@@ -1,0 +1,16 @@
+{
+  "coroner": { "postmortem": {} },
+  "benchmarkSource": "open-pr-time-loss.md (2026-10-16), 50 PRs; p90 upper bounds, not service-level guarantees",
+  "handoffP90Minutes": {
+    "ci-green-review": 6.6,
+    "accepted-ready": 5.6,
+    "changes-fix": 236.9,
+    "fix-ci": 291.9,
+    "fix-review": 207.3,
+    "ready-enqueued": 75.2,
+    "enqueued-merged": 55.1,
+    "clearance-ready": 92.7,
+    "ci-red-heal": 213.2
+  },
+  "prepareStaleHours": 24
+}

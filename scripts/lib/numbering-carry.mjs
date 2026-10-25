@@ -9,6 +9,7 @@
  *   Two backlog cards were renamed and stamped; one existing card and the renamed cards had references
  *   rewritten. The parent acceptance looked stale despite no author change. This proof permits callers
  *   to carry it forward without trusting the drain's subject alone. Duplicate drops never qualify.
+ *   Live case #5608: drain numbering also rewrote ids in docs/agent/platform-decisions.md, voiding human clearance.
  */
 import { proveIdenticalNetPatch, resolveIdenticalNetPatchSetting, logIdenticalNetPatchSetting } from './identical-net-patch.mjs';
 import { readSettings } from './settings-files.mjs';
@@ -99,6 +100,7 @@ const swap = (text, map) => text.replace(/\bx[0-9a-z]{6}\b/g, (hash) => map.get(
 
 /**
  * PURE: verify one commit's entire diff, supplied as no-renames additions/deletions/modifications with blobs.
+ * Allow backlog markdown and M-only top-level docs/agent markdown; every modification must be a ledger id rewrite.
  * @param {{subject:string, parents:string[], changes:Array<{status:string,path:string,before?:string|null,after?:string|null}>,
  *   extraMap?:Map<string,string>}} o
  * @returns {{ok:true,pairs:Array<[string,string]>,renames:Array<{from:string,to:string}>}|{ok:false,reason:string}}
@@ -113,7 +115,9 @@ export function checkNumberingCommit({ subject, parents, changes, extraMap = new
   for (const change of changes) {
     if (!['A', 'D', 'M'].includes(change.status)) return refuse(`unsupported change status ${change.status} at ${change.path}`);
     if (typeof change.path !== 'string' || paths.has(change.path)) return refuse(`invalid or repeated change path ${change.path}`);
-    if (!/^backlog\/(?:[^/]+\/)*[^/]+\.md$/.test(change.path)
+    const backlogMarkdown = /^backlog\/(?:[^/]+\/)*[^/]+\.md$/.test(change.path);
+    const agentDocModification = change.status === 'M' && /^docs\/agent\/[^/]+\.md$/.test(change.path);
+    if ((!backlogMarkdown && !agentDocModification)
       || change.path.split('/').some((part) => part === '.' || part === '..')) return refuse(`id rewrite is outside backlog markdown at ${change.path}`);
     if (change.status === 'M' && change.beforeMode !== change.afterMode) return refuse(`file mode changed at ${change.path}`);
     paths.add(change.path);

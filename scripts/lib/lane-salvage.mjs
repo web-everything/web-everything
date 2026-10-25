@@ -49,6 +49,7 @@ import {
 import { tmpdir, homedir } from 'node:os';
 import { join, resolve, sep, dirname } from 'node:path';
 import { LEASE_FILENAME } from './lane-lease.mjs';
+import { laneGitHardeningEnv, hardenLaneGitArgs } from './lane-git-hardening.mjs';
 
 /** Env override for where salvage lands; default `~/.claude/lane-salvage` (the operator's manual location). */
 export const SALVAGE_DIR_ENV = 'WE_LANE_SALVAGE_DIR';
@@ -177,8 +178,11 @@ export function salvageEligibility({ leased, liveOwner, livePids = [], newestMti
 // ── IO shell ────────────────────────────────────────────────────────────────────────────────────────────
 
 const GIT_TIMEOUT_MS = 120_000;
-const git = (dir, args, extra = {}) => execFileSync('git', args, {
+// The salvaged tree's `.git/config` is agent-writable: every call carries the lane hardening pins, and `diff`
+// runs no `diff.external` / textconv (PR #5775).
+const git = (dir, args, extra = {}) => execFileSync('git', hardenLaneGitArgs(args), {
   cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 256 * 1024 * 1024, timeout: GIT_TIMEOUT_MS, ...extra,
+  env: laneGitHardeningEnv(extra.env ?? process.env),
 });
 
 /** Every live process's cwd, via one `lsof` call. `null` when lsof is unavailable (callers treat as unknown ⇒ not eligible). */

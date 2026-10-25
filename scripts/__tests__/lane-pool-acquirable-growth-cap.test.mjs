@@ -65,7 +65,10 @@ function installFailingLsRemoteShim() {
   const script = [
     '#!/usr/bin/env bash',
     `REAL_GIT=${JSON.stringify(real)}`,
-    'if [ "$1" = "ls-remote" ]; then',
+    'if (',
+    '  while [ "$1" = "-c" ]; do shift 2; done',
+    '  [ "$1" = "ls-remote" ]',
+    '); then',
     '  echo "fatal: simulated probe failure (network unreachable)" >&2',
     '  exit 128',
     'fi',

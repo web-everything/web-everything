@@ -1,0 +1,128 @@
+/** PR #5502: a permanently unreadable merge must not starve later postmortems. */
+import fs from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { runPostmortemPass, listMergedSince } from '../../pass-daemons/pr-postmortem-pass.mjs';
+import { DEFAULTS, withCoronerLock } from '../../../operations/coroner-pr-postmortem.mjs';
+
+const SOURCE = 'scripts/conveyor/pass-daemons/pr-postmortem-pass.mjs';
+export async function sameSecondListingScenario() {
+  const dir = fs.mkdtempSync(join(tmpdir(),'soak-same-second-merge-'));
+  const at = minute => new Date(Date.UTC(2026,9,17,0,minute)).toISOString();
+  const cursor = join(dir,'merge-cursor-example%2Frepo.json');
+  const now = '2026-10-17T11:40:00.500Z', reads = [], violations = [];
+  const listing = Array.from({length:201},(_,i) => ({number:i+1,updated_at:at(650),merged_at:i === 100 ? at(600) : null}));
+  const gh = args => {
+    const page = Number(new URL(`https://example.test/${args.at(-1)}`).searchParams.get('page'));
+    if (page === 2) listing[100].updated_at = at(700);
+    return [...listing].sort((a,b) => b.updated_at.localeCompare(a.updated_at) || a.number-b.number)
+      .slice((page-1)*100,page*100).map(row => ({...row}));
+  };
+  try {
+    fs.writeFileSync(cursor,JSON.stringify({cursor:at(500),done:[]}));
+    await runPostmortemPass({repo:'example/repo',dir,now,settings:{value:DEFAULTS},
+      listMerged:(repo,since,until) => listMergedSince(repo,since,until,{gh}),
+      collect:(repo,pr) => { reads.push(pr); return {repo,pr,openedAt:at(0),mergedAt:at(600)}; }});
+    const state = JSON.parse(fs.readFileSync(cursor,'utf8'));
+    if (reads.join(',') !== '101' || !fs.existsSync(join(dir,'postmortem-example%2Frepo-101.md'))) violations.push('same-second page move lost PR #101');
+    if (state.cursor !== now || state.done.join(',') !== '101') violations.push('same-second page move advanced cursor without processing PR #101');
+    return violations;
+  } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+}
+export async function shiftedListingScenario(moved = 101) {
+  const dir = fs.mkdtempSync(join(tmpdir(),'soak-shifted-merge-'));
+  const at = minute => new Date(Date.UTC(2026,9,17,0,minute)).toISOString();
+  const cursor = join(dir,'merge-cursor-example%2Frepo.json');
+  const original = JSON.stringify({cursor:at(500),done:[]});
+  const violations = [], reads = [];
+  let stable = false, error;
+  const listing = Array.from({length:201},(_,i) => ({number:i+1,updated_at:at(650),merged_at:i === 100 ? at(600) : null}));
+  const gh = args => {
+    const page = Number(new URL(`https://example.test/${args.at(-1)}`).searchParams.get('page'));
+    if (!stable && page === 2) for (const row of listing) if (row.number >= 101 && row.number < 101+moved) row.updated_at = at(701);
+    return [...listing].sort((a,b) => b.updated_at.localeCompare(a.updated_at) || a.number-b.number)
+      .slice((page-1)*100,page*100).map(row => ({...row}));
+  };
+  const args = {repo:'example/repo',dir,settings:{value:DEFAULTS},
+    listMerged:(repo,since,until) => listMergedSince(repo,since,until,{gh}),
+    collect:(repo,pr) => { reads.push(pr); return {repo,pr,openedAt:at(0),mergedAt:at(600)}; }};
+  try {
+    fs.writeFileSync(cursor,original);
+    try { await runPostmortemPass({...args,now:at(700)}); } catch (e) { error = e; }
+    if (error?.message !== 'listing shifted; cursor retained') violations.push('shifted listing did not abort');
+    if (fs.readFileSync(cursor,'utf8') !== original) violations.push('shifted listing advanced persisted cursor');
+    stable = true;
+    await runPostmortemPass({...args,now:at(702)});
+    if (reads.join(',') !== '101' || !fs.existsSync(join(dir,'postmortem-example%2Frepo-101.md'))) violations.push('stable retry lost PR #101');
+    return violations;
+  } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+}
+/** A live owner heartbeating past the old fixed 2h TTL keeps the lock; a lapsed owner is fenced. */
+export async function lockLeaseScenario() {
+  const dir = fs.mkdtempSync(join(tmpdir(),'soak-coroner-lock-'));
+  let now = Date.UTC(2026,9,17), second = 0; const clock = () => now, violations = [];
+  const rival = () => withCoronerLock(dir,() => { second++; },{clock,beatMs:0}).catch(e => e.message);
+  try {
+    await withCoronerLock(dir,async ({beat}) => {
+      for (let i = 0; i < 20; i++) { now += 10*60000; beat(); if (await rival() !== 'coroner postmortem is already running') violations.push('live heartbeating owner lost the lock'); }
+    },{clock,beatMs:0});
+    if (second) violations.push('rival ran while the owner was live');
+    if (await rival() !== undefined || second !== 1) violations.push('lock not released after a heartbeating owner finished');
+    let fenced = false;
+    await withCoronerLock(dir,async ({beat}) => {
+      now += 16*60000; // heartbeat lapses with no beat: a reclaimer may take over and the old owner is fenced
+      await withCoronerLock(dir,() => { try { beat(); violations.push('reclaimed owner was not fenced'); } catch {} },{clock,beatMs:0});
+    },{clock,beatMs:0}).catch(() => { fenced = true; });
+    if (!fenced) violations.push('deposed owner reported success');
+    return violations;
+  } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+}
+export default {
+  id: 'postmortem-poison-merge',
+  title: 'postmortem watcher delays quarantine and retries operator recovery across restarts',
+  card: 'PR #5502',
+  fixedBy: { sha:'HEAD', where:'lane/pr-postmortem', paths:[SOURCE] },
+  fixPresent(root) {
+    const source = fs.readFileSync(join(root,SOURCE),'utf8');
+    return source.includes('MIN_COLLECTION_FAILURE_SPAN_MS') && source.includes('listing shifted; cursor retained') && source.includes('beat()');
+  },
+  async run() {
+    const dir = fs.mkdtempSync(join(tmpdir(),'soak-poison-merge-'));
+    const violations = [], reads = []; let fail = true;
+    const at = minute => new Date(Date.UTC(2026,9,17,0,minute)).toISOString();
+    try {
+      const args = { repo:'example/repo', dir, settings:{value:DEFAULTS},
+        listMerged:async (_repo,since) => [2,3].filter(() => at(600) >= since).map(number => ({number,merged_at:at(600)})),
+        collect:async (repo,pr) => {
+          reads.push(pr);
+          if (pr === 2 && fail) throw Error('PR exceeds 200 observed heads; refusing incomplete check history');
+          return {repo,pr,openedAt:at(0),mergedAt:at(600)};
+        } };
+      let result;
+      for (const minute of [700,701,702,730,740]) {
+        try { result = await runPostmortemPass({...args,now:at(minute)}); }
+        catch (e) { if (minute >= 730) violations.push(`retry budget did not release window: ${e.message}`); }
+        if (minute === 702) {
+          const early = JSON.parse(fs.readFileSync(join(dir,'merge-cursor-example%2Frepo.json')));
+          if (early.quarantined.length) violations.push('transient failure quarantined within two minutes');
+        }
+      }
+      if (result?.cursor !== at(740) || result?.quarantined?.[0]?.pr !== 2) violations.push('missing durable quarantine/cursor');
+      if (reads.join(',') !== '2,3,2,2,2') violations.push(`unexpected reads: ${reads}`);
+      const reports = fs.readdirSync(dir).filter(name => name.endsWith('-3.md'));
+      if (reports.length !== 1) violations.push('later PR report missing');
+      // The merge is now well outside discovery; deleting only quarantine must retry it.
+      const cursor = join(dir,'merge-cursor-example%2Frepo.json');
+      const state = JSON.parse(fs.readFileSync(cursor)); state.quarantined = [];
+      fs.writeFileSync(cursor,JSON.stringify(state)); fail = false;
+      await runPostmortemPass({...args,now:at(741)});
+      if (reads.join(',') !== '2,3,2,2,2,2' || !fs.existsSync(join(dir,'postmortem-example%2Frepo-2.md'))) violations.push('operator quarantine removal did not recover publication');
+      violations.push(...await shiftedListingScenario());
+      violations.push(...await shiftedListingScenario(1));
+      violations.push(...await sameSecondListingScenario());
+      violations.push(...await lockLeaseScenario());
+      return {violations};
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  },
+  judge(report) { return report.violations; },
+};

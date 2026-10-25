@@ -30,9 +30,9 @@
  * GITHUB APP TOKEN, NOT THE OPERATOR'S PERSONAL ONE (xsdm0n7, epic #3383). Every one of these watchers'
  * pass scripts shells `gh` as a child process, inheriting `process.env` — so setting `GH_TOKEN` here, right
  * before each spawn via {@link ensureFreshGithubAppEnv}, covers every pass this daemon can run without
- * touching any pass script itself. Opt-in (the three `WE_GITHUB_APP_*` env vars), never throws, and falls
- * back to the operator's personal `gh auth login` token unchanged if the App isn't configured or a mint
- * fails — see that module's own header. Six resident `lane-pool-health-watch`/`parked-pr-conflict-watch`
+ * touching any pass script itself. The daemon installs a refusal guard before refreshing; inability to
+ * install it stops the loop. Missing App config or mint failures remain subject to the guard's fallback
+ * policy — see that module's own header. Six resident `lane-pool-health-watch`/`parked-pr-conflict-watch`
  * launchd jobs run through this exact file; their personal-token draw is what exhausted the operator's
  * 5,000/hr budget ("API rate limit already exceeded for user ID 760299") on 2026-09-23.
  *
@@ -54,7 +54,7 @@ import {
   RUNNER_LOCK_ROOT, makeOwner,
   acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned,
 } from './runner-lock.mjs';
-import { ensureFreshGithubAppEnv, FLEET_APP_AUTH_OPTS } from '../../scripts/lib/github-app-auth-env.mjs';
+import { ensureFreshGithubAppEnv, FLEET_APP_AUTH_OPTS, isGithubAppAuthGuardError } from '../../scripts/lib/github-app-auth-env.mjs';
 import { withSelfSync, resolvePocSyncBranch, DAEMON_SELF_SYNC_BRANCH_ENV } from '../../scripts/lib/daemon-self-sync.mjs';
 import { StringDecoder } from 'node:string_decoder';
 import { notifyDesktopChecked } from '../../scripts/conveyor/branch-sync.mjs';
@@ -118,9 +118,8 @@ export const MAIN_ONLY_PASSES = new Set(['merge-orphan-sweep']);
  * `refreshAuth` runs right before EVERY spawn (never on its own background timer — a resident watcher's
  * personal `gh` token exhausting the operator's own 5,000/hr budget was live-caught 2026-09-23; a timer would
  * be starved by this same loop's blocking work between spawns, the same reason {@link withGithubAppAuth}
- * refreshes per-tick rather than on a timer). A failed refresh is isolated exactly like a failed run — logged
- * via `onRefreshError`, never allowed to skip the spawn: falling back to whatever auth is already in effect
- * (personal, if the App isn't configured or its mint failed) is always preferable to the watcher not running.
+ * refreshes per-tick rather than on a timer). Transient refresh errors are logged via `onRefreshError`;
+ * a missing refusal guard is fatal and stops the loop before the next spawn.
  * @param {{
  *   runPass: () => Promise<{code:number|null}>,
  *   sleep: (ms:number) => Promise<void>,
@@ -159,6 +158,7 @@ export async function runPassDaemonLoop({
     try {
       await refreshAuth();
     } catch (error) {
+      if (isGithubAppAuthGuardError(error)) throw error;
       onRefreshError(error, run);
     }
     try {

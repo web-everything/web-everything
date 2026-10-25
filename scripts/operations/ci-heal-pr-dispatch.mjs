@@ -34,6 +34,7 @@
  * match) could never recognize a real non-WE heal session as live, so a genuinely in-flight sibling-repo heal
  * would have been re-planned every tick. Threading `repo` through here is what makes the two sides agree.
  */
+import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { pollHealAttempts } from './probation-heal-run.mjs';
 import { readAgyHold } from '../lib/antigravity-run-evidence.mjs';
@@ -188,6 +189,11 @@ export function routeAvailableCiHeal(p, { readHolds = readAgyHold, readScores = 
   } catch (e) { return { outcome: 'refused', refusal: `CI-heal quota evidence unreadable: ${e.message}` }; }
 }
 
+/** The ci-heal brief `dispatchCiHeal` sends by default: the template, its context pack, then the build requirements once. */
+export function readCiHealBriefTemplate(root = REPO_ROOT, pack = (template) => template) {
+  return appendBuildRequirements(pack(readFileSync(briefPath(root, 'ci-heal'), 'utf8')), { policy: resolveBuildPolicy({ log: line => console.error(line) }) });
+}
+
 /**
  * @param {{itemNum:(string|null), pr:number, laneRef:string, scope:string[], lane:number, reason?:string, repo?:string, headRefOid?:string|null}} planned - a `planFixesFromReconcile`
  *   entry (the same planner every repair row uses) plus a lane number and the ci-heal reason (`red-ci` unless told otherwise).
@@ -198,7 +204,7 @@ export async function dispatchCiHeal(planned, {
   root = REPO_ROOT, actions, repo = planned.repo ?? 'we', extraArgs = [],
   // CI-heal context pack (`fix.contextPack`, `fix.localTests`): the failing checks, failing tests and failed-log tail
   // staged in front of the template (we:scripts/conveyor/fix-context-pack.mjs). A test that injects `readBrief` gets its own text.
-  readBrief = (r) => packCiBrief(readFileSync(briefPath(r, 'ci-heal'), 'utf8')),
+  readBrief = (r) => readCiHealBriefTemplate(r, packCiBrief),
   packCiBrief = (template) => briefWithContextPack(template, {
     kind: 'ci-heal', repo, toSlug: (k) => CONSTELLATION_REPOS[repoKeyForSlug(k) ?? k]?.slug ?? k, pr: planned.pr, exec: execFileSyncThrottled,
   }),

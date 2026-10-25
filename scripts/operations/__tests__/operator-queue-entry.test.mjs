@@ -71,8 +71,13 @@ const stage = (root) => {
   // Link review-escalation like gh-throttle above so its larger graph resolves from the source tree;
   // the queue's optional readers remain absent from this partial copy.
   copyFileSync(join(dirname(LEAF), 'red-team-gate.mjs'), join(root, 'lib/red-team-gate.mjs'));
+  // The disposition reader's operator identity helper imports marker-authorship and red-team-gate, both staged here.
+  copyFileSync(join(dirname(LEAF), 'operator-identity.mjs'), join(root, 'lib/operator-identity.mjs'));
   copyFileSync(join(dirname(LEAF), 'review-verdict-carried-marker.mjs'), join(root, 'lib/review-verdict-carried-marker.mjs'));
   symlinkSync(join(dirname(LEAF), 'review-escalation.mjs'), join(root, 'lib/review-escalation.mjs'));
+  // The disposition reader also reads the operator's round grants (a grant after a round-cap record reopens the
+  // send-back step); its own imports (marker-authorship, constellation-repos) are already staged above.
+  copyFileSync(join(dirname(LEAF), '../conveyor/round-extension-mark.mjs'), join(root, 'conveyor/round-extension-mark.mjs'));
 };
 
 let dir;

@@ -39,7 +39,7 @@ describe('launchd templates', () => {
       relatedMaxTests: 'WE_VERIFY_RELATED_MAX_TESTS', relatedDepth: 'WE_VERIFY_RELATED_DEPTH', alwaysRunTests: 'WE_VERIFY_ALWAYS_RUN_TESTS',
       skipLocalForCardOnly: 'WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY', revertRed: 'WE_VERIFY_REVERT_RED',
       revertRedSince: 'WE_VERIFY_REVERT_RED_SINCE', revertRedMaxFiles: 'WE_VERIFY_REVERT_RED_MAX_FILES',
-      selection: 'WE_VERIFY_SELECTION' };
+      selection: 'WE_VERIFY_SELECTION', phaseTimeoutMs: 'WE_VERIFY_PHASE_TIMEOUT_MS', slotHeartbeatMs: 'WE_VERIFY_SLOT_HEARTBEAT_MS' };
     const overrides = Object.fromEntries([...env.matchAll(/<key>([^<]+)<\/key>\s*<string>([^<]*)<\/string>/g)]
       .map(([, key, value]) => [key, value]));
     for (const [key, value] of Object.entries(settings)) {

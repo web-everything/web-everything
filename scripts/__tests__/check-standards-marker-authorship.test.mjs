@@ -68,6 +68,8 @@ it('accepts the live review ceremony parser with its compound author and body gu
 
 it.each([
   'scripts/conveyor/exhausted-retry.mjs',
+  'scripts/conveyor/round-extension-mark.mjs',
+  'scripts/conveyor/standing-ruling-mark.mjs',
   'scripts/lib/operator-send-backs.mjs',
 ])('accepts reviewed readers in %s while still rejecting a new unauthenticated parser', file => {
   const content = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../..', file), 'utf8');

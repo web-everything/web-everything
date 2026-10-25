@@ -36,9 +36,19 @@ import { dirname, basename, join } from 'node:path';
 import { homedir } from 'node:os';
 import { mintInstallationToken, getInstallationInfo, readPrivateKeyRef, canReadPrivateKeyRef } from './github-app-token.mjs';
 import { readDeliveryIdentity, resolveRequestedRole, buildIdentityChain, ROLE_ENV, LEGACY_ROLE, shimRoleTable } from './github-app-identity.mjs';
-import { readGithubAuthPolicy } from './github-auth-policy.mjs';
+import { readGithubAuthPolicy, isDaemonCaller } from './github-auth-policy.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { installationMap, ownerOfSlug, remapLegacyInstallationId, installationCachePath } from './github-app-installations.mjs';
+
+/** A missing refusal boundary is fatal even to callers that tolerate transient refresh errors. */
+export class GithubAppAuthGuardError extends Error {
+  constructor(options) {
+    super('github-app-auth-env: refusing to run daemon without the gh auth guard', options);
+    this.code = 'GITHUB_APP_AUTH_GUARD_UNAVAILABLE';
+  }
+}
+
+export const isGithubAppAuthGuardError = (error) => error?.code === 'GITHUB_APP_AUTH_GUARD_UNAVAILABLE';
 
 /**
  * What the fleet's `gh` calls actually need, as GitHub App permission levels. Live-caught 2026-09-23: the
@@ -109,6 +119,7 @@ async function defaultListInstallationRepos(token, fetchImpl = fetch) {
 /** Refresh this long before the real 1-hour expiry — generous enough that a slow mint, a daemon restart
  *  mid-refresh, or plain clock skew never leaves a consumer holding a token GitHub has already rejected. */
 export const REFRESH_BUFFER_MS = 10 * 60 * 1000;
+export const DAEMON_REFRESH_BUFFER_MS = 30 * 60 * 1000;
 
 /** One shared cache, not per-daemon — the review daemon, the fix-dispatch daemon and the drain all draw
  *  from the SAME installation, so one fresh token serves all of them; minting three independent tokens for
@@ -327,10 +338,9 @@ export function readGithubAppStatus(path = defaultStatusPath(), {
  * it so every `gh` CLI call and every raw `execFileSync('gh', …)` this process (or anything it spawns)
  * makes from here on authenticates as the App installation instead of the operator's personal token.
  *
- * Never throws on a mint failure — a transient GitHub outage must not crash a daemon tick or a drain run;
- * it logs and leaves `process.env.GH_TOKEN` UNCHANGED, so a caller with no App configured (or one whose mint
- * just failed) falls straight back to whatever auth was already in effect (the operator's own `gh auth
- * login`, unchanged from today).
+ * Never throws on a mint failure. Daemons first install the gh refusal shim, and throw if that guard
+ * cannot be installed, before any tick can run with inherited personal auth. Interactive callers leave
+ * `process.env.GH_TOKEN` unchanged on failure and retain their existing inherited-auth fallback.
  *
  * FAIL-SAFE ON A MISCONFIGURED APP. A fresh mint is checked against {@link REQUIRED_APP_PERMISSIONS} and
  * {@link REQUIRED_APP_REPOS} BEFORE it is cached or applied. An installation missing any of them is refused
@@ -359,7 +369,23 @@ export function readGithubAppStatus(path = defaultStatusPath(), {
  *   statusPath?:string, writeStatus?:(path:string, status:object)=>void}} [o]
  * @returns {Promise<{applied:boolean, reason:string, missingPermissions?:string[], missingRepos?:string[]}>}
  */
-export async function ensureFreshGithubAppEnv({
+export async function ensureFreshGithubAppEnv(opts = {}) {
+  // ONE fail-closed boundary for a daemon: any throw before the refusal shim is in place (a default parameter,
+  // a config read, an env write) becomes GithubAppAuthGuardError — the only error the daemon loops stop on.
+  // Throws after the shim is installed, and every throw for an interactive caller, pass through unchanged.
+  const guard = { installed: false };
+  try {
+    return await ensureFreshGithubAppEnvUnguarded(opts, guard);
+  } catch (e) {
+    if (isGithubAppAuthGuardError(e) || guard.installed) throw e;
+    let daemon = true; // an env too broken to classify is treated as a daemon's
+    try { daemon = opts?.daemon ?? isDaemonCaller(opts?.env ?? process.env); } catch { /* fail closed */ }
+    if (!daemon) throw e;
+    throw new GithubAppAuthGuardError({ cause: e });
+  }
+}
+
+async function ensureFreshGithubAppEnvUnguarded({
   env = process.env,
   cachePath = defaultCachePath(),
   now = Date.now(),
@@ -376,7 +402,9 @@ export async function ensureFreshGithubAppEnv({
   extraInstallations = true,
   perOwner = false,
   installShim = defaultInstallOwnerShim,
-  daemon = false,
+  // A caller that forgot `daemon` still gets the refusal shim when its env carries a daemon marker
+  // (launchd `XPC_SERVICE_NAME=com.we.*|com.plateau.*`, or `WE_GH_DAEMON_CALLER`).
+  daemon = isDaemonCaller(env),
   caller = defaultAuthCaller(process.argv, env),
   policy,
   canReadKey = mint === mintInstallationToken ? defaultCanReadKey : () => true,
@@ -389,7 +417,9 @@ export async function ensureFreshGithubAppEnv({
   identity: identityOpt,
   readKeyRef = readPrivateKeyRef,
   canReadKeyRef = mint === mintInstallationToken ? (ref) => canReadPrivateKeyRef(ref) : () => true,
-} = {}) {
+} = {}, guard = {}) {
+  if (daemon) env.WE_GH_DAEMON_CALLER = caller;
+  const bufferMs = daemon ? DAEMON_REFRESH_BUFFER_MS : REFRESH_BUFFER_MS;
   const recordCaller = (result, extra = {}) => {
     writeCallerStatus(callerStatusFile(callerStatusDir, caller), { caller, daemon, ...result, ...extra, checkedAt: new Date(now).toISOString() });
   };
@@ -409,21 +439,52 @@ export async function ensureFreshGithubAppEnv({
     return result;
   };
 
-  // `github.auth: personal` is an explicit, host-wide choice — honoured, recorded, never a silent fallback.
-  const authPolicy = policy ?? readGithubAuthPolicy({ env });
-  if (authPolicy.auth === 'personal') {
+  // Every config read before the guard is installed fails closed for a daemon: an unclassified throw here
+  // (a malformed delivery.identity, an unreadable policy) would otherwise reach the daemon loop, which only
+  // stops on GithubAppAuthGuardError, and its cycle would run on inherited personal credentials.
+  let authPolicy;
+  let personal;
+  let identity;
+  let requested;
+  let chain;
+  try {
+    // `github.auth: personal` is an explicit, host-wide choice — honoured, recorded, never a silent fallback.
+    authPolicy = policy ?? readGithubAuthPolicy({ env });
+    personal = authPolicy.auth === 'personal';
+    if (!personal) {
+      // PER-ROLE IDENTITY (we:scripts/lib/github-app-identity.mjs). With no role configured the chain is only today's
+      // App and everything below behaves exactly as before. Once ANY role is configured, this process's role App is
+      // tried first, then the worker App, then today's App, and every step down is logged and recorded loudly (the
+      // github-app-config smell reads the caller file) — never a silent fallback.
+      identity = identityOpt ?? readDeliveryIdentity({ env });
+      requested = resolveRequestedRole({ role: roleOpt, env, caller, callerRoles: identity.callerRoles });
+      chain = buildIdentityChain({ requestedRole: requested.role, identity, env, cachePath });
+      if (chain.loud) env[ROLE_ENV] = requested.role; // the gh shim and every child process pick the App by it
+    }
+  } catch (e) {
+    if (!daemon) throw e;
+    let why = 'unreadable error';
+    try { why = String((e && e.message) || e); } catch { /* keep the generic text */ }
+    try { log.error?.(`github-app-auth-env: ${caller} could not read its GitHub auth config before installing the gh guard: ${why}`); } catch { /* logging never reopens the path */ }
+    // A bad config read is a fact about THIS caller's env, not the fleet's installation: per-caller file only.
+    try { record({ applied: false, reason: 'guard-config-invalid' }, { shared: false }); } catch { /* the refusal must still throw */ }
+    throw new GithubAppAuthGuardError({ cause: e });
+  }
+  if (personal) {
     warnOnce(log, `policy-personal:${caller}`, `github-app-auth-env: github.auth=personal (${authPolicy.source?.auth ?? '?'}) — ${caller} uses the operator's personal gh login by policy.`);
     return record({ applied: false, reason: 'policy-personal' }, { shared: false });
   }
-
-  // PER-ROLE IDENTITY (we:scripts/lib/github-app-identity.mjs). With no role configured the chain is only today's
-  // App and everything below behaves exactly as before. Once ANY role is configured, this process's role App is
-  // tried first, then the worker App, then today's App, and every step down is logged and recorded loudly (the
-  // github-app-config smell reads the caller file) — never a silent fallback.
-  const identity = identityOpt ?? readDeliveryIdentity({ env });
-  const requested = resolveRequestedRole({ role: roleOpt, env, caller, callerRoles: identity.callerRoles });
-  const chain = buildIdentityChain({ requestedRole: requested.role, identity, env, cachePath });
-  if (chain.loud) env[ROLE_ENV] = requested.role; // the gh shim and every child process pick the App by it
+  // Install the refusal boundary BEFORE any cache/key/mint/access-check failure can return.
+  // Without it a first tick can reach the real gh with inherited personal credentials.
+  let daemonShim;
+  if (daemon) {
+    try { daemonShim = await installShim(env, { cachePath, identity }); } catch { /* fail closed below */ }
+    if (!daemonShim?.ok) {
+      try { record({ applied: false, reason: 'shim-failed' }); } catch { /* the refusal must still throw */ }
+      throw new GithubAppAuthGuardError();
+    }
+    guard.installed = true;
+  }
   const fallbackFrom = [];
   const label = (role) => (role === LEGACY_ROLE ? "today's App" : `the ${role} App`);
   const withRole = (result, role) => {
@@ -439,12 +500,12 @@ export async function ensureFreshGithubAppEnv({
 
   // ONE App, end to end: cached-or-minted token, access check, per-owner caches, then GH_TOKEN or the shim.
   // Returns the outcome WITHOUT recording it; the caller records (today's App) or falls through (a role App).
-  const attempt = async ({ appId, installationId, privateKeyPath, keyRef, installations, cachePath: candCache, required: candRequired }) => {
+  const attempt = async ({ appId, installationId, privateKeyPath, keyRef, installations, cachePath: candCache, required: candRequired }, { cacheOnly = false } = {}) => {
     const config = { appId, installationId, privateKeyPath };
     const keyOpts = keyRef?.keychain ? { readKey: () => readKeyRef(keyRef) } : {};
     let cached = readCache(candCache);
     let source = 'cache';
-    if (!isCacheFresh(cached, now) || typeof cached.token !== 'string' || !cached.token || cached.installationId !== config.installationId || cached.appId !== config.appId) {
+    if (!isCacheFresh(cached, now, bufferMs) || typeof cached.token !== 'string' || !cached.token || cached.installationId !== config.installationId || cached.appId !== config.appId) {
       source = 'mint';
       if (!(keyRef?.keychain ? canReadKeyRef(keyRef) : canReadKey(config.privateKeyPath))) {
         const keyDiag = { state: 'half', missing: [], keyUnreadable: true };
@@ -518,7 +579,7 @@ export async function ensureFreshGithubAppEnv({
     // mapped installation in its own cache file, which the gh shim picks by the target repo's owner.
     // Best-effort: a failure here never affects the primary token applied below.
     if (extraInstallations && !perOwner && Object.values(installations).includes(String(config.installationId))) {
-      await ensurePerInstallationCaches({ config, primary: cached, env, cachePath: candCache, now, readCache, writeCache, mint, log, installations, mintExtra: keyOpts });
+      await ensurePerInstallationCaches({ config, primary: cached, env, cachePath: candCache, now, readCache, writeCache, mint, log, installations, mintExtra: keyOpts, bufferMs });
     }
 
     // MULTI-REPO CALLERS (the drain sweeps web-everything + frontier-ui + plateauapp in one process): one pinned
@@ -533,9 +594,12 @@ export async function ensureFreshGithubAppEnv({
         return ({ applied: false, reason: 'owner-map-missing' });
       }
       // The per-owner caches must be fresh for EVERY owner even when the primary came from the cache.
-      await ensurePerInstallationCaches({ config, primary: cached, env, cachePath: candCache, now, readCache, writeCache, mint, log, installations, mintExtra: keyOpts });
-      let shim;
-      try { shim = await installShim(env, { cachePath, identity }); } catch (e) { shim = { ok: false, reason: String((e && e.message) || e) }; }
+      await ensurePerInstallationCaches({ config, primary: cached, env, cachePath: candCache, now, readCache, writeCache, mint, log, installations, mintExtra: keyOpts, bufferMs });
+      if (cacheOnly) return { applied: true, reason: 'ok' };
+      let shim = daemonShim;
+      if (!shim) {
+        try { shim = await installShim(env, { cachePath, identity }); } catch (e) { shim = { ok: false, reason: String((e && e.message) || e) }; }
+      }
       if (!shim || !shim.ok) {
         log.error?.(`github-app-auth-env: could not install the per-owner gh shim (${shim && shim.reason}) - staying on personal auth.`);
         return ({ applied: false, reason: 'shim-failed' });
@@ -543,6 +607,7 @@ export async function ensureFreshGithubAppEnv({
       return ({ applied: true, reason: 'ok', perOwner: true });
     }
 
+    if (cacheOnly) return { applied: true, reason: 'ok' };
     setEnv(cached.token);
     // Bind provenance to the credential actually applied; inherited metadata cannot label a fallback token.
     env.WE_GH_AUTH_SOURCE = source;
@@ -557,7 +622,16 @@ export async function ensureFreshGithubAppEnv({
     if (!readable) { fallbackFrom.push({ role: cand.role, reason: 'key-unreadable' }); continue; }
     const { [LOCAL_RESULT]: _local, ...r } = await attempt(cand);
     // A role App's outcome goes to the caller file only: the shared status file reports today's installation.
-    if (r.applied) return record(withRole({ ...r, appId: cand.appId }, cand.role), { shared: false });
+    if (r.applied) {
+      // Keep the last App in the shim's fallback chain alive without applying its identity.
+      try {
+        const legacy = resolveGithubAppEnvConfig(env);
+        if (legacy && canReadKey(legacy.privateKeyPath)) {
+          await attempt(chain.candidates.at(-1), { cacheOnly: true });
+        }
+      } catch { /* best-effort: never replace the selected role's outcome */ }
+      return record(withRole({ ...r, appId: cand.appId }, cand.role), { shared: false });
+    }
     fallbackFrom.push({ role: cand.role, reason: r.reason, ...(r.missingPermissions?.length ? { missingPermissions: r.missingPermissions } : {}) });
   }
 
@@ -594,12 +668,14 @@ export async function ensureFreshGithubAppEnv({
  * Default per-owner routing: write this checkout's `gh` shim and prepend its dir to `env.PATH` (idempotent).
  * Dynamic import: `gh-app-shim.mjs` imports this module.
  */
-async function defaultInstallOwnerShim(env, { cachePath, identity }) {
+export async function defaultInstallOwnerShim(env, { cachePath, identity, ...shimEffects }) {
   const { buildGhShimSettingsEnv } = await import('./gh-app-shim.mjs');
-  const settings = buildGhShimSettingsEnv({ env, pathEnv: env.PATH || '', cachePath, identity });
+  const settings = buildGhShimSettingsEnv({ env, pathEnv: env.PATH || '', cachePath, identity, ...shimEffects });
   if (!settings || !settings.PATH) return { ok: false, reason: 'no-real-gh-or-write-failed' };
   const dir = settings.PATH.split(':')[0];
-  if (!(env.PATH || '').split(':').includes(dir)) env.PATH = settings.PATH;
+  // The shim guards only as the FIRST gh on PATH: a copy of its dir later in an inherited PATH still
+  // leaves the real gh in front.
+  if ((env.PATH || '').split(':')[0] !== dir) env.PATH = settings.PATH;
   return { ok: true, dir };
 }
 
@@ -622,7 +698,7 @@ async function defaultInstallOwnerShim(env, { cachePath, identity }) {
  * Keep one fresh token cache per mapped installation (`web-everything.<installationId>.json` beside the legacy
  * cache). The primary installation's already-fresh token is reused, not re-minted. Never throws.
  */
-export async function ensurePerInstallationCaches({ config, primary, env, cachePath, now, readCache, writeCache, mint, log, installations = installationMap(env), mintExtra = {} }) {
+export async function ensurePerInstallationCaches({ config, primary, env, cachePath, now, readCache, writeCache, mint, log, installations = installationMap(env), mintExtra = {}, bufferMs = REFRESH_BUFFER_MS }) {
   const done = {};
   const entries = Object.entries(installations);
   for (const [owner, installationId] of entries) {
@@ -635,7 +711,7 @@ export async function ensurePerInstallationCaches({ config, primary, env, cacheP
         continue;
       }
       const have = readCache(path);
-      if (isCacheFresh(have, now) && have.token && String(have.installationId) === String(installationId) && have.appId === config.appId) continue;
+      if (isCacheFresh(have, now, bufferMs) && have.token && String(have.installationId) === String(installationId) && have.appId === config.appId) continue;
       const minted = await mint({ appId: config.appId, installationId, privateKeyPath: config.privateKeyPath, now, ...mintExtra });
       writeCache(path, { v: CACHE_VERSION, appId: config.appId, installationId: String(installationId), token: minted.token, expiresAt: minted.expiresAt });
     } catch (e) {
@@ -679,7 +755,7 @@ export function withGithubAppAuth(effects, opts = { log: console }) {
     // takes (e.g. runner.mjs's per-tick bookkeeping payload) straight through — this wrapper never needs to
     // see them itself.
     tickOnce: async (...args) => {
-      await ensureFreshGithubAppEnv(opts); // never throws — a failure logs and leaves personal auth in place
+      await ensureFreshGithubAppEnv(opts); // a missing daemon guard throws before the tick can run
       return tick(...args);
     },
   };

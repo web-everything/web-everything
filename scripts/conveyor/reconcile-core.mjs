@@ -181,7 +181,7 @@ import {
 // second derivation): `parseReviewedSha` recovers the head an ACCEPT-shaped verdict (`accepted`/`clear-human`/
 // `restamp`) covered. See {@link planReconcile}'s ONE-REVIEW-PER-HEAD refusal for why this pass needs it too.
 import {
-  parseReviewedSha, planConvertSupersededVerdict, targetedCheckQuestion, findAcceptVerdictComment, REVIEW_LABELS,
+  parseReviewedSha, headEverHumanCleared, planConvertSupersededVerdict, targetedCheckQuestion, findAcceptVerdictComment, REVIEW_LABELS,
 } from '../lib/review-escalation.mjs';
 // live incident, web-everything/web-everything PR #2752 (#4034/#2748) — a PR whose own content is ALREADY on `main`,
 // carried there by a different PR that stacked on its branch and merged first, never owes a fix or a review.
@@ -494,6 +494,17 @@ export function splitFailingChecks(rollup, requiredChecks) {
     out[isRequired ? 'required' : 'nonRequired'].push(name);
   }
   return out;
+}
+
+/**
+ * PURE: a review bounce still owes CI repair when a real required check is red (#5729).
+ * Conflict-labelled bounces retain their repair owner; review-gate/merge-gate are intentional holds.
+ */
+export function isBouncedRealRed({ pr, phase, check, requiredChecks }) {
+  return phase === 'bounced' && !labelNames(pr?.labels).includes(CONFLICT_LABEL)
+    && check?.state === 'red'
+    && splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required
+      .some(name => name !== 'review-gate' && name !== 'merge-gate');
 }
 
 /** PURE: settled head CI missing a required job introduced after this PR's base. */
@@ -1331,15 +1342,52 @@ export function acceptLabelDropped({ labels, comments, headSha, now, graceMs = A
  */
 function refuseReferralHold({ pr, refuse, withPhase, extra = {} }) {
   if (!pr?.referralHold) return false;
+  // stale-hold-resume — `review-referral-hold.mjs#decideReferralHoldAutoResolve` read every live-head finding as ruled.
+  let auto = pr.referralHoldAutoResolve && pr.referralHoldAutoResolve.head === pr.headRefOid ? pr.referralHoldAutoResolve : null;
+  if (auto?.outcome === 'resume') {
+    // All card / not-real: no ruling is owed, so the pause is over and the PR moves to its next step. On a
+    // `review:human` PR whose live head already has its advisory, that step is the human /review, never another panel
+    // (the same-head guard still stands) and never an accept: refuse as the nothing-owed `already-reviewed-head`, which
+    // is not an operator referral hold and posts no "waiting on your ruling" notice.
+    // "Complete" = the live head carries its advisory: the human has what the /review reads. (A head whose one
+    // finished review left no advisory was already resumed above, in planReconcile; a second such run stays paused.)
+    const human = withPhase?.phase === 'needs-human' || (withPhase?.labels ?? []).includes(REVIEW_LABELS.human);
+    const { advisoryIsCurrent } = advisoryHeadState(pr);
+    if (human && advisoryIsCurrent) {
+      refuse('already-reviewed-head', {
+        ...withPhase, ...extra, headSha: pr.headRefOid, referralHoldAutoResolve: { ...auto, next: 'human-review' },
+        why: `referral hold auto-resolved — ${auto.why}; this head's review already ran with those rulings and its advisory is current, so `
+          + 'the next step is the human /review (`review:human` kept); no new panel on an unchanged head',
+      });
+      return true;
+    }
+    // Non-human resumes are cleared in planReconcile's pre-pass. Failed safety bounds arrive here as `stay`,
+    // carrying that pre-pass's reason; never replace it with a blanket refusal to re-review non-human PRs.
+    if (human) auto = { ...auto, outcome: 'stay', why: 'no advisory covers the live head' };
+  }
+  // A `stay` keeps the pause's own words (the daemon logs why it stayed, once per reason).
+  const note = auto?.outcome === 'send-back' ? ` (auto-resolve: ${auto.why}; sending back to the fixer)` : '';
   refuse('review-referrals-pending', {
-    ...withPhase, ...extra, referralHold: pr.referralHold, why: pr.referralHold.why,
+    ...withPhase, ...extra, referralHold: pr.referralHold, why: `${pr.referralHold.why}${note}`,
+    ...(auto ? { referralHoldAutoResolve: auto } : {}),
+  });
+  return true;
+}
+
+/** Every review path respects a trusted human clearance of the exact, normalized head. */
+function refuseHumanClearedHead({ pr, refuse, withPhase, extra = {} }) {
+  const headSha = typeof pr?.headRefOid === 'string' ? pr.headRefOid.trim().toLowerCase() : '';
+  if (!headSha || !headEverHumanCleared(pr.comments, headSha)) return false;
+  refuse('already-reviewed-head', {
+    ...withPhase, headSha, ...extra,
+    why: 'this exact head already carries a human clearance — no further advisory review is owed',
   });
   return true;
 }
 
 /**
  * The pre-review gates a review emission that does NOT go through {@link dispatchReviewRow} must still honour: a draft
- * PR and a scope-bloated diff are never reviewed (the same two refusals `dispatchReviewRow` makes). The direct
+ * PR, a scope-bloated diff and a human-cleared head are never reviewed. The direct
  * `kind: 'review'` branches (a past-cap grant, the advisory-fix cap's stale-advisory review, the addressed-advisory
  * review) call this next to {@link refuseReferralHold}, so none of them reviews what the main path would refuse.
  */
@@ -1353,7 +1401,7 @@ function refuseUnreviewable({ pr, refuse, withPhase, extra = {} }) {
       why: `scope-bloat: ${pr.scopeBloat.why} — a fixer rebases it first, no review reads this diff` });
     return true;
   }
-  return false;
+  return refuseHumanClearedHead({ pr, refuse, withPhase, extra });
 }
 
 /**
@@ -1490,6 +1538,7 @@ function dispatchReviewRow({
   // whose verdict run re-applies the label — carrying `relabelOwed: true` so the report names why.
   const headSha = typeof pr?.headRefOid === 'string' ? pr.headRefOid.trim().toLowerCase() : '';
   const reviewedSha = headSha ? parseReviewedSha(pr?.comments) : null;
+  if (refuseHumanClearedHead({ pr, refuse, withPhase, extra: { reviewedSha, ...extra } })) return;
   const relabelOwed = !!(headSha && reviewedSha && reviewedSha === headSha)
     && acceptLabelDropped({ labels: withPhase?.labels, comments: pr?.comments, headSha, now });
   if (relabelOwed) extra = { ...extra, relabelOwed: true };
@@ -1999,6 +2048,32 @@ export function planReconcile({
   const dispatch = [];
   const refusals = [];
   const notes = [];
+  // A same-head pause whose live-head findings are all ruled resumes the ordinary review once (#5806).
+  // `review:human` keeps its existing advisory-only path: a current advisory leaves the next step to the human;
+  // without one (#5773), resume once to publish it. Every path requires exactly one finished review and one attempt.
+  prs = prs.map(pr => {
+    const auto = pr?.referralHoldAutoResolve;
+    const hold = pr?.referralHold;
+    if (auto?.outcome !== 'resume' || !hold || auto.head !== pr.headRefOid || hold.kind !== 'same-head'
+      || hold.head !== pr.headRefOid || hold.noVerdict) return pr;
+    const human = labelNames(pr.labels).includes(REVIEW_LABELS.human);
+    if (human && advisoryHeadState(pr).advisoryIsCurrent) return pr;
+    // Every attempt since the wake counts, finished or not (a review that dies before `advise` is an attempt too). A
+    // hold that cannot say (a ledger-derived hold carries only finished runs) is never resumed: fail closed.
+    const attempts = Number.isInteger(hold.attemptsSinceWake) ? hold.attemptsSinceWake : null;
+    if (hold.count !== 1 || attempts !== 1) {
+      return { ...pr, referralHoldAutoResolve: { ...auto, outcome: 'stay',
+        why: attempts === null ? 'the pause does not say how many review attempts ran on this head (ledger hold), so the review is not resumed' : `head reviewed ${attempts} time(s) and the PR still carries no advisory for it: the review's write-back fails` } };
+    }
+    const next = human ? 'advisory-review' : 'review';
+    const resolved = { ...auto, next };
+    notes.push({ kind: 'referral-hold-auto-resolved', prNumber: Number(pr.number), head: pr.headRefOid, outcome: 'resume',
+      next, ...(auto.counts ? { counts: auto.counts } : {}),
+      text: human
+        ? `referral hold auto-resolved — ${auto.why}; the head's one finished review left no advisory on the PR, so it is resumed once (advisory only; \`review:human\` kept)`
+        : `referral hold auto-resolved — ${auto.why}; the head's one finished review is resumed once` });
+    return { ...pr, referralHold: null, referralHoldAutoResolve: resolved };
+  });
   // PR number → the live reviewer the joined-fix cap set aside for a CI heal. It still refuses a second review.
   const liveReviewers = new Map();
   const counts = durableCounts && typeof durableCounts === 'object' ? durableCounts : {};
@@ -2044,11 +2119,15 @@ export function planReconcile({
 
     // The evidence every row carries, so a reader never has to go back to the listing to audit a verdict.
     const operatorAnswer = latestOperatorAnswer(pr?.comments);
-    const grants = roundExtensionGrants(pr?.comments, { repo, pr: prNumber });
+    // A standing-ruling grant (automation-posted) counts only under the scope the IO shell verified for this PR
+    // (`we:scripts/conveyor/standing-ruling-io.mjs#enrichPrsWithStandingRulingGrants`); absent, it never counts.
+    const grants = roundExtensionGrants(pr?.comments, { repo, pr: prNumber, standingRuling: pr?.standingRuling ?? null });
     const roundExtensions = grants.reduce((sum, g) => sum + g.by, 0);
     // Each cap uses its own production counter on the thread prefix, never today's durable count map.
     const anchoredCap = (cap, count) => Math.max(cap + roundExtensions,
-      ...grants.map(g => roundExtensionAnchor.value === 'grant'
+      // A standing-ruling (automatic) grant is ALWAYS anchored at the rounds spent when it was posted, whatever the
+      // setting: it answers one limit hit, so it must free a round NOW (max(base + grants, usedAtGrant + by)).
+      ...grants.map(g => (roundExtensionAnchor.value === 'grant' || g.standingRuling)
         ? count({ ...pr, comments: pr.comments.slice(0, g.index) }) + g.by : 0));
     const advisoryFixCapHere = anchoredCap(advisoryFixCap, p => countCompletedAdvisoryEpisodes(p.comments));
     const conflictFixCapHere = anchoredCap(conflictFixCap, p => countStaleConflictFixRounds(p.comments, {
@@ -2676,7 +2755,11 @@ export function planReconcile({
             ? 'ci-heal handed this head to a human, so one advisory AI review runs so the human gets its verdict; it never accepts a review:human PR'
             : 'review holds handed this head to review, so one advisory AI review supplies its verdict; it never accepts a review:human PR' } });
     };
-    const ciRepairOwed = phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red');
+    const bouncedRealRed = isBouncedRealRed({ pr, phase, check, requiredChecks });
+    // At the review-fix cap an unused operator-directed round still belongs to the existing fix path below.
+    // Routing it through CI healing would refuse at the cap before that path can carry the allowance.
+    const ciRepairOwed = phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red')
+      || (bouncedRealRed && !(sendBackRound && roundAttempts() >= effectiveRoundCap));
     if (!(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
         && reviewCi.affected.every(row => row.name === 'review-gate')) {
       refuse('review-ci', { ...withPhase, ci: reviewCi, why: 'required review-gate must succeed before review; resolve the review-dependent required-check configuration' });
@@ -3105,7 +3188,7 @@ export function planReconcile({
       // Live PR #4631 — only REQUIRED failures are healed or named as the failure; a non-required red (`merge-gate`,
       // red by design until #4715) is reported beside it, never healed. The budget is the heals since the PR's last
       // non-mechanical head ({@link ciHealBudgetResetAt}), not every heal it ever had.
-      if (fixTiming.joinCiAndReview && readiness.ciFailed && readiness.reviewFindings && roundAttempts() >= effectiveRoundCap) {
+      if ((bouncedRealRed || (fixTiming.joinCiAndReview && readiness.ciFailed && readiness.reviewFindings)) && roundAttempts() >= effectiveRoundCap) {
         refuseCapExhausted({ ...withPhase, attempts: roundAttempts(), cap: effectiveRoundCap, capKind: 'fix',
           why: 'joined CI/review repair cannot bypass the review-fix round cap' });
         continue;
@@ -3320,10 +3403,8 @@ export function planReconcile({
           // actually runs, `review-pr.mjs`'s `advise` step posts a FRESH advisory note against the CURRENT head
           // unconditionally — which flips `advisoryCoversHead` back to `true` for the next tick, so this path
           // fires AT MOST ONCE per head movement. #2588's own one-review-per-head guard sits ahead of the
-          // ordinary `OWED`-table review dispatch, never this one (this branch dispatches directly, exactly like
-          // the `addressed` branch below it already does) — but it needs no restating here: the SAME evidence
-          // that gates it (a reviewed-sha/advisory naming the current head) is exactly what `advisoryCoversHead`
-          // just proved absent, so the two can never contradict each other on the same PR.
+          // ordinary `OWED`-table review dispatch. This direct path still checks the shared human-clearance
+          // guard through `refuseUnreviewable`: a stale advisory cannot reopen an already human-cleared head.
           const headSha = typeof pr?.headRefOid === 'string' ? pr.headRefOid.trim().toLowerCase() : '';
           // #3383 / PR #2806 review: only a TRUSTED author's advisory counts — `latestAdvisory` itself does no
           // author check, and WE's PRs are public, so an unfiltered read would let any commenter forge a

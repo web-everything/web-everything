@@ -18,9 +18,17 @@ export function boundedText(path, maxBytes = 256 * 1024) {
   } finally { closeSync(fd); }
 }
 export const DEFAULT_HOST_MAX_WAIT_MS = 15 * 60 * 1000;
+export const DEFAULT_MIN_MEMORY_HEADROOM_MB = 2048;
 const leaves = {
   'host.maxWaitMs': [DEFAULT_HOST_MAX_WAIT_MS, 'WE_HOST_MAX_WAIT_MS', (v) => Number.isSafeInteger(v) && v >= 0],
   'host.maxLoadPerCore': [2, 'WE_HOST_MAX_LOAD_PER_CORE', (v) => Number.isFinite(v) && v > 0],
+  // verify-admission (2026-10-20) — memory-aware admission: free RAM (free + speculative + purgeable pages, NOT the
+  // inactive file cache) plus free swap must be at least this many MB before a new background heavy job starts.
+  // Live case: 616 MB free, swap 5.0/6.1 GB, ~30 review/verify processes. 0 is invalid: the check cannot be switched off.
+  'host.minMemoryHeadroomMb': [DEFAULT_MIN_MEMORY_HEADROOM_MB, 'WE_HOST_MIN_MEMORY_HEADROOM_MB', (v) => Number.isFinite(v) && v > 0],
+  // At most this many NEW review sessions per review-daemon tick while the host admits, so memory is re-sampled
+  // between waves instead of one tick launching ten 600 MB review jobs at once. Owed reviews stay queued.
+  'host.maxReviewDispatchPerTick': [2, 'WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK', (v) => Number.isSafeInteger(v) && v >= 1],
   'lanes.transcripts.explicitScan': [true, 'WE_LANE_TRANSCRIPT_EXPLICIT_SCAN', (v) => typeof v === 'boolean'],
   'lanes.gc.schedule': [86400000, 'WE_LANES_GC_SCHEDULE_MS', (v) => Number.isSafeInteger(v) && v >= 60000],
 };

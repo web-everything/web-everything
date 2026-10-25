@@ -34,9 +34,10 @@ import {
 } from './git-transport-branch.mjs';
 import { parseVerdictLog, parseLedgerEvents, ledgerEventId, checkLedgerAppendRows } from './verdict-ledger.mjs';
 import { registerLedgerStore } from './verdict-ledger-store.mjs';
+import { LEDGER_DIR, ledgerGitPath } from './verdict-ledger-path.mjs';
 
 export const LEDGER_TRANSPORT_BRANCH = 'ops/review-requests';
-export const LEDGER_DIR = 'verdict-ledger';
+export { LEDGER_DIR, ledgerGitPath };
 export const DEFAULT_APPEND_ATTEMPTS = 5;
 /** The ONLY ref the ledger push path may write (operator decision 2026-10-08): never main, never a lane, never a force. */
 export const LEDGER_PUSH_REF = `refs/heads/${LEDGER_TRANSPORT_BRANCH}`;
@@ -109,11 +110,6 @@ export function sizedLedgerRun({ maxBytes = DEFAULT_LEDGER_READ_MAX_BYTES, sourc
 const loggedCaps = new Set();
 const defaultLog = (line) => { try { process.stderr.write(`${line}\n`); } catch { /* logging never fails a read */ } };
 
-/** Repo-relative path of one repo's ledger on the transport branch. Same slug rule as `verdictLedgerPath`. */
-export function ledgerGitPath(repo) {
-  const slug = String(repo ?? '').trim().replace(/[/\\\s\x00-\x1f]+/g, '-').replace(/^-+|-+$/g, '') || 'repo';
-  return `${LEDGER_DIR}/${slug}.jsonl`;
-}
 
 export class LedgerAppendExhaustedError extends Error {
   constructor({ repo, attempts, errors }) {

@@ -61,6 +61,7 @@ import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { writeLineSync } from './lib/write-all-sync.mjs';
 import { CONSTELLATION_REPOS, repoKeyForDir, siblingKeys } from './lib/constellation-repos.mjs';
+import { readGitIdentity, identityVerdict, resolveGitIdentityPlaceholders, GIT_IDENTITY_FIX_HINT, invokedAsScript } from './lib/git-identity.mjs';
 
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -835,6 +836,24 @@ function describe(step) {
 }
 
 /**
+ * The `git-identity` step: `drift` when the effective author/committer is a placeholder (`test`, `*@example.com`, …)
+ * or missing, `ok` otherwise. Never throws; an absent reader (a partial io bag) is `skipped`.
+ * @returns {{id:'git-identity', status:'ok'|'drift'|'skipped', detail:string}}
+ */
+export function gitIdentityStatus({ read, env = process.env, lists } = {}) {
+  const id = 'git-identity';
+  if (typeof read !== 'function') return { id, status: 'skipped', detail: 'no identity reader' };
+  try {
+    const v = identityVerdict(read(), lists ?? resolveGitIdentityPlaceholders({ env }));
+    return v.status === 'ok'
+      ? { id, status: 'ok', detail: v.detail }
+      : { id, status: 'drift', detail: `${v.status.toUpperCase()} — ${v.detail} — ${GIT_IDENTITY_FIX_HINT}` };
+  } catch (e) {
+    return { id, status: 'drift', detail: `could not read the git identity (${e?.message ?? e})` };
+  }
+}
+
+/**
  * May this run write OUTSIDE the repository — into the machine-global `$HOME/.claude` tree? PURE.
  *
  * The first cut always could, and the committed project SessionStart hook made that automatic: opening this
@@ -891,6 +910,7 @@ export function gitDirStatus({ gitDir, settings, write, dryRun = false } = {}) {
 export function defaultIo() {
   return {
     readSettings, writeSettings, readTrust, writeTrust, installHook, uninstallHook, runSkills,
+    readGitIdentity: () => readGitIdentity(REPO_ROOT),
     exists: existsSync,
     symlink: (target, path) => symlinkSync(target, path, 'dir'),
     env: process.env,
@@ -1001,6 +1021,11 @@ export function main(argv, io = defaultIo()) {
     ? { id: 'style', status: 'drift', detail: unreadableConfig(SETTINGS_PATH) }
     : outputStyleStatus({ settings: styleSettings, write, dryRun: has('--dry-run'), apply: io.writeSettings }));
 
+  // The git author every commit from this checkout would carry. REPORT-ONLY, never a write: the identity is the
+  // operator's own config. In `report.steps` so `--check`'s drift gate sees it (the 2026-10-05..20 "test" author
+  // incident went unnoticed for two weeks precisely because no surface looked).
+  report.steps.push(gitIdentityStatus({ read: io.readGitIdentity, env: io.env }));
+
   // The user-level SessionStart registration is the most invasive thing here — it makes this script run in
   // repos that never asked for it — so it is the one effect that NEVER happens implicitly on a durable host.
   if (write) report.hook = io.installHook();
@@ -1021,4 +1046,6 @@ export function main(argv, io = defaultIo()) {
 }
 
 // `process.exitCode =`, not `process.exit()` — #3061's exit-wraps-call shape discards the callee's flush.
-if (import.meta.url === `file://${process.argv[1]}`) process.exitCode = main(process.argv.slice(2));
+// Shared canonical comparison: the raw `file://${argv[1]}` template skipped main (and its git-identity report) for a
+// checkout path with a space or a symlink.
+if (invokedAsScript(process.argv[1], import.meta.url)) process.exitCode = main(process.argv.slice(2));

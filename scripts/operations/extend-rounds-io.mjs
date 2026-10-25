@@ -3,6 +3,23 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { countGrantedRoundExtensions } from '../conveyor/round-extension-mark.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import { ROUND_EXTENSION_POST_EFFECT, planRoundExtension } from './extend-rounds.mjs';
+import { spawnSync } from 'node:child_process';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+/**
+ * Re-run the red-team gate on this PR right after a proven grant. The gate runs only after a red-team pass otherwise,
+ * so a break it parked at the round cap would stay parked although the operator just granted the round. The gate
+ * decides under its own rules (the grant must cover the current round); this only asks it to look again.
+ */
+export function runRedTeamGateForPr({ repo, pr, root = REPO_ROOT, env = process.env }) {
+  const r = spawnSync(process.execPath, [join(root, 'scripts', 'operations', 'red-team-gate-apply.mjs'), `--pr=${pr}`, `--repo=${repo}`],
+    { cwd: root, env, encoding: 'utf8', timeout: 10 * 60 * 1000 });
+  const last = String(r.stdout ?? '').trim().split('\n').pop() ?? '';
+  try { return JSON.parse(last); } catch { return { status: 'error', reason: `red-team gate exit ${r.status}, no result` }; }
+}
 
 const gh = (args, throttle) => execFileSyncThrottled('gh', args, {
   encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, maxBuffer: 64 * 1024 * 1024,
@@ -28,6 +45,7 @@ export function createExtendRoundsSinks({
   readThread = readExtensionThread,
   post = (repo, pr, body) => gh(['pr', 'comment', String(pr), '--repo', repo, '--body', body]),
   readViewerLogin: viewerLogin = readViewerLogin,
+  regate = null,
 } = {}) {
   return {
     [ROUND_EXTENSION_POST_EFFECT]: async ({ record, body }) => {
@@ -48,7 +66,12 @@ export function createExtendRoundsSinks({
         || !after.comments.some((c) => c.body === body && countGrantedRoundExtensions([c], { repo, pr }) === by)) {
         throw new Error('could not prove the posted round extension increased the trusted grant count');
       }
-      return { granted: by, total: count + by };
+      // The grant is posted and proven; a gate that cannot re-run is reported, never an undone grant.
+      let redTeamGate = null;
+      if (typeof regate === 'function') {
+        try { redTeamGate = await regate({ repo, pr }); } catch (e) { redTeamGate = { status: 'error', reason: String(e?.message ?? e).slice(0, 300) }; }
+      }
+      return { granted: by, total: count + by, ...(redTeamGate ? { redTeamGate } : {}) };
     },
   };
 }

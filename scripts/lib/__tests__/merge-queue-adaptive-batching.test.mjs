@@ -93,7 +93,7 @@ describe('batching settings', () => {
     expect(resolveBatchingSettings({ env: { VITEST: 'true' }, platform: {} })).toMatchObject(STANDARD_BATCHING_SETTINGS);
     expect(resolveBatchingSettings({ env: { WE_UNDER_TEST: '1' }, platform: {} })).toMatchObject(STANDARD_BATCHING_SETTINGS);
     const declared = JSON.parse(readFileSync(new URL('../../settings/merge-queue-batching.json', import.meta.url), 'utf8'));
-    expect(declared.mergeQueueBatching).toEqual({ enabled: true, groupSize: 3, maxGroupsInFlight: 5 });
+    expect(declared.mergeQueueBatching).toEqual({ enabled: true, groupSize: 3, maxGroupsInFlight: 8 });
     expect(resolveBatchingSettings({ env: {}, settings: declared, platform: {} }).sources.enabled).toBe('repo');
     expect(batchingStatePath({ WE_COORDINATION_ROOT: 'batching-test' })).toBe(join(resolve('batching-test'), 'drain-merge-queue-batching.json'));
   });

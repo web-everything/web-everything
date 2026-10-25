@@ -50,6 +50,13 @@ export const REPO_SCAN_TESTS = Object.freeze([
     inputs: ['scripts/operations/__tests__/health-watch-lane-scan-boundary.test.mjs'],
   },
   {
+    test: 'scripts/lib/__tests__/lane-git-diet.test.mjs',
+    scope: 'files',
+    why: 'every script naming an ops/* ref is a listed by-name reader or a known non-reader (lane fetches exclude ops/*)',
+    matches: (f) => /\.mjs$/.test(f) && !skipped(f) && !/\.test\./.test(f) && inTree(f, ['scripts']),
+    inputs: ['scripts/lib/lane-git-diet.mjs', 'scripts/lib/__tests__/lane-git-diet.test.mjs'],
+  },
+  {
     test: 'scripts/conveyor/__tests__/pr-label-mirror.test.mjs',
     scope: 'full',
     why: 'enforces the ruling-needed reference allowlist: mirror reconciliation, verdict-swap removal, and readers',

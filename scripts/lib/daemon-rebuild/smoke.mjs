@@ -729,7 +729,11 @@ export async function smokeAndAdopt({
       });
       const failedNames = failedA.map((r) => r.name).join(',');
       let failed = planA2.reason ?? 'not planned';
-      if (planA2.ok) {
+      // x9diisp — setting the culprits aside must never also lose an overlay the running build carries (e.g. one a
+      // culprit's change had let apply in the retry pass): such a fallback is refused like prepare refuses it.
+      if (planA2.ok && planA2.establishedLost?.length > 0) {
+        failed = `established-overlay-conflict: ${planA2.establishedLost.map((l) => l.ref).join(', ')}`;
+      } else if (planA2.ok) {
         alert('overlay-set-aside-attributed', {
           culprits: culprits.map(({ ref, pr, matched }) => ({ ref, pr, matched })),
           files, kept: kept.map((ap) => ap.ref), target: planA2.finalSha,
@@ -765,7 +769,10 @@ export async function smokeAndAdopt({
       git, headSha: prevHead, mainRef: 'origin/main', overlays: pinnedOverlays,
       edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
     });
-    if (planB.ok) {
+    // x9diisp/overlay-pin — like planA2, plain main must never lose an overlay the running build carries (e.g. a
+    // pinned head that only merged thanks to a suspect it now leaves out): refused as unplannable instead.
+    const bLost = planB.ok && planB.establishedLost?.length > 0;
+    if (planB.ok && !bLost) {
       const suspectInfo = suspects.map((ap) => ({ ref: ap.ref, pr: ap.pr }));
       alert('fallback-plain-main', {
         failed: failedA.map((r) => r.name).join(','), suspects: suspectInfo, target: planB.finalSha,
@@ -835,7 +842,9 @@ export async function smokeAndAdopt({
         return { moved: false, reason: 'smoke-env-load', plan, alerts: [...prepAlerts, ...alertsList] };
       }
     } else {
-      alert('fallback-plain-main-unplannable', { reason: planB.reason });
+      alert('fallback-plain-main-unplannable', {
+        reason: bLost ? `established-overlay-conflict: ${planB.establishedLost.map((l) => l.ref).join(', ')}` : planB.reason,
+      });
     }
   }
 

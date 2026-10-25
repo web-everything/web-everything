@@ -1,3 +1,4 @@
+import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { applyTestsFirstPolicy } from '../lib/tests-first-policy.mjs';
 import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
 import { resolveClaudeHelperRoute } from '../lib/claude-helper-route.mjs';
@@ -104,7 +105,8 @@ import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 // #3637 — the POC-branch registry, so an item's `deliveryTarget:` resolves against DECLARED branches only.
 import { readRegistry as readPocRegistry, validateDeliveryTarget } from '../lib/poc-branches.mjs';
 import { briefTokensForRepo, repoKeyForScope, deliveryLocusForScope } from '../lib/repo-profile.mjs';
-import { buildGhShimSettingsEnv, sanitizeSpawnEnv, ensureSettingsFilePermissions } from '../lib/gh-app-shim.mjs';
+import { buildGhShimSettingsEnv, sanitizeSpawnEnv, ensureSettingsFilePermissions, isDaemonCaller } from '../lib/gh-app-shim.mjs';
+import { isGithubAppAuthGuardError } from '../lib/github-app-auth-env.mjs';
 // #x9fbg1x — turns OFF Claude Code's own background-session worktree-isolation guard for THIS dispatch's
 // scratch cwd only (never the primary checkout, never a lane clone shared across dispatches) — see that
 // module's own header for the full incident (fix-2748/fix-2770, 2026-09-26) and why the repo-wide tracked
@@ -593,7 +595,9 @@ export function readTick({
     dispatchedGuard,
     item,
     groupItems,
-    briefTemplate: composeOperatorTaskBrief(applyTestsFirstPolicy(String(readText(briefPath(root, launchKind)))), item ?? {}, { ...operatorOptions, steps: operatorSteps }),
+    briefTemplate: composeOperatorTaskBrief(['build', 'fix', 'ci-heal'].includes(launchKind)
+      ? appendBuildRequirements(applyTestsFirstPolicy(String(readText(briefPath(root, launchKind)))), { policy: resolveBuildPolicy({ log: line => console.error(line) }) })
+      : applyTestsFirstPolicy(String(readText(briefPath(root, launchKind)))), item ?? {}, { ...operatorOptions, steps: operatorSteps }),
     // Derived from the card record, never from prompt text: shapeDispatchRead reads this, not the filled prompt.
     operatorPostBuild: operatorSteps.length > 0,
     nextState,
@@ -1534,6 +1538,11 @@ export function createDispatchSinks({
   // (`isolateDispatchSession`); the two seams stay so existing tests can assert each half independently.
   resolveWorktreeIsolation = () => DISPATCH_WORKTREE_SETTINGS.worktree,
   ensureWorktreeIsolation = (cwd) => isolateDispatchSession(cwd).write,
+  // ci-heal-worker-role — an EXPLICIT env this dispatch's session reads its identity from (the durable settings
+  // file + `--settings` env, the `claude --bg` spawn env, the worker-wrapper env), instead of this process's own.
+  // A read-only dispatcher (health-watch is `observer`) passes `{ ...process.env, WE_GITHUB_APP_ROLE: 'worker' }`
+  // for a session that must write; process.env itself is never touched. `null` keeps every path byte-identical.
+  spawnEnv = null,
 } = {}) {
   return {
     // #4349 — `ctx` (`{key, runId, ...}`, from `effect-executor.mjs#applyPendingEffects`'s per-sink call) was
@@ -1628,7 +1637,8 @@ export function createDispatchSinks({
           // session ACTUALLY starts in now, not `root`'s. Writing it to `root` would (a) no longer be where the
           // session looks for it, and (b) be one more write into the dispatching checkout this whole card exists
           // to stop.
-          settingsEnv: resolveSettingsEnv(sessionCwd),
+          settingsEnv: spawnEnv ? resolveSettingsEnv(sessionCwd, { env: spawnEnv }) : resolveSettingsEnv(sessionCwd),
+          ...(spawnEnv ? { spawnEnv } : {}),
           // #x9fbg1x — folds `{"worktree":{"bgIsolation":"none"}}` into the SAME `--settings` argument, and
           // (via `ensureWorktreeIsolation` above) the same durable settings.local.json this dispatch's cwd
           // already carries the gh-shim env/lane-grant overrides in.
@@ -1981,14 +1991,14 @@ export function defaultClaudeProvider(request, {
   const kind = String(request.launchKind || 'build');
   if (wrapKind(kind)) {
     const launched = launchWrapped({
-      role: kind, session: request.sessionSlug, bgArgv: argv, cwd: request.cwd, env: workerSpawnEnv(), pr: request.pr ?? null,
+      role: kind, session: request.sessionSlug, bgArgv: argv, cwd: request.cwd, env: workerSpawnEnv(request.spawnEnv ?? process.env), pr: request.pr ?? null,
       item: request.num ?? null, model: launchedModel, sessionId: request.sessionId,
     });
     request.reportWrapped?.(launched.wrapperPid);
     // `pid:<wrapper>` is the detached-handle shape the run store and liveness already read (route `detached`).
     return launched.handle || request.sessionId;
   }
-  const stdout = String(spawnAgent(argv, { cwd: request.cwd }) ?? '');
+  const stdout = String(spawnAgent(argv, request.spawnEnv ? { cwd: request.cwd, env: request.spawnEnv } : { cwd: request.cwd }) ?? '');
   return parseBackgroundedId(stdout) || request.sessionId;
 }
 
@@ -2142,11 +2152,12 @@ export const DISPATCHED_AGENT_SYSTEM_PROMPT_FILE = join(dirname(fileURLToPath(im
  */
 /**
  * #x8mpubm — THE ONE PLACE a dispatch resolves whether (and how) to route a dispatched session's own `gh`
- * calls through the App-token shim (`we:scripts/lib/gh-app-shim.mjs`). NEVER throws: any failure (no real
- * `gh` on `PATH`, App auth not configured on this host, a read-only shim dir) resolves to `null`, meaning the
- * caller omits `--settings` entirely and the dispatch proceeds exactly as it would have before this existed.
- * A thin wrapper, not re-exported logic — `gh-app-shim.mjs` owns every real decision; this only guarantees
- * the "never blocks a dispatch" contract every sink in this file already holds itself to.
+ * calls through the App-token shim (`we:scripts/lib/gh-app-shim.mjs`). For an INTERACTIVE caller it never
+ * throws: any failure (no real `gh` on `PATH`, App auth not configured on this host, a read-only shim dir)
+ * resolves to `null`, meaning the caller omits `--settings` entirely and the dispatch proceeds as before.
+ * A DAEMON caller (PR #5729) re-throws the shim's refusal, so the dispatch fails closed before the provider
+ * runs — a daemon session without the refusal guard would fall back to personal gh auth.
+ * A thin wrapper, not re-exported logic — `gh-app-shim.mjs` owns every real decision.
  *
  * `cwd` (#x8mpubm follow-up, live-caught 2026-09-24) — the checkout the dispatched session actually starts
  * in (`createDispatchSinks`' own `root`). Forwarded to `buildGhShimSettingsEnv` so it can ALSO write the same
@@ -2156,8 +2167,16 @@ export const DISPATCHED_AGENT_SYSTEM_PROMPT_FILE = join(dirname(fileURLToPath(im
  * @param {string} [cwd]
  * @returns {Record<string,string>|null}
  */
-export function resolveGhShimSettingsEnv(cwd) {
-  try { return buildGhShimSettingsEnv({ cwd }); } catch { return null; }
+export function resolveGhShimSettingsEnv(cwd, { env } = {}) {
+  try { return buildGhShimSettingsEnv(env ? { cwd, env } : { cwd }); } catch (e) {
+    // PR #5729 — except for a daemon: its refusal guard is the auth boundary, so the dispatch fails closed
+    // instead of starting a session without the shim. `notApplied`: nothing was started, so the executor records
+    // a retryable failure, never an UNKNOWN in-flight entry. Fail-soft stays for interactive callers.
+    if (isGithubAppAuthGuardError(e) || isDaemonCaller(process.env) || (env && isDaemonCaller(env))) {
+      throw notApplied(`dispatch refused: ${String(e?.message || e)}`);
+    }
+    return null;
+  }
 }
 
 /**
@@ -2172,9 +2191,9 @@ export function resolveGhShimSettingsEnv(cwd) {
 export const DISPATCH_BASH_TIMEOUT_ENV = Object.freeze({ BASH_DEFAULT_TIMEOUT_MS: '600000', BASH_MAX_TIMEOUT_MS: '600000' });
 
 /** The dispatched session's `--settings` env: the gh-App shim override (when this host opted in) plus the
- *  #x36vidg Bash timeouts (always). Never throws. */
-export function resolveDispatchSettingsEnv(cwd) {
-  return { ...(resolveGhShimSettingsEnv(cwd) || {}), ...DISPATCH_BASH_TIMEOUT_ENV };
+ *  #x36vidg Bash timeouts (always). Throws only a daemon's gh-guard refusal (see resolveGhShimSettingsEnv). */
+export function resolveDispatchSettingsEnv(cwd, opts) {
+  return { ...(resolveGhShimSettingsEnv(cwd, opts) || {}), ...DISPATCH_BASH_TIMEOUT_ENV };
 }
 
 /** Test/override hook for {@link dispatchSessionCwd} — mirrors `explore-io.mjs`'s `REPORT_DIR_ENV`. */

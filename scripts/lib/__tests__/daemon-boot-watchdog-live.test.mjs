@@ -20,6 +20,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { keepAliveScript } from '../test-keepalive.mjs';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { readBootState, runSupervisedStart } from '../daemon-boot-watchdog.mjs';
@@ -51,7 +52,7 @@ describe('daemon-boot-watchdog — live scratch-clone proof (real process, real 
 
   it('crash-loops on a broken overlay, then reverts to the last boot-confirmed commit before the next start, then self-heals', async () => {
     // Commit A — "good": stays alive past the survival window.
-    writeFileSync(join(root, 'entry.mjs'), 'setInterval(() => {}, 1000);\n');
+    writeFileSync(join(root, 'entry.mjs'), `${keepAliveScript()}\n`);
     git(['add', 'entry.mjs'], root);
     git(['commit', '-q', '-m', 'good'], root);
     const shaGood = headSha(root);
@@ -125,7 +126,7 @@ describe('daemon-boot-watchdog — CLI (real `node` invocation of main())', () =
     // The CLI's own JSON output never carries a killable child handle (by design — see `main()`'s own
     // `replacer`), so this entry self-exits shortly after clearing the survival window instead of leaking a
     // real detached `node` process past the end of this test.
-    writeFileSync(join(clone, 'entry.mjs'), 'setInterval(() => {}, 1000);\nsetTimeout(() => process.exit(0), 1200);\n');
+    writeFileSync(join(clone, 'entry.mjs'), `${keepAliveScript({ postlude: 'setTimeout(() => process.exit(0), 1200);' })}\n`);
     const out = execFileSync(process.execPath, [CLI, '--entry=entry.mjs', `--clone=${clone}`], {
       encoding: 'utf8', env: { ...process.env, WE_DAEMON_STATE_DIR: stateDir, WE_DAEMON_BOOT_SURVIVAL_MS: '300' },
     });

@@ -93,6 +93,11 @@
  *      remains the DEFAULT (see `DEFAULT_DELIVERY_AGENT_PROVIDER_NAME`); Codex is opt-in by name, and the
  *      operator chose to build it ahead of `#3581`'s ratified reviewer-first sequencing gate knowingly.
  */
+import { resolveBuildPolicy, appendBuildRequirements } from '../lib/build-policy.mjs';
+import {
+  runBuildSelfReview, renderSelfReviewNotes, reviewBuildDiff, boundedSelfReviewDiff, selfReviewDiffArgs, SELF_REVIEW_MAX_DIFF_BYTES,
+} from '../lib/build-self-review.mjs';
+import { laneGitHardeningEnv, laneGitConfigArgs, hardenLaneGitArgs } from '../lib/lane-git-hardening.mjs';
 import { resolveCodexTaskRoute } from '../lib/codex-task-route.mjs';
 import { machinePrTitle, readMainCard } from './machine-pr-title.mjs';
 import { sanitizeHoldReason } from './build-dispatch-hold-route-land.mjs';
@@ -325,7 +330,7 @@ export const ensureDeliveryHooksSettingsFile = createHooksSettingsWriter(
  *   used rather than minting a second one. `newSessionId` is injectable only so a test can assert on a
  *   deterministic value instead of a fresh random UUID every run.
  */
-export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER, { newSessionId = randomUUID } = {}) {
+export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER, { newSessionId = randomUUID, reviewBuild = reviewBuildDiff } = {}) {
   // `runId`/`effectKey` name this delivery's own run-store dispatch effect, threaded through from the daemon's
   // dispatch sink. Either absent — an older dispatch, a hand-built test launch, a resumed dispatch that
   // predates this — and `settleTerminal` below just skips the run-store settle; it still releases/holds the
@@ -598,8 +603,38 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
     // `provider` threaded through (mechanical-dispatcher follow-up to #3580) — see `runConvergeEdit`'s own
     // docblock ("VISIBILITY fix") for why this does not make Codex the converge editor; it only makes the
     // requested build provider visible to, and recorded by, the round that runs regardless.
-    const convergeVerdict = spanAround('converge.round', { attributes: { item: String(item), buildProvider: provider.name } },
-      () => runConverge({ lane: gate.lanePath, item }, { provider }));
+    const buildPolicy = resolveBuildPolicy({ log: line => console.error(line) });
+    const selfReview = await runBuildSelfReview({
+      policy: buildPolicy, dir: gate.lanePath,
+      // Hardened and bounded: the builder controls this lane's git config, and an overflow is the size note.
+      // Commit against commit, so no worktree clean filter runs.
+      readDiff: () => boundedSelfReviewDiff(() => run('git', selfReviewDiffArgs('origin/main...HEAD'),
+        { cwd: gate.lanePath, env: laneGitHardeningEnv(), maxBuffer: SELF_REVIEW_MAX_DIFF_BYTES + 1 })),
+      review: reviewBuild,
+      fix: async prompt => {
+        const resumed = await provider.spawn({ sessionId: claudeSessionId, resumeSessionId: claudeSessionId,
+          prompt: appendBuildRequirements(prompt, { policy: buildPolicy, selfReview: false }),
+          lane, sessionSlug, item, attemptTag, lanePathOverride: implLanePath });
+        const updated = resumed?.envelope ? buildReportFromEnvelope(resumed, sessionSlug)
+          : tryReadDeliveryReport(sessionSlug, resolveDeliveryReportsDir(gate.lanePath));
+        if (!updated || updated.status !== 'done' || !['done', 'needs-human-judgment'].includes(updated.outcome)) {
+          throw new Error('self-review builder did not complete its repair');
+        }
+        // The repair turn reports only what IT changed; keep every earlier turn's files so the park decision
+        // (statute / policy-core) and the PR body still see them. An earlier turn's needs-human-judgment is
+        // sticky too: a repair that reports `done` never clears the human park it asked for.
+        const judgment = report.outcome === 'needs-human-judgment' && updated.outcome !== 'needs-human-judgment'
+          ? { outcome: report.outcome, reason: report.reason } : {};
+        report = { ...updated, ...judgment, filesTouched: [...new Set([...(report.filesTouched ?? []), ...(updated.filesTouched ?? [])])] };
+        commitBuildTurn({ lane: gate.lanePath, item, provider, phase: 'self-review' });
+      },
+      gate: () => runVerifyOperation(gate.lanePath).outcome === 'pass',
+    });
+    report.selfReview = selfReview;
+    const convergeVerdict = buildPolicy.selfReview.enabled
+      ? { verdict: 'land', selfReview }
+      : spanAround('converge.round', { attributes: { item: String(item), buildProvider: provider.name } },
+        () => runConverge({ lane: gate.lanePath, item }, { provider }));
 
     // ---- 5. Map outcome + convergeVerdict + statute-touch to a park mode, via the EXISTING deterministic
     // rubric (`review-escalation.mjs`) — REAL import, SKETCH call (the real `scoreEscalation` signature takes
@@ -1595,7 +1630,7 @@ export async function runAgentToCompletion(
     resume = false,
   },
   {
-    readBrief = () => readFileSync(`${REPO_ROOT}/skills-src/conveyor/delivery-agent-brief-v2.md`, 'utf8'),
+    readBrief = () => appendBuildRequirements(readFileSync(`${REPO_ROOT}/skills-src/conveyor/delivery-agent-brief-v2.md`, 'utf8'), { selfReview: false }),
     readReport = tryReadDeliveryReport,
     resolveLane = resolveLanePath,
     resolveReportsDir = resolveDeliveryReportsDir,
@@ -1809,15 +1844,7 @@ async function resumeAgentWithGateFailure({
   // files in $LANE are correct"; `runGateWithOneRetry` commits this resumed turn's fix itself, the same
   // wrapper-owned way it already commits the original build (see `commitBuildTurn`'s own header for why —
   // this is the #3565 Codex sandbox finding applied as a structural fix, not a sandbox carve-out).
-  const prompt = gateOutcome === 'unrun'
-    ? `The verification gate could not RUN for your commit in $LANE (this looks like a wrapper/environment `
-      + `problem, not necessarily a problem in your own diff):\n\n${failureOutput}\n\nIf you can see something `
-      + `genuinely wrong in your own change, fix it in $LANE and send a fresh \`done\` report exactly as `
-      + `before — do NOT run \`git commit\` yourself; the wrapper commits your fix for you. If you cannot find `
-      + `anything wrong in your own diff, do not guess at a code change — send a report with `
-      + `\`outcome: 'blocked'\` and a precise \`reason\` describing what you observed instead.`
-    : `Your gate failed:\n\n${failureOutput}\n\nFix it in $LANE, then send a fresh \`done\` report exactly `
-      + `as before — do NOT run \`git commit\` yourself; the wrapper commits your fix for you.`;
+  const prompt = gateFailureResumePrompt({ failureOutput, gateOutcome });
   // BUG-5 FIX: both `sessionId` and `resumeSessionId` are `claudeSessionId` — the real UUID minted once in
   // `deliverItem` and reused by the fresh spawn — never `sessionSlug`. `--resume <id>` must name the SAME CLI
   // session the fresh spawn created, and that id must itself be a UUID (CLI-enforced).
@@ -1828,6 +1855,20 @@ async function resumeAgentWithGateFailure({
     sessionId: claudeSessionId, prompt, resumeSessionId: claudeSessionId, lane, sessionSlug, item, attemptTag,
     lanePathOverride,
   }); // AWAITS. Returned (not dropped): a wrapped provider hands back its v2 envelope for the resumed turn.
+}
+
+/** The resumed turn's prompt after a red or unrun gate (`resumeAgentWithGateFailure`), with the build requirements once. */
+export function gateFailureResumePrompt({ failureOutput, gateOutcome = 'fail' }) {
+  const prompt = gateOutcome === 'unrun'
+    ? `The verification gate could not RUN for your commit in $LANE (this looks like a wrapper/environment `
+      + `problem, not necessarily a problem in your own diff):\n\n${failureOutput}\n\nIf you can see something `
+      + `genuinely wrong in your own change, fix it in $LANE and send a fresh \`done\` report exactly as `
+      + `before — do NOT run \`git commit\` yourself; the wrapper commits your fix for you. If you cannot find `
+      + `anything wrong in your own diff, do not guess at a code change — send a report with `
+      + `\`outcome: 'blocked'\` and a precise \`reason\` describing what you observed instead.`
+    : `Your gate failed:\n\n${failureOutput}\n\nFix it in $LANE, then send a fresh \`done\` report exactly `
+      + `as before — do NOT run \`git commit\` yourself; the wrapper commits your fix for you.`;
+  return appendBuildRequirements(prompt, { selfReview: false });
 }
 
 // #xu2pp2m — `resolveLanePath` EXTRACTED to `./minimal-context-provider.mjs` (imported above), unchanged: the
@@ -2516,16 +2557,20 @@ export function runConverge(
  *  is testable without a real git checkout. Fails soft to an empty/zero reading — a wrapper-side git failure
  *  here must not crash the whole delivery; it just means `scoreEscalation` sees no size/blast-radius signal,
  *  which is the safe direction for a signal that only ever ADDS review capacity, never blocks (#3320). */
-export function computeLaneDiffStats(lanePath, { run: runFn = run, baseRef = 'origin/main' } = {}) {
+export function computeLaneDiffStats(lanePath, { run: runFn = run, baseRef = 'origin/main', strict = false } = {}) {
   try {
-    const mergeBase = runFn('git', ['-C', lanePath, 'merge-base', 'HEAD', baseRef]).trim();
-    const numstat = runFn('git', ['-C', lanePath, 'diff', '--numstat', mergeBase]);
+    // Hardened (the builder controls this lane's git config), commit against commit (no worktree filter runs),
+    // `--no-renames` so a moved file lists both its old and new path, never a `{a => b}` form, and `-z` so a
+    // path with non-ASCII, quote or control bytes comes back raw, never C-quoted past the statute matcher.
+    const opts = { env: laneGitHardeningEnv() };
+    const mergeBase = runFn('git', ['-C', lanePath, ...laneGitConfigArgs(), '--no-replace-objects', 'merge-base', 'HEAD', baseRef], opts).trim();
+    const numstat = runFn('git', ['-C', lanePath, ...laneGitConfigArgs(), '--no-replace-objects',
+      ...hardenLaneGitArgs(['diff', '--numstat', '-z', '--no-renames', mergeBase, 'HEAD', '--'])], opts);
     const changedFiles = [];
     let diffLines = 0;
-    for (const line of numstat.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      const [add, del, ...pathParts] = trimmed.split('\t');
+    for (const record of numstat.split('\0')) {
+      if (!record.trim()) continue;
+      const [add, del, ...pathParts] = record.split('\t');
       const path = pathParts.join('\t');
       if (path) changedFiles.push(path);
       const a = Number(add);
@@ -2534,7 +2579,8 @@ export function computeLaneDiffStats(lanePath, { run: runFn = run, baseRef = 'or
       if (Number.isFinite(d)) diffLines += d;
     }
     return { changedFiles, diffLines };
-  } catch {
+  } catch (e) {
+    if (strict) throw e;
     return { changedFiles: [], diffLines: 0 };
   }
 }
@@ -2561,13 +2607,21 @@ export function computeLaneDiffStats(lanePath, { run: runFn = run, baseRef = 'or
  * so every existing caller (every test that does not pass it) is byte-identical — this is additive-only.
  */
 export function decideParkMode({ report, convergeVerdict, filesTouched, lanePath, crossRepo = false, executedVendor = 'claude' }, { run: runFn = run } = {}) {
-  const touchesStatute = (filesTouched || []).some((f) => isStatutePath(f) || isPolicyCorePath(f));
+  // The statute check reads the lane's net diff too: an agent's self-reported file list can omit a path. An
+  // unreadable diff cannot clear that check, so it fails closed to human review.
+  let diffStats = { changedFiles: filesTouched || [], diffLines: 0 };
+  if (lanePath) {
+    try { diffStats = computeLaneDiffStats(lanePath, { run: runFn, strict: true }); }
+    catch { return { mode: 'park', label: 'review:human', reason: 'lane net diff unreadable; the statute/policy-core check cannot clear' }; }
+  }
+  const touchesStatute = [...(filesTouched || []), ...diffStats.changedFiles].some((f) => isStatutePath(f) || isPolicyCorePath(f));
   if (touchesStatute) return { mode: 'park', label: 'review:human', reason: 'statute/policy-core path touched' };
   if (report.outcome === 'needs-human-judgment') return { mode: 'park', label: 'review:human', reason: report.reason };
   if (convergeVerdict.verdict === 'escalate') return { mode: 'park', label: 'review:human', reason: convergeVerdict.reason };
+  // An incomplete self-check (the diff was over its size bound) read nothing, so its own note's human review applies.
+  if (convergeVerdict.selfReview?.incomplete) return { mode: 'park', label: 'review:human', reason: 'self-review incomplete; human review of the full diff is required' };
 
   const dismissedFindings = Array.isArray(convergeVerdict.dismissed) ? convergeVerdict.dismissed.length : 0;
-  const diffStats = lanePath ? computeLaneDiffStats(lanePath, { run: runFn }) : { changedFiles: filesTouched || [], diffLines: 0 };
   const score = scoreEscalation({
     changedFiles: diffStats.changedFiles, diffLines: diffStats.diffLines, dismissedFindings, crossRepo,
   });
@@ -2575,6 +2629,8 @@ export function decideParkMode({ report, convergeVerdict, filesTouched, lanePath
   if (scoreLabel) {
     return { mode: 'park', label: scoreLabel, reason: `scoreEscalation: ${score.reasons.join('; ') || 'escalated'}`, score };
   }
+  // The self-check replaces only the label-on-green fallthrough, never a stricter label the score asked for.
+  if (convergeVerdict.selfReview) return { mode: 'park', label: 'review:pending', reason: 'pre-review self-check complete; independent review required', score };
   if (executedVendor !== 'claude') {
     return {
       mode: 'park',
@@ -2622,7 +2678,7 @@ export function buildPrBody({ item, report, delegation = null, groupMembers = []
     + groupDropped.map((num) => `\nDropped from group: #${num} — ${sanitizeGroupDropReason(groupDropReasons[num])}`).join('');
   return `## #${item}\n\n${summary}${filesLine}${groupBody}\n\n---\nDelivered by the #3627 minimal delivery-agent pipeline `
     + '(the mechanical wrapper drove review/gate/PR — the agent only built and reported).\n'
-    + (marker ? `${marker}\n` : '');
+    + (marker ? `${marker}\n` : '') + renderSelfReviewNotes(report?.selfReview);
 }
 
 /**

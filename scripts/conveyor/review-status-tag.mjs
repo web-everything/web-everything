@@ -44,6 +44,7 @@ import { listAgentsWithReviewJobs } from '../operations/review-job-store.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 // The ONE `status:*` label (what the PR waits on) — written here, by the same owner, never a second writer (D5).
+import { observeRoundCap } from './round-judge-shadow.mjs';
 import { derivePrStatusLabel, planPrStatusLabel, PR_STATUS_DESCRIPTIONS } from './pr-status-label.mjs';
 
 /** Compatibility default while dispatch and hold readers still use review-status labels. */
@@ -309,6 +310,8 @@ export function tagReviewStatus({
       reviewStatus: status, rows: planRows, defaultBranch, requiredChecks, settings: prStatusSettings });
     const sp = planPrStatusLabel({ state, currentLabels });
     prStatus = state ? `status:${state}` : null;
+    // Shadow round judge: logs what it WOULD do at a round cap; never acts, never throws (round-judge-shadow.mjs).
+    observeRoundCap({ pr, repo, state, subject: statusSubject });
     if (sp.add || sp.remove.length) {
       if (sp.add) provider.ensureLabel(repo, sp.add, { color: 'fbca04', description: PR_STATUS_DESCRIPTIONS[state] ?? 'auto-managed PR status' });
       provider.setLabels(repo, pr, { add: sp.add ?? undefined, remove: sp.remove });

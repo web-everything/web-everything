@@ -509,7 +509,7 @@ describe('pr-merge-gate — retargetStackedPrs (#3383, the #2578 incident)', () 
     };
     const retargeted = [];
     const r = retargetStackedPrs({ headRef: 'lane/3681', defaultBranch: 'main', exec, onRetarget: (n) => retargeted.push(n) });
-    expect(r).toEqual({ retargeted: [2578, 2601], failed: [] });
+    expect(r).toEqual({ retargeted: [2578, 2601], failed: [], listed: true });
     expect(retargeted).toEqual([2578, 2601]);
     // The listing call comes first, then one `pr edit --base main` per stacked PR found.
     expect(calls[0].args).toEqual(['pr', 'list', '--state', 'open', '--base', 'lane/3681', '--json', 'number,baseRefName']);
@@ -519,13 +519,32 @@ describe('pr-merge-gate — retargetStackedPrs (#3383, the #2578 incident)', () 
 
   it('is a no-op when nothing is stacked on the branch (the common case)', () => {
     const exec = (cmd, args) => (args[1] === 'list' ? '[]' : '');
-    expect(retargetStackedPrs({ headRef: 'lane/solo', defaultBranch: 'main', exec })).toEqual({ retargeted: [], failed: [] });
+    expect(retargetStackedPrs({ headRef: 'lane/solo', defaultBranch: 'main', exec })).toEqual({ retargeted: [], failed: [], listed: true });
   });
 
   it('a listing failure never throws — best-effort, never blocks the merge that is about to happen', () => {
     const exec = () => { throw new Error('gh: rate limited'); };
     expect(() => retargetStackedPrs({ headRef: 'lane/x', defaultBranch: 'main', exec })).not.toThrow();
-    expect(retargetStackedPrs({ headRef: 'lane/x', defaultBranch: 'main', exec })).toEqual({ retargeted: [], failed: [] });
+    // xym8nt4 — but it says so: `listed:false` lets a caller that must not orphan a child (card-group source close) refuse.
+    expect(retargetStackedPrs({ headRef: 'lane/x', defaultBranch: 'main', exec })).toEqual({ retargeted: [], failed: [], listed: false });
+  });
+
+  it.each([['an object', '{}'], ['null', 'null'], ['a string', '"oops"'], ['unparseable text', '<html>']])(
+    'a listing that is %s is reported as not listed (xym8nt4)', (_, body) => {
+      const calls = [];
+      const exec = (cmd, args) => { calls.push(args); return args[1] === 'list' ? body : ''; };
+      expect(retargetStackedPrs({ headRef: 'lane/x', defaultBranch: 'main', exec })).toEqual({ retargeted: [], failed: [], listed: false });
+      expect(calls.filter(a => a[1] === 'edit')).toEqual([]);
+    });
+
+  it('a listing that may be truncated (gh default page of 30) or has a row without a number is not complete (xym8nt4)', () => {
+    const full = Array.from({ length: 30 }, (_, i) => ({ number: i + 1 }));
+    const execFull = (cmd, args) => (args[1] === 'list' ? JSON.stringify(full) : '');
+    const r = retargetStackedPrs({ headRef: 'lane/x', defaultBranch: 'main', exec: execFull });
+    expect(r.retargeted).toHaveLength(30); // still best-effort retargets what it saw
+    expect(r.listed).toBe(false);
+    const execBad = (cmd, args) => (args[1] === 'list' ? JSON.stringify([{ number: 1 }, { baseRefName: 'lane/x' }]) : '');
+    expect(retargetStackedPrs({ headRef: 'lane/x', defaultBranch: 'main', exec: execBad })).toEqual({ retargeted: [1], failed: [], listed: false });
   });
 
   it('one failed retarget is reported but does not stop the others — best-effort per PR', () => {
@@ -536,7 +555,7 @@ describe('pr-merge-gate — retargetStackedPrs (#3383, the #2578 incident)', () 
     };
     const failed = [];
     const r = retargetStackedPrs({ headRef: 'lane/x', defaultBranch: 'main', exec, onFailed: (n) => failed.push(n) });
-    expect(r).toEqual({ retargeted: [1, 3], failed: [2] });
+    expect(r).toEqual({ retargeted: [1, 3], failed: [2], listed: true });
     expect(failed).toEqual([2]);
   });
 });

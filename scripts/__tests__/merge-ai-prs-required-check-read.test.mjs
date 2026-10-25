@@ -1,3 +1,4 @@
+import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
@@ -157,7 +158,7 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
     join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'),
     '--this-repo', '--label=ready-to-merge', '--no-reconcile-labels', '--dry-run', '--json',
     '--no-drain-lease', '--no-red-main-freeze', '--no-rebase-drop', '--no-heal-collision', '--no-review-escalation', '--no-overlap-yield',
-  ], { cwd: root, encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}`,
+  ], { cwd: root, encoding: 'utf8', env: { ...process.env, ...daemonAppEnv(root), PATH: `${bin}:${process.env.PATH}`,
     LANE_POOL_ROOT: root, CHECK_PR: JSON.stringify({ ...pr(), files: [{ path: 'README.md', changeType: 'MODIFIED' }] }),
     CHECK_RUNS: JSON.stringify([run()]), CHECK_FAIL: fail ? '1' : '',
     CHECK_LIST_ARGV: join(root, 'list-argv.json'), WE_DRAIN_WORKFLOW_EDIT_HUMAN: workflowEditHuman,

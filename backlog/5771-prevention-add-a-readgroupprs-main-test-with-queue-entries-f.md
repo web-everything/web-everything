@@ -3,9 +3,10 @@ bornAs: x83w03z
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/lib/merge-gate-ci.mjs", "we:scripts/lib/__tests__/merge-gate-ci.test.mjs"]
 dateOpened: "2026-10-10"
+dateResolved: "2026-10-21"
 tags: []
 ---
 

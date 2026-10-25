@@ -22,31 +22,95 @@ export const LANE_GIT_CONFIG_PINS = Object.freeze([
   ['core.attributesFile', '/dev/null'],
   ['core.sshCommand', 'ssh'],
   ['commit.gpgsign', 'false'],
+  // PR #5775 self-review: `log.showSignature` makes every `git log` run `gpg.program` (lane-chosen) on a commit the
+  // agent gave a gpgsig header, and puts signature lines in output callers parse. A `--reference` lane has alternates,
+  // so a lane-set `core.alternateRefsCommand` runs on every fetch; `true` prints no refs (objects still resolve).
+  ['log.showSignature', 'false'],
+  ['gpg.program', 'gpg'],
+  ['gpg.ssh.program', 'ssh-keygen'],
+  ['gpg.x509.program', 'gpgsm'],
+  ['core.alternateRefsCommand', 'true'],
+]);
+
+// Remote proofs use a restricted transport policy. Ordinary hardened callers also fetch/clone
+// from local and HTTP origins, so changing their transport policy here would break those callers.
+const REMOTE_PROBE_CONFIG_PINS = Object.freeze([
+  ['protocol.allow', 'never'],
+  ['protocol.https.allow', 'always'],
+  ['protocol.http.allow', 'always'],
+  ['protocol.git.allow', 'always'],
+  ['protocol.ssh.allow', 'always'],
 ]);
 
 /** The pins as `-c k=v` argv pairs, for a caller that builds its own git command line. */
 export const laneGitConfigArgs = () => LANE_GIT_CONFIG_PINS.flatMap(([k, v]) => ['-c', `${k}=${v}`]);
 
-/** Inherited variables that choose WHICH config, repository or object store git reads. Inherited, none is trusted by a
- *  process that inspects an agent-writable lane: `GIT_CONFIG_GLOBAL` pointed at the lane's own config re-scopes its
- *  `filter.*` / redirect keys to "global", which {@link laneFilterDrivers} ignores. */
-const INHERITED_GIT_LOCATION_VARS = Object.freeze(['GIT_CONFIG', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_PARAMETERS',
-  'GIT_CONFIG_COUNT', 'GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
-  'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_REPLACE_REF_BASE', 'GIT_ATTR_SOURCE', 'GIT_GRAFT_FILE']);
+/** Inherited git env that moves where git reads or writes the repository (its dir, work tree, index, objects, refs,
+ *  `git config` file) or changes what is reachable (a shallow or graft file hides history; `GIT_REF_PARANOIA=0` lets
+ *  gc/prune skip a broken ref's objects). */
+export const GIT_REPO_LOCATION_ENV_KEYS = Object.freeze(['GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE',
+  'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES',
+  'GIT_DISCOVERY_ACROSS_FILESYSTEM', 'GIT_CONFIG', 'GIT_SHALLOW_FILE', 'GIT_GRAFT_FILE', 'GIT_QUARANTINE_PATH',
+  'GIT_REF_PARANOIA', 'GIT_REFERENCE_BACKEND', 'GIT_REPLACE_REF_BASE', 'GIT_ATTR_SOURCE']);
+/** {@link GIT_REPO_LOCATION_ENV_KEYS} plus every env source of config from outside the repository. */
+export const GIT_REPO_ENV_KEYS = Object.freeze([...GIT_REPO_LOCATION_ENV_KEYS, 'GIT_CONFIG_PARAMETERS',
+  'GIT_CONFIG_COUNT', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM']);
 const INHERITED_GIT_INDEXED_CONFIG_RE = /^GIT_CONFIG_(KEY|VALUE)_.*$/s;
 
 /**
  * A copy of `env` with every inherited git config override and repository-location variable removed, including orphaned
- * or malformed `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*` entries. Run it BEFORE {@link laneGitHardeningEnv} so the pins are
- * the only command-scope config. Pure.
+ * or malformed `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*` entries. `GIT_CONFIG_GLOBAL` pointed at the lane's own config
+ * re-scopes its `filter.*` / redirect keys to "global", which {@link laneFilterDrivers} ignores. Run this BEFORE
+ * {@link laneGitHardeningEnv} so the pins are the only command-scope config. Pure.
  * @param {Record<string,string|undefined>} env
  * @returns {Record<string,string|undefined>}
  */
 export function scrubInheritedGitEnv(env = process.env) {
   const out = { ...env };
   for (const key of Object.keys(out)) {
-    if (INHERITED_GIT_LOCATION_VARS.includes(key) || INHERITED_GIT_INDEXED_CONFIG_RE.test(key)) delete out[key];
+    if (GIT_REPO_ENV_KEYS.includes(key) || INHERITED_GIT_INDEXED_CONFIG_RE.test(key)) delete out[key];
   }
+  return out;
+}
+
+/**
+ * A copy of `env` without {@link GIT_REPO_LOCATION_ENV_KEYS}, with `GIT_REF_PARANOIA=1` (a broken ref aborts instead
+ * of being skipped). For every git call in a lane: an inherited GIT_DIR / GIT_REFERENCE_BACKEND would send its writes
+ * into another repository. Env config (the test suite's hermetic global config, say) is kept.
+ * @param {Record<string,string|undefined>} env
+ * @returns {Record<string,string|undefined>}
+ */
+export function scrubGitLocationEnv(env) {
+  const out = { ...env };
+  for (const key of GIT_REPO_LOCATION_ENV_KEYS) delete out[key];
+  out.GIT_REF_PARANOIA = '1';
+  return out;
+}
+
+/**
+ * Deletes {@link GIT_REPO_LOCATION_ENV_KEYS} from `env` IN PLACE — for `process.env` of a lane CLI, so the git a
+ * library spawns from `process.env` (status proofs, history snapshots, salvage refs) is not redirected either. An
+ * inherited `GIT_REF_PARANOIA=0` is dropped back to git's default; callers that want `1` use {@link scrubGitLocationEnv}.
+ * @param {Record<string,string|undefined>} env
+ * @returns {Record<string,string|undefined>} the same `env`
+ */
+export function dropGitLocationEnv(env) {
+  for (const key of GIT_REPO_LOCATION_ENV_KEYS) delete env[key];
+  return env;
+}
+
+/**
+ * {@link scrubGitLocationEnv}, and also without any env config source (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT` /
+ * `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n`, `GIT_CONFIG_GLOBAL` / `SYSTEM`): for a check that reads the lane's config
+ * and must see exactly what git will use. Run it BEFORE {@link laneGitHardeningEnv}: the pins are appended after any
+ * inherited `GIT_CONFIG_COUNT` entries, which would survive.
+ * @param {Record<string,string|undefined>} env
+ * @returns {Record<string,string|undefined>}
+ */
+export function scrubGitRepoEnv(env) {
+  const out = scrubGitLocationEnv(env);
+  for (const key of Object.keys(out)) if (INHERITED_GIT_INDEXED_CONFIG_RE.test(key)) delete out[key];
+  for (const key of GIT_REPO_ENV_KEYS) if (key !== 'GIT_REF_PARANOIA') delete out[key];
   return out;
 }
 
@@ -54,18 +118,22 @@ export function scrubInheritedGitEnv(env = process.env) {
  * `env` with the pins appended to git's environment config list. An existing `GIT_CONFIG_COUNT` is preserved (the pins
  * come AFTER its entries, so they win). `GIT_EXTERNAL_DIFF` is dropped: an inherited one would run on every `git diff`.
  * @param {Record<string,string|undefined>} env
+ * @param {{remoteProbe?: boolean}} options Restrict transports only for an isolated remote proof.
  * @returns {Record<string,string|undefined>}
  */
-export function laneGitHardeningEnv(env = process.env) {
-  const out = { ...env };
+export function laneGitHardeningEnv(env = process.env, { remoteProbe = false } = {}) {
+  // No lazy fetch: a lane declaring itself a partial clone of a promisor remote would fetch a missing object through
+  // its own `remote.<name>.uploadpack` on a plain `show` / `diff` / `cat-file` (PR #5775 self-review).
+  const out = { ...env, GIT_NO_LAZY_FETCH: '1' };
   delete out.GIT_EXTERNAL_DIFF;
   const n = Number.parseInt(String(out.GIT_CONFIG_COUNT ?? '0'), 10);
   const start = Number.isInteger(n) && n > 0 ? n : 0;
-  LANE_GIT_CONFIG_PINS.forEach(([k, v], i) => {
+  const pins = remoteProbe ? [...LANE_GIT_CONFIG_PINS, ...REMOTE_PROBE_CONFIG_PINS] : LANE_GIT_CONFIG_PINS;
+  pins.forEach(([k, v], i) => {
     out[`GIT_CONFIG_KEY_${start + i}`] = k;
     out[`GIT_CONFIG_VALUE_${start + i}`] = v;
   });
-  out.GIT_CONFIG_COUNT = String(start + LANE_GIT_CONFIG_PINS.length);
+  out.GIT_CONFIG_COUNT = String(start + pins.length);
   return out;
 }
 
@@ -139,7 +207,7 @@ export function hardenLaneGitArgs(args) {
 /** Lane-local config keys that name a command, proxy, remote rewrite or credential source and are NOT pinned inert
  *  (a pin to a fixed value would break legitimate auth). A lane whose local/worktree scope defines one is refused
  *  BEFORE the agent runs and again before the push — a baseline an earlier agent poisoned is not trusted. Pure. */
-export const RISKY_LANE_CONFIG_RE = /^(credential\..*|core\.(askpass|gitproxy|editor)|merge\..+\.(driver|recursive)|gpg\..*|trailer\..+\.(cmd|command)|http\..*|https\..*|url\..+\.(insteadof|pushinsteadof)|protocol\..*|remote\..+\.(pushurl|proxy|receivepack|uploadpack|vcs)|include\.path|includeif\..+|filter\..+|alias\..+)$/is;
+export const RISKY_LANE_CONFIG_RE = /^(credential\..*|core\.(askpass|gitproxy|editor)|merge\..+\.(driver|recursive)|gpg\..*|trailer\..+\.(cmd|command)|http\..*|https\..*|url\..+\.(insteadof|pushinsteadof)|protocol\..*|remote\..+\.(pushurl|proxy|receivepack|uploadpack|vcs)|include\.path|includeif\..+|filter\..+|alias\..+|hook\..+)$/is;
 export const SAFE_REMOTE_URL_RE = /^(https:\/\/|ssh:\/\/|git@[\w.-]+:)/i;
 export function riskyLaneConfig(listOutput) {
   const parts = String(listOutput ?? '').split('\0');
@@ -153,6 +221,10 @@ export function riskyLaneConfig(listOutput) {
     // A remote URL is judged by the text after the shortest candidate that reads as a `remote.*.url` key.
     const url = candidates.find(c => /^remote\..+\.url$/is.test(c));
     if (url !== undefined && !SAFE_REMOTE_URL_RE.test(parts[i + 1].slice(url.length + 1))) found.push(url);
+    // `<format>://<path>` puts the refs in another repository: every ref write lands there. A bare format is never
+    // flagged: the scrub unsets flagged keys, and unsetting a real reftable lane's format would hide all its refs.
+    const refStorage = candidates.find(c => /^extensions\.refstorage$/i.test(c));
+    if (refStorage !== undefined && parts[i + 1].slice(refStorage.length + 1).includes('://')) found.push(refStorage);
   }
   return found;
 }
@@ -161,15 +233,20 @@ export function riskyLaneConfig(listOutput) {
 /**
  * Repair only lane-owned unsafe config before hand-out. Only exact `origin` is always retained; the
  * launch guard still refuses anything the scrub could not remove. Runner signature: (args, opts).
+ * `onConfig` receives the successful scoped listing so callers can reuse settings the scrub never changes.
  */
 export function scrubRiskyLaneConfig(dir, {
-  run = (args, opts) => execFileSync('git', args, { ...opts, encoding: 'utf8', env: laneGitHardeningEnv(), timeout: 30000, maxBuffer: 16 * 1024 * 1024 }),
+  // Full env scrub: an inherited GIT_CONFIG would hide the lane's own config from the listing this scrub decides on.
+  run = (args, opts) => execFileSync('git', args, { ...opts, encoding: 'utf8', env: laneGitHardeningEnv(scrubGitRepoEnv(process.env)), timeout: 30000, maxBuffer: 16 * 1024 * 1024 }),
   log = () => {},
+  onConfig = () => {},
 } = {}) {
   const removed = [], kept = [];
   const opts = { cwd: dir };
   try {
-    const parts = String(run([...LANE_CONFIG_LIST_ARGS], opts)).split('\0');
+    const output = String(run([...LANE_CONFIG_LIST_ARGS], opts));
+    onConfig(output);
+    const parts = output.split('\0');
     const sections = new Set();
     for (let i = 0; i + 1 < parts.length; i += 2) {
       const scope = parts[i], entry = parts[i + 1];

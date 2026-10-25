@@ -16,7 +16,8 @@
  * LIMIT, stated plainly: a parent killed with SIGKILL runs no handler at all, so its detached children survive.
  * Nothing in-process can cover that case. The timeout still bounds how long they can run.
  */
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
+import { readdirSync, readFileSync } from 'node:fs';
 
 /** Default hard ceiling for one child call — generous against a slow real pool, but never "forever". */
 export const DEFAULT_CHILD_TIMEOUT_MS = 5 * 60 * 1000;
@@ -147,4 +148,147 @@ export function runBounded(cmd, args, { timeoutMs = DEFAULT_CHILD_TIMEOUT_MS, en
       else resolvePromise(Buffer.concat(chunks).toString('utf8'));
     });
   });
+}
+
+/**
+ * Every descendant of `rootPid` in a `ps -A -o pid=,ppid=` listing, deepest first (so a kill in this order never
+ * lets a parent respawn a child it has not seen die). Pure. `rootPid` itself is excluded.
+ * @param {number} rootPid
+ * @param {string} psText  `pid ppid` per line
+ * @returns {number[]}
+ */
+export function descendantPids(rootPid, psText) {
+  const children = new Map();
+  for (const line of String(psText || '').split('\n')) {
+    const [pid, ppid] = line.trim().split(/\s+/).map(Number);
+    if (!Number.isInteger(pid) || !Number.isInteger(ppid) || pid === ppid) continue;
+    if (!children.has(ppid)) children.set(ppid, []);
+    children.get(ppid).push(pid);
+  }
+  const out = [];
+  const seen = new Set([rootPid]);
+  const walk = (pid) => {
+    for (const c of children.get(pid) ?? []) {
+      if (seen.has(c)) continue;
+      seen.add(c);
+      walk(c);
+      out.push(c);
+    }
+  };
+  walk(rootPid);
+  return out;
+}
+
+/**
+ * Kill `rootPid` and its whole process TREE (not its process group). For a child that must stay in its parent's
+ * group (so a supervisor's group kill of the parent still reaches it) but must also be killable on its own, e.g.
+ * verify-lane's gate phases (`shell → npm exec → node vitest → esbuild`). Best-effort and synchronous.
+ * `orphansOfGroup` (a pgid): ALSO kill processes of that group that were reparented to init (ppid 1) — a
+ * descendant whose intermediate parent already exited is no longer reachable through the tree, but it keeps the
+ * group it was forked into. The caller passes its OWN pgid; an ancestor is never ppid 1 inside that group
+ * unless it is the group's launchd-started leader, which is excluded along with the caller.
+ * @returns {number[]} the pids signalled
+ */
+export function killProcessTree(rootPid, signal = 'SIGKILL', { orphansOfGroup = null, selfPid = process.pid, marker = null, outputFds = [],
+  listProcesses = () => execFileSync('ps', ['-A', '-o', 'pid=,ppid=,pgid='], { encoding: 'utf8', timeout: 10_000 }),
+  listMarked = (m) => listMarkedPids(m, { selfPid }), listPeerHolders = (fds) => listPeerHolderPids(fds, { selfPid }),
+  kill = process.kill.bind(process), afterTree = () => {} } = {}) {
+  if (!Number.isInteger(rootPid) || rootPid <= 0) return [];
+  let tree = [];
+  let orphans = [];
+  try {
+    const text = listProcesses();
+    tree = descendantPids(rootPid, text);
+    if (Number.isInteger(orphansOfGroup) && orphansOfGroup > 1) {
+      for (const line of String(text).split('\n')) {
+        const [pid, ppid, pgid] = line.trim().split(/\s+/).map(Number);
+        if (ppid === 1 && pgid === orphansOfGroup && pid !== orphansOfGroup && pid !== selfPid && !tree.includes(pid)) orphans.push(pid);
+      }
+    }
+  } catch { /* ps unavailable: still kill the root */ }
+  const signalled = [];
+  const send = (pid) => {
+    if (signalled.includes(pid) || (pid !== rootPid && (!Number.isInteger(pid) || pid <= 1 || pid === selfPid))) return;
+    try { kill(pid, signal); signalled.push(pid); } catch { /* already gone */ }
+  };
+  for (const pid of [...orphans, ...tree, rootPid]) send(pid);
+  try { afterTree(); } catch { /* notification only */ }
+  // PR #5768 — a descendant that left BOTH the tree and the group (detached into its own session, reparented to init)
+  // is still provably ours by what it inherited: the per-run env `marker`, or the caller's output pipes (`outputFds`).
+  // Swept AFTER the tree is down: these listings are slow (`lsof`, `ps -E`), and the tree must not wait for them.
+  if (typeof marker === 'string' && marker.includes('=')) { try { listMarked(marker).forEach(send); } catch { /* best-effort */ } }
+  if (outputFds.length) { try { listPeerHolders(outputFds).forEach(send); } catch { /* best-effort */ } }
+  return signalled;
+}
+
+/**
+ * Pids whose environment carries `marker` (`NAME=value`), from a darwin `ps -A -ww -E -o pid=,command=` listing (the
+ * environment is printed after the arguments). Pure. LIMIT: macOS hides a platform binary's environment (`/bin/sleep`),
+ * so such a process is only found here on Linux; on darwin it is found by its inherited output pipe, if it kept one.
+ */
+export function markedPidsFromPs(psText, marker, { selfPid = process.pid } = {}) {
+  const out = [];
+  for (const line of String(psText || '').split('\n')) {
+    const m = /^\s*(\d+)\s(.*)$/.exec(line);
+    const pid = m ? Number(m[1]) : NaN;
+    if (pid > 1 && pid !== selfPid && ` ${m[2]} `.includes(` ${marker} `)) out.push(pid);
+  }
+  return out;
+}
+
+/** Every live pid (not `selfPid`, never init) whose environment carries `marker`: `/proc/<pid>/environ` on Linux, `ps -E` on darwin. */
+export function listMarkedPids(marker, { selfPid = process.pid, platform = process.platform } = {}) {
+  if (platform === 'darwin') {
+    // A loaded host makes this full listing slow; it runs on the watchdog thread, so a generous ceiling costs nothing.
+    return markedPidsFromPs(execFileSync('ps', ['-A', '-ww', '-E', '-o', 'pid=,command='], { encoding: 'utf8', timeout: 30_000, maxBuffer: 256 << 20 }), marker, { selfPid });
+  }
+  if (platform !== 'linux') return [];
+  const out = [];
+  for (const name of readdirSync('/proc')) {
+    const pid = /^\d+$/.test(name) ? Number(name) : NaN;
+    if (!(pid > 1) || pid === selfPid) continue;
+    try { if (readFileSync(`/proc/${name}/environ`, 'latin1').split('\0').includes(marker)) out.push(pid); } catch { /* gone or not ours */ }
+  }
+  return out;
+}
+
+/**
+ * Pids other than `selfPid` holding the PEER end of one of `fds` (this process's ends of the socket pairs a child's
+ * stdio was created on), from an `lsof -U -F pfdn` listing: `p<pid>`, then per fd `f<fd>`, `d<this end>`, `n-><peer end>`.
+ * A process holding that peer end can write into the caller's output pipe — it inherited it. Pure.
+ */
+export function peerHolderPids(lsofText, { selfPid = process.pid, fds = [] } = {}) {
+  const wanted = new Set(fds.map(Number));
+  const entries = [];
+  let pid = null;
+  let cur = null;
+  for (const line of String(lsofText || '').split('\n')) {
+    const value = line.slice(1);
+    if (line[0] === 'p') { pid = Number(value); cur = null; }
+    else if (line[0] === 'f') { cur = { pid, fd: Number(value), dev: null, peer: null }; entries.push(cur); }
+    else if (line[0] === 'd' && cur) cur.dev = value.toLowerCase();
+    else if (line[0] === 'n' && cur) cur.peer = /^->0x[0-9a-f]+$/i.test(value) ? value.slice(2).toLowerCase() : null;
+  }
+  const peers = new Set(entries.filter((e) => e.pid === selfPid && wanted.has(e.fd) && e.peer).map((e) => e.peer));
+  return [...new Set(entries.filter((e) => e.pid > 1 && e.pid !== selfPid && peers.has(e.dev)).map((e) => e.pid))];
+}
+
+/** darwin: the holders of the peer ends of `fds` (an `lsof -U` scan of this user's processes, ~1s). Elsewhere: none —
+ *  Linux shows no socket peers there, and the env marker already finds every descendant on Linux. */
+export function listPeerHolderPids(fds, { selfPid = process.pid, platform = process.platform } = {}) {
+  if (platform !== 'darwin' || !fds.length) return [];
+  const uid = process.getuid?.();
+  let text;
+  // lsof exits 1 when one process could not be read; its listing of the rest is still valid.
+  try { text = execFileSync('lsof', ['-n', '-P', '-w', '-U', ...(Number.isInteger(uid) ? ['-a', '-u', String(uid)] : []), '-F', 'pfdn'], { encoding: 'utf8', timeout: 20_000, maxBuffer: 256 << 20 }); }
+  catch (e) { text = typeof e?.stdout === 'string' ? e.stdout : ''; }
+  return peerHolderPids(text, { selfPid, fds });
+}
+
+/** This process's process-group id (null when `ps` cannot say). */
+export function ownProcessGroup({ pid = process.pid, exec = execFileSync } = {}) {
+  try {
+    const n = Number(String(exec('ps', ['-o', 'pgid=', '-p', String(pid)], { encoding: 'utf8', timeout: 10_000 })).trim());
+    return Number.isInteger(n) && n > 0 ? n : null;
+  } catch { return null; }
 }

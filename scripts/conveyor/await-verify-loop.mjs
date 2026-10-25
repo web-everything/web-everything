@@ -32,7 +32,7 @@ import { listStoredAwaitVerify, resolveAwaitVerifyTtlMs } from './await-verify.m
 import { listFixDispatchClaims, fixDispatchSessionName, fixDispatchResource, fixDispatchClaimRoot } from './fix-claim-store.mjs';
 import { releaseFixDispatchClaim } from './fix-dispatch-claim.mjs';
 import { tryReadCompletion } from '../operations/completion-store.mjs';
-import { ensureFreshGithubAppEnv, FLEET_APP_AUTH_OPTS } from '../lib/github-app-auth-env.mjs';
+import { ensureFreshGithubAppEnv, FLEET_APP_AUTH_OPTS, isGithubAppAuthGuardError } from '../lib/github-app-auth-env.mjs';
 import {
   resolveFixerSlotSettings, fixSlotState, slotCountedItems, admitResumes, awaitPassRunner, releaseOnCompletion,
 } from './fixer-slot-rules.mjs';
@@ -432,10 +432,13 @@ export const LOOP_APP_AUTH_OPTS = FLEET_APP_AUTH_OPTS;
  * One loop cycle: refresh the GitHub App auth FIRST, then run the cycle. The child is spawned once with a frozen env,
  * so without this its pushes and PR reads run on whatever the launching shell held — the operator's personal auth, or
  * an inherited token that lapses after an hour (PR #4510 review). The daemon does the same per tick
- * (`withGithubAppAuth`); a failed refresh leaves the previous auth in place and never stops the cycle.
+ * (`withGithubAppAuth`); a transient refresh failure leaves the installed guard in effect. Failure to
+ * install that guard is fatal and must stop the cycle before any gh work.
  */
 export async function runLoopCycle({ settings, ensureAuth = () => ensureFreshGithubAppEnv(LOOP_APP_AUTH_OPTS), cycle = runAwaitVerifyCycleDefault } = {}) {
-  try { await ensureAuth(); } catch { /* the refresh itself never throws; belt and braces */ }
+  try { await ensureAuth(); } catch (error) {
+    if (isGithubAppAuthGuardError(error)) throw error;
+  }
   return cycle({ settings });
 }
 

@@ -2,10 +2,11 @@
 bornAs: xh5sg8r
 kind: story
 size: 5
-status: open
+status: resolved
 blockedBy: ["5767", "5766"]
 scope: ["we:skills-src/conveyor/prepare-item-agent-brief.md", "we:skills-src/jury/", "we:scripts/lib/review-core.mjs"]
 dateOpened: "2026-10-10"
+dateResolved: "2026-10-22"
 tags: []
 ---
 

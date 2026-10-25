@@ -14,6 +14,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { keepAliveScript } from '../../../scripts/lib/test-keepalive.mjs';
 import {
   runDaemonLoop, runVerifyTick, buildCliDaemonEffects, realSleep, cloneHeadChanged,
   startIndependentHeartbeat, DEFAULT_HEARTBEAT_INTERVAL_MS,
@@ -748,7 +749,8 @@ describe('in-flight PID reconciliation', () => {
       const bytes = JSON.stringify(marker);
       writeFileSync(file, bytes);
       const inFlight = new Map([[dir, entry()]]);
-      reconcileInFlight(inFlight, { isAlive: () => false, killGroup: vi.fn(), log: vi.fn() });
+      // This orphan's group is gone too: never probe the host's group 777 (EPERM also means alive).
+      reconcileInFlight(inFlight, { isAlive: () => false, groupAlive: () => false, killGroup: vi.fn(), log: vi.fn() });
       expect(inFlight.size).toBe(0);
       expect(readFileSync(file, 'utf8')).toBe(bytes);
       expect(laneNeedsVerifyDispatch(JSON.parse(readFileSync(file, 'utf8')), 'abc')).toBe(marker.status === 'running');
@@ -802,7 +804,7 @@ describe('#65 — a daemon restart hands in-flight gates to its successor instea
     const root = mkdtempSync(join(tmpdir(), 'verify-adopt-'));
     const { spawn } = await import('node:child_process');
     const script = join(root, 'verify-lane.mjs');
-    writeFileSync(script, 'setTimeout(() => {}, 20000);');
+    writeFileSync(script, keepAliveScript({ maxLifetimeMs: 20_000 }));
     const child = spawn('node', [script, '--repo=x', '--json', '--run-id=run-live'], { stdio: 'ignore', detached: true });
     try {
       const path = join(root, 'inflight.json');

@@ -77,7 +77,7 @@
  * lock *directory*, since `mkdir` is the one filesystem op every POSIX platform makes atomically exclusive).
  */
 
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import {
   appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync,
 } from 'node:fs';
@@ -85,6 +85,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomBytes, randomUUID } from 'node:crypto';
+import { keepAliveAnchorPid, killKeepAlive, spawnKeepAlive } from '../../../lib/test-keepalive.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const SHIM_PATH = resolve(HERE, 'fake-claude-shim.mjs');
@@ -219,17 +220,16 @@ export function fullSessionId() {
  *  must be genuinely alive rather than a made-up number: every consumer's own liveness probe is a real
  *  `process.kill(pid, 0)`, and a fabricated pid could collide with an unrelated real process. */
 export function spawnSleeper() {
-  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1e9)'], {
-    detached: true,
-    stdio: 'ignore',
-  });
-  child.unref();
+  // It must outlive this (short-lived) CLI on purpose, so it is untracked — bounded instead by its anchor
+  // (the test runner via WE_KEEPALIVE_ANCHOR_PID; else, as a CLI, whoever ran `claude`) and a max lifetime.
+  const anchorPid = keepAliveAnchorPid(process.env, IS_CLI ? process.ppid : process.pid);
+  const child = spawnKeepAlive({ anchorPid, detached: true, unref: true, track: false });
   return child.pid;
 }
 
 export function killSleeper(pid) {
   if (!Number.isInteger(pid)) return;
-  try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+  killKeepAlive(pid);
 }
 
 /** Find a session by short `id`, full `sessionId`, or exact `name` — case-insensitive/trimmed on the id axes,

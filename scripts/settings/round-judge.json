@@ -1,0 +1,9 @@
+{
+  "$comment": "Shadow round judge (operator OK 2026-10-21). rounds.judge.mode off|shadow|on resolves standard (off) -> platform preference `rounds` -> this file -> env WE_ROUNDS_JUDGE_MODE, source logged. shadow = at a round cap the review daemon's status tagger logs what the judge WOULD do to ~/workspace/.operations/round-judge-shadow/; it never acts. `on` is not implemented and behaves as shadow. See scripts/conveyor/round-judge-shadow.mjs. rounds.judge.maxGrants (standard 20) is only a hard backstop on total recommended grants per PR; progress decides.",
+  "rounds": {
+    "judge": {
+      "mode": "shadow",
+      "maxGrants": 20
+    }
+  }
+}

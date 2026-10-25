@@ -6220,6 +6220,11 @@ and #4284. Full reasoning: [#3216](/backlog/3216-revisit-the-ledger-write-miss-p
 These are already enforced/written elsewhere; listed here so the platform's rules are findable from
 one place:
 
+- **Standing ruling — automatic +1 review round for card-only PRs** (operator 2026-10-19, confirmed 2026-10-20,
+  capped at 3 per PR) → recorded as operator-authored issue
+  [web-everything/web-everything#5751](https://github.com/web-everything/web-everything/issues/5751); enforced by
+  `scripts/conveyor/standing-ruling-mark.mjs` + `round-extension-mark.mjs` (close the issue to revoke).
+
 - **Design-first / materialization** → [design-first.md](design-first.md): document in JSON/njk
   before implementing; plan → discrete homes (reports + JSON + research topics).
 - **Native-first default; config extends a platform default** → [conventions.md](conventions.md),
@@ -6274,3 +6279,239 @@ Codex-authored PRs get an Opus judge, same fallback dimension). Declared in `we:
 `we:config/platformDefaults.ts`; the daemon that consumes it is card 4880.
 
 **Lineage:** 4772 (ruled 2026-10-03). Instance of [config-extends-platform-default](#config-extends-platform-default).
+
+### Operator overrides are a local-first store above the code cascade; a loosening write needs the operator's confirmation {#operator-override-settings-layer}
+
+**Ratified 2026-10-17 by the operator (Nicolas Gilbert), in conversation, all three forks at the card's default
+(`#6268`).** The operator's words: *"we should have the option to use a db for settings instead of in code, at least as
+override"*, then "Ok" to defaults (a), (a), (a). Composes with [config-extends-platform-default](#config-extends-platform-default)
+(the new layer is one more cascade layer, each value with its source logged) and the settings-edit authority decision
+`#6239` (cited by id).
+
+**The rule:**
+1. **One new top layer, `operator-override`.** Order: standard < platform < tool < env < operator-override (Fork 2 = a).
+   The layer wins over env, so a stale shell variable never beats a recorded operator instruction. Every resolver of a
+   settable key reads it: the cascade (`resolveCascade`, fed each call by `cascadePolicy`, for readers of its `.value`;
+   the referral safety keys resolve this way) and the merge-queue switches (`resolveRefreshSetting`). A key no such resolver reads
+   cannot be set. Each value taken from it logs `source: operator-db`.
+2. **Local first store at one host-wide path (Fork 1 = a).** The source of truth is a machine-local store at a single
+   host-wide path, never inside a lane clone, so every daemon on the host reads the same answer. Plateau's DB is deferred
+   and may replace the store later behind the same single read interface (`readOperatorOverrides`). The storage format is
+   left to the build card. Daemons read the layer each tick.
+3. **Only the operator writes it.** A write is authorized only by an allowlisted operator's GitHub review of the exact
+   request, verified by protected CI with a key agents never hold; any caller may request or apply, and no agent can
+   authorize. Each write records the operator's verbatim instruction (stored as a quoted string, never executed), actor and
+   channel (from a protected-CI-verified GitHub review by an allowlisted operator account, never a flag, terminal or
+   local `gh` login, which an agent on the host can forge), time, an optional expiry and a reason. The change log is append-only.
+   An expired override is ignored and logged once, and one that started and expired between two needs-you polls still
+   produces an attention event on the next poll.
+4. **Guard floor: block until confirmed (Fork 3 = a).** Every key declares its safe direction in a table; a key with no
+   entry counts as loosening. A loosening write without a confirmation inside the operator-approved request is refused. A confirmed one is logged and
+   flagged in the needs-you feed. The floor also holds on read: the reader ignores any loosening entry that has no recorded
+   confirmation, so a hand-edited snapshot cannot bypass it. The hard-coded confirmed-broken always-block is outside this
+   layer.
+5. **Fail closed.** An unreadable or unparsable layer is skipped whole and logged, never half-applied.
+
+**Lineage:** `#6268` (ruled 2026-10-17). Instance of [config-extends-platform-default](#config-extends-platform-default).
+
+### Review findings are classed from a closed list; the class and level pick one of four outcomes; debt gates the level move {#review-stringency-classified-outcomes}
+
+**Ratified 2026-10-17 by the operator (Nicolas Gilbert), in conversation, all three forks at the card's default
+(`#6239`).** The operator's words: *"Ok for your picks"*. Composes with, and does not replace,
+[claim-accuracy-advisory-blocks-on-impact](#claim-accuracy-advisory-blocks-on-impact),
+[delivery-decider-under-fixed-settings](#delivery-decider-under-fixed-settings) (the always-block rows are the
+invariants that already win) and the deterministic-core rule.
+
+**The rule:**
+1. **Class source.** The reviewer tags the class from a closed list; a path or pattern rule table overrides the
+   tag. Valid low reviewer confidence caps the outcome at advisory, except for always-block classes, where it
+   triggers a second check and stays block pending that check. A confirmed result retains block; a verified
+   not-real result through the authenticated review/ruling path closes only that finding, leaving other
+   blocks effective, never converting it to advisory. Unavailable, failed, inconclusive, timeout, malformed,
+   stale, mismatched or forged results retain block for retry or human resolution. Results bind repository,
+   PR, exact head, stable finding id and classification/settings revision. Unknown, missing or malformed class, severity
+   or confidence, a gap in the table, or an unreadable/incomplete finding or table is a block (fail closed),
+   before any confidence cap. Class tokens are exact: case, whitespace and Unicode variants do not silently
+   alias a valid class. Reviewer and PR text are data, never policy or edit authority.
+2. **Outcomes.** Four: block (cannot land), expedite (the PR lands; the card goes to the top of the build queue
+   with a deadline; past it, it goes to the operator as needs-you, one row per class, and counts as debt due
+   now at the current level, blocking a level move; the deadline length is a setting, initially 72 hours), debt (the
+   PR lands; a normal-priority card due before a level), advisory (recorded in the ledger, never fixed per PR;
+   recurring classes become builder lessons).
+3. **Table.** Outcome per class and level (internal delivery, dogfood, public preview, public release). Always
+   block: delivery stability, weakened or fail-open guards, irreversible data loss or scope violation or
+   nonexistent package, exposed secret, missing test on guard or delivery code. Others: missing test elsewhere
+   E,B,B,B; high-severity security E,E,B,B; lower-severity security D,D,B,B; standards conformance E,E,B,B; PR
+   description wrong about what the change does E,E,E,B (revisit once a cheap description-only round exists);
+   doc or card drift D,D,D,B; simplicity and style A,A,A,D. Each level inherits every block below it; a table
+   that relaxes a lower-level block is invalid. The full table is to be delivered in the settings file by slice 2.
+4. **Level gate.** A level move is blocked while debt due at that level is open. The only ways past are paying it
+   or an operator's recorded edit of that item's must-pay-before level. Due at any skipped lower level also
+   blocks. Payment means protected CI independently verifies a landed fix and passing validation bound to the
+   debt id, source finding and fixed revision; changing a status string is not payment. Compare the complete
+   trusted base inventory with candidate changes before kind/status filtering: deletion, rename, changing
+   kind/class/severity/confidence/source, deadline or due-level tampering, or a forged receipt cannot hide debt.
+   A recorded operator deadline extension may change expedite's overdue calculation; no automatic extension.
+   Re-read settings and debt under a revision lock before a move; unreadable/incomplete state blocks.
+5. **Debt is a backlog kind `debt`**, registered together with its size rule, buildable rule and every
+   kind-set reference; else kind `task` plus debt fields. Both representations have the same gate and write
+   guards. Entries retain class, impact, severity, confidence, must-pay-before level, deadline (absent for
+   ordinary debt), fix cost, interest, and source repository/PR/finding id. Unpaid debt resurfaces after 45 days
+   and never silently expires or disappears. Only prudent-deliberate ordinary deferred debt is acceptable:
+   reckless or inadvertent debt blocks the proposed admission. This restriction applies only after the
+   effective outcome is debt, not to block, expedite or advisory findings. The accountable debt owner records
+   an assessment and rationale for the deferral, confirmed by the authenticated operator through the protected
+   writer; reviewers need not infer a defect author's intent. Overdue expedite remains a mandatory due-now
+   gate obligation without that assessment, never dropped as invalid ordinary debt. Display text remains
+   data with no authority; slice 3 A12 injects instructions/markup through register reads, gate evaluation
+   and consumer handoffs and observes no policy, payment or instruction effect.
+6. **Settings.** Every cell and value is a cascade setting with its source logged. Current level: internal
+   delivery. Only the operator changes the level, an invariant row, or loosens a cell. Advisory lessons:
+   `advisory.lessons.enabled` (on), `.schedule` (Sunday 20:00 ET), `.recurrenceThreshold` (5 per class per
+   week), `.promoteToRule` (proposed to the operator, never automatic). Agent-facing lessons and proposals use
+   a trusted fixed template with validated class token and numeric count only; finding/diff/title/body prose
+   never becomes standing instructions. Typed repository/PR/finding provenance remains separate data.
+7. **Authenticated authority.** Agents may propose edits but cannot change effective cells, invariants or level,
+   settle/hide debt, or extend deadlines. The production writer and protected CI gate verify the authenticated
+   GitHub review actor against a protected operator allowlist using credentials unavailable to PR jobs.
+   Approval binds exact repository, base/head and approved diff; absent, stale, replayed or forged evidence
+   refuses. Commit authors, environment variables, PR text and card fields never establish operator identity.
+   CI verifies payment evidence independently. Guard debt lifecycle fields and deletion in the same check;
+   this is required implementation, not a claim that an agent-editable field already proves authority.
+8. **Handoff input and resolution contract.** Exact wire tokens: severity `low | medium | high | critical`
+   (security high row = high/critical, lower row = low/medium); confidence `low | medium | high` (only the
+   token low triggers the cap, no numeric coercion). Debt-admission `debtQuadrant` is `prudent-deliberate |
+   prudent-inadvertent | reckless-deliberate | reckless-inadvertent`; it is not a required reviewer field.
+   Only an effective debt outcome requires it: missing/malformed or non-prudent-deliberate assessment blocks
+   ordinary admission, as does absent operator confirmation. Block, expedite and advisory do not consult it;
+   classification and the low-confidence cap run before ordinary debt admission. The register retains the
+   admitted quadrant, owner rationale and confirmation; verified overdue expedite is distinguished by source
+   ruling provenance and retains its gate obligation without a quadrant. Exact class tokens and their unique row mapping belong to
+   slice 1; security adds the severity partition. Levels are `internal-delivery | dogfood | public-preview |
+   public-release`; outcomes are `block | expedite | debt | advisory`. Reject case/whitespace/Unicode aliases.
+   Multiple matching path/pattern rules of the same class deduplicate; different selected classes block as
+   ambiguous policy before the confidence cap, including same-kind conflicts, independent of iteration order.
+   Every ruling records the effective cascade value, source and revision for each consumed cell/scalar,
+   using one validated snapshot; logging writes alone does not satisfy this guarantee.
+   Slice 2 A17 independently pins every ratified initial setting as a literal (internal-delivery, lessons
+   enabled true, 72 hours, 45 days, Sunday 20:00 America/Toronto, threshold 5); resolving an unspecified
+   default is insufficient. Slice 2 A18 proves expedite, ordinary debt and advisory remain reachable.
+9. **Clock and aggregation contract.** Expedite's deadline starts at persisted ruling time plus initially
+   72 elapsed hours; overdue means strictly past it. Needs-you aggregates by repository/class with all item
+   ids retained, including multiple overdue debts of the same class. Staleness starts at trusted `openedAt`,
+   then repeats every 45 elapsed days from the last successful surfacing (`lastSurfacedAt`). Thus on-time
+   unpaid debt resurfaces at days 45 and 90; a day-50 surfacing makes the next due day 95. Publication and
+   baseline update are atomic; failed publication retries without advancing time, and PR edits cannot reset
+   either timestamp. Paid debt stops resurfacing, unpaid debt never expires.
+10. **Protected roots and bounded ingress.** The authority check executes trusted base code/policy outside
+    the PR job. PR edits to the allowlist, gate workflow or writer cannot authorize that PR's own changes;
+    privileged credentials never enter PR jobs or candidate code. Slice 2 A15 tests each root edit and token
+    access; slice 3 reuses it. Implementation ingress bounds: protected finding/settings/debt writes reject
+    bodies above 1 MiB, enum tokens above 128 UTF-8 bytes and request 61 in a rolling minute per authenticated
+    repository/principal; no PR-controlled reset. Origin/CSRF is n/a for this CI/CLI-only, non-cookie ingress;
+    provenance/authentication checks still apply. The read-only panel rejects nonempty bodies, caps query/
+    headers at 16 KiB, limits reads to 60/minute per repository/principal and refuses foreign-origin
+    credentialed access; CSRF tokens are n/a only because reads cannot mutate/reset state. The local lesson
+    job caps each fetched page/entry at 1 MiB, class tokens at 128 bytes and runtime at 120 seconds; count is
+    a nonnegative safe integer, incomplete runs publish nothing and do not advance a checkpoint. Incoming
+    rate-limit/origin checks are n/a for a scheduled job without an endpoint; single-emission retry guards
+    still apply. These bounds and n/a reasons are acceptance obligations, not delivered infrastructure.
+
+**Proof requirement and ownership.** Decision `#6239` resolves the design only. Implementation and live proof
+belong to epic `#6236`: production-path before/after on a live PR and a fresh-window recount of auto-block
+overrides and reviewer not-real rulings, with dated windows, denominators and settings revisions. The epic may
+not resolve solely because its children land. Named acceptance coverage: slice 2 `#6233` A5
+(`careless-debt-block`), A6 (`monotonic-levels`), A8–A10 (malformed/unreadable input and forged authority), A12
+(`always-block-second-check`); slice 3 `#6237` A2 (`expedite-deadline-escalation`), A3
+(`debt-staleness-resurface`), A6–A10 (tamper, authority, source, unreadable state and revision races); slice 5
+`#6234` A2–A7 (threshold, disable flag, proposal-only promotion, template safety, scheduling and input failure).
+Additional handoff coverage: slice 2 A2/A13–A18 (all competing rule pairs, literal table cells/domains and
+initial settings, read-side cascade provenance, protected roots, ingress bounds and reachable non-block
+outcomes); slice 3 A2–A3/A8/A11–A12 (N+1 aggregation, repeat baselines, ordinary-debt quadrant admission,
+bounds and inert display-text fixtures); slice 4 A6 and slice 5 A8 (surface-specific bounds).
+Each slice's Test plan and the decision's risk mapping identify repository-qualified planned test files
+as implementation destinations.
+
+**Lineage:** `#6239` (ruled 2026-10-17). Reference: the operator's review stringency proposal artifact.
+
+### Stacking a PR on another PR is a configurable cascade policy; a fixed safety floor protects guard and merge-path code {#stacked-pr-policy-configurable}
+
+**Ratified 2026-10-17 by the operator (Nicolas Gilbert), in conversation, both forks at the card's default
+(`#6903`).** The operator's words: *"Ok, make sure the stacking is a configurable policy"*. Composes with
+[review-stringency-classified-outcomes](#review-stringency-classified-outcomes) (the guard and low-risk classes are read
+from its class list) and the drain's existing proof-of-land gate (base lands first).
+
+**The rule:**
+1. **The whole policy is a cascade policy, each value with its source logged.** That covers every matrix cell (base
+   state by child class), the safety floor, the urgent classes, `stack.smallChildMaxLines` (50),
+   `stack.lowRiskClasses` (cards, settings, docs), `stack.maxDepth` (1), `stack.onBaseHeadMove` (restack, then
+   re-review only the child's delta) and the closed or rejected base handling. Home: `we:scripts/settings/stack.json`.
+2. **Default matrix.** Small and low-risk children stack on any base state. Normal children stack on an approved-waiting
+   base, on an approved-held base only when urgent, on an in-review or fixing base only in an operator-flagged
+   emergency. Guard or merge-path children stack on an approved-waiting base, on an approved-held base only when
+   urgent, and never on an in-review or fixing base.
+3. **Safety floor (Fork 1 = a).** Guard or merge-path code never stacks on an in-review or fixing base. The class is read
+   from the touched paths, not from the card label. Any path under `we:scripts/settings/` that feeds drain, review or
+   merge gates counts as guard, even though settings is a default low-risk class. Guard or merge-path classification
+   takes precedence over low-risk membership, including a child mixing docs or other low-risk files with guard files.
+   "Emergency" is operator-flagged only. The floor can be changed only
+   by an operator-sourced setting, never by an agent. Unknown state, unknown class or a missing proof gate means no
+   stacking (fail closed).
+4. **Base first.** The drain lands the base before the child. Review judges the child's own delta. When the base head
+   moves, the child is restacked and only its delta is re-reviewed; the hold marker moves only when the delta
+   fingerprint is unchanged and the base's new commits touch none of the child's files.
+5. **Closed or rejected base (Fork 2 = a).** A low-risk child rebases onto main by itself only when the rebase is clean
+   and its delta fingerprint is unchanged. Every other child goes to the operator. The cascade default enables
+   auto-rebase; an unset repo-layer value uses that default. No resolved cascade value (including no default), or an
+   unreadable cascade result, goes to the operator. Gate-feeding settings and mixed guard children remain guard class
+   here too. Rebase grants no `review:accepted` label or carried approval; review, CI and proof-of-land gates must
+   still pass for the new head. The auto-rebase clears both drain holds on the old base. It retargets the child PR to
+   its repo's default branch (GitHub retargets only when a base merges), and it removes the closed base from the
+   child's `stackParents` edge in the PR-body lane manifest, after first copying a legacy head-ref manifest into the
+   body with the edge intact (the drain reads the body first). The handler holds the child's fix claim for the whole
+   recovery, and the edge it keeps until last stops the drain landing the child mid-recovery. The order is retarget, then a push leased on the old head, so the new head's CI runs against the
+   default branch; the edge removal is last, only after the new base and the rebased head are both confirmed on the
+   remote. If the retarget, the push or the removal fails, the child goes to the operator. A child sent to the
+   operator keeps its edge and is never left targeting the default branch on its edge alone: it stays on, or is
+   retargeted back to, the closed base's branch, or is parked `review:human`. A later pass finishes or escalates a
+   recovery that a crash interrupted; a recovery read it cannot complete parks the child `review:human`. Independently
+   of the claim and every marker, the drain refuses to land any child whose head still carries a closed (unmerged)
+   base's commits that are not on the default branch, read from the base history of the child's head branch (force-
+   pushed base heads included), and an ancestry read it cannot complete also refuses to land.
+6. **Free-scope.** The caller names the intended base PR (`--stack-on=<n>`); free-scope applies the matrix and excludes
+   only PR holders in that chain, never agent-registry holders. A cell that may not stack still reports OCCUPIED.
+
+**Lineage:** `#6903` (ruled 2026-10-17). Instance of [config-extends-platform-default](#config-extends-platform-default).
+
+### Collector PRs batch card-only filings per stream; the coordinator owns each batch and heals it from GitHub {#collector-pr-card-batching-streams}
+
+**Ratified 2026-10-18 by the operator (Nicolas Gilbert), in conversation, all six forks at the card's default
+(`#6940`).** The operator's words: *"All ok"*. Builds on the rolling card-only PRs of epic #4703.
+
+**The rule:**
+1. **Streams.** `prevention` and `filing` (follow-up and expedite cards fold into `filing`), plus `ruling`,
+   declared and disabled until a filer routes to it. Code PRs never join a collector.
+2. **Flush.** Count and age, whichever first, count wins a tie. Defaults: prevention 10 cards / 120 min, ruling
+   8 / 60, filing 10 / 60. Every value is a cascade setting with its source logged.
+3. **Expedite.** High and urgent cards bypass the collector (`highPriorityBypass`). Bypass is decided by priority
+   alone: an expedite-origin card with ordinary or no priority is collected into `filing` under rule 1.
+4. **Ejection.** A card with a blocking finding is extracted to its own PR and is never re-queued into a
+   collector.
+5. **Numbering.** Every member is numbered once at seal, before the PR is marked ready; numbering failure keeps
+   the batch held.
+6. **Ownership.** The coordinator owns the collector branch (lease plus state file). A sealed state whose PR is
+   merged or closed on GitHub is retired on the next admission; an unreadable PR state keeps it sealed and held.
+
+**Defended by (planned cases, named in each slice's [A1]):** rules 1 to 3 by 6947 (`code changes refuse
+collection`, `count wins simultaneous count and age thresholds`, `every stream value is a cascade setting with its
+source logged`, `high and urgent bypass with shipped defaults`, `follow-up and expedite origins route to filing`, `expedite origin is
+collected unless its priority bypasses`)
+and 6948 (`ruling ships enabled with 8/60 defaults`, `disabled ruling refuses kind-disabled, not unknown kind`);
+rule 4 by 6945 (`extracted member cannot re-enter a collector`); rule 5 by 6942 (`numbering failure retains
+the hold and never reaches ready`); rule 6 by 6941, one case per PR state (`open sealed PR stays sealed and keeps
+refusing batch-sealed`, `retires a sealed state whose PR merged on the next admission`, `split-closed batch retires
+and surfaces nothing`, `closed-unmerged batch is archived, retired and surfaced`, `unreadable PR state stays sealed
+and held`; their `sealed/` archive counterparts are listed in 6941's edge case 6), plus the fault-injection case
+`archive failure preserves the active slot and retry preserves every member`.
+
+**Lineage:** `#6940` (ruled 2026-10-18). Epic 6944.

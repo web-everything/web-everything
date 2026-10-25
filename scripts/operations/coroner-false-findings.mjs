@@ -111,11 +111,15 @@ export function collectFalseFindings(window, { repo = CONSTELLATION_REPOS.we.slu
 }
 
 export function runFalseFindings(argv, { env = process.env, home = homedir(), now = new Date().toISOString(), io = fs, collect = collectFalseFindings } = {}) {
-  const { values } = parseArgs({ args: argv, options: { since: { type: 'string' }, json: { type: 'boolean' } } });
+  // --until bounds the window like coroner-extract's, so the nightly job reads both halves over the same window.
+  const { values } = parseArgs({ args: argv, options: { since: { type: 'string' }, until: { type: 'string' }, json: { type: 'boolean' } } });
   let since = values.since;
   if (since === 'last') since = JSON.parse(io.readFileSync(env.WE_CORONER_STATE || join(home, 'workspace/.operations/state/coroner-last.json'), 'utf8')).lastEnd;
-  if (!/^\d{4}-\d{2}-\d{2}T/.test(since ?? '') || !Number.isFinite(Date.parse(since)) || Date.parse(since) > Date.parse(now)) throw Error('pass an ISO --since or last with previous coroner state');
-  const window = { since: new Date(since).toISOString(), until: now };
+  const validISO = (v) => /^\d{4}-\d{2}-\d{2}T/.test(v ?? '') && Number.isFinite(Date.parse(v));
+  if (!validISO(since) || Date.parse(since) > Date.parse(now)) throw Error('pass an ISO --since or last with previous coroner state');
+  const until = values.until ?? now;
+  if (!validISO(until) || Date.parse(until) > Date.parse(now) || Date.parse(since) > Date.parse(until)) throw Error('pass an ISO --until with since <= until <= now');
+  const window = { since: new Date(since).toISOString(), until: values.until === undefined ? now : new Date(until).toISOString() };
   const report = { window, ...collect(window, { shadowRows: readShadowRows({ path: resolveShadowAgreementPath(env), read: io.readFileSync.bind(io) }) }) };
   return { report, output: values.json ? JSON.stringify(report) : JSON.stringify(report, null, 2) };
 }

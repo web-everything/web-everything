@@ -446,3 +446,21 @@ it('#3996 validates nullable footprint counts and preserves them on each trial',
     expect(validateScorecard({ ...baseRow(), [field]: Number.MAX_SAFE_INTEGER }).ok).toBe(true);
   }
 });
+
+
+describe('strict scorecard reads for red-team admission', () => {
+  it.each(['{', '{}', '{"records":null}'])('refuses malformed scorecards %s', text => {
+    expect(() => readStore({ path: '/fixture/store', strict: true, read: () => text })).toThrow('scorecard store malformed');
+    expect(readStore({ path: '/fixture/store', exists: () => true, read: () => text }).records).toEqual([]);
+  });
+  it('preserves unreadable-store errors instead of admitting an empty history', () => {
+    expect(() => readStore({ path: '/fixture/store', strict: true,
+      read: () => { throw Object.assign(Error('denied'), { code: 'EACCES' }); } })).toThrow('denied');
+  });
+  it('allows absent stores but returns existing records unchanged', () => {
+    expect(readStore({ path: '/fixture/store', strict: true,
+      read: () => { throw Object.assign(Error('absent'), { code: 'ENOENT' }); } }).records).toEqual([]);
+    const records = [baseRow()];
+    expect(readStore({ path: '/fixture/store', strict: true, read: () => JSON.stringify({ records }) }).records).toEqual(records);
+  });
+});

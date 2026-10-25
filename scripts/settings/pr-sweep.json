@@ -5,6 +5,7 @@
     "idleMinutes": 45,
     "stuckAfterMinutes": 90,
     "stuckAlertMinutes": 90,
+    "stalledAfterMinutes": 45,
     "sessionActiveWithinMinutes": 30,
     "dispatchDiagnosis": false,
     "repos": ["web-everything/web-everything", "plateauapp/plateau-app"]

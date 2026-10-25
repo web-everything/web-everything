@@ -17,6 +17,10 @@ import { handoffHome } from '../operations/handoff-home.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
 import { flushDigest } from '../lib/quiet-hours-io.mjs';
 import { classifyIdlePrs, resolveOwner, planSweep, prKey, isRunningSession } from './pr-sweep-core.mjs';
+import { runStallSweep } from './pr-stall-sweep.mjs';
+import { publishStalledDigest } from './pr-stall-digest.mjs';
+import { runDetector } from './pr-stall-detector.mjs';
+import { expandRepeatedLines } from '../lib/log-timestamp.mjs';
 const SELF = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SELF), '../..');
 const exec = promisify(execFile);
@@ -77,7 +81,7 @@ export async function readSweepAgents({ env, listWrapped, readRows } = {}) {
     .map((w) => ({ reason: `wrapped session ${w.name} missing from the agent listing`, session: w.name }))];
   return gaps.length ? Object.defineProperty(rows, 'incomplete', { value: gaps }) : rows;
 }
-export async function collectOwnerSignals({ prs, dir, env, errors, sourceRoot = ROOT,
+export async function collectOwnerSignals({ prs, dir, env, errors, errorSources = [], sourceRoot = ROOT,
   readAgents = () => readSweepAgents({ env }), readActivity = async (agent) => {
     const { readTranscriptTailActivity } = await import('./hung-session.mjs');
     return readTranscriptTailActivity(agent, { tailLines: 15, maxBytes: 400_000, fieldMax: 200 })?.lastActivityMs ?? null;
@@ -85,7 +89,8 @@ export async function collectOwnerSignals({ prs, dir, env, errors, sourceRoot = 
   cloneRoots = () => daemonCloneRoots(workspaceOf(sourceRoot)), listLogs = readdirSync, readTail = readLogTail,
 }) {
   let sessions = []; let health = {}; const logs = []; let unreadSessions = [];
-  const guarded = async (name, fn, fallback) => { try { return await fn(); } catch (e) { errors.push(`${name}: ${e.message}`); return fallback; } };
+  const recordError = (source, text) => { errorSources.push({ index: errors.length, source }); errors.push(text); };
+  const guarded = async (name, fn, fallback, source = 'logs') => { try { return await fn(); } catch (e) { recordError(source, `${name}: ${e.message}`); return fallback; } };
   sessions = await guarded('agents', async () => {
     const rows = await readAgents(); if (!Array.isArray(rows)) throw new Error('expected agent array');
     // A session missing from a partial listing is unknown, not gone. A gap naming a
@@ -101,16 +106,18 @@ export async function collectOwnerSignals({ prs, dir, env, errors, sourceRoot = 
       let at = null; try { at = await readActivity(a); } catch { at = null; }
       return Number.isFinite(at) ? { ...a, lastActivityAt: at } : { ...a, lastActivityAt: null, activityUnknown: true };
     }));
-  }, []);
-  health = await guarded('health state', async () => { const state = await readHealth(); if (!state || typeof state !== 'object' || Array.isArray(state)) throw new Error('expected health object'); return state; }, {});
+  }, [], 'agents');
+  health = await guarded('health state', async () => { const state = await readHealth(); if (!state || typeof state !== 'object' || Array.isArray(state)) throw new Error('expected health object'); return state; }, {}, 'health');
   const roots = await guarded('daemon roots', cloneRoots, []);
   const dirs = [...new Set([...roots.map((r) => join(r, '.conveyor')), ...(env.HEALTH_WATCH_LOGS_DIR ? [env.HEALTH_WATCH_LOGS_DIR] : [])])];
   for (const d of dirs) {
     // Absent clones have no signals; an existing but unreadable directory is a failed owner read.
     let files;
-    try { files = listLogs(d); } catch (e) { if (e.code !== 'ENOENT') errors.push(`logs ${d}: ${e.message}`); continue; }
+    try { files = listLogs(d); } catch (e) { if (e.code !== 'ENOENT') recordError('logs', `logs ${d}: ${e.message}`); continue; }
     for (const name of files.filter((n) => /^(fix-dispatch-daemon|review-daemon)\.log$|drain.*\.log$|^pass-daemon\.merge-orphan-sweep\.log$/.test(n))) {
-      const text = await guarded(`log ${name}`, () => readTail(join(d, name)), '');
+      // Replay the logger's bounded compression format once per log, before PR
+      // binding and progress/refusal parsing, so each occurrence counts normally.
+      const text = await guarded(`log ${name}`, async () => expandRepeatedLines(await readTail(join(d, name))), '');
       logs.push({ name: basename(name, '.log'), text, repo: /plateau/.test(d) ? 'plateau-app' : 'we' });
     }
   }
@@ -123,7 +130,8 @@ export async function collectOwnerSignals({ prs, dir, env, errors, sourceRoot = 
         ...(isDaemonProgress(line) ? { kind: 'progress' } : { kind: isDispatchRefusal(line) ? 'refusal' : 'diagnostic', reason: line }) });
     }
     for (const [name, data] of Object.entries(health.daemons ?? {})) for (const [ref, refusal] of Object.entries(data.prRefusals ?? {})) {
-      if (mentions(ref, pr)) daemons.push({ name, at: refusal.at, kind: 'refusal', reason: refusal.reason });
+      if (mentions(ref, pr)) daemons.push({ name, at: refusal.at, kind: 'refusal', reason: refusal.reason,
+        ...((refusal.head ?? refusal.headRefOid) != null ? { head: refusal.head ?? refusal.headRefOid } : {}) });
     }
     const episode = Object.values(health.episodes ?? {}).find((e) => ['open', 'flapping'].includes(e.status)
       && ['fixer-stuck', 'fix-claim-held-no-progress', 'ruling-needed-waiting'].includes(e.smell) && mentions(`${e.subject} ${JSON.stringify(e.measure)}`, pr));
@@ -132,7 +140,7 @@ export async function collectOwnerSignals({ prs, dir, env, errors, sourceRoot = 
 }
 export async function runPrSweep({ now = Date.now(), dryRun = false, env = process.env, dir = healthDir(undefined, env), config,
   settings, sourceRoot = ROOT, readPrs, readQueue, readSignals = collectOwnerSignals, readPrevious,
-  notify = notifyDesktopChecked, diagnose, persist, append, flush = flushDigest } = {}) {
+  notify = notifyDesktopChecked, diagnose, persist, append, flush = flushDigest, stallSweep = runStallSweep, stallDigest = publishStalledDigest } = {}) {
   const errors = [];
   const safe = async (name, fn, fallback) => { try { return await fn(); } catch (e) { errors.push(`${name}: ${e.message}`); return fallback; } };
   if (!config && !settings) config = await safe('health config', () => JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8')), {});
@@ -161,6 +169,30 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
   const owners = Object.fromEntries(idle.map((p) => [prKey(p), resolveOwner(p, { ...value, now, ...(signals ?? {})[prKey(p)], operator: needsYou?.some((n) => prKey(n) === prKey(p)) })]));
   const planned = planSweep({ idle, owners, prevState: previous ?? {}, needsYou, now, settings: value, ownerReadsOk, prsReadOk });
   const report = { at: new Date(now).toISOString(), settings: value, sources: resolved.sources, ...planned.report, alerts: planned.alerts, diagnose: planned.diagnose, nextState: planned.nextState, errors };
+  const detect = async () => {
+    const out = await runDetector({ prs, seen: previous?.stallDetector ?? {}, now, env,
+      readSignals: async ({ prs }) => {
+        const readErrors = [], errorSources = [];
+        const signals = await readSignals({ prs, now, dir, env, errors: readErrors, errorSources, sourceRoot });
+        // Agent activity is used by the owner sweep, but the detector only needs
+        // log/refusal evidence. Unknown-source errors still fail closed.
+        const agentsOnly = new Set(errorSources.filter(e => e.source === 'agents').map(e => e.index));
+        detectorErrors.push(...readErrors.filter((_, index) => !agentsOnly.has(index)));
+        errors.push(...readErrors.filter((_, index) => agentsOnly.has(index)).map(e => `owner signals: ${e}`));
+        if (readErrors.some((_, index) => !agentsOnly.has(index))) throw new Error('owner signals incomplete');
+        return signals;
+      } });
+    detectorErrors.push(...out.errors);
+    errors.push(...detectorErrors.map(e => `stall detector: ${e}`));
+    report.stallDetector = { enabled: out.enabled, stalled: out.items.length, ...(dryRun ? { items: out.items } : {}) };
+    // A PR the detector could not read keeps its saved clock, so recovery does not restart its age.
+    const keptOld = Object.fromEntries(Object.entries(previous?.stallDetector ?? {}).filter(([k]) =>
+      (out.failedPrKeys ?? []).some(key => k.startsWith(`${key}@`))));
+    report.nextState.stallDetector = prsReadOk ? { ...keptOld, ...out.nextSeen } : previous?.stallDetector ?? {};
+    return out;
+  };
+  const detectorErrors = [];
+  report.nextState.stallDetector = previous?.stallDetector ?? {}; // the first save must not drop saved clocks
   if (!dryRun) {
     await safe('quiet digest', () => flush({ send: (n) => notify(n, { quietGate: null }) }));
     let needsYouSendFailed = false;
@@ -171,16 +203,44 @@ export async function runPrSweep({ now = Date.now(), dryRun = false, env = proce
     }
     if (needsYouSendFailed) report.nextState.needsYou = previous.needsYou;
 
+    report.nextState.stallSweep = previous?.stallSweep ?? {};
     for (const repo of report.diagnose) await safe(`diagnose ${repo}`, () => diagnose ? diagnose(repo) : command(process.execPath, [join(ROOT, 'scripts/conveyor/stuck-pr-watch.mjs'), 'sweep', `--repo=${repo}`], env));
     await safe('handoff log', () => {
       const at = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', dateStyle: 'short', timeStyle: 'medium' }).format(now);
       const line = `${at} ET idle=${idle.length} needsYou=${needsYou?.length ?? '?'} alerts=${report.alerts.length} errors=${errors.length} ${report.idle.map((p) => `${prKey(p)}=${p.owner ?? 'none'}(${p.state})`).join(' ')}\n`;
       if (append) return append(line); const home = handoffHome(); mkdirSync(home, { recursive: true }); appendFileSync(join(home, 'pr-sweep.log'), `${line.trimEnd().replace(/[\r\n]/g, ' ')}\n`);
     });
-    await safe('report write', () => {
+    const write = () => safe('report write', () => {
       if (persist) return persist(report); mkdirSync(dir, { recursive: true }); const dest = join(dir, 'pr-sweep.json'); const tmp = `${dest}.${process.pid}.tmp`; writeFileSync(tmp, `${JSON.stringify(report, null, 2)}\n`); renameSync(tmp, dest);
     });
+    await write();
+    // The automatic stall sweep (shadow until slice 5) runs AFTER this sweep's own state is saved, so a slow or failing
+    // stall pass can never cost the card-335 sweep its state. It keeps its own `prStallSweep.intervalMinutes`.
+    const stalled = await safe('stall sweep', async () => {
+      const out = await safe('stall sweep', () => stallSweep({ now, env, state: previous?.stallSweep ?? {} }),
+        { mode: 'off', incomplete: true });
+      const detector = await detect();
+      report.nextState.stallSweep = out.state ?? report.nextState.stallSweep;
+      report.stallSweep = { mode: out.mode, skipped: out.skipped ?? null, wouldDo: out.act?.length ?? 0, incomplete: out.incomplete ?? null,
+        lanes: Object.fromEntries(['system', 'policy', 'operator'].map((l) => [l, (out.items ?? []).filter((i) => i.lane === l).length])) };
+      errors.push(...(out.errors ?? []).map((e) => `stall sweep: ${e}`));
+      // Operator items go to the needs-you feed (kind `stalled`) and one quiet-hours-gated alert per pass.
+      const sweepDigestEnabled = out.mode !== 'off' && out.digest !== false;
+      const published = sweepDigestEnabled ? out.items ?? [] : [];
+      // A skipped (not-due) sweep has no items, so publishing would clear its open ones: wait for a pass that ran.
+      if (out.dir && (out.items || out.mode === 'off' || out.digest === false)) {
+        const d = stallDigest({ ...out, items: [...published, ...detector.items.filter(d => !published.some(i => i.lane === 'operator' && i.repo === d.repo && i.pr === d.pr && String(i.head).toLowerCase() === d.head))],
+          incomplete: out.incomplete || !prsReadOk || detectorErrors.length > 0 },
+        { now, env, stateDir: out.dir, notify,
+          enabled: sweepDigestEnabled || detector.items.length > 0 || detector.enabled });
+        report.stallSweep.digest = { published: d.lines?.length ?? 0, alerted: d.fresh?.length ?? 0, notified: !!d.notified };
+        errors.push(...(d.errors ?? []).map((e) => `stall digest: ${e}`));
+      }
+      return true;
+    }, false);
+    if (stalled || errors.some((e) => e.startsWith('stall sweep'))) await write();
   }
+  else await detect();
   return report;
 }
 // Match the detached job's entry check, including snapshots reached through /var symlinks.

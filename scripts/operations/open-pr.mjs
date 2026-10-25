@@ -47,6 +47,45 @@ export const SUPERSEDES_LINE_GUIDANCE = 'A PR that folds in another open PR\'s f
 
 export const OPEN_PR_OP = 'open-pr';
 
+export const OPEN_PR_MAX_NON_TEST_LINES = 300;
+
+/** Pure git --numstat -z accounting (also accepts legacy unquoted newline rows).
+ * Binary rows are unmeasurable; malformed or incomplete evidence must never become a zero-sized diff.
+ */
+export function measureNonTestLines(numstatText) {
+  if (typeof numstatText !== 'string') throw new Error('numstat must be text');
+  if (!numstatText) return { lines: 0, exempt: false };
+  const nulDelimited = numstatText.includes('\0');
+  if (nulDelimited && !numstatText.endsWith('\0')) throw new Error('unterminated numstat record');
+  const rows = nulDelimited ? numstatText.slice(0, -1).split('\0') : numstatText.replace(/\n$/, '').split('\n');
+  let lines = 0;
+  let exempt = true;
+  for (let i = 0; i < rows.length; i++) {
+    const match = /^(\d+|-)\t(\d+|-)\t([\s\S]*)$/.exec(rows[i]);
+    if (!match) throw new Error('unreadable numstat line');
+    const [, additions, deletions] = match;
+    let paths = [match[3]];
+    // -z represents a rename as counts + empty path, then the old and new paths.
+    if (nulDelimited && !paths[0]) {
+      const source = rows[++i];
+      const destination = rows[++i];
+      if (!source || !destination) throw new Error('incomplete numstat rename');
+      paths = [source, destination];
+    }
+    if (paths.some((path) => !path || (!nulDelimited && /[\t\r\n]|^"/.test(path)))) throw new Error('unreadable numstat path');
+    if ((additions === '-') !== (deletions === '-')) throw new Error('unreadable numstat counts');
+    if (additions === '-') throw new Error('unmeasurable numstat counts');
+    const changed = Number(additions) + Number(deletions);
+    if (!Number.isSafeInteger(changed)) throw new Error('numstat count exceeds safe integer range');
+    exempt = exempt && paths.every((path) => path.startsWith('backlog/'));
+    if (!paths.every((path) => /(^|\/)__tests__\//.test(path) || /(^|\/)[^/]*\.(test|spec)\.[^/]+$/.test(path))) {
+      lines += changed;
+      if (!Number.isSafeInteger(lines)) throw new Error('numstat total exceeds safe integer range');
+    }
+  }
+  return { lines, exempt };
+}
+
 /** The one effect: hand the planned argv to the home. */
 export const SUBMIT_PR_EFFECT = 'open-pr.submit';
 

@@ -335,6 +335,8 @@ function lockDirAgeMs(lockRoot, path) {
  * outcome the lane acts on. `pidLiveness` defaults to `'unknown'` (TTL-only reclaim) unless the caller
  * probed same-machine liveness. Pass a probe function instead of a verdict to have it judged against the
  * entry this call reads (no stale double-read window).
+ * `leaseMinutes` may likewise be `(entry) => minutes`, so callers recording a holder-specific lease can
+ * judge that SAME entry without applying a contender's lease or taking a separate, stale read.
  * @param {boolean} [requireOwnProcess]  opt-in (default `false`, so every EXISTING caller is unaffected):
  *   when `true`, the "already mine" reentrancy fast path additionally requires the held entry's `pid` to
  *   match THIS call's own `pid` — see {@link reclaimDecision}'s `requesterPid`. Set this only where `owner`
@@ -364,7 +366,8 @@ export function reserve(lockRoot, path, owner, nowMs, nowIso, pid = null, pidLiv
   // `pidLiveness` may be a probe `(entry) => 'dead'|'alive'|'unknown'`, run against THIS read — so the verdict
   // always describes the holder being judged, never one a caller read earlier and lost the lock from (#2668).
   const liveness = typeof pidLiveness === 'function' ? (current ? pidLiveness(current) : 'unknown') : pidLiveness;
-  const d = reclaimDecision(current, nowMs, owner, liveness, leaseMinutes, requireOwnProcess ? pid : null);
+  const heldLeaseMinutes = typeof leaseMinutes === 'function' ? leaseMinutes(current) : leaseMinutes;
+  const d = reclaimDecision(current, nowMs, owner, liveness, heldLeaseMinutes, requireOwnProcess ? pid : null);
   if (!d.acquirable) return { ok: false, reason: d.reason, heldBy: d.heldBy };
   if (d.reason === 'own') { heartbeat(lockRoot, path, owner, nowIso, pid, meta); return { ok: true, reason: 'own', heldBy: owner }; }
   // reclaim a stale/dead owner: drop ITS dir (only if it is still the entry we judged — a reclaimer that read the

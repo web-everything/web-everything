@@ -4,14 +4,16 @@
  *   read/write, the mint call, the repo listing, the clock, the `process.env` mutation) is injected — no real fs,
  *   no real network, no real GitHub App needed.
  */
-import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { describe, it, expect, vi, beforeAll } from 'vitest';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import {
   resolveGithubAppEnvConfig, isCacheFresh, ensureFreshGithubAppEnv, withGithubAppAuth,
   REFRESH_BUFFER_MS, defaultCachePath, findInstallationGaps, CACHE_VERSION, REQUIRED_APP_PERMISSIONS, REQUIRED_APP_REPOS,
-  defaultStatusPath, readGithubAppStatus,
+  defaultStatusPath, readGithubAppStatus, defaultInstallOwnerShim,
 } from '../github-app-auth-env.mjs';
 
 // NEVER THE REAL HOME DIR (#x8mpubm follow-up, live-caught: before this existed, this suite's own pre-existing
@@ -565,7 +567,7 @@ describe('half-configured App auth (2026-10-09 drain incident)', () => {
   });
 
   it.each([true, false])('reports absent configuration only for a daemon (daemon=%s)', async (daemon) => {
-    const opts = { ...options(`absent-config-${daemon}.mjs`, {}), daemon };
+    const opts = { ...options(`absent-config-${daemon}.mjs`, {}), daemon, installShim: async () => ({ ok: true }) };
     expect(await ensureFreshGithubAppEnv(opts)).toEqual({ applied: false, reason: 'not-configured' });
     expect(opts.mint).not.toHaveBeenCalled();
     expect(opts.writeStatus).not.toHaveBeenCalled();
@@ -633,5 +635,270 @@ describe('half-configured App auth (2026-10-09 drain incident)', () => {
     expect(warnGithubAppConfigAtStart({ env: halfEnv, policy: { auth: 'personal' }, log, caller: 'startup-personal-test.mjs' }).state)
       .toBe('policy-personal');
     expect(log.error).not.toHaveBeenCalled();
+  });
+});
+
+describe('daemon refresh lookahead and legacy fallback liveness', () => {
+  // Both loop modules are heavy (8s+ to import on a loaded host): load them once, outside the 5s test budget.
+  let runPassDaemonLoop;
+  let runLoopCycle;
+  beforeAll(async () => {
+    ({ runPassDaemonLoop } = await import('../../../skills-src/conveyor/pass-daemon.mjs'));
+    ({ runLoopCycle } = await import('../../conveyor/await-verify-loop.mjs'));
+  }, 120_000);
+
+  it.each(['pass', 'verify'].flatMap((loop) => ['returned', 'thrown'].map((failure) => [loop, failure])))
+  ('stops the real %s loop when guard installation fails (%s)', async (loop, failure) => {
+    const env = { PATH: '/usr/bin:/bin', GH_TOKEN: 'fixture-personal' };
+    const work = vi.fn(async () => ({ code: 0 }));
+    const refresh = () => ensureFreshGithubAppEnv({
+      ...NOOP_STATUS, env, daemon: true, caller: 'guard-loop-test',
+      identity: {}, policy: { auth: 'app' },
+      installShim: async () => {
+        if (failure === 'thrown') throw Error('fixture unwritable shim');
+        return { ok: false };
+      },
+    });
+    const attempt = loop === 'pass'
+      ? runPassDaemonLoop({ refreshAuth: refresh, runPass: work, sleep: async () => {}, intervalMs: 1, maxRuns: 1 })
+      : runLoopCycle({ ensureAuth: refresh, cycle: work });
+    await expect(attempt).rejects.toThrow('refusing to run daemon without the gh auth guard');
+    expect(work).not.toHaveBeenCalled();
+  });
+
+  // PR #5729 red team: a config read that throws BEFORE the guard is installed (a malformed
+  // delivery.identity, an unreadable auth policy) must still stop the daemon, never fall through to its cycle.
+  const PRE_GUARD_FAILURES = {
+    'malformed identity env': {
+      env: { WE_DELIVERY_IDENTITY: JSON.stringify({ worker: { appId: '1', key: { file: '/fixture.pem' }, installations: { 'web-everything': { toString: null } } } }) },
+      opts: { policy: { auth: 'app' } },
+    },
+    'identity that throws on read': {
+      opts: { policy: { auth: 'app' }, identity: { get callerRoles() { throw TypeError('fixture malformed identity'); } } },
+    },
+    'policy that throws on read': {
+      opts: { identity: {}, policy: { get auth() { throw TypeError('fixture malformed policy'); } } },
+    },
+  };
+  it.each(['pass', 'verify'].flatMap((loop) => Object.keys(PRE_GUARD_FAILURES).map((failure) => [loop, failure])))
+  ('stops the real %s loop when a pre-guard config read throws (%s)', async (loop, failure) => {
+    const { env: extraEnv = {}, opts } = PRE_GUARD_FAILURES[failure];
+    const env = { PATH: '/usr/bin:/bin', GH_TOKEN: 'fixture-personal', ...extraEnv };
+    const work = vi.fn(async () => ({ code: 0 }));
+    const writeCallerStatus = vi.fn();
+    const writeStatus = vi.fn();
+    const refresh = () => ensureFreshGithubAppEnv({
+      writeStatus, writeCallerStatus, env, daemon: true, caller: 'guard-config-test', ...opts,
+      installShim: async () => ({ ok: true }), log: { error() {} },
+    });
+    const attempt = loop === 'pass'
+      ? runPassDaemonLoop({ refreshAuth: refresh, runPass: work, sleep: async () => {}, intervalMs: 1, maxRuns: 1 })
+      : runLoopCycle({ ensureAuth: refresh, cycle: work });
+    await expect(attempt).rejects.toThrow('refusing to run daemon without the gh auth guard');
+    expect(work).not.toHaveBeenCalled();
+    expect(writeCallerStatus).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ applied: false, reason: 'guard-config-invalid' }));
+    // One caller's bad config never overwrites the fleet-wide installation status.
+    expect(writeStatus).not.toHaveBeenCalled();
+  });
+
+  // The whole pre-guard region, default parameters included, is inside the one fail-closed boundary.
+  it.each(['explicit daemon option', 'env daemon marker'])
+  ('stops the real loops when a default parameter throws before the guard (%s)', async (how) => {
+    const brokenEnv = () => ({
+      PATH: '/usr/bin:/bin', GH_TOKEN: 'fixture-personal',
+      ...(how === 'env daemon marker' ? { XPC_SERVICE_NAME: 'com.we.fixture-daemon' } : {}),
+      get WE_GITHUB_AUTH_CALLER() { throw TypeError('fixture unreadable caller'); },
+    });
+    for (const loop of ['pass', 'verify']) {
+      const work = vi.fn(async () => ({ code: 0 }));
+      const installShim = vi.fn(async () => ({ ok: true }));
+      let thrown;
+      const refresh = () => ensureFreshGithubAppEnv({
+        ...NOOP_STATUS, env: brokenEnv(), ...(how === 'explicit daemon option' ? { daemon: true } : {}),
+        identity: {}, policy: { auth: 'app' }, installShim, log: { error() {} },
+      }).catch((e) => { thrown = e; throw e; });
+      const attempt = loop === 'pass'
+        ? runPassDaemonLoop({ refreshAuth: refresh, runPass: work, sleep: async () => {}, intervalMs: 1, maxRuns: 1 })
+        : runLoopCycle({ ensureAuth: refresh, cycle: work });
+      await expect(attempt).rejects.toThrow('refusing to run daemon without the gh auth guard');
+      expect(work).not.toHaveBeenCalled();
+      expect(installShim).not.toHaveBeenCalled();
+      expect(thrown.cause?.message).toBe('fixture unreadable caller');
+    }
+  });
+
+  it('keeps a throw AFTER the guard is installed as a transient refresh error (the guard stays in effect)', async () => {
+    const err = TypeError('fixture cache unreadable');
+    await expect(ensureFreshGithubAppEnv({
+      ...NOOP_STATUS, env: { ...CONFIGURED_ENV }, daemon: true, caller: 'post-guard', identity: {}, policy: { auth: 'app' },
+      installShim: async () => ({ ok: true }), readCache: () => { throw err; }, log: { error() {} },
+    })).rejects.toBe(err);
+  });
+
+  it('a non-daemon caller still sees the original config error (no guard to protect)', async () => {
+    await expect(ensureFreshGithubAppEnv({
+      ...NOOP_STATUS, env: {}, daemon: false, caller: 'interactive', policy: { auth: 'app' },
+      identity: { get callerRoles() { throw TypeError('fixture malformed identity'); } }, log: { error() {} },
+    })).rejects.toThrow('fixture malformed identity');
+  });
+
+  it('installs the daemon refusal shim before a failed early refresh and before the tick', async () => {
+    const { resolveDeliveryIdentity } = await import('../github-app-identity.mjs');
+    const now = Date.now();
+    const identity = resolveDeliveryIdentity({ tool: { worker: { appId: '2', installations: { 'web-everything': '22' }, key: { file: '/fixture/worker-key' } } } });
+    const events = [];
+    const env = { GITHUB_TOKEN: 'fixture-personal' };
+    const wrapped = withGithubAppAuth({ tickOnce: () => { events.push('tick'); } }, {
+      ...NOOP_STATUS, env, identity, role: 'worker', daemon: true, perOwner: true, now,
+      cachePath: '/fixture/cache.json',
+      readCache: () => ({ v: CACHE_VERSION, appId: '2', installationId: '22', token: 'fixture-worker', expiresAt: new Date(now + 20 * 60e3).toISOString() }),
+      canReadKey: () => true,
+      installShim: async () => { events.push('shim'); return { ok: true }; },
+      mint: async () => { events.push('mint'); throw Error('fixture network unavailable'); },
+      log: { error() {} },
+    });
+    await wrapped.tickOnce();
+    expect(events).toEqual(['shim', 'mint', 'tick']);
+  });
+
+  it.each(['returned failure', 'thrown failure'])('does not mint or tick if the daemon guard cannot be installed (%s)', async (failure) => {
+    const tickOnce = vi.fn();
+    const mint = vi.fn();
+    const wrapped = withGithubAppAuth({ tickOnce }, {
+      ...NOOP_STATUS, env: { ...CONFIGURED_ENV }, daemon: true, perOwner: true, mint,
+      installShim: async () => {
+        if (failure === 'thrown failure') throw Error('fixture unwritable shim');
+        return { ok: false };
+      },
+      log: { error() {} },
+    });
+    await expect(wrapped.tickOnce()).rejects.toThrow('refusing to run daemon without the gh auth guard');
+    expect(mint).not.toHaveBeenCalled();
+    expect(tickOnce).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('uses the correct primary AND per-installation buffer (daemon=%s)', async (daemon) => {
+    const { DAEMON_REFRESH_BUFFER_MS } = await import('../github-app-auth-env.mjs');
+    expect(DAEMON_REFRESH_BUFFER_MS).toBe(30 * 60 * 1000);
+    const now = Date.now();
+    const env = { WE_GITHUB_APP_ID: '1', WE_GITHUB_APP_INSTALLATION_ID: '11', WE_GITHUB_APP_PRIVATE_KEY_PATH: '/fixture/key', WE_GITHUB_APP_INSTALLATIONS: JSON.stringify({ 'web-everything': '11', 'frontier-ui': '22', plateauapp: '11' }) };
+    const mint = vi.fn(async ({ installationId }) => ({ token: 'fixture-minted', expiresAt: new Date(now + 3600e3).toISOString(), permissions: FULL_PERMS }));
+    const result = await ensureFreshGithubAppEnv({
+      ...NOOP_STATUS, env, daemon, caller: 'buffer-probe', cachePath: '/fixture/cache.json', now,
+      readCache: (path) => ({ v: CACHE_VERSION, appId: '1', installationId: path.includes('.22.') ? '22' : '11', token: 'fixture-cached', expiresAt: new Date(now + 20 * 60e3).toISOString() }),
+      writeCache: vi.fn(), mint, getInstallationInfo: async () => ({ repositorySelection: 'all' }),
+      perOwner: true, installShim: async () => ({ ok: true }), required: { permissions: {}, repos: [] },
+      log: { error() {} },
+    });
+    expect(result.applied).toBe(true);
+    expect(mint.mock.calls.map(([args]) => args.installationId)).toEqual(daemon ? ['11', '22'] : []);
+    expect(env.WE_GH_DAEMON_CALLER).toBe(daemon ? 'buffer-probe' : undefined);
+  });
+
+  it.each([false, true].flatMap((failLegacy) => ['mint', 'cache'].map((source) => [failLegacy, source])))
+  ('refreshes legacy after the role applies, without replacing role outcome (legacy failure=%s, role source=%s)', async (failLegacy, source) => {
+    const { resolveDeliveryIdentity } = await import('../github-app-identity.mjs');
+    const now = Date.now();
+    const identity = resolveDeliveryIdentity({ tool: { worker: { appId: '2', installations: { 'web-everything': '22' }, key: { file: '/fixture/worker-key' } } } });
+    const env = { ...CONFIGURED_ENV };
+    const setEnv = vi.fn();
+    const mint = vi.fn(async ({ appId }) => {
+      if (failLegacy && appId === CONFIGURED_ENV.WE_GITHUB_APP_ID) throw Error('fixture unavailable');
+      return { token: appId === '2' ? 'fixture-worker' : 'fixture-legacy', expiresAt: new Date(now + 3600e3).toISOString(), permissions: FULL_PERMS };
+    });
+    const writeCache = vi.fn();
+    const writeStatus = vi.fn();
+    const writeCallerStatus = vi.fn();
+    const result = await ensureFreshGithubAppEnv({
+      writeStatus, writeCallerStatus, caller: 'fixture-daemon', env, identity, role: 'worker', daemon: true, now, cachePath: '/fixture/cache.json',
+      readCache: (path) => source === 'cache' && path !== '/fixture/cache.json'
+        ? { v: CACHE_VERSION, appId: '2', installationId: '22', token: 'fixture-worker', expiresAt: new Date(now + 3600e3).toISOString() }
+        : null,
+      writeCache, mint, canReadKey: () => true,
+      getInstallationInfo: async () => ({ repositorySelection: 'all' }), required: { permissions: {}, repos: [] },
+      extraInstallations: false, setEnv, installShim: async () => ({ ok: true }), log: { error() {} },
+    });
+    expect(result).toEqual({ applied: true, reason: 'ok', role: 'worker', requestedRole: 'worker', appId: '2' });
+    expect(mint.mock.calls.map(([a]) => a.appId)).toEqual(source === 'mint' ? ['2', CONFIGURED_ENV.WE_GITHUB_APP_ID] : [CONFIGURED_ENV.WE_GITHUB_APP_ID]);
+    expect(setEnv).toHaveBeenCalledTimes(1);
+    expect(setEnv).toHaveBeenCalledWith('fixture-worker');
+    expect(env.WE_GH_AUTH_INSTALLATION).toBe('22');
+    expect(env.WE_GH_AUTH_SOURCE).toBe(source);
+    expect(env.WE_GH_AUTH_TOKEN_HASH).toBe(createHash('sha256').update('fixture-worker').digest('hex'));
+    expect(writeStatus).not.toHaveBeenCalled();
+    expect(writeCallerStatus).toHaveBeenCalledTimes(1);
+    expect(writeCallerStatus).toHaveBeenCalledWith(expect.any(String), {
+      caller: 'fixture-daemon', daemon: true, ...result, checkedAt: new Date(now).toISOString(),
+    });
+    if (!failLegacy) expect(writeCache).toHaveBeenCalledWith('/fixture/cache.json', expect.objectContaining({ token: 'fixture-legacy' }));
+  });
+});
+
+// PR #5729 red team: the shim only guards a daemon while it is the FIRST gh on PATH. A shim dir that
+// already appears later (an inherited PATH) must still be moved in front of the real gh.
+describe('defaultInstallOwnerShim PATH precedence', () => {
+  const dir = '/fixture/checkout/.gh-shim';
+  const opts = { cachePath: '/fixture/cache.json', identity: { anyConfigured: false, roles: {} }, dir,
+    exists: (path) => path === '/opt/homebrew/bin/gh', writeFile() {}, chmod() {}, mkdir() {} };
+
+  it.each([
+    ['later on PATH', `/opt/homebrew/bin:${dir}:/usr/bin`],
+    ['absent from PATH', '/opt/homebrew/bin:/usr/bin'],
+    ['already first', `${dir}:/opt/homebrew/bin:/usr/bin`],
+  ])('puts the shim dir first when it is %s', async (_, path) => {
+    const env = { WE_GH_DAEMON_CALLER: 'test-daemon', PATH: path };
+    expect(await defaultInstallOwnerShim(env, opts)).toEqual({ ok: true, dir });
+    expect(env.PATH.split(':')[0]).toBe(dir);
+    const once = env.PATH;
+    await defaultInstallOwnerShim(env, opts);
+    expect(env.PATH).toBe(once); // idempotent across ticks
+  });
+});
+
+// PR #5729 send-back — a daemon that forgets `daemon: true` (the drain did) still gets the refusal shim.
+describe('daemon mode defaults from the env markers', () => {
+  it('an XPC-only drain (com.plateau.drain-daemon, auth=app, no App identity) installs the refusal shim and gh auth token is refused', async () => {
+    const work = mkdtempSync(join(tmpdir(), 'drain-gh-guard-'));
+    try {
+      const bin = join(work, 'bin');
+      mkdirSync(bin);
+      const invoked = join(work, 'gh-invoked');
+      writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho called >> '${invoked}'\necho fixture-personal-token\n`, { mode: 0o755 });
+      // node's own dir on PATH: the shim is a node script, and without it the shell's exit 127 would fake a refusal.
+      const env = { PATH: `${bin}:${dirname(process.execPath)}:/usr/bin:/bin`, XPC_SERVICE_NAME: 'com.plateau.drain-daemon', GH_TOKEN: 'fixture-personal' };
+      // The real installer and shim, kept in the fixture dir; the owning checkout is absent, so policy is the daemon default.
+      const installShim = vi.fn((e, o) => defaultInstallOwnerShim(e, { ...o, dir: join(work, 'shim'), ghThrottleCliPath: join(work, 'scripts', 'lib', 'gh-throttle.mjs') }));
+      await ensureFreshGithubAppEnv({
+        ...NOOP_STATUS, env, caller: 'merge-ai-prs.mjs', identity: {}, policy: { auth: 'app' },
+        cachePath: join(work, 'cache.json'), installShim, log: { error() {} },
+      });
+      expect(installShim).toHaveBeenCalledTimes(1);
+      expect(env.PATH.split(':')[0]).toBe(join(work, 'shim'));
+      const r = spawnSync('gh', ['auth', 'token'], { env, encoding: 'utf8', timeout: 20000 });
+      expect(r.status).toBe(1);
+      expect(r.stdout).not.toContain('fixture-personal-token');
+      expect(existsSync(invoked)).toBe(false);
+    } finally { rmSync(work, { recursive: true, force: true }); }
+  }, 60_000); // imports the real shim module and spawns the rendered shim: over 5s on a loaded host
+
+  it.each([
+    ['explicit WE_GH_DAEMON_CALLER', { WE_GH_DAEMON_CALLER: 'drain' }, true],
+    ['XPC com.we.*', { XPC_SERVICE_NAME: 'com.we.pass-daemon' }, true],
+    ['XPC com.plateau.*', { XPC_SERVICE_NAME: 'com.plateau.drain-daemon' }, true],
+    ['no marker', {}, false],
+    ['a non-daemon XPC service', { XPC_SERVICE_NAME: 'application.com.apple.Terminal' }, false],
+  ])('with `daemon` omitted: %s', async (_name, marker, daemon) => {
+    const installShim = vi.fn(async () => ({ ok: false }));
+    const run = ensureFreshGithubAppEnv({
+      ...NOOP_STATUS, env: { PATH: '/usr/bin', ...marker }, caller: 'marker-test', identity: {}, policy: { auth: 'app' },
+      cachePath: '/fixture/missing-cache.json', installShim, log: { error() {} },
+    });
+    if (daemon) {
+      await expect(run).rejects.toThrow('refusing to run daemon without the gh auth guard');
+      expect(installShim).toHaveBeenCalledTimes(1);
+    } else {
+      await run;
+      expect(installShim).not.toHaveBeenCalled();
+    }
   });
 });

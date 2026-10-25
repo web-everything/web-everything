@@ -65,10 +65,13 @@ import { RECORD_REFERRAL_RULING_OP } from '../record-referral-ruling.mjs';
 import { VERIFY_OP } from '../verify.mjs';
 import { MUTATION_CHECK_OP, REVERT_RED_CHECK_OP } from '../mutation-check.mjs';
 import { PR_STATUS_OP } from '../pr-status.mjs';
+import { JUDGE_SWEEP_FACTS_OP } from '../judge-sweep-facts.mjs';
+import { ADOPTION_MATRIX_OP } from '../adoption-matrix.mjs';
 import { LAND_ADVANCE_OP } from '../land-advance.mjs';
 import { PR_RECONCILE_OP } from '../pr-reconcile.mjs';
 import { RUNNER_ACTIVITY_OP } from '../runner-activity.mjs';
 import { PR_OWNERSHIP_OP } from '../pr-ownership.mjs';
+import { PR_SWEEP_OP } from '../pr-sweep.mjs';
 import { DAEMON_STATUS_OP } from '../daemon-status.mjs';
 import { HEAVY_QUEUE_OP } from '../heavy-queue.mjs';
 import { RESOURCE_STATUS_OP } from '../resource-status.mjs';
@@ -343,6 +346,7 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // express: the declaring module reaches nothing at all, and the io shell reaches `child_process` and NO
     // network — the home is its only route to GitHub.
     [OPEN_PR_OP]: 'open-pr.mjs',
+    'graduate-chain': 'graduate-chain.mjs',
     // #xrk6hmj — `record-verdict`'s `stage` step pushes to the transport branch, so it is emphatically NOT
     // read-only; listed here only for map coverage. Its declaring module still imports nothing that can act
     // (the reader and the git sinks live in `record-verdict-io.mjs`), but that is a discipline its own suite
@@ -374,6 +378,8 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // `registry.mjs` and `step-kinds.mjs`, and every `gh` call lives in `pr-status-io.mjs` behind the
     // injected reader. It reads PRs; it can act on none of them.
     [PR_STATUS_OP]: 'pr-status.mjs',
+    [JUDGE_SWEEP_FACTS_OP]: 'judge-sweep-facts.mjs',
+    [ADOPTION_MATRIX_OP]: 'adoption-matrix.mjs',
     // #3720/#3856 — `land-advance` is READ-ONLY (plan only, no sinks): its declaration reaches nothing that
     // can act — every effect the plan can call for (dispatching a delivery agent, a CI-heal repair, a review,
     // queueing an item) lives behind `land-advance-io.mjs`'s sinks, which `../run.mjs` never wires into this
@@ -386,6 +392,9 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // `registry.mjs` and `step-kinds.mjs`, and every reconcile/agents/transcript/lane/timeline/runner-activity
     // read (and the borrowed `classifyPr`/`bindAgents`) lives in `pr-ownership-io.mjs` behind the injected reader.
     [PR_OWNERSHIP_OP]: 'pr-ownership.mjs',
+    // Every step is `compute`; the declaring module reaches only the pure marker/red-team-gate readers and the
+    // reader (`pr-sweep-io.mjs`: gh, ps, the drain log, all read-only) is bound by `../run.mjs`.
+    [PR_SWEEP_OP]: 'pr-sweep.mjs',
     // #4067 (epic #4075, under #3383) — READ-ONLY and genuinely so: both steps are `compute`, the declaring
     // module imports only `registry.mjs` and `step-kinds.mjs`, and every launchd/lease/log/git/overlay/
     // rebuild-alert read lives in `daemon-status-io.mjs` behind the injected `collect` reader.
@@ -404,6 +413,7 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     // `registry.mjs`, `step-kinds.mjs` and the pure `../readiness/scope-lease.mjs` matcher. The gh/registry/card
     // reads live in `free-scope-io.mjs` behind the injected `collect` reader.
     [FREE_SCOPE_OP]: 'free-scope.mjs',
+    'prototype-load': 'prototype-load.mjs',
     // Card 359 — READ-ONLY: snapshot reads are injected from operator-session-bootstrap-io.mjs.
     'operator-session-bootstrap': 'operator-session-bootstrap.mjs',
     // Card xvz55jf (epic #3931) — READ-ONLY and genuinely so: both steps are `compute`, the declaring module's
@@ -510,7 +520,7 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
   it('every operation registered as read-only declares in a module that reaches nothing that can act', () => {
     const readOnly = Object.keys(OPERATIONS).filter((name) => isReadOnlyOperation(resolveOperation(name).declaration));
     // Pinned, not derived: adding a read-only operation must be a deliberate edit here.
-    expect(readOnly.sort()).toEqual(['why', 'health-respond', 'operator-session-bootstrap', AGENT_ACTIVITY_OP, DAEMON_STATUS_OP, DISPATCH_ELIGIBILITY_OP, GATE_HEALTH_OP, GRADUATION_PROGRESS_REPORT_OP, FREE_SCOPE_OP, HEAVY_QUEUE_OP, ITEM_ACTIVITY_OP, LAND_ADVANCE_OP, LIVE_STATE_OP, LIVE_WORK_OP, PR_OWNERSHIP_OP, PR_STATUS_OP, PR_RECONCILE_OP, PRE_PR_CHECK_OP, RESOURCE_STATUS_OP, REVIEW_SEAT_CAPS_OP, ROUTE_PR_OUTCOME_OP, RUNNER_ACTIVITY_OP, SESSIONS_OP, STALE_STATE_OP, SUGGEST_NEXT_OP, TELEMETRY_SUMMARY_OP, VERIFY_OP].sort());
+    expect(readOnly.sort()).toEqual(['why', 'health-respond', 'operator-session-bootstrap', ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, AGENT_ACTIVITY_OP, DAEMON_STATUS_OP, DISPATCH_ELIGIBILITY_OP, GATE_HEALTH_OP, GRADUATION_PROGRESS_REPORT_OP, FREE_SCOPE_OP, HEAVY_QUEUE_OP, ITEM_ACTIVITY_OP, LAND_ADVANCE_OP, LIVE_STATE_OP, LIVE_WORK_OP, PR_OWNERSHIP_OP, PR_SWEEP_OP, PR_STATUS_OP, PR_RECONCILE_OP, PRE_PR_CHECK_OP, RESOURCE_STATUS_OP, REVIEW_SEAT_CAPS_OP, ROUTE_PR_OUTCOME_OP, RUNNER_ACTIVITY_OP, SESSIONS_OP, STALE_STATE_OP, SUGGEST_NEXT_OP, TELEMETRY_SUMMARY_OP, VERIFY_OP].sort());
     for (const name of readOnly) {
       const { external } = importGraph(resolvePath(OPS_DIR, DECLARING_MODULE[name]));
       expect(external, `\`${name}\` declares in ${DECLARING_MODULE[name]}, which must import nothing that can act`)

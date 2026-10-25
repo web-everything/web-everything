@@ -75,4 +75,14 @@ describe('false-finding cause fixtures', () => {
     expect(seen).toEqual({ ...window, since: new Date(window.since).toISOString() }); expect(JSON.parse(result.output).count).toBe(0);
     expect(() => runFalseFindings(['--since=nonsense'], { io })).toThrow(/ISO/);
   });
+  it('--until bounds the window and is validated (ISO, since <= until <= now)', () => {
+    let seen;
+    const collect = w => { seen = w; return { count: 0 }; };
+    const now = '2026-10-20T03:00:00.000Z';
+    runFalseFindings(['--since', '2026-10-19T02:18:30.239Z', '--until', '2026-10-20T02:18:17.742Z', '--json'], { now, collect });
+    expect(seen).toEqual({ since: '2026-10-19T02:18:30.239Z', until: '2026-10-20T02:18:17.742Z' });
+    expect(() => runFalseFindings(['--since', window.since, '--until', 'nonsense'], { now, collect })).toThrow(/--until/);
+    expect(() => runFalseFindings(['--since', '2026-10-19T00:00:00Z', '--until', '2026-10-18T00:00:00Z'], { now, collect })).toThrow(/--until/);
+    expect(() => runFalseFindings(['--since', '2026-10-19T00:00:00Z', '--until', '2026-10-21T00:00:00Z'], { now, collect })).toThrow(/--until/);
+  });
 });

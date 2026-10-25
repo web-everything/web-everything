@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { FAKE_GH_DIR_ENV, lazyTmpPath, writeFakeGhShim } from './scripts/lib/test-tmp-root.mjs';
 import { HERMETIC_ENV, isHermetic } from './scripts/lib/hermetic-tests.mjs';
 import { setupHermeticTestFile } from './scripts/lib/hermetic-tests-vitest.mjs';
+import { KEEPALIVE_ANCHOR_ENV, killKeepAlives } from './scripts/lib/test-keepalive.mjs';
 
 const REPO_ROOT = dirname(fileURLToPath(import.meta.url));
 // Captured BEFORE the sandbox strip below, so the hermetic guard also covers a state root the LAUNCHING shell
@@ -101,6 +102,9 @@ if (process.env.WE_TEST_SANDBOX !== '0') {
     if (ENV_STRIP_ALLOWLIST.has(key)) continue;
     if (ENV_STRIP_PREFIXES.some((p) => key.startsWith(p))) delete process.env[key];
   }
+  // PR #5729 — a launchd daemon parent (`com.we.*` / `com.plateau.*`) marks every child a gh daemon caller
+  // (`isDaemonCaller`), which turns fail-soft paths into refusals. Ambient daemon state, so stripped like the rest.
+  if (/^(com\.we\.|com\.plateau\.)/.test(process.env.XPC_SERVICE_NAME || '')) delete process.env.XPC_SERVICE_NAME;
 }
 
 // HERMETIC BY DEFAULT (card xcu4cqf — main was red ~5.5 h on 2026-10-08 because a soak scenario read live GitHub
@@ -141,9 +145,19 @@ if (hermetic) {
 
 process.env.WE_UNDER_TEST = '1';
 
+// keep-alive leak fix (2026-10-20: 154 orphaned `node -e setInterval(() => {}, …)` children, up to 19 days old).
+// Every keep-alive from scripts/lib/test-keepalive.mjs watches this anchor pid and exits once it is gone, so a
+// killed or timed-out runner leaves nothing behind; the ones this file's tests spawned directly are killed here.
+// Set AFTER the sandbox strip above (it removes every WE_* key), and unconditionally: an outer runner's anchor
+// must not outlive this one's.
+process.env[KEEPALIVE_ANCHOR_ENV] = String(process.pid);
+afterAll(() => killKeepAlives());
+
 // Admission tests and their child CLIs must not wait on the machine running the suite.
 // Tests of overload set their own reading; production ignores this Vitest-only seam.
 if (process.env.WE_TEST_HOST_LOAD1 === undefined) process.env.WE_TEST_HOST_LOAD1 = '0';
+// verify-admission (2026-10-20) — likewise a fixed, ample host memory headroom (MB), so admission under test never samples the real host.
+if (process.env.WE_TEST_HOST_MEMORY_MB === undefined) process.env.WE_TEST_HOST_MEMORY_MB = '1000000';
 
 // #3383: isolate tests from home AND from each other's durable action holds.
 const ownsCoordinationRoot = process.env.WE_COORDINATION_ROOT === undefined;

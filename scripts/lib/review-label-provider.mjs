@@ -86,6 +86,7 @@ export const PR_STATE_FIELDS = Object.freeze(['labels', 'headRefOid', 'headRefNa
  * merge-safety path must be provably argv-preserving, not merely "looks right".
  */
 export const GH_ARGV = Object.freeze({
+  readPostingIdentity: () => ['api', 'user'],
   readPrState: (repo, pr) => ['pr', 'view', String(pr), '--repo', repo, '--json', PR_STATE_FIELDS.join(',')],
   readLabels: (repo, pr) => ['pr', 'view', String(pr), '--repo', repo, '--json', 'labels'],
   // The removals are INTERSECTED with the PR's live labels by `presentRemoveLabels` before they reach here —
@@ -140,7 +141,19 @@ export const GH_ARGV = Object.freeze({
   // `gh pr view --json comments` stops at one page (100): on a long thread a hold or the clear-human past comment 100 is
   // invisible, which the carry rule must never read as "nothing stands against it" (PR #4631 round 3, truncated-read row).
   readComments: (repo, pr) => ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', `repos/${repo}/issues/${pr}/comments`,
-    '--jq', '.[] | {author: {login: .user.login}, body, createdAt: .created_at}'],
+    // `id` is the node id (what GitHub's edit-history read returns): grant readers bind a grant to it (PR #5758). `url`
+    // rides along so a reader that links a comment never builds an anchor from the node id (review-pr-io's sources).
+    '--jq', '.[] | {id: .node_id, url: .html_url, author: {login: .user.login}, body, createdAt: .created_at}'],
+  // Independently prove that the paginated REST read contains the entire issue-comment thread.
+  readCommentsTotalCount: (repo, pr) => {
+    const match = typeof repo === 'string' && /^([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)\/([A-Za-z0-9_.-]+)$/.exec(repo);
+    if (!match || match[0] !== repo || ['.', '..'].includes(match[2])) {
+      throw new Error('comment count requires an explicit valid owner/repo repository');
+    }
+    const [, owner, name] = match;
+    return ['api', 'graphql', '-f', 'query=query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,name:$name){pullRequest(number:$n){comments{totalCount}}}}',
+      '-f', `owner=${owner}`, '-f', `name=${name}`, '-F', `n=${pr}`];
+  },
 });
 
 /** `gh pr view --json comments` returns at most this many comments; a thread this long may be truncated. */
@@ -149,6 +162,30 @@ export const PR_COMMENTS_PAGE_SIZE = 100;
 /** Parse `gh api --paginate --jq '.[] | {...}'` output (one JSON object per line). Throws on a malformed line. */
 export function parseJsonLines(out) {
   return String(out || '').split('\n').map((s) => s.trim()).filter(Boolean).map((l) => JSON.parse(l));
+}
+
+/** Shared proof for both readers: count, unique node ids, string bodies and author logins must all be present. */
+export function assertCompletePrComments(comments, response) {
+  const totalCount = response?.data?.repository?.pullRequest?.comments?.totalCount;
+  if ((response?.errors !== undefined && (!Array.isArray(response.errors) || response.errors.length > 0))
+    || !Number.isSafeInteger(totalCount) || totalCount < 0 || !Array.isArray(comments)
+    || comments.length !== totalCount) {
+    throw new Error('complete comments read did not match a valid GraphQL totalCount');
+  }
+  const ids = new Set();
+  for (const comment of comments) {
+    if (typeof comment?.id !== 'string' || !comment.id.trim() || ids.has(comment.id)) {
+      throw new Error('complete comments read requires present and unique comment node ids');
+    }
+    if (typeof comment.body !== 'string') {
+      throw new Error('complete comments read requires a string body on every comment');
+    }
+    const login = comment.author?.login ?? comment.user?.login;
+    if (typeof login !== 'string' || !login.trim()) {
+      throw new Error('complete comments read requires a non-empty author login on every comment');
+    }
+    ids.add(comment.id);
+  }
 }
 
 /**
@@ -168,6 +205,16 @@ export function createGhProvider({
 } = {}) {
   return {
     name: 'gh',
+
+    // Match postComment's repository-specific App selection, and disable the
+    // personal-token read exception at both the outer throttle and nested shim.
+    readPostingIdentity(repo) {
+      return JSON.parse(exec(GH_ARGV.readPostingIdentity(), {
+        maxBuffer: 1024 * 1024,
+        env: { ...process.env, GH_REPO: repo, WE_GH_THROTTLE_PERSONAL_ROUTE: '0' },
+        throttle: { personalRoute: false },
+      }));
+    },
 
     readPrState(repo, pr) {
       return JSON.parse(exec(GH_ARGV.readPrState(repo, pr), { maxBuffer: 64 * 1024 * 1024 }));
@@ -229,9 +276,13 @@ export function createGhProvider({
       return parseJsonLines(exec(GH_ARGV.readPrReviews(repo, pr), { maxBuffer: 64 * 1024 * 1024 }));
     },
 
-    /** The PR's complete comment thread, every page (see {@link GH_ARGV.readComments}). Throws on a read miss. */
+    /** Every page, verified against GraphQL totalCount and unique node ids. Throws on missing proof. */
     readComments(repo, pr) {
-      return parseJsonLines(exec(GH_ARGV.readComments(repo, pr), { maxBuffer: 64 * 1024 * 1024 }));
+      const countArgv = GH_ARGV.readCommentsTotalCount(repo, pr);
+      const comments = parseJsonLines(exec(GH_ARGV.readComments(repo, pr), { maxBuffer: 64 * 1024 * 1024 }));
+      const response = JSON.parse(exec(countArgv, { maxBuffer: 64 * 1024 * 1024 }));
+      assertCompletePrComments(comments, response);
+      return comments;
     },
   };
 }

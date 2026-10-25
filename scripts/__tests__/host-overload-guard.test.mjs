@@ -1,4 +1,4 @@
-import { it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -26,13 +26,20 @@ it.each(['absent .git', 'missing HEAD'])('refresh heals %s before configuring gc
     looksLikeCorruption: () => false, msgOf: (e) => e.message, log: () => {}, healLaneRefs: () => {},
     recloneLane: () => { broken = false; },
   });
+  const scrub = vi.fn(); const fetch = vi.fn(heal);
   const refresh = poolFunction('refreshLane', {
-    laneDir: (_repo, n) => `/pool/lane-${n}`, gitQuiet: config, fetchOriginHealing: heal,
+    laneDir: (_repo, n) => `/pool/lane-${n}`, gitQuiet: config, fetchOriginHealing: fetch,
+    scrubClaimedLaneConfig: scrub,
     liveLease: () => null, ttlMsFromFlags: () => 0, laneHoldRefuses: () => false,
     laneDirtyOrAhead: () => ({ dirty: true, uncommitted: 1, ahead: 0 }), log: () => {},
   });
   for (const n of [1, 2]) expect(refresh({ branch: 'main' }, n).skipped).toBe(true);
   expect(broken).toBe(false);
+  expect(scrub.mock.calls).toEqual([
+    ['/pool/lane-1', 'before refresh fetch'],
+    ['/pool/lane-2', 'before refresh fetch'],
+  ]);
+  for (const i of [0, 1]) expect(scrub.mock.invocationCallOrder[i]).toBeLessThan(fetch.mock.invocationCallOrder[i]);
   expect(config.mock.calls).toEqual([
     [['config', '--local', 'gc.auto', '0'], '/pool/lane-1'],
     [['config', '--local', 'gc.auto', '0'], '/pool/lane-2'],
@@ -41,12 +48,18 @@ it.each(['absent .git', 'missing HEAD'])('refresh heals %s before configuring gc
 
 it.each([false, true])('sibling clone disables automatic gc (existing=%s)', (existing) => {
   const gitQuiet = vi.fn(); const tryGit = vi.fn(() => 'origin/main');
+  const scrub = vi.fn();
   poolFunction('ensureOneSibling', {
     join, primarySiblingPath: () => '/primary/fui', lstatSync: () => { if (!existing) throw Error('absent'); return { isSymbolicLink: () => false }; },
     existsSync: () => true, tryGit, gitQuiet, cloneReferenceArgs: () => [], log: () => {},
     NETWORK_GIT_TIMEOUT_MS: 1, laneDirtyOrAhead: () => ({ dirty: true, ahead: 0 }),
+    scrubClaimedLaneConfig: scrub,
   })({ poolDir: '/pool' }, 'fui');
   expect([...gitQuiet.mock.calls, ...tryGit.mock.calls]).toContainEqual([['config', '--local', 'gc.auto', '0'], '/pool/fui']);
+  expect(scrub).toHaveBeenCalledWith('/pool/fui', 'before sibling fetch');
+  const fetchIndex = tryGit.mock.calls.findIndex(([args]) => args[0] === 'fetch');
+  expect(fetchIndex).toBeGreaterThanOrEqual(0);
+  expect(scrub.mock.invocationCallOrder[0]).toBeLessThan(tryGit.mock.invocationCallOrder[fetchIndex]);
 });
 
 it('gc command runs one pass and watch re-resolves policy with interactive bypass disabled', () => {
@@ -197,9 +210,9 @@ it('host policy regression: preference files merge per leaf and canonical confli
     lanes: { transcripts: { explicitScan: false }, gc: { schedule: 60000 } } },
   { host: { maxWaitMs: 250 }, lanes: { gc: { schedule: 120000 } } });
   const policy = loadHostOverloadSettings(opts);
-  expect(policy.settings).toEqual({ host: { maxLoadPerCore: 0.5, maxWaitMs: 250 },
+  expect(policy.settings).toEqual({ host: { maxLoadPerCore: 0.5, maxWaitMs: 250, minMemoryHeadroomMb: 2048, maxReviewDispatchPerTick: 2 },
     lanes: { transcripts: { explicitScan: false }, gc: { schedule: 120000 } } });
-  expect(Object.values(policy.sources)).toEqual(['platform', 'platform', 'platform', 'platform']);
+  expect(Object.values(policy.sources)).toEqual(['platform', 'platform', 'standard', 'standard', 'platform', 'platform']);
   expect(hostLoadAdmission({ ...opts, interactive: false, load: () => [1], cores: () => 1 }).admitted).toBe(false);
 });
 
@@ -361,4 +374,53 @@ it('gc refuses concurrent passes and host overload before spawning git', async (
   } });
   expect(nested.reason).toMatch(/busy/);
   expect(exec).not.toHaveBeenCalled();
+});
+
+describe('memory-aware host admission (verify-admission, 2026-10-20)', () => {
+  const policy = { settings: { host: { maxLoadPerCore: 2, minMemoryHeadroomMb: 2048 } }, sources: { 'host.maxLoadPerCore': 'standard', 'host.minMemoryHeadroomMb': 'standard' } };
+  it('waits (not admitted) when free memory + swap headroom is below host.minMemoryHeadroomMb, and logs the source', async () => {
+    const { hostLoadAdmission } = await import('../lib/host-load.mjs');
+    const low = hostLoadAdmission({ policy, interactive: false, load: () => [1], cores: () => 12, memory: () => 1785 });
+    expect(low).toMatchObject({ admitted: false });
+    expect(low.reason).toContain('host memory headroom 1785MB (free+swap); host.minMemoryHeadroomMb=2048 (standard)');
+    expect(hostLoadAdmission({ policy, interactive: false, load: () => [1], cores: () => 12, memory: () => 4096 }).admitted).toBe(true);
+    // Unknown memory fails closed.
+    expect(hostLoadAdmission({ policy, interactive: false, load: () => [1], cores: () => 12, memory: () => { throw Error('no vm_stat'); } }).admitted).toBe(false);
+    expect(hostLoadAdmission({ policy, interactive: false, load: () => [1], cores: () => 12, memory: () => NaN }).admitted).toBe(false);
+  });
+  it('parses macOS vm_stat + swapusage without counting the inactive file cache', async () => {
+    const { parseDarwinMemoryHeadroomMb } = await import('../lib/host-load.mjs');
+    const vm = 'Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                   39424.\nPages active:  1.\nPages inactive:                               793701.\nPages speculative:                             0.\nPages purgeable:                                0.\n';
+    expect(Math.round(parseDarwinMemoryHeadroomMb(vm, 'vm.swapusage: total = 6144.00M  used = 4974.94M  free = 1169.06M  (encrypted)'))).toBe(616 + 1169);
+    expect(() => parseDarwinMemoryHeadroomMb('garbage', '')).toThrow();
+  });
+  it('readHostMemoryHeadroomMb: darwin reads vm_stat + swapusage (bounded), others use freemem; the Vitest seam is validated', async () => {
+    const { readHostMemoryHeadroomMb } = await import('../lib/host-load.mjs');
+    const vm = 'Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                   39424.\nPages inactive: 1.\nPages speculative: 0.\nPages purgeable: 0.\n';
+    const exec = vi.fn((cmd) => (cmd === 'vm_stat' ? vm : 'vm.swapusage: total = 2048.00M  used = 1024.00M  free = 1024.00M'));
+    const real = { VITEST: 'false' };
+    expect(Math.round(readHostMemoryHeadroomMb({ env: real, platform: 'darwin', exec }))).toBe(616 + 1024);
+    expect(exec.mock.calls).toEqual([['vm_stat', [], { encoding: 'utf8', timeout: 5000 }], ['sysctl', ['vm.swapusage'], { encoding: 'utf8', timeout: 5000 }]]);
+    const free = vi.fn(() => 3 * 1048576);
+    expect(readHostMemoryHeadroomMb({ env: real, platform: 'linux', exec, free })).toBe(3);
+    expect(exec).toHaveBeenCalledTimes(2);
+    // A hung vm_stat surfaces as a throw, which hostLoadAdmission turns into a closed (not admitted) verdict.
+    expect(() => readHostMemoryHeadroomMb({ env: real, platform: 'darwin', exec: () => { throw Error('ETIMEDOUT'); } })).toThrow('ETIMEDOUT');
+    expect(readHostMemoryHeadroomMb({ env: { VITEST: 'true', WE_TEST_HOST_MEMORY_MB: '512' }, platform: 'darwin', exec })).toBe(512);
+    expect(exec).toHaveBeenCalledTimes(2);
+    for (const bad of ['', ' ', '-1', 'x']) {
+      expect(() => readHostMemoryHeadroomMb({ env: { VITEST: 'true', WE_TEST_HOST_MEMORY_MB: bad } })).toThrow('invalid test host memory');
+    }
+    // The seam is Vitest-only: outside Vitest the value is ignored and the host is read.
+    expect(readHostMemoryHeadroomMb({ env: { WE_TEST_HOST_MEMORY_MB: '512' }, platform: 'linux', free })).toBe(3);
+  });
+  it('the cascade carries both new leaves with sources, and rejects a 0 (cannot switch the check off)', async () => {
+    const { resolveHostOverloadSettings } = await import('../lib/host-overload-settings.mjs');
+    const log = vi.fn();
+    const p = resolveHostOverloadSettings({ env: { WE_HOST_MIN_MEMORY_HEADROOM_MB: '3000' }, log });
+    expect(p.settings.host).toMatchObject({ minMemoryHeadroomMb: 3000, maxReviewDispatchPerTick: 2 });
+    expect(log.mock.calls.flat().join(' ')).toMatch(/host\.minMemoryHeadroomMb=3000 \(env/);
+    expect(() => resolveHostOverloadSettings({ env: { WE_HOST_MIN_MEMORY_HEADROOM_MB: '0' }, log })).toThrow();
+    expect(() => resolveHostOverloadSettings({ env: { WE_HOST_MAX_REVIEW_DISPATCH_PER_TICK: '0' }, log })).toThrow();
+  });
 });

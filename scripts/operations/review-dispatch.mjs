@@ -460,6 +460,7 @@ const REVIEW_CODE_PATH_FILES = new Set([
   // review-extra-seats, jury-core, write-all-sync) are covered above.
   'scripts/lib/review-ci-gate-io.mjs', 'scripts/operations/completion-cli.mjs', 'scripts/operations/completion-store.mjs',
   'scripts/conveyor/run-rating.mjs', 'scripts/operations/telemetry-store.mjs', 'scripts/conveyor/reconcile-core.mjs',
+  'scripts/lib/pid-alive.mjs',
   // Verdict carry and red-team marker helpers are direct dependencies of review-job's acceptance path.
   'scripts/lib/rebase-verdict-carry.mjs', 'scripts/lib/red-team-gate.mjs', 'scripts/lib/drain-red-team-evidence.mjs',
   'scripts/lib/red-team-status-labels.mjs',
@@ -572,7 +573,7 @@ export function dispatchReview({
   // referenced `settingsEnv` — so no review session ever got `--settings`, and (after the earlier follow-up)
   // no review session ever got `<root>/.claude/settings.local.json` either. Every review 401 traced back to
   // this: the shim was simply never on `PATH`, at all, for any review dispatch, since before this fix
-  // existed. NEVER throws — see `resolveGhShimSettingsEnv`'s own contract.
+  // existed. Throws only a daemon's gh-guard refusal — see `resolveGhShimSettingsEnv`'s own contract.
   resolveSettingsEnv = resolveGhShimSettingsEnv,
   // #4174 — same two seams `createDispatchSinks` takes: WHERE this session's cwd is (a scratch directory,
   // never `root` itself) and making that directory real.

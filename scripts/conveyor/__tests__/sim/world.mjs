@@ -35,6 +35,7 @@ import { nodeRuntimeEnv } from './node-runtime-env.mjs';
 import { seedLaneDependencies } from './dependencies.mjs';
 import { writeFixtureNpm } from './npm-shim.mjs';
 import { isolatedProcessEnv, toolPathDirs } from './environment.mjs';
+import { createHash } from 'node:crypto';
 import * as act from './agent-actions.mjs';
 import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 
@@ -81,7 +82,7 @@ let templateCache = null;
  *  daemons against progressively wider copies; nothing outside these needed adding). `git ls-files -co
  *  --exclude-standard` (not a blind full-tree copy) so gitignored junk (`node_modules`, `_site/`, …) never
  *  rides along and so an uncommitted fix in THIS lane is what the simulator actually runs.
- *  Tests, fixtures and corpora are excluded: per-scenario checkout/clone/teardown cost scales with this
+ *  Tests, fixtures and corpus data are excluded: per-scenario checkout/clone/teardown cost scales with this
  *  tree, and that cost under CI load caused A3 to time out. Fake gh/claude helpers and their shims resolve
  *  from INVOKING_ROOT, not the sim clone, so they do not need to ride along. */
 function buildWeTemplate() {
@@ -90,6 +91,9 @@ function buildWeTemplate() {
     [
       'ls-files', '-co', '--exclude-standard', '--',
       'scripts', 'skills-src', 'package.json', 'package-lock.json',
+      // Brief rendering reads this living checklist relative to the cloned build-policy module.
+      // Keep the real dependency: a missing checklist must still fail closed in production.
+      'docs/agent/reviewer-expectations.md',
       // `.gitignore` itself MUST ride along: `lane-pool.mjs` writes a per-lane `.env.local` expecting it to be
       // gitignored (real repo behaviour, confirmed) — without this file in the template, every provisioned
       // lane reads as permanently dirty (`.env.local` shows up as a genuine untracked file) and
@@ -115,7 +119,8 @@ function buildWeTemplate() {
     { cwd: INVOKING_ROOT, encoding: 'utf8' },
   ).split('\n').filter(Boolean).filter((path) =>
     !/(^|\/)__tests__\/|\.(?:test|spec)\.[^/]+$/.test(path)
-    && !/^scripts\/(?:golden-corpus|review-corpus)\//.test(path)
+    // The registry imports this parser through judge-sweep-facts-io; retain the runtime module, not its corpus.
+    && (path === 'scripts/review-corpus/mine-review-corpus.mjs' || !/^scripts\/(?:golden-corpus|review-corpus)\//.test(path))
     && !/^scripts\/(?:.*\/)?fixtures\//.test(path));
 
   const work = mkdtempSync(join(tmpdir(), 'sim-template-we-'));
@@ -326,6 +331,9 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     // reject-cache the same way.
     WE_DAEMON_STATE_DIR: join(root, 'daemon-self-sync-state'),
     GH_TOKEN: 'sim-token-1',
+    // The fake GitHub's synthetic credential represents an App token. Keep the daemon guard active;
+    // a different/revoked credential must still fail the fake server's auth checks.
+    WE_GH_AUTH_TOKEN_HASH: createHash('sha256').update('sim-token-1').digest('hex'),
     // tuning knobs, pinned short so a real failure surfaces fast instead of the suite waiting out production
     // defaults (bounded-child.mjs#CHILD_TIMEOUT_ENV, lane-pool.mjs's own list-cache/scan-timeout env vars).
     WE_CHILD_TIMEOUT_MS: '20000',

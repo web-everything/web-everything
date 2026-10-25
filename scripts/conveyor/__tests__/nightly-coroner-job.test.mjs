@@ -5,8 +5,9 @@ import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, existsSync
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { EventEmitter } from 'node:events';
-import { coronerNightDue, runNightlyCoronerJob, extractNightlyCoroner, runNightlyCoronerEntry, CHILD_STOP_GRACE_MS, RELEASE_TIMEOUT_MS, CORONER_LANE_SESSION, coronerLaneSession, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed, NIGHTLY_DEFAULTS, coronerDeadline, publishCoronerFailure } from '../nightly-coroner-job.mjs';
+import { coronerNightDue, runNightlyCoronerJob, extractNightlyCoroner, runNightlyCoronerEntry, CHILD_STOP_GRACE_MS, RELEASE_TIMEOUT_MS, CORONER_LANE_SESSION, coronerLaneSession, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed, NIGHTLY_DEFAULTS, coronerDeadline, publishCoronerFailure, coronerExtractorArgs } from '../nightly-coroner-job.mjs';
 import { createJobStore, enqueueJob, reattachTick, runJob, JOB_ID_ENV, JOB_ATTEMPT_ENV } from '../../lib/daemon-jobs-runtime.mjs';
 import { HEALTH_WATCH_JOB_KINDS, HEALTH_NIGHTLY_CORONER_KIND } from '../../../skills-src/conveyor/daemon-manifest.mjs';
 import { parseFeedLine } from '../../operations/needs-you-feed.mjs';
@@ -234,6 +235,36 @@ it('publishes real deterministic extraction output from isolated inputs', async 
   expect(text).toContain('"changeRequests"');
   expect(report.window.until).toBe(input.until);
 });
+it('passes its exact extractor argv through both real CLI parsers (job and scripts cannot drift)', async () => {
+  const { runCoroner } = await import('../../operations/coroner-extract.mjs');
+  const { runFalseFindings } = await import('../../operations/coroner-false-findings.mjs');
+  const root = temp(); const { input, io } = extraction(root);
+  writeFileSync(join((await io.acquire()).path, 'scripts/operations/coroner-false-findings.mjs'), '');
+  const env = Object.fromEntries(['JOBS', 'JOBS_ARCHIVE', 'PROJECTS', 'DAEMON_DIR', 'VERIFY_LOG', 'ADMISSION', 'LANES', 'STATE', 'COORD', 'BACKLOG', 'LAUNCH_AGENTS'].map((key) => [`WE_CORONER_${key}`, join(root, key.toLowerCase())]));
+  env.WE_CORONER_NO_EXECUTORS = '1';
+  let seenWindow;
+  io.run = vi.fn(async ([script, ...args]) => script.endsWith('coroner-false-findings.mjs')
+    ? runFalseFindings(args, { env, home: root, collect: (w) => { seenWindow = w; return { count: 0 }; } }).output
+    : runCoroner(args, { env, home: root, gh: (a) => a[1].includes('/actions/') ? { workflow_runs: [] } : [] }).output);
+  const report = await extractNightlyCoroner(input, io);
+  expect(io.run).toHaveBeenCalledTimes(2);
+  expect(io.run.mock.calls[1][0].slice(1)).toEqual(coronerExtractorArgs(report.window.since, input.until));
+  expect(seenWindow).toEqual(report.window);
+});
+it('caps each extractor run at coroner.nightly.runTimeoutMin, falling back to the default when invalid', async () => {
+  for (const [runTimeoutMin, expected] of [[7, 7 * 60000], [0, NIGHTLY_DEFAULTS.runTimeoutMin * 60000]]) {
+    const { input, io } = extraction(temp());
+    writeFileSync(join((await io.acquire()).path, 'scripts/operations/coroner-false-findings.mjs'), '');
+    await extractNightlyCoroner({ ...input, nightly: { ...NIGHTLY_DEFAULTS, runTimeoutMin } }, io);
+    expect(io.run.mock.calls.map((c) => c[2].timeout)).toEqual([expected, expected]);
+  }
+  const log = vi.fn();
+  const read = () => JSON.stringify({ coroner: { nightly: { runTimeoutMin: 12 } } });
+  const out = resolveNightlyCoronerSettings({ read, log, env: {} });
+  expect(out.value.runTimeoutMin).toBe(12);
+  expect(log.mock.calls.flat().join('\n')).toContain('runTimeoutMin');
+  expect(resolveNightlyCoronerSettings({ read: () => JSON.stringify({ coroner: { nightly: { runTimeoutMin: -1 } } }), log, env: {} }).value.runTimeoutMin).toBe(NIGHTLY_DEFAULTS.runTimeoutMin);
+});
 it.each([
   ['2026-10-16', '2026-10-17T07:30:00.000Z'],
   ['2026-01-16', '2026-01-17T08:30:00.000Z'],
@@ -346,7 +377,7 @@ it('on SIGTERM stops the running extractor subprocess and releases the lane befo
   // The extractor takes a moment to exit on SIGTERM: the lane must not be released while it still runs.
   writeFileSync(join(lane.path, 'scripts/operations/coroner-extract.mjs'),
     `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(pidFile)}, String(process.pid));\n` +
-    `process.on('SIGTERM', () => setTimeout(() => process.exit(0), 400));\nsetInterval(() => {}, 1000);\n`);
+    `process.on('SIGTERM', () => setTimeout(() => process.exit(0), 400));\n${keepAliveScript()}\n`);
   delete io.run; // the real subprocess runner, so the extractor is a live child process
   let aliveAtRelease = null;
   io.release.mockImplementation(async () => { aliveAtRelease = alive(); });

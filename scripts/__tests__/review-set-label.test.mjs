@@ -47,6 +47,7 @@ import {
 import { parseClearerActorId, parseAuthorActorId, readAuthorActorStamps } from '../lib/review-independence.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../lib/review-escalation.mjs';
 import { ADVISORY_LABELS, parseAdvisories } from '../lib/advisory-labels.mjs';
+import { PR_COMMENTS_PAGE_SIZE } from '../lib/review-label-provider.mjs';
 
 // HERMETIC (card xcu4cqf): on an accept/clear-human/restamp the CLI reads the PR's net diff with `git fetch origin
 // +main:refs/remotes/origin/main <head>` + `merge-base`/`diff` against `origin/...` in the PROCESS's git repo, which
@@ -291,6 +292,17 @@ describe('decideSetLabel — changes (a bounce lands nothing)', () => {
 describe('decideSetLabel — rearm (#2644, folded in from the conveyor decideRearm)', () => {
   const changes = [{ name: REVIEW_LABELS.changes }, { name: 'ready-to-merge' }];
   const humanChanges = [{ name: REVIEW_LABELS.human }, { name: REVIEW_LABELS.changes }];
+
+  it('refuses rearm for a human-cleared head; false or omitted clearance preserves the ordinary rearm', () => {
+    const ordinary = decideSetLabel({ to: 'rearm', currentLabels: changes });
+    expect(ordinary.allowed).toBe(true);
+    expect(ordinary.addLabel).toBe(REVIEW_LABELS.pending);
+    expect(decideSetLabel({ to: 'rearm', currentLabels: changes, humanClearedHead: false })).toEqual(ordinary);
+
+    const cleared = decideSetLabel({ to: 'rearm', currentLabels: changes, humanClearedHead: true });
+    expect(cleared.allowed).toBe(false);
+    expect(cleared.reason).toMatch(/human[- ]clearance/i);
+  });
 
   it('re-arms a review:changes bounce → review:pending, dropping review:changes (and #2832 stripping ready-to-merge)', () => {
     const d = decideSetLabel({ to: 'rearm', currentLabels: changes });
@@ -1158,6 +1170,10 @@ describe('the GH_COMMENT_MAX guard is reachable-around by nothing (PR #1057)', (
 const fs = require('fs');
 const a = process.argv.slice(2);
 fs.appendFileSync(process.env.GH_CALL_LOG, a.slice(0, 2).join(' ') + '\\n');
+if (a[0] === 'api' && a[1] === 'user') {
+  process.stdout.write(JSON.stringify({ login: 'chalbert', type: 'User' }));
+  process.exit(0);
+}
 if (a[0] === 'pr' && a[1] === 'view') {
   process.stdout.write(JSON.stringify({ labels: [{ name: 'review:human' }], comments: [], headRefOid: 'f'.repeat(40), state: 'OPEN' }));
   process.exit(0);
@@ -1231,7 +1247,7 @@ process.exit(0);
     // It observed the PR (a read) and then stopped. #2979 moved the fingerprint's diff read off `gh pr diff`
     // onto `computeNetDiffText` (which shells `git`), so no `pr diff` appears in the gh log any more. What
     // matters to this guard is unchanged and still asserted: no MUTATION happened.
-    expect(ghCalls()).toEqual(['pr view']);
+    expect(ghCalls()).toEqual(['api user', 'pr view']);
     expect(ghCalls().some((c) => c === 'pr edit' || c === 'pr comment')).toBe(false);
   });
 });
@@ -1258,6 +1274,11 @@ describe('clear-human drives the swap END-TO-END (#2895, PR #1056 C3)', () => {
 const fs = require('fs');
 const a = process.argv.slice(2);
 fs.appendFileSync(process.env.GH_CALL_LOG, JSON.stringify(a) + '\\n');
+if (a[0] === 'api' && a[1] === 'user') {
+  const routedAway = process.env.GH_REPO !== 'o/n' || process.env.WE_GH_THROTTLE_PERSONAL_ROUTE === '1';
+  process.stdout.write(JSON.stringify({ login: process.env.GH_TOKEN === 'fixture-automation-token' && !routedAway ? 'web-everything' : 'chalbert', type: 'User' }));
+  process.exit(0);
+}
 if (a[0] === 'pr' && a[1] === 'view') {
   const labels = fs.existsSync(process.env.GH_EDIT_FLAG)
     ? [{ name: 'review:accepted' }, { name: 'ready-to-merge' }]
@@ -1307,8 +1328,21 @@ process.exit(0);
     : []);
   /** The values that FOLLOW each occurrence of `flag` in an argv array (adjacency, not mere presence). */
   const valuesOf = (argv, flag) => argv.flatMap((a, i) => (a === flag ? [argv[i + 1]] : []));
-  const runClear = (extra) => spawnSync('node', [script, '1048', '--repo=o/n', '--to=clear-human',
-    `--actor=${ACTOR}`, `--reason=${REASON}`, ...extra], { encoding: 'utf8', env: env() });
+  const runClear = (extra, overrides = {}) => spawnSync('node', [script, '1048', '--repo=o/n', '--to=clear-human',
+    `--actor=${ACTOR}`, `--reason=${REASON}`, ...extra], { encoding: 'utf8', env: { ...env(), GH_TOKEN: '', GITHUB_TOKEN: '', ...overrides } });
+
+  it.each([
+    ['GH_TOKEN identifies the automation poster', {}],
+    ['the shell targets another repository', { GH_REPO: 'other/checkout' }],
+    ['personal read routing is enabled', { WE_GH_THROTTLE_PERSONAL_ROUTE: '1' }],
+  ])('refuses the real CLI when %s', (_name, overrides) => {
+    const r = runClear([], { GH_TOKEN: 'fixture-automation-token', ...overrides });
+    expect(r.status).toBe(2);
+    expect(JSON.parse(r.stdout.trim()).error).toMatch(/posting identity.*allowlisted human operator/);
+    expect(calls().map(a => a.slice(0, 2).join(' '))).toEqual(['api user']);
+    expect(existsSync(join(dir, 'edited'))).toBe(false);
+    expect(existsSync(join(dir, 'comment.md'))).toBe(false);
+  });
 
   it('returns ok:true and lands the label swap, the attributed comment and the reviewed-sha stamp', () => {
     const bodyPath = join(dir, 'findings.md');
@@ -1338,7 +1372,7 @@ process.exit(0);
       // carries `review:human`/`review:pending` and NOT `review:accepted`, so the durable record (with its
       // marker) goes first, where an orphan is inert. The dedicated ordering suite below owns that property; the
       // pin is kept here so a silent re-flip cannot pass this end-to-end test.
-      .toEqual(['pr view', 'pr comment', 'pr view', 'pr edit', 'pr view']);
+      .toEqual(['api user', 'pr view', 'pr comment', 'pr view', 'pr edit', 'pr view']);
 
     // 3. The durable comment — the honesty tax as it is actually posted, not as the module describes it.
     const comment = readFileSync(join(dir, 'comment.md'), 'utf8');
@@ -1794,6 +1828,10 @@ describe('#2844 — the review-set-label CLI refuses a self-cleared verdict (end
 const fs = require('fs');
 const a = process.argv.slice(2);
 fs.appendFileSync(process.env.GH_CALL_LOG, JSON.stringify(a) + '\\n');
+if (a[0] === 'api' && a[1] === 'user') {
+  process.stdout.write(JSON.stringify({ login: 'chalbert', type: 'User' }));
+  process.exit(0);
+}
 if (a[0] === 'pr' && a[1] === 'view') {
   process.stdout.write(JSON.stringify({
     labels: JSON.parse(process.env.GH_PR_LABELS).map((name) => ({ name })),
@@ -1974,8 +2012,8 @@ process.exit(0);
     expect(r.status).not.toBe(0);
     const payload = JSON.parse(r.stdout.trim().split('\n').filter(Boolean).pop());
     expect(payload.error).toMatch(/no review:human label/);
-    // Refused by the PURE decider, so nothing was written.
-    expect(ghCalls()).toEqual(['pr view']);
+    // The posting identity is checked first; the pure decider then refuses without a write.
+    expect(ghCalls()).toEqual(['api user', 'pr view']);
     expect(existsSync(join(dir, 'comment.md'))).toBe(false);
   });
 
@@ -2102,6 +2140,7 @@ describe('the write arc and its #2964 ordering', () => {
       calls,
       name: 'stub',
       currentRepo: () => 'o/n',
+      readPostingIdentity: () => ({ login: 'chalbert', type: 'User' }),
       readPrState: () => {
         calls.push('readPrState');
         return { labels: labels.map((name) => ({ name })), comments: [], headRefOid: 'a'.repeat(40), headRefName: 'lane/x', state: 'OPEN', body, title };
@@ -3000,15 +3039,35 @@ describe('decideSetLabel — rearm requireLive (#4333)', () => {
 });
 
 describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => {
+  let ledgerDir, savedLedgerDir;
+  beforeEach(() => {
+    ledgerDir = mkdtempSync(join(tmpdir(), 'rearm-clearance-'));
+    savedLedgerDir = process.env.WE_VERDICT_LEDGER_DIR;
+    process.env.WE_VERDICT_LEDGER_DIR = ledgerDir;
+  });
+  afterEach(() => {
+    if (savedLedgerDir === undefined) delete process.env.WE_VERDICT_LEDGER_DIR;
+    else process.env.WE_VERDICT_LEDGER_DIR = savedLedgerDir;
+    rmSync(ledgerDir, { recursive: true, force: true });
+    rmSync(`${ledgerDir}-locks`, { recursive: true, force: true });
+  });
   // The caller read `accepted`; by the child's own read a reviewer has flipped it to `changes`.
-  function run(argv, labels) {
+  function run(argv, labels, { comments = [], omitComments = false, readComments = () => comments, headRefOid = 'a'.repeat(40), freshState = {}, swapState = freshState, postSwapState = null } = {}) {
     const calls = [];
+    const initial = { labels: labels.map((name) => ({ name })), headRefOid, headRefName: 'lane/x', state: 'OPEN', isDraft: false, body: '',
+      ...(omitComments ? {} : { comments }) };
+    const readPrState = vi.fn().mockReturnValueOnce(initial).mockReturnValueOnce({ ...initial, ...freshState })
+      .mockReturnValue({ ...initial, ...swapState });
     const provider = {
       name: 'stub',
       currentRepo: () => 'o/n',
-      readPrState: () => ({ labels: labels.map((name) => ({ name })), headRefOid: 'a'.repeat(40), headRefName: 'lane/x', state: 'OPEN', body: '', comments: [] }),
+      readPrState,
+      readComments,
       readLabels: () => labels.map((name) => ({ name })),
-      setLabels: () => { calls.push('setLabels'); },
+      setLabels: () => {
+        calls.push('setLabels');
+        if (postSwapState) readPrState.mockReturnValue({ ...initial, ...swapState, ...postSwapState });
+      },
       postComment: () => { calls.push('postComment'); },
     };
     const chunks = [];
@@ -3023,7 +3082,7 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
       });
     } catch (e) { if (typeof e.exitCode === 'number') exitCode = e.exitCode; else throw e; }
     finally { process.exit = realExit; }
-    return { exitCode, calls, payload: JSON.parse(chunks.join('') || '{}') };
+    return { exitCode, calls, readPrState, ledgerWrites: readdirSync(ledgerDir), payload: JSON.parse(chunks.join('') || '{}') };
   }
 
   it('interleaving: only-if=accepted, child\'s read returns changes → refused, setLabels never called', () => {
@@ -3043,6 +3102,391 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     const { exitCode, calls } = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes]);
     expect(exitCode).toBe(0);
     expect(calls).toContain('setLabels');
+  });
+
+  it.each([
+    ['trusted current-head clearance', 'a'.repeat(40), { login: 'web-everything' }, false],
+    ['trusted stale-head clearance', 'b'.repeat(40), { login: 'web-everything' }, true],
+    ['untrusted current-head marker', 'a'.repeat(40), { login: 'drive-by' }, true],
+    ['current-head marker with no author', 'a'.repeat(40), undefined, true],
+  ])('CLI rearm respects %s with a mixed-case live head', (_name, headSha, author, allowed) => {
+    const comments = [{ body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha }), author }];
+    const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, headRefOid: 'A'.repeat(40) });
+    expect(result.exitCode).toBe(allowed ? 0 : 1);
+    if (allowed) expect(result.calls).toEqual(['postComment', 'setLabels']);
+    else {
+      expect(result.calls).toEqual([]);
+      expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+    }
+  });
+
+  it('CLI rearm preserves human clearance after a same-head plain accept', () => {
+    const comments = ['clear-human', 'accepted'].map((to) => ({
+      body: buildVerdictComment({ to, actor: 'operator', headSha: 'a'.repeat(40) }), author: { login: 'web-everything' },
+    }));
+    const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments });
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual([]);
+    expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+  });
+
+  it('CLI rearm preserves human clearance with a whitespace-padded valid head', () => {
+    const comments = [{ body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
+      author: { login: 'web-everything' } }];
+    const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, headRefOid: ` \t${'A'.repeat(40)}\n` });
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual([]);
+    expect(result.ledgerWrites).toEqual([]);
+    expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+  });
+
+  it.each([{ omitComments: true }, { comments: null }, { comments: {} }, { comments: 'unreadable' }])('CLI rearm fails closed without writes when initial comments are not an array (%j)', (options) => {
+    const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], options);
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual([]);
+    expect(result.payload.reason).toBe('comments unreadable — cannot prove no human clearance');
+  });
+
+  it('CLI rearm preserves a trusted current-head clearance beyond the initial comment page', () => {
+    const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, () => ({ body: 'discussion' }));
+    const clearance = { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
+      author: { login: 'web-everything' } };
+    const readComments = vi.fn(() => [...comments, clearance]);
+    const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, readComments });
+    expect(readComments).toHaveBeenCalledTimes(1);
+    expect(readComments).toHaveBeenCalledWith('o/n', '9');
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual([]);
+    expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+  });
+
+  it('CLI rearm fails closed without writes when the full comment thread is unreadable', () => {
+    const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, () => ({ body: 'discussion' }));
+    const readComments = vi.fn(() => { throw new Error('thread unavailable'); });
+    const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, readComments });
+    expect(readComments).toHaveBeenCalledTimes(1);
+    expect(readComments).toHaveBeenCalledWith('o/n', '9');
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual([]);
+    expect(result.payload.reason).toBe('comments unreadable — cannot prove no human clearance');
+  });
+
+  it.each([undefined, null, {}, 'unreadable'])('CLI rearm fails closed without writes when paged comments are not an array (%j)', (pagedComments) => {
+    const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, () => ({ body: 'discussion' }));
+    const readComments = vi.fn(() => pagedComments);
+    const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, readComments });
+    expect(readComments).toHaveBeenCalledOnce();
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual([]);
+    expect(result.ledgerWrites).toEqual([]);
+    expect(result.payload.reason).toBe('comments unreadable — cannot prove no human clearance');
+  });
+
+  it.each(['empty', 'shorter', 'same-size non-covering', 'longer non-covering'])(
+    'CLI rearm refuses a %s paginated array without proof of the embedded page', shape => {
+      const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({ id: `IC_${i}`, body: `discussion ${i}` }));
+      const pagedComments = shape === 'empty' ? [] : shape === 'shorter' ? comments.slice(0, -1)
+        : [...comments.slice(1), { id: 'IC_other', body: 'other discussion' },
+          ...(shape === 'longer non-covering' ? [{ id: 'IC_extra', body: 'extra discussion' }] : [])];
+      for (const fresh of [false, true]) {
+        const readComments = vi.fn(() => pagedComments);
+        const result = fresh
+          ? run(['9', '--repo=o/n', '--only-if=missing', `--expect-head=${'a'.repeat(40)}`], [],
+            { readComments, freshState: { comments } })
+          : run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, readComments });
+        expect(readComments).toHaveBeenCalledOnce();
+        expect(result.exitCode).toBe(1);
+        expect(result.calls).toEqual([]);
+        expect(result.ledgerWrites).toEqual([]);
+        expect(result.payload.reason).toBe('comments unreadable — cannot prove no human clearance');
+      }
+    });
+
+  describe.each(['initial', 'fresh'])('%s full-thread read', read => {
+    const fresh = read === 'fresh';
+    const attempt = (comments, readComments, freshHead = 'b'.repeat(40)) => fresh
+      ? run(['9', '--repo=o/n', '--only-if=missing', `--expect-head=${'a'.repeat(40)}`], [],
+        { readComments, freshState: { comments, headRefOid: freshHead } })
+      : run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, readComments });
+
+    it.each([
+      ['Web-Everything', 'web-everything[bot]'],
+      ['Web-Everything[bot]', 'web-everything'],
+    ])('rearms a complete 201-comment bot thread with GraphQL %s and REST %s', (listedLogin, fullLogin) => {
+      const full = Array.from({ length: 201 }, (_, i) => ({
+        node_id: `IC_bot_${i}`, body: `bot discussion ${i}`, user: { login: fullLogin },
+      }));
+      const comments = full.slice(0, PR_COMMENTS_PAGE_SIZE).map(c => ({
+        id: c.node_id, body: c.body, author: { login: listedLogin },
+      }));
+      const readComments = vi.fn(() => full);
+      const result = fresh
+        ? run(['9', '--repo=o/n', '--only-if=missing', `--expect-head=${'a'.repeat(40)}`], [], {
+          readComments, freshState: { comments }, postSwapState: { labels: [{ name: REVIEW_LABELS.pending }] },
+        })
+        : attempt(comments, readComments);
+      expect(readComments).toHaveBeenCalledTimes(fresh ? 3 : 2);
+      expect(result.exitCode).toBe(0);
+      expect(result.calls).toEqual(['postComment', 'setLabels']);
+      expect(result.ledgerWrites).toHaveLength(1);
+    });
+
+    it('refuses matching ids with a stale body lacking an embedded older-head clearance', () => {
+      const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({
+        id: `IC_${i}`, body: `discussion ${i}`, author: { login: 'web-everything' },
+      }));
+      comments[0].body = buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'c'.repeat(40) });
+      const readComments = vi.fn(() => [
+        ...comments.map((c, i) => i === 0 ? { ...c, body: 'stale discussion' } : c),
+        { id: 'IC_extra', body: 'later discussion' },
+      ]);
+      const result = attempt(comments, readComments);
+      expect(readComments).toHaveBeenCalledTimes(1);
+      expect(result.exitCode).toBe(1);
+      expect(result.payload.reason).toBe('comments unreadable — cannot prove no human clearance');
+      expect(result.calls).toEqual([]);
+      expect(result.ledgerWrites).toEqual([]);
+    });
+
+    describe.each(['id', 'timestamp'])('author coverage with matching %s and body', identity => {
+      const listed = { ...(identity === 'id' ? { id: 'IC_author' } : { createdAt: '2026-10-06T00:00:00Z' }), body: 'listed discussion' };
+      const complete = { ...(identity === 'id' ? { node_id: 'IC_author' } : { created_at: listed.createdAt }), body: listed.body };
+      const page = author => [{ ...listed, ...author }, ...Array.from({ length: PR_COMMENTS_PAGE_SIZE - 1 }, (_, i) => ({
+        id: `IC_${i}`, body: `discussion ${i}`,
+      }))];
+
+      it.each([
+        ['author missing', { author: { login: 'web-everything' } }, {}],
+        ['user missing', { user: { login: 'web-everything' } }, {}],
+        ['author changed to another user', { author: { login: 'web-everything' } }, { user: { login: 'other' } }],
+        ['user changed to another author', { user: { login: 'web-everything' } }, { author: { login: 'other' } }],
+      ])('fails closed without writes when the complete comment has its %s', (_name, listedAuthor, fullAuthor) => {
+        const comments = page(listedAuthor);
+        const readComments = vi.fn(() => [...comments.slice(1), { ...complete, ...fullAuthor }, { body: 'later discussion' }]);
+        const result = attempt(comments, readComments, 'a'.repeat(40));
+        expect(readComments).toHaveBeenCalledTimes(1);
+        expect(result.exitCode).toBe(1);
+        expect(result.payload.reason).toBe('comments unreadable — cannot prove no human clearance');
+        expect(result.calls).toEqual([]);
+        expect(result.ledgerWrites).toEqual([]);
+      });
+
+      if (!fresh) it.each([
+        ['normalized author / user', { author: { login: 'Web-Everything' } }, { user: { login: 'web-everything[bot]' } }],
+        ['normalized user / author', { user: { login: 'Web-Everything[bot]' } }, { author: { login: 'web-everything' } }],
+        ['author / author', { author: { login: 'web-everything' } }, { author: { login: 'web-everything' } }],
+        ['author / user', { author: { login: 'web-everything' } }, { user: { login: 'web-everything' } }],
+        ['user / author', { user: { login: 'web-everything' } }, { author: { login: 'web-everything' } }],
+        ['user / user', { user: { login: 'web-everything' } }, { user: { login: 'web-everything' } }],
+        ['neither has an author', {}, {}],
+        ['only the complete comment has an author', {}, { user: { login: 'web-everything' } }],
+      ])('allows complete coverage with %s', (_name, listedAuthor, fullAuthor) => {
+        const comments = page(listedAuthor);
+        const readComments = vi.fn(() => [...comments.slice(1), { ...complete, ...fullAuthor }, { body: 'later discussion' }]);
+        const result = attempt(comments, readComments, 'a'.repeat(40));
+        expect(readComments).toHaveBeenCalled();
+        expect(result.exitCode).toBe(0);
+        expect(result.calls).toEqual(['postComment', 'setLabels']);
+      });
+    });
+
+    it('allows an exactly page-sized covering read proved complete by the reader', () => {
+      const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({ id: `IC_${i}`, body: `discussion ${i}` }));
+      const readComments = vi.fn(() => [...comments]);
+      const result = fresh
+        ? run(['9', '--repo=o/n', '--only-if=missing', `--expect-head=${'a'.repeat(40)}`], [], {
+          readComments, freshState: { comments }, postSwapState: { labels: [{ name: REVIEW_LABELS.pending }] },
+        })
+        : attempt(comments, readComments);
+      expect(readComments).toHaveBeenCalledTimes(fresh ? 3 : 2);
+      expect(result.exitCode).toBe(0);
+      expect(result.calls).toEqual(['postComment', 'setLabels']);
+      expect(result.ledgerWrites).toHaveLength(1);
+    });
+
+    it.each([PR_COMMENTS_PAGE_SIZE - 1, PR_COMMENTS_PAGE_SIZE])('allows a complete covering read for an embedded page of %i comments', count => {
+      const comments = Array.from({ length: count }, (_, i) => ({ id: `IC_${i}`, body: `discussion ${i}` }));
+      const readComments = vi.fn(() => [...comments, { id: 'IC_extra', body: 'later discussion' }]);
+      const result = attempt(comments, readComments, 'a'.repeat(40));
+      // The fresh variant's mocked label never shows the handoff; coverage is not the refusal there.
+      if (fresh) { expect(result.payload.reason ?? '').not.toMatch(/cannot prove|truncated/); return; }
+      expect(result.exitCode).toBe(0);
+      expect(result.calls).toEqual(['postComment', 'setLabels']);
+      if (count < PR_COMMENTS_PAGE_SIZE) expect(readComments).not.toHaveBeenCalled();
+      else expect(readComments).toHaveBeenCalled();
+    });
+  });
+
+  it.each(['', null, {}])('CLI rearm fails closed without writes when the head is empty or unreadable (%j)', (headRefOid) => {
+    const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { headRefOid });
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual([]);
+    expect(result.ledgerWrites).toEqual([]);
+    expect(result.payload.reason).toBe('head unreadable — cannot prove no human clearance');
+  });
+
+  it('ordinary rearm refuses the label swap when the second read carries a current-head clearance', () => {
+    const comments = [{ body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
+      author: { login: 'web-everything' } }];
+    const result = run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { freshState: { comments } });
+    expect(result.readPrState).toHaveBeenCalledTimes(2);
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual(['postComment']);
+    expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+  });
+
+  const missingArgs = ['9', '--repo=o/n', '--only-if=missing', `--expect-head=${'a'.repeat(40)}`];
+  it('missing-only rearm refuses the label swap when clearance arrives during the comment write', () => {
+    const comments = [{ body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
+      author: { login: 'web-everything' } }];
+    const result = run(missingArgs, [], { swapState: { comments } });
+    expect(result.readPrState).toHaveBeenCalledTimes(3);
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual(['postComment']);
+    expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+  });
+
+  it('rearm refuses whitespace and non-hex heads on both initial and missing-only fresh reads before any write', () => {
+    for (const fresh of [false, true]) {
+      for (const headRefOid of ['', null, {}, ' \t\n', 'not-a-sha', 'a'.repeat(6), 'a'.repeat(41)]) {
+        const result = fresh
+          ? run(missingArgs, [], { freshState: { headRefOid } })
+          : run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { headRefOid });
+        expect(result.readPrState).toHaveBeenCalledTimes(fresh ? 2 : 1);
+        expect(result.exitCode).toBe(1);
+        expect(result.calls).toEqual([]);
+        expect(result.ledgerWrites).toEqual([]);
+        expect(result.payload.reason).toBe('head unreadable — cannot prove no human clearance');
+      }
+    }
+  });
+
+  it('rearm preserves embedded-page clearance when pagination is empty or partial on initial and missing-only fresh reads', () => {
+    const clearance = { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
+      author: { login: 'web-everything' } };
+    const comments = [clearance, ...Array.from({ length: PR_COMMENTS_PAGE_SIZE - 1 }, () => ({ body: 'discussion' }))];
+    for (const fresh of [false, true]) {
+      for (const pagedComments of [[], [{ body: 'partial discussion' }]]) {
+        const readComments = vi.fn(() => pagedComments);
+        const result = fresh
+          ? run(missingArgs, [], { readComments, freshState: { comments } })
+          : run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, readComments });
+        expect(result.readPrState).toHaveBeenCalledTimes(fresh ? 2 : 1);
+        expect(readComments).toHaveBeenCalledTimes(1);
+        expect(readComments).toHaveBeenCalledWith('o/n', '9');
+        expect(result.exitCode).toBe(1);
+        expect(result.calls).toEqual([]);
+        expect(result.ledgerWrites).toEqual([]);
+        expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+      }
+    }
+  });
+
+  describe.each(['initial read', 'fresh changed-head reread'])('embedded-page human clearance on %s', read => {
+    it('refuses rearm when matching paginated ids have stale bodies without the embedded clearance', () => {
+      const fresh = read === 'fresh changed-head reread';
+      const head = (fresh ? 'b' : 'a').repeat(40);
+      const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({
+        id: `IC_${i}`, body: `discussion ${i}`, author: { login: 'web-everything' },
+      }));
+      comments[0].body = buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: head });
+      const readComments = vi.fn(() => comments.map(c => ({ ...c, body: 'stale discussion' })));
+      const result = fresh
+        ? run(missingArgs, [], { readComments, freshState: { comments, headRefOid: head } })
+        : run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, readComments });
+      expect(readComments).toHaveBeenCalledTimes(1);
+      expect(readComments).toHaveBeenCalledWith('o/n', '9');
+      expect(result.exitCode).toBe(1);
+      expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+      expect(result.calls).toEqual([]);
+      expect(result.ledgerWrites).toEqual([]);
+    });
+
+    it.each(['empty', 'shorter', 'same-size non-covering', 'longer non-covering'])(
+      'refuses rearm without label, comment or ledger writes when pagination is %s', shape => {
+        const fresh = read === 'fresh changed-head reread';
+        const head = (fresh ? 'b' : 'a').repeat(40);
+        const comments = [{ id: 'IC_clearance', author: { login: 'web-everything' },
+          body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: head }) },
+        ...Array.from({ length: PR_COMMENTS_PAGE_SIZE - 1 }, (_, i) => ({ id: `IC_${i}`, body: `discussion ${i}` }))];
+        const pagedComments = shape === 'empty' ? [] : shape === 'shorter' ? comments.slice(1)
+          : [...comments.slice(1), { id: 'IC_other', body: 'other discussion' },
+            ...(shape === 'longer non-covering' ? [{ id: 'IC_extra', body: 'extra discussion' }] : [])];
+        const readComments = vi.fn(() => pagedComments);
+        const result = fresh
+          ? run(missingArgs, [], { readComments, freshState: { comments, headRefOid: head } })
+          : run(['9', '--repo=o/n'], [REVIEW_LABELS.changes], { comments, readComments });
+        expect(result.readPrState).toHaveBeenCalledTimes(fresh ? 2 : 1);
+        expect(readComments).toHaveBeenCalledTimes(1);
+        expect(readComments).toHaveBeenCalledWith('o/n', '9');
+        expect(result.exitCode).toBe(1);
+        expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+        expect(result.calls).toEqual([]);
+        expect(result.ledgerWrites).toEqual([]);
+      });
+  });
+
+  it.each([undefined, null, {}, 'unreadable'])('missing-only rearm fails closed without writes when fresh comments are not an array (%j)', (comments) => {
+    const result = run(missingArgs, [], { freshState: { comments } });
+    expect(result.readPrState).toHaveBeenCalledTimes(2);
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual([]);
+    expect(result.ledgerWrites).toEqual([]);
+    expect(result.payload.reason).toBe('comments unreadable — cannot prove no human clearance');
+  });
+
+  it('missing-only rearm refuses without writes when clearance arrives beyond the fresh embedded comment page', () => {
+    const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, () => ({ body: 'discussion' }));
+    const clearance = { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
+      author: { login: 'web-everything' } };
+    const readComments = vi.fn().mockReturnValueOnce([...comments, { body: 'later discussion' }]).mockReturnValue([...comments, clearance]);
+    const result = run(missingArgs, [], { comments, readComments, freshState: { comments } });
+    expect(result.readPrState).toHaveBeenCalledTimes(2);
+    expect(readComments.mock.calls).toEqual([['o/n', '9'], ['o/n', '9']]);
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual([]);
+    expect(result.ledgerWrites).toEqual([]);
+    expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+  });
+
+  it.each([
+    ['undefined', undefined], ['null', null], ['object', {}], ['string', 'unreadable'], ['throw', new Error('thread unavailable')],
+  ])('missing-only rearm fails closed without writes when the fresh paginated thread is unreadable (%s)', (_name, pagedComments) => {
+    const comments = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, () => ({ body: 'discussion' }));
+    const readComments = vi.fn().mockReturnValueOnce([...comments, { body: 'later discussion' }]).mockImplementation(() => {
+      if (pagedComments instanceof Error) throw pagedComments;
+      return pagedComments;
+    });
+    const result = run(missingArgs, [], { comments, readComments, freshState: { comments } });
+    expect(result.readPrState).toHaveBeenCalledTimes(2);
+    expect(readComments).toHaveBeenCalledTimes(2);
+    expect(result.exitCode).toBe(1);
+    expect(result.calls).toEqual([]);
+    expect(result.ledgerWrites).toEqual([]);
+    expect(result.payload.reason).toBe('comments unreadable — cannot prove no human clearance');
+  });
+
+  it.each([
+    ['trusted current-head clearance', 'a'.repeat(40), { login: 'web-everything' }, false],
+    ['trusted stale-head clearance', 'b'.repeat(40), { login: 'web-everything' }, true],
+    ['untrusted current-head marker', 'a'.repeat(40), { login: 'drive-by' }, true],
+    ['current-head marker with no author', 'a'.repeat(40), undefined, true],
+  ])('missing-only rearm rechecks fresh %s before any write, even after a plain accept', (_name, headSha, author, allowed) => {
+    const comments = [
+      { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha }), author },
+      { body: buildVerdictComment({ to: 'accepted', actor: 'reviewer', headSha: 'a'.repeat(40) }), author: { login: 'web-everything' } },
+    ];
+    const result = run(missingArgs, [], { freshState: { comments } });
+    if (allowed) expect(result.readPrState.mock.calls.length).toBeGreaterThanOrEqual(2); // the post-write verify read adds one
+    else expect(result.readPrState).toHaveBeenCalledTimes(2);
+    // the stub never mutates labels, so an allowed write ends at the post-write verify (exit 1) after both writes
+    if (!allowed) expect(result.exitCode).toBe(1);
+    if (allowed) expect(result.calls).toEqual(['postComment', 'setLabels']);
+    else {
+      expect(result.calls).toEqual([]);
+      expect(result.ledgerWrites).toEqual([]);
+      expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+    }
   });
 
   it('only-if fails closed on any value other than accepted, before any write', () => {
@@ -3671,7 +4115,7 @@ describe('#4315 direct acceptance boundary', () => {
     try {
       expect(() => runReviewLabelCli({ argv: ['7', '--repo=o/r', `--to=${to}`, '--actor=operator', '--reason=generic clearance'],
         allowClearHuman: true, defaultActor: 'operator', emit: x => output.push(x),
-        provider: { readPrState: () => state, postComment: () => writes.push('post'), setLabels: () => writes.push('label') },
+        provider: { readPostingIdentity: () => ({ login: 'chalbert', type: 'User' }), readPrState: () => state, postComment: () => writes.push('post'), setLabels: () => writes.push('label') },
         buildComment: () => 'accept', successResult: x => x, refusalResult: x => x,
       })).toThrow();
       expect(output.join('')).toContain('mandatory referral hold');
@@ -3984,6 +4428,7 @@ describe('#5649 — approval rows at the label home', () => {
     const calls = [];
     return {
       calls, name: 'stub', currentRepo: () => 'o/n',
+      readPostingIdentity: () => ({ login: 'chalbert', type: 'User' }),
       readPrState: () => ({ labels: labels.map((name) => ({ name })), comments: [], headRefOid: 'a'.repeat(40), headRefName: 'lane/x', state: 'OPEN', body: '' }),
       readLabels: () => labels.map((name) => ({ name })),
       setLabels: () => { calls.push('setLabels'); },

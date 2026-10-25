@@ -55,8 +55,12 @@ import { graduationProgressReportOperation, GRADUATION_PROGRESS_REPORT_OP } from
 import { createScorecardReader, createPromotionsReader, createProbationReader } from './graduation-progress-report-io.mjs';
 import { selectSupervisionLevel, DEFAULT_BACKDOWN_THRESHOLDS } from '../lib/provider-routing.mjs';
 import { loadReviewSeatSettings } from '../lib/review-seat-provider.mjs';
-import { prStatusOperation, PR_STATUS_OP } from './pr-status.mjs';
+import { prStatusOperation, PR_STATUS_OP, finishPrStatus } from './pr-status.mjs';
 import { createPrReader } from './pr-status-io.mjs';
+import { judgeSweepFactsOperation, JUDGE_SWEEP_FACTS_OP, finishJudgeSweep } from './judge-sweep-facts.mjs';
+import { createJudgeSweepFactsReader } from './judge-sweep-facts-io.mjs';
+import { adoptionMatrixOperation, ADOPTION_MATRIX_OP, finishAdoptionMatrix } from './adoption-matrix.mjs';
+import { createAdoptionMatrixReader } from './adoption-matrix-io.mjs';
 import { staleStateOperation, STALE_STATE_OP } from './stale-state.mjs';
 import { createStaleStateReader } from './stale-state-io.mjs';
 import { prReconcileOperation, PR_RECONCILE_OP } from './pr-reconcile.mjs';
@@ -76,6 +80,8 @@ import { createPrePrCheckReader } from './pre-pr-check-io.mjs';
 import { maintenanceOperation, MAINTENANCE_OP } from './maintenance.mjs';
 import { createMaintenanceSinks } from './maintenance-io.mjs';
 import { freeScopeOperation, FREE_SCOPE_OP } from './free-scope.mjs';
+import { prototypeLoadOperation, PROTOTYPE_LOAD_OP, PROTOTYPE_LOAD_EFFECT } from './prototype-load.mjs';
+import { createPrototypeLoader, defaultDeps as prototypeLoadDeps } from './prototype-load-io.mjs';
 import { collectFreeScope } from './free-scope-io.mjs';
 import { reviewSeatCapsOperation, REVIEW_SEAT_CAPS_OP } from './review-seat-caps.mjs';
 import { readSeatCapUsage } from './review-extra-seats.mjs';
@@ -107,6 +113,8 @@ import { scaffoldOperation, SCAFFOLD_OP } from './scaffold.mjs';
 import { createScaffoldReader, createScaffoldSinks } from './scaffold-io.mjs';
 import { fileItemOperation, FILE_ITEM_OP } from './file-item.mjs';
 import { createFileItemReader, createFileItemSinks } from './file-item-io.mjs';
+import { graduateChainOperation, GRADUATE_CHAIN_OP, finishGraduateChain } from './graduate-chain.mjs';
+import { createGraduateChainSinks } from './graduate-chain-io.mjs';
 import { openPrOperation, OPEN_PR_OP } from './open-pr.mjs';
 import { createOpenPrSinks, deriveLaneRef } from './open-pr-io.mjs';
 import { PARK_LABELS } from '../pr-land.mjs';
@@ -128,7 +136,7 @@ import { CONTROL_OPS, operatorControlOperation, finishOperatorControl } from './
 import { createOperatorControlsReader, createOperatorControlsSinks } from './operator-controls-io.mjs';
 // The operator's audited auto-repair round extension (cap + granted rounds, read by reconcile-core).
 import { extendRoundsOperation, EXTEND_ROUNDS_OP } from './extend-rounds.mjs';
-import { createExtendRoundsReader, createExtendRoundsSinks } from './extend-rounds-io.mjs';
+import { createExtendRoundsReader, createExtendRoundsSinks, runRedTeamGateForPr } from './extend-rounds-io.mjs';
 // #4979 — the sanctioned writer of an OPERATOR's block/card/not-real ruling on a PR's mandatory referrals.
 import { recordReferralRulingOperation, RECORD_REFERRAL_RULING_OP } from './record-referral-ruling.mjs';
 import { createRecordReferralRulingReader, createRecordReferralRulingSinks } from './record-referral-ruling-io.mjs';
@@ -137,6 +145,9 @@ import { createLandHumanOnlyReader, createLandHumanOnlySinks } from './land-huma
 import { createClearStuckSessionReader, createClearStuckSessionSinks } from './clear-stuck-session-io.mjs';
 import { docketRefreshOperation, DOCKET_REFRESH_OP, finishDocketOutcome } from './docket-refresh.mjs';
 import { createDocketRefreshReader, createDocketRefreshSinks } from './docket-refresh-io.mjs';
+import { prSweepOperation, PR_SWEEP_OP } from './pr-sweep.mjs';
+import { assessPrSweep, finishPrSweep } from './pr-sweep-core.mjs';
+import { createPrSweepReader } from './pr-sweep-io.mjs';
 import { perfSnapshotOperation, PERF_SNAPSHOT_OP, finishPerfSnapshot } from './perf-snapshot.mjs';
 import { createPerfSnapshotReader, createPerfSnapshotSinks } from './perf-snapshot-io.mjs';
 // #3892 (epic #3443 graduation slice) — the SAFE conveyor restart, ported from `origin/lane/mechanical-dispatcher`.
@@ -171,6 +182,11 @@ import { writeAllSync } from '../lib/write-all-sync.mjs';
  */
 
 export const OPERATIONS = Object.freeze({
+  [JUDGE_SWEEP_FACTS_OP]: () => ({
+    declaration: judgeSweepFactsOperation({ readFacts: createJudgeSweepFactsReader() }),
+    sinks: {},
+    finish: finishJudgeSweep,
+  }),
   ...Object.fromEntries(CONTROL_OPS.map(name => [name, ({ preview = false } = {}) => {
     const readContext = createOperatorControlsReader(preview ? {
       runGh: args => execFileSync('gh', args, { encoding: 'utf8', timeout: 60000, maxBuffer: 64 * 1024 * 1024 }),
@@ -268,7 +284,7 @@ export const OPERATIONS = Object.freeze({
   // read → plan → write: the operator's audited round extension, read back through the cap's own counter.
   [EXTEND_ROUNDS_OP]: () => ({
     declaration: extendRoundsOperation({ readExtensionContext: createExtendRoundsReader() }),
-    sinks: createExtendRoundsSinks(),
+    sinks: createExtendRoundsSinks({ regate: runRedTeamGateForPr }),
   }),
   // #4979 — read → plan → write: the operator's referral ruling, pinned to the live head, read back through the gate.
   [RECORD_REFERRAL_RULING_OP]: () => ({
@@ -335,9 +351,11 @@ export const OPERATIONS = Object.freeze({
     }) }),
     sinks: {},
   }),
+  [ADOPTION_MATRIX_OP]: () => ({ declaration: adoptionMatrixOperation({ collect: createAdoptionMatrixReader() }), sinks: {}, finish: finishAdoptionMatrix }),
   [PR_STATUS_OP]: () => ({
     declaration: prStatusOperation({ readPrs: createPrReader() }),
     sinks: {},
+    finish: finishPrStatus,
   }),
   // #3856 — plan only, no sinks. Every effect the plan can call for (dispatching a delivery agent, a
   // CI-heal repair, a review, queueing an item) lives behind `land-advance-io.mjs`'s sinks, which this
@@ -409,6 +427,13 @@ export const OPERATIONS = Object.freeze({
     declaration: freeScopeOperation({ collect: collectFreeScope }),
     sinks: {},
   }),
+  [PROTOTYPE_LOAD_OP]: () => ({ declaration: prototypeLoadOperation(),
+    sinks: { [PROTOTYPE_LOAD_EFFECT]: (input) => createPrototypeLoader(prototypeLoadDeps())(input) },
+    finish: ({ run, code, lines, json }) => run?.verdict ? {
+      code: run.verdict.ok ? 0 : 1,
+      lines: [JSON.stringify(json ? run.verdict : Object.fromEntries(
+        ['ok', 'daemon', 'clone', 'registered', 'adopted', 'stopReason', ...(run.verdict.stale?.length ? ['stale'] : [])].map((key) => [key, run.verdict[key]])))],
+    } : { code, lines } }),
   // Card xn2wf9t (#3383 follow-up) — the operator's "how close is each non-Claude review seat provider to its
   // own daily call cap" one-liner, `heavy-queue`-style. Read-only, same no-sinks reasoning: every step is
   // `compute`. The real scorecard-store + reservation-ledger read (`readSeatCapUsage`) is bound here, and ONLY here.
@@ -484,6 +509,7 @@ export const OPERATIONS = Object.freeze({
   //
   // PARK_LABELS is the home's own, injected rather than restated: a second list here could ask for a park the
   // home refuses.
+  [GRADUATE_CHAIN_OP]: () => ({ declaration: graduateChainOperation({}), sinks: createGraduateChainSinks(), finish: finishGraduateChain }),
   [OPEN_PR_OP]: () => ({
     declaration: openPrOperation({ parkLabels: PARK_LABELS, deriveRef: () => deriveLaneRef() }),
     sinks: createOpenPrSinks(),
@@ -527,6 +553,14 @@ export const OPERATIONS = Object.freeze({
     declaration: docketRefreshOperation({ readFacts: createDocketRefreshReader() }),
     sinks: createDocketRefreshSinks(),
     finish: finishDocketOutcome,
+  }),
+  // Read-only (every step is compute, no sinks): for EVERY open PR, one `waitingOn` state + actor + since, folded from
+  // labels, hold comments, red-team gate records, the drain's skip reasons and live review/fix jobs; STALLED rows carry
+  // the exact next command. `finish` prints the table; `--json` carries the same report as the verdict.
+  [PR_SWEEP_OP]: () => ({
+    declaration: prSweepOperation({ readSweep: createPrSweepReader(), assess: assessPrSweep }),
+    sinks: {},
+    finish: finishPrSweep,
   }),
   // Held card 119 — the repeatable, no-LLM perf snapshot: recomputes the Opus perf sweep's numbers (verify markers,
   // heavy-admission records, build-dispatch tick log, CI via gh, coroner changeRequests, fix outcomes, executor
@@ -633,7 +667,9 @@ export function resolveOperation(name, opts = {}) {
   const build = Object.hasOwn(OPERATIONS, String(name ?? '')) ? OPERATIONS[name] : undefined;
   if (typeof build !== 'function') {
     throw new Error(
-      `operations: no operation named ${JSON.stringify(name)} (known: ${Object.keys(OPERATIONS).sort().join(', ')})`,
+      `operations: no operation named ${JSON.stringify(name)} (known: ${Object.keys(OPERATIONS).sort().join(', ')})`
+      + ' — if this checkout is behind origin/main, update it with `git pull --ff-only origin main`.'
+      + ' After updating, land-human-only can run from a fresh lane: node scripts/run-fresh.mjs land-human-only …',
     );
   }
   // `finish` is OPTIONAL (most builders omit it): a per-operation post-process over `runOperationCli`'s
@@ -718,7 +754,7 @@ if (IS_CLI) {
   try {
     cliPreflight(name);
     assertRunnerFreshness({ declaration, moduleUrl: import.meta.url,
-      zeroWrites: controlPolicy.zeroWrites || [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP].includes(name) });
+      zeroWrites: controlPolicy.zeroWrites || [ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) });
   } catch (e) {
     writeAllSync(2, `${String(e?.message ?? e)}\n`);
     process.exit(1);
@@ -728,7 +764,7 @@ if (IS_CLI) {
   const controlPreview = controlPolicy.memoryStore;
   const cliStores = controlPreview ? { store: createMemoryRunStore(), callLog: undefined }
     : name === RUNNER_ACTIVITY_OP ? createRunnerActivityCliStores()
-    : [STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
+    : [ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
     : { store: createFileRunStore(), callLog: createFileCallLogStore() };
   runOperationCli({
     declaration,

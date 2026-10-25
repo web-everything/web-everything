@@ -40,16 +40,18 @@
  * The wrapper needs no `WE_GITHUB_APP_*` var and never touches the private key itself — only the cache file's
  * already-minted, short-lived token, exactly the credential `GH_TOKEN` was always meant to carry.
  *
- * OPT-IN, SAME GATE AS THE REST OF THIS EPIC (#3866). {@link buildGhShimSettingsEnv} returns `null` — no fs
+ * INTERACTIVE OPT-IN (#3866). {@link buildGhShimSettingsEnv} returns `null` — no fs
  * write, no PATH override, a dispatch byte-identical to before this file existed — unless
  * `we:scripts/lib/github-app-auth-env.mjs#resolveGithubAppEnvConfig` says the CALLING process has actually
  * opted into App auth. This is not only architectural tidiness: a process (or a test) that has not configured
  * `WE_GITHUB_APP_*` has no cache worth shadowing `gh` for, so shimming would be pure overhead for zero benefit
  * — and, live-caught the same day on this same item's own status-file follow-up, an unconditional real-fs
  * default is exactly how an unrelated test run ends up writing into a developer's actual home directory.
+ * Daemon callers always need a refusal shim, including when App configuration is unavailable; inability
+ * to install it throws instead of letting a dispatch omit the auth boundary.
  *
  * NEVER TOUCHES THE PRIVATE KEY. The generated shim only ever reads the shared token CACHE (a short-lived,
- * already-minted installation token) — never `WE_GITHUB_APP_PRIVATE_KEY_PATH`, never signs a JWT, never mints.
+ * already-minted installation token). Daemon cache misses delegate minting to the bounded refresh CLI.
  *
  * #4064 — EVERY BOT gh CALL IS NOW BOTH ON THE APP LOGIN AND THROTTLED. `we:scripts/lib/gh-throttle.mjs` built
  * a cross-process concurrency cap + rate-limit backoff for `gh` calls (a real 2026-09-08 incident: many
@@ -83,12 +85,14 @@
 import { existsSync, writeFileSync, chmodSync, mkdirSync, readFileSync, renameSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
-import { join, resolve, dirname } from 'node:path';
+import { join, resolve, dirname, isAbsolute, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defaultCachePath, resolveGithubAppEnvConfig } from './github-app-auth-env.mjs';
 import {
   OWNER_INSTALLATIONS, MOVED_REPO_OWNERS, canonicalOwner, installationMap, installationForOwner, ownerOfSlug, ownerFromRemoteUrl, ownerFromGhArgv, installationCachePath,
 } from './github-app-installations.mjs';
+import { readGhAuthPolicy, isDaemonCaller } from './github-auth-policy.mjs';
+import { readSettings, SETTINGS_DIR, LEGACY_SETTINGS_PATH } from './settings-files.mjs';
 import { primaryCheckout } from '../bootstrap-session.mjs';
 import { DEFAULT_CALLER_ROLES, roleForCaller, readDeliveryIdentity, shimRoleTable, ROLE_ENV } from './github-app-identity.mjs';
 import { controlClonePath } from './automation-home.mjs';
@@ -162,6 +166,21 @@ export function checkoutShimDir({ ghThrottleCliPath = defaultGhThrottleCliPath()
   return join(home, '.claude', 'github-app-token', 'gh-shim.d', key);
 }
 
+/**
+ * The personal-fallback policy written into a shim. Many processes write one shim dir (it is keyed by
+ * `ghThrottleCliPath`, usually the control clone's), so the policy must not depend on the writer: both its
+ * tool settings and its platform preference files come from the checkout that owns `ghThrottleCliPath`. A
+ * caller's env (WE_GH_AUTH_PERSONAL_FALLBACK, WE_PLATFORM_PREFERENCES_FILE) and the writer's own checkout never
+ * reach it. The shim still reads WE_GH_AUTH_PERSONAL_FALLBACK from each caller at run time.
+ */
+export function shimFallbackPolicy({ ghThrottleCliPath = defaultGhThrottleCliPath() } = {}) {
+  const scripts = dirname(dirname(resolve(ghThrottleCliPath)));
+  return readGhAuthPolicy({ daemon: true, env: {},
+    read: () => readSettings({ dir: join(scripts, basename(SETTINGS_DIR)), legacyPath: join(scripts, basename(LEGACY_SETTINGS_PATH)) }),
+    // The platform files are named relative to the reading module; read the owner's files of the same names.
+    readFile: (path, encoding) => readFileSync(join(scripts, 'lib', basename(path)), encoding) });
+}
+
 /** The root every generated shim dir lives under — never a real `gh` (see {@link resolveRealGhBinary}). */
 function shimRootFor(home = homedir()) {
   return join(home, '.claude', 'github-app-token');
@@ -187,6 +206,8 @@ export function resolveRealGhBinary({
   const resolvedShimDir = resolve(shimDir);
   const resolvedRoot = resolve(shimRoot);
   for (const dir of pathEnv.split(':').filter(Boolean)) {
+    // A relative entry (`.`, `~/bin`) names a different gh in every caller's cwd; the shim is shared.
+    if (!isAbsolute(dir)) continue;
     if (resolve(dir) === resolvedShimDir) continue; // never resolve to ourselves
     // #4044: nor to ANY generated shim (another checkout's per-checkout dir, or the legacy shared one) — a
     // dispatcher running under a session's shim PATH would otherwise bake that shim in as its "real" gh.
@@ -208,6 +229,177 @@ const SHIM_CACHE_VERSION = 2;
 const SHIM_REFRESH_BUFFER_MS = 10 * 60 * 1000;
 /** The captured App-token call's per-stream buffer cap — far above any real gh output (see the shim script). */
 const SHIM_CAPTURE_MAX_BUFFER = 1024 * 1024 * 1024;
+
+/**
+ * The value-taking options of gh 2.95, read from every native command's `--help`: per command,
+ * [its value shorthands, its value long names]. The host guard reads only repository selectors and
+ * target positionals as hosts; an option value (`--comment <url>`, `-n <notes>`) is content. Only a
+ * (command, option) pair listed here skips its value, so a switch of the same name in another command
+ * (`repo edit --template <repo>`, `pr view --comments <url>`) keeps its next argument a target, and an
+ * option a newer gh adds is scanned conservatively: drift can cause a refusal, never a missed host.
+ * Selectors (-R/--repo, -h/--hostname, the repository flags below) and optional-value options (browse
+ * -c/--commit) are absent. Each pair was confirmed by gh's own parser (`<cmd> --<name>=x --unknown`
+ * fails on the unknown flag, not ParseBool): help shows some switches with a backquoted placeholder.
+ */
+export const GH_VALUE_OPTIONS = {
+  'agent-task create': ['baF', 'base custom-agent from-file'],
+  'agent-task list': ['qLt', 'jq json limit template'],
+  'agent-task view': ['qt', 'jq json template'],
+  api: ['FHqXpft', 'cache field header input jq method preview raw-field template'],
+  'attestation download': ['dLo', 'digest-alg limit owner predicate-type'],
+  'attestation trusted-root': ['', 'tuf-root tuf-url'],
+  'attestation verify': ['bidqLot', 'bundle cert-identity cert-identity-regex cert-oidc-issuer ' +
+    'custom-trusted-root digest-alg format jq limit owner predicate-type signer-digest signer-repo ' +
+    'signer-workflow source-digest source-ref template'],
+  'auth login': ['ps', 'git-protocol scopes'],
+  'auth logout': ['u', 'user'],
+  'auth refresh': ['rs', 'remove-scopes scopes'],
+  'auth status': ['', 'jq json template'],
+  'auth switch': ['u', 'user'],
+  'auth token': ['u', 'user'],
+  browse: ['b', 'branch'],
+  'cache delete': ['r', 'ref'],
+  'cache list': ['qkLOrSt', 'jq json key limit order ref sort template'],
+  'codespace code': ['c', 'codespace repo-owner'],
+  'codespace cp': ['cp', 'codespace profile repo-owner'],
+  'codespace create': ['bdlm', 'branch devcontainer-path display-name idle-timeout location machine ' +
+    'retention-period'],
+  'codespace delete': ['cou', 'codespace days org repo-owner user'],
+  'codespace edit': ['cdm', 'codespace display-name machine repo-owner'],
+  'codespace jupyter': ['c', 'codespace repo-owner'],
+  'codespace list': ['qLotu', 'jq json limit org template user'],
+  'codespace logs': ['c', 'codespace repo-owner'],
+  'codespace ports': ['cqt', 'codespace jq json repo-owner template'],
+  'codespace rebuild': ['c', 'codespace repo-owner'],
+  'codespace ssh': ['c', 'codespace debug-file profile repo-owner server-port'],
+  'codespace stop': ['cou', 'codespace org repo-owner user'],
+  'codespace view': ['cqt', 'codespace jq json repo-owner template'],
+  completion: ['s', 'shell'],
+  'discussion comment': ['bF', 'body body-file'],
+  'discussion create': ['bFclt', 'body body-file category label title'],
+  'discussion edit': ['bFct', 'add-label body body-file category remove-label title'],
+  'discussion list': ['AcqlLSst', 'after author category jq json label limit order search sort state template'],
+  'discussion view': ['qLt', 'after jq json limit order template'],
+  'extension create': ['', 'precompiled'],
+  'extension install': ['', 'pin'],
+  'extension search': ['qLt', 'jq json license limit order owner sort template'],
+  'gist create': ['df', 'desc filename'],
+  'gist edit': ['adfr', 'add desc filename remove'],
+  'gist list': ['L', 'filter limit'],
+  'gist view': ['f', 'filename'],
+  'gpg-key add': ['t', 'title'],
+  'issue close': ['cr', 'comment duplicate-of reason'],
+  'issue comment': ['bF', 'body body-file'],
+  'issue create': ['abFlmpTt', 'assignee blocked-by blocking body body-file label milestone parent project ' +
+    'recover template title type'],
+  'issue develop': ['bn', 'base name'],
+  'issue edit': ['bFmt', 'add-assignee add-blocked-by add-blocking add-label add-project add-sub-issue body ' +
+    'body-file milestone parent remove-assignee remove-blocked-by remove-blocking remove-label remove-project ' +
+    'remove-sub-issue title type'],
+  'issue list': ['aAqlLmSst', 'app assignee author jq json label limit mention milestone search state template ' +
+    'type'],
+  'issue lock': ['r', 'reason'],
+  'issue reopen': ['c', 'comment'],
+  'issue status': ['qt', 'jq json template'],
+  'issue view': ['qt', 'jq json template'],
+  'label create': ['cd', 'color description'],
+  'label edit': ['cdn', 'color description name'],
+  'label list': ['qLSt', 'jq json limit order search sort template'],
+  'org list': ['L', 'limit'],
+  'pr checkout': ['b', 'branch'],
+  'pr checks': ['iqt', 'interval jq json template'],
+  'pr close': ['c', 'comment'],
+  'pr comment': ['bF', 'body body-file'],
+  'pr create': ['aBbFHlmprTt', 'assignee base body body-file head label milestone project recover reviewer ' +
+    'template title'],
+  'pr diff': ['e', 'color exclude'],
+  'pr edit': ['BbFmt', 'add-assignee add-label add-project add-reviewer base body body-file milestone ' +
+    'remove-assignee remove-label remove-project remove-reviewer title'],
+  'pr list': ['aABHqlLSst', 'app assignee author base head jq json label limit search state template'],
+  'pr lock': ['r', 'reason'],
+  'pr merge': ['AbFt', 'author-email body body-file match-head-commit subject'],
+  'pr reopen': ['c', 'comment'],
+  'pr revert': ['bFt', 'body body-file title'],
+  'pr review': ['bF', 'body body-file'],
+  'pr status': ['qt', 'jq json template'],
+  'pr view': ['qt', 'jq json template'],
+  'project close': ['qt', 'format jq owner template'],
+  'project copy': ['qt', 'format jq source-owner target-owner template title'],
+  'project create': ['qt', 'format jq owner template title'],
+  'project delete': ['qt', 'format jq owner template'],
+  'project edit': ['dqt', 'description format jq owner readme template title visibility'],
+  'project field-create': ['qt', 'data-type format jq name owner single-select-options template'],
+  'project field-delete': ['qt', 'format id jq template'],
+  'project field-list': ['qLt', 'format jq limit owner template'],
+  'project item-add': ['qt', 'format jq owner template url'],
+  'project item-archive': ['qt', 'format id jq owner template'],
+  'project item-create': ['qt', 'body format jq owner template title'],
+  'project item-delete': ['qt', 'format id jq owner template'],
+  'project item-edit': ['qt', 'body date field-id format id iteration-id jq number project-id ' +
+    'single-select-option-id template text title'],
+  'project item-list': ['qLt', 'format jq limit owner query template'],
+  'project link': ['T', 'owner team'],
+  'project list': ['qLt', 'format jq limit owner template'],
+  'project mark-template': ['qt', 'format jq owner template'],
+  'project unlink': ['T', 'owner team'],
+  'project view': ['qt', 'format jq owner template'],
+  'release create': ['nFt', 'discussion-category notes notes-file notes-start-tag target title'],
+  'release download': ['ADOp', 'archive dir output pattern'],
+  'release edit': ['nFt', 'discussion-category notes notes-file tag target title'],
+  'release list': ['qLOt', 'jq json limit order template'],
+  'release verify': ['qt', 'format jq template'],
+  'release verify-asset': ['qt', 'format jq template'],
+  'release view': ['qt', 'jq json template'],
+  'repo autolink list': ['qt', 'jq json template'],
+  'repo autolink view': ['qt', 'jq json template'],
+  'repo clone': ['u', 'upstream-remote-name'],
+  'repo create': ['dghlrst', 'description gitignore homepage license remote source team'],
+  'repo deploy-key add': ['t', 'title'],
+  'repo deploy-key list': ['qt', 'jq json template'],
+  'repo edit': ['dh', 'add-topic default-branch description homepage remove-topic squash-merge-commit-message ' +
+    'visibility'],
+  'repo fork': ['', 'fork-name org remote-name'],
+  'repo list': ['qlLt', 'jq json language limit template topic visibility'],
+  'repo read-dir': ['qt', 'jq json ref template'],
+  'repo read-file': ['qot', 'jq json output ref template'],
+  'repo sync': ['b', 'branch'],
+  'repo view': ['bqt', 'branch jq json template'],
+  'ruleset list': ['Lo', 'limit org'],
+  'ruleset view': ['o', 'org'],
+  'run download': ['Dnp', 'dir name pattern'],
+  'run list': ['bceqLstuw', 'branch commit created event jq json limit status template user workflow'],
+  'run rerun': ['j', 'job'],
+  'run view': ['ajqt', 'attempt job jq json template'],
+  'run watch': ['i', 'interval'],
+  'search code': ['qLt', 'extension filename jq json language limit match owner size template'],
+  'search commits': ['qLt', 'author author-date author-email author-name committer committer-date committer-email ' +
+    'committer-name hash jq json limit order owner parent sort template tree visibility'],
+  'search issues': ['qLt', 'app assignee author closed commenter comments created interactions involves jq json ' +
+    'label language limit match mentions milestone order owner project reactions sort state team-mentions ' +
+    'template updated visibility'],
+  'search prs': ['BHqLt', 'app assignee author base checks closed commenter comments created head interactions ' +
+    'involves jq json label language limit match mentions merged-at milestone order owner project reactions ' +
+    'review review-requested reviewed-by sort state team-mentions template updated visibility'],
+  'search repos': ['qLt', 'created followers forks good-first-issues help-wanted-issues include-forks jq json ' +
+    'language license limit match number-topics order owner size sort stars template topic updated visibility'],
+  'secret delete': ['aeo', 'app env org'],
+  'secret list': ['aeqot', 'app env jq json org template'],
+  'secret set': ['abefov', 'app body env env-file org visibility'],
+  'skill install': ['', 'agent dir pin scope'],
+  'skill list': ['qt', 'agent dir jq json scope template'],
+  'skill publish': ['', 'tag'],
+  'skill search': ['qLt', 'jq json limit owner page template'],
+  'skill update': ['', 'dir'],
+  'ssh-key add': ['t', 'title type'],
+  status: ['eo', 'exclude org'],
+  'variable delete': ['eo', 'env org'],
+  'variable get': ['eqot', 'env jq json org template'],
+  'variable list': ['eqot', 'env jq json org template'],
+  'variable set': ['befov', 'body env env-file org visibility'],
+  'workflow list': ['qLt', 'jq json limit template'],
+  'workflow run': ['Ffr', 'field raw-field ref'],
+  'workflow view': ['r', 'ref'],
+};
 
 /**
  * PURE: the pattern the shim script tests a FAILED App-token `gh` call's stderr against to tell "this token
@@ -248,6 +440,14 @@ export function shimCallerScriptFromCommand(command) {
   return null;
 }
 
+// isDaemonCaller lives in github-auth-policy.mjs (github-app-auth-env.mjs needs it too); inlined into the shim below.
+export { isDaemonCaller };
+
+/** Use the same stable checkout selection as the throttle CLI. */
+export function defaultGithubAppRefreshCliPath(options) {
+  return join(dirname(defaultGhThrottleCliPath(options)), 'github-app-refresh-cli.mjs');
+}
+
 /**
  * PURE: the shim script's own source text — a standalone, dependency-free CommonJS Node script (no repo
  * import reaches it; see the module header for why). Reads `cachePath` fresh on every invocation, applies
@@ -264,12 +464,13 @@ export function shimCallerScriptFromCommand(command) {
  * recognizes the failure as the token itself being rejected does the shim (a) best-effort delete the shared
  * cache, so the fleet's next refresh mints a replacement instead of every other dispatched session hitting
  * the same bad token for up to an hour, and (b) retry the SAME call once more with no token override — falling
- * back to whatever auth was already in effect (the operator's own `gh auth login`), exactly as a session with
- * no App auth configured at all would run. Every other outcome (success, or a failure unrelated to the token)
+ * back to whatever auth was already in effect for interactive callers. Daemons refuse this fallback unless
+ * `ghAuth.personalFallback=allow` or inherited auth has matching App-token provenance. An interactive session with
+ * no App auth configured keeps its existing behavior. Every other outcome (success, or a failure unrelated to the token)
  * passes the same bytes and exit code through — but BUFFERED, not streamed: on the tokened path gh sees a
  * pipe, not a TTY, so color/pager/live-progress differ from a direct call (harmless for a non-TTY dispatched
  * session; an interactive operator run is the known gap, PR #2600 review). With no cached token at all the
- * original inherited-stdio call runs unchanged — a host with nothing cached sees zero change from before.
+ * interactive inherited-auth call runs unchanged. A daemon tries the refresh CLI once before refusing.
  *
  * #4064 — BOTH real-`gh` invocations below (the tokened attempt and the inherited-auth fallback) run through
  * `we:scripts/lib/gh-throttle.mjs`'s own standalone CLI (`GH_THROTTLE_CLI`, baked in at generation time exactly
@@ -286,14 +487,17 @@ export function shimCallerScriptFromCommand(command) {
  * @param {{realGhPath:string, cachePath:string, ghThrottleCliPath?:string, roleTable?:object, callerRoles?:object}} o
  * @returns {string}
  */
-export function renderGhShimScript({ realGhPath, cachePath, ghThrottleCliPath = defaultGhThrottleCliPath(), roleTable = {}, callerRoles = DEFAULT_CALLER_ROLES }) {
+export function renderGhShimScript({ realGhPath, cachePath, ghThrottleCliPath = defaultGhThrottleCliPath(),
+  // Like the policy, the refresh CLI belongs to the checkout that owns the shim, not the writer.
+  refreshCliPath = join(dirname(ghThrottleCliPath), 'github-app-refresh-cli.mjs'), personalFallbackPolicy = shimFallbackPolicy({ ghThrottleCliPath }),
+  roleTable = {}, callerRoles = DEFAULT_CALLER_ROLES }) {
   return `#!/usr/bin/env node
 // AUTO-GENERATED by we:scripts/lib/gh-app-shim.mjs — regenerated on every dispatch; do not edit by hand.
 // A transparent \`gh\` pass-through that reads the shared GitHub App token cache FRESH on every call (#x8mpubm),
 // so a dispatched session's gh calls keep authenticating as the App installation for as long as the shared
 // cache stays fresh, however long the session itself runs — never a one-time value stale after ~1h. If the
-// cached token itself gets rejected (looks fresh, GitHub disagrees), falls back to personal auth for THIS
-// call and invalidates the cache so the fleet stops handing out the same bad token (#x8mpubm review-2582).
+// cached token gets rejected, invalidate its cache. Daemons refuse inherited personal auth; interactive
+// callers retain their existing retry behavior (#x8mpubm review-2582).
 // #4064: every real \`gh\` invocation below is routed through gh-throttle.mjs's own CLI (GH_THROTTLE_CLI) so
 // it is paced by that module's shared cross-process concurrency cap, not execed directly.
 'use strict';
@@ -321,9 +525,20 @@ ${installationCachePath.toString()}
 // Per-role Apps: {role: {cachePath, installations}} for each CONFIGURED role; empty = today's App only.
 const ROLE_IDENTITIES = ${JSON.stringify(roleTable ?? {})};
 const CALLER_ROLES = ${JSON.stringify(callerRoles ?? {})};
+const GH_VALUE_OPTIONS = ${JSON.stringify(GH_VALUE_OPTIONS)};
 ${roleForCaller.toString()}
 const REFRESH_BUFFER_MS = ${JSON.stringify(SHIM_REFRESH_BUFFER_MS)};
 const GH_THROTTLE_CLI = ${JSON.stringify(ghThrottleCliPath)};
+const APP_REFRESH_CLI = ${JSON.stringify(refreshCliPath)};
+const PERSONAL_FALLBACK_POLICY = ${JSON.stringify(personalFallbackPolicy)};
+${isDaemonCaller.toString()}
+const DAEMON = isDaemonCaller(process.env);
+const DAEMON_CALLER = process.env.WE_GH_DAEMON_CALLER || process.env.XPC_SERVICE_NAME || 'unknown';
+const runtimeFallback = String(process.env.WE_GH_AUTH_PERSONAL_FALLBACK || '').trim().toLowerCase();
+const fallbackOverridden = ['allow', 'refuse'].includes(runtimeFallback);
+const personalFallback = fallbackOverridden ? runtimeFallback : PERSONAL_FALLBACK_POLICY.personalFallback;
+const personalFallbackSource = fallbackOverridden ? 'env' : PERSONAL_FALLBACK_POLICY.source.personalFallback;
+let tokenMisses = [];
 
 // #4064: run \`gh\` (as REAL_GH) through gh-throttle.mjs's CLI instead of execing it directly — same captured
 // shape (\`stdio: ['inherit','pipe','pipe']\`, a big maxBuffer) either way, so every call site below stays a
@@ -527,12 +742,13 @@ function freshCachedToken() {
       cachedInstallationId = r.cached.installationId ?? null;
       return r.cached.token;
     }
-    if (name === 'legacy' && r.noInstallation) {
+    if (!DAEMON && name === 'legacy' && r.noInstallation) {
       process.stderr.write('gh-shim: no GitHub App installation is configured for owner "' + owner + '" - using personal auth for this call\\n');
     }
     misses.push(name + ': ' + r.miss);
   }
-  if (loud) process.stderr.write('gh-shim: no App token for role "' + role + '" (' + misses.join('; ') + ') - using personal auth for this call\\n');
+  tokenMisses = misses;
+  if (!DAEMON && loud) process.stderr.write('gh-shim: no App token for role "' + role + '" (' + misses.join('; ') + ') - using personal auth for this call\\n');
   return null;
 }
 
@@ -552,11 +768,28 @@ function invalidateSharedCache() {
 // for a payload over the ~64KB pipe-buffer size that write is ASYNCHRONOUS — \`process.exit()\` tears the
 // process down before it drains, silently truncating whatever \`gh\` printed. Setting \`exitCode\` and letting the
 // script fall off the end instead keeps the event loop alive until every queued write really lands.
-function runInherited(env) {
+function runInherited(env, reason, rejectedStderr) {
+  const inheritedApp = DAEMON && !unsupportedHost && env.GH_TOKEN && env.WE_GH_AUTH_TOKEN_HASH === createHash('sha256').update(env.GH_TOKEN).digest('hex');
+  if (DAEMON) {
+    if (!inheritedApp) {
+      const detail = ' for daemon caller "' + DAEMON_CALLER + '" (role ' + requestedRole(env)
+        + ', owner ' + (targetOwner(process.argv.slice(2), env) || 'unknown') + '): '
+        + (reason || tokenMisses.join('; ') || 'no fresh token cached')
+        + '; ghAuth.personalFallback=' + personalFallback + ' (source: ' + personalFallbackSource + ')';
+      if (personalFallback === 'refuse') {
+        // Keep gh's actual cause first for callers that classify only the first stderr line.
+        if (rejectedStderr) process.stderr.write(rejectedStderr + (rejectedStderr.endsWith('\\n') ? '' : '\\n'));
+        process.stderr.write('gh-shim: REFUSING personal-auth fallback' + detail + '\\n');
+        process.exitCode = 1;
+        return;
+      }
+      process.stderr.write('gh-shim: personal-auth fallback allowed' + detail + '\\n');
+    }
+  }
   // #4064: was a direct \`spawnSync(REAL_GH, ..., {stdio:'inherit'})\` — now routed through the SAME throttled
   // hop as the tokened path below (stdout/stderr captured then relayed, never \`process.exit()\`'d past — see
   // the block comment above), so the concurrency cap still applies on the no-cached-token fallback too.
-  const result = runThrottled(process.argv.slice(2), env);
+  const result = runThrottled(inheritedApp ? appTokenArgv(process.argv.slice(2)) : process.argv.slice(2), env);
   if (result.error) {
     process.stderr.write(String(result.error && result.error.message || result.error) + '\\n');
     process.exitCode = 1;
@@ -567,14 +800,273 @@ function runInherited(env) {
   process.exitCode = result.status == null ? 1 : result.status;
 }
 
-const token = freshCachedToken();
+// \`gh auth status\` also validates every stored account (TokenForUser) and every configured host
+// unless --active and --hostname narrow it. A daemon spending App credentials checks only the active
+// github.com token, which GH_TOKEN supplies. Placed after every flag (but before a \`--\`) so a user's
+// --active=false cannot win.
+function appTokenArgv(argv) {
+  if (!DAEMON || argv[0] !== 'auth' || argv[1] !== 'status') return argv;
+  const end = argv.indexOf('--') === -1 ? argv.length : argv.indexOf('--');
+  return [...argv.slice(0, end), '--active', '--hostname', 'github.com', ...argv.slice(end)];
+}
+
+// These Apps and their provenance are scoped to github.com. Enterprise gh selects a different
+// credential family (or a stored login), so a GH_TOKEN hash cannot authorize that execution.
+// Check every host hint conservatively, including remotes and URLs, before using ANY App cache.
+function unsupportedTargetHost(argv, env) {
+  const publicHost = (host) => String(host).toLowerCase() === 'github.com';
+  // gh expands aliases/extensions after our check. Their hidden flags cannot establish App provenance.
+  const nativeCommands = ['alias', 'api', 'attestation', 'auth', 'browse', 'cache', 'codespace', 'cs', 'completion',
+    'config', 'extension', 'ext', 'gist', 'gpg-key', 'help', 'issue', 'label', 'org', 'pr', 'project', 'release',
+    'repo', 'ruleset', 'run', 'search', 'secret', 'ssh-key', 'status', 'variable', 'workflow'];
+  if (argv[0] && !argv[0].startsWith('-') && !nativeCommands.includes(argv[0])) return 'unknown command or alias';
+  // cobra finds each command level after skipping options (and the next argument of an option it does
+  // not know) and empty arguments: \`repo --json name view x\` and \`'' repo view x\` both run repo view.
+  // The checks below read the command from fixed positions, so only a leading command word classifies it.
+  if ((argv[0] === '' || argv[0]?.startsWith('-')) && argv.length > 1) return 'ambiguous command';
+  if (!['api', 'browse', 'completion', 'help', 'status'].includes(argv[0]) && argv.length > 1
+    && (argv[1] === '' || argv[1].startsWith('-'))) return 'ambiguous command';
+  if (['extension', 'ext'].includes(argv[0]) && argv[1] === 'exec') return 'extension execution';
+  // Other auth commands read, write or validate stored per-account credentials (git-credential also
+  // takes its host from stdin). \`auth status\` is pinned to the active App token by appTokenArgv.
+  if (argv[0] === 'auth' && argv[1] !== undefined && !['status', 'token'].includes(argv[1])) return 'auth ' + argv[1] + ' uses stored credentials';
+  // \`auth token\` prints the active (App env) token; --user and the hidden --secure-storage read the
+  // keyring instead. Allow only the hostname flag, whose value the scan below checks.
+  if (argv[0] === 'auth' && argv[1] === 'token') {
+    for (let i = 2; i < argv.length; i++) {
+      if (argv[i] === '-h' || argv[i] === '--hostname') i++;
+      else if (!/^-h|^--hostname=/.test(argv[i])) return 'auth token ' + argv[i] + ' reads stored credentials';
+    }
+  }
+  const repoHost = (value, api = false) => {
+    const s = String(value || '');
+    if (/^[a-z][a-z0-9+.-]*:[/][/]/i.test(s)) {
+      try {
+        const host = new URL(s).hostname.toLowerCase();
+        // WHATWG URLs normalize Unicode/percent encodings and default ports; gh's host-keyed
+        // credential lookup need not. Only a literal public authority proves the same host.
+        const authority = s.slice(s.indexOf('://') + 3).split('/')[0].split('?')[0].split('#')[0].toLowerCase();
+        if (authority !== host) return 'ambiguous URL host';
+        return (publicHost(host) || (api && host === 'api.github.com')) ? null : host;
+      } catch { return 'invalid URL'; }
+    }
+    // Both readings must name the public host. gh's [HOST/]OWNER/REPO (FromFullName) splits on '/' and
+    // takes the whole first part as the host, so github.com:443, github.com:443?x and
+    // github.com:x@evil.example are other hosts to gh (an enterprise token, or another server) even
+    // though the SCP reading below sees github.com. The SCP reading covers git@host:o/r and remotes.
+    const parts = s.split('/');
+    if (parts.length >= 3 && parts[0] && !publicHost(parts[0])) return parts[0];
+    const scp = /^(?:[^@/]+@)?([^/:]+):[^/]/.exec(s);
+    if (scp && !publicHost(scp[1])) return scp[1];
+    return null;
+  };
+  if (env.GH_HOST && !publicHost(env.GH_HOST)) return String(env.GH_HOST);
+  if (env.GH_REPO) { const host = repoHost(env.GH_REPO); if (host) return host; }
+  // Only target-bearing positions are URLs. A comment body/title/header may contain any URL.
+  // Native search and extension search positionals are query text.
+  const targetCommand = argv[0] !== 'search' && !(['extension', 'ext'].includes(argv[0]) && argv[1] === 'search');
+  const valueFlags = new Set();
+  // Short names change arity between commands: checkout -q/-f and merge -m/-s/-a are booleans.
+  // Exempt content values only where their consuming option is known; uncertain URL arguments refuse.
+  // Built-in aliases have the same argument arity and target positions as their commands.
+  const subcommand = ({ new: 'create', ls: 'list', co: 'checkout', uninstall: 'remove' })[argv[1]]
+    || (['secret', 'variable'].includes(argv[0]) && argv[1] === 'remove' ? 'delete' : argv[1]);
+  const top = ({ cs: 'codespace', ext: 'extension' })[argv[0]] || argv[0];
+  const command = top + ' ' + subcommand;
+  // Option values are content, never targets (--comment <url>, --notes, --description). Only this
+  // command's own value options skip their value: a switch of the same name elsewhere keeps its next
+  // argument a positional (repo edit --template <repo>). Three-level commands use the deepest key.
+  const commandKeys = [command + ' ' + (({ ls: 'list' })[argv[2]] || argv[2]), command, top];
+  const valueOptions = commandKeys.map((key) => GH_VALUE_OPTIONS[key]).find(Boolean) || ['', ''];
+  for (const name of valueOptions[1].split(' ').filter(Boolean)) valueFlags.add('--' + name);
+  if (argv[0] === 'api') for (const flag of ['-F', '-f', '-H', '-X', '-q', '-t']) valueFlags.add(flag);
+  if (['pr create', 'pr edit', 'pr merge', 'issue create', 'issue edit'].includes(command)) {
+    for (const flag of ['-b', '-F', '-t']) valueFlags.add(flag);
+  }
+  if (['pr comment', 'pr review', 'issue comment'].includes(command)) {
+    for (const flag of ['-b', '-F']) valueFlags.add(flag);
+  }
+  if (['pr view', 'pr list', 'pr status', 'pr checks', 'issue view', 'issue list', 'issue status', 'repo view'].includes(command)) {
+    for (const flag of ['-q', '-t']) valueFlags.add(flag);
+  }
+  if (command === 'workflow run') for (const flag of ['-f', '-F']) valueFlags.add(flag);
+  if (['pr list', 'issue list'].includes(command)) valueFlags.add('-S');
+  const repositoryContentFlags = {
+    'repo clone': ['-o', '--origin', '-u', '--upstream-remote-name'],
+    'repo create': ['-d', '--description', '-h', '--homepage', '-g', '--gitignore', '-l', '--license',
+      '-r', '--remote', '-s', '--source', '-t', '--team'],
+    'repo edit': ['--add-topic', '--default-branch', '-d', '--description', '-h', '--homepage',
+      '--remove-topic', '--squash-merge-commit-message', '--visibility'],
+    'repo fork': ['--fork-name', '--org', '--remote-name'],
+    'repo sync': ['-b', '--branch'],
+    'repo view': ['-b', '--branch'],
+  }[command] || [];
+  for (const flag of repositoryContentFlags) valueFlags.add(flag);
+  // The positionals gh parses as [HOST/]OWNER/REPO (ghrepo.FromFullName). Every other positional is a
+  // local path, branch, tag or name, so a dotted directory like build.v1/app.tar.gz selects no host.
+  const repositoryPositionals = (argv[0] === 'repo' && ['archive', 'clone', 'create', 'credits', 'delete', 'edit',
+    'fork', 'garden', 'rename', 'set-default', 'sync', 'unarchive', 'view'].includes(subcommand))
+    || ['label clone', 'extension install', 'ext install', 'issue transfer'].includes(command);
+  if (['extension install', 'ext install'].includes(command)) valueFlags.add('--pin');
+  // --template is output content elsewhere, but repo create uses it as a source repository.
+  const repositoryFlags = {
+    'repo create': ['--template', '-p'], 'repo sync': ['--source', '-s'], 'issue develop': ['--branch-repo'],
+    'secret set': ['--repos', '-r'], 'variable set': ['--repos', '-r'],
+  }[command] || [];
+  // --repos takes a comma-separated list; each entry may name its own host.
+  // Each entry is checked as written and trimmed: gh may not trim, and either reading must be public.
+  const repoValueHost = (value) => String(value ?? '').split(',').map((part) => repoHost(part) || repoHost(part.trim())).find(Boolean) || null;
+  // Only advance over known boolean shorthands. An unknown shorthand may consume the
+  // rest of the argument as content (-fR=... is a workflow field, not a repo selector).
+  const booleanShorthands = {
+    'pr view': 'cw', 'issue view': 'cw', 'repo view': 'w',
+    'pr list': 'dw', 'issue list': 'w', 'pr status': 'c', 'pr create': 'defw', 'issue create': 'ew', 'pr checks': 'w',
+    'pr checkout': 'f', 'pr merge': 'admrs', 'pr comment': 'cew', 'issue comment': 'cew',
+    'pr close': 'd', 'pr diff': 'w', 'pr ready': 'u', 'pr review': 'acr', 'pr update-branch': 'r',
+    'pr revert': 'd',
+    'issue delete': 'y', 'issue develop': 'cl',
+    'repo create': 'ci', 'repo sync': 'f', 'repo fork': 'cr',
+    'repo archive': 'y', 'repo unarchive': 'y', 'repo delete': 'y', 'repo deploy-key': 'w',
+    'repo rename': 'y', 'repo autolink': 'nw',
+    'release create': 'dp', 'release delete': 'cy', 'release delete-asset': 'y', 'release upload': 'c', 'release view': 'w',
+    'run list': 'a', 'run view': 'evw', 'run watch': 'e', 'run rerun': 'df',
+    'workflow list': 'a', 'workflow view': 'wy', 'cache delete': 'a',
+    'label create': 'f', 'label clone': 'f', 'label delete': 'y', 'label list': 'w',
+    'ruleset check': 'w', 'ruleset list': 'pw', 'ruleset view': 'pw',
+    'codespace code': 'w', 'codespace cp': 'er', 'codespace create': 'sw',
+    'codespace delete': 'f', 'codespace list': 'w', 'codespace logs': 'f', 'codespace ssh': 'd',
+    'secret set': 'u', 'secret list': 'u', 'secret delete': 'u',
+    'search code': 'w', 'search commits': 'w', 'search issues': 'w', 'search prs': 'w', 'search repos': 'w',
+    'auth status': 'at',
+  }[command] || (argv[0] === 'browse' ? 'anprsw' : '');
+  // Value shorthands (GH_VALUE_OPTIONS): inside a bundle they take the rest as content
+  // (-BRelease/a/b is a base branch). Any shorthand in neither table is uncertain.
+  // Optional-value shorthands (browse -c, \`--commit[=last]\`) never take the rest or the
+  // next argument, so they are absent from that table and scanned as uncertain.
+  const valueShorthands = valueOptions[0];
+  // After \`--\` gh reads -x/o/r as a repository argument, unless pflag took the \`--\` as the value of an
+  // option (\`pr list --app -- -R x/o/r\` still parses -R). Check both readings: every later argument is
+  // a positional here, and the option scan below still runs over all of them.
+  const dashDash = argv.indexOf('--');
+  if (targetCommand && dashDash !== -1) {
+    for (const a of argv.slice(dashDash + 1)) {
+      if (repositoryPositionals || /^[a-z][a-z0-9+.-]*:[/][/]/i.test(a)) {
+        const host = repoHost(a, argv[0] === 'api');
+        if (host) return host;
+      }
+    }
+  }
+  let cloneSourceSeen = false;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    // pflag permits boolean bundles before a value flag: -cRhost/o/r, -fsHOST/o/r, -ahHOST.
+    // A known content flag consumes the remainder, so -bRhost/o/r stays body text.
+    // An unknown shorthand may be a boolean (-qRhost/o/r selects host) or a value option (the rest
+    // is content). Check both readings: a later selector still refuses its host, but no following
+    // argument is skipped as a value, so -q -R host/o/r and -qR host/o/r are both scanned.
+    if (a.startsWith('-') && !a.startsWith('--')) {
+      let consumed = false;
+      let uncertain = false;
+      for (let j = 1; j < a.length; j++) {
+        const flag = '-' + a[j];
+        const attached = j + 1 < a.length;
+        const nextValue = () => (uncertain ? argv[i + 1] : argv[++i]);
+        if (flag === '-R' || repositoryFlags.includes(flag)) {
+          const value = attached ? a.slice(j + 1).replace(/^=/, '') : nextValue();
+          const host = repoValueHost(value);
+          if (host) return host;
+          consumed = !uncertain;
+          break;
+        }
+        // auth -h is --hostname and config -h is --host. pflag takes the next argument as its value
+        // even when it starts with -.
+        if ((argv[0] === 'auth' || argv[0] === 'config') && flag === '-h') {
+          const host = attached ? a.slice(j + 1).replace(/^=/, '') : nextValue();
+          if (!publicHost(host ?? '')) return host || 'unknown';
+          consumed = !uncertain;
+          break;
+        }
+        if (valueFlags.has(flag) || valueShorthands.includes(a[j])) {
+          if (!attached && !uncertain) i++;
+          consumed = !uncertain;
+          break;
+        }
+        if (!booleanShorthands.includes(a[j])) uncertain = true;
+      }
+      if (consumed) continue;
+    }
+    const repositoryFlag = repositoryFlags.find((flag) => a === flag || a.startsWith(flag + '='));
+    if (repositoryFlag) {
+      const value = a === repositoryFlag ? argv[++i] : a.slice(repositoryFlag.length).replace(/^=/, '');
+      const host = repoValueHost(value);
+      if (host) return host;
+      continue;
+    }
+    if (valueFlags.has(a)) { i++; continue; }
+    if (a === '--hostname' || a === '--host') {
+      const host = argv[++i];
+      if (!publicHost(host ?? '')) return host || 'unknown';
+      continue;
+    }
+    if (a.startsWith('--hostname=') || a.startsWith('--host=')) {
+      const host = a.slice(a.indexOf('=') + 1);
+      if (!publicHost(host)) return host || 'unknown';
+      continue;
+    }
+    if (a === '--repo') { const host = repoHost(argv[++i]); if (host) return host; continue; }
+    if (a.startsWith('--repo=')) { const host = repoHost(a.slice(7)); if (host) return host; continue; }
+    // Repository arguments also accept single-label host/owner/repo and SCP syntax. A
+    // clone's second positional is a local directory; asset paths, branch names and relative
+    // API endpoints likewise do not select a host. Keep scanning URLs after unknown flags.
+    const repositoryTarget = repositoryPositionals && i > 1 && !a.startsWith('-')
+      && (command !== 'repo clone' || !cloneSourceSeen);
+    if (repositoryTarget && command === 'repo clone') cloneSourceSeen = true;
+    if (targetCommand && !a.startsWith('-') && (repositoryTarget || /^[a-z][a-z0-9+.-]*:[/][/]/i.test(a))) {
+      const host = repoHost(a, argv[0] === 'api');
+      if (host) return host;
+    }
+  }
+  try {
+    const remotes = spawnSync('/usr/bin/git', ['remote', '-v'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000 });
+    if (remotes.error) return 'unreadable git remotes';
+    for (const line of String(remotes.stdout || '').split('\\n')) {
+      const url = line.trim().split(/\\s+/)[1];
+      if (url) { const host = repoHost(url); if (host) return host; }
+    }
+  } catch { return 'unreadable git remotes'; }
+  // gh may use a configured enterprise host as its implicit default. Parse only the simple
+  // public-host-only shape; ambiguous YAML or unreadable config cannot prove public provenance.
+  if (!env.GH_HOST) {
+    const configDir = env.GH_CONFIG_DIR || join(env.XDG_CONFIG_HOME || join(env.HOME || homedir(), '.config'), 'gh');
+    try {
+      const hosts = readFileSync(join(configDir, 'hosts.yml'), 'utf8');
+      const keys = hosts.split('\\n').filter((line) => line.trim() && !/^\\s|^#|^---\\s*$/.test(line));
+      if (!keys.length && hosts.split('\\n').some((line) => line.trim() && !/^\\s*(?:#.*|---)?$/.test(line))) return 'ambiguous gh hosts';
+      if (keys.some((line) => !/^(?:github[.]com|"github[.]com"|'github[.]com'):\\s*(?:#.*)?$/.test(line))) return 'unsupported configured host';
+    } catch (e) { if (e.code !== 'ENOENT') return 'unreadable gh hosts'; }
+  }
+  return null;
+}
+const unsupportedHost = DAEMON ? unsupportedTargetHost(process.argv.slice(2), process.env) : null;
+let token = unsupportedHost ? null : freshCachedToken();
+if (!token && DAEMON && !unsupportedHost) {
+  // One bounded synchronous mint attempt, then one cache re-read. CLI output never reaches the caller.
+  try {
+    if (existsSync(APP_REFRESH_CLI)) {
+      const refreshed = spawnSync(process.execPath, [APP_REFRESH_CLI, '--role=' + requestedRole(process.env)], {
+        env: process.env, stdio: 'ignore', timeout: 90000,
+      });
+      if (!refreshed.error && refreshed.status === 0) token = freshCachedToken();
+    }
+  } catch { /* missing/broken refresh always reaches the refusal guard */ }
+}
 // A reader that closed early (\`gh … | head\`) must not turn a deferred write into an unhandled EPIPE stack trace.
 process.stdout.on('error', () => {});
 process.stderr.on('error', () => {});
 if (!token) {
-  runInherited(process.env); // no cached App token — same bytes/exit code as before (#4064: now also throttled)
+  runInherited(process.env, unsupportedHost ? 'unsupported GitHub host (' + unsupportedHost + ')' : undefined);
 } else {
-  const withToken = runThrottled(process.argv.slice(2), Object.assign({}, process.env, { GH_TOKEN: token }));
+  const withToken = runThrottled(appTokenArgv(process.argv.slice(2)), Object.assign({}, process.env, { GH_TOKEN: token }));
   if (withToken.error) {
     process.stderr.write(String(withToken.error.message || withToken.error) + '\\n');
     process.exitCode = 1;
@@ -582,7 +1074,7 @@ if (!token) {
     const stderrText = withToken.stderr ? withToken.stderr.toString('utf8') : '';
     if (withToken.status !== 0 && looksLikeAppTokenAuthFailure(stderrText)) {
       invalidateSharedCache();
-      runInherited(process.env); // retry once on whatever auth is already in effect — falls back safely
+      runInherited(process.env, 'App token rejected (HTTP 401 / Bad credentials)', stderrText); // guarded inherited-auth retry
     } else {
       if (withToken.stdout && withToken.stdout.length) process.stdout.write(withToken.stdout);
       if (withToken.stderr && withToken.stderr.length) process.stderr.write(withToken.stderr);
@@ -604,6 +1096,7 @@ if (!token) {
 export function ensureGhShim({
   dir = defaultShimDir(), realGhPath, cachePath = defaultCachePath(), ghThrottleCliPath = defaultGhThrottleCliPath(),
   writeFile = writeFileSync, chmod = chmodSync, mkdir = mkdirSync, roleTable = {}, callerRoles = DEFAULT_CALLER_ROLES,
+  refreshCliPath, personalFallbackPolicy,
   // #4044: the real write is ATOMIC (temp file + rename) — this one file is rewritten on every dispatch while
   // other processes exec it, and an in-place truncate-then-write could hand a concurrent `gh` a torn script.
   // An injected `writeFile` (tests) with no injected `rename` keeps the direct single write they assert on.
@@ -613,7 +1106,7 @@ export function ensureGhShim({
   try {
     mkdir(dir, { recursive: true });
     const path = shimGhPath(dir);
-    const src = renderGhShimScript({ realGhPath, cachePath, ghThrottleCliPath, roleTable, callerRoles });
+    const src = renderGhShimScript({ realGhPath, cachePath, ghThrottleCliPath, roleTable, callerRoles, refreshCliPath, personalFallbackPolicy });
     if (rename) {
       const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
       writeFile(tmp, src, 'utf8');
@@ -794,9 +1287,8 @@ export function sanitizeSpawnEnv(env = process.env) {
  * skip (see the module header). That second write's own success/failure never changes this function's return
  * value; it is purely additional insurance.
  *
- * NEVER THROWS. Every real effect below it is wrapped or already non-throwing; this function additionally
- * treats a MISSING real `gh` binary or a failed shim write as "skip it", never as a reason to fail a dispatch
- * that would otherwise have gone out fine on personal auth, exactly as it always has.
+ * Daemon callers throw on a missing real `gh` or a failed shim write: omitting the settings would
+ * lose the refusal boundary. Interactive callers retain the best-effort null result.
  * @param {{env?:NodeJS.ProcessEnv, pathEnv?:string, cachePath?:string, dir?:string, ghThrottleCliPath?:string, cwd?:string,
  *   exists?:Function, writeFile?:Function, chmod?:Function, mkdir?:Function, readFile?:Function}} [o]
  * @returns {Record<string,string>|null}
@@ -808,17 +1300,24 @@ export function buildGhShimSettingsEnv({
   // Per-role Apps: the shim bakes every configured role's cache + installations (empty when none is configured).
   let id = identity;
   if (!id) { try { id = readDeliveryIdentity({ env }); } catch { id = null; } }
-  if (!resolveGithubAppEnvConfig(env) && !id?.anyConfigured) return null; // opt-in — see the module header
+  if (!resolveGithubAppEnvConfig(env) && !id?.anyConfigured && !isDaemonCaller(env)) return null;
   const roleTable = shimRoleTable({ identity: id, cachePath });
   // #4044: THIS checkout's own shim dir by default — never the one machine-wide file every dispatcher rewrote.
   const dir = dirOpt ?? checkoutShimDir({ ghThrottleCliPath });
   const realGhPath = resolveRealGhBinary({ pathEnv, shimDir: dir, exists });
-  if (!realGhPath) return null;
-  const written = ensureGhShim({ dir, realGhPath, cachePath, ghThrottleCliPath, writeFile, chmod, mkdir, roleTable, callerRoles: id?.callerRoles });
-  if (!written.ok) return null;
+  if (!realGhPath) {
+    if (isDaemonCaller(env)) throw new Error('gh-shim: refusing daemon dispatch without a real gh binary');
+    return null;
+  }
+  const written = ensureGhShim({ dir, realGhPath, cachePath, ghThrottleCliPath, writeFile, chmod, mkdir, roleTable, callerRoles: id?.callerRoles, personalFallbackPolicy: shimFallbackPolicy({ ghThrottleCliPath }) });
+  if (!written.ok) {
+    if (isDaemonCaller(env)) throw new Error('gh-shim: refusing daemon dispatch without the gh auth guard');
+    return null;
+  }
   const settingsEnv = { PATH: ghShimPathOverride({ dir, currentPath: pathEnv }) };
   // A dispatched session plays its dispatcher's role (a review session = reviewer) — only once roles are configured.
   if (Object.keys(roleTable).length && env?.[ROLE_ENV]) settingsEnv[ROLE_ENV] = String(env[ROLE_ENV]);
+  if (isDaemonCaller(env)) settingsEnv.WE_GH_DAEMON_CALLER = String(env.WE_GH_DAEMON_CALLER || env.XPC_SERVICE_NAME);
   if (cwd) ensureSettingsFileEnv({ cwd, env: settingsEnv, readFile, writeFile, mkdir }); // best-effort, see above
   return settingsEnv;
 }

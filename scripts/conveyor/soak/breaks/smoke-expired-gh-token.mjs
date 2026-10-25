@@ -44,6 +44,7 @@ import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { runSoak } from '../soak.mjs';
+import { installationCachePath, OWNER_INSTALLATIONS } from '../../../lib/github-app-installations.mjs';
 
 const MOVE_ROUND = 1;
 const JUDGE_ROUND = 2;
@@ -56,7 +57,13 @@ const FAR_EXPIRY = '2099-01-01T00:00:00.000Z';
 function writeTokenCache(w, token) {
   const dir = join(w.home, '.claude', 'github-app-token');
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, 'web-everything.json'), JSON.stringify({ v: 2, token, expiresAt: FAR_EXPIRY }), 'utf8');
+  const path = join(dir, 'web-everything.json');
+  const cached = JSON.stringify({ v: 2, token, expiresAt: FAR_EXPIRY,
+    appId: w.env.WE_GITHUB_APP_ID, installationId: w.env.WE_GITHUB_APP_INSTALLATION_ID });
+  writeFileSync(path, cached, 'utf8');
+  // The refresh and the guarded smoke both select by owner. Rotate that cache alongside the
+  // legacy cache, so neither path retains revoked A after the simulated shared refresh to B.
+  writeFileSync(installationCachePath(path, w.env.WE_GITHUB_APP_INSTALLATION_ID), cached, 'utf8');
 }
 
 const SPECIFIC = new Set([
@@ -94,8 +101,11 @@ export default {
       setup(w) {
         // Baked in BEFORE the daemon host forks (a host copies `w.env` once, at fork).
         Object.assign(w.env, {
-          WE_GITHUB_APP_ID: 'sim-app-1',
-          WE_GITHUB_APP_INSTALLATION_ID: 'sim-install-1',
+          WE_GITHUB_APP_ID: '123456',
+          WE_GITHUB_APP_INSTALLATION_ID: '654321',
+          WE_GITHUB_APP_INSTALLATIONS: JSON.stringify(Object.fromEntries(
+            Object.keys(OWNER_INSTALLATIONS).map(owner => [owner, '654321']))),
+          WE_DELIVERY_IDENTITY: 'none',
           WE_GITHUB_APP_PRIVATE_KEY_PATH: join(w.home, 'app-key.pem'),
         });
         mkdirSync(w.home, { recursive: true });

@@ -4,6 +4,7 @@ import { mkdtempSync, readdirSync, existsSync, rmSync, mkdirSync, writeFileSync,
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 const roots = [];
 afterEach(() => { for (const p of roots.splice(0)) rmSync(p, { recursive: true, force: true }); });
 const moduleUrl = pathToFileURL(resolve('scripts/operations/review-extra-seats.mjs')).href;
@@ -42,7 +43,7 @@ it.each(['success', 'failure', 'SIGTERM', 'SIGINT', 'SIGHUP'])('removes owned ch
   const helper = pathToFileURL(resolve('scripts/lib/review-scratch.mjs')).href;
   const code = `import { mkdirSync } from 'node:fs'; import { ownReviewScratch } from ${JSON.stringify(helper)};
     mkdirSync(${JSON.stringify(dir)}); ownReviewScratch(${JSON.stringify(dir)});
-    ${mode === 'failure' ? "throw new Error('failed seat')" : mode === 'success' ? '' : `process.kill(process.pid, '${mode}'); setTimeout(() => {}, 10000);`}`;
+    ${mode === 'failure' ? "throw new Error('failed seat')" : mode === 'success' ? '' : keepAliveScript({ prelude: `process.kill(process.pid, '${mode}');`, maxLifetimeMs: 10_000 })}`;
   const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', timeout: 15000 });
   expect(existsSync(dir), r.stderr).toBe(false);
   expect(existsSync(`${dir}.owner.json`), r.stderr).toBe(false);
@@ -183,14 +184,15 @@ it.each(['outer-wall', 'SIGTERM'])('escalates %s to SIGKILL for a TERM-ignoring 
   const modelCode = `import { writeFileSync } from 'node:fs';
     process.on('SIGTERM', () => {}); let n = 0;
     writeFileSync(${JSON.stringify(modelPidFile)}, String(process.pid));
-    setInterval(() => writeFileSync(${JSON.stringify(heartbeat)}, String(++n)), 20);`;
+    setInterval(() => writeFileSync(${JSON.stringify(heartbeat)}, String(++n)), 20);
+    ${keepAliveScript()}`;
   writeFileSync(join(tmp, 'scripts', 'codex-direct-task.mjs'), `
     import { writeFileSync } from 'node:fs';
     import { spawn } from 'node:child_process';
     process.on('SIGTERM', () => {});
     spawn(process.execPath, ['--input-type=module', '-e', ${JSON.stringify(modelCode)}], { detached: true, stdio: 'ignore' });
     writeFileSync(${JSON.stringify(ready)}, String(process.pid));
-    setInterval(() => {}, 1000); setTimeout(() => process.exit(), 30000);
+    ${keepAliveScript()} setTimeout(() => process.exit(), 30000);
   `);
   // ps is sandbox-denied. Supply the real fixture PIDs at this OS observation boundary.
   const bin = join(tmp, 'bin'); mkdirSync(bin);
@@ -243,7 +245,7 @@ it('permits another seat after speculative cancellation finishes', async () => {
   writeFileSync(join(tmp, 'scripts', 'codex-direct-task.mjs'), `
     import { existsSync, writeFileSync } from 'node:fs';
     if (existsSync(${JSON.stringify(ready)})) console.log(JSON.stringify({ ok: true }));
-    else { writeFileSync(${JSON.stringify(ready)}, 'ready'); setInterval(() => {}, 1000); }
+    else { writeFileSync(${JSON.stringify(ready)}, 'ready'); ${keepAliveScript()} }
   `);
   const code = `import { createExtraSeatsIo, killActiveSeats } from ${JSON.stringify(moduleUrl)};
     import { existsSync } from 'node:fs';

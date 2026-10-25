@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runInNewContext } from 'node:vm';
+import { scrubRiskyLaneConfig } from '../../../lib/lane-git-hardening.mjs';
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 export default {
@@ -30,7 +31,23 @@ export default {
     const violations = [];
     for (const damage of ['absent .git', 'missing HEAD']) {
       let broken = true; const configured = [];
+      const scrubbed = [], configFailures = [];
       const laneDir = (_repo, n) => `/fixture/lane-${n}`;
+      // Exercise the real scrub wrapper and its failure-tolerant helper; fake only Git I/O.
+      // A failed config read must leave the corrupt lane reachable by fetch recovery.
+      const scrubClaimedLaneConfig = fn('scrubClaimedLaneConfig', {
+        scrubRiskyLaneConfig: (dir, opts) => {
+          scrubbed.push(dir);
+          return scrubRiskyLaneConfig(dir, { ...opts, run: () => {
+            if (broken && dir.endsWith('lane-1')) {
+              configFailures.push(dir);
+              throw Error(damage);
+            }
+            return '';
+          } });
+        },
+        log: () => {}, journalLaneEvent: () => {},
+      });
       const fetchOriginHealing = fn('fetchOriginHealing', {
         laneDir, fetchOriginPruneWithRetry: (dir) => { if (broken && dir.endsWith('lane-1')) throw Error(damage); },
         healSharedStoreFor: () => false, diagnoseLane: () => ({ ok: !broken, problems: [damage] }),
@@ -38,7 +55,7 @@ export default {
         recloneLane: () => { broken = false; },
       });
       const refresh = fn('refreshLane', {
-        laneDir, fetchOriginHealing, gitQuiet: (_args, dir) => {
+        laneDir, scrubClaimedLaneConfig, fetchOriginHealing, gitQuiet: (_args, dir) => {
           if (broken && dir.endsWith('lane-1')) throw Error(damage);
           configured.push(dir);
         },
@@ -47,6 +64,10 @@ export default {
       try { for (const n of [1, 2]) refresh({}, n); }
       catch (e) { violations.push({ invariant: 'recovery-reachable', detail: `${damage}: ${e.message}` }); }
       if (broken || configured.length !== 2) violations.push({ invariant: 'pool-progress', detail: damage });
+      if (scrubbed.join(',') !== '/fixture/lane-1,/fixture/lane-2'
+        || configFailures.join(',') !== '/fixture/lane-1') {
+        violations.push({ invariant: 'config-failure-exercised', detail: damage });
+      }
     }
     return { violations };
   },

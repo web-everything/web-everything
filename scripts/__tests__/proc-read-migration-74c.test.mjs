@@ -9,6 +9,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { countDefaultSeamParams, findUnboundedExecReads } from '../lib/exec-output-guard.mjs';
+// Load the reaper's cyclic dispatch graph during collection, before timed tests can overlap its initialisation.
+import { laneBranchItemNum } from '../conveyor/lease-reaper.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const baseline = JSON.parse(readFileSync(join(root, 'scripts/exec-output-baseline.json'), 'utf8'));
@@ -74,10 +76,9 @@ describe('#74c migrated readers: oversize completes, failure is never empty', ()
     expect(originSlugOf(root)).toBeNull();
   });
 
-  it('lease-reaper laneBranchItemNum', async () => {
-    const { laneBranchItemNum } = await import('../conveyor/lease-reaper.mjs');
+  it('lease-reaper laneBranchItemNum', () => {
     fake({ out: 'lane/123-thing\n', pad: true });
-    expect(laneBranchItemNum(root)).toBe(laneBranchItemNum(root, { git: () => 'lane/123-thing' }));
+    expect(laneBranchItemNum(root)).toBe('123');
     fake({ fail: true });
     expect(laneBranchItemNum(root)).toBeNull();
   });

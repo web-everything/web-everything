@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { cardIdOf, decideBatchFiling, fileIntoBatch, main, NOT_BATCHED_EXIT } from '../card-batch-file.mjs';
+import { cardIdOf, decideBatchFiling, fileIntoBatch, launchSealJob, main, NOT_BATCHED_EXIT } from '../card-batch-file.mjs';
 import { AI_TRAILER } from '../card-batch-io.mjs';
 import { sealDueBatches } from '../card-batch-seal-io.mjs';
 import { effectiveCardBatchPolicy, resolvePreventionBatchSettings, resolveCardBatchSettings } from '../../lib/card-batch-settings.mjs';
@@ -185,4 +185,12 @@ describe('prevention batching is independent of filing', () => {
       expect(admit).not.toHaveBeenCalled();
     }
   });
+});
+
+it('launchSealJob starts the seal worker as the worker App role even from a read-only observer caller', () => {
+  const spawn = vi.fn(() => ({ on: vi.fn(), unref: vi.fn() }));
+  const prior = process.env.WE_GITHUB_APP_ROLE; process.env.WE_GITHUB_APP_ROLE = 'observer';
+  try { launchSealJob('/nonexistent/state.json', { spawn, open: () => { throw Error('no log'); } }); }
+  finally { if (prior === undefined) delete process.env.WE_GITHUB_APP_ROLE; else process.env.WE_GITHUB_APP_ROLE = prior; }
+  expect(spawn.mock.calls[0][2].env.WE_GITHUB_APP_ROLE).toBe('worker');
 });

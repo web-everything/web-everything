@@ -56,7 +56,7 @@ import { NEGOTIATION_ROUND_CAP } from '../../lib/jury-core.mjs';
 import { defaultReadPrs, defaultReadAgents, PR_LIST_JSON_FIELDS, PR_LIST_LIMIT, enrichPrsWithIgnoredRulings } from '../reconcile-pass.mjs';
 import { reviewSessionSlug } from '../review-session-slug.mjs';
 import { sessionSlugFor } from '../../operations/dispatch-lane.mjs';
-import { buildReviewedShaMarker } from '../../lib/review-escalation.mjs';
+import { buildClearedHumanMarker, headEverHumanCleared, parseLatestHumanClearedSha, buildReviewedShaMarker } from '../../lib/review-escalation.mjs';
 import { classifyPr } from '../../progress-board.mjs';
 import { reconcileHolds } from '../../operations/land-advance-items-io.mjs';
 import { readFileSync } from 'node:fs';
@@ -1001,6 +1001,100 @@ describe('case 5j — requiredChecks makes a NEW advisory check\'s red never rea
       agents: [], now: NOW, requiredChecks: REQUIRED_CHECKS,
     });
     expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', prNumber: 2748, phase: 'ci-red' })]);
+  });
+});
+
+describe('bounced PR CI repair — real required failures on the fixer head (#5729)', () => {
+  const HEAD = '5729'.repeat(10);
+  const requiredChecks = ['test', 'test-shard (2)', 'review-gate', 'merge-gate'];
+  const failed = name => ({ name, status: 'completed', conclusion: 'failure' });
+  const bounced = (over = {}) => pr1563({
+    number: 5729, headRefOid: HEAD,
+    statusCheckRollup: [failed('test-shard (2)'), failed('review-gate'), failed('merge-gate')],
+    ...over,
+  });
+  const planFor = pr => planReconcile({ prs: [pr], agents: [], requiredChecks, now: NOW });
+  const escalation = headSha => ({
+    body: buildCiHealEscalationComment({ headSha, outcome: 'needs-human', reason: 'requires human judgment' }),
+    author: AUTOMATION,
+  });
+
+  it.each(['test-shard (2)', 'test'])('dispatches ci-heal for bounced + required red %s with no escalation', name => {
+    const plan = planFor(bounced({ statusCheckRollup: [failed(name), failed('review-gate'), failed('merge-gate')] }));
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', phase: 'bounced', prNumber: 5729 })]);
+  });
+
+  it('bounced real-red ci-heal still honours the review-fix round cap', () => {
+    const plan = planReconcile({ prs: [bounced()], agents: [], requiredChecks, now: NOW, roundCap: 0 });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', prNumber: 5729 }));
+  });
+
+  it.each([false, true])('keeps an unused operator repair round ahead of bounced CI healing (joined=%s)', joinCiAndReview => {
+    const round = () => ({ author: AUTOMATION, body: REARM_COMMENT_MARKER });
+    const sendBack = { id: 'operator', author: { login: 'chalbert' }, createdAt: '2026-08-26T16:00:00Z',
+      body: '🔁 review — changes requested\n\nRecorded by chalbert via chat.\n\nRepair at head aaaaaaa.' };
+    const comments = [finding(), ...Array.from({ length: 8 }, round), sendBack, round(), round()];
+    const pr = bounced({ headRefOid: 'a'.repeat(40), comments, statusCheckRollup: [failed('gate')] });
+    const options = { prs: [pr], agents: [], requiredChecks: ['gate'], now: NOW, roundCap: 6,
+      fixTiming: { joinCiAndReview } };
+    const plan = planReconcile(options);
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', phase: 'bounced', findings: 2, attempts: 10,
+      operatorSendBackRound: { sendBackId: 'operator', used: 0, allowance: 1,
+        setting: 'fix.operatorRulingExtraRounds', source: 'standard' } })]);
+    expect(plan.refusals).not.toContainEqual(expect.objectContaining({ kind: 'cap-exhausted' }));
+
+    const invalidGrants = [
+      { comments: [...comments, { author: AUTOMATION, body: FIX_END_MARKER }] },
+      { comments: comments.map(c => c === sendBack ? { ...c, author: AUTOMATION } : c) },
+    ];
+    for (const over of invalidGrants) {
+      const denied = planReconcile({ ...options, prs: [{ ...pr, ...over }] });
+      expect(denied.dispatch).toEqual([]);
+      expect(denied.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted' }));
+    }
+    // At the list-reader page boundary, completeness must be proved before any cap decision.
+    const page = [...comments, ...Array.from({ length: 100 - comments.length },
+      (_, i) => finding(`Additional review finding ${i + 1}`))];
+    expect(page).toHaveLength(100);
+    const truncated = planReconcile({ ...options, prs: [{ ...pr, comments: page }] });
+    expect(truncated.dispatch).toEqual([]);
+    expect(truncated.refusals).toEqual([expect.objectContaining({ kind: 'thread-truncated', prNumber: 5729 })]);
+    const complete = planReconcile({ ...options, prs: [{ ...pr, comments: page, commentsComplete: true }] });
+    // Ten re-arm markers are bookkeeping; the other 90 comments are findings.
+    // Completing the page preserves the repair grant while carrying every added finding.
+    expect(complete.dispatch).toEqual(plan.dispatch.map(row => ({ ...row, findings: 90 })));
+    expect(complete.refusals).toEqual(plan.refusals);
+    const disabled = planReconcile({ ...options, operatorRulingExtraRounds: { value: 0, source: 'repo' } });
+    expect(disabled.dispatch).toEqual([]);
+    expect(disabled.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted' }));
+  });
+
+  it('refuses ci-heal-escalated for an escalation on THIS bounced head', () => {
+    const plan = planFor(bounced({ comments: [finding(), escalation(HEAD)] }));
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'ci-heal-escalated', headSha: HEAD }));
+  });
+
+  it('an escalation for an OLDER head does not suppress bounced real-red ci-heal', () => {
+    const plan = planFor(bounced({ comments: [finding(), escalation('abcd'.repeat(10))] }));
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', phase: 'bounced' })]);
+    expect(plan.refusals.map(row => row.kind)).not.toContain('ci-heal-escalated');
+  });
+
+  it('bounced with only review-gate/merge-gate red keeps its review-findings fix', () => {
+    const plan = planFor(bounced({ statusCheckRollup: [failed('review-gate'), failed('merge-gate')] }));
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', phase: 'bounced' })]);
+  });
+
+  it('bounced + conflict label keeps its conflict fix despite real red CI', () => {
+    const plan = planFor(bounced({ labels: lbl('review:changes', 'merge-status:conflicting') }));
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', phase: 'bounced', isConflict: true })]);
+  });
+
+  it('bounced with only a non-required real failure keeps its review-findings fix', () => {
+    const plan = planFor(bounced({ statusCheckRollup: [failed('optional-test'), failed('review-gate')] }));
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', phase: 'bounced' })]);
   });
 });
 
@@ -2079,6 +2173,60 @@ describe('case 5g — advisory-fix dispatch on a `needs-human` PR carrying `advi
   // xuxcsw6 — live 2026-10-04, #3771: both direct review branches (a fix postdates the advisory; the newest
   // advisory does not cover the head) bypassed the referral hold and re-dispatched a full review each tick.
   const referralHold = { head: 'a'.repeat(40), episode: 'e', count: 2, why: 'review paused: 2 referrals need a ruling; it resumes on a new push, a ruling, or a send-back' };
+  describe.each(['stale-advisory', 'addressed-advisory'])('%s human clearance', branch => {
+    const clearedHead = REAL_2766_HEAD;
+    const commentsFor = () => [
+      { author: AUTOMATION, body: `${buildReviewedShaMarker(clearedHead)}\n${buildClearedHumanMarker('chalbert')}` },
+      ...(branch === 'stale-advisory' ? live2766Comments() : [
+        advisoryNote, { author: AUTOMATION, body: buildAdvisoryFixComment({}) },
+      ]),
+    ];
+
+    it('refuses already-reviewed-head without dispatch on a trusted human-cleared head', () => {
+      const comments = commentsFor();
+      expect(isLatestAdvisoryFindingAddressed(comments)).toBe(branch === 'addressed-advisory');
+      if (branch === 'stale-advisory') {
+        expect(countCompletedAdvisoryEpisodes(comments)).toBe(ADVISORY_FIX_ROUND_CAP);
+      }
+      const plan = planReconcile({
+        prs: [prNeedsHuman({ comments, headRefOid: ` ${clearedHead.toUpperCase()} ` })], agents: [], now: NOW,
+      });
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals).toEqual([expect.objectContaining({
+        kind: 'already-reviewed-head', prNumber: 2601, phase: 'needs-human', headSha: clearedHead,
+        why: 'this exact head already carries a human clearance — no further advisory review is owed',
+      })]);
+    });
+
+    it('still dispatches review on a different, uncleared head with the same thread', () => {
+      const plan = planReconcile({
+        prs: [prNeedsHuman({ comments: commentsFor(), headRefOid: 'f'.repeat(40) })], agents: [], now: NOW,
+      });
+      expect(plan.refusals).toEqual([]);
+      expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review', prNumber: 2601 })]);
+    });
+
+    it('refuses a human-cleared head on the advisory path past the shared round cap', () => {
+      const rounds = Array.from({ length: NEGOTIATION_ROUND_CAP + 1 }, () => ({
+        author: AUTOMATION, body: REARM_COMMENT_MARKER,
+      }));
+      const history = commentsFor();
+      const comments = [...rounds, ...history];
+      const plan = thread => planReconcile({
+        prs: [prNeedsHuman({ comments: thread, headRefOid: clearedHead })], agents: [], now: NOW,
+      });
+      // Without the clearance, this branch really would dispatch beyond the shared cap.
+      expect(plan([...rounds, ...history.slice(1)]).dispatch)
+        .toEqual([expect.objectContaining({ kind: 'review', prNumber: 2601 })]);
+      const refused = plan(comments);
+      expect(refused.dispatch).toEqual([]);
+      expect(refused.refusals).toEqual([expect.objectContaining({
+        kind: 'already-reviewed-head', prNumber: 2601, headSha: clearedHead,
+        why: expect.stringContaining('human clearance'),
+      })]);
+    });
+  });
+
   it('xuxcsw6 — a held PR is refused review-referrals-pending on the stale-advisory branch, and not when the hold lifts', () => {
     const pr = prNeedsHuman({ comments: live2766Comments(), headRefOid: REAL_2766_HEAD });
     const held = planReconcile({ prs: [{ ...pr, referralHold }], agents: [], now: NOW });
@@ -4069,5 +4217,134 @@ describe('stale required-job base repair (2026-10-19 live PRs)', () => {
     const result = plan({ comments }, options);
     expect(result.dispatch).toEqual([]);
     expect(result.refusals).toMatchObject([{ kind: 'cap-exhausted', capKind: 'stale-base-rebase' }]);
+  });
+});
+
+describe('human clearance and complete evidence before review dispatch (live #5530)', () => {
+  const HEAD = '7596f3621'.padEnd(40, 'a');
+  const OLD = 'b'.repeat(40);
+  const accept = { author: AUTOMATION, createdAt: new Date(NOW - ACCEPT_LABEL_GRACE_MS - 60_000).toISOString(),
+    body: `✅ review — accepted\n\n${buildReviewedShaMarker(HEAD)}` };
+  const escalation = { author: AUTOMATION, createdAt: new Date(NOW - 30_000).toISOString(),
+    body: '<!-- drain-park-reason -->\n⏸ **Parked for review by the drain**\n\ntest-gaming suspected — tests removed' };
+  const prFor = branch => pr1563({ number: 5530, headRefOid: HEAD,
+    labels: lbl(branch === 'relabelOwed' ? 'review:pending' : 'review:human'),
+    comments: branch === 'convert-advisory' ? [accept, escalation] : [accept] });
+  const run = pr => planReconcile({ prs: [pr], agents: [], now: NOW });
+  const expected = branch => branch === 'convert-advisory'
+    ? { kind: 'convert-advisory' } : { kind: 'review', [branch]: true };
+
+  it('refuses a human-cleared head past the round cap before dispatching a mechanical review', () => {
+    const at = hour => new Date(NOW - (12 - hour) * HOUR).toISOString();
+    const rounds = Array.from({ length: NEGOTIATION_ROUND_CAP + 1 }, (_, i) => ({
+      author: AUTOMATION, body: REARM_COMMENT_MARKER, createdAt: at(i),
+    }));
+    const comments = [
+      ...rounds,
+      { author: AUTOMATION, createdAt: at(7), body: `✅ review — accepted\n\n${buildReviewedShaMarker(OLD)}` },
+      { author: AUTOMATION, createdAt: at(8), body: CONFLICT_FIX_COMMENT_MARKER },
+    ];
+    const pr = pr1563({ number: 5530, headRefOid: HEAD, labels: lbl('review:pending'), comments,
+      mechanicalRound: { head: HEAD, priorHead: OLD, proven: true, netDiffIdentical: false, changedFiles: ['src/a.mjs'] },
+    });
+    const plan = thread => planReconcile({ prs: [{ ...pr, comments: thread }], agents: [], now: NOW,
+      mechanicalRoundsCountTowardCap: false });
+    expect(plan(comments).dispatch).toEqual([expect.objectContaining({
+      kind: 'review', attempts: NEGOTIATION_ROUND_CAP + 1, cap: NEGOTIATION_ROUND_CAP,
+      mechanicalRound: expect.objectContaining({ ok: true, action: 'review' }),
+    })]);
+    const refused = plan([{ author: AUTOMATION,
+      body: `${buildReviewedShaMarker(HEAD)}\n${buildClearedHumanMarker('chalbert')}` }, ...comments]);
+    expect(refused.dispatch).toEqual([]);
+    expect(refused.refusals).toEqual([expect.objectContaining({
+      kind: 'already-reviewed-head', prNumber: 5530, headSha: HEAD,
+      why: expect.stringContaining('human clearance'),
+    })]);
+  });
+
+  describe.each(['advisoryOwed', 'convert-advisory'])('%s', branch => {
+    it('refuses an already-reviewed, human-cleared head without dispatching another advisory review', () => {
+      const pr = prFor(branch);
+      expect(run(pr).dispatch).toEqual([expect.objectContaining(expected(branch))]);
+      // A later plain accept must not erase the earlier human clearance of this head.
+      pr.comments.unshift({ author: AUTOMATION,
+        body: `${buildReviewedShaMarker(HEAD)}\n${buildClearedHumanMarker('chalbert')}` });
+      const plan = run(pr);
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals).toEqual([expect.objectContaining({
+        kind: 'already-reviewed-head', prNumber: 5530, headSha: HEAD, reviewedSha: HEAD,
+        why: expect.stringContaining('human clearance'),
+      })]);
+    });
+
+    it.each([
+      ['current-head latest', HEAD, AUTOMATION, true],
+      ['current-head followed by plain accept', HEAD, AUTOMATION, true],
+      ['older-head', OLD, AUTOMATION, false],
+      ['untrusted current-head', HEAD, { login: 'drive-by' }, false],
+    ])('honors %s clearance before considering advisory dispatch', (_name, sha, author, cleared) => {
+      const clearance = { author, body: `${buildReviewedShaMarker(sha)}\n${buildClearedHumanMarker('chalbert')}` };
+      expect(parseLatestHumanClearedSha([clearance])).toBe(author === AUTOMATION ? sha : null);
+      const pr = prFor(branch);
+      if (_name === 'current-head latest') pr.comments.push(clearance);
+      else pr.comments.unshift(clearance); // A later plain accept cannot erase clearance.
+      expect(headEverHumanCleared(pr.comments, HEAD)).toBe(cleared);
+      const plan = run(pr);
+      if (cleared) {
+        expect(plan.dispatch).toEqual([]);
+        expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'already-reviewed-head', prNumber: 5530 })]);
+      } else {
+        expect(plan.dispatch).toEqual([expect.objectContaining(expected(branch))]);
+      }
+    });
+  });
+
+  it('refuses clearance for HEAD followed by a plain accept of another sha', () => {
+    const pr = prFor('advisoryOwed');
+    pr.comments = [
+      { author: AUTOMATION, body: `${buildReviewedShaMarker(HEAD)}\n${buildClearedHumanMarker('chalbert')}` },
+      { ...accept, body: `✅ review — accepted\n\n${buildReviewedShaMarker(OLD)}` },
+    ];
+    const plan = run(pr);
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toEqual([expect.objectContaining({
+      kind: 'already-reviewed-head', headSha: HEAD, reviewedSha: OLD,
+      why: expect.stringContaining('human clearance'),
+    })]);
+  });
+
+  it('refuses a label-dropped cleared head without relabel dispatch', () => {
+    const pr = prFor('relabelOwed');
+    expect(run(pr).dispatch).toEqual([expect.objectContaining(expected('relabelOwed'))]);
+    pr.comments.unshift({ author: AUTOMATION,
+      body: `${buildReviewedShaMarker(HEAD)}\n${buildClearedHumanMarker('chalbert')}` });
+    const plan = run(pr);
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toEqual([expect.objectContaining({
+      kind: 'already-reviewed-head', headSha: HEAD, reviewedSha: HEAD,
+      why: expect.stringContaining('human clearance'),
+    })]);
+    expect(plan.refusals[0].relabelOwed).toBeUndefined();
+  });
+
+  it('still reviews a different head after human clearance of an older head', () => {
+    const pr = prFor('advisoryOwed');
+    pr.comments = [{ author: AUTOMATION,
+      body: `${buildReviewedShaMarker(OLD)}\n${buildClearedHumanMarker('chalbert')}` }];
+    const plan = run(pr);
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review', prNumber: 5530 })]);
+    expect(plan.refusals).toEqual([]);
+  });
+
+  it.each(['relabelOwed', 'advisoryOwed', 'convert-advisory'])('refuses %s on an unproved full comment page', branch => {
+    const pr = prFor(branch);
+    pr.comments.push(...Array.from({ length: 100 - pr.comments.length }, (_, i) => ({ body: `discussion ${i}` })));
+    // Control: this is the requested dispatch path when the reader proves completeness.
+    expect(run({ ...pr, commentsComplete: true }).dispatch).toEqual([expect.objectContaining(expected(branch))]);
+    for (const commentsComplete of [undefined, false]) {
+      const plan = run({ ...pr, commentsComplete });
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'thread-truncated', prNumber: 5530 })]);
+    }
   });
 });

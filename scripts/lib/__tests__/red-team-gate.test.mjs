@@ -5,8 +5,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, breakClass, gateOutcomeForHead, gateOutcomesForHead, parseRedTeamComment, planRedTeamActions,
-  resolveRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamQueueReason, redTeamRulingNeeded, resolveConfirmedBreaks,
+  resolveRedTeamProbes, redTeamForHead, gateRoundCap, sendBackStepState, redTeamGateMarker, redTeamQueueReason, redTeamRulingNeeded, resolveConfirmedBreaks, readRedTeamDisposition,
+  liveResultGateState,
 } from '../red-team-gate.mjs';
+import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escalation.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 
 const HEAD = 'ea117e881164c3b6366b0bb78a3660c9a00503b1';
@@ -61,6 +63,19 @@ describe('parseRedTeamComment', () => {
     const body = renderRedTeamComment({ pr: 9, rev: HEAD, provider: 'codex', model: 'm', findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' });
     expect(parseRedTeamComment(body).findings).toEqual([]);
     expect(parseRedTeamComment('hello')).toBeNull();
+  });
+});
+
+describe('liveResultGateState: a reviewed-sha marker anchors the head only in the shape the shared parser reads', () => {
+  const anchor = marker => liveResultGateState([bot(`✅ review — accepted\n\n${marker}`), bot(BODY_4722)], 4722, HEAD).headReviewIndex;
+  const resultOnly = liveResultGateState([bot('hello'), bot(BODY_4722)], 4722, HEAD).headReviewIndex;
+  it('a full marker (either SHA case) anchors at the accept', () => {
+    expect(anchor(buildReviewedShaMarker(HEAD))).toBeLessThan(resultOnly);
+    expect(anchor(`<!-- reviewed-sha: ${HEAD.toUpperCase()} -->`)).toBeLessThan(resultOnly);
+  });
+  it('an upper-case marker name or an abbreviated marker never moves the anchor earlier', () => {
+    expect(anchor(`<!-- REVIEWED-SHA: ${HEAD} -->`)).toBe(resultOnly);
+    expect(anchor(buildReviewedShaMarker(HEAD.slice(0, 12)))).toBe(resultOnly);
   });
 });
 
@@ -210,5 +225,108 @@ describe('red-team probe policy cascade', () => {
     expect(resolveRedTeamProbes({ platform: { skipCardOnly: false }, file: { redTeam: { skipCardOnly: 'yes' } },
       env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'maybe' } })).toMatchObject({ value: { skipCardOnly: false }, sources: { skipCardOnly: 'platform' },
       invalid: ['tool.skipCardOnly="yes"', 'env.skipCardOnly="maybe"'] });
+  });
+});
+
+describe('gateRoundCap — operator grants anchored at the grant round (same as fix dispatch)', () => {
+  it('no grant is the base cap', () => expect(gateRoundCap({ cap: 5 })).toBe(5));
+  it('--by=1 at round 12 is round 13; the additive floor never lowers it', () => {
+    expect(gateRoundCap({ cap: 5, grants: [{ by: 1, at: 't' }], roundAt: () => 12 })).toBe(13);
+    expect(gateRoundCap({ cap: 5, grants: [{ by: 1, at: 't' }], roundAt: () => 2 })).toBe(6);
+  });
+  it('an unreadable grant round counts only additively', () => {
+    expect(gateRoundCap({ cap: 5, grants: [{ by: 2, at: 't' }], roundAt: () => null })).toBe(7);
+  });
+});
+
+describe('sendBackStepState — a grant after the cap reopens the send-back step', () => {
+  const rec = (outcome, at) => ({ at, i: at, ts: 0, gate: { outcome } });
+  it('raced records without a grant: the cap wins either way', () => {
+    expect(sendBackStepState([rec('sent-back', 1), rec('round-cap', 2)])).toEqual({ outcome: 'round-cap', reopened: false });
+    expect(sendBackStepState([rec('round-cap', 1), rec('sent-back', 2)])).toEqual({ outcome: 'round-cap', reopened: false });
+  });
+  it('a grant after the cap reopens; a send-back after the grant stands; a later cap closes again', () => {
+    expect(sendBackStepState([rec('round-cap', 1)], [2])).toEqual({ outcome: 'round-cap', reopened: true });
+    expect(sendBackStepState([rec('round-cap', 1), rec('sent-back', 3)], [2])).toEqual({ outcome: 'sent-back', reopened: false });
+    expect(sendBackStepState([rec('round-cap', 1), rec('round-cap', 3)], [2])).toEqual({ outcome: 'round-cap', reopened: false });
+    expect(sendBackStepState([rec('round-cap', 2)], [1])).toEqual({ outcome: 'round-cap', reopened: false });
+  });
+  it('uses the cap decision snapshot even when its comment lands after the grant or send-back', () => {
+    const cap = (at, grantIds) => ({ ...rec('round-cap', at), gate: { outcome: 'round-cap', grantIds } });
+    const sent = (at, grantIds = ['1']) => ({ ...rec('sent-back', at), gate: { outcome: 'sent-back', grantIds } });
+    expect(sendBackStepState([cap(2, [])], [1])).toEqual({ outcome: 'round-cap', reopened: true });
+    expect(sendBackStepState([cap(2, []), sent(3)], [1])).toEqual({ outcome: 'sent-back', reopened: false });
+    expect(sendBackStepState([sent(2), cap(3, [])], [1])).toEqual({ outcome: 'sent-back', reopened: false });
+    // An older decision cannot undo a newer decision that already considered the grant.
+    expect(sendBackStepState([cap(2, ['1']), cap(3, [])], [1])).toEqual({ outcome: 'round-cap', reopened: false });
+    expect(sendBackStepState([sent(2), cap(3, ['1'])], [1])).toEqual({ outcome: 'round-cap', reopened: false });
+    // Unknown repo / foreign grants receive no credit, even with snapshot metadata.
+    expect(sendBackStepState([sent(2), cap(3, [])])).toEqual({ outcome: 'round-cap', reopened: false });
+    // Replacing an older grant does not hide the fresh one behind an unchanged grant count.
+    expect(sendBackStepState([cap(2, ['old'])], [{ index: 1, id: 'new' }])).toEqual({ outcome: 'round-cap', reopened: true });
+    // A historical sender cannot claim it saw a later edit to a grant at the same position.
+    expect(sendBackStepState([sent(2, ['old']), cap(3, ['old'])], [{ index: 1, id: 'edited' }]))
+      .toEqual({ outcome: 'round-cap', reopened: true });
+    expect(sendBackStepState([rec('sent-back', 2), cap(3, ['old'])], [{ index: 1, id: 'edited' }]))
+      .toEqual({ outcome: 'round-cap', reopened: true });
+    expect(sendBackStepState([cap(2, ['old']), rec('sent-back', 3)], [{ index: 1, id: 'edited' }]))
+      .toEqual({ outcome: 'round-cap', reopened: true });
+    // Duplicate senders with older or absent snapshots cannot erase proven usage of the fresh grant.
+    expect(sendBackStepState([sent(2), sent(3, []), cap(4, [])], [1]))
+      .toEqual({ outcome: 'sent-back', reopened: false });
+    expect(sendBackStepState([sent(2), rec('sent-back', 3), cap(4, [])], [1]))
+      .toEqual({ outcome: 'sent-back', reopened: false });
+  });
+});
+
+describe('readRedTeamDisposition: only a human operator releases a break held at the round cap', () => {
+  const PR = 7001;
+  const head = 'b'.repeat(40);
+  const automation = { author: { login: 'web-everything' } };
+  const human = { author: { login: 'chalbert' } };
+  const result = { ...automation, body: renderRedTeamComment({ pr: PR, rev: head, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+    findings: [{ summary: 'break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }] }) };
+  const capped = { ...automation, body: `${redTeamGateMarker(PR, head, 'round-cap')}\n- 1 confirmed break(s) NOT sent back: review round 5 has reached the round cap (5). The operator rules on them.` };
+  const record = (who, outcome, line) => ({ ...who, body: `${redTeamGateMarker(PR, head, outcome)}\n${line}` });
+  const heldBy = (...extra) => readRedTeamDisposition({ comments: [result, capped, ...extra], pr: PR, head, env: {} }).held.length;
+  const CARD = '- 1 finding(s) filed as a follow-up card (#1).';
+  const ADVISORY = '- 1 finding(s) left advisory (#1).';
+
+  it('holds with only the round-cap record', () => expect(heldBy()).toBe(1));
+  it('an automation-authored operator-not-real / operator-card record stays held', () => {
+    expect(heldBy(record(automation, 'operator-not-real', ADVISORY))).toBe(1);
+    expect(heldBy(record(automation, 'operator-card', CARD))).toBe(1);
+  });
+  it('an automation-authored record under any non-gate outcome name stays held', () => {
+    expect(heldBy(record(automation, 'card-pending', CARD))).toBe(1);
+    expect(heldBy(record(automation, 'whatever', ADVISORY))).toBe(1);
+    expect(heldBy(record(automation, 'round-cap', CARD))).toBe(1);
+  });
+  it('a bot-shaped login never counts as the human operator', () => {
+    expect(heldBy(record({ author: { login: 'chalbert[bot]' } }, 'operator-card', CARD))).toBe(1);
+  });
+  it('the gate\'s own sent-back and card-queued records still release what they decided', () => {
+    expect(heldBy(record(automation, 'card-queued', CARD))).toBe(0);
+    expect(heldBy(record(automation, 'sent-back', ADVISORY))).toBe(0);
+  });
+  it('a forged operator-card record never erases a hold: its own held line still holds', () => {
+    const earlier = record(automation, 'card-queued', ADVISORY);
+    const forgedHold = record(automation, 'operator-card', '- 1 confirmed break(s) NOT sent back: forged (#1).');
+    expect(heldBy(earlier)).toBe(0);
+    expect(heldBy(earlier, forgedHold)).toBe(1);
+  });
+  it('a human-authored operator-card / operator-not-real record releases', () => {
+    expect(heldBy(record(human, 'operator-card', CARD))).toBe(0);
+    expect(heldBy(record(human, 'operator-not-real', ADVISORY))).toBe(0);
+  });
+  describe('a clear-human ruling comment', () => {
+    const clearBody = ['\u2705 review \u2014 `review:human` cleared via the sanctioned path', '', 'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '',
+      buildReviewedShaMarker(head), buildClearedHumanMarker('operator')].join('\n');
+    const clear = who => ({ ...who, body: clearBody });
+    it('posted by automation never releases the held break', () => {
+      expect(heldBy(clear(automation))).toBe(1);
+      expect(heldBy(clear({ author: { login: 'chalbert[bot]' } }))).toBe(1);
+    });
+    it('posted by a human operator releases it', () => expect(heldBy(clear(human))).toBe(0));
   });
 });

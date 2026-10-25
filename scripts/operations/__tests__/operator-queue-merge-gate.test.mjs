@@ -4,7 +4,8 @@ import { formatPrResult, parsePrResultTable } from '../../lib/merge-gate-verdict
 import { GATE_IDS } from '../../lib/merge-gate-inventory.mjs';
 
 const HEAD = '7d20124ecb8bb052bf1d1dabb8215a54ba6262df';
-// Real job 114754411476, lines 517–542: preserve timestamps and spacing for the replay.
+// Real job 114754411476, lines 517–542, extended with the current enqueue-owned
+// card-group row. Preserve timestamps and spacing for the replay.
 const LOG = `2026-10-12T09:49:30.3867808Z merge-gate: workflow self-check — ok: running workflow .github/workflows/merge-gate.yml matches main
 2026-10-12T09:49:30.3934091Z merge-gate mode: enforce (source: env)
 2026-10-12T09:49:30.3934630Z #4965: HOLD
@@ -28,6 +29,7 @@ const LOG = `2026-10-12T09:49:30.3867808Z merge-gate: workflow self-check — ok
 2026-10-12T09:49:30.3957486Z   pass              couple-whole           no manifest couple / blockedBy
 2026-10-12T09:49:30.3958028Z   pass              blocked-by             no manifest couple / blockedBy
 2026-10-12T09:49:30.3958514Z   enqueue           overlap-yield          enqueue-owned
+2026-10-12T09:49:30.3958750Z   enqueue           card-group             enqueue-owned
 2026-10-12T09:49:30.3958959Z   enqueue           pass-cap               enqueue-owned
 2026-10-12T09:49:30.3959386Z   hold              ledger                 labels: labels hold
 2026-10-12T09:49:30.3959878Z merge-gate: HOLD — held`;
@@ -57,6 +59,11 @@ describe('PR #4965: enforced merge-gate must not hide the human queue', () => {
     const result = evaluatePr(pr(), { mergeGateVerdict: verdict(LOG.replace('pass              red-main-freeze', 'hold              red-main-freeze')) });
     expect(result.ready).toBe(false);
     expect(result.reasons.join('; ')).toContain('red-main-freeze(hold)');
+  });
+  it('a card-group hold still blocks human clearance', () => {
+    const result = evaluatePr(pr(), { mergeGateVerdict: verdict(LOG.replace('enqueue           card-group', 'hold              card-group')) });
+    expect(result.ready).toBe(false);
+    expect(result.reasons.join('; ')).toContain('card-group(hold)');
   });
   it('rejects a different head and accepts case-insensitive head equality', () => {
     expect(evaluatePr(pr(), { mergeGateVerdict: { ...verdict(), headSha: 'f'.repeat(40) } })).toMatchObject({

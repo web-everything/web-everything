@@ -10,24 +10,30 @@ tags: []
 
 # Drain skip-reasons log: give every skip a named bucket, retire the 'other' bucket
 
-Coroner 2026-10-07 F7: plateau-app #212 sat 86 passes as 'other' (no bucket recorded) because its couple partner WE #4288 was checks-pending. Name partner-pending, ready-not-reached, not-certified, off-base, codeql-failed, empty-body, stale-read, escalated, unrecognized-reason. Logging only, no merge-decision change.
+Original incident: plateau-app #212 spent 86 drain passes in an unnamed bucket while WE #4288 was checks-pending. The requested named buckets and partner explanation now exist in this checkout; this card needs disposition rather than duplicate implementation.
 
 ## Done when
 
-1. **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] `q=we:scripts/readiness/heavy-admission.mjs; t=we:scripts/lib/__tests__/drain-skip-reasons.test.mjs; node "${q#we:}" run -- npx vitest run "${t#we:}"` — existing cases assert partner-pending for that incident, ready-not-reached for unvisited ready PRs, and unrecognized-reason instead of other. This is a shipped-behavior check, not a new red/green change; no missing implementation is established.
 
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+## Non-goals
 
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+- [N1] No merge-policy change, log backfill, new endpoint or guard relaxation; body-size/rate/CSRF checks are inapplicable to a pure log classifier.
 
 ## Edge cases this change must handle
 
-One line per class: either the handling, or `n/a: <why>`.
+1. **Untrusted text** — Keep raw reason text as JSON-escaped data; never execute it.
+2. **Truncated reads** — Missing/unknown reasons map to unrecognized-reason, not an invented diagnosis.
+3. **Shared state files** — n/a: classifier is pure; existing drain owns log emission.
+4. **Fail closed** — n/a: classifications grant no merge permission.
+5. **Identity scoping** — Rows retain repo and PR; couple explanations identify the partner.
+6. **State over time** — Classify each pass independently; do not rewrite historical log rows.
+7. **Who wrote it** — source records the drain bucket; reasons are observations, not operator rulings.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+## Grounding
+
+`we:scripts/lib/drain-skip-reasons.mjs:13` lists all requested buckets; `we:scripts/lib/drain-skip-reasons.mjs:81` identifies the partner. `we:scripts/lib/__tests__/drain-skip-reasons.test.mjs:35` reproduces the exact incident; line 43 rejects other.
+
+## Open questions
+
+STALE: should this card be closed as already implemented? Matching code and regression assertions exist. The queued regression attempt was deferred by host load (exit 75); no passing run is claimed.
