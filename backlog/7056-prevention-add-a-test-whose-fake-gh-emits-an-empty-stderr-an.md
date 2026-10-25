@@ -1,20 +1,22 @@
 ---
+bornAs: x5y0xio
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/red-team-status-labels.mjs", "we:scripts/lib/__tests__/red-team-status-labels.test.mjs"]
+scope: ["we:scripts/operations/review-extra-seats.mjs", "we:scripts/operations/__tests__/review-extra-seats.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Add a test that starts with red-team:blocked and red-team:pending labels, a changed head, and no… (from web-everything/web-everything#5877 review)
+# Prevention — Add a test whose fake gh emits an empty stderr and fails with a populated error (for example, by… (from web-everything/web-everything#5906 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/red-team-status-labels.mjs:22` — Add a test that starts with `red-team:blocked` and `red-team:pending` labels, a changed head, and no result. Have it assert the intended outcome, either removal when nothing is owed or an explicit decision to keep. A cheaper guard is to record the head each hold label was applied to, so the planner can tell a stale label from missing evidence.
+1. `we:scripts/operations/review-extra-seats.mjs:1772` — Add a test whose fake gh emits an empty stderr and fails with a populated error (for example, by exceeding a deliberately small maxBuffer), and assert the error message appears in the thrown text. A lint rule against `??` on stderr or stdout string fallbacks would catch the whole class.
+2. `we:scripts/operations/review-extra-seats.mjs:1773` — Add a gh-helper test that injects a fake gh which writes nothing to stderr and exceeds a small maxBuffer or times out. It should assert that the thrown message contains the spawn error code. A pre-merge mutation check that each changed operator flips at least one test would catch this class.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5877@6cdc99ffea30448eb693e0c8b25f944ecb782348
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5906@d4815a60360853acca8d2e761996cdadb24dd0a5
 
 ## Acceptance
 
