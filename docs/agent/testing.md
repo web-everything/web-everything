@@ -203,6 +203,11 @@ handoffs carrying an ordinary finished/null prior both refuse before provider se
 Regression prevention in `review-job-red-team-skip.test.mjs`:
 **fresh guard refuses a finished null prior without queued provenance (admitted=%s)** and
 **fresh admission preserves unknown null completion but recovers a dead queued writer (prior=%s)**.
+The back-port from `8173660fcf` also pins the guard in `review-red-team-resume-only.test.mjs`:
+**refuses a finished null result without queued provenance and with no seat or comment (admitted=%s)**.
+Its production admission regression in `review-job-red-team-only.test.mjs` is
+**fresh recovery preserves unknown finished-null history through production admission and launches no call**;
+it verifies that refusal restores the original finished/null status and publishes no comment.
 These exercise the shared execution guard and production admission, alongside the planner's
 **f: a null completion without queued provenance skips (stored status %s)** in
 `review-red-team-on-skip.test.mjs`. Live or unknown liveness
