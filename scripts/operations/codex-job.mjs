@@ -5,14 +5,16 @@
  * All process and filesystem effects are injectable; main accepts an optional stdout sink.
  * Deletions and renames are not supported: missing audit entries stop with audit-failed.
  * Use the normal reviewed lane workflow for jobs that remove or move tracked files.
+ * HTTPS authentication is opt-in: --credential-helper=/absolute/executable uses
+ * Git's credential-helper protocol with useHttpPath=true. Ambient helpers are ignored.
  */
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { lstatSync, readlinkSync, readFileSync, writeFileSync, mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { lstatSync, realpathSync, readlinkSync, readFileSync, writeFileSync, mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { laneGitHardeningEnv, hardenLaneGitArgs, LANE_CONFIG_LIST_ARGS, riskyLaneConfig as sharedRiskyLaneConfig } from '../lib/lane-git-hardening.mjs';
+import { laneGitHardeningEnv, laneGitConfigArgs, hardenLaneGitArgs } from '../lib/lane-git-hardening.mjs';
 
 export const EXIT_CODES = Object.freeze({
   'bad-args': 2, 'scope-occupied': 10, 'scope-unknown': 11,
@@ -30,6 +32,7 @@ const defaults = {
   mkdir: (dir, options) => mkdirSync(dir, options),
   rm: (file, options) => rmSync(file, options),
   lstat: file => lstatSync(file),
+  realpath: file => realpathSync(file),
   readlink: file => readlinkSync(file, { encoding: 'buffer' }),
   writeFile: (file, data, options = { mode: 0o600 }) => writeFileSync(file, data, options),
   now: Date.now,
@@ -43,7 +46,7 @@ const lines = s => String(s ?? '').split('\n').filter(Boolean);
 export function parseArgs(argv) {
   const opts = { base: 'origin/main', waitMs: 7200000, dryRun: false };
   const keys = { brief: 'brief', purpose: 'purpose', scope: 'scope', tests: 'tests', base: 'base',
-    'edge-clone': 'edgeClone', 'wait-ms': 'waitMs', repo: 'repo' };
+    'edge-clone': 'edgeClone', 'wait-ms': 'waitMs', repo: 'repo', 'credential-helper': 'credentialHelper' };
   const seen = new Set();
   for (const arg of argv) {
     if (arg === '--dry-run' && !seen.has('dry-run')) { opts.dryRun = true; seen.add('dry-run'); continue; }
@@ -58,6 +61,7 @@ export function parseArgs(argv) {
   opts.scope = opts.scope.split(','); opts.tests = opts.tests.split(',');
   const relative = p => p && !p.startsWith('-') && !path.isAbsolute(p) && !p.includes('\\') && !p.split('/').some(v => v === '..' || v === '.') && !/[\x00-\x20\x7f]/.test(p);
   if (opts.scope.some(s => !relative(s.includes(':') ? s.slice(s.indexOf(':') + 1) : s) || (s.includes(':') && !/^[a-z0-9-]+:[^:]+$/.test(s))) || opts.tests.some(t => !relative(t))) fail('bad-args', 'Invalid scope or tests');
+  if (opts.credentialHelper && !path.isAbsolute(opts.credentialHelper)) fail('bad-args', 'credential-helper must be an absolute executable path');
   return opts;
 }
 
@@ -85,51 +89,49 @@ export function pathsWithinScope(files, scopeEntries) {
   }));
 }
 const GIT_TIMEOUT_MS = 120000;
-const GIT_FILE_PINS = ['-c', 'diff.orderFile=', '-c', 'core.fsmonitor=false'];
-const exec = async (s, cmd, args, lane = false, session = false, options = {}) => {
-  // Preserve -C first for callers that relocate a checkout, then pin before the verb.
-  const prefix = args[0] === '-C' ? 2 : 0;
-  const r = await s.io.exec(cmd, cmd === 'git'
-    ? [...args.slice(0, prefix), ...GIT_FILE_PINS, ...args.slice(prefix)] : args, {
+const withoutGitOverrides = () => Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+const exec = async (s, cmd, args, lane = false, session = false, options = {}) =>
+  s.io.exec(cmd, args, {
     cwd: lane ? s.lane.path : s.opts.repo,
-    env: laneGitHardeningEnv({ ...process.env, ...(lane ? { GIT_NO_REPLACE_OBJECTS: '1' } : {}), ...(session ? { LANE_SESSION: s.lane.holder } : {}) }),
-    ...(cmd === 'git' ? { timeout: GIT_TIMEOUT_MS, killSignal: 'SIGKILL' } : {}),
+    env: laneGitHardeningEnv({ ...withoutGitOverrides(), ...(session ? { LANE_SESSION: s.lane.holder } : {}) }),
     ...options,
   });
-  if (cmd === 'git' && r.error?.code === 'ETIMEDOUT') {
-    fail('timeout', 'Git timed out; inspect lane configuration and remote availability before retrying');
-  }
-  return r;
-};
-// Keep this runner's stricter file-read policy local: even a non-executable path
-// can name a FIFO/device. Command pins do not make worker-owned file settings safe.
-function riskyLaneConfig(listOutput) {
-  const found = sharedRiskyLaneConfig(listOutput);
-  const parts = listOutput.split('\0');
-  for (let i = 0; i + 1 < parts.length; i += 2) {
-    const key = parts[i + 1].split('\n')[0];
-    // Lane setup installs .githooks; all lane Git calls pin this to /dev/null.
-    if (key.toLowerCase() === 'core.hookspath') continue;
-    if (['local', 'worktree', 'unknown'].includes(parts[i]) &&
-        /^(diff\.(orderfile|relative|external|.*\.(command|textconv))|core\.(.*(?:file|path)|worktree|fsmonitor|sshcommand|alternaterefscommand|pager))$/i.test(key)) found.push(key);
-  }
-  return found;
-}
-const git = async (s, args, session = false) => {
-  // Re-read after every worker/test/audit boundary. Reading config executes no helpers.
-  const config = await exec(s, 'git', ['-C', s.lane.path, '--no-replace-objects', ...LANE_CONFIG_LIST_ARGS], true);
-  if (!good(config) || typeof config.stdout !== 'string' ||
-      (config.stdout && !config.stdout.endsWith('\0')) || riskyLaneConfig(config.stdout).length) {
-    fail('unsafe-git-config', 'Cannot trust lane Git configuration; inspect its local/worktree configuration before retrying');
-  }
+
+// Every host-side Git operation uses this boundary. The only repository Git may
+// open is our private clone; workTree selects bytes, never lane metadata.
+export async function trustedGit(args, { s, workTree, bootstrap = false } = {}) {
+  if (!s.trustedDir) fail('internal-error', 'Missing trusted Git directory');
+  const env = withoutGitOverrides();
+  Object.assign(env, {
+    GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0',
+    GIT_NO_REPLACE_OBJECTS: '1', GIT_NO_LAZY_FETCH: '1',
+    GIT_AUTHOR_NAME: 'Codex Job', GIT_AUTHOR_EMAIL: 'codex-job@users.noreply.github.com',
+    GIT_COMMITTER_NAME: 'Codex Job', GIT_COMMITTER_EMAIL: 'codex-job@users.noreply.github.com',
+    GIT_ASKPASS: '/usr/bin/false',
+  });
+  // One opt-in authentication route: an operator-selected executable, frozen
+  // before the worker starts. Git's helper protocol receives the repository path.
+  const helper = s.credentialHelper ? '!' + "'" + s.credentialHelper.replaceAll("'", "'\\''") + "'" : '';
+  const pins = [...laneGitConfigArgs(), '-c', 'push.followTags=false', '-c', 'diff.orderFile=',
+    '-c', 'core.pager=cat', '-c', 'core.excludesFile=/dev/null', '-c', 'core.fileMode=true',
+    '-c', 'credential.helper=', ...(helper ? ['-c', `credential.helper=${helper}`] : []),
+    '-c', 'credential.useHttpPath=true', '-c', 'core.askPass=/usr/bin/false',
+    '-c', 'user.name=Codex Job', '-c', 'user.email=codex-job@users.noreply.github.com'];
   const hardened = hardenLaneGitArgs(args);
-  // Apple Git still tries to open an empty diff.orderFile. -O explicitly cancels
-  // ordering on every diff while retaining the config pin on all Git commands.
   if (args[0] === 'diff') hardened.splice(1, 0, '-O/dev/null');
-  const missing = hardened.slice(1).filter(a => !args.includes(a));
+  const extra = hardened.slice(1).filter(arg => !args.includes(arg));
   const end = args.includes('--') ? args.indexOf('--') : args.length;
-  return exec(s, 'git', ['-C', s.lane.path, '--no-replace-objects', ...args.slice(0, end), ...missing, ...args.slice(end)], true, session);
-};
+  const command = [...args.slice(0, end), ...extra, ...args.slice(end)];
+  const r = await s.io.exec('git', ['-C', s.trustedDir, '--no-replace-objects',
+    ...(bootstrap ? [] : [`--git-dir=${path.join(s.trustedDir, '.git')}`,
+      `--work-tree=${workTree ?? s.trustedDir}`]), ...pins, ...command], {
+    cwd: s.trustedDir, env, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
+    timeout: GIT_TIMEOUT_MS, killSignal: 'SIGKILL',
+  });
+  if (r.error?.code === 'ETIMEDOUT') fail('timeout', 'Git timed out; inspect remote availability before retrying');
+  return r;
+}
+const git = (s, args) => trustedGit(args, { s, workTree: s.lane.path });
 const scopeArgs = s => [`--agent=${s.claimId}`, `--owner=${s.claimId}`];
 
 export async function checkFreeScope(s) {
@@ -146,71 +148,50 @@ export async function checkFreeScope(s) {
   }
 }
 export async function acquireLane(s) {
-  const r = await exec(s, 'node', ['scripts/lane-pool.mjs', 'acquire', `--purpose=${s.opts.purpose}`, '--adopt', `--base=${s.opts.base}`, '--json']);
+  const r = await exec(s, 'node', ['scripts/lane-pool.mjs', 'acquire', `--purpose=${s.opts.purpose}`, '--adopt', `--base=${s.startSha}`, '--json']);
   try { s.lane = parseReport(r.stdout ?? ''); } catch { fail('lane-acquire-failed'); }
   if (!good(r) || !Number.isInteger(s.lane.lane) || !s.lane.path || !s.lane.holder) fail('lane-acquire-failed');
   s.result.lane = s.lane.lane;
-}
-const SYSTEM_GIT_CONFIG_FILES = new Set([
-  '/etc/gitconfig',
-  '/Library/Developer/CommandLineTools/usr/share/git-core/gitconfig',
-  '/Applications/Xcode.app/Contents/Developer/usr/share/git-core/gitconfig',
-]);
-async function captureCredentialHelpers(s) {
-  // Read operator config before the worker runs. Only credential helpers and
-  // their useHttpPath policy from known system files (including Apple's unknown
-  // scope), global and command scope cross into publication; lane config never does.
-  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_') ||
-    /^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+|PARAMETERS|GLOBAL|SYSTEM|NOSYSTEM)$/.test(key)));
-  const r = await exec(s, 'git', ['-C', s.opts.repo, 'config', '--show-scope', '--show-origin', '--includes', '-z',
-    '--get-regexp', '^credential(\\..*)?\\.(helper|usehttppath)$'], false, false,
-    { env, timeout: 30000, maxBuffer: 1024 * 1024 });
-  if (r.status === 1 && r.stdout === '') return [];
-  const parts = typeof r.stdout === 'string' ? r.stdout.split('\0') : [];
-  if (!good(r) || parts.pop() !== '' || parts.length % 3) {
-    fail('unsafe-git-config', 'Cannot read trusted credential helpers; inspect operator Git configuration before retrying');
-  }
-  const helpers = [];
-  for (let i = 0; i < parts.length; i += 3) {
-    const [scope, origin, entry] = parts.slice(i, i + 3);
-    const split = entry.indexOf('\n');
-    if (split < 0 || !origin || !['unknown', 'system', 'global', 'local', 'worktree', 'command'].includes(scope)) {
-      fail('unsafe-git-config', 'Cannot parse trusted credential helpers; inspect operator Git configuration before retrying');
-    }
-    const key = entry.slice(0, split), value = entry.slice(split + 1);
-    if (/^credential(?:\..*)?\.(?:helper|usehttppath)$/i.test(key)) {
-      const systemFile = origin.startsWith('file:') && SYSTEM_GIT_CONFIG_FILES.has(origin.slice(5));
-      const file = origin.startsWith('file:') ? path.resolve(s.opts.repo, origin.slice(5)) : null;
-      const laneRelative = file ? path.relative(s.lane.path, file) : null;
-      if (file && (file.split(path.sep).some(part => part.toLowerCase() === '.git') ||
-          laneRelative === '' || (laneRelative !== '..' && !laneRelative.startsWith(`..${path.sep}`) && !path.isAbsolute(laneRelative)))) {
-        fail('unsafe-git-config', 'Lane-owned credential helper origin; inspect operator Git configuration before retrying');
-      }
-      if (!(['unknown', 'system'].includes(scope) && systemFile) &&
-          !(scope === 'global' && origin.startsWith('file:')) &&
-          !(scope === 'command' && origin === 'command line:')) {
-        fail('unsafe-git-config', 'Untrusted credential helper origin; inspect operator Git configuration before retrying');
-      }
-      helpers.push(`${key}=${value}`);
+  if (s.credentialHelper) {
+    const relative = path.relative(await s.io.realpath(s.lane.path), s.credentialHelper);
+    if (!relative || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative))) {
+      fail('bad-args', 'credential-helper must be outside the worker lane');
     }
   }
-  return helpers;
 }
-export async function resetLane(s) {
-  s.credentialHelpers = await captureCredentialHelpers(s);
-  // Capture the publication destination from the primary checkout before any worker runs.
-  const origin = await exec(s, 'git', ['-C', s.opts.repo, 'remote', 'get-url', 'origin']);
+// Bootstrap from the primary repository's literal origin value. Includes and
+// URL rewrites are deliberately not evaluated, and no Git command opens it.
+export async function prepareTrustedRepo(s) {
+  s.trustedDir = await s.io.mkdtemp(path.join(tmpdir(), 'codex-job-publish-'));
+  s.credentialHelper = s.opts.credentialHelper;
+  if (s.credentialHelper && !path.isAbsolute(s.credentialHelper)) fail('bad-args', 'credential-helper must be absolute');
+  if (s.credentialHelper) {
+    try {
+      s.credentialHelper = await s.io.realpath(s.credentialHelper);
+      const stat = await s.io.lstat(s.credentialHelper);
+      if (!stat.isFile() || !(stat.mode & 0o111)) throw new Error('Not executable');
+    } catch { fail('bad-args', 'credential-helper must name a readable executable'); }
+  }
+  const origin = await trustedGit(['config', '--file', path.join(s.opts.repo, '.git/config'),
+    '--no-includes', '--get', 'remote.origin.url'], { s, bootstrap: true });
   if (!good(origin) || typeof origin.stdout !== 'string' || !origin.stdout.trim()) fail('push-failed', 'Cannot read trusted origin URL');
   s.originUrl = origin.stdout.trim();
-  const remoteBase = s.opts.base.startsWith('origin/') ? s.opts.base : `origin/${s.opts.base}`;
-  let base = await git(s, ['rev-parse', '--verify', `${remoteBase}^{commit}`]);
-  if (!good(base) && remoteBase !== s.opts.base) base = await git(s, ['rev-parse', '--verify', `${s.opts.base}^{commit}`]);
-  if (!good(base) || typeof base.stdout !== 'string' || !base.stdout.trim()) fail('lane-reset-failed');
-  s.baseSha = base.stdout.trim();
-  if (!good(await git(s, ['reset', '--hard', s.baseSha], true))) fail('lane-reset-failed');
-  const head = await git(s, ['rev-parse', 'HEAD']);
-  if (!good(head) || !head.stdout?.trim() || head.stdout.trim() !== s.baseSha) fail('lane-reset-failed');
-  s.startSha = head.stdout.trim();
+  if (!good(await trustedGit(['clone', '--no-local', '--no-checkout', '--template=', '--',
+    s.originUrl, s.trustedDir], { s, bootstrap: true }))) fail('commit-failed', 'Cannot create trusted publication clone');
+  // Resolve once, from the fetched remote, never from a stale lane branch.
+  const base = s.opts.base;
+  const ref = /^(?:[a-f0-9]{7,40}|[a-f0-9]{64})$/i.test(base)
+    ? base : `refs/remotes/origin/${base.replace(/^origin\//, '')}`;
+  const resolved = await trustedGit(['rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`], { s });
+  if (!good(resolved) || typeof resolved.stdout !== 'string' ||
+      !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(resolved.stdout.trim())) fail('lane-reset-failed', 'Cannot resolve base from trusted remote');
+  s.baseSha = s.startSha = resolved.stdout.trim();
+  if (!good(await trustedGit(['checkout', '--detach', s.startSha], { s }))) fail('lane-reset-failed');
+}
+export async function resetLane(s) {
+  // Acquisition uses the pinned SHA too. Reset only through our private index;
+  // the lane's config, refs and index are never inputs to trusted Git.
+  if (!good(await git(s, ['reset', '--hard', s.startSha]))) fail('lane-reset-failed');
 }
 const codexArgs = (s, file, review = false) => ['scripts/codex-direct-task.mjs', ...(review ? ['--review'] : []), `--task-file=${file}`, `--dir=${s.lane.path}`, '--gate=none', '--no-stream', '--json'];
 async function codex(s, file, review = false) {
@@ -263,7 +244,7 @@ async function worktreeFingerprint(s, untracked, reason) {
   }
   let hashes = '';
   if (regular.length) {
-    const r = await git(s, ['hash-object', '--no-filters', '--', ...regular]);
+    const r = await git(s, ['hash-object', '--no-filters', '--', ...regular.map(file => path.join(s.lane.path, file))]);
     if (!good(r) || typeof r.stdout !== 'string' || !r.stdout.endsWith('\n') ||
         r.stdout.trimEnd().split('\n').length !== regular.length ||
         r.stdout.trimEnd().split('\n').some(hash => !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(hash))) {
@@ -391,69 +372,50 @@ export async function commitAndPush(s) {
     exportEntry(file, bytes, mode))) !== s.auditExportFingerprint) {
     fail('changed-after-audit', 'Exported bytes or modes differ from the audit input; rerun tests and audit before retrying');
   }
-  // Drop inherited Git overrides and config, then restore only the operator's
-  // frozen credential helpers and useHttpPath policy. Lane config stays out.
-  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
-  Object.assign(env, { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_NO_REPLACE_OBJECTS: '1',
-    GIT_AUTHOR_NAME: 'Codex Job', GIT_AUTHOR_EMAIL: 'codex-job@users.noreply.github.com',
-    GIT_COMMITTER_NAME: 'Codex Job', GIT_COMMITTER_EMAIL: 'codex-job@users.noreply.github.com' });
-  const dir = await s.io.mkdtemp(path.join(tmpdir(), 'codex-job-publish-'));
-  // Stage and query the same literal paths, including names containing * ? or [].
-  const trustedGit = args => exec(s, 'git', ['-C', dir, '--literal-pathspecs', '-c', 'core.hooksPath=/dev/null',
-    ...(s.credentialHelpers ?? []).flatMap(setting => ['-c', setting]),
-    '-c', 'user.name=Codex Job', '-c', 'user.email=codex-job@users.noreply.github.com', ...args],
-    false, false, { cwd: dir, env, maxBuffer: 64 * 1024 * 1024 });
-  try {
-    if (!good(await trustedGit(['clone', '--no-local', '--no-checkout', '--template=', '--', s.originUrl, dir]))) fail('commit-failed', 'Cannot create trusted publication clone');
-    const baseRef = `refs/remotes/origin/${s.opts.base.replace(/^origin\//, '')}`;
-    const base = await trustedGit(['rev-parse', '--verify', `${baseRef}^{commit}`]);
-    if (!good(base) || typeof base.stdout !== 'string' || !base.stdout.trim()) fail('lane-reset-failed', 'Cannot resolve base from trusted remote; inspect the remote branch before retrying');
-    // A busy remote may advance while tests/audit run. Trust only a start commit
-    // still reachable from that remote, and publish on exactly the audited tree.
-    if (!s.startSha || !good(await trustedGit(['merge-base', '--is-ancestor', s.startSha, base.stdout.trim()]))) {
-      fail('changed-after-audit', 'Audited starting commit is absent from trusted remote history; restart the job against the new base');
+  const dir = s.trustedDir;
+  const publishGit = args => trustedGit(['--literal-pathspecs', ...args], { s });
+  // Rebuild the publication worktree from the same pinned base after using the
+  // private index to inspect lane bytes. No remote base is resolved a second time.
+  if (!good(await publishGit(['reset', '--hard', s.startSha]))) fail('commit-failed');
+  for (const { file, bytes, mode } of exported) {
+    const parts = file.split('/');
+    for (let n = 1; n < parts.length; n++) {
+      try {
+        const stat = await s.io.lstat(path.join(dir, ...parts.slice(0, n)));
+        if (stat.isSymbolicLink()) fail('diff-out-of-scope', 'Publication path traverses a symlink; inspect the remote base before retrying');
+      } catch (error) { if (error.code !== 'ENOENT') throw error; }
     }
-    if (!good(await trustedGit(['checkout', '--detach', s.startSha]))) fail('commit-failed');
-    for (const { file, bytes, mode } of exported) {
-      const parts = file.split('/');
-      for (let n = 1; n < parts.length; n++) {
-        try {
-          const stat = await s.io.lstat(path.join(dir, ...parts.slice(0, n)));
-          if (stat.isSymbolicLink()) fail('diff-out-of-scope', 'Publication path traverses a symlink; inspect the remote base before retrying');
-        } catch (error) { if (error.code !== 'ENOENT') throw error; }
-      }
-      const target = path.join(dir, file);
-      await s.io.mkdir(path.dirname(target), { recursive: true });
-      // Replace any base symlink rather than following it, and preserve Git's execute bit.
-      await s.io.rm(target, { force: true });
-      await s.io.writeFile(target, bytes, { mode });
-    }
-    // Only the frozen bytes and modes verified above are staged here.
-    if (!good(await trustedGit(['add', '--', ...s.files]))) fail('commit-failed');
-    // In-tree .gitattributes can make add rewrite bytes (eol, ident, encoding). Require the
-    // staged blobs and modes to equal the frozen export exactly, else refuse to commit.
-    const staged = await trustedGit(['ls-files', '--stage', '-z', '--', ...s.files]);
-    const want = exported.map(({ file, bytes, mode }) => `${mode === 0o755 ? '100755' : '100644'} ${
-      createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex')} 0\t${file}`).sort();
-    if (!good(staged) || typeof staged.stdout !== 'string' || JSON.stringify(staged.stdout.split('\0').filter(Boolean).sort()) !== JSON.stringify(want)) {
-      fail('changed-after-audit', 'Staged blobs differ from the exported bytes (attribute filters?); inspect the lane files before retrying');
-    }
-    const title = (s.brief.split('\n')[0] ?? '').replace(/^\s*#+\s*/, '').replace(/^Task:\s*/i, '').trim().slice(0, 72);
-    if (!good(await trustedGit(['commit', '-m', title]))) fail('commit-failed');
-    const sha = await trustedGit(['rev-parse', 'HEAD']);
-    if (!good(sha) || !sha.stdout?.trim()) fail('commit-failed');
-    s.result.sha = sha.stdout.trim();
-    let branch;
-    for (let n = 1; n <= 9; n++) {
-      const name = `lane/${s.opts.purpose}${n === 1 ? '' : `-${n}`}`;
-      const r = await trustedGit(['ls-remote', '--heads', s.originUrl, name]);
-      if (!good(r) || typeof r.stdout !== 'string') fail('push-failed', 'Cannot check remote branch');
-      if (!r.stdout.trim()) { branch = name; break; }
-    }
-    if (!branch) fail('branch-name-exhausted');
-    s.result.branch = branch;
-    if (!good(await trustedGit(['push', '--no-tags', '--no-follow-tags', s.originUrl, `${s.result.sha}:refs/heads/${branch}`]))) fail('push-failed');
-  } finally { await s.io.rm(dir, { recursive: true, force: true }); }
+    const target = path.join(dir, file);
+    await s.io.mkdir(path.dirname(target), { recursive: true });
+    // Replace any base symlink rather than following it, and preserve Git's execute bit.
+    await s.io.rm(target, { force: true });
+    await s.io.writeFile(target, bytes, { mode });
+  }
+  // Only the frozen bytes and modes verified above are staged here.
+  if (!good(await publishGit(['add', '--', ...s.files]))) fail('commit-failed');
+  // In-tree .gitattributes can make add rewrite bytes (eol, ident, encoding). Require the
+  // staged blobs and modes to equal the frozen export exactly, else refuse to commit.
+  const staged = await publishGit(['ls-files', '--stage', '-z', '--', ...s.files]);
+  const want = exported.map(({ file, bytes, mode }) => `${mode === 0o755 ? '100755' : '100644'} ${
+    createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex')} 0\t${file}`).sort();
+  if (!good(staged) || typeof staged.stdout !== 'string' || JSON.stringify(staged.stdout.split('\0').filter(Boolean).sort()) !== JSON.stringify(want)) {
+    fail('changed-after-audit', 'Staged blobs differ from the exported bytes (attribute filters?); inspect the lane files before retrying');
+  }
+  const title = (s.brief.split('\n')[0] ?? '').replace(/^\s*#+\s*/, '').replace(/^Task:\s*/i, '').trim().slice(0, 72);
+  if (!good(await publishGit(['commit', '-m', title]))) fail('commit-failed');
+  const sha = await publishGit(['rev-parse', 'HEAD']);
+  if (!good(sha) || !sha.stdout?.trim()) fail('commit-failed');
+  s.result.sha = sha.stdout.trim();
+  let branch;
+  for (let n = 1; n <= 9; n++) {
+    const name = `lane/${s.opts.purpose}${n === 1 ? '' : `-${n}`}`;
+    const r = await publishGit(['ls-remote', '--heads', s.originUrl, name]);
+    if (!good(r) || typeof r.stdout !== 'string') fail('push-failed', 'Cannot check remote branch');
+    if (!r.stdout.trim()) { branch = name; break; }
+  }
+  if (!branch) fail('branch-name-exhausted');
+  s.result.branch = branch;
+  if (!good(await publishGit(['push', '--no-tags', '--no-follow-tags', s.originUrl, `${s.result.sha}:refs/heads/${branch}`]))) fail('push-failed');
 }
 export async function markReady(s) {
   try { await s.io.readFile(path.join(s.lane.path, 'scripts/fix-ready.mjs')); }
@@ -505,7 +467,7 @@ function plan(s) {
     'Export scoped regular file bytes with lstat/readFile; reject symlinks, gitlinks and unreadable entries',
     'Deleted or renamed files stop with audit-failed; use the normal reviewed lane workflow for removals or moves',
     'Create a fresh clone of the trusted primary origin with system/global Git config disabled and hooks pinned to /dev/null',
-    'Require the audited starting commit to be an ancestor of the trusted remote base; check out that exact audited commit',
+    'Use the full base SHA resolved once from the trusted remote before acquisition',
     'Apply saved scoped bytes and execute modes to the clean checkout',
     'Stage only the allowed paths and commit once with the fixed Codex Job identity',
     `${show('git', ['ls-remote', '--heads', s.originUrl])} <branch> (try suffixes -2 through -9 if occupied)`,
@@ -517,15 +479,21 @@ function plan(s) {
 export async function runJob(opts, io = {}) {
   const s = { claimId: `codex-job-${randomUUID()}`, opts: { ...opts }, io: { ...defaults, ...io }, result: { ok: false, branch: opts.purpose ? `lane/${opts.purpose}` : null, sha: null, tests: null, audit: null, registered: opts.edgeClone ? false : null, stopReason: null } };
   try {
-    if (!s.opts.repo) {
-      const r = await exec(s, 'git', ['rev-parse', '--show-toplevel']);
-      if (!good(r) || !r.stdout?.trim()) fail('bad-args', 'Cannot resolve repository');
-      s.opts.repo = r.stdout.trim();
+    s.opts.repo = path.resolve(s.opts.repo ?? process.cwd());
+    if (!opts.repo) {
+      for (;;) {
+        try { await s.io.lstat(path.join(s.opts.repo, '.git')); break; }
+        catch (error) {
+          const parent = path.dirname(s.opts.repo);
+          if (error.code !== 'ENOENT' || parent === s.opts.repo) fail('bad-args', 'Cannot resolve repository');
+          s.opts.repo = parent;
+        }
+      }
     }
     s.opts.brief = path.resolve(s.opts.repo, s.opts.brief);
     s.brief = await s.io.readFile(s.opts.brief);
     await preflightEdge(s);
-    await checkFreeScope(s); await acquireLane(s); await resetLane(s);
+    await checkFreeScope(s); await prepareTrustedRepo(s); await acquireLane(s); await resetLane(s);
     if (s.opts.dryRun) { s.result.dryRun = true; s.result.plan = plan(s); }
     else {
       await runCodex(s); await checkDiffScope(s); await runTests(s);
@@ -539,7 +507,10 @@ export async function runJob(opts, io = {}) {
   } catch (error) {
     s.result.stopReason = error.stopReason ?? 'internal-error';
     s.result.detail = error.detail ?? error.message;
-  } finally { await releaseResources(s); }
+  } finally {
+    try { if (s.trustedDir) await s.io.rm(s.trustedDir, { recursive: true, force: true }); }
+    finally { await releaseResources(s); }
+  }
   return s.result;
 }
 export async function main(argv, io = {}) {

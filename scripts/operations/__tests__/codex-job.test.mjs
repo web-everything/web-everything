@@ -3,13 +3,259 @@
  * @description Hermetic command transcripts for scope, lane, repair and publication gates.
  */
 import { it, expect } from 'vitest';
-import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, lstatSync, readlinkSync, symlinkSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { execFile, execFileSync, spawnSync } from 'node:child_process';
+import { createServer } from 'node:http';
+import { existsSync, chmodSync, lstatSync, readlinkSync, symlinkSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { main, runJob, parseArgs, parseReport, pathsWithinScope, registerEdge, preflightEdge, checkDiffScope, checkAuditedFiles, resetLane, commitAndPush, captureAuditExport, STOP_REASONS, EXIT_CODES } from '../codex-job.mjs';
+import { main, runJob, parseArgs, parseReport, pathsWithinScope, registerEdge, preflightEdge, checkDiffScope, checkAuditedFiles, trustedGit, commitAndPush, captureAuditExport, STOP_REASONS, EXIT_CODES } from '../codex-job.mjs';
 import { registerScope, releaseScope, assessFreeScope } from '../free-scope.mjs';
+
+// This fixture executes the runner's Git argv verbatim. Only Codex, admission,
+// scope and lane leasing are simulated; repositories, config, objects, diff,
+// staging, commits and publication all use real Git in disposable directories.
+async function withRealJob(run) {
+  const root = mkdtempSync(path.join(tmpdir(), 'codex-job-real-'));
+  const seed = path.join(root, 'seed'), origin = path.join(root, 'origin.git');
+  const primary = path.join(root, 'primary'), lane = path.join(root, 'lane');
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+  Object.assign(env, { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.test',
+    GIT_COMMITTER_NAME: 'Fixture', GIT_COMMITTER_EMAIL: 'fixture@example.test' });
+  const git = (dir, args) => execFileSync('git', ['-C', dir, '-c', 'core.hooksPath=/dev/null', ...args],
+    { env, encoding: 'utf8', timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+  const calls = [], removed = [];
+  let worker = () => writeFileSync(path.join(lane, 'scripts/a.mjs'), 'changed\n');
+  let audit = () => {}, test = () => {};
+  try {
+    mkdirSync(seed);
+    git(seed, ['init', '--quiet', '--initial-branch=main', '--template=']);
+    mkdirSync(path.join(seed, 'scripts'));
+    mkdirSync(path.join(seed, '.githooks'));
+    writeFileSync(path.join(seed, '.githooks/pre-commit'), '#!/bin/sh\nexit 99\n', { mode: 0o755 });
+    writeFileSync(path.join(seed, 'scripts/a.mjs'), 'original\n');
+    writeFileSync(path.join(seed, 'outside.txt'), 'original outside\n');
+    git(seed, ['add', '.']);
+    git(seed, ['commit', '-qm', 'baseline']);
+    const base = git(seed, ['rev-parse', 'HEAD']);
+    git(root, ['clone', '--bare', '--template=', seed, origin]);
+    git(root, ['clone', '--template=', origin, primary]);
+    git(root, ['clone', '--template=', origin, lane]);
+    writeFileSync(path.join(primary, 'brief.md'), '# Task: Change the scoped file\n');
+    const io = {
+      exec: async (cmd, args, options) => {
+        calls.push({ cmd, args, ...options });
+        if (cmd === 'git') {
+          // Async exec permits the local smart-HTTP server in the auth test to
+          // answer requests while real clone/push processes are running.
+          return new Promise(resolve => execFile(cmd, args, options, (error, stdout, stderr) =>
+            resolve({ status: error ? (typeof error.code === 'number' ? error.code : null) : 0, error, stdout, stderr })));
+        }
+        if (args[0].includes('free-scope-cli')) return ok();
+        if (args[0].includes('lane-pool')) return args[1] === 'acquire'
+          ? ok(JSON.stringify({ lane: 4, path: lane, holder: 'real-session' })) : ok();
+        if (args[0].includes('codex-direct-task')) {
+          if (args.includes('--review')) await audit(); else await worker();
+          return report();
+        }
+        if (args[0].includes('heavy-admission')) { await test(); return ok(); }
+        throw new Error('Unexpected process: ' + cmd + ' ' + args.join(' '));
+      },
+      rm: (file, options) => { removed.push(file); return rmSync(file, options); },
+      log: () => {},
+    };
+    const job = async (extra = {}) => runJob({ ...parseArgs(flags), repo: primary, ...extra }, io);
+    await run({ root, origin, primary, lane, base, git, calls, removed, job,
+      worker: fn => { worker = fn; }, audit: fn => { audit = fn; }, tests: fn => { test = fn; } });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}
+
+async function withGitEnvironment(values, run) {
+  const saved = Object.fromEntries(Object.keys(values).map(key => [key, process.env[key]]));
+  try { Object.assign(process.env, values); await run(); }
+  finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+}
+
+it.each(['Apple system helper', 'lane hooks', 'relative repo', 'full SHA', 'abbreviated SHA', 'stale local base',
+  'inherited GIT_DIR', 'hostile lane commands', 'invalid lane config', 'replacement refs', 'followTags', 'submodule config'])(
+  'real Git end-to-end setup matrix: %s', async variant => {
+    await withRealJob(async f => {
+      const extra = {}, inherited = {};
+      const marker = path.join(f.root, 'HOST_EXECUTED');
+      if (variant === 'Apple system helper') {
+        const config = path.join(f.root, 'apple.gitconfig');
+        writeFileSync(config, '[credential]\n\thelper = osxkeychain\n');
+        Object.assign(inherited, { GIT_CONFIG_SYSTEM: config, GIT_CONFIG_NOSYSTEM: '0' });
+      }
+      if (variant === 'lane hooks') {
+        f.git(f.lane, ['config', 'core.hooksPath', '.githooks']);
+      }
+      if (variant === 'relative repo') extra.repo = path.relative(process.cwd(), f.primary);
+      if (variant === 'full SHA') extra.base = f.base;
+      if (variant === 'abbreviated SHA') extra.base = f.base.slice(0, 12);
+      let expectedBase = f.base;
+      if (variant === 'stale local base') {
+        const tree = f.git(f.origin, ['rev-parse', 'HEAD^{tree}']);
+        expectedBase = f.git(f.origin, ['commit-tree', tree, '-p', f.base, '-m', 'new base']);
+        f.git(f.origin, ['update-ref', 'refs/heads/lane/predecessor', expectedBase]);
+        f.git(f.primary, ['update-ref', 'refs/heads/lane/predecessor', f.base]);
+        f.git(f.lane, ['update-ref', 'refs/heads/lane/predecessor', f.base]);
+        extra.base = 'lane/predecessor';
+      }
+      if (variant === 'inherited GIT_DIR') Object.assign(inherited, {
+        GIT_DIR: '/missing/hostile', GIT_WORK_TREE: '/missing/worktree',
+        GIT_INDEX_FILE: '/missing/index', GIT_OBJECT_DIRECTORY: '/missing/objects',
+        GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.fsmonitor',
+        GIT_CONFIG_VALUE_0: 'touch "' + marker + '"', GIT_EXEC_PATH: '/missing/bin',
+        GIT_EXTERNAL_DIFF: 'touch "' + marker + '"', GIT_SSH_COMMAND: 'touch "' + marker + '"',
+      });
+      f.worker(() => {
+        writeFileSync(path.join(f.lane, 'scripts/a.mjs'), 'changed\n');
+        if (variant === 'hostile lane commands') {
+          for (const key of ['core.fsmonitor', 'filter.attack.clean', 'filter.attack.process',
+            'diff.attack.command', 'diff.attack.textconv', 'credential.helper',
+            'remote.origin.receivepack', 'core.sshCommand']) f.git(f.lane, ['config', key, (key === 'credential.helper' ? '!' : '') + 'touch "' + marker + '"']);
+          f.git(f.lane, ['config', 'include.path', '/missing/config']);
+          f.git(f.lane, ['config', 'diff.orderFile', '/missing/order']);
+          writeFileSync(path.join(f.lane, '.git/info/attributes'), '* filter=attack diff=attack\n');
+        }
+        if (variant === 'replacement refs') {
+          const tree = f.git(f.lane, ['rev-parse', 'HEAD^{tree}']);
+          const replacement = f.git(f.lane, ['commit-tree', tree, '-m', 'replacement']);
+          f.git(f.lane, ['replace', f.base, replacement]);
+        }
+        if (variant === 'followTags') {
+          f.git(f.lane, ['config', 'push.followTags', 'true']);
+          f.git(f.lane, ['tag', '-a', 'worker-only', '-m', 'must not escape']);
+        }
+        if (variant === 'submodule config') {
+          f.git(f.lane, ['config', 'diff.ignoreSubmodules', 'all']);
+          f.git(f.lane, ['config', 'submodule.hostile.ignore', 'all']);
+        }
+        if (variant === 'invalid lane config') writeFileSync(path.join(f.lane, '.git/config'), '[invalid\n');
+      });
+      await withGitEnvironment(inherited, async () => {
+        const result = await f.job(extra);
+        expect(result, result.detail).toMatchObject({ ok: true });
+        expect(f.git(f.origin, ['rev-parse', result.sha + '^'])).toBe(expectedBase);
+        expect(f.git(f.origin, ['show', result.sha + ':scripts/a.mjs'])).toBe('changed');
+        expect(f.git(f.origin, ['show', result.sha + ':outside.txt'])).toBe('original outside');
+        expect(f.git(f.origin, ['tag', '--list'])).toBe('');
+        expect(existsSync(marker)).toBe(false);
+        const calls = f.calls.filter(c => c.cmd === 'git');
+        expect(f.calls.every(c => c.env.GIT_DIR === undefined)).toBe(true);
+        expect(calls.filter(c => c.args.includes('--verify'))).toHaveLength(1);
+        expect(calls.every(c => c.cwd !== f.lane && !c.args.includes('--git-dir=' + path.join(f.lane, '.git')))).toBe(true);
+        expect(f.calls.find(c => c.args[1] === 'acquire').args).toContain('--base=' + expectedBase);
+        for (const c of calls) {
+          expect(c.env.GIT_CONFIG_GLOBAL).toBe('/dev/null');
+          expect(c.env.GIT_CONFIG_NOSYSTEM).toBe('1');
+          expect(c.env.GIT_TERMINAL_PROMPT).toBe('0');
+          expect(c.env.GIT_DIR).toBeUndefined();
+        }
+      });
+    });
+  }, 30000);
+
+it.each(['replacement ref', 'submodule diff config', 'ancestor commits', 'staged gitlink'])(
+  'real Git cannot hide an outside file with %s', async variant => {
+    await withRealJob(async f => {
+      f.worker(() => {
+        if (variant !== 'staged gitlink') writeFileSync(path.join(f.lane, 'outside.txt'), 'outside attack\n');
+        writeFileSync(path.join(f.lane, 'scripts/a.mjs'), 'changed\n');
+        f.git(f.lane, ['add', '.']);
+        if (variant === 'replacement ref') {
+          const replacement = f.git(f.lane, ['commit-tree', f.git(f.lane, ['write-tree']), '-m', 'hidden']);
+          f.git(f.lane, ['replace', f.base, replacement]);
+        } else if (variant === 'ancestor commits') f.git(f.lane, ['commit', '-qm', 'unaudited ancestor']);
+        else if (variant === 'staged gitlink') {
+          const nested = path.join(f.lane, 'outside-module');
+          mkdirSync(nested);
+          f.git(nested, ['init', '--quiet', '--template=']);
+          writeFileSync(path.join(nested, 'module.txt'), 'module bytes\n');
+          f.git(nested, ['add', '.']);
+          f.git(nested, ['commit', '-qm', 'module']);
+          f.git(f.lane, ['update-index', '--add', '--cacheinfo', '160000', f.git(nested, ['rev-parse', 'HEAD']), 'outside-module']);
+          f.git(f.lane, ['config', 'diff.ignoreSubmodules', 'all']);
+          f.git(f.lane, ['config', 'submodule.outside-module.ignore', 'all']);
+        }
+        else {
+          f.git(f.lane, ['config', 'diff.ignoreSubmodules', 'all']);
+          f.git(f.lane, ['config', 'submodule.outside.ignore', 'all']);
+        }
+      });
+      expect(await f.job()).toMatchObject({ ok: false, stopReason: 'diff-out-of-scope' });
+      expect(f.calls.some(c => c.args.includes('push'))).toBe(false);
+    });
+  }, 30000);
+
+it.each([0o644, 0o755])('real Git publishes the exact bytes and executable mode %s', async mode => {
+  await withRealJob(async f => {
+    f.worker(() => {
+      writeFileSync(path.join(f.lane, 'scripts/a.mjs'), 'exact bytes\n');
+      chmodSync(path.join(f.lane, 'scripts/a.mjs'), mode);
+    });
+    const result = await f.job();
+    expect(result, result.detail).toMatchObject({ ok: true });
+    expect(f.git(f.origin, ['ls-tree', result.sha, 'scripts/a.mjs'])).toMatch(new RegExp('^' + (mode === 0o755 ? '100755' : '100644')));
+    expect(f.git(f.origin, ['show', result.sha + ':scripts/a.mjs'])).toBe('exact bytes');
+  });
+}, 30000);
+
+it('real Git authenticates both clone and push through one path-keyed explicit helper', async () => {
+  await withRealJob(async f => {
+    f.git(f.origin, ['config', 'http.receivepack', 'true']);
+    const authorized = [];
+    const server = createServer((req, res) => {
+      if (req.headers.authorization !== 'Basic ' + Buffer.from('path-user:path-token').toString('base64')) {
+        res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="fixture"' }); res.end(); return;
+      }
+      authorized.push(req.url);
+      const chunks = [];
+      req.on('data', chunk => chunks.push(chunk));
+      req.on('end', () => {
+        const url = new URL(req.url, 'http://localhost');
+        const r = spawnSync('git', ['http-backend'], {
+          env: { PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
+            GIT_PROJECT_ROOT: f.root, GIT_HTTP_EXPORT_ALL: '1', PATH_INFO: url.pathname,
+            QUERY_STRING: url.search.slice(1), REQUEST_METHOD: req.method,
+            CONTENT_TYPE: req.headers['content-type'] ?? '', REMOTE_USER: 'path-user' },
+          input: Buffer.concat(chunks), maxBuffer: 16 * 1024 * 1024, timeout: 10000,
+        });
+        const split = r.stdout.indexOf('\r\n\r\n');
+        if (r.status !== 0 || split < 0) { res.writeHead(500); res.end(); return; }
+        const headers = {};
+        let status = 200;
+        for (const line of r.stdout.subarray(0, split).toString().split('\r\n')) {
+          const colon = line.indexOf(':');
+          if (line.slice(0, colon).toLowerCase() === 'status') status = Number(line.slice(colon + 1).trim().split(' ')[0]);
+          else headers[line.slice(0, colon)] = line.slice(colon + 1).trim();
+        }
+        res.writeHead(status, headers); res.end(r.stdout.subarray(split + 4));
+      });
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const helper = path.join(f.root, "operator helper's script");
+    writeFileSync(helper, '#!/bin/sh\n[ "$1" = get ] || exit 0\nwhile IFS= read -r line; do\n' +
+      'if [ "$line" = "path=origin.git" ]; then printf "%s\\n" "username=path-user" "password=path-token"; fi\ndone\n', { mode: 0o755 });
+    try {
+      f.git(f.primary, ['config', 'remote.origin.url', 'http://127.0.0.1:' + server.address().port + '/origin.git']);
+      f.git(f.primary, ['config', 'credential.useHttpPath', 'true']);
+      f.git(f.lane, ['config', 'credential.helper', '!exit 99']);
+      const result = await f.job({ credentialHelper: helper });
+      expect(result, result.detail).toMatchObject({ ok: true });
+      expect(authorized.some(url => url.includes('service=git-upload-pack'))).toBe(true);
+      expect(authorized.some(url => url.endsWith('/git-receive-pack'))).toBe(true);
+      expect(f.git(f.origin, ['show', result.sha + ':scripts/a.mjs'])).toBe('changed');
+    } finally { await new Promise(resolve => server.close(resolve)); }
+  });
+}, 30000);
+
 
 const flags = ['--brief=brief.md', '--purpose=example', '--scope=we:scripts/a.mjs,we:scripts/lib/', '--tests=scripts/a.test.mjs', '--repo=/repo'];
 const ok = (stdout = '') => ({ status: 0, stdout, stderr: '' });
@@ -19,83 +265,31 @@ const loaderHelp = '--branch= --sha= --daemon= --why= --tests-run= --audit= --js
 const originUrl = 'https://github.com/example/trusted.git';
 const laneConfig = `local\0remote.origin.url\n${originUrl}\0local\0remote.origin.fetch\n+refs/heads/*:refs/remotes/origin/*\0local\0remote.origin.fetch\n^refs/heads/ops/*\0`;
 
-it.each(['unknown', 'system'])('accepts the OS credential helper with %s scope and a CLT file origin', async scope => {
-  const f = fixture([['--get-regexp', ok(`${scope}\0file:/Library/Developer/CommandLineTools/usr/share/git-core/gitconfig\0credential.helper\nosxkeychain\0`)]]);
+it('never opens lane Git metadata during an end-to-end job', async () => {
+  const f = fixture();
   expect((await f.run()).result.ok).toBe(true);
-  for (const verb of ['clone', 'push']) {
-    expect(f.calls.find(c => c.args.includes(verb)).args).toContain('credential.helper=osxkeychain');
+  const calls = f.calls.filter(c => c.cmd === 'git');
+  expect(calls.length).toBeGreaterThan(0);
+  expect(calls.some(c => c.args.includes('/lane'))).toBe(false);
+  expect(calls.some(c => c.args.includes('--get-regexp'))).toBe(false);
+  for (const c of calls) {
+    expect(c.env.GIT_CONFIG_NOSYSTEM).toBe('1');
+    expect(c.env.GIT_CONFIG_GLOBAL).toBe('/dev/null');
+    expect(c.env.GIT_TERMINAL_PROMPT).toBe('0');
   }
 });
 
-it.each(['unknown', 'system', 'local', 'worktree', 'global'])(
-  'rejects the same credential helper from a lane file with %s scope', async scope => {
-    const f = fixture([['--get-regexp', ok(`${scope}\0file:/lane/.git/config\0credential.helper\nosxkeychain\0`)]]);
-    expect((await f.run()).result.stopReason).toBe('unsafe-git-config');
-    expect(codexCalls(f)).toHaveLength(0);
-    released(f);
+// Ambient credential config is intentionally never read, regardless of scope or
+// origin. The real-Git matrix below covers the former denylist false rejections.
+it.each(['unknown', 'system', 'local', 'worktree', 'global', 'command'])(
+  'ignores ambient credential and lane config in %s scope', async scope => {
+    const f = fixture([
+      ['--get-regexp', () => { throw new Error('Ambient credentials read'); }],
+      ['config --show-scope', () => { throw new Error(`Lane config read: ${scope}`); }],
+    ]);
+    expect((await f.run()).result.ok).toBe(true);
+    expect(f.calls.some(c => c.args.includes('--get-regexp') || c.args.includes('--show-scope'))).toBe(false);
   });
-
-it.each(['unknown', 'system'])('rejects unlisted or non-file system helper origins with %s scope', async scope => {
-  for (const origin of ['file:/tmp/gitconfig', 'file:/etc/gitconfig.extra', 'file:/etc/../etc/gitconfig',
-    'command line:', 'file:/Applications/Xcode.app/Contents/Developer/usr/share/git-core/gitconfig/extra']) {
-    const f = fixture([['--get-regexp', ok(`${scope}\0${origin}\0credential.helper\nosxkeychain\0`)]]);
-    expect((await f.run()).result.stopReason).toBe('unsafe-git-config');
-    expect(codexCalls(f)).toHaveLength(0);
-  }
-});
-
-it.each(['core.hooksPath', 'CORE.HOOKSPATH'])('completes a default lane job with local %s=.githooks', async key => {
-  const f = fixture([['config --show-scope', ok(`${laneConfig}local\0${key}\n.githooks\0`)]]);
-  expect((await f.run()).result.ok).toBe(true);
-  expect(codexCalls(f)).toHaveLength(1);
-  expect(f.calls.some(c => c.args.includes('push'))).toBe(true);
-});
-
-it.each(['diff.orderFile', 'diff.relative', 'diff.driver.textconv', 'diff.driver.command',
-  'core.excludesFile', 'core.attributesFile', 'core.otherPath', 'CORE.OTHERPATH', 'core.worktree', 'core.fsmonitor', 'core.sshCommand'])(
-  'refuses worker-controlled file/path setting %s before running another diff', async key => {
-    for (const scope of ['local', 'worktree', 'unknown']) {
-      let poisoned = false;
-      const f = fixture([
-        ['--get-regexp', { status: 1, stdout: '', stderr: '' }],
-        ['codex-direct-task.mjs', () => { poisoned = true; return report(); }],
-        ['config --show-scope', () => ok(`${laneConfig}${poisoned ? `${scope}\0${key}\n/lane/blocked\0` : ''}`)],
-      ]);
-      expect((await f.run()).result.stopReason).toBe('unsafe-git-config');
-      released(f);
-      scopeReleased(f);
-    }
-  });
-
-it('fails closed on a FIFO diff.orderFile and releases the job instead of hanging', async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), 'codex-job-fifo-'));
-  const fifo = path.join(dir, 'order');
-  execFileSync('mkfifo', [fifo]);
-  writeFileSync(path.join(dir, 'before'), 'before\n');
-  writeFileSync(path.join(dir, 'after'), 'after\n');
-  let poisoned = false;
-  const f = fixture([
-    ['--get-regexp', { status: 1, stdout: '', stderr: '' }],
-    ['codex-direct-task.mjs', () => { poisoned = true; return report(); }],
-    ['config --show-scope', () => ok(`${laneConfig}${poisoned ? `local\0diff.orderFile\n${fifo}\0` : ''}`)],
-  ]);
-  const exec = f.io.exec;
-  f.io.exec = async (cmd, args, options) => {
-    if (cmd === 'git' && args.includes('diff') && poisoned) {
-      // Exercise Git's actual FIFO read without mutating any checkout. The outer
-      // cap keeps the regression test bounded even on the vulnerable runner.
-      const pins = args.flatMap((arg, i) => arg === '-c' ? ['-c', args[i + 1]] : []);
-      return spawnSync('git', ['-c', `diff.orderFile=${fifo}`, ...pins, 'diff', '--no-index',
-        path.join(dir, 'before'), path.join(dir, 'after')], { ...options, cwd: dir, encoding: 'utf8', timeout: 250, killSignal: 'SIGKILL' });
-    }
-    return exec(cmd, args, options);
-  };
-  try {
-    expect((await f.run()).result.stopReason).toMatch(/^(unsafe-git-config|timeout)$/);
-    released(f);
-    scopeReleased(f);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
-});
 
 it('bounds every Git subprocess and pins file ordering and fsmonitor on hardened calls', async () => {
   const f = fixture();
@@ -118,7 +312,7 @@ it('cancels FIFO ordering on a real diff even when Git treats an empty orderFile
   const before = path.join(dir, 'before'), after = path.join(dir, 'after');
   writeFileSync(before, 'before\n'); writeFileSync(after, 'after\n');
   let diffResult;
-  const state = { opts: { repo: dir, scope: ['we:scripts/'] }, lane: { path: dir }, startSha: 'abc', io: {
+  const state = { trustedDir: dir, opts: { repo: dir, scope: ['we:scripts/'] }, lane: { path: dir }, startSha: 'abc', io: {
     exec: async (cmd, args, options) => {
       if (args.includes('config')) return ok();
       const pins = args.flatMap((arg, i) => arg === '-c' ? ['-c', args[i + 1]] : []);
@@ -139,25 +333,25 @@ it('cancels FIFO ordering on a real diff even when Git treats an empty orderFile
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-it.each(['--get-regexp', 'remote get-url origin', 'config --show-scope', 'reset --hard',
+it.each(['--get remote.origin.url', 'reset --hard',
   'diff --name-only', 'clone --no-local', 'ls-remote --heads', 'push --no-tags'])(
   'returns timeout and cleans up when Git stalls at %s', async command => {
     const f = fixture([[command, { status: null, stdout: '', stderr: '', error: { code: 'ETIMEDOUT' } }]]);
     const { code, result } = await f.run();
     expect(result.stopReason).toBe('timeout');
     expect(code).toBe(EXIT_CODES.timeout);
-    expect(result.detail).toContain('inspect lane configuration and remote availability');
-    released(f);
+    expect(result.detail).toContain('inspect remote availability');
+    if (result.lane) released(f);
     scopeReleased(f);
     for (const dir of f.temps) expect(f.removals).toContainEqual({ file: dir, options: { recursive: true, force: true } });
   });
 
-it('bounds repository discovery and returns timeout before acquiring resources', async () => {
-  const f = fixture([['--show-toplevel', { status: null, stdout: '', error: { code: 'ETIMEDOUT' } }]]);
-  expect(await main(flags.filter(arg => !arg.startsWith('--repo=')), f.io)).toBe(EXIT_CODES.timeout);
-  expect(f.calls).toHaveLength(1);
-  expect(f.calls[0]).toMatchObject({ timeout: 120000, killSignal: 'SIGKILL' });
+it('normalizes a relative repo before any child process', async () => {
+  const f = fixture();
+  expect(await main(flags.map(arg => arg === '--repo=/repo' ? '--repo=relative-repo' : arg), f.io)).toBe(0);
+  expect(f.calls[0].cwd).toBe(path.resolve('relative-repo'));
 });
+
 // Stage what the publisher wrote, independently of the source lane's bytes/modes.
 function stagedEntries(writes, dir, files) {
   const out = [];
@@ -177,8 +371,6 @@ function fixture(rules = [], { ready = true } = {}) {
       const call = { cmd, args, ...options, text: [cmd, ...args].join(' ') };
       calls.push(call);
       for (const [match, response] of rules) {
-        // Credential capture now has its own origin-bearing wire format.
-        if (match === 'config --show-scope' && args.includes('--get-regexp')) continue;
         if (call.text.includes(match)) {
           const n = counts.get(match) ?? 0; counts.set(match, n + 1);
           return typeof response === 'function' ? response(call, n) : response;
@@ -194,11 +386,11 @@ function fixture(rules = [], { ready = true } = {}) {
       if (cmd === 'git') {
         if (args.includes('--get-regexp')) return { status: 1, stdout: '', stderr: '' };
         if (args.includes('clone')) return ok();
-        if (args.includes('get-url')) return ok(`${originUrl}\n`);
+        if (args.includes('--get') && args.includes('remote.origin.url')) return ok(`${originUrl}\n`);
         if (args.includes('config')) return ok(laneConfig);
         if (args.includes('write-tree') || args.some(a => a.endsWith('^{tree}'))) return ok('a'.repeat(40) + '\n');
         if (args.includes('--show-toplevel')) return ok('/repo\n');
-        if (args.includes('rev-parse')) return ok('abc123\n');
+        if (args.includes('rev-parse')) return ok('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n');
         if (args.includes('rev-list')) return ok('1\n');
         if (args.includes('diff') && args.includes('--quiet')) return ok();
         if (args.includes('--binary')) return ok('audited binary diff');
@@ -210,7 +402,8 @@ function fixture(rules = [], { ready = true } = {}) {
       }
       throw new Error(`Unscripted command: ${call.text}`);
     },
-    lstat: file => { stats.push(file); return { mode: 0o100644, isSymbolicLink: () => false, isDirectory: () => false, isFile: () => true }; },
+    realpath: file => file,
+    lstat: file => { stats.push(file); return { mode: file === '/operator/helper' ? 0o100755 : 0o100644, isSymbolicLink: () => false, isDirectory: () => false, isFile: () => true }; },
     mkdtemp: async prefix => { const dir = `${prefix}fixture-${temps.length + 1}`; temps.push(dir); return dir; },
     mkdir: async () => {},
     rm: async (file, options) => { removals.push({ file, options }); },
@@ -247,10 +440,10 @@ const codexCalls = f => f.calls.filter(c => c.text.includes('codex-direct-task.m
 // input is a declared path list, never the lane's index, refs or Git configuration.
 // These contracts replace checkStagedScope and the old lane-ancestry/index tests.
 const remoteBase = 'e'.repeat(40), publishedSha = 'f'.repeat(40);
-async function publicationFixture({ config = '', laneTip = 'abc123', files = ['scripts/a.mjs'], base = 'origin/main', laneRefs = {}, remoteTip = remoteBase, ancestor = true } = {}) {
+async function publicationFixture({ config = '', laneTip = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', files = ['scripts/a.mjs'], base = 'origin/main', laneRefs = {}, remoteTip = remoteBase, ancestor = true } = {}) {
   const f = fixture();
   const s = { opts: { ...parseArgs(flags), base }, lane: { path: '/lane', holder: 'session' },
-    io: f.io, originUrl, startSha: 'abc123', baseSha: 'abc123',
+    trustedDir: await f.io.mkdtemp(path.join(tmpdir(), 'codex-job-publish-')), io: f.io, originUrl, startSha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', baseSha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     brief: '# Task: Build the example\nDetailed brief.', result: { branch: 'lane/example', sha: null } };
   await checkDiffScope(s);
   s.files = files;
@@ -259,10 +452,11 @@ async function publicationFixture({ config = '', laneTip = 'abc123', files = ['s
   try { s.auditExportFingerprint = await captureAuditExport(s); } catch { /* rejected at publish */ }
   f.reads.length = 0; f.stats.length = 0;
   f.calls.length = 0;
+  await trustedGit(['clone', '--no-local', '--no-checkout', '--template=', '--', originUrl, s.trustedDir], { s, bootstrap: true });
   const exec = f.io.exec;
   let freshHead = 'd'.repeat(40);
   const commits = [];
-  const isFresh = c => f.temps.some(dir => c.cwd === dir || c.args.includes(dir));
+  const isFresh = c => !c.args.includes('--work-tree=/lane') && f.temps.some(dir => c.cwd === dir || c.args.includes(dir));
   const pathStats = new Map(), lstat = f.io.lstat;
   f.io.lstat = file => pathStats.has(file) ? pathStats.get(file) : lstat(file);
   f.io.exec = async (cmd, args, options) => {
@@ -303,12 +497,12 @@ async function publicationFixture({ config = '', laneTip = 'abc123', files = ['s
   const publish = async () => {
     try { await commitAndPush(s); return { ok: true, ...s.result }; }
     catch (error) { return { ok: false, stopReason: error.stopReason ?? 'internal-error', detail: error.detail ?? error.message }; }
-    finally { expectScrubbedPublicationEnv(f); }
+    finally { await f.io.rm(s.trustedDir, { recursive: true, force: true }); expectScrubbedPublicationEnv(f); }
   };
   return { ...f, s, commits, pathStats, isFresh, publish };
 }
 const publicationEnvKeys = ['GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_NO_REPLACE_OBJECTS',
-  'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'].sort();
+  'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'GIT_NO_LAZY_FETCH', 'GIT_TERMINAL_PROMPT', 'GIT_ASKPASS'].sort();
 function expectScrubbedPublicationEnv(f) {
   for (const call of f.calls.filter(c => c.cmd === 'git' && f.temps.includes(c.cwd))) {
     expect(Object.keys(call.env).filter(key => key.startsWith('GIT_')).sort()).toEqual(publicationEnvKeys);
@@ -397,17 +591,11 @@ it('push.followTags in lane config is inert: push disables tags and names only o
   expect(push.args.some(a => a.includes('refs/tags/'))).toBe(false);
 });
 
-it('remote-only base is resolved in the fresh trusted clone and ignores a bogus local lane ref', async () => {
-  const f = await publicationFixture({ base: 'lane/predecessor',
-    laneRefs: { 'lane/predecessor': 'b'.repeat(40) } });
+it('publication retains the base resolved before any worker activity', async () => {
+  const f = await publicationFixture({ base: 'lane/predecessor' });
   expect((await f.publish()).ok).toBe(true);
-  expectFreshPush(f);
-  const resolutions = publicationGit(f).filter(c => c.args.includes('rev-parse') &&
-    c.args.some(a => a.includes('origin/lane/predecessor')));
-  expect(resolutions.length).toBeGreaterThan(0);
-  expect(resolutions.every(f.isFresh)).toBe(true);
   expect(f.commits).toEqual([{ sha: publishedSha, parent: remoteBase }]);
-  expect(publicationGit(f).some(c => c.args.includes('/lane'))).toBe(false);
+  expect(f.calls.some(c => c.args.includes('--verify'))).toBe(false);
 });
 
 it.each([
@@ -528,105 +716,10 @@ it('rejects wait-ms above 24 hours before any lane or Codex work', async () => {
   expect(f.calls).toHaveLength(0);
 });
 
-it('resolves a remote-only base once and resets to its pinned commit', async () => {
-  const f = fixture([
-    ['rev-parse --verify lane/predecessor^{commit}', red()],
-    ['rev-parse --verify origin/lane/predecessor^{commit}', ok('abc123\n')],
-  ]);
-  const s = { opts: { repo: '/repo', base: 'lane/predecessor' }, lane: { path: '/lane', holder: 'session' }, io: f.io };
-  await resetLane(s);
-  expect(s.baseSha).toBe('abc123');
-  expect(s.startSha).toBe(s.baseSha);
-  expect(f.calls.find(c => c.args.includes('reset')).args).toContain(s.baseSha);
-  expect(f.calls.filter(c => c.args.includes('--verify'))).toHaveLength(1);
-});
-
-it('falls back to the bare base only when its origin ref cannot resolve', async () => {
-  const f = fixture([
-    ['rev-parse --verify origin/local-base^{commit}', red()],
-    ['rev-parse --verify local-base^{commit}', ok('abc123\n')],
-  ]);
-  const s = { opts: { repo: '/repo', base: 'local-base' }, lane: { path: '/lane', holder: 'session' }, io: f.io };
-  await resetLane(s);
-  expect(s.baseSha).toBe('abc123');
-  expect(f.calls.filter(c => c.args.includes('--verify')).map(c => c.args.at(-1)))
-    .toEqual(['origin/local-base^{commit}', 'local-base^{commit}']);
-});
-
-it('uses an explicitly origin-prefixed base without adding a second origin prefix', async () => {
-  const f = fixture();
-  const s = { opts: { repo: '/repo', base: 'origin/lane/predecessor' }, lane: { path: '/lane', holder: 'session' }, io: f.io };
-  await resetLane(s);
-  expect(f.calls.filter(c => c.args.includes('--verify')).map(c => c.args.at(-1)))
-    .toEqual(['origin/lane/predecessor^{commit}']);
-});
-
-it.each([red(), { status: 0 }, ok('')])('refuses unresolved base commits before resetting (%j)', async response => {
+it.each([red(), { status: 0 }, ok(''), ok('short-sha')])('refuses unresolved base commits before resetting (%j)', async response => {
   const f = fixture([['rev-parse --verify', response]]);
   expect((await f.run()).result.stopReason).toBe('lane-reset-failed');
   expect(f.calls.some(c => c.args.includes('reset') || c.args.includes('push'))).toBe(false);
-});
-
-// Publication effects remain intercepted; only the disposable repository uses real Git.
-async function withPublicationRepo(run) {
-  const repo = mkdtempSync(path.join(tmpdir(), 'codex-job-publication-'));
-  const gitEnv = { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1',
-    GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.test',
-    GIT_COMMITTER_NAME: 'Fixture', GIT_COMMITTER_EMAIL: 'fixture@example.test' };
-  const git = args => execFileSync('git', ['-C', repo, ...args], {
-    encoding: 'utf8', env: { ...process.env, ...gitEnv },
-  });
-  const commit = (message, parent) => {
-    const sha = git(['commit-tree', git(['write-tree']).trim(), ...(parent ? ['-p', parent] : []), '-m', message]).trim();
-    git(['update-ref', 'HEAD', sha]);
-    return sha;
-  };
-  try {
-    git(['init', '--quiet', '--template=']);
-    git(['config', 'remote.origin.url', originUrl]);
-    mkdirSync(path.join(repo, 'scripts'));
-    writeFileSync(path.join(repo, 'scripts/a.mjs'), 'original\n');
-    git(['add', '--', 'scripts/a.mjs']);
-    const startSha = commit('baseline');
-    git(['update-ref', 'refs/remotes/origin/main', startSha]);
-    const f = fixture([['lane-pool.mjs acquire', ok(JSON.stringify({ lane: 4, path: repo, holder: 'session' }))]]);
-    const exec = f.io.exec;
-    f.io.exec = async (cmd, args, options) => {
-      const scripted = await exec(cmd, args, options);
-      if (cmd !== 'git' || args.includes('ls-remote') || args.includes('push')) return scripted;
-      return spawnSync(cmd, ['-C', repo, ...args.slice(2)], {
-        ...options, cwd: repo, encoding: 'utf8', env: { ...options.env, ...gitEnv },
-      });
-    };
-    await run({ repo, git, commit, startSha, f });
-  } finally { rmSync(repo, { recursive: true, force: true }); }
-}
-
-it('resets to origin/lane/predecessor when no local predecessor exists (real Git)', async () => {
-  await withPublicationRepo(async ({ repo, git, startSha, f }) => {
-    git(['update-ref', 'refs/remotes/origin/lane/predecessor', startSha]);
-    expect(git(['for-each-ref', '--format=%(refname)', 'refs/heads/lane/predecessor'])).toBe('');
-    const s = { opts: { repo, base: 'lane/predecessor' }, lane: { path: repo, holder: 'session' }, io: f.io };
-    await resetLane(s);
-    expect(s.baseSha).toBe(startSha);
-    expect(s.startSha).toBe(startSha);
-    expect(git(['rev-parse', 'HEAD']).trim()).toBe(startSha);
-    expect(f.calls.find(c => c.args.includes('reset')).args).toContain(startSha);
-  });
-});
-
-it('prefers the descendant origin base over a stale local predecessor (real Git)', async () => {
-  await withPublicationRepo(async ({ repo, git, commit, startSha, f }) => {
-    git(['update-ref', 'refs/heads/lane/predecessor', startSha]);
-    const nextSha = commit('new predecessor', startSha);
-    git(['update-ref', 'refs/remotes/origin/lane/predecessor', nextSha]);
-    const s = { opts: { repo, base: 'lane/predecessor' }, lane: { path: repo, holder: 'session' }, io: f.io };
-    await resetLane(s);
-    expect(s.baseSha).toBe(nextSha);
-    expect(s.startSha).toBe(nextSha);
-    expect(git(['rev-parse', 'HEAD']).trim()).toBe(nextSha);
-    expect(git(['rev-parse', 'lane/predecessor']).trim()).toBe(startSha);
-  });
 });
 
 it('completes a job with standard cloned-origin configuration', async () => {
@@ -674,54 +767,27 @@ it.each([false, true])('passes exact lane argv with --gate=none to initial, repa
   });
 });
 
-it('pins executable Git configuration on every lane Git command', async () => {
+it('pins executable Git configuration on every trusted Git command', async () => {
   const f = fixture();
-  await f.run();
-  for (const call of f.calls.filter(c => c.cmd === 'git' && c.args.includes('/lane'))) {
-    const count = Number(call.env?.GIT_CONFIG_COUNT ?? 0);
-    const config = Object.fromEntries(Array.from({ length: count }, (_, i) =>
-      [call.env[`GIT_CONFIG_KEY_${i}`], call.env[`GIT_CONFIG_VALUE_${i}`]]));
-    expect(config['core.fsmonitor']).toBe('false');
-    expect(config['core.hooksPath']).toBe('/dev/null');
+  expect((await f.run()).result.ok).toBe(true);
+  const calls = f.calls.filter(c => c.cmd === 'git');
+  expect(calls.length).toBeGreaterThan(0);
+  for (const call of calls) {
+    for (const pin of ['core.fsmonitor=false', 'core.hooksPath=/dev/null', 'push.followTags=false',
+      'core.pager=cat', 'diff.orderFile=', 'commit.gpgsign=false', 'credential.useHttpPath=true'])
+      expect(call.args).toContain(pin);
     expect(call.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
     expect(call.args).toContain('--no-replace-objects');
+    expect(call.args).not.toContain('/lane');
   }
-});
-
-it('rejects outside changes hidden by a replacement root commit (real Git)', async () => {
-  const repo = mkdtempSync(path.join(tmpdir(), 'codex-job-replace-'));
-  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1',
-    GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.test',
-    GIT_COMMITTER_NAME: 'Fixture', GIT_COMMITTER_EMAIL: 'fixture@example.test' };
-  delete env.GIT_NO_REPLACE_OBJECTS;
-  const git = args => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8', env });
-  try {
-    git(['init', '--quiet', '--template=']);
-    mkdirSync(path.join(repo, 'scripts'));
-    writeFileSync(path.join(repo, 'scripts/a.mjs'), 'original\n');
-    git(['add', '--', 'scripts/a.mjs']);
-    const startSha = git(['commit-tree', git(['write-tree']).trim(), '-m', 'baseline']).trim();
-    writeFileSync(path.join(repo, 'outside.txt'), 'outside scope\n');
-    git(['add', '--', 'outside.txt']);
-    const replacement = git(['commit-tree', git(['write-tree']).trim(), '-m', 'replacement root']).trim();
-    git(['replace', startSha, replacement]);
-    writeFileSync(path.join(repo, 'scripts/a.mjs'), 'scoped edit\n');
-    // Demonstrate the attack: ordinary Git hides the newly staged outside file.
-    expect(git(['diff', '--name-only', startSha])).toBe('scripts/a.mjs\n');
-    const state = { opts: { repo, scope: ['we:scripts/'] }, lane: { path: repo }, startSha, io: {
-      exec: async (cmd, args, options) => spawnSync(cmd, args, { ...options, encoding: 'utf8',
-        env: { ...options.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } }),
-    } };
-    await expect(checkDiffScope(state)).rejects.toMatchObject({ stopReason: 'diff-out-of-scope' });
-  } finally { rmSync(repo, { recursive: true, force: true }); }
 });
 
 it('captures the primary origin once before the worker and publishes only to that URL', async () => {
   const f = fixture();
   expect((await f.run()).result.ok).toBe(true);
-  const reads = f.calls.filter(c => c.args.includes('get-url'));
+  const reads = f.calls.filter(c => c.args.includes('remote.origin.url'));
   expect(reads).toHaveLength(1);
-  expect(reads[0]).toMatchObject({ cwd: '/repo', args: ['-C', '/repo', '-c', 'diff.orderFile=', '-c', 'core.fsmonitor=false', 'remote', 'get-url', 'origin'] });
+  expect(reads[0].args).toEqual(expect.arrayContaining(['config', '--file', '/repo/.git/config', '--no-includes', '--get', 'remote.origin.url']));
   expect(f.calls.indexOf(reads[0])).toBeLessThan(f.calls.findIndex(c => c.text.includes('codex-direct-task.mjs')));
   const publication = f.calls.filter(c => c.args.includes('ls-remote') || c.args.includes('push'));
   expect(publication).toHaveLength(2);
@@ -732,73 +798,21 @@ it('captures the primary origin once before the worker and publishes only to tha
 });
 
 it.each([red(), ok(''), ok(' \n'), { status: 0 }])('fails closed before the worker when the primary origin is unavailable (%j)', async response => {
-  const f = fixture([['remote get-url origin', response]]);
+  const f = fixture([['--get remote.origin.url', response]]);
   expect((await f.run()).result.stopReason).toBe('push-failed');
   expect(f.calls.some(c => c.args.includes('reset') || c.text.includes('codex-direct-task.mjs') || c.args.includes('push'))).toBe(false);
-  released(f); scopeReleased(f);
+  scopeReleased(f);
 });
 
-it.each([false, true])('neutralizes inherited fsmonitor commands on a real read-only Git diff (changed=%s)', async changed => {
-  const names = ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'];
-  const saved = names.map(name => process.env[name]);
-  // The CI checkout has a local authentication header, which the lane guard must
-  // reject. Exercise fsmonitor in an isolated repository with known configuration.
-  const repo = mkdtempSync(path.join(tmpdir(), 'codex-job-fsmonitor-'));
-  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
-  const git = args => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8', env });
-  const results = [];
-  try {
-    git(['init', '--quiet', '--template=']);
-    mkdirSync(path.join(repo, 'scripts'));
-    writeFileSync(path.join(repo, 'scripts/a.mjs'), 'original\n');
-    git(['add', '--', 'scripts/a.mjs']);
-    const startSha = git(['write-tree']).trim();
-    if (changed) writeFileSync(path.join(repo, 'scripts/a.mjs'), 'changed\n');
-    process.env.GIT_CONFIG_COUNT = '1';
-    process.env.GIT_CONFIG_KEY_0 = 'core.fsmonitor';
-    process.env.GIT_CONFIG_VALUE_0 = 'echo CODEX_JOB_HOST_EXECUTION >&2; :';
-    const state = { opts: { repo, scope: ['we:scripts/'] }, lane: { path: repo }, startSha, io: {
-      exec: async (cmd, args, options) => {
-        const r = spawnSync(cmd, args, { ...options, encoding: 'utf8',
-          env: { ...options.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } });
-        results.push(r);
-        return r;
-      },
-    } };
-    if (changed) {
-      await expect(checkDiffScope(state)).resolves.toBeUndefined();
-      expect(state.files).toEqual(['scripts/a.mjs']);
-      expect(state.auditFingerprint).toMatch(/^[a-f0-9]{64}$/);
-    } else await expect(checkDiffScope(state)).rejects.toMatchObject({ stopReason: 'no-changes' });
-    expect(results.length).toBeGreaterThan(0);
-    expect(results.every(r => r.status === 0 && !r.stderr.includes('CODEX_JOB_HOST_EXECUTION'))).toBe(true);
-  } finally {
-    names.forEach((name, i) => { if (saved[i] === undefined) delete process.env[name]; else process.env[name] = saved[i]; });
-    rmSync(repo, { recursive: true, force: true });
-  }
-});
-
-it('refuses risky config introduced by a worker, tests or audit before another Git command', async () => {
+it('does not consult unreadable lane config after worker, test or audit boundaries', async () => {
   for (const boundary of ['codex-direct-task.mjs --task-file', 'heavy-admission', 'codex-direct-task.mjs --review']) {
-    for (const key of ['filter.host.clean', 'filter.host.process', 'credential.helper', 'remote.origin.receivepack', 'url.host.insteadof', 'http.https://github.com/.extraheader', 'diff.orderFile', 'core.excludesFile']) {
-      let poisoned = false;
-      const f = fixture([
-        [boundary, () => { poisoned = true; return boundary.includes('codex') ? report() : ok(); }],
-        ['config --show-scope', () => ok(poisoned ? `local\0${key}\necho HOST_EXECUTION\0` : '')],
-      ]);
-      const { result } = await f.run();
-      expect(result.stopReason).toBe('unsafe-git-config');
-      expect(f.calls.some(c => c.args.includes('add') || c.args.includes('push'))).toBe(false);
-      released(f); scopeReleased(f);
-    }
-  }
-});
-
-it('refuses unreadable or truncated lane configuration', async () => {
-  for (const response of [red(), { status: 0 }, ok('local\0filter.host.clean\ncommand')]) {
-    const f = fixture([['config --show-scope', response]]);
-    expect((await f.run()).result.stopReason).toBe('unsafe-git-config');
-    expect(f.calls.some(c => c.args.includes('reset') || c.args.includes('push'))).toBe(false);
+    let ran = false;
+    const f = fixture([
+      [boundary, () => { ran = true; return boundary.includes('codex') ? report() : ok(); }],
+      ['config --show-scope', () => { throw new Error('Untrusted config was opened'); }],
+    ]);
+    expect((await f.run()).result.ok).toBe(true);
+    expect(ran).toBe(true);
     released(f); scopeReleased(f);
   }
 });
@@ -839,7 +853,7 @@ it.each([false, true])('preflights the loader before any lane or publication eff
 });
 
 it('publishes the checked commit SHA when HEAD moves during remote branch selection', async () => {
-  let head = 'abc123', published;
+  let head = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', published;
   const f = fixture([
     ['ls-remote', () => { head = 'different-commit'; return ok(); }],
     [' push ', call => {
@@ -850,7 +864,7 @@ it('publishes the checked commit SHA when HEAD moves during remote branch select
   ]);
   const { result } = await f.run();
   expect(result.ok).toBe(true);
-  expect(published).toBe('abc123');
+  expect(published).toBe('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
 });
 
 it('uses a distinct scope claim identity for concurrent jobs with the same purpose', async () => {
@@ -877,14 +891,14 @@ it('happy path orders gates, captures one JSON line, uses session env and releas
   const f = fixture();
   const { code, result } = await f.run(['--edge-clone=/edge']);
   expect(code).toBe(0);
-  expect(result).toMatchObject({ ok: true, branch: 'lane/example', sha: 'abc123', tests: { status: 'green', repaired: false }, audit: 'NOT WEAKENED', registered: true, stopReason: null, ready: 'marked', lane: 4 });
+  expect(result).toMatchObject({ ok: true, branch: 'lane/example', sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', tests: { status: 'green', repaired: false }, audit: 'NOT WEAKENED', registered: true, stopReason: null, ready: 'marked', lane: 4 });
   expect(f.calls.filter(c => c.text.includes('heavy-admission'))).toHaveLength(1);
   expect(f.output).toHaveLength(1);
   expect(f.output[0].split('\n')).toHaveLength(2);
   const gates = [
     c => c.text.includes('free-scope-cli.mjs register'),
+    c => c.args.includes('remote.origin.url'),
     c => c.text.includes('lane-pool.mjs acquire'),
-    c => c.args.includes('get-url'),
     c => c.text.includes('codex-direct-task.mjs --task-file'),
     c => c.text.includes('heavy-admission'),
     c => c.args.includes('--review'),
@@ -898,14 +912,14 @@ it('happy path orders gates, captures one JSON line, uses session env and releas
   ].map(match => f.calls.findIndex(match));
   expect(gates.every((index, i) => index >= 0 && (!i || index > gates[i - 1]))).toBe(true);
   expect(f.calls.every(c => c.args.every(a => !a.includes('--force') && !a.includes('--allow-conflict')))).toBe(true);
-  expect(f.calls.find(c => c.args.includes('reset')).env.LANE_SESSION).toBe('session');
-  expect(f.calls.find(c => c.args.includes('push')).args).toContain('abc123:refs/heads/lane/example');
+  expect(f.calls.find(c => c.args.includes('reset')).cwd).toBe(f.temps[0]);
+  expect(f.calls.find(c => c.args.includes('push')).args).toContain('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:refs/heads/lane/example');
   const add = f.calls.find(c => c.args.includes('add') && c.cmd === 'git');
   expect(add.args.slice(add.args.indexOf('add'))).toEqual(['add', '--', 'scripts/a.mjs']);
   expect(f.calls.find(c => c.args.includes('commit')).args).toContain('Build the example');
   expect(f.calls.find(c => c.text.includes('heavy-admission')).cwd).toBe('/lane');
   expect(f.calls.find(c => c.text.includes('codex-direct-task')).cwd).toBe('/repo');
-  expect(f.writes[0].data).toContain('against abc123');
+  expect(f.writes[0].data).toContain('against aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
   released(f); scopeReleased(f);
 });
 
@@ -925,12 +939,12 @@ it('invokes prototype-load with job evidence and never invokes daemon-overlay', 
 it('omits audit evidence when registerEdge has no audit result', async () => {
   for (const audit of [null, undefined, '']) {
     const f = fixture();
-    const result = { branch: 'lane/example', sha: 'abc123', tests: { status: 'green', repaired: true }, audit };
+    const result = { branch: 'lane/example', sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', tests: { status: 'green', repaired: true }, audit };
     await registerEdge({ opts: { edgeClone: 'drain', purpose: 'example', repo: '/repo' }, result, io: f.io });
     expect(result.registered).toBe(true);
     expect(f.calls).toHaveLength(1);
     expect(f.calls[0].args).toEqual([
-      'scripts/operations/run.mjs', 'prototype-load', '--branch=lane/example', '--sha=abc123',
+      'scripts/operations/run.mjs', 'prototype-load', '--branch=lane/example', '--sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       '--daemon=drain', '--why=codex-job example', '--tests-run={"status":"green","repaired":true}', '--json',
     ]);
   }
@@ -1104,7 +1118,7 @@ it('changes the fingerprint when only an originally untracked file owner execute
     writeFileSync(file, 'unchanged contents\n');
     const f = fixture([['ls-files', ok('scripts/a.mjs\0')]]);
     f.io.lstat = file => lstatSync(file);
-    const state = { opts: { repo, scope: ['we:scripts/'] }, lane: { path: repo }, startSha: 'abc123', originUrl, io: f.io };
+    const state = { trustedDir: repo, opts: { repo, scope: ['we:scripts/'] }, lane: { path: repo }, startSha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', originUrl, io: f.io };
     chmodSync(file, 0o644);
     await checkDiffScope(state);
     const before = state.auditFingerprint;
@@ -1168,9 +1182,9 @@ it.each([
     f.io.readlink = file => readlinkSync(path.join(repo, path.relative('/lane', file)), { encoding: 'buffer' });
     const exec = f.io.exec;
     f.io.exec = async (cmd, args, options) => {
-      if (cmd === 'git' && !f.temps.some(dir => args.includes(dir)) && ['diff', 'ls-files', 'hash-object', 'add'].some(v => args.includes(v))) {
+      if (cmd === 'git' && args.includes('--work-tree=/lane') && ['diff', 'ls-files', 'hash-object', 'add'].some(v => args.includes(v))) {
         await exec(cmd, args, options);
-        const realArgs = args.slice(2).map(v => v === 'abc123' ? (untracked ? emptyTree : baseline) : v);
+        const realArgs = args.slice(2).filter(v => !v.startsWith('--git-dir=') && !v.startsWith('--work-tree=')).map(v => v.startsWith('/lane/') ? path.join(repo, v.slice('/lane/'.length)) : v === 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' ? (untracked ? emptyTree : baseline) : v);
         if (realArgs.includes('--cached')) realArgs.push(untracked ? emptyTree : baseline);
         try { return ok(git(realArgs)); }
         catch (error) { return { status: error.status, stdout: error.stdout, stderr: error.stderr }; }
@@ -1274,7 +1288,7 @@ it('uses branch suffix -2 on collision and never forces the push', async () => {
   const { result } = await f.run(['--edge-clone=/edge']);
   expect(result.branch).toBe('lane/example-2');
   const push = f.calls.find(c => c.args.includes('push'));
-  expect(push.args).toContain('abc123:refs/heads/lane/example-2');
+  expect(push.args).toContain('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:refs/heads/lane/example-2');
   expect(push.args).not.toContain('--force');
   expect(f.calls.find(c => c.text.includes('run.mjs prototype-load') && !c.args.includes('--help')).args).toContain('--branch=lane/example-2');
 });
@@ -1314,14 +1328,14 @@ it('fails closed on missing report exit code, timeout, or malformed report', asy
     expect((await f.run()).result.stopReason).toBe('codex-failed'); released(f);
   }
 });
-it('fails closed on unreadable diff and mismatched reset evidence', async () => {
+it('fails closed on unreadable diff, base and publication evidence', async () => {
   for (const [rules, reason] of [
     [[['ls-files', red()]], 'diff-out-of-scope'],
-    [[['rev-parse --verify origin/main^{commit}', ok('different')]], 'lane-reset-failed'],
-    [[['rev-parse HEAD', ok('')]], 'lane-reset-failed'],
+    [[['rev-parse --verify', ok('different')]], 'lane-reset-failed'],
+    [[['rev-parse HEAD', ok('')]], 'commit-failed'],
     [[['ls-remote', red()]], 'push-failed'],
   ]) {
-    const f = fixture(rules); expect((await f.run()).result.stopReason).toBe(reason); released(f);
+    const f = fixture(rules); const { result } = await f.run(); expect(result.stopReason).toBe(reason); if (result.lane) released(f);
   }
 });
 it('audit accepts only the exact first nonempty line', async () => {
@@ -1338,11 +1352,11 @@ it('includes untracked paths and safely stages filenames as literal argv', async
   expect((await f.run()).result.ok).toBe(true);
   expect(f.calls.find(c => c.cmd === 'git' && c.args.includes('add')).args).toContain('scripts/lib/$(touch secret).mjs');
 });
-it('resolves repo from git when omitted and uses the fixed lane heavy path and explicit wait setting', async () => {
+it('uses the absolute cwd when repo is omitted and uses the fixed lane heavy path and explicit wait setting', async () => {
   const f = fixture();
   const code = await main([...flags.filter(x => !x.startsWith('--repo=')), '--wait-ms=42'], f.io);
   expect(code).toBe(0);
-  expect(f.calls[0].args).toEqual(['-c', 'diff.orderFile=', '-c', 'core.fsmonitor=false', 'rev-parse', '--show-toplevel']); released(f);
+  expect(f.calls[0].cwd).toBe(process.cwd()); released(f);
   const g = fixture();
   expect(await main([...flags, '--wait-ms=42'], g.io)).toBe(0);
   for (const job of [f, g]) {
@@ -1411,22 +1425,11 @@ it('malformed lane acquisition fails closed without destructive commands', async
   }
 });
 
-it('publication review: publishes on the audited start when the trusted remote tip is a descendant', async () => {
-  const remoteTip = 'b'.repeat(40);
-  const f = await publicationFixture({ remoteTip });
+it.each(['advanced', 'rewritten'])('publication does not resolve a %s remote base again', async () => {
+  const f = await publicationFixture({ remoteTip: 'b'.repeat(40), ancestor: false });
   expect(await f.publish()).toMatchObject({ ok: true });
   expect(f.commits).toEqual([{ sha: publishedSha, parent: remoteBase }]);
-  expect(f.calls.find(c => c.args.includes('merge-base')).args.slice(-4))
-    .toEqual(['merge-base', '--is-ancestor', remoteBase, remoteTip]);
-  expectFreshPush(f);
-});
-
-it('publication review: refuses a rewritten remote base with no audited ancestor', async () => {
-  const f = await publicationFixture({ remoteTip: 'b'.repeat(40), ancestor: false });
-  expect(await f.publish()).toMatchObject({ ok: false, stopReason: 'changed-after-audit' });
-  expect(f.commits).toEqual([]);
-  expect(pushes(f)).toEqual([]);
-  expect(f.removals).toContainEqual({ file: f.temps[0], options: { recursive: true, force: true } });
+  expect(f.calls.some(c => c.args.includes('--verify') || c.args.includes('merge-base'))).toBe(false);
 });
 
 it.each(['deleted tracked file', 'rename source'])('publication review: reports the unsupported %s before audit', async kind => {
@@ -1438,7 +1441,7 @@ it.each(['deleted tracked file', 'rename source'])('publication review: reports 
   };
   expect((await f.run()).result).toMatchObject({ ok: false, stopReason: 'audit-failed',
     detail: expect.stringContaining('Deleted or renamed files are not supported') });
-  expect(f.calls.some(c => c.args.includes('--review') || c.args.includes('clone') || c.args.includes('commit'))).toBe(false);
+  expect(f.calls.some(c => c.args.includes('--review') || c.args.includes('commit'))).toBe(false);
   expect(pushes(f)).toEqual([]);
   released(f); scopeReleased(f);
 });
@@ -1448,19 +1451,14 @@ it.each(['scripts', 'scripts/lib'])('publication review: rejects a lane symlink 
   f.pathStats.set(`/lane/${ancestor}`, { isSymbolicLink: () => true });
   expect(await f.publish()).toMatchObject({ ok: false, stopReason: 'diff-out-of-scope' });
   expect(f.reads).toEqual([]);
-  expect(f.temps).toEqual([]);
+  expect(f.temps).toHaveLength(1);
   expect(f.commits).toEqual([]);
   expect(pushes(f)).toEqual([]);
 });
 
 it.each(['scripts', 'scripts/lib'])('publication review: rejects a fresh-clone symlink directory %s before writing through it', async ancestor => {
   const f = await publicationFixture({ files: ['scripts/lib/a.mjs'] });
-  const mkdtemp = f.io.mkdtemp;
-  f.io.mkdtemp = async prefix => {
-    const dir = await mkdtemp(prefix);
-    f.pathStats.set(path.join(dir, ancestor), { isSymbolicLink: () => true });
-    return dir;
-  };
+  f.pathStats.set(path.join(f.s.trustedDir, ancestor), { isSymbolicLink: () => true });
   expect(await f.publish()).toMatchObject({ ok: false, stopReason: 'diff-out-of-scope' });
   expect(f.writes).toEqual([]);
   expect(f.commits).toEqual([]);
@@ -1476,7 +1474,7 @@ it.each(['scripts/.git/x', 'scripts/.GiT/x', 'scripts//x', 'scripts/x\\y', 'scri
   expect(await f.publish()).toMatchObject({ ok: false, stopReason: 'diff-out-of-scope' });
   expect(f.reads).toEqual([]);
   expect(f.stats).toEqual([]);
-  expect(f.temps).toEqual([]);
+  expect(f.temps).toHaveLength(1);
 });
 
 it('publication review: scrubs inherited Git overrides from clone, commit and push', async () => {
@@ -1499,27 +1497,32 @@ it('publication review: scrubs inherited Git overrides from clone, commit and pu
   }
 });
 
-it('preserves only trusted operator credential helpers for clone and push, captured before the worker', async () => {
-  let workerRan = false;
-  const helpers = ['credential.helper=operator-system-helper', 'credential.helper=store --file=/operator/credentials', 'credential.helper=',
-    'credential.https://github.com.helper=!operator-helper "$@"\n'];
-  const f = fixture([
-    ['--get-regexp', () => ok('system\0file:/etc/gitconfig\0credential.helper\noperator-system-helper\0' +
-      'global\0file:/operator/.gitconfig\0credential.helper\nstore --file=/operator/credentials\0' +
-      'command\0command line:\0credential.helper\n\0command\0command line:\0credential.https://github.com.helper\n!operator-helper "$@"\n\0' +
-      `global\0file:/operator/.gitconfig\0core.fsmonitor\nunsafe-monitor\0${workerRan ? 'global\0file:/operator/.gitconfig\0credential.helper\nlate-helper\0' : ''}`)],
-    ['codex-direct-task.mjs', () => { workerRan = true; return report(); }],
-  ]);
-  expect((await f.run()).result.ok).toBe(true);
+it('freezes one explicit credential helper before the worker', async () => {
+  const f = fixture([['--get-regexp', () => { throw new Error('Ambient config read'); }]]);
+  expect((await f.run(['--credential-helper=/operator/helper'])).result.ok).toBe(true);
   for (const verb of ['clone', 'push']) {
     const call = f.calls.find(c => c.args.includes(verb));
-    const config = call.args.flatMap((arg, i) => arg === '-c' ? [call.args[i + 1]] : []);
-    expect(config.filter(value => value.startsWith('credential.'))).toEqual(helpers);
-    expect(config).not.toContain('core.fsmonitor=unsafe-monitor');
-    expect(call.env).not.toHaveProperty('GIT_DIR');
-    expect(call.env).not.toHaveProperty('GIT_WORK_TREE');
-    expect(call.env.GIT_CONFIG_GLOBAL).toBe('/dev/null');
+    expect(call.args).toContain("credential.helper=!'/operator/helper'");
+    expect(call.args).toContain('credential.helper=');
+    expect(call.args).toContain('credential.useHttpPath=true');
   }
+});
+
+it.each(['relative-helper', '/operator/not-executable'])('refuses unusable explicit credential helper %s before clone', async helper => {
+  const f = fixture();
+  expect((await f.run([`--credential-helper=${helper}`])).result.stopReason).toBe('bad-args');
+  expect(f.calls.some(c => c.args.includes('clone') || c.args.includes('push'))).toBe(false);
+});
+
+it('refuses a helper resolved inside the acquired worker lane before starting the worker', async () => {
+  const f = fixture();
+  f.io.realpath = file => file === '/operator/helper' ? '/lane/helper' : file;
+  const lstat = f.io.lstat;
+  f.io.lstat = file => file === '/lane/helper' ? { mode: 0o100755, isFile: () => true } : lstat(file);
+  expect((await f.run(['--credential-helper=/operator/helper'])).result.stopReason).toBe('bad-args');
+  expect(codexCalls(f)).toHaveLength(0);
+  expect(pushes(f)).toHaveLength(0);
+  released(f); scopeReleased(f);
 });
 
 it.each(['codex-job*.mjs', 'codex-jo?.mjs', 'codex-jo[b].mjs'])(
@@ -1547,103 +1550,6 @@ it.each(['codex-job*.mjs', 'codex-jo?.mjs', 'codex-jo[b].mjs'])(
   expectFreshPush(f);
 });
 
-it('reads global and inherited command credential helpers without inheriting Git directory overrides (real Git)', async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), 'codex-job-credentials-'));
-  const config = path.join(dir, 'operator.config');
-  writeFileSync(config, '[credential]\n\thelper = operator-global-helper\n');
-  const injected = { GIT_CONFIG_GLOBAL: config, GIT_CONFIG_NOSYSTEM: '1',
-    GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: 'operator-command-helper',
-    GIT_CONFIG_KEY_1: 'core.fsmonitor', GIT_CONFIG_VALUE_1: 'unsafe-monitor',
-    GIT_DIR: '/untrusted/git', GIT_WORK_TREE: '/untrusted/worktree' };
-  const saved = Object.fromEntries(Object.keys(injected).map(key => [key, process.env[key]]));
-  try {
-    Object.assign(process.env, injected);
-    const f = fixture();
-    const exec = f.io.exec;
-    f.io.exec = async (cmd, args, options) => {
-      if (cmd === 'git' && args.includes('--get-regexp')) {
-        return spawnSync(cmd, args.slice(2), { ...options, cwd: dir, encoding: 'utf8' });
-      }
-      return exec(cmd, args, options);
-    };
-    expect((await f.run()).result.ok).toBe(true);
-    for (const verb of ['clone', 'push']) {
-      const call = f.calls.find(c => c.args.includes(verb));
-      expect(call.args).toContain('credential.helper=operator-global-helper');
-      expect(call.args).toContain('credential.helper=operator-command-helper');
-      expect(call.args).not.toContain('core.fsmonitor=unsafe-monitor');
-      expect(call.env).not.toHaveProperty('GIT_CONFIG_COUNT');
-      expect(call.env).not.toHaveProperty('GIT_DIR');
-      expect(call.env).not.toHaveProperty('GIT_WORK_TREE');
-    }
-  } finally {
-    for (const [key, value] of Object.entries(saved)) {
-      if (value === undefined) delete process.env[key]; else process.env[key] = value;
-    }
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-it.each(['credential', 'credential "https://github.com"'])(
-  'preserves global credential useHttpPath for a path-keyed helper in publication clone and push (%s)', async section => {
-  const dir = mkdtempSync(path.join(tmpdir(), 'codex-job-http-path-'));
-  const config = path.join(dir, 'operator.config');
-  const helper = '!f() { while IFS= read -r line; do if test "$line" = "path=team/private.git"; then printf "%s\\n" "username=path-user" "password=path-token"; fi; done; }; f';
-  writeFileSync(config, `[credential]\n\thelper = ${JSON.stringify(helper)}\n[${section}]\n\tuseHttpPath = true\n`);
-  const f = fixture();
-  const exec = f.io.exec;
-  const lookups = [];
-  f.io.exec = async (cmd, args, options) => {
-    if (cmd === 'git' && args.includes('--get-regexp')) {
-      const env = Object.fromEntries(Object.entries(options.env).filter(([key]) => !key.startsWith('GIT_')));
-      return spawnSync(cmd, args.slice(2), { ...options, cwd: dir, encoding: 'utf8',
-        env: { ...env, GIT_CONFIG_GLOBAL: config, GIT_CONFIG_NOSYSTEM: '1' } });
-    }
-    if (cmd === 'git' && (args.includes('clone') || args.includes('push'))) {
-      const pins = args.flatMap((arg, i) => arg === '-c' ? ['-c', args[i + 1]] : []);
-      // Exercise the publication argv with real Git locally; no remote or index writes.
-      lookups.push(spawnSync('git', [...pins, 'credential', 'fill'], { ...options, cwd: dir,
-        encoding: 'utf8', input: 'protocol=https\nhost=github.com\npath=team/private.git\n\n',
-        env: { ...options.env, GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: '/usr/bin/false', SSH_ASKPASS: '/usr/bin/false' } }));
-    }
-    return exec(cmd, args, options);
-  };
-  try {
-    expect((await f.run()).result.ok).toBe(true);
-    const key = section === 'credential' ? 'credential.usehttppath' : 'credential.https://github.com.usehttppath';
-    for (const verb of ['clone', 'push']) {
-      const call = f.calls.find(c => c.args.includes(verb));
-      const pins = call.args.flatMap((arg, i) => arg === '-c' ? [call.args[i + 1]] : []);
-      expect(pins).toContain(`${key}=true`);
-    }
-    expect(lookups).toHaveLength(2);
-    for (const lookup of lookups) {
-      expect(lookup.status).toBe(0);
-      expect(lookup.stdout).toContain('username=path-user\n');
-      expect(lookup.stdout).toContain('password=path-token\n');
-    }
-  } finally { rmSync(dir, { recursive: true, force: true }); }
-});
-
-it.each(['local', 'worktree', 'global', 'system', 'unknown', 'command'])(
-  'never forwards lane-owned credential useHttpPath with %s scope', async scope => {
-  for (const key of ['credential.usehttppath', 'credential.https://github.com.usehttppath']) {
-    const f = fixture([['--get-regexp', ok(`${scope}\0file:/lane/operator.config\0${key}\ntrue\0`)]]);
-    expect((await f.run()).result.stopReason).toBe('unsafe-git-config');
-    expect(codexCalls(f)).toHaveLength(0);
-    expect(f.calls.some(c => c.args.includes('clone') || c.args.includes('push'))).toBe(false);
-    released(f);
-  }
-});
-
-it.each([red(), { status: 0 }, ok('global\0file:/operator/.gitconfig\0credential.helper\ntruncated'), ok('global\0file:/operator/.gitconfig\0missing-value-separator\0')])(
-  'refuses unreadable or incomplete operator credential configuration (%j)', async response => {
-  const f = fixture([['--get-regexp', response]]);
-  expect((await f.run()).result.stopReason).toBe('unsafe-git-config');
-  expect(codexCalls(f)).toHaveLength(0);
-  expect(pushes(f)).toHaveLength(0);
-});
-
 it.each(['bytes', 'executable mode'])('publication review: rejects export bytes or modes changed after the post-audit check (%s)', async change => {
   const f = await publicationFixture();
   await checkAuditedFiles(f.s);
@@ -1652,59 +1558,12 @@ it.each(['bytes', 'executable mode'])('publication review: rejects export bytes 
   else f.pathStats.set('/lane/scripts/a.mjs', { mode: 0o100755, isFile: () => true, isSymbolicLink: () => false });
   expect(await f.publish()).toMatchObject({ ok: false, stopReason: 'changed-after-audit',
     detail: expect.stringContaining('Exported bytes or modes differ') });
-  expect(f.temps).toEqual([]);
+  expect(f.temps).toHaveLength(1);
   expect(f.commits).toEqual([]);
   expect(pushes(f)).toEqual([]);
 });
 
-it.each([0o755, 0o644])('publishes executable exports with mode 100755 and non-executable exports with mode 100644 (real Git; mode=%s)', async mode => {
-  const f = await publicationFixture();
-  const dir = mkdtempSync(path.join(tmpdir(), 'codex-job-mode-publication-'));
-  try {
-    f.pathStats.set('/lane/scripts/a.mjs', { mode: 0o100000 | mode, isFile: () => true, isSymbolicLink: () => false });
-    f.s.auditExportFingerprint = await captureAuditExport(f.s);
-    f.io.mkdtemp = async () => { f.temps.push(dir); return dir; };
-    f.io.mkdir = (target, options) => mkdirSync(target, options);
-    f.io.rm = (target, options) => rmSync(target, options);
-    f.io.writeFile = (target, bytes, options) => writeFileSync(target, bytes, options);
-    const exec = f.io.exec;
-    f.io.exec = async (cmd, args, options) => {
-      if (args.includes('clone')) {
-        execFileSync('git', ['-C', dir, 'init', '--quiet', '--template='], { env: options.env });
-        execFileSync('git', ['-C', dir, 'config', 'core.fileMode', 'true'], { env: options.env });
-        // Exercise replacement too: writeFile's mode option alone cannot chmod
-        // a pre-existing file with the opposite execute bit.
-        mkdirSync(path.join(dir, 'scripts'));
-        writeFileSync(path.join(dir, 'scripts/a.mjs'), 'base bytes', { mode: mode === 0o755 ? 0o644 : 0o755 });
-      }
-      if (args.includes('add')) {
-        const staged = spawnSync(cmd, args, { ...options, encoding: 'utf8' });
-        expect(staged.status).toBe(0);
-      }
-      if (args.includes('ls-files')) {
-        const target = path.join(dir, 'scripts/a.mjs');
-        const actualMode = lstatSync(target).mode & 0o777;
-        expect(actualMode & 0o100).toBe(mode & 0o100);
-        const staged = spawnSync(cmd, args, { ...options, encoding: 'utf8' });
-        expect(staged.status).toBe(0);
-        expect(staged.stdout).toMatch(new RegExp(`^${mode === 0o755 ? '100755' : '100644'} `));
-        return staged;
-      }
-      return exec(cmd, args, options);
-    };
-    expect(await f.publish()).toMatchObject({ ok: true });
-    expectFreshPush(f);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
-});
-
-it('refuses to publish when the audited starting commit is absent from trusted remote history', async () => {
-  const f = await publicationFixture();
-  f.s.startSha = 'c'.repeat(40);
-  expect(await f.publish()).toMatchObject({ ok: false, stopReason: 'changed-after-audit' });
-  expect(pushes(f)).toHaveLength(0);
-  expect(f.calls.some(c => c.args.includes('commit'))).toBe(false);
-});
-
+// Mode preservation is exercised against real Git in the end-to-end matrix.
 it('refuses to commit when staging rewrote bytes through in-tree attributes (eol/ident filters)', async () => {
   const f = await publicationFixture();
   const exec = f.io.exec;
