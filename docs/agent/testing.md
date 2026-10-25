@@ -192,7 +192,13 @@ Regression mapping (one representative assertion per guarantee; names are in the
 - Failed attempts count toward the bound and rotate fairly: **failed valid publications count toward 25 attempts and rotate oldest-first across settlements (mtime=%s)**.
 
 Recovery admission carries the `readRedTeamRecoveryStatus` normalization of a confirmed-dead queued
-`ran`/`resumed` prior into the shared guard before writing its own queued status. A guard
+`ran`/`resumed` prior into the shared guard before writing its own queued status. A confirmed-dead
+queued writer without a resumable prior becomes a finished null-result placeholder, so the planner
+can dispatch fresh only when seat evidence establishes that no pass ran. Live or unknown liveness
+and invalid writer PIDs keep the queued record blocked. Regressions in `review-job-red-team-skip.test.mjs`:
+**accepted code head dispatches fresh after queued fresh recovery crashes before running with no seat or result comment**,
+**queued fresh recovery still skips with %s**, and
+**dead queued fresh recovery cannot dispatch over an existing seat row**. A guard
 refusal that launches no call rolls back admission (removes queued status when no prior exists, or restores the
 prior status/result); only a trusted result already on the head is terminal. Regression:
 **a transient comments-unreadable guard refusal leaves status absent and fresh recovery eligible**

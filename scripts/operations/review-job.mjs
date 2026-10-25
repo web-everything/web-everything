@@ -284,8 +284,8 @@ export function redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode, r
   ];
 }
 
-/** A crashed resume keeps its clean prior result in the queued record. Only a confirmed dead
- * writer can expose that result as finished again; live/unknown liveness still blocks recovery.
+/** A crashed resume keeps its clean prior result; a fresh admission has no run to resume.
+ * Only a confirmed dead writer can expose either as finished; live/unknown liveness blocks recovery.
  * Daemon planning uses this reader, followed by its existing row guards.
  */
 export function readRedTeamRecoveryStatus(input, {
@@ -294,9 +294,10 @@ export function readRedTeamRecoveryStatus(input, {
   const status = readStatus(input);
   const { priorResult, priorComment } = normalizeRedTeamResult(status?.result);
   if (status?.status !== 'queued' || !Number.isInteger(status.pid) || status.pid <= 0
-    || !['ran', 'resumed'].includes(priorResult) || priorComment === 'posted') return status;
+    || priorComment === 'posted') return status;
   const evidence = readEvidence(input);
-  return evidence?.inFlight === false && !evidence.queued ? { ...status, status: 'finished' } : status;
+  if (evidence?.inFlight !== false || evidence.queued) return status;
+  return { ...status, status: 'finished', result: ['ran', 'resumed'].includes(priorResult) ? status.result : null };
 }
 
 // ── THE ARC ────────────────────────────────────────────────────────────────────────────────────────────────────

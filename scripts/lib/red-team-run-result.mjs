@@ -9,10 +9,10 @@ export function reviewOnlyRedTeamResult(result) {
     && !Array.isArray(result.findings) && !result.provider && !result.model;
 }
 
-/** Historical review-job completion strings carry no seat result or comment evidence. */
+/** Empty completions and historical review-job strings carry no seat result or comment evidence. */
 export function redTeamStatusWithoutRun(row) {
   if (row?.status !== 'finished') return false;
-  return row.result === 'ran' || row.result === 'resumed'
+  return row.result === null || row.result === 'ran' || row.result === 'resumed'
     || (row.result?.status === 'resumed'
       && !Array.isArray(row.result.findings) && !row.result.provider && !row.result.model);
 }
