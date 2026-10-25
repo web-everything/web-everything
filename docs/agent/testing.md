@@ -37,7 +37,14 @@ build contains (git ancestry; an unreadable answer still holds), so the repair c
 In tops mode, deferring a pinned base behind its containing overlays requires proof that its exact
 registered tip is already in the running HEAD and in each containing overlay's tip. Missing HEAD,
 non-containment or unreadable ancestry preserves ordinary pin handling. The stack-tops regressions
-cover those closed paths. Registered auto-rebase repairs do not trigger deferral; the mechanism-pinned
+cover those closed paths. Deferral also requires an unresolved conflict at the base's ordinary position against
+the accumulated build. A clean base retains its position: applying it can make a containing top
+merge cleanly even when that top conflicts directly with main because of a newer merge base.
+The clean-base regressions cover explicit and mechanism pins, including a preceding overlay that
+makes the base clean; `pinned-stack-clean-base-order` replays adoption through the daemon soak harness.
+Each conflicting base can be deferred only once; failed tops return it to ordinary pin handling.
+Reviewed edge resolution runs before deferral, and an unreadable merge cannot authorize reordering.
+Registered auto-rebase repairs do not trigger deferral; the mechanism-pinned
 auto-rebase cases preserve the original's conflict/loss decision, repair adoption and loss protection.
 Per-ref JSON sidecars next to the overlay
 list survive ticks; per-ref markers expire after 30 minutes without a heartbeat. Live detached

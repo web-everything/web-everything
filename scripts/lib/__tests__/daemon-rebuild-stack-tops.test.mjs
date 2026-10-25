@@ -438,6 +438,45 @@ describe('held item 212 review round 1 — landed overlays and pinned bases', ()
     expect(plan.alerts.map((a) => a.kind)).not.toContain('established-overlay-dropped');
   });
 
+  it.each([
+    ['flag', false], ['mechanism', false], ['flag', true], ['mechanism', true],
+  ])('a clean %s-pinned base stays before a conflicting top (preceding overlay: %s)', async (pin, prefix) => {
+    const f = fixture();
+    const file = pin === 'flag' ? TAKEOVER : MECH;
+    const start = f.push('lane/start', f.init, { [file]: '0\n', 'g.txt': '0\n' });
+    advanceMain(f, start);
+    const base = f.push('lane/base', start, { [file]: '1\n' });
+    const p = f.push('lane/p', start, { [file]: '2\n' });
+    const main = f.push('lane/reverted-main', p, { [file]: '0\n' });
+    advanceMain(f, prefix ? p : main);
+    const before = prefix ? [{ ref: 'lane/prefix' }] : [];
+    if (prefix) f.push('lane/prefix', main, { 'prefix.txt': 'preceding overlay\n' });
+    f.fetch();
+    const headSha = prefix ? await f.build([...before, { ref: 'lane/base', pinned: true }], f.init) : base;
+    gitOk(f.author, ['checkout', '-q', '-B', 'lane/top', base]);
+    const merge = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'merge', '--no-commit', '--no-ff', p], { cwd: f.author });
+    expect(merge.status).toBe(1);
+    write(f.author, file, '1\n');
+    write(f.author, 'g.txt', '1\n');
+    gitOk(f.author, ['add', '-A']);
+    gitOk(f.author, ['commit', '-q', '-m', 'top resolves base and P']);
+    gitOk(f.author, ['push', '-q', 'origin', 'HEAD:refs/heads/lane/top']);
+    const top = gitOk(f.author, ['rev-parse', 'HEAD']).trim();
+    f.fetch();
+    expect(f.runGit(['merge-tree', '--write-tree', '--no-messages', main, base]).status).toBe(0);
+    expect(f.runGit(['merge-tree', '--write-tree', '--no-messages', main, top]).status).toBe(1);
+    const plan = await planRebuild({
+      git: f.runGit, headSha, mainRef: 'origin/main', stackMode: 'tops', edgeResolve: false,
+      overlays: [...before, { ref: 'lane/base', ...(pin === 'flag' ? { pinned: true } : {}) }, { ref: 'lane/top', pinned: true }],
+    });
+    expect(plan.ok, JSON.stringify(plan)).toBe(true);
+    expect(plan.applied.map((a) => a.ref)).toEqual([...before.map((o) => o.ref), 'lane/base', 'lane/top']);
+    expect(plan.establishedLost).toEqual([]);
+    expect(gitOk(f.clone, ['show', `${plan.finalSha}:${file}`])).toBe('1\n');
+    expect(gitOk(f.clone, ['show', `${plan.finalSha}:g.txt`])).toBe('1\n');
+    for (const sha of [base, top]) expect(isAncestor(f.clone, sha, plan.finalSha)).toBe(true);
+  });
+
   it.each(['tops', 'independent'])('an established unpinned base keeps priority over a conflicting newcomer in %s mode', async (stackMode) => {
     const f = fixture();
     const base = f.push('lane/base', f.init, { [TAKEOVER]: lines({ 2: 'established base' }) });
@@ -508,26 +547,73 @@ describe('held item 212 review round 1 — landed overlays and pinned bases', ()
   it.each([
     ['lane/base', 'lane/newcomer', 'lane/top-a', 'lane/top-b'],
     ['lane/top-a', 'lane/top-b', 'lane/newcomer', 'lane/base'],
-  ])('a pinned base moves immediately after its last containing overlay: %j', async (...refs) => {
+  ])('a clean pinned base preserves its position among containing overlays: %j', async (...refs) => {
     const f = fixture();
     const base = f.push('lane/base', f.init, { [TAKEOVER]: lines({ 2: 'base' }) });
     f.push('lane/newcomer', f.init, { 'newcomer.txt': 'unrelated' });
     f.push('lane/top-a', base, { 'top-a.txt': 'first containing overlay' });
     f.push('lane/top-b', base, { 'top-b.txt': 'last containing overlay' });
     f.fetch();
-    // Establish every listed tip so this ordering-only fixture preserves list order before deferral.
+    // Establish every listed tip so established-first priority preserves this list order.
     const live = await f.build(refs.map((ref) => ({ ref })));
     const plan = await planRebuild({
       git: f.runGit, headSha: live, mainRef: 'origin/main',
       overlays: refs.map((ref) => ({ ref, ...(ref === 'lane/base' ? { pinned: true } : {}) })),
     });
     expect(plan.ok).toBe(true);
-    const expected = refs.filter((ref) => ref !== 'lane/base');
-    expected.splice(expected.indexOf('lane/top-b') + 1, 0, 'lane/base');
-    expect(plan.decisions.map((d) => d.ref)).toEqual(expected);
+    expect(plan.decisions.map((d) => d.ref)).toEqual(refs);
     expect(plan.decisions.find((d) => d.ref === 'lane/base'))
-      .toMatchObject({ action: 'skip', reason: 'pinned-contained-in-applied' });
+      .toMatchObject(refs[0] === 'lane/base'
+        ? { action: 'apply' } : { action: 'skip', reason: 'pinned-contained-in-applied' });
+    expect(isAncestor(f.clone, base, plan.finalSha)).toBe(true);
     expect(plan.decisions.some((d) => d.action === 'remove')).toBe(false);
+  });
+
+  it.each([false, true])('an unresolved pinned base waits after its last container (reviewed edge: %s)', async (reviewedEdge) => {
+    const f = fixture();
+    const base = f.push('lane/base', f.init, { [TAKEOVER]: lines({ 2: 'base' }) });
+    const main = f.push('lane/advanced-main', f.init, { [TAKEOVER]: lines({ 2: 'advanced main' }) });
+    advanceMain(f, main);
+    gitOk(f.author, ['checkout', '-q', '-B', 'lane/top-a', base]);
+    const merge = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'merge', '--no-commit', '--no-ff', main], { cwd: f.author });
+    expect(merge.status).toBe(1);
+    write(f.author, TAKEOVER, lines({ 2: 'consolidated base and main' }));
+    gitOk(f.author, ['add', '-A']);
+    gitOk(f.author, ['commit', '-q', '-m', 'consolidated top']);
+    gitOk(f.author, ['push', '-q', 'origin', 'HEAD:refs/heads/lane/top-a']);
+    const topA = gitOk(f.author, ['rev-parse', 'HEAD']).trim();
+    const topB = f.push('lane/top-b', topA, { 'top-b.txt': 'last container\n' });
+    if (reviewedEdge) gitOk(f.author, ['push', '-q', 'origin', `${topA}:refs/heads/edge/lane/base`]);
+    f.fetch();
+    const plan = await planRebuild({
+      git: f.runGit, headSha: base, mainRef: 'origin/main', edgeResolve: reviewedEdge,
+      overlays: [{ ref: 'lane/base', pinned: true, ...(reviewedEdge ? { edgeResolution: { sha: topA } } : {}) },
+        { ref: 'lane/top-a' }, { ref: 'lane/top-b' }],
+    });
+    expect(plan.ok, JSON.stringify(plan)).toBe(true);
+    expect(plan.decisions.map((d) => d.ref)).toEqual(reviewedEdge
+      ? ['lane/base', 'lane/top-a', 'lane/top-b'] : ['lane/top-a', 'lane/top-b', 'lane/base']);
+    expect(plan.decisions.find((d) => d.ref === 'lane/base')).toMatchObject(reviewedEdge
+      ? { action: 'apply', reason: 'applied-edge-ref' } : { action: 'skip', reason: 'pinned-contained-in-applied' });
+    expect(plan.applied.map((a) => a.ref)).toEqual(reviewedEdge
+      ? ['lane/base', 'lane/top-b'] : ['lane/top-a', 'lane/top-b']);
+    expect(plan.establishedLost).toEqual([]);
+    for (const sha of [base, topA, topB]) expect(isAncestor(f.clone, sha, plan.finalSha)).toBe(true);
+  });
+
+  it('an unreadable base merge cannot authorize deferral', async () => {
+    const f = fixture();
+    const base = f.push('lane/base', f.init, { [TAKEOVER]: lines({ 2: 'base' }) });
+    f.push('lane/top', base, { 'top.txt': 'top\n' });
+    f.fetch();
+    const git = (args, opts) => (args[0] === 'merge-tree' && args[4] === base
+      ? { status: 128, stdout: '', stderr: 'unreadable' } : f.runGit(args, opts));
+    const plan = await planRebuild({
+      git, headSha: base, mainRef: 'origin/main', edgeResolve: false,
+      overlays: [{ ref: 'lane/base', pinned: true }, { ref: 'lane/top', pinned: true }],
+    });
+    expect(plan).toMatchObject({ ok: false, reason: 'pinned-overlay-conflict',
+      detail: { ref: 'lane/base', pinnedBy: 'flag', dropReason: 'merge-tree-failed' } });
   });
 
   it.each(['null', 'absent', 'not-contained', 'unreadable'])('does not defer a pinned base when running-head containment is %s', async (evidence) => {
@@ -571,7 +657,7 @@ describe('held item 212 review round 1 — landed overlays and pinned bases', ()
       overlays: [{ ref: 'lane/mech-base' }, { ref: 'lane/mech-top' }],
     });
     expect(plan.ok, JSON.stringify(plan)).toBe(true);
-    expect(attempted.slice(0, 2)).toEqual([top, base]);
+    expect(attempted.slice(0, baseConflicts ? 3 : 1)).toEqual(baseConflicts ? [base, top, base] : [base]);
     expect(plan.decisions.find((d) => d.ref === 'lane/mech-top'))
       .toMatchObject({ action: 'skip', reason: 'pinned-overlay-conflict-skipped' });
     expect(plan.decisions.find((d) => d.ref === 'lane/mech-base')).toMatchObject(baseConflicts

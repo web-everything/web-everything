@@ -313,7 +313,7 @@ export async function planOverlayStacks({
  * Held item 212 — in `stackMode: 'tops'` (default) stacked overlays are planned as stacks (see {@link planOverlayStacks}):
  * only the tops apply, and a base contained in a top, or a base that moved away from its children, is SKIPPED (stays
  * registered) and comes back on its own only if none of its tops could apply. Exceptions: a PINNED base is never set
- * aside (it is deferred after its last strictly containing tip when established priority permits, then `skip`ped
+ * aside (on conflict it is deferred after its last strictly containing tip when established priority permits, then `skip`ped
  * as `pinned-contained-in-applied` if carried by the applied top, rather than removed as `in-main`), and an overlay
  * already an ancestor of main is not part of any stack.
  * @param {{git:(args:string[], opts?:{env?:object})=>{status:number,stdout:string,stderr:string},
@@ -410,10 +410,10 @@ export async function planRebuild({
   const toProcess = [
     ...listed.filter((o) => establishedRefs.has(o?.ref)), ...listed.filter((o) => !establishedRefs.has(o?.ref)),
   ];
-  // In tops mode only, defer a pinned base whose registered tip is already in the running build
-  // until immediately after its last containing overlay. Missing or unreadable ancestry keeps normal pin handling.
-  // Keep an established base ahead of unrelated newcomers, even if that prevents deferring it to its top.
-  // If no containing overlay applies, the base still goes through ordinary pin protections.
+  // In tops mode only, a conflicting pinned base already in the running build may wait for its containers.
+  // Discover candidates here, but try each base at its normal position first: merging a clean base can change
+  // the merge base for its top and make that top clean too. Containment alone cannot justify reordering it.
+  const deferredContainers = new Map();
   if (stackMode === 'tops' && headSha) {
     const entries = toProcess.map((raw) => ({
       raw, sha: raw?.ref ? verifyRev(git, `refs/remotes/origin/${raw.ref}^{commit}`) : null,
@@ -426,17 +426,7 @@ export async function planRebuild({
       const containers = entries.filter((top) => top.raw?.reason !==`auto-rebase of ${base.raw.ref}`
         && top.sha && top.sha !== base.sha
         && git(['merge-base', '--is-ancestor', base.sha, top.sha]).status === 0);
-      const baseIndex = toProcess.indexOf(base.raw);
-      const lastContainer = Math.max(-1, ...containers.map((top) => toProcess.indexOf(top.raw)));
-      // Moving only the base would otherwise let an intervening newcomer claim its conflicting content first.
-      // Unknown containment also keeps established priority: only proven containers may pass the base.
-      if (establishedRefs.has(base.raw.ref) && lastContainer > baseIndex
-        && toProcess.slice(baseIndex + 1, lastContainer + 1).some((raw) => !establishedRefs.has(raw?.ref)
-          && !containers.some((top) => top.raw === raw))) continue;
-      if (lastContainer >= 0 && lastContainer !== baseIndex - 1) {
-        toProcess.splice(baseIndex, 1);
-        toProcess.splice(lastContainer > baseIndex ? lastContainer : lastContainer + 1, 0, base.raw);
-      }
+      if (containers.length > 0) deferredContainers.set(base.raw, containers.map((top) => top.raw));
     }
   }
   if (mainOnly && overlays.length > 0) {
@@ -527,7 +517,8 @@ export async function planRebuild({
     });
   }
 
-  for (const raw of toProcess) {
+  for (let index = 0; index < toProcess.length; index++) {
+    const raw = toProcess[index];
     const ref = raw?.ref;
     const pr = raw?.pr ?? null;
 
@@ -603,6 +594,20 @@ export async function planRebuild({
       if (edgeResolve) resolution = resolveOverlayConflict({ git, cur, ovSha, ref, approvedEdgeSha: recordedEdgeSha(raw) });
       if (resolution?.ok) tree = resolution.tree;
       else {
+        const containers = deferredContainers.get(raw);
+        deferredContainers.delete(raw); // At most one deferral per base; failed tops keep ordinary pin handling.
+        if (containers) {
+          const lastContainer = Math.max(-1, ...containers.map((top) => toProcess.indexOf(top)));
+          // Only proven containers may cross established priority. Recheck the current order after earlier moves.
+          const blocked = establishedRefs.has(ref) && toProcess.slice(index + 1, lastContainer + 1)
+            .some((entry) => !establishedRefs.has(entry?.ref) && !containers.includes(entry));
+          if (lastContainer > index && !blocked) {
+            toProcess.splice(index, 1);
+            toProcess.splice(lastContainer, 0, raw);
+            index--;
+            continue;
+          }
+        }
         const files = resolution?.files ?? conflictFilesOf(mt.stdout);
         // overlay-pin — a moving branch whose NEW tip conflicts with the stack keeps the head this clone last adopted
         // it at, instead of dropping out of the build (which x9diisp then turns into a whole-clone hold). Only when
