@@ -3502,12 +3502,12 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     expect(calls).toEqual([]);
   });
 
-  it.each(['b'.repeat(40), null])('plain rearm refuses a changed or missing swap-time head before the label write: %s', headRefOid => {
+  it.each(['b'.repeat(40), null])('plain rearm refuses a changed or missing head before any write, leaving no re-arm marker: %s', headRefOid => {
     const { exitCode, calls, payload } = run(['9', '--repo=o/n', `--expect-head=${'a'.repeat(40)}`],
       [REVIEW_LABELS.changes], { freshState: { headRefOid } });
     expect(exitCode).toBe(1);
     expect(payload.error).toContain('live head differs from --expect-head');
-    expect(calls).toEqual(['postComment']);
+    expect(calls).toEqual([]);
   });
 
   it.each(['', 'abcdef0', 'z'.repeat(40), 'a'.repeat(41)])('plain rearm refuses non-40-hex --expect-head=%s', head => {

@@ -1930,13 +1930,16 @@ export function runReviewLabelCli({
   // we:scripts/review-set-label.mjs#runReviewLabelCli — THE SWAP: add the verdict label, remove the stale ones
   // (argv array, no shell). Intersect the decision's removals with the labels the PR ACTUALLY carries so
   // `gh pr edit --remove-label` is never handed an absent label (which errors).
+  // A pinned plain re-arm re-reads the head before EACH write, so a refused pin never leaves a re-arm marker comment behind
+  // (the orphan guard treats a trusted marker after the verdict as "already re-armed").
+  const assertPinnedRearmHead = () => {
+    if (pinnedRearm && onlyIf !== 'missing' && provider.readPrState(repo, pr).headRefOid !== expectedHead) {
+      throw new Error('live head differs from --expect-head');
+    }
+  };
   const applySwap = () => {
     try {
-      if (pinnedRearm && onlyIf !== 'missing') {
-        if (provider.readPrState(repo, pr).headRefOid !== expectedHead) {
-          throw new Error('live head differs from --expect-head');
-        }
-      }
+      assertPinnedRearmHead();
       if (['accepted', 'restamp', 'clear-human'].includes(to)) {
         const fresh = provider.readPrState(repo, pr);
         if (fresh.headRefOid !== headSha && !(to === 'restamp' && newHeadArg && !mandatoryReferralState(fresh.comments).records.length)) throw new Error('head changed before acceptance; hold retained');
@@ -1965,6 +1968,7 @@ export function runReviewLabelCli({
   // (and `reviewed-diff`) marker the #2409 staleness gate reads.
   const postComment = () => {
     try {
+      assertPinnedRearmHead();
       provider.postComment(repo, pr, commentBody);
     } catch (e) {
       fail(ghErr(e, 'gh pr comment failed'), 1);
