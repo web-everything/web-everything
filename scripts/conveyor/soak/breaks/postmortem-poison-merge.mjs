@@ -20,9 +20,11 @@ export async function sameSecondListingScenario() {
   };
   try {
     fs.writeFileSync(cursor,JSON.stringify({cursor:at(500),done:[]}));
-    await runPostmortemPass({repo:'example/repo',dir,now,settings:{value:DEFAULTS},
+    const result = await runPostmortemPass({repo:'example/repo',dir,now,settings:{value:DEFAULTS},
+      listOpen:() => [], // This merged-PR scenario has no open subjects.
       listMerged:(repo,since,until) => listMergedSince(repo,since,until,{gh}),
       collect:(repo,pr) => { reads.push(pr); return {repo,pr,openedAt:at(0),mergedAt:at(600)}; }});
+    if (result.open.incomplete) violations.push('same-second listing left the fixture open phase incomplete');
     const state = JSON.parse(fs.readFileSync(cursor,'utf8'));
     if (reads.join(',') !== '101' || !fs.existsSync(join(dir,'postmortem-example%2Frepo-101.md'))) violations.push('same-second page move lost PR #101');
     if (state.cursor !== now || state.done.join(',') !== '101') violations.push('same-second page move advanced cursor without processing PR #101');
@@ -44,6 +46,7 @@ export async function shiftedListingScenario(moved = 101) {
       .slice((page-1)*100,page*100).map(row => ({...row}));
   };
   const args = {repo:'example/repo',dir,settings:{value:DEFAULTS},
+    listOpen:() => [], // This merged-PR scenario has no open subjects.
     listMerged:(repo,since,until) => listMergedSince(repo,since,until,{gh}),
     collect:(repo,pr) => { reads.push(pr); return {repo,pr,openedAt:at(0),mergedAt:at(600)}; }};
   try {
@@ -52,7 +55,8 @@ export async function shiftedListingScenario(moved = 101) {
     if (error?.message !== 'listing shifted; cursor retained') violations.push('shifted listing did not abort');
     if (fs.readFileSync(cursor,'utf8') !== original) violations.push('shifted listing advanced persisted cursor');
     stable = true;
-    await runPostmortemPass({...args,now:at(702)});
+    const result = await runPostmortemPass({...args,now:at(702)});
+    if (result.open.incomplete) violations.push('stable listing retry left the fixture open phase incomplete');
     if (reads.join(',') !== '101' || !fs.existsSync(join(dir,'postmortem-example%2Frepo-101.md'))) violations.push('stable retry lost PR #101');
     return violations;
   } finally { fs.rmSync(dir,{recursive:true,force:true}); }
@@ -92,6 +96,7 @@ export default {
     const at = minute => new Date(Date.UTC(2026,9,17,0,minute)).toISOString();
     try {
       const args = { repo:'example/repo', dir, settings:{value:DEFAULTS},
+        listOpen:() => [], // This merged-PR scenario has no open subjects.
         listMerged:async (_repo,since) => [2,3].filter(() => at(600) >= since).map(number => ({number,merged_at:at(600)})),
         collect:async (repo,pr) => {
           reads.push(pr);
@@ -100,7 +105,10 @@ export default {
         } };
       let result;
       for (const minute of [700,701,702,730,740]) {
-        try { result = await runPostmortemPass({...args,now:at(minute)}); }
+        try {
+          result = await runPostmortemPass({...args,now:at(minute)});
+          if (result.open.incomplete) violations.push(`fixture open phase incomplete at minute ${minute}`);
+        }
         catch (e) { if (minute >= 730) violations.push(`retry budget did not release window: ${e.message}`); }
         if (minute === 702) {
           const early = JSON.parse(fs.readFileSync(join(dir,'merge-cursor-example%2Frepo.json')));
@@ -115,7 +123,8 @@ export default {
       const cursor = join(dir,'merge-cursor-example%2Frepo.json');
       const state = JSON.parse(fs.readFileSync(cursor)); state.quarantined = [];
       fs.writeFileSync(cursor,JSON.stringify(state)); fail = false;
-      await runPostmortemPass({...args,now:at(741)});
+      const recovered = await runPostmortemPass({...args,now:at(741)});
+      if (recovered.open.incomplete) violations.push('operator recovery left the fixture open phase incomplete');
       if (reads.join(',') !== '2,3,2,2,2,2' || !fs.existsSync(join(dir,'postmortem-example%2Frepo-2.md'))) violations.push('operator quarantine removal did not recover publication');
       violations.push(...await shiftedListingScenario());
       violations.push(...await shiftedListingScenario(1));
