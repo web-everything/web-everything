@@ -681,8 +681,8 @@ function gateActionLines(body) {
  * Every gate decision (per-finding actions, the send-back outcome, the round-cap hand-over) applies only to the result
  * it decides ({@link gateRecordsFor}), so a record for an earlier same-head result never releases a newer one's
  * finding. A carried result also keeps the actions bound to the result it was carried from (the same findings,
- * re-keyed); the newer head's own records win. Operator card actions never carry: only a direct record on the live
- * head releases its named result. An operator ruling releases only what the gate handed over (`held`).
+ * re-keyed); the newer head's own records win. Operator cards require a direct human record on the original
+ * head/result after its cap; carrying that release also requires unchanged cited-line proof for every hop.
  */
 export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, savedResult = null, repo = null, standingRuling = null, operatorRulings, clearanceCoverage = null } = {}) {
   const live = String(head ?? '').toLowerCase();
@@ -714,8 +714,9 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
         const { indices } = line;
         let { action } = line;
         if (action === 'operator-card') {
-          // Operator card releases bind to the exact head/result; verdict carries cannot inherit them.
-          if (!first || r.from || r.gate.result !== want) continue;
+          // Read the original human ruling, never a synthetic restamp of it. The per-finding
+          // carry proof below binds an inherited release to this same result on every hop.
+          if (r.from || r.gate.result !== want) continue;
           if (!r.gate.outcome.startsWith('operator-') || !isHumanOperatorComment(r.c)) continue;
           // Validate ownership when the ruling was posted, not against later handovers or grants.
           // Use the same grant-aware decision as the writer: a pending extension belongs to automation.

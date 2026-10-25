@@ -81,3 +81,10 @@ export function redTeamOwedOnHead({ read, evidence = {}, skipCardOnly = true } =
   if (evidence.attempted) return true;
   return !!evidence.scheduled;
 }
+
+/** Only a verified card-only restamp with no exact-head run can replace missing review evidence. */
+export function restampedCardOnlyRedTeamExemption({ loopPayload, head, realFilesCardOnly = false,
+  inFlight = false, recorded = false, attempted = false, queued = false } = {}) {
+  return realFilesCardOnly === true && !inFlight && !recorded && !attempted && !queued
+    && loopPayload?.findings?.read?.netBasis?.rev?.toLowerCase() !== head?.toLowerCase();
+}

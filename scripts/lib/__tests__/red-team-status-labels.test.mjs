@@ -25,6 +25,24 @@ describe('head-bound red-team operator labels', () => {
     expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [result()] }))
       .toEqual({ add: 'red-team:clear', remove: ['red-team:pending'] });
   });
+  it('uses the caller\'s verified saved result before scheduling evidence', () => {
+    expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [], evidence: { scheduled: true },
+      savedResult: { pr: 42, rev: head, findings: [], recheckIncomplete: false } }))
+      .toEqual({ add: 'red-team:clear', remove: ['red-team:pending'] });
+  });
+  it('an incomplete saved recheck cannot clear pending, even with a finished accept', () => {
+    expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [],
+      evidence: { status: { status: 'finished', result: { foldedVerdict: 'accept' } } },
+      savedResult: { pr: 42, rev: head, findings: [], recheckIncomplete: true } }))
+      .toEqual({ add: null, remove: [] });
+  });
+  it.each([{}, { queued: true }, { recorded: true }, { attempted: true }, { inFlight: true },
+    { loopPayload: { findings: { read: { netBasis: { rev: head } } } } }])(
+    'only a verified card-only restamp without exact-head evidence clears scheduling: %j', extra => {
+      const evidence = { scheduled: true, ...extra };
+      expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [], evidence, realFilesCardOnly: true }))
+        .toEqual(Object.keys(extra).length ? { add: null, remove: [] } : { add: 'red-team:clear', remove: ['red-team:pending'] });
+    });
   it.each(['sent-back', 'round-cap'])('a %s break is blocked', outcome => {
     const gate = { author: { login: 'web-everything' }, body: `<!-- we:red-team-gate pr=42 rev=${head} outcome=${outcome} -->` };
     expect(planRedTeamStatusLabels({ ...input, comments: [result(broken), gate] }).add).toBe('red-team:blocked');

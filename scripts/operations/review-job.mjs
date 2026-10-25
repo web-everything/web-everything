@@ -828,7 +828,11 @@ function attestSavedRedTeam(io, runId, input, redTeam) {
  */
 export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   if (opts.drainRedTeamRequest) return runDrainRedTeamJob(opts, io, planReviewDispatch);
-  const timing = io.redTeamTimingSetting?.() ?? readRedTeamTiming();
+  // Legacy IO ports implement the sequential arc. The production port always supplies the
+  // timing cascade; only ports that expose that capability can opt into the panel lifecycle.
+  const timing = typeof io.redTeamTimingSetting === 'function' ? io.redTeamTimingSetting() ?? readRedTeamTiming() : {
+    value: { timing: 'post-accept' }, sources: { timing: 'legacy-io' }, invalid: [],
+  };
   io.log(`review-job: ${formatCascadeSourcesLine('redTeam', timing)}`);
   const seatsBox = { panelSeat: !opts.redTeamOnly && timing.value.timing === 'panel-seat' };
   // Card xbizuci — `review.speculativeRedTeam` (policy cascade; the layer that set it is logged). Off, or an io
@@ -973,11 +977,14 @@ function completeJobRedTeam({ out, seatsBox, redTeam, io, recordSeats, accepted,
       }
     } else {
       // An unsuccessful effects retry must keep the durable clean pass eligible for recovery.
+      // Normal reviews retain publication evidence in their summary; explicit recovery
+      // keeps main's historical result shape and its separate admission guards.
       const result = guardDeferred && prior ? prior.result
         : seatsBox.priorRedTeamResult != null && !['ran', 'resumed'].includes(out.redTeam?.status)
           ? seatsBox.priorRedTeamResult : out.redTeam?.status === 'skipped'
             ? { status: 'skipped', ...(out.redTeam.policy === 'card-only' ? { policy: 'card-only' } : {}) }
-            : seatsBox.panelSeat ? out.redTeam : out.redTeam?.status ?? null;
+            : out.redTeam?.status === 'disabled' ? 'disabled'
+              : seatsBox.input.redTeamMode === undefined ? out.redTeam : out.redTeam?.status ?? null;
       io.redTeamStatus?.({ ...seatsBox.input, status: guardDeferred && prior ? prior.status : 'finished', result });
     }
   }
@@ -1208,8 +1215,9 @@ function runReviewArc({
       } catch (e) { settled = { result: { status: 'error', reason: tail(e?.message ?? e, 300) } }; }
       const redTeam = settled.result ?? { status: 'error', reason: settled.reason ?? 'panel red-team seat has no result' };
       delete settled.result;
-      completeJobRedTeam({ out: seatOut, seatsBox, redTeam, io, recordSeats: () => {},
-        accepted: panelAccepted, spec: seatsBox.speculative });
+      // A rejected panel discards speculation; it owes no result, settlement or gate.
+      if (panelAccepted) completeJobRedTeam({ out: seatOut, seatsBox, redTeam, io, recordSeats: () => {},
+        accepted: true, spec: seatsBox.speculative });
       seatsBox.panelResult = { redTeam: seatOut.redTeam, redTeamSpeculative: settled,
         ...(seatOut.redTeamGate ? { redTeamGate: seatOut.redTeamGate } : {}) };
       const plan = planRedTeamActions({ findings: (redTeam.findings ?? []).map((f, i) => ({

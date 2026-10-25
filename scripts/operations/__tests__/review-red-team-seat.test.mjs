@@ -28,6 +28,7 @@ function job({ timing = 'panel-seat', verdict = 'accept', speculative = true, fi
     claim: () => ({ ok: true }), updateRecord: () => {}, unclaim: () => {},
     report: row => { reports.push(row); if (row.status === 'done') events.push('done'); },
     acquireLane: () => ({ lanePath: '/lanes/lane-7' }), releaseLane: () => events.push('release'),
+    prepareLane: () => ({ head: HEAD }),
     log: line => events.push(line),
     redTeamTimingSetting: () => ({ value: { timing }, sources: { timing: 'env' }, invalid: [] }),
     speculativeRedTeamSetting: () => ({ value: speculative ? 'on' : 'off', enabled: speculative, source: 'standard', invalid: [] }),

@@ -44,6 +44,7 @@ import { buildRoundExtensionComment } from '../round-extension-mark.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
 import { CI_HEAL_COMMENT_MARKER, buildCiHealComment } from '../ci-heal-mark.mjs';
+import { ciHealOwed } from '../ci-heal-rule.mjs';
 import { buildCiHealEscalationComment } from '../ci-heal-escalation-mark.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
 import {
@@ -1017,6 +1018,17 @@ describe('bounced PR CI repair — real required failures on the fixer head (#57
   const escalation = headSha => ({
     body: buildCiHealEscalationComment({ headSha, outcome: 'needs-human', reason: 'requires human judgment' }),
     author: AUTOMATION,
+  });
+
+  it.each([
+    ['unproven required failure', { bouncedRealRed: false }],
+    ['another phase', { phase: 'ci-red' }],
+    ['closed PR', { state: 'CLOSED' }],
+    ['spent CI-heal budget', { attempts: 3, cap: 3 }],
+    ['pending checks', { ci: 'pending' }],
+  ])('shared CI-heal predicate refuses a bounced exception with %s', (_name, over) => {
+    expect(ciHealOwed({ labels: ['review:changes'], phase: 'bounced', bouncedRealRed: true,
+      ci: 'red', ...over })).toBe(false);
   });
 
   it.each(['test-shard (2)', 'test'])('dispatches ci-heal for bounced + required red %s with no escalation', name => {

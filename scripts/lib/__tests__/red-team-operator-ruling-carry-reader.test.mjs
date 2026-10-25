@@ -19,6 +19,8 @@ const result = bot(advisoryBody, '2026-10-21T17:07:55Z');
 const rid = liveResultGateState([result], P, A).resultId;
 const gate = (who, outcome, line, at) => who(`${redTeamGateMarker(P, A, outcome, rid)}\n**Red-team gate** on head \`x\`:\n${line}`, at);
 const ruled = [result, gate(bot, 'sent-back', '- 1 confirmed break(s) sent back to the fixer (#1).', '2026-10-21T17:12:20Z'),
+  // Main requires a grant-aware cap handover before an operator-card release, including on the carried source.
+  gate(bot, 'round-cap', '- 1 confirmed break(s) NOT sent back: cap (#1).', '2026-10-21T20:00:00Z'),
   gate(human, 'operator-card', '- 3 finding(s) carded by the operator to `we:backlog/x.md@pr5502` (#1, #2, #3).', '2026-10-21T20:57:41Z')];
 const carryComment = bot([redTeamGateMarker(P, B, 'sent-back', rid), redTeamGateMarker(P, B, 'operator-card', rid),
   buildVerdictCarriedMarker({ fromSha: A, toSha: B, patchId: 'c'.repeat(40) }), 'Review verdict carried across an identical contribution.',
@@ -35,6 +37,9 @@ describe('operator rulings across a verdict carry (reader)', () => {
   });
   it('rebase-only (cited lines unchanged for all three): the card rulings carry, nothing blocks', () => {
     expect(blocking([...ruled, carryComment, lines([1, 2, 3])])).toEqual([]);
+  });
+  it('cited-line proof cannot carry an operator card without the original cap handover', () => {
+    expect(blocking([...ruled.filter(c => !c.body.includes('outcome=round-cap')), carryComment, lines([1, 2, 3])])).toEqual([1]);
   });
   it('no cited-line record: the gate send-back carries, the operator release does not (#1 blocks)', () => {
     expect(blocking([...ruled, carryComment])).toEqual([1]);

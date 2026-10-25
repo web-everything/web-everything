@@ -481,6 +481,14 @@ first observed by the child, or at its final pre-write read, supersedes the pare
 observation of missing routing, even when no acceptance marker accompanies it.
 
 Queue admission and operator escalation share `red-team-gate.mjs#readRedTeamDisposition`.
+Queue label planning also receives admission's provenance-checked saved result and verified
+card-only restamp proof, so it cannot recreate a pending hold after the evidence clears it.
+An existing head-bound pending record survives queue-read failures and is retired only after
+enqueue succeeds. Its retained pending label counts as synchronized only when the final live
+read observes the published clear label; a failed or stale publication still holds. A label-only
+pending hold requires the full published transition. The drain strategy and status-label suites
+cover those paths. Legacy review-job IO ports without `redTeamTimingSetting` keep the sequential
+arc; production IO always supplies the cascade, including its panel-seat default.
 Read the live head's recorded per-finding gate actions before consulting current policy:
 a card/advisory record releases that finding, while sent-back and round-cap records retain
 only their unresolved findings. Without a recorded per-finding action, a policy send-back
@@ -2496,6 +2504,15 @@ apply; request failures use `redTeamRequestCooldownMin`, and a successful reques
 substitutes for a usable result. The existing review-daemon consumer pins the request
 head and retains its dispatch refusals.
 
+Keep historical red-team completion events distinct from saved findings. An unversioned
+completion event without findings may supersede speculation for the exact repository,
+PR and head, but cannot supply a clean verdict. Post-accept recovery still finishes an
+unversioned seat's effects through validation and the final secret scrub; saved panel
+findings and modern seat reuse require review-job hash attestation. Preserve normal
+kill-switch completion as `finished` / `disabled`. The boundary is exercised by
+`review-red-team.test.mjs`, `review-extra-seats.test.mjs`,
+`review-job-speculative-red-team.test.mjs`, and `review-job-red-team-only.test.mjs`.
+
 Do not assume the drain's DATA clone is fresh: on 2026-10-18 the log selected
 `lane-1 (no-overlays)` while that checkout was 367 commits behind and its sibling CODE
 clone was current. The operator CLI fallback refuses when cwd resolves to that same
@@ -2624,3 +2641,20 @@ re-exported by the hold writer; reconcile imports the leaf. Review-job discovery
 shared `scripts/operations/agent-listing.mjs`, with the dispatch IO re-exporting its existing API.
 The pure clearance predicate lives in `scripts/lib/clearance-binding.mjs` and remains re-exported
 by review escalation. These boundaries keep admission readers out of the writer/dispatch cycles.
+
+Bounced real-red repair must carry `isBouncedRealRed`'s proof into the shared CI-heal
+budget check; a review label alone cannot authorize that exception. Keep the tick's
+default bounce ownership, closed-PR refusal, definitive-red requirement and both repair
+caps. The bounced cases in `reconcile-core.test.mjs` cover these boundaries.
+Speculative red-team supersession uses the same saved-result provenance check as
+prior-row resume. An unattested scorecard row cannot discard a completed speculative pass.
+Ordinary saved-row reuse requires that attestation too. Explicit `--resume-only`
+recovery retains its completed-seat contract and never falls through to a model call.
+A trusted published exact-head result can suppress a duplicate call without replaying
+unattested saved findings; `review-red-team.test.mjs` covers both this path and refusal
+to supersede speculation from an unattested row. Normal job status retains the result
+summary; explicit recovery preserves its historical status representation. Panel fixtures
+must supply main's `prepareLane` hook. A rejected panel cancels and discards speculation
+without settlement, status writes or a gate (`review-red-team-seat.test.mjs`).
+Card-group close fixtures must answer the stacked-child listing and reflect a successful
+close in subsequent live reads; those production checks protect children and racing pushes.

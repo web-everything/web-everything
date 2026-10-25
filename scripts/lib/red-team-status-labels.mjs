@@ -1,5 +1,5 @@
 /** Derived operator labels; head-bound scheduling and recorded dispositions remain authoritative. */
-import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
+import { redTeamOwedOnHead, restampedCardOnlyRedTeamExemption } from './review-red-team-policy.mjs';
 import { readRedTeamDisposition, readRedTeamProbes, unknownOperatorOutcomes } from './red-team-gate.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { execFileSync } from 'node:child_process';
@@ -9,13 +9,16 @@ import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 import { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
 export { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
 
-export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence = {}, env = {}, standingRuling = null, clearanceCoverage = null } = {}) {
-  const disposition = readRedTeamDisposition({ comments, pr, head, env, repo, standingRuling, clearanceCoverage });
+export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence = {}, env = {}, standingRuling = null, clearanceCoverage = null,
+  savedResult = null, realFilesCardOnly = false } = {}) {
+  const disposition = readRedTeamDisposition({ comments, pr, head, env, repo, standingRuling, clearanceCoverage, savedResult });
   const verdict = evidence.status?.status === 'finished' ? evidence.status.result?.foldedVerdict : null;
   const finished = verdict === 'changes' ? 'red-team:blocked' : verdict === 'accept' ? 'red-team:clear' : null;
   const desired = disposition.sendBack.length || disposition.held.length ? 'red-team:blocked'
+    : disposition.result?.recheckIncomplete ? 'red-team:pending'
     : disposition.result ? 'red-team:clear'
       : finished ? finished
+      : restampedCardOnlyRedTeamExemption({ ...evidence, head, realFilesCardOnly }) ? 'red-team:clear'
       : redTeamOwedOnHead({ read: evidence.loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly }) ? 'red-team:pending' : null;
   const names = labels.map(l => typeof l === 'string' ? l : l?.name);
   return { add: desired && !names.includes(desired) ? desired : null,
@@ -28,7 +31,7 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
 /** Uses the existing label provider/writer, including the known-label metadata provisioning path. */
 export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = process.env,
   provider = createGhProvider(), log = () => {}, live, comments, dryRun = false, standingRuling, readGrantScope = standingRulingScope, clearanceCoverage,
-  exec = execFileSync } = {}) {
+  exec = execFileSync, savedResult = null, realFilesCardOnly = false } = {}) {
   if (!readRedTeamProbes({ env, log }).value.statusLabels) return { add: null, remove: [] };
   const state = live ?? provider.readPrState(repo, pr);
   if (state.headRefOid !== head) return { add: null, remove: [], skipped: 'head-moved' };
@@ -48,7 +51,8 @@ export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = p
   // checkout), lazily — only when the sha rule fails on a recorded clearance. `null` disables it (sha rule only).
   const coverage = clearanceCoverage !== undefined ? clearanceCoverage
     : (h) => computeClearanceCoverage({ comments: thread, liveHead: h, exec, reviews: () => provider.readPrReviews(repo, pr) });
-  const plan = planRedTeamStatusLabels({ ...state, repo, pr, head, evidence, env, comments: thread, standingRuling: scope, clearanceCoverage: coverage });
+  const plan = planRedTeamStatusLabels({ ...state, repo, pr, head, evidence, env, comments: thread, standingRuling: scope, clearanceCoverage: coverage,
+    savedResult, realFilesCardOnly });
   if (!dryRun && (plan.add || plan.remove.length)) {
     if (plan.add) provider.ensureLabel(repo, plan.add, RED_TEAM_STATUS_LABEL_META[plan.add]);
     provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });

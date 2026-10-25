@@ -1489,6 +1489,20 @@ describe('red-team wait deadline never merges without a result (redTeam.deadline
     expect(enqueuedAny(h)).toBe(false);
   });
 
+  it('a durable pending record cannot credit a clearance write absent from the final live labels', () => {
+    const labelProvider = { ensureLabel: vi.fn(), setLabels: vi.fn() };
+    const h = harness({ strategy: 'github-merge-queue', labels: [...ACCEPTED, 'red-team:pending'],
+      liveComments: [clean], labelProvider, initial: { pending: [], followedUp: [], redTeamPending: {
+        'cwd#5283': { headSha: HEAD, firstPendingAt: 0, retryAt: 0, reason: 'red team pending' },
+      } } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD, { comments: [clean] })).toMatchObject({
+      enqueued: false, kind: 'red-team-pending', reason: 'state is red-team:pending',
+    });
+    expect(labelProvider.setLabels).toHaveBeenCalledWith(LOCAL, 5283, { add: 'red-team:clear', remove: [] });
+    expect(h.state().redTeamPending['cwd#5283']).toMatchObject({ headSha: HEAD });
+    expect(enqueuedAny(h)).toBe(false);
+  });
+
   it('a result for a DIFFERENT head never releases the hold', () => {
     const { h, clock } = pastDeadline();
     h.s.enqueue({ num: 5283 }, HEAD, { comments: [] });
@@ -2220,6 +2234,11 @@ describe('live queue file-overlap admission', () => {
     const pendingState = () => ({ pending: [], followedUp: [], redTeamPending: {
       'cwd#42': { headSha: HEAD, firstPendingAt: 0, retryAt: 0, commentCount: 0, checkedAt: 0, reason: 'red team pending' } } });
     const evidence = { scheduled: false, inFlight: false, recorded: false, attempted: false, loopPayload: { verdict: { verdict: 'accept' } } };
+    // Main preserves label-only pending holds. A real result must clear red-team admission
+    // before these cases can exercise queue IO; cleanup still waits for a successful enqueue.
+    const liveComments = [{ author: { login: 'web-everything[bot]' }, body: renderRedTeamComment({
+      pr: 42, rev: HEAD, findings: [], recheckStatus: 'ok',
+    }) }];
     const enqueueCalled = h => h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')));
     const pendingRemoved = h => h.calls.some(call => call.includes('--remove-label') && call.includes('red-team:pending'));
     it.each([
@@ -2227,7 +2246,7 @@ describe('live queue file-overlap admission', () => {
       ['queue response malformed', { queueFacts: { data: { repository: { mergeQueue: { entries: { pageInfo: { hasNextPage: false } } } } } } }, 'unreadable merge queue'],
       ['queue read throws an empty message', { onView: { 43: () => { throw new Error(''); } } }, 'queue read error'],
     ])('%s: holds with queue-read-failed, keeps red-team:pending and its pending record', (_name, over, detail) => {
-      const h = setup({ ...over, labels, evidence, initial: pendingState() });
+      const h = setup({ ...over, labels, evidence, liveComments, initial: pendingState() });
       const result = h.s.enqueue(candidate, HEAD, { comments: stampedBy(DRAIN) });
       expect(result).toMatchObject({ enqueued: false, deferred: true, kind: 'queue-read-failed' });
       expect(result.reason).toContain(detail);
@@ -2237,7 +2256,7 @@ describe('live queue file-overlap admission', () => {
       expect(h.logs.join('')).toContain('holding #42 (queue-read-failed), retried next pass');
     });
     it('control: a successful read enqueues, then drops red-team:pending and the pending record', () => {
-      const h = setup({ ghView: { 43: { files: [{ path: 'scripts/other.mjs' }] } }, labels, evidence, initial: pendingState() });
+      const h = setup({ ghView: { 43: { files: [{ path: 'scripts/other.mjs' }] } }, labels, evidence, liveComments, initial: pendingState() });
       expect(h.s.enqueue(candidate, HEAD, { comments: stampedBy(DRAIN) })).toMatchObject({ enqueued: true });
       expect(enqueueCalled(h)).toBe(true);
       expect(pendingRemoved(h)).toBe(true);

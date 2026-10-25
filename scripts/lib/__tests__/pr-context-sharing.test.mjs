@@ -88,6 +88,10 @@ it('the context CLI shares complete threads with fixers', async () => {
   const { readPrContextCli } = await import('../../pr-context.mjs');
   const dir = temp(); let views = 0, threads = 0;
   const exec = args => {
+    // Main's complete-thread reader independently verifies the paginated REST count.
+    if (args[0] === 'api' && args[1] === 'graphql') return JSON.stringify({
+      data: { repository: { pullRequest: { comments: { totalCount: 1 } } } },
+    });
     if (args[0] === 'api') { threads++; return 'note\t2026-01-01T00:00:00Z\towner\tIC_7\thttps://example.com'; }
     views++; return JSON.stringify(value(head));
   };

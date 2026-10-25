@@ -924,7 +924,11 @@ it('keeps distinct per-seat policy models in separate calls and reserves both un
 
 
 describe('speculative red-team supersession provenance', () => {
-  it.each(['missing', 'mismatched', 'valid'])('supersedes only with valid prior provenance (%s)', async proof => {
+  it.each([
+    { name: 'an unattested matching row cannot supersede a completed speculative pass', proof: 'missing' },
+    { name: 'a matching row with mismatched attestation cannot supersede a completed speculative pass', proof: 'mismatched' },
+    { name: 'an attested matching row supersedes a completed speculative pass without writing new evidence', proof: 'valid' },
+  ])('finishSpeculativeRedTeam: $name', async ({ proof }) => {
     const root = mkdtempSync(join(tmpdir(), 'extra-seats-supersession-'));
     try {
       const env = { CONVEYOR_STATE_ROOT: root, OPERATION_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_TIMING: 'post-accept' };
@@ -942,10 +946,20 @@ describe('speculative red-team supersession provenance', () => {
         callId: 'fresh-call', provider: 'codex', model: 'm', call: { status: 'ok' },
         parsed: { [RED_TEAM_SEAT.key]: { ok: true, verdict: 'accept', findings: [] } },
         findings: [], recheckStatus: 'not-needed', evidence: {}, quota: {}, startedAt: NOW, finishedAt: NOW };
-      const { io, rows } = fakeSeatIo({ readRecords: () => records });
+      const { io, rows, calls } = fakeSeatIo({ readRecords: () => records });
       const result = await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload, pass, env, post: false }, io);
       expect(result.status).toBe(proof === 'valid' ? 'superseded' : 'ran');
-      if (proof !== 'valid') expect(rows.some(row => row.callId === 'fresh-call')).toBe(true);
+      if (proof !== 'valid') {
+        expect(rows.some(row => row.callId === 'fresh-call')).toBe(true);
+        expect(result).toMatchObject({ callId: 'fresh-call', rev, foldedVerdict: 'accept', rowsWritten: 1 });
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({ dispatchKind: 'review-seat', seat: 'red-team',
+          repo: REPO, pr: 5, rev, callId: 'fresh-call', status: 'ok' });
+      } else {
+        expect(result.reason).toContain('landed meanwhile');
+        expect(rows).toEqual([]);
+      }
+      expect(calls.filter(([kind]) => kind === 'reserve' || kind === 'seat')).toEqual([]);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });

@@ -3238,7 +3238,7 @@ export function planReconcile({
       const refunded = healBudget.windowRefunded;
       const healFacts = { failingRequiredChecks: failing.required, nonRequiredRed: failing.nonRequired, ciHealBudget: healBudget.log };
       const refund = refunded > 0 ? { refunded } : {};
-      if (!ciHealOwed({ state: pr.state, labels: pr.labels, ci: check.state, phase, attempts: ciHealAttempts, cap: ciHealCap })) {
+      if (!ciHealOwed({ state: pr.state, labels: pr.labels, ci: check.state, phase, bouncedRealRed, attempts: ciHealAttempts, cap: ciHealCap })) {
         refuse('cap-exhausted', {
           ...withPhase, ...refund, ...healFacts, attempts: ciHealAttempts, cap: ciHealCap,
           why: `the PR's own durable CI-heal count is ${ciHealAttempts} against a cap of ${ciHealCap} — auto-heal is exhausted here and a person must take it`,

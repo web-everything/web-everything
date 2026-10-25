@@ -2,7 +2,8 @@ import { listAgentsWithReviewJobs } from '../operations/review-job-store.mjs';
 import { resolveRunsDirReadOnly } from '../operations/run-store.mjs';
 import { mintSessionSlug } from '../conveyor/session-slug.mjs';
 import { repoKeyForSlug } from './constellation-repos.mjs';
-import { readRedTeamProbes } from './red-team-gate.mjs';
+import { readRedTeamProbes, redTeamForHead } from './red-team-gate.mjs';
+import { savedRedTeamFallback } from './drain-saved-red-team.mjs';
 import { redTeamPanelSeatOwed, redTeamOwedOnHead, redTeamOwedFor, redTeamOwedForAcceptedPr } from './review-red-team-policy.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
@@ -552,8 +553,8 @@ export function createDrainMergeStrategy({
   };
   // Preserve producer evidence (including skipCardOnly) and request state for every admission reason.
   // PR #5758: every red-team hold read credits the verified standing-ruling scope, exactly as the gate does.
-  const enqueueRedTeamReason = (c, headSha, evidence, comments, requestPending, standingRuling = grantScopeFor(c, headSha, comments)) => redTeamEnqueueHold({
-    ...evidence, realFilesCardOnly: restampCardOnly(c, headSha, evidence), requestPending, comments, repo: slugOf(c.repo), pr: c.num, head: headSha, env, standingRuling,
+  const enqueueRedTeamReason = (c, headSha, evidence, comments, requestPending, standingRuling = grantScopeFor(c, headSha, comments), realFilesCardOnly = restampCardOnly(c, headSha, evidence)) => redTeamEnqueueHold({
+    ...evidence, realFilesCardOnly, requestPending, comments, repo: slugOf(c.repo), pr: c.num, head: headSha, env, standingRuling,
     clearanceCoverage: coverageFor(c, comments),
   });
   const reserveRedTeamReason = (c, headSha, live) => {
@@ -863,6 +864,7 @@ export function createDrainMergeStrategy({
       }
       let admissionLabels = queueLabels(live.labels);
       let deadlineOverride = false;
+      let retainedPendingClearance = false;
       // Head-bound file preparation is reusable; authorization evidence is always live.
       let syncLabelsAfterEnqueue = null;
       if (safety.value.waitForRedTeamBeforeEnqueue) {
@@ -890,10 +892,15 @@ export function createDrainMergeStrategy({
         const pages = readThreadPages(c.repo, c.num);
         if (!Array.isArray(pages) || pages.some(p => !Array.isArray(p))) throw new Error('red-team admission: unreadable complete comments');
         const standingRuling = grantScopeFor(c, headSha, pages.flat());
-        const reason = enqueueRedTeamReason(c, headSha, evidence, pages.flat(), neverScheduled || (sameHead && pending.requestedAt != null), standingRuling);
+        const realFilesCardOnly = restampCardOnly(c, headSha, evidence);
+        const reason = enqueueRedTeamReason(c, headSha, evidence, pages.flat(), neverScheduled || (sameHead && pending.requestedAt != null), standingRuling, realFilesCardOnly);
         try {
+          // Use the same provenance-checked fallback as admission; missing evidence cannot invent clearance.
+          const savedResult = redTeamForHead(pages.flat(), c.num, headSha) ? null
+            : savedRedTeamFallback({ repo: slugOf(c.repo), pr: c.num, head: headSha, env })();
           const statusInput = { repo: slugOf(c.repo), pr: c.num, head: headSha, evidence, env, standingRuling,
-            clearanceCoverage: coverageFor(c, pages.flat()), live, comments: pages.flat(), provider: statusProvider, log: say };
+            clearanceCoverage: coverageFor(c, pages.flat()), live, comments: pages.flat(), provider: statusProvider, log: say,
+            savedResult, realFilesCardOnly };
           const plan = syncRedTeamStatusLabels({ ...statusInput, dryRun: true });
           const syncedLabels = admissionLabels.filter(label => !plan.remove.includes(label));
           if (plan.add) syncedLabels.push(plan.add);
@@ -908,18 +915,26 @@ export function createDrainMergeStrategy({
             if (published.add) publishedLabels.push(published.add);
             // Release pending in this call only after the clear result was successfully published.
             if (publishedLabels.includes('red-team:clear')) admissionLabels = publishedLabels;
-          } else if (!dropsPendingHold) {
+          } else if (!dropsPendingHold && sameHead) {
             // Publish clearance before crediting it, while retaining pending until enqueue succeeds.
             const retainingProvider = Object.create(statusProvider);
             retainingProvider.setLabels = (repo, pr, change) => statusProvider.setLabels(repo, pr, {
               ...change, remove: change.remove.filter(label => label !== 'red-team:pending'),
             });
             syncRedTeamStatusLabels({ ...statusInput, provider: retainingProvider, dryRun });
-            if (syncedLabels.includes('red-team:clear')) admissionLabels = syncedLabels;
+            if (syncedLabels.includes('red-team:clear')) {
+              admissionLabels = syncedLabels;
+              retainedPendingClearance = true;
+            }
             syncLabelsAfterEnqueue = () => {
               try { syncRedTeamStatusLabels({ ...statusInput, dryRun }); }
               catch (e) { say(`red-team status labels #${c.num}: ${firstLine(e)}`); }
             };
+          } else if (!dropsPendingHold) {
+            // A label-only hold has no durable pending record to protect it: publish the whole
+            // transition now, and require the final live read to observe its removal.
+            syncRedTeamStatusLabels({ ...statusInput, dryRun });
+            if (syncedLabels.includes('red-team:clear')) admissionLabels = syncedLabels;
           }
         }
         catch (e) { say(`red-team status labels #${c.num}: ${firstLine(e)}`); }
@@ -1056,7 +1071,10 @@ export function createDrainMergeStrategy({
       }
       const freshHeld = sendBackReason(fresh.labels);
       const freshLabels = queueLabels(fresh.labels);
-      const freshLabelHold = redTeamLabelHoldReason(deadlineOverride
+      // A durable pending record is retired after enqueue. Its retained label is redundant only
+      // when GitHub actually shows the clearance we published; a stale/failed write stays held.
+      const pendingCleared = retainedPendingClearance && freshLabels.includes('red-team:clear');
+      const freshLabelHold = redTeamLabelHoldReason(deadlineOverride || pendingCleared
         ? freshLabels.filter(label => label !== 'red-team:pending') : freshLabels);
       if (freshHeld) {
         removeSentBack(c.repo, c.num, fresh.labels);

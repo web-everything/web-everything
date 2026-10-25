@@ -108,6 +108,19 @@ function fakeIo(over = {}) {
 }
 
 describe('speculative red-team repository isolation', () => {
+  it('an unattested row cannot supersede a completed speculative pass', async () => {
+    const { io, calls, rows } = fakeIo();
+    const loopPayload = payload('accept');
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: loopPayload.findings.read,
+      env: {}, resume: false }, io);
+    expect(pass.status).toBe('speculated');
+    io.readRecords = () => [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND, seat: 'red-team',
+      pr: 5, repo: REPO, rev: REV, status: 'ok', callId: 'unattested-call', findings: [] }];
+    expect((await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload, pass, env: {} }, io)).status).toBe('ran');
+    expect(calls.filter(c => c[0] === 'post')).toHaveLength(1);
+    expect(rows.filter(row => row.dispatchKind === REVIEW_SEAT_DISPATCH_KIND)).toHaveLength(1);
+  });
+
   it.each([REPO, 'other/repo', undefined])('only a clean row from the target repository supersedes a pass: %s', async rowRepo => {
     const { io, calls, rows } = fakeIo();
     const loopPayload = payload('accept');
@@ -217,6 +230,18 @@ describe('x00g3tt — the red team fires on ACCEPT only', () => {
     expect(result.status).toBe('ran');
     expect(again.calls.filter(c => c[0] === 'seat')).toHaveLength(1);
     expect(again.rows.some(row => row.dispatchKind === REVIEW_SEAT_DISPATCH_KIND)).toBe(true);
+  });
+
+  it('a trusted published result prevents a duplicate call without replaying unattested findings', async () => {
+    const first = fakeIo();
+    const result = await runRedTeam({ pr: 5, repo: REPO, loopPayload: payload('accept'), env: {} }, first.io);
+    expect(result.status).toBe('ran');
+    const again = fakeIo({ readRecords: () => first.rows,
+      listComments: () => [{ author: { login: 'web-everything' }, body: result.comment.body }] });
+    expect((await runRedTeam({ pr: 5, repo: REPO, loopPayload: payload('accept'), env: {} }, again.io)).status).toBe('already-ran');
+    expect(again.calls.some(c => ['seat', 'reserve', 'post'].includes(c[0]))).toBe(false);
+    expect(again.rows).toEqual([]);
+    expect(again.trials).toEqual([]);
   });
 
   it('skips a provider under a quota hold and a missing CLI, and says why when none is left', async () => {

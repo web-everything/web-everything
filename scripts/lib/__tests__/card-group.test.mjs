@@ -2073,12 +2073,14 @@ describe('createCardGrouping — claim under the land mutex, close on current he
     git(t.cwd, 'checkout', '-q', 'main');
     writeFileSync(statePath, JSON.stringify({ groups: [{ id: 'g', repo: 'o/r', pr: 77, branch: 'lane/card-group-g', sources: [{ num: 1, headSha: t.a }, { num: 2, headSha: t.b }] }], failed: {} }));
     const heads = { 1: t.a, 2: bNew };
-    const calls = [];
+    const calls = [], closed = new Set();
     const exec = (cmd, args) => {
       calls.push(args.join(' '));
       if (args[0] === 'pr' && args[1] === 'view') return args[2] === '77' ? JSON.stringify({ state: 'MERGED', labels: [] })
-        : JSON.stringify({ state: 'OPEN', isDraft: false, headRefOid: heads[args[2]], headRefName: 'lane/x', baseRefName: 'main', labels: accepted });
-      if (args[0] === 'pr' && ['comment', 'close'].includes(args[1])) return '';
+        : JSON.stringify({ state: closed.has(args[2]) ? 'CLOSED' : 'OPEN', isDraft: false, headRefOid: heads[args[2]], headRefName: 'lane/x', baseRefName: 'main', labels: accepted });
+      if (args[0] === 'pr' && args[1] === 'list') return '[]';
+      if (args[0] === 'pr' && args[1] === 'close') { closed.add(args[2]); return ''; }
+      if (args[0] === 'pr' && args[1] === 'comment') return '';
       throw new Error(`unexpected ${args.join(' ')}`);
     };
     const g = createCardGrouping({ localSlug: 'o/r', cwd: t.cwd, run: runIn(t.cwd, () => mainAfter), exec, statePath, settings, log: { write() {} } });
