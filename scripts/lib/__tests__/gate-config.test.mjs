@@ -14,7 +14,7 @@
  * → merge argv, buildSetLabelArgs → review-clear argv) are gate-deciding and must stay registered as ENGINE
  * tier (escalate + agent-reviewable — they obey the gate the WE child defines, they do not define it).
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -229,6 +229,36 @@ describe('delivery policy trust boundary (#5113 Part A)', () => {
         expect(result.filesRead).toEqual(['config/deliveryPolicyDefaults.ts', 'webeverything.config.json', 'repair-policy.json']);
         for (const file of result.filesRead) expect(isPolicySpecPath(file)).toBe(true);
       } finally { POLICY_SPEC_BASENAMES.delete('repair-policy.json'); }
+    });
+  });
+
+  describe('shipped human-review surfaces', () => {
+    beforeEach(() => vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', undefined));
+    afterEach(() => vi.unstubAllEnvs());
+
+    it.each([
+      'webeverything.config.json',
+      'config/deliveryPolicyDefaults.ts',
+      'packages/project/webeverything.config.json',
+      'packages/project/config/deliveryPolicyDefaults.ts',
+      './webeverything.config.json',
+      'config\\deliveryPolicyDefaults.ts',
+    ])('%s requires human review with shipped settings and explicit presets', (path) => {
+      const edit = path.endsWith('.json')
+        ? '-{}\n+{"mergeGate":{"onMainRed":"off"}}'
+        : "-    onMainRed: 'halt',\n+    onMainRed: 'off',";
+      const diffHunks = `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n${edit}\n`;
+      for (const humanSurfaces of [undefined, 'narrow', 'broad']) {
+        for (const hunks of [diffHunks, null]) {
+          for (const basis of [{ changedFiles: [path] }, { changedFiles: ['README.md'], humanBasisFiles: [path] }]) {
+            const score = scoreEscalation({ ...basis, diffHunks: hunks, humanSurfaces });
+            if (humanSurfaces === undefined) expect(score.humanSurfaces.preset).toBe('narrow');
+            expect(score.humanRequired, `${path}, preset=${humanSurfaces ?? 'shipped'}, hunks=${hunks !== null}`).toBe(true);
+            expect(producerReviewLabel(score)).toBe('review:human');
+            expect(score.signals.permissionChange).toContain(path);
+          }
+        }
+      }
     });
   });
 

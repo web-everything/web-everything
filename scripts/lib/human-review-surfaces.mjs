@@ -49,6 +49,10 @@ const isTest = p => /(^|\/)(__tests__|__fixtures__)\/|\.(test|spec)\.[^/]+$/.tes
 const pathOf = p => normalizeGatePath(p);
 export const isWorkflowSurface = file => GATE_PATH_PREFIXES.some(prefix => pathOf(file).startsWith(prefix));
 export const PROTECTION_PATHS = Object.freeze([
+  // Delivery protections (#5113) must remain human-gated under the shipped narrow preset.
+  // Match basenames so the protection travels with the policy/spec trust-chain registrations.
+  /(^|\/)webeverything\.config\.json$/,
+  /(^|\/)deliverypolicydefaults\.ts$/,
   /(^|\/)codeowners$/, // Review ownership.
   /^\.github\/rulesets?\//, // GitHub ruleset data.
   /^\.github\/(settings|branch-protection[^/]*)(?:\.|\/|$)/, // Repository protection settings.
