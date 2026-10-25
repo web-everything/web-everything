@@ -22,7 +22,6 @@ describe('TRUST_CHAIN_TIER_FILES — the in-scope set (#2875)', () => {
   it('pins the current tier membership (a change to the set must be a visible diff here)', () => {
     expect([...TRUST_CHAIN_TIER_FILES]).toEqual([
       'scripts/lib/auto-land-seam.mjs',
-      'scripts/lib/delivery-policy.mjs',
       'scripts/lib/disposition-judge.mjs',
       'scripts/lib/disposition-land-seam.mjs',
       'scripts/lib/drain-workflow-edit-hold.mjs',

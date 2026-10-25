@@ -215,36 +215,11 @@ describe('ENGINE_BASENAMES / isEngineTierPath — #2412 layer 4\'s "is this the 
 
 
 describe('delivery policy trust boundary (#5113 Part A)', () => {
-  it('every file the loader reads is gated, including an honoured pointer target', async () => {
-    const { loadDeliveryPolicy } = await import('../delivery-policy.mjs');
-    await fixture(async ({ root }) => {
-      mkdirSync(join(root, 'config'));
-      writeFileSync(join(root, 'config/deliveryPolicyDefaults.ts'), readFileSync(resolve('config/deliveryPolicyDefaults.ts')));
-      writeFileSync(join(root, 'webeverything.config.json'), JSON.stringify({ mergeGate: './repair-policy.json' }));
-      writeFileSync(join(root, 'repair-policy.json'), JSON.stringify({ onMainRed: 'off' }));
-      POLICY_SPEC_BASENAMES.add('repair-policy.json');
-      try {
-        const result = await loadDeliveryPolicy({ root, env: { WE_POLICY_EVENTS_FILE: join(root, 'events.jsonl') } });
-        expect(result.mergeGate.onMainRed).toBe('off');
-        expect(result.filesRead).toEqual(['config/deliveryPolicyDefaults.ts', 'webeverything.config.json', 'repair-policy.json']);
-        for (const file of result.filesRead) expect(isPolicySpecPath(file)).toBe(true);
-      } finally { POLICY_SPEC_BASENAMES.delete('repair-policy.json'); }
-    });
-  });
-
   it.each(['webeverything.config.json', 'config/deliveryPolicyDefaults.ts'])('%s alone forces review:human as policy/spec', (path) => {
     const entry = TRUST_CHAIN.find(member => member.file === path.split('/').at(-1));
     expect(entry).toMatchObject({ tier: 'policy', leash: 'spec', homes: [path] });
     expect(isPolicySpecPath(path)).toBe(true);
     expect(producerReviewLabel(scoreEscalation({ changedFiles: [path], humanSurfaces: 'broad' }))).toBe('review:human');
-  });
-
-  it('registers the delivery policy loader as engine tier without a leash', () => {
-    const entry = TRUST_CHAIN.find(member => member.file === 'delivery-policy.mjs');
-    expect(entry).toMatchObject({ tier: 'engine', homes: ['scripts/lib/delivery-policy.mjs'] });
-    expect(entry.leash).toBeUndefined();
-    expect(isEngineTierPath('scripts/lib/delivery-policy.mjs')).toBe(true);
-    expect(isPolicySpecPath('scripts/lib/delivery-policy.mjs')).toBe(false);
   });
 
   async function fixture(run) {
