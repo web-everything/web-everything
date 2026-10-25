@@ -24,7 +24,7 @@ export default {
       const hold = /export function redTeamLabelHoldReason\b[^}]*?const hold\s*=\s*\[([^\]]*)\]/.exec(source)?.[1] ?? '';
       const labels = readFileSync(join(root, 'scripts/lib/red-team-status-labels.mjs'), 'utf8');
       return /['"]red-team:blocked['"]/.test(hold) && /['"]red-team:pending['"]/.test(hold)
-        && /l === 'red-team:pending' && desired === null/.test(labels);
+        && /desired === null && \(l === 'red-team:pending'/.test(labels);
     } catch { return false; }
   },
   async run({ sourceRoot = ROOT, log } = {}) {

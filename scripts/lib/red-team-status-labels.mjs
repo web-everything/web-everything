@@ -17,10 +17,10 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
       : redTeamOwedOnHead({ read: evidence.loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly }) ? 'red-team:pending' : null;
   const names = labels.map(l => typeof l === 'string' ? l : l?.name);
   return { add: desired && !names.includes(desired) ? desired : null,
-    // With nothing owed and no result (`desired` null) the pending label is a hold we must not drop: only a clear
-    // or blocked outcome replaces it.
+    // With nothing owed and no result (`desired` null) a hold label (pending or blocked) must not be dropped on
+    // unreadable or missing local evidence: only a recorded outcome replaces it.
     remove: names.filter(l => RED_TEAM_STATUS_LABELS.includes(l) && l !== desired
-      && !(l === 'red-team:pending' && desired === null)) };
+      && !(desired === null && (l === 'red-team:pending' || l === 'red-team:blocked'))) };
 }
 
 /** Uses the existing label provider/writer, including the known-label metadata provisioning path. */
