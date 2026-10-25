@@ -14,18 +14,20 @@ const NOW = Date.parse('2026-10-25T17:03:10Z');
 
 export default {
   id: 'await-verify-no-op-self-review',
-  title: 'a no-op early push retains self-review holds and rechecks deferred hand-back',
+  title: 'a no-op early push retains self-review holds and observes verification during push and deferred hand-back',
   card: 'PR #5919, send-back x1b8hlo item 1',
   fixedBy: { sha: 'HEAD', where: 'lane/port-1023a-b', paths: [PASS] },
   fixPresent(root) {
     const source = readFileSync(join(root, PASS), 'utf8');
     return source.includes("['green', 'no-new-commit'].includes(record.pendingResume?.kind)")
       && source.includes('dir: selfReviewStoreDir(env), strict: true')
-      && source.includes('if (pendingNoOp)');
+      && source.includes('if (pendingNoOp)')
+      && source.includes('lane: currentLane');
   },
   async run({ log } = {}) {
     const violations = [];
-    for (const deferred of ['paused', 'busy', 'failed']) {
+    for (const deferred of ['paused', 'busy', 'failed', 'during-push', 'during-rerequest']) {
+      const duringPush = deferred.startsWith('during-');
       const record = { v: 1, sessionId: 'fix-5919-deferred', who: 'fix-5919', repo: CONSTELLATION_REPOS.we.slug,
         pr: 5919, kind: 'fix', sha: SHA, lane: '/lanes/lane-2', ref: 'lane/port-1023a-b', attempt: 1,
         requestedAt: new Date(NOW).toISOString() };
@@ -39,10 +41,10 @@ export default {
         writeRecord: r => { store.set(r.sessionId, r); return { ok: true }; },
         clearRecord: key => { store.delete(key); },
         laneState: () => ({ head: SHA, dirty: false, treeHash: TREE }),
-        readMarker: () => ({ sha: SHA, status: delayed ? 'running' : 'red', exitCode: delayed ? null : 1,
+        readMarker: () => delayed && deferred === 'during-rerequest' ? null : ({ sha: SHA, status: delayed ? 'running' : 'red', exitCode: delayed ? null : 1,
           treeHash: TREE, startedAt: record.requestedAt, failureDetails: { summary: 'deferred verification failed' } }),
         readSelfReview: () => null,
-        push: () => { pushes++; return { ok: true, upToDate: true }; },
+        push: () => { pushes++; if (duringPush) delayed = false; return { ok: true, upToDate: true }; },
         rerequest: () => { violations.push(`${deferred}: unexpectedly re-requested verify`); },
         listSessions: () => [{ sessionId: record.sessionId, name: record.who,
           status: delayed && deferred === 'busy' ? 'running' : 'idle' }],
@@ -54,7 +56,7 @@ export default {
       const tick = allowResume => runAwaitVerifyPass({ io, allowResume, nowMs: NOW + 30_000,
         ttlMs: 150 * 60_000, loggedPolicyLine: { value: null }, resumedUnclearable: new Set() });
       await tick(deferred !== 'paused');
-      if (store.get(record.sessionId)?.pendingResume?.kind !== 'no-new-commit' || prompts.length) {
+      if (!duringPush && (store.get(record.sessionId)?.pendingResume?.kind !== 'no-new-commit' || prompts.length)) {
         violations.push(`${deferred}: no-op resume was not deferred`);
       }
       delayed = false;

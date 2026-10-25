@@ -138,6 +138,59 @@ describe('push-before-gate: the early push', () => {
     await pass(h);
     expect(h.calls.resume).toHaveLength(1);
   });
+  it.each(['wait', 'rerequest'])('delivers red arriving during a no-op push from %s', async (action) => {
+    const h = harness();
+    if (action === 'rerequest') h.state.marker = null;
+    h.io.push = a => {
+      h.calls.push.push(a);
+      h.state.marker = marker('red', { failureDetails: { summary: 'verification failed during push' } });
+      return { ok: true, upToDate: true };
+    };
+    await pass(h);
+    await pass(h);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('RED');
+    expect(h.calls.resume[0].prompt).toContain('verification failed during push');
+    expect(h.calls.resume[0].prompt).not.toContain('## Fix evidence');
+    expect(h.state.claimHeld).toBe(true);
+    expect(h.calls.push).toHaveLength(1);
+    expect(h.calls.rerequest).toEqual([]);
+    expect(h.store.size).toBe(0);
+  });
+  it.each(['moved', 'dirty', 'unreadable'])('voids a no-op when its lane becomes %s during push', async (change) => {
+    const h = harness();
+    h.io.push = () => {
+      if (change === 'moved') h.state.lane.head = SHA2;
+      if (change === 'dirty') h.state.lane.dirty = true;
+      if (change === 'unreadable') h.state.lane = null;
+      return { ok: true, upToDate: true };
+    };
+    const { rows } = await pass(h);
+    expect(rows).toContainEqual(expect.objectContaining({ reason: `lane-${change}`, result: 'resumed:void' }));
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).not.toContain('## Fix evidence');
+  });
+  it.each(['laneState', 'readMarker'])('retains a no-op when %s fails after push and delivers red after recovery', async (reader) => {
+    const h = harness();
+    const original = h.io[reader];
+    h.io.push = a => {
+      h.calls.push.push(a);
+      h.state.marker = marker('red', { failureDetails: { summary: 'red during push' } });
+      h.io[reader] = () => { throw new Error('read failed after push'); };
+      return { ok: true, upToDate: true };
+    };
+    const { rows } = await pass(h);
+    expect(rows.some(row => /error:/.test(row.result))).toBe(true);
+    expect(h.calls.resume).toEqual([]);
+    expect(h.store.size).toBe(1);
+    h.io[reader] = original;
+    await pass(h);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('RED');
+    expect(h.calls.resume[0].prompt).not.toContain('## Fix evidence');
+    expect(h.calls.push).toHaveLength(1);
+    expect(h.store.size).toBe(0);
+  });
   it.each(['paused', 'busy', 'failed'])('rechecks verification after a %s no-op resume', async (deferred) => {
     const h = harness();
     h.io.push = a => { h.calls.push.push(a); return { ok: true, upToDate: true }; };

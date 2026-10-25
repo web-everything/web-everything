@@ -358,7 +358,7 @@ export async function runAwaitVerifyPass({
       }
       const pendingNoOp = record?.pendingResume?.kind === 'no-new-commit';
       const lane = isHarnessRecord(record) && (!record.pendingResume || pendingNoOp) ? io.laneState(record.lane, { hashDirty: isNoPushRecord(record) }) : null;
-      const marker = lane ? io.readMarker(record.lane) : null;
+      let marker = lane ? io.readMarker(record.lane) : null;
       let d = classifyAwaitVerdict({ record, marker, lane: record.pendingResume ? { head: record.sha } : lane, nowMs, ttlMs, limits });
       if (pendingNoOp) {
         // A deferred no-op is not a verify verdict. Red/void/infra recovery takes precedence over hand-back,
@@ -376,6 +376,20 @@ export async function runAwaitVerifyPass({
         row.result = `${row.result ? `${row.result}; ` : ''}persist-failed`;
         return false;
       };
+      if (!(record?.infraRetry?.scheduled && d.action === 'wait') && isEarlyPushOwed({ record, decision: d, policy, limits })) {
+        const early = runEarlyPush({ io, record, nowMs, policy, persist: (next) => (io.writeRecord(next)?.ok === true ? ((record = next), true) : false) });
+        // `record` now carries `earlyPush`; the rest of this record's handling keeps it.
+        if (early) rows.push({ key, pr: record.pr, repo: record.repo, sha: record.sha, ...early });
+        if (record.earlyPush?.ok && record.earlyPush.upToDate) {
+          // The push can outlast verification. As with a deferred no-op, fresh red/void/infra
+          // takes precedence over hand-back. Read errors retain the persisted waiter for retry.
+          const currentLane = io.laneState(record.lane, { hashDirty: isNoPushRecord(record) });
+          marker = currentLane ? io.readMarker(record.lane) : null;
+          const fresh = classifyAwaitVerdict({ record, marker, lane: currentLane, nowMs, ttlMs, limits });
+          if (fresh.action === 'resume') d = fresh;
+          Object.assign(row, { action: d.action, reason: d.reason });
+        }
+      }
       if (record?.kind === 'fix' && (d.resume === 'infra' || (record.infraRetry?.scheduled && d.action === 'wait'))) {
         const { maxAttempts, backoffMinutes } = recovery.value.infraRetry;
         const source = key => recovery.sources?.[`infraRetry.${key}`] ?? 'standard';
@@ -403,11 +417,6 @@ export async function runAwaitVerifyPass({
           }
         }
         rows.push(row); continue;
-      }
-      if (isEarlyPushOwed({ record, decision: d, policy, limits })) {
-        const early = runEarlyPush({ io, record, nowMs, policy, persist: (next) => (io.writeRecord(next)?.ok === true ? ((record = next), true) : false) });
-        // `record` now carries `earlyPush`; the rest of this record's handling (re-request, resume) keeps it.
-        if (early) rows.push({ key, pr: record.pr, repo: record.repo, sha: record.sha, ...early });
       }
       if (record?.kind === 'fix' && !record.pendingResume && record.earlyPush?.ok && record.earlyPush.upToDate
         && (record.attempt ?? 1) === 1 && record.earlyPush.attempts === 1
