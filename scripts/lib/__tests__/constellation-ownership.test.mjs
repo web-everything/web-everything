@@ -156,6 +156,35 @@ describe('constellation ownership', () => {
     ])).files).toHaveLength(1);
   });
 
+  it('? matches exactly one non-slash character', () => {
+    const rules = [{ glob: 'src/file?.json', destination: 'standard-def' }];
+    expect(classify(['src/filea.json', 'src/file1.json'], fixture(rules)).files).toHaveLength(2);
+    for (const path of ['src/file.json', 'src/fileab.json', 'src/file/.json']) {
+      expect(() => classify([path], fixture(rules))).toThrow(/unclassified/i);
+    }
+  });
+
+  it('matches globs case-sensitively', () => {
+    const rules = [{ glob: 'src/File.json', destination: 'standard-def' }];
+    expect(classify(['src/File.json'], fixture(rules)).files).toHaveLength(1);
+    for (const path of ['src/file.json', 'Src/File.json']) {
+      expect(() => classify([path], fixture(rules))).toThrow(/unclassified/i);
+    }
+  });
+
+  it.each([
+    'src/{a,b}.json',
+    'src/[ab].json',
+    '!src/**',
+    'src/../file.json',
+    'src/./file.json',
+    '/src/**',
+    '\\src/**',
+  ])('throws on invalid glob %s', glob => {
+    expect(() => classify([], fixture([{ glob, destination: 'standard-def' }])))
+      .toThrow('Invalid repository path glob');
+  });
+
   it('refuses invalid maps, duplicate input paths and unsafe non-repository paths', () => {
     expect(() => classify([], { order: 'last-match', rules: [] })).toThrow(/order/i);
     expect(() => classify([], fixture([{ glob: '**', destination: 'unknown' }]))).toThrow(/destination/i);
