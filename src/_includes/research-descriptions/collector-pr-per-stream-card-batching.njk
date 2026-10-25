@@ -1,0 +1,39 @@
+{% raw %}
+<h2>Purpose</h2>
+<p>
+  Grounds the decision to batch card-only filings into one parked "collector" PR per stream. The question is how
+  many PRs the card stream should cost, and what the shipped card-batch machinery still lacks.
+</p>
+
+<h2>Prior art</h2>
+<table>
+  <thead><tr><th>System</th><th>Group key</th><th>Size or time bound</th><th>Bad member</th></tr></thead>
+  <tbody>
+    <tr><td>Renovate (<code>groupName</code>, <code>schedule</code>, <code>prConcurrentLimit</code>)</td>
+      <td>Named group of updates</td><td>Schedule window plus a concurrency cap</td>
+      <td>Group PR fails as a whole; the group can be split by config</td></tr>
+    <tr><td>Dependabot <code>groups</code></td><td>Pattern or dependency type</td>
+      <td>Schedule interval</td><td>One group PR; the failing update is ignored by hand</td></tr>
+    <tr><td>bors-ng and GitHub merge queue batching</td><td>Queue order</td>
+      <td>Max batch size and a wait timer</td><td>Bisect: split the batch, retest halves, eject the culprit</td></tr>
+    <tr><td>Gerrit topics</td><td>Topic string</td><td>None (manual)</td><td>Each change reviewed on its own</td></tr>
+  </tbody>
+</table>
+<p>
+  The shared shape is a group key, a count cap and a time window, with a way to remove one bad member without
+  discarding the batch. The shipped policy has all three
+  (<code>we:scripts/lib/card-batch-policy.mjs</code>: <code>maxCards</code>, <code>maxAgeMinutes</code>, and
+  <code>we:scripts/operations/card-batch-extract.mjs</code> for removal). None of these tools puts the removed
+  member into the next batch.
+</p>
+
+<h2>Local finding</h2>
+<p>
+  On 2026-10-18 the prevention collector's state file still carried <code>sealedAt</code> for batch 9 (PR 5272,
+  merged 2026-10-14) at seal step <code>ready</code>, because the seal job timed out before
+  <code>label-on-green</code>, the only step that retires a state
+  (<code>we:scripts/operations/card-batch-seal-io.mjs</code>). The admission plan refuses every later card with
+  <code>batch-sealed</code> (<code>we:scripts/operations/card-batch.mjs</code>), so the filer spools them. 327 cards
+  were spooled by that date. The collector exists; it needs to heal.
+</p>
+{% endraw %}

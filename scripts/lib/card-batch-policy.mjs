@@ -2,6 +2,7 @@
 import { readFileSync } from 'node:fs';
 import { URL as NodeURL } from 'node:url'; // bound at import: some suites stub the global URL
 import { isCardPath } from '../ci-card-only.mjs';
+import { raisedByMemberId } from './raised-by.mjs';
 
 export const CARD_BATCH_KINDS = Object.freeze(['prevention', 'filing', 'prepare']);
 const KEYS = ['enabled', 'maxCards', 'maxAgeMinutes', 'highPriorityBypass'];
@@ -83,7 +84,7 @@ export function bypassesBatch({ priority }, kindPolicy) {
   return kindPolicy.highPriorityBypass === true && (priority === 'high' || priority === 'urgent');
 }
 
-/** Admit only newly added, top-level regular backlog cards with distinct textual IDs. */
+/** Admit new regular cards and immutable raised-by files with distinct member IDs. */
 export function cardOnlyEligibility(rows) {
   if (!Array.isArray(rows) || rows.length === 0) return { ok: false, reason: 'no changed-file rows' };
   const ids = new Set();
@@ -92,6 +93,12 @@ export function cardOnlyEligibility(rows) {
     const refuse = reason => ({ ok: false, reason: `${String(path)}: ${reason}` });
     if (row?.status !== 'A') return refuse('status must be A');
     if (row?.mode !== '100644') return refuse('mode must be 100644');
+    const raiseId = raisedByMemberId(path);
+    if (raiseId) {
+      if (ids.has(raiseId)) return refuse(`duplicate raised-by member ${raiseId}`);
+      ids.add(raiseId);
+      continue;
+    }
     if (!isCardPath(path) || !/^backlog\/[^/]+\.md$/.test(path)) return refuse('not a top-level backlog card');
     const match = /^([^-]+)-.+\.md$/.exec(path.slice(path.indexOf('/') + 1));
     if (!match) return refuse('card basename must be <id>-<name>.md');

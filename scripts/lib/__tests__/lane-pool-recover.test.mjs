@@ -1,12 +1,13 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   classifyLaneNames, nextLaneNumbers, capState, qualifiesForCardBackup,
   recoverPool, diagnosePool, buildNeedsYouItem, backupLaneContent, realRecoverIo,
 } from '../lane-pool-recover.mjs';
-import { LANE_GIT_CONFIG_PINS, laneGitHardeningEnv, scrubGitRepoEnv } from '../lane-git-hardening.mjs';
+import { LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS, laneGitHardeningEnv, scrubGitRepoEnv } from '../lane-git-hardening.mjs';
 import { diffFeed, REPORT_KINDS, sanitizeForFeed } from '../../operations/needs-you-feed.mjs';
 
 const preserved = () => ({ preserved: true, unpreservedFiles: [], unpreservedCommitShas: [], reason: 'safe' });
@@ -247,6 +248,76 @@ describe('backupLaneContent verified preservation', () => {
 });
 
 describe('real recovery backup Git hardening', () => {
+  it('refuses a lane clean filter before status can execute its sentinel command', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'recover-filter-'));
+    try {
+      const repo = { poolDir: join(root, 'pool'), name: 'fixture' };
+      const dir = join(repo.poolDir, 'lane-1'), sentinel = join(root, 'filter-ran');
+      mkdirSync(dir, { recursive: true });
+      const git = args => execFileSync('git', args, { cwd: dir, encoding: 'utf8', env: laneGitHardeningEnv(scrubGitRepoEnv(process.env)) });
+      git(['init', '-q']);
+      writeFileSync(join(dir, 'tracked.txt'), 'original\n');
+      git(['add', 'tracked.txt']);
+      // Poison only after staging, so fixture setup cannot run the driver.
+      writeFileSync(join(dir, '.gitattributes'), 'tracked.txt filter=x\n');
+      writeFileSync(join(dir, 'tracked.txt'), 'changed size\n');
+      git(['config', 'filter.x.clean', `touch '${sentinel}'; cat`]);
+      const commands = [];
+      const io = realRecoverIo({ repo, backupRoot: root, isLeased: () => false,
+        runGit: (command, args, options) => { commands.push(args); return execFileSync(command, args, options); } });
+      const backup = await io.backup(1);
+      expect(existsSync(sentinel)).toBe(false);
+      expect(backup).toMatchObject({ ok: false, error: expect.stringMatching(/filter.*inspect/i) });
+      expect(commands.every(args => args[0] === 'config')).toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['clean', 'smudge', 'process'])('refuses included worktree filter.%s config before reading content', async driver => {
+    const root = mkdtempSync(join(tmpdir(), 'recover-driver-'));
+    try {
+      const runGit = vi.fn(() => `worktree\0filter.x.${driver}\ncommand\0`);
+      const repo = { poolDir: join(root, 'pool'), name: 'fixture' };
+      const io = realRecoverIo({ repo, backupRoot: root, isLeased: () => false, runGit });
+      expect(await io.backup(1)).toMatchObject({ ok: false, error: expect.stringMatching(/filter.*inspect/i) });
+      expect(runGit).toHaveBeenCalledTimes(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('fails closed when config cannot be read, without running status or stash', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'recover-config-'));
+    try {
+      const runGit = vi.fn(() => { throw new Error('config unreadable'); });
+      const repo = { poolDir: join(root, 'pool'), name: 'fixture' };
+      const io = realRecoverIo({ repo, backupRoot: root, isLeased: () => false, runGit });
+      expect(await io.backup(1)).toMatchObject({ ok: false, error: expect.stringMatching(/config unreadable/) });
+      expect(runGit).toHaveBeenCalledTimes(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('backs up raw stash patches without executing textconv or external diff drivers', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'recover-textconv-'));
+    try {
+      const repo = { poolDir: join(root, 'pool'), name: 'fixture' };
+      const dir = join(repo.poolDir, 'lane-1'), sentinel = join(root, 'diff-ran');
+      mkdirSync(dir, { recursive: true });
+      const git = args => execFileSync('git', args, { cwd: dir, encoding: 'utf8', env: laneGitHardeningEnv(scrubGitRepoEnv(process.env)) });
+      git(['init', '-q']);
+      writeFileSync(join(dir, '.gitattributes'), 'tracked.txt diff=x\n');
+      writeFileSync(join(dir, 'tracked.txt'), 'original\n');
+      git(['add', '.gitattributes', 'tracked.txt']);
+      git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-qm', 'fixture']);
+      writeFileSync(join(dir, 'tracked.txt'), 'changed size\n');
+      git(['stash', 'push', '-q']);
+      git(['config', 'diff.x.textconv', `touch '${sentinel}'; cat`]);
+      git(['config', 'diff.external', `touch '${sentinel}'`]);
+      const io = realRecoverIo({ repo, backupRoot: root, isLeased: () => false });
+      const backup = await io.backup(1);
+      expect(existsSync(sentinel)).toBe(false);
+      expect(backup).toMatchObject({ ok: true, stashes: 1 });
+      expect(readFileSync(join(backup.dir, 'stash-0.patch'), 'utf8')).toContain('+changed size');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('passes a scrubbed, hardened read-only env to status, stash list and stash show', async () => {
     const root = mkdtempSync(join(tmpdir(), 'recover-env-'));
     try {
@@ -255,13 +326,15 @@ describe('real recovery backup Git hardening', () => {
       vi.stubEnv('GIT_CONFIG_KEY_0', 'remote.origin.url');
       vi.stubEnv('GIT_CONFIG_VALUE_0', 'untrusted-origin');
       vi.stubEnv('GIT_EXTERNAL_DIFF', 'untrusted-command');
-      const runGit = vi.fn((_git, args) => args[0] === 'status' ? '' : args[1] === 'list' ? 'stash@{0}\n' : 'patch\n');
+      const runGit = vi.fn((_git, args) => ['config', 'status'].includes(args[0]) ? '' : args[1] === 'list' ? 'stash@{0}\n' : 'patch\n');
       const repo = { poolDir: join(root, 'pool'), name: 'fixture' };
       const io = realRecoverIo({ repo, backupRoot: root, isLeased: () => false, runGit });
       expect(await io.backup(1)).toMatchObject({ ok: true, stashes: 1 });
       expect(runGit.mock.calls.map(([, args]) => args)).toEqual([
+        [...LANE_CONFIG_LIST_ARGS],
         ['status', '--porcelain', '--untracked-files=all', '-z'],
-        ['stash', 'list', '--format=%gd'], ['stash', 'show', '-p', 'stash@{0}'],
+        [...LANE_CONFIG_LIST_ARGS], ['stash', 'list', '--format=%gd'],
+        [...LANE_CONFIG_LIST_ARGS], ['stash', 'show', '--no-ext-diff', '--no-textconv', '-p', 'stash@{0}'],
       ]);
       const env = laneGitHardeningEnv({ ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0' });
       for (const [command, , options] of runGit.mock.calls) {

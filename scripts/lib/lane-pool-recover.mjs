@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { isUnderTest } from './under-test.mjs';
-import { laneGitHardeningEnv, scrubGitRepoEnv } from './lane-git-hardening.mjs';
+import { laneFilterDrivers, laneGitHardeningEnv, LANE_CONFIG_LIST_ARGS, scrubGitRepoEnv } from './lane-git-hardening.mjs';
 import { realSalvageIo, salvagePushLane } from './lane-pool-salvage-push.mjs';
 
 const clean = (value, max = 2000) => String(value).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ').slice(0, max);
@@ -184,7 +184,18 @@ export function realRecoverIo({ repo, lanePoolPath, backupRoot = process.env.WE_
     ...Object.entries({ origin: repo.originUrl, reference: repo.referencePath, name: repo.name, branch: repo.branch })
       .filter(([, value]) => value != null).map(([key, value]) => `--${key}=${value}`)], { ...processOptions, env: { ...process.env, ...env } });
   const gitEnv = laneGitHardeningEnv({ ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0' });
-  const git = (dir, args) => runGit('git', args, { ...processOptions, cwd: dir, env: gitEnv });
+  const git = (dir, args) => {
+    const options = { ...processOptions, cwd: dir, env: gitEnv };
+    // Config reads execute no drivers. Check before EVERY content read, following includes
+    // and worktree config; env pins cannot neutralize an arbitrary filter name.
+    const drivers = laneFilterDrivers(runGit('git', [...LANE_CONFIG_LIST_ARGS], options));
+    if (drivers.length) {
+      const warning = `${basename(dir)}: backup refused unsafe Git filter drivers (${drivers.map(key => clean(key)).join(', ')}); inspect the lane manually`;
+      console.error(`lane-pool recovery: WARNING ${warning}`);
+      throw new Error(warning);
+    }
+    return runGit('git', args, options);
+  };
   const backupIo = {
     untracked: dir => {
       // -z keeps spaces, newlines, and quoted paths literal; ?? entries are the only copied paths.
@@ -196,7 +207,7 @@ export function realRecoverIo({ repo, lanePoolPath, backupRoot = process.env.WE_
       return files;
     },
     stashCount: dir => git(dir, ['stash', 'list', '--format=%gd']).split('\n').filter(Boolean).length,
-    stashPatch: (dir, i) => git(dir, ['stash', 'show', '-p', `stash@{${i}}`]),
+    stashPatch: (dir, i) => git(dir, ['stash', 'show', '--no-ext-diff', '--no-textconv', '-p', `stash@{${i}}`]),
     mkdirp: path => mkdirSync(path, { recursive: true }),
     copyFile: (src, dst) => {
       if (!lstatSync(src).isFile()) throw new Error('backup refuses non-regular untracked content');
