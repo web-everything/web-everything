@@ -515,8 +515,10 @@ describe('held item 212 review round 1 — landed overlays and pinned bases', ()
     f.push('lane/top-a', base, { 'top-a.txt': 'first containing overlay' });
     f.push('lane/top-b', base, { 'top-b.txt': 'last containing overlay' });
     f.fetch();
+    // Establish every listed tip so this ordering-only fixture preserves list order before deferral.
+    const live = await f.build(refs.map((ref) => ({ ref })));
     const plan = await planRebuild({
-      git: f.runGit, headSha: null, mainRef: 'origin/main',
+      git: f.runGit, headSha: live, mainRef: 'origin/main',
       overlays: refs.map((ref) => ({ ref, ...(ref === 'lane/base' ? { pinned: true } : {}) })),
     });
     expect(plan.ok).toBe(true);
@@ -526,6 +528,25 @@ describe('held item 212 review round 1 — landed overlays and pinned bases', ()
     expect(plan.decisions.find((d) => d.ref === 'lane/base'))
       .toMatchObject({ action: 'skip', reason: 'pinned-contained-in-applied' });
     expect(plan.decisions.some((d) => d.action === 'remove')).toBe(false);
+  });
+
+  it.each(['null', 'absent', 'not-contained', 'unreadable'])('does not defer a pinned base when running-head containment is %s', async (evidence) => {
+    const f = fixture();
+    const base = f.push('lane/base', f.init, { [TAKEOVER]: lines({ 2: 'base' }) });
+    f.push('lane/top', base, { 'top.txt': 'containing top' });
+    f.fetch();
+    const headSha = evidence === 'null' ? null : evidence === 'absent' ? undefined : evidence === 'not-contained' ? f.init : base;
+    const git = (args, opts) => (evidence === 'unreadable' && args[0] === 'merge-base'
+      && args[1] === '--is-ancestor' && args[2] === base && args[3] === headSha
+      ? { status: 128, stdout: '', stderr: 'unreadable' } : f.runGit(args, opts));
+    const plan = await planRebuild({
+      git, headSha, mainRef: 'origin/main',
+      overlays: [{ ref: 'lane/base', pinned: true }, { ref: 'lane/top' }],
+    });
+    expect(plan.ok).toBe(true);
+    expect(plan.decisions.map((d) => d.ref)).toEqual(['lane/base', 'lane/top']);
+    expect(plan.decisions[0]).toMatchObject({ action: 'apply' });
+    expect(isAncestor(f.clone, base, plan.finalSha)).toBe(true);
   });
 
   it.each([false, true])('a conflicting top preserves normal handling of its established mechanism-pinned base (base conflicts: %s)', async (baseConflicts) => {

@@ -410,17 +410,21 @@ export async function planRebuild({
   const toProcess = [
     ...listed.filter((o) => establishedRefs.has(o?.ref)), ...listed.filter((o) => !establishedRefs.has(o?.ref)),
   ];
-  // In tops mode only, defer a pinned base until immediately after its last containing overlay.
+  // In tops mode only, defer a pinned base whose registered tip is already in the running build
+  // until immediately after its last containing overlay. Missing or unreadable ancestry keeps normal pin handling.
   // Keep an established base ahead of unrelated newcomers, even if that prevents deferring it to its top.
   // If no containing overlay applies, the base still goes through ordinary pin protections.
-  if (stackMode === 'tops') {
+  if (stackMode === 'tops' && headSha) {
     const entries = toProcess.map((raw) => ({
       raw, sha: raw?.ref ? verifyRev(git, `refs/remotes/origin/${raw.ref}^{commit}`) : null,
     }));
     for (const base of entries) {
-      if (!base.sha || !pinnedStatus(git, base.raw, mainSha, base.sha).pinned
+      if (!base.sha || git(['merge-base', '--is-ancestor', base.sha, headSha]).status !== 0
+        || !pinnedStatus(git, base.raw, mainSha, base.sha).pinned
         || git(['merge-base', '--is-ancestor', base.sha, mainSha]).status !== 1) continue;
-      const containers = entries.filter((top) => top.sha && top.sha !== base.sha
+      // Registered repairs keep the original's conflict/loss decision until adoption cleanup retires it.
+      const containers = entries.filter((top) => top.raw?.reason !==`auto-rebase of ${base.raw.ref}`
+        && top.sha && top.sha !== base.sha
         && git(['merge-base', '--is-ancestor', base.sha, top.sha]).status === 0);
       const baseIndex = toProcess.indexOf(base.raw);
       const lastContainer = Math.max(-1, ...containers.map((top) => toProcess.indexOf(top.raw)));
