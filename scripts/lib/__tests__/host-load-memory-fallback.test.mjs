@@ -183,12 +183,23 @@ describe('hostLoadAdmission memory fallback policy', () => {
     ['NaN free()', () => NaN],
     ['infinite free()', () => Infinity],
     ['negative infinite free()', () => -Infinity],
+    ['undefined free() result', () => undefined],
+    ['unavailable free()', null],
     ['denied free()', () => { throw denied(); }],
     ['throwing free()', () => { throw new Error('unavailable'); }],
-  ])('admits acceptable load with memory unknown after %s', (_name, free) => {
-    const result = hostLoad.hostLoadAdmission(admissionOptions(probes({ denyVm: true, denySwap: true, free })));
-    expect(result.admitted).toBe(true);
-    expect(result.reason).toContain('memory unknown');
+  ])('defers acceptable load when native probes are denied and memory is unknown after %s', (_name, free) => {
+    const probe = { ...probes({ denyVm: true, denySwap: true }), free };
+    const result = hostLoad.hostLoadAdmission(admissionOptions(probe));
+    expect(result.admitted).toBe(false);
+    expect(result.reason).toContain('host memory unknown');
+  });
+
+  it('defers acceptable load when os.freemem is the only source and throws', () => {
+    const probe = { ...probes({ free: () => { throw new Error('unavailable'); } }), platform: 'linux' };
+    const result = hostLoad.hostLoadAdmission(admissionOptions(probe));
+    expect(result.admitted).toBe(false);
+    expect(result.reason).toContain('host memory unknown');
+    expect(probe.exec).not.toHaveBeenCalled();
   });
 
   it('still refuses high load per core when all memory sources are unknown', () => {

@@ -1,7 +1,7 @@
 /** Shared admission for background work; operator interactive commands bypass this check.
  * Memory readings report provenance: macOS pages + free swap, pages alone, then os.freemem.
- * Unavailable memory admits with an explicit unknown reason after the load check; measured low
- * headroom still refuses. Malformed readings, non-denial probe errors and legacy numeric-reader failures fail closed.
+ * Unavailable memory and measured low headroom refuse admission. Malformed readings,
+ * non-denial probe errors and legacy numeric-reader failures also fail closed.
  * No network endpoint: body size/rate/CSRF do not apply. Scan/GC triggers use host single-flight locks.
  */
 import { createHash } from 'node:crypto';
@@ -93,13 +93,12 @@ export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => c
     loadVerdict = { admitted: ratio <= limit, reason: `host load ${l.toFixed(2)}/${c}=${ratio.toFixed(2)}; host.maxLoadPerCore=${limit} (${policy.sources['host.maxLoadPerCore']})` };
   } catch (e) { return { admitted: false, reason: `host load unknown: ${e.message}` }; }
   if (!loadVerdict.admitted) return loadVerdict;
-  // Memory is checked only once load admits; only an explicit unavailable reading bypasses it.
+  // Memory is checked only once load admits; unavailable readings fail closed.
   try {
     // A hand-built policy without the leaf takes the standard value; a loaded policy always carries it.
     const min = policy.settings.host.minMemoryHeadroomMb ?? DEFAULT_MIN_MEMORY_HEADROOM_MB;
     if (!Number.isFinite(min) || min <= 0) throw Error('invalid host memory threshold');
     const { mb, source } = memoryReading({ env });
-    if (mb === null && source === 'unknown') return { admitted: true, reason: `${loadVerdict.reason}; host memory unknown; source=unknown` };
     if (!Number.isFinite(mb) || mb < 0) throw Error('unknown host memory');
     const reason = `host memory headroom ${Math.round(mb)}MB (free+swap); host.minMemoryHeadroomMb=${min} (${policy.sources?.['host.minMemoryHeadroomMb'] ?? 'standard'}); source=${source}`;
     return mb >= min ? { admitted: true, reason: `${loadVerdict.reason}; ${reason}` } : { admitted: false, reason };
