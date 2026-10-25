@@ -37,10 +37,10 @@ const gate = (outcome = 'card-queued') => buildGateComment({
 
 describe('numbering carry recognises trusted machine comments with author metadata', () => {
   it.each([
-    ['landing retraction', retraction(), 'plateau-worker'],
+    ['landing retraction', retraction(), 'web-everything[bot]'],
     ['drain enqueue clearance', buildClearanceComment(TO), 'plateau-merger'],
-    ['non-blocking red-team advisory', advisory(), 'plateau-reviewer'],
-    ['card-queued red-team gate', gate(), 'plateau-reviewer'],
+    ['non-blocking red-team advisory', advisory(), 'web-everything[bot]'],
+    ['card-queued red-team gate', gate(), 'web-everything[bot]'],
   ])('tolerates a trusted %s', (_kind, body, login) => {
     expect(isNumberingTolerableLaterBody(body, comment(body, login))).toBe(true);
   });
@@ -57,12 +57,12 @@ describe('numbering carry recognises trusted machine comments with author metada
     ['invalid SHA', body => body.replace(FROM, 'not-a-sha')],
   ])('fails closed on a retraction-looking body with %s', (_kind, change) => {
     const body = change(retraction());
-    expect(isNumberingTolerableLaterBody(body, comment(body, 'plateau-worker'))).toBe(false);
+    expect(isNumberingTolerableLaterBody(body, comment(body, 'web-everything[bot]'))).toBe(false);
   });
 
   it('retains a sent-back red-team gate as a hold even from a trusted author', () => {
     const body = gate('sent-back');
-    expect(isNumberingTolerableLaterBody(body, comment(body, 'plateau-reviewer'))).toBe(false);
+    expect(isNumberingTolerableLaterBody(body, comment(body, 'web-everything[bot]'))).toBe(false);
   });
 
   it.each([
@@ -77,12 +77,12 @@ function acceptedThread() {
   return [
     comment(`✅ review — human cleared\n${markers}`, 'chalbert', 0),
     // The acceptance record retains the human clearance on the same head.
-    comment(`✅ review — accepted\n${markers}`, 'plateau-reviewer', 1),
+    comment(`✅ review — accepted\n${markers}`, 'web-everything[bot]', 1),
   ];
 }
 function machineNotes() {
   return [
-    comment(retraction(), 'plateau-worker', 2),
+    comment(retraction(), 'web-everything[bot]', 2),
     comment('<!-- drain-skip-reason -->\nskipped: numbering carry awaiting recheck', 'plateau-merger', 3),
     comment(buildClearanceComment(TO), 'plateau-merger', 4),
   ];
