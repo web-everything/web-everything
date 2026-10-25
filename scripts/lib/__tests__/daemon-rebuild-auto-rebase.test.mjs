@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { kickAutoRebase, resolveAutoRebaseSwitch, runAutoRebase, finishPendingSwaps } from '../daemon-rebuild/auto-rebase.mjs';
-import { addOverlay, removeOverlay, readOverlays, overlayFilePath, appendOverlayEvent } from '../daemon-overlays.mjs';
+import { addOverlay, removeOverlay, readOverlays, overlayFilePath, appendOverlayEvent, persistStackBases } from '../daemon-overlays.mjs';
+import * as overlays from '../daemon-overlays.mjs';
 import { planRebuild } from '../daemon-rebuild/plan.mjs';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 import { writeRebuildState, readRebuildState, alertsFilePath } from '../daemon-rebuild/state.mjs';
@@ -174,7 +175,7 @@ describe('established overlay auto rebase', () => {
       const pending = fs.readdirSync(pendingDir(f)).filter(n => n.endsWith('.json'));
       expect(pending).toHaveLength(1);
       expect(JSON.parse(fs.readFileSync(join(pendingDir(f), pending[0]), 'utf8'))).toMatchObject({
-        old: ref, new: result.ref, rule,
+        old: ref, oldOverlay: expect.objectContaining({ ref }), new: result.ref, rule,
       });
     };
     const assertUnregistered = f => {
@@ -836,6 +837,88 @@ describe('established overlay auto rebase', () => {
     ]));
     expect(fs.readdirSync(pendingDir(f))).toHaveLength(1);
     expect(needsYouAlert(f)).toMatchObject({ detail: { ref, stage: 'swap', reason: 'registration changed; refusing removal' } });
+    // The next tick reads the re-registration fresh; it must still never be taken for the retired original.
+    expect(() => swaps(f)).not.toThrow();
+    expect(readOverlays(f.root, { env: f.env })).toEqual(expect.arrayContaining([expect.objectContaining({ ref, pr: 999 })]));
+    expect(fs.readdirSync(pendingDir(f))).toHaveLength(1);
+  });
+
+  it('skips removal when the original is absent at recheck, preserving a subsequent re-registration', async () => {
+    const f = fixture(); f.moveMain(); const replacement = await job(f);
+    ok(f.root, ['fetch', 'origin']); ok(f.root, ['reset', '--hard', replacement.newSha]);
+    removeOverlay(f.root, ref, { env: f.env });
+    const readState = overlays.readOverlayState;
+    const recheck = vi.spyOn(overlays, 'readOverlayState').mockImplementationOnce((root, opts) => {
+      const snapshot = readState(root, opts);
+      expect(snapshot.overlays.some(o => o.ref === ref)).toBe(false);
+      addOverlay(root, { ref, pr: 999, reason: 'operator re-registration' }, { env: f.env });
+      return snapshot;
+    });
+    const remove = vi.fn(removeOverlay), event = vi.fn(appendOverlayEvent);
+    expect(() => finishPendingSwaps({ root: f.root, env: f.env, run, removeOverlay: remove, appendOverlayEvent: event })).not.toThrow();
+    expect(recheck).toHaveBeenCalledTimes(1);
+    expect(remove).not.toHaveBeenCalled();
+    expect(readOverlays(f.root, { env: f.env })).toEqual(expect.arrayContaining([
+      expect.objectContaining({ ref, pr: 999 }), expect.objectContaining({ ref: replacement.ref }),
+    ]));
+    expect(fs.readdirSync(pendingDir(f))).toEqual([]);
+    expect(event).toHaveBeenCalledWith(f.root, expect.objectContaining({ kind: 'auto-rebase-swapped', old: ref }), { env: f.env });
+    expect(needsYouAlerts(f)).toEqual([]);
+    expect(() => swaps(f)).not.toThrow();
+    expect(readOverlays(f.root, { env: f.env })).toEqual(expect.arrayContaining([
+      expect.objectContaining({ ref, pr: 999 }), expect.objectContaining({ ref: replacement.ref }),
+    ]));
+    expect(fs.readdirSync(pendingDir(f))).toEqual([]);
+  });
+
+  it('never removes an identical-looking original the operator removed and re-added after the swap was recorded', async () => {
+    const f = fixture(); f.moveMain(); const replacement = await job(f);
+    ok(f.root, ['fetch', 'origin']); ok(f.root, ['reset', '--hard', replacement.newSha]);
+    const recorded = readOverlays(f.root, { env: f.env }).find(o => o.ref === ref);
+    removeOverlay(f.root, ref, { env: f.env });
+    addOverlay(f.root, { ref, pr: recorded.pr, reason: recorded.reason, now: '2099-01-01T00:00:00.000Z' }, { env: f.env });
+    expect(() => swaps(f)).not.toThrow();
+    expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([replacement.ref, ref]);
+    expect(fs.readdirSync(pendingDir(f))).toHaveLength(1);
+    expect(needsYouAlert(f)).toMatchObject({ detail: { ref, stage: 'swap', reason: 'registration changed; refusing removal' } });
+  });
+
+  it('completes the swap when the original is already gone and stays gone', async () => {
+    const f = fixture(); f.moveMain(); const replacement = await job(f);
+    ok(f.root, ['fetch', 'origin']); ok(f.root, ['reset', '--hard', replacement.newSha]);
+    removeOverlay(f.root, ref, { env: f.env });
+    expect(() => swaps(f)).not.toThrow();
+    expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([replacement.ref]);
+    expect(fs.readdirSync(pendingDir(f))).toEqual([]);
+    expect(f.calls).not.toContain('remove');
+    expect(f.calls.at(-1)).toBe('auto-rebase-swapped');
+    expect(needsYouAlerts(f)).toEqual([]);
+  });
+
+  it('still retires the original after the rebuild rewrote its stackBases', async () => {
+    const f = fixture(); f.moveMain(); const replacement = await job(f);
+    ok(f.root, ['fetch', 'origin']); ok(f.root, ['reset', '--hard', replacement.newSha]);
+    const original = readOverlays(f.root, { env: f.env }).find(o => o.ref === ref);
+    persistStackBases(f.root, new Map([[original.pr, ['lane/stack-base']]]), { env: f.env });
+    expect(readOverlays(f.root, { env: f.env }).find(o => o.ref === ref).stackBases).toEqual(['lane/stack-base']);
+    expect(() => swaps(f)).not.toThrow();
+    expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([replacement.ref]);
+    expect(fs.readdirSync(pendingDir(f))).toEqual([]);
+    expect(needsYouAlerts(f)).toEqual([]);
+  });
+
+  it('fails closed on a pending swap that never recorded the original registration', async () => {
+    const f = fixture(); f.moveMain(); const replacement = await job(f);
+    ok(f.root, ['fetch', 'origin']); ok(f.root, ['reset', '--hard', replacement.newSha]);
+    const file = join(pendingDir(f), fs.readdirSync(pendingDir(f))[0]);
+    const { oldOverlay, ...legacy } = JSON.parse(fs.readFileSync(file, 'utf8'));
+    expect(oldOverlay).toMatchObject({ ref });
+    fs.writeFileSync(file, JSON.stringify(legacy));
+    expect(() => swaps(f)).not.toThrow();
+    expect(f.calls).not.toContain('remove');
+    expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([ref, replacement.ref]);
+    expect(fs.readdirSync(pendingDir(f))).toHaveLength(1);
+    expect(needsYouAlert(f)).toMatchObject({ detail: { ref, stage: 'swap', reason: expect.stringContaining('lacks the recorded original registration') } });
   });
 
   describe('mechanism-pinned original', () => {
@@ -1015,12 +1098,13 @@ describe('established overlay auto rebase', () => {
       ok(f.root, ['reset', '--hard', f.oldSha]);
       ok(f.root, ['push', '-q', 'origin', `${f.oldSha}:refs/heads/${healthy}`, `${f.oldSha}:refs/heads/${replacement}`]);
       for (const r of [healthy, replacement]) addOverlay(f.root, { ref: r, pr: 456 }, { env: f.env });
+      const registered = r => readOverlays(f.root, { env: f.env }).find(o => o.ref === r);
       fs.mkdirSync(pendingDir(f), { recursive: true });
       const badFile = join(pendingDir(f), '00-bad.json'), goodFile = join(pendingDir(f), '99-good.json');
       const bad = failure === 'malformed JSON' ? '{' : failure === 'invalid swap' ? '{}' : failure === 'null swap' ? 'null'
-        : JSON.stringify({ old: ref, new: replacement, newSha: failure === 'invalid SHA type' ? [f.oldSha] : f.oldSha });
+        : JSON.stringify({ old: ref, oldOverlay: registered(ref), new: replacement, newSha: failure === 'invalid SHA type' ? [f.oldSha] : f.oldSha });
       fs.writeFileSync(badFile, bad);
-      fs.writeFileSync(goodFile, JSON.stringify({ old: healthy, new: replacement, newSha: f.oldSha }));
+      fs.writeFileSync(goodFile, JSON.stringify({ old: healthy, oldOverlay: registered(healthy), new: replacement, newSha: f.oldSha }));
       const remove = vi.fn((root, r, opts) => {
         if (r === ref) throw new Error('busy list');
         return removeOverlay(root, r, opts);

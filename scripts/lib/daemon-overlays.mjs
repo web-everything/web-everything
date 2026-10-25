@@ -326,7 +326,8 @@ export function recordEdgeResolution(root, ref, {
  * @param {string} ref
  * `requireRef`, when supplied, must still be registered under the list mutex, else nothing is removed: a swap that
  * retires `ref` for its replacement never leaves the list without both. `expectedOverlay`, when supplied, must still
- * match a present `ref` entry under the same mutex, so a concurrent re-registration is never removed.
+ * match a present `ref` entry under the same mutex, so a concurrent re-registration is never removed. `stackBases` is
+ * left out of that comparison: the rebuild rewrites it on its own ({@link persistStackBases}), which is no re-registration.
  * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedOverlay?:object}} [o]
  * @returns {{removed:boolean, list:Array<object>}}
  */
@@ -339,7 +340,8 @@ export function removeOverlay(root, ref, { env = process.env, why, requireRef, e
       throw new Error('replacement registration unavailable');
     }
     const idx = list.findIndex((o) => o && o.ref === ref);
-    if (expectedOverlay !== undefined && idx !== -1 && !isDeepStrictEqual(list[idx], expectedOverlay)) {
+    const identity = (o) => { const { stackBases, ...rest } = o ?? {}; void stackBases; return rest; };
+    if (expectedOverlay !== undefined && idx !== -1 && !isDeepStrictEqual(identity(list[idx]), identity(expectedOverlay))) {
       throw new Error('registration changed; refusing removal');
     }
     if (idx === -1) return { removed: false, list };

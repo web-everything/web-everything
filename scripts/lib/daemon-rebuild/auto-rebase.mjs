@@ -234,7 +234,8 @@ export async function runAutoRebase({ root, ref, token, env = process.env, deps 
     // Recheck under the list mutex: removal during push or lock acquisition must win too.
     add(root, { ref: next, pr: old.pr, stackBases: [ref], reason: `auto-rebase of ${ref}` }, { env, expectedOverlay: old });
     io.mkdirSync(p.dir, { recursive: true });
-    writePending(io, p.pending, { old: ref, new: next, newSha: candidate, rule, at: now() });
+    // The registration this swap retires, recorded once: cleanup removes the original only while it still matches.
+    writePending(io, p.pending, { old: ref, oldOverlay: old, new: next, newSha: candidate, rule, at: now() });
     event(root, { kind: 'auto-rebase-registered', ref, new: next, newSha: candidate, rule }, { env });
     return { ref: next, newSha: candidate };
   } catch (e) {
@@ -258,6 +259,11 @@ export function finishPendingSwaps({ root, env = process.env, run, removeOverlay
       const swap = readPending(fs, file);
       if (!isSafeBranchName(swap?.old) || !isSafeBranchName(swap?.new) || typeof swap?.newSha !== 'string' || !/^[a-f0-9]{40}$/.test(swap.newSha)) throw new Error('invalid pending swap');
       ref = swap.old;
+      // A file without the recorded original (written before it was recorded) cannot tell the retired registration
+      // from a later re-registration: fail closed, keeping both registrations and this evidence.
+      if (!swap.oldOverlay || typeof swap.oldOverlay !== 'object' || swap.oldOverlay.ref !== swap.old) {
+        throw new Error('pending swap lacks the recorded original registration; both registrations retained');
+      }
       const git = args => run(args, { cwd: root, env, timeout: 60_000 });
       const adopted = git(['merge-base', '--is-ancestor', swap.newSha, 'HEAD']);
       if (adopted.status !== 0 || adopted.error) {
@@ -281,10 +287,13 @@ export function finishPendingSwaps({ root, env = process.env, run, removeOverlay
       if (containsReplacement.status !== 0 || containsReplacement.error) throw new Error('replacement origin tip no longer contains the pending SHA');
       const state = overlays.readOverlayState(root, { env });
       if (state.corrupt || !state.overlays.some(o => o?.ref === swap.new)) throw new Error('replacement registration unavailable');
-      // Rechecked under the list mutex: a replacement withdrawn, or an original re-registered, up to the removal keeps
-      // the original and this evidence.
       const original = state.overlays.find(o => o?.ref === swap.old);
-      removeOverlay(root, swap.old, { env, why: `auto-rebase adopted ${swap.new}`, requireRef: swap.new, expectedOverlay: original });
+      // Rechecked under the list mutex against the registration recorded at swap time, never a fresh read: a
+      // replacement withdrawn, or an original re-registered at any point since (this tick or an earlier one), keeps the
+      // original and this evidence. If already absent, finish without removal: a later registration is unrelated.
+      if (original) {
+        removeOverlay(root, swap.old, { env, why: `auto-rebase adopted ${swap.new}`, requireRef: swap.new, expectedOverlay: swap.oldOverlay });
+      }
       appendOverlayEvent(root, { kind: 'auto-rebase-swapped', ...swap }, { env });
       fs.unlinkSync(file);
     } catch (error) {
