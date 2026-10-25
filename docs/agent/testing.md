@@ -92,6 +92,18 @@ negative answers without file reads remain unverifiable.
 
 ## Drain red-team disposition and retry evidence
 
+Accept carry-forward's advisory exemption must use `readConfirmedBreaks` and `planRedTeamActions`,
+including settings and `WE_RED_TEAM_CONFIRMED_BREAKS` overrides. A send-back finding or an
+unresolved policy supersedes the stale accept; the fallback is a fresh review. Regression cases
+in `accept-carry-forward.replay.test.mjs` cover `degraded=send-back`, cosmetic classification,
+non-blocking overrides, and throwing, missing, incomplete or unknown policy resolution.
+
+Gate exemption tests must isolate each predicate with an otherwise valid envelope. The replay
+cases **rejects complete gate envelopes with forbidden outcomes** retain a successful card action;
+**rejects card-queued without a successful card line** covers absent, advisory-only, failed and
+malformed card actions. A successful card beside a failed or unrecognized action must also refuse
+carry, independently defending validation of every action line.
+
 The drain owes a live-head red team only after a speculative or sequential pass is scheduled
 (recorded queued/running status or seat evidence). The review job records the pass as queued as
 soon as the loop returns an owed accept, before the added seats. Before that status exists, the
@@ -2118,3 +2130,15 @@ On an App-token rejection, keep gh's original stderr before the daemon refusal d
 so callers that read the first error line still report GitHub's actual cause.
 The simulator binds its synthetic `sim-token-1` to matching App-token provenance; its fake
 GitHub still owns revocation checks. Never enable personal fallback globally in test setup.
+
+### Adoption evidence and compact terminal output
+
+The adoption matrix is read-only evidence and fails closed. Logged revisions must be full object IDs; probes
+use a sanitized Git environment (no inherited `GIT_DIR`-style variables, `GIT_NO_LAZY_FETCH`,
+`GIT_NO_REPLACE_OBJECTS`, no prompts), run only at a verified repository root, and treat a shallow or unreadable history as
+unknown, never as a definitive "no". Corrupt log lines, bad timestamps or refs, unreadable logs or settings, and gaps in
+clone discovery mark the snapshot incomplete. Reads are bounded (1 MiB log tail, 50 refs, 20 clones, 500 Git calls) and
+omissions are reported as truncation. Clone paths must be absolute. The drain target is the code clone from the
+prototype-load settings, not the plist's data clone; tests inject those settings. Matrix and PR table cells strip
+Cc/Cf controls and are width-capped; table mode keeps the truncated-listing warning.
+

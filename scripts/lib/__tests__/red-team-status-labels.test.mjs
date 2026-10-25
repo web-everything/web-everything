@@ -1,5 +1,9 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
 import { planRedTeamStatusLabels, syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 import { resolveRedTeamProbes } from '../red-team-gate.mjs';
 const head = 'a'.repeat(40);
@@ -55,4 +59,43 @@ describe('head-bound red-team operator labels', () => {
     expect(resolveRedTeamProbes({ file: { redTeam: { statusLabels: false } }, env: { WE_RED_TEAM_STATUS_LABELS: 'on' } }))
       .toMatchObject({ value: { statusLabels: true }, sources: { statusLabels: 'env' } });
   });
+});
+
+describe('finished stored results without a marker', () => {
+  it.each([
+    ['changes', 1, 'red-team:blocked'], ['accept', 0, 'red-team:clear'],
+    ['changes', 0, 'red-team:blocked'], ['changes', undefined, 'red-team:blocked'],
+    ['accept', 3, 'red-team:clear'],
+  ])('finished %s with %s confirmed becomes %s, never pending', (foldedVerdict, confirmedMissCount, desired) => {
+    expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [],
+      evidence: { scheduled: true, status: { status: 'finished', result: { foldedVerdict, confirmedMissCount } } } }))
+      .toEqual({ add: desired, remove: ['red-team:pending'] });
+  });
+  it('keeps existing scheduling behavior for a finished result without a verdict', () => {
+    expect(planRedTeamStatusLabels({ ...input, comments: [], evidence: { scheduled: true, status: { status: 'finished', result: {} } } }).add).toBe('red-team:pending');
+  });
+  it.each(['unknown', '', null])('unknown verdict %s falls through without clearing', foldedVerdict => {
+    expect(planRedTeamStatusLabels({ ...input, comments: [], evidence: { scheduled: true,
+      status: { status: 'finished', result: { foldedVerdict } } } }).add).toBe('red-team:pending');
+  });
+  it('live marker disposition takes precedence over the stored verdict', () => {
+    expect(planRedTeamStatusLabels({ ...input, labels: [], comments: [result(broken)],
+      evidence: { status: { status: 'finished', result: { foldedVerdict: 'accept' } } } }).add).toBe('red-team:blocked');
+  });
+});
+
+
+it('the real drain evidence reader exposes the finished status and its full result for label recovery', () => {
+  const root = mkdtempSync(join(tmpdir(), 'red-team-label-evidence-'));
+  try {
+    const env = { WE_SHARED_RUNS_DIR: join(root, 'runs') };
+    const storedResult = { status: 'ran', comment: 'withheld', foldedVerdict: 'changes', confirmedMissCount: 1, findings: [] };
+    recordRedTeamStatus({ repo: input.repo, pr: input.pr, loopPayload: { findings: { read: { netBasis: { rev: head } } } },
+      status: 'finished', result: storedResult }, { env, readPidStart: () => null });
+    const evidence = readDrainRedTeamEvidence({ repo: input.repo, pr: input.pr, head, env,
+      runsDir: env.WE_SHARED_RUNS_DIR, list: () => [], readScorecards: () => [] });
+    expect(evidence.status).toMatchObject({ repo: input.repo, pr: input.pr, head, status: 'finished', result: storedResult });
+    expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [], evidence }))
+      .toEqual({ add: 'red-team:blocked', remove: ['red-team:pending'] });
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
