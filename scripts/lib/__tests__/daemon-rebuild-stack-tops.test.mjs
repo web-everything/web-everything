@@ -569,7 +569,10 @@ describe('held item 212 review round 1 — landed overlays and pinned bases', ()
     expect(plan.decisions.some((d) => d.action === 'remove')).toBe(false);
   });
 
-  it.each([false, true])('an unresolved pinned base waits after its last container (reviewed edge: %s)', async (reviewedEdge) => {
+  it.each([
+    { reviewedEdge: false, nested: false }, { reviewedEdge: true, nested: false },
+    { reviewedEdge: false, nested: true }, { reviewedEdge: true, nested: true },
+  ])('an unresolved pinned base waits after its last container (reviewed edge: $reviewedEdge, nested: $nested)', async ({ reviewedEdge, nested }) => {
     const f = fixture();
     const base = f.push('lane/base', f.init, { [TAKEOVER]: lines({ 2: 'base' }) });
     const main = f.push('lane/advanced-main', f.init, { [TAKEOVER]: lines({ 2: 'advanced main' }) });
@@ -582,9 +585,17 @@ describe('held item 212 review round 1 — landed overlays and pinned bases', ()
     gitOk(f.author, ['commit', '-q', '-m', 'consolidated top']);
     gitOk(f.author, ['push', '-q', 'origin', 'HEAD:refs/heads/lane/top-a']);
     const topA = gitOk(f.author, ['rev-parse', 'HEAD']).trim();
-    const topB = f.push('lane/top-b', topA, { 'top-b.txt': 'last container\n' });
+    // Sibling containers resolve the same base/main conflict independently. A nested container instead
+    // carries top-a, so tops mode must set top-a aside rather than apply it separately.
+    const topBBase = nested ? topA : gitOk(f.author, [
+      'commit-tree', `${topA}^{tree}`, '-p', base, '-p', main, '-m', 'independent containing merge',
+    ]).trim();
+    const topB = f.push('lane/top-b', topBBase, { 'top-b.txt': 'last container\n' });
     if (reviewedEdge) gitOk(f.author, ['push', '-q', 'origin', `${topA}:refs/heads/edge/lane/base`]);
     f.fetch();
+    for (const top of [topA, topB]) expect(isAncestor(f.clone, base, top)).toBe(true);
+    expect(isAncestor(f.clone, topA, topB)).toBe(nested);
+    expect(isAncestor(f.clone, topB, topA)).toBe(false);
     const plan = await planRebuild({
       git: f.runGit, headSha: base, mainRef: 'origin/main', edgeResolve: reviewedEdge,
       overlays: [{ ref: 'lane/base', pinned: true, ...(reviewedEdge ? { edgeResolution: { sha: topA } } : {}) },
@@ -595,10 +606,15 @@ describe('held item 212 review round 1 — landed overlays and pinned bases', ()
       ? ['lane/base', 'lane/top-a', 'lane/top-b'] : ['lane/top-a', 'lane/top-b', 'lane/base']);
     expect(plan.decisions.find((d) => d.ref === 'lane/base')).toMatchObject(reviewedEdge
       ? { action: 'apply', reason: 'applied-edge-ref' } : { action: 'skip', reason: 'pinned-contained-in-applied' });
+    expect(plan.decisions.find((d) => d.ref === 'lane/top-a')).toMatchObject(nested
+      ? { action: 'skip', reason: 'stack-contained', tops: ['lane/top-b'] }
+      : reviewedEdge ? { action: 'remove', reason: 'in-main' } : { action: 'apply', reason: 'applied' });
     expect(plan.applied.map((a) => a.ref)).toEqual(reviewedEdge
-      ? ['lane/base', 'lane/top-b'] : ['lane/top-a', 'lane/top-b']);
+      ? ['lane/base', 'lane/top-b'] : nested ? ['lane/top-b'] : ['lane/top-a', 'lane/top-b']);
     expect(plan.establishedLost).toEqual([]);
     for (const sha of [base, topA, topB]) expect(isAncestor(f.clone, sha, plan.finalSha)).toBe(true);
+    expect(gitOk(f.clone, ['show', `${plan.finalSha}:${TAKEOVER}`])).toBe(lines({ 2: 'consolidated base and main' }));
+    expect(gitOk(f.clone, ['show', `${plan.finalSha}:top-b.txt`])).toBe('last container\n');
   });
 
   it('an unreadable base merge cannot authorize deferral', async () => {
