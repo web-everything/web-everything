@@ -830,13 +830,13 @@ export async function readPolicySpecRegistryAt(ref, { root = resolve(dirname(fil
       const source = execFileSync('git', ['show', `${commit}:scripts/lib/${file}`], options);
       writeFileSync(join(scratch, file), source);
     }
+    // Resolve the child's static import from the scratch directory. An embedded dynamic import makes
+    // the parent appear incomplete to import-closure.mjs, disabling path-scoped dispatch and smoke checks.
     const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
-      import { pathToFileURL } from 'node:url';
-      const registry = await import(pathToFileURL(process.argv[1]).href);
-      const entries = registry.POLICY_SPEC_BASENAMES;
+      import { POLICY_SPEC_BASENAMES as entries } from './gate-config.mjs';
       if (!(entries instanceof Set) || entries.size === 0) process.exit(1);
       process.stdout.write(JSON.stringify([...entries]));
-    `, join(scratch, 'gate-config.mjs')], options);
+    `], { ...options, cwd: scratch });
     const entries = JSON.parse(output);
     if (!Array.isArray(entries) || entries.length === 0 || entries.some(entry =>
       typeof entry !== 'string' || !entry || entry === '.' || entry === '..' || /[\\/\x00-\x1f\x7f-\x9f]/.test(entry))) return null;
