@@ -68,6 +68,9 @@ It emits one cleanup needs-you event and alert, including both reasons if both r
 and retains the original registration and pending swap. The report/scratch/both cleanup cases
 in `daemon-rebuild-auto-rebase.test.mjs` pin those guarantees.
 The existing [test-selection fallback and durable evidence](../../scripts/lib/__tests__/daemon-rebuild-auto-rebase.test.mjs) cases cover overlay tests, reverse imports, skipped empty runners and exact audit refusal.
+Report and scratch cleanup are both attempted. A cleanup pass emits one needs-you incident containing
+each removal failure; scratch cleanup failure still rejects the worker, while report-only failure remains
+best-effort. The cleanup regression covers report-only, scratch-only and simultaneous failures.
 Missing related tests fall back to overlay-branch tests plus import reach; fenced `noTestFiles` reaches the required audit, which must certify exactly `NOT WEAKENED`.
 Selection rules and original conflict markers persist as JSONL evidence before tests; each conflict read and capture is capped at 65,536 bytes, with its descriptor closed in `finally`.
 Evidence append failures stop at stage `tests` before tests, audit, push or registration; the needs-you event remains the fallback when the alerts file is unwritable.
@@ -77,6 +80,14 @@ Any existing test removed by resolution requires human review at stage `tests`, 
 remain or an auditor would certify the result. Unreadable tree listings also fail closed.
 The `codex-audit-required` fallback covers genuinely uncovered files only; it cannot rescue deleted tests.
 Capture skips non-regular files and platforms without `O_NOFOLLOW`; inspection, open and read failures remain best-effort omissions from evidence.
+
+## Copied CLI fixtures
+
+When copying `scripts/` into a throwaway checkout, link that checkout's `node_modules` to the source
+checkout's installed dependencies. Run the copied entry point so its `import.meta.url` still resolves
+mutations inside the fixture. Node resolves package imports from the copied modules' location, even
+when the child process runs from another directory. Keep the dependency link at the fixture root when
+moving its `scripts/` subtree for locus guards, and remove the fixture during teardown.
 
 ## Daemon entry boot smoke
 

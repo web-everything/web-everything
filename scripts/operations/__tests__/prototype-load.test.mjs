@@ -3,10 +3,13 @@
  * WHY (incident 2026-10-22): pin main preservation, ready evidence, adopt-before-remove, stale
  * replacement, and adoption refusal with injected doubles, plus real filesystem refusal persistence.
  */
-import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { createRequire } from 'node:module';
+import { runInNewContext } from 'node:vm';
 import { withRealRepo, withBareOrigin } from './helpers/real-repo.mjs';
 import { createPrototypeLoader, defaultDeps } from '../prototype-load-io.mjs';
 import { changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
@@ -53,8 +56,10 @@ function fixture(options = {}) {
   const fail = (status, stdout = '', stderr = 'failed') => { throw Object.assign(new Error(stderr), { status, stdout, stderr }); };
   const exec = (cmd, args, config) => {
     calls.push({ cmd, args, config });
+    if (options.combinedIO?.handles(cmd, args)) return options.combinedIO.exec(cmd, args, config);
     expect(args.join(' ')).not.toMatch(/--allow-conflict|--force|--allow-no-pr/);
-    expect(Object.keys(config.env).sort()).toEqual(['HOME', 'PATH', 'USER', ...(env.WE_DAEMON_OVERLAY_DIR ? ['WE_DAEMON_OVERLAY_DIR'] : []), ...(env.WE_OVERLAY_NO_PR?.trim() === 'refuse' ? ['WE_OVERLAY_NO_PR'] : [])]);
+    expect(Object.keys(config.env).sort()).toEqual(['HOME', 'PATH', 'USER', ...Object.keys(options.gitEnv || {}), ...(env.WE_DAEMON_OVERLAY_DIR ? ['WE_DAEMON_OVERLAY_DIR'] : []), ...(env.WE_OVERLAY_NO_PR?.trim() === 'refuse' ? ['WE_OVERLAY_NO_PR'] : [])].sort());
+    if (options.gitEnv) expect(config.env).toMatchObject(options.gitEnv);
     if (options.execFailure === args[0]) throw Object.assign(new Error('maxBuffer exceeded; inspect full output separately'), { code: 'ENOBUFS' });
     if (cmd === 'plutil') return JSON.stringify({ WorkingDirectory: '/home/test/workspace/review' });
     if (cmd === 'node') {
@@ -67,7 +72,7 @@ function fixture(options = {}) {
         if (options.checkRaw) return options.checkRaw;
         if (options.unverifiable === ref) return fail(1, JSON.stringify({ check: { ok: false } }));
         const clean = !(options.conflicts || []).includes(ref);
-        const data = JSON.stringify({ check: { ok: true, clean, candSha: remoteTip, ...(clean ? {} : { files: ['x'], conflicting: [{ ref: 'lane/other' }] }) }, wouldRegister: clean });
+        const data = JSON.stringify({ check: { ok: true, clean, candSha: remoteTip, ...(clean ? {} : { files: options.checkFiles?.[ref] ?? ['x'], conflicting: [{ ref: 'lane/other' }] }) }, wouldRegister: clean });
         if (options.advanceAfterCheck && ref === (options.behind ? 'lane/new-m1' : BASE.branch)) remoteTip = TREE;
         return clean ? data : fail(3, data);
       }
@@ -116,7 +121,21 @@ function fixture(options = {}) {
       if (options.tipReadFails && tipReads > 1) return fail(1);
       return options.tip || remoteTip;
     }
-    if (args[0] === 'diff') return args.at(-1).startsWith('origin/main...') ? 'M\0x\0' : options.diff ?? 'M\0x\0';
+    if (args[0] === 'diff') {
+      const ref = args.at(-1).startsWith('origin/main...origin/') ? args.at(-1).slice('origin/main...origin/'.length) : null;
+      if (registrations.has(ref)) {
+        expect(args.slice(1, 4)).toEqual(['--name-status', '-z', `origin/main...origin/${ref}`]);
+        if (options.staleDiffFails === ref) return fail(1);
+        if (options.staleChanged?.[ref] !== undefined) return options.staleChanged[ref];
+      }
+      return args.at(-1).startsWith('origin/main...') ? 'M\0x\0' : options.diff ?? 'M\0x\0';
+    }
+    if (args[0] === 'cherry') {
+      expect(args.slice(1, 2)).toEqual(['origin/main']);
+      const ref = args[2]?.replace(/^origin\//, '');
+      expect(registrations.has(ref)).toBe(true);
+      return options.cherry?.[ref] ?? `+ ${SHA}\n`;
+    }
     if (args[0] === 'merge-base') {
       if (args[2] === 'origin/main') return options.behind ? fail(1) : '';
       if (args[2] === TREE) return options.advancedContained ? '' : fail(1);
@@ -141,12 +160,381 @@ function fixture(options = {}) {
     if (args[0] === 'push') { remoteTip = MERGE; return ''; }
     throw new Error(`unexpected command ${cmd} ${args}`);
   };
-  const load = createPrototypeLoader({ exec, fs, env, settings: structuredClone(settings), now: () => clock,
+  const combinedTest = vi.fn(async (input) => typeof options.combinedTest === 'function'
+    ? options.combinedTest(input)
+    : options.combinedTest ?? { ok: false, command: 'fixture-related-tests', result: 'failed', reason: 'tests-failed' });
+  if (options.combinedIO) Object.assign(fs, options.combinedIO.fs);
+  const load = createPrototypeLoader({ exec, fs, env, ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone(settings), now: () => clock,
     cloneKey: (root) => { cloneRoots.push(root); return 'test-clone-key'; },
     sleep: async (ms) => { sleeps.push(ms); clock += ms; await options.onSleep?.(); } });
-  return { calls, records, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
+  return { calls, records, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
 }
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
+describe('default combined-tree test proof', () => {
+  const limits = { waitMs: 1234, timeoutMs: 5678, maxBuffer: 4096 };
+  const report = { success: true, numFailedTests: 0, numFailedTestSuites: 0,
+    numPassedTests: 3, numPendingTests: 2, numTodoTests: 1, numTotalTests: 5, testResults: [
+      { name: 'one.test.mjs', status: 'passed', assertionResults: [{ status: 'passed' }, { status: 'skipped' }, { status: 'todo' }] },
+      { name: 'two.test.mjs', status: 'passed', assertionResults: [{ status: 'passed' }, { status: 'passed' }] },
+    ] };
+  async function runReport(value, { missing = false, failure, cleanupRemains = false, env = {}, sourceFiles, changedFiles, runTests, mergeConflict = false, unreadable = false } = {}) {
+    const worktree = '/tmp/prototype-combined-proof';
+    const sources = new Map(sourceFiles || [['one.test.mjs', ''], ['two.test.mjs', '']]);
+    let reportPath;
+    let selectedTests = [];
+    const fs = {
+      mkdtempSync: () => worktree, existsSync: vi.fn((path) => path === worktree && cleanupRemains), rmSync: vi.fn(),
+      readFileSync: vi.fn((path) => {
+        if (path === reportPath) {
+          if (missing) throw new Error('missing report');
+          const reported = typeof value === 'function' ? value(selectedTests) : value;
+          return typeof reported === 'string' ? reported : JSON.stringify(reported);
+        }
+        if (unreadable) throw new Error('permission denied');
+        const source = sources.get(path.slice(worktree.length + 1));
+        if (source === undefined) throw new Error('unexpected read');
+        return source;
+      }),
+    };
+    const exec = vi.fn((command, args) => {
+      if (command === 'node') {
+        selectedTests = args.filter(arg => sources.has(arg));
+        reportPath = args.find(arg => arg.startsWith('--outputFile='))?.slice('--outputFile='.length);
+        if (failure) throw failure;
+        runTests?.(selectedTests);
+        return ''; // Exit zero alone proves nothing.
+      }
+      if (args[0] === '-C' || args[0] === 'rev-parse') return SHA;
+      if (['fetch', 'merge-base', 'worktree'].includes(args[0])) return '';
+      if (args[0] === 'merge-tree') {
+        if (mergeConflict) throw Object.assign(new Error('merge conflict'), { status: 1 });
+        return TREE;
+      }
+      if (args[0] === 'commit-tree') return MERGE;
+      if (args[0] === 'ls-files') return [...sources.keys()].join('\0') + '\0';
+      throw new Error('unexpected command');
+    });
+    const result = await defaultDeps().combinedTest({ clone: '/fixture/clone', candidateSha: SHA,
+      changedFiles: changedFiles ?? [...sources.keys()], refs: ['lane/old'] }, { exec, fs, env, settings: { combinedTest: limits } });
+    return { result, exec, fs, worktree, reportPath };
+  }
+  it.each(Object.keys(limits).flatMap(key => [0, -1, 1.5].map(value => [key, value])))(
+    'rejects invalid %s=%s before spawning anything', async (key, value) => {
+      const exec = vi.fn();
+      await expect(defaultDeps().combinedTest({}, { exec, fs: {}, env: {},
+        settings: { combinedTest: { ...limits, [key]: value } } })).rejects.toThrow(`invalid combinedTest.${key}`);
+      expect(exec).not.toHaveBeenCalled();
+    });
+  it('refuses a real combined-tree merge conflict without spawning tests', async () => {
+    const { result, exec } = await runReport(report, { mergeConflict: true });
+    expect(result).toEqual({ ok: false, reason: 'combined-merge-conflict' });
+    expect(exec.mock.calls.some(([command]) => command === 'node')).toBe(false);
+  });
+  it('refuses zero related tests without spawning tests', async () => {
+    const { result, exec } = await runReport(report, { sourceFiles: [['source.mjs', '']] });
+    expect(result).toMatchObject({ ok: false, reason: 'no-related-tests', testCount: 0 });
+    expect(exec.mock.calls.some(([command]) => command === 'node')).toBe(false);
+  });
+  it('throws sources incomplete for unreadable tracked sources before spawning tests', async () => {
+    await expect(runReport(report, { unreadable: true })).rejects.toThrow('sources incomplete');
+  });
+  it.each(['file', 'symlink', 'directory', 'fresh'])('requires a report from this invocation (report fixture: %s)', async (kind) => {
+    const fs = defaultDeps().fs;
+    const root = fs.mkdtempSync(join(tmpdir(), 'prototype-report-freshness-'));
+    const worktree = join(root, 'worktree');
+    const reportPath = join(worktree, '.prototype-vitest-results.json');
+    const oldReport = join(root, 'old-report.json');
+    const passingReport = JSON.stringify({ success: true, numFailedTests: 0, numFailedTestSuites: 0,
+      numPassedTests: 1, numPendingTests: 0, numTodoTests: 0, numTotalTests: 1,
+      testResults: [{ name: 'one.test.mjs', status: 'passed', assertionResults: [{ status: 'passed' }] }] });
+    fs.mkdirSync(worktree);
+    fs.writeFileSync(oldReport, passingReport);
+    const exec = vi.fn((command, args) => {
+      if (command === 'node') {
+        if (kind === 'fresh') fs.writeFileSync(reportPath, passingReport);
+        return ''; // Other cases model config exiting zero without writing a report.
+      }
+      if (args[0] === 'worktree' && args[1] === 'add') {
+        fs.writeFileSync(join(worktree, 'one.test.mjs'), kind === 'fresh' ? '' : "throw new Error('test must fail');");
+        fs.writeFileSync(join(worktree, 'vitest.config.mjs'), kind === 'fresh' ? '' : 'process.exit(0);');
+        if (kind === 'symlink') fs.symlinkSync(oldReport, reportPath);
+        else if (kind === 'directory') fs.mkdirSync(reportPath);
+        else fs.writeFileSync(reportPath, passingReport);
+        return '';
+      }
+      if (args[0] === '-C' || args[0] === 'rev-parse') return SHA;
+      if (['fetch', 'merge-base', 'worktree'].includes(args[0])) return '';
+      if (args[0] === 'merge-tree') return TREE;
+      if (args[0] === 'commit-tree') return MERGE;
+      if (args[0] === 'ls-files') return 'one.test.mjs\0vitest.config.mjs\0.prototype-vitest-results.json\0';
+      throw new Error('unexpected command');
+    });
+    try {
+      const result = await defaultDeps().combinedTest({ clone: '/fixture/clone', candidateSha: SHA,
+        refs: ['lane/old'] }, { exec, fs: { ...fs, mkdtempSync: () => worktree }, env: {},
+        settings: { combinedTest: limits } });
+      expect(result).toMatchObject(kind === 'fresh' ? { ok: true, result: '1 passed, 0 skipped' }
+        : { ok: false, reason: kind === 'directory' ? 'tests-failed' : 'tests-unproven' });
+      if (kind === 'directory') expect(exec.mock.calls.some(([command]) => command === 'node')).toBe(false);
+      const loader = fixture({ list: ['lane/old'], conflicts: ['lane/old'], combinedTest: result });
+      expect((await loader.run()).ok).toBe(kind === 'fresh');
+      if (kind !== 'fresh') {
+        expect(mutations(loader, 'add')).toEqual([]);
+        expect(mutations(loader, 'remove')).toEqual([]);
+      }
+      expect(fs.existsSync(worktree)).toBe(false);
+      expect(fs.readFileSync(oldReport, 'utf8')).toBe(passingReport);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+  it('refuses combined evidence when an unimported filesystem-dependent test fails', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'prototype-fs-dependency-'));
+    const combination = `const { readFileSync } = require('node:fs');
+      const enabled = name => JSON.parse(readFileSync(require('node:path').join(root, name), 'utf8')).enabled;
+      if (enabled('a.json') && enabled('b.json')) throw new Error('both enabled');`;
+    const runCombination = () => runInNewContext(combination, { root, require: createRequire(import.meta.url) }, { timeout: 1000 });
+    const writeConfig = (a, b) => {
+      writeFileSync(join(root, 'a.json'), JSON.stringify({ enabled: a }));
+      writeFileSync(join(root, 'b.json'), JSON.stringify({ enabled: b }));
+    };
+    try {
+      for (const [a, b] of [[true, false], [false, true]]) {
+        writeConfig(a, b);
+        expect(runCombination).not.toThrow(); // Each branch alone passes.
+      }
+      writeConfig(true, true);
+      expect(runCombination).toThrow('both enabled');
+      const { result, exec } = await runReport({ success: true, numFailedTests: 0, numFailedTestSuites: 0,
+        numPassedTests: 1, numPendingTests: 0, numTodoTests: 0, numTotalTests: 1,
+        testResults: [{ name: 'shared.test.mjs', status: 'passed', assertionResults: [{ status: 'passed' }] }] }, {
+        sourceFiles: [['shared.mjs', 'export const shared = true;'], ['shared.test.mjs', "import './shared.mjs';"],
+          ['a.json', '{"enabled":true}'], ['b.json', '{"enabled":true}'], ['combination.test.mjs', combination]],
+        changedFiles: ['shared.mjs', 'a.json', 'b.json'],
+        runTests: tests => {
+          if (tests.includes('combination.test.mjs')) {
+            try { runCombination(); }
+            catch (error) { throw Object.assign(error, { status: 1, stderr: error.message }); }
+          }
+        },
+      });
+      expect(result).toMatchObject({ ok: false, reason: 'tests-failed' });
+      expect(exec.mock.calls.find(([command]) => command === 'node')[1]).toContain('combination.test.mjs');
+      const loader = fixture({ list: ['lane/old'], conflicts: ['lane/old'], combinedTest: result });
+      expect(await loader.run()).toMatchObject({ ok: false, stopReason: 'stale-registration', staleTolerated: [] });
+      expect(mutations(loader, 'add')).toEqual([]);
+      expect(mutations(loader, 'remove')).toEqual([]);
+      expect(loader.records[0]).toMatchObject({ ok: false, stopReason: 'stale-registration' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  const passingReport = tests => ({ success: true, numFailedTests: 0, numFailedTestSuites: 0,
+    numPassedTests: tests.length, numPendingTests: 0, numTodoTests: 0, numTotalTests: tests.length,
+    testResults: tests.map(name => ({ name, status: 'passed', assertionResults: [{ status: 'passed' }] })) });
+  it('requires all tracked test suffixes even with no static import edges or changed tests', async () => {
+    const tests = ['mjs', 'cjs', 'js', 'jsx', 'ts', 'tsx', 'mts', 'cts'].map(ext => `indirect.test.${ext}`).sort();
+    const { result, exec } = await runReport(passingReport, {
+      sourceFiles: [['source.mjs', ''], ...tests.map(file => [file, ''])], changedFiles: ['source.mjs'],
+    });
+    expect(result).toMatchObject({ ok: true, testCount: tests.length });
+    expect(exec.mock.calls.find(([command]) => command === 'node')[1].slice(-tests.length)).toEqual(tests);
+  });
+  it('refuses a passing report that omits an unimported tracked test', async () => {
+    const { result } = await runReport(passingReport(['one.test.mjs']), { changedFiles: ['one.test.mjs'] });
+    expect(result).toMatchObject({ ok: false, reason: 'tests-unproven', testCount: 2 });
+  });
+  it.each([0, 1])('bounds the complete inventory even when no imports reveal its tests (over limit: %s)', async extra => {
+    const { MAX_RELATED_TARGETS } = await import('../../lib/verify-lane-gate.mjs');
+    const tests = Array.from({ length: MAX_RELATED_TARGETS + extra }, (_, i) => `indirect-${i}.test.mjs`);
+    const { result, exec, fs, worktree } = await runReport(passingReport, {
+      sourceFiles: [['source.mjs', ''], ...tests.map(file => [file, ''])], changedFiles: ['source.mjs'],
+    });
+    if (extra) {
+      expect(result).toMatchObject({ ok: false, reason: 'related-tests-truncated', testCount: 0,
+        result: expect.stringContaining('Rebase and retest the overlapping refs') });
+      expect(exec.mock.calls.some(([command]) => command === 'node')).toBe(false);
+    } else expect(result).toMatchObject({ ok: true, testCount: MAX_RELATED_TARGETS });
+    expect(fs.rmSync).toHaveBeenCalledWith(worktree, { recursive: true, force: true });
+  });
+  it('drops credentials only from the tests child and preserves ordinary and NODE_* variables', async () => {
+    const safe = { PATH: '/bin', HOME: '/home/test', TMPDIR: '/tmp', USER: 'tester', NODE_OPTIONS: '--no-warnings', NODE_ENV: 'test' };
+    const secrets = { SSH_AUTH_SOCK: '/agent', GIT_ASKPASS: '/askpass', GIT_SSH_COMMAND: 'ssh', GH_TOKEN: 'gh',
+      GITHUB_TOKEN: 'github', SERVICE_TOKEN: 'token', SERVICE_SECRET: 'secret', SERVICE_KEY: 'key', NODE_API_KEY: 'key' };
+    const env = { ...safe, ...secrets };
+    const { exec } = await runReport(report, { env });
+    expect(exec.mock.calls.find(([command]) => command === 'node')[2].env).toEqual(safe);
+    for (const [command, , options] of exec.mock.calls) if (command === 'git') expect(options.env).toEqual(env);
+  });
+  it('requires positive JSON proof and reports passed and skipped test counts', async () => {
+    const { result, exec, fs, worktree, reportPath } = await runReport(report);
+    expect(result).toMatchObject({ ok: true, testCount: 2, result: '3 passed, 2 skipped' });
+    const [, args, options] = exec.mock.calls.find(([command]) => command === 'node');
+    expect(args.slice(args.indexOf('vitest'))).toEqual(['vitest', 'run', '--reporter=json',
+      `--outputFile=${reportPath}`, '--testTimeout=30000', '--hookTimeout=60000', '--teardownTimeout=10000',
+      'one.test.mjs', 'two.test.mjs']);
+    expect(reportPath.startsWith(worktree + '/')).toBe(true);
+    expect(fs.readFileSync).toHaveBeenCalledWith(reportPath, 'utf8');
+    expect(args.slice(0, args.indexOf('--'))).toContain(`--ceiling-ms=${limits.timeoutMs}`);
+    expect(options).toMatchObject({ cwd: worktree, timeout: limits.timeoutMs, maxBuffer: limits.maxBuffer, shell: false,
+      killSignal: 'SIGTERM' });
+    expect(fs.rmSync).toHaveBeenCalledWith(worktree, { recursive: true, force: true });
+  });
+  it('accepts actual Vitest JSON containing skipped and todo tests', async () => {
+    // Serialized by Vitest 3.2.4 JsonReporter.onFinished with pass/skip/todo task
+    // records (the todo has result.state=skip). No test runner is spawned here.
+    // Source: https://github.com/vitest-dev/vitest/blob/v3.2.4/packages/vitest/src/node/reporters/json.ts
+    const json = `{
+      "numTotalTestSuites": 2, "numPassedTestSuites": 2, "numFailedTestSuites": 0, "numPendingTestSuites": 0,
+      "numTotalTests": 5, "numPassedTests": 3, "numFailedTests": 0, "numPendingTests": 2, "numTodoTests": 1,
+      "snapshot": {}, "startTime": 0, "success": true,
+      "testResults": [
+        {"assertionResults": [
+          {"ancestorTitles": [],"fullName": "case 0","status": "passed","title": "case 0","duration": 0,"failureMessages": [],"meta": {}},
+          {"ancestorTitles": [],"fullName": "case 1","status": "skipped","title": "case 1","duration": 0,"failureMessages": [],"meta": {}},
+          {"ancestorTitles": [],"fullName": "case 2","status": "skipped","title": "case 2","duration": 0,"failureMessages": [],"meta": {}}
+        ], "startTime": 0, "endTime": 0, "status": "passed", "message": "", "name": "one.test.mjs"},
+        {"assertionResults": [
+          {"ancestorTitles": [],"fullName": "case 0","status": "passed","title": "case 0","duration": 0,"failureMessages": [],"meta": {}},
+          {"ancestorTitles": [],"fullName": "case 1","status": "passed","title": "case 1","duration": 0,"failureMessages": [],"meta": {}}
+        ], "startTime": 0, "endTime": 0, "status": "passed", "message": "", "name": "two.test.mjs"}
+      ]
+    }`;
+    expect(JSON.parse(json)).toMatchObject({ numPendingTests: 2, numTodoTests: 1, numTotalTests: 5 });
+    expect((await runReport(json)).result).toMatchObject({ ok: true, testCount: 2, result: '3 passed, 2 skipped' });
+  });
+  it('accepts separately reported todo assertions without double-counting the summary', async () => {
+    expect((await runReport({ ...report, numPendingTests: 1 })).result)
+      .toMatchObject({ ok: true, testCount: 2, result: '3 passed, 2 skipped' });
+  });
+  it('rejects a todo count larger than all skipped assertions in reporter output', async () => {
+    const value = structuredClone(report);
+    value.testResults[0].assertionResults[2].status = 'skipped';
+    value.numTodoTests = 3;
+    expect((await runReport(value)).result).toMatchObject({ ok: false, reason: 'tests-unproven' });
+  });
+  it('accepts absolute worktree file names and reordered results', async () => {
+    const value = { ...report, testResults: [...report.testResults].reverse().map(file => ({
+      ...file, name: `/tmp/prototype-combined-proof/${file.name}`,
+    })) };
+    expect((await runReport(value)).result.ok).toBe(true);
+  });
+  it.each([
+    ['wrong file', files => { files[1].name = 'other.test.mjs'; }],
+    ['duplicate file', files => { files[1].name = files[0].name; }],
+    ['outside worktree', files => { files[1].name = '../two.test.mjs'; }],
+    ['missing name', files => { delete files[1].name; }],
+    ['missing file status', files => { delete files[1].status; }],
+    ['failed file status', files => { files[1].status = 'failed'; }],
+    ['skipped file status', files => { files[1].status = 'skipped'; }],
+    ['missing assertions', files => { delete files[1].assertionResults; }],
+    ['empty assertions', files => { files[1].assertionResults = []; }],
+    ['failed assertion with green counts', files => { files[1].assertionResults.push({ status: 'failed' }); }],
+    ['unknown assertion status', files => { files[1].assertionResults.push({ status: 'unknown' }); }],
+    ['null assertion', files => { files[1].assertionResults.push(null); }],
+    ['skipped-only file despite overall passes', files => { files[1].assertionResults = [{ status: 'skipped' }, { status: 'todo' }]; }],
+    ['null file', files => { files[1] = null; }],
+  ])('rejects %s in fake JSON despite green aggregate counts', async (_name, mutate) => {
+    const value = structuredClone(report);
+    mutate(value.testResults);
+    const { result, fs, worktree } = await runReport(value);
+    expect(result).toMatchObject({ ok: false, reason: 'tests-unproven' });
+    expect(fs.existsSync).toHaveBeenCalledWith(worktree);
+    expect(result.result).toContain('temp worktree removed');
+  });
+  it.each(['numPassedTests', 'numFailedTests', 'numPendingTests', 'numTodoTests', 'numTotalTests'])(
+    'fails closed on missing or invalid %s without unknown counts', async (key) => {
+      for (const invalid of [undefined, null, '0', -1, 0.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+        const value = { ...report, [key]: invalid };
+        const { result } = await runReport(value);
+        expect(result).toMatchObject({ ok: false, reason: 'tests-unproven' });
+        expect(result.result).not.toContain('unknown');
+      }
+    },
+  );
+  it.each([
+    ['passed', { numPassedTests: 4, numTotalTests: 6 }],
+    ['pending', { numPendingTests: 3, numTotalTests: 6 }],
+    ['todo', { numTodoTests: 2, numTotalTests: 6 }],
+    ['total', { numTotalTests: 6 }],
+    ['balanced pending/todo', { numPendingTests: 0, numTodoTests: 2 }],
+  ])('rejects %s counts inconsistent with individual assertions', async (_name, counts) => {
+    const { result } = await runReport({ ...report, ...counts });
+    expect(result).toMatchObject({ ok: false, reason: 'tests-unproven' });
+    expect(result.result).toContain('counts mismatch');
+  });
+  it.each(['', ' ', '\n', '"', "'", '(', ')', ':', '='])(
+    'redacts arbitrary absolute paths from failed-run output after %j', async (prefix) => {
+      const { result } = await runReport(report, { failure: Object.assign(new Error('runner failed'), {
+        status: 1, stderr: `${prefix}/srv/x/y ${prefix}/mnt/a/b`,
+      }) });
+      expect(result).toMatchObject({ ok: false, reason: 'tests-failed' });
+      expect(result.result).not.toMatch(/\/srv\/x\/y|\/mnt\/a\/b/);
+      expect(result.result).toContain(`${prefix}<path> ${prefix}<path>`);
+    },
+  );
+  it.each(['[', ']', ',', '{', '}', ';', '!', '?', '+', '-', '@', '#', '$', '%', '&', '*', '/', '\\', '|', '~', '`'])(
+    'preserves legacy delimiter %j redaction in persisted failed-run output', async (prefix) => {
+      const raw = `${prefix}/home/fixture/secret.txt] ${prefix}/srv/x/y ${prefix}/mnt/a/b`;
+      const { result } = await runReport(report, { failure: Object.assign(new Error('runner failed'), {
+        status: 1, stderr: raw,
+      }) });
+      expect(result).toMatchObject({ ok: false, reason: 'tests-failed' });
+      expect(result.result.match(/<path>/g)).toHaveLength(3);
+      const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], combinedTest: result });
+      const loaded = await f.run();
+      expect(loaded).toMatchObject({ ok: false, stopReason: 'stale-registration', staleTolerated: [] });
+      for (const output of [result, loaded, ...f.records]) {
+        expect(JSON.stringify(output)).not.toMatch(/\/home\/fixture\/secret\.txt|\/srv\/x\/y|\/mnt\/a\/b/);
+      }
+      expect(mutations(f, 'add')).toEqual([]);
+      expect(mutations(f, 'remove')).toEqual([]);
+    },
+  );
+  it('redacts ANSI-prefixed and single-component absolute paths from failed-run output', async () => {
+    const { result } = await runReport(report, { failure: Object.assign(new Error('runner failed'), { status: 1, stderr: '\u001b[31m/srv/private/file and /secret end' }) });
+    expect(result.result).not.toMatch(/srv|private\/file|\/secret/);
+    expect(result.result).not.toMatch(/\u001b/);
+  });
+  it('redacts home and other absolute paths from failed-run output', async () => {
+    const { result } = await runReport(report, { failure: Object.assign(new Error('runner failed'), { status: 1, stderr: 'at /Users/fixture/secret/dir/file.mjs:3 and /private/var/x/y' }) });
+    expect(result.result).not.toMatch(/\/Users\/fixture|\/private\/var/);
+    expect(result.result).toContain('<path>');
+  });
+  it.each([
+    ['timeout', { code: 'ETIMEDOUT', status: null, signal: 'SIGTERM' }],
+    ['nonzero exit', { status: 1, stderr: 'failed' }],
+    ['output overflow', { code: 'ENOBUFS', status: null }],
+    ['spawn failure', { code: 'ENOENT' }],
+  ])('verifies cleanup after %s and reports descendant ownership only as information', async (_name, failure) => {
+    const { result, fs, exec, worktree } = await runReport(report, { failure: Object.assign(new Error('runner failed'), failure) });
+    expect(result).toMatchObject({ ok: false, reason: 'tests-failed' });
+    expect(exec.mock.calls.some(([cmd, args]) => cmd === 'git' && args.join(' ') === `worktree remove --force ${worktree}`)).toBe(true);
+    expect(fs.rmSync).toHaveBeenCalledWith(worktree, { recursive: true, force: true });
+    expect(fs.existsSync).toHaveBeenCalledWith(worktree);
+    expect(result.result).toContain('temp worktree removed');
+    expect(result.result).toContain('child processes may outlive the timeout; heavy-admission owns them');
+  });
+  it('refuses unverifiable cleanup with an operator recovery instruction', async () => {
+    await expect(runReport(report, { failure: Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }), cleanupRemains: true }))
+      .rejects.toThrow('cleanup unproven; remove the temporary worktree and retry');
+  });
+  it.each([
+    ['missing JSON', report, { missing: true }], ['unparseable JSON', '{bad'],
+    ['null JSON', 'null'], ['skipped-only', { ...report, numPassedTests: 0 }],
+    ['unsuccessful run', { ...report, success: false }], ['missing success', { ...report, success: undefined }],
+    ['failed tests', { ...report, numFailedTests: 1 }], ['failed suites', { ...report, numFailedTestSuites: 1 }],
+    ['missing counts', { success: true, testResults: [{}, {}] }],
+    ['missing results', { ...report, testResults: undefined }],
+    ['too few files', { ...report, testResults: [{}] }], ['too many files', { ...report, testResults: [{}, {}, {}] }],
+  ])('fails closed on exit zero with %s', async (_name, value, options) => {
+    const { result, fs, worktree } = await runReport(value, options);
+    expect(result).toMatchObject({ ok: false, reason: 'tests-unproven', testCount: 2 });
+    expect(result.result).toMatch(/passed.*skipped/);
+    expect(result.result).not.toContain('unknown');
+    expect(result.result.length).toBeLessThanOrEqual(300);
+    expect(fs.rmSync).toHaveBeenCalledWith(worktree, { recursive: true, force: true });
+  });
+});
+
 describe('prototype-load', () => {
   it('refuses missing readiness evidence and persists the refusal on a real filesystem', async () => {
     await withRealRepo(async ({ root }) => {
@@ -190,7 +578,403 @@ describe('prototype-load', () => {
     const f = fixture({ behind: true, diff: 'M\0x\0D\0main-fix\0' }); const r = await f.run(); expect(r.stopReason).toBe('reverts-main'); expect(r.offendingPaths).toEqual(['main-fix']); expect(f.calls.some((c) => c.cmd === 'node' || c.args[0] === 'push')).toBe(false);
   });
   it.each([false, true])('stale-registration names blocker and stops before add (candidate conflict: %s)', async (candidateConflict) => {
-    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old', ...(candidateConflict ? [BASE.branch] : [])] }); const r = await f.run(); expect(r.stopReason).toBe('stale-registration'); expect(r.message).toBe('stale-registration: lane/old'); expect(mutations(f, 'add')).toHaveLength(0);
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old', ...(candidateConflict ? [BASE.branch] : [])] }); const r = await f.run(); expect(r.stopReason).toBe('stale-registration'); expect(r.message).toBe(`stale-registration: lane/old (${candidateConflict ? 'candidate-not-clean' : 'overlap-with-candidate: x; combined-tests-failed: tests-failed'})`); expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('tolerates a pre-existing stale ref when the candidate is clean and file-disjoint', async () => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] }, staleChanged: { 'lane/old': 'M\0old-only.mjs\0' } });
+    const r = await f.run();
+    expect(r.check).toMatchObject({ ok: true, clean: true });
+    expect(r.mainCheck.effectivePaths).toEqual(['x']);
+    expect(r.staleChecks['lane/old']).toMatchObject({ ok: true, clean: false, files: ['old-only.mjs'] });
+    expect(r).toMatchObject({ ok: true, registered: true, adopted: true, stopReason: null, stale: ['lane/old'], contained: [] });
+    expect(r.staleTolerated).toEqual([{ ref: 'lane/old', landedByContent: false, why: expect.stringMatching(/\S/) }]);
+    expect(mutations(f, 'add')).toHaveLength(1);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(f.records).toHaveLength(1);
+    expect(f.records[0]).toMatchObject({ ok: true, staleTolerated: r.staleTolerated });
+  });
+  it('refuses a stale ref whose changed files overlap the candidate files', async () => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs', 'x'] }, staleChanged: { 'lane/old': 'M\0old-only.mjs\0' } });
+    const r = await f.run();
+    expect(r).toMatchObject({ ok: false, stopReason: 'stale-registration', blocking: ['lane/old'], blockingReasons: { 'lane/old': 'overlap-with-candidate: x; combined-tests-failed: tests-failed' } });
+    expect(r.message).toMatch(/^stale-registration: lane\/old/);
+    expect(r.message).toContain('overlap-with-candidate: x; combined-tests-failed: tests-failed');
+    expect(mutations(f, 'add')).toEqual([]);
+  });
+  it('refuses a stale ref whose non-conflicting changed file overlaps the candidate', async () => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] },
+      staleChanged: { 'lane/old': 'M\0old-only.mjs\0M\0x\0' } });
+    const r = await f.run();
+    expect(r.staleChecks['lane/old'].files).toEqual(['old-only.mjs']);
+    expect(r).toMatchObject({ ok: false, stopReason: 'stale-registration', blocking: ['lane/old'], blockingReasons: { 'lane/old': 'overlap-with-candidate: x; combined-tests-failed: tests-failed' } });
+    expect(r.message).toContain('overlap-with-candidate: x; combined-tests-failed: tests-failed');
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+  });
+  it('allows an overlapping stale ref when combined-tree tests pass', async () => {
+    const combinedTests = { command: 'fixture-related-tests', result: '2 passed', testCount: 2 };
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
+      staleChanged: { 'lane/old': 'M\0z-old.mjs\0M\0x\0M\0a-old.mjs\0' },
+      combinedTest: { ok: true, ...combinedTests } });
+    const r = await f.run();
+    expect(f.combinedTest).toHaveBeenCalledTimes(1);
+    expect(f.combinedTest).toHaveBeenCalledWith({ clone: '/home/test/workspace/wev-control', candidateSha: SHA,
+      changedFiles: ['a-old.mjs', 'x', 'z-old.mjs'], refs: ['lane/old'] });
+    expect(r).toMatchObject({ ok: true, registered: true, adopted: true, stopReason: null, contained: [] });
+    expect(r.combinedTests).toEqual(combinedTests);
+    expect(r.staleTolerated).toEqual([{ ref: 'lane/old', landedByContent: false,
+      why: expect.stringMatching(/combined/i), combinedTests }]);
+    expect(mutations(f, 'add')).toHaveLength(1);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(f.registrations.has('lane/old')).toBe(true);
+    expect(f.records).toHaveLength(1);
+    expect(f.records[0]).toMatchObject({ ok: true, combinedTests, staleTolerated: r.staleTolerated });
+  });
+  it('refuses an overlapping stale ref when combined-tree tests fail', async () => {
+    for (const reason of ['tests-failed', 'combined-merge-conflict', 'no-related-tests', 'unrunnable']) {
+      const combinedTests = { command: 'fixture-related-tests', result: 'no passing evidence', testCount: 0 };
+      const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
+        combinedTest: { ok: false, reason, ...combinedTests } });
+      const r = await f.run();
+      expect(f.combinedTest).toHaveBeenCalledTimes(1);
+      expect(r).toMatchObject({ ok: false, registered: false, adopted: false, stopReason: 'stale-registration',
+        blocking: ['lane/old'], blockingReasons: { 'lane/old': `overlap-with-candidate: x; combined-tests-failed: ${reason}` },
+        combinedTests });
+      expect(r.message).toBe(`stale-registration: lane/old (overlap-with-candidate: x; combined-tests-failed: ${reason})`);
+      expect(r.staleTolerated).toEqual([]);
+      expect(mutations(f, 'add')).toEqual([]);
+      expect(mutations(f, 'remove')).toEqual([]);
+      expect(f.records).toHaveLength(1);
+      expect(f.records[0]).toMatchObject({ stopReason: 'stale-registration', combinedTests: r.combinedTests, staleTolerated: [] });
+    }
+  });
+  it('blocks admission for truncated combined evidence when selected tests pass but an omitted related test fails', async () => {
+    const { MAX_RELATED_TARGETS } = await import('../../lib/verify-lane-gate.mjs');
+    const { buildReverseImportGraph, selectRelatedTests } = await import('../../lib/related-test-selection.mjs');
+    const sources = new Map([
+      ['x', ''], ['bridge.mjs', "import './x';"], ['deep.mjs', "import './bridge.mjs';"],
+      ['omitted.test.mjs', "import './deep.mjs';"],
+      ...Array.from({ length: MAX_RELATED_TARGETS }, (_, i) => [`passing-${i}.test.mjs`, "import './x';"]),
+    ]);
+    const reverse = buildReverseImportGraph({ files: [...sources.keys()], readFile: (file) => sources.get(file) });
+    const selection = selectRelatedTests({ changedFiles: ['x'], reverse, maxTests: MAX_RELATED_TARGETS, maxDepth: 2 });
+    expect(selection.status).toBe('selection-truncated');
+    expect(selection.tests).toHaveLength(MAX_RELATED_TARGETS);
+    expect(selection.tests).not.toContain('omitted.test.mjs');
+    // Model the regression: the bounded subset passes, but complete evidence would fail.
+    const testRunner = (tests) => {
+      if (tests.includes('omitted.test.mjs')) throw Object.assign(new Error('omitted related regression'), { status: 1, stderr: 'omitted related regression' });
+      return '';
+    };
+    expect(testRunner(selection.tests)).toBe('');
+    expect(() => testRunner([...selection.tests, 'omitted.test.mjs'])).toThrow('omitted related regression');
+    const queuedRun = vi.fn((args) => testRunner(args));
+    const commands = [];
+    const worktree = '/tmp/prototype-combined-fixture';
+    const fs = {
+      mkdtempSync: vi.fn(() => worktree), existsSync: () => false,
+      readFileSync: (path) => {
+        const file = path.slice(worktree.length + 1);
+        if (!sources.has(file)) throw new Error(`unexpected read: ${file}`);
+        return sources.get(file);
+      },
+      rmSync: vi.fn(),
+    };
+    const exec = (command, args) => {
+      commands.push({ command, args });
+      if (command === 'node') return queuedRun(args);
+      if (args[0] === '-C') return SHA;
+      if (args[0] === 'rev-parse') return SHA;
+      if (args[0] === 'merge-base') return '';
+      if (args[0] === 'fetch' || args[0] === 'worktree') return '';
+      if (args[0] === 'merge-tree') return TREE;
+      if (args[0] === 'commit-tree') return MERGE;
+      if (args[0] === 'ls-files') return [...sources.keys()].join('\0') + '\0';
+      throw new Error(`unexpected command: ${command} ${args}`);
+    };
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
+      combinedTest: (input) => defaultDeps().combinedTest(input, { exec, fs, env: {},
+        settings: { combinedTest: { waitMs: 600000, timeoutMs: 1200000, maxBuffer: 16 * 1024 * 1024 } } }) });
+    const result = await f.run();
+    expect(result).toMatchObject({ ok: false, registered: false, adopted: false, stopReason: 'stale-registration',
+      blocking: ['lane/old'], blockingReasons: { 'lane/old': 'overlap-with-candidate: x; combined-tests-failed: related-tests-truncated' },
+      combinedTests: { testCount: 0, result: expect.stringContaining('Rebase and retest the overlapping refs') }, staleTolerated: [] });
+    expect(queuedRun).not.toHaveBeenCalled();
+    expect(commands).toContainEqual({ command: 'git', args: ['worktree', 'remove', '--force', worktree] });
+    expect(fs.rmSync).toHaveBeenCalledWith(worktree, { recursive: true, force: true });
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(f.registrations.has('lane/old')).toBe(true);
+    expect(f.records[0]).toMatchObject({ ok: false, combinedTests: result.combinedTests });
+  });
+  it('blocks an overlapping ref absent from HEAD and candidate when its inclusion cannot be proved', async () => {
+    const head = 'd'.repeat(40), staleTip = 'e'.repeat(40);
+    const commands = [];
+    // Even a passing runner cannot rescue a tree that excludes the registered work.
+    const queuedRun = vi.fn(() => 'passed');
+    const mkdtempSync = vi.fn();
+    const exec = (command, args) => {
+      commands.push({ command, args });
+      if (command === 'node') return queuedRun(args);
+      if (args[0] === '-C') return head;
+      if (args[0] === 'fetch') return '';
+      if (args[0] === 'rev-parse') return staleTip;
+      if (args[0] === 'merge-base') throw Object.assign(new Error('registered work absent'), { status: 1 });
+      // Without the containment guard, a conflicting inclusion would never be attempted.
+      if (args[0] === 'merge-tree' && args.includes(staleTip)) throw Object.assign(new Error('registered changes conflict'), { status: 1 });
+      if (args[0] === 'merge-tree') return TREE;
+      throw new Error(`unexpected command: ${command} ${args}`);
+    };
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
+      combinedTest: (input) => defaultDeps().combinedTest(input, { exec, fs: { mkdtempSync }, env: {},
+        settings: { combinedTest: { waitMs: 600000, timeoutMs: 1200000, maxBuffer: 16 * 1024 * 1024 } } }) });
+    const result = await f.run();
+    expect(result).toMatchObject({ ok: false, registered: false, adopted: false, stopReason: 'stale-registration',
+      blocking: ['lane/old'], blockingReasons: { 'lane/old': 'overlap-with-candidate: x; combined-tests-failed: combined-ref-not-contained' },
+      combinedTests: { testCount: 0, result: expect.stringContaining('Include its current tip in a tested replacement') }, staleTolerated: [] });
+    expect(commands).toContainEqual({ command: 'git', args: ['fetch', 'origin', 'refs/heads/lane/old'] });
+    expect(commands).toContainEqual({ command: 'git', args: ['rev-parse', '--verify', 'FETCH_HEAD^{commit}'] });
+    expect(commands.filter(({ args }) => args[0] === 'merge-base').map(({ args }) => args)).toEqual([
+      ['merge-base', '--is-ancestor', staleTip, head], ['merge-base', '--is-ancestor', staleTip, SHA],
+    ]);
+    expect(commands.filter(({ args }) => args[0] === '-C')).toEqual([
+      { command: 'git', args: ['-C', '/home/test/workspace/wev-control', 'rev-parse', 'HEAD'] },
+    ]);
+    expect(mkdtempSync).not.toHaveBeenCalled();
+    expect(queuedRun).not.toHaveBeenCalled();
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(f.registrations.has('lane/old')).toBe(true);
+    expect(f.records[0]).toMatchObject({ ok: false, combinedTests: result.combinedTests });
+  });
+  it('refuses an overlapping stale ref when combined-tree tests are unrunnable (throws)', async () => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
+      combinedTest: () => { throw new Error('test runner unavailable'); } });
+    const r = await f.run();
+    expect(f.combinedTest).toHaveBeenCalledTimes(1);
+    expect(r).toMatchObject({ ok: false, registered: false, adopted: false, stopReason: 'stale-registration',
+      blocking: ['lane/old'], blockingReasons: { 'lane/old': 'overlap-with-candidate: x; combined-tests-unrunnable: test runner unavailable' } });
+    expect(r.message).toBe('stale-registration: lane/old (overlap-with-candidate: x; combined-tests-unrunnable: test runner unavailable)');
+    expect(r.combinedTests).toEqual(expect.any(Object));
+    expect(r.staleTolerated).toEqual([]);
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(f.records).toHaveLength(1);
+    expect(f.records[0]).toMatchObject({ stopReason: 'stale-registration', combinedTests: r.combinedTests, staleTolerated: [] });
+  });
+  it.each(['', ' ', '\n', '"', "'", '(', ')', ':', '='])(
+    'redacts arbitrary absolute paths from thrown errors after %j in every persisted field', async (prefix) => {
+      const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
+        combinedTest: () => { throw new Error(`${prefix}/srv/x/y ${prefix}/mnt/a/b`); } });
+      const result = await f.run();
+      expect(result).toMatchObject({ ok: false, stopReason: 'stale-registration', staleTolerated: [] });
+      expect(result.combinedTests.result.match(/<path>/g)).toHaveLength(2);
+      for (const output of [result, ...f.records]) {
+        expect(JSON.stringify(output)).not.toMatch(/\/srv\/x\/y|\/mnt\/a\/b/);
+      }
+      expect(mutations(f, 'add')).toEqual([]);
+      expect(mutations(f, 'remove')).toEqual([]);
+    },
+  );
+  it.each(['[', ']', ',', '{', '}', ';', '!', '?', '+', '-', '@', '#', '$', '%', '&', '*', '/', '\\', '|', '~', '`'])(
+    'preserves legacy delimiter %j redaction in persisted thrown-error output', async (prefix) => {
+      const raw = `${prefix}/home/fixture/secret.txt] ${prefix}/srv/x/y ${prefix}/mnt/a/b`;
+      const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
+        combinedTest: () => { throw new Error(raw); } });
+      const result = await f.run();
+      expect(result).toMatchObject({ ok: false, stopReason: 'stale-registration', staleTolerated: [] });
+      expect(result.combinedTests.result.match(/<path>/g)).toHaveLength(3);
+      for (const output of [result, ...f.records]) {
+        expect(JSON.stringify(output)).not.toMatch(/\/home\/fixture\/secret\.txt|\/srv\/x\/y|\/mnt\/a\/b/);
+      }
+      expect(mutations(f, 'add')).toEqual([]);
+      expect(mutations(f, 'remove')).toEqual([]);
+    },
+  );
+  it('sanitizes and bounds thrown combined-test errors in every persisted refusal field', async () => {
+    const repoPath = process.cwd().replace(/\/$/, '');
+    const raw = `unavailable \u0000${repoPath}/private.mjs /home/test/secret /tmp/private-log \n` + 'x'.repeat(400);
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
+      combinedTest: () => { throw new Error(raw); } });
+    const r = await f.run();
+    const message = r.combinedTests.result;
+    expect(message).toContain('<repo>/private.mjs <home>/secret <tmp>/private-log');
+    expect(message).not.toMatch(/[\x00-\x1f\x7f]/);
+    expect(message).toHaveLength(300);
+    expect(r).toMatchObject({ ok: false, stopReason: 'stale-registration', staleTolerated: [] });
+    expect(r.blockingReasons['lane/old']).toBe(`overlap-with-candidate: x; combined-tests-unrunnable: ${message}`);
+    for (const output of [r, ...f.records]) {
+      const serialized = JSON.stringify(output);
+      expect(serialized).not.toContain(repoPath);
+      expect(serialized).not.toContain('/tmp/private-log');
+      expect(serialized).not.toContain('/home/test/secret');
+    }
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+  });
+  it.each([false, true])('does not run combined tests for overlapping paths plus another blocker (dirty candidate: %s)', async (dirty) => {
+    const f = fixture({ list: ['lane/old', 'lane/also'],
+      conflicts: ['lane/old', 'lane/also', ...(dirty ? [BASE.branch] : [])],
+      ...(dirty ? {} : { staleChanged: { 'lane/also': '' } }), combinedTest: { ok: true } });
+    const result = await f.run();
+    expect(result).toMatchObject({ ok: false, stopReason: 'stale-registration', blocking: ['lane/old', 'lane/also'],
+      blockingReasons: dirty ? { 'lane/old': 'candidate-not-clean', 'lane/also': 'candidate-not-clean' }
+        : { 'lane/old': 'overlap-with-candidate: x', 'lane/also': 'stale-files-unknown' } });
+    expect(f.combinedTest).not.toHaveBeenCalled();
+    expect(mutations(f, 'add')).toEqual([]);
+  });
+  it('wires the default runner with cascade defaults and a credential-free tests environment', async () => {
+    const worktree = '/tmp/prototype-default-wiring';
+    const gitEnv = { SSH_AUTH_SOCK: '/agent', GIT_ASKPASS: '/askpass', GIT_SSH_COMMAND: 'ssh' };
+    const combinedExec = vi.fn((cmd, args) => {
+      if (cmd === 'node') throw Object.assign(new Error('fixture stops runner'), { status: 1 });
+      if (args[0] === '-C' || args[0] === 'rev-parse') return SHA;
+      if (args[0] === 'merge-tree') return TREE;
+      if (args[0] === 'commit-tree') return MERGE;
+      if (args[0] === 'ls-files') return 'one.test.mjs\0';
+      return '';
+    });
+    const f = fixture({ defaultCombined: true, env: gitEnv, gitEnv,
+      list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['one.test.mjs'] },
+      combinedIO: { exec: combinedExec,
+        handles: (cmd, args) => cmd === 'node' && args[1] === 'run' || cmd === 'git' &&
+          (args[0] === '-C' || ['worktree', 'ls-files'].includes(args[0]) || args.includes('FETCH_HEAD^{commit}') ||
+            args[0] === 'fetch' && args[1] !== 'origin' || args[0] === 'fetch' && args[2]?.startsWith('refs/heads/') ||
+            args[0] === 'merge-base' && args[2] === SHA || args[0] === 'merge-tree' || args[0] === 'commit-tree'),
+        fs: { mkdtempSync: () => worktree, existsSync: () => false, rmSync: vi.fn(),
+          readFileSync: (path) => {
+            if (path === worktree + '/one.test.mjs') return '';
+            if (path === '/home/test/ready') return JSON.stringify({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'NOT WEAKENED' });
+            throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+          } } } });
+    const result = await f.run();
+    expect(result).toMatchObject({ stopReason: 'stale-registration', combinedTests: { testCount: 1 } });
+    const [, args, config] = combinedExec.mock.calls.find(([cmd]) => cmd === 'node');
+    expect(args).toContain('--wait-ms=600000');
+    expect(args).toContain('--ceiling-ms=1200000');
+    expect(config).toMatchObject({ timeout: 1200000, maxBuffer: 16 * 1024 * 1024,
+      env: { HOME: '/home/test', PATH: '/bin', USER: 'tester' } });
+    expect(config.env).toEqual({ HOME: '/home/test', PATH: '/bin', USER: 'tester' });
+    for (const [cmd, , options] of combinedExec.mock.calls) if (cmd === 'git') expect(options.env).toMatchObject(gitEnv);
+    expect(f.combinedTest).not.toHaveBeenCalled();
+  });
+  it('does not run combined tests when the candidate is not clean or the stale files are unknown', async () => {
+    for (const options of [
+      { conflicts: ['lane/old', BASE.branch], reason: 'candidate-not-clean' },
+      { unverifiable: BASE.branch, reason: 'candidate-not-clean' },
+      { staleDiffFails: 'lane/old', reason: 'stale-files-unknown' },
+      { staleChanged: { 'lane/old': '' }, reason: 'stale-files-unknown' },
+      { staleChanged: { 'lane/old': 'M\0' }, reason: 'stale-files-unknown' },
+    ]) {
+      const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
+        combinedTest: { ok: true, command: 'fixture-related-tests', result: 'passed' }, ...options });
+      const r = await f.run();
+      expect(f.combinedTest).not.toHaveBeenCalled();
+      expect(r).toMatchObject({ ok: false, stopReason: 'stale-registration', blocking: ['lane/old'],
+        blockingReasons: { 'lane/old': options.reason } });
+      expect(mutations(f, 'add')).toEqual([]);
+      expect(mutations(f, 'remove')).toEqual([]);
+    }
+  });
+  it('runs combined tests once for several overlapping stale refs', async () => {
+    const combinedTests = { command: 'fixture-related-tests', result: '3 passed', testCount: 3 };
+    const f = fixture({ list: ['lane/old', 'lane/also'], conflicts: ['lane/old', 'lane/also'],
+      staleChanged: { 'lane/old': 'M\0z-old.mjs\0M\0x\0', 'lane/also': 'M\0x\0M\0a-also.mjs\0' },
+      cherry: { 'lane/also': `- ${SHA}\n` },
+      combinedTest: { ok: true, ...combinedTests } });
+    const r = await f.run();
+    expect(f.combinedTest).toHaveBeenCalledTimes(1);
+    expect(f.combinedTest).toHaveBeenCalledWith({ clone: '/home/test/workspace/wev-control', candidateSha: SHA,
+      changedFiles: ['a-also.mjs', 'x', 'z-old.mjs'], refs: ['lane/old', 'lane/also'] });
+    expect(r).toMatchObject({ ok: true, registered: true, adopted: true, stopReason: null });
+    expect(r.combinedTests).toEqual(combinedTests);
+    expect(r.staleTolerated).toEqual([
+      { ref: 'lane/old', landedByContent: false, why: expect.stringMatching(/combined/i), combinedTests },
+      { ref: 'lane/also', landedByContent: true, why: expect.stringMatching(/combined/i), combinedTests },
+    ]);
+    expect(mutations(f, 'add')).toHaveLength(1);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect([...f.registrations.keys()]).toEqual(['lane/old', 'lane/also']);
+    expect(f.records[0]).toMatchObject({ combinedTests, staleTolerated: r.staleTolerated });
+  });
+  it('runs combined-tree tests during dry-run without adding or removing registrations', async () => {
+    for (const ok of [true, false]) {
+      const combinedTests = { command: 'fixture-related-tests', result: ok ? 'passed' : 'failed', testCount: 1 };
+      const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
+        combinedTest: { ok, ...combinedTests, ...(ok ? {} : { reason: 'tests-failed' }) } });
+      const r = await f.run({ dryRun: true });
+      expect(f.combinedTest).toHaveBeenCalledTimes(1);
+      expect(f.combinedTest).toHaveBeenCalledWith({ clone: '/home/test/workspace/wev-control', candidateSha: SHA,
+        changedFiles: ['x'], refs: ['lane/old'] });
+      expect(r).toMatchObject({ ok, dryRun: true, registered: false, adopted: false,
+        stopReason: ok ? null : 'stale-registration', combinedTests });
+      if (ok) expect(r.wouldRegister).toBe(true);
+      else expect(r.blockingReasons).toEqual({ 'lane/old': 'overlap-with-candidate: x; combined-tests-failed: tests-failed' });
+      expect(mutations(f, 'add')).toEqual([]);
+      expect(mutations(f, 'remove')).toEqual([]);
+      expect(f.records[0]).toMatchObject({ ok, combinedTests, staleTolerated: r.staleTolerated });
+    }
+  });
+  it('fails closed when the stale ref changed-file diff is unterminated (partial evidence)', async () => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] }, staleChanged: { 'lane/old': 'M\0old-only' } });
+    const r = await f.run();
+    expect(r).toMatchObject({ ok: false, stopReason: 'stale-registration', blockingReasons: { 'lane/old': expect.stringContaining('stale-files-unknown') } });
+    expect(mutations(f, 'add')).toEqual([]);
+  });
+  it('fails closed when the stale ref changed-file diff is unreadable', async () => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] }, staleDiffFails: 'lane/old' });
+    const r = await f.run();
+    expect(r).toMatchObject({ ok: false, stopReason: 'stale-registration', blocking: ['lane/old'], blockingReasons: { 'lane/old': 'stale-files-unknown' } });
+    expect(r.message).toContain('stale-files-unknown');
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+  });
+  it.each(['', 'M\0'])('fails closed when the stale ref changed-file diff is empty or malformed (%j)', async (diff) => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], staleChanged: { 'lane/old': diff } });
+    const r = await f.run();
+    expect(r).toMatchObject({ ok: false, stopReason: 'stale-registration', blocking: ['lane/old'], blockingReasons: { 'lane/old': 'stale-files-unknown' } });
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+  });
+  it('refuses a stale ref when the candidate is not clean', async () => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old', BASE.branch], checkFiles: { 'lane/old': ['old-only.mjs'] }, staleChanged: { 'lane/old': 'M\0old-only.mjs\0' } });
+    const r = await f.run();
+    expect(r.check).toMatchObject({ ok: true, clean: false });
+    expect(r.ok).toBe(false);
+    expect(['stale-registration', 'check-conflict']).toContain(r.stopReason);
+    expect(r.blockingReasons).toEqual({ 'lane/old': 'candidate-not-clean' });
+    expect(r.message).toMatch(/^stale-registration: lane\/old/);
+    expect(r.message).toContain('candidate-not-clean');
+    expect(mutations(f, 'add')).toEqual([]);
+  });
+  it('flags a content-landed stale ref as harmless in staleTolerated', async () => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] }, staleChanged: { 'lane/old': 'M\0old-only.mjs\0' }, cherry: { 'lane/old': `- ${SHA}\n- ${TREE}\n` } });
+    const r = await f.run();
+    expect(r.ok).toBe(true);
+    expect(r.staleTolerated).toEqual([{ ref: 'lane/old', landedByContent: true, why: expect.stringMatching(/\S/) }]);
+    expect(f.calls.some(c => c.cmd === 'git' && c.args.join(' ') === 'cherry origin/main origin/lane/old')).toBe(true);
+    expect(f.records[0].staleTolerated).toEqual(r.staleTolerated);
+    expect(mutations(f, 'add')).toHaveLength(1);
+  });
+  it('a stale ref with unlanded commits is tolerated but flagged landedByContent=false', async () => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] }, staleChanged: { 'lane/old': 'M\0old-only.mjs\0' }, cherry: { 'lane/old': `- ${SHA}\n+ ${TREE}\n` } });
+    const r = await f.run();
+    expect(r.ok).toBe(true);
+    expect(r.staleTolerated).toEqual([{ ref: 'lane/old', landedByContent: false, why: expect.stringMatching(/\S/) }]);
+    expect(f.calls.some(c => c.cmd === 'git' && c.args.join(' ') === 'cherry origin/main origin/lane/old')).toBe(true);
+    expect(f.records[0].staleTolerated).toEqual(r.staleTolerated);
+    expect(mutations(f, 'add')).toHaveLength(1);
+  });
+  it('never removes a tolerated stale registration', async () => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] }, staleChanged: { 'lane/old': 'M\0old-only.mjs\0' } });
+    const r = await f.run();
+    expect(r.ok).toBe(true);
+    expect(r.staleTolerated).toEqual([{ ref: 'lane/old', landedByContent: false, why: expect.stringMatching(/\S/) }]);
+    expect(mutations(f, 'add')).toHaveLength(1);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(r.removed).toEqual([]);
+    expect(r.removedTips).toEqual({});
+    expect([...f.registrations.keys()]).toEqual(['lane/old']);
   });
   it('contained stale and clean registrations remain after replacement adoption', async () => {
     const f = fixture({ list: ['lane/old', 'lane/also'], contained: ['lane/old', 'lane/also'], conflicts: ['lane/old'] }); const r = await f.run();
