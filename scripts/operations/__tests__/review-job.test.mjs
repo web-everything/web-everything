@@ -166,6 +166,7 @@ function fakeIo(over = {}) {
     claim: (slug, rec) => { calls.push(['claim', slug, rec.pid]); return { ok: true }; },
     updateRecord: (rec) => calls.push(['update', rec.cwd, rec.actorId]),
     unclaim: (slug, pid) => calls.push(['unclaim', slug, pid]),
+    prepareLane: () => ({ head: 'a'.repeat(40) }),
     acquireLane: (o) => { calls.push(['acquire', o]); return { lanePath: '/lanes/lane-7' }; },
     runLoop: (o) => {
       calls.push(['loop', o]);

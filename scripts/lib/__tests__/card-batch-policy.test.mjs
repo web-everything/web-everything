@@ -168,3 +168,20 @@ describe('card-only eligibility', () => {
     expect(cardOnlyEligibility([card(), card(path)])).toMatchObject({ ok: false, reason: expect.stringContaining(`${path}: duplicate card id 123`) });
   });
 });
+
+describe('raised-by batch eligibility', () => {
+  const sidecar = 'backlog/raised-by/6636/77-' + 'a'.repeat(24) + '.md';
+  it.each(['6636', '1', '99999', 'xabc123'])('accepts distinct sidecars for target %s alongside a card', target => {
+    const path = sidecar.replace('/6636/', `/${target}/`);
+    expect(cardOnlyEligibility([card(), card(path), card(path.replace('77-', '78-'))])).toEqual({ ok: true });
+  });
+  it.each([{ status: 'M' }, { status: 'D' }, { mode: '120000' }])('refuses non-added regular sidecars %j', change => {
+    expect(cardOnlyEligibility([card(sidecar, change)])).toMatchObject({ ok: false });
+  });
+  it.each(['../6636', '6636/..', '100000', 'xabc12', 'nested/6636'])('refuses malformed sidecar target %s', target => {
+    expect(cardOnlyEligibility([card(sidecar.replace('/6636/', `/${target}/`))])).toMatchObject({ ok: false });
+  });
+  it('refuses duplicate sidecar members', () => {
+    expect(cardOnlyEligibility([card(sidecar), card(sidecar)])).toMatchObject({ ok: false });
+  });
+});

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { RED_TEAM_STATUS_LABELS, syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
-import { readDrainRedTeamEvidence } from '../lib/drain-red-team-evidence.mjs';
+import { readDrainRedTeamEvidence, redTeamStatusDir } from '../lib/drain-red-team-evidence.mjs';
+import { needsPublish, publishStoredRedTeamResult } from '../lib/red-team-withheld-publish.mjs';
 /**
  * @file scripts/conveyor/advisory-label-sweep.mjs
  * @description THE `advisory:*` STALENESS SWEEP — drops `advisory:accepted` / `advisory:changes` from any open PR
@@ -19,8 +20,9 @@ import { readDrainRedTeamEvidence } from '../lib/drain-red-team-evidence.mjs';
  * itself and reports a label that outlived its head as a disagreement in NOT READY, so a stale label can never
  * put a PR in NEEDS YOU even before this sweep removes it.
  *
- * WHAT IT NEVER DOES: touch `review:human` / `review:changes` / `review:accepted`, add anything but an
- * `advisory:*` label, or post a comment. The ONLY non-`advisory:*` labels it may remove are `review:pending` and
+ * Advisory repair leaves `review:human` / `review:changes` / `review:accepted` alone. The red-team pass
+ * recovers completed result comments and reconciles `red-team:*` labels. The ONLY other labels it may remove
+ * are `review:pending` and
  * `review:awaiting-advisory` (#4722), and only in the repair path, where the advisory has demonstrably run on the
  * live head (pinned by a test over every label mix). It
  * removes stale `advisory:*` labels (`planAdvisoryStaleLabels`) and, as the backstop for a missed `advise` label
@@ -44,7 +46,8 @@ import { readDrainRedTeamEvidence } from '../lib/drain-red-team-evidence.mjs';
  * PURE-CORE / IO-SHELL: the plan is pure; {@link sweepAdvisoryLabels} is the shell, with the PR list and the
  * label provider injectable so the whole pass is testable with no `gh`.
  */
-import { resolve } from 'node:path';
+import { readdirSync, readFileSync } from 'node:fs';
+import { resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -131,6 +134,20 @@ export function planForPr(pr) {
   return planAdvisoryRepairLabels(input);
 }
 
+/** Discover recoverable results independently of GitHub label writes. Unreadable files grant no credit. */
+export function defaultListUnpublishedStatuses({ dir = redTeamStatusDir() } = {}) {
+  let files;
+  try { files = readdirSync(dir); } catch { return []; }
+  const statuses = [];
+  for (const file of files.filter(name => name.endsWith('.json'))) {
+    try {
+      const status = JSON.parse(readFileSync(join(dir, file), 'utf8'));
+      if (needsPublish(status)) statuses.push(status);
+    } catch { /* An unreadable status cannot nominate a PR. */ }
+  }
+  return statuses;
+}
+
 /**
  * Drop stale advisory labels off every open PR that carries one, and repair a missing one.
  * @param {{repo?: string|null, listPrs?: Function, readPr?: Function, provider?: object, dryRun?: boolean}} [o]
@@ -139,6 +156,7 @@ export function planForPr(pr) {
  */
 export function sweepAdvisoryLabels({
   repo = null, listPrs = defaultListPrs, readPr = defaultReadPr, provider = createGhProvider(), dryRun = false, readStatusEvidence = readDrainRedTeamEvidence,
+  publishStored = publishStoredRedTeamResult, listUnpublishedStatuses = defaultListUnpublishedStatuses,
   log = line => process.stderr.write(`${line}\n`),
 } = {}) {
   const prs = listPrs({ repo });
@@ -147,16 +165,47 @@ export function sweepAdvisoryLabels({
   // `--repo` into its argv unconditionally, so a null repo must never reach it (the #xoh8fkw bug the conflict
   // watch documents).
   let resolvedRepo = repo;
-  for (const pr of (Array.isArray(prs) ? prs : []).filter(p => labelNames(p.labels).some(l => RED_TEAM_STATUS_LABELS.includes(l)))) {
+  const unpublished = listUnpublishedStatuses();
+  if (unpublished.length && resolvedRepo == null) resolvedRepo = provider.currentRepo();
+  const unpublishedFor = pr => unpublished.find(status => needsPublish(status)
+    && status.repo === resolvedRepo && Number(status.pr) === Number(pr.number) && status.head === pr.headRefOid);
+  for (const pr of (Array.isArray(prs) ? prs : []).filter(p =>
+    labelNames(p.labels).some(l => RED_TEAM_STATUS_LABELS.includes(l)) || unpublishedFor(p))) {
+    const publication = {};
     try {
       resolvedRepo ??= provider.currentRepo();
-      const live = readPr({ repo: resolvedRepo, number: pr.number });
+      let live;
+      try { live = readPr({ repo: resolvedRepo, number: pr.number }); }
+      catch (error) {
+        const status = unpublishedFor(pr) ?? readStatusEvidence({ repo: resolvedRepo, pr: pr.number, head: pr.headRefOid }).status;
+        if (!dryRun && needsPublish(status)) {
+          const published = publishStored({ status, listComments: () => { throw error; },
+            postComment: ({ repo: targetRepo, pr: number, body }) => provider.postComment(targetRepo, number, body) });
+          publication.publishStatus = published.status;
+          log(`red-team publication #${pr.number}: ${published.status}`);
+        }
+        throw error;
+      }
       if (!live || (live.state && live.state !== 'OPEN')) continue;
       const evidence = readStatusEvidence({ repo: resolvedRepo, pr: pr.number, head: live.headRefOid });
+      let comments = live.comments;
+      if (!dryRun && needsPublish(evidence.status)) {
+        try {
+          const published = publishStored({ status: evidence.status,
+            listComments: () => provider.readComments(resolvedRepo, pr.number),
+            postComment: ({ repo: targetRepo, pr: number, body }) => provider.postComment(targetRepo, number, body) });
+          publication.publishStatus = published.status;
+          if (['retry', 'failed'].includes(published.status)) log(`red-team publication #${pr.number}: ${published.status}`);
+          if (published.status === 'posted') comments = provider.readComments(resolvedRepo, pr.number);
+        } catch (e) {
+          publication.publishError = String(e?.message ?? e).replace(/[\p{Cc}\p{Cf}]/gu, ' ').slice(0, 300);
+          log(`red-team publication #${pr.number}: ${publication.publishError}`);
+        }
+      }
       const plan = syncRedTeamStatusLabels({ repo: resolvedRepo, pr: pr.number, head: live.headRefOid,
-        evidence, live, comments: live.comments, provider, dryRun, log });
-      if (plan.add || plan.remove.length) results.push({ num: pr.number, ...plan });
-    } catch (e) { results.push({ num: pr.number, skipped: `red-team status: ${e.message}` }); }
+        evidence, live, comments, provider, dryRun, log });
+      if (plan.add || plan.remove.length || Object.keys(publication).length) results.push({ num: pr.number, ...plan, ...publication });
+    } catch (e) { results.push({ num: pr.number, ...publication, skipped: `red-team status: ${e.message}` }); }
   }
   for (const pr of (Array.isArray(prs) ? prs : []).filter((p) => carriesAdvisoryLabel(p) || isHumanGated(p))) {
     const nominated = planForPr(pr);

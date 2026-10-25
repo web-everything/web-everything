@@ -6,6 +6,7 @@
  * other cards are rebuilt onto a fresh batch ref from main and handed to the existing seal job. The old PR is closed
  * with pointers to both. Nothing is force-pushed; no approval or verify receipt carries over (new heads, new PRs).
  * A finding that cites no card file, a non-card file, or more than one card holds the batch for a person.
+ * A split that separates a raised-by sidecar from its batched parent also holds for a person.
  */
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -17,6 +18,7 @@ import { CARD_BATCH_STATE_DIR, HOLD_LABEL, batchExec } from './card-batch-seal-i
 import { extractSubmitResult } from './open-pr.mjs';
 import { parseRunJsonTail } from './land-prevention-card.mjs';
 import { cardOnlyEligibility } from '../lib/card-batch-policy.mjs';
+import { raisedByMemberId, raisedByParentIds } from '../lib/raised-by.mjs';
 
 const ROOT = resolve(dirname(new URL(import.meta.url).pathname), '../..');
 const MARKER = 'Card-Batch: ';
@@ -57,6 +59,24 @@ export function attributeFindings({ findings, members }) {
     member: members.find(member => member.cardPath === path),
     survivors: members.filter(member => member.cardPath !== path),
   };
+}
+
+/** A one-file extraction must not split a parent/raise dependency, including a parent's birth-ID alias. */
+function raisedBySplitReason({ member, survivors }, git) {
+  const members = [member, ...survivors];
+  const raises = members.filter(candidate => raisedByMemberId(candidate.cardPath));
+  if (!raises.length) return null;
+  for (const parent of members.filter(candidate => !raisedByMemberId(candidate.cardPath))) {
+    const id = basename(parent.cardPath).split('-')[0];
+    const body = git(['show', `${parent.commitSha}:${parent.cardPath}`]);
+    const parentIds = raisedByParentIds(id, body);
+    for (const raise of raises) {
+      if (parentIds.includes(raise.cardPath.split('/')[2]) && (parent === member) !== (raise === member)) {
+        return `raised-by sidecar ${raise.cardPath} would be separated from its batched parent ${parent.cardPath}`;
+      }
+    }
+  }
+  return null;
 }
 
 /** Markdown for the standalone PR's finding comment. */
@@ -180,36 +200,40 @@ export async function extractCard(input, opts = {}) {
     // the SAME base it was planned on: a push may already have landed one ref, and a newer main would change its sha.
     // The extracted card is pinned with it: a retry's findings may differ, but refs already pushed name this card.
     const pinnedBase = journal.plan && !journal.pushed ? journal.plan.baseSha : null;
-    const pinnedCard = pinnedBase ? journal.plan.standalone.member : null;
+    const pinnedCard = journal.plan?.standalone.member;
     if (pinnedBase) journal.plan = null;
+    // Re-check dependency safety even for an older plan that has already pushed its refs but not opened its PRs.
+    const advertised = git(['ls-remote', '--refs', target, `refs/heads/${old.batchRef}`]).trim().split(/\s+/)[0];
+    if (advertised !== old.headSha) return refuse('head-mismatch');
+    git(['fetch', '--no-tags', target, `refs/heads/${old.batchRef}`]);
+    const members = old.members.map(member => {
+      git(['merge-base', '--is-ancestor', member.commitSha, old.headSha]);
+      const rows = git(['diff-tree', '--no-commit-id', '--name-status', '-r', '-z', member.commitSha]).split('\0').filter(Boolean);
+      if (rows.length !== 2 || rows[0] !== 'A') throw new Error(`member ${member.cardId} is not a one-file add`);
+      const cardPath = rows[1];
+      const mode = git(['ls-tree', member.commitSha, '--', cardPath]).split(' ')[0];
+      if (!cardOnlyEligibility([{ status: 'A', mode, path: cardPath }]).ok) throw new Error(`member ${member.cardId} is not an eligible card`);
+      return { ...member, cardPath };
+    });
+    const planned = pinnedCard && members.find(member => member.cardId === pinnedCard);
+    const attribution = journal.plan && !planned
+      ? hold('the planned extraction member no longer belongs to this batch')
+      : planned
+      ? { action: 'extract', member: planned, survivors: members.filter(member => member !== planned) }
+      : attributeFindings({ findings: input.findings, members });
+    const holdReason = attribution.action === 'hold' ? attribution.reason : raisedBySplitReason(attribution, git);
+    if (holdReason) {
+      journal.held = { reason: holdReason, at: new Date(now()).toISOString() };
+      save();
+      return await completeHold();
+    }
     // ── PLAN (once): attribute, then compute every ref and commit so a rerun reproduces identical shas.
     if (!journal.plan) {
-      const advertised = git(['ls-remote', '--refs', target, `refs/heads/${old.batchRef}`]).trim().split(/\s+/)[0];
-      if (advertised !== old.headSha) return refuse('head-mismatch');
-      git(['fetch', '--no-tags', target, `refs/heads/${old.batchRef}`]);
       git(['fetch', '--no-tags', target, `refs/heads/${base}`]);
       let baseSha = git(['rev-parse', 'FETCH_HEAD^{commit}']).trim();
       if (pinnedBase && pinnedBase !== baseSha) {
         // Reuse the planned base while it is still part of main's history; otherwise (main was rewritten) plan afresh.
         try { git(['merge-base', '--is-ancestor', pinnedBase, baseSha]); baseSha = pinnedBase; } catch { /* plan on current main */ }
-      }
-      const members = old.members.map(member => {
-        git(['merge-base', '--is-ancestor', member.commitSha, old.headSha]);
-        const rows = git(['diff-tree', '--no-commit-id', '--name-status', '-r', '-z', member.commitSha]).split('\0').filter(Boolean);
-        if (rows.length !== 2 || rows[0] !== 'A') throw new Error(`member ${member.cardId} is not a one-file add`);
-        const cardPath = rows[1];
-        const mode = git(['ls-tree', member.commitSha, '--', cardPath]).split(' ')[0];
-        if (!cardOnlyEligibility([{ status: 'A', mode, path: cardPath }]).ok) throw new Error(`member ${member.cardId} is not an eligible card`);
-        return { ...member, cardPath };
-      });
-      const planned = pinnedCard && members.find(member => member.cardId === pinnedCard);
-      const attribution = planned
-        ? { action: 'extract', member: planned, survivors: members.filter(member => member !== planned) }
-        : attributeFindings({ findings: input.findings, members });
-      if (attribution.action === 'hold') {
-        journal.held = { reason: attribution.reason, at: new Date(now()).toISOString() };
-        save();
-        return await completeHold();
       }
       const build = (parentSha, member, message, date) => {
         git(['read-tree', parentSha]);
@@ -221,7 +245,8 @@ export async function extractCard(input, opts = {}) {
       };
       const messageOf = member => git(['show', '-s', '--format=%B', member.commitSha]);
       const dateOf = member => git(['show', '-s', '--format=%cI', member.commitSha]).trim();
-      const standaloneRef = `lane/card-extract-${attribution.member.cardId}-${attribution.member.commitSha.slice(0, 7)}`;
+      // Raised-by identities contain colons, which Git refs cannot contain.
+      const standaloneRef = `lane/card-extract-${attribution.member.cardId.replaceAll(':', '-')}-${attribution.member.commitSha.slice(0, 7)}`;
       const standaloneSha = build(baseSha, attribution.member, messageOf(attribution.member), dateOf(attribution.member));
       const generation = (old.generation ?? 0) + 1;
       const remainderRef = `${old.batchRef.replace(/-r\d+$/, '')}-r${generation}`;

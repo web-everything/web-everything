@@ -42,6 +42,8 @@ function jobIo(loopPayload) {
     claim: () => ({ ok: true }),
     updateRecord: () => {},
     unclaim: () => {},
+    redTeamStatus: () => {},
+    prepareLane: () => ({ head: 'a'.repeat(40) }),
     acquireLane: () => ({ lanePath: '/lanes/lane-7' }),
     runLoop: () => ({ status: 0, stdout: JSON.stringify(loopPayload), stderr: '' }),
     releaseLane: () => {},
