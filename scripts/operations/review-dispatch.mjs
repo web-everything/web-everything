@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
+import { reviewUsesRequiredChecks } from '../lib/review-timing.mjs';
 import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.mjs';
 /**
  * @file scripts/operations/review-dispatch.mjs
@@ -610,8 +611,8 @@ export function dispatchReview({
   }
   const policy = resolveTimingPolicy({ env }).review;
   const ci = ciGate({ repo: planned.repo, pr: planned.pr, policy });
-  // Card 273, #5157: a waiver is pinned to readable CI on this exact head.
-  const waived = policy.startAfter === 'ci-green' && typeof ci?.headSha === 'string' && typeof advisoryCiWaiver?.head === 'string'
+  // Card 273, #5157: a waiver is pinned to readable CI on this exact head, including required-check fallback.
+  const waived = reviewUsesRequiredChecks(policy, planned.repo) && typeof ci?.headSha === 'string' && typeof advisoryCiWaiver?.head === 'string'
     && ci.headSha.length > 0 && ci.headSha.toLowerCase() === advisoryCiWaiver.head.toLowerCase()
     && !['head-changed', 'unreadable-ci', 'missing-head', 'unknown-required-set', 'untrusted-required-set'].includes(String(ci.reason ?? '').split(' (')[0])
     && !(ci.affected ?? []).some(row => ['wrong-head', 'malformed', 'missing'].includes(row.reason));

@@ -1,11 +1,14 @@
 /** Live draft #5874: review-owned red gates must not deadlock draft promotion. */
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const PATHS = ['scripts/conveyor/reconcile-core.mjs', 'scripts/conveyor/draft-promotion-rule.mjs',
-  'scripts/conveyor/draft-promotion-loop.mjs', 'scripts/operations/promote-draft-pr-dispatch.mjs'];
+  'scripts/conveyor/draft-promotion-loop.mjs', 'scripts/operations/promote-draft-pr-dispatch.mjs',
+  'scripts/lib/review-timing.mjs', 'scripts/lib/review-ci-gate-io.mjs',
+  'scripts/operations/review-dispatch.mjs', 'scripts/operations/review-job.mjs'];
 const HEAD = 'b'.repeat(40);
 
 export default {
@@ -15,7 +18,8 @@ export default {
   fixedBy: { sha: 'HEAD', where: 'lane/review-hold-red-draft-deadlock', paths: PATHS },
   fixPresent(root) {
     try {
-      return /export\s+function\s+reviewHoldOnlyRed\s*\(/.test(readFileSync(join(root, PATHS[0]), 'utf8'));
+      return /export\s+function\s+reviewHoldOnlyRed\s*\(/.test(readFileSync(join(root, PATHS[0]), 'utf8'))
+        && PATHS.slice(4).every(path => /reviewUsesRequiredChecks/.test(readFileSync(join(root, path), 'utf8')));
     }
     catch { return false; }
   },
@@ -54,6 +58,41 @@ export default {
       const result = isDraftOwedPromotion({ pr, checks });
       check(result.owed === expected, `${name}: draft promotion owed=${result.owed}, expected=${expected}`);
       log?.(`${name}: draft promotion owed=${result.owed}, expected=${expected}\n`);
+    }
+    // PR #5911 send-back: promotion must reach the fresh dispatch gate under fast-check fallback too.
+    const repo = 'frontier-ui/frontierui'; // No fast-check list for this repo.
+    const requiredChecks = ['test', 'review-gate'];
+    const statusCheckRollup = [row('test'), row('review-gate', 'failure')];
+    const reviewTiming = { startAfter: 'fast-checks', fastChecks: { we: ['standards'] } };
+    const plan = isDraft => planReconcile({ repo: 'frontierui', prs: [{ ...pr, isDraft, statusCheckRollup }],
+      agents: [], durableCounts: {}, requiredChecks, reviewTiming, advisoryReviewOnHumanHandoff: 'on',
+      now: Date.parse('2026-10-24T18:24:00Z') });
+    check(plan(true).dispatch.some(d => d.kind === 'promote-draft'), 'fast-check fallback: draft promotion missing');
+    const review = plan(false).dispatch.find(d => d.kind === 'review');
+    check(review?.advisoryReview?.ciWaived === true, 'fast-check fallback: head-pinned advisory waiver missing');
+    const { dispatchReviewByMode } = await import(pathToFileURL(join(sourceRoot, 'scripts/operations/review-job.mjs')).href);
+    const { readReviewCiGate } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/review-ci-gate-io.mjs')).href);
+    const dir = mkdtempSync(join(tmpdir(), 'soak-review-hold-advisory-'));
+    try {
+      for (const mode of ['session', 'job']) {
+        let spawns = 0;
+        const result = dispatchReviewByMode({ mode, pr: pr.number, repo, root: '/daemon', dir,
+          env: { WE_REVIEW_START_AFTER: 'fast-checks' },
+          advisoryCiWaiver: review?.advisoryReview?.ciWaived === true ? { head: review.advisoryReview.head, reason: review.advisoryReview.reason } : null,
+          ciGate: args => readReviewCiGate({ ...args, readHead: () => HEAD,
+            readRequired: () => ({ source: 'live', checks: requiredChecks }), readChecks: () => statusCheckRollup }),
+          checkoutExists: () => true, checkStaleness: () => ({ fresh: true, behind: 0 }), stackCheck: () => ({ base: null }),
+          readCompletion: () => null, resolveSettingsEnv: () => ({}),
+          readBrief: () => 'review {{PR}}', mintSessionId: () => 'soak-review-hold-advisory',
+          wrapReview: false, sessionCwdFor: () => dir, ensureSessionCwd: path => path,
+          isolateSession: () => ({ worktreeSettings: {} }),
+          spawnAgent: () => { spawns++; return ''; }, spawnJob: () => { spawns++; return null; },
+        });
+        check(spawns === 1 && !result.skipped, `fast-check fallback ${mode}: ${result.skipped ?? 'did not start'}`);
+        log?.(`fast-check fallback ${mode}: spawns=${spawns}, skipped=${result.skipped ?? 'none'}\n`);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
     return { violations };
   },
