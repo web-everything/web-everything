@@ -1,3 +1,5 @@
+import { parseCardSquashMarkers, squashPatchHash } from '../lib/card-squash-marker.mjs';
+import { CARD_SQUASH_SUBJECT, cardTreeOnly } from '../lib/card-squash-rebuild.mjs';
 /**
  * we:scripts/conveyor/mechanical-round-cap.mjs — a MECHANICAL round never spends a review round.
  *
@@ -345,8 +347,6 @@ export function readMechanicalRoundFacts({ pr, defaultBranch = 'main', remote = 
   try {
     git(['fetch', '--quiet', '--no-tags', '--end-of-options', remote, `+${base}:refs/remotes/${remote}/${base}`,
       ...(headRef ? [`+${headRef}:refs/remotes/${remote}/${headRef}`] : [])]);
-  } catch { /* a failed fetch degrades to what is cached; the reads below are the real probe */ }
-  try {
     const parents = git(['rev-list', '--parents', '-n', '1', '--end-of-options', head]).trim().split(/\s+/);
     if (parents.length !== 3) return fail('not-a-merge');
     const [, priorHead, merged] = parents;
@@ -432,6 +432,18 @@ export function readRoundCommits({ pr, defaultBranch = 'main', remote = 'origin'
     // stacked PR onto main). Anything else is the PR's own work brought in off the line.
     const onDefault = defaultBranch === base ? map : readRange(defaultBranch);
     if (!onDefault) return fail('invalid-commit-data');
+    const mechanicalSquash = (commit) => {
+      const markers = parseCardSquashMarkers(pr?.comments).filter(m => m.newHead === commit.sha);
+      if (commit.parents.length !== 1 || !CARD_SQUASH_SUBJECT.test(commit.subject) || !markers.length) return false;
+      try {
+        // readRange contains the PR-side range, so membership alone is NOT upstream reachability.
+        git(['merge-base', '--is-ancestor', commit.parents[0], `${remote}/${defaultBranch}`]);
+        const patchHash = squashPatchHash(git(['diff', '--binary', '--no-renames', '-U0', commit.parents[0], commit.sha]));
+        // Shared tree proof requires 100644 blobs in this commit and in its parent if present.
+        return markers.some(m => m.patchHash === patchHash) && cardTreeOnly({ run: (_cmd, args) => ({ status: 0, stdout: git(args) }),
+          base: commit.parents[0], tree: commit.sha });
+      } catch { return false; }
+    };
     const commits = []; const seen = new Set();
     let sha = head;
     while (map.has(sha)) {
@@ -441,9 +453,9 @@ export function readRoundCommits({ pr, defaultBranch = 'main', remote = 'origin'
       const lineParent = commit.parents.length > 1 && commit.subject.startsWith('drain: rebase')
         ? commit.parents.at(-1) : commit.parents[0];
       commits.push(commit.parents.length > 1
-        ? { ...commit, mergesPrWork: commit.parents.some((p) => p !== lineParent && map.has(p) && onDefault.has(p))
+        ? { ...commit, mechanicalSquash: false, mergesPrWork: commit.parents.some((p) => p !== lineParent && map.has(p) && onDefault.has(p))
           || !reproducesCleanMerge({ ...commit, tree }) }
-        : commit);
+        : { ...commit, mechanicalSquash: mechanicalSquash(commit) });
       sha = lineParent;
     }
     // The walk must leave the range through a real parent (a base-side commit). A parentless last commit is a

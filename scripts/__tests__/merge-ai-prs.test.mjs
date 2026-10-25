@@ -8,9 +8,24 @@
  *   base is not the repo's default branch is skipped with `base is not <default> (<base>)`.
  */
 import { describe, it, expect } from 'vitest';
-import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate } from '../merge-ai-prs.mjs';
+import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, candidateWithListedFiles } from '../merge-ai-prs.mjs';
 import { buildManifest } from '../readiness/lane-manifest.mjs';
 import { deriveResolutionBasis, graduatedToFromBody } from '../lib/review-render.mjs';
+
+describe('candidateWithListedFiles — queue admission listing evidence', () => {
+  it.each([true, false])('carries verdict files and completeness=%s into a projected candidate', (listedFilesComplete) => {
+    const c = { repo: 'owner/repo', num: 42, decision: 'merge' };
+    const verdict = { ...c, listedFiles: ['scripts/draft.mjs'], listedFilesComplete };
+    expect(candidateWithListedFiles(c, verdict)).toEqual({ ...c, listedFiles: verdict.listedFiles, listedFilesComplete });
+    expect(c).not.toHaveProperty('listedFiles');
+  });
+
+  it('retains the cached verdict evidence used by prestaged event enqueue', () => {
+    const candidate = { repo: 'owner/repo', num: 42, listedFiles: ['scripts/draft.mjs'], listedFilesComplete: true };
+    const entry = { candidate, queueAdmission: { allowed: true } };
+    expect(candidateWithListedFiles(candidate, entry.candidate)).toEqual(candidate);
+  });
+});
 
 describe('withResolutionBasis — the drain park/skip comment (#2447)', () => {
   const reason = 'branch is BEHIND main — rebase needed';
