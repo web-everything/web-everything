@@ -12,24 +12,35 @@ Recovery (PR 5855) runs a reclaim dry-run subprocess, a bounded fetch and a salv
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
-
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
-
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+- [A1] **Executable** — Add the named test `recovers a 90-lane pool within the transport budget` to `scripts/lib/__tests__/lane-pool-recover.test.mjs`. Run `npm run test:unit -- scripts/lib/__tests__/lane-pool-recover.test.mjs scripts/__tests__/lane-pool-recover-race.test.mjs`. With injected 100 ms asynchronous transport latency per lane, recover all 90 eligible lanes in at most 6 seconds, with at most four in-flight lanes; the current serial implementation exceeds that bound. This is a planned performance test, not evidence that the optimization has shipped.
+- [A2] **Must refuse** — `failed preservation never schedules a reset` must cover fetch, salvage verification, backup and liveness failures, including docs, config, data, stashes and untracked backlog cards.
+- [A3] **Must isolate** — `parallel recovery rechecks leases before reset` must prove a lease acquired during recovery is kept and another lane's backup or remote proof cannot authorize its reset.
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] Do not raise the pool hard cap, relax preservation or liveness checks, force-push salvage refs, or change operator override semantics. Backup-format completeness is a separate follow-up.
 
 ## Edge cases this change must handle
 
-One line per class: either the handling, or `n/a: <why>`.
+1. **Untrusted text** — Keep Git arguments as argv; reject lane-config URL rewrites and unsafe backup paths. Test `parallel recovery retains transport hardening`.
+2. **Truncated reads** — Buffer overflow, timeout or incomplete JSON refuses the affected lane; test `failed preservation never schedules a reset`.
+3. **Shared state files** — Use per-attempt backup directories and existing exclusive lease transitions; test `parallel recovery rechecks leases before reset`.
+4. **Fail closed** — Failed or incomplete preservation, backup or liveness evidence keeps the lane; test `failed preservation never schedules a reset`.
+5. **Identity scoping** — Bind each result to pool, lane and canonical primary origin; test `parallel recovery retains transport hardening` across two pools with the same lane number.
+6. **State over time** — Stop scheduling new work at the recovery deadline, wait for bounded in-flight work, and recheck leases before reset; test `deadline stops new work and accounts for in-flight lanes`.
+7. **Who wrote it** — Lane config and content are untrusted; only canonical remote verification and verified operator backups permit reclaim. Test `parallel recovery retains transport hardening`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+## Risks
+
+- R1: Parallel transport overloads the host or remote. A1 caps in-flight work at four; the deadline test must account for every lane exactly once.
+- R2: A lease or content changes during a parallel proof. A2/A3 keep the lane when evidence changes or fails.
+- R3: Batching shares proof or backup state across pools. The transport-hardening test must use distinct remotes and identical lane numbers.
+
+## Test plan
+
+These tests are requirements for the future performance change, not implemented by the preservation PR.
+
+- R1 → `recovers a 90-lane pool within the transport budget` and `deadline stops new work and accounts for in-flight lanes` in `scripts/lib/__tests__/lane-pool-recover.test.mjs` (A1).
+- R2 → `failed preservation never schedules a reset` and `parallel recovery rechecks leases before reset` in `scripts/__tests__/lane-pool-recover-race.test.mjs` (A2/A3).
+- R3 → `parallel recovery retains transport hardening` in `scripts/__tests__/lane-pool-recover-race.test.mjs` (A2/A3).
+- Capture a before/after 90-lane local-origin CLI benchmark, reporting eligible/reclaimed/kept/skipped counts and total duration. No HTTP endpoint is added; body size, CSRF and request rate limits do not apply. Existing host admission still applies.

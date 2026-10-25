@@ -402,6 +402,13 @@ function resolveRepo(repoFlags = flags) {
   // undeterminable origin URL is NOT fatal for metadata-only operations. Operations that clone, fetch,
   // or prove preservation need a canonical origin at startup; a lane-controlled remote is no fallback.
   const explicitPool = typeof repoFlags.pool === 'string' && repoFlags.pool ? repoFlags.pool : null;
+  // --pool changes the target, not the authority for its remote. Resolve that
+  // primary before any recovery caller can reuse the caller checkout's origin.
+  // Explicit --origin / --reference remain authoritative, even when unresolved.
+  if ((cmd === 'gc' || cmd === 'release') && explicitPool && !repoFlags.origin && !repoFlags.reference
+    && explicitPool !== basename(originUrl || '').replace(/\.git$/, '')) {
+    return resolveRepo({ ...repoFlags, reference: join(dirname(topLevel), explicitPool) });
+  }
   if (!originUrl && !explicitPool) {
     fail(`could not determine an origin URL — pass --origin=<url> (looked in ${topLevel})`);
   }
@@ -2935,22 +2942,10 @@ async function cmdRelease(repo) {
     // `rmSync` here would destroy that NEW holder's live lease, not the one this call actually decided to drop
     // — the same check-then-act TOCTOU `cmdTrim` already closed for its own reap path with this exact primitive.
     if (recoveryEnabled()) {
-      // --pool alone changes repo.name without changing the caller's origin. Discover its primary
-      // only when no canonical --origin or --reference was supplied; keep explicit resolution,
-      // including an unresolved origin, rather than replacing it with a guessed sibling.
-      const callerName = basename(repo.originUrl || '').replace(/\.git$/, '');
-      let salvageRepo = repo;
-      try {
-        if (flags.pool && flags.pool !== callerName && !flags.origin && !flags.reference) {
-          salvageRepo = resolveRepo({ reference: primarySiblingPath(repo, flags.pool), pool: flags.pool });
-        }
-      } catch {
-        salvageRepo = null;
-      }
-      if (!salvageRepo?.originUrl) {
+      if (!repo.originUrl) {
         log(`  WARNING lane-${n}: canonical origin unresolved for pool ${repo.name}; skipping salvage and releasing anyway — inspect the lane before reuse`);
       } else {
-        const salvage = await salvagePushLane({ lane: n, laneDir: dir, io: realSalvageIo({ repo: salvageRepo }) });
+        const salvage = await salvagePushLane({ lane: n, laneDir: dir, io: realSalvageIo({ repo }) });
         if (salvage.status === 'failed') log(`  WARNING lane-${n}: SALVAGE PUSH FAILED: ${salvage.reason}; releasing anyway — inspect the lane before reuse`);
         else if (salvage.status === 'pushed') log(`  lane-${n}: salvaged to ${salvage.ref}`);
       }

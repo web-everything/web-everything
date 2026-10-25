@@ -54,12 +54,22 @@ export function realSalvageIo({ repo, backupRoot = process.env.WE_LANE_BACKUP_RO
     cwd: dir, env, encoding: 'utf8', timeout, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
+  const transportGit = (dir, command, ...args) => {
+    // An explicit URL still passes through url.*.insteadOf / pushInsteadOf. Refuse
+    // every effective rewrite (including includes and global config) before transport.
+    // NUL-delimited names keep newlines in a subsection from hiding a rewrite key.
+    const keys = git(dir, ['config', '--null', '--name-only', '--list']);
+    if (keys.split('\0').some(key => /^url\.[\s\S]*\.(?:push)?insteadof$/i.test(key))) {
+      throw new Error('URL rewriting configured; canonical origin cannot be trusted — remove the rewrite and retry');
+    }
+    return git(dir, transport(command, ...args));
+  };
   return {
     aheadShas: dir => git(dir, ['rev-list', `origin/${repo.branch}..HEAD`]).split('\n').filter(Boolean),
     unmatchedShas: (dir, ahead) => {
       // All branch tips are needed for exact-SHA reachability, but only the integration branch
       // participates in patch equivalence. Explicit refspecs also make pruning independent of lane config.
-      git(dir, transport('fetch', '--prune', '--no-tags', origin, '+refs/heads/*:refs/remotes/origin/*'));
+      transportGit(dir, 'fetch', '--prune', '--no-tags', origin, '+refs/heads/*:refs/remotes/origin/*');
       const matched = new Set();
       for (const line of git(dir, ['cherry', `origin/${repo.branch}`, 'HEAD']).split('\n')) {
         if (line.startsWith('- ')) matched.add(line.slice(2).trim());
@@ -68,11 +78,11 @@ export function realSalvageIo({ repo, backupRoot = process.env.WE_LANE_BACKUP_RO
         && !git(dir, ['for-each-ref', '--contains', sha, 'refs/remotes/origin', '--count=1']));
     },
     push: (dir, ref, sha) => {
-      git(dir, transport('push', origin, `${sha}:refs/heads/${ref}`));
+      transportGit(dir, 'push', origin, `${sha}:refs/heads/${ref}`);
       return { ok: true };
     },
     remoteSha: ref => {
-      const output = git(repo.referencePath, transport('ls-remote', origin, `refs/heads/${ref}`));
+      const output = transportGit(repo.referencePath, 'ls-remote', origin, `refs/heads/${ref}`);
       if (!output) return null;
       const lines = output.split('\n');
       const [sha, name] = lines[0].split(/\s+/);

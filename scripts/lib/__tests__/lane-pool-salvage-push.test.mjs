@@ -157,6 +157,28 @@ describe('salvage push contract', () => {
 
 describe('real salvage preservation and transport', () => {
   const repo = { branch: 'main', originUrl: 'https://example.test/canonical.git', referencePath: 'reference' };
+  it.each(['insteadOf', 'pushInsteadOf', 'newline subsection'])(
+    'refuses %s rewrites before fetch, push, and remote verification', key => {
+      const runGit = vi.fn((_command, args) => args.includes('config')
+        ? (key === 'newline subsection' ? 'url./untrusted\nremote.insteadof\0' : `url./untrusted/remote.${key.toLowerCase()}\0`) : '');
+      const io = realSalvageIo({ repo, runGit });
+      for (const operation of [() => io.unmatchedShas(laneDir, [head]),
+        () => io.push(laneDir, ref, head), () => io.remoteSha(ref)]) {
+        expect(operation).toThrow(/URL rewriting.*canonical origin/);
+      }
+      expect(runGit.mock.calls.some(([, args]) => args.some(arg => ['fetch', 'push', 'ls-remote'].includes(arg)))).toBe(false);
+    });
+
+  it('fails closed when the effective transport configuration cannot be read', () => {
+    const runGit = vi.fn((_command, args) => {
+      if (args.includes('config')) throw new Error('configuration unreadable');
+      return '';
+    });
+    const io = realSalvageIo({ repo, runGit });
+    expect(() => io.unmatchedShas(laneDir, [head])).toThrow(/configuration unreadable/);
+    expect(runGit.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+  });
+
   function realHarness({ cherry = `+ ${head}\n+ ${older}`, contains = '', fail } = {}) {
     const runGit = vi.fn((_command, args) => {
       if (fail && args.includes(fail)) throw new Error(`${fail} unavailable`);

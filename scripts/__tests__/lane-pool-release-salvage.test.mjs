@@ -12,16 +12,20 @@ const git = (args, cwd) => execFileSync('git', args, {
 let fixtureRoot, sharedFixture, origin, reference, base, poolRoot, backupRoot, laneDir, lane;
 const poolArgs = (originUrl = origin, referencePath = reference) => [...(originUrl === null ? [] : [`--origin=${originUrl}`]), ...(referencePath === null ? [] : [`--reference=${referencePath}`]), '--name=releasesalvage', '--branch=main', '--no-install'];
 function runPool(args, env = {}, { stderr, cwd, originUrl = origin, referencePath = reference } = {}) {
-  const result = spawnSync(process.execPath, [script, ...args, ...poolArgs(originUrl, referencePath), '--session=salvage-holder', '--json'], {
+  const preload = `import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module';
+    os.userInfo = () => ({ homedir: ${JSON.stringify(base)} }); syncBuiltinESMExports();`;
+  const result = spawnSync(process.execPath, [`--import=data:text/javascript,${encodeURIComponent(preload)}`,
+    script, ...args, ...poolArgs(originUrl, referencePath), '--session=salvage-holder', '--json'], {
     cwd,
     encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', maxBuffer: 8 * 1024 * 1024,
-    env: withGhStub({ ...process.env, LANE_POOL_ROOT: poolRoot, WE_LANE_BACKUP_ROOT: backupRoot, ...env }),
+    env: withGhStub({ ...process.env, LANE_POOL_AUTO_RECOVER: '1', LANE_POOL_NO_RECOVER: '0',
+      LANE_POOL_ROOT: poolRoot, WE_LANE_BACKUP_ROOT: backupRoot, ...env }),
   });
   expect(result.error).toBeUndefined();
   expect(result.status, result.stderr).toBe(0);
   if (stderr) expect(result.stderr).toMatch(stderr);
   else expect(result.stderr).not.toContain('SALVAGE PUSH FAILED');
-  return JSON.parse(result.stdout);
+  return result.stdout.trim() ? JSON.parse(result.stdout) : null;
 }
 const salvageBranches = () => git(['ls-remote', '--heads', origin, `refs/heads/salvage/lane-${lane}-*`], reference)
   .split('\n').filter(Boolean).map(line => line.split(/\s+/));
@@ -92,6 +96,46 @@ describe('lane-pool release salvage push against a throwaway origin', () => {
     git(['clone', '--quiet', callerOrigin, cwd]);
     return { callerOrigin, cwd, originUrl: null, referencePath: null };
   }
+
+  it.each(['release', 'release --all-pools', 'gc'])(
+    'selected pool recovery never uses the caller origin: %s', command => {
+      const sha = commitLocalWork();
+      const caller = primaryCaller();
+      git(['clone', '--quiet', origin, join(base, 'releasesalvage')]);
+      git(['remote', 'set-url', 'origin', caller.callerOrigin], laneDir);
+      const env = {};
+      if (command === 'gc') {
+        rmSync(join(laneDir, '.git', '.lane-lease'));
+        const bin = join(base, 'bin');
+        mkdirSync(bin);
+        for (const [name, body] of [['claude', 'echo "[]"'], ['lsof', 'exit 0']]) {
+          writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+        }
+        Object.assign(env, { PATH: `${bin}:${process.env.PATH}`, VITEST: 'true',
+          WE_TEST_HOST_LOAD1: '0', WE_TEST_HOST_MEMORY_MB: '999999', WE_LANE_SALVAGE_QUIET_MIN: '0' });
+      }
+      const result = runPool([...command.split(' '), '--pool=releasesalvage'], env, caller);
+      if (command !== 'gc') assertReleased(result);
+      expect(salvageBranches()).toEqual([[sha, expect.stringMatching(/^refs\/heads\/salvage\/lane-1-/)]]);
+      expect(git(['ls-remote', '--heads', caller.callerOrigin, 'refs/heads/salvage/*'], caller.cwd)).toBe('');
+    }, 35_000);
+
+  it.each(['insteadOf', 'pushInsteadOf', 'included insteadOf'])(
+    'refuses lane-controlled %s rather than accepting redirected preservation', kind => {
+      const sha = commitLocalWork();
+      const attacker = join(base, 'attacker.git');
+      git(['clone', '--quiet', '--bare', laneDir, attacker]);
+      const key = `url.${attacker}.${kind === 'pushInsteadOf' ? kind : 'insteadOf'}`;
+      if (kind.startsWith('included')) {
+        const config = join(base, 'rewrites.config');
+        git(['config', '--file', config, key, origin]);
+        git(['config', 'include.path', config], laneDir);
+      } else git(['config', key, origin], laneDir);
+      assertReleased(runPool(['release', '--lane=1'], {}, { stderr: /SALVAGE PUSH FAILED.*URL rewriting.*canonical origin/ }));
+      expect(salvageBranches()).toEqual([]);
+      expect(git(['ls-remote', '--heads', attacker, 'refs/heads/salvage/*'], reference)).toBe('');
+      expect(git(['rev-parse', 'HEAD'], laneDir)).toBe(sha);
+    }, 35_000);
 
   it('release --pool resolves the selected pool\'s canonical origin', () => {
     const sha = commitLocalWork();

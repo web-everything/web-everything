@@ -50,7 +50,7 @@ function runPool(args, extraEnv = {}) {
     encoding: 'utf8',
     timeout: 25_000,
     killSignal: 'SIGKILL',
-    env: { ...process.env, LANE_POOL_ROOT: poolRoot, ...extraEnv },
+    env: { ...process.env, LANE_POOL_NO_RECOVER: '1', LANE_POOL_ROOT: poolRoot, ...extraEnv },
   });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || ''), timedOut: !!r.error };
 }

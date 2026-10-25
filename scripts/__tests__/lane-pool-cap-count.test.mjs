@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, existsSync, readFileSync, renameSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
@@ -13,7 +13,7 @@ function run(args) {
   return spawnSync(process.execPath, [script, ...args, `--origin=${origin}`, `--reference=${reference}`,
     '--name=capcounttest', '--branch=main', '--no-install'], {
     encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
-    env: withGhStub({ ...process.env, LANE_POOL_ROOT: poolRoot, LANE_POOL_HARD_MAX: '3',
+    env: withGhStub({ ...process.env, LANE_POOL_NO_RECOVER: '1', LANE_POOL_ROOT: poolRoot, LANE_POOL_HARD_MAX: '3',
       LANE_POOL_ACQUIRE_GROWTH_MAX_NEW: '1' }),
   });
 }
@@ -56,6 +56,7 @@ describe('lane-pool acquire counts valid lanes for its hard cap', () => {
     const result = acquire();
     expect(result.stdout + result.stderr).not.toMatch(/already at its hard cap/i);
     expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toMatch(/ignored pool entry.*lane-999999/);
     expect(result.stdout.trim()).toMatch(/lane-3$/);
     expect(existsSync(join(lane(3), '.git'))).toBe(true);
     expect(readFileSync(join(lane(3), '.git', '.lane-lease'), 'utf8')).toContain('picker');
@@ -65,9 +66,20 @@ describe('lane-pool acquire counts valid lanes for its hard cap', () => {
     mkdirSync(join(poolRoot, 'capcounttest', 'lane-abc'));
     const result = acquire();
     expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toMatch(/ignored pool entry.*lane-abc/);
     expect(result.stdout + result.stderr).not.toMatch(/already at its hard cap/i);
     expect(result.stdout.trim()).toMatch(/lane-3$/);
     expect(existsSync(join(lane(3), '.git'))).toBe(true);
+  });
+  it('fills lane-2 before growing past lane-3 when the existing lanes are held', () => {
+    hold(2);
+    renameSync(lane(2), lane(3));
+    const result = acquire();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout.trim()).toMatch(/lane-2$/);
+    expect(existsSync(lane(4))).toBe(false);
+    expect(readFileSync(join(lane(2), '.git', '.lane-lease'), 'utf8')).toContain('picker');
+    for (const n of [1, 3]) expect(existsSync(join(lane(n), '.git', '.lane-lease'))).toBe(true);
   });
   it('fails with the hard cap message when all three real lanes are leased (control)', () => {
     hold(3);
