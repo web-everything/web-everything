@@ -79,7 +79,8 @@ describe('build safeguards policy and briefs', () => {
   it('related gate requests the historical selection through verify-lane', () => {
     const exec = vi.fn(() => 'green');
     expect(runGate({ dir: '.', mode: 'related', execFn: exec, env: {} }).pass).toBe(true);
-    expect(exec).toHaveBeenCalledWith('node', ['scripts/verify-lane.mjs', 'run'], { cwd: '.', env: { WE_BUILD_FINAL_GATE: 'related' } });
+    expect(exec).toHaveBeenCalledWith('node', ['scripts/verify-lane.mjs', 'run'],
+      { cwd: '.', env: { WE_BUILD_FINAL_GATE: 'related' }, timeout: codexTasks.DEFAULT_TIMEOUT_MS });
   });
   it('refuses an ephemeral editable builder before spawning when self-review needs a resumable session', async () => {
     const spawnFn = vi.fn();

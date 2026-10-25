@@ -460,6 +460,7 @@ const REVIEW_CODE_PATH_FILES = new Set([
   // review-extra-seats, jury-core, write-all-sync) are covered above.
   'scripts/lib/review-ci-gate-io.mjs', 'scripts/operations/completion-cli.mjs', 'scripts/operations/completion-store.mjs',
   'scripts/conveyor/run-rating.mjs', 'scripts/operations/telemetry-store.mjs', 'scripts/conveyor/reconcile-core.mjs',
+  'scripts/lib/pid-alive.mjs',
   // Verdict carry and red-team marker helpers are direct dependencies of review-job's acceptance path.
   'scripts/lib/rebase-verdict-carry.mjs', 'scripts/lib/red-team-gate.mjs', 'scripts/lib/drain-red-team-evidence.mjs',
   'scripts/lib/red-team-status-labels.mjs',
