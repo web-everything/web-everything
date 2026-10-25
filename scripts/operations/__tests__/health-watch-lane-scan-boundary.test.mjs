@@ -131,6 +131,30 @@ describe('health-watch destructive lane action call-site contract', () => {
     visit(tree);
     return calls;
   };
+  for (const file of scopedScanFiles(['scripts/conveyor/health-watch.mjs', 'scripts/operations/stale-state-io.mjs'])) {
+    it.each(['reclaim', 'reset', 'reuse', 'release-on-behalf'])(
+      `${file}: every added %s call site requires guardLaneAction review, including assigned runners`, action => {
+        const source = readFileSync(new URL(`../../../${file}`, import.meta.url), 'utf8');
+        const before = commands(source);
+        // Parsed only: exercise the same source inventory that protects the real
+        // reporting entry points, without executing a destructive lane command.
+        // A new action must trip that boundary even if its runner was declared
+        // earlier and assigned later, rather than initialized at declaration.
+        for (const assignment of ['launch = exec', 'launch ||= exec', 'launch ??= exec',
+          'launch = later; later = exec', '({ launch } = { launch: exec })',
+          '[launch] = [exec]', 'actions.launch = exec']) {
+          const callee = assignment.startsWith('actions.') ? 'actions.launch' : 'launch';
+          const added = `${source}\nfunction proposedLaneAction() {
+            let launch, later; const actions = {};
+            ${assignment};
+            ${callee}('node', ['lane-pool.mjs', '${action}', '--lane=1']);
+          }`;
+          expect(commands(added), `${action} bypass via ${assignment}`).not.toEqual(before);
+          expect(commands(added).some(call => call.startsWith(`${callee}(`)),
+            `the ${action} invocation itself must be inventoried`).toBe(true);
+        }
+      });
+  }
   it.each([
     ["import { execFileSync as launch } from 'node:child_process'; launch('git', ['reset', '--hard']);", 'launch('],
     ["import { spawnSync } from 'child_process'; spawnSync('git', ['reset', '--hard']);", 'spawnSync('],
