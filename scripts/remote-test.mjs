@@ -134,7 +134,7 @@ export async function runRemoteCLI(options, { repo = process.cwd(), json = false
       do {
         const runs = fetchDispatchRuns(evidence.headSha);
         const run = selectRemoteVerifyRun(runs.filter(run => freshDispatchRun(run, evidence)
-          && matchesDispatchInputs(run, options)), evidence.headSha);
+          && matchesDispatchInputs(run, options)), evidence.headSha, { includeTargeted: options.mode === 'targeted' });
         if (run) return run;
         if (now() >= deadline) return null;
         await pause(5000);

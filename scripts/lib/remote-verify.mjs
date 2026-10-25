@@ -6,12 +6,22 @@ const fullSha = (sha) => typeof sha === 'string' && /^[a-f0-9]{40}$/i.test(sha);
 const sameSha = (a, b) => fullSha(a) && fullSha(b) && a.toLowerCase() === b.toLowerCase();
 export const MAX_REMOTE_WAIT_MS = 540000;
 
-export function selectRemoteVerifyRun(runs, sha) {
+function targetedDispatch(run) {
+  if (run.event !== 'workflow_dispatch') return false;
+  if (run.display_title === 'remote-verify (targeted)') return true;
+  const prefix = 'remote-verify ';
+  if (typeof run.display_title !== 'string' || !run.display_title.startsWith(prefix)) return false;
+  try { return JSON.parse(run.display_title.slice(prefix.length))?.mode === 'targeted'; }
+  catch { return false; }
+}
+
+export function selectRemoteVerifyRun(runs, sha, { includeTargeted = false } = {}) {
   if (!Array.isArray(runs) || !fullSha(sha)) return null;
   // Targeted dispatches are diagnostics, not lane-gate evidence. Keep them out of
-  // both the initial selection and the final attempt re-check.
+  // both the initial selection and the final attempt re-check. Only the diagnostic
+  // client opts into selecting them, after matching the complete dispatch inputs.
   return runs.filter((run) => sameSha(run?.head_sha, sha)
-    && !(run.event === 'workflow_dispatch' && run.display_title === 'remote-verify (targeted)'))
+    && (includeTargeted || !targetedDispatch(run)))
     .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id)[0] ?? null;
 }
 

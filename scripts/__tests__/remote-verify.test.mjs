@@ -78,6 +78,24 @@ describe('selectRemoteVerifyRun — newest run for the exact full SHA', () => {
     }
   });
 
+  it.each(['pretty', 'whitespace-normalized'])('excludes %s JSON targeted titles from lane evidence while allowing explicit diagnostics', format => {
+    const push = run();
+    const title = mode => {
+      const json = JSON.stringify({ ref: '', mode, tests: 'example.test.ts', operation: '' }, null, 2);
+      return `remote-verify ${format === 'pretty' ? json : json.replace(/\s+/g, ' ')}`;
+    };
+    const targeted = run({ id: 456, event: 'workflow_dispatch', display_title: title('targeted'),
+      created_at: new Date(T0 + 1000).toISOString() });
+    expect(selectRemoteVerifyRun([targeted, push], SHA)).toEqual(push);
+    expect(selectRemoteVerifyRun([targeted], SHA)).toBeNull();
+    expect(selectRemoteVerifyRun([targeted], SHA, { includeTargeted: true })).toEqual(targeted);
+    expect(selectRemoteVerifyRun([{ ...targeted, event: 'push' }], SHA)?.id).toBe(456);
+    for (const mode of ['lane-check', 'full']) {
+      const gate = { ...targeted, display_title: title(mode) };
+      expect(selectRemoteVerifyRun([push, gate], SHA)).toEqual(gate);
+    }
+  });
+
   it.each([SHA.slice(0, 7), SHA.slice(0, 39), `${SHA}0`, `${SHA.slice(0, 39)}2`, 'g'.repeat(40), '', null, undefined])(
     'never accepts a prefix, different or malformed SHA (%s)', (badSha) => {
       expect(selectRemoteVerifyRun([run({ head_sha: badSha })], SHA)).toBeNull();
@@ -780,7 +798,7 @@ describe('remote-verify workflow — source contract', () => {
 
   it('targeted, full and lane-check dispatch groups can never cancel a push group', () => {
     const workflow = yaml.safeLoad(source());
-    expect(workflow['run-name']).toBe("remote-verify (${{ inputs.mode || 'lane-check' }})");
+    expect(workflow['run-name']).toBe('remote-verify ${{ toJSON(inputs) }}');
     const group = (inputs, event = 'workflow_dispatch', ref = 'refs/heads/lane/x') =>
       workflow.concurrency.group.replace(/\$\{\{([\s\S]*?)\}\}/g, (_, expression) =>
         Function('inputs', 'github', `return (${expression});`)(inputs, { event_name: event, ref }));

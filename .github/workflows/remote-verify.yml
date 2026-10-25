@@ -1,5 +1,5 @@
 name: Remote verify
-run-name: remote-verify (${{ inputs.mode || 'lane-check' }})
+run-name: remote-verify ${{ toJSON(inputs) }}
 
 on:
   workflow_dispatch:

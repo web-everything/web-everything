@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import yaml from 'js-yaml';
 import { parseArgs, buildDispatchArgs, runRemoteTest, runRemoteCLI, remoteIO } from '../remote-test.mjs';
 
 const REF = 'lane/remote-tests';
@@ -79,6 +80,24 @@ it('remote-test script rejects invalid arguments with usage and exit 3', () => {
 
 describe('CLI marker delegation', () => {
   const title = (options = {}) => `remote-verify ${JSON.stringify({ ref: '', mode: 'lane-check', tests: '', operation: '', ...options })}`;
+  function workflowTitle(options) {
+    const workflow = yaml.load(readFileSync(join(REPO, '.github/workflows/remote-verify.yml'), 'utf8'));
+    const inputs = Object.fromEntries(Object.entries(workflow.on.workflow_dispatch.inputs)
+      .map(([key, definition]) => [key, definition.default ?? '']));
+    const argv = buildDispatchArgs(options);
+    for (let index = 0; index < argv.length; index++) {
+      if (argv[index] !== '-f') continue;
+      const field = argv[++index];
+      const separator = field.indexOf('=');
+      inputs[field.slice(0, separator)] = field.slice(separator + 1);
+    }
+    // Evaluate only the expressions this workflow uses; unknown syntax fails the contract test.
+    return workflow['run-name'].replace(/\$\{\{\s*(.*?)\s*\}\}/g, (_match, expression) => {
+      if (expression === 'toJSON(inputs)') return JSON.stringify(inputs, null, 2);
+      if (expression === "inputs.mode || 'lane-check'") return inputs.mode || 'lane-check';
+      throw new Error(`Unsupported workflow title expression: ${expression}`);
+    });
+  }
   function fixture({ preExisting = [], postDispatch, mode = 'lane-check', inputs = {} } = {}) {
     const run = { id: 123, event: 'workflow_dispatch', head_sha: SHA,
       created_at: CREATED_AFTER, status: 'completed', conclusion: 'success', display_title: title({ mode, ...inputs }) };
@@ -92,6 +111,24 @@ describe('CLI marker delegation', () => {
         })() : run) }, execFile: vi.fn(), now: () => clock,
       pause: vi.fn(async ms => { clock += ms; }) };
   }
+  it.each([
+    { mode: 'lane-check' },
+    { mode: 'full' },
+    { mode: 'targeted', tests },
+    { mode: 'targeted', operation: 'check-standards' },
+  ])('discovers and waits for the rendered checked-in workflow title: %j', async request => {
+    const options = { ref: REF, ...request };
+    const display_title = workflowTitle(options);
+    const run = { id: 123, event: 'workflow_dispatch', head_sha: SHA, created_at: CREATED_AFTER,
+      status: 'completed', conclusion: 'success', display_title };
+    const io = fixture({ postDispatch: [run] });
+    const api = io.live.api.getMockImplementation();
+    io.live.api.mockImplementation(path => path === 'actions/runs/123' ? run : api(path));
+    expect(await runRemoteCLI(options, { ...io, quietFailure: true })).toBe(0);
+    expect(io.live.api).toHaveBeenCalledWith('actions/runs/123');
+    expect(io.pause).not.toHaveBeenCalled();
+    expect(io.execFile).toHaveBeenCalledTimes(request.mode === 'targeted' ? 0 : 1);
+  });
   it.each(['lane-check', 'full'])('imports green %s through verify-lane remote with argv', async mode => {
     const io = fixture({ mode });
     expect(await runRemoteCLI({ ref: REF, mode }, io)).toBe(0);
