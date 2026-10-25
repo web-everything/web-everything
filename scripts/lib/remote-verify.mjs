@@ -36,8 +36,24 @@ export function buildRemoteMarker({ sha, treeHash, run, now }) {
   };
 }
 
-/** Import only a successful attempt whose job proves the required gate actually ran. */
-export async function recordRemoteVerification({ sha, treeHash, run, fetchJobs, fetchRuns, treeUnchanged, writeMarker, now }) {
+// A path allow-list cannot establish the complete executable dependency closure:
+// npm lifecycle hooks, configuration and transitive helpers can all replace a gate.
+// Until protected gate execution exists, accept only the entire protected tree.
+async function protectedDefinition(sha, fetchDefinition) {
+  try {
+    const { head, base } = await fetchDefinition();
+    if (!sameSha(head?.sha, sha) || !fullSha(base?.sha)
+      || !sameSha(head?.commit?.tree?.sha, base?.commit?.tree?.sha)) throw new Error();
+    return { repository: 'web-everything/web-everything', protectedSha: base.sha.toLowerCase(),
+      definitionTree: base.commit.tree.sha.toLowerCase() };
+  } catch {
+    throw Object.assign(new Error('Untrusted or unreadable protected definition; use local verify'),
+      { code: 'REMOTE_UNTRUSTED_DEFINITION' });
+  }
+}
+
+/** Import a successful exact-head attempt only with an unchanged protected definition. */
+export async function recordRemoteVerification({ sha, treeHash, run, fetchJobs, fetchRuns, fetchDefinition, treeUnchanged, writeMarker, now }) {
   if (remoteVerdict(run).state !== 'green' || !sameSha(run?.head_sha, sha)
     || !Number.isSafeInteger(run?.id) || run.id <= 0
     || !Number.isSafeInteger(run?.run_attempt) || run.run_attempt <= 0) {
@@ -53,14 +69,22 @@ export async function recordRemoteVerification({ sha, treeHash, run, fetchJobs, 
       && step.status === 'completed' && step.conclusion === 'success')) {
     throw new Error('Run did not prove the required lane gate; use local verify');
   }
+  const definition = await protectedDefinition(sha, fetchDefinition);
   const runs = await fetchRuns();
   if (!readableRuns(runs)) throw new Error('Unreadable final workflow runs; retry remote or use local verify');
   const newest = selectRemoteVerifyRun(runs, sha);
   if (newest?.id !== run.id || newest?.run_attempt !== run.run_attempt || remoteVerdict(newest).state !== 'green') {
     throw new Error('Remote run changed after job verification; retry remote or use local verify');
   }
+  const finalDefinition = await protectedDefinition(sha, fetchDefinition);
+  if (finalDefinition.protectedSha !== definition.protectedSha
+    || finalDefinition.definitionTree !== definition.definitionTree) {
+    throw Object.assign(new Error('Changed protected definition; retry remote or use local verify'),
+      { code: 'REMOTE_UNTRUSTED_DEFINITION' });
+  }
   if (!treeUnchanged()) throw new Error('HEAD or tree changed during remote verification');
   const marker = buildRemoteMarker({ sha, treeHash, run, now });
+  Object.assign(marker.remote, definition, { runAttempt: run.run_attempt });
   writeMarker(marker);
   return marker;
 }

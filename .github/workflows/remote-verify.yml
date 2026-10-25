@@ -90,7 +90,8 @@ jobs:
           npm run build:tools
       - name: Install
         run: npm ci
-      # The importer accepts only a completed successful Required lane gate step.
+      # Import also requires the entire run tree to equal canonical main's tree.
+      # Lane changes use local verify until protected gate execution is available.
       - name: ${{ inputs.mode == 'targeted' && 'Targeted tests' || 'Required lane gate' }}
         env:
           VERIFY_MODE: ${{ inputs.mode || 'lane-check' }}

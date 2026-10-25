@@ -296,7 +296,7 @@ describe('remote CLI — local preconditions', () => {
     }
   }
 
-  function mockRemote({ root, initial }, url) {
+  function mockRemote({ root, initial, tree }, url) {
     const bin = join(root, 'bin');
     mkdirSync(bin);
     const calls = join(root, 'gh-calls.jsonl');
@@ -318,7 +318,11 @@ describe('remote CLI — local preconditions', () => {
       const { appendFileSync, readFileSync } = require('node:fs');
       const args = process.argv.slice(2);
       appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ args, repo: process.env.GH_REPO, host: process.env.GH_HOST, memo: process.env.WE_GH_READ_MEMO_DIR }) + '\\n');
-      let data = args.includes('view') ? 'ambient/wrong' : args.some(a => a.includes('/jobs?'))
+      const commit = args.find(a => a.includes('/commits/'));
+      let data = commit ? { sha: commit.endsWith('/main') ? ${JSON.stringify(OTHER)} : ${JSON.stringify(initial)},
+        commit: { tree: { sha: process.env.FIXTURE_CHANGED_DEFINITION && !commit.endsWith('/main')
+          ? 'd'.repeat(40) : ${JSON.stringify(tree)} } } }
+        : args.includes('view') ? 'ambient/wrong' : args.some(a => a.includes('/jobs?'))
         ? { total_count: 1, jobs: [{ name: 'verify', run_id: 123, head_sha: ${JSON.stringify(initial)},
           status: 'completed', conclusion: 'success', steps: [{ name: 'Required lane gate', status: 'completed', conclusion: 'success' }] }] }
         : process.env.FIXTURE_ABSENT ? { total_count: 0, workflow_runs: [] }
@@ -326,6 +330,12 @@ describe('remote CLI — local preconditions', () => {
       if (process.env.FIXTURE_RERUN && data.workflow_runs
         && readFileSync(${JSON.stringify(calls)}, 'utf8').trim().split('\\n').length > 1) {
         data.workflow_runs[0].run_attempt += 1;
+      }
+      if (commit && process.env.FIXTURE_UNREADABLE_DEFINITION) data = {};
+      if (commit && process.env.FIXTURE_OVERSIZED_DEFINITION) data.padding = 'x'.repeat(2 * 1024 * 1024);
+      if (commit && commit.endsWith('/main') && process.env.FIXTURE_MOVED_DEFINITION
+        && readFileSync(${JSON.stringify(calls)}, 'utf8').split('/commits/main').length > 2) {
+        data.sha = 'e'.repeat(40);
       }
       process.stdout.write(JSON.stringify(data));
     `);
@@ -343,13 +353,37 @@ describe('remote CLI — local preconditions', () => {
       expect(result.status).toBe(0);
       expect(JSON.parse(result.stdout).ok).toBe(true);
       const calls = readFileSync(mock.calls, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-      expect(calls).toHaveLength(3);
+      expect(calls).toHaveLength(7);
+      const runPath = `repos/web-everything/web-everything/actions/workflows/remote-verify.yml/runs?head_sha=${ctx.initial}&per_page=100`;
+      const headPath = `repos/web-everything/web-everything/commits/${ctx.initial}`;
+      const basePath = 'repos/web-everything/web-everything/commits/main';
+      expect(calls.map(call => call.args.at(-1))).toEqual([runPath,
+        'repos/web-everything/web-everything/actions/runs/123/attempts/2/jobs?per_page=100',
+        headPath, basePath, runPath, headPath, basePath]);
       for (const call of calls) {
         expect(call.repo).toBe('web-everything/web-everything');
         expect(call.args[0]).toBe('api');
-        expect(call.args.some(arg => arg.startsWith('repos/web-everything/web-everything/actions/'))).toBe(true);
       }
+      expect(calls.filter(call => call.args.includes(`repos/web-everything/web-everything/commits/${ctx.initial}`))).toHaveLength(2);
+      expect(calls.filter(call => call.args.includes('repos/web-everything/web-everything/commits/main'))).toHaveLength(2);
+      expect(JSON.parse(readFileSync(ctx.marker, 'utf8')).remote).toMatchObject({
+        repository: 'web-everything/web-everything', protectedSha: OTHER, definitionTree: ctx.tree, runAttempt: 2,
+      });
       expect(existsSync(ctx.marker)).toBe(true);
+    });
+  }, 20000);
+
+  it.each(['FIXTURE_CHANGED_DEFINITION', 'FIXTURE_UNREADABLE_DEFINITION', 'FIXTURE_MOVED_DEFINITION',
+    'FIXTURE_OVERSIZED_DEFINITION'])
+  ('refuses forged green labels when the protected definition fails at the CLI (%s)', (failure) => {
+    fixture((ctx) => {
+      const mock = mockRemote(ctx, 'https://github.com/web-everything/web-everything.git');
+      const result = ctx.invoke({ ...mock.env, [failure]: '1' });
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(2);
+      expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, reason: 'untrusted-definition',
+        detail: expect.stringMatching(/canonical main.*local verify/) });
+      expect(existsSync(ctx.marker)).toBe(false);
     });
   }, 20000);
 
@@ -403,7 +437,7 @@ describe('remote CLI — local preconditions', () => {
       const result = ctx.invoke({ ...mock.env, GH_HOST: 'enterprise.example.test' });
       expect(result.status).toBe(0);
       const calls = readFileSync(mock.calls, 'utf8').trim().split('\n').map(JSON.parse);
-      expect(calls).toHaveLength(3);
+      expect(calls).toHaveLength(7);
       for (const call of calls) {
         expect(call.host).toBe('github.com');
         expect(call.args).toEqual(expect.arrayContaining(['--hostname', 'github.com']));
@@ -421,7 +455,7 @@ describe('remote CLI — local preconditions', () => {
       expect(result.status).toBe(rerun ? 2 : 0);
       expect(JSON.parse(result.stdout).ok).toBe(!rerun);
       const calls = readFileSync(mock.calls, 'utf8').trim().split('\n').map(JSON.parse);
-      expect(calls).toHaveLength(3);
+      expect(calls).toHaveLength(rerun ? 5 : 7);
       expect(calls.filter(call => call.args.some(arg => arg.includes('/runs?')))).toHaveLength(2);
       expect(calls.filter(call => call.args.some(arg => arg.includes('/jobs?')))).toHaveLength(1);
       for (const call of calls) expect(call).not.toHaveProperty('memo');
@@ -487,6 +521,10 @@ describe('remote CLI — local preconditions', () => {
 
 describe('remote lane marker import — required gate evidence', () => {
   const successful = run({ run_attempt: 2 });
+  const definition = () => ({
+    head: { sha: SHA, commit: { tree: { sha: TREE } } },
+    base: { sha: OTHER, commit: { tree: { sha: TREE } } },
+  });
   const gateStep = { name: 'Required lane gate', status: 'completed', conclusion: 'success' };
   const job = (overrides = {}) => ({
     name: 'verify', run_id: successful.id, head_sha: SHA,
@@ -499,9 +537,101 @@ describe('remote lane marker import — required gate evidence', () => {
     expect(result.ok).toBe(true);
     return recordRemoteVerification({
       sha: SHA, treeHash: TREE, run: result.run, now: () => T0,
+      fetchDefinition: async () => definition(),
       fetchRuns: async () => [successful], fetchJobs: async () => jobs, treeUnchanged: () => true, ...overrides,
     });
   }
+
+  it.each(['workflow no-op', 'gate script', 'transitive helper', 'package lifecycle', 'test configuration'])
+  ('refuses lane-edited %s despite successful job and step names', async () => {
+    const writeMarker = vi.fn();
+    const changed = definition();
+    changed.head.commit.tree.sha = 'd'.repeat(40);
+    await expect(importRun([job()], { writeMarker, fetchDefinition: async () => changed }))
+      .rejects.toThrow(/protected definition.*local verify/i);
+    expect(writeMarker).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, null, {}, { head: null, base: null }])
+  ('refuses missing or unreadable protected definitions (%j)', async (evidence) => {
+    const writeMarker = vi.fn();
+    await expect(importRun([job()], { writeMarker, fetchDefinition: async () => evidence }))
+      .rejects.toThrow(/protected definition.*local verify/i);
+    expect(writeMarker).not.toHaveBeenCalled();
+  });
+
+  it('refuses callers without a protected-definition reader', async () => {
+    const writeMarker = vi.fn();
+    await expect(importRun([job()], { writeMarker, fetchDefinition: undefined }))
+      .rejects.toThrow(/protected definition.*local verify/i);
+    expect(writeMarker).not.toHaveBeenCalled();
+  });
+
+  it.each(['head SHA', 'protected SHA', 'head tree', 'protected tree'])
+  ('refuses incomplete or malformed protected-definition identifiers (%s)', async (field) => {
+    const evidence = definition();
+    if (field === 'head SHA') evidence.head.sha = SHA.slice(0, 7);
+    if (field === 'protected SHA') evidence.base.sha = '../main';
+    if (field === 'head tree') evidence.head.commit.tree.sha = '';
+    if (field === 'protected tree') evidence.base.commit.tree.sha = TREE + '\n';
+    const writeMarker = vi.fn();
+    await expect(importRun([job()], { writeMarker, fetchDefinition: async () => evidence }))
+      .rejects.toThrow(/protected definition.*local verify/i);
+    expect(writeMarker).not.toHaveBeenCalled();
+  });
+
+  it.each([1, 2])('refuses an unavailable protected-definition read at probe %s', async (probe) => {
+    const fetchDefinition = vi.fn();
+    if (probe === 2) fetchDefinition.mockResolvedValueOnce(definition());
+    fetchDefinition.mockRejectedValue(new Error('API unavailable'));
+    const writeMarker = vi.fn();
+    await expect(importRun([job()], { writeMarker, fetchDefinition }))
+      .rejects.toThrow(/protected definition.*local verify/i);
+    expect(writeMarker).not.toHaveBeenCalled();
+  });
+
+  it('normalizes Git object IDs consistently across definition reads', async () => {
+    const evidence = definition();
+    evidence.head.sha = SHA.toUpperCase();
+    evidence.head.commit.tree.sha = TREE.toUpperCase();
+    evidence.base.sha = OTHER.toUpperCase();
+    const writeMarker = vi.fn();
+    const fetchDefinition = vi.fn().mockResolvedValueOnce(evidence).mockResolvedValue(definition());
+    const marker = await importRun([job()], { writeMarker, fetchDefinition });
+    expect(marker.remote.protectedSha).toBe(OTHER);
+    expect(marker.remote.definitionTree).toBe(TREE);
+    expect(writeMarker).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses an exact-head definition substituted with another commit', async () => {
+    const writeMarker = vi.fn();
+    const evidence = definition();
+    evidence.head.sha = OTHER;
+    await expect(importRun([job()], { writeMarker, fetchDefinition: async () => evidence }))
+      .rejects.toThrow(/protected definition.*local verify/i);
+    expect(writeMarker).not.toHaveBeenCalled();
+  });
+
+  it('rechecks the protected revision before writing even when its tree is unchanged', async () => {
+    const writeMarker = vi.fn();
+    const moved = definition();
+    moved.base.sha = 'd'.repeat(40);
+    const fetchDefinition = vi.fn().mockResolvedValueOnce(definition()).mockResolvedValue(moved);
+    await expect(importRun([job()], { writeMarker, fetchDefinition }))
+      .rejects.toThrow(/protected definition.*local verify/i);
+    expect(fetchDefinition).toHaveBeenCalledTimes(2);
+    expect(writeMarker).not.toHaveBeenCalled();
+  });
+
+  it('refuses a changed dependency tree on the final definition read', async () => {
+    const changed = definition();
+    changed.base.commit.tree.sha = 'd'.repeat(40);
+    const fetchDefinition = vi.fn().mockResolvedValueOnce(definition()).mockResolvedValue(changed);
+    const writeMarker = vi.fn();
+    await expect(importRun([job()], { writeMarker, fetchDefinition }))
+      .rejects.toThrow(/protected definition.*local verify/i);
+    expect(writeMarker).not.toHaveBeenCalled();
+  });
 
   it('rejects successful targeted runs as lane verification evidence', async () => {
     const writeMarker = vi.fn();
@@ -515,7 +645,9 @@ describe('remote lane marker import — required gate evidence', () => {
     const marker = await importRun([job()], { writeMarker });
     expect(writeMarker).toHaveBeenCalledTimes(1);
     expect(writeMarker).toHaveBeenCalledWith(marker);
-    expect(marker).toEqual(buildRemoteMarker({ sha: SHA, treeHash: TREE, run: successful, now: () => T0 }));
+    const expected = buildRemoteMarker({ sha: SHA, treeHash: TREE, run: successful, now: () => T0 });
+    expect(marker).toEqual({ ...expected, remote: { ...expected.remote,
+      repository: 'web-everything/web-everything', protectedSha: OTHER, definitionTree: TREE, runAttempt: 2 } });
   });
 
   it.each([

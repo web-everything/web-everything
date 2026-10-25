@@ -11,6 +11,10 @@ tags: []
 
 PR #5878 review identified provenance debt: an exact-SHA successful run can still execute a lane-edited workflow or gate script. Canonical origin pinning is implemented in the repair; protected gate execution or land-time comparison must establish which definition produced the evidence.
 
+PR #5878's next repair closes import conservatively: the importer reads canonical GitHub `main` and the exact run commit, requires their complete Git tree IDs to match, then repeats those reads before writing a marker. This covers workflow edits, gate scripts, transitive helpers, package lifecycle hooks and configuration without an incomplete executable-path allow-list. It records the repository, protected commit, tree and run attempt. Missing, malformed, changed or unreadable definitions refuse import with a local-verify fallback. The local working-tree hash remains separate from these Git tree IDs.
+
+This intentionally refuses **all content-changing lane commits**, including legitimate gate changes, until their complete tree is protected on `main`. Remote workflows remain useful for diagnostics; normal lane changes use local verification. Keep this card open for protected execution that can safely verify content-changing lanes. Import and consumption checks must be designed together before relaxing the complete-tree restriction.
+
 ## Acceptance
 
 - [A1] Execute the lane gate from a protected required workflow, or have the importer/land-time gate compare the run's workflow and executable gate dependency tree to the protected base. Fail closed when the protected definition cannot be read or when a lane-edited definition would be imported as proof. Comparing only job and step names is insufficient.
