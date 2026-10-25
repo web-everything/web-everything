@@ -986,14 +986,16 @@ export function probeBgIsolationStalls(agents, { readInfo = readBgIsolationStall
  * The `stale-claim` smell's class-A input: every `status: active`/`preparing` backlog claim's liveness, via the
  * declared `stale-state` read (#911) — shelled exactly like `lane-starvation`'s own `diagnose` already does, so
  * this probe and that diagnose never drift onto two different readers. Read-only; a hard timeout, like every
- * other child call in this file.
+ * other child call in this file. The lane-scan cache target is explicit: omitted, it is NO cache (never the host's).
  * @returns {{observedAt:string, records:Array<object>, gaps:string[]}}
  */
-export function probeStaleState({ exec = run, timeoutMs = 90_000, repoRoot = REPO_ROOT, laneScanDir = healthDir(), laneScanWrite = true } = {}) {
+export function probeStaleState({ exec = run, timeoutMs = 90_000, repoRoot = REPO_ROOT, laneScanDir = null, laneScanWrite = false } = {}) {
+  // Fail closed: a caller (or a queued job input) that names no cache target reads and writes NO cache, never the host's.
+  const cacheDir = typeof laneScanDir === 'string' ? laneScanDir : '';
   const out = exec(process.execPath, [join(repoRoot, 'scripts/operations/run.mjs'), 'stale-state', '--json'], {
     timeoutMs, cwd: repoRoot, stderr: 'inherit', env: { ...process.env,
-      WE_HEALTH_WATCH_LANE_SCAN: '1', WE_HEALTH_WATCH_LANE_SCAN_DIR: laneScanDir || '',
-      WE_HEALTH_WATCH_LANE_SCAN_WRITE: laneScanWrite ? '1' : '0',
+      WE_HEALTH_WATCH_LANE_SCAN: '1', WE_HEALTH_WATCH_LANE_SCAN_DIR: cacheDir,
+      WE_HEALTH_WATCH_LANE_SCAN_WRITE: cacheDir && laneScanWrite === true ? '1' : '0',
     },
   });
   return JSON.parse(out).verdict;
@@ -1025,7 +1027,7 @@ export { GH_GROUP_PROBE_NAMES };
  * checkout itself (backlog, review jobs, the stale-state CLI) must name the real clone, never the snapshot.
  * @returns {{probes: object, errors: Record<string, string>}}
  */
-export function collectGhProbes({ now = Date.now(), sourceRoot = REPO_ROOT, skipBuildSessions = false, laneScanDir = healthDir(), laneScanWrite = true } = {}) {
+export function collectGhProbes({ now = Date.now(), sourceRoot = REPO_ROOT, skipBuildSessions = false, laneScanDir = null, laneScanWrite = false } = {}) {
   const probes = {};
   const errors = {};
   const attempt = (name, fn) => {

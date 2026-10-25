@@ -77,6 +77,59 @@ export function laneRedirectConfig(listOutput) {
   return found;
 }
 
+const LANE_CONFIG_SCOPES = new Set(['system', 'global', 'local', 'worktree', 'command']);
+
+/** True when `listOutput` is a well-formed {@link LANE_CONFIG_LIST_ARGS} listing: empty, or NUL-terminated `scope`/`entry` pairs. */
+export function wellFormedConfigList(listOutput) {
+  const text = String(listOutput ?? '');
+  if (!text) return true;
+  const parts = text.split('\0');
+  if (parts.pop() !== '' || parts.length % 2) return false;
+  return parts.every((part, i) => i % 2 ? part !== '' : LANE_CONFIG_SCOPES.has(part));
+}
+
+/** True when `stageOutput` is empty or NUL-terminated `ls-files --stage -z` entries (`mode oid stage<TAB>path`). */
+export function wellFormedStageList(stageOutput) {
+  const text = String(stageOutput ?? '');
+  if (!text) return true;
+  const entries = text.split('\0');
+  if (entries.pop() !== '') return false;
+  return entries.every(entry => /^\d{6} [0-9a-f]{40,64} [0-3]\t[\s\S]+$/.test(entry));
+}
+
+// Lane-owned config that changes what status / the index REPORT, so a clean read could sit on top of edits. Each key maps
+// to the only value that leaves reporting honest; any other value, or a bare key (which git reads as true), is masking.
+// `ls-files -v` tags (h/S) already catch the per-file bits these keys set; this refuses the lane before any probe trusts it.
+const BOOL_FALSE = v => /^(false|no|off|0)$/i.test(v);
+const BOOL_TRUE = v => /^(true|yes|on|1)$/i.test(v);
+const LANE_MASKING_KEYS = Object.freeze([
+  [/^core\.(ignorestat|sparsecheckout|sparsecheckoutcone|untrackedcache)$/is, BOOL_FALSE],
+  [/^index\.sparse$/is, BOOL_FALSE],
+  [/^core\.(filemode|symlinks|trustctime)$/is, BOOL_TRUE],
+  [/^core\.autocrlf$/is, BOOL_FALSE],
+  [/^core\.eol$/is, v => /^native$/i.test(v)],
+  [/^core\.checkstat$/is, v => /^default$/i.test(v)],
+]);
+
+/** The local/worktree-scope keys in {@link LANE_CONFIG_LIST_ARGS} output that make status or the index under-report. Pure. */
+export function laneMaskingConfig(listOutput) {
+  const parts = String(listOutput ?? '').split('\0');
+  const found = [];
+  for (let i = 0; i + 1 < parts.length; i += 2) {
+    if (parts[i] !== 'local' && parts[i] !== 'worktree') continue;
+    const entry = parts[i + 1];
+    for (const [re, honest] of LANE_MASKING_KEYS) {
+      const key = configKeyCandidates(entry).find(c => re.test(c));
+      if (key === undefined) continue;
+      // A bare key has no `\n<value>` and reads as true.
+      const value = entry.length > key.length ? entry.slice(key.length + 1) : 'true';
+      if (!honest(value.trim())) found.push(key);
+      break;
+    }
+  }
+  return found;
+}
+
 /** Env every lane probe git runs under, on top of the repo's lane hardening. */
 export function laneProbeEnv(path) {
   // Command-scope parameters outrank the indexed pins, and GIT_CONFIG_GLOBAL/SYSTEM/GIT_CONFIG can re-scope the lane's own
@@ -109,10 +162,15 @@ export function freshLaneSafety({ path, exec = execFileSync, now = Date.now } = 
   try {
     // Config reads execute no drivers. Refuse lane-owned filters before status can run a clean filter.
     const config = git([...LANE_CONFIG_LIST_ARGS]);
+    // Output we cannot parse is output we cannot trust: a truncated or garbled listing must not read as "no bad keys".
+    if (!wellFormedConfigList(config)) return unsafe('lane Git config listing unparseable');
     if (laneFilterDrivers(config).length) return unsafe('lane Git filter drivers present');
     if (laneRedirectConfig(config).length) return unsafe('lane Git config redirects objects, transport or worktree');
+    if (laneMaskingConfig(config).length) return unsafe('lane Git config can hide worktree changes');
     // Status can enter submodules with their own untrusted filter config. Do not run that recursive probe.
-    if (git(['ls-files', '--stage', '-z']).split('\0').some(entry => entry.startsWith('160000 '))) {
+    const staged = git(['ls-files', '--stage', '-z']);
+    if (!wellFormedStageList(staged)) return unsafe('staged index listing unparseable');
+    if (staged.split('\0').some(entry => entry.startsWith('160000 '))) {
       return unsafe('submodule safety requires separate inspection');
     }
     // Share destructive cleanup's probe: ignored files and submodule work must remain visible.

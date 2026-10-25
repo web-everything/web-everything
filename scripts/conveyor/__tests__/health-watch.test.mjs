@@ -675,6 +675,19 @@ describe('probeStaleState', () => {
     expect(calls[1][2].env).toMatchObject({ WE_HEALTH_WATCH_LANE_SCAN_DIR: '', WE_HEALTH_WATCH_LANE_SCAN_WRITE: '0' });
   });
 
+  it.each([
+    { name: 'omitted target', args: {} },
+    { name: 'write requested without a directory', args: { laneScanDir: null, laneScanWrite: true } },
+    { name: 'directory without an explicit write grant', args: { laneScanDir: '/fixture/health' }, dir: '/fixture/health' },
+    { name: 'non-string directory', args: { laneScanDir: 42, laneScanWrite: true } },
+    { name: 'truthy but non-boolean write', args: { laneScanDir: '/fixture/health', laneScanWrite: 'yes' }, dir: '/fixture/health' },
+  ])('fails closed to no host cache access: $name', ({ args, dir: expectedDir = '' }) => {
+    const calls = [];
+    const exec = (...a) => { calls.push(a); return JSON.stringify({ verdict: { records: [], gaps: [] } }); };
+    probeStaleState({ exec, ...args });
+    expect(calls[0][2].env).toMatchObject({ WE_HEALTH_WATCH_LANE_SCAN_DIR: expectedDir, WE_HEALTH_WATCH_LANE_SCAN_WRITE: '0' });
+  });
+
   it('shells the declared stale-state read and returns its verdict (records/gaps), not the whole run envelope', () => {
     const exec = () => JSON.stringify({ runId: 'x', verdict: { observedAt: 'now', records: [{ kind: 'claim', id: '4169' }], gaps: ['g'] } });
     const out = probeStaleState({ exec });

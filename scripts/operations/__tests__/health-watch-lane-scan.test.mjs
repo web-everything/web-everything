@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { cachedLaneScan, resolveLaneScanPolicy, freshLaneSafety, guardLaneAction, laneProbeEnv, laneRedirectConfig } from '../../lib/health-watch-lane-scan.mjs';
+import { cachedLaneScan, resolveLaneScanPolicy, freshLaneSafety, guardLaneAction, laneProbeEnv, laneRedirectConfig, laneMaskingConfig } from '../../lib/health-watch-lane-scan.mjs';
 import { createStaleStateReader } from '../stale-state-io.mjs';
 import { OPERATIONS } from '../run.mjs';
 import { DIRTY_PROBE_ARGS, laneGitEnv, worktreeGitEnv } from '../../lib/git-transport-branch.mjs';
@@ -311,7 +311,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
       const exec = vi.fn((bin, argv) => {
         if (argv[0] === 'config') return '';
         if (argv[0] === 'status') return argv.includes('--ignored=traditional') ? status : '';
-        if (argv[0] === 'ls-files') return 'H tracked.txt\n';
+        if (argv[0] === 'ls-files') return argv[1] === '--stage' ? '' : 'H tracked.txt\n';
         if (argv[0] === 'stash') return '';
         if (argv[0] === 'rev-list') return '0\n';
         throw new Error(`unexpected command: ${bin} ${argv.join(' ')}`);
@@ -348,7 +348,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
         if (argv[0] === 'config') return '';
         // Model a clean foreign repo masking edits in the lane selected by cwd.
         if (argv[0] === 'status') return options.env[variable] ? '' : ' M tracked.txt\n';
-        if (argv[0] === 'ls-files') return 'H tracked.txt\n';
+        if (argv[0] === 'ls-files') return argv[1] === '--stage' ? '' : 'H tracked.txt\n';
         if (argv[0] === 'stash') return '';
         if (argv[0] === 'rev-list') return '0\n';
         throw new Error(`unexpected command: ${bin} ${argv.join(' ')}`);
@@ -394,7 +394,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
       if (command === JSON.stringify(['git', ['ls-files', '-v']])) return 'H tracked.txt\n';
       if (command === JSON.stringify(['git', ['stash', 'list', '--no-show-signature']])) return '';
       if (command === JSON.stringify(['git', ['rev-list', '--count', '--all', 'HEAD', '--not', '--remotes=origin']])) return count;
-      if (argv.includes('status')) return '';
+      if (argv.includes('status') || argv[1] === '--stage') return '';
       return '0\n';
     });
     gitMocks.push(exec);
@@ -406,7 +406,7 @@ describe('fresh per-lane safety check before any destructive action', () => {
     const exec = vi.fn((bin, argv) => {
       if (argv[0] === 'config') return '';
       if (argv[0] === 'status') return argv.includes('--ignore-submodules=none') ? ' M child\n' : '';
-      if (argv[0] === 'ls-files') return 'H child\n';
+      if (argv[0] === 'ls-files') return argv[1] === '--stage' ? '' : 'H child\n';
       if (argv[0] === 'stash') return '';
       if (argv[0] === 'rev-parse') return '.git/info/grafts\n';
       if (argv[0] === 'rev-list') return '0\n';
@@ -555,6 +555,64 @@ describe('untrusted lane Git configuration', () => {
       .toMatchObject({ act: false, fresh: { reason: 'submodule safety requires separate inspection' } });
     expect(exec.mock.calls.map(([, argv]) => argv)).toEqual([[...LANE_CONFIG_LIST_ARGS], ['ls-files', '--stage', '-z']]);
   });
+
+  const entry = (key, value, scope = 'local') => `${scope}\0${key}${value === undefined ? '' : `\n${value}`}\0`;
+  it.each([
+    ['core.ignoreStat', 'true'], ['core.ignorestat', 'yes'], ['core.ignoreStat', undefined], ['core.ignoreStat', 'maybe'],
+    ['core.sparseCheckout', 'true'], ['core.sparseCheckoutCone', 'on'], ['index.sparse', '1'], ['core.untrackedCache', 'true'],
+    ['core.fileMode', 'false'], ['core.symlinks', 'false'], ['core.trustctime', 'no'],
+    ['core.autocrlf', 'true'], ['core.autocrlf', 'input'], ['core.eol', 'crlf'], ['core.checkstat', 'minimal'],
+  ])('refuses %s=%s (status or the index would under-report) before status runs', (key, value) => {
+    for (const scope of ['local', 'worktree']) {
+      expect(laneMaskingConfig(entry(key, value, scope))).toEqual([key]);
+    }
+    const exec = vi.fn(() => entry(key, value));
+    expect(guardLaneAction({ path: '/fixture/lane', action: 'reset', exec, log: vi.fn() }))
+      .toMatchObject({ act: false, fresh: { reason: 'lane Git config can hide worktree changes' } });
+    expect(exec.mock.calls.some(([, argv]) => argv[0] === 'status')).toBe(false);
+  });
+
+  it.each([
+    ['core.ignoreStat', 'false'], ['core.sparseCheckout', 'off'], ['core.fileMode', 'true'], ['core.symlinks', 'yes'],
+    ['core.autocrlf', 'false'], ['core.eol', 'native'], ['core.checkstat', 'default'], ['core.ignorecase', 'true'],
+    ['core.repositoryformatversion', '0'],
+  ])('leaves honest %s=%s alone, and a global-scope value is not lane-owned', (key, value) => {
+    expect(laneMaskingConfig(entry(key, value))).toEqual([]);
+    expect(laneMaskingConfig(entry('core.ignoreStat', 'true', 'global'))).toEqual([]);
+  });
+
+  it.each(LINE_TERMINATORS)('a masking key still matches through a line terminator (%s) in its name', (_label, term) => {
+    expect(laneMaskingConfig(`local\0core.ignoreStat\n${term}true\0`)).toEqual(['core.ignoreStat']);
+  });
+
+  // The closed path for the guarantee "output we cannot parse is unsafe", one case per parsed probe.
+  const CLEAN_STAGE = `100644 ${'a'.repeat(40)} 0\ttracked.txt\0`;
+  const CLEAN_CONFIG = 'local\0core.repositoryformatversion\n0\0';
+  it.each([
+    { name: 'config with an unknown scope', config: 'weird\0core.bare\nfalse\0', reason: 'lane Git config listing unparseable' },
+    { name: 'config with a dangling scope', config: 'local\0core.bare\nfalse\0local', reason: 'lane Git config listing unparseable' },
+    { name: 'config missing its final terminator', config: 'local\0core.bare\nfalse', reason: 'lane Git config listing unparseable' },
+    { name: 'config with an empty entry', config: 'local\0\0', reason: 'lane Git config listing unparseable' },
+    { name: 'stage entry that is not mode/oid/stage/path', stage: 'garbage\0', reason: 'staged index listing unparseable' },
+    { name: 'stage listing missing its final terminator', stage: `100644 ${'a'.repeat(40)} 0\ttracked.txt`, reason: 'staged index listing unparseable' },
+    { name: 'stage entry with a truncated oid', stage: '100644 abc 0\ttracked.txt\0', reason: 'staged index listing unparseable' },
+  ])('refuses malformed config and staged-index output: $name', ({ config = CLEAN_CONFIG, stage = CLEAN_STAGE, reason }) => {
+    const fake = (cfg, stg) => vi.fn((bin, argv) => {
+      if (argv[0] === 'config') return cfg;
+      if (argv[0] === 'ls-files' && argv[1] === '--stage') return stg;
+      if (argv[0] === 'ls-files') return 'H tracked.txt\n';
+      if (argv[0] === 'rev-parse') return '.git/info/grafts\n';
+      if (argv[0] === 'rev-list') return '0\n';
+      return '';
+    });
+    const exec = fake(config, stage);
+    expect(guardLaneAction({ path: '/fixture/lane', action: 'reset', exec, log: vi.fn() }))
+      .toMatchObject({ act: false, fresh: { hasUnsafeWork: true, reason } });
+    expect(exec.mock.calls.some(([, argv]) => argv[0] === 'status')).toBe(false);
+    // Control: the same mock with well-formed output authorizes the action, so the refusal above is the parse.
+    expect(guardLaneAction({ path: '/fixture/lane', action: 'reset', exec: fake(CLEAN_CONFIG, CLEAN_STAGE), log: vi.fn() }))
+      .toMatchObject({ act: true });
+  });
 });
 
 describe('lane action guard with real Git', () => {
@@ -650,6 +708,27 @@ describe('lane action guard with real Git', () => {
     expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: true, reason: 'lane has legacy grafts file' });
     rmSync(grafts);
     expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: true, reason: '1 unpushed commit(s)' });
+  });
+
+  it('refuses a lane whose config makes status under-report: core.fileMode=false hides a mode change, core.ignoreStat hides an edit', () => {
+    const { path, git } = fixture();
+    chmodSync(join(path, 'tracked.txt'), 0o755);
+    expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: true, reason: 'worktree has changes' });
+    git(['config', 'core.fileMode', 'false']);
+    // Git itself now reports the lane clean; only the config refusal keeps the guard from authorizing a reset.
+    expect(git(['status', '--porcelain']).trim()).toBe('');
+    for (const action of actions) {
+      expect(guardLaneAction({ path, action, log: vi.fn() }))
+        .toMatchObject({ act: false, fresh: { hasUnsafeWork: true, reason: 'lane Git config can hide worktree changes' } });
+    }
+    git(['config', 'core.fileMode', 'true']);
+    chmodSync(join(path, 'tracked.txt'), 0o644);
+    expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: false });
+    git(['config', 'core.ignoreStat', 'true']);
+    git(['add', 'tracked.txt']);
+    writeFileSync(join(path, 'tracked.txt'), 'edited behind the stat cache\n');
+    expect(git(['status', '--porcelain']).trim()).toBe('');
+    expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: true, reason: 'lane Git config can hide worktree changes' });
   });
 
   it('refuses a lane whose grafts path cannot be resolved (fail closed)', () => {

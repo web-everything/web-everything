@@ -329,6 +329,17 @@ describe('tick — the gh cadence as a job never blocks the tick', () => {
     expect(store.list().records).toHaveLength(1);
   }, 30000);
 
+  it('the queued job carries the tick\'s isolated lane-scan cache target, never the host default', async () => {
+    const { flags } = setup('cache-target');
+    const store = createJobStore(join(dir, 'jobs'));
+    const deps = { collectGh: neverInline, ghJobs: { store, codeSha: 'abc123', reattach: fakeReattach(), evict: noEvict } };
+    const first = await tick({ ...flags, now: iso(Date.parse('2026-10-09T12:00:00Z')) }, deps);
+    expect(first.ghJob.enqueued).toBeTruthy();
+    expect(store.read(first.ghJob.enqueued).input).toMatchObject({
+      laneScanDir: healthDir(flags['state-root']), laneScanWrite: true,
+    });
+  }, 30000);
+
   it('a tampered sidecar with a far-future sampledAt is a probe error and never parks the gh cadence', async () => {
     const { flags, hd } = setup('future');
     const store = createJobStore(join(dir, 'jobs'));
