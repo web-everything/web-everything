@@ -12,6 +12,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { readRaisedBy, raisedByFile } from '../../lib/raised-by.mjs';
+import * as raisedBy from '../../lib/raised-by.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -294,6 +295,56 @@ describe('landPreventionCard — dedupe before filing', () => {
         expect(batch).toHaveBeenCalledTimes(1);
       }
     } finally { cleanup(); }
+  });
+
+  it('lands a mention-only filing through the ordinary PR path when every member has batching disabled', async () => {
+    const acquire = setup();
+    try {
+      const { exec, calls } = scriptedExec([acquire, 'staged', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'labelled', 'released']);
+      const batch = vi.fn(async () => ({ batched: false, disabled: true }));
+      const result = await realLandPreventionCard(input(), {
+        exec, dedupe, batch, pendingDir: join(lane, 'pending'), write: () => {},
+      });
+
+      expect(result).toMatchObject({ ok: true, step: 'done', num: null, rel: null, pr: 5555, mentions: 1 });
+      expect(batch).toHaveBeenCalledTimes(1);
+      expect(batch.mock.calls[0][0].cardPath).toMatch(/^backlog\/raised-by\/4706\//);
+      expect(calls.filter(({ args }) => ['commit', 'verify', 'open-pr'].some(op => args.includes(op)))
+        .map(({ args }) => args.find(arg => ['commit', 'verify', 'open-pr'].includes(arg))))
+        .toEqual(['commit', 'verify', 'open-pr']);
+      expect(calls.some(({ args }) => args.includes('file-item'))).toBe(false);
+      expect(calls.at(-1).args).toContain('release');
+    } finally { cleanup(); }
+  });
+
+  it('rejects an unidentifiable mentioned path before admitting any member of a mixed filing', async () => {
+    const acquire = setup();
+    const originalRaisedByFile = raisedByFile;
+    const mention = vi.spyOn(raisedBy, 'raisedByFile').mockImplementation((id, line) => ({
+      ...originalRaisedByFile(id, line), path: 'backlog/unidentified.md',
+    }));
+    try {
+      const filing = input();
+      filing.digest = filing.digest.replace('\n\nIdempotency key',
+        '\n\n2. `we:scripts/other.mjs:1` — Reject malformed flags before dispatch.\n\nIdempotency key');
+      filing.scope += ',we:scripts/other.mjs';
+      const { exec, calls } = scriptedExec([acquire, 'staged', FILE_ITEM_OK, 'released']);
+      const batch = vi.fn(async () => ({ batched: true, batchRef: 'lane/card-batch-prevention-1' }));
+      const result = await realLandPreventionCard(filing, {
+        exec, dedupe, batch, pendingDir: join(lane, 'pending'), write: () => {},
+      });
+
+      expect(result).toMatchObject({ ok: false, step: 'batch', rel: 'backlog/9001-file-the-prevention.md',
+        reason: 'invalid collector member: backlog/unidentified.md' });
+      expect(mention).toHaveBeenCalledTimes(1);
+      expect(batch).not.toHaveBeenCalled();
+      expect(calls.some(({ args }) => args.includes('file-item'))).toBe(true);
+      expect(calls.some(({ args }) => ['commit', 'verify', 'open-pr'].some(op => args.includes(op)))).toBe(false);
+      expect(calls.at(-1).args).toContain('release');
+    } finally {
+      mention.mockRestore();
+      cleanup();
+    }
   });
 
   it.each(['all', 'sidecar'])('spools every unbatched file on refusal (%s) and drains sidecars', async refused => {

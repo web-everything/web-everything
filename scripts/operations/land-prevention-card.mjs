@@ -624,9 +624,11 @@ export async function landPreventionCard(input, {
 
     const filingPaths = [...new Set([rel, ...mentioned.flatMap(m => m.paths)].filter(Boolean))];
     const outcomes = [];
-    for (const cardPath of filingPaths) {
-      const cardId = cardIdOf(cardPath) ?? (cardPath === rel ? (num ?? input.session) : null);
-      if (!cardId) return fail('batch', `invalid collector member: ${cardPath}`, { num, rel });
+    // Resolve every member identity BEFORE any admission, so an unidentifiable path can never leave a half-admitted filing.
+    const memberIds = filingPaths.map(cardPath => [cardPath, cardIdOf(cardPath) ?? (cardPath === rel ? (num ?? input.session) : null)]);
+    const unidentified = memberIds.find(([, id]) => !id);
+    if (unidentified) return fail('batch', `invalid collector member: ${unidentified[0]}`, { num, rel });
+    for (const [cardPath, cardId] of memberIds) {
       const idemKey = `prevention:${cardId}`;
       const source = { repo: CONSTELLATION_REPOS.we.slug, pr: input.retract?.pr ?? null, head: input.retract?.headSha ?? null,
         note: input.retract?.repo ? `${input.title} (from ${input.retract.repo}#${input.retract.pr})` : input.title };
