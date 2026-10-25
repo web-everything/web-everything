@@ -17,6 +17,11 @@ import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
 import { DISPATCHED_AGENT_SYSTEM_PROMPT_FILE, dispatchSessionCwd } from '../../operations/dispatch-lane-io.mjs';
 import { buildAuthorActorMarker } from '../../lib/review-independence.mjs';
 
+// Existing resume fixtures have no completion record; never consult the host store.
+vi.mock('../../operations/completion-store.mjs', async (importOriginal) => ({
+  ...await importOriginal(), tryReadCompletion: () => null,
+}));
+
 // A `checkStaleness` stub that never touches git — every test below injects one.
 const FRESH = () => ({ fresh: true, behind: 0 });
 
@@ -1347,6 +1352,41 @@ describe('runReconcileFixDispatch — read reconcile-pass, plan, assign a lane, 
 describe('fixBriefPath', () => {
   it('points at the SAME brief dispatch-lane.mjs\'s own tick-core-driven fix dispatch fills', () => {
     expect(fixBriefPath('/repo')).toBe('/repo/skills-src/conveyor/fix-agent-brief.md');
+  });
+});
+
+describe('conflict resume permission-blocked completion', () => {
+  const sessionId = '11111111-1111-4111-8111-111111111111';
+  const body = buildAuthorActorMarker(sessionId);
+  const agentsAll = [{ sessionId, name: 'fix-1764' }];
+  it.each([
+    { status: 'done', outcome: 'blocked-on-permission' },
+    { status: 'blocked-on-permission' },
+  ])('declines candidate and conflict resume for %j with the recorded reason', (record) => {
+    const readCompletion = vi.fn(() => ({ ...record, sessionId }));
+    const onDecline = vi.fn();
+    expect(findResumeCandidate({ body, agentsAll, readCompletion, onDecline })).toBeNull();
+    expect(readCompletion).toHaveBeenCalledWith('fix-1764');
+    expect(onDecline).toHaveBeenCalledWith(expect.objectContaining({ reason: 'prior-blocked-on-permission' }));
+    const spawnAgent = vi.fn();
+    const resolveHead = vi.fn();
+    const result = tryResumeFix({ pr: 1764, isConflict: true, body }, {
+      root: '/repo', listAgentsAll: () => agentsAll, readCompletion, spawnAgent, resolveHead,
+    });
+    expect(result).toMatchObject({ resumed: false, resumeAttempt: {
+      attempted: false, refused: 'prior-blocked-on-permission', why: expect.stringContaining(sessionId),
+    } });
+    expect(spawnAgent).not.toHaveBeenCalled();
+    expect(resolveHead).not.toHaveBeenCalled();
+  });
+  it.each([
+    null, { status: 'done', outcome: 're-armed' }, { status: 'started' },
+    { status: 'done', outcome: 'blocked-on-permission', sessionId: 'another-session' },
+  ])('keeps conflict candidate unchanged for %j', (record) => {
+    expect(findResumeCandidate({ body, agentsAll, readCompletion: () => record })).toBe(sessionId);
+  });
+  it('fails open on unreadable completion evidence', () => {
+    expect(findResumeCandidate({ body, agentsAll, readCompletion: () => { throw new Error('unreadable'); } })).toBe(sessionId);
   });
 });
 
