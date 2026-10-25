@@ -3504,7 +3504,7 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
 
   it.each(['b'.repeat(40), null])('plain rearm refuses a changed or missing swap-time head before the label write: %s', headRefOid => {
     const { exitCode, calls, payload } = run(['9', '--repo=o/n', `--expect-head=${'a'.repeat(40)}`],
-      [REVIEW_LABELS.changes], { swapState: { headRefOid } });
+      [REVIEW_LABELS.changes], { freshState: { headRefOid } });
     expect(exitCode).toBe(1);
     expect(payload.error).toContain('live head differs from --expect-head');
     expect(calls).toEqual(['postComment']);
