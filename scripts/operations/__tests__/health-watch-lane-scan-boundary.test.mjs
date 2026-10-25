@@ -63,6 +63,125 @@ describe('published history trust boundary', () => {
 });
 
 describe('health-watch destructive lane action call-site contract', () => {
+  it('every destructive lane action in health-watch lane code goes through guardLaneAction', () => {
+    const mutators = new Set(['writeFileSync', 'mkdirSync', 'renameSync', 'rmSync', 'unlinkSync',
+      'rmdirSync', 'appendFileSync', 'copyFileSync', 'symlinkSync']);
+    const runners = new Set(['runner', 'run', 'exec', 'execSync', 'spawn', 'spawnSync',
+      'execFile', 'execFileSync', 'git', 'laneGit']);
+    const scan = (source, file = 'synthetic.mjs') => {
+      const tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+      expect(tree.parseDiagnostics, `${file}: unreadable syntax requires review`).toEqual([]);
+      const walk = (node, fn) => { fn(node); ts.forEachChild(node, child => walk(child, fn)); };
+      const aliases = new Map();
+      walk(tree, node => {
+        if (ts.isImportSpecifier(node)) aliases.set(node.name.text, node.propertyName?.text ?? node.name.text);
+      });
+      const calleeName = node => {
+        const name = ts.isPropertyAccessExpression(node) ? node.name.text
+          : ts.isElementAccessExpression(node) && ts.isStringLiteralLike(node.argumentExpression)
+            ? node.argumentExpression.text : ts.isIdentifier(node) ? node.text : '';
+        return aliases.get(name) ?? name;
+      };
+      const owner = node => {
+        for (let p = node.parent; p; p = p.parent) if (ts.isFunctionLike(p)) return p;
+        return tree;
+      };
+      const functionName = node => node === tree ? '<module>'
+        : node.name?.getText(tree) ?? (ts.isVariableDeclaration(node.parent)
+          ? node.parent.name.getText(tree) : `${functionName(owner(node))}/<anonymous>`);
+      const guarded = new Set();
+      walk(tree, node => {
+        if (ts.isCallExpression(node) && calleeName(node.expression) === 'guardLaneAction') guarded.add(owner(node));
+      });
+      // Inspect literal argv (including join(root, 'scripts/lane-pool.mjs')),
+      // never comments or string contents elsewhere in the function.
+      const literals = node => {
+        if (ts.isStringLiteralLike(node)) return node.text.split(/\s+/);
+        if (ts.isArrayLiteralExpression(node)) return node.elements.flatMap(literals);
+        if (ts.isCallExpression(node) && calleeName(node.expression) === 'join') return node.arguments.flatMap(literals);
+        return ['<dynamic>'];
+      };
+      const destructive = (callee, args) => {
+        const words = args.flatMap(literals);
+        if (['git', 'laneGit'].includes(callee)) words.unshift('git');
+        const git = words.findIndex(word => /(?:^|\/)git$/.test(word));
+        const argv = words.slice(git + 1);
+        return (git >= 0 && argv.some((word, i) =>
+          /^(reset|clean|checkout|switch|rm|gc|prune|restore)$/.test(word)
+          || (word === 'stash' && /^(push|drop|pop|clear)$/.test(argv[i + 1]))
+          || (word === 'branch' && argv.slice(i + 1).some(flag => /^-[Dd]$/.test(flag)))
+          || (word === 'worktree' && /^(remove|prune)$/.test(argv[i + 1]))))
+          || words.some((word, i) => /(?:^|\/)lane-pool(?:\.mjs)?$/.test(word)
+            && words.slice(i + 1).some(action => /^(release|reclaim|reuse|reset)$/.test(action)));
+      };
+      const sites = [];
+      walk(tree, node => {
+        if (!ts.isCallExpression(node)) return;
+        const callee = calleeName(node.expression);
+        if (!mutators.has(callee) && !(runners.has(callee) && destructive(callee, [...node.arguments]))) return;
+        const fn = owner(node);
+        // Keep every occurrence, with target arguments: moving a reviewed write
+        // from a cache/state file to a lane must change the exact inventory too.
+        const targets = node.arguments.slice(0, callee === 'renameSync' || callee === 'copyFileSync'
+          || callee === 'symlinkSync' || runners.has(callee) ? 2 : 1)
+          .map(arg => arg.getText(tree).replace(/\s+/g, ' ')).join(', ');
+        sites.push({ site: `${file}:${functionName(fn)}:${node.expression.getText(tree)}(${targets})`, guarded: guarded.has(fn) });
+      });
+      return sites;
+    };
+    // Explicit non-lane targets. cachedLaneScan operates on dir/lane-scan.json
+    // and its temp file; health-watch's other writes operate on daemon state,
+    // tick.lock and overrun.json. No entire function or file is exempted.
+    const ALLOWLIST = [
+      'scripts/lib/health-watch-lane-scan.mjs:cachedLaneScan:mkdirSync(dir)',
+      'scripts/lib/health-watch-lane-scan.mjs:cachedLaneScan:writeFileSync(tmp)',
+      'scripts/lib/health-watch-lane-scan.mjs:cachedLaneScan:renameSync(tmp, path)',
+      'scripts/lib/health-watch-lane-scan.mjs:cachedLaneScan:rmSync(tmp)',
+      'scripts/conveyor/health-watch.mjs:writeJsonAtomic:mkdirSync(dirname(path))',
+      'scripts/conveyor/health-watch.mjs:writeJsonAtomic:writeFileSync(tmp)',
+      'scripts/conveyor/health-watch.mjs:writeJsonAtomic:renameSync(tmp, path)',
+      'scripts/conveyor/health-watch.mjs:acquireTickLock:mkdirSync(dir)',
+      'scripts/conveyor/health-watch.mjs:acquireTickLock:unlinkSync(p)',
+      'scripts/conveyor/health-watch.mjs:acquireTickLock:writeFileSync(p)',
+      'scripts/conveyor/health-watch.mjs:acquireTickLock/<anonymous>:unlinkSync(p)',
+      'scripts/conveyor/health-watch.mjs:tick:unlinkSync(overrunPath)',
+    ];
+    const violations = sites => sites.filter(({ site, guarded }) => !ALLOWLIST.includes(site) && !guarded);
+    const sites = scopedScanFiles(['scripts/lib/health-watch-lane-scan.mjs',
+      'scripts/operations/stale-state-io.mjs', 'scripts/conveyor/health-watch.mjs'])
+      .flatMap(file => scan(readFileSync(new URL(`../../../${file}`, import.meta.url), 'utf8'), file));
+    expect(sites.map(({ site }) => site).sort()).toEqual([...ALLOWLIST].sort());
+    expect(violations(sites)).toEqual([]);
+    expect(sites.filter(({ site }) => !ALLOWLIST.includes(site))).toHaveLength(0);
+
+    const unguarded = "function resetLane() { execFileSync('git', ['reset', '--hard']); }";
+    expect(violations(scan(unguarded))).toEqual([
+      { site: "synthetic.mjs:resetLane:execFileSync('git', ['reset', '--hard'])", guarded: false },
+    ]);
+    expect(scan(unguarded)).toHaveLength(1);
+    const wrapped = unguarded.replace("execFileSync(", "if (!guardLaneAction({ path, action: 'reset' }).act) return; execFileSync(");
+    expect(scan(wrapped)).toHaveLength(1);
+    expect(violations(scan(wrapped))).toEqual([]);
+    // A guard in a sibling callback cannot bless the action's function.
+    expect(violations(scan(unguarded.replace('execFileSync(', 'const other = () => guardLaneAction({}); execFileSync('))))
+      .toHaveLength(1);
+    for (const callee of mutators) expect(violations(scan(`${callee}(lane);`))).toHaveLength(1);
+    for (const argv of ["['clean', '-fd']", "['checkout', 'main']", "['switch', 'main']",
+      "['stash', 'push']", "['stash', 'drop']", "['stash', 'pop']", "['stash', 'clear']",
+      "['branch', '-D', 'lane']", "['branch', '-d', 'lane']", "['worktree', 'remove', lane]",
+      "['worktree', 'prune']", "['rm', 'file']", "['gc']", "['prune']", "['restore', '.']"]) {
+      for (const callee of runners) {
+        const args = ['git', 'laneGit'].includes(callee) ? argv : `'git', ${argv}`;
+        expect(violations(scan(`${callee}(${args});`)), `${callee}(${args})`).toHaveLength(1);
+      }
+    }
+    for (const action of ['release', 'reclaim', 'reuse', 'reset']) {
+      expect(violations(scan(`runner(process.execPath, [join(root, 'scripts/lane-pool.mjs'), '${action}']);`)))
+        .toHaveLength(1);
+    }
+    expect(scan("execFileSync('git', ['stash', 'list']); // rmSync(lane)\nconst text = 'git reset --hard';"))
+      .toEqual([]);
+  });
   // Enumerate executable call sites, including the git wrapper. A newly added
   // reset/reuse/reclaim/release command (even in an unexercised branch) fails this
   // allowlist. Health-watch has no lane mutations today; adding one requires a
