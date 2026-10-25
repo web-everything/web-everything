@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { vi } from 'vitest';
 import { evaluateStuckTriggers, buildStuckPostmortem } from '../coroner-stuck-trigger.mjs';
+import { classifyEvent, normalizeComment } from '../coroner-rounds.mjs';
+import { buildPostmortem } from '../coroner-pr-postmortem.mjs';
 
 const openedAt = '2026-10-01T00:00:00.000Z';
 const now = '2026-10-04T00:00:00.000Z';
@@ -38,6 +40,138 @@ describe('R90 stuck triggers', () => {
     expect(report).toEqual(buildStuckPostmortem(input,{now}));
     expect(report.markdown).toMatch(/## What would have prevented this\n[\s\S]*48/);
     expect(report.markdown).not.toMatch(/\u001b|\/private\/|touch/);
+  });
+});
+
+describe('R90 structured timeline evidence (implementation pending)', () => {
+  const at = hour => new Date(Date.parse(openedAt) + hour * 3600000).toISOString();
+  const head = round => String(round).repeat(40);
+  const comment = (hour, body) => ({ createdAt:at(hour), author:{login:'web-everything'}, body });
+  const key = JSON.stringify(['judgeCorrectnessAdvisory', 'src/a.js', 2, 'missing guard']);
+  const referral = (round, findingKey = key) => comment(round * 3,
+    `Mandatory review owner: 7 (correctness).\nAttempt recorded: true. Rulings: ${JSON.stringify([{key:findingKey,result:'block'}])}\n<!-- mandatory-referrals-v1: ${encodeURIComponent(JSON.stringify({version:1,head:head(round)}))} -->`);
+  const repair = round => [
+    comment(round * 3 + 1, `🔒 conveyor fix-begin\n**Who:** \`fixer\`\n**Branch:** \`lane/test\` at \`${head(round)}\``),
+    comment(round * 3 + 2, '🔓 conveyor fix-end\n`fixer` released'),
+  ];
+  const returned = count => ({...raw(), comments:Array.from({length:count}, (_, i) =>
+    [referral(i + 1), ...(i < count - 1 ? repair(i + 1) : [])]).flat()});
+  const review = (round, category = 'breaks-change') => comment(round * 3,
+    `🔁 review — changes requested\nRecorded by agent\nfor head \`${head(round)}\`\n### Findings\n**judge/${category}** (1)\n- \`src/round-${round}.js:2\` — guard regression`);
+  const status = (input, trigger) => evaluateStuckTriggers(input,{now}).find(t => t.trigger === trigger).status;
+  // buildPostmortem currently requires a merged endpoint. Use the observation time
+  // only to inspect its structured output; evaluateStuckTriggers gets the open input.
+  const postmortem = input => buildPostmortem({...input,mergedAt:now});
+
+  it('fires recurrence when the identical finding key returns blocked after two repairs', () => {
+    const input = returned(3);
+    expect(classifyEvent(normalizeComment(input.comments[0]))).toMatchObject({
+      type:'round', trigger:'referral-block', rulings:[{file:'src/a.js',line:2,claim:'missing guard',result:'block'}],
+    });
+    expect(postmortem(input).rounds.map(r => r.fixSessions.length)).toEqual([1,1,0]);
+    expect(status(input,'recurrence')).toBe('fired');
+  });
+
+  it.each([1,2])('clears recurrence with complete evidence and only %i appearances of the key', count => {
+    expect(status(returned(count),'recurrence')).toBe('clear');
+  });
+
+  it('clears recurrence when three blocked keys have different claims despite identical locations', () => {
+    const input = {...raw(),comments:[1,2,3].flatMap(i => [
+      referral(i,JSON.stringify(['judgeCorrectnessAdvisory','src/a.js',2,`distinct claim ${i}`])),
+      ...(i < 3 ? repair(i) : []),
+    ])};
+    expect(status(input,'recurrence')).toBe('clear');
+  });
+
+  it('does not count duplicate referral comments on one head as two recurrences', () => {
+    const input = returned(2);
+    input.comments.push(referral(2),referral(2));
+    expect(status(input,'recurrence')).toBe('clear');
+  });
+
+  it('fires fix-causation for explicit breaks-change findings in three consecutive rounds', () => {
+    const input = {...raw(),comments:[review(1),...repair(1),review(2),...repair(2),review(3)]};
+    expect(postmortem(input).rounds.map(r => r.causes)).toEqual(Array.from({length:3}, () =>
+      [{cause:'review-finding',lens:'judge',theme:'breaks-change'}]));
+    expect(status(input,'fix-causation')).toBe('fired');
+  });
+
+  it.each([1,2])('clears fix-causation below three consecutive breaks-change rounds (%i)', count => {
+    expect(status({...raw(),comments:Array.from({length:count}, (_, i) => review(i+1))},'fix-causation')).toBe('clear');
+  });
+
+  it('clears fix-causation when a different finding theme interrupts three breaks-change rounds', () => {
+    expect(status({...raw(),comments:[review(1),review(2),review(3,'correctness'),review(4)]},'fix-causation')).toBe('clear');
+  });
+
+  it('does not count duplicate reviews on one head as consecutive causation rounds', () => {
+    expect(status({...raw(),comments:[review(1),review(1),review(1)]},'fix-causation')).toBe('clear');
+  });
+
+  it.each(['recurrence','fix-causation'])('keeps %s unknown when structured evidence is absent', trigger => {
+    expect(status(raw(),trigger)).toBe('unknown');
+  });
+
+  it.each(['recurrence','fix-causation'])('keeps %s unknown for unauthenticated otherwise sufficient markers', trigger => {
+    const input = trigger === 'recurrence' ? returned(3) : {...raw(),comments:[review(1),review(2),review(3)]};
+    input.comments = input.comments.map(c => ({...c,author:{login:'untrusted'}}));
+    expect(status(input,trigger)).toBe('unknown');
+  });
+
+  it.each(['recurrence','fix-causation'])('keeps %s unknown for malformed event timestamps', trigger => {
+    const input = trigger === 'recurrence' ? returned(3) : {...raw(),comments:[review(1),review(2),review(3)]};
+    input.comments = input.comments.map(c => ({...c,createdAt:'invalid'}));
+    expect(status(input,trigger)).toBe('unknown');
+  });
+
+  it('keeps recurrence unknown for malformed finding keys', () => {
+    expect(status({...raw(),comments:[referral(1,'{'),...repair(1),referral(2,'{'),...repair(2),referral(3,'{')]},'recurrence')).toBe('unknown');
+  });
+
+  it('keeps fix-causation unknown for malformed finding groups', () => {
+    const comments = [review(1),review(2),review(3)].map(c => ({...c,body:c.body.replace('**judge/breaks-change** (1)','**judge/breaks-change** (invalid)')}));
+    expect(status({...raw(),comments},'fix-causation')).toBe('unknown');
+  });
+
+  it('never fires from recurrence or breaks-change prose alone', () => {
+    const input = {...raw(),comments:[1,2,3].map(i => comment(i,
+      'same finding key returned unfixed; already fixed claim proven false; breaks-change'))};
+    expect(status(input,'recurrence')).toBe('unknown');
+    expect(status(input,'fix-causation')).toBe('unknown');
+  });
+
+  it('keeps two round-cap claims unknown without structured cap-hit records', () => {
+    // Missing source: classifyEvent has no cap-hit event; buildPostmortem has
+    // no cap-hit count. A fixLoop park reason does not identify a review round cap.
+    const input = {...raw(),comments:[comment(1,'round cap hit'),comment(2,'round cap hit')],
+      fixLoop:[1,2].map(i => ({v:1,repo:'example/repo',pr:7,kind:'park',head:head(i),at:at(i),reason:'round cap hit'}))};
+    expect(status(input,'fix-rounds')).toBe('unknown');
+  });
+
+  it('keeps two allegedly disproven already-fixed claims unknown without adjudication records', () => {
+    // Missing source: neither classified fix-end events nor postmortem
+    // falseFindings record a keyed already-fixed claim and its proven refutation.
+    const input = {...raw(),comments:[comment(1,'already fixed — proven false'),comment(2,'already fixed — proven false')]};
+    expect(status(input,'recurrence')).toBe('unknown');
+  });
+
+  it.each([2,3])('keeps daemon-idle unknown after %i quiet hours with repeated reason prose', hours => {
+    // Missing source: collected PR timelines contain no daemon reason samples
+    // or completeness for daemon observations. Silence is not a repeated reason.
+    const input = {...raw(),comments:[comment(70-hours,'daemon idle: same reason'),comment(72-hours,'daemon idle: same reason')]};
+    expect(status(input,'daemon-idle')).toBe('unknown');
+  });
+
+  it.each([6,7])('keeps dependency-or-cap unknown after %i hours of alleged dependency wait', hours => {
+    // Missing source: no structured dependency PR identity, wait-start/end, or
+    // dependency completeness is collected; ordinary comments cannot supply it.
+    expect(status({...raw(),comments:[comment(72-hours,'waiting on PR #4')]},'dependency-or-cap')).toBe('unknown');
+  });
+
+  it.each(['fix-rounds','daemon-idle','dependency-or-cap'])('keeps %s unknown with absent or malformed source arrays', trigger => {
+    for (const patch of [{comments:undefined,fixLoop:undefined},{comments:[],fixLoop:null}])
+      expect(status({...raw(),...patch},trigger)).toBe('unknown');
   });
 });
 
