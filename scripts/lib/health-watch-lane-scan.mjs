@@ -13,7 +13,7 @@ import { join, resolve } from 'node:path';
 import { platformPreference, resolveCascade } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { DIRTY_PROBE_ARGS, hasHiddenIndexFlags, laneGitEnv } from './git-transport-branch.mjs';
-import { hardenLaneGitArgs, laneGitHardeningEnv, scrubInheritedGitEnv, laneFilterDrivers, LANE_CONFIG_LIST_ARGS } from './lane-git-hardening.mjs';
+import { hardenLaneGitArgs, laneGitHardeningEnv, scrubInheritedGitEnv, laneFilterDrivers, configKeyCandidates, LANE_CONFIG_LIST_ARGS } from './lane-git-hardening.mjs';
 
 export function resolveLaneScanPolicy({ env = process.env,
   platform = platformPreference('healthWatch', { env }), tool = readDeclaredSettings().settings?.healthWatch,
@@ -70,8 +70,9 @@ export function laneRedirectConfig(listOutput) {
   const parts = String(listOutput ?? '').split('\0');
   const found = [];
   for (let i = 0; i + 1 < parts.length; i += 2) {
-    const key = parts[i + 1].split('\n')[0];
-    if ((parts[i] === 'local' || parts[i] === 'worktree') && LANE_REDIRECT_KEY_RE.test(key)) found.push(key);
+    if (parts[i] !== 'local' && parts[i] !== 'worktree') continue;
+    const key = configKeyCandidates(parts[i + 1]).find(c => LANE_REDIRECT_KEY_RE.test(c));
+    if (key !== undefined) found.push(key);
   }
   return found;
 }

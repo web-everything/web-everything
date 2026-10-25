@@ -76,6 +76,19 @@ export const LANE_CONFIG_LIST_ARGS = Object.freeze(['config', '--show-scope', '-
 const FILTER_DRIVER_KEY_RE = /^filter\..+\.(clean|smudge|process)$/is;
 
 /**
+ * Every way to read the key out of one `key\nvalue` entry of {@link LANE_CONFIG_LIST_ARGS} output: the text before the
+ * first newline (what git means), then each longer line-prefix. Git cannot write a newline into a key, so the extra
+ * prefixes only matter for an entry that misparses — a key checker that tests all of them fails closed instead of
+ * letting a `\n` truncate the key into something that no longer matches. Pure.
+ * @param {string} entry
+ * @returns {string[]}
+ */
+export function configKeyCandidates(entry) {
+  const lines = String(entry ?? '').split('\n');
+  return lines.map((_, i) => lines.slice(0, i + 1).join('\n'));
+}
+
+/**
  * The `filter.<name>.clean|smudge|process` keys a lane's OWN config (local / worktree scope, includes followed) defines,
  * from {@link LANE_CONFIG_LIST_ARGS} output. A clean filter runs on worktree content during `git diff` / `git status`, and
  * which paths it applies to is chosen by an in-repo `.gitattributes` or `.git/info/attributes` — neither can be switched off
@@ -89,8 +102,9 @@ export function laneFilterDrivers(listOutput) {
   const found = [];
   for (let i = 0; i + 1 < parts.length; i += 2) {
     const scope = parts[i];
-    const key = parts[i + 1].split('\n')[0];
-    if ((scope === 'local' || scope === 'worktree') && FILTER_DRIVER_KEY_RE.test(key)) found.push(key);
+    if (scope !== 'local' && scope !== 'worktree') continue;
+    const key = configKeyCandidates(parts[i + 1]).find(c => FILTER_DRIVER_KEY_RE.test(c));
+    if (key !== undefined) found.push(key);
   }
   return found;
 }
@@ -120,9 +134,12 @@ export function riskyLaneConfig(listOutput) {
   for (let i = 0; i + 1 < parts.length; i += 2) {
     const scope = parts[i];
     if (scope !== 'local' && scope !== 'worktree') continue;
-    const [key, ...rest] = parts[i + 1].split('\n');
-    if (RISKY_LANE_CONFIG_RE.test(key)) found.push(key);
-    else if (/^remote\..+\.url$/is.test(key) && !SAFE_REMOTE_URL_RE.test(rest.join('\n'))) found.push(key);
+    const candidates = configKeyCandidates(parts[i + 1]);
+    const risky = candidates.find(c => RISKY_LANE_CONFIG_RE.test(c));
+    if (risky !== undefined) { found.push(risky); continue; }
+    // A remote URL is judged by the text after the shortest candidate that reads as a `remote.*.url` key.
+    const url = candidates.find(c => /^remote\..+\.url$/is.test(c));
+    if (url !== undefined && !SAFE_REMOTE_URL_RE.test(parts[i + 1].slice(url.length + 1))) found.push(url);
   }
   return found;
 }

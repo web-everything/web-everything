@@ -7,7 +7,7 @@ import { cachedLaneScan, resolveLaneScanPolicy, freshLaneSafety, guardLaneAction
 import { createStaleStateReader } from '../stale-state-io.mjs';
 import { OPERATIONS } from '../run.mjs';
 import { DIRTY_PROBE_ARGS, laneGitEnv, worktreeGitEnv } from '../../lib/git-transport-branch.mjs';
-import { LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS, laneFilterDrivers, riskyLaneConfig, scrubInheritedGitEnv } from '../../lib/lane-git-hardening.mjs';
+import { LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS, configKeyCandidates, laneFilterDrivers, riskyLaneConfig, scrubInheritedGitEnv } from '../../lib/lane-git-hardening.mjs';
 
 vi.mock('../stale-state-io.mjs', async original => {
   const real = await original();
@@ -540,6 +540,13 @@ describe('untrusted lane Git configuration', () => {
     expect(riskyLaneConfig(entry('local', `alias.a${term}b`))).toHaveLength(1);
     expect(scrubInheritedGitEnv({ [`GIT_CONFIG_KEY_0${term}x`]: 'core.fsmonitor', [`GIT_CONFIG_VALUE_${term}`]: 'x', KEEP: '1' }))
       .toEqual({ KEEP: '1' });
+  });
+
+  it('a newline inside a key cannot truncate it into a name the filter check misses', () => {
+    expect(configKeyCandidates('filter.a\nb.clean\nvalue')).toEqual(['filter.a', 'filter.a\nb.clean', 'filter.a\nb.clean\nvalue']);
+    expect(laneFilterDrivers('local\0filter.a\r\nb.process\nvalue\0')).toEqual(['filter.a\r\nb.process']);
+    // The fail-closed split must not flag an ordinary safe remote whose URL merely ends in `.url`.
+    expect(riskyLaneConfig('local\0remote.origin.url\nhttps://example.com/x.url\0')).toEqual([]);
   });
 
   it('refuses submodules before status can enter their untrusted configuration', () => {
