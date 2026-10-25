@@ -1,4 +1,4 @@
-/** PR #5848: the detached repair must respect an operator's concurrent unload. */
+/** PR #5848: detached repairs require executed tests and must respect concurrent operator unloads. */
 import * as fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -13,17 +13,91 @@ const REF = 'lane/fix';
 const success = stdout => ({ status: 0, stdout: stdout ?? '' });
 const agent = lastMessage => success(JSON.stringify({ exitCode: 0, events: { terminal: 'turn.completed' }, lastMessage }));
 
+// The worker is real; Git is virtual so this probe never mutates repository metadata.
+// realRunner exercises Vitest's actual file-filter/exclude behavior with the reported paths.
+export async function runTestInventoryCase({ mode = 'excluded', realRunner = false } = {}) {
+  const dir = fs.mkdtempSync(join(tmpdir(), 'soak-auto-inventory-'));
+  const root = join(dir, 'clone');
+  fs.mkdirSync(root);
+  const integration = 'scripts/operations/__tests__/dispatch-spawn-live.test.mjs';
+  const unit = 'scripts/operations/__tests__/dispatch-lane-io.test.mjs';
+  const files = mode === 'all-excluded' ? [integration] : [integration, unit];
+  const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(dir, 'overlays'), WE_DAEMON_STATE_DIR: join(dir, 'state') };
+  addOverlay(root, { ref: REF, pr: 123 }, { env });
+  let failure, pushed = false, registered = false, audited = false, runnerResult;
+  const events = [], scratches = [];
+  const deps = {
+    io: {
+      ...fs,
+      mkdtempSync(prefix) { const path = fs.mkdtempSync(prefix); scratches.push(path); return path; },
+      writeFileSync: (file, ...args) => file.includes('/.git/') ? undefined : fs.writeFileSync(file, ...args),
+      appendFileSync: (file, ...args) => file.includes('/.git/') ? undefined : fs.appendFileSync(file, ...args),
+      readFileSync: (file, ...args) => files.some(f => file.endsWith(`/${f}`)) ? '// selected test\n' : fs.readFileSync(file, ...args),
+      statSync: file => file.endsWith('/node_modules') ? {} : fs.statSync(file),
+      symlinkSync: (_target, link) => realRunner ? fs.symlinkSync(join(REPO, 'node_modules'), link, 'dir') : undefined,
+    },
+    git(args) {
+      if (args[0] === 'remote') return success(root);
+      if (args[0] === 'diff') return success(args.includes('--diff-filter=U') ? '' : `${files.join('\0')}\0`);
+      if (args[0] === 'ls-tree') return success(`${files.join('\0')}\0`);
+      if (args[0] === 'rev-parse') return args.includes('MERGE_HEAD') ? { status: 1 } : success('a'.repeat(40));
+      if (args[0] === 'push') pushed = true;
+      return success();
+    },
+    async testRunner({ root: scratch, args }) {
+      if (realRunner) {
+        for (const file of files) {
+          fs.mkdirSync(join(scratch, 'scripts/operations/__tests__'), { recursive: true });
+          fs.writeFileSync(join(scratch, file), `import { it, expect } from 'vitest'; it('assertion', () => expect(${file === integration ? 'false' : 'true'}).toBe(true));\n`);
+        }
+        // Same exclusion as the repository's unit config; no project setup or external state.
+        fs.writeFileSync(join(scratch, 'vitest.config.mjs'), `export default { test: { exclude: [${JSON.stringify(integration)}], poolOptions: { threads: { minThreads: 1, maxThreads: 1 } } } };\n`);
+        runnerResult = spawnSync(process.execPath, [join(REPO, 'node_modules/vitest/vitest.mjs'), ...args.slice(6)], {
+          cwd: scratch, env, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
+        });
+        return runnerResult;
+      }
+      const reportArg = args.find(a => a.startsWith('--outputFile.json='));
+      if (reportArg && mode !== 'missing') {
+        const reported = mode === 'excluded' ? [unit] : mode === 'all-excluded' ? [] : files;
+        const report = { testResults: reported.map(file => ({
+          name: join(mode === 'wrong-root' ? '/other-clone' : fs.realpathSync(scratch), file),
+          assertionResults: mode === 'empty-assertions' ? [] : [{ status: mode === 'unknown-status' ? 'unknown' : mode === 'skipped' && file === integration ? 'pending' : 'passed' }],
+        })) };
+        fs.writeFileSync(reportArg.slice('--outputFile.json='.length), mode === 'malformed' ? '{' : mode === 'oversized' ? ' '.repeat(8 * 1024 * 1024 + 1) : JSON.stringify(report));
+      }
+      return { status: mode === 'failed' ? 1 : 0 };
+    },
+    async auditor() { audited = true; return agent('NOT WEAKENED'); },
+    addOverlay(...args) { registered = true; return addOverlay(...args); },
+    appendOverlayEvent(_root, event) { events.push(event); },
+  };
+  try {
+    try { await runAutoRebase({ root, ref: REF, env, deps }); } catch (error) { failure = error.message; }
+    const pending = `${overlayFilePath(root, env)}.auto-rebase`;
+    return { failure, pushed, registered, audited, events, runnerResult,
+      remaining: fs.existsSync(pending) ? fs.readdirSync(pending) : [],
+      overlays: readOverlays(root, { env }).map(o => o.ref),
+      cleaned: scratches.every(p => !fs.existsSync(p)),
+    };
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
 export default {
   id: 'auto-rebase-operator-withdrawal',
-  title: 'a detached repair never re-registers an overlay removed by the operator',
-  card: 'PR #5848 send-back x1b8hlo items 1 and 2 (detached repair, then adoption cleanup)',
+  title: 'a detached repair requires executed tests and respects operator withdrawal',
+  card: 'PR #5848 send-back x1b8hlo (selected test execution, detached repair and adoption cleanup)',
   fixedBy: { sha: 'launcher-pending', where: 'lane/loader-auto-rebase-r2', paths: [WORKER, 'scripts/lib/daemon-overlays.mjs'] },
   fixPresent(root) {
     const worker = fs.readFileSync(join(root, WORKER), 'utf8');
-    return worker.includes('expectedOverlay: old') && worker.includes('requireRef: swap.new');
+    return worker.includes('expectedOverlay: old') && worker.includes('requireRef: swap.new') && worker.includes('alwaysRunInventory');
   },
   async run({ log } = {}) {
     const violations = [];
+    const inventory = await runTestInventoryCase();
+    if (!inventory.failure?.includes('selected tests did not execute') || inventory.pushed || inventory.registered || inventory.audited) {
+      violations.push({ invariant: 'selected-test-inventory', detail: 'an excluded integration test authorized repair' });
+    }
     const operatorRemove = (root, env, ref) => {
       const result = spawnSync(process.execPath, [join(REPO, 'scripts/daemon-overlay.mjs'), 'remove', `--clone=${root}`, `--ref=${ref}`, '--json'], { env, encoding: 'utf8', timeout: 20_000 });
       if (result.status !== 0) throw new Error(`operator remove failed: ${result.stderr}`);
@@ -62,7 +136,14 @@ export default {
           throw new Error(`unexpected Git operation: ${args[0]}`);
         },
         async codex() { if (phase === 'fixer') withdraw(); resolved = true; return agent(); },
-        async testRunner() { if (phase === 'tests') withdraw(); return success(); },
+        async testRunner({ root: scratch, args }) {
+          if (phase === 'tests') withdraw();
+          const report = args.find(a => a.startsWith('--outputFile.json='));
+          fs.writeFileSync(report.slice('--outputFile.json='.length), JSON.stringify({ testResults: [{
+            name: join(fs.realpathSync(scratch), 'worker.test.mjs'), assertionResults: [{ status: 'passed' }],
+          }] }));
+          return success();
+        },
         async auditor() { if (phase === 'audit') withdraw(); return agent('NOT WEAKENED'); },
         addOverlay(...args) { if (phase === 'register') withdraw(); return addOverlay(...args); },
         appendOverlayEvent(_root, event) { if (event.kind === 'auto-rebase-registered') registered = true; },

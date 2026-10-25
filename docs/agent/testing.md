@@ -46,6 +46,13 @@ Git path listings use `-z` and split on NUL without trimming, so non-ASCII and w
 paths match the import graph in conflict, candidate-diff and overlay-branch selection.
 The static reverse-import graph supplies scoped tests, so dynamic-only relationships require human intervention. Exercise both registration and adoption with real git in temporary repos;
 Codex and the queued test runner stay fake in `daemon-rebuild-auto-rebase.test.mjs`.
+The queued test run must also produce a fresh Vitest JSON report proving every selected file executed.
+Exit zero alone is insufficient: a mixed selection can pass while the unit config excludes an integration
+file. Missing, malformed, partial, oversized (over 8 MiB), or entirely skipped inventories stop before audit, push and registration
+with `auto-rebase-needs-you`; verifying excluded tiers requires human review. The worker uses the shared
+`alwaysRunInventory` check, compares paths against the scratch clone's real path, and removes its private
+report on exit. The `auto-rebase executed-test inventory` regression includes a real Vitest exclusion probe;
+the existing `auto-rebase-operator-withdrawal` soak break also exercises the omitted-file refusal.
 The existing [test-selection fallback and durable evidence](../../scripts/lib/__tests__/daemon-rebuild-auto-rebase.test.mjs) cases cover overlay tests, reverse imports, skipped empty runners and exact audit refusal.
 Missing related tests fall back to overlay-branch tests plus import reach; fenced `noTestFiles` reaches the required audit, which must certify exactly `NOT WEAKENED`.
 Selection rules and original conflict markers persist as JSONL evidence before tests; each conflict read and capture is capped at 65,536 bytes, with its descriptor closed in `finally`.
