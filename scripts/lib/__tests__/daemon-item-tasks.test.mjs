@@ -431,10 +431,12 @@ it.each([
   expect(result.recordedReads).toEqual([]);
 });
 
-it('task telemetry meters probes fences and acts before budget spend', async () => {
-  for (const [budgets, outcome, expected] of [
-    [{ read: 0, write: 1 }, 'failed', []], [{ read: 1, write: 1 }, 'deferred-read', ['probe']],
-    [{ read: 2, write: 0 }, 'failed', ['probe', 'fence']], [{ read: 2, write: 1 }, 'acted', ['probe', 'fence', 'act']],
+it('task telemetry measures exact phase durations and meters probes fences and acts before budget spend', async () => {
+  for (const [budgets, outcome, expected, phaseTimings] of [
+    [{ read: 0, write: 1 }, 'failed', [], { fence: 0, act: 0, mark: 0 }],
+    [{ read: 1, write: 1 }, 'deferred-read', ['probe'], { fence: 1, act: 0, mark: 0 }],
+    [{ read: 2, write: 0 }, 'failed', ['probe', 'fence'], { fence: 1, act: 1, mark: 1 }],
+    [{ read: 2, write: 1 }, 'acted', ['probe', 'fence', 'act'], { fence: 1, act: 1, mark: 2 }],
   ]) {
     const h = taskHarness(); h.args.budgets = budgets;
     const result = await runItemTask(h.args);
@@ -443,9 +445,12 @@ it('task telemetry meters probes fences and acts before budget spend', async () 
     expect(result.gh).toEqual({ read: expected.filter(c => c !== 'act').length, write: expected.includes('act') ? 1 : 0 });
     if (outcome !== 'acted') expect(result.reason).toContain('budget-exhausted');
     expect(result.recordedReads).toHaveLength(1);
-    for (const phase of ['read', 'plan', 'claim', 'probe', 'fence', 'act', 'mark']) expect(result.timings[phase]).toBeGreaterThanOrEqual(0);
+    // The harness clock advances by one per call: each measured phase takes one,
+    // skipped phases stay zero, and a successful act records two mark intervals.
+    const expectedTimings = { read: 1, plan: 1, claim: 1, probe: 1, release: 1, ...phaseTimings };
+    expect(result.timings).toEqual(expectedTimings);
     await runItemTask(h.args); expect(h.logs).toHaveLength(1);
-    expect(h.logs[0]).toMatchObject({ type: 'task-timing', key: `${h.args.task.id}:3`, attempt: 3 });
+    expect(h.logs[0]).toMatchObject({ type: 'task-timing', key: `${h.args.task.id}:3`, attempt: 3, timings: expectedTimings });
   }
   const h = taskHarness(); h.args.budgets.read = 0;
   h.args.read = ({ gh }) => gh.read(() => { throw Error('denied call executed'); });
