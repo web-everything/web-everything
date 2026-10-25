@@ -93,7 +93,8 @@
  * Exit status: with --json, a completed run exits 0 and its report carries `exitCode`, `timedOut` and `gate.pass`,
  * the contract machine callers already read (codex-worker, the probation launchers). Without --json, a failed run
  * or a red gate exits 1. A thrown error (including an unavailable self-review) exits 1 in both modes.
- * Detached job records preserve the task's nonzero code; timeout or a red gate falls back to 1.
+ * A transcript fail verdict or check error in fail mode exits nonzero in both output modes.
+ * Detached job records preserve the task's nonzero code; timeout, a red gate or a failed transcript check falls back to 1.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -1424,9 +1425,14 @@ export async function waitForJob({
 }
 
 // ── CLI ───────────────────────────────────────────────────────────────────────────────────────────
-/** Process exit status for a completed run; see the file header's "Exit status". PURE. */
+function transcriptCheckFailed(check) {
+  const mode = check?.mode ?? process.env.WE_CODEX_TRANSCRIPT_CHECK_MODE?.trim();
+  return check?.verdict === 'fail' || Boolean(check && Object.hasOwn(check, 'error') && mode === 'fail');
+}
+
+/** Process exit status for a completed run; see the file header's "Exit status". */
 export function cliExitCode(report, { json = false } = {}) {
-  if (report.transcriptCheck?.verdict === 'fail') return 1;
+  if (transcriptCheckFailed(report.transcriptCheck)) return 1;
   if (json) return 0;
   return report.exitCode !== 0 || report.timedOut || !report.gate.pass ? 1 : 0;
 }
@@ -1434,6 +1440,7 @@ export function cliExitCode(report, { json = false } = {}) {
 /** Internal job records preserve a nonzero task code independently of the foreground contract. */
 function jobExitCode(report) {
   if (report.exitCode !== 0) return report.exitCode || 1;
+  if (transcriptCheckFailed(report.transcriptCheck)) return 1;
   return report.timedOut || !report.gate.pass ? 1 : 0;
 }
 

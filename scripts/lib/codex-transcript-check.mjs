@@ -1,4 +1,4 @@
-/** Best-effort post-run diagnostics over one Codex rollout; never execute transcript text. */
+/** Post-run diagnostics over one Codex rollout; never execute transcript text. */
 import { readFileSync, mkdirSync, appendFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -44,11 +44,79 @@ function toolCommands(record) {
   return commands.length ? commands : [input];
 }
 
+// Tokenize quoted strings atomically and recognize loop keywords only at command
+// boundaries. Each token is visited once; no search retries across loop delimiters.
+function hasRiskyLoop(command) {
+  const loops = [];
+  let commandStart = true, parens = 0, braces = 0, previous = '';
+  const tokens = /"(?:\\[\s\S]|[^"\\])*(?:"|$)|'[^']*(?:'|$)|\\[\s\S]|[^\s;|&(){}"'\\]+|[;|&(){}\n]/g;
+  for (const [word] of command.matchAll(tokens)) {
+    const loop = loops[loops.length - 1];
+    if (/^["'\\]/.test(word)) {
+      commandStart = false;
+    } else if (word === '(') {
+      parens++;
+      if (loop && !loop.body && ['while', 'for'].includes(previous)) loop.headerDepth = parens;
+      // A shell group starts a command; a JS loop header remains an expression.
+      commandStart = !(loop && !loop.body && loop.headerDepth);
+    } else if (word === ')') {
+      if (loop?.headerDepth === parens) loop.headerClosed = true;
+      parens = Math.max(0, parens - 1);
+      commandStart = false;
+    } else if (word === '{') {
+      braces++;
+      if (loop?.headerClosed && !loop.body) {
+        loop.body = true;
+        loop.braceDepth = braces;
+      }
+      commandStart = true;
+    } else if (word === '}') {
+      if (loop?.braceDepth === braces) {
+        loops.pop();
+        if (loop.risky) return true;
+      }
+      braces = Math.max(0, braces - 1);
+      commandStart = true;
+    } else if (/^[;|&\n]$/.test(word)) {
+      commandStart = !(loop && !loop.body && loop.headerDepth);
+    } else if (commandStart && ['if', 'then', 'else', 'elif', '!'].includes(word)) {
+      // These reserved words introduce a condition or branch command, not arguments.
+      commandStart = true;
+    } else if (commandStart && ['while', 'for', 'until'].includes(word)) {
+      loops.push({ body: false, risky: false });
+      commandStart = word !== 'for';
+    } else if (commandStart && word === 'do' && loop && !loop.body && !loop.headerDepth) {
+      loop.body = true;
+      commandStart = true;
+    } else if (commandStart && word === 'done' && loop?.body && !loop.braceDepth) {
+      loops.pop();
+      if (loop.risky) return true;
+      commandStart = false;
+    } else {
+      if (loop && (/(?:^|\/)sleep$/.test(word) || loop.body && /\bheavy-admission\b|\bvitest\b/.test(word))) loop.risky = true;
+      commandStart = false;
+    }
+    previous = word;
+  }
+  return false;
+}
+
+function flagDetail(excerpt) {
+  // Drop the sensitive suffix before truncation, including incomplete or multiline
+  // quoted values: a truncated header/token must never leave its tail in a flag.
+  return String(excerpt)
+    .replace(/(?:^|\s)-H[\s\S]*/g, ' -H [REDACTED]')
+    .replace(/\bAuthorization\s*:[\s\S]*/gi, 'Authorization: [REDACTED]')
+    .replace(/\bBearer\s+[\s\S]*/gi, 'Bearer [REDACTED]')
+    .replace(/\btoken\s*=[\s\S]*/gi, 'token=[REDACTED]')
+    .replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+}
+
 export function checkTranscriptText(jsonlText, { tokenCap = 3000000 } = {}) {
   const flags = [], commands = [], seen = new Set();
   let totalTokens = 0;
   const flag = (kind, excerpt) => {
-    const detail = String(excerpt).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+    const detail = flagDetail(excerpt);
     const key = JSON.stringify([kind, detail]);
     if (!seen.has(key) && flags.length < 20) { seen.add(key); flags.push({ kind, detail }); }
   };
@@ -61,8 +129,7 @@ export function checkTranscriptText(jsonlText, { tokenCap = 3000000 } = {}) {
     if (record.kind !== 'tool_call') continue;
     for (const command of toolCommands(record)) {
       commands.push(command);
-      const loops = command.match(/\b(?:while|for|until)\b[^]*?\bdo\b[^]*?\bdone\b|\b(?:while|for)\s*\([^]*?\)\s*\{[^]*?\}/g) ?? [];
-      if (loops.some(loop => /\bsleep\b/.test(loop) || /(?:\bdo\b|\{)[^]*(?:heavy-admission|\bvitest\b)/.test(loop))) flag('loop', command);
+      if (hasRiskyLoop(command)) flag('loop', command);
       const tmp = `(?:["']?)/tmp/`;
       if (new RegExp(`(?:>{1,2}\\s*|\\btee\\s+(?:-[^\\s]+\\s+)*|(?:^|\\s)-o\\s*)${tmp}`).test(command)
         || /\b(?:cp|mv)\b[^\n;&|]*\s["']?\/tmp\/[^\s"']*["']?\s*(?:$|[;&|\n])/.test(command)
@@ -70,7 +137,7 @@ export function checkTranscriptText(jsonlText, { tokenCap = 3000000 } = {}) {
         || /\bmktemp\b/.test(command) && !/TMPDIR|\/private\/tmp\/claude-|\bmktemp\b[^\n;&|]*\s-p(?:\s|$)/.test(command)
         || /(?:\*\*\* (?:Add|Update|Delete) File:|(?:path|file_path|target)["']?\s*[:=])\s*["']?\/tmp\//.test(command)) flag('tmp-write', command);
       // Quoted search patterns are data. Restrict network detection to command words, with wrappers
-      // such as env/npx allowed; a preceding rg/grep on the same shell segment suppresses it.
+      // env/sudo/command/exec and VAR=val allowed. Any rg/grep in that shell segment suppresses it.
       for (const segment of command.split(/[;\n|]|&&/)) {
         const words = segment.replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g, ' STRING ').trim();
         if (!/\b(?:rg|grep)\b/.test(words) && /(?:^|\||\bdo\b)\s*(?:(?:env|sudo|command|exec)\s+|[A-Za-z_][\w]*=\S+\s+)*(?:(?:gh|curl)(?:\s|$)|git\s+(?:-C\s+\S+\s+)?(?:fetch|push)(?:\s|$))/.test(words)) flag('network', command);
@@ -95,13 +162,18 @@ export function runTranscriptCheck({ rolloutFile, policy, threadId, readFile = r
   return result;
 }
 
-/** Keep lookup, policy, read and log failures inside the runner's best-effort boundary. */
-export function checkRunTranscript({ codexHome, threadId, findRolloutFile, env, emit }) {
+/** Preserve the effective mode on lookup, policy, read and log failures for exit enforcement. */
+export function checkRunTranscript({ codexHome, threadId, findRolloutFile, env = process.env, emit,
+  resolvePolicy = resolveTranscriptCheckPolicy, runCheck = runTranscriptCheck }) {
+  let policy;
   try {
-    const policy = resolveTranscriptCheckPolicy({ env });
+    policy = resolvePolicy({ env });
     emit(formatCascadeSourcesLine('transcriptCheck', { value: policy, sources: policy.sources }));
-    const result = runTranscriptCheck({ rolloutFile: findRolloutFile({ codexHome, threadId }), policy, threadId });
+    const result = runCheck({ rolloutFile: findRolloutFile({ codexHome, threadId }), policy, threadId });
     emit(`codex-transcript-check · verdict=${result.verdict} flags=${[...new Set(result.flags.map(flag => flag.kind))].join(',')}`);
     return result;
-  } catch (error) { return { error: String(error?.message ?? error) }; }
+  } catch (error) {
+    const mode = policy?.mode ?? (env.WE_CODEX_TRANSCRIPT_CHECK_MODE?.trim() === 'fail' ? 'fail' : 'warn');
+    return { mode, error: String(error?.message ?? error) };
+  }
 }

@@ -47,7 +47,6 @@ import {
   runGate,
   runCodexDirectExec,
   codexDirectTask,
-  cliExitCode,
 } from '../codex-direct-task.mjs';
 
 // Historical orchestration fixtures isolate the new independently tested self-review.
@@ -2722,6 +2721,31 @@ describe('detached jobs', () => {
     expect(cliExitCode(report, { json: true })).toBe(0);
   });
 
+  it.each([
+    { mode: 'fail', error: 'rollout missing', expected: 1 },
+    { mode: 'fail', error: '', expected: 1 },
+    { mode: 'warn', error: 'read denied', expected: 0 },
+    { mode: 'fail', verdict: 'fail', expected: 1 },
+    { mode: 'warn', verdict: 'warn', expected: 0 },
+  ])('foreground enforces transcript outcome $mode/$error/$verdict in both output modes', ({ expected, ...transcriptCheck }) => {
+    const report = { exitCode: 0, gate: { pass: true }, transcriptCheck };
+    expect(cliExitCode(report)).toBe(expected);
+    expect(cliExitCode(report, { json: true })).toBe(expected);
+  });
+
+  it('falls back to environment fail mode only when an error has no resolved mode', () => {
+    vi.stubEnv('WE_CODEX_TRANSCRIPT_CHECK_MODE', 'fail');
+    const report = { exitCode: 0, gate: { pass: true }, transcriptCheck: { error: 'policy unreadable' } };
+    expect(cliExitCode(report)).toBe(1);
+    expect(cliExitCode(report, { json: true })).toBe(1);
+    report.transcriptCheck.mode = 'warn';
+    expect(cliExitCode(report)).toBe(0);
+    expect(cliExitCode(report, { json: true })).toBe(0);
+    vi.stubEnv('WE_CODEX_TRANSCRIPT_CHECK_MODE', 'warn');
+    delete report.transcriptCheck.mode;
+    expect(cliExitCode(report, { json: true })).toBe(0);
+  });
+
   const jsonTaskArgs = ['--task=fixture', '--json', '--no-stream', '--no-self-review'];
   it.each(['SIGINT', 'SIGTERM'])('detached CLI cancellation by %s during startup records failure', async signal => {
     const preload = join(jobsDir, 'startup-preload.mjs');
@@ -2833,6 +2857,12 @@ describe('detached jobs', () => {
   }, 20000);
 
   it.each([
+    { label: 'transcript fail verdict', args: [...jsonTaskArgs, '--gate=none'], processCode: 1, recordCode: 1, transcriptMode: 'fail', transcriptExists: true,
+      report: { transcriptCheck: { mode: 'fail', verdict: 'fail', flags: [{ kind: 'network', detail: 'gh issue list' }] } } },
+    { label: 'missing transcript in fail mode', args: [...jsonTaskArgs, '--gate=none'], processCode: 1, recordCode: 1, transcriptMode: 'fail',
+      report: { transcriptCheck: { mode: 'fail', error: 'Run rollout transcript not found' } } },
+    { label: 'missing transcript in warn mode', args: [...jsonTaskArgs, '--gate=none'], processCode: 0, recordCode: 0, transcriptMode: 'warn',
+      report: { transcriptCheck: { mode: 'warn', error: 'Run rollout transcript not found' } } },
     { label: 'validation failure', args: [], processCode: 2, recordCode: 2 },
     { label: 'success', args: [...jsonTaskArgs, '--review'], processCode: 0, recordCode: 0,
       report: { exitCode: 0, timedOut: false, gate: { pass: true } } },
@@ -2845,16 +2875,23 @@ describe('detached jobs', () => {
     { label: 'failed gate in JSON mode', args: [...jsonTaskArgs, '--gate=standards'], processCode: 0, recordCode: 1, gateFails: true,
       report: { exitCode: 0, timedOut: false, gate: { ran: true, pass: false } } },
     { label: 'unreadable task file', args: ['--task-file=missing-detached-task-fixture'], processCode: 1, recordCode: 1 },
-  ])('CLI $label atomically records the internal job outcome', async ({ args, processCode, recordCode, runCode = 0, timeout = false, gateFails = false, report }) => {
+  ])('CLI $label atomically records the internal job outcome', async ({ args, processCode, recordCode, runCode = 0, timeout = false, gateFails = false, report, transcriptMode, transcriptExists }) => {
     // Bootstrap the record with the actual child PID; task execution and gates stay hermetic.
     const boot = `
-      import { writeFileSync } from 'node:fs';
+      import { writeFileSync, mkdirSync } from 'node:fs';
       import { join, resolve } from 'node:path';
       import { pathToFileURL } from 'node:url';
       import cp from 'node:child_process';
       import { syncBuiltinESMExports } from 'node:module';
       import { EventEmitter } from 'node:events';
       const scenario = JSON.parse(process.env.TEST_JOB_SCENARIO);
+      if (scenario.transcriptMode) {
+        process.env.WE_CODEX_TRANSCRIPT_CHECK_MODE = scenario.transcriptMode;
+        process.env.CODEX_HOME = process.env.CODEX_JOBS_DIR;
+        process.env.WE_COORDINATION_ROOT = join(process.env.CODEX_JOBS_DIR, 'coordination');
+        mkdirSync(join(process.env.CODEX_HOME, 'sessions'), { recursive: true });
+        if (scenario.transcriptExists) writeFileSync(join(process.env.CODEX_HOME, 'sessions', 'rollout-t1.jsonl'), JSON.stringify({ payload: { type: 'function_call', name: 'exec_command', arguments: '{"cmd":"gh issue list"}' } }));
+      }
       cp.execFileSync = (bin, args) => {
         if (bin === 'npm' && args.includes('check:standards') && scenario.gateFails) {
           throw Object.assign(new Error('standards failed'), { status: 1 });
@@ -2872,6 +2909,7 @@ describe('detached jobs', () => {
         }
         let completion;
         child.stdin = { on() {}, end() {
+          if (scenario.transcriptMode) child.stdout.emit('data', Buffer.from('{"type":"thread.started","thread_id":"t1"}\\n'));
           if (scenario.timeout) completion = setTimeout(() => child.emit('close', 0), 1000);
           else queueMicrotask(() => child.emit('close', scenario.runCode));
         } };
@@ -2891,7 +2929,7 @@ describe('detached jobs', () => {
       encoding: 'utf8', timeout: 10000,
       maxBuffer: 1024 * 1024,
       env: { ...process.env, CODEX_JOBS_DIR: jobsDir, TEST_JOB_ARGS: JSON.stringify(args),
-        TEST_JOB_SCENARIO: JSON.stringify({ runCode, timeout, gateFails }) },
+        TEST_JOB_SCENARIO: JSON.stringify({ runCode, timeout, gateFails, transcriptMode, transcriptExists }) },
     });
     expect(child.error).toBeUndefined();
     expect(child.status, child.stderr).toBe(processCode);
