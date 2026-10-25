@@ -13,6 +13,87 @@ const FRESH = () => ({ fresh: true, behind: 0 });
 const ALWAYS_GREEN = () => ({ state: 'green', why: 'all required checks succeeded', counts: {} });
 const NOOP_STATUS = () => {};
 
+describe('review-hold-only red draft promotion', () => {
+  const HEAD = 'a'.repeat(40);
+  const check = (name, conclusion = 'success', extra = {}) => ({ name, status: 'completed', conclusion, ...extra });
+  const heldRows = () => [check('test'), check('review-gate', 'failure'), check('merge-gate', 'failure', { id: 123 })];
+  const verdict = () => ({ num: 198, head_sha: HEAD, ok: false,
+    results: [{ id: 'review-gate', status: 'hold', reason: 'review required' }] });
+
+  it.each([
+    ['annotated merge-gate and review-gate red', heldRows(), 'red', true],
+    ['review-gate red only', [check('test'), check('review-gate', 'failure'), check('merge-gate')], 'red', true],
+    ['green', [check('test'), check('review-gate'), check('merge-gate')], 'green', false],
+    ['another required failure', heldRows().map(row => row.name === 'test' ? check('test', 'failure') : row), 'red', false],
+    ['another required check pending', heldRows().map(row => row.name === 'test' ? { ...row, status: 'in_progress', conclusion: null } : row), 'red', false],
+    ['another required check absent', heldRows().filter(row => row.name !== 'test'), 'red', false],
+    ['pending', [check('test'), check('merge-gate'), { name: 'review-gate', status: 'in_progress', conclusion: null }], 'pending', false],
+    ['no evidence', [], 'unchecked', false],
+  ])('the fresh reader returns reviewHoldOnly for %s', (_, rows, state, reviewHoldOnly) => {
+    const out = defaultReadHeadCheckState({
+      repoSlug: 'web-everything/web-everything', sha: HEAD, prNumber: 198,
+      runGh: () => rows.map(row => JSON.stringify(row)).join('\n'),
+      getRequiredChecks: () => ({ checks: ['test', 'merge-gate', 'review-gate'], source: 'live' }),
+      readPrLabels: () => ['review:pending'], readMergeGateVerdict: verdict,
+      readFreeze: () => ({ error: 'not needed' }), mergeGateSetting: { value: 'on' },
+    });
+    expect(out).toMatchObject({ state, reviewHoldOnly });
+  });
+
+  it('the fresh reader keeps an unannotated red merge-gate ineligible when its verdict is unreadable', () => {
+    const out = defaultReadHeadCheckState({
+      repoSlug: 'web-everything/web-everything', sha: HEAD, prNumber: 198,
+      runGh: () => heldRows().map(row => JSON.stringify(row)).join('\n'),
+      getRequiredChecks: () => ({ checks: ['test', 'merge-gate', 'review-gate'], source: 'live' }),
+      readPrLabels: () => ['review:pending'], readMergeGateVerdict: () => ({ error: 'unreadable' }),
+      mergeGateSetting: { value: 'on' },
+    });
+    expect(out).toMatchObject({ state: 'red', reviewHoldOnly: false });
+  });
+
+  it.each([
+    ['red without the flag', { state: 'red' }],
+    ['red with false', { state: 'red', reviewHoldOnly: false }],
+    ['red with a truthy string', { state: 'red', reviewHoldOnly: 'true' }],
+    ['pending despite the flag', { state: 'pending', reviewHoldOnly: true }],
+    ['unchecked despite the flag', { state: 'unchecked', reviewHoldOnly: true }],
+  ])('refuses %s before calling ready', (_, fresh) => {
+    const ready = vi.fn();
+    const result = runReconcilePromoteDraftDispatch({
+      root: '/repo',
+      reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 198, headRefOid: HEAD }], refusals: [] }),
+      provider: { ready }, checkStaleness: FRESH, readPrLabels: () => [],
+      readHeadCheckState: () => fresh, clearAwaitingCi: NOOP_STATUS,
+    });
+    expect(ready).not.toHaveBeenCalled();
+    expect(result.dispatched).toEqual([]);
+    expect(result.refusals).toEqual([expect.objectContaining({
+      pr: 198, kind: 'stale-check-refused', checkState: fresh.state, headSha: HEAD,
+    })]);
+  });
+
+  it('promotes a fresh red verdict with reviewHoldOnly true through the gh pr ready seam', async () => {
+    const ghThrottle = await import('../../lib/gh-throttle.mjs');
+    const runGhSyncSpy = vi.spyOn(ghThrottle, 'runGhSync').mockReturnValue('');
+    const clearAwaitingCi = vi.fn();
+    try {
+      const result = runReconcilePromoteDraftDispatch({
+        root: '/repo', repo: 'plateauapp/plateau-app',
+        reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 198, headRefOid: HEAD }], refusals: [] }),
+        checkStaleness: FRESH, readPrLabels: () => [],
+        readHeadCheckState: () => ({ state: 'red', reviewHoldOnly: true }), clearAwaitingCi,
+      });
+      expect(result.dispatched).toEqual([{ pr: 198, kind: 'promote-draft' }]);
+      expect(result.refusals).toEqual([]);
+      expect(runGhSyncSpy).toHaveBeenCalledTimes(1);
+      expect(runGhSyncSpy.mock.calls[0][0]).toEqual(['pr', 'ready', '198', '--repo', 'plateauapp/plateau-app']);
+      expect(clearAwaitingCi).toHaveBeenCalledWith({ pr: 198, repo: 'plateauapp/plateau-app', state: null });
+    } finally {
+      runGhSyncSpy.mockRestore();
+    }
+  });
+});
+
 describe('runReconcilePromoteDraftDispatch (draft-first PRs)', () => {
   it('calls provider.ready for every promote-draft entry, and nothing else', async () => {
     const readyCalls = [];
