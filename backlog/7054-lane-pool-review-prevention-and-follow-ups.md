@@ -1,4 +1,5 @@
 ---
+bornAs: x5859pf
 kind: story
 size: 5
 status: open
@@ -19,7 +20,7 @@ Filed from the 2026-10-24 changes-requested review of PR #5859. These are the re
 5. Keep the parameterized `selected pool recovery never uses the caller origin` integration gate covering gc, release and release --all-pools from a different caller with --pool and no explicit origin/reference. Explicit origin/reference and missing-primary refusals must remain covered.
 6. Add a real backup regression proving successive recovery attempts never overwrite prior backup bytes. Exercise the actual `realRecoverIo.backup` path, not just an injected mkdir function.
 7. Repair stash preservation completeness in `realRecoverIo`: `git stash show -p` alone omits some stash contents. Test staged/unstaged, untracked (`stash -u`), ignored (`stash -a`) and binary content with byte-for-byte restoration before permitting a reset; unreadable or incomplete backup must keep the lane.
-8. The recovery-speed acceptance suggestion is specified on #xle1sxo, including the executable gate, planned named performance tests and risk mapping.
+8. The recovery-speed acceptance suggestion is specified on #7055, including the executable gate, planned named performance tests and risk mapping.
 
 ## Acceptance
 
