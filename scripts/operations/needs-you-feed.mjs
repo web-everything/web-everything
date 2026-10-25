@@ -232,15 +232,18 @@ export async function gateRulingItems(items, { gh = execFileSyncThrottled, cwd, 
     const item = items[index];
     out[index] = item;
     if (item.kind !== 'ruling-needed') return;
-    if (Date.now() >= deadline) { log(`needs-you-feed ${item.repo}#${item.pr} ruling gate deadline reached, keeping`); return; }
-    try {
-      const pr = await readLivePr(item, { gh, cwd }, 'labels,headRefOid,body,createdAt');
-      if (!/^[a-f0-9]{40}$/i.test(pr.headRefOid) || !Array.isArray(pr.labels) || typeof pr.body !== 'string'
-        || !Number.isFinite(Date.parse(pr.createdAt))) throw new Error('incomplete live PR');
-      if (await lookup(pr) !== null) return;
-    } catch (error) { log(`needs-you-feed ${item.repo}#${item.pr} ruling gate unreadable, keeping: ${error.message}`); return; }
+    const autoResolved = /referral hold auto-resolved/i.test(item.reason ?? '');
+    if (!autoResolved) {
+      if (Date.now() >= deadline) { log(`needs-you-feed ${item.repo}#${item.pr} ruling gate deadline reached, keeping`); return; }
+      try {
+        const pr = await readLivePr(item, { gh, cwd }, 'labels,headRefOid,body,createdAt');
+        if (!/^[a-f0-9]{40}$/i.test(pr.headRefOid) || !Array.isArray(pr.labels) || typeof pr.body !== 'string'
+          || !Number.isFinite(Date.parse(pr.createdAt))) throw new Error('incomplete live PR');
+        if (await lookup(pr) !== null) return;
+      } catch (error) { log(`needs-you-feed ${item.repo}#${item.pr} ruling gate unreadable, keeping: ${error.message}`); return; }
+    }
     out[index] = undefined;
-    const detail = 'all confirmed findings already ruled';
+    const detail = autoResolved ? 'referral hold auto-resolved' : 'all confirmed findings already ruled';
     log(`needs-you-feed ${item.repo}#${item.pr} needs-you-suppressed: ${detail}`);
     try { await emitEvent({ kind: 'needs-you-suppressed', repo: item.repo, pr: item.pr, detail }); }
     catch (error) { log(`needs-you-feed suppression event failed: ${error.message}`); }
