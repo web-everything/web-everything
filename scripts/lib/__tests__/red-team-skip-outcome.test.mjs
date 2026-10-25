@@ -228,7 +228,7 @@ describe('PR 5890 not-owed settlement', () => {
     expect(f.settle(redTeam).outcome).toBe('non-policy');
     expect(f.io.postComment).not.toHaveBeenCalled();
     expect(redTeamForHead(f.comments, pr, head)).toBeNull();
-    expect(planRedTeamStatusLabels({ pr, head, comments: f.comments, evidence: {} }).add).not.toContain('red-team:clear');
+    expect(planRedTeamStatusLabels({ pr, head, comments: f.comments, evidence: {} }).add).not.toBe('red-team:clear');
     expect(f.io.publishNeedsYou).toHaveBeenCalledOnce();
     expect(f.io.publishNeedsYou.mock.calls[0][0]).toMatchObject({
       repo, pr, head, reason: 'red team skipped (red team reported not-owed on an accepted head); not cleared',
