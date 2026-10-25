@@ -3550,10 +3550,9 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
 
   it.each([
     ['annotated merge-gate and review-gate red', heldRollup],
-    ['review-gate red only', reviewOnlyRollup],
-  ])('dispatches review for a non-draft with %s without a review-ci refusal', (_, rollup) => {
+  ])('hands a non-draft with %s to the review daemon instead of the review-ci config-conflict refusal', (_, rollup) => {
     const result = plan({ isDraft: false, statusCheckRollup: rollup() });
-    expect(result.dispatch).toContainEqual(expect.objectContaining({ kind: 'review', prNumber: 1563 }));
+    expect(result.refusals.map(row => row.kind)).toEqual(['review-hold-red']);
     expect(result.refusals.filter(row => row.kind === 'review-ci' || row.reviewRefusal?.kind === 'review-ci')).toEqual([]);
   });
 
