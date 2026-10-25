@@ -246,6 +246,7 @@ describe('health-investigate on the declared dispatch-lane operation', () => {
     }
     const allow = argv.find((a) => a.startsWith('--allowedTools='));
     expect(allow).toContain(`Bash(node ${root}/scripts/operations/run.mjs stale-state:*)`);
+    expect(allow).toContain(`Bash(node ${root}/scripts/operations/run.mjs adoption-matrix:*)`);
     expect(allow).not.toMatch(/Edit|Write/);
     // model from routing (the investigator role → sonnet tier), never hand-set
     expect(argv[argv.indexOf('--model') + 1]).toBe('sonnet');

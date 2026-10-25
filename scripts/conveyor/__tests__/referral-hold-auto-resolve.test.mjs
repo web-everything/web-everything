@@ -10,7 +10,7 @@ const require = createRequire(import.meta.url);
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { buildOperatorRulingComment, readReferralRecords, REFERRAL_SUPERSEDE_REASON } from '../../lib/jury-core.mjs';
+import { AUTO_POLICY_ACTOR, buildOperatorRulingComment, readReferralRecords, REFERRAL_SUPERSEDE_REASON } from '../../lib/jury-core.mjs';
 import { liveReferralState } from '../../lib/referral-live-context.mjs';
 import { openReferralFindings } from '../../operations/record-referral-ruling.mjs';
 import {
@@ -39,16 +39,16 @@ const asPr = (fx, comments = fx.comments) => ({
 });
 const decide = (pr, hold, o = {}) => decideReferralHoldAutoResolve(pr, hold, { repo, cardReadable: noCards, env: {}, ...o });
 /** The daemon's enrichment chain for one PR: today's hold, then the auto-resolve step. */
-const enrich = (fx, { comments, env = {} } = {}) => {
+const enrich = (fx, { comments, env = {}, cardReadable = noCards } = {}) => {
   const [held] = enrichPrsWithReferralHolds([asPr(fx, comments)], { repo, readRuns: () => fx.runs, now: Date.parse(fx.capturedAt), env });
-  return enrichPrsWithReferralHoldAutoResolve([held], { repo, env, decide: (p, h) => decide(p, h, { env }) })[0];
+  return enrichPrsWithReferralHoldAutoResolve([held], { repo, env, decide: (p, h) => decide(p, h, { env, cardReadable }) })[0];
 };
 const plan = pr => planReconcile({ repo: 'we', prs: [pr], agents: [], requiredChecks: ['test'], now: Date.parse('2026-10-21T17:30:00Z') });
 
 /** An operator ruling comment on the live head (posted before the head's last review started, so it is no wake). */
-function operatorRuling(fx, { key, runId, result, at, reason = 'operator: this must be fixed' }) {
+function operatorRuling(fx, { key, runId, result, at, actor = 'chalbert', reason = 'operator: this must be fixed' }) {
   const body = buildOperatorRulingComment({ version: 1, repo, pr: fx.number, head: fx.headRefOid,
-    rulings: [{ runId, key, result }], actor: 'chalbert', channel: 'test', reason, at, clearerId: '' });
+    rulings: [{ runId, key, result }], actor, channel: 'test', reason, at, clearerId: '' });
   return { author: { login: 'chalbert' }, authorAssociation: 'OWNER', body, createdAt: at };
 }
 const liveRecord = fx => readReferralRecords(fx.comments, { head: fx.headRefOid }).records.find(r => r.head === fx.headRefOid);
@@ -331,12 +331,134 @@ describe('fail closed: anything unproven keeps the pause, and says why', () => {
   it('the kill switch turns it off', () => {
     expect(decide(pr, hold, { env: { WE_REFERRAL_HOLD_AUTO_RESOLVE: '0' } })).toBeNull();
   });
-  it('a resume on a PR that is not review:human stays paused (no second verdict on an unchanged head)', () => {
+  it('a resume on a PR that is not review:human clears the hold and dispatches review even with a current advisory', () => {
     const p0 = enrich(fx);
-    const p = plan({ ...p0, labels: [{ name: 'review:pending' }] });
-    expect(p.dispatch.filter(d => d.kind === 'review')).toEqual([]);
-    const row = p.refusals.find(r => r.kind === 'review-referrals-pending');
-    expect(row?.referralHoldAutoResolve).toMatchObject({ outcome: 'stay' });
+    const pr = { ...p0, labels: [{ name: 'review:pending' }] };
+    const p = plan(pr);
+    expect(p.dispatch.map(d => d.kind)).toEqual(['review']);
+    expect(p.refusals.some(r => r.kind === 'review-referrals-pending')).toBe(false);
+    expect(p.notes.filter(n => n.kind === 'referral-hold-auto-resolved')).toEqual([expect.objectContaining({
+      outcome: 'resume', next: 'review', head: fx.headRefOid,
+    })]);
+    expect(pr.labels).toEqual([{ name: 'review:pending' }]);
+  });
+});
+
+describe('ruled parked heads: #5806-shaped pending and #5762-shaped human replays', () => {
+  const fx = FX[5775];
+  const rec = liveRecord(fx);
+  const pending = options => ({ ...enrich(fx, options), labels: [{ name: 'review:pending' }] });
+  const expectLabelsKept = (pr, p) => {
+    const labels = pr.labels.map(l => l.name);
+    for (const row of [...p.dispatch, ...p.refusals]) expect(row.labels).toEqual(labels);
+    expect(p.dispatch.some(d => d.kind === 'accept')).toBe(false);
+    expect(p.notes.some(n => /label/.test(n.kind))).toBe(false);
+  };
+
+  it('#5806-shaped: all not-real/card on the live head, one review and one attempt, re-arms review with no accept or label change', () => {
+    const card = 'we:backlog/referral-follow-up.md';
+    const cardReadable = ref => ref === card;
+    const comments = fx.comments.map(c => {
+      const m = /<!-- mandatory-referrals-v1: (\S+) -->/.exec(c.body);
+      if (!m) return c;
+      const record = JSON.parse(decodeURIComponent(m[1]));
+      if (record.head !== fx.headRefOid) return c;
+      const orig = record.referrals[0];
+      const summary = `${orig.finding.summary} (second finding)`;
+      const key = JSON.stringify([orig.seat, orig.finding.file, orig.finding.line, summary]);
+      const second = { ...orig, key, finding: { ...orig.finding, summary }, original: { ...orig.original, summary } };
+      return { ...c, body: c.body.replace(m[1], encodeURIComponent(JSON.stringify({ ...record,
+        referrals: [...record.referrals, second], rulings: [...record.rulings,
+          { ...record.rulings[0], id: `${record.runId}:9`, key, result: 'card', card }],
+      }))) };
+    });
+    const pr = pending({ comments, cardReadable });
+    expect(pr.referralHold).toMatchObject({ kind: 'same-head', head: fx.headRefOid, count: 1, attemptsSinceWake: 1 });
+    expect(pr.referralHoldAutoResolve).toMatchObject({ outcome: 'resume', counts: { 'not-real': 1, card: 1 } });
+    const p = plan(pr);
+    expect(p.dispatch.map(d => d.kind)).toEqual(['review']);
+    expect(p.refusals.some(r => r.kind === 'review-referrals-pending')).toBe(false);
+    expect(p.notes).toContainEqual(expect.objectContaining({ kind: 'referral-hold-auto-resolved', outcome: 'resume', next: 'review' }));
+    expectLabelsKept(pr, p);
+    expect(pr.labels).toEqual([{ name: 'review:pending' }]);
+  });
+
+  it.each([
+    ['two attempts', { attemptsSinceWake: 2 }, /head reviewed 2 time\(s\)/],
+    ['two finished reviews', { count: 2, attemptsSinceWake: 2 }, /head reviewed 2 time\(s\)/],
+    ['two finished reviews with an inconsistent attempt count', { count: 2 }, /head reviewed 1 time\(s\)/],
+    ['unknown attempts', { attemptsSinceWake: undefined }, /ledger hold/],
+  ])('#5806-shaped: %s stays paused with the bounds reason', (_name, change, reason) => {
+    const pr = pending();
+    pr.referralHold = { ...pr.referralHold, ...change };
+    const p = plan(pr);
+    expect(p.dispatch).toEqual([]);
+    expect(p.refusals).toContainEqual(expect.objectContaining({ kind: 'review-referrals-pending',
+      referralHoldAutoResolve: expect.objectContaining({ outcome: 'stay', why: expect.stringMatching(reason) }) }));
+    expectLabelsKept(pr, p);
+  });
+
+  it.each([
+    ['a different hold kind', { kind: 'referral' }],
+    ['a different hold head', { head: 'a'.repeat(40) }],
+    ['a no-verdict hold', { noVerdict: { exhausted: true } }],
+  ])('#5806-shaped: %s cannot consume a resume', (_name, change) => {
+    const pr = pending();
+    pr.referralHold = { ...pr.referralHold, ...change };
+    const p = plan(pr);
+    expect(p.dispatch).toEqual([]);
+    expect(p.refusals[0].kind).toBe('review-referrals-pending');
+    expect(p.notes.some(n => n.kind === 'referral-hold-auto-resolved')).toBe(false);
+    expectLabelsKept(pr, p);
+  });
+
+  it('#5806-shaped: a partial ruling with one pending finding keeps the hold', () => {
+    const f = FX[5800];
+    const comments = f.comments.map(c => {
+      const m = /<!-- mandatory-referrals-v1: (\S+) -->/.exec(c.body);
+      if (!m) return c;
+      const record = JSON.parse(decodeURIComponent(m[1]));
+      if (record.head !== f.headRefOid) return c;
+      return { ...c, body: c.body.replace(m[1], encodeURIComponent(JSON.stringify({ ...record, rulings: [] }))) };
+    });
+    const pr = { ...enrich(f, { comments }), labels: [{ name: 'review:pending' }] };
+    expect(liveReferralState(pr, { repo, pr: f.number, cardReadable: noCards }).pending).toHaveLength(1);
+    expect(pr.referralHoldAutoResolve).toMatchObject({ outcome: 'stay', why: expect.stringMatching(/no readable ruling/) });
+    const p = plan(pr);
+    expect(p.dispatch).toEqual([]);
+    expect(p.refusals[0].kind).toBe('review-referrals-pending');
+    expectLabelsKept(pr, p);
+  });
+
+  it('#5762-shaped: review:human with a current advisory still refuses already-reviewed-head and keeps review:human', () => {
+    const pr = enrich(fx);
+    const p = plan(pr);
+    expect(p.dispatch).toEqual([]);
+    expect(p.refusals).toContainEqual(expect.objectContaining({ kind: 'already-reviewed-head',
+      referralHoldAutoResolve: expect.objectContaining({ outcome: 'resume', next: 'human-review' }) }));
+    expectLabelsKept(pr, p);
+    expect(pr.labels).toEqual(fx.labels.map(name => ({ name })));
+    expect(pr.labels).toContainEqual({ name: 'review:human' });
+  });
+
+  it('an operator ruling that replaces an earlier auto-policy ruling permits resume', () => {
+    const subject = { key: rec.referrals[0].key, runId: rec.runId };
+    const policy = operatorRuling(fx, { ...subject, result: 'block', actor: AUTO_POLICY_ACTOR, at: '2026-10-21T10:57:30.000Z' });
+    const operator = operatorRuling(fx, { ...subject, result: 'not-real', at: '2026-10-21T10:58:00.000Z' });
+    const pr = pending({ comments: [...fx.comments, policy, operator] });
+    expect(pr.referralHoldAutoResolve).toMatchObject({ outcome: 'resume', counts: { 'not-real': 1 } });
+    const p = plan(pr);
+    expect(p.dispatch.map(d => d.kind)).toEqual(['review']);
+    expectLabelsKept(pr, p);
+  });
+
+  it('#5806-shaped: an operator block still sends back to the fixer without acceptance or label changes', () => {
+    const block = operatorRuling(fx, { key: rec.referrals[0].key, runId: rec.runId, result: 'block', at: '2026-10-21T10:58:00.000Z' });
+    const pr = pending({ comments: [...fx.comments, block] });
+    expect(pr.referralHoldAutoResolve).toMatchObject({ outcome: 'send-back', counts: { block: 1 } });
+    const p = plan(pr);
+    expect(p.dispatch.map(d => [d.kind, d.mode])).toEqual([['fix', 'block-ruled-referral']]);
+    expectLabelsKept(pr, p);
   });
 });
 

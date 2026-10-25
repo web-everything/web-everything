@@ -1,23 +1,53 @@
 /**
  * @file scripts/operations/record-red-team-ruling.mjs
  * @description Operator card ruling for a confirmed live-head break parked at the round cap.
- * Requires a trusted round-cap record, an existing readable --card, a human operator poster,
+ * Requires a trusted round-cap record, an optional existing readable --card, a human operator poster,
  * and the operator's --reason and --channel. review:changes may coexist with the cap record.
  * The ruling binds to the head and result. Preview plans without writing; the sink rechecks
  * before writing and proves release by reading back the human-authored record.
- * Reader and sink: ./record-red-team-ruling-io.mjs. Automatic filing and other rulings come later.
+ * Without --card, queues one follow-up through the detached landing job with retry-safe claims.
+ * Reader and sink: ./record-red-team-ruling-io.mjs. Other ruling kinds come later.
  */
+import { createHash } from 'node:crypto';
+import { actionResource } from './action-record.mjs';
+import { buildRedTeamCardInput } from './red-team-gate-apply.mjs';
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
-import { assertHumanOperator, operatorBoundComments } from '../lib/operator-identity.mjs';
-import { GATE_OUTCOMES, liveResultGateState, readRedTeamDisposition } from '../lib/red-team-gate.mjs';
+import { assertHumanOperator, isHumanOperatorComment, operatorBoundComments } from '../lib/operator-identity.mjs';
+import { GATE_OUTCOMES, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
 import { sanitizeCardField } from '../lib/review-loop-policy.mjs';
+import { boundCardText, CARD_TEXT_CAPS } from './land-prevention-card.mjs';
 
 export const RECORD_RED_TEAM_RULING_OP = 'record-red-team-ruling';
 export const RED_TEAM_RULINGS = Object.freeze(['card']);
 export const RED_TEAM_RULING_CARD_EFFECT = 'github.red-team-ruling-card';
 export const OPERATOR_CARD_OUTCOME = 'operator-card';
+
+/** Refuse lossy landing bounds before posting a pending intent. Include escaping expansion in the budget. */
+export function assertRulingCardInputFits(input) {
+  for (const field of ['digest', 'scope']) {
+    const text = boundCardText(input[field], Number.MAX_SAFE_INTEGER,
+      { singleLine: field === 'scope', escapeWikiLinks: field !== 'scope' });
+    if (!text.trim() || text.length > CARD_TEXT_CAPS[field]) {
+      throw new Error(`automatic card landing ${field} exceeds its limit or is empty; select a smaller --break group or file the complete findings manually and cite --card`);
+    }
+  }
+}
+
+/** The bare intent marker written BEFORE the card job is spawned: it has no action line, so the break stays held. */
+export const CARD_PENDING_OUTCOME = 'card-pending';
+const CARD_PENDING_INTENT_RE = /Operator card ruling pending \(job ([0-9a-f]{12}), break\(s\) (#\d+(?:, #\d+)*)\)/;
+
+/** The stable key one card ruling spawns under: same PR, head, result and breaks always map to the same job. PURE. */
+export function cardJobKey({ repo, pr, head, resultId, indices }) {
+  return createHash('sha256').update(JSON.stringify(['v1', repo, Number(pr), head, resultId, [...indices].sort((a, b) => a - b)])).digest('hex').slice(0, 12);
+}
+
+/** Shared resource: bind the full repo/PR/head/result/break identity into a safe item id. */
+export const rulingCardResource = (p, scope = 'card') => actionResource(p.repo, {
+  type: 'item', id: `rtr-${p.pr}-${p.head.slice(0, 12)}-${cardJobKey(p)}${scope === 'break' ? '-break' : ''}`,
+});
 
 const where = (f) => `${f.file ?? '(no file cited)'}${f.line ? `:${f.line}` : ''}`;
 
@@ -76,6 +106,37 @@ export function rulableBreaks({ comments, repo, pr, head, setting, standingRulin
   return { state, rulable: held, noun: 'held for the operator' };
 }
 
+/**
+ * Card jobs another invocation already started for this result (the bare `card-pending` intent a human operator
+ * posted before the spawn) whose break set overlaps `indices` under a DIFFERENT job key. A retry with an overlapping
+ * but different selection would spawn a second filing for the same break, so it is refused; re-running the exact same
+ * selection reconciles that job instead. PURE.
+ */
+export function conflictingPendingCardJobs(comments, { pr, head, resultId, jobKey, indices }) {
+  const marker = redTeamGateMarker(pr, head, CARD_PENDING_OUTCOME, resultId);
+  const out = [];
+  for (const c of Array.isArray(comments) ? comments : []) {
+    const body = String(c?.body ?? '').trimStart();
+    if (!body.startsWith(marker) || !isHumanOperatorComment(c)) continue;
+    const m = CARD_PENDING_INTENT_RE.exec(body);
+    if (!m || m[1] === jobKey) continue;
+    const theirs = m[2].split(', ').map((x) => Number(x.slice(1)));
+    const overlap = indices.filter((i) => theirs.includes(i));
+    if (overlap.length) out.push({ jobKey: m[1], indices: theirs, overlap });
+  }
+  return out;
+}
+
+/** A trusted intent for this exact job, including one started under another host's state root. PURE. */
+export function hasPendingCardIntent(comments, { pr, head, resultId, jobKey }) {
+  const marker = redTeamGateMarker(pr, head, CARD_PENDING_OUTCOME, resultId);
+  return (Array.isArray(comments) ? comments : []).some((c) => {
+    const body = String(c?.body ?? '').trimStart();
+    return body.startsWith(marker) && isHumanOperatorComment(c)
+      && CARD_PENDING_INTENT_RE.exec(body)?.[1] === jobKey;
+  });
+}
+
 /** THE VERDICT. Validate, select, and describe the writes. PURE. */
 export function planRedTeamRuling(read, input) {
   const { pr, ruling, actor, channel, reason } = input;
@@ -85,8 +146,7 @@ export function planRedTeamRuling(read, input) {
   }
   if (!String(reason ?? '').trim()) throw new Error("--reason is required: the operator's words, verbatim");
   if (!String(channel ?? '').trim() || /[\r\n]/.test(channel)) throw new Error('--channel is required and must be one line');
-  if (!String(input.card ?? '').trim()) throw new Error('--card is required: cite an existing readable backlog card');
-  if (!read.card?.readable) {
+  if ((String(input.card ?? '').trim() || read.card) && !read.card?.readable) {
     throw new Error(`--card ${read.card?.requested ?? input.card} does not resolve to a readable backlog card (${read.card?.reason ?? 'unresolved'})`);
   }
   // Bind to who actually posts: the authenticated gh identity must be a human operator and equal --actor.
@@ -101,7 +161,21 @@ export function planRedTeamRuling(read, input) {
   const base = { repo: input.repo, pr: Number(pr), head, ruling, actor: String(actor).toLowerCase(), channel: String(channel).trim(),
     reason: String(reason), at: read.now, resultId: state.resultId, findings: selected, setting: read.setting,
     indices: selected.map((f) => f.index) };
-  return { ...base, effect: RED_TEAM_RULING_CARD_EFFECT, cardRef: read.card.ref };
+  if (read.card) {
+    return { ...base, effect: RED_TEAM_RULING_CARD_EFFECT, cardRef: read.card.ref };
+  }
+  const cardInput = buildRedTeamCardInput({ repo: input.repo, pr, head, findings: selected });
+  cardInput.digest += `\n\nOperator ruling (${base.actor} via ${base.channel}): carded. Reason: ${sanitizeCardField(reason, 600)}`;
+  // No-file findings remain rulable with --card. An empty automatic filing scope
+  // must be refused here, before a pending intent can strand the ruling.
+  assertRulingCardInputFits(cardInput);
+  const jobKey = cardJobKey(base);
+  const pending = conflictingPendingCardJobs(comments, { pr, head, resultId: state.resultId, jobKey, indices: base.indices });
+  if (pending.length) {
+    throw new Error(`a card job is already pending for ${pending.map((j) => `break(s) ${j.indices.map((i) => `#${i}`).join(', ')} (job ${j.jobKey})`).join('; ')}; `
+      + 're-run with exactly that --break selection to finish it (a different overlapping selection would file the same break twice)');
+  }
+  return { ...base, effect: RED_TEAM_RULING_CARD_EFFECT, cardInput, jobKey, session: `red-team-ruling-card-${jobKey}` };
 }
 
 export function recordRedTeamRulingOperation({ readRulingContext } = {}) {
@@ -118,7 +192,7 @@ export function recordRedTeamRulingOperation({ readRulingContext } = {}) {
       actor: 'string',
       channel: 'string',
       reason: 'string',
-      card: 'string',
+      card: { type: 'string', required: false },
       preview: { type: 'boolean', required: false, default: false },
     },
     verdictFrom: 'plan',
@@ -140,6 +214,7 @@ export function recordRedTeamRulingOperation({ readRulingContext } = {}) {
           actor: view.verdict.actor, channel: view.verdict.channel, reason: view.verdict.reason, at: view.verdict.at,
           resultId: view.verdict.resultId, findings: view.verdict.findings, indices: view.verdict.indices,
           setting: view.verdict.setting, cardRef: view.verdict.cardRef,
+          cardInput: view.verdict.cardInput, jobKey: view.verdict.jobKey, session: view.verdict.session,
         },
       }]),
     }),

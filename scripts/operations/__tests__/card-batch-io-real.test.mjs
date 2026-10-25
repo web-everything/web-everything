@@ -10,6 +10,7 @@ import { describe, expect, it } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { cardIdOf, fileIntoBatch } from '../card-batch-file.mjs';
 import { admitCard } from '../card-batch-io.mjs';
 import { withNarrowClone } from './helpers/real-repo.mjs';
 
@@ -51,6 +52,41 @@ describe('card batch admission against a real origin and a narrow clone', () => 
       } finally {
         rmSync(stateDir, { recursive: true, force: true });
       }
+    });
+  }, 30_000);
+});
+
+describe('raised-by admission against a real origin', () => {
+  it('admits a sidecar beside cards, dedupes its key and recovers both from remote evidence', async () => {
+    await withNarrowClone(async ctx => {
+      const stateDir = mkdtempSync(join(tmpdir(), 'sidecar-batch-real-'));
+      try {
+        const baseSha = ctx.git(['rev-parse', 'HEAD']).trim();
+        const sidecar = 'backlog/raised-by/6636/77-' + 'a'.repeat(24) + '.md';
+        mkdirSync(join(ctx.clone, 'backlog/raised-by/6636'), { recursive: true });
+        writeFileSync(join(ctx.clone, 'backlog/6636-card.md'), '# Card\n');
+        writeFileSync(join(ctx.clone, sidecar), '# Raised by\n');
+        const options = { stateDir, baseSha, launch: () => {}, log: () => {} };
+        const input = { laneDir: ctx.clone, kind: 'prevention', source: { repo: 'org/repo', pr: 77 }, actor: 'mechanical' };
+        const card = await fileIntoBatch({ ...input, cardPath: 'backlog/6636-card.md', idemKey: 'prevention:6636' }, options);
+        const memberId = 'raised-by:6636:77-' + 'a'.repeat(24);
+        expect(cardIdOf(sidecar)).toBe(memberId);
+        const sideInput = { ...input, cardPath: sidecar, idemKey: `prevention:${memberId}` };
+        const added = await fileIntoBatch(sideInput, options);
+        expect(card).toMatchObject({ batched: true, batchRef: REF });
+        expect(added).toMatchObject({ batched: true, batchRef: REF, member: { cardId: memberId } });
+        expect(ctx.showOnOrigin(REF, sidecar)).toBe('# Raised by\n');
+        expect(ctx.showOnOrigin(REF, 'backlog/6636-card.md')).toBe('# Card\n');
+        const again = await fileIntoBatch(sideInput, options);
+        expect(again).toMatchObject({ batched: true, deduped: true });
+        expect(again.member.commitSha).toBe(added.member.commitSha);
+        rmSync(join(stateDir, 'org-repo-prevention.json'));
+        expect(await fileIntoBatch(sideInput, options)).toMatchObject({ batched: true, deduped: true });
+        const state = JSON.parse(readFileSync(join(stateDir, 'org-repo-prevention.json'), 'utf8'));
+        expect(state.members).toHaveLength(2);
+        expect(state.headSha).toBe(added.member.commitSha);
+        expect(ctx.git(['ls-remote', '--refs', 'origin', REF]).trim()).toContain(added.member.commitSha);
+      } finally { rmSync(stateDir, { recursive: true, force: true }); }
     });
   }, 30_000);
 });
