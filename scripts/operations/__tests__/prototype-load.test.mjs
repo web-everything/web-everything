@@ -70,10 +70,12 @@ function fixture(options = {}) {
       }
       if (args.includes('--check')) {
         if (options.checkRaw) return options.checkRaw;
-        if (options.unverifiable === ref) return fail(1, JSON.stringify({ check: { ok: false } }));
+        if (options.unverifiable === ref) return fail(1, JSON.stringify({ check: { ok: false, reason: 'ref-unresolved' } }), 'WARNING overlay NO PR');
+        if (options.checkBeforeFetch === ref && !establishedFetches.has(ref)) return fail(1, JSON.stringify({ check: { ok: false, reason: 'ref-unresolved' } }));
         const clean = !(options.conflicts || []).includes(ref);
         const data = JSON.stringify({ check: { ok: true, clean, candSha: remoteTip, ...(clean ? {} : { files: options.checkFiles?.[ref] ?? ['x'], conflicting: [{ ref: 'lane/other' }] }) }, wouldRegister: clean });
         if (options.advanceAfterCheck && ref === (options.behind ? 'lane/new-m1' : BASE.branch)) remoteTip = TREE;
+        if (options.noPrWarning === ref) return fail(1, data, 'WARNING overlay NO PR');
         return clean ? data : fail(3, data);
       }
       if (action === 'add' && options.addFails) return fail(1);
@@ -102,6 +104,7 @@ function fixture(options = {}) {
     }
     if (args[0] === 'fetch') {
       const ref = args[2]?.replace(/^\+refs\/heads\//, '').split(':')[0];
+      if (options.staleFetchFails === ref) return fail(1);
       if (ref === BASE.branch && tipReads > 0 && options.advanceEstablishedBeforeSwap) establishedAdvanced = true;
       if (establishedTips.has(ref)) {
         const count = (establishedFetches.get(ref) || 0) + 1;
@@ -155,7 +158,13 @@ function fixture(options = {}) {
       return (options.contained || []).includes(args[2].slice(7)) ? '' : fail(1);
     }
     if (args[0] === 'merge-tree') return options.mergeConflict ? fail(1, `${TREE}\n100644 ${SHA} 1\tx\nCONFLICT (content): Merge conflict in x\n`) : TREE;
-    if (args[0] === 'ls-remote') return options.remote || '';
+    if (args[0] === 'ls-remote') {
+      if (args[1] === '--exit-code') {
+        expect(args).toEqual(['ls-remote', '--exit-code', 'origin', `refs/heads/${options.staleFetchFails}`]);
+        if (options.staleRemoteCode) return fail(options.staleRemoteCode);
+      }
+      return options.remote || '';
+    }
     if (args[0] === 'commit-tree') return MERGE;
     if (args[0] === 'push') { remoteTip = MERGE; return ''; }
     throw new Error(`unexpected command ${cmd} ${args}`);
@@ -880,7 +889,6 @@ describe('prototype-load', () => {
     const combinedTests = { command: 'fixture-related-tests', result: '3 passed', testCount: 3 };
     const f = fixture({ list: ['lane/old', 'lane/also'], conflicts: ['lane/old', 'lane/also'],
       staleChanged: { 'lane/old': 'M\0z-old.mjs\0M\0x\0', 'lane/also': 'M\0x\0M\0a-also.mjs\0' },
-      cherry: { 'lane/also': `- ${SHA}\n` },
       combinedTest: { ok: true, ...combinedTests } });
     const r = await f.run();
     expect(f.combinedTest).toHaveBeenCalledTimes(1);
@@ -890,7 +898,7 @@ describe('prototype-load', () => {
     expect(r.combinedTests).toEqual(combinedTests);
     expect(r.staleTolerated).toEqual([
       { ref: 'lane/old', landedByContent: false, why: expect.stringMatching(/combined/i), combinedTests },
-      { ref: 'lane/also', landedByContent: true, why: expect.stringMatching(/combined/i), combinedTests },
+      { ref: 'lane/also', landedByContent: false, why: expect.stringMatching(/combined/i), combinedTests },
     ]);
     expect(mutations(f, 'add')).toHaveLength(1);
     expect(mutations(f, 'remove')).toEqual([]);
@@ -947,11 +955,12 @@ describe('prototype-load', () => {
     expect(r.message).toContain('candidate-not-clean');
     expect(mutations(f, 'add')).toEqual([]);
   });
-  it('flags a content-landed stale ref as harmless in staleTolerated', async () => {
+  it('skips pairwise checks for a content-landed stale ref and hands it to swap', async () => {
     const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] }, staleChanged: { 'lane/old': 'M\0old-only.mjs\0' }, cherry: { 'lane/old': `- ${SHA}\n- ${TREE}\n` } });
     const r = await f.run();
-    expect(r.ok).toBe(true);
-    expect(r.staleTolerated).toEqual([{ ref: 'lane/old', landedByContent: true, why: expect.stringMatching(/\S/) }]);
+    expect(r).toMatchObject({ adopted: true, contained: ['lane/old'], swap: { contained: ['lane/old'] }, staleChecks: { 'lane/old': { skipped: 'contained', included: false, landed: true } } });
+    expect(r.staleTolerated).toEqual([]);
+    expect(f.calls.filter(c => c.cmd === 'node' && c.args.includes('--check'))).toHaveLength(1);
     expect(f.calls.some(c => c.cmd === 'git' && c.args.join(' ') === 'cherry origin/main origin/lane/old')).toBe(true);
     expect(f.records[0].staleTolerated).toEqual(r.staleTolerated);
     expect(mutations(f, 'add')).toHaveLength(1);
@@ -976,10 +985,74 @@ describe('prototype-load', () => {
     expect(r.removedTips).toEqual({});
     expect([...f.registrations.keys()]).toEqual(['lane/old']);
   });
+  it('adopts a candidate containing two mutually conflicting stale refs without pairwise checks', async () => {
+    const refs = ['lane/old', 'lane/also'];
+    const f = fixture({ list: refs, contained: refs, conflicts: refs, checkBeforeFetch: 'lane/old' });
+    const r = await f.run();
+    expect(r).toMatchObject({ registered: true, adopted: true, stopReason: 'swap-remove-failed', contained: refs, swap: { contained: refs } });
+    expect(r.staleChecks).toEqual(Object.fromEntries(refs.map(ref => [ref, { skipped: 'contained', included: true, landed: false }])));
+    expect(f.calls.filter(c => c.cmd === 'node' && c.args.includes('--check')).map(c => c.args.find(a => a.startsWith('--ref=')))).toEqual([`--ref=${BASE.branch}`]);
+  });
+  it('fetches a non-contained stale ref before checking it', async () => {
+    const f = fixture({ list: ['lane/old'], checkBeforeFetch: 'lane/old' });
+    expect(await f.run()).toMatchObject({ ok: true, contained: [] });
+  });
+  it('fails closed on a genuinely unresolved non-contained stale ref despite a no-PR warning', async () => {
+    const f = fixture({ list: ['lane/old'], unverifiable: 'lane/old' });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'check-unverifiable', staleChecks: { 'lane/old': { ok: false, reason: 'ref-unresolved' } } });
+    expect(mutations(f, 'add')).toEqual([]);
+  });
+  it.each([BASE.branch, 'lane/old'])('accepts a clean JSON check with a nonzero no-PR warning: %s', async (noPrWarning) => {
+    const f = fixture({ list: ['lane/old'], noPrWarning, safetySettings: { overlaySafety: { noPr: 'warn' } } });
+    expect(await f.run()).toMatchObject({ ok: true, registered: true, adopted: true, stopReason: null });
+  });
+  it.each([
+    ['included in the candidate', { contained: ['lane/old'] }],
+    ['landed by content', { cherry: { 'lane/old': `- ${SHA}\n` } }],
+  ])('fails closed when a deleted remote ref has only cached evidence %s', async (_, evidence) => {
+    const f = fixture({ list: ['lane/old'], staleFetchFails: 'lane/old', staleRemoteCode: 2, ...evidence });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, adopted: false,
+      staleChecks: {}, stopReason: 'check-unverifiable', fallback: expect.stringContaining('authoritative registered tip is unavailable') });
+    expect(f.calls.filter(c => c.cmd === 'git' && c.args[0] === 'ls-remote' && c.args[1] === '--exit-code')).toHaveLength(1);
+    expect(f.calls.filter(c => c.cmd === 'node' && c.args.includes('--check')).map(c => c.args.find(a => a.startsWith('--ref=')))).toEqual([`--ref=${BASE.branch}`]);
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+  });
+  it('fails closed when a deleted remote ref has unlanded changes absent from the candidate', async () => {
+    const f = fixture({ list: ['lane/old'], staleFetchFails: 'lane/old', staleRemoteCode: 2 });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, adopted: false,
+      stopReason: 'check-unverifiable', detail: 'could not fetch registered ref lane/old', staleChecks: {} });
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+  });
+  it('rejects deleted remote ref when cached tip predates registered tip', async () => {
+    // The cached tip appears contained, but the listing claims a newer, uncontained
+    // SHA. The registry has no authoritative tip contract; neither is safe evidence.
+    const f = fixture({ list: ['lane/old'], contained: ['lane/old'], staleFetchFails: 'lane/old', staleRemoteCode: 2,
+      listRaw: JSON.stringify({ list: [{ ref: 'lane/old', sha: TREE }] }) });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, adopted: false, stopReason: 'check-unverifiable' });
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(f.registrations.has('lane/old')).toBe(true);
+    expect(f.calls.some(c => c.cmd === 'git' && ['cherry', 'rev-parse', 'merge-base'].includes(c.args[0])
+      && c.args.some(arg => arg.includes('origin/lane/old')))).toBe(false);
+  });
+  it.each([0, 1, 128])('fails closed when fetching a registered ref fails and ls-remote exits %s even if containment would pass', async (staleRemoteCode) => {
+    const f = fixture({ list: ['lane/old'], contained: ['lane/old'], staleFetchFails: 'lane/old', staleRemoteCode });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'check-unverifiable', detail: 'could not fetch registered ref lane/old' });
+    expect(f.calls.filter(c => c.cmd === 'git' && c.args[0] === 'ls-remote' && c.args[1] === '--exit-code')).toHaveLength(1);
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+  });
+  it('does not accept a conflicting JSON check with a no-PR warning exit', async () => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], noPrWarning: 'lane/old' });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'check-unverifiable' });
+    expect(mutations(f, 'add')).toEqual([]);
+  });
   it('contained stale and clean registrations remain after replacement adoption', async () => {
     const f = fixture({ list: ['lane/old', 'lane/also'], contained: ['lane/old', 'lane/also'], conflicts: ['lane/old'] }); const r = await f.run();
     expect(r).toMatchObject({ ok: false, adopted: true, stopReason: 'swap-remove-failed', detail: 'mutable-registration', removed: [], removedTips: {}, swap: { retained: ['lane/old', 'lane/also'] } });
-    expect(r.stale).toEqual(['lane/old']);
+    expect(r.stale).toEqual([]);
     const index = f.calls.findIndex((c) => c.cmd === 'node' && c.args[1] === 'add' && !c.args.includes('--check'));
     const adopted = f.calls.findLastIndex((c) => c.args[0] === '-C');
     expect(adopted).toBeGreaterThan(index);
@@ -1016,7 +1089,7 @@ describe('prototype-load', () => {
     expect(r).toMatchObject({ ok: false, stopReason, registered: true, adopted: false, removed: [] });
     expect(mutations(f, 'remove')).toEqual([]);
     expect(r.fallback).toContain('Prior registrations retained: lane/old, lane/also.');
-    expect(r.fallback).toContain('If stale registrations block adoption, rebase and retest them');
+    expect(r.staleChecks['lane/old']).toEqual({ skipped: 'contained', included: true, landed: false });
   });
   it.each([false, true])('retains registrations while adoption is pending and if the wait is interrupted (already registered: %s)', async (already) => {
     const f = fixture({
@@ -1202,7 +1275,6 @@ describe('prototype-load', () => {
     expect(calls).toEqual([
       ['add', clone, '--ref=lane/new', '--check', `--expected-sha=${SHA}`, '--json'],
       ['list', clone, '--json'],
-      ['add', clone, '--ref=lane/old', '--check', '--json'],
       ['add', clone, '--ref=lane/new', `--expected-sha=${SHA}`, '--reason=tested change', '--by=tester', '--json'],
     ]);
     const addIndex = f.calls.findIndex((c) => c.cmd === 'node' && c.args.includes('--by=tester'));

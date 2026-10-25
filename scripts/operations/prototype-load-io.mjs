@@ -196,13 +196,14 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
   const check = (clone, ref, expectedSha) => {
     const result = loader('add', clone, ref, ['--check', ...(expectedSha ? [`--expected-sha=${expectedSha}`] : [])]);
     const data = lastJson(result);
-    if (![0, 3].includes(result.code) || data?.check?.ok !== true || typeof data.check.clean !== 'boolean'
+    if (result.code < 0 || data?.check?.ok !== true || typeof data.check.clean !== 'boolean'
       // A clean check carries no `files`/`conflicting` (the loader only adds them on a conflict); default them.
       || (data.check.files !== undefined && (!Array.isArray(data.check.files) || !data.check.files.every((file) => typeof file === 'string')))
       || (data.check.conflicting !== undefined && !Array.isArray(data.check.conflicting))
       || (!data.check.clean && (!Array.isArray(data.check.files) || !Array.isArray(data.check.conflicting)))
       || (expectedSha && data.check.candSha !== expectedSha)
-      || result.code !== (data.check.clean ? 0 : 3)) return { ok: false, ...result, reason: data?.check?.reason || 'incomplete loader check' };
+      // A clean JSON check remains valid when a no-PR warning makes the CLI exit nonzero.
+      || (!data.check.clean && result.code !== 3)) return { ok: false, ...result, reason: data?.check?.reason || 'incomplete loader check' };
     return { files: [], conflicting: [], ...data.check, exit: result.code, wouldRegister: data.wouldRegister };
   };
   return async function load(input) {
@@ -282,12 +283,27 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const blockingReasons = Object.create(null);
       out.staleChecks = {};
       for (const ref of established.filter((ref) => ref !== out.effectiveRef)) {
+        if (git('fetch', 'origin', ref).code !== 0) {
+          if (git('ls-remote', '--exit-code', 'origin', `refs/heads/${ref}`).code === 2) {
+            // Registrations do not pin an authoritative tip. A cached tracking ref may
+            // predate deleted work, so even cached containment cannot authorize adoption.
+            return stop('check-unverifiable', {
+              detail: `could not fetch registered ref ${ref}`,
+              fallback: `Remote ref ${ref} was deleted, and its authoritative registered tip is unavailable. Retain the registration; recover and verify its latest work before retrying.`,
+            });
+          }
+          return stop('check-unverifiable', { detail: `could not fetch registered ref ${ref}` });
+        }
+        const included = ancestor(`origin/${ref}`, out.effectiveSha);
+        const landed = landedByContent(ref);
+        if (included || landed) {
+          contained.push(ref);
+          out.staleChecks[ref] = { skipped: 'contained', included, landed };
+          continue;
+        }
         const evidence = check(out.clone, ref);
         out.staleChecks[ref] = evidence;
         if (!evidence.ok) return stop('check-unverifiable');
-        if (git('fetch', 'origin', ref).code !== 0) return stop('check-unverifiable', { detail: `could not fetch registered ref ${ref}` });
-        const included = ancestor(`origin/${ref}`, out.effectiveSha);
-        if (included) contained.push(ref);
         if (!evidence.clean) {
           out.stale.push(ref);
           if (!included) {
