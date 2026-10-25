@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/** Standalone merge watcher. --watch polls every minute; one-shot mode is scheduler-friendly.
+/** Standalone merged/open PR watcher. --watch polls every minute; one-shot mode is scheduler-friendly.
  * GitHub merged_at is the landed confirmation; no drain mutation or shared conveyor-file edit.
  * Receipts and retries persist per item. The cursor advances once at batch end,
  * only when no non-quarantined error remains; otherwise the discovery window is retained.
@@ -8,11 +8,82 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { setTimeout as sleep } from 'node:timers/promises';
+import fs from 'node:fs';
+import { buildStuckPostmortem } from '../../operations/coroner-stuck-trigger.mjs';
+import { planFileItem } from '../../operations/file-item.mjs';
+import { createFileItemReader, createFileItemSinks, REPO_ROOT } from '../../operations/file-item-io.mjs';
+import { SCAFFOLD_EFFECT } from '../../operations/scaffold.mjs';
+import { fileIntoBatch } from '../../operations/card-batch-file.mjs';
 import { buildPostmortem, shouldPostmortem, publishPostmortem, collectPrTimeline, resolvePostmortemSettings,
   coronerStateDir, readOptionalJson, atomicJson, ghJson, validateSubject, withCoronerLock, repoFilenameKey } from '../../operations/coroner-pr-postmortem.mjs';
 
 const MAX_COLLECTION_ATTEMPTS = 3;
 const MIN_COLLECTION_FAILURE_SPAN_MS = 30*60000;
+
+/** Refuse capped or malformed discovery; an operator must inspect omitted PRs. */
+export function listOpenPrs(repo, { gh = ghJson, maxPages = 10 } = {}) {
+  validateSubject(repo,1);
+  if (!Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > 100) throw Error('invalid open page cap; operator inspection required');
+  const found = new Map();
+  for (let page = 1; page <= maxPages; page++) {
+    const rows = gh(['api',`repos/${repo}/pulls?state=open&sort=created&direction=asc&per_page=100&page=${page}`]);
+    if (!Array.isArray(rows) || rows.length > 100 || rows.some(p => !Number.isSafeInteger(p?.number) || p.number < 1 || p.state !== 'open')) throw Error('invalid open PR listing; operator inspection required');
+    for (const p of rows) found.set(p.number,p);
+    if (rows.length < 100) return [...found.values()];
+  }
+  throw Error('open PR listing exceeds page cap; operator must inspect the full open listing');
+}
+
+const defaultPlanCard = input => planFileItem(createFileItemReader()(), input);
+const defaultFileCard = payload => createFileItemSinks()[SCAFFOLD_EFFECT](payload);
+const defaultBatchCard = payload => fileIntoBatch({ laneDir:REPO_ROOT, cardPath:payload.rel, idemKey:payload.identity, kind:'prevention' });
+
+async function runOpenPhase({ repo, dir, now, listOpen, collectOpen, planCard, fileCard, batchCard, dryRun, beat }) {
+  const result = { incomplete:false, wouldFile:[] };
+  const fallback = 'operator must inspect open PR evidence and retry pending card publication';
+  try {
+    const path = join(dir,`open-stuck-${repoFilenameKey(repo)}.json`);
+    const state = readOptionalJson(path,{ cards:{} });
+    if (!state.cards || typeof state.cards !== 'object' || Array.isArray(state.cards)) throw Error('invalid open card state');
+    const save = () => { beat(); atomicJson(path,state); };
+    const publish = async entry => {
+      if (!entry?.payload || typeof entry.filed !== 'boolean' || typeof entry.batched !== 'boolean') throw Error('invalid pending card receipt');
+      if (!entry.filed) { beat(); await fileCard(entry.payload); entry.filed = true; save(); }
+      if (!entry.batched) {
+        beat(); const outcome = await batchCard(entry.payload);
+        if (!outcome?.batched) throw Error('card batching refused; operator publication required');
+        entry.batched = true; save();
+      }
+    };
+    // Retry saved identities even when discovery no longer returns their PR.
+    if (!dryRun) for (const entry of Object.values(state.cards)) await publish(entry);
+    const prs = await listOpen(repo);
+    if (!Array.isArray(prs) || prs.length > 1000 || prs.some(p => !Number.isSafeInteger(p?.number) || p.number < 1)) throw Error('invalid or oversized open listing');
+    for (const p of prs) {
+      try {
+        beat();
+        const input = await collectOpen(repo,p.number);
+        if (input?.repo !== repo || input.pr !== p.number) throw Error('open timeline subject disagrees with listing');
+        const report = buildStuckPostmortem(input,{now});
+        if (!dryRun) {
+          beat(); atomicJson(join(dir,`stuck-${repoFilenameKey(repo)}-${p.number}.json`),report);
+          beat(); fs.writeFileSync(join(dir,`stuck-${repoFilenameKey(repo)}-${p.number}.md`),report.markdown);
+        }
+        if (report.triggers.every(t => t.status === 'unknown')) throw Error('open timeline evidence unknown');
+        for (const trigger of report.triggers.filter(t => t.status === 'fired')) {
+          const identity = `${repo}#${p.number}:${trigger.trigger}`;
+          if (state.cards[identity]) continue;
+          if (dryRun) { result.wouldFile.push(identity); continue; }
+          const payload = await planCard({ kind:'investigation', title:`Investigate ${trigger.trigger} for ${repo} PR ${p.number}`, digest:report.markdown });
+          state.cards[identity] = { payload:{...payload,identity}, filed:false, batched:false };
+          save(); // Identity and exact bytes survive failure before the first filing effect.
+          await publish(state.cards[identity]);
+        }
+      } catch { result.incomplete = true; result.fallback = fallback; }
+    }
+  } catch { result.incomplete = true; result.fallback = fallback; }
+  return result;
+}
 
 /** Updated-order REST listing avoids search-index lag and its separate rate budget.
  * A failed/capped listing never advances the cursor. Recent closed-but-unmerged PRs are ignored.
@@ -41,7 +112,9 @@ export function listMergedSince(repo, since, until, { gh = ghJson, maxPages = 10
   throw Error('merged PR listing exceeds page cap; cursor retained');
 }
 export async function runPostmortemPass({ repo, dir = coronerStateDir(), now = new Date().toISOString(),
-  settings = resolvePostmortemSettings(), listMerged = listMergedSince, collect = collectPrTimeline } = {}) {
+  settings = resolvePostmortemSettings(), listMerged = listMergedSince, collect = collectPrTimeline,
+  listOpen = listOpenPrs, collectOpen = (repo,pr) => collectPrTimeline(repo,pr,{allowOpen:true}),
+  planCard = defaultPlanCard, fileCard = defaultFileCard, batchCard = defaultBatchCard, dryRun = false } = {}) {
   validateSubject(repo,1);
   return withCoronerLock(dir, async ({ beat }) => {
     beat();
@@ -82,27 +155,28 @@ export async function runPostmortemPass({ repo, dir = coronerStateDir(), now = n
         } else {
           errors.push(`PR ${p.number}: ${failure.error}`);
         }
-        beat(); atomicJson(file,state); // fence every write: a reclaimed owner must not overwrite the new owner's state
+        beat(); if (!dryRun) atomicJson(file,state); // fence every write: a reclaimed owner must not overwrite the new owner's state
         continue;
       }
       // Storage/publication failures are pass failures, never poison-item quarantines.
       beat();
-      if (shouldPostmortem(r,config)) { publishPostmortem(r,{dir,beat}); published++; }
+      if (shouldPostmortem(r,config) && !dryRun) { publishPostmortem(r,{dir,beat}); published++; }
       delete state.failures[p.number];
       state.done.push(p.number); state.done.sort((a,b) => a-b);
-      beat(); atomicJson(file,state);
+      beat(); if (!dryRun) atomicJson(file,state);
     }
     if (errors.length) throw Error(`postmortem incomplete; cursor retained: ${errors.join('; ')}`);
-    beat(); state.cursor = now; atomicJson(file,state);
-    return { published, cursor:state.cursor, done:state.done.length, quarantined:state.quarantined };
+    beat(); state.cursor = now; if (!dryRun) atomicJson(file,state);
+    const open = await runOpenPhase({repo,dir,now,listOpen,collectOpen,planCard,fileCard,batchCard,dryRun,beat});
+    return { published, cursor:state.cursor, done:state.done.length, quarantined:state.quarantined, open };
   });
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const { values } = parseArgs({ options: { repo:{type:'string'}, out:{type:'string'}, watch:{type:'boolean'} } });
+  const { values } = parseArgs({ options: { repo:{type:'string'}, out:{type:'string'}, watch:{type:'boolean'}, 'dry-run':{type:'boolean'} } });
   const abort = new AbortController();
   process.once('SIGTERM',() => abort.abort()); process.once('SIGINT',() => abort.abort());
   do {
-    try { console.log(JSON.stringify(await runPostmortemPass({repo:values.repo,dir:values.out}))); }
+    try { console.log(JSON.stringify(await runPostmortemPass({repo:values.repo,dir:values.out,dryRun:values['dry-run']}))); }
     catch(e) { console.error(`pr-postmortem-pass: ${e.message}`); if (!values.watch) process.exitCode = 1; }
     if (values.watch && !abort.signal.aborted) await sleep(60000,undefined,{signal:abort.signal}).catch(() => {});
   } while (values.watch && !abort.signal.aborted);

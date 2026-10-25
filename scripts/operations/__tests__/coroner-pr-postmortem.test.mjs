@@ -1021,3 +1021,108 @@ describe('stuck open PR phase', () => {
     } finally {fs.rmSync(dir,{recursive:true,force:true});}
   });
 });
+
+
+describe('open discovery boundaries and publication restart regressions', () => {
+  const scratch = () => fs.mkdtempSync(join(process.env.TMPDIR,'coroner-open-regression-'));
+  const openTimeline = number => ({...fixture(number),state:'open',openedAt:at(-4000),mergedAt:null,
+    completeness:{core:'complete'}});
+
+  it.each([
+    ['unreadable page',null],
+    ['null row',[null]],
+    ['missing number',[{state:'open'}]],
+    ['fractional number',[{number:1.5,state:'open'}]],
+    ['nonpositive number',[{number:0,state:'open'}]],
+    ['missing state',[{number:7}]],
+    ['closed row',[{number:7,state:'closed'}]],
+    ['oversized page',Array.from({length:101},(_,i) => ({number:i+1,state:'open'}))],
+  ])('refuses %s during open discovery without collecting or filing cards', async (_name,rows) => {
+    const dir = scratch(), gh = vi.fn(() => rows);
+    const collectOpen = vi.fn(), planCard = vi.fn(), fileCard = vi.fn(), batchCard = vi.fn();
+    try {
+      const result = await runPostmortemPass({repo:'example/repo',dir,now:at(700),settings,
+        listMerged:() => [],listOpen:repo => listOpenPrs(repo,{gh,maxPages:2}),
+        collectOpen,planCard,fileCard,batchCard});
+      expect(result.open).toMatchObject({incomplete:true,fallback:expect.stringMatching(/operator/)});
+      expect(gh).toHaveBeenCalledTimes(1);
+      expect(collectOpen).not.toHaveBeenCalled(); expect(planCard).not.toHaveBeenCalled();
+      expect(fileCard).not.toHaveBeenCalled(); expect(batchCard).not.toHaveBeenCalled();
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+
+  it('refuses a full final discovery page at the cap without filing a partial listing', async () => {
+    const dir = scratch();
+    const gh = vi.fn(() => Array.from({length:100},(_,i) => ({number:i+1,state:'open'})));
+    const collectOpen = vi.fn(), planCard = vi.fn(), fileCard = vi.fn(), batchCard = vi.fn();
+    try {
+      const result = await runPostmortemPass({repo:'example/repo',dir,now:at(700),settings,
+        listMerged:() => [],listOpen:repo => listOpenPrs(repo,{gh,maxPages:2}),
+        collectOpen,planCard,fileCard,batchCard});
+      expect(gh).toHaveBeenCalledTimes(2);
+      expect(result.open).toMatchObject({incomplete:true,fallback:expect.stringMatching(/operator/)});
+      expect(collectOpen).not.toHaveBeenCalled(); expect(planCard).not.toHaveBeenCalled();
+      expect(fileCard).not.toHaveBeenCalled(); expect(batchCard).not.toHaveBeenCalled();
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+
+  it('accepts a short final page at the cap and files the eligible PR on that page', async () => {
+    const dir = scratch();
+    const gh = vi.fn().mockReturnValueOnce(Array.from({length:100},(_,i) => ({number:i+1,state:'open'})))
+      .mockReturnValueOnce([{number:101,state:'open'}]);
+    const collectOpen = vi.fn((_repo,number) => ({...openTimeline(number),openedAt:number === 101 ? at(-4000) : at(0)}));
+    const planCard = vi.fn(() => ({num:'xabcdef',rel:'backlog/xabcdef-improve.md',content:'card'}));
+    const fileCard = vi.fn(), batchCard = vi.fn(async () => ({batched:true}));
+    try {
+      const result = await runPostmortemPass({repo:'example/repo',dir,now:at(700),settings,
+        listMerged:() => [],listOpen:repo => listOpenPrs(repo,{gh,maxPages:2}),
+        collectOpen,planCard,fileCard,batchCard});
+      expect(result.open.incomplete).toBe(false); expect(gh).toHaveBeenCalledTimes(2);
+      expect(collectOpen.mock.calls.map(([,number]) => number)).toEqual(Array.from({length:101},(_,i) => i+1));
+      expect(planCard).toHaveBeenCalledTimes(1); expect(fileCard).toHaveBeenCalledTimes(1);
+      expect(fileCard.mock.calls[0][0].identity).toBe('example/repo#101:open-age');
+      expect(batchCard).toHaveBeenCalledTimes(1);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+
+  it.each(['filing throws','batching throws','batching refuses'])(
+    'restarts after %s with the saved payload when the PR disappears, without repeating completed filing', async failure => {
+      const dir = scratch(), statePath = join(dir,'open-stuck-example%2Frepo.json');
+      const identity = 'example/repo#7:open-age';
+      const planCard = vi.fn(() => ({num:'xabcdef',rel:'backlog/xabcdef-improve.md',content:'exact planned bytes\n'}));
+      const fileCard = vi.fn(async payload => {
+        expect(JSON.parse(fs.readFileSync(statePath,'utf8')).cards[identity].payload).toEqual(payload);
+        if (failure === 'filing throws') throw Error('filing interrupted');
+      });
+      const batchCard = vi.fn(async () => {
+        if (failure === 'batching throws') throw Error('batch interrupted');
+        return {batched:false,reason:'lease-held'};
+      });
+      try {
+        const first = await runPostmortemPass({repo:'example/repo',dir,now:at(700),settings,
+          listMerged:() => [],listOpen:() => [{number:7}],collectOpen:(_repo,number) => openTimeline(number),
+          planCard,fileCard,batchCard});
+        expect(first.open).toMatchObject({incomplete:true,fallback:expect.stringMatching(/operator/)});
+        const saved = JSON.parse(fs.readFileSync(statePath,'utf8')).cards[identity];
+        expect(saved).toEqual({payload:{num:'xabcdef',rel:'backlog/xabcdef-improve.md',content:'exact planned bytes\n',identity},
+          filed:failure !== 'filing throws',batched:false});
+        expect(planCard).toHaveBeenCalledTimes(1); expect(fileCard).toHaveBeenCalledTimes(1);
+        expect(batchCard).toHaveBeenCalledTimes(failure === 'filing throws' ? 0 : 1);
+
+        const retryPlan = vi.fn(() => {throw Error('must reuse saved identity');});
+        const retryCollect = vi.fn(() => {throw Error('PR absent from discovery');});
+        const retryFile = vi.fn(async () => {}), retryBatch = vi.fn(async () => ({batched:true}));
+        const restart = {repo:'example/repo',dir,now:at(701),settings,listMerged:() => [],listOpen:() => [],
+          collectOpen:retryCollect,planCard:retryPlan,fileCard:retryFile,batchCard:retryBatch};
+        const recovered = await runPostmortemPass(restart);
+        expect(recovered.open.incomplete).toBe(false);
+        expect(retryPlan).not.toHaveBeenCalled(); expect(retryCollect).not.toHaveBeenCalled();
+        expect(retryFile.mock.calls).toEqual(failure === 'filing throws' ? [[saved.payload]] : []);
+        expect(retryBatch.mock.calls).toEqual([[saved.payload]]);
+        expect(JSON.parse(fs.readFileSync(statePath,'utf8')).cards).toEqual({[identity]:{...saved,filed:true,batched:true}});
+        await runPostmortemPass({...restart,now:at(702)});
+        expect(retryFile).toHaveBeenCalledTimes(failure === 'filing throws' ? 1 : 0);
+        expect(retryBatch).toHaveBeenCalledTimes(1); expect(retryPlan).not.toHaveBeenCalled();
+      } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+    });
+});
