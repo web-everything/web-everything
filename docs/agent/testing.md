@@ -121,10 +121,12 @@ findings or an unstringifiable comment status must still reach settlement and pr
 status write and gate. Runner exceptions and policy-comment post failures use the shared
 `safeErrorText` catch boundary (including message access and string coercion), falling back to
 `unprintable error`; post failures still persist pending needs-you before publication and retry.
-Guard deferrals clear queued admission for retry instead of writing finished status, while cap
-deferrals suppress the gate; completion-evidence tests assert those exact lifecycle differences.
-Gate suppression retains the runner's cap flag before reading comment diagnostics, so a throwing
-comment-status accessor cannot turn a cap deferral into a gate run in either job mode.
+Guard deferrals clear queued admission for retry instead of writing finished status. A `ran` or
+`resumed` result carrying a cap deferral suppresses the gate; a `skipped` cap attempt rolls back
+admission and still runs the gate over existing findings. Completion-evidence and red-team-only
+tests assert those lifecycle differences.
+Gate suppression retains the completed status and runner's cap flag before reading comment
+diagnostics, so a throwing comment-status accessor cannot admit a cap-deferred completion in either job mode.
 The fallback summary also retains guard deferrals before diagnostics, preserving admission rollback.
 Coerce diagnostic values with `String()` inside a catch boundary, using `unknown`
 for an unreadable comment status; retain the original completed status when summary rows fail.

@@ -180,7 +180,7 @@ describe('review-job red-team skip settlement', () => {
         expect(publishNeedsYou).toHaveBeenCalledTimes(1);
         expect(publishNeedsYou).toHaveBeenCalledWith(expect.objectContaining({ repo, pr, head }));
         expect(postComment).not.toHaveBeenCalled();
-        // Guard deferrals clear admission for retry; cap deferrals suppress the gate.
+        // Guard deferrals clear admission for retry; cap-deferred completions suppress the gate.
         // Neither is a completed pass, so the unconditional five-event expectation was wrong.
         expect(f.events).toEqual(redTeam.deferredByGuard
           ? ['queued', 'red-team', 'settle', 'gate']
@@ -210,6 +210,26 @@ describe('review-job red-team skip settlement', () => {
       expect(f.io.runRedTeamGate).toHaveBeenCalledTimes(flag === 'deferredByCap' ? 0 : 1);
       expect(out.redTeam).toMatchObject({ status, [flag]: true, outcome: 'non-policy' });
       if (flag === 'deferredByCap') expect(out).not.toHaveProperty('redTeamGate');
+    }
+  });
+
+  it.each([false, true])('skipped cap attempt rolls back admission and gates existing findings (throwing diagnostics=%s)', throwing => {
+    for (const redTeamOnly of [false, true]) {
+      const f = fixture({ status: 'skipped', deferredByCap: true,
+        comment: throwing ? { get status() { throw Error('comment status unavailable'); } } : undefined,
+      });
+      f.io.settleRedTeamSkip.mockImplementation(() => {
+        f.events.push('settle');
+        return { outcome: 'non-policy' };
+      });
+      const out = runReviewJob({ repo, pr, redTeamOnly }, f.io);
+      expect(f.events).toEqual(['queued', 'red-team', 'settle', 'gate']);
+      expect(f.io.settleRedTeamSkip).toHaveBeenCalledTimes(1);
+      expect(f.io.clearRedTeamQueued).toHaveBeenCalledWith({ repo, pr, head });
+      expect(f.io.redTeamStatus.mock.calls.map(([row]) => row.status)).toEqual(['queued']);
+      expect(f.io.runRedTeamGate.mock.calls).toEqual([[{ repo, pr }]]);
+      expect(out.redTeam).toMatchObject({ status: 'skipped', deferredByCap: true, outcome: 'non-policy' });
+      expect(out.redTeamGate).toEqual({ status: 'ok', outcome: 'advisory' });
     }
   });
 

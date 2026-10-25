@@ -794,7 +794,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       out.redTeamSpeculative = { decision: 'error', reason: tail(e?.message ?? e, 300) };
     }
   }
-  let redTeamDeferredByCap = false;
+  let redTeamCompletionDeferredByCap = false;
   if (accepted && (out.redTeamSpeculative?.result || typeof io.runRedTeam === 'function')) {
     let redTeam = out.redTeamSpeculative?.result ?? null;
     if (!redTeam) {
@@ -815,13 +815,14 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     out.redTeam = settlementOutcome;
     try {
       // Gate admission must survive failures while deriving the printable summary.
-      redTeamDeferredByCap = Boolean(redTeam?.deferredByCap);
+      const redTeamDeferredByCap = Boolean(redTeam?.deferredByCap);
       const status = redTeam?.status;
+      const completed = ['ran', 'resumed'].includes(status);
+      redTeamCompletionDeferredByCap = completed && redTeamDeferredByCap;
       // Retain lifecycle evidence before reading comment or summary diagnostics.
       out.redTeam = { status: typeof status === 'string' ? status : 'error',
         ...(redTeam?.deferredByGuard ? { deferredByGuard: true } : {}),
         ...(redTeamDeferredByCap ? { deferredByCap: true } : {}) };
-      const completed = ['ran', 'resumed'].includes(status);
       const published = ['posted', 'deduped'].includes(redTeam?.comment?.status);
       // Acceptance already established that a pass was owed; not-owed cannot exempt it.
       const deferred = Boolean(redTeam?.deferredByGuard || redTeam?.deferredByCap);
@@ -885,7 +886,9 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   // x1b8hlo — THE RED-TEAM GATE: a confirmed `broken` break on the live head goes back to the fixer (review:changes
   // through review-set-label, bounded by the round cap); a confirmed `degraded` one becomes a follow-up card. Same
   // containment as above: a crash is a status in `redTeamGate`, and it never accepts or clears anything.
-  if (out.redTeam && typeof io.runRedTeamGate === 'function') {
+  // A cap-deferred completion is contradictory evidence; keep it out of the gate even if
+  // diagnostics fail. A skipped cap attempt still runs the gate over existing findings.
+  if (out.redTeam && !redTeamCompletionDeferredByCap && typeof io.runRedTeamGate === 'function') {
     let gate;
     try { gate = io.runRedTeamGate({ pr: out.pr, repo: out.repo }); } catch (e) { gate = { status: 'error', reason: tail(e?.message ?? e, 300) }; }
     io.log(`review-job ${out.sessionSlug}: red-team gate — ${gate?.status ?? 'none'}${gate?.outcome ? ` → ${gate.outcome}` : ''}${gate?.reason ?? gate?.error ? ` (${gate.reason ?? gate.error})` : ''}`);
