@@ -78,6 +78,36 @@ describe('checkNumberingCommit', () => {
     o.changes.push({ status: 'M', path, before: "'xf74q20'", after: "'6053'" });
     refused(checkNumberingCommit(o), /backlog/);
   });
+  it('allows mapped id rewrites in top-level agent docs', () => {
+    const o = live();
+    const before = 'see (`#xf74q20`) and xf74q20';
+    o.changes.push({ status: 'M', path: 'docs/agent/platform-decisions.md', before, after: rewrite(before) });
+    expect(checkNumberingCommit(o).ok).toBe(true);
+  });
+  it('refuses a non-id word change alongside an agent doc id rewrite', () => {
+    const o = live();
+    const before = 'see (`#xf74q20`) and xf74q20';
+    o.changes.push({ status: 'M', path: 'docs/agent/platform-decisions.md',
+      before, after: rewrite(before).replace('see', 'read') });
+    refused(checkNumberingCommit(o), /id rewrite/);
+  });
+  it('refuses a mapped code rewrite alongside a valid agent doc rewrite', () => {
+    const o = live();
+    const before = 'see (`#xf74q20`) and xf74q20';
+    o.changes.push({ status: 'M', path: 'docs/agent/platform-decisions.md', before, after: rewrite(before) });
+    o.changes.push({ status: 'M', path: 'scripts/app.mjs', before: "'xf74q20'", after: "'6053'" });
+    refused(checkNumberingCommit(o), /outside backlog/);
+  });
+  it.each([
+    { status: 'A', path: 'docs/agent/platform-decisions.md', after: 'see (`#6053`) and 6053' },
+    { status: 'D', path: 'docs/agent/platform-decisions.md', before: 'see (`#xf74q20`) and xf74q20' },
+    { status: 'M', path: 'docs/agent/sub/x.md', before: '#xf74q20', after: '#6053' },
+    { status: 'M', path: 'docs/other/x.md', before: '#xf74q20', after: '#6053' },
+  ])('refuses agent doc scope violations: $status $path', (change) => {
+    const o = live();
+    o.changes.push(change);
+    refused(checkNumberingCommit(o), /outside backlog/);
+  });
   it('allows main aliases inside renamed cards', () => {
     const o = live();
     o.extraMap = new Map([['xabc123', '7001']]);
