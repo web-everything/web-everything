@@ -134,6 +134,102 @@ describe('push-before-gate: the early push', () => {
     await pass(h);
     expect(h.calls.resume).toHaveLength(1);
   });
+  it.each(['pending', 'must-fix'].flatMap(state => ['wait', 'rerequest'].map(action => [state, action])))
+  ('holds a no-op %s review on the %s path until it returns clean', async (state, action) => {
+    const h = harness();
+    if (action === 'rerequest') h.state.marker = null;
+    let review = { ...rec(), state, startedAt: new Date(T0).toISOString(), returnedAt: new Date(T0 + 5_000).toISOString() };
+    h.io.readSelfReview = () => review;
+    h.io.push = (a) => { h.calls.push.push(a); return { ok: true, upToDate: true }; };
+    const held = await pass(h);
+    expect(h.calls.resume).toEqual([]);
+    expect(h.store.has(SESSION)).toBe(true);
+    expect(held.rows).toContainEqual(expect.objectContaining({ action: 'self-review-hold' }));
+    await pass(h, { nowMs: T0 + 60_000 });
+    expect(h.calls.resume).toEqual([]);
+    expect(h.calls.push).toHaveLength(1);
+    review = { ...review, state: 'clean', returnedAt: new Date(T0 + 70_000).toISOString() };
+    await pass(h, { nowMs: T0 + 80_000 });
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('## Fix evidence');
+    expect(h.calls.resume[0].prompt).toContain('fix-end');
+    expect(h.store.has(SESSION)).toBe(false);
+    expect(h.calls.rerequest).toEqual([]);
+  });
+  it.each(['pending', 'must-fix', 'invalid-time'])('recovers an overdue no-op %s review without authorizing hand-back', async (state) => {
+    const h = harness();
+    h.io.readSelfReview = () => ({ ...rec(), state: state === 'invalid-time' ? 'pending' : state,
+      startedAt: state === 'invalid-time' ? 'invalid' : new Date(T0).toISOString(), returnedAt: new Date(T0).toISOString() });
+    h.io.push = () => ({ ok: true, upToDate: true });
+    await pass(h, { nowMs: T0 + AWAIT_VERIFY_LIMITS.selfReviewMaxMs + 1 });
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('Do not hand back yet');
+    expect(h.calls.resume[0].prompt).toContain('self-review clean|must-fix');
+    expect(h.calls.resume[0].prompt).not.toContain('Verify is GREEN');
+    expect(h.calls.resume[0].prompt).not.toContain('Then follow your fix brief');
+    expect(h.store.has(SESSION)).toBe(false);
+  });
+  it('rechecks the self-review before delivering a saved no-op resume', async () => {
+    const h = harness({ records: [rec({ pendingResume: { kind: 'no-new-commit' } })] });
+    h.io.readSelfReview = () => ({ ...rec(), state: 'pending', startedAt: new Date(T0).toISOString() });
+    await pass(h);
+    expect(h.calls.resume).toEqual([]);
+    expect(h.store.has(SESSION)).toBe(true);
+  });
+  it('fails closed when the no-op self-review cannot be read', async () => {
+    const h = harness();
+    h.io.readSelfReview = () => { throw new Error('unreadable review'); };
+    h.io.push = () => ({ ok: true, upToDate: true });
+    const { rows } = await pass(h);
+    expect(h.calls.resume).toEqual([]);
+    expect(h.store.has(SESSION)).toBe(true);
+    expect(rows).toContainEqual(expect.objectContaining({ result: 'error: unreadable review' }));
+  });
+  it.each(['clean', 'repaired', 'foreign-owner'])('allows a no-op completion for a %s review', async (state) => {
+    const h = harness();
+    h.io.readSelfReview = () => ({ ...rec(), state: state === 'foreign-owner' ? 'pending' : state,
+      sessionId: state === 'foreign-owner' ? 'other-session' : SESSION, startedAt: new Date(T0).toISOString() });
+    h.io.push = () => ({ ok: true, upToDate: true });
+    await pass(h);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('## Fix evidence');
+    expect(h.store.has(SESSION)).toBe(false);
+  });
+  it.each(['red', 'lane-moved'])('still observes %s after a no-op self-review hold', async (change) => {
+    const h = harness();
+    h.io.readSelfReview = () => ({ ...rec(), state: 'pending', startedAt: new Date(T0).toISOString() });
+    h.io.push = () => ({ ok: true, upToDate: true });
+    await pass(h);
+    expect(h.calls.resume).toEqual([]);
+    expect(h.store.get(SESSION).pendingResume).toBeUndefined();
+    if (change === 'red') h.state.marker = marker('red');
+    else h.state.lane.head = SHA2;
+    const { rows } = await pass(h, { nowMs: T0 + 60_000 });
+    expect(h.calls.resume).toHaveLength(1);
+    expect(rows).toContainEqual(expect.objectContaining({ reason: change, result: `resumed:${change === 'red' ? 'red' : 'void'}` }));
+    expect(h.calls.resume[0].prompt).not.toContain('## Fix evidence');
+  });
+  it('persists overdue recovery across a busy session and a failed recovery write', async () => {
+    const h = harness({ records: [rec({ pendingResume: { kind: 'no-new-commit' } })] });
+    h.io.readSelfReview = () => ({ ...rec(), state: 'pending', startedAt: new Date(T0).toISOString() });
+    const write = h.io.writeRecord;
+    h.io.writeRecord = r => r.pendingResume?.selfReviewOverdue ? { ok: false } : write(r);
+    const nowMs = T0 + AWAIT_VERIFY_LIMITS.selfReviewMaxMs + 1;
+    await pass(h, { nowMs });
+    expect(h.calls.resume).toEqual([]);
+    expect(h.store.get(SESSION).pendingResume.selfReviewOverdue).toBeUndefined();
+    h.io.writeRecord = write;
+    const sessions = h.io.listSessions;
+    h.io.listSessions = () => [{ ...sessions()[0], state: 'running' }];
+    await pass(h, { nowMs });
+    expect(h.calls.resume).toEqual([]);
+    expect(h.store.get(SESSION).pendingResume.selfReviewOverdue).toContain('pending');
+    h.io.listSessions = sessions;
+    await pass(h, { nowMs: nowMs + 1_000 });
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toContain('Do not hand back yet');
+    expect(h.store.has(SESSION)).toBe(false);
+  });
   it('keeps waiting when a landed push loses its success persist and the next tick reports upToDate', async () => {
     const h = harness();
     const writeRecord = h.io.writeRecord;

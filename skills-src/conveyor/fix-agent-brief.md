@@ -474,7 +474,7 @@ exit below. `infrastructure-failure` or no verdict → the harness re-requests o
 the message tells you to report the stalled request with the blocked-on-infra exit (the signal/ceiling evidence,
 without claiming a test failure). A moved or dirty lane → re-commit, `request`, `mark` again.
 
-- `no-new-commit` → the remote branch already had this exact sha when the harness tried to push it (`upToDate`). Do not re-mark: post step 6's durable `## Fix evidence` comment, then finish the hand-back, completion report and fix-end.
+- `no-new-commit` → the remote branch already had this exact sha when the harness tried to push it (`upToDate`). The harness still enforces the parallel self-review hold. If the resume says the review is overdue, finish and record that review before hand-back (must-fix → repair with a NEW commit and re-mark as instructed). Otherwise do not re-mark: post step 6's durable `## Fix evidence` comment, then finish the hand-back, completion report and fix-end.
 
 Other statuses follow [we:skills-src/conveyor/delivery-agent-brief.md](delivery-agent-brief.md).
 
