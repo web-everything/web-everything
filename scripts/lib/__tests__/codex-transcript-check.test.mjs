@@ -112,6 +112,19 @@ describe('checkTranscriptText fixture rollouts', () => {
   it.each(['env curl x', 'sudo curl x', 'command curl x', 'exec curl x', 'KEY=value curl x', 'rg curl file; curl x'])('honours network wrappers and per-segment suppression: %s', command => {
     expect(check(command).flags.map(flag => flag.kind)).toContain('network');
   });
+  it.each([
+    'curl https://x/rg', 'curl https://x/grep', 'curl x rg', 'gh api /grep',
+    'git fetch origin rg', 'env KEY=value sudo command curl https://x/rg',
+    'rg curl file; curl https://x/grep', 'grep curl file | curl https://x/rg',
+  ])('does not suppress network commands with search words in arguments: %s', command => {
+    expect(check(command).flags.map(flag => flag.kind)).toContain('network');
+  });
+  it.each([
+    'rg curl file', 'grep gh file', 'env KEY=value sudo command rg do curl file',
+    'KEY=value exec grep do curl file',
+  ])('suppresses search commands only at the command word after wrappers: %s', command => {
+    expect(check(command).flags).toEqual([]);
+  });
   it('does not treat npx as an allowed network wrapper', () => {
     expect(check('npx curl x').flags).toEqual([]);
   });
@@ -248,6 +261,25 @@ describe('checkTranscriptText fixture rollouts', () => {
     const input = '\u001b[31m'.repeat(40001) + 'echo clean';
     const custom = JSON.stringify({ payload: { type: 'custom_tool_call', name: 'exec', input } });
     expect(checkTranscriptText(custom).flags).toEqual([{ kind: 'truncated', length: input.length }]);
+  });
+  it.each(['{}', '{}\n{}', '{"type":"message"}', '{"type":"future_record","payload":{"type":"future_event","text":"private-value"}}'])('flags wholly unrecognized evidence: %s', transcript => {
+    expect(checkTranscriptText(transcript).flags).toEqual([{ kind: 'unrecognized', length: transcript.length }]);
+  });
+  it.each(['warn', 'fail'])('returns %s and logs no content for wholly unrecognized evidence', mode => {
+    const transcript = '{"private":"private-value"}';
+    const appendLog = vi.fn();
+    const result = runTranscriptCheck({ rolloutFile: 'fixture', policy: { mode }, readFile: () => transcript, appendLog });
+    expect(result.verdict).toBe(mode);
+    expect(result.flags).toEqual([{ kind: 'unrecognized', length: transcript.length }]);
+    expect(appendLog.mock.calls[0][1]).not.toContain('private-value');
+  });
+  it.each([
+    call('true'), tokens(0),
+    JSON.stringify({ payload: { type: 'message', content: [] } }),
+    JSON.stringify({ payload: { type: 'function_call_output', output: 'ok' } }),
+    JSON.stringify({ type: 'turn_context', payload: { cwd: 'repo' } }),
+  ])('accepts recognized evidence alongside unknown records: %s', record => {
+    expect(checkTranscriptText(fixture('{}', record)).flags).toEqual([]);
   });
   it('refuses empty or malformed evidence instead of reporting clean', () => {
     expect(() => checkTranscriptText('')).toThrow('Empty');

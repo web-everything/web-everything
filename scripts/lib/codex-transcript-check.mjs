@@ -109,7 +109,7 @@ function hasRiskyLoop(command) {
 
 export function checkTranscriptText(jsonlText, { tokenCap = 3000000 } = {}) {
   const flags = [], seen = new Set();
-  let totalTokens = 0;
+  let totalTokens = 0, recognized = false;
   const flag = (kind, excerpt) => {
     // Raw evidence stays local to inspection and deduplication. Only numeric lengths
     // cross the return/log boundary; arbitrary argument forms cannot leak through redaction.
@@ -121,11 +121,15 @@ export function checkTranscriptText(jsonlText, { tokenCap = 3000000 } = {}) {
   for (const line of lines) {
     const record = summarizeRecord(line, INSPECTION_CAP);
     if (record.kind === 'unparseable') throw new Error('Malformed rollout JSONL');
+    const raw = JSON.parse(line);
+    if (['function_call', 'custom_tool_call', 'function_call_output', 'custom_tool_call_output',
+      'message', 'reasoning', 'task_started', 'task_complete', 'token_count'].includes(raw?.payload?.type)
+      || raw?.type === 'turn_context') recognized = true;
     if (record.kind === 'tokens' && Number.isFinite(record.totalTokens)) totalTokens = Math.max(totalTokens, record.totalTokens);
     if (record.kind !== 'tool_call') continue;
     // Check the raw field before the summarizer's printable sanitization. Incomplete
     // tool input cannot prove a clean run: fail mode rejects it.
-    const payload = JSON.parse(line).payload;
+    const payload = raw.payload;
     const input = payload.input ?? payload.arguments ?? '';
     const rawInput = typeof input === 'string' ? input : JSON.stringify(input);
     if (rawInput.length > INSPECTION_CAP) {
@@ -141,13 +145,15 @@ export function checkTranscriptText(jsonlText, { tokenCap = 3000000 } = {}) {
         || /\bmktemp\b/.test(command) && !/TMPDIR|\/private\/tmp\/claude-|\bmktemp\b[^\n;&|]*\s-p(?:\s|$)/.test(command)
         || /(?:\*\*\* (?:Add|Update|Delete) File:|(?:path|file_path|target)["']?\s*[:=])\s*["']?\/tmp\//.test(command)) flag('tmp-write', command);
       // Quoted search patterns are data. Restrict network detection to command words, with wrappers
-      // env/sudo/command/exec and VAR=val allowed. Any rg/grep in that shell segment suppresses it.
+      // env/sudo/command/exec and VAR=val allowed. Suppress only search command words after wrappers.
       for (const segment of command.split(/[;\n|]|&&/)) {
         const words = segment.replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g, ' STRING ').trim();
-        if (!/\b(?:rg|grep)\b/.test(words) && /(?:^|\||\bdo\b)\s*(?:(?:env|sudo|command|exec)\s+|[A-Za-z_][\w]*=\S+\s+)*(?:(?:gh|curl)(?:\s|$)|git\s+(?:-C\s+\S+\s+)?(?:fetch|push)(?:\s|$))/.test(words)) flag('network', command);
+        if (/^\s*(?:(?:env|sudo|command|exec)\s+|[A-Za-z_][\w]*=\S+\s+)*(?:rg|grep)(?:\s|$)/.test(words)) continue;
+        if (/(?:^|\||\bdo\b)\s*(?:(?:env|sudo|command|exec)\s+|[A-Za-z_][\w]*=\S+\s+)*(?:(?:gh|curl)(?:\s|$)|git\s+(?:-C\s+\S+\s+)?(?:fetch|push)(?:\s|$))/.test(words)) flag('network', command);
       }
     }
   }
+  if (!recognized) flag('unrecognized', String(jsonlText));
   if (totalTokens > tokenCap) flag('token-cap', `${totalTokens} tokens exceeds cap ${tokenCap}`);
   return { flags, totalTokens };
 }

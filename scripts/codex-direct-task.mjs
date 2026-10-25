@@ -345,11 +345,11 @@ export function parseJsonlEvents(stdout) {
 }
 
 /**
- * A short, human-readable digest of an agentic run's event stream — counts by type, shell command lengths,
- * the literal files touched, the terminal status, and the thread id (for a manual `codex exec resume`).
+ * A short, human-readable digest of an agentic run's event stream — counts by type, the literal shell commands
+ * run, the literal files touched, the terminal status, and the thread id (for a manual `codex exec resume`).
  * PURE.
  * @param {object[]} events - parsed JSONL events, in order (see `parseJsonlEvents`).
- * @returns {{threadId: string|null, turns: number, commands: {length: number}[], filesChanged: {path: string, kind:
+ * @returns {{threadId: string|null, turns: number, commands: string[], filesChanged: {path: string, kind:
  *   string}[], agentMessages: string[], terminal: string|null, usage: object}}
  */
 export function summarizeEvents(events) {
@@ -357,7 +357,7 @@ export function summarizeEvents(events) {
   const turns = events.filter((e) => e?.type === 'turn.started').length;
   const commands = events
     .filter((e) => e?.type === 'item.completed' && e.item?.type === 'command_execution')
-    .map((e) => ({ length: String(e.item.command ?? '').length }));
+    .map((e) => e.item.command);
   const filesChanged = events
     .filter((e) => e?.type === 'item.completed' && e.item?.type === 'file_change')
     .flatMap((e) => (Array.isArray(e.item.changes) ? e.item.changes : []))

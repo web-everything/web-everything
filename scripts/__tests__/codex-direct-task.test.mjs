@@ -345,19 +345,11 @@ describe('summarizeEvents — the real agentic-mode event shape observed in a li
     const s = summarizeEvents(REAL_EVENTS);
     expect(s.threadId).toBe('01a08aed-f2ec-7ad0-b4e2-7a7ab89abb98');
     expect(s.turns).toBe(1);
-    expect(s.commands).toEqual([{ length: "/bin/bash -lc 'pwd; rg --files'".length }, { length: "/bin/bash -lc 'cat notes.txt'".length }]);
+    expect(s.commands).toEqual(["/bin/bash -lc 'pwd; rg --files'", "/bin/bash -lc 'cat notes.txt'"]);
     expect(s.filesChanged).toEqual([{ path: '/scratch/notes.txt', kind: 'update' }]);
     expect(s.agentMessages).toEqual(['I will read notes.txt…', 'Added a purpose comment. No other edits.']);
     expect(s.terminal).toBe('turn.completed');
     expect(s.usage.input_tokens).toBe(62159);
-  });
-
-  it('returns only command lengths for arbitrary arguments in completed command events', () => {
-    const command = 'curl https://private.test --field arbitrary=private-argument';
-    const result = summarizeEvents([{ type: 'item.completed', item: { type: 'command_execution', command } }]);
-    expect(result.commands).toEqual([{ length: command.length }]);
-    expect(JSON.stringify(result)).not.toContain('private-argument');
-    expect(JSON.stringify(result)).not.toContain('https://private.test');
   });
 
   it('reads the LAST terminal event, never the first, over a multi-turn stream', () => {
