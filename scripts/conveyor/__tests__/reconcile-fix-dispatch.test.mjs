@@ -673,12 +673,12 @@ describe('dispatchFix — permission preparation never blocks a dispatch (PR #39
   });
 });
 
-describe('dispatchFix — the DEFAULT conflict-helper grant really lands on disk (PR #3990 review round 6)', () => {
+describe('dispatchFix — the DEFAULT repair-helper grants really land on disk', () => {
   // Every other dispatchFix test injects a mock `grantConflictHelper`, so dropping the default grant — or letting
   // the later default `isolateSession` write clobber it — would leave them all green while every fixer hit the
   // permission wall. This one runs the real defaults against a real tmpdir and reads the file back.
-  const dispatchIntoTmp = async (seed) => {
-    const { mkdtempSync, mkdirSync, writeFileSync } = await import('node:fs');
+  const dispatchIntoTmp = async (seed, wrapFix = false) => {
+    const { mkdtempSync, mkdirSync, readFileSync, writeFileSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
     const scratch = mkdtempSync(join(tmpdir(), 'fix-helper-grant-'));
@@ -686,6 +686,11 @@ describe('dispatchFix — the DEFAULT conflict-helper grant really lands on disk
     const cwd = join(scratch, sessionId);
     if (seed) { mkdirSync(join(cwd, '.claude'), { recursive: true }); writeFileSync(join(cwd, '.claude', 'settings.local.json'), seed); }
     const calls = [];
+    const captureLaunch = (argv, opts) => {
+      const settings = JSON.parse(readFileSync(join(cwd, '.claude', 'settings.local.json'), 'utf8'));
+      calls.push({ argv, opts, settings });
+      return '';
+    };
     dispatchFix(
       { itemNum: '3438', pr: 1764, laneRef: 'lane/3438-wire-reconcile-pass', scope: ['we:scripts/conveyor/reconcile-fix-dispatch.mjs'], lane: 9 },
       {
@@ -696,38 +701,46 @@ describe('dispatchFix — the DEFAULT conflict-helper grant really lands on disk
         // The default would grant trust in the operator's real `~/.claude.json`; only the mkdir is wanted here.
         ensureSessionCwd: (d) => { mkdirSync(d, { recursive: true }); return d; },
         resolveSettingsEnv: () => null,
-        spawnAgent: (argv, opts) => { calls.push({ argv, opts }); return ''; },
+        wrapFix,
+        spawnAgent: captureLaunch,
+        launchWrapped: ({ bgArgv, cwd }) => { captureLaunch(bgArgv, { cwd }); return { handle: 'pid:123' }; },
         // `grantConflictHelper` and `isolateSession` are deliberately NOT injected: the real defaults run.
       },
     );
     return { scratch, cwd, calls };
   };
 
-  it('leaves the helper allow rules in <sessionCwd>/.claude/settings.local.json after the isolation write, next to bgIsolation', async () => {
+  it.each([false, true])('grants both helpers before launch and preserves them through isolation (wrapped=%s)', async (wrapFix) => {
     const { rmSync, readFileSync } = await import('node:fs');
     const { join } = await import('node:path');
-    const { scratch, cwd, calls } = await dispatchIntoTmp();
+    const { scratch, cwd, calls } = await dispatchIntoTmp(undefined, wrapFix);
     try {
       const settings = JSON.parse(readFileSync(join(cwd, '.claude', 'settings.local.json'), 'utf8'));
       expect(settings.permissions.allow).toEqual(expect.arrayContaining([
         'Bash(node /repo/scripts/conveyor/resolve-conflict.mjs:*)',
         'Bash(node "/repo/scripts/conveyor/resolve-conflict.mjs":*)',
+        'Bash(node /repo/scripts/conveyor/rearm-review.mjs:*)',
+        'Bash(node "/repo/scripts/conveyor/rearm-review.mjs":*)',
       ]));
       expect(settings.worktree).toEqual({ bgIsolation: 'none' });
       expect(calls).toHaveLength(1);
       expect(calls[0].opts.cwd).toBe(cwd);
+      expect(calls[0].settings).toEqual(settings);
+      expect(settings.permissions.allow).not.toContain('Bash(node:*)');
+      expect(settings.permissions.allow).not.toContain('Bash(*)');
     } finally { rmSync(scratch, { recursive: true, force: true }); }
   });
 
   it('keeps rules and env already in the file, adding the helper rules exactly once', async () => {
     const { rmSync, readFileSync } = await import('node:fs');
     const { join } = await import('node:path');
-    const seed = JSON.stringify({ permissions: { allow: ['Bash(echo ok:*)'] }, env: { KEEP: '1' } });
+    const seed = JSON.stringify({ permissions: { allow: ['Bash(echo ok:*)', 'Bash(node /repo/scripts/conveyor/rearm-review.mjs:*)'] }, env: { KEEP: '1' } });
     const { scratch, cwd } = await dispatchIntoTmp(seed);
     try {
       const settings = JSON.parse(readFileSync(join(cwd, '.claude', 'settings.local.json'), 'utf8'));
       expect(settings.permissions.allow).toContain('Bash(echo ok:*)');
       expect(settings.permissions.allow.filter((r) => r.includes('resolve-conflict.mjs'))).toHaveLength(2);
+      expect(settings.permissions.allow.filter((r) => r.includes('rearm-review.mjs'))).toHaveLength(2);
       expect(settings.env).toEqual({ KEEP: '1' });
     } finally { rmSync(scratch, { recursive: true, force: true }); }
   });

@@ -71,7 +71,7 @@ import { repeatedFindingPlan, resolveFixSafety } from './repeated-finding-reset.
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { readDeclaredSettings } from '../lib/settings-files.mjs';
 import { advisorForLaunch, advisorLedgerRow, advisorLogLine, recordAdvisorRun } from '../lib/advisor-trial.mjs';
-import { conflictHelperAllowRules } from '../lib/conflict-helper-allow.mjs';
+import { conflictHelperAllowRules, rearmReviewAllowRules } from '../lib/conflict-helper-allow.mjs';
 import { ensureSettingsFilePermissions } from '../lib/gh-app-shim.mjs';
 
 import { renderOperatorSendBackBrief } from '../lib/operator-send-backs.mjs';
@@ -1432,7 +1432,10 @@ export function dispatchFix(planned, {
   // never `root` itself) and making that directory real. See `dispatchSessionCwd`'s own header at the io shell.
   sessionCwdFor = (sessionId) => dispatchSessionCwd(sessionId, { root }),
   ensureSessionCwd = ensureDispatchSessionCwd,
-  grantConflictHelper = (cwd) => ensureSettingsFilePermissions({ cwd, allow: conflictHelperAllowRules(root) }),
+  // This fresh-fix path launches directly, bypassing dispatchLaneGrant's repair-helper grants.
+  grantConflictHelper = (cwd) => ensureSettingsFilePermissions({
+    cwd, allow: [...conflictHelperAllowRules(root), ...rearmReviewAllowRules(root)],
+  }),
   // build-path-codex-isolation — the shared bg-isolation helper (writes `<sessionCwd>/.claude/settings.local.json`
   // and returns the `--settings` worktree patch). Before this, only dispatch-lane's sink applied it, so this
   // path's sessions hit Claude Code's "Call EnterWorktree first" guard on their first Edit.
