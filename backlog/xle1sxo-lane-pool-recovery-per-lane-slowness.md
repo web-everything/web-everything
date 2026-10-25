@@ -12,9 +12,15 @@ Recovery (PR 5855) runs a reclaim dry-run subprocess, a bounded fetch and a salv
 
 ## Acceptance
 
-- [A1] **Executable** — Add the named test `recovers a 90-lane pool within the transport budget` to `scripts/lib/__tests__/lane-pool-recover.test.mjs`. Run `npm run test:unit -- scripts/lib/__tests__/lane-pool-recover.test.mjs scripts/__tests__/lane-pool-recover-race.test.mjs`. With injected 100 ms asynchronous transport latency per lane, recover all 90 eligible lanes in at most 6 seconds, with at most four in-flight lanes; the current serial implementation exceeds that bound. This is a planned performance test, not evidence that the optimization has shipped.
+- [A1] **Executable** — Add the named test `recovers a 90-lane pool within the transport budget` to `we:scripts/lib/__tests__/lane-pool-recover.test.mjs` and run the recovery test command below. With injected 100 ms asynchronous transport latency per lane, recover all 90 eligible lanes in at most 6 seconds, with at most four in-flight lanes; the current serial implementation exceeds that bound. This is a planned performance test, not evidence that the optimization has shipped.
 - [A2] **Must refuse** — `failed preservation never schedules a reset` must cover fetch, salvage verification, backup and liveness failures, including docs, config, data, stashes and untracked backlog cards.
 - [A3] **Must isolate** — `parallel recovery rechecks leases before reset` must prove a lease acquired during recovery is kept and another lane's backup or remote proof cannot authorize its reset.
+
+Run the recovery tests from the WE checkout:
+
+```bash
+npm run test:unit -- scripts/lib/__tests__/lane-pool-recover.test.mjs scripts/__tests__/lane-pool-recover-race.test.mjs
+```
 
 ## Non-goals
 
@@ -40,7 +46,7 @@ Recovery (PR 5855) runs a reclaim dry-run subprocess, a bounded fetch and a salv
 
 These tests are requirements for the future performance change, not implemented by the preservation PR.
 
-- R1 → `recovers a 90-lane pool within the transport budget` and `deadline stops new work and accounts for in-flight lanes` in `scripts/lib/__tests__/lane-pool-recover.test.mjs` (A1).
-- R2 → `failed preservation never schedules a reset` and `parallel recovery rechecks leases before reset` in `scripts/__tests__/lane-pool-recover-race.test.mjs` (A2/A3).
-- R3 → `parallel recovery retains transport hardening` in `scripts/__tests__/lane-pool-recover-race.test.mjs` (A2/A3).
+- R1 → `recovers a 90-lane pool within the transport budget` and `deadline stops new work and accounts for in-flight lanes` in `we:scripts/lib/__tests__/lane-pool-recover.test.mjs` (A1).
+- R2 → `failed preservation never schedules a reset` and `parallel recovery rechecks leases before reset` in `we:scripts/__tests__/lane-pool-recover-race.test.mjs` (A2/A3).
+- R3 → `parallel recovery retains transport hardening` in `we:scripts/__tests__/lane-pool-recover-race.test.mjs` (A2/A3).
 - Capture a before/after 90-lane local-origin CLI benchmark, reporting eligible/reclaimed/kept/skipped counts and total duration. No HTTP endpoint is added; body size, CSRF and request rate limits do not apply. Existing host admission still applies.
