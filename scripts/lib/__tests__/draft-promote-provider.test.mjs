@@ -1,5 +1,8 @@
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import { buildReadyArgs, createDraftPromoteProvider } from '../draft-promote-provider.mjs';
+import { runGhSync } from '../gh-throttle.mjs';
+
+vi.mock('../gh-throttle.mjs', () => ({ runGhSync: vi.fn() }));
 
 describe('draft-promote-provider (draft-first PRs)', () => {
   it('buildReadyArgs is exactly `gh pr ready <pr>`, pr coerced to a string', () => {
@@ -12,6 +15,50 @@ describe('draft-promote-provider (draft-first PRs)', () => {
     const provider = createDraftPromoteProvider({ cwd: '/repo', exec: (args) => { seen.push(args); return 'ok'; } });
     expect(provider.ready(42)).toBe('ok');
     expect(seen).toEqual([['pr', 'ready', '42']]);
+  });
+
+  describe('exec role isolation', () => {
+    afterEach(() => {
+      vi.unstubAllEnvs();
+      vi.mocked(runGhSync).mockReset();
+    });
+
+    it('the default exec explicitly passes reviewer in a copied env when the process role is observer', () => {
+      vi.stubEnv('WE_GITHUB_APP_ROLE', 'observer');
+      const originalEnv = process.env;
+      const before = { ...process.env };
+      vi.mocked(runGhSync).mockReturnValue('ready\n');
+      const provider = createDraftPromoteProvider({ cwd: '/repo', repo: 'example/project' });
+
+      expect(provider.ready(42)).toBe('ready');
+      expect(runGhSync).toHaveBeenCalledTimes(1);
+      const [args, opts] = vi.mocked(runGhSync).mock.calls[0];
+      expect(args).toEqual(['pr', 'ready', '42', '--repo', 'example/project']);
+      expect(process.env).toBe(originalEnv);
+      expect(process.env).toEqual(before);
+      expect(opts.env?.WE_GITHUB_APP_ROLE).toBe('reviewer');
+      expect(opts.env).not.toBe(process.env);
+      expect(opts.env).toEqual({ ...before, WE_GITHUB_APP_ROLE: 'reviewer' });
+    });
+
+    it('leaves a custom injected exec and its observer process env unaffected', () => {
+      vi.stubEnv('WE_GITHUB_APP_ROLE', 'observer');
+      const originalEnv = process.env;
+      const before = { ...process.env };
+      const exec = vi.fn(() => {
+        expect(process.env).toBe(originalEnv);
+        expect(process.env).toEqual(before);
+        return 'custom output\n';
+      });
+      const provider = createDraftPromoteProvider({ cwd: '/repo', repo: 'example/project', exec });
+
+      expect(provider.ready(42)).toBe('custom output\n');
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(exec).toHaveBeenCalledWith(['pr', 'ready', '42', '--repo', 'example/project']);
+      expect(runGhSync).not.toHaveBeenCalled();
+      expect(process.env).toBe(originalEnv);
+      expect(process.env).toEqual(before);
+    });
   });
 
 
