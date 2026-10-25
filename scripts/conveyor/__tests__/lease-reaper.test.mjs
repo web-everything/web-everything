@@ -720,7 +720,6 @@ describe('buildLeaseSignalsFor + reapPlan — borrowed Codex fixer absent from c
     ['dead runner', 0, 2147483647, 'node fix-run.mjs --session=fix-5806'],
     ['reused PID', 0, process.pid, 'node unrelated.mjs'],
     ['session prefix collision', 0, process.pid, 'node fix-run.mjs --session=fix-58061'],
-    ['unknown command', 0, process.pid, null],
   ])('retained terminal rows still reap with an invalid claim: %s', (_label, offset, runnerPid, command) => {
     const claims = claimsWith(runnerPid).map((claim) => ({
       ...claim, heartbeatAt: offset === null ? undefined : new Date(NOW + offset).toISOString(),
@@ -784,9 +783,6 @@ describe('buildLeaseSignalsFor + reapPlan — borrowed Codex fixer absent from c
     ['unrelated live process', 'node unrelated.mjs'],
     ['session prefix collision', 'node fix-run.mjs --session=fix-58061'],
     ['embedded session token', 'node fix-run.mjs --other=--session=fix-5806'],
-    ['unknown command', null],
-    ['missing command', undefined],
-    ['empty command', ''],
   ])('reaps a claim with an %s as session-gone', (_name, command) => {
     const signalsFor = signalsWith(claimRunnerPidsBySession(claimsWith(process.pid), { nowMs: NOW }), {
       pidCommand: () => command,
@@ -797,14 +793,24 @@ describe('buildLeaseSignalsFor + reapPlan — borrowed Codex fixer absent from c
     expect(keep).toEqual([]);
   });
 
-  it('fails closed when reading the live claim runner command throws', () => {
+  it.each([null, undefined, '', '  \n'])('unreadable claim runner command %j keeps the fresh claim lane', command => {
+    const signalsFor = signalsWith(claimRunnerPidsBySession(claimsWith(process.pid), { nowMs: NOW }), {
+      pidCommand: () => command,
+    });
+    expect(signalsFor(cand).sessionGone).toBe(false);
+    const { reap, keep } = reapPlan([cand], { nowMs: NOW, ttlMs: TTL_MS, signalsFor });
+    expect(reap).toEqual([]);
+    expect(keep).toHaveLength(1);
+  });
+
+  it('keeps the fresh claim lane when reading the live claim runner command throws', () => {
     const signalsFor = signalsWith(claimRunnerPidsBySession(claimsWith(process.pid), { nowMs: NOW }), {
       pidCommand: () => { throw new Error('ps unavailable'); },
     });
-    expect(signalsFor(cand).sessionGone).toBe(true);
+    expect(signalsFor(cand).sessionGone).toBe(false);
     const { reap, keep } = reapPlan([cand], { nowMs: NOW, ttlMs: TTL_MS, signalsFor });
-    expect(reap.map((r) => r.reason)).toEqual(['session-gone']);
-    expect(keep).toEqual([]);
+    expect(reap).toEqual([]);
+    expect(keep).toHaveLength(1);
   });
 
   it('dead claim runner pid lets the unlisted fixer be reaped as session-gone', () => {

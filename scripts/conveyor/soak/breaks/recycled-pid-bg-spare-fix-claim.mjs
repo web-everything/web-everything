@@ -3,10 +3,11 @@
  * into `claude bg-spare --bg-spare <sock>`. PID existence kept the stale fix
  * session/claim live forever. PR #5880 makes reconcile check process identity.
  *
- * Four fix-dispatch ticks exercise the real daemon against a working fix-<P>
- * row with a REAL live bg-spare PID. The row is recent, so age-based reaping
- * cannot rescue the pre-fix case. Only a NEW fix session counts as dispatch.
- * No scripted agent behaviors run: the stale row cannot push, crash or finish.
+ * A working fix-<P> row first keeps its REAL claimed bg-spare process and claim
+ * across two ticks: spare argv alone cannot justify dispatching a second fixer.
+ * Then the process exits and two further ticks must recover using confirmed death.
+ * The session row never reports completion. Stamped PID reuse is covered by the
+ * identity unit fixtures; an unstamped working spare is ambiguous until TTL/death.
  * The simulator host omits main()'s claim-refresh wrapper, so each tick explicitly
  * runs that real wrapper first. Guards require ps, listing/probe/claim evidence
  * and an observed dispatch decision. The bounded failure names the stuck PR/session for operator investigation.
@@ -31,7 +32,7 @@ function inClone(w, source, args = []) {
 
 export default {
   id: 'recycled-pid-bg-spare-fix-claim',
-  title: 'a recycled bg-spare PID cannot hold a dead fixer session live forever',
+  title: 'a claimed spare keeps its fixer claim until positive process death permits recovery',
   card: 'PR #5880',
   fixedBy: {
     sha: 'fe6b5a138f', where: 'main',
@@ -69,17 +70,30 @@ export default {
       const say = log ?? (line => process.stdout.write(`${line}\n`));
       const play = [];
       for (let round = 0; round < ROUNDS; round += 1) {
-        play.push(w => {
+        play.push(async w => {
           const ctx = report.ctx;
-          process.kill(sleeper.pid, 0);
-          const argv = execFileSync('ps', ['-p', String(sleeper.pid), '-o', 'command='],
-            { encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
-          if (argv.trim() !== SPARE_ARGV) throw new Error('sleeper argv mismatch');
+          const live = round < 2;
+          if (round === 2) {
+            await new Promise((resolve, reject) => {
+              const timer = setTimeout(() => reject(new Error('claimed spare did not exit')), 5000);
+              sleeper.once('exit', () => { clearTimeout(timer); resolve(); });
+              if (!sleeper.kill('SIGKILL')) { clearTimeout(timer); reject(new Error('claimed spare kill failed')); }
+            });
+          }
+          let argv = null;
+          try {
+            argv = execFileSync('ps', ['-p', String(sleeper.pid), '-o', 'command='],
+              { encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+          } catch (error) {
+            if (live || error.status !== 1 || String(error.stderr ?? '').trim()) throw error;
+          }
+          if (live ? argv !== SPARE_ARGV : !!argv) throw new Error('spare process evidence disagrees with phase');
           ctx.psChecks += 1;
           const evidence = JSON.parse(inClone(w, `
             import { gateHost } from './scripts/lib/dispatch-throttle.mjs';
             import { enrichAgents, defaultReadAgents } from './scripts/conveyor/reconcile-pass.mjs';
             import { readLiveFixClaim } from './scripts/conveyor/fix-procedure.mjs';
+            import { buildLeaseSignalsFor } from './scripts/conveyor/lease-reaper.mjs';
             import { withFixDispatchClaimRefresh } from './skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
             const [id, pr] = process.argv.slice(1);
             const before = readLiveFixClaim({ repo: 'we', pr: Number(pr) });
@@ -89,7 +103,13 @@ export default {
               log: { error() {} },
             }).tickOnce();
             const after = readLiveFixClaim({ repo: 'we', pr: Number(pr) });
-            process.stdout.write(JSON.stringify({ row, before, after, hostGate: gateHost() }));
+            const nowMs = Date.now();
+            const unknownRunner = buildLeaseSignalsFor({
+              prStatesByRepo: new Map(), sessionStates: new Map(), sessionPidAlive: new Map(),
+              sessionAgents: [], wrapperPids: new Map(), claimRunnerPids: new Map([['fix-' + pr, row.pid]]),
+              nowMs, isPidAlive: () => null, pidCommand: () => { throw new Error('ps timeout fixture'); },
+            })({ lease: { session: 'fix-' + pr, acquiredAt: new Date(nowMs - 3600000).toISOString() }, repoKey: 'we' });
+            process.stdout.write(JSON.stringify({ row, before, after, unknownRunner, hostGate: gateHost() }));
           `, [ctx.staleId, String(ctx.pr)]));
           if (!evidence.hostGate?.admit || (process.platform === 'darwin'
               && (evidence.hostGate.cpuIdlePct !== 100 || evidence.hostGate.memFreePct !== 100))) {
@@ -99,7 +119,7 @@ export default {
           const row = evidence.row;
           if (row?.pid !== sleeper.pid || row?.sessionId !== ctx.sessionId || row?.state !== 'working' || row?.selfReportedDone || row?.hung
               || row?.authExpired || row?.idleFinished || typeof row?.pidAlive !== 'boolean') {
-            fail(`r${round}: stale listing row lost its live PID or was bypassed by another finished signal`);
+            fail(`r${round}: listing row lost its PID or was bypassed by another finished signal`);
           }
           if (round === 0 && (evidence.before?.meta?.kind !== 'fixing'
               || evidence.before?.meta?.who !== `fix-${ctx.pr}`
@@ -107,10 +127,18 @@ export default {
               || Object.hasOwn(evidence.before?.meta ?? {}, 'runnerPid'))) {
             fail('initial fixing claim must be session-bound without a runnerPid, as acquired in production');
           }
-          if (round > 0 && row?.pidAlive !== ctx.pidAlive) fail('PID verdict changed during scenario');
+          if (row?.pidAlive !== live) fail(`r${round}: PID verdict disagrees with confirmed process phase`);
           ctx.pidAlive = row?.pidAlive;
           ctx.claimReleased ||= !evidence.after;
-          if (evidence.after) fail(`r${round}: production refresh retained the dead fixer's session-bound fixing claim (pidAlive=${row?.pidAlive})`);
+          if (live) {
+            if (!evidence.after || evidence.after.meta.sessionId !== ctx.sessionId) fail(`r${round}: live claimed spare lost its claim`);
+            else ctx.healthyChecks += 1;
+          } else {
+            if (evidence.after) fail(`r${round}: production refresh retained a confirmed dead process's claim`);
+            else ctx.recoveryChecks += 1;
+          }
+          if (evidence.unknownRunner?.sessionGone !== false) fail(`r${round}: unreadable claim runner allowed lane reaping`);
+          else ctx.unknownLeaseChecks += 1;
           ctx.evidenceChecks += 1;
         });
         play.push('tick fix-dispatch');
@@ -126,6 +154,7 @@ export default {
           const decision = tick?.result?.reconcileRefusals?.some(r =>
             Number(r.pr ?? r.prNumber) === ctx.pr && ['live-process', 'fix-claimed'].includes(r.kind));
           ctx.dispatched ||= w.claude.sessions().some(s => s.id !== ctx.staleId && sessionMatches(s.name, 'fix', ctx.pr));
+          if (round < 2 && (ctx.dispatched || !decision)) fail(`r${round}: live claimed spare did not veto a duplicate fixer`);
           if (!ctx.dispatched && !decision) {
             const reasons = [...(tick?.result?.refusals ?? []), ...(tick?.result?.reconcileRefusals ?? [])]
               .filter(r => Number(r.pr ?? r.prNumber) === ctx.pr).map(r => r.kind).slice(0, 8);
@@ -179,7 +208,8 @@ export default {
               process.stdout.write(JSON.stringify(claim));
             `, [String(pr), sessionId]));
             if (!claim.ok) throw new Error('fixing claim was refused');
-            report.ctx = { pr, staleId: id, sessionId, psChecks: 0, evidenceChecks: 0, hostGateChecks: 0, claimReleased: false, dispatched: false, checked: 0 };
+            report.ctx = { pr, staleId: id, sessionId, psChecks: 0, evidenceChecks: 0, hostGateChecks: 0,
+              healthyChecks: 0, recoveryChecks: 0, unknownLeaseChecks: 0, claimReleased: false, dispatched: false, checked: 0 };
             return report.ctx;
           },
         }), { timeoutMs: 60_000, budgetMs: 240_000 });
@@ -194,10 +224,13 @@ export default {
         report.violations.push({ invariant: 'recycled-pid-live',
           detail: `PR #${ctx.pr} received no new fix after ${ROUNDS} ticks; investigate stale fix session ${ctx.staleId} holding the recycled bg-spare PID` });
       }
+      if (ctx?.healthyChecks !== 2 || ctx?.recoveryChecks !== 2 || ctx?.unknownLeaseChecks !== ROUNDS) {
+        fail(`incomplete safety phases: healthy=${ctx?.healthyChecks ?? 0}, recovery=${ctx?.recoveryChecks ?? 0}, unknownLease=${ctx?.unknownLeaseChecks ?? 0}`);
+      }
       say(`break verdict: ${report.violations.length ? JSON.stringify(report.violations) : 'GREEN'}`);
       return report;
     } finally {
-      if (sleeper && sleeper.exitCode === null) sleeper.kill('SIGKILL');
+      if (sleeper && sleeper.exitCode === null && sleeper.signalCode === null) sleeper.kill('SIGKILL');
     }
   },
   judge(report) {

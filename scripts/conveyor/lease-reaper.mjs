@@ -1071,11 +1071,12 @@ export function ownerSessionAliveForLease(lease, agents, dir) {
  *   listed in a terminal state — because those are positive evidence about the actual worker, while
  *   `ownerAlive` is a proxy (`workerSession`) that can legitimately outlive the one delivery agent a lease was
  *   minted for — see {@link ownerSessionAliveForLease}'s own "known, accepted trade-offs" note
- *   for what this narrowing does and does not close. `claimRunnerAlive` requires a live claim-derived PID
- *   whose command contains the exact session token (`null` when no claim pid). This identifies the current
+ *   for what this narrowing does and does not close. `claimRunnerAlive` retains a fresh claim-derived PID
+ *   unless death or a readable command with no exact session token disproves it (`null` when no claim pid).
+ *   Unreadable process/command evidence keeps the veto until claim or lease expiry. This identifies the current
  *   borrowed runner even when a previous Claude round remains listed under the same deterministic name,
  *   with a terminal state or dead PID. Like live run-store wrapper evidence, it takes precedence over that
- *   name-keyed listing evidence. Without a validated live runner, the ordinary death checks still apply.
+ *   name-keyed listing evidence. Without a retained claim runner, the ordinary death checks still apply.
  * @returns {boolean|null}
  */
 export function sessionGoneForLease(lease, sessionStates, { nowMs, graceMs = DISPATCH_GUARD_LISTING_GRACE_MINUTES * 60_000, pidAlive = null, wrapperAlive = null, ownerAlive = null, claimRunnerAlive = null } = {}) {
@@ -1472,14 +1473,17 @@ export function buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPid
     const wrapperPid = c.lease?.session ? wrapperPids.get(c.lease.session) : undefined;
     // Only explicit death lifts the wrapper veto; unreadable identity must keep the lane.
     const wrapperAlive = wrapperPid === undefined ? null : isPidAlive(wrapperPid) !== false;
-    // Bind a live claim PID to this session so PID reuse cannot preserve a dead fixer's lane.
+    // Only positive death or readable command mismatch lifts a fresh claim runner's veto.
     const claimRunnerPid = c.lease?.session ? claimRunnerPids.get(c.lease.session) : undefined;
     let claimRunnerAlive = claimRunnerPid === undefined ? null : false;
-    if (claimRunnerPid !== undefined && defaultIsPidAlive(claimRunnerPid)) {
+    if (claimRunnerPid !== undefined && isPidAlive(claimRunnerPid) !== false) {
+      claimRunnerAlive = true;
       try {
         const command = pidCommand(claimRunnerPid);
-        claimRunnerAlive = typeof command === 'string' && command.split(/\s+/).includes(`--session=${c.lease.session}`);
-      } catch { /* Unknown identity falls through to ordinary session absence logic. */ }
+        if (typeof command === 'string' && command.trim()) {
+          claimRunnerAlive = command.split(/\s+/).includes(`--session=${c.lease.session}`);
+        }
+      } catch { /* Unreadable command evidence retains the fresh claim's veto. */ }
     }
     return {
       prState,

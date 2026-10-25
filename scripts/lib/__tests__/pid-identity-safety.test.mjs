@@ -27,19 +27,21 @@ describe('PID snapshot safety boundaries', () => {
       .toEqual({ alive: true, reason: 'match' });
   });
 
-  it('path-prefixed claude bg-spare is a recycled spare', () => {
+  it('path-prefixed claude bg-spare can host a live working session', () => {
     const argv = '/usr/local/bin/claude bg-spare --bg-spare /tmp/x.sock';
     expect(pidIdentity(PID, { exec: () => `S ${START} ${argv}\n` }))
-      .toEqual({ alive: false, reason: 'recycled-spare' });
+      .toEqual({ alive: true, reason: 'match' });
   });
 
   it.each([
     'node /opt/tools/claude.mjs bg-spare --bg-spare /tmp/x.sock',
     '/usr/local/bin/node /opt/tools/claude.mjs bg-spare --bg-spare /tmp/x.sock',
     '/opt/tools/claude-code bg-spare --bg-spare /tmp/x.sock',
-  ])('recognizes a Claude spare launcher: %s', argv => {
+  ])('Claude spare launcher argv alone preserves liveness: %s', argv => {
     expect(pidIdentity(PID, { exec: () => `S ${START} ${argv}\n` }))
-      .toEqual({ alive: false, reason: 'recycled-spare' });
+      .toEqual({ alive: true, reason: 'match' });
+    expect(pidIdentity(PID, { expectStart: 'Sat Oct 24 11:59:00 2026', exec: () => `S ${START} ${argv}\n` }))
+      .toEqual({ alive: false, reason: 'start-mismatch' });
   });
 
   it.each([
@@ -113,6 +115,28 @@ describe('PID snapshot safety boundaries', () => {
 });
 
 describe('session-bound fixing claim identity safety', () => {
+  it.each([false, true])('a live working session on a claimed spare keeps its claim (stamped=%s)', stamped => {
+    const lockRoot = mkdtempSync(join(tmpdir(), 'live-claimed-spare-'));
+    const claim = { repo: 'we', pr: 42, kind: 'fixing', lockRoot };
+    const argv = 'claude bg-spare --bg-spare /tmp/claimed.sock';
+    const identity = (pid, options) => pidIdentity(pid, { ...options, exec: () => `S ${START} ${argv}\n` });
+    try {
+      expect(acquireFixClaim({ ...claim, who: 'fix-42', sessionId: 'working-spare', nowMs: NOW }).ok).toBe(true);
+      if (stamped) expect(stampBorrowedRunnerPid({ ...claim, owner: 'fixer:fix-42', pid: PID,
+        runnerStart: START, runnerArgv: argv, nowIso: new Date(NOW).toISOString() })).toBe(true);
+      const [agent] = enrichAgents([{ name: 'fix-42', sessionId: 'working-spare', state: 'working',
+        pid: PID, startedAt: NOW - 1000 }], { probe: pid => probePid(pid, () => {}, identity) });
+      expect(agent.pidAlive).toBe(true);
+      expect(assessLiveness([{ agent }])).toMatchObject({ kind: 'live-process' });
+      const result = refreshLiveFixDispatchClaims({ lockRoot, alive: () => true, identity,
+        listAgentsAll: () => [agent], hungInfoFor: () => null, awaitingVerifyFor: null,
+        nowMs: NOW + 1000, nowIso: () => new Date(NOW + 1000).toISOString() });
+      expect(result.released ?? []).toEqual([]);
+      expect(result.refreshed).toHaveLength(1);
+      expect(readFixDispatchClaim(claim).meta.sessionId).toBe('working-spare');
+    } finally { rmSync(lockRoot, { recursive: true, force: true }); }
+  });
+
   it.each([
     ['an older dead-pid working row with a different sessionId keeps a newer claim', 'bound-fix',
       [{ sessionId: 'old-fix', startedAt: NOW - 1000 }], false],
@@ -139,7 +163,7 @@ describe('session-bound fixing claim identity safety', () => {
     const claim = { repo: 'we', pr: 42, kind: 'fixing', lockRoot };
     const agents = rows.map((row, index) => ({ name: 'fix-42', state: 'working', pid: PID + index, ...row }));
     const identity = vi.fn(pid => pid === PID
-      ? { alive: false, reason: 'recycled-spare' }
+      ? { alive: false, reason: 'zombie' }
       : { alive: agents.find(row => row.pid === pid)?.live ? true : null });
     try {
       expect(acquireFixClaim({ ...claim, who: 'fix-42', sessionId, nowMs: NOW }).ok).toBe(true);
@@ -150,7 +174,7 @@ describe('session-bound fixing claim identity safety', () => {
       });
       if (released) {
         expect(result.released).toEqual([{ repo: 'we', pr: 42, kind: 'fixing', owner: 'fixer:fix-42',
-          reason: 'session-identity-dead (recycled-spare)' }]);
+          reason: 'session-identity-dead (zombie)' }]);
         expect(result.refreshed).toEqual([]);
         expect(readFixDispatchClaim(claim)).toBeNull();
         expect(identity).toHaveBeenCalledWith(PID);
@@ -165,7 +189,7 @@ describe('session-bound fixing claim identity safety', () => {
   });
 
   it.each([
-    ['releases a working row with a recycled-spare pid and logs the reason', [], true],
+    ['releases a working row with a zombie spare pid and logs the reason', [], true],
     ['releases when all working rows have dead identities', [{ pid: PID + 1 }], true],
     ['unknown identity keeps the claim', [{ pid: PID, unknown: true }], false],
     ['a second live row keeps the claim', [{ pid: PID + 1, live: true }], false],
@@ -182,7 +206,7 @@ describe('session-bound fixing claim identity safety', () => {
     const exec = vi.fn((_cmd, args) => {
       const row = rows.find(row => row.pid === Number(args[1]));
       if (row?.unknown) throw new Error('unreadable ps');
-      return `S ${START} ${row?.live ? ARGV : 'claude bg-spare --bg-spare /tmp/x.sock'}\n`;
+      return `${row?.live ? 'S' : 'Z+'} ${START} ${row?.live ? ARGV : 'claude bg-spare --bg-spare /tmp/x.sock'}\n`;
     });
     const identity = vi.fn(pid => {
       if (rows.find(row => row.pid === pid)?.throws) throw new Error('identity probe failed');
@@ -199,7 +223,7 @@ describe('session-bound fixing claim identity safety', () => {
       if (released) {
         expect(result.refreshed).toEqual([]);
         expect(result.released).toEqual([{ repo: 'we', pr: 42, kind: 'fixing', owner: 'fixer:fix-42',
-          reason: 'session-identity-dead (recycled-spare)' }]);
+          reason: 'session-identity-dead (zombie)' }]);
         expect(readFixDispatchClaim(claim)).toBeNull();
       } else {
         expect(result.released ?? []).toEqual([]);
@@ -218,7 +242,7 @@ describe('session-bound fixing claim identity safety', () => {
       releaseFixDispatchClaim({ ...claim, owner: 'fixer:fix-42' });
       acquireFixClaim({ ...claim, who: changed === 'owner' ? 'new-fixer' : 'fix-42',
         sessionId: 'new-session', nowMs: NOW + 500 });
-      return { alive: false, reason: 'recycled-spare' };
+      return { alive: false, reason: 'zombie' };
     });
     try {
       acquireFixClaim({ ...claim, who: 'fix-42', sessionId: 'bound-fix', nowMs: NOW });
@@ -263,7 +287,7 @@ describe.each(['runnerPid', 'session-identity'])('%s claim probe fencing', path 
           }
         }
         replacement = readFixDispatchClaim(claim);
-        return { alive, reason: alive === false ? 'recycled-spare' : 'match' };
+        return { alive, reason: alive === false ? 'zombie' : 'match' };
       });
       try {
         expect(acquireFixDispatchClaim({ ...claim, sessionId: 'bound-fix', nowMs: NOW }).ok).toBe(true);
@@ -324,8 +348,8 @@ describe('borrowed runner stamp probe fencing', () => {
 describe('positive identity evidence controls claim release', () => {
   it.each([
     ['zombie releases claim', 'Z+', START, ARGV, 'zombie'],
-    ['recycled-spare subcommand releases claim', 'Ss', START, 'claude bg-spare', 'recycled-spare'],
-    ['recycled-spare subcommand with flag releases claim', 'S', START, 'claude bg-spare --bg-spare=spare.sock', 'recycled-spare'],
+    ['spare with different stored argv releases claim', 'Ss', START, 'claude bg-spare', 'argv-mismatch'],
+    ['spare with flag and different stored argv releases claim', 'S', START, 'claude bg-spare --bg-spare=spare.sock', 'argv-mismatch'],
     ['start mismatch releases claim', 'S', 'Sat Oct 24 12:01:00 2026', ARGV, 'start-mismatch'],
     ['argv mismatch releases claim', 'S', START, 'node scripts/other-runner.mjs', 'argv-mismatch'],
     ['matching identity retains claim', 'S+', START, ARGV, 'match'],
