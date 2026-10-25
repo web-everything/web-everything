@@ -387,13 +387,13 @@ describe('remote CLI — local preconditions', () => {
       expect(result.status).toBe(0);
       expect(JSON.parse(result.stdout).ok).toBe(true);
       const calls = readFileSync(mock.calls, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-      expect(calls).toHaveLength(7);
+      expect(calls).toHaveLength(8);
       const runPath = `repos/web-everything/web-everything/actions/workflows/remote-verify.yml/runs?head_sha=${ctx.initial}&per_page=100`;
       const headPath = `repos/web-everything/web-everything/commits/${ctx.initial}`;
       const basePath = 'repos/web-everything/web-everything/commits/main';
       expect(calls.map(call => call.args.at(-1))).toEqual([runPath,
         'repos/web-everything/web-everything/actions/runs/123/attempts/2/jobs?per_page=100',
-        headPath, basePath, runPath, headPath, basePath]);
+        headPath, basePath, runPath, headPath, basePath, runPath]);
       for (const call of calls) {
         expect(call.repo).toBe('web-everything/web-everything');
         expect(call.args[0]).toBe('api');
@@ -471,7 +471,7 @@ describe('remote CLI — local preconditions', () => {
       const result = ctx.invoke({ ...mock.env, GH_HOST: 'enterprise.example.test' });
       expect(result.status).toBe(0);
       const calls = readFileSync(mock.calls, 'utf8').trim().split('\n').map(JSON.parse);
-      expect(calls).toHaveLength(7);
+      expect(calls).toHaveLength(8);
       for (const call of calls) {
         expect(call.host).toBe('github.com');
         expect(call.args).toEqual(expect.arrayContaining(['--hostname', 'github.com']));
@@ -489,8 +489,8 @@ describe('remote CLI — local preconditions', () => {
       expect(result.status).toBe(rerun ? 2 : 0);
       expect(JSON.parse(result.stdout).ok).toBe(!rerun);
       const calls = readFileSync(mock.calls, 'utf8').trim().split('\n').map(JSON.parse);
-      expect(calls).toHaveLength(rerun ? 5 : 7);
-      expect(calls.filter(call => call.args.some(arg => arg.includes('/runs?')))).toHaveLength(2);
+      expect(calls).toHaveLength(rerun ? 5 : 8);
+      expect(calls.filter(call => call.args.some(arg => arg.includes('/runs?')))).toHaveLength(rerun ? 2 : 3);
       expect(calls.filter(call => call.args.some(arg => arg.includes('/jobs?')))).toHaveLength(1);
       for (const call of calls) expect(call).not.toHaveProperty('memo');
       expect(readdirSync(memo)).toEqual([]);
@@ -702,14 +702,28 @@ describe('remote lane marker import — required gate evidence', () => {
     expect(writeMarker).not.toHaveBeenCalled();
   });
 
-  it('rechecks the run list after the attempt jobs and before writing', async () => {
+  it('rechecks the run list after the attempt jobs and after the final definition read, before writing', async () => {
     const order = [];
     await importRun([job()], {
       fetchJobs: async (selected) => { expect(selected).toEqual(successful); order.push('jobs'); return [job()]; },
+      fetchDefinition: async () => { order.push('definition'); return definition(); },
       fetchRuns: async () => { order.push('runs'); return [successful]; },
       writeMarker: () => order.push('write'),
     });
-    expect(order).toEqual(['jobs', 'runs', 'write']);
+    expect(order).toEqual(['jobs', 'definition', 'runs', 'definition', 'runs', 'write']);
+  });
+
+  it.each([
+    ['pending rerun attempt', [{ ...successful, run_attempt: 2, status: 'in_progress', conclusion: null }]],
+    ['failed rerun attempt', [{ ...successful, run_attempt: 2, conclusion: 'failure' }]],
+    ['newer queued run', [successful, run({ id: 456, created_at: new Date(T0 + 1000).toISOString(), status: 'queued', conclusion: null })]],
+    ['unreadable listing', null],
+  ])('writes no marker when a %s appears during the final definition read', async (_label, laterRuns) => {
+    const writeMarker = vi.fn();
+    const fetchRuns = vi.fn().mockResolvedValueOnce([successful]).mockResolvedValue(laterRuns);
+    await expect(importRun([job()], { fetchRuns, writeMarker })).rejects.toThrow(/local verify/);
+    expect(fetchRuns).toHaveBeenCalledTimes(2);
+    expect(writeMarker).not.toHaveBeenCalled();
   });
 
   it('a targeted dispatch during job verification does not invalidate the required lane run', async () => {
