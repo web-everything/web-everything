@@ -1,5 +1,6 @@
 // @vitest-environment node
 // Read command call sites from disk without Vite's browser asset URL rewriting.
+// @repo-scanning-test scope=files
 import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
@@ -7,6 +8,7 @@ import { freshLaneSafety, guardLaneAction } from '../../lib/health-watch-lane-sc
 import { createStaleStateReader } from '../stale-state-io.mjs';
 import { OPERATIONS } from '../run.mjs';
 import { probeStaleState } from '../../conveyor/health-watch.mjs';
+import { scopedScanFiles } from '../../lib/repo-scan-tests.mjs';
 
 const published = 'a'.repeat(40);
 // A forged loose OR packed origin ref makes the old exclusion return zero. The
@@ -147,9 +149,9 @@ describe('health-watch destructive lane action call-site contract', () => {
     // inventory, letting an unguarded action appear without changing its list.
     expect(commands(source).some(call => call.startsWith(site))).toBe(true);
   });
-  it('allowlists every health-watch and stale-state command call site; new destructive lane actions require a guard', () => {
-    const watch = readFileSync(new URL('../../conveyor/health-watch.mjs', import.meta.url), 'utf8');
-    const reader = readFileSync(new URL('../stale-state-io.mjs', import.meta.url), 'utf8');
+  it.each(scopedScanFiles(['scripts/conveyor/health-watch.mjs', 'scripts/operations/stale-state-io.mjs']))(
+    'allowlists every command call site in %s; new destructive lane actions require a guard', file => {
+    const source = readFileSync(new URL(`../../../${file}`, import.meta.url), 'utf8');
     const allowedWatch = [
       'execFileSync(cmd, args)',
       "exec('git', ['-C', cwd, ...args])",
@@ -185,11 +187,11 @@ describe('health-watch destructive lane action call-site contract', () => {
       counts[name] = (counts[name] ?? 0) + 1;
       return counts;
     }, {});
-    expect(subprocesses(watch)).toEqual(allowedWatch);
-    expect(subprocesses(reader)).toEqual(allowedReader);
+    const allowed = file === 'scripts/conveyor/health-watch.mjs' ? allowedWatch : allowedReader;
+    expect(subprocesses(source)).toEqual(allowed);
     // Keep imported-helper coverage visible and reviewable. A new helper call or
     // additional invocation requires inspection even if its name hides its effect.
-    expect(helperCounts(watch)).toEqual({
+    const allowedHelpers = file === 'scripts/conveyor/health-watch.mjs' ? {
       resolveCoordinationRoot: 1, readFileSync: 12, mkdirSync: 2, writeFileSync: 2, renameSync: 1,
       openSync: 3, readSync: 3, closeSync: 3, statSync: 9, existsSync: 14, readdirSync: 8,
       daemonCloneRoots: 5, workspaceOf: 8, daemonJobsRoot: 1, realpathSync: 3, readGit: 1,
@@ -216,17 +218,17 @@ describe('health-watch destructive lane action call-site contract', () => {
       loadQuietSettings: 1, breaksThrough: 1, flushDigest: 1, renderEpisodeReport: 1,
       spliceFilingSection: 1, renderHealthSection: 1, formatClaudeJobsArchiveLine: 2,
       formatTmpSweepLine: 2, healthSectionLines: 1,
-    });
-    expect(helperCounts(reader)).toEqual({
+    } : {
       readdirSync: 1, readFileSync: 1, createFileRunStore: 1, laneProbeEnv: 2, hardenLaneGitArgs: 1,
       laneRedirectConfig: 1, cachedLaneScan: 1, isLeaseStale: 1, idFromName: 2, createClaimReader: 1, readField: 2,
-    });
+    };
+    expect(helperCounts(source)).toEqual(allowedHelpers);
     // Negative controls: real command shapes in an otherwise dormant branch
     // cannot be admitted by the allowlist. Comments/strings aren't call sites.
     for (const action of ['reclaim', 'reset', 'reuse', 'release']) {
-      expect(subprocesses(`${watch}\nif (false) run('node', ['lane-pool.mjs', '${action}']);`)).not.toEqual(allowedWatch);
+      expect(subprocesses(`${source}\nif (false) run('node', ['lane-pool.mjs', '${action}']);`)).not.toEqual(allowed);
     }
-    expect(subprocesses(`${reader}\n// run('git', ['reset']);`)).toEqual(allowedReader);
+    expect(subprocesses(`${source}\n// run('git', ['reset']);`)).toEqual(allowed);
   });
 
   it('pins the real stale-state call sites to reporting only, with no destructive lane action bypassing guardLaneAction', () => {

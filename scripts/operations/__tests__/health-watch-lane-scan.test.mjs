@@ -790,7 +790,10 @@ describe('lane action guard with real Git', () => {
     chmodSync(join(path, 'tracked.txt'), 0o644);
     expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: false });
     git(['config', 'core.ignoreStat', 'true']);
-    git(['add', 'tracked.txt']);
+    // A no-op add need not update the index. Explicitly model the assumed-unchanged
+    // entry that ignoreStat can leave behind, independently of Git's stat timing.
+    git(['update-index', '--assume-unchanged', 'tracked.txt']);
+    expect(git(['ls-files', '-v', 'tracked.txt'])).toBe('h tracked.txt\n');
     writeFileSync(join(path, 'tracked.txt'), 'edited behind the stat cache\n');
     expect(git(['status', '--porcelain']).trim()).toBe('');
     expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: true, reason: 'lane Git config can hide worktree changes' });
