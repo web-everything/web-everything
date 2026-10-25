@@ -73,7 +73,8 @@ describe('number-stranded refuses on the locus it PROTECTS, not the one it is ca
     // The guard must not fire everywhere. Asserted from a lane-free cwd AND from `elsewhere`, so neither a
     // cwd-based nor a ROOT-based reading can pass this by accident.
     for (const cwd of [plainRoot, elsewhere]) {
-      const { out } = run(plainRoot, cwd);
+      const { code, out } = run(plainRoot, cwd);
+      expect(code, out).toBe(0);
       expect(out, `cwd=${cwd}`).not.toMatch(/refusing to run in a LANE clone/);
     }
   });
