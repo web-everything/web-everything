@@ -35,4 +35,90 @@ describe('draft-promote-provider (draft-first PRs)', () => {
     expect(provider.ready(7)).toBe('ok');
     expect(seen).toEqual([['pr', 'ready', '7', '--repo', 'frontier-ui/frontierui']]);
   });
+  describe('ready() exec error diagnostics', () => {
+    const command = 'Command failed: gh pr ready 42 --repo example/project';
+
+    function readyError(original) {
+      const provider = createDraftPromoteProvider({
+        repo: 'example/project',
+        exec: () => { throw original; },
+      });
+      try {
+        provider.ready(42);
+      } catch (error) {
+        return error;
+      }
+      throw new Error('Expected ready() to throw');
+    }
+
+    it('puts stderr after the original command on the first line, preferring it over stdout', () => {
+      const original = Object.assign(new Error(`${command}\noriginal trailing detail`), {
+        stderr: 'GraphQL: Resource not accessible by integration',
+        stdout: 'irrelevant stdout',
+      });
+      const error = readyError(original);
+      expect(error.message.split('\n')[0]).toBe(`${command}: ${original.stderr}`);
+    });
+
+    it('keeps the original error as cause and preserves stderr and exit status', () => {
+      const original = Object.assign(new Error(command), { stderr: 'permission denied', status: 1 });
+      const error = readyError(original);
+      expect(error).not.toBe(original);
+      expect(error.cause).toBe(original);
+      expect(error.stderr).toBe(original.stderr);
+      expect(error.status).toBe(1);
+    });
+
+    it.each([undefined, ''])('falls back to stdout when stderr is %j', (stderr) => {
+      const original = Object.assign(new Error(command), { stderr, stdout: 'stdout failure detail' });
+      expect(readyError(original).message.split('\n')[0]).toBe(`${command}: stdout failure detail`);
+    });
+
+    it('bounds 5000-character stderr to at most 400 detail characters plus an ellipsis', () => {
+      const original = Object.assign(new Error(command), { stderr: 'x'.repeat(5000) });
+      const firstLine = readyError(original).message.split('\n')[0];
+      expect(firstLine.startsWith(`${command}: `)).toBe(true);
+      const detail = firstLine.slice(`${command}: `.length);
+      expect(detail).toMatch(/^x{1,400}(?:…|\.\.\.)$/u);
+    });
+
+    it('collapses multiline stderr and repeated whitespace into one first-line diagnostic', () => {
+      const original = Object.assign(new Error(command), {
+        stderr: ' \n GraphQL:\t permission   denied\r\n  for this repository \n ',
+      });
+      expect(readyError(original).message.split('\n')[0])
+        .toBe(`${command}: GraphQL: permission denied for this repository`);
+    });
+
+    it.each(['ghp', 'gho', 'ghu', 'ghs', 'ghr', 'github_pat'])(
+      'redacts %s tokens from stderr and fallback stdout diagnostics', (prefix) => {
+        const token = `${prefix}_Synthetic_123abc`;
+        for (const stream of ['stderr', 'stdout']) {
+          const original = Object.assign(new Error(command), { [stream]: `denied token ${token} for repository` });
+          const firstLine = readyError(original).message.split('\n')[0];
+          expect(firstLine).toMatch(/^Command failed: .*: denied token .+ for repository$/);
+          expect(firstLine).not.toContain(token);
+          expect(firstLine).not.toContain('Synthetic_123abc');
+        }
+      },
+    );
+
+    it.each([{}, { stderr: '', stdout: '' }])(
+      'rethrows the identical original error unchanged when no output is available (%j)', (output) => {
+        const original = Object.assign(new Error(`${command}\noriginal trailing detail`), output, { status: 2 });
+        const before = Object.getOwnPropertyDescriptors(original);
+        expect(readyError(original)).toBe(original);
+        expect(Object.getOwnPropertyDescriptors(original)).toEqual(before);
+      },
+    );
+
+    it.each(['', 'ready\n'])('returns successful exec output %j unchanged', (output) => {
+      const seen = [];
+      const provider = createDraftPromoteProvider({
+        repo: 'example/project', exec: (args) => { seen.push(args); return output; },
+      });
+      expect(provider.ready(42)).toBe(output);
+      expect(seen).toEqual([['pr', 'ready', '42', '--repo', 'example/project']]);
+    });
+  });
 });
