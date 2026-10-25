@@ -90,6 +90,41 @@ describe('R90 structured timeline evidence (implementation pending)', () => {
     expect(status(input,'recurrence')).toBe('clear');
   });
 
+  it.each([0,1])('clears recurrence after three identical blocks with only %i completed repairs', completed => {
+    const input = {...raw(),comments:[1,2,3].flatMap(i => [
+      referral(i), ...(i < 3 ? (i <= completed ? repair(i) : [repair(i)[0]]) : []),
+    ])};
+    expect(status(input,'recurrence')).toBe('clear');
+  });
+
+  it('clears recurrence when the full finding identity differs only in its judge', () => {
+    const input = {...raw(),comments:[1,2,3].flatMap(i => [
+      referral(i,JSON.stringify([`judge-${i}`,'src/a.js',2,'missing guard'])),
+      ...(i < 3 ? repair(i) : []),
+    ])};
+    expect(status(input,'recurrence')).toBe('clear');
+  });
+
+  it('compares recurrence claims beyond the display parser truncation boundary', () => {
+    const input = {...raw(),comments:[1,2,3].flatMap(i => [
+      referral(i,JSON.stringify(['judgeCorrectnessAdvisory','src/a.js',2,`${'x'.repeat(240)} distinct ${i}`])),
+      ...(i < 3 ? repair(i) : []),
+    ])};
+    expect(status(input,'recurrence')).toBe('clear');
+  });
+
+  it.each(['recurrence','fix-causation'])('keeps %s unknown when one unreadable event accompanies sufficient valid evidence', trigger => {
+    const input = trigger === 'recurrence' ? returned(3) : {...raw(),comments:[review(1),review(2),review(3)]};
+    input.comments.push({...review(4,'correctness'),createdAt:'invalid'});
+    expect(status(input,trigger)).toBe('unknown');
+  });
+
+  it('keeps fix-causation unknown when malformed finding groups interrupt qualifying rounds', () => {
+    const malformed = review(3);
+    malformed.body = malformed.body.replace('**judge/breaks-change** (1)','**judge/breaks-change** (invalid)');
+    expect(status({...raw(),comments:[review(1),review(2),malformed,review(4)]},'fix-causation')).toBe('unknown');
+  });
+
   it('fires fix-causation for explicit breaks-change findings in three consecutive rounds', () => {
     const input = {...raw(),comments:[review(1),...repair(1),review(2),...repair(2),review(3)]};
     expect(postmortem(input).rounds.map(r => r.causes)).toEqual(Array.from({length:3}, () =>
@@ -194,6 +229,14 @@ describe('stuck trigger evidence and rendering regressions', () => {
   ])('keeps every trigger unknown for %s even with eight trusted round markers', (_name, patch) => {
     const input = {...raw(), comments:observedRounds(), ...patch};
     expect(evaluateStuckTriggers(input,{now}).map(t => t.status)).toEqual(Array(6).fill('unknown'));
+  });
+
+  it('fires fix-rounds from eight valid heads despite an additional invalid-timestamp event', () => {
+    const comments = observedRounds();
+    comments.push({...comments[0],createdAt:'invalid'});
+    const triggers = evaluateStuckTriggers({...raw(),comments},{now});
+    expect(triggers[1]).toMatchObject({trigger:'fix-rounds',status:'fired',observedRounds:8});
+    expect(triggers.slice(2).map(t => t.status)).toEqual(Array(4).fill('unknown'));
   });
 
   it('keeps unreadable evidence and invalid clocks unknown despite otherwise firing observations', () => {
