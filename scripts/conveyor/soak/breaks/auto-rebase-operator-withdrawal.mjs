@@ -89,7 +89,8 @@ export default {
       addOverlay(root, { ref: next, pr: 123, stackBases: [REF] }, { env });
       const pending = `${overlayFilePath(root, env)}.auto-rebase`;
       fs.mkdirSync(pending, { recursive: true });
-      fs.writeFileSync(join(pending, `${encodeURIComponent(REF)}.json`), JSON.stringify({ old: REF, new: next, newSha: 'a'.repeat(40) }));
+      const oldOverlay = readOverlays(root, { env }).find(o => o.ref === REF);
+      fs.writeFileSync(join(pending, `${encodeURIComponent(REF)}.json`), JSON.stringify({ old: REF, oldOverlay, new: next, newSha: 'a'.repeat(40) }));
       finishPendingSwaps({
         root, env,
         run: args => success(args[0] === 'rev-parse' ? 'a'.repeat(40) : ''),

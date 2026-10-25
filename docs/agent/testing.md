@@ -17,7 +17,9 @@ fetched origin tip of the old ref. An advanced or unreadable old tip retains bot
 escalates through `auto-rebase-needs-you`. Cleanup requires the replacement's freshly fetched origin
 tip to contain the pending SHA, and `removeOverlay`'s `requireRef` checks the replacement is still
 registered under the same list mutex that removes the original, so a withdrawal up to that write wins;
-its `expectedOverlay` likewise refuses to remove an original re-registered meanwhile. A replacement
+its `expectedOverlay` is the original's registration recorded in the pending file at swap time (never a
+fresh read), so an original re-registered at any point since is never removed, on that pass or a later
+one; a pending file without it fails closed. A replacement
 unregistered before adoption escalates every cleanup pass instead of waiting silently;
 the pending file stays, so a fresh repair is the operator's call;
 missing or unreadable evidence retains the old registration and pending file and alerts in both sinks.
