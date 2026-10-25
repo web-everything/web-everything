@@ -1,3 +1,5 @@
+// @vitest-environment node
+// Keep file URLs intact: the browser asset transform rewrites the settings fixture's path.
 // Test-first contract: static imports intentionally fail until the module exists.
 import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
