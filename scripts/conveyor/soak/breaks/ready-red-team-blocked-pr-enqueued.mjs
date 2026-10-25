@@ -37,8 +37,15 @@ export default {
         ['red-team:blocked', false], ['red-team:pending', false], ['red-team:clear', false],
         ...(wait === 'false' ? [] : [['red-team:pending', true]]),
       ].map(([status, overdue]) => ({ wait, status, overdue })));
-      for (const { wait, status, overdue } of cases) {
-        const labels = ['review:accepted', 'ready-to-merge', status];
+      cases.push(
+        { wait: 'true', status: 'red-team:pending', overdue: true, override: true },
+        { wait: 'true', status: 'red-team:blocked', overdue: true, override: true },
+        { wait: 'true', status: 'red-team:pending', overdue: true, resultArrived: true },
+      );
+      for (const { wait, status, overdue, override, resultArrived } of cases) {
+        let labels = ['review:accepted', 'ready-to-merge', status];
+        const comments = resultArrived ? [{ user: { login: 'web-everything[bot]' },
+          body: `<!-- we:red-team-advisory pr=${PR} rev=${HEAD} -->\n### Post-accept red team — no break found` }] : [];
         let clock = 45 * 60_000;
         let queued = false, requests = 0, notes = 0;
         let stored = { pending: [], followedUp: [], ...(overdue ? { redTeamPending: { [`cwd#${PR}`]: {
@@ -57,7 +64,7 @@ export default {
             if (['fetch', 'cat-file'].includes(args[0])) return '';
           }
           if (cmd === 'gh') {
-            if (args.includes('--slurp')) return '[[]]';
+            if (args.includes('--slurp')) return JSON.stringify([comments]);
             if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({
               id: 'PR_NODE', state: 'OPEN', headRefOid: HEAD, baseRefName: 'main', labels });
             if (args[0] === 'pr' && ['comment', 'edit'].includes(args[1])) return '';
@@ -85,19 +92,27 @@ export default {
           throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
         };
         const s = createDrainMergeStrategy({
-          env: { WE_UNDER_TEST: '1', ...(wait === undefined ? {} : { WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE: wait }) },
+          env: { WE_UNDER_TEST: '1', ...(wait === undefined ? {} : { WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE: wait }),
+            ...(override ? { WE_RED_TEAM_DEADLINE_ACTION: 'merge-without-result', WE_RED_TEAM_DEADLINE_OVERRIDE_BY: 'soak-operator' } : {}) },
           cwd: sourceRoot, now: () => clock, exec,
           resolved: { policy: resolveMergeDeliveryPolicy({ tool: { strategy: 'github-merge-queue' } }), note: null },
           isLocalRepo: () => true, localSlug: REPO, statePath: '/injected/queue-state.json',
           readFile: () => JSON.stringify(stored), writeState: (_path, state) => { stored = structuredClone(state); },
           readRedTeamEvidence: () => evidence, readGrantScope: () => null,
+          labelProvider: {
+            ensureLabel: () => {},
+            setLabels: (_repo, _pr, { add, remove }) => {
+              labels = labels.filter(label => !remove.includes(label));
+              if (add) labels.push(add);
+            },
+          },
           requestRedTeam: () => { requests++; return { requested: true }; },
           publishNeedsYou: () => { notes++; }, cancelObsoleteRuns: () => {},
           batching: { gate: () => ({ admit: true }), observe: () => ({}) },
           log: { write: line => log?.(line) },
         });
-        const result = s.enqueue({ num: PR }, HEAD, { comments: [] });
-        if (overdue) {
+        const result = s.enqueue({ num: PR }, HEAD, { comments });
+        if (overdue && !override && !resultArrived) {
           check(result.kind === 'red-team-pending' && result.healthSmell && result.redTeamRequested,
             `wait=${wait ?? 'default'}: pending label bypassed the deadline path`);
           check(requests === 1, `wait=${wait ?? 'default'}: overdue pending head was not re-requested once`);
@@ -107,13 +122,19 @@ export default {
             `wait=${wait ?? 'default'}: pending label bypassed the operator notification`);
         }
         const sent = calls.some(c => c.some(isMutation));
-        if (status === 'red-team:clear') {
-          check(sent, `wait=${wait ?? 'default'} / ${status}: control did not send the merge-queue enqueue mutation`);
+        const allowed = status === 'red-team:clear' || resultArrived || (override && status === 'red-team:pending');
+        if (allowed) {
+          check(sent && result.enqueued === true,
+            `wait=${wait ?? 'default'} / ${status} / override=${!!override} / result=${!!resultArrived}: did not enqueue`);
+          check(!stored.redTeamPending?.[`cwd#${PR}`], 'successful admission retained the pending backoff');
+          if (resultArrived) check(labels.includes('red-team:clear') && !labels.includes('red-team:pending'),
+            'same-call result did not synchronize pending to clear');
         } else {
           check(!sent, `wait=${wait ?? 'default'} / ${status}: merge-queue enqueue mutation was sent despite the hold label`);
           check(result.enqueued !== true, `wait=${wait ?? 'default'} / ${status}: returned enqueued: true despite the hold label`);
         }
         // Existing queue membership is independent of admission: pending is normal there; blocked is sent back.
+        labels = ['review:accepted', 'ready-to-merge', status];
         queued = true;
         stored.pending = [{ num: PR, headSha: HEAD }];
         calls.length = 0;
