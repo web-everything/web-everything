@@ -355,7 +355,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           // readRedTeamStatus binds status.head to this job's head; the predicate
           // separately requires the stored read's netBasis.rev to equal status.head.
           if (input.redTeamMode === 'fresh' && (redTeamSkipNeedsSettlement(admissionPrior)
-            || redTeamStatusWithoutRun(admissionPrior))) admissionPrior = null;
+            || redTeamStatusWithoutRun(admissionPrior, prior))) admissionPrior = null;
           if (['ran', 'resumed'].includes(normalizeRedTeamResult(admissionPrior?.result).priorResult)) priorResult = admissionPrior.result;
           input = { ...input, result: priorResult };
         }

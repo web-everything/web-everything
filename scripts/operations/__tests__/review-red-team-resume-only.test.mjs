@@ -216,6 +216,13 @@ if (args[0] === 'pr' && args[1] === 'view' && args.includes('--json') && args.in
     expect(io.cliAvailable).toHaveBeenCalledOnce();
     for (const hook of ['reserveCalls', 'runSeat', 'runRecheck']) expect(io[hook]).not.toHaveBeenCalled();
   });
+  it.each([false, true])('refuses a finished null result without queued provenance and with no seat or comment (admitted=%s)', async admitted => {
+    const status = finished(null);
+    const io = fakeIo('fresh', { readRedTeamStatus: () => admitted
+      ? { status: 'queued', pid: 42, result: null } : status });
+    await refused('fresh', io, 'prior red-team status; not re-run', admitted
+      ? { redTeamAdmission: { pid: 42, prior: status } } : {});
+  });
   it.each(['ran', { status: 'ran', comment: 'error' }, 'resumed', { status: 'resumed', comment: { status: 'error' } }])(
     'resumes both production result shapes %j with a clean matching row and zero model calls', async result => {
       const io = fakeIo('resume', { readRedTeamStatus: () => finished(result) });

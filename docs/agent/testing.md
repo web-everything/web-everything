@@ -274,7 +274,10 @@ Recovery admission carries the `readRedTeamRecoveryStatus` normalization of a co
 queued writer without a resumable prior becomes a finished null-result placeholder, so the planner
 can dispatch fresh only when seat evidence establishes that no pass ran and the evidence reader
 retains the original queued status. An ordinary finished null result has unknown run provenance
-and never authorizes fresh dispatch. Live or unknown liveness
+and never authorizes fresh dispatch. The planner, admission writer and execution guard share
+`redTeamStatusWithoutRun` so admission cannot erase that unknown history. Regression in
+`review-red-team-resume-only.test.mjs`: **refuses a finished null result without queued provenance
+and with no seat or comment (admitted=%s)**. Live or unknown liveness
 and invalid writer PIDs keep the queued record blocked. Regressions in `review-job-red-team-skip.test.mjs`:
 **accepted code head dispatches fresh after queued fresh recovery crashes before running with no seat or result comment**,
 **queued fresh recovery still skips with %s**, and
