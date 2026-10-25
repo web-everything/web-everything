@@ -122,6 +122,7 @@ it.each(['Apple system helper', 'lane hooks', 'relative repo', 'full SHA', 'abbr
             'remote.origin.receivepack', 'core.sshCommand']) f.git(f.lane, ['config', key, (key === 'credential.helper' ? '!' : '') + 'touch "' + marker + '"']);
           f.git(f.lane, ['config', 'include.path', '/missing/config']);
           f.git(f.lane, ['config', 'diff.orderFile', '/missing/order']);
+          mkdirSync(path.join(f.lane, '.git/info'), { recursive: true });
           writeFileSync(path.join(f.lane, '.git/info/attributes'), '* filter=attack diff=attack\n');
         }
         if (variant === 'replacement refs') {
@@ -298,14 +299,14 @@ it('bounds every Git subprocess and pins file ordering and fsmonitor on hardened
     expect(c.timeout).toBeGreaterThan(0);
     expect(c.timeout).toBeLessThanOrEqual(120000);
     if (!c.args.includes('--get-regexp')) {
-      expect(c.args).toContain('diff.orderFile=');
+      expect(c.args).toContain('diff.orderFile=/dev/null');
       expect(c.args).toContain('core.fsmonitor=false');
     }
     if (c.args.includes('diff')) expect(c.args).toContain('-O/dev/null');
   }
 });
 
-it('cancels FIFO ordering on a real diff even when Git treats an empty orderFile as a filename', async () => {
+it.each(['diff', 'commit'])('cancels FIFO ordering for %s rendering with real Git', async command => {
   const dir = mkdtempSync(path.join(tmpdir(), 'codex-job-order-pin-'));
   const fifo = path.join(dir, 'order');
   execFileSync('mkfifo', [fifo]);
@@ -316,7 +317,10 @@ it('cancels FIFO ordering on a real diff even when Git treats an empty orderFile
     exec: async (cmd, args, options) => {
       if (args.includes('config')) return ok();
       const pins = args.flatMap((arg, i) => arg === '-c' ? ['-c', args[i + 1]] : []);
+      // Render commit's diffstat through the same Git diff machinery without
+      // writing Git metadata. Commit cannot use diff's explicit -O override.
       diffResult = spawnSync(cmd, ['-c', `diff.orderFile=${fifo}`, ...pins, 'diff', '--no-index',
+        ...(command === 'commit' ? ['--stat'] : []),
         ...args.filter(arg => arg.startsWith('-O')), before, after], {
         ...options, encoding: 'utf8', timeout: 1000,
         env: { ...options.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
@@ -325,10 +329,11 @@ it('cancels FIFO ordering on a real diff even when Git treats an empty orderFile
     },
   } };
   try {
-    await expect(checkDiffScope(state)).rejects.toThrow('diff probe complete');
+    await expect(command === 'diff' ? checkDiffScope(state) : trustedGit(['commit', '-m', 'summary'], { s: state }))
+      .rejects.toThrow('diff probe complete');
     expect(diffResult.error).toBeUndefined();
     expect(diffResult.status).toBe(1); // --no-index reports the differing bytes.
-    expect(diffResult.stdout).toContain('+after');
+    expect(diffResult.stdout).toContain(command === 'diff' ? '+after' : '1 insertion(+)');
     expect(diffResult.stderr).toBe('');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -774,7 +779,7 @@ it('pins executable Git configuration on every trusted Git command', async () =>
   expect(calls.length).toBeGreaterThan(0);
   for (const call of calls) {
     for (const pin of ['core.fsmonitor=false', 'core.hooksPath=/dev/null', 'push.followTags=false',
-      'core.pager=cat', 'diff.orderFile=', 'commit.gpgsign=false', 'credential.useHttpPath=true'])
+      'core.pager=cat', 'diff.orderFile=/dev/null', 'commit.gpgsign=false', 'credential.useHttpPath=true'])
       expect(call.args).toContain(pin);
     expect(call.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
     expect(call.args).toContain('--no-replace-objects');

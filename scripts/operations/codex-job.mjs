@@ -112,7 +112,8 @@ export async function trustedGit(args, { s, workTree, bootstrap = false } = {}) 
   // One opt-in authentication route: an operator-selected executable, frozen
   // before the worker starts. Git's helper protocol receives the repository path.
   const helper = s.credentialHelper ? '!' + "'" + s.credentialHelper.replaceAll("'", "'\\''") + "'" : '';
-  const pins = [...laneGitConfigArgs(), '-c', 'push.followTags=false', '-c', 'diff.orderFile=',
+  // An empty orderFile is a filename, and commit's diffstat reads it too.
+  const pins = [...laneGitConfigArgs(), '-c', 'push.followTags=false', '-c', 'diff.orderFile=/dev/null',
     '-c', 'core.pager=cat', '-c', 'core.excludesFile=/dev/null', '-c', 'core.fileMode=true',
     '-c', 'credential.helper=', ...(helper ? ['-c', `credential.helper=${helper}`] : []),
     '-c', 'credential.useHttpPath=true', '-c', 'core.askPass=/usr/bin/false',
