@@ -674,6 +674,7 @@ describe('#4194 review-job — the seats run AFTER the arc, and can never change
       claim: () => { calls.push(['claim']); return { ok: true }; },
       updateRecord: () => calls.push(['update']),
       unclaim: () => calls.push(['unclaim']),
+      prepareLane: () => ({ head: 'a'.repeat(40) }),
       acquireLane: () => { calls.push(['acquire']); return { lanePath: '/lanes/lane-7' }; },
       runLoop: () => { calls.push(['loop']); return { status: 0, stdout: JSON.stringify(LOOP_PAYLOAD), stderr: '' }; },
       releaseLane: () => calls.push(['release']),

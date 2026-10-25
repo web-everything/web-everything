@@ -732,6 +732,8 @@ describe('review-job runs the gate right after the red team', () => {
     const io = {
       root: '/daemon', now: (() => { let t = 0; return () => { t += 10; return t; }; })(), newActorId: () => 'a',
       readPrevCompletion: () => null, report: () => {}, claim: () => ({ ok: true }), updateRecord: () => {}, unclaim: () => {},
+      redTeamStatus: () => {},
+      prepareLane: () => ({ head: 'a'.repeat(40) }),
       acquireLane: () => ({ lanePath: '/lanes/lane-7' }), runLoop: () => ({ status: 0, stdout: JSON.stringify(loop(verdict)), stderr: '' }),
       releaseLane: () => {}, log: () => {},
       runExtraSeats: () => ({ status: 'ran', seats: [] }),
