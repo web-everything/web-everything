@@ -471,6 +471,58 @@ describe('trust, confinement and reach set', () => {
 });
 
 describe('policy journal', () => {
+  it('records the reported eight-level shared array graph within a bounded child process', () => {
+    execFileSync(process.execPath, ['--max-old-space-size=128', '--input-type=module', '-e', `
+      import { recordPolicyEvent } from './scripts/lib/delivery-policy.mjs';
+      const detail = Array.from({ length: 8 }).reduce(previous => Array(20).fill(previous), 'x');
+      recordPolicyEvent({ key: 'mergeGate', event: 'refused', subject: 'PR 1', detail }, JSON.parse(process.argv[1]));
+    `, JSON.stringify(env)], { cwd: resolve('.'), encoding: 'utf8', timeout: 5000, killSignal: 'SIGKILL', maxBuffer: 65536 });
+    expect(readPolicyEvents({ env })).toMatchObject([{ key: 'mergeGate', event: 'refused', subject: 'PR 1' }]);
+    expect(Buffer.byteLength(readFileSync(env.WE_POLICY_EVENTS_FILE))).toBeLessThanOrEqual(4096);
+  });
+
+  it.each(['array', 'object', 'mixed'])('visits shared %s descendants once and resets traversal for each event', shape => {
+    let reads = 0;
+    const leaf = { get value() { if (++reads > 2) throw new Error('repeated shared expansion'); return 'kept'; } };
+    const shared = shape === 'array' ? [leaf] : { leaf };
+    const detail = shape === 'object' ? { first: shared, second: shared } : [shared, shared];
+    for (let i = 0; i < 2; i++) recordPolicyEvent({ key: 'mergeGate', event: 'refused', subject: 'PR 1', detail }, env);
+    const expected = shape === 'object'
+      ? { first: { leaf: { value: 'kept' } }, second: null }
+      : [shape === 'array' ? [{ value: 'kept' }] : { leaf: { value: 'kept' } }, null];
+    expect(reads).toBe(2);
+    expect(readPolicyEvents({ env }).map(event => event.detail)).toEqual([expected, expected]);
+  });
+
+  it('bounds total traversal of distinct descendants before serialization and preserves the event', () => {
+    let reads = 0;
+    const tree = depth => {
+      const value = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [String(i), null]));
+      for (const key of Object.keys(value)) Object.defineProperty(value, key, { enumerable: true, get() {
+        if (++reads > 256) throw new Error('unbounded traversal');
+        return depth ? tree(depth - 1) : 'leaf';
+      } });
+      return value;
+    };
+    recordPolicyEvent({ key: 'mergeGate', event: 'refused', subject: 'PR 1', detail: tree(6) }, env);
+    expect(reads).toBeLessThanOrEqual(256);
+    expect(readPolicyEvents({ env })).toMatchObject([{ key: 'mergeGate', event: 'refused', subject: 'PR 1' }]);
+    expect(Buffer.byteLength(readFileSync(env.WE_POLICY_EVENTS_FILE))).toBeLessThanOrEqual(4096);
+  });
+
+  it('does not read object values beyond the field limit and handles cycles', () => {
+    const detail = Object.fromEntries(Array.from({ length: 100 }, (_, i) => [`field${i}`, i]));
+    Object.defineProperty(detail, 'outside', { enumerable: true, get() { throw new Error('outside field limit'); } });
+    recordPolicyEvent({ key: 'mergeGate', event: 'refused', subject: 'PR 1', detail }, env);
+    const cycle = { value: 'kept' };
+    cycle.self = cycle;
+    recordPolicyEvent({ key: 'mergeGate', event: 'refused', subject: 'PR 2', detail: cycle }, env);
+    expect(readPolicyEvents({ env }).map(event => event.detail)).toEqual([
+      Object.fromEntries(Array.from({ length: 100 }, (_, i) => [`field${i}`, i])),
+      { value: 'kept', self: null },
+    ]);
+  });
+
   it('round-trips with timestamp, since filter, corrupt-line tolerance and never throws on unwritable IO', () => {
     expect(policyEventsPath(env)).toBe(env.WE_POLICY_EVENTS_FILE);
     expect(policyEventsPath({ HEALTH_WATCH_LOGS_DIR: dir })).toBe(join(dir, 'policy-events.jsonl'));

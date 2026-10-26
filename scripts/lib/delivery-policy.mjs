@@ -41,16 +41,27 @@ function identityText(value, max, byteLimit) {
   while (Buffer.byteLength(JSON.stringify(text)) > byteLimit) text = text.slice(0, -2) + '…';
   return text;
 }
-function sanitise(value, depth = 0, seen = new Set()) {
+function sanitise(value, depth = 0, state = { remaining: 256, seen: new Set() }) {
+  // Bound traversal before the wire-size check, even for trees without shared references.
+  if (state.remaining-- <= 0) return null;
   if (typeof value === 'string') return clean(value, 500);
   if (value === null || typeof value === 'boolean' || typeof value === 'number') return value;
-  if (depth >= 8 || typeof value !== 'object' || seen.has(value)) return null;
-  seen.add(value);
-  const result = Array.isArray(value)
-    ? value.slice(0, 20).map(item => sanitise(item, depth + 1, seen))
-    : Object.fromEntries(Object.entries(value).slice(0, 100).map(([key, item]) => [clean(key, 500), sanitise(item, depth + 1, seen)]));
-  seen.delete(value);
-  return result;
+  if (depth >= 8 || typeof value !== 'object' || state.seen.has(value)) return null;
+  // Keep references for the entire traversal: aliases, like cycles, become null.
+  state.seen.add(value);
+  if (Array.isArray(value)) {
+    const result = [];
+    for (let i = 0; i < Math.min(value.length, 20) && state.remaining > 0; i++) {
+      result.push(sanitise(value[i], depth + 1, state));
+    }
+    return result;
+  }
+  const entries = [];
+  for (const key of Object.keys(value).slice(0, 100)) {
+    if (state.remaining <= 0) break;
+    entries.push([clean(key, 500), sanitise(value[key], depth + 1, state)]);
+  }
+  return Object.fromEntries(entries);
 }
 
 export function policyEventsPath(env = process.env) {
