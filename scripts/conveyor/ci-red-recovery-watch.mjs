@@ -1496,10 +1496,17 @@ export function sweepMainCancelledRetrigger(options = {}) {
   const { repo = null, apply = false, recordPath = mainRetriggerRecordPath(repo), lock = withMainRetriggerLock } = options;
   if (!apply) return sweepMainCancelledLocked({ ...options, recordPath });
   let held;
-  try { held = lock(recordPath, ctx => sweepMainCancelledLocked({ ...options, recordPath, assertHeld: ctx?.assertHeld })); }
-  catch (e) {
+  let sweepError = null;
+  try {
+    held = lock(recordPath, ctx => {
+      // A sweep exception is not a lock failure: let it reach the caller's per-pass isolation unchanged.
+      try { return sweepMainCancelledLocked({ ...options, recordPath, assertHeld: ctx?.assertHeld }); }
+      catch (e) { sweepError = { e }; return null; }
+    });
+  } catch (e) {
     return { dispatch: [], applied: [], refusals: [{ reason: 'record-lock-failed', error: describeExecError(e) }] };
   }
+  if (sweepError) throw sweepError.e;
   return held.locked ? held.value
     : { dispatch: [], applied: [], refusals: [{ reason: 'record-locked', error: 'another watcher is updating the main CI retrigger record; retry next tick' }] };
 }

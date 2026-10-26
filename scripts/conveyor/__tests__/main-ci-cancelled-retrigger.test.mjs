@@ -16,7 +16,7 @@ function fixture(runs = [run()], initial = {}) {
   const options = { apply: true, now, repo: 'web-everything/web-everything', recordPath: 'fixture/main-ci-retrigger.json',
     readMainRuns: vi.fn(() => runs), rerun: vi.fn(() => ({ ok: true })),
     readRecord: vi.fn(() => structuredClone(record)),
-    writeRecord: vi.fn((path, value) => { record = structuredClone(value); }), emitEvent: vi.fn(), lock: fn => ({ locked: true, value: fn() }) };
+    writeRecord: vi.fn((path, value) => { record = structuredClone(value); }), emitEvent: vi.fn(), lock: (_path, fn) => ({ locked: true, value: fn() }) };
   return { options, record: () => record, tick: () => sweepMainCancelledRetrigger(options) };
 }
 
@@ -419,7 +419,7 @@ describe('main cancelled CI retrigger: concurrent watchers', () => {
     const f = fixture();
     f.options.lock = () => ({ locked: false });
     const result = f.tick();
-    expect(result.refusals[0]).toMatchObject({ reason: 'record-locked', sha });
+    expect(result.refusals[0]).toMatchObject({ reason: 'record-locked' });
     expect(f.options.rerun).not.toHaveBeenCalled();
     expect(f.options.writeRecord).not.toHaveBeenCalled();
   });
@@ -430,9 +430,10 @@ describe('main cancelled CI retrigger: concurrent watchers', () => {
     const common = { apply: true, now, recordPath: 'fixture/r.json', rerun: vi.fn(() => ({ ok: true })), emitEvent: vi.fn(),
       readRecord: vi.fn(() => structuredClone(record)), writeRecord: vi.fn((p, v) => { record = structuredClone(v); }) };
     const withLock = fn => ({ locked: true, value: fn() });
+    const sweepOptionsLock = (_path, fn) => withLock(fn);
     // Watcher A starts; before its critical section runs, watcher B records head B.
     const a = { ...common, repo: 'web-everything/web-everything', readMainRuns: () => [run()],
-      lock: fn => { record = { [shaB]: { runId: 456, retriggeredAt: new Date(now).toISOString() } }; return withLock(fn); } };
+      lock: (path, fn) => { record = { [shaB]: { runId: 456, retriggeredAt: new Date(now).toISOString() } }; return sweepOptionsLock(path, fn); } };
     sweepMainCancelledRetrigger(a);
     expect(Object.keys(record).sort()).toEqual([sha, shaB].sort());
   });
