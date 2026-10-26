@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Card 106 — install command for the scheduled sweeps. DEFAULT OFF: with no flag it only prints the plan.
- *   --apply  writes the three plists into ~/Library/LaunchAgents (never overwrites an existing file).
+ *   --apply  writes the selected plists (--pass=<name> selects one) into ~/Library/LaunchAgents (never overwrites an existing file).
  * It NEVER runs launchctl; it prints the `launchctl bootstrap` lines for the operator to run (or not).
  * The write loop lives in `applyInstallPlan` (scheduled-sweep.mjs) so those guarantees are unit-tested.
  */
@@ -13,8 +13,9 @@ import { installPlan, applyInstallPlan } from './scheduled-sweep.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const apply = process.argv.includes('--apply');
+const pass = process.argv.find(arg => arg.startsWith('--pass='))?.slice(7);
 const home = homedir();
-const plan = installPlan({ repoRoot, nodePath: process.execPath, home, apply });
+const plan = installPlan({ repoRoot, nodePath: process.execPath, home, apply, pass });
 const { wrote, skipped } = applyInstallPlan({ plan, fs, home });
 for (const p of skipped) console.log(`skip (exists): ${p}`);
 for (const p of wrote) console.log(`wrote ${p}`);

@@ -1,5 +1,7 @@
+import { proveCardOnlyHeadMove } from '../card-only-head-move.mjs';
+import * as numbering from '../numbering-carry.mjs';
 import { describe, it, expect, vi } from 'vitest';
-import { normalizeRedTeamResult, planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
+import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
 import { readDrainRedTeamEvidence } from '../drain-red-team-evidence.mjs';
@@ -379,5 +381,218 @@ describe('PR 5890 review-pr status payloads', () => {
     expect(decide({ readStatus: () => ({ repo, pr, head, status: 'finished', result: 'ran', loopPayload: { ...payload(), op: 'review-pr' } }),
       readEvidence: () => ({ loopPayload: payload(), recorded: true, seatRecorded: true, completedRecorded: true }) }))
       .toMatchObject({ action: 'dispatch', mode: 'resume' });
+  });
+});
+
+
+describe('card-only head move recovery', () => {
+  const fromSha = 'b'.repeat(40);
+  const oldPayload = () => ({ verdict: { verdict: 'changes' }, findings: { read: {
+    netBasis: { rev: fromSha }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
+  } } });
+  const oldEvidence = () => {
+    const loopPayload = oldPayload();
+    return { loopPayload, recorded: false, seatRecorded: false, completedRecorded: false, inFlight: false,
+      status: { head: fromSha, status: 'finished', result: 'skipped', skipCardOnly: true, loopPayload: structuredClone(loopPayload) } };
+  };
+  // One row per top-level conjunct of cardOnlyHeadMoveCandidate. Keep this list
+  // aligned with the predicate so overlapping planner guards cannot hide a missing check.
+  it.each([
+    // Real-head validity is also implied by the matching-head and settleable-status guards.
+    ['real read head', e => { e.loopPayload.findings.read.netBasis.rev = 'unknown'; }],
+    ['moved read head', e => { e.loopPayload.findings.read.netBasis.rev = head; e.status.head = head; e.status.loopPayload.findings.read.netBasis.rev = head; }],
+    ['card-only read', e => { e.loopPayload.findings.read.netChangedFiles = ['scripts/code.mjs']; }],
+    ['settleable skip', e => { e.status.result = 'ran'; }],
+    ['matching status head', e => { e.status.head = 'c'.repeat(40); e.status.loopPayload.findings.read.netBasis.rev = e.status.head; }],
+    ['no recorded result', e => { e.recorded = true; }],
+    ['no recorded seat', e => { e.seatRecorded = true; }],
+    ['not in flight', e => { e.inFlight = true; }],
+    ['not queued', e => { e.queued = true; }],
+  ])('moved candidate requires %s', (_clause, mutate) => {
+    const evidence = oldEvidence();
+    expect(cardOnlyHeadMoveCandidate(evidence, head)).toBe(true);
+    mutate(evidence);
+    expect(cardOnlyHeadMoveCandidate(evidence, head)).toBe(false);
+  });
+  it.each(['numbering-only', 'card-only'])('%s move dispatches fresh despite a not-owed old review', kind => {
+    const proveMove = vi.fn(() => ({ ok: true, kind }));
+    expect(decide({ readEvidence: oldEvidence, proveMove })).toMatchObject({ action: 'dispatch', mode: 'fresh' });
+    expect(proveMove).toHaveBeenCalledWith({ fromSha, toSha: head });
+  });
+  it.each(['code change', 'unprovable move'])('keeps the skip for %s', reason => {
+    expect(decide({ readEvidence: oldEvidence, proveMove: () => ({ ok: false, reason }) }).action).toBe('skip');
+  });
+  it.each([
+    { recorded: true }, { seatRecorded: true }, { inFlight: true }, { queued: true },
+    { status: null }, { completedRecorded: true },
+  ])('does not dispatch with existing or unknown evidence %j', over => {
+    expect(decide({ readEvidence: () => ({ ...oldEvidence(), ...over }), proveMove: () => ({ ok: true }) }).action).toBe('skip');
+  });
+  it.each(['missing head', 'status head mismatch', 'code read', 'not skipped', 'skip disabled'])('refuses %s provenance', kind => {
+    const evidence = oldEvidence();
+    if (kind === 'missing head') delete evidence.loopPayload.findings.read.netBasis.rev;
+    if (kind === 'status head mismatch') {
+      evidence.status.head = 'c'.repeat(40);
+      evidence.status.loopPayload.findings.read.netBasis.rev = evidence.status.head;
+    }
+    if (kind === 'code read') evidence.loopPayload.findings.read.netChangedFiles = ['scripts/code.mjs'];
+    if (kind === 'not skipped') evidence.status.result = 'ran';
+    if (kind === 'skip disabled') evidence.status.skipCardOnly = false;
+    expect(decide({ readEvidence: () => evidence, proveMove: () => ({ ok: true }) }).action).toBe('skip');
+  });
+  it('observes cooldown and existing live-head state after the proof', () => {
+    const base = { readEvidence: oldEvidence, proveMove: () => ({ ok: true }) };
+    expect(decide({ ...base, lastDispatch: new Map([[`${repo}#${pr}@${head}`, 200_001]]) }).why).toBe('retry cooldown active');
+    expect(decide({ ...base, readStatus: () => ({ status: 'finished' }) }).action).toBe('skip');
+  });
+  it('runner uses the injected move proof and dispatches the normal red-team-only job', () => {
+    const dispatch = vi.fn(() => ({ jobPid: 42 }));
+    const out = runRedTeamOnSkip({ ...fixture(), plan: { refusals: fixture().refusals },
+      now: () => 2_000_000, readEvidence: oldEvidence, proveMove: () => ({ ok: true }),
+      capacity: { lanes: 1 }, dispatch });
+    expect(out.dispatched).toHaveLength(1);
+    expect(dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' });
+  });
+  it('runner default move proof forwards exec, cwd and mainRef to the numbering proof', () => {
+    const exec = vi.fn(), cwd = '/fixture/checkout', mainRef = 'fixture/main';
+    const detector = vi.spyOn(numbering, 'proveNumberingOnlyMove').mockReturnValue({ ok: true, kind: 'numbering-only' });
+    try {
+      const dispatch = vi.fn(() => ({ jobPid: 42 }));
+      const out = runRedTeamOnSkip({ ...fixture(), plan: { refusals: fixture().refusals },
+        now: () => 2_000_000, readEvidence: oldEvidence, exec, cwd, mainRef,
+        capacity: { lanes: 1 }, dispatch, lastDispatch: new Map() });
+      expect(out.dispatched).toHaveLength(1);
+      expect(detector).toHaveBeenCalledWith({ exec, cwd, mainRef, fromSha, toSha: head });
+      expect(dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' });
+    } finally { detector.mockRestore(); }
+  });
+  it('runner default move proof executes the card-path proof with its supplied cwd', () => {
+    const cwd = '/fixture/checkout';
+    const exec = vi.fn((file, args, options) => {
+      expect(file).toBe('git');
+      expect(options.cwd).toBe(cwd);
+      if (args[0] === 'merge-base') return '';
+      if (args[0] === 'rev-list') return `${head} ${fromSha}`;
+      if (args[0] === 'diff-tree') return 'backlog/123-card.md\0';
+      throw Error('not numbering');
+    });
+    const out = runRedTeamOnSkip({ ...fixture(), plan: { refusals: fixture().refusals },
+      now: () => 2_000_000, readEvidence: oldEvidence, exec, cwd, lastDispatch: new Map(),
+      capacity: { lanes: 1 }, dispatch: () => ({ jobPid: 42 }) });
+    expect(out.dispatched).toHaveLength(1);
+    expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['diff-tree', head]), expect.objectContaining({ cwd }));
+  });
+});
+
+describe('proveCardOnlyHeadMove', () => {
+  const fromSha = 'b'.repeat(40), toSha = head;
+  it('reuses the numbering detector before checking card paths', () => {
+    const proof = { ok: true, kind: 'numbering-only' };
+    const detector = vi.spyOn(numbering, 'proveNumberingOnlyMove').mockReturnValue(proof);
+    const exec = vi.fn();
+    try {
+      expect(proveCardOnlyHeadMove({ exec, fromSha, toSha, cwd: 'checkout', mainRef: 'main' })).toBe(proof);
+      expect(detector).toHaveBeenCalledWith({ exec, fromSha, toSha, cwd: 'checkout', mainRef: 'main' });
+      expect(exec).not.toHaveBeenCalled();
+    } finally { detector.mockRestore(); }
+  });
+  it('carries a renumber plus docs id rewrite through the real numbering detector', () => {
+    const zero = '0'.repeat(40), beforeOid = '1'.repeat(40), afterOid = '2'.repeat(40);
+    const docBeforeOid = '3'.repeat(40), docAfterOid = '4'.repeat(40);
+    const blobs = new Map([[beforeOid, '---\ntitle: card\n---\n'], [afterOid, '---\nbornAs: xabcdef\ntitle: card\n---\n'],
+      [docBeforeOid, 'See xabcdef.\n'], [docAfterOid, 'See 123.\n']]);
+    const exec = vi.fn((file, args, options) => {
+      expect(file).toBe('git');
+      expect(options.cwd).toBe('checkout');
+      let output;
+      if (args[0] === 'cat-file') {
+        if (args[1] === '-e') output = '';
+        else {
+          const blob = blobs.get(args[2]);
+          if (blob === undefined) throw Error('unknown blob');
+          output = args[1] === '-t' ? 'blob\n' : args[1] === '-s' ? `${Buffer.byteLength(blob)}\n` : blob;
+        }
+      } else if (args[0] === 'rev-parse') output = fromSha;
+      else if (args[0] === 'rev-list') output = `${toSha} ${fromSha}\n`;
+      else if (args[0] === 'log') output = 'drain: JIT-number xabcdef→#123 at land (#2288)\n';
+      else if (['ls-tree', 'grep'].includes(args[0])) output = '';
+      else if (args[0] === 'diff-tree') output = [
+        `:100644 000000 ${beforeOid} ${zero} D\0backlog/xabcdef-card.md\0`,
+        `:000000 100644 ${zero} ${afterOid} A\0backlog/123-card.md\0`,
+        `:100644 100644 ${docBeforeOid} ${docAfterOid} M\0docs/agent/testing.md\0`,
+      ].join('');
+      else throw Error(`unexpected Git read: ${args[0]}`);
+      return options.encoding === null ? Buffer.from(output) : output;
+    });
+    expect(proveCardOnlyHeadMove({ exec, fromSha, toSha, cwd: 'checkout', mainRef: 'fixture/main' }))
+      .toMatchObject({ ok: true, commits: [toSha], pairs: [['xabcdef', '123']] });
+    expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['ls-tree', 'fixture/main']), expect.anything());
+    expect(exec.mock.calls.some(([, args]) => args[0] === 'merge-base')).toBe(false);
+  });
+  const c1 = 'c'.repeat(40);
+  const fake = ({ ancestor = true, revList = `${c1} ${fromSha}`, tree }) => vi.fn((file, args) => {
+    if (args[0] === 'merge-base') { if (!ancestor) throw Error('not ancestor'); return ''; }
+    if (args[0] === 'rev-list') return revList;
+    if (args[0] === 'diff-tree') return tree;
+    throw Error('not numbering');
+  });
+  const history = count => Array.from({ length: count }, (_, i) => (i + 1).toString(16).padStart(40, '0'));
+  const revListFor = commits => commits.map((sha, i) => `${sha} ${commits[i + 1] ?? fromSha}`).join('\n');
+  it('accepts exactly 20 card-only commits and inspects every commit within bounded Git calls', () => {
+    const commits = history(20), exec = fake({ revList: revListFor(commits), tree: 'backlog/123-card.md\0' });
+    expect(proveCardOnlyHeadMove({ exec, fromSha, toSha: commits[0], cwd: 'checkout' })).toMatchObject({ ok: true, kind: 'card-only' });
+    expect(exec.mock.calls.filter(([, args]) => args[0] === 'diff-tree').map(([, args]) => args.at(-1))).toEqual(commits);
+    expect(exec).toHaveBeenCalledWith('git', ['rev-list', '--max-count=21', '--parents', `${fromSha}..${commits[0]}`],
+      expect.objectContaining({ cwd: 'checkout', timeout: 10_000, maxBuffer: 1024 * 1024 }));
+  });
+  it('rejects a history over MAX_COMMITS', () => {
+    for (const count of [20, 21]) {
+      const commits = history(count), exec = fake({ revList: revListFor(commits), tree: 'backlog/123-card.md\0' });
+      expect(proveCardOnlyHeadMove({ exec, fromSha, toSha: commits[0] }).ok, `${count} card-only commits`).toBe(count === 20);
+      expect(exec.mock.calls.filter(([, args]) => args[0] === 'diff-tree')).toHaveLength(count === 20 ? 20 : 0);
+    }
+  });
+  it.each(['', c1])('rejects empty or zero-parent history %j', revList => {
+    expect(proveCardOnlyHeadMove({ exec: fake({ revList, tree: 'backlog/123-card.md\0' }), fromSha, toSha }).ok).toBe(false);
+  });
+  it('rejects an intermediate non-card commit', () => {
+    // Both two-commit orders reject first-only/last-only inspection; the middle of three rejects endpoints-only inspection.
+    for (const [count, badIndex] of [[2, 0], [2, 1], [3, 0], [3, 1], [3, 2]]) {
+      const commits = history(count);
+      const exec = fake({ revList: revListFor(commits), tree: 'backlog/123-card.md\0' });
+      const read = exec.getMockImplementation();
+      exec.mockImplementation((file, args, options) => args[0] === 'diff-tree' && args.at(-1) === commits[badIndex]
+        ? 'scripts/code.mjs\0' : read(file, args, options));
+      expect(proveCardOnlyHeadMove({ exec, fromSha, toSha: commits[0] }).ok,
+        `non-card commit at index ${badIndex} of ${count}`).toBe(false);
+    }
+  });
+  it('requires --no-renames and sees a code-to-card rename', () => {
+    const exec = fake({ revList: `${toSha} ${fromSha}`, tree: 'backlog/123-card.md\0' }), read = exec.getMockImplementation();
+    exec.mockImplementation((file, args, options) => args[0] === 'diff-tree' && args.includes('--no-renames')
+      ? 'scripts/code.mjs\0backlog/123-card.md\0' : read(file, args, options));
+    expect(proveCardOnlyHeadMove({ exec, fromSha, toSha }).ok).toBe(false);
+    expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['diff-tree', '--no-renames', toSha]), expect.anything());
+  });
+  it.each([
+    ['backlog/123-card.md\0', true],
+    ['backlog/123-card.md\0scripts/code.mjs\0', false],
+    ['scripts/code.mjs\0backlog/123-moved.md\0', false],
+    ['', false], ['backlog/123-card.md', false], ['x'.repeat(1024 * 1024 + 1) + '\0', false],
+  ])('fails closed unless every commit contains only card paths (case %#)', (tree, ok) => {
+    const exec = fake({ tree });
+    expect(proveCardOnlyHeadMove({ exec, fromSha, toSha, cwd: 'checkout' }).ok).toBe(ok);
+  });
+  it('refuses a non-descendant head, a merge commit, and submodule-blind diffs', () => {
+    expect(proveCardOnlyHeadMove({ exec: fake({ ancestor: false, tree: 'backlog/1-a.md\0' }), fromSha, toSha }).ok).toBe(false);
+    expect(proveCardOnlyHeadMove({ exec: fake({ revList: `${c1} ${fromSha} ${'d'.repeat(40)}`, tree: 'backlog/1-a.md\0' }), fromSha, toSha }).ok).toBe(false);
+    const exec = fake({ tree: 'backlog/1-a.md\0' });
+    proveCardOnlyHeadMove({ exec, fromSha, toSha });
+    expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['diff-tree', '--ignore-submodules=none', '--no-ext-diff']), expect.anything());
+  });
+  it('refuses missing heads and unreadable Git evidence', () => {
+    const exec = () => { throw Error('missing commit'); };
+    expect(proveCardOnlyHeadMove({ exec, toSha }).ok).toBe(false);
+    expect(proveCardOnlyHeadMove({ exec, fromSha, toSha }).ok).toBe(false);
   });
 });

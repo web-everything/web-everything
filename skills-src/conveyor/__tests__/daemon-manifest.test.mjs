@@ -23,7 +23,7 @@ describe('DAEMON_MANIFEST — #3873, the 7 real watcher passes', () => {
 
   it('has the host passes plus 7 passes per repo', () => {
     expect(Object.keys(DAEMON_MANIFEST).sort()).toEqual([
-      'branch-drift', 'load-flake-reverify', 'infra-blocked', 'duplicate-pr-watch', 'orphan-claim-release', 'merge-orphan-sweep', 'lease-reaper', 'health-watch', 'health-responder', 'pr-movement-sweep', 'coroner-sweep', 'opus-sweep',
+      'branch-drift', 'load-flake-reverify', 'infra-blocked', 'duplicate-pr-watch', 'orphan-claim-release', 'merge-orphan-sweep', 'lease-reaper', 'health-watch', 'health-responder', 'pr-merge-watch', 'pr-movement-sweep', 'coroner-sweep', 'opus-sweep',
       ...['ci-queue-watch', 'parked-pr-conflict-watch', 'parked-pr-progress-watch', 'lane-pool-health-watch', 'stuck-pr-watch', 'ci-red-recovery-watch', 'advisory-label-sweep']
         .flatMap((p) => REPO_KEYS.map((k) => `${p}-${k}`)),
     ].sort());
@@ -257,4 +257,12 @@ describe('#4131 — the health watch job kinds', () => {
     expect(typeof m.HEALTH_WATCH_JOB_SWITCHES.ghProbes).toBe('boolean');
     expect(Object.isFrozen(m.HEALTH_WATCH_JOB_SWITCHES)).toBe(true);
   });
+});
+
+
+it('R116 pr-merge-watch is an opt-in five-minute one-shot pass', () => {
+  const entry = DAEMON_MANIFEST['pr-merge-watch'];
+  expect(entry).toEqual({ script: 'scripts/conveyor/pass-daemons/pr-merge-watch-pass.mjs',
+    args: ['--repo=web-everything/web-everything'], intervalMs: 300000, defaultLaunch: false });
+  expect(existsSync(join(REPO_ROOT, entry.script))).toBe(true);
 });

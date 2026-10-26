@@ -37,39 +37,91 @@ describe('measureNonTestLines — pure numstat accounting', () => {
   });
 
   it('treats empty input as zero changes without a backlog exemption', () => {
-    expect(openPr.measureNonTestLines('')).toEqual({ lines: 0, exempt: false });
+    expect(openPr.measureNonTestLines('')).toEqual({ lines: 0, dataLines: 0, exempt: false });
+  });
+
+  it.each(['config/settings.json', 'src/data/entries.json', 'nested/config/entries.yaml',
+    'data/entries.yml', 'nested/data/entries.csv'])('excludes and reports data additions and deletions in %s', (path) => {
+    expect(openPr.measureNonTestLines(`600\t100\t${path}\0`))
+      .toEqual({ lines: 0, dataLines: 700, exempt: false });
+  });
+
+  it.each(['config/setup.mjs', 'scripts/settings.json', 'docs/guide.md', 'data/guide.md',
+    'metadata/entries.json', 'config.json'])('still counts code, docs and non-data directories: %s', (path) => {
+    expect(openPr.measureNonTestLines(`200\t101\t${path}\0`))
+      .toEqual({ lines: 301, dataLines: 0, exempt: false });
+  });
+
+  it('accepts exact extra data paths from resolved settings without matching prefixes', () => {
+    const settings = { dataExtensions: [], dataDirs: [], dataPaths: ['scripts/settings.json'] };
+    expect(openPr.measureNonTestLines('600\t100\tscripts/settings.json\0', settings))
+      .toEqual({ lines: 0, dataLines: 700, exempt: false });
+    expect(openPr.measureNonTestLines('600\t100\tscripts/settings.json.extra\0', settings))
+      .toEqual({ lines: 700, dataLines: 0, exempt: false });
+    expect(openPr.measureNonTestLines('600\t100\tconfig/settings.json\0', settings))
+      .toEqual({ lines: 700, dataLines: 0, exempt: false });
+  });
+
+  it('counts both paths conservatively when a rename crosses the data boundary', () => {
+    expect(openPr.measureNonTestLines('301\t0\t\0scripts/settings.json\0data/settings.json\0'))
+      .toEqual({ lines: 301, dataLines: 0, exempt: false });
+    expect(openPr.measureNonTestLines('301\t0\t\0config/settings.json\0data/settings.json\0'))
+      .toEqual({ lines: 0, dataLines: 301, exempt: false });
+  });
+
+  it.each(['config/../scripts/a.json', 'config/./a.json', 'config//a.json',
+    '/config/a.json', './config/a.json', '../data/a.json', 'data/a.json/'])
+  ('counts unsafe data paths even when listed as exact exemptions: %s', (path) => {
+    const settings = { dataExtensions: ['.json'], dataDirs: ['config', 'data'], dataPaths: [path] };
+    for (const value of [undefined, settings]) {
+      expect(openPr.measureNonTestLines(`301\t0\t${path}\0`, value))
+        .toEqual({ lines: 301, dataLines: 0, exempt: false });
+    }
+  });
+
+  it.each(['config/a.mjs', 'data/a.md'])('never exempts code or markdown even with unchecked settings: %s', (path) => {
+    for (const dataPaths of [[], [path]]) {
+      const settings = { dataExtensions: ['.mjs', '.md'], dataDirs: ['config', 'data'], dataPaths };
+      expect(openPr.measureNonTestLines(`301\t0\t${path}\0`, settings))
+        .toEqual({ lines: 301, dataLines: 0, exempt: false });
+    }
+  });
+
+  it('fails closed for binary data and overflowing data totals', () => {
+    expect(() => openPr.measureNonTestLines('-\t-\tdata/blob.json\0')).toThrow(/unmeasurable/);
+    expect(() => openPr.measureNonTestLines('9007199254740991\t0\tdata/a.json\0' + '1\t0\tdata/b.json\0')).toThrow();
   });
 
   it('sums additions and deletions across non-test paths, with or without a trailing newline', () => {
     const text = '100\t50\tscripts/operations/open-pr.mjs\n20\t30\tdocs/a guide.md';
-    expect(openPr.measureNonTestLines(text)).toEqual({ lines: 200, exempt: false });
-    expect(openPr.measureNonTestLines(`${text}\n`)).toEqual({ lines: 200, exempt: false });
+    expect(openPr.measureNonTestLines(text)).toEqual({ lines: 200, dataLines: 0, exempt: false });
+    expect(openPr.measureNonTestLines(`${text}\n`)).toEqual({ lines: 200, dataLines: 0, exempt: false });
   });
 
   it('reads NUL-delimited paths containing non-ASCII characters, tabs, newlines and quotes literally', () => {
     expect(openPr.measureNonTestLines('700\t100\tbacklog/é.md\0'))
-      .toEqual({ lines: 800, exempt: true });
+      .toEqual({ lines: 800, dataLines: 0, exempt: true });
     expect(openPr.measureNonTestLines('1\t2\tscripts/a\tb\nc"d.mjs\0'))
-      .toEqual({ lines: 3, exempt: false });
+      .toEqual({ lines: 3, dataLines: 0, exempt: false });
     expect(openPr.measureNonTestLines('200\t50\tscripts/a.mjs\0' + '600\t300\tscripts/__tests__/é.mjs\0'))
-      .toEqual({ lines: 250, exempt: false });
+      .toEqual({ lines: 250, dataLines: 0, exempt: false });
   });
 
   it('counts renames by their numstat counts and classifies both paths', () => {
     expect(openPr.measureNonTestLines('0\t0\t\0scripts/old.mjs\0scripts/new.mjs\0'))
-      .toEqual({ lines: 0, exempt: false });
+      .toEqual({ lines: 0, dataLines: 0, exempt: false });
     expect(openPr.measureNonTestLines('1\t1\t\0scripts/old.test.mjs\0scripts/new.mjs\0'))
-      .toEqual({ lines: 2, exempt: false });
+      .toEqual({ lines: 2, dataLines: 0, exempt: false });
     expect(openPr.measureNonTestLines('400\t0\t\0scripts/old.mjs\0scripts/new.test.mjs\0'))
-      .toEqual({ lines: 400, exempt: false });
+      .toEqual({ lines: 400, dataLines: 0, exempt: false });
     expect(openPr.measureNonTestLines('400\t0\t\0docs/old.md\0backlog/new.md\0'))
-      .toEqual({ lines: 400, exempt: false });
+      .toEqual({ lines: 400, dataLines: 0, exempt: false });
     expect(openPr.measureNonTestLines('400\t0\t\0backlog/old.md\0docs/new.md\0'))
-      .toEqual({ lines: 400, exempt: false });
+      .toEqual({ lines: 400, dataLines: 0, exempt: false });
     expect(openPr.measureNonTestLines('400\t0\t\0scripts/old.test.mjs\0scripts/__tests__/new.mjs\0'))
-      .toEqual({ lines: 0, exempt: false });
+      .toEqual({ lines: 0, dataLines: 0, exempt: false });
     expect(openPr.measureNonTestLines('400\t0\t\0backlog/old.md\0backlog/new.md\0'))
-      .toEqual({ lines: 400, exempt: true });
+      .toEqual({ lines: 400, dataLines: 0, exempt: true });
   });
 
   it.each([
@@ -91,26 +143,26 @@ describe('measureNonTestLines — pure numstat accounting', () => {
     'scripts/x/a.spec.ts',
   ])('excludes additions and deletions for test path %s', (path) => {
     expect(openPr.measureNonTestLines(`200\t50\tscripts/x.mjs\n600\t300\t${path}\n`))
-      .toEqual({ lines: 250, exempt: false });
+      .toEqual({ lines: 250, dataLines: 0, exempt: false });
   });
 
   it('counts similarly named non-test paths', () => {
     expect(openPr.measureNonTestLines('10\t5\tscripts/__tests__helpers/a.mjs\n20\t5\tscripts/a.testing.mjs\n'))
-      .toEqual({ lines: 40, exempt: false });
+      .toEqual({ lines: 40, dataLines: 0, exempt: false });
   });
 
   it('exempts a nonempty diff only when every path starts with backlog/', () => {
     expect(openPr.measureNonTestLines('700\t100\tbacklog/a.md\n150\t50\tbacklog/nested/b.md\n'))
-      .toEqual({ lines: 1000, exempt: true });
+      .toEqual({ lines: 1000, dataLines: 0, exempt: true });
     expect(openPr.measureNonTestLines('0\t0\tbacklog/a.md\n'))
-      .toEqual({ lines: 0, exempt: true });
+      .toEqual({ lines: 0, dataLines: 0, exempt: true });
   });
 
   it('does not exempt mixed paths, even when the outside path is a test', () => {
     expect(openPr.measureNonTestLines('1000\t0\tbacklog/a.md\n1\t0\tscripts/a.mjs\n'))
-      .toEqual({ lines: 1001, exempt: false });
+      .toEqual({ lines: 1001, dataLines: 0, exempt: false });
     expect(openPr.measureNonTestLines('1000\t0\tbacklog/a.md\n900\t0\tscripts/a.test.mjs\n'))
-      .toEqual({ lines: 1000, exempt: false });
+      .toEqual({ lines: 1000, dataLines: 0, exempt: false });
   });
 
   it.each([
@@ -133,6 +185,113 @@ describe('measureNonTestLines — pure numstat accounting', () => {
   ])('throws rather than silently undercounting %s', (_name, text) => {
     expect(openPr.measureNonTestLines).toBeTypeOf('function');
     expect(() => openPr.measureNonTestLines(text)).toThrow();
+  });
+});
+
+describe('PR size settings cascade', () => {
+  it('loads the production default settings file as a filesystem path', async () => {
+    const { loadPrSizeSettingsFile } = await import('../../lib/pr-size-settings.mjs');
+    expect(loadPrSizeSettingsFile(undefined, { platform: {}, env: {} })).toEqual({
+      dataExtensions: ['.json', '.yaml', '.yml', '.csv'], dataDirs: ['config', 'data'], dataPaths: [],
+    });
+  });
+
+  it('resolves standard, platform, tool and environment leaves with provenance', async () => {
+    const { resolvePrSizeSettings } = await import('../../lib/pr-size-settings.mjs');
+    const resolved = resolvePrSizeSettings({ platform: { dataDirs: ['fixtures'], dataPaths: ['platform.json'] },
+      tool: { dataPaths: ['tool.json'] }, env: { WE_PR_SIZE_DATA_EXTENSIONS: '[".csv"]' } });
+    expect(resolved.value).toEqual({ dataExtensions: ['.csv'], dataDirs: ['fixtures'], dataPaths: ['tool.json'] });
+    expect(resolved.sources).toEqual({ dataExtensions: 'env', dataDirs: 'platform', dataPaths: 'tool' });
+    expect(openPr.measureNonTestLines('400\t5\tfixtures/table.csv\0', resolved.value))
+      .toEqual({ lines: 0, dataLines: 405, exempt: false });
+  });
+
+  it('rejects invalid overrides instead of retaining lower layers', async () => {
+    const { resolvePrSizeSettings } = await import('../../lib/pr-size-settings.mjs');
+    expect(() => resolvePrSizeSettings({ platform: {}, tool: { dataDirs: ['../scripts'], dataPaths: ['/absolute.json'] },
+      env: { WE_PR_SIZE_DATA_EXTENSIONS: 'not-json', WE_PR_SIZE_DATA_PATHS: '["../escape.json"]' } })).toThrow();
+  });
+
+  it.each([
+    { dataExtensions: ['.mjs'] }, { dataExtensions: ['.json', '.md'] },
+    { dataPaths: ['scripts/a.mjs'] }, { dataPaths: ['docs/a.md'] },
+    { dataPaths: ['config/../scripts/a.json'] }, { dataPaths: ['config/./a.json'] },
+    { dataPaths: ['config//a.json'] }, { dataPaths: ['/config/a.json'] },
+    { dataExtensions: '.json' }, { dataExtensions: [1] }, { dataDirs: null },
+    { dataPaths: {} }, { dataPaths: { nested: ['scripts/a.json'] } }, null, [], 'invalid',
+  ])('rejects invalid settings in every cascade layer: %j', async (invalid) => {
+    const { resolvePrSizeSettings } = await import('../../lib/pr-size-settings.mjs');
+    expect(() => resolvePrSizeSettings({ platform: {}, tool: invalid, env: {} })).toThrow();
+    expect(() => resolvePrSizeSettings({ platform: invalid, tool: {}, env: {} })).toThrow();
+    if (invalid && !Array.isArray(invalid) && typeof invalid === 'object') {
+      const env = Object.fromEntries(Object.entries(invalid).map(([key, value]) => [
+        `WE_PR_SIZE_${key.replace(/[A-Z]/g, letter => `_${letter}`).toUpperCase()}`, JSON.stringify(value),
+      ]));
+      expect(() => resolvePrSizeSettings({ platform: {}, tool: {}, env })).toThrow();
+    }
+  });
+
+  it('allows narrowing and extending the extension selection only within pure data', async () => {
+    const { resolvePrSizeSettings } = await import('../../lib/pr-size-settings.mjs');
+    const { value } = resolvePrSizeSettings({ platform: { dataExtensions: ['.json'] },
+      tool: { dataExtensions: ['.json', '.yaml', '.yml', '.csv'] }, env: {} });
+    expect(value.dataExtensions).toEqual(['.json', '.yaml', '.yml', '.csv']);
+  });
+
+  it('rejects malformed environment JSON even when lower layers are valid', async () => {
+    const { resolvePrSizeSettings } = await import('../../lib/pr-size-settings.mjs');
+    expect(() => resolvePrSizeSettings({ platform: {}, env: { WE_PR_SIZE_DATA_PATHS: 'not-json' } })).toThrow();
+  });
+
+  it('rejects invalid lower layers even when a valid override would replace them', async () => {
+    const { resolvePrSizeSettings } = await import('../../lib/pr-size-settings.mjs');
+    expect(() => resolvePrSizeSettings({ platform: { dataExtensions: ['.mjs'] },
+      tool: { dataExtensions: ['.json'] }, env: { WE_PR_SIZE_DATA_EXTENSIONS: '[".csv"]' } })).toThrow();
+  });
+
+  it.each(['{broken', '[]', '{"prSize":null}', '{"prSize":{"dataPaths":["scripts/a.mjs"]}}'])
+  ('rejects unreadable or invalid platform preferences: %s', async (contents) => {
+    const { resolvePrSizeSettings } = await import('../../lib/pr-size-settings.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'pr-size-platform-'));
+    try {
+      const path = join(dir, 'preferences.json');
+      writeFileSync(path, contents);
+      expect(() => resolvePrSizeSettings({ env: { WE_PLATFORM_PREFERENCES_FILE: path } })).toThrow();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('loads exact repo paths, throws for malformed or unreadable files, and defaults only for absent files', async () => {
+    const { loadPrSizeSettingsFile } = await import('../../lib/pr-size-settings.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'pr-size-settings-'));
+    try {
+      const path = join(dir, 'settings.json');
+      writeFileSync(path, JSON.stringify({ dataPaths: ['scripts/settings.json'] }));
+      const settings = loadPrSizeSettingsFile(path, { env: {}, platform: {} });
+      expect(openPr.measureNonTestLines('400\t5\tscripts/settings.json\0', settings))
+        .toEqual({ lines: 0, dataLines: 405, exempt: false });
+      writeFileSync(path, 'invalid');
+      expect(() => loadPrSizeSettingsFile(path, { env: {}, platform: {} })).toThrow();
+      expect(() => loadPrSizeSettingsFile(dir, { env: {}, platform: {} })).toThrow();
+      expect(loadPrSizeSettingsFile(join(dir, 'missing'), { env: {}, platform: {} })).toEqual({
+        dataExtensions: ['.json', '.yaml', '.yml', '.csv'], dataDirs: ['config', 'data'], dataPaths: [],
+      });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each(['{broken', 'null', '{"dataExtensions":".json"}', '{"dataExtensions":[".mjs"]}',
+    '{"dataPaths":["scripts/a.mjs"]}', '{"dataPaths":["docs/a.md"]}'])
+  ('reports pr-size-unreadable without submission for invalid present settings: %s', async (contents) => {
+    const { loadPrSizeSettingsFile } = await import('../../lib/pr-size-settings.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'pr-size-invalid-'));
+    try {
+      const path = join(dir, 'settings.json');
+      writeFileSync(path, contents);
+      const { run, spawn } = fixture('1\t0\tconfig/a.json\0', {
+        loadSizeSettings: () => loadPrSizeSettingsFile(path, { platform: {}, env: {} }),
+      });
+      expect(run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-size-unreadable' });
+      expect(spawn).not.toHaveBeenCalled();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
 
@@ -303,7 +462,7 @@ describe('real git numstat evidence', () => {
       git(['add', '.']);
       const backlog = git(['-c', 'core.quotePath=true', 'diff', '--cached', '--numstat', '-z', '--find-renames']);
       expect(backlog).toBe('400\t0\tbacklog/é.md\0');
-      expect(openPr.measureNonTestLines(backlog)).toEqual({ lines: 400, exempt: true });
+      expect(openPr.measureNonTestLines(backlog)).toEqual({ lines: 400, dataLines: 0, exempt: true });
       const { run, spawn } = fixture(backlog);
       expect(run({ argv })).toMatchObject(opened);
       expect(spawn).toHaveBeenCalledTimes(1);
@@ -314,7 +473,7 @@ describe('real git numstat evidence', () => {
       git(['add', '.']);
       const renamed = git(['diff', '--cached', '--numstat', '-z', '--find-renames', '--', '*.mjs']);
       expect(renamed).toBe('1\t1\t\0old.mjs\0new.mjs\0');
-      expect(openPr.measureNonTestLines(renamed)).toEqual({ lines: 2, exempt: false });
+      expect(openPr.measureNonTestLines(renamed)).toEqual({ lines: 2, dataLines: 0, exempt: false });
       const renameRun = fixture(renamed);
       expect(renameRun.run({ argv })).toMatchObject(opened);
       expect(renameRun.spawn).toHaveBeenCalledTimes(1);
@@ -460,6 +619,27 @@ describe('createPrLandRunner — non-test size admission', () => {
     expect(run({ argv })).toMatchObject(opened);
     expect(diffStat).toHaveBeenCalledTimes(1);
     expect(spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it('admits 300 code lines plus data lines that still require review', () => {
+    const { run, spawn } = fixture('300\t0\tscripts/a.mjs\0' + '900\t100\tconfig/settings.json\0');
+    expect(run({ argv })).toMatchObject(opened);
+    expect(spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses cascade settings for the admission counter', () => {
+    const { run, spawn } = fixture('400\t5\tscripts/settings.json\0', {
+      env: { WE_PR_SIZE_DATA_PATHS: '["scripts/settings.json"]' },
+    });
+    expect(run({ argv })).toMatchObject(opened);
+    expect(spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports excluded data lines in a size refusal', () => {
+    const { run, spawn } = fixture('301\t0\tscripts/a.mjs\0' + '900\t100\tdata/entries.json\0');
+    expect(run({ argv })).toMatchObject({ outcome: 'refused', reason: 'pr-too-large',
+      detail: expect.stringContaining('1000 data lines (not counted)') });
+    expect(spawn).not.toHaveBeenCalled();
   });
 
   it('admits a backlog-only diff of 1000 lines', () => {
