@@ -38,7 +38,7 @@ export default {
           ...(strict ? { reviewTiming: { startAfter: 'ci-green' } } : {}),
           over: { labels: [{ name: label }], statusCheckRollup: rollup.map(row =>
             ['test', 'smoke'].includes(row.name) ? check(row.name, row.name === cancelled ? 'CANCELLED' : 'SUCCESS') : row),
-          timeoutRetry: { eligible: true, infraCancelled: true, repo: 'web-everything/web-everything',
+          timeoutRetry: { eligible: true, infraCancelled: true, repo: 'review-gate-fixture/example',
             pr: pull.number, head, signature: 'infra', jobs: [{ run: 10, job: 20, attempt: 1 }] },
           timeoutRetryBudget: { confirmed: 0, rejected: 0, pending: false } },
         })))),
