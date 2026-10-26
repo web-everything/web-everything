@@ -59,7 +59,7 @@
 import { readFixPush } from './fix-push-state.mjs';
 import { resolveHandoffSettings } from '../lib/handoff-settings.mjs';
 import { dirname, join, resolve } from 'node:path';
-import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { linkSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { handoffHome } from '../operations/handoff-home.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
 import { randomUUID } from 'node:crypto';
@@ -1398,24 +1398,36 @@ export function formatMissingRunReport({ dispatch = [], refusals = [], applied =
 function readMainRetriggerRecord(path) {
   try { return JSON.parse(readFileSync(path, 'utf8')); }
   catch (e) {
-    if (e.code === 'ENOENT') return {};
-    throw e;
+    if (e.code !== 'ENOENT') throw e;
+    // A repository's first read seeds from the pre-split shared file, so a head already retriggered there
+    // is still remembered (entries are keyed by sha; foreign shas are inert and age out with the bound).
+    const legacy = join(dirname(path), 'main-ci-retrigger.json');
+    if (legacy === path) return {};
+    try { return JSON.parse(readFileSync(legacy, 'utf8')); }
+    catch (le) { if (le.code === 'ENOENT') return {}; throw le; }
   }
 }
 
 function writeMainRetriggerRecord(path, record) {
   mkdirSync(dirname(path), { recursive: true });
   const temporary = `${path}.${randomUUID()}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(record)}\n`, { mode: 0o600 });
-  renameSync(temporary, path);
+  try {
+    writeFileSync(temporary, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    renameSync(temporary, path);
+  } catch (e) {
+    rmSync(temporary, { force: true });
+    throw e;
+  }
 }
 
 export function rerunMainCancelledRun(runId, { repo = null, exec = execFileSyncThrottled } = {}) {
   try {
-    exec('gh', ['api', '-X', 'POST', `repos/${repoSlug(repo)}/actions/runs/${runId}/rerun`], {
+    const out = exec('gh', ['api', '-X', 'POST', `repos/${repoSlug(repo)}/actions/runs/${runId}/rerun`], {
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024,
       timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
     });
+    // The throttle can answer with a deferral payload instead of running gh: nothing was submitted.
+    if (isGhDeferred(out)) return { ok: false, uncertain: false, error: 'rerun deferred by the gh throttle; nothing submitted' };
     return { ok: true };
   } catch (e) {
     const error = describeExecError(e);
@@ -1431,30 +1443,49 @@ export function rerunMainCancelledRun(runId, { repo = null, exec = execFileSyncT
 export function mainRetriggerRecordPath(repo = null, home = handoffHome()) {
   const slug = repoSlug(repo);
   return join(home, slug === CONSTELLATION_REPOS.we.slug ? 'main-ci-retrigger.json'
-    : `main-ci-retrigger.${slug.replace(/[^A-Za-z0-9._-]/g, '-')}.json`);
+    : `main-ci-retrigger.${encodeURIComponent(slug)}.json`);
 }
 
 /** Exclusive advisory lock around a record's read-modify-write (atomic rename protects one write, not the sequence).
  *  Returns {locked:false} when another holder is still live after `waitMs`; a lock older than `staleMs`
  *  (a crashed holder) is stolen. The lock is always released, including when `fn` throws. */
-export function withMainRetriggerLock(recordPath, fn, { waitMs = 5000, staleMs = resolveChildTimeoutMs() + 60_000 } = {}) {
+export function withMainRetriggerLock(recordPath, fn, { waitMs = 5000, staleMs = resolveChildTimeoutMs() * 2 + 60_000 } = {}) {
   const lockPath = `${recordPath}.lock`;
+  const token = randomUUID();
   mkdirSync(dirname(recordPath), { recursive: true });
   const deadline = Date.now() + waitMs;
-  let acquired = false;
-  while (!acquired) {
-    try { closeSync(openSync(lockPath, 'wx', 0o600)); acquired = true; }
+  const readToken = () => { try { return readFileSync(lockPath, 'utf8'); } catch { return null; } };
+  const holdsLock = () => readToken() === token;
+  // The lock file carries an owner token: only its owner releases it, and a holder whose lock was stolen
+  // as stale (slow gh calls) learns that via assertHeld before every record write instead of clobbering.
+  const assertHeld = () => { if (!holdsLock()) throw Error('main retrigger lock lost; another watcher may be updating the record'); };
+  // Stale = older than any live holder can run, either direction (a future mtime is clock skew, not a live hold).
+  // Never throws or loops without a sleep: an unremovable or odd entry just falls through to the deadline.
+  const reclaimStale = () => {
+    let seen;
+    try { const st = lstatSync(lockPath); if (Math.abs(Date.now() - st.mtimeMs) <= staleMs) return false; seen = readToken(); }
+    catch { return false; }
+    const parked = `${lockPath}.stale.${randomUUID()}`;
+    try { renameSync(lockPath, parked); } catch { return false; }
+    try {
+      // Between the stat and the rename a faster watcher may have replaced the stale lock; put a fresh one back.
+      let content = null;
+      try { content = readFileSync(parked, 'utf8'); } catch { /* a directory or symlink: nothing to restore */ }
+      if (content !== seen) { try { linkSync(parked, lockPath); } catch { /* lost the lock: its holder's assertHeld aborts it */ } }
+    } finally { rmSync(parked, { recursive: true, force: true }); }
+    return true;
+  };
+  for (;;) {
+    try { writeFileSync(lockPath, token, { flag: 'wx', mode: 0o600 }); break; }
     catch (e) {
       if (e.code !== 'EEXIST') throw e;
-      let age = 0;
-      try { age = Date.now() - statSync(lockPath).mtimeMs; } catch { continue; }
-      if (age > staleMs) { try { unlinkSync(lockPath); } catch { /* another watcher stole it first */ } continue; }
+      const reclaimed = reclaimStale();
       if (Date.now() >= deadline) return { locked: false };
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+      if (!reclaimed) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
     }
   }
-  try { return { locked: true, value: fn() }; }
-  finally { try { unlinkSync(lockPath); } catch { /* already stolen as stale */ } }
+  try { return { locked: true, value: fn({ assertHeld }) }; }
+  finally { if (holdsLock()) rmSync(lockPath, { force: true }); }
 }
 
 /** One whole-run retry per main head, then a durable, once-only stuck signal.
@@ -1464,7 +1495,7 @@ export function sweepMainCancelledRetrigger(options = {}) {
   const { repo = null, apply = false, recordPath = mainRetriggerRecordPath(repo), lock = withMainRetriggerLock } = options;
   if (!apply) return sweepMainCancelledLocked({ ...options, recordPath });
   let held;
-  try { held = lock(recordPath, () => sweepMainCancelledLocked({ ...options, recordPath })); }
+  try { held = lock(recordPath, ctx => sweepMainCancelledLocked({ ...options, recordPath, assertHeld: ctx?.assertHeld })); }
   catch (e) {
     return { dispatch: [], applied: [], refusals: [{ reason: 'record-lock-failed', error: describeExecError(e) }] };
   }
@@ -1475,10 +1506,12 @@ export function sweepMainCancelledRetrigger(options = {}) {
 function sweepMainCancelledLocked({ repo = null, defaultBranch = 'main', apply = false,
   readMainRuns = defaultReadMainRuns, rerun = rerunMainCancelledRun,
   recordPath,
-  readRecord = readMainRetriggerRecord, writeRecord = writeMainRetriggerRecord,
+  readRecord = readMainRetriggerRecord, writeRecord: persistRecord = writeMainRetriggerRecord,
   emitEvent = event => appendDaemonEvent({ ...event, daemon: 'ci-red-recovery-watch' }),
-  now = Date.now(),
+  now = Date.now(), assertHeld = () => {},
 } = {}) {
+  // A holder whose lock expired during slow gh calls must not write its stale snapshot over a newer record.
+  const writeRecord = (path, value) => { assertHeld(); persistRecord(path, value); };
   const result = { dispatch: [], refusals: [], applied: [] };
   const refuse = (reason, detail = {}) => {
     result.refusals.push({ reason, ...detail });

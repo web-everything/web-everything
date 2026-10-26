@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, utimesSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, utimesSync, readFileSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { sweepMainCancelledRetrigger, rerunMainCancelledRun, formatMainCancelledReport, main,
   mainRetriggerRecordPath, withMainRetriggerLock } from '../ci-red-recovery-watch.mjs';
 import { DEFAULT_MAIN_WORKFLOW_NAME } from '../main-red-recovery.mjs';
@@ -435,5 +435,80 @@ describe('main cancelled CI retrigger: concurrent watchers', () => {
       lock: fn => { record = { [shaB]: { runId: 456, retriggeredAt: new Date(now).toISOString() } }; return withLock(fn); } };
     sweepMainCancelledRetrigger(a);
     expect(Object.keys(record).sort()).toEqual([sha, shaB].sort());
+  });
+});
+
+describe('main cancelled CI retrigger: lock hardening', () => {
+  const dir = () => mkdtempSync(join(tmpdir(), 'main-retrigger-'));
+  const inTemp = body => { const root = dir(); try { body(join(root, 'record.json')); } finally { rmSync(root, { recursive: true, force: true }); } };
+
+  it('does not delete a lock that a newer holder owns after this holder was treated as stale', () => {
+    inTemp(path => {
+      withMainRetriggerLock(path, () => { writeFileSync(`${path}.lock`, 'newer-holder-token'); }, { waitMs: 0 });
+      expect(readFileSync(`${path}.lock`, 'utf8')).toBe('newer-holder-token');
+    });
+  });
+
+  it('aborts the record write when the lock was lost, so an expired holder cannot clobber the record', () => {
+    inTemp(path => {
+      const f = fixture();
+      f.options.recordPath = path;
+      f.options.lock = withMainRetriggerLock;
+      f.options.rerun.mockImplementation(() => { writeFileSync(`${path}.lock`, 'newer-holder-token'); return { ok: true }; });
+      const result = f.tick();
+      expect(result.applied[0]).toMatchObject({ ok: false, error: expect.stringContaining('lock lost') });
+      expect(f.record()[sha]).toMatchObject({ reserved: true });
+    });
+  });
+
+  it.each([
+    ['a directory', p => mkdirSync(p)],
+    ['a dangling symlink', p => symlinkSync(join(p, 'missing'), p)],
+  ])('reclaims %s left at the lock path without spinning', (_name, make) => {
+    inTemp(path => {
+      make(`${path}.lock`);
+      const started = Date.now();
+      expect(withMainRetriggerLock(path, () => 'ok', { waitMs: 200, staleMs: -1 })).toEqual({ locked: true, value: 'ok' });
+      expect(Date.now() - started).toBeLessThan(2000);
+    });
+  });
+
+  it('gives up at the deadline when an unreclaimable live-looking lock stays', () => {
+    inTemp(path => {
+      writeFileSync(`${path}.lock`, 'live');
+      const started = Date.now();
+      expect(withMainRetriggerLock(path, () => 'no', { waitMs: 150, staleMs: 3_600_000 })).toEqual({ locked: false });
+      expect(Date.now() - started).toBeLessThan(2000);
+    });
+  });
+
+  it('treats a lock stamped far in the future as stale clock skew', () => {
+    inTemp(path => {
+      writeFileSync(`${path}.lock`, 'skewed');
+      const future = new Date(Date.now() + 3_600_000);
+      utimesSync(`${path}.lock`, future, future);
+      expect(withMainRetriggerLock(path, () => 'ok', { waitMs: 0, staleMs: 60_000 })).toEqual({ locked: true, value: 'ok' });
+    });
+  });
+
+  it('encodes repository slugs so distinct repositories never share a record file', () => {
+    expect(mainRetriggerRecordPath('a/b-c', '/h')).not.toBe(mainRetriggerRecordPath('a-b/c', '/h'));
+  });
+
+  it('seeds a repository record from the pre-split shared file so an already-retriggered head is not rerun', () => {
+    inTemp(path => {
+      writeFileSync(join(dirname(path), 'main-ci-retrigger.json'), JSON.stringify({ [sha]: { runId: 123, retriggeredAt: new Date(now).toISOString() } }));
+      const repoPath = mainRetriggerRecordPath('web-everything/frontierui', dirname(path));
+      const rerun = vi.fn(() => ({ ok: true }));
+      const result = sweepMainCancelledRetrigger({ apply: true, now, repo: 'web-everything/frontierui', recordPath: repoPath, rerun,
+        readMainRuns: () => [run({ updatedAt: '2026-10-26T11:30:00Z' })], emitEvent: vi.fn() });
+      expect(result.dispatch[0].action).toBe('main-ci-stuck');
+      expect(rerun).not.toHaveBeenCalled();
+    });
+  });
+
+  it('does not count a throttle deferral payload as a submitted rerun', () => {
+    const exec = () => JSON.stringify({ outcome: 'deferred-low-budget' });
+    expect(rerunMainCancelledRun(123, { exec })).toEqual({ ok: false, uncertain: false, error: expect.stringContaining('deferred') });
   });
 });
