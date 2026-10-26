@@ -2431,18 +2431,16 @@ Cc/Cf controls and are width-capped; table mode keeps the truncated-listing warn
 
 ### Delegated clearance races
 
-The delegated-clearance suite passes the sweep's actual argv through `runReviewLabelCli`
-with injected forge IO. `clear-human` pins via `--expect-head` plus validated delegation;
-`--new-head` only overrides restamp and delegation scope alone does not pin anything.
-Re-read full comments and PR gates before live clearance; shadow runs need no live read.
-Void memos belong to `repo#pr:rulingId`, surviving head movement and daemon restarts.
-The reconciler composition regression keeps its default PR reader and injects forge transport
-that projects only requested JSON fields. It must reach live clearance with eligible evidence
-and refuse missing or failed gates; testing the expanded reader alone misses caller overrides.
+The delegated-clearance suite constructs CLI arguments for `runReviewLabelCli` with injected
+forge IO. A clear-human request carrying delegation, the daemon channel, or an expected head
+requires a full 40-hex `--expect-head`, valid delegation JSON, and no `--new-head` flag.
+Missing the pin refuses before PR reads or writes. Ordinary operator clearances keep their
+existing path. These tests cover the CLI boundary; they do not establish R130 sweep wiring,
+shadow/live behavior, durable void memos, or default-reader reconciler composition.
 
 `scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` crosses every label in
 `DELEGATED_CLEARANCE_INELIGIBLE_LABELS`, plus unreadable/malformed labels and failed reads,
-with each admission read after the initial observation: before comment, before swap, and
+with each admission read including the initial observation: before comment, before swap, and
 (already accepted only) before reassertion. Keep a trusted matching repark marker in these
 fixtures so the reassert write is reachable. Refusal exits 1 and permits no subsequent writes;
 only a refusal before the first write can promise zero writes for the entire invocation.
@@ -2461,3 +2459,15 @@ There are no delegated `addLabels` or `removeLabels` calls. Mechanical handoff's
 two label writes, and `withdrawParkOnLiveClearance`/`restoreClearanceOverRacedPark` are
 restricted to `restampAcrossHold` (`to === 'restamp'`), so delegation cannot reach them.
 Operator clearances keep their existing eligibility and best-effort reassertion behavior.
+
+Guarantee-to-test map (case names are parameterized Vitest titles):
+
+| Guarantee | Repository-qualified test file | Exact case title | Observable assertion |
+| --- | --- | --- | --- |
+| Required pin/delegation and forbidden new-head flags | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `refuses pinned clear-human with $name before any PR read or write` | Exit 2, argument diagnostic, zero PR reads/writes. |
+| Validated delegation | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `refuses invalid delegation %s before any PR read or write` | Invalid JSON/null/object/array refuses before PR access. |
+| Head pin at every admission boundary | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `refuses a moved head at read $injectAt ($boundary), with no subsequent writes` | Exit 1, boundary diagnostic, only explicitly enumerated prior writes. |
+| Initial and later label eligibility | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `refuses $label at read $injectAt ($boundary), with no subsequent comment or label writes` | Every blocker/read failure refuses; no writes after refusal. |
+| Operator recovery remains best effort | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `preserves operator best-effort reassertion on %s` | Read failure/head movement leaves exit 0 with no reassert write. |
+| List field projection | `we:scripts/conveyor/__tests__/advisory-label-sweep.test.mjs` | `passes $name list fields unchanged to forge argv` | Default and explicit fields reach the exact JSON argument. |
+| View field projection and complete comments | `we:scripts/conveyor/__tests__/advisory-label-sweep.test.mjs` | `passes $name view fields and replaces projected comments with the complete thread` | Exact argv; paginated thread replaces projected comments. |
