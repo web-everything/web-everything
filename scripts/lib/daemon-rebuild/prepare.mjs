@@ -267,6 +267,9 @@ export async function prepareRebuild({
   const fetchedMainSha = verifyRev(git, 'origin/main^{commit}');
   // Per-ref confirmation allows recorded-SHA retirement for deleted branches without trusting failed fetches
   // or names the fetch layer skipped. One unavailable ref cannot block retirement of independently verified ones.
+  // Sources a retirement put back this tick were never fetched by it: they wait for the next tick's fetch
+  // instead of raising unavailable alerts or a pinned hold (their container's content is already in main).
+  const reinstatedNow = new Set();
   if (!mainOnly && !overlayState.corrupt && fetchedMainSha) {
     try {
       // The adopted build's applied tips are evidence for a deleted branch registered before `tipSha` was
@@ -276,6 +279,7 @@ export async function prepareRebuild({
       const retired = await autoRetireOverlays({ root, env, overlays: overlaysBefore, git, mainSha: fetchedMainSha,
         refEvidence: fetchResult.refEvidence, recordedShas, now, removeOverlay, appendOverlayEvent });
       if (retired.auditFailures.length) alert('overlay-auto-retire-audit-failed', { failures: retired.auditFailures });
+      for (const ref of retired.reinstated) reinstatedNow.add(ref);
       if (retired.retired.length) {
         const fresh = readOverlayState(root, { env });
         if (!fresh.corrupt) overlaysBefore = fresh.overlays;
@@ -285,7 +289,7 @@ export async function prepareRebuild({
   // Preserve unavailable registrations without building from cached tips. Unpinned overlays may be skipped,
   // but an unavailable pin must use the normal refusal/last-good hold path before any new build is adopted.
   const overlaysForPlan = overlaysBefore.filter((o) => fetchResult.refEvidence.get(o?.ref) === 'refreshed');
-  const unverified = overlaysBefore.filter((o) => fetchResult.refEvidence.get(o?.ref) !== 'refreshed');
+  const unverified = overlaysBefore.filter((o) => fetchResult.refEvidence.get(o?.ref) !== 'refreshed' && !reinstatedNow.has(o?.ref));
   let unavailablePinned = null;
   if (!mainOnly) {
     for (const raw of unverified) {

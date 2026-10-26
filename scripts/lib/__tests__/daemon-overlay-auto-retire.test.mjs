@@ -629,6 +629,29 @@ describe('PR #5964 advisory round: evidence, containment recovery and audit orde
     expect(readOverlayState(root, { env }).overlays).toEqual(before);
   });
 
+  it('a plain replacement swap moves the retired sources onto the replacement instead of reinstating them', () => {
+    register([{ ref: 'old', retiredSources: [{ entry: { ref: 'src' }, sha: initial }] }, { ref: 'new' }]);
+    expect(removeOverlay(root, 'old', { env, requireRef: 'new' }).reinstated).toEqual([]);
+    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'new', retiredSources: [{ entry: { ref: 'src' }, sha: initial }] }]);
+  });
+
+  it('a source registered again keeps its registration while its own nested sources come back', () => {
+    const nested = { entry: { ref: 's', retiredSources: [{ entry: { ref: 'r' }, sha: initial }] }, sha: initial };
+    register([{ ref: 's', addedAt: 'again' }, { ref: 'c', retiredSources: [nested] }]);
+    expect(removeOverlay(root, 'c', { env }).reinstated).toEqual(['r']);
+    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 's', addedAt: 'again' }, { ref: 'r', tipSha: initial }]);
+    expect(audit()).toContainEqual(expect.objectContaining({ kind: 'reinstate-skipped', refs: ['s'], from: 'c' }));
+  });
+
+  it('sources reinstated by a landed container retirement wait for the next fetch without alerts or a pinned hold', async () => {
+    localOrigin();
+    register([{ ref: 'main', retiredSources: [{ entry: { ref: 'gone-src', pinned: true }, sha: initial }] }]);
+    const prepared = await prepare();
+    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'gone-src', pinned: true, tipSha: initial }]);
+    expect(prepared.result?.reason).not.toBe('pinned-overlay-unavailable');
+    expect(prepared.alerts.filter((a) => a.kind === 'overlay-fetch-unverifiable')).toEqual([]);
+  });
+
   it('a container retired into a later container keeps its own retired sources nested', async () => {
     branch('a'); commit('a', 'a'); track('a');
     commit('b', 'b'); track('b');

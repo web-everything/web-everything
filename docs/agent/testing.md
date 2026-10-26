@@ -49,7 +49,10 @@ Deleted-branch evidence comes from the registration's own `tipSha` (the last ref
 skipped. A regression registers through `addOverlay`, squash-lands, deletes the branch and asserts retirement.
 A contained source moves into its container's `retiredSources` in the same locked write. Removing that
 container by any path (planner `pr-closed`/`ref-gone`, smoke, auto-rebase, operator) reinstates the sources in
-its place, nested sources included. Tests drive the planner to close a container on a later tick. In `on` mode a
+its place, nested sources included; an auto-rebase swap instead moves them onto the replacement. A source
+registered again meanwhile is skipped (audited `reinstate-skipped`) but its own nested sources still come back.
+Sources a retirement reinstates in the same tick are not fetched yet, so preparation neither alerts on them nor
+holds for a pin until the next tick. Tests drive the planner to close a container on a later tick. In `on` mode a
 `retiring` audit line is written before removal; if it fails, nothing is removed. A failed `removed` line or
 `overlay-retired` event after removal is returned in `auditFailures` and preparation alerts on it.
 

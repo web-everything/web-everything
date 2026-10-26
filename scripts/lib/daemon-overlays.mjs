@@ -339,9 +339,11 @@ export function recordEdgeResolution(root, ref, {
  * left out of that comparison: the rebuild rewrites it on its own ({@link persistStackBases}), which is no re-registration.
  * `expectedRequiredOverlay` also compares the required container's registration identity under that mutex;
  * its presence alone cannot authorize removal after concurrent replacement.
- * `retireInto` (with `requireRef`) moves the removed entry into the container's `retiredSources` in the same write.
- * Removing ANY entry that carries `retiredSources` puts those sources back in its place (unless re-registered
- * meanwhile), so a container dropped later (pr-closed, ref-gone, operator) never takes their content with it.
+ * `retireInto` (with `requireRef`) moves the removed entry into the container's `retiredSources` in the same write;
+ * a plain `requireRef` swap moves only the entry's own `retiredSources` onto the replacement. Any other removal of
+ * an entry carrying `retiredSources` puts those sources back in its place (a source registered again meanwhile is
+ * skipped, its own nested sources still come back), so a container dropped later (pr-closed, ref-gone, smoke,
+ * operator) never takes their content with it.
  * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedOverlay?:object, expectedRequiredOverlay?:object,
  *   retireInto?:boolean, retiredSha?:string|null}} [o]
  * @returns {{removed:boolean, list:Array<object>, reinstated:string[]}}
@@ -367,20 +369,34 @@ export function removeOverlay(root, ref, {
     }
     if (idx === -1) return { removed: false, list, reinstated: [] };
     const entry = list[idx];
-    const into = retireInto && requireRef !== undefined && requireRef !== ref;
-    // An entry retired INTO a container carries its own retired sources along, nested; otherwise they come back.
-    const sources = !into && Array.isArray(entry.retiredSources) ? entry.retiredSources : [];
+    const own = Array.isArray(entry.retiredSources) ? entry.retiredSources : [];
+    // A replacement (`requireRef`) supersedes the removed entry: retired INTO it, the entry moves with its own
+    // sources nested; in a plain swap (auto-rebase) only those sources move, since the replacement carries them.
+    const swap = requireRef !== undefined && requireRef !== ref;
+    const moved = !swap ? [] : retireInto ? [{ entry, sha: retiredSha }] : own;
     const seen = new Set(list.map((o) => o?.ref));
-    const back = sources.filter((s) => isSafeBranchName(s?.entry?.ref) && !seen.has(s.entry.ref) && seen.add(s.entry.ref));
+    const back = [];
+    const skipped = [];
+    // A source registered again meanwhile stays as it is, but whatever was retired into it still comes back.
+    const collect = (sources) => {
+      for (const s of Array.isArray(sources) ? sources : []) {
+        if (!isSafeBranchName(s?.entry?.ref) || seen.has(s.entry.ref)) { skipped.push(s?.entry?.ref ?? null); collect(s?.entry?.retiredSources); continue; }
+        seen.add(s.entry.ref);
+        back.push(s);
+      }
+    };
+    if (!swap) collect(own);
     const restored = back.map((s) => (SHA_RE.test(s.sha ?? '') ? { ...s.entry, tipSha: s.sha } : s.entry));
     const next = list.slice(0, idx).concat(restored, list.slice(idx + 1));
-    if (into) {
+    if (swap && moved.length) {
       const c = next.findIndex((o) => o?.ref === requireRef);
       const prior = Array.isArray(next[c].retiredSources) ? next[c].retiredSources : [];
-      next[c] = { ...next[c], retiredSources: [...prior.filter((s) => s?.entry?.ref !== ref), { entry, sha: retiredSha }] };
+      const refs = new Set(moved.map((s) => s?.entry?.ref));
+      next[c] = { ...next[c], retiredSources: [...prior.filter((s) => !refs.has(s?.entry?.ref)), ...moved] };
     }
     // Audit before the write: a failed append throws and leaves the list (container included) unchanged.
     for (const s of back) appendOverlayEvent(root, { kind: 'reinstated', ref: s.entry.ref, from: ref, sha: s.sha ?? null }, { env });
+    if (skipped.length) appendOverlayEvent(root, { kind: 'reinstate-skipped', refs: skipped, from: ref }, { env });
     writeOverlays(root, next, { env });
     return { removed: true, list: next, reinstated: back.map((s) => s.entry.ref) };
   });

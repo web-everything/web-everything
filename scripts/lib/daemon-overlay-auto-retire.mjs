@@ -106,6 +106,7 @@ export function classifyOverlays({ overlays, git, mainSha = 'origin/main', refEv
  * `retiring` audit line (ref, sha, reason) is written BEFORE removal, and no removal happens if it cannot be;
  * a later `removed` line or `overlay-retired` event that fails lands in `auditFailures` for the caller to alert.
  * A contained source moves into its container's `retiredSources`, so removing the container later reinstates it.
+ * Sources reinstated by this run's own removals are listed in `reinstated`; this run fetched none of them.
  */
 export async function autoRetireOverlays({
   root, env = process.env, overlays, git, mainSha, refEvidence, recordedShas, now = Date.now,
@@ -113,7 +114,7 @@ export async function autoRetireOverlays({
   persistTipShas = persistTipsDefault,
 }) {
   const { mode, source } = resolveAutoRetireMode(env, { now });
-  const result = { retired: [], wouldRetire: [], kept: [], auditFailures: [] };
+  const result = { retired: [], wouldRetire: [], kept: [], auditFailures: [], reinstated: [] };
   const rows = classifyOverlays({ overlays, git, mainSha, refEvidence, recordedShas });
   for (const row of rows) {
     if (mode === 'off' || row.class === 'needed') { result.kept.push(row); continue; }
@@ -134,6 +135,7 @@ export async function autoRetireOverlays({
       });
       if (!removed.removed) { result.kept.push(row); continue; }
       result.retired.push(row);
+      result.reinstated.push(...(removed.reinstated ?? []));
     } catch {
       result.kept.push({ ...row, reason: 'retirement-unverifiable' });
       continue;
