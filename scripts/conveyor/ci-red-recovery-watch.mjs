@@ -59,11 +59,11 @@
 import { readFixPush } from './fix-push-state.mjs';
 import { resolveHandoffSettings } from '../lib/handoff-settings.mjs';
 import { dirname, join, resolve } from 'node:path';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { handoffHome } from '../operations/handoff-home.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
 import { randomUUID } from 'node:crypto';
-import { isGhDeferred } from '../lib/gh-deferred.mjs';
+import { isGhDeferred, isGhThrottled } from '../lib/gh-deferred.mjs';
 import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { resolveCiHealBudget } from './reconcile-core.mjs';
@@ -1421,16 +1421,60 @@ export function rerunMainCancelledRun(runId, { repo = null, exec = execFileSyncT
     const error = describeExecError(e);
     // An explicit API rejection is retryable; a timeout/transport failure may
     // have lost the acknowledgement after GitHub accepted the rerun.
-    return { ok: false, error, uncertain: !/\bHTTP 4(?!08)\d\d\b/.test(error) };
+    // A local throttle rejection is raised before gh runs: nothing was submitted, so it is safe to retry.
+    return { ok: false, error, uncertain: !isGhThrottled(e) && !/\bHTTP 4(?!08)\d\d\b/.test(error) };
   }
+}
+
+/** Per-repository record file; WE keeps the legacy name so existing records stay valid. Every repository
+ *  watcher shares one handoff home, and a shared file lets one watcher's stale snapshot erase another's attempts. */
+export function mainRetriggerRecordPath(repo = null, home = handoffHome()) {
+  const slug = repoSlug(repo);
+  return join(home, slug === CONSTELLATION_REPOS.we.slug ? 'main-ci-retrigger.json'
+    : `main-ci-retrigger.${slug.replace(/[^A-Za-z0-9._-]/g, '-')}.json`);
+}
+
+/** Exclusive advisory lock around a record's read-modify-write (atomic rename protects one write, not the sequence).
+ *  Returns {locked:false} when another holder is still live after `waitMs`; a lock older than `staleMs`
+ *  (a crashed holder) is stolen. The lock is always released, including when `fn` throws. */
+export function withMainRetriggerLock(recordPath, fn, { waitMs = 5000, staleMs = resolveChildTimeoutMs() + 60_000 } = {}) {
+  const lockPath = `${recordPath}.lock`;
+  mkdirSync(dirname(recordPath), { recursive: true });
+  const deadline = Date.now() + waitMs;
+  let acquired = false;
+  while (!acquired) {
+    try { closeSync(openSync(lockPath, 'wx', 0o600)); acquired = true; }
+    catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      let age = 0;
+      try { age = Date.now() - statSync(lockPath).mtimeMs; } catch { continue; }
+      if (age > staleMs) { try { unlinkSync(lockPath); } catch { /* another watcher stole it first */ } continue; }
+      if (Date.now() >= deadline) return { locked: false };
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+  }
+  try { return { locked: true, value: fn() }; }
+  finally { try { unlinkSync(lockPath); } catch { /* already stolen as stale */ } }
 }
 
 /** One whole-run retry per main head, then a durable, once-only stuck signal.
  * Record IO is synchronous; event delivery is best-effort and cannot fail the sweep.
  * Unreadable evidence refuses action: restore the record or inspect main CI before retrying. */
-export function sweepMainCancelledRetrigger({ repo = null, defaultBranch = 'main', apply = false,
+export function sweepMainCancelledRetrigger(options = {}) {
+  const { repo = null, apply = false, recordPath = mainRetriggerRecordPath(repo), lock = withMainRetriggerLock } = options;
+  if (!apply) return sweepMainCancelledLocked({ ...options, recordPath });
+  let held;
+  try { held = lock(recordPath, () => sweepMainCancelledLocked({ ...options, recordPath })); }
+  catch (e) {
+    return { dispatch: [], applied: [], refusals: [{ reason: 'record-lock-failed', error: describeExecError(e) }] };
+  }
+  return held.locked ? held.value
+    : { dispatch: [], applied: [], refusals: [{ reason: 'record-locked', error: 'another watcher is updating the main CI retrigger record; retry next tick' }] };
+}
+
+function sweepMainCancelledLocked({ repo = null, defaultBranch = 'main', apply = false,
   readMainRuns = defaultReadMainRuns, rerun = rerunMainCancelledRun,
-  recordPath = join(handoffHome(), 'main-ci-retrigger.json'),
+  recordPath,
   readRecord = readMainRetriggerRecord, writeRecord = writeMainRetriggerRecord,
   emitEvent = event => appendDaemonEvent({ ...event, daemon: 'ci-red-recovery-watch' }),
   now = Date.now(),
@@ -1501,7 +1545,7 @@ export function sweepMainCancelledRetrigger({ repo = null, defaultBranch = 'main
     // Injectable rerunners may return ok:false for a confirmed rejection;
     // uncertain:true (or a thrown error) retains the reservation for inspection.
     try { outcome = rerun(runId, { repo }); }
-    catch (e) { outcome = { ok: false, uncertain: true, error: describeExecError(e) }; }
+    catch (e) { outcome = { ok: false, uncertain: !isGhThrottled(e), error: describeExecError(e) }; }
     if (outcome?.ok !== true) {
       let error = outcome?.error ?? 'rerun did not confirm success';
       if (outcome?.ok === false && outcome.uncertain !== true) {

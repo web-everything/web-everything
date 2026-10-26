@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-import { sweepMainCancelledRetrigger, rerunMainCancelledRun, formatMainCancelledReport, main } from '../ci-red-recovery-watch.mjs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, utimesSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { sweepMainCancelledRetrigger, rerunMainCancelledRun, formatMainCancelledReport, main,
+  mainRetriggerRecordPath, withMainRetriggerLock } from '../ci-red-recovery-watch.mjs';
 import { DEFAULT_MAIN_WORKFLOW_NAME } from '../main-red-recovery.mjs';
 
 const sha = 'a'.repeat(40);
@@ -12,7 +16,7 @@ function fixture(runs = [run()], initial = {}) {
   const options = { apply: true, now, repo: 'web-everything/web-everything', recordPath: 'fixture/main-ci-retrigger.json',
     readMainRuns: vi.fn(() => runs), rerun: vi.fn(() => ({ ok: true })),
     readRecord: vi.fn(() => structuredClone(record)),
-    writeRecord: vi.fn((path, value) => { record = structuredClone(value); }), emitEvent: vi.fn() };
+    writeRecord: vi.fn((path, value) => { record = structuredClone(value); }), emitEvent: vi.fn(), lock: fn => fn() };
   return { options, record: () => record, tick: () => sweepMainCancelledRetrigger(options) };
 }
 
@@ -331,5 +335,105 @@ describe('main cancelled CLI pass', () => {
       expect(deps.writeLine.mock.calls.some(([, line]) => line.includes('main-cancelled: cancelled read failed'))).toBe(true);
       expect(JSON.parse(deps.writeAll.mock.calls[0][1]).mainCancelledRetrigger.error).toContain('cancelled read failed');
     } finally { process.exitCode = previousExitCode; }
+  });
+});
+
+describe('main cancelled CI retrigger: local throttle rejection', () => {
+  const throttled = () => Object.assign(Error('gh-throttle: throttled before submission'),
+    { status: 1, stdout: '', stderr: 'gh-throttle: throttled', ghThrottled: { class: 'write', waitedMs: 0 } });
+
+  it('classifies a rejection raised before gh ran as safe to retry', () => {
+    const exec = () => { throw throttled(); };
+    expect(rerunMainCancelledRun(123, { exec })).toEqual({ ok: false, uncertain: false, error: expect.stringContaining('throttled') });
+  });
+
+  it('keeps a throttle-marked error that carries an HTTP 5xx body uncertain only when gh actually ran', () => {
+    const exec = () => { throw Error('HTTP 502 from gateway'); };
+    expect(rerunMainCancelledRun(123, { exec }).uncertain).toBe(true);
+  });
+
+  it('releases the reservation after a local throttle rejection so the next sweep reruns', () => {
+    const f = fixture();
+    const exec = vi.fn().mockImplementationOnce(() => { throw throttled(); });
+    f.options.rerun = (runId, opts) => rerunMainCancelledRun(runId, { ...opts, exec });
+    expect(f.tick().applied[0]).toMatchObject({ ok: false });
+    expect(f.record()).toEqual({});
+    expect(f.tick().applied[0].ok).toBe(true);
+    expect(exec).toHaveBeenCalledTimes(2);
+  });
+
+  it('treats a throttle error thrown by an injected rerunner as a confirmed non-submission too', () => {
+    const f = fixture();
+    f.options.rerun.mockImplementationOnce(() => { throw throttled(); });
+    expect(f.tick().applied[0].ok).toBe(false);
+    expect(f.record()).toEqual({});
+    expect(f.tick().applied[0].ok).toBe(true);
+  });
+});
+
+describe('main cancelled CI retrigger: concurrent watchers', () => {
+  const dir = () => mkdtempSync(join(tmpdir(), 'main-retrigger-'));
+
+  it('gives each repository its own default record file, keeping the legacy name for WE', () => {
+    expect(mainRetriggerRecordPath('web-everything/web-everything', '/h')).toBe(join('/h', 'main-ci-retrigger.json'));
+    expect(mainRetriggerRecordPath(null, '/h')).toBe(join('/h', 'main-ci-retrigger.json'));
+    const other = mainRetriggerRecordPath('web-everything/frontierui', '/h');
+    expect(other).not.toBe(join('/h', 'main-ci-retrigger.json'));
+    expect(other).toMatch(/main-ci-retrigger[^/]*\.json$/);
+  });
+
+  it('serializes the read-modify-write: a second holder is refused while the first runs, then released', () => {
+    const root = dir();
+    try {
+      const path = join(root, 'record.json');
+      let inner;
+      expect(withMainRetriggerLock(path, () => { inner = withMainRetriggerLock(path, () => 'nested', { waitMs: 0 }); return 'outer'; })).toEqual({ locked: true, value: 'outer' });
+      expect(inner).toEqual({ locked: false });
+      expect(existsSync(`${path}.lock`)).toBe(false);
+      expect(withMainRetriggerLock(path, () => 'again', { waitMs: 0 })).toEqual({ locked: true, value: 'again' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('releases the lock when the critical section throws', () => {
+    const root = dir();
+    try {
+      const path = join(root, 'record.json');
+      expect(() => withMainRetriggerLock(path, () => { throw Error('boom'); }, { waitMs: 0 })).toThrow('boom');
+      expect(existsSync(`${path}.lock`)).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('steals a stale lock left by a crashed holder', () => {
+    const root = dir();
+    try {
+      const path = join(root, 'record.json');
+      mkdirSync(root, { recursive: true });
+      writeFileSync(`${path}.lock`, '999999');
+      const old = new Date(Date.now() - 3_600_000);
+      utimesSync(`${path}.lock`, old, old);
+      expect(withMainRetriggerLock(path, () => 'ok', { waitMs: 0, staleMs: 60_000 })).toEqual({ locked: true, value: 'ok' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('refuses to act (no rerun) while another watcher holds the record', () => {
+    const f = fixture();
+    f.options.lock = () => ({ locked: false });
+    const result = f.tick();
+    expect(result.refusals[0]).toMatchObject({ reason: 'record-locked', sha });
+    expect(f.options.rerun).not.toHaveBeenCalled();
+    expect(f.options.writeRecord).not.toHaveBeenCalled();
+  });
+
+  it('re-reads the record inside the lock so a concurrent head attempt is not lost', () => {
+    const shaB = 'b'.repeat(40);
+    let record = {};
+    const common = { apply: true, now, recordPath: 'fixture/r.json', rerun: vi.fn(() => ({ ok: true })), emitEvent: vi.fn(),
+      readRecord: vi.fn(() => structuredClone(record)), writeRecord: vi.fn((p, v) => { record = structuredClone(v); }) };
+    const withLock = fn => ({ locked: true, value: fn() });
+    // Watcher A starts; before its critical section runs, watcher B records head B.
+    const a = { ...common, repo: 'web-everything/web-everything', readMainRuns: () => [run()],
+      lock: fn => { record = { [shaB]: { runId: 456, retriggeredAt: new Date(now).toISOString() } }; return withLock(fn); } };
+    sweepMainCancelledRetrigger(a);
+    expect(Object.keys(record).sort()).toEqual([sha, shaB].sort());
   });
 });
