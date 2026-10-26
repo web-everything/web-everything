@@ -680,7 +680,7 @@ function rewriteSoakCardCitation(content, visit) {
  * Commits the rename+rewrites in ONE scoped commit; the caller publishes. Best-effort like the rest of the reconcile: a
  * failure is reported, the land stands.
  */
-export function numberPendingHashes(CWD, { dryRun = false, minNext = 1 } = {}) {
+export function numberPendingHashes(CWD, { dryRun = false, minNext = 1, execFile = execFileSync } = {}) {
   // Phase costs expose where the drain pass budget goes, including refused passes.
   const phaseMs = { read: 0, precheck: 0, resolve: 0, apply: 0, write: 0 };
   let readSource = 'worktree';
@@ -779,7 +779,7 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1 } = {}) {
       ...docsPaths, ...memoryPaths, ...flowsPaths, ...breakPaths,
     ];
     try {
-      const batch = execFileSync('git', ['cat-file', '--batch'], {
+      const batch = execFile('git', ['cat-file', '--batch'], {
         cwd: CWD, input: trackedPaths.map((rel) => `HEAD:${rel}\n`).join(''),
         stdio: ['pipe', 'pipe', 'ignore'], maxBuffer: 128 * 1024 * 1024,
       });
@@ -874,7 +874,7 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1 } = {}) {
   const sweptRelPaths = new Set(files.map((f) => pathFor(f.name).relPath));
   let unsweptHashPathCites = [];
   try {
-    const hits = execFileSync(
+    const hits = execFile(
       'git', ['grep', '--threads=1', '-nE', HASH_PATH_CITE_SOURCE, ...(readSource === 'head' ? ['HEAD'] : []), '--', '.', ':!node_modules', ':!backlog'],
       { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 },
     ).split('\n').filter(Boolean);
@@ -917,7 +917,7 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1 } = {}) {
   // A held card must not be renamed by a STALE ledger entry either (the ledger is append-only and applyLedger
   // swaps the whole of it), so drop any old mapping for it before anything reads the ledger.
   for (const hash of heldHashes) delete ledger[hash];
-  const numberingGit = (args, options = {}) => execFileSync('git', args, {
+  const numberingGit = (args, options = {}) => execFile('git', args, {
     cwd: CWD, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 10_000, maxBuffer: 1024 * 1024,
     env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, ...options,
   });
@@ -943,7 +943,7 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1 } = {}) {
   const dupDropped = [];
   const bornAsOnMain = new Map(); // hash → repo-relative path of the numbered card on origin/main
   try {
-    const out = execFileSync('git', ['grep', '-E', '^bornAs: x[0-9a-z]{6}$', 'origin/main', '--', 'backlog/'],
+    const out = execFile('git', ['grep', '-E', '^bornAs: x[0-9a-z]{6}$', 'origin/main', '--', 'backlog/'],
       { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 });
     for (const line of out.split('\n')) {
       const m = line.match(/^origin\/main:(backlog\/.*):bornAs: (x[0-9a-z]{6})$/);
@@ -956,7 +956,7 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1 } = {}) {
     const onMain = /^backlog\/\d{1,5}-.*\.md$/.test(bornAsOnMain.get(hash) ?? '') ? bornAsOnMain.get(hash) : null;
     if (!onMain || heldHashes.has(hash)) continue;
     let mainBody = null;
-    try { mainBody = bodyOf(execFileSync('git', ['show', `origin/main:${onMain}`], { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 })); } catch { /* unreadable → treat as differing */ }
+    try { mainBody = bodyOf(execFile('git', ['show', `origin/main:${onMain}`], { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 })); } catch { /* unreadable → treat as differing */ }
     if (mainBody !== null && mainBody === bodyOf(contentByName.get(stem) ?? '')) {
       dupDropped.push({ hash, stem, existing: onMain });
       ledger[hash] = idFromName(onMain.replace(/^backlog\//, '').replace(/\.md$/, ''));
@@ -1058,7 +1058,7 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1 } = {}) {
       remoteHashSetCache = new Set(cached.hashes);
       if (!newTips.length) return remoteHashSetCache;
     }
-    const walk = (args) => execFileSync('git', ['rev-list', '--objects', ...args, '--', 'backlog/'],
+    const walk = (args) => execFile('git', ['rev-list', '--objects', ...args, '--', 'backlog/'],
       { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 });
     let out = '';
     try {

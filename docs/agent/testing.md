@@ -1606,9 +1606,9 @@ only repositories without any remote retain local-only numbering. Test an outsta
 against the actual deferred-numbering dry run, and test allocation/replay races through the shared core.
 Refresh canonical evidence before scanning landed `bornAs` identities. Cover a stale checkout
 whose pending hash already landed without reservation refs: identical content deduplicates and
-differing content holds, with no new claim. Fixtures that intercept builtin subprocess calls
-must cover both Vitest's captured named imports (a module mock) and native ESM bindings
-(a builtin spy plus synchronized exports); restore the builtin and synchronize its exports after each test.
+differing content holds, with no new claim. Deferred-numbering fixtures inject the `execFile`
+option on `numberPendingHashes` and mock the shared process reader, so every Git path uses
+the same fixture without depending on captured builtin imports or patching native ESM bindings.
 Review staleness fixtures must use off-path files from the current sandbox import closure.
 Collision healing now pulls `backlog/frontmatter.mjs` onto that path; cover its refusal and
 use `backlog/capacity.mjs` for tolerated unrelated lag in both dispatch modes and the soak.

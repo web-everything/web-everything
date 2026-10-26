@@ -1,6 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import childProcess from 'node:child_process';
-import { syncBuiltinESMExports } from 'node:module';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,21 +11,12 @@ import { planRenumber } from '../../backlog/renumber-collisions.mjs';
 import { gitBlobOid } from '../git-run.mjs';
 
 const io = vi.hoisted(() => ({ git: null }));
-vi.mock('node:child_process', async (original) => {
-  const actual = await original();
-  // Vitest snapshots named builtin imports; syncBuiltinESMExports only updates
-  // native ESM bindings. Route the Vitest graph through the same fixture too.
-  return { ...actual, execFileSync: (cmd, args, opts) => io.git && cmd === 'git'
-    ? io.git(args, opts) : actual.execFileSync(cmd, args, opts) };
-});
-beforeEach(() => {
-  // The drain can be loaded through native ESM as well as Vitest's module graph.
-  // Patch the builtin too so every Git call uses this fixture's remote.
-  const exec = childProcess.execFileSync;
-  vi.spyOn(childProcess, 'execFileSync').mockImplementation((cmd, args, opts) => io.git && cmd === 'git'
-    ? io.git(args, opts) : exec(cmd, args, opts));
-  syncBuiltinESMExports();
-});
+// Inject the subprocess boundary explicitly: builtin ESM mocks can leave the
+// drain's captured execFileSync pointing at the real process runner.
+const execFile = (cmd, args, opts) => {
+  if (cmd !== 'git' || !io.git) throw Error(`unexpected subprocess ${cmd}`);
+  return io.git(args, opts);
+};
 vi.mock('../proc-read.mjs', async (original) => {
   const actual = await original();
   return { ...actual, readGit: (args, opts) => io.git ? io.git(args, opts) : actual.readGit(args, opts) };
@@ -68,7 +57,6 @@ function remote() {
 afterEach(() => {
   io.git = null;
   vi.restoreAllMocks();
-  syncBuiltinESMExports();
   vi.unstubAllEnvs();
   roots.splice(0).forEach((p) => rmSync(p, { recursive: true, force: true }));
 });
@@ -90,7 +78,7 @@ it.each([true, false])('legacy numbering with births disabled skips an outstandi
     if (['add', 'commit'].includes(args[0])) return '';
     return r.git(args, extra);
   };
-  const result = numberPendingHashes(opts.cwd, { dryRun });
+  const result = numberPendingHashes(opts.cwd, { dryRun, execFile });
   expect(result.assigned).toEqual([{ hash: 'xbbbbbb', nnn: '076' }]);
   if (!dryRun) {
     expect(result.committed).toBe(true);
@@ -112,7 +100,7 @@ it('legacy numbering holds cards when configured remote evidence is unavailable'
     if (args[0] === 'grep') return '';
     throw Error('offline');
   };
-  expect(numberPendingHashes(opts.cwd)).toMatchObject({ assigned: [], committed: false, error: expect.stringContaining('offline') });
+  expect(numberPendingHashes(opts.cwd, { execFile })).toMatchObject({ assigned: [], committed: false, error: expect.stringContaining('offline') });
   expect(calls.some((args) => ['push', 'hash-object', 'rm', 'add', 'commit'].includes(args[0]))).toBe(false);
   expect(readFileSync(join(opts.cwd, 'backlog/xbbbbbb-other.md'), 'utf8')).toBe('---\n---\nOther\n');
 });
@@ -136,7 +124,7 @@ it.each([true, false])('refreshes canonical bornAs before deferred numbering (id
     if (args[0] === 'show') return '---\nbornAs: xaaaaaa\n---\nSame\n';
     return r.git(args, extra);
   };
-  const result = numberPendingHashes(opts.cwd, { dryRun: true });
+  const result = numberPendingHashes(opts.cwd, { dryRun: true, execFile });
   expect(result.assigned).toEqual([]);
   if (identical) expect(result.droppedDuplicates).toEqual([
     { hash: 'xaaaaaa', stem: 'xaaaaaa-same', existing: 'backlog/075-same.md' },
