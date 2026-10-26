@@ -2,6 +2,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { completeListedFiles, queueFileOverlap, readQueueEntryFiles } from '../queue-file-overlap.mjs';
 import { queueBlocksGroup } from '../card-group.mjs';
+import * as queueOverlap from '../queue-file-overlap.mjs';
 
 
 describe('main regression coverage', () => {
@@ -70,6 +71,45 @@ describe('readQueueEntryFiles fail-closed grouping reads', () => {
   });
 });
 
+describe('queued file blocker diagnostics', () => {
+  const enqueuedAt = '2026-10-26T10:39:00Z';
+  const nowMs = Date.parse('2026-10-26T12:00:00Z');
+  const blocker = { state: 'AWAITING_CHECKS', enqueuedAt, ci: 'PENDING' };
+
+  it('reads state, enqueue time and group CI in the same queue query', () => {
+    const { result, exec } = reader({ nodes: [{ state: blocker.state, enqueuedAt,
+      headCommit: { oid: 'b'.repeat(40), statusCheckRollup: { state: 'PENDING' } }, pullRequest: { number: 5977 } }] });
+    expect(result.entries[0]).toMatchObject({ num: 5977, ...blocker });
+    const queueCalls = exec.mock.calls.filter(([, args]) => args[0] === 'api');
+    expect(queueCalls).toHaveLength(1);
+    const query = queueCalls[0][1].find(a => a.startsWith('query=')).replace(/\s/g, '');
+    expect(query).toContain('enqueuedAt');
+    expect(query).toContain('state');
+    expect(query).toContain('headCommit{');
+    expect(query).toContain('statusCheckRollup{state}');
+    expect(queueFileOverlap({ candidateFiles: [file], queuedEntries: result.entries, includeCards: true }).with)
+      .toEqual([{ num: 5977, files: [file], blocker }]);
+  });
+
+  it('carries available blocker fields without requiring all of them', () => {
+    expect(queueFileOverlap({ candidateFiles: [file], queuedEntries: [{ num: 7, files: [file], state: 'UNMERGEABLE' }], includeCards: true }).with)
+      .toEqual([{ num: 7, files: [file], blocker: { state: 'UNMERGEABLE' } }]);
+  });
+
+  it('summarizes a blocker age, state and CI', () => {
+    expect(queueOverlap.blockerSummary({ num: 5977, files: [file], blocker }, nowMs))
+      .toBe('#5977 queued 81 min, state AWAITING_CHECKS, CI PENDING');
+  });
+
+  it('renders unknown age, state and CI for a legacy hit', () => {
+    expect(queueOverlap.blockerSummary({ num: 7, files: [file] }, nowMs))
+      .toBe('#7 queued unknown min, state unknown, CI unknown');
+  });
+
+  it.each([undefined, null, {}, { num: 7, blocker: { enqueuedAt: 'invalid' } }])('handles missing or invalid blocker fields without throwing: %j', hit => {
+    expect(queueOverlap.blockerSummary(hit, nowMs)).toContain('unknown');
+  });
+});
 });
 
 describe('overlay regression coverage', () => {
