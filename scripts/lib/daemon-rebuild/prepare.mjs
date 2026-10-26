@@ -24,6 +24,7 @@ import {
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
+import { autoRetireOverlays } from '../daemon-overlay-auto-retire.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
 import { repairCloneRefs, holdsCloneWriteLock } from '../lane-repair.mjs';
@@ -230,7 +231,7 @@ export async function prepareRebuild({
     alert('overlay-state-corrupt', { file: overlayFilePath(root, env) });
     if (!mainOnly) return terminal({ moved: false, reason: 'overlay-state-corrupt' });
   }
-  const overlaysBefore = overlayState.overlays;
+  let overlaysBefore = overlayState.overlays;
   const edgeResolve = env[OVERLAY_EDGE_RESOLVE_ENV] !== '0';
   // Heal dangling remote-tracking refs (and a clone that is itself broken) BEFORE the fetch: one such ref makes
   // `fetch --prune` reject the whole batch. Daemon clones are never acquired through lane-pool, so this is their only heal.
@@ -264,6 +265,17 @@ export async function prepareRebuild({
   for (const ref of fetchResult.goneRefs) alert('overlay-ref-gone-on-fetch', { ref });
 
   const fetchedMainSha = verifyRev(git, 'origin/main^{commit}');
+  // Failed individual fetches do not distinguish deleted branches from transient errors. Preserve registrations
+  // for auto-retirement unless this pass refreshed every overlay as well as main; never classify cached tips.
+  if (!mainOnly && !overlayState.corrupt && fetchedMainSha && fetchResult.goneRefs.length === 0) {
+    try {
+      const retired = await autoRetireOverlays({ root, env, overlays: overlaysBefore, git, mainSha: fetchedMainSha, now, removeOverlay, appendOverlayEvent });
+      if (retired.retired.length) {
+        const fresh = readOverlayState(root, { env });
+        if (!fresh.corrupt) overlaysBefore = fresh.overlays;
+      }
+    } catch (error) { alert('overlay-auto-retire-failed', { error: String(error?.message || error) }); }
+  }
   pruneLandedBacklogSidecars({ git, root, paths: unsafe.untracked, mainSha: fetchedMainSha, alert });
   const remaining = collectUntrackedPaths(git);
   if (remaining === null) {

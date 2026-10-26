@@ -1,5 +1,18 @@
 # Testing — Three-Tier Strategy
 
+## Overlay auto-retirement
+
+`daemon-overlay-auto-retire.test.mjs` uses local Git repositories for ancestry, squash/content
+equivalence, deleted-branch recorded commits, and equal-tip carrier preservation. Retirement
+uses `removeOverlay`'s `requireRef` and `expectedOverlay` guards: container withdrawal or source
+re-registration preserves the source. Git uncertainty preserves registrations. `autoRetire`
+resolves through the policy cascade; shadow audit entries graduate after a full day from
+`shadowSince`. Inject `now` when testing that boundary. Run this suite through heavy admission.
+Preparation refreshes main and overlay tips before retirement; failed fetch evidence skips auto-retirement.
+Cherry records historical patch equivalence and omits merge commits. All patch-based retirement requires
+current whole-tree equivalence, even when every cherry line is negative. Regressions cover a cached landed
+tip advanced remotely, unique merge-resolution content, and an equivalent main patch subsequently reverted.
+
 ## Established-overlay auto-rebase
 
 Operator withdrawal wins over a detached repair: the worker rechecks its source registration
