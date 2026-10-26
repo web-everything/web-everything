@@ -44,6 +44,16 @@ export function cardOnlyHeadMoveCandidate(evidence, head) {
     && !evidence.inFlight && !evidence.queued;
 }
 
+/** A failed policy comment remains retryable after the carried read has been pinned to this head. */
+export function cardOnlySkipSettlementCandidate(evidence, head) {
+  const read = evidence?.loopPayload?.findings?.read;
+  return isRealHead(head) && read?.netBasis?.rev === head
+    && redTeamCardOnly(read) && redTeamSkipNeedsSettlement(evidence?.status)
+    && evidence.status.head === head
+    && evidence.recorded === false && evidence.seatRecorded === false
+    && !evidence.inFlight && !evidence.queued;
+}
+
 export function resolveReviewRedTeamOnSkip({ env = process.env, log, readFile = readFileSync,
   toolPath = join(dirname(fileURLToPath(import.meta.url)), '../settings/review-red-team-on-skip.json') } = {}) {
   let tool;
@@ -76,10 +86,11 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const evidence = readEvidence({ repo, pr, head });
       const movedCardOnly = cardOnlyHeadMoveCandidate(evidence, head)
         && proveMove({ fromSha: evidence.loopPayload.findings.read.netBasis.rev, toSha: head })?.ok === true;
-      if (!movedCardOnly && !redTeamOwedFor(evidence?.loopPayload)) return skip('stored review does not owe a red team');
+      const status = readStatus({ repo, pr, head });
+      const pendingCardOnly = cardOnlySkipSettlementCandidate({ ...evidence, status }, head);
+      if (!movedCardOnly && !pendingCardOnly && !redTeamOwedFor(evidence?.loopPayload)) return skip('stored review does not owe a red team');
       if (!movedCardOnly && evidence.loopPayload?.findings?.read?.netBasis?.rev !== head) return skip('stored review does not match live head');
       if (evidence.inFlight || evidence.queued) return skip('red-team pass in flight');
-      const status = readStatus({ repo, pr, head });
       const { priorResult: prior, priorComment: comment } = normalizeRedTeamResult(status?.result);
       const completedSeat = evidence.completedRecorded === true || evidence.cleanRecorded === true;
       // A null completion alone is unknown. Only the recovery reader's normalization

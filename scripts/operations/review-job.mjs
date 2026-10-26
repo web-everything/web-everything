@@ -90,7 +90,7 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
 import { liveResultGateState, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
-import { normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate } from '../lib/review-red-team-on-skip.mjs';
+import { normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
 import { redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { publishAttention } from './needs-you-feed.mjs';
@@ -1044,6 +1044,10 @@ function runReviewArc({
         loopPayload = { ...loopPayload, findings: { ...loopPayload.findings,
           read: { ...loopPayload.findings.read, netBasis: { ...loopPayload.findings.read.netBasis, rev: head } } } };
       }
+      // A prior carry may have persisted this head before its policy comment failed.
+      // Non-accept payloads can retry that settlement, but must never reach a model.
+      if (redTeamMode === 'fresh' && stored?.head === head && !redTeamOwedFor(loopPayload)
+        && cardOnlySkipSettlementCandidate(stored, head)) seatsBox.cardOnlyRecovery = true;
       const pinned = stored?.head === head && loopPayload?.findings?.read?.netBasis?.rev === head;
       if (!pinned || (!seatsBox.cardOnlyRecovery && !redTeamOwedFor(loopPayload))) {
         classified = { outcome: 'red-team-not-owed', reason: pinned ? 'stored review does not owe a red team' : 'stored review does not match live head' };
