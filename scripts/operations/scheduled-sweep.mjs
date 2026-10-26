@@ -160,8 +160,10 @@ export function buildLaunchdPlist({ pass, repoRoot, nodePath, home }) {
 }
 
 /** Default off: `apply:false` plans no writes. Never runs launchctl; it only lists the commands for the operator. */
-export function installPlan({ repoRoot, nodePath, home, apply = false }) {
-  const files = Object.values(SWEEP_JOBS).map(({ pass }) => ({
+export function installPlan({ repoRoot, nodePath, home, apply = false, pass: selected }) {
+  const passes = [...Object.values(SWEEP_JOBS).map(j => j.pass), 'pr-merge-watch'];
+  if (selected !== undefined && !passes.includes(selected)) throw Error('unknown installable pass');
+  const files = passes.filter(pass => selected === undefined || pass === selected).map(pass => ({
     pass, path: `${home}/Library/LaunchAgents/com.we.conveyor-pass-daemon.${pass}.plist`,
     xml: buildLaunchdPlist({ pass, repoRoot, nodePath, home }),
   }));
