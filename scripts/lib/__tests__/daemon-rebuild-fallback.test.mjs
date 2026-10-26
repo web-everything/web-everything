@@ -386,14 +386,14 @@ describe('smoke-env-timeout: a slow lane scan under load never makes an overlay 
 // ── d. pinned overlay + bad candidate + passing last-good control ──────────────────────────────────────────
 
 describe('pinned overlay stays held on smoke-rejected when the last-good control passes', () => {
-  it('holds the clone on last-good, records state.held, alerts daemon-held-on-last-good', async () => {
+  async function assertHeldDiagnostics(diagnostics = {}, expected = {}) {
     const { originDir, cloneDir, env } = makeFixture();
     pushBranch(originDir, 'lane/pinned-bad', (dir) => writeFile(dir, 'pinned-bad.txt', 'x\n'));
     addOverlay(cloneDir, { ref: 'lane/pinned-bad', pinned: true }, { env });
     const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
 
     const runSmoke = failsWhenFile('pinned-bad.txt', {
-      verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'x', detail: 'boom' }] },
+      verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'x', detail: 'boom', ...diagnostics }] },
     });
     const result = await rebuildClone({
       root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
@@ -405,9 +405,23 @@ describe('pinned overlay stays held on smoke-rejected when the last-good control
     const state = readRebuildState(cloneDir, env);
     expect(state.held?.reason).toBe('smoke-rejected');
     expect(state.held?.lastGood).toBe(prevHead);
-    expect(result.alerts.some((a) => a.kind === 'daemon-held-on-last-good')).toBe(true);
+    const details = [{ name: 'x', detail: 'boom', ...expected }];
+    expect(result.alerts.find((a) => a.kind === 'smoke-rejected').detail.details).toEqual(details);
+    expect(result.alerts.find((a) => a.kind === 'daemon-held-on-last-good').detail.details).toEqual(details);
+    expect(state.held.details).toEqual(details);
     // A (candidate) + C (last-good control) — no B: the overlay is pinned, so the plain-main fallback never runs.
     expect(runSmoke).toHaveBeenCalledTimes(2);
+  }
+
+  it('holds the clone on last-good, records state.held, alerts daemon-held-on-last-good', async () => {
+    await assertHeldDiagnostics();
+  });
+
+  it('holds on last-good and preserves redacted, bounded stderr diagnostics', async () => {
+    await assertHeldDiagnostics(
+      { stderrTail: `HTTP 401: ghp_secretToken ${'x'.repeat(600)}` },
+      { stderrTail: `HTTP 401: ghp_<redacted> ${'x'.repeat(600)}`.slice(0, 500) },
+    );
   });
 });
 

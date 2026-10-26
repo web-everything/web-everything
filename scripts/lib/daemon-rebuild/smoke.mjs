@@ -27,6 +27,15 @@ import { cascadePolicy } from '../policy-cascade.mjs';
 
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 
+/** Alert-safe diagnostics only; classification continues to use the original row. */
+function rejectionDetail(row) {
+  return {
+    name: row.name,
+    detail: redactDetail(row.detail, row.name),
+    ...(row.stderrTail != null ? { stderrTail: redactDetail(row.stderrTail, row.name) } : {}),
+  };
+}
+
 /** Identity of a proven tree and the dependencies of its full smoke. */
 export function smokePassKey({ tree, lockHash, nodeVersion, harnessHash, cloneKind = 'daemon' }) {
   return sha256(JSON.stringify({ tree, lockHash, nodeVersion, harnessHash, cloneKind }));
@@ -607,7 +616,7 @@ export async function smokeAndAdopt({
         since,
         reason,
         failed: failed.map((r) => r.name).join(','),
-        details: failed.map((r) => ({ name: r.name, detail: redactDetail(r.detail, r.name) })).slice(0, 10),
+        details: failed.map(rejectionDetail).slice(0, 10),
         lastGood: prevHead,
         target: plan.finalSha,
         mainSha: plan.mainSha,
@@ -616,7 +625,7 @@ export async function smokeAndAdopt({
       };
     }, { release: true })) ?? readRebuildState(root, stEnv);
     alert('daemon-held-on-last-good', {
-      details: failed.map((r) => ({ name: r.name, detail: redactDetail(r.detail, r.name) })),
+      details: failed.map(rejectionDetail),
       reason, failed: failed.map((r) => r.name).join(','), since: since ?? state.held?.since ?? null, lastGood: prevHead, target: plan.finalSha,
       message: 'the new build failed its live smoke — staying on the last working build and still dispatching from it (x5wbsbc)',
     });
@@ -677,7 +686,7 @@ export async function smokeAndAdopt({
     });
     alert('smoke-rejected', {
       failed: failedNames,
-      details: failedA.map((r) => ({ name: r.name, detail: redactDetail(r.detail, r.name) })),
+      details: failedA.map(rejectionDetail),
       ...(rejected?.retryAt ? { retryAt: rejected.retryAt, attempts: rejected.attempts } : {}),
       ...(rejected ? {} : { recorded: false }),
     });
@@ -708,7 +717,7 @@ export async function smokeAndAdopt({
   };
   const envLoadAlert = (extra) => alert('smoke-env-load', {
     failed: failedA.map((r) => r.name).join(','),
-    details: failedA.map((r) => ({ name: r.name, ms: r.ms, detail: redactDetail(r.detail, r.name) })),
+    details: failedA.map((r) => ({ ...rejectionDetail(r), ms: r.ms })),
     suspects: suspects.map((ap) => ({ ref: ap.ref, pr: ap.pr })),
     ...extra,
     message: 'every failed check is load-shaped (timeout / lock contention) and no same-run differential pinned it on an overlay — environment, not the candidate; overlays kept, retrying with backoff',
@@ -873,7 +882,7 @@ export async function smokeAndAdopt({
     const retryAt = new Date(now() + rejectRetryDelayMs(env, attempts)).toISOString();
     alert('smoke-harness-broken', {
       failed: failedA.map((r) => r.name).join(','),
-      details: cFailed.map((r) => ({ name: r.name, detail: redactDetail(r.detail, r.name) })),
+      details: cFailed.map(rejectionDetail),
       alsoFailedOn: bFailed ? ['plain-main', 'last-good'] : ['last-good'],
       retryAt,
       attempts,
