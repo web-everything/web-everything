@@ -115,7 +115,7 @@ function readOnlyAddition(rows, readOnlyOps, hunk) {
   for (const op of ops) if (!readOnlyOps.has(op)) throw new Error(`write-capable or unproven op: ${op}`);
   // Context/import references prove no list membership. Credit only an adjacent replacement of
   // the same complete named array; incomplete or moved entries must each carry read-only proof.
-  const listName = text => new RegExp(`^\\s*const\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*\\[\\s*${ITEM}(?:\\s*,\\s*${ITEM})*\\s*,?\\s*\\]\\s*;?\\s*$`).exec(text)?.[1];
+  const listName = text => new RegExp(`^\\s*const\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*\\[\\s*${ITEM}(?:\\s*,\\s*${ITEM})*\\s*,?\\s*\\]\\s*;\\s*$`).exec(text)?.[1];
   for (let i = 0; i < rows.length; i += 1) {
     if (rows[i].kind !== '+') continue;
     const prior = rows[i - 1];
@@ -148,22 +148,30 @@ function readOnlyAddition(rows, readOnlyOps, hunk) {
     if (partner === undefined) throw new Error('unpaired removed line: human review required');
     nextAdded.set(removed.hunk, partner + 1);
   }
-  // Membership requires the nearest nonblank lines in the new side of this hunk.
-  // Precompute neighbours so a long run of entries stays linear in diff size.
-  const neighbours = new Map();
-  let neighbour;
+  // Neighbouring items can belong to a destructuring assignment. Require both
+  // boundaries of a complete named array literal in the same hunk, and accept
+  // only pure entries between them. A semicolon prevents a following line from
+  // turning the initializer into a destructuring assignment. Scan each run once.
+  const listStart = /^\s*const\s+[A-Za-z_$][\w$]*\s*=\s*(Object\.freeze\()?\[\s*$/;
+  const literalItems = new Set();
+  let literal;
   for (const row of rows) {
     if (row.kind === '-' || !row.text.trim()) continue;
-    neighbours.set(row, { before: neighbour?.hunk === row.hunk ? neighbour.text : undefined });
-    if (neighbour?.hunk === row.hunk) neighbours.get(neighbour).after = row.text;
-    neighbour = row;
+    if (literal?.hunk !== row.hunk) literal = undefined;
+    const start = listStart.exec(row.text);
+    if (start) {
+      literal = { hunk: row.hunk, frozen: !!start[1], items: [] };
+    } else if (literal && pureItem.test(row.text)) {
+      literal.items.push(row);
+    } else {
+      if (literal && (literal.frozen ? /^\s*\]\)\s*;\s*$/ : /^\s*\]\s*;\s*$/).test(row.text)) {
+        for (const item of literal.items) literalItems.add(item);
+      }
+      literal = undefined;
+    }
   }
   for (const row of rows) {
-    if (row.kind !== '+' || !pureItem.test(row.text)) continue;
-    const { before, after } = neighbours.get(row);
-    if (before === undefined || after === undefined
-      || !(pureItem.test(before) || /(?:^\s*\[|Object\.freeze\(\[|=\s*\[|\(\[)\s*$/.test(before))
-      || !(pureItem.test(after) || /^\s*\]/.test(after))) {
+    if (row.kind === '+' && pureItem.test(row.text) && !literalItems.has(row)) {
       throw new Error('unprovable list membership: human review required');
     }
   }
@@ -173,7 +181,7 @@ function readOnlyAddition(rows, readOnlyOps, hunk) {
   const replacement = (old, line) => {
     if (old.trim() === line.trim()) return true;
     const name = listName(old);
-    if (!name || listName(line) !== name || old.trim().endsWith(';') !== line.trim().endsWith(';')) return false;
+    if (!name || listName(line) !== name) return false;
     const members = text => text.slice(text.indexOf('[') + 1, text.lastIndexOf(']'))
       .split(',').map(item => item.trim()).filter(Boolean);
     const prior = members(old);
