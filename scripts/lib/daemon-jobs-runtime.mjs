@@ -234,8 +234,8 @@ export function spawnDetached({ entryPath, cwd, env, logPath }) {
 }
 
 /**
- * Launch one queued job: prepare its code, stamp `launching` (counting the attempt), evict idle snapshots
- * best-effort, spawn it detached.
+ * Launch one queued job: prepare its code, stamp `launching` (counting the attempt), spawn it detached,
+ * record its child, then evict idle snapshots best-effort.
  * Returns the written record, or `null` when the record was no longer `queued` (someone else got it).
  */
 export function launchJob({ store, id, kindDef, snapshot, evict = evictSnapshots, now = () => Date.now(), spawnFn = spawnDetached, env = process.env, heartbeatIntervalMs }) {
@@ -253,12 +253,6 @@ export function launchJob({ store, id, kindDef, snapshot, evict = evictSnapshots
     ? markLaunching(r, { at: iso(now()), launcherPid: process.pid, cwd: code.cwd, snapshotKeys: code.snapshotKeys })
     : null));
   if (!launching) return null;
-  try {
-    const referenced = store.list().records
-      .filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status))
-      .flatMap((r) => r.job.snapshotKeys);
-    evict({ jobsDir: store.dir, referenced });
-  } catch { /* Snapshot cleanup is best-effort; never block a launch. */ }
   const childEnv = {
     ...env,
     OPERATION_RUNS_DIR: store.dir,
@@ -273,7 +267,16 @@ export function launchJob({ store, id, kindDef, snapshot, evict = evictSnapshots
     // Never launched: the attempt stays counted, the launch grace turns it into a dead launch next tick.
     return store.update(id, (r) => ({ ...r, job: { ...r.job, error: `spawn failed: ${e.message}` } }));
   }
-  return store.update(id, (r) => markSpawned(r, { at: iso(now()), pid }));
+  const spawned = store.update(id, (r) => markSpawned(r, { at: iso(now()), pid }));
+  // Housekeeping runs only after the child exists and its pid is durable: a recursive snapshot delete
+  // can outlast the tick watchdog, but must never strand a launching record without a spawned child.
+  try {
+    const referenced = store.list().records
+      .filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status))
+      .flatMap((r) => r.job.snapshotKeys);
+    evict({ jobsDir: store.dir, referenced });
+  } catch { /* Snapshot cleanup is best-effort; the child is already spawned and recorded. */ }
+  return spawned;
 }
 
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));

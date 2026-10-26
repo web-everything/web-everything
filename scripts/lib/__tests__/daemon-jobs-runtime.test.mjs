@@ -8,7 +8,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
-import { ensureCodeSnapshot, snapshotsRoot } from '../daemon-job-snapshots.mjs';
+import { ensureCodeSnapshot, evictSnapshots, snapshotsRoot } from '../daemon-job-snapshots.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -365,6 +365,42 @@ describe('launchJob snapshot eviction', () => {
     expect(spawnFn).toHaveBeenCalledOnce();
     expect(out.job).toMatchObject({ status: 'launching', attempts: 1 });
     expect(store.read('launching').job.timeline.at(-1)).toMatchObject({ event: 'spawned', pid: 4242 });
+  });
+
+  it('spawns and persists the child before a slow snapshot delete exceeds the tick watchdog', () => {
+    for (const type of ['code', 'node-modules']) seedStores(type, ['old', 'recent', 'newest']);
+    const events = [];
+    const atDelete = [];
+    let clock = Date.now();
+    const slowDelete = (ref) => {
+      events.push('delete');
+      const record = store.read('launching');
+      atDelete.push({ spawnedPid: record.job.timeline.findLast((e) => e.event === 'spawned')?.pid, event: record.job.timeline.at(-1).event });
+      clock += 180_001; // Model a recursive delete outlasting the health tick's watchdog, without waiting.
+      const colon = ref.indexOf(':');
+      rmSync(join(snapshotsRoot(dir), ref.slice(0, colon), ref.slice(colon + 1)), { recursive: true, force: true });
+    };
+    const out = launch({
+      now: () => clock,
+      spawnFn: () => { events.push('spawn'); return 4242; },
+      evict: (options) => {
+        for (const ref of evictSnapshots({ ...options, dryRun: true }).evicted) slowDelete(ref);
+      },
+    });
+
+    expect(atDelete.length).toBeGreaterThanOrEqual(2); // Both code and node-modules have victims.
+    expect(events[0]).toBe('spawn');
+    expect(atDelete).toEqual(atDelete.map(() => ({ spawnedPid: 4242, event: 'spawned' })));
+    expect(out.job.timeline.at(-1)).toMatchObject({ event: 'spawned', pid: 4242 });
+    expect(store.read('launching').job.timeline.at(-1)).toMatchObject({ event: 'spawned', pid: 4242 });
+  });
+
+  it('skips housekeeping when spawning fails', () => {
+    const evict = vi.fn();
+    const out = launch({ evict, spawnFn: () => { throw new Error('spawn refused'); } });
+
+    expect(out.job.error).toBe('spawn failed: spawn refused');
+    expect(evict).not.toHaveBeenCalled();
   });
 });
 
