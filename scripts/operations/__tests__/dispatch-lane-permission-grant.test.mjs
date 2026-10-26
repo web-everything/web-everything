@@ -10,12 +10,15 @@
  * that number to an absolute directory and the sink grants it, in `<sessionCwd>/.claude/settings.local.json`,
  * BEFORE the agent is spawned into that cwd.
  *
- * NO REAL FS, NO REAL PROCESS. `laneDirFor`/`laneRootsFor`/`dispatchLaneGrant` are pure over an injected
+ * NO REAL PROCESS. The hand-back test reads the checked-in brief; otherwise
+ * `laneDirFor`/`laneRootsFor`/`dispatchLaneGrant` are pure over an injected
  * `exists`; the sink test below injects `grantLanePermission`/`resolveLaneGrant` directly (mirrors
  * `dispatch-lane-defaults.test.mjs`'s own `spyExec` seam for the OTHER subprocess calls this file makes) so
  * this never touches a real `.claude/settings.local.json` or spawns a real `claude`.
  */
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { conflictHelperAllowRules, rearmReviewAllowRules } from '../../lib/conflict-helper-allow.mjs';
 
 import { DISPATCH_EFFECT } from '../dispatch-lane.mjs';
 import { createDispatchSinks, laneDirFor, laneRootsFor, dispatchLaneGrant } from '../dispatch-lane-io.mjs';
@@ -159,8 +162,7 @@ describe('createDispatchSinks — grants the lane BEFORE spawning the agent', ()
   });
 });
 
-it('grants only the sanctioned helper for fix and ci-heal, preserving build grants', async () => {
-  const { conflictHelperAllowRules } = await import('../../lib/conflict-helper-allow.mjs');
+it('grants only the sanctioned helpers for fix and ci-heal, preserving build grants', () => {
   const root = '/repo'; const options = { root, exists: () => false };
   const rules = conflictHelperAllowRules(root);
   expect(rules).toEqual(['Bash(node /repo/scripts/conveyor/resolve-conflict.mjs:*)', 'Bash(node "/repo/scripts/conveyor/resolve-conflict.mjs":*)']);
@@ -168,6 +170,43 @@ it('grants only the sanctioned helper for fix and ci-heal, preserving build gran
   const baseline = dispatchLaneGrant({ lane: 1 }, options);
   expect(dispatchLaneGrant({ lane: 1, launchKind: 'build' }, options)).toEqual(baseline);
   for (const launchKind of ['fix', 'ci-heal']) {
-    expect(dispatchLaneGrant({ lane: 1, launchKind }, options)).toEqual({ ...baseline, allow: [...baseline.allow, ...rules] });
+    expect(dispatchLaneGrant({ lane: 1, launchKind }, options)).toEqual({
+      ...baseline, allow: [...baseline.allow, ...rules, ...rearmReviewAllowRules(root)],
+    });
   }
+});
+
+it('limits review re-arming rules to the two quoting forms of its script', () => {
+  expect(rearmReviewAllowRules('/repo')).toEqual([
+    'Bash(node /repo/scripts/conveyor/rearm-review.mjs:*)',
+    'Bash(node "/repo/scripts/conveyor/rearm-review.mjs":*)',
+  ]);
+});
+
+it.each([undefined, null, ''])('grants no review re-arming rules without a root (%s)', (root) => {
+  expect(rearmReviewAllowRules(root)).toEqual([]);
+});
+
+// Model only Claude Code's Bash(<prefix>:*) rule form; other rule forms do not match.
+function matchesBashPrefix(rule, command) {
+  const match = /^Bash\((.+):\*\)$/.exec(rule);
+  return match != null && command.startsWith(match[1]);
+}
+
+describe('review hand-back command from the fixer brief', () => {
+  const brief = readFileSync('skills-src/conveyor/fix-agent-brief.md', 'utf8');
+  const firstLine = brief.match(/```bash\r?\n(node "\{\{WE_ROOT\}\}\/scripts\/conveyor\/rearm-review\.mjs" \{\{PR_NUM\}\} --repo=\{\{REPO\}\}[^\r\n]*)/);
+  const root = '/repo';
+
+  it.each(['fix', 'ci-heal', 'build'])('grants the brief command only to repair launches (%s)', (launchKind) => {
+    expect(firstLine).not.toBeNull();
+    const command = firstLine[1]
+      .replaceAll('{{WE_ROOT}}', root)
+      .replaceAll('{{PR_NUM}}', '123')
+      .replaceAll('{{REPO}}', 'example/web-everything');
+    const { allow } = dispatchLaneGrant({ lane: 3, launchKind }, { root });
+    expect(allow.some((rule) => matchesBashPrefix(rule, command))).toBe(launchKind !== 'build');
+    expect(allow).not.toContain('Bash(node:*)');
+    expect(allow).not.toContain('Bash(*)');
+  });
 });

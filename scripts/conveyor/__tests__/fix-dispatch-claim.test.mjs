@@ -392,6 +392,7 @@ describe('tryResumeFix — a racing resume attempt is claim-refused, never a dup
   };
   const baseOpts = {
     root: '/repo', claimRoot,
+    grantConflictHelper: () => ({ ok: true }), // Permission migration is covered by the real-file resume regression.
     listAgentsAll: () => [{ sessionId: 'cand-0000-0000-0000-000000000000', id: 'candxxxx', cwd: '/lanes/lane-4', name: 'conveyor-3438' }],
     resolveHead: (cwd) => (cwd === '/lanes/lane-4' ? MATCHING_HEAD : null),
   };

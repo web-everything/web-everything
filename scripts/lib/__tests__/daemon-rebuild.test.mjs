@@ -32,6 +32,7 @@ import {
 import { acquireRead, releaseRead } from '../daemon-clone-lock.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { readOverlayConflictWakes, markOverlayConflictWake } from '../overlay-conflict-wake.mjs';
+import { rebuildCommitEnv } from '../daemon-rebuild/shared.mjs';
 
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
@@ -148,6 +149,15 @@ describe('overlay conflict resolution', () => {
     git: f.runGit, headSha: f.main, mainRef: 'origin/main', overlays: f.overlays, ...options,
   });
 
+  it('dates a rebuild from its latest parent, including the approved edge', () => {
+    const dates = { current: 100, overlay: 200, edge: 300 };
+    const git = (args) => ({ status: 0, stdout: String(dates[args.at(-1)]) });
+    expect(rebuildCommitEnv(git, 'current', 'overlay')).toMatchObject({ GIT_COMMITTER_DATE: '@200 +0000' });
+    expect(rebuildCommitEnv(git, 'current', 'overlay', 'edge')).toMatchObject({
+      GIT_AUTHOR_DATE: '@300 +0000', GIT_COMMITTER_DATE: '@300 +0000',
+    });
+  });
+
   it('replays a conflicting overlay deterministically and verifies the ready build', async () => {
     const f = conflictFixture({ replay: true });
     const result = await plan(f);
@@ -207,6 +217,9 @@ describe('overlay conflict resolution', () => {
     expect(result.decisions[1]).toMatchObject({ action: 'apply', reason: 'applied-edge-ref', sha: f.b });
     expect(result.applied[1]).toMatchObject({ resolvedVia: 'edge-ref', edgeSha });
     expect(gitOk(f.cloneDir, ['rev-parse', `${result.finalSha}^2`]).trim()).toBe(f.b);
+    expect(gitOk(f.cloneDir, ['rev-parse', `${result.finalSha}^3`]).trim()).toBe(edgeSha);
+    expect(git(f.cloneDir, ['merge-base', '--is-ancestor', edgeSha, result.finalSha]).status).toBe(0);
+    expect((await plan(f)).finalSha).toBe(result.finalSha);
     expect(result.alerts).toContainEqual({ kind: 'overlay-conflict-resolved', detail: { ref: 'lane/b', pr: 2, via: 'edge-ref', edgeSha } });
   });
 
@@ -276,6 +289,55 @@ describe('overlay conflict resolution', () => {
       expect(verify(() => edgeSha)).toBe(true);
       expect(verify(() => null)).toBe(false); // approval withdrawn / never recorded
       expect(verify(() => f.a)).toBe(false); // approval now names a different tip
+    });
+
+    it('verifies legacy edge builds but rejects unrelated or additional merge parents', async () => {
+      const f = conflictFixture();
+      const edgeSha = pushEdge(f);
+      f.overlays[1] = { ...f.overlays[1], edgeResolution: { sha: edgeSha, by: 'operator' } };
+      const result = await plan(f);
+      const tree = gitOk(f.cloneDir, ['rev-parse', `${result.finalSha}^{tree}`]).trim();
+      const prev = gitOk(f.cloneDir, ['rev-parse', `${result.finalSha}^1`]).trim();
+      const withParents = (extra) => ({ ...result, finalSha: gitOk(f.cloneDir, [
+        'commit-tree', tree, '-p', prev, '-p', f.b, ...extra.flatMap((sha) => ['-p', sha]), '-m', 'ready fixture',
+      ]).trim() });
+      const verify = (adopt) => readyBuildVerified({
+        git: f.runGit, adopt, mainTip: f.main, prevHead: f.main, approvedEdgeShaFor: () => edgeSha,
+      });
+      expect(verify(withParents([]))).toBe(true); // persisted builds made before edge ancestry was retained
+      expect(verify(withParents([edgeSha]))).toBe(true);
+      expect(verify(withParents([f.main]))).toBe(false);
+      expect(verify(withParents([edgeSha, f.main]))).toBe(false);
+      expect(verify({ ...result, applied: result.applied.map(({ resolvedVia, ...a }) => a) })).toBe(false);
+    });
+
+    it('keeps an edge-resolved overlay loss-protected after a force-push', async () => {
+      const f = conflictFixture();
+      const edgeSha = pushEdge(f);
+      f.overlays[1] = { ...f.overlays[1], edgeResolution: { sha: edgeSha, by: 'operator' } };
+      const adopted = await plan(f);
+      const replacement = pushBranch(f.originDir, 'lane/replacement', (dir) => writeFile(dir, 'README.md', 'C\n'));
+      gitOk(f.originDir, ['update-ref', 'refs/heads/lane/b', replacement]);
+      gitOk(f.cloneDir, ['fetch', '-q', 'origin']);
+      const result = await plan(f, { headSha: adopted.finalSha });
+      expect(result.decisions.find((d) => d.ref === 'lane/b')).toMatchObject({ action: 'drop', reason: 'conflict' });
+      expect(result.establishedLost).toEqual([expect.objectContaining({ ref: 'lane/b', sha: replacement })]);
+    });
+
+    it('refuses edge ancestry when only replay can reproduce the ready tree', async () => {
+      const f = conflictFixture({ replay: true });
+      const replay = await plan(f);
+      expect(replay.applied[1]).toMatchObject({ resolvedVia: 'replay' });
+      const prev = gitOk(f.cloneDir, ['rev-parse', `${replay.finalSha}^1`]).trim();
+      const tree = gitOk(f.cloneDir, ['rev-parse', `${replay.finalSha}^{tree}`]).trim();
+      const finalSha = gitOk(f.cloneDir, [
+        'commit-tree', tree, '-p', prev, '-p', f.b, '-p', f.main, '-m', 'unverified edge parent',
+      ]).trim();
+      const adopt = { ...replay, finalSha, applied: replay.applied.map((a) => a.ref === 'lane/b'
+        ? { ...a, resolvedVia: 'edge-ref', edgeSha: f.main } : a) };
+      expect(readyBuildVerified({
+        git: f.runGit, adopt, mainTip: f.main, prevHead: f.main, approvedEdgeShaFor: () => f.main,
+      })).toBe(false);
     });
 
     it('refuses a malformed recorded sha instead of matching it loosely', async () => {
