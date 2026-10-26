@@ -216,7 +216,10 @@ intent → clear label → result comment → done. The shared file lock seriali
 journal is not a panel verdict or a queued model job. Each unfinished step checks live policy,
 head, holds and superseding review evidence, then its own observable postcondition before acting.
 Crash tests must cover each boundary, including a successful remote effect whose reply/journal
-write is lost. Recovery discovery must include an unfinished journal even when the result comment
+write is lost. Exercise both accepting and non-accepting source verdicts through the persisted
+evidence reader, recovery planner and job. For lost status-write, label and comment replies, assert
+one status write, one label change, one comment and no model call after retry, with a null carried verdict.
+Recovery discovery must include an unfinished journal even when the result comment
 is already visible. A later real panel or changed head refuses recovery; it cannot inherit the
 carry's null verdict. A contended lock or unreadable evidence leaves the journal for the next
 recovery tick and reports an inspect/retry diagnostic; it never authorizes a model call.

@@ -1398,22 +1398,34 @@ describe('moved card-only skip settlement', () => {
       expect(readRedTeamStatus({ repo, pr, head, env }).loopPayload.verdict).toBeNull();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
-  it.each(['after-intent', 'after-label', 'after-comment', 'before-done'])(
-    'job and planner resume a durable carry after %s without a model', boundary => {
+  it.each(['after-intent', 'after-label', 'after-comment', 'before-done',
+    'lost-intent-reply', 'lost-label-reply', 'lost-comment-reply'].flatMap(boundary =>
+    ['accept', 'changes'].map(verdict => ({ boundary, verdict }))))(
+    'job and planner resume a $verdict carry after $boundary without a model', ({ boundary, verdict }) => {
       const dir = mkdtempSync(join(tmpdir(), 'carry-job-crash-'));
       const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_RED_TEAM_SKIP_CARD_ONLY: '1' };
       const fromSha = 'b'.repeat(40), comments = [], labels = [];
-      const loopPayload = { verdict: { verdict: 'accept' }, findings: { read: {
+      const loopPayload = { verdict: { verdict }, findings: { read: {
         netBasis: { rev: fromSha }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
       } } };
       const evidence = key => readDrainRedTeamEvidence({ ...key, env, runsDir: env.WE_SHARED_RUNS_DIR, readScorecards: () => [] });
       let crash = true;
-      const applyLabel = vi.fn(() => labels.push('red-team:clear'));
-      const postResult = vi.fn(({ body }) => comments.push({ body, author: { login: 'web-everything' } }));
+      const checkpoint = step => { if (crash && step === boundary) throw Error('crash'); };
+      const writeStatus = vi.fn((value, options) => {
+        recordRedTeamStatus(value, options);
+        checkpoint('lost-intent-reply');
+      });
+      const applyLabel = vi.fn(() => {
+        labels.push('red-team:clear');
+        checkpoint('lost-label-reply');
+      });
+      const postResult = vi.fn(({ body }) => {
+        comments.push({ body, author: { login: 'web-everything' } });
+        checkpoint('lost-comment-reply');
+      });
       const carryIo = () => createRedTeamCarryIo({ env, readEvidence: evidence,
         readLive: () => ({ headRefOid: head, labels }), readComments: () => comments,
-        proveMove: () => ({ ok: true }), applyLabel, postResult,
-        checkpoint: step => { if (crash && step === boundary) throw Error('crash'); },
+        proveMove: () => ({ ok: true }), writeStatus, applyLabel, postResult, checkpoint,
       });
       const io = fakeIo({ readRedTeamOnlyPayload: key => ({ ...evidence(key), head }),
         redTeamSkipCardOnlySetting: () => true, proveCardOnlyHeadMove: () => ({ ok: true }),
@@ -1424,7 +1436,7 @@ describe('moved card-only skip settlement', () => {
       try {
         writeRun({ ...newRunRecord({ id: 'review-pr-carry-crash', op: 'review-pr', input: { repo, pr } }), ...loopPayload }, env.WE_SHARED_RUNS_DIR);
         recordRedTeamStatus({ repo, pr, loopPayload, status: 'finished', result: 'skipped' }, { env });
-        runReviewJob({ repo, pr, redTeamOnly: true }, io);
+        expect(runReviewJob({ repo, pr, redTeamOnly: true }, io).redTeam.outcome).toBe('non-policy');
         expect(readRedTeamCarry({ repo, pr, head, env }).step).not.toBe('done');
         expect(planRedTeamOnSkip({ repo, refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }],
           rawPrs: [{ number: pr, headRefOid: head, comments }], readEvidence: evidence,
@@ -1435,8 +1447,12 @@ describe('moved card-only skip settlement', () => {
         crash = false;
         expect(runReviewJob({ repo, pr, redTeamOnly: true }, io).redTeam.outcome).toBe('policy-clear');
         expect(readRedTeamCarry({ repo, pr, head, env }).step).toBe('done');
+        expect(readRedTeamStatus({ repo, pr, head, env }).loopPayload.verdict).toBeNull();
+        expect(writeStatus).toHaveBeenCalledTimes(1);
         expect(applyLabel).toHaveBeenCalledTimes(1);
         expect(postResult).toHaveBeenCalledTimes(1);
+        expect(labels).toEqual(['red-team:clear']);
+        expect(comments).toHaveLength(1);
         expect(io.redTeamStatus).not.toHaveBeenCalled();
         expect(io.runRedTeam).not.toHaveBeenCalled();
         expect(io.runLoop).not.toHaveBeenCalled();
