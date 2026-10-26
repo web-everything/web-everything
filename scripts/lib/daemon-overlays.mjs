@@ -346,7 +346,7 @@ export function recordEdgeResolution(root, ref, {
  * operator) never takes their content with it.
  * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedOverlay?:object, expectedRequiredOverlay?:object,
  *   retireInto?:boolean, retiredSha?:string|null}} [o]
- * @returns {{removed:boolean, list:Array<object>, reinstated:string[]}}
+ * @returns {{removed:boolean, list:Array<object>, reinstated?:string[]}}
  */
 export function removeOverlay(root, ref, {
   env = process.env, why, requireRef, expectedOverlay, expectedRequiredOverlay, retireInto = false, retiredSha = null,
@@ -367,7 +367,7 @@ export function removeOverlay(root, ref, {
     if (expectedOverlay !== undefined && idx !== -1 && !isDeepStrictEqual(registrationIdentity(list[idx]), registrationIdentity(expectedOverlay))) {
       throw new Error('registration changed; refusing removal');
     }
-    if (idx === -1) return { removed: false, list, reinstated: [] };
+    if (idx === -1) return { removed: false, list };
     const entry = list[idx];
     const own = Array.isArray(entry.retiredSources) ? entry.retiredSources : [];
     // A replacement (`requireRef`) supersedes the removed entry: retired INTO it, the entry moves with its own

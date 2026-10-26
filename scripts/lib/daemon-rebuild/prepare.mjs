@@ -20,7 +20,7 @@ import {
   pruneLandedBacklogSidecars,
 } from './local-state.mjs';
 import {
-  readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode, persistStackBases,
+  readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode, persistStackBases, persistTipShas,
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild, pinnedStatus, PINNED_OVERLAY_GONE_MESSAGE } from './plan.mjs';
@@ -270,6 +270,7 @@ export async function prepareRebuild({
   // Sources a retirement put back this tick were never fetched by it: they wait for the next tick's fetch
   // instead of raising unavailable alerts or a pinned hold (their container's content is already in main).
   const reinstatedNow = new Set();
+  let refreshedTips = new Map();
   if (!mainOnly && !overlayState.corrupt && fetchedMainSha) {
     try {
       // The adopted build's applied tips are evidence for a deleted branch registered before `tipSha` was
@@ -277,7 +278,10 @@ export async function prepareRebuild({
       const recordedShas = new Map((state.adopted?.head === prevHead ? state.adopted.applied ?? [] : [])
         .filter((a) => a?.ref && a.sha && !a.resolvedVia).map((a) => [a.ref, a.sha]));
       const retired = await autoRetireOverlays({ root, env, overlays: overlaysBefore, git, mainSha: fetchedMainSha,
-        refEvidence: fetchResult.refEvidence, recordedShas, now, removeOverlay, appendOverlayEvent });
+        refEvidence: fetchResult.refEvidence, recordedShas, now, removeOverlay, appendOverlayEvent,
+        // A refused plan must preserve the registered tips as well as the running tree. Keep this tick's
+        // fresh evidence in memory until both pinned and established-content checks accept the plan.
+        persistTipShas: (_root, tips) => { refreshedTips = tips; } });
       if (retired.auditFailures.length) alert('overlay-auto-retire-audit-failed', { failures: retired.auditFailures });
       for (const ref of retired.reinstated) reinstatedNow.add(ref);
       if (retired.retired.length) {
@@ -432,6 +436,10 @@ export async function prepareRebuild({
       writeState();
     }
     return terminal({ moved: false, reason: 'established-overlay-conflict', detail });
+  }
+  try { persistTipShas(root, refreshedTips, { env }); }
+  catch (error) {
+    alert('overlay-auto-retire-audit-failed', { failures: [{ ref: null, kind: 'tip-sha', error: String(error?.message || error) }] });
   }
   for (const d of plan.decisions) {
     if (d.pr != null && (d.action === 'apply' || d.action === 'remove') && !d.pinned) clearOverlayConflictWake(env, d.pr);

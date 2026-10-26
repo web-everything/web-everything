@@ -45,8 +45,12 @@ Cherry records historical patch equivalence and omits merge commits. All patch-b
 current whole-tree equivalence, even when every cherry line is negative. Regressions cover a cached landed
 tip advanced remotely, unique merge-resolution content, and an equivalent main patch subsequently reverted.
 Deleted-branch evidence comes from the registration's own `tipSha` (the last refreshed remote tip, written by
-`persistTipShas` outside `registrationIdentity`), else the adopted build's applied tip; edge-resolved inputs are
+`persistTipShas` outside `registrationIdentity` after the plan passes pinned and established-content checks),
+else the adopted build's applied tip; edge-resolved inputs are
 skipped. A regression registers through `addOverlay`, squash-lands, deletes the branch and asserts retirement.
+Refused pin/established-content plans preserve registered tips; the overlay-pin tests compare the full list
+before and after repeated refusals. Hand-built daemon fixtures must seed `origin/main` before preparation:
+the local-commit safety check runs before fetch, and a bare remote alone creates no tracking refs.
 A contained source moves into its container's `retiredSources` in the same locked write. Removing that
 container by any path (planner `pr-closed`/`ref-gone`, smoke, auto-rebase, operator) reinstates the sources in
 its place, nested sources included; an auto-rebase swap instead moves them onto the replacement. A source

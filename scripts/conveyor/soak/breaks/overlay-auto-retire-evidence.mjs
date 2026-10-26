@@ -228,10 +228,14 @@ async function retirementRecovery(violation) {
     ok('checkout', '-q', 'main');
     ok('clone', '--bare', '-q', root, join(root, 'origin.git'));
     ok('remote', 'add', 'origin', join(root, 'origin.git'));
+    // A daemon clone already knows origin/main before preparation's local-commit safety check.
+    // Creating a bare remote alone leaves this hand-built fixture without any tracking refs.
+    ok('fetch', '-q', 'origin', '+refs/heads/main:refs/remotes/origin/main');
     addOverlay(root, { ref: 'feature', pr: 1 }, { env });
     addOverlay(root, { ref: 'lower', pr: 2 }, { env });
     addOverlay(root, { ref: 'top', pr: 3 }, { env });
-    await prepare();
+    const first = await prepare();
+    if (first.terminal) violation('retirement-preparation-refused', `first preparation stopped before the candidate build (${first.result?.reason})`);
     if (refs() !== 'feature,top') violation('contained-source-not-retired', `expected feature,top after the first tick, got ${refs()}`);
     // feature squash-lands and GitHub deletes its branch; top's PR is closed unmerged on the same tick.
     ok('checkout', '-q', 'feature', '--', 'feature'); ok('commit', '-qm', 'squash feature');
