@@ -102,7 +102,7 @@ function defaultPidAlive(pid) {
  * provably dead. Unlock + `worktree remove --force` on that exact path + prune. Fail closed: another clone's
  * prefix, an unlocked tree, an unparseable name, a live or unknown owner, a failed listing or unlock — untouched.
  * (The owner's start time is not recorded in the name or lock, so a reused pid reads as alive: safe side.)
- * @returns {{reclaimed:string[], skipped:{path:string, reason:string}[]}}
+ * @returns {{reclaimed:string[], skipped:{path:string, why:string}[]}}
  */
 export function reclaimStaleCandidates({ root, run, env, pidAlive = defaultPidAlive, rm = rmSync, keepPath }) {
   const reclaimed = []; const skipped = [];
@@ -117,15 +117,15 @@ export function reclaimStaleCandidates({ root, run, env, pidAlive = defaultPidAl
     if (!path || path === keepPath || dirname(path) !== dir || !basename(path).startsWith(namePrefix)) continue;
     if (!lines.some((l) => l === 'locked' || l.startsWith('locked '))) continue;
     const pid = Number(/^(\d+)-[0-9a-f]+$/.exec(basename(path).slice(namePrefix.length))?.[1]);
-    if (!Number.isInteger(pid) || pid <= 0) { skipped.push({ path, reason: 'owner-unknown' }); continue; }
-    if (pidAlive(pid) !== false) { skipped.push({ path, reason: 'owner-alive-or-unknown' }); continue; }
+    if (!Number.isInteger(pid) || pid <= 0) { skipped.push({ path, why: 'owner-unknown' }); continue; }
+    if (pidAlive(pid) !== false) { skipped.push({ path, why: 'owner-alive-or-unknown' }); continue; }
     const unlock = git(['worktree', 'unlock', path]);
-    if (unlock.status !== 0) { skipped.push({ path, reason: `unlock-failed: ${String(unlock.stderr || '').trim().split('\n')[0]}` }); continue; }
+    if (unlock.status !== 0) { skipped.push({ path, why: `unlock-failed: ${String(unlock.stderr || '').trim().split('\n')[0]}` }); continue; }
     const removed = git(['worktree', 'remove', '--force', path]);
     if (removed.status !== 0) {
       // Not claimed as reclaimed; the caller's own prune (it follows) clears a registration whose dir is now gone.
       try { rm(path, { recursive: true, force: true }); } catch { /* best-effort */ }
-      skipped.push({ path, reason: `remove-failed: ${String(removed.stderr || '').trim().split('\n')[0]}` });
+      skipped.push({ path, why: `remove-failed: ${String(removed.stderr || '').trim().split('\n')[0]}` });
       continue;
     }
     reclaimed.push(path);

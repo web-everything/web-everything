@@ -83,7 +83,7 @@ describe('reclaim honesty', () => {
     const { run } = fakeGit([{ path: dead, locked: true }], { failOn: { prefix: 'worktree remove', stderr: 'busy' } });
     const r = reclaimStaleCandidates({ root: ROOT, run, env: ENV, pidAlive: () => false, rm: () => {} });
     expect(r.reclaimed).toEqual([]);
-    expect(r.skipped[0].reason).toMatch(/remove-failed: busy/);
+    expect(r.skipped[0].why).toMatch(/remove-failed: busy/);
   });
 });
 
