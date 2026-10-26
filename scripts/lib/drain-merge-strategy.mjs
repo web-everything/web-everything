@@ -40,6 +40,7 @@ import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
  *   (non-dry-run) pass ignores the variable and says so.
  */
 import { sweepStuckEntries } from './merge-queue-stuck-dequeue.mjs';
+import { guardEnqueue } from './drain-poison-guard.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
 import { labelSignature } from './drain-prestage.mjs';
 import { readDrainRedTeamEvidence } from './drain-red-team-evidence.mjs';
@@ -869,6 +870,25 @@ export function createDrainMergeStrategy({
         if (!holdOnly) removeSentBack(c.repo, c.num, live.labels);
         return { enqueued: false, deferred: true, kind: 'sent-back', reason: held };
       }
+      // A current, head-bound list with no backlog changes also proves there are no added cards.
+      const surface = preparedAdmission ? prepared.preparedSurface : null;
+      const poisonExec = (cmd, args, options) => {
+        if (cmd === 'git' && (args[0] === 'diff' || args[0] === 'fetch') && surface?.headSha === headSha && surface.base === 'main'
+          && /^[a-f0-9]{40}$/i.test(surface.baseSha ?? '') && Array.isArray(surface.files)
+          && surface.files.every(path => typeof path === 'string' && !path.startsWith('backlog/'))) {
+          const tip = String(exec('git', ['ls-remote', '--exit-code', 'origin', 'refs/heads/main'],
+            { ...options, timeout: 60_000 })).trim().split(/\s+/)[0];
+          if (tip === surface.baseSha) return '';
+        }
+        return exec(cmd, args, options);
+      };
+      const poison = guardEnqueue({ c, headSha, repo: slugOf(c.repo), exec: poisonExec, cwd,
+        emit: event => appendDaemonEvent(event, { env }),
+        comment: body => {
+          try { exec('gh', ['pr', 'comment', String(c.num), '--repo', slugOf(c.repo), '--body', body], { encoding: 'utf8' }); } catch { /* Best effort. */ }
+          try { exec('gh', ['pr', 'edit', String(c.num), '--repo', slugOf(c.repo), '--add-label', 'review:changes'], { encoding: 'utf8' }); } catch { /* Best effort. */ }
+        } });
+      if (poison) return poison;
       let admissionLabels = queueLabels(live.labels);
       let deadlineOverride = false;
       let retainedPendingClearance = false;
