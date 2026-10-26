@@ -9,6 +9,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { killProcessTree } from './bounded-child.mjs';
 
 export const resolveDetachedOpsDir = (env = process.env) => env.DETACHED_OPS_DIR
   || join(homedir(), 'workspace', '.operations', 'coordination', 'detached-ops');
@@ -110,28 +111,51 @@ export async function handleDetachCli(args, { scriptPath, out = console.log, ...
 }
 async function runRecord(args) {
   const path = args[0].slice('--run-record='.length);
-  const deadline = Date.now() + 5000;
   let record;
-  do {
-    record = JSON.parse(readFileSync(path, 'utf8'));
-    if (record.pid === process.pid) break;
-    if (Date.now() >= deadline) throw new Error('launcher did not initialize runner record');
-    await sleep(25);
-  } while (true);
+  let child;
+  let interrupted = 0;
   const fds = [];
   let exitCode = 1;
+  const stopCommand = () => {
+    if (!child?.pid) return;
+    // Kill the tree first, including descendants in separate process groups, then
+    // the command group to catch children reparented when their parent exited.
+    killProcessTree(child.pid, 'SIGKILL');
+    try { process.kill(-child.pid, 'SIGKILL'); }
+    catch (error) { if (error.code !== 'ESRCH') throw error; }
+  };
+  const handlers = [['SIGINT', 130], ['SIGTERM', 143], ['SIGHUP', 129]].map(([signal, code]) => {
+    const handler = () => { interrupted ||= code; stopCommand(); };
+    process.on(signal, handler);
+    return [signal, handler];
+  });
+  process.on('exit', stopCommand);
   try {
+    const deadline = Date.now() + 5000;
+    do {
+      record = JSON.parse(readFileSync(path, 'utf8'));
+      if (record.pid === process.pid) break;
+      if (Date.now() >= deadline) throw new Error('launcher did not initialize runner record');
+      await sleep(25);
+    } while (true);
     fds.push(openSync(record.stdoutPath, 'a'));
     fds.push(openSync(record.stderrPath, 'a'));
     const argv = args.slice(args.indexOf('--') + 1);
-    exitCode = await new Promise((done, reject) => {
-      const child = spawn(argv[0], argv.slice(1), { stdio: ['ignore', ...fds] });
+    exitCode = interrupted || await new Promise((done, reject) => {
+      child = spawn(argv[0], argv.slice(1), { detached: true, stdio: ['ignore', ...fds] });
       child.once('error', reject);
-      child.once('exit', code => done(code ?? 1));
+      // A signal must never publish failure before the killed child is reaped.
+      child.once('close', code => done(interrupted || (code ?? 1)));
     });
   } catch (error) { console.error(error.message); }
-  finally { for (const fd of fds) closeSync(fd); }
-  writeRecord(path, { ...record, status: exitCode === 0 ? 'done' : 'failed', exitCode });
+  finally {
+    for (const [signal, handler] of handlers) process.removeListener(signal, handler);
+    process.removeListener('exit', stopCommand);
+    for (const fd of fds) closeSync(fd);
+  }
+  if (record?.pid === process.pid) {
+    writeRecord(path, { ...record, status: exitCode === 0 ? 'done' : 'failed', exitCode });
+  }
   process.exitCode = exitCode;
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

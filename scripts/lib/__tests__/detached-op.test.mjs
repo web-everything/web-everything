@@ -1,6 +1,7 @@
-/** @file Acceptance contract for resumable detached operations; no real runner or timers. */
+/** @file Acceptance contract for resumable detached operations, including runner termination. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { fstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, fstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -15,6 +16,80 @@ describe('resolveDetachedOpsDir', () => {
   it('defaults to the coordination detached-ops directory under the home directory', () => {
     expect(resolveDetachedOpsDir({})).toBe(join(homedir(), 'workspace', '.operations', 'coordination', 'detached-ops'));
   });
+});
+
+describe.skipIf(process.platform === 'win32')('runner termination integration', () => {
+  const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+  it.each([
+    ['SIGTERM', true, false], ['SIGTERM', false, false],
+    ['SIGINT', true, false], ['SIGHUP', true, false], ['SIGTERM', true, true],
+  ])('stops command and descendants before reporting failure on %s (stubborn command: %s, detached descendant: %s)', async (signal, stubborn, detachedDescendant, context) => {
+    if (detachedDescendant) {
+      // Cross-group tree cleanup needs process-list access; a restricted sandbox
+      // can still exercise all four process-group cancellation regressions.
+      try { execFileSync('ps', ['-A', '-o', 'pid=,ppid=,pgid='], { stdio: 'ignore', timeout: 1000 }); }
+      catch (error) {
+        if (!['EPERM', 'EACCES'].includes(error.code)) throw error;
+        context.skip(); return;
+      }
+    }
+    const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'detached-op-signal-'));
+    const commandReady = join(dir, 'command.pid');
+    const descendantReady = join(dir, 'descendant.pid');
+    const heartbeat = join(dir, 'heartbeat');
+    let record;
+    const alive = pid => {
+      try { process.kill(pid, 0); return true; } catch { return false; }
+    };
+    try {
+      const descendant = `
+        const fs = require('node:fs');
+        for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => {});
+        fs.writeFileSync(${JSON.stringify(descendantReady)}, String(process.pid));
+        setInterval(() => fs.appendFileSync(${JSON.stringify(heartbeat)}, 'descendant\\n'), 10);
+      `;
+      const command = `
+        const fs = require('node:fs');
+        const { spawn } = require('node:child_process');
+        if (${stubborn}) for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => {});
+        spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}], { stdio: 'ignore', detached: ${detachedDescendant} });
+        fs.writeFileSync(${JSON.stringify(commandReady)}, String(process.pid));
+        setInterval(() => fs.appendFileSync(${JSON.stringify(heartbeat)}, 'command\\n'), 10);
+      `;
+      record = await startDetachedOp({ argv: [process.execPath, '-e', command], kind: 'signal-test', dir });
+      const readyDeadline = Date.now() + 5000;
+      while (!(existsSync(commandReady) && existsSync(descendantReady) && existsSync(heartbeat))) {
+        if (Date.now() >= readyDeadline) throw new Error('command tree did not become ready');
+        await delay(20);
+      }
+      expect(alive(Number(readFileSync(commandReady, 'utf8')))).toBe(true);
+      expect(alive(Number(readFileSync(descendantReady, 'utf8')))).toBe(true);
+      process.kill(record.pid, signal);
+      let result;
+      const terminalDeadline = Date.now() + 6000;
+      do {
+        result = await waitForOp({ id: record.id, dir, maxWaitMs: 250 });
+        if (Date.now() >= terminalDeadline) throw new Error('runner cleanup did not finish');
+      } while (result.status === 'running');
+      expect(result).toMatchObject({ status: 'failed', code: 1,
+        exitCode: { SIGTERM: 143, SIGINT: 130, SIGHUP: 129 }[signal] });
+      const stoppedAt = readFileSync(heartbeat, 'utf8');
+      await delay(150);
+      expect(readFileSync(heartbeat, 'utf8')).toBe(stoppedAt);
+    } finally {
+      // Also clean up the unfixed implementation after the red run.
+      for (const path of [descendantReady, commandReady]) {
+        if (!existsSync(path)) continue;
+        const pid = Number(readFileSync(path, 'utf8'));
+        try { process.kill(-pid, 'SIGKILL'); } catch {}
+        try { process.kill(pid, 'SIGKILL'); } catch {}
+      }
+      if (record) { try { process.kill(record.pid, 'SIGKILL'); } catch {} }
+      await delay(30);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15000);
 });
 
 describe('parseDetachFlags', () => {
