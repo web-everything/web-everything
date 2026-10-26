@@ -1992,6 +1992,11 @@ and the review/readiness labels created by the swap. Exercise a same-head human
 clearance on the third failed comment attempt, a newer or edited verdict with labels
 still pending, changed holds/readiness, and unreadable state. Refuse compensation
 when superseded; preserve unrelated labels and ignore untrusted verdict claims.
+The `pinned-rearm-orphan-marker` soak replay retains one provider's PR state across
+exhausted HTTP 503 retries, successful or failed rollback, and subsequent retries.
+Assert that failed rollback resumes with only a marker write, a completed retry writes
+nothing further even within the verdict's timestamp second, and rollback spends no
+repair round or bypasses the orphan redispatch cap.
 
 The shared policy cascade resolves `fix.sendBackReservedSlots` (standard 1),
 `fix.ciMissingAfterPushMin` (standard 10), and `drain.mergeableUnknownRepollSec`

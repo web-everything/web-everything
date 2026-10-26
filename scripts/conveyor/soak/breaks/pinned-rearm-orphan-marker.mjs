@@ -18,8 +18,8 @@ export default {
   async run({ sourceRoot = ROOT, log } = {}) {
     const load = rel => import(pathToFileURL(join(sourceRoot, rel)).href);
     const { runReviewLabelCli } = await load('scripts/review-set-label.mjs');
-    const { buildRearmComment, REARM_COMMENT_MARKER } = await load('scripts/conveyor/rearm-review.mjs');
-    const { planOrphanFixRound, CHANGES_VERDICT_PREFIX } = await load('scripts/conveyor/orphan-fix-round.mjs');
+    const { buildRearmComment, REARM_COMMENT_MARKER, countRearmComments } = await load('scripts/conveyor/rearm-review.mjs');
+    const { planOrphanFixRound, CHANGES_VERDICT_PREFIX, ORPHAN_GUARD_MARKER } = await load('scripts/conveyor/orphan-fix-round.mjs');
     const { FIX_END_MARKER } = await load('scripts/conveyor/fix-procedure.mjs');
     const { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey,
       renderReferralRecord } = await load('scripts/lib/jury-core.mjs');
@@ -74,6 +74,77 @@ export default {
         if (mode === 'third-read push' && reads !== 3) violations.push(`${mode}: expected exactly three head reads`);
         if (mode === 'label write failure' && plan.decision !== 'rearm') violations.push(`${mode}: retry no longer actionable`);
         log?.(`${mode}: exit=${exitCode}, recovery=${plan.decision}, markers=${pr.comments.filter(c => c.body.startsWith(REARM_COMMENT_MARKER)).length}`);
+      }
+      // R88 / PR #5925: keep the same remote state across a failed command and
+      // its retry, including the pending-without-marker state after failed rollback.
+      for (const rollbackFails of [false, true]) {
+        const mode = rollbackFails ? '503 with failed rollback' : '503 with rollback';
+        const at = '2026-10-26T12:00:00Z';
+        const originalLabels = ['review:changes', 'ready-to-merge', 'unrelated'];
+        const pr = { number: 5925, body: '', state: 'OPEN', isDraft: false,
+          headRefOid: head, headRefName: 'lane/x', labels: originalLabels.map(name => ({ name })),
+          comments: [
+            { ...comment(`${CHANGES_VERDICT_PREFIX}\nFindings`, at), id: 'IC_503' },
+            comment(FIX_END_MARKER, at),
+            ...Array.from({ length: 2 }, () => comment(`${ORPHAN_GUARD_MARKER} — re-dispatched a fixer`, at)),
+          ] };
+        let unavailable = true, labelWrites = 0, commentAttempts = 0;
+        const sleeps = [];
+        const provider = {
+          readPrState: () => ({ ...pr, labels: [...pr.labels], comments: [...pr.comments] }),
+          readLabels: () => pr.labels,
+          setLabels(_repo, _pr, { add, remove }) {
+            labelWrites++;
+            if (unavailable && rollbackFails && labelWrites === 2) throw new Error('rollback unavailable');
+            const names = new Set(pr.labels.map(l => l.name).filter(name => !remove.includes(name)));
+            for (const name of add.split(',').filter(Boolean)) names.add(name);
+            pr.labels = [...names].map(name => ({ name }));
+          },
+          postComment(_repo, _pr, body) {
+            commentAttempts++;
+            if (unavailable) throw new Error('HTTP 503: comment unavailable');
+            pr.comments.push(comment(body, at));
+          },
+        };
+        const invoke = () => {
+          const output = [];
+          let exitCode = 0;
+          try {
+            runReviewLabelCli({ argv: ['5925', '--repo=o/n', `--expect-head=${head}`], fixedTo: 'rearm',
+              provider, defaultActor: 'test', usage: 'soak', buildComment: buildRearmComment,
+              rearmRetrySleep: ms => sleeps.push(ms), emit: line => output.push(line),
+              successResult: o => o, refusalResult: o => o, signalFix() {} });
+          } catch (error) {
+            if (error?.signal !== exitSignal) throw error;
+            exitCode = error.code;
+          }
+          return { exitCode, error: JSON.parse(output.join('') || '{}').error ?? '' };
+        };
+        const failed = invoke();
+        const labelsAre = expected => JSON.stringify(pr.labels.map(l => l.name).sort()) === JSON.stringify([...expected].sort());
+        const expectedError = rollbackFails ? /rollback unavailable.*review:pending without a marker/ : /503.*labels restored/;
+        if (failed.exitCode !== 1 || !expectedError.test(failed.error)) violations.push(`${mode}: wrong failure outcome`);
+        if (commentAttempts !== 3 || JSON.stringify(sleeps) !== '[1000,1000]') violations.push(`${mode}: retry bound changed`);
+        if (labelWrites !== 2) violations.push(`${mode}: expected one swap and one rollback attempt`);
+        if (countRearmComments(pr.comments) !== 0) violations.push(`${mode}: failed attempt consumed a round`);
+        if (!labelsAre(rollbackFails ? ['review:pending', 'unrelated'] : originalLabels)) violations.push(`${mode}: wrong recovery labels`);
+        if (!rollbackFails) {
+          const plan = planOrphanFixRound({ pr, nowMs: Date.parse('2026-10-26T15:00:00Z'), cap: 2 });
+          if (plan.decision !== 'escalate' || !plan.reason.includes('cap 2')) violations.push(`${mode}: orphan cap bypassed`);
+        }
+        unavailable = false;
+        const retried = invoke();
+        if (retried.exitCode !== 0 || commentAttempts !== 4 || countRearmComments(pr.comments) !== 1) {
+          violations.push(`${mode}: successful retry did not record exactly one round`);
+        }
+        const expectedWrites = rollbackFails ? 2 : 3;
+        if (labelWrites !== expectedWrites || !labelsAre(['review:pending', 'unrelated'])) {
+          violations.push(`${mode}: retry did not preserve marker-only resume or pending labels`);
+        }
+        const duplicate = invoke();
+        if (duplicate.exitCode !== 0 || labelWrites !== expectedWrites || commentAttempts !== 4
+          || countRearmComments(pr.comments) !== 1) violations.push(`${mode}: completed retry was not idempotent`);
+        log?.(`${mode}: failure=${failed.exitCode}, retry=${retried.exitCode}, duplicate=${duplicate.exitCode}, markers=${countRearmComments(pr.comments)}`);
       }
       // PR #5925 / x1b8hlo: a new send-back can land on the SAME SHA at either
       // write boundary. Settle that new referral only after the stale marker lands.
