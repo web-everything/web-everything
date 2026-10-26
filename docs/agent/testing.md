@@ -44,6 +44,14 @@ as `rebuild-in-progress`, even when its overlay plan is healthy.
 Cherry records historical patch equivalence and omits merge commits. All patch-based retirement requires
 current whole-tree equivalence, even when every cherry line is negative. Regressions cover a cached landed
 tip advanced remotely, unique merge-resolution content, and an equivalent main patch subsequently reverted.
+Deleted-branch evidence comes from the registration's own `tipSha` (the last refreshed remote tip, written by
+`persistTipShas` outside `registrationIdentity`), else the adopted build's applied tip; edge-resolved inputs are
+skipped. A regression registers through `addOverlay`, squash-lands, deletes the branch and asserts retirement.
+A contained source moves into its container's `retiredSources` in the same locked write. Removing that
+container by any path (planner `pr-closed`/`ref-gone`, smoke, auto-rebase, operator) reinstates the sources in
+its place, nested sources included. Tests drive the planner to close a container on a later tick. In `on` mode a
+`retiring` audit line is written before removal; if it fails, nothing is removed. A failed `removed` line or
+`overlay-retired` event after removal is returned in `auditFailures` and preparation alerts on it.
 
 ## Established-overlay auto-rebase
 

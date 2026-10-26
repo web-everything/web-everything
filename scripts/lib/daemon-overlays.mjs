@@ -137,6 +137,7 @@ export function readOverlays(root, { env = process.env } = {}) {
 // A holder that died is detected by age (`LIST_LOCK_STALE_MS`) and its lock is broken.
 
 const LIST_LOCK_STALE_MS = 30_000;
+const SHA_RE = /^[0-9a-f]{40,64}$/;
 const LIST_LOCK_WAIT_MS = 20_000;
 const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
@@ -246,11 +247,11 @@ export async function readOverrideViewerLogin() {
   } catch { return null; }
 }
 
-/** Registration intent excludes the rebuild's mutable base-chain cache. */
+/** Registration intent excludes the rebuild's own caches: base chain, last refreshed tip, retired sources. */
 export function registrationIdentity(entry) {
   if (entry == null) return entry;
-  const { stackBases, ...identity } = entry;
-  void stackBases;
+  const { stackBases, tipSha, retiredSources, ...identity } = entry;
+  void stackBases; void tipSha; void retiredSources;
   return identity;
 }
 
@@ -338,10 +339,16 @@ export function recordEdgeResolution(root, ref, {
  * left out of that comparison: the rebuild rewrites it on its own ({@link persistStackBases}), which is no re-registration.
  * `expectedRequiredOverlay` also compares the required container's registration identity under that mutex;
  * its presence alone cannot authorize removal after concurrent replacement.
- * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedOverlay?:object, expectedRequiredOverlay?:object}} [o]
- * @returns {{removed:boolean, list:Array<object>}}
+ * `retireInto` (with `requireRef`) moves the removed entry into the container's `retiredSources` in the same write.
+ * Removing ANY entry that carries `retiredSources` puts those sources back in its place (unless re-registered
+ * meanwhile), so a container dropped later (pr-closed, ref-gone, operator) never takes their content with it.
+ * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedOverlay?:object, expectedRequiredOverlay?:object,
+ *   retireInto?:boolean, retiredSha?:string|null}} [o]
+ * @returns {{removed:boolean, list:Array<object>, reinstated:string[]}}
  */
-export function removeOverlay(root, ref, { env = process.env, why, requireRef, expectedOverlay, expectedRequiredOverlay } = {}) {
+export function removeOverlay(root, ref, {
+  env = process.env, why, requireRef, expectedOverlay, expectedRequiredOverlay, retireInto = false, retiredSha = null,
+} = {}) {
   void why; // caller bookkeeping only — see JSDoc above.
   return withListLock(root, env, (pause) => {
     const list = readOverlaysForWrite(root, env);
@@ -358,10 +365,48 @@ export function removeOverlay(root, ref, { env = process.env, why, requireRef, e
     if (expectedOverlay !== undefined && idx !== -1 && !isDeepStrictEqual(registrationIdentity(list[idx]), registrationIdentity(expectedOverlay))) {
       throw new Error('registration changed; refusing removal');
     }
-    if (idx === -1) return { removed: false, list };
-    const next = list.slice(0, idx).concat(list.slice(idx + 1));
+    if (idx === -1) return { removed: false, list, reinstated: [] };
+    const entry = list[idx];
+    const into = retireInto && requireRef !== undefined && requireRef !== ref;
+    // An entry retired INTO a container carries its own retired sources along, nested; otherwise they come back.
+    const sources = !into && Array.isArray(entry.retiredSources) ? entry.retiredSources : [];
+    const seen = new Set(list.map((o) => o?.ref));
+    const back = sources.filter((s) => isSafeBranchName(s?.entry?.ref) && !seen.has(s.entry.ref) && seen.add(s.entry.ref));
+    const restored = back.map((s) => (SHA_RE.test(s.sha ?? '') ? { ...s.entry, tipSha: s.sha } : s.entry));
+    const next = list.slice(0, idx).concat(restored, list.slice(idx + 1));
+    if (into) {
+      const c = next.findIndex((o) => o?.ref === requireRef);
+      const prior = Array.isArray(next[c].retiredSources) ? next[c].retiredSources : [];
+      next[c] = { ...next[c], retiredSources: [...prior.filter((s) => s?.entry?.ref !== ref), { entry, sha: retiredSha }] };
+    }
+    // Audit before the write: a failed append throws and leaves the list (container included) unchanged.
+    for (const s of back) appendOverlayEvent(root, { kind: 'reinstated', ref: s.entry.ref, from: ref, sha: s.sha ?? null }, { env });
     writeOverlays(root, next, { env });
-    return { removed: true, list: next };
+    return { removed: true, list: next, reinstated: back.map((s) => s.entry.ref) };
+  });
+}
+
+/**
+ * Record each refreshed overlay's remote tip as `tipSha` — retirement evidence once its branch is deleted. Same
+ * shape as {@link persistStackBases}: fresh read under the list lock, writes only changed entries, skips vanished ones.
+ * @param {string} root
+ * @param {Map<string,string>} tips ref → full sha
+ * @param {{env?:NodeJS.ProcessEnv}} [o]
+ * @returns {{written:number}}
+ */
+export function persistTipShas(root, tips, { env = process.env } = {}) {
+  if (!(tips instanceof Map) || tips.size === 0) return { written: 0 };
+  return withListLock(root, env, () => {
+    const list = readOverlaysForWrite(root, env).slice();
+    let written = 0;
+    for (let i = 0; i < list.length; i += 1) {
+      const sha = list[i] && tips.get(list[i].ref);
+      if (!SHA_RE.test(sha ?? '') || list[i].tipSha === sha) continue;
+      list[i] = { ...list[i], tipSha: sha };
+      written += 1;
+    }
+    if (written > 0) writeOverlays(root, list, { env });
+    return { written };
   });
 }
 

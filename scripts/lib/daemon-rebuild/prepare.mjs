@@ -269,8 +269,13 @@ export async function prepareRebuild({
   // or names the fetch layer skipped. One unavailable ref cannot block retirement of independently verified ones.
   if (!mainOnly && !overlayState.corrupt && fetchedMainSha) {
     try {
+      // The adopted build's applied tips are evidence for a deleted branch registered before `tipSha` was
+      // recorded. Edge-resolved entries applied a resolution commit, not the overlay's own tip, so they are skipped.
+      const recordedShas = new Map((state.adopted?.head === prevHead ? state.adopted.applied ?? [] : [])
+        .filter((a) => a?.ref && a.sha && !a.resolvedVia).map((a) => [a.ref, a.sha]));
       const retired = await autoRetireOverlays({ root, env, overlays: overlaysBefore, git, mainSha: fetchedMainSha,
-        refEvidence: fetchResult.refEvidence, now, removeOverlay, appendOverlayEvent });
+        refEvidence: fetchResult.refEvidence, recordedShas, now, removeOverlay, appendOverlayEvent });
+      if (retired.auditFailures.length) alert('overlay-auto-retire-audit-failed', { failures: retired.auditFailures });
       if (retired.retired.length) {
         const fresh = readOverlayState(root, { env });
         if (!fresh.corrupt) overlaysBefore = fresh.overlays;

@@ -3,7 +3,9 @@ import { readFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cascadePolicy, logCascadeSources } from './policy-cascade.mjs';
-import { removeOverlay as removeDefault, appendOverlayEvent as auditDefault } from './daemon-overlays.mjs';
+import {
+  removeOverlay as removeDefault, appendOverlayEvent as auditDefault, persistTipShas as persistTipsDefault,
+} from './daemon-overlays.mjs';
 import { appendDaemonEvent as eventDefault } from './daemon-events.mjs';
 import { isSafeBranchName } from './daemon-self-sync.mjs';
 
@@ -28,7 +30,7 @@ export function resolveAutoRetireMode(env = process.env, { settingsPath = SETTIN
 }
 
 /** Git runner takes argv and returns spawnSync-shaped results. No worktree or network mutations. */
-export function classifyOverlays({ overlays, git, mainSha = 'origin/main', refEvidence }) {
+export function classifyOverlays({ overlays, git, mainSha = 'origin/main', refEvidence, recordedShas }) {
   const call = (args, allowed = [0]) => {
     const r = git(args);
     if (!r || r.error || !allowed.includes(r.status)) throw new Error('git-unverifiable');
@@ -52,8 +54,9 @@ export function classifyOverlays({ overlays, git, mainSha = 'origin/main', refEv
       const refs = evidence === 'missing' ? [] : String(call(['for-each-ref', '--format=%(refname) %(objectname)', tracking]).stdout ?? '').trim().split('\n');
       const remote = refs.find((line) => line.startsWith(`${tracking} `))?.split(' ')[1];
       if (evidence === 'refreshed' && !remote) return row;
-      // Recorded commits are fallback evidence for absent branches, never for a failed refresh.
-      const recorded = overlay.sha ?? overlay.headSha ?? overlay.tipSha;
+      // Recorded commits are fallback evidence for absent branches, never for a failed refresh: the registration's
+      // own fields (`tipSha`, the last refreshed tip, wins as the newest), else the adopted build's applied tip.
+      const recorded = overlay.tipSha ?? overlay.sha ?? overlay.headSha ?? recordedShas?.get(overlay.ref);
       if (!remote && !SHA.test(recorded ?? '')) return row;
       row.sha = rev(remote || recorded);
       if (call(['merge-base', '--is-ancestor', row.sha, main], [0, 1]).status === 0) {
@@ -98,14 +101,20 @@ export function classifyOverlays({ overlays, git, mainSha = 'origin/main', refEv
   return rows;
 }
 
-/** Best-effort retirement; list mutex guards both source and container registration identities. */
+/**
+ * Best-effort retirement; list mutex guards both source and container registration identities. In 'on' mode a
+ * `retiring` audit line (ref, sha, reason) is written BEFORE removal, and no removal happens if it cannot be;
+ * a later `removed` line or `overlay-retired` event that fails lands in `auditFailures` for the caller to alert.
+ * A contained source moves into its container's `retiredSources`, so removing the container later reinstates it.
+ */
 export async function autoRetireOverlays({
-  root, env = process.env, overlays, git, mainSha, refEvidence, now = Date.now,
+  root, env = process.env, overlays, git, mainSha, refEvidence, recordedShas, now = Date.now,
   removeOverlay = removeDefault, appendOverlayEvent = auditDefault, appendDaemonEvent = eventDefault,
+  persistTipShas = persistTipsDefault,
 }) {
   const { mode, source } = resolveAutoRetireMode(env, { now });
-  const result = { retired: [], wouldRetire: [], kept: [] };
-  const rows = classifyOverlays({ overlays, git, mainSha, refEvidence });
+  const result = { retired: [], wouldRetire: [], kept: [], auditFailures: [] };
+  const rows = classifyOverlays({ overlays, git, mainSha, refEvidence, recordedShas });
   for (const row of rows) {
     if (mode === 'off' || row.class === 'needed') { result.kept.push(row); continue; }
     const event = { ref: row.ref, by: 'auto-retire', reason: row.reason, sha: row.sha };
@@ -115,19 +124,32 @@ export async function autoRetireOverlays({
         result.wouldRetire.push(row);
         continue;
       }
+      appendOverlayEvent(root, { ...event, kind: 'retiring', ...(row.container ? { container: row.container } : {}) }, { env });
       const removed = removeOverlay(root, row.ref, {
         env, why: row.reason, expectedOverlay: overlays.find((o) => o?.ref === row.ref),
         ...(row.container ? {
           requireRef: row.container, expectedRequiredOverlay: overlays.find((o) => o?.ref === row.container),
+          retireInto: true, retiredSha: row.sha,
         } : {}),
       });
       if (!removed.removed) { result.kept.push(row); continue; }
       result.retired.push(row);
-      appendOverlayEvent(root, { ...event, kind: 'removed' }, { env });
-      await appendDaemonEvent({ kind: 'overlay-retired', daemon: env.WE_DAEMON_NAME || basename(root), detail: { ref: row.ref, reason: row.reason } }, { env });
     } catch {
-      if (!result.retired.includes(row)) result.kept.push({ ...row, reason: 'retirement-unverifiable' });
+      result.kept.push({ ...row, reason: 'retirement-unverifiable' });
+      continue;
     }
+    try { appendOverlayEvent(root, { ...event, kind: 'removed' }, { env }); }
+    catch (error) { result.auditFailures.push({ ref: row.ref, kind: 'removed', error: String(error?.message || error) }); }
+    try {
+      await appendDaemonEvent({ kind: 'overlay-retired', daemon: env.WE_DAEMON_NAME || basename(root), detail: { ref: row.ref, reason: row.reason } }, { env });
+    } catch (error) { result.auditFailures.push({ ref: row.ref, kind: 'overlay-retired', error: String(error?.message || error) }); }
+  }
+  // Only a tip this run refreshed is evidence; a cached tracking ref (no refEvidence) never is.
+  const tips = new Map(rows.filter((r) => refEvidence?.get(r.ref) === 'refreshed' && SHA.test(r.sha ?? '')
+    && !result.retired.includes(r)).map((r) => [r.ref, r.sha]));
+  if (mode !== 'off' && tips.size) {
+    try { persistTipShas(root, tips, { env }); }
+    catch (error) { result.auditFailures.push({ ref: null, kind: 'tip-sha', error: String(error?.message || error) }); }
   }
   return result;
 }

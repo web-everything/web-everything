@@ -7,7 +7,7 @@ import { prepareRebuild } from '../../../lib/daemon-rebuild/prepare.mjs';
 import { rebuildClone } from '../../../lib/daemon-rebuild.mjs';
 import { ACTIVE_BUILD_TOKENS, releaseBuildLease } from '../../../lib/daemon-rebuild/lease.mjs';
 import { readRebuildState, writeRebuildState } from '../../../lib/daemon-rebuild/state.mjs';
-import { overlayFilePath, readOverlayState, removeOverlay, writeOverlays } from '../../../lib/daemon-overlays.mjs';
+import { addOverlay, overlayFilePath, readOverlayState, removeOverlay, writeOverlays } from '../../../lib/daemon-overlays.mjs';
 import { autoRetireOverlays } from '../../../lib/daemon-overlay-auto-retire.mjs';
 
 export default {
@@ -23,7 +23,9 @@ export default {
       return readFileSync(join(root, 'scripts/lib/daemon-overlay-auto-retire.mjs'), 'utf8').includes("r.sources.mode === 'tool'")
         && readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8').includes('refEvidence: fetchResult.refEvidence')
         && readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8').includes('const plan = unavailablePinned ??')
-        && readFileSync(join(root, 'scripts/lib/daemon-overlays.mjs'), 'utf8').includes('expectedRequiredOverlay');
+        && readFileSync(join(root, 'scripts/lib/daemon-overlays.mjs'), 'utf8').includes('expectedRequiredOverlay')
+        && readFileSync(join(root, 'scripts/lib/daemon-overlays.mjs'), 'utf8').includes('retiredSources')
+        && readFileSync(join(root, 'scripts/lib/daemon-overlay-auto-retire.mjs'), 'utf8').includes('persistTipShas');
     } catch { return false; }
   },
   async run() {
@@ -176,7 +178,69 @@ export default {
       }
     } catch (error) { violation('crash', String(error?.message ?? error)); }
     finally { rmSync(root, { recursive: true, force: true }); }
+    await retirementRecovery(violation);
     return { violations };
   },
   judge(report) { return report.violations.map((v) => `[${v.invariant}] ${v.detail}`); },
 };
+
+/** PR #5964 advisory round, 'on' mode: a registration added without a sha retires once its landed branch is
+ *  deleted, and a container closed on a later tick leaves the source retired into it registered. */
+async function retirementRecovery(violation) {
+  const root = mkdtempSync(join(tmpdir(), 'overlay-retire-on-soak-'));
+  const env = {
+    WE_DAEMON_OVERLAY_DIR: join(root, 'store'), WE_DAEMON_STATE_DIR: join(root, 'state'),
+    WE_DAEMON_EVENTS: join(root, 'events.jsonl'), WE_PLATFORM_PREFERENCES_FILE: join(root, 'prefs.json'),
+    WE_DAEMON_AUTO_REBASE: '0', WE_DAEMON_OVERLAY_AUTO_RETIRE: 'on',
+  };
+  const git = (args) => spawnSync('git', ['-c', 'user.name=Soak', '-c', 'user.email=soak@example.test', ...args], {
+    cwd: root, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+  });
+  const ok = (...args) => {
+    const result = git(args);
+    if (result.status !== 0) throw new Error(String(result.stderr));
+    return String(result.stdout).trim();
+  };
+  const commit = (file) => {
+    writeFileSync(join(root, file), file);
+    ok('add', file); ok('commit', '-qm', file);
+    return ok('rev-parse', 'HEAD');
+  };
+  const refs = () => readOverlayState(root, { env }).overlays.map((o) => o.ref).join(',');
+  const prepare = async (prState = async () => 'OPEN') => {
+    const prepared = await prepareRebuild({ root, env, run: git, now: Date.now, mainOnly: false, prState, prBaseChain: async () => [] });
+    if (prepared.lease) {
+      try {
+        const state = readRebuildState(root, env);
+        releaseBuildLease(state, prepared.lease);
+        writeRebuildState(root, state, env);
+      } finally { ACTIVE_BUILD_TOKENS.delete(prepared.lease.token); }
+    }
+    return prepared;
+  };
+  try {
+    writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, '{}');
+    ok('init', '-q', '-b', 'main');
+    const initial = commit('base');
+    ok('checkout', '-qb', 'feature'); commit('feature');
+    ok('checkout', '-qb', 'lower', initial); const lower = commit('lower');
+    ok('checkout', '-qb', 'top', lower); commit('top');
+    ok('checkout', '-q', 'main');
+    ok('clone', '--bare', '-q', root, join(root, 'origin.git'));
+    ok('remote', 'add', 'origin', join(root, 'origin.git'));
+    addOverlay(root, { ref: 'feature', pr: 1 }, { env });
+    addOverlay(root, { ref: 'lower', pr: 2 }, { env });
+    addOverlay(root, { ref: 'top', pr: 3 }, { env });
+    await prepare();
+    if (refs() !== 'feature,top') violation('contained-source-not-retired', `expected feature,top after the first tick, got ${refs()}`);
+    // feature squash-lands and GitHub deletes its branch; top's PR is closed unmerged on the same tick.
+    ok('checkout', '-q', 'feature', '--', 'feature'); ok('commit', '-qm', 'squash feature');
+    ok('push', '-q', 'origin', 'main');
+    ok('push', '-q', 'origin', '--delete', 'feature');
+    await prepare(async (pr) => (pr === 3 ? 'CLOSED' : 'OPEN'));
+    const after = readOverlayState(root, { env }).overlays.map((o) => o.ref);
+    if (after.includes('feature')) violation('deleted-landed-branch-never-retires', 'an addOverlay registration stayed after its landed branch was deleted');
+    if (!after.includes('lower')) violation('closed-container-loses-retired-source', `lower's open PR content left the registry with its closed container (${after.join(',')})`);
+  } catch (error) { violation('crash', String(error?.message ?? error)); }
+  finally { rmSync(root, { recursive: true, force: true }); }
+}

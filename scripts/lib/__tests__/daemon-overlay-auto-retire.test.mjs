@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { autoRetireOverlays, classifyOverlays, resolveAutoRetireMode } from '../daemon-overlay-auto-retire.mjs';
-import { appendOverlayEvent, overlayFilePath, readOverlayState, removeOverlay, writeOverlays } from '../daemon-overlays.mjs';
+import { addOverlay, appendOverlayEvent, overlayFilePath, readOverlayState, removeOverlay, writeOverlays } from '../daemon-overlays.mjs';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 
 let root, env, base, initial;
@@ -45,7 +45,8 @@ const localOrigin = () => {
 };
 const expectNoRetirement = () => {
   const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
-  expect(existsSync(file) ? audit().filter((e) => e.by === 'auto-retire') : []).toEqual([]);
+  // A `retiring` intent line may precede a refused removal; only `removed` and shadow lines record retirement.
+  expect(existsSync(file) ? audit().filter((e) => e.by === 'auto-retire' && e.kind !== 'retiring') : []).toEqual([]);
   expect(existsSync(env.WE_DAEMON_EVENTS) ? readFileSync(env.WE_DAEMON_EVENTS, 'utf8') : '').not.toContain('overlay-retired');
 };
 
@@ -197,7 +198,7 @@ describe('real Git retirement evidence', () => {
     register([{ ref: 'deleted', [field]: initial }, { ref: 'main-overlay' }]);
     await prepare();
     expect(readOverlayState(root, { env }).overlays).toEqual([]);
-    expect(audit().filter((e) => e.by === 'auto-retire').map((e) => e.ref)).toEqual(['deleted', 'main-overlay']);
+    expect(audit().filter((e) => e.kind === 'removed').map((e) => e.ref)).toEqual(['deleted', 'main-overlay']);
     expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).toContain('overlay-retired');
   });
 
@@ -239,7 +240,7 @@ describe('real Git retirement evidence', () => {
     await prepare({ run: (args) => args[0] === 'ls-remote'
       ? { status: 128, stderr: 'unavailable' } : git(args) });
     expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'uncertain', sha: initial }]);
-    expect(audit().filter((e) => e.by === 'auto-retire').map((e) => e.ref)).toEqual(['main']);
+    expect(audit().filter((e) => e.kind === 'removed').map((e) => e.ref)).toEqual(['main']);
   });
 
   it('mainOnly preserves landed registrations without retirement events', async () => {
@@ -342,7 +343,8 @@ describe('real Git retirement evidence', () => {
     });
     expect(prepared.terminal, JSON.stringify(prepared)).toBe(false);
     expect(ok('rev-parse', 'refs/remotes/origin/feature')).toBe(newer);
-    expect(readOverlayState(root, { env }).overlays).toEqual(overlays);
+    // The refreshed tip is recorded as later deleted-branch evidence; the registration itself is unchanged.
+    expect(readOverlayState(root, { env }).overlays).toEqual([{ ...overlays[0], tipSha: newer }]);
     expect(prepared.plan.decisions).toContainEqual(expect.objectContaining({ ref: 'feature', action: 'apply', sha: newer }));
   });
 
@@ -392,8 +394,11 @@ describe('real Git retirement evidence', () => {
     track('top');
     const result = await retire([{ ref: 'lower' }, { ref: 'top' }]);
     expect(result.retired).toEqual([expect.objectContaining({ ref: 'lower', class: 'contained', sha: lower })]);
-    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'top' }]);
-    expect(audit()).toEqual([expect.objectContaining({ kind: 'removed', by: 'auto-retire', ref: 'lower', sha: lower })]);
+    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'top', retiredSources: [{ entry: { ref: 'lower' }, sha: lower }] }]);
+    expect(audit()).toEqual([
+      expect.objectContaining({ kind: 'retiring', by: 'auto-retire', ref: 'lower', sha: lower, container: 'top' }),
+      expect.objectContaining({ kind: 'removed', by: 'auto-retire', ref: 'lower', sha: lower }),
+    ]);
     expect(JSON.parse(readFileSync(env.WE_DAEMON_EVENTS, 'utf8'))).toMatchObject({ kind: 'overlay-retired', daemon: root.split('/').pop(), detail: { ref: 'lower', reason: 'stack-contained' } });
   });
 
@@ -573,6 +578,100 @@ describe('real Git retirement evidence', () => {
     });
     expect(result.retired).toEqual([]);
     expect(result.kept[0].reason).toBe('retirement-unverifiable');
+  });
+});
+
+describe('PR #5964 advisory round: evidence, containment recovery and audit order', () => {
+  it('an addOverlay registration retires after its squash-landed branch is deleted', async () => {
+    branch('feature');
+    commit('feature', 'feature content');
+    branch('main');
+    localOrigin();
+    addOverlay(root, { ref: 'feature', pr: 7 }, { env });
+    await prepare();
+    expect(readOverlayState(root, { env }).overlays.map((o) => o.ref)).toEqual(['feature']);
+    commit('feature', 'feature content');
+    ok('push', '-q', 'origin', 'main');
+    ok('push', '-q', 'origin', '--delete', 'feature');
+    await prepare();
+    expect(readOverlayState(root, { env }).overlays).toEqual([]);
+    expect(audit().filter((e) => e.kind === 'removed').map((e) => e.ref)).toEqual(['feature']);
+  }, 30_000); // two full preparations
+
+  it('classification falls back to a supplied adopted SHA for a confirmed-missing branch', () => {
+    const overlays = [{ ref: 'feature' }];
+    const refEvidence = new Map([['feature', 'missing']]);
+    expect(classifyOverlays({ overlays, git, refEvidence })[0]).toMatchObject({ class: 'needed' });
+    expect(classifyOverlays({ overlays, git, refEvidence, recordedShas: new Map([['feature', initial]]) })[0])
+      .toMatchObject({ class: 'landed', sha: initial });
+  });
+
+  it('removing a container reinstates the overlays retired into it', async () => {
+    branch('lower'); const lower = commit('lower', 'lower'); track('lower');
+    commit('top', 'top'); track('top');
+    await retire([{ ref: 'lower', pr: 1 }, { ref: 'top', pr: 2 }]);
+    expect(readOverlayState(root, { env }).overlays.map((o) => o.ref)).toEqual(['top']);
+    const removed = removeOverlay(root, 'top', { env, why: 'pr-closed' });
+    expect(removed.reinstated).toEqual(['lower']);
+    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'lower', pr: 1, tipSha: lower }]);
+    expect(audit()).toContainEqual(expect.objectContaining({ kind: 'reinstated', ref: 'lower', from: 'top', sha: lower }));
+  });
+
+  it('a failed reinstatement audit leaves the container and its retired sources registered', async () => {
+    branch('lower'); commit('lower', 'lower'); track('lower');
+    commit('top', 'top'); track('top');
+    await retire([{ ref: 'lower' }, { ref: 'top' }]);
+    const before = readOverlayState(root, { env }).overlays;
+    const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
+    rmSync(file);
+    mkdirSync(file);
+    expect(() => removeOverlay(root, 'top', { env, why: 'pr-closed' })).toThrow();
+    expect(readOverlayState(root, { env }).overlays).toEqual(before);
+  });
+
+  it('a container retired into a later container keeps its own retired sources nested', async () => {
+    branch('a'); commit('a', 'a'); track('a');
+    commit('b', 'b'); track('b');
+    await retire([{ ref: 'a' }, { ref: 'b' }]);
+    commit('c', 'c'); track('c');
+    const second = [...readOverlayState(root, { env }).overlays, { ref: 'c' }];
+    await retire(second);
+    expect(readOverlayState(root, { env }).overlays.map((o) => o.ref)).toEqual(['c']);
+    expect(removeOverlay(root, 'c', { env }).reinstated).toEqual(['b']);
+    expect(removeOverlay(root, 'b', { env }).reinstated).toEqual(['a']);
+    expect(readOverlayState(root, { env }).overlays.map((o) => o.ref)).toEqual(['a']);
+  });
+
+  it('the planner closing a container on a later tick leaves the retired source registered', async () => {
+    branch('lower'); const lower = commit('lower', 'lower');
+    branch('top', lower); commit('top', 'top');
+    branch('main');
+    localOrigin();
+    register([{ ref: 'lower', pr: 1 }, { ref: 'top', pr: 2 }]);
+    await prepare();
+    expect(readOverlayState(root, { env }).overlays.map((o) => o.ref)).toEqual(['top']);
+    await prepare({ prState: async (pr) => (pr === 2 ? 'CLOSED' : 'OPEN') });
+    expect(readOverlayState(root, { env }).overlays.map((o) => o.ref)).toEqual(['lower']);
+  }, 30_000); // two full preparations
+
+  it('on mode writes the audit line before removal and keeps the registration when it cannot', async () => {
+    const overlays = [{ ref: 'gone', sha: initial }];
+    const result = await retire(overlays, { appendOverlayEvent: () => { throw new Error('disk full'); } });
+    expect(result.retired).toEqual([]);
+    expect(result.kept).toEqual([expect.objectContaining({ ref: 'gone', reason: 'retirement-unverifiable' })]);
+    expect(readOverlayState(root, { env }).overlays).toEqual(overlays);
+  });
+
+  it('on mode reports a post-removal audit failure instead of swallowing it', async () => {
+    const result = await retire([{ ref: 'gone', sha: initial }], {
+      appendOverlayEvent: (r, event, o) => {
+        if (event.kind === 'removed') throw new Error('disk full');
+        return appendOverlayEvent(r, event, o);
+      },
+    });
+    expect(result.retired.map((r) => r.ref)).toEqual(['gone']);
+    expect(result.auditFailures).toEqual([expect.objectContaining({ ref: 'gone', error: 'disk full' })]);
+    expect(audit()).toEqual([expect.objectContaining({ kind: 'retiring', ref: 'gone', sha: initial })]);
   });
 });
 
