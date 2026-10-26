@@ -1,18 +1,19 @@
 ---
+bornAs: xu02z27
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/red-team-gate.mjs"]
+scope: ["we:scripts/lib/pr-size-admission.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5922 (head 5e8db5677)
+# Red-team follow-ups from web-everything/web-everything#5874 (head 59dd2a7df)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5922 (reviewed head `5e8db56777b1a770ea35c1f94bfef6628cd3ed05`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5874 (reviewed head `59dd2a7df2c6f714b65fe1042b2c8f3759b32592`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/lib/red-team-gate.mjs:703` — (failing-input, degraded) Rejected automation-authored operator-card lines still suppress legitimate card filing.
-   - Scenario: For a live result R containing confirmed break #1, append a trusted automation comment with outcome=card-queued, result=R, and the action line '- 1 finding(s) carded by the operator to 'we:backlog/nonexistent.md' (#1).', followed by a round-cap record holding #1. The release reader correctly rejects the operator-only action, but operatorRulingsOnLiveResult marks #1 carded because card-queued is an automation release outcome. A Node probe confirmed held=[1], ruled=[], carded=[1] with anyState both false and true. Consequently, rulableBreaks filters out #1 when ruling card without --card, preven
+1. `we:scripts/lib/pr-size-admission.mjs:102` — (edge-case, degraded) Qualified remote bases can be shadowed by another branch
+   - Scenario: Run with remote=upstream and base=main while refs/remotes/origin/upstream/main also exists. The new caller supplies upstream/main, but the reader preferentially resolves origin/upstream/main. An injected-Git probe with upstream/main at the actual base and origin/upstream/main at the PR head selected the latter, returning status=ok, zero lines, and no split card or size escalation for an actual 301-line change. Already-qualified bases must retain the selected remote.
    - Claude's re-check: demonstrated break
 
 ## Acceptance

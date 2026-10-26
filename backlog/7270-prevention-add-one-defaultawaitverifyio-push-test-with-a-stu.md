@@ -1,22 +1,21 @@
 ---
+bornAs: xf815g4
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/needs-you-feed.mjs", "we:vitest.globalSetup.mjs", "we:scripts/operations/__tests__/needs-you-feed.test.mjs", "we:./__tests__/vitest.globalSetup.test.mjs"]
+scope: ["we:scripts/conveyor/await-verify-pass.mjs", "we:scripts/conveyor/__tests__/await-verify-pass.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Return a discriminated result from the ledger, such as {status:'ruled'|'none'|'accepted'}, and su… (from web-everything/web-everything#5944 review)
+# Prevention — Add one defaultAwaitVerifyIo.push test with a stubbed exec asserting the upToDate propagation. A… (from web-everything/web-everything#5919 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/needs-you-feed.mjs:243` — Return a discriminated result from the ledger, such as `{status:'ruled'|'none'|'accepted'}`, and suppress only on the ruled status. Add a test per null cause.
-2. `we:vitest.globalSetup.mjs:30` — Add a deterministic test matrix covering child-process event writes under both hermetic and non-hermetic setup, with an explicit assertion that the seeded operator stream remains unchanged.
-3. `we:vitest.globalSetup.mjs:30` — Add the named subprocess isolation regression test to the deterministic test gate, including an explicit pre-existing operator event-path override.
+1. `we:scripts/conveyor/await-verify-pass.mjs:791` — Add one defaultAwaitVerifyIo.push test with a stubbed exec asserting the upToDate propagation. A broader option is a convention that every new field on an IO result needs a test crossing the real factory.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5944@da35416ed91c17012193cd33e34f09d86f6c4216
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5919@96db515f154fd071b0fb554ff3fecdadcdfc103f
 
 ## Acceptance
 

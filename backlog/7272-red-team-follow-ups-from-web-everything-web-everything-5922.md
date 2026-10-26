@@ -1,18 +1,19 @@
 ---
+bornAs: xfxa20y
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/pr-size-admission.mjs"]
-dateOpened: "2026-10-26"
+scope: ["we:scripts/lib/red-team-gate.mjs"]
+dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5874 (head fb1a3c63f)
+# Red-team follow-ups from web-everything/web-everything#5922 (head 5e8db5677)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5874 (reviewed head `fb1a3c63f99c2fd5cc07e184cdfb1d9b17d28a74`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5922 (reviewed head `5e8db56777b1a770ea35c1f94bfef6628cd3ed05`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/lib/pr-size-admission.mjs:241` — (edge-case, degraded) Same-head retries republish the split card after its batch seals
-   - Scenario: Open a 301-line PR, let its split-card batch seal, then rerun the same head before that batch merges. The card is still absent from the canonical base, so publication calls fileIntoBatch again. Sealing archives the original membership and leaves an active state containing only seq and lastSealedState; admission therefore admits the identical idempotency key into the next batch. A read-only probe using the real admission runner, local lookup, and planAdmit produced lane/card-batch-filing-1 followed by lane/card-batch-filing-2 for one unchanged card. This creates redundant publication and verifi
+1. `we:scripts/lib/red-team-gate.mjs:703` — (failing-input, degraded) Rejected automation-authored operator-card lines still suppress legitimate card filing.
+   - Scenario: For a live result R containing confirmed break #1, append a trusted automation comment with outcome=card-queued, result=R, and the action line '- 1 finding(s) carded by the operator to 'we:backlog/nonexistent.md' (#1).', followed by a round-cap record holding #1. The release reader correctly rejects the operator-only action, but operatorRulingsOnLiveResult marks #1 carded because card-queued is an automation release outcome. A Node probe confirmed held=[1], ruled=[], carded=[1] with anyState both false and true. Consequently, rulableBreaks filters out #1 when ruling card without --card, preven
    - Claude's re-check: demonstrated break
 
 ## Acceptance

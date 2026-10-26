@@ -1,20 +1,21 @@
 ---
+bornAs: xvv94h1
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/await-verify-pass.mjs", "we:scripts/conveyor/__tests__/await-verify-pass.test.mjs"]
-dateOpened: "2026-10-25"
+scope: ["we:scripts/lib/review-red-team-on-skip.mjs", "we:scripts/lib/__tests__/review-red-team-on-skip.test.mjs"]
+dateOpened: "2026-10-26"
 tags: []
 ---
 
-# Prevention — Add one defaultAwaitVerifyIo.push test with a stubbed exec asserting the upToDate propagation. A… (from web-everything/web-everything#5919 review)
+# Prevention — Add an integration test that builds the cliReviewTickOpts().redTeamOnSkip closure and asserts the… (from web-everything/web-everything#5942 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/await-verify-pass.mjs:791` — Add one defaultAwaitVerifyIo.push test with a stubbed exec asserting the upToDate propagation. A broader option is a convention that every new field on an IO result needs a test crossing the real factory.
+1. `we:scripts/lib/review-red-team-on-skip.mjs:128` — Add an integration test that builds the `cliReviewTickOpts().redTeamOnSkip` closure and asserts the proof runs against a checkout containing the PR head. Alternatively, have the planner fetch the head or reuse the lane-based proof.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5919@96db515f154fd071b0fb554ff3fecdadcdfc103f
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5942@e18dcd00f8bb7c111088524a66dd64ced796e88f
 
 ## Acceptance
 

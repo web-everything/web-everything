@@ -1,20 +1,25 @@
 ---
+bornAs: xln4o33
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/review-red-team-on-skip.mjs", "we:scripts/lib/__tests__/review-red-team-on-skip.test.mjs"]
-dateOpened: "2026-10-26"
+scope: ["we:scripts/lib/delivery-policy.mjs", "we:scripts/lib/__tests__/delivery-policy.test.mjs"]
+dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Add an integration test that builds the cliReviewTickOpts().redTeamOnSkip closure and asserts the… (from web-everything/web-everything#5942 review)
+# Prevention — Extend the xg5936p review rule to require one cache-warm, authorization-only-change test per trus… (from web-everything/web-everything#5936 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+1. `we:scripts/lib/delivery-policy.mjs:14` — Extend the xg5936p review rule to require one cache-warm, authorization-only-change test per trust check the comment names, not per comment.
+2. `we:scripts/lib/delivery-policy.mjs:239` — Route every failsafe return through one helper that both warns and journals. Add a test assertion that every failsafe test checks readPolicyEvents.
+3. `we:scripts/lib/__tests__/delivery-policy.test.mjs:125` — Apply the guard-isolation review rule already filed as card xg5936p: each guard-named test needs a positive control and an assertion that fails if only that guard is removed. Longer term, add a mutation-smoke check for trust-boundary modules.
+4. `we:scripts/lib/delivery-policy.mjs:96` — Apply the cache-hit revalidation rule in card xg5936p (A2): every 'never cached' trust promise must map to a named test with content and mtime held fixed, one per authorization axis.
 
-1. `we:scripts/lib/review-red-team-on-skip.mjs:128` — Add an integration test that builds the `cliReviewTickOpts().redTeamOnSkip` closure and asserts the proof runs against a checkout containing the PR head. Alternatively, have the planner fetch the head or reuse the lane-based proof.
+Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 5 → #5360, finding 6 → #5360.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5942@e18dcd00f8bb7c111088524a66dd64ced796e88f
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5936@b6a414a7a9a674eed369bc12b058ccb7d3125077
 
 ## Acceptance
 

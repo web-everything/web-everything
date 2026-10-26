@@ -1,18 +1,19 @@
 ---
+bornAs: xl4gbjq
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/pr-size-admission.mjs"]
+scope: ["we:scripts/operations/record-red-team-ruling-io.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5874 (head 59dd2a7df)
+# Red-team follow-ups from web-everything/web-everything#5923 (head cd1c3041b)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5874 (reviewed head `59dd2a7df2c6f714b65fe1042b2c8f3759b32592`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5923 (reviewed head `cd1c3041b01d662ed9c3a5e7c6135bc89074b709`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/lib/pr-size-admission.mjs:102` — (edge-case, degraded) Qualified remote bases can be shadowed by another branch
-   - Scenario: Run with remote=upstream and base=main while refs/remotes/origin/upstream/main also exists. The new caller supplies upstream/main, but the reader preferentially resolves origin/upstream/main. An injected-Git probe with upstream/main at the actual base and origin/upstream/main at the PR head selected the latter, returning status=ok, zero lines, and no split card or size escalation for an actual 301-line change. Already-qualified bases must retain the selected remote.
+1. `we:scripts/operations/record-red-team-ruling-io.mjs:389` — (failing-input, degraded) A failed reason post leaves an incomplete block that retries refuse
+   - Scenario: Start with a confirmed break at round-cap and review:changes already present. Invoke --ruling=block; let the first POST persist operator-block, then make the second POST fail with HTTP 503. The operator's reason is absent, and execution never reaches the ledger append. Replanning the identical command refuses with 'no confirmed red-team break ... left to rule 'block'' because the persisted block and existing label are treated as completion. This was reproduced with injected IO. The partial operation should remain retryable until its reason and required recording steps complete.
    - Claude's re-check: demonstrated break
 
 ## Acceptance

@@ -1,18 +1,19 @@
 ---
+bornAs: xfi89io
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/operations/review-job.mjs"]
-dateOpened: "2026-10-25"
+scope: ["we:scripts/lib/pr-size-admission.mjs"]
+dateOpened: "2026-10-26"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5890 (head f929f28c6)
+# Red-team follow-ups from web-everything/web-everything#5874 (head fb1a3c63f)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5890 (reviewed head `f929f28c6dcb531e9d112938583bbbcae9419db9`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5874 (reviewed head `fb1a3c63f99c2fd5cc07e184cdfb1d9b17d28a74`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/operations/review-job.mjs:300` — (edge-case, degraded) A crashed admission erases the unknown prior and permits a fresh model call
-   - Scenario: Start with an accepted code head whose persisted status is finished/result:null, with no seat row or result comment. Invoke fresh recovery directly: admission preserves the unknown prior only in memory and overwrites storage with queued/result:null. Crash after that write, before guard rollback. Once the writer is dead, recovery normalizes this queued record to finished/null; the planner dispatches fresh and the next admission discards the prior. An in-memory probe of the production functions confirmed the original guard refuses, while the post-crash guard admits execution. This bypasses the c
+1. `we:scripts/lib/pr-size-admission.mjs:241` — (edge-case, degraded) Same-head retries republish the split card after its batch seals
+   - Scenario: Open a 301-line PR, let its split-card batch seal, then rerun the same head before that batch merges. The card is still absent from the canonical base, so publication calls fileIntoBatch again. Sealing archives the original membership and leaves an active state containing only seq and lastSealedState; admission therefore admits the identical idempotency key into the next batch. A read-only probe using the real admission runner, local lookup, and planAdmit produced lane/card-batch-filing-1 followed by lane/card-batch-filing-2 for one unchanged card. This creates redundant publication and verifi
    - Claude's re-check: demonstrated break
 
 ## Acceptance

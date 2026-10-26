@@ -1,21 +1,21 @@
 ---
+bornAs: xu1cvvr
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/daemon-rebuild/candidate.mjs", "we:scripts/lane-pool.mjs", "we:scripts/lib/daemon-rebuild/__tests__/candidate.test.mjs", "we:scripts/__tests__/lane-pool.test.mjs"]
-dateOpened: "2026-10-25"
+scope: ["we:scripts/lib/__tests__/daemon-rebuild.test.mjs"]
+dateOpened: "2026-10-26"
 tags: []
 ---
 
-# Prevention — Resolve a relative origin to an absolute path against root in candidateSmokeEnv, and add a test c… (from web-everything/web-everything#5941 review)
+# Prevention — Add a deterministic configuration check asserting the effective file-level timeout equals 60,000… (from web-everything/web-everything#5971 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/daemon-rebuild/candidate.mjs:148` — Resolve a relative origin to an absolute path against `root` in candidateSmokeEnv, and add a test case for a relative-path remote. Alternatively, a lint or test asserting that exported origins are absolute or URL-shaped.
-2. `we:scripts/lane-pool.mjs:355` — Add a lane-pool test matrix that runs each command class (needsOrigin, gc, release with --pool) under the env. Alternatively, scope the env to `needsOrigin` commands only.
+1. `we:scripts/lib/__tests__/daemon-rebuild.test.mjs:43` — Add a deterministic configuration check asserting the effective file-level timeout equals 60,000 milliseconds, so the default cannot satisfy it.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5941@3161dc0a49b64cb764bdf98b455d9941424a918f
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5971@9912cd6335a5bc6700cf888645b5e18911dbbc47
 
 ## Acceptance
 

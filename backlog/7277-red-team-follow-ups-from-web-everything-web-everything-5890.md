@@ -1,18 +1,19 @@
 ---
+bornAs: xhxgbjx
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/operations/record-red-team-ruling-io.mjs"]
+scope: ["we:scripts/operations/review-job.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5923 (head cd1c3041b)
+# Red-team follow-ups from web-everything/web-everything#5890 (head f929f28c6)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5923 (reviewed head `cd1c3041b01d662ed9c3a5e7c6135bc89074b709`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5890 (reviewed head `f929f28c6dcb531e9d112938583bbbcae9419db9`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/operations/record-red-team-ruling-io.mjs:389` — (failing-input, degraded) A failed reason post leaves an incomplete block that retries refuse
-   - Scenario: Start with a confirmed break at round-cap and review:changes already present. Invoke --ruling=block; let the first POST persist operator-block, then make the second POST fail with HTTP 503. The operator's reason is absent, and execution never reaches the ledger append. Replanning the identical command refuses with 'no confirmed red-team break ... left to rule 'block'' because the persisted block and existing label are treated as completion. This was reproduced with injected IO. The partial operation should remain retryable until its reason and required recording steps complete.
+1. `we:scripts/operations/review-job.mjs:300` — (edge-case, degraded) A crashed admission erases the unknown prior and permits a fresh model call
+   - Scenario: Start with an accepted code head whose persisted status is finished/result:null, with no seat row or result comment. Invoke fresh recovery directly: admission preserves the unknown prior only in memory and overwrites storage with queued/result:null. Crash after that write, before guard rollback. Once the writer is dead, recovery normalizes this queued record to finished/null; the planner dispatches fresh and the next admission discards the prior. An in-memory probe of the production functions confirmed the original guard refuses, while the post-crash guard admits execution. This bypasses the c
    - Claude's re-check: demonstrated break
 
 ## Acceptance
