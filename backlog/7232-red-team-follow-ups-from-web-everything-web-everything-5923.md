@@ -1,18 +1,19 @@
 ---
+bornAs: xfkmmkx
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/operations/completion-cli.mjs"]
+scope: ["we:scripts/operations/record-red-team-ruling-io.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5943 (head 44e2565f7)
+# Red-team follow-ups from web-everything/web-everything#5923 (head 90df9e891)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5943 (reviewed head `44e2565f740d4c27b7aedb00c0dca009d9274c5c`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5923 (reviewed head `90df9e8917cd400fdbe9a564d7943d1b013d04c0`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/operations/completion-cli.mjs:165` — (failing-input, degraded) Sibling-repository blocked events are attributed to web-everything
-   - Scenario: Report session=fix-fui-42, repo=web-everything/frontierui, kind=fix, pr=42, status=done, outcome=blocked-on-permission, denied='git push'. The emitted event omits repo, so appendDaemonEvent writes repo='web-everything', incorrectly identifying WE PR #42. A read-only probe running the actual report and event-writer code with in-memory storage reproduced this. The event should retain Frontier UI's repository identity, including when subsequent reports supply only the session slug.
+1. `we:scripts/operations/record-red-team-ruling-io.mjs:390` — (edge-case, degraded) A stale label snapshot can report a send-back that never happened
+   - Scenario: Start a block with review:changes present. During the reason-comment POST, another writer replaces it with review:accepted on the same head/result. proveHeld reads the updated thread, but the subsequent alreadyUnderChanges decision uses labels captured before both POSTs. A read-only injected-IO probe returned sentBack:true and alreadyUnderChanges:true while labels remained review:accepted and runSetLabel was called zero times. The red-team hold persists without returning the PR to the fixer. Use the fresh read-back labels and restore review:changes, or report an incomplete send-back.
    - Claude's re-check: demonstrated break
 
 ## Acceptance

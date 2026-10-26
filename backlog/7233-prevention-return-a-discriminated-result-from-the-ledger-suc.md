@@ -1,24 +1,23 @@
 ---
+bornAs: xgcpm6z
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/red-team-gate.mjs", "we:scripts/operations/record-red-team-ruling.mjs", "we:scripts/lib/__tests__/red-team-gate.test.mjs", "we:scripts/operations/__tests__/record-red-team-ruling.test.mjs"]
+scope: ["we:scripts/operations/needs-you-feed.mjs", "we:vitest.globalSetup.mjs", "we:scripts/operations/__tests__/needs-you-feed.test.mjs", "we:./__tests__/vitest.globalSetup.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Matrix test in the shared-reader test file: {legacy, named} × {anyState on, off} × {live head, ca… (from web-everything/web-everything#5922 review)
+# Prevention — Return a discriminated result from the ledger, such as {status:'ruled'|'none'|'accepted'}, and su… (from web-everything/web-everything#5944 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/red-team-gate.mjs:638` — Matrix test in the shared-reader test file: {legacy, named} × {anyState on, off} × {live head, carried head}, asserting release or no release for each cell.
-2. `we:scripts/lib/red-team-gate.mjs:637` — Run main's reader tests on the default path unchanged, and add a golden differential test (old vs new reader over a recorded-thread corpus with anyState off) so any default-mode delta is explicit.
-3. `we:scripts/operations/record-red-team-ruling.mjs:117` — Parameterize the superseded-card test over both anyState values and require both cases to reject new filing while allowing an existing-card release in the automated test gate.
-4. `we:scripts/lib/red-team-gate.mjs:645` — Add the reader-level regression test and a mutation gate removing the any-state explicit-result check.
-5. `we:scripts/operations/record-red-team-ruling.mjs` — Run the duplicate-card regression test for both policy values and mutation-check each branch's carded filter.
+1. `we:scripts/operations/needs-you-feed.mjs:243` — Return a discriminated result from the ledger, such as `{status:'ruled'|'none'|'accepted'}`, and suppress only on the ruled status. Add a test per null cause.
+2. `we:vitest.globalSetup.mjs:30` — Add a deterministic test matrix covering child-process event writes under both hermetic and non-hermetic setup, with an explicit assertion that the seeded operator stream remains unchanged.
+3. `we:vitest.globalSetup.mjs:30` — Add the named subprocess isolation regression test to the deterministic test gate, including an explicit pre-existing operator event-path override.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5922@eb081852c9d1e2f3e44e2f533d60c7c4b3de725c
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5944@da35416ed91c17012193cd33e34f09d86f6c4216
 
 ## Acceptance
 

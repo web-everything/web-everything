@@ -1,18 +1,19 @@
 ---
+bornAs: x2ac48y
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/operations/record-red-team-ruling-io.mjs"]
+scope: ["we:scripts/lib/daemon-item-tasks.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5923 (head 90df9e891)
+# Red-team follow-ups from web-everything/web-everything#5934 (head 2e3a24712)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5923 (reviewed head `90df9e8917cd400fdbe9a564d7943d1b013d04c0`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5934 (reviewed head `2e3a2471214bd38c0d27a016015f49cba4a380e7`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/operations/record-red-team-ruling-io.mjs:390` — (edge-case, degraded) A stale label snapshot can report a send-back that never happened
-   - Scenario: Start a block with review:changes present. During the reason-comment POST, another writer replaces it with review:accepted on the same head/result. proveHeld reads the updated thread, but the subsequent alreadyUnderChanges decision uses labels captured before both POSTs. A read-only injected-IO probe returned sentBack:true and alreadyUnderChanges:true while labels remained review:accepted and runSetLabel was called zero times. The red-team hold persists without returning the PR to the fixer. Use the fresh read-back labels and restore review:changes, or report an incomplete send-back.
+1. `we:scripts/lib/daemon-item-tasks.mjs:334` — (edge-case, degraded) Nullish probe rejections bypass failure persistence
+   - Scenario: With valid facts, plan, budgets and claim ports, supply effects.probe = ({gh}) =&gt; gh.read(() =&gt; { throw null; }). The catch handler dereferences error.outcome and runItemTask rejects with TypeError. The claim is released, but no attempt result is persisted and failureCount remains 0. Reproduced with both null and undefined; an Error rejection correctly persists failed and charges one failure. Nullish probe failures should likewise produce a durable failed outcome and exactly one failure charge.
    - Claude's re-check: demonstrated break
 
 ## Acceptance

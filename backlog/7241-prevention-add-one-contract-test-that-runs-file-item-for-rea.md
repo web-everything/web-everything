@@ -1,20 +1,23 @@
 ---
+bornAs: xvq1ugb
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/__tests__/dispatch-lane-permission-grant.test.mjs"]
+scope: ["we:scripts/lib/pr-size-admission.mjs", "we:scripts/pr-land.mjs", "we:scripts/lib/__tests__/pr-size-admission.test.mjs", "we:scripts/__tests__/pr-land.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Add a check:standards or test rule that extracts every node {{WE_ROOT}}/scripts/... command from… (from web-everything/web-everything#5931 review)
+# Prevention — Add one contract test that runs file-item for real in a temp backlog dir (no stubbed execFileSync… (from web-everything/web-everything#5874 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/__tests__/dispatch-lane-permission-grant.test.mjs:190` — Add a check:standards or test rule that extracts every `node {{WE_ROOT}}/scripts/...` command from the fixer brief's hand-back blocks and asserts each is either allow-listed for fix/ci-heal or on an explicit not-needed list.
+1. `we:scripts/lib/pr-size-admission.mjs:134` — Add one contract test that runs `file-item` for real in a temp backlog dir (no stubbed `execFileSync`) and asserts `fileSplitItem` returns a card id accepted by `splitCardId`. Better, share the payload builder between the operation and the adapter so the shape cannot drift.
+2. `we:scripts/pr-land.mjs:1243` — Reuse the first verdict (memoise it) instead of calling the helper again. Add a per-mode `runCli` test with injected forge and git that asserts one label application and one body edit for an over-size PR.
+3. `we:scripts/lib/pr-size-admission.mjs:196` — Add one `sanitizeForBody()` helper that strips control characters and `&lt;!--`/`--&gt;` and rejects commas for scope entries. Route every interpolation into the body or file-item arguments through it. Back it with a property test over filenames containing newlines, commas and marker text.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5931@046c5e9e5612f832f3bd420836672ffd3041847d
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5874@59dd2a7df2c6f714b65fe1042b2c8f3759b32592
 
 ## Acceptance
 

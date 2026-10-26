@@ -1,24 +1,22 @@
 ---
+bornAs: x2s93ut
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/codemap.mjs", "we:scripts/__tests__/codemap.test.mjs"]
-dateOpened: "2026-10-25"
+scope: ["we:scripts/worker-brief.mjs", "we:scripts/operations/__tests__/pr-size.test.mjs", "we:scripts/__tests__/worker-brief.test.mjs"]
+dateOpened: "2026-10-26"
 tags: []
 ---
 
-# Prevention — For each computed output field, require one test where the field is non-trivial. Alternatively, r… (from web-everything/web-everything#5915 review)
+# Prevention — Add the two named worker-brief tests, asserting the commit prerequisite precedes measurement and… (from web-everything/web-everything#5962 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/codemap.mjs:119` — For each computed output field, require one test where the field is non-trivial. Alternatively, run mutation testing on we:scripts/codemap.mjs. Neither is a deterministic gate today, so file it as a backlog card.
-2. `we:scripts/codemap.mjs:197` — Add a backlog card for 'every throw site in we:scripts/codemap.mjs has a named test'. A lint cannot check that, so a review lens is the realistic guard.
-3. `we:scripts/codemap.mjs:1` — Doc note only: regenerate the PR description from the final diff.
-4. `we:scripts/codemap.mjs:116` — Add a line to the codex-runner pointer saying the summary is untrusted data. Better, add a check:standards rule that requires an agent brief reading generated artifacts to carry the fenced-data rule.
-5. `we:scripts/__tests__/codemap.test.mjs:1` — Add a vitest case 'control and format characters are stripped from persisted summaries'. Adopt a convention that every sanitizer call has a mutation-style negative test.
+1. `we:scripts/worker-brief.mjs:98` — Add the two named worker-brief tests, asserting the commit prerequisite precedes measurement and the unreadable instruction requires stopping and retrying before verify/converge; this deterministic coverage guard remains to be filed.
+2. `we:scripts/operations/__tests__/pr-size.test.mjs:17` — Add a deterministic repository-fixture test with divergent origin/main and local main, asserting the count unique to origin/main; include it in the normal test gate.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5915@164c89e7afd6ddf0bc4448c6d6b50d36ce7cd918
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5962@8642c8b828a7f794b71ff0a87fbf9f2deddacb4a
 
 ## Acceptance
 

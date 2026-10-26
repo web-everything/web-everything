@@ -1,4 +1,5 @@
 ---
+bornAs: x7jyuvr
 kind: story
 size: 2
 status: open

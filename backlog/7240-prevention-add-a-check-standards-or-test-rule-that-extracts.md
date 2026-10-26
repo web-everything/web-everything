@@ -1,24 +1,21 @@
 ---
+bornAs: xvkrzs3
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lane-pool.mjs", "we:backlog/7054-lane-pool-review-prevention-and-follow-ups.md", "we:scripts/__tests__/lane-pool.test.mjs"]
+scope: ["we:scripts/operations/__tests__/dispatch-lane-permission-grant.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Reject pool names containing path separators or .. once, at flag parse, so every derived path is… (from web-everything/web-everything#5859 review)
+# Prevention — Add a check:standards or test rule that extracts every node {{WE_ROOT}}/scripts/... command from… (from web-everything/web-everything#5931 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:scripts/lane-pool.mjs:385` — Reject pool names containing path separators or `..` once, at flag parse, so every derived path is covered. A lint on `join(..., flags.pool)` would catch the class.
-2. `we:scripts/lane-pool.mjs:3862` — Export one `cleanForLog` from the lane-pool lib, and add a check:standards rule that bans logging raw `entry.name` or `readdir` names.
-3. `we:backlog/7054-lane-pool-review-prevention-and-follow-ups.md:15` — The `check:standards` rule already specced as 7054 A1: tests that spawn lane-pool acquire/release must set the recovery policy explicitly. It is not built yet.
-4. `we:backlog/7054-lane-pool-review-prevention-and-follow-ups.md:43` — Add a deterministic backlog lint rule requiring each behavioral risk mapping to specify a repository-qualified test file, named case, and observable expected result.
 
-Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 5 → #5360.
+1. `we:scripts/operations/__tests__/dispatch-lane-permission-grant.test.mjs:190` — Add a check:standards or test rule that extracts every `node {{WE_ROOT}}/scripts/...` command from the fixer brief's hand-back blocks and asserts each is either allow-listed for fix/ci-heal or on an explicit not-needed list.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5859@b5b1b9b7d19aba0f29d7e69aef5c14ab524e4504
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5931@046c5e9e5612f832f3bd420836672ffd3041847d
 
 ## Acceptance
 

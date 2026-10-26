@@ -1,21 +1,20 @@
 ---
+bornAs: xtq8i8g
 kind: story
-size: 3
-parent: "4075"
+size: 2
 status: open
-scope: ["we:scripts/conveyor/await-verify-pass.mjs", "we:scripts/conveyor/__tests__/await-verify-pass.test.mjs"]
+scope: ["we:scripts/operations/completion-cli.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Extend the parameterized deferred-resume regression test to cover every promised replacement outc… (from web-everything/web-everything#5919 review)
+# Red-team follow-ups from web-everything/web-everything#5943 (head 44e2565f7)
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5943 (reviewed head `44e2565f740d4c27b7aedb00c0dca009d9274c5c`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/conveyor/await-verify-pass.mjs:364` — Extend the parameterized deferred-resume regression test to cover every promised replacement outcome, asserting its observable prompt, and run it in the test gate.
-2. `we:scripts/conveyor/await-verify-pass.mjs:364` — Add a parameterized deferred-resume regression test covering every promised replacement outcome and asserting the delivered prompt.
-
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5919@c4b3a3610766591caf3afe9b8fbd95f228658279
+1. `we:scripts/operations/completion-cli.mjs:165` — (failing-input, degraded) Sibling-repository blocked events are attributed to web-everything
+   - Scenario: Report session=fix-fui-42, repo=web-everything/frontierui, kind=fix, pr=42, status=done, outcome=blocked-on-permission, denied='git push'. The emitted event omits repo, so appendDaemonEvent writes repo='web-everything', incorrectly identifying WE PR #42. A read-only probe running the actual report and event-writer code with in-memory storage reproduced this. The event should retain Frontier UI's repository identity, including when subsequent reports supply only the session slug.
+   - Claude's re-check: demonstrated break
 
 ## Acceptance
 

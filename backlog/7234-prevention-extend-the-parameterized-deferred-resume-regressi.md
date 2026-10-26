@@ -1,20 +1,22 @@
 ---
+bornAs: xr82cl4
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/host-load.mjs", "we:scripts/lib/__tests__/host-load.test.mjs"]
+scope: ["we:scripts/conveyor/await-verify-pass.mjs", "we:scripts/conveyor/__tests__/await-verify-pass.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Add the named memory-only tests and a targeted mutation check requiring them to fail when the ada… (from web-everything/web-everything#5914 review)
+# Prevention — Extend the parameterized deferred-resume regression test to cover every promised replacement outc… (from web-everything/web-everything#5919 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/host-load.mjs:4` — Add the named memory-only tests and a targeted mutation check requiring them to fail when the adapter substitutes a valid reading for a legacy-reader failure.
+1. `we:scripts/conveyor/await-verify-pass.mjs:364` — Extend the parameterized deferred-resume regression test to cover every promised replacement outcome, asserting its observable prompt, and run it in the test gate.
+2. `we:scripts/conveyor/await-verify-pass.mjs:364` — Add a parameterized deferred-resume regression test covering every promised replacement outcome and asserting the delivered prompt.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5914@46d9e7e5d109b5ecb1008f2715856385533f65e3
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5919@c4b3a3610766591caf3afe9b8fbd95f228658279
 
 ## Acceptance
 

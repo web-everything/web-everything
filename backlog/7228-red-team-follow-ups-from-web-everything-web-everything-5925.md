@@ -1,18 +1,19 @@
 ---
+bornAs: xatlizb
 kind: story
 size: 2
 status: open
-scope: ["we:src/_includes/research-descriptions/probation-registry-generalisation.njk"]
-dateOpened: "2026-10-26"
+scope: ["we:scripts/conveyor/orphan-fix-round.mjs"]
+dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5953 (head bb7efb874)
+# Red-team follow-ups from web-everything/web-everything#5925 (head 9c8e4c5f8)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5953 (reviewed head `bb7efb874ab0e04c2742faa9c04533ee18ec1e08`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5925 (reviewed head `9c8e4c5f83f31d9c5b901bf76e2e1e13151eb988`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:src/_includes/research-descriptions/probation-registry-generalisation.njk:34` — (failing-input, degraded) Argo Rollouts can pass missing metric data, contradicting the new prior-art claim.
-   - Scenario: Configure an Argo analysis with successCondition: len(result) == 0 || result[0] &gt;= 0.95, then return an empty Prometheus result ([]). Argo's official documentation explicitly shows this producing phase: Successful, contradicting 'inconclusive, never a pass'. The research should distinguish Argo's configurable handling from this proposal's stricter insufficient-evidence policy. Evidence: [official empty-result example] (https://argo-rollouts.readthedocs.io/en/stable/features/analysis/#empty-array).
+1. `we:scripts/conveyor/orphan-fix-round.mjs:100` — (edge-case, degraded) A valid ruling posted after the verdict within the same timestamp second never triggers recovery.
+   - Scenario: Provide an ordered thread containing a blocked-referral changes verdict followed by a valid operator not-real ruling, both with createdAt=2026-10-25T13:00:00Z, on the unchanged head with review:changes + review:human and no fix round. The referral gate reports open=0, ruled=1, pending=[], blocked=[], but the planner returns none because the ruling is excluded from the strictly-later 'after' array. Moving only the ruling timestamp forward one second produces rearm. GitHub timestamps can tie within a second; recovery should recognize the later comment using thread order or another ordering signa
    - Claude's re-check: demonstrated break
 
 ## Acceptance

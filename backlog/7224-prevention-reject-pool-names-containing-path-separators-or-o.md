@@ -1,22 +1,25 @@
 ---
+bornAs: x2y3c2y
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/needs-you-feed.mjs", "we:vitest.globalSetup.mjs", "we:scripts/operations/__tests__/needs-you-feed.test.mjs", "we:./__tests__/vitest.globalSetup.test.mjs"]
+scope: ["we:scripts/lane-pool.mjs", "we:backlog/7054-lane-pool-review-prevention-and-follow-ups.md", "we:scripts/__tests__/lane-pool.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Return a discriminated result from the ledger, such as {status:'ruled'|'none'|'accepted'}, and su… (from web-everything/web-everything#5944 review)
+# Prevention — Reject pool names containing path separators or .. once, at flag parse, so every derived path is… (from web-everything/web-everything#5859 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+1. `we:scripts/lane-pool.mjs:385` — Reject pool names containing path separators or `..` once, at flag parse, so every derived path is covered. A lint on `join(..., flags.pool)` would catch the class.
+2. `we:scripts/lane-pool.mjs:3862` — Export one `cleanForLog` from the lane-pool lib, and add a check:standards rule that bans logging raw `entry.name` or `readdir` names.
+3. `we:backlog/7054-lane-pool-review-prevention-and-follow-ups.md:15` — The `check:standards` rule already specced as 7054 A1: tests that spawn lane-pool acquire/release must set the recovery policy explicitly. It is not built yet.
+4. `we:backlog/7054-lane-pool-review-prevention-and-follow-ups.md:43` — Add a deterministic backlog lint rule requiring each behavioral risk mapping to specify a repository-qualified test file, named case, and observable expected result.
 
-1. `we:scripts/operations/needs-you-feed.mjs:243` — Return a discriminated result from the ledger, such as `{status:'ruled'|'none'|'accepted'}`, and suppress only on the ruled status. Add a test per null cause.
-2. `we:vitest.globalSetup.mjs:30` — Add a deterministic test matrix covering child-process event writes under both hermetic and non-hermetic setup, with an explicit assertion that the seeded operator stream remains unchanged.
-3. `we:vitest.globalSetup.mjs:30` — Add the named subprocess isolation regression test to the deterministic test gate, including an explicit pre-existing operator event-path override.
+Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 5 → #5360.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5944@da35416ed91c17012193cd33e34f09d86f6c4216
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5859@b5b1b9b7d19aba0f29d7e69aef5c14ab524e4504
 
 ## Acceptance
 

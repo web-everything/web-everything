@@ -1,22 +1,25 @@
 ---
+bornAs: xs7dgwp
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/pr-size-admission.mjs", "we:scripts/pr-land.mjs", "we:scripts/lib/__tests__/pr-size-admission.test.mjs", "we:scripts/__tests__/pr-land.test.mjs"]
+scope: ["we:scripts/codemap.mjs", "we:scripts/__tests__/codemap.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Add one contract test that runs file-item for real in a temp backlog dir (no stubbed execFileSync… (from web-everything/web-everything#5874 review)
+# Prevention — For each computed output field, require one test where the field is non-trivial. Alternatively, r… (from web-everything/web-everything#5915 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/pr-size-admission.mjs:134` — Add one contract test that runs `file-item` for real in a temp backlog dir (no stubbed `execFileSync`) and asserts `fileSplitItem` returns a card id accepted by `splitCardId`. Better, share the payload builder between the operation and the adapter so the shape cannot drift.
-2. `we:scripts/pr-land.mjs:1243` — Reuse the first verdict (memoise it) instead of calling the helper again. Add a per-mode `runCli` test with injected forge and git that asserts one label application and one body edit for an over-size PR.
-3. `we:scripts/lib/pr-size-admission.mjs:196` — Add one `sanitizeForBody()` helper that strips control characters and `&lt;!--`/`--&gt;` and rejects commas for scope entries. Route every interpolation into the body or file-item arguments through it. Back it with a property test over filenames containing newlines, commas and marker text.
+1. `we:scripts/codemap.mjs:119` — For each computed output field, require one test where the field is non-trivial. Alternatively, run mutation testing on we:scripts/codemap.mjs. Neither is a deterministic gate today, so file it as a backlog card.
+2. `we:scripts/codemap.mjs:197` — Add a backlog card for 'every throw site in we:scripts/codemap.mjs has a named test'. A lint cannot check that, so a review lens is the realistic guard.
+3. `we:scripts/codemap.mjs:1` — Doc note only: regenerate the PR description from the final diff.
+4. `we:scripts/codemap.mjs:116` — Add a line to the codex-runner pointer saying the summary is untrusted data. Better, add a check:standards rule that requires an agent brief reading generated artifacts to carry the fenced-data rule.
+5. `we:scripts/__tests__/codemap.test.mjs:1` — Add a vitest case 'control and format characters are stripped from persisted summaries'. Adopt a convention that every sanitizer call has a mutation-style negative test.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5874@59dd2a7df2c6f714b65fe1042b2c8f3759b32592
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5915@164c89e7afd6ddf0bc4448c6d6b50d36ce7cd918
 
 ## Acceptance
 

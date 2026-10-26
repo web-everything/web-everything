@@ -1,4 +1,5 @@
 ---
+bornAs: xrwh0az
 kind: story
 size: 2
 status: open
