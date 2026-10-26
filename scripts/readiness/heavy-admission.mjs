@@ -139,6 +139,7 @@ import { hostname, homedir, userInfo } from 'node:os';
 import { createHash } from 'node:crypto';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { parseDetachFlags, handleDetachCli, startDetachedOp } from '../lib/detached-op.mjs';
 import { shadowAdmission, readSnapshot } from '../lib/resource-admission.mjs';
 import { hostLoadAdmission } from '../lib/host-load.mjs';
 import { DEFAULT_HOST_MAX_WAIT_MS, loadHostOverloadSettings } from '../lib/host-overload-settings.mjs';
@@ -1754,7 +1755,20 @@ async function main(argv) {
   // `--coverage` meant for the wrapped command would otherwise be read as a flag of THIS script).
   const dashDashIdx = argv.indexOf('--');
   const preArgv = dashDashIdx === -1 ? argv : argv.slice(0, dashDashIdx);
-  const { flags, positionals } = parseFlags(preArgv);
+  const detachFlags = parseDetachFlags(preArgv);
+  const { flags, positionals } = parseFlags(detachFlags.rest);
+  const detachOptions = { scriptPath: fileURLToPath(import.meta.url), kind: 'heavy-admission',
+    out: (line) => writeAllSync(1, `${line}\n`) };
+  if (detachFlags.waitFor !== null) {
+    process.exit(await handleDetachCli(preArgv, detachOptions));
+  }
+  if (detachFlags.detach && positionals[0] === 'run') {
+    const record = await startDetachedOp({ kind: detachOptions.kind,
+      argv: [process.execPath, detachOptions.scriptPath, ...detachFlags.rest,
+        ...(dashDashIdx === -1 ? [] : argv.slice(dashDashIdx))] });
+    detachOptions.out(JSON.stringify(record));
+    process.exit(0);
+  }
   // Resolve before lock-root derivation so relative --repo uses the same shared pool and execution cwd.
   const repo = resolve(typeof flags.repo === 'string' ? flags.repo : process.cwd());
   const policy = loadAdmissionPolicy({ env: process.env, checkoutRoot: repo });

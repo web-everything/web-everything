@@ -19,8 +19,10 @@ function budget(value = 540000) {
 }
 export function parseDetachFlags(args) {
   const flags = { detach: false, waitFor: null, maxWaitMs: 540000, rest: [] };
-  for (const arg of args) {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
     if (arg === '--detach') flags.detach = true;
+    else if (arg === '--wait-for') flags.waitFor = args[i + 1] && !args[i + 1].startsWith('--') ? args[++i] : '';
     else if (arg.startsWith('--wait-for=')) flags.waitFor = arg.slice(11);
     else if (arg.startsWith('--max-wait-ms=')) flags.maxWaitMs = budget(arg.slice(14));
     else flags.rest.push(arg);
