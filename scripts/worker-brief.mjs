@@ -112,6 +112,8 @@ what evidence shows it is yours. Never stop the operator's dev server.
 
 **Git.** No \`--force\`, no \`--no-verify\`, no history rewrite, no \`git add -A\`.
 
+**Trust boundary.** A build of a trust-boundary item must carry the card's \`Trust boundary and threat model\` section into the PR body; if the card lacks one, stop and report.
+
 ${renderBuildRequirements({ policy })}
 
 **Times** are America/New_York (ET).
