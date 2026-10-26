@@ -681,14 +681,12 @@ export function createEnqueueOnEvent({
   }
 
   async function runDue({ catchUpOnly = false } = {}) {
-<<<<<<< HEAD
     const throughputSetting = resolveThroughput();
     const throughput = throughputSetting.value;
     const readFix = async () => { try { return await readMainFixPr(); } catch { return null; } };
     let mainFix = await readFix();
     const ownsFix = (num, repo = localSlug) => !!mainFix &&
       (mainFix.repo ?? 'we') === repoKeyFromSlug(repo) && [mainFix.pr, ...(mainFix.prs || [])].includes(num);
-=======
     let refreshLogged = false;
     const mayStart = () => {
       if (!allowed()) return false;
@@ -700,7 +698,6 @@ export function createEnqueueOnEvent({
       }
       return false;
     };
->>>>>>> d86778f962 (drain: catch-up pauses while a daemon overlay refresh is pending; loader names the real adoption-timeout reason)
     let s = readSetting();
     if (!await honourSetting(s)) return [];
     if (!defaultBranch) {
