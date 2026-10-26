@@ -9,6 +9,8 @@ tags: []
 
 # Red-team follow-ups from web-everything/web-everything#5874 (head 946132fb8)
 
+This is the canonical card for both findings from this reviewed head. The redundant, unnumbered `x3f0tyd` card was removed from the admission batch in PR #5963; both findings below remain open here.
+
 Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5874 (reviewed head `946132fb8bc28673347e636886f07602eb66880b`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
 1. `we:scripts/lib/pr-size-admission.mjs:248` — (security, degraded) Editable PR body receipts can suppress split-card filing
