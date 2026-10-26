@@ -92,7 +92,7 @@ function expectSizeNote(body) {
 const sizeEnd = '<!-- pr-size:end -->';
 
 describe('stateless size-section replacement', () => {
-  it('a runner in a fresh HOME replaces in place and stays byte-identical on two retries', async () => {
+  it('a runner in a fresh HOME performs no secret IO, replaces in place, and stays byte-identical on two retries', async () => {
     const freshHome = mkdtempSync(join(tmpdir(), 'pr-size-fresh-home-'));
     try {
       const first = await sizeAdmission.createSizeAdmissionRunner(effects())(request);
@@ -100,6 +100,20 @@ describe('stateless size-section replacement', () => {
       const moduleUrl = pathToFileURL(join(process.cwd(), 'scripts/lib/pr-size-admission.mjs')).href;
       const source = `
         import { createSizeAdmissionRunner } from ${JSON.stringify(moduleUrl)};
+        import fs from 'node:fs';
+        import childProcess from 'node:child_process';
+        import { syncBuiltinESMExports } from 'node:module';
+        // Observe attempts, including failures swallowed by a secret-reader fallback.
+        // Injected card/diff effects leave no reason for direct filesystem or git IO.
+        const ioAttempts = [];
+        for (const [api, methods] of [[fs, ['openSync', 'readFileSync', 'writeFileSync']],
+          [childProcess, ['execFileSync']]]) {
+          for (const method of methods) api[method] = () => {
+            ioAttempts.push(method);
+            throw new Error('unexpected local IO');
+          };
+        }
+        syncBuiltinESMExports();
         const { input, card } = JSON.parse(process.argv[1]);
         const effects = {
           diffStat: () => ({ text: '401\\t0\\tdocs/agent/a.md\\0', sha: input.sha }),
@@ -110,12 +124,13 @@ describe('stateless size-section replacement', () => {
         const updated = await createSizeAdmissionRunner(effects)(input);
         const retry = await createSizeAdmissionRunner(effects)({ ...input, body: updated.body });
         const secondRetry = await createSizeAdmissionRunner(effects)({ ...input, body: retry.body });
-        process.stdout.write(JSON.stringify([updated, retry, secondRetry]));
+        process.stdout.write(JSON.stringify({ results: [updated, retry, secondRetry], ioAttempts }));
       `;
-      const results = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', source,
+      const { results, ioAttempts } = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', source,
         JSON.stringify({ input: { ...request, body: first.body + tail }, card: cardResult.verdict })], {
         cwd: freshHome, env: { ...process.env, HOME: freshHome }, encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024,
       }));
+      expect(ioAttempts).toEqual([]);
       const [updated, retry, secondRetry] = results;
       expect(updated.body.startsWith(request.body + '\n\n<!-- pr-size:begin -->\n')).toBe(true);
       expect(updated.body.endsWith('<!-- pr-size:end -->' + tail)).toBe(true);

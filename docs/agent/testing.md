@@ -16,6 +16,9 @@ including after a conservative append. No machine-local state is read or created
 Test replacement across a fresh HOME and preserve all bytes before and after the pair,
 including CRLF. PR text remains untrusted: neither delimiters nor enclosed receipts authorize
 card filing or publication, which must be checked through the trusted store/publisher (R115).
+The fresh-HOME child also records and rejects synchronous file open/read/write and subprocess
+attempts after module loading, with diff/card effects injected. Assert no attempts on creation
+or retries: an empty directory alone cannot detect a secret read whose failure was swallowed.
 Without pinned evidence, the display key hashes repo, PR-or-ref, requested SHA and base; it
 does not make an unresolved head eligible for trusted card lookup.
 pr-land re-reads the live body after card filing and skips the note when it changed or is unreadable.
