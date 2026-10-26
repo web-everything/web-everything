@@ -336,16 +336,23 @@ export function recordEdgeResolution(root, ref, {
  * retires `ref` for its replacement never leaves the list without both. `expectedOverlay`, when supplied, must still
  * match a present `ref` entry under the same mutex, so a concurrent re-registration is never removed. `stackBases` is
  * left out of that comparison: the rebuild rewrites it on its own ({@link persistStackBases}), which is no re-registration.
- * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedOverlay?:object}} [o]
+ * `expectedRequiredOverlay` also compares the required container's registration identity under that mutex;
+ * its presence alone cannot authorize removal after concurrent replacement.
+ * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedOverlay?:object, expectedRequiredOverlay?:object}} [o]
  * @returns {{removed:boolean, list:Array<object>}}
  */
-export function removeOverlay(root, ref, { env = process.env, why, requireRef, expectedOverlay } = {}) {
+export function removeOverlay(root, ref, { env = process.env, why, requireRef, expectedOverlay, expectedRequiredOverlay } = {}) {
   void why; // caller bookkeeping only — see JSDoc above.
   return withListLock(root, env, (pause) => {
     const list = readOverlaysForWrite(root, env);
     pause();
     if (requireRef !== undefined && !list.some((o) => o && o.ref === requireRef)) {
       throw new Error('replacement registration unavailable');
+    }
+    if (expectedRequiredOverlay !== undefined && (!requireRef || !expectedRequiredOverlay
+      || expectedRequiredOverlay.ref !== requireRef
+      || !isDeepStrictEqual(registrationIdentity(list.find((o) => o?.ref === requireRef)), registrationIdentity(expectedRequiredOverlay)))) {
+      throw new Error('replacement registration changed; refusing removal');
     }
     const idx = list.findIndex((o) => o && o.ref === ref);
     if (expectedOverlay !== undefined && idx !== -1 && !isDeepStrictEqual(registrationIdentity(list[idx]), registrationIdentity(expectedOverlay))) {
@@ -369,7 +376,19 @@ export function removeOverlay(root, ref, { env = process.env, why, requireRef, e
 export function appendOverlayEvent(root, event, { env = process.env } = {}) {
   const file = eventsFilePath(root, env);
   mkdirSync(dirname(file), { recursive: true });
-  appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`, 'utf8');
+  const append = () => appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`, 'utf8');
+  if (event.kind !== 'auto-retire-shadow') { append(); return; }
+  // Shadow ticks repeatedly observe the same evidence. A durable marker per exact tuple avoids scanning an
+  // ever-growing audit log; the list mutex serializes the check/append/mark across processes. Mark AFTER the
+  // append so a failed write cannot suppress the observation on the next tick.
+  return withListLock(root, env, () => {
+    const key = createHash('sha256').update(JSON.stringify([event.ref, event.sha, event.reason])).digest('hex');
+    const marker = join(`${file}.shadow`, key);
+    try { statSync(marker); return; } catch (error) { if (error?.code !== 'ENOENT') throw error; }
+    mkdirSync(dirname(marker), { recursive: true });
+    append();
+    writeFileSync(marker, '', 'utf8');
+  });
 }
 
 // ── overlay stacks (held item 212) ─────────────────────────────────────────────────────────────────────────────
