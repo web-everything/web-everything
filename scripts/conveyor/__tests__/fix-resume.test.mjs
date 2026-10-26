@@ -31,7 +31,7 @@ const prior = { id: '11111111', sessionId: SID, name: 'fix-77', state: 'done', c
 const job = { template: 'bg', respawnFlags: ['-n', 'fix-77', '--model', 'sonnet'] };
 const freeLane = { lane: 4, path: '/lanes/we/lane-4', held: 'free', head: HEAD, sessionHead: HEAD };
 const planned = (o = {}) => ({ pr: 77, itemNum: null, laneRef: 'lane/x', headRefOid: HEAD, baseRefName: 'main', attempts: 1, scope: ['we:x'], ...o });
-const resumable = (o = {}) => ({ planned: planned(), settings: SETTINGS, prior, job, transcript: true, lane: freeLane, base: { rebased: false }, scratchRoot: '/scratch', ...o });
+const resumable = (o = {}) => ({ planned: planned(), settings: SETTINGS, prior, job, transcript: true, lane: freeLane, base: { rebased: false }, scratchRoot: '/scratch', readCompletion: () => null, ...o });
 
 describe('fix settings cascade — card xrbu1bp keys', () => {
   const noFile = () => { throw new Error('no file'); };
@@ -98,6 +98,37 @@ describe('rung by round (planRoundEscalation / roundEscalationFor)', () => {
     expect(r3[r3.indexOf('--model') + 1]).toBe('sonnet');
     const r2 = launch(1);
     expect(r2[r2.indexOf('--model') + 1]).toBe('sonnet');
+  });
+});
+
+describe('permission-blocked prior completion', () => {
+  it.each([
+    { status: 'done', outcome: 'blocked-on-permission' },
+    { status: 'blocked-on-permission' },
+  ])('declines round resume for %j and records the session and reason', (record) => {
+    const readCompletion = vi.fn(() => ({ ...record, sessionId: SID }));
+    expect(planRoundResume(resumable({ readCompletion }))).toMatchObject({
+      resume: false, reason: 'prior-blocked-on-permission', why: expect.stringContaining(SID),
+    });
+    expect(readCompletion).toHaveBeenCalledWith('fix-77');
+    const resume = vi.fn();
+    const result = tryResumeRoundFix(planned(), {
+      root: '/repo', fixSettings: SETTINGS, wrapFix: false, loadLadder: () => LADDER,
+      readHistoryInputs: () => null, readInputs: () => resumable(), readCompletion, resume,
+    });
+    expect(result.resumeAttempt).toMatchObject({
+      attempted: false, refused: 'prior-blocked-on-permission', why: expect.stringContaining(SID),
+    });
+    expect(resume).not.toHaveBeenCalled();
+  });
+  it.each([
+    null, { status: 'done', outcome: 're-armed' }, { status: 'started' },
+    { status: 'done', outcome: 'blocked-on-permission', sessionId: 'another-session' },
+  ])('keeps round resume unchanged for %j', (record) => {
+    expect(planRoundResume(resumable({ readCompletion: () => record })).resume).toBe(true);
+  });
+  it('fails open on an unreadable completion', () => {
+    expect(planRoundResume(resumable({ readCompletion: () => { throw new Error('unreadable'); } })).resume).toBe(true);
   });
 });
 
@@ -303,7 +334,7 @@ describe('the resume trigger starts only in a dispatch scratch directory (#4174)
 
 describe('tryResumeRoundFix', () => {
   const base = {
-    root: '/repo', fixSettings: SETTINGS, wrapFix: false, loadLadder: () => LADDER, listAgentsAll: () => [],
+    root: '/repo', readCompletion: () => null, fixSettings: SETTINGS, wrapFix: false, loadLadder: () => LADDER, listAgentsAll: () => [],
     postNotice: () => false, readHistoryInputs: () => null, scratchRoot: '/scratch', realpath: (p) => p,
     isolateSession: () => ({ write: { ok: true }, hooks: { ok: true, count: 8 } }),
   };

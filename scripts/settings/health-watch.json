@@ -1,0 +1,3 @@
+{
+  "$comment": "Health-watch lane scan cascade: standard 300 seconds → platform healthWatch.laneScanIntervalSec → tool healthWatch.laneScanIntervalSec here → WE_HEALTH_WATCH_LANE_SCAN_INTERVAL_SEC. Leave unset to inherit. Positive integers only; invalid settings fall back to standard 300 seconds and are logged. Only the full stale-state lane sweep (including leased-lane ahead counts) is cached in healthDir/lane-scan.json; claims and owner liveness are still read on each stale-state invocation."
+}
