@@ -363,6 +363,14 @@ describe('shared admission effects', () => {
     expectSizeNote(result.body);
   });
 
+  it('drops a legacy marker whose encoded ref is far longer than the ref itself', async () => {
+    const ref = `lane/${'ü'.repeat(120)}`;
+    const body = `${request.body}\n\n## Size\n\nstale\n<!-- size-admission:${encodeURIComponent(ref)} 9001 -->\n`;
+    const result = await sizeAdmission.createSizeAdmissionRunner(effects())({ ...request, ref, body });
+    expect(result.body).not.toContain(encodeURIComponent(ref));
+    expect(result.body).toContain('stale');
+  });
+
   it.each([
     ['CRLF line endings from a web edit', (body) => body.replace(/\n/g, '\r\n')],
     ['a forge-trimmed empty description', (body) => body.replace(/^\n+/, '')],

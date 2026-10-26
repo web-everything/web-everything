@@ -380,7 +380,8 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = crea
     const text = body.replace(/\r\n/g, '\n');
     // Our note is appended last, so prefer the last marker over an earlier quoted copy.
     // Marker tokens cannot span whitespace or `>`, so the match never reaches author text.
-    const existing = [...text.matchAll(/<!-- size-admission:([^\s<>]{1,512})(?: [^\s<>]{1,256})? -->/g)]
+    // 4608 = the longest encodeURIComponent of a 512-character legacy ref.
+    const existing = [...text.matchAll(/<!-- size-admission:([^\s<>]{1,4608})(?: [^\s<>]{1,256})? -->/g)]
       .findLast((match) => match[1] === markerKey || (legacyToken && match[1] === legacyToken));
     let previousBody = body;
     if (existing) {
