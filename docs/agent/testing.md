@@ -500,6 +500,19 @@ must pass a temporary `lockRoot` through `withPocLandLock`, preserving the mutex
 
 ## PR time-loss safeguards
 
+R125: `measureNonTestLines` excludes pure data from the 300-line budget and reports it separately as
+`dataLines`; those files still require review. Built-in data extensions are `.json`, `.yaml`, `.yml`,
+and `.csv`, under a `config/` or `data/` directory segment at any depth. Exact `dataPaths` add exceptions
+only for those four extensions; `dataExtensions` may select only within that set. Code and markdown
+cannot become data exemptions. Absolute paths and paths with empty, `.` or `..` segments always count.
+The IO caller resolves `prSize` through the shared policy cascade and `scripts/pr-size-settings.json`;
+JSON-array env overrides are `WE_PR_SIZE_DATA_EXTENSIONS`, `WE_PR_SIZE_DATA_DIRS`, and `WE_PR_SIZE_DATA_PATHS`.
+Invalid present settings at any layer throw and refuse submission as `pr-size-unreadable`; only an absent
+tool settings file uses lower layers and built-in defaults. Restore valid settings before retrying.
+The counter defaults to dependency-free frozen built-ins to preserve the declaration's import safety.
+Keep the classification, settings provenance, refusal detail, binary/overflow refusal, and conservative
+rename cases in `scripts/operations/__tests__/open-pr-size-cap.test.mjs`.
+
 `fix.alertAtRoundCap` publishes through the needs-you feed as soon as the notes pass observes exhaustion,
 independently of note-comment dedup and quiet-hour desktop delivery. Polling must include `needsPerson`
 rows so it does not clear and reopen those events, losing the original idle timestamp.
@@ -2428,18 +2441,3 @@ omissions are reported as truncation. Clone paths must be absolute. The drain ta
 prototype-load settings, not the plist's data clone; tests inject those settings. Matrix and PR table cells strip
 Cc/Cf controls and are width-capped; table mode keeps the truncated-listing warning.
 
-
-## Cancelled PR rerun accounting
-
-The 500-entry attempt record permanently preserves consumed heads and uncertain reservations;
-closed/merged PR evidence, a different head, and absence from a snapshot never permit eviction.
-At capacity, refuse new head admissions with `record-full` and tell the operator to archive/trim the
-record file; preserve existing entries, including oversized legacy records. Accept job evidence only
-when every job has status `completed` and conclusion `success`, `skipped`, `neutral` or `cancelled`.
-Refuse known failure conclusions (`failure`, `timed_out`, `error`, `startup_failure`, `action_required`,
-`stale`) with `real-failure-in-run`; refuse other conclusions or incomplete/unknown statuses with
-`jobs-unreadable`. Neither path may dispatch, reserve, rerun or emit an action event.
-Track each workflow attempt independently within a head, including uncertain reservations, and
-attribute legacy run-only records using observed history before admitting another workflow.
-The permanent-retention, job-whitelist, multi-workflow, restart, capacity and legacy-evidence regressions live in
-`scripts/conveyor/__tests__/pr-cancelled-rerun-accounting.test.mjs`.
