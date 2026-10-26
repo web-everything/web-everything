@@ -1,15 +1,19 @@
 ---
-bornAs: xgcpm6z
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: closed
+closedReason: duplicate
+closedInto: "7233"
+dateClosed: "2026-10-26"
 scope: ["we:scripts/operations/needs-you-feed.mjs", "we:vitest.globalSetup.mjs", "we:scripts/operations/__tests__/needs-you-feed.test.mjs", "we:./__tests__/vitest.globalSetup.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
 # Prevention — Return a discriminated result from the ledger, such as {status:'ruled'|'none'|'accepted'}, and su… (from web-everything/web-everything#5944 review)
+
+> **DUPLICATE OF #7233 — closed as such.** This copy carried the same `bornAs` as #7233, which main already held; the drain would not enqueue it. Its `bornAs` was dropped so the identity stays with #7233, the real item.
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
