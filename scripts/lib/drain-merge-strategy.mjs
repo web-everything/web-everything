@@ -309,11 +309,13 @@ export function createDrainMergeStrategy({
       // never replace it with an API sweep of every non-ready open PR.
       const queue = candidates.length ? readQueueFacts({ repo: slugOf(repo), exec: (cmd, args, opts) => exec(cmd, args, { ...opts, timeout: 60_000 }) }) : null;
       if (queue?.error) { say(`  ⚠ merge-queue discovery failed (${queue.error}) — dequeue sweep retried next pass`); return; }
-      if (queue && !queue.entries.length) return; // Complete empty discovery also proves no stuck entries.
       sweepStuckEntries({ repo: slugOf(repo), exec: (cmd, args, opts) => exec(cmd, args, { ...opts, timeout: 60_000 }),
         max: safety.value.queueRebuildMax, nowMs: now(),
         statePath: join(dirname(statePath), 'drain-merge-queue-stuck.json'), readFile, writeFile, log: say,
-        emit: event => { void appendDaemonEvent(event, { env }); } });
+        // Reuse complete empty discovery to prune history without another API call.
+        ...(queue && !queue.entries.length ? { queue } : {}),
+        emit: event => appendDaemonEvent(event, { env }) });
+      if (queue && !queue.entries.length) return;
       for (const row of candidates) {
         if (!queue.inQueue.has(Number(row.number))) continue;
         try { removeSentBack(repo, row.number, readLive(repo, row.number).labels); }

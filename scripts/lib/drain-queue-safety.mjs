@@ -68,6 +68,10 @@ export function dequeueSentBack({ repo, pr, reason, exec = execFileSync, log = (
   const after = readMergeQueueState({ repo, pr, readJson });
   if (after.error || after.inQueue !== false) throw new Error(`dequeue unconfirmed: ${after.error ?? 'isInMergeQueue is still true'}`);
   log(`merge-queue: dequeued ${repo}#${pr}: ${reason} (isInMergeQueue=false)`);
-  exec('gh', ['pr', 'comment', String(pr), '--repo', repo, '--body', `Removed from the merge queue: ${reason}.`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    exec('gh', ['pr', 'comment', String(pr), '--repo', repo, '--body', `Removed from the merge queue: ${reason}.`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (e) {
+    log(`⚠ merge-queue comment #${pr} failed (${String(e?.message ?? e).split('\n')[0]}) — removal confirmed`);
+  }
   return { dequeued: true };
 }

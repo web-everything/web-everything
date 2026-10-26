@@ -44,7 +44,11 @@ describe('readQueueEntryStates', () => {
     ['missing PR', response([node({ pullRequest: null })])],
     ['non-integer PR', response([node({ pullRequest: { number: '5977' } })])],
     ['missing state', response([node({ state: null })])],
-    ['missing group commit', response([node({ headCommit: null })])],
+    ['missing group commit field', response([node({ headCommit: undefined })])],
+    ['malformed group commit', response([node({ headCommit: { oid: 'invalid' } })])],
+    ['oversized page despite no next page', response(Array.from({ length: 101 }, (_, i) => node({ pullRequest: { number: i + 1 } })))],
+    ['null OID on a non-null group commit', response([node({ headCommit: { oid: null } })])],
+    ['missing OID on a non-null group commit', response([node({ headCommit: {} })])],
   ])('fails closed on %s without returning partial entries', (_name, data) => {
     expect(readQueueEntryStates({ repo, exec: () => JSON.stringify(data) })).toEqual({ entries: [], error: expect.any(String) });
   });
@@ -53,17 +57,48 @@ describe('readQueueEntryStates', () => {
     const exec = () => { if (mode === 'throws') throw new Error('offline'); return '{'; };
     expect(readQueueEntryStates({ repo, exec })).toEqual({ entries: [], error: expect.any(String) });
   });
+
+  it.each(['QUEUED', 'AWAITING_CHECKS', 'UNMERGEABLE'])('accepts a %s entry without a group commit alongside other entries', state => {
+    expect(readQueueEntryStates({ repo, exec: () => JSON.stringify(response([
+      node({ state, headCommit: null }), node({ state: 'UNMERGEABLE', pullRequest: { number: 5962 } }),
+    ])) })).toEqual({ entries: [entry({ state, groupOid: null, ci: undefined }), entry({ num: 5962, state: 'UNMERGEABLE' })] });
+  });
 });
 
 describe('decideStuckDequeues', () => {
   const decide = (entries, tracker = {}, max = 3) => decideStuckDequeues({ entries, tracker, max, nowMs });
 
+  it.each(['same', 'changed'])('resets rebuild history for a new enqueue with a %s group OID', mode => {
+    let tracker = {};
+    for (const group of ['a', 'b', 'c']) tracker = decide([entry({ groupOid: group.repeat(40) })], tracker).tracker;
+    expect(tracker[5977].count).toBe(2);
+    const fresh = decide([entry({ enqueuedAt: '2026-10-26T11:59:00Z', groupOid: (mode === 'same' ? 'c' : 'd').repeat(40) })], tracker);
+    expect(fresh.dequeue).toEqual([]);
+    expect(fresh.tracker[5977]).toMatchObject({ count: 0, enqueuedAt: '2026-10-26T11:59:00Z' });
+  });
+
+  it('starts legacy persisted history without enqueue identity at zero', () => {
+    expect(decide([entry()], { 5977: { oid: 'b'.repeat(40), count: 2 } })).toEqual({
+      dequeue: [], tracker: { 5977: { oid, count: 0, enqueuedAt } },
+    });
+  });
+
+  it('skips rebuild counting without a group commit while still selecting UNMERGEABLE entries', () => {
+    const result = decide([entry({ groupOid: null }), entry({ num: 5962, state: 'UNMERGEABLE', groupOid: null })],
+      { 5977: { oid, count: 2, enqueuedAt } });
+    expect(result.dequeue.map(d => d.num)).toEqual([5962]);
+    expect(result.tracker[5977]).toBeUndefined();
+    const grouped = decide([entry({ groupOid: 'b'.repeat(40) })], result.tracker);
+    expect(grouped.dequeue).toEqual([]);
+    expect(grouped.tracker[5977].count).toBe(0);
+  });
+
   it('records first sight at zero, ignores the same OID, increments on a changed group OID and prunes departed PRs', () => {
     const first = decide([entry()], { 42: { oid, count: 2 } });
-    expect(first).toEqual({ dequeue: [], tracker: { 5977: { oid, count: 0 } } });
+    expect(first).toEqual({ dequeue: [], tracker: { 5977: { oid, count: 0, enqueuedAt } } });
     expect(decide([entry()], first.tracker)).toEqual(first);
     const changed = decide([entry({ groupOid: 'b'.repeat(40) })], first.tracker);
-    expect(changed).toEqual({ dequeue: [], tracker: { 5977: { oid: 'b'.repeat(40), count: 1 } } });
+    expect(changed).toEqual({ dequeue: [], tracker: { 5977: { oid: 'b'.repeat(40), count: 1, enqueuedAt } } });
     expect(decide([], changed.tracker)).toEqual({ dequeue: [], tracker: {} });
   });
 
@@ -91,13 +126,13 @@ describe('decideStuckDequeues', () => {
   });
 
   it('names distinct rebuild count and max at and beyond the configured threshold', () => {
-    const result = decide([entry()], { 5977: { oid, count: 4 } }, 3);
+    const result = decide([entry()], { 5977: { oid, count: 4, enqueuedAt } }, 3);
     expect(result.dequeue).toEqual([{ num: 5977, kind: 'rebuilds', reason: expect.any(String) }]);
     for (const text of ['#5977', 'AWAITING_CHECKS', '4', '3']) expect(result.dequeue[0].reason).toContain(text);
   });
 
   it('never dequeues a MERGEABLE entry even with a high rebuild count', () => {
-    expect(decide([entry({ state: 'MERGEABLE' })], { 5977: { oid, count: 99 } }).dequeue).toEqual([]);
+    expect(decide([entry({ state: 'MERGEABLE' })], { 5977: { oid, count: 99, enqueuedAt } }).dequeue).toEqual([]);
   });
 
   it('honors a max of one at the first group rebuild', () => {
@@ -108,7 +143,7 @@ describe('decideStuckDequeues', () => {
   });
 
   it('reports an UNMERGEABLE entry as unmergeable even when it also exceeds the rebuild max', () => {
-    expect(decide([entry({ state: 'UNMERGEABLE' })], { 5977: { oid, count: 99 } }).dequeue)
+    expect(decide([entry({ state: 'UNMERGEABLE' })], { 5977: { oid, count: 99, enqueuedAt } }).dequeue)
       .toEqual([{ num: 5977, kind: 'unmergeable', reason: expect.any(String) }]);
   });
 
@@ -117,6 +152,12 @@ describe('decideStuckDequeues', () => {
   });
   it.each([null, undefined, {}, 'entries'])('dequeues nothing for non-array entries %s', entries => {
     expect(decide(entries).dequeue).toEqual([]);
+  });
+
+  it.each([undefined, null, '', 'invalid'])('does not reuse or persist rebuild history without a valid enqueue time: %s', time => {
+    const result = decide([entry({ enqueuedAt: time })], { 5977: { oid: 'b'.repeat(40), count: 2, enqueuedAt: time } });
+    expect(result).toEqual({ dequeue: [], tracker: {} });
+    expect(decide([entry({ state: 'UNMERGEABLE', enqueuedAt: time })]).dequeue.map(d => d.num)).toEqual([5977]);
   });
 });
 
@@ -132,7 +173,7 @@ describe('describeBlocker', () => {
   });
 });
 
-function sweepIo({ nodes = [node({ state: 'UNMERGEABLE' })], queueError, queueResponse, state = '{}', readError = false, fail = [], absent = [], unconfirmed = [] } = {}) {
+function sweepIo({ nodes = [node({ state: 'UNMERGEABLE' })], queueError, queueResponse, state = '{}', readError = false, fail = [], absent = [], unconfirmed = [], commentFail = [] } = {}) {
   const queued = new Set(nodes.map(n => n.pullRequest.number).filter(n => !absent.includes(n)));
   const timeline = [];
   const exec = vi.fn((cmd, args) => {
@@ -155,7 +196,11 @@ function sweepIo({ nodes = [node({ state: 'UNMERGEABLE' })], queueError, queueRe
       if (!unconfirmed.includes(pr)) queued.delete(pr);
       return JSON.stringify({ data: { dequeuePullRequest: { clientMutationId: null } } });
     }
-    if (args[0] === 'pr' && args[1] === 'comment') { timeline.push(['comment', Number(args[2]), args.at(-1)]); return ''; }
+    if (args[0] === 'pr' && args[1] === 'comment') {
+      timeline.push(['comment', Number(args[2]), args.at(-1)]);
+      if (commentFail.includes(Number(args[2]))) throw new Error('comment unavailable');
+      return '';
+    }
     throw new Error(`unexpected args ${args}`);
   });
   const readFile = vi.fn(() => { if (readError) throw new Error('ENOENT'); return state; });
@@ -167,6 +212,45 @@ function sweepIo({ nodes = [node({ state: 'UNMERGEABLE' })], queueError, queueRe
 }
 
 describe('sweepStuckEntries', () => {
+  it('records confirmed removals and clears history even when a PR comment fails', () => {
+    const h = sweepIo({ commentFail: [5977], nodes: [node({ state: 'UNMERGEABLE' }), node({ state: 'UNMERGEABLE', pullRequest: { number: 5962 } })] });
+    expect(h.run()).toEqual({ dequeued: [5977, 5962] });
+    expect(h.emit.mock.calls.map(([event]) => event.pr)).toEqual([5977, 5962]);
+    expect(JSON.parse(h.writeFile.mock.calls.at(-1)[1])).toEqual({});
+    expect(h.log.mock.calls.flat().join(' ')).toMatch(/comment.*(?:failed|unavailable)/i);
+  });
+
+  it.each(['throwing', 'rejecting'])('isolates throwing and rejecting event sinks (%s)', async mode => {
+    const h = sweepIo({ nodes: [node({ state: 'UNMERGEABLE' }), node({ state: 'UNMERGEABLE', pullRequest: { number: 5962 } })] });
+    const emit = vi.fn(() => {
+      if (mode === 'throwing') throw new Error('event sink unavailable');
+      return Promise.reject(new Error('event sink unavailable'));
+    });
+    const unhandled = vi.fn();
+    process.on('unhandledRejection', unhandled);
+    try {
+      expect(h.run({ emit })).toEqual({ dequeued: [5977, 5962] });
+      await new Promise(resolve => setImmediate(resolve));
+      expect(emit).toHaveBeenCalledTimes(2);
+      expect(JSON.parse(h.writeFile.mock.calls.at(-1)[1])).toEqual({});
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally { process.off('unhandledRejection', unhandled); }
+  });
+
+  it('dequeues an UNMERGEABLE entry even when another queued entry has no group commit', () => {
+    const h = sweepIo({ nodes: [node({ state: 'QUEUED', headCommit: null }), node({ state: 'UNMERGEABLE', pullRequest: { number: 5962 } })] });
+    expect(h.run()).toEqual({ dequeued: [5962] });
+    expect(h.emit).toHaveBeenCalledWith(expect.objectContaining({ pr: 5962 }));
+  });
+
+  it('resets persisted rebuild history when a PR is externally re-enqueued', () => {
+    const h = sweepIo({ nodes: [node({ enqueuedAt: '2026-10-26T11:59:00Z', headCommit: { oid: 'd'.repeat(40) } })],
+      state: JSON.stringify({ 5977: { oid: 'c'.repeat(40), count: 2, enqueuedAt } }) });
+    expect(h.run()).toEqual({ dequeued: [] });
+    expect(JSON.parse(h.writeFile.mock.calls.at(-1)[1])[5977]).toMatchObject({ count: 0, enqueuedAt: '2026-10-26T11:59:00Z' });
+    expect(h.timeline).toEqual([]);
+  });
+
   it('confirms removal and passes the same reason to the PR comment and event, emitting only after success', () => {
     const h = sweepIo();
     expect(h.run()).toEqual({ dequeued: [5977] });
@@ -217,17 +301,17 @@ describe('sweepStuckEntries', () => {
   });
 
   it('loads tracker JSON and saves changed OIDs for the next pass', () => {
-    const h = sweepIo({ nodes: [node()], state: JSON.stringify({ 5977: { oid: 'b'.repeat(40), count: 1 }, 42: { oid, count: 8 } }) });
+    const h = sweepIo({ nodes: [node()], state: JSON.stringify({ 5977: { oid: 'b'.repeat(40), count: 1, enqueuedAt }, 42: { oid, count: 8 } }) });
     expect(h.run()).toEqual({ dequeued: [] });
     expect(h.readFile.mock.calls[0][0]).toBe(h.options.statePath);
     const [path, json] = h.writeFile.mock.calls.at(-1);
     expect(path).toBe(h.options.statePath);
-    expect(JSON.parse(json)).toEqual({ 5977: { oid, count: 2 } });
+    expect(JSON.parse(json)).toEqual({ 5977: { oid, count: 2, enqueuedAt } });
     expect(h.emit).not.toHaveBeenCalled();
   });
 
   it('uses the persisted rebuild count to dequeue the head on its third OID change', () => {
-    const h = sweepIo({ nodes: [node()], state: JSON.stringify({ 5977: { oid: 'b'.repeat(40), count: 2 } }) });
+    const h = sweepIo({ nodes: [node()], state: JSON.stringify({ 5977: { oid: 'b'.repeat(40), count: 2, enqueuedAt } }) });
     expect(h.run().dequeued).toEqual([5977]);
     expect(h.emit).toHaveBeenCalledWith(expect.objectContaining({ pr: 5977,
       detail: { kind: 'rebuilds', state: 'AWAITING_CHECKS', reason: expect.stringContaining('3') } }));

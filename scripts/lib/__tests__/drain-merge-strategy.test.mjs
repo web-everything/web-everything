@@ -83,6 +83,7 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
   const writeState = (_p, s) => { stored = JSON.parse(JSON.stringify(s)); };
   const s = createDrainMergeStrategy({
     ...strategyExtra,
+    writeFile: strategyExtra.writeFile ?? vi.fn(),
     dryRun, env, labelProvider, readRedTeamEvidence: () => { if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }, requestRedTeam, publishNeedsYou, redTeamDeadline, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
     cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
     postConflictFinding, ...(now ? { now } : {}), resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(withLock ? { withLock } : {}),
@@ -1407,6 +1408,31 @@ describe('queue safeguard overrides and untracked queue entries', () => {
   it('revalidates labels so an old listing cannot dequeue a newly ready PR', () => {
     const h = harness({ strategy: 'github-merge-queue', queued: true });
     h.s.dequeueSendBacks([{ number: 5283, labels: [] }]);
+    expect(h.calls.some(c => c.some(a => String(a).includes('dequeuePullRequest')))).toBe(false);
+  });
+
+  it('empty discovery clears rebuild history before re-enqueue', () => {
+    const enqueuedAt = '2026-10-26T10:39:00Z';
+    let nodes = [];
+    let h;
+    const writeFile = vi.fn((_path, json) => h.setState(JSON.parse(json)));
+    h = harness({ strategy: 'github-merge-queue', queued: true, env: { WE_UNDER_TEST: '1' },
+      queueFacts: () => ({ data: { repository: { mergeQueue: { entries: { pageInfo: { hasNextPage: false }, nodes } } } } }),
+      strategyExtra: { writeFile } });
+    const pass = (group, time = enqueuedAt) => {
+      nodes = group ? [{ state: 'AWAITING_CHECKS', enqueuedAt: time,
+        headCommit: { oid: group.repeat(40), statusCheckRollup: { state: 'PENDING' } },
+        pullRequest: { id: 'PR_NODE', number: 5283 } }] : [];
+      h.s.dequeueSendBacks([{ number: 99, labels: ['review:changes'] }]);
+    };
+    for (const group of ['a', 'b', 'c']) pass(group);
+    expect(h.state()[5283].count).toBe(2);
+    const calls = h.calls.length;
+    pass(null);
+    expect(h.state()).toEqual({});
+    expect(h.calls.length - calls).toBe(1);
+    pass('d', '2026-10-26T11:59:00Z');
+    expect(h.state()[5283].count).toBe(0);
     expect(h.calls.some(c => c.some(a => String(a).includes('dequeuePullRequest')))).toBe(false);
   });
 
