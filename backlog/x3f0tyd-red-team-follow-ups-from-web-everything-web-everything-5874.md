@@ -1,13 +1,18 @@
 ---
 kind: story
 size: 2
-status: open
+status: closed
+closedReason: duplicate
+closedInto: "xnlnkmb"
+dateClosed: "2026-10-26"
 scope: ["we:scripts/lib/pr-size-admission.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
 # Red-team follow-ups from web-everything/web-everything#5874 (head 946132fb8)
+
+Closed as a duplicate of [xnlnkmb](xnlnkmb-red-team-follow-ups-from-web-everything-web-everything-5874.md), which tracks both findings below. No implementation work is claimed by this closure.
 
 Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5874 (reviewed head `946132fb8bc28673347e636886f07602eb66880b`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
