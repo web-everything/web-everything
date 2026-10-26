@@ -14,7 +14,13 @@ self-changes retain proposed human review even when the current gate did not fir
 Diff lines over 2000 characters require human review before parsing expressions.
 
 PR-head modules are untrusted data: never import them into the reviewer process, even in shadow mode.
-Read-only proof uses the reviewer checkout's registry and unchanged declaration plus every runner-imported `-io.mjs` module and their closures, regardless of operation name; new or
+Read-only proof first requires an explicit IO audit in `read-only-ops.mjs`: only `heavy-queue`
+and `pr-reconcile` are currently admitted. Compute-only declarations alone cannot prove purity:
+injected IO can execute arbitrary commands, as `verify` does in run mode. Audit every mode before
+admitting an operation; unaudited operations retain human review. The verify regression exercises
+its real `createChecksRunner` with an injected spawn, then checks loader exclusion and live scoring;
+a separate regression rejects another unaudited compute-only operation with complete byte evidence.
+Proof also uses the reviewer checkout's registry and unchanged declaration plus every runner-imported `-io.mjs` module and their closures, regardless of operation name; new or
 unreadable operations retain human review. `direction-aware-shape.test.mjs` probes a top-level host-write
 attempt in native Node, dependency tampering, and live-mode holds on registry/step-kind changes.
 An operation reference in hunk context never proves allow-list membership: moving a write-capable

@@ -6,8 +6,16 @@ import { collectImportClosure } from './import-closure.mjs';
 
 const trustedRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
+// `compute` is a declaration contract, not an IO sandbox: verify, for example,
+// runs arbitrary gate commands through its injected runner. Require an explicit
+// audit of the trusted runner's IO for every admitted operation, in all modes.
+// heavy-queue: admission/lease reads, ps and git merge-base (heavy-queue-io.mjs).
+// pr-reconcile: gh pr list/view and check-run GETs (pr-status-io.mjs).
+// All other operations retain human review until their IO has been audited here.
+const auditedReadOnlyOps = new Set(['heavy-queue', 'pr-reconcile']);
+
 /** Never execute head code. Only unchanged, already trusted declarations can supply read-only proof.
- * New operations, changed dependencies, incomplete graphs and exceeded bounds retain human review. */
+ * Unaudited/new operations, changed dependencies, incomplete graphs and exceeded bounds retain human review. */
 export async function loadReadOnlyOps(root, { importModule = url => import(url), readFile = readFileSync, lstat = lstatSync } = {}) {
   const names = new Set();
   if (typeof root !== 'string' || !root) return names;
@@ -20,7 +28,7 @@ export async function loadReadOnlyOps(root, { importModule = url => import(url),
       try {
         if (!/^[a-z][a-z0-9-]*$/.test(name)) continue;
         const { declaration } = await runner.resolveOperation(name);
-        if (!isReadOnlyOperation(declaration)) continue;
+        if (!isReadOnlyOperation(declaration) || !auditedReadOnlyOps.has(name)) continue;
         const entries = new Set([`scripts/operations/${name}.mjs`]);
         // The runner can inject any imported IO module, regardless of the operation's name.
         for (const spec of imports) {

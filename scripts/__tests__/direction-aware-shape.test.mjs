@@ -9,8 +9,10 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'nod
 import { join, resolve, relative } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
-import { op } from '../operations/registry.mjs';
+import { op, isReadOnlyOperation } from '../operations/registry.mjs';
 import { compute, effect } from '../operations/step-kinds.mjs';
+import { verifyOperation } from '../operations/verify.mjs';
+import { createChecksRunner, VERIFY_LANE_CLI } from '../operations/verify-io.mjs';
 import { execFileSync } from 'node:child_process';
 
 const runner = 'scripts/operations/run.mjs';
@@ -184,6 +186,38 @@ describe('R131 direction-aware shape wiring', () => {
     expect(write.mock.calls[0][1]).toContain('humanRequiredProposed: true (null hunks)');
     expect(appendEvent).not.toHaveBeenCalled();
   });
+  it('retains human review for verify despite an unchanged compute-only declaration and complete dependency proof', async () => withCompleteClosure(async () => {
+    const spawn = vi.fn(() => ({ status: 0, stdout: '{"status":"green","sha":"fixture"}' }));
+    const declaration = verifyOperation({ runChecks: createChecksRunner({ spawn, env: {} }) });
+    // Exercise the real injected IO without executing any command on the host.
+    expect(isReadOnlyOperation(declaration)).toBe(true);
+    declaration.steps.find(({ name }) => name === 'run').step.fn({
+      input: { checkout: '/head', mode: 'run', gate: 'printf compromised' },
+    });
+    expect(spawn).toHaveBeenCalledWith(process.execPath,
+      [VERIFY_LANE_CLI, '--repo=/head', '--json', '--gate=printf compromised'], expect.any(Object));
+    const readOnlyOps = await loadReadOnlyOps('/head', { ...readOnlyProofOptions(),
+      importModule: async () => ({ OPERATIONS: { verify: 1, 'heavy-queue': 1 },
+        resolveOperation: name => ({ declaration: name === 'verify' ? declaration
+          : op(name, { read: compute({ fn: () => null }) }) }),
+      }),
+    });
+    expect(readOnlyOps).toEqual(new Set(['heavy-queue']));
+    const verifyDiff = diffHunks.replaceAll('PR_TRACE_OP', 'VERIFY_OP')
+      .replace('prTraceOperation({ readFacts: createPrTraceReader() })', 'verifyOperation({ runChecks: createChecksRunner() })')
+      .replace('finishPrTrace', 'finishVerify');
+    expect(scoreEscalation({ changedFiles: [runner], diffHunks: verifyDiff, readOnlyOps, directionAwareLive: true }))
+      .toMatchObject({ humanRequired: true, humanRequiredProposed: true,
+        humanRequiredProposedReason: 'write-capable or unproven op: verify' });
+  }));
+  it('rejects other unaudited trusted compute-only operations with identical complete dependencies', async () => withCompleteClosure(async () => {
+    const options = readOnlyProofOptions();
+    expect(await loadReadOnlyOps('/head', options)).toEqual(new Set(['heavy-queue']));
+    expect(await loadReadOnlyOps('/head', { ...options,
+      importModule: async () => ({ OPERATIONS: { 'health-respond': 1 },
+        resolveOperation: () => ({ declaration: op('health-respond', { read: compute({ fn: () => null }) }) }) }),
+    })).toEqual(new Set());
+  }));
   it('classifies with trusted declarations only and rejects changed dependencies', async () => withCompleteClosure(async () => {
     const resolveOperation = vi.fn(name => {
       if (name === 'broken') throw new Error('cannot build');
