@@ -277,14 +277,13 @@ export async function prepareRebuild({
       }
     } catch (error) { alert('overlay-auto-retire-failed', { error: String(error?.message || error) }); }
   }
-  // The planner otherwise drops missing refs as ref-gone. Preserve every remaining registration whose tip this
-  // pass could not refresh, including deleted branches whose recorded content is still needed. Retry on the next
-  // tick; operators can restore/re-register a missing branch from its recorded SHA. Never build from cached tips.
+  // Preserve unavailable registrations, but hold only those overlays out of this plan. Main and independently
+  // refreshed overlays must still advance in every retirement mode. Never build from cached overlay tips.
+  const overlaysForPlan = overlaysBefore.filter((o) => fetchResult.refEvidence.get(o?.ref) === 'refreshed');
   const unverified = overlaysBefore.filter((o) => fetchResult.refEvidence.get(o?.ref) !== 'refreshed');
   if (!mainOnly && unverified.length) {
-    const detail = { refs: unverified.map((o) => o?.ref), message: 'Overlay tips unavailable; preserving registrations and retrying next tick. Restore or re-register deleted branches from their recorded SHA.' };
+    const detail = { refs: unverified.map((o) => o?.ref), message: 'Overlay tips unavailable; preserving registrations and skipping these overlays for this rebuild. Retrying next tick; restore or re-register deleted branches from their recorded SHA.' };
     alert('overlay-fetch-unverifiable', detail);
-    return terminal({ moved: false, reason: 'fetch-failed', detail });
   }
   pruneLandedBacklogSidecars({ git, root, paths: unsafe.untracked, mainSha: fetchedMainSha, alert });
   const remaining = collectUntrackedPaths(git);
@@ -299,9 +298,9 @@ export async function prepareRebuild({
   // Held item 212 — stacked overlay PRs apply as stacks (only their tops) unless `overlay.stackMode` says independent.
   // The PR base chains come from gh, else from each entry's recorded `stackBases`, else ancestry alone.
   const stack = resolveOverlayStackMode(env);
-  const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysBefore, env });
+  const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysForPlan, env });
   const plan = await planRebuild({
-    git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, edgeResolve,
+    git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysForPlan, prState, mainOnly, edgeResolve,
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
   });
@@ -461,7 +460,8 @@ export async function prepareRebuild({
     if (ready) {
       // Still wanted = registered AFTER this tick's own list edits (a same-tick `pr-closed`/`ref-gone` removal is
       // NOT wanted), plus overlays that left because main now has them. A mainOnly rebuild wants no overlay.
-      const registeredRefs = new Set((overlaysBefore || []).map((o) => o?.ref));
+      // A saved candidate cannot restore a cached tip that this tick could not refresh.
+      const registeredRefs = new Set(overlaysForPlan.map((o) => o?.ref));
       for (const d of plan.decisions) if (d.action === 'remove') registeredRefs.delete(d.ref);
       const wantedRefs = new Set(mainOnly ? [] : registeredRefs);
       for (const d of plan.decisions) {

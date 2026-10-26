@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { autoRetireOverlays, classifyOverlays, resolveAutoRetireMode } from '../daemon-overlay-auto-retire.mjs';
-import { overlayFilePath, readOverlayState, removeOverlay, writeOverlays } from '../daemon-overlays.mjs';
+import { appendOverlayEvent, overlayFilePath, readOverlayState, removeOverlay, writeOverlays } from '../daemon-overlays.mjs';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 
 let root, env, base, initial;
@@ -63,6 +63,80 @@ beforeEach(() => {
 afterEach(() => rmSync(base, { recursive: true, force: true }));
 
 describe('real Git retirement evidence', () => {
+  it.each(['off', 'shadow', 'on'])('%s preparation proceeds past a squash-landed deleted branch', async (mode) => {
+    env.WE_DAEMON_OVERLAY_AUTO_RETIRE = mode;
+    branch('deleted');
+    const sha = commit('landed', 'overlay content');
+    branch('main');
+    commit('unrelated', 'unrelated main content');
+    commit('landed', 'overlay content');
+    track('main');
+    localOrigin();
+    ok('push', '-q', 'origin', '--delete', 'deleted');
+    register([{ ref: 'deleted', sha }]);
+    const result = await prepare();
+    expect(result.result?.reason).not.toBe('fetch-failed');
+    expect(readOverlayState(root, { env }).overlays.map((o) => o.ref)).toEqual(mode === 'on' ? [] : ['deleted']);
+    expect((result.plan ?? result.result.plan).decisions.some((d) => d.ref === 'deleted')).toBe(false);
+  });
+
+  it.each(['off', 'shadow', 'on'])('%s preparation isolates unavailable registrations from a healthy overlay', async (mode) => {
+    env.WE_DAEMON_OVERLAY_AUTO_RETIRE = mode;
+    branch('healthy');
+    commit('healthy', 'healthy');
+    track('healthy');
+    ok('checkout', '-q', 'main');
+    localOrigin();
+    const overlays = [{ ref: 'deleted' }, { ref: 'unsafe@name' }, { ref: 'healthy' }];
+    register(overlays);
+    const result = await prepare();
+    expect(result.terminal).not.toBe(true);
+    expect(result.plan.decisions.map((d) => d.ref)).toEqual(['healthy']);
+    expect(readOverlayState(root, { env }).overlays.map((o) => o.ref)).toEqual(overlays.map((o) => o.ref));
+    expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-fetch-unverifiable' }));
+  });
+
+  it('deduplicates shadow audit entries across calls while reporting every observation', async () => {
+    env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'shadow';
+    const overlays = [{ ref: 'deleted', sha: initial }];
+    register(overlays);
+    await autoRetireOverlays({ root, env, overlays, git });
+    const first = readFileSync(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'), 'utf8');
+    const second = await autoRetireOverlays({ root, env, overlays, git });
+    expect(second.wouldRetire).toHaveLength(1);
+    expect(readFileSync(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'), 'utf8')).toBe(first);
+  });
+
+  it('deduplicates exact shadow tuples across processes and retains distinct evidence and ordinary audit events', async () => {
+    const event = { kind: 'auto-retire-shadow', ref: 'feature', sha: initial, reason: 'ancestor-of-main' };
+    const moduleUrl = new URL('../daemon-overlays.mjs', import.meta.url).href;
+    const code = `import { appendOverlayEvent } from ${JSON.stringify(moduleUrl)}; appendOverlayEvent(${JSON.stringify(root)}, ${JSON.stringify(event)}, { env: ${JSON.stringify(env)} });`;
+    await Promise.all(Array.from({ length: 3 }, () => new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ['--input-type=module', '-e', code], { stdio: 'ignore', timeout: 10_000, killSignal: 'SIGKILL' });
+      child.once('error', reject);
+      child.once('exit', (status) => status === 0 ? resolve() : reject(new Error(`audit writer exited ${status}`)));
+    })));
+    expect(audit()).toHaveLength(1);
+    for (const change of [{ ref: 'other' }, { sha: 'a'.repeat(40) }, { reason: 'contained' }]) {
+      appendOverlayEvent(root, { ...event, ...change }, { env });
+    }
+    appendOverlayEvent(root, event, { env });
+    expect(audit()).toHaveLength(4);
+    appendOverlayEvent(root, { ...event, kind: 'removed' }, { env });
+    appendOverlayEvent(root, { ...event, kind: 'removed' }, { env });
+    expect(audit()).toHaveLength(6);
+  });
+
+  it('retries a shadow observation after audit append failure', () => {
+    const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
+    mkdirSync(file, { recursive: true });
+    const event = { kind: 'auto-retire-shadow', ref: 'feature', sha: initial, reason: 'ancestor-of-main' };
+    expect(() => appendOverlayEvent(root, event, { env })).toThrow();
+    rmSync(file, { recursive: true });
+    appendOverlayEvent(root, event, { env });
+    expect(audit()).toEqual([expect.objectContaining(event)]);
+  });
+
   it.each(['sha', 'headSha', 'tipSha'])('preparation retires a deleted remote branch using recorded %s and independently refreshed overlays', async (field) => {
     localOrigin();
     track('deleted');
@@ -99,7 +173,8 @@ describe('real Git retirement evidence', () => {
       return result;
     } });
     expect(mainFetched).toBe(true);
-    expect(prepared.result.reason).toBe('fetch-failed');
+    expect(prepared.result.reason).toBe('up-to-date');
+    expect(prepared.result.plan.decisions).toEqual([]);
     expect(prepared.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-fetch-unverifiable' }));
     expect(readOverlayState(root, { env }).overlays).toEqual(overlays);
     expectNoRetirement();
