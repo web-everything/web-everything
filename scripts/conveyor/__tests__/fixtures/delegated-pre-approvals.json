@@ -1,0 +1,10 @@
+[
+  {
+    "repo": "o/r",
+    "pr": 5925,
+    "rulingId": "R122",
+    "operatorQuote": "Approved subject to a clear red team and accepted review",
+    "conditions": { "redTeamClear": true, "accepted": true, "allowedHeadMove": "card-only" },
+    "voidIf": "new-confirmed-correctness-or-security-break"
+  }
+]
