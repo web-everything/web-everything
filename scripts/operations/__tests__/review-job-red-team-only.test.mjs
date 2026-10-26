@@ -124,29 +124,35 @@ function fakeIo(over = {}) {
 }
 
 // Exercise the async shared seat through the same synchronous child boundary as the job.
-function runSharedRecovery(input, { status, records = [], recordsUnreadable = false, commentsUnreadable = false, comments = [], env = {} } = {}) {
+function runSharedRecovery(input, { status, records = [], recordsUnreadable = false, commentsUnreadable = false, comments = [], env = {}, probeFresh = false, failAppend = false, staleStatus = false } = {}) {
   const source = `
     import { readFileSync } from 'node:fs';
     import { runRedTeam } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../review-extra-seats.mjs')).href)};
     import { readStore } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../../conveyor/run-scorecard-store.mjs')).href)};
-    const { input, status, records, recordsUnreadable, commentsUnreadable, comments, env } = JSON.parse(readFileSync(0, 'utf8'));
+    import { recordRedTeamStatus, readRedTeamStatus } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../../lib/drain-red-team-evidence.mjs')).href)};
+    const { input, status, records, recordsUnreadable, commentsUnreadable, comments, env, probeFresh, failAppend, staleStatus } = JSON.parse(readFileSync(0, 'utf8'));
     const calls = { provider: 0, reserve: 0, model: 0, recheck: 0 };
     const forbid = key => () => { calls[key]++; throw Error('unexpected ' + key); };
+    let firstStatusRead = true;
     const result = await runRedTeam({ ...input, env }, {
       now: () => 1000, log: () => {},
       readRecords: options => recordsUnreadable ? readStore({ ...options, path: 'injected-scorecards.json',
         exists: () => true, read: () => { throw Object.assign(Error('transient EIO'), { code: 'EIO' }); } }).records : records,
-      readRedTeamStatus: () => status,
+      readRedTeamStatus: () => { if (staleStatus && firstStatusRead) { firstStatusRead = false; return status; } return env.WE_SHARED_RUNS_DIR ? readRedTeamStatus({ repo: input.repo, pr: input.pr, head: input.loopPayload.findings.read.netBasis.rev, env }) : status; },
+      redTeamStatus: value => { if (env.WE_SHARED_RUNS_DIR) recordRedTeamStatus(value, { env }); },
       readRecoveryComments: () => { if (commentsUnreadable) throw Error('transient EIO'); return comments; },
-      cliAvailable: forbid('provider'), reserveCalls: forbid('reserve'),
-      runSeat: forbid('model'), runRecheck: forbid('recheck'),
+      cliAvailable: probeFresh ? provider => { calls.provider++; return provider === 'codex'; } : forbid('provider'),
+      reserveCalls: probeFresh ? () => { calls.reserve++; return { used: 0, callIds: ['retry-call'] }; } : forbid('reserve'),
+      makeScratch: () => 'fixture-scratch', writeFile: () => {}, removeScratch: () => {},
+      runSeat: probeFresh ? () => { calls.model++; if (env.WE_SHARED_RUNS_DIR) calls.retryCountAtCall = readRedTeamStatus({ repo: input.repo, pr: input.pr, head: input.loopPayload.findings.read.netBasis.rev, env }).retryCount; return { report: null, error: 'injected failed retry' }; } : forbid('model'),
+      runRecheck: forbid('recheck'),
       listComments: () => comments, postComment: ({ body }) => comments.push({ body, author: { login: 'web-everything' } }),
-      append: () => { throw Error('resume must reuse stored row'); },
+      append: row => { calls.append = (calls.append ?? 0) + 1; if (failAppend) throw Error('injected append failure'); if (!probeFresh) throw Error('resume must reuse stored row'); records.push(row); },
     });
     process.stdout.write(JSON.stringify({ result, calls, comments }));
   `;
   return JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', source], {
-    input: JSON.stringify({ input, status, records, recordsUnreadable, commentsUnreadable, comments, env }), encoding: 'utf8',
+    input: JSON.stringify({ input, status, records, recordsUnreadable, commentsUnreadable, comments, env, probeFresh, failAppend, staleStatus }), encoding: 'utf8',
     timeout: 30_000, maxBuffer: 1024 * 1024, env: { PATH: '' },
   }));
 }
@@ -857,7 +863,7 @@ describe('red-team-only review job', () => {
     };
     const realIo = createReviewJobIo({ env, readStatus });
     const io = fakeIo({
-      runLoop: () => ({ status: 0, stdout: JSON.stringify(payload()) }),
+      runLoop: () => ({ status: 0, stdout: JSON.stringify({ ...payload(), stopped: 'complete' }) }),
       redTeamStatus: input => { calls.push(input.status); return realIo.redTeamStatus(input); },
       unclaim: () => calls.push('unclaim'),
       runRedTeam: () => { calls.push('red-team'); return { status: 'ran' }; },
@@ -966,7 +972,7 @@ describe('red-team-only review job', () => {
     const args = { pr, repo, lanePath: '/lanes/lane-7' };
     expect(prepareReviewArc(args, { prepareLane })).toEqual({ head });
     for (const redTeamOnly of [false, true]) {
-      const io = fakeIo({ prepareLane, runLoop: vi.fn(() => ({ status: 0, stdout: JSON.stringify(payload()) })) });
+      const io = fakeIo({ prepareLane, runLoop: vi.fn(() => ({ status: 0, stdout: JSON.stringify({ ...payload(), stopped: 'complete' }) })) });
       runReviewJob({ pr, repo, redTeamOnly }, io);
       expect(io.prepareLane).toBe(prepareLane);
       expect(io.fetchRedTeamHead).toHaveBeenCalledTimes(redTeamOnly ? 1 : 0);
@@ -1239,6 +1245,39 @@ describe('red-team-only review job', () => {
     const io = fakeIo({ claim: () => ({ ok: false, heldBy: 99 }) });
     expect(runReviewJob({ pr, repo, redTeamOnly: true }, io).outcome).toBe('refused-live-job');
     expect(io.acquireLane).not.toHaveBeenCalled(); expect(io.runRedTeam).not.toHaveBeenCalled();
+  });
+});
+
+describe('accepted head-move full review dispatch', () => {
+  it('plain recovery dispatch spawns an ordinary job and runs its full loop plus red team', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'accepted-head-review-'));
+    const io = fakeIo({ runLoop: vi.fn(() => ({ status: 0, stdout: JSON.stringify({ ...payload(), stopped: 'complete' }) })) });
+    const spawnJob = vi.fn(() => {
+      runReviewJob({ pr, repo }, io);
+      return 4242;
+    });
+    try {
+      const old = 'b'.repeat(40);
+      const result = runRedTeamOnSkip({ repo,
+        plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] },
+        rawPrs: [{ number: pr, headRefOid: head, labels: ['review:accepted'], reviews: [], comments: [
+          { body: `✅ review — accepted\n<!-- reviewed-sha: ${old} -->`, author: { login: 'web-everything' } },
+          { body: `${redTeamMarker(pr, old)}\nRed team not required on this head: card-only diff`, author: { login: 'web-everything' } },
+        ] }],
+        readEvidence: () => ({ inFlight: false, recorded: false, seatRecorded: false }), readStatus: () => null,
+        setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(),
+        capacity: { lanes: 1, budget: { left: 1 } },
+        dispatch: options => dispatchReviewJob({ ...options, root: '/daemon', dir,
+          checkStaleness: () => ({ fresh: true, behind: 0 }), readCompletion: () => null,
+          resolveSettingsEnv: () => ({}), ciGate: () => ({ allowed: true }), spawnJob }),
+      });
+      expect(result.rows[0].action).toBe('review');
+      expect(spawnJob).toHaveBeenCalledTimes(1);
+      expect(spawnJob.mock.calls[0][0].argv).not.toEqual(expect.arrayContaining([expect.stringContaining('--red-team-only')]));
+      expect(io.runLoop).toHaveBeenCalledTimes(1);
+      expect(io.runRedTeam).toHaveBeenCalledTimes(1);
+      expect(io.readRedTeamOnlyPayload).not.toHaveBeenCalled();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
 
@@ -1707,4 +1746,116 @@ describe('moved card-only skip settlement', () => {
     expect(io.settleRedTeamSkip).not.toHaveBeenCalled();
     expect(io.runRedTeam).not.toHaveBeenCalled();
   });
+});
+
+
+describe('R100 failed-seat recovery admission', () => {
+  it('two interleaved admissions launch exactly one model call and preserve the winning status', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-atomic-retry-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+    const loopPayload = payload();
+    loopPayload.findings.read.diffText = 'diff --git a/scripts/a.mjs b/scripts/a.mjs\n+code';
+    const records = [{ dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'unparseable' }];
+    const read = () => readRedTeamStatus({ repo, pr, head, env });
+    const evidence = () => ({ inFlight: false, queued: false, seatRecorded: true, recorded: true,
+      completedRecorded: false, failedSeatCount: 1 });
+    let winner, winningStatus;
+    try {
+      recordRedTeamStatus({ repo, pr, loopPayload, status: 'finished', result: 'ran' }, { env });
+      const stale = read();
+      const production = createReviewJobIo({ env, readEvidence: evidence, writeStatus: (input, options) => {
+        // Worker A has read the failed status. Worker B admits before A's exclusive create.
+        winner = runSharedRecovery({ repo, pr, loopPayload, redTeamMode: 'fresh' },
+          { status: stale, records, env, probeFresh: true, failAppend: true, staleStatus: true });
+        winningStatus = read();
+        recordRedTeamStatus(input, options);
+      } });
+      const io = fakeIo({ redTeamStatus: production.redTeamStatus,
+        readRedTeamOnlyPayload: () => ({ head, loopPayload }) });
+      const result = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, io);
+      expect(winner.calls.model).toBe(1);
+      expect(winner.calls.retryCountAtCall).toBe(1);
+      expect(io.runRedTeam).not.toHaveBeenCalled();
+      expect(result.label).toContain('retry already admitted');
+      expect(read()).toEqual(winningStatus);
+      // A shared runner that also read the old status must lose the same exclusive claim.
+      const loser = runSharedRecovery({ repo, pr, loopPayload, redTeamMode: 'fresh' },
+        { status: stale, records, env, probeFresh: true, staleStatus: true });
+      expect(loser.calls.model).toBe(0);
+      expect(loser.result.reason).toContain('retry already admitted');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each([true, false])('spends retry before the call even if seat append fails (job admission: %s)', admitted => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-lost-retry-row-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+    const records = [{ dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'unparseable' }];
+    const evidence = () => ({ inFlight: false, queued: false, loopPayload: payload(),
+      recorded: true, seatRecorded: true, completedRecorded: false, failedSeatCount: 1 });
+    const read = () => readRedTeamStatus({ repo, pr, head, env });
+    const production = createReviewJobIo({ env, readEvidence: evidence });
+    const loopPayload = payload();
+    loopPayload.findings.read.diffText = 'diff --git a/scripts/a.mjs b/scripts/a.mjs\n+code';
+    let first;
+    try {
+      recordRedTeamStatus({ repo, pr, loopPayload, status: 'finished', result: 'ran' }, { env });
+      const run = input => runSharedRecovery(input, { status: read(), records, env, probeFresh: true, failAppend: true });
+      if (admitted) {
+        runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, fakeIo({
+          readRedTeamOnlyPayload: () => ({ head, loopPayload }), redTeamStatus: production.redTeamStatus,
+          runRedTeam: input => { first = run(input); return first.result; },
+        }));
+      } else first = run({ repo, pr, loopPayload, redTeamMode: 'fresh' });
+      expect(first.calls).toMatchObject({ model: 1, append: 1, retryCountAtCall: 1 });
+      expect(records).toHaveLength(1);
+      expect(read().retryCount).toBe(1);
+      const recovery = runRedTeamOnSkip({ repo, plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] },
+        rawPrs: [{ number: pr, headRefOid: head, comments: [] }], readEvidence: evidence, readStatus: read,
+        setting: { enabled: true, retryCooldownMin: 30 }, now: () => 9_000_000, lastDispatch: new Map(),
+        dispatch: () => { throw Error('must not dispatch'); } });
+      expect(recovery.rows[0].action).toBe('skip');
+      const second = run({ repo, pr, loopPayload, redTeamMode: 'fresh' });
+      expect(second.calls.model).toBe(0);
+      expect(second.result).toMatchObject({ deferredByGuard: true });
+      let secondAdmission;
+      runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, fakeIo({
+        readRedTeamOnlyPayload: () => ({ head, loopPayload }), redTeamStatus: production.redTeamStatus,
+        runRedTeam: input => { secondAdmission = run(input); return secondAdmission.result; },
+      }));
+      expect(secondAdmission.calls.model).toBe(0);
+      expect(secondAdmission.result).toMatchObject({ deferredByGuard: true });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each([1, 2, 3, 'completed'])(
+    'production admission and shared guard permit exactly one failed seat retry: %s', count => {
+      const dir = mkdtempSync(join(tmpdir(), 'red-team-failed-retry-'));
+      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+      const records = Array.from({ length: count === 'completed' ? 1 : count }, () => ({
+        dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head,
+        status: count === 'completed' ? 'ok' : 'unparseable',
+      }));
+      const read = () => readRedTeamStatus({ repo, pr, head, env });
+      const production = createReviewJobIo({ env, readEvidence: () => ({
+        inFlight: false, queued: false, completedRecorded: count === 'completed',
+        seatRecorded: true, recorded: true, failedSeatCount: count === 'completed' ? 0 : count,
+      }) });
+      let observed;
+      const loopPayload = payload();
+      loopPayload.findings.read.diffText = 'diff --git a/scripts/a.mjs b/scripts/a.mjs\n+code';
+      const io = fakeIo({ readRedTeamOnlyPayload: () => ({ head, loopPayload }), redTeamStatus: production.redTeamStatus,
+        runRedTeam: input => {
+          observed = runSharedRecovery(input, { status: read(), records, probeFresh: true });
+          return observed.result;
+        } });
+      try {
+        recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'finished', result: 'ran' }, { env });
+        runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, io);
+        expect(observed.comments).toEqual([]);
+        expect(observed.calls.model).toBe(count === 1 ? 1 : 0);
+        expect(observed.calls.reserve).toBe(count === 1 ? 1 : 0);
+        if (count === 1) expect(observed.result).toMatchObject({ status: 'ran', comment: { status: 'not-posted' }, rowsWritten: 1 });
+        if (count !== 1) expect(observed.result).toMatchObject({ status: 'not-owed', deferredByGuard: true });
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
 });

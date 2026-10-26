@@ -36,17 +36,19 @@ function itemKey(item) {
 }
 
 /** PURE. A reason string is never evidence of a policy exemption. */
-export function classifyRedTeamSkip(redTeam) {
+export function classifyRedTeamSkip(redTeam, { accepted = false } = {}) {
   const valid = redTeam != null && typeof redTeam === 'object' && !Array.isArray(redTeam);
   const deferred = valid && Boolean(redTeam.deferredByGuard || redTeam.deferredByCap);
-  // Settlement is reached only for an accepted head: a terminal not-owed contradicts that admission.
+  // R100: a terminal not-owed on an ACCEPTED head (caller asserts accepted === true) is policy-clear,
+  // since nothing is owed. Anything not explicitly accepted, or deferred, still alerts and never clears.
   const reason = valid && redTeam.status === 'not-owed' && !deferred
     ? 'red team reported not-owed on an accepted head'
     : valid && typeof redTeam.reason === 'string' && redTeam.reason.trim()
       ? redTeam.reason : 'unknown red-team outcome';
-  return { kind: valid && redTeam.status === 'skipped' && redTeam.policy === 'card-only'
-    && !deferred
-    ? 'policy' : 'non-policy', reason };
+  const notOwedClear = accepted === true && valid && redTeam.status === 'not-owed' && !deferred;
+  return { kind: notOwedClear || (valid && redTeam.status === 'skipped' && redTeam.policy === 'card-only'
+    && !deferred)
+    ? 'policy' : 'non-policy', reason, ...(notOwedClear ? { notOwed: true } : {}) };
 }
 
 /** Retry notification IO only; old failures must not prevent this job's settlement. */
@@ -128,7 +130,7 @@ export function settleRedTeamSkip(input = {}) {
     const { redTeam, pr, repo, comments } = input;
     const realHead = isRealHead(input.head);
     const head = realHead ? input.head : 'unknown';
-    const classified = classifyRedTeamSkip(redTeam);
+    const classified = classifyRedTeamSkip(redTeam, { accepted: input.accepted });
     let { reason } = classified;
     const boundRead = isRealHead(input.readHead)
       && realHead && input.readHead.toLowerCase() === head.toLowerCase();
@@ -145,7 +147,10 @@ export function settleRedTeamSkip(input = {}) {
         const thread = comments ?? io.readComments({ repo, pr });
         if (!Array.isArray(thread)) throw Error('PR comments unreadable');
         if (redTeamForHead(thread, pr, head)) return { outcome: 'already' };
-        io.postComment({ repo, pr, body: `${redTeamMarker(pr, head)}\n\nRed team not required on this head: card-only diff (policy redTeam.skipCardOnly)` });
+        io.postComment({ repo, pr, body: `${redTeamMarker(pr, head)}\n\n${classified.notOwed
+          ? 'Red team not required on this head: red team reported not-owed on an accepted head (policy clear)'
+          : 'Red team not required on this head: card-only diff (policy redTeam.skipCardOnly)'}${
+          typeof input.reason === 'string' && input.reason.trim() ? ` — ${boundReason(input.reason)}` : ''}` });
         return { outcome: 'policy-clear' };
       } catch (error) {
         reason = `policy-clear comment failed: ${safeErrorText(error)}`;

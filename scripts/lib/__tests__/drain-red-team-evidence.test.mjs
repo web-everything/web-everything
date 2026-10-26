@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
-import { historicalCardOnlySkipCandidate, readDrainRedTeamEvidence, recordRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
+import { historicalCardOnlySkipCandidate, readDrainRedTeamEvidence, recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { redTeamOwedFor } from '../review-red-team-policy.mjs';
 import { pidStartTime } from '../pid-alive.mjs';
@@ -78,9 +78,63 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     expect(evidence.status.loopPayload.verdict).toEqual({ verdict });
     expect(loopPayload.verdict).toEqual({ verdict });
   });
+  it('preserves spent retry admission through running and finished writes, including an explicit zero', () => {
+    const f = fixture(), loopPayload = payload(f.head);
+    recordRedTeamStatus({ ...f, loopPayload, status: 'queued', retryCount: 1 }, { env: f.env });
+    recordRedTeamStatus({ ...f, loopPayload, status: 'running' }, { env: f.env });
+    expect(readRedTeamStatus(f).retryCount).toBe(1);
+    recordRedTeamStatus({ ...f, loopPayload, status: 'finished', result: 'ran', retryCount: 0 }, { env: f.env });
+    expect(readRedTeamStatus(f).retryCount).toBe(1);
+  });
+  it('refuses an existing retry marker even after stale status restoration, and isolates heads', () => {
+    const f = fixture(), loopPayload = payload(f.head);
+    recordRedTeamStatus({ ...f, loopPayload, status: 'finished', result: 'ran' }, { env: f.env });
+    const path = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+    const stale = readFileSync(path, 'utf8');
+    recordRedTeamStatus({ ...f, loopPayload, status: 'queued', retryCount: 1 }, { env: f.env });
+    writeFileSync(path, stale);
+    expect(() => recordRedTeamStatus({ ...f, loopPayload, status: 'queued', retryCount: 1 }, { env: f.env }))
+      .toThrow('retry already admitted');
+    expect(readFileSync(path, 'utf8')).toBe(stale);
+    recordRedTeamStatus({ ...f, loopPayload, status: 'running' }, { env: f.env });
+    expect(readRedTeamStatus(f).retryCount).toBe(1);
+    const other = { ...f, head: 'c'.repeat(40) };
+    recordRedTeamStatus({ ...other, loopPayload: payload(other.head), status: 'queued', retryCount: 1 }, { env: f.env });
+    expect(readRedTeamStatus(other).retryCount).toBe(1);
+  });
+
+  it('keeps the retry spent when status persistence fails after the exclusive create', () => {
+    const f = fixture(), loopPayload = payload(f.head);
+    expect(() => recordRedTeamStatus({ ...f, loopPayload, status: 'queued', retryCount: 1 },
+      { env: f.env, readPidStart: () => { throw Error('injected metadata failure'); } })).toThrow('injected metadata failure');
+    expect(readRedTeamStatus(f)).toBeNull();
+    expect(() => recordRedTeamStatus({ ...f, loopPayload, status: 'queued', retryCount: 1 }, { env: f.env }))
+      .toThrow('retry already admitted');
+    recordRedTeamStatus({ ...f, loopPayload, status: 'finished', retryCount: 0 }, { env: f.env });
+    expect(readRedTeamStatus(f).retryCount).toBe(1);
+  });
+
+  it('refuses historical spent retry counts without a marker', () => {
+    const f = fixture(), loopPayload = payload(f.head);
+    recordRedTeamStatus({ ...f, loopPayload, status: 'finished' }, { env: f.env });
+    const path = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+    writeFileSync(path, JSON.stringify({ ...readRedTeamStatus(f), retryCount: 1 }));
+    expect(() => recordRedTeamStatus({ ...f, loopPayload, status: 'queued', retryCount: 1 }, { env: f.env }))
+      .toThrow('retry already admitted');
+  });
+
+  it('refuses to overwrite unreadable retry evidence so an operator can inspect it', () => {
+    const f = fixture(), loopPayload = payload(f.head);
+    recordRedTeamStatus({ ...f, loopPayload, status: 'queued', retryCount: 1 }, { env: f.env });
+    const path = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+    writeFileSync(path, '{broken');
+    expect(() => recordRedTeamStatus({ ...f, loopPayload, status: 'running' }, { env: f.env })).toThrow();
+    expect(readFileSync(path, 'utf8')).toBe('{broken');
+  });
+
   it('does not invent an accept when no review run exists', () => {
     expect(readDrainRedTeamEvidence(fixture())).toEqual({ loopPayload: null, recorded: false,
-      seatRecorded: false, completedRecorded: false, scheduled: false, inFlight: false });
+      seatRecorded: false, completedRecorded: false, failedSeatCount: 0, scheduled: false, inFlight: false });
   });
   it('pins the accepted-label boundary with empty status and run stores', () => {
     const f = fixture();
@@ -294,4 +348,13 @@ it.each(['non-card read', 'missing read paths', 'non-card rename source', 'skipC
     expect(evidence).toEqual({ loopPayload: null, recorded: variant === 'live-head seat',
       seatRecorded: variant === 'live-head seat', completedRecorded: false,
       scheduled: variant === 'live-head seat', inFlight: false });
+  });
+
+
+it.each([['unparseable', 1, false], ['error', 1, false], ['ok', 0, true]])(
+  'counts failed %s seats only for the exact repo/PR/head', (status, failedSeatCount, completedRecorded) => {
+    const f = fixture();
+    const row = { dispatchKind: 'review-seat', seat: 'red-team', repo: f.repo, pr: f.pr, rev: f.head, status };
+    f.readScorecards = () => [row, { ...row, rev: 'a'.repeat(40) }, { ...row, repo: 'another/repo' }];
+    expect(readDrainRedTeamEvidence(f)).toMatchObject({ failedSeatCount, completedRecorded, seatRecorded: true });
   });
