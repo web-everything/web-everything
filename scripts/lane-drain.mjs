@@ -68,6 +68,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import { readGit, readGh } from './lib/proc-read.mjs';
+import { reserveCardNumber, readNumberingEvidence } from './lib/card-number-allocator.mjs';
 import { readFileSync, writeFileSync, readdirSync, mkdtempSync, rmSync, existsSync, renameSync } from 'node:fs';
 import { resolve, join, isAbsolute, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -916,6 +917,22 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1 } = {}) {
   // A held card must not be renamed by a STALE ledger entry either (the ledger is append-only and applyLedger
   // swaps the whole of it), so drop any old mapping for it before anything reads the ledger.
   for (const hash of heldHashes) delete ledger[hash];
+  const numberingGit = (args, options = {}) => execFileSync('git', args, {
+    cwd: CWD, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 10_000, maxBuffer: 1024 * 1024,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, ...options,
+  });
+  let remoteNumbering;
+  let numberingEvidence;
+  try {
+    const remotes = String(numberingGit(['remote'])).trim().split('\n').filter(Boolean);
+    remoteNumbering = remotes.includes('origin');
+    if (remotes.length && !remoteNumbering) throw Error('number reservation remote origin unavailable');
+    // Refresh before reading bornAs too: a stale ref can otherwise hide an already-landed
+    // legacy identity without card-ids refs and cause a second number to be reserved for it.
+    if (remoteNumbering) numberingEvidence = readNumberingEvidence(numberingGit);
+  } catch (e) {
+    return finish({ assigned: [], committed: false, error: `number reservation unavailable: ${e.message}` });
+  }
   // xsjn0uf-incident — NEVER MINT A SECOND NUMBER FOR A `bornAs` ALREADY ON MAIN. The `bornAs` hash is the
   // card's identity across its rename; a hash-named copy that re-lands after the card was already numbered
   // (the same card file carried by two PRs, e.g. a card-only PR plus the feature PR that also carried it)
@@ -958,8 +975,18 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1 } = {}) {
   const assigned = [];
   for (const stem of ordered.filter((name) => !heldHashes.has(idFromName(name)) && !dupHashes.has(idFromName(name)))) {
     const hash = idFromName(stem);
-    maxNum += 1;
-    const nnn = String(maxNum).padStart(3, '0');
+    let nnn;
+    try {
+      nnn = remoteNumbering ? reserveCardNumber({ id: hash, git: numberingGit, minimum: maxNum + 1, dryRun, evidence: numberingEvidence })
+        : String(maxNum + 1).padStart(3, '0');
+      if (!isNum(nnn)) throw Error('card number exhausted');
+      // A replay must not silently alias another local card after an old collision.
+      if (stems.some((name) => Number(idFromName(name)) === Number(nnn)))
+        throw Error(`reserved number ${nnn} already exists locally; repair the collision manually`);
+    } catch (e) {
+      return finish({ assigned: [], committed: false, error: `number reservation unavailable: ${e.message}` });
+    }
+    maxNum = Math.max(maxNum, Number(nnn));
     ledger[hash] = nnn;
     assigned.push({ hash, nnn });
   }
