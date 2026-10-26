@@ -4,6 +4,7 @@ kind: story
 size: 2
 status: open
 scope: ["we:docs/agent/testing.md", "we:docs/agent/reviewer-expectations.md", "we:skills-src/review/review-agent-system-prompt.md"]
+scopeRationale: "The delivery-policy test file is an existing reference example for the guidance; this story edits only the three scoped guidance files."
 dateOpened: "2026-10-25"
 tags: []
 ---
