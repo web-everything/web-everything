@@ -12,7 +12,7 @@ import { STAND_DOWN_MARKER } from '../stand-down.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from '../fix-procedure.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { runFixerStuckReclaimPass, formatFixerStuckReclaimLines } from '../fixer-stuck-reclaim.mjs';
-import { buildVerdictComment } from '../../review-set-label.mjs';
+import { buildVerdictComment, buildRearmVerdictBinding, rearmVerdictKey, latestChangesVerdict } from '../../review-set-label.mjs';
 import { parseLatestHumanClearedSha } from '../../lib/review-escalation.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
 
@@ -26,6 +26,54 @@ const BEGIN = c('2026-10-10T15:03:55Z', `${FIX_BEGIN_MARKER}\n\n**Who:** \`fix-4
 const RESTACK = c('2026-10-10T15:21:28Z', '🔁 restack — merged `origin/lane/gh-merge-queue-gate` into this branch.');
 const END = c('2026-10-10T15:21:33Z', `${FIX_END_MARKER}\n\n\`fix-4715\` released the fix claim at \`124e242da\`.`);
 const pr4715 = (comments, extra = {}) => ({ number: 4715, labels: [{ name: 'review:changes' }, { name: 'review-round:1' }], headRefOid: HEAD, isDraft: false, comments, ...extra });
+
+it('recovers a concurrent same-head send-back after the pinned re-arm marker and operator ruling (PR #5925)', async () => {
+  const { default: scenario } = await import('../soak/breaks/pinned-rearm-orphan-marker.mjs');
+  const report = await scenario.run({ log: line => console.log(line) });
+  expect(scenario.judge(report)).toEqual([]);
+});
+
+describe('verdict-bound orphan re-arm markers', () => {
+  const verdict = { ...VERDICT, id: 'IC_verdict' };
+  const marker = binding => c('2026-10-10T15:22:00Z', REARM_COMMENT_MARKER + binding);
+  const plan = (binding, current = verdict, author = BOT) => planOrphanFixRound({
+    pr: pr4715([current, EVIDENCE, END, { ...marker(binding), author }]), nowMs: NOW,
+  });
+
+  it('suppresses a repeat only for the verdict the marker actually re-armed', () => {
+    const binding = buildRearmVerdictBinding(verdict);
+    expect(plan(binding).reason).toBe('already re-armed after the latest verdict');
+    expect(plan(binding, { ...verdict, id: 'IC_other' }).decision).toBe('rearm');
+    expect(plan(binding, { ...verdict, body: verdict.body + '\nNew finding' }).decision).toBe('rearm');
+    expect(plan(binding, verdict, { login: 'drive-by' }).decision).toBe('rearm');
+  });
+
+  it('normalizes GraphQL and REST identity and timestamp fields to the same binding', () => {
+    const rest = { node_id: verdict.id, id: 42, created_at: new Date(verdict.createdAt).toISOString(), body: verdict.body };
+    expect(rearmVerdictKey(rest)).toBe(rearmVerdictKey(verdict));
+  });
+
+  it('selects the latest trusted verdict even when two verdicts have identical bodies and timestamps', () => {
+    const newer = { ...verdict, id: 'IC_newer' };
+    const forged = { ...newer, id: 'IC_forged', author: { login: 'drive-by' } };
+    expect(latestChangesVerdict([verdict, newer, forged])).toBe(newer);
+    expect(rearmVerdictKey(newer)).not.toBe(rearmVerdictKey(verdict));
+  });
+
+  it.each([
+    buildRearmVerdictBinding(null),
+    buildRearmVerdictBinding(VERDICT), // No comment identity: do not claim coverage.
+    '\n\n<!-- rearm-verdict-v1: invalid -->',
+    '\n\n<!-- rearm-verdict-v2: unknown -->',
+    buildRearmVerdictBinding(verdict) + buildRearmVerdictBinding(verdict),
+  ])('keeps recovery actionable for missing, malformed or duplicate binding: %s', binding => {
+    expect(plan(binding).decision).toBe('rearm');
+  });
+
+  it('preserves chronological handling of historical unbound markers', () => {
+    expect(plan('\n\nHistorical re-arm').reason).toBe('already re-armed after the latest verdict');
+  });
+});
 
 describe('defaultRearm child diagnostics', () => {
   it('surfaces the first non-empty child stderr lines and forwards the full head pin', () => {

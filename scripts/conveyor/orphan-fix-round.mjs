@@ -45,13 +45,14 @@ import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
+import { CHANGES_VERDICT_PREFIX, latestChangesVerdict, rearmCoversVerdict } from '../review-set-label.mjs';
 import { annotateLapsedStandDowns } from './stand-down.mjs';
 import { countUnresolvedStandDowns } from './reconcile-core.mjs';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
 export const ORPHAN_GUARD_MARKER = '🧭 conveyor orphan-guard';
 /** The leading line of a review `changes` verdict (`we:scripts/review-set-label.mjs`). */
-export const CHANGES_VERDICT_PREFIX = '🔁 review — changes requested';
+export { CHANGES_VERDICT_PREFIX };
 /** The fixer's evidence comment has no fixed template; its heading always opens with this (live #4715). */
 export const FIX_EVIDENCE_RE = /^#{0,6}\s*🔧 conveyor fix\b[^\n]*\bevidence\b/i;
 /** How long a round must sit unowned after its last event before the guard acts, so the ordinary dispatcher and a
@@ -86,12 +87,13 @@ export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT
   if (pr?.isDraft) return none('draft — the draft-promotion path owns it');
   if (owned) return none('owned — a live fix or dispatch claim holds it');
   const trusted = (Array.isArray(pr?.comments) ? pr.comments : []).filter((c) => isTrustedMarkerAuthor(c) && atMs(c) != null);
-  let verdict = null;
-  for (const c of trusted) if (lead(c).startsWith(CHANGES_VERDICT_PREFIX) && (!verdict || atMs(c) >= atMs(verdict))) verdict = c;
+  const verdict = latestChangesVerdict(trusted);
   if (!verdict) return none('no trusted changes verdict on the thread');
   const vAt = atMs(verdict);
   const after = trusted.filter((c) => atMs(c) > vAt);
-  if (after.some((c) => lead(c).startsWith(REARM_COMMENT_MARKER))) return none('already re-armed after the latest verdict');
+  if (after.some((c) => lead(c).startsWith(REARM_COMMENT_MARKER) && rearmCoversVerdict(c.body, verdict))) {
+    return none('already re-armed after the latest verdict');
+  }
   if (String(verdict.body).includes('### Blocked referral findings')) {
     const reviewed = String(verdict.body).match(/on head `([0-9a-f]{7,40})`/i)?.[1]?.toLowerCase() ?? verdictReviewedHead(verdict.body);
     const head = String(pr.headRefOid ?? '').toLowerCase();

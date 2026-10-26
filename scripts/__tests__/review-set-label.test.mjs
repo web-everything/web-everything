@@ -19,6 +19,7 @@ import {
   decideSetLabel, presentRemoveLabels, buildVerdictComment, neutralizeCommentMarkers, normalizeChannel,
   runReviewLabelCli as runReviewLabelCliRaw, projectVerdictCommentLength, REVIEW_LABEL_TARGETS, GH_COMMENT_MAX,
   checkBodyFileLocation, bodyFileRoots,
+  buildRearmVerdictBinding,
   // #x9krtkb — the restamp path's carried-human-clearance decision (bug 1) and its CLI wiring (bug 2's
   // `--new-head`, exercised through `runReviewLabelCli` below with a stub provider).
   decideRestampHumanClearance,
@@ -3054,6 +3055,7 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
   // The caller read `accepted`; by the child's own read a reviewer has flipped it to `changes`.
   function run(argv, labels, { comments = [], omitComments = false, readComments = () => comments, headRefOid = 'a'.repeat(40), freshState = {}, swapState = freshState, postSwapState = null } = {}) {
     const calls = [];
+    const postedBodies = [];
     const initial = { labels: labels.map((name) => ({ name })), headRefOid, headRefName: 'lane/x', state: 'OPEN', isDraft: false, body: '',
       ...(omitComments ? {} : { comments }) };
     const readPrState = vi.fn().mockReturnValueOnce(initial).mockReturnValueOnce({ ...initial, ...freshState })
@@ -3068,7 +3070,7 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
         calls.push('setLabels');
         if (postSwapState) readPrState.mockReturnValue({ ...initial, ...swapState, ...postSwapState });
       },
-      postComment: () => { calls.push('postComment'); },
+      postComment: (_repo, _pr, body) => { calls.push('postComment'); postedBodies.push(body); },
     };
     const chunks = [];
     const realExit = process.exit.bind(process);
@@ -3082,8 +3084,26 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
       });
     } catch (e) { if (typeof e.exitCode === 'number') exitCode = e.exitCode; else throw e; }
     finally { process.exit = realExit; }
-    return { exitCode, calls, readPrState, ledgerWrites: readdirSync(ledgerDir), payload: JSON.parse(chunks.join('') || '{}') };
+    return { exitCode, calls, postedBodies, readPrState, ledgerWrites: readdirSync(ledgerDir), payload: JSON.parse(chunks.join('') || '{}') };
   }
+
+  it.each([
+    ['pinned plain', [`--expect-head=${'a'.repeat(40)}`], [REVIEW_LABELS.changes]],
+    ['unpinned plain', [], [REVIEW_LABELS.changes]],
+    ['accepted-only', ['--only-if=accepted'], [REVIEW_LABELS.accepted]],
+    ['missing-only', ['--only-if=missing', `--expect-head=${'a'.repeat(40)}`], []],
+  ])('%s rearm binds even a custom comment to the initial verdict, not the fresh send-back', (_name, args, labels) => {
+    const verdict = { id: 'IC_initial', body: '🔁 review — changes requested\nOriginal findings',
+      createdAt: '2026-10-25T12:00:00Z', author: { login: 'web-everything' } };
+    const newer = { ...verdict, id: 'IC_newer', createdAt: '2026-10-25T13:00:00Z' };
+    const result = run(['9', '--repo=o/n', ...args], labels, {
+      comments: [verdict], freshState: { comments: [verdict, newer] },
+      postSwapState: { labels: [{ name: REVIEW_LABELS.pending }] },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.postedBodies).toEqual(['# body' + buildRearmVerdictBinding(verdict)]);
+    expect(result.postedBodies[0]).not.toContain(buildRearmVerdictBinding(newer));
+  });
 
   it('interleaving: only-if=accepted, child\'s read returns changes → refused, setLabels never called', () => {
     const { exitCode, calls, payload } = run(['9', '--repo=o/n', '--only-if=accepted'], [REVIEW_LABELS.changes]);

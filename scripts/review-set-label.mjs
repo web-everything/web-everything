@@ -64,6 +64,7 @@ import { basename, dirname, join, resolve, sep } from 'node:path';
 import { readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readPinnedChangedFiles, workflowEditHold } from './lib/merge-queue-enqueue.mjs';
 // Rebase resolution (2026-08-08): the UNION of both sides. `buildReviewedDiffMarker` is #2979's accept
 // fingerprint, `READY_TO_MERGE_LABEL` is #2832's hold invariant, `buildReviewedContributionMarker` is
@@ -98,6 +99,42 @@ import {
 // #4140 — `decideRestampHumanClearance` names the carried clearance's actor from TRUSTED comments only, so a later
 // untrusted `cleared-human` marker cannot rename it (the other three parsers it reaches gate themselves).
 import { isTrustedMarkerAuthor } from './lib/marker-authorship.mjs';
+
+export const CHANGES_VERDICT_PREFIX = '🔁 review — changes requested';
+
+/** Share the same verdict selection between the re-arm writer and orphan recovery. */
+export function latestChangesVerdict(comments) {
+  let latest = null, latestAt = -Infinity;
+  for (const c of Array.isArray(comments) ? comments : []) {
+    const at = Date.parse(c?.createdAt ?? c?.created_at ?? '');
+    if (isTrustedMarkerAuthor(c) && String(c?.body ?? '').trimStart().startsWith(CHANGES_VERDICT_PREFIX)
+      && Number.isFinite(at) && at >= latestAt) { latest = c; latestAt = at; }
+  }
+  return latest;
+}
+
+/** Node ids agree across GraphQL's id and REST's node_id. Include the body so an
+ * edited verdict is not silently covered either. Without identity, claim no coverage. */
+export function rearmVerdictKey(verdict) {
+  const id = verdict?.node_id ?? verdict?.id;
+  const at = Date.parse(verdict?.createdAt ?? verdict?.created_at ?? '');
+  if (typeof id !== 'string' || !id || !Number.isFinite(at) || typeof verdict?.body !== 'string') return null;
+  return createHash('sha256').update(JSON.stringify([id, at, verdict.body])).digest('hex');
+}
+
+export function buildRearmVerdictBinding(verdict) {
+  return `\n\n<!-- rearm-verdict-v1: ${rearmVerdictKey(verdict) ?? 'none'} -->`;
+}
+
+/** Legacy markers retain their chronological meaning. A new or malformed binding
+ * never falls back to chronology: it must identify this exact verdict. */
+export function rearmCoversVerdict(body, verdict) {
+  const text = String(body ?? '');
+  if (!text.includes('rearm-verdict-')) return true;
+  const markers = text.match(/rearm-verdict-/g);
+  const key = text.match(/^<!-- rearm-verdict-v1: ([0-9a-f]{64}) -->$/m)?.[1];
+  return markers.length === 1 && !!key && key === rearmVerdictKey(verdict);
+}
 
 import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward, laterReviewHold } from './lib/accept-carry-forward.mjs'; // card xu7kxtt
 import { referralCardReadable } from './lib/referral-card-readable.mjs';
@@ -1467,6 +1504,10 @@ export function runReviewLabelCli({
     }
     return comments;
   };
+  const rearmThread = to === 'rearm' ? fullThread() : null;
+  // Capture before either write; a send-back during the swap or comment must not
+  // become the verdict this older re-arm claims to have handled.
+  const rearmBinding = to === 'rearm' ? buildRearmVerdictBinding(latestChangesVerdict(rearmThread)) : '';
   const redTeamRulingHold = to === 'clear-human' && hasReviewLabel(currentLabels, REVIEW_LABELS.accepted)
     && !hasReviewLabel(currentLabels, REVIEW_LABELS.human) && !hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical)
     && redTeamRulingHeld({ repo, pr, headSha, labels: currentLabels, comments: fullThread(), setting: readConfirmedBreaks().value, readGrantScope });
@@ -1479,7 +1520,7 @@ export function runReviewLabelCli({
     humanOnlyHold,
     redTeamRulingHold,
     acceptanceStillCoversHead: parseReviewedSha(prComments.filter(isTrustedMarkerAuthor)) === headSha,
-    humanClearedHead: to === 'rearm' && headEverHumanCleared(fullThread(), headSha.trim()),
+    humanClearedHead: to === 'rearm' && headEverHumanCleared(rearmThread, headSha.trim()),
   });
   if (!decision.allowed && !restampAcrossHold) {
     emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision }))}\n`);
@@ -1758,7 +1799,7 @@ export function runReviewLabelCli({
   // that are size-checked, written and posted are the same bytes.
   const commentBody = buildComment({
     to, actor, decision, headSha, reason: clearReason, reviewedDiff, clearerId, independence, humanClearance,
-  }) + renderReferralCarryRecord(referralCarry);
+  }) + renderReferralCarryRecord(referralCarry) + rearmBinding;
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — THE SIZE GUARD, on the RENDERED bytes, before ANY write.
   // GitHub rejects a comment over `GH_COMMENT_MAX`. The cause this guard exists for: an oversize comment used to

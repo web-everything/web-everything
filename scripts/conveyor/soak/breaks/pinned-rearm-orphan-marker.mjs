@@ -1,5 +1,5 @@
-/** PR #5925: a push between the re-arm marker and label writes must not
- * leave a bounced PR with a marker that suppresses orphan recovery. */
+/** PR #5925: a push or concurrent same-head send-back between re-arm writes
+ * must not leave a marker that suppresses orphan recovery. */
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -10,8 +10,8 @@ const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 export default {
   id: 'pinned-rearm-orphan-marker',
   title: 'pinned re-arm never leaves an orphan marker suppressing recovery',
-  card: 'PR #5925 blocked referral: third-read head movement',
-  fixedBy: { sha: 'pending', where: 'lane/port-c-orphan-rearm', paths: ['scripts/review-set-label.mjs'] },
+  card: 'PR #5925 / x1b8hlo: head movement and concurrent send-back',
+  fixedBy: { sha: 'pending', where: 'lane/port-c-orphan-rearm', paths: ['scripts/review-set-label.mjs', 'scripts/conveyor/orphan-fix-round.mjs'] },
   fixPresent(root) {
     return readFileSync(join(root, 'scripts/review-set-label.mjs'), 'utf8').includes('pinnedPlainRearm');
   },
@@ -21,6 +21,8 @@ export default {
     const { buildRearmComment, REARM_COMMENT_MARKER } = await load('scripts/conveyor/rearm-review.mjs');
     const { planOrphanFixRound, CHANGES_VERDICT_PREFIX } = await load('scripts/conveyor/orphan-fix-round.mjs');
     const { FIX_END_MARKER } = await load('scripts/conveyor/fix-procedure.mjs');
+    const { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey,
+      renderReferralRecord } = await load('scripts/lib/jury-core.mjs');
     const violations = [];
     const ledgerDir = mkdtempSync(join(tmpdir(), 'soak-pinned-rearm-'));
     const savedLedgerDir = process.env.WE_VERDICT_LEDGER_DIR;
@@ -72,6 +74,60 @@ export default {
         if (mode === 'third-read push' && reads !== 3) violations.push(`${mode}: expected exactly three head reads`);
         if (mode === 'label write failure' && plan.decision !== 'rearm') violations.push(`${mode}: retry no longer actionable`);
         log?.(`${mode}: exit=${exitCode}, recovery=${plan.decision}, markers=${pr.comments.filter(c => c.body.startsWith(REARM_COMMENT_MARKER)).length}`);
+      }
+      // PR #5925 / x1b8hlo: a new send-back can land on the SAME SHA at either
+      // write boundary. Settle that new referral only after the stale marker lands.
+      for (const mode of ['after swap', 'final head read', 'during comment', 'same timestamp']) {
+        const repo = 'o/n', runId = 'review-pr-5925-race', seat = 'judgeCorrectnessAdvisory';
+        const reviewer = mandatoryReferralReviewer(runId);
+        const original = { summary: 'concurrent referral', file: 'scripts/x.mjs', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+        const key = referralFindingKey(seat, original);
+        const body = '<!-- authored-by-actor: author -->';
+        const record = { version: 1, repo, pr: 5925, head, runId, reviewer, authorBody: body, attempted: true,
+          referrals: [{ key, seat, original, finding: normalizeFinding(original) }],
+          rulings: [{ id: `${runId}:0`, key, reviewerId: reviewer.id, lens: 'correctness', result: 'block', rationale: 'checked', evidence: ['diff'] }] };
+        const verdictBody = `${CHANGES_VERDICT_PREFIX}\n\n### Blocked referral findings\n\non head \`${head}\``;
+        const oldVerdict = { ...comment(verdictBody, '2026-10-25T12:00:00Z'), id: 'IC_old' };
+        const newVerdict = { ...comment(verdictBody, mode === 'same timestamp' ? oldVerdict.createdAt : '2026-10-25T13:00:00Z'), id: 'IC_new' };
+        const pr = { number: 5925, body, createdAt: '2026-10-24T12:00:00Z', state: 'OPEN', isDraft: false,
+          headRefOid: head, headRefName: 'lane/x', labels: [{ name: 'review:changes' }, { name: 'review:human' }],
+          comments: [oldVerdict] };
+        const sendBack = () => {
+          pr.comments.push(comment(renderReferralRecord(record), '2026-10-25T12:59:00Z'), newVerdict);
+          pr.labels = [{ name: 'review:changes' }, { name: 'review:human' }];
+        };
+        let reads = 0, exitCode = 0;
+        const provider = {
+          readPrState() {
+            if (++reads === 3 && mode === 'final head read') sendBack();
+            return { ...pr, comments: [...pr.comments] };
+          },
+          readLabels: () => pr.labels,
+          setLabels(_repo, _pr, { add, remove }) {
+            pr.labels = [...pr.labels.filter(l => !remove.includes(l.name)), { name: add }];
+            if (mode === 'after swap' || mode === 'same timestamp') sendBack();
+          },
+          postComment(_repo, _pr, text) {
+            if (mode === 'during comment') sendBack();
+            pr.comments.push(comment(text, '2026-10-25T13:02:00Z'));
+          },
+        };
+        try {
+          runReviewLabelCli({ argv: ['5925', `--repo=${repo}`, `--expect-head=${head}`], fixedTo: 'rearm',
+            provider, defaultActor: 'test', usage: 'soak', buildComment: buildRearmComment,
+            emit() {}, successResult: o => o, refusalResult: o => o, signalFix() {} });
+        } catch (error) {
+          if (error?.signal !== exitSignal) throw error;
+          exitCode = error.code;
+        }
+        pr.comments.push(comment(buildOperatorRulingComment({ version: 1, repo, pr: 5925, head,
+          actor: 'chalbert', channel: 'claude-code-chat', reason: 'Operator settled the new referral',
+          at: '2026-10-25T14:00:00Z', clearerId: 'session-5925', rulings: [{ runId, key, result: 'not-real' }] }), '2026-10-25T14:00:00Z'));
+        const plan = planOrphanFixRound({ pr, repo, nowMs: Date.parse('2026-10-25T15:00:00Z') });
+        if (exitCode !== 0) violations.push(`${mode}: re-arm unexpectedly failed`);
+        if (!pr.labels.some(l => l.name === 'review:human')) violations.push(`${mode}: human hold lost`);
+        if (plan.decision !== 'rearm') violations.push(`${mode}: ${plan.reason}`);
+        log?.(`${mode}: exit=${exitCode}, recovery=${plan.decision}, reason=${plan.reason}`);
       }
     } finally {
       process.exit = realExit;
