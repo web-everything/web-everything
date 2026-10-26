@@ -1101,6 +1101,23 @@ plugs/__tests__/e2e/sw-fixtures/          # static fixture server + SW/page + re
 | Store | Yes | Maybe | If in demo |
 | Demo feature | No | No | Yes |
 
+## Delivery policy path probes
+
+All worktree delivery-policy sources and journal IO use `resolveTrustedConfigPath` in
+`scripts/lib/delivery-policy.mjs`. Canonical allowed bases may resolve platform aliases;
+symlinks below those bases are refused, including parents whose targets stay inside the base.
+Use its `beforeRead` hook to swap a leaf or directory after validation: reads/appends must
+refuse the swap or retain the originally validated inode. The fd's device/inode and size
+are checked before IO, and reads are bounded even if a concurrent writer grows the file.
+Cache hits still check paths; the existing mtime-based content cache remains intentional.
+
+Explicit journal redirects must stay inside the working directory, daemon state, or the
+configured logs root. Fixtures should put journals under their isolated daemon state.
+Invalid policy sources retain defaults (or the protective failsafe) with warnings; journal
+failures remain best effort (empty reads, skipped writes). Journals reaching the 1 MiB source
+limit require operator rotation before further reads/appends. Regression home:
+`scripts/lib/__tests__/delivery-policy.test.mjs`.
+
 ## Quality guidelines
 Real Git fixtures must pass `-c gc.auto=0 -c maintenance.auto=false` on their Git invocations.
 A large seed commit can launch detached maintenance/repack that outlives `execFileSync`, racing
