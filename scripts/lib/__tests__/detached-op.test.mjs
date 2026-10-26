@@ -108,26 +108,34 @@ describe.skipIf(process.platform === 'win32')('re-parented descendants (runner s
   async function runScenario({ midLingerMs, snapshotMs }) {
     const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'detached-op-reparent-'));
     const grandchildReady = join(dir, 'grandchild.pid');
+    const heartbeat = join(dir, 'grandchild.heartbeat');
     const midGone = join(dir, 'mid.gone');
     let record;
     let grandchildPid;
     try {
       const grandchild = keepAliveScript({
-        prelude: "for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => {});",
+        prelude: `
+          for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => {});
+          setInterval(() => require('node:fs').appendFileSync(${JSON.stringify(heartbeat)}, '.'), 10);
+        `,
         postlude: `require('node:fs').writeFileSync(${JSON.stringify(grandchildReady)}, String(process.pid));`,
       });
       const mid = `
         const { spawn } = require('node:child_process');
         spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { stdio: 'ignore', detached: true }).unref();
-        setTimeout(() => { require('node:fs').writeFileSync(${JSON.stringify(midGone)}, '1'); process.exit(0); }, ${midLingerMs});
+        setTimeout(() => process.exit(0), ${midLingerMs});
       `;
       const command = keepAliveScript({
-        postlude: `require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(mid)}], { stdio: 'ignore' });`,
+        postlude: `
+          require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(mid)}], { stdio: 'ignore' })
+            .once('exit', () => require('node:fs').writeFileSync(${JSON.stringify(midGone)}, 'reaped'));
+        `,
       });
       record = await startDetachedOp({ argv: [process.execPath, '-e', command], kind: 'reparent-test', dir,
-        env: { ...process.env, DETACHED_OP_SNAPSHOT_MS: String(snapshotMs) } });
+        env: { ...process.env, DETACHED_OP_SNAPSHOT_MS: snapshotMs === undefined ? '' : String(snapshotMs) } });
       const readyDeadline = Date.now() + 8000;
-      while (!(existsSync(grandchildReady) && existsSync(midGone))) {
+      while (!(existsSync(grandchildReady) && existsSync(heartbeat)
+        && existsSync(midGone) && readFileSync(midGone, 'utf8') === 'reaped')) {
         if (Date.now() >= readyDeadline) throw new Error('scenario did not become ready');
         await delay(20);
       }
@@ -140,9 +148,20 @@ describe.skipIf(process.platform === 'win32')('re-parented descendants (runner s
         result = await waitForOp({ id: record.id, dir, maxWaitMs: 250 });
         if (Date.now() >= terminalDeadline) throw new Error('runner cleanup did not finish');
       } while (result.status === 'running');
-      await delay(100);
-      return alive(grandchildPid);
+      expect(result).toMatchObject({ status: 'failed', code: 1, exitCode: 143 });
+      // kill(pid, 0) also sees unreaped zombies on Linux. Check execution state AND continued work.
+      const stoppedAt = readFileSync(heartbeat, 'utf8');
+      await delay(150);
+      let state = '';
+      try {
+        state = execFileSync('ps', ['-o', 'stat=', '-p', String(grandchildPid)],
+          { encoding: 'utf8', timeout: 1000 }).trim();
+      } catch (error) { if (error.status !== 1) throw error; } // ps exits 1 for an absent PID.
+      const survivor = Boolean(state && !state.startsWith('Z'));
+      expect(readFileSync(heartbeat, 'utf8') !== stoppedAt).toBe(survivor);
+      return survivor;
     } finally {
+      if (!grandchildPid && existsSync(grandchildReady)) grandchildPid = Number(readFileSync(grandchildReady, 'utf8'));
       if (grandchildPid) { try { process.kill(grandchildPid, 'SIGKILL'); } catch {} }
       if (record) { try { process.kill(record.pid, 'SIGKILL'); } catch {} }
       await delay(30);
@@ -153,7 +172,7 @@ describe.skipIf(process.platform === 'win32')('re-parented descendants (runner s
   it('leaves no survivor when a detached grandchild was re-parented to PID 1 before SIGTERM', async context => {
     if (!psWorks()) { context.skip(); return; }
     // mid lingers well past one snapshot interval, so the periodic snapshot saw the grandchild.
-    expect(await runScenario({ midLingerMs: 900, snapshotMs: 100 })).toBe(false);
+    expect(await runScenario({ midLingerMs: 1500 })).toBe(false);
   }, 20000);
 
   it('documented bound: a descendant orphaned before any snapshot ran escapes the sweep', async context => {
@@ -339,6 +358,19 @@ describe('detached operation lifecycle', () => {
     expect(await waitForOp({ id: legacy.id, maxWaitMs: 250, dir, ...fakeClock(), isAlive: () => true, startOf: neverCalled }))
       .toMatchObject({ status: 'running', code: 75 });
     expect(neverCalled).not.toHaveBeenCalled();
+  });
+
+  it('rechecks a refreshed runner identity even when the PID is unchanged', async () => {
+    const record = writeRecord({ pidStart: 'old-start' });
+    const clock = fakeClock();
+    const startOf = vi.fn(() => {
+      writeRecord({ pidStart: 'new-start' });
+      return 'new-start';
+    });
+    expect(await waitForOp({ id: record.id, dir, maxWaitMs: 250, ...clock,
+      isAlive: () => true, startOf }))
+      .toMatchObject({ status: 'running', pid: record.pid, pidStart: 'new-start', code: 75 });
+    expect(startOf.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 
   it.skipIf(process.platform === 'win32')('reads the same runner start time whatever TZ the reader runs under', () => {

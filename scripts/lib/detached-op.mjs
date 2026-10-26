@@ -11,10 +11,13 @@
  *   ps is run with TZ=UTC so readers in different time zones agree. On Linux, ps derives lstart from boot time,
  *   so a wall-clock step can shift it by about a second and make a live runner look dead; not compensated.
  * - Command stop: SIGKILL of the command's process tree and process group, plus every descendant seen by a
- *   periodic snapshot (every 250 ms, pid + start time) whose start time still matches at stop time. A
+ *   periodic snapshot (scheduled every 250 ms, pid + start time) whose start time still matches at stop time. A
  *   descendant that detaches (setsid) and is re-parented to PID 1 is therefore stopped, UNLESS it was created
- *   and orphaned (its parent exited) within one snapshot interval, before any snapshot saw it: that race is not
- *   closed. Its descendants spawned later are covered only if the survivor itself was snapshotted.
+ *   and orphaned (its parent exited) between successful snapshots, before any snapshot saw it: that race is not
+ *   closed. The observation gap is not capped at 250 ms: event-loop delays, process-list latency (10 s timeout
+ *   per attempt), and failed listings extend it; repeated listing failures give no finite observation bound.
+ *   Its descendants spawned later are covered only if the survivor itself was snapshotted. Start times have
+ *   1 s resolution, and identity checks and signals are not atomic; reuse inside either window is not excluded.
  *   A SIGKILLed runner cleans nothing up. DETACHED_OP_SNAPSHOT_MS overrides the interval (test seam).
  */
 import { execFileSync, spawn } from 'node:child_process';
@@ -135,11 +138,11 @@ export async function waitForOp({ id, maxWaitMs = 540000, dir = resolveDetachedO
   };
   for (;;) {
     let record;
-    let deadRunnerPid;
+    let deadRunner;
     try {
       record = readRecord();
       if (record.status === 'running' && runnerGone(record)) {
-        deadRunnerPid = record.pid;
+        deadRunner = record;
         // The runner publishes its terminal record before exiting. Refresh after
         // observing death so a stale running snapshot cannot hide that result.
         record = readRecord();
@@ -147,7 +150,11 @@ export async function waitForOp({ id, maxWaitMs = 540000, dir = resolveDetachedO
     } catch (error) { return { id, status: 'failed', code: 1, reason: error.code === 'ENOENT' ? 'unknown-job' : 'invalid-record' }; }
     const result = { ...record, stdoutTail: tail(record.stdoutPath), stderrTail: tail(record.stderrPath) };
     if (record.status !== 'running') return { ...result, code: record.status === 'done' ? 0 : 1 };
-    if (record.pid === deadRunnerPid) return { ...result, status: 'failed', code: 1, reason: 'runner-died' };
+    // A refreshed record may name a new incarnation of the same PID. Death belongs
+    // to the full observed identity, not to every subsequent holder of that number.
+    if (deadRunner && record.pid === deadRunner.pid && record.pidStart === deadRunner.pidStart) {
+      return { ...result, status: 'failed', code: 1, reason: 'runner-died' };
+    }
     if (now() >= deadline) return { ...result, code: 75 };
     await pause(Math.min(1000, deadline - now()));
   }
@@ -192,7 +199,7 @@ async function runRecord(args) {
     if (!watched.size) return;
     let starts;
     try { starts = startsFromPs(psAll()); } catch { return; }
-    // Only pids that still carry the recorded start time: a reused pid is never killed.
+    // Only identities matching the latest listing; see the non-atomic identity/signal bound above.
     for (const [pid, start] of watched) {
       if (starts.get(pid) === start) killProcessTree(pid, 'SIGKILL');
     }
