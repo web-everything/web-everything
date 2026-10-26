@@ -6,7 +6,12 @@ In-process review callers import the pure shape derivation from `scripts/lib/rev
 Keep CLI evidence loading outside that module: unknown dynamic imports make daemon/promotion import
 closures incomplete and force conservative restart, smoke and staleness fallbacks.
 
-Shape shadow evidence must preserve every current file-only shape field; a hunk-cleared hold stays proposed-human as unproven. Diff lines over 2000 characters require human review before parsing expressions.
+Shape shadow evidence must preserve every current file-only shape field. Pass hunks through the scorer's
+`proposalDiffHunks` input so the proposal proves changes against the historical hold and sensitive hits;
+clearing the hunk-aware gate alone cannot clear the proposal. A complete read-only array addition can be
+proven, while a harmless comment retains the hold with a `no new op reference` reason. Classifier
+self-changes retain proposed human review even when the current gate did not fire.
+Diff lines over 2000 characters require human review before parsing expressions.
 
 PR-head modules are untrusted data: never import them into the reviewer process, even in shadow mode.
 Read-only proof uses the reviewer checkout's registry and unchanged declaration plus every runner-imported `-io.mjs` module and their closures, regardless of operation name; new or

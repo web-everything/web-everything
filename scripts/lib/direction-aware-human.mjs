@@ -218,12 +218,15 @@ function readOnlyAddition(rows, readOnlyOps, hunk) {
 /** Inputs are evidence from the caller; unavailable or malformed evidence preserves human review. */
 export function proposeHumanRequired({ humanRequired, otherHumanForced, hits, files, hunksOf,
   readOnlyOps, protectionPaths = PROTECTION_PATHS } = {}) {
+  // Self-changes invalidate the classifier's proof even when today's hunk-aware gate did not fire.
+  if (Array.isArray(files)) {
+    for (const file of files) if (CLASSIFIERS.has(file)) return yes(`classifier self-change: ${file}`);
+  }
   if (humanRequired === false) return { proposed: false, reason: 'not human-required today' };
   if (otherHumanForced) return yes('other human-forced trigger');
   try {
     if (humanRequired !== true || !Array.isArray(files) || !files.length
       || files.some(f => typeof f !== 'string' || !f)) throw new Error('incomplete changed files');
-    for (const file of files) if (CLASSIFIERS.has(file)) return yes(`classifier self-change: ${file}`);
     if (!(readOnlyOps instanceof Set) || !readOnlyOps.size) return yes('empty readOnlyOps');
     if (!Array.isArray(protectionPaths) || protectionPaths.some(re => !(re instanceof RegExp))) throw new Error('invalid protectionPaths');
     const hunks = new Map(files.map(file => [file, hunksOf(file)]));

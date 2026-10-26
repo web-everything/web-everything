@@ -44,14 +44,8 @@ export function buildShapePlan({ changedFiles = [], careLevel, commits = null, d
   const files = (Array.isArray(changedFiles) ? changedFiles : [])
     .filter((f) => typeof f === 'string' && f.trim().length > 0)
     .map((f) => f.trim());
-  const escalation = scoreEscalation({ changedFiles: files, readOnlyOps });
   // Hunks are shadow evidence only; keep every current shape field on the historical file-only score.
-  const shadow = diffHunks == null ? escalation : scoreEscalation({ changedFiles: files, diffHunks, readOnlyOps });
-  const proposal = !escalation.humanRequired
-    ? { proposed: false, reason: 'not human-required today' }
-    : !shadow.humanRequired
-      ? { proposed: true, reason: 'hunks changed the current decision; unproven' }
-      : { proposed: shadow.humanRequiredProposed, reason: shadow.humanRequiredProposedReason };
+  const escalation = scoreEscalation({ changedFiles: files, readOnlyOps, proposalDiffHunks: diffHunks });
   // The score is handed ACROSS so the router does not pay for a second `scoreEscalation` over the same list —
   // and, more importantly, so the reasons printed below and the subject routed here are provably one score.
   const plan = routeReviewShape({ changedFiles: files, escalation, careLevel });
@@ -59,8 +53,8 @@ export function buildShapePlan({ changedFiles = [], careLevel, commits = null, d
     careLevel: plan.careLevel,
     reasons: [...escalation.reasons],
     humanRequired: escalation.humanRequired === true,
-    humanRequiredProposed: proposal.proposed,
-    humanRequiredProposedReason: proposal.reason,
+    humanRequiredProposed: escalation.humanRequiredProposed,
+    humanRequiredProposedReason: escalation.humanRequiredProposedReason,
     earnedLenses: [...plan.lenses],
     mandatoryFloor: [...plan.mandatoryLenses],
     subject: plan.subject,

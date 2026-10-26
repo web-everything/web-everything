@@ -300,6 +300,11 @@ describe('direction-aware humanRequired shadow (R131)', () => {
     expect(propose({}, [], { humanRequired: false, otherHumanForced: true }))
       .toEqual({ proposed: false, reason: 'not human-required today' });
   });
+  it.each(['scripts/operations/registry.mjs', 'scripts/operations/step-kinds.mjs'])
+    ('keeps classifier self-change human when the current gate did not fire: %s', file => {
+      expect(propose({ [file]: diff(file, ['+// change']) }, [], { humanRequired: false }))
+        .toEqual({ proposed: true, reason: `classifier self-change: ${file}` });
+    });
   it('preserves other forced human triggers', () => {
     expect(propose({}, [], { otherHumanForced: true }).proposed).toBe(true);
   });

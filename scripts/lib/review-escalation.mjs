@@ -691,6 +691,8 @@ export function scoreEscalation({
   crossRepo = false,
   thresholds = {},
   diffHunks = null,
+  // Shape callers can supply proposal evidence while keeping today's file-only score intact.
+  proposalDiffHunks = diffHunks,
   basisNarrowed = true,
   deviation = null,
   humanSurfaces,
@@ -858,7 +860,7 @@ export function scoreEscalation({
   let proposal;
   try {
     proposal = proposeHumanRequired({ humanRequired: humanForced, otherHumanForced,
-      hits: permissionHits, files: gateBasis, hunksOf: fileHunksOf, readOnlyOps });
+      hits: permissionHits, files: gateBasis, hunksOf: fileHunksResolver(proposalDiffHunks), readOnlyOps });
   } catch { proposal = { proposed: humanForced, reason: 'proposal error' }; }
   return { humanSurfaces: resolvedSurfaces, escalate: reasons.length > 0,
     humanRequired: directionAwareLive === true ? proposal.proposed : humanForced,

@@ -14,10 +14,13 @@ import { compute, effect } from '../operations/step-kinds.mjs';
 import { execFileSync } from 'node:child_process';
 
 const runner = 'scripts/operations/run.mjs';
+// Include registration wiring: a complete named array alone clears the current permission detector.
 const diffHunks = `diff --git a/${runner} b/${runner}
 --- a/${runner}
 +++ b/${runner}
-@@ -1,4 +1,5 @@
+@@ -1,0 +1 @@
++  [PR_TRACE_OP]: () => ({ declaration: prTraceOperation({ readFacts: createPrTraceReader() }), sinks: {}, finish: finishPrTrace }),
+@@ -10,4 +11,5 @@
  const zeroWrites = [
    HEALTH_OP,
 +  PR_TRACE_OP,
@@ -65,7 +68,17 @@ describe('R131 direction-aware shape wiring', () => {
     expect(current).toEqual(before);
     expect(current.humanRequired).toBe(base.humanRequired);
     expect(humanRequiredProposed).toBe(true);
-    expect(humanRequiredProposedReason).toBe('hunks changed the current decision; unproven');
+    expect(humanRequiredProposedReason).toBe('no new op reference');
+  });
+  it('proves a complete read-only list addition even when hunks clear the current hold', () => {
+    const listOnly = diffHunks.slice(0, diffHunks.indexOf('@@'))
+      + diffHunks.slice(diffHunks.indexOf('@@ -10'));
+    expect(scoreEscalation({ ...evidence, diffHunks: listOnly }).humanRequired).toBe(false);
+    const { humanRequiredProposed, humanRequiredProposedReason, ...current } = buildShapePlan({ ...evidence, diffHunks: listOnly });
+    const { humanRequiredProposed: ignored, humanRequiredProposedReason: ignoredReason, ...before } = buildShapePlan({ changedFiles: [runner] });
+    expect(current).toEqual(before);
+    expect(humanRequiredProposed).toBe(false);
+    expect(humanRequiredProposedReason).toBe('adds only read-only ops: pr-trace');
   });
   it('keeps the proposal false when the no-hunks decision never required a human', () => {
     expect(buildShapePlan({ changedFiles: ['scripts/example.mjs'], diffHunks }))
@@ -99,6 +112,21 @@ describe('R131 direction-aware shape wiring', () => {
     expect(scoreEscalation({ ...evidence, changedFiles: [runner, 'scripts/lib/permission-change.mjs'] }))
       .toMatchObject({ humanRequired: true, humanRequiredProposed: true });
   });
+  it.each(['registry.mjs', 'step-kinds.mjs'])
+    ('keeps a classifier-only %s change human in live shape output', async file => {
+      const path = `scripts/operations/${file}`;
+      const diff = `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-// before\n+// after\n`;
+      const input = { changedFiles: [path], diffHunks: diff };
+      expect(scoreEscalation(input)).toMatchObject({ humanRequired: false, humanRequiredProposed: true });
+      expect(scoreEscalation({ ...input, directionAwareLive: true }))
+        .toMatchObject({ humanRequired: true, humanRequiredProposed: true });
+      const write = vi.fn();
+      await runShape({ files: path, 'diff-file': 'fixture.diff' }, true, {
+        readFile: () => diff, loadOps: async () => new Set(), resolveMode: () => 'live', write, exit: vi.fn(),
+      });
+      expect(JSON.parse(write.mock.calls[0][1])).toMatchObject({ humanRequired: true,
+        humanRequiredProposed: true, humanRequiredProposedReason: `classifier self-change: ${path}` });
+    });
   it('keeps humanRequired true in live mode for guard relocation across scopes', () => {
     const rows = [' function authorize(op) {', '-  if (!allowed.includes(op)) return false;',
       '   if (optional) {', '+    if (!allowed.includes(op)) return false;', '   }',
