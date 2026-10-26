@@ -17,6 +17,7 @@ import { proveCardOnlyHeadMove } from '../../lib/card-only-head-move.mjs';
 import { createReviewJobIo, execReadRaw, prepareReviewArc, runReviewJob, dispatchReviewJob, writeJobRecord, redTeamRunnerArgs, readRedTeamRecoveryStatus, runRedTeamOnlyJob } from '../review-job.mjs';
 import { createExtraSeatsIo } from '../review-extra-seats.mjs';
 import { newRunRecord, writeRun } from '../run-store.mjs';
+import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
 
 
 describe('main regression coverage', () => {
@@ -1766,6 +1767,58 @@ describe('moved card-only skip settlement', () => {
 
 
 describe('R100 failed-seat recovery admission', () => {
+  it.each(['spent retry', 'unreadable scorecards'])(
+    'daemon request refuses %s before invoking the runner or model, like explicit fresh recovery', fault => {
+      const dir = mkdtempSync(join(tmpdir(), 'daemon-red-team-admission-'));
+      const records = Array.from({ length: 2 }, () => ({ dispatchKind: 'review-seat', seat: 'red-team',
+        repo, pr, rev: head, status: 'unparseable' }));
+      const loopPayload = payload();
+      loopPayload.findings.read.diffText = 'diff --git a/scripts/a.mjs b/scripts/a.mjs\n+code';
+      loopPayload.findings.read.netChangedFiles = ['scripts/a.mjs'];
+      const exercise = mode => {
+        const env = { WE_SHARED_RUNS_DIR: join(dir, mode, 'runs'), CONVEYOR_STATE_ROOT: join(dir, mode),
+          WE_RED_TEAM_TIMING: 'post-accept' };
+        const store = resolveScorecardStorePath(env);
+        mkdirSync(dirname(store), { recursive: true });
+        writeFileSync(store, fault === 'unreadable scorecards' ? '{truncated' : JSON.stringify({ version: 1, records }));
+        recordRedTeamStatus({ repo, pr, loopPayload, status: 'finished', result: 'ran', retryCount: 1 }, { env });
+        const readEvidence = key => readDrainRedTeamEvidence({ ...key, env, runsDir: env.WE_SHARED_RUNS_DIR });
+        const production = createReviewJobIo({ env, readEvidence });
+        let modelCalls = 0;
+        const io = fakeIo({
+          readRedTeamOnlyPayload: () => ({ ...readEvidence({ repo, pr, head }), head }),
+          redTeamStatus: vi.fn(production.redTeamStatus), clearRedTeamQueued: production.clearRedTeamQueued,
+          readDrainRedTeamState: () => ({ headRefOid: head, state: 'OPEN', isDraft: false,
+            labels: ['review:accepted', 'ready-to-merge'] }),
+          readDrainRedTeamReview: () => loopPayload, finishDrainRedTeamRequest: vi.fn(),
+          recordSavedRedTeamResult: vi.fn(() => false),
+          runRedTeam: vi.fn(input => {
+            const observed = runSharedRecovery(input, { env, records, probeFresh: true,
+              recordsUnreadable: fault === 'unreadable scorecards' });
+            modelCalls += observed.calls.model;
+            return observed.result;
+          }),
+        });
+        const out = runReviewJob({ repo, pr, ...(mode === 'fresh'
+          ? { redTeamOnly: true, redTeamMode: 'fresh' }
+          : { drainRedTeamRequest: { repo, pr, head } }) }, io);
+        return { out, io, modelCalls };
+      };
+      try {
+        const fresh = exercise('fresh');
+        expect(fresh.modelCalls, 'the explicit fresh path must already refuse this evidence').toBe(0);
+        if (fault === 'unreadable scorecards') expect(fresh.out.label).toContain('saved red-team evidence malformed');
+        else expect(fresh.out.redTeam).toMatchObject({ status: 'not-owed', deferredByGuard: true });
+        const daemon = exercise('daemon');
+        expect(daemon.io.finishDrainRedTeamRequest).not.toHaveBeenCalled();
+        expect({ runnerCalls: daemon.io.runRedTeam.mock.calls.length, modelCalls: daemon.modelCalls,
+          refusalRecorded: daemon.out.refused === true || daemon.out.redTeam?.deferredByGuard === true
+            || /evidence (malformed|unreadable)/.test(daemon.out.label ?? '') },
+        `daemon request must fail closed on ${fault} before launching a runner or model`)
+          .toEqual({ runnerCalls: 0, modelCalls: 0, refusalRecorded: true });
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
   it('two interleaved admissions launch exactly one model call and preserve the winning status', () => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-atomic-retry-'));
     const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };

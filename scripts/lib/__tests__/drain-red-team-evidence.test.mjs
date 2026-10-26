@@ -2,7 +2,7 @@
 import { beforeEach as beforeTimingFixture, afterEach as afterTimingFixture, vi as timingFixture } from 'vitest';
 beforeTimingFixture(() => timingFixture.stubEnv('WE_RED_TEAM_TIMING', 'post-accept'));
 afterTimingFixture(() => timingFixture.unstubAllEnvs());
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { saveProvenanceFixtures } from './fixtures/saved-red-team-provenance.mjs';
@@ -14,7 +14,13 @@ import { historicalCardOnlySkipCandidate, readDrainRedTeamEvidence, recordRedTea
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { redTeamOwedFor } from '../review-red-team-policy.mjs';
 import { pidStartTime } from '../pid-alive.mjs';
-import { resumeRedTeamCarry } from '../red-team-carry-machine.mjs';
+import { readRedTeamCarry, resumeRedTeamCarry } from '../red-team-carry-machine.mjs';
+import { staleRedTeamRequestEligibility } from '../drain-merge-strategy.mjs';
+
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, readFileSync: vi.fn(actual.readFileSync) };
+});
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -26,6 +32,89 @@ function fixture() {
     readScorecards: () => [], env: { WE_RED_TEAM_TIMING: 'post-accept', WE_SHARED_RUNS_DIR: runsDir, CONVEYOR_STATE_ROOT: root } };
 }
 const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
+
+describe('invalid status carry cannot suppress failed-seat recovery', () => {
+  function failedSeatFixture() {
+    const f = fixture();
+    const loopPayload = payload(f.head);
+    loopPayload.findings.read.diffText = 'diff --git a/scripts/a.mjs b/scripts/a.mjs\n+code';
+    loopPayload.findings.read.netChangedFiles = ['scripts/a.mjs'];
+    writeRun({ ...newRunRecord({ id: 'review-pr-live', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
+      ...loopPayload }, f.runsDir);
+    f.readScorecards = () => [{ dispatchKind: 'review-seat', seat: 'red-team', repo: f.repo,
+      pr: f.pr, rev: f.head, status: 'unparseable' }];
+    const path = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+    mkdirSync(dirname(path), { recursive: true });
+    return { f, path, loopPayload };
+  }
+  function invalidStatus(f, loopPayload, over = {}) {
+    return { repo: f.repo, pr: f.pr, head: f.head, status: 'finished', result: 'skipped', skipCardOnly: true,
+      loopPayload: { ...loopPayload, verdict: null, carriedFrom: 'not-a-sha' }, ...over };
+  }
+
+  it.each([
+    ['foreign repo', { repo: 'foreign/repository' }],
+    ['other PR', { pr: 99999 }],
+    ['other head', { head: 'c'.repeat(40) }],
+  ])('ignores a %s status with invalid carriedFrom when no journal exists', (_kind, over) => {
+    const { f, path, loopPayload } = failedSeatFixture();
+    expect(readRedTeamCarry(f)).toBeNull();
+    const absent = readDrainRedTeamEvidence(f);
+    expect(absent).toMatchObject({ scheduled: true, noUsableResult: true, failedSeatCount: 1 });
+    writeFileSync(path, JSON.stringify(invalidStatus(f, loopPayload, over)));
+    expect(readDrainRedTeamEvidence(f), 'a status for another identity must behave exactly like absent status').toEqual(absent);
+  });
+
+  it.each(['not-a-sha', 'a'.repeat(39), 'g'.repeat(40)])(
+    'matching status with ineligible carriedFrom %s cannot create a carry conflict', carriedFrom => {
+      const { f, path, loopPayload } = failedSeatFixture();
+      expect(readRedTeamCarry(f)).toBeNull();
+      const status = invalidStatus(f, loopPayload);
+      status.loopPayload.carriedFrom = carriedFrom;
+      writeFileSync(path, JSON.stringify(status));
+      const evidence = readDrainRedTeamEvidence(f);
+      expect({ carryConflict: evidence.carryConflict, scheduled: evidence.scheduled,
+        noUsableResult: evidence.noUsableResult, failedSeatCount: evidence.failedSeatCount },
+      'invalid carry provenance must not enter the carry branch or hide a missing result')
+        .toEqual({ carryConflict: undefined, scheduled: true, noUsableResult: true, failedSeatCount: 1 });
+    });
+
+  it('merge-strategy keeps the failed-seat request eligible despite a foreign invalid-carry status', () => {
+    const { f, path, loopPayload } = failedSeatFixture();
+    const eligible = () => staleRedTeamRequestEligibility({ ...f, evidence: readDrainRedTeamEvidence(f),
+      enabled: true, labels: ['review:accepted', 'ready-to-merge'] });
+    const absent = eligible();
+    expect(absent).toEqual({ eligible: true, reason: 'stale rows with no usable result' });
+    writeFileSync(path, JSON.stringify(invalidStatus(f, loopPayload, { repo: 'foreign/repository' })));
+    expect(eligible(), 'foreign invalid carry must not suppress the drain consumer request').toEqual(absent);
+  });
+});
+
+describe('scorecard read failures stay closed with saved-result reading disabled', () => {
+  it.each(['EIO', 'parse failure'])('refuses %s instead of returning an empty failed-seat history', fault => {
+    const f = fixture();
+    f.readScorecards = undefined;
+    const path = resolveScorecardStorePath(f.env);
+    mkdirSync(dirname(path), { recursive: true });
+    const rows = Array.from({ length: 2 }, () => ({ dispatchKind: 'review-seat', seat: 'red-team',
+      repo: f.repo, pr: f.pr, rev: f.head, status: 'unparseable' }));
+    writeFileSync(path, fault === 'parse failure' ? '{truncated' : JSON.stringify({ version: 1, records: rows }));
+    const actualRead = vi.mocked(readFileSync).getMockImplementation();
+    if (fault === 'EIO') vi.mocked(readFileSync).mockImplementation((file, ...args) => {
+      if (file === path) throw Object.assign(Error('injected scorecard EIO'), { code: 'EIO' });
+      return actualRead(file, ...args);
+    });
+    try {
+      // The same fault already refuses when saved-result validation is enabled.
+      expect(() => readDrainRedTeamEvidence({ ...f,
+        env: { ...f.env, WE_RED_TEAM_DRAIN_READS_SAVED_RESULT: 'on' } })).toThrow(/unreadable|malformed/);
+      expect(() => readDrainRedTeamEvidence({ ...f,
+        env: { ...f.env, WE_RED_TEAM_DRAIN_READS_SAVED_RESULT: 'off' } }),
+      `saved-result off must not turn ${fault} into attempted:false / failedSeatCount:0`)
+        .toThrow(/unreadable|malformed/);
+    } finally { vi.mocked(readFileSync).mockImplementation(actualRead); }
+  });
+});
 
 describe('carry and saved-result merge guarantees', () => {
   function journal(f) {
