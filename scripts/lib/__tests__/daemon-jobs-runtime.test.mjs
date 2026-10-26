@@ -465,6 +465,48 @@ describe('stopping a job that owns subprocesses', () => {
   });
 });
 
+describe('reapDeadGroup confirmed absence contract', () => {
+  const started = Date.parse('2026-10-19T00:00:00Z');
+  const handle = formatJobHandle({ host: 'h', pid: 999999, procStart: new Date(started).toUTCString() });
+  const base = { host: 'h', requireConfirmedDeath: true, notAfterMs: started + 60000,
+    readStart: () => null, bootTime: () => started - 60000, groupStarts: () => [started + 1000] };
+  const gone = () => { throw Object.assign(Error('gone'), { code: 'ESRCH' }); };
+
+  it('distinguishes confirmed absence from missing timestamps and unreadable probes', () => {
+    expect(reapDeadGroup(handle, { ...base, notAfterMs: NaN, kill: gone })).toBe(true);
+    for (const code of ['EPERM', 'EIO', undefined]) {
+      expect(reapDeadGroup(handle, { ...base, kill: () => { throw Object.assign(Error('unknown'), { code }); } })).toBe(false);
+    }
+  });
+
+  it.each(['late', 'old', 'rebooted', 'boot-unknown', 'members-unknown', 'empty-scan', 'read-throws', 'reused', 'cutoff-unknown'])(
+    'retains a present group when identity evidence is %s', mode => {
+      const kill = vi.fn();
+      const variants = {
+        late: { groupStarts: () => [started + 120000] }, old: { groupStarts: () => [started - 60000] },
+        rebooted: { bootTime: () => started + 1000 }, 'boot-unknown': { bootTime: () => null },
+        'members-unknown': { groupStarts: () => null }, 'empty-scan': { groupStarts: () => [] },
+        'read-throws': { groupStarts: () => { throw Error('ps failed'); } },
+        reused: { readStart: () => 'another owner' }, 'cutoff-unknown': { notAfterMs: NaN },
+      };
+      expect(reapDeadGroup(handle, { ...base, ...variants[mode], kill })).toBe(false);
+      expect(kill.mock.calls).toEqual([[-999999, 0]]);
+    });
+
+  it.each(['pending', 'refused', 'gone', 'raced-exit'])('requires confirmed absence after SIGKILL: %s', mode => {
+    let signalled = false;
+    const kill = vi.fn((pid, signal) => {
+      if (signal === 'SIGKILL') {
+        signalled = true;
+        if (mode === 'refused') throw Object.assign(Error('denied'), { code: 'EPERM' });
+        if (mode === 'raced-exit') gone();
+      } else if (signalled && mode === 'gone') gone();
+    });
+    expect(reapDeadGroup(handle, { ...base, kill })).toBe(['gone', 'raced-exit'].includes(mode));
+    expect(kill).toHaveBeenCalledWith(-999999, 'SIGKILL');
+  });
+});
+
 
 function queuedTask(item = 1, timeoutMs = 1000) {
   return enqueueItemTask({ store, kindDef: noop, repo: 'owner/repo', item, seq: 1, codeSha: 's',
@@ -493,7 +535,8 @@ it('task deadlines coexist with legacy absolute deadlines', async () => {
   enqueueJob({ store, kindDef: noop, codeSha: 's', id: 'coroner-queued' });
   const legacyDeadline = vi.fn(r => r.id === 'coroner-queued' ? now : null);
   const tick = (time, adoptedStore = store) => reattachTick({ store: adoptedStore, kinds, maxConcurrent: 3,
-    observation: { now: time, slept: true }, deadlineAt: legacyDeadline, launch: vi.fn(), probe: h => h === taskOwner.handle ? 'dead' : 'alive' });
+    observation: { now: time, slept: true }, deadlineAt: legacyDeadline, launch: vi.fn(),
+    reapGroup: () => true, probe: h => h === taskOwner.handle ? 'dead' : 'alive' });
   // A live probe avoids ordinary crash recovery; neither generation nor store recreation extends the task.
   const first = await reattachTick({ store, kinds, maxConcurrent: 3, observation: { now, slept: false },
     deadlineAt: legacyDeadline, launch: vi.fn(), probe: () => 'alive' });
@@ -524,7 +567,7 @@ it('task timeout escalates before claim release and retains unconfirmed owners',
       signals.push([pid, signal]); if (signal === 'SIGKILL') live = false;
     } });
   await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now, slept: true },
-    probe, stop, launch, releaseTaskClaim });
+    probe, stop, launch, releaseTaskClaim, reapGroup: () => !live });
   expect(signals.slice(0, 3)).toEqual([[-123, 'SIGTERM'], [-123, 'SIGCONT'], [-123, 'SIGKILL']]);
   expect(releases).toEqual([[active.id, 1]]);
   expect(store.read(active.id).job).toMatchObject({ status: 'queued', task: { failureCount: 1 } });
@@ -570,7 +613,7 @@ it('task timeout escalates before claim release and retains unconfirmed owners',
         store.update(owner.id, r => race === 'finish' ? markSucceeded(r, { at: new Date(now).toISOString() })
           : { ...r, job: { ...r.job, ...(race === 'attempt' ? { attempts: r.job.attempts + 1 } : { handle: 'test:456:new' }) } });
         dead = true; return { gone: true, signal: 'SIGKILL' };
-      }, launch, releaseTaskClaim: release });
+      }, launch, releaseTaskClaim: release, reapGroup: () => true });
     expect(release).not.toHaveBeenCalled();
     expect(store.read(owner.id).job.task.failureCount).toBe(0);
     store.update(owner.id, r => markSucceeded(r, { at: new Date(now).toISOString() }));
@@ -587,7 +630,7 @@ it('task timeout escalates before claim release and retains unconfirmed owners',
   // Timeout exhaustion uses semantic failures, independently of the monotonic attempt token.
   const exhausted = runningTask(21, now - 1000, now);
   store.update(exhausted.id, r => ({ ...r, job: { ...r.job, task: { ...r.job.task, failureCount: 2 } } }));
-  await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now }, probe: () => 'dead', launch });
+  await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now }, probe: () => 'dead', launch, reapGroup: () => true });
   expect(store.read(exhausted.id).job).toMatchObject({ status: 'failed', attempts: 1, task: { failureCount: 3 } });
 });
 
@@ -607,10 +650,69 @@ it.each([false, true])('reaps a task group when the owner dies between the tick 
     stop: (h, options) => stopHandle(h, { ...options, probe, kill }),
     reapGroup, releaseTaskClaim: release, launch: vi.fn() });
   expect(kill).not.toHaveBeenCalled(); // stopHandle first sees a dead owner
-  expect(reapGroup).toHaveBeenCalledWith(owner.job.handle, now + 60000);
+  expect(reapGroup).toHaveBeenCalledWith(owner.job.handle, now + 60000, { requireConfirmedDeath: true });
   expect(release).toHaveBeenCalledTimes(1);
   expect(store.read(owner.id).job).toMatchObject({ status: saved ? 'succeeded' : 'queued',
     task: { failureCount: saved ? 0 : 1 } });
+});
+
+it.each(['dead', 'stop-race', 'saved-result', 'exhausted'])('retains task exclusion when production reaper refuses a late descendant: %s', async mode => {
+  const now = Date.now(), heartbeat = now - 300000, started = heartbeat - 60000;
+  const owner = runningTask(902, started, heartbeat);
+  const handle = formatJobHandle({ host: hostName(), pid: 999999, procStart: new Date(started).toUTCString() });
+  store.update(owner.id, r => {
+    r.job.handle = handle;
+    if (mode === 'exhausted') r.job.task.failureCount = 2;
+    if (mode === 'saved-result') r.job.task.execution = { effects: {}, timings: {}, results: { 1: {
+      v: 1, taskId: r.job.task.id, attempt: 1, outcome: 'acted', effects: [], recordedReads: [], timings: {}, gh: { read: 0, write: 0 },
+    } } };
+    return r;
+  });
+  const before = store.read(owner.id), release = vi.fn(), launch = vi.fn(), logs = [];
+  let descendantAlive = true, observations = 0;
+  const kill = vi.fn((pid, signal) => {
+    if (!descendantAlive) throw Object.assign(Error('gone'), { code: 'ESRCH' });
+    if (signal === 'SIGKILL') descendantAlive = false;
+  });
+  const reapGroup = (h, notAfterMs, options) => reapDeadGroup(h, { ...options, notAfterMs,
+    readStart: () => null, bootTime: () => started - 60000,
+    groupStarts: () => descendantAlive ? [heartbeat + 120000] : [], kill });
+  queuedTask(903);
+  const tick = () => reattachTick({ store, kinds, maxConcurrent: 1, observation: { now },
+    probe: () => mode === 'stop-race' && ++observations === 1 ? 'alive' : 'dead',
+    stop: async () => ({ gone: true, signal: null }), reapGroup,
+    releaseTaskClaim: release, launch, log: message => logs.push(message) });
+  await tick();
+  expect(descendantAlive).toBe(true);
+  expect(release).not.toHaveBeenCalled();
+  expect(launch).not.toHaveBeenCalled();
+  expect(() => enqueueItemTask({ store, kindDef: noop, repo: 'owner/repo', item: 902, seq: 2,
+    codeSha: 's', acting: true, resourceKind: 'build' })).toThrow(/active tuple/);
+  expect(store.read(owner.id).job).toMatchObject({ status: before.job.status, handle,
+    attempts: before.job.attempts, task: { failureCount: before.job.task.failureCount } });
+  expect(logs.some(message => message.includes('group') && message.includes('retains'))).toBe(true);
+  // A later tick can recover once the descendant actually disappears.
+  descendantAlive = false;
+  await tick();
+  expect(release).toHaveBeenCalledTimes(1);
+  expect(store.read(owner.id).job.status).toBe(mode === 'saved-result' ? 'succeeded' : mode === 'exhausted' ? 'failed' : 'queued');
+});
+
+it.each(['false', 'undefined', 'throw'])('unconfirmed cleanup (%s) retains its owner while another task recovers', async answer => {
+  const now = Date.now(), owner = runningTask(904, now - 1000, now), other = runningTask(905, now - 1000, now);
+  store.update(other.id, r => ({ ...r, job: { ...r.job, handle: 'test:456:other' } }));
+  const before = store.read(owner.id), release = vi.fn(), launch = vi.fn();
+  const out = await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now }, probe: () => 'dead',
+    releaseTaskClaim: release, launch, reapGroup: handle => {
+      if (handle !== owner.job.handle) return true;
+      if (answer === 'throw') throw Error('cleanup unavailable');
+      return answer === 'false' ? false : undefined;
+    } });
+  expect(store.read(owner.id)).toEqual(before);
+  expect(store.read(other.id).job.status).toBe('queued');
+  expect(release.mock.calls.map(([r]) => r.id)).toEqual([other.id]);
+  expect(launch).not.toHaveBeenCalled();
+  expect(out.actions).toContainEqual(expect.objectContaining({ id: owner.id, action: 'stop-failed' }));
 });
 
 function childTaskStep(id, { act = () => ({}), timing = () => {}, mutate = () => {}, onRead = () => {}, onClaim = () => {}, names = ['first'], precondition = 'none' } = {}) {
@@ -670,7 +772,7 @@ it.each([1, 3, 4])('persisted failed results with failureCount=%s complete in th
     } });
     expect(child).toEqual({ outcome: 'error', error: recover ? 'crash after persistence' : 'failed' });
     const tick = () => reattachTick({ store, kinds, maxConcurrent: 1, observation: { now },
-      probe: () => 'dead', launch, releaseTaskClaim: release, reapGroup: () => false });
+      probe: () => 'dead', launch, releaseTaskClaim: release, reapGroup: () => true });
     await tick();
     const finished = store.read(r.id);
     expect(finished.job).toMatchObject({ status: failureCount >= 3 ? 'failed' : 'queued', attempts: 1,
@@ -722,7 +824,7 @@ it.each([false, true])('overdue persisted results escalate the owner, confirmed 
   const signals = [], release = vi.fn(), launch = vi.fn();
   const probe = () => alive ? 'alive' : 'dead';
   const out = await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now }, probe, launch,
-    releaseTaskClaim: release, stop: (h, options) => stopHandle(h, { ...options, probe,
+    releaseTaskClaim: release, reapGroup: () => !alive, stop: (h, options) => stopHandle(h, { ...options, probe,
       termGraceMs: 0, killGraceMs: 0, sleep: async () => {}, kill: (pid, signal) => {
         signals.push(signal);
         expect(release).not.toHaveBeenCalled();
@@ -756,7 +858,7 @@ it.each(['saved', 'dead', 'stopped'])('claim-release refusal under lock retains 
   await expect(reattachTick({ store, kinds, maxConcurrent: 1, observation: { now }, launch,
     probe: () => mode === 'stopped' && !stopped ? 'alive' : 'dead',
     stop: async () => { stopped = true; return { gone: true, signal: 'SIGKILL' }; },
-    reapGroup: () => false, releaseTaskClaim: release, log: m => logs.push(m) })).resolves.toBeDefined();
+    reapGroup: () => true, releaseTaskClaim: release, log: m => logs.push(m) })).resolves.toBeDefined();
   expect(store.read(owner.id)).toEqual(before);
   expect(store.read(other.id).job).toMatchObject({ status: 'queued', task: { failureCount: 1 } });
   expect(store.read(waiting.id).job.status).toBe('queued');
@@ -796,7 +898,7 @@ it.each(['acted', 'nothing-owed', 'superseded', 'deferred-claim-held', 'deferred
       } });
       expect(child.outcome).toBe(recover ? 'error' : 'succeeded');
       const tick = () => reattachTick({ store, kinds, maxConcurrent: 1, observation: { now },
-        probe: () => 'dead', launch, releaseTaskClaim: release });
+        probe: () => 'dead', launch, releaseTaskClaim: release, reapGroup: () => true });
       await tick();
       await tick();
       expect(store.read(r.id).job).toMatchObject({ status: 'succeeded', attempts: 1,
@@ -813,7 +915,7 @@ it('confirmed-dead task owners before deadline exhaust semantic failures indepen
   store.update(retry.id, r => ({ ...r, job: { ...r.job, attempts: 10 } }));
   store.update(exhausted.id, r => ({ ...r, job: { ...r.job, task: { ...r.job.task, failureCount: 2 } } }));
   const tick = () => reattachTick({ store, kinds, maxConcurrent: 1, observation: { now },
-    probe: () => 'dead', launch, releaseTaskClaim: release });
+    probe: () => 'dead', launch, releaseTaskClaim: release, reapGroup: () => true });
   await tick();
   expect(store.read(retry.id).job).toMatchObject({ status: 'queued', attempts: 10,
     task: { outcome: 'failed', failureCount: 1 } });
@@ -839,7 +941,7 @@ it('task results repair publication without replay and retain partial success', 
   const saved = store.read(r.id).job.task.execution.results[1];
   expect(saved).toMatchObject({ v: 1, attempt: 1, outcome: 'failed', effects: [
     expect.objectContaining({ status: 'applied', evidence: { receipt: 'first-applied' } }), expect.objectContaining({ status: 'intent' })] });
-  const reaped = vi.fn(() => false);
+  const reaped = vi.fn(() => true); // confirmed empty group, not merely "nothing killed"
   const release = vi.fn(() => { expect(reaped).toHaveBeenCalled(); }), launch = vi.fn();
   const tick = probe => reattachTick({ store: createJobStore(dir), kinds, maxConcurrent: 1,
     observation: { now, slept: false }, probe: () => probe, launch, releaseTaskClaim: release, reapGroup: reaped });
@@ -931,7 +1033,7 @@ it('task timeout honors semantic completion persisted while stopping without ano
   });
   const release = vi.fn(() => { expect(alive).toBe(false); }), launch = vi.fn();
   const tick = () => reattachTick({ store, kinds, maxConcurrent: 1, observation: { now, slept: false },
-    probe: () => alive ? 'alive' : 'dead', stop, releaseTaskClaim: release, launch });
+    probe: () => alive ? 'alive' : 'dead', stop, releaseTaskClaim: release, launch, reapGroup: () => !alive });
   const out = await tick();
   expect(store.read(owner.id).job).toMatchObject({ status: 'succeeded', attempts: 1,
     task: { outcome: 'acted', failureCount: 2, execution: { results: { 1: result } } } });

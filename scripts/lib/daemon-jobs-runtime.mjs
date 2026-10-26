@@ -347,23 +347,37 @@ export function readBootTime({ execFn = execFileSync, readFile = readFileSync } 
  * unused, the host has not rebooted since the job started, and every member started between the job's start
  * and `notAfterMs` (when it was last known alive, plus the staleness window). A group whose id was reused
  * after the job died has members started later, so it is never touched. Anything unreadable skips the reap.
- * @returns {boolean} whether a leftover group was killed
+ * With requireConfirmedDeath, true means the group is confirmed absent (including after SIGKILL),
+ * not merely signalled. Refusal, unreadable evidence, and pending exit all return false for a later tick.
+ * @returns {boolean} whether a leftover group was killed, or confirmed absent in strict mode
  */
 export function reapDeadGroup(handle, {
   notAfterMs, host = hostName(), aliases = null, readStart = readProcStart, groupStarts = readGroupStarts,
-  bootTime = readBootTime, kill = (pid, sig) => process.kill(pid, sig),
+  bootTime = readBootTime, kill = (pid, sig) => process.kill(pid, sig), requireConfirmedDeath = false,
 } = {}) {
   const h = parseJobHandle(handle);
-  if (!h?.pid || !Number.isFinite(notAfterMs)) return false;
+  if (!h?.pid) return false;
   const local = aliases ?? (arguments[1]?.host !== undefined ? new Set([host]) : localHostAliases());
   if (h.host !== host && !local.has(h.host)) return false;
+  const groupGone = () => {
+    try { kill(-h.pid, 0); return false; } catch (error) { return error?.code === 'ESRCH' ? true : null; }
+  };
+  if (requireConfirmedDeath) {
+    const gone = groupGone();
+    if (gone !== false) return gone === true;
+  }
+  if (!Number.isFinite(notAfterMs)) return false;
   try { if (readStart(h.pid)) return false; } catch { return false; }
   const startedMs = Date.parse(h.procStart);
-  const boot = bootTime();
+  let boot, members;
+  try { boot = bootTime(); } catch { return false; }
   if (!Number.isFinite(startedMs) || !Number.isFinite(boot) || boot > startedMs) return false;
-  const members = groupStarts(h.pid);
+  try { members = groupStarts(h.pid); } catch { return false; }
   if (!members?.length || members.some((t) => !Number.isFinite(t) || t < startedMs - 1000 || t > notAfterMs)) return false;
-  try { kill(-h.pid, 'SIGKILL'); return true; } catch { return false; }
+  try {
+    kill(-h.pid, 'SIGKILL');
+    return requireConfirmedDeath ? groupGone() === true : true;
+  } catch (error) { return requireConfirmedDeath && error?.code === 'ESRCH'; }
 }
 
 /**
@@ -421,6 +435,7 @@ function completeTaskResult(r, { at, now, backoffBaseMs }) {
  * ONE reattach-and-admit pass. Run at boot and every tick.
  * @param {{store: object, kinds: Map<string, object>, maxConcurrent: number, clock?: object, observation?: object,
  *   probe?: Function, stop?: Function, launch?: Function, staleMs?: number, launchGraceMs?: number, reapGroup?: Function,
+ *   // reapGroup(handle, cutoff, { requireConfirmedDeath: true }) must return true only for confirmed absence.
  *   releaseTaskClaim?: (record: object) => void, // synchronous, attempt-scoped port; must throw on refusal
  *   deadlineAt?: (record: object) => number|null, backoffBaseMs?: number, snapshot?: object, heartbeatIntervalMs?: number, log?: Function}} o
  * @returns {Promise<{slept: boolean, gapMs: number, actions: object[], corrupt: string[]}>}
@@ -430,7 +445,7 @@ export async function reattachTick({
   launch = launchJob, staleMs = DEFAULT_HEARTBEAT_STALE_MS, launchGraceMs = DEFAULT_LAUNCH_GRACE_MS,
   backoffBaseMs = DEFAULT_BACKOFF_BASE_MS, snapshot, heartbeatIntervalMs, log = () => {}, deadlineAt = () => null,
   releaseTaskClaim = () => {},
-  reapGroup = (h, notAfterMs) => reapDeadGroup(h, { notAfterMs }),
+  reapGroup = (h, notAfterMs, options) => reapDeadGroup(h, { ...options, notAfterMs }),
 }) {
   const obs = observation ?? (clock ? clock.observe() : { now: Date.now(), slept: false, gapMs: 0 });
   const { now, slept, gapMs } = obs;
@@ -442,6 +457,16 @@ export async function reattachTick({
   };
   if (slept) log(`daemon-jobs: host slept (wall-vs-monotonic gap ${Math.round(gapMs)}ms) — skipping the staleness check this tick`);
   const actions = [];
+  const confirmTaskGroupGone = (record, state) => {
+    if (!record.job.handle) return true; // unclaimed launch; no process group was recorded
+    const lastAliveMs = Date.parse(record.job.heartbeatAt ?? record.job.startedAt ?? '');
+    try {
+      if (reapGroup(record.job.handle, lastAliveMs + staleMs, { requireConfirmedDeath: true }) === true) return true;
+    } catch { /* unavailable cleanup evidence retains exclusion too */ }
+    actions.push({ id: record.id, state, action: 'stop-failed' });
+    log(`daemon-jobs: cannot confirm task process group gone ${record.id} (${record.job.handle}) — retains claim and slot; inspect group before recovery`);
+    return false;
+  };
   const { records, corrupt } = store.list();
   for (const id of corrupt) log(`daemon-jobs: job record ${id} is corrupt — left untouched, fix or delete it`);
 
@@ -463,8 +488,7 @@ export async function reattachTick({
     const savedResult = r.job.task?.execution?.results?.[r.job.attempts];
     if (savedResult && state !== 'terminal' && state !== 'queued' && state !== 'waiting' && (liveness === 'dead' || !expired)) {
       if (liveness !== 'dead') continue; // publication does not revoke a live/unknown owner
-      const lastAliveMs = Date.parse(r.job.heartbeatAt ?? r.job.startedAt ?? '');
-      if (Number.isFinite(lastAliveMs)) reapGroup(r.job.handle, lastAliveMs + staleMs);
+      if (!confirmTaskGroupGone(r, state)) continue;
       store.update(r.id, f => {
         if (!sameGeneration(f, r)) return null;
         if (!tryReleaseTaskClaim(f)) return null;
@@ -504,7 +528,11 @@ export async function reattachTick({
     }
     // The owner can die after the tick's probe but before stopHandle's first observation. Reap after
     // stopping too, using the dead-group identity checks before releasing exclusion or requeuing.
-    if ((liveness === 'dead' || stopped) && Number.isFinite(lastAliveMs) && reapGroup(r.job.handle, lastAliveMs + staleMs)) log(`daemon-jobs: job ${r.id} died with subprocesses still running — killed its process group`);
+    if (isTask) {
+      if (!confirmTaskGroupGone(r, state)) continue;
+    } else if ((liveness === 'dead' || stopped) && Number.isFinite(lastAliveMs) && reapGroup(r.job.handle, lastAliveMs + staleMs)) {
+      log(`daemon-jobs: job ${r.id} died with subprocesses still running — killed its process group`);
+    }
     const at = iso(Date.now());
     const written = store.update(r.id, (f) => {
       if (!sameGeneration(f, r)) return null; // the child claimed or finished since we looked — re-judge next tick

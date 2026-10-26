@@ -47,24 +47,27 @@ export default {
       const handle = formatJobHandle({ host: hostName(), pid: parent.pid, procStart });
       store.update(task.id, r => markClaimed(markLaunching(r, { at: new Date(now - 1000).toISOString() }),
         { handle, host: hostName(), pid: parent.pid, procStart, at: new Date(now).toISOString() }));
-      await reattachTick({ store, kinds: kindRegistry([kind]), maxConcurrent: 1, observation: { now },
+      const tick = () => reattachTick({ store, kinds: kindRegistry([kind]), maxConcurrent: 1, observation: { now },
         probe: probeHandle, launch: () => null,
         stop: async (h, options) => {
-          process.kill(parent.pid, 'SIGKILL');
+          if (parent.exitCode === null && parent.signalCode === null) process.kill(parent.pid, 'SIGKILL');
           await waitFor(() => parent.exitCode !== null || parent.signalCode !== null);
           return stopHandle(h, { ...options, kill: (pid, signal) => { stopSignals++; process.kill(pid, signal); } });
         },
-        reapGroup: (h, notAfterMs) => reapDeadGroup(h, { notAfterMs, kill: (pid, signal) => {
-          process.kill(pid, signal); swept = true;
+        reapGroup: (h, notAfterMs, options) => reapDeadGroup(h, { ...options, notAfterMs, kill: (pid, signal) => {
+          process.kill(pid, signal); if (signal === 'SIGKILL') swept = true;
         } }),
         releaseTaskClaim: () => {
           released = true;
           if (!swept) violations.push({ invariant: 'claim-released-before-group-sweep', detail: 'descendant left running when exclusion was released' });
         },
       });
+      await tick();
+      if (swept) await waitFor(() => !readProcStart(childPid));
+      // SIGKILL delivery need not complete synchronously; strict cleanup retries on the next tick.
+      if (!released) await tick();
       if (!released) violations.push({ invariant: 'no-recovery', detail: 'dead task owner was not recovered' });
       if (stopSignals) violations.push({ invariant: 'race-not-exercised', detail: 'stopHandle observed a live owner' });
-      if (swept) await waitFor(() => !readProcStart(childPid));
       if (store.read(task.id).job.status !== 'queued') violations.push({ invariant: 'no-requeue', detail: 'task was not requeued' });
     } catch (error) {
       violations.push({ invariant: 'probe-error', detail: error.message });
