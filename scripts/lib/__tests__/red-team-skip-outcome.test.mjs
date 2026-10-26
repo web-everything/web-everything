@@ -250,3 +250,30 @@ describe('PR 5890 not-owed settlement', () => {
     expect(f.io.publishNeedsYou).toHaveBeenCalledOnce();
   });
 });
+
+
+describe('stored-review not-owed settlement context', () => {
+  it('clears only the explicitly acceptance-checked recovery context once', () => {
+    const f = fixture(), context = { accepted: true, storedReviewPolicyClear: true };
+    expect(f.settle({ status: 'not-owed' }, context).outcome).toBe('policy-clear');
+    expect(f.comments[0].body).toContain('Red team not required on this head: not owed (stored review)');
+    expect(f.settle({ status: 'not-owed' }, context).outcome).toBe('already');
+    expect(f.io.postComment).toHaveBeenCalledOnce();
+  });
+  it.each([
+    { accepted: false }, { storedReviewPolicyClear: false }, { readHead: 'b'.repeat(40) },
+  ])('refuses incomplete stored-review authority %j', override => {
+    const f = fixture();
+    expect(f.settle({ status: 'not-owed' }, {
+      accepted: true, storedReviewPolicyClear: true, ...override,
+    }).outcome).toBe('non-policy');
+    expect(f.io.postComment).not.toHaveBeenCalled();
+  });
+  it.each(['deferredByGuard', 'deferredByCap'])('refuses a stored-review clear with %s', flag => {
+    const f = fixture();
+    expect(f.settle({ status: 'not-owed', [flag]: true }, {
+      accepted: true, storedReviewPolicyClear: true,
+    }).outcome).toBe('non-policy');
+    expect(f.io.postComment).not.toHaveBeenCalled();
+  });
+});
