@@ -87,6 +87,7 @@ import { listAgentsWithReviewJobs } from '../operations/review-job-store.mjs';
 import { countRearmComments } from './rearm-review.mjs';
 import { readFileSync } from 'node:fs';
 import { resolveStandDownHoldsAcrossHeads } from './stand-down.mjs';
+import { enrichPrsWithStandDownAutoProceed } from './stand-down-auto-proceed-io.mjs';
 import { resolveRoundCap, planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, resolveInfraRetryCooloffMs, resolveInfraTransientCooloffMs, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, resolveOperatorRulingExtraRounds, resolveRoundExtensionAnchor } from './reconcile-core.mjs';
 import { tryReadCompletion } from '../operations/completion-store.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
@@ -1469,6 +1470,7 @@ export function runReconcilePass({
   enrichCodeQL = enrichPrsWithCodeQL, // card x8cnbii — the drain's CodeQL hold is owed a ci-heal
   // Standing-ruling round grants (operator option B, 2026-10-20): verify the ruling + cited heads at read time.
   enrichStandingRulingGrants = enrichPrsWithStandingRulingGrants,
+  enrichStandDownAutoProceed = enrichPrsWithStandDownAutoProceed,
   // The fixer-escalation ladder (default + local override, models from the routing policy). Injectable for tests.
   loadLadder = loadFixerLadder,
   // Card xx0055i — the `fix.*` settings (policy cascade: env > we:scripts/settings/fix.json > built-in). Injectable.
@@ -1551,9 +1553,12 @@ export function runReconcilePass({
     repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, requiredChecks, readChecks, defaultBranch,
   });
   // Evidence is applied before every downstream CI reader, including main-red attribution.
-  let holdPrs = hydrated.prs;
+  const autoProceedPrs = enrichStandDownAutoProceed(hydrated.prs, {
+    repo: CONSTELLATION_REPOS[repoKey].slug, requiredChecks, env,
+  });
+  let holdPrs = autoProceedPrs;
   try {
-    holdPrs = excuseMergeGateHolds(hydrated.prs, {
+    holdPrs = excuseMergeGateHolds(autoProceedPrs, {
       repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug,
       readMergeGateVerdict, readFreeze, mergeGateSetting, env,
     });
