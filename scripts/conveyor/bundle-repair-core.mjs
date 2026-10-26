@@ -76,6 +76,7 @@ export const HOLD_RULES = Object.freeze({
 });
 
 const MINUTE = 60_000;
+const GIT_SHA = /^[0-9a-f]{40,64}$/i;
 
 /** PURE: the short clone name the operator uses (`wev-review-daemon` → `review`, `.lanes/we-drain-daemon/code` →
  *  `we-drain-code`). */
@@ -149,13 +150,16 @@ export function planBundleRepairs({ clones = [], ledger = [], settings = BUNDLE_
       if (!Number.isSafeInteger(retries) || retries < 0 || !Number.isFinite(prior.endedAt)) {
         hold(HOLD_RULES.ONE_PER_HOLD, 'dispatch-failed retry held: invalid dispatchRetries or endedAt'); continue;
       }
+      if (prior.escalationPending?.length) {
+        hold(HOLD_RULES.ONE_PER_HOLD, 'dispatch-failed retry held: its escalation alert is not yet published'); continue;
+      }
       if (retries >= s.maxDispatchRetries) {
         hold(HOLD_RULES.ONE_PER_HOLD, `dispatch retries used (${retries}/${s.maxDispatchRetries})`); continue;
       }
-      if (prior.dispatcherSha != null && (typeof prior.dispatcherSha !== 'string' || prior.dispatcherSha.trim() === '')) {
+      if (prior.dispatcherSha != null && !GIT_SHA.test(String(prior.dispatcherSha))) {
         hold(HOLD_RULES.ONE_PER_HOLD, 'dispatch-failed retry held: invalid dispatcherSha'); continue;
       }
-      const shaChanged = typeof dispatcherSha === 'string' && dispatcherSha.trim() !== '' && dispatcherSha !== prior.dispatcherSha;
+      const shaChanged = typeof dispatcherSha === 'string' && GIT_SHA.test(dispatcherSha) && dispatcherSha !== prior.dispatcherSha;
       const backoffElapsed = now - prior.endedAt >= s.dispatchRetryBackoffMinutes * MINUTE;
       if (!shaChanged && !backoffElapsed) {
         hold(HOLD_RULES.ONE_PER_HOLD, `dispatcher sha unchanged or unavailable; waiting ${s.dispatchRetryBackoffMinutes} min backoff after dispatch-failed`); continue;

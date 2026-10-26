@@ -100,8 +100,16 @@ describe('planBundleRepairs — bounded dispatch-failed retries', () => {
     expect(p.held).toEqual([expect.objectContaining({ rule: HOLD_RULES.ONE_PER_HOLD })]);
   });
 
-  it.each([[{ corrupt: true }], [''], [42]])('malformed stored dispatcherSha %j is held, never a sha-retry', (bad) => {
+  it.each([[{ corrupt: true }], [''], [42], ['not-a-git-sha']])('malformed stored dispatcherSha %j is held, never a sha-retry', (bad) => {
     expectHeld(plan(prior({ dispatcherSha: bad })), /invalid dispatcherSha/);
+  });
+
+  it('a dispatch-failed entry with an unpublished escalation alert is held, not replaced', () => {
+    expectHeld(plan(prior({ escalationPending: [{ reason: 'dispatch-failed' }] })), /not yet published/);
+  });
+
+  it('a malformed current sha never triggers a sha-retry', () => {
+    expectHeld(plan(prior(), { dispatcherSha: 'HEAD~1' }), /unchanged or unavailable/);
   });
 
   it.each(['cleared', 'repaired', 'shadow'])('%s stays sticky despite a new sha and elapsed backoff', (status) => {
