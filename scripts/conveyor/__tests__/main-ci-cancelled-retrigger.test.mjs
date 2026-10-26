@@ -16,7 +16,7 @@ function fixture(runs = [run()], initial = {}) {
   const options = { apply: true, now, repo: 'web-everything/web-everything', recordPath: 'fixture/main-ci-retrigger.json',
     readMainRuns: vi.fn(() => runs), rerun: vi.fn(() => ({ ok: true })),
     readRecord: vi.fn(() => structuredClone(record)),
-    writeRecord: vi.fn((path, value) => { record = structuredClone(value); }), emitEvent: vi.fn(), lock: fn => fn() };
+    writeRecord: vi.fn((path, value) => { record = structuredClone(value); }), emitEvent: vi.fn(), lock: fn => ({ locked: true, value: fn() }) };
   return { options, record: () => record, tick: () => sweepMainCancelledRetrigger(options) };
 }
 
@@ -501,7 +501,7 @@ describe('main cancelled CI retrigger: lock hardening', () => {
       const repoPath = mainRetriggerRecordPath('web-everything/frontierui', dirname(path));
       const rerun = vi.fn(() => ({ ok: true }));
       const result = sweepMainCancelledRetrigger({ apply: true, now, repo: 'web-everything/frontierui', recordPath: repoPath, rerun,
-        readMainRuns: () => [run({ updatedAt: '2026-10-26T11:30:00Z' })], emitEvent: vi.fn() });
+        readMainRuns: () => [run({ updatedAt: '2026-10-26T12:30:00Z' })], emitEvent: vi.fn() });
       expect(result.dispatch[0].action).toBe('main-ci-stuck');
       expect(rerun).not.toHaveBeenCalled();
     });

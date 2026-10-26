@@ -1479,9 +1479,10 @@ export function withMainRetriggerLock(recordPath, fn, { waitMs = 5000, staleMs =
     try { writeFileSync(lockPath, token, { flag: 'wx', mode: 0o600 }); break; }
     catch (e) {
       if (e.code !== 'EEXIST') throw e;
-      const reclaimed = reclaimStale();
+      // A reclaimed lock is retried at once (even with no wait budget); otherwise honour the deadline, then sleep.
+      if (reclaimStale()) continue;
       if (Date.now() >= deadline) return { locked: false };
-      if (!reclaimed) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
     }
   }
   try { return { locked: true, value: fn({ assertHeld }) }; }
