@@ -167,6 +167,8 @@ export async function loadDeliveryPolicy({ root = process.cwd(), env = process.e
       }
       if (lstatSync(absolute).isSymbolicLink()) throw Error(`Policy symlink refused: ${path}`);
       const real = realpathSync(absolute);
+      // Refuse symlinked parents as well as the leaf before consulting cached content.
+      if (!external && real !== resolve(realpathSync(root), relative(root, absolute))) throw Error(`Policy symlink refused: ${path}`);
       if (!external && !inside(root, real)) throw Error(`Outside root: ${path}`);
       const stat = statSync(real);
       if (!stat.isFile() || stat.size > MAX_SOURCE_BYTES) throw Error(`Unreadable or oversized policy source: ${path}`);

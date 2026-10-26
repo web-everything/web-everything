@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import ts from 'typescript';
@@ -224,6 +224,62 @@ describe('trust, confinement and reach set', () => {
     expect(result.mergeGate.onMainRed).toBe('halt');
     expect(result.warnings).toHaveLength(1);
     reach(result);
+  });
+  it.each([false, true])('refuses a directory-symlink pointer before and after a target swap (cached targets: %s)', async cachedTargets => {
+    for (const [variant, onMainRed] of [['strict', 'halt'], ['weak', 'off']]) {
+      put(`variants/${variant}/${rootFile}`, { onMainRed });
+      if (cachedTargets) {
+        put(rootFile, { mergeGate: `./variants/${variant}/${rootFile}` });
+        utimesSync(join(root, rootFile), 1000000000, variant === 'strict' ? 1000000000 : 1000000001);
+        expect((await load()).mergeGate.onMainRed).toBe(onMainRed);
+      }
+    }
+    const pointer = `./selector/${rootFile}`;
+    const source = JSON.stringify({ mergeGate: pointer });
+    put(rootFile, source);
+    utimesSync(join(root, rootFile), 1000000000, 1000000002);
+    const parse = vi.spyOn(JSON, 'parse');
+    symlinkSync('variants/strict', join(root, 'selector'), 'dir');
+    const strict = await load();
+    rmSync(join(root, 'selector'));
+    symlinkSync('variants/weak', join(root, 'selector'), 'dir');
+    const weak = await load();
+    const repeated = await load();
+    // The root document is cached across the swap; target trust must still be checked.
+    expect(parse.mock.calls.filter(([text]) => text === source)).toHaveLength(1);
+    for (const result of [weak, repeated, strict]) {
+      expect(result.mergeGate.onMainRed).toBe('halt');
+      expect(result.sources.mergeGate.onMainRed).toBe('default');
+      expect(result.warnings).toEqual([`Policy symlink refused: ${pointer}`]);
+      expect(result.filesRead).toEqual([defaultFile, rootFile]);
+    }
+  });
+  it('refuses a symlinked defaults parent before and after a strict-to-weak swap', async () => {
+    const source = readFileSync(join(root, defaultFile), 'utf8');
+    put('variants/weak/deliveryPolicyDefaults.ts', source.replace("onMainRed: 'halt'", "onMainRed: 'off'"));
+    renameSync(join(root, 'config'), join(root, 'variants/strict'));
+    symlinkSync('variants/strict', join(root, 'config'), 'dir');
+    const strict = await load();
+    rmSync(join(root, 'config'));
+    symlinkSync('variants/weak', join(root, 'config'), 'dir');
+    const weak = await load();
+    const repeated = await load();
+    for (const result of [weak, repeated, strict]) {
+      expect(policy(result)).toEqual(DELIVERY_POLICY_FAILSAFE);
+      expect(result.warnings).toEqual(['Policy defaults unreadable; using most-protective failsafe. Restore the human-gated defaults file.']);
+      expect(result.filesRead).toEqual([]);
+    }
+  });
+  it('preserves external WE_POLICY_CONFIG through a symlinked parent in daemon state', async () => {
+    const state = join(dir, 'state');
+    mkdirSync(join(state, 'variant'));
+    const target = join(state, 'variant/override.json');
+    writeFileSync(target, JSON.stringify({ mergeGate: { onMainRed: 'off' } }));
+    symlinkSync('variant', join(state, 'selector'), 'dir');
+    const result = await load({ env: { ...env, WE_POLICY_CONFIG: join(state, 'selector/override.json') } });
+    expect(result.mergeGate.onMainRed).toBe('off');
+    expect(result.warnings).toEqual([]);
+    expect(result.filesRead).toEqual([defaultFile, target]);
   });
   it('unregistered pointers are refused locally, at base, recursively and inside env config', async () => {
     put('ungated.json', { onMainRed: 'off' });
