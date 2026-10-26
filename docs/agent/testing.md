@@ -1570,6 +1570,20 @@ and cache replay assertions on that fallback. Keep the fake host's throttle stor
 suite cannot consume its budget. Numbering fixtures likewise pass a private `lockRoot` to the real
 mutex instead of acquiring the developer's shared drain lock.
 
+### Card numbers at birth
+
+`card-number-allocator.mjs` shares the drain numbering mutex and persists host reservations
+before releasing it. Allocator tests must inject temporary `lockRoot` and `statePath` values;
+remote-claim probes use an injected transport, never the live remote. Producers fall back to
+hash paths on unavailable or truncated canonical main or remote-ref evidence; `backlog.cardNumbering.remote=required`
+refuses instead. `WE_NUMBER_AT_BIRTH=off` retains hash naming. Numeric cards carry their fresh
+hash only in `bornAs`. The drain's existing hash-only selection leaves these cards untouched.
+CLI probes must also isolate `HOME` and Git transport so they cannot reserve production card numbers.
+The create-only `refs/card-ids/<HASH_RE id>` mapping and number reservation share one blob and
+one atomic push with empty-ref leases. Test replay with separate host state, two distinct ids,
+and races on either claim; neither ref may be replaced. Settings resolve through the shared
+cascade with each leaf’s source logged under `backlog.cardNumbering.*`.
+
 ### Dispatched conflict resolution
 
 `we:scripts/conveyor/resolve-conflict.mjs` uses index stages only inside a lane clone with
