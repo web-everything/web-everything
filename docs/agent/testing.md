@@ -8,9 +8,17 @@ full head/base SHAs; mock symbolic SHA strings no longer represent valid Git evi
 Retry fixtures need a trusted card store keyed by repository and head SHA; assigning a PR
 number after creation must reuse the initial card. Cover retries with and without a saved body.
 Body markers are display hints; publication must be confirmed again from the store/publisher.
-The admission marker carries a digest of the exact Size section it closes. When any text there
-changed (another heading, a comment, or an edit that keeps the note's grammar), retries remove
-only that marker and preserve the author's text. Ordinary retries still replace their own Size note.
+Size sections carry a keyed HMAC-SHA256 hex digest of the exact inner text after the begin
+line (including the newline before the end marker). The random 32-byte local secret lives
+in the Git common directory as `we-pr-size-secret`, created exclusively with mode 0600.
+Only one unambiguous pair with a valid HMAC under this secret is replaceable. Public SHA-256
+digests, missing/mismatched HMACs, edits (including line-ending changes), and malformed pairs
+preserve the entire body. If the secret cannot be read or created, append only; never fall
+back to a shared temporary secret. A different secret also appends conservatively. Identical
+retries stay stable. Tests inject `secret` or a temporary `secretPath`; never use the checkout
+secret. The HMAC authorizes display replacement only, never filing/publication authority (R115).
+Without pinned evidence, the display key hashes repo, PR-or-ref, requested SHA and base; it
+does not make an unresolved head eligible for trusted card lookup.
 pr-land re-reads the live body after card filing and skips the note when it changed or is unreadable.
 Author text is never truncated or escaped: past the forge body limit the note is skipped and the
 body returned unchanged (no edit), and every fallback, including the runner's outer catch, returns
