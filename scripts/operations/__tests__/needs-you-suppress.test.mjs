@@ -116,6 +116,23 @@ describe('gateRulingItems: suppress only live findings that already have rulings
     expect(opts.emitEvent).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['short head', { headRefOid: 'abc' }],
+    ['non-hex head', { headRefOid: 'z'.repeat(40) }],
+    ['null labels', { labels: null }],
+    ['object labels', { labels: {} }],
+    ['null body', { body: null }],
+    ['object body', { body: {} }],
+    ['invalid creation time', { createdAt: 'invalid' }],
+    ['missing creation time', { createdAt: undefined }],
+  ])('keeps incomplete live evidence without consulting the ledger: %s', async (_name, fields) => {
+    const original = item(), opts = options({ gh: fakeGh({ ...view, ...fields }) });
+    const { kept } = await feed.gateRulingItems([original], opts);
+    expect(kept).toEqual([original]);
+    expect(opts.lookup).not.toHaveBeenCalled();
+    expect(opts.emitEvent).not.toHaveBeenCalled();
+  });
+
   it('keeps every item without IO when the deadline has already expired', async () => {
     const originals = [item(), item(43)], opts = options({ deadlineMs: -1 });
     const { kept } = await feed.gateRulingItems(originals, opts);
@@ -181,19 +198,25 @@ describe('gateRulingItems: suppress only live findings that already have rulings
 });
 
 describe('gateRulingItems: reporter auto-resolved referral holds', () => {
-  it.each(['readable PR', 'unreadable PR', 'pending findings', 'mixed-case reason'])(
-    'drops incident #5922 with the exact suppression log and event without live IO: %s', async scenario => {
+  it.each(['readable PR', 'unreadable PR', 'pending findings', 'mixed-case reason', 'expired deadline'])(
+    'verifies live evidence before suppressing incident #5922: %s', async scenario => {
       const original = { ...item(5922), reason: scenario === 'mixed-case reason'
         ? autoResolvedReason.replace('referral hold auto-resolved', 'Referral Hold Auto-Resolved') : autoResolvedReason };
       const gh = scenario === 'unreadable PR' ? vi.fn(async () => { throw new Error('unreadable PR'); }) : fakeGh();
       const lookup = vi.fn(() => scenario === 'pending findings' ? { findings: [{ key: 'still-pending' }] } : null);
-      const opts = options({ gh, lookup });
+      const opts = options({ gh, lookup, ...(scenario === 'expired deadline' ? { deadlineMs: -1 } : {}) });
       const { kept } = await feed.gateRulingItems([original], opts);
-      expect(kept).toHaveLength(0);
-      expect(gh).not.toHaveBeenCalled();
-      expect(lookup).not.toHaveBeenCalled();
-      expectOnce(opts.log, `needs-you-feed ${repo}#5922 needs-you-suppressed: referral hold auto-resolved`);
-      expectOnce(opts.emitEvent, { kind: 'needs-you-suppressed', repo, pr: 5922, detail: 'referral hold auto-resolved' });
+      const retained = ['unreadable PR', 'pending findings', 'expired deadline'].includes(scenario);
+      expect([...kept]).toEqual(retained ? [original] : []);
+      if (scenario === 'expired deadline') expect(gh).not.toHaveBeenCalled();
+      else expect(gh).toHaveBeenCalled();
+      if (scenario === 'unreadable PR' || scenario === 'expired deadline') expect(lookup).not.toHaveBeenCalled();
+      else expectOnce(lookup, expect.objectContaining({ number: 5922, headRefOid: head }));
+      if (retained) expect(opts.emitEvent).not.toHaveBeenCalled();
+      else {
+        expectOnce(opts.log, `needs-you-feed ${repo}#5922 needs-you-suppressed: ${detail}`);
+        expectOnce(opts.emitEvent, event(5922));
+      }
     });
 
   it.each([null, { findings: [{ key: 'still-pending' }] }])(
@@ -210,7 +233,7 @@ describe('gateRulingItems: reporter auto-resolved referral holds', () => {
 });
 
 describe('runOnce liveGate ruling suppression', () => {
-  it('does not publish the auto-resolved incident #5922 to the feed file when live PR reads are unavailable', async () => {
+  it('publishes the auto-resolved incident #5922 when live PR reads are unavailable', async () => {
     const root = mkdtempSync(join(process.env.TMPDIR, 'needs-you-auto-resolved-'));
     roots.push(root);
     const path = join(root, 'needs-you-events.jsonl');
@@ -223,17 +246,19 @@ describe('runOnce liveGate ruling suppression', () => {
     const settings = feed.resolveSettings({ env: {}, home: root, file: { path, allowPrimary: true } });
     const result = await feed.runOnce({ exec, gh, home: root, checkoutRoot: root, settings,
       env: {}, now: new Date(at), log, liveGate: true });
-    expect(result.lines).toHaveLength(1);
-    expect(result.openKeys).toEqual([`${repo}#43@${head}:stood-down`]);
-    expect(feed.replay({ path })).toEqual([expect.objectContaining({ pr: 43, kind: 'stood-down' })]);
-    expect(readFileSync(path, 'utf8')).not.toContain('5922');
-    expect(readFileSync(path, 'utf8')).not.toContain('ruling-needed');
-    expect(gh).not.toHaveBeenCalled();
-    expect(log).toHaveBeenCalledWith(`needs-you-feed ${repo}#5922 needs-you-suppressed: referral hold auto-resolved`);
-    expectOnce(appendDaemonEvent, { kind: 'needs-you-suppressed', repo, pr: 5922, detail: 'referral hold auto-resolved' });
+    expect(result.lines).toHaveLength(2);
+    expect(result.openKeys).toEqual([`${repo}#5922@5e8db5677:ruling-needed`, `${repo}#43@${head}:stood-down`]);
+    expect(feed.replay({ path })).toEqual([
+      expect.objectContaining({ pr: 5922, kind: 'ruling-needed' }),
+      expect.objectContaining({ pr: 43, kind: 'stood-down' }),
+    ]);
+    expect(readFileSync(path, 'utf8')).toContain('ruling-needed');
+    expect(gh).toHaveBeenCalled();
+    expect(log.mock.calls.some(([line]) => line.includes('needs-you-suppressed:'))).toBe(false);
+    expect(appendDaemonEvent).not.toHaveBeenCalled();
   });
 
-  it('does not publish an already-ruled alert to the feed file, while retaining another alert', async () => {
+  it.each([false, true])('uses the live ledger despite an auto-resolved report (pending=%s)', async pending => {
     const root = mkdtempSync(join(process.env.TMPDIR, 'needs-you-suppress-'));
     roots.push(root);
     const path = join(root, 'needs-you-events.jsonl');
@@ -251,21 +276,27 @@ describe('runOnce liveGate ruling suppression', () => {
     // Prove the fixture actually transitions from pending to ruled using the real ledger.
     expect(rulingNeeded(asPr(comments.slice(0, 1)))?.findings).toHaveLength(1);
     expect(rulingNeeded(asPr(comments))).toBeNull();
-    const report = { ready: [], rulingNeeded: [{ repo, number: 42, head: staleHead }],
+    const report = { ready: [], rulingNeeded: [{ repo, number: 42, head: staleHead, reason: autoResolvedReason }],
       stoodDown: [{ repo, number: 43, head, reason: 'operator answer still needed' }] };
     const exec = vi.fn(async () => JSON.stringify(report));
-    const gh = fakeGh(view, [[comments[0]], [comments[1]]]);
+    const gh = fakeGh(view, pending ? [[comments[0]]] : [[comments[0]], [comments[1]]]);
     const settings = feed.resolveSettings({ env: {}, home: root, file: { path, allowPrimary: true } });
     const result = await feed.runOnce({ exec, gh, home: root, checkoutRoot: root, settings,
       env: {}, now: new Date(at), log: vi.fn(), liveGate: true });
     expect(exec).toHaveBeenCalledTimes(1);
     expect(gh).toHaveBeenCalledTimes(2);
-    expect(result.lines).toHaveLength(1);
-    expect(result.openKeys).toEqual([`${repo}#43@${head}:stood-down`]);
-    expect(feed.replay({ path })).toEqual([expect.objectContaining({ pr: 43, kind: 'stood-down' })]);
-    expect(readFileSync(path, 'utf8')).not.toContain('ruling-needed');
+    expect(result.lines).toHaveLength(pending ? 2 : 1);
+    expect(result.openKeys).toEqual(pending
+      ? [`${repo}#42@${staleHead}:ruling-needed`, `${repo}#43@${head}:stood-down`]
+      : [`${repo}#43@${head}:stood-down`]);
+    expect(feed.replay({ path })).toEqual([
+      ...(pending ? [expect.objectContaining({ pr: 42, kind: 'ruling-needed' })] : []),
+      expect.objectContaining({ pr: 43, kind: 'stood-down' }),
+    ]);
+    expect(readFileSync(path, 'utf8').includes('ruling-needed')).toBe(pending);
     expect(existsSync(feed.sidecarsOf(path).state)).toBe(true);
     expect(JSON.parse(readFileSync(feed.sidecarsOf(path).state, 'utf8')).openKeys).toEqual(result.openKeys);
-    expectOnce(appendDaemonEvent, event(42));
+    if (pending) expect(appendDaemonEvent).not.toHaveBeenCalled();
+    else expectOnce(appendDaemonEvent, event(42));
   });
 });

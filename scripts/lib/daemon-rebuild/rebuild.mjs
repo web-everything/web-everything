@@ -22,6 +22,20 @@ import { smokeAndAdopt } from './smoke.mjs';
 import { resolveVersionedContext, versionedRebuild } from '../daemon-version-runtime.mjs';
 import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
 
+// Positive classification: new/waiting reasons must never become failures by default.
+// Shared with the event-contract tests so every declared failure has a wiring regression.
+export const REBUILD_FAILURE_REASONS = Object.freeze([
+  'index-locked', 'rebuild-interrupted-unrecoverable', 'quarantined', 'not-on-main',
+  'head-unresolved', 'overlay-state-corrupt', 'fetch-failed', 'status-failed',
+  'main-unresolved', 'pinned-overlay-conflict', 'pinned-overlay-unavailable',
+  'established-overlay-conflict', 'untracked-collision', 'still-rejected',
+  'merge-in-progress', 'dirty', 'local-commits', 'root-changed-during-smoke',
+  'reset-failed', 'rollback-failed', 'rebuild-error', 'rebuild-job-queue-failed',
+  'dispatch-smoke-failed', 'candidate-worktree-failed', 'smoke-threw',
+  'smoke-reused-env-failed', 'smoke-harness-broken', 'smoke-rejected',
+  'rev-parse-failed', 'smoke-failed', 'not-built',
+]);
+
 // ── rebuildClone — the IO shell ──────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -41,22 +55,18 @@ import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
 export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options } = {}) {
   const result = await rebuildCloneInternal(options);
   try {
-    const idle = new Set([
-      'up-to-date', 'ready-pending', 'needs-build', 'no-op', 'already-adopted',
-      'ready-recorded', 'rebuild-in-progress',
-      'rebuild-job-started', 'rebuild-job-running', 'rebuild-job-spaced',
-      'already-head', 'already-on-main', 'no-change', 'none', 'in-main', 'skipped-unrelated',
-      'deps-job-running', 'deps-job-spaced', 'deps-job-started', 'applied-pinned', 'stack-contained',
-      'pinned-contained-in-applied', 'overlay-no-longer-wanted', 'clone-recloned', 'smoke-harness-broken-backoff',
-    ]);
+    const eventOptions = { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } };
     if (result.adopted || result.moved) {
-      await emitEvent({
-        kind: 'rebuild-adopted', daemon: basename(options.root), detail: { sha: result.head },
-      }, { env: options.env });
-    } else if (result.reason && !idle.has(result.reason)) {
+      if (typeof result.head === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(result.head)) {
+        await emitEvent({
+          kind: 'rebuild-adopted', daemon: basename(options.root), detail: { sha: result.head },
+        }, eventOptions);
+      }
+    } else if (REBUILD_FAILURE_REASONS.includes(result.reason)
+      || (typeof result.reason === 'string' && /^(?:error: |established-overlay-conflict: )/.test(result.reason))) {
       await emitEvent({
         kind: 'rebuild-failed', daemon: basename(options.root), detail: { reason: result.reason },
-      }, { env: options.env });
+      }, eventOptions);
     }
   } catch { /* Event failures must never change the rebuild outcome. */ }
   return result;
