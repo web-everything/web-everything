@@ -80,7 +80,8 @@ function fixture() {
   return { clone, env, init, a, b, mOld, push, tick, head, logs, pinnedLogs, smoke };
 }
 
-describe('overlay-pin — a moving overlay whose new tip conflicts stays at its adopted head', () => {
+// Real Git setup and repeated rebuild ticks need the same CI headroom as the explicit cases below.
+describe('overlay-pin — a moving overlay whose new tip conflicts stays at its adopted head', { timeout: 60_000 }, () => {
   it('holds without a pin alert or persisted notice when the pin commit-tree fails', async () => {
     const f = fixture();
     f.env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';
