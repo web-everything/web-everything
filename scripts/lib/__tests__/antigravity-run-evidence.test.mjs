@@ -1,8 +1,8 @@
-import { describe, it, expect } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { afterEach, describe, it, expect } from 'vitest';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { agyRunEvidence, readAgyHold, saveAgyHold } from '../antigravity-run-evidence.mjs';
+import { agyEvidenceError, agyRunEvidence, readAgyHold, saveAgyHold } from '../antigravity-run-evidence.mjs';
 import { normalizeJudgeTelemetry } from '../../operations/run-record.mjs';
 import { classifySeatCall } from '../../operations/review-extra-seats.mjs';
 const stream = (model, result) => [JSON.stringify({ event: 'init', init: { model } }), JSON.stringify({ event: 'result', result })].join('\n');
@@ -27,6 +27,94 @@ describe('agy observed model and quota evidence', () => {
       expect(readAgyHold('sonnet', { dir, now: Date.parse(row.quotaResetsAt) })).toBeNull();
       expect(classifySeatCall('agy-claude', { report: { ...row, events: { finalResponse: '{"findings":[]}' } } }).status).toBe('quota-exhausted');
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('agy family-keyed quota holds and legacy observations', () => {
+  let dir;
+  const setup = () => { dir = mkdtempSync(join(tmpdir(), 'agy-family-hold-test-')); return dir; };
+  const rowFor = (model) => agyRunEvidence({ requestedModel: model, now: 0,
+    stdout: stream(model, { status: 'ERROR', error: 'RESOURCE_EXHAUSTED. Resets in 1h.' }) });
+  afterEach(() => { if (dir) rmSync(dir, { recursive: true, force: true }); });
+
+  it.each([
+    ['claude-sonnet-4-6', 'anthropic', 'claude-opus-4-6', 'gemini-3.1-pro-high'],
+    ['gemini-3.1-pro-high', 'google', 'gemini-3.1-pro-high', 'claude-sonnet-4-6'],
+  ])('%s hold blocks its family and leaves the other family available', (heldModel, heldBackend, sameFamily, otherFamily) => {
+    setup();
+    saveAgyHold(rowFor(heldModel), { dir });
+    expect(readAgyHold(sameFamily, { dir, now: 1000 })).toMatchObject({ requestedModel: sameFamily,
+      servedModel: 'unknown', servedBackend: 'unknown', modelEvidence: 'not-launched',
+      fallbackDecision: 'skip-quota-hold', heldBackend, heldModel });
+    expect(readAgyHold(otherFamily, { dir, now: 1000 })).toBeNull();
+  });
+
+  it.each([
+    ['claude-sonnet-4-6', 'anthropic'], ['gemini-3.1-pro-high', 'google'], ['experimental-model', 'unknown'],
+  ])('default and unknown launches scan the %s backend folder', (heldModel, heldBackend) => {
+    setup();
+    saveAgyHold(rowFor(heldModel), { dir });
+    for (const model of [undefined, 'unrecognized-model']) {
+      const hold = readAgyHold(model, { dir, now: 1000 });
+      expect(hold).toMatchObject({ requestedModel: model || 'default', heldBackend, heldModel });
+      expect(agyEvidenceError(hold).message).toContain(`(held by ${heldBackend} model ${heldModel})`);
+      expect(agyEvidenceError(hold).telemetry).toBe(hold);
+    }
+  });
+
+  it('uses the reported held model, falling back to the request when init was unavailable', () => {
+    setup();
+    const row = { ...rowFor('claude-sonnet-4-6'), servedModel: 'claude-opus-4-6' };
+    saveAgyHold(row, { dir });
+    expect(readAgyHold('sonnet', { dir, now: 1000 })).toMatchObject({ heldModel: 'claude-opus-4-6' });
+    saveAgyHold({ ...row, servedModel: 'unknown', servedBackend: 'unknown', quotaResetsAt: new Date(7200000).toISOString() }, { dir });
+    expect(readAgyHold('sonnet', { dir, now: 1000 })).toMatchObject({ heldBackend: 'anthropic', heldModel: 'claude-sonnet-4-6' });
+  });
+
+  it.each([
+    ['claude-opus-4-6', 'gemini-3.1-pro-high', 'anthropic', 'sonnet', 'gemini-3.1-pro-high'],
+    ['unknown', 'gemini-3.1-pro-high', 'google', 'gemini-3.1-pro-high', 'sonnet'],
+    [undefined, 'claude-sonnet-4-6', 'anthropic', 'opus', 'gemini-3.1-pro-high'],
+  ])('attributes legacy served %s / requested %s to its known backend', (servedModel, requestedModel, heldBackend, blocked, available) => {
+    setup();
+    const row = { ...rowFor(requestedModel), servedModel };
+    const file = join(dir, 'legacy.json');
+    const original = JSON.stringify(row);
+    writeFileSync(file, original);
+    const heldModel = servedModel && servedModel !== 'unknown' ? servedModel : requestedModel;
+    expect(readAgyHold(blocked, { dir, now: 1000 })).toMatchObject({ heldBackend, heldModel });
+    expect(readAgyHold(available, { dir, now: 1000 })).toBeNull();
+    expect(readAgyHold(undefined, { dir, now: 1000 })).toMatchObject({ heldBackend, heldModel });
+    expect(readFileSync(file, 'utf8')).toBe(original);
+    expect(readdirSync(dir)).toEqual(['legacy.json']);
+    expect(readAgyHold(blocked, { dir, now: Date.parse(row.quotaResetsAt) })).toBeNull();
+  });
+
+  it.each([
+    ['experimental-served', 'experimental-request', 'experimental-served'],
+    ['unknown', 'experimental-request', 'experimental-request'],
+    [undefined, undefined, 'unknown'],
+  ])('keeps unattributed legacy served %s / requested %s global', (servedModel, requestedModel, heldModel) => {
+    setup();
+    writeFileSync(join(dir, 'legacy.json'), JSON.stringify({ servedModel, requestedModel,
+      quotaResetsAt: new Date(3600000).toISOString(), quotaState: 'exhausted' }));
+    for (const model of ['claude-sonnet-4-6', 'gemini-3.1-pro-high', undefined, 'unrecognized-model']) {
+      expect(readAgyHold(model, { dir, now: 1000 })).toMatchObject({ heldBackend: 'unknown', heldModel,
+        fallbackDecision: 'skip-quota-hold' });
+    }
+  });
+
+  it('ignores expired legacy holds and root JSON without a quota reset', () => {
+    setup();
+    writeFileSync(join(dir, 'expired.json'), JSON.stringify({ quotaResetsAt: new Date(1000).toISOString() }));
+    writeFileSync(join(dir, 'unrelated.json'), JSON.stringify({ requestedModel: 'sonnet' }));
+    expect(readAgyHold(undefined, { dir, now: 1000 })).toBeNull();
+  });
+
+  it('refuses malformed legacy evidence rather than silently launching', () => {
+    setup();
+    writeFileSync(join(dir, 'legacy.json'), '{');
+    expect(() => readAgyHold('gemini-3.1-pro-high', { dir, now: 1000 })).toThrow(SyntaxError);
   });
 });
 

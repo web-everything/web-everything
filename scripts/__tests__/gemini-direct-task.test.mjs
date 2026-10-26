@@ -534,11 +534,14 @@ describe('runAgyDirectExec / geminiDirectTask — injected process mechanics', (
   it('still enforces persisted quota holds before a real process launch', async () => {
     const dir = tempDir();
     vi.stubEnv('ANTIGRAVITY_QUOTA_DIR', join(dir, 'quota'));
+    const quotaResetsAt = new Date(Date.now() + 60_000).toISOString();
     saveAgyHold({ requestedModel: 'gemini-3.1-pro', servedBackend: 'google', quotaState: 'exhausted',
-      quotaResetsAt: new Date(Date.now() + 60_000).toISOString() });
+      quotaResetsAt });
     const result = await runAgyDirectExec({ dir, task: 't', logFile: join(dir, 'run.jsonl'), stream: false,
       cli: join(dir, 'must-not-launch') });
-    expect(result).toMatchObject({ code: 1, fallbackDecision: 'skip-quota-hold', modelEvidence: 'not-launched' });
+    expect(result).toMatchObject({ code: 1, fallbackDecision: 'skip-quota-hold', modelEvidence: 'not-launched',
+      heldBackend: 'google', heldModel: 'gemini-3.1-pro' });
+    expect(result.stderr).toBe(`agy quota exhausted: skip-quota-hold until ${quotaResetsAt} (held by google model gemini-3.1-pro)`);
   });
 
   it('recovers the init UUID after SIGKILL and resumes once with a fresh budget and no task replay', async () => {

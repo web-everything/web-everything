@@ -1,16 +1,16 @@
 /**
  * @file Hermetic prototype admission proofs.
  * WHY (incident 2026-10-22): pin main preservation, ready evidence, adopt-before-remove, stale
- * replacement, and adoption refusal with injected doubles, plus real filesystem refusal persistence.
+ * replacement, and adoption refusal with injected doubles, plus real Git adoption probes.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import { runInNewContext } from 'node:vm';
-import { withRealRepo, withBareOrigin } from './helpers/real-repo.mjs';
+import { withBareOrigin } from './helpers/real-repo.mjs';
 import { createPrototypeLoader, defaultDeps } from '../prototype-load-io.mjs';
 import { changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
 import { createRegistry } from '../registry.mjs';
@@ -70,10 +70,18 @@ function fixture(options = {}) {
       }
       if (args.includes('--check')) {
         if (options.checkRaw) return options.checkRaw;
-        if (options.unverifiable === ref) return fail(1, JSON.stringify({ check: { ok: false } }));
+        if (options.unverifiable === ref) return fail(1, JSON.stringify({ check: { ok: false, reason: 'ref-unresolved' } }), 'WARNING overlay NO PR');
+        if (options.checkBeforeFetch === ref && !establishedFetches.has(ref)) return fail(1, JSON.stringify({ check: { ok: false, reason: 'ref-unresolved' } }));
         const clean = !(options.conflicts || []).includes(ref);
         const data = JSON.stringify({ check: { ok: true, clean, candSha: remoteTip, ...(clean ? {} : { files: options.checkFiles?.[ref] ?? ['x'], conflicting: [{ ref: 'lane/other' }] }) }, wouldRegister: clean });
         if (options.advanceAfterCheck && ref === (options.behind ? 'lane/new-m1' : BASE.branch)) remoteTip = TREE;
+        if (options.noPrWarning === ref) return fail(1, data, 'WARNING overlay NO PR');
+        if (options.checkExit?.ref === ref && options.checkExit.code !== 0) {
+          if (options.checkExit.message) throw Object.assign(new Error(options.checkExit.message), {
+            status: options.checkExit.code, stdout: data, stderr: options.checkExit.stderr,
+          });
+          return fail(options.checkExit.code, data, options.checkExit.stderr);
+        }
         return clean ? data : fail(3, data);
       }
       if (action === 'add' && options.addFails) return fail(1);
@@ -102,6 +110,7 @@ function fixture(options = {}) {
     }
     if (args[0] === 'fetch') {
       const ref = args[2]?.replace(/^\+refs\/heads\//, '').split(':')[0];
+      if (options.staleFetchFails === ref) return fail(1);
       if (ref === BASE.branch && tipReads > 0 && options.advanceEstablishedBeforeSwap) establishedAdvanced = true;
       if (establishedTips.has(ref)) {
         const count = (establishedFetches.get(ref) || 0) + 1;
@@ -122,6 +131,11 @@ function fixture(options = {}) {
       return options.tip || remoteTip;
     }
     if (args[0] === 'diff') {
+      if (args[1] === '--name-only') {
+        expect(args).toEqual(['diff', '--name-only', '--no-renames', '--ignore-submodules=none', '--no-ext-diff', '--no-textconv',
+          '-z', 'origin/main...origin/lane/old']);
+        return options.landedPathsError ? fail(128) : options.landedPaths ?? 'x\0';
+      }
       const ref = args.at(-1).startsWith('origin/main...origin/') ? args.at(-1).slice('origin/main...origin/'.length) : null;
       if (registrations.has(ref)) {
         expect(args.slice(1, 4)).toEqual(['--name-status', '-z', `origin/main...origin/${ref}`]);
@@ -154,8 +168,22 @@ function fixture(options = {}) {
       }
       return (options.contained || []).includes(args[2].slice(7)) ? '' : fail(1);
     }
+    if (args[0] === '--literal-pathspecs') {
+      expect(args.slice(1, 7)).toEqual(['diff', '--quiet', '--no-ext-diff', '--no-textconv', '--no-renames', '--ignore-submodules=none']);
+      expect(['origin/main', candidateSha].includes(args[7])).toBe(true);
+      expect(args.slice(8, 10)).toEqual(['origin/lane/old', '--']);
+      const proof = options.landedProof?.[args[7]];
+      if (proof && typeof proof === 'object') return fail(proof.code, proof.stdout || '');
+      return proof ?? '';
+    }
     if (args[0] === 'merge-tree') return options.mergeConflict ? fail(1, `${TREE}\n100644 ${SHA} 1\tx\nCONFLICT (content): Merge conflict in x\n`) : TREE;
-    if (args[0] === 'ls-remote') return options.remote || '';
+    if (args[0] === 'ls-remote') {
+      if (args[1] === '--exit-code') {
+        expect(args).toEqual(['ls-remote', '--exit-code', 'origin', `refs/heads/${options.staleFetchFails}`]);
+        if (options.staleRemoteCode) return fail(options.staleRemoteCode);
+      }
+      return options.remote || '';
+    }
     if (args[0] === 'commit-tree') return MERGE;
     if (args[0] === 'push') { remoteTip = MERGE; return ''; }
     throw new Error(`unexpected command ${cmd} ${args}`);
@@ -536,21 +564,6 @@ describe('default combined-tree test proof', () => {
 });
 
 describe('prototype-load', () => {
-  it('refuses missing readiness evidence and persists the refusal on a real filesystem', async () => {
-    await withRealRepo(async ({ root }) => {
-      const recordPath = join(root, 'audit', 'prototype-load.jsonl');
-      const load = createPrototypeLoader({ ...defaultDeps(),
-        env: { HOME: root },
-        settings: { ...settings, workspaceRoot: root, recordPath, readyRecordPath: join(root, 'missing-ready.jsonl') },
-      });
-      const result = await load(BASE);
-      expect(result).toMatchObject({ ok: false, stopReason: 'no-ready', registered: false, adopted: false });
-      const records = readFileSync(recordPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-      expect(records).toHaveLength(1);
-      expect(records[0]).toMatchObject({ ...BASE, ok: false, stopReason: 'no-ready', registered: false, adopted: false });
-    });
-  });
-
   it.each([
     ['missing', ''], ['wrong sha', JSON.stringify({ ref: BASE.branch, sha: TREE, tests: 'green', audit: 'NOT WEAKENED' })],
     ['weakened', JSON.stringify({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'WEAKENED' })],
@@ -880,7 +893,6 @@ describe('prototype-load', () => {
     const combinedTests = { command: 'fixture-related-tests', result: '3 passed', testCount: 3 };
     const f = fixture({ list: ['lane/old', 'lane/also'], conflicts: ['lane/old', 'lane/also'],
       staleChanged: { 'lane/old': 'M\0z-old.mjs\0M\0x\0', 'lane/also': 'M\0x\0M\0a-also.mjs\0' },
-      cherry: { 'lane/also': `- ${SHA}\n` },
       combinedTest: { ok: true, ...combinedTests } });
     const r = await f.run();
     expect(f.combinedTest).toHaveBeenCalledTimes(1);
@@ -890,7 +902,7 @@ describe('prototype-load', () => {
     expect(r.combinedTests).toEqual(combinedTests);
     expect(r.staleTolerated).toEqual([
       { ref: 'lane/old', landedByContent: false, why: expect.stringMatching(/combined/i), combinedTests },
-      { ref: 'lane/also', landedByContent: true, why: expect.stringMatching(/combined/i), combinedTests },
+      { ref: 'lane/also', landedByContent: false, why: expect.stringMatching(/combined/i), combinedTests },
     ]);
     expect(mutations(f, 'add')).toHaveLength(1);
     expect(mutations(f, 'remove')).toEqual([]);
@@ -947,14 +959,105 @@ describe('prototype-load', () => {
     expect(r.message).toContain('candidate-not-clean');
     expect(mutations(f, 'add')).toEqual([]);
   });
-  it('flags a content-landed stale ref as harmless in staleTolerated', async () => {
-    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] }, staleChanged: { 'lane/old': 'M\0old-only.mjs\0' }, cherry: { 'lane/old': `- ${SHA}\n- ${TREE}\n` } });
+  it.each([
+    ['main differs', { 'origin/main': { code: 1 } }],
+    ['candidate differs', { [SHA]: { code: 1 } }],
+    ['unreadable proof', { 'origin/main': { code: 128 } }],
+    ['spawn or buffer failure', { 'origin/main': { code: -1 } }],
+    ['partial proof with diagnostics', { 'origin/main': `${TREE}\npartial` }],
+  ])('does not waive a patch-id match without exact content containment: %s', async (_, landedProof) => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'],
+      cherry: { 'lane/old': `- ${SHA}\n` }, landedProof });
     const r = await f.run();
-    expect(r.ok).toBe(true);
-    expect(r.staleTolerated).toEqual([{ ref: 'lane/old', landedByContent: true, why: expect.stringMatching(/\S/) }]);
+    expect(r).toMatchObject({ ok: false, registered: false, adopted: false,
+      stopReason: 'stale-registration', blocking: ['lane/old'] });
+    expect(r.staleChecks['lane/old']).toMatchObject({ ok: true, clean: false });
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+  });
+  it.each([{ landedPaths: '' }, { landedPaths: 'x' }, { landedPaths: 'x\0\0' }, { landedPaths: 'x\uFFFD.mjs\0' }, { landedPathsError: true }])('does not waive a patch-id match with incomplete or lossy path evidence: %j', async (options) => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], cherry: { 'lane/old': `- ${SHA}\n` }, ...options });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'stale-registration', registered: false, adopted: false });
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+  });
+  it('compares exact tree entries including gitlinks with literal paths and ignores merge-driver results', async () => {
+    const paths = ['module', 'x[1].mjs', ':(exclude)x', '--option', 'line\nbreak', 'quote"`', 'a\rb', 'a\u2028b', 'e\u0301.mjs'];
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], cherry: { 'lane/old': `- ${SHA}\n` },
+      landedPaths: paths.join('\0') + '\0', landedProof: { 'origin/main': { code: 1 } } });
+    // The fixture's merge-tree returns a clean unchanged tree, as a keep-ours
+    // merge driver would. It cannot substitute for exact tree-entry comparison.
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'stale-registration', registered: false, adopted: false });
+    expect(f.calls.find(c => c.cmd === 'git' && c.args[0] === '--literal-pathspecs')?.args).toEqual([
+      '--literal-pathspecs', 'diff', '--quiet', '--no-ext-diff', '--no-textconv', '--no-renames', '--ignore-submodules=none',
+      'origin/main', 'origin/lane/old', '--', ...paths,
+    ]);
+    expect(f.calls.some(c => c.cmd === 'git' && c.args[0] === 'merge-tree')).toBe(false);
+    expect(mutations(f, 'add')).toEqual([]);
+  });
+  it.each(['ab', 'a\tb'])('protects conflicting live string content ignored by Git patch-id: %j', async (oldValue) => {
+    const root = mkdtempSync(join(tmpdir(), 'prototype-patch-id-'));
+    try {
+      const base = join(root, 'base'), old = join(root, 'old'), main = join(root, 'main'), candidate = join(root, 'candidate');
+      for (const [path, value] of [[base, 'a'], [old, oldValue], [main, 'a b'], [candidate, 'a b c']]) {
+        writeFileSync(path, `export const s = "${value}";\n`);
+      }
+      const patchId = (path) => {
+        let patch;
+        try { execFileSync('git', ['diff', '--no-index', '--', base, path], { encoding: 'utf8', stdio: 'pipe' }); }
+        catch (e) { expect(e.status).toBe(1); patch = e.stdout; }
+        // Use the same file names: only the content difference participates in this probe.
+        patch = String(patch).replaceAll(path, old);
+        return execFileSync('git', ['patch-id', '--stable'], { input: patch, encoding: 'utf8' }).split(' ')[0];
+      };
+      expect(patchId(old)).toMatch(/^[a-f0-9]{40}$/);
+      expect(patchId(old)).toBe(patchId(main));
+      const landedProof = {};
+      for (const [target, path] of [['origin/main', main], [SHA, candidate]]) {
+        try { execFileSync('git', ['merge-file', '-p', path, base, old], { encoding: 'utf8', stdio: 'pipe' }); }
+        catch (e) { expect(e.status).toBe(1); landedProof[target] = { code: e.status, stdout: e.stdout }; }
+        expect(landedProof[target]).toBeDefined();
+        let comparisonCode = 0;
+        try { execFileSync('git', ['diff', '--no-index', '--quiet', '--no-ext-diff', '--no-textconv', '--', path, old], { encoding: 'utf8', stdio: 'pipe' }); }
+        catch (e) { expect(e.status).toBe(1); comparisonCode = e.status; landedProof[target] = { code: e.status }; }
+        expect(comparisonCode).toBe(1);
+      }
+      const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], cherry: { 'lane/old': `- ${SHA}\n` }, landedProof });
+      expect(await f.run()).toMatchObject({ ok: false, registered: false, adopted: false,
+        stopReason: 'stale-registration', blocking: ['lane/old'] });
+      expect(mutations(f, 'add')).toEqual([]);
+      expect(mutations(f, 'remove')).toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('adopts with a content-landed stale ref without pairwise checks or ancestry-only swap', async () => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] }, staleChanged: { 'lane/old': 'M\0old-only.mjs\0' }, landedPaths: 'old-only.mjs\0', cherry: { 'lane/old': `- ${SHA}\n- ${TREE}\n` } });
+    const r = await f.run();
+    expect(r).toMatchObject({ ok: true, registered: true, adopted: true, stopReason: null, contained: [],
+      swap: { contained: [], removed: [] }, staleChecks: { 'lane/old': { skipped: 'landed', included: false, landed: true } } });
+    expect(r.swap.failed).toBeUndefined();
+    expect(r.staleTolerated).toEqual([{ ref: 'lane/old', landedByContent: true, why: expect.stringMatching(/exact.*main.*candidate/) }]);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect([...f.registrations.keys()]).toEqual(['lane/old']);
+    expect(f.calls.filter(c => c.cmd === 'node' && c.args.includes('--check'))).toHaveLength(1);
     expect(f.calls.some(c => c.cmd === 'git' && c.args.join(' ') === 'cherry origin/main origin/lane/old')).toBe(true);
+    for (const target of ['origin/main', SHA]) {
+      expect(f.calls.some(c => c.cmd === 'git' && c.args.join(' ') === `--literal-pathspecs diff --quiet --no-ext-diff --no-textconv --no-renames --ignore-submodules=none ${target} origin/lane/old -- old-only.mjs`)).toBe(true);
+    }
     expect(f.records[0].staleTolerated).toEqual(r.staleTolerated);
     expect(mutations(f, 'add')).toHaveLength(1);
+  });
+  it.each([
+    ['overlapping paths', { staleChanged: { 'lane/old': 'M\0x\0' } }],
+    ['unresolved pairwise preview', { unverifiable: 'lane/old' }],
+    ['already registered candidate', { list: [BASE.branch, 'lane/old'] }],
+  ])('retains a landed-only registration without a swap failure: %s', async (_, options) => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], cherry: { 'lane/old': `- ${SHA}\n` }, ...options });
+    const r = await f.run();
+    expect(r).toMatchObject({ ok: true, adopted: true, stopReason: null, contained: [], swap: { contained: [], removed: [] } });
+    expect(r.swap.failed).toBeUndefined();
+    expect(f.calls.filter(c => c.cmd === 'node' && c.args.includes('--check'))).toHaveLength(1);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(f.registrations.has('lane/old')).toBe(true);
   });
   it('a stale ref with unlanded commits is tolerated but flagged landedByContent=false', async () => {
     const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], checkFiles: { 'lane/old': ['old-only.mjs'] }, staleChanged: { 'lane/old': 'M\0old-only.mjs\0' }, cherry: { 'lane/old': `- ${SHA}\n+ ${TREE}\n` } });
@@ -976,10 +1079,93 @@ describe('prototype-load', () => {
     expect(r.removedTips).toEqual({});
     expect([...f.registrations.keys()]).toEqual(['lane/old']);
   });
+  it('adopts a candidate containing two mutually conflicting stale refs without pairwise checks', async () => {
+    const refs = ['lane/old', 'lane/also'];
+    const f = fixture({ list: refs, contained: refs, conflicts: refs, checkBeforeFetch: 'lane/old' });
+    const r = await f.run();
+    expect(r).toMatchObject({ registered: true, adopted: true, stopReason: 'swap-remove-failed', contained: refs, swap: { contained: refs } });
+    expect(r.staleChecks).toEqual(Object.fromEntries(refs.map(ref => [ref, { skipped: 'contained', included: true, landed: false }])));
+    expect(f.calls.filter(c => c.cmd === 'node' && c.args.includes('--check')).map(c => c.args.find(a => a.startsWith('--ref=')))).toEqual([`--ref=${BASE.branch}`]);
+  });
+  it('fetches a non-contained stale ref before checking it', async () => {
+    const f = fixture({ list: ['lane/old'], checkBeforeFetch: 'lane/old' });
+    expect(await f.run()).toMatchObject({ ok: true, contained: [] });
+  });
+  it('fails closed on a genuinely unresolved non-contained stale ref despite a no-PR warning', async () => {
+    const f = fixture({ list: ['lane/old'], unverifiable: 'lane/old' });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'check-unverifiable', staleChecks: { 'lane/old': { ok: false, reason: 'ref-unresolved' } } });
+    expect(mutations(f, 'add')).toEqual([]);
+  });
+  it.each([BASE.branch, 'lane/old'])('accepts a clean JSON check with a nonzero no-PR warning: %s', async (noPrWarning) => {
+    const f = fixture({ list: ['lane/old'], noPrWarning, safetySettings: { overlaySafety: { noPr: 'warn' } } });
+    expect(await f.run()).toMatchObject({ ok: true, registered: true, adopted: true, stopReason: null });
+  });
+  it.each([BASE.branch, 'lane/old'].flatMap(ref => [0, 1, 2, 70, 128, -1].flatMap(code =>
+    ['', 'daemon-overlay: WARNING — lane/new is being added with NO PR.'].map(stderr => ({ ref, code, stderr })),
+  )))('bounds clean check exits: $ref code=$code stderr=$stderr', async (checkExit) => {
+    const f = fixture({ list: ['lane/old'], checkExit });
+    const accepted = checkExit.code === 0 || (checkExit.code === 1 && checkExit.stderr.includes('WARNING'));
+    expect(await f.run()).toMatchObject({ ok: accepted, registered: accepted, adopted: accepted,
+      stopReason: accepted ? null : 'check-unverifiable' });
+    expect(mutations(f, 'add')).toHaveLength(accepted ? 1 : 0);
+  });
+  it.each([BASE.branch, 'lane/old'].flatMap(ref => [
+    { ref, code: 1, stderr: '', message: 'WARNING overlay NO PR' },
+    { ref, code: 1, stderr: 'WARNING unrelated error' },
+    { ref, code: 1, stderr: 'NO PR' },
+    { ref, code: 1, stderr: 'WARNING unrelated error\nNO PR' },
+  ]))('rejects incomplete warning evidence: $ref stderr=$stderr message=$message', async (checkExit) => {
+    const f = fixture({ list: ['lane/old'], checkExit });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, adopted: false, stopReason: 'check-unverifiable' });
+    expect(mutations(f, 'add')).toEqual([]);
+  });
+  it.each([
+    ['included in the candidate', { contained: ['lane/old'] }],
+    ['landed by content', { cherry: { 'lane/old': `- ${SHA}\n` } }],
+  ])('fails closed when a deleted remote ref has only cached evidence %s', async (_, evidence) => {
+    const f = fixture({ list: ['lane/old'], staleFetchFails: 'lane/old', staleRemoteCode: 2, ...evidence });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, adopted: false,
+      staleChecks: {}, stopReason: 'check-unverifiable', fallback: expect.stringContaining('authoritative registered tip is unavailable') });
+    expect(f.calls.filter(c => c.cmd === 'git' && c.args[0] === 'ls-remote' && c.args[1] === '--exit-code')).toHaveLength(1);
+    expect(f.calls.filter(c => c.cmd === 'node' && c.args.includes('--check')).map(c => c.args.find(a => a.startsWith('--ref=')))).toEqual([`--ref=${BASE.branch}`]);
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+  });
+  it('fails closed when a deleted remote ref has unlanded changes absent from the candidate', async () => {
+    const f = fixture({ list: ['lane/old'], staleFetchFails: 'lane/old', staleRemoteCode: 2 });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, adopted: false,
+      stopReason: 'check-unverifiable', detail: 'could not fetch registered ref lane/old', staleChecks: {} });
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+  });
+  it('rejects deleted remote ref when cached tip predates registered tip', async () => {
+    // The cached tip appears contained, but the listing claims a newer, uncontained
+    // SHA. The registry has no authoritative tip contract; neither is safe evidence.
+    const f = fixture({ list: ['lane/old'], contained: ['lane/old'], staleFetchFails: 'lane/old', staleRemoteCode: 2,
+      listRaw: JSON.stringify({ list: [{ ref: 'lane/old', sha: TREE }] }) });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, adopted: false, stopReason: 'check-unverifiable' });
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+    expect(f.registrations.has('lane/old')).toBe(true);
+    expect(f.calls.some(c => c.cmd === 'git' && ['cherry', 'rev-parse', 'merge-base'].includes(c.args[0])
+      && c.args.some(arg => arg.includes('origin/lane/old')))).toBe(false);
+  });
+  it.each([0, 1, 128])('fails closed when fetching a registered ref fails and ls-remote exits %s even if containment would pass', async (staleRemoteCode) => {
+    const f = fixture({ list: ['lane/old'], contained: ['lane/old'], staleFetchFails: 'lane/old', staleRemoteCode });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'check-unverifiable', detail: 'could not fetch registered ref lane/old' });
+    expect(f.calls.filter(c => c.cmd === 'git' && c.args[0] === 'ls-remote' && c.args[1] === '--exit-code')).toHaveLength(1);
+    expect(mutations(f, 'add')).toEqual([]);
+    expect(mutations(f, 'remove')).toEqual([]);
+  });
+  it('does not accept a conflicting JSON check with a no-PR warning exit', async () => {
+    const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], noPrWarning: 'lane/old' });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'check-unverifiable' });
+    expect(mutations(f, 'add')).toEqual([]);
+  });
   it('contained stale and clean registrations remain after replacement adoption', async () => {
     const f = fixture({ list: ['lane/old', 'lane/also'], contained: ['lane/old', 'lane/also'], conflicts: ['lane/old'] }); const r = await f.run();
     expect(r).toMatchObject({ ok: false, adopted: true, stopReason: 'swap-remove-failed', detail: 'mutable-registration', removed: [], removedTips: {}, swap: { retained: ['lane/old', 'lane/also'] } });
-    expect(r.stale).toEqual(['lane/old']);
+    expect(r.stale).toEqual([]);
     const index = f.calls.findIndex((c) => c.cmd === 'node' && c.args[1] === 'add' && !c.args.includes('--check'));
     const adopted = f.calls.findLastIndex((c) => c.args[0] === '-C');
     expect(adopted).toBeGreaterThan(index);
@@ -1016,7 +1202,8 @@ describe('prototype-load', () => {
     expect(r).toMatchObject({ ok: false, stopReason, registered: true, adopted: false, removed: [] });
     expect(mutations(f, 'remove')).toEqual([]);
     expect(r.fallback).toContain('Prior registrations retained: lane/old, lane/also.');
-    expect(r.fallback).toContain('If stale registrations block adoption, rebase and retest them');
+    expect(r.staleChecks['lane/old']).toEqual({ skipped: 'contained', included: true, landed: false });
+    expect(r.fallback).not.toContain('If stale registrations block adoption');
   });
   it.each([false, true])('retains registrations while adoption is pending and if the wait is interrupted (already registered: %s)', async (already) => {
     const f = fixture({
@@ -1202,7 +1389,6 @@ describe('prototype-load', () => {
     expect(calls).toEqual([
       ['add', clone, '--ref=lane/new', '--check', `--expected-sha=${SHA}`, '--json'],
       ['list', clone, '--json'],
-      ['add', clone, '--ref=lane/old', '--check', '--json'],
       ['add', clone, '--ref=lane/new', `--expected-sha=${SHA}`, '--reason=tested change', '--by=tester', '--json'],
     ]);
     const addIndex = f.calls.findIndex((c) => c.cmd === 'node' && c.args.includes('--by=tester'));

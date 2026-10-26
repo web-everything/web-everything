@@ -13,7 +13,7 @@
  * came back against an operator `block` ruling (`we:scripts/lib/fixer-escalation-policy.mjs`), never because rounds
  * kept failing.
  *
- * Two decisions live here, both PURE:
+ * Two decisions live here (inject the completion reader for deterministic resume planning):
  *  - {@link planRoundEscalation}: from round `fix.strongerModelFromRound` (default 3) an ordinary fix round goes on
  *    the fixer ladder's stronger-model rung. The model is the routing policy's answer for that rung, never hand-set.
  *  - {@link planRoundResume}: resume the previous round's session instead of a cold start, only when it is still
@@ -33,6 +33,20 @@ import { homedir } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { isLeaseStale, LEASE_FILENAME } from '../lib/lane-lease.mjs';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
+import { isForeignCompletionSessionId, tryReadCompletion } from '../operations/completion-store.mjs';
+
+/** Completion files are keyed by slug; a newer session's record cannot speak for this row. */
+export function priorPermissionBlock(prior, readCompletion = tryReadCompletion) {
+  try {
+    const record = readCompletion(prior.name);
+    if (!record || isForeignCompletionSessionId(prior.sessionId, record.sessionId)) return null;
+    if (record.status === 'blocked-on-permission' || record.outcome === 'blocked-on-permission') {
+      return { reason: 'prior-blocked-on-permission',
+        why: `the earlier session ${prior.sessionId} (${prior.name}) completed blocked-on-permission` };
+    }
+  } catch { /* Missing/unreadable completion evidence allows the ordinary resume guards to decide. */ }
+  return null;
+}
 
 /** Listing states a `claude --bg` session can be resumed from. A `working` (or idle-but-running) session would fork. */
 export const RESUMABLE_STATES = Object.freeze(['done', 'stopped', 'failed', 'error']);
@@ -81,7 +95,7 @@ export function latestSessionRow(agentsAll, slug) {
 }
 
 /**
- * PURE: resume the previous round's session, or cold-start. `{ resume: true, sessionId, lane }` or
+ * Resume the previous round's session, or cold-start. `{ resume: true, sessionId, lane }` or
  * `{ resume: false, reason, why }`. Checked in order, so the reason is the FIRST bound that fails.
  * @param {object} o
  * @param {object} o.planned          the planned fix entry (`pr`, `headRefOid`, `attempts`, `takeover`, `isConflict`, `restack`)
@@ -95,8 +109,9 @@ export function latestSessionRow(agentsAll, slug) {
  * @param {?string} [o.scratchRoot]   the dispatch scratch root (`dispatch-lane-io.mjs#dispatchScratchRoot`): the
  *   resume trigger starts in the previous session's cwd, so that cwd must be one of its direct children
  * @param {(p:string)=>string} [o.realpath] resolves symlinks (identity by default; the IO caller passes the real one)
+ * @param {Function} [o.readCompletion] reads the slug's last completion; unreadable evidence permits resume
  */
-export function planRoundResume({ planned, settings, prior, job, transcript, lane, base, desiredModel = null, scratchRoot = null, realpath = (p) => p } = {}) {
+export function planRoundResume({ planned, settings, prior, job, transcript, lane, base, desiredModel = null, scratchRoot = null, realpath = (p) => p, readCompletion = tryReadCompletion } = {}) {
   const no = (reason, why) => ({ resume: false, reason, why });
   if (settings?.resumeAcrossRounds === 'off') return no('setting-off', 'fix.resumeAcrossRounds is off');
   const round = roundOf(planned);
@@ -105,6 +120,8 @@ export function planRoundResume({ planned, settings, prior, job, transcript, lan
   if (planned?.isConflict) return no('conflict', 'a conflict bounce has its own resume path');
   if (planned?.restack) return no('restack', 'a restack starts fresh');
   if (!prior) return no('no-prior-session', 'no earlier fixer session is listed for this PR');
+  const blocked = priorPermissionBlock(prior, readCompletion);
+  if (blocked) return no(blocked.reason, blocked.why);
   if (!RESUMABLE_STATES.includes(prior.state)) {
     return no('prior-session-busy', `the earlier session ${prior.id ?? prior.sessionId} is ${prior.state} (resuming it would fork a copy)`);
   }
