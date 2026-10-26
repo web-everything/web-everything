@@ -706,12 +706,17 @@ describe('dispatchReview — managed clone behind origin/main (#4387)', () => {
     expect(git(root, 'rev-list', '--count', 'HEAD..origin/main').trim()).toBe('3'); // the clone is never moved
   });
 
-  it.each(['scripts/operations/review-pr.mjs', 'scripts/backlog/frontmatter.mjs'])(
-    'behind in review-path file %s: still refuses, before spawning', (file) => {
-      const root = behindClone('scripts/lane-pool.mjs', file);
-      managed();
-      expect(() => run(root)).toThrow(/2 commit\(s\) behind origin\/main.*STALE code from this checkout/s);
-    });
+  it('behind in a review-path file: still refuses, before spawning', () => {
+    const root = behindClone('scripts/lane-pool.mjs', 'scripts/operations/review-pr.mjs');
+    managed();
+    expect(() => run(root)).toThrow(/2 commit\(s\) behind origin\/main.*STALE code from this checkout/s);
+  });
+
+  it('behind in frontmatter imported by collision healing: still refuses, before spawning', () => {
+    const root = behindClone('scripts/lane-pool.mjs', 'scripts/backlog/frontmatter.mjs');
+    managed();
+    expect(() => run(root)).toThrow(/2 commit\(s\) behind origin\/main.*STALE code from this checkout/s);
+  });
 
   it('behind only in the dispatcher\'s sandbox/routing imports: still refuses (PR #2916 review)', () => {
     const root = behindClone('scripts/operations/dispatch-lane-io.mjs', 'scripts/lib/dispatch-bg-isolation.mjs');

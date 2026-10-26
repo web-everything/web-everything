@@ -353,11 +353,15 @@ describe('dispatchReviewJob — a managed clone behind origin/main (the default 
     } finally { err.mockRestore(); }
   });
 
-  it.each(['scripts/operations/review-loop-cli.mjs', 'scripts/backlog/frontmatter.mjs'])(
-    'behind in review dependency %s: still refuses', (file) => {
-      behind('scripts/lane-pool.mjs', file);
-      expect(() => go()).toThrow(/2 commit\(s\) behind origin\/main.*STALE code/s);
-    });
+  it('behind in a file the review runs (review-loop-cli, or review-job\'s own imports): still refuses', () => {
+    behind('scripts/lane-pool.mjs', 'scripts/operations/review-loop-cli.mjs');
+    expect(() => go()).toThrow(/2 commit\(s\) behind origin\/main.*STALE code/s);
+  });
+
+  it('behind in frontmatter imported by collision healing: still refuses', () => {
+    behind('scripts/lane-pool.mjs', 'scripts/backlog/frontmatter.mjs');
+    expect(() => go()).toThrow(/2 commit\(s\) behind origin\/main.*STALE code/s);
+  });
 });
 
 describe('the two readers that decide "is a review running" see job rows (x26lw6u)', () => {
