@@ -1,0 +1,49 @@
+# R123: automatic answers to recovered CI stand-downs
+
+Operator ruling R123 authorizes we:scripts/conveyor/stand-down-auto-proceed.mjs to classify only
+`gate-red` and `fix-loop-exhausted` terminal records bound to the exact PR head. It produces an ordinary
+strict operator answer through we:scripts/conveyor/stand-down-answer-core.mjs with actor `auto-R123`
+and channel `auto (R123)`. Posting still requires an existing trusted automation/operator principal.
+The parser and all review gates remain unchanged.
+
+For each required check name, every run in the complete history must identify the same app.
+Identity uses a positive safe-integer `app.id`, falling back to a nonempty `app.slug` when no valid ID
+is available. Differing identity keys or any missing identity hold with
+`operator answer required: ambiguous check identity`. The REST reader preserves the full app object.
+Case (a) requires an older failed run and a later successful run with the same name and app on the
+same head, completed after the stand-down. Case (b) accepts completed CANCELLED/SKIPPED checks without any required FAILURE. Case (c)
+uses the existing `fixLoopRedMainLapse` from we:scripts/conveyor/fix-loop-ledger.mjs; each remaining
+required FAILURE must also be attributed by `classifyMainDefect` from
+we:scripts/conveyor/main-red-recovery.mjs. A PR-scoped or independently failed required check holds.
+The comment records case, check names, run IDs/conclusions/times and short head SHA; case (c) also
+records main's red windows and the relevant ledger rows. Green checks alone do not answer a judgment.
+
+Because answers are newest-wins, any unresolved non-CI question blocks automatic posting, including
+an older reviewer question. The pending set includes trusted legacy load-flake saved-fix holds that
+an operator can still answer, even though they are excluded from terminal stand-down listings.
+Superseded or answered holds are excluded. Every pending record must have a valid identity and timestamp,
+because the answer releases older records too. Unknown reasons, missing identity, missing checks, pending checks,
+unbound/different heads and incomplete feeds require an operator answer. Existing same-head red-main
+lapse annotations are examined before recording the durable answer.
+
+we:scripts/conveyor/stand-down-auto-proceed-io.mjs runs as an injected enrichment in
+we:scripts/conveyor/reconcile-pass.mjs before planning. It rereads complete comments, fetches exact-head
+`filter=all` check history, and verifies the head immediately before writing. It processes at most three
+candidate PRs per tick and ten check pages (1000 runs) per candidate; oversized threads (2000 comments)
+or answer bodies (60000 characters) hold with an operator-visible message. Deferred candidates remain
+eligible next tick. A per-repository cursor beside the fix-loop ledger rotates candidates in PR-number
+order, wrapping after the highest number. The cursor advances atomically before any candidate IO,
+including when all selected candidates retain holds or reads fail, and survives process restarts.
+An absent cursor starts at the lowest number; invalid, unreadable or unwritable cursor state retains
+all holds and logs the manual operator-answer fallback. Manual operator answers remain the fallback.
+GitHub calls use the shared throttle
+and paged comment reader. There is no settings bypass.
+
+A durable exclusive reservation lives beside the existing fix-loop ledger, keyed by repository, PR and
+stand-down comment ID. It is allocated before the sole write and never automatically removed or retried.
+Concurrent ticks and ambiguous writes therefore cannot post twice. A crash between reservation and post
+can leave an unanswered hold: inspect the PR thread and reservation, then use the explicit operator-answer
+ceremony. No synthetic posting identity is added to the snapshot: only GitHub's returned comment that
+passes the unchanged strict parser is appended. A later complete thread read provides normal deduplication.
+
+Focused fixtures: we:scripts/conveyor/__tests__/stand-down-auto-proceed.test.mjs.
