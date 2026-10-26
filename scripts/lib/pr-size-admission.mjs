@@ -1,7 +1,7 @@
 /** Shared size evidence and non-blocking PR admission. */
-import { createHash, createHmac, randomBytes } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { closeSync, constants, fstatSync, openSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { REVIEW_LABELS } from './review-labels.mjs';
 
@@ -263,54 +263,18 @@ function lookupLocalSplitCard({ key }, cwd) {
 }
 
 const SIZE_BEGIN = '<!-- pr-size:begin -->';
+const SIZE_END = '<!-- pr-size:end -->';
 const SIZE_CATCH_FALLBACK = '## Size\n\nSize unknown: extra reviewers requested (review:pending); human review of the full diff is required. Split-card filing could not be confirmed.';
 const sha256 = (text) => createHash('sha256').update(text).digest('hex');
 
-/** Local deletion authority, shared by worktrees but never stored in PR text.
- * Exclusive creation never overwrites another writer's key. An incomplete write,
- * unsafe permissions or any IO failure disables deletion; there is no temp-dir fallback.
- */
-export function readOrCreateSizeSecret({ cwd = process.cwd(), secretPath } = {}) {
-  const read = (path) => {
-    const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    try {
-      const stat = fstatSync(fd);
-      if (!stat.isFile() || stat.size !== 32 || (stat.mode & 0o777) !== 0o600) return null;
-      const secret = readFileSync(fd);
-      return secret.length === 32 ? secret : null;
-    } finally { closeSync(fd); }
-  };
-  try {
-    if (secretPath === undefined) {
-      const commonDir = execFileSync('git', ['rev-parse', '--git-common-dir'], {
-        cwd, encoding: 'utf8', timeout: 5000, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'pipe'],
-      }).trim();
-      if (!commonDir) return null;
-      secretPath = resolve(cwd, commonDir, 'we-pr-size-secret');
-    }
-    try { return read(secretPath); }
-    catch (error) { if (error.code !== 'ENOENT') return null; }
-    try { writeFileSync(secretPath, randomBytes(32), { flag: 'wx', mode: 0o600 }); }
-    catch (error) { if (error.code !== 'EEXIST') return null; }
-    return read(secretPath);
-  } catch { return null; }
-}
-
-const validSecret = (secret) => (Buffer.isBuffer(secret) || typeof secret === 'string')
-  && Buffer.byteLength(secret) === 32;
-const sectionHmac = (text, secret) => createHmac('sha256', secret).update(text).digest('hex');
-
 /** Replace one unambiguous, line-delimited display section, preserving all other
  * bytes (including CRLF). Editable markers never supply card/publication evidence.
- * The HMAC binds the exact text after the begin line, including the final newline,
- * to a local secret. Without that secret, no section is eligible for deletion.
- * Legacy, modified or malformed sections are retained in full; a fresh section is appended.
+ * Only an exact plain begin/end pair is replaceable, regardless of its inner text.
+ * Malformed, partial, nested or duplicate markers retain the entire original body;
+ * a fresh section is appended. No machine-local state is needed (R126, R115).
  */
-export function replaceOwnedSection(body, sectionText, { secret } = {}) {
-  const innerText = `${sectionText}\n`;
-  const canSign = validSecret(secret);
-  const end = canSign ? `<!-- pr-size:end hmac-sha256=${sectionHmac(innerText, secret)} -->` : '<!-- pr-size:end -->';
-  const section = `${SIZE_BEGIN}\n${innerText}${end}`;
+export function replaceOwnedSection(body, sectionText) {
+  const section = `${SIZE_BEGIN}\n${sectionText}\n${SIZE_END}`;
   // A malformed body stays malformed after appending. An identical appended
   // section makes retries a no-op without authorizing deletion of any old text.
   if (body === section || body.endsWith(`\n\n${section}`)) return body;
@@ -322,16 +286,10 @@ export function replaceOwnedSection(body, sectionText, { secret } = {}) {
     return (match.index === 0 || body[match.index - 1] === '\n')
       && (end === body.length || body[end] === '\n' || body.slice(end, end + 2) === '\r\n');
   };
-  if (canSign && markerLikeCount === 2 && markers.length === 2 && markers[0][0] === SIZE_BEGIN && markers[1][1] === 'end'
+  if (markerLikeCount === 2 && markers.length === 2 && markers[0][0] === SIZE_BEGIN && markers[1][0] === SIZE_END
     && markers.every(ownLine)) {
-    const beginEnd = markers[0].index + markers[0][0].length;
-    const innerStart = beginEnd + (body.slice(beginEnd, beginEnd + 2) === '\r\n' ? 2 : 1);
-    const inner = body.slice(innerStart, markers[1].index);
-    const digest = /^<!-- pr-size:end hmac-sha256=([a-f0-9]{64}) -->$/.exec(markers[1][0])?.[1];
-    if (digest === sectionHmac(inner, secret)) {
-      return body.slice(0, markers[0].index) + section
-        + body.slice(markers[1].index + markers[1][0].length);
-    }
+    return body.slice(0, markers[0].index) + section
+      + body.slice(markers[1].index + markers[1][0].length);
   }
   return body + (body ? '\n\n' : '') + section;
 }
@@ -342,7 +300,6 @@ function splitCardId(value) {
 }
 
 export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = createPrDiffStatReader({ cwd }),
-  secretPath, secret = readOrCreateSizeSecret({ cwd, secretPath }),
   fileItem = (fields) => fileSplitItem(fields, cwd), lookupSplitCard = (request) => lookupLocalSplitCard(request, cwd),
   publishSplitCard = (card, request) => publishLocalSplitCard(card, request, cwd),
 } = {}) {
@@ -438,7 +395,7 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = crea
       : `size unknown: extra reviewers requested via the size escalation (review:pending); ${cardNote}`;
     const noted = replaceOwnedSection(body, `## Size\n\n${note}\n${groupLine}${fallback}\n`
       + (cardPublished ? `<!-- size-published:${markerKey} -->\n` : '')
-      + `<!-- size-admission:${markerKey} -->`, { secret });
+      + `<!-- size-admission:${markerKey} -->`);
     // Never truncate or escape author text to fit the forge. The review label
     // still escalates when there is no room for the owned note.
     if (noted.length <= FORGE_BODY_CHARS) result.body = noted;
@@ -451,7 +408,7 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = crea
     try { return await run(request); }
     catch {
       // Use the safely captured body; a throwing getter must not break this fallback.
-      const noted = replaceOwnedSection(body, SIZE_CATCH_FALLBACK, { secret });
+      const noted = replaceOwnedSection(body, SIZE_CATCH_FALLBACK);
       return { status: 'unknown', lines: null, reviewLabel: REVIEW_LABELS.pending,
         body: noted.length <= FORGE_BODY_CHARS ? noted : body };
     }

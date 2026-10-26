@@ -28,7 +28,7 @@ function wrapper(overrides = {}) {
 // in createParams/applyReviewEscalationLabel. All effects here are injected.
 function direct(overrides = {}) {
   const cards = new Map(); // trusted card-store fixture; body markers are advisory
-  const effects = { secret: Buffer.alloc(32, 0x42), diffStat: vi.fn(() => ({ text, sha: '1'.repeat(40) })),
+  const effects = { diffStat: vi.fn(() => ({ text, sha: '1'.repeat(40) })),
     fileItem: vi.fn((fields) => {
       cards.set(/^size-split-key:([a-f0-9]{64})/.exec(fields.digest)?.[1], card.verdict);
       return card;
@@ -282,6 +282,43 @@ describe('direct pr-land uses the same admission and existing review-label path'
     expect(effects.fileItem).toHaveBeenCalledTimes(1);
     expect(second.body.match(/^## Size$/gm)).toHaveLength(1);
     expect(second.body).toBe(first.body);
+    const third = await run({ ...request, body: second.body });
+    expect(third.body).toBe(first.body);
+    expect(effects.fileItem).toHaveBeenCalledTimes(1);
+  });
+
+  it('direct pr-land replaces a plain section in place, preserves surrounding text, and retries twice identically', async () => {
+    const { run, effects } = direct();
+    const before = 'Author rationale.  \r\n\r\n';
+    const after = '\r\n\r\n## Testing\r\nKeep this.  \r\n';
+    const body = before + '<!-- pr-size:begin -->\nStale display text\n<!-- pr-size:end -->' + after;
+    const first = await run({ ...request, body });
+    expect(first.body.startsWith(before + '<!-- pr-size:begin -->\n')).toBe(true);
+    expect(first.body.endsWith('<!-- pr-size:end -->' + after)).toBe(true);
+    expect(first.body).not.toContain('Stale display text');
+    expect(first.body.match(/^## Size$/gm)).toHaveLength(1);
+    const retry = await run({ ...request, body: first.body });
+    expect(retry.body).toBe(first.body);
+    expect((await run({ ...request, body: retry.body })).body).toBe(first.body);
+    expect(effects.fileItem).toHaveBeenCalledTimes(1);
+    expect(effects.lookupSplitCard).toHaveBeenCalledTimes(3);
+    expect(effects.publishSplitCard).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([
+    ['forged', '<!-- pr-size:begin -->\nKeep prose\n<!-- pr-size:end forged=true -->'],
+    ['partial', '<!-- pr-size:begin -->\nKeep prose'],
+    ['duplicate', '<!-- pr-size:begin -->\nFirst\n<!-- pr-size:end -->\n<!-- pr-size:begin -->\nSecond\n<!-- pr-size:end -->'],
+  ])('direct pr-land preserves all %s marker text and appends identically on two retries', async (_label, markers) => {
+    const { run, effects } = direct();
+    const body = 'Before\r\n' + markers + '\r\nAfter';
+    const first = await run({ ...request, body });
+    const generated = (await run({ ...request, body: '' })).body;
+    expect(first.body).toBe(body + '\n\n' + generated);
+    const retry = await run({ ...request, body: first.body });
+    expect(retry.body).toBe(first.body);
+    expect((await run({ ...request, body: retry.body })).body).toBe(first.body);
+    expect(effects.fileItem).toHaveBeenCalledTimes(1);
   });
 
   it.each(['over', 'unknown'])('forces %s through review:pending even below the existing 400-line threshold', (status) => {
@@ -358,7 +395,7 @@ describe('pr-land CLI size failure boundaries', () => {
     expect(result.sizeAdmission).toMatchObject({ status: 'unknown', lines: null, reviewLabel: REVIEW_LABELS.pending });
     expect(result.createParams.body.startsWith(original + '\n\n<!-- pr-size:begin -->')).toBe(true);
     expect(result.createParams.body).toContain('Split-card filing could not be confirmed.');
-    expect(result.createParams.body).toMatch(/<!-- pr-size:end hmac-sha256=[a-f0-9]{64} -->$/);
+    expect(result.createParams.body).toMatch(/<!-- pr-size:end -->$/);
     if (prNum != null) expect(forge.editBody).toHaveBeenCalledWith(prNum, result.createParams.body);
     else expect(forge.editBody).not.toHaveBeenCalled();
   });
@@ -371,7 +408,7 @@ describe('pr-land CLI size failure boundaries', () => {
     expect(result.createParams.body).toContain('split card not filed (file-item failed)');
     expect(result.sizeAdmission.reviewLabel).toBe(REVIEW_LABELS.pending);
     expect(result.createParams.body).toMatch(/<!-- size-admission:[a-f0-9]{64} -->/);
-    expect(result.createParams.body).toMatch(/<!-- pr-size:begin -->\n[\s\S]*<!-- pr-size:end hmac-sha256=[a-f0-9]{64} -->$/);
+    expect(result.createParams.body).toMatch(/<!-- pr-size:begin -->\n[\s\S]*<!-- pr-size:end -->$/);
     if (prNum != null) expect(forge.editBody).toHaveBeenCalledWith(prNum, result.createParams.body);
   });
 

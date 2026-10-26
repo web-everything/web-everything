@@ -1,11 +1,12 @@
 /** Phase 1 RED contracts: the shared size home is intentionally a behavior-free stub. */
-import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, statSync, symlinkSync, renameSync, rmSync } from 'node:fs';
+import { afterEach, describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, renameSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import yaml from 'js-yaml';
-import { createHash, createHmac } from 'node:crypto';
+import { createHash } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
 import { planFileItem } from '../../operations/file-item.mjs';
 import * as sizeAdmission from '../pr-size-admission.mjs';
 import { outcomePayload } from '../../operations/cli-adapter.mjs';
@@ -18,12 +19,6 @@ vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal();
   const execFileSync = vi.fn(actual.execFileSync);
   return { ...actual, execFileSync, default: { ...actual.default, execFileSync } };
-});
-
-vi.mock('node:fs', async (importOriginal) => {
-  const actual = await importOriginal();
-  const writeFileSync = vi.fn(actual.writeFileSync);
-  return { ...actual, writeFileSync, default: { ...actual.default, writeFileSync } };
 });
 
 // Effect seam: createSizeAdmissionRunner({ diffStat, fileItem, lookupSplitCard, publishSplitCard })
@@ -55,11 +50,10 @@ const evidence = '100\t50\tscripts/operations/a.mjs\0'
   + '50\t0\tscripts/operations/b.mjs\0'
   + '101\t0\tdocs/agent/a.md\0'
   + '900\t0\tscripts/operations/__tests__/a.test.mjs\0';
-const SECRET = Buffer.alloc(32, 0x42); // Hermetic local authority, never read from the checkout.
 const HEAD_SHA = '1'.repeat(40), BASE_SHA = '2'.repeat(40);
 const cardKey = (sha = HEAD_SHA, repo = 'web-everything/web-everything') => createHash('sha256').update(JSON.stringify([repo, sha])).digest('hex');
 const KEY = cardKey();
-// The display marker identifies the note; the HMAC end marker authenticates its exact bytes.
+// Display markers never authenticate filing or publication evidence (R115).
 const MARKER = new RegExp(`<!-- size-admission:${KEY} -->`);
 const request = { ref: 'lane/size-admission', pr: 5854, base: 'main', sha: HEAD_SHA, body: 'Existing PR description.', repo: 'web-everything/web-everything' };
 const cardResult = { verdict: { num: 9001, id: 'xsplit1', rel: 'backlog/xsplit1-split.md' } };
@@ -69,7 +63,6 @@ function effects(overrides = {}) {
   const cards = new Map();
   const reader = overrides.diffStat || (() => ({ text: evidence, sha: HEAD_SHA, baseSha: BASE_SHA }));
   return {
-    secret: SECRET,
     ...overrides,
     diffStat: vi.fn((input) => {
       const result = reader(input);
@@ -93,128 +86,51 @@ function expectSizeNote(body) {
   expect(body).toMatch(/file groups[^\n]*scripts\/operations[^\n]*200/i);
   expect(body).toMatch(/file groups[^\n]*docs\/agent[^\n]*101/i);
   expect(body).not.toMatch(/900 non-test|a\.test\.mjs/);
-  const owned = [...body.matchAll(/<!-- pr-size:begin -->\n([\s\S]*?)<!-- pr-size:end hmac-sha256=([a-f0-9]{64}) -->/g)].at(-1);
-  expect(owned).toBeDefined();
-  expect(owned[2]).toBe(createHmac('sha256', SECRET).update(owned[1]).digest('hex'));
+  expect(body).toMatch(/<!-- pr-size:begin -->\n[\s\S]*?\n<!-- pr-size:end -->/);
 }
 
-const sizeEnd = (inner) => `<!-- pr-size:end hmac-sha256=${createHmac('sha256', SECRET).update(inner).digest('hex')} -->`;
+const sizeEnd = '<!-- pr-size:end -->';
 
-describe('readOrCreateSizeSecret', () => {
-  let cwd, secretPath;
-  beforeEach(() => {
-    cwd = mkdtempSync(join(tmpdir(), 'pr-size-secret-'));
-    secretPath = join(cwd, 'secret');
-  });
-  afterEach(() => rmSync(cwd, { recursive: true, force: true }));
-
-  it('creates a private random 32-byte secret and preserves it across fresh reads', () => {
-    const first = sizeAdmission.readOrCreateSizeSecret({ secretPath });
-    expect(first).toBeInstanceOf(Buffer);
-    expect(first).toHaveLength(32);
-    expect(statSync(secretPath).mode & 0o777).toBe(0o600);
-    expect(readFileSync(secretPath)).toEqual(first);
-    expect(sizeAdmission.readOrCreateSizeSecret({ secretPath })).toEqual(first);
-    expect(sizeAdmission.readOrCreateSizeSecret({ secretPath: join(cwd, 'other-secret') })).not.toEqual(first);
-  });
-
-  it('never overwrites an existing private secret', () => {
-    writeFileSync(secretPath, SECRET, { mode: 0o600 });
-    expect(sizeAdmission.readOrCreateSizeSecret({ secretPath })).toEqual(SECRET);
-    expect(readFileSync(secretPath)).toEqual(SECRET);
-  });
-
-  it('exclusive creation reads a concurrent winner without replacing its key', async () => {
-    const fs = await vi.importActual('node:fs');
-    vi.mocked(writeFileSync).mockImplementationOnce((path, candidate, options) => {
-      expect(options).toEqual({ flag: 'wx', mode: 0o600 });
-      fs.writeFileSync(path, SECRET, { flag: 'wx', mode: 0o600 });
-      // The real O_EXCL write must fail after the competing writer wins.
-      fs.writeFileSync(path, candidate, options);
-    });
-    expect(sizeAdmission.readOrCreateSizeSecret({ secretPath })).toEqual(SECRET);
-    expect(readFileSync(secretPath)).toEqual(SECRET);
-  });
-
-  it('a failed partial creation returns no key and remains unusable on retry', async () => {
-    const fs = await vi.importActual('node:fs');
-    vi.mocked(writeFileSync).mockImplementationOnce((path, candidate, options) => {
-      fs.writeFileSync(path, candidate.subarray(0, 16), options);
-      throw Object.assign(new Error('write failed'), { code: 'EIO' });
-    });
-    expect(sizeAdmission.readOrCreateSizeSecret({ secretPath })).toBeNull();
-    expect(sizeAdmission.readOrCreateSizeSecret({ secretPath })).toBeNull();
-    expect(readFileSync(secretPath)).toHaveLength(16);
-  });
-
-  it('defaults to the Git common directory from a nested working directory', () => {
-    execFileSync('git', ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false', 'init', '--quiet', cwd]);
-    const nested = join(cwd, 'nested');
-    mkdirSync(nested);
-    vi.spyOn(process, 'cwd').mockReturnValue(nested);
-    const secret = sizeAdmission.readOrCreateSizeSecret();
-    expect(secret).toHaveLength(32);
-    expect(readFileSync(join(cwd, '.git', 'we-pr-size-secret'))).toEqual(secret);
-    expect(sizeAdmission.readOrCreateSizeSecret({ cwd })).toEqual(secret);
-  });
-
-  it.each([0, 31, 33, 1024 * 1024])('rejects incomplete or oversized %i-byte secrets without overwriting them', (size) => {
-    const original = Buffer.alloc(size, 0x42);
-    writeFileSync(secretPath, original, { mode: 0o600 });
-    expect(sizeAdmission.readOrCreateSizeSecret({ secretPath })).toBeNull();
-    expect(readFileSync(secretPath)).toEqual(original);
-  });
-
-  it.each([0o644, 0o000])('rejects unsafe or unreadable secret permissions %i', (mode) => {
-    writeFileSync(secretPath, SECRET, { mode });
-    expect(sizeAdmission.readOrCreateSizeSecret({ secretPath })).toBeNull();
-    expect(statSync(secretPath).mode & 0o777).toBe(mode);
-  });
-
-  it('rejects symlinked secrets without modifying their target', () => {
-    const target = join(cwd, 'target');
-    writeFileSync(target, SECRET, { mode: 0o600 });
-    symlinkSync(target, secretPath);
-    expect(sizeAdmission.readOrCreateSizeSecret({ secretPath })).toBeNull();
-    expect(readFileSync(target)).toEqual(SECRET);
-  });
-
-  it('returns no secret when Git discovery or creation fails, without a temp-directory fallback', () => {
-    expect(sizeAdmission.readOrCreateSizeSecret({ cwd })).toBeNull();
-    expect(sizeAdmission.readOrCreateSizeSecret({ secretPath: join(cwd, 'missing', 'secret') })).toBeNull();
-    expect(() => statSync(join(cwd, 'we-pr-size-secret'))).toThrow();
-  });
-
-  it('runner loads the injected secret path, replaces its HMAC section, and stays identical on two retries', async () => {
-    let lines = 301;
-    const io = effects({ secret: undefined, secretPath,
-      diffStat: () => `${lines}\t0\tdocs/agent/a.md\0` });
-    const first = await sizeAdmission.createSizeAdmissionRunner(io)(request);
-    const inner = first.body.split('<!-- pr-size:begin -->\n')[1].split('<!-- pr-size:end')[0];
-    expect(first.body).toContain(`hmac-sha256=${createHmac('sha256', readFileSync(secretPath)).update(inner).digest('hex')}`);
-    lines = 401;
-    const second = await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, body: first.body });
-    expect(second.body).not.toContain('301 non-test lines');
-    expect(second.body).toContain('401 non-test lines');
-    expect(second.body.match(/^## Size$/gm)).toHaveLength(1);
-    const retry = await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, body: second.body });
-    expect(retry.body).toBe(second.body);
-    expect((await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, body: retry.body })).body).toBe(second.body);
-  });
-
-  it.each([false, true])('runner appends only when secret creation fails (outer fallback: %s)', async (fallback) => {
-    const body = sizeAdmission.replaceOwnedSection(request.body, 'Keep authenticated old text', { secret: SECRET });
-    const io = effects({ secret: undefined, secretPath: join(cwd, 'missing', 'secret') });
-    const result = await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, body,
-      ...(fallback ? { sha: Symbol('invalid SHA') } : {}) });
-    expect(result.body.startsWith(body + '\n\n<!-- pr-size:begin -->\n')).toBe(true);
-    expect(result.body).toContain('Keep authenticated old text');
-    expect(result.body).toMatch(/<!-- pr-size:end -->$/);
-    expect(result.reviewLabel).toBe('review:pending');
+describe('stateless size-section replacement', () => {
+  it('a runner in a fresh HOME replaces in place and stays byte-identical on two retries', async () => {
+    const freshHome = mkdtempSync(join(tmpdir(), 'pr-size-fresh-home-'));
+    try {
+      const first = await sizeAdmission.createSizeAdmissionRunner(effects())(request);
+      const tail = '\r\n\r\n## Testing\r\nKeep trailing text.  \r\n';
+      const moduleUrl = pathToFileURL(join(process.cwd(), 'scripts/lib/pr-size-admission.mjs')).href;
+      const source = `
+        import { createSizeAdmissionRunner } from ${JSON.stringify(moduleUrl)};
+        const { input, card } = JSON.parse(process.argv[1]);
+        const effects = {
+          diffStat: () => ({ text: '401\\t0\\tdocs/agent/a.md\\0', sha: input.sha }),
+          lookupSplitCard: () => card,
+          fileItem: () => { throw new Error('must reuse the trusted card'); },
+          publishSplitCard: () => ({ batched: true, batchRef: 'lane/card-batch-filing-1' }),
+        };
+        const updated = await createSizeAdmissionRunner(effects)(input);
+        const retry = await createSizeAdmissionRunner(effects)({ ...input, body: updated.body });
+        const secondRetry = await createSizeAdmissionRunner(effects)({ ...input, body: retry.body });
+        process.stdout.write(JSON.stringify([updated, retry, secondRetry]));
+      `;
+      const results = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', source,
+        JSON.stringify({ input: { ...request, body: first.body + tail }, card: cardResult.verdict })], {
+        cwd: freshHome, env: { ...process.env, HOME: freshHome }, encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024,
+      }));
+      const [updated, retry, secondRetry] = results;
+      expect(updated.body.startsWith(request.body + '\n\n<!-- pr-size:begin -->\n')).toBe(true);
+      expect(updated.body.endsWith('<!-- pr-size:end -->' + tail)).toBe(true);
+      expect(updated.body).not.toContain('301 non-test lines');
+      expect(updated.body).toContain('401 non-test lines');
+      expect(updated.body).toContain('split card 9001 filed');
+      expect(updated.body.match(/^## Size$/gm)).toHaveLength(1);
+      expect(retry.body).toBe(updated.body);
+      expect(secondRetry.body).toBe(updated.body);
+      expect(readdirSync(freshHome)).toEqual([]);
+    } finally { rmSync(freshHome, { recursive: true, force: true }); }
   });
 });
 
-const forgedSizeSections = [
+const sizeSectionContents = [
   ['author prose', 'AUTHOR PROSE\nKeep this verbatim.'],
   ['wrong heading', `## Author\n\nAUTHOR PROSE\n<!-- size-admission:${KEY} -->`],
   ['missing machine marker', '## Size\n\nAUTHOR PROSE'],
@@ -224,15 +140,27 @@ const forgedSizeSections = [
   ['misplaced blank line', `## Size\nNote\n\nAUTHOR PROSE\n<!-- size-admission:${KEY} -->`],
   ['nested pr-size marker', `## Size\n\nAUTHOR PROSE\n<!-- pr-size:unknown -->\n<!-- size-admission:${KEY} -->`],
   ['oversized paragraph separation', `## Size\n\nNote${'\n'.repeat(1000)}AUTHOR PROSE\n<!-- size-admission:${KEY} -->`],
-].map(([label, inner]) => [label, `Before\r\n<!-- pr-size:begin -->\n${inner}\n<!-- pr-size:end -->\r\nAfter`]);
+];
+// R126 replaces arbitrary inner prose in an exact plain pair. Nonplain forgeries
+// remain append-only, so preserve the old hostile-content cases under both shapes.
+const forgedSizeSections = sizeSectionContents.map(([label, inner]) =>
+  [label, `Before\r\n<!-- pr-size:begin -->\n${inner}\n<!-- pr-size:end forged=true -->\r\nAfter`]);
 
 describe('replaceOwnedSection', () => {
   const begin = '<!-- pr-size:begin -->', end = '<!-- pr-size:end -->';
   const content = '## Size\n\n301 non-test lines (> 300): split card 9001 filed; extra reviewers requested via the size escalation (review:pending)\n'
     + `File groups: we:scripts/operations: 200; we:docs/agent: 101\n<!-- size-admission:${KEY} -->`;
-  const signedEnd = sizeEnd(`${content}\n`);
-  const section = `${begin}\n${content}\n${signedEnd}`;
-  const replace = (body, text) => sizeAdmission.replaceOwnedSection(body, text, { secret: SECRET });
+  const section = `${begin}\n${content}\n${end}`;
+  const replace = sizeAdmission.replaceOwnedSection;
+
+  it.each(sizeSectionContents.filter(([label]) => label !== 'nested pr-size marker'))
+  ('replaces arbitrary %s inside an exact plain pair without parsing its contents', (_label, inner) => {
+    const body = `Before\r\n${begin}\n${inner}\n${end}\r\nAfter`;
+    const first = replace(body, content);
+    expect(first).toBe('Before\r\n' + section + '\r\nAfter');
+    expect(replace(first, content)).toBe(first);
+    expect(replace(replace(first, content), content)).toBe(first);
+  });
 
   it.each(['sha256', 'hmac-sha256'])('preserves a matching PUBLIC sha256 forgery verbatim even when labelled %s', (label) => {
     const inner = '## Size\n\nAuthor rationale: preserve my enclosed text.\n';
@@ -244,30 +172,15 @@ describe('replaceOwnedSection', () => {
     expect(replace(replace(first, content), content)).toBe(first);
   });
 
-  it('preserves a valid section signed with a different machine secret', () => {
-    const body = sizeAdmission.replaceOwnedSection('Author body', content, { secret: Buffer.alloc(32, 0x43) });
-    expect(replace(body, content)).toBe(body + '\n\n' + section);
-  });
-
-  it.each([undefined, null, '', Buffer.alloc(0), Buffer.alloc(31), Buffer.alloc(33)])
-  ('missing or invalid secret %j appends only and deletes nothing', (secret) => {
-    const body = replace('Author body', 'Previous authenticated content');
-    const unsigned = `${begin}\n${content}\n${end}`;
-    const first = sizeAdmission.replaceOwnedSection(body, content, { secret });
-    expect(first).toBe(body + '\n\n' + unsigned);
-    expect(sizeAdmission.replaceOwnedSection(first, content, { secret })).toBe(first);
-    expect(sizeAdmission.replaceOwnedSection(body, content)).toBe(body + '\n\n' + unsigned);
-  });
-
-  it('binds the exact UTF-8 inner text including its final newline', () => {
+  it('emits UTF-8 inner text with a final newline', () => {
     const inner = '## Size\n\nFile groups: we:docs/界: 301\n';
-    expect(replace('', inner.slice(0, -1))).toBe(`${begin}\n${inner}${sizeEnd(inner)}`);
+    expect(replace('', inner.slice(0, -1))).toBe(`${begin}\n${inner}${sizeEnd}`);
   });
 
-  it.each([end, `<!-- pr-size:end sha256=${'0'.repeat(64)} -->`,
+  it.each([`<!-- pr-size:end sha256=${'0'.repeat(64)} -->`,
     '<!-- pr-size:end sha256=invalid -->', `<!-- pr-size:end hmac-sha256=${'0'.repeat(64)} -->`,
     '<!-- pr-size:end hmac-sha256=invalid -->'])
-  ('preserves a forged grammar-matching pair with missing or invalid digest (%s)', (forgedEnd) => {
+  ('preserves a forged nonplain end marker (%s)', (forgedEnd) => {
     const forged = content.replace(/^File groups:.*$/m, 'File groups: we:docs/agent: 301; Author rationale: 123');
     const body = `Before\n${begin}\n${forged}\n${forgedEnd}\nAfter`;
     const first = replace(body, content);
@@ -287,18 +200,19 @@ describe('replaceOwnedSection', () => {
     const before = `Author 界 <tag>  ${eol}${eol}`;
     const after = `${eol}${eol}## Testing${eol}Keep this.  ${eol}`;
     const oldContent = content.replace('301 non-test lines', '401 non-test lines').replace(/\n/g, eol);
-    const body = before + begin + eol + oldContent + eol + sizeEnd(oldContent + eol) + after;
+    const body = before + begin + eol + oldContent + eol + sizeEnd + after;
     const result = replace(body, content);
     expect(result).toBe(before + section + after);
     expect(replace(result, content)).toBe(result);
+    expect(replace(replace(result, content), content)).toBe(result);
   });
 
-  it('replaces a genuine HMAC section at the body boundaries', () => {
+  it('replaces a plain section at the body boundaries', () => {
     const inner = content.replace('301 non-test lines', '401 non-test lines') + '\n';
-    expect(replace(`${begin}\n${inner}${sizeEnd(inner)}`, content)).toBe(section);
+    expect(replace(`${begin}\n${inner}${sizeEnd}`, content)).toBe(section);
   });
 
-  describe.each(['before', 'after', 'both'])('extra marker-like text %s an authenticated section', (position) => {
+  describe.each(['before', 'after', 'both'])('extra marker-like text %s a plain section', (position) => {
     it.each([
       '<!-- pr-size:begin',
       '<!-- pr-size:end',
@@ -306,7 +220,7 @@ describe('replaceOwnedSection', () => {
       'Author prose mentioning pr-size:',
       'pr-size:pr-size:',
     ])('appends only, deletes nothing, and remains idempotent for %j', (extra) => {
-      const previous = replace('', 'Previous authenticated content');
+      const previous = replace('', 'Previous display content');
       const before = position !== 'after' ? `${extra}\r\n` : '';
       const after = position !== 'before' ? `\r\n${extra}` : '';
       const body = `Before\r\n${before}${previous}${after}\r\nAfter`;
@@ -314,12 +228,12 @@ describe('replaceOwnedSection', () => {
       expect(first).toBe(body + '\n\n' + section);
       expect(replace(first, content)).toBe(first);
       expect(replace(replace(first, content), content)).toBe(first);
-      expect(replace(first, 'Changed note')).toBe(first + `\n\n${begin}\nChanged note\n${sizeEnd('Changed note\n')}`);
+      expect(replace(first, 'Changed note')).toBe(first + `\n\n${begin}\nChanged note\n${sizeEnd}`);
     });
   });
 
-  it('appends only when authenticated inner text contains another pr-size: occurrence', () => {
-    const body = replace('', 'Authenticated prose mentioning pr-size:');
+  it('appends only when inner text contains another pr-size: occurrence', () => {
+    const body = replace('', 'Display prose mentioning pr-size:');
     expect(replace(body, content)).toBe(body + '\n\n' + section);
   });
 
@@ -344,10 +258,10 @@ describe('replaceOwnedSection', () => {
     ['mismatched publication marker', (text) => text.replace('<!-- size-admission:', `<!-- size-published:${'f'.repeat(64)} -->\n<!-- size-admission:`)],
     ['extra trailing newline', (text) => text + '\n'],
     ['extra leading newline', (text) => '\n' + text],
-  ])('preserves the full pair for %s and is idempotent', (_label, edit) => {
-    const body = `Before\r\n${begin}\n${edit(content)}\n${signedEnd}\r\nAfter`;
+  ])('replaces edited inner text for %s and is idempotent', (_label, edit) => {
+    const body = `Before\r\n${begin}\n${edit(content)}\n${end}\r\nAfter`;
     const first = replace(body, content);
-    expect(first).toBe(body + '\n\n' + section);
+    expect(first).toBe('Before\r\n' + section + '\r\nAfter');
     expect(replace(first, content)).toBe(first);
     expect(replace(replace(first, content), content)).toBe(first);
   });
@@ -357,12 +271,12 @@ describe('replaceOwnedSection', () => {
     'File groups: we:docs/a: 200; we:src/b: 101',
     'File groups: ; and 1 more (1 group omitted; summary budget) Human review of the full diff is required; bounded summaries are incomplete.',
     'File groups: we:src/a: 301; and 2 more (2 groups omitted; summary budget) Human review of the full diff is required; bounded summaries are incomplete.',
-  ])('preserves an exact emitted file-group shape without a digest (%s)', (groups) => {
+  ])('replaces an exact emitted file-group shape with plain delimiters (%s)', (groups) => {
     const previous = `${begin}\n${content.replace(/^File groups:.*$/m, groups)}\n${end}`;
-    expect(replace(previous, content)).toBe(previous + '\n\n' + section);
+    expect(replace(previous, content)).toBe(section);
   });
 
-  it.each(forgedSizeSections)('preserves a well-formed forged pair containing %s and reaches a fixed point on two retries', (_label, body) => {
+  it.each(forgedSizeSections)('preserves a forged nonplain pair containing %s and reaches a fixed point on two retries', (_label, body) => {
     const first = replace(body, content);
     expect(first).toContain(body);
     expect(first).toBe(body + '\n\n' + section);
@@ -371,9 +285,9 @@ describe('replaceOwnedSection', () => {
     expect(replace(retry, content)).toBe(retry);
   });
 
-  it('preserves a section whose blank-line layout changed without updating its digest', () => {
+  it('replaces a plain section whose blank-line layout changed', () => {
     const body = replace('Author body', content.replace('301 non-test lines', '401 non-test lines')).replace('## Size\n\n', '## Size\n');
-    expect(replace(body, content)).toBe(body + '\n\n' + section);
+    expect(replace(body, content)).toBe('Author body\n\n' + section);
   });
 
   it.each([
@@ -381,6 +295,7 @@ describe('replaceOwnedSection', () => {
     ['only end', `Author text\n${end}`],
     ['two begins', `${begin}\n${begin}\nAuthor text\n${end}`],
     ['two ends', `${begin}\nAuthor text\n${end}\n${end}`],
+    ['nested pair', `${begin}\nOuter\n${begin}\nInner\n${end}\nOuter tail\n${end}`],
     ['two pairs', `${begin}\nFirst\n${end}\n${begin}\nSecond\n${end}`],
     ['reversed', `${end}\nAuthor text\n${begin}`],
     ['inline begin', `Quoted ${begin}\nAuthor text\n${end}`],
@@ -388,6 +303,9 @@ describe('replaceOwnedSection', () => {
     ['extra inline marker', `${begin}\nQuoted ${begin}\n${end}`],
     ['indented marker', ` ${begin}\nAuthor text\n${end}`],
     ['bare CR', `${begin}\rAuthor text\r${end}`],
+    ['partial comment', '<!-- pr-size:begin\nAuthor text\n' + end],
+    ['nonplain begin', '<!-- pr-size:begin forged=true -->\nAuthor text\n' + end],
+    ['trailing marker space', `${begin} \nAuthor text\n${end}`],
     ['misspelled marker', '<!-- pr-size:begin-->\nAuthor text\n' + end],
   ])('preserves the entire original body for %s and is identical on retries', (_name, malformed) => {
     const body = `Before\r\n${malformed}\r\nAfter`;
@@ -397,7 +315,7 @@ describe('replaceOwnedSection', () => {
     expect(replace(first, content)).toBe(first);
     expect(replace(replace(first, content), content)).toBe(first);
     // Changing the note cannot authorize replacement in a still-malformed body.
-    expect(replace(first, 'Changed note')).toBe(first + `\n\n${begin}\nChanged note\n${sizeEnd('Changed note\n')}`);
+    expect(replace(first, 'Changed note')).toBe(first + `\n\n${begin}\nChanged note\n${sizeEnd}`);
   });
 });
 
@@ -512,13 +430,13 @@ describe('shared admission effects', () => {
     });
     const fileItem = vi.fn();
     try {
-      const result = await sizeAdmission.createSizeAdmissionRunner({ secret: SECRET, cwd, diffStat: () => ({ text: evidence, sha: HEAD_SHA, baseSha: BASE_SHA }), fileItem })(request);
+      const result = await sizeAdmission.createSizeAdmissionRunner({ cwd, diffStat: () => ({ text: evidence, sha: HEAD_SHA, baseSha: BASE_SHA }), fileItem })(request);
       expect(result).toMatchObject({ status: 'over', reviewLabel: 'review:pending' });
       expect(result.body).toContain('split card not filed (file-item failed)');
       expect(result.body).toMatch(MARKER);
       expect(fileItem).not.toHaveBeenCalled();
       vi.mocked(fileIntoBatch).mockResolvedValue({ batched: true, batchRef: 'lane/card-batch-filing-1' });
-      expectSizeNote((await sizeAdmission.createSizeAdmissionRunner({ secret: SECRET, cwd, diffStat: () => ({ text: evidence, sha: HEAD_SHA, baseSha: BASE_SHA }), fileItem })({ ...request, body: result.body })).body);
+      expectSizeNote((await sizeAdmission.createSizeAdmissionRunner({ cwd, diffStat: () => ({ text: evidence, sha: HEAD_SHA, baseSha: BASE_SHA }), fileItem })({ ...request, body: result.body })).body);
       expect(fileItem).not.toHaveBeenCalled();
     } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
@@ -582,7 +500,7 @@ describe('shared admission effects', () => {
       }));
     });
     vi.mocked(execFileSync).mockImplementation(exec);
-    const run = (body = request.body) => sizeAdmission.createSizeAdmissionRunner({ secret: SECRET, cwd, diffStat: () => ({ text: evidence, sha: HEAD_SHA, baseSha: BASE_SHA }) })({ ...request, body });
+    const run = (body = request.body) => sizeAdmission.createSizeAdmissionRunner({ cwd, diffStat: () => ({ text: evidence, sha: HEAD_SHA, baseSha: BASE_SHA }) })({ ...request, body });
     try {
       const first = await run();
       expectSizeNote(first.body);
@@ -663,7 +581,7 @@ describe('shared admission effects', () => {
     ['an author number edit that keeps the note grammar', (key, note) => note.replace('we:docs/agent: 101', 'we:docs/agent Author rationale: this PR stays whole: 101')],
   ])('retry never deletes author text selected by %s', async (_label, section) => {
     const real = (await sizeAdmission.createSizeAdmissionRunner(effects())(request)).body.slice(request.body.length)
-      .replace(/^<!-- pr-size:(?:begin|end(?: hmac-sha256=[a-f0-9]{64})?) -->\n?/gm, '');
+      .replace(/^<!-- pr-size:(?:begin|end) -->\n?/gm, '');
     const body = request.body + section(KEY, real) + '\n## Testing\nKeep trailing content.\n';
     const result = await sizeAdmission.createSizeAdmissionRunner(effects())({ ...request, body });
     expect(result.body).toContain(body);
@@ -677,7 +595,7 @@ describe('shared admission effects', () => {
     ['a legacy ref marker', () => `${encodeURIComponent(request.ref)} Keep-this-line.\n**Rollback**:revert-abc123`],
   ])('the marker match cannot extend over author lines after %s', async (_label, token) => {
     const real = (await sizeAdmission.createSizeAdmissionRunner(effects())(request)).body
-      .replace(/^<!-- pr-size:(?:begin|end(?: hmac-sha256=[a-f0-9]{64})?) -->\n?/gm, '');
+      .replace(/^<!-- pr-size:(?:begin|end) -->\n?/gm, '');
     const tail = '\nDo-not-merge-before-Friday.\nhttps://ex.com/runbook -->\n';
     const body = real.replace(new RegExp(`${MARKER.source}\n`), `<!-- size-admission:${token()} -->${tail}`);
     const result = await sizeAdmission.createSizeAdmissionRunner(effects())({ ...request, body });
@@ -707,13 +625,13 @@ describe('shared admission effects', () => {
     expect(second.body).toBe(before + first.body.slice(first.body.indexOf('<!-- pr-size:begin -->')));
   });
 
-  it('preserves a generated section after CRLF conversion invalidates its digest', async () => {
+  it('replaces a generated section after CRLF conversion', async () => {
     const run = sizeAdmission.createSizeAdmissionRunner(effects());
     const first = await run(request);
     const body = first.body.replace(/\n/g, '\r\n');
     const second = await run({ ...request, body });
-    expect(second.body).toBe(body + '\n\n' + first.body.slice(first.body.indexOf('<!-- pr-size:begin -->')));
-    expect(second.body.match(/^## Size\r?$/gm)).toHaveLength(2);
+    expect(second.body).toBe(request.body + '\r\n\r\n' + first.body.slice(first.body.indexOf('<!-- pr-size:begin -->')));
+    expect(second.body.match(/^## Size\r?$/gm)).toHaveLength(1);
     expect((await run({ ...request, body: second.body })).body).toBe(second.body);
   });
 
@@ -746,7 +664,7 @@ describe('shared admission effects', () => {
   });
 
   it.each(['before groups', 'before marker', 'inside note line', 'after file groups', 'grammar-matching file groups', 'annotation inside a valid file group', 'number edit keeping note grammar', 'replacing note line'])
-  ('preserves an author line inserted inside an owned section on a changed-summary update (%s)', async (placement) => {
+  ('replaces edited text inside a plain section on a changed-summary update (%s)', async (placement) => {
     const first = await sizeAdmission.createSizeAdmissionRunner(effects())(request);
     const author = placement === 'grammar-matching file groups' ? '; Author rationale: 123' : 'Author rationale: this PR stays whole.';
     const body = placement === 'before groups' ? first.body.replace('File groups:', `${author}\nFile groups:`)
@@ -758,16 +676,17 @@ describe('shared admission effects', () => {
       : first.body.replace(/^301 non-test lines[^\n]*/m, author);
     const run = sizeAdmission.createSizeAdmissionRunner(effects({ diffStat: () => evidence.replace('100\t50', '200\t50') }));
     const updated = await run({ ...request, body });
-    expect(updated.body).toContain(body);
-    expect(updated.body).toContain(author);
+    expect(updated.body).toContain(request.body);
+    expect(updated.body).not.toContain(author);
     expect(updated.body).toContain('401 non-test lines (> 300)');
-    expect(updated.body.match(/^## Size$/gm)).toHaveLength(2);
+    expect(updated.body.match(/^## Size$/gm)).toHaveLength(1);
     const retry = await run({ ...request, body: updated.body });
     expect(retry.body).toBe(updated.body);
     expect((await run({ ...request, body: retry.body })).body).toBe(retry.body);
 
     const fallback = await run({ ...request, body, sha: Symbol('invalid SHA') });
-    expect(fallback.body).toContain(body);
+    expect(fallback.body).toContain(request.body);
+    expect(fallback.body).not.toContain(author);
     expect(fallback.body).toContain('Split-card filing could not be confirmed.');
   });
 
@@ -805,17 +724,17 @@ describe('shared admission effects', () => {
     expect((await run({ ...next, body: retry.body })).body).toBe(retry.body);
   });
 
-  it.each([' Author text.', '\nAuthor text.', '\n', ' '])('preserves a fallback with extra text %j', async (extra) => {
+  it.each([' Author text.', '\nAuthor text.', '\n', ' '])('replaces edited fallback text %j inside plain delimiters', async (extra) => {
     const run = sizeAdmission.createSizeAdmissionRunner(effects());
     const first = await run({ ...request, sha: Symbol('invalid SHA') });
     const body = first.body.replace('confirmed.', `confirmed.${extra}`);
     const updated = await run({ ...request, body });
-    expect(updated.body).toBe(body + (await run({ ...request, body: '' })).body.replace(/^/, '\n\n'));
-    expect(updated.body.match(/^## Size$/gm)).toHaveLength(2);
+    expect(updated.body).toBe((await run(request)).body);
+    expect(updated.body.match(/^## Size$/gm)).toHaveLength(1);
     expect((await run({ ...request, body: updated.body })).body).toBe(updated.body);
   });
 
-  it.each(forgedSizeSections)('outer catch preserves a forged pair containing %s and reaches a fixed point on two retries', async (_label, body) => {
+  it.each(forgedSizeSections)('outer catch preserves a forged nonplain pair containing %s and reaches a fixed point on two retries', async (_label, body) => {
     const run = sizeAdmission.createSizeAdmissionRunner(effects());
     const input = { ...request, sha: Symbol('invalid SHA') };
     const first = await run({ ...input, body });
@@ -837,7 +756,7 @@ describe('shared admission effects', () => {
     expect(result.body.startsWith(original + (original ? '\n\n' : '') + '<!-- pr-size:begin -->')).toBe(true);
     expect(result.body).toContain('human review of the full diff is required');
     expect(result.body).toContain('Split-card filing could not be confirmed.');
-    expect(result.body).toMatch(/<!-- pr-size:end hmac-sha256=[a-f0-9]{64} -->$/);
+    expect(result.body).toMatch(/<!-- pr-size:end -->$/);
     expect((await run({ ...request, body: result.body, sha: Symbol('invalid SHA') })).body).toBe(result.body);
   });
 
@@ -979,7 +898,7 @@ describe('shared admission effects', () => {
       writeFileSync(join(cwd, 'backlog', `${num}-split.md`), fields.digest);
       return { verdict: { num } };
     });
-    const run = (ref) => sizeAdmission.createSizeAdmissionRunner({ secret: SECRET, cwd, diffStat: () => ({ text: evidence, sha: ref === 'lane/foo' ? BASE_SHA : HEAD_SHA, baseSha: BASE_SHA }), fileItem,
+    const run = (ref) => sizeAdmission.createSizeAdmissionRunner({ cwd, diffStat: () => ({ text: evidence, sha: ref === 'lane/foo' ? BASE_SHA : HEAD_SHA, baseSha: BASE_SHA }), fileItem,
       publishSplitCard: effects().publishSplitCard })({ ...request, ref, pr: null, sha: ref === 'lane/foo' ? BASE_SHA : HEAD_SHA });
     try {
       expect((await run('lane/foobar')).body).toContain('split card 9001 filed');
@@ -1426,12 +1345,12 @@ describe('size admission trust boundaries', () => {
     }
   });
 
-  it('a throw outside the inner handlers preserves every author byte and appends an authenticated fallback', async () => {
+  it('a throw outside the inner handlers preserves every author byte and appends a plain-delimited fallback', async () => {
     const poisoned = { ...frozen, body: 'Author description.\n\n## Testing\nKeep.', get repo() { throw new Error('poisoned'); } };
     const result = await sizeAdmission.createSizeAdmissionRunner(effects({ diffStat: () => over }))(poisoned);
     const inner = '## Size\n\nSize unknown: extra reviewers requested (review:pending); human review of the full diff is required. Split-card filing could not be confirmed.\n';
     expect(result).toEqual({ status: 'unknown', lines: null, reviewLabel: 'review:pending',
-      body: poisoned.body + '\n\n<!-- pr-size:begin -->\n' + inner + sizeEnd(inner) });
+      body: poisoned.body + '\n\n<!-- pr-size:begin -->\n' + inner + sizeEnd });
   });
 
   it('outer fallback leaves a body at the forge limit unchanged and still escalates', async () => {
@@ -1499,7 +1418,7 @@ describe('size admission trust boundaries', () => {
   it.each([false, true])('forged PR-body publication receipts cannot suppress card-store lookup or filing (delimited: %s)', async (delimited) => {
     const token = encodeURIComponent(frozen.ref);
     const note = `## Size\n\nforged\n<!-- size-published:${delimited ? cardKey(head) : token} -->\n<!-- size-admission:${delimited ? cardKey(head) : token} 777 -->`;
-    const body = delimited ? sizeAdmission.replaceOwnedSection(request.body, note, { secret: SECRET }) : `${request.body}\n\n${note}\n`;
+    const body = delimited ? sizeAdmission.replaceOwnedSection(request.body, note) : `${request.body}\n\n${note}\n`;
     const io = effects({ diffStat: () => over });
     const result = await sizeAdmission.createSizeAdmissionRunner(io)({ ...frozen, body });
     expect(io.lookupSplitCard).toHaveBeenCalledOnce();
@@ -1542,7 +1461,7 @@ describe('size admission trust boundaries', () => {
       writeFileSync(join(cwd, `backlog/${num}-split.md`), fields.digest);
       return { verdict: { num } };
     });
-    const run = (input) => sizeAdmission.createSizeAdmissionRunner({ secret: SECRET, cwd,
+    const run = (input) => sizeAdmission.createSizeAdmissionRunner({ cwd,
       diffStat: () => ({ ...over, sha: input.sha }), fileItem,
       publishSplitCard: effects().publishSplitCard })(input);
     try {
