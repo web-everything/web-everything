@@ -329,6 +329,17 @@ describe('tick — the gh cadence as a job never blocks the tick', () => {
     expect(store.list().records).toHaveLength(1);
   }, 30000);
 
+  it('the queued job carries the tick\'s isolated lane-scan cache target, never the host default', async () => {
+    const { flags } = setup('cache-target');
+    const store = createJobStore(join(dir, 'jobs'));
+    const deps = { collectGh: neverInline, ghJobs: { store, codeSha: 'abc123', reattach: fakeReattach(), evict: noEvict } };
+    const first = await tick({ ...flags, now: iso(Date.parse('2026-10-09T12:00:00Z')) }, deps);
+    expect(first.ghJob.enqueued).toBeTruthy();
+    expect(store.read(first.ghJob.enqueued).input).toMatchObject({
+      laneScanDir: healthDir(flags['state-root']), laneScanWrite: true,
+    });
+  }, 30000);
+
   it('a tampered sidecar with a far-future sampledAt is a probe error and never parks the gh cadence', async () => {
     const { flags, hd } = setup('future');
     const store = createJobStore(join(dir, 'jobs'));
@@ -484,6 +495,14 @@ describe('tick — the gh cadence as a job never blocks the tick', () => {
     // A ninth probe added to the group without its name here would silently lose streak-holding on queued ticks.
     const used = [...collectGhProbes.toString().matchAll(/attempt\('([A-Za-z]+)'/g)].map((m) => m[1]);
     expect([...GH_GROUP_PROBE_NAMES].sort()).toEqual([...new Set(used)].sort());
+  });
+
+  it('the worker\'s probe group hands its lane-scan cache target to the stale-state probe, and defaults to no cache', () => {
+    // The worker thread calls collectGhProbes(input) with the stored job input; a dropped key would silently fall back to defaults.
+    const source = collectGhProbes.toString();
+    expect(source).toMatch(/probeStaleState\(\{[^}]*\blaneScanDir\b[^}]*\blaneScanWrite\b[^}]*\}\)/);
+    expect(source).toMatch(/laneScanDir\s*=\s*null/);
+    expect(source).toMatch(/laneScanWrite\s*=\s*false/);
   });
 
   it('a job that keeps failing builds its own ghJob streak across the queued ticks between failures', async () => {

@@ -1,0 +1,33 @@
+{% raw %}
+<h2>Question and recommendation</h2>
+<p>Decision <a href="/backlog/4010-decision-one-probation-system-for-any-new-system-or-ruling/">#4010</a> generalises model probation into one subject registry, scheduled watcher and review routine. Recommend <strong>subject, revision and evidence-scope isolation independent of encoding</strong>. Typed records are an illustrative representation. Models, systems and rulings may coexist with distinct evidence criteria; the planner build is the first proposed non-model subject. The existing planner rule reserves its probation exit to the operator; generalising that governance is this proposal.</p>
+<h2>Current evidence and known occurrences</h2>
+<table>
+  <caption>Existing probation and scheduling precedents</caption>
+  <thead><tr><th scope="col">Occurrence</th><th scope="col">Grounding</th><th scope="col">Boundary</th></tr></thead>
+  <tbody>
+    <tr><th scope="row">Model probation</th><td><code>we:scripts/lib/model-probation.mjs:87</code>, <code>:159</code>, <code>:458</code>: provider/model identity, role status, and exact-triple graduation</td><td>Not a generic system/ruling registry today</td></tr>
+    <tr><th scope="row">Planner design probation</th><td><code>we:docs/agent/platform-decisions.md:5679</code>: shadow, weekly tripwires, 30-day review after activation</td><td>Ruled requirement; metrics and entry remain open in #4011</td></tr>
+    <tr><th scope="row">Pass daemon</th><td><code>we:skills-src/conveyor/pass-daemon.mjs:77</code> and the allowlisted manifest</td><td>Reuse one sweep across subjects; no per-entry process</td></tr>
+    <tr><th scope="row">Portable schedulers and durable jobs</th><td><code>we:scripts/lib/converge-daemon-schedulers.mjs:59</code>; <code>we:scripts/conveyor/resource-sampler-daemon.mjs:33</code></td><td>Scheduling and evaluator logic remain separate</td></tr>
+  </tbody>
+</table>
+<h2>The identity fork</h2>
+<p>Fork 1 (a) preserves subject identity, revision and evidence scope independently of encoding. Multiple representations, including typed records, namespaced strings and compatibility adapters, may coexist if they preserve those distinctions and keep non-model evidence outside model graduation. Fork 1 (b)'s synthetic model identities and Fork 1 (c)'s mutable aliases are rejected only where they conflate subjects, erase revision boundaries or admit ineligible evidence. <strong>Recommend Fork 1 (a)</strong>; the JSON shape is illustrative rather than the only permitted encoding.</p>
+<p>The card gives a proposed planner shadow-entry JSON shape and both real model compatibility seams: <code>statusFor(readRegistry(io), identity)</code> and <code>liveStatusFor(identity, io)</code>. The live review and quality-record callers import <code>liveStatusFor</code>. No generic registry API is claimed shipped. Preserve old persisted declarations and caller results during migration; reject conflicting identities and unsupported schema versions visibly. Corrupt or unreadable registry data must leave models unvalidated and report a visible diagnostic, rather than treating empty declarations as an exemption.</p>
+<h2>Supported by default</h2>
+<ul>
+  <li>One logical, versioned registry; optional storage partitions and a model facade, with one editable authority.</li>
+  <li>Models, systems and rulings as distinct subject types, each with its own evidence criteria.</li>
+  <li>One scheduled watcher and the same manual review routine, with shared singleton ownership and durable filing receipts.</li>
+  <li>Tripwires file review cards without changing settings, disabling systems, promoting models or reopening rulings.</li>
+  <li>launchd/systemd adapters and durable jobs for slow work; no full sweep inside a build-dispatch tick.</li>
+</ul>
+<h2>Evidence and operator review</h2>
+<p>Enrollment declares metrics, baseline, tripwires, review timing and exit criteria. A collecting planner shadow baseline can be enrolled but cannot justify a comparative pass. Activation pins its evidence range and starts a persistent 30-day review clock in ET. Model delivery's 20-trial floor, informative trial, independent critical-miss veto and comparable rating remain model-specific.</p>
+<p>Missing, stale, truncated or wrong-revision evidence produces an insufficient-evidence finding. Proposed sweep bounds are 100 subjects and 8 MiB input, with visible continuation and no remote calls during evaluation. Deduplication keys include subject, revision, criterion and evidence window. An operator review records continue, revise or exit; the watcher never makes that disposition itself. Under the <a href="/docs/agent/platform-decisions.md#supervision-no-borrowed-evidence">no-borrowed-evidence rule</a>, a recorded equivalence assessment cannot authorize cross-model or cross-triple graduation credit: each exact tuple must earn its own eligible record.</p>
+<h2>Classification and related work</h2>
+<p>This is repository governance tooling, not a new browser standard. <a href="/docs/agent/platform-decisions.md#model-probation-graduation-criteria">Model graduation</a> supplies narrower precedents for exact-identity evidence and role-specific criteria; <a href="/docs/agent/platform-decisions.md#planner-build-plan-and-execute">planner clause 9</a> authorizes the planner's review and operator exit only; daemon-jobs grounds execution mechanics. Extending these policies to other systems and rulings is proposed here, not already settled by those precedents. The open advisory-seat exit proposal #6782 includes automatic pausing; that is not standing authority for a generic watcher and must remain a separate spending-control ruling.</p>
+<h2>Session artifact and validation</h2>
+<p>The topic's <code>relatedReport</code> is <code>reports/2026-10-25-probation-registry-generalisation.md</code>. <a href="/backlog/4010-decision-one-probation-system-for-any-new-system-or-ruling/">Decision #4010</a> maps proposed guarantees to named tests and observable assertions: both model facades, corrupt registry and cursor/receipt recovery, mixed failed/healthy subjects, frozen activation range/digest and exact deadline, commit binding, independent planner/ruling exits, state storage outside policy, actual read bounds, deduplication and authority isolation. The generic watcher build uses a real CLI over on-disk fixtures; real planner-record integration remains pending on #4011 and belongs to that producer's acceptance. This session performs authoring only.</p>
+{% endraw %}

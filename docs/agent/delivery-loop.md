@@ -240,6 +240,8 @@ work, and leaving effort at its inherited default is the same under-spend model 
 the other axis — see *Effort routing* in `we:docs/agent/backlog-workflow.md#effort-routing`. A mechanical
 spawn (a named one-file fix, a pointer check) wants `--effort low` instead; judgment wants `high`/`xhigh`.
 
+Preferred task vendors resolve through [`vendorRouting.byTaskType`](../../scripts/settings/vendor-routing.json) via `scripts/lib/vendor-routing-settings.mjs`: standard defaults (read-only/research → Gemini, code → Codex, judgment → Claude), platform preferences, tool settings, then `WE_VENDOR_ROUTING` (JSON task-type-to-vendor object), with source logging. "Gemini" means the LOCAL Antigravity CLI (`agy`, see scripts/gemini-direct-task.mjs), which runs on this machine and counts against Mac load (run one at a time, only under the host load cap) - it is not a remote service. agy can hit a quota hold; the reader only names the preferred vendor, callers must fall back per their own rules.
+
 Run it in the background and keep working; the verdict arrives on the PR. Several at once is normal —
 see *Parallelism* below.
 

@@ -1,11 +1,12 @@
-/** Per-item enqueue exclusion and read/plan ports. No claim or effect execution lives here. */
+/** Per-item exclusion, recording facts and recoverable effect execution through injected ports. */
 import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { withFileLock } from './atomic-json-file.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { RESOURCE_POLICY_KINDS } from './resource-policy.mjs';
-import { taskRunId, markQueued, DEFAULT_TASK_TIMEOUT_MS, validateTaskPolicy } from './daemon-jobs.mjs';
+import { taskRunId, markQueued, DEFAULT_TASK_TIMEOUT_MS, validateTaskPolicy, taskFailureCharge } from './daemon-jobs.mjs';
 import { validateTaskIdentity, validateTaskMetadata, TERMINAL_JOB_STATUSES } from '../operations/job-record.mjs';
 import { newJobRunRecord, isValidRunId } from '../operations/run-record.mjs';
 
@@ -103,6 +104,8 @@ function freezeData(value, seen = new Set()) {
 const accessors = new WeakMap();
 const fieldPath = path => typeof path === 'string' && /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(path) &&
   !path.split('.').some(key => ['__proto__', 'constructor', 'prototype'].includes(key));
+const containsComments = value => value !== null && typeof value === 'object' &&
+  Object.entries(value).some(([key, child]) => key === 'comments' || containsComments(child));
 
 /**
  * load() synchronously supplies { identity, observedAt (epoch ms), source, complete, data }.
@@ -136,6 +139,11 @@ export function createRecordingFacts({ load, expectedIdentity, now, snapshotMaxA
         for (const key of path.split('.')) {
           if (!value || typeof value !== 'object' || !Object.hasOwn(value, key)) throw new Error('missing field');
           value = value[key];
+        }
+        // A parent object can expose comments without naming them in the requested path.
+        if ((path.split('.').includes('comments') || containsComments(value)) &&
+          (snapshot.thread?.source !== 'live-thread' || snapshot.thread.complete !== true)) {
+          throw new Error('comment facts require a complete live thread provider');
         }
         reads.set(path, Object.freeze({ path, source: snapshot.source, observedAt: snapshot.observedAt, age: now - snapshot.observedAt }));
         return value;
@@ -174,4 +182,189 @@ export function validateTaskPlan({ facts, effects }) {
     return freezeData({ effects, recordedReads: facts.recordedReads,
       inputs: Object.fromEntries([...state.reads.keys()].map(path => [path, facts.read(path)])) });
   } catch (error) { refuse(`plan must be serializable: ${error.message}`); }
+}
+
+
+/**
+ * Async child-side executor. record.read()/update(fn) must be ownership-checked atomic operations;
+ * update runs fn under the record lock and returns the committed record. We also check status,
+ * handle and attempt inside every callback, so a stale child cannot write or start reads.
+ *
+ * read({gh}) and effects.fence(context) return createRecordingFacts accessors. plan(facts)
+ * returns effect declarations. probe returns {applied: boolean, evidence?}; live-marker probes
+ * additionally require thread: {source: "live-thread", complete: true}, asserting full pagination.
+ * act returns JSON
+ * evidence and must enforce the declared server precondition. All remote IO in these adapters
+ * goes through gh.read(fn)/write(fn), including pagination/retries. Budgets are explicit finite
+ * nonnegative integers; local claim, record and run-store operations do not spend GitHub budget.
+ * worker-run probes exclusively call runStore.find(effectId), which must authoritatively return
+ * null or a worker with status launching/running/done. No GitHub probe is invoked for that kind.
+ *
+ * Durable execution state lives at job.task.execution: effects by stable ID, results and timing
+ * entries by launch attempt. Runtime publication/retry and timeout synthesis consume that state;
+ * this core never changes the launch token, job status, backoff or owner handle.
+ */
+export async function runItemTask({ task, attempt, handle, record, read, plan, claim, effects,
+  runStore, budgets, now = Date.now, timing = () => {} }) {
+  task = taskIdentity(task);
+  if (!Number.isSafeInteger(attempt) || attempt < 1 || typeof handle !== 'string' || !handle) {
+    throw new TypeError('task execution requires a launch attempt and handle');
+  }
+  const stop = (outcome, reason) => Object.assign(new Error(reason), { outcome });
+  const owned = r => {
+    if (r?.job?.status !== 'running' || r.job.handle !== handle || r.job.attempts !== attempt || r.job.task?.id !== task.id) {
+      throw stop('superseded', 'task writer no longer owns this running launch');
+    }
+    return r;
+  };
+  const current = async () => owned(await record.read());
+  const update = async fn => {
+    const committed = await record.update(r => fn(owned(r)));
+    return owned(committed);
+  };
+  const gh = { read: 0, write: 0 }, timings = Object.fromEntries(
+    ['read', 'plan', 'claim', 'probe', 'fence', 'act', 'mark', 'release'].map(p => [p, 0]));
+  let phase = 'read', facts, token, result, reason, outcome = 'nothing-owed', saved = {};
+  const measured = async (name, fn) => {
+    phase = name;
+    const start = now();
+    try { return await fn(); } finally { timings[name] += Math.max(0, now() - start); }
+  };
+  const metered = Object.freeze(Object.fromEntries(['read', 'write'].map(kind => [kind, async fn => {
+    // Adapters may await or retry after entry: recheck both authorities before each write.
+    if (kind === 'write') await assertClaim();
+    else await current();
+    if (gh[kind] >= budgets[kind]) throw Error(`budget-exhausted: GitHub ${kind}; reschedule with refreshed budget or correct the declared bound`);
+    gh[kind]++;
+    return fn();
+  }])));
+  const remember = async entry => measured('mark', async () => {
+    await update(r => {
+      const execution = r.job.task.execution ?? { effects: {}, results: {}, timings: {} };
+      execution.effects[entry.effectId] = freezeData(entry);
+      r.job.task.execution = execution;
+      saved = execution.effects;
+      return r;
+    });
+  });
+  const assertClaim = async () => {
+    await current();
+    if (token === null || token === undefined || token === false) throw stop('superseded', 'item claim required before effect');
+    if (await claim.assert(token, task) !== true) throw stop('superseded', 'item claim lost before effect');
+    await current(); // the launch can be superseded while the claim assertion awaits
+  };
+  try {
+    const r = await current();
+    const completed = r.job.task.execution?.results?.[attempt];
+    if (completed) return completed;
+    saved = r.job.task.execution?.effects ?? {};
+    if (!budgets || ['read', 'write'].some(k => !Number.isSafeInteger(budgets[k]) || budgets[k] < 0)) {
+      throw Error('task requires finite read/write budgets; correct policy before rescheduling');
+    }
+    facts = await measured('read', () => read({ gh: metered }));
+    if (!accessors.has(facts) || facts.outcome !== 'ready') throw stop('deferred-read', facts?.reason ?? 'unreadable recording facts');
+    const factIdentity = accessors.get(facts)().snapshot.identity;
+    if (factIdentity.repo !== task.repo || factIdentity.item !== task.item) throw stop('deferred-read', 'task fact identity mismatch');
+    const planned = await measured('plan', async () => {
+      const declarations = await plan(facts);
+      if (facts.outcome !== 'ready') throw stop('deferred-read', facts.reason);
+      if (declarations.length && accessors.get(facts)().snapshot.source !== 'live-pr') {
+        throw stop('deferred-read', 'effects require complete live per-PR facts, including comment threads');
+      }
+      return validateTaskPlan({ facts, effects: declarations });
+    });
+    // Pending intents survive replans (including an empty plan). Their original values remain
+    // authoritative: a new plan cannot silently overwrite an interrupted operation's inputs.
+    const pending = Object.values(saved).filter(e => e.status === 'intent');
+    const queue = new Map(pending.map(e => [e.effectId, e]));
+    for (const declaration of planned.effects) {
+      const effectId = `${task.id}:${declaration.name}`;
+      if (!queue.has(effectId)) queue.set(effectId, saved[effectId] ?? {
+        effectId, status: 'intent', declaration,
+        inputs: Object.fromEntries(declaration.fences.map(path => [path, planned.inputs[path] ?? facts.read(path)])),
+        precondition: declaration.precondition,
+      });
+    }
+    if (queue.size) {
+      token = await measured('claim', () => claim.acquire(task));
+      if (token === null || token === undefined || token === false) throw stop('deferred-claim-held', 'item claim held; retry after the owner releases it');
+    }
+    for (const entry of queue.values()) {
+      if (entry.status === 'applied') { outcome = 'acted'; continue; }
+      const context = { task, attempt, effectId: entry.effectId, effect: entry.declaration,
+        inputs: entry.inputs, precondition: entry.precondition, claim: token, gh: metered };
+      // Planning and claim acquisition can await a newer launch; stale owners cannot start probes.
+      await current();
+      const probe = await measured('probe', async () => {
+        if (entry.declaration.appliedProbe !== 'worker-run') return effects.probe(context);
+        const worker = await runStore.find(entry.effectId);
+        if (worker === null) return { applied: false };
+        if (!worker || !['launching', 'running', 'done'].includes(worker.status)) throw Error('indeterminate worker run-store probe');
+        return { applied: true, evidence: worker };
+      });
+      if (!probe || typeof probe.applied !== 'boolean') throw Error('indeterminate authoritative applied probe');
+      if (entry.declaration.appliedProbe === 'live-marker' &&
+        (probe.thread?.source !== 'live-thread' || probe.thread.complete !== true)) {
+        throw Error('comment marker probe requires a complete live thread provider');
+      }
+      if (probe.applied) {
+        await remember({ ...entry, status: 'applied', evidence: probe.evidence ?? { probed: true } });
+        outcome = 'acted';
+        continue;
+      }
+      await measured('fence', async () => {
+        await assertClaim();
+        const live = await effects.fence(context);
+        const state = accessors.get(live)?.();
+        if (!state || state.reason || state.snapshot.source !== 'live-pr') throw stop('deferred-read', live?.reason ?? 'incomplete live fence');
+        if (state.snapshot.identity.repo !== task.repo || state.snapshot.identity.item !== task.item) throw stop('deferred-read', 'live fence identity mismatch');
+        for (const path of entry.declaration.fences) {
+          if (!isDeepStrictEqual(live.read(path), entry.inputs[path])) throw stop('superseded', `live input changed: ${path}`);
+        }
+      });
+      await remember(entry); // durable intent BEFORE act, including after a conclusive restart probe
+      const evidence = await measured('act', async () => {
+        await assertClaim(); // ownership can change during the fence or record write
+        return effects.act(context);
+      });
+      await remember({ ...entry, status: 'applied', evidence });
+      outcome = 'acted';
+    }
+  } catch (error) {
+    outcome = error.outcome ?? (phase === 'probe' ? 'failed' :
+      ((phase === 'read' || phase === 'fence' || facts?.outcome === 'deferred-read') ? 'deferred-read' : 'failed'));
+    reason = error.message;
+  } finally {
+    if (token !== null && token !== undefined && token !== false) {
+      try { await measured('release', () => claim.release(token, task)); }
+      catch (error) {
+        if (outcome !== 'superseded') outcome = 'failed';
+        reason = `${reason ? `${reason}; ` : ''}claim release failed: ${error.message}`;
+      }
+    }
+  }
+  result = freezeData({ v: 1, taskId: task.id, attempt, outcome, ...(reason ? { reason } : {}),
+    effects: Object.values(saved), recordedReads: facts?.recordedReads ?? [], timings, gh });
+  try {
+    let entry;
+    await update(r => {
+      const execution = r.job.task.execution ?? { effects: {}, results: {}, timings: {} };
+      if (execution.results[attempt]) { result = execution.results[attempt]; return r; }
+      r.job.task.failureCount += taskFailureCharge(outcome);
+      r.job.task.outcome = outcome;
+      execution.results[attempt] = result;
+      entry = { type: 'task-timing', key: `${task.id}:${attempt}`, taskId: task.id, attempt,
+        outcome, failureCount: r.job.task.failureCount, timings, gh };
+      execution.timings[attempt] = entry;
+      r.job.task.execution = execution;
+      return r;
+    });
+    if (entry) await timing(entry);
+  } catch (error) {
+    if (error.outcome === 'superseded') return freezeData({ ...result, outcome: 'superseded', reason: error.message });
+    // Publication/logging failures never replay effects or charge another failure; durable results
+    // and task-timing entries are available to the runtime's completion/recovery collector.
+    throw error;
+  }
+  return result;
 }
