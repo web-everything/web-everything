@@ -12,6 +12,7 @@ import { readSettings } from '../lib/settings-files.mjs';
 import { readVerifyMarker, VERIFY_FILENAME } from '../lib/lane-verify.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
 import { parseRunJsonTail } from './land-prevention-card.mjs';
+import { primaryCheckout } from '../bootstrap-session.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 export const CARD_BATCH_STATE_DIR = cardBatchStateDir();
@@ -42,6 +43,8 @@ export function resolveAdoptDescendantHead({ env = process.env, read = readSetti
 export async function publishBatch(input, opts = {}) {
   const { stateDir = CARD_BATCH_STATE_DIR, exec = batchExec, clock = Date.now, remote = 'origin',
     policy = effectiveCardBatchPolicy(), leaseMs = 3 * 60 * 60_000, crashAt, verifyRetryMinutes } = opts;
+  // A job launched from a lane clone has no canonical origin of its own; anchor lane acquisition on the primary checkout.
+  const reference = opts.reference ?? primaryCheckout(ROOT);
   const now = () => new Date(clock()).getTime();
   const statePath = resolve(input.statePath ?? join(stateDir, `${input.source.repo.replaceAll('/', '-')}-${input.kind}.json`));
   mkdirSync(dirname(statePath), { recursive: true });
@@ -145,7 +148,7 @@ export async function publishBatch(input, opts = {}) {
     writeFileSync(bodyPath, renderBatchBody(state));
     const acquireCheckout = async () => {
       const acquire = pin => run('node', [join(ROOT, 'scripts/lane-pool.mjs'), 'acquire',
-        '--purpose=card-batch-seal', '--ttl-minutes=180', ...(pin ? [`--lane=${pin}`] : []), '--json'], { timeout: 3 * 60_000 });
+        '--purpose=card-batch-seal', '--ttl-minutes=180', `--reference=${reference}`, ...(pin ? [`--lane=${pin}`] : []), '--json'], { timeout: 3 * 60_000 });
       // The remembered lane is a preference, not a requirement: once released it may be leased by anyone (live
       // 2026-10-10: lane-2 went to a fix worker and every retry failed). The verify receipt is restored from
       // state below, so any lane serves.
