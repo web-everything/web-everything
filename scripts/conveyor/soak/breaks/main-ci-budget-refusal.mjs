@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { sweepMainCancelledRetrigger, rerunMainCancelledRun, mainRetriggerRecordPath } from '../../ci-red-recovery-watch.mjs';
 import { DEFAULT_MAIN_WORKFLOW_NAME } from '../../main-red-recovery.mjs';
 import { runGhSync, writeBudgetBlock } from '../../../lib/gh-throttle.mjs';
+import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
 
 const SOURCE = 'scripts/conveyor/ci-red-recovery-watch.mjs';
 const REPO = 'main-ci-fixture/example';
@@ -70,7 +71,7 @@ export default {
 
       // WE's legacy filename and a mirror's new file share a home and a commit, but not a retry.
       const sharedHome = join(root, 'shared-head');
-      const repos = [['web-everything/web-everything', 321], ['main-ci-fixture/mirror', 654]];
+      const repos = [[CONSTELLATION_REPOS.we.slug, 321], ['main-ci-fixture/mirror', 654]];
       const sharedSubmissions = [];
       for (let tick = 0; tick < 3; tick++) {
         for (const [repo, runId] of repos) {
