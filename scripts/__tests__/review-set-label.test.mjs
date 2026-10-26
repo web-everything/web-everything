@@ -49,6 +49,9 @@ import { parseClearerActorId, parseAuthorActorId, readAuthorActorStamps } from '
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../lib/review-escalation.mjs';
 import { ADVISORY_LABELS, parseAdvisories } from '../lib/advisory-labels.mjs';
 import { PR_COMMENTS_PAGE_SIZE } from '../lib/review-label-provider.mjs';
+import { REARM_COMMENT_MARKER, countRearmComments } from '../conveyor/rearm-review.mjs';
+import { planOrphanFixRound, ORPHAN_GUARD_MARKER } from '../conveyor/orphan-fix-round.mjs';
+import { FIX_END_MARKER } from '../conveyor/fix-procedure.mjs';
 
 // HERMETIC (card xcu4cqf): on an accept/clear-human/restamp the CLI reads the PR's net diff with `git fetch origin
 // +main:refs/remotes/origin/main <head>` + `merge-base`/`diff` against `origin/...` in the PROCESS's git repo, which
@@ -3053,24 +3056,43 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     rmSync(`${ledgerDir}-locks`, { recursive: true, force: true });
   });
   // The caller read `accepted`; by the child's own read a reviewer has flipped it to `changes`.
-  function run(argv, labels, { comments = [], omitComments = false, readComments = () => comments, headRefOid = 'a'.repeat(40), freshState = {}, swapState = freshState, postSwapState = null } = {}) {
+  function run(argv, labels, { comments = [], omitComments = false, readComments = () => comments, headRefOid = 'a'.repeat(40), freshState = {}, swapState = freshState, postSwapState = null,
+    postCommentFailures = 0, postCommentFailureState = () => null, rollbackFailure = false, buildComment = () => '# body' } = {}) {
     const calls = [];
     const postedBodies = [];
+    const labelWrites = [];
+    const rearmRetrySleep = vi.fn();
+    let liveLabels = [...labels];
     const initial = { labels: labels.map((name) => ({ name })), headRefOid, headRefName: 'lane/x', state: 'OPEN', isDraft: false, body: '',
       ...(omitComments ? {} : { comments }) };
-    const readPrState = vi.fn().mockReturnValueOnce(initial).mockReturnValueOnce({ ...initial, ...freshState })
-      .mockReturnValue({ ...initial, ...swapState });
+    const liveState = state => ({ ...initial, labels: liveLabels.map(name => ({ name })), ...state });
+    const readPrState = vi.fn().mockReturnValueOnce(initial).mockImplementationOnce(() => liveState(freshState))
+      .mockImplementation(() => liveState(swapState));
     const provider = {
       name: 'stub',
       currentRepo: () => 'o/n',
       readPrState,
       readComments,
-      readLabels: () => labels.map((name) => ({ name })),
-      setLabels: () => {
+      readLabels: () => liveLabels.map((name) => ({ name })),
+      setLabels: (_repo, _pr, spec) => {
         calls.push('setLabels');
-        if (postSwapState) readPrState.mockReturnValue({ ...initial, ...swapState, ...postSwapState });
+        labelWrites.push(spec);
+        if (rollbackFailure && labelWrites.length > 1) throw new Error('rollback unavailable');
+        liveLabels = [...new Set([...liveLabels.filter(name => !spec.remove.includes(name)), ...(spec.add ? spec.add.split(',') : [])])];
+        if (postSwapState) readPrState.mockImplementation(() => liveState({ ...swapState, ...postSwapState }));
       },
-      postComment: (_repo, _pr, body) => { calls.push('postComment'); postedBodies.push(body); },
+      postComment: (_repo, _pr, body) => {
+        calls.push('postComment');
+        if (postCommentFailures-- > 0) {
+          const state = postCommentFailureState();
+          if (state) {
+            if (Array.isArray(state.labels)) liveLabels = state.labels.map(l => typeof l === 'string' ? l : l?.name);
+            readPrState.mockImplementation(() => liveState({ ...swapState, ...state }));
+          }
+          throw new Error('HTTP 503: comment unavailable');
+        }
+        postedBodies.push(body);
+      },
     };
     const chunks = [];
     const realExit = process.exit.bind(process);
@@ -3078,13 +3100,13 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     let exitCode = 0;
     try {
       runReviewLabelCli({
-        defaultActor: 'test', usage: 'usage: test', fixedTo: 'rearm', buildComment: () => '# body',
+        defaultActor: 'test', usage: 'usage: test', fixedTo: 'rearm', buildComment,
         successResult: (o) => ({ ok: true, ...o }), refusalResult: ({ decision }) => ({ ok: false, reason: decision.reason }),
-        emit: (l) => chunks.push(String(l)), provider, argv,
+        emit: (l) => chunks.push(String(l)), provider, argv, rearmRetrySleep,
       });
     } catch (e) { if (typeof e.exitCode === 'number') exitCode = e.exitCode; else throw e; }
     finally { process.exit = realExit; }
-    return { exitCode, calls, postedBodies, readPrState, ledgerWrites: readdirSync(ledgerDir), payload: JSON.parse(chunks.join('') || '{}') };
+    return { exitCode, calls, postedBodies, labelWrites, liveLabels, readPrState, rearmRetrySleep, ledgerWrites: readdirSync(ledgerDir), payload: JSON.parse(chunks.join('') || '{}') };
   }
 
   it.each([
@@ -3513,6 +3535,236 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     const { exitCode, calls } = run(['9', '--repo=o/n', `--expect-head=${'a'.repeat(40)}`], [REVIEW_LABELS.changes]);
     expect(exitCode).toBe(0);
     expect(calls).toEqual(['setLabels', 'postComment']);
+  });
+
+  describe('crash-safe pinned plain rearm', () => {
+    const argv = ['9', '--repo=o/n', `--expect-head=${'a'.repeat(40)}`];
+    const verdict = { id: 'IC_crash', body: '🔁 review — changes requested\nFindings',
+      createdAt: '2026-10-25T12:00:00Z', author: { login: 'web-everything' } };
+    const marker = { body: REARM_COMMENT_MARKER + buildRearmVerdictBinding(verdict),
+      createdAt: verdict.createdAt, author: verdict.author };
+    const options = { comments: [verdict], buildComment: () => REARM_COMMENT_MARKER };
+
+    it('rolls back the exact pre-swap labels after three HTTP 503 comment failures', () => {
+      const labels = [REVIEW_LABELS.changes, READY_TO_MERGE_LABEL, REVIEW_LABELS.redteamAccepted, 'unrelated'];
+      const result = run(argv, labels, { ...options, postCommentFailures: 3 });
+      expect(result.exitCode).toBe(1);
+      expect(result.calls).toEqual(['setLabels', 'postComment', 'postComment', 'postComment', 'setLabels']);
+      expect(result.labelWrites).toEqual([
+        { add: REVIEW_LABELS.pending, remove: [REVIEW_LABELS.changes, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL] },
+        { add: [REVIEW_LABELS.changes, REVIEW_LABELS.redteamAccepted, READY_TO_MERGE_LABEL].join(','), remove: [REVIEW_LABELS.pending] },
+      ]);
+      expect(result.liveLabels.sort()).toEqual([...labels].sort());
+      expect(result.postedBodies).toEqual([]);
+      expect(result.payload.error).toMatch(/503.*labels restored/i);
+      expect(result.rearmRetrySleep.mock.calls).toEqual([[1000], [1000]]);
+    });
+
+    it('retries a transient comment failure and posts exactly one marker', () => {
+      const result = run(argv, [REVIEW_LABELS.changes], { ...options, postCommentFailures: 1 });
+      expect(result.exitCode).toBe(0);
+      expect(result.calls).toEqual(['setLabels', 'postComment', 'postComment']);
+      expect(result.liveLabels).toEqual([REVIEW_LABELS.pending]);
+      expect(result.postedBodies).toEqual([marker.body]);
+      expect(result.rearmRetrySleep.mock.calls).toEqual([[1000]]);
+    });
+
+    it.each([null, {}, [null], [{ name: '' }]])('refuses unreadable pre-swap labels before writing: %j', labels => {
+      const result = run(argv, [REVIEW_LABELS.changes], { ...options, freshState: { labels } });
+      expect(result.exitCode).toBe(1);
+      expect(result.calls).toEqual([]);
+      expect(result.payload.error).toContain('pre-swap labels unreadable');
+    });
+
+    it('checks the head again before a comment retry and refuses to write to the moved head', () => {
+      const result = run(argv, [REVIEW_LABELS.changes], { ...options, postCommentFailures: 1,
+        postCommentFailureState: () => ({ headRefOid: 'b'.repeat(40) }) });
+      expect(result.exitCode).toBe(1);
+      expect(result.calls).toEqual(['setLabels', 'postComment']);
+      expect(result.postedBodies).toEqual([]);
+      expect(result.payload.error).toContain('live head differs from --expect-head');
+    });
+
+    it('checks the head before rollback and reports unmarked pending when the pin moved', () => {
+      const result = run(argv, [REVIEW_LABELS.changes], { ...options, postCommentFailures: 3,
+        postCommentFailureState: vi.fn().mockReturnValueOnce(null).mockReturnValueOnce(null)
+          .mockReturnValue({ headRefOid: 'b'.repeat(40) }) });
+      expect(result.exitCode).toBe(1);
+      expect(result.calls).toEqual(['setLabels', 'postComment', 'postComment', 'postComment']);
+      expect(result.liveLabels).toEqual([REVIEW_LABELS.pending]);
+      expect(result.postedBodies).toEqual([]);
+      expect(result.payload.error).toMatch(/503.*live head differs from --expect-head.*review:pending without a marker/i);
+    });
+
+    it('names the unmarked pending state explicitly when rollback also fails', () => {
+      const result = run(argv, [REVIEW_LABELS.changes], { ...options, postCommentFailures: 3, rollbackFailure: true });
+      expect(result.exitCode).toBe(1);
+      expect(result.calls).toEqual(['setLabels', 'postComment', 'postComment', 'postComment', 'setLabels']);
+      expect(result.liveLabels).toEqual([REVIEW_LABELS.pending]);
+      expect(result.postedBodies).toEqual([]);
+      expect(result.payload.error).toMatch(/503.*rollback unavailable.*review:pending without a marker/i);
+    });
+
+    it('refuses rollback when a same-head human clearance arrives during the third failed comment attempt', () => {
+      const clearance = { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }),
+        author: verdict.author };
+      const labels = [REVIEW_LABELS.accepted, READY_TO_MERGE_LABEL];
+      const result = run(argv, [REVIEW_LABELS.changes], { ...options, postCommentFailures: 3,
+        postCommentFailureState: vi.fn().mockReturnValueOnce(null).mockReturnValueOnce(null)
+          .mockReturnValue({ comments: [verdict, clearance], labels: labels.map(name => ({ name })) }) });
+      expect(result.exitCode).toBe(1);
+      expect(result.calls).toEqual(['setLabels', 'postComment', 'postComment', 'postComment']);
+      expect(result.labelWrites).toHaveLength(1);
+      expect(result.liveLabels).toEqual(labels);
+      expect(result.postedBodies).toEqual([]);
+      expect(result.readPrState.mock.results.at(-1).value.headRefOid).toBe('a'.repeat(40));
+      expect(result.payload.error).toMatch(/503.*rollback failed.*human clearance.*inspect the current review state/i);
+    });
+
+    it.each([
+      ['a newer changes verdict', { ...verdict, id: 'IC_newer' }],
+      ['an edited changes verdict', { ...verdict, body: `${verdict.body}\nNew finding` }],
+      ['a new acceptance before its label swap', { ...verdict, id: 'IC_accept',
+        body: buildVerdictComment({ to: 'accepted', actor: 'reviewer', headSha: 'a'.repeat(40) }) }],
+    ])('refuses rollback after %s on the same head while labels remain pending', (_name, newerVerdict) => {
+      const comments = newerVerdict.id === verdict.id ? [newerVerdict] : [verdict, newerVerdict];
+      const result = run(argv, [REVIEW_LABELS.changes], { ...options, postCommentFailures: 3,
+        postCommentFailureState: vi.fn().mockReturnValueOnce(null).mockReturnValueOnce(null)
+          .mockReturnValue({ comments }) });
+      expect(result.exitCode).toBe(1);
+      expect(result.calls).toEqual(['setLabels', 'postComment', 'postComment', 'postComment']);
+      expect(result.labelWrites).toHaveLength(1);
+      expect(result.liveLabels).toEqual([REVIEW_LABELS.pending]);
+      expect(result.postedBodies).toEqual([]);
+      expect(result.payload.error).toMatch(/503.*verdict evidence changed before rollback.*newer review state retained/i);
+    });
+
+    it.each([
+      [], [REVIEW_LABELS.changes], [REVIEW_LABELS.accepted], [REVIEW_LABELS.human],
+      [REVIEW_LABELS.pending, REVIEW_LABELS.heldMechanical],
+      [REVIEW_LABELS.pending, READY_TO_MERGE_LABEL], [REVIEW_LABELS.pending, 'review:future'],
+    ].map(labels => [labels]))('refuses rollback when the expected re-arm labels have changed: %j', labels => {
+      const result = run(argv, [REVIEW_LABELS.changes], { ...options, postCommentFailures: 3,
+        postCommentFailureState: vi.fn().mockReturnValueOnce(null).mockReturnValueOnce(null)
+          .mockReturnValue({ labels: labels.map(name => ({ name })) }) });
+      expect(result.exitCode).toBe(1);
+      expect(result.calls).toEqual(['setLabels', 'postComment', 'postComment', 'postComment']);
+      expect(result.labelWrites).toHaveLength(1);
+      expect(result.liveLabels).toEqual(labels);
+      expect(result.payload.error).toMatch(/503.*labels changed before rollback.*newer review state retained/i);
+    });
+
+    it.each([
+      ['comments', { comments: null }], ['labels', { labels: null }], ['label entry', { labels: [null] }],
+    ])('refuses rollback with unreadable %s', (_name, state) => {
+      const result = run(argv, [REVIEW_LABELS.changes], { ...options, postCommentFailures: 3,
+        postCommentFailureState: vi.fn().mockReturnValueOnce(null).mockReturnValueOnce(null).mockReturnValue(state) });
+      expect(result.exitCode).toBe(1);
+      expect(result.calls).toEqual(['setLabels', 'postComment', 'postComment', 'postComment']);
+      expect(result.labelWrites).toHaveLength(1);
+      expect(result.payload.error).toMatch(/503.*rollback failed.*unreadable.*inspect the current review state/i);
+    });
+
+    it('allows rollback after unrelated labels and untrusted comments arrive without removing them', () => {
+      const result = run(argv, [REVIEW_LABELS.changes], { ...options, postCommentFailures: 3,
+        postCommentFailureState: vi.fn().mockReturnValueOnce(null).mockReturnValueOnce(null)
+          .mockReturnValue({ labels: [{ name: REVIEW_LABELS.pending }, { name: 'unrelated' }],
+            comments: [verdict, { ...verdict, id: 'IC_untrusted', author: { login: 'drive-by' } }] }) });
+      expect(result.exitCode).toBe(1);
+      expect(result.calls).toEqual(['setLabels', 'postComment', 'postComment', 'postComment', 'setLabels']);
+      expect(result.liveLabels.sort()).toEqual([REVIEW_LABELS.changes, 'unrelated'].sort());
+      expect(result.payload.error).toMatch(/503.*labels restored/i);
+    });
+
+    it.each([
+      ['missing marker', [verdict], true],
+      ['covering marker later in the same second', [verdict, marker], false],
+      ['legacy covering marker later in the same second', [verdict, { ...marker, body: REARM_COMMENT_MARKER }], false],
+      ['marker before verdict in the same second', [marker, verdict], true],
+      ['untrusted covering marker', [verdict, { ...marker, author: { login: 'drive-by' } }], true],
+      ['marker bound to another verdict', [verdict, { ...marker, body: REARM_COMMENT_MARKER + buildRearmVerdictBinding({ ...verdict, id: 'IC_other' }) }], true],
+    ])('resumes pending with %s without swapping labels', (_name, comments, posts) => {
+      const result = run(argv, [REVIEW_LABELS.pending], { ...options, comments });
+      expect(result.exitCode).toBe(0);
+      expect(result.calls).toEqual(posts ? ['postComment'] : []);
+      expect(result.labelWrites).toEqual([]);
+      expect(result.postedBodies).toEqual(posts ? [marker.body] : []);
+    });
+
+    it.each([[], [{ ...verdict, id: undefined }]].map(comments => [comments]))('refuses resume without an identifiable changes verdict: %j', comments => {
+      const result = run(argv, [REVIEW_LABELS.pending], { ...options, comments });
+      expect(result.exitCode).toBe(1);
+      expect(result.calls).toEqual([]);
+      expect(result.payload.reason).toContain('nothing to re-arm');
+    });
+
+    it('avoids a duplicate if a covering marker arrives before the resumed write', () => {
+      const result = run(argv, [REVIEW_LABELS.pending], { ...options, freshState: { comments: [verdict, marker] } });
+      expect(result.exitCode).toBe(0);
+      expect(result.calls).toEqual([]);
+    });
+
+    it('refuses resume if a newer changes verdict arrives before the marker write', () => {
+      const result = run(argv, [REVIEW_LABELS.pending], { ...options,
+        freshState: { comments: [verdict, { ...verdict, id: 'IC_newer' }] } });
+      expect(result.exitCode).toBe(1);
+      expect(result.calls).toEqual([]);
+      expect(result.payload.error).toContain('latest changes verdict changed');
+    });
+
+    it('refuses resume when a concurrent changes label replaces pending', () => {
+      const result = run(argv, [REVIEW_LABELS.pending], { ...options,
+        freshState: { labels: [{ name: REVIEW_LABELS.changes }] } });
+      expect(result.exitCode).toBe(1);
+      expect(result.calls).toEqual([]);
+      expect(result.payload.error).toContain('pending re-arm state changed');
+    });
+
+    it('refuses a resumed marker write when the head changes', () => {
+      const result = run(argv, [REVIEW_LABELS.pending], { ...options, freshState: { headRefOid: 'b'.repeat(40) } });
+      expect(result.exitCode).toBe(1);
+      expect(result.calls).toEqual([]);
+      expect(result.payload.error).toContain('live head differs from --expect-head');
+    });
+
+    it('refuses resume if a human clearance arrives before the marker write', () => {
+      const clearance = { body: buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: 'a'.repeat(40) }), author: verdict.author };
+      const result = run(argv, [REVIEW_LABELS.pending], { ...options, freshState: { comments: [verdict, clearance] } });
+      expect(result.exitCode).toBe(1);
+      expect(result.calls).toEqual([]);
+      expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
+    });
+
+    it('leaves a failed resume pending for retry without inventing rollback labels', () => {
+      const result = run(argv, [REVIEW_LABELS.pending], { ...options, postCommentFailures: 3 });
+      expect(result.exitCode).toBe(1);
+      expect(result.calls).toEqual(['postComment', 'postComment', 'postComment']);
+      expect(result.liveLabels).toEqual([REVIEW_LABELS.pending]);
+      expect(result.payload.error).toMatch(/503.*review:pending without a marker/i);
+    });
+
+    it('does not consume a round on rollback; a clean retry counts once and the orphan repair cap still caps', () => {
+      const comments = [verdict,
+        { ...marker, body: FIX_END_MARKER },
+        ...Array.from({ length: 2 }, () => ({ ...marker, body: `${ORPHAN_GUARD_MARKER} — re-dispatched a fixer` }))];
+      const failed = run(argv, [REVIEW_LABELS.changes], { ...options, comments, postCommentFailures: 3 });
+      expect(failed.exitCode).toBe(1);
+      expect(failed.liveLabels).toEqual([REVIEW_LABELS.changes]);
+      expect(countRearmComments(comments)).toBe(0);
+      expect(failed.postedBodies).toEqual([]);
+      const plan = planOrphanFixRound({ pr: { labels: failed.liveLabels, comments, headRefOid: 'a'.repeat(40) },
+        nowMs: Date.parse('2026-10-26T12:00:00Z'), cap: 2 });
+      expect(plan.decision).toBe('escalate');
+      expect(plan.reason).toContain('cap 2');
+      const retry = run(argv, failed.liveLabels, { ...options, comments });
+      expect(retry.exitCode).toBe(0);
+      expect(retry.postedBodies).toEqual([marker.body]);
+      const completed = [...comments, ...retry.postedBodies.map(body => ({ ...marker, body }))];
+      expect(countRearmComments(completed)).toBe(1);
+      const resumed = run(argv, retry.liveLabels, { ...options, comments: completed });
+      expect(resumed.exitCode).toBe(0);
+      expect(resumed.calls).toEqual([]);
+    });
   });
 
   it('plain rearm refuses a different live head before any write', () => {
