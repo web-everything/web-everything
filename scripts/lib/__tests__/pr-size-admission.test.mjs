@@ -350,6 +350,39 @@ describe('shared admission effects', () => {
     expectSizeNote(result.body);
   });
 
+  it.each([
+    ['a current marker', () => KEY],
+    ['a legacy ref marker', () => `${encodeURIComponent(request.ref)} Keep-this-line.\n**Rollback**:revert-abc123`],
+  ])('the marker match cannot extend over author lines after %s', async (_label, token) => {
+    const real = (await sizeAdmission.createSizeAdmissionRunner(effects())(request)).body;
+    const tail = '\nDo-not-merge-before-Friday.\nhttps://ex.com/runbook -->\n';
+    const body = real.replace(`<!-- size-admission:${KEY} -->\n`, `<!-- size-admission:${token()} -->${tail}`);
+    const result = await sizeAdmission.createSizeAdmissionRunner(effects())({ ...request, body });
+    expect(result.body).toContain('Do-not-merge-before-Friday.\nhttps://ex.com/runbook');
+    if (token() !== KEY) expect(result.body).toContain('**Rollback**:revert-abc123');
+    expectSizeNote(result.body);
+  });
+
+  it.each([
+    ['CRLF line endings from a web edit', (body) => body.replace(/\n/g, '\r\n')],
+    ['a forge-trimmed empty description', (body) => body.replace(/^\n+/, '')],
+  ])('retry replaces its own note after %s instead of stacking another', async (_label, edit) => {
+    const base = { ...request, body: _label.includes('empty') ? '' : request.body };
+    const first = await sizeAdmission.createSizeAdmissionRunner(effects())(base);
+    const second = await sizeAdmission.createSizeAdmissionRunner(effects())({ ...base, body: edit(first.body) });
+    expect(second.body.match(/^## Size$/gm)).toHaveLength(1);
+    expect(second.body).not.toContain('\r');
+  });
+
+  it('retry replaces its own note when the only file group is over the summary budget', async () => {
+    const name = '_'.repeat(700);
+    const io = effects({ diffStat: () => `400\t0\t${name}/${name}/f\0` });
+    const first = await sizeAdmission.createSizeAdmissionRunner(io)(request);
+    expect(first.body).toContain('File groups: ; and 1 more (1 group omitted; summary budget)');
+    const second = await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, body: first.body });
+    expect(second.body.match(/^## Size$/gm)).toHaveLength(1);
+  });
+
   it('a copied marker earlier in the body cannot redirect the replacement away from the real note', async () => {
     const first = await sizeAdmission.createSizeAdmissionRunner(effects())(request);
     const quote = `\n\n## Size\n\nQuoted for reviewers:\n<!-- size-admission:${KEY} -->\n`;

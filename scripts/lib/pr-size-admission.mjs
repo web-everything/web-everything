@@ -269,7 +269,7 @@ const CARD_NOTE = 'split card (?:[A-Za-z0-9]{1,64} filed(?: via lane/[A-Za-z0-9-
 const ESCALATION = 'extra reviewers requested via the size escalation \\(review:pending\\)';
 const OWN_NOTE = new RegExp(`^\\n\\n## Size\\n\\n(?:\\d{1,9} non-test lines \\(> ${OPEN_PR_MAX_NON_TEST_LINES}\\): ${CARD_NOTE}; ${ESCALATION}`
   + `|size unknown: ${ESCALATION}; ${CARD_NOTE})\\n`
-  + `File groups: (?:unavailable \\(size unknown\\)|we:${ESCAPED}*: \\d{1,12})(?:; and \\d{1,9} more \\(\\d{1,9} groups? omitted; summary budget\\))?`
+  + `File groups: (?:unavailable \\(size unknown\\)|(?:we:${ESCAPED}*: \\d{1,12})?)(?:; and \\d{1,9} more \\(\\d{1,9} groups? omitted; summary budget\\))?`
   + '(?: Human review of the full diff is required; bounded summaries are incomplete\\.)?\\n'
   + '(?:<!-- size-published:[a-f0-9]{64} -->\\n)?(?![\\s\\S])');
 
@@ -376,18 +376,22 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = crea
     // Never read their ids/receipts as filing or publication evidence.
     let legacyToken;
     try { if (typeof ref === 'string' && ref.length <= 512) legacyToken = encodeURIComponent(ref); } catch { /* malformed ref */ }
+    // A web edit returns CRLF; a forge may trim the leading blank lines of an empty description.
+    const text = body.replace(/\r\n/g, '\n');
     // Our note is appended last, so prefer the last marker over an earlier quoted copy.
-    const existing = [...body.matchAll(/<!-- size-admission:([^ ]+)(?: [^ ]+)? -->/g)]
+    // Marker tokens cannot span whitespace or `>`, so the match never reaches author text.
+    const existing = [...text.matchAll(/<!-- size-admission:([^\s<>]{1,512})(?: [^\s<>]{1,256})? -->/g)]
       .findLast((match) => match[1] === markerKey || (legacyToken && match[1] === legacyToken));
     let previousBody = body;
     if (existing) {
-      const start = body.lastIndexOf('\n\n## Size\n', existing.index);
+      const heading = text.lastIndexOf('\n\n## Size\n', existing.index);
+      const start = heading >= 0 ? heading : text.startsWith('## Size\n') ? 0 : -1;
       // Legacy ref-token notes predate the fixed shape: only their marker is dropped.
       const replaceNote = start >= 0 && existing[1] === markerKey
-        && isOwnSizeNote(body.slice(start, existing.index), markerKey);
+        && isOwnSizeNote((heading >= 0 ? '' : '\n\n') + text.slice(start, existing.index), markerKey);
       let end = existing.index + existing[0].length;
-      if ((existing.index === 0 || body[existing.index - 1] === '\n') && body[end] === '\n') end++;
-      previousBody = body.slice(0, replaceNote ? start : existing.index) + body.slice(end);
+      if ((existing.index === 0 || text[existing.index - 1] === '\n') && text[end] === '\n') end++;
+      previousBody = text.slice(0, replaceNote ? start : existing.index) + text.slice(end);
     }
     if (Buffer.byteLength(previousBody) > BODY_BYTES) previousBody = boundedText(previousBody, BODY_BYTES)
       + '\n\nPR description truncated; human review of the full diff is required.';
