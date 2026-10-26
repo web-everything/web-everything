@@ -1,5 +1,39 @@
 # Testing — Three-Tier Strategy
 
+## PR size admission trust-boundary fixtures
+
+`scripts/lib/__tests__/pr-size-admission.test.mjs` exercises Git with real shadow refs and
+round-trips hostile filenames through `planFileItem` and `js-yaml`. Size evidence must carry
+full head/base SHAs; mock symbolic SHA strings no longer represent valid Git evidence.
+Retry fixtures need a trusted card store keyed by repository and head SHA; assigning a PR
+number after creation must reuse the initial card. Cover retries with and without a saved body.
+Body markers are display hints; publication must be confirmed again from the store/publisher.
+Size sections carry a keyed HMAC-SHA256 hex digest of the exact inner text after the begin
+line (including the newline before the end marker). The random 32-byte local secret lives
+in the Git common directory as `we-pr-size-secret`, created exclusively with mode 0600.
+Only one unambiguous pair with a valid HMAC under this secret is replaceable. Public SHA-256
+digests, missing/mismatched HMACs, edits (including line-ending changes), and malformed pairs
+preserve the entire body. If the secret cannot be read or created, append only; never fall
+back to a shared temporary secret. A different secret also appends conservatively. Identical
+retries stay stable. Tests inject `secret` or a temporary `secretPath`; never use the checkout
+secret. The HMAC authorizes display replacement only, never filing/publication authority (R115).
+Without pinned evidence, the display key hashes repo, PR-or-ref, requested SHA and base; it
+does not make an unresolved head eligible for trusted card lookup.
+pr-land re-reads the live body after card filing and skips the note when it changed or is unreadable.
+Author text is never truncated or escaped: past the forge body limit the note is skipped and the
+body returned unchanged (no edit), and every fallback, including the runner's outer catch, returns
+the caller's body. Reviewers are still requested in each case.
+Unknown or stale evidence and unreadable/ambiguous stores file conservatively and request reviewers.
+
+The legacy `file-item` scope flag is a comma list whose renderer supplies YAML double quotes.
+Size admission JSON-escapes each scalar's contents before bounding entries; it also escapes YAML
+line separators and trailing whitespace. Comma-bearing paths are omitted with an explicit count.
+Every incomplete summary names human review of the full diff as its fallback. Keep these tests
+in the shared suite and run it and the scoped producer/prepare suites through heavy admission.
+Identity, path and published batch-ref validators use explicit absolute-end assertions
+(`(?![\s\S])`). Keep the named trailing-newline regressions and the CR/CRLF/Unicode
+line-separator suffix cases in that required scoped gate.
+
 ## Established-overlay auto-rebase
 
 Operator withdrawal wins over a detached repair: the worker rechecks its source registration
