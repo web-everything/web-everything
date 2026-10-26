@@ -138,7 +138,7 @@ export const sourceSetKey = sources => [...sources].map(s => `${Number(s.num)}@$
 export function overlapReasonIsCardOnly(reason) {
   const at = String(reason ?? '').indexOf(' share ');
   if (at < 0) return false;
-  const files = String(reason).slice(at + 7).split(', ').map(s => s.trim()).filter(Boolean);
+  const files = String(reason).slice(at + 7).split('; blocker ')[0].split(', ').map(s => s.trim()).filter(Boolean);
   return files.length > 0 && files.every(isCardPath);
 }
 
