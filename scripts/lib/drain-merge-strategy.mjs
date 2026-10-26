@@ -32,6 +32,8 @@ import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
  *   operator can preview which PRs `github-merge-queue` would enqueue without flipping the live policy. A live
  *   (non-dry-run) pass ignores the variable and says so.
  */
+import { sweepStuckEntries } from './merge-queue-stuck-dequeue.mjs';
+import { appendDaemonEvent } from './daemon-events.mjs';
 import { labelSignature } from './drain-prestage.mjs';
 import { readDrainRedTeamEvidence } from './drain-red-team-evidence.mjs';
 import { readDrainQueueSafety, redTeamEnqueueHold, redTeamLabelHoldReason, dequeueSentBack, sendBackReason, queueLabels } from './drain-queue-safety.mjs';
@@ -215,7 +217,7 @@ const firstLine = (e) => String(e?.stderr || e?.message || e).trim().split('\n')
 export function createDrainMergeStrategy({
   dryRun = false, quiet = false, isLocalRepo = () => true, localSlug = null, exec = execFileSync,
   statePath = queueStatePath(), resolved = resolveDrainMergePolicy({ dryRun }), log = process.stderr,
-  readFile = readFileSync, writeState = writeQueueState, withLock = (fn) => ({ ran: true, result: fn() }),
+  readFile = readFileSync, writeFile, writeState = writeQueueState, withLock = (fn) => ({ ran: true, result: fn() }),
   postConflictFinding = defaultPostConflictFinding, now = () => Date.now(),
   cancelObsoleteRuns = cancelObsoleteQueueRuns, batching,
   env = process.env, queueSafety, labelProvider, readRedTeamEvidence = readDrainRedTeamEvidence, requestRedTeam = null,
@@ -303,11 +305,15 @@ export function createDrainMergeStrategy({
     dequeueSendBacks(rows = [], repo = null) {
       if (dryRun || !enqueueMode || !safety.value.dequeueOnSendBack || !isLocalRepo(repo)) return;
       const candidates = rows.filter(row => Array.isArray(row.labels) && sendBackReason(row.labels));
-      if (!candidates.length) return;
       // Discover membership once, before any per-PR read. An incomplete discovery retries next pass;
       // never replace it with an API sweep of every non-ready open PR.
-      const queue = readQueueFacts({ repo: slugOf(repo), exec: (cmd, args, opts) => exec(cmd, args, { ...opts, timeout: 60_000 }) });
-      if (queue.error) { say(`  ⚠ merge-queue discovery failed (${queue.error}) — dequeue sweep retried next pass`); return; }
+      const queue = candidates.length ? readQueueFacts({ repo: slugOf(repo), exec: (cmd, args, opts) => exec(cmd, args, { ...opts, timeout: 60_000 }) }) : null;
+      if (queue?.error) { say(`  ⚠ merge-queue discovery failed (${queue.error}) — dequeue sweep retried next pass`); return; }
+      if (queue && !queue.entries.length) return; // Complete empty discovery also proves no stuck entries.
+      sweepStuckEntries({ repo: slugOf(repo), exec: (cmd, args, opts) => exec(cmd, args, { ...opts, timeout: 60_000 }),
+        max: safety.value.queueRebuildMax, nowMs: now(),
+        statePath: join(dirname(statePath), 'drain-merge-queue-stuck.json'), readFile, writeFile, log: say,
+        emit: event => { void appendDaemonEvent(event, { env }); } });
       for (const row of candidates) {
         if (!queue.inQueue.has(Number(row.number))) continue;
         try { removeSentBack(repo, row.number, readLive(repo, row.number).labels); }
