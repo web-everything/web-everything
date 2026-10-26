@@ -1616,6 +1616,14 @@ Both collision planners refuse to move a `bornAs` card or a reserved source numb
 heals skip reserved and canonical numbers, claim all target gaps atomically before rewriting, and
 refuse for manual repair when no safe gap exists. The manual `yield` command uses the same guards,
 including with `--force`. Claims survive a failed rewrite or publish.
+Test reserved legacy sources without `bornAs` independently in both planners and in `yield --force`.
+Exercise `yield` and the renumber CLI with a stub Git transport: reserve destination gaps, include
+a canonical-tree gap, and snapshot every backlog file at push time to prove the claim precedes
+any write or delete. Rejected claims, unavailable evidence, and a full frontier must preserve all
+files; a renumber dry run must neither claim nor write.
+Remote-backed gap selection uses current trees and reservation refs, without historical deletion
+evidence; the historical-number reuse policy is tracked in
+#xpg1c2d.
 Canonical tree reads use NUL-delimited paths; cover Unicode, quotes, backslashes and embedded newlines.
 Allocation and replay must obey the five-digit numeric ID grammar, including contention at 99999.
 

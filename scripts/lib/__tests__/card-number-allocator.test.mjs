@@ -144,6 +144,19 @@ it.each(['base', 'merged'])('%s collision planner refuses to move a bornAs ident
     .toThrow(/birth|bornAs|immutable/i);
 });
 
+it.each(['base', 'merged'])('%s collision planner refuses a reserved source without bornAs', (kind) => {
+  const incoming = { name: '075-incoming.md', text: '---\nkind: task\n---\nLegacy incoming\n', ordinal: 2 };
+  const existing = { name: '075-existing.md', text: '---\n---\nExisting\n', ordinal: 1 };
+  const before = structuredClone([existing, incoming]);
+  // Leave a valid destination gap: the refusal must come from the source guard.
+  const constraints = { reservedNums: ['075', '078'], ceiling: 78 };
+  expect(() => kind === 'base'
+    ? planBaseCollisionHeal([incoming], { baseNums: ['075'], baseNames: [existing.name], ...constraints })
+    : planRenumber([existing, incoming], { ontoNames: [existing.name], ...constraints }))
+    .toThrow(/immutable birth number/);
+  expect([existing, incoming]).toEqual(before);
+});
+
 it.each(['base', 'merged'])('%s collision planner skips reserved gaps and refuses an unsafe frontier', (kind) => {
   const files = [{ name: '074-incoming.md', text: '---\n---\nIncoming\n', ordinal: 2 }];
   const constraints = { reservedNums: ['075', '077'], ceiling: 77 };
