@@ -28,6 +28,17 @@ const yes = reason => ({ proposed: true, reason });
 const entry = text => /^\s*\/((?:\\[^\n]|[^/\\\n])+)\/([a-z]*),\s*(?:\/\/[^\n]*)?$/.exec(text);
 const opener = text => /^\s*(?:export\s+)?const\s+[A-Z_]+_PATHS\s*=\s*Object\.freeze\(\[\s*$/.test(text);
 
+// Compilation proves syntax, not bounded matching cost. Admit only short literal
+// paths, optional anchors and the fixed basename boundary used by shipped rules.
+// No quantifiers, arbitrary groups, alternatives, character classes or stateful flags.
+function boundedProtection(source, flags) {
+  if (source.length > 512 || !['', 'i'].includes(flags)) return false;
+  const boundary = String.raw`(^|\/)`;
+  let literal = source.startsWith(boundary) ? source.slice(boundary.length) : source.replace(/^\^/, '');
+  if (literal.endsWith('$')) literal = literal.slice(0, -1);
+  return /^(?:[a-z0-9_-]|\\[./])+$/i.test(literal);
+}
+
 // Count both sides of every hunk: truncated, binary, combined and malformed evidence cannot clear a hold.
 function parse(text) {
   if (typeof text !== 'string') throw new Error('null hunks');
@@ -66,8 +77,11 @@ function tightening(rows) {
     if (/^\s*\/\//.test(row.text)) continue;
     const match = entry(row.text);
     if (!match) throw new Error('unprovable tightening');
-    try { regexes.push(new RegExp(match[1], match[2])); }
+    let regex;
+    try { regex = new RegExp(match[1], match[2]); }
     catch { throw new Error('invalid protection regex'); }
+    if (!boundedProtection(match[1], match[2])) throw new Error('unproven protection regex cost: human review required');
+    regexes.push(regex);
   }
   return regexes;
 }
@@ -84,10 +98,10 @@ const balanced = text => {
 };
 const ITEM = String.raw`(?:[A-Z][A-Z0-9_]*_OP|'[a-z][a-z0-9-]*'|"[a-z][a-z0-9-]*")`;
 const pureItem = new RegExp(`^\\s*${ITEM},?\\s*$`);
-// A read-only name proves only its own entry, never neighboring structural lines.
+// Operation names alone do not prove list use; accept only self-contained wiring.
 function allowedAddition(line, ops) {
   const text = line.trim();
-  if (pureItem.test(text)) return true;
+  if (pureItem.test(text)) return false;
   if (!balanced(text)) return false;
   const imported = /^import\s*\{\s*([\w$,\s]+)\}\s*from\s*(['"])(\.\/[^'"]+\.mjs)\2\s*;$/.exec(text);
   const registration = /^\[([A-Z][A-Z0-9_]*_OP)\]:\s*\(\)\s*=>\s*\(\{\s*declaration:\s*(\w+)\(\{\s*readFacts:\s*(\w+)\(\)\s*\}\),\s*sinks:\s*\{\},\s*finish:\s*(\w+)\s*\}\)\s*,$/.exec(text);
@@ -113,17 +127,13 @@ function readOnlyAddition(rows, readOnlyOps, hunk) {
   const ops = [...new Set(references(added.join('\n')))].filter(op => !previous.has(op));
   if (!ops.length) throw new Error('no new op reference');
   for (const op of ops) if (!readOnlyOps.has(op)) throw new Error(`write-capable or unproven op: ${op}`);
-  // Context/import references prove no list membership. Credit only an adjacent replacement of
-  // the same complete named array; incomplete or moved entries must each carry read-only proof.
-  const listName = text => new RegExp(`^\\s*const\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*\\[\\s*${ITEM}(?:\\s*,\\s*${ITEM})*\\s*,?\\s*\\]\\s*;\\s*$`).exec(text)?.[1];
-  for (let i = 0; i < rows.length; i += 1) {
-    if (rows[i].kind !== '+') continue;
-    const prior = rows[i - 1];
-    const name = listName(rows[i].text);
-    const members = new Set(prior?.kind === '-' && prior.hunk === rows[i].hunk
-      && name && listName(prior.text) === name ? references(prior.text) : []);
-    for (const op of references(rows[i].text)) {
-      if (!members.has(op) && !readOnlyOps.has(op)) throw new Error(`write-capable or unproven op: ${op}`);
+  // A stored array can control writes through indices, length or consumers outside
+  // the hunk. Neither its name nor complete literal boundaries prove membership-only use.
+  // Inline replacements get no exemption for pre-existing operation names either.
+  for (const row of rows) {
+    if (row.kind !== '+') continue;
+    for (const op of references(row.text)) {
+      if (!readOnlyOps.has(op)) throw new Error(`write-capable or unproven op: ${op}`);
     }
   }
   // Every removal needs its own ordered partner in the same hunk. Word subsets
@@ -148,50 +158,14 @@ function readOnlyAddition(rows, readOnlyOps, hunk) {
     if (partner === undefined) throw new Error('unpaired removed line: human review required');
     nextAdded.set(removed.hunk, partner + 1);
   }
-  // Neighbouring items can belong to a destructuring assignment. Require both
-  // boundaries of a complete named array literal in the same hunk, and accept
-  // only pure entries between them. A semicolon prevents a following line from
-  // turning the initializer into a destructuring assignment. Scan each run once.
-  const listStart = /^\s*const\s+[A-Za-z_$][\w$]*\s*=\s*(Object\.freeze\()?\[\s*$/;
-  const literalItems = new Set();
-  let literal;
   for (const row of rows) {
-    if (row.kind === '-' || !row.text.trim()) continue;
-    if (literal?.hunk !== row.hunk) literal = undefined;
-    const start = listStart.exec(row.text);
-    if (start) {
-      literal = { hunk: row.hunk, frozen: !!start[1], items: [] };
-    } else if (literal && pureItem.test(row.text)) {
-      literal.items.push(row);
-    } else {
-      if (literal && (literal.frozen ? /^\s*\]\)\s*;\s*$/ : /^\s*\]\s*;\s*$/).test(row.text)) {
-        for (const item of literal.items) literalItems.add(item);
-      }
-      literal = undefined;
-    }
-  }
-  for (const row of rows) {
-    if (row.kind === '+' && pureItem.test(row.text) && !literalItems.has(row)) {
+    if (row.kind === '+' && pureItem.test(row.text)) {
       throw new Error('unprovable list membership: human review required');
     }
   }
   // Word/bracket conservation cannot prove executable semantics (for example !).
-  // Preserve replacements verbatim apart from indentation, or prove that the
-  // only change is insertion of read-only members into the same complete array.
-  const replacement = (old, line) => {
-    if (old.trim() === line.trim()) return true;
-    const name = listName(old);
-    if (!name || listName(line) !== name) return false;
-    const members = text => text.slice(text.indexOf('[') + 1, text.lastIndexOf(']'))
-      .split(',').map(item => item.trim()).filter(Boolean);
-    const prior = members(old);
-    let index = 0;
-    for (const member of members(line)) {
-      if (member === prior[index]) index += 1;
-      else if (!readOnlyOps.has(references(member)[0])) return false;
-    }
-    return index === prior.length;
-  };
+  // Preserve replacements verbatim apart from indentation. Array insertions need
+  // consumer evidence beyond this API's hunks, so retain human review for them.
   for (const [index, row] of rows.entries()) {
     if (row.kind !== '+') continue;
     const line = row.text;
@@ -201,10 +175,10 @@ function readOnlyAddition(rows, readOnlyOps, hunk) {
     // crossing a hunk boundary. Only an immediately replaced line is evidence.
     const prior = rows[index - 1];
     const readded = balanced(line) && prior?.kind === '-' && prior.hunk === row.hunk
-      && sameCounts(counts, bracketCounts(prior.text)) && replacement(prior.text, line);
+      && sameCounts(counts, bracketCounts(prior.text)) && prior.text.trim() === line.trim();
     if (!readded) throw new Error('unprovable added expression: human review required');
   }
-  // Pure entries and self-contained wiring carry their own proof. Everything else
+  // Self-contained wiring carries its own proof. Everything else
   // must conserve each bracket kind across the file, including removed-only lines.
   const delta = [0, 0, 0, 0, 0, 0];
   for (const row of rows) {

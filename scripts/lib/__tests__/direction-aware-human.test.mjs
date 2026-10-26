@@ -19,9 +19,49 @@ function propose(sections, hits, overrides = {}) {
     readOnlyOps: new Set(['pr-trace']), protectionPaths: [/CODEOWNERS$/], ...overrides });
 }
 const simple = (op = 'PR_TRACE_OP') => diff(runner, [' const zeroWrites = [', `+  ${op},`, '   EVENTS_OP,', ' ];']);
+const importOnly = () => diff(runner, ["+import { PR_TRACE_OP } from './pr-trace.mjs';"]);
 const tightening = (changes) => diff(surface, [' export const PROTECTION_PATHS = Object.freeze([', ...changes, '   /codeowners$/,', ' ]);']);
 
 describe('direction-aware humanRequired shadow (R131)', () => {
+  it('keeps a complete long named array human when insertion enables a positional write guard', () => {
+    const lines = [' let writes = 0;', ' const approvalTuple = [',
+      ...Array(201).fill(" 'events',"), "+ 'pr-trace',", " 'health',", ' ];',
+      " const approved = approvalTuple[201] !== 'health';", ' if (approved) writes += 1;'];
+    const execute = side => Function(`${lines.filter(line => line[0] !== side)
+      .map(line => line.slice(1)).join('\n')}\nreturn writes;`)();
+    expect(execute('+')).toBe(0);
+    expect(execute('-')).toBe(1);
+    const section = diff(runner, lines);
+    const hits = sensitiveSurfaceHits([runner], () => section, 'narrow');
+    expect(hits).toContainEqual(permission(runner));
+    expect(propose({ [runner]: section }, hits).proposed).toBe(true);
+  });
+  it.each([runner, sweep, dispatch])('keeps stored arrays human regardless of spelling or consumers: %s', file => {
+    const readOnlyOps = new Set(['pr-trace', 'events', 'health']);
+    for (const name of ['approvalTuple', 'zeroWrites', 'allowed', 'readOnly']) {
+      for (const frozen of [false, true]) {
+        const section = diff(file, [` const ${name} = ${frozen ? 'Object.freeze(' : ''}[`,
+          " 'events',", "+ 'pr-trace',", " 'health',", frozen ? ' ]);' : ' ];',
+          ` if (${name}.length === 3) writes += 1;`]);
+        expect(propose({ [file]: section }, [permission(file)]).proposed).toBe(true);
+        expect(propose({ [file]: section }, [permission(file)], { readOnlyOps }).proposed).toBe(true);
+      }
+      const inline = diff(file, [`-const ${name} = ['events', 'health'];`,
+        `+const ${name} = ['events', 'pr-trace', 'health'];`]);
+      expect(propose({ [file]: inline }, [permission(file)]).proposed).toBe(true);
+      expect(propose({ [file]: inline }, [permission(file)], { readOnlyOps }).proposed).toBe(true);
+    }
+  });
+  it.each([
+    '/^(a+)+$/', '/^(a|aa)+$/', '/^a+a+$/', '/^.*a.*a.*$/',
+    '/^(a{1,100}){1,100}$/', '/^(a+)\\1$/', '/^a+$/',
+    '/path$/g', '/path$/y', '/a{999999999}/',
+  ])('keeps unproven protection regex costs and state human: %s', regex => {
+    expect(propose({ [surface]: tightening([`+  ${regex},`]) }, [setting]).proposed).toBe(true);
+    const file = `${'a'.repeat(30)}!`;
+    expect(propose({ [surface]: tightening([`+  ${regex},`]), [file]: diff(file, ['+changed']) },
+      [setting, { file, category: 'protection' }]).proposed).toBe(true);
+  });
   it.each([
     [' FIRST_OP,', ' SECOND_OP,', ' THIRD_OP,', '+ PR_TRACE_OP,', ' APPROVED_OP,', ' ] = [null, null, null, false, true];'],
     [' [', ' FIRST_OP,', '+ PR_TRACE_OP,', ' APPROVED_OP,', ' ] = [null, false, true];'],
@@ -59,10 +99,10 @@ describe('direction-aware humanRequired shadow (R131)', () => {
     expect(hits).toContainEqual(permission(runner));
     expect(propose({ [runner]: section }, hits).proposed).toBe(true);
   });
-  it('permits complete named array literals, including frozen lists and consecutive additions', () => {
+  it('keeps complete named arrays human, including frozen lists and consecutive additions', () => {
     const section = diff(runner, [' const first = [', '+ PR_TRACE_OP,', '+ PR_TRACE_OP,', ' ];',
       ' const second = Object.freeze([', " 'events',", "+ 'pr-trace',", ' ]);']);
-    expect(propose({ [runner]: section }, [permission(runner)]).proposed).toBe(false);
+    expect(propose({ [runner]: section }, [permission(runner)]).proposed).toBe(true);
   });
   it('requires both array boundaries in one hunk even when each added item has neighbours', () => {
     const section = diff(runner,
@@ -82,9 +122,13 @@ describe('direction-aware humanRequired shadow (R131)', () => {
       .toEqual({ proposed: true, reason: 'oversized line: human review required' });
     expect(performance.now() - start).toBeLessThan(500);
   });
-  it('accepts a provable entry on a diff line exactly 2000 characters long', () => {
+  it('keeps stored entries human even on a diff line exactly 2000 characters long', () => {
     const line = '+PR_TRACE_OP,'.padEnd(2000);
-    expect(propose({ [runner]: diff(runner, [' const allowed = [', line, ' ];']) }, [permission(runner)]).proposed).toBe(false);
+    expect(propose({ [runner]: diff(runner, [' const allowed = [', line, ' ];']) }, [permission(runner)]).proposed).toBe(true);
+  });
+  it('accepts a provable import on a diff line exactly 2000 characters long', () => {
+    const line = "+import { PR_TRACE_OP } from './pr-trace.mjs';".padEnd(2000);
+    expect(propose({ [runner]: diff(runner, [line]) }, [permission(runner)]).proposed).toBe(false);
   });
   it.each(["'heavy-queue'", 'HEAVY_QUEUE_OP,'])('refuses a standalone op in executable context: %s', line => {
     const section = diff(sweep, [' if (approved)', `+${line}`, ' launchWriter();']);
@@ -138,7 +182,7 @@ describe('direction-aware humanRequired shadow (R131)', () => {
       expect(propose({ [runner]: diff(runner, [`+${expression}`]) }, [permission(runner)]).proposed, expression).toBe(true);
     }
   });
-  it('#5961/#5962: permits read-only imports, registration, re-added zeroWrites and health allow-list', () => {
+  it('#5961/#5962: retains human review for stored zeroWrites and health lists beside read-only wiring', () => {
     const sections = {
       [runner]: diff(runner,
         ["+import { prTraceOperation, PR_TRACE_OP, finishPrTrace } from './pr-trace.mjs';", ' const OPERATIONS = {'],
@@ -147,7 +191,14 @@ describe('direction-aware humanRequired shadow (R131)', () => {
         ['-const zeroWrites = [EVENTS_OP, HEALTH_OP];', '+const zeroWrites = [PR_TRACE_OP, EVENTS_OP, HEALTH_OP];']),
       [dispatch]: diff(dispatch, ["-const allowed = ['events', 'health'];", "+const allowed = ['pr-trace', 'events', 'health'];"]),
     };
-    expect(propose(sections, [permission(runner), permission(dispatch)]))
+    expect(propose(sections, [permission(runner), permission(dispatch)]).proposed).toBe(true);
+  });
+  it('still permits self-contained read-only imports and registration without stored-array edits', () => {
+    const section = diff(runner,
+      ["+import { prTraceOperation, PR_TRACE_OP, finishPrTrace } from './pr-trace.mjs';", ' const OPERATIONS = {'],
+      ['   declaration: oldDeclaration,', '   sinks: {},', '   finish: oldFinish,',
+        '+  [PR_TRACE_OP]: () => ({ declaration: prTraceOperation({ readFacts: createPrTraceReader() }), sinks: {}, finish: finishPrTrace }),']);
+    expect(propose({ [runner]: section }, [permission(runner)]))
       .toEqual({ proposed: false, reason: 'adds only read-only ops: pr-trace' });
   });
   it('#5948: keeps pass-entry additions human under the strict line shapes', () => {
@@ -177,10 +228,10 @@ describe('direction-aware humanRequired shadow (R131)', () => {
     expect(propose({ [sweep]: section }, [permission(sweep)], { readOnlyOps: new Set(['heavy-queue']) })
       .proposed).toBe(true);
   });
-  it('permits the scheduled-sweep read-only list entry shape', () => {
+  it('keeps the scheduled-sweep stored read-only list human without consumer proof', () => {
     const section = diff(sweep, [' const readOnly = [', "+  'heavy-queue',", "   'events',", ' ];']);
     expect(propose({ [sweep]: section }, [permission(sweep)], { readOnlyOps: new Set(['heavy-queue']) })
-      .proposed).toBe(false);
+      .proposed).toBe(true);
   });
   it('refuses the exact health allow-list early-return bypass', () => {
     const section = diff(dispatch, [' export function healthInvestigateDisallowedTools() {', '   return [',
@@ -225,10 +276,15 @@ describe('direction-aware humanRequired shadow (R131)', () => {
       '+const zeroWrites = [PR_TRACE_OP, HEALTH_OP, EVENTS_OP];']);
     expect(propose({ [runner]: section }, [permission(runner)]).proposed).toBe(true);
   });
-  it('permits an unchanged guard re-add beside a pure read-only addition', () => {
+  it('keeps stored arrays human even beside an unchanged guard re-add', () => {
     const section = diff(dispatch, ['-if (!allowed.includes(op)) return false;',
       '+  if (!allowed.includes(op)) return false;', ' const allowed = [', '+PR_TRACE_OP,', ' ];']);
-    expect(propose({ [dispatch]: section }, [permission(dispatch)]).proposed).toBe(false);
+    expect(propose({ [dispatch]: section }, [permission(dispatch)]).proposed).toBe(true);
+  });
+  it('permits an unchanged guard re-add beside a self-contained read-only import', () => {
+    const section = diff(runner, ['-if (!allowed.includes(op)) return false;',
+      '+  if (!allowed.includes(op)) return false;', "+import { PR_TRACE_OP } from './pr-trace.mjs';"]);
+    expect(propose({ [runner]: section }, [permission(runner)]).proposed).toBe(false);
   });
   it('requires re-added non-new words to come from the replaced line', () => {
     const section = diff(runner, [' const unused = [];', '-const zeroWrites = [EVENTS_OP];',
@@ -248,6 +304,17 @@ describe('direction-aware humanRequired shadow (R131)', () => {
     'webeverything.config.json': diff('webeverything.config.json', ['-old', '+next']) };
     const hits = [setting, ...Object.keys(sections).slice(1).map(file => ({ file, category: 'protection', kind: 'protection' }))];
     expect(propose(sections, hits)).toEqual({ proposed: false, reason: 'adds protected paths only' });
+  });
+  it.each(['/literal-path_1$/', '/^scripts\\/rulesets\\//', '/(^|\\/)policy\\.json$/i'])
+    ('permits bounded literal-path protections: %s', regex => {
+      expect(propose({ [surface]: tightening([`+  ${regex},`]) }, [setting]))
+        .toEqual({ proposed: false, reason: 'adds protected paths only' });
+    });
+  it('requires human review beyond the literal regex size bound', () => {
+    expect(propose({ [surface]: tightening([`+  /${'a'.repeat(511)}$/d,`]) }, [setting]).proposed).toBe(true);
+    expect(propose({ [surface]: tightening([`+  /${'a'.repeat(511)}$/,`]) }, [setting]).proposed).toBe(false);
+    expect(propose({ [surface]: tightening([`+  /${'a'.repeat(512)}$/,`]) }, [setting]))
+      .toEqual({ proposed: true, reason: 'unproven protection regex cost: human review required' });
   });
   it.each(['LAND_PR_OP', "'land-pr'", "PR_TRACE_OP, LAND_PR_OP", "'pr-trace', 'land-pr'"])
     ('keeps write-capable or mixed additions human: %s', op => {
@@ -365,7 +432,7 @@ describe('direction-aware humanRequired shadow (R131)', () => {
   it('preserves caller regex state and read-only proof inputs', () => {
     const regex = /unrelated/g; regex.lastIndex = 4;
     const readOnlyOps = new Set(['pr-trace']);
-    const sections = Object.freeze({ [runner]: simple() });
+    const sections = Object.freeze({ [runner]: importOnly() });
     const hits = Object.freeze([Object.freeze(permission(runner))]);
     expect(propose(sections, hits, { readOnlyOps, protectionPaths: [regex] }).proposed).toBe(false);
     expect(regex.lastIndex).toBe(4);
