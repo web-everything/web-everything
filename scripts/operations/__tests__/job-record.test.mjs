@@ -75,6 +75,44 @@ describe('job run record', () => {
     const { job, ...plain } = newJobRunRecord({ id: 'r1', kind: 'noop' });
     expect(validateRunRecord({ ...plain, op: 'land' }).ok).toBe(true);
   });
+
+  it('optional task metadata round-trips and rejects malformed fields', () => {
+    const rec = newJobRunRecord({ id: 'task-review-1', kind: 'review' });
+    const old = structuredClone(rec);
+    expect(rec.job).not.toHaveProperty('task');
+    writeRun(rec, dir);
+    expect(readRun(rec.id, dir)).toEqual(old);
+    const task = {
+      id: 'review:owner/repo:42:1', kind: 'review', repo: 'owner/repo', item: 42, seq: 1,
+      timeoutMs: 300000, policy: { timeoutMs: 300000 }, sources: { timeoutMs: 'standard' },
+      acting: true, actingRepoCap: 1, resourceKind: 'review', failureCount: 0,
+      outcome: null, resultRef: null,
+    };
+    rec.job.task = task;
+    writeRun(rec, dir);
+    expect(readRun(rec.id, dir).job.task).toEqual(task);
+    for (const outcome of ['acted', 'nothing-owed', 'superseded', 'deferred-claim-held', 'deferred-read', 'failed']) {
+      expect(validateJobBlock({ ...rec.job, task: { ...task, outcome, resultRef: 'results/task-review-1-1.json' } })).toEqual([]);
+    }
+    const bad = [
+      null, [], {}, { ...task, id: 'review:owner/repo:42:2' }, { ...task, kind: 'other' },
+      ...['Owner/repo', '../repo', 'owner/repo/extra', 'owner/repo\n', 'o/'.concat('r'.repeat(101))].map(repo => ({ ...task, repo })),
+      ...['item', 'seq'].flatMap(key => [0, -1, 1.5, '1', Number.MAX_SAFE_INTEGER + 1].map(v => ({ ...task, [key]: v }))),
+      ...[0, -1, Infinity, NaN, '300000'].map(timeoutMs => ({ ...task, timeoutMs })),
+      { ...task, policy: {} }, { ...task, policy: { timeoutMs: 1 } }, { ...task, sources: {} },
+      { ...task, sources: { timeoutMs: 'unknown' } }, { ...task, acting: 'yes' },
+      ...[0, 1.5, Infinity].map(actingRepoCap => ({ ...task, actingRepoCap })),
+      ...[-1, 0.5, Infinity, '0', Number.MAX_SAFE_INTEGER + 1].map(failureCount => ({ ...task, failureCount })),
+      { ...task, resourceKind: 'Bad Resource' }, { ...task, outcome: 'success' },
+      { ...task, repo: 'owner/repo\n', id: 'review:owner/repo\n:42:1' },
+      ...['../escape', '/local/result.json', 'results/../escape', 'results/x.json\n', `results/${'x'.repeat(257)}.json`, 1].map(resultRef => ({ ...task, resultRef })),
+    ];
+    for (const value of bad) {
+      expect(validateJobBlock({ ...rec.job, task: value }).join(), JSON.stringify(value)).toMatch(/task/);
+    }
+    writeFileSync(join(dir, `${rec.id}.json`), JSON.stringify({ ...rec, job: { ...rec.job, task: {} } }));
+    expect(() => readRun(rec.id, dir)).toThrow();
+  });
 });
 
 describe('daemon jobs dir', () => {
