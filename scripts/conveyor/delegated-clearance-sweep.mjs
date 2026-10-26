@@ -133,9 +133,14 @@ export function planDelegatedClearance(prs, { repo = null, preApprovals = [] } =
     const c = { num: pr.number, head: pr.headRefOid, approval, broken };
     if (approval && broken.length) return [c];
     const labels = names(pr), accepted = latestAdvisory(trustedAdvisoryComments(pr.comments));
+    // review-gate fails while review:human stands; requiring that failure to clear first deadlocks.
+    // Exempt only its completed failure, and still require positive CI evidence from other checks.
+    const checks = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup.filter(ch =>
+      !((ch?.name ?? ch?.context) === 'review-gate'
+        && (ch?.status === 'COMPLETED' && ch.conclusion === 'FAILURE' || ch?.state === 'FAILURE'))) : [];
     if (labels.some(l => DELEGATED_CLEARANCE_INELIGIBLE_LABELS.includes(l)) || pr.isDraft === true || pr.mergeable !== 'MERGEABLE'
-      || !Array.isArray(pr.statusCheckRollup) || !pr.statusCheckRollup.length
-      || !pr.statusCheckRollup.every(ch => ch?.conclusion === 'SUCCESS' && ch.status === 'COMPLETED'
+      || !checks.length
+      || !checks.every(ch => ch?.conclusion === 'SUCCESS' && ch.status === 'COMPLETED'
         || ch?.state === 'SUCCESS') || broken.length) return [];
     if ((!approval || approval.conditions.accepted) && (!labels.includes('advisory:accepted') || accepted?.outcome !== 'accept' || !advisoryCoversHead(accepted, pr.headRefOid))) return [];
     if ((!approval || approval.conditions.redTeamClear) && (!labels.includes('red-team:clear') || !redTeam)) return [];

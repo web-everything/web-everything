@@ -33,6 +33,49 @@ function harness(extra = {}) {
 }
 describe('R130 delegated clearance', () => {
   afterEach(() => vi.unstubAllEnvs());
+  it.each(['shadow', 'live', 'pre-approved', 'status-context'])('clears the review-gate hold cycle in %s mode', mode => {
+    const p = pr();
+    p.statusCheckRollup.push(mode === 'status-context' ? { context: 'review-gate', state: 'FAILURE' }
+      : { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' });
+    const h = harness({ prs: [p],
+      ...(mode === 'shadow' ? { setting: {} } : {}),
+      readPreApprovals: () => mode === 'pre-approved' ? approvals : [] });
+    const results = sweepDelegatedClearance(h);
+    expect(results).toContainEqual(expect.objectContaining({ num: p.number,
+      delegated: mode === 'shadow' ? 'would-approve' : 'auto-approved' }));
+    expect(h.runLabel).toHaveBeenCalledTimes(mode === 'shadow' ? 0 : 1);
+  });
+  it.each([
+    { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' },
+    { name: 'test', status: 'IN_PROGRESS', conclusion: null },
+    { context: 'test', state: 'FAILURE' },
+    { context: 'test', state: 'PENDING' },
+    { name: 'review-gate-extra', status: 'COMPLETED', conclusion: 'FAILURE' },
+    { name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+    { name: 'review-gate', status: 'IN_PROGRESS', conclusion: null },
+    { name: 'review-gate', status: 'COMPLETED', conclusion: 'CANCELLED' },
+    null,
+  ])('still refuses incomplete or failing CI beside a held review-gate: %j', check => {
+    const p = pr();
+    p.statusCheckRollup.push({ name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' }, check);
+    expect(planDelegatedClearance([p], { repo: 'o/r', preApprovals: approvals })).toEqual([]);
+    const h = harness({ prs: [p], readPreApprovals: () => approvals });
+    expect(sweepDelegatedClearance(h)).toEqual([]);
+    expect(h.runLabel).not.toHaveBeenCalled();
+  });
+  it.each([{ checks: [] }, { checks: [{ name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' }] }])(
+    'requires positive CI evidence beyond the hold: %j', ({ checks }) => {
+      expect(planDelegatedClearance([{ ...pr(), statusCheckRollup: checks }])).toEqual([]);
+    });
+  it('aborts if real CI turns red during the held PR live reread', () => {
+    const p = pr();
+    p.statusCheckRollup.push({ name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' });
+    const h = harness({ prs: [p], readPr: vi.fn(() => ({ ...p,
+      statusCheckRollup: [...p.statusCheckRollup, { context: 'test', state: 'FAILURE' }] })) });
+    expect(sweepDelegatedClearance(h)).toContainEqual(expect.objectContaining({ delegated: 'aborted' }));
+    expect(h.readPr).toHaveBeenCalledOnce();
+    expect(h.runLabel).not.toHaveBeenCalled();
+  });
   it('accepts the emitted advisory outcome and net basis without a reviewed-sha marker', () => {
     expect(pr().comments[0].body).not.toContain('reviewed-sha');
     expect(planDelegatedClearance([pr()])).toHaveLength(1);
@@ -86,11 +129,12 @@ describe('R130 delegated clearance', () => {
     } finally { exit.mockRestore(); }
   });
 
-  it.each(['eligible', 'missing-gates', 'failed-check'])('reconciler default reader composes live delegated gates: %s', evidence => {
+  it.each(['eligible', 'review-held', 'missing-gates', 'failed-check'])('reconciler default reader composes live delegated gates: %s', evidence => {
     const h = harness();
+    if (evidence === 'review-held') h.prs[0].statusCheckRollup.push({ name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' });
     // Exercise the production reader composition, injecting only forge transport and the write sink.
     delete h.readPr;
-    const fresh = { ...pr(), state: 'OPEN', isDraft: false };
+    const fresh = { ...h.prs[0], state: 'OPEN', isDraft: false };
     if (evidence === 'missing-gates') delete fresh.mergeable;
     if (evidence === 'failed-check') fresh.statusCheckRollup = [{ status: 'COMPLETED', conclusion: 'FAILURE' }];
     const forge = vi.spyOn(ghThrottle, 'execFileSyncThrottled').mockImplementation((file, args) => {
@@ -106,7 +150,7 @@ describe('R130 delegated clearance', () => {
         now: h.now, delegatedClearance: h });
       expect(forge).toHaveBeenCalledOnce();
       expect(forge.mock.calls[0][1].at(-1).split(',')).toEqual(expect.arrayContaining(['mergeable', 'statusCheckRollup', 'isDraft']));
-      if (evidence === 'eligible') {
+      if (evidence === 'eligible' || evidence === 'review-held') {
         expect(h.runLabel).toHaveBeenCalledOnce();
         expect(results).toContainEqual(expect.objectContaining({ num: 5925, delegated: 'auto-approved' }));
       } else {
