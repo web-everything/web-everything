@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { createRedTeamIo, priorRedTeamRow, redTeamAlreadyRan, redTeamMarker, runRedTeam, speculateRedTeam } from '../review-extra-seats.mjs';
 import { readStore } from '../../conveyor/run-scorecard-store.mjs';
 import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
@@ -7,6 +7,8 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { provenanceRun } from '../../lib/__tests__/fixtures/saved-red-team-provenance.mjs';
+import { writeRun } from '../run-store.mjs';
 
 vi.mock('../../conveyor/pr-comments-complete.mjs', () => ({ readCompletePrComments: vi.fn(() => []) }));
 
@@ -60,6 +62,18 @@ const read = { netBasis: { rev }, netChangedFiles: ['scripts/example.mjs'], diff
 const loopPayload = { verdict: { verdict: 'accept' }, findings: { read } };
 const prior = { dispatchKind: 'review-seat', seat: 'red-team', status: 'ok', pr, repo, rev,
   callId: 'stored-call', provider: 'codex', model: 'm', findings: [], foldedVerdict: 'accept' };
+
+// Ordinary review reuse needs provenance even for legacy rows; explicit resume-only
+// recovery tests below retain main's guarded legacy evidence path.
+const provenanceRoots = [];
+afterEach(() => { for (const root of provenanceRoots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+function attestRows(rows) {
+  const root = mkdtempSync(join(tmpdir(), 'red-team-resume-provenance-'));
+  provenanceRoots.push(root);
+  const env = { WE_RED_TEAM_TIMING: 'post-accept', OPERATION_RUNS_DIR: join(root, 'runs'), CONVEYOR_STATE_ROOT: root };
+  writeRun(provenanceRun({ env, rows, repo, pr, head: rev }), env.OPERATION_RUNS_DIR);
+  return env;
+}
 
 describe('shared red-team recovery entry guards', () => {
   const finished = result => ({ repo, pr, head: rev, status: 'finished', result });
@@ -240,7 +254,7 @@ if (args[0] === 'pr' && args[1] === 'view' && args.includes('--json') && args.in
   it('leaves normal full reviews free to resume without recovery readers', async () => {
     const io = fakeIo('resume', { readRedTeamStatus: vi.fn(() => { throw Error('unavailable'); }),
       readRecoveryComments: vi.fn(() => { throw Error('unavailable'); }) });
-    expect(await run(undefined, io)).toMatchObject({ status: 'resumed' });
+    expect(await run(undefined, io, { env: attestRows([prior]) })).toMatchObject({ status: 'resumed' });
     expect(io.readRedTeamStatus).not.toHaveBeenCalled();
     expect(io.readRecoveryComments).not.toHaveBeenCalled();
     noLaunch(io);
@@ -431,7 +445,7 @@ for (const entry of [runRedTeam, speculateRedTeam]) {
       const io = fakeIo(() => [prior]);
       expect(await entry({ pr, repo, read: cardRead,
         loopPayload: { ...loopPayload, findings: { read: cardRead } },
-        env: { WE_RED_TEAM_SKIP_CARD_ONLY: '1' }, resumeOnly }, io)).toMatchObject({
+        env: { ...attestRows([prior]), WE_RED_TEAM_SKIP_CARD_ONLY: '1' }, resumeOnly }, io)).toMatchObject({
         status: 'resumed', callId: prior.callId, comment: { status: 'posted' },
       });
       expect(io.postComment).toHaveBeenCalledOnce();
@@ -452,7 +466,7 @@ for (const entry of [runRedTeam, speculateRedTeam]) {
       it('reports a recorded card-only result without publishing before the verdict', async () => {
         const io = fakeIo(() => [prior]);
         expect(await entry({ pr, repo, read: { ...read, netChangedFiles: ['backlog/123-card.md'] },
-          env: { WE_RED_TEAM_SKIP_CARD_ONLY: '1' }, resume: false }, io)).toMatchObject({ status: 'prior-row' });
+          env: { ...attestRows([prior]), WE_RED_TEAM_SKIP_CARD_ONLY: '1' }, resume: false }, io)).toMatchObject({ status: 'prior-row' });
         expect(io.postComment).not.toHaveBeenCalled();
         expect(io.append).not.toHaveBeenCalled();
         noCalls(io);
@@ -472,7 +486,7 @@ describe('PR 5890 completed-seat dedupe', () => {
     const io = { now: () => 1_000, log: () => {}, readRecords: () => [broken],
       listComments: () => [{ author: { login: 'web-everything' }, body: redTeamMarker(pr, rev) }],
       cliAvailable: vi.fn(() => { throw Error('must not launch another pass'); }) };
-    const result = await speculateRedTeam({ pr, repo, read, env: {}, resume: false }, io);
+    const result = await speculateRedTeam({ pr, repo, read, env: attestRows([broken]), resume: false }, io);
     expect(priorRedTeamRow([broken], pr, rev, repo)).toBe(broken);
     expect(result).toMatchObject({ status: 'prior-row', reason: expect.stringContaining('completed red-team seat row') });
     expect(result.reason).not.toContain('clean');
@@ -484,7 +498,7 @@ describe('PR 5890 completed-seat dedupe', () => {
     const io = { now: () => 1_000, log: () => {}, readRecords: () => [broken], listComments: () => [],
       postComment: vi.fn(), append: vi.fn(),
       cliAvailable: vi.fn(), reserveCalls: vi.fn(), runSeat: vi.fn(), runRecheck: vi.fn() };
-    const result = await runRedTeam({ pr, repo, loopPayload, env: {} }, io);
+    const result = await runRedTeam({ pr, repo, loopPayload, env: attestRows([broken]) }, io);
     expect(result).toMatchObject({ status: 'resumed', callId: prior.callId, comment: { status: 'posted' } });
     expect(result.reason).not.toContain('clean');
     expect(io.postComment.mock.calls[0][0].body).toContain('Confirmed break');
@@ -499,7 +513,7 @@ describe('PR 5890 completed-seat dedupe', () => {
       const io = { now: () => 1_000, log: () => {}, readRecords: () => [row],
         listComments: () => [], postComment: vi.fn(), cliAvailable: vi.fn() };
       expect(priorRedTeamRow([row], pr, rev, repo)).toBe(row);
-      expect(await runRedTeam({ pr, repo, loopPayload, env: {} }, io)).toMatchObject({ status: 'error' });
+      expect(await runRedTeam({ pr, repo, loopPayload, env: attestRows([row]) }, io)).toMatchObject({ status: 'error' });
       expect(io.postComment).not.toHaveBeenCalled();
       expect(io.cliAvailable).not.toHaveBeenCalled();
     });

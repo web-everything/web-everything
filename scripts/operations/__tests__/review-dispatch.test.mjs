@@ -600,6 +600,8 @@ describe('isReviewCodePath (#4387)', () => {
       'scripts/operations/review-pr.mjs', 'scripts/operations/review-dispatch.mjs', 'scripts/operations/cli-adapter.mjs',
       'scripts/operations/review-loop-cli.mjs', 'scripts/lib/judge-spawn.mjs', 'scripts/lib/jury-core.mjs',
       'scripts/lib/codex-judge-spawn.mjs', 'scripts/lib/review-policy.contract.json', 'scripts/lib/main-staleness.mjs',
+      'scripts/lib/saved-red-team-provenance.mjs', 'scripts/lib/drain-saved-red-team.mjs',
+      'scripts/lib/drain-red-team-requests.mjs', 'scripts/lib/drain-red-team-review.mjs',
     ].every(isReviewCodePath)).toBe(true);
   });
   it('rejects unrelated code, backlog cards, nested dirs, and non-strings', () => {

@@ -1,0 +1,4 @@
+{
+  "$comment": "Scheduling only: holds move earlier; carry-over never bypasses a gate. Set boolean leaves false to roll them back; catchUpSkipMaxMin bounds hold skips; priorityReserveMaxMin bounds red-team file reservations (zero disables them). redMainSkipCatchUp skips non-fix catch-up PRs while red-main-hold is active.",
+  "drain": { "redMainSkipCatchUp": true, "holdFirst": true, "catchUpSkipUnchangedHolds": true, "carryOverReadyFirst": true, "catchUpSkipMaxMin": 15, "priorityReserveMaxMin": 90 }
+}

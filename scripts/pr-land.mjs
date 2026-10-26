@@ -82,7 +82,7 @@ import { defaultShimDir, resolveOrgAwareShimDir, pathWithOrgAwareShim } from './
 import { publicationTitle, readMainCard } from './operations/machine-pr-title.mjs';
 import { producerBuildContext, checkpointBuildPr } from './operations/build-pr-authorship.mjs';
 import { execFileSync } from 'node:child_process';
-import { readFileSync, realpathSync } from 'node:fs';
+import { readFileSync, realpathSync, lstatSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
@@ -119,7 +119,8 @@ import { writeAllSync } from './lib/write-all-sync.mjs';
 import { admittedArgv } from './readiness/heavy-admission.mjs'; // xaipsbs — the heal's check:standards waits for a heavy-command slot
 import { verifyGateDecision, readVerifyMarker, resolveVerifyOptions } from './lib/lane-verify.mjs'; // #2833 — the lane-verification finish-guard: refuse to land a HEAD whose synchronous suite run never finished (or, under --require-verified, was never recorded green). readVerifyMarker/resolveVerifyOptions are the SHARED marker reader + option resolver (findings 2/5) both this gate and verify-lane use, so the two can never drift (readVerifyMarker owns the VERIFY_FILENAME path — no bare JSON.parse of the marker here).
 import { MAIN_CI_RED_DEFAULTS } from './conveyor/main-ci-red-core.mjs'; // card xu1nixv — a red-main fix PR never opens as a draft
-import { laneRelevantChangeSinceForRecord } from './lib/verify-lane-gate.mjs'; // #4296 — keys the finish-guard's marker match to what LANE-RELEVANT files changed since the marker's recorded sha, not the exact commit (a no-op merge of BASE that conflicts only outside the lane's own touch-set must not force a fresh full re-verify).
+import { resolveSharedRecordDir, repoScopeOf, readSharedRecord, sharedFinishGuardFallback } from './lib/verify-shared-record.mjs';
+import { computeWorkingTreeHash, laneRelevantChangeSinceForRecord } from './lib/verify-lane-gate.mjs'; // #4296 — keys the finish-guard's marker match to what LANE-RELEVANT files changed since the marker's recorded sha, not the exact commit (a no-op merge of BASE that conflicts only outside the lane's own touch-set must not force a fresh full re-verify).
 
 // ── flag parsing (mirrors push-if-green.mjs) ──────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
@@ -669,13 +670,18 @@ export function resolveRosterReconcile({ careLevel, changedFiles = [], preRegist
  * `verifyGateDecision` verdict the CLI's inline block acts on. Pure given `readMarker`/`runGit` — no CLI argv,
  * no `process.exit`, no gh.
  * @param {{gitDir: string, headSha: string, remote: string, base: string, runGit: (args: string[]) => string,
- *   readMarker: (gitDir: string) => object|null, breakGlass?: boolean, requireVerified?: boolean}} args
+ *   readMarker: (gitDir: string) => object|null, readSharedRecord?: (args: {headSha: string}) => object|null,
+ *   breakGlass?: boolean, requireVerified?: boolean}} args
  * @returns {{ ok: boolean, status: string, reason: string, detail: string }}
  */
-export function resolveFinishGuardVerdict({ gitDir, headSha, remote, base, runGit, readMarker, breakGlass = false, requireVerified = true }) {
+export function resolveFinishGuardVerdict({ gitDir, headSha, remote, base, runGit, readMarker, readSharedRecord, breakGlass = false, requireVerified = true }) {
   const verifyRecord = readMarker(gitDir);
   const laneRelevantChangeSinceRecord = laneRelevantChangeSinceForRecord({ record: verifyRecord, headSha, base: `${remote}/${base}`, runGit });
-  return verifyGateDecision({ record: verifyRecord, headSha, breakGlass, requireVerified, laneRelevantChangeSince: laneRelevantChangeSinceRecord });
+  const localVerdict = verifyGateDecision({ record: verifyRecord, headSha, breakGlass, requireVerified, laneRelevantChangeSince: laneRelevantChangeSinceRecord });
+  return typeof readSharedRecord === 'function'
+    ? sharedFinishGuardFallback({ localVerdict, headSha, readShared: readSharedRecord,
+      decide: (record) => verifyGateDecision({ record, headSha, breakGlass, requireVerified }) })
+    : localVerdict;
 }
 
 /** Preserve the original push error while explaining a rejected lane tip. */
@@ -918,6 +924,17 @@ function runCli() {
     // own source-text wiring assertions.
     const gate = resolveFinishGuardVerdict({
       gitDir, headSha: refSha, remote: REMOTE, base: BASE, runGit: gitC, readMarker: readVerifyMarker,
+      readSharedRecord: ({ headSha }) => {
+        const { dir, source } = resolveSharedRecordDir();
+        process.stderr.write(`pr-land: shared verify record store ${dir} (source: ${source})\n`);
+        // The tree hash below describes the checkout's working tree, so it only vouches for `headSha` when HEAD IS it.
+        if (gitC(['rev-parse', 'HEAD']) !== headSha) return null;
+        const scope = repoScopeOf(gitC);
+        if (!scope) return null;
+        // readSharedRecord obtains checkoutIdentity itself and refuses dirty or unavailable checkouts.
+        return readSharedRecord({ dir, sha: headSha, runGit: gitC,
+          fileMode: (f) => lstatSync(join(REPO, f)).mode, gate: 'default', scope });
+      },
       breakGlass: VERIFY_BREAK_GLASS, requireVerified: REQUIRE_VERIFIED,
     });
     if (!gate.ok) {

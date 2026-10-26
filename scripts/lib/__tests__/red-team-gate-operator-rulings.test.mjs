@@ -1,11 +1,21 @@
-/** Cap-only shared-reader subset: human card records, author/wrapper and head/result binding. */
+// @vitest-environment node
 import { describe, expect, it } from 'vitest';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
-import { CONFIRMED_BREAKS_DEFAULTS, operatorRulingsOnLiveResult, resolveOperatorRulings, readOperatorRulings, gateRoundGrants, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } from '../red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, operatorRulingsOnLiveResult, resolveOperatorRulings, readOperatorRulings, unknownOperatorOutcomes, redTeamCarryLinesMarker, gateRoundGrants, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } from '../red-team-gate.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
-import { planRedTeamStatusLabels } from '../red-team-status-labels.mjs';
+import { planRedTeamStatusLabels, syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
+
+
+/** Cap-only shared-reader subset: human card records, author/wrapper and head/result binding. */
+
+
+
+
+
+
+
 
 const H = '61782334289124cd4fcb51d0bdadb6ef3c795e82';
 const P = 5502;
@@ -221,6 +231,11 @@ describe('operator ruling in any state (shared reader)', () => {
     const next = bot(renderRedTeamComment({ pr: P, rev: N, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes', findings: [F(159, 'broken')] }), '2026-10-21T21:00:00Z');
     expect(sent(disp([...live, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z'), next], true, N))).toEqual([1]);
   });
+  it('an operator-block after the card re-holds', () => {
+    const comments = [...live, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z'),
+      gate(human, 'operator-block', '- 1 confirmed break(s) sent back to the fixer (#1).', '2026-10-21T20:40:00Z')];
+    expect(sent(disp(comments))).toEqual([1]);
+  });
   it.each(operatorReleaseLines)('kill switch off for %s: never overrides a live send-back, still releases a break handed over at the cap', (_format, line) => {
     const op = gate(human, 'operator-card', line, '2026-10-21T20:30:00Z');
     expect(held(disp([...live, op], true))).toEqual([]);
@@ -292,5 +307,38 @@ describe('latest operator action deduplication', () => {
     expect([...fresh.ruled]).toEqual([]);
     expect([...fresh.carded]).toEqual([]);
     expect(operatorRulingsOnLiveResult([], P, H).resultId).toBeNull();
+  });
+});
+
+describe('label writers never re-derive over an operator ruling they cannot read', () => {
+  it('a trusted operator-* outcome this reader does not know skips the sync (no label write)', () => {
+    const future = gate(human, 'operator-defer', '- 1 finding(s) left advisory (#1).', '2026-10-21T20:30:00Z');
+    expect(unknownOperatorOutcomes([...live, future], P, H)).toEqual(['operator-defer']);
+    expect(unknownOperatorOutcomes([...live, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z')], P, H)).toEqual([]);
+    const writes = [];
+    const provider = { readPrState: () => ({ headRefOid: H, labels: [{ name: 'red-team:clear' }] }), readComments: () => [...live, future],
+      ensureLabel: () => {}, setLabels: (...a) => writes.push(a) };
+    const out = syncRedTeamStatusLabels({ repo: 'web-everything/web-everything', pr: P, head: H, env: {}, provider, standingRuling: null, savedResult: null });
+    expect(out.skipped).toBe('unknown-operator-outcome');
+    expect(writes).toEqual([]);
+  });
+});
+
+describe('operator carry policy', () => {
+  it('retains cap-only defaults alongside the carry environment switch', () => {
+    expect(resolveOperatorRulings({}).value).toEqual({ anyState: false, carryAcrossRebase: true });
+    expect(resolveOperatorRulings({ env: { WE_RED_TEAM_OPERATOR_RULINGS_CARRY: 'off' } }))
+      .toMatchObject({ value: { anyState: false, carryAcrossRebase: false }, sources: { carryAcrossRebase: 'env' } });
+  });
+  it('carries a cap-owned release only with exact cited-line proof and an enabled carry policy', () => {
+    const source = [...live, gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:30:00Z')];
+    const proof = bot(redTeamCarryLinesMarker({ pr: P, from: H, to: N, result: rid, unchanged: [1] }), '2026-10-21T21:00:01Z');
+    const read = (comments, carryAcrossRebase = true) => readRedTeamDisposition({ comments, pr: P, head: N,
+      setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: false, carryAcrossRebase } });
+    expect(held(read([...source, carried]))).toEqual([1]);
+    expect(held(read([...source, carried, proof]))).toEqual([]);
+    expect(held(read([...source, carried, proof], false))).toEqual([1]);
+    expect(held(read([result, source.at(-1), carried, proof]))).toEqual([1]);
+    expect(held(read([...source, carried, { ...proof, user: { login: 'mallory', type: 'User' } }]))).toEqual([1]);
   });
 });
