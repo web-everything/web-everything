@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
-import { scoreEscalation } from '../lib/review-escalation.mjs';
+import { isBlastRadiusPath, scoreEscalation } from '../lib/review-escalation.mjs';
 import { buildShapePlan, runShape } from '../review-core-cli.mjs';
+import { buildShapePlan as sharedShapePlan } from '../lib/review-shape.mjs';
 import { resolveDirectionAwareMode } from '../lib/direction-aware-human.mjs';
 import { loadReadOnlyOps } from '../lib/read-only-ops.mjs';
 import * as importClosure from '../lib/import-closure.mjs';
@@ -23,7 +24,7 @@ const diffHunks = `diff --git a/${runner} b/${runner}
 `;
 const evidence = { changedFiles: [runner], diffHunks, readOnlyOps: new Set(['pr-trace']) };
 
-// Isolate byte-comparison evidence from the live runner's conservatively incomplete graph.
+// Isolate byte-comparison evidence from the live runner's conservative dependency checks.
 async function withCompleteClosure(check) {
   const closure = vi.spyOn(importClosure, 'collectImportClosure').mockImplementation(({ entries }) => ({
     files: new Set(entries), complete: true, jsonNames: new Set(),
@@ -32,6 +33,17 @@ async function withCompleteClosure(check) {
 }
 
 describe('R131 direction-aware shape wiring', () => {
+  it('shares the pure shape function without pulling CLI evidence loading into operations', () => {
+    expect(buildShapePlan).toBe(sharedShapePlan);
+    expect(isBlastRadiusPath('scripts/lib/review-shape.mjs')).toBe(true);
+    const closure = importClosure.collectImportClosure({ root: resolve('.'), entries: ['scripts/operations/review-pr.mjs'] });
+    expect(closure?.complete).toBe(true);
+    expect(closure.files.has('scripts/lib/review-shape.mjs')).toBe(true);
+    for (const file of ['scripts/review-core-cli.mjs', 'scripts/lib/read-only-ops.mjs',
+      'scripts/operations/run.mjs', 'scripts/operations/cli-adapter.mjs']) {
+      expect(closure.files.has(file)).toBe(false);
+    }
+  });
   it('keeps the entire current no-hunks shape for a readable harmless runner edit', () => {
     const harmless = `diff --git a/${runner} b/${runner}\n--- a/${runner}\n+++ b/${runner}\n@@ -1 +1 @@\n-// old note\n+// new note\n`;
     const base = scoreEscalation({ changedFiles: [runner] });

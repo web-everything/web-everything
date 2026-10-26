@@ -2,6 +2,10 @@
 
 ## Direction-aware operation evidence (R131)
 
+In-process review callers import the pure shape derivation from `scripts/lib/review-shape.mjs`.
+Keep CLI evidence loading outside that module: unknown dynamic imports make daemon/promotion import
+closures incomplete and force conservative restart, smoke and staleness fallbacks.
+
 Shape shadow evidence must preserve every current file-only shape field; a hunk-cleared hold stays proposed-human as unproven. Diff lines over 2000 characters require human review before parsing expressions.
 
 PR-head modules are untrusted data: never import them into the reviewer process, even in shadow mode.

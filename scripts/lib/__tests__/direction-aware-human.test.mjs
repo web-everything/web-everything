@@ -207,7 +207,7 @@ describe('direction-aware humanRequired shadow (R131)', () => {
     expect(propose({ [surface]: tightening(changes) }, [setting])).toEqual({ proposed: true, reason });
   });
   it.each(['scripts/lib/review-escalation.mjs', 'scripts/lib/permission-change.mjs',
-    'scripts/lib/direction-aware-human.mjs', 'scripts/review-core-cli.mjs', 'scripts/settings/human-review-surfaces.json',
+    'scripts/lib/direction-aware-human.mjs', 'scripts/review-core-cli.mjs', 'scripts/lib/review-shape.mjs', 'scripts/settings/human-review-surfaces.json',
     'scripts/lib/policy-cascade.mjs', 'scripts/lib/read-only-ops.mjs', 'scripts/settings/direction-aware-human.json'])
     ('keeps any classifier self-change human even without a hit: %s', file => {
       expect(propose({ [file]: diff(file, ['+// change']) }, []))
