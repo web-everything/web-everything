@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { buildAgentArgv } from '../../operations/dispatch-lane-io.mjs';
 
 import {
   BUNDLE_REPAIR_BOT, BUNDLE_REPAIR_STANDARD, HOLD_RULES, assertBriefSafe, cloneName, heldRefs, holdIdFor,
@@ -685,7 +686,6 @@ describe('settings via the cascade', () => {
 
 describe('bundle-repair dispatch carries a resolvable model', () => {
   it('builds an argv with exactly one non-flag --model for the bundle-repair kind, with no routing table', async () => {
-    const { buildAgentArgv } = await import('../../operations/dispatch-lane-io.mjs');
     const argv = buildAgentArgv({ sessionId: 'sid-1', payload: { launchKind: 'bundle-repair', sessionSlug: 'bundle-repair-x', prompt: 'repair' }, extraArgs: [] });
     const at = argv.indexOf('--model');
     expect(at).toBeGreaterThanOrEqual(0);

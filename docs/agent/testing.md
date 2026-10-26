@@ -2009,6 +2009,25 @@ Run `nightly-coroner-*.test.mjs` under `scripts/conveyor/__tests__/` through hea
 Cover ET boundaries and DST, persisted job adoption/catch-up, source logging, cursor continuity,
 publication deduplication, real isolated extraction, and release without cursor advance on failure.
 
+## Periodic card-batch recovery
+
+Health-watch imports `scripts/operations/card-batch-reconcile.mjs` for terminal-batch recovery and
+pending/owed prevention draining. Keep this hook when porting health features. Its import graph reaches
+reconcile-core through the filer and drain; avoid reading rearm-review's exported marker constant during
+module initialization. The reconcile tests exercise bookkeeping with the canonical exported marker.
+Use the card-batch-reconcile, prevention-drain-cap and tick-deadline-bounds tests together: they cover
+unreadable terminal evidence, one shared pending/owed allowance, deadline deferral and cursor fairness.
+The admission deadline must also reach terminal retirement: CLOSED member respooling and MERGED
+landing proofs share the same GitHub, Git and cat-file timeout budget. The named terminal-recovery
+admission tests use a deterministic clock to prove no subprocess starts after expiry; the sealed state
+stays intact for the next tick, and the admission lease is released.
+The periodic caller must pass that same tick-start deadline into retirement and stop before leasing
+another slot once exhausted. Keep the named periodic terminal-recovery deadline cases in
+`card-batch-reconcile.test.mjs` in the affected test gate: they cover many slots, slow CLOSED member
+reads, an already-spent budget, lease release and the subsequent due-batch flush.
+A filing pause must retain an owed record and propagate a non-success result through review-loop;
+never report a paused filing as queued or accept it as filed. Main's filing default stays enabled.
+
 ## Automated repair hand-offs
 
 `review-set-label` and the red-team gate signal the local fix daemon after a successful
