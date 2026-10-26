@@ -17,6 +17,7 @@ import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import { assertHumanOperator, isHumanOperatorComment, operatorBoundComments } from '../lib/operator-identity.mjs';
+import { resolveDisposition } from '../lib/red-team-disposition.mjs';
 import { GATE_OUTCOMES, OPERATOR_RULINGS_DEFAULTS, operatorRulingsOnLiveResult, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
 import { FALSE_FINDING_CAUSES } from '../lib/false-finding-causes.mjs';
 import { sanitizeCardField } from '../lib/review-loop-policy.mjs';
@@ -64,7 +65,6 @@ export const rulingCardResource = (p, scope = 'card') => actionResource(p.repo, 
 });
 
 const labelNames = (labels) => (Array.isArray(labels) ? labels : []).map((l) => (typeof l === 'string' ? l : l?.name));
-const RULING_ACTION = Object.freeze({ card: 'card', 'not-real': 'advisory', block: 'send-back' });
 const where = (f) => `${f.file ?? '(no file cited)'}${f.line ? `:${f.line}` : ''}`;
 
 /** Pick the selected held breaks from `--break`: `1`, `#1,#3`, `<file>:<line>` or `<file>`. PURE; throws. */
@@ -115,13 +115,20 @@ export function buildRuleReasonComment({ head, ruling, actor, channel, at, reaso
  *   - OFF (default): the round-cap restriction. Only a result parked at the round cap, after pending grants are consumed,
  *     and only the breaks the gate still holds for the operator.
  */
-export function rulableBreaks({ comments, labels, pr, head, setting, scope, ruling, citesCard = false, repo, standingRuling = null }) {
+export function rulableBreaks({ comments, labels, pr, head, setting, scope, ruling = 'card', citesCard = false, repo, standingRuling = null }) {
   const anyState = scope?.anyState === true;
   const state = liveResultGateState(comments, pr, head, repo, standingRuling);
   if (!state.result) throw new Error(`no red-team result on the live head ${head.slice(0, 9)} — nothing to rule on`);
   const atCap = state.outcomes.has(GATE_OUTCOMES.ROUND_CAP);
-  const { ruled, carded, blocked } = operatorRulingsOnLiveResult(comments, pr, head);
-  const releasable = f => ruling === 'block' || !blocked.has(f.index);
+  const { carded, blocked } = operatorRulingsOnLiveResult(comments, pr, head);
+  const disposition = readRedTeamDisposition({ comments, repo, pr, head, setting, standingRuling, operatorRulings: scope });
+  const resolved = f => resolveDisposition(f.index, disposition.rulings.get(f.index) ?? []);
+  const releasable = f => {
+    const evidence = disposition.rulings.get(f.index) ?? [];
+    const proposed = { kind: ruling, source: 'operator', keys: [f.index],
+      at: evidence.reduce((latest, r) => Math.max(latest, r.at), -1) + 1 };
+    return resolveDisposition(f.index, [...evidence, proposed]).by === proposed;
+  };
   if (!anyState) {
     if (!atCap) {
       throw new Error(`the red-team result on head ${head.slice(0, 9)} was not parked at the round cap (no trusted \`round-cap\` gate record decides it); `
@@ -129,21 +136,19 @@ export function rulableBreaks({ comments, labels, pr, head, setting, scope, ruli
     }
     if (state.reopened) throw new Error('a pending round extension reopened the red-team gate; let the gate consume the grant before ruling on a break');
     // A NEW card filing is never made for a break already carded by anyone, in either mode.
-    const held = readRedTeamDisposition({ comments, repo, pr, head, setting, standingRuling, operatorRulings: scope }).held
+    const held = disposition.held
       .filter((f) => !(ruling === 'card' && !citesCard && carded.has(f.index)))
       .filter(releasable);
     if (!held.length) throw new Error('no red-team break is held for the operator on the live head (already carded, ruled or cleared)'
       + (blocked.size ? '; live operator block takes precedence' : ''));
     return { state, atCap, anyState, rulable: held, noun: 'held for the operator' };
   }
-  const action = RULING_ACTION[ruling];
   // A NEW card filing is never made for a break already carded by anyone (the gate or an operator); citing an
   // existing card (--card) files nothing, so it may release a finding held again after the latest operator ruling.
   // A later gate action can supersede an operator release. Use the grant-aware reader so stale caps do not reopen it.
-  const disposition = readRedTeamDisposition({ comments, repo, pr, head, setting, standingRuling, operatorRulings: scope });
   const blocking = new Set([...disposition.held, ...disposition.sendBack].map((f) => f.index));
   // Completion is a durable sink check, never inferred from labels alone.
-  const rulable = state.result.findings.filter((f) => f.confirmed && releasable(f) && (ruling === 'block' || ruled.get(f.index)?.at(-1) !== action || blocking.has(f.index))
+  const rulable = state.result.findings.filter((f) => f.confirmed && releasable(f) && (ruling === 'block' || resolved(f).by?.source !== 'operator' || resolved(f).by?.kind !== ruling || blocking.has(f.index))
     && !(ruling === 'card' && !citesCard && carded.has(f.index)));
   if (!rulable.length) throw new Error(`no confirmed red-team break on the live head is left to rule \`${ruling}\` (none confirmed, or each already ruled \`${ruling}\` by the operator on this result; live operator block takes precedence)`);
   return { state, atCap, anyState, rulable, noun: `confirmed and not already ruled \`${ruling}\` on the live head` };

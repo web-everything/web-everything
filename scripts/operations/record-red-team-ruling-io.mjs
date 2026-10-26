@@ -9,6 +9,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveDisposition } from '../lib/red-team-disposition.mjs';
 import { liveResultGateState, readConfirmedBreaks, readOperatorRulings, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { resolveCardRef } from './record-referral-ruling-io.mjs';
@@ -198,7 +199,8 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
       throw new Error(`${what} is not in the read-back as a human operator's comment (altered, or posted as another account); inspect the thread before retrying`);
     }
     const d = readRedTeamDisposition({ comments, repo: p.repo, pr: p.pr, head, setting: p.setting, operatorRulings: effectiveScope(p), standingRuling });
-    const still = p.indices.filter((i) => d.held.some((f) => f.index === i) || d.sendBack.some((f) => f.index === i));
+    const still = p.indices.filter((i) => resolveDisposition(i, d.rulings.get(i) ?? []).state === 'held'
+      || d.held.some((f) => f.index === i) || d.sendBack.some((f) => f.index === i));
     if (still.length) throw new Error(`${what} was posted but the gate still holds break(s) ${still.map((i) => `#${i}`).join(', ')} `
       + '(not authored by the operator account, or an altered body); inspect the thread before retrying');
     return after;
@@ -215,7 +217,8 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
       throw new Error("the operator-block record is not in the read-back as a human operator's comment; inspect the thread before retrying");
     }
     const d = readRedTeamDisposition({ comments, repo: p.repo, pr: p.pr, head, setting: p.setting, operatorRulings: p.scope, standingRuling });
-    const free = p.indices.filter((i) => !d.held.some((f) => f.index === i) && !d.sendBack.some((f) => f.index === i));
+    const free = p.indices.filter((i) => resolveDisposition(i, d.rulings.get(i) ?? []).by?.kind !== 'block'
+      || (!d.held.some((f) => f.index === i) && !d.sendBack.some((f) => f.index === i)));
     if (free.length) throw new Error(`the operator-block record was posted but the gate does not hold break(s) ${free.map((i) => `#${i}`).join(', ')}; inspect the thread`);
     return after;
   };
