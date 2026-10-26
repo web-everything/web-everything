@@ -41,10 +41,10 @@ export function resolveAdoptDescendantHead({ env = process.env, read = readSetti
 
 /** Call after admission. All commands, including lane acquisition, pass through the injected runner. */
 export async function publishBatch(input, opts = {}) {
-  const { stateDir = CARD_BATCH_STATE_DIR, exec = batchExec, clock = Date.now, remote = 'origin',
+  const { root = ROOT, stateDir = CARD_BATCH_STATE_DIR, exec = batchExec, clock = Date.now, remote = 'origin',
     policy = effectiveCardBatchPolicy(), leaseMs = 3 * 60 * 60_000, crashAt, verifyRetryMinutes } = opts;
-  // A job launched from a lane clone has no canonical origin of its own; anchor lane acquisition on the primary checkout.
-  const reference = opts.reference ?? primaryCheckout(ROOT);
+  // Anchor standard lanes on their primary; custom pools must leave the trusted env origin eligible.
+  const reference = opts.reference ?? primaryCheckout(root);
   const now = () => new Date(clock()).getTime();
   const statePath = resolve(input.statePath ?? join(stateDir, `${input.source.repo.replaceAll('/', '-')}-${input.kind}.json`));
   mkdirSync(dirname(statePath), { recursive: true });
@@ -54,7 +54,7 @@ export async function publishBatch(input, opts = {}) {
   let acquired;
   let bodyPath;
   let gitDir;
-  let cwd = input.laneDir ?? ROOT;
+  let cwd = input.laneDir ?? root;
   const run = (command, args, extra = {}) => exec(command, args, { cwd, ...extra });
   const gh = args => opts.gh ? opts.gh(args, { cwd }) : run('gh', args);
   const held = () => tokenOf(lockPath) === lease.token && now() < lease.expiresAt;
@@ -147,8 +147,9 @@ export async function publishBatch(input, opts = {}) {
     bodyPath = `${statePath}.${lease.token}.body.md`;
     writeFileSync(bodyPath, renderBatchBody(state));
     const acquireCheckout = async () => {
-      const acquire = pin => run('node', [join(ROOT, 'scripts/lane-pool.mjs'), 'acquire',
-        '--purpose=card-batch-seal', '--ttl-minutes=180', `--reference=${reference}`, ...(pin ? [`--lane=${pin}`] : []), '--json'], { timeout: 3 * 60_000 });
+      const acquire = pin => run('node', [join(root, 'scripts/lane-pool.mjs'), 'acquire',
+        '--purpose=card-batch-seal', '--ttl-minutes=180', ...(reference !== root ? [`--reference=${reference}`] : []),
+        ...(pin ? [`--lane=${pin}`] : []), '--json'], { timeout: 3 * 60_000 });
       // The remembered lane is a preference, not a requirement: once released it may be leased by anyone (live
       // 2026-10-10: lane-2 went to a fix worker and every retry failed). The verify receipt is restored from
       // state below, so any lane serves.
@@ -262,8 +263,8 @@ export async function publishBatch(input, opts = {}) {
     return { action: 'sealed', state };
   } finally {
     try {
-      if (acquired?.lane != null) await exec('node', [join(ROOT, 'scripts/lane-pool.mjs'), 'release',
-        `--lane=${acquired.lane}`, `--session=${acquired.holder}`], { cwd: ROOT, timeout: 3 * 60_000 });
+      if (acquired?.lane != null) await exec('node', [join(root, 'scripts/lane-pool.mjs'), 'release',
+        `--lane=${acquired.lane}`, `--session=${acquired.holder}`], { cwd: root, timeout: 3 * 60_000 });
     } finally {
       if (bodyPath) rmSync(bodyPath, { force: true });
       if (tokenOf(lockPath) === lease.token) rmSync(lockPath, { force: true });

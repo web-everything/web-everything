@@ -560,11 +560,32 @@ it('acquires the seal lane against the primary checkout so a lane-clone job is n
 });
 it('defaults the acquire reference to the derived primary checkout, never the running lane clone', async () => {
   const f = fixture({ maxCards: 1 });
-  await publishBatch(f.input, f.opts);
+  const primary = join(f.dir, 'web-everything');
+  mkdirSync(primary);
+  const root = join(f.dir, '.lanes', 'web-everything', 'lane-3');
+  mkdirSync(root, { recursive: true });
+  await publishBatch(f.input, { ...f.opts, root });
   const [, args] = f.exec.mock.calls.find(([, a]) => a[1] === 'acquire');
-  const reference = args.find(a => a.startsWith('--reference='));
-  expect(reference).toBeTruthy();
-  expect(reference).not.toMatch(/\/lane-\d+(\/|$)/);
+  expect(args).toContain(`--reference=${primary}`);
+  expect(args).not.toContain(`--reference=${root}`);
+});
+it.each([false, true])('preserves the trusted env origin for a custom-pool root (busy pinned lane: %s)', async busy => {
+  const f = fixture({ maxCards: 1 });
+  const root = join(f.dir, 'custom-pool', 'lane-3');
+  mkdirSync(root, { recursive: true });
+  vi.stubEnv('LANE_POOL_CANONICAL_ORIGIN', 'https://github.com/org/repo.git');
+  if (busy) writeFileSync(f.statePath, JSON.stringify({ ...f.state, sealLane: 3 }));
+  const attempts = [];
+  const exec = (cmd, args, options) => {
+    if (args[1] === 'acquire') {
+      attempts.push(args);
+      if (busy && args.includes('--lane=3')) throw new Error('lane busy');
+    }
+    return f.exec(cmd, args, options);
+  };
+  expect((await publishBatch(f.input, { ...f.opts, root, exec })).action).toBe('sealed');
+  expect(attempts).toHaveLength(busy ? 2 : 1);
+  for (const args of attempts) expect(args.some(arg => arg.startsWith('--reference='))).toBe(false);
 });
 it('a failed acquire leaves the batch resumable: the next tick relaunches the job and the hold stays', async () => {
   const f = fixture({ maxCards: 1 });
