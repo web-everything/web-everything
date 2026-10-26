@@ -1,0 +1,10 @@
+{
+  "$comment": "Numbering carry (#5742, #5777, #5779). review.carryAcceptAcrossNumbering (boolean, standard true, env WE_REVIEW_CARRY_ACCEPT_ACROSS_NUMBERING): an automated review:accepted is re-stamped onto a head that moved only by the drain's own card-numbering commit(s), proven by proveNumberingOnlyMove (card renames, bornAs stamps, whole-token id rewrites only); false = the numbered head needs a fresh review. The human clearance has its own key, review.carryHumanClearanceAcrossNumbering (numbering-human-clearance.json). review.carryRedTeamAcrossNumbering (boolean, standard true, env WE_REVIEW_CARRY_RED_TEAM_ACROSS_NUMBERING): when the exact head has no red-team evidence and would be held or requested, the drain's red-team admission reads the evidence and gate records of the proven numbering ancestor, so a renumber never requests a red team or a fresh review; false = exact-head evidence only. drain.numberingCommitIdentity (trusted|clone, standard trusted, env WE_DRAIN_NUMBERING_COMMIT_IDENTITY): trusted = a JIT-number commit is authored as an identity origin/main already trusts when the clone's own identity is not (CI exempts only trusted authors); clone = the clone's git config, as before. Any failed proof keeps today's behavior. Values and sources are logged where each is used.",
+  "review": {
+    "carryAcceptAcrossNumbering": true,
+    "carryRedTeamAcrossNumbering": true
+  },
+  "drain": {
+    "numberingCommitIdentity": "trusted"
+  }
+}

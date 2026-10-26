@@ -59,7 +59,8 @@ import { readGitAlreadyDone } from '../lib/git-already-done.mjs';
 
 import { withSalvageHint } from '../lib/salvage-index.mjs';
 import { execFileSync } from 'node:child_process';
-import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
+import { defaultListAgents, timeoutFromEnv } from './agent-listing.mjs';
+export { defaultListAgents, LIST_TIMEOUT_MS, LIST_TIMEOUT_ENV, listTimeoutMs } from './agent-listing.mjs';
 // #4415 (round 2) — live incident 2026-09-29: `defaultCheckAlreadyDone`/`defaultCheckAlreadyDoneAsync`/
 // `defaultListPrs` below all defaulted to a bare, unattributed `execFileSync`/`execFile` — never
 // `execFileSyncThrottled` — exactly the same defect this card's first round fixed in `lease-reaper.mjs` and
@@ -1124,10 +1125,10 @@ export function createTickReader(bindings = {}) {
 export const SPAWN_TIMEOUT_MS = 60 * 1000;
 
 /** How long `claude agents --json` gets. A read this cheap that blocks is a broken environment, not slow work. */
-export const LIST_TIMEOUT_MS = 15 * 1000;
+
 
 /** The env var that overrides {@link LIST_TIMEOUT_MS}. `0` means UNBOUNDED. See {@link listTimeoutMs}. */
-export const LIST_TIMEOUT_ENV = 'WE_DISPATCH_LIST_TIMEOUT_MS';
+
 
 /**
  * How long `gh pr list` gets. Longer than the agent listing because it is a NETWORK read against GitHub rather
@@ -1166,9 +1167,7 @@ export const PR_LIST_JSON_FIELDS = 'number,state,mergedAt,labels,headRefName';
  * @param {Record<string, string|undefined>} [env]
  * @returns {number} milliseconds; `0` = unbounded.
  */
-export function listTimeoutMs(env = process.env) {
-  return timeoutFromEnv(env, LIST_TIMEOUT_ENV, LIST_TIMEOUT_MS);
-}
+
 
 /**
  * The `gh pr list` bound for THIS process — {@link PR_LIST_TIMEOUT_MS} unless the environment overrides it.
@@ -1188,17 +1187,7 @@ export function prListTimeoutMs(env = process.env) {
  * operator who set a bound that never applied is in exactly the position this module's `WE_DISPATCH_AGENT_ARGS`
  * refusal exists to prevent.
  */
-function timeoutFromEnv(env, name, fallback) {
-  const raw = String(env[name] ?? '').trim();
-  if (!raw) return fallback;
-  const ms = Number(raw);
-  if (!Number.isFinite(ms) || ms < 0) {
-    throw new TypeError(
-      `operations: ${name} must be a non-negative number of milliseconds (0 = unbounded), got ${JSON.stringify(raw)}`,
-    );
-  }
-  return ms;
-}
+
 
 /**
  * How long the whole tick read gets. It is the only NETWORK-bound path in this file — `tick-core` shells
@@ -3491,18 +3480,3 @@ export function defaultLaneRefForPr(pr, { exec = execFileSyncThrottled, env = pr
  *   asserted. `all` defaults to `false` — every existing caller keeps today's active-sessions-only behavior
  *   unchanged; pass `all: true` ONLY from a caller whose job requires seeing completed sessions too.
  */
-export function defaultListAgents({ exec = execFileSync, env = process.env, all = false } = {}) {
-  const out = cachedClaudeAgents({ all, env, fetch: () => exec('claude', ['agents', '--json', ...(all ? ['--all'] : [])], {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    maxBuffer: 8 * 1024 * 1024,
-    timeout: listTimeoutMs(env),
-    killSignal: 'SIGKILL',
-    // FORWARDED TO THE CHILD, not just read for the timeout. `defaultSpawnAgent` forwards its `env` (via
-    // `...opts`) and this did not, so the two halves of one chain resolved `claude` differently: a test that
-    // pointed `PATH` at a fake got a real spawn and a REAL listing back. The default is `process.env`, so
-    // every existing caller — all of which pass `{ exec }` alone — is byte-identical.
-    env,
-  }) });
-  return JSON.parse(String(out || '[]'));
-}
