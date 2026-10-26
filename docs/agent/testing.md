@@ -18,6 +18,10 @@ verified overlays. Remaining unavailable registrations emit an `overlay-fetch-un
 excluded from the plan and saved-candidate eligibility, preventing both stale-tip adoption and the planner's
 `ref-gone` removal. In off, shadow and on modes, main and healthy overlays still advance. The next tick retries;
 restore or re-register deleted branches from recorded SHAs when their content is still needed.
+Containment carriers must have refreshed fetch evidence when preparation supplies it. Select maximal carriers
+only among those available refs: a missing larger or equal tip must not displace a refreshed overlay from the
+plan. Preparation regressions cover missing tops, equal tips, a missing top above a live containing branch,
+and retirement into a refreshed top; the soak also checks a refreshed source beneath a missing recorded top.
 Shadow audit observations dedupe by exact `(ref, sha, reason)` using durable markers under the list mutex;
 repeat observations still appear in `wouldRetire`. Audit append precedes marking so failed writes retry.
 The command allowlist test restricts classification to local Git reads/merge-tree object creation; it forbids

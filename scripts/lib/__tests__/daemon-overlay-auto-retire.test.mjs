@@ -64,6 +64,54 @@ beforeEach(() => {
 afterEach(() => rmSync(base, { recursive: true, force: true }));
 
 describe('real Git retirement evidence', () => {
+  it.each(['missing-top', 'missing-equal', 'missing-above-live-top', 'refreshed-top'])(
+    'preparation retains an available carrier of unmerged content (%s)', async (shape) => {
+      branch('lower');
+      const lower = commit('lower', 'lower content');
+      branch('top', lower);
+      const top = shape === 'missing-equal' ? lower : commit('top', 'top content');
+      const overlays = [{ ref: 'lower', sha: lower }, { ref: 'top', sha: top }];
+      if (shape === 'missing-above-live-top') {
+        branch('missing', top);
+        overlays.push({ ref: 'missing', sha: commit('missing', 'missing content') });
+      }
+      branch('main');
+      localOrigin();
+      const missing = shape === 'missing-above-live-top' ? 'missing'
+        : shape.startsWith('missing-') ? 'top' : null;
+      if (missing) ok('push', '-q', 'origin', '--delete', missing);
+      register(overlays);
+
+      const prepared = await prepare();
+      const carrier = ['missing-top', 'missing-equal'].includes(shape) ? 'lower' : 'top';
+      expect(prepared.terminal).not.toBe(true);
+      expect(prepared.plan.applied.map((o) => o.ref)).toEqual([carrier]);
+      expect(readOverlayState(root, { env }).overlays.map((o) => o.ref))
+        .toEqual({
+          'missing-top': ['lower', 'top'],
+          'missing-equal': ['lower'],
+          'missing-above-live-top': ['top', 'missing'],
+          'refreshed-top': ['top'],
+        }[shape]);
+      expect(prepared.plan.decisions.some((d) => d.ref === missing)).toBe(false);
+    },
+    30_000,
+  );
+
+  it.each(['missing', 'unverifiable', undefined])('does not elect a carrier with %s fetch evidence', (evidence) => {
+    branch('lower');
+    const lower = commit('lower', 'lower');
+    track('lower');
+    branch('top', lower);
+    const top = commit('top', 'top');
+    track('top');
+    const rows = classifyOverlays({
+      overlays: [{ ref: 'lower', sha: lower }, { ref: 'top', sha: top }], git,
+      refEvidence: new Map([['lower', 'refreshed'], ['top', evidence]]),
+    });
+    expect(rows[0]).toMatchObject({ ref: 'lower', class: 'needed', reason: 'unmerged-content' });
+  });
+
   it.each(['off', 'shadow', 'on'])('%s preparation proceeds past a squash-landed deleted branch', async (mode) => {
     env.WE_DAEMON_OVERLAY_AUTO_RETIRE = mode;
     branch('deleted');

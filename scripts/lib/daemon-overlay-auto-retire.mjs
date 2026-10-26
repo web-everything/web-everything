@@ -85,8 +85,11 @@ export function classifyOverlays({ overlays, git, mainSha = 'origin/main', refEv
     catch { uncertain.add(a); uncertain.add(b); }
   }
   const contains = (a, b) => ancestors.get(`${a.ref}\n${b.ref}`) === true;
-  // Strict maxima stay registered. Equal tips elect the last registration, preventing mutual retirement.
-  const tops = candidates.filter((a, i) => !candidates.some((b, j) => a !== b && contains(a, b) && (!contains(b, a) || j > i)));
+  // Preparation excludes unavailable refs from the plan, even when their recorded commits prove containment.
+  // Elect maxima only among refreshed carriers so a missing larger/equal tip cannot displace an available one.
+  const carriers = candidates.filter((r) => !refEvidence || refEvidence.get(r.ref) === 'refreshed');
+  // Strict maxima stay registered. Equal tips elect the last eligible registration, preventing mutual retirement.
+  const tops = carriers.filter((a, i) => !carriers.some((b, j) => a !== b && contains(a, b) && (!contains(b, a) || j > i)));
   for (const a of candidates) {
     if (uncertain.has(a)) { a.reason = 'git-unverifiable'; continue; }
     const container = tops.find((b) => a !== b && !uncertain.has(b) && contains(a, b));

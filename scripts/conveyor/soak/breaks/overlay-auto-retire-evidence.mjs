@@ -111,6 +111,16 @@ export default {
       if (replaced.retired.length || !readOverlayState(root, { env }).overlays.some((o) => o.ref === 'lower')) {
         violation('replaced-container-lost-source', 'the source was removed after its containing registration was replaced');
       }
+      // Only lower is on origin. The recorded top contains it but cannot carry this rebuild.
+      ok('push', '-q', 'origin', `${lower}:refs/heads/lower`);
+      ok('checkout', '-q', 'main');
+      writeOverlays(root, stack, { env });
+      const available = await prepareRebuild({ root, env, run: git, now: Date.now, mainOnly: false,
+        prState: async () => 'OPEN', prBaseChain: async () => [] });
+      if (available.terminal || available.plan?.applied.map((o) => o.ref).join(',') !== 'lower'
+        || !readOverlayState(root, { env }).overlays.some((o) => o.ref === 'lower')) {
+        violation('missing-container-lost-available-source', 'a missing recorded top retired the refreshed lower overlay out of the rebuild');
+      }
       ok('checkout', '-q', 'main');
       const nextMain = commit('main-advanced');
       ok('push', '-q', 'origin', 'main');
