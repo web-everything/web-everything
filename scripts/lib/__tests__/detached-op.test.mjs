@@ -4,6 +4,7 @@ import { fstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as pidProbes from '../pid-alive.mjs';
+import { keepAliveScript } from '../test-keepalive.mjs';
 import {
   resolveDetachedOpsDir, parseDetachFlags, startDetachedOp, waitForOp, handleDetachCli,
 } from '../detached-op.mjs';
@@ -264,7 +265,7 @@ describe('detached operation lifecycle', () => {
     const stamp = vi.spyOn(pidProbes, 'pidIdentityStamp').mockReturnValue({ runnerStart: null, runnerArgv: null });
     try {
       const record = await startDetachedOp({
-        argv: [process.execPath, '-e', 'setTimeout(() => {}, 1500)'], kind: 'acceptance', dir, env: {},
+        argv: [process.execPath, '-e', keepAliveScript({ maxLifetimeMs: 1500 })], kind: 'acceptance', dir, env: {},
       });
       expect(record.runnerStart).toBeNull();
       let stored = record;
