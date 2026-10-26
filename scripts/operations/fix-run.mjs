@@ -792,7 +792,16 @@ export async function runFixCli(argv = [], {
       : (await import('./deliver-item-wrapper.mjs')).coAuthorTrailerFor(launch.provider);
     const mergeHeadPath = () => git('rev-parse', '--git-path', 'MERGE_HEAD').trim();
     const inMerge = () => { const path = mergeHeadPath(); return !!path && fileExists(resolve(lanePath, path)); };
-    const commitMerge = () => git('commit', '--no-edit', '--trailer', trailer);
+    const commitMerge = () => {
+      // A merge leaves HEAD at the acquired PR tip until commit, including after conflict resolution.
+      checkLane(before, false);
+      git('commit', '--no-edit', '--trailer', trailer);
+      const mergedHead = git('rev-parse', '--verify', 'HEAD').trim();
+      if (!mergedHead || git('rev-parse', '--verify', `${mergedHead}^1`).trim() !== before) {
+        throw new LauncherError('launcher merge first parent does not match the pinned PR head; refusing to continue');
+      }
+      return mergedHead;
+    };
     const blob = (oid) => run('git', [...HARDENED_GIT_ARGS, 'cat-file', 'blob', oid], { cwd: lanePath, env: gitEnv, maxBuffer: BLOB_MAX_BYTES });
     // Index entries for exactly `path` (a pathspec could also match other names, e.g. one holding `*`).
     const indexEntries = (path) => git('ls-files', '-s', '-z', '--', path).split('\0')
@@ -804,6 +813,7 @@ export async function runFixCli(argv = [], {
     let mergePrompt = '';
     if (target) {
       if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(target)) throw new LauncherError(`invalid merge ref: ${target}`);
+      checkLane(before, false);
       git('check-ref-format', '--branch', target);
       git('fetch', 'origin', target);
       // Runs from the catch after the agent may have rewritten the lane config: `merge --abort` checks files out through
@@ -811,10 +821,12 @@ export async function runFixCli(argv = [], {
       abortMerge = () => {
         assertLaneLease({ lanePath, holder, readLease, phase: 'abort merge' });
         if (!inMerge()) return;
+        checkLane(before, false);
         const now = laneConfig();
         if (now !== configBefore || riskyLaneConfig(now).length) throw new LauncherError('lane git config changed; not running merge --abort in it');
         git('merge', '--abort');
       };
+      checkLane(before, false);
       try { git('merge', '--no-commit', '--no-ff', `origin/${target}`); }
       catch (e) {
         const conflicts = unmergedPaths(git('status', '--porcelain=v1', '-z'));
@@ -825,14 +837,13 @@ export async function runFixCli(argv = [], {
         const kinds = binaryConflictPaths(git, conflicts.map(c => c.path));
         const bad = conflicts.filter(c => !EDITABLE_CONFLICT_CODES.has(c.code) || kinds.has(c.path));
         if (bad.length) {
-          git('merge', '--abort');
+          abortMerge();
           throw new LauncherError(`conflict not resolvable by editing files: ${bad.map(c => `${c.path}(${kinds.has(c.path) ? `${c.code} ${kinds.get(c.path)}` : c.code})`).join(', ')}`);
         }
         unmerged = conflicts.map(c => c.path);
       }
       if (!unmerged.length && inMerge()) {
-        commitMerge();
-        preparedHead = git('rev-parse', '--verify', 'HEAD').trim();
+        preparedHead = commitMerge();
       }
       if (unmerged.length) mergePrompt = `The launcher has ALREADY started git merge origin/${target}; the conflicted files are: ${unmerged.join(', ')}. Resolve them by editing the files only. Do NOT run any git command that writes (merge, add, commit, checkout, reset, stash, rebase) — the sandbox forbids .git writes; the launcher stages and commits after you exit.\n\n`;
     }
@@ -918,7 +929,7 @@ export async function runFixCli(argv = [], {
         return hasLeftoverMarkers(text, sizes, allowance);
       });
       const refuse = (paths) => {
-        git('merge', '--abort');
+        abortMerge();
         throw new LauncherError(`conflict unresolved in ${paths.join(', ')}: ${finalMessage || 'agent committed nothing'}`);
       };
       if (unresolved.length) refuse(unresolved);

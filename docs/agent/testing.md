@@ -2421,6 +2421,14 @@ merge preparation, and checks ownership again before staging and pushing. Only a
 owned, clean lane can be fetched/reset to the pinned PR SHA; recovery rechecks the
 lease and HEAD. These checks detect takeover but do not make the allocator atomic.
 
+Merge preparation rechecks the pinned PR head and holder after provider resolution,
+immediately before merge, and immediately before either clean or resolved-conflict
+merge commit. Drift refuses recovery and mutation, including aborting a merge in a
+lane whose head or holder changed. Each merge commit's first parent must equal the
+original pinned PR head before its SHA can authorize an agent launch or push.
+Inject head and holder changes during provider resolution, fetch and merge preparation
+in `fix-run-lane-head.test.mjs`; also reject missing or unexpected first-parent evidence.
+
 For a read-only observation, run
 `node scripts/operations/fix-run.mjs --probe-lane-head --lane-path=<absolute lane path> --pr=<PR> --holder=<original acquired holder> [--repo=owner/repo]`.
 The probe prints the observed lease, HEAD, current GitHub PR head and pure

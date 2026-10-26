@@ -89,6 +89,7 @@ describe('runFixCli', () => {
   const argv = ['--pr=7', '--session=fix-7', '--ref=lane/7-x', '--prompt-file=/p.md', '--provider=codex', '--repo=o/r', '--lane-repo=/w'];
   const mk = (heads) => {
     const initialHead = heads.shift();
+    let laneHead = initialHead;
     const calls = [];
     const envs = [];
     const run = vi.fn((cmd, args, opts) => {
@@ -97,7 +98,9 @@ describe('runFixCli', () => {
       if (cmd === 'gh') return JSON.stringify({ title: 'T', body: 'B', headRefOid: initialHead });
       if (args.includes('acquire')) return JSON.stringify({ path: '/lanes/lane-5', holder: 'test-holder' });
       if (args.includes('--absolute-git-dir')) return tmpdir(); // the staging copy is made (and removed) under it
-      if (args.includes('--verify') && args.includes('HEAD')) return initialHead;
+      if (args.includes('commit')) laneHead = heads[0] ?? laneHead;
+      if (args.includes('--verify') && args.includes('HEAD')) return laneHead;
+      if (args.includes('--verify') && args.at(-1) === `${laneHead}^1`) return initialHead;
       if (args[0] === 'rev-parse') return heads.shift();
       return '';
     });

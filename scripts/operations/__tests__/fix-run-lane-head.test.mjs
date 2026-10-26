@@ -33,6 +33,73 @@ function fixture({ head = prHead, owner = holder } = {}) {
 }
 const argv = ['--pr=5759', '--session=fix-5759', '--ref=lane/pr', '--prompt-file=/p', '--provider=codex'];
 
+function mergeFixture({ driftAt, drift = 'head', parent = prHead } = {}) {
+  const f = fixture();
+  const mergedHead = 'a'.repeat(40);
+  let merging = false;
+  const changeLane = () => {
+    if (drift === 'holder') f.state.owner = foreign;
+    else f.state.head = oldHead;
+  };
+  const run = (cmd, args, opts) => {
+    const value = f.run(cmd, args, opts);
+    if (cmd !== 'git') return value;
+    if (args.includes('fetch') && driftAt === 'fetch') changeLane();
+    if (args.includes('merge') && args.includes('--no-commit')) {
+      merging = true;
+      if (driftAt === 'merge') changeLane();
+    }
+    if (args.includes('commit')) { merging = false; f.state.head = mergedHead; }
+    if (args.includes('--git-path')) return 'MERGE_HEAD';
+    if (args.includes('rev-parse') && args.at(-1) === `${mergedHead}^1`) return parent;
+    return value;
+  };
+  const io = { ...f.io, run, fileExists: path => path.endsWith('MERGE_HEAD') && merging,
+    resolveProvider: async () => {
+      await Promise.resolve();
+      if (driftAt === 'provider') changeLane();
+      return { spawn: f.spawn };
+    } };
+  return { ...f, io, mergedHead };
+}
+
+describe('fixer merge preparation pins the acquired head and holder', () => {
+  it.each(['head', 'holder'])('refuses %s drift during awaited provider resolution before merge, commit or spawn', async drift => {
+    const f = mergeFixture({ driftAt: 'provider', drift });
+    expect((await runFixCli([...argv, '--merge-onto=main'], f.io)).code).toBe(1);
+    expect(f.calls.some(c => c.args.includes('merge') || c.args.includes('commit'))).toBe(false);
+    expect(f.spawn).not.toHaveBeenCalled();
+    expect(f.calls.filter(c => c.args.includes('acquire'))).toHaveLength(1);
+  });
+  it.each(['head', 'holder'])('refuses %s drift during fetch before merge, commit or spawn', async drift => {
+    const f = mergeFixture({ driftAt: 'fetch', drift });
+    expect((await runFixCli([...argv, '--merge-onto=main'], f.io)).code).toBe(1);
+    expect(f.calls.some(c => c.args.includes('merge') || c.args.includes('commit'))).toBe(false);
+    expect(f.spawn).not.toHaveBeenCalled();
+  });
+  it.each(['head', 'holder'])('refuses %s drift after merge preparation before commit or spawn', async drift => {
+    const f = mergeFixture({ driftAt: 'merge', drift });
+    expect((await runFixCli([...argv, '--merge-onto=main'], f.io)).code).toBe(1);
+    expect(f.calls.some(c => c.args.includes('merge') && c.args.includes('--no-commit'))).toBe(true);
+    expect(f.calls.some(c => c.args.includes('commit'))).toBe(false);
+    expect(f.calls.some(c => c.args.includes('--abort'))).toBe(false);
+    expect(f.spawn).not.toHaveBeenCalled();
+  });
+  it.each([oldHead, ''])('refuses an unexpected or unreadable merge first parent (%s) before spawn or push', async parent => {
+    const f = mergeFixture({ parent });
+    expect((await runFixCli([...argv, '--merge-onto=main'], f.io)).code).toBe(1);
+    expect(f.calls.some(c => c.args.includes('commit'))).toBe(true);
+    expect(f.spawn).not.toHaveBeenCalled();
+    expect(f.calls.some(c => c.args.includes('push'))).toBe(false);
+  });
+  it('accepts a merge rooted at the pinned head and spawns on its verified commit', async () => {
+    const f = mergeFixture();
+    expect((await runFixCli([...argv, '--merge-onto=main'], f.io)).code).toBe(0);
+    expect(f.state.spawnHead).toBe(f.mergedHead);
+    expect(f.calls.some(c => c.args.includes(`${f.mergedHead}^1`))).toBe(true);
+  });
+});
+
 describe('fixer lane head guard', () => {
   it('accepts both legacy path output and JSON acquire output', () => {
     expect(parseAcquiredLanePath('noise\n/lanes/lane-10\n')).toBe('/lanes/lane-10');
