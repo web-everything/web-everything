@@ -1,4 +1,4 @@
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,6 +8,11 @@ import { buildOperatorAnswer, parseOperatorAnswer, isOperatorAnswerStandDownSupe
 import { autoProceedStandDowns, hasAutoProceedCandidate, classifyStandDownAutoProceed } from '../stand-down-auto-proceed.mjs';
 import { enrichPrsWithStandDownAutoProceed as enrichWithCursor, readAutoProceedChecks, reserveAutoProceed,
   selectAutoProceedCandidates } from '../stand-down-auto-proceed-io.mjs';
+import { execFileSyncThrottled } from '../../lib/gh-throttle.mjs';
+
+vi.mock('../../lib/gh-throttle.mjs', async importOriginal => ({
+  ...await importOriginal(), execFileSyncThrottled: vi.fn(() => { throw new Error('unexpected live IO'); }),
+}));
 
 // Classifier/writer fixtures inject scheduling IO; fairness fixtures below exercise the persistent cursor.
 const enrichPrsWithStandDownAutoProceed = (prs, options) => enrichWithCursor(prs, {
@@ -19,7 +24,8 @@ const at = '2026-10-13T22:55:00Z';
 const stand = (reason = 'gate-red', id = 'SD1') => ({ id, author, createdAt: at,
   body: buildStandDownComment({ reason, head, detail: 'reviewer-question' }) });
 const run = (id, conclusion, completed_at = '2026-10-13T23:40:00Z', name = 'test') =>
-  ({ id, name, app: { id: 15368, slug: 'github-actions' }, head_sha: head, status: 'completed', conclusion, completed_at });
+  ({ id, name, app: { id: 15368, slug: 'github-actions' }, check_suite: { id: 901 },
+    head_sha: head, status: 'completed', conclusion, completed_at });
 const pr = (comments = [stand()]) => ({ number: 5195, headRefOid: head, comments });
 const evidence = runs => ({ head, complete: true, runs });
 const args = (runs, extra = {}) => ({ pr: pr(), requiredChecks: ['test'], checks: evidence(runs), ...extra });
@@ -32,6 +38,52 @@ const redMainContext = {
     redMainDiscount: 'on', redMainWindows: [{ start: '2026-10-13T21:33:48Z', end: '2026-10-13T23:32:06Z' }] },
 };
 const rerun = [run(1, 'failure', '2026-10-13T22:50:00Z'), run(2, 'success')];
+
+it.each(['success', 'cancelled', 'skipped', 'failure'])(
+  'never supersedes an independent same-name failed workflow with %s', conclusion => {
+    assertAuthorizationBoundary(args([rerun[0], { ...run(2, conclusion,
+      conclusion === 'failure' ? rerun[0].completed_at : undefined), check_suite: { id: 902 } }], { redMainContext }),
+      'hold', /ambiguous check identity/);
+  });
+it.each([undefined, null, {}, { id: 0 }, { id: '901' }, { id: -1 }, { id: 1.5 }])(
+  'holds missing or invalid suite identity: %j', check_suite => {
+    assertAuthorizationBoundary(args(rerun.map(r => ({ ...r, check_suite }))), 'hold', /ambiguous check identity/);
+    assertAuthorizationBoundary(args([{ ...rerun[0], check_suite }, rerun[1]]), 'hold', /ambiguous check identity/);
+    assertAuthorizationBoundary(args([rerun[0], { ...rerun[1], check_suite }]), 'hold', /ambiguous check identity/);
+    assertAuthorizationBoundary(args([{ ...run(2, 'cancelled'), check_suite }]), 'hold', /ambiguous check identity/);
+  });
+
+it.each(['we', 'web-everything/web-everything', 'frontierui', 'frontier-ui/frontierui'])(
+  'reads only the reconciled repository main history through the default context: %s', repo => {
+    const slug = repo.includes('frontier') ? 'frontier-ui/frontierui' : 'web-everything/web-everything';
+    const rows = redMainContext.rows.map(r => ({ ...r, repo: slug.includes('frontier') ? 'frontierui' : 'we' }));
+    const now = vi.spyOn(Date, 'now').mockReturnValue(redMainContext.now);
+    const calls = [], posts = [], reservations = [];
+    execFileSyncThrottled.mockImplementation((command, argv) => {
+      calls.push({ command, argv });
+      // WE had an unrelated, recovered outage; FrontierUI's main was always green.
+      const main = argv[argv.indexOf('--repo') + 1];
+      return JSON.stringify(main === 'web-everything/web-everything' ? [
+        { status: 'completed', conclusion: 'failure', updatedAt: '2026-10-13T21:33:48Z' },
+        { status: 'completed', conclusion: 'success', updatedAt: '2026-10-13T23:32:06Z' },
+      ] : [{ status: 'completed', conclusion: 'success', updatedAt: '2026-10-13T23:32:06Z' }]);
+    });
+    try {
+      enrichPrsWithStandDownAutoProceed([pr([stand('fix-loop-exhausted')])], {
+        repo, defaultBranch: 'trunk', requiredChecks: ['test'], env: { WE_FIX_LOOP_RED_MAIN_DISCOUNT: 'on' },
+        readRows: options => { expect(options.env.WE_FIX_LOOP_RED_MAIN_DISCOUNT).toBe('on'); return rows; },
+        readComments: () => pr([stand('fix-loop-exhausted')]).comments,
+        readChecks: () => evidence([rerun[0]]), readHead: () => head, readScopedChecks: () => [],
+        reserve: claim => { reservations.push(claim); return true; },
+        post: ({ body }) => { posts.push(body); return { author, body }; }, log: () => {},
+      });
+      expect(calls).toHaveLength(1);
+      expect(calls[0].command).toBe('gh');
+      expect(calls[0].argv).toEqual(expect.arrayContaining(['--repo', slug, '--branch', 'trunk', '--workflow', 'CI']));
+      expect(posts).toHaveLength(slug.includes('frontier') ? 0 : 1);
+      expect(reservations).toHaveLength(posts.length);
+    } finally { now.mockRestore(); execFileSyncThrottled.mockReset(); }
+  });
 
 it.each([
   ['a', args(rerun)],
@@ -275,6 +327,7 @@ it('proves paged check completeness and preserves failed rerun history', () => {
   } });
   expect(result).toEqual(evidence(runs));
   expect(result.runs.every(r => r.app.id === 15368 && r.app.slug === 'github-actions')).toBe(true);
+  expect(result.runs.every(r => r.check_suite.id === 901)).toBe(true);
   expect(calls).toHaveLength(2);
   expect(calls[0][1]).toContain('filter=all');
 });

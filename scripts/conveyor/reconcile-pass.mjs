@@ -1470,6 +1470,8 @@ export function runReconcilePass({
   // Standing-ruling round grants (operator option B, 2026-10-20): verify the ruling + cited heads at read time.
   enrichStandingRulingGrants = enrichPrsWithStandingRulingGrants,
   enrichStandDownAutoProceed = enrichPrsWithStandDownAutoProceed,
+  // Planning/read-only callers must never create cursors, reservations or operator answers.
+  allowStandDownAutoProceed = false,
   // The fixer-escalation ladder (default + local override, models from the routing policy). Injectable for tests.
   loadLadder = loadFixerLadder,
   // Card xx0055i — the `fix.*` settings (policy cascade: env > we:scripts/settings/fix.json > built-in). Injectable.
@@ -1530,9 +1532,9 @@ export function runReconcilePass({
     repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, requiredChecks, readChecks, defaultBranch,
   });
   // Evidence is applied before every downstream CI reader, including main-red attribution.
-  const autoProceedPrs = enrichStandDownAutoProceed(hydrated.prs, {
-    repo: CONSTELLATION_REPOS[repoKey].slug, requiredChecks, env,
-  });
+  const autoProceedPrs = allowStandDownAutoProceed === true ? enrichStandDownAutoProceed(hydrated.prs, {
+    repo: CONSTELLATION_REPOS[repoKey].slug, requiredChecks, defaultBranch, env,
+  }) : hydrated.prs;
   let holdPrs = autoProceedPrs;
   try {
     holdPrs = excuseMergeGateHolds(autoProceedPrs, {

@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { repoKeyForSlug, ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { fixLoopConfig, readFixLoopRows, fixLoopLedgerPath } from './fix-loop-ledger.mjs';
 import { parseOperatorAnswer } from './stand-down-answer-core.mjs';
@@ -17,6 +17,19 @@ const gh = (args, options = {}) => JSON.parse(execFileSyncThrottled('gh', args, 
 // A single-comment WRITE (POST), not a thread read: named apart so the comment-read ratchet does not mistake it for one.
 const ISSUE_COMMENT_WRITE = 'comments';
 const readHead = ({ repo, number }) => gh(['pr', 'view', String(number), '--repo', repo, '--json', 'headRefOid']).headRefOid;
+
+/** Bind the history reader as well as the ledger filter to the reconciled repository. */
+export function readAutoProceedContext({ repo, defaultBranch = 'main', env = process.env }, {
+  readRows = readFixLoopRows,
+  readMainRuns = ({ repo, branch }) => gh(['run', 'list', '--repo', repo, '--branch', branch,
+    '--workflow', 'CI', '--limit', '60', '--json', 'conclusion,status,updatedAt']),
+} = {}) {
+  const key = repoKeyForSlug(repo);
+  if (!key) throw new Error('operator answer required: unknown main-history repository');
+  const slug = ghRepoSlug(repo);
+  return { repo: key, rows: readRows({ env }),
+    config: fixLoopConfig(env, { readMainRuns: () => readMainRuns({ repo: slug, branch: defaultBranch }) }) };
+}
 
 /** Ten pages maximum, with total-count and unique-id proof; filter=all retains earlier failed attempts. */
 export function readAutoProceedChecks({ repo, head }, { read = gh } = {}) {
@@ -71,9 +84,10 @@ export function selectAutoProceedCandidates(candidates, { repo, env = process.en
 }
 
 /** At most three candidate PRs/tick; all IO injectable. No retries after a write starts. */
-export function enrichPrsWithStandDownAutoProceed(prs, { repo, requiredChecks,
+export function enrichPrsWithStandDownAutoProceed(prs, { repo, requiredChecks, defaultBranch = 'main',
+  readRows = readFixLoopRows,
   readComments = (number, o) => readCompletePrComments(number, o), readHead: headReader = readHead,
-  readChecks = readAutoProceedChecks, readContext = () => ({ rows: readFixLoopRows(), config: fixLoopConfig(), repo: repoKeyForSlug(repo) }),
+  readChecks = readAutoProceedChecks, readContext = () => readAutoProceedContext({ repo, defaultBranch, env }, { readRows }),
   readScopedChecks = resolvePrScopedChecks, reserve = reserveAutoProceed,
   selectCandidates = selectAutoProceedCandidates, env = process.env,
   post = ({ repo, number, body }) => gh(['api', `repos/${repo}/issues/${number}/${ISSUE_COMMENT_WRITE}`, '--method', 'POST', '--input', '-'], { input: JSON.stringify({ body }) }),

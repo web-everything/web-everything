@@ -34,7 +34,7 @@ it('R123 wires the automatic answer before main-red enrichment and terminal refu
   const { buildStandDownComment } = await import('../stand-down.mjs');
   const { buildOperatorAnswer } = await import('../stand-down-answer-core.mjs');
   const head = 'a'.repeat(40), author = { login: 'web-everything' };
-  const snapshot = { number: 5195, headRefOid: head, headRefName: 'lane/r123', baseRefName: 'main',
+  const snapshot = { number: 5195, headRefOid: head, headRefName: 'lane/r123', baseRefName: 'trunk',
     labels: [], files: [], body: '', statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
     comments: [{ id: 'SD1', author, body: buildStandDownComment({ reason: 'gate-red', head }) }] };
   let observed;
@@ -43,7 +43,8 @@ it('R123 wires the automatic answer before main-red enrichment and terminal refu
     return prs.map(pr => ({ ...pr, comments: [...pr.comments, { author,
       body: buildOperatorAnswer({ standDownId: 'SD1', actor: 'auto-R123', channel: 'auto (R123)', reason: 'R123 recovered CI fixture' }) }] }));
   });
-  const plan = runReconcilePass({ repo: 'we', readPrs: () => [snapshot], readAgents: () => [], enrich: p => p,
+  const plan = runReconcilePass({ repo: 'we', defaultBranch: 'trunk', allowStandDownAutoProceed: true,
+    readPrs: () => [snapshot], readAgents: () => [], enrich: p => p,
     readRequiredChecks: () => ({ checks: ['test'] }), enrichStandDownAutoProceed,
     enrichMainRed: prs => { expect(prs[0].comments).toHaveLength(2); return { prs, mainRedWindows: [] }; },
     enrichAlreadyLanded: p => p, enrichBaseRef: p => p, enrichSystemFix: p => p, enrichEscalationBase: p => p,
@@ -52,8 +53,22 @@ it('R123 wires the automatic answer before main-red enrichment and terminal refu
     enrichStandingRulingGrants: p => p, resolveMainSha: () => null, env: {},
   });
   expect(enrichStandDownAutoProceed).toHaveBeenCalledTimes(1);
-  expect(observed).toEqual({ repo: 'web-everything/web-everything', requiredChecks: ['test'], env: {} });
+  expect(observed).toEqual({ repo: 'web-everything/web-everything', requiredChecks: ['test'], defaultBranch: 'trunk', env: {} });
   expect(plan.refusals.some(r => r.kind === 'stood-down')).toBe(false);
+});
+
+it.each([undefined, false, 'true', 1])('read-only reconcile and dry-run claim planning never invoke the R123 writer (%s)', async enabled => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const { planFixDispatchClaimStatus } = await import('../reconcile-fix-dispatch.mjs');
+  const writer = vi.fn(prs => prs);
+  const options = { ...xxOptions(), env: {}, readPrs: () => [], enrichStandDownAutoProceed: writer,
+    allowStandDownAutoProceed: enabled };
+  runReconcilePass(options);
+  planFixDispatchClaimStatus({ repo: 'we', checkStaleness: () => ({ fresh: true }),
+    reconcile: input => runReconcilePass({ ...options, ...input }),
+    resolveProfile: () => ({ capabilities: { fix: false } }),
+  });
+  expect(writer).not.toHaveBeenCalled();
 });
 
 describe('mechanical round enrichment port (#5948)', () => {
