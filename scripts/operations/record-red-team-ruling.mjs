@@ -7,7 +7,8 @@
  * The ruling binds to the head and result. Preview plans without writing; the sink rechecks
  * before writing and proves release by reading back the human-authored record.
  * Without --card, queues one follow-up through the detached landing job with retry-safe claims.
- * Reader and sink: ./record-red-team-ruling-io.mjs. Block resumes ledger intent → reason → hold record → review:changes from durable evidence; not-real requires a cause.
+ * Reader and sink: ./record-red-team-ruling-io.mjs. Block resumes hold record → ledger intent → reason → review:changes → proof
+ * from durable evidence, preserving the hold if a later step fails; not-real requires a cause.
  */
 import { createHash } from 'node:crypto';
 import { actionResource } from './action-record.mjs';
