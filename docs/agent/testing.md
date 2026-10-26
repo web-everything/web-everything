@@ -2428,18 +2428,3 @@ omissions are reported as truncation. Clone paths must be absolute. The drain ta
 prototype-load settings, not the plist's data clone; tests inject those settings. Matrix and PR table cells strip
 Cc/Cf controls and are width-capped; table mode keeps the truncated-listing warning.
 
-
-## Cancelled PR rerun accounting
-
-The 500-entry attempt record permanently preserves consumed heads and uncertain reservations;
-closed/merged PR evidence, a different head, and absence from a snapshot never permit eviction.
-At capacity, refuse new head admissions with `record-full` and tell the operator to archive/trim the
-record file; preserve existing entries, including oversized legacy records. Accept job evidence only
-when every job has status `completed` and conclusion `success`, `skipped`, `neutral` or `cancelled`.
-Refuse known failure conclusions (`failure`, `timed_out`, `error`, `startup_failure`, `action_required`,
-`stale`) with `real-failure-in-run`; refuse other conclusions or incomplete/unknown statuses with
-`jobs-unreadable`. Neither path may dispatch, reserve, rerun or emit an action event.
-Track each workflow attempt independently within a head, including uncertain reservations, and
-attribute legacy run-only records using observed history before admitting another workflow.
-The permanent-retention, job-whitelist, multi-workflow, restart, capacity and legacy-evidence regressions live in
-`scripts/conveyor/__tests__/pr-cancelled-rerun-accounting.test.mjs`.
