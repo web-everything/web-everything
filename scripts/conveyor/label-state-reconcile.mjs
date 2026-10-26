@@ -9,6 +9,8 @@ import { readRun } from '../operations/run-store.mjs';
 import { readReviewRunEvidence, reviewRunEvidence } from './review-referral-hold.mjs';
 import { defaultReadPr } from './advisory-label-sweep.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
+import { isLaterVerdictBody } from '../lib/accept-carry-forward.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 
 const names = labels => labels.map(l => typeof l === 'string' ? l : l.name);
 
@@ -35,19 +37,27 @@ export function planLabelStateReconcile({ repo, pr, review = null, redTeam = nul
   const observed = reviewRunEvidence(review);
   if (observed?.repo === repo && observed.pr === pr.number && observed.head === head
     && Number.isFinite(observed.completedAt) && !observed.incomplete
-    && observed.parked === false && observed.persistenceFailed === false) {
+    && observed.parked === false && observed.persistenceFailed === false
+    && review.findings?.confirm !== 'abstain') {
     const verdict = review.findings?.referralVerdict ?? review.verdict;
     // Confirmation is the recorded operator decision; an accepted panel cannot supersede changes.
     const confirmedChanges = review.findings?.confirm === 'changes';
+    // A completed panel cannot erase a subsequent trusted verdict/hold. Unknown or tied times
+    // cannot prove the accept supersedes it; a newer completed accept can reconcile it next tick.
+    const laterHold = pr.comments.some(c => {
+      if (!isTrustedMarkerAuthor(c) || !isLaterVerdictBody(c?.body)) return false;
+      const at = Date.parse(c.createdAt ?? c.created_at ?? '');
+      return !Number.isFinite(at) || at >= observed.completedAt;
+    });
     const referrals = liveReferralState(pr, { repo, pr: pr.number });
     const settled = !referrals.malformed && !referrals.pending.length && !referrals.blocked.length
       && Array.isArray(verdict?.pendingReferrals) && !verdict.pendingReferrals.length
       && Array.isArray(verdict?.blockedReferrals) && !verdict.blockedReferrals.length;
-    if (!confirmedChanges && verdict?.verdict === 'accept' && settled && !after.has('red-team:blocked')) {
+    if (!confirmedChanges && !laterHold && verdict?.verdict === 'accept' && settled && !after.has('red-team:blocked')) {
       after.delete('review:changes');
       for (const label of after) if (label.startsWith('fix-waiting:')) after.delete(label);
     }
-    reviewBlocked = confirmedChanges || referrals.pending.length > 0 || referrals.blocked.length > 0 || verdict?.verdict === 'changes'
+    reviewBlocked = confirmedChanges || laterHold || referrals.pending.length > 0 || referrals.blocked.length > 0 || verdict?.verdict === 'changes'
       || verdict?.pendingReferrals?.length > 0 || verdict?.blockedReferrals?.length > 0;
     evidence.review = { id: observed.id, sha: head };
   }

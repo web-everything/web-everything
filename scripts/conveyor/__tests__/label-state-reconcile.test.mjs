@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { planLabelStateReconcile, sweepLabelStateReconcile } from '../label-state-reconcile.mjs';
 import { reviewRunEvidence } from '../review-referral-hold.mjs';
+import { planRecordDecision } from '../../operations/review-pr.mjs';
 import { defaultReadPr } from '../advisory-label-sweep.mjs';
 import { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
 
@@ -70,6 +71,53 @@ describe('planLabelStateReconcile', () => {
     stored.findings.confirm = 'accept';
     expect(planLabelStateReconcile({ repo, pr: pr(42,
       ['review:changes', 'fix-waiting:host-busy'], []), review: stored }).to).toEqual([]);
+  });
+  it.each(['🔁 review — changes requested', '🔁 human review — changes requested'])
+  ('a later trusted %s preserves holds until a newer accepted run', heading => {
+    const stored = review(42);
+    const observed = reviewRunEvidence(stored);
+    expect(observed.completedAt).toBe(Date.parse('2026-10-26T01:01:00Z'));
+    const verdict = { author: { login: 'chalbert' }, body: `${heading}\nRemaining blocker`,
+      createdAt: '2026-10-26T01:02:00Z' };
+    const live = pr(42, ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held', 'ready-to-merge'], [verdict]);
+    expect(planLabelStateReconcile({ repo, pr: live, review: stored }).to)
+      .toEqual(['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held']);
+    stored.findings.confirm = 'accept';
+    stored.stepTimings = [{ step: 'read', startedAt: '2026-10-26T01:03:00Z' },
+      { step: 'advise', finishedAt: '2026-10-26T01:04:00Z' }];
+    expect(reviewRunEvidence(stored).completedAt).toBeGreaterThan(Date.parse(verdict.createdAt));
+    expect(planLabelStateReconcile({ repo, pr: live, review: stored }).to).toEqual(['ready-to-merge']);
+  });
+  it.each(['missing', 'invalid', 'same-time', 'REST'])
+  ('a trusted changes verdict with %s timing cannot be cleared by the stored accept', kind => {
+    const verdict = comment('🔁 review — changes requested\nRemaining blocker');
+    if (kind === 'invalid') verdict.createdAt = 'invalid';
+    if (kind === 'same-time') verdict.createdAt = '2026-10-26T01:01:00Z';
+    if (kind === 'REST') {
+      delete verdict.author;
+      verdict.user = { login: 'chalbert' };
+      verdict.created_at = '2026-10-26T01:02:00Z';
+    }
+    expect(planLabelStateReconcile({ repo, pr: pr(42,
+      ['review:changes', 'fix-waiting:host-busy'], [verdict]), review: review(42) })).toBeNull();
+  });
+  it.each(['older', 'untrusted', 'quoted'])('%s changes text cannot veto a settled accept', kind => {
+    const verdict = { ...comment('🔁 review — changes requested'), createdAt: '2026-10-26T01:02:00Z' };
+    if (kind === 'older') verdict.createdAt = '2026-10-26T01:00:00Z';
+    if (kind === 'untrusted') verdict.author.login = 'attacker';
+    if (kind === 'quoted') verdict.body = `Quoted example:\n${verdict.body}`;
+    expect(planLabelStateReconcile({ repo, pr: pr(42,
+      ['review:changes', 'fix-waiting:host-busy'], [verdict]), review: review(42) }).to).toEqual([]);
+  });
+  it('abstain records nothing and the accepted panel cannot remove review holds', () => {
+    const stored = review(42);
+    stored.findings.confirm = 'abstain';
+    expect(planRecordDecision(stored)).toEqual({ abstain: true });
+    expect(reviewRunEvidence(stored)).toMatchObject({ completedAt: expect.any(Number), parked: false,
+      persistenceFailed: false });
+    expect(planLabelStateReconcile({ repo, pr: pr(42,
+      ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held', 'ready-to-merge'], []), review: stored }))
+      .toBeNull();
   });
   it('an explicit accept cannot bypass unresolved referrals', () => {
     const stored = review(42);
@@ -157,6 +205,18 @@ describe('sweepLabelStateReconcile', () => {
     expect(exec.mock.calls[1][1].at(-1)).toBe('number,state,headRefOid');
     expect(io.provider.setLabels).toHaveBeenCalledWith(repo, 5954, {
       add: 'red-team:clear', remove: ['review:changes', 'red-team:blocked', 'fix-waiting:host-busy'] });
+  });
+  it.each(['later-changes', 'abstain'])('the sweep preserves review holds for %s despite an accepted panel', kind => {
+    const io = fixture(), stored = review(5954);
+    if (kind === 'abstain') stored.findings.confirm = 'abstain';
+    else io.prs[0].comments.push({ ...comment('🔁 review — changes requested\nRemaining blocker'),
+      createdAt: '2026-10-26T01:02:00Z' });
+    io.readReviews = () => [reviewRunEvidence(stored)];
+    io.readReview = () => stored;
+    const [row] = sweepLabelStateReconcile(io);
+    expect(row.labelsReconciled.to).toEqual(['review:changes', 'fix-waiting:host-busy', 'red-team:clear']);
+    expect(io.provider.setLabels).toHaveBeenCalledWith(repo, 5954, {
+      add: 'red-team:clear', remove: ['red-team:blocked'] });
   });
   it('the production PR reader preserves its default fields for existing callers', () => {
     const exec = vi.fn(() => '{}');
