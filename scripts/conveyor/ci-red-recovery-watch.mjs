@@ -48,6 +48,7 @@
  * PURE-CORE / IO-SHELL SPLIT, mirroring `ci-queue-watch.mjs`: the pure planner
  * ({@link module:./main-red-recovery.mjs.planMainRedRebases}) is imported, not re-derived; this file owns every
  * `gh`/git call and the CLI.
+ * The pr-cancelled pass grants one durable, free failed-jobs rerun per cancelled required workflow on a PR head.
  *
  * `--apply` GATES THE REAL WRITE (the rebase + push), mirroring `we:scripts/conveyor/orphan-claim-release.mjs`'s
  * own convention: bare `sweep` is a DRY RUN (plans and reports, touches nothing), `sweep --apply` actually
@@ -58,9 +59,12 @@
  */
 import { readFixPush } from './fix-push-state.mjs';
 import { resolveHandoffSettings } from '../lib/handoff-settings.mjs';
-import { resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { linkSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { handoffHome } from '../operations/handoff-home.mjs';
+import { appendDaemonEvent } from '../lib/daemon-events.mjs';
 import { randomUUID } from 'node:crypto';
-import { isGhDeferred } from '../lib/gh-deferred.mjs';
+import { isGhDeferred, isGhThrottled } from '../lib/gh-deferred.mjs';
 import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { resolveCiHealBudget } from './reconcile-core.mjs';
@@ -70,6 +74,7 @@ import { resolveExhaustedRetry, exhaustionFacts, countExhaustedRetries, planExha
   buildExhaustedRetryRecoveredComment, EXHAUSTED_RETRY_RECOVERED_MARKER } from './exhausted-retry.mjs';
 import { excusePrMergeGateHolds } from '../lib/merge-gate-hold-class.mjs';
 import { pushMissingRunCommit } from './missing-run-push.mjs';
+import { sweepPrCancelledRerun, formatPrCancelledReport } from './pr-cancelled-rerun.mjs';
 import { DECLARED_REQUIRED_STATUS_CHECKS, getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -250,7 +255,7 @@ export function sweepCiRedRecovery({
   readPriority = () => readMainRedPriority(),
 } = {}) {
   const retrySettings = exhaustedRetrySettings ?? resolveExhaustedRetry();
-  const prs = readOpenPrs({ repo, extraFields: ['labels'] });
+  const prs = readOpenPrs({ repo, extraFields: ['labels', 'baseRefName'] });
   // soak-main-red — judge every REQUIRED check (shared ruleset ∪ classic-protection set when available, else
   // DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS), so a `daemon-soak`-only red PR is refreshed like a `test`-red one.
   // Required checks also judge terminal retry outcomes when the CLI shares green PRs with the next pass.
@@ -1013,6 +1018,21 @@ export function defaultReadAttributedRequiredChecks({
   }
 }
 
+/** Required checks for cancelled-PR recovery: only a fresh live read can authorize a rerun. */
+export function readLiveRequiredChecks({
+  repo = null, branch = 'main', readRequiredChecks = getRequiredStatusChecks,
+} = {}) {
+  if (!repo) return null;
+  try {
+    const result = readRequiredChecks({ repo, branch, ttlMs: 0 });
+    if (result?.source !== 'live' || !Array.isArray(result.checks) || !result.checks.length ||
+      result.checks.some(check => typeof check !== 'string' || !check)) return null;
+    return result.checks;
+  } catch {
+    return null;
+  }
+}
+
 // ── MISSING-CI-RUN RECOVERY (we:backlog/xi4od2p-*.md, parent #4075/#3383) ──────────────────────────────────────
 // See `we:scripts/conveyor/main-red-recovery.mjs`'s own "MISSING-CI-RUN RECOVERY" section header for the full
 // incident (PR web-everything/web-everything#2729) and why this is a THIRD, disjoint population from the main-red and
@@ -1392,6 +1412,251 @@ export function formatMissingRunReport({ dispatch = [], refusals = [], applied =
   return lines.join('\n');
 }
 
+function readMainRetriggerRecord(path) {
+  try { return JSON.parse(readFileSync(path, 'utf8')); }
+  catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+    // A repository's first read seeds from the pre-split shared file, so a head already retriggered there
+    // is still remembered (entries are keyed by sha; foreign shas are inert and age out with the bound).
+    const legacy = join(dirname(path), 'main-ci-retrigger.json');
+    if (legacy === path) return {};
+    try { return JSON.parse(readFileSync(legacy, 'utf8')); }
+    catch (le) { if (le.code === 'ENOENT') return {}; throw le; }
+  }
+}
+
+function writeMainRetriggerRecord(path, record) {
+  mkdirSync(dirname(path), { recursive: true });
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporary, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    renameSync(temporary, path);
+  } catch (e) {
+    rmSync(temporary, { force: true });
+    throw e;
+  }
+}
+
+/** Local refusals prove that no rerun was submitted; generic rate-limit/transport errors do not. */
+function isMainRerunNotSubmitted(error) {
+  if (isGhThrottled(error) || error?.budgetBlocked) return true;
+  // The gh shim preserves the budget refusal on stderr, but cannot preserve custom Error properties.
+  const stderr = error?.stderr;
+  return (typeof stderr === 'string' || Buffer.isBuffer(stderr)) &&
+    /^gh-throttle: GitHub (?:core|graphql) API rate limit exceeded for this identity — shared backoff until [^\r\n]+, call not sent \(#gh-graphql-budget\)\r?$/m.test(String(stderr));
+}
+
+export function rerunMainCancelledRun(runId, { repo = null, exec = execFileSyncThrottled } = {}) {
+  try {
+    const out = exec('gh', ['api', '-X', 'POST', `repos/${repoSlug(repo)}/actions/runs/${runId}/rerun`], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024,
+      timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+    });
+    // The throttle can answer with a deferral payload instead of running gh: nothing was submitted.
+    if (isGhDeferred(out)) return { ok: false, uncertain: false, error: 'rerun deferred by the gh throttle; nothing submitted' };
+    return { ok: true };
+  } catch (e) {
+    const error = describeExecError(e);
+    // An explicit API rejection is retryable; a timeout/transport failure may
+    // have lost the acknowledgement after GitHub accepted the rerun.
+    // Local slot/budget refusals happen before submission and can safely release the reservation.
+    return { ok: false, error, uncertain: !isMainRerunNotSubmitted(e) && !/\bHTTP 4(?!08)\d\d\b/.test(error) };
+  }
+}
+
+/** Per-repository record file; WE keeps the legacy name so existing records stay valid. Every repository
+ *  watcher shares one handoff home, and a shared file lets one watcher's stale snapshot erase another's attempts. */
+export function mainRetriggerRecordPath(repo = null, home = handoffHome()) {
+  const slug = repoSlug(repo);
+  return join(home, slug === CONSTELLATION_REPOS.we.slug ? 'main-ci-retrigger.json'
+    : `main-ci-retrigger.${encodeURIComponent(slug)}.json`);
+}
+
+export function prCancelledRecordPath(repo = null, home = handoffHome()) {
+  const slug = repoSlug(repo);
+  return join(home, slug === CONSTELLATION_REPOS.we.slug ? 'pr-ci-cancelled-rerun.json'
+    : `pr-ci-cancelled-rerun.${encodeURIComponent(slug)}.json`);
+}
+
+function readPrCancelledRecord(path) {
+  try { return JSON.parse(readFileSync(path, 'utf8')); }
+  catch (e) { if (e.code === 'ENOENT') return {}; throw e; }
+}
+
+/** Exclusive advisory lock around a record's read-modify-write (atomic rename protects one write, not the sequence).
+ *  Returns {locked:false} when another holder is still live after `waitMs`; a lock older than `staleMs`
+ *  (a crashed holder) is stolen. The lock is always released, including when `fn` throws. */
+export function withMainRetriggerLock(recordPath, fn, { waitMs = 5000, staleMs = resolveChildTimeoutMs() * 2 + 60_000 } = {}) {
+  const lockPath = `${recordPath}.lock`;
+  const token = randomUUID();
+  mkdirSync(dirname(recordPath), { recursive: true });
+  const deadline = Date.now() + waitMs;
+  const readToken = () => { try { return readFileSync(lockPath, 'utf8'); } catch { return null; } };
+  const holdsLock = () => readToken() === token;
+  // The lock file carries an owner token: only its owner releases it, and a holder whose lock was stolen
+  // as stale (slow gh calls) learns that via assertHeld before every record write instead of clobbering.
+  const assertHeld = () => { if (!holdsLock()) throw Error('main retrigger lock lost; another watcher may be updating the record'); };
+  // Stale = older than any live holder can run, either direction (a future mtime is clock skew, not a live hold).
+  // Never throws or loops without a sleep: an unremovable or odd entry just falls through to the deadline.
+  const reclaimStale = () => {
+    let seen;
+    try { const st = lstatSync(lockPath); if (Math.abs(Date.now() - st.mtimeMs) <= staleMs) return false; seen = readToken(); }
+    catch { return false; }
+    const parked = `${lockPath}.stale.${randomUUID()}`;
+    try { renameSync(lockPath, parked); } catch { return false; }
+    try {
+      // Between the stat and the rename a faster watcher may have replaced the stale lock; put a fresh one back.
+      let content = null;
+      try { content = readFileSync(parked, 'utf8'); } catch { /* a directory or symlink: nothing to restore */ }
+      if (content !== seen) { try { linkSync(parked, lockPath); } catch { /* lost the lock: its holder's assertHeld aborts it */ } }
+    } finally { rmSync(parked, { recursive: true, force: true }); }
+    return true;
+  };
+  for (;;) {
+    try { writeFileSync(lockPath, token, { flag: 'wx', mode: 0o600 }); break; }
+    catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      // A reclaimed lock is retried at once (even with no wait budget); otherwise honour the deadline, then sleep.
+      if (reclaimStale()) continue;
+      if (Date.now() >= deadline) return { locked: false };
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+  }
+  try { return { locked: true, value: fn({ assertHeld }) }; }
+  finally { if (holdsLock()) rmSync(lockPath, { force: true }); }
+}
+
+/** One whole-run retry per main head, then a durable, once-only stuck signal.
+ * Record IO is synchronous; event delivery is best-effort and cannot fail the sweep.
+ * Unreadable evidence refuses action: restore the record or inspect main CI before retrying. */
+export function sweepMainCancelledRetrigger(options = {}) {
+  const { repo = null, apply = false, recordPath = mainRetriggerRecordPath(repo), lock = withMainRetriggerLock } = options;
+  if (!apply) return sweepMainCancelledLocked({ ...options, recordPath });
+  let held;
+  let sweepError = null;
+  try {
+    held = lock(recordPath, ctx => {
+      // A sweep exception is not a lock failure: let it reach the caller's per-pass isolation unchanged.
+      try { return sweepMainCancelledLocked({ ...options, recordPath, assertHeld: ctx?.assertHeld }); }
+      catch (e) { sweepError = { e }; return null; }
+    });
+  } catch (e) {
+    return { dispatch: [], applied: [], refusals: [{ reason: 'record-lock-failed', error: describeExecError(e) }] };
+  }
+  if (sweepError) throw sweepError.e;
+  return held.locked ? held.value
+    : { dispatch: [], applied: [], refusals: [{ reason: 'record-locked', error: 'another watcher is updating the main CI retrigger record; retry next tick' }] };
+}
+
+function sweepMainCancelledLocked({ repo = null, defaultBranch = 'main', apply = false,
+  readMainRuns = defaultReadMainRuns, rerun = rerunMainCancelledRun,
+  recordPath,
+  readRecord = readMainRetriggerRecord, writeRecord: persistRecord = writeMainRetriggerRecord,
+  emitEvent = event => appendDaemonEvent({ ...event, daemon: 'ci-red-recovery-watch' }),
+  now = Date.now(), assertHeld = () => {},
+} = {}) {
+  // A holder whose lock expired during slow gh calls must not write its stale snapshot over a newer record.
+  const writeRecord = (path, value) => { assertHeld(); persistRecord(path, value); };
+  const result = { dispatch: [], refusals: [], applied: [] };
+  const refuse = (reason, detail = {}) => {
+    result.refusals.push({ reason, ...detail });
+    return result;
+  };
+  let runs;
+  try {
+    runs = readMainRuns({ repo, branch: defaultBranch, workflowName: DEFAULT_MAIN_WORKFLOW_NAME });
+    if (!Array.isArray(runs) || runs.some(r => typeof r?.workflowName !== 'string')) throw Error('incomplete main run history');
+    runs = runs.filter(r => r.workflowName === DEFAULT_MAIN_WORKFLOW_NAME);
+    if (runs.some(r => !Number.isFinite(Date.parse(r.createdAt)) || typeof r.headSha !== 'string' || !r.headSha || !r.status)) throw Error('incomplete main run evidence');
+  } catch (e) { return refuse('main-runs-unreadable', { error: describeExecError(e) }); }
+  if (!runs.length) return result;
+  const newest = [...runs].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
+  const sha = newest.headSha;
+  const runId = newest.databaseId;
+  if (runs.some(r => r.headSha === sha && ['queued', 'in_progress', 'waiting', 'pending'].includes(r.status))) {
+    return refuse('in-progress', { sha, runId });
+  }
+  if (newest.status !== 'completed' || !['cancelled', 'skipped'].includes(newest.conclusion)) return result;
+  if (!/^[1-9]\d*$/.test(String(runId))) return refuse('invalid-run-id', { sha });
+  let record;
+  try {
+    record = readRecord(recordPath);
+    if (!record || Array.isArray(record) || typeof record !== 'object' || Object.values(record).some(entry =>
+      !entry || !/^[1-9]\d*$/.test(String(entry.runId)) || !Number.isFinite(Date.parse(entry.retriggeredAt)) ||
+      (entry.stuck !== undefined && typeof entry.stuck !== 'boolean') ||
+      (entry.reserved !== undefined && typeof entry.reserved !== 'boolean'))) throw Error('invalid main retrigger record');
+  } catch (e) {
+    return refuse('record-unreadable', { sha, runId,
+      error: `${describeExecError(e)}; restore the attempt record or inspect main CI before retrying` });
+  }
+  const previous = Object.hasOwn(record, sha) ? record[sha] : null;
+  if (previous?.stuck) return result;
+  // A successful rerun request is not evidence that its attempt has finished. GitHub
+  // can still return the original cancellation for several sweeps. Reruns retain
+  // their run ID and createdAt, so require a completed observation updated after
+  // the request, or a distinct newest run, before consuming the stuck signal.
+  if (previous && String(previous.runId) === String(runId) &&
+    !(Date.parse(newest.updatedAt) > Date.parse(previous.retriggeredAt))) {
+    if (previous.reserved) return refuse('rerun-outcome-unknown', { sha, runId,
+      error: 'inspect main CI; clear the reservation only after confirming that no rerun was accepted' });
+    return result;
+  }
+  const action = previous ? 'main-ci-stuck' : 'main-ci-retriggered';
+  const dispatch = { action, sha, runId };
+  result.dispatch.push(dispatch);
+  if (!apply) return result;
+  const boundedRecord = entry => Object.fromEntries([[sha, entry], ...Object.entries(record)
+    .filter(([key]) => key !== sha)
+    .sort((a, b) => Date.parse(b[1].retriggeredAt) - Date.parse(a[1].retriggeredAt)).slice(0, 19)]);
+  const attempt = previous
+    ? { runId: previous.runId, retriggeredAt: previous.retriggeredAt, stuck: true }
+    : { runId, retriggeredAt: new Date(now).toISOString() };
+  if (!previous) {
+    // Reserve durably BEFORE the remote write. A crash, lost acknowledgement,
+    // or failed confirmation write must never make this head eligible again.
+    try { writeRecord(recordPath, boundedRecord({ ...attempt, reserved: true })); }
+    catch (e) {
+      result.applied.push({ ...dispatch, ok: false, error: `reservation failed: ${describeExecError(e)}` });
+      return result;
+    }
+    let outcome;
+    // Injectable rerunners may return ok:false for a confirmed rejection;
+    // uncertain:true (or a thrown error) retains the reservation for inspection.
+    try { outcome = rerun(runId, { repo }); }
+    catch (e) { outcome = { ok: false, uncertain: !isMainRerunNotSubmitted(e), error: describeExecError(e) }; }
+    if (outcome?.ok !== true) {
+      let error = outcome?.error ?? 'rerun did not confirm success';
+      if (outcome?.ok === false && outcome.uncertain !== true) {
+        try { writeRecord(recordPath, record); }
+        catch (e) { error += `; reservation rollback failed: ${describeExecError(e)}; inspect main CI before clearing the reservation`; }
+      } else error += '; reservation retained; inspect main CI before clearing it';
+      result.applied.push({ ...dispatch, ok: false, error });
+      return result;
+    }
+  }
+  // Always retain the head being acted on, including when an oversized old record is supplied.
+  try { writeRecord(recordPath, boundedRecord(attempt)); }
+  catch (e) {
+    result.applied.push({ ...dispatch, ok: false,
+      error: `${describeExecError(e)}; attempt remains recorded; inspect main CI before changing the record` });
+    return result;
+  }
+  try { Promise.resolve(emitEvent({ kind: action, detail: { sha, runId } })).catch(() => {}); }
+  catch { /* Best-effort events; the durable record is authoritative. */ }
+  result.applied.push({ ...dispatch, ok: true });
+  return result;
+}
+
+export function formatMainCancelledReport({ dispatch = [], refusals = [], applied = [] } = {}) {
+  const lines = [`ci-red-recovery-watch (main-cancelled) — ${dispatch.length} dispatch, ${refusals.length} refusal(s), ${applied.length} applied`];
+  for (const d of dispatch) {
+    const outcome = applied.find(a => a.sha === d.sha);
+    lines.push(`  ${outcome ? (outcome.ok ? '✓' : '✗') : '→'} ${d.action} ${d.sha}${outcome?.error ? ` — ${markerFreeText(outcome.error)}` : ''}`);
+  }
+  for (const r of refusals) lines.push(`  ✗ ${r.reason} ${r.sha ?? '(unknown sha)'}${r.error ? ` — ${markerFreeText(r.error)}` : ''}`);
+  return lines.map(line => line.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')).join('\n');
+}
+
 // ── CLI ──────────────────────────────────────────────────────────────────────────────────────────────────────
 
 function parseFlags(argv) {
@@ -1419,6 +1684,8 @@ export function formatReport({ dispatch = [], refusals = [], applied = [] } = {}
 // Injectable CLI boundary: regression tests exercise the same orchestration that the daemon invokes.
 export async function main(argv, { sweepOptions = {}, sweepMainRed = sweepCiRedRecovery,
   sweepExhausted = sweepExhaustedRetry, sweepHung = sweepHungCiRecovery, sweepMissingRun = sweepMissingRunRecovery,
+  sweepMainCancelled = sweepMainCancelledRetrigger,
+  sweepPrCancelled = sweepPrCancelledRerun,
   writeLine = writeLineSync, writeAll = writeAllSync } = {}) {
   const [verbRaw, ...rest] = argv;
   const verb = verbRaw && !verbRaw.startsWith('--') ? verbRaw : 'sweep';
@@ -1461,14 +1728,26 @@ export async function main(argv, { sweepOptions = {}, sweepMainRed = sweepCiRedR
   // open-PR listing for the same reason (a PR wrongly stuck on `checking`), and the daemon-manifest entry that
   // already schedules this script gets the missing-run fix for free rather than needing a third entry.
   const missingRunResult = runPass('missing-run', sweepMissingRun, { ...options, mainRuns: result.mainRuns?.length ? result.mainRuns : null });
+  const mainCancelledResult = runPass('main-cancelled', sweepMainCancelled, options);
+  const prCancelledResult = runPass('pr-cancelled', sweepPrCancelled, {
+    ...options, repo: repoSlug(options.repo),
+    // Reuse defaultReadOpenPrs' snapshot from main-red; a failed pass provides no actionable evidence.
+    readOpenPrs: options.readOpenPrs ?? (() => result.prs ?? null),
+    requiredChecks: undefined,
+    readRequiredChecks: readLiveRequiredChecks,
+    recordPath: prCancelledRecordPath(options.repo), lock: withMainRetriggerLock,
+    readRecord: readPrCancelledRecord, writeRecord: writeMainRetriggerRecord,
+  });
   if (flags.json) {
     writeLine(2, formatExhaustedRetryReport(exhaustedResult).split('\n')[0]);
-    writeAll(1, `${JSON.stringify({ mainRedRecovery: result, hungRecovery: hungResult, missingRunRecovery: missingRunResult, exhaustedRetry: exhaustedResult })}\n`);
+    writeAll(1, `${JSON.stringify({ mainRedRecovery: result, hungRecovery: hungResult, missingRunRecovery: missingRunResult, exhaustedRetry: exhaustedResult, mainCancelledRetrigger: mainCancelledResult, prCancelledRerun: prCancelledResult })}\n`);
   } else {
     writeLine(2, formatReport(result));
     writeLine(2, formatExhaustedRetryReport(exhaustedResult));
     writeLine(2, formatHungReport(hungResult));
     writeLine(2, formatMissingRunReport(missingRunResult));
+    writeLine(2, formatMainCancelledReport(mainCancelledResult));
+    writeLine(2, formatPrCancelledReport(prCancelledResult));
   }
   process.exitCode = failed ? 1 : 0;
 }
