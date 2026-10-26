@@ -94,6 +94,78 @@ describe.skipIf(process.platform === 'win32')('runner termination integration', 
   }
 });
 
+describe.skipIf(process.platform === 'win32')('re-parented descendants (runner stop sweep)', () => {
+  const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const psWorks = () => {
+    try { execFileSync('ps', ['-A', '-o', 'pid=,ppid=,pgid=,lstart='], { stdio: 'ignore', timeout: 1000 }); return true; }
+    catch { return false; }
+  };
+
+  // command (stays alive) -> mid -> detached grandchild; mid exits `midLingerMs` after spawning it,
+  // so the grandchild is re-parented to PID 1 while the command keeps running.
+  async function runScenario({ midLingerMs, snapshotMs }) {
+    const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'detached-op-reparent-'));
+    const grandchildReady = join(dir, 'grandchild.pid');
+    const midGone = join(dir, 'mid.gone');
+    let record;
+    let grandchildPid;
+    try {
+      const grandchild = `
+        require('node:fs').writeFileSync(${JSON.stringify(grandchildReady)}, String(process.pid));
+        for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => {});
+        setInterval(() => {}, 1000);
+      `;
+      const mid = `
+        const { spawn } = require('node:child_process');
+        spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { stdio: 'ignore', detached: true }).unref();
+        setTimeout(() => { require('node:fs').writeFileSync(${JSON.stringify(midGone)}, '1'); process.exit(0); }, ${midLingerMs});
+      `;
+      const command = `
+        const { spawn } = require('node:child_process');
+        spawn(process.execPath, ['-e', ${JSON.stringify(mid)}], { stdio: 'ignore' });
+        setInterval(() => {}, 1000);
+      `;
+      record = await startDetachedOp({ argv: [process.execPath, '-e', command], kind: 'reparent-test', dir,
+        env: { ...process.env, DETACHED_OP_SNAPSHOT_MS: String(snapshotMs) } });
+      const readyDeadline = Date.now() + 8000;
+      while (!(existsSync(grandchildReady) && existsSync(midGone))) {
+        if (Date.now() >= readyDeadline) throw new Error('scenario did not become ready');
+        await delay(20);
+      }
+      grandchildPid = Number(readFileSync(grandchildReady, 'utf8'));
+      expect(alive(grandchildPid)).toBe(true);
+      process.kill(record.pid, 'SIGTERM');
+      const terminalDeadline = Date.now() + 8000;
+      let result;
+      do {
+        result = await waitForOp({ id: record.id, dir, maxWaitMs: 250 });
+        if (Date.now() >= terminalDeadline) throw new Error('runner cleanup did not finish');
+      } while (result.status === 'running');
+      await delay(100);
+      return alive(grandchildPid);
+    } finally {
+      if (grandchildPid) { try { process.kill(grandchildPid, 'SIGKILL'); } catch {} }
+      if (record) { try { process.kill(record.pid, 'SIGKILL'); } catch {} }
+      await delay(30);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it('leaves no survivor when a detached grandchild was re-parented to PID 1 before SIGTERM', async context => {
+    if (!psWorks()) { context.skip(); return; }
+    // mid lingers well past one snapshot interval, so the periodic snapshot saw the grandchild.
+    expect(await runScenario({ midLingerMs: 900, snapshotMs: 100 })).toBe(false);
+  }, 20000);
+
+  it('documented bound: a descendant orphaned before any snapshot ran escapes the sweep', async context => {
+    if (!psWorks()) { context.skip(); return; }
+    // The module header states this race is not closed: nothing observed the grandchild while it was
+    // still in the command tree. A huge interval makes "orphaned between snapshots" deterministic.
+    expect(await runScenario({ midLingerMs: 0, snapshotMs: 3_600_000 })).toBe(true);
+  }, 20000);
+});
+
 describe('parseDetachFlags', () => {
   it('defaults to foreground operation and a nine-minute wait budget', () => {
     expect(parseDetachFlags([])).toEqual({ detach: false, waitFor: null, maxWaitMs: 540000, rest: [] });
@@ -248,6 +320,33 @@ describe('detached operation lifecycle', () => {
       .toMatchObject({ status: 'failed', code: 1, reason: variant === 'missing' ? 'unknown-job' : 'invalid-record' });
     expect(isAlive).toHaveBeenCalledOnce();
     expect(clock.sleep).not.toHaveBeenCalled();
+  });
+
+  it('treats a live pid whose start time differs from the recorded pidStart as a dead runner (PID reuse)', async () => {
+    const record = writeRecord({ pid: process.pid, pidStart: 'Mon Jan  1 00:00:00 2001' });
+    const clock = fakeClock();
+    const result = await waitForOp({ id: record.id, maxWaitMs: 250, dir, ...clock });
+    expect(result).toMatchObject({ id: record.id, status: 'failed', code: 1, reason: 'runner-died' });
+    expect(clock.sleep).not.toHaveBeenCalled();
+  });
+
+  it('keeps waiting while the live pid still has the recorded start time, and when none was recorded', async () => {
+    const withStart = writeRecord({ pidStart: 'Mon Jan  1 00:00:00 2001' });
+    const startOf = vi.fn(() => 'Mon Jan  1 00:00:00 2001');
+    expect(await waitForOp({ id: withStart.id, maxWaitMs: 250, dir, ...fakeClock(), isAlive: () => true, startOf }))
+      .toMatchObject({ status: 'running', code: 75 });
+    expect(startOf).toHaveBeenCalledWith(withStart.pid);
+    const legacy = writeRecord({ id: 'legacy-job' });
+    const neverCalled = vi.fn();
+    expect(await waitForOp({ id: legacy.id, maxWaitMs: 250, dir, ...fakeClock(), isAlive: () => true, startOf: neverCalled }))
+      .toMatchObject({ status: 'running', code: 75 });
+    expect(neverCalled).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-string pidStart as an invalid record', async () => {
+    const record = writeRecord({ pidStart: 42 });
+    expect(await waitForOp({ id: record.id, maxWaitMs: 250, dir, ...fakeClock(), isAlive: () => true }))
+      .toMatchObject({ status: 'failed', code: 1, reason: 'invalid-record' });
   });
 
   it('checks a replacement runner instead of applying the previous PID death to it', async () => {
