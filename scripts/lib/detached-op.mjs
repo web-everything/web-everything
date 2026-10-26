@@ -61,13 +61,17 @@ export async function startDetachedOp({ argv, kind, dir = resolveDetachedOpsDir(
   const path = recordPath(dir, id);
   const record = { id, kind, status: 'running', pid: process.pid, startedAt: new Date(now()).toISOString(),
     exitCode: null, stdoutPath: join(dir, `${id}.stdout.log`), stderrPath: join(dir, `${id}.stderr.log`) };
+  // Detached work outlives its launcher's admission slot and must acquire its own.
+  // Scrub at the shared boundary so every detached entry point follows this rule.
+  const childEnv = { ...env };
+  delete childEnv.WE_HEAVY_ADMISSION_HELD;
   const fds = [];
   try {
     fds.push(openSync(record.stdoutPath, 'w', 0o600));
     fds.push(openSync(record.stderrPath, 'w', 0o600));
     writeRecord(path, record);
     const child = spawnFn(process.execPath, [fileURLToPath(import.meta.url), `--run-record=${path}`, '--', ...argv],
-      { detached: true, stdio: ['ignore', ...fds], env });
+      { detached: true, stdio: ['ignore', ...fds], env: childEnv });
     if (child.once) await new Promise((done, reject) => { child.once('spawn', done); child.once('error', reject); });
     record.pid = child.pid;
     writeRecord(path, record);
@@ -78,6 +82,7 @@ export async function startDetachedOp({ argv, kind, dir = resolveDetachedOpsDir(
 export async function waitForOp({ id, maxWaitMs = 540000, dir = resolveDetachedOpsDir(),
   now = Date.now, sleep: pause = sleep, isAlive = alive } = {}) {
   const deadline = now() + budget(maxWaitMs);
+  let deadRunnerPid = null;
   for (;;) {
     let record;
     try {
@@ -93,7 +98,13 @@ export async function waitForOp({ id, maxWaitMs = 540000, dir = resolveDetachedO
     } catch (error) { return { id, status: 'failed', code: 1, reason: error.code === 'ENOENT' ? 'unknown-job' : 'invalid-record' }; }
     const result = { ...record, stdoutTail: tail(record.stdoutPath), stderrTail: tail(record.stderrPath) };
     if (record.status !== 'running') return { ...result, code: record.status === 'done' ? 0 : 1 };
-    if (!isAlive(record.pid)) return { ...result, status: 'failed', code: 1, reason: 'runner-died' };
+    if (record.pid === deadRunnerPid) return { ...result, status: 'failed', code: 1, reason: 'runner-died' };
+    if (!isAlive(record.pid)) {
+      // The runner publishes its terminal record before exiting. Re-read and
+      // validate it before classifying a stale running snapshot as runner-died.
+      deadRunnerPid = record.pid;
+      continue;
+    }
     if (now() >= deadline) return { ...result, code: 75 };
     await pause(Math.min(1000, deadline - now()));
   }

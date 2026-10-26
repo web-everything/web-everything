@@ -116,6 +116,14 @@ describe('detached operation lifecycle', () => {
     },
   );
 
+  it('drops inherited admission ownership without mutating the caller environment', async () => {
+    const env = { WE_HEAVY_ADMISSION_HELD: '1', DETACHED_OPS_DIR: dir, KEEP_ME: 'preserved' };
+    const spawnFn = vi.fn(() => ({ pid: 43210, unref: vi.fn() }));
+    await startDetachedOp({ argv: [process.execPath, '-e', ''], kind: 'acceptance', dir, env, spawnFn });
+    expect(spawnFn.mock.calls[0][2].env).toEqual({ DETACHED_OPS_DIR: dir, KEEP_ME: 'preserved' });
+    expect(env.WE_HEAVY_ADMISSION_HELD).toBe('1');
+  });
+
   it('returns code 75 at the foreground deadline while leaving a live job running', async () => {
     const record = writeRecord();
     const clock = fakeClock();
@@ -130,6 +138,22 @@ describe('detached operation lifecycle', () => {
     expect(JSON.parse(readFileSync(join(dir, `${record.id}.json`), 'utf8'))).toEqual(record);
   });
 
+  it.each([['done', 0, 0], ['failed', 23, 1]])(
+    're-reads a runner that completed as %s between the record read and liveness check', async (status, exitCode, code) => {
+      const record = writeRecord();
+      const clock = fakeClock();
+      const isAlive = vi.fn(() => {
+        writeRecord({ status, exitCode });
+        return false;
+      });
+      expect(await waitForOp({ id: record.id, maxWaitMs: 250, dir, ...clock, isAlive }))
+        .toMatchObject({ id: record.id, status, exitCode, code,
+          stdoutTail: 'stdout from the operation\n', stderrTail: 'stderr from the operation\n' });
+      expect(isAlive).toHaveBeenCalledOnce();
+      expect(clock.sleep).not.toHaveBeenCalled();
+    },
+  );
+
   it('fails closed with runner-died when a running record has a dead runner', async () => {
     const record = writeRecord();
     const clock = fakeClock();
@@ -137,6 +161,18 @@ describe('detached operation lifecycle', () => {
     expect(await waitForOp({ id: record.id, maxWaitMs: 250, dir, ...clock, isAlive }))
       .toMatchObject({ id: record.id, status: 'failed', code: 1, reason: 'runner-died' });
     expect(isAlive).toHaveBeenCalledWith(record.pid);
+    expect(clock.sleep).not.toHaveBeenCalled();
+  });
+
+  it('validates the replacement record read after a dead-runner probe', async () => {
+    const record = writeRecord();
+    const clock = fakeClock();
+    const isAlive = vi.fn(() => {
+      writeRecord({ status: 'done', exitCode: null });
+      return false;
+    });
+    expect(await waitForOp({ id: record.id, maxWaitMs: 250, dir, ...clock, isAlive }))
+      .toMatchObject({ id: record.id, status: 'failed', code: 1, reason: 'invalid-record' });
     expect(clock.sleep).not.toHaveBeenCalled();
   });
 

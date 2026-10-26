@@ -1,7 +1,7 @@
 /** @file Real admission CLI detach, bounded wait and command-tail preservation contract. */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { tryAcquireSlot } from '../heavy-admission.mjs';
@@ -20,7 +20,7 @@ beforeEach(() => {
     WE_HEAVY_ADMISSION_CAP: '1', WE_HEAVY_ADMISSION_FAST_SLOTS: '0',
     WE_HEAVY_ADMISSION_RUN_WAIT_MS: '0', WE_HEAVY_ADMISSION_CONTAINER: '0',
     WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES: '0',
-    VITEST: 'true', WE_TEST_HOST_LOAD1: '0',
+    VITEST: 'true', WE_TEST_HOST_LOAD1: '0', WE_TEST_HOST_MEMORY_MB: '16384',
     WE_RESOURCE_SHADOW: 'off', WE_RESOURCE_CUTOVER: 'shadow',
   };
   delete env.CI;
@@ -58,6 +58,40 @@ describe('heavy-admission detached CLI', () => {
   it('maps a wrapped exit 3 to wait exit 1 while preserving exitCode 3', () => {
     const id = detach('process.exit(3)');
     expect(wait(id, { status: 1 })).toMatchObject({ id, status: 'failed', exitCode: 3 });
+  }, 30_000);
+
+  it('reacquires admission for a nested detached command after its outer wrapper releases', async () => {
+    const started = join(root, 'started');
+    const finish = join(root, 'finish');
+    const source = `
+      const fs = require('node:fs');
+      fs.writeFileSync(${JSON.stringify(started)}, 'started');
+      const timer = setInterval(() => {
+        if (fs.existsSync(${JSON.stringify(finish)})) clearInterval(timer);
+      }, 25);
+      setTimeout(() => process.exit(2), 15000).unref();
+    `;
+    const record = JSON.parse(cli(['run', '--', process.execPath, CLI,
+      'run', '--detach', '--wait-ms=10000', '--', process.execPath, '-e', source], 0, 5000));
+    try {
+      await vi.waitFor(() => expect(existsSync(started)).toBe(true), { timeout: 12000, interval: 25 });
+      expect(JSON.parse(cli(['status'])).heldCount).toBe(1);
+      expect(cli(['run', '--wait-ms=250', '--', process.execPath, '-e', "console.log('overlap')"], 75)).toBe('');
+    } finally {
+      writeFileSync(finish, 'finish');
+      expect(wait(record.id)).toMatchObject({ status: 'done', exitCode: 0 });
+    }
+  }, 30_000);
+
+  it('defers a detached command with inherited ownership when the pool stays full', () => {
+    expect(tryAcquireSlot({ lockRoot, cap: 1, owner: 'test-holder' }).ok).toBe(true);
+    env.WE_HEAVY_ADMISSION_HELD = '1';
+    const record = JSON.parse(cli(['run', '--detach', '--wait-ms=250', '--',
+      process.execPath, '-e', "console.log('overlap')"]));
+    expect(wait(record.id, { status: 1 })).toMatchObject({
+      status: 'failed', exitCode: 75, stdoutTail: '',
+    });
+    expect(JSON.parse(cli(['status'])).heldCount).toBe(1);
   }, 30_000);
 
   it.each([false, true])('preserves all detach-like flags after -- (detached=%s)', detached => {

@@ -2418,8 +2418,9 @@ describe('detached jobs', () => {
     const spawnFn = vi.fn(() => { queueMicrotask(() => child.emit('spawn')); return child; });
     const args = ['--task=literal $(no-shell)', detachFlag, '--dir=checkout'];
     const readStart = vi.fn(() => 'Fri Oct 23 20:10:13 2026');
+    const env = { WE_HEAVY_ADMISSION_HELD: '1', KEEP_ME: 'preserved' };
     const job = await startDetachedJob({ args, jobsDir, spawnFn, now: () => 0, random: () => 'random',
-      nodePath: 'node', scriptPath: 'scripts/codex-direct-task.mjs', env: {}, readStart });
+      nodePath: 'node', scriptPath: 'scripts/codex-direct-task.mjs', env, readStart });
     expect(readStart).toHaveBeenCalledWith(321);
     expect(job).toEqual({ id: '0-random', pid: 321, pidStart: 'Fri Oct 23 20:10:13 2026', status: 'running', startedAt: new Date(0).toISOString(),
       resultPath: join(jobsDir, '0-random.result.json'), exitCode: null, recordPath: join(jobsDir, '0-random.json') });
@@ -2427,7 +2428,8 @@ describe('detached jobs', () => {
     expect(readJobRecord(job.id, { jobsDir })).toEqual(record);
     expect(child.unref).toHaveBeenCalledOnce();
     expect(spawnFn).toHaveBeenCalledWith('node', ['scripts/codex-direct-task.mjs', args[0], args[2], '--json', '--no-stream', '--job=0-random'],
-      { detached: true, stdio: ['ignore', expect.any(Number), expect.any(Number)], env: { CODEX_JOBS_DIR: jobsDir } });
+      { detached: true, stdio: ['ignore', expect.any(Number), expect.any(Number)], env: { CODEX_JOBS_DIR: jobsDir, KEEP_ME: 'preserved' } });
+    expect(env).toEqual({ WE_HEAVY_ADMISSION_HELD: '1', KEEP_ME: 'preserved' });
     const spawnOptions = spawnFn.mock.calls[0][2];
     expect(spawnOptions.detached).toBe(true);
     expect(spawnOptions.stdio).not.toBe('pipe');

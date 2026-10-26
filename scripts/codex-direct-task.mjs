@@ -1236,12 +1236,15 @@ export async function startDetachedJob({
   const recordPath = jobRecordPath(jobsDir, id);
   fsDeps.mkdirSync(jobsDir, { recursive: true });
   const resultPath = join(jobsDir, `${id}.result.json`);
+  // A detached job's gate must acquire capacity after its launching wrapper exits.
+  const childEnv = { ...env, CODEX_JOBS_DIR: jobsDir };
+  delete childEnv.WE_HEAVY_ADMISSION_HELD;
   const fds = [];
   try {
     fds.push(fsDeps.openSync(resultPath, 'w', 0o600));
     fds.push(fsDeps.openSync(join(jobsDir, `${id}.stderr.log`), 'w', 0o600));
     const child = spawnFn(nodePath, [scriptPath, ...args.filter(a => a !== '--detach' && !a.startsWith('--detach=')), '--json', '--no-stream', `--job=${id}`], {
-      detached: true, stdio: ['ignore', ...fds], env: { ...env, CODEX_JOBS_DIR: jobsDir },
+      detached: true, stdio: ['ignore', ...fds], env: childEnv,
     });
     await new Promise((resolveSpawn, reject) => {
       child.once('spawn', resolveSpawn);
