@@ -114,7 +114,7 @@ function record(path, section, key, value) {
   writeJsonAtomic(path, state);
 }
 
-export function readOwedMainRule(pr, { slug, exec = execFileSyncThrottled, cache = stateFile(), authors = trustedDrainAuthors() } = {}) {
+export function readOwedMainRule(pr, { slug, exec = execFileSyncThrottled, cache = stateFile(), readOnly = false, authors = trustedDrainAuthors() } = {}) {
   try {
     const check = redTest(pr);
     if (!check) return { owed: false, nums: [], reason: 'required test is not red' };
@@ -130,7 +130,7 @@ export function readOwedMainRule(pr, { slug, exec = execFileSyncThrottled, cache
     // Project each commit to its subject in jq: a commit BODY must never masquerade as a drain commit.
     const commits = parsed.only ? String(exec('gh', ['api', `repos/${slug}/pulls/${pr.number}/commits`, '--paginate', '--jq', '.[] | {subject: (.commit.message | split("\\n")[0]), author: .commit.author} | @json'], options)).split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line)) : [];
     const verdict = classifyOwedMainRule({ logText, commits, authors });
-    record(cache, 'verdicts', key, verdict);
+    if (!readOnly) record(cache, 'verdicts', key, verdict);
     return verdict;
   } catch (e) { return { owed: false, nums: [], reason: `unreadable: ${e.message}` }; }
 }

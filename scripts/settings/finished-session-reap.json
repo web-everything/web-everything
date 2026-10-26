@@ -1,0 +1,4 @@
+{
+  "$comment": "finishedSessionReap: stop a fixer session still alive afterMinutes after its fix claim was released (fix-end at the PR head, no new claim). Only dispatch-dir sessions; stops via claude stop. Cascade: standard (enabled true, 10 min) in we:scripts/conveyor/finished-session-reap.mjs → platform preference finishedSessionReap → this file → env WE_FINISHED_SESSION_REAP (0 = report only) / WE_FINISHED_SESSION_REAP_MINUTES.",
+  "finishedSessionReap": { "enabled": true, "afterMinutes": 10 }
+}
