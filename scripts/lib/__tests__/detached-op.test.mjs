@@ -21,75 +21,77 @@ describe('resolveDetachedOpsDir', () => {
 describe.skipIf(process.platform === 'win32')('runner termination integration', () => {
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-  it.each([
+  for (const [signal, stubborn, detachedDescendant] of [
     ['SIGTERM', true, false], ['SIGTERM', false, false],
     ['SIGINT', true, false], ['SIGHUP', true, false], ['SIGTERM', true, true],
-  ])('stops command and descendants before reporting failure on %s (stubborn command: %s, detached descendant: %s)', async (signal, stubborn, detachedDescendant, context) => {
-    if (detachedDescendant) {
-      // Cross-group tree cleanup needs process-list access; a restricted sandbox
-      // can still exercise all four process-group cancellation regressions.
-      try { execFileSync('ps', ['-A', '-o', 'pid=,ppid=,pgid='], { stdio: 'ignore', timeout: 1000 }); }
-      catch (error) {
-        if (!['EPERM', 'EACCES'].includes(error.code)) throw error;
-        context.skip(); return;
+  ]) {
+    it(`stops command and descendants before reporting failure on ${signal} (stubborn command: ${stubborn}, detached descendant: ${detachedDescendant})`, async context => {
+      if (detachedDescendant) {
+        // Cross-group tree cleanup needs process-list access; a restricted sandbox
+        // can still exercise all four process-group cancellation regressions.
+        try { execFileSync('ps', ['-A', '-o', 'pid=,ppid=,pgid='], { stdio: 'ignore', timeout: 1000 }); }
+        catch (error) {
+          if (!['EPERM', 'EACCES'].includes(error.code)) throw error;
+          context.skip(); return;
+        }
       }
-    }
-    const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'detached-op-signal-'));
-    const commandReady = join(dir, 'command.pid');
-    const descendantReady = join(dir, 'descendant.pid');
-    const heartbeat = join(dir, 'heartbeat');
-    let record;
-    const alive = pid => {
-      try { process.kill(pid, 0); return true; } catch { return false; }
-    };
-    try {
-      const descendant = `
-        const fs = require('node:fs');
-        for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => {});
-        fs.writeFileSync(${JSON.stringify(descendantReady)}, String(process.pid));
-        setInterval(() => fs.appendFileSync(${JSON.stringify(heartbeat)}, 'descendant\\n'), 10);
-      `;
-      const command = `
-        const fs = require('node:fs');
-        const { spawn } = require('node:child_process');
-        if (${stubborn}) for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => {});
-        spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}], { stdio: 'ignore', detached: ${detachedDescendant} });
-        fs.writeFileSync(${JSON.stringify(commandReady)}, String(process.pid));
-        setInterval(() => fs.appendFileSync(${JSON.stringify(heartbeat)}, 'command\\n'), 10);
-      `;
-      record = await startDetachedOp({ argv: [process.execPath, '-e', command], kind: 'signal-test', dir });
-      const readyDeadline = Date.now() + 5000;
-      while (!(existsSync(commandReady) && existsSync(descendantReady) && existsSync(heartbeat))) {
-        if (Date.now() >= readyDeadline) throw new Error('command tree did not become ready');
-        await delay(20);
+      const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'detached-op-signal-'));
+      const commandReady = join(dir, 'command.pid');
+      const descendantReady = join(dir, 'descendant.pid');
+      const heartbeat = join(dir, 'heartbeat');
+      let record;
+      const alive = pid => {
+        try { process.kill(pid, 0); return true; } catch { return false; }
+      };
+      try {
+        const descendant = `
+          const fs = require('node:fs');
+          for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => {});
+          fs.writeFileSync(${JSON.stringify(descendantReady)}, String(process.pid));
+          setInterval(() => fs.appendFileSync(${JSON.stringify(heartbeat)}, 'descendant\\n'), 10);
+        `;
+        const command = `
+          const fs = require('node:fs');
+          const { spawn } = require('node:child_process');
+          if (${stubborn}) for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => {});
+          spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}], { stdio: 'ignore', detached: ${detachedDescendant} });
+          fs.writeFileSync(${JSON.stringify(commandReady)}, String(process.pid));
+          setInterval(() => fs.appendFileSync(${JSON.stringify(heartbeat)}, 'command\\n'), 10);
+        `;
+        record = await startDetachedOp({ argv: [process.execPath, '-e', command], kind: 'signal-test', dir });
+        const readyDeadline = Date.now() + 5000;
+        while (!(existsSync(commandReady) && existsSync(descendantReady) && existsSync(heartbeat))) {
+          if (Date.now() >= readyDeadline) throw new Error('command tree did not become ready');
+          await delay(20);
+        }
+        expect(alive(Number(readFileSync(commandReady, 'utf8')))).toBe(true);
+        expect(alive(Number(readFileSync(descendantReady, 'utf8')))).toBe(true);
+        process.kill(record.pid, signal);
+        let result;
+        const terminalDeadline = Date.now() + 6000;
+        do {
+          result = await waitForOp({ id: record.id, dir, maxWaitMs: 250 });
+          if (Date.now() >= terminalDeadline) throw new Error('runner cleanup did not finish');
+        } while (result.status === 'running');
+        expect(result).toMatchObject({ status: 'failed', code: 1,
+          exitCode: { SIGTERM: 143, SIGINT: 130, SIGHUP: 129 }[signal] });
+        const stoppedAt = readFileSync(heartbeat, 'utf8');
+        await delay(150);
+        expect(readFileSync(heartbeat, 'utf8')).toBe(stoppedAt);
+      } finally {
+        // Also clean up the unfixed implementation after the red run.
+        for (const path of [descendantReady, commandReady]) {
+          if (!existsSync(path)) continue;
+          const pid = Number(readFileSync(path, 'utf8'));
+          try { process.kill(-pid, 'SIGKILL'); } catch {}
+          try { process.kill(pid, 'SIGKILL'); } catch {}
+        }
+        if (record) { try { process.kill(record.pid, 'SIGKILL'); } catch {} }
+        await delay(30);
+        rmSync(dir, { recursive: true, force: true });
       }
-      expect(alive(Number(readFileSync(commandReady, 'utf8')))).toBe(true);
-      expect(alive(Number(readFileSync(descendantReady, 'utf8')))).toBe(true);
-      process.kill(record.pid, signal);
-      let result;
-      const terminalDeadline = Date.now() + 6000;
-      do {
-        result = await waitForOp({ id: record.id, dir, maxWaitMs: 250 });
-        if (Date.now() >= terminalDeadline) throw new Error('runner cleanup did not finish');
-      } while (result.status === 'running');
-      expect(result).toMatchObject({ status: 'failed', code: 1,
-        exitCode: { SIGTERM: 143, SIGINT: 130, SIGHUP: 129 }[signal] });
-      const stoppedAt = readFileSync(heartbeat, 'utf8');
-      await delay(150);
-      expect(readFileSync(heartbeat, 'utf8')).toBe(stoppedAt);
-    } finally {
-      // Also clean up the unfixed implementation after the red run.
-      for (const path of [descendantReady, commandReady]) {
-        if (!existsSync(path)) continue;
-        const pid = Number(readFileSync(path, 'utf8'));
-        try { process.kill(-pid, 'SIGKILL'); } catch {}
-        try { process.kill(pid, 'SIGKILL'); } catch {}
-      }
-      if (record) { try { process.kill(record.pid, 'SIGKILL'); } catch {} }
-      await delay(30);
-      rmSync(dir, { recursive: true, force: true });
-    }
-  }, 15000);
+    }, 15000);
+  }
 });
 
 describe('parseDetachFlags', () => {
@@ -213,6 +215,55 @@ describe('detached operation lifecycle', () => {
       .toMatchObject({ id: record.id, status: 'failed', code: 1, reason: 'runner-died' });
     expect(isAlive).toHaveBeenCalledWith(record.pid);
     expect(clock.sleep).not.toHaveBeenCalled();
+  });
+
+  it.each([['done', 0, 0], ['failed', 23, 1]])(
+    'uses the %s record published between the first read and runner death', async (status, exitCode, code) => {
+      const record = writeRecord();
+      const clock = fakeClock();
+      const isAlive = vi.fn(() => {
+        writeRecord({ status, exitCode });
+        writeFileSync(record.stdoutPath, 'final output\n');
+        return false;
+      });
+      const result = await waitForOp({ id: record.id, dir, maxWaitMs: 250, ...clock, isAlive });
+      expect(result).toMatchObject({ status, exitCode, code, stdoutTail: 'final output\n' });
+      expect(result).not.toHaveProperty('reason');
+      expect(isAlive).toHaveBeenCalledOnce();
+      expect(clock.sleep).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['missing', 'malformed', 'invalid'])('fails closed when the final record is %s', async variant => {
+    const record = writeRecord();
+    const clock = fakeClock();
+    const isAlive = vi.fn(() => {
+      const path = join(dir, `${record.id}.json`);
+      if (variant === 'missing') rmSync(path);
+      else if (variant === 'malformed') writeFileSync(path, '{');
+      else writeRecord({ status: 'done', exitCode: null });
+      return false;
+    });
+    expect(await waitForOp({ id: record.id, dir, maxWaitMs: 250, ...clock, isAlive }))
+      .toMatchObject({ status: 'failed', code: 1, reason: variant === 'missing' ? 'unknown-job' : 'invalid-record' });
+    expect(isAlive).toHaveBeenCalledOnce();
+    expect(clock.sleep).not.toHaveBeenCalled();
+  });
+
+  it('checks a replacement runner instead of applying the previous PID death to it', async () => {
+    const record = writeRecord();
+    const clock = fakeClock();
+    const isAlive = vi.fn(pid => {
+      if (pid === record.pid) {
+        writeRecord({ pid: 54321 });
+        return false;
+      }
+      return true;
+    });
+    expect(await waitForOp({ id: record.id, dir, maxWaitMs: 250, ...clock, isAlive }))
+      .toMatchObject({ status: 'running', pid: 54321, code: 75 });
+    expect(isAlive).toHaveBeenCalledWith(54321);
+    expect(clock.now()).toBe(250);
   });
 
   it('fails closed with unknown-job for an unknown id', async () => {

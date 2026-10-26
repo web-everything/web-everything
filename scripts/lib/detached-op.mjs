@@ -77,22 +77,33 @@ export async function startDetachedOp({ argv, kind, dir = resolveDetachedOpsDir(
 export async function waitForOp({ id, maxWaitMs = 540000, dir = resolveDetachedOpsDir(),
   now = Date.now, sleep: pause = sleep, isAlive = alive } = {}) {
   const deadline = now() + budget(maxWaitMs);
+  const readRecord = () => {
+    const record = JSON.parse(readFileSync(recordPath(dir, id), 'utf8'));
+    if (record.id !== id || !['running', 'done', 'failed'].includes(record.status)
+      || !Number.isInteger(record.pid) || record.pid <= 0
+      || typeof record.stdoutPath !== 'string' || typeof record.stderrPath !== 'string'
+      || (record.status === 'running' && record.exitCode !== null)
+      || (record.status === 'done' && record.exitCode !== 0)
+      || (record.status === 'failed' && (!Number.isInteger(record.exitCode) || record.exitCode <= 0))) {
+      throw new Error('incomplete job record');
+    }
+    return record;
+  };
   for (;;) {
     let record;
+    let deadRunnerPid;
     try {
-      record = JSON.parse(readFileSync(recordPath(dir, id), 'utf8'));
-      if (record.id !== id || !['running', 'done', 'failed'].includes(record.status)
-        || !Number.isInteger(record.pid) || record.pid <= 0
-        || typeof record.stdoutPath !== 'string' || typeof record.stderrPath !== 'string'
-        || (record.status === 'running' && record.exitCode !== null)
-        || (record.status === 'done' && record.exitCode !== 0)
-        || (record.status === 'failed' && (!Number.isInteger(record.exitCode) || record.exitCode <= 0))) {
-        throw new Error('incomplete job record');
+      record = readRecord();
+      if (record.status === 'running' && !isAlive(record.pid)) {
+        deadRunnerPid = record.pid;
+        // The runner publishes its terminal record before exiting. Refresh after
+        // observing death so a stale running snapshot cannot hide that result.
+        record = readRecord();
       }
     } catch (error) { return { id, status: 'failed', code: 1, reason: error.code === 'ENOENT' ? 'unknown-job' : 'invalid-record' }; }
     const result = { ...record, stdoutTail: tail(record.stdoutPath), stderrTail: tail(record.stderrPath) };
     if (record.status !== 'running') return { ...result, code: record.status === 'done' ? 0 : 1 };
-    if (!isAlive(record.pid)) return { ...result, status: 'failed', code: 1, reason: 'runner-died' };
+    if (record.pid === deadRunnerPid) return { ...result, status: 'failed', code: 1, reason: 'runner-died' };
     if (now() >= deadline) return { ...result, code: 75 };
     await pause(Math.min(1000, deadline - now()));
   }
