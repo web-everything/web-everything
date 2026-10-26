@@ -6,6 +6,7 @@ import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
 import { planRedTeamStatusLabels } from '../red-team-status-labels.mjs';
+import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escalation.mjs';
 
 const H = '61782334289124cd4fcb51d0bdadb6ef3c795e82';
 const P = 5502;
@@ -35,6 +36,34 @@ const carried = bot([
 ].join('\n'), '2026-10-21T21:00:00Z');
 
 describe('operator-block held actions (shared reader)', () => {
+  it.each([
+    ['indexed send-back', '- 1 confirmed break(s) sent back to the fixer (#1).', rid, [1]],
+    ['indexed hold', '- 1 confirmed break(s) NOT sent back: cap (#1).', rid, [1]],
+    ['legacy unindexed hold', '- 1 confirmed break(s) NOT sent back: cap.', null, [1, 2, 3]],
+  ].flatMap(([format, line, id, expected]) => [['human', human], ['bot', bot]].flatMap(([author, who]) =>
+    [false, true].map(anyState => [format, author, anyState, line, id, expected, who]))))(
+    '%s by %s supersedes only its covered clear-human findings (anyState=%s)',
+    (_format, _author, anyState, line, id, expected, who) => {
+      const comments = [result,
+        gate(bot, 'round-cap', '- 3 confirmed break(s) NOT sent back: cap (#1, #2, #3).', '2026-10-21T17:12:20Z'),
+        human(['✅ review — `review:human` cleared via the sanctioned path', '',
+          'Cleared by chalbert via `review-set-label.mjs --to=clear-human` (gate-self).', '',
+          buildReviewedShaMarker(H), buildClearedHumanMarker('chalbert')].join('\n'), '2026-10-21T20:00:00Z')];
+      const disposition = () => readRedTeamDisposition({ comments, pr: P, head: H,
+        setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState } });
+      expect(held(disposition())).toEqual([]);
+      expect(redTeamEnqueueHold({ comments, pr: P, head: H, env: {} })).toBeNull();
+
+      comments.push(gate(who, 'operator-block', line, '2026-10-21T20:30:00Z', id));
+      // An indexed block leaves the other clearances standing; a legacy line without
+      // indices must conservatively supersede the ceremony for every confirmed finding.
+      expect(disposition().held.map(f => f.index)).toEqual(expected);
+      expect(disposition().sendBack).toEqual([]);
+      expect(redTeamEnqueueHold({ comments, pr: P, head: H, env: {} })).not.toBeNull();
+      expect(planRedTeamStatusLabels({ comments, pr: P, head: H, labels: ['review:human', 'red-team:clear'], env: {} }))
+        .toEqual({ add: 'red-team:blocked', remove: ['red-team:clear'] });
+    });
+
   it.each([
     ['human', 'indexed', human, '- 1 confirmed break(s) NOT sent back: cap (#1).', rid, [1]],
     ['bot', 'indexed', bot, '- 1 confirmed break(s) NOT sent back: cap (#1).', rid, [1]],
