@@ -3,7 +3,7 @@ import { build } from 'esbuild';
 import ts from 'typescript';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readSync, realpathSync, rmSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readSync, realpathSync, rmSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -36,6 +36,16 @@ const object = value => value !== null && typeof value === 'object' && !Array.is
 const valid = (value, domain) => Array.isArray(domain) ? domain.includes(value) : Number.isSafeInteger(value) && value >= domain;
 const clone = value => structuredClone(value);
 const inside = (root, path) => { const rel = relative(root, path); return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`)); };
+
+export function assertStoredEntryName(dir, name, readdir = d => readdirSync(d, { withFileTypes: true })) {
+  const entries = readdir(dir);
+  const exact = entries.find(entry => entry.name === name);
+  if (exact && !exact.isSymbolicLink()) return;
+  if (exact || entries.some(entry => ['NFC', 'NFD'].some(form => entry.name.normalize(form).toLowerCase() === name.normalize(form).toLowerCase()))) {
+    throw Object.assign(Error(`Policy path identity refused: ${name}`), { code: 'POLICY_PATH_IDENTITY' });
+  }
+  throw Object.assign(Error(`Policy entry not found: ${name}`), { code: 'ENOENT' });
+}
 
 /**
  * One trust boundary for worktree policy sources and the journal. Only the canonical
@@ -555,7 +565,7 @@ async function transpileDefaults(source, env) {
 }
 
 /** Resolve only human-gated sources. On incomplete evidence, retain defaults (or the protective failsafe). */
-export async function loadDeliveryPolicy({ root = process.cwd(), env = process.env, ref } = {}) {
+export async function loadDeliveryPolicy({ root = process.cwd(), env = process.env, ref, readdir } = {}) {
   const emergency = resultFrom(DELIVERY_POLICY_FAILSAFE);
   try {
     root = realpathSync(root);
@@ -582,6 +592,13 @@ export async function loadDeliveryPolicy({ root = process.cwd(), env = process.e
         const match = /^(100644|100755) blob [a-f0-9]+\t([^\0]+)\0$/.exec(tree);
         if (!match || match[2] !== normalized) throw Error(`Not a regular policy blob: ${path}`);
         return { path: normalized, version: commit, read: () => git(['show', `${commit}:${normalized}`]) };
+      }
+      if (!external) {
+        try { assertStoredEntryName(dirname(absolute), basename(absolute), readdir); } catch (error) {
+          // Listed nowhere yet reachable by path means the filesystem aliased the name (case, normalization): refuse.
+          if (error.code === 'ENOENT' && lstatSync(absolute, { throwIfNoEntry: false })) throw Object.assign(Error(`Policy path identity refused: ${basename(absolute)}`), { code: 'POLICY_PATH_IDENTITY' });
+          throw error;
+        }
       }
       const trusted = resolveTrustedConfigPath(path, { root, allowedRoots: external ? [daemonStateDir(env)] : [root] });
       return { path: external ? trusted.real : relative(root, trusted.real).split(sep).join('/'), version: trusted.version, read: trusted.read };

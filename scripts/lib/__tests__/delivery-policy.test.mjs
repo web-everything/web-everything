@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { Worker } from 'node:worker_threads';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import ts from 'typescript';
@@ -388,8 +388,9 @@ describe('delivery policy values', () => {
     expect(result.warnings).toHaveLength(1);
   });
   it('refuses defaults with the right own-key count where one required field is only inherited', async () => {
-    const { mainStateParity, ...own } = defaults.prCi;
-    put(defaultFile, `export const PLATFORM_DELIVERY_POLICY_DEFAULTS = { ...${JSON.stringify(defaults)}, prCi: { __proto__: { mainStateParity: ${JSON.stringify(mainStateParity)} }, ...${JSON.stringify(own)}, padding: ${JSON.stringify(mainStateParity)} } };`);
+    const { prCi, ...rest } = defaults;
+    const body = Object.entries(rest).map(([k, v]) => `${k}: ${JSON.stringify(v)}`).join(', ');
+    put(defaultFile, `export const PLATFORM_DELIVERY_POLICY_DEFAULTS = { ${body}, prCi: { __proto__: ${JSON.stringify(prCi)}, padding: 'on' } };`);
     const result = await load();
     expect(policy(result)).toEqual(DELIVERY_POLICY_FAILSAFE);
     expect(result.warnings).toHaveLength(1);
@@ -1317,6 +1318,7 @@ describe('policy journal', () => {
 
 describe('policy file path identity', () => {
   const entry = (name, link = false) => ({ name, isSymbolicLink: () => link, isFile: () => !link });
+  const listAt = listing => dir => dir === root ? listing : readdirSync(dir, { withFileTypes: true });
   const hostile = { mergeGate: { onMainRed: 'off' } };
   it.each([
     ['case alias', () => [entry('WebEverything.config.json')]],
@@ -1324,13 +1326,13 @@ describe('policy file path identity', () => {
     ['unicode variant', () => [entry('webeverything.config.json\u0301')]],
   ])('refuses the conventional root file when its stored entry is a %s', async (_name, listing) => {
     put(rootFile, hostile);
-    const result = await load({ readdir: () => listing() });
+    const result = await load({ readdir: listAt(listing()) });
     expect(result.mergeGate.onMainRed).toBe(defaults.mergeGate.onMainRed);
     expect(result.warnings).toEqual([expect.stringMatching(/policy config/)]);
   });
   it('accepts the exact stored name', async () => {
     put(rootFile, hostile);
-    const result = await load({ readdir: () => [entry(rootFile)] });
+    const result = await load({ readdir: listAt([entry(rootFile)]) });
     expect(result.mergeGate.onMainRed).toBe('off');
   });
   it('refuses NFC/NFD variants of a stored name', () => {
