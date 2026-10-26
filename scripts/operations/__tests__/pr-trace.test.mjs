@@ -26,11 +26,12 @@ describe('pr-trace observed blockers', () => {
       .toContain('stored red-team head != live head');
   });
   it('#5874 names the landing holder', () => {
-    expect(trace(5874, { sources: { drain: drain(5874, 'merge-queue: wait (behind landing holder #5870)') } }).likelyBlocker).toContain('landing holder #5870');
+    expect(trace(5874, { sources: { drain: drain(5874, 'merge-queue: wait (behind landing holder #5870)') } }).likelyBlocker).toBe('#5874 waiting behind landing holder #5870');
   });
   it('#5878 reports a live pid on a stuck session', () => {
-    const out = trace(5878, { sources: { fix: 'reconcile-fix-dispatch-daemon: refused live-process owner/repo PR #5878 — live pid on stuck session, no progress [name=fix-5878 pid=123 cwd=fixture]' } });
-    expect(out.likelyBlocker).toContain('live pid on stuck session');
+    const out = trace(5878, { sources: { fix: 'reconcile-fix-dispatch-daemon: refused live-process owner/repo PR #5878 — pid 123 alive, session stalled [name=fix-5878 cwd=fixture]' } });
+    expect(out.likelyBlocker).toMatch(/^#5878 live pid on stuck session/);
+    expect(trace(5878, { sources: { fix: 'PR #5878 pid 123 alive, making progress' } }).likelyBlocker).not.toContain('stuck session');
   });
   it('detects repeated reasons across timestamps, scoped to the exact PR', () => {
     const logs = Array.from({ length: 10 }, (_, n) => `2026-10-26T15:${String(n).padStart(2, '0')}:00Z PR #12 waiting for review`).join('\n');

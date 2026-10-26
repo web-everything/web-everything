@@ -61,7 +61,7 @@ export function buildPrTrace({ pr, repo, now, live, sources = {}, unavailable = 
     ...mismatches.map(m => m.reason), renumber ? `drain renumber at ${et(renumber.at)}` : null].filter(Boolean)
     : stuck ? ['live pid on stuck session', latest.fix]
     : ci.length ? [`waiting on CI shard ${ci.map(c => c.name).join(', ')}`]
-    : holder ? [`waiting behind ${holder}`]
+    : holder ? [`waiting ${/^behind\b/i.test(holder) ? '' : 'behind '}${holder}`]
     : conflicts.length ? [`label conflict: ${conflicts.join('; ')}`]
     : looping.length ? [`looping: ${looping[0].source}: ${looping[0].reason} (${looping[0].count} times)`]
     : [latest.drain ?? latest.fix ?? latest.review ?? 'no blocker established from bounded evidence'];
