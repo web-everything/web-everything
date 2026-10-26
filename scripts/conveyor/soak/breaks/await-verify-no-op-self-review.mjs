@@ -15,7 +15,7 @@ const NOW = Date.parse('2026-10-25T17:03:10Z');
 export default {
   id: 'await-verify-no-op-self-review',
   title: 'a no-op early push retains self-review holds and observes verification during push and deferred hand-back',
-  card: 'PR #5919, send-back x1b8hlo item 1',
+  card: 'PR #5919, send-back 5726 item 1',
   fixedBy: { sha: 'HEAD', where: 'lane/port-1023a-b', paths: [PASS] },
   fixPresent(root) {
     const source = readFileSync(join(root, PASS), 'utf8');

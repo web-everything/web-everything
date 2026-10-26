@@ -1,20 +1,21 @@
 ---
+bornAs: x1kj5jx
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/__tests__/reconcile-core.test.mjs"]
+scope: ["we:scripts/lib/gate-config.mjs", "we:scripts/lib/__tests__/gate-config.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Add a table-driven test that runs every reviewStartGate non-failure reason (wrong-head, missing,… (from web-everything/web-everything#5911 review)
+# Prevention — Add a review-lens checklist item: each 'cannot'/'never'/'once' sentence in a new function's doc c… (from web-everything/web-everything#5935 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/reconcile-core.mjs:1465` — Add a table-driven test that runs every `reviewStartGate` non-failure reason (wrong-head, missing, malformed, missing-head) through `reviewChecksAllow` with a red `review-gate`. A lint rule requiring a named test for each 'preserves X refusals' comment is a possible gate but heavy.
+1. `we:scripts/lib/gate-config.mjs:819` — Add a review-lens checklist item: each 'cannot'/'never'/'once' sentence in a new function's doc comment must name a test, mutation-checked. A deterministic gate is hard to build for this class.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5911@6675223e02446c0a853eceaa6abf52ee2dbd002e
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5935@936f5d094560cece508104918e22226095fb86d5
 
 ## Acceptance
 

@@ -1,21 +1,22 @@
 ---
+bornAs: x1fga51
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/__tests__/dispatch-lane-permission-grant.test.mjs", "we:scripts/operations/dispatch-lane-io.mjs", "we:scripts/operations/__tests__/dispatch-lane-io.test.mjs"]
+scope: ["we:backlog/xyfyxjk-prevent-cross-repository-checkout-authentication-drift-in-re.md"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Add a test that extracts every node "{{WE_ROOT}}/scripts/..." invocation from the brief's hand-ba… (from web-everything/web-everything#5931 review)
+# Prevention — Gate backlog preparation on requirement-to-test mappings containing repository-qualified files, c… (from web-everything/web-everything#5946 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+1. `we:backlog/7201-prevent-cross-repository-checkout-authentication-drift-in-re.md:17` — Gate backlog preparation on requirement-to-test mappings containing repository-qualified files, case names, and observable assertions, allowing explicitly named manual checks for live evidence; require explicit/default input variants where defaults affect behavior.
 
-1. `we:scripts/operations/__tests__/dispatch-lane-permission-grant.test.mjs:196` — Add a test that extracts every `node "{{WE_ROOT}}/scripts/..."` invocation from the brief's hand-back block and asserts each is covered by an allow rule or a documented exemption.
-2. `we:scripts/operations/dispatch-lane-io.mjs:2338` — Derive the per-launchKind allow set from the brief that launchKind uses, and test each launchKind against its own brief file.
+Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 1 → #5473.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5931@1f883d5ab7faf68be7254781d1db089b4f7c94ca
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5946@e27a55245099b442bd808c0ff17a89ea3b840708
 
 ## Acceptance
 

@@ -1,21 +1,21 @@
 ---
+bornAs: x6gharx
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/daemon-rebuild/rebuild.mjs", "we:scripts/operations/completion-cli.mjs", "we:scripts/lib/daemon-rebuild/__tests__/rebuild.test.mjs", "we:scripts/operations/__tests__/completion-cli.test.mjs"]
+scope: ["we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/__tests__/reconcile-core.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — A test that walks every reason: literal in scripts/lib/daemon-rebuild/*.mjs and asserts each is e… (from web-everything/web-everything#5943 review)
+# Prevention — Add a table-driven test that runs every reviewStartGate non-failure reason (wrong-head, missing,… (from web-everything/web-everything#5911 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/daemon-rebuild/rebuild.mjs:46` — A test that walks every `reason:` literal in scripts/lib/daemon-rebuild/*.mjs and asserts each is explicitly classified as idle or failed, so a new or unclassified reason fails CI. Alternatively, have each result carry an explicit `severity` or `event` flag.
-2. `we:scripts/operations/completion-cli.mjs:159` — Add the named regression test to the automated suite and persist session-scoped emission history independently of the current outcome.
+1. `we:scripts/conveyor/reconcile-core.mjs:1465` — Add a table-driven test that runs every `reviewStartGate` non-failure reason (wrong-head, missing, malformed, missing-head) through `reviewChecksAllow` with a red `review-gate`. A lint rule requiring a named test for each 'preserves X refusals' comment is a possible gate but heavy.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5943@1925ac5b860466cb6d728d4399ee429f0ba22ad9
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5911@6675223e02446c0a853eceaa6abf52ee2dbd002e
 
 ## Acceptance
 

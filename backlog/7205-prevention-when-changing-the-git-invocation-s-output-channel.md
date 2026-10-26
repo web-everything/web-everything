@@ -1,21 +1,22 @@
 ---
+bornAs: x0khwsn
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/xyfyxjk-prevent-cross-repository-checkout-authentication-drift-in-re.md"]
+scope: ["we:scripts/conveyor/await-verify-pass.mjs", "we:scripts/conveyor/__tests__/await-verify-pass.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Gate backlog preparation on requirement-to-test mappings containing repository-qualified files, c… (from web-everything/web-everything#5946 review)
+# Prevention — When changing the git invocation's output channel, add a test asserting the surfaced reason text… (from web-everything/web-everything#5919 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/xyfyxjk-prevent-cross-repository-checkout-authentication-drift-in-re.md:17` — Gate backlog preparation on requirement-to-test mappings containing repository-qualified files, case names, and observable assertions, allowing explicitly named manual checks for live evidence; require explicit/default input variants where defaults affect behavior.
 
-Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 1 → #5473.
+1. `we:scripts/conveyor/await-verify-pass.mjs:784` — When changing the git invocation's output channel, add a test asserting the surfaced reason text for a rejected push; a grep-based lint for `e?.stderr` readers next to `pushShaFromScratch` would also catch it.
+2. `we:scripts/conveyor/await-verify-pass.mjs:364` — Add parameterized regression tests covering every promised precedence outcome and run them in the automated test gate.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5946@e27a55245099b442bd808c0ff17a89ea3b840708
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5919@a82f7ab6a98c69d6a0368288987136f8f4db61cb
 
 ## Acceptance
 
