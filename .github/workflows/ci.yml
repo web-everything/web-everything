@@ -12,6 +12,8 @@ name: CI
 #   job `test-shard` — the 2000+ vitest suite split across N runners (`vitest run --shard=i/N`, #2682),
 #                 each emitting a partial coverage report. A matrix job, so its own check names are
 #                 `test-shard (1..N)`, NOT a required check.
+#   Trusted merge_group/main-push suites use `hetzner`; PR/manual suites use hosted jobs.
+#   Required contexts remain `test`, `smoke`, and `daemon-soak` in this workflow.
 #   job `coverage-merge` — combines nine coverage artifacts and applies the 80% bar (#2082).
 #   jobs `standards` / `host-paths` — independent repo health and host-local path checks.
 #   job `test` — THE required shell-only gate over shards, coverage, integration and health checks.
@@ -166,6 +168,7 @@ jobs:
   # is deliberately deferred; shallow checkout brings changes to roughly 30-40 seconds.
   test-shard:
     needs: changes
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
     # #5027 — Arm-runner experiment switch. The repo is public, so `ubuntu-24.04-arm` is free; paid larger
     # runners were rejected on cost. `vars.WE_SHARD_RUNNER` unset (the default) = x86 `ubuntu-latest`; set it to
     # `ubuntu-24.04-arm` to trial the shards on Arm, unset it to abort — no PR needed either way. ONLY this job
@@ -306,16 +309,31 @@ jobs:
           path: web-everything/coverage/timing-unit-${{ matrix.shard }}.json
           if-no-files-found: ignore
 
+  # The operator asked for @main, but a same-repo @main ref fails the whole run
+  # while this file is absent from main (including this PR's own run), and tests
+  # main's version rather than the commit's. The local ref resolves at the
+  # merge-group/push sha.
+  hetzner:
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) }}
+    uses: ./.github/workflows/hetzner-jobs.yml
+    secrets: inherit
+
   # Coverage merging and host-path checks run independently; the required test job only reads results.
   coverage-merge:
-    needs: [changes, test-shard]
+    needs: [changes, test-shard, hetzner]
     if: ${{ !cancelled() && needs.changes.outputs.light != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Require successful shards
         run: |
-          if [ "${{ needs.test-shard.result }}" != "success" ]; then
+          if [ "${{ github.event_name }}" = "merge_group" ] || [ "${{ github.event_name }}" = "push" ]; then
+            shard_result="${{ needs.hetzner.result }}"
+          else
+            shard_result="${{ needs.test-shard.result }}"
+          fi
+          if [ "$shard_result" != "success" ]; then
             echo "::error::Unit shards did not succeed; refusing incomplete coverage."
             exit 1
           fi
@@ -356,7 +374,7 @@ jobs:
   # THE required test status: fail closed on all dependencies, including light runs.
   # Only unit shards and their coverage merge may be skipped on the card-only path.
   test:
-    needs: [changes, test-shard, integration, standards, coverage-merge, host-paths]
+    needs: [changes, test-shard, integration, standards, coverage-merge, host-paths, hetzner]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -367,7 +385,12 @@ jobs:
             echo "::error::Changes detection did not succeed."
             exit 1
           fi
-          if [ "${{ needs.integration.result }}" != "success" ]; then
+          if [ "${{ github.event_name }}" = "merge_group" ] || [ "${{ github.event_name }}" = "push" ]; then
+            integration_result="${{ needs.hetzner.result }}"
+          else
+            integration_result="${{ needs.integration.result }}"
+          fi
+          if [ "$integration_result" != "success" ]; then
             echo "::error::Integration did not succeed."
             exit 1
           fi
@@ -383,7 +406,12 @@ jobs:
             echo "Card-only PR: unit shards and coverage merge intentionally omitted."
             exit 0
           fi
-          if [ "${{ needs.test-shard.result }}" != "success" ]; then
+          if [ "${{ github.event_name }}" = "merge_group" ] || [ "${{ github.event_name }}" = "push" ]; then
+            shard_result="${{ needs.hetzner.result }}"
+          else
+            shard_result="${{ needs.test-shard.result }}"
+          fi
+          if [ "$shard_result" != "success" ]; then
             echo "::error::Unit shards did not succeed."
             exit 1
           fi
@@ -401,16 +429,15 @@ jobs:
   # The real-git/real-subprocess tier `vitest.config.ts` excludes (see its `test.exclude` comment) is split out
   # so `npm run test:unit` (and everything that shells it locally) no longer pays real git/subprocess cost per lane.
   #
-  # Check names: `integration` is its own check and is meant to be REQUIRED in branch protection alongside `test`,
-  # `smoke` and `daemon-soak`. `test` ALSO still fails when this job fails (see its "Gate on shard results" step),
-  # so nothing that is required today became skippable.
+  # Check names: `integration` is an implementation check; `test` gates the active hosted or
+  # Hetzner integration result. Required contexts remain `test`, `smoke`, and `daemon-soak`.
   #
   # Card-only PRs: like `test`/`smoke`, it stays a REAL running job (not job-level skipped) that passes in
   # seconds, because a SKIPPED required check is not read as success by the drain's `reviewCiGate`. Fail closed:
   # if `changes` did not succeed, the first step fails the job.
   integration:
     needs: changes
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     # Measured 5.8-8.4 min (perf sweep 2026-10-07); ~2.5x the worst case.
     timeout-minutes: 20
