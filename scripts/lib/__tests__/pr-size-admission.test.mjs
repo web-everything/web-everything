@@ -334,6 +334,32 @@ describe('shared admission effects', () => {
     expectSizeNote(result.body);
   });
 
+  // An editable marker never selects text to delete: only a note in exactly the
+  // shape this module writes is replaced, otherwise just the marker is dropped.
+  it.each([
+    ['author prose under a forged marker', (key) => `\n\n## Size\n\nAuthor rationale: this PR stays whole.\n\nSecond paragraph.\n<!-- size-admission:${key} -->\n`],
+    ['a legacy ref marker', () => `\n\n## Size\n\nAuthor rationale: this PR stays whole.\n<!-- size-admission:${encodeURIComponent(request.ref)} 9001 -->\n`],
+    ['an author line appended to a real note', (key, note) => note.replace(`<!-- size-admission:${key} -->`, `Author rationale: this PR stays whole.\n<!-- size-admission:${key} -->`)],
+    ['an author edit inside a real note line', (key, note) => note.replace('File groups: ', 'File groups: Author rationale: this PR stays whole; ')],
+  ])('retry never deletes author text selected by %s', async (_label, section) => {
+    const real = (await sizeAdmission.createSizeAdmissionRunner(effects())(request)).body.slice(request.body.length);
+    const body = request.body + section(KEY, real) + '\n## Testing\nKeep trailing content.\n';
+    const result = await sizeAdmission.createSizeAdmissionRunner(effects())({ ...request, body });
+    expect(result.body).toContain('Author rationale: this PR stays whole');
+    expect(result.body).toContain('\n## Testing\nKeep trailing content.\n');
+    expectSizeNote(result.body);
+  });
+
+  it('a copied marker earlier in the body cannot redirect the replacement away from the real note', async () => {
+    const first = await sizeAdmission.createSizeAdmissionRunner(effects())(request);
+    const quote = `\n\n## Size\n\nQuoted for reviewers:\n<!-- size-admission:${KEY} -->\n`;
+    const body = request.body + quote + first.body.slice(request.body.length);
+    const result = await sizeAdmission.createSizeAdmissionRunner(effects())({ ...request, body });
+    expect(result.body).toContain(quote);
+    expect(result.body.match(/301 non-test lines/g)).toHaveLength(1);
+    expectSizeNote(result.body);
+  });
+
   it('301 non-test lines proceed with one split card naming PR and file groups, reviewers escalated and body noting both', async () => {
     const io = effects();
     const run = sizeAdmission.createSizeAdmissionRunner(io);

@@ -261,6 +261,23 @@ function lookupLocalSplitCard({ key }, cwd) {
   return matches[0] || null;
 }
 
+// The exact Size note this module writes (see the runner's result.body). A marker in
+// the editable body only names a candidate: text between the heading and the marker is
+// replaced only when it is byte-for-byte this shape, so author text is never deleted.
+const ESCAPED = '(?:[^\\x00-\\x1f\\x7f-\\x9f\\u2028\\u2029\\u202a-\\u202e\\u2066-\\u2069&<>"\'`\\\\[\\](){}*_$#!|~]|&#\\d{1,7};)';
+const CARD_NOTE = 'split card (?:[A-Za-z0-9]{1,64} filed(?: via lane/[A-Za-z0-9-]{1,100})?|not filed \\(file-item failed\\))';
+const ESCALATION = 'extra reviewers requested via the size escalation \\(review:pending\\)';
+const OWN_NOTE = new RegExp(`^\\n\\n## Size\\n\\n(?:\\d{1,9} non-test lines \\(> ${OPEN_PR_MAX_NON_TEST_LINES}\\): ${CARD_NOTE}; ${ESCALATION}`
+  + `|size unknown: ${ESCALATION}; ${CARD_NOTE})\\n`
+  + `File groups: (?:unavailable \\(size unknown\\)|we:${ESCAPED}*: \\d{1,12})(?:; and \\d{1,9} more \\(\\d{1,9} groups? omitted; summary budget\\))?`
+  + '(?: Human review of the full diff is required; bounded summaries are incomplete\\.)?\\n'
+  + '(?:<!-- size-published:[a-f0-9]{64} -->\\n)?(?![\\s\\S])');
+
+function isOwnSizeNote(section, markerKey) {
+  const published = /<!-- size-published:([a-f0-9]{64}) -->\n(?![\s\S])/.exec(section);
+  return section.length <= 4 * SUMMARY_BYTES && OWN_NOTE.test(section) && (!published || published[1] === markerKey);
+}
+
 function splitCardId(value) {
   const id = typeof value === 'number' && Number.isSafeInteger(value) ? String(value) : value;
   return typeof id === 'string' && /^[A-Za-z0-9]{1,64}(?![\s\S])/.test(id) ? id : null;
@@ -359,16 +376,15 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = crea
     // Never read their ids/receipts as filing or publication evidence.
     let legacyToken;
     try { if (typeof ref === 'string' && ref.length <= 512) legacyToken = encodeURIComponent(ref); } catch { /* malformed ref */ }
+    // Our note is appended last, so prefer the last marker over an earlier quoted copy.
     const existing = [...body.matchAll(/<!-- size-admission:([^ ]+)(?: [^ ]+)? -->/g)]
-      .find((match) => match[1] === markerKey || (legacyToken && match[1] === legacyToken));
+      .findLast((match) => match[1] === markerKey || (legacyToken && match[1] === legacyToken));
     let previousBody = body;
     if (existing) {
       const start = body.lastIndexOf('\n\n## Size\n', existing.index);
-      const between = start >= 0 ? body.slice(start + '\n\n## Size\n'.length, existing.index)
-        .replace(new RegExp(`^<!-- size-published:${markerKey} -->\\n`, 'm'), '') : '';
-      // Only our own publication marker belongs to the replaceable note. Any other
-      // heading/comment makes its boundaries ambiguous: preserve the author's text.
-      const replaceNote = start >= 0 && !/(?:^|[\r\n])##[ \t]|(?:<|&lt;)!--/.test(between);
+      // Legacy ref-token notes predate the fixed shape: only their marker is dropped.
+      const replaceNote = start >= 0 && existing[1] === markerKey
+        && isOwnSizeNote(body.slice(start, existing.index), markerKey);
       let end = existing.index + existing[0].length;
       if ((existing.index === 0 || body[existing.index - 1] === '\n') && body[end] === '\n') end++;
       previousBody = body.slice(0, replaceNote ? start : existing.index) + body.slice(end);
