@@ -1878,7 +1878,8 @@ export function runReconcileFixDispatch({
   // will, once fix dispatch is turned on for that repo, dispatch fixes) from code that had already been proven
   // stale. Run it for every repo.
   assertMainNotStale(root, checkStaleness, FIX_STALE_GUARD_OPTS);
-  const reconciledRaw = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
+  const reconciledRaw = reconcile({ repo, allowStandDownAutoProceed: true,
+    ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   const reconciled = netScope ? netScope(reconciledRaw, { root, repoKey }) : reconciledRaw;
   const dispatchEntries = Array.isArray(reconciled.dispatch) ? reconciled.dispatch : [];
   const profile = resolveProfile(repoKey);
