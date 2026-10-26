@@ -1756,6 +1756,46 @@ describe('block and not-real rulings', () => {
     }
   });
 
+  it.each([false, true])('a completed block survives an older not-real suspended at its ledger append (anyState=%s)', async anyState => {
+    const comments = thread(), labels = [], events = [], posted = [], syncs = [];
+    const scope = { value: { anyState } };
+    const plan = ruling => payloadFor({ ruling, ...(ruling === 'not-real' ? { cause: 'other' } : {}) },
+      { comments, labels, scope });
+    const older = plan('not-real'), newer = plan('block');
+    let resumeAppend, signalAppend;
+    const appendPaused = new Promise(resolve => { signalAppend = resolve; });
+    const appendResumed = new Promise(resolve => { resumeAppend = resolve; });
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: HEAD, labels: [...labels], comments: [...comments] }),
+      readScope: () => scope, readStandingRulingScope: () => null, resolveIdentity: () => OP,
+      readEvents: async () => ({ status: 'ok', rows: [...events] }),
+      appendEvents: async rows => {
+        events.push(...rows);
+        if (rows.some(row => row.ruling === 'not-real')) {
+          signalAppend();
+          await appendResumed;
+        }
+      },
+      post: (_repo, _pr, body) => { posted.push(body); comments.push({ author: OP, body }); },
+      runSetLabel: () => { labels.push('review:changes'); return '{"ok":true}'; },
+      syncLabels: p => { syncs.push(p); return null; },
+    });
+    const pending = sinks[RED_TEAM_RULING_NOT_REAL_EFFECT](older);
+    const rejected = expect(pending).rejects.toThrow(/live operator block takes precedence/);
+    await appendPaused;
+    try {
+      await expect(sinks[RED_TEAM_RULING_BLOCK_EFFECT](newer)).resolves.toMatchObject({ sentBack: true });
+    } finally {
+      resumeAppend();
+    }
+    await rejected;
+    expect(events.map(row => row.ruling)).toEqual(['not-real', 'block']);
+    expect(posted.some(body => body.includes('outcome=operator-not-real'))).toBe(false);
+    expect(heldAfter(comments).map(f => f.index)).toEqual([1]);
+    expect(labels).toEqual(['review:changes']);
+    expect(syncs).toHaveLength(1); // Only the completed block may synchronize status.
+  });
+
   it('precedence is operator block > operator not-real > automatic card regardless of record order', () => {
     const block = blockRecord(), notReal = notRealRecord(), card = automaticCard();
     for (const records of [[block, notReal, card], [block, card, notReal], [notReal, block, card],
