@@ -1,5 +1,23 @@
 # Testing — Three-Tier Strategy
 
+## PR size admission trust-boundary fixtures
+
+`scripts/lib/__tests__/pr-size-admission.test.mjs` exercises Git with real shadow refs and
+round-trips hostile filenames through `planFileItem` and `js-yaml`. Size evidence must carry
+full head/base SHAs; mock symbolic SHA strings no longer represent valid Git evidence.
+Retry fixtures need a trusted card store keyed by repository, PR number and head SHA.
+Body markers are display hints; publication must be confirmed again from the store/publisher.
+Unknown or stale evidence and unreadable/ambiguous stores file conservatively and request reviewers.
+
+The legacy `file-item` scope flag is a comma list whose renderer supplies YAML double quotes.
+Size admission JSON-escapes each scalar's contents before bounding entries; it also escapes YAML
+line separators and trailing whitespace. Comma-bearing paths are omitted with an explicit count.
+Every incomplete summary names human review of the full diff as its fallback. Keep these tests
+in the shared suite and run it and the scoped producer/prepare suites through heavy admission.
+Identity, path and published batch-ref validators use explicit absolute-end assertions
+(`(?![\s\S])`). Keep the named trailing-newline regressions and the CR/CRLF/Unicode
+line-separator suffix cases in that required scoped gate.
+
 ## Daemon entry boot smoke
 
 Boot each entry in a fresh child to preserve cold import graphs. `rebuildSmoke.bootConcurrency`

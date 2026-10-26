@@ -4,6 +4,9 @@ import { mkdtempSync, mkdirSync, writeFileSync, renameSync, rmSync } from 'node:
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import yaml from 'js-yaml';
+import { createHash } from 'node:crypto';
+import { planFileItem } from '../../operations/file-item.mjs';
 import * as sizeAdmission from '../pr-size-admission.mjs';
 import { outcomePayload } from '../../operations/cli-adapter.mjs';
 import { fileIntoBatch } from '../../operations/card-batch-file.mjs';
@@ -46,15 +49,29 @@ const evidence = '100\t50\tscripts/operations/a.mjs\0'
   + '50\t0\tscripts/operations/b.mjs\0'
   + '101\t0\tdocs/agent/a.md\0'
   + '900\t0\tscripts/operations/__tests__/a.test.mjs\0';
-const request = { ref: 'lane/size-admission', pr: 5854, base: 'main', sha: 'HEAD', body: 'Existing PR description.' };
+const HEAD_SHA = '1'.repeat(40), BASE_SHA = '2'.repeat(40);
+const cardKey = (pr = 5854, sha = HEAD_SHA, repo = 'web-everything/web-everything') => createHash('sha256').update(JSON.stringify([repo, pr, sha])).digest('hex');
+const KEY = cardKey();
+const request = { ref: 'lane/size-admission', pr: 5854, base: 'main', sha: HEAD_SHA, body: 'Existing PR description.', repo: 'web-everything/web-everything' };
 const cardResult = { verdict: { num: 9001, id: 'xsplit1', rel: 'backlog/xsplit1-split.md' } };
 function effects(overrides = {}) {
+  // The real producer always supplies frozen evidence and a durable card store.
+  // Keep those contracts in retry fixtures rather than treating an editable body as storage.
+  const cards = new Map();
+  const reader = overrides.diffStat || (() => ({ text: evidence, sha: HEAD_SHA, baseSha: BASE_SHA }));
   return {
-    diffStat: vi.fn(() => ({ text: evidence, sha: 'pinned-sha' })),
-    fileItem: vi.fn(() => cardResult),
-    lookupSplitCard: vi.fn(() => null),
-    publishSplitCard: vi.fn(async () => ({ batched: true, batchRef: 'lane/card-batch-filing-1' })),
     ...overrides,
+    diffStat: vi.fn((input) => {
+      const result = reader(input);
+      return typeof result === 'string' ? { text: result, sha: HEAD_SHA, baseSha: BASE_SHA } : result;
+    }),
+    fileItem: overrides.fileItem || vi.fn((fields) => {
+      const key = /^size-split-key:([a-f0-9]{64})\. /.exec(fields.digest)?.[1];
+      cards.set(key, cardResult.verdict);
+      return cardResult;
+    }),
+    lookupSplitCard: overrides.lookupSplitCard || vi.fn(({ key }) => cards.get(key) || null),
+    publishSplitCard: overrides.publishSplitCard || vi.fn(async () => ({ batched: true, batchRef: 'lane/card-batch-filing-1' })),
   };
 }
 function expectSizeNote(body) {
@@ -83,7 +100,7 @@ describe('shared admission effects', () => {
     expect(result.body).not.toContain(localPath);
     expect(result.body).not.toContain('private diagnostic');
     expect(result.body).toContain('split card not filed (file-item failed)');
-    expect(result.body).toContain('<!-- size-admission:lane%2Fsize-admission - -->');
+    expect(result.body).toContain(`<!-- size-admission:${KEY} -->`);
     expect(io.publishSplitCard).not.toHaveBeenCalled();
   });
 
@@ -120,7 +137,7 @@ describe('shared admission effects', () => {
     const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
     expect(result).toMatchObject({ status: 'over', reviewLabel: 'review:pending' });
     expect(result.body).toContain('split card not filed (file-item failed)');
-    expect(result.body).toContain('<!-- size-admission:lane%2Fsize-admission - -->');
+    expect(result.body).toContain(`<!-- size-admission:${KEY} -->`);
     io.publishSplitCard.mockResolvedValue({ batched: true, batchRef: 'lane/card-batch-filing-1' });
     expectSizeNote((await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, body: result.body })).body);
     expect(io.fileItem).not.toHaveBeenCalled();
@@ -131,7 +148,7 @@ describe('shared admission effects', () => {
       member: { cardId: 'xwinner' }, batchRef: 'lane/card-batch-filing-1' }) });
     const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
     expect(result.body).toContain('split card xwinner filed via lane/card-batch-filing-1');
-    expect(result.body).toContain('<!-- size-admission:lane%2Fsize-admission xwinner -->');
+    expect(result.body).toContain(`<!-- size-admission:${KEY} -->`);
     expect(result.body).not.toContain('split card 9001 filed');
   });
 
@@ -139,7 +156,7 @@ describe('shared admission effects', () => {
     const io = effects({ publishSplitCard: async () => ({ batched: true, deduped: true, member }) });
     const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
     expect(result.body).toContain('split card not filed (file-item failed)');
-    expect(result.body).toContain('<!-- size-admission:lane%2Fsize-admission - -->');
+    expect(result.body).toContain(`<!-- size-admission:${KEY} -->`);
   });
 
   it.each(['a', '界'])('bounds both PR notes and file-item arguments for twelve thousand long %s file groups', async (letter) => {
@@ -171,7 +188,7 @@ describe('shared admission effects', () => {
   it.each(['refusal', 'exception'])('default publisher does not mistake a locally scaffolded card for publication after batch %s', async (mode) => {
     const cwd = mkdtempSync(join(tmpdir(), 'size-split-publish-'));
     mkdirSync(join(cwd, 'backlog'));
-    writeFileSync(join(cwd, cardResult.verdict.rel), `size-split-ref:${encodeURIComponent(request.ref)}. File groups: we:scripts: 301`);
+    writeFileSync(join(cwd, cardResult.verdict.rel), `size-split-key:${KEY}. File groups: we:scripts: 301`);
     vi.mocked(execFileSync).mockReturnValue(''); // absent from the canonical remote base
     vi.mocked(fileIntoBatch).mockImplementation(async () => {
       if (mode === 'exception') throw new Error('publication failed');
@@ -179,13 +196,13 @@ describe('shared admission effects', () => {
     });
     const fileItem = vi.fn();
     try {
-      const result = await sizeAdmission.createSizeAdmissionRunner({ cwd, diffStat: () => evidence, fileItem })(request);
+      const result = await sizeAdmission.createSizeAdmissionRunner({ cwd, diffStat: () => ({ text: evidence, sha: HEAD_SHA, baseSha: BASE_SHA }), fileItem })(request);
       expect(result).toMatchObject({ status: 'over', reviewLabel: 'review:pending' });
       expect(result.body).toContain('split card not filed (file-item failed)');
-      expect(result.body).toContain('<!-- size-admission:lane%2Fsize-admission - -->');
+      expect(result.body).toContain(`<!-- size-admission:${KEY} -->`);
       expect(fileItem).not.toHaveBeenCalled();
       vi.mocked(fileIntoBatch).mockResolvedValue({ batched: true, batchRef: 'lane/card-batch-filing-1' });
-      expectSizeNote((await sizeAdmission.createSizeAdmissionRunner({ cwd, diffStat: () => evidence, fileItem })({ ...request, body: result.body })).body);
+      expectSizeNote((await sizeAdmission.createSizeAdmissionRunner({ cwd, diffStat: () => ({ text: evidence, sha: HEAD_SHA, baseSha: BASE_SHA }), fileItem })({ ...request, body: result.body })).body);
       expect(fileItem).not.toHaveBeenCalled();
     } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
@@ -221,7 +238,7 @@ describe('shared admission effects', () => {
     vi.mocked(fileIntoBatch).mockResolvedValue({ batched: true, batchRef: 'lane/card-batch-filing-1' });
     const exec = vi.fn((command, args, options) => {
       if (command === 'git') {
-        expect(args).toEqual(['ls-tree', '-z', '--full-tree', 'origin/main', '--', expect.stringMatching(/^backlog\//)]);
+        expect(args).toEqual(['ls-tree', '-z', '--full-tree', BASE_SHA, '--', expect.stringMatching(/^backlog\//)]);
         expect(options).toMatchObject({ cwd, timeout: 5000 });
         return '';
       }
@@ -237,7 +254,7 @@ describe('shared admission effects', () => {
       }));
       expect(fields).toEqual({
         title: 'Split PR #5854 into focused changes', kind: 'story', size: '3',
-        digest: expect.stringContaining(`size-split-ref:${encodeURIComponent(request.ref)}. `),
+        digest: expect.stringContaining(`size-split-key:${KEY}. `),
         scope: 'we:scripts/operations/a.mjs,we:scripts/operations/b.mjs,we:docs/agent/a.md',
       });
       const rel = `backlog/${id}-split.md`;
@@ -249,7 +266,7 @@ describe('shared admission effects', () => {
       }));
     });
     vi.mocked(execFileSync).mockImplementation(exec);
-    const run = (body = request.body) => sizeAdmission.createSizeAdmissionRunner({ cwd, diffStat: () => evidence })({ ...request, body });
+    const run = (body = request.body) => sizeAdmission.createSizeAdmissionRunner({ cwd, diffStat: () => ({ text: evidence, sha: HEAD_SHA, baseSha: BASE_SHA }) })({ ...request, body });
     try {
       const first = await run();
       expectSizeNote(first.body);
@@ -257,8 +274,8 @@ describe('shared admission effects', () => {
       expectSizeNote((await run(first.body)).body); // published marker
       expect(exec.mock.calls.filter(([command]) => command === process.execPath)).toHaveLength(1);
       expect(fileIntoBatch).toHaveBeenCalledWith({ laneDir: cwd, cardPath: `backlog/${id}-split.md`,
-        actor: 'mechanical', idemKey: `size-split:${request.ref}`,
-        source: { repo: 'web-everything/web-everything', pr: request.pr, head: request.sha, note: `Split oversized PR ${request.ref}` },
+        actor: 'mechanical', idemKey: `size-split:${KEY}`,
+        source: { repo: 'web-everything/web-everything', pr: request.pr, head: HEAD_SHA, note: `Split oversized PR ${request.ref}` },
       });
     } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
@@ -285,7 +302,7 @@ describe('shared admission effects', () => {
     const io = effects({ fileItem: () => ({ verdict: { id: '9001\n## Injected' } }) });
     const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
     expect(result.body).toContain('split card not filed (file-item failed)');
-    expect(result.body).toContain('<!-- size-admission:lane%2Fsize-admission - -->');
+    expect(result.body).toContain(`<!-- size-admission:${KEY} -->`);
     expect(result.body).not.toContain('Injected');
   });
 
@@ -301,7 +318,7 @@ describe('shared admission effects', () => {
     expect(second.body).toContain(request.body + other);
     expect(second.body).toContain(unrelated);
     expect(second.body.match(/^## Size$/gm)).toHaveLength(2);
-    expect(second.body.match(/<!-- size-admission:lane%2Fsize-admission /g)).toHaveLength(1);
+    expect(second.body.match(new RegExp(`<!-- size-admission:${KEY} -->`, 'g'))).toHaveLength(1);
     expectSizeNote(second.body);
   });
 
@@ -309,7 +326,7 @@ describe('shared admission effects', () => {
     const io = effects();
     const run = sizeAdmission.createSizeAdmissionRunner(io);
     const result = await run(request);
-    expect(result).toMatchObject({ status: 'over', lines: 301, reviewLabel: 'review:pending', sha: 'pinned-sha' });
+    expect(result).toMatchObject({ status: 'over', lines: 301, reviewLabel: 'review:pending', sha: '1111111111111111111111111111111111111111' });
     expect(io.fileItem).toHaveBeenCalledTimes(1);
     const card = io.fileItem.mock.calls[0][0];
     expect(card).toMatchObject({ kind: 'story', size: expect.any(Number) });
@@ -343,14 +360,14 @@ describe('shared admission effects', () => {
     ['reader throws', () => { throw new Error('diff unavailable'); }],
     ['malformed evidence', () => '1\t0\tscripts/a.mjs\0truncated'],
     ['unmeasurable binary', () => '-\t-\tassets/image.png\0'],
-  ])('unreadable diff (%s) proceeds, says size unknown, escalates reviewers and needs no card', async (_name, diffStat) => {
+  ])('unreadable diff (%s) proceeds, says size unknown, escalates reviewers and files conservatively', async (_name, diffStat) => {
     const io = effects({ diffStat: vi.fn(diffStat) });
     const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
     expect(result).toMatchObject({ status: 'unknown', lines: null, reviewLabel: 'review:pending' });
     expect(result.body).toContain('size unknown: extra reviewers requested');
     expect(result.body).toMatch(/file groups/i);
     expect(result.body).toContain(request.body);
-    expect(io.fileItem).not.toHaveBeenCalled();
+    expect(io.fileItem).toHaveBeenCalledOnce();
   });
 
   it('card filing failure still proceeds and escalates with the filing reason in the body', async () => {
@@ -371,26 +388,29 @@ describe('shared admission effects', () => {
     expect(result.body).not.toMatch(/split card (?!not filed)\S+ filed/);
   });
 
-  it('same-ref retries reuse the body marker across fresh runners: one card and one Size section', async () => {
+  it('same-head retries reuse the card store across fresh runners: one card and one Size section', async () => {
     const io = effects();
     const first = await sizeAdmission.createSizeAdmissionRunner(io)(request);
     const second = await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, body: first.body });
     expect(io.fileItem).toHaveBeenCalledTimes(1);
-    expect(io.publishSplitCard).toHaveBeenCalledTimes(1);
+    expect(io.publishSplitCard).toHaveBeenCalledTimes(2);
     expect(second.body.match(/^## Size$/gm)).toHaveLength(1);
     expectSizeNote(second.body);
   });
 
   it('retains confirmed publication through unknown-size retries after the original batch has sealed', async () => {
     const io = effects();
+    delete io.publishSplitCard;
+    vi.mocked(execFileSync).mockReturnValue(`100644 blob ${'a'.repeat(40)}\t${cardResult.verdict.rel}\0`);
+    vi.mocked(fileIntoBatch).mockClear();
+    vi.mocked(fileIntoBatch).mockRejectedValue(new Error('original batch sealed'));
     const first = await sizeAdmission.createSizeAdmissionRunner(io)(request);
-    expect(first.body).toContain('<!-- size-published:lane%2Fsize-admission 9001 -->');
+    expect(first.body).toContain(`<!-- size-published:${KEY} -->`);
     const unknown = await sizeAdmission.createSizeAdmissionRunner(effects({ diffStat: () => { throw new Error('unknown'); } }))({ ...request, body: first.body });
-    io.publishSplitCard.mockRejectedValue(new Error('original batch sealed'));
-    io.lookupSplitCard.mockReturnValue(null);
     const retry = await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, body: unknown.body });
     expectSizeNote(retry.body);
-    expect(io.publishSplitCard).toHaveBeenCalledTimes(1);
+    expect(io.fileItem).toHaveBeenCalledTimes(1);
+    expect(fileIntoBatch).not.toHaveBeenCalled();
     expect(retry.body.match(/<!-- size-published:/g)).toHaveLength(1);
   });
 
@@ -410,8 +430,8 @@ describe('shared admission effects', () => {
       writeFileSync(join(cwd, 'backlog', `${num}-split.md`), fields.digest);
       return { verdict: { num } };
     });
-    const run = (ref) => sizeAdmission.createSizeAdmissionRunner({ cwd, diffStat: () => evidence, fileItem,
-      publishSplitCard: effects().publishSplitCard })({ ...request, ref, pr: null });
+    const run = (ref) => sizeAdmission.createSizeAdmissionRunner({ cwd, diffStat: () => ({ text: evidence, sha: ref === 'lane/foo' ? BASE_SHA : HEAD_SHA, baseSha: BASE_SHA }), fileItem,
+      publishSplitCard: effects().publishSplitCard })({ ...request, ref, pr: null, sha: ref === 'lane/foo' ? BASE_SHA : HEAD_SHA });
     try {
       expect((await run('lane/foobar')).body).toContain('split card 9001 filed');
       expect((await run('lane/foo')).body).toContain('split card 9002 filed');
@@ -428,7 +448,7 @@ describe('shared admission effects', () => {
   it('a different ref cannot inherit another ref’s split-card marker', async () => {
     const io = effects();
     const first = await sizeAdmission.createSizeAdmissionRunner(io)(request);
-    await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, ref: 'lane/other', body: first.body });
+    await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, ref: 'lane/other', pr: 5855, body: first.body });
     expect(io.fileItem).toHaveBeenCalledTimes(2);
   });
 });
@@ -440,10 +460,10 @@ function readerFixture({ numstat = '301\t0\tscripts/a.mjs\0', root = 'repo-top\n
     const value = override(args, options);
     if (value !== undefined) return value;
     if (args.includes('--show-toplevel')) return root;
-    if (args.includes('rev-parse')) return 'resolved-sha\n';
+    if (args.includes('rev-parse')) return args.some((a) => /refs\/(remotes|tags)\/|refs\/heads\/main/.test(a)) ? `${BASE_SHA}\n` : `${HEAD_SHA}\n`;
     if (args.includes('diff')) return numstat;
-    if (args.includes('merge-base')) return 'base-sha\n';
-    if (args.includes('ls-tree')) return `100644 blob ${args.includes('resolved-sha') ? 'a'.repeat(40) : 'b'.repeat(40)}\t${args.at(-1)}\0`;
+    if (args.includes('merge-base')) return '2222222222222222222222222222222222222222\n';
+    if (args.includes('ls-tree')) return `100644 blob ${args.includes('1111111111111111111111111111111111111111') ? 'a'.repeat(40) : 'b'.repeat(40)}\t${args.at(-1)}\0`;
     if (args.includes('cat-file')) return 'code\n';
     throw new Error(`unexpected git read: ${args}`);
   });
@@ -454,14 +474,17 @@ function readerFixture({ numstat = '301\t0\tscripts/a.mjs\0', root = 'repo-top\n
 
 describe('shared reader — retained sha, rename, binary and timeout audits', () => {
   it.each(['origin/main', 'origin/release/stable', 'upstream/main', 'refs/remotes/origin/main', 'refs/heads/main', 'refs/tags/base'])(
-    'preserves qualified base %s despite an origin-prefixed shadow and escalates 301 lines', async (base) => {
+    'qualifies remote base %s despite a shadow, or escalates unknown for a nonremote base', async (base) => {
       const { git, read } = readerFixture({ read: (args) => {
         if (args[0] === 'remote') return 'origin\nupstream\n';
-        if (args.includes('diff')) return args.at(-1) === `${base}...resolved-sha` ? '301\t0\tREADME.md\0' : '';
+        if (args.includes('diff')) return args.includes(`${BASE_SHA}...${HEAD_SHA}`) ? '301\t0\tREADME.md\0' : '';
       } });
       const io = effects({ diffStat: read });
       const result = await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, base });
-      expect(result).toMatchObject({ status: 'over', lines: 301, reviewLabel: 'review:pending' });
+      expect(result).toMatchObject({
+        status: /^refs\/(heads|tags)\//.test(base) ? 'unknown' : 'over',
+        lines: /^refs\/(heads|tags)\//.test(base) ? null : 301, reviewLabel: 'review:pending',
+      });
       expect(io.fileItem).toHaveBeenCalledTimes(1);
       expect(io.publishSplitCard).toHaveBeenCalledTimes(1);
       expect(result.body).toContain('split card 9001 filed');
@@ -470,23 +493,24 @@ describe('shared reader — retained sha, rename, binary and timeout audits', ()
 
   it('keeps a missing qualified base unknown instead of using its origin-prefixed shadow', async () => {
     const { read } = readerFixture({ read: (args) => {
-      if (args.includes('diff')) {
-        if (args.at(-1) === 'origin/missing...resolved-sha') throw new Error('unknown revision');
-        return '';
-      }
+      if (args.some((a) => a.includes('refs/remotes/origin/missing'))) throw new Error('unknown revision');
     } });
     const result = await sizeAdmission.createSizeAdmissionRunner(effects({ diffStat: read }))({ ...request, base: 'origin/missing' });
     expect(result).toMatchObject({ status: 'unknown', lines: null, reviewLabel: 'review:pending' });
   });
 
-  it.each([true, false])('retains remote-first resolution of an unqualified slash branch (remote exists: %s)', (exists) => {
+  it.each([true, false])('resolves the real remote for an unqualified slash branch, failing closed if absent (remote exists: %s)', (exists) => {
     const { git, read } = readerFixture({ read: (args) => {
       if (args[0] === 'remote') return 'origin\nupstream\n';
-      if (args.includes('--quiet') && !exists) throw new Error('no remote branch');
+      if (args.some((a) => a.includes('refs/remotes/origin/release/stable')) && !exists) throw new Error('no remote branch');
     } });
-    read({ base: 'release/stable' });
-    expect(git.mock.calls.find(([args]) => args.includes('diff'))[0].at(-1))
-      .toBe(`${exists ? 'origin/' : ''}release/stable...resolved-sha`);
+    if (exists) {
+      read({ base: 'release/stable' });
+      expect(git.mock.calls.find(([args]) => args.includes('diff'))[0]).toContain(`${BASE_SHA}...${HEAD_SHA}`);
+    } else {
+      expect(() => read({ base: 'release/stable' })).toThrow('no remote branch');
+      expect(git.mock.calls.some(([args]) => args.includes('diff'))).toBe(false);
+    }
   });
 
   it('escalates unknown size when configured remotes cannot be read', async () => {
@@ -500,25 +524,25 @@ describe('shared reader — retained sha, rename, binary and timeout audits', ()
 
   it('pins the measured SHA, roots the diff, clears attributes and disables external diff/textconv', () => {
     const { git, read } = readerFixture();
-    expect(read({ base: 'release', sha: 'moving-ref' })).toEqual({ text: '301\t0\tscripts/a.mjs\0', sha: 'resolved-sha' });
+    expect(read({ base: 'release', sha: 'moving-ref' })).toEqual({ text: '301\t0\tscripts/a.mjs\0', sha: HEAD_SHA, baseSha: BASE_SHA });
     expect(git.mock.calls).toEqual([
-      [['rev-parse', '--verify', 'moving-ref^{commit}']],
-      [['rev-parse', '--verify', '--quiet', 'origin/release']],
+      [['rev-parse', '--verify', '--end-of-options', 'refs/heads/moving-ref^{commit}']],
+      [['rev-parse', '--verify', '--end-of-options', 'refs/remotes/origin/release^{commit}']],
       [['rev-parse', '--show-toplevel']],
-      [['-C', 'repo-top', '-c', 'core.attributesFile=', 'diff', '--no-relative', '--text', '--numstat', '-z', '--find-renames', '--no-ext-diff', '--no-textconv', 'origin/release...resolved-sha'], { timeout: 60_000 }],
+      [['-C', 'repo-top', '-c', 'core.attributesFile=', 'diff', '--no-relative', '--text', '--numstat', '-z', '--find-renames', '--no-ext-diff', '--no-textconv', `${BASE_SHA}...${HEAD_SHA}`, '--'], { timeout: 60_000 }],
     ]);
   });
 
   it('rejects an unresolved commit before reading a diff', () => {
     const { git, read } = readerFixture({ read: () => { throw new Error('not a commit'); } });
     expect(() => read({ sha: 'missing' })).toThrow('not a commit');
-    expect(git.mock.calls).toEqual([[['rev-parse', '--verify', 'missing^{commit}']]]);
+    expect(git.mock.calls).toEqual([[['rev-parse', '--verify', '--end-of-options', 'refs/heads/missing^{commit}']]]);
   });
 
   it.each([' ', '\t', '\r', '\n'])('preserves repository trailing whitespace %j', (suffix) => {
     const root = `repo${suffix}`;
     const { git, read } = readerFixture({ root: `${root}\n` });
-    expect(read().sha).toBe('resolved-sha');
+    expect(read().sha).toBe('1111111111111111111111111111111111111111');
     expect(git.mock.calls.find(([args]) => args.includes('diff'))[0].slice(0, 2)).toEqual(['-C', root]);
   });
 
@@ -530,22 +554,22 @@ describe('shared reader — retained sha, rename, binary and timeout audits', ()
       }
     } });
     const result = read();
-    expect(result).toEqual({ text: '301\t1\tscripts/a.mjs\0', sha: 'resolved-sha' });
+    expect(result).toEqual({ text: '301\t1\tscripts/a.mjs\0', sha: HEAD_SHA, baseSha: BASE_SHA });
     expect(git.mock.calls.filter(([args]) => args.includes('ls-tree')).map(([args]) => args))
       .toEqual([
-        ['-C', 'repo-top', 'ls-tree', '-z', '--full-tree', 'resolved-sha', '--', 'scripts/a.mjs'],
-        ['-C', 'repo-top', 'ls-tree', '-z', '--full-tree', 'base-sha', '--', 'scripts/a.mjs'],
+        ['--literal-pathspecs', '-C', 'repo-top', 'ls-tree', '-z', '--full-tree', '1111111111111111111111111111111111111111', '--', 'scripts/a.mjs'],
+        ['--literal-pathspecs', '-C', 'repo-top', 'ls-tree', '-z', '--full-tree', '2222222222222222222222222222222222222222', '--', 'scripts/a.mjs'],
       ]);
   });
 
   it('binary rename reads the destination at head and source at base, without discarding either path', () => {
     const { git, read } = readerFixture({ numstat: '-\t-\t\0scripts/old.mjs\0scripts/new.mjs\0' });
     expect(read().text).toBe('1\t1\t\0scripts/old.mjs\0scripts/new.mjs\0');
-    expect(git.mock.calls.filter(([args]) => args.includes('ls-tree')).map(([args]) => [args[5], args.at(-1)]))
-      .toEqual([['resolved-sha', 'scripts/new.mjs'], ['base-sha', 'scripts/old.mjs']]);
+    expect(git.mock.calls.filter(([args]) => args.includes('ls-tree')).map(([args]) => [args.find((a) => /^[a-f0-9]{40}$/.test(a)), args.at(-1)]))
+      .toEqual([['1111111111111111111111111111111111111111', 'scripts/new.mjs'], ['2222222222222222222222222222222222222222', 'scripts/old.mjs']]);
   });
 
-  it.each(['resolved-sha', 'base-sha'])('rejects failed binary tree reads at %s', (revision) => {
+  it.each(['1111111111111111111111111111111111111111', '2222222222222222222222222222222222222222'])('rejects failed binary tree reads at %s', (revision) => {
     const { git, read } = readerFixture({ numstat: '-\t-\tscripts/a.mjs\0', read: (args) => {
       if (args.includes('ls-tree') && args.includes(revision)) throw new Error('tree unavailable');
     } });
@@ -560,11 +584,11 @@ describe('shared reader — retained sha, rename, binary and timeout audits', ()
     expect(() => read()).toThrow('blob unavailable');
   });
 
-  it.each(['resolved-sha', 'base-sha'])('accepts a binary addition/deletion only after an empty tree proves the absent side at %s', (revision) => {
+  it.each(['1111111111111111111111111111111111111111', '2222222222222222222222222222222222222222'])('accepts a binary addition/deletion only after an empty tree proves the absent side at %s', (revision) => {
     const { git, read } = readerFixture({ numstat: '-\t-\tscripts/a.mjs\0', read: (args) => {
       if (args.includes('ls-tree') && args.includes(revision)) return '';
     } });
-    expect(read().text).toBe(revision === 'resolved-sha' ? '0\t1\tscripts/a.mjs\0' : '1\t0\tscripts/a.mjs\0');
+    expect(read().text).toBe(revision === '1111111111111111111111111111111111111111' ? '0\t1\tscripts/a.mjs\0' : '1\t0\tscripts/a.mjs\0');
     expect(git.mock.calls.filter(([args]) => args.includes('ls-tree'))).toHaveLength(2);
     expect(git.mock.calls.filter(([args]) => args.includes('cat-file'))).toHaveLength(1);
   });
@@ -586,7 +610,7 @@ describe('shared reader — retained sha, rename, binary and timeout audits', ()
   it('bounds the initial diff to 60 seconds and 64 MB without timing out unrelated git calls', () => {
     const exec = vi.fn((_command, args) => {
       if (args.includes('diff')) throw Object.assign(new Error('git timed out'), { code: 'ETIMEDOUT' });
-      return Buffer.from(args.includes('--show-toplevel') ? 'repo-top\n' : 'resolved-sha\n');
+      return Buffer.from(args.includes('--show-toplevel') ? 'repo-top\n' : '1111111111111111111111111111111111111111\n');
     });
     const read = sizeAdmission.createPrDiffStatReader({ exec, cwd: '.' });
     expect(() => read({ base: 'main', sha: 'HEAD' })).toThrow('git timed out');
@@ -603,9 +627,9 @@ describe('shared reader — retained sha, rename, binary and timeout audits', ()
 function encodedReader({ numstat, root = Buffer.from('repo\n'), entry, blob = Buffer.from('code\n') }) {
   const exec = vi.fn((_command, args, options) => {
     const output = args.includes('--show-toplevel') ? root
-      : args.includes('rev-parse') ? Buffer.from('resolved-sha\n')
+      : args.includes('rev-parse') ? Buffer.from('1111111111111111111111111111111111111111\n')
       : args.includes('diff') ? numstat
-      : args.includes('merge-base') ? Buffer.from('base-sha\n')
+      : args.includes('merge-base') ? Buffer.from('2222222222222222222222222222222222222222\n')
       : args.includes('ls-tree') ? entry ?? Buffer.alloc(0)
       : args.includes('cat-file') ? blob : undefined;
     if (output === undefined) throw new Error(`unexpected git call: ${args}`);
@@ -732,4 +756,253 @@ describe('shared reader — real git evidence', () => {
     expect(result.text).toBe('1\t1\t\0old.mjs\0new.mjs\0');
     expect(sizeAdmission.measureNonTestLines(result.text)).toEqual({ lines: 2, exempt: false });
   }));
+});
+
+
+describe('size admission trust boundaries', () => {
+  const head = '1'.repeat(40), baseSha = '2'.repeat(40);
+  const frozen = { ...request, sha: head, repo: 'owner/repository' };
+  const over = { text: evidence, sha: head, baseSha };
+
+  it('hostile branch names stay inert and bounded at card and PR-body sinks', async () => {
+    const ref = 'lane/`$(touch-pwn)`<img>-->' + '界'.repeat(20_000);
+    const io = effects({ diffStat: () => over });
+    const result = await sizeAdmission.createSizeAdmissionRunner(io)({ ...frozen, pr: null, ref });
+    expect(result.reviewLabel).toBe('review:pending');
+    for (const field of Object.values(io.fileItem.mock.calls[0][0])) {
+      expect(Buffer.byteLength(String(field))).toBeLessThan(16_384);
+      expect(String(field)).not.toMatch(/<img>|`|\$\(/);
+    }
+    expect(Buffer.byteLength(result.body)).toBeLessThan(16_384);
+    expect(result.body).not.toContain('<img>');
+  });
+
+  it.each(['scripts/quote"\\:---\n---\n# {hostile}.mjs', 'scripts/n\u0085l\u2028p\u2029control\u0001\u007f\u009f\ufffe\uffff.mjs  '])(
+    'YAML-breaking filename %j round-trips through the actual file-item renderer', async (path) => {
+    let content;
+    const cwd = mkdtempSync(join(tmpdir(), 'size-yaml-'));
+    mkdirSync(join(cwd, 'backlog'));
+    vi.mocked(execFileSync).mockImplementation((command, args) => {
+      expect(command).toBe(process.execPath);
+      const fields = Object.fromEntries(args.slice(2, -1).map((arg) => {
+        const at = arg.indexOf('=');
+        return [arg.slice(2, at), arg.slice(at + 1)];
+      }));
+      const verdict = planFileItem({ existingIds: [], today: '2026-10-25' }, fields);
+      content = verdict.content;
+      writeFileSync(join(cwd, verdict.rel), content);
+      return JSON.stringify({ verdict });
+    });
+    const io = effects({ cwd, diffStat: () => ({ ...over, text: `301\t0\t${path}\0` }) });
+    delete io.fileItem;
+    try {
+      const result = await sizeAdmission.createSizeAdmissionRunner(io)(frozen);
+      expect(result.body).toMatch(/split card \w+ filed/);
+      const frontmatter = yaml.safeLoad(content.split('\n---\n')[0].slice(4));
+      expect(frontmatter.scope).toEqual([`we:${path}`]);
+      expect(frontmatter.kind).toBe('story');
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it('a trailing newline in a file-item card id cannot reach publication', async () => {
+    const io = effects({ diffStat: () => over, fileItem: () => ({ verdict: { id: '9001\n' } }) });
+    const result = await sizeAdmission.createSizeAdmissionRunner(io)(frozen);
+    expect(io.publishSplitCard).not.toHaveBeenCalled();
+    expect(result.body).toContain('split card not filed (file-item failed)');
+  });
+
+  it('a trailing newline in a file-item card path cannot reach Git or batching', async () => {
+    const io = effects({ diffStat: () => over,
+      fileItem: () => ({ verdict: { id: 'xsplit1', rel: 'backlog/xsplit1-split.md\n' } }) });
+    delete io.publishSplitCard;
+    vi.mocked(execFileSync).mockReturnValue(`100644 blob ${'a'.repeat(40)}\tbacklog/xsplit1-split.md\n\0`);
+    vi.mocked(fileIntoBatch).mockClear();
+    const result = await sizeAdmission.createSizeAdmissionRunner(io)(frozen);
+    expect(result.body).toContain('split card not filed (file-item failed)');
+    expect(execFileSync).not.toHaveBeenCalled();
+    expect(fileIntoBatch).not.toHaveBeenCalled();
+  });
+
+  it('a trailing newline in a returned batch ref cannot enter the PR note', async () => {
+    const io = effects({ diffStat: () => over,
+      publishSplitCard: async () => ({ batched: true, batchRef: 'lane/batch\n' }) });
+    const result = await sizeAdmission.createSizeAdmissionRunner(io)(frozen);
+    expect(result.body).toContain('split card 9001 filed');
+    expect(result.body).not.toContain('via lane/batch');
+  });
+
+  it.each(['\r', '\r\n', '\u2028', '\u2029', '\nextra'])(
+    'trailing suffix %j is rejected for card ids, paths and batch refs', async (suffix) => {
+      const idIo = effects({ diffStat: () => over,
+        fileItem: () => ({ verdict: { id: `9001${suffix}` } }) });
+      const idResult = await sizeAdmission.createSizeAdmissionRunner(idIo)(frozen);
+      expect(idIo.publishSplitCard).not.toHaveBeenCalled();
+      expect(idResult.body).toContain('split card not filed (file-item failed)');
+      expect(idResult.reviewLabel).toBe('review:pending');
+
+      const pathIo = effects({ diffStat: () => over,
+        fileItem: () => ({ verdict: { id: 'xsplit1', rel: `backlog/xsplit1-split.md${suffix}` } }) });
+      delete pathIo.publishSplitCard;
+      vi.mocked(execFileSync).mockReturnValue(`100644 blob ${'a'.repeat(40)}\tbacklog/xsplit1-split.md${suffix}\0`);
+      vi.mocked(fileIntoBatch).mockClear();
+      const pathResult = await sizeAdmission.createSizeAdmissionRunner(pathIo)(frozen);
+      expect(pathResult.body).toContain('split card not filed (file-item failed)');
+      expect(pathResult.reviewLabel).toBe('review:pending');
+      expect(execFileSync).not.toHaveBeenCalled();
+      expect(fileIntoBatch).not.toHaveBeenCalled();
+
+      const refIo = effects({ diffStat: () => over,
+        publishSplitCard: async () => ({ batched: true, batchRef: `lane/batch${suffix}` }) });
+      const refResult = await sizeAdmission.createSizeAdmissionRunner(refIo)(frozen);
+      expect(refResult.body).toContain('split card 9001 filed');
+      expect(refResult.body).not.toContain('via lane/batch');
+      expect(refResult.reviewLabel).toBe('review:pending');
+    });
+
+  it('oversized existing PR text has a bounded output and an explicit human-review fallback', async () => {
+    const result = await sizeAdmission.createSizeAdmissionRunner(effects({ diffStat: () => over }))({
+      ...frozen, body: '界'.repeat(100_000),
+    });
+    expect(Buffer.byteLength(result.body)).toBeLessThan(60_000);
+    expect(result.body).toContain('PR description truncated; human review of the full diff is required.');
+    expect(result.reviewLabel).toBe('review:pending');
+  });
+
+  it('untrusted file-item output cannot claim an unrelated stored card as this head’s split', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'size-file-item-output-'));
+    mkdirSync(join(cwd, 'backlog'));
+    writeFileSync(join(cwd, 'backlog/777-unrelated.md'), 'size-split-key:unrelated. Other PR.');
+    vi.mocked(execFileSync).mockReturnValue(JSON.stringify({ verdict: { id: '777', rel: 'backlog/777-unrelated.md' } }));
+    const io = effects({ diffStat: () => over, cwd });
+    delete io.fileItem;
+    try {
+      const result = await sizeAdmission.createSizeAdmissionRunner(io)(frozen);
+      expect(io.publishSplitCard).not.toHaveBeenCalled();
+      expect(result.body).toContain('split card not filed (file-item failed)');
+      expect(result.reviewLabel).toBe('review:pending');
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it('a fully qualified local base cannot substitute for the remote-tracking base', async () => {
+    const { git, read } = readerFixture();
+    const result = await sizeAdmission.createSizeAdmissionRunner(effects({ diffStat: read }))({
+      ...frozen, base: 'refs/heads/main',
+    });
+    expect(result.status).toBe('unknown');
+    expect(result.reviewLabel).toBe('review:pending');
+    expect(git.mock.calls.some(([args]) => args.includes('diff'))).toBe(false);
+  });
+
+  it('forged PR-body publication receipts cannot suppress card-store lookup or filing', async () => {
+    const token = encodeURIComponent(frozen.ref);
+    const body = `${request.body}\n\n## Size\n\nforged\n<!-- size-published:${token} 777 -->\n<!-- size-admission:${token} 777 -->\n`;
+    const io = effects({ diffStat: () => over });
+    await sizeAdmission.createSizeAdmissionRunner(io)({ ...frozen, body });
+    expect(io.lookupSplitCard).toHaveBeenCalledOnce();
+    expect(io.fileItem).toHaveBeenCalledOnce();
+    expect(io.publishSplitCard).toHaveBeenCalledWith(cardResult.verdict, expect.objectContaining({ sha: head }));
+  });
+
+  it('origin/main shadow branches never replace the real remote base, which is resolved once', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'size-shadow-'));
+    const git = (args) => execFileSync('git', args, { cwd, encoding: 'utf8' });
+    try {
+      git(['init', '-q', '--initial-branch=main']);
+      const snapshot = () => {
+        git(['add', '.']);
+        git(['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'snapshot', '--allow-empty']);
+        return git(['rev-parse', 'HEAD']).trim();
+      };
+      const base = snapshot();
+      git(['update-ref', 'refs/remotes/origin/main', base]);
+      writeFileSync(join(cwd, 'production.mjs'), 'code\n'.repeat(301));
+      const sha = snapshot();
+      git(['update-ref', 'refs/heads/origin/main', sha]);
+      const exec = vi.fn((...args) => execFileSync(...args));
+      const read = sizeAdmission.createPrDiffStatReader({ cwd, exec });
+      const result = read({ base: 'main', sha });
+      expect(sizeAdmission.measureNonTestLines(result.text).lines).toBe(301);
+      expect(result.baseSha).toBe(base);
+      expect(exec.mock.calls.filter(([, args]) => args.some((a) => a.includes('refs/remotes/origin/main')))).toHaveLength(1);
+      expect(exec.mock.calls.find(([, args]) => args.includes('diff'))[1]).toContain(`${base}...${sha}`);
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it('reused branches cannot reuse an unrelated prior card for another repo, PR, or head', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'size-identity-'));
+    mkdirSync(join(cwd, 'backlog'));
+    const fileItem = vi.fn((fields) => {
+      const num = 9100 + fileItem.mock.calls.length;
+      writeFileSync(join(cwd, `backlog/${num}-split.md`), fields.digest);
+      return { verdict: { num } };
+    });
+    const run = (input) => sizeAdmission.createSizeAdmissionRunner({ cwd,
+      diffStat: () => ({ ...over, sha: input.sha }), fileItem,
+      publishSplitCard: effects().publishSplitCard })(input);
+    try {
+      for (const input of [frozen, { ...frozen, pr: 999 }, { ...frozen, sha: '3'.repeat(40) },
+        { ...frozen, repo: 'other/repository' }]) await run(input);
+      expect(fileItem).toHaveBeenCalledTimes(4);
+      await run(frozen);
+      await run({ ...frozen, ref: 'lane/renamed' }); // branch labels are not card identity
+      expect(fileItem).toHaveBeenCalledTimes(4);
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it('oversized file-group summaries bound entry count and bytes and name a human-review fallback', async () => {
+    const text = Array.from({ length: 1000 }, (_, i) => `1\t0\t${i}/a\0`).join('');
+    const io = effects({ diffStat: () => ({ ...over, text }) });
+    const result = await sizeAdmission.createSizeAdmissionRunner(io)(frozen);
+    const fields = io.fileItem.mock.calls[0][0];
+    expect(fields.scope.split(',').length).toBeLessThanOrEqual(100);
+    expect(result.body).toMatch(/and \d+ more/);
+    expect(result.body).toMatch(/human review.*full diff/i);
+    expect(fields.digest).toMatch(/and \d+ more/);
+    expect(Buffer.byteLength(result.body)).toBeLessThan(16_384);
+  });
+
+  it.each(['unreadable', 'ambiguous'])('a %s card store files a fresh card and requests reviewers', async (mode) => {
+    const cwd = mkdtempSync(join(tmpdir(), 'size-card-store-'));
+    if (mode === 'ambiguous') {
+      mkdirSync(join(cwd, 'backlog'));
+      const key = cardKey(frozen.pr, frozen.sha, frozen.repo);
+      for (const id of ['777', '888']) writeFileSync(join(cwd, `backlog/${id}-split.md`), `size-split-key:${key}. Prior filing.`);
+    }
+    const io = effects({ cwd, diffStat: () => over });
+    delete io.lookupSplitCard;
+    try {
+      const result = await sizeAdmission.createSizeAdmissionRunner(io)(frozen);
+      expect(io.fileItem).toHaveBeenCalledOnce();
+      expect(result.reviewLabel).toBe('review:pending');
+      expect(result.body).toContain('split card 9001 filed');
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it('unknown or stale size evidence files conservatively and requests human review', async () => {
+    for (const diffStat of [() => { throw new Error('base unavailable'); },
+      () => ({ ...over, sha: '4'.repeat(40) })]) {
+      const io = effects({ diffStat });
+      const result = await sizeAdmission.createSizeAdmissionRunner(io)(frozen);
+      expect(result).toMatchObject({ status: 'unknown', reviewLabel: 'review:pending' });
+      if (result.sha) expect(result.sha).toBe(frozen.sha);
+      expect(io.fileItem).toHaveBeenCalledOnce();
+      expect(result.body).toMatch(/human review.*full diff/i);
+    }
+  });
+
+  it.each([null, { ref: '\ud800', body: null }, { ...frozen, body: 42 }])(
+    'malformed admission input never throws and requests reviewers (%j)', async (input) => {
+      const io = effects({ diffStat: () => { throw new Error('unknown'); } });
+      await expect(sizeAdmission.createSizeAdmissionRunner(io)(input)).resolves.toMatchObject({
+        status: 'unknown', reviewLabel: 'review:pending',
+      });
+    });
+
+  it('PR-body file groups escape markdown, HTML, controls and comment terminators', async () => {
+    const path = 'scripts/`[click](https:evil)<img>-->\n# injected\u001b.mjs';
+    const io = effects({ diffStat: () => ({ ...over, text: `301\t0\t${path}\0` }) });
+    const result = await sizeAdmission.createSizeAdmissionRunner(io)(frozen);
+    expect(result.body).not.toMatch(/`|\[click\]|<img>|\u001b|\n# injected/);
+    expect(result.body).toContain('extra reviewers requested');
+  });
 });

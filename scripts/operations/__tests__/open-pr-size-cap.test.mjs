@@ -11,7 +11,7 @@ import { REVIEW_LABELS } from '../../lib/review-labels.mjs';
 const argv = ['--ref=lane/size-admission'];
 const opened = { outcome: 'opened', pr: 5854, url: 'https://example.invalid/pull/5854' };
 const text = '200\t0\tdocs/agent/a.md\0' + '101\t0\tdocs/agent/b.md\0';
-const request = { ref: 'lane/size-admission', pr: 5854, base: 'main', sha: 'HEAD', body: 'Describe the change.' };
+const request = { ref: 'lane/size-admission', pr: 5854, base: 'main', sha: '1'.repeat(40), body: 'Describe the change.', repo: 'web-everything/web-everything' };
 const card = { verdict: { num: 9001, id: 'xsplit1', rel: 'backlog/xsplit1-split.md' } };
 
 function wrapper(overrides = {}) {
@@ -27,8 +27,12 @@ function wrapper(overrides = {}) {
 // pr-land and CALLS IT from runCli before forge.create, using its body and verdict
 // in createParams/applyReviewEscalationLabel. All effects here are injected.
 function direct(overrides = {}) {
-  const effects = { diffStat: vi.fn(() => ({ text, sha: 'pinned-sha' })),
-    fileItem: vi.fn(() => card), lookupSplitCard: vi.fn(() => null),
+  const cards = new Map(); // trusted card-store fixture; body markers are advisory
+  const effects = { diffStat: vi.fn(() => ({ text, sha: '1'.repeat(40) })),
+    fileItem: vi.fn((fields) => {
+      cards.set(/^size-split-key:([a-f0-9]{64})/.exec(fields.digest)?.[1], card.verdict);
+      return card;
+    }), lookupSplitCard: vi.fn(({ key }) => cards.get(key) || null),
     publishSplitCard: vi.fn(async () => ({ batched: true, batchRef: 'lane/card-batch-filing-1' })), ...overrides };
   return { effects, run: (input = request) => {
     expect(prLand.admitPrSize, 'direct pr-land must expose its injected admission seam').toBeTypeOf('function');
@@ -179,10 +183,10 @@ describe('open-pr delegates size admission to the direct producer', () => {
   });
 
   it('a reviewed SHA is passed intact to the producer for measurement and publication', () => {
-    const { run, spawn } = wrapper({ prePrReview: () => ({ action: 'pass', sha: 'reviewed-sha' }) });
+    const { run, spawn } = wrapper({ prePrReview: () => ({ action: 'pass', sha: '3333333333333333333333333333333333333333' }) });
     const requested = [...argv, '--sha=HEAD'];
     expect(run({ argv: requested })).toMatchObject(opened);
-    expect(spawn.mock.calls[0][1].filter((arg) => arg.startsWith('--sha='))).toEqual(['--sha=reviewed-sha']);
+    expect(spawn.mock.calls[0][1].filter((arg) => arg.startsWith('--sha='))).toEqual(['--sha=3333333333333333333333333333333333333333']);
     expect(requested).toEqual([...argv, '--sha=HEAD']);
   });
 
@@ -211,7 +215,7 @@ describe('direct pr-land uses the same admission and existing review-label path'
   it('direct pr-land: 301 lines proceed, one card names PR + groups, body notes both, reviewers escalated', async () => {
     const { run, effects } = direct();
     const result = await run();
-    expect(result).toMatchObject({ status: 'over', lines: 301, reviewLabel: REVIEW_LABELS.pending, sha: 'pinned-sha' });
+    expect(result).toMatchObject({ status: 'over', lines: 301, reviewLabel: REVIEW_LABELS.pending, sha: '1111111111111111111111111111111111111111' });
     expect(effects.fileItem).toHaveBeenCalledTimes(1);
     const filed = effects.fileItem.mock.calls[0][0];
     expect(filed.title).toContain('#5854');
@@ -229,18 +233,18 @@ describe('direct pr-land uses the same admission and existing review-label path'
     ['test-only big diff', '1000\t0\tscripts/a.test.mjs\0'],
     ['backlog-only big diff', '1000\t0\tbacklog/a.md\0'],
   ])('direct pr-land: %s needs no size action', async (_name, evidence) => {
-    const { run, effects } = direct({ diffStat: vi.fn(() => evidence) });
+    const { run, effects } = direct({ diffStat: vi.fn(() => ({ text: evidence, sha: request.sha })) });
     expect(await run()).toMatchObject({ status: 'ok', body: request.body, reviewLabel: null });
     expect(effects.fileItem).not.toHaveBeenCalled();
   });
 
-  it('direct pr-land: throwing reader proceeds with size unknown and extra reviewers, no required card', async () => {
+  it('direct pr-land: throwing reader proceeds with size unknown, files conservatively and requests extra reviewers', async () => {
     const { run, effects } = direct({ diffStat: vi.fn(() => { throw new Error('diff unavailable'); }) });
     const result = await run();
     expect(result).toMatchObject({ status: 'unknown', reviewLabel: REVIEW_LABELS.pending });
     expect(result.body).toContain('size unknown: extra reviewers requested');
     expect(result.body).toMatch(/file groups/i);
-    expect(effects.fileItem).not.toHaveBeenCalled();
+    expect(effects.fileItem).toHaveBeenCalledOnce();
     expect(prLand.resolveProducerReviewLabel({ changedFiles: [], diffLines: 0, sizeAdmission: result }))
       .toMatchObject({ label: REVIEW_LABELS.pending, apply: true });
   });
@@ -256,10 +260,10 @@ describe('direct pr-land uses the same admission and existing review-label path'
   });
 
   it('direct pr-land measures the reviewed SHA and returns the pinned publication SHA', async () => {
-    const { run, effects } = direct({ diffStat: vi.fn(() => ({ text, sha: 'reviewed-sha' })) });
-    const result = await run({ ...request, sha: 'reviewed-sha' });
-    expect(effects.diffStat).toHaveBeenCalledWith({ base: 'main', sha: 'reviewed-sha' });
-    expect(result.sha).toBe('reviewed-sha');
+    const { run, effects } = direct({ diffStat: vi.fn(() => ({ text, sha: '3333333333333333333333333333333333333333' })) });
+    const result = await run({ ...request, sha: '3333333333333333333333333333333333333333' });
+    expect(effects.diffStat).toHaveBeenCalledWith({ base: 'main', sha: '3333333333333333333333333333333333333333' });
+    expect(result.sha).toBe('3333333333333333333333333333333333333333');
   });
 
   it('direct pr-land: card failure still proceeds and escalates', async () => {
@@ -352,7 +356,7 @@ describe('pr-land CLI size failure boundaries', () => {
     expect(effects.publishSplitCard).toHaveBeenCalledTimes(1);
     expect(result.createParams.body).toContain('split card not filed (file-item failed)');
     expect(result.sizeAdmission.reviewLabel).toBe(REVIEW_LABELS.pending);
-    expect(result.createParams.body).toContain('<!-- size-admission:lane%2Ftest - -->');
+    expect(result.createParams.body).toMatch(/<!-- size-admission:[a-f0-9]{64} -->/);
     if (prNum != null) expect(forge.editBody).toHaveBeenCalledWith(prNum, result.createParams.body);
   });
 

@@ -150,7 +150,7 @@ describe('prepare guard scope (only prepare-item PRs are guarded)', () => {
       return Buffer.from(`${sha}\n`);
     });
     const read = createPrDiffStatReader({ cwd: '/repo', exec });
-    expect(read({ base: 'main', sha: 'HEAD' })).toEqual({ text, sha });
+    expect(read({ base: 'main', sha: 'HEAD' })).toEqual({ text, sha, baseSha: sha });
     expect(exec).toHaveBeenCalledTimes(4);
     for (const [command, , options] of exec.mock.calls) {
       expect(command).toBe('git');
