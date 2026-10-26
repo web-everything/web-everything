@@ -13,6 +13,13 @@ import { planRenumber } from '../../backlog/renumber-collisions.mjs';
 import { gitBlobOid } from '../git-run.mjs';
 
 const io = vi.hoisted(() => ({ git: null }));
+vi.mock('node:child_process', async (original) => {
+  const actual = await original();
+  // Vitest snapshots named builtin imports; syncBuiltinESMExports only updates
+  // native ESM bindings. Route the Vitest graph through the same fixture too.
+  return { ...actual, execFileSync: (cmd, args, opts) => io.git && cmd === 'git'
+    ? io.git(args, opts) : actual.execFileSync(cmd, args, opts) };
+});
 beforeEach(() => {
   // The drain can be loaded through native ESM as well as Vitest's module graph.
   // Patch the builtin too so every Git call uses this fixture's remote.

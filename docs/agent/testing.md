@@ -1607,7 +1607,11 @@ against the actual deferred-numbering dry run, and test allocation/replay races 
 Refresh canonical evidence before scanning landed `bornAs` identities. Cover a stale checkout
 whose pending hash already landed without reservation refs: identical content deduplicates and
 differing content holds, with no new claim. Fixtures that intercept builtin subprocess calls
-must also reach native ESM imports; restore the builtin and synchronize its exports after each test.
+must cover both Vitest's captured named imports (a module mock) and native ESM bindings
+(a builtin spy plus synchronized exports); restore the builtin and synchronize its exports after each test.
+Review staleness fixtures must use off-path files from the current sandbox import closure.
+Collision healing now pulls `backlog/frontmatter.mjs` onto that path; cover its refusal and
+use `backlog/capacity.mjs` for tolerated unrelated lag in both dispatch modes and the soak.
 Both collision planners refuse to move a `bornAs` card or a reserved source number. Remote-backed
 heals skip reserved and canonical numbers, claim all target gaps atomically before rewriting, and
 refuse for manual repair when no safe gap exists. The manual `yield` command uses the same guards,
