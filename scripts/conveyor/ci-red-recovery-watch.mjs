@@ -255,7 +255,7 @@ export function sweepCiRedRecovery({
   readPriority = () => readMainRedPriority(),
 } = {}) {
   const retrySettings = exhaustedRetrySettings ?? resolveExhaustedRetry();
-  const prs = readOpenPrs({ repo, extraFields: ['labels'] });
+  const prs = readOpenPrs({ repo, extraFields: ['labels', 'baseRefName'] });
   // soak-main-red — judge every REQUIRED check (shared ruleset ∪ classic-protection set when available, else
   // DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS), so a `daemon-soak`-only red PR is refreshed like a `test`-red one.
   // Required checks also judge terminal retry outcomes when the CLI shares green PRs with the next pass.

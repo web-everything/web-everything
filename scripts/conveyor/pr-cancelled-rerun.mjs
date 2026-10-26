@@ -10,7 +10,16 @@ const ioOptions = () => ({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
 const validId = id => /^[1-9]\d*$/.test(String(id)) && Number.isSafeInteger(Number(id));
 const validAttempt = e => e && validId(e.runId) && Number.isFinite(Date.parse(e.retriggeredAt)) &&
   (e.reserved === undefined || typeof e.reserved === 'boolean');
-const rowRunId = row => String(row.detailsUrl || '').match(/\/actions\/runs\/(\d+)/)?.[1];
+const rowRunId = (row, repo) => {
+  try {
+    const url = new URL(row.detailsUrl);
+    if (url.origin !== 'https://github.com' || url.username || url.password || url.search || url.hash) return;
+    const match = url.pathname.match(/^\/([^/]+)\/([^/]+)\/actions\/runs\/(\d+)(?:\/job\/\d+)?\/?$/);
+    if (match && `${match[1]}/${match[2]}`.toLowerCase() === repo.toLowerCase()) return match[3];
+  } catch {
+    // An invalid URL cannot establish which workflow run owns the check.
+  }
+};
 const errorText = error => String(error?.stderr || error?.message || error).slice(0, 500);
 const notSubmitted = error => isGhThrottled(error) || error?.budgetBlocked ||
   /^gh-throttle: GitHub (?:core|graphql) API rate limit exceeded for this identity — shared backoff until [^\r\n]+, call not sent \(#gh-graphql-budget\)\r?$/m.test(String(error?.stderr || ''));
@@ -85,21 +94,14 @@ function sweepLocked({ repo, apply = false, readOpenPrs, requiredChecks, readReq
     refuse('record-unreadable', { error: 'restore the attempt record or inspect PR CI before retrying' });
     return result;
   }
-  let prs, checks;
+  let prs;
   try {
     if (typeof repo !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(repo)) throw Error('repository missing');
-    prs = readOpenPrs({ repo });
+    prs = readOpenPrs({ repo, extraFields: ['baseRefName'] });
     if (!Array.isArray(prs)) throw Error('incomplete PR evidence');
     if (!Number.isInteger(maxPerTick) || maxPerTick < 1) throw Error('invalid per-tick cap');
   } catch {
     refuse('prs-unreadable', { error: 'inspect PR and required-check evidence; retry next tick' });
-    return result;
-  }
-  try {
-    checks = requiredChecks ?? readRequiredChecks({ repo });
-    if (!Array.isArray(checks) || !checks.length || checks.some(c => typeof c !== 'string' || !c)) throw Error('incomplete required set');
-  } catch {
-    refuse('required-set-unreadable', { error: 'inspect live required-check settings; retry next tick' });
     return result;
   }
   let inspected = 0;
@@ -114,6 +116,15 @@ function sweepLocked({ repo, apply = false, readOpenPrs, requiredChecks, readReq
     if (pr?.state && pr.state !== 'OPEN') continue;
     if (!validId(pr?.number) || !/^[a-f\d]{40}$/i.test(sha || '') || !pr.headRefName ||
       !Array.isArray(pr.statusCheckRollup) || pr.requiredCheckReadError) { refuse('pr-evidence-incomplete', detail); continue; }
+    let checks;
+    try {
+      if (typeof pr.baseRefName !== 'string' || !/^[A-Za-z0-9._\/-]+$/.test(pr.baseRefName)) throw Error('unsafe or missing PR base');
+      checks = requiredChecks ?? readRequiredChecks({ repo, branch: pr.baseRefName });
+      if (!Array.isArray(checks) || !checks.length || checks.some(c => typeof c !== 'string' || !c)) throw Error('incomplete required set');
+    } catch {
+      refuse('required-set-unreadable', { ...detail, error: 'inspect PR base and live required-check settings; retry next tick' });
+      continue;
+    }
     const rows = checks.map(name => latestCheckNamed(pr.statusCheckRollup, name));
     const conclusion = row => String(row?.conclusion || row?.state || '').toUpperCase();
     if (rows.some(row => ['QUEUED', 'IN_PROGRESS', 'PENDING', 'WAITING'].includes(row?.status))) {
@@ -137,7 +148,7 @@ function sweepLocked({ repo, apply = false, readOpenPrs, requiredChecks, readReq
     const knownAttempts = previous?.workflows;
     // Avoid spending the read budget on heads whose cancelled workflows are all already recorded.
     const recordedForRow = row => knownAttempts && (Object.hasOwn(knownAttempts, row.workflowName)
-      ? knownAttempts[row.workflowName] : Object.values(knownAttempts).find(a => String(a.runId) === rowRunId(row)));
+      ? knownAttempts[row.workflowName] : Object.values(knownAttempts).find(a => String(a.runId) === rowRunId(row, repo)));
     if (knownAttempts && cancelled.every(row => recordedForRow(row))) {
       for (const attempt of new Set(cancelled.map(recordedForRow))) alreadyAttempted(attempt, detail);
       continue;
@@ -167,8 +178,22 @@ function sweepLocked({ repo, apply = false, readOpenPrs, requiredChecks, readReq
     }
     if (headRuns.some(r => r.status !== 'completed')) { refuse('later-run-exists', detail); continue; }
     if (headRuns.some(r => !validId(r.databaseId))) { refuse('invalid-run-id', detail); continue; }
+    // URL attribution must agree with this head's observed workflow history.
+    // Without a URL, successful historical runs cannot own a cancelled row, but a
+    // second cancelled run makes workflow-name attribution ambiguous.
+    if (cancelled.some(row => {
+      const id = rowRunId(row, repo);
+      if (!id && !row.detailsUrl) return new Set(headRuns.filter(r =>
+        r.workflowName === row.workflowName && r.conclusion === 'cancelled')
+        .map(r => String(r.databaseId))).size > 1;
+      const attributed = headRuns.find(r => String(r.databaseId) === id);
+      return !attributed || (row.workflowName && attributed.workflowName !== row.workflowName);
+    })) {
+      refuse('attribution-contradiction', { ...detail, error: 'inspect check URLs and workflow run history; retry next tick' });
+      continue;
+    }
     const owners = cancelled.map(row => {
-      const id = rowRunId(row);
+      const id = rowRunId(row, repo);
       return row.workflowName || headRuns.find(r => String(r.databaseId) === id)?.workflowName;
     });
     if (owners.some(owner => !owner)) { refuse('workflow-unknown', detail); continue; }
@@ -186,6 +211,11 @@ function sweepLocked({ repo, apply = false, readOpenPrs, requiredChecks, readReq
     }
     const newest = [...new Set(owners)].map(owner => headRuns.filter(r => r.workflowName === owner)
       .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt) || Number(b.databaseId) - Number(a.databaseId))[0]);
+    if (newest.some(target => target?.conclusion === 'cancelled' && cancelled.some((row, index) =>
+      owners[index] === target.workflowName && rowRunId(row, repo) && rowRunId(row, repo) !== String(target.databaseId)))) {
+      refuse('later-run-exists', { ...detail, error: 'wait for rollup to reflect the newest workflow run; retry next tick' });
+      continue;
+    }
     const refusalsBefore = result.refusals.length;
     const ready = [];
     const candidates = newest.filter(target => target && !Object.hasOwn(attempts, target.workflowName) &&

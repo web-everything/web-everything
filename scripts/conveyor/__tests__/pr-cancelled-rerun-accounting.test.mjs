@@ -13,7 +13,7 @@ const run = (workflowName = 'CI', databaseId = 123, headSha = sha) => ({
   createdAt: date, updatedAt: date,
 });
 const pr = (number = 42, headRefOid = sha, workflows = ['CI']) => ({
-  number, headRefOid, headRefName: 'lane/test',
+  number, headRefOid, headRefName: 'lane/test', baseRefName: 'main',
   statusCheckRollup: workflows.map(workflowName => ({ name: workflowName, workflowName,
     __typename: 'CheckRun', status: 'COMPLETED', conclusion: 'CANCELLED', startedAt: date, completedAt: date })),
 });
@@ -30,6 +30,188 @@ function fixture({ initial = {}, prs = [pr()], runs = [run()], checks = ['CI'] }
 }
 
 describe('PR cancelled durable accounting regressions', () => {
+
+  it.each([true, false].flatMap(apply => [
+    `https://github.com/${repo}/actions/runs/123oops`,
+    `https://github.com/${repo}/actions/runs/123/job/1oops`,
+    `https://github.com/${repo}/actions/runs/123/extra`,
+    `https://github.com/${repo}/actions/runs/123/job/1/extra`,
+    `https://github.com/${repo}/actions/runs/123//`,
+    `http://github.com/${repo}/actions/runs/123`,
+    `https://example.com/${repo}/actions/runs/123`,
+    `https://github.com.example.com/${repo}/actions/runs/123`,
+    `https://github.com:444/${repo}/actions/runs/123`,
+    'https://github.com/other/web-everything/actions/runs/123',
+    'https://github.com/web-everything/other/actions/runs/123',
+    `https://github.com/prefix/${repo}/actions/runs/123`,
+    `https://github.com/${repo}/actions/runs/123?job=1`,
+    `https://github.com/${repo}/actions/runs/123#job`,
+    `/${repo}/actions/runs/123`,
+    'not a URL',
+  ].map(detailsUrl => ({ apply, detailsUrl }))))(
+    'refuses unresolvable check URLs without consuming an attempt (apply: $apply, URL: $detailsUrl)',
+    ({ apply, detailsUrl }) => {
+      const head = pr();
+      head.statusCheckRollup[0].detailsUrl = detailsUrl;
+      const f = fixture({ prs: [head] });
+      f.options.apply = apply;
+      expect(f.tick()).toMatchObject({ dispatch: [], applied: [], refusals: [
+        expect.objectContaining({ reason: 'attribution-contradiction', error: expect.stringContaining('retry next tick') }),
+      ] });
+      expect(f.options.readJobs).not.toHaveBeenCalled();
+      expect(f.options.writeRecord).not.toHaveBeenCalled();
+      expect(f.options.rerunFailed).not.toHaveBeenCalled();
+      expect(f.options.emitEvent).not.toHaveBeenCalled();
+      expect(f.record()).toEqual({});
+    },
+  );
+
+  it.each([
+    `https://github.com/${repo}/actions/runs/123`,
+    `https://github.com/${repo}/actions/runs/123/`,
+    `https://github.com/${repo}/actions/runs/123/job/1`,
+    `https://github.com/${repo}/actions/runs/123/job/1/`,
+    `https://github.com/${repo.toUpperCase()}/actions/runs/123`,
+  ])('resolves an exact same-repository run or job URL without workflowName: %s', detailsUrl => {
+    const head = pr();
+    delete head.statusCheckRollup[0].workflowName;
+    head.statusCheckRollup[0].detailsUrl = detailsUrl;
+    const f = fixture({ prs: [head] });
+    f.options.repo = repo.toUpperCase();
+    expect(f.tick()).toMatchObject({
+      dispatch: [expect.objectContaining({ runId: 123 })],
+      applied: [expect.objectContaining({ runId: 123, ok: true })], refusals: [],
+    });
+    expect(f.options.rerunFailed).toHaveBeenCalledTimes(1);
+    expect(f.options.rerunFailed).toHaveBeenCalledWith(123, { repo: repo.toUpperCase() });
+  });
+
+  it.each([true, false].flatMap(apply => [undefined, 'https://github.com/web-everything/web-everything/actions/runs/unknown'].flatMap(detailsUrl =>
+    ['older', 'tied', 'newer'].map(age => ({ apply, detailsUrl, age })))))(
+    'refuses ambiguous cancellation attribution without a resolvable run ID (apply: $apply, URL: $detailsUrl, second run: $age)',
+    ({ apply, detailsUrl, age }) => {
+      const head = pr();
+      if (detailsUrl !== undefined) head.statusCheckRollup[0].detailsUrl = detailsUrl;
+      const second = { ...run('CI', 124), createdAt: age === 'older' ? '2026-10-26T11:00:00Z'
+        : age === 'newer' ? '2026-10-26T13:00:00Z' : date };
+      const f = fixture({ prs: [head], runs: [second, run()] });
+      f.options.apply = apply;
+      expect(f.tick()).toMatchObject({ dispatch: [], applied: [], refusals: [
+        expect.objectContaining({ reason: 'attribution-contradiction', error: expect.stringContaining('retry next tick') }),
+      ] });
+      expect(f.options.readJobs).not.toHaveBeenCalled();
+      expect(f.options.writeRecord).not.toHaveBeenCalled();
+      expect(f.options.rerunFailed).not.toHaveBeenCalled();
+      expect(f.options.emitEvent).not.toHaveBeenCalled();
+      expect(f.record()).toEqual({});
+    },
+  );
+
+  it.each([true, false].flatMap(apply => [false, true].flatMap(tied =>
+    [false, true].map(omitWorkflow => ({ apply, tied, omitWorkflow })))))(
+    'refuses a newer cancelled same-workflow run without submitting either run (apply: $apply, tied: $tied, omit workflow: $omitWorkflow)', ({ apply, tied, omitWorkflow }) => {
+      const head = pr();
+      head.statusCheckRollup[0].detailsUrl = 'https://github.com/web-everything/web-everything/actions/runs/123/job/1';
+      if (omitWorkflow) delete head.statusCheckRollup[0].workflowName;
+      const f = fixture({ prs: [head], runs: [run(), { ...run('CI', 124),
+        createdAt: tied ? date : '2026-10-26T12:01:00Z' }] });
+      f.options.apply = apply;
+      expect(f.tick()).toMatchObject({ dispatch: [], applied: [], refusals: [
+        expect.objectContaining({ reason: 'later-run-exists' }),
+      ] });
+      expect(f.options.readJobs).not.toHaveBeenCalled();
+      expect(f.options.writeRecord).not.toHaveBeenCalled();
+      expect(f.options.rerunFailed).not.toHaveBeenCalled();
+      expect(f.record()).toEqual({});
+    },
+  );
+
+  it.each([true, false].flatMap(apply => ['missing', 'different-workflow'].map(evidence => ({ apply, evidence }))))(
+    'refuses contradictory check attribution ($evidence, apply: $apply)', ({ apply, evidence }) => {
+      const head = pr();
+      head.statusCheckRollup[0].detailsUrl = 'https://github.com/web-everything/web-everything/actions/runs/999/job/1';
+      const f = fixture({ prs: [head], runs: evidence === 'missing' ? [run()] : [run(), run('Other', 999)] });
+      f.options.apply = apply;
+      expect(f.tick()).toMatchObject({ dispatch: [], applied: [], refusals: [
+        expect.objectContaining({ reason: 'attribution-contradiction' }),
+      ] });
+      expect(f.options.readJobs).not.toHaveBeenCalled();
+      expect(f.options.writeRecord).not.toHaveBeenCalled();
+      expect(f.options.rerunFailed).not.toHaveBeenCalled();
+      expect(f.record()).toEqual({});
+    },
+  );
+
+  it('includes the PR base branch in the shared discovery snapshot for the cancelled pass', () => {
+    const readOpenPrs = vi.fn(() => []);
+    watcher.sweepCiRedRecovery({ repo, readOpenPrs, exhaustedRetrySettings: { enabled: false }, readPriority: () => null });
+    expect(readOpenPrs).toHaveBeenCalledWith({ repo, extraFields: expect.arrayContaining(['baseRefName']) });
+  });
+
+  it('reruns a URL-attributed cancelled check without workflowName', () => {
+    const head = pr();
+    delete head.statusCheckRollup[0].workflowName;
+    head.statusCheckRollup[0].detailsUrl = 'https://github.com/web-everything/web-everything/actions/runs/123/job/1';
+    const f = fixture({ prs: [head] });
+    expect(f.tick()).toMatchObject({
+      dispatch: [expect.objectContaining({ runId: 123 })],
+      applied: [expect.objectContaining({ runId: 123, ok: true })], refusals: [],
+    });
+    expect(f.options.rerunFailed).toHaveBeenCalledOnce();
+    expect(f.options.rerunFailed).toHaveBeenCalledWith(123, { repo });
+    expect(f.record()[key()].workflows).toEqual({ CI: attempt(123) });
+  });
+
+  it('refuses a missing URL-attributed run even without workflowName', () => {
+    const head = pr();
+    delete head.statusCheckRollup[0].workflowName;
+    head.statusCheckRollup[0].detailsUrl = 'https://github.com/web-everything/web-everything/actions/runs/999/job/1';
+    const f = fixture({ prs: [head] });
+    expect(f.tick()).toMatchObject({ dispatch: [], applied: [], refusals: [
+      expect.objectContaining({ reason: 'attribution-contradiction' }),
+    ] });
+    expect(f.options.readJobs).not.toHaveBeenCalled();
+    expect(f.options.writeRecord).not.toHaveBeenCalled();
+    expect(f.options.rerunFailed).not.toHaveBeenCalled();
+    expect(f.record()).toEqual({});
+  });
+
+  it('reruns exactly the attributed newest workflow run', () => {
+    const head = pr();
+    head.statusCheckRollup[0].detailsUrl = 'https://github.com/web-everything/web-everything/actions/runs/124/job/1';
+    const f = fixture({ prs: [head], runs: [run(), { ...run('CI', 124), createdAt: '2026-10-26T12:01:00Z' }] });
+    expect(f.tick().dispatch.map(d => d.runId)).toEqual([124]);
+    expect(f.options.rerunFailed).toHaveBeenCalledOnce();
+    expect(f.options.rerunFailed).toHaveBeenCalledWith(124, { repo });
+  });
+
+  it('reads each PR base branch live instead of applying the main required set', () => {
+    const first = { ...pr(), baseRefName: 'release/1.0' };
+    const second = { ...pr(43, 'b'.repeat(40), ['CD']), baseRefName: 'stack/topic' };
+    const f = fixture({ prs: [first, second], runs: [run(), run('CD', 124, 'b'.repeat(40))] });
+    delete f.options.requiredChecks;
+    const readRequiredChecks = vi.fn(({ branch }) => ({ source: 'live', checks: branch === 'release/1.0' ? ['CI'] : ['CD'] }));
+    f.options.readRequiredChecks = args => watcher.readLiveRequiredChecks({ ...args, readRequiredChecks });
+    expect(f.tick().dispatch.map(d => d.runId)).toEqual([123, 124]);
+    expect(readRequiredChecks.mock.calls.map(([args]) => args)).toEqual([
+      { repo, branch: 'release/1.0', ttlMs: 0 }, { repo, branch: 'stack/topic', ttlMs: 0 },
+    ]);
+  });
+
+  it.each([undefined, null, '', 'topic;command', 'topic name', 'topic\nmain', 42])(
+    'refuses missing or unsafe PR base %j before reading required settings', baseRefName => {
+      const f = fixture({ prs: [{ ...pr(), baseRefName }] });
+      f.options.readRequiredChecks = vi.fn(() => ['CI']);
+      expect(f.tick()).toMatchObject({ dispatch: [], applied: [], refusals: [
+        expect.objectContaining({ reason: 'required-set-unreadable', error: expect.stringContaining('retry next tick') }),
+      ] });
+      expect(f.options.readRequiredChecks).not.toHaveBeenCalled();
+      expect(f.options.readRuns).not.toHaveBeenCalled();
+      expect(f.options.writeRecord).not.toHaveBeenCalled();
+      expect(f.options.rerunFailed).not.toHaveBeenCalled();
+    },
+  );
+
   it.each(['fallback', 'declared', 'stale-cache', 'cache', 'unavailable', 'mystery', undefined])(
     'refuses required-check provenance %s without reserving any workflow', source => {
       const f = fixture();
@@ -107,7 +289,7 @@ describe('PR cancelled durable accounting regressions', () => {
     expect(result).toMatchObject({ dispatch: [], applied: [], refusals: [
       expect.objectContaining({ reason: 'required-set-unreadable', error: expect.stringContaining('retry next tick') }),
     ] });
-    expect(f.options.readRequiredChecks).toHaveBeenCalledWith({ repo });
+    expect(f.options.readRequiredChecks).toHaveBeenCalledWith({ repo, branch: 'main' });
     expect(f.record()).toEqual({});
     expect(f.options.readRuns).not.toHaveBeenCalled();
     expect(f.options.readJobs).not.toHaveBeenCalled();
@@ -121,7 +303,7 @@ describe('PR cancelled durable accounting regressions', () => {
     delete f.options.requiredChecks;
     f.options.readRequiredChecks = vi.fn(() => ['CI']);
     expect(f.tick().dispatch.map(d => d.runId)).toEqual([123]);
-    expect(f.options.readRequiredChecks).toHaveBeenCalledWith({ repo });
+    expect(f.options.readRequiredChecks).toHaveBeenCalledWith({ repo, branch: 'main' });
   });
 
   it('honours an explicit required set without consulting the live reader', () => {
