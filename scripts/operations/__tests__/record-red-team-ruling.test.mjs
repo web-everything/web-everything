@@ -1,20 +1,27 @@
 /** Cap-held card rulings: declaration and retry-safe automatic filing, with injected IO. */
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createActionStore } from '../action-store.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, operatorRulingsOnLiveResult, redTeamGateMarker, readRedTeamDisposition, readOperatorRulings, liveResultGateState, gateRoundGrants } from '../../lib/red-team-gate.mjs';
-import { assertRulingCardInputFits, planRedTeamRuling, rulableBreaks, selectBreaks, recordRedTeamRulingOperation, buildRuleReasonComment, RED_TEAM_RULING_CARD_EFFECT } from '../record-red-team-ruling.mjs';
+import * as redTeamGate from '../../lib/red-team-gate.mjs';
+import { buildVerdictCarriedMarker } from '../../lib/review-verdict-carried-marker.mjs';
+import { assertRulingCardInputFits, planRedTeamRuling, rulableBreaks, selectBreaks, recordRedTeamRulingOperation, buildRuleReasonComment, RED_TEAM_RULING_CARD_EFFECT, RED_TEAM_RULING_BLOCK_EFFECT, RED_TEAM_RULING_NOT_REAL_EFFECT } from '../record-red-team-ruling.mjs';
 import { assertHumanOperator, operatorBoundComments } from '../../lib/operator-identity.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 import { runCardLandingWithReceipt, createRecordRedTeamRulingSinks, spawnStableCardJob } from '../record-red-team-ruling-io.mjs';
-import { cardJobKey, conflictingPendingCardJobs, rulingCardResource } from '../record-red-team-ruling.mjs';
+import { blockRulingId, cardJobKey, conflictingPendingCardJobs, rulingCardResource } from '../record-red-team-ruling.mjs';
 import { applyRedTeamGate } from '../red-team-gate-apply.mjs';
 import { parseAdvisories, trustedAdvisoryComments } from '../../lib/advisory-labels.mjs';
 import { parseLandPreventionCardArgv, runLandPreventionCardCli } from '../land-prevention-card.mjs';
 import { parseFilingItems, planDedupe } from '../../lib/card-dedupe.mjs';
+
+const ledgerIO = (rows = []) => ({
+  readEvents: async () => ({ status: 'ok', rows: [...rows] }),
+  appendEvents: async events => { rows.push(...events); },
+});
 
 const repo = 'o/r';
 const PR = 5530;
@@ -1188,7 +1195,7 @@ const OFF = { value: { anyState: false }, sources: { anyState: 'env' } };
 
 describe('operator ruling in ANY state (live #5502 shape: sent back at repair cap 11/10, operator "5502 approved")', () => {
   function fake({ initial, liveHead, labels }) {
-    const comments = [...initial], posted = [], cards = [], labelSyncs = [];
+    const comments = [...initial], posted = [], cards = [], labelCalls = [], labelSyncs = [];
     const sinks = createRecordRedTeamRulingSinks({
       readThread: () => ({ headRefOid: liveHead, labels, comments: [...comments] }),
       readScope: () => ({ value: { anyState: true } }),
@@ -1199,9 +1206,11 @@ describe('operator ruling in ANY state (live #5502 shape: sent back at repair ca
         posted.push(body);
         comments.push({ author: OP, createdAt: '2026-10-21T20:30:00Z', body });
       },
+      runSetLabel: (_exe, args) => { labelCalls.push(args); return '{"ok":true}'; },
+      ...ledgerIO(),
       syncLabels: args => { labelSyncs.push(args); return { add: null, remove: [] }; },
     });
-    return { sinks, comments, posted, cards, labelSyncs };
+    return { sinks, comments, posted, cards, labelCalls, labelSyncs };
   }
   const H = '61782334289124cd4fcb51d0bdadb6ef3c795e82';
   const P = 5502;
@@ -1273,6 +1282,15 @@ describe('operator ruling in ANY state (live #5502 shape: sent back at repair ca
     const body = `${redTeamGateMarker(P, H, 'operator-card', rid)}\n**Red-team gate** operator ruling on head \`x\`:\n- 1 finding(s) carded by the operator to \`${CARD}\` (#1).`;
     expect(disp([...live, { author: { login: 'chalbert' }, createdAt: '2026-10-21T20:00:00Z', body }], false).sendBack.map((x) => x.index)).toEqual([1]);
   });
+  it('block after a card keeps blocking: the operator-block record re-holds the break', async () => {
+    const f = fake({ initial: live, liveHead: H, labels: LABELS });
+    f.sinks[RED_TEAM_RULING_CARD_EFFECT](planRedTeamRuling(r5502(), in5502({ break: '#1' })));
+    expect(disp(f.comments).sendBack).toEqual([]);
+    const b = planRedTeamRuling(r5502({ comments: f.comments }), in5502({ break: '#1', ruling: 'block', card: undefined }));
+    await expect(f.sinks[RED_TEAM_RULING_BLOCK_EFFECT](b)).resolves.toMatchObject({ sentBack: true, alreadyUnderChanges: true });
+    expect(f.labelCalls).toEqual([]); // already under review:changes: no second send-back
+    expect(disp(f.comments).sendBack.map((x) => x.index)).toEqual([1]);
+  });
   it('a new head re-evaluates: the ruling does not carry to it', () => {
     const f = fake({ initial: live, liveHead: H, labels: LABELS });
     f.sinks[RED_TEAM_RULING_CARD_EFFECT](planRedTeamRuling(r5502(), in5502()));
@@ -1290,6 +1308,15 @@ describe('operator ruling in ANY state (live #5502 shape: sent back at repair ca
     const comments = [bot(renderRedTeamComment({ pr: P, rev: H, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
       findings: [{ ...F(159, 'broken', 'unconfirmed'), confirmedByRecheck: false }] }), '2026-10-21T17:07:55Z')];
     expect(() => planRedTeamRuling(r5502({ comments }), in5502({ break: '1' }))).toThrow(/no confirmed red-team break/);
+  });
+  it('refusals: not-real needs --cause, --card only with card, an unreadable card, a non-operator', () => {
+    expect(() => planRedTeamRuling(r5502({ card: null }), in5502({ ruling: 'not-real', card: undefined }))).toThrow(/requires --cause/);
+    expect(() => planRedTeamRuling(r5502(), in5502({ ruling: 'block' }))).toThrow(/--card applies only/);
+    expect(() => planRedTeamRuling(r5502({ card: null }), in5502({ ruling: 'block', card: undefined, cause: 'other' }))).toThrow(/--cause applies only/);
+    expect(() => planRedTeamRuling(r5502({ card: { requested: 'x', ref: null, readable: false, reason: 'nope' } }), in5502())).toThrow(/does not resolve to a readable/);
+    expect(() => planRedTeamRuling(r5502(), in5502({ actor: 'auto-policy' }))).toThrow(/registered operator login/);
+    expect(() => planRedTeamRuling(r5502({ identity: { login: 'plateau-reviewer[bot]', type: 'Bot' } }), in5502())).toThrow(/not a human account/);
+    expect(planRedTeamRuling(r5502({ card: null }), in5502({ ruling: 'not-real', card: undefined, cause: 'test-nit', break: '2' }))).toMatchObject({ cause: 'test-nit', indices: [2] });
   });
   it('the setting cascade: default off, file and env opt in, each with its source', async () => {
     const { resolveOperatorRulings } = await import('../../lib/red-team-gate.mjs');
@@ -1481,4 +1508,759 @@ describe('ruling scope binding and provenance', () => {
     expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](planRedTeamRuling(read(), input()))).toThrow(/not parked at the round cap.*nothing written/);
     expect(posted).toEqual([]);
   });
+});
+
+describe('block and not-real rulings', () => {
+  const read = (over = {}) => ({ scope: { value: { anyState: true } }, identity: OP, head: HEAD, labels: [{ name: 'review:human' }], comments: thread(), setting: CONFIRMED_BREAKS_DEFAULTS, now: '2026-10-20T20:55:00-04:00', ...over });
+  const input = (over = {}) => ({ repo, pr: PR, break: '1', ruling: 'card', actor: 'chalbert', channel: 'claude-code-chat', reason: 'card it, ship the PR', ...over });
+  function fake({ cardOk = true, postFails = null, liveHead = HEAD, labels = [], identity = OP, author = 'chalbert', claims, noPid = false, initial, sharedBreaks, attemptFails = false, receiptFails = false, ledgerFails = false } = {}) {
+    const comments = initial ? [...initial] : thread();
+    const posted = [], cards = [], labelCalls = [], labelSyncs = [], events = [], warnings = [];
+    const attempts = new Set();
+    const gens = new Map(), receipts = new Set(), breakOwners = sharedBreaks ?? new Map();
+    let clock = 1_000_000;
+    const memClaims = {
+      claim: (k) => { if (!gens.has(k)) { gens.set(k, { gen: 0, at: clock }); return { created: true, gen: 0, at: clock }; } return { created: false, ...gens.get(k) }; },
+      reclaim: (k, g) => { if (gens.get(k).gen !== g) return false; gens.set(k, { gen: g + 1, at: clock }); return true; },
+      spawned: (k) => receipts.has(k), markSpawned: (k) => { if (receiptFails) throw new Error('receipt write failed'); receipts.add(k); }, now: () => clock,
+      attempted: (k) => attempts.has(k), markAttempt: (k) => { if (attemptFails) throw new Error('disk full'); if (attempts.has(k)) return false; attempts.add(k); return true; }, clearAttempt: (k) => attempts.delete(k),
+      claimBreak: (k, job) => { if (!breakOwners.has(k)) breakOwners.set(k, job); return breakOwners.get(k); },
+    };
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: liveHead, labels, comments: [...comments] }),
+      readScope: () => ({ value: { anyState: true } }),
+      readStandingRulingScope: () => null, resolveIdentity: () => identity,
+      claims: claims ?? memClaims,
+      fileCard: (c, session) => { cards.push(c); if (!cardOk) return { ok: false, error: 'spawn failed' }; return { ok: true, session, handle: noPid ? undefined : 'pid:4242' }; },
+      post: (r, n, body) => { if (postFails?.(body)) throw new Error('gh down'); posted.push(body); comments.push({ author: { login: author }, createdAt: '2026-10-20T23:55:00Z', body }); },
+      runSetLabel: (exe, args) => { labelCalls.push(args); labels.push('review:changes'); return '{"ok":true}'; },
+      readEvents: async () => ({ status: 'ok', rows: [...events] }),
+      appendEvents: async rows => { if (ledgerFails) throw new Error('ledger unavailable'); events.push(...rows); }, warn: m => warnings.push(m), syncLabels: (a) => { labelSyncs.push(a); return { add: null, remove: [] }; },
+    });
+    return { sinks, posted, cards, labelCalls, labelSyncs, events, warnings, comments, memClaims, advance: (ms) => { clock += ms; } };
+  }
+  const payloadFor = (over = {}, readOver = {}) => planRedTeamRuling(read(readOver), input(over));
+  const heldAfter = (comments) => readRedTeamDisposition({ comments: operatorBoundComments(comments), pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } }).held;
+
+  // A new sink instance on every run; only these simulated durable stores survive a restart.
+  function machine(over = {}) {
+    const state = { head: HEAD, labels: ['review:changes'], comments: thread(), events: [],
+      posts: [], appends: [], labelsWritten: 0, ...over };
+    const plan = () => payloadFor({ ruling: 'block' }, { head: state.head, comments: state.comments, labels: state.labels });
+    const run = (p = plan()) => createRecordRedTeamRulingSinks({
+      readThread: () => { state.onRead?.(); return { headRefOid: state.head, labels: state.labels && [...state.labels], comments: [...state.comments] }; },
+      readScope: () => ({ value: { anyState: true } }), readStandingRulingScope: () => null,
+      resolveIdentity: () => OP,
+      readEvents: async () => {
+        state.onLedgerRead?.();
+        return state.ledgerUnreadable ? { status: 'unreadable', error: 'disk unavailable' } : { status: 'ok', rows: [...state.events] };
+      },
+      appendEvents: async rows => { state.beforeAppend?.(); state.appends.push(rows); state.events.push(...rows); state.afterAppend?.(); },
+      post: (_repo, _pr, body) => {
+        state.beforePost?.(body);
+        state.posts.push(body);
+        state.comments.push({ author: OP, createdAt: '2026-10-21T00:00:00Z', body });
+        state.afterPost?.(body);
+      },
+      runSetLabel: () => { state.labelsWritten++; state.labels = ['review:changes']; return '{"ok":true}'; },
+      syncLabels: () => null,
+    })[RED_TEAM_RULING_BLOCK_EFFECT](p);
+    return { state, plan, run };
+  }
+
+  it('block with failed reason POST re-holds a not-real-released finding and resumes without redoing completed steps', async () => {
+    const m = machine({ comments: thread([notRealRecord()]), beforePost: body => {
+      if (body.includes('**Operator ruling on')) throw new Error('reason POST failed');
+    } });
+    expect(heldAfter(m.state.comments)).toEqual([]);
+    const p = m.plan();
+    await expect(m.run(p)).rejects.toThrow('reason POST failed');
+    expect(m.state.events).toHaveLength(1);
+    expect(m.state.posts).toHaveLength(1);
+    expect(m.state.posts[0]).toContain('outcome=operator-block');
+    expect(heldAfter(m.state.comments).map(f => f.index)).toEqual([1]);
+    expect(m.plan().resultId).toBe(p.resultId);
+    m.state.beforePost = null;
+    await expect(m.run()).resolves.toMatchObject({ sentBack: true, rulingId: blockRulingId(p) });
+    expect(m.state.posts).toHaveLength(2);
+    expect(m.state.posts[0]).toContain(`ruling=${blockRulingId(p)}`);
+    expect(m.state.posts[1]).toContain('**Operator ruling on');
+    await m.run();
+    expect(m.state.posts).toHaveLength(2);
+    expect(m.state.appends).toHaveLength(1);
+    expect(m.state.labelsWritten).toBe(0);
+  });
+
+  it('block with failed ledger append re-holds a not-real-released finding and retry resumes without duplicates', async () => {
+    const m = machine({ comments: thread([notRealRecord()]), labels: ['review:accepted'],
+      beforeAppend: () => { throw new Error('ledger unavailable'); } });
+    expect(heldAfter(m.state.comments)).toEqual([]);
+    await expect(m.run()).rejects.toThrow(/ledger-write-miss.*ledger unavailable/);
+    expect(m.state.posts).toHaveLength(1);
+    expect(m.state.posts[0]).toContain('outcome=operator-block');
+    expect(heldAfter(m.state.comments).map(f => f.index)).toEqual([1]);
+    expect(m.state.events).toEqual([]);
+    expect(m.state.labelsWritten).toBe(0);
+    m.state.beforeAppend = null;
+    await expect(m.run()).resolves.toMatchObject({ sentBack: true });
+    await expect(m.run()).resolves.toMatchObject({ sentBack: true });
+    expect(m.state.posts).toHaveLength(2);
+    expect(m.state.posts[1]).toContain('**Operator ruling on');
+    expect(m.state.events).toHaveLength(1);
+    expect(m.state.appends).toHaveLength(1);
+    expect(m.state.labelsWritten).toBe(1);
+    expect(heldAfter(m.state.comments).map(f => f.index)).toEqual([1]);
+  });
+
+  it.each(['beforePost', 'afterPost'])('block resumes a failed hold POST (%s) without duplicate holds or premature writes', async hook => {
+    const m = machine({ [hook]: body => {
+      if (body.includes('outcome=operator-block')) throw new Error('hold POST failed');
+    } });
+    await expect(m.run()).rejects.toThrow('hold POST failed');
+    expect(m.state.posts).toHaveLength(hook === 'afterPost' ? 1 : 0);
+    expect(m.state.events).toEqual([]);
+    expect(m.state.appends).toEqual([]);
+    expect(m.state.labelsWritten).toBe(0);
+    m.state[hook] = null;
+    await expect(m.run()).resolves.toMatchObject({ sentBack: true });
+    await m.run();
+    expect(m.state.posts).toHaveLength(2);
+    expect(m.state.posts[0]).toContain('outcome=operator-block');
+    expect(m.state.posts[1]).toContain('**Operator ruling on');
+    expect(m.state.appends).toHaveLength(1);
+    expect(m.state.events).toHaveLength(1);
+  });
+
+  it('ledger has no double append on retry after an ambiguous successful append', async () => {
+    const m = machine({ afterAppend: () => { throw new Error('lost acknowledgement'); } });
+    await expect(m.run()).rejects.toThrow(/ledger-write-miss.*lost acknowledgement/);
+    expect(m.state.posts).toHaveLength(1);
+    expect(m.state.posts[0]).toContain('outcome=operator-block');
+    m.state.afterAppend = null;
+    await m.run();
+    expect(m.state.events).toHaveLength(1);
+    expect(m.state.appends).toHaveLength(1);
+    expect(m.state.posts).toHaveLength(2);
+    const p = m.plan();
+    expect(blockRulingId({ ...p, indices: [2, 1] })).toBe(blockRulingId({ ...p, indices: [1, 2] }));
+  });
+
+  it('block refuses unreadable ledger after the safe hold, and unreadable labels before any writes', async () => {
+    for (const over of [{ ledgerUnreadable: true }, { labels: null }]) {
+      const m = machine(over);
+      await expect(m.run()).rejects.toThrow(/ledger unreadable|unreadable thread or labels/);
+      if (over.ledgerUnreadable) {
+        expect(m.state.posts).toHaveLength(1);
+        expect(m.state.posts[0]).toContain('outcome=operator-block');
+        expect(heldAfter(m.state.comments).map(f => f.index)).toEqual([1]);
+      } else expect(m.state.posts).toEqual([]);
+      expect(m.state.appends).toEqual([]);
+      expect(m.state.labelsWritten).toBe(0);
+    }
+  });
+
+  it('stale label snapshot: block rereads labels after ledger and reason writes', async () => {
+    const m = machine({ afterAppend: () => { m.state.labels = ['review:accepted']; },
+      afterPost: body => { if (body.includes('outcome=operator-block')) m.state.labels = ['review:human']; } });
+    const p = m.plan();
+    expect(p.underChanges).toBe(true);
+    await m.run(p);
+    expect(m.state.labelsWritten).toBe(1);
+    expect(m.state.labels).toEqual(['review:changes']);
+  });
+
+  it('block completion checks labels freshly after the final ledger read and remains resumable', async () => {
+    const m = machine({ onLedgerRead: () => {
+      if (m.state.posts.length === 2) m.state.labels = ['review:accepted'];
+    } });
+    await expect(m.run()).rejects.toThrow(/block incomplete.*retry/);
+    m.state.onLedgerRead = null;
+    await m.run();
+    expect(m.state.labelsWritten).toBe(1);
+    expect(m.state.posts).toHaveLength(2);
+    expect(m.state.events).toHaveLength(1);
+  });
+
+  it('block retries a partially persisted multi-finding intent without appending the first key twice', async () => {
+    const m = machine({ comments: [redTeam(HEAD, [1, 2].map(index => ({ summary: `Break ${index}`, category: 'edge-case',
+      impactIfUnfixed: 'broken', file: 'x.mjs', line: index, confirmedByRecheck: true }))), capped()],
+      afterAppend: () => { m.state.events.pop(); throw new Error('second event failed'); } });
+    const p = payloadFor({ ruling: 'block', break: '2,1' }, { comments: m.state.comments });
+    await expect(m.run(p)).rejects.toThrow(/ledger-write-miss/);
+    expect(m.state.posts).toHaveLength(1);
+    expect(m.state.posts[0]).toContain('outcome=operator-block');
+    m.state.afterAppend = null;
+    await m.run({ ...p, indices: [1, 2] });
+    expect(m.state.appends.map(rows => rows.length)).toEqual([2, 1]);
+    expect(new Set(m.state.events.map(e => e.id)).size).toBe(2);
+    expect(m.state.posts).toHaveLength(2);
+    expect(heldAfter(m.state.comments).map(f => f.index)).toEqual([1, 2]);
+  });
+
+  it('repair-cap path stays resumable and ruled correctly after the reason is durable', async () => {
+    const m = machine({ comments: [redTeam()], labels: ['review:changes', 'review-round:11'],
+      afterPost: body => { if (body.includes('**Operator ruling on')) throw new Error('reason acknowledgement lost'); } });
+    await expect(m.run()).rejects.toThrow('reason acknowledgement lost');
+    expect(m.state.posts).toHaveLength(2);
+    expect(m.plan().atCap).toBe(false);
+    m.state.afterPost = null;
+    await m.run();
+    expect(m.state.posts).toHaveLength(2);
+    expect(m.state.events).toHaveLength(1);
+    expect(operatorRulingsOnLiveResult(m.state.comments, PR, HEAD).blocked).toEqual(new Set([1]));
+    expect(readRedTeamDisposition({ comments: m.state.comments, pr: PR, head: HEAD }).sendBack.map(f => f.index)).toEqual([1]);
+  });
+
+  it.each(['head', 'result'])('superseded block does not apply to a new %s', async kind => {
+    const m = machine();
+    const old = m.plan();
+    await m.run(old);
+    if (kind === 'head') m.state.head = OTHER;
+    const next = redTeam(m.state.head, [{ summary: 'New degraded finding', category: 'edge-case', impactIfUnfixed: 'degraded',
+      file: 'next.mjs', line: 2, confirmedByRecheck: true }]);
+    next.createdAt = '2026-10-21T01:00:00Z';
+    m.state.comments.push(next);
+    const d = readRedTeamDisposition({ comments: m.state.comments, pr: PR, head: m.state.head });
+    expect(d.held).toEqual([]);
+    expect(d.sendBack).toEqual([]);
+    expect(operatorRulingsOnLiveResult(m.state.comments, PR, m.state.head).blocked.size).toBe(0);
+    await expect(m.run(old)).rejects.toThrow(/head moved|result on the live head changed/);
+    expect(m.state.posts).toHaveLength(2);
+    expect(m.state.events).toHaveLength(1);
+    expect(blockRulingId(m.plan())).not.toBe(blockRulingId(old));
+  });
+
+  it.each(['head', 'result'])('block-specific %s change during reason POST rejects further writes', async kind => {
+    const m = machine({ afterPost: body => {
+      if (!body.includes('**Operator ruling on')) return;
+      if (kind === 'head') m.state.head = OTHER;
+      else m.state.comments.push({ ...redTeam(HEAD, [{ summary: 'Replacement', category: 'edge-case', impactIfUnfixed: 'broken',
+        file: 'next.mjs', line: 2, confirmedByRecheck: true }]), createdAt: '2026-10-21T01:00:00Z' });
+    } });
+    await expect(m.run()).rejects.toThrow(/head moved|result on the live head changed/);
+    expect(m.state.posts).toHaveLength(2);
+    expect(m.state.labelsWritten).toBe(0);
+  });
+
+  const rulingRecord = (outcome, line, human = true, at = '2026-10-20T23:55:00Z') => ({
+    author: human ? OP : { login: 'web-everything' }, createdAt: at,
+    body: `${redTeamGateMarker(PR, HEAD, outcome, liveResultGateState(thread(), PR, HEAD).resultId)}\n**Red-team gate** ruling:\n${line}`,
+  });
+  const blockRecord = () => rulingRecord('operator-block', '- 1 confirmed break(s) sent back to the fixer (#1).');
+  const notRealRecord = () => rulingRecord('operator-not-real', '- 1 finding(s) left advisory (#1).', true, '2026-10-20T23:50:00Z');
+  const automaticCard = () => rulingRecord('card-queued', '- 1 finding(s) filed as a follow-up card (#1).', false);
+
+  it('older not-real cannot release a newer block even when records arrive out of order', () => {
+    for (const records of [[notRealRecord(), blockRecord()], [blockRecord(), notRealRecord()]]) {
+      expect(heldAfter(thread(records)).map(f => f.index)).toEqual([1]);
+    }
+  });
+
+  it.each([false, true])('a completed block survives an older not-real suspended at its ledger append (anyState=%s)', async anyState => {
+    const comments = thread(), labels = [], events = [], posted = [], syncs = [];
+    const scope = { value: { anyState } };
+    const plan = ruling => payloadFor({ ruling, ...(ruling === 'not-real' ? { cause: 'other' } : {}) },
+      { comments, labels, scope });
+    const older = plan('not-real'), newer = plan('block');
+    let resumeAppend, signalAppend;
+    const appendPaused = new Promise(resolve => { signalAppend = resolve; });
+    const appendResumed = new Promise(resolve => { resumeAppend = resolve; });
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: HEAD, labels: [...labels], comments: [...comments] }),
+      readScope: () => scope, readStandingRulingScope: () => null, resolveIdentity: () => OP,
+      readEvents: async () => ({ status: 'ok', rows: [...events] }),
+      appendEvents: async rows => {
+        events.push(...rows);
+        if (rows.some(row => row.ruling === 'not-real')) {
+          signalAppend();
+          await appendResumed;
+        }
+      },
+      post: (_repo, _pr, body) => { posted.push(body); comments.push({ author: OP, body }); },
+      runSetLabel: () => { labels.push('review:changes'); return '{"ok":true}'; },
+      syncLabels: p => { syncs.push(p); return null; },
+    });
+    const pending = sinks[RED_TEAM_RULING_NOT_REAL_EFFECT](older);
+    const rejected = expect(pending).rejects.toThrow(/live operator block takes precedence/);
+    await appendPaused;
+    try {
+      await expect(sinks[RED_TEAM_RULING_BLOCK_EFFECT](newer)).resolves.toMatchObject({ sentBack: true });
+    } finally {
+      resumeAppend();
+    }
+    await rejected;
+    expect(events.map(row => row.ruling)).toEqual(['not-real', 'block']);
+    expect(posted.some(body => body.includes('outcome=operator-not-real'))).toBe(false);
+    expect(heldAfter(comments).map(f => f.index)).toEqual([1]);
+    expect(labels).toEqual(['review:changes']);
+    expect(syncs).toHaveLength(1); // Only the completed block may synchronize status.
+  });
+
+  it('precedence is operator block > operator not-real > automatic card regardless of record order', () => {
+    const block = blockRecord(), notReal = notRealRecord(), card = automaticCard();
+    for (const records of [[block, notReal, card], [block, card, notReal], [notReal, block, card],
+      [notReal, card, block], [card, block, notReal], [card, notReal, block]]) {
+      expect(heldAfter(thread(records)).map(f => f.index)).toEqual([1]);
+    }
+    // Not-real keeps last-record-wins ordering against automatic send-backs.
+    const autoHold = rulingRecord('sent-back', '- 1 confirmed break(s) sent back to the fixer (#1).', false);
+    expect(heldAfter(thread([notReal, card, autoHold])).map(f => f.index)).toEqual([1]);
+    expect(heldAfter(thread([autoHold, card, notReal]))).toEqual([]);
+  });
+
+  it.each([true, false])('earlier human not-real then later automatic send-back restores the HEAD disposition (capped=%s)', capped => {
+    const autoHold = rulingRecord('sent-back', '- 1 confirmed break(s) sent back to the fixer (#1).', false);
+    const records = [notRealRecord(), autoHold];
+    const comments = capped ? thread(records) : [redTeam(), ...records];
+    const disposition = readRedTeamDisposition({ comments, pr: PR, head: HEAD,
+      setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } });
+    expect(disposition.held.map(f => f.index)).toEqual(capped ? [1] : []);
+    expect(disposition.sendBack.map(f => f.index)).toEqual(capped ? [] : [1]);
+  });
+
+  it('earlier human not-real then later automatic held line re-holds the finding', () => {
+    const autoHold = rulingRecord('round-cap', '- 1 confirmed break(s) NOT sent back: cap (#1).', false);
+    expect(heldAfter(thread([notRealRecord(), autoHold])).map(f => f.index)).toEqual([1]);
+    expect(heldAfter(thread([autoHold, notRealRecord()]))).toEqual([]);
+  });
+
+  it.each([true, false])('human block outranks an earlier automatic card through an unchanged-findings carry (explicit result=%s)', explicitResult => {
+    const block = blockRecord();
+    if (!explicitResult) block.body = block.body.replace(/ result=[0-9a-f]{16}/, '');
+    const comments = [redTeam(), { ...automaticCard(), createdAt: '2026-10-20T23:45:00Z' }, block];
+    const disposition = head => readRedTeamDisposition({ comments, pr: PR, head,
+      setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } });
+    expect(disposition(HEAD).sendBack.map(f => f.index)).toEqual([1]);
+    comments.push(bot([
+      buildVerdictCarriedMarker({ fromSha: HEAD, toSha: OTHER, patchId: 'b'.repeat(40) }),
+      'Review verdict carried across an identical contribution.',
+      redTeam(OTHER).body,
+    ].join('\n'), '2026-10-21T00:00:00Z'));
+    expect(liveResultGateState(comments, PR, OTHER).resultId).toBe(liveResultGateState(comments, PR, HEAD).resultId);
+    expect(disposition(OTHER).result.rev).toBe(OTHER);
+    expect(disposition(OTHER).sendBack.map(f => f.index)).toEqual([1]);
+    expect(disposition(OTHER).held).toEqual([]);
+  });
+
+  it('legacy human block without result= outranks an earlier automatic card at the cap', () => {
+    const block = blockRecord();
+    block.body = block.body.replace(/ result=[0-9a-f]{16}/, '');
+    const comments = thread([{ ...automaticCard(), createdAt: '2026-10-20T23:45:00Z' }, block]);
+    expect(heldAfter(comments).map(f => f.index)).toEqual([1]);
+    expect(readRedTeamDisposition({ comments, pr: PR, head: HEAD }).sendBack).toEqual([]);
+  });
+
+  it('a bot-authored operator-block still re-holds an earlier not-real in the raw gate reader', () => {
+    const forged = { ...blockRecord(), author: { login: 'web-everything' } };
+    const comments = thread([notRealRecord(), forged]);
+    const disposition = readRedTeamDisposition({ comments, pr: PR, head: HEAD });
+    expect(disposition.held.map(f => f.index)).toEqual([1]);
+    expect(disposition.sendBack).toEqual([]);
+    expect(liveResultGateState(comments, PR, HEAD).outcomes.has('operator-block')).toBe(true);
+    expect(operatorRulingsOnLiveResult(comments, PR, HEAD).blocked.size).toBe(0);
+  });
+
+  it.each(['operator-not-real', 'operator-card'])('a bot-authored block does not outrank a later human %s release', outcome => {
+    const block = { ...blockRecord(), author: { login: 'web-everything' } };
+    const release = rulingRecord(outcome, outcome === 'operator-not-real'
+      ? '- 1 finding(s) left advisory (#1).'
+      : '- 1 finding(s) filed as a follow-up card (#1).', true, '2026-10-21T00:00:00Z');
+    const comments = thread([block, release]);
+    const disposition = readRedTeamDisposition({ comments, pr: PR, head: HEAD,
+      setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } });
+    expect(disposition.held).toEqual([]);
+    expect(disposition.sendBack).toEqual([]);
+    expect(operatorRulingsOnLiveResult(comments, PR, HEAD).blocked.size).toBe(0);
+  });
+
+  it('an operator-block outcome cannot smuggle a release line over a live operator hold', () => {
+    const invalid = rulingRecord('operator-block', '- 1 finding(s) left advisory (#1).');
+    expect(heldAfter(thread([blockRecord(), invalid])).map(f => f.index)).toEqual([1]);
+  });
+
+  it.each(['not-real', 'card'])('%s sink refuses a live operator block appearing after planning', async ruling => {
+    const p = payloadFor({ ruling, ...(ruling === 'card' ? { card: CARD } : { cause: 'other' }) },
+      ruling === 'card' ? { card } : {});
+    const f = fake({ initial: thread([blockRecord()]) });
+    await expect((async () => f.sinks[p.effect](p))()).rejects.toThrow(/live operator block/);
+    expect(f.posted).toEqual([]);
+    expect(f.events).toEqual([]);
+    expect(f.cards).toEqual([]);
+  });
+
+  it.each(['diff-only-recheck', 'stale-head-reraise', 'auto-policy-over-not-real', 'card-only-probe', 'config-prose', 'test-nit', 'other'])('accepts the shared false-finding cause %s', cause => {
+    expect(payloadFor({ ruling: 'not-real', cause })).toMatchObject({ cause, effect: RED_TEAM_RULING_NOT_REAL_EFFECT });
+  });
+  it.each([undefined, '', 'unknown'])('refuses a missing or unknown false-finding cause %s', cause => {
+    expect(() => payloadFor({ ruling: 'not-real', cause })).toThrow(/requires --cause/);
+  });
+  it.each([['block', undefined, RED_TEAM_RULING_BLOCK_EFFECT], ['not-real', 'other', RED_TEAM_RULING_NOT_REAL_EFFECT]])('dispatches the complete %s payload and suppresses preview writes', (ruling, cause, type) => {
+    const operation = recordRedTeamRulingOperation({ readRulingContext: () => read() });
+    const verdict = payloadFor({ ruling, cause });
+    const write = operation.steps.find(s => s.name === 'write').step;
+    expect(write.effects({ verdict, input: {} })).toMatchObject([{ type, payload: {
+      ruling, cause, underChanges: false, sendBackBody: verdict.sendBackBody, indices: [1], resultId: verdict.resultId,
+    } }]);
+    expect(write.effects({ verdict, input: { preview: true } })).toEqual([]);
+  });
+  it('an operator-card/not-real record authored by automation never counts (read side)', () => {
+    const forged = bot(`${redTeamGateMarker(PR, HEAD, 'operator-not-real', liveResultGateState(thread(), PR, HEAD).resultId)}\n**Red-team gate** (setting \`redTeam.confirmedBreaks\`, card x1b8hlo) on head \`${HEAD.slice(0, 12)}\`:\n- 1 finding(s) left advisory (#1).`);
+    expect(operatorBoundComments(thread([forged]))).toHaveLength(2);
+    expect(() => planRedTeamRuling(read({ scope: OFF, comments: thread([forged]) }), input())).not.toThrow(); // still held: the forged release is dropped
+    const human = { ...forged, author: { login: 'chalbert' } };
+    expect(operatorBoundComments(thread([human]))).toHaveLength(3);
+    expect(() => planRedTeamRuling(read({ scope: OFF, comments: thread([human]) }), input())).toThrow(/no red-team break is held/);
+  });
+  it('plans block and not-real, and the ambiguity message lists the choices', () => {
+    expect(planRedTeamRuling(read(), input({ ruling: 'block' }))).toMatchObject({ effect: RED_TEAM_RULING_BLOCK_EFFECT });
+    expect(planRedTeamRuling(read(), input({ ruling: 'not-real', cause: 'other', break: 'backlog/x.md:24' }))).toMatchObject({ effect: RED_TEAM_RULING_NOT_REAL_EFFECT, indices: [1], cause: 'other' });
+    const held = [{ index: 1, file: 'a', line: 1, summary: 's' }, { index: 2, file: 'a', line: 1, summary: 't' }];
+    expect(() => selectBreaks(held, 'a:1')).toThrow(/ambiguous/);
+    expect(selectBreaks(held, '#1,2').map((f) => f.index)).toEqual([1, 2]);
+  });
+  it('a result that changed on the same head after the plan writes nothing (stale write)', async () => {
+    const f = fake();
+    f.comments.push(redTeam(HEAD, [{ summary: 'a different break reusing #1', category: 'edge-case', impactIfUnfixed: 'broken', file: 'z.mjs', line: 9, confirmedByRecheck: true }]));
+    f.comments.at(-1).createdAt = '2026-10-20T23:50:00Z';
+    for (const effect of [RED_TEAM_RULING_CARD_EFFECT, RED_TEAM_RULING_NOT_REAL_EFFECT, RED_TEAM_RULING_BLOCK_EFFECT]) {
+      await expect((async () => f.sinks[effect](payloadFor()))()).rejects.toThrow(/result on the live head changed/);
+    }
+    expect(f.cards.length + f.posted.length + f.labelCalls.length).toBe(0);
+  });
+  it('kill switch off: a result no longer at the round cap writes nothing', async () => {
+    const f = fake();
+    f.comments.splice(1, 1);
+    await expect(f.sinks[RED_TEAM_RULING_NOT_REAL_EFFECT](payloadFor({ ruling: 'not-real', cause: 'other' }, { scope: OFF }))).rejects.toThrow(/not parked at the round cap.*nothing written/);
+    expect(f.posted).toEqual([]);
+  });
+  it('a sink re-checks the poster: a bot identity writes nothing', () => {
+    const f = fake({ identity: { login: 'web-everything[bot]', type: 'Bot' } });
+    expect(() => f.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/not a human account/);
+    expect(f.cards.length + f.posted.length).toBe(0);
+  });
+  it('records posted by the automation account never release the break, and the sink says so', async () => {
+    const f = fake({ author: 'web-everything' });
+    await expect(f.sinks[RED_TEAM_RULING_NOT_REAL_EFFECT](payloadFor({ ruling: 'not-real', cause: 'other' }))).rejects.toThrow(/not in the read-back as a human operator/);
+  });
+  it('refuses a moved head or a missing trusted cap, writing nothing', () => {
+    const moved = fake({ liveHead: OTHER });
+    expect(() => moved.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/head moved/);
+    const changes = fake({ labels: [{ name: 'review:changes' }], initial: [redTeam()] });
+    expect(() => changes.sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor({}, { scope: OFF }))).toThrow(/not parked at the round cap/);
+    expect(moved.cards.length + moved.posted.length + changes.cards.length + changes.posted.length).toBe(0);
+  });
+  it.each(['block', 'not-real'])('%s defaults to cap-only and refuses a pending extension', ruling => {
+    const args = { ruling, ...(ruling === 'not-real' ? { cause: 'other' } : {}) };
+    expect(() => payloadFor(args, { scope: undefined, comments: [redTeam()] })).toThrow(/not parked at the round cap/);
+    const grant = { author: OP, createdAt: '2026-10-20T23:50:00Z', body: buildRoundExtensionComment({
+      repo, pr: PR, by: 1, actor: OP.login, channel: 'chat', reason: 'one more round', at: '2026-10-20T23:50:00Z',
+    }) };
+    expect(() => payloadFor(args, { scope: undefined, comments: thread([grant]) })).toThrow(/pending round extension/);
+  });
+  it('not-real: a failed ledger append reports an error and leaves the hold intact without a release', async () => {
+    const f = fake({ ledgerFails: true });
+    await expect((async () => f.sinks[RED_TEAM_RULING_NOT_REAL_EFFECT](payloadFor({ ruling: 'not-real', cause: 'other' })))())
+      .rejects.toThrow(/ledger-write-miss.*ledger unavailable/);
+    expect(heldAfter(f.comments).map(f => f.index)).toEqual([1]);
+    expect(f.posted.some(body => body.includes('outcome=operator-not-real'))).toBe(false);
+    expect(f.labelCalls).toEqual([]);
+    expect(f.labelSyncs).toEqual([]);
+  });
+  it.each([{ labels: [] }, { labels: ['review:changes'] }])('block: a failed ledger append throws before further writes and leaves a retryable hold (labels=%j)', async ({ labels }) => {
+    const f = fake({ ledgerFails: true, labels });
+    await expect(f.sinks[RED_TEAM_RULING_BLOCK_EFFECT](payloadFor({ ruling: 'block' })))
+      .rejects.toThrow(/ledger-write-miss.*ledger unavailable/);
+    expect(heldAfter(f.comments).map(f => f.index)).toEqual([1]);
+    expect(f.warnings).toEqual([]);
+    expect(f.posted).toHaveLength(1);
+    expect(f.posted[0]).toContain('outcome=operator-block');
+    expect(f.posted.some(body => body.includes('outcome=operator-not-real'))).toBe(false);
+    expect(f.labelCalls).toHaveLength(0);
+  });
+  it('not-real: a failed reason POST leaves the break held', async () => {
+    const f = fake({ postFails: body => body.includes('Operator ruling on') });
+    await expect(f.sinks[RED_TEAM_RULING_NOT_REAL_EFFECT](payloadFor({ ruling: 'not-real', cause: 'other' }))).rejects.toThrow(/gh down/);
+    expect(f.posted).toEqual([]);
+    expect(heldAfter(f.comments).map(f => f.index)).toEqual([1]);
+  });
+  it('not-real: a head change during the reason POST prevents release', async () => {
+    const comments = thread(), posted = [];
+    let liveHead = HEAD;
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: liveHead, labels: [], comments }),
+      readStandingRulingScope: () => null, resolveIdentity: () => OP,
+      post: (_repo, _pr, body) => { posted.push(body); liveHead = OTHER; },
+    });
+    await expect(sinks[RED_TEAM_RULING_NOT_REAL_EFFECT](payloadFor({ ruling: 'not-real', cause: 'other' }))).rejects.toThrow(/head moved.*no release record written/);
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).not.toContain('<!-- we:red-team-gate');
+  });
+  it('not-real: leaves the break advisory and clears nothing else', async () => {
+    const f = fake();
+    await f.sinks[RED_TEAM_RULING_NOT_REAL_EFFECT](payloadFor({ ruling: 'not-real', cause: 'other' }));
+    expect(f.cards).toEqual([]);
+    expect(f.events).toEqual([expect.objectContaining({ type: 'ruling', repo, pr: PR, ruling: 'not-real',
+      findingKey: `red-team:${HEAD}:${payloadFor({ ruling: 'not-real', cause: 'other' }).resultId}:1`,
+      source: 'record-red-team-ruling', actor: expect.objectContaining({ declared: 'chalbert', channel: 'claude-code-chat' }) })]);
+    expect(f.posted[1]).toContain('outcome=operator-not-real');
+    expect(f.posted[0]).toContain('does not clear `review:human`');
+    expect(heldAfter(f.comments)).toHaveLength(0);
+  });
+  it('block: sends back through review-set-label --to=changes with the operator as actor', async () => {
+    const f = fake();
+    await expect(f.sinks[RED_TEAM_RULING_BLOCK_EFFECT](payloadFor({ ruling: 'block' }))).resolves.toMatchObject({ sentBack: true });
+    expect(f.labelCalls[0]).toEqual(expect.arrayContaining(['5530', '--repo=o/r', '--to=changes', '--actor=chalbert', '--channel=claude-code-chat']));
+    expect(f.posted[0]).toMatch(/outcome=operator-block result=[0-9a-f]{16} -->/);
+    expect(f.posted[0]).toContain('sent back to the fixer (#1)');
+  });
+  it.each([[true, 1], [true, 2], [false, 1], [false, 2]])('block: rejects proof when only one of two selected findings is held or sent back (capped=%s, advisory=#%s)', async (atCap, advisoryIndex) => {
+    const comments = [redTeam(HEAD, [1, 2].map(index => ({ summary: `Confirmed break ${index}`, category: 'edge-case',
+      impactIfUnfixed: 'broken', file: 'backlog/x.md', line: 24 + index, confirmedByRecheck: true }))), ...(atCap ? [capped()] : [])];
+    const labels = ['review:changes'];
+    const p = payloadFor({ ruling: 'block', break: '1,2' }, { comments, labels });
+    expect(p.indices).toEqual([1, 2]);
+    const disposition = () => readRedTeamDisposition({ comments: operatorBoundComments(comments), repo, pr: PR,
+      head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } });
+    expect(disposition()[atCap ? 'held' : 'sendBack'].map(f => f.index)).toEqual([1, 2]);
+    const posted = [], labelCalls = [], events = [], syncs = [];
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: HEAD, labels: [...labels], comments: [...comments] }),
+      readScope: () => ({ value: { anyState: true } }), readStandingRulingScope: () => null, resolveIdentity: () => OP,
+      post: (_repo, _pr, body) => {
+        posted.push(body);
+        comments.push({ author: OP, createdAt: '2026-10-20T23:55:00Z',
+          body: body.includes('outcome=operator-block') ? body.replace('(#1, #2)', `(#${3 - advisoryIndex})`) : body });
+        // The durable block covers only one selected finding; the other is advisory.
+        if (posted.length === 2) comments.push({ author: OP, createdAt: '2026-10-20T23:56:00Z',
+          body: `${redTeamGateMarker(PR, HEAD, 'operator-not-real', p.resultId)}\n**Red-team gate** operator ruling:\n- 1 finding(s) left advisory (#${advisoryIndex}).` });
+      },
+      runSetLabel: (_exe, args) => { labelCalls.push(args); return '{"ok":true}'; },
+      ...ledgerIO(events), syncLabels: args => { syncs.push(args); },
+    });
+    await expect(sinks[RED_TEAM_RULING_BLOCK_EFFECT](p)).rejects.toThrow(/operator-block record is not in the read-back/);
+    expect(posted).toHaveLength(2);
+    expect(posted[0]).toContain('sent back to the fixer (#1, #2)');
+    expect(disposition()[atCap ? 'held' : 'sendBack'].map(f => f.index)).toEqual([3 - advisoryIndex]);
+    expect(disposition()[atCap ? 'sendBack' : 'held']).toEqual([]);
+    expect(operatorRulingsOnLiveResult(operatorBoundComments(comments), PR, HEAD).ruled.get(advisoryIndex).at(-1)).toBe('advisory');
+    expect(labelCalls).toEqual([]);
+    expect(events).toHaveLength(2);
+    expect(events.every(e => e.type === 'ruling' && e.ruling === 'block')).toBe(true);
+    expect(syncs).toEqual([]);
+  });
+  it.each([[true, 1], [true, 2], [false, 1], [false, 2]])('block: per-finding coverage proof rejects a partial hold despite the exact human record (capped=%s, free=#%s)', async (atCap, freeIndex) => {
+    const comments = [redTeam(HEAD, [1, 2].map(index => ({ summary: `Confirmed break ${index}`, category: 'edge-case',
+      impactIfUnfixed: 'broken', file: 'backlog/x.md', line: 24 + index, confirmedByRecheck: true }))), ...(atCap ? [capped()] : [])];
+    const labels = ['review:changes'];
+    const p = payloadFor({ ruling: 'block', break: '1,2' }, { comments, labels });
+    const posted = [], labelCalls = [], events = [], syncs = [];
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: HEAD, labels: [...labels], comments: [...comments] }),
+      readScope: () => ({ value: { anyState: true } }), readStandingRulingScope: () => null, resolveIdentity: () => OP,
+      post: (_repo, _pr, body) => {
+        posted.push(body);
+        comments.push({ author: OP, createdAt: '2026-10-20T23:55:00Z', body });
+      },
+      runSetLabel: (_exe, args) => { labelCalls.push(args); return '{"ok":true}'; },
+      ...ledgerIO(events), syncLabels: args => { syncs.push(args); },
+    });
+    const actualDisposition = redTeamGate.readRedTeamDisposition;
+    // Inject a partial reader result to isolate proveHeld's coverage guard from record/authorship checks.
+    // The real block now has precedence over every release, so a later advisory cannot create this fault.
+    const reader = vi.spyOn(redTeamGate, 'readRedTeamDisposition').mockImplementation(args => {
+      const d = actualDisposition(args);
+      return { ...d, held: d.held.filter(f => f.index !== freeIndex), sendBack: d.sendBack.filter(f => f.index !== freeIndex) };
+    });
+    try {
+      await expect(sinks[RED_TEAM_RULING_BLOCK_EFFECT](p)).rejects.toThrow(
+        `the operator-block record was posted but the gate does not hold break(s) #${freeIndex}; inspect the thread`);
+      expect(reader).toHaveBeenCalled();
+      expect(posted).toHaveLength(2);
+      expect(comments.at(-2)).toMatchObject({ author: OP, body: posted[0] });
+      expect(posted[0]).toContain('sent back to the fixer (#1, #2)');
+      expect(liveResultGateState(comments, PR, HEAD).resultId).toBe(p.resultId);
+      const d = reader.mock.results.at(-1).value;
+      expect(d[atCap ? 'held' : 'sendBack'].map(f => f.index)).toEqual([3 - freeIndex]);
+      expect(d[atCap ? 'sendBack' : 'held']).toEqual([]);
+      expect(labelCalls).toEqual([]);
+      expect(events).toHaveLength(2);
+      expect(events.every(e => e.type === 'ruling' && e.ruling === 'block')).toBe(true);
+      expect(syncs).toEqual([]);
+    } finally {
+      reader.mockRestore();
+    }
+  });
+
+  it('automatic card decision does not erase an operator block after applyRedTeamGate files card-queued', async () => {
+    const comments = [redTeam(HEAD, [{ summary: 'Degraded recovery', category: 'edge-case',
+      impactIfUnfixed: 'degraded', file: 'backlog/x.md', line: 24, confirmedByRecheck: true }])];
+    const labels = ['review:changes'];
+    let tick = 0;
+    const post = (author, body) => comments.push({ author, body, createdAt: new Date(Date.UTC(2026, 9, 21, 0, 0, tick++)).toISOString() });
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: HEAD, labels: [...labels], comments: [...comments] }),
+      readScope: () => ({ value: { anyState: true } }), readStandingRulingScope: () => null,
+      resolveIdentity: () => OP, post: (_repo, _pr, body) => post(OP, body),
+      ...ledgerIO(), syncLabels: () => null,
+    });
+    const replan = () => planRedTeamRuling(read({ comments, labels }), input({ ruling: 'block' }));
+    await expect(sinks[RED_TEAM_RULING_BLOCK_EFFECT](replan())).resolves.toMatchObject({ sentBack: true });
+    const doneCount = comments.length;
+    await expect(sinks[RED_TEAM_RULING_BLOCK_EFFECT](replan())).resolves.toMatchObject({ sentBack: true });
+    expect(comments).toHaveLength(doneCount);
+    await expect(applyRedTeamGate({ repo, pr: PR }, {
+      readPr: () => ({ headRefOid: HEAD, labels, comments }),
+      readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }),
+      fileCard: () => ({ ok: true, session: 'gate-card' }),
+      postComment: ({ body }) => post({ login: 'web-everything' }, body),
+    })).resolves.toMatchObject({ status: 'applied', cardMarker: 'posted' });
+    expect(comments.some(c => c.body.includes('outcome=card-queued'))).toBe(true);
+    expect(readRedTeamDisposition({ comments: operatorBoundComments(comments), repo, pr: PR, head: HEAD,
+      setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } }).sendBack.map(f => f.index)).toEqual([1]);
+    await expect(sinks[RED_TEAM_RULING_BLOCK_EFFECT](replan())).resolves.toMatchObject({ sentBack: true });
+    expect(readRedTeamDisposition({ comments: operatorBoundComments(comments), repo, pr: PR, head: HEAD,
+      setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } }).sendBack.map(f => f.index)).toEqual([1]);
+  });
+  it.each([[1, true], [2, true], [2, false]])('block: restores review:changes when labels change during POST %s (restore succeeds=%s)', async (changeOnPost, restoreSucceeds) => {
+    const comments = thread(), labelCalls = [];
+    let labels = ['review:changes'], posts = 0;
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: HEAD, labels: [...labels], comments: [...comments] }),
+      readScope: () => ({ value: { anyState: true } }), readStandingRulingScope: () => null,
+      resolveIdentity: () => OP,
+      post: (_repo, _pr, body) => {
+        comments.push({ author: OP, createdAt: '2026-10-20T23:55:00Z', body });
+        if (++posts === changeOnPost) labels = ['review:accepted'];
+      },
+      runSetLabel: (_exe, args) => {
+        labelCalls.push(args);
+        if (!restoreSucceeds) return '{"ok":false,"error":"restoration failed"}';
+        labels = ['review:changes'];
+        return '{"ok":true}';
+      },
+      ...ledgerIO(), syncLabels: () => null,
+    });
+    const pending = sinks[RED_TEAM_RULING_BLOCK_EFFECT](payloadFor({ ruling: 'block' }, { labels }));
+    if (!restoreSucceeds) {
+      await expect(pending).rejects.toThrow('restoration failed');
+      expect(labelCalls).toHaveLength(1);
+      expect(labels).toEqual(['review:accepted']);
+      expect(heldAfter(comments).map(f => f.index)).toEqual([1]);
+      return;
+    }
+    const result = await pending;
+    expect(labelCalls).toHaveLength(1);
+    expect(labelCalls[0]).toContain('--to=changes');
+    expect(labels).toEqual(['review:changes']);
+    expect(result).toMatchObject({ sentBack: true });
+    expect(result.alreadyUnderChanges).toBeUndefined();
+  });
+  it.each([{ labels: [] }, { labels: ['review:changes'] }])('block: records the per-finding ruling intent in the ledger for labels=%j', async ({ labels }) => {
+    const f = fake({ labels });
+    await f.sinks[RED_TEAM_RULING_BLOCK_EFFECT](payloadFor({ ruling: 'block' }));
+    expect(f.events).toEqual([expect.objectContaining({ type: 'ruling', repo, pr: PR, ruling: 'block',
+      findingKey: `red-team:${HEAD}:${payloadFor({ ruling: 'block' }).resultId}:1`, source: 'record-red-team-ruling', actor: expect.objectContaining({ declared: 'chalbert' }) })]);
+  });
+  it.each([['any-state', { value: { anyState: true } }], ['cap-only', OFF]])('block: replans from the persisted ruling after a failed send-back and applies review:changes on retry (%s)', async (_mode, scope) => {
+    const comments = thread(), labels = ['review:human'], labelCalls = [];
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: HEAD, labels: [...labels], comments: [...comments] }),
+      readScope: () => scope,
+      readStandingRulingScope: () => null, resolveIdentity: () => OP,
+      post: (_repo, _pr, body) => comments.push({ author: OP, createdAt: '2026-10-20T23:55:00Z', body }),
+      runSetLabel: (_exe, args) => {
+        labelCalls.push(args);
+        if (labelCalls.length === 1) throw new Error('send-back failed');
+        labels.push('review:changes');
+        return '{"ok":true}';
+      },
+      ...ledgerIO(), syncLabels: () => null,
+    });
+    const replan = () => planRedTeamRuling(read({ comments, labels, scope }), input({ ruling: 'block' }));
+    await expect(sinks[RED_TEAM_RULING_BLOCK_EFFECT](replan())).rejects.toThrow(/send-back failed/);
+    expect(comments.some(c => c.body.includes('outcome=operator-block'))).toBe(true);
+    expect(heldAfter(comments).map(f => f.index)).toEqual([1]);
+    expect(labels).not.toContain('review:changes');
+
+    await expect(sinks[RED_TEAM_RULING_BLOCK_EFFECT](replan())).resolves.toMatchObject({ sentBack: true });
+    expect(labelCalls).toHaveLength(2);
+    expect(labelCalls[1]).toEqual(expect.arrayContaining(['5530', '--repo=o/r', '--to=changes', '--actor=chalbert']));
+    expect(labels).toContain('review:changes');
+    const doneCount = comments.length;
+    await expect(sinks[RED_TEAM_RULING_BLOCK_EFFECT](replan())).resolves.toMatchObject({ sentBack: true });
+    expect(comments).toHaveLength(doneCount);
+    expect(labelCalls).toHaveLength(2);
+  });
+  describe('audit fixes (Codex read-only audit of 952397690)', () => {
+    const H = HEAD;
+    const rid = () => liveResultGateState(thread(), PR, H).resultId;
+    const sentBack = () => bot(`${redTeamGateMarker(PR, H, 'sent-back', rid())}\n**Red-team gate** (setting x) on head \`x\`:\n- 1 confirmed break(s) sent back to the fixer (#1).`, '2026-10-20T23:30:00Z');
+    const opLine = '- 1 finding(s) carded by the operator to `we:backlog/x.md` (#1).';
+    const d = (comments, anyState = true) => readRedTeamDisposition({ comments, pr: PR, head: H, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState } });
+    it('automation wrapping the operator-only card line in card-queued / sent-back releases nothing', () => {
+      for (const outcome of ['card-queued', 'sent-back', 'operator-card']) {
+        const forged = bot(`${redTeamGateMarker(PR, H, outcome, rid())}\n**Red-team gate** x:\n${opLine}`, '2026-10-20T23:45:00Z');
+        expect(d([redTeam(), sentBack(), forged]).sendBack.map((f) => f.index)).toEqual([1]);
+      }
+      const human = { author: { login: 'chalbert' }, createdAt: '2026-10-20T23:45:00Z', body: `${redTeamGateMarker(PR, H, 'card-queued', rid())}\n**Red-team gate** x:\n${opLine}` };
+      expect(d([redTeam(), sentBack(), human]).sendBack.map((f) => f.index)).toEqual([1]); // operator line needs an operator-* outcome too
+    });
+    it('kill switch off: a release still works for a break handed over at the cap (send-back then round-cap), never for a live send-back', () => {
+      const op = { author: { login: 'chalbert' }, createdAt: '2026-10-21T00:00:00Z', body: `${redTeamGateMarker(PR, H, 'operator-card', rid())}\n**Red-team gate** x:\n${opLine}` };
+      expect(d([redTeam(), sentBack(), op], false).sendBack.map((f) => f.index)).toEqual([1]);
+      const cap = bot(`${redTeamGateMarker(PR, H, 'round-cap', rid())}\n**Red-team gate** x:\n- 1 confirmed break(s) NOT sent back: cap (#1).`, '2026-10-20T23:40:00Z');
+      expect(d([redTeam(), sentBack(), cap], false).held.map((f) => f.index)).toEqual([1]);
+      expect(d([redTeam(), sentBack(), cap, op], false).held).toEqual([]);
+    });
+    it('a NEW card is never planned for a break the gate already carded; citing an existing card still is', () => {
+      const carded = bot(`${redTeamGateMarker(PR, H, 'card-queued', rid())}\n**Red-team gate** x:\n- 1 finding(s) filed as a follow-up card (#1) — landing job j.`, '2026-10-20T23:50:00Z');
+      expect(() => planRedTeamRuling(read({ comments: thread([carded]), card: null }), input())).toThrow(/no confirmed red-team break .* left to rule `card`/);
+      const ref = 'we:backlog/x.md';
+      expect(planRedTeamRuling(read({ comments: thread([carded]), card: { requested: ref, ref, readable: true } }), input({ card: ref }))).toMatchObject({ cardRef: ref, indices: [1] });
+    });
+    it('post-write proof fails on a moved head, a missing record, or a changed result', async () => {
+      const p = payloadFor({ ruling: 'not-real', cause: 'other' });
+      for (const after of [
+        { headRefOid: OTHER, labels: [], comments: [] },
+        { headRefOid: H, labels: [], comments: thread() },
+        { headRefOid: H, labels: [], comments: thread([redTeam(HEAD, [{ summary: 'new finding', category: 'edge-case', impactIfUnfixed: 'broken', file: 'new.mjs', line: 2, confirmedByRecheck: true }])]) },
+      ]) {
+        let n = 0;
+        const sinks = createRecordRedTeamRulingSinks({ readThread: () => (n++ < 3 ? { headRefOid: H, labels: [], comments: thread() } : after),
+          resolveIdentity: () => OP, post: () => {}, ...ledgerIO(), warn: () => {}, syncLabels: () => null });
+        await expect(sinks[RED_TEAM_RULING_NOT_REAL_EFFECT](p)).rejects.toThrow(/head moved|not in the read-back|result changed/);
+      }
+    });
+  });
+
+  describe('audit round 2', () => {
+    const rid = () => liveResultGateState(thread(), PR, HEAD).resultId;
+    const d = (comments) => readRedTeamDisposition({ comments: operatorBoundComments(comments), pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } });
+    it('block after a clear-human ceremony re-holds the break (the ceremony no longer covers it), and the sink proves it', async () => {
+      const { buildReviewedShaMarker, buildClearedHumanMarker } = await import('../../lib/review-escalation.mjs');
+      // main #5803: only a human operator's own clear-human comment is a ruling, so the ceremony is posted by the operator login.
+      const clearance = { ...bot(['✅ review — `review:human` cleared via the sanctioned path', '',
+        'Cleared by operator via `review-set-label.mjs --to=clear-human` (gate-self).', '',
+        buildReviewedShaMarker(HEAD), buildClearedHumanMarker('operator')].join('\n'), '2026-10-20T23:50:00Z'), author: { login: 'chalbert' } };
+      const f = fake({ initial: thread([clearance]) });
+      expect(d(f.comments).held).toEqual([]); // the ceremony ruled on the cap
+      const b = planRedTeamRuling(read({ comments: f.comments }), input({ ruling: 'block' }));
+      await f.sinks[RED_TEAM_RULING_BLOCK_EFFECT](b);
+      expect(d(f.comments).held.map((x) => x.index)).toEqual([1]);
+    });
+    it('kill switch off: no second filing for a gate-carded break re-held by a block', () => {
+      const carded = bot(`${redTeamGateMarker(PR, HEAD, 'card-queued', rid())}\n**Red-team gate** x:\n- 1 finding(s) filed as a follow-up card (#1) — landing job j.`, '2026-10-20T23:50:00Z');
+      const block = { author: { login: 'chalbert' }, createdAt: '2026-10-21T00:10:00Z', body: `${redTeamGateMarker(PR, HEAD, 'operator-block', rid())}\n**Red-team gate** x:\n- 1 confirmed break(s) sent back to the fixer (#1).` };
+      const comments = thread([carded, block]);
+      expect(d(comments).held.map((x) => x.index)).toEqual([1]);
+      expect(() => planRedTeamRuling(read({ scope: OFF, comments }), input())).toThrow(/no red-team break is held/);
+      const ref = 'we:backlog/x.md';
+      expect(() => planRedTeamRuling(read({ scope: OFF, comments, card: { requested: ref, ref, readable: true } }), input({ card: ref }))).toThrow(/live operator block takes precedence/);
+    });
+    it('a block whose record does not re-hold (posted as another account) fails its proof', async () => {
+      const f = fake({ author: 'web-everything' });
+      await expect(f.sinks[RED_TEAM_RULING_BLOCK_EFFECT](payloadFor({ ruling: 'block' }))).rejects.toThrow(/not in the read-back/);
+    });
+  });
+
 });
