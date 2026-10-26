@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 
 // Exercise the real rebuildClone IO shell with controlled phase outcomes. Git,
@@ -203,11 +204,14 @@ describe('rebuildClone coordination events', () => {
       else if (ts.isBinaryExpression(expression)) { collect(expression.left); collect(expression.right); }
       else if (ts.isParenthesizedExpression(expression)) collect(expression.expression);
     }
-    const dir = new URL('../daemon-rebuild/', import.meta.url);
-    const files = readdirSync(dir).filter((name) => name.endsWith('.mjs')).map((name) => new URL(name, dir));
-    files.push(new URL('../daemon-version-runtime.mjs', import.meta.url));
+    // Resolve filesystem paths directly: Vite rewrites new URL(..., import.meta.url)
+    // as an asset URL, which cannot be passed to Node's filesystem APIs.
+    const libDir = join(dirname(fileURLToPath(import.meta.url)), '..');
+    const dir = join(libDir, 'daemon-rebuild');
+    const files = readdirSync(dir).filter((name) => name.endsWith('.mjs')).map((name) => join(dir, name));
+    files.push(join(libDir, 'daemon-version-runtime.mjs'));
     for (const file of files) {
-      const source = ts.createSourceFile(file.pathname, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+      const source = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
       function visit(node) {
         if ((ts.isPropertyAssignment(node) || ts.isVariableDeclaration(node)) && node.name?.getText(source) === 'reason') collect(node.initializer);
         if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
