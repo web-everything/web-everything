@@ -2870,28 +2870,36 @@ export function planReconcile({
     const bouncedRealRed = isBouncedRealRed({ pr, phase, check, requiredChecks });
     // At the review-fix cap an unused operator-directed round still belongs to the existing fix path below.
     // Routing it through CI healing would refuse at the cap before that path can carry the allowance.
-    // Review holds own review-gate failures; cancelled/skipped jobs are not real CI red.
+    // Ignore cancellations when identifying a review-gate-only failure; required CI still gates review below.
     // Inspect all visible checks so a non-required failure still keeps its repair owner.
-    const visibleRealRed = collapseRollupToLatestPerName(pr?.statusCheckRollup)
+    const reviewRollup = collapseRollupToLatestPerName(pr?.statusCheckRollup);
+    const visibleRealRed = reviewRollup
       .filter(row => FAILED_CHECK_CONCLUSIONS.filter(c => c !== 'CANCELLED')
         .includes(String(row?.conclusion || row?.state || '').toUpperCase()))
       .filter(row => row?.name !== 'merge-gate' || !reviewHoldGatesOnlyRed([row], ['merge-gate']))
       .map(row => row?.name || row?.context);
     const reviewHoldHasRealRed = withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))
+      // Required review gates keep the existing review-ci / review-hold-red refusals.
+      && !requiredChecks?.includes('review-gate')
       // A non-required merge-gate is reported only; required failures still route via check.state below.
       && visibleRealRed.includes('review-gate') && visibleRealRed.some(name => name !== 'review-gate' && name !== 'merge-gate');
     const reviewGateOnlyRed = withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))
       && !requiredChecks?.includes('review-gate')
       && visibleRealRed.length > 0 && visibleRealRed.every(name => name === 'review-gate');
-    const ciRepairOwed = !reviewGateOnlyRed && (phase === 'ci-red' || (phase === 'needs-human' && (check.state === 'red' || reviewHoldHasRealRed))
+    const reviewGateHasChanges = withPhase.labels.some(l => ['review:changes', ADVISORY_LABELS.CHANGES].includes(l));
+    // Leave operator-directed repairs to the ruling branches below, including their caps and ladder.
+    const reviewGateRulingOwed = reviewGateOnlyRed && (pr?.ignoredRulings?.matches?.length > 0
+      || (Array.isArray(pr?.blockRuledReferrals) && pr.blockRuledReferrals.length > 0));
+    // A changes label keeps the existing CI repair owner; it cannot take the review shortcut.
+    const ciRepairOwed = (!reviewGateOnlyRed || (reviewGateHasChanges && !reviewGateRulingOwed)) && (phase === 'ci-red' || (phase === 'needs-human' && (check.state === 'red' || reviewHoldHasRealRed))
       || (bouncedRealRed && !(sendBackRound && roundAttempts() >= effectiveRoundCap)));
-    const cancelledReviewWork = reviewGateOnlyRed && collapseRollupToLatestPerName(pr?.statusCheckRollup)
+    const cancelledReviewWork = reviewGateOnlyRed && reviewRollup
       .some(row => String(row?.status).toLowerCase() === 'completed' && String(row?.conclusion).toLowerCase() === 'cancelled');
-    if (reviewGateOnlyRed && (phase === 'ci-red' || (phase === 'needs-human'
-        && (cancelledReviewWork || check.state !== 'green') && !withPhase.labels.includes(ADVISORY_LABELS.CHANGES)))) {
-      // Ignore completed cancellations only for this review decision; preserve missing/pending evidence.
-      const reviewPr = { ...pr, statusCheckRollup: collapseRollupToLatestPerName(pr?.statusCheckRollup).map(row =>
-        String(row?.status).toLowerCase() === 'completed' && String(row?.conclusion).toLowerCase() === 'cancelled'
+    if (reviewGateOnlyRed && !reviewGateHasChanges && !reviewGateRulingOwed
+        && (phase === 'ci-red' || (phase === 'needs-human' && (cancelledReviewWork || check.state !== 'green')))) {
+      // The #5925 exception is only cancelled smoke; other evidence and review timing stay intact.
+      const reviewPr = { ...pr, statusCheckRollup: reviewRollup.map(row =>
+        (row?.name ?? row?.context) === 'smoke' && String(row?.status).toLowerCase() === 'completed' && String(row?.conclusion).toLowerCase() === 'cancelled'
           ? { ...row, conclusion: 'neutral' } : row) };
       dispatchReviewRow({ pr: reviewPr, requiredChecks, withPhase, base, attempts: roundAttempts(),
         roundCap: effectiveRoundCap, now, refuse, refuseCapExhausted, dispatch });
@@ -3381,7 +3389,7 @@ export function planReconcile({
     // attached. How far up the fixer-escalation ladder it goes (resend, stronger model with a failing test first,
     // cross-provider when available, then the operator as a needs-you note, an arbiter later) is the configured
     // ladder's call, counted in heads it came back on plus fixer turns that ended without a new head.
-    if (phase === 'needs-human' && pr?.ignoredRulings?.matches?.length) {
+    if ((phase === 'needs-human' || reviewGateRulingOwed) && pr?.ignoredRulings?.matches?.length) {
       const ig = pr.ignoredRulings;
       const files = ig.matches.map((m) => m.finding.file ?? '(no file)');
       // WHICH RUNG: the configured ladder (`we:scripts/lib/fixer-escalation-policy.mjs`) decides from how many heads the
@@ -3418,7 +3426,7 @@ export function planReconcile({
     // Live 2026-10-12, #5009: a carried operator block survived on the new head, but verdict write-back was
     // refused (0 juror findings), leaving the label stuck `review:pending`. The current-head block ruling
     // owes a fix regardless of which review label landed.
-    if ((phase === 'needs-human' || phase === 'needs-review') && Array.isArray(pr?.blockRuledReferrals) && pr.blockRuledReferrals.length) {
+    if ((phase === 'needs-human' || phase === 'needs-review' || reviewGateRulingOwed) && Array.isArray(pr?.blockRuledReferrals) && pr.blockRuledReferrals.length) {
       const attempts = roundAttempts();
       // An operator ruling WITH A DIRECTION on this head grants ONE directed takeover round past the cap
       // (`fix.operatorRulingExtraRounds`), its brief carrying the ruling text verbatim. Once per ruling; see

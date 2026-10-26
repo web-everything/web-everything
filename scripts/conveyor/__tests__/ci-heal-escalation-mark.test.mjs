@@ -348,6 +348,22 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
     ];
     expect(refusal({ pr: { ...fixture, statusCheckRollup }, requiredChecks: ['test', 'smoke', 'review-gate'] })).toContain('test');
   });
+  it.each(['test', 'standards', 'daemon-soak'])('cancelled required %s refuses not-a-ci-break recording', name => {
+    const statusCheckRollup = [
+      { name, status: 'COMPLETED', conclusion: 'CANCELLED' },
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+    ];
+    expect(refusal({ pr: { ...fixture, statusCheckRollup }, requiredChecks: [name, 'smoke'] })).toContain(name);
+  });
+  it('recording cancellation allowance does not change verdict-reader refusal', async () => {
+    const { unsettledRequiredChecks } = await import('../ci-heal-verdict-recheck.mjs');
+    const statusCheckRollup = [{ name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED' }];
+    const pull = { ...fixture, statusCheckRollup };
+    expect(refusal({ pr: pull, requiredChecks: ['smoke'] })).toBeNull();
+    expect(unsettledRequiredChecks({ rollup: statusCheckRollup, requiredChecks: ['smoke'] }).red).toEqual(['smoke']);
+    expect(pull.statusCheckRollup[0].conclusion).toBe('CANCELLED');
+  });
   it('a newer real failure still refuses after an older cancellation', () => {
     const statusCheckRollup = [
       { name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED', startedAt: '2026-10-26T10:00:00Z' },
@@ -379,6 +395,15 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
     expect(await checkNotCiBreakRecordable(opts)).toEqual({ refusal: expect.stringContaining('red: test') });
     expect(opts.readPr).toHaveBeenCalledWith({ pr: 4535, repo: fixture.repo });
     expect(opts.readRequired).toHaveBeenCalledWith({ repo: fixture.repo });
+  });
+  it('recording IO refuses a cancelled required test instead of recording a stand-down', async () => {
+    const opts = recordOptions();
+    opts.readPr.mockReturnValue({ ...fixture, statusCheckRollup: [
+      { name: 'test', status: 'COMPLETED', conclusion: 'CANCELLED' },
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS' },
+    ] });
+    opts.readRequired.mockResolvedValue({ checks: ['test', 'smoke'] });
+    expect(await checkNotCiBreakRecordable(opts)).toEqual({ refusal: expect.stringContaining('red: test') });
   });
 
   const note = { kind: 'ci-heal-escalated', outcome: 'not-a-ci-break', headSha: head, prNumber: 4535 };

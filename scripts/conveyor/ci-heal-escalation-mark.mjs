@@ -340,7 +340,7 @@ export function needsHumanVoidState(comments, headSha) {
 
 /**
  * card x9zznl9 — prevention at the source. Why the CLI must NOT record `not-a-ci-break` on this head yet, or `null`
- * when it may. Completed cancellations and `review-gate` do not represent unsettled repair work; pending, missing or red
+ * when it may. Completed smoke cancellations and `review-gate` do not represent unsettled repair work; pending, missing or red
  * one refuses it. `pr` is `{ headRefOid, statusCheckRollup }` for the PR now. A different head is not judged here
  * (the rollup describes another commit). Pure.
  */
@@ -349,9 +349,10 @@ export function notCiBreakRecordRefusal({ headSha, pr, requiredChecks }) {
   const prHead = String(pr?.headRefOid ?? '').trim().toLowerCase();
   if (!head || !prHead || !(prHead.startsWith(head) || head.startsWith(prHead))) return null;
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return null;
+  // Only smoke may be cancelled (#5925); every other required check must supply its result.
   // Local to recording this stand-down: other verdict readers retain their cancellation policy.
   const rollup = collapseRollupToLatestPerName(pr?.statusCheckRollup).map(row =>
-    String(row?.status).toLowerCase() === 'completed' && String(row?.conclusion).toLowerCase() === 'cancelled'
+    (row?.name ?? row?.context) === 'smoke' && String(row?.status).toLowerCase() === 'completed' && String(row?.conclusion).toLowerCase() === 'cancelled'
       ? { ...row, conclusion: 'success' } : row);
   const u = unsettledRequiredChecks({ rollup, requiredChecks });
   const parts = [];
@@ -359,7 +360,7 @@ export function notCiBreakRecordRefusal({ headSha, pr, requiredChecks }) {
   if (u.missing.length) parts.push(`not started: ${u.missing.join(', ')}`);
   if (u.red.length) parts.push(`red: ${u.red.join(', ')}`);
   if (!parts.length) return null;
-  return `not-a-ci-break needs every required check except review-gate finished green or cancelled on this head — ${parts.join('; ')}. `
+  return `not-a-ci-break needs every required check except review-gate finished green on this head (only smoke may be cancelled) — ${parts.join('; ')}. `
     + (u.red.length ? 'A required check is red, so this IS a CI break: heal it or escalate needs-human.'
       : 'Wait for the checks to finish, then decide.');
 }

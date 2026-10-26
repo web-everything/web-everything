@@ -11,8 +11,10 @@ const pr = (over = {}) => ({
   number: 5925, state: 'OPEN', isDraft: false, headRefName: 'lane/review-gate-only', headRefOid: HEAD,
   labels: [{ name: 'review:human' }], mergeStateStatus: 'CLEAN', statusCheckRollup: checks, comments: [], ...over,
 });
-const plan = (pull) => planReconcile({ prs: [{ ...pull, statusCheckRollup: [...fastChecks, ...pull.statusCheckRollup] }], agents: [], now: Date.parse('2026-10-26T12:00:00Z'),
-  requiredChecks: ['test', 'smoke'] });
+const plan = (pull, options = {}) => planReconcile({ prs: [{ ...pull, statusCheckRollup: [
+  ...fastChecks.filter(row => !pull.statusCheckRollup.some(check => check.name === row.name)), ...pull.statusCheckRollup,
+] }], agents: [], now: Date.parse('2026-10-26T12:00:00Z'),
+  requiredChecks: ['test', 'smoke'], ...options });
 
 describe('review-gate-only red belongs to review', () => {
   it.each(['review:human', 'review:pending'])('%s dispatches review rather than ci-heal', label => {
@@ -35,6 +37,76 @@ describe('review-gate-only red belongs to review', () => {
     const result = plan(pr({ statusCheckRollup: [...checks, check('optional-ci', 'FAILURE')] }));
     expect(result.dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-heal' }));
     expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+  });
+
+  it.each([false, true].flatMap(requiredGate => ['none', 'test', 'optional-ci'].map(realRed => [requiredGate, realRed])))(
+    'review-gate required=%s with real red=%s preserves CI ownership', (requiredGate, realRed) => {
+      const result = plan(pr({ statusCheckRollup: [
+        ...checks.filter(row => row.name !== realRed),
+        ...(realRed === 'none' ? [] : [check(realRed, 'FAILURE')]),
+      ] }), { requiredChecks: ['test', 'smoke', ...(requiredGate ? ['review-gate'] : [])] });
+      if (requiredGate && realRed !== 'test') {
+        expect(result.dispatch).toEqual([]);
+        expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci' }));
+      } else {
+        expect(result.dispatch).toEqual([expect.objectContaining({ kind: realRed === 'none' ? 'review' : 'ci-heal' })]);
+      }
+    });
+
+  it.each(['test', 'standards', 'test-shard (1)', 'daemon-soak'])('cancelled required %s refuses review', name => {
+    const result = plan(pr({ statusCheckRollup: [
+      ...checks.filter(row => row.name !== name), check(name, 'CANCELLED'),
+    ] }), { requiredChecks: ['test', 'smoke', name] });
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci' }));
+  });
+
+  it.each(['review:changes', 'advisory:changes'])('%s with cancelled smoke retains a CI repair owner', label => {
+    const result = plan(pr({ labels: [{ name: 'review:human' }, { name: label }],
+      statusCheckRollup: [checks[0], check('smoke', 'CANCELLED'), checks[2]] }));
+    expect(result.dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-heal' }));
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+  });
+
+  it.each(['review:human', 'review:changes', 'advisory:changes'])('%s preserves block-ruled referral repair before review', label => {
+    const result = plan(pr({ labels: [{ name: 'review:human' }, { name: label }],
+      blockRuledReferrals: [{ key: 'blocked', finding: { file: 'example.mjs' } }],
+      statusCheckRollup: [checks[0], check('smoke', 'CANCELLED'), checks[2]] }));
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'fix', mode: 'block-ruled-referral' })]);
+  });
+
+  it('review:pending in ci-red preserves its block-ruled referral repair', () => {
+    const result = plan(pr({ labels: [{ name: 'review:pending' }],
+      blockRuledReferrals: [{ key: 'blocked', finding: { file: 'example.mjs' } }],
+      statusCheckRollup: [checks[0], check('smoke', 'CANCELLED'), checks[2]] }));
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'fix', mode: 'block-ruled-referral' })]);
+  });
+
+  it.each([1, 3])('ignored operator ruling at miss %s retains its fixer ladder owner', misses => {
+    const result = plan(pr({ ignoredRulings: { head: HEAD, misses, matches: [
+      { finding: { file: 'example.mjs' }, ruling: 'block: repair the finding', priorHead: 'b'.repeat(40), misses },
+    ] }, statusCheckRollup: [checks[0], check('smoke', 'CANCELLED'), checks[2]] }));
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+    if (misses === 1) expect(result.dispatch).toContainEqual(expect.objectContaining({ kind: 'fix', mode: 'ruling-not-addressed' }));
+    else expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'ruling-dispute' }));
+  });
+
+  it('existing review-hold-red routing remains unchanged', () => {
+    const result = plan(pr({ statusCheckRollup: [...checks, { ...check('merge-gate', 'FAILURE'),
+      mergeGateReviewHold: { holds: ['review-gate'], jobId: 5874001 } }] }),
+    { requiredChecks: ['test', 'smoke', 'merge-gate', 'review-gate'] });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals.map(row => row.kind)).toEqual(['review-hold-red']);
+  });
+
+  it.each([false, true])('held merge-gate with optional red preserves ownership when review-gate required=%s', requiredGate => {
+    const result = plan(pr({ statusCheckRollup: [...checks, check('optional-ci', 'FAILURE'),
+      { ...check('merge-gate', 'FAILURE'), mergeGateReviewHold: { holds: ['review-gate'], jobId: 5874001 } },
+    ] }), { requiredChecks: ['test', 'smoke', 'merge-gate', ...(requiredGate ? ['review-gate'] : [])] });
+    if (requiredGate) {
+      expect(result.dispatch).toEqual([]);
+      expect(result.refusals.map(row => row.kind)).toEqual(['review-hold-red']);
+    } else expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal' })]);
   });
 
   it('missing check evidence cannot dispatch review', () => {
