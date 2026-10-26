@@ -167,9 +167,10 @@ export async function planOverlayStacks({
   }
   const anc = (a, b) => a !== b && git(['merge-base', '--is-ancestor', a, b]).status === 0;
   const outLines = (r) => (r.status === 0 ? String(r.stdout ?? '').split('\n').filter((l) => l.trim()) : []);
-  // The overlay heads one daemon build merged, as `{ref, pr, sha}`: the second parent of each two-parent
+  // The overlay heads one daemon build merged, as `{ref, pr, sha}`: the second parent of each
   // `daemon-rebuild: merge overlay <ref> [(PR #n)] onto …` commit the rebuild identity committed on the build's
-  // first-parent line above main (newest 200). Local and daemon-made: an overlay's own commits sit on second-parent
+  // first-parent line above main (newest 200). An approved edge adds a third parent without changing that identity.
+  // Local and daemon-made: an overlay's own commits sit on second-parent
   // lines and carry their author's committer, so they never count. Cached per build.
   const buildCache = new Map();
   const mergedBy = (build) => {
@@ -181,7 +182,7 @@ export async function planOverlayStacks({
         const [parents, committer, ...rest] = l.split('\t');
         const ps = parents.split(' ');
         const hit = rest.join('\t').match(/^daemon-rebuild: merge overlay (\S+) (?:\(PR #(\d+)\) )?onto /);
-        if (!hit || committer !== REBUILD_COMMITTER || ps.length !== 2 || !OID.test(ps[1])) continue;
+        if (!hit || committer !== REBUILD_COMMITTER || ![2, 3].includes(ps.length) || !OID.test(ps[1])) continue;
         merged.push({ ref: hit[1], pr: hit[2] != null ? Number(hit[2]) : null, sha: ps[1] });
       }
       buildCache.set(build, merged);
@@ -376,7 +377,7 @@ export async function planRebuild({
         const [parents, committer, ...subject] = line.split('\t');
         const ps = parents.split(' ');
         const hit = subject.join('\t').match(/^daemon-rebuild: merge overlay (\S+) (?:\(PR #(\d+)\) )?onto /);
-        if (!hit || committer !== REBUILD_COMMITTER || ps.length !== 2 || !OID.test(ps[1])) continue;
+        if (!hit || committer !== REBUILD_COMMITTER || ![2, 3].includes(ps.length) || !OID.test(ps[1])) continue;
         recordedRefs.add(hit[1]);
         if (!registered.has(hit[1]) || registered.get(hit[1]) !== prKey(hit[2])) continue;
         // A graduated old tip is already carried by main; only its new, unproven changes can be dropped now.
@@ -676,12 +677,14 @@ export async function planRebuild({
       continue;
     }
 
-    // 6. mint the merge commit — fixed identity, date = the later of the two parents' committer dates, so the
-    //    same (cur, ovSha) pair always mints the identical sha (see file header — DETERMINISM).
+    // 6. Keep the overlay as second parent for adopted-head tracking. An approved edge must also be an
+    // ancestor: a later overlay with the same tree may be removed as redundant, so copying only the edge's
+    // tree would lose its history. Replay has no approved edge and keeps the ordinary two-parent shape.
+    const parents = [cur, ovSha, ...(resolution?.edgeSha ? [resolution.edgeSha] : [])];
     const message = `daemon-rebuild: merge overlay ${ref}${pr != null ? ` (PR #${pr})` : ''} onto ${cur}`
       + (resolution?.ok ? ` (resolved via ${resolution.via})` : '');
-    const ct = git(['commit-tree', tree, '-p', cur, '-p', ovSha, '-m', message], {
-      env: rebuildCommitEnv(git, cur, ovSha),
+    const ct = git(['commit-tree', tree, ...parents.flatMap((sha) => ['-p', sha]), '-m', message], {
+      env: rebuildCommitEnv(git, ...parents),
     });
     const newSha = String(ct.stdout ?? '').trim();
     if (ct.status !== 0 || !newSha) {

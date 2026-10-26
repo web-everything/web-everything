@@ -44,6 +44,10 @@ The clean-base regressions cover explicit and mechanism pins, including a preced
 makes the base clean; `pinned-stack-clean-base-order` replays adoption through the daemon soak harness.
 Each conflicting base can be deferred only once; failed tops return it to ordinary pin handling.
 Reviewed edge resolution runs before deferral, and an unreadable merge cannot authorize reordering.
+Edge-resolved rebuilds retain the registered overlay tip as their second parent and the approved edge tip
+as a third parent. Copying only its tree loses ancestry when a later overlay has identical content.
+History readers accept both merge shapes; ready-build verification allows only the approved edge as the
+extra parent, still checks current approval and content, and accepts persisted two-parent builds.
 Registered auto-rebase repairs do not trigger deferral; the mechanism-pinned
 auto-rebase cases preserve the original's conflict/loss decision, repair adoption and loss protection.
 Per-ref JSON sidecars next to the overlay
