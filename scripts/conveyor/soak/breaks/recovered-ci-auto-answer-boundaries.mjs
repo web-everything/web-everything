@@ -21,6 +21,8 @@ export default {
     const { planFixDispatchClaimStatus, runReconcileFixDispatch } = await load('scripts/conveyor/reconcile-fix-dispatch.mjs');
     const io = await load('scripts/conveyor/stand-down-auto-proceed-io.mjs');
     const { buildStandDownComment } = await load('scripts/conveyor/stand-down.mjs');
+    const { ghRepoSlug } = await load('scripts/lib/constellation-repos.mjs');
+    const weSlug = ghRepoSlug('we'), frontierSlug = ghRepoSlug('frontierui');
     const head = 'a'.repeat(40), author = { login: 'web-everything' };
     const comments = [{ id: 'SD1', author, createdAt: '2026-10-13T12:00:00Z',
       body: buildStandDownComment({ reason: 'gate-red', head }) }];
@@ -32,7 +34,7 @@ export default {
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
     const writes = [], violations = [];
     const writerOptions = {
-      repo: 'web-everything/web-everything', requiredChecks: ['test'],
+      repo: weSlug, requiredChecks: ['test'],
       selectCandidates: candidates => { writes.push('cursor'); return candidates; },
       readComments: () => comments, readHead: () => head,
       readChecks: () => ({ head, complete: true, runs: [run(101, 'failure'), run(102, 'success')] }),
@@ -77,19 +79,19 @@ export default {
         env: { WE_FIX_LOOP_RED_MAIN_DISCOUNT: 'on' } }, {
         readRows: () => rows, readMainRuns: input => {
           mainReads.push(input);
-          return input.repo === 'web-everything/web-everything' ? [
+          return input.repo === weSlug ? [
             { status: 'completed', conclusion: 'failure', updatedAt: stamp(50) },
             { status: 'completed', conclusion: 'success', updatedAt: stamp(15) },
           ] : [{ status: 'completed', conclusion: 'success', updatedAt: stamp(15) }];
         },
       });
-      if (mainReads.length !== 1 || mainReads[0].repo !== 'frontier-ui/frontierui'
+      if (mainReads.length !== 1 || mainReads[0].repo !== frontierSlug
         || mainReads[0].branch !== 'trunk' || context.repo !== 'frontierui'
         || context.config.redMainWindows?.length !== 0) violations.push('main history escaped the reconciled repository/branch');
       const parkedComments = [{ ...comments[0], createdAt: stamp(20),
         body: buildStandDownComment({ reason: 'fix-loop-exhausted', head }) }];
       io.enrichPrsWithStandDownAutoProceed([{ ...pr, comments: parkedComments }], { ...writerOptions,
-        repo: 'frontier-ui/frontierui', readContext: () => context, readComments: () => parkedComments,
+        repo: frontierSlug, readContext: () => context, readComments: () => parkedComments,
         readChecks: () => ({ head, complete: true, runs: [{ ...run(101, 'failure'), completed_at: stamp(25) }] }),
         reserve: () => { crossRepoWrites.push('reserve'); return true; },
         post: ({ body }) => { crossRepoWrites.push('post'); return { author, body }; },
