@@ -84,6 +84,8 @@ describe('planCardGroups', () => {
   });
   it('reads the overlap reason as card-only only when every shared path is a card', () => {
     expect(overlapReasonIsCardOnly('#5663 share backlog/5360-a.md')).toBe(true);
+    expect(overlapReasonIsCardOnly('#5663 share backlog/5360-a.md; blocker #5663 queued 81 min, state AWAITING_CHECKS, CI PENDING')).toBe(true);
+    expect(overlapReasonIsCardOnly('#5663 share scripts/x.mjs; blocker #5663 queued 1 min, state QUEUED, CI unknown')).toBe(false);
     expect(overlapReasonIsCardOnly('#5736 share scripts/lib/x.test.mjs')).toBe(false);
     expect(overlapReasonIsCardOnly('#1,#2 share backlog/1-a.md, scripts/x.mjs')).toBe(false);
     expect(cardOnlyFiles(['backlog/1-a.md'])).toBe(true);

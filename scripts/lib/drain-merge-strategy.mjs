@@ -63,7 +63,7 @@ import { mergeActionFor, enqueuePr, planQueueFollowUps, REQUIRED_WORKFLOWS_UNSAT
 import { getRequiredStatusChecks } from './required-status-checks.mjs';
 import { readSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { queueFileOverlap, readQueueEntryFiles, completeListedFiles } from './queue-file-overlap.mjs';
+import { queueFileOverlap, readQueueEntryFiles, completeListedFiles, blockerSummary } from './queue-file-overlap.mjs';
 import { cardOverlapRelief, readCardOverlapCleanMerge, readQueueTip as defaultReadQueueTip } from './card-overlap-clean-merge.mjs';
 import { gitRealFiles, resolveRealFiles as defaultResolveRealFiles } from './pr-real-files.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
@@ -643,7 +643,8 @@ export function createDrainMergeStrategy({
       queuedEntries: queue.entries.filter(entry => entry.num !== c.num),
       includeCards: safety.value.queueFileOverlapIncludesCards ?? true });
     const files = [...new Set(overlap.with.flatMap(entry => entry.files))].slice(0, 3);
-    return { ...overlap, reason: `${overlap.with.map(entry => `#${entry.num}`).join(',')} share ${files.join(', ')}` };
+    const detail = overlap.with[0]?.blocker ? `; blocker ${blockerSummary(overlap.with[0], now())}` : '';
+    return { ...overlap, reason: `${overlap.with.map(entry => `#${entry.num}`).join(',')} share ${files.join(', ')}${detail}` };
   };
 
   return {
