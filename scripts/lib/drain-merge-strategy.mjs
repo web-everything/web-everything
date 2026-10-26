@@ -34,6 +34,7 @@ import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
  */
 import { sweepStuckEntries } from './merge-queue-stuck-dequeue.mjs';
 import { guardEnqueue } from './drain-poison-guard.mjs';
+import { countTrustedLeadingMarker } from './marker-authorship.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
 import { labelSignature } from './drain-prestage.mjs';
 import { readDrainRedTeamEvidence } from './drain-red-team-evidence.mjs';
@@ -530,23 +531,29 @@ export function createDrainMergeStrategy({
         if (freshHeld !== freshLabelHold) return { enqueued: false, deferred: true, kind: 'sent-back', reason: freshHeld };
       }
       if (freshLabelHold) return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: freshLabelHold };
-      // A current, head-bound list with no backlog changes also proves there are no added cards.
-      const surface = preparedAdmission ? prepared.preparedSurface : null;
-      const poisonExec = (cmd, args, options) => {
-        if (cmd === 'git' && (args[0] === 'diff' || args[0] === 'fetch') && surface?.headSha === headSha && surface.base === 'main'
-          && /^[a-f0-9]{40}$/i.test(surface.baseSha ?? '') && Array.isArray(surface.files)
-          && surface.files.every(path => typeof path === 'string' && !path.startsWith('backlog/'))) {
-          const tip = String(exec('git', ['ls-remote', '--exit-code', 'origin', 'refs/heads/main'],
-            { ...options, timeout: 60_000 })).trim().split(/\s+/)[0];
-          if (tip === surface.baseSha) return '';
-        }
-        return exec(cmd, args, options);
-      };
-      const poison = guardEnqueue({ c, headSha, repo: slugOf(c.repo), exec: poisonExec, cwd,
+      // Prepared file lists do not substitute for fresh Git evidence at identity admission.
+      const poison = guardEnqueue({ c, headSha, repo: slugOf(c.repo), exec, cwd,
         emit: event => appendDaemonEvent(event, { env }),
-        comment: body => {
-          try { exec('gh', ['pr', 'comment', String(c.num), '--repo', slugOf(c.repo), '--body', body], { encoding: 'utf8' }); } catch { /* Best effort. */ }
-          try { exec('gh', ['pr', 'edit', String(c.num), '--repo', slugOf(c.repo), '--add-label', 'review:changes'], { encoding: 'utf8' }); } catch { /* Best effort. */ }
+        comment: (body, { kind, marker }) => {
+          let commented = false;
+          try {
+            const pages = readThreadPages(c.repo, c.num);
+            if (!Array.isArray(pages) || pages.some(page => !Array.isArray(page))) throw new Error('malformed comments response');
+            if (!countTrustedLeadingMarker(pages.flat(), marker)) {
+              exec('gh', ['pr', 'comment', String(c.num), '--repo', slugOf(c.repo), '--body', `${marker}\n${body}`],
+                { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] });
+            }
+            commented = true;
+          } catch { /* Unknown thread/delivery retries next pass without posting duplicates. */ }
+          let labelled = kind !== 'bornas-collision';
+          if (!labelled) {
+            try {
+              exec('gh', ['pr', 'edit', String(c.num), '--repo', slugOf(c.repo), '--add-label', 'review:changes'],
+                { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] });
+              labelled = true;
+            } catch { /* Retry the label independently of the durable comment marker. */ }
+          }
+          return commented && labelled;
         } });
       if (poison) return poison;
       const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, cwd, exec, ...(preparedAdmission ? { preparedSurface: prepared.preparedSurface } : {}) });

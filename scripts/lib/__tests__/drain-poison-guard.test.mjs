@@ -80,6 +80,30 @@ describe('guardEnqueue', () => {
     for (let i = 0; i < 2; i++) guardEnqueue({ c, headSha: sha, repo: 'o/r', exec: fakeExec(), emit: vi.fn(), comment, seen });
     expect(comment).toHaveBeenCalledTimes(1);
   });
+  it('retries a failed notification for the same head', () => {
+    const comment = vi.fn().mockImplementationOnce(() => { throw new Error('outage'); }).mockReturnValue(true);
+    const seen = new Set();
+    for (let i = 0; i < 3; i++) guardEnqueue({ c, headSha: sha, repo: 'o/r', exec: fakeExec(), comment, seen });
+    expect(comment).toHaveBeenCalledTimes(2);
+  });
+  it.each(['false', 'rejection'])('retries delivery after a callback reports %s', async mode => {
+    const seen = new Set();
+    const comment = vi.fn().mockImplementationOnce(() => mode === 'false' ? false : Promise.reject(new Error('outage'))).mockReturnValue(true);
+    guardEnqueue({ c, headSha: sha, repo: 'o/r', exec: fakeExec(), comment, seen });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(seen.size).toBe(0);
+    guardEnqueue({ c, headSha: sha, repo: 'o/r', exec: fakeExec(), comment, seen });
+    expect(comment).toHaveBeenCalledTimes(2);
+    expect(seen.size).toBe(1);
+  });
+  it('keeps raw Git errors out of the public refusal reason and comment', () => {
+    const comment = vi.fn();
+    const exec = () => { throw new Error('https://secret-token@example.invalid /private/clone'); };
+    const out = guardEnqueue({ c, headSha: sha, repo: 'o/r', exec, comment, seen: new Set() });
+    expect(out.reason).not.toContain('secret-token');
+    expect(comment.mock.calls[0][0]).not.toContain('/private/clone');
+  });
 });
 
 describe('enqueueOutcomeEvent', () => {
