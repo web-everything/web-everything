@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -19,12 +19,27 @@ beforeEach(() => {
 afterEach(() => rmSync(scratch, { recursive: true, force: true }));
 
 describe('daemon event asynchronous failure isolation', () => {
-  it('appendDaemonEvent returns false when storage rejects asynchronously', async () => {
+  it.each(['rebuild-failed', 'pr-looping', 'pr-no-progress', 'ci-job-overdue', 'pr-merged', 'pr-ready-not-merging'])('appendDaemonEvent returns false when storage rejects asynchronously (%s)', async kind => {
     const appendFile = vi.fn().mockRejectedValue(new Error('storage unavailable'));
-    await expect(appendDaemonEvent({ kind: 'rebuild-failed', detail: { reason: 'held' } }, {
+    await expect(appendDaemonEvent({ kind, detail: { reason: 'held' } }, {
       env: { WE_DAEMON_EVENTS: join(scratch, 'events.jsonl') }, appendFile,
     })).resolves.toBe(false);
     expect(appendFile).toHaveBeenCalledTimes(1);
+  });
+
+  it('appendDaemonEvent persists both merge-watch event kinds through the real writer', async () => {
+    const file = join(scratch, 'events.jsonl');
+    const events = [
+      { kind: 'pr-merged', repo: 'example/widgets', pr: 17 },
+      { kind: 'pr-ready-not-merging', repo: 'example/widgets', pr: 17,
+        detail: { minutes: 61, head: 'a'.repeat(40) } },
+    ];
+    for (const event of events) {
+      await expect(appendDaemonEvent(event, { env: { WE_DAEMON_EVENTS: file } })).resolves.toBe(true);
+    }
+    const saved = readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(saved).toHaveLength(2);
+    events.forEach((event, index) => expect(saved[index]).toMatchObject(event));
   });
 
   it.each([true, false])('rebuildClone preserves its result when emitEvent rejects (moved=%s)', async (moved) => {

@@ -196,6 +196,7 @@ export const DAEMON_MANIFEST = {
     alertOnConsecutiveFailures: true },
   // Card 106 — durable schedules (we:scripts/operations/scheduled-sweep.mjs). Opt-in: `defaultLaunch:false` keeps
   // them out of the supervisor's default set; the operator installs them with install-scheduled-sweeps.mjs.
+  'pr-merge-watch': { script: 'scripts/conveyor/pass-daemons/pr-merge-watch-pass.mjs', args: [`--repo=${CONSTELLATION_REPOS.we.slug}`], intervalMs: 5 * 60_000, defaultLaunch: false },
   'pr-movement-sweep': { script: 'scripts/operations/scheduled-sweep.mjs', args: ['run', 'pr-movement'], intervalMs: 30 * 60_000, defaultLaunch: false },
   'coroner-sweep': { script: 'scripts/operations/scheduled-sweep.mjs', args: ['run', 'coroner'], intervalMs: 6 * 60 * 60_000, defaultLaunch: false },
   'opus-sweep': { script: 'scripts/operations/scheduled-sweep.mjs', args: ['run', 'opus'], intervalMs: 24 * 60 * 60_000, defaultLaunch: false },
