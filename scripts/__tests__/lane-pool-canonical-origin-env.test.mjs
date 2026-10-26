@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { scrubGitRepoEnv } from '../lib/lane-git-hardening.mjs';
@@ -139,4 +139,78 @@ describe('lane-pool canonical origin env', () => {
     expect(result.status, result.stderr).toBe(0);
     expect(result.stdout.trim()).toBe(selectedLane);
   });
+
+  it.each(['reference', 'repo'])(
+    'resolves an explicit %s independently of the inherited canonical origin', selector => {
+      const caller = join(base, 'caller');
+      const selected = join(base, 'selected');
+      for (const [dir, name] of [[caller, 'caller'], [selected, 'selected']]) {
+        mkdirSync(dir);
+        git(dir, ['init', '--quiet']);
+        git(dir, ['remote', 'add', 'origin', `https://example.com/${name}.git`]);
+      }
+      const selectedLane = join(poolRoot, 'selected', 'lane-1');
+      mkdirSync(selectedLane, { recursive: true });
+      const result = spawnSync(process.execPath, [script, 'path', '--lane=1',
+        `--${selector}=${selected}`], {
+        cwd: caller, env: { ...env, LANE_POOL_CANONICAL_ORIGIN: 'https://example.com/caller.git' },
+        encoding: 'utf8', timeout: 15_000, maxBuffer: 64 * 1024,
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout.trim()).toBe(selectedLane);
+    },
+  );
+
+  it.each([
+    ['configured', 'sweep'], ['missing', 'sweep'], ['without origin', 'sweep'],
+    ['configured', 'pool'], ['missing', 'pool'], ['without origin', 'pool'],
+    ['configured', 'reference'], ['configured', 'repo'],
+  ])(
+    'never sends another pool\'s unpublished commit to the inherited origin (%s primary, %s)', (state, selector) => {
+      const caller = join(base, 'caller');
+      const callerOrigin = join(base, 'caller.git');
+      const other = join(base, 'secondary');
+      const otherOrigin = join(base, 'secondary.git');
+      const lane = join(poolRoot, 'secondary', 'lane-1');
+      git(base, ['clone', '--quiet', '--bare', root, callerOrigin]);
+      git(base, ['clone', '--quiet', callerOrigin, caller]);
+      git(base, ['clone', '--quiet', '--bare', root, otherOrigin]);
+      if (state !== 'missing') {
+        git(base, ['clone', '--quiet', otherOrigin, other]);
+        if (state === 'without origin') git(other, ['remote', 'remove', 'origin']);
+      }
+      mkdirSync(join(poolRoot, 'secondary'), { recursive: true });
+      git(base, ['clone', '--quiet', otherOrigin, lane]);
+      git(lane, ['-c', 'user.name=Test', '-c', 'user.email=test@example.com',
+        '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', 'commit', '--quiet', '--allow-empty', '-m', 'private work']);
+      const sha = git(lane, ['rev-parse', 'HEAD']).trim();
+      const marker = join(lane, '.git', '.lane-lease');
+      writeFileSync(marker, JSON.stringify({ session: 'origin-env-holder', acquiredAt: new Date().toISOString() }));
+      // Neither inherited environment nor lane-controlled config can authorize this destination.
+      git(lane, ['remote', 'set-url', 'origin', callerOrigin]);
+      const selection = selector === 'sweep' ? ['--all-pools']
+        : ['--lane=1', '--pool=secondary', ...(selector === 'pool' ? [] : [`--${selector}=${other}`])];
+      const result = spawnSync(process.execPath, [script, 'release', ...selection,
+        '--session=origin-env-holder', '--json'], {
+        cwd: caller, env: { ...env, LANE_POOL_CANONICAL_ORIGIN: callerOrigin,
+          LANE_POOL_AUTO_RECOVER: '1', LANE_POOL_NO_RECOVER: '0', WE_LANE_BACKUP_ROOT: join(base, 'backups') },
+        encoding: 'utf8', timeout: 30_000, maxBuffer: 64 * 1024,
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout).released).toBe(1);
+      expect(existsSync(marker)).toBe(false);
+      expect(git(base, ['ls-remote', '--heads', callerOrigin, 'refs/heads/salvage/*']).trim()).toBe('');
+      const salvaged = git(base, ['ls-remote', '--heads', otherOrigin, 'refs/heads/salvage/*']).trim();
+      if (state === 'configured') {
+        expect(result.stderr).not.toContain('SALVAGE PUSH FAILED');
+        expect(salvaged).toMatch(new RegExp(`^${sha}\\s+refs/heads/salvage/lane-1-`));
+      } else {
+        expect(result.stderr).toContain('canonical origin unresolved');
+        expect(salvaged).toBe('');
+        expect(git(lane, ['rev-parse', 'HEAD']).trim()).toBe(sha);
+      }
+    }, 35_000,
+  );
 });
