@@ -58,7 +58,10 @@
  */
 import { readFixPush } from './fix-push-state.mjs';
 import { resolveHandoffSettings } from '../lib/handoff-settings.mjs';
-import { resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { handoffHome } from '../operations/handoff-home.mjs';
+import { appendDaemonEvent } from '../lib/daemon-events.mjs';
 import { randomUUID } from 'node:crypto';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
 import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
@@ -1392,6 +1395,146 @@ export function formatMissingRunReport({ dispatch = [], refusals = [], applied =
   return lines.join('\n');
 }
 
+function readMainRetriggerRecord(path) {
+  try { return JSON.parse(readFileSync(path, 'utf8')); }
+  catch (e) {
+    if (e.code === 'ENOENT') return {};
+    throw e;
+  }
+}
+
+function writeMainRetriggerRecord(path, record) {
+  mkdirSync(dirname(path), { recursive: true });
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  writeFileSync(temporary, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+  renameSync(temporary, path);
+}
+
+export function rerunMainCancelledRun(runId, { repo = null, exec = execFileSyncThrottled } = {}) {
+  try {
+    exec('gh', ['api', '-X', 'POST', `repos/${repoSlug(repo)}/actions/runs/${runId}/rerun`], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024,
+      timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+    });
+    return { ok: true };
+  } catch (e) {
+    const error = describeExecError(e);
+    // An explicit API rejection is retryable; a timeout/transport failure may
+    // have lost the acknowledgement after GitHub accepted the rerun.
+    return { ok: false, error, uncertain: !/\bHTTP 4(?!08)\d\d\b/.test(error) };
+  }
+}
+
+/** One whole-run retry per main head, then a durable, once-only stuck signal.
+ * Record IO is synchronous; event delivery is best-effort and cannot fail the sweep.
+ * Unreadable evidence refuses action: restore the record or inspect main CI before retrying. */
+export function sweepMainCancelledRetrigger({ repo = null, defaultBranch = 'main', apply = false,
+  readMainRuns = defaultReadMainRuns, rerun = rerunMainCancelledRun,
+  recordPath = join(handoffHome(), 'main-ci-retrigger.json'),
+  readRecord = readMainRetriggerRecord, writeRecord = writeMainRetriggerRecord,
+  emitEvent = event => appendDaemonEvent({ ...event, daemon: 'ci-red-recovery-watch' }),
+  now = Date.now(),
+} = {}) {
+  const result = { dispatch: [], refusals: [], applied: [] };
+  const refuse = (reason, detail = {}) => {
+    result.refusals.push({ reason, ...detail });
+    return result;
+  };
+  let runs;
+  try {
+    runs = readMainRuns({ repo, branch: defaultBranch, workflowName: DEFAULT_MAIN_WORKFLOW_NAME });
+    if (!Array.isArray(runs) || runs.some(r => typeof r?.workflowName !== 'string')) throw Error('incomplete main run history');
+    runs = runs.filter(r => r.workflowName === DEFAULT_MAIN_WORKFLOW_NAME);
+    if (runs.some(r => !Number.isFinite(Date.parse(r.createdAt)) || typeof r.headSha !== 'string' || !r.headSha || !r.status)) throw Error('incomplete main run evidence');
+  } catch (e) { return refuse('main-runs-unreadable', { error: describeExecError(e) }); }
+  if (!runs.length) return result;
+  const newest = [...runs].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
+  const sha = newest.headSha;
+  const runId = newest.databaseId;
+  if (runs.some(r => r.headSha === sha && ['queued', 'in_progress', 'waiting', 'pending'].includes(r.status))) {
+    return refuse('in-progress', { sha, runId });
+  }
+  if (newest.status !== 'completed' || !['cancelled', 'skipped'].includes(newest.conclusion)) return result;
+  if (!/^[1-9]\d*$/.test(String(runId))) return refuse('invalid-run-id', { sha });
+  let record;
+  try {
+    record = readRecord(recordPath);
+    if (!record || Array.isArray(record) || typeof record !== 'object' || Object.values(record).some(entry =>
+      !entry || !/^[1-9]\d*$/.test(String(entry.runId)) || !Number.isFinite(Date.parse(entry.retriggeredAt)) ||
+      (entry.stuck !== undefined && typeof entry.stuck !== 'boolean') ||
+      (entry.reserved !== undefined && typeof entry.reserved !== 'boolean'))) throw Error('invalid main retrigger record');
+  } catch (e) {
+    return refuse('record-unreadable', { sha, runId,
+      error: `${describeExecError(e)}; restore the attempt record or inspect main CI before retrying` });
+  }
+  const previous = Object.hasOwn(record, sha) ? record[sha] : null;
+  if (previous?.stuck) return result;
+  // A successful rerun request is not evidence that its attempt has finished. GitHub
+  // can still return the original cancellation for several sweeps. Reruns retain
+  // their run ID and createdAt, so require a completed observation updated after
+  // the request, or a distinct newest run, before consuming the stuck signal.
+  if (previous && String(previous.runId) === String(runId) &&
+    !(Date.parse(newest.updatedAt) > Date.parse(previous.retriggeredAt))) {
+    if (previous.reserved) return refuse('rerun-outcome-unknown', { sha, runId,
+      error: 'inspect main CI; clear the reservation only after confirming that no rerun was accepted' });
+    return result;
+  }
+  const action = previous ? 'main-ci-stuck' : 'main-ci-retriggered';
+  const dispatch = { action, sha, runId };
+  result.dispatch.push(dispatch);
+  if (!apply) return result;
+  const boundedRecord = entry => Object.fromEntries([[sha, entry], ...Object.entries(record)
+    .filter(([key]) => key !== sha)
+    .sort((a, b) => Date.parse(b[1].retriggeredAt) - Date.parse(a[1].retriggeredAt)).slice(0, 19)]);
+  const attempt = previous
+    ? { runId: previous.runId, retriggeredAt: previous.retriggeredAt, stuck: true }
+    : { runId, retriggeredAt: new Date(now).toISOString() };
+  if (!previous) {
+    // Reserve durably BEFORE the remote write. A crash, lost acknowledgement,
+    // or failed confirmation write must never make this head eligible again.
+    try { writeRecord(recordPath, boundedRecord({ ...attempt, reserved: true })); }
+    catch (e) {
+      result.applied.push({ ...dispatch, ok: false, error: `reservation failed: ${describeExecError(e)}` });
+      return result;
+    }
+    let outcome;
+    // Injectable rerunners may return ok:false for a confirmed rejection;
+    // uncertain:true (or a thrown error) retains the reservation for inspection.
+    try { outcome = rerun(runId, { repo }); }
+    catch (e) { outcome = { ok: false, uncertain: true, error: describeExecError(e) }; }
+    if (outcome?.ok !== true) {
+      let error = outcome?.error ?? 'rerun did not confirm success';
+      if (outcome?.ok === false && outcome.uncertain !== true) {
+        try { writeRecord(recordPath, record); }
+        catch (e) { error += `; reservation rollback failed: ${describeExecError(e)}; inspect main CI before clearing the reservation`; }
+      } else error += '; reservation retained; inspect main CI before clearing it';
+      result.applied.push({ ...dispatch, ok: false, error });
+      return result;
+    }
+  }
+  // Always retain the head being acted on, including when an oversized old record is supplied.
+  try { writeRecord(recordPath, boundedRecord(attempt)); }
+  catch (e) {
+    result.applied.push({ ...dispatch, ok: false,
+      error: `${describeExecError(e)}; attempt remains recorded; inspect main CI before changing the record` });
+    return result;
+  }
+  try { Promise.resolve(emitEvent({ kind: action, detail: { sha, runId } })).catch(() => {}); }
+  catch { /* Best-effort events; the durable record is authoritative. */ }
+  result.applied.push({ ...dispatch, ok: true });
+  return result;
+}
+
+export function formatMainCancelledReport({ dispatch = [], refusals = [], applied = [] } = {}) {
+  const lines = [`ci-red-recovery-watch (main-cancelled) — ${dispatch.length} dispatch, ${refusals.length} refusal(s), ${applied.length} applied`];
+  for (const d of dispatch) {
+    const outcome = applied.find(a => a.sha === d.sha);
+    lines.push(`  ${outcome ? (outcome.ok ? '✓' : '✗') : '→'} ${d.action} ${d.sha}${outcome?.error ? ` — ${markerFreeText(outcome.error)}` : ''}`);
+  }
+  for (const r of refusals) lines.push(`  ✗ ${r.reason} ${r.sha ?? '(unknown sha)'}${r.error ? ` — ${markerFreeText(r.error)}` : ''}`);
+  return lines.map(line => line.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')).join('\n');
+}
+
 // ── CLI ──────────────────────────────────────────────────────────────────────────────────────────────────────
 
 function parseFlags(argv) {
@@ -1419,6 +1562,7 @@ export function formatReport({ dispatch = [], refusals = [], applied = [] } = {}
 // Injectable CLI boundary: regression tests exercise the same orchestration that the daemon invokes.
 export async function main(argv, { sweepOptions = {}, sweepMainRed = sweepCiRedRecovery,
   sweepExhausted = sweepExhaustedRetry, sweepHung = sweepHungCiRecovery, sweepMissingRun = sweepMissingRunRecovery,
+  sweepMainCancelled = sweepMainCancelledRetrigger,
   writeLine = writeLineSync, writeAll = writeAllSync } = {}) {
   const [verbRaw, ...rest] = argv;
   const verb = verbRaw && !verbRaw.startsWith('--') ? verbRaw : 'sweep';
@@ -1461,14 +1605,16 @@ export async function main(argv, { sweepOptions = {}, sweepMainRed = sweepCiRedR
   // open-PR listing for the same reason (a PR wrongly stuck on `checking`), and the daemon-manifest entry that
   // already schedules this script gets the missing-run fix for free rather than needing a third entry.
   const missingRunResult = runPass('missing-run', sweepMissingRun, { ...options, mainRuns: result.mainRuns?.length ? result.mainRuns : null });
+  const mainCancelledResult = runPass('main-cancelled', sweepMainCancelled, options);
   if (flags.json) {
     writeLine(2, formatExhaustedRetryReport(exhaustedResult).split('\n')[0]);
-    writeAll(1, `${JSON.stringify({ mainRedRecovery: result, hungRecovery: hungResult, missingRunRecovery: missingRunResult, exhaustedRetry: exhaustedResult })}\n`);
+    writeAll(1, `${JSON.stringify({ mainRedRecovery: result, hungRecovery: hungResult, missingRunRecovery: missingRunResult, exhaustedRetry: exhaustedResult, mainCancelledRetrigger: mainCancelledResult })}\n`);
   } else {
     writeLine(2, formatReport(result));
     writeLine(2, formatExhaustedRetryReport(exhaustedResult));
     writeLine(2, formatHungReport(hungResult));
     writeLine(2, formatMissingRunReport(missingRunResult));
+    writeLine(2, formatMainCancelledReport(mainCancelledResult));
   }
   process.exitCode = failed ? 1 : 0;
 }
