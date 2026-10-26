@@ -1657,6 +1657,40 @@ describe('block and not-real rulings', () => {
     expect(f.posted[0]).toMatch(/outcome=operator-block result=[0-9a-f]{16} -->/);
     expect(f.posted[0]).toContain('sent back to the fixer (#1)');
   });
+  it.each([[true, 1], [true, 2], [false, 1], [false, 2]])('block: rejects proof when only one of two selected findings is held or sent back (capped=%s, advisory=#%s)', async (atCap, advisoryIndex) => {
+    const comments = [redTeam(HEAD, [1, 2].map(index => ({ summary: `Confirmed break ${index}`, category: 'edge-case',
+      impactIfUnfixed: 'broken', file: 'backlog/x.md', line: 24 + index, confirmedByRecheck: true }))), ...(atCap ? [capped()] : [])];
+    const labels = ['review:changes'];
+    const p = payloadFor({ ruling: 'block', break: '1,2' }, { comments, labels });
+    expect(p.indices).toEqual([1, 2]);
+    const disposition = () => readRedTeamDisposition({ comments: operatorBoundComments(comments), repo, pr: PR,
+      head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } });
+    expect(disposition()[atCap ? 'held' : 'sendBack'].map(f => f.index)).toEqual([1, 2]);
+    const posted = [], labelCalls = [], events = [], syncs = [];
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: HEAD, labels: [...labels], comments: [...comments] }),
+      readScope: () => ({ value: { anyState: true } }), readStandingRulingScope: () => null, resolveIdentity: () => OP,
+      post: (_repo, _pr, body) => {
+        posted.push(body);
+        comments.push({ author: OP, createdAt: '2026-10-20T23:55:00Z', body });
+        // A concurrent operator release wins for just one finding before the block's read-back.
+        // Keep the block record intact so only the per-finding coverage proof can reject it.
+        if (posted.length === 2) comments.push({ author: OP, createdAt: '2026-10-20T23:56:00Z',
+          body: `${redTeamGateMarker(PR, HEAD, 'operator-not-real', p.resultId)}\n**Red-team gate** operator ruling:\n- 1 finding(s) left advisory (#${advisoryIndex}).` });
+      },
+      runSetLabel: (_exe, args) => { labelCalls.push(args); return '{"ok":true}'; },
+      appendEvents: async rows => { events.push(...rows); }, syncLabels: args => { syncs.push(args); },
+    });
+    await expect(sinks[RED_TEAM_RULING_BLOCK_EFFECT](p)).rejects.toThrow(`the gate does not hold break(s) #${advisoryIndex};`);
+    expect(posted).toHaveLength(2);
+    expect(posted[0]).toContain('sent back to the fixer (#1, #2)');
+    expect(disposition()[atCap ? 'held' : 'sendBack'].map(f => f.index)).toEqual([3 - advisoryIndex]);
+    expect(disposition()[atCap ? 'sendBack' : 'held']).toEqual([]);
+    expect(operatorRulingsOnLiveResult(operatorBoundComments(comments), PR, HEAD).ruled.get(advisoryIndex).at(-1)).toBe('advisory');
+    expect(labelCalls).toEqual([]);
+    expect(events).toEqual([]);
+    expect(syncs).toEqual([]);
+  });
   it('block: can block again after applyRedTeamGate files the finding as card-queued', async () => {
     const comments = [redTeam(HEAD, [{ summary: 'Degraded recovery', category: 'edge-case',
       impactIfUnfixed: 'degraded', file: 'backlog/x.md', line: 24, confirmedByRecheck: true }])];
