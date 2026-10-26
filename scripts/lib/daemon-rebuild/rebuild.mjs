@@ -24,6 +24,25 @@ import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
 
 // ── rebuildClone — the IO shell ──────────────────────────────────────────────────────────────────────────────
 
+// Only explicit failures belong in the coordination feed. Holds, contention and
+// unknown future reasons stay quiet; the reason-inventory contract test requires
+// new reasons to be classified. `error` covers versionedRebuild's error: <detail>.
+export const FAILURE_REASONS = new Set([
+  'candidate-worktree-failed', 'deps-job-queue-failed', 'dispatch-smoke-failed',
+  'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed',
+  'git-common-dir-failed', 'git-dir-unreadable', 'head-unresolved', 'launch-failed',
+  'main-unresolved', 'merge-tree-failed', 'no-origin-url', 'not-built',
+  'overlay-state-corrupt', 'pinned-overlay-conflict', 'pinned-overlay-unavailable',
+  'pinned-unparsable', 'pinned-unreadable', 'pinned-write-failed', 'quarantined',
+  'rebuild-error', 'rebuild-interrupted-unrecoverable', 'rebuild-job-queue-failed',
+  'rebuild-threw', 'reset-failed', 'reset-rollback-failed', 'restore-failed',
+  'rev-parse-failed', 'rollback-failed', 'save-failed', 'scratch-init-failed',
+  'smoke-failed', 'smoke-harness-broken', 'smoke-rejected', 'smoke-retry',
+  'smoke-reused-env-failed', 'smoke-threw', 'state-file-unparsable', 'state-file-unreadable',
+  'status-failed', 'status-unreadable', 'still-rejected', 'swap-failed', 'switch-failed',
+  'worktree-add-failed', 'error',
+]);
+
 /**
  * Rebuild `root` fresh from `origin/main` + its registered overlay list. See the file header (xa4qo7n) for the
  * full three-step design — {@link prepareRebuild} (locked, fast) → build + smoke a disposable candidate
@@ -41,19 +60,13 @@ import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
 export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options } = {}) {
   const result = await rebuildCloneInternal(options);
   try {
-    const idle = new Set([
-      'up-to-date', 'ready-pending', 'needs-build', 'no-op', 'already-adopted',
-      'ready-recorded', 'rebuild-in-progress',
-      'rebuild-job-started', 'rebuild-job-running', 'rebuild-job-spaced',
-      'already-head', 'already-on-main', 'no-change', 'none', 'in-main', 'skipped-unrelated',
-      'deps-job-running', 'deps-job-spaced', 'deps-job-started', 'applied-pinned', 'stack-contained',
-      'pinned-contained-in-applied', 'overlay-no-longer-wanted', 'clone-recloned', 'smoke-harness-broken-backoff',
-    ]);
-    if (result.adopted || result.moved) {
+    // adopted also describes a sibling's completed swap or crash recovery.
+    // Only moved proves this invocation actually changed the running build.
+    if (result.moved === true) {
       await emitEvent({
         kind: 'rebuild-adopted', daemon: basename(options.root), detail: { sha: result.head },
       }, { env: options.env });
-    } else if (result.reason && !idle.has(result.reason)) {
+    } else if (typeof result.reason === 'string' && FAILURE_REASONS.has(result.reason.split(':', 1)[0])) {
       await emitEvent({
         kind: 'rebuild-failed', daemon: basename(options.root), detail: { reason: result.reason },
       }, { env: options.env });
