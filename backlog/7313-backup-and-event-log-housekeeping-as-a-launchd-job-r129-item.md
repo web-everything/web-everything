@@ -1,16 +1,17 @@
 ---
+bornAs: xybkuvw
 kind: story
 size: 3
-parent: "xhuyhbg"
+parent: "7312"
 status: open
-scope: ["we:scripts/operations/telemetry.mjs"]
+scope: ["we:scripts/operations/"]
 dateOpened: "2026-10-26"
 tags: []
 ---
 
-# Event writer appends quiet-hours logs to the handoff file directly (R129 item 10)
+# Backup and event-log housekeeping as a launchd job (R129 item 8)
 
-During quiet hours the event writer appends events to the handoff file itself; the session only reads. Part of R129.
+Run we:backup-ops.sh and event-log housekeeping from a launchd job instead of the orchestrator doing it by hand. Part of R129.
 
 ## Acceptance
 

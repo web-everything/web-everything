@@ -1,16 +1,17 @@
 ---
+bornAs: x0slz3p
 kind: story
-size: 3
-parent: "xhuyhbg"
+size: 5
+parent: "7312"
 status: open
-scope: ["we:scripts/operations/"]
+scope: ["we:scripts/conveyor/fix-procedure.mjs"]
 dateOpened: "2026-10-26"
 tags: []
 ---
 
-# Backup and event-log housekeeping as a launchd job (R129 item 8)
+# Daemon-held detection: extend bundle repair to the review daemon (R129 item 2)
 
-Run we:backup-ops.sh and event-log housekeeping from a launchd job instead of the orchestrator doing it by hand. Part of R129.
+Bundle repair for a daemon-held PR is live for drain and fix (R124). Extend it to the review daemon after a watched run, so the orchestrator stops detecting review holds by hand. Part of R129.
 
 ## Acceptance
 

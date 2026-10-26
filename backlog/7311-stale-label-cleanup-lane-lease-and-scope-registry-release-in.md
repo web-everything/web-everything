@@ -1,7 +1,8 @@
 ---
+bornAs: xg867w8
 kind: story
 size: 5
-parent: "xhuyhbg"
+parent: "7312"
 status: open
 scope: ["we:scripts/conveyor/lease-reaper.mjs"]
 dateOpened: "2026-10-26"

@@ -1,16 +1,17 @@
 ---
+bornAs: xftu1np
 kind: story
-size: 5
-parent: "xhuyhbg"
+size: 3
+parent: "7312"
 status: open
-scope: ["we:scripts/conveyor/fix-procedure.mjs"]
+scope: ["we:scripts/operations/telemetry.mjs"]
 dateOpened: "2026-10-26"
 tags: []
 ---
 
-# Daemon-held detection: extend bundle repair to the review daemon (R129 item 2)
+# Event writer appends quiet-hours logs to the handoff file directly (R129 item 10)
 
-Bundle repair for a daemon-held PR is live for drain and fix (R124). Extend it to the review daemon after a watched run, so the orchestrator stops detecting review holds by hand. Part of R129.
+During quiet hours the event writer appends events to the handoff file itself; the session only reads. Part of R129.
 
 ## Acceptance
 
