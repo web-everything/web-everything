@@ -863,7 +863,7 @@ describe('red-team-only review job', () => {
     };
     const realIo = createReviewJobIo({ env, readStatus });
     const io = fakeIo({
-      runLoop: () => ({ status: 0, stdout: JSON.stringify(payload()) }),
+      runLoop: () => ({ status: 0, stdout: JSON.stringify({ ...payload(), stopped: 'complete' }) }),
       redTeamStatus: input => { calls.push(input.status); return realIo.redTeamStatus(input); },
       unclaim: () => calls.push('unclaim'),
       runRedTeam: () => { calls.push('red-team'); return { status: 'ran' }; },
@@ -972,7 +972,7 @@ describe('red-team-only review job', () => {
     const args = { pr, repo, lanePath: '/lanes/lane-7' };
     expect(prepareReviewArc(args, { prepareLane })).toEqual({ head });
     for (const redTeamOnly of [false, true]) {
-      const io = fakeIo({ prepareLane, runLoop: vi.fn(() => ({ status: 0, stdout: JSON.stringify(payload()) })) });
+      const io = fakeIo({ prepareLane, runLoop: vi.fn(() => ({ status: 0, stdout: JSON.stringify({ ...payload(), stopped: 'complete' }) })) });
       runReviewJob({ pr, repo, redTeamOnly }, io);
       expect(io.prepareLane).toBe(prepareLane);
       expect(io.fetchRedTeamHead).toHaveBeenCalledTimes(redTeamOnly ? 1 : 0);
@@ -1245,6 +1245,39 @@ describe('red-team-only review job', () => {
     const io = fakeIo({ claim: () => ({ ok: false, heldBy: 99 }) });
     expect(runReviewJob({ pr, repo, redTeamOnly: true }, io).outcome).toBe('refused-live-job');
     expect(io.acquireLane).not.toHaveBeenCalled(); expect(io.runRedTeam).not.toHaveBeenCalled();
+  });
+});
+
+describe('accepted head-move full review dispatch', () => {
+  it('plain recovery dispatch spawns an ordinary job and runs its full loop plus red team', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'accepted-head-review-'));
+    const io = fakeIo({ runLoop: vi.fn(() => ({ status: 0, stdout: JSON.stringify({ ...payload(), stopped: 'complete' }) })) });
+    const spawnJob = vi.fn(() => {
+      runReviewJob({ pr, repo }, io);
+      return 4242;
+    });
+    try {
+      const old = 'b'.repeat(40);
+      const result = runRedTeamOnSkip({ repo,
+        plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] },
+        rawPrs: [{ number: pr, headRefOid: head, labels: ['review:accepted'], reviews: [], comments: [
+          { body: `✅ review — accepted\n<!-- reviewed-sha: ${old} -->`, author: { login: 'web-everything' } },
+          { body: `${redTeamMarker(pr, old)}\nRed team not required on this head: card-only diff`, author: { login: 'web-everything' } },
+        ] }],
+        readEvidence: () => ({ inFlight: false, recorded: false, seatRecorded: false }), readStatus: () => null,
+        setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(),
+        capacity: { lanes: 1, budget: { left: 1 } },
+        dispatch: options => dispatchReviewJob({ ...options, root: '/daemon', dir,
+          checkStaleness: () => ({ fresh: true, behind: 0 }), readCompletion: () => null,
+          resolveSettingsEnv: () => ({}), ciGate: () => ({ allowed: true }), spawnJob }),
+      });
+      expect(result.rows[0].action).toBe('review');
+      expect(spawnJob).toHaveBeenCalledTimes(1);
+      expect(spawnJob.mock.calls[0][0].argv).not.toEqual(expect.arrayContaining([expect.stringContaining('--red-team-only')]));
+      expect(io.runLoop).toHaveBeenCalledTimes(1);
+      expect(io.runRedTeam).toHaveBeenCalledTimes(1);
+      expect(io.readRedTeamOnlyPayload).not.toHaveBeenCalled();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
 
