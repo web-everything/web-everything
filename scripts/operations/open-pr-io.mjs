@@ -19,6 +19,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { classifySubmit, measureNonTestLines, OPEN_PR_MAX_NON_TEST_LINES } from './open-pr.mjs';
+import { loadPrSizeSettingsFile } from '../lib/pr-size-settings.mjs';
 import { checkDuplicateBornAs } from '../lib/duplicate-bornas-added.mjs';
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
@@ -199,6 +200,7 @@ export function createPrDiffStatReader({ cwd = process.cwd(), exec = execFileSyn
  * `classifySubmit` is reachable with no `gh`, no network and no PR.
  */
 export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSettings = loadPrePrSettings, spawn = spawnSync, cwd = process.cwd(),
+  loadSizeSettings = loadPrSizeSettingsFile,
   // Card 6931 — the credential env is resolved per run, inside the runner, so a daemon's guard refusal is a refused
   // outcome before any gh call (never a crash where run.mjs builds the sinks). An explicit `env` skips resolution;
   // a caller that injected `spawn` is a rehearsal/test and writes no shim.
@@ -242,16 +244,17 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
         try {
           const evidence = diffStat({ base: arg('base') || 'main', sha: arg('sha') || 'HEAD' });
           // Plain-text injected readers retain their caller's argv; the production reader also pins its commit.
-          size = measureNonTestLines(typeof evidence === 'string' ? evidence : evidence.text);
+          size = measureNonTestLines(typeof evidence === 'string' ? evidence : evidence.text, loadSizeSettings(undefined, { env }));
           measuredSha = typeof evidence === 'string' ? '' : evidence.sha;
         }
         catch {
           cleanupBody();
-          return { outcome: 'refused', reason: 'pr-size-unreadable', detail: 'Could not measure the PR diff. Restore readable git numstat evidence and try again.' };
+          return { outcome: 'refused', reason: 'pr-size-unreadable', detail: 'Could not measure the PR diff. Restore readable git numstat evidence and valid PR-size settings, then try again.' };
         }
         if (size.lines > OPEN_PR_MAX_NON_TEST_LINES && !size.exempt) {
           cleanupBody();
-          return { outcome: 'refused', reason: 'pr-too-large', detail: `The PR changes ${size.lines} non-test lines, exceeding the ${OPEN_PR_MAX_NON_TEST_LINES} limit. Split the PR into smaller PRs.` };
+          const dataDetail = size.dataLines > 0 ? ` ${size.dataLines} data lines (not counted).` : '';
+          return { outcome: 'refused', reason: 'pr-too-large', detail: `The PR changes ${size.lines} non-test lines, exceeding the ${OPEN_PR_MAX_NON_TEST_LINES} limit.${dataDetail} Split the PR into smaller PRs.` };
         }
         if (measuredSha) argv = [...argv.filter((a) => !a.startsWith('--sha=')), `--sha=${measuredSha}`];
       }

@@ -511,6 +511,19 @@ must pass a temporary `lockRoot` through `withPocLandLock`, preserving the mutex
 
 ## PR time-loss safeguards
 
+R125: `measureNonTestLines` excludes pure data from the 300-line budget and reports it separately as
+`dataLines`; those files still require review. Built-in data extensions are `.json`, `.yaml`, `.yml`,
+and `.csv`, under a `config/` or `data/` directory segment at any depth. Exact `dataPaths` add exceptions
+only for those four extensions; `dataExtensions` may select only within that set. Code and markdown
+cannot become data exemptions. Absolute paths and paths with empty, `.` or `..` segments always count.
+The IO caller resolves `prSize` through the shared policy cascade and `scripts/pr-size-settings.json`;
+JSON-array env overrides are `WE_PR_SIZE_DATA_EXTENSIONS`, `WE_PR_SIZE_DATA_DIRS`, and `WE_PR_SIZE_DATA_PATHS`.
+Invalid present settings at any layer throw and refuse submission as `pr-size-unreadable`; only an absent
+tool settings file uses lower layers and built-in defaults. Restore valid settings before retrying.
+The counter defaults to dependency-free frozen built-ins to preserve the declaration's import safety.
+Keep the classification, settings provenance, refusal detail, binary/overflow refusal, and conservative
+rename cases in `scripts/operations/__tests__/open-pr-size-cap.test.mjs`.
+
 `fix.alertAtRoundCap` publishes through the needs-you feed as soon as the notes pass observes exhaustion,
 independently of note-comment dedup and quiet-hour desktop delivery. Polling must include `needsPerson`
 rows so it does not clear and reopen those events, losing the original idle timestamp.
@@ -2508,3 +2521,18 @@ the current occupant as ours. Git optional locks are disabled, so status does no
 refresh the index. The live PR head may have advanced since an incident; compare
 against the SHA the probe actually reports. Regression files: `fix-run-lane-head.test.mjs`,
 `fix-run.test.mjs`, and `fix-run-borrow-dies.test.mjs` under `scripts/operations/__tests__/`.
+
+
+### Red-team disposition precedence
+
+`red-team-disposition.test.mjs` pins all ranked pairs in both temporal and input
+orders, alongside shared-reader regressions for carry, repost, per-key blocks and
+legacy holds. Keep the oracle independent of `DISPOSITION_PRECEDENCE`.
+The pure resolver consumes validated live rulings; the thread adapter owns trust,
+head/result binding, carry eligibility and ceremony validity. Compatibility notes
+beside the table are deliberate: later indexed gate holds retire older releases,
+unindexed legacy holds do not. Operator blocks outrank clear-human regardless of
+recency; recency breaks ties only within a rank. Clear-human clears only keys
+the block does not name. A `NOT sent back` line is an ordinary hold even
+inside an operator-block record. Preserve these fixtures when changing liveness;
+rank alone cannot describe the historical wire protocol.
