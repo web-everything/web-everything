@@ -1,0 +1,3 @@
+{
+  "$comment": "R125: prSize tool overrides. Built-in dataExtensions/dataDirs classify pure data; dataPaths adds exact repo paths. Data remains subject to review."
+}
