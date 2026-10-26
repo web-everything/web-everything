@@ -1,21 +1,23 @@
 ---
+bornAs: xejj3dd
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/x1h788e-the-gh-shim-runs-gh-throttle-from-the-primary-checkout-535-c.md"]
+scope: ["we:backlog/4010-decision-one-probation-system-for-any-new-system-or-ruling.md", "we:reports/2026-10-25-probation-registry-generalisation.md", "we:backlog/xezensp-prevention-decision-preparation-coverage-and-citation-checks.md"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Add a deterministic import gate that flags WITHDRAWN entries assigned open status and requires an… (from web-everything/web-everything#5929 review)
+# Prevention — Extend the xezensp guarantee-manifest gate (Done when 2) so that any "only X may do Y" sentence r… (from web-everything/web-everything#5932 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/x1h788e-the-gh-shim-runs-gh-throttle-from-the-primary-checkout-535-c.md:4` — Add a deterministic import gate that flags WITHDRAWN entries assigned open status and requires an explicit surviving proposal or withdrawal disposition.
 
-Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 2 → #5473.
+1. `we:backlog/4010-decision-one-probation-system-for-any-new-system-or-ruling.md` — Extend the xezensp guarantee-manifest gate (Done when 2) so that any "only X may do Y" sentence requires a mapped test with a refusal assertion for a non-X actor, not only a success assertion for X.
+2. `we:reports/2026-10-25-probation-registry-generalisation.md:57` — Extend the normative-guarantee mapping gate tracked by #7199 to include linked research reports and require an observable assertion for absent criteria.
+3. `we:backlog/7199-prevention-decision-preparation-coverage-and-citation-checks.md:37` — Require each edge-case guarantee to map to a named test with an assertion on the promised behavior, including execution and write side effects.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5929@377095049187d68a906d03fa3f9ae83769225c9d
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5932@f63e2345fa010188a607d5ec99baec184ba16f77
 
 ## Acceptance
 

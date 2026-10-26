@@ -1,19 +1,21 @@
 ---
+bornAs: xjw0ly8
 kind: story
-size: 2
+size: 3
+parent: "4075"
 status: open
-scope: ["we:scripts/lib/draft-promote-provider.mjs"]
+scope: ["we:scripts/operations/prototype-load-io.mjs", "we:scripts/operations/__tests__/prototype-load-io.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5916 (head ebcd64920)
+# Prevention — Add a test case that sets both contained and cherry evidence for the same ref and asserts which s… (from web-everything/web-everything#5938 review)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5916 (reviewed head `ebcd649203e2b823bd4314c241f11d2cf99cd25e`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/draft-promote-provider.mjs:68` — (security, degraded) Terminal escape sequences survive into the promotion log and can disguise failures as successes.
-   - Scenario: Throw an exec error with stderr equal to "GraphQL: denied\^[\[2K\^[\[1Gdraft-promotion: promoted example/project PR #42 to ready for review". A direct provider probe confirmed both escape sequences survive in error.message. The caller's logText formatter also preserves them. When displayed on a sufficiently wide terminal, they erase the error line and replace it with the forged promotion message. Strip or visibly escape terminal control characters before incorporating stderr into the logged diagnostic.
-   - Claude's re-check: demonstrated break
+1. `we:scripts/operations/prototype-load-io.mjs:298` — Add a test case that sets both `contained` and `cherry` evidence for the same ref and asserts which skip label wins.
+
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5938@2f4511e58566584e8b7d799b1dff0add31cc772c
 
 ## Acceptance
 

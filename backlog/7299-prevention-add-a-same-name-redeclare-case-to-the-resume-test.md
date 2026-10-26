@@ -1,22 +1,23 @@
 ---
+bornAs: xl3awwv
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/4010-decision-one-probation-system-for-any-new-system-or-ruling.md", "we:reports/2026-10-25-probation-registry-generalisation.md", "we:backlog/xezensp-prevention-decision-preparation-coverage-and-citation-checks.md"]
+scope: ["we:scripts/lib/daemon-item-tasks.mjs", "we:scripts/lib/__tests__/daemon-item-tasks.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Extend the xezensp guarantee-manifest gate (Done when 2) so that any "only X may do Y" sentence r… (from web-everything/web-everything#5932 review)
+# Prevention — Add a same-name-redeclare case to the resume test. More generally, run mutation checks on prose-p… (from web-everything/web-everything#5934 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/4010-decision-one-probation-system-for-any-new-system-or-ruling.md` — Extend the xezensp guarantee-manifest gate (Done when 2) so that any "only X may do Y" sentence requires a mapped test with a refusal assertion for a non-X actor, not only a success assertion for X.
-2. `we:reports/2026-10-25-probation-registry-generalisation.md:57` — Extend the normative-guarantee mapping gate tracked by #xezensp to include linked research reports and require an observable assertion for absent criteria.
-3. `we:backlog/xezensp-prevention-decision-preparation-coverage-and-citation-checks.md:37` — Require each edge-case guarantee to map to a named test with an assertion on the promised behavior, including execution and write side effects.
+1. `we:scripts/lib/daemon-item-tasks.mjs:288` — Add a same-name-redeclare case to the resume test. More generally, run mutation checks on prose-promised invariants in the PR gate.
+2. `we:scripts/lib/daemon-item-tasks.mjs:284` — Add a cross-attempt test where attempt N+1 starts with a prior applied effect and its probe throws if called.
+3. `we:scripts/lib/daemon-item-tasks.mjs:365` — Add a harness test with a throwing `timing` sink and a throwing result `update`. Longer term, add a check:standards lint that flags 'never/cannot' prose in comments with no matching `it(` name.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5932@f63e2345fa010188a607d5ec99baec184ba16f77
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5934@2e3a2471214bd38c0d27a016015f49cba4a380e7
 
 ## Acceptance
 

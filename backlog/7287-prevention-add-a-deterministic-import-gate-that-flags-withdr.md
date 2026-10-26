@@ -1,21 +1,22 @@
 ---
+bornAs: x533hge
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/red-team-gate.mjs", "we:scripts/lib/__tests__/red-team-gate.test.mjs"]
+scope: ["we:backlog/x1h788e-the-gh-shim-runs-gh-throttle-from-the-primary-checkout-535-c.md"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Either drop the env opt-in (keep only the opt-out, which is fail-safe), or record the effective s… (from web-everything/web-everything#5922 review)
+# Prevention — Add a deterministic import gate that flags WITHDRAWN entries assigned open status and requires an… (from web-everything/web-everything#5929 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+1. `we:backlog/7123-the-gh-shim-runs-gh-throttle-from-the-primary-checkout-535-c.md:4` — Add a deterministic import gate that flags WITHDRAWN entries assigned open status and requires an explicit surviving proposal or withdrawal disposition.
 
-1. `we:scripts/lib/red-team-gate.mjs:634` — Either drop the env opt-in (keep only the opt-out, which is fail-safe), or record the effective scope in the release record so every reader judges the record by the scope it was posted under. Add a test that reads the same thread with default `readRedTeamDisposition` (no `operatorRulings`) and with env-only opt-in.
-2. `we:scripts/lib/red-team-gate.mjs:651` — Add a mutation or coverage gate (e.g. a Stryker or branch-coverage check on `we:scripts/lib/red-team-gate.mjs`) so that an unexercised conditional operand fails the lane. At minimum, parametrize the `operatorReleaseLines` tests over `anyState` and over a null versus a named result id.
+Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 2 → #5473.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5922@5e8db56777b1a770ea35c1f94bfef6628cd3ed05
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5929@377095049187d68a906d03fa3f9ae83769225c9d
 
 ## Acceptance
 

@@ -1,21 +1,22 @@
 ---
+bornAs: xwbpl7i
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/__tests__/ruling-ledger.test.mjs"]
+scope: ["we:scripts/lib/red-team-gate.mjs", "we:scripts/lib/__tests__/red-team-gate.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Add a table-driven control for recheckClearanceAt, one row per early return: no recheck, invalid… (from web-everything/web-everything#5924 review)
+# Prevention — Either drop the env opt-in (keep only the opt-out, which is fail-safe), or record the effective s… (from web-everything/web-everything#5922 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/__tests__/ruling-ledger.test.mjs:375` — Add a table-driven control for `recheckClearanceAt`, one row per early return: no recheck, invalid sha, fromHead equal to head, a non-not-real ruling on the source head, and a not-real ruling without evidence.
-2. `we:scripts/lib/__tests__/ruling-ledger.test.mjs:381` — Add a required parameterized regression test for absent, empty, and whitespace-only source-clearance evidence, alongside the valid-evidence control; this guard requires a future backlog filing.
+1. `we:scripts/lib/red-team-gate.mjs:634` — Either drop the env opt-in (keep only the opt-out, which is fail-safe), or record the effective scope in the release record so every reader judges the record by the scope it was posted under. Add a test that reads the same thread with default `readRedTeamDisposition` (no `operatorRulings`) and with env-only opt-in.
+2. `we:scripts/lib/red-team-gate.mjs:651` — Add a mutation or coverage gate (e.g. a Stryker or branch-coverage check on `we:scripts/lib/red-team-gate.mjs`) so that an unexercised conditional operand fails the lane. At minimum, parametrize the `operatorReleaseLines` tests over `anyState` and over a null versus a named result id.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5924@50608b23f34eb5a818017813fbf50289180e95a2
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5922@5e8db56777b1a770ea35c1f94bfef6628cd3ed05
 
 ## Acceptance
 

@@ -1,20 +1,20 @@
 ---
+bornAs: xibejma
 kind: story
-size: 3
-parent: "4075"
+size: 2
 status: open
-scope: ["we:scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs"]
+scope: ["we:scripts/lib/draft-promote-provider.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Add a parameterized dispatch-level regression test covering permission-blocked ordinary and confl… (from web-everything/web-everything#5939 review)
+# Red-team follow-ups from web-everything/web-everything#5916 (head ebcd64920)
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5916 (reviewed head `ebcd649203e2b823bd4314c241f11d2cf99cd25e`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs:1358` — Add a parameterized dispatch-level regression test covering permission-blocked ordinary and conflict resumes, asserting a different session ID and the rendered fresh brief.
-
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5939@833d5d6cd3051d0afd08df827c78fb8cbd347f00
+1. `we:scripts/lib/draft-promote-provider.mjs:68` — (security, degraded) Terminal escape sequences survive into the promotion log and can disguise failures as successes.
+   - Scenario: Throw an exec error with stderr equal to "GraphQL: denied\^[\[2K\^[\[1Gdraft-promotion: promoted example/project PR #42 to ready for review". A direct provider probe confirmed both escape sequences survive in error.message. The caller's logText formatter also preserves them. When displayed on a sufficiently wide terminal, they erase the error line and replace it with the forged promotion message. Strip or visibly escape terminal control characters before incorporating stderr into the logged diagnostic.
+   - Claude's re-check: demonstrated break
 
 ## Acceptance
 

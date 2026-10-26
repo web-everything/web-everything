@@ -1,4 +1,5 @@
 ---
+bornAs: xl4s901
 kind: story
 size: 2
 status: open

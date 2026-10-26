@@ -1,19 +1,21 @@
 ---
+bornAs: x9l7e1v
 kind: story
-size: 2
+size: 3
+parent: "4075"
 status: open
-scope: ["we:scripts/lane-pool.mjs"]
+scope: ["we:scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5859 (head b5b1b9b7d)
+# Prevention — Add a parameterized dispatch-level regression test covering permission-blocked ordinary and confl… (from web-everything/web-everything#5939 review)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5859 (reviewed head `b5b1b9b7d19aba0f29d7e69aef5c14ab524e4504`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lane-pool.mjs:2775` — (edge-case, degraded) Salvage can exceed existing release deadlines and leave leases held
-   - Scenario: Leave a coroner lane leased with HEAD ahead of origin/main, then run the nightly coroner's normal orphan sweep while origin's fetch stalls for over 30 seconds. we:nightly-coroner-job.mjs gives release --all-pools only 30,000 ms, but the new salvage fetch permits 120,000 ms and runs before takeMarkerIf removes the lease. The caller therefore terminates release before its 'releasing anyway' fallback, leaving the lease and registry mapping behind. A read-only injected-Git probe confirmed the 120,000 ms timeout; a scaled subprocess probe confirmed an outer deadline terminates salvage before cleanup i
-   - Claude's re-check: demonstrated break
+1. `we:scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs:1358` — Add a parameterized dispatch-level regression test covering permission-blocked ordinary and conflict resumes, asserting a different session ID and the rendered fresh brief.
+
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5939@833d5d6cd3051d0afd08df827c78fb8cbd347f00
 
 ## Acceptance
 

@@ -1,18 +1,19 @@
 ---
+bornAs: xnoxvzx
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/operations/completion-cli.mjs"]
+scope: ["we:scripts/operations/record-red-team-ruling.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5943 (head 1925ac5b8)
+# Red-team follow-ups from web-everything/web-everything#5923 (head c41e4039a)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5943 (reviewed head `1925ac5b860466cb6d728d4399ee429f0ba22ad9`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5923 (reviewed head `c41e4039ae57a79fffe8743d242813c9e319c957`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/operations/completion-cli.mjs:165` — (failing-input, degraded) Sibling-repository permission blocks are attributed to Web Everything
-   - Scenario: Report started and then blocked-on-permission for kind=fix, pr=42, repo=frontier-ui/frontierui and the same session-id. A read-only probe executing the actual reporting and event serialization code with memory-backed IO produced session fix-fui-42 but an event containing repo='web-everything', pr='42'. The emitter receives no repository, so the shared writer supplies its WE default. The event should identify Frontier UI PR #42.
+1. `we:scripts/operations/record-red-team-ruling.mjs:128` — (edge-case, degraded) A failed reason POST makes an incomplete block ruling unretryable
+   - Scenario: Start with confirmed finding #1, a trusted round-cap record, review:changes already present, and anyState=false. Invoke --ruling=block --break=1 with a valid operator, channel and reason. Let the operator-block POST succeed, then fail the reason POST at we:record-red-team-ruling-io.mjs:388. The invocation throws before recording any ledger event. After posting recovers, retrying the same command is refused because the persisted block plus review:changes is considered complete. An in-memory probe of the changed modules confirmed one posted hold record, no persisted reason, zero ledger events, and
    - Claude's re-check: demonstrated break
 
 ## Acceptance

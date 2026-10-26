@@ -1,4 +1,5 @@
 ---
+bornAs: x589k42
 kind: story
 size: 2
 status: open

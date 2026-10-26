@@ -1,20 +1,22 @@
 ---
+bornAs: xwgddd2
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/daemon-rebuild/rebuild.mjs", "we:scripts/lib/daemon-rebuild/__tests__/rebuild.test.mjs"]
+scope: ["we:scripts/lib/__tests__/ruling-ledger.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Add a sequence-level test (same failing result across N ticks) to the event contract and state th… (from web-everything/web-everything#5940 review)
+# Prevention — Add a table-driven control for recheckClearanceAt, one row per early return: no recheck, invalid… (from web-everything/web-everything#5924 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/daemon-rebuild/rebuild.mjs:69` — Add a sequence-level test (same failing result across N ticks) to the event contract and state the intended dedup policy in the card's acceptance criteria.
+1. `we:scripts/lib/__tests__/ruling-ledger.test.mjs:375` — Add a table-driven control for `recheckClearanceAt`, one row per early return: no recheck, invalid sha, fromHead equal to head, a non-not-real ruling on the source head, and a not-real ruling without evidence.
+2. `we:scripts/lib/__tests__/ruling-ledger.test.mjs:381` — Add a required parameterized regression test for absent, empty, and whitespace-only source-clearance evidence, alongside the valid-evidence control; this guard requires a future backlog filing.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5940@3b271f87d33d93186f56569ad8cc37cfd621b017
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5924@50608b23f34eb5a818017813fbf50289180e95a2
 
 ## Acceptance
 
