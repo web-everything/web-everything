@@ -881,6 +881,8 @@ export async function runFixCli(argv = [], {
       if (target) throw new LauncherError('repeated finding: resolve base conflict before scope reset');
       const scope = String(launch.scope ?? '').split(',').map(p => p.trim().replace(/^[a-z][\w-]*:/i, '')).filter(Boolean);
       let reset;
+      // Provider resolution awaited above: a reset must still own the pinned lane before any tree writes.
+      checkLane(before, false);
       try { reset = applyScopeReset({ ...repeatPlan, scope, git }); }
       catch {
         const body = buildStandDownComment({ reason: 'repeated-finding', head: prHeadSha,

@@ -2429,6 +2429,12 @@ original pinned PR head before its SHA can authorize an agent launch or push.
 Inject head and holder changes during provider resolution, fetch and merge preparation
 in `fix-run-lane-head.test.mjs`; also reject missing or unexpected first-parent evidence.
 
+Repeated-finding scope resets recheck the original pinned HEAD and acquired holder
+immediately before `applyScopeReset`, with lane recovery disabled. Inject holder or
+HEAD drift and missing/unreadable lease evidence during awaited provider resolution;
+assert refusal before `merge-tree --write-tree`, `read-tree`, replay, commit or push.
+Keep an unchanged-head/holder case that reaches the real reset path.
+
 For a read-only observation, run
 `node scripts/operations/fix-run.mjs --probe-lane-head --lane-path=<absolute lane path> --pr=<PR> --holder=<original acquired holder> [--repo=owner/repo]`.
 The probe prints the observed lease, HEAD, current GitHub PR head and pure

@@ -33,6 +33,56 @@ function fixture({ head = prHead, owner = holder } = {}) {
 }
 const argv = ['--pr=5759', '--session=fix-5759', '--ref=lane/pr', '--prompt-file=/p', '--provider=codex'];
 
+function resetFixture({ drift } = {}) {
+  const f = fixture();
+  const baseline = 'b'.repeat(40), main = 'c'.repeat(40), base = 'd'.repeat(40), tree = 'e'.repeat(40);
+  const finding = { author: { login: 'web-everything' }, body: '🔁 review — changes requested\n'
+    + '### Findings (1)\n**correctness/bug** (1)\n- `a.mjs:10` — same bug' };
+  const io = { ...f.io,
+    readComments: async () => [
+      { author: { login: 'chalbert' }, body: `scope-baseline: ${baseline}` },
+      finding, { author: { login: 'chalbert' }, body: '🔓 conveyor fix-end' }, finding,
+    ],
+    resolveProvider: async () => {
+      await Promise.resolve();
+      if (drift === 'holder') f.state.owner = foreign;
+      if (drift === 'missing lease') f.readLease.mockReturnValue(null);
+      if (drift === 'unreadable lease') f.readLease.mockImplementation(() => { throw new Error('unreadable lease'); });
+      if (drift === 'head') f.state.head = oldHead;
+      return { spawn: f.spawn };
+    },
+    run: (cmd, args, opts) => {
+      const value = f.run(cmd, args, opts);
+      if (cmd !== 'git') return value;
+      if (args.includes('rev-parse') && args.at(-1) === 'origin/main^{commit}') return main;
+      if (args.includes('merge-base') && !args.includes('--is-ancestor')) return base;
+      if (args.includes('diff') && args.includes('--name-only')) return 'a.mjs\0';
+      if (args.includes('merge-tree')) return tree;
+      return value;
+    },
+  };
+  return { ...f, io, tree };
+}
+
+describe('repeated-finding reset pins the acquired head and holder', () => {
+  it.each(['holder', 'missing lease', 'unreadable lease', 'head'])(
+    'refuses %s drift during provider resolution before reset mutations', async drift => {
+      const f = resetFixture({ drift });
+      expect((await runFixCli([...argv, '--scope=we:a.mjs'], f.io)).code).toBe(1);
+      expect(f.calls.filter(c => c.cmd === 'git' && c.args.some(arg =>
+        ['merge-tree', 'read-tree', 'cherry-pick', 'commit', 'push'].includes(arg))).map(c => c.args)).toEqual([]);
+      expect(f.calls.filter(c => c.args.includes('acquire'))).toHaveLength(1);
+      expect(f.spawn).not.toHaveBeenCalled();
+    });
+  it('allows the real reset path with an unchanged head and holder', async () => {
+    const f = resetFixture();
+    expect((await runFixCli([...argv, '--scope=we:a.mjs'], f.io)).code).toBe(0);
+    expect(f.calls.some(c => c.args.includes('merge-tree'))).toBe(true);
+    expect(f.calls.some(c => c.args.includes('read-tree') && c.args.at(-1) === f.tree)).toBe(true);
+    expect(f.spawn).not.toHaveBeenCalled();
+  });
+});
+
 function mergeFixture({ driftAt, drift = 'head', parent = prHead } = {}) {
   const f = fixture();
   const mergedHead = 'a'.repeat(40);
