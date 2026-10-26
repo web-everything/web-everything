@@ -6,13 +6,15 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   planOrphanFixRound, runOrphanFixRoundPass, formatOrphanFixRoundLines, buildOrphanGuardComment, verdictReviewedHead,
-  ORPHAN_GUARD_MARKER, CHANGES_VERDICT_PREFIX, DEFAULT_ORPHAN_GRACE_MS,
+  ORPHAN_GUARD_MARKER, CHANGES_VERDICT_PREFIX, DEFAULT_ORPHAN_GRACE_MS, defaultRearm,
 } from '../orphan-fix-round.mjs';
+import { STAND_DOWN_MARKER } from '../stand-down.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from '../fix-procedure.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { runFixerStuckReclaimPass, formatFixerStuckReclaimLines } from '../fixer-stuck-reclaim.mjs';
 import { buildVerdictComment } from '../../review-set-label.mjs';
 import { parseLatestHumanClearedSha } from '../../lib/review-escalation.mjs';
+import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
 
 const BOT = { login: 'web-everything' };
 const c = (createdAt, body, author = BOT) => ({ createdAt, body, author });
@@ -24,6 +26,46 @@ const BEGIN = c('2026-10-10T15:03:55Z', `${FIX_BEGIN_MARKER}\n\n**Who:** \`fix-4
 const RESTACK = c('2026-10-10T15:21:28Z', '🔁 restack — merged `origin/lane/gh-merge-queue-gate` into this branch.');
 const END = c('2026-10-10T15:21:33Z', `${FIX_END_MARKER}\n\n\`fix-4715\` released the fix claim at \`124e242da\`.`);
 const pr4715 = (comments, extra = {}) => ({ number: 4715, labels: [{ name: 'review:changes' }, { name: 'review-round:1' }], headRefOid: HEAD, isDraft: false, comments, ...extra });
+
+describe('defaultRearm child diagnostics', () => {
+  it('surfaces the first non-empty child stderr lines and forwards the full head pin', () => {
+    const exec = vi.fn(() => { throw Object.assign(new Error('Command failed: node rearm-review.mjs'), {
+      stderr: Buffer.from('\n\u001b[31mlive head differs from --expect-head\u001b[0m\nrefused\u0000\n'),
+      stdout: Buffer.from(JSON.stringify({ reason: '\u001b[31mshared refusal\u001b[0m\u0000\u202e' })),
+    }); });
+    expect(() => defaultRearm({ slug: 'o/n', pr: 5608, head: HEAD, exec }))
+      .toThrow('orphan-guard re-arm failed: live head differs from --expect-head; refused; shared refusal');
+    expect(exec.mock.calls[0][1]).toContain(`--expect-head=${HEAD}`);
+  });
+
+  it('caps oversized stderr at 300 characters', () => {
+    const exec = () => { throw Object.assign(new Error('Command failed'), { stderr: 'x'.repeat(1000) }); };
+    expect(() => defaultRearm({ slug: 'o/n', pr: 5608, exec }))
+      .toThrow(new Error(`orphan-guard re-arm failed: ${'x'.repeat(300)}`));
+  });
+
+  it.each([
+    JSON.stringify({ reason: '\u001b[31mlive head differs from --expect-head\u001b[0m\u0000' }),
+    JSON.stringify({ error: 'live head differs from --expect-head' }),
+    '\n\u001b[31mlive head differs from --expect-head\u001b[0m\u0000\nignored second line',
+  ])('surfaces sanitized stdout when stderr is empty: %s', stdout => {
+    const exec = () => { throw Object.assign(new Error('Command failed'), { stdout, stderr: '' }); };
+    expect(() => defaultRearm({ slug: 'o/n', pr: 5608, exec }))
+      .toThrow(new Error('orphan-guard re-arm failed: live head differs from --expect-head'));
+  });
+
+  it.each(['x'.repeat(1000), JSON.stringify({ reason: 'x'.repeat(1000) })])('caps oversized stdout at 300 characters', stdout => {
+    const exec = () => { throw Object.assign(new Error('Command failed'), { stdout }); };
+    expect(() => defaultRearm({ slug: 'o/n', pr: 5608, exec }))
+      .toThrow(new Error(`orphan-guard re-arm failed: ${'x'.repeat(300)}`));
+  });
+
+  it('names the missing-output fallback', () => {
+    const exec = () => { throw new Error('spawn failed'); };
+    expect(() => defaultRearm({ slug: 'o/n', pr: 5608, exec }))
+      .toThrow('orphan-guard re-arm failed: child failed without stderr or stdout');
+  });
+});
 
 describe('planOrphanFixRound — the #4715 shapes', () => {
   it('re-arms the live #4715 thread: findings addressed (evidence, head moved), round ended, never re-armed', () => {
@@ -111,6 +153,140 @@ describe('planOrphanFixRound — the #4715 shapes', () => {
   it('reads the reviewed head off the verdict', () => {
     expect(verdictReviewedHead(VERDICT.body)).toBe('d9829f557f3f264ac885722cb9afef18bd91ca7f');
     expect(verdictReviewedHead('no basis')).toBeNull();
+  });
+});
+
+describe('planOrphanFixRound — #5608 operator referral rulings', () => {
+  const repo = 'o/r';
+  const card = 'we:backlog/xvm9vbu-follow-up.md';
+  const body = '<!-- authored-by-actor: author -->';
+  const verdictAt = '2026-10-10T12:00:00Z';
+  const rulingAt = '2026-10-10T13:00:00Z';
+  const seat = 'judgeCorrectnessAdvisory';
+  const reviewer = mandatoryReferralReviewer('review-pr-5608');
+  const referrals = ['first defect', 'second defect'].map((summary) => {
+    const original = { summary, file: 'scripts/x.mjs', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+    return { key: referralFindingKey(seat, original), seat, original, finding: normalizeFinding(original) };
+  });
+  const record = { version: 1, repo, pr: 5608, head: HEAD, runId: 'review-pr-5608', reviewer, authorBody: body,
+    attempted: true, referrals, rulings: referrals.map(({ key }, i) => ({ id: `review-pr-5608:${i}`, key,
+      reviewerId: reviewer.id, lens: 'correctness', result: 'block', rationale: 'checked', evidence: ['diff'] })) };
+  const verdict = c(verdictAt, `${CHANGES_VERDICT_PREFIX}\n\n### Blocked referral findings\n\nStill blocked on head \`${HEAD}\`.`);
+  const ruling = (count = 2, extra = {}, author = { login: 'chalbert' }) => c(rulingAt, buildOperatorRulingComment({
+    version: 1, repo, pr: 5608, head: HEAD, actor: 'chalbert', channel: 'claude-code-chat', reason: 'Accept',
+    at: rulingAt, clearerId: 'session-1',
+    rulings: referrals.slice(0, count).map(({ key }) => ({ runId: record.runId, key, result: 'card', card })), ...extra,
+  }), author);
+  const thread = (answer = ruling(), extra = {}) => ({ number: 5608, body, createdAt: '2026-10-09T12:00:00Z',
+    labels: ['review:changes', 'review:human', 'review-round:3'], headRefOid: HEAD,
+    comments: [c('2026-10-10T11:00:00Z', renderReferralRecord(record)), verdict, answer], ...extra });
+  const plan = (pr, extra = {}) => planOrphanFixRound({ pr, repo, nowMs: NOW, cardReadable: (ref) => ref === card, ...extra });
+
+  it('re-arms a fully carded thread without a fix round even with review:human', () => {
+    expect(plan(thread())).toMatchObject({ decision: 'rearm', verdictAt: new Date(verdictAt).toISOString(),
+      rulingAt: new Date(rulingAt).toISOString(), reason: expect.stringContaining('no fix is owed') });
+  });
+
+  it('does not re-arm a fully carded thread while a stand-down is unresolved', () => {
+    const pr = thread();
+    pr.comments.splice(2, 0, c('2026-10-10T12:30:00Z', `${STAND_DOWN_MARKER}\n\nneeds a person`));
+    expect(plan(pr)).toMatchObject({ decision: 'none', reason: expect.stringContaining('stood down') });
+  });
+
+  it('does not re-arm a fully carded thread followed by a malformed operator ruling', () => {
+    const pr = thread();
+    pr.comments.push(c('2026-10-10T14:00:00Z',
+      '## Operator ruling on mandatory referrals\n\n<!-- mandatory-referral-operator-ruling-v1: not-base64 -->',
+      { login: 'chalbert' }));
+    expect(plan(pr).decision).not.toBe('rearm');
+  });
+
+  it('keeps a partial ruling with a person, even if a fix round ended', () => {
+    const pr = thread(ruling(1));
+    pr.comments.push(END);
+    expect(plan(pr)).toMatchObject({ decision: 'none', rulingAt: new Date(rulingAt).toISOString(),
+      reason: expect.stringContaining('partial: 1 referral finding(s) still open') });
+    expect(plan(pr).reason).toContain('1 blocked, 0 awaiting');
+  });
+
+  it('falls through when the head moved since the send-back', () => {
+    expect(plan(thread(ruling(), { headRefOid: 'b'.repeat(40) }))).toMatchObject({ decision: 'none',
+      reason: expect.stringContaining('no fix round since the latest verdict') });
+  });
+
+  it('does not count an automatic policy ruling, even when operator-authored', () => {
+    const auto = ruling(2, { actor: 'auto-policy', channel: 'policy',
+      rulings: referrals.map(({ key }) => ({ runId: record.runId, key, result: 'block' })) });
+    expect(auto.body).toMatch(/^## Automatic policy ruling/);
+    expect(plan(thread(auto)).reason).toContain('no fix round since the latest verdict');
+  });
+
+  it('fails closed to a partial ruling when cards are not readable by default', () => {
+    const p = planOrphanFixRound({ pr: thread(), repo, nowMs: NOW });
+    expect(p.decision).toBe('none');
+    expect(p.reason).toContain('partial: 2 referral finding(s) still open');
+    expect(p.reason).toContain('0 blocked, 2 awaiting');
+  });
+
+  it('leaves ordinary changes verdicts on the existing path', () => {
+    const pr = thread();
+    pr.comments[1] = c(verdictAt, `${CHANGES_VERDICT_PREFIX}\n\nOrdinary review findings.`);
+    expect(plan(pr).reason).toContain('no fix round since the latest verdict');
+  });
+
+  it.each(['card', 'not-real'])('re-arms an automation-posted operator %s ruling', (result) => {
+    const answer = ruling(2, { rulings: referrals.map(({ key }) => ({
+      runId: record.runId, key, result, ...(result === 'card' ? { card } : {}),
+    })) }, BOT);
+    expect(plan(thread(answer))).toMatchObject({ decision: 'rearm',
+      rulingAt: new Date(rulingAt).toISOString() });
+  });
+
+  it('does not treat an untrusted author as an operator', () => {
+    expect(plan(thread(ruling(2, {}, { login: 'mallory' }))).reason).toContain('no fix round since the latest verdict');
+  });
+
+  it('keeps an automation-posted partial ruling with a person', () => {
+    expect(plan(thread(ruling(1, {}, BOT)))).toMatchObject({ decision: 'none',
+      reason: expect.stringContaining('partial: 1 referral finding(s) still open') });
+  });
+
+  it('rejects an automation-posted ruling with a hand-edited operator assertion', () => {
+    const answer = ruling(2, {}, BOT);
+    answer.body = answer.body.replace('@chalbert', '@mallory');
+    expect(plan(thread(answer)).decision).toBe('none');
+  });
+
+  it('does not treat an automation-posted policy block as an operator answer', () => {
+    const answer = ruling(2, { actor: 'auto-policy', channel: 'policy',
+      rulings: referrals.map(({ key }) => ({ runId: record.runId, key, result: 'block' })),
+    }, BOT);
+    expect(plan(thread(answer)).reason).toContain('no fix round since the latest verdict');
+  });
+
+  it('matches an abbreviated send-back head and falls back to Net basis', () => {
+    for (const text of [`on head \`${HEAD.slice(0, 9)}\``, `Net basis: \`${'a'.repeat(40)}..${HEAD}\``]) {
+      const pr = thread();
+      pr.comments[1] = c(verdictAt, `${CHANGES_VERDICT_PREFIX}\n\n### Blocked referral findings\n\n${text}`);
+      expect(plan(pr).decision).toBe('rearm');
+    }
+  });
+
+  it('falls through if the gate reader throws', () => {
+    expect(plan(thread(), { cardReadable: () => { throw new Error('unreadable'); } }).reason)
+      .toContain('no fix round since the latest verdict');
+  });
+
+  it.each(['chalbert', 'web-everything'])('passes a ruling posted by %s through the IO shell', async (login) => {
+    const pr = thread(ruling(2, {}, { login }));
+    const rearm = vi.fn(async () => ({ ok: true }));
+    const cardReadable = vi.fn((ref) => ref === card);
+    const result = await runOrphanFixRoundPass({ repos: [{ key: 'test', slug: repo }], nowMs: NOW, env: {},
+      listBounced: () => [pr], readComments: async () => pr.comments, isOwned: async () => false,
+      cardReadable, rearm, postComment: vi.fn() });
+    expect(result.rows[0]).toMatchObject({ decision: 'rearm', result: 're-armed' });
+    expect(rearm).toHaveBeenCalledWith({ slug: repo, pr: 5608, head: HEAD });
+    expect(cardReadable).toHaveBeenCalledWith(card);
   });
 });
 
