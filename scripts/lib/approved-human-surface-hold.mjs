@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { parseLatestHumanClearedSha, scoreEscalation } from './review-escalation.mjs';
+import { parseLatestHumanClearedSha, scoreEscalation, clearanceBindsHead } from './review-escalation.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 
 /** PURE: only a fully proven, manifest-free human approval keeps its head. */
@@ -23,7 +23,8 @@ export function resolveSkipRebaseApprovedHumanSurface({ env = process.env, readF
 }
 
 /** IO: read the live head, tracked tree and trusted clearance; errors refuse mutation. */
-export function readApprovedHumanSurfaceHold({ setting, pr, repo, expectedHead, exec, readComments = readCompletePrComments }) {
+// `readCoverage({comments, headSha})` (optional, approval-binding): the caller's git-proven clearance coverage for this head.
+export function readApprovedHumanSurfaceHold({ setting, pr, repo, expectedHead, exec, readComments = readCompletePrComments, readCoverage = null }) {
   if (setting !== 'on') return decideHoldApprovedHumanSurfaceHead({ setting });
   const view = JSON.parse(exec('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []), '--json', 'headRefOid,labels,mergeable'], { encoding: 'utf8' }));
   if (!/^[0-9a-f]{40}$/i.test(view.headRefOid ?? '') || view.headRefOid !== expectedHead || !Array.isArray(view.labels)) throw Error('live approval head/labels unreadable or moved');
@@ -42,7 +43,8 @@ export function readApprovedHumanSurfaceHold({ setting, pr, repo, expectedHead, 
   if (!['', '.lane-manifest.json'].includes(manifest)) throw Error('tracked manifest unreadable');
   if (!['MERGEABLE', 'CONFLICTING'].includes(view.mergeable)) throw Error('live mergeability unreadable');
   return decideHoldApprovedHumanSurfaceHead({ setting,
-    approved: view.labels.some(l => (l?.name ?? l) === 'review:accepted') && parseLatestHumanClearedSha(comments) === expectedHead,
+    approved: view.labels.some(l => (l?.name ?? l) === 'review:accepted') && clearanceBindsHead({ humanClearedSha: parseLatestHumanClearedSha(comments),
+      headSha: expectedHead, coverage: typeof readCoverage === 'function' ? readCoverage({ comments, headSha: expectedHead }) : null }),
     humanSurface: scoreEscalation({ changedFiles: files, diffHunks }).humanRequired === true,
     conflicting: view.mergeable === 'CONFLICTING', manifestOnHead: manifest === '.lane-manifest.json' });
 }
