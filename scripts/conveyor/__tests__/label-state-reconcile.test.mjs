@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { planLabelStateReconcile, sweepLabelStateReconcile } from '../label-state-reconcile.mjs';
 import { reviewRunEvidence } from '../review-referral-hold.mjs';
+import { defaultReadPr } from '../advisory-label-sweep.mjs';
 import { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
 
 const repo = 'o/n', head = 'a'.repeat(40), otherHead = 'b'.repeat(40);
@@ -54,6 +55,28 @@ describe('planLabelStateReconcile', () => {
     const plan = planLabelStateReconcile({ repo, pr: pr(42, ['review:changes', 'fix-waiting:host-busy', 'ready-to-merge'],
       [referral(42, false)]), review: review(42) });
     expect(plan.to).toEqual(['review:changes', 'fix-waiting:host-busy']);
+  });
+  it('an explicit changes confirmation overrides the accepted panel and drops ready', () => {
+    const stored = review(42);
+    stored.findings.confirm = 'changes';
+    stored.input = { reason: 'operator confirmed a remaining blocker' };
+    const plan = planLabelStateReconcile({ repo, pr: pr(42,
+      ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held', 'ready-to-merge'], []), review: stored });
+    expect(plan.to).toEqual(['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held']);
+    expect(plan.remove).toEqual(['ready-to-merge']);
+  });
+  it('a superseding explicit accept can clear a previously confirmed changes decision', () => {
+    const stored = review(42);
+    stored.findings.confirm = 'accept';
+    expect(planLabelStateReconcile({ repo, pr: pr(42,
+      ['review:changes', 'fix-waiting:host-busy'], []), review: stored }).to).toEqual([]);
+  });
+  it('an explicit accept cannot bypass unresolved referrals', () => {
+    const stored = review(42);
+    stored.findings.confirm = 'accept';
+    expect(planLabelStateReconcile({ repo, pr: pr(42,
+      ['review:changes', 'fix-waiting:host-busy', 'ready-to-merge'], [referral(42, false)]), review: stored }).to)
+      .toEqual(['review:changes', 'fix-waiting:host-busy']);
   });
   it('a confirmed red-team break on head preserves blocked and drops ready', () => {
     const plan = planLabelStateReconcile({ repo, pr: pr(42, ['red-team:blocked', 'ready-to-merge'], [red(42, head, true)]) });
@@ -123,6 +146,22 @@ describe('sweepLabelStateReconcile', () => {
     io.prs[0].labels = row.labelsReconciled.to;
     expect(sweepLabelStateReconcile(io)).toEqual([]);
     expect(io.emit).toHaveBeenCalledTimes(1);
+  });
+  it('the production PR reader supplies author metadata so settled referrals clear changes', () => {
+    const io = fixture(), live = io.prs[0];
+    const exec = vi.fn((_cmd, argv) => JSON.stringify(Object.fromEntries(
+      argv[argv.indexOf('--json') + 1].split(',').map(field => [field, live[field]]))));
+    io.readPr = args => defaultReadPr({ ...args, exec, readComments: io.readComments });
+    expect(sweepLabelStateReconcile(io)[0]?.labelsReconciled.to).toEqual(['red-team:clear']);
+    expect(exec.mock.calls[0][1].at(-1)).toBe('number,state,headRefOid,labels,body,createdAt');
+    expect(exec.mock.calls[1][1].at(-1)).toBe('number,state,headRefOid');
+    expect(io.provider.setLabels).toHaveBeenCalledWith(repo, 5954, {
+      add: 'red-team:clear', remove: ['review:changes', 'red-team:blocked', 'fix-waiting:host-busy'] });
+  });
+  it('the production PR reader preserves its default fields for existing callers', () => {
+    const exec = vi.fn(() => '{}');
+    defaultReadPr({ repo, number: 42, exec, readComments: () => [] });
+    expect(exec.mock.calls[0][1].at(-1)).toBe('number,state,labels,headRefOid');
   });
   it('dryRun plans the change without label writes, provisioning or events', () => {
     const io = fixture();

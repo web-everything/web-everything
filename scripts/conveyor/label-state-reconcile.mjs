@@ -37,15 +37,17 @@ export function planLabelStateReconcile({ repo, pr, review = null, redTeam = nul
     && Number.isFinite(observed.completedAt) && !observed.incomplete
     && observed.parked === false && observed.persistenceFailed === false) {
     const verdict = review.findings?.referralVerdict ?? review.verdict;
+    // Confirmation is the recorded operator decision; an accepted panel cannot supersede changes.
+    const confirmedChanges = review.findings?.confirm === 'changes';
     const referrals = liveReferralState(pr, { repo, pr: pr.number });
     const settled = !referrals.malformed && !referrals.pending.length && !referrals.blocked.length
       && Array.isArray(verdict?.pendingReferrals) && !verdict.pendingReferrals.length
       && Array.isArray(verdict?.blockedReferrals) && !verdict.blockedReferrals.length;
-    if (verdict?.verdict === 'accept' && settled && !after.has('red-team:blocked')) {
+    if (!confirmedChanges && verdict?.verdict === 'accept' && settled && !after.has('red-team:blocked')) {
       after.delete('review:changes');
       for (const label of after) if (label.startsWith('fix-waiting:')) after.delete(label);
     }
-    reviewBlocked = referrals.pending.length > 0 || referrals.blocked.length > 0 || verdict?.verdict === 'changes'
+    reviewBlocked = confirmedChanges || referrals.pending.length > 0 || referrals.blocked.length > 0 || verdict?.verdict === 'changes'
       || verdict?.pendingReferrals?.length > 0 || verdict?.blockedReferrals?.length > 0;
     evidence.review = { id: observed.id, sha: head };
   }

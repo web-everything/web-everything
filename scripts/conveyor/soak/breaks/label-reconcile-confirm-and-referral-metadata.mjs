@@ -1,0 +1,71 @@
+/** Replay PR #5990: preserve operator changes and read the metadata needed to settle referrals. */
+import { readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
+
+export default {
+  id: 'label-reconcile-confirm-and-referral-metadata',
+  title: 'label reconciliation erases operator changes or strands independently settled referrals',
+  card: 'PR #5990',
+  fixedBy: { sha: 'HEAD', where: 'lane/labels-reconcile-main', paths: [
+    'scripts/conveyor/label-state-reconcile.mjs', 'scripts/conveyor/advisory-label-sweep.mjs',
+  ] },
+  fixPresent(root) {
+    const planner = readFileSync(join(root, 'scripts/conveyor/label-state-reconcile.mjs'), 'utf8');
+    const reader = readFileSync(join(root, 'scripts/conveyor/advisory-label-sweep.mjs'), 'utf8');
+    return planner.includes("review.findings?.confirm === 'changes'")
+      && reader.includes("fields = 'number,state,labels,headRefOid'");
+  },
+  async run({ sourceRoot = ROOT, log } = {}) {
+    const load = path => import(pathToFileURL(join(sourceRoot, path)).href);
+    const { sweepLabelStateReconcile } = await load('scripts/conveyor/label-state-reconcile.mjs');
+    const { defaultReadPr } = await load('scripts/conveyor/advisory-label-sweep.mjs');
+    const { reviewRunEvidence } = await load('scripts/conveyor/review-referral-hold.mjs');
+    const { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord }
+      = await load('scripts/lib/jury-core.mjs');
+    const repo = 'o/n', number = 5990, head = 'a'.repeat(40);
+    const body = '<!-- authored-by-actor: author -->';
+    const runId = 'review-pr-bounced', original = { summary: 'broken case', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+    const key = referralFindingKey('judge', original), reviewer = mandatoryReferralReviewer(runId);
+    const settled = { author: { login: 'web-everything' }, body: renderReferralRecord({
+      version: 1, repo, pr: number, head, runId, reviewer, authorBody: body, attempted: true,
+      referrals: [{ key, seat: 'judge', original, finding: normalizeFinding(original) }],
+      rulings: [{ id: 'r1', key, reviewerId: reviewer.id, lens: 'correctness', result: 'not-real',
+        rationale: 'checked independently', evidence: ['diff'] }],
+    }) };
+    const violations = [];
+    for (const confirm of ['changes', 'accept']) {
+      let labels = ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held', 'ready-to-merge'];
+      const review = { id: 'review-pr-accepted', op: 'review-pr', input: { reason: 'remaining operator blocker' }, findings: {
+        read: { repo, pr: number, netBasis: { rev: head } }, confirm,
+        referralVerdict: { verdict: 'accept', pendingReferrals: [], blockedReferrals: [],
+          lenses: ['correctness', 'security'], lensVerdicts: { correctness: 'accept', security: 'accept' } },
+      }, stepTimings: [{ step: 'read', startedAt: '2026-10-26T01:00:00Z' },
+        { step: 'advise', finishedAt: '2026-10-26T01:01:00Z' }] };
+      const comments = confirm === 'changes' ? [] : [settled];
+      const exec = (_cmd, argv) => {
+        const live = { number, state: 'OPEN', headRefOid: head, labels, body, createdAt: '2026-01-01T00:00:00Z' };
+        return JSON.stringify(Object.fromEntries(argv[argv.indexOf('--json') + 1].split(',').map(f => [f, live[f]])));
+      };
+      const io = { repo, prs: [{ number, labels }],
+        readPr: args => defaultReadPr({ ...args, exec, readComments: () => comments }),
+        readComments: () => comments, readReviews: () => [reviewRunEvidence(review)], readReview: () => review,
+        readRedTeam: () => null, emit: () => {}, provider: { ensureLabel() {}, setLabels(_repo, _pr, { remove }) {
+          labels = labels.filter(l => !remove.includes(l));
+        } } };
+      const rows = sweepLabelStateReconcile(io);
+      if (rows.some(row => row.error)) violations.push(`${confirm}: sweep failed`);
+      const expected = confirm === 'changes'
+        ? ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held'] : ['ready-to-merge'];
+      if (JSON.stringify(labels) !== JSON.stringify(expected)) violations.push(`${confirm}: unexpected labels ${labels.join(',')}`);
+      // The next tick must be stable after either a hold or a clearance.
+      io.prs[0].labels = labels;
+      if (sweepLabelStateReconcile(io).length) violations.push(`${confirm}: repeated reconciliation`);
+    }
+    log?.(`label reconciliation: ${violations.length} violation(s)`);
+    return { violations };
+  },
+  judge: report => report.violations,
+};
