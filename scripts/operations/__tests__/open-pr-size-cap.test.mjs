@@ -28,7 +28,7 @@ function wrapper(overrides = {}) {
 // in createParams/applyReviewEscalationLabel. All effects here are injected.
 function direct(overrides = {}) {
   const cards = new Map(); // trusted card-store fixture; body markers are advisory
-  const effects = { diffStat: vi.fn(() => ({ text, sha: '1'.repeat(40) })),
+  const effects = { secret: Buffer.alloc(32, 0x42), diffStat: vi.fn(() => ({ text, sha: '1'.repeat(40) })),
     fileItem: vi.fn((fields) => {
       cards.set(/^size-split-key:([a-f0-9]{64})/.exec(fields.digest)?.[1], card.verdict);
       return card;
@@ -281,6 +281,7 @@ describe('direct pr-land uses the same admission and existing review-label path'
     const second = await run({ ...request, body: first.body });
     expect(effects.fileItem).toHaveBeenCalledTimes(1);
     expect(second.body.match(/^## Size$/gm)).toHaveLength(1);
+    expect(second.body).toBe(first.body);
   });
 
   it.each(['over', 'unknown'])('forces %s through review:pending even below the existing 400-line threshold', (status) => {
@@ -349,6 +350,19 @@ describe('pr-land CLI size failure boundaries', () => {
   const runBlock = (forge, admit, prNum, labels, publication = { REF: 'lane/test', REMOTE: 'origin', BASE: 'main', refSha: 'sha', SRC: 'HEAD' }) =>
     executeBlock(forge, admit, prNum, labels, prLand.buildSizeAdmissionRequest, publication);
 
+  it.each([null, 5854])('the real runner outer fallback preserves the body passed to the forge (PR %s)', async (prNum) => {
+    const original = prNum == null ? 'create body' : 'Author body\r\n\r\n## Testing\r\nKeep this.  ';
+    const forge = { viewPr: vi.fn(() => ({ body: original })), editBody: vi.fn() };
+    const { run } = direct();
+    const result = await runBlock(forge, (input) => run({ ...input, sha: Symbol('invalid SHA') }), prNum, REVIEW_LABELS);
+    expect(result.sizeAdmission).toMatchObject({ status: 'unknown', lines: null, reviewLabel: REVIEW_LABELS.pending });
+    expect(result.createParams.body.startsWith(original + '\n\n<!-- pr-size:begin -->')).toBe(true);
+    expect(result.createParams.body).toContain('Split-card filing could not be confirmed.');
+    expect(result.createParams.body).toMatch(/<!-- pr-size:end hmac-sha256=[a-f0-9]{64} -->$/);
+    if (prNum != null) expect(forge.editBody).toHaveBeenCalledWith(prNum, result.createParams.body);
+    else expect(forge.editBody).not.toHaveBeenCalled();
+  });
+
   it.each([null, 5854])('CLI body reports a split card only after shared admission publishes it (PR %s)', async (prNum) => {
     const forge = { viewPr: vi.fn(() => ({ body: 'live body' })), editBody: vi.fn() };
     const { effects, run } = direct({ publishSplitCard: vi.fn(async () => ({ batched: false, reason: 'publication unavailable' })) });
@@ -356,7 +370,8 @@ describe('pr-land CLI size failure boundaries', () => {
     expect(effects.publishSplitCard).toHaveBeenCalledTimes(1);
     expect(result.createParams.body).toContain('split card not filed (file-item failed)');
     expect(result.sizeAdmission.reviewLabel).toBe(REVIEW_LABELS.pending);
-    expect(result.createParams.body).toMatch(/<!-- size-admission:[a-f0-9]{64} [a-f0-9]{64} -->/);
+    expect(result.createParams.body).toMatch(/<!-- size-admission:[a-f0-9]{64} -->/);
+    expect(result.createParams.body).toMatch(/<!-- pr-size:begin -->\n[\s\S]*<!-- pr-size:end hmac-sha256=[a-f0-9]{64} -->$/);
     if (prNum != null) expect(forge.editBody).toHaveBeenCalledWith(prNum, result.createParams.body);
   });
 

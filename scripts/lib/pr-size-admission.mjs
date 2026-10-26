@@ -1,7 +1,7 @@
 /** Shared size evidence and non-blocking PR admission. */
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { readFileSync, readdirSync } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { REVIEW_LABELS } from './review-labels.mjs';
 
@@ -262,12 +262,78 @@ function lookupLocalSplitCard({ key }, cwd) {
   return matches[0] || null;
 }
 
-// The marker carries a digest of the exact Size section this module wrote. A marker in
-// the editable body only names a candidate: the text between the heading and the marker
-// is replaced only when its bytes still hash to that digest. Any edit there — even one
-// that keeps the note's grammar — leaves the section in place and drops only the marker.
-function sizeNoteDigest(markerKey, section) {
-  return createHash('sha256').update(JSON.stringify([markerKey, section])).digest('hex');
+const SIZE_BEGIN = '<!-- pr-size:begin -->';
+const SIZE_CATCH_FALLBACK = '## Size\n\nSize unknown: extra reviewers requested (review:pending); human review of the full diff is required. Split-card filing could not be confirmed.';
+const sha256 = (text) => createHash('sha256').update(text).digest('hex');
+
+/** Local deletion authority, shared by worktrees but never stored in PR text.
+ * Exclusive creation never overwrites another writer's key. An incomplete write,
+ * unsafe permissions or any IO failure disables deletion; there is no temp-dir fallback.
+ */
+export function readOrCreateSizeSecret({ cwd = process.cwd(), secretPath } = {}) {
+  const read = (path) => {
+    const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const stat = fstatSync(fd);
+      if (!stat.isFile() || stat.size !== 32 || (stat.mode & 0o777) !== 0o600) return null;
+      const secret = readFileSync(fd);
+      return secret.length === 32 ? secret : null;
+    } finally { closeSync(fd); }
+  };
+  try {
+    if (secretPath === undefined) {
+      const commonDir = execFileSync('git', ['rev-parse', '--git-common-dir'], {
+        cwd, encoding: 'utf8', timeout: 5000, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'pipe'],
+      }).trim();
+      if (!commonDir) return null;
+      secretPath = resolve(cwd, commonDir, 'we-pr-size-secret');
+    }
+    try { return read(secretPath); }
+    catch (error) { if (error.code !== 'ENOENT') return null; }
+    try { writeFileSync(secretPath, randomBytes(32), { flag: 'wx', mode: 0o600 }); }
+    catch (error) { if (error.code !== 'EEXIST') return null; }
+    return read(secretPath);
+  } catch { return null; }
+}
+
+const validSecret = (secret) => (Buffer.isBuffer(secret) || typeof secret === 'string')
+  && Buffer.byteLength(secret) === 32;
+const sectionHmac = (text, secret) => createHmac('sha256', secret).update(text).digest('hex');
+
+/** Replace one unambiguous, line-delimited display section, preserving all other
+ * bytes (including CRLF). Editable markers never supply card/publication evidence.
+ * The HMAC binds the exact text after the begin line, including the final newline,
+ * to a local secret. Without that secret, no section is eligible for deletion.
+ * Legacy, modified or malformed sections are retained in full; a fresh section is appended.
+ */
+export function replaceOwnedSection(body, sectionText, { secret } = {}) {
+  const innerText = `${sectionText}\n`;
+  const canSign = validSecret(secret);
+  const end = canSign ? `<!-- pr-size:end hmac-sha256=${sectionHmac(innerText, secret)} -->` : '<!-- pr-size:end -->';
+  const section = `${SIZE_BEGIN}\n${innerText}${end}`;
+  // A malformed body stays malformed after appending. An identical appended
+  // section makes retries a no-op without authorizing deletion of any old text.
+  if (body === section || body.endsWith(`\n\n${section}`)) return body;
+  const markers = [...body.matchAll(/<!-- pr-size:(begin|end)\b[^\r\n]*?-->/g)];
+  // Partial comments and other marker-like text also make deletion ambiguous.
+  const markerLikeCount = [...body.matchAll(/pr-size:/g)].length;
+  const ownLine = (match) => {
+    const end = match.index + match[0].length;
+    return (match.index === 0 || body[match.index - 1] === '\n')
+      && (end === body.length || body[end] === '\n' || body.slice(end, end + 2) === '\r\n');
+  };
+  if (canSign && markerLikeCount === 2 && markers.length === 2 && markers[0][0] === SIZE_BEGIN && markers[1][1] === 'end'
+    && markers.every(ownLine)) {
+    const beginEnd = markers[0].index + markers[0][0].length;
+    const innerStart = beginEnd + (body.slice(beginEnd, beginEnd + 2) === '\r\n' ? 2 : 1);
+    const inner = body.slice(innerStart, markers[1].index);
+    const digest = /^<!-- pr-size:end hmac-sha256=([a-f0-9]{64}) -->$/.exec(markers[1][0])?.[1];
+    if (digest === sectionHmac(inner, secret)) {
+      return body.slice(0, markers[0].index) + section
+        + body.slice(markers[1].index + markers[1][0].length);
+    }
+  }
+  return body + (body ? '\n\n' : '') + section;
 }
 
 function splitCardId(value) {
@@ -276,6 +342,7 @@ function splitCardId(value) {
 }
 
 export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = createPrDiffStatReader({ cwd }),
+  secretPath, secret = readOrCreateSizeSecret({ cwd, secretPath }),
   fileItem = (fields) => fileSplitItem(fields, cwd), lookupSplitCard = (request) => lookupLocalSplitCard(request, cwd),
   publishSplitCard = (card, request) => publishLocalSplitCard(card, request, cwd),
 } = {}) {
@@ -310,7 +377,9 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = crea
     const key = typeof repo === 'string' && repo && FULL_SHA.test(head)
       && (request.pr == null || (Number.isSafeInteger(request.pr) && request.pr > 0))
       ? createHash('sha256').update(JSON.stringify([repo, head])).digest('hex') : null;
-    const markerKey = key || createHash('sha256').update(randomUUID()).digest('hex');
+    // Deterministic display identity even without pinned evidence; it does not
+    // make an unresolved head eligible for trusted card lookup.
+    const markerKey = key || sha256(JSON.stringify([repo, request.pr ?? ref, sha, base]));
     const filingRequest = { ...request, repo, sha: head, baseSha, key: markerKey };
     const groups = new Map(), files = new Set();
     if (plan.status === 'over') {
@@ -364,36 +433,14 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = crea
       cardId = null;
       cardNote = 'split card not filed (file-item failed)';
     }
-    // Advisory markers are display hints only, including old ref-based notes.
-    // Never read their ids/receipts as filing or publication evidence.
-    let legacyToken;
-    try { if (typeof ref === 'string' && ref.length <= 512) legacyToken = encodeURIComponent(ref); } catch { /* malformed ref */ }
-    // A web edit returns CRLF; a forge may trim the leading blank lines of an empty description.
-    const text = body.replace(/\r\n/g, '\n');
-    // Our note is appended last, so prefer the last marker over an earlier quoted copy.
-    // Marker tokens cannot span whitespace or `>`, so the match never reaches author text.
-    // 4608 = the longest encodeURIComponent of a 512-character legacy ref.
-    const existing = [...text.matchAll(/<!-- size-admission:([^\s<>]{1,4608})(?: ([^\s<>]{1,256}))? -->/g)]
-      .findLast((match) => match[1] === markerKey || (legacyToken && match[1] === legacyToken));
-    let previousBody = body;
-    if (existing) {
-      const heading = text.lastIndexOf('\n\n## Size\n', existing.index);
-      const start = heading >= 0 ? heading : text.startsWith('## Size\n') ? 0 : -1;
-      // Legacy ref-token notes predate the fixed shape: only their marker is dropped.
-      const replaceNote = start >= 0 && existing[1] === markerKey && existing[2]
-        === sizeNoteDigest(markerKey, (heading >= 0 ? '' : '\n\n') + text.slice(start, existing.index));
-      let end = existing.index + existing[0].length;
-      if ((existing.index === 0 || text[existing.index - 1] === '\n') && text[end] === '\n') end++;
-      previousBody = text.slice(0, replaceNote ? start : existing.index) + text.slice(end);
-    }
     const note = plan.status === 'over'
       ? `${plan.lines} non-test lines (> ${OPEN_PR_MAX_NON_TEST_LINES}): ${cardNote}; extra reviewers requested via the size escalation (review:pending)`
       : `size unknown: extra reviewers requested via the size escalation (review:pending); ${cardNote}`;
-    const section = `\n\n## Size\n\n${note}\n${groupLine}${fallback}\n`
-      + (cardPublished ? `<!-- size-published:${markerKey} -->\n` : '');
-    const noted = `${previousBody}${section}<!-- size-admission:${markerKey} ${sizeNoteDigest(markerKey, section)} -->\n`;
-    // Author text is never truncated or escaped. Past the forge limit the note is
-    // skipped and the body returned unchanged; the review label still escalates.
+    const noted = replaceOwnedSection(body, `## Size\n\n${note}\n${groupLine}${fallback}\n`
+      + (cardPublished ? `<!-- size-published:${markerKey} -->\n` : '')
+      + `<!-- size-admission:${markerKey} -->`, { secret });
+    // Never truncate or escape author text to fit the forge. The review label
+    // still escalates when there is no room for the owned note.
     if (noted.length <= FORGE_BODY_CHARS) result.body = noted;
     return result;
   };
@@ -403,8 +450,10 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = crea
     try { if (typeof request?.body === 'string') body = request.body; } catch { /* unreadable body */ }
     try { return await run(request); }
     catch {
-      // Return the caller's body unchanged so a fallback never replaces the description.
-      return { status: 'unknown', lines: null, reviewLabel: REVIEW_LABELS.pending, body };
+      // Use the safely captured body; a throwing getter must not break this fallback.
+      const noted = replaceOwnedSection(body, SIZE_CATCH_FALLBACK, { secret });
+      return { status: 'unknown', lines: null, reviewLabel: REVIEW_LABELS.pending,
+        body: noted.length <= FORGE_BODY_CHARS ? noted : body };
     }
   };
 }
