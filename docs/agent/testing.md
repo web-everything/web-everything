@@ -2411,18 +2411,3 @@ omissions are reported as truncation. Clone paths must be absolute. The drain ta
 prototype-load settings, not the plist's data clone; tests inject those settings. Matrix and PR table cells strip
 Cc/Cf controls and are width-capped; table mode keeps the truncated-listing warning.
 
-
-### Task timeout recovery probes
-
-For item-task timeout recovery, exercise positive `dead` evidence, including a probe that
-becomes foreign or throws after SIGTERM. A `gone` stop result alone is insufficient.
-The runtime's synchronous `releaseTaskClaim(record)` port runs under the record lock after
-checking status, handle and attempt; fixtures should record releases and race finish/reclaim
-against stopping. Production claim lifecycle integration remains separate from this core port.
-
-Task result sidecars live below the jobs store's `results/` child directory. Repair missing or torn
-outputs from `job.task.execution.results` before terminal classification; root torn JSON still
-means a corrupt run. Publication never releases a live owner. Child task record hooks guard both
-handle and attempt plus running status, while ordinary step contexts retain their existing shape.
-Recovery must recheck the current attempt's semantic result under the record lock after awaiting
-stop: unchanged ownership does not rule out completion during shutdown or justify a timeout charge.
