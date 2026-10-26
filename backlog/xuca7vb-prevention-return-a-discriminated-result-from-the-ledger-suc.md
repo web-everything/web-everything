@@ -1,4 +1,5 @@
 ---
+bornAs: xuca7vb
 kind: story
 size: 3
 parent: "4075"
@@ -13,7 +14,7 @@ tags: []
 
 # Prevention — Return a discriminated result from the ledger, such as {status:'ruled'|'none'|'accepted'}, and su… (from web-everything/web-everything#5944 review)
 
-> **DUPLICATE OF #7233 — closed as such.** This copy carried the same `bornAs` as #7233, which main already held; the drain would not enqueue it. Its `bornAs` was dropped so the identity stays with #7233, the real item.
+> **DUPLICATE OF #7233 — closed as such.** This copy was minted as #7274 with the same `bornAs` (`xgcpm6z`) as #7233, which main already held, so the drain would not enqueue it. It is re-keyed to a fresh hash id so the identity stays with #7233, the real item.
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
