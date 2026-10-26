@@ -173,6 +173,34 @@ describe('merge-watch durable readiness and delivery guarantees', () => {
     expect(events.filter(e => e.kind === 'pr-ready-not-merging')).toHaveLength(60);
   });
 
+  it('cursor resets to first repo after a complete sweep', async () => {
+    prs = Array.from({ length: 40 }, (_, i) => ready(i + 1));
+    const otherRepo = 'example/other';
+    const repos = [repo, otherRepo];
+    const previous = gh.getMockImplementation();
+    gh.mockImplementation(args => args[1]?.startsWith(`repos/${otherRepo}/pulls?`)
+      ? [] : previous(args));
+    const sweep = minute => {
+      headTime = at(minute);
+      return runMergeWatch({ repos, gh, now: at(minute), stateDir,
+        settings: { readyNotMergingMinutes: threshold }, emitEvent, log, signalLogs: () => [] });
+    };
+    const cursor = () => JSON.parse(fs.readFileSync(join(stateDir, 'cursor.json'), 'utf8'));
+
+    expect((await sweep(0)).incomplete).toBe(true);
+    expect(cursor()).toEqual({ repo, number: expect.any(Number) });
+    expect(cursor().number).toBeGreaterThan(1);
+    gh.mockClear();
+    expect((await sweep(1)).incomplete).toBe(false);
+    expect(gh.mock.calls.some(([args]) => args[1]?.startsWith(`repos/${otherRepo}/pulls?`))).toBe(true);
+    expect(cursor()).toEqual({ repo: repos[0], number: null });
+
+    // The next tick must revisit low-numbered PRs skipped by a stale deferral cursor.
+    gh.mockClear();
+    await sweep(2);
+    expect(gh.mock.calls.some(([args]) => args[0] === 'pr' && args[2] === '1')).toBe(true);
+  });
+
   it('retires a long-lived closed-unmerged set so later ticks spend no requests on it', async () => {
     prs = [];
     fs.mkdirSync(stateDir);
@@ -264,7 +292,9 @@ describe('merge-watch durable readiness and delivery guarantees', () => {
     expect(gh.mock.calls.filter(([args]) => args[1]?.includes('/comments?')).length).toBe(10);
     expect(result.incomplete).toBe(true);
     expect(emitEvent).not.toHaveBeenCalled();
-    expect(fs.existsSync(stateDir)).toBe(false);
+    const state = JSON.parse(fs.readFileSync(join(stateDir, `${encodeURIComponent(repo)}.json`), 'utf8'));
+    // Discovery survives incomplete evidence, without a timer or delivery receipt.
+    expect(state).toEqual({ prs: { 17: { heads: {}, merged: false } } });
     expect(log.mock.calls.flat().join(' ')).toMatch(/operator must inspect/);
   });
 });
