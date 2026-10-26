@@ -929,7 +929,7 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1, execFile
     if (remotes.length && !remoteNumbering) throw Error('number reservation remote origin unavailable');
     // Refresh before reading bornAs too: a stale ref can otherwise hide an already-landed
     // legacy identity without card-ids refs and cause a second number to be reserved for it.
-    if (remoteNumbering) numberingEvidence = readNumberingEvidence(numberingGit);
+    if (remoteNumbering) numberingEvidence = readNumberingEvidence(numberingGit, 'origin', { refreshTracking: true });
   } catch (e) {
     return finish({ assigned: [], committed: false, error: `number reservation unavailable: ${e.message}` });
   }

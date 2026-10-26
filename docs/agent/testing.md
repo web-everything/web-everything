@@ -1626,6 +1626,16 @@ evidence; the historical-number reuse policy is tracked in
 #xpg1c2d.
 Canonical tree reads use NUL-delimited paths; cover Unicode, quotes, backslashes and embedded newlines.
 Allocation and replay must obey the five-digit numeric ID grammar, including contention at 99999.
+Numbering evidence reads leave tracking refs unchanged by default: fetch with an empty refmap
+and read `FETCH_HEAD`, so collision healing cannot change a rebuild's parent after its tree was
+computed. Deferred numbering explicitly opts into refreshing tracking before its `bornAs` scan.
+Cover a remote main advance during the actual `rebaseDropManifest` collision-healing path and
+assert that the committed parent and tree still describe the same main snapshot.
+Permanent reservation listings use a bounded 32 MiB budget in both the parser and subprocess,
+enough for paired number/card-id refs throughout the five-digit range, including SHA-256 OIDs.
+Canonical path reads use the same budget so a full backlog does not hit a smaller output cap.
+Cover 8,500 claims, allocation of 99999, replay after a lost push response, and oversized refusal;
+also exercise the shared Git runner to catch adapters that silently discard `maxBuffer`.
 
 ### Dispatched conflict resolution
 

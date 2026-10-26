@@ -3,12 +3,13 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { allocateCardNumber, loadNumberAtBirthSettings, reserveCardNumber, reserveCollisionNumbers } from '../card-number-allocator.mjs';
+import { allocateCardNumber, loadNumberAtBirthSettings, reserveCardNumber, reserveCollisionNumbers, readNumberingEvidence } from '../card-number-allocator.mjs';
 import { tryAcquireNumberingLock } from '../../readiness/drain-lock.mjs';
 import { numberPendingHashes } from '../../lane-drain.mjs';
 import { planBaseCollisionHeal, applyCollisionHealToIndex, healNnnCollision } from '../nnn-collision-heal.mjs';
 import { planRenumber } from '../../backlog/renumber-collisions.mjs';
-import { gitBlobOid } from '../git-run.mjs';
+import { gitBlobOid, gitRun } from '../git-run.mjs';
+import { rebaseDropManifest } from '../rebase-drop-manifest.mjs';
 
 const io = vi.hoisted(() => ({ git: null }));
 // Inject the subprocess boundary explicitly: builtin ESM mocks can leave the
@@ -117,7 +118,10 @@ it.each([true, false])('refreshes canonical bornAs before deferred numbering (id
     if (args[0] === 'remote') return 'origin\n';
     if (args[0] === 'ls-files') return args[1] === 'backlog/*.md'
       ? 'backlog/074-existing.md\nbacklog/xaaaaaa-same.md\n' : '';
-    if (args[0] === 'fetch') { refreshed = true; return ''; }
+    if (args[0] === 'fetch') {
+      refreshed = args.includes('main:refs/remotes/origin/main');
+      return '';
+    }
     if (args[0] === 'ls-tree') return 'backlog/074-existing.md\0backlog/075-same.md\0';
     if (args[0] === 'grep') return refreshed && args.includes('^bornAs: x[0-9a-z]{6}$')
       ? 'origin/main:backlog/075-same.md:bornAs: xaaaaaa\n' : '';
@@ -373,9 +377,97 @@ it('prunes old and landed entries without lowering the high-water mark', () => {
 
 it('oversized ref evidence fails closed with an explicit hash-fallback result', () => {
   const r = remote();
-  const git = (args, extra) => args[0] === 'ls-remote' ? ' '.repeat(1024 * 1024 + 1) : r.git(args, extra);
+  const git = (args, extra) => args[0] === 'ls-remote' ? ' '.repeat(32 * 1024 * 1024 + 1) : r.git(args, extra);
   expect(allocateCardNumber({ ...fixture(), git })).toMatchObject({ ok: false, required: false, reason: 'oversized remote ref listing' });
   expect(r.refs.size).toBe(0);
+});
+
+it.each([8500, 99998])('allocates and replays after %s permanent birth reservations, including retry scans', (count) => {
+  const r = remote();
+  const paths = Array.from({ length: count }, (_, i) => `backlog/${String(i + 1).padStart(3, '0')}-card.md\0`).join('');
+  for (let n = 1; n <= count; n++) {
+    const num = String(n).padStart(3, '0');
+    const id = `x${n.toString(36).padStart(6, '0')}`;
+    const claim = JSON.stringify({ id, num, owner: 'fixture', timestamp: '2026-10-01T00:00:00Z' }) + '\n';
+    const oid = createHash('sha256').update(claim).digest('hex');
+    r.blobs.set(oid, claim);
+    r.refs.set(`refs/number-reservations/${num}`, oid);
+    r.refs.set(`refs/card-ids/${id}`, oid);
+  }
+  let lostResponse = false;
+  const git = (args, options) => {
+    const output = args[0] === 'ls-tree' ? paths : r.git(args, options);
+    if (args[0] === 'ls-tree' && Buffer.byteLength(output) > (options?.maxBuffer ?? 1024 * 1024)) throw Error('ENOBUFS');
+    if (args[0] === 'ls-remote') {
+      expect(Buffer.byteLength(output)).toBeGreaterThan(1024 * 1024);
+      // Exercise the same output cap as the production subprocess, including retry scans.
+      if (Buffer.byteLength(output) > (options?.maxBuffer ?? 1024 * 1024)) throw Error('ENOBUFS');
+    }
+    if (args[0] === 'push' && !lostResponse) { lostResponse = true; throw Error('lost push response'); }
+    return output;
+  };
+  const expected = String(count + 1);
+  expect(reserveCardNumber({ id: 'xaaaaaa', git })).toBe(expected);
+  expect(reserveCardNumber({ id: 'xaaaaaa', git })).toBe(expected);
+  expect(r.calls.filter((args) => args[0] === 'push')).toHaveLength(1);
+});
+
+it('the shared collision subprocess runner honors the numbering listing buffer', () => {
+  const size = 2 * 1024 * 1024;
+  const result = gitRun(process.execPath, ['-e', `process.stdout.write('a'.repeat(${size}))`], {
+    maxBuffer: 32 * 1024 * 1024,
+  });
+  expect(result.status).toBe(0);
+  expect(result.stdout.length).toBe(size);
+});
+
+it('collision evidence fetched during a rebuild cannot pair an old tree with a newer main parent', () => {
+  vi.stubEnv('WE_COORDINATION_ROOT', join(fixture().cwd, 'coordination'));
+  let trackingMain = 'A'; let fetchedMain = 'A'; let mergedNotes; let committed;
+  const run = (cmd, args, options = {}) => {
+    let stdout = '';
+    if (args[0] === 'fetch') {
+      fetchedMain = 'B';
+      // Git updates tracking refs for explicit destinations AND its configured refmap.
+      if (args.some((arg) => arg.includes(':refs/remotes/')) || !args.includes('--refmap=')) trackingMain = 'B';
+    } else if (args[0] === 'merge-tree') { mergedNotes = trackingMain; stdout = 'merged-tree\n'; }
+    else if (args[0] === 'remote') stdout = 'origin\n';
+    else if (args[0] === 'ls-tree' && args.includes('backlog/')) {
+      stdout = args.includes('merged-tree')
+        ? 'backlog/074-existing.md\0backlog/077-latest.md\0backlog/074-incoming.md\0'
+        : 'backlog/074-existing.md\0backlog/077-latest.md\0';
+    } else if (args[0] === 'cat-file') stdout = '---\nkind: task\n---\nLegacy card\n';
+    else if (args[0] === 'hash-object') stdout = gitBlobOid(options.input) + '\n';
+    else if (args[0] === 'write-tree') stdout = 'healed-tree\n';
+    else if (args[0] === 'commit-tree') {
+      committed = { parentNotes: trackingMain, treeNotes: mergedNotes };
+      stdout = 'new-commit\n';
+    }
+    return { status: 0, stdout, stderr: '' };
+  };
+  const result = rebaseDropManifest({ laneRef: 'lane/test', fetch: false, healCollision: true, run });
+  expect(result.action).toBe('rebased');
+  expect(result.healed).toMatchObject([{ oldNum: '074', newNum: '076' }]);
+  expect(fetchedMain).toBe('B');
+  expect(committed).toEqual({ parentNotes: 'A', treeNotes: 'A' });
+});
+
+it.each(['origin', 'upstream'])('reads fresh %s numbering evidence without advancing its tracking main', (remoteName) => {
+  let fetched = false;
+  const git = (args) => {
+    if (args[0] === 'fetch') {
+      expect(args).toEqual(['fetch', '--no-tags', '--refmap=', remoteName, 'refs/heads/main']);
+      fetched = true;
+      return '';
+    }
+    if (args[0] === 'ls-tree') {
+      expect(fetched).toBe(true);
+      return args.includes('FETCH_HEAD') ? 'backlog/078-newest.md\0' : 'backlog/074-stale.md\0';
+    }
+    if (args[0] === 'ls-remote') { expect(args[1]).toBe(remoteName); return ''; }
+    throw Error(`unexpected command ${args[0]}`);
+  };
+  expect(readNumberingEvidence(git, remoteName).main).toEqual([78]);
 });
 
 it('deferred numbering atomically reserves and replays even when birth numbering is disabled', () => {
@@ -405,7 +497,7 @@ it.each(['index', 'standalone'])('%s collision wiring refuses unreadable reserva
     calls.push(args);
     let stdout = '';
     if (args[0] === 'remote') stdout = 'origin\n';
-    if (args[0] === 'ls-tree') stdout = args.includes('origin/main')
+    if (args[0] === 'ls-tree') stdout = args.includes('origin/main') || args.includes('FETCH_HEAD')
       ? 'backlog/074-existing.md\0backlog/077-latest.md\0' : 'backlog/074-incoming.md\0';
     if (args[0] === 'cat-file') stdout = '---\n---\nIncoming\n';
     if (args[0] === 'ls-remote') return { status: 1, stdout: '', stderr: 'offline' };
@@ -425,7 +517,7 @@ it.each(['index', 'standalone'])('%s collision wiring claims the unreserved gap 
     calls.push(args);
     let stdout;
     if (args[0] === 'remote') stdout = 'origin\n';
-    else if (args[0] === 'ls-tree') stdout = args.includes('origin/main')
+    else if (args[0] === 'ls-tree') stdout = args.includes('origin/main') || args.includes('FETCH_HEAD')
       ? 'backlog/074-existing.md\0backlog/077-latest.md\0' : 'backlog/074-incoming.md\0';
     else if (args[0] === 'cat-file') stdout = '---\n---\nIncoming\n';
     else if (args[0] === 'hash-object') stdout = gitBlobOid(options.input) + '\n';
@@ -467,7 +559,7 @@ it('allows the last supported number and rejects oversized canonical tree eviden
   writeFileSync(join(opts.cwd, 'backlog/99998-existing.md'), '');
   expect(allocateCardNumber({ ...opts, git: r.git })).toMatchObject({ ok: true, num: '99999' });
   const other = remote();
-  const git = (args, options) => args[0] === 'ls-tree' ? 'a'.repeat(1024 * 1024 + 1) + '\0' : other.git(args, options);
+  const git = (args, options) => args[0] === 'ls-tree' ? 'a'.repeat(32 * 1024 * 1024 + 1) + '\0' : other.git(args, options);
   expect(allocateCardNumber({ ...fixture(), git })).toMatchObject({ ok: false,
     reason: expect.stringContaining('oversized backlog tree') });
   expect(other.refs.size).toBe(0);

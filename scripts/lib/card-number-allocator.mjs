@@ -32,10 +32,14 @@ const numericIds = (paths) => paths.flatMap((p) => {
 });
 const maximum = (ids) => ids.reduce((max, n) => Number.isSafeInteger(n) ? Math.max(max, n) : max, 0);
 const OID_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+// Permanent claims can contain two refs for every number through 99999. Even
+// with 64-byte SHA-256 hex OIDs this is under 19 MiB; leave bounded headroom.
+// This also fits a canonical backlog of 99999 filesystem-length card names.
+const NUMBERING_EVIDENCE_MAX_BYTES = 32 * 1024 * 1024;
 // Empty is a complete empty listing; any nonempty listing must end in a newline.
 function readRefs(output) {
   const text = String(output);
-  if (text.length > 1024 * 1024) throw Error('oversized remote ref listing');
+  if (Buffer.byteLength(text) > NUMBERING_EVIDENCE_MAX_BYTES) throw Error('oversized remote ref listing');
   if (text && !text.endsWith('\n')) throw Error('truncated remote ref listing');
   const refs = new Map();
   for (const line of text.split('\n').filter(Boolean)) {
@@ -51,17 +55,30 @@ function readRefs(output) {
   return refs;
 }
 
-/** Read complete canonical paths and immutable claims; shared by every numeric writer. */
-export function readNumberingEvidence(git, remote = 'origin') {
+function readRemoteRefs(git, remote = 'origin') {
+  return readRefs(git(['ls-remote', remote, 'refs/number-reservations/*', 'refs/card-ids/*'],
+    { maxBuffer: NUMBERING_EVIDENCE_MAX_BYTES }));
+}
+
+/** Read complete canonical paths and immutable claims; shared by every numeric writer.
+ * Leave tracking refs alone by default: a caller may already have merged their trees.
+ * Deferred numbering explicitly refreshes tracking before its separate bornAs reads.
+ */
+export function readNumberingEvidence(git, remote = 'origin', { refreshTracking = false } = {}) {
   let main;
   try {
-    git(['fetch', remote, `main:refs/remotes/${remote}/main`]);
-    const paths = String(git(['ls-tree', '-r', '--name-only', '-z', `${remote}/main`, '--', 'backlog/']));
-    if (paths.length > 1024 * 1024) throw Error('oversized backlog tree');
+    if (refreshTracking) git(['fetch', remote, `main:refs/remotes/${remote}/main`]);
+    // An empty refmap also disables the configured remote.fetch mapping: merely
+    // omitting a destination still opportunistically updates origin/main in Git.
+    else git(['fetch', '--no-tags', '--refmap=', remote, 'refs/heads/main']);
+    const paths = String(git(['ls-tree', '-r', '--name-only', '-z',
+      refreshTracking ? `${remote}/main` : 'FETCH_HEAD', '--', 'backlog/'],
+    { maxBuffer: NUMBERING_EVIDENCE_MAX_BYTES }));
+    if (Buffer.byteLength(paths) > NUMBERING_EVIDENCE_MAX_BYTES) throw Error('oversized backlog tree');
     if (paths && !paths.endsWith('\0')) throw Error('truncated backlog tree');
     main = numericIds(paths.split('\0').filter(Boolean));
   } catch (e) { throw Error(`${remote}/main high-water mark unavailable: ${e.message}`); }
-  const refs = readRefs(git(['ls-remote', remote, 'refs/number-reservations/*', 'refs/card-ids/*']));
+  const refs = readRemoteRefs(git, remote);
   return { main, refs };
 }
 
@@ -73,7 +90,7 @@ export function reserveCardNumber({ id, git, minimum = 1, dryRun = false, now = 
   if (typeof id !== 'string' || !HASH_RE.test(id)) throw Error('invalid card id: expected HASH_RE');
   evidence ??= readNumberingEvidence(git);
   const { main } = evidence;
-  const scan = () => readRefs(git(['ls-remote', 'origin', 'refs/number-reservations/*', 'refs/card-ids/*']));
+  const scan = () => readRemoteRefs(git);
   const idRef = `refs/card-ids/${id}`;
   const replay = (refs) => {
     const oid = refs.get(idRef);
