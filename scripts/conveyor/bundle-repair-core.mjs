@@ -60,7 +60,7 @@ export const BUNDLE_REPAIR_VALID = Object.freeze({
 export const LEDGER_STATUSES = Object.freeze(['running', 'repaired', 'shadow', 'cleared', 'escalated', 'dispatch-failed']);
 export const ESCALATION_REASONS = Object.freeze([
   'weakened-twice', 'unresolvable-conflict', 'tests-regressed', 'conflict-override-used', 'wall-time', 'hold-not-cleared',
-  'dispatch-failed', 'other',
+  'dispatch-failed', 'deadline', 'other',
 ]);
 /** What the session itself may record as its reason to stop (the rest are the tick's own findings). */
 export const SESSION_ESCALATION_REASONS = Object.freeze(['weakened-twice', 'unresolvable-conflict', 'tests-regressed', 'other']);
@@ -236,6 +236,10 @@ export function planReconcile(ledger, { clones = [], now, outcomeFor = () => nul
       const reason = saidRepaired ? 'hold-not-cleared' : 'wall-time';
       if (!raised.has(reason)) {
         act('escalated', reason, saidRepaired ? 'the session said repaired but the clone is still held at the wall time' : 'the repair session reached its wall time without recording an outcome');
+      } else if (sessionLive && !raised.has('deadline')) {
+        // The wall-time alert was raised already but the entry is still running: end it anyway, so an expired
+        // repair can never hold the one-at-a-time slot.
+        act('escalated', 'deadline', 'the repair is past its deadline and was still running');
       }
       continue;
     }
