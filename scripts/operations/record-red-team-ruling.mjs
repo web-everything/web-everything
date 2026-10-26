@@ -1,28 +1,36 @@
 /**
  * @file scripts/operations/record-red-team-ruling.mjs
- * @description Operator card ruling for a confirmed break in any state of the live result.
+ * @description Operator card, block and not-real ruling for a confirmed break in any state of the live result.
  * Requires an optional existing readable --card, a human operator poster,
  * and the operator's --reason and --channel. By default rulings require cap-held
  * breaks, after automation consumes pending round extensions; anyState=true opts into other states.
  * The ruling binds to the head and result. Preview plans without writing; the sink rechecks
  * before writing and proves release by reading back the human-authored record.
  * Without --card, queues one follow-up through the detached landing job with retry-safe claims.
- * Reader and sink: ./record-red-team-ruling-io.mjs. Other ruling kinds come later.
+ * Reader and sink: ./record-red-team-ruling-io.mjs. Block resumes hold record → ledger intent → reason → review:changes → proof
+ * from durable evidence, preserving the hold if a later step fails; not-real requires a cause.
  */
 import { createHash } from 'node:crypto';
 import { actionResource } from './action-record.mjs';
-import { buildRedTeamCardInput } from './red-team-gate-apply.mjs';
+import { buildRedTeamCardInput, buildSendBackBody } from './red-team-gate-apply.mjs';
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import { assertHumanOperator, isHumanOperatorComment, operatorBoundComments } from '../lib/operator-identity.mjs';
+import { resolveDisposition } from '../lib/red-team-disposition.mjs';
 import { GATE_OUTCOMES, OPERATOR_RULINGS_DEFAULTS, operatorRulingsOnLiveResult, liveResultGateState, readRedTeamDisposition, redTeamGateMarker } from '../lib/red-team-gate.mjs';
+import { FALSE_FINDING_CAUSES } from '../lib/false-finding-causes.mjs';
 import { sanitizeCardField } from '../lib/review-loop-policy.mjs';
 import { boundCardText, CARD_TEXT_CAPS } from './land-prevention-card.mjs';
 
 export const RECORD_RED_TEAM_RULING_OP = 'record-red-team-ruling';
-export const RED_TEAM_RULINGS = Object.freeze(['card']);
+export const RED_TEAM_RULINGS = Object.freeze(['card', 'block', 'not-real']);
 export const RED_TEAM_RULING_CARD_EFFECT = 'github.red-team-ruling-card';
+export const RED_TEAM_RULING_BLOCK_EFFECT = 'github.red-team-ruling-block';
+export const RED_TEAM_RULING_NOT_REAL_EFFECT = 'github.red-team-ruling-not-real';
+/** The gate-record outcomes for an operator's `not-real` / `card` ruling (the per-finding line releases the hold; the
+ *  `operator-` outcome is what lets a reader accept the record only from a human operator account). */
+export const OPERATOR_NOT_REAL_OUTCOME = 'operator-not-real';
 export const OPERATOR_CARD_OUTCOME = 'operator-card';
 
 /** Refuse lossy landing bounds before posting a pending intent. Include escaping expansion in the budget. */
@@ -36,6 +44,8 @@ export function assertRulingCardInputFits(input) {
   }
 }
 
+/** An operator `block` ruling's gate record: its `send-back` line re-holds the break even if an earlier ruling released it. */
+export const OPERATOR_BLOCK_OUTCOME = 'operator-block';
 /** The bare intent marker written BEFORE the card job is spawned: it has no action line, so the break stays held. */
 export const CARD_PENDING_OUTCOME = 'card-pending';
 const CARD_PENDING_INTENT_RE = /Operator card ruling pending \(job ([0-9a-f]{12}), break\(s\) (#\d+(?:, #\d+)*)\)/;
@@ -45,13 +55,16 @@ export function cardJobKey({ repo, pr, head, resultId, indices }) {
   return createHash('sha256').update(JSON.stringify(['v1', repo, Number(pr), head, resultId, [...indices].sort((a, b) => a - b)])).digest('hex').slice(0, 12);
 }
 
+/** Stable block identity; ledger event ids add the finding key, and repository scopes the store. */
+export const blockRulingId = ({ pr, head, resultId, indices }) => createHash('sha256')
+  .update(JSON.stringify([Number(pr), head, resultId, [...indices].sort((a, b) => a - b)])).digest('hex');
+
 /** Shared resource: bind the full repo/PR/head/result/break identity into a safe item id. */
 export const rulingCardResource = (p, scope = 'card') => actionResource(p.repo, {
   type: 'item', id: `rtr-${p.pr}-${p.head.slice(0, 12)}-${cardJobKey(p)}${scope === 'break' ? '-break' : ''}`,
 });
 
 const labelNames = (labels) => (Array.isArray(labels) ? labels : []).map((l) => (typeof l === 'string' ? l : l?.name));
-const RULING_ACTION = Object.freeze({ card: 'card' });
 const where = (f) => `${f.file ?? '(no file cited)'}${f.line ? `:${f.line}` : ''}`;
 
 /** Pick the selected held breaks from `--break`: `1`, `#1,#3`, `<file>:<line>` or `<file>`. PURE; throws. */
@@ -98,37 +111,46 @@ export function buildRuleReasonComment({ head, ruling, actor, channel, at, reaso
  *   - `anyState` ON (the `redTeam.operatorRulings.anyState` setting, opt-in): ANY confirmed break of the live head's
  *     latest result, whatever the gate did with it (parked at the cap, sent back, or carded), except one whose latest
  *     operator ruling on THIS result is already the same ruling and no later gate action superseded its release.
+ *     Blocks remain plannable; the sink alone proves completion from ledger, reason, hold record and fresh labels.
  *   - OFF (default): the round-cap restriction. Only a result parked at the round cap, after pending grants are consumed,
  *     and only the breaks the gate still holds for the operator.
  */
-export function rulableBreaks({ comments, labels, pr, head, setting, scope, ruling, citesCard = false, repo, standingRuling = null }) {
+export function rulableBreaks({ comments, labels, pr, head, setting, scope, ruling = 'card', citesCard = false, repo, standingRuling = null }) {
   const anyState = scope?.anyState === true;
   const state = liveResultGateState(comments, pr, head, repo, standingRuling);
   if (!state.result) throw new Error(`no red-team result on the live head ${head.slice(0, 9)} — nothing to rule on`);
   const atCap = state.outcomes.has(GATE_OUTCOMES.ROUND_CAP);
+  const { carded, blocked } = operatorRulingsOnLiveResult(comments, pr, head);
+  const disposition = readRedTeamDisposition({ comments, repo, pr, head, setting, standingRuling, operatorRulings: scope });
+  const resolved = f => resolveDisposition(f.index, disposition.rulings.get(f.index) ?? []);
+  const releasable = f => {
+    const evidence = disposition.rulings.get(f.index) ?? [];
+    const proposed = { kind: ruling, source: 'operator', keys: [f.index],
+      at: evidence.reduce((latest, r) => Math.max(latest, r.at), -1) + 1 };
+    return resolveDisposition(f.index, [...evidence, proposed]).by === proposed;
+  };
   if (!anyState) {
     if (!atCap) {
       throw new Error(`the red-team result on head ${head.slice(0, 9)} was not parked at the round cap (no trusted \`round-cap\` gate record decides it); `
         + 'a break that is not at the cap belongs to the gate or the fixer (redTeam.operatorRulings.anyState is off)');
     }
     if (state.reopened) throw new Error('a pending round extension reopened the red-team gate; let the gate consume the grant before ruling on a break');
-    const { carded } = operatorRulingsOnLiveResult(comments, pr, head);
     // A NEW card filing is never made for a break already carded by anyone, in either mode.
-    const held = readRedTeamDisposition({ comments, repo, pr, head, setting, standingRuling, operatorRulings: scope }).held
-      .filter((f) => !(ruling === 'card' && !citesCard && carded.has(f.index)));
-    if (!held.length) throw new Error('no red-team break is held for the operator on the live head (already carded, ruled or cleared)');
+    const held = disposition.held
+      .filter((f) => !(ruling === 'card' && !citesCard && carded.has(f.index)))
+      .filter(releasable);
+    if (!held.length) throw new Error('no red-team break is held for the operator on the live head (already carded, ruled or cleared)'
+      + (blocked.size ? '; live operator block takes precedence' : ''));
     return { state, atCap, anyState, rulable: held, noun: 'held for the operator' };
   }
-  const { ruled, carded } = operatorRulingsOnLiveResult(comments, pr, head);
-  const action = RULING_ACTION[ruling];
   // A NEW card filing is never made for a break already carded by anyone (the gate or an operator); citing an
   // existing card (--card) files nothing, so it may release a finding held again after the latest operator ruling.
   // A later gate action can supersede an operator release. Use the grant-aware reader so stale caps do not reopen it.
-  const disposition = readRedTeamDisposition({ comments, repo, pr, head, setting, standingRuling, operatorRulings: scope });
   const blocking = new Set([...disposition.held, ...disposition.sendBack].map((f) => f.index));
-  const rulable = state.result.findings.filter((f) => f.confirmed && (ruled.get(f.index)?.at(-1) !== action || blocking.has(f.index))
+  // Completion is a durable sink check, never inferred from labels alone.
+  const rulable = state.result.findings.filter((f) => f.confirmed && releasable(f) && (ruling === 'block' || resolved(f).by?.source !== 'operator' || resolved(f).by?.kind !== ruling || blocking.has(f.index))
     && !(ruling === 'card' && !citesCard && carded.has(f.index)));
-  if (!rulable.length) throw new Error(`no confirmed red-team break on the live head is left to rule \`${ruling}\` (none confirmed, or each already ruled \`${ruling}\` by the operator on this result)`);
+  if (!rulable.length) throw new Error(`no confirmed red-team break on the live head is left to rule \`${ruling}\` (none confirmed, or each already ruled \`${ruling}\` by the operator on this result; live operator block takes precedence)`);
   return { state, atCap, anyState, rulable, noun: `confirmed and not already ruled \`${ruling}\` on the live head` };
 }
 
@@ -172,7 +194,12 @@ export function planRedTeamRuling(read, input) {
   }
   if (!String(reason ?? '').trim()) throw new Error("--reason is required: the operator's words, verbatim");
   if (!String(channel ?? '').trim() || /[\r\n]/.test(channel)) throw new Error('--channel is required and must be one line');
-  if ((String(input.card ?? '').trim() || read.card) && !read.card?.readable) {
+  if (ruling === 'not-real' && !FALSE_FINDING_CAUSES.includes(input.cause)) {
+    throw new Error(`--ruling=not-real requires --cause=<${FALSE_FINDING_CAUSES.join('|')}> (as for referral rulings)`);
+  }
+  if (ruling !== 'not-real' && input.cause !== undefined) throw new Error('--cause applies only to --ruling=not-real');
+  if (ruling !== 'card' && input.card !== undefined && input.card !== '') throw new Error('--card applies only to --ruling=card');
+  if (ruling === 'card' && (String(input.card ?? '').trim() || read.card) && !read.card?.readable) {
     throw new Error(`--card ${read.card?.requested ?? input.card} does not resolve to a readable backlog card (${read.card?.reason ?? 'unresolved'})`);
   }
   // Bind to who actually posts: the authenticated gh identity must be a human operator and equal --actor.
@@ -189,21 +216,28 @@ export function planRedTeamRuling(read, input) {
     reason: String(reason), at: read.now, resultId: state.resultId, findings: selected, setting: read.setting,
     indices: selected.map((f) => f.index), scope, scopeSources: read.scope?.sources ?? {}, atCap,
     underChanges: labelNames(read.labels).includes('review:changes') };
-  if (read.card) {
+  if (ruling === 'card' && read.card) {
     return { ...base, effect: RED_TEAM_RULING_CARD_EFFECT, cardRef: read.card.ref };
   }
-  const cardInput = buildRedTeamCardInput({ repo: input.repo, pr, head, findings: selected });
-  cardInput.digest += `\n\nOperator ruling (${base.actor} via ${base.channel}): carded. Reason: ${sanitizeCardField(reason, 600)}`;
-  // No-file findings remain rulable with --card. An empty automatic filing scope
-  // must be refused here, before a pending intent can strand the ruling.
-  assertRulingCardInputFits(cardInput);
-  const jobKey = cardJobKey(base);
-  const pending = conflictingPendingCardJobs(comments, { pr, head, resultId: state.resultId, jobKey, indices: base.indices });
-  if (pending.length) {
-    throw new Error(`a card job is already pending for ${pending.map((j) => `break(s) ${j.indices.map((i) => `#${i}`).join(', ')} (job ${j.jobKey})`).join('; ')}; `
-      + 're-run with exactly that --break selection to finish it (a different overlapping selection would file the same break twice)');
+  if (ruling === 'card') {
+    const cardInput = buildRedTeamCardInput({ repo: input.repo, pr, head, findings: selected });
+    cardInput.digest += `\n\nOperator ruling (${base.actor} via ${base.channel}): carded. Reason: ${sanitizeCardField(reason, 600)}`;
+    // No-file findings remain rulable with --card. An empty automatic filing scope
+    // must be refused here, before a pending intent can strand the ruling.
+    assertRulingCardInputFits(cardInput);
+    const jobKey = cardJobKey(base);
+    const pending = conflictingPendingCardJobs(comments, { pr, head, resultId: state.resultId, jobKey, indices: base.indices });
+    if (pending.length) {
+      throw new Error(`a card job is already pending for ${pending.map((j) => `break(s) ${j.indices.map((i) => `#${i}`).join(', ')} (job ${j.jobKey})`).join('; ')}; `
+        + 're-run with exactly that --break selection to finish it (a different overlapping selection would file the same break twice)');
+    }
+    return { ...base, effect: RED_TEAM_RULING_CARD_EFFECT, cardInput, jobKey, session: `red-team-ruling-card-${jobKey}` };
   }
-  return { ...base, effect: RED_TEAM_RULING_CARD_EFFECT, cardInput, jobKey, session: `red-team-ruling-card-${jobKey}` };
+  if (ruling === 'block') {
+    const body = `${buildSendBackBody({ pr, head, findings: selected })}\n\nOperator ruling: block (${base.actor} via ${base.channel}). Reason: ${sanitizeCardField(reason, 600)}`;
+    return { ...base, effect: RED_TEAM_RULING_BLOCK_EFFECT, sendBackBody: body };
+  }
+  return { ...base, effect: RED_TEAM_RULING_NOT_REAL_EFFECT, cause: input.cause };
 }
 
 export function recordRedTeamRulingOperation({ readRulingContext } = {}) {
@@ -221,6 +255,7 @@ export function recordRedTeamRulingOperation({ readRulingContext } = {}) {
       channel: 'string',
       reason: 'string',
       card: { type: 'string', required: false },
+      cause: { type: 'string', enum: [...FALSE_FINDING_CAUSES], required: false },
       preview: { type: 'boolean', required: false, default: false },
     },
     verdictFrom: 'plan',
@@ -229,20 +264,20 @@ export function recordRedTeamRulingOperation({ readRulingContext } = {}) {
       fn: (view) => readRulingContext({ repo: view.input.repo, pr: view.input.pr, card: view.input.card }),
     }),
     plan: compute({
-      reads: ['input.repo', 'input.pr', 'input.break', 'input.ruling', 'input.actor', 'input.channel', 'input.reason', 'input.card', 'findings.read'],
+      reads: ['input.repo', 'input.pr', 'input.break', 'input.ruling', 'input.actor', 'input.channel', 'input.reason', 'input.card', 'input.cause', 'findings.read'],
       fn: (view) => planRedTeamRuling(view.findings.read, view.input),
     }),
     write: effectStep({
       reads: ['verdict', 'input.preview'],
       // The sink re-reads the thread and refuses when the selected breaks are no longer held.
       effects: (view) => (view.input.preview ? [] : [{
-        type: view.verdict.effect, idempotent: false,
+        type: view.verdict.effect, idempotent: view.verdict.ruling === 'block',
         payload: {
           repo: view.verdict.repo, pr: view.verdict.pr, head: view.verdict.head, ruling: view.verdict.ruling,
           actor: view.verdict.actor, channel: view.verdict.channel, reason: view.verdict.reason, at: view.verdict.at,
           resultId: view.verdict.resultId, findings: view.verdict.findings, indices: view.verdict.indices,
-          setting: view.verdict.setting, scope: view.verdict.scope, cardRef: view.verdict.cardRef,
-          cardInput: view.verdict.cardInput, jobKey: view.verdict.jobKey, session: view.verdict.session,
+          setting: view.verdict.setting, scope: view.verdict.scope, cardRef: view.verdict.cardRef, cause: view.verdict.cause, underChanges: view.verdict.underChanges,
+          cardInput: view.verdict.cardInput, jobKey: view.verdict.jobKey, session: view.verdict.session, sendBackBody: view.verdict.sendBackBody,
         },
       }]),
     }),
