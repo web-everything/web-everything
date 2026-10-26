@@ -1,0 +1,15 @@
+{
+  "id": "probation-registry-generalisation",
+  "title": "Probation Registry \u2014 Systems, Models, and Rulings",
+  "status": "open",
+  "summary": "Preparation for decision #4010: revision-bound subject identity, model compatibility, shared scheduled review, and operator-controlled exit. Planner design probation supplies the first non-model subject; model-specific graduation criteria remain separate.",
+  "dateOpened": "2026-10-25",
+  "tags": [
+    "probation",
+    "governance",
+    "operations"
+  ],
+  "relatedBlocks": [],
+  "relatedPlugs": [],
+  "relatedReport": "reports/2026-10-25-probation-registry-generalisation.md"
+}

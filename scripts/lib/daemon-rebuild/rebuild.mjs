@@ -22,21 +22,29 @@ import { smokeAndAdopt } from './smoke.mjs';
 import { resolveVersionedContext, versionedRebuild } from '../daemon-version-runtime.mjs';
 import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
 
-// Positive classification: new/waiting reasons must never become failures by default.
-// Shared with the event-contract tests so every declared failure has a wiring regression.
-export const REBUILD_FAILURE_REASONS = Object.freeze([
-  'index-locked', 'rebuild-interrupted-unrecoverable', 'quarantined', 'not-on-main',
-  'head-unresolved', 'overlay-state-corrupt', 'fetch-failed', 'status-failed',
-  'main-unresolved', 'pinned-overlay-conflict', 'pinned-overlay-unavailable',
-  'established-overlay-conflict', 'untracked-collision', 'still-rejected',
-  'merge-in-progress', 'dirty', 'local-commits', 'root-changed-during-smoke',
-  'reset-failed', 'rollback-failed', 'rebuild-error', 'rebuild-job-queue-failed',
-  'dispatch-smoke-failed', 'candidate-worktree-failed', 'smoke-threw',
-  'smoke-reused-env-failed', 'smoke-harness-broken', 'smoke-rejected',
-  'rev-parse-failed', 'smoke-failed', 'not-built',
+// ── rebuildClone — the IO shell ──────────────────────────────────────────────────────────────────────────────
+
+// Only explicit failures belong in the coordination feed. Holds, contention and
+// unknown future reasons stay quiet; the reason-inventory contract test requires
+// new reasons to be classified. `error` covers versionedRebuild's error: <detail>.
+export const FAILURE_REASONS = new Set([
+  'candidate-worktree-failed', 'deps-job-queue-failed', 'dispatch-smoke-failed',
+  'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed',
+  'git-common-dir-failed', 'git-dir-unreadable', 'head-unresolved', 'launch-failed',
+  'main-unresolved', 'merge-tree-failed', 'no-origin-url', 'not-built',
+  'overlay-state-corrupt', 'pinned-overlay-conflict', 'pinned-overlay-unavailable',
+  'pinned-unparsable', 'pinned-unreadable', 'pinned-write-failed', 'quarantined',
+  'rebuild-error', 'rebuild-interrupted-unrecoverable', 'rebuild-job-queue-failed',
+  'rebuild-threw', 'reset-failed', 'reset-rollback-failed', 'restore-failed',
+  'rev-parse-failed', 'rollback-failed', 'save-failed', 'scratch-init-failed',
+  'smoke-failed', 'smoke-harness-broken', 'smoke-rejected', 'smoke-retry',
+  'smoke-reused-env-failed', 'smoke-threw', 'state-file-unparsable', 'state-file-unreadable',
+  'status-failed', 'status-unreadable', 'still-rejected', 'swap-failed', 'switch-failed',
+  'worktree-add-failed', 'error',
 ]);
 
-// ── rebuildClone — the IO shell ──────────────────────────────────────────────────────────────────────────────
+// Array view for event-contract consumers, sharing the explicit failure classification.
+export const REBUILD_FAILURE_REASONS = Object.freeze([...FAILURE_REASONS]);
 
 /**
  * Rebuild `root` fresh from `origin/main` + its registered overlay list. See the file header (xa4qo7n) for the
@@ -56,14 +64,15 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
   const result = await rebuildCloneInternal(options);
   try {
     const eventOptions = { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } };
-    if (result.adopted || result.moved) {
+    // adopted also describes a sibling's completed swap or crash recovery.
+    // Only moved proves this invocation actually changed the running build.
+    if (result.moved === true) {
       if (typeof result.head === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(result.head)) {
         await emitEvent({
           kind: 'rebuild-adopted', daemon: basename(options.root), detail: { sha: result.head },
         }, eventOptions);
       }
-    } else if (REBUILD_FAILURE_REASONS.includes(result.reason)
-      || (typeof result.reason === 'string' && /^(?:error: |established-overlay-conflict: )/.test(result.reason))) {
+    } else if (typeof result.reason === 'string' && FAILURE_REASONS.has(result.reason.split(':', 1)[0])) {
       await emitEvent({
         kind: 'rebuild-failed', daemon: basename(options.root), detail: { reason: result.reason },
       }, eventOptions);
