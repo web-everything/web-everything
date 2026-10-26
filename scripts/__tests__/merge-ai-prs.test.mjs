@@ -232,8 +232,8 @@ describe('round listing freshness at the CLI boundary', () => {
       writeFileSync(snapshot, JSON.stringify({ repo: 'fixture/repo', writtenAt: Date.now(), defaultBranch: 'main', rows: [target, ...(sendBack && !omitSibling ? [sibling] : [])] }));
       if (sendBack) {
         // Neither PR has a follow-up entry. Only live rows know that manually queued #43 is now held.
-        // Keep the target out of land/repair processing so the fixture isolates the pass-wide sweep.
-        target.labels = [{ name: 'review:changes' }];
+        // Keep the target held but selected, so an empty candidate set does not trigger a label-lag re-poll.
+        target.labels = [...target.labels, { name: 'review:changes' }];
         sibling.labels = sendBack === 'removed-ready' ? [] : [...sibling.labels, { name: sendBack }];
       }
       writeFileSync(join(dir, 'rows.json'), JSON.stringify([target, sibling]));
@@ -257,7 +257,7 @@ else if (a[0] === 'api' && a[1] === 'graphql') {
     out = { data: { repository: { mergeQueue: { entries: { nodes: fs.existsSync(process.env.QUEUE_REMOVED) ? [] : [{ pullRequest: { id: 'PR_43', number: 43 } }], pageInfo: { hasNextPage: false } } } } } };
   } else {
     if (process.env.FAIL_LISTING === '1') { fs.writeSync(2, 'fixture live listing unavailable'); process.exit(1); }
-    const local = a.some(v => v.includes('owner:"fixture"'));
+    const local = a.some(v => v.includes('repository(owner:"fixture",name:"repo")'));
     const nodes = (local ? rows : []).map(r => ({ ...r, labels: { nodes: r.labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: r.statusCheckRollup } } } }] } }));
     out = { data: { repository: { pullRequests: { nodes, totalCount: nodes.length, pageInfo: { hasNextPage: false, endCursor: null } } } } };
   }
@@ -310,7 +310,7 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
     expect(calls.filter(a => a[0] === 'pr' && a[1] === 'comment' && a[2] === '43')).toHaveLength(1);
     // No second candidate listing is needed when the context already listed this repo live.
     const liveListings = calls.filter(a => a[0] === 'api' && a[1] === 'graphql'
-      && a.some(v => v.includes('owner:"fixture"') && v.includes('pullRequests(states:OPEN')));
+      && a.some(v => v.includes('repository(owner:"fixture",name:"repo")') && v.includes('pullRequests(states:OPEN')));
     expect(liveListings).toHaveLength(1);
   });
   it('keeps eviction on live evidence when round snapshots are disabled', () => {
