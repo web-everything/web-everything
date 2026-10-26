@@ -54,13 +54,20 @@ function acceptedRedTeamClearAndClean(pr, now) {
 
 let root, stateDir, prs, gh, emitEvent, log;
 const modulePath = join(process.cwd(), 'scripts/conveyor/pass-daemons/pr-merge-watch-pass.mjs');
-const loadPass = () => import(/* @vite-ignore */ modulePath);
+let passInstance = 0;
+const loadPass = () => import(/* @vite-ignore */ `${modulePath}?instance=${passInstance}`);
+async function restartPass() {
+  const previous = await loadPass();
+  // Reload the watcher, retaining its shared analysis graph. Resetting every
+  // dependency made even the injected, sleep-free CLI test exceed 5s under load.
+  passInstance++;
+  expect((await loadPass()).runMergeWatch).not.toBe(previous.runMergeWatch);
+}
 const alert = (head = HEAD, minutes = 61, repo = REPO) => ({
   kind: 'pr-ready-not-merging', repo, pr: 17, detail: { minutes, head },
 });
 
 beforeEach(() => {
-  vi.resetModules();
   io.tool = {};
   io.reads = [];
   io.append.mockReset().mockResolvedValue(true);
@@ -126,7 +133,7 @@ describe('runMergeWatch — acceptedRedTeamClearAndClean (humanReviewHold + fina
     await tick(0);
     expect(emitEvent).not.toHaveBeenCalled();
     expect(fs.readdirSync(stateDir).length).toBeGreaterThan(0);
-    vi.resetModules(); // A new pass instance must recover the timer from disk.
+    await restartPass(); // A new pass instance must recover the timer from disk.
     await tick(61);
     expect(emitEvent.mock.calls).toEqual([[alert()]]);
   });
@@ -179,7 +186,7 @@ describe('runMergeWatch — acceptedRedTeamClearAndClean (humanReviewHold + fina
     await tick(0);
     await tick(61);
     await tick(62);
-    vi.resetModules();
+    await restartPass();
     await tick(180);
     expect(emitEvent.mock.calls).toEqual([[alert()]]);
   });
@@ -208,7 +215,7 @@ describe('runMergeWatch — acceptedRedTeamClearAndClean (humanReviewHold + fina
     await tick(0);
     prs.set(REPO, [readyPr({ state: 'CLOSED', merged_at: at(10) })]);
     await tick(11);
-    vi.resetModules();
+    await restartPass();
     await tick(12);
     expect(emitEvent.mock.calls).toEqual([[{ kind: 'pr-merged', repo: REPO, pr: 17 }]]);
   });
@@ -249,7 +256,7 @@ describe('runMergeWatch — acceptedRedTeamClearAndClean (humanReviewHold + fina
     // A pass may surface or log delivery errors; either way it must retain the receipt for retry.
     await tick(61).catch(() => {});
     expect(emitEvent).toHaveBeenCalledTimes(1);
-    vi.resetModules();
+    await restartPass();
     await tick(62);
     await tick(63);
     expect(emitEvent).toHaveBeenCalledTimes(2);
