@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { proposeHumanRequired } from '../direction-aware-human.mjs';
+import { sensitiveSurfaceHits } from '../human-review-surfaces.mjs';
 
 const surface = 'scripts/lib/human-review-surfaces.mjs';
 const runner = 'scripts/operations/run.mjs';
@@ -21,6 +22,54 @@ const simple = (op = 'PR_TRACE_OP') => diff(runner, [' const zeroWrites = [', `+
 const tightening = (changes) => diff(surface, [' export const PROTECTION_PATHS = Object.freeze([', ...changes, '   /codeowners$/,', ' ]);']);
 
 describe('direction-aware humanRequired shadow (R131)', () => {
+  it.each([
+    [' FIRST_OP,', ' SECOND_OP,', ' THIRD_OP,', '+ PR_TRACE_OP,', ' APPROVED_OP,', ' ] = [null, null, null, false, true];'],
+    [' [', ' FIRST_OP,', '+ PR_TRACE_OP,', ' APPROVED_OP,', ' ] = [null, false, true];'],
+    [' let [', ' FIRST_OP,', '+ PR_TRACE_OP,', ' APPROVED_OP,', ' ] = [null, false, true];'],
+    [' const [', ' FIRST_OP,', '+ PR_TRACE_OP,', ' APPROVED_OP,', ' ] = [null, false, true];'],
+    [' var [', ' FIRST_OP,', '+ PR_TRACE_OP,', ' APPROVED_OP,', ' ] = [null, false, true];'],
+    [' const values = [', ' FIRST_OP,', ' SECOND_OP,', ' THIRD_OP,', '+ PR_TRACE_OP,', ' APPROVED_OP,'],
+    [' FIRST_OP,', ' SECOND_OP,', ' THIRD_OP,', '+ PR_TRACE_OP,', ' APPROVED_OP,', ' ];'],
+    [' [', " 'events',", "+ 'pr-trace',", " 'health',", ' ].forEach(runWriter);'],
+    [' writeValues([', " 'events',", "+ 'pr-trace',", " 'health',", ' ]);'],
+    [' const values = [', ' FIRST_OP,', '+ PR_TRACE_OP,', ' APPROVED_OP,', ' ]', ' = [null, false, true];'],
+    [' const values = [', ' FIRST_OP,', '+ PR_TRACE_OP,', ' APPROVED_OP,', ' ]'],
+    ['-const values = [EVENTS_OP, APPROVED_OP]', '+const values = [EVENTS_OP, PR_TRACE_OP, APPROVED_OP]',
+      ' = [null, false, true];'],
+    ['-const values = [EVENTS_OP, APPROVED_OP]', '+const values = [EVENTS_OP, PR_TRACE_OP, APPROVED_OP]'],
+  ].map(lines => [lines]))('keeps unproven array and destructuring contexts human: %j', lines => {
+    for (const file of [runner, sweep, dispatch]) {
+      expect(propose({ [file]: diff(file, lines) }, [permission(file)]).proposed).toBe(true);
+    }
+  });
+  it('demonstrates that the reported destructuring insertion enables a write', () => {
+    const execute = inserted => Function(`
+      let FIRST_OP, SECOND_OP, THIRD_OP, PR_TRACE_OP, APPROVED_OP;
+      [FIRST_OP, SECOND_OP, THIRD_OP, ${inserted ? 'PR_TRACE_OP,' : ''} APPROVED_OP]
+        = [null, null, null, false, true];
+      let writes = 0;
+      if (APPROVED_OP) writes += 1;
+      return writes;
+    `)();
+    expect(execute(false)).toBe(0);
+    expect(execute(true)).toBe(1);
+    const section = diff(runner, [' FIRST_OP,', ' SECOND_OP,', ' THIRD_OP,',
+      '+ PR_TRACE_OP,', ' APPROVED_OP,', ' ] = [null, null, null, false, true];']);
+    const hits = sensitiveSurfaceHits([runner], () => section, 'narrow');
+    expect(hits).toContainEqual(permission(runner));
+    expect(propose({ [runner]: section }, hits).proposed).toBe(true);
+  });
+  it('permits complete named array literals, including frozen lists and consecutive additions', () => {
+    const section = diff(runner, [' const first = [', '+ PR_TRACE_OP,', '+ PR_TRACE_OP,', ' ];',
+      ' const second = Object.freeze([', " 'events',", "+ 'pr-trace',", ' ]);']);
+    expect(propose({ [runner]: section }, [permission(runner)]).proposed).toBe(false);
+  });
+  it('requires both array boundaries in one hunk even when each added item has neighbours', () => {
+    const section = diff(runner,
+      [' const values = [', ' FIRST_OP,', '+ PR_TRACE_OP,', ' SECOND_OP,'],
+      [' THIRD_OP,', '+ PR_TRACE_OP,', ' APPROVED_OP,', ' ];']);
+    expect(propose({ [runner]: section }, [permission(runner)]).proposed).toBe(true);
+  });
   it.each(['scripts/lib/merge-queue-enqueue.mjs', 'scripts/lib/policy-cascade.mjs'])
     ('refuses classifier dependency changes beside a provable read-only addition: %s', file => {
       expect(propose({ [runner]: simple(), [file]: diff(file, ['+// change']) }, [permission(runner)]))
