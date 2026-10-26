@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, fstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { keepAliveScript } from '../test-keepalive.mjs';
 import {
   resolveDetachedOpsDir, processStart, parseDetachFlags, startDetachedOp, waitForOp, handleDetachCli,
 } from '../detached-op.mjs';
@@ -111,21 +112,18 @@ describe.skipIf(process.platform === 'win32')('re-parented descendants (runner s
     let record;
     let grandchildPid;
     try {
-      const grandchild = `
-        require('node:fs').writeFileSync(${JSON.stringify(grandchildReady)}, String(process.pid));
-        for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => {});
-        setInterval(() => {}, 1000);
-      `;
+      const grandchild = keepAliveScript({
+        prelude: "for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => {});",
+        postlude: `require('node:fs').writeFileSync(${JSON.stringify(grandchildReady)}, String(process.pid));`,
+      });
       const mid = `
         const { spawn } = require('node:child_process');
         spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { stdio: 'ignore', detached: true }).unref();
         setTimeout(() => { require('node:fs').writeFileSync(${JSON.stringify(midGone)}, '1'); process.exit(0); }, ${midLingerMs});
       `;
-      const command = `
-        const { spawn } = require('node:child_process');
-        spawn(process.execPath, ['-e', ${JSON.stringify(mid)}], { stdio: 'ignore' });
-        setInterval(() => {}, 1000);
-      `;
+      const command = keepAliveScript({
+        postlude: `require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(mid)}], { stdio: 'ignore' });`,
+      });
       record = await startDetachedOp({ argv: [process.execPath, '-e', command], kind: 'reparent-test', dir,
         env: { ...process.env, DETACHED_OP_SNAPSHOT_MS: String(snapshotMs) } });
       const readyDeadline = Date.now() + 8000;
