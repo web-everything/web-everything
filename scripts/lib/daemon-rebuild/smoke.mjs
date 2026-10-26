@@ -407,7 +407,7 @@ export async function smokeAndAdopt({
   /** The dispatch smoke on its own (a proven tree, or the adopt-as-no-worse path): materialize, launch, tear down. */
   const dispatchOnly = async (sha, suspects) => {
     const candidate = materializeCandidate({
-      root, sha, run, env, path: lease.path,
+      root, sha, run, env, path: lease.path, log,
     });
     if (!candidate.ok) return { suspects, result: { ok: false, reason: 'candidate-worktree-failed', detail: candidate.reason } };
     try {

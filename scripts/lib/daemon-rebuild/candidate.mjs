@@ -4,7 +4,7 @@
 
 import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { join, dirname, isAbsolute, resolve as resolvePath } from 'node:path';
+import { join, dirname, basename, isAbsolute, resolve as resolvePath } from 'node:path';
 import { stateDir } from './state.mjs';
 import { cloneKey } from '../daemon-overlays.mjs';
 import { makeGit } from './shared.mjs';
@@ -60,16 +60,22 @@ export function candidateWorktreePath(root, env = process.env, token = `manual-$
  * @returns {{ok:true, path:string}|{ok:false, reason:string}}
  */
 export function materializeCandidate({
-  root, sha, run, env, path = candidateWorktreePath(root, env),
+  root, sha, run, env, path = candidateWorktreePath(root, env), pidAlive = defaultPidAlive, rm = rmSync, log,
 }) {
   const git = makeGit({ run, cwd: root, env, timeoutMs: 120_000 });
+  // Live 2026-10-26 (wev-fix-daemon): a killed attempt left its candidate LOCKED ("initializing"), and the rebuild
+  // could never adopt again. Reclaim OUR OWN dead-owner leftovers first; a live or unknown owner is never touched.
+  const { reclaimed } = reclaimStaleCandidates({ root, run, env, pidAlive, rm, keepPath: path });
+  for (const p of reclaimed) log?.error?.(`daemon-rebuild: reclaimed stale candidate worktree ${p} (owner pid dead, lock cleared)`);
   git(['worktree', 'remove', '--force', path]);
-  try { rmSync(path, { recursive: true, force: true }); } catch { /* best-effort teardown of a stale attempt */ }
+  try { rm(path, { recursive: true, force: true }); } catch { /* best-effort teardown of a stale attempt */ }
   git(['worktree', 'prune']);
   mkdirSync(dirname(path), { recursive: true });
   const add = git(['worktree', 'add', '--detach', '--quiet', path, sha]);
   if (add.status !== 0) {
-    return { ok: false, reason: `worktree-add-failed: ${String(add.stderr || add.stdout || '').trim().split('\n')[0]}` };
+    const msg = String(add.stderr || add.stdout || '').trim().split('\n').find((l) => l.trim())
+      || `git worktree add exited ${add.status} with no output (timeout or kill?)`;
+    return { ok: false, reason: `worktree-add-failed: ${msg}`, reclaimed };
   }
   try {
     const nodeModules = join(root, 'node_modules');
@@ -78,7 +84,48 @@ export function materializeCandidate({
       symlinkSync(nodeModules, join(path, 'node_modules'), 'dir');
     }
   } catch { /* best-effort — see docblock above */ }
-  return { ok: true, path };
+  return { ok: true, path, reclaimed };
+}
+
+/** true = alive, false = provably gone (ESRCH), null = unknown (never treated as dead). */
+function defaultPidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) {
+    if (e?.code === 'ESRCH') return false;
+    if (e?.code === 'EPERM') return true;
+    return null;
+  }
+}
+
+/**
+ * Reclaim THIS clone's own stale candidate worktrees: registered under `<stateDir>/<cloneKey>.candidate-<pid>-<hex>`,
+ * git-locked (a killed `worktree add` leaves the lock "initializing"), and whose owner pid (from the name) is
+ * provably dead. Unlock + `worktree remove --force` on that exact path + prune. Fail closed: another clone's
+ * prefix, an unlocked tree, an unparseable name, a live or unknown owner, a failed listing or unlock — untouched.
+ * (The owner's start time is not recorded in the name or lock, so a reused pid reads as alive: safe side.)
+ * @returns {{reclaimed:string[], skipped:{path:string, reason:string}[]}}
+ */
+export function reclaimStaleCandidates({ root, run, env, pidAlive = defaultPidAlive, rm = rmSync, keepPath }) {
+  const reclaimed = []; const skipped = [];
+  const git = makeGit({ run, cwd: root, env, timeoutMs: 60_000 });
+  const list = git(['worktree', 'list', '--porcelain']);
+  if (list.status !== 0) return { reclaimed, skipped };
+  const prefix = join(stateDir(env), `${cloneKey(root)}.candidate-`);
+  for (const block of String(list.stdout || '').split(/\n\n+/)) {
+    const lines = block.split('\n');
+    const path = lines.find((l) => l.startsWith('worktree '))?.slice('worktree '.length);
+    if (!path || !path.startsWith(prefix) || path === keepPath) continue;
+    if (!lines.some((l) => l === 'locked' || l.startsWith('locked '))) continue;
+    const pid = Number(/^(\d+)-[0-9a-f]+$/.exec(basename(path).slice(basename(prefix).length))?.[1]);
+    if (!Number.isInteger(pid) || pid <= 0) { skipped.push({ path, reason: 'owner-unknown' }); continue; }
+    if (pidAlive(pid) !== false) { skipped.push({ path, reason: 'owner-alive-or-unknown' }); continue; }
+    const unlock = git(['worktree', 'unlock', path]);
+    if (unlock.status !== 0) { skipped.push({ path, reason: `unlock-failed: ${String(unlock.stderr || '').trim().split('\n')[0]}` }); continue; }
+    git(['worktree', 'remove', '--force', path]);
+    try { rm(path, { recursive: true, force: true }); } catch { /* best-effort */ }
+    reclaimed.push(path);
+  }
+  if (reclaimed.length) git(['worktree', 'prune']);
+  return { reclaimed, skipped };
 }
 
 /**
