@@ -3,11 +3,195 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { existsSync, fstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { keepAliveScript } from '../test-keepalive.mjs';
 import {
   resolveDetachedOpsDir, processStart, parseDetachFlags, startDetachedOp, waitForOp, handleDetachCli,
 } from '../detached-op.mjs';
+
+// Patch built-in boundaries only inside a disposable Node process. The real module,
+// private runner entry point and filesystem run unchanged; no host process is signalled.
+function boundaryProbe(dir, body) {
+  return JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', `
+    import assert from 'node:assert/strict';
+    import fs from 'node:fs';
+    import cp from 'node:child_process';
+    import { EventEmitter } from 'node:events';
+    import { syncBuiltinESMExports } from 'node:module';
+    import { pathToFileURL } from 'node:url';
+    import { join } from 'node:path';
+    const [dir, modulePath] = process.argv.slice(1);
+    const tick = () => new Promise(resolve => setImmediate(resolve));
+    ${body}
+  `, dir, resolve('scripts/lib/detached-op.mjs')], {
+    encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024,
+  }));
+}
+
+const controlledRunner = `
+  const path = join(dir, 'controlled.json');
+  const record = { id: 'controlled', status: 'running', pid: process.pid, exitCode: null,
+    stdoutPath: join(dir, 'stdout'), stderrPath: join(dir, 'stderr') };
+  fs.writeFileSync(path, JSON.stringify(record));
+  fs.writeFileSync(record.stdoutPath, '');
+  fs.writeFileSync(record.stderrPath, '');
+  const readRecord = () => JSON.parse(fs.readFileSync(path, 'utf8'));
+  const child = new EventEmitter();
+  child.pid = 4100001;
+  cp.spawn = () => child;
+  const signals = [];
+  process.kill = (pid, signal) => { signals.push([pid, signal]); return true; };
+  let listing = child.pid + ' 1 ' + child.pid + ' command-start';
+  cp.execFileSync = (command, args) => args[0] === '-o' ? 'runner-start' : listing;
+  let snapshot;
+  globalThis.setInterval = callback => { snapshot = callback; return { unref() {} }; };
+  globalThis.clearInterval = () => {};
+  syncBuiltinESMExports();
+  process.argv = [process.execPath, modulePath, '--run-record=' + path, '--', 'fake-command'];
+  await import(pathToFileURL(modulePath).href);
+  assert.equal(child.listenerCount('close'), 1, 'runner must reach command spawn');
+`;
+
+describe('runner lifecycle boundaries', () => {
+  let dir;
+  beforeEach(() => { dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'detached-op-boundary-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  it('does not publish terminal failure until the command closes', () => {
+    expect(boundaryProbe(dir, `${controlledRunner}
+      process.emit('SIGTERM');
+      assert.ok(signals.some(([pid]) => pid === child.pid), 'command must be signalled');
+      // Give a premature promise resolution/publication a chance to run.
+      await tick();
+      const beforeClose = readRecord();
+      child.emit('exit', null, 'SIGKILL');
+      await tick();
+      const afterExit = readRecord();
+      child.emit('close', null, 'SIGKILL');
+      await tick();
+      console.log(JSON.stringify({ beforeClose, afterExit, afterClose: readRecord() }));
+      process.exitCode = 0;
+    `)).toMatchObject({
+      beforeClose: { status: 'running', exitCode: null },
+      afterExit: { status: 'running', exitCode: null },
+      afterClose: { status: 'failed', exitCode: 143 },
+    });
+  });
+
+  it.each([false, true])('does not signal a watched descendant whose start time changed (reused: %s)', reused => {
+    const result = boundaryProbe(dir, `${controlledRunner}
+      const descendant = 4100002;
+      listing += '\\n' + descendant + ' ' + child.pid + ' ' + descendant + ' descendant-start';
+      snapshot();
+      // At stop, the descendant is orphaned. Its identity changes only at the
+      // final sweep, after stopCommand's last snapshot, to exercise that guard.
+      let listings = 0;
+      cp.execFileSync = (command, args) => {
+        if (args[0] === '-o') return 'runner-start';
+        if (args.includes('pid=,ppid=,pgid=,lstart=')) listings++;
+        return child.pid + ' 1 ' + child.pid + ' command-start\\n'
+          + descendant + ' 1 ' + descendant + ' '
+          + (${reused} && listings >= 2 ? 'replacement-start' : 'descendant-start');
+      };
+      syncBuiltinESMExports();
+      process.emit('SIGTERM');
+      child.emit('close', null, 'SIGKILL');
+      await tick();
+      console.log(JSON.stringify({ signals, listings, record: readRecord() }));
+      process.exitCode = 0;
+    `);
+    expect(result.listings).toBeGreaterThanOrEqual(2);
+    expect(result.signals).toContainEqual([4100001, 'SIGKILL']);
+    expect(result.signals.some(([pid]) => Math.abs(pid) === 4100002)).toBe(!reused);
+    expect(result.record).toMatchObject({ status: 'failed', exitCode: 143 });
+  });
+
+  it('publishes lifecycle records by atomic replacement', () => {
+    expect(boundaryProbe(dir, `
+      const write = fs.writeFileSync;
+      const rename = fs.renameSync;
+      const publications = [];
+      fs.writeFileSync = (path, data, options) => {
+        assert.ok(!String(path).endsWith('.json'), 'never write the destination in place');
+        return write(path, data, options);
+      };
+      fs.renameSync = (tmp, destination) => {
+        const next = JSON.parse(fs.readFileSync(tmp, 'utf8'));
+        const previous = fs.existsSync(destination) ? JSON.parse(fs.readFileSync(destination, 'utf8')) : null;
+        assert.equal(String(tmp).startsWith(destination + '.'), true);
+        assert.equal(fs.statSync(tmp).mode & 0o777, 0o600);
+        assert.equal(next.status, 'running');
+        publications.push({ previous, next });
+        rename(tmp, destination);
+        assert.deepEqual(JSON.parse(fs.readFileSync(destination, 'utf8')), next);
+      };
+      syncBuiltinESMExports();
+      const { startDetachedOp } = await import(pathToFileURL(modulePath).href);
+      const record = await startDetachedOp({ dir, argv: ['fake-command'],
+        now: () => 1767225600000, random: () => 'atomic',
+        spawnFn: () => ({ pid: 43210, unref() {} }) });
+      console.log(JSON.stringify({ publications, record }));
+    `)).toMatchObject({ publications: [
+      { previous: null, next: { status: 'running', pid: expect.any(Number) } },
+      { previous: { status: 'running', pid: expect.any(Number) }, next: { status: 'running', pid: 43210 } },
+    ], record: { pid: 43210 } });
+  });
+
+  it.each([0, 23])('publishes runner terminal exit %s by atomic replacement', exitCode => {
+    const result = boundaryProbe(dir, `${controlledRunner}
+      const write = fs.writeFileSync;
+      const rename = fs.renameSync;
+      const previous = readRecord();
+      let replacements = 0;
+      fs.writeFileSync = (destination, data, options) => {
+        assert.notEqual(destination, path, 'never overwrite the live lifecycle record');
+        const result = write(destination, data, options);
+        assert.deepEqual(readRecord(), previous, 'old JSON stays intact after temporary write');
+        return result;
+      };
+      fs.renameSync = (tmp, destination) => {
+        assert.equal(destination, path);
+        assert.deepEqual(readRecord(), previous);
+        const next = JSON.parse(fs.readFileSync(tmp, 'utf8'));
+        assert.equal(next.exitCode, ${exitCode});
+        assert.equal(next.status, ${JSON.stringify(exitCode === 0 ? 'done' : 'failed')});
+        replacements++;
+        return rename(tmp, destination);
+      };
+      syncBuiltinESMExports();
+      child.emit('close', ${exitCode});
+      await tick();
+      console.log(JSON.stringify({ replacements, record: readRecord() }));
+      process.exitCode = 0;
+    `);
+    expect(result).toMatchObject({ replacements: 1,
+      record: { status: exitCode === 0 ? 'done' : 'failed', exitCode } });
+  });
+});
+
+describe('real runner ordinary completion', () => {
+  it.each([0, 7, 23])('publishes terminal state and captured output for command exit %s', async exitCode => {
+    const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'detached-op-completion-'));
+    let record;
+    try {
+      record = await startDetachedOp({ dir, kind: 'completion-test', argv: [process.execPath, '-e',
+        `console.log('ordinary stdout'); console.error('ordinary stderr'); process.exit(${exitCode});`] });
+      const result = await waitForOp({ id: record.id, dir, maxWaitMs: 5000 });
+      const status = exitCode === 0 ? 'done' : 'failed';
+      expect(result).toMatchObject({ id: record.id, status, code: exitCode === 0 ? 0 : 1, exitCode,
+        stdoutTail: 'ordinary stdout\n', stderrTail: 'ordinary stderr\n' });
+      expect(JSON.parse(readFileSync(join(dir, `${record.id}.json`), 'utf8')))
+        .toMatchObject({ id: record.id, status, exitCode });
+    } finally {
+      // Never signal a completed runner's PID, which could already have been reused.
+      if (record && JSON.parse(readFileSync(join(dir, `${record.id}.json`), 'utf8')).status === 'running') {
+        try { process.kill(record.pid, 'SIGTERM'); } catch {}
+        await waitForOp({ id: record.id, dir, maxWaitMs: 1000 });
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 10000);
+});
 
 describe('resolveDetachedOpsDir', () => {
   it('uses the explicit DETACHED_OPS_DIR override', () => {
@@ -340,9 +524,10 @@ describe('detached operation lifecycle', () => {
   });
 
   it('treats a live pid whose start time differs from the recorded pidStart as a dead runner (PID reuse)', async () => {
-    const record = writeRecord({ pid: process.pid, pidStart: 'Mon Jan  1 00:00:00 2001' });
+    const record = writeRecord({ pidStart: 'original-start' });
     const clock = fakeClock();
-    const result = await waitForOp({ id: record.id, maxWaitMs: 250, dir, ...clock });
+    const result = await waitForOp({ id: record.id, maxWaitMs: 250, dir, ...clock,
+      isAlive: () => true, startOf: () => 'replacement-start' });
     expect(result).toMatchObject({ id: record.id, status: 'failed', code: 1, reason: 'runner-died' });
     expect(clock.sleep).not.toHaveBeenCalled();
   });
@@ -360,6 +545,17 @@ describe('detached operation lifecycle', () => {
     expect(neverCalled).not.toHaveBeenCalled();
   });
 
+  it.each([null, undefined])('keeps a live runner running when its recorded start time cannot be re-read (%s)', async unreadable => {
+    const record = writeRecord({ pidStart: 'recorded-start' });
+    const startOf = vi.fn(() => unreadable);
+    const clock = fakeClock();
+    expect(await waitForOp({ id: record.id, dir, maxWaitMs: 250, ...clock,
+      isAlive: () => true, startOf })).toMatchObject({ status: 'running', code: 75, exitCode: null });
+    expect(startOf).toHaveBeenCalledWith(record.pid);
+    expect(clock.now()).toBe(250);
+    expect(JSON.parse(readFileSync(join(dir, `${record.id}.json`), 'utf8'))).toEqual(record);
+  });
+
   it('rechecks a refreshed runner identity even when the PID is unchanged', async () => {
     const record = writeRecord({ pidStart: 'old-start' });
     const clock = fakeClock();
@@ -373,7 +569,12 @@ describe('detached operation lifecycle', () => {
     expect(startOf.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 
-  it.skipIf(process.platform === 'win32')('reads the same runner start time whatever TZ the reader runs under', () => {
+  it.skipIf(process.platform === 'win32')('processStart reads the same runner start time whatever TZ the reader runs under', context => {
+    try { execFileSync('ps', ['-o', 'lstart=', '-p', String(process.pid)], { stdio: 'ignore', timeout: 1000 }); }
+    catch (error) {
+      if (!['EPERM', 'EACCES'].includes(error.code)) throw error;
+      context.skip(); return;
+    }
     const saved = process.env.TZ;
     try {
       process.env.TZ = 'UTC';
@@ -434,5 +635,78 @@ describe('detached operation lifecycle', () => {
       scriptPath: 'scripts/example.mjs', kind: 'acceptance', dir, env: {}, out,
     })).toBeNull();
     expect(out).not.toHaveBeenCalled();
+  });
+
+  it.each([['running', null, 75], ['done', 0, 0], ['failed', 23, 1]])(
+    'handleDetachCli --wait-for emits JSON for %s exit %s and returns code %s', async (status, exitCode, code) => {
+      const record = writeRecord({ status, exitCode });
+      const out = vi.fn();
+      const spawnFn = vi.fn();
+      const clock = fakeClock();
+      expect(await handleDetachCli([`--wait-for=${record.id}`, '--max-wait-ms=250', '--detach'], {
+        dir, out, spawnFn, ...clock, isAlive: () => true,
+      })).toBe(code);
+      expect(out).toHaveBeenCalledOnce();
+      expect(JSON.parse(out.mock.calls[0][0])).toMatchObject({ id: record.id, status, exitCode, code,
+        stdoutTail: 'stdout from the operation\n', stderrTail: 'stderr from the operation\n' });
+      expect(spawnFn).not.toHaveBeenCalled();
+      expect(clock.now()).toBe(status === 'running' ? 250 : 0);
+    },
+  );
+
+  it('handleDetachCli --detach launches scriptPath without --detach and prints the record', async () => {
+    const scriptPath = join(dir, 'script with spaces.mjs');
+    const rest = ['--task=a=b', 'two words', '`literal`', '--flag'];
+    const args = ['--detach', rest[0], '--max-wait-ms=250', ...rest.slice(1), '--detach'];
+    const original = [...args];
+    const out = vi.fn();
+    const unref = vi.fn();
+    const spawnFn = vi.fn(() => ({ pid: 43210, unref }));
+    expect(await handleDetachCli(args, { scriptPath, dir, out, spawnFn, kind: 'cli-test',
+      now: () => 1767225600000, random: () => 'cli', env: {} })).toBe(0);
+    expect(spawnFn).toHaveBeenCalledOnce();
+    const [command, runnerArgs, options] = spawnFn.mock.calls[0];
+    const record = JSON.parse(out.mock.calls[0][0]);
+    expect(command).toBe(process.execPath);
+    expect(runnerArgs).toEqual([resolve('scripts/lib/detached-op.mjs'),
+      `--run-record=${join(dir, `${record.id}.json`)}`, '--', process.execPath, scriptPath, ...rest]);
+    expect(options).toMatchObject({ detached: true, env: {} });
+    expect(out).toHaveBeenCalledOnce();
+    expect(record).toMatchObject({ kind: 'cli-test', pid: 43210, status: 'running', exitCode: null });
+    expect(JSON.parse(readFileSync(join(dir, `${record.id}.json`), 'utf8'))).toEqual(record);
+    expect(args).toEqual(original);
+    expect(unref).toHaveBeenCalledOnce();
+  });
+
+  it.each(['../x', '../../x', '/abs', '-flag', '', '.', '..', 'a/b', 'a\\b', 'a b', 'a`b', 'a"b',
+    'a\nb', 'a\rb', 'a\u2028b', 'ａ', 'a\u200bb'])(
+    'rejects hostile job id %j before waitForOp reads any file or startDetachedOp spawns', async id => {
+      const spawnFn = vi.fn();
+      const isAlive = vi.fn();
+      expect(await waitForOp({ id, dir, maxWaitMs: 250, ...fakeClock(), isAlive }))
+        .toMatchObject({ id, status: 'failed', code: 1, reason: 'invalid-record' });
+      // The starter generates its own id. A hostile clock prefix exercises its
+      // recordPath guard; hostile random suffixes are separately sanitized below.
+      await expect(startDetachedOp({ dir, argv: ['fake-command'], now: () => id, random: () => 'safe', spawnFn }))
+        .rejects.toThrow('invalid job id');
+      expect(spawnFn).not.toHaveBeenCalled();
+      expect(isAlive).not.toHaveBeenCalled();
+      expect(boundaryProbe(dir, `
+        const { waitForOp } = await import(pathToFileURL(modulePath).href);
+        const reads = [];
+        const read = fs.readFileSync;
+        fs.readFileSync = (...args) => { reads.push(String(args[0])); return read(...args); };
+        syncBuiltinESMExports();
+        const result = await waitForOp({ id: ${JSON.stringify(id)}, dir, maxWaitMs: 250 });
+        console.log(JSON.stringify({ result, reads }));
+      `)).toMatchObject({ result: { reason: 'invalid-record' }, reads: [] });
+    },
+  );
+
+  it('startDetachedOp sanitizes hostile random suffixes into an allowlisted record id', async () => {
+    const record = await startDetachedOp({ dir, argv: ['fake-command'], now: () => 1767225600000,
+      random: () => '../a/b\\c\n--flag', spawnFn: () => ({ pid: 43210, unref() {} }) });
+    expect(record.id).toBe('1767225600000-abc--flag');
+    expect(JSON.parse(readFileSync(join(dir, `${record.id}.json`), 'utf8'))).toEqual(record);
   });
 });
