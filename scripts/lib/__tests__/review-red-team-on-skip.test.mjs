@@ -545,28 +545,34 @@ describe('proveCardOnlyHeadMove', () => {
     expect(exec).toHaveBeenCalledWith('git', ['rev-list', '--max-count=21', '--parents', `${fromSha}..${commits[0]}`],
       expect.objectContaining({ cwd: 'checkout', timeout: 10_000, maxBuffer: 1024 * 1024 }));
   });
-  it('rejects histories exceeding MAX_COMMITS (21 commits) before reading any diff', () => {
-    const commits = history(21), exec = fake({ revList: revListFor(commits), tree: 'backlog/123-card.md\0' });
-    expect(proveCardOnlyHeadMove({ exec, fromSha, toSha: commits[0] }).ok).toBe(false);
-    expect(exec.mock.calls.filter(([, args]) => args[0] === 'diff-tree')).toHaveLength(0);
+  it('rejects a history over MAX_COMMITS', () => {
+    for (const count of [20, 21]) {
+      const commits = history(count), exec = fake({ revList: revListFor(commits), tree: 'backlog/123-card.md\0' });
+      expect(proveCardOnlyHeadMove({ exec, fromSha, toSha: commits[0] }).ok, `${count} card-only commits`).toBe(count === 20);
+      expect(exec.mock.calls.filter(([, args]) => args[0] === 'diff-tree')).toHaveLength(count === 20 ? 20 : 0);
+    }
   });
   it.each(['', c1])('rejects empty or zero-parent history %j', revList => {
     expect(proveCardOnlyHeadMove({ exec: fake({ revList, tree: 'backlog/123-card.md\0' }), fromSha, toSha }).ok).toBe(false);
   });
-  it.each([0, 1, 2])('rejects a non-card commit at history position %i, including an intermediate code change', badIndex => {
-    const commits = history(3);
-    const exec = fake({ revList: revListFor(commits), tree: 'backlog/123-card.md\0' });
-    const read = exec.getMockImplementation();
-    exec.mockImplementation((file, args, options) => args[0] === 'diff-tree' && args.at(-1) === commits[badIndex]
-      ? 'scripts/code.mjs\0' : read(file, args, options));
-    expect(proveCardOnlyHeadMove({ exec, fromSha, toSha: commits[0] }).ok).toBe(false);
+  it('rejects an intermediate non-card commit', () => {
+    // Both two-commit orders reject first-only/last-only inspection; the middle of three rejects endpoints-only inspection.
+    for (const [count, badIndex] of [[2, 0], [2, 1], [3, 0], [3, 1], [3, 2]]) {
+      const commits = history(count);
+      const exec = fake({ revList: revListFor(commits), tree: 'backlog/123-card.md\0' });
+      const read = exec.getMockImplementation();
+      exec.mockImplementation((file, args, options) => args[0] === 'diff-tree' && args.at(-1) === commits[badIndex]
+        ? 'scripts/code.mjs\0' : read(file, args, options));
+      expect(proveCardOnlyHeadMove({ exec, fromSha, toSha: commits[0] }).ok,
+        `non-card commit at index ${badIndex} of ${count}`).toBe(false);
+    }
   });
-  it('requests no-renames diffs so a code-to-card rename exposes its non-card source', () => {
-    const exec = fake({ tree: 'backlog/123-card.md\0' }), read = exec.getMockImplementation();
+  it('requires --no-renames and sees a code-to-card rename', () => {
+    const exec = fake({ revList: `${toSha} ${fromSha}`, tree: 'backlog/123-card.md\0' }), read = exec.getMockImplementation();
     exec.mockImplementation((file, args, options) => args[0] === 'diff-tree' && args.includes('--no-renames')
       ? 'scripts/code.mjs\0backlog/123-card.md\0' : read(file, args, options));
     expect(proveCardOnlyHeadMove({ exec, fromSha, toSha }).ok).toBe(false);
-    expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['diff-tree', '--no-renames']), expect.anything());
+    expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['diff-tree', '--no-renames', toSha]), expect.anything());
   });
   it.each([
     ['backlog/123-card.md\0', true],
