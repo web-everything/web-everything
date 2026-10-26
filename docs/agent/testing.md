@@ -8,8 +8,9 @@ full head/base SHAs; mock symbolic SHA strings no longer represent valid Git evi
 Retry fixtures need a trusted card store keyed by repository and head SHA; assigning a PR
 number after creation must reuse the initial card. Cover retries with and without a saved body.
 Body markers are display hints; publication must be confirmed again from the store/publisher.
-When another heading or comment intervenes before an admission marker, retries remove only
-that marker and preserve the author's text. Ordinary retries still replace their own Size note.
+The admission marker carries a digest of the exact Size section it closes. When any text there
+changed (another heading, a comment, or an edit that keeps the note's grammar), retries remove
+only that marker and preserve the author's text. Ordinary retries still replace their own Size note.
 Author text is never truncated or escaped: past the forge body limit the note is skipped and the
 body returned unchanged (no edit), and every fallback, including the runner's outer catch, returns
 the caller's body. Reviewers are still requested in each case.

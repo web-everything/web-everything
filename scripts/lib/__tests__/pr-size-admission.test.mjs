@@ -52,6 +52,8 @@ const evidence = '100\t50\tscripts/operations/a.mjs\0'
 const HEAD_SHA = '1'.repeat(40), BASE_SHA = '2'.repeat(40);
 const cardKey = (sha = HEAD_SHA, repo = 'web-everything/web-everything') => createHash('sha256').update(JSON.stringify([repo, sha])).digest('hex');
 const KEY = cardKey();
+// The written marker binds the key to a digest of the exact Size section it closes.
+const MARKER = new RegExp(`<!-- size-admission:${KEY} [a-f0-9]{64} -->`);
 const request = { ref: 'lane/size-admission', pr: 5854, base: 'main', sha: HEAD_SHA, body: 'Existing PR description.', repo: 'web-everything/web-everything' };
 const cardResult = { verdict: { num: 9001, id: 'xsplit1', rel: 'backlog/xsplit1-split.md' } };
 function effects(overrides = {}) {
@@ -100,7 +102,7 @@ describe('shared admission effects', () => {
     expect(result.body).not.toContain(localPath);
     expect(result.body).not.toContain('private diagnostic');
     expect(result.body).toContain('split card not filed (file-item failed)');
-    expect(result.body).toContain(`<!-- size-admission:${KEY} -->`);
+    expect(result.body).toMatch(MARKER);
     expect(io.publishSplitCard).not.toHaveBeenCalled();
   });
 
@@ -137,7 +139,7 @@ describe('shared admission effects', () => {
     const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
     expect(result).toMatchObject({ status: 'over', reviewLabel: 'review:pending' });
     expect(result.body).toContain('split card not filed (file-item failed)');
-    expect(result.body).toContain(`<!-- size-admission:${KEY} -->`);
+    expect(result.body).toMatch(MARKER);
     io.publishSplitCard.mockResolvedValue({ batched: true, batchRef: 'lane/card-batch-filing-1' });
     expectSizeNote((await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, body: result.body })).body);
     expect(io.fileItem).not.toHaveBeenCalled();
@@ -148,7 +150,7 @@ describe('shared admission effects', () => {
       member: { cardId: 'xwinner' }, batchRef: 'lane/card-batch-filing-1' }) });
     const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
     expect(result.body).toContain('split card xwinner filed via lane/card-batch-filing-1');
-    expect(result.body).toContain(`<!-- size-admission:${KEY} -->`);
+    expect(result.body).toMatch(MARKER);
     expect(result.body).not.toContain('split card 9001 filed');
   });
 
@@ -156,7 +158,7 @@ describe('shared admission effects', () => {
     const io = effects({ publishSplitCard: async () => ({ batched: true, deduped: true, member }) });
     const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
     expect(result.body).toContain('split card not filed (file-item failed)');
-    expect(result.body).toContain(`<!-- size-admission:${KEY} -->`);
+    expect(result.body).toMatch(MARKER);
   });
 
   it.each(['a', '界'])('bounds both PR notes and file-item arguments for twelve thousand long %s file groups', async (letter) => {
@@ -199,7 +201,7 @@ describe('shared admission effects', () => {
       const result = await sizeAdmission.createSizeAdmissionRunner({ cwd, diffStat: () => ({ text: evidence, sha: HEAD_SHA, baseSha: BASE_SHA }), fileItem })(request);
       expect(result).toMatchObject({ status: 'over', reviewLabel: 'review:pending' });
       expect(result.body).toContain('split card not filed (file-item failed)');
-      expect(result.body).toContain(`<!-- size-admission:${KEY} -->`);
+      expect(result.body).toMatch(MARKER);
       expect(fileItem).not.toHaveBeenCalled();
       vi.mocked(fileIntoBatch).mockResolvedValue({ batched: true, batchRef: 'lane/card-batch-filing-1' });
       expectSizeNote((await sizeAdmission.createSizeAdmissionRunner({ cwd, diffStat: () => ({ text: evidence, sha: HEAD_SHA, baseSha: BASE_SHA }), fileItem })({ ...request, body: result.body })).body);
@@ -302,7 +304,7 @@ describe('shared admission effects', () => {
     const io = effects({ fileItem: () => ({ verdict: { id: '9001\n## Injected' } }) });
     const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
     expect(result.body).toContain('split card not filed (file-item failed)');
-    expect(result.body).toContain(`<!-- size-admission:${KEY} -->`);
+    expect(result.body).toMatch(MARKER);
     expect(result.body).not.toContain('Injected');
   });
 
@@ -318,7 +320,7 @@ describe('shared admission effects', () => {
     expect(second.body).toContain(request.body + other);
     expect(second.body).toContain(unrelated);
     expect(second.body.match(/^## Size$/gm)).toHaveLength(2);
-    expect(second.body.match(new RegExp(`<!-- size-admission:${KEY} -->`, 'g'))).toHaveLength(1);
+    expect(second.body.match(new RegExp(MARKER.source, 'g'))).toHaveLength(1);
     expectSizeNote(second.body);
   });
 
@@ -330,7 +332,7 @@ describe('shared admission effects', () => {
     const body = `${preserved}<!-- size-admission:${KEY} -->\n${suffix}`;
     const result = await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, body });
     expect(result.body.startsWith(preserved + suffix)).toBe(true);
-    expect(result.body.match(new RegExp(`<!-- size-admission:${KEY} -->`, 'g'))).toHaveLength(1);
+    expect(result.body.match(new RegExp(MARKER.source, 'g'))).toHaveLength(1);
     expectSizeNote(result.body);
   });
 
@@ -339,8 +341,10 @@ describe('shared admission effects', () => {
   it.each([
     ['author prose under a forged marker', (key) => `\n\n## Size\n\nAuthor rationale: this PR stays whole.\n\nSecond paragraph.\n<!-- size-admission:${key} -->\n`],
     ['a legacy ref marker', () => `\n\n## Size\n\nAuthor rationale: this PR stays whole.\n<!-- size-admission:${encodeURIComponent(request.ref)} 9001 -->\n`],
-    ['an author line appended to a real note', (key, note) => note.replace(`<!-- size-admission:${key} -->`, `Author rationale: this PR stays whole.\n<!-- size-admission:${key} -->`)],
+    ['an author line appended to a real note', (key, note) => note.replace(MARKER, (marker) => `Author rationale: this PR stays whole.\n${marker}`)],
     ['an author edit inside a real note line', (key, note) => note.replace('File groups: ', 'File groups: Author rationale: this PR stays whole; ')],
+    ['an author annotation inside a valid file group', (key, note) => note.replace('we:scripts/operations: 200', 'we:scripts/operations — Author rationale: this PR stays whole: 200')],
+    ['an author number edit that keeps the note grammar', (key, note) => note.replace('we:docs/agent: 101', 'we:docs/agent Author rationale: this PR stays whole: 101')],
   ])('retry never deletes author text selected by %s', async (_label, section) => {
     const real = (await sizeAdmission.createSizeAdmissionRunner(effects())(request)).body.slice(request.body.length);
     const body = request.body + section(KEY, real) + '\n## Testing\nKeep trailing content.\n';
@@ -356,7 +360,7 @@ describe('shared admission effects', () => {
   ])('the marker match cannot extend over author lines after %s', async (_label, token) => {
     const real = (await sizeAdmission.createSizeAdmissionRunner(effects())(request)).body;
     const tail = '\nDo-not-merge-before-Friday.\nhttps://ex.com/runbook -->\n';
-    const body = real.replace(`<!-- size-admission:${KEY} -->\n`, `<!-- size-admission:${token()} -->${tail}`);
+    const body = real.replace(new RegExp(`${MARKER.source}\n`), `<!-- size-admission:${token()} -->${tail}`);
     const result = await sizeAdmission.createSizeAdmissionRunner(effects())({ ...request, body });
     expect(result.body).toContain('Do-not-merge-before-Friday.\nhttps://ex.com/runbook');
     if (token() !== KEY) expect(result.body).toContain('**Rollback**:revert-abc123');

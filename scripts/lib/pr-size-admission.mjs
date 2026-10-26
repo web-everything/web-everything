@@ -262,21 +262,12 @@ function lookupLocalSplitCard({ key }, cwd) {
   return matches[0] || null;
 }
 
-// The exact Size note this module writes (see the runner's result.body). A marker in
-// the editable body only names a candidate: text between the heading and the marker is
-// replaced only when it is byte-for-byte this shape, so author text is never deleted.
-const ESCAPED = '(?:[^\\x00-\\x1f\\x7f-\\x9f\\u2028\\u2029\\u202a-\\u202e\\u2066-\\u2069&<>"\'`\\\\[\\](){}*_$#!|~]|&#\\d{1,7};)';
-const CARD_NOTE = 'split card (?:[A-Za-z0-9]{1,64} filed(?: via lane/[A-Za-z0-9-]{1,100})?|not filed \\(file-item failed\\))';
-const ESCALATION = 'extra reviewers requested via the size escalation \\(review:pending\\)';
-const OWN_NOTE = new RegExp(`^\\n\\n## Size\\n\\n(?:\\d{1,9} non-test lines \\(> ${OPEN_PR_MAX_NON_TEST_LINES}\\): ${CARD_NOTE}; ${ESCALATION}`
-  + `|size unknown: ${ESCALATION}; ${CARD_NOTE})\\n`
-  + `File groups: (?:unavailable \\(size unknown\\)|(?:we:${ESCAPED}*: \\d{1,12})?)(?:; and \\d{1,9} more \\(\\d{1,9} groups? omitted; summary budget\\))?`
-  + '(?: Human review of the full diff is required; bounded summaries are incomplete\\.)?\\n'
-  + '(?:<!-- size-published:[a-f0-9]{64} -->\\n)?(?![\\s\\S])');
-
-function isOwnSizeNote(section, markerKey) {
-  const published = /<!-- size-published:([a-f0-9]{64}) -->\n(?![\s\S])/.exec(section);
-  return section.length <= 4 * SUMMARY_BYTES && OWN_NOTE.test(section) && (!published || published[1] === markerKey);
+// The marker carries a digest of the exact Size section this module wrote. A marker in
+// the editable body only names a candidate: the text between the heading and the marker
+// is replaced only when its bytes still hash to that digest. Any edit there — even one
+// that keeps the note's grammar — leaves the section in place and drops only the marker.
+function sizeNoteDigest(markerKey, section) {
+  return createHash('sha256').update(JSON.stringify([markerKey, section])).digest('hex');
 }
 
 function splitCardId(value) {
@@ -382,15 +373,15 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = crea
     // Our note is appended last, so prefer the last marker over an earlier quoted copy.
     // Marker tokens cannot span whitespace or `>`, so the match never reaches author text.
     // 4608 = the longest encodeURIComponent of a 512-character legacy ref.
-    const existing = [...text.matchAll(/<!-- size-admission:([^\s<>]{1,4608})(?: [^\s<>]{1,256})? -->/g)]
+    const existing = [...text.matchAll(/<!-- size-admission:([^\s<>]{1,4608})(?: ([^\s<>]{1,256}))? -->/g)]
       .findLast((match) => match[1] === markerKey || (legacyToken && match[1] === legacyToken));
     let previousBody = body;
     if (existing) {
       const heading = text.lastIndexOf('\n\n## Size\n', existing.index);
       const start = heading >= 0 ? heading : text.startsWith('## Size\n') ? 0 : -1;
       // Legacy ref-token notes predate the fixed shape: only their marker is dropped.
-      const replaceNote = start >= 0 && existing[1] === markerKey
-        && isOwnSizeNote((heading >= 0 ? '' : '\n\n') + text.slice(start, existing.index), markerKey);
+      const replaceNote = start >= 0 && existing[1] === markerKey && existing[2]
+        === sizeNoteDigest(markerKey, (heading >= 0 ? '' : '\n\n') + text.slice(start, existing.index));
       let end = existing.index + existing[0].length;
       if ((existing.index === 0 || text[existing.index - 1] === '\n') && text[end] === '\n') end++;
       previousBody = text.slice(0, replaceNote ? start : existing.index) + text.slice(end);
@@ -398,9 +389,9 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = crea
     const note = plan.status === 'over'
       ? `${plan.lines} non-test lines (> ${OPEN_PR_MAX_NON_TEST_LINES}): ${cardNote}; extra reviewers requested via the size escalation (review:pending)`
       : `size unknown: extra reviewers requested via the size escalation (review:pending); ${cardNote}`;
-    const noted = `${previousBody}\n\n## Size\n\n${note}\n${groupLine}${fallback}\n`
-      + (cardPublished ? `<!-- size-published:${markerKey} -->\n` : '')
-      + `<!-- size-admission:${markerKey} -->\n`;
+    const section = `\n\n## Size\n\n${note}\n${groupLine}${fallback}\n`
+      + (cardPublished ? `<!-- size-published:${markerKey} -->\n` : '');
+    const noted = `${previousBody}${section}<!-- size-admission:${markerKey} ${sizeNoteDigest(markerKey, section)} -->\n`;
     // Author text is never truncated or escaped. Past the forge limit the note is
     // skipped and the body returned unchanged; the review label still escalates.
     if (noted.length <= FORGE_BODY_CHARS) result.body = noted;

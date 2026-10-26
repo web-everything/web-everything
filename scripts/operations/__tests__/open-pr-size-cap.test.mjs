@@ -356,7 +356,7 @@ describe('pr-land CLI size failure boundaries', () => {
     expect(effects.publishSplitCard).toHaveBeenCalledTimes(1);
     expect(result.createParams.body).toContain('split card not filed (file-item failed)');
     expect(result.sizeAdmission.reviewLabel).toBe(REVIEW_LABELS.pending);
-    expect(result.createParams.body).toMatch(/<!-- size-admission:[a-f0-9]{64} -->/);
+    expect(result.createParams.body).toMatch(/<!-- size-admission:[a-f0-9]{64} [a-f0-9]{64} -->/);
     if (prNum != null) expect(forge.editBody).toHaveBeenCalledWith(prNum, result.createParams.body);
   });
 
