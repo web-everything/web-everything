@@ -138,6 +138,12 @@ describe('overlayRefreshPending', () => {
   const overlay = (ageMs) => ({ ref: 'lane/new', addedAt: at(ageMs) });
   const check = (overlays, rebuildState, extra = {}) => enqueueModule.overlayRefreshPending({ overlays, rebuildState, now, ...extra });
 
+  it('does not wait on a stale build record older than the age bound', () => {
+    expect(check([], { building: { target: 'a'.repeat(40), startedAt: at(3_600_001), pid: 123 } }))
+      .toMatchObject({ pending: false, reason: null });
+    expect(check([], { building: { target: 'a'.repeat(40) } })).toMatchObject({ pending: false });
+  });
+
   it('reports an active build as pending', () => {
     expect(check([overlay(1000)], { building: { target: 'a'.repeat(40), startedAt: at(500), pid: 123 } }))
       .toMatchObject({ pending: true, reason: 'building' });
