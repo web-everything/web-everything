@@ -79,6 +79,7 @@ import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { sweepAutoBlock } from './referral-auto-block.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { sweepAcceptCarry, defaultCloneDirFor } from './accept-carry-sweep.mjs';
+import { sweepDelegatedClearance } from './delegated-clearance-sweep.mjs';
 
 /** Plain label names off a `gh --json labels` array (`[{name}]`) or a bare-string array. Pure. */
 function labelNames(labels) {
@@ -158,7 +159,8 @@ export const STRANDED_BACKOFF_MS = 5 * 60_000;
 export function _resetStrandedCheckMemo() { strandedChecked.clear(); }
 
 export function sweepReviewHoldLabels({
-  repo = null, listPrs = defaultListPrs, provider = createGhProvider(), dryRun = false, settings, runRuling, acceptCarry,
+  repo = null, listPrs = opts => defaultListPrs({ ...opts, fields: 'number,labels,headRefOid,comments,mergeable,statusCheckRollup,isDraft' }),
+  provider = createGhProvider(), dryRun = false, settings, runRuling, acceptCarry, delegatedClearance,
   readComments = readCompletePrComments, readPr = defaultReadPr,
   numberingRestamp = restampAfterNumbering, exec = execFileSync, now = Date.now, log = (line) => writeLineSync(2, line),
 } = {}) {
@@ -351,6 +353,14 @@ export function sweepReviewHoldLabels({
     }
   } catch (e) {
     results.push({ num: 0, carry: 'sweep-failed', error: String((e && e.message) || e).split('\n')[0] });
+  }
+  try {
+    results.push(...sweepDelegatedClearance({ prs, repo, dryRun, now, readComments,
+      // This writer needs live merge/check/draft gates as well as the shared reader's label/head fields.
+      readPr: opts => readPr({ ...opts, fields: 'number,state,labels,headRefOid,mergeable,statusCheckRollup,isDraft' }),
+      ...delegatedClearance }));
+  } catch (e) {
+    results.push({ num: 0, delegated: 'sweep-failed', detail: String(e?.message ?? e).split('\n')[0] });
   }
   // Each composed writer gets its own live read. In particular, the ruling-label pass
   // must see any new rulings or label changes after auto-block, never reuse its decision record.
