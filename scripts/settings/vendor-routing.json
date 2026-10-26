@@ -1,0 +1,4 @@
+{
+  "$comment": "vendorRouting.byTaskType names preferred vendors: read-only/research tasks default to gemini, code tasks to codex, judgment tasks to claude. Cascade: standard → platform vendorRouting preferences → tool → WE_VENDOR_ROUTING (JSON task-type-to-vendor object), with source logging. Invalid vendors and unknown task types are ignored. \"Gemini\" means the LOCAL Antigravity CLI (`agy`, see scripts/gemini-direct-task.mjs), which runs on this machine and counts against Mac load (run one at a time, only under the host load cap) - it is not a remote service. agy can hit a quota hold; the reader only names the preferred vendor, callers must fall back per their own rules.",
+  "vendorRouting": { "byTaskType": {} }
+}

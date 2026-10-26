@@ -80,6 +80,8 @@ function fixture() {
   return { clone, env, init, a, b, mOld, push, tick, head, logs, pinnedLogs, smoke };
 }
 
+// Real Git setup and multiple rebuild ticks share each test's wall-clock budget. Match the
+// existing 60-second cases so the remaining scenarios have the same headroom on CI shards.
 describe('overlay-pin — a moving overlay whose new tip conflicts stays at its adopted head', () => {
   it('holds without a pin alert or persisted notice when the pin commit-tree fails', async () => {
     const f = fixture();
@@ -404,4 +406,4 @@ describe('overlay-pin — a moving overlay whose new tip conflicts stays at its 
     expect(isAncestor(f.clone, u, f.head())).toBe(true);
     expect(readRebuildState(f.clone, f.env).held ?? null).toBeNull();
   });
-});
+}, 60_000);
