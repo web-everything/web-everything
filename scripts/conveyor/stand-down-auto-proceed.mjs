@@ -54,7 +54,15 @@ export function classifyStandDownAutoProceed({ pr, requiredChecks, checks, redMa
   const requiredRuns = requiredChecks.map(name => runs.filter(r => r.name === name));
   if (requiredRuns.some(history => history.some(r => checkIdentity(r) === null)
     || new Set(history.map(checkIdentity)).size > 1)) return hold('operator answer required: ambiguous check identity');
-  const latest = requiredRuns.map(history => history.sort((a, b) => b.id - a.id)[0]);
+  // App/suite/name is not a job identity. Only collapse a complete history when the
+  // Actions job reader proves one same-name job per attempt of a single workflow run.
+  if (requiredRuns.some(history => history.length > 1 && (
+    history.some(r => !Number.isSafeInteger(r.actions?.runId) || r.actions.runId < 1
+      || !Number.isSafeInteger(r.actions?.attempt) || r.actions.attempt < 1)
+    || new Set(history.map(r => r.actions?.runId)).size !== 1
+    || new Set(history.map(r => r.actions?.attempt)).size !== history.length
+  ))) return hold('operator answer required: ambiguous rerun lineage');
+  const latest = requiredRuns.map(history => [...history].sort((a, b) => b.actions?.attempt - a.actions?.attempt)[0]);
   const conclusion = r => String(r?.conclusion ?? '').toUpperCase();
   if (latest.some(r => !r || String(r.status).toUpperCase() !== 'COMPLETED'
     || !Number.isFinite(Date.parse(r.completed_at)) || !['SUCCESS', 'FAILURE', 'CANCELLED', 'SKIPPED'].includes(conclusion(r)))) return hold('operator answer required: missing, pending or unknown required check');
@@ -67,14 +75,16 @@ export function classifyStandDownAutoProceed({ pr, requiredChecks, checks, redMa
     failingCheckName: r.name, mainRedWindows: redMainContext.config.redMainWindows, prScopedChecks }).mainDefect)) return hold('operator answer required: genuine required-check FAILURE');
   const reruns = latest.filter(r => conclusion(r) === 'SUCCESS' && Date.parse(r.completed_at) > Date.parse(target.createdAt)
     && runs.some(old => old.name === r.name && checkIdentity(old) === checkIdentity(r)
-      && old.id < r.id && conclusion(old) === 'FAILURE'
+      && old.actions?.runId === r.actions?.runId && old.actions?.attempt < r.actions?.attempt
+      && conclusion(old) === 'FAILURE'
       && Date.parse(old.completed_at) <= Date.parse(target.createdAt)));
   const kind = failures.length ? 'c' : reruns.length ? 'a'
     : latest.some(r => ['CANCELLED', 'SKIPPED'].includes(conclusion(r))) ? 'b' : redMain ? 'c' : null;
   if (!kind) return hold('operator answer required: no recovered CI evidence');
   const labels = { a: 'passed a later rerun on the same head', b: 'cancelled/skipped rather than failed', c: 'main\'s own CI was red; fixLoopRedMainLapse confirms the park no longer holds' };
   const details = JSON.stringify({ checks: runs.filter(r => requiredChecks.includes(r.name))
-    .map(r => ({ check: r.name, runId: r.id, suiteId: r.check_suite.id, conclusion: conclusion(r), completedAt: r.completed_at })),
+    .map(r => ({ check: r.name, runId: r.id, suiteId: r.check_suite.id, actions: r.actions,
+      conclusion: conclusion(r), completedAt: r.completed_at })),
   ...(kind === 'c' ? { mainWindows: redMainContext.config.redMainWindows,
     ledger: redMainContext.rows.filter(r => r.pr === pr.number && r.head === pr.headRefOid).map(r => ({ kind: r.kind, at: r.at })) } : {}) });
   const reason = `AUTO-PROCEED R123 (${kind}): ${labels[kind]}. Head ${pr.headRefOid.slice(0, 7)}.\n\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', details)}\n\nContinue through normal review and CI gates.`;

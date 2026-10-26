@@ -29,6 +29,7 @@ export default {
       body: buildStandDownComment({ reason: 'gate-red', head }) }];
     const run = (id, conclusion, suite = 901) => ({ id, name: 'test', head_sha: head,
       app: { id: 15368, slug: 'github-actions' }, check_suite: { id: suite }, status: 'completed', conclusion,
+      actions: { runId: 700, attempt: id === 101 ? 1 : 2 },
       completed_at: id === 101 ? '2026-10-13T11:59:00Z' : '2026-10-13T12:01:00Z' });
     const pr = { number: 5981, headRefOid: head, headRefName: 'lane/r123-auto-proceed', baseRefName: 'main',
       labels: [], files: [], body: '', comments,
@@ -79,6 +80,26 @@ export default {
     io.enrichPrsWithStandDownAutoProceed([pr], { ...writerOptions,
       readChecks: () => ({ head, complete: true, runs: [run(101, 'failure'), run(102, 'success', 902)] }) });
     if (writes.includes('reserve') || writes.includes('post')) violations.push('independent same-name workflow success released a failed suite');
+
+    // Use the real REST reader, classifier and writer: same suite/name does not prove a rerun.
+    const sameAttemptWrites = {};
+    for (const conclusion of ['success', 'cancelled', 'skipped']) {
+      writes.length = 0;
+      const checks = [run(101, 'failure'), run(102, conclusion)].map(({ actions, ...r }) => ({ ...r,
+        details_url: `https://github.com/${weSlug}/actions/runs/700/job/${r.id}` }));
+      const [retained] = io.enrichPrsWithStandDownAutoProceed([pr], { ...writerOptions,
+        readChecks: input => io.readAutoProceedChecks(input, { read: argv => {
+          if (argv[1].includes('/commits/')) return { total_count: 2, check_runs: checks };
+          const id = Number(argv[1].split('/').at(-1));
+          return { id, run_id: 700, run_attempt: 1, name: 'test', head_sha: head,
+            check_run_url: `https://api.github.com/repos/${weSlug}/check-runs/${id}` };
+        } }),
+      });
+      sameAttemptWrites[conclusion] = [...writes];
+      if (writes.includes('reserve') || writes.includes('post') || countUnresolvedStandDowns(retained.comments) !== 1) {
+        violations.push(`independent same-name job ${conclusion} released a failed job in the same attempt`);
+      }
+    }
 
     // A recovered main can lapse the original hold before the writer refreshes the thread.
     // A question arriving during check reads must still reach the downstream planner.
@@ -137,7 +158,7 @@ export default {
       if (crossRepoWrites.length) violations.push('a WE outage released a genuine FrontierUI failure');
     }
     return { violations, dryRunWrites, defaultDispatchWrites, optedOutDispatchWrites, mainReads, crossRepoWrites,
-      refreshedThreadRace };
+      refreshedThreadRace, sameAttemptWrites };
   },
   judge(report) { return report.violations; },
 };
