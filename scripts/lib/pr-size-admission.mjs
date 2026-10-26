@@ -283,10 +283,11 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = crea
         cardNote = `split card ${cardId} filed`
           + (typeof publication.batchRef === 'string' && /^lane\/[A-Za-z0-9-]{1,100}$/.test(publication.batchRef)
             ? ` via ${publication.batchRef}` : '');
-      } catch (error) {
+      } catch {
         cardId = null;
         cardPublished = false;
-        cardNote = `split card not filed: ${summaryText(String(error?.message || error).slice(0, 300))}`;
+        // Child-process errors can contain absolute local paths; never publish their detail.
+        cardNote = 'split card not filed (file-item failed)';
       }
     }
     // Replace only this ref's generated section, including unknown-size/failure retries.

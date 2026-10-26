@@ -69,6 +69,24 @@ function expectSizeNote(body) {
 }
 
 describe('shared admission effects', () => {
+  it.each([
+    '/private/tmp/size-admission/scripts/operations/run.mjs',
+    'C:\\workspace\\size-admission\\scripts\\operations\\run.mjs',
+  ])('withholds absolute paths from the card note when file-item fails (%s)', async (localPath) => {
+    vi.mocked(execFileSync).mockImplementation(() => { throw new Error(`Command failed: node "${localPath}" file-item\nprivate diagnostic`); });
+    const io = effects();
+    delete io.fileItem;
+    const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
+    expect(execFileSync).toHaveBeenCalledWith(process.execPath,
+      expect.arrayContaining(['file-item', '--json']), expect.any(Object));
+    expect(result).toMatchObject({ status: 'over', reviewLabel: 'review:pending' });
+    expect(result.body).not.toContain(localPath);
+    expect(result.body).not.toContain('private diagnostic');
+    expect(result.body).toContain('split card not filed (file-item failed)');
+    expect(result.body).toContain('<!-- size-admission:lane%2Fsize-admission - -->');
+    expect(io.publishSplitCard).not.toHaveBeenCalled();
+  });
+
   it.each(['new', 'local retry', 'old body marker'])('awaits durable publication before reporting a %s split card filed', async (mode) => {
     let finish;
     const io = effects({
@@ -101,7 +119,7 @@ describe('shared admission effects', () => {
     });
     const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
     expect(result).toMatchObject({ status: 'over', reviewLabel: 'review:pending' });
-    expect(result.body).toContain('split card not filed:');
+    expect(result.body).toContain('split card not filed (file-item failed)');
     expect(result.body).toContain('<!-- size-admission:lane%2Fsize-admission - -->');
     io.publishSplitCard.mockResolvedValue({ batched: true, batchRef: 'lane/card-batch-filing-1' });
     expectSizeNote((await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, body: result.body })).body);
@@ -120,7 +138,7 @@ describe('shared admission effects', () => {
   it.each([undefined, { cardId: 'bad\nidentity' }])('does not claim publication when a deduplicated member lacks a safe identity (%j)', async (member) => {
     const io = effects({ publishSplitCard: async () => ({ batched: true, deduped: true, member }) });
     const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
-    expect(result.body).toContain('split card not filed: published split-card identity was not confirmed');
+    expect(result.body).toContain('split card not filed (file-item failed)');
     expect(result.body).toContain('<!-- size-admission:lane%2Fsize-admission - -->');
   });
 
@@ -144,7 +162,7 @@ describe('shared admission effects', () => {
     const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
     expect(Buffer.byteLength(result.body)).toBeLessThan(16_384);
     expect(result.body).toContain('1 group omitted');
-    expect(result.body).toContain('split card not filed: unavailable');
+    expect(result.body).toContain('split card not filed (file-item failed)');
     const fields = io.fileItem.mock.calls[0][0];
     expect(fields.scope).toBe('');
     expect(fields.digest).toContain('1 scope path omitted');
@@ -163,7 +181,7 @@ describe('shared admission effects', () => {
     try {
       const result = await sizeAdmission.createSizeAdmissionRunner({ cwd, diffStat: () => evidence, fileItem })(request);
       expect(result).toMatchObject({ status: 'over', reviewLabel: 'review:pending' });
-      expect(result.body).toContain(`split card not filed: ${mode === 'exception' ? 'publication failed' : 'batch unavailable'}`);
+      expect(result.body).toContain('split card not filed (file-item failed)');
       expect(result.body).toContain('<!-- size-admission:lane%2Fsize-admission - -->');
       expect(fileItem).not.toHaveBeenCalled();
       vi.mocked(fileIntoBatch).mockResolvedValue({ batched: true, batchRef: 'lane/card-batch-filing-1' });
@@ -190,7 +208,7 @@ describe('shared admission effects', () => {
     vi.mocked(execFileSync).mockReturnValue(entry);
     vi.mocked(fileIntoBatch).mockResolvedValue({ batched: false, reason: 'publication unavailable' });
     const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
-    expect(result.body).toContain('split card not filed: publication unavailable');
+    expect(result.body).toContain('split card not filed (file-item failed)');
     expect(result.body).not.toContain('<!-- size-published:');
   });
 
@@ -266,7 +284,7 @@ describe('shared admission effects', () => {
   it('invalid CLI card identifiers are not published or persisted as filing evidence', async () => {
     const io = effects({ fileItem: () => ({ verdict: { id: '9001\n## Injected' } }) });
     const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
-    expect(result.body).toContain('split card not filed: file-item returned no card');
+    expect(result.body).toContain('split card not filed (file-item failed)');
     expect(result.body).toContain('<!-- size-admission:lane%2Fsize-admission - -->');
     expect(result.body).not.toContain('Injected');
   });
@@ -339,7 +357,7 @@ describe('shared admission effects', () => {
     const io = effects({ fileItem: vi.fn(() => { throw new Error('filing unavailable'); }) });
     const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
     expect(result).toMatchObject({ status: 'over', reviewLabel: 'review:pending' });
-    expect(result.body).toContain('split card not filed: filing unavailable');
+    expect(result.body).toContain('split card not filed (file-item failed)');
     expect(result.body).toContain('extra reviewers requested');
     expect(result.body).toMatch(/file groups[^\n]*200/i);
     expect(io.fileItem).toHaveBeenCalledTimes(1);
@@ -349,7 +367,7 @@ describe('shared admission effects', () => {
     const io = effects({ fileItem: vi.fn(() => ({ verdict: { outcome: 'refused', reason: 'operation unavailable' } })) });
     const result = await sizeAdmission.createSizeAdmissionRunner(io)(request);
     expect(result).toMatchObject({ status: 'over', reviewLabel: 'review:pending' });
-    expect(result.body).toContain('split card not filed: operation unavailable');
+    expect(result.body).toContain('split card not filed (file-item failed)');
     expect(result.body).not.toMatch(/split card (?!not filed)\S+ filed/);
   });
 

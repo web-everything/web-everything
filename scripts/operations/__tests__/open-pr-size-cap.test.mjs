@@ -266,7 +266,7 @@ describe('direct pr-land uses the same admission and existing review-label path'
     const { run, effects } = direct({ fileItem: vi.fn(() => { throw new Error('filing unavailable'); }) });
     const result = await run();
     expect(result).toMatchObject({ status: 'over', reviewLabel: REVIEW_LABELS.pending });
-    expect(result.body).toContain('split card not filed: filing unavailable');
+    expect(result.body).toContain('split card not filed (file-item failed)');
     expect(result.body).toContain('extra reviewers requested');
     expect(effects.fileItem).toHaveBeenCalledTimes(1);
   });
@@ -350,7 +350,7 @@ describe('pr-land CLI size failure boundaries', () => {
     const { effects, run } = direct({ publishSplitCard: vi.fn(async () => ({ batched: false, reason: 'publication unavailable' })) });
     const result = await runBlock(forge, (input) => run(input), prNum, REVIEW_LABELS);
     expect(effects.publishSplitCard).toHaveBeenCalledTimes(1);
-    expect(result.createParams.body).toContain('split card not filed: publication unavailable');
+    expect(result.createParams.body).toContain('split card not filed (file-item failed)');
     expect(result.sizeAdmission.reviewLabel).toBe(REVIEW_LABELS.pending);
     expect(result.createParams.body).toContain('<!-- size-admission:lane%2Ftest - -->');
     if (prNum != null) expect(forge.editBody).toHaveBeenCalledWith(prNum, result.createParams.body);
