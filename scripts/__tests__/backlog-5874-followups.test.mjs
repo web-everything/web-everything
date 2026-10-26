@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { readdirSync, readFileSync } from 'node:fs';
-import { fileURLToPath, URL } from 'node:url';
-import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { dirname, join, resolve } from 'node:path';
 import matter from 'gray-matter';
 
-const backlog = fileURLToPath(new URL('../../backlog/', import.meta.url));
+const backlog = resolve(dirname(fileURLToPath(import.meta.url)), '../../backlog');
 
 function cardsUnder(directory) {
   return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
