@@ -2,11 +2,12 @@
 bornAs: xtmprx7
 kind: story
 size: 5
-status: active
+status: resolved
 scaffoldedBy: "agy-model-provenance"
 dateScaffolded: "2026-09-30"
 scope: ["we:scripts/__tests__/gemini-direct-task.test.mjs", "we:scripts/conveyor/run-quality-record.mjs", "we:scripts/gemini-direct-task.mjs", "we:scripts/lib/__tests__/antigravity-judge-spawn.test.mjs", "we:scripts/lib/antigravity-judge-spawn.mjs", "we:scripts/lib/probation-launcher.mjs", "we:scripts/operations/cli-adapter.mjs", "we:scripts/operations/probation-build-run.mjs", "we:scripts/operations/probation-heal-run.mjs", "we:scripts/operations/review-extra-seats.mjs", "we:scripts/operations/run-record.mjs", "we:scripts/lib/antigravity-run-evidence.mjs", "we:scripts/lib/__tests__/antigravity-run-evidence.test.mjs"]
 dateOpened: "2026-09-30"
+dateResolved: "2026-10-25"
 tags: []
 ---
 
