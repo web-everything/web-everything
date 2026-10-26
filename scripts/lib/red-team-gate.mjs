@@ -528,10 +528,13 @@ const HOLDING_OUTCOMES = Object.freeze([GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.S
  * head. A carried result defers to the ruling on the head it was carried from, read from the thread before the carry.
  * PURE.
  */
-function operatorRuled(records, pr, head) {
+function operatorRuled(records, pr, head, index) {
   const trusted = records.filter(r => isTrustedMarkerAuthor(r.c));
   if (parseLatestHumanClearedSha(trusted.filter(r => !r.from).map(r => r.c)) !== head) return false;
   const lastAt = (rs, test) => rs.reduce((found, r) => (test(r) ? r : found), null);
+  // A per-finding block supersedes the standing clearance only for its named holds.
+  const holds = r => HOLDING_OUTCOMES.includes(r.gate.outcome) && (r.gate.outcome !== 'operator-block'
+    || gateActionLines(recordBody(r)).some(({ action, indices }) => (action === 'send-back' || action === 'held') && (!indices.length || indices.includes(index))));
   const rulingHeads = new Set();
   // Each carry removes its own comment and every later record, so even a cyclic head chain terminates.
   for (let sha = head, rs = trusted, want = null; sha && rs.length;) {
@@ -555,9 +558,9 @@ function operatorRuled(records, pr, head) {
     const reaccepted = cleared && trusted.some(r => !r.from && r.at > cleared.at && parseLatestHumanClearedSha([r.c]) === null
       && reviewed(recordBody(r)));
     if (cap && cleared && !reaccepted && cleared.at > result.at && gates.every(r =>
-      !HOLDING_OUTCOMES.includes(r.gate.outcome) || cleared.at > r.at)) return true;
+      !holds(r) || cleared.at > r.at)) return true;
     // A ruling inherited through a carry cannot approve this head's own later gate decisions.
-    if (gates.some(r => !r.from && HOLDING_OUTCOMES.includes(r.gate.outcome))) return false;
+    if (gates.some(r => !r.from && holds(r))) return false;
     if (!result.from) return false;
     rs = rs.filter(r => r.at < result.at);
     sha = result.from;
@@ -673,7 +676,6 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
   // Audited grants unseen by the cap decision let a later send-back stand, even if the cap POST arrives last.
   // Without a repo there is no grant credit and the cap keeps winning.
   const outcome = sendBackStepState(liveGates, grants).outcome;
-  const ruled = operatorRuled(records, pr, live);
   const { blocked } = operatorRulingsOnLiveResult(comments, pr, live);
   const sendBack = [], held = [];
   for (const f of result?.findings ?? []) {
@@ -682,7 +684,7 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     const action = (recorded === 'send-back' && outcome === GATE_OUTCOMES.ROUND_CAP ? 'held' : recorded)
       ?? (legacyHeld && f.confirmed ? 'held' : null) ?? (plan.sendBack.includes(f)
         ? outcome === GATE_OUTCOMES.ROUND_CAP ? 'held' : 'send-back' : null);
-    if (action === 'held' && (!ruled || blocked.has(f.index))) held.push(f);
+    if (action === 'held' && (!operatorRuled(records, pr, live, f.index) || blocked.has(f.index))) held.push(f);
     if (action === 'send-back') sendBack.push(f);
   }
   return { result, sendBack, held, since: commentCreatedAt(capRecord) ?? null, outcome };

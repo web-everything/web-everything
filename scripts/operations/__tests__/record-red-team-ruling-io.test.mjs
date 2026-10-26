@@ -2,13 +2,15 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import * as redTeamGate from '../../lib/red-team-gate.mjs';
+import { buildReviewedShaMarker, buildClearedHumanMarker } from '../../lib/review-escalation.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, redTeamGateMarker, readRedTeamDisposition, liveResultGateState, gateRoundGrants } from '../../lib/red-team-gate.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 import { buildStandingRulingBody, pickStandingRuling } from '../../conveyor/standing-ruling-mark.mjs';
 import { standingRulingScope } from '../../conveyor/standing-ruling-io.mjs';
-import { planRedTeamRuling, selectBreaks, recordRedTeamRulingOperation, buildRuleReasonComment, RED_TEAM_RULING_CARD_EFFECT } from '../record-red-team-ruling.mjs';
+import { planRedTeamRuling, selectBreaks, recordRedTeamRulingOperation, buildRuleReasonComment, RED_TEAM_RULING_CARD_EFFECT, RED_TEAM_RULING_BLOCK_EFFECT } from '../record-red-team-ruling.mjs';
 import { operatorBoundComments } from '../../lib/operator-identity.mjs';
 
 import { createRecordRedTeamRulingReader, createRecordRedTeamRulingSinks } from '../record-red-team-ruling-io.mjs';
@@ -189,6 +191,60 @@ function extendedThread({ grantRepo = repo, grantPr = PR, author = OP, sent = tr
 }
 
 describe('existing-card IO', () => {
+  it('blocks only A while B stays operator-cleared, proves both selected indices, and preserves review:human', async () => {
+    for (const clearance of ['not-real', 'card', 'clear-human']) {
+      const comments = [redTeam(HEAD, [1, 2].map(index => ({ summary: `Confirmed break ${index}`,
+        category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }))), capped()];
+      const resultId = liveResultGateState(comments, PR, HEAD).resultId;
+      const body = clearance === 'clear-human'
+        ? ['✅ review — `review:human` cleared via the sanctioned path', '',
+          'Cleared by chalbert via `review-set-label.mjs --to=clear-human` (gate-self).', '',
+          buildReviewedShaMarker(HEAD), buildClearedHumanMarker('chalbert')].join('\n')
+        : `${redTeamGateMarker(PR, HEAD, `operator-${clearance}`, resultId)}\n`
+          + (clearance === 'card' ? `- 1 finding(s) carded by the operator to \`${CARD}\` (#2).`
+            : '- 1 finding(s) left advisory (#2).');
+      comments.push({ author: OP, createdAt: '2026-10-20T23:50:00Z', body });
+      const labels = ['review:human'], events = [], labelCalls = [];
+      const scope = { value: { anyState: true } };
+      const disposition = () => readRedTeamDisposition({ comments: operatorBoundComments(comments), repo,
+        pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: scope.value });
+      const plan = selection => payloadFor({ ruling: 'block', card: undefined, break: selection },
+        { comments, labels, card: null, scope });
+      const sinks = createRecordRedTeamRulingSinks({
+        readThread: () => ({ headRefOid: HEAD, labels: [...labels], comments: [...comments] }),
+        readScope: () => scope, readStandingRulingScope: () => null, resolveIdentity: () => OP,
+        post: (_repo, _pr, record) => comments.push({ author: OP, createdAt: '2026-10-20T23:55:00Z', body: record }),
+        readEvents: async () => ({ status: 'ok', rows: [...events] }),
+        appendEvents: async rows => events.push(...rows),
+        runSetLabel: (_exe, args) => { labelCalls.push(args); labels.push('review:changes'); return '{"ok":true}'; },
+        syncLabels: () => ({ add: null, remove: [] }),
+      });
+      expect([...disposition().held, ...disposition().sendBack].map(f => f.index)).not.toContain(2);
+      await expect(sinks[RED_TEAM_RULING_BLOCK_EFFECT](plan('1'))).resolves.toMatchObject({ indices: [1], sentBack: true });
+      expect(disposition().held.map(f => f.index)).toEqual([1]);
+      expect(disposition().sendBack).toEqual([]);
+      expect(labels).toContain('review:human');
+
+      // An exact human block record alone is insufficient: proveHeld must cover EVERY selected index.
+      const both = plan('1,2');
+      const actualReader = redTeamGate.readRedTeamDisposition;
+      for (const freeIndex of [1, 2]) {
+        const reader = vi.spyOn(redTeamGate, 'readRedTeamDisposition').mockImplementation(args => {
+          const d = actualReader(args);
+          return { ...d, held: d.held.filter(f => f.index !== freeIndex), sendBack: d.sendBack.filter(f => f.index !== freeIndex) };
+        });
+        try {
+          await expect(sinks[RED_TEAM_RULING_BLOCK_EFFECT](both)).rejects.toThrow(
+            `the operator-block record was posted but the gate does not hold break(s) #${freeIndex}; inspect the thread`);
+        } finally { reader.mockRestore(); }
+        expect(labelCalls).toHaveLength(1);
+      }
+      await expect(sinks[RED_TEAM_RULING_BLOCK_EFFECT](both)).resolves.toMatchObject({ indices: [1, 2], sentBack: true });
+      expect(disposition().held.map(f => f.index)).toEqual([1, 2]);
+      expect(disposition().sendBack).toEqual([]);
+      expect(labels).toContain('review:human');
+    }
+  });
   it.each(['missing', 'unknown', 'read error', 'different reference'])('keeps the break held when the backing card becomes %s while posting the reason', failure => {
     const comments = thread(), posted = [], resolutions = [], labelSyncs = [];
     const plan = payloadFor();
