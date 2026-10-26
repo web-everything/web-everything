@@ -7,7 +7,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawn } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,6 +20,7 @@ import {
 import { defineJobKind, kindRegistry, markClaimed, markLaunching, markSucceeded } from '../daemon-jobs.mjs';
 import { createRecordingFacts, runItemTask, enqueueItemTask } from '../daemon-item-tasks.mjs';
 import { formatJobHandle } from '../../operations/job-record.mjs';
+import { runPath } from '../../operations/run-store.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RUNTIME = resolve(HERE, '..', 'daemon-jobs-runtime.mjs');
@@ -610,6 +611,134 @@ function childTaskStep(id, { act = () => ({}), timing = () => {}, mutate = () =>
 const runTaskChild = (id, step, attempt = 1) => runJob({ steps: [step], env: jobEnv(id, attempt),
   host: 'test', pid: 123, readStart: () => 'start' });
 
+it.each([1, 3, 4])('persisted failed results with failureCount=%s complete in the child and dead-owner recovery', async failureCount => {
+  const now = Date.now(), launch = vi.fn(), release = vi.fn();
+  for (const recover of [false, true]) {
+    const r = queuedTask(recover ? 402 : 401, 300000);
+    store.update(r.id, f => markLaunching(f, { at: new Date(now).toISOString() }));
+    const result = { v: 1, taskId: r.job.task.id, attempt: 1, outcome: 'failed',
+      ...(failureCount === 1 ? { reason: 'effect refused' } : {}),
+      effects: [], recordedReads: [], timings: {}, gh: { read: 0, write: 0 } };
+    const child = await runTaskChild(r.id, { name: 'persist failure', run: ({ task }) => {
+      task.record.update(f => {
+        f.job.checkpoint = { step: 0, data: { retained: true } };
+        Object.assign(f.job.task, { outcome: 'failed', failureCount,
+          execution: { effects: {}, results: { 1: result }, timings: {} } });
+        return f;
+      });
+      if (recover) throw Error('crash after persistence');
+      return { completed: true };
+    } });
+    expect(child).toEqual({ outcome: 'error', error: recover ? 'crash after persistence' : 'failed' });
+    const tick = () => reattachTick({ store, kinds, maxConcurrent: 1, observation: { now },
+      probe: () => 'dead', launch, releaseTaskClaim: release, reapGroup: () => false });
+    await tick();
+    const finished = store.read(r.id);
+    expect(finished.job).toMatchObject({ status: failureCount >= 3 ? 'failed' : 'queued', attempts: 1,
+      handle: null, task: { outcome: 'failed', failureCount, execution: { results: { 1: result } } } });
+    if (failureCount >= 3) {
+      expect(finished.job.error).toBe('failed');
+      expect(finished.job.finishedAt).toEqual(expect.any(String));
+    } else {
+      expect(finished.job.checkpoint).toEqual({ step: 0, data: {} });
+      expect(Date.parse(finished.job.nextAttemptAt)).toBeGreaterThan(now);
+      expect(finished.job.timeline).toContainEqual(expect.objectContaining({ event: 'requeued', resume: false, reason: 'effect refused' }));
+    }
+    expect(JSON.parse(readFileSync(join(dir, `results/${r.id}-1.json`), 'utf8'))).toEqual(result);
+    await tick();
+    expect(store.read(r.id)).toEqual(finished);
+  }
+  expect(release).toHaveBeenCalledTimes(1);
+  expect(launch).not.toHaveBeenCalled();
+});
+
+it('result repair skips unchanged record and sidecar writes on repeated terminal ticks', async () => {
+  const r = queuedTask(403, 300000);
+  store.update(r.id, f => markLaunching(f, { at: new Date().toISOString() }));
+  expect(await runTaskChild(r.id, childTaskStep(r.id))).toEqual({ outcome: 'succeeded' });
+  const recordPath = runPath(r.id, dir), resultPath = join(dir, `results/${r.id}-1.json`);
+  const saved = store.read(r.id);
+  const sentinel = new Date('2000-01-01T00:00:00Z');
+  utimesSync(recordPath, sentinel, sentinel);
+  utimesSync(resultPath, sentinel, sentinel);
+  const tick = () => reattachTick({ store, kinds, maxConcurrent: 1 });
+  await tick();
+  await tick();
+  expect(statSync(recordPath).mtimeMs).toBe(sentinel.getTime());
+  expect(statSync(resultPath).mtimeMs).toBe(sentinel.getTime());
+  rmSync(resultPath);
+  await tick();
+  expect(JSON.parse(readFileSync(resultPath, 'utf8'))).toEqual(saved.job.task.execution.results[1]);
+  expect(statSync(recordPath).mtimeMs).toBe(sentinel.getTime());
+  expect(store.read(r.id)).toEqual(saved);
+});
+
+it.each([false, true])('overdue persisted results escalate the owner, confirmed death=%s', async confirmed => {
+  const now = Date.now(), owner = runningTask(301, now - 1000, now);
+  const result = { v: 1, taskId: owner.job.task.id, attempt: 1, outcome: 'acted',
+    effects: [], recordedReads: [], timings: {}, gh: { read: 0, write: 0 } };
+  store.update(owner.id, r => ({ ...r, job: { ...r.job, task: { ...r.job.task, outcome: 'acted',
+    execution: { effects: {}, results: { 1: result }, timings: {} } } } }));
+  let alive = true;
+  const signals = [], release = vi.fn(), launch = vi.fn();
+  const probe = () => alive ? 'alive' : 'dead';
+  const out = await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now }, probe, launch,
+    releaseTaskClaim: release, stop: (h, options) => stopHandle(h, { ...options, probe,
+      termGraceMs: 0, killGraceMs: 0, sleep: async () => {}, kill: (pid, signal) => {
+        signals.push(signal);
+        expect(release).not.toHaveBeenCalled();
+        if (confirmed && signal === 'SIGKILL') alive = false;
+      } }) });
+  expect(signals.slice(0, 3)).toEqual(['SIGTERM', 'SIGCONT', 'SIGKILL']);
+  expect(store.read(owner.id).job).toMatchObject({ status: confirmed ? 'succeeded' : 'running',
+    handle: confirmed ? null : taskOwner.handle, task: { failureCount: 0 } });
+  expect(release).toHaveBeenCalledTimes(confirmed ? 1 : 0);
+  if (!confirmed) expect(out.actions).toContainEqual(expect.objectContaining({ id: owner.id, action: 'stop-failed' }));
+  expect(JSON.parse(readFileSync(join(dir, `results/${owner.id}-1.json`), 'utf8'))).toEqual(result);
+  expect(launch).not.toHaveBeenCalled();
+});
+
+it.each(['saved', 'dead', 'stopped'])('claim-release refusal under lock retains the %s record and continues the tick', async mode => {
+  const now = Date.now();
+  runningTask(302, now - 1000, now);
+  runningTask(303, now - 1000, now);
+  const [owner, other] = store.list().records;
+  if (mode === 'saved') store.update(owner.id, r => ({ ...r, job: { ...r.job, task: { ...r.job.task,
+    resultRef: `results/${owner.id}-1.json`, execution: { effects: {}, timings: {}, results: { 1: {
+      v: 1, taskId: owner.job.task.id, attempt: 1, outcome: 'acted',
+      effects: [], recordedReads: [], timings: {}, gh: { read: 0, write: 0 } } } } } } }));
+  const before = store.read(owner.id), launch = vi.fn(), logs = [];
+  const waiting = queuedTask(305);
+  let stopped = false;
+  const release = vi.fn(r => {
+    expect(existsSync(join(dir, `${r.id}.json.lock`))).toBe(true);
+    if (r.id === owner.id) throw Error('claim release refused');
+  });
+  await expect(reattachTick({ store, kinds, maxConcurrent: 1, observation: { now }, launch,
+    probe: () => mode === 'stopped' && !stopped ? 'alive' : 'dead',
+    stop: async () => { stopped = true; return { gone: true, signal: 'SIGKILL' }; },
+    reapGroup: () => false, releaseTaskClaim: release, log: m => logs.push(m) })).resolves.toBeDefined();
+  expect(store.read(owner.id)).toEqual(before);
+  expect(store.read(other.id).job).toMatchObject({ status: 'queued', task: { failureCount: 1 } });
+  expect(store.read(waiting.id).job.status).toBe('queued');
+  expect(release.mock.calls.map(([r]) => r.id)).toEqual([owner.id, other.id]);
+  expect(logs.some(m => m.includes(owner.id) && m.includes('claim release refused'))).toBe(true);
+  expect(launch).not.toHaveBeenCalled();
+});
+
+it('a handle with no parsed pid cannot confirm death or release a task owner', async () => {
+  const kill = vi.fn(), release = vi.fn(), launch = vi.fn(), now = Date.now();
+  expect(await stopHandle('no-pid', { requireConfirmedDeath: true, kill })).toEqual({ gone: false, signal: null });
+  const owner = runningTask(304, now - 1000, now);
+  const before = store.read(owner.id);
+  await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now }, probe: () => 'alive',
+    stop: (h, options) => stopHandle('no-pid', { ...options, kill }), releaseTaskClaim: release, launch });
+  expect(store.read(owner.id)).toEqual(before);
+  expect(kill).not.toHaveBeenCalled();
+  expect(release).not.toHaveBeenCalled();
+  expect(launch).not.toHaveBeenCalled();
+});
+
 it.each(['acted', 'nothing-owed', 'superseded', 'deferred-claim-held', 'deferred-read'])(
   'non-failure outcome %s succeeds in the child and after persisted-result recovery', async outcome => {
     const now = Date.now(), launch = vi.fn(), release = vi.fn();
@@ -681,7 +810,9 @@ it('task results repair publication without replay and retain partial success', 
   expect(store.read(r.id).job).toMatchObject({ status: 'running', handle: taskOwner.handle, task: { failureCount: 1 } });
   expect(release).not.toHaveBeenCalled();
   writeFileSync(join(dir, ref1), '{');
-  expect((await tick('alive')).corrupt).toEqual([]);
+  writeFileSync(join(dir, 'torn-root.json'), '{');
+  expect((await tick('alive')).corrupt).toEqual(['torn-root']);
+  expect(readFileSync(join(dir, 'torn-root.json'), 'utf8')).toBe('{');
   expect(JSON.parse(readFileSync(join(dir, ref1), 'utf8'))).toEqual(saved);
   await tick('dead');
   expect(store.read(r.id).job).toMatchObject({ status: 'queued', task: { failureCount: 1 } });
