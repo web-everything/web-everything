@@ -34,6 +34,15 @@ export function trustedDrainSubject(commit, authors) {
   return commit && authors?.has(`${commit.author?.name}\0${commit.author?.email}`)
     && jitSubject.test(commit.subject ?? '') ? commit.subject : null;
 }
+/**
+ * The one sanctioned nested backlog shape: raised-by sidecars written by raised-by.cjs `raisedByFile`
+ * (`backlog/raised-by/<parent card id>/<pr>-<24 hex>.md`). They are not cards: excluded from every card set
+ * here, yet still pass the generic tracked-file safety (no symlinks, no `..`, regular files). Any other
+ * nested backlog path stays a card-path refusal.
+ */
+const RAISED_BY_SIDECAR = /^backlog\/raised-by\/(?:\d{1,5}|x[a-z0-9]{6})\/\d+-[0-9a-f]{24}\.md$/;
+export const isRaisedBySidecar = (path) => RAISED_BY_SIDECAR.test(path) && !path.includes('\0');
+const cardPaths = (files) => lines(files).filter((p) => !isRaisedBySidecar(p));
 export const hashBacklogFiles = (files) => lines(files).filter((p) => /^backlog\/[^/]+\.md$/.test(p) && isHash(cardId(p)));
 export const isMergeGroupCiRun = (env = process.env) => env.GITHUB_ACTIONS === 'true' && env.GITHUB_EVENT_NAME === 'merge_group';
 /** Temporary ids are unconditionally refused in merge-group CI, independent of drain settings. */
@@ -121,7 +130,8 @@ export function logQueueNumbering(setting = resolveQueueNumbering(), log = proce
 }
 
 export function reservationPlan(mainFiles, reservations, isOpen) {
-  const mainIds = new Set(lines(mainFiles).map(cardId).filter(isNum).map(Number));
+  // A sidecar's basename leads with a PR number, never a card id: it must not raise the floor.
+  const mainIds = new Set(cardPaths(mainFiles).map(cardId).filter(isNum).map(Number));
   const kept = reservations.filter((r) => !r.nnns.every((n) => mainIds.has(Number(n))) && isOpen(r.repo, r.num) !== false);
   const max = [...mainIds, ...kept.flatMap((r) => r.nnns.map(Number))].reduce((m, n) => Math.max(m, n), 0);
   return { reservations: kept, minNext: max + 1 };
@@ -259,7 +269,8 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
       temporary = fs.mkdtempSync(join(tmpdir(), 'queue-numbering-'));
       const worktree = join(temporary, 'tree');
       git(['worktree', 'add', '--detach', worktree, traceHeadSha]);
-      const tracked = () => lines(git(['ls-files', 'backlog/'], worktree));
+      // Sidecars leave the card set here; the whole-tree assertWorktreeFile pass below still covers them.
+      const tracked = () => cardPaths(git(['ls-files', 'backlog/'], worktree));
       const files = tracked();
       for (const path of files) assertWorktreeCard(worktree, path, fs);
       // Numbering also rewrites references in docs, memory, flows and soak files.

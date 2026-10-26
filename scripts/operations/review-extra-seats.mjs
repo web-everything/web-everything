@@ -4,6 +4,7 @@ import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
 import { completedRedTeamSeat, redTeamStatusWithoutRun } from '../lib/red-team-run-result.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { execRead } from '../lib/proc-read.mjs';
+import { readSnapshotPrView } from '../lib/review-pr-snapshot.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { redTeamCardOnly } from '../lib/review-red-team-policy.mjs';
 import { ownReviewScratch, removeReviewScratch, retainReviewScratch, REVIEW_SCRATCH_PREFIXES } from '../lib/review-scratch.mjs';
@@ -75,9 +76,10 @@ import {
   findingCorroboratedBy, foldRedTeamVerdict, IMPACT_LEVELS, normalizeFinding,
 } from '../lib/jury-core.mjs';
 import { renameSourcePaths } from './review-pr.mjs';
-import { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTeamOwedFor } from '../lib/review-red-team-policy.mjs';
-export { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTeamOwedFor } from '../lib/review-red-team-policy.mjs';
+import { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTeamOwedFor, redTeamPanelSeatOwed } from '../lib/review-red-team-policy.mjs';
+export { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTeamOwedFor, redTeamPanelSeatOwed } from '../lib/review-red-team-policy.mjs';
 import { expectationForLens, huntBriefForLens } from '../lib/review-core.mjs';
+import { verifySavedRedTeamProvenance } from '../lib/saved-red-team-provenance.mjs';
 import { appendScorecard, readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { scrubPublish } from '../lib/secret-scrub.mjs';
 import { parseDelegationMarker } from '../lib/delegation-marker.mjs';
@@ -1022,6 +1024,13 @@ export function priorRedTeamRow(records, pr, rev, repo) {
   return seatRows(records).filter((r) => r.seat === RED_TEAM_SEAT.seat && r.repo === repo && r.pr === Number(pr) && r.rev === rev && completedRedTeamSeat(r)).at(-1) ?? null;
 }
 
+/** Saved rows can replace a model call only when a completed review job attests this snapshot. */
+function verifiedPriorRedTeamRow(records, { repo, pr, rev, env }) {
+  const prior = priorRedTeamRow(records, pr, rev, repo);
+  return prior && !verifySavedRedTeamProvenance({ repo, pr, head: rev,
+    path: resolveScorecardStorePath(env), records, index: records.indexOf(prior), env }) ? prior : null;
+}
+
 /**
  * Has this `(repo, pr, head)` already had a completed red-team execution? PURE. A completed row stops the MODEL from
  * running again — the effects after it (miss rows, delegation trial, comment) are re-checked and finished by
@@ -1376,7 +1385,7 @@ async function resumeRedTeam({ pr, repo, rev, title, prior, records, post, recor
     // rather than defaulting through a null seatRow.
     changedFiles: prior.changedFiles ?? null,
   }, io);
-  if (!done.didWork && !done.failed) return { status: 'already-ran', reason: `a completed red-team seat row already exists for #${pr} at ${rev.slice(0, 12)}` };
+  if (!done.didWork && !done.failed) return { status: 'already-ran', rev, callId: prior.callId, reason: `a completed red-team seat row already exists for #${pr} at ${rev.slice(0, 12)}` };
   return {
     status: 'resumed', rev, callId: prior.callId, provider: prior.provider, model: prior.model,
     reason: `${done.failed ? 'retried (still failing)' : 'finished'} what the completed pass for #${pr} at ${rev.slice(0, 12)} left undone — ${done.rowsWritten} row(s) written, delegation trial ${done.delegationTrial}, comment ${done.comment.status}${done.comment.status === 'error' && done.comment.reason ? ` (${done.comment.reason})` : ''}`,
@@ -1498,17 +1507,25 @@ export async function speculateRedTeam({
       if (resumeOnly) return { status: 'skipped', reason: 'resume-only: scorecard store unreadable — no call launched' };
       io.log(`red team: could not read the scorecard store (${e.message}) — treating it as empty`);
     }
-    const prior = priorRedTeamRow(records, pr, rev, repo);
+    const completed = priorRedTeamRow(records, pr, rev, repo);
+    const prior = resumeOnly ? completed
+      : verifiedPriorRedTeamRow(records, { repo, pr, rev, env });
     if (resumeOnly && !prior) return { status: 'skipped', reason: 'resume-only: no clean prior red-team row — no call launched' };
+    // A published, trusted exact-head result is independent evidence of completion.
+    // It can prevent a duplicate call without replaying any unattested saved findings.
+    if (!prior && completed
+      && redTeamCommentPosted(io.listComments({ pr, repo }), pr, rev)) {
+      return { status: 'already-ran', rev, reason: `a trusted red-team result already exists for #${pr} at ${rev.slice(0, 12)}` };
+    }
     // A speculative pass (`resume: false`) must not finish a prior pass's effects before the verdict is known: it
     // reports the row and the job's sequential pass resumes it if, and only if, the review accepts.
-    if (prior && !resume) return { status: 'prior-row', reason: `a completed red-team seat row already exists for #${pr} at ${rev.slice(0, 12)}` };
+    if (prior && !resume) return { status: 'prior-row', rev, readFingerprint: redTeamReadFingerprint(read), reason: `a completed red-team seat row already exists for #${pr} at ${rev.slice(0, 12)}` };
     if (prior) return await resumeRedTeam({ pr, repo, rev, title: read.title, prior, records, post, record }, io);
     // Launch policy applies only to new calls: a recorded pass must finish its effects even if policy changed.
     // The net path list names only rename/copy destinations. Include sources so
     // moving executable code into backlog/ cannot turn the probe off. Unknown
     // or empty destination lists and malformed source lists must still probe.
-    if (settings.value.skipCardOnly && redTeamCardOnly(read)) {
+    if (!redTeamPanelSeatOwed({ findings: { read } }, env) && settings.value.skipCardOnly && redTeamCardOnly(read)) {
       io.log('red team skipped: card-only');
       return { status: 'skipped', policy: 'card-only', reason: 'red team skipped: card-only' };
     }
@@ -1568,6 +1585,7 @@ export async function speculateRedTeam({
     if (typeof onReserved === 'function') {
       try { onReserved({ callId, provider, model, effort, rev, reservedAt: new Date(io.now()).toISOString() }); } catch { /* best effort */ }
     }
+
     if (record && post) {
       try { io.redTeamStatus?.({ repo, pr, loopPayload: { findings: { read } }, status: 'running' }); }
       catch (e) { io.log(`red-team status: ${e.message}`); }
@@ -1682,7 +1700,7 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
     let rowsWritten = 0;
     let delegationTrial = 'not-delegated';
     let comment = { status: 'not-posted', reason: 'the red team did not run cleanly' };
-    if (ran) {
+    if (ran && redTeamOwedFor(loopPayload)) {
       ({ rowsWritten, delegationTrial, comment } = await finishRedTeamEffects({
         pr, repo, rev, title: pass.title, callId, provider, model, findings, recheckStatus, foldedVerdict, builder, records, seatRow: row, post, record,
       }, io));
@@ -1691,7 +1709,7 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
       try { io.append(row); rowsWritten = 1; } catch (e) { io.log(`red team: evidence row (${row.seat}) NOT written — ${e.message}`); }
     }
 
-    if (record && post) {
+    if (record && post && redTeamOwedFor(loopPayload)) {
       try { io.redTeamStatus?.({ repo, pr, loopPayload, status: 'finished', result: 'ran' }); }
       catch (e) { io.log(`red-team status: ${e.message}`); }
     }
@@ -1715,6 +1733,20 @@ export async function finishSpeculativeRedTeam({ pr, repo, loopPayload, pass, en
   try {
     if (!redTeamEnabled(env)) return { status: 'disabled', reason: `${RED_TEAM_ENV}=${env?.[RED_TEAM_ENV] ?? ''} ${EXTRA_SEATS_ENV}=${env?.[EXTRA_SEATS_ENV] ?? ''}`.trim() };
     if (!redTeamOwedFor(loopPayload)) return { status: 'not-owed', reason: notOwedReason(loopPayload) };
+    if (redTeamPanelSeatOwed(loopPayload, env) && pass?.status === 'prior-row'
+      && pass.readFingerprint === redTeamReadFingerprint(loopPayload?.findings?.read)) {
+      const records = io.readRecords();
+      const prior = verifiedPriorRedTeamRow(records, { repo, pr, rev: pass.rev, env });
+      if (prior) {
+        const resumed = redTeamOwedFor(loopPayload) ? await resumeRedTeam({ pr, repo, rev: pass.rev, title: loopPayload.findings.read.title,
+          prior, records, post, record: loopPayload?.replay !== true }, io)
+          : { rowsWritten: 0, delegationTrial: 'not-accepted', comment: { status: 'not-posted', reason: 'review not accepted' } };
+        // Resume reports effects, but the panel also needs the saved verdict and re-check evidence.
+        return { ...resumed, status: 'ran', rev: pass.rev, callId: prior.callId, provider: prior.provider, model: prior.model,
+          findings: prior.findings, recheckStatus: prior.recheckStatus,
+          foldedVerdict: prior.foldedVerdict, confirmedMissCount: prior.confirmedMissCount };
+      }
+    }
     if (pass?.status !== 'speculated') return { status: 'stale', reason: `the speculative pass is ${pass?.status ?? 'missing'}, not speculated` };
     const read = loopPayload?.findings?.read;
     const fp = redTeamReadFingerprint(read);
@@ -1729,7 +1761,7 @@ export async function finishSpeculativeRedTeam({ pr, repo, loopPayload, pass, en
     }
     let records = [];
     try { records = io.readRecords(); } catch { records = []; }
-    if (priorRedTeamRow(records, pr, pass.rev, repo)) return { status: 'superseded', reason: `a completed red-team seat row for #${pr} at ${String(pass.rev).slice(0, 12)} landed meanwhile` };
+    if (verifiedPriorRedTeamRow(records, { repo, pr, rev: pass.rev, env })) return { status: 'superseded', reason: `a completed red-team seat row for #${pr} at ${String(pass.rev).slice(0, 12)} landed meanwhile` };
     const recording = loopPayload?.replay !== true;
     return await completeRedTeam({ pr, repo, loopPayload, pass, post, record: recording }, io);
   } catch (e) {
@@ -1949,8 +1981,9 @@ export function runExtraSeatsCli(argv = process.argv.slice(2), { redTeamIo } = {
       return r.stdout;
     };
     const pr = Number(flag('pr'));
-    const view = JSON.parse(ghRead(['pr', 'view', String(pr), `--repo=${flag('repo')}`, '--json', 'title,body,headRefOid,files']));
-    const diffText = ghRead(['pr', 'diff', String(pr), `--repo=${flag('repo')}`]);
+    const { diff: diffText, ...view } = readSnapshotPrView({ pr, repo: flag('repo'),
+      fields: ['title', 'body', 'headRefOid', 'files', 'diff'], exec: ghRead,
+    });
     // Card 341: the open operator send-backs come from the COMPLETE thread (the shared reader), never a truncated view.
     import('../conveyor/pr-comments-complete.mjs')
       .then(({ readCompletePrComments }) => readCompletePrComments(pr, { repo: flag('repo') }))

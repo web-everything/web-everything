@@ -1116,3 +1116,10 @@ describe('non-implementing retry branch grants', () => {
     expect(isBranchAllowedNow(build, 'lane/5754b-example', 1000)).toBe(false);
   });
 });
+
+import { isCardOnlyPr } from '../pr-limit.mjs';
+it('PR-limit pure card classification accepts already-resolved files without fetching', () => {
+  expect(isCardOnlyPr({ files: [{ path: 'code.js' }], realFiles: ['backlog/123-card.md'] })).toBe(true);
+  expect(isCardOnlyPr({ files: [{ path: 'backlog/123-card.md' }], realFiles: ['code.js'] })).toBe(false);
+  expect(isCardOnlyPr({ files: [{ path: 'backlog/123-card.md' }], realFiles: null })).toBe(false);
+});

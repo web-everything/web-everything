@@ -19,6 +19,7 @@ import { countGrantedRoundExtensions } from '../conveyor/round-extension-mark.mj
 import { listDaemonPlistFiles, readPlistAsJson, extractDaemonSpec, classifyDaemonSpec, tailFile } from './daemon-status-io.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { evaluatePr, rulingNeededRow, redTeamRulingRow } from './operator-queue.mjs';
+import { savedRedTeamFallback } from '../lib/drain-saved-red-team.mjs';
 import { orderReadyCandidates } from '../merge-ai-prs.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { explainWhy, lastMentionLine } from './operator-why.mjs';
@@ -65,7 +66,8 @@ export function createWhyReader({
       if (comments) facts.queueSection = safe('operator queue', () => {
         const evaluation = evaluatePr(facts.pr);
         const human = (facts.pr.labels ?? []).some(l => (l.name ?? l) === 'review:human');
-        return rulingNeededRow(repo, facts.pr) || redTeamRulingRow(repo, facts.pr) ? 'RULING NEEDED'
+        return rulingNeededRow(repo, facts.pr) || redTeamRulingRow(repo, facts.pr, undefined,
+          { readSaved: savedRedTeamFallback({ repo, pr: facts.pr.number, head: facts.pr.headRefOid }) }) ? 'RULING NEEDED'
           : evaluation.ready ? 'NEEDS YOU' : facts.standDown ? 'STOOD DOWN' : human ? evaluation.transient ? 'PENDING' : `NOT READY: ${evaluation.reasons.join('; ')}` : 'not in the queue';
       }, 'classification unavailable');
       // Reuse the drain's pure ready-age ordering; label-age/priority context is explicitly unavailable here.

@@ -1,0 +1,4 @@
+{
+  "$comment": "review.clearance (scripts/lib/approval-binding.mjs, operator 2026-10-21). bindTo fingerprint|sha: an operator clear-human clearance covers a live head when trusted git proves the PR's net change vs its merge-base equals the recorded one (strict reviewed-diff, or reviewed-contribution plus the replay proof), so a mechanical new head (rebase, restamp, conflict-watch merge, ci-heal) keeps it; sha is the kill switch (exact sha identity only). normalizeNumbering true|false: a head that adds only the drain's own proven card-numbering commits on top of a covered head is covered. Env WE_REVIEW_CLEARANCE_BIND_TO / WE_REVIEW_CLEARANCE_NORMALIZE_NUMBERING override; values and sources are logged once per process.",
+  "review": { "clearance": { "bindTo": "fingerprint", "normalizeNumbering": true } }
+}
