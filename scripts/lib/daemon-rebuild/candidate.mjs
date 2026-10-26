@@ -120,11 +120,15 @@ export function reclaimStaleCandidates({ root, run, env, pidAlive = defaultPidAl
     if (pidAlive(pid) !== false) { skipped.push({ path, reason: 'owner-alive-or-unknown' }); continue; }
     const unlock = git(['worktree', 'unlock', path]);
     if (unlock.status !== 0) { skipped.push({ path, reason: `unlock-failed: ${String(unlock.stderr || '').trim().split('\n')[0]}` }); continue; }
-    git(['worktree', 'remove', '--force', path]);
-    try { rm(path, { recursive: true, force: true }); } catch { /* best-effort */ }
+    const removed = git(['worktree', 'remove', '--force', path]);
+    if (removed.status !== 0) {
+      // Not claimed as reclaimed; the caller's own prune (it follows) clears a registration whose dir is now gone.
+      try { rm(path, { recursive: true, force: true }); } catch { /* best-effort */ }
+      skipped.push({ path, reason: `remove-failed: ${String(removed.stderr || '').trim().split('\n')[0]}` });
+      continue;
+    }
     reclaimed.push(path);
   }
-  if (reclaimed.length) git(['worktree', 'prune']);
   return { reclaimed, skipped };
 }
 

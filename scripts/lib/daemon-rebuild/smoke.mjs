@@ -451,7 +451,7 @@ export async function smokeAndAdopt({
     if (proven) log.error?.(`daemon-rebuild: smoke reused from ${proven.passedAt} on tree ${identity.tree} (env checks re-run)`);
     // Every smoke of this build (A, then B / C) reuses the lease's own unique path, one after another.
     const candidate = materializeCandidate({
-      root, sha, run, env, path: lease.path,
+      root, sha, run, env, path: lease.path, log,
     });
     if (!candidate.ok) return { worktreeFailed: candidate.reason };
     let smokeResult = null;

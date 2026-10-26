@@ -24,14 +24,13 @@ function fakeGit(entries, { failOn } = {}) {
 }
 
 describe('reclaimStaleCandidates', () => {
-  it('unlocks + removes + prunes a locked own-clone candidate whose pid is dead, and nothing else', () => {
+  it('unlocks + removes (that path only) a locked own-clone candidate whose pid is dead, and nothing else', () => {
     const dead = own('80466-851559f8');
     const { run, calls } = fakeGit([{ path: ROOT }, { path: dead, locked: true, reason: 'initializing' }]);
     const r = reclaimStaleCandidates({ root: ROOT, run, env: ENV, pidAlive: () => false, rm: () => {} });
     expect(r.reclaimed).toEqual([dead]);
     expect(calls).toContain(`worktree unlock ${dead}`);
     expect(calls).toContain(`worktree remove --force ${dead}`);
-    expect(calls).toContain('worktree prune');
     expect(calls.filter((c) => c.includes('remove')).length).toBe(1);
   });
   it('never touches a live owner', () => {
@@ -68,6 +67,16 @@ describe('reclaimStaleCandidates', () => {
     const r = reclaimStaleCandidates({ root: ROOT, run, env: ENV, pidAlive: () => false, rm: () => {} });
     expect(r.reclaimed).toEqual([]);
     expect(r.skipped[0]).toMatchObject({ path: dead });
+  });
+});
+
+describe('reclaim honesty', () => {
+  it('does not report reclaimed when git remove fails', () => {
+    const dead = own('7-dd');
+    const { run } = fakeGit([{ path: dead, locked: true }], { failOn: { prefix: 'worktree remove', stderr: 'busy' } });
+    const r = reclaimStaleCandidates({ root: ROOT, run, env: ENV, pidAlive: () => false, rm: () => {} });
+    expect(r.reclaimed).toEqual([]);
+    expect(r.skipped[0].reason).toMatch(/remove-failed: busy/);
   });
 });
 
