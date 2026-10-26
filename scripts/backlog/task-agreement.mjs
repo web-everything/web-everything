@@ -21,9 +21,9 @@
  */
 export const ACCEPTANCE_HEADING = '## Acceptance';
 export const NON_GOALS_HEADING = '## Non-goals';
-/** On its own line directly under either heading: the section was machine-drafted (the one-off refresh of open
+/** First non-blank line under either heading: the section was machine-drafted (the one-off refresh of open
  *  stories) and no author or preparer has confirmed it yet. The reader reports it as `draft: true`. */
-export const AGREEMENT_DRAFT_MARKER = '<!-- agreement: draft -->';
+export const AGREEMENT_DRAFT_MARKER = 'Draft: model-written, not yet confirmed.';
 /** Matches the TEXT of a level-2 heading (after `## `). Gates import it so `## Acceptance` and the legacy
  *  `## Done when` stay one rule. */
 export const ACCEPTANCE_HEADING_RE = /^(?:acceptance|done when)\b/i;
@@ -108,8 +108,12 @@ export function readTaskAgreement(body) {
   const problem = (code, section, detail) => result.problems.push({ code, section, detail });
   const text = (typeof body === 'string' ? body : '').replace(/^---\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/, '');
   const sections = { canonical: [], legacy: [], nonGoals: [] };
-  let current = null, fence = null, inComment = false;
+  let current = null, fence = null, inComment = false, sectionStart = false;
   for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    // Comments and fences also occupy the first non-blank line under a section heading.
+    const firstNonBlank = sectionStart && !!trimmed;
+    if (trimmed) sectionStart = false;
     // A line inside a comment is never a fence or a heading; the section keeps it so pass 2 skips it too.
     if (inComment) { inComment = commentOpenAfter(line, true); current?.push(line); continue; }
     const fm = /^\s*(`{3,}|~{3,})(.*)$/.exec(line);
@@ -127,11 +131,11 @@ export function readTaskAgreement(body) {
         const kind = /^acceptance\b/i.test(title) ? 'canonical'
           : /^done when\b/i.test(title) ? 'legacy'
             : NON_GOALS_HEADING_RE.test(title) ? 'nonGoals' : null;
-        if (kind) { current = []; sections[kind].push(current); }
+        if (kind) { current = []; sections[kind].push(current); sectionStart = true; }
       }
       continue;
     }
-    if (current && line.trim() === AGREEMENT_DRAFT_MARKER) result.draft = true;
+    if (current && firstNonBlank && trimmed === AGREEMENT_DRAFT_MARKER) { result.draft = true; continue; }
     current?.push(line);
   }
   if (inComment) problem('unterminated-comment', 'agreement', 'An HTML comment is never closed, so everything after it was skipped.');

@@ -53,7 +53,8 @@ it('retains real corrupt/unreadable lease files alongside normal leases; real CL
     });
     const result = readState();
     expect(result.records.find((r) => r.kind === 'claim')).toMatchObject({ owner: 'fixture-person', pidAlive: null, hasUnsafeWork: null });
-    expect(result.records.find((r) => r.kind === 'lane-lease')).toMatchObject({ ownerPidAlive: true, hasUnsafeWork: false });
+    expect(result.records.find((r) => r.kind === 'lane-lease')).toMatchObject({ ownerPidAlive: true, hasUnsafeWork: null,
+      lane: { clean: true, ahead: 0 }, safety: { reason: 'local tracking refs cannot prove publication' } });
     expect(result.records.filter((r) => r.kind === 'lane-lease')).toHaveLength(3);
     for (const path of [corruptLane, unreadableLane]) {
       expect(result.records.find((r) => r.id === path)).toMatchObject({
@@ -69,7 +70,8 @@ it('retains real corrupt/unreadable lease files alongside normal leases; real CL
       env: { ...process.env, LANE_POOL_ROOT: pool, OPERATION_RUNS_DIR: runDir, OPERATION_CALLS_DIR: callsDir, WE_DAEMON_MANAGED_CLONE: '1' },
     });
     const report = JSON.parse(stdout).verdict;
-    expect(report.records.find((r) => r.kind === 'lane-lease')).toMatchObject({ verdict: 'live', hasUnsafeWork: false });
+    expect(report.records.find((r) => r.kind === 'lane-lease')).toMatchObject({ verdict: 'live', hasUnsafeWork: null,
+      lane: { clean: true, ahead: 0 }, safety: { reason: 'local tracking refs cannot prove publication' } });
     expect(report.records.filter((r) => r.kind === 'lane-lease')).toHaveLength(3);
     for (const path of [corruptLane, unreadableLane]) {
       expect(report.records.find((r) => r.id === path)).toMatchObject({
