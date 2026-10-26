@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
+import { promisify } from 'node:util';
+import { Worker } from 'node:worker_threads';
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -385,11 +387,133 @@ describe('delivery policy values', () => {
     put('config/ungated.mjs', "throw Error('must never execute');");
     expect(policy(await load())).toEqual(DELIVERY_POLICY_FAILSAFE);
   });
+  it.each([
+    ['computed', "const x = 'node:path'; await import /* gap */ (x);"],
+    ['template', 'const x = "path"; await import(`node:${x}`);'],
+    ['relative template', 'const x = "other"; if (false) import(`./${x}`);'],
+    ['literal', "await import('node:path');"],
+    ['meta', 'void import /* gap */ .meta.url;'],
+    ['dead require', "if (false) require('node:path');"],
+  ])('refuses %s runtime imports before executing defaults and reports failsafe', async (_name, expression) => {
+    const source = readFileSync(join(root, defaultFile), 'utf8');
+    put(defaultFile, `${expression}\n${source}`);
+    const result = await load();
+    expect(policy(result)).toEqual(DELIVERY_POLICY_FAILSAFE);
+    expect(result.warnings).toEqual([expect.stringMatching(/failsafe/)]);
+    expect(readPolicyEvents({ env })).toMatchObject([{ event: 'policy-defaults-unreadable' }]);
+  });
+  it.each([
+    ['new Function', `new Function('return im'+'port("node:path")')()`],
+    ['Function call', `Function('return im'+'port("node:path")')()`],
+    ['eval', `eval('im'+'port("node:path")')`],
+    ['constructor member', `(()=>{}).constructor('return im'+'port("node:path")')()`],
+    ['computed constructor member', `(()=>{})['constructor']('return im'+'port("node:path")')()`],
+    ['dynamically computed constructor key', `const key = ['con', 'structor'].join(''); const make = (() => {})[key]; make('return pro' + 'cess')().exit(0)`],
+    ['globalThis', 'void globalThis'],
+    ['process', 'void process'],
+    ['require alias', 'const loader = require'],
+    ['module', 'void module'],
+    ['string setTimeout', `setTimeout('im'+'port("node:path")', 0)`],
+    ['string setInterval', `setInterval('im'+'port("node:path")', 0)`],
+    ['import.meta', 'void import.meta'],
+    ['WebAssembly', 'void WebAssembly'],
+    ['Worker', 'void Worker'],
+  ])('refuses %s dynamic-code escape with failsafe at every execution boundary', async (_name, expression) => {
+    const guard = deliveryPolicy.createPolicyImportGuard();
+    expect(() => guard.check(expression)).toThrow(/Policy defaults runtime import refused/);
+    await expect(guard.importModule(expression)).rejects.toThrow(/Policy defaults runtime import refused/);
+    const source = readFileSync(join(root, defaultFile), 'utf8');
+    put(defaultFile, `${expression};\n${source}`);
+    const result = await load();
+    expect(policy(result)).toEqual(DELIVERY_POLICY_FAILSAFE);
+    expect(result.warnings).toEqual([expect.stringMatching(/failsafe/)]);
+    expect(readPolicyEvents({ env })).toMatchObject([{ event: 'policy-defaults-unreadable' }]);
+  });
+  it('loads benign defaults with dynamic-code words only in strings and comments', async () => {
+    const source = readFileSync(join(root, defaultFile), 'utf8');
+    const words = 'eval Function .constructor globalThis process require module setTimeout setInterval import.meta WebAssembly Worker';
+    put(defaultFile, `// ${words}\n/* ${words} */\nexport const note = ${JSON.stringify(words)};\n${source}`);
+    const result = await load();
+    expect(policy(result)).toEqual(defaults);
+    expect(result.warnings).toEqual([]);
+    expect(readPolicyEvents({ env })).toEqual([]);
+  });
   it('CLI flattened keys equal the defaults and all nine documented fields', () => {
     const output = JSON.parse(execFileSync(process.execPath, [resolve('scripts/lib/delivery-policy.mjs'), '--json'], { cwd: root, env: { ...process.env, ...env, WE_POLICY_CONFIG: '', GITHUB_ACTIONS: '' }, encoding: 'utf8', timeout: 20000, maxBuffer: 1024 * 1024 }));
     expect(flat(policy(output))).toEqual(flat(defaults));
     expect(flat(policy(output))).toHaveLength(9);
     expect(policy(output)).toEqual(defaults);
+  });
+});
+
+describe('policy runtime import allow-list', () => {
+  it('checks executable output again at the data-URL boundary and permits an approved literal', () => {
+    // Exercise native import.meta.resolve, which Vitest's import.meta shim lacks.
+    const observed = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', `
+      import { createPolicyImportGuard } from './scripts/lib/delivery-policy.mjs';
+      const guard = createPolicyImportGuard(['node:path']);
+      const module = await guard.importModule("export const path = await import('node:path');");
+      const source = 'globalThis.__policyImportProbe = true; const x = "node:path"; await import(x);';
+      let refusal;
+      try { await guard.importModule(source); } catch (error) { refusal = error.message; }
+      process.stdout.write(JSON.stringify({ name: module.path.basename('/a/b'), refusal, executed: globalThis.__policyImportProbe === true }), () => process.exit(0));
+    `], { cwd: resolve('.'), encoding: 'utf8', timeout: 10000, killSignal: 'SIGKILL', maxBuffer: 65536 }));
+    expect(observed.name).toBe('b');
+    expect(observed.refusal).toMatch(/Policy defaults/);
+    expect(observed.executed).toBe(false);
+  });
+
+  it('freezes the empty production list and resolves an injected literal allow-list once', () => {
+    expect(deliveryPolicy.POLICY_DEFAULTS_IMPORT_ALLOW_LIST).toEqual([]);
+    expect(Object.isFrozen(deliveryPolicy.POLICY_DEFAULTS_IMPORT_ALLOW_LIST)).toBe(true);
+    const resolveImport = vi.fn(() => 'node:path');
+    const guard = deliveryPolicy.createPolicyImportGuard(['path'], resolveImport);
+    for (const source of ["import /* gap */ ('path')", "import('node:path')", "import p from 'path';"]) {
+      expect(() => guard.check(source)).not.toThrow();
+    }
+    expect(() => guard.check("require('path')")).toThrow(/Policy defaults runtime import refused/);
+    expect(resolveImport).toHaveBeenCalledTimes(1);
+    expect(guard.resolve('path')).toBe('node:path');
+  });
+
+  it.each([
+    "import(x)", 'import(`./${x}`)', "import /* comment */ (x)",
+    "import('node:fs')", 'import(`path`)', "import('path' + '')",
+    'import.meta', "require(x)", "require('node:fs')", 'const r = require;',
+    "export { x } from 'node:fs';", "import x = require('node:fs');", 'import(',
+  ])('refuses unknown or incomplete source and bundled syntax: %s', source => {
+    const guard = deliveryPolicy.createPolicyImportGuard(['path'], () => 'node:path');
+    expect(() => guard.check(source)).toThrow(/Policy defaults/);
+  });
+
+  it('ignores strings, comments, regexes and erased type imports, but scans template expressions', () => {
+    const guard = deliveryPolicy.createPolicyImportGuard();
+    expect(() => guard.check(`
+      import type { X } from './types';
+      import { type Y } from './types';
+      type Z = import('./types').Z;
+      const text = "import(x); require(x); import.meta";
+      const template = \`import(x)\`;
+      const regex = /import\\(x\\)/;
+      // import(x)
+      /* require(x) */
+    `)).not.toThrow();
+    expect(() => guard.check('const text = `${import(x)}`;')).toThrow(/Policy defaults/);
+  });
+
+  it.each([
+    'const key = "constructor"; const value = {}[key];',
+    'const value = {}.toString;',
+    'const value = (() => 1)();',
+    'const value = { get answer() { return 1; } };',
+    'const value = { ["answer"]: 1 };',
+    'const value = { ...{} };',
+    'const { value } = {};',
+    'const value = `${1 + 1}`;',
+  ])('refuses non-data defaults syntax at check and execution boundaries: %s', async source => {
+    const guard = deliveryPolicy.createPolicyImportGuard();
+    expect(() => guard.check(source)).toThrow(/Policy defaults runtime import refused/);
+    await expect(guard.importModule(source)).rejects.toThrow(/Policy defaults runtime import refused/);
   });
 });
 
@@ -747,6 +871,307 @@ describe('trust, confinement and reach set', () => {
 });
 
 describe('policy journal', () => {
+  it('does not reclaim an aged lock with a live pid and refuses within a bounded wait', () => {
+    const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
+    const owner = JSON.stringify({ pid: process.pid, token: 'live-owner' });
+    writeFileSync(lock, owner);
+    utimesSync(lock, 1, 1);
+    const start = Date.now();
+    expect(() => deliveryPolicy.appendPolicyJournal(env.WE_POLICY_EVENTS_FILE, '{}\n', {
+      allowedRoots: [dir],
+    })).toThrow(/lock timeout; event not recorded/);
+    expect(Date.now() - start).toBeLessThan(2000);
+    expect(() => recordPolicyEvent({ event: 'refused' }, env)).not.toThrow();
+    expect(readPolicyEvents({ env })).toEqual([]);
+    expect(readFileSync(lock, 'utf8')).toBe(owner);
+  });
+
+  it('reclaims an aged lock with a dead pid', () => {
+    const pid = Number(execFileSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], {
+      encoding: 'utf8', timeout: 10000, maxBuffer: 65536,
+    }));
+    expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
+    const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
+    writeFileSync(lock, JSON.stringify({ pid, token: 'dead-owner' }));
+    utimesSync(lock, 1, 1);
+    recordPolicyEvent({ event: 'reclaimed' }, env);
+    expect(readPolicyEvents({ env })).toMatchObject([{ event: 'reclaimed' }]);
+    expect(() => statSync(lock)).toThrow(/ENOENT/);
+  });
+
+  it('does not reclaim an aged lock when pid liveness is unknown', () => {
+    const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
+    const owner = JSON.stringify({ pid: process.pid, token: 'inaccessible-owner' });
+    writeFileSync(lock, owner);
+    utimesSync(lock, 1, 1);
+    const probe = vi.spyOn(process, 'kill').mockImplementation(() => {
+      throw Object.assign(Error('not permitted'), { code: 'EPERM' });
+    });
+    expect(() => recordPolicyEvent({ event: 'refused' }, env)).not.toThrow();
+    expect(probe).toHaveBeenCalledWith(process.pid, 0);
+    expect(readPolicyEvents({ env })).toEqual([]);
+    expect(readFileSync(lock, 'utf8')).toBe(owner);
+  });
+
+  it('refuses an oversized aged lock without reclaiming it', () => {
+    const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
+    const content = 'x'.repeat(4097);
+    writeFileSync(lock, content);
+    utimesSync(lock, 1, 1);
+    expect(() => deliveryPolicy.appendPolicyJournal(env.WE_POLICY_EVENTS_FILE, '{}\n', {
+      allowedRoots: [dir],
+    })).toThrow(/Oversized policy journal lock.*Verify no writer/);
+    expect(() => recordPolicyEvent({ event: 'refused' }, env)).not.toThrow();
+    expect(readPolicyEvents({ env })).toEqual([]);
+    expect(readFileSync(lock, 'utf8')).toBe(content);
+  });
+
+  it.each(['append', 'best effort'])('aborts %s when the lock token is stolen before the write', mode => {
+    const script = `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { appendPolicyJournal, recordPolicyEvent } from './scripts/lib/delivery-policy.mjs';
+      const [envText, mode] = process.argv.slice(1);
+      const env = JSON.parse(envText);
+      const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
+      const original = fs.openSync;
+      let owner, sameInode;
+      fs.openSync = (path, ...args) => {
+        const fd = original(path, ...args);
+        if (path === env.WE_POLICY_EVENTS_FILE && (args[0] & fs.constants.O_APPEND)) {
+          owner = JSON.parse(fs.readFileSync(lock, 'utf8'));
+          const before = fs.statSync(lock);
+          fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'stolen' }));
+          sameInode = fs.statSync(lock).ino === before.ino;
+        }
+        return fd;
+      };
+      syncBuiltinESMExports();
+      let error;
+      try {
+        if (mode === 'append') appendPolicyJournal(env.WE_POLICY_EVENTS_FILE, '{}\\n', {
+          allowedRoots: [env.WE_DAEMON_STATE_DIR],
+        });
+        else recordPolicyEvent({ event: 'refused' }, env);
+      } catch (caught) { error = caught.message; }
+      process.stdout.write(JSON.stringify({ owner, sameInode, error, pid: process.pid }), () => process.exit(0));
+    `;
+    const result = JSON.parse(execFileSync(process.execPath,
+      ['--input-type=module', '-e', script, JSON.stringify(env), mode],
+      { cwd: resolve('.'), encoding: 'utf8', timeout: 10000, killSignal: 'SIGKILL', maxBuffer: 65536 }));
+    expect(result.owner.pid).toBe(result.pid);
+    expect(result.owner.token).toMatch(/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/);
+    expect(result.sameInode).toBe(true);
+    if (mode === 'append') expect(result.error).toMatch(/lock ownership lost; event not recorded/);
+    else expect(result.error).toBeUndefined();
+    expect(readFileSync(env.WE_POLICY_EVENTS_FILE, 'utf8')).toBe('');
+    expect(JSON.parse(readFileSync(env.WE_POLICY_EVENTS_FILE + '.lock', 'utf8')).token).toBe('stolen');
+  });
+
+  it.each(['normal capacity', 'one remaining record'])('serializes stale removers across the validation/unlink gap with %s', async capacity => {
+    const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
+    if (capacity === 'one remaining record') {
+      const at = new Date().toISOString();
+      const firstBytes = Buffer.byteLength(JSON.stringify({ at, key: '', event: 'interleaved', subject: 'first', reason: '' }) + '\n');
+      const seed = { at, subject: 'seed', padding: '' };
+      const paddingBytes = 1024 * 1024 - firstBytes - Buffer.byteLength(JSON.stringify(seed) + '\n');
+      writeFileSync(env.WE_POLICY_EVENTS_FILE, JSON.stringify({ ...seed, padding: 'x'.repeat(paddingBytes) }) + '\n');
+    }
+    writeFileSync(lock, 'stale');
+    utimesSync(lock, 1, 1);
+    const barrier = new SharedArrayBuffer(8);
+    const control = new Int32Array(barrier);
+    const workerFile = join(dir, 'journal-reclamation-worker.mjs');
+    writeFileSync(workerFile, `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { parentPort, workerData } from 'node:worker_threads';
+      const { recordPolicyEvent } = await import(workerData.module);
+      const { env, role, barrier } = workerData;
+      const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
+      const control = new Int32Array(barrier);
+      const original = { open: fs.openSync, unlink: fs.unlinkSync, write: fs.writeSync };
+      let paused = false, competing = false, survived;
+      const compete = kind => {
+        if (!competing) { competing = true; parentPort.postMessage({ phase: 'competing', kind }); }
+      };
+      const wait = index => {
+        if (Atomics.wait(control, index, 0, 8000) === 'timed-out') throw Error('barrier timed out');
+      };
+      fs.unlinkSync = (path, ...args) => {
+        if (role === 'first' && path === lock && !paused) {
+          paused = true;
+          parentPort.postMessage({ phase: 'paused' });
+          wait(0); // Last identity check has completed; unlink has not run.
+        }
+        return original.unlink(path, ...args);
+      };
+      fs.openSync = (path, ...args) => {
+        try { return original.open(path, ...args); } catch (error) {
+          if (role === 'second' && String(path).endsWith('.reclaim') && error.code === 'EEXIST') compete('contended');
+          throw error;
+        }
+      };
+      fs.writeSync = (fd, data, ...args) => {
+        if (role === 'second' && String(data).includes('"event":"interleaved"')) {
+          const held = fs.lstatSync(lock);
+          compete('replacement');
+          parentPort.postMessage({ phase: 'held' });
+          wait(1); // Hold the replacement while the first remover finishes.
+          try {
+            const current = fs.lstatSync(lock);
+            survived = current.dev === held.dev && current.ino === held.ino;
+          } catch { survived = false; }
+        }
+        return original.write(fd, data, ...args);
+      };
+      syncBuiltinESMExports();
+      recordPolicyEvent({ event: 'interleaved', subject: role }, env);
+      parentPort.postMessage({ phase: 'done', survived });
+      process.exit(0);
+    `);
+    const workers = [];
+    const start = role => {
+      const worker = new Worker(workerFile, { workerData: {
+        module: resolve('scripts/lib/delivery-policy.mjs'), env, role, barrier,
+      } });
+      workers.push(worker);
+      const messages = new Map(), waiting = new Map();
+      let failure;
+      worker.on('message', message => {
+        messages.set(message.phase, message);
+        waiting.get(message.phase)?.resolve(message);
+      });
+      worker.on('error', error => {
+        failure = error;
+        for (const pending of waiting.values()) pending.reject(error);
+      });
+      return phase => {
+        if (failure) return Promise.reject(failure);
+        if (messages.has(phase)) return Promise.resolve(messages.get(phase));
+        return new Promise((resolve, reject) => waiting.set(phase, { resolve, reject }));
+      };
+    };
+    const resume = index => { Atomics.store(control, index, 1); Atomics.notify(control, index); };
+    try {
+      const first = start('first');
+      await first('paused');
+      const second = start('second');
+      const competition = await second('competing');
+      resume(0);
+      await first('done');
+      await Promise.race([second('held'), second('done')]);
+      resume(1);
+      const completed = await second('done');
+      if (capacity === 'normal capacity') {
+        expect(completed.survived).toBe(true);
+        expect(readPolicyEvents({ env }).map(event => event.subject).sort()).toEqual(['first', 'second']);
+      } else {
+        // The second writer must recheck size after the first appends. Refuse
+        // its record rather than growing the journal beyond the reader's bound.
+        expect(completed.survived).toBeUndefined();
+        expect(statSync(env.WE_POLICY_EVENTS_FILE).size).toBe(1024 * 1024);
+        expect(readPolicyEvents({ env }).map(event => event.subject)).toEqual(['seed', 'first']);
+      }
+      expect(competition.kind).toBe('contended');
+      expect(() => statSync(lock)).toThrow(/ENOENT/);
+    } finally {
+      resume(0); resume(1);
+      await Promise.all(workers.map(worker => worker.terminate()));
+    }
+  }, 15000);
+
+  it('fails closed on an abandoned generation guard and reports operator cleanup without stopping the daemon', () => {
+    const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
+    writeFileSync(lock, 'stale');
+    utimesSync(lock, 1, 1);
+    const { dev, ino, birthtimeMs } = statSync(lock);
+    const guard = `${lock}.${dev}-${ino}-${birthtimeMs}.reclaim`;
+    writeFileSync(guard, 'abandoned');
+    utimesSync(guard, 1, 1);
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    expect(() => recordPolicyEvent({ event: 'refused' }, env)).not.toThrow();
+    expect(readPolicyEvents({ env })).toEqual([]);
+    expect(readFileSync(lock, 'utf8')).toBe('stale');
+    expect(readFileSync(guard, 'utf8')).toBe('abandoned');
+    expect(warning).toHaveBeenCalledWith(expect.stringMatching(/reclamation guard.*verify no writer.*remove/i));
+  });
+
+  it.each(['new journal', 'missing directories', 'stale lock'])('serializes two child-process appends with %s into intact JSON lines', async kind => {
+    if (kind === 'missing directories') env.WE_POLICY_EVENTS_FILE = join(env.WE_DAEMON_STATE_DIR, 'new/nested/events.jsonl');
+    if (kind === 'stale lock') {
+      writeFileSync(env.WE_POLICY_EVENTS_FILE + '.lock', 'stale');
+      utimesSync(env.WE_POLICY_EVENTS_FILE + '.lock', 1, 1);
+    }
+    const script = `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { recordPolicyEvent } from './scripts/lib/delivery-policy.mjs';
+      const [envText, subject] = process.argv.slice(1);
+      const env = JSON.parse(envText);
+      const original = fs.writeSync;
+      let writes = 0;
+      fs.writeSync = (fd, data, ...args) => {
+        if (String(data).includes('"event":"parallel"')) {
+          if (!fs.existsSync(env.WE_POLICY_EVENTS_FILE + '.lock')) throw Error('unlocked journal write');
+          writes++;
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60);
+        }
+        return original(fd, data, ...args);
+      };
+      syncBuiltinESMExports();
+      recordPolicyEvent({ key: 'mergeGate', event: 'parallel', subject, detail: 'x'.repeat(500) }, env);
+      process.stdout.write(JSON.stringify({ writes }), () => process.exit(0));
+    `;
+    const children = await Promise.all(['one', 'two'].map(subject => promisify(execFile)(process.execPath,
+      ['--input-type=module', '-e', script, JSON.stringify(env), subject],
+      { cwd: resolve('.'), encoding: 'utf8', timeout: 10000, killSignal: 'SIGKILL', maxBuffer: 65536 })));
+    for (const child of children) expect(JSON.parse(child.stdout).writes).toBe(1);
+    const lines = readFileSync(env.WE_POLICY_EVENTS_FILE, 'utf8').trim().split('\n');
+    expect(lines).toHaveLength(2);
+    expect(lines.map(line => JSON.parse(line).subject).sort()).toEqual(['one', 'two']);
+    expect(() => statSync(env.WE_POLICY_EVENTS_FILE + '.lock')).toThrow(/ENOENT/);
+  });
+
+  it('refuses a live lock within a bounded wait without stopping the daemon', () => {
+    const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
+    writeFileSync(lock, 'held');
+    const start = Date.now();
+    expect(() => recordPolicyEvent({ event: 'refused' }, env)).not.toThrow();
+    expect(Date.now() - start).toBeLessThan(2000);
+    expect(readPolicyEvents({ env })).toEqual([]);
+    expect(readFileSync(lock, 'utf8')).toBe('held');
+  });
+
+  it('reclaims an aged lock and removes its own lock after a failed append', () => {
+    const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
+    writeFileSync(lock, 'stale');
+    utimesSync(lock, 1, 1);
+    recordPolicyEvent({ event: 'reclaimed' }, env);
+    expect(readPolicyEvents({ env })).toMatchObject([{ event: 'reclaimed' }]);
+    expect(() => statSync(lock)).toThrow(/ENOENT/);
+    writeFileSync(env.WE_POLICY_EVENTS_FILE, 'x'.repeat(1024 * 1024));
+    expect(() => recordPolicyEvent({ event: 'too-large' }, env)).not.toThrow();
+    expect(statSync(env.WE_POLICY_EVENTS_FILE).size).toBe(1024 * 1024);
+    expect(() => statSync(lock)).toThrow(/ENOENT/);
+  });
+
+  it('refuses a symlink lock without following or removing its target', () => {
+    const target = join(env.WE_DAEMON_STATE_DIR, 'target');
+    writeFileSync(target, 'untouched');
+    symlinkSync(target, env.WE_POLICY_EVENTS_FILE + '.lock');
+    recordPolicyEvent({ event: 'refused' }, env);
+    expect(readPolicyEvents({ env })).toEqual([]);
+    expect(readFileSync(target, 'utf8')).toBe('untouched');
+  });
+
+  it('refuses oversized raw records before writing and exposes the bound to its best-effort caller', () => {
+    expect(() => deliveryPolicy.appendPolicyJournal(env.WE_POLICY_EVENTS_FILE, 'x'.repeat(4097), {
+      allowedRoots: [env.WE_DAEMON_STATE_DIR],
+    })).toThrow(/oversized.*record/i);
+    expect(readPolicyEvents({ env })).toEqual([]);
+  });
+
   it.each(['leaf', 'parent'])('refuses a symlinked journal %s for both append and read', kind => {
     const state = env.WE_DAEMON_STATE_DIR;
     mkdirSync(join(state, 'target'));

@@ -1,7 +1,9 @@
 /** Delivery-flow policy: human-gated values, base-ref isolation, and a best-effort event journal. */
 import { build } from 'esbuild';
+import ts from 'typescript';
 import { execFileSync } from 'node:child_process';
-import { closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readSync, realpathSync, rmSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -20,6 +22,9 @@ export const DELIVERY_POLICY_FAILSAFE = Object.freeze({
 const DEFAULTS_FILE = 'config/deliveryPolicyDefaults.ts';
 const ROOT_FILE = 'webeverything.config.json';
 const MAX_SOURCE_BYTES = 1024 * 1024;
+const MAX_JOURNAL_RECORD_BYTES = 4096;
+const JOURNAL_LOCK_STALE_MS = 30000;
+const JOURNAL_LOCK_ATTEMPTS = 10;
 const domains = {
   prCi: { mainStateParity: ['on', 'off'] },
   mergeGate: { recheckWhenMainMoved: ['if-older-than-N-min', 'always', 'off'], recheckMaxAgeMin: 1, onMainRed: ['halt', 'warn', 'off'] },
@@ -177,6 +182,168 @@ export function policyEventsPath(env = process.env) {
   try { return env.WE_POLICY_EVENTS_FILE || join(defaultLogsDir(env), 'policy-events.jsonl'); } catch { return undefined; }
 }
 
+// Keep the R88 resolver unchanged. Journal descriptors use its confinement rules,
+// then retain directory identities across exclusive creation/open and unlink.
+function journalTarget(path, options) {
+  let trusted;
+  // Another journal writer may create a missing parent during the resolver's
+  // mkdir. Retry that specific race; every attempt repeats the full trust check.
+  for (let attempt = 0; attempt < JOURNAL_LOCK_ATTEMPTS; attempt++) {
+    try { trusted = resolveTrustedConfigPath(path, { ...options, create: true }); break; } catch (error) {
+      if (error.code !== 'EEXIST' || attempt + 1 === JOURNAL_LOCK_ATTEMPTS) throw error;
+    }
+  }
+  const { real } = trusted;
+  const same = (a, b) => a.dev === b.dev && a.ino === b.ino && a.birthtimeMs === b.birthtimeMs;
+  const changed = () => Error('Policy journal path changed during access');
+  const directories = [];
+  for (let parent = dirname(real);; parent = dirname(parent)) {
+    const stat = lstatSync(parent);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw changed();
+    directories.push({ path: parent, stat });
+    if (dirname(parent) === parent) break;
+  }
+  function check(expected) {
+    for (const directory of directories) {
+      const stat = lstatSync(directory.path);
+      if (!stat.isDirectory() || !same(stat, directory.stat)) throw changed();
+    }
+    let stat;
+    try { stat = lstatSync(real); } catch (error) {
+      if (error.code !== 'ENOENT' || expected) throw error;
+      return undefined;
+    }
+    if (!stat.isFile() || stat.isSymbolicLink()) throw changed();
+    if (expected && !same(stat, expected)) throw changed();
+    return stat;
+  }
+  function unlinkExpected(expected, canRemove = () => true) {
+    const current = check();
+    if (!current || !same(current, expected)) return;
+    if (!canRemove(current)) return;
+    try { unlinkSync(real); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  return {
+    check,
+    readOwner(expected) {
+      check(expected);
+      const fd = openSync(real, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      try {
+        const stat = fstatSync(fd);
+        if (!stat.isFile() || !same(stat, expected)) throw changed();
+        // Bound reads even if a lock is replaced or grows during access.
+        const buffer = Buffer.alloc(MAX_JOURNAL_RECORD_BYTES + 1);
+        let length = 0;
+        while (length < buffer.length) {
+          const bytes = readSync(fd, buffer, length, buffer.length - length, length);
+          if (!bytes) break;
+          length += bytes;
+        }
+        check(stat);
+        if (length > MAX_JOURNAL_RECORD_BYTES) throw Error('Oversized policy journal lock; event not recorded. Verify no writer is active before removing the lock.');
+        let owner;
+        try { owner = JSON.parse(buffer.toString('utf8', 0, length)); } catch { return null; }
+        return object(owner) && Number.isSafeInteger(owner.pid) && owner.pid > 0 ? owner : null;
+      } finally { closeSync(fd); }
+    },
+    // Only the exclusive owner removes a generation guard. These guards are
+    // NEVER reclaimed by age: doing so would recreate the check/unlink race.
+    removeOwnedGuard: unlinkExpected,
+    remove(expected, canRemove) {
+      const guardPath = `${real}.${expected.dev}-${expected.ino}-${expected.birthtimeMs}.reclaim`;
+      const guard = journalTarget(guardPath, options);
+      let held;
+      for (let attempt = 0; attempt < JOURNAL_LOCK_ATTEMPTS; attempt++) {
+        try {
+          held = guard.open(constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL);
+          break;
+        } catch (error) {
+          if (error.code !== 'EEXIST') throw error;
+          if (attempt + 1 < JOURNAL_LOCK_ATTEMPTS) {
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(10 * (attempt + 1), 80));
+          }
+        }
+      }
+      if (!held) throw Object.assign(Error(`Policy journal reclamation guard busy: ${guardPath}; event may not be recorded. If abandoned, verify no writer is active, then remove this guard.`), {
+        code: 'POLICY_JOURNAL_RECLAIM_BUSY',
+      });
+      try {
+        // Both normal release and stale reclamation take this generation's
+        // guard. A second remover cannot validate/unlink until the first has
+        // finished, and must then revalidate against any replacement owner.
+        unlinkExpected(expected, canRemove);
+      } finally {
+        try { guard.removeOwnedGuard(held.stat); } finally { closeSync(held.fd); }
+      }
+    },
+    open(flags) {
+      const before = check();
+      const fd = openSync(real, flags | constants.O_NOFOLLOW | constants.O_NONBLOCK
+        | (!before ? constants.O_CREAT | constants.O_EXCL : 0), 0o600);
+      try {
+        const stat = fstatSync(fd);
+        // O_EXCL success proves this is our new lock, even if the previous
+        // holder released between check() and openSync().
+        if (!stat.isFile() || (!(flags & constants.O_EXCL) && before && !same(before, stat))) throw changed();
+        check(stat);
+        return { fd, stat };
+      } catch (error) { closeSync(fd); throw error; }
+    },
+  };
+}
+
+/** Synchronous, bounded best-effort append; recordPolicyEvent absorbs any refusal. */
+export function appendPolicyJournal(path, record, options = {}) {
+  const data = Buffer.from(record);
+  if (data.length > MAX_JOURNAL_RECORD_BYTES) throw Error('Oversized policy journal record; event not recorded');
+  const lock = journalTarget(`${path}.lock`, options);
+  const token = randomUUID();
+  const reclaimable = stat => {
+    if (Date.now() - stat.mtimeMs <= JOURNAL_LOCK_STALE_MS) return false;
+    const owner = lock.readOwner(stat);
+    if (!owner) return true;
+    try { process.kill(owner.pid, 0); } catch (error) { return error.code === 'ESRCH'; }
+    return false;
+  };
+  let held;
+  for (let attempt = 0; attempt < JOURNAL_LOCK_ATTEMPTS; attempt++) {
+    try {
+      held = lock.open(constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL);
+      break;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      const existing = lock.check();
+      if (existing && reclaimable(existing)) {
+        // Recheck age and liveness under the generation's removal guard too.
+        lock.remove(existing, reclaimable);
+      } else if (attempt + 1 < JOURNAL_LOCK_ATTEMPTS) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(10 * (attempt + 1), 80));
+      }
+    }
+  }
+  if (!held) throw Error('Policy journal lock timeout; event not recorded');
+  try {
+    const owner = Buffer.from(JSON.stringify({ pid: process.pid, token }));
+    if (writeSync(held.fd, owner, 0, owner.length, null) !== owner.length) {
+      throw Error('Short policy journal lock write; event not recorded');
+    }
+    // Resolve only after acquiring the lock, including a formerly missing leaf.
+    const journal = journalTarget(path, options);
+    const { fd, stat } = journal.open(constants.O_WRONLY | constants.O_APPEND);
+    try {
+      if (stat.size + data.length > MAX_SOURCE_BYTES) throw Error('Oversized policy journal; event not recorded');
+      if (lock.readOwner(held.stat)?.token !== token) {
+        throw Error('Policy journal lock ownership lost; event not recorded');
+      }
+      if (writeSync(fd, data, 0, data.length, null) !== data.length) {
+        throw Error('Short policy journal write; event incomplete');
+      }
+    } finally { closeSync(fd); }
+  } finally {
+    try { lock.remove(held.stat, stat => lock.readOwner(stat)?.token === token); } finally { closeSync(held.fd); }
+  }
+}
+
 /** Optional env argument keeps callers and fixtures independent of ambient daemon state. */
 export function recordPolicyEvent(input, env = process.env) {
   try {
@@ -192,11 +359,16 @@ export function recordPolicyEvent(input, env = process.env) {
     if (bytes() > 4096) delete event.detail;
     // Non-detail text is bounded too; keep the identity fields even for multibyte input.
     if (bytes() > 4096) event.reason = '…';
-    const journal = resolveTrustedConfigPath(policyEventsPath(env), {
-      allowedRoots: [process.cwd(), daemonStateDir(env), defaultLogsDir(env)], create: true,
+    appendPolicyJournal(policyEventsPath(env), JSON.stringify(event) + '\n', {
+      allowedRoots: [process.cwd(), daemonStateDir(env), defaultLogsDir(env)],
     });
-    journal.append(JSON.stringify(event) + '\n');
-  } catch { /* A failed journal must never stop the daemon. */ }
+  } catch (error) {
+    // Ordinary journal failures remain best effort. An abandoned removal guard
+    // needs operator cleanup; never recursively reclaim it or hide this bound.
+    if (error?.code === 'POLICY_JOURNAL_RECLAIM_BUSY') {
+      try { console.warn(clean(error.message, 1000)); } catch { /* Logging is best effort too. */ }
+    }
+  }
 }
 
 export function readPolicyEvents({ sinceMs = 0, env = process.env } = {}) {
@@ -223,20 +395,150 @@ function resultFrom(defaults) {
   return { ...clone(defaults), sources: Object.fromEntries(Object.entries(defaults).map(([key, fields]) => [key, Object.fromEntries(Object.keys(fields).map(field => [field, 'default']))])), warnings: [], filesRead: [] };
 }
 
+// Policy defaults have no runtime dependencies. This list is code-owned, never
+// sourced from policy/env input, and resolved once when this module loads.
+export const POLICY_DEFAULTS_IMPORT_ALLOW_LIST = Object.freeze([]);
+
+// Pure-data defaults must not reach code constructors or ambient runtime APIs.
+// Match syntax identifiers, never text inside comments or string literals.
+const POLICY_DEFAULTS_FORBIDDEN_IDENTIFIERS = new Set([
+  'eval', 'Function', 'constructor', 'globalThis', 'process', 'require', 'module',
+  'setTimeout', 'setInterval', 'WebAssembly', 'Worker',
+]);
+
+/** Injectable for conformance tests; neither the list nor its resolution map escapes. */
+export function createPolicyImportGuard(allowList = POLICY_DEFAULTS_IMPORT_ALLOW_LIST, resolveImport = specifier => import.meta.resolve(specifier)) {
+  const resolved = new Map(allowList.map(specifier => [specifier, resolveImport(specifier)]));
+  const allowed = new Set([...resolved.keys(), ...resolved.values()]);
+  const refuse = () => { throw Error('Policy defaults runtime import refused; only allow-listed string literals are permitted'); };
+  const literal = node => {
+    if (!node || !ts.isStringLiteral(node) || !allowed.has(node.text)) refuse();
+  };
+  // An identifier denylist alone cannot constrain computed property access.
+  // Permit only data construction, erased types, and the explicit import list.
+  function dataExpression(node) {
+    if (!node) refuse();
+    if (ts.isStringLiteral(node) || ts.isNumericLiteral(node) || ts.isBigIntLiteral(node)
+      || ts.isRegularExpressionLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)
+      || [ts.SyntaxKind.TrueKeyword, ts.SyntaxKind.FalseKeyword, ts.SyntaxKind.NullKeyword].includes(node.kind)) return;
+    if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node)
+      || ts.isTypeAssertionExpression(node) || ts.isSatisfiesExpression(node)) {
+      dataExpression(node.expression);
+      return;
+    }
+    if (ts.isPrefixUnaryExpression(node)
+      && [ts.SyntaxKind.PlusToken, ts.SyntaxKind.MinusToken].includes(node.operator)
+      && (ts.isNumericLiteral(node.operand) || ts.isBigIntLiteral(node.operand))) return;
+    if (ts.isArrayLiteralExpression(node)) {
+      node.elements.forEach(dataExpression);
+      return;
+    }
+    if (ts.isObjectLiteralExpression(node)) {
+      for (const property of node.properties) {
+        if (!ts.isPropertyAssignment(property)
+          || !(ts.isIdentifier(property.name) || ts.isStringLiteral(property.name) || ts.isNumericLiteral(property.name))) refuse();
+        dataExpression(property.initializer);
+      }
+      return;
+    }
+    if (ts.isAwaitExpression(node)) {
+      if (!ts.isCallExpression(node.expression) || node.expression.expression.kind !== ts.SyntaxKind.ImportKeyword) refuse();
+      dataExpression(node.expression);
+      return;
+    }
+    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      if (node.arguments.length !== 1) refuse();
+      literal(node.arguments[0]);
+      return;
+    }
+    refuse();
+  }
+  function dataStatement(node) {
+    if (ts.isVariableStatement(node)) {
+      for (const declaration of node.declarationList.declarations) {
+        if (!ts.isIdentifier(declaration.name)) refuse();
+        dataExpression(declaration.initializer);
+      }
+      return;
+    }
+    // Import validation below retains the code-owned allow-list and type erasure.
+    if (ts.isImportDeclaration(node) || ts.isImportEqualsDeclaration(node)
+      || ts.isTypeAliasDeclaration(node) || ts.isInterfaceDeclaration(node)
+      || ts.isEmptyStatement(node)) return;
+    if (ts.isExportDeclaration(node) && (node.isTypeOnly || node.moduleSpecifier
+      || (node.exportClause && ts.isNamedExports(node.exportClause)))) return;
+    if (ts.isExpressionStatement(node)) {
+      dataExpression(node.expression);
+      return;
+    }
+    refuse();
+  }
+  function check(source) {
+    const ast = ts.createSourceFile('policy.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    if (ast.parseDiagnostics.length) refuse();
+    function visit(node) {
+      if (ts.isImportTypeNode(node)) return; // Erased TS type queries.
+      if (ts.isImportDeclaration(node)) {
+        const clause = node.importClause;
+        const bindings = clause?.namedBindings;
+        if (clause?.isTypeOnly || (!clause?.name && bindings && ts.isNamedImports(bindings)
+          && bindings.elements.length > 0 && bindings.elements.every(binding => binding.isTypeOnly))) return;
+        literal(node.moduleSpecifier);
+      }
+      if (ts.isExportDeclaration(node) && node.moduleSpecifier) {
+        if (node.isTypeOnly) return;
+        literal(node.moduleSpecifier);
+      }
+      if (ts.isImportEqualsDeclaration(node)) {
+        if (node.isTypeOnly) return;
+        if (!ts.isExternalModuleReference(node.moduleReference)) refuse();
+        literal(node.moduleReference.expression);
+      }
+      if (ts.isMetaProperty(node) && node.keywordToken === ts.SyntaxKind.ImportKeyword) refuse();
+      if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+        if (node.arguments.length !== 1) refuse();
+        literal(node.arguments[0]);
+      }
+      // Refuse aliases and member access too, including literal computed members.
+      if (ts.isIdentifier(node) && POLICY_DEFAULTS_FORBIDDEN_IDENTIFIERS.has(node.text)) refuse();
+      if (ts.isElementAccessExpression(node) && ts.isStringLiteral(node.argumentExpression)
+        && POLICY_DEFAULTS_FORBIDDEN_IDENTIFIERS.has(node.argumentExpression.text)) refuse();
+      ts.forEachChild(node, visit);
+    }
+    visit(ast);
+    ast.statements.forEach(dataStatement);
+  }
+  return Object.freeze({
+    check,
+    resolve(specifier) { if (!resolved.has(specifier)) refuse(); return resolved.get(specifier); },
+    async importModule(source) {
+      // Runtime boundary: recheck the exact bytes about to execute, even if a
+      // caller bypassed the source/bundle lint checks.
+      check(source);
+      return import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
+    },
+  });
+}
+const defaultsImportGuard = createPolicyImportGuard();
+
 async function transpileDefaults(source, env) {
   let scratch;
   try {
+    defaultsImportGuard.check(source);
     scratch = mkdtempSync(join(env.TMPDIR || process.env.TMPDIR || tmpdir(), 'delivery-policy-defaults-'));
     const entry = join(scratch, 'deliveryPolicyDefaults.ts');
     writeFileSync(entry, source);
     // The component-tokens pattern: bundle real TS to an in-memory ESM data URL.
-    // Type imports disappear before resolution; any runtime import is an ungated value source.
+    // Scan before bundling (including dead code), and again after transformation.
     const output = await build({ entryPoints: [entry], bundle: true, format: 'esm', platform: 'node', write: false, logLevel: 'silent',
-      plugins: [{ name: 'type-imports-only', setup(builder) {
-        builder.onResolve({ filter: /.*/ }, args => args.kind === 'entry-point' ? undefined : { errors: [{ text: 'Policy defaults permit import type only' }] });
+      plugins: [{ name: 'policy-import-allow-list', setup(builder) {
+        builder.onResolve({ filter: /.*/ }, args => args.kind === 'entry-point' ? undefined
+          : { path: defaultsImportGuard.resolve(args.path), external: true });
       } }],
     });
-    const module = await import('data:text/javascript;base64,' + Buffer.from(output.outputFiles[0].text).toString('base64'));
+    const bundled = output.outputFiles[0].text;
+    defaultsImportGuard.check(bundled);
+    const module = await defaultsImportGuard.importModule(bundled);
     const defaults = module.PLATFORM_DELIVERY_POLICY_DEFAULTS;
     if (!object(defaults) || Object.keys(defaults).length !== Object.keys(domains).length) throw Error('Incomplete defaults');
     for (const [key, fields] of Object.entries(domains)) {
