@@ -2411,36 +2411,3 @@ omissions are reported as truncation. Clone paths must be absolute. The drain ta
 prototype-load settings, not the plist's data clone; tests inject those settings. Matrix and PR table cells strip
 Cc/Cf controls and are width-capped; table mode keeps the truncated-listing warning.
 
-
-### Delegated clearance races
-
-The delegated-clearance suite passes the sweep's actual argv through `runReviewLabelCli`
-with injected forge IO. `clear-human` pins via `--expect-head` plus validated delegation;
-`--new-head` only overrides restamp and delegation scope alone does not pin anything.
-Re-read full comments and PR gates before live clearance; shadow runs need no live read.
-Void memos belong to `repo#pr:rulingId`, surviving head movement and daemon restarts.
-The reconciler composition regression keeps its default PR reader and injects forge transport
-that projects only requested JSON fields. It must reach live clearance with eligible evidence
-and refuse missing or failed gates; testing the expanded reader alone misses caller overrides.
-
-`scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` crosses every label in
-`DELEGATED_CLEARANCE_INELIGIBLE_LABELS`, plus unreadable/malformed labels and failed reads,
-with each admission read after the initial observation: before comment, before swap, and
-(already accepted only) before reassertion. Keep a trusted matching repark marker in these
-fixtures so the reassert write is reachable. Refusal exits 1 and permits no subsequent writes;
-only a refusal before the first write can promise zero writes for the entire invocation.
-The later presentation-only `readLabels` does not authorize writes.
-
-Delegated `runReviewLabelCli` forge-write inventory (including called helpers):
-
-| Write | Reachability / guard |
-| --- | --- |
-| `postComment` in the verdict step | Shared delegated eligibility assertion on its fresh PR read. |
-| `setLabels` in `applySwap` | Same assertion on its independent fresh PR read. |
-| `setLabels` in `reassertHumanClearance` | Already accepted only; same assertion before inspecting the repark marker. Read failure exits 1 for delegation. |
-| `postComment` in `runApprovalPreventionFiling` | Conditional prevention receipt after clearance; reassert refusal exits before this call. |
-
-There are no delegated `addLabels` or `removeLabels` calls. Mechanical handoff's comment,
-two label writes, and `withdrawParkOnLiveClearance`/`restoreClearanceOverRacedPark` are
-restricted to `restampAcrossHold` (`to === 'restamp'`), so delegation cannot reach them.
-Operator clearances keep their existing eligibility and best-effort reassertion behavior.
