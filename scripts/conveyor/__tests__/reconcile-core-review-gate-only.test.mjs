@@ -27,6 +27,36 @@ describe('review-gate-only red belongs to review', () => {
     expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'review' })]);
   });
 
+  it.each(['review:human', 'review:pending'].flatMap(label =>
+    ['test', 'standards', 'test-shard (1)', 'daemon-soak'].map(name => [label, name])))(
+    '%s retains the retry owner for cancelled required %s beside review-gate', (label, name) => {
+      const pull = pr({ labels: [{ name: label }], statusCheckRollup: [
+        ...checks.filter(row => row.name !== name), check(name, 'CANCELLED'),
+      ], timeoutRetry: { eligible: true, infraCancelled: true, repo: 'web-everything/web-everything',
+        pr: 5925, head: HEAD, signature: 'infra', jobs: [{ run: 10, job: 20, attempt: 1 }] },
+      timeoutRetryBudget: { confirmed: 0, rejected: 0, pending: false } });
+      const options = { requiredChecks: [...new Set(['test', 'smoke', name])] };
+      for (const includeGate of [false, true]) {
+        const result = plan({ ...pull, statusCheckRollup: pull.statusCheckRollup
+          .filter(row => includeGate || row.name !== 'review-gate') }, options);
+        expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'ci-timeout-rerun' })]);
+      }
+    });
+
+  it.each(['review:human', 'review:pending'])('%s retains cancelled smoke retry under ci-green timing', label => {
+    const pull = pr({ labels: [{ name: label }],
+      statusCheckRollup: [checks[0], check('smoke', 'CANCELLED'), checks[2]],
+      timeoutRetry: { eligible: true, infraCancelled: true, repo: 'web-everything/web-everything',
+        pr: 5925, head: HEAD, signature: 'infra', jobs: [{ run: 10, job: 20, attempt: 1 }] },
+      timeoutRetryBudget: { confirmed: 0, rejected: 0, pending: false } });
+    expect(plan(pull).dispatch).toEqual([expect.objectContaining({ kind: 'review' })]);
+    for (const includeGate of [false, true]) {
+      const result = plan({ ...pull, statusCheckRollup: pull.statusCheckRollup
+        .filter(row => includeGate || row.name !== 'review-gate') }, { reviewTiming: { startAfter: 'ci-green' } });
+      expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'ci-timeout-rerun' })]);
+    }
+  });
+
   it.each(['test', 'smoke'])('real red %s plus review-gate still dispatches ci-heal', name => {
     const result = plan(pr({ statusCheckRollup: [...checks.filter(row => row.name !== name), check(name, 'FAILURE')] }));
     expect(result.dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-heal' }));
@@ -53,12 +83,12 @@ describe('review-gate-only red belongs to review', () => {
       }
     });
 
-  it.each(['test', 'standards', 'test-shard (1)', 'daemon-soak'])('cancelled required %s refuses review', name => {
+  it.each(['test', 'standards', 'test-shard (1)', 'daemon-soak'])('cancelled required %s retains CI repair and refuses review', name => {
     const result = plan(pr({ statusCheckRollup: [
       ...checks.filter(row => row.name !== name), check(name, 'CANCELLED'),
     ] }), { requiredChecks: ['test', 'smoke', name] });
     expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
-    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci' }));
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal' })]);
   });
 
   it.each(['review:changes', 'advisory:changes'])('%s with cancelled smoke retains a CI repair owner', label => {

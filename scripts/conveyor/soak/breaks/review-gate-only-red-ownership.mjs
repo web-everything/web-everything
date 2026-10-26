@@ -30,7 +30,18 @@ export default {
       { name: 'block ruling', expected: 'fix', over: { blockRuledReferrals: blocked } },
       { name: 'ignored ruling', expected: 'fix', over: { ignoredRulings: { head, misses: 1,
         matches: [{ finding: { file: 'example.mjs' }, ruling: 'block: repair', priorHead: 'b'.repeat(40), misses: 1 }] } } },
-      { name: 'cancelled test', refusal: 'review-ci', over: { statusCheckRollup: rollup.map(row => row.name === 'test' ? check('test', 'CANCELLED') : row) } },
+      { name: 'cancelled test without retry evidence', expected: 'ci-heal',
+        over: { statusCheckRollup: rollup.map(row => row.name === 'test' ? check('test', 'CANCELLED') : row) } },
+      ...['review:human', 'review:pending'].flatMap(label => ['test', 'smoke'].flatMap(cancelled =>
+        [false, true].map(strict => ({ name: `${label} cancelled ${cancelled} strict=${strict}`,
+          expected: cancelled === 'smoke' && !strict ? 'review' : 'ci-timeout-rerun',
+          ...(strict ? { reviewTiming: { startAfter: 'ci-green' } } : {}),
+          over: { labels: [{ name: label }], statusCheckRollup: rollup.map(row =>
+            ['test', 'smoke'].includes(row.name) ? check(row.name, row.name === cancelled ? 'CANCELLED' : 'SUCCESS') : row),
+          timeoutRetry: { eligible: true, infraCancelled: true, repo: 'web-everything/web-everything',
+            pr: pull.number, head, signature: 'infra', jobs: [{ run: 10, job: 20, attempt: 1 }] },
+          timeoutRetryBudget: { confirmed: 0, rejected: 0, pending: false } },
+        })))),
       { name: 'required gate and optional red', refusal: 'review-ci', requiredChecks: ['test', 'smoke', 'review-gate'],
         over: { statusCheckRollup: rollup.map(row => row.name === 'smoke' ? check('smoke') : row).concat(check('optional-ci', 'FAILURE')) } },
     ];
@@ -40,6 +51,7 @@ export default {
         const pr = { ...pull, ...variant.over };
         const requiredChecks = variant.requiredChecks ?? ['test', 'smoke'];
         const plan = planReconcile({ prs: [pr], agents: [], requiredChecks,
+          ...(variant.reviewTiming ? { reviewTiming: variant.reviewTiming } : {}),
           now: Date.parse('2026-10-26T12:00:00Z') + tick * 60000 });
         const kinds = plan.dispatch.map(row => row.kind);
         const safe = variant.expected ? kinds.length === 1 && kinds[0] === variant.expected

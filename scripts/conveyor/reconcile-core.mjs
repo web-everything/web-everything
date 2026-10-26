@@ -2870,7 +2870,7 @@ export function planReconcile({
     const bouncedRealRed = isBouncedRealRed({ pr, phase, check, requiredChecks });
     // At the review-fix cap an unused operator-directed round still belongs to the existing fix path below.
     // Routing it through CI healing would refuse at the cap before that path can carry the allowance.
-    // Ignore cancellations when identifying a review-gate-only failure; required CI still gates review below.
+    // Ignore cancellations when identifying a review-gate-only failure; retain CI repair if review cannot accept them.
     // Inspect all visible checks so a non-required failure still keeps its repair owner.
     const reviewRollup = collapseRollupToLatestPerName(pr?.statusCheckRollup);
     const visibleRealRed = reviewRollup
@@ -2890,17 +2890,21 @@ export function planReconcile({
     // Leave operator-directed repairs to the ruling branches below, including their caps and ladder.
     const reviewGateRulingOwed = reviewGateOnlyRed && (pr?.ignoredRulings?.matches?.length > 0
       || (Array.isArray(pr?.blockRuledReferrals) && pr.blockRuledReferrals.length > 0));
-    // A changes label keeps the existing CI repair owner; it cannot take the review shortcut.
-    const ciRepairOwed = (!reviewGateOnlyRed || (reviewGateHasChanges && !reviewGateRulingOwed)) && (phase === 'ci-red' || (phase === 'needs-human' && (check.state === 'red' || reviewHoldHasRealRed))
-      || (bouncedRealRed && !(sendBackRound && roundAttempts() >= effectiveRoundCap)));
     const cancelledReviewWork = reviewGateOnlyRed && reviewRollup
       .some(row => String(row?.status).toLowerCase() === 'completed' && String(row?.conclusion).toLowerCase() === 'cancelled');
+    // The #5925 exception is only cancelled smoke; other evidence and review timing stay intact.
+    const reviewPr = { ...pr, statusCheckRollup: reviewRollup.map(row =>
+      (row?.name ?? row?.context) === 'smoke' && String(row?.status).toLowerCase() === 'completed' && String(row?.conclusion).toLowerCase() === 'cancelled'
+        ? { ...row, conclusion: 'neutral' } : row) };
+    const cancelledReviewNeedsRepair = cancelledReviewWork && !reviewStartGate({
+      headSha: reviewPr.headRefOid, requiredChecks, checks: reviewPr.statusCheckRollup, policy: reviewPr.reviewTiming,
+    }).allowed;
+    // A rejected cancellation or changes label keeps CI ownership; operator rulings keep their repair ladder.
+    const ciRepairOwed = (!reviewGateOnlyRed || (!reviewGateRulingOwed && (reviewGateHasChanges || cancelledReviewNeedsRepair))) && (phase === 'ci-red' || (phase === 'needs-human' && (check.state === 'red' || reviewHoldHasRealRed))
+      || (bouncedRealRed && !(sendBackRound && roundAttempts() >= effectiveRoundCap)));
     if (reviewGateOnlyRed && !reviewGateHasChanges && !reviewGateRulingOwed
+        && !cancelledReviewNeedsRepair
         && (phase === 'ci-red' || (phase === 'needs-human' && (cancelledReviewWork || check.state !== 'green')))) {
-      // The #5925 exception is only cancelled smoke; other evidence and review timing stay intact.
-      const reviewPr = { ...pr, statusCheckRollup: reviewRollup.map(row =>
-        (row?.name ?? row?.context) === 'smoke' && String(row?.status).toLowerCase() === 'completed' && String(row?.conclusion).toLowerCase() === 'cancelled'
-          ? { ...row, conclusion: 'neutral' } : row) };
       dispatchReviewRow({ pr: reviewPr, requiredChecks, withPhase, base, attempts: roundAttempts(),
         roundCap: effectiveRoundCap, now, refuse, refuseCapExhausted, dispatch });
       continue;
