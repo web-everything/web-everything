@@ -138,7 +138,8 @@ export function rulableBreaks({ comments, labels, pr, head, setting, scope, ruli
   // A later gate action can supersede an operator release. Use the grant-aware reader so stale caps do not reopen it.
   const disposition = readRedTeamDisposition({ comments, repo, pr, head, setting, standingRuling, operatorRulings: scope });
   const blocking = new Set([...disposition.held, ...disposition.sendBack].map((f) => f.index));
-  const rulable = state.result.findings.filter((f) => f.confirmed && (ruled.get(f.index)?.at(-1) !== action || incompleteBlock || (ruling !== 'block' && blocking.has(f.index)))
+  // A repeated block is complete only while it still holds; a later card or clearance lets the operator block again.
+  const rulable = state.result.findings.filter((f) => f.confirmed && (ruled.get(f.index)?.at(-1) !== action || incompleteBlock || (ruling === 'block' ? !blocking.has(f.index) : blocking.has(f.index)))
     && !(ruling === 'card' && !citesCard && carded.has(f.index)));
   if (!rulable.length) throw new Error(`no confirmed red-team break on the live head is left to rule \`${ruling}\` (none confirmed, or each already ruled \`${ruling}\` by the operator on this result)`);
   return { state, atCap, anyState, rulable, noun: `confirmed and not already ruled \`${ruling}\` on the live head` };

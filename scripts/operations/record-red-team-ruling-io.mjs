@@ -214,6 +214,7 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
     const d = readRedTeamDisposition({ comments, repo: p.repo, pr: p.pr, head, setting: p.setting, operatorRulings: p.scope, standingRuling });
     const free = p.indices.filter((i) => !d.held.some((f) => f.index === i) && !d.sendBack.some((f) => f.index === i));
     if (free.length) throw new Error(`the operator-block record was posted but the gate does not hold break(s) ${free.map((i) => `#${i}`).join(', ')}; inspect the thread`);
+    return after;
   };
   /** The derived `red-team:*` label follows the disposition; a failed sync is reported, never fatal (the record is what counts). */
   const resync = (p) => {
@@ -381,12 +382,12 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
       return { ruling: 'not-real', head: p.head, indices: p.indices, cause: p.cause ?? null, labels: resync(p) };
     },
     [RED_TEAM_RULING_BLOCK_EFFECT]: async (p) => {
-      const { labels } = recheck(p);
+      recheck(p);
       // The hold first (adding a hold is always safe): the send-back line re-holds a break an earlier ruling released.
       const record = operatorRecord(p, OPERATOR_BLOCK_OUTCOME, `- ${p.indices.length} confirmed break(s) sent back to the fixer ${indexList(p)}.`);
       post(p.repo, p.pr, record);
       post(p.repo, p.pr, reasonBody(p, 'Blocked: the break(s) go back to the fixer.'));
-      proveHeld(p, record);
+      const { labels } = proveHeld(p, record);
       const alreadyUnderChanges = labelNames(labels).includes('review:changes');
       if (!alreadyUnderChanges) {
         const dir = mkdtempSync(join(tmpdir(), 'red-team-ruling-'));

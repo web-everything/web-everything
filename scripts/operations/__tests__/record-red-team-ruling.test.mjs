@@ -1657,6 +1657,68 @@ describe('block and not-real rulings', () => {
     expect(f.posted[0]).toMatch(/outcome=operator-block result=[0-9a-f]{16} -->/);
     expect(f.posted[0]).toContain('sent back to the fixer (#1)');
   });
+  it('block: can block again after applyRedTeamGate files the finding as card-queued', async () => {
+    const comments = [redTeam(HEAD, [{ summary: 'Degraded recovery', category: 'edge-case',
+      impactIfUnfixed: 'degraded', file: 'backlog/x.md', line: 24, confirmedByRecheck: true }])];
+    const labels = ['review:changes'];
+    let tick = 0;
+    const post = (author, body) => comments.push({ author, body, createdAt: new Date(Date.UTC(2026, 9, 21, 0, 0, tick++)).toISOString() });
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: HEAD, labels: [...labels], comments: [...comments] }),
+      readScope: () => ({ value: { anyState: true } }), readStandingRulingScope: () => null,
+      resolveIdentity: () => OP, post: (_repo, _pr, body) => post(OP, body),
+      appendEvents: async () => {}, syncLabels: () => null,
+    });
+    const replan = () => planRedTeamRuling(read({ comments, labels }), input({ ruling: 'block' }));
+    await expect(sinks[RED_TEAM_RULING_BLOCK_EFFECT](replan())).resolves.toMatchObject({ sentBack: true });
+    expect(() => replan()).toThrow(/already ruled `block`/);
+    await expect(applyRedTeamGate({ repo, pr: PR }, {
+      readPr: () => ({ headRefOid: HEAD, labels, comments }),
+      readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }),
+      fileCard: () => ({ ok: true, session: 'gate-card' }),
+      postComment: ({ body }) => post({ login: 'web-everything' }, body),
+    })).resolves.toMatchObject({ status: 'applied', cardMarker: 'posted' });
+    expect(comments.some(c => c.body.includes('outcome=card-queued'))).toBe(true);
+    expect(readRedTeamDisposition({ comments: operatorBoundComments(comments), repo, pr: PR, head: HEAD,
+      setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } })).toMatchObject({ held: [], sendBack: [] });
+    await expect(sinks[RED_TEAM_RULING_BLOCK_EFFECT](replan())).resolves.toMatchObject({ sentBack: true });
+    expect(readRedTeamDisposition({ comments: operatorBoundComments(comments), repo, pr: PR, head: HEAD,
+      setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } }).sendBack.map(f => f.index)).toEqual([1]);
+  });
+  it.each([[1, true], [2, true], [2, false]])('block: restores review:changes when labels change during POST %s (restore succeeds=%s)', async (changeOnPost, restoreSucceeds) => {
+    const comments = thread(), labelCalls = [];
+    let labels = ['review:changes'], posts = 0;
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: HEAD, labels: [...labels], comments: [...comments] }),
+      readScope: () => ({ value: { anyState: true } }), readStandingRulingScope: () => null,
+      resolveIdentity: () => OP,
+      post: (_repo, _pr, body) => {
+        comments.push({ author: OP, createdAt: '2026-10-20T23:55:00Z', body });
+        if (++posts === changeOnPost) labels = ['review:accepted'];
+      },
+      runSetLabel: (_exe, args) => {
+        labelCalls.push(args);
+        if (!restoreSucceeds) return '{"ok":false,"error":"restoration failed"}';
+        labels = ['review:changes'];
+        return '{"ok":true}';
+      },
+      appendEvents: async () => {}, syncLabels: () => null,
+    });
+    const pending = sinks[RED_TEAM_RULING_BLOCK_EFFECT](payloadFor({ ruling: 'block' }, { labels }));
+    if (!restoreSucceeds) {
+      await expect(pending).rejects.toThrow('restoration failed');
+      expect(labelCalls).toHaveLength(1);
+      expect(labels).toEqual(['review:accepted']);
+      expect(heldAfter(comments).map(f => f.index)).toEqual([1]);
+      return;
+    }
+    const result = await pending;
+    expect(labelCalls).toHaveLength(1);
+    expect(labelCalls[0]).toContain('--to=changes');
+    expect(labels).toEqual(['review:changes']);
+    expect(result).toMatchObject({ sentBack: true });
+    expect(result.alreadyUnderChanges).toBeUndefined();
+  });
   it.each([{ labels: [] }, { labels: ['review:changes'] }])('block: records the send-back in the ledger for labels=%j', async ({ labels }) => {
     const f = fake({ labels });
     await f.sinks[RED_TEAM_RULING_BLOCK_EFFECT](payloadFor({ ruling: 'block' }));
