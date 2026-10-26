@@ -39,7 +39,33 @@ const redMainContext = {
   config: { maxSessions: 3, windowHours: 6, hold: true, rearmAfterMinutes: 120,
     redMainDiscount: 'on', redMainWindows: [{ start: '2026-10-13T21:33:48Z', end: '2026-10-13T23:32:06Z' }] },
 };
-const rerun = [run(1, 'failure', '2026-10-13T22:50:00Z'), run(2, 'success')];
+const rerun = [run(1, 'failure', '2026-10-13T22:50:00Z'), run(2, 'success')]
+  .map((r, i) => ({ ...r, actions: { runId: 700, attempt: i + 1 } }));
+
+it.each(['success', 'cancelled', 'skipped'])(
+  'retains a failed independent same-name job in the same suite beside %s', conclusion => {
+    const jobs = [run(101, 'failure', '2026-10-13T11:59:00Z'),
+      run(102, conclusion, '2026-10-13T12:01:00Z')];
+    const snapshot = pr([{ ...stand(), createdAt: '2026-10-13T12:00:00Z' }]);
+    assertAuthorizationBoundary(args(jobs, { pr: snapshot }), 'hold', /ambiguous.*lineage/);
+  });
+
+it.each(['same-attempt', 'different-run', 'missing', 'zero', 'string', 'duplicate-in-old-attempt'])(
+  'holds ambiguous rerun lineage through the writer: %s', scenario => {
+    const jobs = rerun.map(r => ({ ...r, actions: { ...r.actions } }));
+    if (scenario === 'same-attempt') jobs[1].actions.attempt = 1;
+    if (scenario === 'different-run') jobs[1].actions.runId = 701;
+    if (scenario === 'missing') delete jobs[0].actions;
+    if (scenario === 'zero') jobs[1].actions.attempt = 0;
+    if (scenario === 'string') jobs[1].actions.attempt = '2';
+    if (scenario === 'duplicate-in-old-attempt') jobs.push({ ...jobs[0], id: 3, conclusion: 'success' });
+    for (const context of [undefined, redMainContext]) {
+      assertAuthorizationBoundary(args(jobs, { redMainContext: context }), 'hold', /ambiguous rerun lineage/);
+    }
+  });
+it('orders verified reruns by attempt, independently of check IDs and feed order', () => {
+  assertAuthorizationBoundary(args([{ ...rerun[1], id: 1 }, { ...rerun[0], id: 2 }]), 'auto-proceed');
+});
 
 it('enumerates production dispatch callers and requires explicit R123 permission', () => {
   const scripts = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -365,7 +391,7 @@ it('durably reserves once across passes and distinguishes stand-down IDs', () =>
 it('proves paged check completeness and preserves failed rerun history', () => {
   const runs = Array.from({ length: 101 }, (_, i) => run(i + 1, i ? 'success' : 'failure'));
   const calls = [];
-  const result = readAutoProceedChecks({ repo: 'org/repo', head }, { read: argv => {
+  const result = readAutoProceedChecks({ repo: 'org/repo', head, requiredChecks: [] }, { read: argv => {
     calls.push(argv); return { total_count: 101, check_runs: calls.length === 1 ? runs.slice(0, 100) : runs.slice(100) };
   } });
   expect(result).toEqual(evidence(runs));
@@ -373,6 +399,53 @@ it('proves paged check completeness and preserves failed rerun history', () => {
   expect(result.runs.every(r => r.check_suite.id === 901)).toBe(true);
   expect(calls).toHaveLength(2);
   expect(calls[0][1]).toContain('filter=all');
+});
+
+const apiChecks = () => rerun.map(({ actions, ...r }) => ({ ...r,
+  details_url: `https://github.com/org/repo/actions/runs/700/job/${r.id + 100}` }));
+const apiJob = (r, attempt = r.id) => ({ id: r.id + 100, run_id: 700, run_attempt: attempt,
+  head_sha: head, name: r.name, check_run_url: `https://api.github.com/repos/org/repo/check-runs/${r.id}` });
+it.each([false, true])('binds REST job attempts through classification and posting (independent: %s)', independent => {
+  const runs = apiChecks(), calls = [];
+  const checks = readAutoProceedChecks({ repo: 'org/repo', head, requiredChecks: ['test'] }, { read: argv => {
+    calls.push(argv[1]);
+    if (argv[1].includes('/commits/')) return { total_count: runs.length, check_runs: runs };
+    const r = runs.find(r => argv[1].endsWith(`/jobs/${r.id + 100}`));
+    expect(r).toBeDefined();
+    return apiJob(r, independent ? 1 : r.id);
+  } });
+  expect(calls).toHaveLength(3);
+  assertAuthorizationBoundary(args(checks.runs), independent ? 'hold' : 'auto-proceed',
+    independent ? /ambiguous rerun lineage/ : undefined);
+});
+it.each([
+  ['job ID', { id: 999 }], ['run ID', { run_id: 701 }], ['head', { head_sha: 'b'.repeat(40) }],
+  ['name', { name: 'other' }], ['check binding', { check_run_url: 'https://api.github.com/repos/other/repo/check-runs/1' }],
+  ['attempt missing', { run_attempt: undefined }], ['attempt string', { run_attempt: '2' }],
+  ['attempt zero', { run_attempt: 0 }],
+])('rejects mismatched or missing job lineage: %s', (_name, changes) => {
+  const runs = apiChecks();
+  expect(() => readAutoProceedChecks({ repo: 'org/repo', head }, { read: argv =>
+    argv[1].includes('/commits/') ? { total_count: 2, check_runs: runs } : { ...apiJob(runs[0]), ...changes },
+  })).toThrow(/operator answer required: ambiguous rerun lineage/);
+});
+it.each([undefined, 'https://github.com/other/repo/actions/runs/700/job/101',
+  'https://evil.test/org/repo/actions/runs/700/job/101',
+  'https://github.com/org/repo/actions/runs/700/job/101?redirect=1'])(
+  'rejects unbound details URLs without reading a job: %s', details_url => {
+    const read = vi.fn(() => ({ total_count: 2, check_runs: apiChecks().map(r => ({ ...r, details_url })) }));
+    expect(() => readAutoProceedChecks({ repo: 'org/repo', head }, { read })).toThrow(/ambiguous rerun lineage/);
+    expect(read).toHaveBeenCalledTimes(1);
+  });
+it('bounds lineage reads with an operator fallback at 20 jobs', () => {
+  const runs = Array.from({ length: 21 }, (_, i) => ({ ...run(i + 1, 'success'),
+    details_url: `https://github.com/org/repo/actions/runs/700/job/${i + 101}` }));
+  let reads = 0;
+  expect(() => readAutoProceedChecks({ repo: 'org/repo', head }, { read: argv => {
+    if (argv[1].includes('/commits/')) return { total_count: runs.length, check_runs: runs };
+    return apiJob(runs[reads++]);
+  } })).toThrow(/operator answer required: rerun lineage exceeds 20 job reads/);
+  expect(reads).toBe(20);
 });
 it.each([
   { total_count: 1001, check_runs: [] },

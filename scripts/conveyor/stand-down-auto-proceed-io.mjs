@@ -32,7 +32,7 @@ export function readAutoProceedContext({ repo, defaultBranch = 'main', env = pro
 }
 
 /** Ten pages maximum, with total-count and unique-id proof; filter=all retains earlier failed attempts. */
-export function readAutoProceedChecks({ repo, head }, { read = gh } = {}) {
+export function readAutoProceedChecks({ repo, head, requiredChecks }, { read = gh } = {}) {
   const runs = [];
   let total;
   for (let page = 1; page <= 10; page++) {
@@ -41,10 +41,35 @@ export function readAutoProceedChecks({ repo, head }, { read = gh } = {}) {
       || (total !== undefined && data.total_count !== total) || !Array.isArray(data.check_runs)) throw new Error('operator answer required: incomplete or oversized check feed (1000 run limit)');
     total = data.total_count;
     runs.push(...data.check_runs);
-    if (runs.length === total && new Set(runs.map(r => r.id)).size === total) return { head, complete: true, runs };
+    if (runs.length === total && new Set(runs.map(r => r.id)).size === total) {
+      return { head, complete: true, runs: readRerunLineage(runs, { repo, head, requiredChecks, read }) };
+    }
     if (data.check_runs.length !== 100 || runs.length >= total) break;
   }
   throw new Error('operator answer required: check pagination incomplete');
+}
+
+/** Check-run IDs order creations, not attempts. Bind duplicate names to actual Actions jobs. */
+function readRerunLineage(runs, { repo, head, requiredChecks, read }) {
+  const counts = new Map();
+  for (const r of runs) counts.set(r.name, (counts.get(r.name) ?? 0) + 1);
+  let reads = 0;
+  return runs.map(r => {
+    // Never accept a lineage field from the check feed itself.
+    const { actions: ignored, ...check } = r;
+    if (counts.get(r.name) < 2 || (Array.isArray(requiredChecks) && !requiredChecks.includes(r.name))) return check;
+    const unavailable = () => { throw new Error('operator answer required: ambiguous rerun lineage'); };
+    if (r.app?.slug !== 'github-actions' || typeof r.details_url !== 'string') return unavailable();
+    const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/actions\/runs\/([1-9]\d*)\/job\/([1-9]\d*)$/.exec(r.details_url);
+    if (!match || match[1] !== repo || !Number.isSafeInteger(Number(match[2]))
+      || !Number.isSafeInteger(Number(match[3]))) return unavailable();
+    if (++reads > 20) throw new Error('operator answer required: rerun lineage exceeds 20 job reads');
+    const job = read(['api', `repos/${repo}/actions/jobs/${match[3]}`]);
+    if (job?.id !== Number(match[3]) || job.run_id !== Number(match[2]) || job.head_sha !== head
+      || job.name !== r.name || job.check_run_url !== `https://api.github.com/repos/${repo}/check-runs/${r.id}`
+      || !Number.isSafeInteger(job.run_attempt) || job.run_attempt < 1) return unavailable();
+    return { ...check, actions: { runId: job.run_id, attempt: job.run_attempt } };
+  });
 }
 
 /** Exclusive, durable intent BEFORE the write: crashes/ambiguous responses require operator inspection. */
@@ -111,7 +136,7 @@ export function enrichPrsWithStandDownAutoProceed(prs, { repo, requiredChecks, d
       fresh = { ...pr, comments };
       // Cheap first pass rejects judgment holds without reading checks or main history.
       if (!hasAutoProceedCandidate(fresh)) return fresh;
-      const checks = readChecks({ repo, head: pr.headRefOid });
+      const checks = readChecks({ repo, head: pr.headRefOid, requiredChecks });
       try { context ??= readContext(); } catch { context = null; } // Cases a/b do not depend on main's ledger.
       const scoped = readScopedChecks() ?? DEFAULT_PR_SCOPED_CHECKS;
       const decision = classifyStandDownAutoProceed({ pr: fresh, requiredChecks, checks,
