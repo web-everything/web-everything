@@ -8,7 +8,7 @@ import { tryAcquireNumberingLock, releaseNumberingLockIfOwned } from '../../read
 const collisionRoots = [];
 afterEach(() => collisionRoots.splice(0).forEach((root) => rmSync(root, { recursive: true, force: true })));
 
-function collisionCli(kind, { reservedSource = false, rejectPush = false, offline = false, dense = false } = {}) {
+function collisionCli(kind, { reservedSource = false, rejectPush = false, offline = false, dense = false, noop = false, lastNumber = false } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'collision-cli-')));
   collisionRoots.push(root);
   cpSync('scripts', join(root, 'scripts'), { recursive: true, filter: (p) => basename(p) !== '__tests__' });
@@ -17,7 +17,8 @@ function collisionCli(kind, { reservedSource = false, rejectPush = false, offlin
   mkdirSync(join(root, 'home'));
   mkdirSync(join(root, 'bin'));
   const original = { '074-incoming.md': '---\nkind: task\ntitle: Legacy incoming\n---\nAuthored body\n' };
-  if (kind === 'renumber') original['074-existing.md'] = '---\n---\nKeeper body\n';
+  if (kind === 'renumber' && !noop) original['074-existing.md'] = '---\n---\nKeeper body\n';
+  if (lastNumber) original['99999-last.md'] = '---\n---\nLast supported number\n';
   for (const [name, text] of Object.entries(original)) writeFileSync(join(root, 'backlog', name), text);
   const stateFile = join(root, 'remote.json');
   const refs = Object.fromEntries((dense ? ['075'] : ['075', '077', '079'])
@@ -36,7 +37,11 @@ switch (args[0]) {
   case 'ls-files': break;
   case 'remote': process.stdout.write('origin\\n'); break;
   case 'fetch': if (process.env.COLLISION_OFFLINE === '1') process.exit(1); break;
-  case 'ls-tree': process.stdout.write(process.env.COLLISION_DENSE === '1' ? '' : 'backlog/078-canonical.md\\0'); break;
+  case 'update-ref': break;
+  case 'ls-tree':
+    process.stdout.write(args.includes('published-fixture') ? 'backlog/074-incoming.md\\0backlog/074-existing.md\\0'
+      : args.includes('keeper-fixture') ? 'backlog/074-existing.md\\0'
+      : process.env.COLLISION_DENSE === '1' ? '' : 'backlog/078-canonical.md\\0'); break;
   case 'ls-remote': process.stdout.write(Object.entries(state.refs).map(([ref, oid]) => oid + '\\t' + ref + '\\n').join('')); break;
   case 'hash-object': {
     const raw = fs.readFileSync(0, 'utf8'), oid = crypto.createHash('sha1').update(raw).digest('hex');
@@ -68,6 +73,36 @@ save();
           COLLISION_OFFLINE: offline ? '1' : '0', COLLISION_DENSE: dense ? '1' : '0' } })),
   };
 }
+
+it.each([false, true])('renumber CLI no-op makes no remote call (offline=%s)', (offline) => {
+  const cli = collisionCli('renumber', { noop: true, offline });
+  expect(cli.run()).toEqual({ renumbered: [], writes: 0, deletes: 0, noop: true });
+  expect(cli.state().calls.filter(([command]) => ['remote', 'fetch', 'ls-remote', 'push'].includes(command))).toEqual([]);
+  expect(cli.files()).toEqual(cli.original);
+});
+
+it.each([
+  ['base-owned', ['--base-nums=074']],
+  ['entirely published', ['--onto-ref=published-fixture']],
+  ['base-owned and published', ['--base-nums=074', '--onto-ref=published-fixture']],
+])('renumber CLI skips remote calls for %s duplicate groups', (_kind, flags) => {
+  const cli = collisionCli('renumber', { offline: true });
+  expect(cli.run(flags)).toEqual({ renumbered: [], writes: 0, deletes: 0, noop: true });
+  expect(cli.state().calls.filter(([command]) => ['remote', 'fetch', 'ls-remote', 'push'].includes(command))).toEqual([]);
+  expect(cli.files()).toEqual(cli.original);
+});
+
+it('renumber CLI still checks remote constraints for an incoming collision with a published base keeper', () => {
+  const cli = collisionCli('renumber', { offline: true });
+  expect(() => cli.run(['--base-nums=074', '--onto-ref=keeper-fixture'])).toThrow(/high-water mark unavailable/);
+  expect(cli.state().calls.some(([command]) => command === 'fetch')).toBe(true);
+  expect(cli.files()).toEqual(cli.original);
+});
+
+it('renumber CLI checks collisions without first allocating a local number beyond 99999', () => {
+  const cli = collisionCli('renumber', { lastNumber: true });
+  expect(cli.run()).toMatchObject({ renumbered: [expect.objectContaining({ newNum: '076' })] });
+});
 
 it.each(['yield', 'renumber'])('%s CLI skips reserved and canonical gaps and claims before writing', (kind) => {
   const cli = collisionCli(kind);
@@ -149,7 +184,7 @@ switch(args[0]) {
     claims.forEach(([oid, ref]) => state.refs[ref] = oid); break;
   }
   case 'cat-file': process.stdout.write(state.blobs[args[2]]); break;
-  case 'fetch': case 'ls-tree': break;
+  case 'fetch': case 'ls-tree': case 'update-ref': break;
   default: process.exit(1);
 }
 fs.writeFileSync(file, JSON.stringify(state));

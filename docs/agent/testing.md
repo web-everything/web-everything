@@ -1620,15 +1620,22 @@ Test reserved legacy sources without `bornAs` independently in both planners and
 Exercise `yield` and the renumber CLI with a stub Git transport: reserve destination gaps, include
 a canonical-tree gap, and snapshot every backlog file at push time to prove the claim precedes
 any write or delete. Rejected claims, unavailable evidence, and a full frontier must preserve all
-files; a renumber dry run must neither claim nor write.
+files; a renumber dry run must neither claim nor write. No-op renumber runs (including
+base-owned or entirely published duplicates) must not read remote numbering evidence.
+The allocator suite pins the held-fix-claim refusal before constraint reads or reservation
+pushes, and asserts that reservations survive both failed index rewrites and failed publication.
+It also observes the allocator's log callback for each effective setting and its source.
 Remote-backed gap selection uses current trees and reservation refs, without historical deletion
 evidence; the historical-number reuse policy is tracked in
 #xpg1c2d.
 Canonical tree reads use NUL-delimited paths; cover Unicode, quotes, backslashes and embedded newlines.
 Allocation and replay must obey the five-digit numeric ID grammar, including contention at 99999.
 Numbering evidence reads leave tracking refs unchanged by default: fetch with an empty refmap
-and read `FETCH_HEAD`, so collision healing cannot change a rebuild's parent after its tree was
-computed. Deferred numbering explicitly opts into refreshing tracking before its `bornAs` scan.
+into a unique per-call `refs/tmp/numbering-*` ref without writing `FETCH_HEAD`, then delete the
+private ref in `finally`. Interleaved readers must retain their own trees; failed fetches or
+tree reads must still attempt cleanup. Collision healing cannot change a rebuild's parent
+after its tree was computed. Deferred numbering explicitly opts into refreshing tracking
+before its `bornAs` scan, while reading numeric evidence from its own private ref too.
 Cover a remote main advance during the actual `rebaseDropManifest` collision-healing path and
 assert that the committed parent and tree still describe the same main snapshot.
 Permanent reservation listings use a bounded 32 MiB budget in both the parser and subprocess,

@@ -66,17 +66,23 @@ function readRemoteRefs(git, remote = 'origin') {
  */
 export function readNumberingEvidence(git, remote = 'origin', { refreshTracking = false } = {}) {
   let main;
+  const snapshotRef = `refs/tmp/numbering-${process.pid}-${randomUUID()}`;
   try {
-    if (refreshTracking) git(['fetch', remote, `main:refs/remotes/${remote}/main`]);
-    // An empty refmap also disables the configured remote.fetch mapping: merely
-    // omitting a destination still opportunistically updates origin/main in Git.
-    else git(['fetch', '--no-tags', '--refmap=', remote, 'refs/heads/main']);
-    const paths = String(git(['ls-tree', '-r', '--name-only', '-z',
-      refreshTracking ? `${remote}/main` : 'FETCH_HEAD', '--', 'backlog/'],
-    { maxBuffer: NUMBERING_EVIDENCE_MAX_BYTES }));
-    if (Buffer.byteLength(paths) > NUMBERING_EVIDENCE_MAX_BYTES) throw Error('oversized backlog tree');
-    if (paths && !paths.endsWith('\0')) throw Error('truncated backlog tree');
-    main = numericIds(paths.split('\0').filter(Boolean));
+    try {
+      // Neither FETCH_HEAD nor a tracking ref is private to this reader. Keep
+      // the fetched tree pinned until ls-tree finishes, even across interleaved
+      // reads. An empty refmap disables opportunistic tracking-ref updates.
+      git(['fetch', '--no-tags', '--no-write-fetch-head', '--refmap=', remote,
+        `refs/heads/main:${snapshotRef}`,
+        ...(refreshTracking ? [`main:refs/remotes/${remote}/main`] : [])]);
+      const paths = String(git(['ls-tree', '-r', '--name-only', '-z', snapshotRef, '--', 'backlog/'],
+        { maxBuffer: NUMBERING_EVIDENCE_MAX_BYTES }));
+      if (Buffer.byteLength(paths) > NUMBERING_EVIDENCE_MAX_BYTES) throw Error('oversized backlog tree');
+      if (paths && !paths.endsWith('\0')) throw Error('truncated backlog tree');
+      main = numericIds(paths.split('\0').filter(Boolean));
+    } finally {
+      git(['update-ref', '-d', snapshotRef]);
+    }
   } catch (e) { throw Error(`${remote}/main high-water mark unavailable: ${e.message}`); }
   const refs = readRemoteRefs(git, remote);
   return { main, refs };

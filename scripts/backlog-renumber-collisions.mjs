@@ -40,7 +40,7 @@ import { readdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { planRenumber, parseBacklogFilename } from './backlog/renumber-collisions.mjs';
+import { planRenumber, parseBacklogFilename, findCollisions } from './backlog/renumber-collisions.mjs';
 import { collisionNumberingConstraints, reserveCollisionNumbers } from './lib/card-number-allocator.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -131,18 +131,25 @@ function main() {
   }));
   const base = baseNums();
   const onto = ontoNames();
+  const baseSet = new Set(base);
+  const ontoSet = new Set(onto);
+  // Match the planner's published/base guards without allocating a provisional
+  // number: a local max+1 could be exhausted even when a remote gap is usable.
+  const needsNumber = findCollisions(files).some(({ num, files: group }) => {
+    const hasPublished = group.some(({ name }) => ontoSet.has(name));
+    return hasPublished ? group.some(({ name }) => !ontoSet.has(name)) : !baseSet.has(num);
+  });
+  if (!needsNumber) {
+    if (JSON_MODE) process.stdout.write(JSON.stringify({ renumbered: [], writes: 0, deletes: 0, noop: true }) + '\n');
+    else process.stdout.write(`${GRN}✓${RST} No new-item id collision on the merged tree — no-op.\n`);
+    return 0;
+  }
   const numberingGit = (args, options = {}) => execFileSync('git', args, {
     cwd: ROOT, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
     env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, ...options,
   });
   const constraints = collisionNumberingConstraints(numberingGit);
   const plan = planRenumber(files, { baseNums: base, ontoNames: onto, ...constraints });
-
-  if (plan.collisions.length === 0) {
-    if (JSON_MODE) process.stdout.write(JSON.stringify({ renumbered: [], writes: 0, deletes: 0, noop: true }) + '\n');
-    else process.stdout.write(`${GRN}✓${RST} No new-item id collision on the merged tree — no-op.\n`);
-    return 0;
-  }
 
   if (DRY) {
     if (JSON_MODE) process.stdout.write(JSON.stringify({ dryRun: true, ...planSummary(plan) }) + '\n');
