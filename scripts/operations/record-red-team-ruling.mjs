@@ -7,7 +7,7 @@
  * The ruling binds to the head and result. Preview plans without writing; the sink rechecks
  * before writing and proves release by reading back the human-authored record.
  * Without --card, queues one follow-up through the detached landing job with retry-safe claims.
- * Reader and sink: ./record-red-team-ruling-io.mjs. Block sends back through review-set-label; not-real records an advisory with a required cause.
+ * Reader and sink: ./record-red-team-ruling-io.mjs. Block resumes ledger intent → reason → hold record → review:changes from durable evidence; not-real requires a cause.
  */
 import { createHash } from 'node:crypto';
 import { actionResource } from './action-record.mjs';
@@ -52,6 +52,10 @@ const CARD_PENDING_INTENT_RE = /Operator card ruling pending \(job ([0-9a-f]{12}
 export function cardJobKey({ repo, pr, head, resultId, indices }) {
   return createHash('sha256').update(JSON.stringify(['v1', repo, Number(pr), head, resultId, [...indices].sort((a, b) => a - b)])).digest('hex').slice(0, 12);
 }
+
+/** Stable block identity; ledger event ids add the finding key, and repository scopes the store. */
+export const blockRulingId = ({ pr, head, resultId, indices }) => createHash('sha256')
+  .update(JSON.stringify([Number(pr), head, resultId, [...indices].sort((a, b) => a - b)])).digest('hex');
 
 /** Shared resource: bind the full repo/PR/head/result/break identity into a safe item id. */
 export const rulingCardResource = (p, scope = 'card') => actionResource(p.repo, {
@@ -106,7 +110,7 @@ export function buildRuleReasonComment({ head, ruling, actor, channel, at, reaso
  *   - `anyState` ON (the `redTeam.operatorRulings.anyState` setting, opt-in): ANY confirmed break of the live head's
  *     latest result, whatever the gate did with it (parked at the cap, sent back, or carded), except one whose latest
  *     operator ruling on THIS result is already the same ruling and no later gate action superseded its release.
- *     A block remains retryable until its review:changes transition completes.
+ *     Blocks remain plannable; the sink alone proves completion from ledger, reason, hold record and fresh labels.
  *   - OFF (default): the round-cap restriction. Only a result parked at the round cap, after pending grants are consumed,
  *     and only the breaks the gate still holds for the operator.
  */
@@ -115,33 +119,32 @@ export function rulableBreaks({ comments, labels, pr, head, setting, scope, ruli
   const state = liveResultGateState(comments, pr, head, repo, standingRuling);
   if (!state.result) throw new Error(`no red-team result on the live head ${head.slice(0, 9)} — nothing to rule on`);
   const atCap = state.outcomes.has(GATE_OUTCOMES.ROUND_CAP);
+  const { ruled, carded, blocked } = operatorRulingsOnLiveResult(comments, pr, head);
+  const releasable = f => ruling === 'block' || !blocked.has(f.index);
   if (!anyState) {
     if (!atCap) {
       throw new Error(`the red-team result on head ${head.slice(0, 9)} was not parked at the round cap (no trusted \`round-cap\` gate record decides it); `
         + 'a break that is not at the cap belongs to the gate or the fixer (redTeam.operatorRulings.anyState is off)');
     }
     if (state.reopened) throw new Error('a pending round extension reopened the red-team gate; let the gate consume the grant before ruling on a break');
-    const { carded, ruled } = operatorRulingsOnLiveResult(comments, pr, head);
     // A NEW card filing is never made for a break already carded by anyone, in either mode.
     const held = readRedTeamDisposition({ comments, repo, pr, head, setting, standingRuling, operatorRulings: scope }).held
       .filter((f) => !(ruling === 'card' && !citesCard && carded.has(f.index)))
-      .filter((f) => !(ruling === 'block' && labelNames(labels).includes('review:changes') && ruled.get(f.index)?.at(-1) === 'send-back'));
+      .filter(releasable);
     if (!held.length) throw new Error('no red-team break is held for the operator on the live head (already carded, ruled or cleared)'
-      + (ruling === 'block' ? '; breaks already ruled `block` under review:changes are complete' : ''));
+      + (blocked.size ? '; live operator block takes precedence' : ''));
     return { state, atCap, anyState, rulable: held, noun: 'held for the operator' };
   }
-  const { ruled, carded } = operatorRulingsOnLiveResult(comments, pr, head);
   const action = RULING_ACTION[ruling];
-  const incompleteBlock = ruling === 'block' && !labelNames(labels).includes('review:changes');
   // A NEW card filing is never made for a break already carded by anyone (the gate or an operator); citing an
   // existing card (--card) files nothing, so it may release a finding held again after the latest operator ruling.
   // A later gate action can supersede an operator release. Use the grant-aware reader so stale caps do not reopen it.
   const disposition = readRedTeamDisposition({ comments, repo, pr, head, setting, standingRuling, operatorRulings: scope });
   const blocking = new Set([...disposition.held, ...disposition.sendBack].map((f) => f.index));
-  // A repeated block is complete only while it still holds; a later card or clearance lets the operator block again.
-  const rulable = state.result.findings.filter((f) => f.confirmed && (ruled.get(f.index)?.at(-1) !== action || incompleteBlock || (ruling === 'block' ? !blocking.has(f.index) : blocking.has(f.index)))
+  // Completion is a durable sink check, never inferred from labels alone.
+  const rulable = state.result.findings.filter((f) => f.confirmed && releasable(f) && (ruling === 'block' || ruled.get(f.index)?.at(-1) !== action || blocking.has(f.index))
     && !(ruling === 'card' && !citesCard && carded.has(f.index)));
-  if (!rulable.length) throw new Error(`no confirmed red-team break on the live head is left to rule \`${ruling}\` (none confirmed, or each already ruled \`${ruling}\` by the operator on this result)`);
+  if (!rulable.length) throw new Error(`no confirmed red-team break on the live head is left to rule \`${ruling}\` (none confirmed, or each already ruled \`${ruling}\` by the operator on this result; live operator block takes precedence)`);
   return { state, atCap, anyState, rulable, noun: `confirmed and not already ruled \`${ruling}\` on the live head` };
 }
 
@@ -262,7 +265,7 @@ export function recordRedTeamRulingOperation({ readRulingContext } = {}) {
       reads: ['verdict', 'input.preview'],
       // The sink re-reads the thread and refuses when the selected breaks are no longer held.
       effects: (view) => (view.input.preview ? [] : [{
-        type: view.verdict.effect, idempotent: false,
+        type: view.verdict.effect, idempotent: view.verdict.ruling === 'block',
         payload: {
           repo: view.verdict.repo, pr: view.verdict.pr, head: view.verdict.head, ruling: view.verdict.ruling,
           actor: view.verdict.actor, channel: view.verdict.channel, reason: view.verdict.reason, at: view.verdict.at,

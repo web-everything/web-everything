@@ -34,6 +34,48 @@ const carried = bot([
   result.body.replace(H, N),
 ].join('\n'), '2026-10-21T21:00:00Z');
 
+describe('operator-block held actions (shared reader)', () => {
+  it.each([
+    ['human', 'indexed', human, '- 1 confirmed break(s) NOT sent back: cap (#1).', rid, [1]],
+    ['bot', 'indexed', bot, '- 1 confirmed break(s) NOT sent back: cap (#1).', rid, [1]],
+    ['human', 'legacy unindexed', human, '- 1 confirmed break(s) NOT sent back: cap.', null, [1, 2, 3]],
+    ['bot', 'legacy unindexed', bot, '- 1 confirmed break(s) NOT sent back: cap.', null, [1, 2, 3]],
+  ])('preserves a %s-authored %s hold without a round-cap record', (_author, _format, who, line, id, expected) => {
+    const d = disp([result, gate(who, 'operator-block', line, '2026-10-21T20:30:00Z', id)]);
+    expect(d.held.map(f => f.index)).toEqual(expected);
+    expect(d.sendBack).toEqual([]);
+  });
+
+  it.each([['human', human], ['bot', bot]])('keeps a %s-authored held line at ordinary priority', (_author, who) => {
+    const comments = [result,
+      gate(who, 'operator-block', '- 1 confirmed break(s) NOT sent back: cap (#1).', '2026-10-21T20:30:00Z'),
+      gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:40:00Z')];
+    const d = readRedTeamDisposition({ comments, pr: P, head: H, setting: CONFIRMED_BREAKS_DEFAULTS,
+      operatorRulings: { anyState: true } });
+    expect(d.held).toEqual([]);
+    expect(d.sendBack).toEqual([]);
+  });
+
+  it.each([['human', human], ['bot', bot]])('does not let a %s-authored held line lower an existing human block', (_author, who) => {
+    const comments = [result,
+      gate(human, 'operator-block', '- 1 confirmed break(s) sent back to the fixer (#1).', '2026-10-21T20:20:00Z'),
+      gate(who, 'operator-block', '- 1 confirmed break(s) NOT sent back: cap (#1).', '2026-10-21T20:30:00Z'),
+      gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:40:00Z')];
+    const d = readRedTeamDisposition({ comments, pr: P, head: H, setting: CONFIRMED_BREAKS_DEFAULTS,
+      operatorRulings: { anyState: true } });
+    expect(d.held).toEqual([]);
+    expect(d.sendBack.map(f => f.index)).toEqual([1]);
+  });
+
+  it.each(operatorReleaseLines.flatMap(([format, line]) =>
+    [['human', human], ['bot', bot]].map(([author, who]) => [format, author, line, who])))('ignores %s release lines in a %s-authored block record', (_format, _author, line, who) => {
+    const d = readRedTeamDisposition({ comments: [...live, gate(who, 'operator-block', line, '2026-10-21T20:30:00Z')],
+      pr: P, head: H, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } });
+    expect(d.held.map(f => f.index)).toEqual([1]);
+    expect(d.sendBack).toEqual([]);
+  });
+});
+
 describe('operator card release at the cap (shared reader)', () => {
   it.each([
     ['accepts a trusted human operator-card after a trusted cap', { login: 'chalbert', type: 'User' }, true],

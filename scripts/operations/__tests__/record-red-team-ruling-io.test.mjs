@@ -89,7 +89,7 @@ describe('published backing cards at the production reader and release boundary'
     const io = main();
     const comments = thread(), posted = [];
     const sinks = createRecordRedTeamRulingSinks({ ...io,
-      readThread: () => ({ headRefOid: HEAD, comments: [...comments] }),
+      readThread: () => ({ headRefOid: HEAD, labels: [], comments: [...comments] }),
       readStandingRulingScope: () => null, resolveIdentity: () => OP,
       post: (_repo, _pr, body) => { posted.push(body); comments.push({ author: OP, body }); },
       syncLabels: () => { throw new Error('must remain held'); },
@@ -193,7 +193,7 @@ describe('existing-card IO', () => {
     const comments = thread(), posted = [], resolutions = [], labelSyncs = [];
     const plan = payloadFor();
     const sinks = createRecordRedTeamRulingSinks({
-      readThread: () => ({ headRefOid: HEAD, comments: [...comments] }),
+      readThread: () => ({ headRefOid: HEAD, labels: [], comments: [...comments] }),
       readStandingRulingScope: () => null, resolveIdentity: () => OP,
       resolveCard: (ref, context) => {
         resolutions.push([ref, context, posted.length]);
@@ -218,7 +218,7 @@ describe('existing-card IO', () => {
   it('a throwing syncLabels is warned, not fatal', () => {
     const comments = thread(), posted = [], warnings = [], labelSyncs = [];
     const sinks = createRecordRedTeamRulingSinks({
-      readThread: () => ({ headRefOid: HEAD, comments: [...comments] }),
+      readThread: () => ({ headRefOid: HEAD, labels: [], comments: [...comments] }),
       resolveIdentity: () => OP,
       resolveCard: () => card,
       readStandingRulingScope: () => null,
@@ -305,7 +305,7 @@ describe('existing-card IO', () => {
     const { vi } = await import('vitest');
     const spy = vi.spyOn(await import('../../conveyor/standing-ruling-io.mjs'), 'standingRulingScope').mockReturnValue(scope);
     try {
-      const readThread = () => ({ headRefOid: HEAD, comments });
+      const readThread = () => ({ headRefOid: HEAD, labels: [], comments });
       const context = createRecordRedTeamRulingReader({ assertFresh: () => {}, readThread,
         resolveIdentity: () => OP, resolveCard: () => card, readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }) })(input());
       expect(context.standingRuling).toBe(scope);
@@ -315,14 +315,14 @@ describe('existing-card IO', () => {
       expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/no red-team break is held.*nothing written/);
       expect(posted).toEqual([]);
       expect(spy).toHaveBeenCalledTimes(2);
-      expect(spy).toHaveBeenLastCalledWith({ repo, pr: { number: PR, headRefOid: HEAD, comments } });
+      expect(spy).toHaveBeenLastCalledWith({ repo, pr: { number: PR, headRefOid: HEAD, labels: [], comments } });
     } finally { spy.mockRestore(); }
   });
   it.each(['head', 'standing grant'])('refuses release if the %s changes during the reason POST', variant => {
     let postedReason = false;
     const posted = [], synced = [], resolutions = [];
     const sinks = createRecordRedTeamRulingSinks({
-      readThread: () => ({ headRefOid: postedReason && variant === 'head' ? OTHER : HEAD,
+      readThread: () => ({ headRefOid: postedReason && variant === 'head' ? OTHER : HEAD, labels: [],
         comments: postedReason && variant === 'standing grant' ? standingThread() : thread() }),
       readStandingRulingScope: verifiedScope, resolveIdentity: () => OP,
       resolveCard: (ref, context) => { resolutions.push([ref, context, posted.length]); return card; },
@@ -437,12 +437,12 @@ describe('existing-card IO', () => {
     const next = redTeam(HEAD, [{ summary: 'new break', category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }]);
     next.createdAt = '2026-10-20T23:59:00Z';
     for (const after of [
-      { headRefOid: OTHER, comments: [] },
-      { headRefOid: HEAD, comments: thread() },
-      { headRefOid: HEAD, comments: [...thread(), next] },
+      { headRefOid: OTHER, labels: [], comments: [] },
+      { headRefOid: HEAD, labels: [], comments: thread() },
+      { headRefOid: HEAD, labels: [], comments: [...thread(), next] },
     ]) {
       let n = 0;
-      const sinks = createRecordRedTeamRulingSinks({ readThread: () => n++ < 2 ? { headRefOid: HEAD, comments: thread() } : after,
+      const sinks = createRecordRedTeamRulingSinks({ readThread: () => n++ < 2 ? { headRefOid: HEAD, labels: [], comments: thread() } : after,
         resolveCard: () => card,
         resolveIdentity: () => OP, post: () => {}, warn: () => {}, syncLabels: () => null });
       expect(() => sinks[RED_TEAM_RULING_CARD_EFFECT](payloadFor())).toThrow(/head moved|not in the read-back|result changed/);

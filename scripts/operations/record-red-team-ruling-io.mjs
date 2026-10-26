@@ -15,19 +15,20 @@ import { resolveCardRef } from './record-referral-ruling-io.mjs';
 import { CARD_REF_RE, readCardAtPrHead, referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { trackingRefspec } from '../lib/git-transport-branch.mjs';
 import { assertHumanOperator, isHumanOperatorComment, operatorBoundComments, operatorGhEnv, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createActionStore } from './action-store.mjs';
 import { cardBatchStateDir } from './card-batch-io.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { defaultSpawnDetached } from './detached-dispatch.mjs';
 import { preventionCardLandingLogPath, spawnPreventionLandingJob } from '../lib/prevention-landing-job.mjs';
-import { EVENT_TYPES, buildLedgerEvent } from '../lib/verdict-ledger.mjs';
+import { EVENT_TYPES, buildLedgerEvent, readLedgerEventsFromStore } from '../lib/verdict-ledger.mjs';
 import { appendLedgerEvents } from './record-referral-ruling-io.mjs';
 import { buildGateComment } from './red-team-gate-apply.mjs';
 import { assertOperatorCliFresh } from '../lib/main-staleness.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 import { runCardDedupe, runLandPreventionCardCli } from './land-prevention-card.mjs';
-import { assertRulingCardInputFits, CARD_PENDING_OUTCOME, OPERATOR_BLOCK_OUTCOME, OPERATOR_NOT_REAL_OUTCOME, RED_TEAM_RULING_BLOCK_EFFECT, RED_TEAM_RULING_NOT_REAL_EFFECT, conflictingPendingCardJobs, hasPendingCardIntent, OPERATOR_CARD_OUTCOME, RED_TEAM_RULING_CARD_EFFECT, buildRuleReasonComment, recordRedTeamRulingOperation, rulingCardResource, rulableBreaks } from './record-red-team-ruling.mjs';
+import { blockRulingId, assertRulingCardInputFits, CARD_PENDING_OUTCOME, OPERATOR_BLOCK_OUTCOME, OPERATOR_NOT_REAL_OUTCOME, RED_TEAM_RULING_BLOCK_EFFECT, RED_TEAM_RULING_NOT_REAL_EFFECT, conflictingPendingCardJobs, hasPendingCardIntent, OPERATOR_CARD_OUTCOME, RED_TEAM_RULING_CARD_EFFECT, buildRuleReasonComment, recordRedTeamRulingOperation, rulingCardResource, rulableBreaks } from './record-red-team-ruling.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 /** `gh` under the OPERATOR channel: App tokens removed, so it runs as the operator's own login. */
@@ -157,6 +158,7 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
   coordinationRoot = resolveCoordinationRoot(), actions = createActionStore({ root: coordinationRoot }), fileCard = spawnStableCardJob,
   post = (repo, pr, body) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body, env),
   runSetLabel = execFileSync, appendEvents = appendLedgerEvents,
+  readEvents = repo => readLedgerEventsFromStore(repo, { env }),
   syncLabels = ({ repo, pr, head }) => syncRedTeamStatusLabels({ repo, pr, head, env }),
   warn = (m) => process.stderr.write(`${m}\n`), now = () => new Date().toISOString() } = {}) {
   // An opt-out takes effect on retries too; a later opt-in cannot widen the approved plan.
@@ -169,6 +171,7 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
   const recheck = (p, noWrite = 'nothing written') => {
     assertHumanOperator(resolveIdentity(), p.actor);
     const thread = readThread({ repo: p.repo, pr: p.pr });
+    if (!Array.isArray(thread.labels) || !Array.isArray(thread.comments)) throw new Error('unreadable thread or labels; retry after a complete read');
     const head = String(thread.headRefOid ?? '').toLowerCase();
     if (head !== p.head) throw new Error(`PR #${p.pr}'s head moved to ${head} since the plan (${p.head}); ${noWrite} — re-run against the new head`);
     const comments = operatorBoundComments(thread.comments);
@@ -382,13 +385,43 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
       return { ruling: 'not-real', head: p.head, indices: p.indices, cause: p.cause ?? null, labels: resync(p) };
     },
     [RED_TEAM_RULING_BLOCK_EFFECT]: async (p) => {
-      recheck(p);
-      // The hold first (adding a hold is always safe): the send-back line re-holds a break an earlier ruling released.
-      const record = operatorRecord(p, OPERATOR_BLOCK_OUTCOME, `- ${p.indices.length} confirmed break(s) sent back to the fixer ${indexList(p)}.`);
-      post(p.repo, p.pr, record);
-      post(p.repo, p.pr, reasonBody(p, 'Blocked: the break(s) go back to the fixer.'));
-      const { labels } = proveHeld(p, record);
-      const alreadyUnderChanges = labelNames(labels).includes('review:changes');
+      // Each invocation reconstructs progress; no process-local receipt can stand in for durable facts.
+      p = { ...p, indices: [...p.indices].sort((a, b) => a - b) };
+      let fresh = recheck(p);
+      const rulingId = blockRulingId(p), marker = `<!-- we:red-team-block ruling=${rulingId} -->`;
+      const record = operatorRecord(p, OPERATOR_BLOCK_OUTCOME, `- ${p.indices.length} confirmed break(s) sent back to the fixer ${indexList(p)}.`) + `\n${marker}`;
+      const reason = `${marker}\n${reasonBody(p, 'Blocked: the break(s) go back to the fixer.')}`;
+      const hasReason = comments => comments.filter(isTrustedMarkerAuthor).some(c => isHumanOperatorComment(c)
+        && String(c.body ?? '').startsWith(`${marker}\n**Operator ruling on the post-accept red team: block**`));
+      // Adding a hold is safe: restore it before any ledger or reason failure can strand a released finding.
+      if (!fresh.comments.filter(isTrustedMarkerAuthor).some(c => isHumanOperatorComment(c) && String(c.body ?? '').trim() === record)) {
+        await post(p.repo, p.pr, record);
+      }
+      const intents = p.indices.map(index => ({ ...buildLedgerEvent({ type: EVENT_TYPES.RULING,
+        repo: p.repo, pr: p.pr, at: now(), source: 'record-red-team-ruling', declaredActor: p.actor,
+        channel: p.channel, session: rulingId, findingKey: `red-team:${p.head}:${p.resultId}:${index}`, ruling: 'block' }),
+        id: `rtr-block-${rulingId}-${index}` }));
+      const missingIntents = async () => {
+        const ledger = await readEvents(p.repo);
+        if (ledger?.status !== 'ok' || !Array.isArray(ledger.rows)) throw new Error(`ledger-write-miss: ledger unreadable; retry when readable (${ledger?.error ?? 'incomplete evidence'})`);
+        return intents.filter(e => !ledger.rows.some(row => row.id === e.id && row.repo === p.repo && row.pr === p.pr
+          && row.type === e.type && row.findingKey === e.findingKey && row.ruling === 'block' && row.actor?.session === rulingId));
+      };
+      const missing = await missingIntents();
+      if (missing.length) {
+        recheck(p);
+        try { await appendEvents(missing); }
+        catch (e) { throw new Error(`ledger-write-miss: block intent not confirmed; retry when writable (${e.message})`); }
+        if ((await missingIntents()).length) throw new Error('ledger-write-miss: block intent absent on read-back; retry when readable');
+      }
+      fresh = recheck(p);
+      if (!hasReason(fresh.comments)) {
+        await post(p.repo, p.pr, reason);
+        fresh = recheck(p);
+      }
+      if (!hasReason(fresh.comments)) throw new Error('block reason not in the read-back as a human operator comment; retry');
+      proveHeld(p, record);
+      const alreadyUnderChanges = labelNames(recheck(p).labels).includes('review:changes');
       if (!alreadyUnderChanges) {
         const dir = mkdtempSync(join(tmpdir(), 'red-team-ruling-'));
         try {
@@ -396,7 +429,7 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
           writeFileSync(path, p.sendBackBody, 'utf8');
           let stdout;
           try {
-            stdout = await runSetLabel(process.execPath, [join(root, 'scripts/review-set-label.mjs'), String(p.pr), `--repo=${p.repo}`,
+            stdout = labelNames(recheck(p).labels).includes('review:changes') ? '{"ok":true}' : await runSetLabel(process.execPath, [join(root, 'scripts/review-set-label.mjs'), String(p.pr), `--repo=${p.repo}`,
               '--to=changes', `--body-file=${path}`, `--actor=${p.actor}`, `--channel=${p.channel}`], { encoding: 'utf8', timeout: 120_000 });
           } catch (error) {
             let message;
@@ -407,16 +440,14 @@ export function createRecordRedTeamRulingSinks({ env = process.env, root = REPO_
           if (result.error || result.ok !== true) throw new Error(result.error || 'review-set-label did not confirm the send-back');
         } finally { rmSync(dir, { recursive: true, force: true }); }
       }
-      let ledgerWriteMiss = false;
-      try {
-        await appendEvents([buildLedgerEvent({ type: EVENT_TYPES.SEND_BACK, repo: p.repo, pr: p.pr, at: now(),
-          source: 'record-red-team-ruling', declaredActor: p.actor, channel: p.channel, cause: 'block-ruling' })]);
-      } catch (e) {
-        ledgerWriteMiss = true;
-        warn(`ledger-write-miss: send-back of ${p.repo}#${p.pr} was applied but not recorded in the verdict ledger: ${String(e?.message ?? e)}`);
+      const incompleteIntent = (await missingIntents()).length > 0;
+      recheck(p);
+      const after = proveHeld(p, record);
+      if (!labelNames(after.labels).includes('review:changes') || !hasReason(after.comments) || incompleteIntent) {
+        throw new Error('block incomplete on read-back; retry to resume missing steps');
       }
-      return { ruling: 'block', head: p.head, indices: p.indices, sentBack: true,
-        ...(alreadyUnderChanges ? { alreadyUnderChanges } : {}), ...(ledgerWriteMiss ? { ledgerWriteMiss } : {}), labels: resync(p) };
+      return { ruling: 'block', head: p.head, indices: p.indices, rulingId, sentBack: true,
+        ...(alreadyUnderChanges ? { alreadyUnderChanges } : {}), labels: resync(p) };
     },
   };
 }
