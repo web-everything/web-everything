@@ -35,10 +35,10 @@ describe('checkBornAsCollision', () => {
   it('passes a PR whose new cards are unique on main', () => {
     expect(checkBornAsCollision({ exec: fakeExec({ main: '' }), headSha: sha })).toEqual({ ok: true });
   });
-  it('passes a PR that adds no backlog cards without touching the network', () => {
+  it('passes a PR that adds no backlog cards after refreshing main', () => {
     const exec = fakeExec({ added: [] });
     expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ ok: true });
-    expect(exec.mock.calls.some(([, a]) => a[0] === 'fetch')).toBe(false);
+    expect(exec.mock.calls.map(([, a]) => a[0])).toEqual(['fetch', 'diff']);
   });
   it('catches a hash-named card by its file name when bornAs is not in the text', () => {
     const exec = fakeExec({ added: ['backlog/xgcpm6z-new.md'], texts: { 'backlog/xgcpm6z-new.md': '---\nid: x\n---\n' } });
