@@ -30,7 +30,7 @@ export const CARD_BATCH_ENV = Object.freeze({
 });
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
-const validValue = (key, value) => key === 'batchFiling'
+const validValue = (key, value) => key === 'batchFiling' || key === 'filingEnabled'
   ? typeof value === 'boolean'
   : Number.isSafeInteger(value) && value > 0;
 
@@ -41,7 +41,7 @@ function envLayer(env, keys = CARD_BATCH_SETTING_KEYS, names = CARD_BATCH_ENV) {
   for (const key of keys) {
     const raw = env[names[key]];
     if (raw === undefined || raw === '') continue;
-    if (key === 'batchFiling') layer[key] = raw === '1' || raw === 'true' ? true : raw === '0' || raw === 'false' ? false : raw;
+    if (key === 'batchFiling' || key === 'filingEnabled') layer[key] = raw === '1' || raw === 'true' ? true : raw === '0' || raw === 'false' ? false : raw;
     else layer[key] = /^\d+$/.test(String(raw)) ? Number(raw) : raw;
   }
   return layer;
@@ -95,19 +95,20 @@ export function loadCardBatchSettings({
  * lives in scripts/settings/prevention-batch.json. Lease waiting defaults to 15 minutes here, independently
  * of the policy overlay. Invalid optional values retain the lower layer.
  */
-const PREVENTION_BATCH_SETTING_KEYS = Object.freeze(['batchFiling', 'batchWindowMinutes', 'batchMaxCards', 'batchLeaseWaitMinutes']);
+const PREVENTION_BATCH_SETTING_KEYS = Object.freeze(['batchFiling', 'batchWindowMinutes', 'batchMaxCards', 'batchLeaseWaitMinutes', 'filingEnabled']);
 const PREVENTION_BATCH_ENV = Object.freeze({
   batchFiling: 'WE_PREVENTION_BATCH_FILING',
   batchWindowMinutes: 'WE_PREVENTION_BATCH_WINDOW_MINUTES',
   batchMaxCards: 'WE_PREVENTION_BATCH_MAX_CARDS',
   batchLeaseWaitMinutes: 'WE_PREVENTION_BATCH_LEASE_WAIT_MINUTES',
+  filingEnabled: 'WE_PREVENTION_FILING_ENABLED',
 });
 
 /** PURE: resolve boolean batchFiling and positive integer window/count/lease wait, retaining each source. */
 export function resolvePreventionBatchSettings({ standard, platform, repo, env } = {}) {
   if (!isObject(standard)) throw new TypeError('prevention batch settings: standard prevention policy is required');
   const out = { batchFiling: standard.enabled, batchWindowMinutes: standard.maxAgeMinutes,
-    batchMaxCards: standard.maxCards, batchLeaseWaitMinutes: 15 };
+    batchMaxCards: standard.maxCards, batchLeaseWaitMinutes: 15, filingEnabled: true };
   const sources = Object.fromEntries(PREVENTION_BATCH_SETTING_KEYS.map((k) => [k, 'standard']));
   const invalid = [];
   for (const [name, layer] of [['platform', platform], ['repo', repo],
