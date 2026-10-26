@@ -6,13 +6,49 @@ import { publishStoredRedTeamResult } from '../../lib/red-team-withheld-publish.
 import { describe, expect, it } from 'vitest';
 
 import {
-  defaultListUnpublishedStatuses, LIST_COMMENTS_CAP, carriesAdvisoryLabel, commentsMayBeTruncated, defaultReadPr, sweepAdvisoryLabels as realSweep,
+  defaultListUnpublishedStatuses, LIST_COMMENTS_CAP, carriesAdvisoryLabel, commentsMayBeTruncated, defaultListPrs, defaultReadPr, sweepAdvisoryLabels as realSweep,
 } from '../advisory-label-sweep.mjs';
 
 const rawSweep = (options = {}) => realSweep({ listUnpublishedStatuses: () => [], ...options });
 
 const HEAD = 'fd37ce270'.padEnd(40, 'a');
 const NEW_HEAD = 'b'.repeat(40);
+
+describe('advisory reader field projection', () => {
+  it.each([
+    { name: 'default', fields: undefined, expected: 'number,labels,headRefOid,comments' },
+    { name: 'explicit', fields: 'number,state,statusCheckRollup', expected: 'number,state,statusCheckRollup' },
+  ])('passes $name list fields unchanged to forge argv', ({ fields, expected }) => {
+    const calls = [];
+    const result = defaultListPrs({ repo: 'o/n', fields, exec: (command, argv) => {
+      calls.push({ command, argv });
+      return JSON.stringify([{ number: 7 }]);
+    } });
+    expect(result).toEqual([{ number: 7 }]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].command).toBe('gh');
+    expect(calls[0].argv.slice(0, 4)).toEqual(['pr', 'list', '--state', 'open']);
+    expect(calls[0].argv.slice(-4)).toEqual(['--json', expected, '--repo', 'o/n']);
+  });
+
+  it.each([
+    { name: 'default', fields: undefined, expected: 'number,state,labels,headRefOid' },
+    { name: 'explicit', fields: 'number,state,statusCheckRollup,comments', expected: 'number,state,statusCheckRollup,comments' },
+  ])('passes $name view fields and replaces projected comments with the complete thread', ({ fields, expected }) => {
+    const calls = [];
+    const result = defaultReadPr({ repo: 'o/n', number: 7, fields, exec: (command, argv) => {
+      calls.push({ command, argv });
+      return JSON.stringify({ number: 7, comments: [{ body: 'truncated' }] });
+    }, readComments: (number, options) => {
+      expect(number).toBe(7);
+      expect(options).toEqual({ repo: 'o/n' });
+      return [{ body: 'complete' }];
+    } });
+    expect(calls).toEqual([{ command: 'gh', argv: ['pr', 'view', '7', '--repo', 'o/n', '--json', expected] }]);
+    expect(result).toEqual({ number: 7, comments: [{ body: 'complete' }] });
+  });
+});
+
 const advisory = (head = HEAD, login = 'web-everything') => ({
   body: `**Verdict:** 🚦 human review required\n**Advisory outcome:** \`accept\` — x.\nNet basis: \`${'a'.repeat(40)}..${head}\``,
   createdAt: '2026-09-19T12:00:00Z',

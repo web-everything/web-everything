@@ -9,7 +9,8 @@ vi.mock('../verdict-ledger.mjs', async importOriginal => ({
 
 const head = 'a'.repeat(40);
 
-function run({ evidence, delegated = true, accepted = false, injectAt = 2, repark = false, readError = false }) {
+function run({ evidence, delegated = true, accepted = false, injectAt = 2, repark = false, readError = false,
+  args, movedHead }) {
   const initialLabels = ['review:human', ...(accepted ? ['review:accepted'] : [])];
   const output = [];
   let reads = 0;
@@ -22,8 +23,8 @@ function run({ evidence, delegated = true, accepted = false, injectAt = 2, repar
       const blocked = ++reads >= injectAt;
       events.push(blocked ? 'blocked-read' : 'eligible-read');
       if (blocked && readError) throw new Error('labels unavailable');
-      return { state: 'OPEN', headRefOid: head, comments, body: '',
-        labels: blocked ? evidence : initialLabels };
+      return { state: 'OPEN', headRefOid: blocked && movedHead ? movedHead : head, comments, body: '',
+        labels: blocked && !movedHead ? evidence : initialLabels };
     }),
     readLabels: () => initialLabels,
     setLabels: vi.fn(() => events.push('label-write')),
@@ -38,8 +39,8 @@ function run({ evidence, delegated = true, accepted = false, injectAt = 2, repar
   try {
     runReviewLabelCli({
       argv: ['7', '--repo=o/r', '--to=clear-human', '--actor=operator', '--reason=operator review',
-        ...(delegated ? [`--expect-head=${head}`, '--channel=daemon',
-          '--delegation-json=' + JSON.stringify({ by: 'operator', scope: 'test', expires: '2099-01-01T00:00:00Z' })] : [])],
+        ...(args ?? (delegated ? [`--expect-head=${head}`, '--channel=daemon',
+          '--delegation-json=' + JSON.stringify({ by: 'operator', scope: 'test', expires: '2099-01-01T00:00:00Z' })] : []))],
       allowClearHuman: true, provider, buildComment: buildVerdictComment,
       successResult: result => result, emit: line => output.push(line),
       signalFix: () => {}, fileApprovalPrevention: () => null,
@@ -53,15 +54,58 @@ function run({ evidence, delegated = true, accepted = false, injectAt = 2, repar
 }
 
 describe('delegated clear-human final label guard', () => {
-  // Every admission read after the initial observation, in both write orders.
+  // Every admission read, including the initial observation, in both write orders.
   // The accepted path has a fourth read inside reassertHumanClearance.
   const readBoundaries = [
+    { accepted: false, injectAt: 1, boundary: 'initial observation', priorWrites: [] },
+    { accepted: true, injectAt: 1, boundary: 'initial accepted observation', priorWrites: [] },
     { accepted: false, injectAt: 2, boundary: 'before comment', priorWrites: [] },
     { accepted: false, injectAt: 3, boundary: 'before swap', priorWrites: ['comment-write'] },
     { accepted: true, injectAt: 2, boundary: 'before accepted swap', priorWrites: [] },
     { accepted: true, injectAt: 3, boundary: 'before accepted comment', priorWrites: ['label-write'] },
     { accepted: true, injectAt: 4, boundary: 'before reassert', priorWrites: ['label-write', 'comment-write'] },
   ];
+  const delegation = '--delegation-json=' + JSON.stringify({
+    by: 'operator', scope: 'test', expires: '2099-01-01T00:00:00Z',
+  });
+  it.each([
+    { name: 'short --expect-head', args: ['--expect-head=abcdef0', delegation] },
+    { name: 'empty --expect-head', args: ['--expect-head=', delegation] },
+    { name: 'bare --expect-head', args: ['--expect-head', delegation] },
+    { name: 'non-hex --expect-head', args: [`--expect-head=${'g'.repeat(40)}`, delegation] },
+    { name: 'overlong --expect-head', args: [`--expect-head=${'a'.repeat(41)}`, delegation] },
+    { name: '--new-head', args: [`--expect-head=${head}`, delegation, `--new-head=${head}`] },
+    { name: 'empty --new-head', args: [`--expect-head=${head}`, delegation, '--new-head='] },
+    { name: 'bare --new-head', args: [`--expect-head=${head}`, delegation, '--new-head'] },
+    { name: 'missing --delegation-json', args: [`--expect-head=${head}`] },
+    { name: 'delegated daemon without --expect-head', args: [delegation, '--channel=daemon'] },
+    { name: 'delegation alone without --expect-head', args: [delegation] },
+    { name: 'daemon alone without --expect-head', args: ['--channel=daemon'] },
+    { name: 'normalized daemon without --expect-head', args: ['--channel= DAEMON '] },
+    { name: 'punctuated daemon without --expect-head', args: ['--channel= DAEMON. '] },
+    { name: 'bare delegation without --expect-head', args: ['--delegation-json'] },
+  ])('refuses pinned clear-human with $name before any PR read or write', ({ args }) => {
+    const result = run({ args, injectAt: Infinity });
+    expect(result.exitCode).toBe(2);
+    expect(result.output).toContain('pinned clear-human requires --expect-head=<full 40-hex SHA> and --delegation-json (and no --new-head)');
+    expect(result.provider.readPrState).not.toHaveBeenCalled();
+    expect(result.events).toEqual([]);
+  });
+
+  it.each(readBoundaries)(
+    'refuses a moved head at read $injectAt ($boundary), with no subsequent writes', testCase => {
+      const result = run({ ...testCase, movedHead: 'b'.repeat(40), repark: true });
+      expect(result.exitCode).toBe(1);
+      expect(result.provider.readPrState).toHaveBeenCalledTimes(testCase.injectAt);
+      expect(result.events.slice(result.events.indexOf('blocked-read'))).toEqual(['blocked-read']);
+      expect(result.events.filter(event => event.endsWith('write'))).toEqual(testCase.priorWrites);
+      expect(result.provider.addLabels).not.toHaveBeenCalled();
+      expect(result.provider.removeLabels).not.toHaveBeenCalled();
+      expect(result.output).toContain(testCase.injectAt === 1 ? 'live head differs from --expect-head'
+        : testCase.injectAt === 4 ? 'delegated clearance refused: post-clearance re-check failed'
+          : 'head changed before acceptance; hold retained');
+    },
+  );
   const blockers = [...DELEGATED_CLEARANCE_INELIGIBLE_LABELS.map(label => ({
     label, evidence: ['review:human', { name: label }],
   })),
@@ -106,6 +150,32 @@ describe('delegated clear-human final label guard', () => {
     expect(result.provider.postComment).toHaveBeenCalledOnce();
     expect(result.provider.setLabels).toHaveBeenCalledTimes(2);
   });
+
+  it.each(['not-json', 'null', '{}', '[]'])(
+    'refuses invalid delegation %s before any PR read or write', delegationJson => {
+      const result = run({ args: [`--expect-head=${head}`, `--delegation-json=${delegationJson}`] });
+      expect(result.exitCode).toBe(2);
+      expect(result.output).toContain('--delegation-json');
+      expect(result.events).toEqual([]);
+    },
+  );
+
+  it('accepts a full uppercase expected head after normalization', () => {
+    const result = run({ args: [`--expect-head=${head.toUpperCase()}`, delegation], injectAt: Infinity });
+    expect(result.exitCode).toBe(0);
+    expect(result.provider.postComment).toHaveBeenCalledOnce();
+    expect(result.provider.setLabels).toHaveBeenCalledOnce();
+  });
+
+  it.each(['read failure', 'head movement'])(
+    'preserves operator best-effort reassertion on %s', failure => {
+      const result = run({ delegated: false, accepted: true, repark: true, injectAt: 3,
+        readError: failure === 'read failure', movedHead: failure === 'head movement' ? 'b'.repeat(40) : undefined });
+      expect(result.exitCode).toBe(0);
+      expect(result.provider.postComment).toHaveBeenCalledOnce();
+      expect(result.provider.setLabels).toHaveBeenCalledOnce();
+    },
+  );
 
   it.each([
     ['review:changes', ['review:human', 'review:changes']],

@@ -334,7 +334,8 @@ export function reassertHumanClearance({ provider, repo, pr, headSha, assertElig
   // Validate even when the repark marker is absent or labels are unreadable.
   assertEligible(fresh?.labels);
   try {
-    if (String(fresh.headRefOid).toLowerCase() !== String(headSha).toLowerCase() || !Array.isArray(fresh.labels)) return { reapplied: false };
+    if (String(fresh.headRefOid).toLowerCase() !== String(headSha).toLowerCase()) return { reapplied: false, error: true };
+    if (!Array.isArray(fresh.labels)) return { reapplied: false };
     if (!isHumanSurfacePark({ provider, repo, pr, labels: fresh.labels, headSha, comments: fresh.comments })) return { reapplied: false };
     provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
     return { reapplied: true };
@@ -1197,8 +1198,11 @@ export function runReviewLabelCli({
     fail("invalid --only-if — expected 'accepted' or 'missing'");
   }
   // Delegated clearances pin the observed head; delegation never bypasses operator identity or hold checks.
-  const guardedClearHuman = to === 'clear-human' && expectHeadFlag !== undefined;
-  if (guardedClearHuman && (!/^[0-9a-f]{40}$/.test(expectedHead || '') || newHeadArg
+  const guardedClearHuman = to === 'clear-human' && (expectHeadFlag !== undefined
+    || normalizeChannel(channelArg).toLowerCase() === 'daemon'
+    || argv.some(a => a === '--delegation-json' || a.startsWith('--delegation-json=')));
+  if (guardedClearHuman && (!/^[0-9a-f]{40}$/.test(expectedHead || '')
+    || argv.some(a => a === '--new-head' || a.startsWith('--new-head='))
     || !argv.some(a => a.startsWith('--delegation-json=')))) {
     fail('pinned clear-human requires --expect-head=<full 40-hex SHA> and --delegation-json (and no --new-head)');
   }
