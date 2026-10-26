@@ -414,6 +414,44 @@ describe('R130 delegated clearance', () => {
     const h = harness({ shape: () => scored });
     expect(sweepDelegatedClearance(h)[0].delegated).toBe('sweep-failed'); expect(h.runLabel).not.toHaveBeenCalled();
   });
+  it.each(['eligible', 'missing-advisory-label', 'missing-advisory-evidence', 'missing-red-team-label',
+    'missing-red-team-evidence', 'failed-check', 'missing-checks', 'draft', 'conflict', 'hold', 'confirmed-break',
+    'human-required-shape'])('a missing configured pre-approvals file uses the full R11 gates: %s', evidence => {
+    const dir = mkdtempSync(join(tmpdir(), 'delegated-missing-approval-test-'));
+    try {
+      const file = join(dir, 'configured-pre-approvals.json'), p = pr();
+      // Leave this explicit path absent and use the production reader, rather than injecting a failure.
+      expect(() => readFileSync(file)).toThrow(expect.objectContaining({ code: 'ENOENT' }));
+      if (evidence === 'missing-advisory-label') p.labels = p.labels.filter(l => l !== 'advisory:accepted');
+      if (evidence === 'missing-advisory-evidence') p.comments.shift();
+      if (evidence === 'missing-red-team-label') p.labels = p.labels.filter(l => l !== 'red-team:clear');
+      if (evidence === 'missing-red-team-evidence') p.comments.pop();
+      if (evidence === 'failed-check') p.statusCheckRollup[0].conclusion = 'FAILURE';
+      if (evidence === 'missing-checks') delete p.statusCheckRollup;
+      if (evidence === 'draft') p.isDraft = true;
+      if (evidence === 'conflict') p.mergeable = 'CONFLICTING';
+      if (evidence === 'hold') p.labels.push('operator:hold');
+      if (evidence === 'confirmed-break') p.comments.push(bot(`<!-- we:red-team-advisory pr=5925 rev=${head} -->\n1. [**confirmed**] (security, broken) \`src/a.js:1\` — break`));
+      const h = harness({ prs: [p], shape: vi.fn(() => ({ humanRequired: evidence === 'human-required-shape' })) });
+      h.setting.preApprovalsFile = file;
+      delete h.readPreApprovals;
+      const results = sweepDelegatedClearance(h);
+      if (evidence === 'eligible') {
+        expect(results).toEqual([{ num: 5925, delegated: 'auto-approved', detail: 'cleared' }]);
+        expect(h.runLabel).toHaveBeenCalledOnce();
+        expect(h.runLabel).toHaveBeenCalledWith(expect.objectContaining({ num: 5925, head, approval: undefined,
+          body: expect.stringContaining('R130 / R11') }));
+        expect(h.emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'auto-approved', basis: 'R130 / R11' }));
+        expect(h.readPr).toHaveBeenCalledOnce();
+      } else {
+        expect(results).toEqual([]);
+        expect(h.runLabel).not.toHaveBeenCalled();
+        expect(h.emit).not.toHaveBeenCalled();
+        if (evidence === 'human-required-shape') expect(h.shape).toHaveBeenCalledOnce();
+      }
+      expect(h.readState().observed).toEqual({});
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it('a pre-approval read failure never falls through to R11', () => {
     const h = harness({ readPreApprovals: () => { throw new Error('unreadable'); } });
     expect(sweepDelegatedClearance(h)[0].delegated).toBe('sweep-failed'); expect(h.runLabel).not.toHaveBeenCalled();
