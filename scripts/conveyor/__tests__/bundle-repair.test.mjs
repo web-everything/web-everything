@@ -337,6 +337,24 @@ describe('planReconcile — the escalation path', () => {
   });
 });
 
+describe('planReconcile — deadline enforcement', () => {
+  const c = { cloneKey: KEY, root: ROOT, held: held(60) };
+  const run = (o = {}) => ({ holdId: 'h', cloneKey: KEY, status: 'running', startedAt: NOW - 130 * MIN, deadlineAt: NOW - 10 * MIN, escalations: [], ...o });
+  it('an expired running repair whose wall-time alert was already raised is still ended with reason deadline', () => {
+    const a = planReconcile([run({ escalations: ['wall-time'] })], { clones: [c], now: NOW });
+    expect(a).toEqual([expect.objectContaining({ holdId: 'h', stop: true, status: 'escalated', escalate: 'deadline' })]);
+  });
+  it('an expired running repair on a clone missing from the probe is ended too', () => {
+    const a = planReconcile([run({ escalations: ['wall-time'] })], { clones: [], now: NOW });
+    expect(a[0]).toMatchObject({ status: 'escalated', escalate: 'deadline' });
+  });
+  it('deadline is a tick-raised reason a session cannot record', async () => {
+    const { ESCALATION_REASONS, SESSION_ESCALATION_REASONS } = await import('../bundle-repair-core.mjs');
+    expect(ESCALATION_REASONS).toContain('deadline');
+    expect(SESSION_ESCALATION_REASONS).not.toContain('deadline');
+  });
+});
+
 describe('runBundleRepairs (IO shell, every seam injected)', () => {
   const setup = () => {
     const dir = mkdtempSync(join(tmpdir(), 'bundle-repair-'));
@@ -452,6 +470,22 @@ describe('runBundleRepairs (IO shell, every seam injected)', () => {
     expect(s.escalated).toEqual([{ holdId: reservation.holdId, reason: 'dispatch-failed' }]);
     expect(published).toHaveLength(1);
     expect(readLedger(dir)[0]).toMatchObject({ status: 'dispatch-failed', dispatchRetries: 1, dispatcherSha: 'b'.repeat(40), escalations: ['dispatch-failed'] });
+  });
+
+  it('an expired running repair is ended (endReason deadline), its slot freed and an alert raised, in one pass', async () => {
+    const { dir, published, dispatched, stopped, seams } = setup();
+    const c = clone(60);
+    const stale = { holdId: 'older-hold', cloneKey: KEY, root: ROOT, name: 'review', status: 'running', startedAt: NOW - 130 * MIN,
+      deadlineAt: NOW - 10 * MIN, escalations: ['wall-time'], session: 's1', handle: 'h0' };
+    mkdirSync(join(dir, 'bundle-repair'), { recursive: true });
+    writeFileSync(ledgerPath(dir), JSON.stringify([stale]));
+    const s = await runBundleRepairs({ ...seams, selfSync: [{ cloneKey: KEY, rebuild: { held: c.held } }], ...settings({ maxConcurrent: 1 }) });
+    const e = readLedger(dir).find((x) => x.holdId === 'older-hold');
+    expect(e).toMatchObject({ status: 'escalated', endReason: 'deadline', endedAt: NOW });
+    expect(stopped).toContain('older-hold');
+    expect(s.escalated).toEqual(expect.arrayContaining([{ holdId: 'older-hold', reason: 'deadline' }]));
+    expect(published.length).toBeGreaterThan(0);
+    expect(dispatched).toHaveLength(1);
   });
 
   it('unreadable ledger throws and dispatches nothing even with retry enabled and a known sha', async () => {
