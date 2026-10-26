@@ -1,4 +1,5 @@
 import { RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
+import { proposeHumanRequired } from './direction-aware-human.mjs';
 /**
  * review-escalation.mjs — the DETERMINISTIC drain review-escalation rubric (#2171, under #2162).
  *
@@ -692,6 +693,8 @@ export function scoreEscalation({
   basisNarrowed = true,
   deviation = null,
   humanSurfaces,
+  readOnlyOps = new Set(),
+  directionAwareLive = false,
 } = {}) {
   const resolvedSurfaces = humanSurfaces === undefined ? resolveHumanReviewSurfaces() : normalizeHumanSurfaces(humanSurfaces);
   const t = { ...DEFAULT_THRESHOLDS, ...thresholds };
@@ -763,6 +766,7 @@ export function scoreEscalation({
   }
 
   // Keep one permission-change token so every existing clearance consumer sees the same sensitive holds.
+  const otherHumanForced = humanForced;
   const permissionHits = sensitiveSurfaceHits(gateBasis, fileHunksOf, resolvedSurfaces);
   if (permissionHits.length) {
     humanForced = true;
@@ -850,7 +854,15 @@ export function scoreEscalation({
   // #2635 roster recompute) can select over the SAME honest basis this scored, instead of the own-delta.
   // #3343 — `basisUntrusted` rides the verdict so a consumer (and the human who has to clear a `review:human`)
   // can tell a verdict scored on the PR's own file set from one scored on the base tip. Never a permission.
-  return { humanSurfaces: resolvedSurfaces, escalate: reasons.length > 0, humanRequired: humanForced, careLevel, reasons, signals, basisFiles, basisUntrusted, diffHunks: hunks, diffHunksBasisFiles };
+  let proposal;
+  try {
+    proposal = proposeHumanRequired({ humanRequired: humanForced, otherHumanForced,
+      hits: permissionHits, files: gateBasis, hunksOf: fileHunksOf, readOnlyOps });
+  } catch { proposal = { proposed: humanForced, reason: 'proposal error' }; }
+  return { humanSurfaces: resolvedSurfaces, escalate: reasons.length > 0,
+    humanRequired: directionAwareLive === true ? proposal.proposed : humanForced,
+    humanRequiredProposed: proposal.proposed, humanRequiredProposedReason: proposal.reason,
+    careLevel, reasons, signals, basisFiles, basisUntrusted, diffHunks: hunks, diffHunksBasisFiles };
 }
 
 /**

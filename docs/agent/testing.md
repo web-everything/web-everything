@@ -1,5 +1,35 @@
 # Testing — Three-Tier Strategy
 
+## Direction-aware operation evidence (R131)
+
+Shape shadow evidence must preserve every current file-only shape field; a hunk-cleared hold stays proposed-human as unproven. Diff lines over 2000 characters require human review before parsing expressions.
+
+PR-head modules are untrusted data: never import them into the reviewer process, even in shadow mode.
+Read-only proof uses the reviewer checkout's registry and unchanged declaration plus every runner-imported `-io.mjs` module and their closures, regardless of operation name; new or
+unreadable operations retain human review. `direction-aware-shape.test.mjs` probes a top-level host-write
+attempt in native Node, dependency tampering, and live-mode holds on registry/step-kind changes.
+An operation reference in hunk context never proves allow-list membership: moving a write-capable
+import into `zeroWrites` beside a read-only addition must retain human review in live mode.
+Standalone entries require the nearest nonblank context-or-added neighbours in the same hunk to prove list membership on both sides; zero-context entries retain human review. Total diff text over 200000 characters retains human review with an oversized-diff reason. Removal matching consumes indexed normalized-text buckets while preserving same-hunk ordering.
+Allow-list additions accept only pure single entries, balanced import/registration wiring, or
+balanced re-adds preserving a removed line's bracket counts and executable structure. Replacements
+must be identical apart from indentation, or add only validated read-only members to the same
+complete named array while preserving existing member order and spelling. Replacement evidence
+must be the immediately preceding removed line in the same hunk; matching text elsewhere cannot
+prove control-flow scope. The guard-relocation regression also pins the live-mode human hold.
+Word conservation alone
+cannot prove semantics: the guard-inversion-with-comment regression must retain human review. Other structural
+lines retain human review, as does any net bracket-count change outside pure entries/wiring.
+Every removed allow-list line also needs a distinct added partner in the same hunk, in removal
+order, identical after stripping newly introduced op references from the addition and whitespace
+and commas from both. Unpaired deletions retain human review; the scheduled-sweep quiet-hours
+bypass and duplicate-guard regressions prevent borrowing another guard's replacement.
+The health early-return bypass and removed-bracket regressions pin these fail-closed paths;
+the #5961/#5962 fixture preserves the real import, registration and array-replacement shapes.
+Sandbox tokens anywhere in a hunk and hidden separators/control characters in protection additions
+retain the hold. Missing/invalid tool mode stays shadow even when the platform requests live;
+dependency proof checks regular-file sizes before reads, and shadow event logging waits at most 2s.
+
 ## Established-overlay auto-rebase
 
 Operator withdrawal wins over a detached repair: the worker rechecks its source registration

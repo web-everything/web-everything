@@ -96,6 +96,9 @@ import { CARE_LEVELS, scoreEscalation } from './lib/review-escalation.mjs';
 import { routeReviewShape } from './lib/decision-routing.mjs';
 import { reviewNeedFor } from './lib/review-need.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
+import { resolveDirectionAwareMode } from './lib/direction-aware-human.mjs';
+import { loadReadOnlyOps } from './lib/read-only-ops.mjs';
+import { appendDaemonEvent } from './lib/daemon-events.mjs';
 
 // ── tiny flags parser (matches push-if-green.mjs) ─────────────────────────────────────────────────────
 /**
@@ -517,11 +520,18 @@ function runRigor(flags, asJson) {
  *   mandatoryFloor: string[], subject: string, rounds: number, jurorsPerLens: number, seatLens: string,
  *   escalated: boolean, changedFiles: string[], trail: string[]}}
  */
-export function buildShapePlan({ changedFiles = [], careLevel, commits = null } = {}) {
+export function buildShapePlan({ changedFiles = [], careLevel, commits = null, diffHunks, readOnlyOps } = {}) {
   const files = (Array.isArray(changedFiles) ? changedFiles : [])
     .filter((f) => typeof f === 'string' && f.trim().length > 0)
     .map((f) => f.trim());
-  const escalation = scoreEscalation({ changedFiles: files });
+  const escalation = scoreEscalation({ changedFiles: files, readOnlyOps });
+  // Hunks are shadow evidence only; keep every current shape field on the historical file-only score.
+  const shadow = diffHunks == null ? escalation : scoreEscalation({ changedFiles: files, diffHunks, readOnlyOps });
+  const proposal = !escalation.humanRequired
+    ? { proposed: false, reason: 'not human-required today' }
+    : !shadow.humanRequired
+      ? { proposed: true, reason: 'hunks changed the current decision; unproven' }
+      : { proposed: shadow.humanRequiredProposed, reason: shadow.humanRequiredProposedReason };
   // The score is handed ACROSS so the router does not pay for a second `scoreEscalation` over the same list —
   // and, more importantly, so the reasons printed below and the subject routed here are provably one score.
   const plan = routeReviewShape({ changedFiles: files, escalation, careLevel });
@@ -529,6 +539,8 @@ export function buildShapePlan({ changedFiles = [], careLevel, commits = null } 
     careLevel: plan.careLevel,
     reasons: [...escalation.reasons],
     humanRequired: escalation.humanRequired === true,
+    humanRequiredProposed: proposal.proposed,
+    humanRequiredProposedReason: proposal.reason,
     earnedLenses: [...plan.lenses],
     mandatoryFloor: [...plan.mandatoryLenses],
     subject: plan.subject,
@@ -554,8 +566,13 @@ export function buildShapePlan({ changedFiles = [], careLevel, commits = null } 
  * contradicts. Input is `--files=a,b,c`, or a JSON array / `{changedFiles}` / `{files}` on --file/stdin, so
  * `gh pr view <pr> --json files --jq '[.files[].path]'` pipes in unmodified.
  * Optional `--commits-file` reads a JSON array or `gh pr view --json commits` output for author routing.
+ * R131: `--diff-file` supplies unified hunks; `--ops-root` supplies PR-head dependency bytes for comparison.
+ * Missing evidence preserves the hold. `--pr` records differing shadow proposals best-effort.
  */
-function runShape(flags, asJson) {
+export async function runShape(flags, asJson, {
+  readFile = readFileSync, loadOps = loadReadOnlyOps, resolveMode = resolveDirectionAwareMode,
+  appendEvent = appendDaemonEvent, write = writeAllSync, exit = code => process.exit(code),
+} = {}) {
   let files = [];
   if (typeof flags.files === 'string') files = flags.files.split(',').map((s) => s.trim()).filter(Boolean);
   else {
@@ -592,17 +609,31 @@ function runShape(flags, asJson) {
   }
   let plan;
   try {
-    plan = buildShapePlan({ changedFiles: files, commits, careLevel: typeof flags.careLevel === 'string' ? flags.careLevel : undefined });
+    let diffHunks = null;
+    try { if (typeof flags['diff-file'] === 'string') diffHunks = readFile(flags['diff-file'], 'utf8'); } catch { /* unavailable hunks */ }
+    const readOnlyOps = await loadOps(flags['ops-root']);
+    plan = buildShapePlan({ changedFiles: files, commits, diffHunks, readOnlyOps,
+      careLevel: typeof flags.careLevel === 'string' ? flags.careLevel : undefined });
+    if (resolveMode() === 'live') plan.humanRequired = plan.humanRequiredProposed;
   } catch (e) {
     return fail(String(e && e.message || e), 1);
   }
 
-  if (asJson) {
-    writeAllSync(1, `${JSON.stringify(plan)}\n`);
-    return process.exit(0);
+  if (plan.humanRequired !== plan.humanRequiredProposed && /^\d+$/.test(String(flags.pr ?? ''))) {
+    const pr = Number(flags.pr);
+    let timer;
+    try { await Promise.race([Promise.resolve().then(() => appendEvent({ kind: 'shape-shadow-diff', pr, daemon: 'review-core-cli',
+      detail: { pr, current: plan.humanRequired, proposed: plan.humanRequiredProposed, reason: plan.humanRequiredProposedReason } })),
+      new Promise(resolve => { timer = setTimeout(resolve, 2000); })]);
+    } catch { /* best effort */ } finally { clearTimeout(timer); }
   }
-  writeAllSync(1,
+  if (asJson) {
+    write(1, `${JSON.stringify(plan)}\n`);
+    return exit(0);
+  }
+  write(1,
     `care-level: ${plan.careLevel}   humanRequired: ${plan.humanRequired}   subject: ${plan.subject}\n`
+    + `humanRequiredProposed: ${plan.humanRequiredProposed} (${plan.humanRequiredProposedReason})\n`
     + `earned: ${plan.earnedLenses.length} lens(es) (${plan.earnedLenses.join(', ') || '(none)'}) `
     + `× ${plan.jurorsPerLens} juror(s)/lens × ${plan.rounds} round(s)\n`
     + `tier: ${plan.need.tier} (${plan.need.tierReasons.join('; ')})  tools: ${Object.entries(plan.need.needsTools).map(([lens, tools]) => `${lens}=${tools}`).join(',')}  cross-provider seat: ${plan.need.crossProvider.required ?? 'none'}\n`
@@ -619,7 +650,7 @@ function runShape(flags, asJson) {
         + '  does not seat is a SHORTFALL the verdict must state, not imply away.\n'
       : '  care `none` — the dial asks for no panel at all, so the floor lens is proportionate.\n'),
   );
-  return process.exit(0);
+  return exit(0);
 }
 
 /**
