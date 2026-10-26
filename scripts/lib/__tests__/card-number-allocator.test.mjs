@@ -1,4 +1,6 @@
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,10 +13,13 @@ import { planRenumber } from '../../backlog/renumber-collisions.mjs';
 import { gitBlobOid } from '../git-run.mjs';
 
 const io = vi.hoisted(() => ({ git: null }));
-vi.mock('node:child_process', async (original) => {
-  const actual = await original();
-  return { ...actual, execFileSync: (cmd, args, opts) => io.git && cmd === 'git'
-    ? io.git(args, opts) : actual.execFileSync(cmd, args, opts) };
+beforeEach(() => {
+  // The drain can be loaded through native ESM as well as Vitest's module graph.
+  // Patch the builtin too so every Git call uses this fixture's remote.
+  const exec = childProcess.execFileSync;
+  vi.spyOn(childProcess, 'execFileSync').mockImplementation((cmd, args, opts) => io.git && cmd === 'git'
+    ? io.git(args, opts) : exec(cmd, args, opts));
+  syncBuiltinESMExports();
 });
 vi.mock('../proc-read.mjs', async (original) => {
   const actual = await original();
@@ -55,6 +60,8 @@ function remote() {
 }
 afterEach(() => {
   io.git = null;
+  vi.restoreAllMocks();
+  syncBuiltinESMExports();
   vi.unstubAllEnvs();
   roots.splice(0).forEach((p) => rmSync(p, { recursive: true, force: true }));
 });
@@ -101,6 +108,36 @@ it('legacy numbering holds cards when configured remote evidence is unavailable'
   expect(numberPendingHashes(opts.cwd)).toMatchObject({ assigned: [], committed: false, error: expect.stringContaining('offline') });
   expect(calls.some((args) => ['push', 'hash-object', 'rm', 'add', 'commit'].includes(args[0]))).toBe(false);
   expect(readFileSync(join(opts.cwd, 'backlog/xbbbbbb-other.md'), 'utf8')).toBe('---\n---\nOther\n');
+});
+
+it.each([true, false])('refreshes canonical bornAs before deferred numbering (identical body=%s)', (identical) => {
+  const opts = fixture(); const r = remote(); const calls = [];
+  writeFileSync(join(opts.cwd, 'backlog/074-existing.md'), '---\n---\nExisting\n');
+  writeFileSync(join(opts.cwd, 'backlog/xaaaaaa-same.md'), `---\nkind: task\n---\n${identical ? 'Same' : 'Edited'}\n`);
+  vi.stubEnv('WE_NUMBER_AT_BIRTH', 'off');
+  vi.stubEnv('WE_JIT_READ_SOURCE', 'worktree');
+  let refreshed = false;
+  io.git = (args, extra) => {
+    calls.push(args);
+    if (args[0] === 'remote') return 'origin\n';
+    if (args[0] === 'ls-files') return args[1] === 'backlog/*.md'
+      ? 'backlog/074-existing.md\nbacklog/xaaaaaa-same.md\n' : '';
+    if (args[0] === 'fetch') { refreshed = true; return ''; }
+    if (args[0] === 'ls-tree') return 'backlog/074-existing.md\0backlog/075-same.md\0';
+    if (args[0] === 'grep') return refreshed && args.includes('^bornAs: x[0-9a-z]{6}$')
+      ? 'origin/main:backlog/075-same.md:bornAs: xaaaaaa\n' : '';
+    if (args[0] === 'show') return '---\nbornAs: xaaaaaa\n---\nSame\n';
+    return r.git(args, extra);
+  };
+  const result = numberPendingHashes(opts.cwd, { dryRun: true });
+  expect(result.assigned).toEqual([]);
+  if (identical) expect(result.droppedDuplicates).toEqual([
+    { hash: 'xaaaaaa', stem: 'xaaaaaa-same', existing: 'backlog/075-same.md' },
+  ]);
+  else expect(result.held).toContainEqual(expect.objectContaining({ hash: 'xaaaaaa', reason: expect.stringContaining('body differs') }));
+  expect(calls.findIndex((args) => args[0] === 'fetch')).toBeLessThan(
+    calls.findIndex((args) => args[0] === 'grep' && args.includes('^bornAs: x[0-9a-z]{6}$')));
+  expect(calls.some((args) => ['push', 'hash-object', 'rm', 'add', 'commit'].includes(args[0]))).toBe(false);
 });
 
 it.each(['base', 'merged'])('%s collision planner refuses to move a bornAs identity', (kind) => {

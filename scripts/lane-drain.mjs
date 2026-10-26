@@ -917,6 +917,22 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1 } = {}) {
   // A held card must not be renamed by a STALE ledger entry either (the ledger is append-only and applyLedger
   // swaps the whole of it), so drop any old mapping for it before anything reads the ledger.
   for (const hash of heldHashes) delete ledger[hash];
+  const numberingGit = (args, options = {}) => execFileSync('git', args, {
+    cwd: CWD, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 10_000, maxBuffer: 1024 * 1024,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, ...options,
+  });
+  let remoteNumbering;
+  let numberingEvidence;
+  try {
+    const remotes = String(numberingGit(['remote'])).trim().split('\n').filter(Boolean);
+    remoteNumbering = remotes.includes('origin');
+    if (remotes.length && !remoteNumbering) throw Error('number reservation remote origin unavailable');
+    // Refresh before reading bornAs too: a stale ref can otherwise hide an already-landed
+    // legacy identity without card-ids refs and cause a second number to be reserved for it.
+    if (remoteNumbering) numberingEvidence = readNumberingEvidence(numberingGit);
+  } catch (e) {
+    return finish({ assigned: [], committed: false, error: `number reservation unavailable: ${e.message}` });
+  }
   // xsjn0uf-incident — NEVER MINT A SECOND NUMBER FOR A `bornAs` ALREADY ON MAIN. The `bornAs` hash is the
   // card's identity across its rename; a hash-named copy that re-lands after the card was already numbered
   // (the same card file carried by two PRs, e.g. a card-only PR plus the feature PR that also carried it)
@@ -957,20 +973,6 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1 } = {}) {
   let maxNum = stems.map(idFromName).filter(isNum).reduce((m, n) => Math.max(m, Number(n)), 0);
   maxNum = Math.max(maxNum, minNext - 1);
   const assigned = [];
-  const numberingGit = (args, options = {}) => execFileSync('git', args, {
-    cwd: CWD, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 10_000, maxBuffer: 1024 * 1024,
-    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, ...options,
-  });
-  let remoteNumbering;
-  let numberingEvidence;
-  try {
-    const remotes = String(numberingGit(['remote'])).trim().split('\n').filter(Boolean);
-    remoteNumbering = remotes.includes('origin');
-    if (remotes.length && !remoteNumbering) throw Error('number reservation remote origin unavailable');
-    if (remoteNumbering) numberingEvidence = readNumberingEvidence(numberingGit);
-  } catch (e) {
-    return finish({ assigned: [], committed: false, error: `number reservation unavailable: ${e.message}` });
-  }
   for (const stem of ordered.filter((name) => !heldHashes.has(idFromName(name)) && !dupHashes.has(idFromName(name)))) {
     const hash = idFromName(stem);
     let nnn;

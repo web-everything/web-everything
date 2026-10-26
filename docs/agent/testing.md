@@ -1604,6 +1604,10 @@ Deferred numbering uses the same atomic remote reservations even when birth numb
 With a configured remote, an unavailable canonical tree or reservation listing holds the hash cards;
 only repositories without any remote retain local-only numbering. Test an outstanding birth claim
 against the actual deferred-numbering dry run, and test allocation/replay races through the shared core.
+Refresh canonical evidence before scanning landed `bornAs` identities. Cover a stale checkout
+whose pending hash already landed without reservation refs: identical content deduplicates and
+differing content holds, with no new claim. Fixtures that intercept builtin subprocess calls
+must also reach native ESM imports; restore the builtin and synchronize its exports after each test.
 Both collision planners refuse to move a `bornAs` card or a reserved source number. Remote-backed
 heals skip reserved and canonical numbers, claim all target gaps atomically before rewriting, and
 refuse for manual repair when no safe gap exists. The manual `yield` command uses the same guards,
