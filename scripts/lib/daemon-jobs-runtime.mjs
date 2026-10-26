@@ -34,7 +34,7 @@ import {
   markHeartbeat, markLaunching, markQueued, markRequeued, markSpawned, markStepError, markStopped, markSucceeded,
   planReattach,
 } from './daemon-jobs.mjs';
-import { codeRef, ensureCodeSnapshot, ensureNodeModulesStore, linkNodeModules, nodeModulesRef } from './daemon-job-snapshots.mjs';
+import { codeRef, ensureCodeSnapshot, ensureNodeModulesStore, evictSnapshots, linkNodeModules, nodeModulesRef } from './daemon-job-snapshots.mjs';
 import { TERMINAL_JOB_STATUSES, formatJobHandle, isJobRecord, normalizeProcStart, parseJobHandle } from '../operations/job-record.mjs';
 import { listRunIds, newJobRunRecord, newRunId, runPath, tryReadRun, writeRun } from '../operations/run-store.mjs';
 
@@ -234,10 +234,11 @@ export function spawnDetached({ entryPath, cwd, env, logPath }) {
 }
 
 /**
- * Launch one queued job: prepare its code, stamp `launching` (counting the attempt), spawn it detached.
+ * Launch one queued job: prepare its code, stamp `launching` (counting the attempt), evict idle snapshots
+ * best-effort, spawn it detached.
  * Returns the written record, or `null` when the record was no longer `queued` (someone else got it).
  */
-export function launchJob({ store, id, kindDef, snapshot, now = () => Date.now(), spawnFn = spawnDetached, env = process.env, heartbeatIntervalMs }) {
+export function launchJob({ store, id, kindDef, snapshot, evict = evictSnapshots, now = () => Date.now(), spawnFn = spawnDetached, env = process.env, heartbeatIntervalMs }) {
   const current = store.read(id);
   if (!current || current.job.status !== 'queued') return null;
   let code;
@@ -252,6 +253,12 @@ export function launchJob({ store, id, kindDef, snapshot, now = () => Date.now()
     ? markLaunching(r, { at: iso(now()), launcherPid: process.pid, cwd: code.cwd, snapshotKeys: code.snapshotKeys })
     : null));
   if (!launching) return null;
+  try {
+    const referenced = store.list().records
+      .filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status))
+      .flatMap((r) => r.job.snapshotKeys);
+    evict({ jobsDir: store.dir, referenced });
+  } catch { /* Snapshot cleanup is best-effort; never block a launch. */ }
   const childEnv = {
     ...env,
     OPERATION_RUNS_DIR: store.dir,
