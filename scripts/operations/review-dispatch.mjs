@@ -466,6 +466,7 @@ const REVIEW_CODE_PATH_FILES = new Set([
   'scripts/conveyor/run-rating.mjs', 'scripts/operations/telemetry-store.mjs', 'scripts/conveyor/reconcile-core.mjs',
   'scripts/lib/pid-alive.mjs',
   // Verdict carry and red-team marker helpers are direct dependencies of review-job's acceptance path.
+  'scripts/lib/card-only-head-move.mjs',
   'scripts/lib/rebase-verdict-carry.mjs', 'scripts/lib/red-team-gate.mjs', 'scripts/lib/drain-red-team-evidence.mjs',
   'scripts/lib/red-team-status-labels.mjs',
   // 117 S3b — the review session and the review job now launch / record through the unified worker wrapper.
