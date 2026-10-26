@@ -23,7 +23,7 @@ export default {
     const dir = mkdtempSync(join(tmpdir(), 'soak-ruling-events-'));
     const violations = [], events = [];
     try {
-      const repo = 'web-everything/web-everything', head = 'b'.repeat(40), at = '2026-10-20T12:00:00Z';
+      const repo = 'ruling-fixture/example', head = 'b'.repeat(40), at = '2026-10-20T12:00:00Z';
       const original = { file: 'policy/pointer.md', line: 12, summary: 'policy pointer missing', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
       const runId = 'stale-ruling-report', reviewer = mandatoryReferralReviewer(runId);
       const key = referralFindingKey('judge', original);
