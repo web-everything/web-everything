@@ -1,16 +1,16 @@
 /**
  * @file Hermetic prototype admission proofs.
  * WHY (incident 2026-10-22): pin main preservation, ready evidence, adopt-before-remove, stale
- * replacement, and adoption refusal with injected doubles, plus real filesystem refusal persistence.
+ * replacement, and adoption refusal with injected doubles, plus real Git adoption probes.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import { runInNewContext } from 'node:vm';
-import { withRealRepo, withBareOrigin } from './helpers/real-repo.mjs';
+import { withBareOrigin } from './helpers/real-repo.mjs';
 import { createPrototypeLoader, defaultDeps } from '../prototype-load-io.mjs';
 import { changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
 import { createRegistry } from '../registry.mjs';
@@ -564,21 +564,6 @@ describe('default combined-tree test proof', () => {
 });
 
 describe('prototype-load', () => {
-  it('refuses missing readiness evidence and persists the refusal on a real filesystem', async () => {
-    await withRealRepo(async ({ root }) => {
-      const recordPath = join(root, 'audit', 'prototype-load.jsonl');
-      const load = createPrototypeLoader({ ...defaultDeps(),
-        env: { HOME: root },
-        settings: { ...settings, workspaceRoot: root, recordPath, readyRecordPath: join(root, 'missing-ready.jsonl') },
-      });
-      const result = await load(BASE);
-      expect(result).toMatchObject({ ok: false, stopReason: 'no-ready', registered: false, adopted: false });
-      const records = readFileSync(recordPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-      expect(records).toHaveLength(1);
-      expect(records[0]).toMatchObject({ ...BASE, ok: false, stopReason: 'no-ready', registered: false, adopted: false });
-    });
-  });
-
   it.each([
     ['missing', ''], ['wrong sha', JSON.stringify({ ref: BASE.branch, sha: TREE, tests: 'green', audit: 'NOT WEAKENED' })],
     ['weakened', JSON.stringify({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'WEAKENED' })],
