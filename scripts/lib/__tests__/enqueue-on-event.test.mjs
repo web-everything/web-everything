@@ -132,6 +132,61 @@ describe('pending marks', () => {
   });
 });
 
+describe('overlayRefreshPending', () => {
+  const now = Date.parse('2026-10-26T12:00:00.000Z');
+  const at = (ageMs) => new Date(now - ageMs).toISOString();
+  const overlay = (ageMs) => ({ ref: 'lane/new', addedAt: at(ageMs) });
+  const check = (overlays, rebuildState, extra = {}) => enqueueModule.overlayRefreshPending({ overlays, rebuildState, now, ...extra });
+
+  it('does not wait on a stale build record older than the age bound', () => {
+    expect(check([], { building: { target: 'a'.repeat(40), startedAt: at(3_600_001), pid: 123 } }))
+      .toMatchObject({ pending: false, reason: null });
+    expect(check([], { building: { target: 'a'.repeat(40) } })).toMatchObject({ pending: false });
+  });
+
+  it('reports an active build as pending', () => {
+    expect(check([overlay(1000)], { building: { target: 'a'.repeat(40), startedAt: at(500), pid: 123 } }))
+      .toMatchObject({ pending: true, reason: 'building' });
+  });
+
+  it.each([{}, { adopted: null }, { adopted: {} }, { adopted: { at: at(2000) } }])(
+    'reports a recent overlay newer than the last adoption as pending: %j', (state) => {
+      expect(check([overlay(1000)], state)).toMatchObject({ pending: true, reason: 'unadopted-overlay' });
+    },
+  );
+
+  it('finds an unadopted overlay after an already adopted overlay', () => {
+    expect(check([overlay(3000), overlay(1000)], { adopted: { at: at(2000) } }))
+      .toMatchObject({ pending: true, reason: 'unadopted-overlay' });
+  });
+
+  it('expires an unadopted overlay after the default one-hour bound', () => {
+    expect(check([overlay(3_600_001)], {})).toMatchObject({ pending: false, reason: null });
+  });
+
+  it('honors a custom age bound and resumes catch-up once it expires', () => {
+    expect(check([overlay(999)], {}, { maxAgeMs: 1000 })).toMatchObject({ pending: true, reason: 'unadopted-overlay' });
+    expect(check([overlay(1001)], {}, { maxAgeMs: 1000 })).toMatchObject({ pending: false, reason: null });
+  });
+
+  it.each([1000, 2000])('does not wait for an overlay added at or before adoption (age %i)', (age) => {
+    expect(check([overlay(age)], { adopted: { at: at(1000) } })).toMatchObject({ pending: false, reason: null });
+  });
+
+  it.each(['rejected', 'held', 'quarantine', 'unverified'])('never starves catch-up on a stuck %s state', (field) => {
+    expect(check([overlay(1000)], { [field]: { reason: 'stuck' }, adopted: { at: at(2000) } }))
+      .toMatchObject({ pending: false, reason: null });
+  });
+
+  it.each([null, undefined, 'unreadable'])('does not wait without readable rebuild state: %s', (state) => {
+    expect(check([overlay(1000)], state)).toMatchObject({ pending: false, reason: null });
+  });
+
+  it('does not wait when there are no overlays', () => {
+    expect(check([], {})).toMatchObject({ pending: false, reason: null });
+  });
+});
+
 describe('fast drain helpers', () => {
   it('builds the exact single-PR fast drain arguments', () => {
     expect(fastDrainArgs({ scriptRoot: '/code', num: 42 })).toEqual([
@@ -582,6 +637,38 @@ describe('readCatchUpCandidates', () => {
 });
 
 describe('catch-up handle', () => {
+  it.each(['building', 'unadopted-overlay'])('pauses catch-up before any fast drain and logs the %s reason once', async (reason) => {
+    const { handle, calls, lines } = catchUpSetup({ refreshPending: () => ({ pending: true, reason }) });
+    await handle.catchUp();
+    expect(calls).toEqual([]);
+    const pauses = lines.filter((line) => line.includes('catch-up paused'));
+    expect(pauses).toHaveLength(1);
+    expect(pauses[0]).toContain(reason);
+  });
+
+  it('rechecks refresh state after the first fast drain and pauses the second planned drain', async () => {
+    let refresh = { pending: false, reason: null };
+    const { handle, calls, lines } = catchUpSetup({
+      refreshPending: () => refresh,
+      drainResult: (num) => {
+        refresh = { pending: true, reason: 'unadopted-overlay' };
+        return { considered: 1, toMerge: [{ num }], failed: [], skipReasons: [] };
+      },
+    });
+    await handle.catchUp();
+    expect(calls.map((call) => call.args[1])).toEqual(['--only=42']);
+    const pauses = lines.filter((line) => line.includes('catch-up paused'));
+    expect(pauses).toHaveLength(1);
+    expect(pauses[0]).toContain('unadopted-overlay');
+  });
+
+  it('runs both planned catch-up drains when refresh is not pending', async () => {
+    const { handle, calls, lines } = catchUpSetup({ refreshPending: () => ({ pending: false, reason: null }) });
+    await handle.catchUp();
+    expect(calls.map((call) => call.args[1])).toEqual(['--only=42', '--only=43']);
+    expect(lines.filter((line) => line.includes('catch-up paused'))).toEqual([]);
+  });
+
   it.each([
     ['10 minutes after child end', 10, null, true],
     ['16 minutes after child end', 16, null, false],
