@@ -427,7 +427,11 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     },
     readRedTeamOnlyPayload: ({ pr, repo, head }) => ({ ...readEvidence({ repo, pr, head, env }), head }),
     redTeamSkipCardOnlySetting: () => readRedTeamProbes({ env, log: line => process.stderr.write(`${line}\n`) }).value.skipCardOnly,
-    proveCardOnlyHeadMove: move => proveCardOnlyHeadMove({ ...move, exec, cwd: root }),
+    // Prove in the review lane: prepareLane fetched and pinned the PR head there; the daemon's own clone may lack it.
+    proveCardOnlyHeadMove: ({ lanePath, ...move } = {}) => (typeof lanePath === 'string' && lanePath
+      ? proveCardOnlyHeadMove({ ...move, cwd: lanePath,
+        exec: (file, args, options) => exec(file, args, { ...options, env: laneGitHardeningEnv(env) }) })
+      : { ok: false }),
     // The carry's own resolver is its only source (logged with that source); no timing setting governs it.
     carryAcrossRebaseSetting: () => resolveCarryAcrossRebase({ env, readFile }),
     readCarryEvidence: ({ pr, repo }) => {
@@ -1055,7 +1059,7 @@ function runReviewArc({
       // Re-prove at execution: planner evidence may have changed since dispatch. Never run
       // a model against the old read; this path only settles the card-only policy exemption.
       if (movedCardOnly
-        && io.proveCardOnlyHeadMove?.({ fromSha: loopPayload.findings.read.netBasis.rev, toSha: head })?.ok === true) {
+        && io.proveCardOnlyHeadMove?.({ fromSha: loopPayload.findings.read.netBasis.rev, toSha: head, lanePath })?.ok === true) {
         seatsBox.cardOnlyRecovery = true;
         // This head was proved eligible for settlement, not read by the panel. Retain
         // the original review in its run/status and never copy its verdict onto this head.

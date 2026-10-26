@@ -1449,11 +1449,13 @@ describe('moved card-only skip settlement', () => {
         status: { head: fromSha, status: 'finished', result: 'skipped', skipCardOnly: true } });
     } finally { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); }
   });
-  it('production proveCardOnlyHeadMove uses the factory exec and root for every Git read', () => {
+  it('production proveCardOnlyHeadMove reads every Git object in the review lane with hardened Git env, never the daemon root', () => {
     const root = mkdtempSync(join(tmpdir(), 'moved-card-io-proof-')), fromSha = 'b'.repeat(40);
+    const lanePath = join(root, 'lane');
     const exec = vi.fn((file, args, options) => {
       expect(file).toBe('git');
-      expect(options.cwd).toBe(root);
+      expect(options.cwd).toBe(lanePath);
+      expect(options.env.GIT_NO_LAZY_FETCH).toBe('1');
       if (args[0] === 'merge-base') return '';
       if (args[0] === 'rev-list') return `${head} ${fromSha}`;
       if (args[0] === 'diff-tree') return 'backlog/123-card.md\0';
@@ -1461,9 +1463,14 @@ describe('moved card-only skip settlement', () => {
     });
     try {
       const io = createReviewJobIo({ root, env: { WE_SHARED_RUNS_DIR: join(root, 'runs') }, exec });
-      expect(io.proveCardOnlyHeadMove({ fromSha, toSha: head })).toMatchObject({ ok: true, kind: 'card-only' });
+      expect(io.proveCardOnlyHeadMove({ fromSha, toSha: head, lanePath })).toMatchObject({ ok: true, kind: 'card-only' });
       expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['diff-tree', '--no-renames', head]),
-        expect.objectContaining({ cwd: root, timeout: 10_000, maxBuffer: 1024 * 1024 }));
+        expect.objectContaining({ cwd: lanePath, timeout: 10_000, maxBuffer: 1024 * 1024 }));
+      exec.mockClear();
+      for (const missing of [undefined, '', null]) {
+        expect(io.proveCardOnlyHeadMove({ fromSha, toSha: head, lanePath: missing })).toEqual({ ok: false });
+      }
+      expect(exec).not.toHaveBeenCalled();
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
   it('production proveCardOnlyHeadMove proves a real numbering move that rewrites a doc reference with its default reader', () => {
@@ -1485,8 +1492,12 @@ describe('moved card-only skip settlement', () => {
       const toSha = commit('drain: JIT-number xabcdef→#7001 at land (#2288)');
       // The planner's reader proves it; the job's default reader must reach the same verdict.
       expect(proveCardOnlyHeadMove({ exec: execFileSync, cwd: root, fromSha, toSha })).toMatchObject({ ok: true, commits: [toSha] });
-      const io = createReviewJobIo({ root, env: { WE_SHARED_RUNS_DIR: join(root, 'runs') } });
-      expect(io.proveCardOnlyHeadMove({ fromSha, toSha })).toMatchObject({ ok: true, commits: [toSha] });
+      // The daemon root is a different (non-repo) directory: the proof must read the lane, where the head was fetched.
+      const daemonRoot = mkdtempSync(join(tmpdir(), 'moved-card-io-daemon-'));
+      try {
+        const io = createReviewJobIo({ root: daemonRoot, env: { ...process.env, WE_SHARED_RUNS_DIR: join(daemonRoot, 'runs') } });
+        expect(io.proveCardOnlyHeadMove({ fromSha, toSha, lanePath: root })).toMatchObject({ ok: true, commits: [toSha] });
+      } finally { rmSync(daemonRoot, { recursive: true, force: true }); }
       expect(Buffer.isBuffer(execReadRaw('git', ['cat-file', 'blob', `${toSha}:docs/agent/testing.md`], { cwd: root, encoding: null })))
         .toBe(true);
       expect(execReadRaw('git', ['rev-parse', 'HEAD'], { cwd: root }).trim()).toBe(toSha);
@@ -1503,7 +1514,7 @@ describe('moved card-only skip settlement', () => {
     } } };
     const exec = vi.fn((file, args, options) => {
       expect(file).toBe('git');
-      expect(options.cwd).toBe(dir);
+      expect(options.cwd).toBe('/lanes/lane-7');
       if (args[0] === 'merge-base') return '';
       if (args[0] === 'rev-list') return `${head} ${fromSha}`;
       if (args[0] === 'diff-tree') return 'backlog/123-card.md\0';
@@ -1555,7 +1566,7 @@ describe('moved card-only skip settlement', () => {
       expect(comments).toHaveLength(1);
       expect(comments[0].body).toContain(redTeamMarker(pr, head));
       expect(plan()).toMatchObject({ action: 'skip', why: 'red-team result already on head' });
-      expect(io.proveCardOnlyHeadMove).toHaveBeenCalledWith({ fromSha, toSha: head });
+      expect(io.proveCardOnlyHeadMove).toHaveBeenCalledWith({ fromSha, toSha: head, lanePath: '/lanes/lane-7' });
       expect(io.runRedTeam).not.toHaveBeenCalled();
       expect(io.runLoop).not.toHaveBeenCalled();
       expect(readRedTeamStatus({ repo, pr, head, env })).toMatchObject({ status: 'finished',
