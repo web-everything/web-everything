@@ -77,7 +77,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  * `release --lane=N --release-reserved`. (NOTE: this script only PROVISIONS the reserved lane; the live repoint
  * of the machine-global `~/.claude/…/memory` symlink at it is the SUPERVISED, human-gated half of #2350.)
  */
-import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomBytes } from 'node:crypto';
@@ -368,6 +368,8 @@ function resolveRepo(repoFlags = flags) {
     || (cmd === 'list' && repoFlags.acquirable);
   // GC and release can maintain leases without a trusted origin, but recovery must never forward a lane remote.
   let canonicalOrigin = true;
+  let smokeOrigin = null;
+  let originBase = topLevel;
   if (!repoFlags.origin && (needsOrigin || cmd === 'gc' || cmd === 'release')) {
     const poolRoots = [resolve(POOL_ROOT), resolveReal(POOL_ROOT)];
     // A linked worktree outside the pool still shares its owner's config (and remote), so its real owner
@@ -375,12 +377,14 @@ function resolveRepo(repoFlags = flags) {
     // disk. A worktree of a non-lane primary stays usable (the daemon rebuild smoke runs from one).
     // An unreadable owner is refused: a failed read must not fall back to the path-only check.
     let unreadableOwner = false;
+    const owners = [];
     const gitOwnerPaths = [referencePath, topLevel].flatMap((dir) => {
       const [gitDir, commonDir] = ['--git-dir', '--git-common-dir'].map((arg) => {
         const out = tryGit(['rev-parse', arg], dir, gitOptions);
         return out ? resolve(dir, out) : null;
       });
       if (!gitDir || !commonDir) unreadableOwner = true;
+      owners.push({ gitDir, commonDir });
       return [gitDir, commonDir, commonDir && dirname(commonDir)].filter(Boolean);
     });
     const originSourcePaths = [referencePath, topLevel, ...gitOwnerPaths].flatMap(path => [resolve(path), resolveReal(path)]);
@@ -391,14 +395,29 @@ function resolveRepo(repoFlags = flags) {
     // ambiguous lane-shaped checkouts must supply --origin or a primary --reference.
     if (unreadableOwner || originSourcePaths.some(path => poolRoots.some(root => path === root || path.startsWith(`${root}${sep}`))
       || path.split(sep).some(part => /^lane-\d+$/.test(part)))) {
-      canonicalOrigin = false;
-      if (needsOrigin) fail(`${cmd} requires a canonical origin outside lane config — pass --origin=<url> or --reference=<primary-checkout> (looked in ${topLevel})`);
+      // Old live daemons export the smoke owner, but not LANE_POOL_CANONICAL_ORIGIN.
+      // Trust that owner only for its own named, linked candidate; a lane's remote is never an anchor.
+      const liveClone = process.env.WE_SMOKE_LIVE_CLONE;
+      if (!unreadableOwner && liveClone && /\.candidate-[^/]+$/.test(basename(topLevel))) {
+        try {
+          const liveRoot = realpathSync(liveClone);
+          const paths = [...originSourcePaths, resolve(liveClone), liveRoot];
+          if (!paths.some(path => path.split(sep).some(part => /^lane-\d+$/.test(part)))
+            && owners.every(({ gitDir, commonDir }) => realpathSync(gitDir) !== realpathSync(commonDir)
+              && realpathSync(dirname(commonDir)) === liveRoot)) {
+            smokeOrigin = tryGit(['remote', 'get-url', 'origin'], liveRoot, gitOptions);
+            originBase = liveRoot;
+          }
+        } catch { /* Missing or unreadable ownership evidence keeps the existing refusal. */ }
+      }
+      canonicalOrigin = !!smokeOrigin;
+      if (!canonicalOrigin && needsOrigin) fail(`${cmd} requires a canonical origin outside lane config — pass --origin=<url> or --reference=<primary-checkout> (looked in ${topLevel})`);
     }
   }
-  const rawOrigin = repoFlags.origin || tryGit(['remote', 'get-url', 'origin'], topLevel, gitOptions);
+  const rawOrigin = repoFlags.origin || smokeOrigin || tryGit(['remote', 'get-url', 'origin'], topLevel, gitOptions);
   // A configured local path belongs to the primary checkout. Explicit --origin paths belong to the caller.
   const originUrl = !repoFlags.origin && rawOrigin && !/^[^/]*:/.test(rawOrigin)
-    ? resolve(topLevel, rawOrigin) : rawOrigin;
+    ? resolve(originBase, rawOrigin) : rawOrigin;
   // #2667 — `--pool=<name>` selects a pool DIRECTLY by its directory name under POOL_ROOT, bypassing origin-URL
   // derivation. It is the pool selector for the READ / RELEASE ops (status / list / path / release) that need
   // only `poolDir` — e.g. the main session releasing a cross-locus couple's lingering lease in the `plateau-app`
