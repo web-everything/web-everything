@@ -34,7 +34,7 @@ import { op } from './registry.mjs';
 import { DECLARED_HOMES } from './declared-homes.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import { BACKLOG_KINDS } from '../check-standards-rules.mjs';
-import { nextHash, stampBornAs } from '../backlog/id.mjs';
+import { nextHash, stampBornAs, isNum } from '../backlog/id.mjs';
 import { renderItem, sizeRefusal, parseSize } from '../backlog/scaffold.mjs';
 
 export const SCAFFOLD_OP = 'scaffold';
@@ -134,6 +134,8 @@ export function planScaffold(read, input = {}, { alloc = nextHash } = {}) {
   const key = (id) => /^\d+$/.test(id) ? String(Number(id)) : id;
   const taken = new Set(read.existingIds.map(key));
   let num = String(read.allocatedId || alloc(read.existingIds));
+  if (read.allocatedId && (!isNum(num) || Number(num) < 1))
+    refuse('invalid-allocated-id', `allocated id ${num} is outside the supported numeric ID grammar`);
   if (!read.allocatedId && taken.has(key(num))) num = alloc([...read.existingIds, num]);
   if (taken.has(key(num))) {
     refuse('id-exhausted', `the id allocator returned a taken id (${num}) — refusing`);

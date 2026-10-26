@@ -43,8 +43,9 @@ import { applyTransition, applySettle, readField, setFrontmatterField, removeFro
 import { planEpicResolveOnLand, hasBlockedBy } from './backlog/epic-resolve.mjs';
 import { parseCostTokens, formatCostTokens } from './backlog/cost-rates.mjs';
 import { nextNum, slugify, renderItem, sizeRefusal, parseSize } from './backlog/scaffold.mjs';
-import { allocateCardNumber } from './lib/card-number-allocator.mjs';
-import { nextHash, stampBornAs, normalizeId, idFromName, isHash, slugFromName } from './backlog/id.mjs';
+import { allocateCardNumber, collisionNumberingConstraints, reserveCollisionNumbers } from './lib/card-number-allocator.mjs';
+import { assertRenumberable, allocateCollisionNum } from './backlog/renumber-collisions.mjs';
+import { nextHash, stampBornAs, normalizeId, idFromName, isHash, isNum, slugFromName } from './backlog/id.mjs';
 import { parseReservations, emptyState, addHolds, removeBySession, removeNums, pruneExpired, serialize, sessionForNum } from './readiness/reservations.mjs';
 // #2803 resolve-time scope reconciliation. Every one of these graphs is light and adds no measurable startup
 // cost to this CLI (which every hook and the conveyor shell out to): render-check imports only
@@ -1289,10 +1290,19 @@ function yieldNum() {
   if (tracked && !argv.includes('--force')) die(`${rel} is git-tracked — NNN is immutable, a committed item never renumbers. yield only moves a LOCAL-ONLY (untracked) collision. (If this really is a dup to reconcile, that's a manual call.)`);
   const slug = slugFromName(file.replace(/\.md$/, '')); // two-form id (#2288): strip NNN- or xNNNNNN-
   const existing = files().map((f) => (f.match(/^(\d+)/) || [])[1]).filter(Boolean);
-  const newNum = nextNum(existing);
+  const content = readFileSync(join(DIR, file), 'utf8');
+  assertRenumberable({ name: file, text: content });
+  const numberingGit = (args, options = {}) => execFileSync('git', args, {
+    cwd: ROOT, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 10_000, maxBuffer: 1024 * 1024,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, ...options,
+  });
+  const constraints = collisionNumberingConstraints(numberingGit);
+  assertRenumberable({ name: file, text: content }, constraints.reservedNums);
+  const newNum = allocateCollisionNum(new Set(existing), new Set(), new Set(), constraints, (used) => nextNum([...used]));
+  if (!isNum(newNum)) die('card number exhausted');
   const newName = `${newNum}-${slug}.md`;
   if (files().some((f) => f.startsWith(`${newNum}-`))) die(`race: #${newNum} just got taken — re-run yield`);
-  const content = readFileSync(join(DIR, file), 'utf8');
+  reserveCollisionNumbers({ collisions: [{ oldName: file, newName, newNum }] }, numberingGit, constraints.reservationRemote);
   writeBacklogMd(join(DIR, newName), `backlog/${newName}`, content);
   unlinkSync(join(DIR, file));
   ok({ verb: 'yield', from: file.replace(/\.md$/, ''), to: newName.replace(/\.md$/, ''), num: newNum, file: `backlog/${newName}` },

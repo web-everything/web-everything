@@ -1,10 +1,25 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { allocateCardNumber, loadNumberAtBirthSettings } from '../card-number-allocator.mjs';
+import { allocateCardNumber, loadNumberAtBirthSettings, reserveCardNumber, reserveCollisionNumbers } from '../card-number-allocator.mjs';
 import { tryAcquireNumberingLock } from '../../readiness/drain-lock.mjs';
+import { numberPendingHashes } from '../../lane-drain.mjs';
+import { planBaseCollisionHeal, applyCollisionHealToIndex, healNnnCollision } from '../nnn-collision-heal.mjs';
+import { planRenumber } from '../../backlog/renumber-collisions.mjs';
+import { gitBlobOid } from '../git-run.mjs';
+
+const io = vi.hoisted(() => ({ git: null }));
+vi.mock('node:child_process', async (original) => {
+  const actual = await original();
+  return { ...actual, execFileSync: (cmd, args, opts) => io.git && cmd === 'git'
+    ? io.git(args, opts) : actual.execFileSync(cmd, args, opts) };
+});
+vi.mock('../proc-read.mjs', async (original) => {
+  const actual = await original();
+  return { ...actual, readGit: (args, opts) => io.git ? io.git(args, opts) : actual.readGit(args, opts) };
+});
 
 const roots = [];
 const fixture = (id = 'xaaaaaa') => {
@@ -38,9 +53,102 @@ function remote() {
   };
   return { git, refs, blobs, calls };
 }
-afterEach(() => roots.splice(0).forEach((p) => rmSync(p, { recursive: true, force: true })));
+afterEach(() => {
+  io.git = null;
+  vi.unstubAllEnvs();
+  roots.splice(0).forEach((p) => rmSync(p, { recursive: true, force: true }));
+});
+
+it.each([true, false])('legacy numbering with births disabled skips an outstanding birth reservation (dryRun=%s)', (dryRun) => {
+  const opts = fixture(); const r = remote();
+  writeFileSync(join(opts.cwd, 'backlog/074-existing.md'), '---\n---\nExisting\n');
+  expect(allocateCardNumber({ ...opts, git: r.git }).num).toBe('075');
+  writeFileSync(join(opts.cwd, 'backlog/xbbbbbb-other.md'), '---\n---\nOther\n');
+  mkdirSync(join(opts.cwd, '.claude/skills/batch-backlog-items'), { recursive: true });
+  vi.stubEnv('WE_NUMBER_AT_BIRTH', 'off');
+  vi.stubEnv('WE_JIT_READ_SOURCE', 'worktree');
+  io.git = (args, extra) => {
+    if (args[0] === 'remote') return 'origin\n';
+    if (args[0] === 'ls-files') return args[1] === 'backlog/*.md'
+      ? 'backlog/074-existing.md\nbacklog/xbbbbbb-other.md\n' : '';
+    if (args[0] === 'grep') return '';
+    if (args[0] === 'rm') { rmSync(join(opts.cwd, args.at(-1))); return ''; }
+    if (['add', 'commit'].includes(args[0])) return '';
+    return r.git(args, extra);
+  };
+  const result = numberPendingHashes(opts.cwd, { dryRun });
+  expect(result.assigned).toEqual([{ hash: 'xbbbbbb', nnn: '076' }]);
+  if (!dryRun) {
+    expect(result.committed).toBe(true);
+    expect(readFileSync(join(opts.cwd, 'backlog/076-other.md'), 'utf8')).toContain('bornAs: xbbbbbb');
+    expect(r.refs.get('refs/card-ids/xbbbbbb')).toBe(r.refs.get('refs/number-reservations/076'));
+  } else expect(r.refs.has('refs/card-ids/xbbbbbb')).toBe(false);
+  expect(allocateCardNumber({ ...fixture(), git: r.git }).num).toBe('075');
+});
+
+it('legacy numbering holds cards when configured remote evidence is unavailable', () => {
+  const opts = fixture();
+  writeFileSync(join(opts.cwd, 'backlog/xbbbbbb-other.md'), '---\n---\nOther\n');
+  vi.stubEnv('WE_JIT_READ_SOURCE', 'worktree');
+  const calls = [];
+  io.git = (args) => {
+    calls.push(args);
+    if (args[0] === 'remote') return 'origin\n';
+    if (args[0] === 'ls-files') return args[1] === 'backlog/*.md' ? 'backlog/xbbbbbb-other.md\n' : '';
+    if (args[0] === 'grep') return '';
+    throw Error('offline');
+  };
+  expect(numberPendingHashes(opts.cwd)).toMatchObject({ assigned: [], committed: false, error: expect.stringContaining('offline') });
+  expect(calls.some((args) => ['push', 'hash-object', 'rm', 'add', 'commit'].includes(args[0]))).toBe(false);
+  expect(readFileSync(join(opts.cwd, 'backlog/xbbbbbb-other.md'), 'utf8')).toBe('---\n---\nOther\n');
+});
+
+it.each(['base', 'merged'])('%s collision planner refuses to move a bornAs identity', (kind) => {
+  const birth = { name: '075-birth.md', text: '---\nbornAs: xaaaaaa\n---\nBirth\n', ordinal: 2 };
+  const existing = { name: '075-other.md', text: '---\n---\nOther\n', ordinal: 1 };
+  expect(() => kind === 'base'
+    ? planBaseCollisionHeal([birth], { baseNums: ['075'], baseNames: [existing.name] })
+    : planRenumber([existing, birth], { ontoNames: [existing.name] }))
+    .toThrow(/birth|bornAs|immutable/i);
+});
+
+it.each(['base', 'merged'])('%s collision planner skips reserved gaps and refuses an unsafe frontier', (kind) => {
+  const files = [{ name: '074-incoming.md', text: '---\n---\nIncoming\n', ordinal: 2 }];
+  const constraints = { reservedNums: ['075', '077'], ceiling: 77 };
+  const plan = kind === 'base'
+    ? planBaseCollisionHeal(files, { baseNums: ['074'], baseNames: ['074-existing.md'], ...constraints })
+    : planRenumber([...files, { name: '074-existing.md', text: 'Existing\n', ordinal: 1 }],
+      { ontoNames: ['074-existing.md'], ...constraints });
+  expect(plan.collisions[0].newNum).toBe('076');
+  expect(() => kind === 'base'
+    ? planBaseCollisionHeal(files, { baseNums: ['074'], baseNames: ['074-existing.md'], reservedNums: ['075'], ceiling: 75 })
+    : planRenumber([...files, { name: '074-existing.md', text: 'Existing\n' }],
+      { ontoNames: ['074-existing.md'], reservedNums: ['075'], ceiling: 75 }))
+    .toThrow(/gap|reservation/i);
+});
 
 describe('atomic birth numbering', () => {
+  it.each(['café', 'cafe\u0301', 'quote"', 'back\\slash', 'line\nbreak', 'carriage\rreturn',
+    'line\u2028separator', 'invisible\u200b', '`backtick`', '--leading'])('counts canonical paths containing %s without Git quoting loss', (slug) => {
+    const opts = fixture(); const r = remote();
+    writeFileSync(join(opts.cwd, 'backlog/074-existing.md'), '');
+    opts.settings.value.remote = 'required';
+    const git = (args, extra) => args[0] === 'ls-tree'
+      ? (args.includes('-z') ? `backlog/075-${slug}.md\0` : '"backlog/075-caf\\303\\251.md"\n')
+      : r.git(args, extra);
+    expect(allocateCardNumber({ ...opts, git })).toMatchObject({ ok: true, num: '076' });
+  });
+
+  it.each(['best-effort', 'required'])('%s refuses numbers beyond the five-digit ID grammar', (mode) => {
+    const opts = fixture(); const r = remote();
+    opts.settings.value.remote = mode;
+    writeFileSync(join(opts.cwd, 'backlog/99999-existing.md'), '');
+    expect(allocateCardNumber({ ...opts, git: r.git })).toMatchObject({
+      ok: false, required: mode === 'required', reason: expect.stringContaining('exhausted'),
+    });
+    expect(r.calls.filter((args) => args[0] === 'push')).toHaveLength(0);
+  });
+
   it('replaying the same id on another host returns the same number through card-ids', () => {
     const r = remote(); const a = fixture(); const b = fixture();
     expect(allocateCardNumber({ ...a, git: r.git })).toMatchObject({ ok: true, num: '001' });
@@ -97,7 +205,7 @@ describe('atomic birth numbering', () => {
       writeFileSync(opts.statePath, JSON.stringify({ highest: 75, reservations: [] }));
     }
     if (plane === 'remote') r.refs.set('refs/number-reservations/075', 'a'.repeat(40));
-    const git = (args, extra) => args[0] === 'ls-tree' && plane === 'main' ? 'backlog/075-main.md\n' : r.git(args, extra);
+    const git = (args, extra) => args[0] === 'ls-tree' && plane === 'main' ? 'backlog/075-main.md\0' : r.git(args, extra);
     expect(allocateCardNumber({ ...opts, git })).toMatchObject({ ok: true, num: '076' });
     expect(JSON.parse(readFileSync(opts.statePath, 'utf8')).highest).toBe(76);
   });
@@ -119,7 +227,7 @@ describe('atomic birth numbering', () => {
       const r = remote();
       const git = (args, extra) => {
         if (args[0] === failure) throw Error('canonical main unavailable');
-        if (args[0] === 'ls-tree') return failure === 'truncated-tree' ? 'backlog/075-existing.md' : 'backlog/075-existing.md\n';
+        if (args[0] === 'ls-tree') return failure === 'truncated-tree' ? 'backlog/075-existing.md' : 'backlog/075-existing.md\0';
         return r.git(args, extra);
       };
       // No local cards or remote refs cover the historical cards on canonical main.
@@ -212,7 +320,7 @@ it('prunes old and landed entries without lowering the high-water mark', () => {
     { num: 20, timestamp: new Date().toISOString() },
   ] }));
   const r = remote();
-  const git = (args, extra) => args[0] === 'ls-tree' ? 'backlog/020-landed.md\n' : r.git(args, extra);
+  const git = (args, extra) => args[0] === 'ls-tree' ? 'backlog/020-landed.md\0' : r.git(args, extra);
   expect(allocateCardNumber({ ...opts, git }).num).toBe('091');
   expect(JSON.parse(readFileSync(opts.statePath, 'utf8')).reservations.map((e) => e.num)).toEqual([91]);
   expect(allocateCardNumber({ ...opts, id: 'xbbbbbb', git }).num).toBe('092');
@@ -223,4 +331,99 @@ it('oversized ref evidence fails closed with an explicit hash-fallback result', 
   const git = (args, extra) => args[0] === 'ls-remote' ? ' '.repeat(1024 * 1024 + 1) : r.git(args, extra);
   expect(allocateCardNumber({ ...fixture(), git })).toMatchObject({ ok: false, required: false, reason: 'oversized remote ref listing' });
   expect(r.refs.size).toBe(0);
+});
+
+it('deferred numbering atomically reserves and replays even when birth numbering is disabled', () => {
+  const r = remote();
+  vi.stubEnv('WE_NUMBER_AT_BIRTH', 'off');
+  expect(reserveCardNumber({ id: 'xaaaaaa', git: r.git, minimum: 75 })).toBe('075');
+  expect(reserveCardNumber({ id: 'xbbbbbb', git: r.git, minimum: 75 })).toBe('076');
+  expect(reserveCardNumber({ id: 'xaaaaaa', git: r.git, minimum: 77 })).toBe('075');
+  expect(r.refs.get('refs/card-ids/xbbbbbb')).toBe(r.refs.get('refs/number-reservations/076'));
+});
+
+it('collision targets use atomic create-only claims and a stale plan loses to a birth', () => {
+  const r = remote();
+  const plan = { collisions: [{ newNum: '075' }, { newNum: '076' }] };
+  expect(reserveCardNumber({ id: 'xaaaaaa', git: r.git, minimum: 75 })).toBe('075');
+  expect(() => reserveCollisionNumbers(plan, r.git, 'origin')).toThrow('already exists');
+  expect(r.refs.has('refs/number-reservations/076')).toBe(false);
+  reserveCollisionNumbers({ collisions: [{ newNum: '076' }] }, r.git, 'origin');
+  expect(reserveCardNumber({ id: 'xbbbbbb', git: r.git, minimum: 75 })).toBe('077');
+  expect(reserveCardNumber({ id: 'xaaaaaa', git: r.git })).toBe('075');
+});
+
+it.each(['index', 'standalone'])('%s collision wiring refuses unreadable reservations before any index write', (mode) => {
+  vi.stubEnv('WE_COORDINATION_ROOT', join(fixture().cwd, 'coordination'));
+  const calls = [];
+  const run = (cmd, args) => {
+    calls.push(args);
+    let stdout = '';
+    if (args[0] === 'remote') stdout = 'origin\n';
+    if (args[0] === 'ls-tree') stdout = args.includes('origin/main')
+      ? 'backlog/074-existing.md\0backlog/077-latest.md\0' : 'backlog/074-incoming.md\0';
+    if (args[0] === 'cat-file') stdout = '---\n---\nIncoming\n';
+    if (args[0] === 'ls-remote') return { status: 1, stdout: '', stderr: 'offline' };
+    return { status: 0, stdout, stderr: '' };
+  };
+  const result = mode === 'index' ? applyCollisionHealToIndex({ run, env: {}, tree: 'lane/test', cwd: '/fixture' })
+    : healNnnCollision({ run, laneRef: 'lane/test', fetch: false });
+  expect(result.reason).toMatch(/reservation/);
+  expect(calls.some((args) => ['hash-object', 'update-index', 'read-tree', 'push'].includes(args[0]))).toBe(false);
+});
+
+it.each(['index', 'standalone'])('%s collision wiring claims the unreserved gap before rewriting', (mode) => {
+  vi.stubEnv('WE_COORDINATION_ROOT', join(fixture().cwd, 'coordination'));
+  const r = remote(); const calls = [];
+  r.refs.set('refs/number-reservations/076', 'a'.repeat(40));
+  const run = (cmd, args, options) => {
+    calls.push(args);
+    let stdout;
+    if (args[0] === 'remote') stdout = 'origin\n';
+    else if (args[0] === 'ls-tree') stdout = args.includes('origin/main')
+      ? 'backlog/074-existing.md\0backlog/077-latest.md\0' : 'backlog/074-incoming.md\0';
+    else if (args[0] === 'cat-file') stdout = '---\n---\nIncoming\n';
+    else if (args[0] === 'hash-object') stdout = gitBlobOid(options.input) + '\n';
+    // Stop at the first index mutation; the claim must already be durable.
+    else if (['read-tree', 'update-index'].includes(args[0])) {
+      expect(r.refs.has('refs/number-reservations/075')).toBe(true);
+      return { status: 1, stdout: '', stderr: 'stop after claim' };
+    } else stdout = r.git(args, options);
+    return { status: 0, stdout, stderr: '' };
+  };
+  const result = mode === 'index' ? applyCollisionHealToIndex({ run, env: {}, tree: 'lane/test' })
+    : healNnnCollision({ run, laneRef: 'lane/test', fetch: false });
+  expect(result.reason).toMatch(/stop after claim/);
+  expect(calls.find((args) => args[0] === 'push')).toContain('--force-with-lease=refs/number-reservations/075:');
+});
+
+it('bounds overflow after a last-number contention and refuses out-of-grammar reservation refs', () => {
+  const r = remote();
+  const git = (args, options) => {
+    if (args[0] === 'push') {
+      r.refs.set('refs/number-reservations/99999', 'a'.repeat(40));
+      throw Error('clash');
+    }
+    return r.git(args, options);
+  };
+  expect(() => reserveCardNumber({ id: 'xaaaaaa', git, minimum: 99999 })).toThrow('exhausted');
+  r.refs.set('refs/number-reservations/100000', 'b'.repeat(40));
+  expect(() => reserveCardNumber({ id: 'xbbbbbb', git: r.git })).toThrow('invalid reservation number');
+});
+
+it('local filenames containing a newline retain their complete numeric prefix', () => {
+  const opts = fixture(); const r = remote();
+  writeFileSync(join(opts.cwd, 'backlog/075-line\nbreak.md'), '');
+  expect(allocateCardNumber({ ...opts, git: r.git })).toMatchObject({ ok: true, num: '076' });
+});
+
+it('allows the last supported number and rejects oversized canonical tree evidence', () => {
+  const opts = fixture(); const r = remote();
+  writeFileSync(join(opts.cwd, 'backlog/99998-existing.md'), '');
+  expect(allocateCardNumber({ ...opts, git: r.git })).toMatchObject({ ok: true, num: '99999' });
+  const other = remote();
+  const git = (args, options) => args[0] === 'ls-tree' ? 'a'.repeat(1024 * 1024 + 1) + '\0' : other.git(args, options);
+  expect(allocateCardNumber({ ...fixture(), git })).toMatchObject({ ok: false,
+    reason: expect.stringContaining('oversized backlog tree') });
+  expect(other.refs.size).toBe(0);
 });

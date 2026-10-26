@@ -32,9 +32,34 @@
  *   • Idempotent: with no collision the plan is empty → a no-op (a second run does nothing).
  */
 
+import { readField } from './frontmatter.mjs';
+import { isNum } from './id.mjs';
+
+/** Refuse ambiguous legacy damage instead of changing an immutable identity's number. */
+export function assertRenumberable(file, reservedNums = []) {
+  const num = parseBacklogFilename(file.name)?.num;
+  if (readField(file.text || '', 'bornAs') || reservedNums.some((n) => Number(n) === Number(num)))
+    throw Error(`immutable birth number in ${file.name}; repair the collision manually`);
+}
+
+/** Remote-backed healing uses only unreserved gaps below a durable high-water mark.
+ * The caller must atomically claim the targets before applying this plan. No gap means manual repair.
+ */
+export function allocateCollisionNum(usedNums, allocated, baseNums, constraints, fallback = allocateGapId) {
+  const { reservedNums = [], canonicalNums = [], ceiling } = constraints;
+  const taken = new Set([...usedNums, ...allocated, ...baseNums, ...reservedNums, ...canonicalNums].map(Number));
+  if (ceiling == null) return fallback(new Set([...usedNums, ...reservedNums, ...canonicalNums]), allocated, baseNums);
+  if (!Number.isSafeInteger(ceiling) || ceiling < 0) throw Error('invalid reservation frontier');
+  const min = [...taken].reduce((lowest, n) => Math.min(lowest, n), Infinity);
+  for (let n = Math.min(ceiling - 1, 99999); n > Math.max(0, min); n--) {
+    if (!taken.has(n)) return String(n).padStart(3, '0');
+  }
+  throw Error('no safe unreserved gap; repair the collision manually');
+}
+
 /** Parse a `backlog/NNN-slug.md` filename into `{ num, slug }`, or `null` if it isn't one. */
 export function parseBacklogFilename(name) {
-  const m = String(name).match(/^(\d+)-(.+)\.md$/);
+  const m = String(name).match(/^(\d+)-([^/]+)\.md$/);
   if (!m) return null;
   return { num: m[1], slug: m[2] };
 }
@@ -104,6 +129,7 @@ export function allocateFreeNum(usedNums, allocated, baseNums) {
   };
   let cand = max + 1;
   while (taken(cand)) cand++;
+  if (!isNum(String(cand)) || width > 5) throw Error('card number exhausted');
   return String(cand).padStart(width, '0');
 }
 
@@ -137,6 +163,7 @@ export function allocateGapId(usedNums, allocated = new Set(), baseNums = new Se
   };
   // Take the highest free slot below `max` (the hole nearest the frontier). `>= max+1` is the frontier a
   // concurrent scaffold owns (the re-collision we avoid); `<= min` would be an absurd ancient-range id.
+  if (width > 5) throw Error('card number exhausted');
   for (let cand = max - 1; cand > min; cand--) {
     if (!taken(cand)) return String(cand).padStart(width, '0');
   }
@@ -284,7 +311,7 @@ export function assertContentPreserved(originalText, newText, moves, name = '<fi
  *   summary: string,
  * }}
  */
-export function planRenumber(files, { baseNums = [], ontoNames = [] } = {}) {
+export function planRenumber(files, { baseNums = [], ontoNames = [], ...constraints } = {}) {
   const baseSet = new Set(baseNums.map(String));
   const ontoSet = new Set(ontoNames.map(String));
   const collisions = findCollisions(files);
@@ -304,7 +331,8 @@ export function planRenumber(files, { baseNums = [], ontoNames = [] } = {}) {
       const incoming = group.files.filter((f) => !ontoSet.has(f.name));
       if (incoming.length === 0) continue; // every colliding file is already published — a genuine edit conflict, skip
       const { yielder } = pickYielder(incoming);
-      const newNum = allocateFreeNum(usedNums, allocated, baseSet);
+      assertRenumberable(files.find((f) => f.name === yielder.name), constraints.reservedNums);
+      const newNum = allocateCollisionNum(usedNums, allocated, baseSet, constraints, allocateFreeNum);
       allocated.add(newNum);
       moves.push({ oldNum: group.num, newNum, oldName: yielder.name, newName: `${newNum}-${yielder.slug}.md`, slug: yielder.slug });
       continue;
@@ -313,7 +341,8 @@ export function planRenumber(files, { baseNums = [], ontoNames = [] } = {}) {
     // real edit conflict git already flagged, not an allocation race. Skip the whole group in that case.
     if (baseSet.has(group.num)) continue;
     const { yielder } = pickYielder(group.files);
-    const newNum = allocateFreeNum(usedNums, allocated, baseSet);
+    assertRenumberable(files.find((f) => f.name === yielder.name), constraints.reservedNums);
+    const newNum = allocateCollisionNum(usedNums, allocated, baseSet, constraints, allocateFreeNum);
     allocated.add(newNum);
     const newName = `${newNum}-${yielder.slug}.md`;
     moves.push({ oldNum: group.num, newNum, oldName: yielder.name, newName, slug: yielder.slug });

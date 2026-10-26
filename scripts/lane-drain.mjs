@@ -68,6 +68,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import { readGit, readGh } from './lib/proc-read.mjs';
+import { reserveCardNumber, readNumberingEvidence } from './lib/card-number-allocator.mjs';
 import { readFileSync, writeFileSync, readdirSync, mkdtempSync, rmSync, existsSync, renameSync } from 'node:fs';
 import { resolve, join, isAbsolute, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -956,10 +957,34 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1 } = {}) {
   let maxNum = stems.map(idFromName).filter(isNum).reduce((m, n) => Math.max(m, Number(n)), 0);
   maxNum = Math.max(maxNum, minNext - 1);
   const assigned = [];
+  const numberingGit = (args, options = {}) => execFileSync('git', args, {
+    cwd: CWD, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 10_000, maxBuffer: 1024 * 1024,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, ...options,
+  });
+  let remoteNumbering;
+  let numberingEvidence;
+  try {
+    const remotes = String(numberingGit(['remote'])).trim().split('\n').filter(Boolean);
+    remoteNumbering = remotes.includes('origin');
+    if (remotes.length && !remoteNumbering) throw Error('number reservation remote origin unavailable');
+    if (remoteNumbering) numberingEvidence = readNumberingEvidence(numberingGit);
+  } catch (e) {
+    return finish({ assigned: [], committed: false, error: `number reservation unavailable: ${e.message}` });
+  }
   for (const stem of ordered.filter((name) => !heldHashes.has(idFromName(name)) && !dupHashes.has(idFromName(name)))) {
     const hash = idFromName(stem);
-    maxNum += 1;
-    const nnn = String(maxNum).padStart(3, '0');
+    let nnn;
+    try {
+      nnn = remoteNumbering ? reserveCardNumber({ id: hash, git: numberingGit, minimum: maxNum + 1, dryRun, evidence: numberingEvidence })
+        : String(maxNum + 1).padStart(3, '0');
+      if (!isNum(nnn)) throw Error('card number exhausted');
+      // A replay must not silently alias another local card after an old collision.
+      if (stems.some((name) => Number(idFromName(name)) === Number(nnn)))
+        throw Error(`reserved number ${nnn} already exists locally; repair the collision manually`);
+    } catch (e) {
+      return finish({ assigned: [], committed: false, error: `number reservation unavailable: ${e.message}` });
+    }
+    maxNum = Math.max(maxNum, Number(nnn));
     ledger[hash] = nnn;
     assigned.push({ hash, nnn });
   }

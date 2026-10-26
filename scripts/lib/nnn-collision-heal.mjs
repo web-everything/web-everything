@@ -24,7 +24,8 @@
  */
 
 import { gitRun as gitRunner, hashObjectVerified } from './git-run.mjs';
-import { parseBacklogFilename, rewriteRefs, allocateGapId, assertContentPreserved } from '../backlog/renumber-collisions.mjs';
+import { parseBacklogFilename, rewriteRefs, allocateCollisionNum, assertRenumberable, assertContentPreserved } from '../backlog/renumber-collisions.mjs';
+import { collisionNumberingConstraints, reserveCollisionNumbers } from './card-number-allocator.mjs';
 import { refuseHeldPush } from '../conveyor/fix-procedure.mjs';
 
 /**
@@ -57,7 +58,7 @@ import { refuseHeldPush } from '../conveyor/fix-procedure.mjs';
  *   summary: string,
  * }}
  */
-export function planBaseCollisionHeal(laneFiles, { baseNums = [], baseNames = [] } = {}) {
+export function planBaseCollisionHeal(laneFiles, { baseNums = [], baseNames = [], ...constraints } = {}) {
   const files = Array.isArray(laneFiles) ? laneFiles : [];
   const baseNumSet = new Set(baseNums.map(String));
   const baseNameSet = new Set(baseNames.map(String));
@@ -77,7 +78,8 @@ export function planBaseCollisionHeal(laneFiles, { baseNums = [], baseNames = []
     // A NEW lane item collides iff its num already lives on the base AND this exact file is not the base's own
     // file (i.e. the lane authored a different item under the same number). The base file is the keeper.
     if (!baseNumSet.has(p.num) || baseNameSet.has(file.name)) continue;
-    const newNum = allocateGapId(usedNums, allocated, baseNumSet);
+    assertRenumberable(file, constraints.reservedNums);
+    const newNum = allocateCollisionNum(usedNums, allocated, baseNumSet, constraints);
     allocated.add(newNum);
     usedNums.add(newNum);
     moves.push({ oldNum: p.num, newNum, oldName: file.name, newName: `${newNum}-${p.slug}.md`, slug: p.slug });
@@ -127,13 +129,14 @@ export function planBaseCollisionHeal(laneFiles, { baseNums = [], baseNames = []
   return { collisions: moves, writes, deletes, summary };
 }
 
-/** Parse `git ls-tree -r --name-only <ref> -- backlog/` output into the `NNN-slug.md` basenames. Pure. */
+/** Parse NUL-delimited git paths (also accepts legacy newline fixtures). Pure. */
 export function backlogBasenames(lsTreeStdout) {
   const out = [];
-  for (const line of String(lsTreeStdout || '').split('\n')) {
-    const m = line.match(/(?:^|\/)?backlog\/(\d+-.+\.md)$/);
+  const text = String(lsTreeStdout || '');
+  for (const line of text.split(text.includes('\0') ? '\0' : '\n')) {
+    const m = line.match(/^backlog\/(\d+-[^/]+\.md)$/);
     if (m) out.push(m[1]);
-    else { const b = line.match(/^(\d+-.+\.md)$/); if (b) out.push(b[1]); }
+    else { const b = line.match(/^(\d+-[^/]+\.md)$/); if (b) out.push(b[1]); }
   }
   return out;
 }
@@ -144,6 +147,14 @@ export function backlogBasenames(lsTreeStdout) {
 export { gitRunner };
 
 const firstLine = (s) => String(s || '').split('\n')[0];
+
+function numberingGit(run, cwd) {
+  return (args, options = {}) => {
+    const result = run('git', args, { cwd, timeoutMs: 10_000, ...options });
+    if (result.status !== 0) throw Error(`number reservation read failed (${firstLine(result.stderr)})`);
+    return result.stdout;
+  };
+}
 
 /**
  * Apply a renumber PLAN's writes/deletes to a git index (via `GIT_INDEX_FILE=<env.GIT_INDEX_FILE>`), by
@@ -187,9 +198,9 @@ export function writePlanToIndex(run, env, plan, { cwd } = {}) {
  *                                             WRONG repository's index.
  */
 export function applyCollisionHealToIndex({ run, env, tree, base = 'origin/main', cwd }) {
-  const baseLs = run('git', ['ls-tree', '-r', '--name-only', base, '--', 'backlog/'], { cwd });
+  const baseLs = run('git', ['ls-tree', '-r', '--name-only', '-z', base, '--', 'backlog/'], { cwd });
   if (baseLs.status !== 0) return { ok: false, reason: `ls-tree ${base} failed (${firstLine(baseLs.stderr)})` };
-  const treeLs = run('git', ['ls-tree', '-r', '--name-only', tree, '--', 'backlog/'], { cwd });
+  const treeLs = run('git', ['ls-tree', '-r', '--name-only', '-z', tree, '--', 'backlog/'], { cwd });
   if (treeLs.status !== 0) return { ok: false, reason: `ls-tree ${tree} failed (${firstLine(treeLs.stderr)})` };
   const baseNames = backlogBasenames(baseLs.stdout);
   const names = backlogBasenames(treeLs.stdout);
@@ -209,7 +220,10 @@ export function applyCollisionHealToIndex({ run, env, tree, base = 'origin/main'
   // Degrade to the existing error shape: the heal is skipped, the pass carries on.
   let plan;
   try {
-    plan = planBaseCollisionHeal(files, { baseNums: [...baseNumSet], baseNames });
+    const git = numberingGit(run, cwd);
+    const constraints = collisionNumberingConstraints(git);
+    plan = planBaseCollisionHeal(files, { baseNums: [...baseNumSet], baseNames, ...constraints });
+    reserveCollisionNumbers(plan, git, constraints.reservationRemote);
   } catch (e) {
     return { ok: false, reason: `collision-heal plan refused (${firstLine(e?.message)})` };
   }
@@ -255,9 +269,9 @@ export function healNnnCollision({
 
   // CHEAP detection first: compare base vs lane backlog basenames (names only, no content read). Only on a real
   // collision do we pay to read the lane corpus for the reference sweep.
-  const baseLs = run('git', ['ls-tree', '-r', '--name-only', base, '--', 'backlog/']);
+  const baseLs = run('git', ['ls-tree', '-r', '--name-only', '-z', base, '--', 'backlog/']);
   if (baseLs.status !== 0) return { action: 'error', reason: `ls-tree ${base} failed (${firstLine(baseLs.stderr)})` };
-  const laneLs = run('git', ['ls-tree', '-r', '--name-only', mergeRef, '--', 'backlog/']);
+  const laneLs = run('git', ['ls-tree', '-r', '--name-only', '-z', mergeRef, '--', 'backlog/']);
   if (laneLs.status !== 0) return { action: 'error', reason: `ls-tree ${mergeRef} failed (${firstLine(laneLs.stderr)})` };
 
   const baseNames = backlogBasenames(baseLs.stdout);
@@ -269,6 +283,10 @@ export function healNnnCollision({
     return p && baseNumSet.has(p.num) && !baseNameSet.has(n);
   });
   if (!collides) return { action: 'none' };
+
+  // Check the live fix claim before reserving numbers as well as before publishing a tip.
+  const refusal = refuseHeldPush({ run, remote, branch: laneRef });
+  if (refusal) return { action: 'error', reason: refusal.message };
 
   // A collision exists — read the lane corpus and compute the full ref-rewriting plan.
   const laneFiles = [];
@@ -282,7 +300,10 @@ export function healNnnCollision({
   // (documented as non-fatal) so one unhealable lane cannot take down the whole drain run.
   let plan;
   try {
-    plan = planBaseCollisionHeal(laneFiles, { baseNums: [...baseNumSet], baseNames });
+    const git = numberingGit(run);
+    const constraints = collisionNumberingConstraints(git, remote);
+    plan = planBaseCollisionHeal(laneFiles, { baseNums: [...baseNumSet], baseNames, ...constraints });
+    reserveCollisionNumbers(plan, git, constraints.reservationRemote);
   } catch (e) {
     return { action: 'error', reason: `collision-heal plan refused (${firstLine(e?.message)})` };
   }
@@ -305,10 +326,9 @@ export function healNnnCollision({
   const newCommit = String(ct.stdout || '').trim();
   if (ct.status !== 0 || !newCommit) return { action: 'error', reason: `commit-tree failed (${firstLine(ct.stderr)})` };
 
-  // #4293 — refuse this mechanical push too if another fixer holds the LIVE fix claim on the PR this laneRef
-  // belongs to (see `refuseHeldPush`'s own header for why the check lives here, not at each caller).
-  const refusal = refuseHeldPush({ run, remote, branch: laneRef });
-  if (refusal) return { action: 'error', reason: refusal.message };
+  // Recheck after rebuilding: a fixer may have acquired the claim while the heal was running.
+  const finalRefusal = refuseHeldPush({ run, remote, branch: laneRef });
+  if (finalRefusal) return { action: 'error', reason: finalRefusal.message };
 
   const push = run('git', ['push', remote, `${newCommit}:refs/heads/${laneRef}`]);
   if (push.status !== 0) return { action: 'error', reason: `push to ${laneRef} failed (${firstLine(push.stderr)})` };

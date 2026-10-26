@@ -35,7 +35,7 @@ import { allocateCardNumber } from '../../lib/card-number-allocator.mjs';
 // Dispatch fixtures use a deterministic birth number; allocator transport has its own suite.
 // Replacing the filing sink alone still leaves planning able to reserve a live remote number.
 vi.mock('../../lib/card-number-allocator.mjs', () => ({
-  allocateCardNumber: vi.fn(() => ({ ok: true, num: '900001' })),
+  allocateCardNumber: vi.fn(() => ({ ok: true, num: '90001' })),
 }));
 
 it.each([0, 3])('xng7q1p: eligible PR with %i heals retries without a lane or heal', async (count) => {
@@ -843,9 +843,9 @@ describe('xng7q1p retry reservation and restart soak', () => {
     await flushTimeoutFollowups(opts);
     await flushTimeoutFollowups(opts);
     expect(ids).toHaveLength(2); expect(new Set(ids).size).toBe(1);
-    expect(ids).toEqual(['900001', '900001']);
+    expect(ids).toEqual(['90001', '90001']);
     expect(fileFollowup.mock.calls[1][0]).toEqual(fileFollowup.mock.calls[0][0]);
-    expect(fileFollowup.mock.calls[0][0].abs).toBe(join(dir, 'backlog', '900001-investigate-timeout-retries-for-pr-3415-at-aaaaaaaa.md'));
+    expect(fileFollowup.mock.calls[0][0].abs).toBe(join(dir, 'backlog', '90001-investigate-timeout-retries-for-pr-3415-at-aaaaaaaa.md'));
     expect(vi.mocked(allocateCardNumber).mock.calls.length - allocationsBefore).toBe(1);
   }));
   it('refuses stale heads and nonterminal jobs; a newly evidenced head gets a fresh budget', async () => harness(async (dir) => {

@@ -38,8 +38,8 @@ switch(args[0]) {
 }
 fs.writeFileSync(file, JSON.stringify(state));
 `, { mode: 0o755 });
-    const run = (env = {}, operation = 'scaffold') => JSON.parse(execFileSync(process.execPath,
-      [join(root, operation === 'scaffold' ? 'scripts/backlog.mjs' : 'scripts/operations/run.mjs'), operation,
+    const run = (env = {}, operation = 'scaffold', args = []) => JSON.parse(execFileSync(process.execPath,
+      [join(root, operation === 'file-item' ? 'scripts/operations/run.mjs' : 'scripts/backlog.mjs'), operation, ...args,
         '--kind=task', '--title=Born numbered', '--queue=false', '--json'],
       { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
         env: { ...process.env, HOME: home, PATH: bin + delimiter + process.env.PATH,
@@ -52,6 +52,8 @@ fs.writeFileSync(file, JSON.stringify(state));
     const refs = JSON.parse(readFileSync(join(root, 'remote.json'), 'utf8')).refs;
     expect(refs['refs/card-ids/' + bornAs]).toBe(refs['refs/number-reservations/' + numeric.num]);
     expect(readdirSync(join(root, 'backlog'))).toEqual([`${numeric.num}-born-numbered.md`]);
+    expect(() => run({}, 'yield', [`${numeric.num}-born-numbered`, '--force'])).toThrow(/immutable birth number/);
+    expect(readFileSync(join(root, numeric.file), 'utf8')).toBe(content);
     run({}, 'file-item');
     const names = readdirSync(join(root, 'backlog'));
     expect(names).toContain('002-born-numbered.md');

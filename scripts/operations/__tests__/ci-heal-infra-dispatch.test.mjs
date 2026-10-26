@@ -7,7 +7,7 @@ import { readTimeoutBudget } from '../../conveyor/timeout-retry-state.mjs';
 
 // Dispatch coverage uses a deterministic birth number; allocator transport has its own suite.
 vi.mock('../../lib/card-number-allocator.mjs', () => ({
-  allocateCardNumber: () => ({ ok: true, num: '900001' }),
+  allocateCardNumber: () => ({ ok: true, num: '90001' }),
 }));
 
 // Dispatch-level coverage of the infra-cancelled re-run path (PR #4024 review): the planner tests pin WHEN a re-run
@@ -64,7 +64,7 @@ describe('infra-cancelled dispatch', () => {
     expect(request).toHaveBeenCalledTimes(2);
     expect(fileFollowup).toHaveBeenCalledTimes(1);
     expect(fileFollowup.mock.calls[0][0]).toMatchObject({
-      num: '900001', abs: join(dir, 'backlog', '900001-investigate-timeout-retries-for-pr-4023-at-aaaaaaaa.md'),
+      num: '90001', abs: join(dir, 'backlog', '90001-investigate-timeout-retries-for-pr-4023-at-aaaaaaaa.md'),
     });
   }));
 

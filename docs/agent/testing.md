@@ -1600,6 +1600,17 @@ one atomic push with empty-ref leases. Test replay with separate host state, two
 and races on either claim; neither ref may be replaced. Settings resolve through the shared
 cascade with each leaf’s source logged under `backlog.cardNumbering.*`.
 
+Deferred numbering uses the same atomic remote reservations even when birth numbering is off.
+With a configured remote, an unavailable canonical tree or reservation listing holds the hash cards;
+only repositories without any remote retain local-only numbering. Test an outstanding birth claim
+against the actual deferred-numbering dry run, and test allocation/replay races through the shared core.
+Both collision planners refuse to move a `bornAs` card or a reserved source number. Remote-backed
+heals skip reserved and canonical numbers, claim all target gaps atomically before rewriting, and
+refuse for manual repair when no safe gap exists. The manual `yield` command uses the same guards,
+including with `--force`. Claims survive a failed rewrite or publish.
+Canonical tree reads use NUL-delimited paths; cover Unicode, quotes, backslashes and embedded newlines.
+Allocation and replay must obey the five-digit numeric ID grammar, including contention at 99999.
+
 ### Dispatched conflict resolution
 
 `we:scripts/conveyor/resolve-conflict.mjs` uses index stages only inside a lane clone with

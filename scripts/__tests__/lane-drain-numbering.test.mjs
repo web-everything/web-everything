@@ -382,6 +382,7 @@ describe('numberPendingHashes — drain JIT numbering wire (#2288)', () => {
   });
 
   it('repairs clone B references from clone A bornAs with an empty local ledger (#2903)', () => {
+    git('symbolic-ref', 'HEAD', 'refs/heads/main'); // the shared allocator reads canonical origin/main
     write('backlog/2200-legacy.md', '---\nkind: story\n---\n# Legacy\n');
     write('backlog/xblkr01-blocker.md', '---\nkind: story\n---\n# Blocker\n');
     write(QUEUED_REL, JSON.stringify({ queued: [] }));
