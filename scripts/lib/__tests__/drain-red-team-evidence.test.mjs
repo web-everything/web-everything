@@ -192,6 +192,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
 
 it('surfaces a finished old card-only skip when the live head has no read', () => {
   const f = fixture(), oldHead = 'b'.repeat(40);
+  f.head = 'a'.repeat(40);
   const loopPayload = { verdict: { verdict: 'changes' }, findings: { read: {
     netBasis: { rev: oldHead }, netChangedFiles: ['backlog/123-card.md'], diffText: '+card',
   } } };
@@ -205,3 +206,34 @@ it('surfaces a finished old card-only skip when the live head has no read', () =
     ...payload(f.head) }, f.runsDir);
   expect(readDrainRedTeamEvidence(f).loopPayload.findings.read.netBasis.rev).toBe(f.head);
 });
+
+it.each(['non-card read', 'missing read paths', 'non-card rename source', 'skipCardOnly false',
+  'skipCardOnly missing', 'recorded seat', 'live-head seat', 'running', 'queued', 'not skipped', 'missing status'])(
+  'historical fallback refuses %s and returns no live-head read', variant => {
+    const f = fixture(), oldHead = 'c'.repeat(40);
+    const loopPayload = { verdict: { verdict: 'changes' }, findings: { read: {
+      netBasis: { rev: oldHead }, netChangedFiles: ['backlog/123-card.md'], diffText: '+card',
+    } } };
+    if (variant === 'non-card read') loopPayload.findings.read.netChangedFiles = ['scripts/code.mjs'];
+    if (variant === 'missing read paths') delete loopPayload.findings.read.netChangedFiles;
+    if (variant === 'non-card rename source') loopPayload.findings.read.netRenameSources = ['scripts/code.mjs'];
+    writeRun({ ...newRunRecord({ id: 'review-pr-old-card-negative', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
+      ...loopPayload }, f.runsDir);
+    if (variant !== 'missing status') {
+      recordRedTeamStatus({ ...f, loopPayload, status: 'finished', result: 'skipped' }, f);
+      const path = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${oldHead}.json`);
+      const status = JSON.parse(readFileSync(path, 'utf8'));
+      if (variant === 'skipCardOnly false') status.skipCardOnly = false;
+      if (variant === 'skipCardOnly missing') delete status.skipCardOnly;
+      if (['running', 'queued'].includes(variant)) status.status = variant;
+      if (variant === 'not skipped') status.result = 'error';
+      writeFileSync(path, JSON.stringify(status));
+    }
+    const hasSeat = ['recorded seat', 'live-head seat'].includes(variant);
+    const evidence = readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => null,
+      readScorecards: () => hasSeat ? [{ dispatchKind: 'review-seat', seat: 'red-team', repo: f.repo,
+        pr: f.pr, rev: variant === 'live-head seat' ? f.head : oldHead }] : [] });
+    expect(evidence).toEqual({ loopPayload: null, recorded: variant === 'live-head seat',
+      seatRecorded: variant === 'live-head seat', completedRecorded: false,
+      scheduled: variant === 'live-head seat', inFlight: false });
+  });

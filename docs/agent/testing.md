@@ -178,6 +178,13 @@ The job repeats that proof before settling the policy comment on the new head; i
 the historical diff to a model or changes the stored panel verdict. Unknown moves stay skipped.
 The moved-card cases in `review-red-team-on-skip.test.mjs`, `drain-red-team-evidence.test.mjs`
 and `review-job-red-team-only.test.mjs` pin selection, fail-closed proof and real comment settlement.
+Keep these files in the affected-test gate whenever the moved-card readers, proof or job wiring change:
+`npm run test:unit -- scripts/lib/__tests__/review-red-team-on-skip.test.mjs scripts/lib/__tests__/drain-red-team-evidence.test.mjs scripts/operations/__tests__/review-job-red-team-only.test.mjs`.
+Exercise new factory IO members through `createReviewJobIo` with temporary persisted evidence and an
+injected command reader; cover runner defaults as well as injected proofs. History cases must include
+20 and 21 commits, a root, an intermediate code change, and a code-to-card rename whose source becomes
+visible only with `--no-renames`. Historical evidence filters need a refusal case for each condition,
+with distinct old and live heads. Byte fixtures exercise the complete numbering detector without Git writes.
 
 Accept carry-forward's advisory exemption must use `readConfirmedBreaks` and `planRedTeamActions`,
 including settings and `WE_RED_TEAM_CONFIRMED_BREAKS` overrides. A send-back finding or an

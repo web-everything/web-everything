@@ -430,6 +430,35 @@ describe('card-only head move recovery', () => {
     expect(out.dispatched).toHaveLength(1);
     expect(dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' });
   });
+  it('runner default move proof forwards exec, cwd and mainRef to the numbering proof', () => {
+    const exec = vi.fn(), cwd = '/fixture/checkout', mainRef = 'fixture/main';
+    const detector = vi.spyOn(numbering, 'proveNumberingOnlyMove').mockReturnValue({ ok: true, kind: 'numbering-only' });
+    try {
+      const dispatch = vi.fn(() => ({ jobPid: 42 }));
+      const out = runRedTeamOnSkip({ ...fixture(), plan: { refusals: fixture().refusals },
+        now: () => 2_000_000, readEvidence: oldEvidence, exec, cwd, mainRef,
+        capacity: { lanes: 1 }, dispatch, lastDispatch: new Map() });
+      expect(out.dispatched).toHaveLength(1);
+      expect(detector).toHaveBeenCalledWith({ exec, cwd, mainRef, fromSha, toSha: head });
+      expect(dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' });
+    } finally { detector.mockRestore(); }
+  });
+  it('runner default move proof executes the card-path proof with its supplied cwd', () => {
+    const cwd = '/fixture/checkout';
+    const exec = vi.fn((file, args, options) => {
+      expect(file).toBe('git');
+      expect(options.cwd).toBe(cwd);
+      if (args[0] === 'merge-base') return '';
+      if (args[0] === 'rev-list') return `${head} ${fromSha}`;
+      if (args[0] === 'diff-tree') return 'backlog/123-card.md\0';
+      throw Error('not numbering');
+    });
+    const out = runRedTeamOnSkip({ ...fixture(), plan: { refusals: fixture().refusals },
+      now: () => 2_000_000, readEvidence: oldEvidence, exec, cwd, lastDispatch: new Map(),
+      capacity: { lanes: 1 }, dispatch: () => ({ jobPid: 42 }) });
+    expect(out.dispatched).toHaveLength(1);
+    expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['diff-tree', head]), expect.objectContaining({ cwd }));
+  });
 });
 
 describe('proveCardOnlyHeadMove', () => {
@@ -444,12 +473,77 @@ describe('proveCardOnlyHeadMove', () => {
       expect(exec).not.toHaveBeenCalled();
     } finally { detector.mockRestore(); }
   });
+  it('carries a renumber plus docs id rewrite through the real numbering detector', () => {
+    const zero = '0'.repeat(40), beforeOid = '1'.repeat(40), afterOid = '2'.repeat(40);
+    const docBeforeOid = '3'.repeat(40), docAfterOid = '4'.repeat(40);
+    const blobs = new Map([[beforeOid, '---\ntitle: card\n---\n'], [afterOid, '---\nbornAs: xabcdef\ntitle: card\n---\n'],
+      [docBeforeOid, 'See xabcdef.\n'], [docAfterOid, 'See 123.\n']]);
+    const exec = vi.fn((file, args, options) => {
+      expect(file).toBe('git');
+      expect(options.cwd).toBe('checkout');
+      let output;
+      if (args[0] === 'cat-file') {
+        if (args[1] === '-e') output = '';
+        else {
+          const blob = blobs.get(args[2]);
+          if (blob === undefined) throw Error('unknown blob');
+          output = args[1] === '-t' ? 'blob\n' : args[1] === '-s' ? `${Buffer.byteLength(blob)}\n` : blob;
+        }
+      } else if (args[0] === 'rev-parse') output = fromSha;
+      else if (args[0] === 'rev-list') output = `${toSha} ${fromSha}\n`;
+      else if (args[0] === 'log') output = 'drain: JIT-number xabcdef→#123 at land (#2288)\n';
+      else if (['ls-tree', 'grep'].includes(args[0])) output = '';
+      else if (args[0] === 'diff-tree') output = [
+        `:100644 000000 ${beforeOid} ${zero} D\0backlog/xabcdef-card.md\0`,
+        `:000000 100644 ${zero} ${afterOid} A\0backlog/123-card.md\0`,
+        `:100644 100644 ${docBeforeOid} ${docAfterOid} M\0docs/agent/testing.md\0`,
+      ].join('');
+      else throw Error(`unexpected Git read: ${args[0]}`);
+      return options.encoding === null ? Buffer.from(output) : output;
+    });
+    expect(proveCardOnlyHeadMove({ exec, fromSha, toSha, cwd: 'checkout', mainRef: 'fixture/main' }))
+      .toMatchObject({ ok: true, commits: [toSha], pairs: [['xabcdef', '123']] });
+    expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['ls-tree', 'fixture/main']), expect.anything());
+    expect(exec.mock.calls.some(([, args]) => args[0] === 'merge-base')).toBe(false);
+  });
   const c1 = 'c'.repeat(40);
   const fake = ({ ancestor = true, revList = `${c1} ${fromSha}`, tree }) => vi.fn((file, args) => {
     if (args[0] === 'merge-base') { if (!ancestor) throw Error('not ancestor'); return ''; }
     if (args[0] === 'rev-list') return revList;
     if (args[0] === 'diff-tree') return tree;
     throw Error('not numbering');
+  });
+  const history = count => Array.from({ length: count }, (_, i) => (i + 1).toString(16).padStart(40, '0'));
+  const revListFor = commits => commits.map((sha, i) => `${sha} ${commits[i + 1] ?? fromSha}`).join('\n');
+  it('accepts exactly 20 card-only commits and inspects every commit within bounded Git calls', () => {
+    const commits = history(20), exec = fake({ revList: revListFor(commits), tree: 'backlog/123-card.md\0' });
+    expect(proveCardOnlyHeadMove({ exec, fromSha, toSha: commits[0], cwd: 'checkout' })).toMatchObject({ ok: true, kind: 'card-only' });
+    expect(exec.mock.calls.filter(([, args]) => args[0] === 'diff-tree').map(([, args]) => args.at(-1))).toEqual(commits);
+    expect(exec).toHaveBeenCalledWith('git', ['rev-list', '--max-count=21', '--parents', `${fromSha}..${commits[0]}`],
+      expect.objectContaining({ cwd: 'checkout', timeout: 10_000, maxBuffer: 1024 * 1024 }));
+  });
+  it('rejects histories exceeding MAX_COMMITS (21 commits) before reading any diff', () => {
+    const commits = history(21), exec = fake({ revList: revListFor(commits), tree: 'backlog/123-card.md\0' });
+    expect(proveCardOnlyHeadMove({ exec, fromSha, toSha: commits[0] }).ok).toBe(false);
+    expect(exec.mock.calls.filter(([, args]) => args[0] === 'diff-tree')).toHaveLength(0);
+  });
+  it.each(['', c1])('rejects empty or zero-parent history %j', revList => {
+    expect(proveCardOnlyHeadMove({ exec: fake({ revList, tree: 'backlog/123-card.md\0' }), fromSha, toSha }).ok).toBe(false);
+  });
+  it.each([0, 1, 2])('rejects a non-card commit at history position %i, including an intermediate code change', badIndex => {
+    const commits = history(3);
+    const exec = fake({ revList: revListFor(commits), tree: 'backlog/123-card.md\0' });
+    const read = exec.getMockImplementation();
+    exec.mockImplementation((file, args, options) => args[0] === 'diff-tree' && args.at(-1) === commits[badIndex]
+      ? 'scripts/code.mjs\0' : read(file, args, options));
+    expect(proveCardOnlyHeadMove({ exec, fromSha, toSha: commits[0] }).ok).toBe(false);
+  });
+  it('requests no-renames diffs so a code-to-card rename exposes its non-card source', () => {
+    const exec = fake({ tree: 'backlog/123-card.md\0' }), read = exec.getMockImplementation();
+    exec.mockImplementation((file, args, options) => args[0] === 'diff-tree' && args.includes('--no-renames')
+      ? 'scripts/code.mjs\0backlog/123-card.md\0' : read(file, args, options));
+    expect(proveCardOnlyHeadMove({ exec, fromSha, toSha }).ok).toBe(false);
+    expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['diff-tree', '--no-renames']), expect.anything());
   });
   it.each([
     ['backlog/123-card.md\0', true],

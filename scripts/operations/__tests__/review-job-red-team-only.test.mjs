@@ -11,6 +11,7 @@ import { writeJsonAtomic } from '../../lib/atomic-json-file.mjs';
 import { recordRedTeamStatus, readRedTeamStatus, readDrainRedTeamEvidence, redTeamStatusDir } from '../../lib/drain-red-team-evidence.mjs';
 import { createReviewJobIo, prepareReviewArc, runReviewJob, dispatchReviewJob, writeJobRecord, redTeamRunnerArgs, readRedTeamRecoveryStatus } from '../review-job.mjs';
 import { createExtraSeatsIo } from '../review-extra-seats.mjs';
+import { newRunRecord, writeRun } from '../run-store.mjs';
 
 vi.mock('../../lib/red-team-status-labels.mjs', () => ({ syncRedTeamStatusLabels: vi.fn() }));
 vi.mock('../../lib/atomic-json-file.mjs', async importOriginal => {
@@ -1343,24 +1344,73 @@ describe('PR 5890 persisted review-pr recovery rows', () => {
 
 
 describe('moved card-only skip settlement', () => {
+  it('production readRedTeamOnlyPayload preserves historical status, recorded and seatRecorded evidence with the live head', () => {
+    const root = mkdtempSync(join(tmpdir(), 'moved-card-io-read-'));
+    const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), CONVEYOR_STATE_ROOT: root,
+      WE_RED_TEAM_SKIP_CARD_ONLY: '1' };
+    const fromSha = 'b'.repeat(40);
+    const loopPayload = { verdict: { verdict: 'changes' }, findings: { read: {
+      netBasis: { rev: fromSha }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
+    } } };
+    try {
+      vi.stubEnv('WE_SHARED_RUNS_DIR', env.WE_SHARED_RUNS_DIR);
+      vi.stubEnv('OPERATION_RUNS_DIR', env.WE_SHARED_RUNS_DIR);
+      writeRun({ ...newRunRecord({ id: 'review-pr-moved-card', op: 'review-pr', input: { repo, pr } }),
+        ...loopPayload }, env.WE_SHARED_RUNS_DIR);
+      recordRedTeamStatus({ repo, pr, loopPayload, status: 'finished', result: 'skipped' }, { env });
+      const io = createReviewJobIo({ root, env, exec: () => { throw Error('payload read must not execute commands'); } });
+      expect(io.readRedTeamOnlyPayload({ repo, pr, head })).toMatchObject({ head, loopPayload,
+        recorded: false, seatRecorded: false, completedRecorded: false, inFlight: false,
+        status: { head: fromSha, status: 'finished', result: 'skipped', skipCardOnly: true } });
+    } finally { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); }
+  });
+  it('production proveCardOnlyHeadMove uses the factory exec and root for every Git read', () => {
+    const root = mkdtempSync(join(tmpdir(), 'moved-card-io-proof-')), fromSha = 'b'.repeat(40);
+    const exec = vi.fn((file, args, options) => {
+      expect(file).toBe('git');
+      expect(options.cwd).toBe(root);
+      if (args[0] === 'merge-base') return '';
+      if (args[0] === 'rev-list') return `${head} ${fromSha}`;
+      if (args[0] === 'diff-tree') return 'backlog/123-card.md\0';
+      throw Error('not numbering');
+    });
+    try {
+      const io = createReviewJobIo({ root, env: { WE_SHARED_RUNS_DIR: join(root, 'runs') }, exec });
+      expect(io.proveCardOnlyHeadMove({ fromSha, toSha: head })).toMatchObject({ ok: true, kind: 'card-only' });
+      expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['diff-tree', '--no-renames', head]),
+        expect.objectContaining({ cwd: root, timeout: 10_000, maxBuffer: 1024 * 1024 }));
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   it('fresh recovery posts policy-clear on the new head without a stored review or model call there', () => {
     const dir = mkdtempSync(join(tmpdir(), 'moved-card-skip-'));
-    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), CONVEYOR_STATE_ROOT: dir,
+      WE_RED_TEAM_SKIP_CARD_ONLY: '1' };
     const fromSha = 'b'.repeat(40), comments = [];
     const loopPayload = { verdict: { verdict: 'changes' }, findings: { read: {
       netBasis: { rev: fromSha }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
     } } };
-    const stored = { head, loopPayload, recorded: false, seatRecorded: false, inFlight: false,
-      status: { head: fromSha, status: 'finished', result: 'skipped', skipCardOnly: true, loopPayload } };
-    const production = createReviewJobIo({ env });
-    const io = fakeIo({ readRedTeamOnlyPayload: () => stored,
-      proveCardOnlyHeadMove: vi.fn(() => ({ ok: true })),
+    const exec = vi.fn((file, args, options) => {
+      expect(file).toBe('git');
+      expect(options.cwd).toBe(dir);
+      if (args[0] === 'merge-base') return '';
+      if (args[0] === 'rev-list') return `${head} ${fromSha}`;
+      if (args[0] === 'diff-tree') return 'backlog/123-card.md\0';
+      throw Error('not numbering');
+    });
+    const production = createReviewJobIo({ root: dir, env, exec });
+    const io = fakeIo({ readRedTeamOnlyPayload: production.readRedTeamOnlyPayload,
+      proveCardOnlyHeadMove: vi.fn(production.proveCardOnlyHeadMove),
       redTeamStatus: vi.fn(production.redTeamStatus),
       settleRedTeamSkip: input => settleRedTeamSkip({ ...input, io: { env,
         readComments: () => comments, postComment: ({ body }) => comments.push({ body }),
       } }),
     });
     try {
+      vi.stubEnv('WE_SHARED_RUNS_DIR', env.WE_SHARED_RUNS_DIR);
+      vi.stubEnv('OPERATION_RUNS_DIR', env.WE_SHARED_RUNS_DIR);
+      writeRun({ ...newRunRecord({ id: 'review-pr-card-settlement', op: 'review-pr', input: { repo, pr } }),
+        ...loopPayload }, env.WE_SHARED_RUNS_DIR);
+      recordRedTeamStatus({ repo, pr, loopPayload, status: 'finished', result: 'skipped' }, { env });
       expect(readRedTeamStatus({ repo, pr, head, env })).toBeNull();
       const out = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, io);
       expect(out.redTeam).toMatchObject({ status: 'skipped', policy: 'card-only', outcome: 'policy-clear' });
@@ -1372,7 +1422,7 @@ describe('moved card-only skip settlement', () => {
       expect(readRedTeamStatus({ repo, pr, head, env })).toMatchObject({ status: 'finished',
         result: { status: 'skipped', policy: 'card-only' } });
       expect(loopPayload.findings.read.netBasis.rev).toBe(fromSha);
-    } finally { rmSync(dir, { recursive: true, force: true }); }
+    } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
   });
   it('refuses a moved card-only read if the execution-time proof fails', () => {
     const fromSha = 'b'.repeat(40);

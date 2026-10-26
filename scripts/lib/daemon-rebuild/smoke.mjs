@@ -304,10 +304,9 @@ async function resolveDispatchSmoke(opt, env) {
  *   (a) PLAIN MAIN: when A carries any NON-pinned overlay, build B = main + pinned overlays only and smoke it. B
  *       passes ⇒ adopt B and DROP A's non-pinned overlays from the list (they are what broke it — every one is
  *       reported, `overlay-dropped-smoke-failed`; with several, all are dropped as suspects, never bisected).
- *       When ANY A failure is load-shaped ({@link isLoadShapedRow}), B is a full smoke and a B pass re-smokes A
- *       in the same run: A passes ⇒ adopt A; A reproduces a non-load failure on the same check ⇒ drop as above;
- *       otherwise `smoke-env-load` — adopt B, keep every overlay, retry A with backoff. If B fails, only an
- *       entirely load-shaped A holds as `smoke-env-load`; mixed failures continue to control (c).
+ *       When EVERY A failure is load-shaped ({@link isLoadShapedRow}), B is a full smoke and a B pass re-smokes A
+ *       in the same run: A passes ⇒ adopt A; A reproduces a code-shaped failure ⇒ drop as above; otherwise
+ *       `smoke-env-load` — adopt B (or hold when B failed too), keep every overlay, retry A with backoff.
  *   (b) otherwise the clone STAYS on its last-good build (`prevHead`, never touched) and `state.held` records
  *       why; `main-staleness.mjs#assertMainNotStale` keeps dispatching from that build (max-age alert, never a
  *       refusal), and the health watch's `daemon-held-on-last-good` sign notifies after 15 min.
@@ -691,9 +690,8 @@ export async function smokeAndAdopt({
   }));
   const suspects = withPin.filter((ap) => !ap.pinned);
   let bFailed = null;
-  // Any load-shaped A failure warrants confirmation after B passes; only load-only failures hold if B fails.
+  // See LOAD_CONTENTION_SIGNATURES' header: every A row load-shaped ⇒ the same-run differential decides.
   const loadOnly = loadDifferentialEnabled(env) && failedA.length > 0 && failedA.every((r) => isLoadShapedRow(r, env));
-  const loadMixed = loadDifferentialEnabled(env) && !loadOnly && failedA.some((r) => isLoadShapedRow(r, env));
   const envLoadRecord = (st) => {
     const prev = st.rejected?.envLoad && st.rejected?.inputsKey === plan.inputsKey ? st.rejected
       : (priorRejected?.envLoad && priorRejected?.inputsKey === plan.inputsKey ? priorRejected : null);
@@ -713,7 +711,7 @@ export async function smokeAndAdopt({
     details: failedA.map((r) => ({ name: r.name, ms: r.ms, detail: redactDetail(r.detail, r.name) })),
     suspects: suspects.map((ap) => ({ ref: ap.ref, pr: ap.pr })),
     ...extra,
-    message: 'load-shaped failures occurred (timeout / lock contention) and no same-run differential pinned a code-shaped failure on an overlay — overlays kept, retrying with backoff',
+    message: 'every failed check is load-shaped (timeout / lock contention) and no same-run differential pinned it on an overlay — environment, not the candidate; overlays kept, retrying with backoff',
   });
   // ── (a0) set aside only the overlays that changed files named by A's failures ─────────────────────────
   if (!mainOnly && !loadOnly && suspects.length > 1) {
@@ -792,13 +790,13 @@ export async function smokeAndAdopt({
       // Even the currently adopted head needs a fresh comparison before blaming an overlay.
       // Fail fast on every check A failed: if plain main fails one of them too, the rest of B cannot change the outcome.
       const b = budgetAllows('plain-main')
-        ? await smokeSha(planB.finalSha, (loadOnly || loadMixed) ? null : changedSince(planB.finalSha), 'plain-main', suspectsFor(planB.applied), { failFast: failedA.map((r) => r.name) })
+        ? await smokeSha(planB.finalSha, loadOnly ? null : changedSince(planB.finalSha), 'plain-main', suspectsFor(planB.applied), { failFast: failedA.map((r) => r.name) })
         : { budgetSkipped: true };
       if (b.dispatch && !b.dispatch.result.ok) {
         alert('fallback-plain-main-dispatch-smoke-failed', { reason: b.dispatch.result.reason, suspects: b.dispatch.suspects.map((s) => s.ref) });
       }
       const bPassed = !b.worktreeFailed && !b.threw && b.smokeResult?.verdict === 'pass' && (!b.dispatch || b.dispatch.result.ok);
-      if (bPassed && (loadOnly || loadMixed)) {
+      if (bPassed && loadOnly) {
         // Same-run differential, second half: re-smoke A now that plain main passed.
         // No budget left for the re-smoke: no same-run differential, so treat it as load (never blame the overlay).
         const a2 = budgetAllows('confirm') ? await smokeSha(plan.finalSha, null, 'confirm', aSuspects) : { budgetSkipped: true };
