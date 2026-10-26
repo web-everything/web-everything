@@ -1,6 +1,6 @@
 import { settleRedTeamSkip } from '../../lib/red-team-skip-outcome.mjs';
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -10,7 +10,8 @@ import { redTeamForHead, redTeamMarker } from '../../lib/red-team-gate.mjs';
 import { redTeamOwedFor } from '../../lib/review-red-team-policy.mjs';
 import { writeJsonAtomic } from '../../lib/atomic-json-file.mjs';
 import { recordRedTeamStatus, readRedTeamStatus, readDrainRedTeamEvidence, redTeamStatusDir } from '../../lib/drain-red-team-evidence.mjs';
-import { createReviewJobIo, prepareReviewArc, runReviewJob, dispatchReviewJob, writeJobRecord, redTeamRunnerArgs, readRedTeamRecoveryStatus } from '../review-job.mjs';
+import { proveCardOnlyHeadMove } from '../../lib/card-only-head-move.mjs';
+import { createReviewJobIo, execReadRaw, prepareReviewArc, runReviewJob, dispatchReviewJob, writeJobRecord, redTeamRunnerArgs, readRedTeamRecoveryStatus } from '../review-job.mjs';
 import { createExtraSeatsIo } from '../review-extra-seats.mjs';
 import { newRunRecord, writeRun } from '../run-store.mjs';
 
@@ -1463,6 +1464,32 @@ describe('moved card-only skip settlement', () => {
       expect(io.proveCardOnlyHeadMove({ fromSha, toSha: head })).toMatchObject({ ok: true, kind: 'card-only' });
       expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['diff-tree', '--no-renames', head]),
         expect.objectContaining({ cwd: root, timeout: 10_000, maxBuffer: 1024 * 1024 }));
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('production proveCardOnlyHeadMove proves a real numbering move that rewrites a doc reference with its default reader', () => {
+    const root = mkdtempSync(join(tmpdir(), 'moved-card-io-numbering-'));
+    const git = args => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    const write = (path, text) => { mkdirSync(dirname(join(root, path)), { recursive: true }); writeFileSync(join(root, path), text); };
+    const commit = message => { git(['add', '-A']); git(['commit', '-q', '-m', message]); return git(['rev-parse', 'HEAD']); };
+    try {
+      git(['init', '-q', '-b', 'main']);
+      git(['config', 'user.email', 'test@example.com']);
+      git(['config', 'user.name', 'Moved Card Test']);
+      write('backlog/xabcdef-card.md', '---\nkind: story\n---\nbody\n');
+      write('docs/agent/testing.md', 'See xabcdef.\n');
+      const fromSha = commit('card');
+      git(['update-ref', 'refs/remotes/origin/main', fromSha]);
+      git(['mv', 'backlog/xabcdef-card.md', 'backlog/7001-card.md']);
+      write('backlog/7001-card.md', '---\nbornAs: xabcdef\nkind: story\n---\nbody\n');
+      write('docs/agent/testing.md', 'See 7001.\n');
+      const toSha = commit('drain: JIT-number xabcdef→#7001 at land (#2288)');
+      // The planner's reader proves it; the job's default reader must reach the same verdict.
+      expect(proveCardOnlyHeadMove({ exec: execFileSync, cwd: root, fromSha, toSha })).toMatchObject({ ok: true, commits: [toSha] });
+      const io = createReviewJobIo({ root, env: { WE_SHARED_RUNS_DIR: join(root, 'runs') } });
+      expect(io.proveCardOnlyHeadMove({ fromSha, toSha })).toMatchObject({ ok: true, commits: [toSha] });
+      expect(Buffer.isBuffer(execReadRaw('git', ['cat-file', 'blob', `${toSha}:docs/agent/testing.md`], { cwd: root, encoding: null })))
+        .toBe(true);
+      expect(execReadRaw('git', ['rev-parse', 'HEAD'], { cwd: root }).trim()).toBe(toSha);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
   it.each([false, true].flatMap(failFirstComment => ['changes', 'accept'].map(verdict => ({ failFirstComment, verdict }))))(

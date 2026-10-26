@@ -84,7 +84,8 @@ import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.m
  */
 
 import { spawn, spawnSync } from 'node:child_process';
-import { execRead } from '../lib/proc-read.mjs';
+import { execRead, READ_MAX_BUFFER } from '../lib/proc-read.mjs';
+import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
@@ -304,8 +305,18 @@ export function readRedTeamRecoveryStatus(input, {
 
 // ── THE ARC ────────────────────────────────────────────────────────────────────────────────────────────────────
 
+/**
+ * The factory's default reader: execRead text for every read, except an explicit raw-bytes read (`encoding: null`,
+ * the numbering proof's shape) which gets the undecoded Buffer the planner's reader returns. execRead alone decodes
+ * it to text, so the job refused every renumber the planner had proven and the moved skip never settled.
+ */
+export function execReadRaw(file, args, options = {}) {
+  if (options.encoding !== null) return execRead(file, args, options);
+  return execFileSyncThrottled(file, args, { ...options, maxBuffer: options.maxBuffer ?? READ_MAX_BUFFER });
+}
+
 /** The real effects, each one command. `root` is the checkout the arc runs from (the daemon's clone). */
-export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execRead, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence } = {}) {
+export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence } = {}) {
   const node = (args, { actorId, timeoutMs, extraEnv = null } = {}) => spawnSync(process.execPath, args, {
     cwd: root,
     encoding: 'utf8',
