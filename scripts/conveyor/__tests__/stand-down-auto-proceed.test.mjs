@@ -1,8 +1,10 @@
 import { expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { buildStandDownComment, isLoadFlakeStandDown, standDownComments } from '../stand-down.mjs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { annotateLapsedStandDowns, buildStandDownComment, isLoadFlakeStandDown, standDownComments } from '../stand-down.mjs';
+import { countUnresolvedStandDowns, planReconcile } from '../reconcile-core.mjs';
 import { AUTOMATION_LOGINS } from '../../lib/marker-authorship.mjs';
 import { buildOperatorAnswer, parseOperatorAnswer, isOperatorAnswerStandDownSuperseded } from '../stand-down-answer-core.mjs';
 import { autoProceedStandDowns, hasAutoProceedCandidate, classifyStandDownAutoProceed } from '../stand-down-auto-proceed.mjs';
@@ -38,6 +40,47 @@ const redMainContext = {
     redMainDiscount: 'on', redMainWindows: [{ start: '2026-10-13T21:33:48Z', end: '2026-10-13T23:32:06Z' }] },
 };
 const rerun = [run(1, 'failure', '2026-10-13T22:50:00Z'), run(2, 'success')];
+
+it('enumerates production dispatch callers and requires explicit R123 permission', () => {
+  const scripts = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+  const callers = [];
+  for (const path of readdirSync(scripts, { recursive: true })) {
+    if (!path.endsWith('.mjs') || path.includes('__tests__/') || path.includes('/soak/')) continue;
+    const source = readFileSync(join(scripts, path), 'utf8');
+    // Include the smoke's generated JavaScript, excluding the exported declaration.
+    const calls = [...source.matchAll(/\brunReconcileFixDispatch\(\{([\s\S]*?)\}\);/g)]
+      .filter(match => !/\bfunction\s*$/.test(source.slice(0, match.index)));
+    for (const [, options] of calls) {
+      callers.push(path);
+      expect(options, path).toMatch(path === 'conveyor/reconcile-fix-dispatch.mjs'
+        ? /allowStandDownAutoProceed: true\b/ : /allowStandDownAutoProceed: false\b/);
+    }
+  }
+  expect(callers.sort()).toEqual([
+    'conveyor/orphan-fix-round.mjs', 'conveyor/reconcile-fix-dispatch.mjs', 'lib/daemon-live-smoke.mjs',
+  ]);
+});
+
+it.each(['queued', 'in_progress', 'waiting'])(
+  'holds pending checks despite an acceptable conclusion: %s', status => {
+    for (const conclusion of ['success', 'cancelled', 'skipped', 'failure']) {
+      assertAuthorizationBoundary(args([rerun[0], { ...rerun[1], status, conclusion }], { redMainContext }),
+        'hold', /missing, pending or unknown required check/);
+    }
+  });
+it.each(['2026-10-13T22:54:59Z', at])(
+  'holds when rerun success does not follow the stand-down: %s', completedAt => {
+    assertAuthorizationBoundary(args([rerun[0], { ...rerun[1], completed_at: completedAt }]),
+      'hold', /no recovered CI evidence/);
+  });
+it('holds when the earlier failure follows the stand-down', () => {
+  assertAuthorizationBoundary(args([{ ...rerun[0], completed_at: '2026-10-13T22:55:01Z' }, rerun[1]]),
+    'hold', /no recovered CI evidence/);
+});
+it('accepts an earlier failure at the stand-down boundary and success immediately afterward', () => {
+  assertAuthorizationBoundary(args([{ ...rerun[0], completed_at: at },
+    { ...rerun[1], completed_at: '2026-10-13T22:55:01Z' }]), 'auto-proceed');
+});
 
 it.each(['success', 'cancelled', 'skipped', 'failure'])(
   'never supersedes an independent same-name failed workflow with %s', conclusion => {
@@ -353,6 +396,56 @@ it.each(['head-moved', 'new-question', 'unreadable-thread', 'unreadable-checks',
     });
     expect(posts).toBe(scenario === 'untrusted-post' ? 1 : 0);
     expect(isOperatorAnswerStandDownSuperseded(result[0].comments, 0)).toBe(false);
+  });
+it.each(['new-question', 'new-ci-hold', 'operator-answer', 'reservation-denied', 'head-moved',
+  'reservation-error', 'post-error', 'untrusted-post', 'second-read-error', 'checks-error'])(
+  'preserves the latest complete thread for downstream planning: %s', scenario => {
+    const original = [stand('fix-loop-exhausted')];
+    const lapse = snapshot => annotateLapsedStandDowns(snapshot, {
+      lapseOnNewHead: 'off', redMainLapse: () => true, onLapse: () => {},
+    });
+    const snapshot = lapse({ ...pr(original), labels: ['review:changes'] });
+    expect(countUnresolvedStandDowns(snapshot.comments)).toBe(0);
+    const first = [...original, { id: 'NOTE1', author, body: 'first refresh' }];
+    const extra = scenario === 'new-question' ? stand('needs-judgment', 'SD2')
+      : scenario === 'new-ci-hold' ? stand('gate-red', 'SD2')
+        : scenario === 'operator-answer' ? { author, body: buildOperatorAnswer({
+          standDownId: 'SD1', actor: 'operator', channel: 'test', reason: 'handled',
+        }) } : { id: 'NOTE2', author, body: 'second refresh' };
+    const latest = [...first, extra];
+    let reads = 0;
+    const reserve = vi.fn(() => {
+      if (scenario === 'reservation-error') throw new Error('reservation failed');
+      return scenario !== 'reservation-denied';
+    });
+    const post = vi.fn(({ body }) => {
+      if (scenario === 'post-error') throw new Error('ambiguous write');
+      return { body, author: { login: 'outsider' } };
+    });
+    const [result] = enrichPrsWithStandDownAutoProceed([snapshot], {
+      repo: 'org/repo', requiredChecks: ['test'], readContext: () => redMainContext,
+      readScopedChecks: () => [], readComments: () => {
+        if (++reads === 1) return first;
+        if (scenario === 'second-read-error') throw new Error('thread unavailable');
+        return latest;
+      }, readChecks: () => {
+        if (scenario === 'checks-error') throw new Error('checks unavailable');
+        return evidence(rerun);
+      }, readHead: () => scenario === 'head-moved' ? 'b'.repeat(40) : head,
+      reserve, post, log: () => {},
+    });
+    expect(result.comments).toEqual(['second-read-error', 'checks-error'].includes(scenario) ? first : latest);
+    if (['new-question', 'new-ci-hold', 'operator-answer'].includes(scenario)) {
+      expect(reserve).not.toHaveBeenCalled();
+      expect(post).not.toHaveBeenCalled();
+    }
+    if (['new-question', 'new-ci-hold'].includes(scenario)) {
+      const refreshed = lapse(result);
+      expect(countUnresolvedStandDowns(refreshed.comments)).toBe(1);
+      const plan = planReconcile({ prs: [refreshed], agents: [], requiredChecks: ['test'] });
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals.map(row => row.kind)).toContain('stood-down');
+    }
   });
 it('bounds candidate reads and leaves an operator-visible fallback', () => {
   let reads = 0;

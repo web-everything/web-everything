@@ -12,4 +12,6 @@ A durable exclusive reservation lives beside the existing fix-loop ledger, keyed
 
 Focused fixtures: we:scripts/conveyor/__tests__/stand-down-auto-proceed.test.mjs.
 
-Reconciliation is read-only for R123 by default. Only a caller passing the literal boolean `allowStandDownAutoProceed: true` may invoke this writer, including its cursor and reservation writes. The mutating fix-dispatch pass enables it; dry-run claim planning, standalone reconcile CLI and other planning readers do not. The writer remains before main-red enrichment when enabled.
+Every completed comment refresh is retained for downstream planning, including when reclassification rejects a new question or changed target, a reservation is refused, or later IO fails. An unreadable refresh retains the last complete thread; an unverified posted answer is never appended.
+
+Reconciliation and the exported `runReconcileFixDispatch` function are read-only for R123 by default. Only a caller passing the literal boolean `allowStandDownAutoProceed: true` may invoke this writer, including its cursor and reservation writes. The mutating fix-dispatch CLI enables it explicitly. The daemon live smoke and targeted orphan redispatch explicitly pass false; dry-run claim planning, standalone reconcile CLI and other planning readers leave it disabled. Stubbing dispatch alone does not authorize R123 writes. The writer remains before main-red enrichment when enabled.

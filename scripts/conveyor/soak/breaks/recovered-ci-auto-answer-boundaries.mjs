@@ -20,7 +20,8 @@ export default {
     const { runReconcilePass } = await load('scripts/conveyor/reconcile-pass.mjs');
     const { planFixDispatchClaimStatus, runReconcileFixDispatch } = await load('scripts/conveyor/reconcile-fix-dispatch.mjs');
     const io = await load('scripts/conveyor/stand-down-auto-proceed-io.mjs');
-    const { buildStandDownComment } = await load('scripts/conveyor/stand-down.mjs');
+    const { annotateLapsedStandDowns, buildStandDownComment } = await load('scripts/conveyor/stand-down.mjs');
+    const { countUnresolvedStandDowns, planReconcile } = await load('scripts/conveyor/reconcile-core.mjs');
     const { ghRepoSlug } = await load('scripts/lib/constellation-repos.mjs');
     const weSlug = ghRepoSlug('we'), frontierSlug = ghRepoSlug('frontierui');
     const head = 'a'.repeat(40), author = { login: 'web-everything' };
@@ -60,13 +61,50 @@ export default {
     const dryRunWrites = [...writes];
     if (writes.length) violations.push(`dry-run wrote ${writes.join(',')}`);
     writes.length = 0;
+    const dispatchOptions = { repo: 'we', reconcile, checkStaleness: () => ({ fresh: true }),
+      netScope: null, prStack: null, resolveProfile: () => ({ capabilities: { fix: false } }) };
+    runReconcileFixDispatch(dispatchOptions);
+    const defaultDispatchWrites = [...writes];
+    if (writes.length) violations.push(`default dispatch wrote ${writes.join(',')}`);
+    writes.length = 0;
+    runReconcileFixDispatch({ ...dispatchOptions, allowStandDownAutoProceed: false });
+    const optedOutDispatchWrites = [...writes];
+    if (writes.length) violations.push(`opted-out dispatch wrote ${writes.join(',')}`);
+    writes.length = 0;
     runReconcileFixDispatch({ repo: 'we', reconcile, checkStaleness: () => ({ fresh: true }),
+      allowStandDownAutoProceed: true,
       netScope: null, prStack: null, resolveProfile: () => ({ capabilities: { fix: false } }) });
     if (writes.join(',') !== 'cursor,reserve,post') violations.push('mutating dispatch did not explicitly enable automatic answers');
     writes.length = 0;
     io.enrichPrsWithStandDownAutoProceed([pr], { ...writerOptions,
       readChecks: () => ({ head, complete: true, runs: [run(101, 'failure'), run(102, 'success', 902)] }) });
     if (writes.includes('reserve') || writes.includes('post')) violations.push('independent same-name workflow success released a failed suite');
+
+    // A recovered main can lapse the original hold before the writer refreshes the thread.
+    // A question arriving during check reads must still reach the downstream planner.
+    const lapse = snapshot => annotateLapsedStandDowns(snapshot, {
+      lapseOnNewHead: 'off', redMainLapse: () => true, onLapse: () => {},
+    });
+    const parked = [{ ...comments[0], body: buildStandDownComment({ reason: 'fix-loop-exhausted', head }) }];
+    const question = { id: 'SD2', author, createdAt: '2026-10-13T12:02:00Z',
+      body: buildStandDownComment({ reason: 'needs-judgment', head }) };
+    const lapsed = lapse({ ...pr, labels: ['review:changes'], comments: parked });
+    if (countUnresolvedStandDowns(lapsed.comments) !== 0) violations.push('race fixture did not lapse the original hold');
+    let threadReads = 0;
+    writes.length = 0;
+    const [refreshed] = io.enrichPrsWithStandDownAutoProceed([lapsed], { ...writerOptions,
+      readComments: () => ++threadReads === 1 ? parked : [...parked, question],
+    });
+    const plannedPr = lapse(refreshed);
+    const racePlan = planReconcile({ prs: [plannedPr], agents: [], requiredChecks: ['test'] });
+    const refreshedThreadRace = { threadReads, writes: [...writes],
+      unresolved: countUnresolvedStandDowns(plannedPr.comments),
+      dispatch: racePlan.dispatch, refusals: racePlan.refusals.map(row => row.kind) };
+    if (threadReads !== 2 || writes.includes('reserve') || writes.includes('post')
+      || refreshedThreadRace.unresolved !== 1 || racePlan.dispatch.length
+      || !refreshedThreadRace.refusals.includes('stood-down')) {
+      violations.push('refreshed judgment hold was discarded before downstream planning');
+    }
 
     const mainReads = [], crossRepoWrites = [];
     if (typeof io.readAutoProceedContext !== 'function') violations.push('repository-bound main context reader is missing');
@@ -98,7 +136,8 @@ export default {
       });
       if (crossRepoWrites.length) violations.push('a WE outage released a genuine FrontierUI failure');
     }
-    return { violations, dryRunWrites, mainReads, crossRepoWrites };
+    return { violations, dryRunWrites, defaultDispatchWrites, optedOutDispatchWrites, mainReads, crossRepoWrites,
+      refreshedThreadRace };
   },
   judge(report) { return report.violations; },
 };

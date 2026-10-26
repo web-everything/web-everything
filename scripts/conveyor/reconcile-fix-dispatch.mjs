@@ -1808,6 +1808,8 @@ export function runReconcileFixDispatch({
   tryResumeRound = isUnderTestEnv() ? null : tryResumeRoundFix,
   dispatch = dispatchFix,
   reconcile = runReconcilePass,
+  // R123 writes require caller permission, even when dispatch itself is stubbed (live smoke).
+  allowStandDownAutoProceed = false,
   // Card xd1tvd0 — rewrite the scope-overlap fences to each PR's git net diff vs current main (the `fixOverlap`
   // setting). Real git only with the real reconcile; an injected `reconcile` (every test) keeps its own fences.
   netScope = reconcile === runReconcilePass ? applyNetScopeToReconcile : null,
@@ -1878,7 +1880,7 @@ export function runReconcileFixDispatch({
   // will, once fix dispatch is turned on for that repo, dispatch fixes) from code that had already been proven
   // stale. Run it for every repo.
   assertMainNotStale(root, checkStaleness, FIX_STALE_GUARD_OPTS);
-  const reconciledRaw = reconcile({ repo, allowStandDownAutoProceed: true,
+  const reconciledRaw = reconcile({ repo, allowStandDownAutoProceed,
     ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   const reconciled = netScope ? netScope(reconciledRaw, { root, repoKey }) : reconciledRaw;
   const dispatchEntries = Array.isArray(reconciled.dispatch) ? reconciled.dispatch : [];
@@ -2437,6 +2439,7 @@ if (IS_CLI) {
       const { resolveLiveQueueBaseline } = await import('../readiness/heavy-admission.mjs');
       result = runReconcileFixDispatch({
         repo: typeof flags.repo === 'string' ? flags.repo : null, prsFile: flags['prs-file'],
+        allowStandDownAutoProceed: true,
         queueAdmission: ({ root }) => resolveLiveQueueBaseline({ checkoutRoot: root }),
       });
     } catch (e) {
