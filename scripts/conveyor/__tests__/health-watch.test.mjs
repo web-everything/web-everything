@@ -47,6 +47,11 @@ vi.mock('../health-watch-section.mjs', async original => {
 vi.mock('../needs-you-feed-job.mjs', () => ({ superviseNeedsYouFeed: vi.fn(() => ({ enqueued: false })) }));
 const cardBatchSeal = vi.hoisted(() => vi.fn(() => []));
 vi.mock('../../operations/card-batch-seal-io.mjs', () => ({ sealDueBatches: cardBatchSeal }));
+const cardBatchReconcile = vi.hoisted(() => vi.fn(() => []));
+vi.mock('../../operations/card-batch-reconcile.mjs', () => ({
+  reconcileCardBatches: cardBatchReconcile, resolveReconcileIntervalMin: () => 5,
+}));
+
 
 let dir;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'health-watch-test-')); });
@@ -428,7 +433,7 @@ describe('tick() — machine-overload: normal snapshot never opens, the incident
     for (let i = 0; i < copies; i += 1) {
       const scriptPid = pid++;
       const nodePid = pid++;
-      lines.push(`${scriptPid}     1  92.0       00:19:40 /bin/sh /Users/nicolasgilbert/workspace/webeverything/scratchpad/spawn-hog2.sh`);
+      lines.push(`${scriptPid}     1  92.0       00:19:40 /bin/sh /fixture/workspace/webeverything/scratchpad/spawn-hog2.sh`);
       lines.push(`${nodePid} ${scriptPid}  98.0       00:00:02 node -e 1`);
     }
     writeFileSync(path, lines.join('\n'));
@@ -1636,3 +1641,32 @@ it('wires each review sweep and disk probe into tick and publishes distinct open
     sweepReviewTmp.mockImplementation(real.sweepReviewTmp); probeDiskSpace.mockImplementation(real.probeDiskSpace);
   }
 }, 30000);
+
+
+it('runs card batch reconcile only when due, stamps success, and reports failures', async () => {
+  sealTestRoot.path = dir;
+  const hd = healthDir(dir); mkdirSync(hd, { recursive: true });
+  writeFileSync(join(hd, 'config.json'), JSON.stringify({ tmpSweepEnabled: false, claudeJobsArchiveEnabled: false }));
+  const ps = join(dir, 'ps.txt'); writeFileSync(ps, '');
+  const flags = { 'logs-dir': join(dir, 'logs'), 'lock-root': join(dir, 'locks'),
+    'self-sync-dir': join(dir, 'sync'), 'ps-fixture': ps, 'no-gh': true, 'no-diagnose': true };
+  const start = Date.parse('2026-10-18T12:00:00Z');
+  cardBatchReconcile.mockClear();
+  try {
+    await tick({ ...flags, now: new Date(start).toISOString() });
+    expect(cardBatchReconcile).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(readFileSync(join(hd, 'state.json'))).cardBatchReconcile.completedAt).toBe(start);
+    await tick({ ...flags, now: new Date(start + 299_999).toISOString() });
+    expect(cardBatchReconcile).toHaveBeenCalledTimes(1);
+    await tick({ ...flags, now: new Date(start + 300_000).toISOString() });
+    expect(cardBatchReconcile).toHaveBeenCalledTimes(2);
+    cardBatchReconcile.mockImplementationOnce(() => { throw Error('reconcile failed'); });
+    const failed = await tick({ ...flags, now: new Date(start + 600_000).toISOString() });
+    expect(failed.probeErrors.cardBatchReconcile).toBe('reconcile failed');
+    expect(JSON.parse(readFileSync(join(hd, 'state.json'))).cardBatchReconcile.completedAt).toBe(start + 300_000);
+    cardBatchReconcile.mockClear();
+    await tick({ ...flags, 'dry-run': true });
+    await tick({ ...flags, 'state-root': dir });
+    expect(cardBatchReconcile).not.toHaveBeenCalled();
+  } finally { sealTestRoot.path = null; }
+});

@@ -3,16 +3,22 @@ import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
 import { readRedTeamDisposition, readRedTeamProbes } from './red-team-gate.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
+import { savedRedTeamFallback } from './drain-saved-red-team.mjs';
 
 import { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
 export { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
 
 export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence = {}, env = {}, standingRuling = null } = {}) {
-  const disposition = readRedTeamDisposition({ comments, pr, head, env, repo, standingRuling });
+  let disposition = readRedTeamDisposition({ comments, pr, head, env, repo, standingRuling });
+  if (!disposition.result) {
+    const savedResult = savedRedTeamFallback({ repo, pr, head, env })();
+    if (savedResult) disposition = readRedTeamDisposition({ comments, pr, head, env, repo, standingRuling, savedResult });
+  }
   const verdict = evidence.status?.status === 'finished' ? evidence.status.result?.foldedVerdict : null;
   const finished = verdict === 'changes' ? 'red-team:blocked' : verdict === 'accept' ? 'red-team:clear' : null;
   const desired = disposition.sendBack.length || disposition.held.length ? 'red-team:blocked'
-    : disposition.result ? 'red-team:clear'
+    : disposition.result?.recheckIncomplete ? 'red-team:pending'
+      : disposition.result ? 'red-team:clear'
       : finished ? finished
       : redTeamOwedOnHead({ read: evidence.loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly }) ? 'red-team:pending' : null;
   const names = labels.map(l => typeof l === 'string' ? l : l?.name);
