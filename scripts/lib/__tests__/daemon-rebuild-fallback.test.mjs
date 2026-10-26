@@ -386,12 +386,7 @@ describe('smoke-env-timeout: a slow lane scan under load never makes an overlay 
 // ── d. pinned overlay + bad candidate + passing last-good control ──────────────────────────────────────────
 
 describe('pinned overlay stays held on smoke-rejected when the last-good control passes', () => {
-  it.each([
-    { label: 'without a tail', diagnostics: {}, expected: {} },
-    { label: 'with a redacted, bounded tail',
-      diagnostics: { stderrTail: `HTTP 401: ghp_secretToken ${'x'.repeat(600)}` },
-      expected: { stderrTail: `HTTP 401: ghp_<redacted> ${'x'.repeat(600)}`.slice(0, 500) } },
-  ])('holds on last-good and preserves rejection diagnostics $label', async ({ diagnostics, expected }) => {
+  async function assertHeldDiagnostics(diagnostics = {}, expected = {}) {
     const { originDir, cloneDir, env } = makeFixture();
     pushBranch(originDir, 'lane/pinned-bad', (dir) => writeFile(dir, 'pinned-bad.txt', 'x\n'));
     addOverlay(cloneDir, { ref: 'lane/pinned-bad', pinned: true }, { env });
@@ -416,6 +411,17 @@ describe('pinned overlay stays held on smoke-rejected when the last-good control
     expect(state.held.details).toEqual(details);
     // A (candidate) + C (last-good control) — no B: the overlay is pinned, so the plain-main fallback never runs.
     expect(runSmoke).toHaveBeenCalledTimes(2);
+  }
+
+  it('holds the clone on last-good, records state.held, alerts daemon-held-on-last-good', async () => {
+    await assertHeldDiagnostics();
+  });
+
+  it('holds on last-good and preserves redacted, bounded stderr diagnostics', async () => {
+    await assertHeldDiagnostics(
+      { stderrTail: `HTTP 401: ghp_secretToken ${'x'.repeat(600)}` },
+      { stderrTail: `HTTP 401: ghp_<redacted> ${'x'.repeat(600)}`.slice(0, 500) },
+    );
   });
 });
 
