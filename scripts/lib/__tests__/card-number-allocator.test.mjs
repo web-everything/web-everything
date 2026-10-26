@@ -172,13 +172,26 @@ it.each(['base', 'merged'])('%s collision planner takes a number above the front
     : planRenumber([...files, { name: '074-existing.md', text: 'Existing\n', ordinal: 1 }],
       { ontoNames: ['074-existing.md'], ...constraints });
   expect(plan.collisions[0].newNum).toBe('078');
-  for (const exhausted of [{ reservedNums: ['99999'], ceiling: 99999 }, { reservedNums: ['nan'], ceiling: 75 }]) {
+  for (const [refused, error] of [[{ reservedNums: ['99999'], ceiling: 99999 }, /exhausted/],
+    [{ reservedNums: ['nan'], ceiling: 75 }, /invalid card number/]]) {
     expect(() => kind === 'base'
-      ? planBaseCollisionHeal(files, { baseNums: ['074'], baseNames: ['074-existing.md'], ...exhausted })
+      ? planBaseCollisionHeal(files, { baseNums: ['074'], baseNames: ['074-existing.md'], ...refused })
       : planRenumber([...files, { name: '074-existing.md', text: 'Existing\n' }],
-        { ontoNames: ['074-existing.md'], ...exhausted }))
-      .toThrow(/exhausted/);
+        { ontoNames: ['074-existing.md'], ...refused }))
+      .toThrow(error);
   }
+});
+
+it.each(['base', 'merged'])('%s collision planner skips but never trusts a high unreserved lane number', (kind) => {
+  // A stray lane file must not push the permanent shared claim to the top of the range.
+  const files = [{ name: '074-incoming.md', text: '---\n---\nIncoming\n', ordinal: 2 },
+    { name: '076-local.md', text: 'Local\n', ordinal: 1 }, { name: '99998-stray.md', text: 'Stray\n', ordinal: 1 }];
+  const constraints = { reservedNums: ['075'], ceiling: 75 };
+  const plan = kind === 'base'
+    ? planBaseCollisionHeal(files, { baseNums: ['074'], baseNames: ['074-existing.md'], ...constraints })
+    : planRenumber([...files, { name: '074-existing.md', text: 'Existing\n', ordinal: 1 }],
+      { ontoNames: ['074-existing.md'], ...constraints });
+  expect(plan.collisions.map((move) => move.newNum)).toEqual(['077']);
 });
 
 it.each(['base', 'merged'])('%s collision planner never reuses a deleted legacy number below the frontier', (kind) => {

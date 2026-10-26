@@ -8,7 +8,7 @@ import { tryAcquireNumberingLock, releaseNumberingLockIfOwned } from '../../read
 const collisionRoots = [];
 afterEach(() => collisionRoots.splice(0).forEach((root) => rmSync(root, { recursive: true, force: true })));
 
-function collisionCli(kind, { reservedSource = false, rejectPush = false, offline = false, noop = false, lastNumber = false } = {}) {
+function collisionCli(kind, { reservedSource = false, rejectPush = false, offline = false, noop = false, lastNumber = false, exhausted = false } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'collision-cli-')));
   collisionRoots.push(root);
   cpSync('scripts', join(root, 'scripts'), { recursive: true, filter: (p) => basename(p) !== '__tests__' });
@@ -25,6 +25,7 @@ function collisionCli(kind, { reservedSource = false, rejectPush = false, offlin
   const refs = Object.fromEntries(['075', '077', '079']
     .map((num) => ['refs/number-reservations/' + num, 'a'.repeat(40)]));
   if (reservedSource) refs['refs/number-reservations/074'] = 'a'.repeat(40);
+  if (exhausted) refs['refs/number-reservations/99999'] = 'a'.repeat(40);
   writeFileSync(stateFile, JSON.stringify({ refs, calls: [], pushes: [], blobs: {} }));
   // Observe the real CLI's filesystem at the transport boundary, before accepting a claim.
   // Unknown commands fail; this fixture never delegates to live Git or touches .git.
@@ -116,6 +117,14 @@ it.each(['yield', 'renumber'])('%s CLI takes a fresh number above the frontier, 
   expect(cli.files()).toEqual({ ...keepers, '080-incoming.md': incoming });
 });
 
+it.each(['yield', 'renumber'])('%s CLI does not let an unreserved local 99999 card raise the shared frontier', (kind) => {
+  const cli = collisionCli(kind, { lastNumber: true });
+  const result = cli.run();
+  const nums = kind === 'yield' ? [result.num] : result.renumbered.map((move) => move.newNum);
+  expect(nums).toEqual(['080']);
+  expect(Object.keys(cli.state().refs)).not.toContain('refs/number-reservations/99999');
+});
+
 it.each(['yield', 'renumber'])('%s CLI refuses a reserved source without bornAs before any claim or rewrite', (kind) => {
   const cli = collisionCli(kind, { reservedSource: true });
   expect(() => cli.run()).toThrow(/immutable birth number/);
@@ -140,7 +149,7 @@ it.each(['yield', 'renumber'])('%s CLI refuses unavailable remote evidence befor
 });
 
 it.each(['yield', 'renumber'])('%s CLI refuses an exhausted number range before any claim or rewrite', (kind) => {
-  const cli = collisionCli(kind, { lastNumber: true });
+  const cli = collisionCli(kind, { exhausted: true });
   expect(() => cli.run()).toThrow(/exhausted/);
   expect(cli.files()).toEqual(cli.original);
   expect(cli.state()).toMatchObject({ refs: cli.refs, pushes: [], blobs: {} });

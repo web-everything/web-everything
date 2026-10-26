@@ -42,20 +42,24 @@ export function assertRenumberable(file, reservedNums = []) {
     throw Error(`immutable birth number in ${file.name}; repair the collision manually`);
 }
 
-/** Remote-backed healing takes a fresh number above the durable frontier and every known number.
+/** Remote-backed healing takes the lowest free number above the durable frontier.
  * Trees and reservation refs cannot prove a gap was never issued: a legacy card deleted before
- * reservation refs existed leaves no trace, so a gap is never reused. The caller must atomically
- * claim the targets before applying this plan; a lost claim or exhausted range means manual repair.
+ * reservation refs existed leaves no trace, so a gap below the frontier is never reused. Local and
+ * lane numbers are only skipped, never trusted to raise the shared frontier. The caller must
+ * atomically claim the targets before applying this plan; a lost claim or exhausted range means
+ * manual repair.
  */
 export function allocateCollisionNum(usedNums, allocated, baseNums, constraints, fallback = allocateGapId) {
   const { reservedNums = [], canonicalNums = [], ceiling } = constraints;
   if (ceiling == null) return fallback(new Set([...usedNums, ...reservedNums, ...canonicalNums]), allocated, baseNums);
   if (!Number.isSafeInteger(ceiling) || ceiling < 0) throw Error('invalid reservation frontier');
-  // NaN from a malformed number poisons the max, so the range check below refuses it.
-  const next = [...usedNums, ...allocated, ...baseNums, ...reservedNums, ...canonicalNums]
-    .reduce((max, n) => Math.max(max, Number(n)), ceiling) + 1;
-  if (!Number.isSafeInteger(next) || next > 99999) throw Error('card number exhausted; repair the collision manually');
-  return String(next).padStart(3, '0');
+  const taken = [...usedNums, ...allocated, ...baseNums, ...reservedNums, ...canonicalNums].map(Number);
+  if (taken.some((n) => !Number.isSafeInteger(n))) throw Error('invalid card number in collision evidence');
+  const takenSet = new Set(taken);
+  for (let n = ceiling + 1; n <= 99999; n++) {
+    if (!takenSet.has(n)) return String(n).padStart(3, '0');
+  }
+  throw Error('card number exhausted; repair the collision manually');
 }
 
 /** Parse a `backlog/NNN-slug.md` filename into `{ num, slug }`, or `null` if it isn't one. */
