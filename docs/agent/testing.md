@@ -33,6 +33,12 @@ the #5961/#5962 fixture preserves the real import, registration and array-replac
 Sandbox tokens anywhere in a hunk and hidden separators/control characters in protection additions
 retain the hold. Missing/invalid tool mode stays shadow even when the platform requests live;
 dependency proof checks regular-file sizes before reads, and shadow event logging waits at most 2s.
+Review each "nearest", "only", and "never" qualifier in this document against a named test
+that would fail if the qualifier were removed; prose qualifiers require review, not a deterministic gate.
+The nearest-nonblank cases cover blank context before and after a list entry. The shape tests
+read the shipped settings with an empty environment and require shadow mode. Loader rejection
+cases start with successful read-only evidence, then isolate missing trusted declarations,
+incomplete dependency graphs, and the accepted 512-file / rejected 513-file boundary.
 
 ## Established-overlay auto-rebase
 

@@ -100,6 +100,13 @@ describe('direction-aware humanRequired shadow (R131)', () => {
       expect(propose({ [runner]: diff(runner, ...hunks) }, [permission(runner)]).proposed).toBe(true);
     }
   });
+  it.each(['before', 'after', 'both'])('uses nearest nonblank list neighbours with blank context %s the entry', side => {
+    const section = diff(runner, [' const allowed = [',
+      ...(side !== 'after' ? [' ', '   '] : []), '+PR_TRACE_OP,',
+      ...(side !== 'before' ? [' ', '   '] : []), ' ];']);
+    expect(propose({ [runner]: section }, [permission(runner)]))
+      .toEqual({ proposed: false, reason: 'adds only read-only ops: pr-trace' });
+  });
   it('caps total diff text at 200000 characters with an explicit human-review fallback', () => {
     const sections = Object.fromEntries([runner, sweep].map(file => [file,
       diff(file, [' const allowed = [', '+PR_TRACE_OP,', ' ];', ...Array(100).fill(` ${' '.repeat(1000)}`)])]));

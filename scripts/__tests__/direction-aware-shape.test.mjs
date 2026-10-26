@@ -17,10 +17,12 @@ const runner = 'scripts/operations/run.mjs';
 const diffHunks = `diff --git a/${runner} b/${runner}
 --- a/${runner}
 +++ b/${runner}
-@@ -1,2 +1,3 @@
+@@ -1,4 +1,5 @@
+ const zeroWrites = [
    HEALTH_OP,
 +  PR_TRACE_OP,
    EVENTS_OP,
+ ];
 `;
 const evidence = { changedFiles: [runner], diffHunks, readOnlyOps: new Set(['pr-trace']) };
 
@@ -30,6 +32,15 @@ async function withCompleteClosure(check) {
     files: new Set(entries), complete: true, jsonNames: new Set(),
   }));
   try { await check(closure); } finally { closure.mockRestore(); }
+}
+
+function readOnlyProofOptions() {
+  return {
+    importModule: vi.fn(async () => ({ OPERATIONS: { 'heavy-queue': 1 },
+      resolveOperation: () => ({ declaration: op('heavy-queue', { read: compute({ fn: () => null }) }) }) })),
+    lstat: () => ({ isFile: () => true, size: 9 }),
+    readFile: () => Buffer.from('unchanged'),
+  };
 }
 
 describe('R131 direction-aware shape wiring', () => {
@@ -107,6 +118,9 @@ describe('R131 direction-aware shape wiring', () => {
       expect(scoreEscalation({ ...evidence, ...override })).toMatchObject({ humanRequired: true, humanRequiredProposed: true });
     }
   });
+  it('defaults to shadow with shipped settings and an empty environment', () => {
+    expect(resolveDirectionAwareMode({ env: {} })).toBe('shadow');
+  });
   it('defaults to shadow, honours live env, and fails closed on invalid values', () => {
     const readFile = () => { throw new Error('missing'); };
     expect(resolveDirectionAwareMode({ env: {}, readFile })).toBe('shadow');
@@ -161,6 +175,46 @@ describe('R131 direction-aware shape wiring', () => {
       readFile: () => Buffer.alloc(8000001) })).toEqual(new Set());
     expect(resolveOperation).toHaveBeenCalledTimes(9);
     expect(await loadReadOnlyOps('/missing', { importModule: async () => { throw new Error('missing'); } })).toEqual(new Set());
+  }));
+  it('rejects operations without trusted declarations', async () => withCompleteClosure(async closure => {
+    const options = readOnlyProofOptions();
+    expect(await loadReadOnlyOps('/head', options)).toEqual(new Set(['heavy-queue']));
+    closure.mockClear();
+    // Even a resolved compute declaration cannot prove an operation absent from the trusted checkout.
+    const name = 'direction-aware-new-operation-fixture';
+    const resolveOperation = vi.fn(() => ({ declaration: op(name, { read: compute({ fn: () => null }) }) }));
+    expect(await loadReadOnlyOps('/head', { ...options,
+      importModule: async () => ({ OPERATIONS: { [name]: 1 }, resolveOperation }),
+    })).toEqual(new Set());
+    expect(resolveOperation).toHaveBeenCalledWith(name);
+    expect(closure).not.toHaveBeenCalled();
+  }));
+  it.each([undefined, null, {}])('rejects missing or malformed resolved declarations: %j', declaration => withCompleteClosure(async () => {
+    const options = readOnlyProofOptions();
+    expect(await loadReadOnlyOps('/head', options)).toEqual(new Set(['heavy-queue']));
+    expect(await loadReadOnlyOps('/head', { ...options,
+      importModule: async () => ({ OPERATIONS: { 'heavy-queue': 1 }, resolveOperation: () => ({ declaration }) }),
+    })).toEqual(new Set());
+  }));
+  it('rejects incomplete dependency graphs', async () => withCompleteClosure(async closure => {
+    const options = readOnlyProofOptions();
+    expect(await loadReadOnlyOps('/head', options)).toEqual(new Set(['heavy-queue']));
+    const graph = closure.mock.results[0].value;
+    closure.mockReturnValue({ ...graph, complete: false });
+    expect(await loadReadOnlyOps('/head', options)).toEqual(new Set());
+  }));
+  it('rejects dependency graphs above 512 files', async () => withCompleteClosure(async closure => {
+    const options = readOnlyProofOptions();
+    expect(await loadReadOnlyOps('/head', options)).toEqual(new Set(['heavy-queue']));
+    const graph = closure.mock.results[0].value;
+    const files = new Set(graph.files);
+    for (let i = files.size; i < 512; i += 1) files.add(`scripts/lib/proof-fixture-${i}.mjs`);
+    closure.mockReturnValue({ ...graph, files });
+    expect(files.size).toBe(512);
+    expect(await loadReadOnlyOps('/head', options)).toEqual(new Set(['heavy-queue']));
+    files.add('scripts/lib/proof-fixture-over-limit.mjs');
+    expect(files.size).toBe(513);
+    expect(await loadReadOnlyOps('/head', options)).toEqual(new Set());
   }));
   it('rejects pr-reconcile when the non-name-prefixed pr-status IO differs in the head', async () => {
     await withCompleteClosure(async closure => {
