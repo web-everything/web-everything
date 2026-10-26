@@ -11,6 +11,7 @@ Body markers are display hints; publication must be confirmed again from the sto
 The admission marker carries a digest of the exact Size section it closes. When any text there
 changed (another heading, a comment, or an edit that keeps the note's grammar), retries remove
 only that marker and preserve the author's text. Ordinary retries still replace their own Size note.
+pr-land re-reads the live body after card filing and skips the note when it changed or is unreadable.
 Author text is never truncated or escaped: past the forge body limit the note is skipped and the
 body returned unchanged (no edit), and every fallback, including the runner's outer catch, returns
 the caller's body. Reviewers are still requested in each case.

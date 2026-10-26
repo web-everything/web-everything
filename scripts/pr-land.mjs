@@ -1023,7 +1023,10 @@ async function runCli() {
   }
   createParams.body = sizeAdmission.body;
   if (prNum != null && sizeBodyRead && sizeAdmission.body !== sizeBody) {
-    try { forge.editBody(prNum, sizeAdmission.body); } catch { /* retry will reuse the local split card */ }
+    // Card filing can take minutes: re-read first and skip the note if the body changed meanwhile.
+    try {
+      if (composePrBody(forge.viewPr(prNum, 'body').body || '') === sizeBody) forge.editBody(prNum, sizeAdmission.body);
+    } catch { /* retry will reuse the local split card */ }
   }
 
   if (prNum == null) {

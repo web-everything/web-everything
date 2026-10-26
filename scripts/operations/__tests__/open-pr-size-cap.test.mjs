@@ -360,6 +360,21 @@ describe('pr-land CLI size failure boundaries', () => {
     if (prNum != null) expect(forge.editBody).toHaveBeenCalledWith(prNum, result.createParams.body);
   });
 
+  it.each([
+    ['an author edit', () => ({ body: 'live body\n\n## Rollout\nAuthor edit during card filing.' })],
+    ['an unreadable re-read', () => { throw new Error('body unavailable'); }],
+  ])('never writes the size note over %s made while cards were filed', async (_label, reread) => {
+    const forge = { viewPr: vi.fn(() => ({ body: 'live body' })), editBody: vi.fn() };
+    const admit = vi.fn(async ({ body }) => {
+      forge.viewPr.mockImplementation(reread);
+      return { status: 'over', body: `${body}\nSize note`, reviewLabel: REVIEW_LABELS.pending };
+    });
+    const result = await runBlock(forge, admit, 5854, REVIEW_LABELS);
+    expect(forge.viewPr).toHaveBeenCalledTimes(2);
+    expect(forge.editBody).not.toHaveBeenCalled();
+    expect(result.sizeAdmission.reviewLabel).toBe(REVIEW_LABELS.pending);
+  });
+
   it('never edits a live body that is already at the forge limit', async () => {
     const live = 'x'.repeat(65_500);
     const forge = { viewPr: vi.fn(() => ({ body: live })), editBody: vi.fn() };
