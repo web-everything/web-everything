@@ -371,15 +371,21 @@ describe('pr-land CLI size failure boundaries', () => {
   });
 
   it('the escalation-reason stamp never writes over an unread live body', () => {
-    const start = source.indexOf("        let liveBody = '';");
-    const stamp = source.slice(start, source.indexOf('\n      } catch { /* best-effort — the label already carries the signal */ }', start));
+    const start = source.indexOf("        let liveBody = ''");
+    const end = source.indexOf('\n      } catch { /* best-effort — the label already carries the signal */ }', start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
     const reconcile = vi.fn(() => ({ changed: true, body: '## Escalation reasons\n- size' }));
-    const execute = new Function('forge', 'prNum', 'verdict', 'reconcileEscalationReasonBlock', stamp);
-    for (const read of [() => { throw new Error('body unavailable'); }, () => ({ body: 'live body' })]) {
-      const forge = { viewPr: vi.fn(read), editBody: vi.fn() };
+    const execute = new Function('forge', 'prNum', 'verdict', 'reconcileEscalationReasonBlock', source.slice(start, end));
+    for (const readSucceeds of [false, true]) {
+      const forge = { viewPr: vi.fn(() => {
+        if (!readSucceeds) throw new Error('body unavailable');
+        return { body: 'live body' };
+      }), editBody: vi.fn() };
       execute(forge, 5854, { reasons: ['size'] }, reconcile);
-      if (forge.viewPr.mock.results[0].type === 'throw') expect(forge.editBody).not.toHaveBeenCalled();
-      else expect(forge.editBody).toHaveBeenCalledWith(5854, '## Escalation reasons\n- size');
+      expect(forge.viewPr).toHaveBeenCalledOnce();
+      if (readSucceeds) expect(forge.editBody).toHaveBeenCalledWith(5854, '## Escalation reasons\n- size');
+      else expect(forge.editBody).not.toHaveBeenCalled();
     }
   });
 
