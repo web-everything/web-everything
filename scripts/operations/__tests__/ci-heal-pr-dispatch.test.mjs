@@ -30,6 +30,13 @@ import { buildCiHealComment } from '../../conveyor/ci-heal-mark.mjs';
 import { enrichPrsWithTimeoutEvidence } from '../../conveyor/reconcile-pass.mjs';
 import { readTimeoutBudget, timeoutKey } from '../../conveyor/timeout-retry-state.mjs';
 import { planReconcile } from '../../conveyor/reconcile-core.mjs';
+import { allocateCardNumber } from '../../lib/card-number-allocator.mjs';
+
+// Dispatch fixtures use a deterministic birth number; allocator transport has its own suite.
+// Replacing the filing sink alone still leaves planning able to reserve a live remote number.
+vi.mock('../../lib/card-number-allocator.mjs', () => ({
+  allocateCardNumber: vi.fn(() => ({ ok: true, num: '900001' })),
+}));
 
 it.each([0, 3])('xng7q1p: eligible PR with %i heals retries without a lane or heal', async (count) => {
   const head = 'a'.repeat(40);
@@ -645,7 +652,10 @@ describe('xng7q1p retry reservation and restart soak', () => {
     job: j.job, jobRun: j.run, attempt: j.attempt, jobAttempt: j.attempt, status: 'completed', conclusion: 'failure' });
   async function harness(fn) {
     const dir = mkdtempSync(join(tmpdir(), 'timeout-retry-'));
-    try { await fn(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
+    try {
+      mkdirSync(join(dir, 'backlog'));
+      await fn(dir);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   }
   const t0 = Date.parse('2026-10-01T00:00:00.000Z');
   const readState = (dir, e) => JSON.parse(readFileSync(join(dir, `${timeoutKey(e)}.json`), 'utf8'));
@@ -721,7 +731,7 @@ describe('xng7q1p retry reservation and restart soak', () => {
   }));
   it('100 concurrent ticks/restarts spend exactly two requests, one card, and no third request', async () => harness(async (dir) => {
     const e = evidence(); let requests = 0; let cards = 0;
-    const opts = { dir, repo: e.repo, effects: { observe, request: async () => { requests++; return { status: 'confirmed' }; } },
+    const opts = { dir, root: dir, repo: e.repo, effects: { observe, request: async () => { requests++; return { status: 'confirmed' }; } },
       fileFollowup: async () => { cards++; } };
     await Promise.all(Array.from({ length: 50 }, () => dispatchTimeoutRetry(e, opts)));
     expect(requests).toBe(1); expect(cards).toBe(0);
@@ -738,14 +748,14 @@ describe('xng7q1p retry reservation and restart soak', () => {
     for (let i = 0; i < 2; i++) writeFileSync(join(dir, `legacy-${i}.json`), JSON.stringify({ version: 1,
       evidence: { ...e, signature: `old-${i}` }, requests: [{ id: 0, target: { ...e.jobs[0], job: 20 + i }, status: 'confirmed' }] }));
     expect(readTimeoutBudget({ ...e, dir })).toEqual({ confirmed: 2, rejected: 0, pending: false });
-    expect(await dispatchTimeoutRetry(e, { dir, repo: e.repo, fileFollowup: async () => {},
+    expect(await dispatchTimeoutRetry(e, { dir, root: dir, repo: e.repo, fileFollowup: async () => {},
       effects: { observe, request: () => { throw new Error('budget already spent'); } } }))
       .toMatchObject({ reason: 'timeout-retries-exhausted' });
     expect(readTimeoutBudget({ ...e, dir })).toEqual({ confirmed: 2, rejected: 0, pending: false });
   }));
   it('different signatures on one head share two requests and a new head receives a fresh budget', async () => harness(async (dir) => {
     const e = evidence(); let requests = 0;
-    const opts = { dir, repo: e.repo, effects: { observe, request: () => { requests++; return { status: 'confirmed' }; } }, fileFollowup: async () => {} };
+    const opts = { dir, root: dir, repo: e.repo, effects: { observe, request: () => { requests++; return { status: 'confirmed' }; } }, fileFollowup: async () => {} };
     for (let i = 0; i < 5; i++) {
       const result = await dispatchTimeoutRetry({ ...e, signature: `failure-set-${i}`, jobs: [{ ...e.jobs[0], job: 20 + i, attempt: 1 + i }] }, opts);
       expect(result.status).toBe(i < 2 ? 'requested' : 'refused');
@@ -757,7 +767,7 @@ describe('xng7q1p retry reservation and restart soak', () => {
   }));
   it.each(['confirmed', 'ambiguous'])('planner and dispatch reach a terminal action after %s requests', async (status) => harness(async (dir) => {
     const e = evidence(); let requests = 0;
-    const opts = { dir, repo: e.repo, effects: { observe, request: () => { requests++; return { status }; } }, fileFollowup: async () => {} };
+    const opts = { dir, root: dir, repo: e.repo, effects: { observe, request: () => { requests++; return { status }; } }, fileFollowup: async () => {} };
     let lastPlan;
     for (let tick = 0; tick < 5; tick++) {
       const next = { ...e, signature: `failure-${tick}`, jobs: [{ ...e.jobs[0], job: 20 + tick, attempt: 1 + tick }] };
@@ -824,14 +834,19 @@ describe('xng7q1p retry reservation and restart soak', () => {
   }));
   it('owed filing retries independently after CI passes and never reallocates its card identity', async () => harness(async (dir) => {
     const e = evidence(); const ids = []; let reject = true;
-    const fileFollowup = async (p) => { ids.push(p.num); if (reject) throw new Error('disk unavailable'); };
-    const opts = { dir, repo: e.repo, fileFollowup, effects: { observe, request: () => ({ status: 'confirmed' }) } };
+    const allocationsBefore = vi.mocked(allocateCardNumber).mock.calls.length;
+    const fileFollowup = vi.fn(async (p) => { ids.push(p.num); if (reject) throw new Error('disk unavailable'); });
+    const opts = { dir, root: dir, repo: e.repo, fileFollowup, effects: { observe, request: () => ({ status: 'confirmed' }) } };
     await dispatchTimeoutRetry(e, opts);
     await dispatchTimeoutRetry({ ...e, jobs: [{ ...e.jobs[0], job: 21, attempt: 2 }] }, opts);
     reject = false;
     await flushTimeoutFollowups(opts);
     await flushTimeoutFollowups(opts);
     expect(ids).toHaveLength(2); expect(new Set(ids).size).toBe(1);
+    expect(ids).toEqual(['900001', '900001']);
+    expect(fileFollowup.mock.calls[1][0]).toEqual(fileFollowup.mock.calls[0][0]);
+    expect(fileFollowup.mock.calls[0][0].abs).toBe(join(dir, 'backlog', '900001-investigate-timeout-retries-for-pr-3415-at-aaaaaaaa.md'));
+    expect(vi.mocked(allocateCardNumber).mock.calls.length - allocationsBefore).toBe(1);
   }));
   it('refuses stale heads and nonterminal jobs; a newly evidenced head gets a fresh budget', async () => harness(async (dir) => {
     const e = evidence(); let requests = 0;
