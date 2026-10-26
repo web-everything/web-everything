@@ -353,8 +353,18 @@ describe('planOrphanFixRound — #5608 operator referral rulings', () => {
       rulingAt: new Date(rulingAt).toISOString() });
   });
 
-  it('does not treat an untrusted author as an operator', () => {
-    expect(plan(thread(ruling(2, {}, { login: 'mallory' }))).reason).toContain('no fix round since the latest verdict');
+  it.each([false, true])('keeps an untrusted operator ruling with a person (completed fix round: %s)', (completedFix) => {
+    // The shared referral gate flags an outsider's copy as malformed, rather than ignoring it.
+    // Remove the human label so it cannot mask a fallback into ordinary fix-round recovery.
+    const pr = thread(ruling(2, {}, { login: 'mallory' }), { labels: ['review:changes'] });
+    if (completedFix) pr.comments.push(EVIDENCE, END);
+    expect(plan(pr)).toEqual({ decision: 'none', reason: 'malformed referral history — it stays with a person' });
+  });
+
+  it('keeps an untrusted operator ruling with a person even after a settled operator ruling', () => {
+    const pr = thread(ruling(), { labels: ['review:changes'] });
+    pr.comments.push(ruling(2, {}, { login: 'mallory' }));
+    expect(plan(pr)).toEqual({ decision: 'none', reason: 'malformed referral history — it stays with a person' });
   });
 
   it('keeps an automation-posted partial ruling with a person', () => {
