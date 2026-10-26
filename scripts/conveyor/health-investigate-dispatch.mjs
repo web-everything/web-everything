@@ -58,14 +58,14 @@ import { healthDir } from './health-watch-section.mjs';
 
 /** The declared read operations the agent may run through `run.mjs` (4078: runner-activity, stale-state,
  *  dispatch-eligibility). Every other operation id is denied — see {@link NON_READ_OPERATIONS}. */
-export const HEALTH_INVESTIGATE_READ_OPERATIONS = Object.freeze(['runner-activity', 'stale-state', 'adoption-matrix', 'dispatch-eligibility', 'health-respond', 'why']);
+export const HEALTH_INVESTIGATE_READ_OPERATIONS = Object.freeze(['runner-activity', 'stale-state', 'adoption-matrix', 'dispatch-eligibility', 'health-respond', 'why', 'pr-trace']);
 
 /** Every OTHER `run.mjs` operation id, denied by name. A static list (importing `run.mjs` here would pull every
  *  operation's io into the health tick); `health-investigate-dispatch.test.mjs` asserts it covers every id in
  *  `run.mjs#OPERATIONS`, so a new operation cannot silently become reachable. */
 export const NON_READ_OPERATIONS = Object.freeze([
   'land-human-only',
-  'review-pr', 'review-prep', 'record-verdict', 'verify', 'mutation-check', 'revert-red-check', 'gap-sweep-status', 'clear-stuck-session',
+  'review-pr', 'review-prep', 'record-verdict', 'verify', 'pr-size', 'mutation-check', 'revert-red-check', 'gap-sweep-status', 'clear-stuck-session',
   'resolve', 'close-items', 'reopen-items', 'scaffold', 'file-item', 'suggest-next', 'pr-status', 'land-advance', 'pr-reconcile', 'pr-ownership', 'pr-sweep',
   'agent-activity', 'item-activity', 'daemon-status', 'heavy-queue', 'review-seat-caps', 'gate-health', 'telemetry-summary',
   'graduation-progress-report', 'graduate-chain', 'judge-sweep-facts', 'route-pr-outcome', 'dispatch-lane', 'claim', 'open-pr', 'explore', 'stage-pr-view',

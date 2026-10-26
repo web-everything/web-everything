@@ -17,7 +17,7 @@ import { OPERATOR_LOGINS } from './marker-authorship.mjs';
 import { parseRedTeamGateMarker } from './red-team-gate.mjs';
 
 /** Gate-record outcomes only an operator may write. */
-export const OPERATOR_GATE_OUTCOMES = Object.freeze(['operator-card', 'operator-not-real']);
+export const OPERATOR_GATE_OUTCOMES = Object.freeze(['operator-card', 'operator-not-real', 'operator-block']);
 
 export function operatorGhEnv(env = process.env) {
   const out = { ...env };

@@ -233,22 +233,42 @@ describe('landing holder policy', () => {
 });
 describe('holder state reader', () => {
   const page = (nodes, hasNextPage = false, endCursor = null) => JSON.stringify({ data: { repository: { pullRequests: { nodes, pageInfo: { hasNextPage, endCursor } } } } });
-  const node = (number, labels = [], isInMergeQueue = false) => ({ number, headRefOid: 'head' + number, isInMergeQueue, labels: { nodes: labels.map(name => ({ name })) } });
+  const node = (number, labels = [], isInMergeQueue = false) => ({ number, headRefOid: 'head' + number, baseRefName: 'main', isInMergeQueue, labels: { nodes: labels.map(name => ({ name })) } });
   it('parses and lazily caches paginated states for the selected repository', () => {
     const first = page([node(1, ['review:accepted'])], true, 'next');
-    expect(policyApi.parseHolderStates(first).get(1)).toEqual({ labels: ['review:accepted'], inMergeQueue: false, headRefOid: 'head1' });
+    expect(policyApi.parseHolderStates(first).get(1)).toEqual({ labels: ['review:accepted'], inMergeQueue: false, headRefOid: 'head1', baseRefName: 'main' });
     const calls = [];
     const reader = policyApi.createHolderStateReader({ repo: 'owner/project', exec: (cmd, args) => {
       calls.push([cmd, args]); return calls.length === 1 ? first : page([node(2, [], true), node(3, ['review:pending'])]);
     } });
     expect(calls).toEqual([]);
-    expect(reader.stateFor(2)).toEqual({ labels: [], inMergeQueue: true, headRefOid: 'head2' });
+    expect(reader.stateFor(2)).toEqual({ labels: [], inMergeQueue: true, headRefOid: 'head2', baseRefName: 'main' });
     expect(reader.landingPrs(['review:accepted', 'in-merge-queue'])).toEqual([1, 2]);
     expect(reader.stateFor(99)).toBeNull();
     expect(calls).toHaveLength(2);
     expect(calls[0][0]).toBe('gh');
     expect(calls[0][1]).toEqual(expect.arrayContaining(['api', 'graphql', 'owner=owner', 'name=project']));
+    expect(calls[0][1].find(arg => arg.startsWith('query='))).toContain('baseRefName');
     expect(calls[1][1]).toContain('cursor=next');
+  });
+  it.each([
+    ['stacked child', 'lane/x', false],
+    ['child retargeted to main', 'main', true],
+    ['legacy state without a base', undefined, true],
+  ])('%s only holds when landable, preserving unrelated main holders', (_name, baseRefName, hold) => {
+    const child = { ...node(1, ['review:accepted']), baseRefName };
+    const reader = policyApi.createHolderStateReader({ repo: 'owner/project', exec: () => page([child, node(2, ['review:accepted'])]) });
+    const setting = policy().value.waitForLandingHolder;
+    expect(policyApi.landingHolderDecision({ state: reader.stateFor(1), setting })).toMatchObject({ hold });
+    expect(policyApi.landingHolderDecision({ state: reader.stateFor(2), setting })).toMatchObject({ hold: true, landing: true });
+    expect(reader.landingPrs(setting.holderStates)).toEqual(hold ? [1, 2] : [2]);
+    if (baseRefName === undefined) expect(reader.stateFor(1)).not.toHaveProperty('baseRefName');
+  });
+  it('excludes a stacked child from landing holds even when queued', () => {
+    const reader = policyApi.createHolderStateReader({ repo: 'owner/project', exec: () => page([{ ...node(1, [], true), baseRefName: 'lane/x' }]) });
+    const setting = policy().value.waitForLandingHolder;
+    expect(policyApi.landingHolderDecision({ state: reader.stateFor(1), setting })).toMatchObject({ hold: false });
+    expect(reader.landingPrs(setting.holderStates)).toEqual([]);
   });
   it('fails closed and caches subprocess or malformed response failures', () => {
     for (const exec of [() => { throw Error('offline'); }, () => '{}']) {

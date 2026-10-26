@@ -249,8 +249,9 @@ land the `preparedDate` via the lane→PR; `resolve` is the *decision* turn's jo
    referenced as "Fork N (a)", a second-level choice as a "Fork N sub-fork" — never `## Fork (a)` or
    `A1`/`B2` aliases.
    **Trust boundary and threat model (REQUIRED).** For any item that runs, publishes or trusts untrusted
-   output, add that section and run the design red-team on it with `/jury`'s decision-approach subject
-   before stamping (*backlog-workflow.md → Definition of Ready → Trust boundary and threat model*).
+   output, add that section and run a design red-team on it before stamping: either the `/jury` panel on the
+   prose, or a Gemini red-team via local agy (`scripts/gemini-direct-task.mjs`, model from the
+   vendor-routing setting); PR reviews still use the review panel (*backlog-workflow.md → Definition of Ready → Trust boundary and threat model*).
    Then stamp `preparedDate` **in the lane** with `node scripts/backlog.mjs prepare-stamp
    <NNN>` (writes `status: open` + `preparedDate: <today>` into the lane's item file — the one flag that
    makes readiness rank it `✓ ready to ratify`, so stamping a half-prepared item is a false "ready" the next
