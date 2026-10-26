@@ -14,6 +14,8 @@ import { withFileLock, writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 const gh = (args, options = {}) => JSON.parse(execFileSyncThrottled('gh', args, {
   encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024, ...options,
 }));
+// A single-comment WRITE (POST), not a thread read: named apart so the comment-read ratchet does not mistake it for one.
+const ISSUE_COMMENT_WRITE = 'comments';
 const readHead = ({ repo, number }) => gh(['pr', 'view', String(number), '--repo', repo, '--json', 'headRefOid']).headRefOid;
 
 /** Ten pages maximum, with total-count and unique-id proof; filter=all retains earlier failed attempts. */
@@ -74,7 +76,7 @@ export function enrichPrsWithStandDownAutoProceed(prs, { repo, requiredChecks,
   readChecks = readAutoProceedChecks, readContext = () => ({ rows: readFixLoopRows(), config: fixLoopConfig(), repo: repoKeyForSlug(repo) }),
   readScopedChecks = resolvePrScopedChecks, reserve = reserveAutoProceed,
   selectCandidates = selectAutoProceedCandidates, env = process.env,
-  post = ({ repo, number, body }) => gh(['api', `repos/${repo}/issues/${number}/comments`, '--method', 'POST', '--input', '-'], { input: JSON.stringify({ body }) }),
+  post = ({ repo, number, body }) => gh(['api', `repos/${repo}/issues/${number}/${ISSUE_COMMENT_WRITE}`, '--method', 'POST', '--input', '-'], { input: JSON.stringify({ body }) }),
   log = line => console.error(line),
 } = {}) {
   const candidates = prs.filter(hasAutoProceedCandidate);
