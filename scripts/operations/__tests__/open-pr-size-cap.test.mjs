@@ -360,6 +360,16 @@ describe('pr-land CLI size failure boundaries', () => {
     if (prNum != null) expect(forge.editBody).toHaveBeenCalledWith(prNum, result.createParams.body);
   });
 
+  it('never edits a live body that is already at the forge limit', async () => {
+    const live = 'x'.repeat(65_500);
+    const forge = { viewPr: vi.fn(() => ({ body: live })), editBody: vi.fn() };
+    const { run } = direct();
+    const result = await runBlock(forge, (input) => run(input), 5854, REVIEW_LABELS);
+    expect(result.createParams.body).toBe(live);
+    expect(result.sizeAdmission.reviewLabel).toBe(REVIEW_LABELS.pending);
+    expect(forge.editBody).not.toHaveBeenCalled();
+  });
+
   it('builds admission arguments from the resolved publication SHA and remote base', () => {
     expect(prLand.buildSizeAdmissionRequest).toBeTypeOf('function');
     expect(prLand.buildSizeAdmissionRequest({ ref: 'lane/reviewed', pr: 5854, remote: 'upstream',

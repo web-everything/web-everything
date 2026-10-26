@@ -949,13 +949,39 @@ describe('size admission trust boundaries', () => {
       expect(refResult.reviewLabel).toBe('review:pending');
     });
 
-  it('oversized existing PR text has a bounded output and an explicit human-review fallback', async () => {
-    const result = await sizeAdmission.createSizeAdmissionRunner(effects({ diffStat: () => over }))({
-      ...frozen, body: '界'.repeat(100_000),
-    });
-    expect(Buffer.byteLength(result.body)).toBeLessThan(60_000);
-    expect(result.body).toContain('PR description truncated; human review of the full diff is required.');
-    expect(result.reviewLabel).toBe('review:pending');
+  it('size admission preserves oversized existing descriptions', async () => {
+    const section = '## Evidence\n\n* keep `this` & <that> [link](x) #1\r\n';
+    const long = `${section.repeat(Math.ceil(50_000 / section.length))}\n## Testing\n\nKeep this trailing section.\n`;
+    const appended = await sizeAdmission.createSizeAdmissionRunner(effects({ diffStat: () => over }))({ ...frozen, body: long });
+    expect(appended.body.startsWith(long)).toBe(true);
+    expect(appended.body.slice(long.length)).toMatch(/^\n\n## Size\n\n301 non-test lines/);
+    expect(appended.reviewLabel).toBe('review:pending');
+
+    // Past the forge limit nothing is appended: the body is returned unchanged, so no edit is made.
+    for (const status of ['over', 'unknown']) {
+      const atLimit = '界'.repeat(65_536 - 100);
+      const diffStat = status === 'over' ? () => over : () => { throw new Error('unavailable'); };
+      const result = await sizeAdmission.createSizeAdmissionRunner(effects({ diffStat }))({ ...frozen, body: atLimit });
+      expect(result.body).toBe(atLimit);
+      expect(result).toMatchObject({ status, reviewLabel: 'review:pending' });
+    }
+  });
+
+  it('a throw outside the inner handlers returns the original body unchanged and requests reviewers', async () => {
+    const poisoned = { ...frozen, body: 'Author description.\n\n## Testing\nKeep.', get repo() { throw new Error('poisoned'); } };
+    const result = await sizeAdmission.createSizeAdmissionRunner(effects({ diffStat: () => over }))(poisoned);
+    expect(result).toEqual({ status: 'unknown', lines: null, reviewLabel: 'review:pending', body: poisoned.body });
+  });
+
+  it('comma-bearing paths are omitted with exact accounting', async () => {
+    const io = effects({ diffStat: () => ({ ...over, text: '200\t0\tscripts/keep.mjs\0' + '101\t0\tscripts/a,b.mjs\0' }) });
+    const result = await sizeAdmission.createSizeAdmissionRunner(io)(frozen);
+    const fields = io.fileItem.mock.calls[0][0];
+    expect(fields.scope).toBe('we:scripts/keep.mjs');
+    expect(fields.scope).not.toContain('a,b');
+    expect(fields.digest).toContain('; and 1 more (1 scope path omitted; scope budget or unrepresentable delimiter)');
+    expect(fields.digest).toContain('Human review of the full diff is required; bounded summaries are incomplete.');
+    expect(result.body).toContain('Human review of the full diff is required; bounded summaries are incomplete.');
   });
 
   it('untrusted file-item output cannot claim an unrelated stored card as this head’s split', async () => {

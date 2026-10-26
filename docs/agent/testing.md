@@ -10,6 +10,9 @@ number after creation must reuse the initial card. Cover retries with and withou
 Body markers are display hints; publication must be confirmed again from the store/publisher.
 When another heading or comment intervenes before an admission marker, retries remove only
 that marker and preserve the author's text. Ordinary retries still replace their own Size note.
+Author text is never truncated or escaped: past the forge body limit the note is skipped and the
+body returned unchanged (no edit), and every fallback, including the runner's outer catch, returns
+the caller's body. Reviewers are still requested in each case.
 Unknown or stale evidence and unreadable/ambiguous stores file conservatively and request reviewers.
 
 The legacy `file-item` scope flag is a comma list whose renderer supplies YAML double quotes.

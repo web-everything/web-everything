@@ -10,7 +10,8 @@ const SUMMARY_BYTES = 4096;
 const SUMMARY_COUNT = 100;
 // Require the absolute end of input for identities and paths at trust boundaries.
 const FULL_SHA = /^[a-f0-9]{40}(?![\s\S])/;
-const BODY_BYTES = 48 * 1024;
+// GitHub's PR-body limit, in characters (UTF-16 length is the conservative count).
+const FORGE_BODY_CHARS = 65536;
 const CARD_PATH = /^backlog\/([A-Za-z0-9]{1,64})-[a-z0-9-]{1,160}\.md(?![\s\S])/;
 
 function commitSha(value) {
@@ -394,22 +395,25 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = crea
       if ((existing.index === 0 || text[existing.index - 1] === '\n') && text[end] === '\n') end++;
       previousBody = text.slice(0, replaceNote ? start : existing.index) + text.slice(end);
     }
-    if (Buffer.byteLength(previousBody) > BODY_BYTES) previousBody = boundedText(previousBody, BODY_BYTES)
-      + '\n\nPR description truncated; human review of the full diff is required.';
     const note = plan.status === 'over'
       ? `${plan.lines} non-test lines (> ${OPEN_PR_MAX_NON_TEST_LINES}): ${cardNote}; extra reviewers requested via the size escalation (review:pending)`
       : `size unknown: extra reviewers requested via the size escalation (review:pending); ${cardNote}`;
-    result.body = `${previousBody}\n\n## Size\n\n${note}\n${groupLine}${fallback}\n`
+    const noted = `${previousBody}\n\n## Size\n\n${note}\n${groupLine}${fallback}\n`
       + (cardPublished ? `<!-- size-published:${markerKey} -->\n` : '')
       + `<!-- size-admission:${markerKey} -->\n`;
+    // Author text is never truncated or escaped. Past the forge limit the note is
+    // skipped and the body returned unchanged; the review label still escalates.
+    if (noted.length <= FORGE_BODY_CHARS) result.body = noted;
     return result;
   };
   // No malformed input or IO failure may block opening the PR or silence review escalation.
   return async (request) => {
+    let body = '';
+    try { if (typeof request?.body === 'string') body = request.body; } catch { /* unreadable body */ }
     try { return await run(request); }
     catch {
-      return { status: 'unknown', lines: null, reviewLabel: REVIEW_LABELS.pending,
-        body: 'Size unknown: extra reviewers requested (review:pending); human review of the full diff is required. Split-card filing could not be confirmed.' };
+      // Return the caller's body unchanged so a fallback never replaces the description.
+      return { status: 'unknown', lines: null, reviewLabel: REVIEW_LABELS.pending, body };
     }
   };
 }
