@@ -1,8 +1,9 @@
-/** @file Acceptance contract for resumable detached operations; no real runner or timers. */
+/** @file Acceptance contract for resumable detached operations and runner liveness. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import * as pidProbes from '../pid-alive.mjs';
 import {
   resolveDetachedOpsDir, parseDetachFlags, startDetachedOp, waitForOp, handleDetachCli,
 } from '../detached-op.mjs';
@@ -162,6 +163,65 @@ describe('detached operation lifecycle', () => {
       .toMatchObject({ id: record.id, status: 'failed', code: 1, reason: 'runner-died' });
     expect(isAlive).toHaveBeenCalledWith(record.pid);
     expect(clock.sleep).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['zombie', false, 1], ['gone', false, 1], ['match', true, 75], ['unreadable', null, 75],
+  ])('consults identity after signal zero succeeds: %s', async (reason, alive, code) => {
+    const record = writeRecord({ pid: process.pid });
+    const identity = vi.spyOn(pidProbes, 'pidIdentity').mockReturnValue({ alive, reason });
+    try {
+      const clock = fakeClock();
+      const result = await waitForOp({ id: record.id, maxWaitMs: 250, dir, ...clock });
+      expect(result).toMatchObject(code === 1
+        ? { status: 'failed', code: 1, reason: 'runner-died' }
+        : { status: 'running', code: 75 });
+      expect(identity).toHaveBeenCalledWith(record.pid);
+      if (code === 1) expect(clock.sleep).not.toHaveBeenCalled();
+    } finally {
+      identity.mockRestore();
+    }
+  });
+
+  it.each([false, true, null])('consults identity after EPERM (alive=%s)', async alive => {
+    const record = writeRecord();
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+      throw Object.assign(new Error('permission denied'), { code: 'EPERM' });
+    });
+    const identity = vi.spyOn(pidProbes, 'pidIdentity').mockReturnValue({ alive });
+    try {
+      const result = await waitForOp({ id: record.id, maxWaitMs: 250, dir, ...fakeClock() });
+      expect(result.code).toBe(alive === false ? 1 : 75);
+      expect(identity).toHaveBeenCalledWith(record.pid);
+    } finally {
+      kill.mockRestore();
+      identity.mockRestore();
+    }
+  });
+
+  it('keeps an actual live runner running with the default liveness probe', async () => {
+    const record = writeRecord({ pid: process.pid });
+    expect(await waitForOp({ id: record.id, maxWaitMs: 250, dir, ...fakeClock() }))
+      .toMatchObject({ status: 'running', code: 75 });
+  });
+
+  it.each(['ESRCH', 'EINVAL'])('handles signal-zero %s before inspecting identity', async code => {
+    const record = writeRecord();
+    const error = Object.assign(new Error(code), { code });
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => { throw error; });
+    const identity = vi.spyOn(pidProbes, 'pidIdentity');
+    try {
+      const waiting = waitForOp({ id: record.id, maxWaitMs: 250, dir, ...fakeClock() });
+      if (code === 'ESRCH') {
+        expect(await waiting).toMatchObject({ status: 'failed', code: 1, reason: 'runner-died' });
+      } else {
+        await expect(waiting).rejects.toBe(error);
+      }
+      expect(identity).not.toHaveBeenCalled();
+    } finally {
+      kill.mockRestore();
+      identity.mockRestore();
+    }
   });
 
   it('validates the replacement record read after a dead-runner probe', async () => {

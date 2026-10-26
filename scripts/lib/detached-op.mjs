@@ -9,6 +9,8 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { pidIdentity } from './pid-alive.mjs';
+import { writeLineSync } from './write-all-sync.mjs';
 
 export const resolveDetachedOpsDir = (env = process.env) => env.DETACHED_OPS_DIR
   || join(homedir(), 'workspace', '.operations', 'coordination', 'detached-ops');
@@ -39,8 +41,11 @@ function writeRecord(path, record) {
   renameSync(tmp, path);
 }
 function alive(pid) {
-  try { process.kill(pid, 0); return true; }
-  catch (error) { if (error.code === 'EPERM') return true; if (error.code === 'ESRCH') return false; throw error; }
+  try { process.kill(pid, 0); }
+  catch (error) { if (error.code === 'ESRCH') return false; if (error.code !== 'EPERM') throw error; }
+  // Signal zero also succeeds for unreaped zombies. Require positive death
+  // evidence; an unreadable identity must not mark a potentially live runner dead.
+  return pidIdentity(pid).alive !== false;
 }
 function tail(path) {
   let fd;
@@ -109,7 +114,7 @@ export async function waitForOp({ id, maxWaitMs = 540000, dir = resolveDetachedO
     await pause(Math.min(1000, deadline - now()));
   }
 }
-export async function handleDetachCli(args, { scriptPath, out = console.log, ...options } = {}) {
+export async function handleDetachCli(args, { scriptPath, out = line => writeLineSync(1, line), ...options } = {}) {
   const flags = parseDetachFlags(args);
   if (flags.waitFor !== null) {
     const result = await waitForOp({ ...options, id: flags.waitFor, maxWaitMs: flags.maxWaitMs });

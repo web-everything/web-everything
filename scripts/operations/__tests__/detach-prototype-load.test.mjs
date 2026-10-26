@@ -1,5 +1,6 @@
 /** @file Detached prototype-load routing and same-job resume contract. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -18,6 +19,31 @@ afterEach(() => {
 });
 
 describe('maybeHandleDetach', () => {
+  it.each([['done', 0, 0], ['failed', 7, 1], ['running', null, 75]])(
+    'flushes both full log tails through a pipe for a %s CLI wait', (status, exitCode, code) => {
+      const id = 'large-response';
+      // Quotes, newlines and Unicode also exercise JSON escaping and byte lengths.
+      const log = '"\n雪'.repeat(20000);
+      const stdoutPath = join(dir, `${id}.stdout.log`);
+      const stderrPath = join(dir, `${id}.stderr.log`);
+      writeFileSync(stdoutPath, log);
+      writeFileSync(stderrPath, log);
+      writeFileSync(join(dir, `${id}.json`), JSON.stringify({
+        id, kind: 'prototype-load', status, exitCode, pid: process.pid, stdoutPath, stderrPath,
+      }));
+      const result = spawnSync(process.execPath,
+        [scriptPath, PROTOTYPE_LOAD_OP, `--wait-for=${id}`, '--max-wait-ms=250'],
+        { env: process.env, encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024 });
+      expect(result.error, result.stderr).toBeUndefined();
+      expect(result.status, result.stderr).toBe(code);
+      const response = JSON.parse(result.stdout);
+      const expectedTail = Buffer.from(log).subarray(-65536).toString('utf8');
+      expect(response).toMatchObject({ id, status, exitCode, code,
+        stdoutTail: expectedTail, stderrTail: expectedTail });
+      expect(result.stdout).toBe(`${JSON.stringify(response)}\n`);
+    }, 20000,
+  );
+
   it.each([
     ['review-pr', ['--detach']],
     ['review-pr', ['--wait-for=job']],
