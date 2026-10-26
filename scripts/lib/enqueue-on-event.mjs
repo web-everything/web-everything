@@ -91,7 +91,11 @@ const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 export function overlayRefreshPending({ overlays, rebuildState, now, maxAgeMs = 3600000 }) {
   const clear = { pending: false, reason: null };
   if (!isObj(rebuildState)) return clear;
-  if (rebuildState.building) return { pending: true, reason: 'building' };
+  if (rebuildState.building) {
+    const startedAt = Date.parse(rebuildState.building.startedAt);
+    // A build record with no readable start, or older than the bound, is stale (dead builder): never starve catch-up on it.
+    return Number.isFinite(startedAt) && now - startedAt <= maxAgeMs ? { pending: true, reason: 'building' } : clear;
+  }
   if (['rejected', 'held', 'quarantine', 'unverified'].some((key) => rebuildState[key])) return clear;
   const adoptedAt = Date.parse(rebuildState.adopted?.at);
   if (Array.isArray(overlays) && overlays.some((overlay) => {
@@ -523,7 +527,7 @@ export function createEnqueueOnEvent({
     try {
       const root = scriptRoot();
       if (root === cwd) return { pending: false };
-      return overlayRefreshPending({ overlays: readOverlays(root), rebuildState: readRebuildState(root, env), now: now() });
+      return overlayRefreshPending({ overlays: readOverlays(root, { env }), rebuildState: readRebuildState(root, env), now: now() });
     } catch { return { pending: false }; }
   },
   readCandidates = ({ repo }) => readCatchUpCandidates({ repo, env, defaultBranch }), readCapacity = (s) => readQueueCapacity(s),
