@@ -592,14 +592,35 @@ it('task timeout escalates before claim release and retains unconfirmed owners',
 });
 
 
-function childTaskStep(id, { act = () => ({}), timing = () => {}, mutate = () => {}, onRead = () => {}, onClaim = () => {}, names = ['first'] } = {}) {
+it.each([false, true])('reaps a task group when the owner dies between the tick probe and stop, saved result=%s', async saved => {
+  const now = Date.now(), owner = runningTask(900, now - 1000, now);
+  if (saved) store.update(owner.id, r => ({ ...r, job: { ...r.job, task: { ...r.job.task,
+    execution: { effects: {}, timings: {}, results: { 1: { v: 1, taskId: r.job.task.id, attempt: 1,
+      outcome: 'acted', effects: [], recordedReads: [], timings: {}, gh: { read: 0, write: 0 } } } },
+  } } }));
+  let observations = 0, descendantAlive = true;
+  const probe = () => ++observations === 1 ? 'alive' : 'dead';
+  const kill = vi.fn();
+  const reapGroup = vi.fn(() => { descendantAlive = false; return true; });
+  const release = vi.fn(() => { expect(descendantAlive).toBe(false); });
+  await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now }, probe,
+    stop: (h, options) => stopHandle(h, { ...options, probe, kill }),
+    reapGroup, releaseTaskClaim: release, launch: vi.fn() });
+  expect(kill).not.toHaveBeenCalled(); // stopHandle first sees a dead owner
+  expect(reapGroup).toHaveBeenCalledWith(owner.job.handle, now + 60000);
+  expect(release).toHaveBeenCalledTimes(1);
+  expect(store.read(owner.id).job).toMatchObject({ status: saved ? 'succeeded' : 'queued',
+    task: { failureCount: saved ? 0 : 1 } });
+});
+
+function childTaskStep(id, { act = () => ({}), timing = () => {}, mutate = () => {}, onRead = () => {}, onClaim = () => {}, names = ['first'], precondition = 'none' } = {}) {
   const facts = () => createRecordingFacts({ load: () => ({ identity: { repo: 'owner/repo', item: store.read(id).job.task.item },
     observedAt: 1, source: 'live-pr', complete: true, data: { head: 'abc' } }),
     expectedIdentity: { repo: 'owner/repo', item: store.read(id).job.task.item }, now: 1, snapshotMaxAgeMs: 100 });
   return { name: 'task', run: async ({ task }) => {
     mutate(task);
     return runItemTask({ ...task, read: () => { onRead(); return facts(); }, plan: f => { f.read('head'); return names.map(name => ({ name,
-      inputs: ['head'], fences: ['head'], appliedProbe: 'worker-run', precondition: 'none' })); },
+      inputs: ['head'], fences: ['head'], appliedProbe: 'worker-run', precondition })); },
       budgets: { read: 10, write: 10 }, runStore: { find: () => null },
       claim: { acquire: () => { onClaim(); return 'claim'; }, assert: () => true, release: () => {} },
       effects: { fence: facts, act: context => {
@@ -610,6 +631,24 @@ function childTaskStep(id, { act = () => ({}), timing = () => {}, mutate = () =>
 }
 const runTaskChild = (id, step, attempt = 1) => runJob({ steps: [step], env: jobEnv(id, attempt),
   host: 'test', pid: 123, readStart: () => 'start' });
+
+it.each([false, true])('structured preconditions persist through child intent, act and result, rejected=%s', async rejected => {
+  const owner = queuedTask(901, 300000), precondition = { ifMatch: 'abc' };
+  store.update(owner.id, r => markLaunching(r, { at: new Date().toISOString() }));
+  const act = vi.fn(context => {
+    expect(context.precondition).toEqual(precondition);
+    expect(store.read(owner.id).job.task.execution.effects[context.effectId]).toMatchObject({ status: 'intent', precondition });
+    if (rejected) throw Error('server precondition rejected');
+    return { applied: true };
+  });
+  await runTaskChild(owner.id, childTaskStep(owner.id, { precondition, act }));
+  expect(act).toHaveBeenCalledTimes(1);
+  const saved = store.read(owner.id);
+  const result = saved.job.task.execution.results[1];
+  expect(result.outcome).toBe(rejected ? 'failed' : 'acted');
+  expect(result.effects[0]).toMatchObject({ precondition, status: rejected ? 'intent' : 'applied' });
+  expect(JSON.parse(readFileSync(join(dir, `results/${owner.id}-1.json`), 'utf8'))).toEqual(result);
+});
 
 it.each([1, 3, 4])('persisted failed results with failureCount=%s complete in the child and dead-owner recovery', async failureCount => {
   const now = Date.now(), launch = vi.fn(), release = vi.fn();

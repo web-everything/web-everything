@@ -488,7 +488,6 @@ export async function reattachTick({
     }
     if (plan.type === 'none') continue;
     const lastAliveMs = Date.parse(r.job.heartbeatAt ?? r.job.startedAt ?? '');
-    if (liveness === 'dead' && Number.isFinite(lastAliveMs) && reapGroup(r.job.handle, lastAliveMs + staleMs)) log(`daemon-jobs: job ${r.id} died with subprocesses still running — killed its process group`);
     let stopped;
     if (plan.stopFirst) {
       const res = await stop(r.job.handle, {
@@ -503,6 +502,9 @@ export async function reattachTick({
       stopped = { at: iso(Date.now()), signal: res.signal, handle: r.job.handle };
       if (!isTask) store.update(r.id, (f) => (sameGeneration(f, r) ? markStopped(f, stopped) : null));
     }
+    // The owner can die after the tick's probe but before stopHandle's first observation. Reap after
+    // stopping too, using the dead-group identity checks before releasing exclusion or requeuing.
+    if ((liveness === 'dead' || stopped) && Number.isFinite(lastAliveMs) && reapGroup(r.job.handle, lastAliveMs + staleMs)) log(`daemon-jobs: job ${r.id} died with subprocesses still running — killed its process group`);
     const at = iso(Date.now());
     const written = store.update(r.id, (f) => {
       if (!sameGeneration(f, r)) return null; // the child claimed or finished since we looked — re-judge next tick

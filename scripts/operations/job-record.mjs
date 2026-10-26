@@ -85,7 +85,7 @@ export function validateTaskMetadata(task) {
     const times = v => isPlainObject(v) && Object.values(v).every(n => Number.isFinite(n) && n >= 0);
     const effect = v => isPlainObject(v) && typeof v.effectId === 'string' && v.effectId.startsWith(`${task.id}:`) &&
       ['intent', 'applied'].includes(v.status) && isPlainObject(v.declaration) && isPlainObject(v.inputs) &&
-      typeof v.precondition === 'string';
+      (v.precondition === 'none' || (isPlainObject(v.precondition) && Object.keys(v.precondition).length > 0));
     const attempt = (key, v) => /^[1-9][0-9]*$/.test(key) && positiveInteger(v?.attempt) && String(v.attempt) === key;
     if (!isPlainObject(ex) || ['effects', 'results', 'timings'].some(k => !isPlainObject(ex[k]))) {
       errors.push('job.task.execution must carry effects, results and timings objects');

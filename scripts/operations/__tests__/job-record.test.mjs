@@ -101,6 +101,19 @@ describe('job run record', () => {
     rec.job.task = { ...task, execution };
     writeRun(rec, dir);
     expect(readRun(rec.id, dir).job.task.execution).toEqual(execution);
+    for (const precondition of ['none', { ifMatch: 'abc' }, { expected: { head: 'abc' }, allowed: ['open', 'draft'] }]) {
+      const entry = { effectId: `${task.id}:dispatch`, status: 'intent', declaration: {}, inputs: {}, precondition };
+      const saved = { ...execution, effects: { [entry.effectId]: entry }, results: { 1: { ...result, effects: [entry] } } };
+      rec.job.task = { ...task, execution: saved };
+      writeRun(rec, dir);
+      expect(readRun(rec.id, dir).job.task.execution).toEqual(saved);
+    }
+    for (const precondition of [undefined, null, '', 'if-match', {}, [], 1, false]) {
+      const entry = { effectId: `${task.id}:dispatch`, status: 'intent', declaration: {}, inputs: {}, precondition };
+      expect(validateJobBlock({ ...rec.job, task: { ...task, execution: {
+        effects: { [entry.effectId]: entry }, results: { 1: { ...result, effects: [entry] } }, timings: {},
+      } } }).join()).toMatch(/execution.effects.*execution.results/);
+    }
     for (const execution of [null, [], {}, { effects: [], results: {}, timings: {} },
       ...[0, 2, '1'].map(attempt => ({ effects: {}, results: { 1: { ...result, attempt } }, timings: {} })),
       ...[{ v: 2 }, { outcome: 'success' }, { taskId: 'other' }, { effects: {} }, { gh: { read: -1, write: 0 } },
