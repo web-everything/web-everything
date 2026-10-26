@@ -1613,14 +1613,16 @@ Review staleness fixtures must use off-path files from the current sandbox impor
 Collision healing now pulls `backlog/frontmatter.mjs` onto that path; cover its refusal and
 use `backlog/capacity.mjs` for tolerated unrelated lag in both dispatch modes and the soak.
 Both collision planners refuse to move a `bornAs` card or a reserved source number. Remote-backed
-heals skip reserved and canonical numbers, claim all target gaps atomically before rewriting, and
-refuse for manual repair when no safe gap exists. The manual `yield` command uses the same guards,
-including with `--force`. Claims survive a failed rewrite or publish.
+heals never reuse a gap below the frontier: trees and reservation refs cannot show whether a gap
+held a legacy card deleted before reservation refs existed. They take a fresh number above every
+reserved, canonical and local number, claim all targets atomically before rewriting, and refuse
+for manual repair when the number range is exhausted. The manual `yield` command uses the same
+guards, including with `--force`. Claims survive a failed rewrite or publish.
 Test reserved legacy sources without `bornAs` independently in both planners and in `yield --force`.
-Exercise `yield` and the renumber CLI with a stub Git transport: reserve destination gaps, include
-a canonical-tree gap, and snapshot every backlog file at push time to prove the claim precedes
-any write or delete. Rejected claims, unavailable evidence, and a full frontier must preserve all
-files; a renumber dry run must neither claim nor write. No-op renumber runs (including
+Exercise `yield` and the renumber CLI with a stub Git transport: leave an untraced gap below the
+frontier, include a canonical-tree number, and snapshot every backlog file at push time to prove
+the claim precedes any write or delete. Rejected claims, unavailable evidence, and an exhausted
+range must preserve all files; a renumber dry run must neither claim nor write. No-op renumber runs (including
 base-owned or entirely published duplicates) must not read remote numbering evidence.
 The allocator suite pins the held-fix-claim refusal before constraint reads or reservation
 pushes, and asserts that reservations survive both failed index rewrites and failed publication.

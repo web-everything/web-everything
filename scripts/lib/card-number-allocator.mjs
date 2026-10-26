@@ -143,7 +143,7 @@ export function reserveCardNumber({ id, git, minimum = 1, dryRun = false, now = 
   throw Error('remote reservation contention exhausted');
 }
 
-/** Healers plan gaps below a durable frontier and must claim them before applying the plan.
+/** Healers plan fresh numbers above a durable frontier and must claim them before applying the plan.
  * A repository with no remote is local-only; unreadable/configured remotes never degrade to that case.
  */
 export function collisionNumberingConstraints(git, remote = 'origin') {

@@ -42,19 +42,20 @@ export function assertRenumberable(file, reservedNums = []) {
     throw Error(`immutable birth number in ${file.name}; repair the collision manually`);
 }
 
-/** Remote-backed healing uses only unreserved gaps below a durable high-water mark.
- * The caller must atomically claim the targets before applying this plan. No gap means manual repair.
+/** Remote-backed healing takes a fresh number above the durable frontier and every known number.
+ * Trees and reservation refs cannot prove a gap was never issued: a legacy card deleted before
+ * reservation refs existed leaves no trace, so a gap is never reused. The caller must atomically
+ * claim the targets before applying this plan; a lost claim or exhausted range means manual repair.
  */
 export function allocateCollisionNum(usedNums, allocated, baseNums, constraints, fallback = allocateGapId) {
   const { reservedNums = [], canonicalNums = [], ceiling } = constraints;
-  const taken = new Set([...usedNums, ...allocated, ...baseNums, ...reservedNums, ...canonicalNums].map(Number));
   if (ceiling == null) return fallback(new Set([...usedNums, ...reservedNums, ...canonicalNums]), allocated, baseNums);
   if (!Number.isSafeInteger(ceiling) || ceiling < 0) throw Error('invalid reservation frontier');
-  const min = [...taken].reduce((lowest, n) => Math.min(lowest, n), Infinity);
-  for (let n = Math.min(ceiling - 1, 99999); n > Math.max(0, min); n--) {
-    if (!taken.has(n)) return String(n).padStart(3, '0');
-  }
-  throw Error('no safe unreserved gap; repair the collision manually');
+  // NaN from a malformed number poisons the max, so the range check below refuses it.
+  const next = [...usedNums, ...allocated, ...baseNums, ...reservedNums, ...canonicalNums]
+    .reduce((max, n) => Math.max(max, Number(n)), ceiling) + 1;
+  if (!Number.isSafeInteger(next) || next > 99999) throw Error('card number exhausted; repair the collision manually');
+  return String(next).padStart(3, '0');
 }
 
 /** Parse a `backlog/NNN-slug.md` filename into `{ num, slug }`, or `null` if it isn't one. */

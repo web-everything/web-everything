@@ -8,7 +8,7 @@ import { tryAcquireNumberingLock, releaseNumberingLockIfOwned } from '../../read
 const collisionRoots = [];
 afterEach(() => collisionRoots.splice(0).forEach((root) => rmSync(root, { recursive: true, force: true })));
 
-function collisionCli(kind, { reservedSource = false, rejectPush = false, offline = false, dense = false, noop = false, lastNumber = false } = {}) {
+function collisionCli(kind, { reservedSource = false, rejectPush = false, offline = false, noop = false, lastNumber = false } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'collision-cli-')));
   collisionRoots.push(root);
   cpSync('scripts', join(root, 'scripts'), { recursive: true, filter: (p) => basename(p) !== '__tests__' });
@@ -21,7 +21,8 @@ function collisionCli(kind, { reservedSource = false, rejectPush = false, offlin
   if (lastNumber) original['99999-last.md'] = '---\n---\nLast supported number\n';
   for (const [name, text] of Object.entries(original)) writeFileSync(join(root, 'backlog', name), text);
   const stateFile = join(root, 'remote.json');
-  const refs = Object.fromEntries((dense ? ['075'] : ['075', '077', '079'])
+  // 076 is an untraced gap: it may be a legacy card deleted before reservation refs existed.
+  const refs = Object.fromEntries(['075', '077', '079']
     .map((num) => ['refs/number-reservations/' + num, 'a'.repeat(40)]));
   if (reservedSource) refs['refs/number-reservations/074'] = 'a'.repeat(40);
   writeFileSync(stateFile, JSON.stringify({ refs, calls: [], pushes: [], blobs: {} }));
@@ -41,7 +42,7 @@ switch (args[0]) {
   case 'ls-tree':
     process.stdout.write(args.includes('published-fixture') ? 'backlog/074-incoming.md\\0backlog/074-existing.md\\0'
       : args.includes('keeper-fixture') ? 'backlog/074-existing.md\\0'
-      : process.env.COLLISION_DENSE === '1' ? '' : 'backlog/078-canonical.md\\0'); break;
+      : 'backlog/078-canonical.md\\0'); break;
   case 'ls-remote': process.stdout.write(Object.entries(state.refs).map(([ref, oid]) => oid + '\\t' + ref + '\\n').join('')); break;
   case 'hash-object': {
     const raw = fs.readFileSync(0, 'utf8'), oid = crypto.createHash('sha1').update(raw).digest('hex');
@@ -70,7 +71,7 @@ save();
       { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000,
         env: { ...process.env, HOME: join(root, 'home'), PATH: join(root, 'bin') + delimiter + process.env.PATH,
           COLLISION_REMOTE_FILE: stateFile, COLLISION_REJECT_PUSH: rejectPush ? '1' : '0',
-          COLLISION_OFFLINE: offline ? '1' : '0', COLLISION_DENSE: dense ? '1' : '0' } })),
+          COLLISION_OFFLINE: offline ? '1' : '0' } })),
   };
 }
 
@@ -99,24 +100,20 @@ it('renumber CLI still checks remote constraints for an incoming collision with 
   expect(cli.files()).toEqual(cli.original);
 });
 
-it('renumber CLI checks collisions without first allocating a local number beyond 99999', () => {
-  const cli = collisionCli('renumber', { lastNumber: true });
-  expect(cli.run()).toMatchObject({ renumbered: [expect.objectContaining({ newNum: '076' })] });
-});
-
-it.each(['yield', 'renumber'])('%s CLI skips reserved and canonical gaps and claims before writing', (kind) => {
+it.each(['yield', 'renumber'])('%s CLI takes a fresh number above the frontier, never an untraced gap, and claims before writing', (kind) => {
   const cli = collisionCli(kind);
   const result = cli.run();
-  if (kind === 'yield') expect(result).toMatchObject({ num: '076', to: '076-incoming' });
-  else expect(result.renumbered).toEqual([expect.objectContaining({ oldName: '074-incoming.md', newNum: '076', newName: '076-incoming.md' })]);
+  if (kind === 'yield') expect(result).toMatchObject({ num: '080', to: '080-incoming' });
+  else expect(result.renumbered).toEqual([expect.objectContaining({ oldName: '074-incoming.md', newNum: '080', newName: '080-incoming.md' })]);
   const state = cli.state();
   expect(state.pushes).toHaveLength(1);
   expect(state.pushes[0].files).toEqual(cli.original);
-  expect(state.pushes[0].args).toEqual(['push', '--atomic', '--force-with-lease=refs/number-reservations/076:',
-    'origin', expect.stringMatching(/^[a-f0-9]{40}:refs\/number-reservations\/076$/)]);
-  expect(state.refs).toEqual({ ...cli.refs, 'refs/number-reservations/076': expect.stringMatching(/^[a-f0-9]{40}$/) });
+  expect(state.pushes[0].args).toEqual(['push', '--atomic', '--force-with-lease=refs/number-reservations/080:',
+    'origin', expect.stringMatching(/^[a-f0-9]{40}:refs\/number-reservations\/080$/)]);
+  expect(state.refs).toEqual({ ...cli.refs, 'refs/number-reservations/080': expect.stringMatching(/^[a-f0-9]{40}$/) });
+  expect(state.refs['refs/number-reservations/076']).toBeUndefined();
   const { '074-incoming.md': incoming, ...keepers } = cli.original;
-  expect(cli.files()).toEqual({ ...keepers, '076-incoming.md': incoming });
+  expect(cli.files()).toEqual({ ...keepers, '080-incoming.md': incoming });
 });
 
 it.each(['yield', 'renumber'])('%s CLI refuses a reserved source without bornAs before any claim or rewrite', (kind) => {
@@ -142,16 +139,16 @@ it.each(['yield', 'renumber'])('%s CLI refuses unavailable remote evidence befor
   expect(cli.state()).toMatchObject({ refs: cli.refs, pushes: [], blobs: {} });
 });
 
-it.each(['yield', 'renumber'])('%s CLI refuses a full reservation frontier before any claim or rewrite', (kind) => {
-  const cli = collisionCli(kind, { dense: true });
-  expect(() => cli.run()).toThrow(/no safe unreserved gap/);
+it.each(['yield', 'renumber'])('%s CLI refuses an exhausted number range before any claim or rewrite', (kind) => {
+  const cli = collisionCli(kind, { lastNumber: true });
+  expect(() => cli.run()).toThrow(/exhausted/);
   expect(cli.files()).toEqual(cli.original);
   expect(cli.state()).toMatchObject({ refs: cli.refs, pushes: [], blobs: {} });
 });
 
-it('renumber CLI dry-run plans the reserved gap without claiming or rewriting', () => {
+it('renumber CLI dry-run plans the fresh target without claiming or rewriting', () => {
   const cli = collisionCli('renumber');
-  expect(cli.run(['--dry-run'])).toMatchObject({ dryRun: true, renumbered: [expect.objectContaining({ newNum: '076' })] });
+  expect(cli.run(['--dry-run'])).toMatchObject({ dryRun: true, renumbered: [expect.objectContaining({ newNum: '080' })] });
   expect(cli.files()).toEqual(cli.original);
   expect(cli.state()).toMatchObject({ refs: cli.refs, pushes: [], blobs: {} });
 });

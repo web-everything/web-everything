@@ -164,19 +164,33 @@ it.each(['base', 'merged'])('%s collision planner refuses a reserved source with
   expect([existing, incoming]).toEqual(before);
 });
 
-it.each(['base', 'merged'])('%s collision planner skips reserved gaps and refuses an unsafe frontier', (kind) => {
+it.each(['base', 'merged'])('%s collision planner takes a number above the frontier and refuses an exhausted range', (kind) => {
   const files = [{ name: '074-incoming.md', text: '---\n---\nIncoming\n', ordinal: 2 }];
   const constraints = { reservedNums: ['075', '077'], ceiling: 77 };
   const plan = kind === 'base'
     ? planBaseCollisionHeal(files, { baseNums: ['074'], baseNames: ['074-existing.md'], ...constraints })
     : planRenumber([...files, { name: '074-existing.md', text: 'Existing\n', ordinal: 1 }],
       { ontoNames: ['074-existing.md'], ...constraints });
-  expect(plan.collisions[0].newNum).toBe('076');
-  expect(() => kind === 'base'
-    ? planBaseCollisionHeal(files, { baseNums: ['074'], baseNames: ['074-existing.md'], reservedNums: ['075'], ceiling: 75 })
-    : planRenumber([...files, { name: '074-existing.md', text: 'Existing\n' }],
-      { ontoNames: ['074-existing.md'], reservedNums: ['075'], ceiling: 75 }))
-    .toThrow(/gap|reservation/i);
+  expect(plan.collisions[0].newNum).toBe('078');
+  for (const exhausted of [{ reservedNums: ['99999'], ceiling: 99999 }, { reservedNums: ['nan'], ceiling: 75 }]) {
+    expect(() => kind === 'base'
+      ? planBaseCollisionHeal(files, { baseNums: ['074'], baseNames: ['074-existing.md'], ...exhausted })
+      : planRenumber([...files, { name: '074-existing.md', text: 'Existing\n' }],
+        { ontoNames: ['074-existing.md'], ...exhausted }))
+      .toThrow(/exhausted/);
+  }
+});
+
+it.each(['base', 'merged'])('%s collision planner never reuses a deleted legacy number below the frontier', (kind) => {
+  // 075 and 076 belonged to legacy cards deleted before reservation refs existed: no tree or ref
+  // records them, so the remote-backed planner must take a fresh number above the frontier.
+  const files = [{ name: '074-incoming.md', text: '---\n---\nIncoming\n', ordinal: 2 }];
+  const constraints = { reservedNums: ['078'], canonicalNums: ['074', '077'], ceiling: 78 };
+  const plan = kind === 'base'
+    ? planBaseCollisionHeal(files, { baseNums: ['074'], baseNames: ['074-existing.md'], ...constraints })
+    : planRenumber([...files, { name: '074-existing.md', text: 'Existing\n', ordinal: 1 }],
+      { ontoNames: ['074-existing.md'], ...constraints });
+  expect(plan.collisions.map((move) => move.newNum)).toEqual(['079']);
 });
 
 describe('atomic birth numbering', () => {
@@ -463,7 +477,7 @@ it('collision evidence fetched during a rebuild cannot pair an old tree with a n
   };
   const result = rebaseDropManifest({ laneRef: 'lane/test', fetch: false, healCollision: true, run });
   expect(result.action).toBe('rebased');
-  expect(result.healed).toMatchObject([{ oldNum: '074', newNum: '076' }]);
+  expect(result.healed).toMatchObject([{ oldNum: '074', newNum: '078' }]);
   expect(fetchedMain).toBe('B');
   expect(committed).toEqual({ parentNotes: 'A', treeNotes: 'A' });
 });
@@ -591,12 +605,12 @@ it.each(['rewrite', 'publish'])('collision reservations survive a failed %s and 
     action: 'error', reason: expect.stringContaining(`injected ${failure} failure`),
   });
   const claims = new Map(r.refs);
-  expect(claims.get('refs/number-reservations/076')).toMatch(/^[a-f0-9]{40}$/);
+  expect(claims.get('refs/number-reservations/078')).toMatch(/^[a-f0-9]{40}$/);
   expect(calls.filter(([command]) => command === 'push')).toHaveLength(failure === 'publish' ? 2 : 1);
-  expect(() => reserveCollisionNumbers({ collisions: [{ newNum: '076' }] }, r.git, 'origin')).toThrow('already exists');
+  expect(() => reserveCollisionNumbers({ collisions: [{ newNum: '078' }] }, r.git, 'origin')).toThrow('already exists');
   expect(r.refs).toEqual(claims);
-  expect(reserveCardNumber({ id: 'xbbbbbb', minimum: 76, git: r.git })).toBe('077');
-  expect(r.refs.get('refs/number-reservations/076')).toBe(claims.get('refs/number-reservations/076'));
+  expect(reserveCardNumber({ id: 'xbbbbbb', minimum: 76, git: r.git })).toBe('079');
+  expect(r.refs.get('refs/number-reservations/078')).toBe(claims.get('refs/number-reservations/078'));
 });
 
 it('deferred numbering atomically reserves and replays even when birth numbering is disabled', () => {
@@ -638,7 +652,7 @@ it.each(['index', 'standalone'])('%s collision wiring refuses unreadable reserva
   expect(calls.some((args) => ['hash-object', 'update-index', 'read-tree', 'push'].includes(args[0]))).toBe(false);
 });
 
-it.each(['index', 'standalone'])('%s collision wiring claims the unreserved gap before rewriting', (mode) => {
+it.each(['index', 'standalone'])('%s collision wiring claims a fresh target above the frontier before rewriting', (mode) => {
   vi.stubEnv('WE_COORDINATION_ROOT', join(fixture().cwd, 'coordination'));
   const r = remote(); const calls = [];
   r.refs.set('refs/number-reservations/076', 'a'.repeat(40));
@@ -652,7 +666,7 @@ it.each(['index', 'standalone'])('%s collision wiring claims the unreserved gap 
     else if (args[0] === 'hash-object') stdout = gitBlobOid(options.input) + '\n';
     // Stop at the first index mutation; the claim must already be durable.
     else if (['read-tree', 'update-index'].includes(args[0])) {
-      expect(r.refs.has('refs/number-reservations/075')).toBe(true);
+      expect(r.refs.has('refs/number-reservations/078')).toBe(true);
       return { status: 1, stdout: '', stderr: 'stop after claim' };
     } else stdout = r.git(args, options);
     return { status: 0, stdout, stderr: '' };
@@ -660,7 +674,9 @@ it.each(['index', 'standalone'])('%s collision wiring claims the unreserved gap 
   const result = mode === 'index' ? applyCollisionHealToIndex({ run, env: {}, tree: 'lane/test' })
     : healNnnCollision({ run, laneRef: 'lane/test', fetch: false });
   expect(result.reason).toMatch(/stop after claim/);
-  expect(calls.find((args) => args[0] === 'push')).toContain('--force-with-lease=refs/number-reservations/075:');
+  // 075 is an untraced gap below the frontier: it may be a deleted legacy card, so it is never claimed.
+  expect(calls.find((args) => args[0] === 'push')).toContain('--force-with-lease=refs/number-reservations/078:');
+  expect(r.refs.has('refs/number-reservations/075')).toBe(false);
 });
 
 it('bounds overflow after a last-number contention and refuses out-of-grammar reservation refs', () => {
