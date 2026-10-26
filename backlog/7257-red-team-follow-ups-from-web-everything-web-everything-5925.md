@@ -1,18 +1,19 @@
 ---
+bornAs: xp7i2bw
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/daemon-rebuild/plan.mjs"]
-dateOpened: "2026-10-25"
+scope: ["we:scripts/conveyor/orphan-fix-round.mjs"]
+dateOpened: "2026-10-26"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5937 (head 4c0c3ff69)
+# Red-team follow-ups from web-everything/web-everything#5925 (head dcbd47f4d)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5937 (reviewed head `4c0c3ff69c08ca5288139e275d57976019c292ee`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5925 (reviewed head `dcbd47f4d22b37e26c3d8fc6cc2c4934a0409223`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/lib/daemon-rebuild/plan.mjs:603` — (edge-case, degraded) A stack-contained prerequisite incorrectly blocks pinned-base deferral.
-   - Scenario: Start at A with f=0,g=0. B branches from A with f=1; running HEAD carries B. New main M branches from A with f=2. Prerequisite U branches from A with g=1. Top T has parents B,M,U and resolves to f=3,g=1. Register overlays in order [B pinned:true, U, T], with stackMode=tops and edgeResolve=false. planOverlayStacks correctly marks U stack-contained in T, but the new blocked check counts U as an unrelated newcomer, prevents B's deferral, and returns pinned-overlay-conflict before trying T. U cannot compete for priority because it is skipped. Expected: apply T and retain both contained bases. A re
+1. `we:scripts/conveyor/orphan-fix-round.mjs:119` — (failing-input, degraded) Malformed ruling history falls through to automatic re-arm
+   - Scenario: On an unchanged head with review:changes and no review:human, append: a blocked-referral verdict containing 'on head' but no Net basis; a valid operator not-real ruling settling all referrals; a trusted operator-ruling comment with '&lt;!-- mandatory-referral-operator-ruling-v1: not-base64 --&gt;'; a trusted fix-evidence comment; and FIX_END_MARKER. After the grace period, the gate reports protectionMalformed=true and pending=[malformed-operator-ruling], yet the planner returns rearm. The malformed-history exception is swallowed, and fallback interprets the absent Net basis as head movement. Malform
    - Claude's re-check: demonstrated break
 
 ## Acceptance

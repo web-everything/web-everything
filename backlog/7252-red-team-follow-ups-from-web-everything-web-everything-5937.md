@@ -1,18 +1,19 @@
 ---
+bornAs: xisz3x1
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/health-watch-lane-scan.mjs"]
+scope: ["we:scripts/lib/daemon-rebuild/plan.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5759 (head f7c0342cc)
+# Red-team follow-ups from web-everything/web-everything#5937 (head 4c0c3ff69)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5759 (reviewed head `f7c0342cc13b54535afd6c8ef7a62939b5c87aaa`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5937 (reviewed head `4c0c3ff69c08ca5288139e275d57976019c292ee`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/lib/health-watch-lane-scan.mjs:74` — (failing-input, degraded) A valid fetch refspec is misclassified as dangerous Git configuration
-   - Scenario: Configure remote.origin.fetch as +refs/heads/main:refs/remotes/origin/backup.promisor in an otherwise clean, published lane. configKeyCandidates includes the entire key\nvalue entry, and the dot-all remote.*.promisor regex matches that entry because its value ends in .promisor. freshLaneSafety consequently refuses the lane as redirecting objects, transport or worktree; stale-state also skips its ahead calculation. A read-only probe using this config-list entry and real Git for every other check changed guardLaneAction.act from true to false. The parser should recognize remote.origin.fetch as t
+1. `we:scripts/lib/daemon-rebuild/plan.mjs:603` — (edge-case, degraded) A stack-contained prerequisite incorrectly blocks pinned-base deferral.
+   - Scenario: Start at A with f=0,g=0. B branches from A with f=1; running HEAD carries B. New main M branches from A with f=2. Prerequisite U branches from A with g=1. Top T has parents B,M,U and resolves to f=3,g=1. Register overlays in order [B pinned:true, U, T], with stackMode=tops and edgeResolve=false. planOverlayStacks correctly marks U stack-contained in T, but the new blocked check counts U as an unrelated newcomer, prevents B's deferral, and returns pinned-overlay-conflict before trying T. U cannot compete for priority because it is skipped. Expected: apply T and retain both contained bases. A re
    - Claude's re-check: demonstrated break
 
 ## Acceptance

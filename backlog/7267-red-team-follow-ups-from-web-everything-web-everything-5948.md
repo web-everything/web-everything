@@ -1,18 +1,19 @@
 ---
+bornAs: xyd5nta
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/conveyor/orphan-fix-round.mjs"]
+scope: ["we:scripts/conveyor/pass-daemons/pr-merge-watch-signals.mjs"]
 dateOpened: "2026-10-26"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5925 (head dcbd47f4d)
+# Red-team follow-ups from web-everything/web-everything#5948 (head a9da952dc)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5925 (reviewed head `dcbd47f4d22b37e26c3d8fc6cc2c4934a0409223`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5948 (reviewed head `a9da952dce7404e545eccc4af31747626c976377`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/conveyor/orphan-fix-round.mjs:119` — (failing-input, degraded) Malformed ruling history falls through to automatic re-arm
-   - Scenario: On an unchanged head with review:changes and no review:human, append: a blocked-referral verdict containing 'on head' but no Net basis; a valid operator not-real ruling settling all referrals; a trusted operator-ruling comment with '&lt;!-- mandatory-referral-operator-ruling-v1: not-base64 --&gt;'; a trusted fix-evidence comment; and FIX_END_MARKER. After the grace period, the gate reports protectionMalformed=true and pending=[malformed-operator-ruling], yet the planner returns rearm. The malformed-history exception is swallowed, and fallback interprets the absent Net basis as head movement. Malform
+1. `we:scripts/conveyor/pass-daemons/pr-merge-watch-signals.mjs` — (edge-case, degraded) Force-pushing an old commit attributes previous-head refusal logs to the new head
+   - Scenario: At 12:00, the current head is B, whose committer date is yesterday. The timeline records a force-push at 11:55; ten refusal logs from head A occur at 11:40–11:49. Running runMergeWatchSignals emits pr-looping with count:10 and saves B's delivery receipt, despite every refusal preceding B's push. Loop detection uses the committer date before reading the force-push timeline. It should exclude those previous-head logs; the premature receipt also suppresses a later genuine loop with the same reason on B.
    - Claude's re-check: demonstrated break
 
 ## Acceptance

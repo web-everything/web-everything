@@ -1,21 +1,24 @@
 ---
+bornAs: xc2n84y
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/red-team-gate.mjs", "we:scripts/lib/operator-identity.mjs", "we:scripts/lib/__tests__/red-team-gate.test.mjs", "we:scripts/lib/__tests__/operator-identity.test.mjs"]
+scope: ["we:scripts/lib/red-team-gate.mjs", "we:scripts/lib/operator-identity.mjs", "we:scripts/operations/__tests__/record-red-team-ruling.test.mjs", "we:scripts/lib/__tests__/red-team-gate.test.mjs", "we:scripts/lib/__tests__/operator-identity.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Add a mutation or parameterized test for each consumer of a shared outcome list. A lint that flag… (from web-everything/web-everything#5923 review)
+# Prevention — Add a test or lint for boolean opt-in cascades that an invalid env override resolves to the least… (from web-everything/web-everything#5923 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/red-team-gate.mjs:560` — Add a mutation or parameterized test for each consumer of a shared outcome list. A lint that flags a duplicated outcome array would also work, but a test is cheaper.
-2. `we:scripts/lib/operator-identity.mjs:20` — Add a table-driven test over OPERATOR_GATE_OUTCOMES. For each outcome, assert that a bot-authored comment is dropped by operatorBoundComments and a human operator-authored one is kept. A new outcome then cannot be added without a row in that table.
+1. `we:scripts/lib/red-team-gate.mjs:181` — Add a test or lint for boolean opt-in cascades that an invalid env override resolves to the least-permissive value, or warns, when a lower layer opts in.
+2. `we:scripts/lib/operator-identity.mjs:20` — Make the automation-forgery test table-driven over `OPERATOR_GATE_OUTCOMES`, so any added operator outcome automatically gets a 'bot-authored record is dropped' assertion.
+3. `we:scripts/operations/__tests__/record-red-team-ruling.test.mjs` — Extend the named test with an unrelated held finding and review:human present, asserting the resulting unrelated disposition and label state through the real synchronization path; run it in the deterministic test gate.
+4. `we:scripts/lib/red-team-gate.mjs:559` — Add a deterministic regression test that clears two findings, blocks one, and asserts that only the selected finding becomes held.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5923@90df9e8917cd400fdbe9a564d7943d1b013d04c0
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5923@7548c7a4831fb0a5de17b625f65a150e3696365e
 
 ## Acceptance
 

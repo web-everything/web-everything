@@ -1,20 +1,24 @@
 ---
+bornAs: xnfrapc
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/completion-cli.mjs", "we:scripts/operations/__tests__/completion-cli.test.mjs"]
-dateOpened: "2026-10-25"
+scope: ["we:backlog/7199-prevention-decision-preparation-coverage-and-citation-checks.md"]
+dateOpened: "2026-10-26"
 tags: []
 ---
 
-# Prevention — Add a deterministic state-transition regression test asserting at most one emission per session a… (from web-everything/web-everything#5943 review)
+# Prevention — Extend the #5473 preparation gate so that any normative "no X option / cannot be disabled" clause… (from web-everything/web-everything#5953 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+1. `we:backlog/7199-prevention-decision-preparation-coverage-and-citation-checks.md:43` — Extend the #5473 preparation gate so that any normative "no X option / cannot be disabled" clause needs a mapped case. That is the same rule as the self-referential Done-when check, applied to its own prose.
+2. `we:backlog/7199-prevention-decision-preparation-coverage-and-citation-checks.md:38` — Add a review-lens checklist item for tools that dereference author-supplied paths (confine to the repo root, reject symlink escapes, test each). Longer term, make a shared path-confinement helper a standards-checked dependency.
+3. `we:backlog/7199-prevention-decision-preparation-coverage-and-citation-checks.md:71` — Have the manifest gate treat "n/a" edge-case dispositions that make a negative claim as claims needing a case or an explicit "not tested" marker.
 
-1. `we:scripts/operations/completion-cli.mjs:158` — Add a deterministic state-transition regression test asserting at most one emission per session across intervening outcomes, backed by persistent session-level emission tracking.
+Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 4 → #xg637ec.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5943@db09e13bcf8e69366df20203ad1d509fa7b6bbea
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5953@bb7efb874ab0e04c2742faa9c04533ee18ec1e08
 
 ## Acceptance
 

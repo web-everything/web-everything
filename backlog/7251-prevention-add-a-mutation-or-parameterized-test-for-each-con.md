@@ -1,22 +1,22 @@
 ---
+bornAs: xi0ktuu
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/delivery-policy.mjs", "we:scripts/lib/__tests__/delivery-policy.test.mjs"]
+scope: ["we:scripts/lib/red-team-gate.mjs", "we:scripts/lib/operator-identity.mjs", "we:scripts/lib/__tests__/red-team-gate.test.mjs", "we:scripts/lib/__tests__/operator-identity.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Extend card 7204's checklist rule so every 'never cached' promise must map to one cache-warm-then… (from web-everything/web-everything#5936 review)
+# Prevention — Add a mutation or parameterized test for each consumer of a shared outcome list. A lint that flag… (from web-everything/web-everything#5923 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:scripts/lib/delivery-policy.mjs:87` — Extend card 7204's checklist rule so every 'never cached' promise must map to one cache-warm-then-revoke test for each cached source kind (defaults, root, pointer, external). Ideally add a table-driven test that loops over source kinds.
-2. `we:scripts/lib/delivery-policy.mjs:135` — File a card to key worktree policy caches on size and mtime, or a content hash. Policy files are capped at 1 MiB, so hashing is cheap. This could be a lint on 'cached(...)' callers in trust-boundary modules, but it is a future item.
 
-Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 3 → #5360, finding 4 → #5360.
+1. `we:scripts/lib/red-team-gate.mjs:560` — Add a mutation or parameterized test for each consumer of a shared outcome list. A lint that flags a duplicated outcome array would also work, but a test is cheaper.
+2. `we:scripts/lib/operator-identity.mjs:20` — Add a table-driven test over OPERATOR_GATE_OUTCOMES. For each outcome, assert that a bot-authored comment is dropped by operatorBoundComments and a human operator-authored one is kept. A new outcome then cannot be added without a row in that table.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5936@030e7ffb5bfaeadc2899c9e9e41db601cf8c5710
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5923@90df9e8917cd400fdbe9a564d7943d1b013d04c0
 
 ## Acceptance
 

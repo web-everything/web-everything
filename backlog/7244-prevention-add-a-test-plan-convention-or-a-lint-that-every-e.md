@@ -1,23 +1,23 @@
 ---
+bornAs: x8rtmi2
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/7199-prevention-decision-preparation-coverage-and-citation-checks.md"]
+scope: ["we:scripts/operations/record-red-team-ruling-io.mjs", "we:scripts/lib/operator-identity.mjs", "we:scripts/operations/__tests__/record-red-team-ruling.test.mjs", "we:scripts/operations/__tests__/record-red-team-ruling-io.test.mjs", "we:scripts/lib/__tests__/operator-identity.test.mjs"]
 dateOpened: "2026-10-26"
 tags: []
 ---
 
-# Prevention — Extend the #5473 preparation gate so that any normative "no X option / cannot be disabled" clause… (from web-everything/web-everything#5953 review)
+# Prevention — Add a test-plan convention, or a lint, that every effect sink in this file has a retry test: fail… (from web-everything/web-everything#5923 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/7199-prevention-decision-preparation-coverage-and-citation-checks.md:43` — Extend the #5473 preparation gate so that any normative "no X option / cannot be disabled" clause needs a mapped case. That is the same rule as the self-referential Done-when check, applied to its own prose.
-2. `we:backlog/7199-prevention-decision-preparation-coverage-and-citation-checks.md:38` — Add a review-lens checklist item for tools that dereference author-supplied paths (confine to the repo root, reject symlink escapes, test each). Longer term, make a shared path-confinement helper a standards-checked dependency.
-3. `we:backlog/7199-prevention-decision-preparation-coverage-and-citation-checks.md:71` — Have the manifest gate treat "n/a" edge-case dispositions that make a negative claim as claims needing a case or an explicit "not tested" marker.
 
-Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 4 → #xg637ec.
+1. `we:scripts/operations/record-red-team-ruling-io.mjs:367` — Add a test-plan convention, or a lint, that every effect sink in this file has a retry test: fail the last write, retry, and assert event and post counts are unchanged. Better, share one 'ensure ledger intent' helper between the sinks.
+2. `we:scripts/lib/operator-identity.mjs:20` — Add a table-driven test asserting every member of OPERATOR_GATE_OUTCOMES is dropped by operatorBoundComments when bot-authored. A new outcome then cannot be added without that coverage.
+3. `we:scripts/operations/__tests__/record-red-team-ruling.test.mjs` — Add a deterministic integration test starting with review:human, exercising production label synchronization through injected transport, and asserting that the label remains after a not-real ruling.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5953@bb7efb874ab0e04c2742faa9c04533ee18ec1e08
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5923@c77d6d2202b29f0701ab71b8fde8a2574aafae30
 
 ## Acceptance
 

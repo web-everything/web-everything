@@ -1,19 +1,21 @@
 ---
+bornAs: xczvawy
 kind: story
-size: 2
+size: 3
+parent: "4075"
 status: open
-scope: ["we:scripts/operations/record-red-team-ruling-io.mjs"]
+scope: ["we:scripts/operations/completion-cli.mjs", "we:scripts/operations/__tests__/completion-cli.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5923 (head 62863380f)
+# Prevention — Add a deterministic state-transition regression test asserting at most one emission per session a… (from web-everything/web-everything#5943 review)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5923 (reviewed head `62863380f100c89bbbf7f82172a0344d2d44f469`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/operations/record-red-team-ruling-io.mjs:379` — (edge-case, degraded) A failed block reason post permanently prevents completing the ruling.
-   - Scenario: Start with a confirmed cap-held break and review:changes already present. Invoke ruling=block; let the operator-block record POST succeed, then fail the reason-comment POST. The sink throws before recording any ledger event. Replanning the same ruling refuses because the persisted block plus review:changes counts as complete, so the operator's reason and ledger event cannot be recovered through retry. Reproduced in both any-state and default cap-only modes. Completion must remain retryable until the reason and remaining required writes are persisted.
-   - Claude's re-check: demonstrated break
+1. `we:scripts/operations/completion-cli.mjs:158` — Add a deterministic state-transition regression test asserting at most one emission per session across intervening outcomes, backed by persistent session-level emission tracking.
+
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5943@db09e13bcf8e69366df20203ad1d509fa7b6bbea
 
 ## Acceptance
 

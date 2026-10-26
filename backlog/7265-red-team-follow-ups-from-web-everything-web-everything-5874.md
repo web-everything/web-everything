@@ -1,20 +1,20 @@
 ---
+bornAs: xus24w6
 kind: story
-size: 3
-parent: "4075"
+size: 2
 status: open
-scope: ["we:scripts/lane-pool.mjs", "we:scripts/__tests__/lane-pool.test.mjs"]
+scope: ["we:scripts/lib/pr-size-admission.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Add a mutation-testing step or checklist for guard predicates. For each clause in a trust conditi… (from web-everything/web-everything#5947 review)
+# Red-team follow-ups from web-everything/web-everything#5874 (head 5a0b327d9)
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5874 (reviewed head `5a0b327d943d32a9028adce76e36419417cfdd79`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/lane-pool.mjs:405` — Add a mutation-testing step or checklist for guard predicates. For each clause in a trust condition, require a test where only that clause is false.
-
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5947@0d7e33f031f57c28a93332104be889633b952239
+1. `we:scripts/lib/pr-size-admission.mjs:202` — (edge-case, degraded) Reusing a branch reuses an unrelated, resolved split card
+   - Scenario: PR #100 on lane/reused previously filed we:backlog/9001-split-old-pr.md containing 'size-split-ref:lane%2Freused. '; that card is now resolved. Open unrelated PR #200 on the same branch with 301 changed lines and no admission marker. The default local lookup matches the old card solely by branch token, ignoring its status and PR identity. A read-only probe observed zero fileItem calls and a body claiming 'split card 9001 filed' for #200. Deduplication should distinguish PR lifecycles and file a new card for the new PR.
+   - Claude's re-check: demonstrated break
 
 ## Acceptance
 

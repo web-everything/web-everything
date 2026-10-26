@@ -1,23 +1,21 @@
 ---
+bornAs: xqe73x4
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/red-team-gate.mjs", "we:scripts/lib/operator-identity.mjs", "we:scripts/operations/__tests__/record-red-team-ruling.test.mjs", "we:scripts/lib/__tests__/red-team-gate.test.mjs", "we:scripts/lib/__tests__/operator-identity.test.mjs"]
+scope: ["we:scripts/lane-pool.mjs", "we:scripts/__tests__/lane-pool.test.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Add a test or lint for boolean opt-in cascades that an invalid env override resolves to the least… (from web-everything/web-everything#5923 review)
+# Prevention — Add a mutation-testing step or checklist for guard predicates. For each clause in a trust conditi… (from web-everything/web-everything#5947 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/red-team-gate.mjs:181` — Add a test or lint for boolean opt-in cascades that an invalid env override resolves to the least-permissive value, or warns, when a lower layer opts in.
-2. `we:scripts/lib/operator-identity.mjs:20` — Make the automation-forgery test table-driven over `OPERATOR_GATE_OUTCOMES`, so any added operator outcome automatically gets a 'bot-authored record is dropped' assertion.
-3. `we:scripts/operations/__tests__/record-red-team-ruling.test.mjs` — Extend the named test with an unrelated held finding and review:human present, asserting the resulting unrelated disposition and label state through the real synchronization path; run it in the deterministic test gate.
-4. `we:scripts/lib/red-team-gate.mjs:559` — Add a deterministic regression test that clears two findings, blocks one, and asserts that only the selected finding becomes held.
+1. `we:scripts/lane-pool.mjs:405` — Add a mutation-testing step or checklist for guard predicates. For each clause in a trust condition, require a test where only that clause is false.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5923@7548c7a4831fb0a5de17b625f65a150e3696365e
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5947@0d7e33f031f57c28a93332104be889633b952239
 
 ## Acceptance
 

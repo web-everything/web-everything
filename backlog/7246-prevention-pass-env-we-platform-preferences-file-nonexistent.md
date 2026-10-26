@@ -1,21 +1,22 @@
 ---
+bornAs: xaottge
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/red-team-gate.mjs", "we:scripts/operations/record-red-team-ruling-io.mjs", "we:scripts/lib/__tests__/red-team-gate.test.mjs", "we:scripts/operations/__tests__/record-red-team-ruling-io.test.mjs"]
-dateOpened: "2026-10-26"
+scope: ["we:scripts/lib/__tests__/vendor-routing-settings.test.mjs"]
+dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Prevention — Add a table-driven test that crosses release kind (not-real, card, clear-human) with order (befor… (from web-everything/web-everything#5923 review)
+# Prevention — Pass env: { WE_PLATFORM_PREFERENCES_FILE: '/nonexistent' } in the shared base. Reader tests would… (from web-everything/web-everything#5950 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/red-team-gate.mjs:687` — Add a table-driven test that crosses release kind (not-real, card, clear-human) with order (before or after the block) and asserts held in all cells. Also run a mutation check on each clause of the held predicate.
-2. `we:scripts/operations/record-red-team-ruling-io.mjs:367` — Add a shared helper for deterministic ledger ids with a read-back check and use it in both sinks. Add a test that retries after a failed release POST and asserts the ledger row count stays at one.
+1. `we:scripts/lib/__tests__/vendor-routing-settings.test.mjs:86` — Pass `env: { WE_PLATFORM_PREFERENCES_FILE: '/nonexistent' }` in the shared `base`. Reader tests would then never touch the real platform files.
+2. `we:scripts/lib/__tests__/vendor-routing-settings.test.mjs:92` — Add a deterministic parameterized regression test pairing each malformed tool-container shape with a distinct valid platform override and asserting its value and source.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5923@ddd5dda965b31fd1fc01c9ed32a7e77f69babe44
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5950@6cbc8e872a30c1ca792fe62b1db7a50397266829
 
 ## Acceptance
 

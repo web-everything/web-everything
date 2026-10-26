@@ -1,18 +1,19 @@
 ---
+bornAs: xo5h7i6
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/pr-size-admission.mjs"]
+scope: ["we:scripts/lib/health-watch-lane-scan.mjs"]
 dateOpened: "2026-10-25"
 tags: []
 ---
 
-# Red-team follow-ups from web-everything/web-everything#5874 (head 5a0b327d9)
+# Red-team follow-ups from web-everything/web-everything#5759 (head f7c0342cc)
 
-Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5874 (reviewed head `5a0b327d943d32a9028adce76e36419417cfdd79`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+Filed mechanically by the red-team gate: the post-accept red team on web-everything/web-everything#5759 (reviewed head `f7c0342cc13b54535afd6c8ef7a62939b5c87aaa`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
 
-1. `we:scripts/lib/pr-size-admission.mjs:202` — (edge-case, degraded) Reusing a branch reuses an unrelated, resolved split card
-   - Scenario: PR #100 on lane/reused previously filed we:backlog/9001-split-old-pr.md containing 'size-split-ref:lane%2Freused. '; that card is now resolved. Open unrelated PR #200 on the same branch with 301 changed lines and no admission marker. The default local lookup matches the old card solely by branch token, ignoring its status and PR identity. A read-only probe observed zero fileItem calls and a body claiming 'split card 9001 filed' for #200. Deduplication should distinguish PR lifecycles and file a new card for the new PR.
+1. `we:scripts/lib/health-watch-lane-scan.mjs:74` — (failing-input, degraded) A valid fetch refspec is misclassified as dangerous Git configuration
+   - Scenario: Configure remote.origin.fetch as +refs/heads/main:refs/remotes/origin/backup.promisor in an otherwise clean, published lane. configKeyCandidates includes the entire key\nvalue entry, and the dot-all remote.*.promisor regex matches that entry because its value ends in .promisor. freshLaneSafety consequently refuses the lane as redirecting objects, transport or worktree; stale-state also skips its ahead calculation. A read-only probe using this config-list entry and real Git for every other check changed guardLaneAction.act from true to false. The parser should recognize remote.origin.fetch as t
    - Claude's re-check: demonstrated break
 
 ## Acceptance
