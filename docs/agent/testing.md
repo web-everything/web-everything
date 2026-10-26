@@ -198,6 +198,48 @@ negative answers without file reads remain unverifiable.
 
 ## Drain red-team disposition and retry evidence
 
+Moved card-only skips recover through the normal red-team-only review job. The planner requires a
+finished policy skip with a pinned card-only read and no seat, then proves the move with
+`card-only-head-move.mjs` (shared numbering proof, otherwise a complete no-renames card-path diff).
+The job repeats that proof before settling the policy comment on the new head; it never sends
+the historical diff to a model or changes the original panel review. Unknown moves stay skipped.
+Both initial recovery and failed-comment retries resolve the live `redTeam.skipCardOnly` cascade
+after the proof/fetch; a disabled policy or missing/throwing policy hook refuses with
+`red-team-not-owed` before admission or settlement. Cover card-only and numbering-only moves, retries, and old accepting
+as well as non-accepting verdicts, including a policy change after IO construction.
+Carried settlement payloads retain `carriedFrom` (the original reviewed head) and clear `verdict`;
+their live `netBasis.rev` identifies settlement, not a panel read. The drain reader also strips
+any verdict on a marked carry before exposing it to scheduling consumers. Persisted comment-failure
+tests must prove that the payload cannot authorize a post-accept model pass and remains retryable.
+Carry publication uses a separate `(repo, pr, head, kind)` journal in `red-team-status/carry`:
+intent → clear label → result comment → done. The shared file lock serializes resumes; the
+journal is not a panel verdict or a queued model job. Each unfinished step checks live policy,
+head, holds and superseding review evidence, then its own observable postcondition before acting.
+Crash tests must cover each boundary, including a successful remote effect whose reply/journal
+write is lost. Exercise both accepting and non-accepting source verdicts through the persisted
+evidence reader, recovery planner and job. For lost status-write, label and comment replies, assert
+one status write, one label change, one comment and no model call after retry, with a null carried verdict.
+Recovery discovery must include an unfinished journal even when the result comment
+is already visible. A later real panel or changed head refuses recovery; it cannot inherit the
+carry's null verdict. A contended lock or unreadable evidence leaves the journal for the next
+recovery tick and reports an inspect/retry diagnostic; it never authorizes a model call.
+The moved-card cases in `review-red-team-on-skip.test.mjs`, `drain-red-team-evidence.test.mjs`
+and `review-job-red-team-only.test.mjs` pin selection, fail-closed proof and real comment settlement.
+Keep these files in the affected-test gate whenever the moved-card readers, proof or job wiring change:
+`npm run test:unit -- scripts/lib/__tests__/review-red-team-on-skip.test.mjs scripts/lib/__tests__/drain-red-team-evidence.test.mjs scripts/operations/__tests__/review-job-red-team-only.test.mjs`.
+Exercise new factory IO members through `createReviewJobIo` with temporary persisted evidence and an
+injected command reader; cover runner defaults as well as injected proofs. History cases must include
+20 and 21 commits, a root, an intermediate code change, and a code-to-card rename whose source becomes
+visible only with `--no-renames`. Historical evidence filters need a refusal case for each condition,
+with distinct old and live heads. Byte fixtures exercise the complete numbering detector without Git writes.
+Maintain a table with one independently falsified row per candidate-predicate conjunct, alongside
+planner/job integration tests. The moved candidate table must isolate status/read head equality;
+the historical fallback table must isolate `inFlight` from finished status (the reader currently
+derives them together). Give the status its own read so a mismatch does not also invalidate the
+status's internal provenance. Document logically implied clauses (real-head validity also follows
+from matching a valid status head); otherwise require a named row that fails if the conjunct is
+removed. Keep these tables in the affected-test gate above.
+
 Accept carry-forward's advisory exemption must use `readConfirmedBreaks` and `planRedTeamActions`,
 including settings and `WE_RED_TEAM_CONFIRMED_BREAKS` overrides. A send-back finding or an
 unresolved policy supersedes the stale accept; the fallback is a fresh review. Regression cases
