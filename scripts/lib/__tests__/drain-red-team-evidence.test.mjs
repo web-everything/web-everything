@@ -4,9 +4,11 @@ import { mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
-import { readDrainRedTeamEvidence, recordRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
+import { historicalCardOnlySkipCandidate, readDrainRedTeamEvidence, recordRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
+import { redTeamOwedFor } from '../review-red-team-policy.mjs';
 import { pidStartTime } from '../pid-alive.mjs';
+import { resumeRedTeamCarry } from '../red-team-carry-machine.mjs';
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -19,7 +21,63 @@ function fixture() {
 }
 const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
 
+describe('historical fallback predicate clauses', () => {
+  const evidence = () => ({ status: { status: 'finished', skipCardOnly: true, result: 'skipped' },
+    recorded: false, inFlight: false, queued: false });
+  it('accepts a finished unrecorded policy skip', () => {
+    expect(historicalCardOnlySkipCandidate(evidence())).toBe(true);
+  });
+  it.each([
+    ['finished status', e => { e.status.status = 'running'; }],
+    ['historical policy', e => { e.status.skipCardOnly = false; }],
+    ['skipped result', e => { e.status.result = 'ran'; }],
+    ['no recorded seat', e => { e.recorded = true; }],
+    ['not in flight', e => { e.inFlight = true; }],
+    ['not queued', e => { e.queued = true; }],
+  ])('independently requires %s', (_clause, mutate) => {
+    const old = evidence();
+    mutate(old);
+    expect(historicalCardOnlySkipCandidate(old)).toBe(false);
+  });
+});
+
 describe('drain reads actual head-bound review scheduler inputs', () => {
+  it.each(['missing status', 'real panel status', 'same-head panel', 'different-head panel'])(
+    'unfinished journal discovery handles %s without manufacturing a verdict', kind => {
+      const f = fixture(), from = 'a'.repeat(40);
+      const loopPayload = { verdict: null, carriedFrom: from, findings: { read: {
+        netBasis: { rev: f.head }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
+      } } };
+      // Power loss immediately after the journal rename, before the compatibility status.
+      expect(() => resumeRedTeamCarry({ ...f, loopPayload }, { env: f.env, eligible: () => true,
+        intentRecorded: () => false, recordIntent: () => { throw Error('crash'); },
+      })).toThrow('crash');
+      if (kind === 'real panel status') {
+        recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'ran' }, f);
+      } else if (kind.includes('panel')) {
+        writeRun({ ...newRunRecord({ id: 'review-pr-later-panel', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
+          ...payload(kind === 'same-head panel' ? f.head : 'c'.repeat(40)) }, f.runsDir);
+      }
+      const evidence = readDrainRedTeamEvidence(f);
+      if (kind === 'missing status') {
+        expect(evidence).toMatchObject({ carry: { step: 'intent' }, loopPayload: { verdict: null },
+          status: { status: 'finished', result: { status: 'skipped', policy: 'card-only' } } });
+      } else {
+        expect(evidence.carryConflict).toBe(true);
+        expect(evidence.carry).toBeUndefined();
+      }
+    });
+  it.each(['accept', 'changes'])('a carried %s verdict is never exposed as a live-head panel verdict', verdict => {
+    const f = fixture(), carriedFrom = 'c'.repeat(40);
+    const loopPayload = { ...payload(f.head), carriedFrom, verdict: { verdict } };
+    recordRedTeamStatus({ ...f, loopPayload, status: 'finished', result: { status: 'skipped', policy: 'card-only' } }, f);
+    const evidence = readDrainRedTeamEvidence(f);
+    expect(evidence.loopPayload).toMatchObject({ carriedFrom, verdict: null,
+      findings: { read: { netBasis: { rev: f.head } } } });
+    expect(redTeamOwedFor(evidence.loopPayload)).toBe(false);
+    expect(evidence.status.loopPayload.verdict).toEqual({ verdict });
+    expect(loopPayload.verdict).toEqual({ verdict });
+  });
   it('does not invent an accept when no review run exists', () => {
     expect(readDrainRedTeamEvidence(fixture())).toEqual({ loopPayload: null, recorded: false,
       seatRecorded: false, completedRecorded: false, scheduled: false, inFlight: false });
@@ -188,3 +246,52 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     expect(readDrainRedTeamEvidence({ ...f, isAlive: () => true })).toMatchObject({ recorded: true, inFlight: false });
   });
 });
+
+
+it('surfaces a finished old card-only skip when the live head has no read', () => {
+  const f = fixture(), oldHead = 'b'.repeat(40);
+  f.head = 'a'.repeat(40);
+  const loopPayload = { verdict: { verdict: 'changes' }, findings: { read: {
+    netBasis: { rev: oldHead }, netChangedFiles: ['backlog/123-card.md'], diffText: '+card',
+  } } };
+  writeRun({ ...newRunRecord({ id: 'review-pr-old-card', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
+    ...loopPayload }, f.runsDir);
+  recordRedTeamStatus({ ...f, loopPayload, status: 'finished', result: 'skipped' }, f);
+  expect(readDrainRedTeamEvidence(f)).toMatchObject({ loopPayload, recorded: false, seatRecorded: false,
+    status: { status: 'finished', head: oldHead, skipCardOnly: true } });
+  // The exact live-head read always wins over this historical fallback.
+  writeRun({ ...newRunRecord({ id: 'review-pr-live', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
+    ...payload(f.head) }, f.runsDir);
+  expect(readDrainRedTeamEvidence(f).loopPayload.findings.read.netBasis.rev).toBe(f.head);
+});
+
+it.each(['non-card read', 'missing read paths', 'non-card rename source', 'skipCardOnly false',
+  'skipCardOnly missing', 'recorded seat', 'live-head seat', 'running', 'queued', 'not skipped', 'missing status'])(
+  'historical fallback refuses %s and returns no live-head read', variant => {
+    const f = fixture(), oldHead = 'c'.repeat(40);
+    const loopPayload = { verdict: { verdict: 'changes' }, findings: { read: {
+      netBasis: { rev: oldHead }, netChangedFiles: ['backlog/123-card.md'], diffText: '+card',
+    } } };
+    if (variant === 'non-card read') loopPayload.findings.read.netChangedFiles = ['scripts/code.mjs'];
+    if (variant === 'missing read paths') delete loopPayload.findings.read.netChangedFiles;
+    if (variant === 'non-card rename source') loopPayload.findings.read.netRenameSources = ['scripts/code.mjs'];
+    writeRun({ ...newRunRecord({ id: 'review-pr-old-card-negative', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
+      ...loopPayload }, f.runsDir);
+    if (variant !== 'missing status') {
+      recordRedTeamStatus({ ...f, loopPayload, status: 'finished', result: 'skipped' }, f);
+      const path = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${oldHead}.json`);
+      const status = JSON.parse(readFileSync(path, 'utf8'));
+      if (variant === 'skipCardOnly false') status.skipCardOnly = false;
+      if (variant === 'skipCardOnly missing') delete status.skipCardOnly;
+      if (['running', 'queued'].includes(variant)) status.status = variant;
+      if (variant === 'not skipped') status.result = 'error';
+      writeFileSync(path, JSON.stringify(status));
+    }
+    const hasSeat = ['recorded seat', 'live-head seat'].includes(variant);
+    const evidence = readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => null,
+      readScorecards: () => hasSeat ? [{ dispatchKind: 'review-seat', seat: 'red-team', repo: f.repo,
+        pr: f.pr, rev: variant === 'live-head seat' ? f.head : oldHead }] : [] });
+    expect(evidence).toEqual({ loopPayload: null, recorded: variant === 'live-head seat',
+      seatRecorded: variant === 'live-head seat', completedRecorded: false,
+      scheduled: variant === 'live-head seat', inFlight: false });
+  });

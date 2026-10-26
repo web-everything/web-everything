@@ -1,0 +1,1 @@
+- Also raised by web-everything/web-everything#5936 (finding 4: `we:backlog/7204-prevention-isolate-refusal-guards-and-test-cache-trust-revalidation.md:31` — Add a deterministic card-validation gate requiring each Acceptance identifier to reference a named implemented or planned check, its repository-qualified file, and its observable assertion.)
