@@ -2028,6 +2028,23 @@ sleep without consuming native filesystem watchers, and the optional webhook sle
 provides an isolated mailbox for tests. A wake only schedules a normal pass; claims,
 scope, host admission and attempt budgets remain authoritative.
 
+Pinned plain re-arm fixtures must exercise the partial state between the label swap and
+the durable marker: three failed comment attempts restore the pre-swap labels, while a
+pending PR resumes by posting only its missing marker. Inject `rearmRetrySleep` to avoid
+real delays. Assert head checks on comment retries and rollback, trusted verdict-bound
+coverage in thread order (including the same timestamp second), and round counts after
+rollback and successful retry. A rollback failure must name the unmarked pending state.
+Compensating label writes must also revalidate the complete trusted review evidence
+and the review/readiness labels created by the swap. Exercise a same-head human
+clearance on the third failed comment attempt, a newer or edited verdict with labels
+still pending, changed holds/readiness, and unreadable state. Refuse compensation
+when superseded; preserve unrelated labels and ignore untrusted verdict claims.
+The `pinned-rearm-orphan-marker` soak replay retains one provider's PR state across
+exhausted HTTP 503 retries, successful or failed rollback, and subsequent retries.
+Assert that failed rollback resumes with only a marker write, a completed retry writes
+nothing further even within the verdict's timestamp second, and rollback spends no
+repair round or bypasses the orphan redispatch cap.
+
 The shared policy cascade resolves `fix.sendBackReservedSlots` (standard 1),
 `fix.ciMissingAfterPushMin` (standard 10), and `drain.mergeableUnknownRepollSec`
 (standard 20), independently through platform preferences, declared tool settings and
