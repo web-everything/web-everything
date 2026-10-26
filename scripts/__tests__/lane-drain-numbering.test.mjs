@@ -18,6 +18,7 @@ import { pathToFileURL } from 'node:url';
 import { numberPendingHashes, landedNumberFor, cardPathInTree, hasPendingHashFiles, numberPendingHashesIfAny, finalizeLand } from '../lane-drain.mjs';
 import { tryAcquireNumberingLock } from '../readiness/drain-lock.mjs';
 import { checkFlow } from '../conveyor/flows/flow-model.mjs';
+import { mergeGroupHashRefusals } from '../lib/queue-branch-numbering.mjs';
 import { strandedHashesOnMain } from '../check-standards-rules.mjs';
 
 const DRAIN_CLI = join(process.cwd(), 'scripts/lane-drain.mjs');
@@ -1302,4 +1303,18 @@ describe('xsjn0uf-incident — a bornAs already numbered on origin/main is never
     expect(r.held.map((h) => h.hash)).toEqual(['xdup001']);
     expect(backlogNames()).toEqual(['5319-same-card.md', '5320-other.md', 'xdup001-same-card.md']);
   });
+});
+
+it('numeric cards with bornAs need zero assignments and zero rewrites', () => {
+  write('backlog/123-born-numbered.md', '---\nbornAs: xabc123\nkind: task\n---\n#123\n');
+  git('add', '.'); git('commit', '-qm', 'born numbered');
+  const before = git('rev-parse', 'HEAD');
+  const bytes = readFileSync(join(repo, 'backlog/123-born-numbered.md'), 'utf8');
+  expect(numberPendingHashes(repo)).toEqual({ assigned: [], committed: false });
+  expect(git('rev-parse', 'HEAD')).toBe(before);
+  expect(git('status', '--porcelain')).toBe('');
+  expect(readFileSync(join(repo, 'backlog/123-born-numbered.md'), 'utf8')).toBe(bytes);
+  expect(mergeGroupHashRefusals({ env: { GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'merge_group' },
+    files: ['backlog/123-born-numbered.md'] })).toEqual([]);
+  expect(strandedHashesOnMain(['backlog/123-born-numbered.md'])).toEqual({ errors: [], warnings: [] });
 });
