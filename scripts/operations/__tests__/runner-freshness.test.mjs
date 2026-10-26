@@ -97,6 +97,7 @@ describe('runner freshness policy', () => {
         "pr-reconcile",
         "pr-status",
         "pr-sweep",
+        "pr-trace",
         "pre-pr-check",
         "priority-sync",
         "prototype-load",
