@@ -35,6 +35,14 @@ export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = nu
     pid: process.pid, host, pidNamespace: namespace, pidStart: readPidStart(process.pid) });
 }
 
+/** Each conjunct is independently pinned by the historical fallback predicate tests. PURE. */
+export function historicalCardOnlySkipCandidate(old) {
+  const prior = old?.status;
+  return prior?.status === 'finished' && prior.skipCardOnly === true
+    && (typeof prior.result === 'string' ? prior.result : prior.result?.status) === 'skipped'
+    && !old.recorded && !old.inFlight && !old.queued;
+}
+
 /** Absence of a review payload is not an accept. Labels alone never schedule a post-accept pass. */
 export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   runsDir = resolveRunsDir(), list = listRunIds, read = readRun, isAlive = pidAlive, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
@@ -88,7 +96,10 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
         live = !start || !status.pidStart || start === status.pidStart;
       }
     }
-    return { status, loopPayload: status.loopPayload, ...seatEvidence, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
+    // Settlement provenance cannot stand in for a panel verdict, even if an older
+    // writer retained one. Keep the status intact for recovery's provenance checks.
+    const loopPayload = status.loopPayload?.carriedFrom != null ? { ...status.loopPayload, verdict: null } : status.loopPayload;
+    return { status, loopPayload, ...seatEvidence, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
       ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(resultStatus), recorded: recorded || resultStatus === 'ran' };
   }
   const loopPayload = latestRun().run;
@@ -98,10 +109,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     if (oldHead && oldHead !== head && redTeamCardOnly(older.findings.read)) {
       const old = readDrainRedTeamEvidence({ repo, pr, head: oldHead, env, runsDir, list, read,
         isAlive, host, namespace, readPidStart, readScorecards });
-      const prior = old.status;
-      if (prior?.status === 'finished' && prior.skipCardOnly === true
-        && (typeof prior.result === 'string' ? prior.result : prior.result?.status) === 'skipped'
-        && !old.recorded && !old.inFlight && !old.queued) return old;
+      if (historicalCardOnlySkipCandidate(old)) return old;
     }
   }
   // An owing run with no job status yet: only the job's process knows its card-only skip decision, so hold the head

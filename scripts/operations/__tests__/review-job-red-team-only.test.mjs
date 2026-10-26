@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { planRedTeamOnSkip, redTeamSkipNeedsSettlement, runRedTeamOnSkip } from '../../lib/review-red-team-on-skip.mjs';
 import { redTeamForHead, redTeamMarker } from '../../lib/red-team-gate.mjs';
+import { redTeamOwedFor } from '../../lib/review-red-team-policy.mjs';
 import { writeJsonAtomic } from '../../lib/atomic-json-file.mjs';
 import { recordRedTeamStatus, readRedTeamStatus, readDrainRedTeamEvidence, redTeamStatusDir } from '../../lib/drain-red-team-evidence.mjs';
 import { createReviewJobIo, prepareReviewArc, runReviewJob, dispatchReviewJob, writeJobRecord, redTeamRunnerArgs, readRedTeamRecoveryStatus } from '../review-job.mjs';
@@ -1344,6 +1345,55 @@ describe('PR 5890 persisted review-pr recovery rows', () => {
 
 
 describe('moved card-only skip settlement', () => {
+  it.each(['card-only', 'numbering-only', 'settlement retry'].flatMap(kind =>
+    ['changes', 'accept'].flatMap(verdict => ['before execution', 'during fetch'].map(policyChange => ({ kind, verdict, policyChange }))))) (
+    'live policy off $policyChange refuses $kind recovery of $verdict without settlement or a comment', ({ kind, verdict, policyChange }) => {
+      const fromSha = 'b'.repeat(40), comments = [];
+      const env = { WE_RED_TEAM_SKIP_CARD_ONLY: '1' };
+      const production = createReviewJobIo({ env });
+      const readHead = kind === 'settlement retry' ? head : fromSha;
+      const loopPayload = { verdict: { verdict }, findings: { read: {
+        netBasis: { rev: readHead }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
+      } }, ...(kind === 'settlement retry' ? { carriedFrom: fromSha, verdict: null } : {}) };
+      const evidence = { head, loopPayload, recorded: false, seatRecorded: false,
+        status: { head: readHead, status: 'finished', result: 'skipped', skipCardOnly: true, loopPayload } };
+      const io = fakeIo({ readRedTeamOnlyPayload: () => evidence,
+        redTeamSkipCardOnlySetting: production.redTeamSkipCardOnlySetting,
+        proveCardOnlyHeadMove: () => ({ ok: true, kind }),
+        fetchRedTeamHead: () => { env.WE_RED_TEAM_SKIP_CARD_ONLY = '0'; return { head }; },
+        settleRedTeamSkip: vi.fn(() => comments.push('unexpected policy comment')) });
+      // Resolve at execution, not when the IO is created or when the old skip was written.
+      if (policyChange === 'before execution') env.WE_RED_TEAM_SKIP_CARD_ONLY = '0';
+      expect(runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, io).outcome).toBe('red-team-not-owed');
+      expect(io.settleRedTeamSkip).not.toHaveBeenCalled();
+      expect(io.redTeamStatus).not.toHaveBeenCalled();
+      expect(io.runRedTeam).not.toHaveBeenCalled();
+      expect(comments).toEqual([]);
+    });
+  it.each(['missing', 'throwing', 'unknown'])('refuses %s live policy evidence before admission', kind => {
+    const fromSha = 'b'.repeat(40);
+    const loopPayload = { verdict: null, carriedFrom: fromSha, findings: { read: {
+      netBasis: { rev: head }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
+    } } };
+    const io = fakeIo({ readRedTeamOnlyPayload: () => ({ head, loopPayload, recorded: false, seatRecorded: false,
+      status: { head, status: 'finished', result: 'skipped', skipCardOnly: true, loopPayload } }),
+      redTeamSkipCardOnlySetting: kind === 'missing' ? undefined : () => {
+        if (kind === 'throwing') throw Error('policy unreadable');
+        return undefined;
+      }, settleRedTeamSkip: vi.fn() });
+    expect(runReviewJob({ repo, pr, redTeamOnly: true }, io).outcome).toBe('red-team-not-owed');
+    expect(io.redTeamStatus).not.toHaveBeenCalled();
+    expect(io.settleRedTeamSkip).not.toHaveBeenCalled();
+    expect(io.runRedTeam).not.toHaveBeenCalled();
+  });
+  it.each(['fresh', 'resume'])('a carried accepting payload cannot fall through to a model in %s mode', redTeamMode => {
+    const loopPayload = { ...payload(), carriedFrom: 'b'.repeat(40) };
+    const io = fakeIo({ readRedTeamOnlyPayload: () => ({ head, loopPayload }), settleRedTeamSkip: vi.fn() });
+    expect(runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode }, io).outcome).toBe('red-team-not-owed');
+    expect(io.redTeamStatus).not.toHaveBeenCalled();
+    expect(io.settleRedTeamSkip).not.toHaveBeenCalled();
+    expect(io.runRedTeam).not.toHaveBeenCalled();
+  });
   it.each([
     ['missing status', evidence => { evidence.status = null; }],
     ['wrong status head', evidence => { evidence.status.head = 'b'.repeat(40); }],
@@ -1415,12 +1465,13 @@ describe('moved card-only skip settlement', () => {
         expect.objectContaining({ cwd: root, timeout: 10_000, maxBuffer: 1024 * 1024 }));
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
-  it.each([false, true])('fresh recovery settles a moved non-accept skip, retrying a transient comment failure=%s without a model', failFirstComment => {
+  it.each([false, true].flatMap(failFirstComment => ['changes', 'accept'].map(verdict => ({ failFirstComment, verdict }))))(
+    'fresh recovery settles a moved $verdict skip, retrying a transient comment failure=$failFirstComment without a model', ({ failFirstComment, verdict }) => {
     const dir = mkdtempSync(join(tmpdir(), 'moved-card-skip-'));
     const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), CONVEYOR_STATE_ROOT: dir,
       WE_RED_TEAM_SKIP_CARD_ONLY: '1' };
     const fromSha = 'b'.repeat(40), comments = [];
-    const loopPayload = { verdict: { verdict: 'changes' }, findings: { read: {
+    const loopPayload = { verdict: { verdict }, findings: { read: {
       netBasis: { rev: fromSha }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
     } } };
     const exec = vi.fn((file, args, options) => {
@@ -1437,6 +1488,7 @@ describe('moved card-only skip settlement', () => {
     });
     const production = createReviewJobIo({ root: dir, env, exec });
     const io = fakeIo({ readRedTeamOnlyPayload: production.readRedTeamOnlyPayload,
+      redTeamSkipCardOnlySetting: production.redTeamSkipCardOnlySetting,
       proveCardOnlyHeadMove: vi.fn(production.proveCardOnlyHeadMove),
       redTeamStatus: vi.fn(production.redTeamStatus),
       settleRedTeamSkip: input => settleRedTeamSkip({ ...input, io: { env,
@@ -1463,8 +1515,11 @@ describe('moved card-only skip settlement', () => {
         expect(comments).toHaveLength(0);
         const persisted = readRedTeamStatus({ repo, pr, head, env });
         expect(redTeamSkipNeedsSettlement(persisted)).toBe(true);
-        expect(persisted.loopPayload).toMatchObject({ verdict: { verdict: 'changes' },
+        expect(persisted.loopPayload).toMatchObject({ carriedFrom: fromSha, verdict: null,
           findings: { read: { netBasis: { rev: head } } } });
+        const evidence = production.readRedTeamOnlyPayload({ repo, pr, head });
+        expect(evidence.loopPayload.carriedFrom).toBe(fromSha);
+        expect(redTeamOwedFor(evidence.loopPayload)).toBe(false);
         expect(plan()).toMatchObject({ action: 'dispatch', mode: 'fresh' });
         out = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, io);
         expect(io.proveCardOnlyHeadMove).toHaveBeenCalledTimes(1);
@@ -1477,7 +1532,7 @@ describe('moved card-only skip settlement', () => {
       expect(io.runRedTeam).not.toHaveBeenCalled();
       expect(io.runLoop).not.toHaveBeenCalled();
       expect(readRedTeamStatus({ repo, pr, head, env })).toMatchObject({ status: 'finished',
-        result: { status: 'skipped', policy: 'card-only' } });
+        result: { status: 'skipped', policy: 'card-only' }, loopPayload: { carriedFrom: fromSha, verdict: null } });
       expect(loopPayload.findings.read.netBasis.rev).toBe(fromSha);
     } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
   });

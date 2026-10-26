@@ -4,8 +4,9 @@ import { mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
-import { readDrainRedTeamEvidence, recordRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
+import { historicalCardOnlySkipCandidate, readDrainRedTeamEvidence, recordRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
+import { redTeamOwedFor } from '../review-red-team-policy.mjs';
 import { pidStartTime } from '../pid-alive.mjs';
 
 const roots = [];
@@ -19,7 +20,38 @@ function fixture() {
 }
 const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
 
+describe('historical fallback predicate clauses', () => {
+  const evidence = () => ({ status: { status: 'finished', skipCardOnly: true, result: 'skipped' },
+    recorded: false, inFlight: false, queued: false });
+  it('accepts a finished unrecorded policy skip', () => {
+    expect(historicalCardOnlySkipCandidate(evidence())).toBe(true);
+  });
+  it.each([
+    ['finished status', e => { e.status.status = 'running'; }],
+    ['historical policy', e => { e.status.skipCardOnly = false; }],
+    ['skipped result', e => { e.status.result = 'ran'; }],
+    ['no recorded seat', e => { e.recorded = true; }],
+    ['not in flight', e => { e.inFlight = true; }],
+    ['not queued', e => { e.queued = true; }],
+  ])('independently requires %s', (_clause, mutate) => {
+    const old = evidence();
+    mutate(old);
+    expect(historicalCardOnlySkipCandidate(old)).toBe(false);
+  });
+});
+
 describe('drain reads actual head-bound review scheduler inputs', () => {
+  it.each(['accept', 'changes'])('a carried %s verdict is never exposed as a live-head panel verdict', verdict => {
+    const f = fixture(), carriedFrom = 'c'.repeat(40);
+    const loopPayload = { ...payload(f.head), carriedFrom, verdict: { verdict } };
+    recordRedTeamStatus({ ...f, loopPayload, status: 'finished', result: { status: 'skipped', policy: 'card-only' } }, f);
+    const evidence = readDrainRedTeamEvidence(f);
+    expect(evidence.loopPayload).toMatchObject({ carriedFrom, verdict: null,
+      findings: { read: { netBasis: { rev: f.head } } } });
+    expect(redTeamOwedFor(evidence.loopPayload)).toBe(false);
+    expect(evidence.status.loopPayload.verdict).toEqual({ verdict });
+    expect(loopPayload.verdict).toEqual({ verdict });
+  });
   it('does not invent an accept when no review run exists', () => {
     expect(readDrainRedTeamEvidence(fixture())).toEqual({ loopPayload: null, recorded: false,
       seatRecorded: false, completedRecorded: false, scheduled: false, inFlight: false });

@@ -88,7 +88,7 @@ import { execRead } from '../lib/proc-read.mjs';
 import { laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
-import { liveResultGateState, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
+import { liveResultGateState, readRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
 import { normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
 import { redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
@@ -415,6 +415,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       return { head };
     },
     readRedTeamOnlyPayload: ({ pr, repo, head }) => ({ ...readEvidence({ repo, pr, head, env }), head }),
+    redTeamSkipCardOnlySetting: () => readRedTeamProbes({ env, log: line => process.stderr.write(`${line}\n`) }).value.skipCardOnly,
     proveCardOnlyHeadMove: move => proveCardOnlyHeadMove({ ...move, exec, cwd: root }),
     // The carry's own resolver is its only source (logged with that source); no timing setting governs it.
     carryAcrossRebaseSetting: () => resolveCarryAcrossRebase({ env, readFile }),
@@ -1036,20 +1037,29 @@ function runReviewArc({
       if (!['fresh', 'resume'].includes(redTeamMode)) throw Error('unknown red-team mode; inspect recovery settings before retrying');
       const stored = io.readRedTeamOnlyPayload({ pr: planned.pr, repo: planned.repo, head });
       let loopPayload = stored?.loopPayload;
+      const movedCardOnly = redTeamMode === 'fresh' && stored?.head === head && cardOnlyHeadMoveCandidate(stored, head);
+      const pendingCardOnly = redTeamMode === 'fresh' && stored?.head === head
+        && (!redTeamOwedFor(loopPayload) || loopPayload?.carriedFrom != null)
+        && cardOnlySkipSettlementCandidate(stored, head);
       // Re-prove at execution: planner evidence may have changed since dispatch. Never run
       // a model against the old read; this path only settles the card-only policy exemption.
-      if (redTeamMode === 'fresh' && stored?.head === head && cardOnlyHeadMoveCandidate(stored, head)
+      if (movedCardOnly
         && io.proveCardOnlyHeadMove?.({ fromSha: loopPayload.findings.read.netBasis.rev, toSha: head })?.ok === true) {
         seatsBox.cardOnlyRecovery = true;
-        loopPayload = { ...loopPayload, findings: { ...loopPayload.findings,
+        // This head was proved eligible for settlement, not read by the panel. Retain
+        // the original review in its run/status and never copy its verdict onto this head.
+        loopPayload = { ...loopPayload, carriedFrom: loopPayload.carriedFrom ?? loopPayload.findings.read.netBasis.rev,
+          verdict: null, findings: { ...loopPayload.findings,
           read: { ...loopPayload.findings.read, netBasis: { ...loopPayload.findings.read.netBasis, rev: head } } } };
       }
       // A prior carry may have persisted this head before its policy comment failed.
       // Non-accept payloads can retry that settlement, but must never reach a model.
-      if (redTeamMode === 'fresh' && stored?.head === head && !redTeamOwedFor(loopPayload)
-        && cardOnlySkipSettlementCandidate(stored, head)) seatsBox.cardOnlyRecovery = true;
+      if (pendingCardOnly) {
+        seatsBox.cardOnlyRecovery = true;
+        if (loopPayload.carriedFrom != null) loopPayload = { ...loopPayload, verdict: null };
+      }
       const pinned = stored?.head === head && loopPayload?.findings?.read?.netBasis?.rev === head;
-      if (!pinned || (!seatsBox.cardOnlyRecovery && !redTeamOwedFor(loopPayload))) {
+      if (!pinned || (!seatsBox.cardOnlyRecovery && (loopPayload?.carriedFrom != null || !redTeamOwedFor(loopPayload)))) {
         classified = { outcome: 'red-team-not-owed', reason: pinned ? 'stored review does not owe a red team' : 'stored review does not match live head' };
         return result({ ...classified, lanePath });
       }
@@ -1064,6 +1074,16 @@ function runReviewArc({
         if (fetched?.head !== head) throw Error('pinned red-team head mismatch');
       } catch {
         return refuse('reviewed head could not be fetched into the lane; retry next tick');
+      }
+      if (seatsBox.cardOnlyRecovery) {
+        // Historical provenance cannot authorize today's policy. Resolve after the
+        // potentially slow proof/fetch, before admission writes or settlement.
+        let skipCardOnly = false;
+        try { skipCardOnly = io.redTeamSkipCardOnlySetting?.() === true; } catch { /* fail closed */ }
+        if (!skipCardOnly) {
+          classified = { outcome: 'red-team-not-owed', reason: 'live card-only skip policy is disabled or unreadable' };
+          return result({ ...classified, lanePath });
+        }
       }
       classified = { outcome: 'red-team-only' };
       return finishArc({ pr: planned.pr, repo: planned.repo, lanePath, loopPayload, slug, redTeamMode });

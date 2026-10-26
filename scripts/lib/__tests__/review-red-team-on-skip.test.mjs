@@ -1,7 +1,7 @@
 import { proveCardOnlyHeadMove } from '../card-only-head-move.mjs';
 import * as numbering from '../numbering-carry.mjs';
 import { describe, it, expect, vi } from 'vitest';
-import { normalizeRedTeamResult, planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
+import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
 import { readDrainRedTeamEvidence } from '../drain-red-team-evidence.mjs';
@@ -393,8 +393,27 @@ describe('card-only head move recovery', () => {
   const oldEvidence = () => {
     const loopPayload = oldPayload();
     return { loopPayload, recorded: false, seatRecorded: false, completedRecorded: false, inFlight: false,
-      status: { head: fromSha, status: 'finished', result: 'skipped', skipCardOnly: true, loopPayload } };
+      status: { head: fromSha, status: 'finished', result: 'skipped', skipCardOnly: true, loopPayload: structuredClone(loopPayload) } };
   };
+  // One row per top-level conjunct of cardOnlyHeadMoveCandidate. Keep this list
+  // aligned with the predicate so overlapping planner guards cannot hide a missing check.
+  it.each([
+    // Real-head validity is also implied by the matching-head and settleable-status guards.
+    ['real read head', e => { e.loopPayload.findings.read.netBasis.rev = 'unknown'; }],
+    ['moved read head', e => { e.loopPayload.findings.read.netBasis.rev = head; e.status.head = head; e.status.loopPayload.findings.read.netBasis.rev = head; }],
+    ['card-only read', e => { e.loopPayload.findings.read.netChangedFiles = ['scripts/code.mjs']; }],
+    ['settleable skip', e => { e.status.result = 'ran'; }],
+    ['matching status head', e => { e.status.head = 'c'.repeat(40); e.status.loopPayload.findings.read.netBasis.rev = e.status.head; }],
+    ['no recorded result', e => { e.recorded = true; }],
+    ['no recorded seat', e => { e.seatRecorded = true; }],
+    ['not in flight', e => { e.inFlight = true; }],
+    ['not queued', e => { e.queued = true; }],
+  ])('moved candidate requires %s', (_clause, mutate) => {
+    const evidence = oldEvidence();
+    expect(cardOnlyHeadMoveCandidate(evidence, head)).toBe(true);
+    mutate(evidence);
+    expect(cardOnlyHeadMoveCandidate(evidence, head)).toBe(false);
+  });
   it.each(['numbering-only', 'card-only'])('%s move dispatches fresh despite a not-owed old review', kind => {
     const proveMove = vi.fn(() => ({ ok: true, kind }));
     expect(decide({ readEvidence: oldEvidence, proveMove })).toMatchObject({ action: 'dispatch', mode: 'fresh' });
@@ -409,9 +428,13 @@ describe('card-only head move recovery', () => {
   ])('does not dispatch with existing or unknown evidence %j', over => {
     expect(decide({ readEvidence: () => ({ ...oldEvidence(), ...over }), proveMove: () => ({ ok: true }) }).action).toBe('skip');
   });
-  it.each(['missing head', 'code read', 'not skipped', 'skip disabled'])('refuses %s provenance', kind => {
+  it.each(['missing head', 'status head mismatch', 'code read', 'not skipped', 'skip disabled'])('refuses %s provenance', kind => {
     const evidence = oldEvidence();
     if (kind === 'missing head') delete evidence.loopPayload.findings.read.netBasis.rev;
+    if (kind === 'status head mismatch') {
+      evidence.status.head = 'c'.repeat(40);
+      evidence.status.loopPayload.findings.read.netBasis.rev = evidence.status.head;
+    }
     if (kind === 'code read') evidence.loopPayload.findings.read.netChangedFiles = ['scripts/code.mjs'];
     if (kind === 'not skipped') evidence.status.result = 'ran';
     if (kind === 'skip disabled') evidence.status.skipCardOnly = false;
