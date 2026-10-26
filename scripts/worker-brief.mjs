@@ -87,7 +87,7 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    \`node scripts/lane-pool.mjs release --lane=<N> --session=<holder slug it printed>\`.
 4. **Codex for scoped coding.** Well-scoped coding sub-tasks (tests, mechanical edits, a single-file fix with clear
    acceptance) go to Codex: \`node scripts/codex-direct-task.mjs --task-file=<f> --dir=<lane> --gate=${codexGate}\`.
-   It is SYNCHRONOUS: run it in the foreground, never backgrounded, never wrapped in a wait. Review the diff before
+   It may be run with --detach and resumed with --wait-for if it may exceed 9 min. Review the diff before
    you commit. You keep root cause, design, edge adoption and live proof.
 5. **Red-green tests through the heavy queue.** Write the failing test first, then the fix.
    ${testsFirstWorkerRule()}
@@ -106,6 +106,8 @@ ${renderProofStep(proof)}
 minutes, and only after checking the condition is reachable. Never loop on anything outside your control (another
 daemon's tick, a rebuild, CI, a merge, review, load dropping): report it as PENDING with the exact command that
 checks it, and end. If you need the condition to happen, cause it through the sanctioned mechanism instead of waiting.
+For any op that may exceed 9 min, use --detach then repeated --wait-for calls; never end a turn while a job is still-running.
+Exit code 75 means still-running (call --wait-for again).
 
 **Processes.** Never \`pkill\`, \`killall\`, or any pattern kill. Stop only a process you started, by PID, and say
 what evidence shows it is yours. Never stop the operator's dev server.

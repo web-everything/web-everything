@@ -1451,8 +1451,16 @@ function repoRootFromCwd() {
   return execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', timeout: GIT_STEP_TIMEOUT_MS }).trim();
 }
 
+export function normalizeWaitAlias(args) {
+  const waitFor = args.find(arg => arg.startsWith('--wait-for='));
+  if (!waitFor) return args;
+  return ['wait', `--job=${waitFor.slice(11)}`, ...args
+    .filter(arg => !arg.startsWith('--wait-for=') && arg !== 'wait')
+    .map(arg => arg.startsWith('--max-wait-ms=') ? `--max-ms=${arg.slice(14)}` : arg)];
+}
+
 async function main() {
-  const args = process.argv.slice(2);
+  const args = normalizeWaitAlias(process.argv.slice(2));
   const flags = parseFlags(args);
   if (flags.help) {
     console.log(
@@ -1461,6 +1469,7 @@ async function main() {
       + '[--task-kind=<kind>] [--size=<n>] [--care=low|normal|elevated|high] [--epic] [--decision] [--timeout-ms=<n>] [--gate=full|related|none|standards] [--ephemeral] [--clear-rollout-after-run] '
       + '[--no-stream] [--log=<path>] [--no-install] [--wire-origin-to-remote] [--review] [--no-self-review] [--json] [--detach]\n'
       + '  --detach: launch a detached job; print its id and record path immediately.\n'
+      + '  --wait-for=<id> [--max-wait-ms=540000]: alias for wait --job=<id> --max-ms=<n>.\n'
       + '  wait --job=<id> [--max-ms=540000]: poll a job (maximum 9 minutes); exit 75 if still running.\n'
       + '    A terminal task exit 75 is preserved in JSON but wait exits 1.\n'
       + '    Values below 250 or non-numeric values are usage errors (exit 2), before any job IO.\n'
