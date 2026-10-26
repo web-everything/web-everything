@@ -224,19 +224,62 @@ describe('detached operation lifecycle', () => {
 
   it('stamps the launched runner birth identity into the running record', async () => {
     const stamp = vi.spyOn(pidProbes, 'pidIdentityStamp')
-      .mockReturnValue({ runnerStart: 'Mon Oct 26 21:00:00 2026', runnerArgv: 'node detached-op.mjs' });
+      .mockReturnValue({
+        runnerStart: 'Mon Oct 26 21:00:00 2026',
+        runnerArgv: 'node detached-op.mjs --run-record=/x/j.json -- node task.mjs --token=SECRET',
+      });
     try {
       const record = await startDetachedOp({
         argv: [process.execPath, '-e', ''], kind: 'acceptance', dir, env: {},
         spawnFn: () => ({ pid: 43210, unref: vi.fn() }),
       });
       expect(stamp).toHaveBeenCalledWith(43210);
-      expect(record).toMatchObject({ runnerStart: 'Mon Oct 26 21:00:00 2026', runnerArgv: 'node detached-op.mjs' });
-      expect(JSON.parse(readFileSync(join(dir, `${record.id}.json`), 'utf8'))).toEqual(record);
+      // The wrapped command line (which may hold secrets) never reaches the record.
+      expect(record).toMatchObject({
+        runnerStart: 'Mon Oct 26 21:00:00 2026', runnerArgv: 'node detached-op.mjs --run-record=/x/j.json',
+      });
+      const stored = readFileSync(join(dir, `${record.id}.json`), 'utf8');
+      expect(stored).not.toContain('SECRET');
+      expect(JSON.parse(stored)).toEqual(record);
     } finally {
       stamp.mockRestore();
     }
   });
+
+  it('stores a null argv stamp when the ps argv carries no wrapped-command separator', async () => {
+    const stamp = vi.spyOn(pidProbes, 'pidIdentityStamp')
+      .mockReturnValue({ runnerStart: 'Mon Oct 26 21:00:00 2026', runnerArgv: 'node detached-op.mjs' });
+    try {
+      const record = await startDetachedOp({
+        argv: [process.execPath, '-e', ''], kind: 'acceptance', dir, env: {},
+        spawnFn: () => ({ pid: 43210, unref: vi.fn() }),
+      });
+      expect(record).toMatchObject({ runnerStart: 'Mon Oct 26 21:00:00 2026', runnerArgv: null });
+    } finally {
+      stamp.mockRestore();
+    }
+  });
+
+  it('has the real runner stamp itself when the launcher could not read its identity', async () => {
+    const stamp = vi.spyOn(pidProbes, 'pidIdentityStamp').mockReturnValue({ runnerStart: null, runnerArgv: null });
+    try {
+      const record = await startDetachedOp({
+        argv: [process.execPath, '-e', 'setTimeout(() => {}, 1500)'], kind: 'acceptance', dir, env: {},
+      });
+      expect(record.runnerStart).toBeNull();
+      let stored = record;
+      for (let i = 0; i < 100 && typeof stored.runnerStart !== 'string'; i++) {
+        await new Promise(done => setTimeout(done, 50));
+        stored = JSON.parse(readFileSync(join(dir, `${record.id}.json`), 'utf8'));
+      }
+      expect(stored).toMatchObject({ status: 'running', runnerStart: expect.any(String) });
+      expect(stored.runnerArgv).toContain('--run-record=');
+      expect(stored.runnerArgv).not.toContain(' -- ');
+      expect(await waitForOp({ id: record.id, maxWaitMs: 540000, dir })).toMatchObject({ status: 'done', code: 0 });
+    } finally {
+      stamp.mockRestore();
+    }
+  }, 20000);
 
   it('keeps an actual live runner running with the default liveness probe', async () => {
     const record = writeRecord({ pid: process.pid });

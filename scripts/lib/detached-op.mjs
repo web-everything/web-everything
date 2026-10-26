@@ -48,6 +48,13 @@ function alive(pid, { runnerStart = null, runnerArgv = null } = {}) {
   // an unreadable identity must not mark a potentially live runner dead.
   return pidIdentity(pid, { expectStart: runnerStart, expectArgv: runnerArgv }).alive !== false;
 }
+/** Birth stamp for a runner pid. Only the argv up to the wrapped-command separator is kept: the wrapped
+ *  command line may hold secrets and must not reach the record file or the echoed output. */
+function runnerStamp(pid) {
+  const { runnerStart, runnerArgv } = pidIdentityStamp(pid);
+  const cut = runnerArgv === null ? -1 : runnerArgv.indexOf(' -- ');
+  return { runnerStart, runnerArgv: cut > 0 ? runnerArgv.slice(0, cut) : null };
+}
 function tail(path) {
   let fd;
   try {
@@ -81,7 +88,7 @@ export async function startDetachedOp({ argv, kind, dir = resolveDetachedOpsDir(
     if (child.once) await new Promise((done, reject) => { child.once('spawn', done); child.once('error', reject); });
     record.pid = child.pid;
     // Birth stamp lets waiters tell the runner from a later process that reuses its pid.
-    Object.assign(record, pidIdentityStamp(child.pid));
+    Object.assign(record, runnerStamp(child.pid));
     writeRecord(path, record);
     child.unref();
     return record;
@@ -140,6 +147,11 @@ async function runRecord(args) {
     if (Date.now() >= deadline) throw new Error('launcher did not initialize runner record');
     await sleep(25);
   } while (true);
+  // The launcher's ps probe can fail; the runner stamping itself closes that fail-open gap.
+  if (typeof record.runnerStart !== 'string') {
+    Object.assign(record, runnerStamp(process.pid));
+    writeRecord(path, record);
+  }
   const fds = [];
   let exitCode = 1;
   try {
