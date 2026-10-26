@@ -159,7 +159,7 @@ import { isUnderTest as isUnderTestEnv } from '../lib/under-test.mjs';
 import { renderPreviousTakeover } from './takeover-budget.mjs';
 // Card xrbu1bp — resume the previous round's fixer session; the stronger-model rung from round 3.
 import {
-  buildRoundResumePrompt, planRoundEscalation, planRoundResume, readRoundResumeInputs, roundOf,
+  buildRoundResumePrompt, planRoundEscalation, planRoundResume, priorPermissionBlock, readRoundResumeInputs, roundOf,
 } from './fix-resume.mjs';
 import { loadFixerLadder } from './fixer-ladder.mjs';
 import { mainRedPriorityRank } from './main-ci-red-core.mjs';
@@ -718,7 +718,7 @@ export function fetchCardScopeAtRef(path, ref, { exec = execFileSyncThrottled, r
 
 /**
  * we:scripts/conveyor/reconcile-fix-dispatch.mjs#findResumeCandidate — `#xu2krte` Fork 1: is there a session to
- * PREFER resuming for this conflict-caused fix dispatch? PURE over its two inputs.
+ * PREFER resuming for this conflict-caused fix dispatch? Reads its last completion through an injectable reader.
  *
  * Extracts the PR's own `authored-by-actor` stamp (`we:scripts/lib/review-independence.mjs#parseAuthorActorId`
  * — agreement-or-nothing: a missing or ambiguous stamp answers `''`, never a guess) and confirms it is still
@@ -726,15 +726,18 @@ export function fetchCardScopeAtRef(path, ref, { exec = execFileSyncThrottled, r
  * exited (and been reaped, e.g. by `we:scripts/conveyor/session-reaper.mjs`) is not a resume candidate at all —
  * the caller goes straight to a fresh dispatch, per the ratified default, rather than attempting a resume
  * against a listing that cannot even confirm the session ever existed.
- * @param {{body:string|null, agentsAll:Array<object>}} o
+ * @param {{body:string|null, agentsAll:Array<object>, readCompletion?:Function, onDecline?:Function}} o
  * @returns {string|null} the full `sessionId` to attempt resuming, or `null`.
  */
-export function findResumeCandidate({ body, agentsAll }) {
+export function findResumeCandidate({ body, agentsAll, readCompletion, onDecline = () => {} }) {
   const id = parseAuthorActorId(String(body || ''));
   if (!id) return null;
   const norm = normalizeHandle(id);
-  const listed = (Array.isArray(agentsAll) ? agentsAll : []).some((a) => normalizeHandle(a?.sessionId) === norm);
-  return listed ? id : null;
+  const row = (Array.isArray(agentsAll) ? agentsAll : []).find((a) => normalizeHandle(a?.sessionId) === norm);
+  if (!row) return null;
+  const blocked = priorPermissionBlock(row, readCompletion);
+  if (blocked) { onDecline({ ...blocked, candidate: id }); return null; }
+  return id;
 }
 
 /**
@@ -872,6 +875,7 @@ export function freeLaneNumbers({ exec = execFileSync, root = REPO_ROOT, lanePoo
  * @returns {{resumed:boolean, result?:{sessionId:string, sessionSlug:null, pr:number, itemNum:string, lane:null, unknownTokens:string[], resumed:true}, resumeAttempt?:object|null}}
  */
 export function tryResumeFix(planned, {
+  readCompletion,
   repo = 'we',
   root = REPO_ROOT,
   postNotice = postRulingNotice,
@@ -901,7 +905,11 @@ export function tryResumeFix(planned, {
   if (!planned.isConflict) return { resumed: false, resumeAttempt: null };
 
   const agentsBefore = listAgentsAll();
-  const candidate = findResumeCandidate({ body: planned.body, agentsAll: agentsBefore });
+  let decline = null;
+  const candidate = findResumeCandidate({ body: planned.body, agentsAll: agentsBefore, readCompletion,
+    onDecline: (decision) => { decline = decision; } });
+  if (decline) return { resumed: false, resumeAttempt: { attempted: false, candidate: decline.candidate,
+    forked: false, refused: decline.reason, why: decline.why } };
   if (!candidate) return { resumed: false, resumeAttempt: null };
 
   const candidateRow = agentsBefore.find((a) => normalizeHandle(a?.sessionId) === normalizeHandle(candidate));
@@ -1062,6 +1070,7 @@ export function resumeBgSession(planned, {
  * @returns {{resumed:boolean, result?:object, resumeAttempt?:object|null, decision?:object}}
  */
 export function tryResumeRoundFix(planned, {
+  readCompletion,
   repo = 'we', root = REPO_ROOT,
   fixSettings = resolveFixSettings(),
   wrapFix = workerWrapperEnabledFor('fix'),
@@ -1095,7 +1104,7 @@ export function tryResumeRoundFix(planned, {
   const desiredModel = table?.model ? claudeSpawnAlias(String(table.model)) : null;
   const defaultBranch = 'main'; // every constellation repo's default branch (reconcile-pass assumes the same)
   const inputs = readInputs({ planned, slug, root, listAgentsAll, defaultBranch, repoSlug: ghRepoSlug(repo) });
-  const decision = planRoundResume({ planned, settings: fixSettings, desiredModel, scratchRoot, realpath, ...inputs });
+  const decision = planRoundResume({ planned, settings: fixSettings, desiredModel, scratchRoot, realpath, ...inputs, readCompletion });
   if (!decision.resume) return declined(decision);
   if (dryRun) return { resumed: false, decision, dryRun: true, roundEscalation };
   // The resumed session reloads `<cwd>/.claude/settings.local.json`, whose guard hooks were written at its first
@@ -1148,7 +1157,7 @@ export function withOperatorSendBack(prompt, sendBack) {
   if (!sendBack?.body) return prompt;
   return '# Operator send-back — must-fix items, read this first\n\n'
     + `@${sendBack.login} sent this PR back (operator re-arm). The items below are the whole ask: fix them, `
-    + 'push, and leave CI green. Do not touch any review label.\n\n'
+    + 'push, and leave CI green. Do not touch any review label, with ONE sanctioned exception: the re-arm step in your brief, running `node scripts/conveyor/rearm-review.mjs <pr> --repo=<repo>`, is authorized by the operator and you must run it.\n\n'
     + `${sendBack.body}\n\n${prompt}`;
 }
 

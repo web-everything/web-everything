@@ -11,6 +11,10 @@ import { createClaimReader, REPO_ROOT } from './claim-io.mjs';
 import { createFileRunStore } from './run-store.mjs';
 import { idFromName } from '../backlog/id.mjs';
 import { readField } from '../backlog/frontmatter.mjs';
+import { cachedLaneScan, laneProbeEnv, laneRedirectConfig } from '../lib/health-watch-lane-scan.mjs';
+import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
+import { hardenLaneGitArgs, LANE_CONFIG_LIST_ARGS } from '../lib/lane-git-hardening.mjs';
+import { assertPushRef } from '../lib/git-transport-branch.mjs';
 import { probePid } from '../conveyor/reconcile-pass.mjs';
 
 /** Bind external reads, including subprocesses and clock, for fixture-only tests. */
@@ -19,11 +23,16 @@ export function createStaleStateReader({
   listFiles = (dir) => readdirSync(dir),
   readText = (path) => readFileSync(path, 'utf8'),
   readClaim, runStore = createFileRunStore(), probe = probePid,
-  now = Date.now, host = hostname(),
+  now = Date.now, host = hostname(), laneScan,
 } = {}) {
   // Propagates to lane-pool's git children too: status must not refresh the index.
   const exec = (bin, argv, opts = {}) => run(bin, argv, {
-    ...opts, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+    ...opts, env: laneProbeEnv(opts.cwd ?? root),
+    encoding: 'utf8', timeout: 120_000, maxBuffer: 32 * 1024 * 1024,
+  });
+  // A lane's own .git/config is untrusted: any git run inside one gets the repo's lane hardening, like freshLaneSafety.
+  const laneGit = (argv, cwd) => run('git', hardenLaneGitArgs(argv), {
+    cwd, env: laneProbeEnv(cwd),
     encoding: 'utf8', timeout: 120_000, maxBuffer: 32 * 1024 * 1024,
   });
   return () => {
@@ -32,7 +41,7 @@ export function createStaleStateReader({
     const gaps = [
       'Scope: this checkout backlog, its repository lane pool, and the configured operation run store.',
       'Lease pid identifies the acquire CLI, not the owner; owner liveness needs a same-host agentPid.',
-      'Work safety is best-effort against local origin refs, without fetching; false is not cleanup authorization.',
+      'Local tracking refs cannot prove publication; a zero ahead count leaves work safety unknown. Destructive lane actions require a fresh trusted publication check (health-watch-lane-scan.mjs#guardLaneAction).',
       'Claims and run records may lack owner, pid, or timestamps; missing evidence remains null/unknown.',
     ];
     const observe = (pid, recordHost) => {
@@ -54,26 +63,71 @@ export function createStaleStateReader({
       });
     };
     try {
-      const status = JSON.parse(exec(process.execPath, [join(root, 'scripts/lane-pool.mjs'), 'status', '--json'], { cwd: root }));
-      if (!Array.isArray(status.lanes)) throw new Error('status returned no lanes array');
-      for (const lane of status.lanes) {
+      const scan = () => {
+        const status = JSON.parse(exec(process.execPath, [join(root, 'scripts/lane-pool.mjs'), 'status', '--json'], { cwd: root }));
+        if (!Array.isArray(status.lanes)) throw new Error('status returned no lanes array');
+        return status.lanes.map(lane => {
+          let ahead = null;
+          if (!lane.readError && lane.lease) {
+            try {
+              // A lane redirecting its worktree or transport is reported unknown, never probed.
+              if (laneRedirectConfig(laneGit([...LANE_CONFIG_LIST_ARGS], lane.path)).length) throw new Error('redirecting lane config');
+              // Reporting only: unrelated lane-writable origin refs cannot prove publication.
+              // Require the expected branch and main, resolving fully qualified refs to OIDs.
+              if (typeof lane.branch !== 'string') throw new Error('missing lane branch');
+              const branchRef = assertPushRef(lane.branch).replace(/^refs\/heads\//, 'refs/remotes/origin/');
+              const refs = [...new Set([branchRef, 'refs/remotes/origin/main'])];
+              const tips = refs.map(ref => {
+                const tip = String(laneGit(['rev-parse', '--verify', '--quiet', ref], lane.path)).trim();
+                if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(tip)) throw new Error('unverified reporting ref');
+                return tip;
+              });
+              const raw = String(laneGit(['rev-list', '--count', 'HEAD', '--not', ...tips], lane.path)).trim();
+              if (/^\d+$/.test(raw) && Number.isSafeInteger(Number(raw))) ahead = Number(raw);
+            } catch { /* unknown, never zero */ }
+          }
+          return { lane, ahead };
+        });
+      };
+      const lanes = laneScan ? cachedLaneScan(scan, { ...laneScan, root, now: now() }) : scan();
+      const cachedRow = lanes.find(row => Number.isFinite(row?.cachedAt));
+      if (cachedRow) gaps.push(`lane-lease work safety is from the lane-scan cache (${new Date(cachedRow.cachedAt).toISOString()}): reporting only, never safe; a destructive lane action needs a fresh check (health-watch-lane-scan.mjs#guardLaneAction).`);
+      for (const { lane: scannedLane, ahead, cachedAt } of lanes) {
+        const fromCache = Number.isFinite(cachedAt);
+        let lane = scannedLane;
+        if (fromCache) {
+          // Cache only supplies work-safety evidence. Ownership may have changed since the scan, even for a
+          // formerly free or unreadable lane. Never fall back to cached ownership when the fresh read fails.
+          lane = { ...scannedLane, lease: null, leased: false };
+          delete lane.readError;
+          try {
+            const lease = JSON.parse(readText(join(lane.path, '.git', LEASE_FILENAME)));
+            if (!lease || typeof lease !== 'object' || Array.isArray(lease)) throw new Error('lease marker must contain a JSON object');
+            lane.lease = lease;
+            lane.leased = !isLeaseStale(lease, Date.parse(observedAt));
+          } catch (error) {
+            if (error.code !== 'ENOENT') lane.readError = error.message;
+          }
+        }
         if (lane.readError) {
           add('lane-lease', lane.path, {}, null, { lane, readError: lane.readError });
           continue;
         }
         if (!lane.lease) continue; // include raw expired leases regardless of `leased`
         const lease = lane.lease;
-        let ahead = null;
-        try {
-          // Behind cannot detect unpushed commits. Count commits absent from local origin refs.
-          const raw = String(exec('git', ['rev-list', '--count', 'HEAD', '--not', '--remotes=origin'], { cwd: lane.path })).trim();
-          if (/^\d+$/.test(raw)) ahead = Number(raw);
-        } catch { /* unknown, never zero */ }
-        const hasUnsafeWork = lane.clean === false || (ahead !== null && ahead > 0) ? true
-          : lane.clean === true && ahead === 0 ? false : null;
+        // Even verified expected refs are lane-writable: zero cannot prove publication.
+        const computed = lane.clean === false || (ahead !== null && ahead > 0) ? true : null;
+        const reason = computed === true ? (lane.clean === false ? 'worktree has changes' : 'local ahead count is positive')
+          : ahead === 0 ? 'local tracking refs cannot prove publication' : 'work safety evidence is incomplete';
+        // Cached unsafe stays unsafe; all other cached or fresh evidence remains unknown. Acting
+        // on a lane needs health-watch-lane-scan.mjs#guardLaneAction's fresh check, never this field.
+        const hasUnsafeWork = fromCache ? (computed === true ? true : null) : computed;
         add('lane-lease', lane.path, {
           ...lease, owner: lease.workerSession ?? lease.ownerSession ?? lease.session ?? lease.holder,
-        }, lease.acquiredAt, { hasUnsafeWork, lane: { ...lane, ahead }, lease });
+        }, lease.acquiredAt, { hasUnsafeWork,
+          safety: { source: fromCache ? 'cache' : 'fresh', reason, observedAt: fromCache ? new Date(cachedAt).toISOString() : observedAt,
+            cachedHasUnsafeWork: fromCache ? computed : null },
+          lane: { ...lane, ahead }, lease });
       }
     } catch (error) { gaps.push(`lane-lease enumeration failed: ${error.message}`); }
     try {
