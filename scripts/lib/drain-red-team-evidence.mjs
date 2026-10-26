@@ -4,16 +4,20 @@ import { dirname, join } from 'node:path';
 import { hostname } from 'node:os';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
-import { readFilteredInOrder } from './stream-filter-runs.mjs';
-import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
+import { resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
+import { scorecardOperationSnapshot, snapshotStoreRecords } from './scorecard-operation-snapshot.mjs';
+import { readSavedRedTeamResult, attemptedRedTeamRun, sameRepo } from './drain-saved-red-team.mjs';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
-import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
+import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly, redTeamPanelSeatOwed } from './review-red-team-policy.mjs';
 import { readRedTeamProbes } from './red-team-gate.mjs';
 import { completedRedTeamSeat } from './red-team-run-result.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
+import { readFilteredInOrder } from './stream-filter-runs.mjs';
 
 export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDir(env)), 'red-team-status');
-const statusPath = ({ repo, pr, head }, env) => join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
+// Slugs and shas are case-insensitive: the writer and the drain must name one file whatever case each was handed.
+const statusPath = ({ repo, pr, head }, env) => join(redTeamStatusDir(env),
+  `${encodeURIComponent(String(repo).toLowerCase())}-${Number(pr)}-${String(head).toLowerCase()}.json`);
 
 /** Read the head-bound status; unreadable evidence is an error, absence is null. */
 export function readRedTeamStatus({ repo, pr, head, env = process.env } = {}) {
@@ -70,18 +74,33 @@ export function historicalCardOnlySkipCandidate(old) {
 /** Absence of a review payload is not an accept. Labels alone never schedule a post-accept pass. */
 export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   runsDir = resolveRunsDir(), list = listRunIds, read = readRun, isAlive = pidAlive, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
-  readScorecards = () => readStore({ path: resolveScorecardStorePath(env) }).records } = {}) {
-  const seats = readScorecards().filter(row => row.dispatchKind === 'review-seat' && row.seat === 'red-team'
-    && row.repo === repo && Number(row.pr) === Number(pr) && row.rev === head);
-  const recorded = seats.length > 0;
+  readScorecards } = {}) {
+  const legacyStatusPath = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
+  const originalHead = head;
+  head = String(head ?? '').toLowerCase();
+  // One scorecard read for this whole call, shared with the saved-result check below (xwu9oxh S2, per operation).
+  // An injected reader keeps the saved-result check on its own fresh read, as before.
+  const scorecardSnapshot = readScorecards === undefined ? scorecardOperationSnapshot(resolveScorecardStorePath(env)) : undefined;
+  const rows = readScorecards === undefined ? snapshotStoreRecords(scorecardSnapshot) : readScorecards();
+  const recorded = rows.some(row => row?.dispatchKind === 'review-seat' && row.seat === 'red-team'
+    && sameRepo(row.repo, repo) && Number(row.pr) === Number(pr) && String(row.rev ?? '').toLowerCase() === head);
+  let attempted = attemptedRedTeamRun(rows, { repo, pr, head });
+  // Saved-result usability is independent of historical scorecard attempts.
+  const noSavedResult = readSavedRedTeamResult({ repo, pr, head, env, runsDir, scorecardSnapshot }) === null;
+  const withUsability = evidence => ({ ...evidence, noUsableResult: noSavedResult && !evidence.inFlight && !evidence.queued });
+  const untrustedSavedResult = rows.some(row => row?.status === 'ok' && row?.dispatchKind === 'review-seat'
+    && row.seat === 'red-team' && sameRepo(row.repo, repo) && Number(row.pr) === Number(pr) && String(row.rev ?? '').toLowerCase() === head)
+    && noSavedResult;
+  const seats = rows.filter(row => row?.dispatchKind === 'review-seat' && row.seat === 'red-team'
+    && sameRepo(row.repo, repo) && Number(row.pr) === Number(pr) && String(row.rev ?? '').toLowerCase() === head);
   const seatEvidence = { seatRecorded: recorded, completedRecorded: seats.some(completedRedTeamSeat),
     failedSeatCount: seats.filter(row => !completedRedTeamSeat(row)).length };
   // Runs are immutable in identity but updated in place: choose the latest read of this exact repo/PR/head.
   const latestRun = (exactHead = true) => {
     // Read, test and drop one run at a time (xwu9oxh S1a): same reads, order and errors as map-then-filter.
     const hits = readFilteredInOrder(list(runsDir).filter(id => id.startsWith('review-pr-')), id => read(id, runsDir),
-      run => run?.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr)
-        && (!exactHead || run.findings?.read?.netBasis?.rev === head), (run, id) => ({ id, run }))
+      run => run?.op === 'review-pr' && sameRepo(run.input?.repo, repo) && Number(run.input?.pr) === Number(pr)
+        && (!exactHead || String(run.findings?.read?.netBasis?.rev ?? '').toLowerCase() === head), (run, id) => ({ id, run }))
       .map(hit => ({ ...hit, at: statSync(join(runsDir, `${hit.id}.json`)).mtimeMs }));
     hits.sort((a, b) => b.at - a.at);
     return { run: hits[0]?.run ?? null, at: hits[0]?.at ?? 0 };
@@ -89,34 +108,43 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   // The review loop applies the accept labels before the job can write a status, so a persisted accepting run that
   // owes a pass holds until the job's status supersedes it. It is not a live queue entry: the drain's
   // never-scheduled deadline still applies when no job ever picks it up.
-  const owes = run => redTeamEnabled(env) && redTeamOwedFor(run);
+  const owes = run => (redTeamPanelSeatOwed(run, env) || (redTeamEnabled(env) && redTeamOwedFor(run)));
   let status, statusAt = 0;
-  try {
-    status = JSON.parse(readFileSync(statusPath({ repo, pr, head }, env), 'utf8'));
-    statusAt = statSync(statusPath({ repo, pr, head }, env)).mtimeMs;
-  } catch (e) { if (e.code !== 'ENOENT') throw e; }
-  const carry = readRedTeamCarry({ repo, pr, head, env });
+  // Keep pre-normalization status records authoritative during the transition too.
+  for (const path of new Set([statusPath({ repo, pr, head }, env), legacyStatusPath])) {
+    try {
+      const candidate = JSON.parse(readFileSync(path, 'utf8'));
+      const at = statSync(path).mtimeMs;
+      if (!status || at > statusAt) { status = candidate; statusAt = at; }
+    } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  }
+  const matchingStatus = sameRepo(status?.repo, repo) && Number(status.pr) === Number(pr)
+    && String(status.head ?? '').toLowerCase() === head;
+  if (matchingStatus) attempted ||= attemptedRedTeamRun([], { repo, pr, head }, status.result);
+  // Carry identities retain the writer's casing; both lookups keep the journal's strict validation.
+  const carry = readRedTeamCarry({ repo, pr, head, env })
+    ?? (originalHead !== head ? readRedTeamCarry({ repo, pr, head: originalHead, env }) : null);
   const carriedFrom = carry?.loopPayload.carriedFrom ?? status?.loopPayload?.carriedFrom;
   if (carriedFrom) {
     const latest = latestRun(false).run;
-    const laterPanel = latest && latest.findings?.read?.netBasis?.rev !== carriedFrom;
-    const ownStatus = status === undefined || (status?.repo === repo && Number(status.pr) === Number(pr) && status.head === head
-      && (status.loopPayload?.carriedFrom === carriedFrom || (status.head === carriedFrom && status.skipCardOnly === true))
+    const laterPanel = latest && String(latest.findings?.read?.netBasis?.rev ?? '').toLowerCase() !== String(carriedFrom).toLowerCase();
+    const ownStatus = status === undefined || (sameRepo(status?.repo, repo) && Number(status.pr) === Number(pr) && String(status.head ?? '').toLowerCase() === head
+      && (String(status.loopPayload?.carriedFrom ?? '').toLowerCase() === String(carriedFrom).toLowerCase() || (String(status.head ?? '').toLowerCase() === String(carriedFrom).toLowerCase() && status.skipCardOnly === true))
       && status.status === 'finished'
       && (status.result === 'skipped' || (status.result?.status === 'skipped' && status.result.policy === 'card-only')));
     if (laterPanel || (carry && !ownStatus) || recorded) {
-      return { loopPayload: latest, status, carryConflict: true, inFlight: false,
+      return { attempted, ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), noUsableResult: false, loopPayload: latest, status, carryConflict: true, inFlight: false,
         recorded, ...seatEvidence, scheduled: false };
     }
     if (carry) {
       // The journal survives a crash before the compatibility status exists. Never invent an accept.
       const projected = { repo, pr, head, loopPayload: carry.loopPayload, status: 'finished',
         result: { status: 'skipped', policy: 'card-only' }, skipCardOnly: true };
-      return { carry, status: projected, loopPayload: carry.loopPayload, inFlight: false,
+      return { attempted, ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), noUsableResult: false, carry, status: projected, loopPayload: carry.loopPayload, inFlight: false,
         recorded: false, ...seatEvidence, scheduled: false, skipCardOnly: true };
     }
   }
-  if (status?.repo === repo && Number(status.pr) === Number(pr) && status.head === head) {
+  if (matchingStatus) {
     // A finished status from an earlier review of this same head never supersedes a newer accepting run (a re-review
     // of an unchanged head labels its accept before its job writes `queued`).
     if (!['queued', 'running'].includes(status.status)) {
@@ -125,7 +153,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
         // A finished result that was never published still reaches the recovery path: a re-review of the same head must not
         // strand it behind a pass that may never come (#5759, #5762).
         const unpublished = status.status === 'finished' && ['withheld', 'error'].includes(status.result?.comment);
-        return { loopPayload: latest.run, inFlight: false, scheduled: true, recorded, ...seatEvidence, skipCardOnly: false, ...(unpublished ? { status } : {}) };
+        return withUsability({ ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), attempted, loopPayload: latest.run, inFlight: false, scheduled: true, recorded, ...seatEvidence, skipCardOnly: false, ...(unpublished ? { status } : {}) });
       }
     }
     // A local pid probe says nothing about another host or namespace: keep that pass held for its result.
@@ -145,20 +173,26 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     // Settlement provenance cannot stand in for a panel verdict, even if an older
     // writer retained one. Keep the status intact for recovery's provenance checks.
     const loopPayload = status.loopPayload?.carriedFrom != null ? { ...status.loopPayload, verdict: null } : status.loopPayload;
-    return { status, loopPayload, ...seatEvidence, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
-      ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(resultStatus), recorded: recorded || resultStatus === 'ran' };
+    return withUsability({ ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), status, ...seatEvidence, loopPayload, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
+      ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: attempted || redTeamPanelSeatOwed(status.loopPayload, env) || ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(resultStatus),
+      recorded: recorded || resultStatus === 'ran',
+      // A pass whose job died while running started and left no usable result, like one that errored.
+      attempted: attempted || (status.status === 'running' && !live) });
   }
   const loopPayload = latestRun().run;
   if (!loopPayload && !recorded) {
     const older = latestRun(false).run;
     const oldHead = older?.findings?.read?.netBasis?.rev;
-    if (oldHead && oldHead !== head && redTeamCardOnly(older.findings.read)) {
+    if (oldHead && String(oldHead).toLowerCase() !== head && redTeamCardOnly(older.findings.read)) {
       const old = readDrainRedTeamEvidence({ repo, pr, head: oldHead, env, runsDir, list, read,
         isAlive, host, namespace, readPidStart, readScorecards });
       if (historicalCardOnlySkipCandidate(old)) return old;
     }
   }
   // An owing run with no job status yet: only the job's process knows its card-only skip decision, so hold the head
-  // (skip off) until that status records it. The never-scheduled deadline still applies if no job ever writes one.
-  return { loopPayload, inFlight: false, scheduled: recorded || owes(loopPayload), recorded, ...seatEvidence, ...(owes(loopPayload) ? { skipCardOnly: false } : {}) };
+  // (skip off) until that status records it (main's guard, kept). A recorded or started pass still holds.
+  // A pass that already ran (even unusably) is scheduled, never "never scheduled".
+  const ran = attempted || attemptedRedTeamRun([], { repo, pr, head }, loopPayload?.redTeam);
+  return withUsability({ ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), loopPayload, ...seatEvidence, inFlight: false, scheduled: recorded || ran || owes(loopPayload),
+    recorded, attempted: ran, ...(owes(loopPayload) ? { skipCardOnly: false } : {}) });
 }

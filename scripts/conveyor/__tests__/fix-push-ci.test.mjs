@@ -1,4 +1,9 @@
-import { it, expect } from 'vitest';
+import { it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+// These adapter assertions exercise uncached argv; label-cache.test.mjs covers shared caching.
+beforeEach(() => vi.stubEnv('WE_LABELS_CACHE_TTL_MS', '0'));
+afterEach(() => vi.unstubAllEnvs());
+
 import { markFixPushAwaitingCi } from '../fix-push-ci.mjs';
 import { resolveHandoffSettings } from '../../lib/handoff-settings.mjs';
 it('creates missing CI labels before applying them and supports a same-head retry', () => {
@@ -8,7 +13,7 @@ it('creates missing CI labels before applying them and supports a same-head retr
     expect(cmd).toBe('gh');
     expect(args).toContain('--repo=o/r');
     if (args[0] === 'label' && args[1] === 'create') {
-      expect(args).toContain('--force');
+      expect(args).not.toContain('--force');
       labels.add(args[2]);
       return '';
     }
@@ -50,7 +55,7 @@ it('retains the push record and stops before editing when label creation fails',
   };
   expect(() => markFixPushAwaitingCi(push, { run, recordPush: value => recorded.push(value) })).toThrow('label creation unavailable');
   expect(recorded).toEqual([push]);
-  expect(calls.map(args => args.slice(0, 2))).toEqual([['pr', 'view'], ['label', 'create']]);
+  expect(calls.map(args => args.slice(0, 2))).toEqual([['pr', 'view'], ['label', 'create'], ['label', 'list']]);
 });
 it('a same-head retry after a required check failed keeps the red verdict and drops only fixer state', () => {
   const calls = [];

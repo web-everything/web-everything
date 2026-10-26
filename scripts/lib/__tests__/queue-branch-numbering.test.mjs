@@ -349,6 +349,34 @@ it.each([false, true])('permits confined convenience links and refuses escaping 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+describe('raised-by sidecars are not cards', () => {
+  const sidecar = 'backlog/raised-by/5473/5619-a56d6de393ea8aa2f9b77445.md';
+  function run(extra, { link = false } = {}) {
+    const root = mkdtempSync(join(tmpdir(), 'queue-sidecar-'));
+    try {
+      const tree = join(root, 'tree');
+      mkdirSync(join(tree, 'backlog'), { recursive: true }); mkdirSync(join(root, 'outside'));
+      writeFileSync(join(tree, 'backlog/5473-card.md'), '---\nstatus: open\n---\n');
+      for (const path of extra) {
+        mkdirSync(join(tree, path, '..'), { recursive: true });
+        if (link) { writeFileSync(join(root, 'outside/x.md'), 'outside\n'); symlinkSync(join(root, 'outside/x.md'), join(tree, path)); }
+        else writeFileSync(join(tree, path), '- Also raised by a/b#5619 (finding 1: `x` — y)\n');
+      }
+      const listed = ['backlog/5473-card.md', ...extra].join('\n');
+      const exec = vi.fn((_cmd, args) => args[0] === 'ls-remote' ? 'head\trefs/heads/lane/example' : args[0] === 'ls-files' ? listed : '');
+      return prepareBranchBeforeEnqueue({ c: { headRef: 'lane/example' }, traceHeadSha: 'head', exec,
+        fs: { ...realFs, mkdtempSync: () => root }, number: () => { throw new Error('unexpected numbering'); } });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+  it('admits a sanctioned sidecar to numbering', () => expect(run([sidecar])).toEqual({ action: 'final' }));
+  it.each(['backlog/evil/x.md', 'backlog/raised-by/5473/evil.md', 'backlog/raised-by/5473/sub/5619-a56d6de393ea8aa2f9b77445.md',
+    'backlog/raised-by/../5619-a56d6de393ea8aa2f9b77445.md'])('still refuses nested non-sidecar %s', path =>
+    expect(run([path]).reason).toContain('unsafe backlog card path'));
+  it('still refuses a symlinked sidecar', () => expect(run([sidecar], { link: true }).reason).toContain('symlinked tracked path refused'));
+  it('never lets a sidecar PR number raise the main floor', () =>
+    expect(reservationPlan(['backlog/041-card.md', 'backlog/raised-by/041/9999-a56d6de393ea8aa2f9b77445.md'], [], () => undefined).minNext).toBe(42));
+});
+
 it('retains reservations when the pass cannot prove a PR closed', () => {
   expect(openReservationPr({ prsByRepo: new Map([['r', []]]), contextComplete: true }, 'r', 1)).toBe(false);
   expect(openReservationPr({ prsByRepo: new Map([['r', []]]), contextComplete: false }, 'r', 1)).toBeUndefined();
