@@ -137,10 +137,11 @@ export function planBundleRepairs({ clones = [], ledger = [], settings = BUNDLE_
     // by its deadline, so a crashed launcher cannot block the clone forever).
     const live = entries.find((e) => e.cloneKey === c.cloneKey && (e.status === 'running' || e.stopPending || (e.launching && now < e.deadlineAt)));
     if (live) { hold(HOLD_RULES.ONE_PER_CLONE, `a repair is already running on this clone (${live.session ?? live.holdId})`); continue; }
-    const prior = entries.find((e) => e.holdId === holdId);
+    const priors = entries.filter((e) => e.holdId === holdId);
+    const prior = priors[0];
     let retry = {};
     if (prior) {
-      if (prior.status !== 'dispatch-failed' || s.mode !== 'live') {
+      if (priors.length !== 1 || prior.status !== 'dispatch-failed' || s.mode !== 'live') {
         hold(HOLD_RULES.ONE_PER_HOLD, `this hold already had its one repair attempt (${prior.status})`); continue;
       }
       const retries = Object.hasOwn(prior, 'dispatchRetries') ? prior.dispatchRetries : 0;
@@ -150,6 +151,9 @@ export function planBundleRepairs({ clones = [], ledger = [], settings = BUNDLE_
       }
       if (retries >= s.maxDispatchRetries) {
         hold(HOLD_RULES.ONE_PER_HOLD, `dispatch retries used (${retries}/${s.maxDispatchRetries})`); continue;
+      }
+      if (prior.dispatcherSha != null && (typeof prior.dispatcherSha !== 'string' || prior.dispatcherSha.trim() === '')) {
+        hold(HOLD_RULES.ONE_PER_HOLD, 'dispatch-failed retry held: invalid dispatcherSha'); continue;
       }
       const shaChanged = typeof dispatcherSha === 'string' && dispatcherSha.trim() !== '' && dispatcherSha !== prior.dispatcherSha;
       const backoffElapsed = now - prior.endedAt >= s.dispatchRetryBackoffMinutes * MINUTE;

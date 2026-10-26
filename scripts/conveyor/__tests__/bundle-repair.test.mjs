@@ -93,6 +93,17 @@ describe('planBundleRepairs — bounded dispatch-failed retries', () => {
     expectHeld(plan(prior({ status: 'escalated', endedAt: NOW - 120 * MIN })), /escalated/);
   });
 
+  it('duplicate ledger entries for one hold (dispatch-failed then escalated) stay sticky', () => {
+    const e = prior({ endedAt: NOW - 120 * MIN });
+    const p = plan(e, { ledger: [e, { ...e, status: 'escalated' }] });
+    expect(p.dispatch).toEqual([]);
+    expect(p.held).toEqual([expect.objectContaining({ rule: HOLD_RULES.ONE_PER_HOLD })]);
+  });
+
+  it.each([[{ corrupt: true }], [''], [42]])('malformed stored dispatcherSha %j is held, never a sha-retry', (bad) => {
+    expectHeld(plan(prior({ dispatcherSha: bad })), /invalid dispatcherSha/);
+  });
+
   it.each(['cleared', 'repaired', 'shadow'])('%s stays sticky despite a new sha and elapsed backoff', (status) => {
     expectHeld(plan(prior({ status, endedAt: NOW - 120 * MIN })), new RegExp(status));
   });
