@@ -109,13 +109,14 @@ export function reclaimStaleCandidates({ root, run, env, pidAlive = defaultPidAl
   const git = makeGit({ run, cwd: root, env, timeoutMs: 60_000 });
   const list = git(['worktree', 'list', '--porcelain']);
   if (list.status !== 0) return { reclaimed, skipped };
-  const prefix = join(stateDir(env), `${cloneKey(root)}.candidate-`);
+  const dir = stateDir(env);
+  const namePrefix = `${cloneKey(root)}.candidate-`;
   for (const block of String(list.stdout || '').split(/\n\n+/)) {
     const lines = block.split('\n');
     const path = lines.find((l) => l.startsWith('worktree '))?.slice('worktree '.length);
-    if (!path || !path.startsWith(prefix) || path === keepPath) continue;
+    if (!path || path === keepPath || dirname(path) !== dir || !basename(path).startsWith(namePrefix)) continue;
     if (!lines.some((l) => l === 'locked' || l.startsWith('locked '))) continue;
-    const pid = Number(/^(\d+)-[0-9a-f]+$/.exec(basename(path).slice(basename(prefix).length))?.[1]);
+    const pid = Number(/^(\d+)-[0-9a-f]+$/.exec(basename(path).slice(namePrefix.length))?.[1]);
     if (!Number.isInteger(pid) || pid <= 0) { skipped.push({ path, reason: 'owner-unknown' }); continue; }
     if (pidAlive(pid) !== false) { skipped.push({ path, reason: 'owner-alive-or-unknown' }); continue; }
     const unlock = git(['worktree', 'unlock', path]);

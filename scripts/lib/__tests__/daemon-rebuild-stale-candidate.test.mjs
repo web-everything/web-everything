@@ -71,6 +71,13 @@ describe('reclaimStaleCandidates', () => {
 });
 
 describe('reclaim honesty', () => {
+  it('never reclaims a nested path that only embeds this clone prefix in a parent dir name', () => {
+    const nested = join(STATE, `${cloneKey(ROOT)}.candidate-manual-parent`, `${cloneKey('/some/other')}.candidate-123-aa`);
+    const { run, calls } = fakeGit([{ path: nested, locked: true }]);
+    const r = reclaimStaleCandidates({ root: ROOT, run, env: ENV, pidAlive: () => false, rm: () => {} });
+    expect(r.reclaimed).toEqual([]);
+    expect(calls.some((c) => c.includes('unlock') || c.includes('remove'))).toBe(false);
+  });
   it('does not report reclaimed when git remove fails', () => {
     const dead = own('7-dd');
     const { run } = fakeGit([{ path: dead, locked: true }], { failOn: { prefix: 'worktree remove', stderr: 'busy' } });
