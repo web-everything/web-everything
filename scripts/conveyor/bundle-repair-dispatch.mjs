@@ -43,6 +43,7 @@
  *   node scripts/conveyor/bundle-repair-dispatch.mjs record --hold=<id> --session=<slug> < outcome.json   (the session's one write)
  */
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, hostname, userInfo } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -56,6 +57,14 @@ import {
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WE_ROOT = resolve(HERE, '..', '..');
+
+/** The dispatcher revision is optional evidence: a failed read never counts as a changed sha. */
+function readDispatcherSha(root) {
+  try {
+    const r = spawnSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8', timeout: 5000, maxBuffer: 4096 });
+    return !r.error && r.status === 0 ? r.stdout.trim() || null : null;
+  } catch { return null; }
+}
 
 export const KILL_FILE_ENV = 'WE_BUNDLE_REPAIR_KILL_FILE';
 export const TOKEN_ENV = 'WE_BUNDLE_REPAIR_TOKEN';
@@ -366,6 +375,7 @@ function writeJsonAtomicSync(path, value) {
 export async function runBundleRepairs({
   dir, selfSync = [], now = Date.now(), dryRun = false, env = process.env, root = WE_ROOT,
   settingsResolved = null,
+  resolveDispatcherSha = () => readDispatcherSha(root),
   rootsByKey = () => cloneRootsByKey({ root, env }),
   killed = () => existsSync(killFilePath(env)),
   overrideFor, dispatch = (target, o) => dispatchRepair(target, { ...o, root, env }),
@@ -378,6 +388,11 @@ export async function runBundleRepairs({
   const summary = { settings, sources, invalid, killed: false, off: false, dispatched: [], shadow: [], held: [], reconciled: [], escalated: [], failed: [] };
   // Off with nothing ever recorded: no lock, no files — the feature leaves no footprint until it is turned on.
   if (settings.enabled !== true && !existsSync(ledgerPath(dir))) { summary.off = 'disabled'; return summary; }
+  let dispatcherSha = null;
+  try {
+    const sha = await resolveDispatcherSha();
+    if (typeof sha === 'string' && sha.trim() !== '') dispatcherSha = sha.trim();
+  } catch { /* Unknown revision: backoff alone can permit a retry. */ }
   const deps = await loadHostDeps({ needStop: !stop, needPublish: !publish, needEvents: !overrideFor });
   stop ??= deps.stop;
   publish ??= deps.publish;
@@ -471,7 +486,7 @@ export async function runBundleRepairs({
       }
     }
     // 2. plan + reserve
-    const planned = planBundleRepairs({ clones, ledger, settings, killed: isKilled, now });
+    const planned = planBundleRepairs({ clones, ledger, settings, killed: isKilled, now, dispatcherSha });
     summary.off = planned.off;
     summary.held = planned.held;
     for (const t of planned.dispatch) {
@@ -498,7 +513,12 @@ export async function runBundleRepairs({
       // RESERVE BEFORE LAUNCH: on disk (inside this lock) as an indeterminate running repair before anything spawns.
       const token = randomBytes(24).toString('hex');
       const deadlineAt = now + settings.wallTimeMinutes * 60_000;
-      ledger.push({ ...base, handle: null, deadlineAt, status: 'running', indeterminate: true, launching: true, tokenHash: sha256(token) });
+      if (t.retryOf) {
+        const oldIndex = ledger.findIndex((e) => e.holdId === t.holdId && e.status === 'dispatch-failed');
+        if (oldIndex >= 0) ledger.splice(oldIndex, 1);
+      }
+      ledger.push({ ...base, handle: null, deadlineAt, status: 'running', indeterminate: true, launching: true, tokenHash: sha256(token),
+        dispatchRetries: t.retryOf?.dispatchRetries ?? 0, dispatcherSha, escalations: [] });
       reserved.push({ t, filled, token, base });
     }
     persist(ledger);
@@ -508,6 +528,7 @@ export async function runBundleRepairs({
   // 3. launch outside the lock; patch each result in under the lock.
   for (const { t, filled, token, base } of reserved) {
     let patch;
+    if (t.retryOf) log(`bundle-repair[retry]: relaunching ${filled.session} for clone ${t.name} after dispatch-failed (attempt ${t.retryOf.dispatchRetries}/${settings.maxDispatchRetries}, reason ${t.dispatchRetryReason})`);
     try {
       const r = await dispatch(t, { prompt: filled.prompt, session: filled.session, token, stateRoot: resolve(dir, '..', '..'), wallTimeMinutes: settings.wallTimeMinutes });
       patch = { handle: r.handle };

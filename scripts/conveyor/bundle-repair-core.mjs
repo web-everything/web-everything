@@ -40,6 +40,8 @@ export const BUNDLE_REPAIR_STANDARD = Object.freeze({
   clones: Object.freeze(['*']),
   maxConcurrent: 1,
   wallTimeMinutes: 120,
+  dispatchRetryBackoffMinutes: 60,
+  maxDispatchRetries: 2,
 });
 
 const int = (lo, hi) => (v) => Number.isSafeInteger(v) && v >= lo && v <= hi;
@@ -51,6 +53,8 @@ export const BUNDLE_REPAIR_VALID = Object.freeze({
   clones: (v) => Array.isArray(v) && v.every((x) => typeof x === 'string' && x.trim() !== ''),
   maxConcurrent: int(1, 4),
   wallTimeMinutes: int(10, 8 * 60),
+  dispatchRetryBackoffMinutes: int(1, 24 * 60),
+  maxDispatchRetries: int(0, 5),
 });
 
 export const LEDGER_STATUSES = Object.freeze(['running', 'repaired', 'shadow', 'cleared', 'escalated', 'dispatch-failed']);
@@ -109,10 +113,10 @@ export function heldRefs(held) {
 /**
  * PURE: which held clones get a repair session this tick.
  * @param {{clones:Array<{cloneKey:string, root:string|null, held:object|null}>, ledger:Array<object>,
- *   settings:object, killed:boolean, now:number}} o
+ *   settings:object, killed:boolean, now:number, dispatcherSha?:string|null}} o
  * @returns {{off:false|'disabled'|'kill-switch', dispatch:Array<object>, held:Array<{cloneKey:string, rule:string, reason:string}>}}
  */
-export function planBundleRepairs({ clones = [], ledger = [], settings = BUNDLE_REPAIR_STANDARD, killed = false, now }) {
+export function planBundleRepairs({ clones = [], ledger = [], settings = BUNDLE_REPAIR_STANDARD, killed = false, now, dispatcherSha = null }) {
   const s = { ...BUNDLE_REPAIR_STANDARD, ...settings };
   if (s.enabled !== true) return { off: 'disabled', dispatch: [], held: [] };
   if (killed) return { off: 'kill-switch', dispatch: [], held: [] };
@@ -134,11 +138,34 @@ export function planBundleRepairs({ clones = [], ledger = [], settings = BUNDLE_
     const live = entries.find((e) => e.cloneKey === c.cloneKey && (e.status === 'running' || e.stopPending || (e.launching && now < e.deadlineAt)));
     if (live) { hold(HOLD_RULES.ONE_PER_CLONE, `a repair is already running on this clone (${live.session ?? live.holdId})`); continue; }
     const prior = entries.find((e) => e.holdId === holdId);
-    if (prior) { hold(HOLD_RULES.ONE_PER_HOLD, `this hold already had its one repair attempt (${prior.status})`); continue; }
+    let retry = {};
+    if (prior) {
+      if (prior.status !== 'dispatch-failed' || s.mode !== 'live') {
+        hold(HOLD_RULES.ONE_PER_HOLD, `this hold already had its one repair attempt (${prior.status})`); continue;
+      }
+      const retries = Object.hasOwn(prior, 'dispatchRetries') ? prior.dispatchRetries : 0;
+      // Legacy entries omit the retry count. Other malformed evidence must never open a retry, even on a new sha.
+      if (!Number.isSafeInteger(retries) || retries < 0 || !Number.isFinite(prior.endedAt)) {
+        hold(HOLD_RULES.ONE_PER_HOLD, 'dispatch-failed retry held: invalid dispatchRetries or endedAt'); continue;
+      }
+      if (retries >= s.maxDispatchRetries) {
+        hold(HOLD_RULES.ONE_PER_HOLD, `dispatch retries used (${retries}/${s.maxDispatchRetries})`); continue;
+      }
+      const shaChanged = typeof dispatcherSha === 'string' && dispatcherSha.trim() !== '' && dispatcherSha !== prior.dispatcherSha;
+      const backoffElapsed = now - prior.endedAt >= s.dispatchRetryBackoffMinutes * MINUTE;
+      if (!shaChanged && !backoffElapsed) {
+        hold(HOLD_RULES.ONE_PER_HOLD, `dispatcher sha unchanged or unavailable; waiting ${s.dispatchRetryBackoffMinutes} min backoff after dispatch-failed`); continue;
+      }
+      retry = {
+        retryOf: { dispatchRetries: retries + 1, previousStatus: prior.status },
+        dispatchRetryReason: shaChanged ? 'sha-changed' : 'backoff',
+      };
+    }
     if (s.mode === 'live' && running >= s.maxConcurrent) { hold(HOLD_RULES.MAX_CONCURRENT, `${running} repair(s) running (max ${s.maxConcurrent})`); continue; }
     dispatch.push({
       cloneKey: c.cloneKey, root: c.root, name: cloneName(c.root), holdId, holdSince: c.held.since,
       holdReason: c.held.reason, refs: heldRefs(c.held), lastGood: c.held.lastGood ?? null, mainSha: c.held.mainSha ?? null,
+      ...retry,
     });
     if (s.mode === 'live') running += 1;
   }

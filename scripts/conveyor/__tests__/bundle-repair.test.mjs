@@ -119,6 +119,33 @@ describe('planBundleRepairs — bounded dispatch-failed retries', () => {
     expect(plan(entry).dispatch).toEqual([expect.objectContaining({ retryOf: { dispatchRetries: 1, previousStatus: 'dispatch-failed' } })]);
   });
 
+  describe.each([
+    ['changed sha', {}],
+    ['elapsed backoff', { dispatcherSha: SHA, endedAt: NOW - 60 * MIN }],
+  ])('retry count evidence with %s', (_trigger, triggerFields) => {
+    it.each([
+      ['omitted legacy count', {}, 1],
+      ['explicit null', { dispatchRetries: null }, null],
+      ['explicit undefined', { dispatchRetries: undefined }, null],
+      ['negative count', { dispatchRetries: -1 }, null],
+      ['fractional count', { dispatchRetries: 0.5 }, null],
+      ['zero count', { dispatchRetries: 0 }, 1],
+      ['valid positive count', { dispatchRetries: 1 }, 2],
+    ])('%s permits only valid or omitted evidence', (_label, countFields, nextCount) => {
+      const entry = prior(triggerFields);
+      delete entry.dispatchRetries;
+      Object.assign(entry, countFields);
+      const p = plan(entry);
+      if (nextCount === null) expectHeld(p, /invalid dispatchRetries/);
+      else {
+        expect(p.held).toEqual([]);
+        expect(p.dispatch).toEqual([expect.objectContaining({
+          retryOf: { dispatchRetries: nextCount, previousStatus: 'dispatch-failed' },
+        })]);
+      }
+    });
+  });
+
   it('maxDispatchRetries 0 never retries even with a changed sha and elapsed backoff', () => {
     expectHeld(plan(prior({ endedAt: NOW - 120 * MIN }), { settings: on({ maxDispatchRetries: 0 }) }), /retr(?:y|ies)|used|limit/i);
   });
