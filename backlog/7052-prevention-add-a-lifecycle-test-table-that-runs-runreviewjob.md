@@ -13,8 +13,8 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 1. `we:scripts/lib/review-red-team-on-skip.mjs:14` — Add a lifecycle test table that runs runReviewJob with every persisted prior-status shape (ran, resumed, object forms) followed by an erroring retry, and asserts the status written afterwards. Prefer a shared fixture over per-shape ad hoc tests.
-2. `we:backlog/x46te7z-coverage-exercise-pending-skip-quarantine-removal-fallback.md:16` — Require acceptance entries to cite repository-qualified files and explicit planned test titles; validate title existence when implementation completes. The quarantine coverage work is already filed in this card.
-3. `we:backlog/xebglin-prevention-validate-regression-mapping-test-titles-in-standa.md:15` — Add named planned cases in a concrete we:scripts/__tests__/ test file for each Acceptance constraint, and enforce Acceptance-to-test mappings through a deterministic standards rule; the supplied card records the intended validator but shows no existing enforcement.
+2. `we:backlog/7049-coverage-exercise-pending-skip-quarantine-removal-fallback.md:16` — Require acceptance entries to cite repository-qualified files and explicit planned test titles; validate title existence when implementation completes. The quarantine coverage work is already filed in this card.
+3. `we:backlog/7050-prevention-validate-regression-mapping-test-titles-in-standa.md:15` — Add named planned cases in a concrete we:scripts/__tests__/ test file for each Acceptance constraint, and enforce Acceptance-to-test mappings through a deterministic standards rule; the supplied card records the intended validator but shows no existing enforcement.
 
 Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 3 → #5473, finding 4 → #5473.
 
