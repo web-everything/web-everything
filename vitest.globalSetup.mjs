@@ -2,6 +2,7 @@
 // the WE_TMP_LEAK_* policy knobs. Runs in the main vitest process BEFORE workers spawn; vitest builds the
 // worker env from `process.env` at run time, so the TMPDIR set here reaches every worker and spawned child.
 import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   FAKE_GH_DIR_ENV,
   createRunTmpRoot,
@@ -20,11 +21,14 @@ export default function setup() {
     TMPDIR: process.env.TMPDIR,
     TMP: process.env.TMP,
     TEMP: process.env.TEMP,
+    WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS,
     [FAKE_GH_DIR_ENV]: process.env[FAKE_GH_DIR_ENV],
   };
   process.env.TMPDIR = root;
   process.env.TMP = root;
   process.env.TEMP = root;
+  // Child processes and non-sandboxed test tiers must never inherit the operator's event stream.
+  process.env.WE_DAEMON_EVENTS = join(root, 'daemon-events.jsonl');
   // One fake `gh` for the whole run (vitest.setup.ts used to write one per test file).
   process.env[FAKE_GH_DIR_ENV] = createSharedFakeGh(root);
   return function teardown() {

@@ -144,6 +144,10 @@ if (hermetic) {
 }
 
 process.env.WE_UNDER_TEST = '1';
+// Set after the ambient WE_* strip, including for tiers that opt out of hermetic HOME.
+// Callers may still inject a private sink; the default and child processes use this file's sink.
+process.env.WE_DAEMON_EVENTS = lazyRoot('daemon-events.jsonl');
+fixtureRootKeys.push('WE_DAEMON_EVENTS');
 
 // keep-alive leak fix (2026-10-20: 154 orphaned `node -e setInterval(() => {}, …)` children, up to 19 days old).
 // Every keep-alive from scripts/lib/test-keepalive.mjs watches this anchor pid and exits once it is gone, so a

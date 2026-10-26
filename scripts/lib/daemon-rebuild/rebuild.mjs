@@ -3,6 +3,8 @@
  * design notes it refers to as "the file header" are the header of `scripts/lib/daemon-rebuild.mjs`.
  */
 
+import { basename } from 'node:path';
+import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
@@ -20,6 +22,20 @@ import { smokeAndAdopt } from './smoke.mjs';
 import { resolveVersionedContext, versionedRebuild } from '../daemon-version-runtime.mjs';
 import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
 
+// Positive classification: new/waiting reasons must never become failures by default.
+// Shared with the event-contract tests so every declared failure has a wiring regression.
+export const REBUILD_FAILURE_REASONS = Object.freeze([
+  'index-locked', 'rebuild-interrupted-unrecoverable', 'quarantined', 'not-on-main',
+  'head-unresolved', 'overlay-state-corrupt', 'fetch-failed', 'status-failed',
+  'main-unresolved', 'pinned-overlay-conflict', 'pinned-overlay-unavailable',
+  'established-overlay-conflict', 'untracked-collision', 'still-rejected',
+  'merge-in-progress', 'dirty', 'local-commits', 'root-changed-during-smoke',
+  'reset-failed', 'rollback-failed', 'rebuild-error', 'rebuild-job-queue-failed',
+  'dispatch-smoke-failed', 'candidate-worktree-failed', 'smoke-threw',
+  'smoke-reused-env-failed', 'smoke-harness-broken', 'smoke-rejected',
+  'rev-parse-failed', 'smoke-failed', 'not-built',
+]);
+
 // ── rebuildClone — the IO shell ──────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -32,11 +48,31 @@ import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
  * @param {{root:string, env?:NodeJS.ProcessEnv, log?:Console, run?:typeof gitRun, runSmoke?:typeof runLiveSmokeWithRetry,
  *   prState?:(pr:number)=>(Promise<string|null>|string|null), lockOpts?:object, stateOpts?:{env?:NodeJS.ProcessEnv},
  *   mainOnly?:boolean, admissionWaitMs?:number, now?:()=>number, sleep?:(ms:number)=>Promise<void>,
- *   dispatchSmoke?:{settings?:object, run?:Function, match?:Function}}} o — `dispatchSmoke` (xhiqxz3): injected
+ *   emitEvent?:Function, dispatchSmoke?:{settings?:object, run?:Function, match?:Function}}} o — injected
  *   pieces of the real dispatch smoke the candidate smoke runs for a new dispatch-touching overlay (default: #4481's).
  * @returns {Promise<object>}
  */
-export async function rebuildClone({
+export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options } = {}) {
+  const result = await rebuildCloneInternal(options);
+  try {
+    const eventOptions = { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } };
+    if (result.adopted || result.moved) {
+      if (typeof result.head === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(result.head)) {
+        await emitEvent({
+          kind: 'rebuild-adopted', daemon: basename(options.root), detail: { sha: result.head },
+        }, eventOptions);
+      }
+    } else if (REBUILD_FAILURE_REASONS.includes(result.reason)
+      || (typeof result.reason === 'string' && /^(?:error: |established-overlay-conflict: )/.test(result.reason))) {
+      await emitEvent({
+        kind: 'rebuild-failed', daemon: basename(options.root), detail: { reason: result.reason },
+      }, eventOptions);
+    }
+  } catch { /* Event failures must never change the rebuild outcome. */ }
+  return result;
+}
+
+async function rebuildCloneInternal({
   root, env = process.env, log = console, run = gitRun, runSmoke = runLiveSmokeWithRetry,
   prState = (pr) => defaultPrState({ pr, root }), lockOpts = {}, stateOpts = {}, mainOnly = false,
   now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false,
@@ -48,7 +84,7 @@ export async function rebuildClone({
   if (!readyOnly && !adoptOnly && (asJob === undefined ? resolveRebuildAsJob({ entries, env }) : asJob)) {
     return rebuildCloneAsJob({
       root, env, log, mainOnly, entries,
-      adopt: (o = {}) => rebuildClone({
+      adopt: (o = {}) => rebuildCloneInternal({
         root, env, log, run, runSmoke, prState, lockOpts, stateOpts, mainOnly, now, sleep, versions, skipCheck, entries,
         dispatchSmoke, admissionWaitMs, ...o, adoptOnly: true, asJob: false,
       }),
