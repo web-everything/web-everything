@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { assignByTime, median, ambiguousFilters, timingsFromReports, parseShardArg } from '../shard-assign.mjs';
+import { assignByTime, median, ambiguousFilters, timingsFromReports, parseShardArg, listUnitTestFiles, loadTimings, assertTimingKeys, formatUpdatedTimings } from '../shard-assign.mjs';
 
 describe('shard-assign — balance by measured time (card 11)', () => {
   const files = ['a', 'b', 'c', 'd', 'e', 'f'];
@@ -46,6 +46,18 @@ describe('shard-assign — vitest substring-filter guard', () => {
 });
 
 describe('shard-assign — timings from vitest json reports', () => {
+  it('rejects report filenames outside the checkout instead of storing parent-traversing keys', () => {
+    const report = { testResults: [{ name: '/other-checkout/a.test.mjs', startTime: 0, endTime: 1000 }] };
+    expect(() => timingsFromReports([report], '/repo')).toThrow(/repository-relative/);
+  });
+
+  it.each(['/absolute.test.mjs', '../outside.test.mjs', 'a/../../outside.test.mjs', 'C:/checkout/a.test.mjs', 'a\\b.test.mjs'])('rejects nonportable persisted timing key %s in the shared standards guard and writer', (key) => {
+    const unit = { [key]: 1 };
+    expect(() => assertTimingKeys({ unit })).toThrow(/repository-relative/);
+    expect(() => formatUpdatedTimings({ unit: {}, soak: {} }, 'unit', unit)).toThrow(/repository-relative/);
+    expect(() => assertTimingKeys({ soak: unit })).toThrow(/repository-relative/);
+  });
+
   it('maps absolute names to repo-relative seconds, keeping the largest sample', () => {
     const root = '/repo';
     const r1 = { testResults: [{ name: '/repo/a/x.test.mjs', startTime: 0, endTime: 2500 }] };
@@ -57,4 +69,14 @@ describe('shard-assign — timings from vitest json reports', () => {
     expect(parseShardArg(['--shard=2/4'])).toEqual({ shard: 2, total: 4 });
     expect(() => parseShardArg(['--shard=5/4'])).toThrow();
   });
+});
+
+
+describe('shard-assign — persisted unit timing freshness', () => {
+  it('committed unit timing keys match discovered test filenames', async () => {
+    const files = new Set(await listUnitTestFiles());
+    const unit = loadTimings().unit;
+    expect(Object.keys(unit).filter(file => !files.has(file))).toEqual([]);
+  }, 30_000);
+
 });
