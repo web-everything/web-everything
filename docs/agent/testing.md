@@ -91,6 +91,17 @@ moving its `scripts/` subtree for locus guards, and remove the fixture during te
 
 ## Daemon entry boot smoke
 
+Rebuild candidates must also work with the old live daemon's smoke environment: it exports
+`WE_SMOKE_LIVE_CLONE` and `LANE_POOL_ROOT`, but may omit `LANE_POOL_CANONICAL_ORIGIN`.
+The canonical-origin CLI fixture covers the named candidate's verified Git owner under a fake pool;
+forged markers, lane owners and unreadable ownership must retain the explicit-origin refusal.
+The candidate-env fixture also checks that configured local origins are anchored to the live root before
+export, so changing to the candidate directory preserves the destination; explicit env values keep precedence.
+The inherited origin applies only without `--reference`, `--repo` or `--pool`; those selectors resolve
+their own primary. The CLI fixture exercises recovery against separate local bare repositories and
+checks that cross-pool release never publishes another pool's work to the inherited origin, including
+when that pool's primary is missing or has no origin.
+
 Boot each entry in a fresh child to preserve cold import graphs. `rebuildSmoke.bootConcurrency`
 (default 3) bounds initial boots; after those children drain, `rebuildSmoke.bootSignalRetries`
 (default 1; zero disables) retries only SIGTRAP/SIGSEGV/SIGABRT/SIGBUS/SIGILL deaths, serially.
