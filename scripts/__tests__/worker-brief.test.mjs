@@ -25,7 +25,7 @@ describe('renderWorkerBrief', () => {
       '2. **Register your scope.**', '3. **Lane.**', '4. **Codex for scoped coding.**',
       '5. **Red-green tests through the heavy queue.**', '6. **One PR.**',
       '7. **Pre-push recheck.**', '**Proof.**', '**Waiting (rule 23).**',
-      '**Processes.**', '**Git.**', '**Times**', '**Report**'];
+      '**Processes.**', '**Git.**', '**Trust boundary.**', '**Times**', '**Report**'];
     let previous = -1;
     for (const section of sections) {
       const index = brief.indexOf(section);
@@ -57,6 +57,10 @@ describe('renderWorkerBrief', () => {
       expect(text).toMatch(/UNKNOWN/);
       expect(text).toMatch(/exit(?:s)? 2/);
     }
+  });
+
+  it('requires the trust-boundary section in the PR body and stops if the card lacks it', () => {
+    expect(renderWorkerBrief(params)).toContain("**Trust boundary.** A build of a trust-boundary item must carry the card's `Trust boundary and threat model` section into the PR body; if the card lacks one, stop and report.");
   });
 
   it('tells the worker to stop and report when open-pr is refused by the PR limit, never to self-allow (xfaz7ho)', () => {
