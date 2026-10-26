@@ -1,0 +1,16 @@
+{% raw %}
+<h2>Question and recommendation</h2>
+<p>How should the codex-job runner make sure the bytes that were tested are the bytes that were audited and published? The recommendation is to capture the in-scope lane state once as a Git tree object from a temporary index, record its tree SHA, run tests in a disposable copy of that tree, and publish with <code>commit-tree</code> from the recorded SHA. Nothing re-reads the mutable lane after the snapshot.</p>
+<h2>Why the earlier design failed</h2>
+<p>PR #5839 compared fingerprints of the live lane before and after tests. A surviving test subprocess could show one set of bytes to Git and the tests and another to the audit and publish export, so every fingerprint matched while untested bytes shipped. Eighteen review rounds each found a new break class in the same shape.</p>
+<h2>Prior art</h2>
+<ul>
+  <li><strong>Git plumbing:</strong> <code>write-tree</code> and <code>commit-tree</code> bind content and modes to one hash without touching the filesystem again.</li>
+  <li><strong>Nix and Bazel sandboxes:</strong> actions run in ephemeral copies with read-only inputs and their process group is reaped before outputs are collected.</li>
+  <li><strong>TOCTOU literature:</strong> ingest untrusted bytes into a trusted immutable object first, then check and use only that object.</li>
+  <li><strong>CI pipelines and <code>pull_request_target</code> hazards:</strong> untrusted test execution is kept apart from privileged publication, and approvals bind to an immutable tree or commit hash.</li>
+  <li><strong>SLSA and in-toto provenance:</strong> test and review results attach to the digest of the exact tree that was tested.</li>
+</ul>
+<h2>Decision card</h2>
+<p>The forks, the trust boundary and threat model, and the done-when checks are on the decision card for the redesign (filed as <code>x41mr6v</code>).</p>
+{% endraw %}

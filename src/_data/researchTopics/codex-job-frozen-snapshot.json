@@ -1,0 +1,14 @@
+{
+  "id": "codex-job-frozen-snapshot",
+  "title": "Codex Job — Tests, Audit and Publish on One Frozen Snapshot",
+  "status": "open",
+  "summary": "Preparation for the redesign of the closed #5839: freeze the post-Codex lane state into one Git tree object so tests, audit and publication all read the same bytes, with an explicit trust boundary and threat model.",
+  "dateOpened": "2026-10-25",
+  "tags": [
+    "operations",
+    "security",
+    "git"
+  ],
+  "relatedBlocks": [],
+  "relatedPlugs": []
+}
