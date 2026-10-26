@@ -379,6 +379,21 @@ describe('delivery policy values', () => {
     }
     expect(readPolicyEvents({ env }).map(event => event.event)).toEqual(['policy-defaults-unreadable', 'policy-defaults-unreadable']);
   });
+  it.each(['__proto__', 'constructor', 'toString'])('refuses defaults whose dimension is inherited, not own (%s)', async name => {
+    const { prCi, ...rest } = defaults;
+    const pad = name === '__proto__' ? 'padding' : name;
+    put(defaultFile, `export const PLATFORM_DELIVERY_POLICY_DEFAULTS = { __proto__: { prCi: ${JSON.stringify(prCi)} }, ${Object.entries(rest).map(([k, v]) => `${k}: ${JSON.stringify(v)}`).join(', ')}, ${pad}: {} };`);
+    const result = await load();
+    expect(policy(result)).toEqual(DELIVERY_POLICY_FAILSAFE);
+    expect(result.warnings).toHaveLength(1);
+  });
+  it.each(['__proto__', 'constructor', 'toString'])('refuses defaults whose field is inherited, not own (%s)', async name => {
+    const pad = name === '__proto__' ? 'padding' : name;
+    put(defaultFile, `export const PLATFORM_DELIVERY_POLICY_DEFAULTS = { ...${JSON.stringify(defaults)}, prCi: { __proto__: { mainStateParity: 'on' }, ${pad}: 'on' } };`);
+    const result = await load();
+    expect(policy(result)).toEqual(DELIVERY_POLICY_FAILSAFE);
+    expect(result.warnings).toHaveLength(1);
+  });
   it('defaults source imports types only; a value import is rejected before execution', async () => {
     const source = readFileSync(resolve(defaultFile), 'utf8');
     const ast = ts.createSourceFile(defaultFile, source, ts.ScriptTarget.Latest, true);
