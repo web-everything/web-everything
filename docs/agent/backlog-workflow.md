@@ -611,8 +611,9 @@ This sequence is also why **research-first matters**: it supplies the platform v
 output — Codex or agent output, test subprocesses, git config or remotes, PR text, or external input —
 must carry a `## Trust boundary and threat model` section. State what may be adversarial, what is
 explicitly out of scope, and which inputs must be frozen (snapshotted once and never re-read).
-Before setting `preparedDate`, run a design red-team on that section using the existing jury on prose
-(`/jury`'s decision-approach subject). Motivating case: #5839 (18 rounds, a new break class almost every
+Before setting `preparedDate`, run a design red-team on that section: either the `/jury` panel on the prose, or a Gemini
+red-team via local agy (`scripts/gemini-direct-task.mjs`, model from the vendor-routing setting); PR
+reviews still use the review panel. Motivating case: #5839 (18 rounds, a new break class almost every
 round, closed for redesign under R114).
 
 An item with all forks stated this way — each carrying options, a bold default, and a fork-specific `/research/` topic — is **prepared**: first run `npm run check:health` green alongside the standard `npm run check:standards` gate (catches a G4 false-prepared-fork tell — e.g. a prioritization/effort word that only *looks* like one — before review instead of after a bounce; the #3427 prep bounced review:changes on exactly this), then stamp **`preparedDate: "YYYY-MM-DD"`** (alongside **`preparedAgainstSha`**, #3108) into its frontmatter with `node scripts/backlog.mjs prepare-stamp <NNN>` **in the lane** (the #2219 (b) flow, shipped #2264 — the stamp is a backlog mutation, blocked from a primary cwd and landed via the one PR; don't hand-Edit it onto primary). While you prepare, a hard local `prepare-hold` keeps the fork out of every other session's selection + claim. `check:readiness --select` then ranks a prepared item **prepared-first within Tier B and tags it `✓ ready to ratify`** (vs `○ needs prep`), so decision-mode surfaces the ready-to-ratify forks ahead of the ones still needing a research pass. The research cost is paid once, ahead of the turn, not re-paid cold in every discussion.

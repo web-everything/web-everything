@@ -33,6 +33,7 @@ import { op } from './registry.mjs';
 import { DECLARED_HOMES } from './declared-homes.mjs';
 import { compute, effect } from './step-kinds.mjs';
 import { HOME_REASONS } from './pr-land-reasons.mjs';
+import { BUILT_IN_PR_SIZE_SETTINGS } from '../lib/pr-size-defaults.mjs';
 
 /**
  * card xiqtf7w — the ONE way a PR says it replaces another open PR. A PR that folds in another open PR's fix must
@@ -51,15 +52,28 @@ export const OPEN_PR_MAX_NON_TEST_LINES = 300;
 
 /** Pure git --numstat -z accounting (also accepts legacy unquoted newline rows).
  * Binary rows are unmeasurable; malformed or incomplete evidence must never become a zero-sized diff.
+ * IO callers pass cascade-resolved prSize settings; standalone callers use frozen built-in defaults.
+ * Data is excluded only from the line budget, never from review. Both rename paths must qualify.
  */
-export function measureNonTestLines(numstatText) {
+export function measureNonTestLines(numstatText, settings = BUILT_IN_PR_SIZE_SETTINGS) {
   if (typeof numstatText !== 'string') throw new Error('numstat must be text');
-  if (!numstatText) return { lines: 0, exempt: false };
+  if (!numstatText) return { lines: 0, dataLines: 0, exempt: false };
   const nulDelimited = numstatText.includes('\0');
   if (nulDelimited && !numstatText.endsWith('\0')) throw new Error('unterminated numstat record');
   const rows = nulDelimited ? numstatText.slice(0, -1).split('\0') : numstatText.replace(/\n$/, '').split('\n');
   let lines = 0;
+  let dataLines = 0;
   let exempt = true;
+  const isData = path => {
+    const segments = path.split('/');
+    if (segments.some(segment => !segment || segment === '.' || segment === '..')) return false;
+    const filename = segments.pop();
+    const dot = filename.lastIndexOf('.');
+    if (dot === -1 || !BUILT_IN_PR_SIZE_SETTINGS.dataExtensions.includes(filename.slice(dot))) return false;
+    if (settings.dataPaths.includes(path)) return true;
+    return settings.dataExtensions.includes(filename.slice(dot))
+      && segments.some(segment => settings.dataDirs.includes(segment));
+  };
   for (let i = 0; i < rows.length; i++) {
     const match = /^(\d+|-)\t(\d+|-)\t([\s\S]*)$/.exec(rows[i]);
     if (!match) throw new Error('unreadable numstat line');
@@ -78,12 +92,15 @@ export function measureNonTestLines(numstatText) {
     const changed = Number(additions) + Number(deletions);
     if (!Number.isSafeInteger(changed)) throw new Error('numstat count exceeds safe integer range');
     exempt = exempt && paths.every((path) => path.startsWith('backlog/'));
-    if (!paths.every((path) => /(^|\/)__tests__\//.test(path) || /(^|\/)[^/]*\.(test|spec)\.[^/]+$/.test(path))) {
+    if (paths.every(isData)) {
+      dataLines += changed;
+      if (!Number.isSafeInteger(dataLines)) throw new Error('numstat data total exceeds safe integer range');
+    } else if (!paths.every((path) => /(^|\/)__tests__\//.test(path) || /(^|\/)[^/]*\.(test|spec)\.[^/]+$/.test(path))) {
       lines += changed;
       if (!Number.isSafeInteger(lines)) throw new Error('numstat total exceeds safe integer range');
     }
   }
-  return { lines, exempt };
+  return { lines, dataLines, exempt };
 }
 
 /** The one effect: hand the planned argv to the home. */

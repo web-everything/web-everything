@@ -6,6 +6,7 @@ import { sanitizeForFeed } from '../operations/needs-you-feed.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { redTeamStatusDir } from './drain-red-team-evidence.mjs';
 import { redTeamForHead, redTeamMarker } from './red-team-gate.mjs';
+import { resumeRedTeamCarry } from './red-team-carry-machine.mjs';
 
 /** Thrown values can have unreadable messages or unstringifiable JSON shapes. */
 export function safeErrorText(error) {
@@ -137,6 +138,10 @@ export function settleRedTeamSkip(input = {}) {
       try {
         if (!Number.isSafeInteger(Number(pr)) || Number(pr) <= 0 || typeof repo !== 'string' || !repo
           || !isRealHead(head)) throw Error('missing or invalid PR/head');
+        if (input.carry) {
+          if (!io.carry) throw Error('carry IO missing; inspect recovery configuration before retrying');
+          return resumeRedTeamCarry({ repo, pr, head, kind: 'card-only', loopPayload: input.carry.loopPayload }, io.carry);
+        }
         const thread = comments ?? io.readComments({ repo, pr });
         if (!Array.isArray(thread)) throw Error('PR comments unreadable');
         if (redTeamForHead(thread, pr, head)) return { outcome: 'already' };
