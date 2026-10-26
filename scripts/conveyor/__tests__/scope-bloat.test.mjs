@@ -158,21 +158,24 @@ describe('card scope helpers', () => {
   });
 });
 
-describe('enrichPrsWithScopeBloat — the io shell fails open and remembers the refresh', () => {
+describe('enrichPrsWithScopeBloat — the io shell holds unknown stack diffs and remembers the refresh', () => {
   const pr = (over = {}) => ({ number: 4361, title: 'WE #xykwe0h: build', headRefName: 'lane/build-outcomes', headRefOid: 'a'.repeat(40),
     files: FILES_4361.map((path) => ({ path, additions: 1, deletions: 0 })), comments: [], ...over });
   const readers = { readNet: () => OWN, readScope: () => CARD_SCOPE, readBaseSha: () => 'base0', repo: 'web-everything/web-everything', env: {} };
 
-  it('marks an unresolved lane base unknown without claiming scope bloat', () => {
+  it('holds an unresolved lane base with unknown scope bloat', () => {
     const base = 'lane/unresolved-bottom';
     const events = [];
     const [out] = enrichPrsWithScopeBloat([pr({ number: 5943, baseRefName: base })], {
       ...readers, readStacks: () => new Map(), emitEvent: (event) => events.push(event),
     });
     const detail = { reason: 'stack-base-unresolved', base };
-    expect(out.scopeBloat).toBeUndefined();
+    expect(out.scopeBloat).toEqual({
+      reason: 'scope-bloat', unknown: true, files: 0, alreadyOnMain: [], outsideScope: [], stale: false, wide: false,
+      why: `${detail.reason}: the PR's stack base could not be resolved, so its own diff is unknown — a person or fixer must settle the base before a review reads it`,
+    });
     expect(out.scopeBloatUnknown).toEqual(detail);
-    expect(events).toEqual([{ kind: 'scope-bloat-unknown', pr: 5943, detail }]);
+    expect(events).toEqual([{ kind: 'scope-bloat-unknown', pr: 5943, daemon: 'scope-bloat', detail }]);
   });
 
   it('leaves a clean main-based PR untouched without emitting an unknown event', () => {
@@ -183,6 +186,37 @@ describe('enrichPrsWithScopeBloat — the io shell fails open and remembers the 
     });
     expect(out).toEqual(input);
     expect(out.scopeBloatUnknown).toBeUndefined();
+    expect(events).toEqual([]);
+  });
+
+  it.each([
+    ['files absent', { number: 5947, files: undefined }],
+    ['headRefOid absent', { number: 5948, headRefOid: undefined }],
+  ])('marks an unresolved lane base unknown with %s and emits once per PR/head', (_, missing) => {
+    const base = 'lane/unresolved-bottom';
+    const events = [];
+    const input = pr({ ...missing, baseRefName: base, scopeBloat: { stale: true } });
+    const options = { ...readers, readStacks: () => new Map(), emitEvent: (event) => events.push(event) };
+    const [out] = enrichPrsWithScopeBloat([input], options);
+    const detail = { reason: 'stack-base-unresolved', base };
+    expect(out.scopeBloat).toEqual({
+      reason: 'scope-bloat', unknown: true, files: 0, alreadyOnMain: [], outsideScope: [], stale: false, wide: false,
+      why: `${detail.reason}: the PR's stack base could not be resolved, so its own diff is unknown — a person or fixer must settle the base before a review reads it`,
+    });
+    expect(out.scopeBloatUnknown).toEqual(detail);
+    const [again] = enrichPrsWithScopeBloat([input], options);
+    expect(again.scopeBloat.unknown).toBe(true);
+    expect(again.scopeBloatUnknown).toEqual(detail);
+    expect(events).toEqual([{ kind: 'scope-bloat-unknown', pr: input.number, daemon: 'scope-bloat', detail }]);
+  });
+
+  it('skips drafts with an unresolved lane base and missing evidence', () => {
+    const events = [];
+    const input = pr({ isDraft: true, baseRefName: 'lane/unresolved-bottom', files: undefined, headRefOid: undefined });
+    const [out] = enrichPrsWithScopeBloat([input], {
+      ...readers, readStacks: () => new Map(), emitEvent: (event) => events.push(event),
+    });
+    expect(out).toBe(input);
     expect(events).toEqual([]);
   });
 
@@ -492,16 +526,44 @@ describe('stack-aware review (held item 177)', () => {
     expect(out.stackBase).toBeUndefined();
   });
 
-  it('falls back to the main basis when the stack file read throws', () => {
+  it('marks the stack diff unknown without falling back to main when the stack file read throws', () => {
     let stackReads = 0;
     let mainReads = 0;
+    const events = [];
     const [out] = enrichPrsWithScopeBloat([pr()], { ...readers('fallback'),
       readStackFiles: () => { stackReads += 1; throw new Error('unreadable stack tree'); },
       readNet: () => { mainReads += 1; return ALL23; },
+      emitEvent: (event) => events.push(event),
     });
     expect(stackReads).toBe(1);
-    expect(mainReads).toBe(1);
-    expect(out.scopeBloat).toMatchObject({ wide: true });
-    expect(out.scopeBloat.outsideScope).toEqual(BOTTOM_ONLY);
+    expect(mainReads).toBe(0);
+    const detail = { reason: 'stack-diff-unreadable', base: stack.ref };
+    expect(out.scopeBloat).toEqual({
+      reason: 'scope-bloat', unknown: true, files: 0, alreadyOnMain: [], outsideScope: [], stale: false, wide: false,
+      why: `${detail.reason}: the PR's stack base could not be resolved, so its own diff is unknown — a person or fixer must settle the base before a review reads it`,
+    });
+    expect(out.scopeBloatUnknown).toEqual(detail);
+    expect(events).toEqual([{ kind: 'scope-bloat-unknown', pr: 4631, daemon: 'scope-bloat', detail }]);
+  });
+
+  it('marks a non-array stack diff unknown and emits once per PR/head without reading main', () => {
+    const input = { ...pr(), number: 4632, scopeBloat: { wide: true } };
+    const events = [];
+    let mainReads = 0;
+    const options = { ...readers('fallback'), readStacks: () => new Map([[4632, stack]]),
+      readStackFiles: () => null, readNet: () => { mainReads += 1; return ALL23; },
+      emitEvent: (event) => events.push(event) };
+    const [out] = enrichPrsWithScopeBloat([input], options);
+    const detail = { reason: 'stack-diff-unreadable', base: stack.ref };
+    expect(out.scopeBloat).toEqual({
+      reason: 'scope-bloat', unknown: true, files: 0, alreadyOnMain: [], outsideScope: [], stale: false, wide: false,
+      why: `${detail.reason}: the PR's stack base could not be resolved, so its own diff is unknown — a person or fixer must settle the base before a review reads it`,
+    });
+    expect(out.scopeBloatUnknown).toEqual(detail);
+    const [again] = enrichPrsWithScopeBloat([input], options);
+    expect(again.scopeBloat.unknown).toBe(true);
+    expect(again.scopeBloatUnknown).toEqual(detail);
+    expect(mainReads).toBe(0);
+    expect(events).toEqual([{ kind: 'scope-bloat-unknown', pr: 4632, daemon: 'scope-bloat', detail }]);
   });
 });

@@ -494,14 +494,18 @@ describe('readStackBases — the same trust rule as the fix daemon', () => {
     }
   });
   it.each([
-    ['different actors', { 4631: { author: 'someone-else' } }],
-    ['an unreadable author on the top', { 4631: { author: null } }],
-    ['an unreadable author on the bottom', { 4624: { author: null } }],
     ['a fork top', { 4631: { isCrossRepository: true } }],
     ['a fork bottom', { 4624: { isCrossRepository: true } }],
     ['a top with an unknown fork status', { 4631: { isCrossRepository: undefined } }],
   ])('forms no stack for %s', (_name, patch) => {
     for (const prs of [null, listed()]) expect(read(patch, { prs }).size).toBe(0);
+  });
+  it.each([
+    ['different actors', { 4631: { author: 'someone-else' } }],
+    ['an unreadable author on the top', { 4631: { author: null } }],
+    ['an unreadable author on the bottom', { 4624: { author: null } }],
+  ])('finds the declared stack for %s (GitHub\'s base ref is the authority)', (_name, patch) => {
+    for (const prs of [null, listed()]) expect(read(patch, { prs }).get(4631)?.pr).toBe(4624);
   });
   it('treats a PR GitHub has no record for as a fork (unknown means untrusted)', () => {
     for (const prs of [null, listed()]) {
@@ -509,9 +513,9 @@ describe('readStackBases — the same trust rule as the fix daemon', () => {
       expect(read({}, { prs, readRefs: () => refs }).size).toBe(0);
     }
   });
-  it('takes the author from GitHub\'s record, never from the caller\'s list', () => {
+  it('takes the fork status from GitHub\'s record, never from the caller\'s list', () => {
     const lying = listed().map((p) => ({ ...p, author: AUTHOR, isCrossRepository: false }));
-    expect(read({ 4631: { author: 'someone-else' } }, { prs: lying }).size).toBe(0);
+    expect(read({ 4631: { isCrossRepository: true } }, { prs: lying }).size).toBe(0);
   });
   it('takes baseRefName from GitHub refs even when the caller disagrees', () => {
     const caller = (baseRefName) => listed().map(p => ({ ...p, baseRefName }));
@@ -533,8 +537,7 @@ describe('readStackBases — the same trust rule as the fix daemon', () => {
     const daemon = (patch) => readStacksForPass({ root: '/repo', repoKey: 'we', planned: [], openPrFiles: [{ pr: 4624 }, { pr: 4631 }],
       settings: { detect: true }, readRefs: () => refsOf(patch), readLanes: lanes, isAncestor: (b, t) => b === BOTTOM && t === TOP,
       onMain: () => false, readMem: () => [], writeMem: () => {}, now: () => 0 }).pairs.length;
-    for (const patch of [{}, { 4631: { author: 'someone-else' } }, { 4631: { author: null } }, { 4624: { isCrossRepository: true } },
-      { 4631: { isCrossRepository: undefined } }]) {
+    for (const patch of [{}, { 4624: { isCrossRepository: true } }, { 4631: { isCrossRepository: undefined } }]) {
       expect(read(patch).size, JSON.stringify(patch)).toBe(daemon(patch));
     }
   });
