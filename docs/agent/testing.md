@@ -198,6 +198,48 @@ negative answers without file reads remain unverifiable.
 
 ## Drain red-team disposition and retry evidence
 
+Moved card-only skips recover through the normal red-team-only review job. The planner requires a
+finished policy skip with a pinned card-only read and no seat, then proves the move with
+`card-only-head-move.mjs` (shared numbering proof, otherwise a complete no-renames card-path diff).
+The job repeats that proof before settling the policy comment on the new head; it never sends
+the historical diff to a model or changes the original panel review. Unknown moves stay skipped.
+Both initial recovery and failed-comment retries resolve the live `redTeam.skipCardOnly` cascade
+after the proof/fetch; a disabled policy or missing/throwing policy hook refuses with
+`red-team-not-owed` before admission or settlement. Cover card-only and numbering-only moves, retries, and old accepting
+as well as non-accepting verdicts, including a policy change after IO construction.
+Carried settlement payloads retain `carriedFrom` (the original reviewed head) and clear `verdict`;
+their live `netBasis.rev` identifies settlement, not a panel read. The drain reader also strips
+any verdict on a marked carry before exposing it to scheduling consumers. Persisted comment-failure
+tests must prove that the payload cannot authorize a post-accept model pass and remains retryable.
+Carry publication uses a separate `(repo, pr, head, kind)` journal in `red-team-status/carry`:
+intent → clear label → result comment → done. The shared file lock serializes resumes; the
+journal is not a panel verdict or a queued model job. Each unfinished step checks live policy,
+head, holds and superseding review evidence, then its own observable postcondition before acting.
+Crash tests must cover each boundary, including a successful remote effect whose reply/journal
+write is lost. Exercise both accepting and non-accepting source verdicts through the persisted
+evidence reader, recovery planner and job. For lost status-write, label and comment replies, assert
+one status write, one label change, one comment and no model call after retry, with a null carried verdict.
+Recovery discovery must include an unfinished journal even when the result comment
+is already visible. A later real panel or changed head refuses recovery; it cannot inherit the
+carry's null verdict. A contended lock or unreadable evidence leaves the journal for the next
+recovery tick and reports an inspect/retry diagnostic; it never authorizes a model call.
+The moved-card cases in `review-red-team-on-skip.test.mjs`, `drain-red-team-evidence.test.mjs`
+and `review-job-red-team-only.test.mjs` pin selection, fail-closed proof and real comment settlement.
+Keep these files in the affected-test gate whenever the moved-card readers, proof or job wiring change:
+`npm run test:unit -- scripts/lib/__tests__/review-red-team-on-skip.test.mjs scripts/lib/__tests__/drain-red-team-evidence.test.mjs scripts/operations/__tests__/review-job-red-team-only.test.mjs`.
+Exercise new factory IO members through `createReviewJobIo` with temporary persisted evidence and an
+injected command reader; cover runner defaults as well as injected proofs. History cases must include
+20 and 21 commits, a root, an intermediate code change, and a code-to-card rename whose source becomes
+visible only with `--no-renames`. Historical evidence filters need a refusal case for each condition,
+with distinct old and live heads. Byte fixtures exercise the complete numbering detector without Git writes.
+Maintain a table with one independently falsified row per candidate-predicate conjunct, alongside
+planner/job integration tests. The moved candidate table must isolate status/read head equality;
+the historical fallback table must isolate `inFlight` from finished status (the reader currently
+derives them together). Give the status its own read so a mismatch does not also invalidate the
+status's internal provenance. Document logically implied clauses (real-head validity also follows
+from matching a valid status head); otherwise require a named row that fails if the conjunct is
+removed. Keep these tables in the affected-test gate above.
+
 Accept carry-forward's advisory exemption must use `readConfirmedBreaks` and `planRedTeamActions`,
 including settings and `WE_RED_TEAM_CONFIRMED_BREAKS` overrides. A send-back finding or an
 unresolved policy supersedes the stale accept; the fallback is a fresh review. Regression cases
@@ -499,6 +541,19 @@ real backend holds otherwise prevent even the fake child from starting. Real POC
 must pass a temporary `lockRoot` through `withPocLandLock`, preserving the mutex without touching host locks.
 
 ## PR time-loss safeguards
+
+R125: `measureNonTestLines` excludes pure data from the 300-line budget and reports it separately as
+`dataLines`; those files still require review. Built-in data extensions are `.json`, `.yaml`, `.yml`,
+and `.csv`, under a `config/` or `data/` directory segment at any depth. Exact `dataPaths` add exceptions
+only for those four extensions; `dataExtensions` may select only within that set. Code and markdown
+cannot become data exemptions. Absolute paths and paths with empty, `.` or `..` segments always count.
+The IO caller resolves `prSize` through the shared policy cascade and `scripts/pr-size-settings.json`;
+JSON-array env overrides are `WE_PR_SIZE_DATA_EXTENSIONS`, `WE_PR_SIZE_DATA_DIRS`, and `WE_PR_SIZE_DATA_PATHS`.
+Invalid present settings at any layer throw and refuse submission as `pr-size-unreadable`; only an absent
+tool settings file uses lower layers and built-in defaults. Restore valid settings before retrying.
+The counter defaults to dependency-free frozen built-ins to preserve the declaration's import safety.
+Keep the classification, settings provenance, refusal detail, binary/overflow refusal, and conservative
+rename cases in `scripts/operations/__tests__/open-pr-size-cap.test.mjs`.
 
 `fix.alertAtRoundCap` publishes through the needs-you feed as soon as the notes pass observes exhaustion,
 independently of note-comment dedup and quiet-hour desktop delivery. Polling must include `needsPerson`
@@ -2019,6 +2074,23 @@ sleep without consuming native filesystem watchers, and the optional webhook sle
 provides an isolated mailbox for tests. A wake only schedules a normal pass; claims,
 scope, host admission and attempt budgets remain authoritative.
 
+Pinned plain re-arm fixtures must exercise the partial state between the label swap and
+the durable marker: three failed comment attempts restore the pre-swap labels, while a
+pending PR resumes by posting only its missing marker. Inject `rearmRetrySleep` to avoid
+real delays. Assert head checks on comment retries and rollback, trusted verdict-bound
+coverage in thread order (including the same timestamp second), and round counts after
+rollback and successful retry. A rollback failure must name the unmarked pending state.
+Compensating label writes must also revalidate the complete trusted review evidence
+and the review/readiness labels created by the swap. Exercise a same-head human
+clearance on the third failed comment attempt, a newer or edited verdict with labels
+still pending, changed holds/readiness, and unreadable state. Refuse compensation
+when superseded; preserve unrelated labels and ignore untrusted verdict claims.
+The `pinned-rearm-orphan-marker` soak replay retains one provider's PR state across
+exhausted HTTP 503 retries, successful or failed rollback, and subsequent retries.
+Assert that failed rollback resumes with only a marker write, a completed retry writes
+nothing further even within the verdict's timestamp second, and rollback spends no
+repair round or bypasses the orphan redispatch cap.
+
 The shared policy cascade resolves `fix.sendBackReservedSlots` (standard 1),
 `fix.ciMissingAfterPushMin` (standard 10), and `drain.mergeableUnknownRepollSec`
 (standard 20), independently through platform preferences, declared tool settings and
@@ -2411,3 +2483,17 @@ omissions are reported as truncation. Clone paths must be absolute. The drain ta
 prototype-load settings, not the plist's data clone; tests inject those settings. Matrix and PR table cells strip
 Cc/Cf controls and are width-capped; table mode keeps the truncated-listing warning.
 
+
+### Red-team disposition precedence
+
+`red-team-disposition.test.mjs` pins all ranked pairs in both temporal and input
+orders, alongside shared-reader regressions for carry, repost, per-key blocks and
+legacy holds. Keep the oracle independent of `DISPOSITION_PRECEDENCE`.
+The pure resolver consumes validated live rulings; the thread adapter owns trust,
+head/result binding, carry eligibility and ceremony validity. Compatibility notes
+beside the table are deliberate: later indexed gate holds retire older releases,
+unindexed legacy holds do not. Operator blocks outrank clear-human regardless of
+recency; recency breaks ties only within a rank. Clear-human clears only keys
+the block does not name. A `NOT sent back` line is an ordinary hold even
+inside an operator-block record. Preserve these fixtures when changing liveness;
+rank alone cannot describe the historical wire protocol.

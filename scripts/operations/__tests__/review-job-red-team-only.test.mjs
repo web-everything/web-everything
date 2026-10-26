@@ -1,15 +1,21 @@
+import { settleRedTeamSkip } from '../../lib/red-team-skip-outcome.mjs';
+import { createRedTeamCarryIo } from '../../lib/red-team-carry-io.mjs';
+import { readRedTeamCarry } from '../../lib/red-team-carry-machine.mjs';
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
-import { runRedTeamOnSkip } from '../../lib/review-red-team-on-skip.mjs';
+import { planRedTeamOnSkip, redTeamSkipNeedsSettlement, runRedTeamOnSkip } from '../../lib/review-red-team-on-skip.mjs';
 import { redTeamForHead, redTeamMarker } from '../../lib/red-team-gate.mjs';
+import { redTeamOwedFor } from '../../lib/review-red-team-policy.mjs';
 import { writeJsonAtomic } from '../../lib/atomic-json-file.mjs';
 import { recordRedTeamStatus, readRedTeamStatus, readDrainRedTeamEvidence, redTeamStatusDir } from '../../lib/drain-red-team-evidence.mjs';
-import { createReviewJobIo, prepareReviewArc, runReviewJob, dispatchReviewJob, writeJobRecord, redTeamRunnerArgs, readRedTeamRecoveryStatus } from '../review-job.mjs';
+import { proveCardOnlyHeadMove } from '../../lib/card-only-head-move.mjs';
+import { createReviewJobIo, execReadRaw, prepareReviewArc, runReviewJob, dispatchReviewJob, writeJobRecord, redTeamRunnerArgs, readRedTeamRecoveryStatus } from '../review-job.mjs';
 import { createExtraSeatsIo } from '../review-extra-seats.mjs';
+import { newRunRecord, writeRun } from '../run-store.mjs';
 
 vi.mock('../../lib/red-team-status-labels.mjs', () => ({ syncRedTeamStatusLabels: vi.fn() }));
 vi.mock('../../lib/atomic-json-file.mjs', async importOriginal => {
@@ -1337,5 +1343,368 @@ describe('PR 5890 persisted review-pr recovery rows', () => {
       expect(observed.calls).toEqual({ provider: 1, reserve: 0, model: 0, recheck: 0 });
       expect(io.runRedTeamGate).toHaveBeenCalledOnce();
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+
+describe('moved card-only skip settlement', () => {
+  it('production carry adapter retries a lost comment reply through paged marker reads without repeating effects', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'carry-adapter-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_RED_TEAM_SKIP_CARD_ONLY: '1' };
+    const fromSha = 'b'.repeat(40), comments = [], labels = ['red-team:pending'];
+    const old = { verdict: { verdict: 'changes' }, findings: { read: {
+      netBasis: { rev: fromSha }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
+    } } };
+    const carried = { ...old, carriedFrom: fromSha, verdict: null,
+      findings: { read: { ...old.findings.read, netBasis: { rev: head } } } };
+    const exec = vi.fn((file, args, options) => {
+      if (file === 'git') {
+        expect(options.cwd).toBe('/lanes/lane-7');
+        if (args[0] === 'merge-base') return '';
+        if (args[0] === 'rev-list') return `${head} ${fromSha}`;
+        if (args[0] === 'diff-tree') return 'backlog/123-card.md\0';
+        throw Error('not numbering');
+      }
+      expect(file).toBe('gh');
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefOid: head, labels });
+      if (args[0] === 'api' && args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: comments.length } } } } });
+      if (args[0] === 'api') return comments.map(comment => [
+        comment.body.replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\t/g, '\\t'),
+        '2026-10-26T00:00:00Z', comment.author.login, comment.id, '',
+      ].join('\t')).join('\n');
+      if (args[0] === 'label') return '';
+      if (args[1] === 'edit') { labels.splice(0, labels.length, 'red-team:clear'); return ''; }
+      if (args[1] === 'comment') {
+        expect(args).toContain('--body-file');
+        comments.push({ id: 'IC_carry', body: options.input, author: { login: 'web-everything' } });
+        throw Error('lost comment reply');
+      }
+      throw Error(`unexpected command ${file}`);
+    });
+    try {
+      writeRun({ ...newRunRecord({ id: 'review-pr-adapter', op: 'review-pr', input: { repo, pr } }), ...old }, env.WE_SHARED_RUNS_DIR);
+      recordRedTeamStatus({ repo, pr, loopPayload: old, status: 'finished', result: 'skipped' }, { env });
+      const io = createReviewJobIo({ root: dir, env, exec,
+        readEvidence: key => readDrainRedTeamEvidence({ ...key, runsDir: env.WE_SHARED_RUNS_DIR, readScorecards: () => [] }) });
+      const input = { repo, pr, head, readHead: head, redTeam: { status: 'skipped', policy: 'card-only' },
+        carry: { loopPayload: carried, lanePath: '/lanes/lane-7' } };
+      expect(io.settleRedTeamSkip(input).outcome).toBe('non-policy');
+      expect(readRedTeamCarry({ repo, pr, head, env }).step).toBe('label');
+      expect(io.settleRedTeamSkip(input).outcome).toBe('policy-clear');
+      expect(io.settleRedTeamSkip(input).outcome).toBe('already');
+      expect(readRedTeamCarry({ repo, pr, head, env }).step).toBe('done');
+      expect(exec.mock.calls.filter(([file, args]) => file === 'gh' && args[1] === 'edit')).toHaveLength(1);
+      expect(exec.mock.calls.filter(([file, args]) => file === 'gh' && args[1] === 'comment')).toHaveLength(1);
+      expect(readRedTeamStatus({ repo, pr, head, env }).loopPayload.verdict).toBeNull();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each(['after-intent', 'after-label', 'after-comment', 'before-done',
+    'lost-intent-reply', 'lost-label-reply', 'lost-comment-reply'].flatMap(boundary =>
+    ['accept', 'changes'].map(verdict => ({ boundary, verdict }))))(
+    'job and planner resume a $verdict carry after $boundary without a model', ({ boundary, verdict }) => {
+      const dir = mkdtempSync(join(tmpdir(), 'carry-job-crash-'));
+      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_RED_TEAM_SKIP_CARD_ONLY: '1' };
+      const fromSha = 'b'.repeat(40), comments = [], labels = [];
+      const loopPayload = { verdict: { verdict }, findings: { read: {
+        netBasis: { rev: fromSha }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
+      } } };
+      const evidence = key => readDrainRedTeamEvidence({ ...key, env, runsDir: env.WE_SHARED_RUNS_DIR, readScorecards: () => [] });
+      let crash = true;
+      const checkpoint = step => { if (crash && step === boundary) throw Error('crash'); };
+      const writeStatus = vi.fn((value, options) => {
+        recordRedTeamStatus(value, options);
+        checkpoint('lost-intent-reply');
+      });
+      const applyLabel = vi.fn(() => {
+        labels.push('red-team:clear');
+        checkpoint('lost-label-reply');
+      });
+      const postResult = vi.fn(({ body }) => {
+        comments.push({ body, author: { login: 'web-everything' } });
+        checkpoint('lost-comment-reply');
+      });
+      const carryIo = () => createRedTeamCarryIo({ env, readEvidence: evidence,
+        readLive: () => ({ headRefOid: head, labels }), readComments: () => comments,
+        proveMove: () => ({ ok: true }), writeStatus, applyLabel, postResult, checkpoint,
+      });
+      const io = fakeIo({ readRedTeamOnlyPayload: key => ({ ...evidence(key), head }),
+        redTeamSkipCardOnlySetting: () => true, proveCardOnlyHeadMove: () => ({ ok: true }),
+        settleRedTeamSkip: input => settleRedTeamSkip({ ...input, io: {
+          env, carry: carryIo(), publishNeedsYou: vi.fn(),
+        } }),
+      });
+      try {
+        writeRun({ ...newRunRecord({ id: 'review-pr-carry-crash', op: 'review-pr', input: { repo, pr } }), ...loopPayload }, env.WE_SHARED_RUNS_DIR);
+        recordRedTeamStatus({ repo, pr, loopPayload, status: 'finished', result: 'skipped' }, { env });
+        expect(runReviewJob({ repo, pr, redTeamOnly: true }, io).redTeam.outcome).toBe('non-policy');
+        expect(readRedTeamCarry({ repo, pr, head, env }).step).not.toBe('done');
+        expect(planRedTeamOnSkip({ repo, refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }],
+          rawPrs: [{ number: pr, headRefOid: head, comments }], readEvidence: evidence,
+          readStatus: key => readRedTeamStatus({ ...key, env }), proveMove: () => ({ ok: true }),
+          readCarry: key => readRedTeamCarry({ ...key, env }),
+          setting: { enabled: true, retryCooldownMin: 0 }, lastDispatch: new Map(), now: 1000,
+        })[0]).toMatchObject({ action: 'dispatch', mode: 'fresh' });
+        crash = false;
+        expect(runReviewJob({ repo, pr, redTeamOnly: true }, io).redTeam.outcome).toBe('policy-clear');
+        expect(readRedTeamCarry({ repo, pr, head, env }).step).toBe('done');
+        expect(readRedTeamStatus({ repo, pr, head, env }).loopPayload.verdict).toBeNull();
+        expect(writeStatus).toHaveBeenCalledTimes(1);
+        expect(applyLabel).toHaveBeenCalledTimes(1);
+        expect(postResult).toHaveBeenCalledTimes(1);
+        expect(labels).toEqual(['red-team:clear']);
+        expect(comments).toHaveLength(1);
+        expect(io.redTeamStatus).not.toHaveBeenCalled();
+        expect(io.runRedTeam).not.toHaveBeenCalled();
+        expect(io.runLoop).not.toHaveBeenCalled();
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+  it.each(['card-only', 'numbering-only', 'settlement retry'].flatMap(kind =>
+    ['changes', 'accept'].flatMap(verdict => ['before execution', 'during fetch'].map(policyChange => ({ kind, verdict, policyChange }))))) (
+    'live policy off $policyChange refuses $kind recovery of $verdict without settlement or a comment', ({ kind, verdict, policyChange }) => {
+      const fromSha = 'b'.repeat(40), comments = [];
+      const env = { WE_RED_TEAM_SKIP_CARD_ONLY: '1' };
+      const production = createReviewJobIo({ env });
+      const readHead = kind === 'settlement retry' ? head : fromSha;
+      const loopPayload = { verdict: { verdict }, findings: { read: {
+        netBasis: { rev: readHead }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
+      } }, ...(kind === 'settlement retry' ? { carriedFrom: fromSha, verdict: null } : {}) };
+      const evidence = { head, loopPayload, recorded: false, seatRecorded: false,
+        status: { head: readHead, status: 'finished', result: 'skipped', skipCardOnly: true, loopPayload } };
+      const io = fakeIo({ readRedTeamOnlyPayload: () => evidence,
+        redTeamSkipCardOnlySetting: production.redTeamSkipCardOnlySetting,
+        proveCardOnlyHeadMove: () => ({ ok: true, kind }),
+        fetchRedTeamHead: () => { env.WE_RED_TEAM_SKIP_CARD_ONLY = '0'; return { head }; },
+        settleRedTeamSkip: vi.fn(() => comments.push('unexpected policy comment')) });
+      // Resolve at execution, not when the IO is created or when the old skip was written.
+      if (policyChange === 'before execution') env.WE_RED_TEAM_SKIP_CARD_ONLY = '0';
+      expect(runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, io).outcome).toBe('red-team-not-owed');
+      expect(io.settleRedTeamSkip).not.toHaveBeenCalled();
+      expect(io.redTeamStatus).not.toHaveBeenCalled();
+      expect(io.runRedTeam).not.toHaveBeenCalled();
+      expect(comments).toEqual([]);
+    });
+  it.each(['missing', 'throwing', 'unknown'])('refuses %s live policy evidence before admission', kind => {
+    const fromSha = 'b'.repeat(40);
+    const loopPayload = { verdict: null, carriedFrom: fromSha, findings: { read: {
+      netBasis: { rev: head }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
+    } } };
+    const io = fakeIo({ readRedTeamOnlyPayload: () => ({ head, loopPayload, recorded: false, seatRecorded: false,
+      status: { head, status: 'finished', result: 'skipped', skipCardOnly: true, loopPayload } }),
+      redTeamSkipCardOnlySetting: kind === 'missing' ? undefined : () => {
+        if (kind === 'throwing') throw Error('policy unreadable');
+        return undefined;
+      }, settleRedTeamSkip: vi.fn() });
+    expect(runReviewJob({ repo, pr, redTeamOnly: true }, io).outcome).toBe('red-team-not-owed');
+    expect(io.redTeamStatus).not.toHaveBeenCalled();
+    expect(io.settleRedTeamSkip).not.toHaveBeenCalled();
+    expect(io.runRedTeam).not.toHaveBeenCalled();
+  });
+  it.each(['fresh', 'resume'])('a carried accepting payload cannot fall through to a model in %s mode', redTeamMode => {
+    const loopPayload = { ...payload(), carriedFrom: 'b'.repeat(40) };
+    const io = fakeIo({ readRedTeamOnlyPayload: () => ({ head, loopPayload }), settleRedTeamSkip: vi.fn() });
+    expect(runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode }, io).outcome).toBe('red-team-not-owed');
+    expect(io.redTeamStatus).not.toHaveBeenCalled();
+    expect(io.settleRedTeamSkip).not.toHaveBeenCalled();
+    expect(io.runRedTeam).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['missing status', evidence => { evidence.status = null; }],
+    ['wrong status head', evidence => { evidence.status.head = 'b'.repeat(40); }],
+    ['wrong read head', evidence => { evidence.loopPayload.findings.read.netBasis.rev = 'b'.repeat(40); }],
+    ['non-card paths', evidence => { evidence.loopPayload.findings.read.netChangedFiles = ['scripts/code.mjs']; }],
+    ['code rename source', evidence => { evidence.loopPayload.findings.read.netRenameSources = ['scripts/code.mjs']; }],
+    ['missing diff', evidence => { evidence.loopPayload.findings.read.diffText = ''; }],
+    ['policy absent', evidence => { evidence.status.result = { status: 'skipped' }; }],
+    ['policy disabled', evidence => { evidence.status.skipCardOnly = false; }],
+    ['unfinished', evidence => { evidence.status.status = 'queued'; }],
+    ['recorded result', evidence => { evidence.recorded = true; }],
+    ['recorded seat', evidence => { evidence.seatRecorded = true; }],
+    ['unknown seats', evidence => { delete evidence.seatRecorded; }],
+    ['in flight', evidence => { evidence.inFlight = true; }],
+    ['queued', evidence => { evidence.queued = true; }],
+  ])('non-accept settlement retry fails closed for %s in planner and job', (_name, mutate) => {
+    const loopPayload = { verdict: { verdict: 'changes' }, findings: { read: {
+      netBasis: { rev: head }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
+    } } };
+    const evidence = { head, loopPayload, recorded: false, seatRecorded: false,
+      status: { head, status: 'finished', result: { status: 'skipped', policy: 'card-only' },
+        skipCardOnly: true, loopPayload } };
+    mutate(evidence);
+    expect(planRedTeamOnSkip({ repo,
+      refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }],
+      rawPrs: [{ number: pr, headRefOid: head, comments: [] }],
+      readEvidence: () => evidence, readStatus: () => evidence.status,
+      setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(),
+    })[0].action).toBe('skip');
+    const io = fakeIo({ readRedTeamOnlyPayload: () => evidence, settleRedTeamSkip: vi.fn() });
+    expect(runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, io).outcome).toBe('red-team-not-owed');
+    expect(io.settleRedTeamSkip).not.toHaveBeenCalled();
+    expect(io.runRedTeam).not.toHaveBeenCalled();
+  });
+  it('production readRedTeamOnlyPayload preserves historical status, recorded and seatRecorded evidence with the live head', () => {
+    const root = mkdtempSync(join(tmpdir(), 'moved-card-io-read-'));
+    const env = { WE_SHARED_RUNS_DIR: join(root, 'runs'), CONVEYOR_STATE_ROOT: root,
+      WE_RED_TEAM_SKIP_CARD_ONLY: '1' };
+    const fromSha = 'b'.repeat(40);
+    const loopPayload = { verdict: { verdict: 'changes' }, findings: { read: {
+      netBasis: { rev: fromSha }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
+    } } };
+    try {
+      vi.stubEnv('WE_SHARED_RUNS_DIR', env.WE_SHARED_RUNS_DIR);
+      vi.stubEnv('OPERATION_RUNS_DIR', env.WE_SHARED_RUNS_DIR);
+      writeRun({ ...newRunRecord({ id: 'review-pr-moved-card', op: 'review-pr', input: { repo, pr } }),
+        ...loopPayload }, env.WE_SHARED_RUNS_DIR);
+      recordRedTeamStatus({ repo, pr, loopPayload, status: 'finished', result: 'skipped' }, { env });
+      const io = createReviewJobIo({ root, env, exec: () => { throw Error('payload read must not execute commands'); } });
+      expect(io.readRedTeamOnlyPayload({ repo, pr, head })).toMatchObject({ head, loopPayload,
+        recorded: false, seatRecorded: false, completedRecorded: false, inFlight: false,
+        status: { head: fromSha, status: 'finished', result: 'skipped', skipCardOnly: true } });
+    } finally { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); }
+  });
+  it('production proveCardOnlyHeadMove reads every Git object in the review lane with hardened Git env, never the daemon root', () => {
+    const root = mkdtempSync(join(tmpdir(), 'moved-card-io-proof-')), fromSha = 'b'.repeat(40);
+    const lanePath = join(root, 'lane');
+    const exec = vi.fn((file, args, options) => {
+      expect(file).toBe('git');
+      expect(options.cwd).toBe(lanePath);
+      expect(options.env.GIT_NO_LAZY_FETCH).toBe('1');
+      if (args[0] === 'merge-base') return '';
+      if (args[0] === 'rev-list') return `${head} ${fromSha}`;
+      if (args[0] === 'diff-tree') return 'backlog/123-card.md\0';
+      throw Error('not numbering');
+    });
+    try {
+      const io = createReviewJobIo({ root, env: { WE_SHARED_RUNS_DIR: join(root, 'runs') }, exec });
+      expect(io.proveCardOnlyHeadMove({ fromSha, toSha: head, lanePath })).toMatchObject({ ok: true, kind: 'card-only' });
+      expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['diff-tree', '--no-renames', head]),
+        expect.objectContaining({ cwd: lanePath, timeout: 10_000, maxBuffer: 1024 * 1024 }));
+      exec.mockClear();
+      for (const missing of [undefined, '', null]) {
+        expect(io.proveCardOnlyHeadMove({ fromSha, toSha: head, lanePath: missing })).toEqual({ ok: false });
+      }
+      expect(exec).not.toHaveBeenCalled();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('production proveCardOnlyHeadMove proves a real numbering move that rewrites a doc reference with its default reader', () => {
+    const root = mkdtempSync(join(tmpdir(), 'moved-card-io-numbering-'));
+    const git = args => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    const write = (path, text) => { mkdirSync(dirname(join(root, path)), { recursive: true }); writeFileSync(join(root, path), text); };
+    const commit = message => { git(['add', '-A']); git(['commit', '-q', '-m', message]); return git(['rev-parse', 'HEAD']); };
+    try {
+      git(['init', '-q', '-b', 'main']);
+      git(['config', 'user.email', 'test@example.com']);
+      git(['config', 'user.name', 'Moved Card Test']);
+      write('backlog/xabcdef-card.md', '---\nkind: story\n---\nbody\n');
+      write('docs/agent/testing.md', 'See xabcdef.\n');
+      const fromSha = commit('card');
+      git(['update-ref', 'refs/remotes/origin/main', fromSha]);
+      git(['mv', 'backlog/xabcdef-card.md', 'backlog/7001-card.md']);
+      write('backlog/7001-card.md', '---\nbornAs: xabcdef\nkind: story\n---\nbody\n');
+      write('docs/agent/testing.md', 'See 7001.\n');
+      const toSha = commit('drain: JIT-number xabcdef→#7001 at land (#2288)');
+      // The planner's reader proves it; the job's default reader must reach the same verdict.
+      expect(proveCardOnlyHeadMove({ exec: execFileSync, cwd: root, fromSha, toSha })).toMatchObject({ ok: true, commits: [toSha] });
+      // The daemon root is a different (non-repo) directory: the proof must read the lane, where the head was fetched.
+      const daemonRoot = mkdtempSync(join(tmpdir(), 'moved-card-io-daemon-'));
+      try {
+        const io = createReviewJobIo({ root: daemonRoot, env: { ...process.env, WE_SHARED_RUNS_DIR: join(daemonRoot, 'runs') } });
+        expect(io.proveCardOnlyHeadMove({ fromSha, toSha, lanePath: root })).toMatchObject({ ok: true, commits: [toSha] });
+      } finally { rmSync(daemonRoot, { recursive: true, force: true }); }
+      expect(Buffer.isBuffer(execReadRaw('git', ['cat-file', 'blob', `${toSha}:docs/agent/testing.md`], { cwd: root, encoding: null })))
+        .toBe(true);
+      expect(execReadRaw('git', ['rev-parse', 'HEAD'], { cwd: root }).trim()).toBe(toSha);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it.each([false, true].flatMap(failFirstComment => ['changes', 'accept'].map(verdict => ({ failFirstComment, verdict }))))(
+    'fresh recovery settles a moved $verdict skip, retrying a transient comment failure=$failFirstComment without a model', ({ failFirstComment, verdict }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'moved-card-skip-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), CONVEYOR_STATE_ROOT: dir,
+      WE_RED_TEAM_SKIP_CARD_ONLY: '1' };
+    const fromSha = 'b'.repeat(40), comments = [];
+    const loopPayload = { verdict: { verdict }, findings: { read: {
+      netBasis: { rev: fromSha }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
+    } } };
+    const exec = vi.fn((file, args, options) => {
+      expect(file).toBe('git');
+      expect(options.cwd).toBe('/lanes/lane-7');
+      if (args[0] === 'merge-base') return '';
+      if (args[0] === 'rev-list') return `${head} ${fromSha}`;
+      if (args[0] === 'diff-tree') return 'backlog/123-card.md\0';
+      throw Error('not numbering');
+    });
+    const postComment = vi.fn(({ body }) => {
+      if (failFirstComment && postComment.mock.calls.length === 1) throw Error('transient comment failure');
+      comments.push({ body, author: { login: 'web-everything' } });
+    });
+    const production = createReviewJobIo({ root: dir, env, exec });
+    const labels = [];
+    const applyLabel = vi.fn(() => labels.push('red-team:clear'));
+    const io = fakeIo({ readRedTeamOnlyPayload: production.readRedTeamOnlyPayload,
+      redTeamSkipCardOnlySetting: production.redTeamSkipCardOnlySetting,
+      proveCardOnlyHeadMove: vi.fn(production.proveCardOnlyHeadMove),
+      redTeamStatus: vi.fn(production.redTeamStatus),
+      settleRedTeamSkip: input => settleRedTeamSkip({ ...input, io: { env,
+        readComments: () => comments, postComment, publishNeedsYou: vi.fn(),
+        carry: createRedTeamCarryIo({ env,
+          readEvidence: key => production.readRedTeamOnlyPayload(key),
+          readLive: () => ({ headRefOid: head, labels }), readComments: () => comments,
+          proveMove: ({ fromSha, toSha }) => production.proveCardOnlyHeadMove({ fromSha, toSha, lanePath: input.carry.lanePath }),
+          applyLabel, postResult: postComment,
+        }),
+      } }),
+    });
+    try {
+      vi.stubEnv('WE_SHARED_RUNS_DIR', env.WE_SHARED_RUNS_DIR);
+      vi.stubEnv('OPERATION_RUNS_DIR', env.WE_SHARED_RUNS_DIR);
+      writeRun({ ...newRunRecord({ id: 'review-pr-card-settlement', op: 'review-pr', input: { repo, pr } }),
+        ...loopPayload }, env.WE_SHARED_RUNS_DIR);
+      recordRedTeamStatus({ repo, pr, loopPayload, status: 'finished', result: 'skipped' }, { env });
+      expect(readRedTeamStatus({ repo, pr, head, env })).toBeNull();
+      let out = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, io);
+      const plan = () => planRedTeamOnSkip({ repo,
+        refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }],
+        rawPrs: [{ number: pr, headRefOid: head, comments }],
+        readEvidence: () => production.readRedTeamOnlyPayload({ repo, pr, head }),
+        readStatus: () => readRedTeamStatus({ repo, pr, head, env }),
+        setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(),
+      })[0];
+      if (failFirstComment) {
+        expect(out.redTeam).toMatchObject({ status: 'skipped', policy: 'card-only', outcome: 'non-policy' });
+        expect(comments).toHaveLength(0);
+        const persisted = readRedTeamStatus({ repo, pr, head, env });
+        expect(redTeamSkipNeedsSettlement(persisted)).toBe(true);
+        expect(persisted.loopPayload).toMatchObject({ carriedFrom: fromSha, verdict: null,
+          findings: { read: { netBasis: { rev: head } } } });
+        const evidence = production.readRedTeamOnlyPayload({ repo, pr, head });
+        expect(evidence.loopPayload.carriedFrom).toBe(fromSha);
+        expect(redTeamOwedFor(evidence.loopPayload)).toBe(false);
+        expect(plan()).toMatchObject({ action: 'dispatch', mode: 'fresh' });
+        out = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, io);
+        expect(io.proveCardOnlyHeadMove).toHaveBeenCalledTimes(1);
+      }
+      expect(out.redTeam).toMatchObject({ status: 'skipped', policy: 'card-only', outcome: 'policy-clear' });
+      expect(comments).toHaveLength(1);
+      expect(comments[0].body).toContain(redTeamMarker(pr, head));
+      expect(applyLabel).toHaveBeenCalledTimes(1);
+      expect(plan()).toMatchObject({ action: 'skip', why: 'red-team result already on head' });
+      expect(io.proveCardOnlyHeadMove).toHaveBeenCalledWith({ fromSha, toSha: head, lanePath: '/lanes/lane-7' });
+      expect(io.runRedTeam).not.toHaveBeenCalled();
+      expect(io.runLoop).not.toHaveBeenCalled();
+      expect(readRedTeamStatus({ repo, pr, head, env })).toMatchObject({ status: 'finished',
+        result: { status: 'skipped', policy: 'card-only' }, loopPayload: { carriedFrom: fromSha, verdict: null } });
+      expect(loopPayload.findings.read.netBasis.rev).toBe(fromSha);
+    } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('refuses a moved card-only read if the execution-time proof fails', () => {
+    const fromSha = 'b'.repeat(40);
+    const loopPayload = { verdict: { verdict: 'changes' }, findings: { read: {
+      netBasis: { rev: fromSha }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
+    } } };
+    const io = fakeIo({ readRedTeamOnlyPayload: () => ({ head, loopPayload, recorded: false,
+      seatRecorded: false, status: { head: fromSha, status: 'finished', result: 'skipped', skipCardOnly: true, loopPayload } }),
+      proveCardOnlyHeadMove: () => ({ ok: false }), settleRedTeamSkip: vi.fn() });
+    expect(runReviewJob({ repo, pr, redTeamOnly: true }, io).outcome).toBe('red-team-not-owed');
+    expect(io.settleRedTeamSkip).not.toHaveBeenCalled();
+    expect(io.runRedTeam).not.toHaveBeenCalled();
   });
 });
