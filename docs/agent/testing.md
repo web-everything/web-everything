@@ -14,9 +14,14 @@ Run this suite through heavy admission.
 Preparation records per-ref fetch evidence: refreshed tips may be classified; a successful remote absence
 check (`ls-remote --exit-code` status 2 with empty stdout) permits recorded-SHA evidence, ignoring cached tips.
 Failed/unknown fetches and unsafe names preserve registrations. They do not block retirement of independently
-verified overlays. Remaining unavailable registrations emit an `overlay-fetch-unverifiable` alert and are
+verified overlays. Remaining unavailable unpinned registrations emit an `overlay-fetch-unverifiable` alert and are
 excluded from the plan and saved-candidate eligibility, preventing both stale-tip adoption and the planner's
-`ref-gone` removal. In off, shadow and on modes, main and healthy overlays still advance. The next tick retries;
+`ref-gone` removal. In off, shadow and on modes, main and healthy overlays still advance when unavailable
+overlays are unpinned. An unavailable explicit pin, or a mechanism pin identified from the current adopted
+build's inputs, refuses with `pinned-overlay-unavailable` and holds the verified last-good build. Historical
+inputs establish only that refusal; they never authorize building from a stale tip. Rebuild regressions and
+the soak adopt a pin, advance main, fail its refresh, assert preserved content/HEAD/registration, and retry
+with a healthy fetch to verify recovery. The next tick retries;
 restore or re-register deleted branches from recorded SHAs when their content is still needed.
 Containment carriers must have refreshed fetch evidence when preparation supplies it. Select maximal carriers
 only among those available refs: a missing larger or equal tip must not displace a refreshed overlay from the

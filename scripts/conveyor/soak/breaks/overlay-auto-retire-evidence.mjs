@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { prepareRebuild } from '../../../lib/daemon-rebuild/prepare.mjs';
+import { rebuildClone } from '../../../lib/daemon-rebuild.mjs';
 import { ACTIVE_BUILD_TOKENS, releaseBuildLease } from '../../../lib/daemon-rebuild/lease.mjs';
 import { readRebuildState, writeRebuildState } from '../../../lib/daemon-rebuild/state.mjs';
 import { overlayFilePath, readOverlayState, removeOverlay, writeOverlays } from '../../../lib/daemon-overlays.mjs';
@@ -11,7 +12,7 @@ import { autoRetireOverlays } from '../../../lib/daemon-overlay-auto-retire.mjs'
 
 export default {
   id: 'overlay-auto-retire-evidence',
-  title: 'stale overlays preserve registrations without blocking healthy rebuilds or repeating shadow audit',
+  title: 'stale overlays preserve registrations and adopted pins without repeating shadow audit',
   card: 'PR #5964',
   fixedBy: { sha: 'pr-5964-repair', where: 'lane/overlay-auto-retire', paths: [
     'scripts/lib/daemon-overlay-auto-retire.mjs', 'scripts/lib/daemon-rebuild/prepare.mjs',
@@ -21,6 +22,7 @@ export default {
     try {
       return readFileSync(join(root, 'scripts/lib/daemon-overlay-auto-retire.mjs'), 'utf8').includes("r.sources.mode === 'tool'")
         && readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8').includes('refEvidence: fetchResult.refEvidence')
+        && readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8').includes('const plan = unavailablePinned ??')
         && readFileSync(join(root, 'scripts/lib/daemon-overlays.mjs'), 'utf8').includes('expectedRequiredOverlay');
     } catch { return false; }
   },
@@ -32,6 +34,7 @@ export default {
       WE_DAEMON_OVERLAY_DIR: join(root, 'store'), WE_DAEMON_STATE_DIR: join(root, 'state'),
       WE_DAEMON_EVENTS: join(root, 'events.jsonl'), WE_PLATFORM_PREFERENCES_FILE: join(root, 'prefs.json'),
       WE_DAEMON_AUTO_REBASE: '0', WE_DAEMON_OVERLAY_AUTO_RETIRE: 'shadow',
+      WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks'), WE_DAEMON_REBUILD_SKIP_UNRELATED: '0',
     };
     const git = (args) => spawnSync('git', ['-c', 'user.name=Soak', '-c', 'user.email=soak@example.test', ...args], {
       cwd: root, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
@@ -144,6 +147,32 @@ export default {
       if (healthy.terminal || healthy.plan?.mainSha !== nextMain || healthy.plan?.applied.map((o) => o.ref).join(',') !== 'feature'
         || readOverlayState(root, { env }).overlays.length !== stale.length) {
         violation('single-stale-registration-blocks-healthy-overlay', `a deleted no-sha or unsafe registration stopped the healthy overlay plan (${healthy.result?.reason ?? 'non-terminal plan'})`);
+      }
+      // Adopt a pinned feature, then lose only its refresh while main advances. The running
+      // feature must survive the outage, and the next healthy tick must catch up with main.
+      writeOverlays(root, [{ ref: 'feature', pinned: true }], { env });
+      const rebuild = (run = git) => rebuildClone({ root, env, run,
+        runSmoke: async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }),
+        prState: async () => 'OPEN', prBaseChain: async () => [], lockOpts: { waitMs: 2000, pollMs: 20 } });
+      const adopted = await rebuild();
+      if (!adopted.adopted || readFileSync(join(root, 'feature'), 'utf8') !== 'feature') {
+        throw new Error(`pinned fixture was not adopted: ${adopted.reason}`);
+      }
+      const pinnedHead = ok('rev-parse', 'HEAD');
+      const advanced = ok('commit-tree', `${nextMain}^{tree}`, '-p', nextMain, '-m', 'advance main during outage');
+      ok('push', '-q', 'origin', `${advanced}:refs/heads/main`);
+      const failed = await rebuild((args) => args[0] === 'fetch' && args.some((a) => a.includes('refs/heads/feature:'))
+        ? { status: 1, stdout: '', stderr: 'injected refresh failure' } : git(args));
+      if (failed.moved || failed.reason !== 'pinned-overlay-unavailable' || ok('rev-parse', 'HEAD') !== pinnedHead
+        || readRebuildState(root, env).held?.lastGood !== pinnedHead
+        || readFileSync(join(root, 'feature'), 'utf8') !== 'feature'
+        || !readOverlayState(root, { env }).overlays.some((o) => o.ref === 'feature' && o.pinned)) {
+        violation('failed-refresh-loses-adopted-pin', `expected last-good hold, got ${failed.reason}`);
+      }
+      const recovered = await rebuild();
+      if (!recovered.adopted || readFileSync(join(root, 'feature'), 'utf8') !== 'feature'
+        || readRebuildState(root, env).held) {
+        violation('pinned-refresh-does-not-recover', `healthy retry failed: ${recovered.reason}`);
       }
     } catch (error) { violation('crash', String(error?.message ?? error)); }
     finally { rmSync(root, { recursive: true, force: true }); }

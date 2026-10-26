@@ -1908,7 +1908,44 @@ describe('rebuildClone — pinned overlays never conflict-drop (self-destruct gu
     expect(readOverlays(cloneDir, { env })[0]).toMatchObject({ ref: 'lane/pinned-plain', pinned: true });
   });
 
-  it('a pinned overlay whose ref vanished stays registered without blocking main advancement', async () => {
+  it.each(['off', 'shadow', 'on'].flatMap((mode) => ['flag', 'mechanism'].flatMap((pin) =>
+    ['transient', 'deleted'].map((failure) => [mode, pin, failure]))))(
+    'failed refresh preserves an adopted pinned overlay (%s, %s, %s)', async (mode, pin, failure) => {
+      const { originDir, cloneDir, env } = makeFixture();
+      env.WE_DAEMON_OVERLAY_AUTO_RETIRE = mode;
+      const file = pin === 'flag' ? 'pinned.txt' : 'scripts/lib/daemon-rebuild.mjs';
+      pushBranch(originDir, 'lane/pinned-refresh', (dir) => writeFile(dir, file, 'pinned content\n'));
+      addOverlay(cloneDir, { ref: 'lane/pinned-refresh', pinned: pin === 'flag' }, { env });
+      const first = await rebuildClone({ root: cloneDir, env, runSmoke: passSmoke(), lockOpts: LOCK_OPTS });
+      expect(first).toMatchObject({ moved: true, adopted: true });
+      const headBefore = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+      const overlaySha = readRebuildState(cloneDir, env).adopted.applied.find((o) => o.ref === 'lane/pinned-refresh').sha;
+      const registrations = readOverlays(cloneDir, { env });
+      advanceMain(originDir, (dir) => writeFile(dir, 'main-after-pin.txt', 'advanced\n'));
+      if (failure === 'deleted') deleteBranch(originDir, 'lane/pinned-refresh');
+      const runSmoke = passSmoke();
+      const run = (args, opts = {}) => {
+        if (failure === 'transient' && args[0] === 'fetch' && args.some((arg) => arg.includes('refs/heads/lane/pinned-refresh:'))) {
+          return { status: 1, stdout: '', stderr: 'injected transient overlay fetch failure' };
+        }
+        return gitRun(args, { cwd: cloneDir, env: { ...env, ...opts.env } });
+      };
+      const second = await rebuildClone({ root: cloneDir, env, run, runSmoke, lockOpts: LOCK_OPTS });
+      expect(second).toMatchObject({ moved: false, reason: 'pinned-overlay-unavailable', detail: { pinnedBy: pin } });
+      expect(runSmoke).not.toHaveBeenCalled();
+      expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(headBefore);
+      expect(readFileSync(join(cloneDir, file), 'utf8')).toBe('pinned content\n');
+      expect(readOverlays(cloneDir, { env })).toEqual(registrations);
+      expect(readRebuildState(cloneDir, env).held).toMatchObject({ reason: 'pinned-overlay-unavailable', lastGood: headBefore });
+      if (failure === 'deleted') gitOk(cloneDir, ['push', '-q', 'origin', `${overlaySha}:refs/heads/lane/pinned-refresh`]);
+      const recovered = await rebuildClone({ root: cloneDir, env, runSmoke: passSmoke(), lockOpts: LOCK_OPTS });
+      expect(recovered).toMatchObject({ moved: true, adopted: true });
+      expect(readFileSync(join(cloneDir, file), 'utf8')).toBe('pinned content\n');
+      expect(readFileSync(join(cloneDir, 'main-after-pin.txt'), 'utf8')).toBe('advanced\n');
+      expect(readRebuildState(cloneDir, env).held).toBeNull();
+    });
+
+  it('a pinned overlay whose ref vanished refuses advancement and stays registered', async () => {
     const { originDir, cloneDir, env } = makeFixture();
     pushBranch(originDir, 'lane/pinned-gone', (dir) => writeFile(dir, 'g.txt', 'g\n'));
     addOverlay(cloneDir, { ref: 'lane/pinned-gone', pinned: true }, { env });
@@ -1918,9 +1955,16 @@ describe('rebuildClone — pinned overlays never conflict-drop (self-destruct gu
     const result = await rebuildClone({
       root: cloneDir, env, runSmoke: passSmoke(), prState: async () => null, lockOpts: LOCK_OPTS,
     });
-    expect(result).toMatchObject({ moved: true, adopted: true });
+    expect(result).toMatchObject({ moved: false, reason: 'pinned-overlay-unavailable' });
+    expect(existsSync(join(cloneDir, 'main-after-pin.txt'))).toBe(false);
+    expect(result.alerts.some((a) => a.kind === 'pinned-overlay-unavailable')).toBe(true);
+    expect(readOverlays(cloneDir, { env }).map((o) => o.ref)).toEqual(['lane/pinned-gone']);
+
+    const mainOnly = await rebuildClone({
+      root: cloneDir, env, mainOnly: true, runSmoke: passSmoke(), lockOpts: LOCK_OPTS,
+    });
+    expect(mainOnly).toMatchObject({ moved: true, adopted: true });
     expect(readFileSync(join(cloneDir, 'main-after-pin.txt'), 'utf8')).toBe('advanced\n');
-    expect(result.alerts.some((a) => a.kind === 'overlay-fetch-unverifiable')).toBe(true);
     expect(readOverlays(cloneDir, { env }).map((o) => o.ref)).toEqual(['lane/pinned-gone']);
   });
 

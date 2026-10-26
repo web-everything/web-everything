@@ -23,7 +23,7 @@ import {
   readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode, persistStackBases,
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
-import { planRebuild } from './plan.mjs';
+import { planRebuild, pinnedStatus, PINNED_OVERLAY_GONE_MESSAGE } from './plan.mjs';
 import { autoRetireOverlays } from '../daemon-overlay-auto-retire.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
@@ -277,11 +277,28 @@ export async function prepareRebuild({
       }
     } catch (error) { alert('overlay-auto-retire-failed', { error: String(error?.message || error) }); }
   }
-  // Preserve unavailable registrations, but hold only those overlays out of this plan. Main and independently
-  // refreshed overlays must still advance in every retirement mode. Never build from cached overlay tips.
+  // Preserve unavailable registrations without building from cached tips. Unpinned overlays may be skipped,
+  // but an unavailable pin must use the normal refusal/last-good hold path before any new build is adopted.
   const overlaysForPlan = overlaysBefore.filter((o) => fetchResult.refEvidence.get(o?.ref) === 'refreshed');
   const unverified = overlaysBefore.filter((o) => fetchResult.refEvidence.get(o?.ref) !== 'refreshed');
-  if (!mainOnly && unverified.length) {
+  let unavailablePinned = null;
+  if (!mainOnly) {
+    for (const raw of unverified) {
+      // Fetch cleanup may have deleted the tracking ref. The last adopted inputs still identify the
+      // mechanism this clone runs; use them only to refuse a loss, never as fresh build/retirement inputs.
+      const adopted = state.adopted?.head === prevHead
+        ? state.adopted.applied?.find((o) => o.ref === raw.ref) : null;
+      const pin = pinnedStatus(git, raw, state.adopted?.mainSha ?? fetchedMainSha, adopted?.sha);
+      if (!pin.pinned) continue;
+      unavailablePinned = {
+        ok: false, reason: 'pinned-overlay-unavailable',
+        detail: { ref: raw.ref, pr: raw.pr ?? null, sha: adopted?.sha ?? null,
+          dropReason: 'ref-unavailable', pinnedBy: pin.why, message: PINNED_OVERLAY_GONE_MESSAGE },
+      };
+      break;
+    }
+  }
+  if (!mainOnly && unverified.length && !unavailablePinned) {
     const detail = { refs: unverified.map((o) => o?.ref), message: 'Overlay tips unavailable; preserving registrations and skipping these overlays for this rebuild. Retrying next tick; restore or re-register deleted branches from their recorded SHA.' };
     alert('overlay-fetch-unverifiable', detail);
   }
@@ -299,7 +316,7 @@ export async function prepareRebuild({
   // The PR base chains come from gh, else from each entry's recorded `stackBases`, else ancestry alone.
   const stack = resolveOverlayStackMode(env);
   const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysForPlan, env });
-  const plan = await planRebuild({
+  const plan = unavailablePinned ?? await planRebuild({
     git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysForPlan, prState, mainOnly, edgeResolve,
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
