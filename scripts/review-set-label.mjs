@@ -64,6 +64,7 @@ import { basename, dirname, join, resolve, sep } from 'node:path';
 import { readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readPinnedChangedFiles, workflowEditHold } from './lib/merge-queue-enqueue.mjs';
 // Rebase resolution (2026-08-08): the UNION of both sides. `buildReviewedDiffMarker` is #2979's accept
 // fingerprint, `READY_TO_MERGE_LABEL` is #2832's hold invariant, `buildReviewedContributionMarker` is
@@ -98,6 +99,44 @@ import {
 // #4140 — `decideRestampHumanClearance` names the carried clearance's actor from TRUSTED comments only, so a later
 // untrusted `cleared-human` marker cannot rename it (the other three parsers it reaches gate themselves).
 import { isTrustedMarkerAuthor } from './lib/marker-authorship.mjs';
+import { REARM_COMMENT_MARKER } from './conveyor/rearm-review.mjs';
+import { sleepSyncMs } from './readiness/drain-lock.mjs';
+
+export const CHANGES_VERDICT_PREFIX = '🔁 review — changes requested';
+
+/** Share the same verdict selection between the re-arm writer and orphan recovery. */
+export function latestChangesVerdict(comments) {
+  let latest = null, latestAt = -Infinity;
+  for (const c of Array.isArray(comments) ? comments : []) {
+    const at = Date.parse(c?.createdAt ?? c?.created_at ?? '');
+    if (isTrustedMarkerAuthor(c) && String(c?.body ?? '').trimStart().startsWith(CHANGES_VERDICT_PREFIX)
+      && Number.isFinite(at) && at >= latestAt) { latest = c; latestAt = at; }
+  }
+  return latest;
+}
+
+/** Node ids agree across GraphQL's id and REST's node_id. Include the body so an
+ * edited verdict is not silently covered either. Without identity, claim no coverage. */
+export function rearmVerdictKey(verdict) {
+  const id = verdict?.node_id ?? verdict?.id;
+  const at = Date.parse(verdict?.createdAt ?? verdict?.created_at ?? '');
+  if (typeof id !== 'string' || !id || !Number.isFinite(at) || typeof verdict?.body !== 'string') return null;
+  return createHash('sha256').update(JSON.stringify([id, at, verdict.body])).digest('hex');
+}
+
+export function buildRearmVerdictBinding(verdict) {
+  return `\n\n<!-- rearm-verdict-v1: ${rearmVerdictKey(verdict) ?? 'none'} -->`;
+}
+
+/** Legacy markers retain their chronological meaning. A new or malformed binding
+ * never falls back to chronology: it must identify this exact verdict. */
+export function rearmCoversVerdict(body, verdict) {
+  const text = String(body ?? '');
+  if (!text.includes('rearm-verdict-')) return true;
+  const markers = text.match(/rearm-verdict-/g);
+  const key = text.match(/^<!-- rearm-verdict-v1: ([0-9a-f]{64}) -->$/m)?.[1];
+  return markers.length === 1 && !!key && key === rearmVerdictKey(verdict);
+}
 
 import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward, laterReviewHold } from './lib/accept-carry-forward.mjs'; // card xu7kxtt
 import { referralCardReadable } from './lib/referral-card-readable.mjs';
@@ -1065,6 +1104,8 @@ export function runReviewLabelCli({
   // Injected so the WRITE ARC — above all the #2964 ordering below — is assertable without `gh`,
   // which it never was: the suite could only reach this function's pure helpers and its refusals.
   provider = createGhProvider(),
+  // Pinned re-arm marker retries are bounded to three attempts; tests inject a no-op delay.
+  rearmRetrySleep = sleepSyncMs,
   readTrialStore = readStore,
   logTrialFn = logDelegationTrial,
   trialLogIo = {},
@@ -1144,8 +1185,11 @@ export function runReviewLabelCli({
   if (onlyIf !== null && !['accepted', 'missing'].includes(onlyIf)) {
     fail("invalid --only-if — expected 'accepted' or 'missing'");
   }
-  if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, missing re-arm or a pinned accept');
+  const pinnedRearm = to === 'rearm' && expectHeadFlag !== undefined;
+  const pinnedPlainRearm = pinnedRearm && onlyIf !== 'missing';
+  if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && !pinnedRearm && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, re-arm or a pinned accept');
   if (onlyIf === 'missing' && (!/^[0-9a-f]{40}$/.test(expectedHead || '') || newHeadArg)) fail('missing re-arm requires --expect-head=<full 40-hex SHA>');
+  if (pinnedRearm && !/^[0-9a-f]{40}$/.test(expectedHead || '')) fail('re-arm requires --expect-head=<full 40-hex SHA>');
   if (onlyIf !== null && to !== 'rearm') {
     fail('--only-if is only valid with the rearm target');
   }
@@ -1323,7 +1367,7 @@ export function runReviewLabelCli({
   if (to === 'rearm' && !prCommentsReadable) refuseRearm('comments unreadable — cannot prove no human clearance');
   if (to === 'rearm' && !/^[0-9a-f]{7,40}$/i.test(headSha.trim())) refuseRearm('head unreadable — cannot prove no human clearance');
 
-  if ((guardedRestamp || pinnedAccept || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
+  if ((guardedRestamp || pinnedAccept || pinnedRearm || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
   if (expectNoReadiness && hasReviewLabel(currentLabels, READY_TO_MERGE_LABEL)) {
     fail('missing review handoff refused: producer readiness appeared after the caller observation', 1);
   }
@@ -1437,14 +1481,14 @@ export function runReviewLabelCli({
   // PR #5482: RULING NEEDED advertises this ceremony as the not-real ruling on a red-team break held at the round cap.
   // On an accepted PR the ceremony's comment is that ruling. It never manufactures an acceptance: a PR without
   // `review:accepted` still owes its review first. A round-capped thread is long, so read all of it when the page is full.
-  const fullThread = (page = prComments, threadHead = headSha) => {
+  const fullThread = (page = prComments, threadHead = headSha, refuse = refuseRearm) => {
     if (page.length < PR_COMMENTS_PAGE_SIZE) return page;
     let comments;
     try { comments = provider.readComments(repo, pr); } catch (e) {
-      if (to === 'rearm') return refuseRearm('comments unreadable — cannot prove no human clearance');
+      if (to === 'rearm') return refuse('comments unreadable — cannot prove no human clearance');
       return fail(ghErr(e, 'complete comment thread unreadable'), 1);
     }
-    if (to === 'rearm' && !Array.isArray(comments)) refuseRearm('comments unreadable — cannot prove no human clearance');
+    if (to === 'rearm' && !Array.isArray(comments)) refuse('comments unreadable — cannot prove no human clearance');
     if (to === 'rearm') {
       const ids = c => [c?.node_id, c?.id, c?.url, c?.html_url].filter(v => v !== undefined && v !== null && v !== '');
       const normalizeLogin = login => typeof login === 'string' ? login.toLowerCase().replace(/\[bot\]$/, '') : login;
@@ -1458,13 +1502,28 @@ export function runReviewLabelCli({
       }));
       if (!covered) {
         // Even an incomplete read cannot undo clearance already visible on the embedded page.
-        if (headEverHumanCleared(page, threadHead.trim())) refuseRearm('head carries a human clearance — a rearm never undoes it');
-        refuseRearm('comments unreadable — cannot prove no human clearance');
+        if (headEverHumanCleared(page, threadHead.trim())) refuse('head carries a human clearance — a rearm never undoes it');
+        refuse('comments unreadable — cannot prove no human clearance');
       }
       return [...page, ...comments];
     }
     return comments;
   };
+  const rearmThread = to === 'rearm' ? fullThread() : null;
+  // Capture before either write; a send-back during the swap or comment must not
+  // become the verdict this older re-arm claims to have handled.
+  const rearmVerdict = to === 'rearm' ? latestChangesVerdict(rearmThread) : null;
+  const rearmBinding = to === 'rearm' ? buildRearmVerdictBinding(rearmVerdict) : '';
+  const coveringRearm = (comments, verdict) => verdict && comments.slice(comments.indexOf(verdict) + 1)
+    .some(c => isTrustedMarkerAuthor(c) && String(c?.body ?? '').trimStart().startsWith(REARM_COMMENT_MARKER)
+      && rearmCoversVerdict(c.body, verdict));
+  // A prior process may have died between the swap and marker. Only a pinned,
+  // ordinary pending PR with an identifiable verdict can resume that missing write.
+  const resumePinnedRearm = pinnedPlainRearm && onlyIf === null && !!rearmVerdictKey(rearmVerdict)
+    && hasReviewLabel(currentLabels, REVIEW_LABELS.pending)
+    && ![REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.human, REVIEW_LABELS.heldMechanical]
+      .some(label => hasReviewLabel(currentLabels, label))
+    && !headEverHumanCleared(rearmThread, headSha.trim());
   const redTeamRulingHold = to === 'clear-human' && hasReviewLabel(currentLabels, REVIEW_LABELS.accepted)
     && !hasReviewLabel(currentLabels, REVIEW_LABELS.human) && !hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical)
     && redTeamRulingHeld({ repo, pr, headSha, labels: currentLabels, comments: fullThread(), setting: readConfirmedBreaks().value, readGrantScope });
@@ -1477,8 +1536,17 @@ export function runReviewLabelCli({
     humanOnlyHold,
     redTeamRulingHold,
     acceptanceStillCoversHead: parseReviewedSha(prComments.filter(isTrustedMarkerAuthor)) === headSha,
-    humanClearedHead: to === 'rearm' && headEverHumanCleared(fullThread(), headSha.trim()),
+    humanClearedHead: to === 'rearm' && headEverHumanCleared(rearmThread, headSha.trim()),
   });
+  if (resumePinnedRearm) {
+    decision = { ...decision, allowed: true, addLabel: REVIEW_LABELS.pending, removeLabels: [],
+      rearmFrom: REVIEW_LABELS.pending, reason: 'resuming the marker for a pinned pending re-arm' };
+    if (coveringRearm(rearmThread, rearmVerdict)) {
+      emit(`${JSON.stringify(successResult({ pr: Number(pr), to, decision,
+        labels: currentLabels.map(l => typeof l === 'string' ? l : l.name) }))}\n`);
+      process.exit(0);
+    }
+  }
   if (!decision.allowed && !restampAcrossHold) {
     emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision }))}\n`);
     process.exit(1);
@@ -1700,6 +1768,9 @@ export function runReviewLabelCli({
     };
   };
   const originalEvidence = guardedRestamp ? carryEvidence(prComments) : null;
+  // Compensation must not restore an old verdict after newer trusted evidence
+  // arrived, even when the head and labels have not changed yet.
+  const rearmRollbackEvidence = pinnedPlainRearm ? JSON.stringify(carryEvidence(rearmThread)) : null;
   if (guardedRestamp) {
     const coverage = acceptanceCoversHead({ ...originalEvidence, headSha: expectedHead,
       headDiff: reviewedDiff, headContribution: reviewedDiff });
@@ -1756,7 +1827,7 @@ export function runReviewLabelCli({
   // that are size-checked, written and posted are the same bytes.
   const commentBody = buildComment({
     to, actor, decision, headSha, reason: clearReason, reviewedDiff, clearerId, independence, humanClearance,
-  }) + renderReferralCarryRecord(referralCarry);
+  }) + renderReferralCarryRecord(referralCarry) + rearmBinding;
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — THE SIZE GUARD, on the RENDERED bytes, before ANY write.
   // GitHub rejects a comment over `GH_COMMENT_MAX`. The cause this guard exists for: an oversize comment used to
@@ -1833,13 +1904,24 @@ export function runReviewLabelCli({
     if (live !== expectedHead) fail('live head differs from --expect-head; nothing written', 1);
   }
 
-  const recheckRearmClearance = () => {
+  // Check the pin before each write. At the label write, reuse the clearance check's
+  // fresh state so a push during that read cannot bypass the pin.
+  const assertPinnedRearmHead = (fresh) => {
+    if (pinnedRearm && onlyIf !== 'missing' && (fresh ?? provider.readPrState(repo, pr)).headRefOid !== expectedHead) {
+      throw new Error('live head differs from --expect-head');
+    }
+  };
+  const recheckRearmClearance = ({ refuse = refuseRearm,
+    readError = e => fail(ghErr(e, 'gh pr view failed'), 1) } = {}) => {
     let fresh;
-    try { fresh = provider.readPrState(repo, pr); } catch (e) { fail(ghErr(e, 'gh pr view failed'), 1); }
-    if (!Array.isArray(fresh.comments)) refuseRearm('comments unreadable — cannot prove no human clearance');
-    if (typeof fresh.headRefOid !== 'string' || !/^[0-9a-f]{7,40}$/i.test(fresh.headRefOid.trim())) refuseRearm('head unreadable — cannot prove no human clearance');
-    const freshComments = fullThread(fresh.comments, fresh.headRefOid).filter(isTrustedMarkerAuthor);
-    if (headEverHumanCleared(freshComments, fresh.headRefOid.trim())) refuseRearm('head carries a human clearance — a rearm never undoes it');
+    try {
+      fresh = provider.readPrState(repo, pr);
+      assertPinnedRearmHead(fresh);
+    } catch (e) { return readError(e); }
+    if (!Array.isArray(fresh.comments)) refuse('comments unreadable — cannot prove no human clearance');
+    if (typeof fresh.headRefOid !== 'string' || !/^[0-9a-f]{7,40}$/i.test(fresh.headRefOid.trim())) refuse('head unreadable — cannot prove no human clearance');
+    const freshComments = fullThread(fresh.comments, fresh.headRefOid, refuse).filter(isTrustedMarkerAuthor);
+    if (headEverHumanCleared(freshComments, fresh.headRefOid.trim())) refuse('head carries a human clearance — a rearm never undoes it');
     return { fresh, freshComments };
   };
   // Missing-only rearm rechecks before any write and again at the label swap: clearance can arrive during the comment.
@@ -1928,6 +2010,7 @@ export function runReviewLabelCli({
   // we:scripts/review-set-label.mjs#runReviewLabelCli — THE SWAP: add the verdict label, remove the stale ones
   // (argv array, no shell). Intersect the decision's removals with the labels the PR ACTUALLY carries so
   // `gh pr edit --remove-label` is never handed an absent label (which errors).
+  let preSwapLabels;
   const applySwap = () => {
     try {
       if (['accepted', 'restamp', 'clear-human'].includes(to)) {
@@ -1945,7 +2028,18 @@ export function runReviewLabelCli({
       fail(ghErr(e, 'gh pr edit failed'), 1);
     }
     recheckMissingRearm();
-    if (to === 'rearm') recheckRearmClearance();
+    if (to === 'rearm') {
+      const { fresh } = recheckRearmClearance();
+      if (pinnedPlainRearm) {
+        if (!Array.isArray(fresh.labels) || !fresh.labels.every(l => {
+          const name = typeof l === 'string' ? l : l?.name;
+          return typeof name === 'string' && name.length > 0;
+        })) {
+          fail('pre-swap labels unreadable — cannot guarantee re-arm rollback', 1);
+        }
+        preSwapLabels = fresh.labels.map(l => typeof l === 'string' ? l : l.name);
+      }
+    }
     try {
       provider.setLabels(repo, pr, { add: decision.addLabel, remove: removals });
     } catch (e) {
@@ -1957,20 +2051,67 @@ export function runReviewLabelCli({
   // shell-quoting pitfalls (emoji/newlines), then `--body-file`. This is the half that carries the `reviewed-sha`
   // (and `reviewed-diff`) marker the #2409 staleness gate reads.
   const postComment = () => {
-    try {
-      provider.postComment(repo, pr, commentBody);
-    } catch (e) {
-      fail(ghErr(e, 'gh pr comment failed'), 1);
+    let commentFailure;
+    for (let attempt = 0; attempt < (pinnedPlainRearm ? 3 : 1); attempt++) {
+      // Keep pin failures outside the provider retry catch: a moved head must
+      // never receive a marker (or a compensating label write) for the old head.
+      if (resumePinnedRearm) {
+        const { fresh, freshComments } = recheckRearmClearance();
+        if (!hasReviewLabel(fresh.labels, REVIEW_LABELS.pending)
+          || [REVIEW_LABELS.changes, REVIEW_LABELS.accepted, REVIEW_LABELS.human, REVIEW_LABELS.heldMechanical]
+            .some(label => hasReviewLabel(fresh.labels, label))) fail('pending re-arm state changed before marker write', 1);
+        const verdict = latestChangesVerdict(freshComments);
+        if (rearmVerdictKey(verdict) !== rearmVerdictKey(rearmVerdict)) fail('latest changes verdict changed before marker write — retry the pinned re-arm', 1);
+        if (coveringRearm(freshComments, verdict)) return;
+      } else {
+        try { assertPinnedRearmHead(); } catch (e) { fail(ghErr(e, 'gh pr comment failed'), 1); }
+      }
+      try {
+        provider.postComment(repo, pr, commentBody);
+        return;
+      } catch (e) { commentFailure = ghErr(e, 'gh pr comment failed'); }
+      if (pinnedPlainRearm && attempt < 2) rearmRetrySleep(1000);
     }
+    if (!pinnedPlainRearm) fail(commentFailure, 1);
+    if (resumePinnedRearm) fail(`${commentFailure}; PR is review:pending without a marker — retry the same pinned re-arm`, 1);
+    try {
+      const { fresh, freshComments } = recheckRearmClearance({
+        refuse: reason => { throw new Error(reason); },
+        readError: e => { throw e; },
+      });
+      if (JSON.stringify(carryEvidence(freshComments)) !== rearmRollbackEvidence) {
+        throw new Error('review verdict evidence changed before rollback — newer review state retained');
+      }
+      if (!Array.isArray(fresh.labels) || !fresh.labels.every(l => {
+        const name = typeof l === 'string' ? l : l?.name;
+        return typeof name === 'string' && name.length > 0;
+      })) throw new Error('rollback labels unreadable — cannot prove the re-arm state is unchanged');
+      const relevantLabels = labels => [...new Set(labels.filter(name =>
+        name.startsWith('review:') || decision.removeLabels.includes(name) || name === decision.addLabel))].sort();
+      const expectedLabels = [...preSwapLabels.filter(name => !removals.includes(name)), ...(decision.addLabel ? [decision.addLabel] : [])];
+      if (JSON.stringify(relevantLabels(fresh.labels.map(l => typeof l === 'string' ? l : l.name)))
+        !== JSON.stringify(relevantLabels(expectedLabels))) {
+        throw new Error('re-arm labels changed before rollback — newer review state retained');
+      }
+      // Invert only this swap. Restore every removed pre-swap label, and remove
+      // the new pending hold only if it was absent before the attempt.
+      provider.setLabels(repo, pr, {
+        add: removals.filter(label => preSwapLabels.includes(label)).join(','),
+        remove: decision.addLabel && !preSwapLabels.includes(decision.addLabel) ? [decision.addLabel] : [],
+      });
+    } catch (e) {
+      fail(`${commentFailure}; rollback failed: ${ghErr(e, 'gh pr edit failed')}; review:pending without a marker may remain — inspect the current review state before retrying the pinned re-arm`, 1);
+    }
+    fail(`${commentFailure}; pre-swap labels restored — no re-arm attempt consumed; retry the pinned re-arm`, 1);
   };
 
   // #2964 — THE ORDER THESE TWO LAND IN IS THE SAFETY PROPERTY, and it is NOT the same order in both cases.
   //
-  // They are two non-atomic `gh` calls with no rollback and no retry, so one of them can land alone. Which half is
+  // They are two non-atomic `gh` calls, so one of them can land alone. Which half is
   // SAFE TO LOSE depends on one thing: whether `review:accepted` is ALREADY live on this PR.
   //
   //   • NOT already accepted (the ordinary first accept, and every `changes` / `rearm` / `clear-human` bounce) —
-  //     COMMENT FIRST. An orphan comment is INERT: `parseReviewedSha` is only ever reached behind a live
+  //     COMMENT FIRST, except the pinned plain re-arm below. An orphan acceptance comment is INERT: `parseReviewedSha` is only ever reached behind a live
   //     `review:accepted` check (lazily, inside `if (hasReviewLabel(...accepted))` in `we:scripts/merge-ai-prs.mjs`,
   //     and again inside `decideReviewGate`'s accepted branch), so a marker with no label behind it is never read
   //     and the command stays re-runnable. An orphan LABEL is not inert: `review:accepted` with no marker makes
@@ -1997,15 +2138,25 @@ export function runReviewLabelCli({
   // The test is keyed on the LABEL, not on `to`, on purpose: `buildComment` is caller-supplied, so this harness
   // cannot know whether a given importer's body stamps a marker. Assuming it might is the conservative direction.
   //
-  // SAY WHAT THIS DOES NOT BUY: the act is STILL NOT ATOMIC. Two non-atomic calls remain two non-atomic calls —
-  // this relocates the partial state onto the half that is safe to lose in each case, it does not eliminate it.
-  // Closing it fully needs reconciliation or rollback, which is not what this is.
+  // PINNED PLAIN RE-ARM: swap first, then try the marker at most three times. Its
+  // marker counts a repair round even with review:changes still live, so posting
+  // first could suppress orphan recovery after a failed swap. If all posts fail,
+  // invert the swap to restore the exact pre-swap label set: no marker means no
+  // consumed round. A rollback failure explicitly reports pending without a marker.
+  // Every write, including retries and rollback, rechecks --expect-head. A pin
+  // failure stops writes; the pending state can be resumed using that same pin.
+  // A process death between swap and marker is recovered by a pinned pending-only
+  // retry: post just the missing marker, bound to the latest changes verdict.
+  // A trusted covering marker AFTER that verdict in thread order (including within
+  // the same timestamp second) makes resume a no-op. Human clearance still refuses.
+  // Other targets and missing-only recovery retain their own ordering protocol.
   // #x8xf5rl — the order now comes from the PURE `writeOrder`, so the property this block spends forty lines
   // explaining is finally assertable. The steps themselves are unchanged; only the choosing moved.
   const acceptanceAlreadyLive = hasReviewLabel(currentLabels, REVIEW_LABELS.accepted);
   // Guarded carry leaves the live acceptance label alone; its fresh-state check already ran before the ledger.
   const steps = { comment: postComment, swap: guardedRestamp ? () => {} : applySwap };
-  for (const step of writeOrder({ acceptanceAlreadyLive })) { steps[step](); }
+  const order = resumePinnedRearm ? ['comment'] : pinnedPlainRearm ? ['swap', 'comment'] : writeOrder({ acceptanceAlreadyLive });
+  for (const step of order) { steps[step](); }
   signalFix({ repo, pr, label: decision.addLabel });
   // PR #5273: labels have no conditional write. A re-park that read before this clearance can land its
   // `review:human` after the swap. When the comment went last, read once more after it and undo only that park.
