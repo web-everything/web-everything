@@ -298,6 +298,9 @@ export function buildRetargetArgs({ pr, repo = null, base }) {
   return ['pr', 'edit', String(pr), ...(repo ? ['--repo', repo] : []), '--base', String(base)];
 }
 
+/** gh pr list's default --limit (buildStackedPrListArgs passes none): a listing this long may be truncated. */
+export const STACKED_PR_LIST_PAGE = 30;
+
 /**
  * Retarget every OPEN PR based on `headRef` onto `defaultBranch`, BEFORE `headRef` is deleted by the merge
  * that is about to happen. Best-effort throughout, by design: a `gh` miss here (listing or an individual
@@ -306,7 +309,10 @@ export function buildRetargetArgs({ pr, repo = null, base }) {
  * while a merge blocked on this side-effect is not. `exec` is injectable so this is unit-testable without
  * shelling `gh`.
  * @param {{repo?:(string|null), headRef:string, defaultBranch:string, exec?:Function, onRetarget?:Function, onFailed?:Function}} o
- * @returns {{retargeted:number[], failed:number[]}}
+ * xym8nt4 — `listed` says whether the listing is COMPLETE evidence of what is stacked: false when it threw, was not an
+ * array, may be truncated (a full default `gh pr list` page) or had a row without a number. The drain ignores it (the
+ * merge must still land); a caller that would orphan a child by closing `headRef` (card-group source close) refuses.
+ * @returns {{retargeted:number[], failed:number[], listed:boolean}}
  */
 export function retargetStackedPrs({ repo = null, headRef, defaultBranch, exec = execFileSync, onRetarget = () => {}, onFailed = () => {} } = {}) {
   const retargeted = [];
@@ -315,11 +321,12 @@ export function retargetStackedPrs({ repo = null, headRef, defaultBranch, exec =
   try {
     const out = exec('gh', buildStackedPrListArgs({ repo, headRef }), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
     stacked = JSON.parse(String(out || '[]').trim() || '[]');
-  } catch { return { retargeted, failed }; } // listing miss — nothing to safely act on, never blocks the merge
-  if (!Array.isArray(stacked)) return { retargeted, failed };
+  } catch { return { retargeted, failed, listed: false }; } // listing miss — nothing to safely act on, never blocks the merge
+  if (!Array.isArray(stacked)) return { retargeted, failed, listed: false };
+  let listed = stacked.length < STACKED_PR_LIST_PAGE;
   for (const s of stacked) {
     const num = s && s.number;
-    if (num == null) continue;
+    if (num == null) { listed = false; continue; }
     try {
       exec('gh', buildRetargetArgs({ pr: num, repo, base: defaultBranch }), { stdio: ['ignore', 'ignore', 'pipe'] });
       retargeted.push(num);
@@ -329,7 +336,7 @@ export function retargetStackedPrs({ repo = null, headRef, defaultBranch, exec =
       onFailed(num);
     }
   }
-  return { retargeted, failed };
+  return { retargeted, failed, listed };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────

@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assertLaneCwd, buildJudgeArgv, deriveSessionId } from '../../lib/judge-spawn.mjs';
 import { parseRedTeamComment } from '../../lib/red-team-gate.mjs';
+import { scrubPublish } from '../../lib/secret-scrub.mjs';
 
 import {
   createRedTeamIo, speculateRedTeam, completeRedTeam, finishSpeculativeRedTeam, runRedTeam, redTeamEnabled, redTeamMarker, redTeamCommentPosted, redTeamAlreadyRan, resolveBuilder,
@@ -88,6 +89,21 @@ function fakeIo(over = {}) {
   return { io, calls, rows, trials };
 }
 
+describe('speculative red-team repository isolation', () => {
+  it.each([REPO, 'other/repo', undefined])('only a clean row from the target repository supersedes a pass: %s', async rowRepo => {
+    const { io, calls, rows } = fakeIo();
+    const loopPayload = payload('accept');
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: loopPayload.findings.read, env: {}, resume: false }, io);
+    expect(pass.status).toBe('speculated');
+    io.readRecords = () => [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND, seat: 'red-team',
+      pr: 5, repo: rowRepo, rev: REV, status: 'ok', callId: 'later-call' }];
+    const result = await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload, pass, env: {} }, io);
+    expect(result.status).toBe(rowRepo === REPO ? 'superseded' : 'ran');
+    expect(calls.filter(c => c[0] === 'post')).toHaveLength(rowRepo === REPO ? 0 : 1);
+    expect(rows.filter(row => row.dispatchKind === REVIEW_SEAT_DISPATCH_KIND)).toHaveLength(rowRepo === REPO ? 0 : 1);
+  });
+});
+
 describe('x00g3tt — the red team fires on ACCEPT only', () => {
   it('an accepted PR gets exactly one red-team dispatch to a non-Claude provider', async () => {
     const { io, calls } = fakeIo();
@@ -162,9 +178,9 @@ describe('x00g3tt — the red team fires on ACCEPT only', () => {
   });
 
   it('never runs twice for the same head once a clean row exists', async () => {
-    const prior = [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND, seat: 'red-team', pr: 5, rev: REV, status: 'ok' }];
-    expect(redTeamAlreadyRan(prior, 5, REV)).toBe(true);
-    expect(redTeamAlreadyRan(prior, 5, 'c'.repeat(40))).toBe(false);
+    const prior = [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND, seat: 'red-team', pr: 5, repo: REPO, rev: REV, status: 'ok' }];
+    expect(redTeamAlreadyRan(prior, 5, REV, REPO)).toBe(true);
+    expect(redTeamAlreadyRan(prior, 5, 'c'.repeat(40), REPO)).toBe(false);
     // The pass finished (its comment is up), so nothing is owed. When the comment is missing, see the resume tests.
     const { io, calls } = fakeIo({ readRecords: () => prior, listComments: () => [{ body: redTeamMarker(5, REV), author: { login: 'web-everything' } }] });
     expect((await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: {} }, io)).status).toBe('already-ran');
@@ -288,7 +304,7 @@ describe('x00g3tt — evidence, Claude re-check and confirmed misses', () => {
     const prior = {
       dispatchKind: REVIEW_SEAT_DISPATCH_KIND, seat: RED_TEAM_SEAT.seat, status: 'ok',
       provider: 'agy-gemini', model: RED_TEAM_MODELS['agy-gemini'].model, callId: 'call-1', rev: REV,
-      pr: 5, findings: [{ ...BREAK, confirmedByRecheck: true }], builder: { provider: 'claude', model: 'claude-opus-5.5', source: 'co-authored-by' },
+      pr: 5, repo: REPO, findings: [{ ...BREAK, confirmedByRecheck: true }], builder: { provider: 'claude', model: 'claude-opus-5.5', source: 'co-authored-by' },
       recheckStatus: 'ok', foldedVerdict: 'changes', changedFiles: ['prior/scope.mjs'],
     };
     const { io, rows } = fakeIo({ readRecords: () => [prior] });
@@ -332,12 +348,56 @@ describe('x00g3tt — the ONE advisory comment, deduped by a trusted marker', ()
     const text = renderRedTeamComment({ pr: 5, rev: REV, provider: 'codex', model: 'm', findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' });
     expect(text).toMatch(/no break found/);
   });
+
+  it('the rendered marker for PR 5848 body outside the generated marker line is clean for the secret scrub', () => {
+    const rev = 'bc0ffddd262712cf405cafbf7e8118b335c267ff';
+    const body = renderRedTeamComment({ pr: 5848, rev, provider: 'codex', model: 'm', findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' });
+    const marker = body.split('\n')[0];
+    expect(marker).toBe(redTeamMarker(5848, rev));
+    expect(scrubPublish(body.slice(body.indexOf('\n') + 1))).toEqual([]);
+  });
 });
 
 describe('x00g3tt — a clean seat row never strands an unfinished effect (PR #2735 review)', () => {
   const DELEGATED = `Claims: adds a guard.\n\n${buildDelegationMarker({ provider: 'codex', model: 'gpt-6-astra', taskType: 'bugfix' })}`;
   const run = (io, over = {}) => runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: payload('accept'), env: {}, ...over }, io);
   const trustedMarker = () => [{ body: `${redTeamMarker(5, REV)}\nold`, author: { login: 'web-everything' } }];
+
+  it('resumes a completed zero-finding row for PR 5848 and posts its missing comment', async () => {
+    const rev = 'bc0ffddd262712cf405cafbf7e8118b335c267ff';
+    const prior = {
+      dispatchKind: REVIEW_SEAT_DISPATCH_KIND, seat: RED_TEAM_SEAT.seat, status: 'ok',
+      provider: 'codex', model: 'm', callId: 'call-1', rev, pr: 5848, repo: REPO,
+      findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept',
+    };
+    const p = payload('accept');
+    p.findings.read.netBasis.rev = rev;
+    const { io, calls } = fakeIo({ readRecords: () => [prior] });
+    const r = await run(io, { pr: 5848, loopPayload: p, post: true });
+    expect(r).toMatchObject({ status: 'resumed', comment: { status: 'posted' } });
+    expect(r.comment.body.startsWith(redTeamMarker(5848, rev))).toBe(true);
+    expect(calls.filter(c => c[0] === 'post')).toHaveLength(1);
+  });
+
+  it('a resumed comment containing a real secret is withheld and counts as failed', async () => {
+    const secret = 'AKIA' + '1234567890ABCDEF';
+    // Finding fields are scrubbed individually; the legacy model reaches the final body scrub.
+    const prior = {
+      dispatchKind: REVIEW_SEAT_DISPATCH_KIND, seat: RED_TEAM_SEAT.seat, status: 'ok',
+      provider: 'codex', model: secret, callId: 'call-1', rev: REV, pr: 5, repo: REPO,
+      findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept',
+    };
+    const body = renderRedTeamComment(prior);
+    expect(body).toContain(secret);
+    expect(scrubPublish(body.split('\n')[0])).toEqual([]);
+    expect(scrubPublish(body)).not.toEqual([]);
+    const { io, calls } = fakeIo({ readRecords: () => [prior] });
+    const r = await run(io, { post: true });
+    expect(r).toMatchObject({ status: 'resumed', comment: { status: 'withheld' } });
+    expect(r.reason).toContain('still failing');
+    expect(r.status).not.toBe('already-ran');
+    expect(calls.some(c => c[0] === 'post')).toBe(false);
+  });
 
   it('a failed comment post is retried on the next run, without re-running the model or spending a call', async () => {
     const first = fakeIo({ postComment: () => { throw new Error('gh: network unreachable'); } });
@@ -461,6 +521,8 @@ describe('x00g3tt — review-job: the red team is the post-accept hook, after th
       claim: () => ({ ok: true }),
       updateRecord: () => {},
       unclaim: () => calls.push(['unclaim']),
+      redTeamStatus: () => {},
+      prepareLane: () => ({ head: 'a'.repeat(40) }),
       acquireLane: () => ({ lanePath: '/lanes/lane-7' }),
       runLoop: () => ({ status: 0, stdout: JSON.stringify(loop), stderr: '' }),
       releaseLane: () => calls.push(['release']),
@@ -594,7 +656,7 @@ describe('repo-grounded red-team re-check and card-only skips', () => {
     const r = speculative
       ? await speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', read: p.findings.read, env: {} }, io)
       : await runRedTeam({ pr: 5, repo: REPO, lanePath: 'lane', loopPayload: p, env: {} }, io);
-    expect(r).toEqual({ status: 'skipped', reason: 'red team skipped: card-only' });
+    expect(r).toEqual({ status: 'skipped', reason: 'red team skipped: card-only', policy: 'card-only' });
     expect(calls.every(c => c[0] === 'log')).toBe(true);
     expect(calls.some(c => c[1] === 'red team skipped: card-only')).toBe(true);
     expect(calls.find(c => c[0] === 'log')[1]).toMatch(/recheckReadsRepo=true.*standard.*skipCardOnly=true.*standard/);

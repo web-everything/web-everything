@@ -9,12 +9,18 @@ export { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-s
 
 export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence = {}, env = {}, standingRuling = null } = {}) {
   const disposition = readRedTeamDisposition({ comments, pr, head, env, repo, standingRuling });
+  const verdict = evidence.status?.status === 'finished' ? evidence.status.result?.foldedVerdict : null;
+  const finished = verdict === 'changes' ? 'red-team:blocked' : verdict === 'accept' ? 'red-team:clear' : null;
   const desired = disposition.sendBack.length || disposition.held.length ? 'red-team:blocked'
     : disposition.result ? 'red-team:clear'
+      : finished ? finished
       : redTeamOwedOnHead({ read: evidence.loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly }) ? 'red-team:pending' : null;
   const names = labels.map(l => typeof l === 'string' ? l : l?.name);
   return { add: desired && !names.includes(desired) ? desired : null,
-    remove: names.filter(l => RED_TEAM_STATUS_LABELS.includes(l) && l !== desired) };
+    // With nothing owed and no result (`desired` null) a hold label (pending or blocked) must not be dropped on
+    // unreadable or missing local evidence: only a recorded outcome replaces it.
+    remove: names.filter(l => RED_TEAM_STATUS_LABELS.includes(l) && l !== desired
+      && !(desired === null && (l === 'red-team:pending' || l === 'red-team:blocked'))) };
 }
 
 /** Uses the existing label provider/writer, including the known-label metadata provisioning path. */

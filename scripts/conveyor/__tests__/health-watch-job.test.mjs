@@ -95,6 +95,16 @@ describe('health-gh-probe job child', () => {
     expect(existsSync(join(d, `job-x${RESULT_SUFFIX}.tmp-${process.pid}`))).toBe(false);
   });
 
+  it('the step hands the isolated lane-scan cache target through to the probe worker unchanged', async () => {
+    const d = mkdtempSync(join(dir, 'step-target-'));
+    const seen = [];
+    const runWorker = async ({ input }) => { seen.push(input); return { probes: {}, errors: {} }; };
+    await ghProbeStep({ jobId: 'job-t', input: { laneScanDir: '/isolated/health', laneScanWrite: true }, dir: d, runWorker, now: () => 5 });
+    await ghProbeStep({ jobId: 'job-t2', input: { laneScanDir: null, laneScanWrite: false }, dir: d, runWorker, now: () => 5 });
+    expect(seen[0]).toMatchObject({ laneScanDir: '/isolated/health', laneScanWrite: true });
+    expect(seen[1]).toMatchObject({ laneScanDir: null, laneScanWrite: false });
+  });
+
   it('a worker that does not answer in time is terminated and the step fails', async () => {
     const t0 = Date.now();
     await expect(runProbeWorker({ input: { proofBlockMs: 3000 }, timeoutMs: 500 })).rejects.toThrow(/timed out after 500ms/);

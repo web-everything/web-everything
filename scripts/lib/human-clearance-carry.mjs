@@ -348,7 +348,7 @@ function liveCarryChange({ readLiveEvidence, carried }) {
   }
   const rec = latestAcceptRecord(live.comments);
   if (!rec || rec.sha !== clearance.sha) return 'a later acceptance record changed during the proof';
-  if (rec.laterBodyDerivedHold || live.comments.slice(rec.index + 1).some((c) => !isNumberingTolerableLaterBody(c?.body))) {
+  if (rec.laterBodyDerivedHold || live.comments.slice(rec.index + 1).some((c) => !isNumberingTolerableLaterBody(c?.body, c))) {
     return 'a later verdict or unknown comment stands';
   }
   if (!Array.isArray(live.reviews)) return 'formal reviews unreadable';

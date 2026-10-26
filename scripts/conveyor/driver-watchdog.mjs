@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { pidIdentity } from '../lib/pid-alive.mjs';
 /**
  * @file scripts/conveyor/driver-watchdog.mjs
  * @description THE DRIVER WATCHDOG (epic #3383) — a deliberately SMALL, SEPARATE process that notices when the
@@ -199,10 +200,14 @@ export function splitQueue(queue, agents) {
   return { inFlight, eligible, deadSessions };
 }
 
-/** `process.kill(pid, 0)` — `true`/`false` when established (an `EPERM` still proves the pid exists, just not
- *  ours to signal). The direct, no-subprocess probe used when a listing row carries a `pid`. */
-export function defaultIsPidAlive(pid) {
-  try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; }
+/** Existence plus identity; unreadable probes are unknown and never prove death. */
+export function defaultIsPidAlive(pid, identity = pidIdentity, kill = process.kill.bind(process)) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try { kill(pid, 0); } catch (e) {
+    if (e?.code === 'ESRCH') return false;
+    if (e?.code !== 'EPERM') return null;
+  }
+  try { return identity(pid).alive; } catch { return null; }
 }
 
 /**

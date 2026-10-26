@@ -388,6 +388,15 @@ describe('confirmed dequeue', () => {
     expect(q.logs).toHaveLength(0);
   });
   it.each(['review:changes', 'review:human', 'review:pending'])('recognizes %s even if ready remains', label => expect(sendBackReason([label, 'ready-to-merge'])).toContain(label));
+  it('recognizes red-team:blocked even if ready remains', () => expect(sendBackReason(['red-team:blocked', 'ready-to-merge'])).toContain('red-team:blocked'));
+  it('pending alone is an admission hold rather than a send-back', () => {
+    expect(sendBackReason(['red-team:pending', 'ready-to-merge'])).toBeNull();
+    expect(sendBackReason(['red-team:pending'])).toContain('ready-to-merge');
+    expect(sendBackReason(['red-team:pending', 'ready-to-merge', 'review:changes'])).toContain('review:changes');
+  });
+  it('allows ready-to-merge with red-team:clear', () => {
+    expect(sendBackReason(['ready-to-merge', 'red-team:clear'])).toBeNull();
+  });
   it('recognizes ready removal and leaves ready accepted PRs alone', () => {
     expect(sendBackReason([])).toContain('ready-to-merge');
     expect(sendBackReason(['review:accepted', 'ready-to-merge'])).toBeNull();

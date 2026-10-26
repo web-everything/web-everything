@@ -21,7 +21,8 @@ const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: { n
 
 describe('drain reads actual head-bound review scheduler inputs', () => {
   it('does not invent an accept when no review run exists', () => {
-    expect(readDrainRedTeamEvidence(fixture())).toEqual({ loopPayload: null, recorded: false, scheduled: false, inFlight: false });
+    expect(readDrainRedTeamEvidence(fixture())).toEqual({ loopPayload: null, recorded: false,
+      seatRecorded: false, completedRecorded: false, scheduled: false, inFlight: false });
   });
   it('pins the accepted-label boundary with empty status and run stores', () => {
     const f = fixture();
@@ -56,6 +57,14 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     // The re-review's own later status supersedes the run again.
     recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'skipped' }, f);
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), comments: [] })).toBeNull();
+  });
+  it('a newer accepting run does not hide a finished but unpublished result on the same head', () => {
+    const f = fixture();
+    const result = { status: 'ran', foldedVerdict: 'changes', comment: 'withheld', findings: [] };
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result }, f);
+    utimesSync(join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`), new Date(1_000_000), new Date(1_000_000));
+    writeRun({ ...newRunRecord({ id: 'review-pr-3', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), ...payload(f.head) }, f.runsDir);
+    expect(readDrainRedTeamEvidence(f).status?.result?.comment).toBe('withheld');
   });
   it('recognizes queued scheduling for the live head only while its writer is alive', () => {
     const f = fixture();
@@ -103,6 +112,11 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'ran' }, { ...f, ...writer });
     expect(readDrainRedTeamEvidence({ ...f, ...reader, isAlive: () => false })).toMatchObject({ inFlight: false, recorded: true });
   });
+  it('reads a compact result object like the bare ran string', () => {
+    const f = fixture();
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: { status: 'ran', foldedVerdict: 'changes', comment: 'withheld' } }, f);
+    expect(readDrainRedTeamEvidence({ ...f, isAlive: () => false })).toMatchObject({ scheduled: true, recorded: true });
+  });
   it('preserves local liveness when the birth-time probe is unavailable or metadata is legacy', () => {
     const f = fixture();
     recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, { ...f, readPidStart: () => 'start' });
@@ -143,6 +157,21 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     for (const mismatch of [{ rev: 'a'.repeat(40) }, { repo: 'other/repo' }, { pr: 5443 }, { dispatchKind: 'review-seat-speculative-discard' }]) {
       expect(readDrainRedTeamEvidence({ ...f, readScorecards: () => [{ ...row, ...mismatch }] }).recorded).toBe(false);
     }
+  });
+  it.each([
+    [{ status: 'ok', foldedVerdict: 'changes', confirmedMissCount: 1 }, true],
+    [{ status: 'error' }, false],
+    [{ status: 'ok', seatStatus: 'error' }, false],
+  ])('separates an existing seat from a completed execution: %j', (fields, completedRecorded) => {
+    const f = fixture();
+    const row = { dispatchKind: 'review-seat', seat: 'red-team', repo: f.repo, pr: f.pr, rev: f.head, ...fields };
+    expect(readDrainRedTeamEvidence({ ...f, readScorecards: () => [row] }))
+      .toMatchObject({ recorded: true, seatRecorded: true, completedRecorded });
+  });
+  it('a review-pr string ran cannot substitute for an actual completed seat', () => {
+    const f = fixture();
+    recordRedTeamStatus({ ...f, loopPayload: { ...payload(f.head), op: 'review-pr' }, status: 'finished', result: 'ran' }, f);
+    expect(readDrainRedTeamEvidence(f)).toMatchObject({ seatRecorded: false, completedRecorded: false });
   });
   it('a skipped provider pass is not evidence that a red team ran', () => {
     const f = fixture();

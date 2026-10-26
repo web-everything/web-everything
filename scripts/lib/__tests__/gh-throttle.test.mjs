@@ -319,7 +319,7 @@ describe('acquireGhSlotSync / releaseGhSlotSync — cap-independent slots over a
   it('the gh-throttle lock root is a SIBLING of, never inside, heavy-admission’s own root', async () => {
     const { admissionLockRoot } = await import('../../readiness/heavy-admission.mjs');
     const { ghThrottleLockRoot } = await import('../gh-throttle.mjs');
-    const heavy = admissionLockRoot('/some/checkout', {});
+    const heavy = admissionLockRoot('/some/checkout', { WE_UNDER_TEST: '1' });
     const gh = ghThrottleLockRoot('/some/checkout', {});
     expect(gh).not.toBe(heavy);
     expect(gh.endsWith(join('.admission', 'gh'))).toBe(true);

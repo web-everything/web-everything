@@ -1,0 +1,1185 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { cachedLaneScan, resolveLaneScanPolicy, freshLaneSafety as checkFreshLaneSafety, guardLaneAction as checkGuardLaneAction, laneProbeEnv, laneRedirectConfig, laneMaskingConfig, withHonestReportingPins, LANE_HONEST_REPORTING_PINS } from '../../lib/health-watch-lane-scan.mjs';
+import { createStaleStateReader } from '../stale-state-io.mjs';
+import { OPERATIONS } from '../run.mjs';
+import * as policyCascade from '../../lib/policy-cascade.mjs';
+import * as settingsFiles from '../../lib/settings-files.mjs';
+import { DIRTY_PROBE_ARGS, laneGitEnv, worktreeGitEnv } from '../../lib/git-transport-branch.mjs';
+import { LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS, configKeyCandidates, laneFilterDrivers, riskyLaneConfig, scrubInheritedGitEnv } from '../../lib/lane-git-hardening.mjs';
+
+// Mock at the module boundary so default-parameter imports see these functions.
+// Post-import namespace spies do not replace those bindings in this test setup.
+vi.mock('../../lib/policy-cascade.mjs', async original => {
+  const real = await original();
+  return { ...real, platformPreference: vi.fn(real.platformPreference) };
+});
+vi.mock('../../lib/settings-files.mjs', async original => {
+  const real = await original();
+  return { ...real, readDeclaredSettings: vi.fn(real.readDeclaredSettings) };
+});
+
+vi.mock('../stale-state-io.mjs', async original => {
+  const real = await original();
+  return { ...real, createStaleStateReader: vi.fn(real.createStaleStateReader) };
+});
+
+const dirs = [];
+// Publication belongs to the test driver, never to a lane-owned tracking ref.
+// Unit probes use a fixed OID; real-Git fixtures register their initial published
+// commit once, before creating local work or forging any refs.
+const PUBLISHED_TIP = 'a'.repeat(40);
+const publishedTips = new Map();
+const readPublishedTips = ({ path }) => [publishedTips.get(path) ?? PUBLISHED_TIP];
+const freshLaneSafety = options => checkFreshLaneSafety({ readPublishedTips, ...options });
+const guardLaneAction = options => checkGuardLaneAction({ readPublishedTips, ...options });
+const temp = () => { const dir = mkdtempSync(join(tmpdir(), 'health-lane-scan-')); dirs.push(dir); return dir; };
+afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+const policy = { interval: 300, source: 'standard', invalid: [] };
+const rows = [{ lane: { path: '/fixture/lane-1', clean: false, lease: { agentPid: 123 } }, ahead: 2 }];
+
+describe('operator send-back regressions', () => {
+  it('freshLaneSafety never runs inherited GIT_CONFIG_PARAMETERS fsmonitor commands (read-only Git)', () => {
+    const marker = join(temp(), 'executed');
+    vi.stubEnv('GIT_CONFIG_PARAMETERS', `'core.fsmonitor=echo executed >> "${marker}"'`);
+    try {
+      const exec = vi.fn(execFileSync);
+      freshLaneSafety({ path: process.cwd(), exec });
+      expect(exec.mock.calls.some(([, argv]) => argv[0] === 'status')).toBe(true);
+      expect(existsSync(marker)).toBe(false);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it.each(['2', 'garbage', '999999999'])('replaces all inherited config overrides before pinning (count=%s)', count => {
+    const inherited = { GIT_CONFIG_COUNT: count, GIT_CONFIG_PARAMETERS: "'core.fsmonitor=marker'",
+      GIT_CONFIG_KEY_0: 'core.worktree', GIT_CONFIG_VALUE_0: '/foreign',
+      GIT_CONFIG_KEY_99: 'filter.marker.clean', GIT_CONFIG_VALUE_99: 'marker',
+      GIT_CONFIG_KEY_stray: 'include.path', GIT_CONFIG_VALUE_stray: '/foreign/config' };
+    for (const [key, value] of Object.entries(inherited)) vi.stubEnv(key, value);
+    try {
+      const env = laneProbeEnv('/fixture/lane');
+      const overrides = Object.fromEntries(Object.entries(env).filter(([key]) => /^GIT_CONFIG_(PARAMETERS|COUNT|KEY_.*|VALUE_.*)$/.test(key)));
+      expect(overrides).toEqual({ GIT_CONFIG_COUNT: String(LANE_GIT_CONFIG_PINS.length),
+        ...Object.fromEntries(LANE_GIT_CONFIG_PINS.flatMap(([key, value], i) =>
+          [[`GIT_CONFIG_KEY_${i}`, key], [`GIT_CONFIG_VALUE_${i}`, value]])) });
+      for (const [key, value] of Object.entries(inherited)) expect(process.env[key]).toBe(value);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('drops every inherited Git config/location override; only lane pins and GIT_CONFIG_NOSYSTEM remain', () => {
+    const inherited = { GIT_CONFIG_GLOBAL: '/foreign/global', GIT_CONFIG_SYSTEM: '/foreign/system', GIT_CONFIG: '/foreign/config',
+      GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.worktree', GIT_CONFIG_VALUE_0: '/foreign',
+      GIT_CONFIG_PARAMETERS: "'core.fsmonitor=marker'", GIT_DIR: '/foreign/.git', GIT_COMMON_DIR: '/foreign/common',
+      GIT_WORK_TREE: '/foreign', GIT_INDEX_FILE: '/foreign/index', GIT_OBJECT_DIRECTORY: '/foreign/objects',
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: '/foreign/alt', GIT_NAMESPACE: 'foreign',
+      GIT_REPLACE_REF_BASE: 'refs/foreign/', GIT_ATTR_SOURCE: 'foreign', GIT_GRAFT_FILE: '/foreign/grafts' };
+    for (const [key, value] of Object.entries(inherited)) vi.stubEnv(key, value);
+    try {
+      const env = laneProbeEnv('/fixture/lane');
+      for (const key of Object.keys(inherited)) {
+        if (/^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/.test(key)) continue; // replaced by the lane pins, asserted below
+        expect(env, key).not.toHaveProperty(key);
+      }
+      const config = Object.fromEntries(Object.entries(env).filter(([key]) => /^GIT_CONFIG/.test(key)));
+      expect(env.GIT_NO_REPLACE_OBJECTS).toBe('1');
+      expect(config).toEqual({ GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: String(LANE_GIT_CONFIG_PINS.length),
+        ...Object.fromEntries(LANE_GIT_CONFIG_PINS.flatMap(([key, value], i) =>
+          [[`GIT_CONFIG_KEY_${i}`, key], [`GIT_CONFIG_VALUE_${i}`, value]])) });
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  const cachedReader = (initial = {}) => {
+    const lane = { path: '/fixture/lane-1', branch: 'lane/fixture', clean: true,
+      lease: { workerSession: 'old-worker', pid: 10, agentPid: 11 }, ...initial };
+    let now = 0;
+    let leaseText = JSON.stringify(lane.lease);
+    const run = vi.fn((bin, argv) => bin === 'git'
+      ? argv[0] === 'rev-parse' ? PUBLISHED_TIP : '0' : JSON.stringify({ lanes: [lane] }));
+    const readText = vi.fn(() => {
+      if (leaseText instanceof Error) throw leaseText;
+      return leaseText;
+    });
+    const probe = vi.fn(pid => pid === 21);
+    const read = createStaleStateReader({ root: '/fixture', run, readText, probe, now: () => now,
+      listFiles: () => [], runStore: { list: () => [] }, laneScan: { dir: temp(), policy, log: vi.fn() } });
+    read();
+    run.mockClear();
+    probe.mockClear();
+    now = 120000;
+    return { read, run, readText, probe, setLease: value => { leaseText = value; } };
+  };
+
+  it.each([{}, { lease: null }, { lease: null, readError: 'old corrupt lease' }])(
+    'at 120s cached old-worker/free/error lane shows live current-worker (%j)', initial => {
+      const r = cachedReader(initial);
+      const lease = { workerSession: 'current-worker', pid: 20, agentPid: 21, acquiredAt: new Date(100000).toISOString() };
+      r.setLease(JSON.stringify(lease));
+      expect(r.read().records[0]).toMatchObject({ owner: 'current-worker', ownerPid: 21, ownerPidAlive: true,
+        pid: 20, ageMs: 20000, lease, lane: { lease }, hasUnsafeWork: null });
+      expect(r.run).not.toHaveBeenCalled();
+      expect(r.probe).not.toHaveBeenCalledWith(11);
+      expect(r.readText).toHaveBeenCalledWith('/fixture/lane-1/.git/.lane-lease');
+    });
+
+  it('omits a cached lease that has since been removed', () => {
+    const r = cachedReader();
+    r.setLease(Object.assign(new Error('gone'), { code: 'ENOENT' }));
+    expect(r.read().records).toEqual([]);
+    expect(r.probe).not.toHaveBeenCalled();
+  });
+
+  it.each(['{broken', 'null', '[]', new Error('unreadable lease')])('reports unknown ownership on fresh lease read failure (%s)', value => {
+    const r = cachedReader();
+    r.setLease(value);
+    const row = r.read().records[0];
+    expect(row).toMatchObject({ owner: null, ownerPid: null, ownerPidAlive: null, hasUnsafeWork: null });
+    expect(row.readError).toBeTruthy();
+    expect(row.lane.lease).toBeNull();
+    expect(r.probe).not.toHaveBeenCalled();
+  });
+});
+
+describe('health-watch persistent lane scan', () => {
+  it.each([
+    ['wrong version', { version: 2 }], ['wrong root', { root: '/other' }],
+    ['non-finite at', { at: Infinity }], ['non-number at', { at: '1000' }],
+    ['non-array lanes', { lanes: {} }], ['row without lane', { lanes: [{ ahead: 0 }] }],
+    ['non-object lane', { lanes: [{ lane: '/lane', ahead: 0 }] }],
+    ['lane without string path', { lanes: [{ lane: { path: 42 }, ahead: 0 }] }],
+    ...[-1, 0.5, '0', Number.MAX_SAFE_INTEGER + 1].map(ahead => [`invalid ahead ${ahead}`, { lanes: [{ lane: { path: '/lane' }, ahead }] }]),
+    ['future at', { at: 2001 }],
+  ])('rescans for cache guard: %s', (_name, patch) => {
+    const dir = temp();
+    // JSON permits overflowing numeric literals, although JSON.stringify(Infinity) writes null.
+    const content = JSON.stringify({ version: 1, root: '/fixture', at: 1000, lanes: rows, ...patch });
+    writeFileSync(join(dir, 'lane-scan.json'), patch.at === Infinity ? content.replace('"at":null', '"at":1e999') : content);
+    const scan = vi.fn(() => rows);
+    expect(cachedLaneScan(scan, { dir, root: '/fixture', now: 2000, policy, log: vi.fn() })).toEqual(rows);
+    expect(scan).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(readFileSync(join(dir, 'lane-scan.json'), 'utf8'))).toEqual({ version: 1, root: '/fixture', at: 2000, lanes: rows });
+  });
+
+  it('skips within the interval across readers, retains lane data and logs interval/source once', () => {
+    const dir = temp();
+    const scan = vi.fn(() => rows);
+    const log = vi.fn();
+    expect(cachedLaneScan(scan, { dir, root: '/fixture', now: 1000, policy, log })).toEqual(rows);
+    const nextScan = vi.fn();
+    expect(cachedLaneScan(nextScan, { dir, root: '/fixture', now: 42000, policy, log })).toEqual(rows.map(row => ({ ...row, cachedAt: 1000 })));
+    expect(scan).toHaveBeenCalledTimes(1);
+    expect(nextScan).not.toHaveBeenCalled();
+    expect(log.mock.calls).toEqual([
+      ['health-watch: lane scan running (due, interval=300s, source=standard)'],
+      ['health-watch: lane scan skipped (age 41s < 300s, source=standard)'],
+    ]);
+    expect(readdirSync(dir)).toEqual(['lane-scan.json']);
+    expect(JSON.parse(readFileSync(join(dir, 'lane-scan.json'), 'utf8')).lanes).toEqual(rows);
+  });
+
+  it('runs the full scan when due at the boundary', () => {
+    const dir = temp();
+    const scan = vi.fn(() => rows);
+    const opts = { dir, root: '/fixture', policy, log: vi.fn() };
+    cachedLaneScan(scan, { ...opts, now: 1000 });
+    cachedLaneScan(scan, { ...opts, now: 301000 });
+    expect(scan).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([undefined, '{broken', '{}', '{"version":1,"root":"/fixture","at":1000,"lanes":[null]}'])(
+    'runs when cache is missing or corrupt (%s)', content => {
+      const dir = temp();
+      if (content !== undefined) writeFileSync(join(dir, 'lane-scan.json'), content);
+      const scan = vi.fn(() => rows);
+      expect(cachedLaneScan(scan, { dir, root: '/fixture', now: 2000, policy, log: vi.fn() })).toEqual(rows);
+      expect(scan).toHaveBeenCalledTimes(1);
+    });
+
+  it('does not write with caching disabled for a bare dry run/fixture', () => {
+    const dir = temp();
+    cachedLaneScan(() => rows, { dir, root: '/fixture', now: 1000, write: false, policy, log: vi.fn() });
+    expect(readdirSync(dir)).toEqual([]);
+    cachedLaneScan(() => rows, { dir: null, root: '/fixture', now: 1000, policy, log: vi.fn() });
+  });
+
+  it('retains expired leases, read errors and unsafe-work decisions while rechecking claims and owner liveness', () => {
+    const dir = temp();
+    let now = 1000;
+    let alive = true;
+    const lane = { path: '/fixture/lane-1', branch: 'lane/fixture', leased: false, clean: true,
+      lease: { pid: 12, agentPid: 123, workerSession: 'worker', acquiredAt: '1970-01-01T00:00:00Z' } };
+    const run = vi.fn((bin, argv) => bin === 'git'
+      ? argv[0] === 'rev-parse' ? PUBLISHED_TIP : '2'
+      : JSON.stringify({ lanes: [lane, { path: '/fixture/lane-2', readError: 'bad lease' }] }));
+    const readClaim = vi.fn(() => ({ found: true, status: 'active', rel: 'backlog/123-active.md',
+      content: '---\nstatus: active\npid: 123\n---\n' }));
+    const options = { root: '/fixture', run, now: () => now, probe: () => alive,
+      listFiles: () => ['123-active.md'], readText: path => {
+        if (path === '/fixture/lane-1/.git/.lane-lease') return JSON.stringify(lane.lease);
+        if (path === '/fixture/lane-2/.git/.lane-lease') throw new Error('bad lease');
+        return '---\nstatus: active\n---\n';
+      }, readClaim,
+      runStore: { list: () => [] }, laneScan: { dir, policy, log: vi.fn() } };
+    const first = createStaleStateReader(options)();
+    now = 42000;
+    alive = false;
+    const second = createStaleStateReader(options)();
+    expect(run).toHaveBeenCalledTimes(5); // status, config, two verified reporting refs and ahead
+    expect(readClaim).toHaveBeenCalledTimes(2);
+    expect(second.records.map(r => r.kind)).toEqual(['lane-lease', 'lane-lease', 'claim']);
+    expect(first.records[0]).toMatchObject({ ownerPidAlive: true, hasUnsafeWork: true, lane: { ahead: 2 } });
+    expect(second.records[0]).toMatchObject({ ownerPidAlive: false, hasUnsafeWork: true, lane: { ahead: 2 } });
+    expect(second.records[1]).toMatchObject({ readError: 'bad lease' });
+    expect(second.records[2]).toMatchObject({ ownerPidAlive: false });
+    expect(Object.keys(second.records[0])).toEqual(Object.keys(first.records[0]));
+  });
+});
+
+describe('cached lane safety is reporting only (operator ruling 2026-10-20)', () => {
+  const lease = { pid: 12, agentPid: 123, workerSession: 'worker', acquiredAt: '1970-01-01T00:00:00Z' };
+  const reader = (dir, lanes, aheadOut) => {
+    let now = 1000;
+    lanes = lanes.map(lane => ({ branch: 'lane/fixture', ...lane }));
+    const run = vi.fn((bin, argv) => bin === 'git'
+      ? argv[0] === 'rev-parse' ? PUBLISHED_TIP : aheadOut : JSON.stringify({ lanes }));
+    const options = { root: '/fixture', run, now: () => now, probe: () => false, listFiles: () => [],
+      readText: path => JSON.stringify(lanes.find(lane => path === `${lane.path}/.git/.lane-lease`)?.lease),
+      readClaim: vi.fn(), runStore: { list: () => [] }, laneScan: { dir, policy, log: vi.fn() } };
+    return { read: () => createStaleStateReader(options)(), tick: ms => { now += ms; }, run };
+  };
+  it('zero local ahead stays unknown in fresh and cached rows, with the publication limit visible', () => {
+    const dir = temp();
+    const r = reader(dir, [{ path: '/fixture/lane-1', clean: true, lease }], '0');
+    const first = r.read();
+    expect(first.records[0]).toMatchObject({ hasUnsafeWork: null, lane: { clean: true, ahead: 0 },
+      safety: { source: 'fresh', cachedHasUnsafeWork: null, reason: 'local tracking refs cannot prove publication' } });
+    r.tick(41000);
+    const second = r.read();
+    expect(second.records[0]).toMatchObject({ hasUnsafeWork: null,
+      lane: { clean: true, ahead: 0 }, safety: { source: 'cache', observedAt: new Date(1000).toISOString(),
+        cachedHasUnsafeWork: null, reason: 'local tracking refs cannot prove publication' } });
+    expect(second.gaps.some(g => g.includes('reporting only, never safe'))).toBe(true);
+    expect(second.gaps.some(g => g.includes('Local tracking refs cannot prove publication'))).toBe(true);
+    expect(Object.keys(second.records[0])).toEqual(Object.keys(first.records[0]));
+  });
+  it('a cached UNKNOWN row stays unknown and a cached UNSAFE row stays unsafe', () => {
+    const dir = temp();
+    const r = reader(dir, [{ path: '/fixture/a', clean: true, lease }, { path: '/fixture/b', clean: false, lease }], 'garbage');
+    r.read();
+    r.tick(1000);
+    const [a, b] = r.read().records;
+    expect(a).toMatchObject({ hasUnsafeWork: null, safety: { source: 'cache', cachedHasUnsafeWork: null } });
+    expect(b).toMatchObject({ hasUnsafeWork: true, safety: { source: 'cache', cachedHasUnsafeWork: true } });
+  });
+  it('a persisted version-1 clean zero-ahead row from the old safe mapping remains unknown', () => {
+    const dir = temp();
+    const lane = { path: '/fixture/lane-1', branch: 'lane/fixture', clean: true, lease };
+    writeFileSync(join(dir, 'lane-scan.json'), JSON.stringify({ version: 1, root: '/fixture', at: 1000,
+      lanes: [{ lane, ahead: 0 }] }));
+    const r = reader(dir, [lane], '0');
+    expect(r.read().records[0]).toMatchObject({ hasUnsafeWork: null, lane: { ahead: 0 },
+      safety: { source: 'cache', cachedHasUnsafeWork: null, reason: 'local tracking refs cannot prove publication' } });
+    expect(r.run).not.toHaveBeenCalled();
+  });
+  it('never writes an unsafe or unknown row into the cache as safe', () => {
+    const dir = temp();
+    const r = reader(dir, [{ path: '/fixture/a', clean: true, lease }, { path: '/fixture/b', clean: false, lease }], 'garbage');
+    r.read();
+    const cached = JSON.parse(readFileSync(join(dir, 'lane-scan.json'), 'utf8')).lanes;
+    expect(cached.map(row => row.ahead)).toEqual([null, null]);
+    expect(cached[1].lane.clean).toBe(false);
+  });
+  it('isolates both the lane-pool child and per-lane git reporting reads from inherited Git selectors', () => {
+    vi.stubEnv('GIT_DIR', '/foreign/clean');
+    vi.stubEnv('GIT_CONFIG_PARAMETERS', "'core.fsmonitor=marker'");
+    vi.stubEnv('GIT_CONFIG_COUNT', '1');
+    vi.stubEnv('GIT_CONFIG_KEY_0', 'core.worktree');
+    vi.stubEnv('GIT_CONFIG_VALUE_0', '/foreign/clean');
+    const r = reader(temp(), [{ path: '/fixture/lane-1', clean: true, lease }], '0');
+    try {
+      r.read();
+      expect(r.run.mock.calls.map(([bin, , options]) => [bin === 'git', options.cwd, options.env.GIT_CEILING_DIRECTORIES]))
+        .toEqual([[false, '/fixture', '/'], ...Array.from({ length: 4 }, () => [true, '/fixture/lane-1', '/fixture'])]);
+      for (const [, , options] of r.run.mock.calls) {
+        expect(options.env).not.toHaveProperty('GIT_DIR');
+        expect(options.env).not.toHaveProperty('GIT_CONFIG_PARAMETERS');
+        expect(options.env.GIT_CONFIG_COUNT).toBe(String(LANE_GIT_CONFIG_PINS.length));
+        expect(options.env.GIT_CONFIG_KEY_0).toBe('core.fsmonitor');
+        expect(options.env.GIT_OPTIONAL_LOCKS).toBe('0');
+      }
+    } finally { vi.unstubAllEnvs(); }
+  });
+});
+
+describe('shared lane Git environment', () => {
+  it('strips every repository selector without changing the base or the transport credential role', () => {
+    const selectors = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY'];
+    const base = { ...Object.fromEntries(selectors.map(key => [key, '/foreign/clean'])),
+      GIT_CEILING_DIRECTORIES: '/foreign', WE_GITHUB_APP_ROLE: 'reader', PATH: '/bin' };
+    const env = laneGitEnv('/fixture/lane', base);
+    for (const key of selectors) {
+      expect(env).not.toHaveProperty(key);
+      expect(base[key]).toBe('/foreign/clean');
+    }
+    expect(env).toMatchObject({ GIT_CEILING_DIRECTORIES: '/fixture', WE_GITHUB_APP_ROLE: 'reader', PATH: '/bin' });
+    expect(worktreeGitEnv('/fixture/lane', base)).toEqual({ ...env, WE_GITHUB_APP_ROLE: 'ledger' });
+  });
+});
+
+describe('fresh per-lane safety check before any destructive action', () => {
+  const commands = [
+    ['git', [...LANE_CONFIG_LIST_ARGS]],
+    ['git', ['ls-files', '--stage', '-z']],
+    ['git', ['status', '--porcelain', '--untracked-files=all', '--ignored=traditional', '--ignore-submodules=none']],
+    ['git', ['ls-files', '-v']],
+    ['git', ['stash', 'list', '--no-show-signature']],
+    ['git', ['rev-parse', '--git-path', 'info/grafts']],
+    ['git', ['rev-list', '--count', '--all', 'HEAD', '--not', PUBLISHED_TIP]],
+  ];
+  const gitMocks = [];
+  // Assert outside the checker: it catches exec errors, including failed assertions inside a mock.
+  afterEach(() => {
+    for (const exec of gitMocks.splice(0)) {
+      for (const [bin, argv] of exec.mock.calls) expect(commands).toContainEqual([bin, argv]);
+    }
+  });
+  const git = outputs => {
+    const replies = new Map(commands.map((command, i) => [JSON.stringify(command),
+      [outputs.config ?? '', outputs.stage ?? '', outputs.status, outputs['ls-files'] ?? 'H tracked.txt\n', outputs.stash,
+        outputs.grafts ?? '.git/info/grafts\n', outputs['rev-list']][i]]));
+    const exec = vi.fn((bin, argv) => {
+      const out = replies.get(JSON.stringify([bin, argv]));
+      if (out instanceof Error) throw out;
+      return out;
+    });
+    gitMocks.push(exec);
+    return exec;
+  };
+  it('safe only when clean, no stash and nothing unpushed', () => {
+    expect(freshLaneSafety({ path: '/l', exec: git({ status: '', stash: '', 'rev-list': '0\n' }) })).toMatchObject({ hasUnsafeWork: false, fresh: true });
+    expect(freshLaneSafety({ path: '/l', exec: git({ status: ' M a.mjs\n', stash: '', 'rev-list': '0' }) })).toMatchObject({ hasUnsafeWork: true });
+    expect(freshLaneSafety({ path: '/l', exec: git({ status: '?? new.mjs\n', stash: '', 'rev-list': '0' }) })).toMatchObject({ hasUnsafeWork: true });
+    expect(freshLaneSafety({ path: '/l', exec: git({ status: '', stash: 'stash@{0}: x', 'rev-list': '0' }) })).toMatchObject({ hasUnsafeWork: true });
+    expect(freshLaneSafety({ path: '/l', exec: git({ status: '', stash: '', 'rev-list': '3' }) })).toMatchObject({ hasUnsafeWork: true });
+  });
+  it.each(['!! ignored.txt\n', '!! local-data/\n'])(
+    'refuses every destructive action for ignored work reported as %s', status => {
+      const exec = vi.fn((bin, argv) => {
+        if (argv[0] === 'config') return '';
+        if (argv[0] === 'status') return argv.includes('--ignored=traditional') ? status : '';
+        if (argv[0] === 'ls-files') return argv[1] === '--stage' ? '' : 'H tracked.txt\n';
+        if (argv[0] === 'stash') return '';
+        if (argv[0] === 'rev-list') return '0\n';
+        throw new Error(`unexpected command: ${bin} ${argv.join(' ')}`);
+      });
+      gitMocks.push(exec);
+      for (const action of ['reclaim', 'reset', 'reuse', 'release-on-behalf']) {
+        expect(guardLaneAction({ path: '/l', action, exec, log: vi.fn() })).toMatchObject({
+          act: false, fresh: { hasUnsafeWork: true, reason: 'worktree has changes' },
+        });
+      }
+    });
+  it('pins the exact git argv: untracked files listed in full, all refs and HEAD counted against trusted publication only', () => {
+    const exec = git({ status: '', stash: '', 'rev-list': '0\n' });
+    freshLaneSafety({ path: '/l', exec });
+    expect(exec.mock.calls.map(([bin, argv]) => [bin, argv])).toEqual([
+      ['git', [...LANE_CONFIG_LIST_ARGS]],
+      ['git', ['ls-files', '--stage', '-z']],
+      ['git', ['status', '--porcelain', '--untracked-files=all', '--ignored=traditional', '--ignore-submodules=none']],
+      ['git', ['ls-files', '-v']],
+      ['git', ['stash', 'list', '--no-show-signature']],
+      ['git', ['rev-parse', '--git-path', 'info/grafts']],
+      ['git', ['rev-list', '--count', '--all', 'HEAD', '--not', PUBLISHED_TIP]],
+    ]);
+    for (const [, , options] of exec.mock.calls) {
+      expect(options).toMatchObject({ cwd: '/l', encoding: 'utf8', timeout: 30_000 });
+      expect(options.env.GIT_OPTIONAL_LOCKS).toBe('0');
+    }
+    expect(exec.mock.calls[2][1]).toEqual([...DIRTY_PROBE_ARGS]);
+  });
+  it.each(['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY'])(
+    'ignores inherited %s so a clean foreign repository cannot authorize a dirty lane', variable => {
+      vi.stubEnv(variable, '/foreign/clean');
+      const exec = vi.fn((bin, argv, options) => {
+        if (argv[0] === 'config') return '';
+        // Model a clean foreign repo masking edits in the lane selected by cwd.
+        if (argv[0] === 'status') return options.env[variable] ? '' : ' M tracked.txt\n';
+        if (argv[0] === 'ls-files') return argv[1] === '--stage' ? '' : 'H tracked.txt\n';
+        if (argv[0] === 'stash') return '';
+        if (argv[0] === 'rev-list') return '0\n';
+        throw new Error(`unexpected command: ${bin} ${argv.join(' ')}`);
+      });
+      gitMocks.push(exec);
+      try {
+        expect(freshLaneSafety({ path: '/l', exec })).toMatchObject({ hasUnsafeWork: true, reason: 'worktree has changes' });
+        for (const action of ['reclaim', 'reset', 'reuse', 'release-on-behalf']) {
+          expect(guardLaneAction({ path: '/l', action, exec, log: vi.fn() }).act).toBe(false);
+        }
+        for (const [, , options] of exec.mock.calls) {
+          expect(options.cwd).toBe('/l');
+          expect(options.env).not.toHaveProperty(variable);
+          expect(options.env.GIT_CEILING_DIRECTORIES).toBe('/');
+        }
+      } finally { vi.unstubAllEnvs(); }
+    });
+  it('sanitizes the environment of every git probe in a clean lane', () => {
+    const selectors = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY'];
+    for (const key of selectors) vi.stubEnv(key, '/foreign/clean');
+    const exec = git({ status: '', stash: '', 'rev-list': '0' });
+    try {
+      expect(freshLaneSafety({ path: '/fixture/lane', exec }).hasUnsafeWork).toBe(false);
+      expect(exec).toHaveBeenCalledTimes(commands.length);
+      for (const [, , options] of exec.mock.calls) {
+        for (const key of selectors) expect(options.env).not.toHaveProperty(key);
+        expect(options.env.GIT_CEILING_DIRECTORIES).toBe('/fixture');
+        expect(options.env.GIT_OPTIONAL_LOCKS).toBe('0');
+        // A missing object must never trigger a lazy fetch through lane-chosen transport config.
+        expect(options.env.GIT_NO_LAZY_FETCH).toBe('1');
+      }
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it.each([
+    { work: 'only an untracked file', status: '?? dir/new.mjs\n', count: '0\n', reason: 'worktree has changes' },
+    { work: 'only commits missing from origin', status: '', count: '2\n', reason: '2 unpushed commit(s)' },
+  ])('reports a lane with $work unsafe using the full git argv', ({ status, count, reason }) => {
+    // Deliberately return clean results for other argv so a missing flag cannot pass by triggering an exec error.
+    const exec = vi.fn((bin, argv) => {
+      if (argv[0] === 'config') return '';
+      const command = JSON.stringify([bin, argv]);
+      if (command === JSON.stringify(['git', ['status', '--porcelain', '--untracked-files=all', '--ignored=traditional', '--ignore-submodules=none']])) return status;
+      if (command === JSON.stringify(['git', ['ls-files', '-v']])) return 'H tracked.txt\n';
+      if (command === JSON.stringify(['git', ['stash', 'list', '--no-show-signature']])) return '';
+      if (command === JSON.stringify(['git', ['rev-list', '--count', '--all', 'HEAD', '--not', PUBLISHED_TIP]])) return count;
+      if (argv.includes('status') || argv[1] === '--stage') return '';
+      return '0\n';
+    });
+    gitMocks.push(exec);
+    expect(freshLaneSafety({ path: '/l', exec })).toMatchObject({ hasUnsafeWork: true, reason });
+  });
+  it('refuses every destructive action when status would hide submodule changes without an explicit override', () => {
+    // Model Git hiding submodule dirt unless the command explicitly overrides ignore settings.
+    // The fallback is clean (not an error), so omission must fail by authorizing the action.
+    const exec = vi.fn((bin, argv) => {
+      if (argv[0] === 'config') return '';
+      if (argv[0] === 'status') return argv.includes('--ignore-submodules=none') ? ' M child\n' : '';
+      if (argv[0] === 'ls-files') return argv[1] === '--stage' ? '' : 'H child\n';
+      if (argv[0] === 'stash') return '';
+      if (argv[0] === 'rev-parse') return '.git/info/grafts\n';
+      if (argv[0] === 'rev-list') return '0\n';
+      throw new Error(`unexpected command: ${bin} ${argv.join(' ')}`);
+    });
+    gitMocks.push(exec);
+    for (const action of ['reclaim', 'reset', 'reuse', 'release-on-behalf']) {
+      expect(guardLaneAction({ path: '/l', action, exec, log: vi.fn() })).toMatchObject({
+        act: false, fresh: { hasUnsafeWork: true, reason: 'worktree has changes' },
+      });
+    }
+  });
+  it.each(['h', 'S', 's', 'M', '?'])(
+    'refuses every destructive action when index tag %s hides work despite clean status', tag => {
+      const exec = git({ status: '', 'ls-files': `H ordinary.txt\n${tag} tracked.txt\n`, stash: '', 'rev-list': '0' });
+      expect(freshLaneSafety({ path: '/l', exec })).toMatchObject({
+        hasUnsafeWork: true, fresh: true, reason: 'index flags may hide worktree changes',
+      });
+      for (const action of ['reclaim', 'reset', 'reuse', 'release-on-behalf']) {
+        expect(guardLaneAction({ path: '/l', action, exec, log: vi.fn() })).toMatchObject({
+          act: false, fresh: { hasUnsafeWork: true, reason: 'index flags may hide worktree changes' },
+        });
+      }
+    });
+  it('refuses destructive action when the index flag probe fails', () => {
+    const exec = git({ status: '', 'ls-files': new Error('index unreadable'), stash: '', 'rev-list': '0' });
+    expect(guardLaneAction({ path: '/l', action: 'reset', exec, log: vi.fn() })).toMatchObject({
+      act: false, fresh: { hasUnsafeWork: true, reason: 'fresh safety check failed', error: 'index unreadable' },
+    });
+  });
+  it('any error, timeout or unparseable output is unsafe', () => {
+    for (const outputs of [{ config: new Error('config unreadable') }, { stage: new Error('index unreadable') },
+      { status: new Error('timeout') }, { status: '', stash: new Error('locked') },
+      { status: '', stash: '', 'rev-list': new Error('bad object') }, { status: '', stash: '', 'rev-list': 'nope' }]) {
+      expect(freshLaneSafety({ path: '/l', exec: git(outputs) })).toMatchObject({ hasUnsafeWork: true, fresh: true });
+    }
+    expect(freshLaneSafety({ path: '', exec: git({}) })).toMatchObject({ hasUnsafeWork: true });
+  });
+  it('stale cached SAFE + fresh UNSAFE -> no action (the record is ignored, the fresh check decides)', () => {
+    const cachedRecord = { kind: 'lane-lease', id: '/fixture/lane-1', hasUnsafeWork: null, safety: { source: 'cache', cachedHasUnsafeWork: false } };
+    const log = vi.fn();
+    const exec = git({ status: ' M work-in-progress.mjs\n', stash: '', 'rev-list': '0' });
+    const verdict = guardLaneAction({ path: cachedRecord.id, action: 'release-on-behalf', exec, log });
+    expect(verdict).toMatchObject({ act: false, fresh: { hasUnsafeWork: true, fresh: true } });
+    expect(exec).toHaveBeenCalled();
+    expect(log.mock.calls[0][0]).toContain('refused');
+    for (const action of ['reclaim', 'reset', 'reuse', 'release-on-behalf']) {
+      expect(guardLaneAction({ path: '/fixture/lane-1', action, exec, log }).act).toBe(false);
+    }
+  });
+  it('fresh check error -> no action; a throwing or non-fresh checker -> no action; only fresh safe -> act', () => {
+    const log = vi.fn();
+    expect(guardLaneAction({ path: '/l', action: 'reset', exec: git({ status: new Error('EACCES') }), log }).act).toBe(false);
+    expect(guardLaneAction({ path: '/l', action: 'reset', check: () => { throw new Error('boom'); }, log }).act).toBe(false);
+    expect(guardLaneAction({ path: '/l', action: 'reset', check: () => ({ hasUnsafeWork: false }), log }).act).toBe(false);
+    expect(guardLaneAction({ path: '/l', action: 'reset', exec: git({ status: '', stash: '', 'rev-list': '0' }), log }).act).toBe(true);
+  });
+  it('logging never decides: a throwing logger neither blocks a safe lane nor frees an unsafe one', () => {
+    const log = vi.fn(() => { throw new Error('log sink down'); });
+    expect(guardLaneAction({ path: '/l', action: 'reset', exec: git({ status: '', stash: '', 'rev-list': '0' }), log }))
+      .toMatchObject({ act: true });
+    expect(guardLaneAction({ path: '/l', action: 'reset', exec: git({ status: ' M a.mjs\n', stash: '', 'rev-list': '0' }), log }))
+      .toMatchObject({ act: false });
+    expect(log).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('untrusted lane Git configuration', () => {
+  it('does not execute fsmonitor or external diff from configuration overrides (read-only Git)', () => {
+    const marker = join(temp(), 'executed');
+    const command = `echo executed >> '${marker}'`;
+    vi.stubEnv('GIT_CONFIG_COUNT', '2');
+    vi.stubEnv('GIT_CONFIG_KEY_0', 'core.fsmonitor');
+    vi.stubEnv('GIT_CONFIG_VALUE_0', command);
+    vi.stubEnv('GIT_CONFIG_KEY_1', 'diff.external');
+    vi.stubEnv('GIT_CONFIG_VALUE_1', command);
+    try {
+      // Exercise the actual guard and Git without writing any repository metadata.
+      const exec = vi.fn(execFileSync);
+      guardLaneAction({ path: process.cwd(), action: 'reclaim', exec, log: vi.fn() });
+      expect(exec.mock.calls.some(([, argv]) => argv[0] === 'status')).toBe(true);
+      expect(existsSync(marker)).toBe(false);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('hardens every probe and reads filter configuration before examining the worktree', () => {
+    const exec = vi.fn((bin, argv) => argv[0] === 'rev-list' ? '0\n' : argv[0] === 'rev-parse' ? '.git/info/grafts\n' : '');
+    expect(freshLaneSafety({ path: '/fixture/lane', exec }).hasUnsafeWork).toBe(false);
+    expect(exec.mock.calls.map(([, argv]) => argv)).toEqual([
+      [...LANE_CONFIG_LIST_ARGS], ['ls-files', '--stage', '-z'], [...DIRTY_PROBE_ARGS], ['ls-files', '-v'], ['stash', 'list', '--no-show-signature'],
+      ['rev-parse', '--git-path', 'info/grafts'],
+      ['rev-list', '--count', '--all', 'HEAD', '--not', PUBLISHED_TIP],
+    ]);
+    for (const [, , { env }] of exec.mock.calls) {
+      const config = Object.fromEntries(Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) =>
+        [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]));
+      expect(config).toMatchObject(Object.fromEntries(LANE_GIT_CONFIG_PINS));
+      expect(env).toMatchObject({ GIT_CONFIG_NOSYSTEM: '1', GIT_PAGER: 'cat', GIT_OPTIONAL_LOCKS: '0' });
+      expect(env).not.toHaveProperty('GIT_EXTERNAL_DIFF');
+    }
+  });
+
+  it.each(['local', 'worktree'])('refuses %s clean filters before status can execute them', scope => {
+    const exec = vi.fn(() => `${scope}\0filter.marker.clean\nmarker-command\0`);
+    expect(guardLaneAction({ path: '/fixture/lane', action: 'reset', exec, log: vi.fn() }))
+      .toMatchObject({ act: false, fresh: { reason: 'lane Git filter drivers present' } });
+    expect(exec.mock.calls.map(([, argv]) => argv)).toEqual([[...LANE_CONFIG_LIST_ARGS]]);
+  });
+
+  // `.` does not match a line terminator, so a key such as `filter.red<U+2028>team.clean` slipped past every `.+` key regex.
+  const LINE_TERMINATORS = [['LF', '\n'], ['U+2028', '\u2028'], ['U+2029', '\u2029'], ['CR', '\r'], ['CRLF', '\r\n'], ['VT/FF', '\v\f']];
+  it.each(LINE_TERMINATORS)('line-terminator filter name (%s) still refuses the lane and never calls status', (_label, term) => {
+    for (const driver of ['clean', 'smudge', 'process']) {
+      const exec = vi.fn(() => `local\0filter.red${term}team.${driver}\nmarker-command\0`);
+      expect(freshLaneSafety({ path: '/fixture/lane', exec }))
+        .toMatchObject({ hasUnsafeWork: true, reason: 'lane Git filter drivers present' });
+      expect(exec.mock.calls.map(([, argv]) => argv)).toEqual([[...LANE_CONFIG_LIST_ARGS]]);
+      expect(exec.mock.calls.some(([, argv]) => argv[0] === 'status')).toBe(false);
+    }
+  });
+
+  it.each(LINE_TERMINATORS)('every config-key regex sees through a line terminator (%s) inside the name', (_label, term) => {
+    const entry = (scope, key, value = 'x') => `${scope}\0${key}\n${value}\0`;
+    expect(laneFilterDrivers(entry('local', `filter.a${term}b.clean`))).toEqual([`filter.a${term}b.clean`]);
+    expect(laneFilterDrivers(entry('worktree', `filter.a${term}b.process`))).toHaveLength(1);
+    expect(laneRedirectConfig(entry('local', `remote.o${term}rigin.promisor`, 'true'))).toHaveLength(1);
+    expect(laneRedirectConfig(entry('local', `remote.o${term}rigin.uploadpack`))).toHaveLength(1);
+    expect(riskyLaneConfig(entry('local', `credential.a${term}b.helper`))).toHaveLength(1);
+    expect(riskyLaneConfig(entry('local', `url.a${term}b.insteadOf`))).toHaveLength(1);
+    expect(riskyLaneConfig(entry('local', `remote.o${term}rigin.url`, 'ext::sh -c evil'))).toHaveLength(1);
+    expect(riskyLaneConfig(entry('local', `alias.a${term}b`))).toHaveLength(1);
+    expect(scrubInheritedGitEnv({ [`GIT_CONFIG_KEY_0${term}x`]: 'core.fsmonitor', [`GIT_CONFIG_VALUE_${term}`]: 'x', KEEP: '1' }))
+      .toEqual({ KEEP: '1' });
+  });
+
+  it('a newline inside a key cannot truncate it into a name the filter check misses', () => {
+    expect(configKeyCandidates('filter.a\nb.clean\nvalue')).toEqual(['filter.a', 'filter.a\nb.clean', 'filter.a\nb.clean\nvalue']);
+    expect(laneFilterDrivers('local\0filter.a\r\nb.process\nvalue\0')).toEqual(['filter.a\r\nb.process']);
+    // The fail-closed split must not flag an ordinary safe remote whose URL merely ends in `.url`.
+    expect(riskyLaneConfig('local\0remote.origin.url\nhttps://example.com/x.url\0')).toEqual([]);
+  });
+
+  it('refuses submodules before status can enter their untrusted configuration', () => {
+    const exec = vi.fn((bin, argv) => argv[0] === 'config' ? '' : `160000 ${'a'.repeat(40)} 0\tchild\0`);
+    expect(guardLaneAction({ path: '/fixture/lane', action: 'reset', exec, log: vi.fn() }))
+      .toMatchObject({ act: false, fresh: { reason: 'submodule safety requires separate inspection' } });
+    expect(exec.mock.calls.map(([, argv]) => argv)).toEqual([[...LANE_CONFIG_LIST_ARGS], ['ls-files', '--stage', '-z']]);
+  });
+
+  const entry = (key, value, scope = 'local') => `${scope}\0${key}${value === undefined ? '' : `\n${value}`}\0`;
+  it.each([
+    ['core.ignoreStat', 'true'], ['core.ignorestat', 'yes'], ['core.ignoreStat', undefined], ['core.ignoreStat', 'maybe'],
+    ['core.sparseCheckout', 'true'], ['core.sparseCheckoutCone', 'on'], ['index.sparse', '1'], ['core.untrackedCache', 'true'],
+    ['core.fileMode', 'false'], ['core.symlinks', 'false'], ['core.trustctime', 'no'],
+    ['core.autocrlf', 'true'], ['core.autocrlf', 'input'], ['core.eol', 'crlf'], ['core.checkstat', 'minimal'],
+  ])('refuses %s=%s (status or the index would under-report) before status runs', (key, value) => {
+    for (const scope of ['local', 'worktree']) {
+      expect(laneMaskingConfig(entry(key, value, scope))).toEqual([key]);
+    }
+    const exec = vi.fn(() => entry(key, value));
+    expect(guardLaneAction({ path: '/fixture/lane', action: 'reset', exec, log: vi.fn() }))
+      .toMatchObject({ act: false, fresh: { reason: 'lane Git config can hide worktree changes' } });
+    expect(exec.mock.calls.some(([, argv]) => argv[0] === 'status')).toBe(false);
+  });
+
+  it.each([
+    ['core.ignoreStat', 'false'], ['core.sparseCheckout', 'off'], ['core.fileMode', 'true'], ['core.symlinks', 'yes'],
+    ['core.autocrlf', 'false'], ['core.eol', 'native'], ['core.checkstat', 'default'], ['core.ignorecase', 'true'],
+    ['core.repositoryformatversion', '0'],
+  ])('leaves honest %s=%s alone, and a global-scope value is not lane-owned', (key, value) => {
+    expect(laneMaskingConfig(entry(key, value))).toEqual([]);
+    expect(laneMaskingConfig(entry('core.ignoreStat', 'true', 'global'))).toEqual([]);
+  });
+
+  it.each(LINE_TERMINATORS)('a masking key still matches through a line terminator (%s) in its name', (_label, term) => {
+    expect(laneMaskingConfig(`local\0core.ignoreStat\n${term}true\0`)).toEqual(['core.ignoreStat']);
+  });
+
+  it('parses a hostile many-line config entry in linear time and still sees the key on its first lines', () => {
+    const hostile = `x.y\n${'\n'.repeat(200_000)}`;
+    const started = Date.now();
+    expect(configKeyCandidates(hostile).length).toBeLessThanOrEqual(9);
+    expect(laneMaskingConfig(`local\0${hostile}\0`)).toEqual([]);
+    expect(laneFilterDrivers(`local\0${hostile}\0`)).toEqual([]);
+    expect(riskyLaneConfig(`local\0${hostile}\0`)).toEqual([]);
+    expect(laneRedirectConfig(`local\0${hostile}\0`)).toEqual([]);
+    // The keys that matter are on the first lines and are still found past a huge value.
+    expect(laneMaskingConfig(`local\0core.ignoreStat\ntrue${'\n'.repeat(200_000)}\0`)).toEqual(['core.ignoreStat']);
+    expect(laneFilterDrivers(`local\0filter.a.clean\n${'x\n'.repeat(100_000)}\0`)).toEqual(['filter.a.clean']);
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+
+  it('pins the honest value of every masking key at command scope, after any existing pins, and agrees with the refusal', () => {
+    const env = withHonestReportingPins({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'a.b', GIT_CONFIG_VALUE_0: '1',
+      GIT_CONFIG_KEY_1: 'c.d', GIT_CONFIG_VALUE_1: '2', KEEP: 'x' });
+    expect(env.GIT_CONFIG_COUNT).toBe(String(2 + LANE_HONEST_REPORTING_PINS.length));
+    expect(env).toMatchObject({ GIT_CONFIG_KEY_0: 'a.b', GIT_CONFIG_VALUE_1: '2', KEEP: 'x' });
+    LANE_HONEST_REPORTING_PINS.forEach(([key, value], i) => {
+      expect([env[`GIT_CONFIG_KEY_${2 + i}`], env[`GIT_CONFIG_VALUE_${2 + i}`]]).toEqual([key, value]);
+      // A pin is only honest if the refusal would accept that very value in a lane's own config.
+      expect(laneMaskingConfig(entry(key, value))).toEqual([]);
+    });
+    // Every key the refusal knows has a pin, so no host-level setting survives unpinned.
+    for (const key of ['core.ignoreStat', 'core.sparseCheckout', 'core.sparseCheckoutCone', 'index.sparse', 'core.untrackedCache',
+      'core.fileMode', 'core.symlinks', 'core.trustctime', 'core.checkStat']) {
+      expect(LANE_HONEST_REPORTING_PINS.map(([k]) => k)).toContain(key);
+    }
+    // Line-ending settings are refused in a lane's own config but never pinned: a host with autocrlf=true must not be refused for good.
+    expect(LANE_HONEST_REPORTING_PINS.map(([k]) => k)).not.toContain('core.autocrlf');
+    expect(LANE_HONEST_REPORTING_PINS.map(([k]) => k)).not.toContain('core.eol');
+    const probe = vi.fn(() => '');
+    freshLaneSafety({ path: '/l', exec: probe });
+    for (const [, , options] of probe.mock.calls) {
+      expect(options.env.GIT_CONFIG_COUNT).toBe(String(LANE_GIT_CONFIG_PINS.length + LANE_HONEST_REPORTING_PINS.length));
+    }
+  });
+
+  // The closed path for the guarantee "output we cannot parse is unsafe", one case per parsed probe.
+  const CLEAN_STAGE = `100644 ${'a'.repeat(40)} 0\ttracked.txt\0`;
+  const CLEAN_CONFIG = 'local\0core.repositoryformatversion\n0\0';
+  it.each([
+    { name: 'config with an unknown scope', config: 'weird\0core.bare\nfalse\0', reason: 'lane Git config listing unparseable' },
+    { name: 'config with a dangling scope', config: 'local\0core.bare\nfalse\0local', reason: 'lane Git config listing unparseable' },
+    { name: 'config missing its final terminator', config: 'local\0core.bare\nfalse', reason: 'lane Git config listing unparseable' },
+    { name: 'config with an empty entry', config: 'local\0\0', reason: 'lane Git config listing unparseable' },
+    { name: 'stage entry that is not mode/oid/stage/path', stage: 'garbage\0', reason: 'staged index listing unparseable' },
+    { name: 'stage listing missing its final terminator', stage: `100644 ${'a'.repeat(40)} 0\ttracked.txt`, reason: 'staged index listing unparseable' },
+    { name: 'stage entry with a truncated oid', stage: '100644 abc 0\ttracked.txt\0', reason: 'staged index listing unparseable' },
+  ])('refuses malformed config and staged-index output: $name', ({ config = CLEAN_CONFIG, stage = CLEAN_STAGE, reason }) => {
+    const fake = (cfg, stg) => vi.fn((bin, argv) => {
+      if (argv[0] === 'config') return cfg;
+      if (argv[0] === 'ls-files' && argv[1] === '--stage') return stg;
+      if (argv[0] === 'ls-files') return 'H tracked.txt\n';
+      if (argv[0] === 'rev-parse') return '.git/info/grafts\n';
+      if (argv[0] === 'rev-list') return '0\n';
+      return '';
+    });
+    const exec = fake(config, stage);
+    expect(guardLaneAction({ path: '/fixture/lane', action: 'reset', exec, log: vi.fn() }))
+      .toMatchObject({ act: false, fresh: { hasUnsafeWork: true, reason } });
+    expect(exec.mock.calls.some(([, argv]) => argv[0] === 'status')).toBe(false);
+    // Control: the same mock with well-formed output authorizes the action, so the refusal above is the parse.
+    expect(guardLaneAction({ path: '/fixture/lane', action: 'reset', exec: fake(CLEAN_CONFIG, CLEAN_STAGE), log: vi.fn() }))
+      .toMatchObject({ act: true });
+  });
+});
+
+describe('lane action guard with real Git', () => {
+  const actions = ['reclaim', 'reset', 'reuse', 'release-on-behalf'];
+  const fixture = () => {
+    const path = temp();
+    const git = argv => execFileSync('git', argv, {
+      cwd: path, encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...laneGitEnv(path), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
+    });
+    // All Git writes stay inside this disposable fixture, never the lane checkout.
+    git(['init', '--quiet']);
+    writeFileSync(join(path, 'tracked.txt'), 'committed content\n');
+    writeFileSync(join(path, '.gitignore'), 'ignored.txt\nlocal-data/\n');
+    git(['add', 'tracked.txt', '.gitignore']);
+    const commit = () => git(['-c', 'user.name=Guard Fixture', '-c', 'user.email=guard@example.invalid',
+      '-c', 'commit.gpgSign=false', '-c', 'core.hooksPath=/dev/null', 'commit', '--quiet', '-m', 'fixture']);
+    commit();
+    publishedTips.set(path, git(['rev-parse', 'HEAD']).trim());
+    // A tracking ref may agree with publication, but is never its authority.
+    git(['update-ref', 'refs/remotes/origin/fixture', 'HEAD']);
+    for (const action of actions) {
+      expect(guardLaneAction({ path, action, log: vi.fn() })).toMatchObject({
+        act: true, fresh: { hasUnsafeWork: false },
+      });
+    }
+    return { path, git, commit };
+  };
+
+  it('never runs marker scripts from lane-local fsmonitor or diff configuration', () => {
+    const { path, git } = fixture();
+    const scripts = temp();
+    const marker = join(scripts, 'executed');
+    const script = join(scripts, 'marker.sh');
+    writeFileSync(script, `#!/bin/sh\necho executed >> '${marker}'\n`, { mode: 0o700 });
+    const command = `'${script}'`;
+    git(['config', 'core.fsmonitor', command]);
+    git(['config', 'diff.external', command]);
+    for (const action of actions) {
+      expect(guardLaneAction({ path, action, log: vi.fn() }).act).toBe(true);
+      expect(existsSync(marker)).toBe(false);
+    }
+    writeFileSync(join(path, 'tracked.txt'), 'modified content\n');
+    expect(guardLaneAction({ path, action: 'reclaim', log: vi.fn() }).act).toBe(false);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it.each(['loose', 'packed'])('refuses forged %s origin refs for every destructive action with real Git', storage => {
+    const { path, git, commit } = fixture();
+    writeFileSync(join(path, 'tracked.txt'), 'never published\n');
+    git(['add', 'tracked.txt']);
+    commit();
+    git(['update-ref', 'refs/remotes/origin/forged', 'HEAD']);
+    if (storage === 'packed') git(['pack-refs', '--all', '--prune']);
+    // Reproduce the exact old false-safe count without treating it as authority.
+    expect(git(['rev-list', '--count', '--all', 'HEAD', '--not', '--remotes=origin'])).toBe('0\n');
+    for (const action of actions) {
+      expect(guardLaneAction({ path, action, log: vi.fn() })).toMatchObject({
+        act: false, fresh: { hasUnsafeWork: true, reason: '1 unpushed commit(s)' },
+      });
+    }
+    expect(readFileSync(join(path, 'tracked.txt'), 'utf8')).toBe('never published\n');
+  });
+
+  it.each(['loose', 'packed'])('reporting ignores forged %s unrelated origin refs with real Git', storage => {
+    const { path, git, commit } = fixture();
+    const branch = git(['branch', '--show-current']).trim();
+    git(['update-ref', `refs/remotes/origin/${branch}`, 'HEAD']);
+    git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    writeFileSync(join(path, 'tracked.txt'), 'never published\n');
+    git(['add', 'tracked.txt']);
+    commit();
+    git(['update-ref', 'refs/remotes/origin/x', 'HEAD']);
+    if (storage === 'packed') git(['pack-refs', '--all', '--prune']);
+    expect(git(['rev-list', '--count', 'HEAD', '--not', '--remotes=origin'])).toBe('0\n');
+    const lane = { path, branch, clean: true, lease: { agentPid: 123 } };
+    const run = vi.fn((bin, argv, options) => bin === 'git' ? execFileSync(bin, argv, options) : JSON.stringify({ lanes: [lane] }));
+    const read = () => createStaleStateReader({ root: path, run, listFiles: () => [], runStore: { list: () => [] }, probe: () => false })().records[0];
+    expect(read()).toMatchObject({ hasUnsafeWork: true, lane: { ahead: 1 } });
+    git(['update-ref', '-d', `refs/remotes/origin/${branch}`]);
+    expect(read()).toMatchObject({ hasUnsafeWork: null, lane: { ahead: null } });
+    expect(readFileSync(join(path, 'tracked.txt'), 'utf8')).toBe('never published\n');
+  });
+
+  it.each(['loose', 'packed'].flatMap(storage => ['expected branch', 'main', 'both'].map(target => ({ storage, target }))))(
+    'reporting stays unknown when $storage $target tracking refs are forged to HEAD with real Git', ({ storage, target }) => {
+      const { path, git, commit } = fixture();
+      const branch = 'lane/reporting-forgery';
+      git(['checkout', '--quiet', '-b', branch]);
+      const branchRef = `refs/remotes/origin/${branch}`;
+      const mainRef = 'refs/remotes/origin/main';
+      git(['update-ref', branchRef, 'HEAD']);
+      git(['update-ref', mainRef, 'HEAD']);
+      writeFileSync(join(path, 'tracked.txt'), 'never published\n');
+      git(['add', 'tracked.txt']);
+      commit();
+      const lane = { path, branch, clean: true, lease: { agentPid: 123 } };
+      const run = vi.fn((bin, argv, options) => bin === 'git' ? execFileSync(bin, argv, options) : JSON.stringify({ lanes: [lane] }));
+      const read = () => createStaleStateReader({ root: path, run, listFiles: () => [], runStore: { list: () => [] }, probe: () => false })().records[0];
+      expect(read()).toMatchObject({ hasUnsafeWork: true, lane: { clean: true, ahead: 1 } });
+      if (target !== 'main') git(['update-ref', branchRef, 'HEAD']);
+      if (target !== 'expected branch') git(['update-ref', mainRef, 'HEAD']);
+      if (storage === 'packed') git(['pack-refs', '--all', '--prune']);
+      expect(git(['rev-list', '--count', 'HEAD', '--not', branchRef, mainRef])).toBe('0\n');
+      expect(read()).toMatchObject({ hasUnsafeWork: null, lane: { clean: true, ahead: 0 },
+        safety: { reason: 'local tracking refs cannot prove publication' } });
+      for (const action of actions) {
+        expect(guardLaneAction({ path, action, log: vi.fn() })).toMatchObject({
+          act: false, fresh: { hasUnsafeWork: true, reason: '1 unpushed commit(s)' },
+        });
+      }
+      expect(readFileSync(join(path, 'tracked.txt'), 'utf8')).toBe('never published\n');
+    });
+
+  it.each(['core.sparseCheckout', 'core.sparseCheckoutCone', 'index.sparse'])(
+    'refuses sparse-checkout masking config %s with real Git', key => {
+      const { path, git } = fixture();
+      git(['config', key, 'true']);
+      for (const action of actions) {
+        expect(guardLaneAction({ path, action, log: vi.fn() }))
+          .toMatchObject({ act: false, fresh: { reason: 'lane Git config can hide worktree changes' } });
+      }
+    });
+
+  it.each(['K', 'ı'])('refuses a non-ASCII filter name %s before executing its driver with real Git', name => {
+    const { path, git } = fixture();
+    const marker = join(temp(), 'executed');
+    git(['config', `filter.${name}.clean`, `echo executed > '${marker}'; cat`]);
+    writeFileSync(join(path, '.git', 'info', 'attributes'), `tracked.txt filter=${name}\n`);
+    const config = git([...LANE_CONFIG_LIST_ARGS]);
+    expect(laneFilterDrivers(config)).toContain(`filter.${name}.clean`);
+    for (const action of actions) {
+      expect(guardLaneAction({ path, action, log: vi.fn() }))
+        .toMatchObject({ act: false, fresh: { reason: 'lane Git filter drivers present' } });
+    }
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it.each([
+    ['extensions.partialclone', 'origin', 'partial-clone lazy fetch'],
+    ['remote.origin.promisor', 'true', 'promisor remote lazy fetch'],
+    ['remote.origin.uploadpack', 'MARKER', 'lane-chosen upload-pack transport'],
+    ['core.gitProxy', 'MARKER', 'lane-chosen git proxy'],
+  ])('refuses a lane whose config enables %s (%s) without executing the marker', (key, value) => {
+    const { path, git } = fixture();
+    const scripts = temp();
+    const marker = join(scripts, 'executed');
+    const script = join(scripts, 'marker.sh');
+    writeFileSync(script, `#!/bin/sh\necho executed >> '${marker}'\n`, { mode: 0o700 });
+    git(['config', key, value === 'MARKER' ? script : value]);
+    for (const action of actions) {
+      expect(guardLaneAction({ path, action, log: vi.fn() }))
+        .toMatchObject({ act: false, fresh: { reason: 'lane Git config redirects objects, transport or worktree' } });
+    }
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it('refuses a lane that redirects its worktree, instead of probing a different clean checkout', () => {
+    const { path, git } = fixture();
+    const elsewhere = fixture().path; // a different, genuinely clean and pushed checkout
+    writeFileSync(join(path, 'untracked.txt'), 'local data\n');
+    git(['config', 'core.worktree', elsewhere]);
+    for (const action of actions) {
+      expect(guardLaneAction({ path, action, log: vi.fn() }))
+        .toMatchObject({ act: false, fresh: { hasUnsafeWork: true } });
+    }
+  });
+
+  it('refuses a lane with a legacy info/grafts file that would hide an unpushed commit; unchanged without it', () => {
+    const { path, git } = fixture();
+    const pushed = git(['rev-parse', 'HEAD']).trim();
+    git(['-c', 'user.name=Guard Fixture', '-c', 'user.email=guard@example.invalid', '-c', 'commit.gpgSign=false',
+      '-c', 'core.hooksPath=/dev/null', 'commit', '--quiet', '--allow-empty', '-m', 'unpushed']);
+    const unpushed = git(['rev-parse', 'HEAD']).trim();
+    // The probe's unpushed-commit count must not be trusted once the lane can rewrite history with grafts.
+    const grafts = join(path, '.git', 'info', 'grafts');
+    mkdirSync(join(path, '.git', 'info'), { recursive: true });
+    writeFileSync(grafts, `${unpushed} ${pushed}\n`);
+    for (const action of actions) {
+      expect(guardLaneAction({ path, action, log: vi.fn() }))
+        .toMatchObject({ act: false, fresh: { hasUnsafeWork: true, reason: 'lane has legacy grafts file' } });
+    }
+    // An empty grafts file still counts: presence is the signal, not content.
+    writeFileSync(grafts, '');
+    expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: true, reason: 'lane has legacy grafts file' });
+    rmSync(grafts);
+    expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: true, reason: '1 unpushed commit(s)' });
+  });
+
+  it('refuses a lane whose config makes status under-report: core.fileMode=false hides a mode change, core.ignoreStat hides an edit', () => {
+    const { path, git } = fixture();
+    chmodSync(join(path, 'tracked.txt'), 0o755);
+    expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: true, reason: 'worktree has changes' });
+    git(['config', 'core.fileMode', 'false']);
+    // Git itself now reports the lane clean; only the config refusal keeps the guard from authorizing a reset.
+    expect(git(['status', '--porcelain']).trim()).toBe('');
+    for (const action of actions) {
+      expect(guardLaneAction({ path, action, log: vi.fn() }))
+        .toMatchObject({ act: false, fresh: { hasUnsafeWork: true, reason: 'lane Git config can hide worktree changes' } });
+    }
+    git(['config', 'core.fileMode', 'true']);
+    chmodSync(join(path, 'tracked.txt'), 0o644);
+    expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: false });
+    git(['config', 'core.ignoreStat', 'true']);
+    // A no-op add need not update the index. Explicitly model the assumed-unchanged
+    // entry that ignoreStat can leave behind, independently of Git's stat timing.
+    git(['update-index', '--assume-unchanged', 'tracked.txt']);
+    expect(git(['ls-files', '-v', 'tracked.txt'])).toBe('h tracked.txt\n');
+    writeFileSync(join(path, 'tracked.txt'), 'edited behind the stat cache\n');
+    expect(git(['status', '--porcelain']).trim()).toBe('');
+    expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: true, reason: 'lane Git config can hide worktree changes' });
+  });
+
+  it('a host-level (global) core.fileMode=false cannot make a lane with edits read as clean', () => {
+    const { path, git } = fixture();
+    const home = temp();
+    writeFileSync(join(home, '.gitconfig'), '[core]\n\tfileMode = false\n');
+    git(['config', '--unset', 'core.fileMode']); // `git init` wrote it locally, which would outrank the global file
+    chmodSync(join(path, 'tracked.txt'), 0o755);
+    vi.stubEnv('HOME', home);
+    vi.stubEnv('XDG_CONFIG_HOME', join(home, '.config'));
+    try {
+      // The global file is what an UNPINNED git would read: it reports the mode change as nothing.
+      const unpinned = execFileSync('git', ['status', '--porcelain'], { cwd: path, encoding: 'utf8',
+        env: { ...laneGitEnv(path), HOME: home, XDG_CONFIG_HOME: join(home, '.config'), GIT_CONFIG_NOSYSTEM: '1',
+          GIT_CONFIG_GLOBAL: join(home, '.gitconfig') } }); // the test runner pins its own global; the probe scrubs it and reads HOME
+      expect(unpinned.trim()).toBe('');
+      for (const action of actions) {
+        expect(guardLaneAction({ path, action, log: vi.fn() }))
+          .toMatchObject({ act: false, fresh: { hasUnsafeWork: true, reason: 'worktree has changes' } });
+      }
+      chmodSync(join(path, 'tracked.txt'), 0o644);
+      expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: false });
+    } finally { vi.unstubAllEnvs(); }
+    expect(git(['status', '--porcelain']).trim()).toBe('');
+  });
+
+  it('refuses a lane whose grafts path cannot be resolved (fail closed)', () => {
+    const exec = vi.fn((bin, argv) => argv[0] === 'rev-list' ? '0\n' : '');
+    expect(freshLaneSafety({ path: '/l', exec })).toMatchObject({ hasUnsafeWork: true, reason: 'lane grafts path unreadable' });
+  });
+
+  it('stays unsafe when a lane-local replace ref makes an unpushed commit look already pushed', () => {
+    const { path, git } = fixture();
+    const pushed = git(['rev-parse', 'HEAD']).trim();
+    git(['-c', 'user.name=Guard Fixture', '-c', 'user.email=guard@example.invalid', '-c', 'commit.gpgSign=false',
+      '-c', 'core.hooksPath=/dev/null', 'commit', '--quiet', '--allow-empty', '-m', 'unpushed']);
+    const unpushed = git(['rev-parse', 'HEAD']).trim();
+    git(['replace', unpushed, pushed]);
+    expect(guardLaneAction({ path, action: 'reclaim', log: vi.fn() }))
+      .toMatchObject({ act: false, fresh: { hasUnsafeWork: true, reason: '1 unpushed commit(s)' } });
+  });
+
+  it('stays unsafe for a lane-local filter even when inherited GIT_CONFIG_GLOBAL points at the lane config', () => {
+    const { path, git } = fixture();
+    const marker = join(temp(), 'executed');
+    writeFileSync(join(path, '.gitattributes'), 'tracked.txt filter=marker\n');
+    writeFileSync(join(path, 'tracked.txt'), 'modified content\n');
+    git(['config', 'filter.marker.clean', `echo executed >> '${marker}'`]);
+    // Re-scopes the lane's local keys to "global", which laneFilterDrivers ignores unless the probe env drops it.
+    vi.stubEnv('GIT_CONFIG_GLOBAL', join(path, '.git', 'config'));
+    vi.stubEnv('GIT_CONFIG_SYSTEM', join(path, '.git', 'config'));
+    try {
+      expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: true, reason: 'lane Git filter drivers present' });
+      expect(guardLaneAction({ path, action: 'reclaim', log: vi.fn() }).act).toBe(false);
+      expect(existsSync(marker)).toBe(false);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it.each(['clean', 'smudge', 'process'])('refuses a lane-local %s filter without executing it', driver => {
+    const { path, git } = fixture();
+    const marker = join(temp(), 'executed');
+    writeFileSync(join(path, '.gitattributes'), 'tracked.txt filter=marker\n');
+    writeFileSync(join(path, 'tracked.txt'), 'modified content\n');
+    git(['config', `filter.marker.${driver}`, `echo executed >> '${marker}'`]);
+    expect(guardLaneAction({ path, action: 'reclaim', log: vi.fn() }))
+      .toMatchObject({ act: false, fresh: { reason: 'lane Git filter drivers present' } });
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it('never enters a submodule with a lane-local clean filter', () => {
+    const { path, git, commit } = fixture();
+    const child = fixture();
+    git(['-c', 'protocol.file.allow=always', 'submodule', 'add', '--quiet', child.path, 'child']);
+    commit();
+    git(['update-ref', 'refs/remotes/origin/fixture', 'HEAD']);
+    const marker = join(temp(), 'executed');
+    git(['-C', join(path, 'child'), 'config', 'filter.marker.clean', `echo executed >> '${marker}'`]);
+    writeFileSync(join(path, 'child', '.gitattributes'), 'tracked.txt filter=marker\n');
+    writeFileSync(join(path, 'child', 'tracked.txt'), 'modified content\n');
+    for (const action of actions) {
+      expect(guardLaneAction({ path, action, log: vi.fn() }))
+        .toMatchObject({ act: false, fresh: { reason: 'submodule safety requires separate inspection' } });
+      expect(existsSync(marker)).toBe(false);
+    }
+  });
+
+  it.each([
+    { work: 'untracked file', reason: 'worktree has changes', prepare: ({ path, git }) => {
+      writeFileSync(join(path, 'untracked.txt'), 'local data\n');
+      expect(git([...DIRTY_PROBE_ARGS])).toBe('?? untracked.txt\n');
+      return 'untracked.txt';
+    } },
+    { work: 'ignored-but-present file', reason: 'worktree has changes', prepare: ({ path, git }) => {
+      writeFileSync(join(path, 'ignored.txt'), 'local data\n');
+      expect(git(['status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none'])).toBe('');
+      expect(git([...DIRTY_PROBE_ARGS])).toBe('!! ignored.txt\n');
+      return 'ignored.txt';
+    } },
+    ...['--assume-unchanged', '--skip-worktree'].map(flag => ({
+      work: flag, reason: 'index flags may hide worktree changes', prepare: ({ path, git }) => {
+        git(['update-index', flag, 'tracked.txt']);
+        writeFileSync(join(path, 'tracked.txt'), 'local data\n');
+        expect(git([...DIRTY_PROBE_ARGS])).toBe('');
+        expect(git(['ls-files', '-v', 'tracked.txt'])).toBe(`${flag === '--assume-unchanged' ? 'h' : 'S'} tracked.txt\n`);
+        return 'tracked.txt';
+      },
+    })),
+    { work: 'modified submodule hidden by Git configuration', reason: 'submodule safety requires separate inspection', prepare: ({ path, git, commit }) => {
+      const child = fixture();
+      git(['-c', 'protocol.file.allow=always', 'submodule', 'add', '--quiet', child.path, 'child']);
+      commit();
+      git(['update-ref', 'refs/remotes/origin/fixture', 'HEAD']);
+      git(['config', 'diff.ignoreSubmodules', 'all']);
+      git(['config', 'submodule.child.ignore', 'all']);
+      expect(freshLaneSafety({ path })).toMatchObject({ hasUnsafeWork: true, reason: 'submodule safety requires separate inspection' });
+      writeFileSync(join(path, 'child', 'tracked.txt'), 'local data\n');
+      expect(git(['status', '--porcelain', '--untracked-files=all'])).toBe('');
+      expect(git([...DIRTY_PROBE_ARGS])).toBe(' M child\n');
+      return join('child', 'tracked.txt');
+    } },
+    { work: 'unpushed commit', reason: '1 unpushed commit(s)', prepare: ({ path, git, commit }) => {
+      writeFileSync(join(path, 'tracked.txt'), 'local data\n');
+      git(['add', 'tracked.txt']);
+      commit();
+      // A non-origin remote knows this commit; only origin refs may authorize losing it.
+      git(['update-ref', 'refs/remotes/backup/fixture', 'HEAD']);
+      expect(git([...DIRTY_PROBE_ARGS])).toBe('');
+      expect(git(['rev-list', '--count', 'HEAD', '--not', '--remotes=origin'])).toBe('1\n');
+      return 'tracked.txt';
+    } },
+    ...[
+      { work: 'unpushed commit on a non-HEAD branch with pushed HEAD', ref: 'refs/heads/local-work', detached: false },
+      { work: 'unpushed commit on a non-HEAD branch with detached HEAD', ref: 'refs/heads/local-work', detached: true },
+      { work: 'unpushed commit held only by a tag', ref: 'refs/tags/local-work', detached: false },
+      { work: 'unpushed commit held only by a custom ref', ref: 'refs/local/work', detached: false },
+    ].map(({ work, ref, detached }) => ({
+      work, reason: '1 unpushed commit(s)', expectedContent: 'committed content\n',
+      prepare: ({ path, git, commit }) => {
+        const pushed = git(['rev-parse', 'HEAD']).trim();
+        const branch = git(['symbolic-ref', '--short', 'HEAD']).trim();
+        git(['switch', '--quiet', '--detach']);
+        writeFileSync(join(path, 'tracked.txt'), 'local data\n');
+        git(['add', 'tracked.txt']);
+        commit();
+        git(['update-ref', ref, 'HEAD']);
+        git(['switch', '--quiet', ...(detached ? ['--detach', pushed] : [branch])]);
+        expect(git([...DIRTY_PROBE_ARGS])).toBe('');
+        expect(git(['rev-list', '--count', 'HEAD', '--not', '--remotes=origin'])).toBe('0\n');
+        expect(git(['show', `${ref}:tracked.txt`])).toBe('local data\n');
+        return 'tracked.txt';
+      },
+    })),
+  ])('reports $work unsafe and refuses every destructive action with real Git', ({ prepare, reason, expectedContent }) => {
+    const repo = fixture();
+    const file = prepare(repo);
+    expect(freshLaneSafety({ path: repo.path })).toMatchObject({ hasUnsafeWork: true, fresh: true, reason });
+    for (const action of actions) {
+      expect(guardLaneAction({ path: repo.path, action, log: vi.fn() })).toMatchObject({
+        act: false, fresh: { hasUnsafeWork: true, reason },
+      });
+    }
+    expect(readFileSync(join(repo.path, file), 'utf8')).toBe(expectedContent ?? 'local data\n');
+  }, 30_000);
+});
+
+describe('stale-state operation factory cache opt-in', () => {
+  it.each([
+    { enabled: undefined, dir: '/cache', write: '1', laneScan: undefined },
+    { enabled: '', dir: '/cache', write: '1', laneScan: undefined },
+    { enabled: '0', dir: '/cache', write: '1', laneScan: undefined },
+    { enabled: 'true', dir: '/cache', write: '1', laneScan: undefined },
+    { enabled: '1', dir: '/cache', write: '1', laneScan: { dir: '/cache', write: true } },
+    { enabled: '1', dir: '', write: '', laneScan: { dir: undefined, write: false } },
+    { enabled: '1', dir: undefined, write: undefined, laneScan: { dir: undefined, write: false } },
+    { enabled: '1', dir: '/cache', write: '0', laneScan: { dir: '/cache', write: false } },
+  ])('passes laneScan=$laneScan for enabled=$enabled, dir=$dir, write=$write', ({ enabled, dir, write, laneScan }) => {
+    for (const [key, value] of Object.entries({
+      WE_HEALTH_WATCH_LANE_SCAN: enabled,
+      WE_HEALTH_WATCH_LANE_SCAN_DIR: dir,
+      WE_HEALTH_WATCH_LANE_SCAN_WRITE: write,
+    })) {
+      vi.stubEnv(key, value ?? '');
+      if (value === undefined) delete process.env[key];
+    }
+    createStaleStateReader.mockClear();
+    try {
+      OPERATIONS['stale-state']();
+      expect(createStaleStateReader).toHaveBeenCalledTimes(1);
+      expect(createStaleStateReader).toHaveBeenCalledWith({ laneScan });
+    } finally { vi.unstubAllEnvs(); }
+  });
+});
+
+describe('lane scan setting cascade', () => {
+  it.each([
+    ['platform', 60, undefined, undefined, 60, 'platform'],
+    ['tool', 60, 90, undefined, 90, 'tool'],
+    ['env', 60, 90, '120', 120, 'env'],
+    ['invalid platform', -1, undefined, undefined, 300, 'standard'],
+    ['invalid tool', 60, '90', undefined, 300, 'standard'],
+    ['invalid env', 60, 90, '0', 300, 'standard'],
+  ])('default settings path resolves %s with provenance', (_label, platform, tool, env, interval, source) => {
+    const platformSpy = vi.mocked(policyCascade.platformPreference).mockClear()
+      .mockReturnValueOnce({ laneScanIntervalSec: platform });
+    const toolSpy = vi.mocked(settingsFiles.readDeclaredSettings).mockClear()
+      .mockReturnValueOnce({ settings: { healthWatch: { laneScanIntervalSec: tool } } });
+    vi.stubEnv('WE_HEALTH_WATCH_LANE_SCAN_INTERVAL_SEC', env ?? '');
+    if (env === undefined) delete process.env.WE_HEALTH_WATCH_LANE_SCAN_INTERVAL_SEC;
+    try {
+      const result = resolveLaneScanPolicy();
+      expect(result).toMatchObject({ interval, source });
+      expect(result.invalid.length).toBe(source === 'standard' ? 1 : 0);
+      expect(platformSpy).toHaveBeenCalledWith('healthWatch', { env: process.env });
+      expect(toolSpy).toHaveBeenCalledWith();
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('reads the real platform default file when no platform argument is supplied', () => {
+    const file = join(temp(), 'preferences.json');
+    writeFileSync(file, JSON.stringify({ healthWatch: { laneScanIntervalSec: 75 } }));
+    vi.mocked(settingsFiles.readDeclaredSettings).mockReturnValueOnce({ settings: {} });
+    vi.stubEnv('WE_PLATFORM_PREFERENCES_FILE', file);
+    vi.stubEnv('WE_HEALTH_WATCH_LANE_SCAN_INTERVAL_SEC', '');
+    delete process.env.WE_HEALTH_WATCH_LANE_SCAN_INTERVAL_SEC;
+    try {
+      expect(resolveLaneScanPolicy()).toEqual({ interval: 75, source: 'platform', invalid: [] });
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  const resolve = options => resolveLaneScanPolicy({ env: {}, platform: {}, tool: {}, ...options });
+  it('uses standard, platform, tool, then environment and logs the winning source', () => {
+    expect(resolve()).toEqual(policy);
+    expect(resolve({ platform: { laneScanIntervalSec: 60 } })).toMatchObject({ interval: 60, source: 'platform' });
+    expect(resolve({ platform: { laneScanIntervalSec: 60 }, tool: { laneScanIntervalSec: 90 } })).toMatchObject({ interval: 90, source: 'tool' });
+    const resolved = resolve({ platform: { laneScanIntervalSec: 60 }, tool: { laneScanIntervalSec: 90 },
+      env: { WE_HEALTH_WATCH_LANE_SCAN_INTERVAL_SEC: '120' } });
+    expect(resolved).toMatchObject({ interval: 120, source: 'env' });
+    const log = vi.fn();
+    cachedLaneScan(() => rows, { dir: null, root: '/fixture', policy: resolved, log });
+    expect(log).toHaveBeenCalledWith('health-watch: lane scan running (due, interval=120s, source=env)');
+  });
+  it.each(['0', '-1', '1.5', 'abc', '', 'Infinity', '9007199254740992'])(
+    'falls back to standard and says so for invalid env %s', value => {
+      const resolved = resolve({ platform: { laneScanIntervalSec: 60 }, env: { WE_HEALTH_WATCH_LANE_SCAN_INTERVAL_SEC: value } });
+      expect(resolved).toMatchObject({ interval: 300, source: 'standard' });
+      const log = vi.fn();
+      cachedLaneScan(() => rows, { dir: null, root: '/fixture', policy: resolved, log });
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(log.mock.calls[0][0]).toContain('source=standard');
+      expect(log.mock.calls[0][0]).toContain('falling back to default 300s');
+    });
+  it.each([0, -1, 1.5, '300'])( 'falls back for invalid tool setting %s', value => {
+    expect(resolve({ tool: { laneScanIntervalSec: value } })).toMatchObject({ interval: 300, source: 'standard' });
+  });
+  it.each([{}, { seconds: 60 }, [60], [], null])('falls back to standard and reports invalid for a malformed object setting %j', value => {
+    for (const layer of ['platform', 'tool']) {
+      const resolved = resolve({ [layer]: { laneScanIntervalSec: value } });
+      expect(resolved).toMatchObject({ interval: 300, source: 'standard' });
+      expect(resolved.invalid.length).toBeGreaterThan(0);
+    }
+  });
+});

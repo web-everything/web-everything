@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { runInNewContext } from 'node:vm';
 const dirs = [];
 const temp = () => { const d = mkdtempSync(join(tmpdir(), 'overload-')); dirs.push(d); return d; };
@@ -11,7 +11,7 @@ afterEach(() => { vi.unstubAllEnvs(); for (const d of dirs.splice(0)) rmSync(d, 
 // Exercise the command wiring without dispatching the lane-pool CLI or mutating Git metadata.
 function poolFunction(name, seams) {
   const source = readFileSync(resolve('scripts/lane-pool.mjs'), 'utf8');
-  const body = source.match(new RegExp(`function ${name}\\([^]*?\\n\\}`))?.[0];
+  const body = source.match(new RegExp(`(?:async )?function ${name}\\([^]*?\\n\\}`))?.[0];
   if (!body) throw Error(`missing lane-pool function ${name}`);
   return runInNewContext(`(${body})`, seams);
 }
@@ -62,26 +62,104 @@ it.each([false, true])('sibling clone disables automatic gc (existing=%s)', (exi
   expect(scrub.mock.invocationCallOrder[0]).toBeLessThan(tryGit.mock.invocationCallOrder[fetchIndex]);
 });
 
-it('gc command runs one pass and watch re-resolves policy with interactive bypass disabled', () => {
-  const run = (watch) => {
+it('gc command runs one pass and watch re-resolves policy with interactive bypass disabled', async () => {
+  const run = async (watch) => {
     const scheduledLaneGc = vi.fn(() => ({ ran: true }));
     const loadHostOverloadSettings = vi.fn().mockReturnValueOnce({ settings: { lanes: { gc: { schedule: 60000 } } } })
       .mockReturnValue({ settings: { lanes: { gc: { schedule: 120000 } } } });
     const timers = [];
     const command = poolFunction('cmdGc', { scheduledLaneGc, loadHostOverloadSettings, flags: { watch },
       existingLanes: () => [1], laneDir: () => '/pool/lane-1', log: () => {},
-      process: { stdin: { isTTY: true } }, setTimeout: (fn, ms) => timers.push({ fn, ms }) });
-    command({});
+      process: { stdin: { isTTY: true } }, recoveryEnabled: () => false,
+      setTimeout: (fn, ms) => timers.push({ fn, ms }) });
+    await command({});
     expect(scheduledLaneGc).toHaveBeenLastCalledWith(['/pool/lane-1'], expect.objectContaining({ interactive: !watch }));
     if (watch) {
       expect(timers[0].ms).toBe(60000);
-      timers[0].fn();
+      await timers[0].fn();
       expect(timers[1].ms).toBe(120000);
       expect(scheduledLaneGc).toHaveBeenCalledTimes(2);
       expect(loadHostOverloadSettings).toHaveBeenCalledTimes(2);
     } else expect(timers).toEqual([]);
   };
-  run(false); run(true);
+  await run(false); await run(true);
+});
+
+// Exercise each scheduled-pass refusal in both command modes, including the next watch tick.
+it.each([false, true])('gc recovery only follows completed scheduled passes (watch=%s)', async watch => {
+  for (const reason of ['host overloaded', 'unreadable policy', 'gc lock held', 'gc schedule not due']) {
+    const scheduledLaneGc = vi.fn().mockReturnValueOnce({ ran: false, reason }).mockReturnValue({ ran: true });
+    const recoverRepoPool = vi.fn(async () => {}), timers = [], log = vi.fn();
+    const command = poolFunction('cmdGc', {
+      scheduledLaneGc, flags: { watch }, existingLanes: () => [1], laneDir: () => '/pool/lane-1',
+      recoveryEnabled: () => true, recoverRepoPool, log, process: { stdin: {} },
+      loadHostOverloadSettings: () => ({ settings: { lanes: { gc: { schedule: 60000 } } } }),
+      setTimeout: (fn, ms) => timers.push({ fn, ms }),
+    });
+    const repo = { originUrl: 'https://example.org/canonical.git' };
+    await command(repo);
+    expect(recoverRepoPool).not.toHaveBeenCalled();
+    if (watch) {
+      expect(timers[0].ms).toBe(60000);
+      await timers[0].fn();
+      expect(timers[1].ms).toBe(60000);
+    } else await command(repo);
+    expect(recoverRepoPool).toHaveBeenCalledTimes(1);
+    expect(recoverRepoPool).toHaveBeenCalledWith(repo);
+  }
+});
+
+it.each([false, true])('gc skips recovery without a resolved canonical origin (watch=%s)', async watch => {
+  const recoverRepoPool = vi.fn(), log = vi.fn(), timers = [];
+  const command = poolFunction('cmdGc', {
+    scheduledLaneGc: () => ({ ran: true }), flags: { watch }, existingLanes: () => [], laneDir: vi.fn(),
+    recoveryEnabled: () => true, recoverRepoPool, log, process: { stdin: {} },
+    loadHostOverloadSettings: () => ({ settings: { lanes: { gc: { schedule: 60000 } } } }),
+    setTimeout: (fn, ms) => timers.push({ fn, ms }),
+  });
+  await command({ originUrl: null });
+  expect(recoverRepoPool).not.toHaveBeenCalled();
+  expect(log).toHaveBeenCalledWith(expect.stringMatching(/gc recovery skipped:.*canonical origin.*--origin/));
+  expect(timers).toHaveLength(watch ? 1 : 0);
+});
+
+it.each(['lane', 'linked lane worktree', 'unreadable owner', 'primary', 'explicit origin'])(
+  'gc only resolves a canonical recovery origin from trusted evidence: %s', kind => {
+    const reference = kind === 'lane' ? '/pool/project/lane-1' : '/primary/project';
+    const origin = 'https://example.org/project.git';
+    const tryGit = vi.fn((args) => {
+      if (args[0] === 'remote') return origin;
+      if (args[1] === '--show-toplevel') return reference;
+      if (args[1] === '--git-dir' || args[1] === '--git-common-dir') {
+        if (kind === 'unreadable owner') return null;
+        return kind === 'linked lane worktree' ? '/pool/project/lane-1/.git' : join(reference, '.git');
+      }
+      return null;
+    });
+    const repo = poolFunction('resolveRepo', {
+      flags: { repo: reference, pool: 'project', ...(kind === 'explicit origin' ? { origin } : {}) },
+      cmd: 'gc', resolve, dirname, basename, join, sep, expandHome: value => value,
+      resolveReal: value => value, POOL_ROOT: '/pool', CWD_TOP_LEVEL: true, CHECKOUT_ROOT: '/primary/project',
+      process: { env: {} }, laneGitHardeningEnv: value => value, scrubGitRepoEnv: value => value,
+      LOCAL_GIT_TIMEOUT_MS: 1000, tryGit, fail: message => { throw Error(message); },
+    })();
+    expect(repo.poolDir).toBe('/pool/project');
+    expect(repo.originUrl).toBe(['primary', 'explicit origin'].includes(kind) ? origin : null);
+  },
+);
+
+it('gc watch retries unreadable policy without running a pass or recovery', async () => {
+  const scheduledLaneGc = vi.fn(), recoverRepoPool = vi.fn(), timers = [], log = vi.fn();
+  const command = poolFunction('cmdGc', {
+    scheduledLaneGc, recoverRepoPool, flags: { watch: true }, log,
+    loadHostOverloadSettings: () => { throw Error('unreadable policy'); },
+    setTimeout: (fn, ms) => timers.push({ fn, ms }),
+  });
+  await command({ originUrl: 'https://example.org/canonical.git' });
+  expect(scheduledLaneGc).not.toHaveBeenCalled();
+  expect(recoverRepoPool).not.toHaveBeenCalled();
+  expect(log).toHaveBeenCalledWith('gc skipped: unreadable policy');
+  expect(timers[0].ms).toBe(60000);
 });
 
 // Kept for the launcher gate: local repair sandboxes forbid executing lane-pool.mjs.

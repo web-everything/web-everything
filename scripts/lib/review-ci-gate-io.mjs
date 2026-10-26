@@ -1,4 +1,4 @@
-import { ciRedOnHead, fastChecksFor, reviewStartGate } from './review-timing.mjs';
+import { ciRedOnHead, fastChecksFor, reviewStartGate, reviewUsesRequiredChecks } from './review-timing.mjs';
 import { resolveTimingPolicy } from './review-timing-settings.mjs';
 /** Fresh repo-explicit review eligibility, with injectable read-only GitHub IO. */
 import { readGh } from './proc-read.mjs';
@@ -52,7 +52,7 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
     let checks;
     const fast = policy.startAfter === 'fast-checks' ? fastChecksFor(policy.fastChecks, repo) : null;
     // A repo whose CI does not publish fast checks waits on its own required set, exactly as ci-green does.
-    const needsRequired = policy.startAfter === 'ci-green' || (policy.startAfter === 'fast-checks' && !fast);
+    const needsRequired = reviewUsesRequiredChecks(policy, repo);
     let required = { source: 'timing-policy', checks: fast ?? [] };
     if (needsRequired) required = readRequired({ repo, ttlMs: 0 });
     else {

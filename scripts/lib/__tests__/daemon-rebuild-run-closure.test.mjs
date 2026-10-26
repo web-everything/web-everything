@@ -1,6 +1,7 @@
 /** @file Per-walk filesystem caching for the rebuild's import and spawned-script closure. */
 import { describe, expect, it } from 'vitest';
 import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { collectRunClosure, decideSkipRebuild, makeSkipCheck } from '../daemon-rebuild/skip-unrelated.mjs';
 import { collectImportClosure } from '../import-closure.mjs';
 
@@ -26,6 +27,16 @@ function fixture(contents) {
 }
 
 describe('collectRunClosure filesystem reads', () => {
+  it('keeps the registry reader closure complete when its child imports a base-ref copy', () => {
+    const root = resolve(fileURLToPath(import.meta.url), '../../../..');
+    const entry = 'scripts/lib/gate-config.mjs';
+    const closure = collectImportClosure({ root, entries: [entry] });
+    expect(closure.files.has(entry)).toBe(true);
+    expect(closure.complete).toBe(true);
+    expect(decideSkipRebuild({ closure, changedFiles: ['scripts/unrelated.mjs'] }).skip).toBe(true);
+    expect(decideSkipRebuild({ closure, changedFiles: [entry] }).skip).toBe(false);
+  });
+
   it('checks shared import targets once in a standalone import walk', () => {
     const f = fixture({
       'scripts/daemon.mjs': "import './shared.mjs';\nimport './worker.mjs';\n",

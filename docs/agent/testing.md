@@ -18,6 +18,95 @@ Identity, path and published batch-ref validators use explicit absolute-end asse
 (`(?![\s\S])`). Keep the named trailing-newline regressions and the CR/CRLF/Unicode
 line-separator suffix cases in that required scoped gate.
 
+## Established-overlay auto-rebase
+
+Operator withdrawal wins over a detached repair: the worker rechecks its source registration
+before push, then `addOverlay` compares the same snapshot under the overlay list mutex before
+registering a replacement. An absent, changed (including a new `addedAt`) or corrupt source refuses registration,
+creates no pending swap and reports `auto-rebase-needs-you`. A removal during push can leave an
+unregistered remote branch; it never authorizes loading that branch. Unrelated list edits are preserved.
+The `operator withdrawal during detached repair` tests cover each async phase and the final write boundary;
+the `auto-rebase-operator-withdrawal` soak scenario uses the real removal CLI with injected Git and agents.
+All three registration guards share `registrationIdentity`: cached `stackBases` rewrites do not change
+operator intent, while every other field still participates in the comparison. Worker regressions rewrite
+the cache during audit and at registration, then exercise adoption cleanup.
+Pending evidence is persisted before replacement registration. Write or rename failure leaves only the
+original registration; a rejected registration removes its pending file. An interruption between persistence
+and registration leaves evidence for cleanup to escalate safely. The persistence regressions also retry the repair.
+Under Vitest, `prepareRebuild` defaults auto-rebase to off without mutating the caller's environment;
+tests exercising worker launch or pending cleanup must explicitly set `WE_DAEMON_AUTO_REBASE=1`.
+
+The detached worker in `scripts/lib/daemon-rebuild/auto-rebase.mjs` merges main into a new
+`<ref>-auto-<n>` branch so ancestry preserves the original tip. It retains the old registration
+until the verified adopted HEAD contains the replacement SHA and the replacement contains a freshly
+fetched origin tip of the old ref. An advanced or unreadable old tip retains both registrations and
+escalates through `auto-rebase-needs-you`. Cleanup requires the replacement's freshly fetched origin
+tip to contain the pending SHA, and `removeOverlay`'s `requireRef` checks the replacement is still
+registered under the same list mutex that removes the original, so a withdrawal up to that write wins;
+its `expectedOverlay` is the original's registration recorded in the pending file at swap time (never a
+fresh read), so an original re-registered at any point since is never removed, on that pass or a later
+one; a pending file without it fails closed. A replacement
+unregistered before adoption escalates every cleanup pass instead of waiting silently;
+the pending file stays, so a fresh repair is the operator's call;
+missing or unreadable evidence retains the old registration and pending file and alerts in both sinks.
+A mechanism-pinned original is never set aside as stack-contained, so the plan still lists it as lost
+beside its applied repair. `prepareRebuild` does not hold for a lost overlay whose current tip the
+build contains (git ancestry; an unreadable answer still holds), so the repair can be adopted and cleaned up.
+Per-ref JSON sidecars next to the overlay
+list survive ticks; per-ref markers expire after 30 minutes without a heartbeat. Live detached
+workers touch their own token's marker every minute with an unrefed interval, cleared in `finally`.
+Long-running agents and tests use asynchronous child processes so they cannot starve that timer.
+Test liveness past expiry with a fake clock and injected filesystem touch. Failed workers retain their
+marker until expiry to bound retry cost. `WE_DAEMON_AUTO_REBASE=0` disables
+new jobs and pending-swap cleanup. Cleanup follows interrupted-build recovery and requires
+`state.adopted.head === HEAD`. Launch and pending-swap failures write both the needs-you event and alert.
+Pending files are isolated: unreadable JSON, invalid swaps and failed removal retain the evidence
+and leave later files eligible for cleanup. Unexpected scan failures also escalate from prepare.
+Both Codex JSON reports must carry exit code zero, no timeout, and terminal `turn.completed`;
+the wrapper process exiting zero alone is insufficient. The source of the switch is logged on consultation. Missing related tests, incomplete
+reads, more than 100 selected tests, failed tests, or an audit without the exact verdict
+`NOT WEAKENED` escalate through `auto-rebase-needs-you`; the old registration remains.
+Select scoped tests from the completed candidate diff against the old tip as well as the
+original conflict paths: the fixer can edit modules beyond those conflicts.
+Git path listings use `-z` and split on NUL without trimming, so non-ASCII and whitespace
+paths match the import graph in conflict, candidate-diff and overlay-branch selection.
+The static reverse-import graph supplies scoped tests, so dynamic-only relationships require human intervention. Exercise both registration and adoption with real git in temporary repos;
+Codex and the queued test runner stay fake in `daemon-rebuild-auto-rebase.test.mjs`.
+The queued test run must also produce a fresh Vitest JSON report proving every selected file executed.
+Load its inventory helper only during validation: its dependency graph needs npm packages, while
+the copied-script backlog CLI fixtures intentionally boot without `node_modules`.
+Exit zero alone is insufficient: a mixed selection can pass while the unit config excludes an integration
+file. Missing, malformed, partial, oversized (over 8 MiB), or entirely skipped inventories stop before audit, push and registration
+with `auto-rebase-needs-you`; verifying excluded tiers requires human review. The worker uses the shared
+`alwaysRunInventory` check, compares paths against the scratch clone's real path, and removes its private
+report on exit. The `auto-rebase executed-test inventory` regression includes a real Vitest exclusion probe;
+the existing `auto-rebase-operator-withdrawal` soak break also exercises the omitted-file refusal.
+Cleanup attempts both the private report and the scratch clone before rejecting a removal failure.
+It emits one cleanup needs-you event and alert, including both reasons if both removals fail,
+and retains the original registration and pending swap. The report/scratch/both cleanup cases
+in `daemon-rebuild-auto-rebase.test.mjs` pin those guarantees.
+The existing [test-selection fallback and durable evidence](../../scripts/lib/__tests__/daemon-rebuild-auto-rebase.test.mjs) cases cover overlay tests, reverse imports, skipped empty runners and exact audit refusal.
+Report and scratch cleanup are both attempted. A cleanup pass emits one needs-you incident containing
+each removal failure; scratch cleanup failure still rejects the worker, while report-only failure remains
+best-effort. The cleanup regression covers report-only, scratch-only and simultaneous failures.
+Missing related tests fall back to overlay-branch tests plus import reach; fenced `noTestFiles` reaches the required audit, which must certify exactly `NOT WEAKENED`.
+Selection rules and original conflict markers persist as JSONL evidence before tests; each conflict read and capture is capped at 65,536 bytes, with its descriptor closed in `finally`.
+Evidence append failures stop at stage `tests` before tests, audit, push or registration; the needs-you event remains the fallback when the alerts file is unwritable.
+Before test selection, list the candidate and both parent trees and require every parent's
+`.test.*` or `.spec.*` JS/TS test path to remain at the same path in the candidate, including renames.
+Any existing test removed by resolution requires human review at stage `tests`, even if other tests
+remain or an auditor would certify the result. Unreadable tree listings also fail closed.
+The `codex-audit-required` fallback covers genuinely uncovered files only; it cannot rescue deleted tests.
+Capture skips non-regular files and platforms without `O_NOFOLLOW`; inspection, open and read failures remain best-effort omissions from evidence.
+
+## Copied CLI fixtures
+
+When copying `scripts/` into a throwaway checkout, link that checkout's `node_modules` to the source
+checkout's installed dependencies. Run the copied entry point so its `import.meta.url` still resolves
+mutations inside the fixture. Node resolves package imports from the copied modules' location, even
+when the child process runs from another directory. Keep the dependency link at the fixture root when
+moving its `scripts/` subtree for locus guards, and remove the fixture during teardown.
+
 ## Daemon entry boot smoke
 
 Boot each entry in a fresh child to preserve cold import graphs. `rebuildSmoke.bootConcurrency`
@@ -100,6 +189,18 @@ negative answers without file reads remain unverifiable.
 
 ## Drain red-team disposition and retry evidence
 
+Accept carry-forward's advisory exemption must use `readConfirmedBreaks` and `planRedTeamActions`,
+including settings and `WE_RED_TEAM_CONFIRMED_BREAKS` overrides. A send-back finding or an
+unresolved policy supersedes the stale accept; the fallback is a fresh review. Regression cases
+in `accept-carry-forward.replay.test.mjs` cover `degraded=send-back`, cosmetic classification,
+non-blocking overrides, and throwing, missing, incomplete or unknown policy resolution.
+
+Gate exemption tests must isolate each predicate with an otherwise valid envelope. The replay
+cases **rejects complete gate envelopes with forbidden outcomes** retain a successful card action;
+**rejects card-queued without a successful card line** covers absent, advisory-only, failed and
+malformed card actions. A successful card beside a failed or unrecognized action must also refuse
+carry, independently defending validation of every action line.
+
 The drain owes a live-head red team only after a speculative or sequential pass is scheduled
 (recorded queued/running status or seat evidence). The review job records the pass as queued as
 soon as the loop returns an owed accept, before the added seats. Before that status exists, the
@@ -112,12 +213,120 @@ picked up, retains the 45-minute never-scheduled recovery path; live passes and 
 cannot use it.
 
 Already-reviewed heads with an owed result can use the existing review job's `--red-team-only`
-mode (`--red-team-only=resume|fresh`; the bare flag retains fresh guards). A recorded scorecard row plus a finished status whose `result` string or `result.status` is `ran` or `resumed`
-resumes its missing comment/effects without another model call; a failed recovery persists `resumed` and remains eligible after cooldown, subject to the same clean-row guards;
-only a head with neither status nor row starts fresh. A trusted result comment, live pass,
+mode (`--red-team-only=resume|fresh`; the bare flag retains fresh guards). A completed scorecard seat (`completedRecorded === true`) plus a finished status whose `result` string or `result.status` is `ran` or `resumed`
+resumes its missing comment/effects without another model call; a failed recovery persists `resumed` and remains eligible after cooldown, subject to the same clean-row guards.
+Daemon and soak fixtures that expect legacy completion strings to resume must carry that seat evidence explicitly; with `recorded === true`, missing or incomplete completed-seat evidence refuses dispatch.
+Only a head with neither status nor row starts fresh. A trusted result comment, live pass,
 non-accept, unreadable evidence, recorded row without a status, or any prior result other than `ran` or `resumed`
-prevents dispatch. The dispatcher carries the selected mode into the job. At job time, resume requires a clean row selected by `priorRedTeamRow` from a strict scorecard-store read, plus a finished `ran` or `resumed` status without a posted comment. Fresh mode re-reads and refuses any status or red-team seat row for that head. Unreadable scorecards refuse with `red-team-not-owed`; inspect the stored evidence before retrying. Recovery
-shares the tick's lane/live-review capacity and host admission (including recovery-only ticks).
+prevents dispatch, except a finished `skipped` status with `skipCardOnly === true` and a
+stored card-only net read with non-empty trimmed `diffText` and `netBasis.rev` matching the status head: that historical gap dispatches fresh to settle the skip. A structured result with an absent policy or any policy other than `card-only` never heals; legacy string `skipped` remains eligible.
+The dispatcher carries the selected mode into the job. At job time, resume requires a clean row selected by `priorRedTeamRow` from a strict scorecard-store read, plus a finished `ran` or `resumed` status without a posted comment. Fresh mode re-reads and refuses any status or red-team seat row for that head; admission treats the validated historical card-only skip as fresh while retaining the seat-row and comment guards. Unreadable scorecards refuse with `red-team-not-owed`; inspect the stored evidence before retrying.
+
+Settlement runs for skipped, error, disabled and unknown outcomes before the finished status write and gate in both normal and red-team-only jobs. Budget/guard deferrals (including `deferredByCap` and `deferredByGuard`) also reach non-policy settlement. An accepted head already owes a pass: even plain `not-owed` settles as non-policy needs-you with reason `red team reported not-owed on an accepted head`. Only completed (`ran`/`resumed`) outcomes with a `posted` or `deduped` result comment bypass settlement. Completion also requires no truthy guard/cap deferral flag, successful summary/diagnostic derivations, and a complete live comment read with a trusted result for exactly the settlement head. The production visibility hook shares settlement's `readCompletePrComments` reader and uses `redTeamForHead`; missing readers, unreadable/incomplete threads, other heads and untrusted authors fail closed to needs-you, without posting or clearing. Completed outcomes that fail these checks settle as `unpublished`; those with any other or missing comment status settle as `unpublished`, with reason `red team <status> but its result comment is <comment status or unknown>` through the same sanitized, bounded needs-you path; they never post a result comment or clear.
+The persisted `skipCardOnly` boolean records the writer's resolved setting; consumers must still classify the stored net read, so a `.mjs` code diff remains owed. Settlement exception diagnostics cannot abort the finished status write or gate even if the logger throws.
+Contain summary construction, seat diagnostics and unpublished-comment reason coercion too: malformed
+findings or an unstringifiable comment status must still reach settlement and preserve the finished
+status write and gate. Runner exceptions and policy-comment post failures use the shared
+`safeErrorText` catch boundary (including message access and string coercion), falling back to
+`unprintable error`; post failures still persist pending needs-you before publication and retry.
+Guard deferrals clear queued admission for retry instead of writing finished status. A `ran` or
+`resumed` result carrying a cap deferral suppresses the gate; a `skipped` cap attempt rolls back
+admission and still runs the gate over existing findings. Completion-evidence and red-team-only
+tests assert those lifecycle differences.
+Gate suppression retains the completed status and runner's cap flag before reading comment
+diagnostics, so a throwing comment-status accessor cannot admit a cap-deferred completion in either job mode.
+The fallback summary also retains guard deferrals before diagnostics, preserving admission rollback.
+Coerce diagnostic values with `String()` inside a catch boundary, using `unknown`
+for an unreadable comment status; retain the original completed status when summary rows fail.
+Only structured `status: 'skipped', policy: 'card-only'` without any truthy `deferredByGuard`
+or `deferredByCap` flag, with a real 40-hex `readHead`
+(the loop read's `netBasis.rev`) matching the settlement head case-insensitively produces a trusted,
+head-bound zero-finding result comment. An absent, invalid or mismatched read head publishes
+needs-you with reason `policy skip head not bound to the reviewed read`. Reason strings never grant clearance. Other skips and failed policy comment posts
+publish needs-you with kind `red-team-skip-<first 26 hex of the SHA-256 identity key>`, so distinct reasons survive feed deduplication. Embedded reasons are sanitized with `sanitizeForFeed` and capped at 80 characters before constructing both the item and deterministic identity key. Markers deduplicate by repo/PR/head/sanitized bounded reason under `red-team-status/skip-published`;
+Write the item atomically to `red-team-status/skip-pending/<key>.json` before publication, then write the published marker and remove the pending record after success. Before retry publication, re-sanitize and bound the embedded reason (80 characters) and title (200 characters), and require the filename and kind to match the content-addressed identity of the sanitized fields. Invalid records, including unreadable per-record metadata, move to `.json.bad` (or are removed if quarantine fails) with a quarantine diagnostic; an operator must inspect and repair or reissue them. Every settlement first retries up to 25 unpublished pending records without a model call, even when settling another PR. Failures retain their records and do not abort the current settlement; overflow is logged and remains for the next settlement. Already-published pending records are removed without republication. Settlement uses the stored review head, then the prepared lane head; the job refuses an invalid prepared lane head before running the arc. If no real head is available, publish with `head: 'unknown'` and include the run ID in the identity key (a fresh attempt ID if absent); the attempt ID is persisted as `attemptId` so retries can verify the key. Unknown-head pending records without that identity are quarantined. Fallback heads identify needs-you items but cannot authorize policy clearance.
+Regressions: `red-team-skip-outcome.test.mjs`, `red-team-skip-outcome-regressions.test.mjs`, `review-job-red-team-skip.test.mjs`, `review-red-team-on-skip.test.mjs`, `review-red-team-resume-only.test.mjs`.
+Regression mapping (one representative assertion per guarantee; names are in the files above unless noted):
+
+- Sanitized bounded identity and publication: **sanitizes and bounds %s reasons before publication and deterministic deduplication**.
+- Lane validation precedes the arc: **invalid prepared lane head stops the job before settlement (%s)**.
+- Missing read revision needs no live read: **missing read revision uses the valid lane head without reading live carry evidence**.
+- Settlement exceptions preserve the arc: **throwing settlement still writes finished status and runs gate (redTeamOnly=%s)**.
+- Retry display bounds: **pending retry re-sanitizes and bounds reason and title before publication**.
+- Retry content identity fails closed: **pending record with a valid-shaped kind but mismatched content key is quarantined**.
+- Unknown-head retries preserve identity: **unknown-head pending records retain their attempt identity across retries**.
+- Legacy unknown-head retries fail closed: **legacy unknown-head pending records without attempt identity are quarantined**.
+- Production comment and feed effects: **production settlement posts marker via gh argv/body and publishes real needs-you**.
+- Budget/guard deferrals escalate once per head/reason without posting a result: **unfinished publication or deferral publishes needs-you once without a result comment: %j**.
+- A plain `not-owed` on an accepted code head is contradictory evidence and escalates in both job modes: **not-owed on an accepted head publishes needs-you (redTeamOnly=%s)** in `review-job-red-team-skip.test.mjs`.
+- A terminal `not-owed` cannot grant policy clearance even with a card-only policy or a misleading reason, and repeated settlement notifies once: **contradictory not-owed never clears and notifies once: %j** in `red-team-skip-outcome.test.mjs`.
+- Finished but unpublished results escalate once without posting or clearing: **unfinished publication or deferral publishes needs-you once without a result comment: %j**.
+- Writer setting never classifies a code PR as card-only: **never exempts a code read from speculation, recovery guards or an owed pending label**.
+- A throwing settlement logger preserves finished status and gate: **throwing settlement and logger still write finished status and run the gate**.
+- Unreadable record metadata cannot block pending retries: **unreadable pending metadata is quarantined without blocking a valid pending record**.
+- Healing retains fresh guards: **healed card-only fresh admission still refuses a prior %s**.
+- Structured policy provenance: **policy predicate requires both structured fields: %s cannot clear**.
+- Read/head binding fails closed: **policy cannot clear an unbound reviewed read (%s)**.
+- Case-insensitive read/head binding: **policy read head binding is case-insensitive**.
+- Missing read revision cannot clear a lane head: **policy skip without a valid netBasis.rev cannot clear the lane head (%s)**.
+- Publication precedes deduplication: **failed publication leaves no marker; retry succeeds before deduplication begins**.
+- Identity includes repo, PR, head and reason: **successful publication deduplicates by repo/PR/head/reason: changing %s publishes again**.
+- Feed kinds preserve distinct reasons: **distinct reasons on one head survive real feed deduplication**.
+- Kind collision regression: **colliding 32-bit reason prefixes produce two real feed lines with 40-character kinds**.
+- Unknown heads retain run identity: **unknown heads deduplicate within a run but retain different attempts**.
+- Absent run IDs retain attempt identity: **unknown-head skips without runId both publish with fresh attempt identities**.
+- Unknown heads cannot clear policy: **policy cannot clear without a real head (%s)**.
+- Incomplete outcomes reach settlement: **production dispatch settles every incomplete outcome %j**.
+- Unverified, deferred or malformed completions notify without clearing: **completed result with %s notifies without posting or clearing**.
+- Production completion evidence uses the complete trusted head-bound thread: **production visibility reader requires a complete trusted result on the settlement head**.
+- Visible completed results bypass settlement: **completed %s with a visible result does not settle**.
+- Fallback head identity survives feed deduplication: **two real lane heads without netBasis.rev publish twice**.
+- Read head takes precedence: **stored review head takes precedence over the prepared lane head**.
+- Prepared lane head fallback: **a missing pinned rev falls back to the prepared lane head, never a null identity**.
+- Historical recovery rejects incomplete reads: **does not heal incomplete or mismatched stored read %j** in `review-red-team-on-skip.test.mjs`.
+- Historical recovery requires provenance: **policy-absent object %j never heals even with a complete card-only read** in `review-red-team-on-skip.test.mjs`.
+- Durable cross-PR retry: **failed publication persists the item before publishing and another PR retries it exactly once**.
+- Retry failure retains pending evidence: **pending retry failure does not block current policy settlement or discard the item**.
+- Parse failures quarantine pending evidence: **unparseable pending evidence is quarantined and cannot prevent current settlement**.
+- Retry bound and overflow fallback: **flushes at most 25 pending records and leaves overflow for the next settlement**.
+- Crash cleanup avoids duplicates: **already-published pending records are removed without republication**.
+- Contradictory policy/deferral evidence fails closed and deduplicates escalation: **policy with contradictory %s=%j fails closed and notifies once**.
+- Malformed completed results retain settlement, finished status and gate: **malformed result settles once without a comment and preserves finished status and gate: %j**.
+- Malformed diagnostics cannot abort settlement: **malformed reason cannot prevent settlement or throw (redTeamOnly=%s)**.
+- Finished status preserves provenance: **persists skip provenance and keeps other outcomes as strings: %j**.
+- Persisted recovery honors policy: **real persisted skip survives drain reads and recovery admission (policy=%s)**.
+- Poison records cannot consume retry slots: **30 invalid records do not consume the attempt budget; one valid record publishes and poison is never rescanned**.
+- Failed attempts count toward the bound and rotate fairly: **failed valid publications count toward 25 attempts and rotate oldest-first across settlements (mtime=%s)**.
+
+Recovery admission carries the `readRedTeamRecoveryStatus` normalization of a confirmed-dead queued
+`ran`/`resumed` prior into the shared guard before writing its own queued status. A confirmed-dead
+queued writer without a resumable prior becomes a finished null-result placeholder, so the planner
+can dispatch fresh only when seat evidence establishes that no pass ran and the evidence reader
+retains the original queued status. An ordinary finished null result has unknown run provenance
+and never authorizes fresh dispatch. The shared placeholder predicate requires explicit original
+queued provenance for null results; admission supplies its pre-write record only after recovery
+normalization. The execution guard supplies no such provenance, so direct fresh calls and queued
+handoffs carrying an ordinary finished/null prior both refuse before provider selection.
+Regression prevention in `review-job-red-team-skip.test.mjs`:
+**fresh guard refuses a finished null prior without queued provenance (admitted=%s)** and
+**fresh admission preserves unknown null completion but recovers a dead queued writer (prior=%s)**.
+The back-port from `8173660fcf` also pins the guard in `review-red-team-resume-only.test.mjs`:
+**refuses a finished null result without queued provenance and with no seat or comment (admitted=%s)**.
+Its production admission regression in `review-job-red-team-only.test.mjs` is
+**fresh recovery preserves unknown finished-null history through production admission and launches no call**;
+it verifies that refusal restores the original finished/null status and publishes no comment.
+These exercise the shared execution guard and production admission, alongside the planner's
+**f: a null completion without queued provenance skips (stored status %s)** in
+`review-red-team-on-skip.test.mjs`. Live or unknown liveness
+and invalid writer PIDs keep the queued record blocked. Regressions in `review-job-red-team-skip.test.mjs`:
+**accepted code head dispatches fresh after queued fresh recovery crashes before running with no seat or result comment**,
+**queued fresh recovery still skips with %s**, and
+**dead queued fresh recovery cannot dispatch over an existing seat row**. A guard
+refusal that launches no call rolls back admission (removes queued status when no prior exists, or restores the
+prior status/result); only a trusted result already on the head is terminal. Regression:
+**a transient comments-unreadable guard refusal leaves status absent and fresh recovery eligible**
+and **a confirmed-dead queued/ran prior admits and reaches the shared resume path without a model call**.
+Recovery shares the tick's lane/live-review capacity and host admission (including recovery-only ticks).
 Ordinary and recovery starts share the remaining host per-tick allowance; confirmed starts and
 unknown outcomes consume the cross-repo host budget, while confirmed non-starts do not.
 Recovery defaults to a 30-minute retry cooldown through
@@ -177,6 +386,26 @@ Verify-daemon orphan fixtures must inject both `isAlive` and `groupAlive`: a fak
 does not imply its host process group is gone. Signal-zero probes can return `EPERM` in a
 restricted execution environment, which correctly retains the entry. The real-process adoption
 test additionally requires permission to inspect child argv with `ps`.
+
+Runner fixtures using synthetic PIDs must inject `identity` alongside `alive`: a successful
+existence probe still checks process identity. Stamp fixtures must also inject `identityOf`
+or supply both `runnerStart` and `runnerArgv`, so stamping cannot inspect a host process.
+
+Keep production PID caller tests in a dedicated file using injected IO: the Vitest
+`node:child_process` module mock does not reach `pid-alive.mjs` in this configuration.
+Inject `buildLeaseSignalsFor`'s `isPidAlive`, composing `defaultIsPidAlive` with a fake
+`kill` and `pidIdentity` with a fake `exec`. Assert the `ps` call as well as liveness
+and reclamation outcomes; see `pid-identity-lease-reaper.test.mjs`.
+
+PID identity probes return `true`, `false`, or `null`: callers must compare explicitly,
+never truthiness-test `defaultIsPidAlive` or `probePid`. Only `false` establishes death;
+unreadable identity or claim-runner command evidence retains a fresh claim's lane veto.
+Test both wrapper and claim-runner wiring. Cover every changed `catch` branch with an
+injected error: existence success and `EPERM` must consult identity (including false and
+null verdicts), `ESRCH` proves death, and other errors remain unknown without identity IO.
+Include invalid PID inputs and an identity probe that throws. A working Claude session
+can retain `claude bg-spare` argv; require stored start/argv mismatch or other positive
+death evidence to reclaim it. Legacy unstamped spares retain TTL recovery.
 
 The host queue needs write access to the admission pool's parent as well as the pool:
 `releaseLockDirIf` atomically renames a lock to a sibling tombstone before removal.
@@ -506,6 +735,17 @@ unlocked fallback on timeout. A refused scorecard write is reported on stderr wi
 successful build. Operation records use UUID filenames and atomic rename; call logs use append-only
 writes, so they do not replace a sibling process's records.
 
+## Antigravity quota hold evidence
+
+Exercise holds with an injected temporary `dir` in
+`scripts/lib/__tests__/antigravity-run-evidence.test.mjs`. Explicit Claude and Gemini
+requests read their own backend folders; default or unrecognized models scan
+`anthropic`, `google`, and `unknown`. Legacy root JSON holds use the known served
+model's backend, falling back to the requested model's backend; unattributed legacy
+holds apply globally. Reads leave legacy files untouched. A skipped run retains
+`servedModel: 'unknown'` and `modelEvidence: 'not-launched'`; `heldBackend` and
+`heldModel` identify the observation responsible for the refusal.
+
 ## Shadow reviewer agreement evidence
 
 The agy mandatory-seat shadows are off by default (operator 2026-10-16).
@@ -707,6 +947,27 @@ applies to every "does it work / why is it broken" moment, not just to written t
   type-filter-coverage guard in `scripts/check-standards.mjs` §10.) Note `check:standards` does **not**
   run the 11ty build, so render-layer bugs stay green-invisible — smoke template changes with a real
   build/probe too.
+
+### Default-parameter dependency tests
+
+The lane-scan resolver's default-parameter tests must mock `platformPreference` and
+`readDeclaredSettings` at the module boundary with hoisted `vi.mock` factories; post-import
+namespace spies did not reach the resolver's named imports in this suite. Preserve the real
+exports and use `mockReturnValueOnce` for each layer case so other callers retain real IO.
+Also exercise the real platform reader with a temporary `WE_PLATFORM_PREFERENCES_FILE`
+and an empty mocked tool layer, calling `resolveLaneScanPolicy()` without injected arguments.
+For an unset environment layer, register the stub for restoration, then explicitly delete the
+key; passing `undefined` to `vi.stubEnv` can leave a string value in older Vitest versions.
+
+### Imported action-wrapper inventories
+
+Lane-action boundary tests inventory imported helper targets from every module, including
+module/export identity and aliased callees. Keep exact per-occurrence counts, keyed by file,
+module, export and callee, for mutating helpers and every helper owned by the change. Only
+known read-only/noise helpers (filesystem reads, pure formatters and renderers; redaction scrubbers keep exact counts) may vary in
+count; a mutating name or target overrides that exemption. Keep distinct module/export identity
+checks for every helper, including noise. Named negative controls must reject repeated existing
+mutations as well as aliased cleanup wrappers imported from outside the owned modules.
 
 ### Gates in git fixtures
 
@@ -952,9 +1213,12 @@ owner liveness even if their recorded PID is dead. Probes reuse `reconcile-pass.
 null/invalid PIDs and foreign-host PIDs remain unknown. TTL and run completion never prove death.
 Claims do not normally record an owner or PID; the report preserves that missing evidence as null.
 
-`hasUnsafeWork` reuses lane status cleanliness and supplements its behind count with a read-only
-count of commits absent from local origin refs. No fetch occurs: remote ref freshness is a named
-limit, and false is never cleanup authorization. Unassociated claims/runs have null work safety.
+`hasUnsafeWork` reuses lane status cleanliness and supplements it with a read-only count of commits
+absent from the verified expected branch and main origin refs. Dirty status or a positive ahead
+count reports true. A zero local ahead count reports null with a publication reason: even these
+expected tracking refs are lane-writable and cannot prove publication. This reader never reports
+false, whether fresh or cached; destructive actions require `guardLaneAction` with fresh trusted
+publication evidence. Unassociated claims/runs have null work safety.
 Age is milliseconds since the recorded acquisition/start time, or null when missing/unreadable.
 
 The CLI normally persists runs and call telemetry even for compute-only operations. This inventory
@@ -2126,3 +2390,15 @@ On an App-token rejection, keep gh's original stderr before the daemon refusal d
 so callers that read the first error line still report GitHub's actual cause.
 The simulator binds its synthetic `sim-token-1` to matching App-token provenance; its fake
 GitHub still owns revocation checks. Never enable personal fallback globally in test setup.
+
+### Adoption evidence and compact terminal output
+
+The adoption matrix is read-only evidence and fails closed. Logged revisions must be full object IDs; probes
+use a sanitized Git environment (no inherited `GIT_DIR`-style variables, `GIT_NO_LAZY_FETCH`,
+`GIT_NO_REPLACE_OBJECTS`, no prompts), run only at a verified repository root, and treat a shallow or unreadable history as
+unknown, never as a definitive "no". Corrupt log lines, bad timestamps or refs, unreadable logs or settings, and gaps in
+clone discovery mark the snapshot incomplete. Reads are bounded (1 MiB log tail, 50 refs, 20 clones, 500 Git calls) and
+omissions are reported as truncation. Clone paths must be absolute. The drain target is the code clone from the
+prototype-load settings, not the plist's data clone; tests inject those settings. Matrix and PR table cells strip
+Cc/Cf controls and are width-capped; table mode keeps the truncated-listing warning.
+

@@ -27,7 +27,7 @@
  *   today: a moved head loses a SHA-bound accept) → platform preference (`we:scripts/settings/accept-carry-forward.json`)
  *   → tool override (env `WE_ACCEPT_CARRY_FORWARD`).
  *
- *   Pure except {@link resolveAcceptCarryForward} (reads the settings file).
+ *   {@link resolveAcceptCarryForward} reads its settings file; red-team advisory classification reads the live gate policy.
  */
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -35,7 +35,8 @@ import { fileURLToPath } from 'node:url';
 
 import { compareCarryFingerprints, resolveCarryEquivalenceSetting } from './carry-equivalence.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
-import { MARKER_RE, JOB_RE } from './approval-prevention-notice.mjs';
+import { MARKER_RE, JOB_RE, RETRACTED_RE } from './approval-prevention-notice.mjs';
+import { breakClass, CONFIRMED_BREAK_ACTIONS, GATE_OUTCOMES, planRedTeamActions, readConfirmedBreaks, parseRedTeamComment, parseRedTeamGateMarker, redTeamMarker, redTeamGateMarker, RED_TEAM_COMMENT_MARKER, RED_TEAM_GATE_MARKER } from './red-team-gate.mjs';
 
 export const ACCEPT_CARRY_FORWARD_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'accept-carry-forward.json');
 
@@ -145,18 +146,99 @@ function isApprovalPreventionNotice(text, comment) {
   return fixedText.exec(rest)?.[0] === rest;
 }
 
+/** Exact buildClearanceComment envelope (importing drain-merge-strategy would cycle back through numbering-carry). */
+function isDrainEnqueueClearance(text, comment) {
+  if (comment !== undefined && !isTrustedMarkerAuthor(comment)) return false;
+  const m = /^<!-- we-drain-enqueue-clearance head=([0-9a-f]{7,40}) -->\n\*\*Drain enqueue clearance\*\* — the drain judged head `([0-9a-f]{7,40})` ready \(every drain gate passed: couple whole, blockedBy landed\) and enqueued it on GitHub's merge queue \(xtpxusq\)\. The `merge-gate` check reads this for its couple-whole \/ blocked-by gates\.$/.exec(text);
+  return Boolean(m) && m[2] === m[1].slice(0, 12);
+}
+
+/** Exact buildLandingRetractionComment envelope; an unknown shape still requires a fresh review. */
+function isApprovalPreventionRetraction(text, comment) {
+  if (comment !== undefined && !isTrustedMarkerAuthor(comment)) return false;
+  const marker = text.matchAll(RETRACTED_RE).next().value;
+  if (!marker || marker.index !== 0) return false;
+  const prefix = `\nThe approval-time prevention card for this head did not land (\`${marker[2]}\` failed at `;
+  const rest = text.slice(marker[0].length);
+  if (!rest.startsWith(prefix)) return false;
+  const reasonAndSuffix = rest.slice(prefix.length);
+  const fixedText = /^[^\r\n]{1,300}\)\. Its filing marker above is retracted, so the next approval on this head files the guard again\./;
+  return fixedText.exec(reasonAndSuffix)?.[0] === reasonAndSuffix;
+}
+
+/** A marker parser deliberately ignores trailing text; a carry exemption must consume the entire machine body. */
+function isNonBlockingRedTeamGate(text) {
+  const gate = parseRedTeamGateMarker(text);
+  if (!gate || ![GATE_OUTCOMES.NOTHING_TO_SEND, GATE_OUTCOMES.CARD_QUEUED].includes(gate.outcome)) return false;
+  const lines = text.split('\n');
+  if (lines[0] !== redTeamGateMarker(gate.pr, gate.rev, gate.outcome, gate.result, gate.grantIds)
+    || lines[1] !== `**Red-team gate** (setting \`redTeam.confirmedBreaks\`, card x1b8hlo) on head \`${gate.rev.slice(0, 12)}\`:`) return false;
+  // Only successful card/advisory action lines. Landing handles are machine tokens, never free prose.
+  const card = /^- [1-9]\d* finding\(s\) filed as a follow-up card \(#[1-9]\d*(?:, #[1-9]\d*)*\) — landing job [A-Za-z0-9:._-]{0,120}\.$/;
+  const advisory = /^- [1-9]\d* finding\(s\) left advisory \(#[1-9]\d*(?:, #[1-9]\d*)*\)\.$/;
+  const actions = lines.slice(2);
+  return actions.every(line => card.test(line) || advisory.test(line))
+    && (gate.outcome !== GATE_OUTCOMES.CARD_QUEUED || actions.some(line => card.test(line)));
+}
+
+/** Validate the rendered envelope and every finding line: the shared evidence parser skips malformed lines. */
+function isNonBlockingRedTeamAdvisory(text) {
+  const parsed = parseRedTeamComment(text);
+  if (!parsed) return false;
+  const lines = text.split('\n');
+  const { findings } = parsed;
+  const heading = findings.length
+    ? `${findings.length} possible break(s), ${findings.filter(f => f.confirmed).length} confirmed by Claude's re-check`
+    : 'no break found';
+  const prefix = 'Advisory only: this comment changes no label itself; the red-team gate (setting `redTeam.confirmedBreaks`) sends a confirmed broken break back to the fixer. '
+    + `Head \`${parsed.rev.slice(0, 12)}\` · red team `;
+  if (lines[0] !== redTeamMarker(parsed.pr, parsed.rev) || lines[1] !== `### Post-accept red team — ${heading}`
+    || lines[2] !== '' || !lines[3]?.startsWith(prefix)
+    || !/^[^\s`]+\/[^\s`]+(?: · re-check (?:ok|pending|not-needed|error))? · recorded verdict `(accept|changes|null)`\.$/.test(lines[3].slice(prefix.length))
+    || lines[4] !== '') return false;
+  if (!findings.length) return lines.length === 6 && lines[5] === 'The red team tried to break this change and reported nothing.';
+  if (lines.at(-2) !== '' || lines.at(-1) !== "A confirmed break is recorded as a miss for the accepting review and for the builder's model.") return false;
+  // Resolve exactly the gate's live policy: degraded (or any other class) can be configured for send-back.
+  // Unknown policy refuses the exemption; the existing later-verdict path requires a fresh review.
+  try {
+    const setting = readConfirmedBreaks()?.value;
+    if (findings.some(f => !Object.values(CONFIRMED_BREAK_ACTIONS).includes(setting?.[breakClass(f)]))) return false;
+    if (planRedTeamActions(parsed, setting).sendBack.length) return false;
+  } catch { return false; }
+  let count = 0;
+  for (const line of lines.slice(5, -2)) {
+    const finding = parseRedTeamComment(`${lines[0]}\n${line}`).findings[0];
+    if (finding) {
+      if (finding.index !== ++count || !finding.category || !finding.summary) return false;
+    } else if (!count || !/^ {3}- (?:Scenario|Re-check|Files read): [^\r\n]*$/.test(line)) return false;
+  }
+  return count === findings.length;
+}
+
 /**
- * Pure: is this comment body a recognised machine shape that cannot be a hold?
+ * Is this comment body a recognised machine shape that cannot be a hold? Red-team advisories read the live gate policy.
  * Approval-prevention notices require a trusted author when the caller supplies comment metadata. An empty body says nothing.
+ * Red-team gate records and advisories require trusted author metadata, the complete machine shape, and no blocking result.
  * Verdicts, re-arms, stand-downs and non-mechanical drain parks are NOT machine shapes (they supersede the accept).
  */
 export function isKnownMachineBody(body, comment = undefined) {
   const text = typeof body === 'string' ? body : '';
   if (!text.trim()) return true;
   if (isLaterVerdictBody(text)) return false;
+  // Only non-blocking results are machine notes: a policy send-back or a failed/unknown gate supersedes the accept.
+  if (isTrustedMarkerAuthor(comment)) {
+    if (text.startsWith(RED_TEAM_GATE_MARKER)) {
+      return isNonBlockingRedTeamGate(text);
+    }
+    if (text.startsWith(RED_TEAM_COMMENT_MARKER)) {
+      return isNonBlockingRedTeamAdvisory(text);
+    }
+  }
   if (MECHANICAL_PARK_RE.test(text)) return true;
   if (ADVISORY_NOTE_RE.test(text)) return !ADVISORY_CHANGES_RE.test(text);
-  return isApprovalPreventionNotice(text, comment) || KNOWN_MACHINE_SHAPE_RES.some((re) => re.test(text));
+  return isApprovalPreventionNotice(text, comment) || isApprovalPreventionRetraction(text, comment)
+    || isDrainEnqueueClearance(text, comment)
+    || KNOWN_MACHINE_SHAPE_RES.some((re) => re.test(text));
 }
 
 /**
@@ -205,7 +287,7 @@ export function laterReviewHold(reviews, acceptAt = null) {
 const lastMatch = (re, body) => { re.lastIndex = 0; let m; let out = null; while ((m = re.exec(body)) !== null) out = m[1].toLowerCase(); return out; };
 
 /**
- * The latest trusted accept record on a PR thread, and what was posted after it. Pure.
+ * The latest trusted accept record on a PR thread, and what was posted after it, under the live red-team policy.
  * @param {Array<{body?:string, author?:object, createdAt?:string}>} comments
  * @param {Array|null|undefined} reviews — the PR's formal reviews (`pulls/{n}/reviews`): an array = read; `null` =
  *   UNREADABLE (the record is marked `reviewsUnreadable`, which {@link decideAcceptCarryForward} refuses as a retryable

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
+import { reviewUsesRequiredChecks } from '../lib/review-timing.mjs';
 import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.mjs';
 /**
  * @file scripts/operations/review-dispatch.mjs
@@ -458,8 +459,12 @@ const REVIEW_CODE_PATH_FILES = new Set([
   // review-job.mjs (the default dispatch mode, which the daemon runs) — its own direct imports. review-job is
   // matched by REVIEW_CODE_PATH_RE; the rest of its imports (dispatch-lane-io, review-dispatch, review-independence,
   // review-extra-seats, jury-core, write-all-sync) are covered above.
+  // red-team skip settlement, run evidence and status liveness: direct imports of review-job.mjs
+  'scripts/lib/red-team-skip-outcome.mjs', 'scripts/lib/red-team-run-result.mjs',
+  'scripts/lib/pid-alive.mjs', 'scripts/operations/needs-you-feed.mjs',
   'scripts/lib/review-ci-gate-io.mjs', 'scripts/operations/completion-cli.mjs', 'scripts/operations/completion-store.mjs',
   'scripts/conveyor/run-rating.mjs', 'scripts/operations/telemetry-store.mjs', 'scripts/conveyor/reconcile-core.mjs',
+  'scripts/lib/pid-alive.mjs',
   // Verdict carry and red-team marker helpers are direct dependencies of review-job's acceptance path.
   'scripts/lib/rebase-verdict-carry.mjs', 'scripts/lib/red-team-gate.mjs', 'scripts/lib/drain-red-team-evidence.mjs',
   'scripts/lib/red-team-status-labels.mjs',
@@ -609,8 +614,8 @@ export function dispatchReview({
   }
   const policy = resolveTimingPolicy({ env }).review;
   const ci = ciGate({ repo: planned.repo, pr: planned.pr, policy });
-  // Card 273, #5157: a waiver is pinned to readable CI on this exact head.
-  const waived = policy.startAfter === 'ci-green' && typeof ci?.headSha === 'string' && typeof advisoryCiWaiver?.head === 'string'
+  // Card 273, #5157: a waiver is pinned to readable CI on this exact head, including required-check fallback.
+  const waived = reviewUsesRequiredChecks(policy, planned.repo) && typeof ci?.headSha === 'string' && typeof advisoryCiWaiver?.head === 'string'
     && ci.headSha.length > 0 && ci.headSha.toLowerCase() === advisoryCiWaiver.head.toLowerCase()
     && !['head-changed', 'unreadable-ci', 'missing-head', 'unknown-required-set', 'untrusted-required-set'].includes(String(ci.reason ?? '').split(' (')[0])
     && !(ci.affected ?? []).some(row => ['wrong-head', 'malformed', 'missing'].includes(row.reason));

@@ -11,3 +11,12 @@ export function conflictHelperAllowRules(weRoot) {
     `Bash(node "${weRoot}/scripts/conveyor/resolve-conflict.mjs":*)`,
   ];
 }
+
+/** Narrow hand-back grant for unattended fix/ci-heal review re-arming. */
+export function rearmReviewAllowRules(weRoot) {
+  if (!weRoot) return [];
+  return [
+    `Bash(node ${weRoot}/scripts/conveyor/rearm-review.mjs:*)`,
+    `Bash(node "${weRoot}/scripts/conveyor/rearm-review.mjs":*)`,
+  ];
+}

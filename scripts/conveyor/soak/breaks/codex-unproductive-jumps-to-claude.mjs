@@ -1,11 +1,13 @@
 /**
  * @file breaks/codex-unproductive-jumps-to-claude.mjs — live break 2026-10-14: 22 repairs jumped from
  * two unproductive Codex runs straight to Claude (including PRs #5294, #5281, #5237), as did five
- * stronger-model fixes. The fallback chain must try codex-alt first without weakening the critical-work gate.
+ * stronger-model fixes. The fallback chain must try codex-alt first. R99 (2026-10-25) extends this to
+ * critical work below criticalClaudeFromRung (default index 2); takeover and ruling-not-addressed force Claude.
  *
  * SCENARIO: route an ordinary fix with two unproductive Codex runs on its head, a round-3 ordinary fix
- * with none, a round-3 fix with two, and a critical fix with two. RED = an ordinary fix skips codex-alt; GREEN = all pick
- * codex-alt, while critical escalation still picks Claude.
+ * with none, and a round-3 fix with two, for ordinary and critical work. All must try codex-alt first.
+ * Critical work must reach Claude at index 2 (three unproductive runs), at index 1 with the legacy threshold,
+ * and on takeover or ruling-not-addressed even with a threshold beyond the chain.
  */
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -33,11 +35,21 @@ const options = {
   fixSettings: { strongerModelFromRound: 3 }, loadLadder: () => null,
   launcherAvailable: () => true, readRouted: () => table, criticalFor: () => false,
 };
+const criticalOptions = { ...options, criticalFor: () => true };
+const highThresholdOptions = { ...criticalOptions, chain: { ...chain, criticalClaudeFromRung: 99 } };
 const out = {
   unproductive: routeFixExecutor(planned, options),
   strongerModel: routeFixExecutor({ ...planned, pr: 5281, round: 3 }, options),
   combined: routeFixExecutor({ ...planned, round: 3 }, options),
-  critical: routeFixExecutor(planned, { ...options, criticalFor: () => true }),
+  critical: routeFixExecutor(planned, criticalOptions),
+  criticalStrongerModel: routeFixExecutor({ ...planned, pr: 5281, round: 3 }, criticalOptions),
+  criticalCombined: routeFixExecutor({ ...planned, round: 3 }, criticalOptions),
+  criticalThreshold: routeFixExecutor(planned, { ...criticalOptions,
+    readRouted: () => ({ 'we#5294': [...table['we#5294'], { head, outcome: 'failed' }] }) }),
+  criticalLegacyThreshold: routeFixExecutor(planned, { ...criticalOptions,
+    chain: { ...chain, criticalClaudeFromRung: 1 } }),
+  criticalTakeover: routeFixExecutor({ ...planned, takeover: true }, highThresholdOptions),
+  criticalRuling: routeFixExecutor({ ...planned, rulingNotAddressed: true }, highThresholdOptions),
 };
 process.stdout.write(JSON.stringify(out));
 `;
@@ -68,14 +80,25 @@ export default {
         ['unproductive', 'unproductive-tries-codex-alt', 'two unproductive Codex runs on this head'],
         ['strongerModel', 'stronger-model-tries-codex-alt', 'round-3 ordinary fix with no unproductive runs'],
         ['combined', 'combined-triggers-try-codex-alt', 'round-3 ordinary fix with two unproductive runs'],
+        ['critical', 'critical-tries-codex-alt', 'critical work with two unproductive Codex runs'],
+        ['criticalStrongerModel', 'critical-stronger-model-tries-codex-alt', 'round-3 critical fix with no unproductive runs'],
+        ['criticalCombined', 'critical-combined-triggers-try-codex-alt', 'round-3 critical fix with two unproductive runs'],
       ]) {
         const decision = out[key];
         if (decision.executor !== 'codex' || decision.rung !== 'codex-alt') {
           violations.push({ invariant, detail: `${detail} must pick codex-alt before Claude; got ${JSON.stringify(decision)}` });
         }
       }
-      if (out.critical.executor !== 'claude') {
-        violations.push({ invariant: 'critical-stays-claude', detail: `critical work with two unproductive Codex runs must still pick Claude; got ${JSON.stringify(out.critical)}` });
+      for (const [key, invariant, detail] of [
+        ['criticalThreshold', 'critical-reaches-claude', 'critical work with three unproductive runs at the default threshold'],
+        ['criticalLegacyThreshold', 'critical-legacy-threshold', 'critical work with two unproductive runs and criticalClaudeFromRung=1'],
+        ['criticalTakeover', 'critical-takeover-forces-claude', 'critical takeover with criticalClaudeFromRung=99'],
+        ['criticalRuling', 'critical-ruling-forces-claude', 'critical ruling-not-addressed with criticalClaudeFromRung=99'],
+      ]) {
+        const decision = out[key];
+        if (decision.executor !== 'claude' || decision.rung !== 'claude') {
+          violations.push({ invariant, detail: `${detail} must pick Claude; got ${JSON.stringify(decision)}` });
+        }
       }
       return { violations };
     } finally {

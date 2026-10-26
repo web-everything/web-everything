@@ -1,0 +1,15 @@
+{
+  "id": "heavy-admission-adaptive-cap",
+  "title": "Heavy Admission \u2014 Adaptive Capacity and Controller Authority",
+  "status": "open",
+  "summary": "Survey of current host sampling, resource gates, and historical measurements for decision #3610. Fixed, EWMA, and learned strategies compose beneath an independently configured capacity envelope; the survey distinguishes aggregate telemetry from missing per-command feedback.",
+  "dateOpened": "2026-10-25",
+  "tags": [
+    "admission-control",
+    "resource-scheduling",
+    "telemetry"
+  ],
+  "relatedBlocks": [],
+  "relatedPlugs": [],
+  "relatedReport": "reports/2026-10-25-heavy-admission-adaptive-cap.md"
+}

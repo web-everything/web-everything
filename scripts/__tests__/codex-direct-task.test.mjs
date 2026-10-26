@@ -14,6 +14,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
+import { CODEX_TASK_RULES, CODEX_REVIEW_TASK_RULES } from '../lib/build-policy.mjs';
 import {
   startDetachedJob, waitForJob, readJobRecord, writeJobRecord, cliExitCode, jobIsAlive, readPidStart, readPidState,
   PID_START_TIMEOUT_MS, JOB_RECORD_INIT_DEADLINE_MS,
@@ -255,6 +256,31 @@ describe('buildCodexPrompt — folds in the do-not-commit instruction', () => {
   it('rejects an empty task', () => {
     expect(() => buildCodexPrompt('')).toThrow();
     expect(() => buildCodexPrompt('   ')).toThrow();
+  });
+});
+
+describe('buildCodexPrompt — fixed task rules', () => {
+  it('appends the verbatim build block exactly once', () => {
+    const prompt = buildCodexPrompt('Add a comment to notes.txt');
+    expect(prompt).toContain(CODEX_TASK_RULES);
+    expect(prompt.endsWith(CODEX_TASK_RULES)).toBe(true);
+    expect(prompt.split(CODEX_TASK_RULES)).toHaveLength(2);
+    expect(prompt.split('Task rules (fixed; follow them exactly):')).toHaveLength(2);
+  });
+
+  it('appends the read-only block exactly once without build-only rules', () => {
+    const prompt = buildCodexPrompt('Review notes.txt', { review: true });
+    expect(prompt).toContain(CODEX_REVIEW_TASK_RULES);
+    expect(prompt.endsWith(CODEX_REVIEW_TASK_RULES)).toBe(true);
+    expect(prompt.split(CODEX_REVIEW_TASK_RULES)).toHaveLength(2);
+    expect(prompt.split('Task rules (fixed; follow them exactly):')).toHaveLength(2);
+    expect(prompt).not.toContain('$TMPDIR');
+    expect(prompt).not.toContain('npm run test:unit');
+  });
+
+  it('keeps each fixed block within twelve lines', () => {
+    expect(CODEX_TASK_RULES.split('\n').length).toBeLessThanOrEqual(12);
+    expect(CODEX_REVIEW_TASK_RULES.split('\n').length).toBeLessThanOrEqual(12);
   });
 });
 
@@ -2096,6 +2122,43 @@ describe('detached jobs', () => {
       .toMatchObject({ status: 'running', code: 75 });
     expect(f.sleep.mock.calls).toEqual([[maxMs]]);
     expect(f.options.readRecord).toHaveBeenCalledOnce();
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+
+  it.each([250, 1000])('waits out an early timer wake before the next poll with pollMs=%s', async pollMs => {
+    const f = fixture();
+    const sleep = vi.fn()
+      .mockImplementationOnce(ms => f.sleep(ms - 1))
+      .mockImplementation(ms => f.sleep(ms));
+    const readTimes = [];
+    const readRecord = vi.fn(() => {
+      readTimes.push(f.options.now());
+      return f.options.readRecord();
+    });
+    expect(await waitForJob({ ...f.options, maxMs: 500, pollMs, sleep, readRecord }))
+      .toMatchObject({ status: 'running', code: 75 });
+    expect(sleep.mock.calls).toEqual(pollMs === 250 ? [[250], [1], [250]] : [[500], [1]]);
+    expect(readTimes).toEqual(pollMs === 250 ? [0, 250] : [0]);
+    expect(readRecord).toHaveBeenCalledTimes(pollMs === 250 ? 2 : 1);
+    expect(f.writeRecord).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [250, [0], [[250], [1]]],
+    [1500, [0, 1000], [[1000], [1], [500], [1]]],
+  ])('finishes an early-waking poll sleep before reading again with maxMs=%s', async (maxMs, expectedReads, expectedSleeps) => {
+    const f = fixture();
+    const readAt = [];
+    const readRecord = vi.fn(() => {
+      readAt.push(f.options.now());
+      return f.options.readRecord();
+    });
+    const sleep = vi.fn(async ms => { await f.sleep(ms > 1 ? ms - 1 : ms); });
+    expect(await waitForJob({ ...f.options, maxMs, readRecord, sleep }))
+      .toEqual({ status: 'running', exitCode: null, resultPath: 'test-job.result.json', code: 75 });
+    expect(readAt).toEqual(expectedReads);
+    expect(sleep.mock.calls).toEqual(expectedSleeps);
+    expect(f.options.now()).toBe(maxMs);
     expect(f.writeRecord).not.toHaveBeenCalled();
   });
 

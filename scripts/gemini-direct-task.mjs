@@ -426,7 +426,7 @@ export async function runAgyDirectExec({
     if (resumeConversationId !== null) appendFileSync(logFile, '\n');
     else writeFileSync(logFile, '');
     const hold = readHold(model);
-    if (hold) return { stdout: '', stderr: `agy quota exhausted: ${hold.fallbackDecision} until ${hold.quotaResetsAt}`, code: 1, timedOut: false, argv, ...hold };
+    if (hold) return { stdout: '', stderr: `agy quota exhausted: ${hold.fallbackDecision} until ${hold.quotaResetsAt} (held by ${hold.heldBackend} model ${hold.heldModel})`, code: 1, timedOut: false, argv, ...hold };
   } catch (e) {
     return { stdout: '', stderr: e.message, code: null, timedOut: false, argv };
   }

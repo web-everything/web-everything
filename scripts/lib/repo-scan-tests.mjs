@@ -43,6 +43,13 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/operations/__tests__/health-watch-lane-scan-boundary.test.mjs',
+    scope: 'files',
+    why: 'inventories health-watch and stale-state command/helper calls so new destructive lane actions require guard coverage',
+    matches: (f) => ['scripts/conveyor/health-watch.mjs', 'scripts/operations/stale-state-io.mjs'].includes(f),
+    inputs: ['scripts/operations/__tests__/health-watch-lane-scan-boundary.test.mjs'],
+  },
+  {
     test: 'scripts/lib/__tests__/lane-git-diet.test.mjs',
     scope: 'files',
     why: 'every script naming an ops/* ref is a listed by-name reader or a known non-reader (lane fetches exclude ops/*)',

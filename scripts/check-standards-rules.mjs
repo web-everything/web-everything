@@ -1078,13 +1078,16 @@ export function findDuplicateKeysPerScope(raw) {
   while (i < n) {
     const c = raw[i];
     if (c === '"') {
-      // read a JSON string, honoring backslash escapes; s is the decoded-enough key/value text
-      let j = i + 1, s = '';
+      // Decode keys exactly as JSON.parse does, including Unicode escape spellings.
+      let j = i + 1;
       while (j < n) {
-        if (raw[j] === '\\') { s += raw[j + 1] ?? ''; j += 2; continue; }
+        if (raw[j] === '\\') { j += 2; continue; }
         if (raw[j] === '"') break;
-        s += raw[j]; j++;
+        j++;
       }
+      // A malformed string (unterminated, raw control character) keeps the scanner tolerant: compare its raw text.
+      let s;
+      try { s = JSON.parse(raw.slice(i, j + 1)); } catch { s = raw.slice(i + 1, j); }
       i = j + 1;
       const top = frames[frames.length - 1];
       if (top && top.isObject && top.expectKey) {
@@ -4448,6 +4451,8 @@ export const LEASH_PIN_SNAPSHOT = Object.freeze([
   'gate-invariants.test.mjs',
   'drain-gate-settings.json',
   'drain-workflow-edit-hold.mjs',
+  'webeverything.config.json',
+  'deliveryPolicyDefaults.ts',
 ]);
 
 /** A REAL-shaped diff section for `path` whose only change is whitespace — exactly the hunk a content trigger

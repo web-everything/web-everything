@@ -11,11 +11,16 @@ import { describe, it, expect, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import {
   withStaleBase, withPlannedContext, dispatchFix, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
-  findResumeCandidate, buildResumePrompt, tryResumeFix, filterFixesByInFlightScope, dropTerminalFixClaims, routeFixExecutor,
+  findResumeCandidate, buildResumePrompt, tryResumeFix, tryResumeRoundFix, filterFixesByInFlightScope, dropTerminalFixClaims, routeFixExecutor,
 } from '../reconcile-fix-dispatch.mjs';
 import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
 import { DISPATCHED_AGENT_SYSTEM_PROMPT_FILE, dispatchSessionCwd } from '../../operations/dispatch-lane-io.mjs';
 import { buildAuthorActorMarker } from '../../lib/review-independence.mjs';
+
+// Existing resume fixtures have no completion record; never consult the host store.
+vi.mock('../../operations/completion-store.mjs', async (importOriginal) => ({
+  ...await importOriginal(), tryReadCompletion: () => null,
+}));
 
 // A `checkStaleness` stub that never touches git — every test below injects one.
 const FRESH = () => ({ fresh: true, behind: 0 });
@@ -673,12 +678,12 @@ describe('dispatchFix — permission preparation never blocks a dispatch (PR #39
   });
 });
 
-describe('dispatchFix — the DEFAULT conflict-helper grant really lands on disk (PR #3990 review round 6)', () => {
+describe('dispatchFix — the DEFAULT repair-helper grants really land on disk', () => {
   // Every other dispatchFix test injects a mock `grantConflictHelper`, so dropping the default grant — or letting
   // the later default `isolateSession` write clobber it — would leave them all green while every fixer hit the
   // permission wall. This one runs the real defaults against a real tmpdir and reads the file back.
-  const dispatchIntoTmp = async (seed) => {
-    const { mkdtempSync, mkdirSync, writeFileSync } = await import('node:fs');
+  const dispatchIntoTmp = async (seed, wrapFix = false) => {
+    const { mkdtempSync, mkdirSync, readFileSync, writeFileSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
     const scratch = mkdtempSync(join(tmpdir(), 'fix-helper-grant-'));
@@ -686,6 +691,11 @@ describe('dispatchFix — the DEFAULT conflict-helper grant really lands on disk
     const cwd = join(scratch, sessionId);
     if (seed) { mkdirSync(join(cwd, '.claude'), { recursive: true }); writeFileSync(join(cwd, '.claude', 'settings.local.json'), seed); }
     const calls = [];
+    const captureLaunch = (argv, opts) => {
+      const settings = JSON.parse(readFileSync(join(cwd, '.claude', 'settings.local.json'), 'utf8'));
+      calls.push({ argv, opts, settings });
+      return '';
+    };
     dispatchFix(
       { itemNum: '3438', pr: 1764, laneRef: 'lane/3438-wire-reconcile-pass', scope: ['we:scripts/conveyor/reconcile-fix-dispatch.mjs'], lane: 9 },
       {
@@ -696,39 +706,123 @@ describe('dispatchFix — the DEFAULT conflict-helper grant really lands on disk
         // The default would grant trust in the operator's real `~/.claude.json`; only the mkdir is wanted here.
         ensureSessionCwd: (d) => { mkdirSync(d, { recursive: true }); return d; },
         resolveSettingsEnv: () => null,
-        spawnAgent: (argv, opts) => { calls.push({ argv, opts }); return ''; },
+        wrapFix,
+        spawnAgent: captureLaunch,
+        launchWrapped: ({ bgArgv, cwd }) => { captureLaunch(bgArgv, { cwd }); return { handle: 'pid:123' }; },
         // `grantConflictHelper` and `isolateSession` are deliberately NOT injected: the real defaults run.
       },
     );
     return { scratch, cwd, calls };
   };
 
-  it('leaves the helper allow rules in <sessionCwd>/.claude/settings.local.json after the isolation write, next to bgIsolation', async () => {
+  it.each([false, true])('grants both helpers before launch and preserves them through isolation (wrapped=%s)', async (wrapFix) => {
     const { rmSync, readFileSync } = await import('node:fs');
     const { join } = await import('node:path');
-    const { scratch, cwd, calls } = await dispatchIntoTmp();
+    const { scratch, cwd, calls } = await dispatchIntoTmp(undefined, wrapFix);
     try {
       const settings = JSON.parse(readFileSync(join(cwd, '.claude', 'settings.local.json'), 'utf8'));
       expect(settings.permissions.allow).toEqual(expect.arrayContaining([
         'Bash(node /repo/scripts/conveyor/resolve-conflict.mjs:*)',
         'Bash(node "/repo/scripts/conveyor/resolve-conflict.mjs":*)',
+        'Bash(node /repo/scripts/conveyor/rearm-review.mjs:*)',
+        'Bash(node "/repo/scripts/conveyor/rearm-review.mjs":*)',
       ]));
       expect(settings.worktree).toEqual({ bgIsolation: 'none' });
       expect(calls).toHaveLength(1);
       expect(calls[0].opts.cwd).toBe(cwd);
+      expect(calls[0].settings).toEqual(settings);
+      expect(settings.permissions.allow).not.toContain('Bash(node:*)');
+      expect(settings.permissions.allow).not.toContain('Bash(*)');
     } finally { rmSync(scratch, { recursive: true, force: true }); }
   });
 
   it('keeps rules and env already in the file, adding the helper rules exactly once', async () => {
     const { rmSync, readFileSync } = await import('node:fs');
     const { join } = await import('node:path');
-    const seed = JSON.stringify({ permissions: { allow: ['Bash(echo ok:*)'] }, env: { KEEP: '1' } });
+    const seed = JSON.stringify({ permissions: { allow: ['Bash(echo ok:*)', 'Bash(node /repo/scripts/conveyor/rearm-review.mjs:*)'] }, env: { KEEP: '1' } });
     const { scratch, cwd } = await dispatchIntoTmp(seed);
     try {
       const settings = JSON.parse(readFileSync(join(cwd, '.claude', 'settings.local.json'), 'utf8'));
       expect(settings.permissions.allow).toContain('Bash(echo ok:*)');
       expect(settings.permissions.allow.filter((r) => r.includes('resolve-conflict.mjs'))).toHaveLength(2);
+      expect(settings.permissions.allow.filter((r) => r.includes('rearm-review.mjs'))).toHaveLength(2);
       expect(settings.env).toEqual({ KEEP: '1' });
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  });
+});
+
+describe('tryResumeRoundFix — migrate legacy repair-helper permissions before resuming', () => {
+  it('adds the hand-back grant to legacy settings before resume, preserving settings on repeated rounds', async () => {
+    const { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const scratch = mkdtempSync(join(tmpdir(), 'fix-round-helper-grant-'));
+    const cwd = join(scratch, 'previous-fixer');
+    const path = join(cwd, '.claude', 'settings.local.json');
+    const sessionId = '33333333-3333-4333-8333-333333333333';
+    const head = 'a'.repeat(40);
+    const oldAllow = [
+      'Bash(echo ok:*)',
+      'Bash(node /repo/scripts/conveyor/resolve-conflict.mjs:*)',
+      'Bash(node "/repo/scripts/conveyor/resolve-conflict.mjs":*)',
+    ];
+    mkdirSync(join(cwd, '.claude'), { recursive: true });
+    writeFileSync(path, JSON.stringify({
+      permissions: { allow: oldAllow, deny: ['Bash(rm:*)'], additionalDirectories: ['/lanes/lane-4'] },
+      env: { KEEP: '1' },
+    }));
+    const resume = vi.fn(() => {
+      // Observe the actual file at the launch boundary, after the real isolation/hooks refresh.
+      const settings = JSON.parse(readFileSync(path, 'utf8'));
+      expect(settings.permissions.allow).toEqual([...oldAllow,
+        'Bash(node /repo/scripts/conveyor/rearm-review.mjs:*)',
+        'Bash(node "/repo/scripts/conveyor/rearm-review.mjs":*)',
+      ]);
+      expect(settings.permissions.deny).toEqual(['Bash(rm:*)']);
+      expect(settings.permissions.additionalDirectories).toEqual(['/lanes/lane-4']);
+      expect(settings.env).toEqual({ KEEP: '1' });
+      expect(settings.worktree).toEqual({ bgIsolation: 'none' });
+      expect(settings.hooks.PreToolUse.length).toBeGreaterThan(0);
+      return { resumed: true, result: { sessionId } };
+    });
+    const planned = { pr: 5931, itemNum: null, attempts: 1, headRefOid: head, baseRefName: 'main', scope: ['we:x'] };
+    const options = {
+      root: '/repo', scratchRoot: scratch, realpath: (p) => p, wrapFix: false,
+      fixSettings: { resumeAcrossRounds: 'on', strongerModelFromRound: 3 },
+      readHistoryInputs: () => null, postNotice: () => false, resume,
+      readInputs: () => ({
+        prior: { sessionId, name: 'fix-5931', state: 'done', cwd },
+        job: { template: 'bg', respawnFlags: ['--model', 'sonnet'] }, transcript: true,
+        lane: { lane: 4, path: '/lanes/lane-4', held: 'free', head, sessionHead: head },
+        base: { rebased: false },
+      }),
+    };
+    try {
+      const before = readFileSync(path, 'utf8');
+      expect(tryResumeRoundFix(planned, { ...options, dryRun: true }).decision.resume).toBe(true);
+      expect(tryResumeRoundFix({ ...planned, attempts: 0 }, options).resumed).toBe(false);
+      expect(readFileSync(path, 'utf8')).toBe(before);
+      expect(resume).not.toHaveBeenCalled();
+      // Do not inject isolateSession: a mock would hide the missing default permission refresh.
+      expect(tryResumeRoundFix(planned, options).resumed).toBe(true);
+      expect(tryResumeRoundFix(planned, options).resumed).toBe(true);
+      expect(resume).toHaveBeenCalledTimes(2);
+      const shim = await import('../../lib/gh-app-shim.mjs');
+      const grant = vi.spyOn(shim, 'ensureSettingsFilePermissions');
+      try {
+        for (const fails of [
+          () => ({ ok: false, reason: 'write-failed' }),
+          () => { throw new Error('EACCES'); },
+        ]) {
+          grant.mockImplementation(fails);
+          const beforeFailure = readFileSync(path, 'utf8');
+          const result = tryResumeRoundFix(planned, options);
+          expect(result.resumed).toBe(false);
+          expect(result.resumeAttempt).toMatchObject({ attempted: false, refused: 'guard-hooks-unwritten' });
+          expect(readFileSync(path, 'utf8')).toBe(beforeFailure);
+          expect(resume).toHaveBeenCalledTimes(2);
+        }
+      } finally { grant.mockRestore(); }
     } finally { rmSync(scratch, { recursive: true, force: true }); }
   });
 });
@@ -853,6 +947,88 @@ describe('dispatchFix — the composition: plan → fill → mint → spawn', ()
 });
 
 describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exist: this runs with NO lane involved at all', () => {
+  it('refreshes legacy conflict-session grants through reconcile before resume, and refuses failed writes', async () => {
+    const { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const scratch = mkdtempSync(join(tmpdir(), 'conflict-resume-grant-'));
+    const cwd = join(scratch, 'legacy-session');
+    const path = join(cwd, '.claude', 'settings.local.json');
+    const sessionId = '33333333-3333-4333-8333-333333333333';
+    const prior = { permissions: { allow: ['Bash(echo ok:*)'], deny: ['Bash(rm:*)'] }, env: { KEEP: '1' } };
+    mkdirSync(join(cwd, '.claude'), { recursive: true });
+    writeFileSync(path, JSON.stringify(prior));
+    let name = 'fix-1764';
+    let head = MATCHING_HEAD;
+    const acquireClaim = vi.fn(() => ({ ok: true }));
+    const releaseClaim = vi.fn();
+    const observed = [];
+    const spawnAgent = vi.fn(() => {
+      observed.push(JSON.parse(readFileSync(path, 'utf8')));
+      return 'backgrounded · candxxxx\n';
+    });
+    const resumeOptions = {
+      root: '/repo', postNotice: () => false, spawnAgent,
+      listAgentsAll: () => [{ sessionId, id: 'candxxxx', cwd, name }],
+      resolveHead: () => head,
+      acquireClaim, releaseClaim,
+      sessionCwdFor: () => join(scratch, 'trigger'), ensureSessionCwd: (p) => p,
+    };
+    const entry = {
+      kind: 'fix', prNumber: 1764, headRefName: 'lane/3438-wire-reconcile-pass',
+      labels: [CONFLICT_LABEL, 'review:changes'], headRefOid: MATCHING_HEAD,
+      body: buildAuthorActorMarker(sessionId),
+    };
+    const dispatch = vi.fn();
+    const run = () => runReconcileFixDispatch({
+      root: '/repo', checkStaleness: FRESH, findItemFn: findItemStub, loadItems: () => [],
+      fetchItemlessDiffPaths: () => [], listFixClaims: () => [],
+      reconcile: () => ({ dispatch: [entry], refusals: [], notes: [] }),
+      pickFreeLanes: () => [], dispatch, tryResumeRound: null, fixExecutorRoute: null,
+      tryResume: (planned, options) => tryResumeFix(planned, { ...options, ...resumeOptions }),
+    });
+    try {
+      for (const candidateName of ['fix-1764', 'conveyor-3438']) {
+        name = candidateName;
+        expect(run().dispatched).toHaveLength(1);
+        expect(observed.at(-1)).toEqual({ ...prior, permissions: { ...prior.permissions,
+          additionalDirectories: [], allow: [...prior.permissions.allow,
+            'Bash(node /repo/scripts/conveyor/resolve-conflict.mjs:*)',
+            'Bash(node "/repo/scripts/conveyor/resolve-conflict.mjs":*)',
+            'Bash(node /repo/scripts/conveyor/rearm-review.mjs:*)',
+            'Bash(node "/repo/scripts/conveyor/rearm-review.mjs":*)',
+          ],
+        } });
+      }
+      expect(dispatch).not.toHaveBeenCalled();
+      const shim = await import('../../lib/gh-app-shim.mjs');
+      const grant = vi.spyOn(shim, 'ensureSettingsFilePermissions');
+      try {
+        head = 'wrong-head';
+        expect(run().dispatched).toHaveLength(0);
+        head = MATCHING_HEAD;
+        name = 'fix-9999';
+        expect(run().dispatched).toHaveLength(0);
+        expect(grant).not.toHaveBeenCalled();
+        name = 'fix-1764';
+        acquireClaim.mockReturnValueOnce({ ok: false, reason: 'held' });
+        expect(run().dispatched).toHaveLength(0);
+        expect(grant).not.toHaveBeenCalled();
+        for (const fail of [() => ({ ok: false, reason: 'write-failed' }), () => { throw new Error('EACCES'); }, () => undefined]) {
+          grant.mockImplementation(fail);
+          const releasedBefore = releaseClaim.mock.calls.length;
+          const settingsBefore = readFileSync(path, 'utf8');
+          const result = run();
+          expect(result.dispatched).toHaveLength(0);
+          expect(result.refusals).toEqual([expect.objectContaining({ pr: 1764, kind: 'dispatch-failed' })]);
+          expect(releaseClaim).toHaveBeenCalledTimes(releasedBefore + 1);
+          expect(readFileSync(path, 'utf8')).toBe(settingsBefore);
+          expect(spawnAgent).toHaveBeenCalledTimes(2);
+        }
+      } finally { grant.mockRestore(); }
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  });
+
   it('a non-conflict planned entry never consults `claude agents` at all, and reports `resumed: false`/no attempt', () => {
     let listAgentsAllCalls = 0;
     const result = tryResumeFix(
@@ -888,6 +1064,7 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
       {
         root: '/repo',
         postNotice: notice => notices.push(notice),
+        grantConflictHelper: () => ({ ok: true }),
         spawnAgent: (argv) => { spawnCalls.push(argv); return 'backgrounded · candxxxx\n'; },
         listAgentsAll: () => [{ sessionId: 'cand-0000-0000-0000-000000000000', id: 'candxxxx', cwd: '/lanes/lane-4', name: 'conveyor-3438' }],
         resolveHead: (cwd) => (cwd === '/lanes/lane-4' ? MATCHING_HEAD : null),
@@ -971,6 +1148,7 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
       {
         root: '/repo',
         spawnAgent: (argv) => { spawnCalls.push(argv); return 'backgrounded · forkedid\n'; },
+        grantConflictHelper: () => ({ ok: true }),
         // Row 1 (before the resume attempt): the candidate is listed, so a resume is attempted.
         // Every read AFTER: only a DIFFERENT id ("forkedid") is listed — the CLI forked a copy. The retry
         // loop (hardening 2) reads this same wrong answer every time, so it correctly exhausts, not stalls.
@@ -1004,6 +1182,7 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
       {
         root: '/repo',
         spawnAgent: () => 'backgrounded · candxxxx\n',
+        grantConflictHelper: () => ({ ok: true }),
         // Call 1: the pre-spawn candidate lookup. Call 2 (the FIRST post-spawn confirm read): the listing has
         // not caught up yet — no row at all, simulating exactly the propagation lag #3331 documents. Call 3
         // onward: caught up.
@@ -1036,6 +1215,7 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
       {
         root: '/repo',
         spawnAgent: () => 'backgrounded · candxxxx\n',
+        grantConflictHelper: () => ({ ok: true }),
         // Call 1 (the pre-resume ownership check): the candidate is listed with its `id`, as always. Every
         // call AFTER: the SAME session, still listed by `sessionId` — but this time its `id` is gone, the
         // exact `#x3gdu12` scenario this item was filed to worry about.
@@ -1071,6 +1251,7 @@ describe('tryResumeFix — #xu2krte Fork 1, and #xazl9u3\'s whole reason to exis
       },
       {
         root: '/repo',
+        grantConflictHelper: () => ({ ok: true }),
         // The CLI actually forked a copy under `forkedid`, but that fork's row never shows up within this
         // dispatch's retry budget — every read looks identical (candidate still listed, id present, nothing new).
         spawnAgent: () => 'backgrounded · forkedid\n',
@@ -1347,6 +1528,41 @@ describe('runReconcileFixDispatch — read reconcile-pass, plan, assign a lane, 
 describe('fixBriefPath', () => {
   it('points at the SAME brief dispatch-lane.mjs\'s own tick-core-driven fix dispatch fills', () => {
     expect(fixBriefPath('/repo')).toBe('/repo/skills-src/conveyor/fix-agent-brief.md');
+  });
+});
+
+describe('conflict resume permission-blocked completion', () => {
+  const sessionId = '11111111-1111-4111-8111-111111111111';
+  const body = buildAuthorActorMarker(sessionId);
+  const agentsAll = [{ sessionId, name: 'fix-1764' }];
+  it.each([
+    { status: 'done', outcome: 'blocked-on-permission' },
+    { status: 'blocked-on-permission' },
+  ])('declines candidate and conflict resume for %j with the recorded reason', (record) => {
+    const readCompletion = vi.fn(() => ({ ...record, sessionId }));
+    const onDecline = vi.fn();
+    expect(findResumeCandidate({ body, agentsAll, readCompletion, onDecline })).toBeNull();
+    expect(readCompletion).toHaveBeenCalledWith('fix-1764');
+    expect(onDecline).toHaveBeenCalledWith(expect.objectContaining({ reason: 'prior-blocked-on-permission' }));
+    const spawnAgent = vi.fn();
+    const resolveHead = vi.fn();
+    const result = tryResumeFix({ pr: 1764, isConflict: true, body }, {
+      root: '/repo', listAgentsAll: () => agentsAll, readCompletion, spawnAgent, resolveHead,
+    });
+    expect(result).toMatchObject({ resumed: false, resumeAttempt: {
+      attempted: false, refused: 'prior-blocked-on-permission', why: expect.stringContaining(sessionId),
+    } });
+    expect(spawnAgent).not.toHaveBeenCalled();
+    expect(resolveHead).not.toHaveBeenCalled();
+  });
+  it.each([
+    null, { status: 'done', outcome: 're-armed' }, { status: 'started' },
+    { status: 'done', outcome: 'blocked-on-permission', sessionId: 'another-session' },
+  ])('keeps conflict candidate unchanged for %j', (record) => {
+    expect(findResumeCandidate({ body, agentsAll, readCompletion: () => record })).toBe(sessionId);
+  });
+  it('fails open on unreadable completion evidence', () => {
+    expect(findResumeCandidate({ body, agentsAll, readCompletion: () => { throw new Error('unreadable'); } })).toBe(sessionId);
   });
 });
 

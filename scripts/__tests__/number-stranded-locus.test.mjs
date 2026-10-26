@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, cpSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, cpSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,6 +34,7 @@ beforeAll(() => {
   for (const d of [laneRoot, plainRoot, elsewhere]) mkdirSync(d, { recursive: true });
   for (const root of [laneRoot, plainRoot]) {
     cpSync(WE_SCRIPTS_DIR, join(root, 'scripts'), { recursive: true });
+    symlinkSync(join(dirname(WE_SCRIPTS_DIR), 'node_modules'), join(root, 'node_modules'), 'dir');
     mkdirSync(join(root, 'backlog'), { recursive: true });
   }
 });
@@ -72,7 +73,8 @@ describe('number-stranded refuses on the locus it PROTECTS, not the one it is ca
     // The guard must not fire everywhere. Asserted from a lane-free cwd AND from `elsewhere`, so neither a
     // cwd-based nor a ROOT-based reading can pass this by accident.
     for (const cwd of [plainRoot, elsewhere]) {
-      const { out } = run(plainRoot, cwd);
+      const { code, out } = run(plainRoot, cwd);
+      expect(code, out).toBe(0);
       expect(out, `cwd=${cwd}`).not.toMatch(/refusing to run in a LANE clone/);
     }
   });
