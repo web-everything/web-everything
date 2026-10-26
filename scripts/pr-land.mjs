@@ -1205,9 +1205,9 @@ async function runCli() {
       // and answering it from the trusted reader made a body that blanks its own appended block (an unclosed
       // fence) re-append on every pass, unboundedly.
       try {
-        let liveBody = '';
-        try { liveBody = forge.viewPr(prNum, 'body').body || ''; } catch { /* fetch miss — augment from empty */ }
-        const reconciled = reconcileEscalationReasonBlock(liveBody, verdict.reasons);
+        let liveBody = '', liveBodyRead = false;
+        try { liveBody = forge.viewPr(prNum, 'body').body || ''; liveBodyRead = true; } catch { /* fetch miss — never replace an unread body */ }
+        const reconciled = liveBodyRead ? reconcileEscalationReasonBlock(liveBody, verdict.reasons) : { changed: false };
         if (reconciled.changed) forge.editBody(prNum, reconciled.body);
       } catch { /* best-effort — the label already carries the signal */ }
     }

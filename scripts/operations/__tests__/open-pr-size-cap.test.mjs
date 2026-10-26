@@ -370,6 +370,19 @@ describe('pr-land CLI size failure boundaries', () => {
     expect(forge.editBody).not.toHaveBeenCalled();
   });
 
+  it('the escalation-reason stamp never writes over an unread live body', () => {
+    const start = source.indexOf("        let liveBody = '';");
+    const stamp = source.slice(start, source.indexOf('\n      } catch { /* best-effort — the label already carries the signal */ }', start));
+    const reconcile = vi.fn(() => ({ changed: true, body: '## Escalation reasons\n- size' }));
+    const execute = new Function('forge', 'prNum', 'verdict', 'reconcileEscalationReasonBlock', stamp);
+    for (const read of [() => { throw new Error('body unavailable'); }, () => ({ body: 'live body' })]) {
+      const forge = { viewPr: vi.fn(read), editBody: vi.fn() };
+      execute(forge, 5854, { reasons: ['size'] }, reconcile);
+      if (forge.viewPr.mock.results[0].type === 'throw') expect(forge.editBody).not.toHaveBeenCalled();
+      else expect(forge.editBody).toHaveBeenCalledWith(5854, '## Escalation reasons\n- size');
+    }
+  });
+
   it('builds admission arguments from the resolved publication SHA and remote base', () => {
     expect(prLand.buildSizeAdmissionRequest).toBeTypeOf('function');
     expect(prLand.buildSizeAdmissionRequest({ ref: 'lane/reviewed', pr: 5854, remote: 'upstream',
