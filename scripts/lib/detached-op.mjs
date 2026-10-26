@@ -8,6 +8,8 @@
  *   cannot look "running" forever. A record without `pidStart` (older runner, or `ps` unavailable) is checked
  *   by liveness only, and a live pid whose start time cannot be read is given the benefit of the doubt.
  *   A reused pid that also starts within the same second as the original runner is indistinguishable.
+ *   ps is run with TZ=UTC so readers in different time zones agree. On Linux, ps derives lstart from boot time,
+ *   so a wall-clock step can shift it by about a second and make a live runner look dead; not compensated.
  * - Command stop: SIGKILL of the command's process tree and process group, plus every descendant seen by a
  *   periodic snapshot (every 250 ms, pid + start time) whose start time still matches at stop time. A
  *   descendant that detaches (setsid) and is re-parented to PID 1 is therefore stopped, UNLESS it was created
@@ -25,9 +27,10 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { descendantPids, killProcessTree } from './bounded-child.mjs';
 
 const SNAPSHOT_MS = 250;
-const psEnv = () => ({ ...process.env, LC_ALL: 'C' });
+// lstart prints local time: pin TZ so the runner and a waiter with a different TZ compare equal strings.
+const psEnv = () => ({ ...process.env, LC_ALL: 'C', TZ: 'UTC' });
 const psAll = () => execFileSync('ps', ['-A', '-o', 'pid=,ppid=,pgid=,lstart='],
-  { encoding: 'utf8', timeout: 10_000, env: psEnv() });
+  { encoding: 'utf8', timeout: 10_000, env: psEnv(), maxBuffer: 64 * 1024 * 1024 });
 const startsFromPs = text => {
   const starts = new Map();
   for (const line of String(text).split('\n')) {
@@ -175,6 +178,7 @@ async function runRecord(args) {
     try {
       const text = psAll();
       const starts = startsFromPs(text);
+      for (const [pid, start] of watched) if (starts.get(pid) !== start) watched.delete(pid); // gone or reused
       // Roots: the command, plus watched survivors (re-parented) whose pid still has the same start time.
       const roots = [child.pid, ...[...watched].filter(([pid, start]) => starts.get(pid) === start).map(([pid]) => pid)];
       for (const root of roots) {

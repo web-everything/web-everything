@@ -5,7 +5,7 @@ import { existsSync, fstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  resolveDetachedOpsDir, parseDetachFlags, startDetachedOp, waitForOp, handleDetachCli,
+  resolveDetachedOpsDir, processStart, parseDetachFlags, startDetachedOp, waitForOp, handleDetachCli,
 } from '../detached-op.mjs';
 
 describe('resolveDetachedOpsDir', () => {
@@ -341,6 +341,17 @@ describe('detached operation lifecycle', () => {
     expect(await waitForOp({ id: legacy.id, maxWaitMs: 250, dir, ...fakeClock(), isAlive: () => true, startOf: neverCalled }))
       .toMatchObject({ status: 'running', code: 75 });
     expect(neverCalled).not.toHaveBeenCalled();
+  });
+
+  it.skipIf(process.platform === 'win32')('reads the same runner start time whatever TZ the reader runs under', () => {
+    const saved = process.env.TZ;
+    try {
+      process.env.TZ = 'UTC';
+      const utc = processStart(process.pid);
+      process.env.TZ = 'America/New_York';
+      expect(utc).toBeTruthy();
+      expect(processStart(process.pid)).toBe(utc);
+    } finally { if (saved === undefined) delete process.env.TZ; else process.env.TZ = saved; }
   });
 
   it('rejects a non-string pidStart as an invalid record', async () => {
