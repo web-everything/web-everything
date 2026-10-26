@@ -22,6 +22,10 @@ Shadow audit observations dedupe by exact `(ref, sha, reason)` using durable mar
 repeat observations still appear in `wouldRetire`. Audit append precedes marking so failed writes retry.
 The command allowlist test restricts classification to local Git reads/merge-tree object creation; it forbids
 network and worktree mutations. `mainOnly` and corrupt state have separate preparation regressions.
+Malformed registry records (non-objects or missing/non-string/empty refs) hold preparation before fetch or
+retirement and require operator repair of the stored list. Structurally valid entries with unsafe branch names
+remain isolated as unavailable overlays. For native audit subprocess imports, construct the module URL with
+`fileURLToPath` and `pathToFileURL`; Vite rewrites static `new URL(relative, import.meta.url)` as a web asset.
 The `overlay-auto-retire-evidence` daemon soak reproduces explicit shadow, deleted remote branches in all modes,
 unavailable overlays beside healthy ones, repeated shadow ticks and container replacement using real disposable
 repositories. The soak registry discovers its module automatically.

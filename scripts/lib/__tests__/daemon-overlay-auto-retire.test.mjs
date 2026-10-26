@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { autoRetireOverlays, classifyOverlays, resolveAutoRetireMode } from '../daemon-overlay-auto-retire.mjs';
 import { appendOverlayEvent, overlayFilePath, readOverlayState, removeOverlay, writeOverlays } from '../daemon-overlays.mjs';
@@ -109,12 +110,15 @@ describe('real Git retirement evidence', () => {
 
   it('deduplicates exact shadow tuples across processes and retains distinct evidence and ordinary audit events', async () => {
     const event = { kind: 'auto-retire-shadow', ref: 'feature', sha: initial, reason: 'ancestor-of-main' };
-    const moduleUrl = new URL('../daemon-overlays.mjs', import.meta.url).href;
+    // Build a filesystem URL: Vite rewrites static new URL(relative, import.meta.url) as a web asset.
+    const moduleUrl = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../daemon-overlays.mjs')).href;
     const code = `import { appendOverlayEvent } from ${JSON.stringify(moduleUrl)}; appendOverlayEvent(${JSON.stringify(root)}, ${JSON.stringify(event)}, { env: ${JSON.stringify(env)} });`;
     await Promise.all(Array.from({ length: 3 }, () => new Promise((resolve, reject) => {
-      const child = spawn(process.execPath, ['--input-type=module', '-e', code], { stdio: 'ignore', timeout: 10_000, killSignal: 'SIGKILL' });
+      const child = spawn(process.execPath, ['--input-type=module', '-e', code], { stdio: ['ignore', 'ignore', 'pipe'], timeout: 10_000, killSignal: 'SIGKILL' });
+      let stderr = '';
+      child.stderr.on('data', (chunk) => { stderr = (stderr + chunk).slice(-4096); });
       child.once('error', reject);
-      child.once('exit', (status) => status === 0 ? resolve() : reject(new Error(`audit writer exited ${status}`)));
+      child.once('close', (status) => status === 0 ? resolve() : reject(new Error(`audit writer exited ${status}: ${stderr}`)));
     })));
     expect(audit()).toHaveLength(1);
     for (const change of [{ ref: 'other' }, { sha: 'a'.repeat(40) }, { reason: 'contained' }]) {
@@ -254,12 +258,20 @@ describe('real Git retirement evidence', () => {
       .toMatchObject({ class: 'needed', reason: 'git-unverifiable' });
   });
 
-  it('invalid registry entries hold preparation without overwriting the registry', async () => {
+  it.each([null, {}, { ref: 42 }, { ref: '' }, 'main', []].map((invalid) => [invalid]))('invalid registry entry %j holds preparation without overwriting the registry', async (invalid) => {
     localOrigin();
-    const overlays = [null, { ref: '--invalid' }];
+    const overlays = [invalid, { ref: '--invalid' }, { ref: 'main' }];
     register(overlays);
-    const prepared = await prepare();
+    const stored = readFileSync(overlayFilePath(root, env), 'utf8');
+    const fetches = [];
+    const prepared = await prepare({ run: (args) => {
+      if (args[0] === 'fetch') fetches.push(args);
+      return git(args);
+    } });
     expect(prepared.result.reason).toBe('fetch-failed');
+    expect(fetches).toEqual([]);
+    expect(prepared.alerts).toContainEqual(expect.objectContaining({ kind: 'fetch-failed' }));
+    expect(readFileSync(overlayFilePath(root, env), 'utf8')).toBe(stored);
     expect(readOverlayState(root, { env }).overlays).toEqual(overlays);
     expectNoRetirement();
   });

@@ -23,6 +23,10 @@ export function recordedEdgeSha(entry) {
  *  tracking ref. `refEvidence` distinguishes refreshed refs, remotely confirmed missing
  *  branches and unverifiable fetch failures. A failed fetch alone never proves remote absence. */
 export function fetchMainAndOverlays({ git, overlays, edgeResolve = true }) {
+  // Malformed records are invalid registry evidence, not merely unavailable branch names. Refuse the
+  // whole preparation before fetching or retiring anything; the operator must repair the stored list.
+  if (overlays.some((o) => !o || typeof o !== 'object' || Array.isArray(o)
+    || typeof o.ref !== 'string' || !o.ref)) return { ok: false, reason: 'fetch-failed' };
   const safeOverlays = overlays.filter((o) => isSafeBranchName(o?.ref));
   const refEvidence = new Map();
   const attempt = (args) => {
