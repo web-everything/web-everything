@@ -15,8 +15,10 @@
  *     PR sat with findings addressed but never handed back: `review:changes` with no owner.
  *
  * THE RULE THIS ENFORCES. Every fix round must end in exactly one owned state. Once per fix-daemon tick, for each open
- * `review:changes` PR with no live fix claim and no live dispatch claim, where a fix round began or ended AFTER the
- * latest changes verdict and no re-arm followed that verdict:
+ * `review:changes` PR with no live fix claim and no live dispatch claim, where no re-arm followed the latest changes
+ * verdict and either an operator answered blocked referrals or a fix round began or ended AFTER that verdict:
+ *   - an operator ruling clears every blocked referral on the unchanged head → RE-ARM even without a fix round,
+ *     keeping any human hold: no fix is owed (live PR #5608);
  *   - the findings were addressed (a trusted fix-evidence comment after the verdict, and the head moved past the
  *     verdict's reviewed head) → RE-ARM it for review through `rearm-review.mjs` (the same sanctioned hand-back the
  *     fixer would have run);
@@ -30,22 +32,27 @@
  * {@link runOrphanFixRoundPass}, run by the fix daemon inside its stuck-fixer reclaim step.
  */
 import { execFileSync } from 'node:child_process';
+import { stripVTControlCharacters } from 'node:util';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { parseOperatorRulingComment } from '../lib/jury-core.mjs';
 import { headEverHumanCleared } from '../lib/review-escalation.mjs';
+import { referralCardReadable } from '../lib/referral-card-readable.mjs';
+import { openReferralFindings, isBlockedFinding, isAwaitingRuling } from '../operations/record-referral-ruling.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
+import { CHANGES_VERDICT_PREFIX, latestChangesVerdict, rearmCoversVerdict } from '../review-set-label.mjs';
 import { annotateLapsedStandDowns } from './stand-down.mjs';
 import { countUnresolvedStandDowns } from './reconcile-core.mjs';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
 export const ORPHAN_GUARD_MARKER = '🧭 conveyor orphan-guard';
 /** The leading line of a review `changes` verdict (`we:scripts/review-set-label.mjs`). */
-export const CHANGES_VERDICT_PREFIX = '🔁 review — changes requested';
+export { CHANGES_VERDICT_PREFIX };
 /** The fixer's evidence comment has no fixed template; its heading always opens with this (live #4715). */
 export const FIX_EVIDENCE_RE = /^#{0,6}\s*🔧 conveyor fix\b[^\n]*\bevidence\b/i;
 /** How long a round must sit unowned after its last event before the guard acts, so the ordinary dispatcher and a
@@ -68,10 +75,11 @@ export function verdictReviewedHead(body) {
 /**
  * Decide what one PR is owed. PURE.
  * @param {{pr:{number:number, labels?:Array, headRefOid?:string, isDraft?:boolean, comments?:Array}, owned?:boolean,
- *   nowMs:number, graceMs?:number, cap?:number}} o
- * @returns {{decision:'none'|'rearm'|'redispatch'|'escalate', reason:string, verdictAt?:string, roundAt?:string}}
+ *   nowMs:number, graceMs?:number, cap?:number, repo?:string, cardReadable?:Function}} o
+ * @returns {{decision:'none'|'rearm'|'redispatch'|'escalate', reason:string, verdictAt?:string, roundAt?:string, rulingAt?:string}}
  */
-export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT_ORPHAN_GRACE_MS, cap = ORPHAN_REDISPATCH_CAP }) {
+export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT_ORPHAN_GRACE_MS, cap = ORPHAN_REDISPATCH_CAP,
+  repo = CONSTELLATION_REPOS.we.slug, cardReadable = () => false }) {
   const none = (reason) => ({ decision: 'none', reason });
   const labels = labelNames(pr?.labels);
   if (!labels.includes('review:changes')) return none('not bounced (no review:changes)');
@@ -79,12 +87,43 @@ export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT
   if (pr?.isDraft) return none('draft — the draft-promotion path owns it');
   if (owned) return none('owned — a live fix or dispatch claim holds it');
   const trusted = (Array.isArray(pr?.comments) ? pr.comments : []).filter((c) => isTrustedMarkerAuthor(c) && atMs(c) != null);
-  let verdict = null;
-  for (const c of trusted) if (lead(c).startsWith(CHANGES_VERDICT_PREFIX) && (!verdict || atMs(c) >= atMs(verdict))) verdict = c;
+  const verdict = latestChangesVerdict(trusted);
   if (!verdict) return none('no trusted changes verdict on the thread');
   const vAt = atMs(verdict);
-  const after = trusted.filter((c) => atMs(c) > vAt);
-  if (after.some((c) => lead(c).startsWith(REARM_COMMENT_MARKER))) return none('already re-armed after the latest verdict');
+  // GitHub timestamps have second precision; the thread also orders comments within that second.
+  const vIndex = trusted.indexOf(verdict);
+  const after = trusted.slice(vIndex + 1);
+  if (after.some((c) => lead(c).startsWith(REARM_COMMENT_MARKER) && rearmCoversVerdict(c.body, verdict))) {
+    return none('already re-armed after the latest verdict');
+  }
+  if (String(verdict.body).includes('### Blocked referral findings')) {
+    const reviewed = String(verdict.body).match(/on head `([0-9a-f]{7,40})`/i)?.[1]?.toLowerCase() ?? verdictReviewedHead(verdict.body);
+    const head = String(pr.headRefOid ?? '').toLowerCase();
+    // The sanctioned writer posts the operator's assertion through automation credentials.
+    // Use the referral gate's parser to validate both that provenance and the operator assertion.
+    const ruling = after.filter((c) => lead(c).startsWith('## Operator ruling on mandatory referrals') && parseOperatorRulingComment(c)?.record)
+      .at(-1);
+    try {
+      // Validate even without a valid ruling: malformed-only history must not reach fix-round recovery.
+      const gate = openReferralFindings({ comments: pr.comments, repo, pr: pr.number, head: pr.headRefOid,
+        body: pr.body ?? '', createdAt: pr.createdAt ?? '', cardReadable });
+      if (gate.malformed || gate.protectionMalformed) return none('malformed referral history — it stays with a person');
+      if (reviewed && head && (head.startsWith(reviewed) || reviewed.startsWith(head)) && ruling) {
+        const { open, ruled } = gate;
+        // A disputed referral history, or any gate-level pending/blocked hold, is not a settled ruling.
+        const settled = !gate.pending?.length && !gate.blocked?.length && !gate.disputed?.length;
+        const ctx = { verdictAt: new Date(vAt).toISOString(), rulingAt: new Date(atMs(ruling)).toISOString() };
+        if (!open.length && ruled.length && settled && countUnresolvedStandDowns(annotateLapsedStandDowns(pr)?.comments) > 0) {
+          return { ...none('stood down — the stand-down answer owns it'), ...ctx };
+        }
+        if (!open.length && ruled.length && settled) return { decision: 'rearm', ...ctx,
+          reason: `operator ruling ${ctx.rulingAt} answered every referral finding the send-back blocked on head ${head.slice(0, 9)} (card/not-real) — no fix is owed, so the review is re-armed; review:human, if present, stays` };
+        if (open.length || !settled) return { ...none(`operator ruling ${ctx.rulingAt} is partial: ${open.length} referral finding(s) still open on head ${head.slice(0, 9)} (${open.filter(isBlockedFinding).length} blocked, ${open.filter(isAwaitingRuling).length} awaiting a ruling or re-check) — it stays with a person`), ...ctx };
+      }
+    } catch {
+      return none('malformed referral history — it stays with a person');
+    }
+  }
   const roundEvents = after.filter((c) => lead(c).startsWith(FIX_END_MARKER) || lead(c).startsWith(FIX_BEGIN_MARKER));
   if (!roundEvents.length) return none('no fix round since the latest verdict — the ordinary fix dispatch owns it');
   const lastRoundMs = Math.max(...roundEvents.map(atMs));
@@ -128,7 +167,7 @@ const ghOpts = () => ({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], tim
 export function defaultListBounced(slug, { exec = execFileSync } = {}) {
   // Filtered here, not with `--label` (search-backed, rate-limited on its own budget — #no-label-search).
   const out = exec('gh', ['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '200',
-    '--json', 'number,labels,headRefOid,isDraft'], ghOpts());
+    '--json', 'number,labels,headRefOid,isDraft,body,createdAt'], ghOpts());
   return JSON.parse(String(out || '[]')).filter((p) => labelNames(p.labels).includes('review:changes'));
 }
 
@@ -146,8 +185,23 @@ async function defaultOwned(repoKey, number) {
 }
 
 export function defaultRearm({ slug, pr, head, exec = execFileSync }) {
-  exec('node', [resolve(ROOT, 'scripts', 'conveyor', 'rearm-review.mjs'), String(pr), `--repo=${slug}`,
-    '--actor=conveyor orphan-guard', ...(head ? [`--expect-head=${head}`] : [])], { ...ghOpts(), cwd: ROOT });
+  try {
+    exec('node', [resolve(ROOT, 'scripts', 'conveyor', 'rearm-review.mjs'), String(pr), `--repo=${slug}`,
+      '--actor=conveyor orphan-guard', ...(head ? [`--expect-head=${head}`] : [])], { ...ghOpts(), cwd: ROOT });
+  } catch (error) {
+    const sanitize = (value) => stripVTControlCharacters(String(value ?? '')).split(/\r?\n/)
+      .map((line) => line.replace(/[\p{Cc}\p{Cf}]/gu, '').trim()).filter(Boolean);
+    const stderr = sanitize(error.stderr).join('; ').slice(0, 300);
+    let stdout = String(error.stdout ?? '');
+    try {
+      const parsed = JSON.parse(stdout);
+      if (typeof parsed?.reason === 'string') stdout = parsed.reason;
+      else if (typeof parsed?.error === 'string') stdout = parsed.error;
+    } catch { /* Non-JSON output uses its first non-empty line. */ }
+    stdout = (sanitize(stdout)[0] ?? '').slice(0, 300);
+    const detail = [stderr, stdout].filter(Boolean).join('; ');
+    throw new Error(`orphan-guard re-arm failed: ${detail || 'child failed without stderr or stdout'}`, { cause: error });
+  }
   return { ok: true };
 }
 
@@ -199,6 +253,7 @@ export async function runOrphanFixRoundPass({
   escalate = defaultEscalate,
   postComment = defaultPostComment,
   graceMs = DEFAULT_ORPHAN_GRACE_MS,
+  cardReadable = (ref) => referralCardReadable(ref, ROOT),
 } = {}) {
   const enabled = orphanGuardEnabled(env);
   const rows = [];
@@ -210,7 +265,7 @@ export async function runOrphanFixRoundPass({
       try {
         const owned = await isOwned(key, p.number);
         const comments = owned ? [] : await readComments(p.number, slug);
-        const plan = planOrphanFixRound({ pr: { ...p, comments }, owned, nowMs, graceMs });
+        const plan = planOrphanFixRound({ pr: { ...p, comments }, owned, nowMs, graceMs, repo: slug, cardReadable });
         if (plan.decision === 'none') continue;
         Object.assign(row, { decision: plan.decision, reason: plan.reason });
         rows.push(row);

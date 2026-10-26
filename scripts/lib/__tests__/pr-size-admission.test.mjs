@@ -9,6 +9,7 @@ import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { planFileItem } from '../../operations/file-item.mjs';
 import * as sizeAdmission from '../pr-size-admission.mjs';
+import { BUILT_IN_PR_SIZE_SETTINGS } from '../pr-size-defaults.mjs';
 import { outcomePayload } from '../../operations/cli-adapter.mjs';
 import { fileIntoBatch } from '../../operations/card-batch-file.mjs';
 
@@ -63,6 +64,7 @@ function effects(overrides = {}) {
   const cards = new Map();
   const reader = overrides.diffStat || (() => ({ text: evidence, sha: HEAD_SHA, baseSha: BASE_SHA }));
   return {
+    loadSizeSettings: () => BUILT_IN_PR_SIZE_SETTINGS,
     ...overrides,
     diffStat: vi.fn((input) => {
       const result = reader(input);
@@ -116,6 +118,8 @@ describe('stateless size-section replacement', () => {
         syncBuiltinESMExports();
         const { input, card } = JSON.parse(process.argv[1]);
         const effects = {
+          loadSizeSettings: () => ({ dataExtensions: ['.json', '.yaml', '.yml', '.csv'],
+            dataDirs: ['config', 'data'], dataPaths: [] }),
           diffStat: () => ({ text: '401\\t0\\tdocs/agent/a.md\\0', sha: input.sha }),
           lookupSplitCard: () => card,
           fileItem: () => { throw new Error('must reuse the trusted card'); },
@@ -1192,11 +1196,11 @@ describe('shared reader — real git evidence', () => {
     const read = sizeAdmission.createPrDiffStatReader({ cwd: join(cwd, 'backlog') });
     expect(read).toBeTypeOf('function');
     const result = read({ base: 'main', sha: 'HEAD' });
-    expect(sizeAdmission.measureNonTestLines(result.text)).toEqual({ lines: 701, exempt: false });
+    expect(sizeAdmission.measureNonTestLines(result.text)).toEqual({ lines: 701, dataLines: 0, exempt: false });
     expect(result.sha).toBe(git(['rev-parse', 'HEAD']).trim());
     git(['rm', '--quiet', 'production.mjs']);
     commit('backlog only');
-    expect(sizeAdmission.measureNonTestLines(read({ base: 'main', sha: 'HEAD' }).text)).toEqual({ lines: 400, exempt: true });
+    expect(sizeAdmission.measureNonTestLines(read({ base: 'main', sha: 'HEAD' }).text)).toEqual({ lines: 400, dataLines: 0, exempt: true });
   }));
 
   it.each(['worktree -diff', 'worktree binary', 'info -diff', 'global -diff', 'NUL bytes'])(
@@ -1229,7 +1233,7 @@ describe('shared reader — real git evidence', () => {
     commit('card');
     const read = sizeAdmission.createPrDiffStatReader({ cwd });
     expect(read).toBeTypeOf('function');
-    expect(sizeAdmission.measureNonTestLines(read({ base: 'main', sha: 'HEAD' }).text)).toEqual({ lines: 400, exempt: true });
+    expect(sizeAdmission.measureNonTestLines(read({ base: 'main', sha: 'HEAD' }).text)).toEqual({ lines: 400, dataLines: 0, exempt: true });
     git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
     renameSync(join(cwd, 'old.mjs'), join(cwd, 'new.mjs'));
     lines[200] = 'changed\n';
@@ -1237,7 +1241,7 @@ describe('shared reader — real git evidence', () => {
     commit('rename');
     const result = read({ base: 'main', sha: 'HEAD' });
     expect(result.text).toBe('1\t1\t\0old.mjs\0new.mjs\0');
-    expect(sizeAdmission.measureNonTestLines(result.text)).toEqual({ lines: 2, exempt: false });
+    expect(sizeAdmission.measureNonTestLines(result.text)).toEqual({ lines: 2, dataLines: 0, exempt: false });
   }));
 });
 

@@ -5,7 +5,9 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { REVIEW_LABELS } from './review-labels.mjs';
 
-export const OPEN_PR_MAX_NON_TEST_LINES = 300;
+import { OPEN_PR_MAX_NON_TEST_LINES, parseNumstat, measureEntries, isTestPath } from './pr-size-accounting.mjs';
+import { loadPrSizeSettingsFile } from './pr-size-settings.mjs';
+export { OPEN_PR_MAX_NON_TEST_LINES, measureNonTestLines } from './pr-size-accounting.mjs';
 const SUMMARY_BYTES = 4096;
 const SUMMARY_COUNT = 100;
 // Require the absolute end of input for identities and paths at trust boundaries.
@@ -58,38 +60,6 @@ function boundedEntries(entries, separator, budget = SUMMARY_BYTES) {
 function summaryText(text) {
   return text.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, ' ')
     .replace(/[&<>"'`\\[\](){}*_$#!|~]/g, (character) => `&#${character.codePointAt(0)};`);
-}
-
-/** Pure git --numstat -z accounting (also accepts legacy unquoted newline rows).
- * Binary rows are unmeasurable; malformed or incomplete evidence must never become a zero-sized diff.
- */
-function parseNumstat(numstatText) {
-  if (typeof numstatText !== 'string') throw new Error('numstat must be text');
-  if (!numstatText) return [];
-  const nulDelimited = numstatText.includes('\0');
-  if (nulDelimited && !numstatText.endsWith('\0')) throw new Error('unterminated numstat record');
-  const rows = nulDelimited ? numstatText.slice(0, -1).split('\0') : numstatText.replace(/\n$/, '').split('\n');
-  const entries = [];
-  for (let i = 0; i < rows.length; i++) {
-    const match = /^(\d+|-)\t(\d+|-)\t([\s\S]*)$/.exec(rows[i]);
-    if (!match) throw new Error('unreadable numstat line');
-    const [, additions, deletions] = match;
-    let paths = [match[3]];
-    // -z represents a rename as counts + empty path, then the old and new paths.
-    if (nulDelimited && !paths[0]) {
-      const source = rows[++i];
-      const destination = rows[++i];
-      if (!source || !destination) throw new Error('incomplete numstat rename');
-      paths = [source, destination];
-    }
-    if (paths.some((path) => !path || (!nulDelimited && /[\t\r\n]|^"/.test(path)))) throw new Error('unreadable numstat path');
-    if ((additions === '-') !== (deletions === '-')) throw new Error('unreadable numstat counts');
-    if (additions === '-') throw new Error('unmeasurable numstat counts');
-    const changed = Number(additions) + Number(deletions);
-    if (!Number.isSafeInteger(changed)) throw new Error('numstat count exceeds safe integer range');
-    entries.push({ paths, changed });
-  }
-  return entries;
 }
 
 export function createGitReader(cwd, exec = execFileSync) {
@@ -175,21 +145,6 @@ export function createPrDiffStatReader({ cwd = process.cwd(), exec = execFileSyn
       sha: resolvedSha, baseSha,
     };
   };
-}
-
-
-const isTestPath = (path) => /(^|\/)__tests__\//.test(path) || /(^|\/)[^/]*\.(test|spec)\.[^/]+$/.test(path);
-export function measureNonTestLines(text) {
-  return measureEntries(parseNumstat(text));
-}
-
-function measureEntries(entries) {
-  let lines = 0;
-  for (const { paths, changed } of entries) {
-    if (!paths.every(isTestPath)) lines += changed;
-    if (!Number.isSafeInteger(lines)) throw new Error('numstat total exceeds safe integer range');
-  }
-  return { lines, exempt: entries.length > 0 && entries.every(({ paths }) => paths.every((p) => p.startsWith('backlog/'))) };
 }
 
 export function planSizeAdmission(result) {
@@ -299,7 +254,7 @@ function splitCardId(value) {
   return typeof id === 'string' && /^[A-Za-z0-9]{1,64}(?![\s\S])/.test(id) ? id : null;
 }
 
-export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = createPrDiffStatReader({ cwd }),
+export function createSizeAdmissionRunner({ cwd = process.cwd(), env = process.env, loadSizeSettings = loadPrSizeSettingsFile, diffStat = createPrDiffStatReader({ cwd }),
   fileItem = (fields) => fileSplitItem(fields, cwd), lookupSplitCard = (request) => lookupLocalSplitCard(request, cwd),
   publishSplitCard = (card, request) => publishLocalSplitCard(card, request, cwd),
 } = {}) {
@@ -318,7 +273,7 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = crea
         throw new Error('stale size request');
       }
       entries = parseNumstat(text);
-      plan = planSizeAdmission(measureEntries(entries));
+      plan = planSizeAdmission(measureEntries(entries, loadSizeSettings(undefined, { env })));
     } catch (error) { plan = planSizeAdmission(error); }
     const result = { ...plan, body, reviewLabel: null, ...(pinnedSha ? { sha: pinnedSha } : {}) };
     if (plan.status === 'ok') return result;
@@ -390,8 +345,9 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = crea
       cardId = null;
       cardNote = 'split card not filed (file-item failed)';
     }
+    const dataNote = plan.dataLines > 0 ? ` ${plan.dataLines} data lines (not counted).` : '';
     const note = plan.status === 'over'
-      ? `${plan.lines} non-test lines (> ${OPEN_PR_MAX_NON_TEST_LINES}): ${cardNote}; extra reviewers requested via the size escalation (review:pending)`
+      ? `${plan.lines} non-test lines (> ${OPEN_PR_MAX_NON_TEST_LINES}): ${cardNote}; extra reviewers requested via the size escalation (review:pending)${dataNote}`
       : `size unknown: extra reviewers requested via the size escalation (review:pending); ${cardNote}`;
     const noted = replaceOwnedSection(body, `## Size\n\n${note}\n${groupLine}${fallback}\n`
       + (cardPublished ? `<!-- size-published:${markerKey} -->\n` : '')

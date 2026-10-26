@@ -1,10 +1,12 @@
-/** Phase 1 RED: size adds a split card and review capacity, never a refusal. */
+/** Shared accounting, data exclusions, and non-blocking size admission. */
 import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import * as openPr from '../open-pr.mjs';
 import * as openPrIo from '../open-pr-io.mjs';
 import * as sizeAdmission from '../../lib/pr-size-admission.mjs';
+import { BUILT_IN_PR_SIZE_SETTINGS } from '../../lib/pr-size-defaults.mjs';
 import * as prLand from '../../pr-land.mjs';
 import { REVIEW_LABELS } from '../../lib/review-labels.mjs';
 
@@ -28,7 +30,8 @@ function wrapper(overrides = {}) {
 // in createParams/applyReviewEscalationLabel. All effects here are injected.
 function direct(overrides = {}) {
   const cards = new Map(); // trusted card-store fixture; body markers are advisory
-  const effects = { diffStat: vi.fn(() => ({ text, sha: '1'.repeat(40) })),
+  const effects = { loadSizeSettings: () => BUILT_IN_PR_SIZE_SETTINGS,
+    diffStat: vi.fn(() => ({ text, sha: '1'.repeat(40) })),
     fileItem: vi.fn((fields) => {
       cards.set(/^size-split-key:([a-f0-9]{64})/.exec(fields.digest)?.[1], card.verdict);
       return card;
@@ -47,39 +50,91 @@ describe('measureNonTestLines — pure numstat accounting', () => {
   });
 
   it('treats empty input as zero changes without a backlog exemption', () => {
-    expect(sizeAdmission.measureNonTestLines('')).toEqual({ lines: 0, exempt: false });
+    expect(sizeAdmission.measureNonTestLines('')).toEqual({ lines: 0, dataLines: 0, exempt: false });
+  });
+
+  it.each(['config/settings.json', 'src/data/entries.json', 'nested/config/entries.yaml',
+    'data/entries.yml', 'nested/data/entries.csv'])('excludes and reports data additions and deletions in %s', (path) => {
+    expect(sizeAdmission.measureNonTestLines(`600\t100\t${path}\0`))
+      .toEqual({ lines: 0, dataLines: 700, exempt: false });
+  });
+
+  it.each(['config/setup.mjs', 'scripts/settings.json', 'docs/guide.md', 'data/guide.md',
+    'metadata/entries.json', 'config.json'])('still counts code, docs and non-data directories: %s', (path) => {
+    expect(sizeAdmission.measureNonTestLines(`200\t101\t${path}\0`))
+      .toEqual({ lines: 301, dataLines: 0, exempt: false });
+  });
+
+  it('accepts exact extra data paths from resolved settings without matching prefixes', () => {
+    const settings = { dataExtensions: [], dataDirs: [], dataPaths: ['scripts/settings.json'] };
+    expect(sizeAdmission.measureNonTestLines('600\t100\tscripts/settings.json\0', settings))
+      .toEqual({ lines: 0, dataLines: 700, exempt: false });
+    expect(sizeAdmission.measureNonTestLines('600\t100\tscripts/settings.json.extra\0', settings))
+      .toEqual({ lines: 700, dataLines: 0, exempt: false });
+    expect(sizeAdmission.measureNonTestLines('600\t100\tconfig/settings.json\0', settings))
+      .toEqual({ lines: 700, dataLines: 0, exempt: false });
+  });
+
+  it('counts both paths conservatively when a rename crosses the data boundary', () => {
+    expect(sizeAdmission.measureNonTestLines('301\t0\t\0scripts/settings.json\0data/settings.json\0'))
+      .toEqual({ lines: 301, dataLines: 0, exempt: false });
+    expect(sizeAdmission.measureNonTestLines('301\t0\t\0config/settings.json\0data/settings.json\0'))
+      .toEqual({ lines: 0, dataLines: 301, exempt: false });
+  });
+
+  it.each(['config/../scripts/a.json', 'config/./a.json', 'config//a.json',
+    '/config/a.json', './config/a.json', '../data/a.json', 'data/a.json/'])
+  ('counts unsafe data paths even when listed as exact exemptions: %s', (path) => {
+    const settings = { dataExtensions: ['.json'], dataDirs: ['config', 'data'], dataPaths: [path] };
+    for (const value of [undefined, settings]) {
+      expect(sizeAdmission.measureNonTestLines(`301\t0\t${path}\0`, value))
+        .toEqual({ lines: 301, dataLines: 0, exempt: false });
+    }
+  });
+
+  it.each(['config/a.mjs', 'data/a.md'])('never exempts code or markdown even with unchecked settings: %s', (path) => {
+    for (const dataPaths of [[], [path]]) {
+      const settings = { dataExtensions: ['.mjs', '.md'], dataDirs: ['config', 'data'], dataPaths };
+      expect(sizeAdmission.measureNonTestLines(`301\t0\t${path}\0`, settings))
+        .toEqual({ lines: 301, dataLines: 0, exempt: false });
+    }
+  });
+
+  it('fails closed for binary data and overflowing data totals', () => {
+    expect(() => sizeAdmission.measureNonTestLines('-\t-\tdata/blob.json\0')).toThrow(/unmeasurable/);
+    expect(() => sizeAdmission.measureNonTestLines('9007199254740991\t0\tdata/a.json\0' + '1\t0\tdata/b.json\0')).toThrow();
   });
 
   it('sums additions and deletions across non-test paths, with or without a trailing newline', () => {
     const text = '100\t50\tscripts/operations/open-pr.mjs\n20\t30\tdocs/a guide.md';
-    expect(sizeAdmission.measureNonTestLines(text)).toEqual({ lines: 200, exempt: false });
-    expect(sizeAdmission.measureNonTestLines(`${text}\n`)).toEqual({ lines: 200, exempt: false });
+    expect(sizeAdmission.measureNonTestLines(text)).toEqual({ lines: 200, dataLines: 0, exempt: false });
+    expect(sizeAdmission.measureNonTestLines(`${text}\n`)).toEqual({ lines: 200, dataLines: 0, exempt: false });
   });
 
   it('reads NUL-delimited paths containing non-ASCII characters, tabs, newlines and quotes literally', () => {
     expect(sizeAdmission.measureNonTestLines('700\t100\tbacklog/é.md\0'))
-      .toEqual({ lines: 800, exempt: true });
+      .toEqual({ lines: 800, dataLines: 0, exempt: true });
     expect(sizeAdmission.measureNonTestLines('1\t2\tscripts/a\tb\nc"d.mjs\0'))
-      .toEqual({ lines: 3, exempt: false });
+      .toEqual({ lines: 3, dataLines: 0, exempt: false });
     expect(sizeAdmission.measureNonTestLines('200\t50\tscripts/a.mjs\0' + '600\t300\tscripts/__tests__/é.mjs\0'))
-      .toEqual({ lines: 250, exempt: false });
+      .toEqual({ lines: 250, dataLines: 0, exempt: false });
   });
 
   it('counts renames by their numstat counts and classifies both paths', () => {
     expect(sizeAdmission.measureNonTestLines('0\t0\t\0scripts/old.mjs\0scripts/new.mjs\0'))
-      .toEqual({ lines: 0, exempt: false });
+      .toEqual({ lines: 0, dataLines: 0, exempt: false });
     expect(sizeAdmission.measureNonTestLines('1\t1\t\0scripts/old.test.mjs\0scripts/new.mjs\0'))
-      .toEqual({ lines: 2, exempt: false });
+      .toEqual({ lines: 2, dataLines: 0, exempt: false });
     expect(sizeAdmission.measureNonTestLines('400\t0\t\0scripts/old.mjs\0scripts/new.test.mjs\0'))
-      .toEqual({ lines: 400, exempt: false });
+      .toEqual({ lines: 400, dataLines: 0, exempt: false });
     expect(sizeAdmission.measureNonTestLines('400\t0\t\0docs/old.md\0backlog/new.md\0'))
-      .toEqual({ lines: 400, exempt: false });
+      .toEqual({ lines: 400, dataLines: 0, exempt: false });
     expect(sizeAdmission.measureNonTestLines('400\t0\t\0backlog/old.md\0docs/new.md\0'))
-      .toEqual({ lines: 400, exempt: false });
+      .toEqual({ lines: 400, dataLines: 0, exempt: false });
     expect(sizeAdmission.measureNonTestLines('400\t0\t\0scripts/old.test.mjs\0scripts/__tests__/new.mjs\0'))
-      .toEqual({ lines: 0, exempt: false });
+      .toEqual({ lines: 0, dataLines: 0, exempt: false });
     expect(sizeAdmission.measureNonTestLines('400\t0\t\0backlog/old.md\0backlog/new.md\0'))
-      .toEqual({ lines: 400, exempt: true });
+      .toEqual({ lines: 400, dataLines: 0, exempt: true });
   });
 
   it.each([
@@ -101,26 +156,26 @@ describe('measureNonTestLines — pure numstat accounting', () => {
     'scripts/x/a.spec.ts',
   ])('excludes additions and deletions for test path %s', (path) => {
     expect(sizeAdmission.measureNonTestLines(`200\t50\tscripts/x.mjs\n600\t300\t${path}\n`))
-      .toEqual({ lines: 250, exempt: false });
+      .toEqual({ lines: 250, dataLines: 0, exempt: false });
   });
 
   it('counts similarly named non-test paths', () => {
     expect(sizeAdmission.measureNonTestLines('10\t5\tscripts/__tests__helpers/a.mjs\n20\t5\tscripts/a.testing.mjs\n'))
-      .toEqual({ lines: 40, exempt: false });
+      .toEqual({ lines: 40, dataLines: 0, exempt: false });
   });
 
   it('exempts a nonempty diff only when every path starts with backlog/', () => {
     expect(sizeAdmission.measureNonTestLines('700\t100\tbacklog/a.md\n150\t50\tbacklog/nested/b.md\n'))
-      .toEqual({ lines: 1000, exempt: true });
+      .toEqual({ lines: 1000, dataLines: 0, exempt: true });
     expect(sizeAdmission.measureNonTestLines('0\t0\tbacklog/a.md\n'))
-      .toEqual({ lines: 0, exempt: true });
+      .toEqual({ lines: 0, dataLines: 0, exempt: true });
   });
 
   it('does not exempt mixed paths, even when the outside path is a test', () => {
     expect(sizeAdmission.measureNonTestLines('1000\t0\tbacklog/a.md\n1\t0\tscripts/a.mjs\n'))
-      .toEqual({ lines: 1001, exempt: false });
+      .toEqual({ lines: 1001, dataLines: 0, exempt: false });
     expect(sizeAdmission.measureNonTestLines('1000\t0\tbacklog/a.md\n900\t0\tscripts/a.test.mjs\n'))
-      .toEqual({ lines: 1000, exempt: false });
+      .toEqual({ lines: 1000, dataLines: 0, exempt: false });
   });
 
   it.each([
@@ -146,11 +201,121 @@ describe('measureNonTestLines — pure numstat accounting', () => {
   });
 });
 
+describe('PR size settings cascade', () => {
+  it('loads the production default settings file as a filesystem path', async () => {
+    const { loadPrSizeSettingsFile } = await import('../../lib/pr-size-settings.mjs');
+    expect(loadPrSizeSettingsFile(undefined, { platform: {}, env: {} })).toEqual({
+      dataExtensions: ['.json', '.yaml', '.yml', '.csv'], dataDirs: ['config', 'data'], dataPaths: [],
+    });
+  });
+
+  it('resolves standard, platform, tool and environment leaves with provenance', async () => {
+    const { resolvePrSizeSettings } = await import('../../lib/pr-size-settings.mjs');
+    const resolved = resolvePrSizeSettings({ platform: { dataDirs: ['fixtures'], dataPaths: ['platform.json'] },
+      tool: { dataPaths: ['tool.json'] }, env: { WE_PR_SIZE_DATA_EXTENSIONS: '[".csv"]' } });
+    expect(resolved.value).toEqual({ dataExtensions: ['.csv'], dataDirs: ['fixtures'], dataPaths: ['tool.json'] });
+    expect(resolved.sources).toEqual({ dataExtensions: 'env', dataDirs: 'platform', dataPaths: 'tool' });
+    expect(sizeAdmission.measureNonTestLines('400\t5\tfixtures/table.csv\0', resolved.value))
+      .toEqual({ lines: 0, dataLines: 405, exempt: false });
+  });
+
+  it('rejects invalid overrides instead of retaining lower layers', async () => {
+    const { resolvePrSizeSettings } = await import('../../lib/pr-size-settings.mjs');
+    expect(() => resolvePrSizeSettings({ platform: {}, tool: { dataDirs: ['../scripts'], dataPaths: ['/absolute.json'] },
+      env: { WE_PR_SIZE_DATA_EXTENSIONS: 'not-json', WE_PR_SIZE_DATA_PATHS: '["../escape.json"]' } })).toThrow();
+  });
+
+  it.each([
+    { dataExtensions: ['.mjs'] }, { dataExtensions: ['.json', '.md'] },
+    { dataPaths: ['scripts/a.mjs'] }, { dataPaths: ['docs/a.md'] },
+    { dataPaths: ['config/../scripts/a.json'] }, { dataPaths: ['config/./a.json'] },
+    { dataPaths: ['config//a.json'] }, { dataPaths: ['/config/a.json'] },
+    { dataExtensions: '.json' }, { dataExtensions: [1] }, { dataDirs: null },
+    { dataPaths: {} }, { dataPaths: { nested: ['scripts/a.json'] } }, null, [], 'invalid',
+  ])('rejects invalid settings in every cascade layer: %j', async (invalid) => {
+    const { resolvePrSizeSettings } = await import('../../lib/pr-size-settings.mjs');
+    expect(() => resolvePrSizeSettings({ platform: {}, tool: invalid, env: {} })).toThrow();
+    expect(() => resolvePrSizeSettings({ platform: invalid, tool: {}, env: {} })).toThrow();
+    if (invalid && !Array.isArray(invalid) && typeof invalid === 'object') {
+      const env = Object.fromEntries(Object.entries(invalid).map(([key, value]) => [
+        `WE_PR_SIZE_${key.replace(/[A-Z]/g, letter => `_${letter}`).toUpperCase()}`, JSON.stringify(value),
+      ]));
+      expect(() => resolvePrSizeSettings({ platform: {}, tool: {}, env })).toThrow();
+    }
+  });
+
+  it('allows narrowing and extending the extension selection only within pure data', async () => {
+    const { resolvePrSizeSettings } = await import('../../lib/pr-size-settings.mjs');
+    const { value } = resolvePrSizeSettings({ platform: { dataExtensions: ['.json'] },
+      tool: { dataExtensions: ['.json', '.yaml', '.yml', '.csv'] }, env: {} });
+    expect(value.dataExtensions).toEqual(['.json', '.yaml', '.yml', '.csv']);
+  });
+
+  it('rejects malformed environment JSON even when lower layers are valid', async () => {
+    const { resolvePrSizeSettings } = await import('../../lib/pr-size-settings.mjs');
+    expect(() => resolvePrSizeSettings({ platform: {}, env: { WE_PR_SIZE_DATA_PATHS: 'not-json' } })).toThrow();
+  });
+
+  it('rejects invalid lower layers even when a valid override would replace them', async () => {
+    const { resolvePrSizeSettings } = await import('../../lib/pr-size-settings.mjs');
+    expect(() => resolvePrSizeSettings({ platform: { dataExtensions: ['.mjs'] },
+      tool: { dataExtensions: ['.json'] }, env: { WE_PR_SIZE_DATA_EXTENSIONS: '[".csv"]' } })).toThrow();
+  });
+
+  it.each(['{broken', '[]', '{"prSize":null}', '{"prSize":{"dataPaths":["scripts/a.mjs"]}}'])
+  ('rejects unreadable or invalid platform preferences: %s', async (contents) => {
+    const { resolvePrSizeSettings } = await import('../../lib/pr-size-settings.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'pr-size-platform-'));
+    try {
+      const path = join(dir, 'preferences.json');
+      writeFileSync(path, contents);
+      expect(() => resolvePrSizeSettings({ env: { WE_PLATFORM_PREFERENCES_FILE: path } })).toThrow();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('loads exact repo paths, throws for malformed or unreadable files, and defaults only for absent files', async () => {
+    const { loadPrSizeSettingsFile } = await import('../../lib/pr-size-settings.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'pr-size-settings-'));
+    try {
+      const path = join(dir, 'settings.json');
+      writeFileSync(path, JSON.stringify({ dataPaths: ['scripts/settings.json'] }));
+      const settings = loadPrSizeSettingsFile(path, { env: {}, platform: {} });
+      expect(sizeAdmission.measureNonTestLines('400\t5\tscripts/settings.json\0', settings))
+        .toEqual({ lines: 0, dataLines: 405, exempt: false });
+      writeFileSync(path, 'invalid');
+      expect(() => loadPrSizeSettingsFile(path, { env: {}, platform: {} })).toThrow();
+      expect(() => loadPrSizeSettingsFile(dir, { env: {}, platform: {} })).toThrow();
+      expect(loadPrSizeSettingsFile(join(dir, 'missing'), { env: {}, platform: {} })).toEqual({
+        dataExtensions: ['.json', '.yaml', '.yml', '.csv'], dataDirs: ['config', 'data'], dataPaths: [],
+      });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each(['{broken', 'null', '{"dataExtensions":".json"}', '{"dataExtensions":[".mjs"]}',
+    '{"dataPaths":["scripts/a.mjs"]}', '{"dataPaths":["docs/a.md"]}'])
+  ('invalid present settings escalate review without refusing direct admission: %s', async (contents) => {
+    const { loadPrSizeSettingsFile } = await import('../../lib/pr-size-settings.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'pr-size-invalid-'));
+    try {
+      const path = join(dir, 'settings.json');
+      writeFileSync(path, contents);
+      const { run, effects } = direct({
+        diffStat: () => ({ text: '1\t0\tconfig/a.json\0', sha: request.sha }),
+        loadSizeSettings: () => loadPrSizeSettingsFile(path, { platform: {}, env: {} }),
+      });
+      expect(await run()).toMatchObject({ status: 'unknown', reviewLabel: REVIEW_LABELS.pending });
+      expect(effects.fileItem).toHaveBeenCalledOnce();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
 describe('legacy size imports remain compatible with the shared home', () => {
   it('open-pr-io re-exports the shared 300-line constant and measurement function (the declaration stays import-free)', () => {
     expect(sizeAdmission.OPEN_PR_MAX_NON_TEST_LINES).toBe(300);
     expect(openPrIo.OPEN_PR_MAX_NON_TEST_LINES).toBe(sizeAdmission.OPEN_PR_MAX_NON_TEST_LINES);
     expect(openPrIo.measureNonTestLines).toBe(sizeAdmission.measureNonTestLines);
+    expect(openPr.measureNonTestLines).toBe(sizeAdmission.measureNonTestLines);
+    expect(openPr.OPEN_PR_MAX_NON_TEST_LINES).toBe(sizeAdmission.OPEN_PR_MAX_NON_TEST_LINES);
   });
   it('open-pr-io re-exports the shared diff-stat reader', () => {
     expect(openPrIo.createPrDiffStatReader).toBe(sizeAdmission.createPrDiffStatReader);
@@ -212,6 +377,41 @@ describe('open-pr delegates size admission to the direct producer', () => {
 });
 
 describe('direct pr-land uses the same admission and existing review-label path', () => {
+  it.each([
+    ['data-only diff', '1000\t0\tconfig/settings.json\0', 0],
+    ['300 code lines plus data', '300\t0\tscripts/a.mjs\0' + '1000\t0\tdata/entries.json\0', 300],
+  ])('direct pr-land excludes data from the budget for %s', async (_name, evidence, lines) => {
+    const { run, effects } = direct({ diffStat: () => ({ text: evidence, sha: request.sha }) });
+    expect(await run()).toMatchObject({ status: 'ok', lines, dataLines: 1000,
+      body: request.body, reviewLabel: null });
+    expect(effects.fileItem).not.toHaveBeenCalled();
+    expect(effects.publishSplitCard).not.toHaveBeenCalled();
+  });
+
+  it('direct pr-land loads cascade settings using the producer environment', async () => {
+    const { run, effects } = direct({
+      loadSizeSettings: undefined, // exercise the production settings loader
+      env: { WE_PLATFORM_PREFERENCES_FILE: join(tmpdir(), 'absent-pr-size-platform-preferences.json'),
+        WE_PR_SIZE_DATA_PATHS: '["scripts/settings.json"]' },
+      diffStat: () => ({ text: '400\t5\tscripts/settings.json\0', sha: request.sha }),
+    });
+    expect(await run()).toMatchObject({ status: 'ok', lines: 0, dataLines: 405, reviewLabel: null });
+    expect(effects.fileItem).not.toHaveBeenCalled();
+  });
+
+  it('direct pr-land reports excluded data while retaining its file groups for review', async () => {
+    const { run, effects } = direct({ diffStat: () => ({
+      text: '301\t0\tscripts/a.mjs\0' + '900\t100\tdata/entries.json\0', sha: request.sha,
+    }) });
+    const result = await run();
+    expect(result).toMatchObject({ status: 'over', lines: 301, dataLines: 1000,
+      reviewLabel: REVIEW_LABELS.pending });
+    expect(result.body).toContain('1000 data lines (not counted).');
+    expect(result.body).toContain('we:data/entries.json: 1000');
+    expect(effects.fileItem).toHaveBeenCalledOnce();
+    expect(effects.fileItem.mock.calls[0][0].scope).toContain('we:data/entries.json');
+  });
+
   it('direct pr-land: 301 lines proceed, one card names PR + groups, body notes both, reviewers escalated', async () => {
     const { run, effects } = direct();
     const result = await run();

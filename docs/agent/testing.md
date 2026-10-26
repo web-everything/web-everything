@@ -536,6 +536,20 @@ must pass a temporary `lockRoot` through `withPocLandLock`, preserving the mutex
 
 ## PR time-loss safeguards
 
+R125: `measureNonTestLines` excludes pure data from the 300-line budget and reports it separately as
+`dataLines`; those files still require review. Built-in data extensions are `.json`, `.yaml`, `.yml`,
+and `.csv`, under a `config/` or `data/` directory segment at any depth. Exact `dataPaths` add exceptions
+only for those four extensions; `dataExtensions` may select only within that set. Code and markdown
+cannot become data exemptions. Absolute paths and paths with empty, `.` or `..` segments always count.
+The shared producer admission resolves `prSize` through the shared policy cascade and `scripts/pr-size-settings.json`;
+JSON-array env overrides are `WE_PR_SIZE_DATA_EXTENSIONS`, `WE_PR_SIZE_DATA_DIRS`, and `WE_PR_SIZE_DATA_PATHS`.
+Invalid present settings at any layer make size unknown, file a split card conservatively and request
+extra reviewers without refusing PR creation; only an absent tool settings file uses lower layers and
+built-in defaults. Restore valid settings before retrying measurement.
+The counter defaults to dependency-free frozen built-ins to preserve the declaration's import safety.
+Keep the classification, settings provenance, data accounting, binary/overflow errors, and conservative
+rename cases in `scripts/operations/__tests__/open-pr-size-cap.test.mjs`.
+
 `fix.alertAtRoundCap` publishes through the needs-you feed as soon as the notes pass observes exhaustion,
 independently of note-comment dedup and quiet-hour desktop delivery. Polling must include `needsPerson`
 rows so it does not clear and reopen those events, losing the original idle timestamp.
@@ -2055,6 +2069,23 @@ sleep without consuming native filesystem watchers, and the optional webhook sle
 provides an isolated mailbox for tests. A wake only schedules a normal pass; claims,
 scope, host admission and attempt budgets remain authoritative.
 
+Pinned plain re-arm fixtures must exercise the partial state between the label swap and
+the durable marker: three failed comment attempts restore the pre-swap labels, while a
+pending PR resumes by posting only its missing marker. Inject `rearmRetrySleep` to avoid
+real delays. Assert head checks on comment retries and rollback, trusted verdict-bound
+coverage in thread order (including the same timestamp second), and round counts after
+rollback and successful retry. A rollback failure must name the unmarked pending state.
+Compensating label writes must also revalidate the complete trusted review evidence
+and the review/readiness labels created by the swap. Exercise a same-head human
+clearance on the third failed comment attempt, a newer or edited verdict with labels
+still pending, changed holds/readiness, and unreadable state. Refuse compensation
+when superseded; preserve unrelated labels and ignore untrusted verdict claims.
+The `pinned-rearm-orphan-marker` soak replay retains one provider's PR state across
+exhausted HTTP 503 retries, successful or failed rollback, and subsequent retries.
+Assert that failed rollback resumes with only a marker write, a completed retry writes
+nothing further even within the verdict's timestamp second, and rollback spends no
+repair round or bypasses the orphan redispatch cap.
+
 The shared policy cascade resolves `fix.sendBackReservedSlots` (standard 1),
 `fix.ciMissingAfterPushMin` (standard 10), and `drain.mergeableUnknownRepollSec`
 (standard 20), independently through platform preferences, declared tool settings and
@@ -2447,3 +2478,17 @@ omissions are reported as truncation. Clone paths must be absolute. The drain ta
 prototype-load settings, not the plist's data clone; tests inject those settings. Matrix and PR table cells strip
 Cc/Cf controls and are width-capped; table mode keeps the truncated-listing warning.
 
+
+### Red-team disposition precedence
+
+`red-team-disposition.test.mjs` pins all ranked pairs in both temporal and input
+orders, alongside shared-reader regressions for carry, repost, per-key blocks and
+legacy holds. Keep the oracle independent of `DISPOSITION_PRECEDENCE`.
+The pure resolver consumes validated live rulings; the thread adapter owns trust,
+head/result binding, carry eligibility and ceremony validity. Compatibility notes
+beside the table are deliberate: later indexed gate holds retire older releases,
+unindexed legacy holds do not. Operator blocks outrank clear-human regardless of
+recency; recency breaks ties only within a rank. Clear-human clears only keys
+the block does not name. A `NOT sent back` line is an ordinary hold even
+inside an operator-block record. Preserve these fixtures when changing liveness;
+rank alone cannot describe the historical wire protocol.

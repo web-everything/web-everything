@@ -33,6 +33,7 @@ import { op } from './registry.mjs';
 import { DECLARED_HOMES } from './declared-homes.mjs';
 import { compute, effect } from './step-kinds.mjs';
 import { HOME_REASONS } from './pr-land-reasons.mjs';
+export { measureNonTestLines, OPEN_PR_MAX_NON_TEST_LINES } from '../lib/pr-size-accounting.mjs';
 
 /**
  * card xiqtf7w — the ONE way a PR says it replaces another open PR. A PR that folds in another open PR's fix must
@@ -46,7 +47,6 @@ export const SUPERSEDES_LINE_GUIDANCE = 'A PR that folds in another open PR\'s f
   + '(the fix daemon stands #N down once this PR merges; prose such as "is superseded by this PR" is not read).';
 
 export const OPEN_PR_OP = 'open-pr';
-
 
 /** The one effect: hand the planned argv to the home. */
 export const SUBMIT_PR_EFFECT = 'open-pr.submit';

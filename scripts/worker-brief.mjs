@@ -92,6 +92,13 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
 5. **Red-green tests through the heavy queue.** Write the failing test first, then the fix.
    ${testsFirstWorkerRule()}
    Run tests with \`npm run test:unit -- <test files>\`. Running vitest directly is denied.
+   If the card size is >= 8, ask for a split plan up front, before any build.
+   After the first Codex round and before verify/converge, run
+   \`node scripts/operations/run.mjs pr-size --checkout=<lane>\`.
+   This measures committed changes only; commit the first round with a tight pathspec before checking.
+   If over the limit, stop and propose a split plan instead of finishing the build.
+   If unreadable, stop, restore readable git diff evidence, and retry before verify/converge.
+
 6. **One PR.** Commit with a tight pathspec (your files only), verify with
    \`node scripts/operations/run.mjs verify --checkout=<lane>\`, then open exactly one PR:
    \`node scripts/operations/run.mjs open-pr --ref=lane/${purpose} --title="<title>" --bodyFile=<path> --json\`.
