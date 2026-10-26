@@ -83,6 +83,21 @@ Skeptic: SURVIVES-WITH-AMENDMENT -- Subject, revision, and evidence-scope isolat
 
 Screen: clear
 
+## Trust boundary and threat model
+
+- **Trusted:** the checked-in probation registry policy once it passes schema validation; allowlisted metric and exit adapter code in the repository; operator dispositions recorded through the authorised operations.
+- **Adversarial or untrusted:** metric and trial records emitted by model, agent or planner runs (they may be malformed, oversized, truncated or forged); free text and adapter names inside those payloads or inside backlog cards; coordination-store cursors and filing receipts, which a crashed or concurrent sweep may leave stale or corrupt; any unverified working-tree state.
+- **Out of scope:** tamper protection against a local actor who can already write the checked-in policy or the coordination store; automatic shutoff, setting changes or promotion (the watcher only files review cards; the operator decides).
+- **Rules that enforce the boundary:** adapter names resolve against a static in-code allowlist, never a dynamic import or evaluated string. A corrupt, missing or unreadable registry fails closed to `unvalidated` with a visible diagnostic. A cursor or receipt that names a missing or mismatched card is reconciled against the backlog before it may suppress a review.
+
+| Frozen input | Frozen when | Representation | Re-read rule |
+| --- | --- | --- | --- |
+| Subject revision and commit | At trial or metric emission | Immutable revision id bound to the evaluated commit SHA in the evidence manifest | Never re-pointed to a newer commit; a behaviour change needs a new revision id |
+| Activation event and deadline | Once, on explicit activation | Persisted event id, activation instant and derived 30-day review date | Never reset or extended by a watcher restart, re-run or replayed event |
+| Shadow baseline | Once, on explicit activation | Exact record range and content digest of the baseline window | Never recomputed as later records are appended |
+| Registry policy | Once, at sweep start | Parsed, schema-validated snapshot | Held constant for the sweep |
+| Sweep evidence batch | Once per bounded read pass | In-memory slice capped at 100 subjects and 8 MiB | Evaluated in memory only; never re-read mid-evaluation |
+
 ## Supported by default (not decisions)
 
 - **Registry location/shape:** use a versioned data registry, proposed `we:scripts/lib/probation-registry.json`, beside the existing model registry. One logical registry can be partitioned by subject kind; JSON versus per-kind JSON is an authoring/storage dimension, not a merit fork. Keep mutable watcher cursors and dedup receipts in the resolved operations coordination store, outside checked-in policy. The migration moves model declarations once; the old module becomes a facade or generated view, never a second editable authority. Reject conflicting duplicates and unsupported versions visibly; unknown identities remain unvalidated. Corrupt, truncated, missing or unreadable v1/v2 registry data must yield `unvalidated` through both model facade seams and a visible read diagnostic, never trust or an error-free empty-policy success.
@@ -103,8 +118,9 @@ Screen: clear
 | Dispatcher model rollout | we:backlog/3383-a-background-mechanical-dispatcher-replaces-the-interactive.md:2554 records the original provider/model registry rollout. | History corroborates the seam; the named statute anchor, not the epic log, governs authority. |
 | Pass daemons and durable sampler job | we:skills-src/conveyor/pass-daemon.mjs:77 defines per-pass leases; we:scripts/conveyor/resource-sampler-daemon.mjs:33 refuses corrupt job records and enforces one current sampler job. | Reuse scheduled work and durable ownership, not a bespoke polling process per subject. |
 | Advisory-seat exit proposal | we:backlog/6782-probation-exit-report-scheduled-job-that-proposes-promote-ke.md:12 proposes report-and-pause at a deadline; status remains open (:5). | Its automatic pause is not standing authority. Reuse report evidence, but keep any seat-specific spending pause separate from the generic watcher and require its own ruling. |
+| Per-run probation launcher and judged trials | we:scripts/lib/probation-launcher.mjs launches per-run worker and feature trials; cards 4290 and 6163 extend that path and card 6473 guards its roster check. | These are per-run trial execution, not the subject-level registry or the scheduled review; keep them separate from the registry. |
 
-No browser primitive supplies operator-governed probation. This is repository operations tooling, not a new plug, block, intent, or vocabulary entry in the web standard. No external framework comparison is needed to override the stronger in-repo lifecycle and job precedents.
+No browser primitive supplies operator-governed probation. This is repository operations tooling, not a new plug, block, intent, or vocabulary entry in the web standard. External prior art is summarised in the linked research topic (canary analysis, progressive delivery, guarded rollouts, error-budget policy, attestations); the stronger in-repo lifecycle and job precedents still govern the shape.
 
 The current model reader's empty fallback is fail-closed because `statusFor` defaults to `unvalidated` (we:scripts/lib/model-probation.mjs:159), and `liveStatusFor` composes that lookup with the reader (:239). Empty declarations do not mean exemption from probation. The proposed v2 reader must preserve this result and add a visible read diagnostic; the current fallback alone is not evidence that v2 corruption handling has been implemented.
 
@@ -187,3 +203,5 @@ Care level: `high`. This jury binds against the item's predicted scope and is re
 | standards-conformance#2 | standards-conformance | static-review | The change follows this repo's conventions and platform-native defaults, and does not diverge from a ratified standard or placement rule. |
 | claim-accuracy#1 | claim-accuracy | static-review | Every factual claim the change makes about the repo holds against the repo: a cited path:line names what is actually there, a quoted grep literal really matches, a stated count is the real count, a referenced id or link resolves, and anything the description says was changed appears in the diff. |
 | claim-accuracy#2 | claim-accuracy | static-review | Every factual claim the change makes about the repo holds against the repo: a cited path:line names what is actually there, a quoted grep literal really matches, a stated count is the real count, a referenced id or link resolves, and anything the description says was changed appears in the diff. |
+
+Boundary invariants named in this card's normative guarantees and in its Trust boundary and threat model (bounded reads, commit-bound provenance, fail-closed refusal of corrupt state) block acceptance of the build. They are not deferred debt, whatever the generic juror expectations above say.

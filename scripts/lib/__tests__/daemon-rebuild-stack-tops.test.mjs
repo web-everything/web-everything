@@ -387,11 +387,311 @@ describe('held item 212 review round 1 — landed overlays and pinned bases', ()
     f.push('lane/mech-top', p, { [LADDER]: lines({ 3: 'mech top' }) });
     f.fetch();
     const plan = await planRebuild({
-      git: f.runGit, headSha: null, mainRef: 'origin/main', overlays: [{ ref: 'lane/mech-base' }, { ref: 'lane/mech-top' }],
+      git: f.runGit, headSha: null, mainRef: 'origin/main', stackMode: 'independent',
+      overlays: [{ ref: 'lane/mech-base' }, { ref: 'lane/mech-top' }],
     });
     expect(plan.ok).toBe(true);
     expect(plan.decisions.find((d) => d.ref === 'lane/mech-base')).toMatchObject({ action: 'apply' });
     expect(plan.decisions.find((d) => d.ref === 'lane/mech-base').reason).not.toBe('stack-contained');
+    expect(plan.decisions.map((d) => d.ref)).toEqual(['lane/mech-base', 'lane/mech-top']);
+    expect(plan.applied.map((a) => a.ref)).toEqual(['lane/mech-base', 'lane/mech-top']);
+  });
+
+  it('an established mechanism-pinned base listed first survives through its rebased newcomer top', async () => {
+    const f = fixture();
+    const mechMain = f.push('lane/mech-main', f.init, {
+      [MECH]: lines({ 2: 'main mechanism' }), 'scripts/lib/daemon-rebuild.mjs': lines(),
+    });
+    advanceMain(f, mechMain);
+    const base = f.push('lane/mech-base', mechMain, { [MECH]: lines({ 2: 'base mechanism' }) });
+    f.fetch();
+    const live = await f.build([{ ref: 'lane/mech-base' }], mechMain);
+    const advanced = f.push('lane/advanced-main', mechMain, { [MECH]: lines({ 2: 'advanced mechanism' }) });
+    advanceMain(f, advanced);
+    // Merge current main into the top and resolve the conflict there, retaining the base's exact ancestry.
+    gitOk(f.author, ['checkout', '-q', '-B', 'lane/mech-top', base]);
+    const merge = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'merge', '--no-commit', '--no-ff', advanced], { cwd: f.author });
+    expect(merge.status).toBe(1);
+    write(f.author, MECH, lines({ 2: 'base and advanced mechanism consolidated' }));
+    gitOk(f.author, ['add', '-A']);
+    gitOk(f.author, ['commit', '-q', '-m', 'consolidate base on advanced main']);
+    gitOk(f.author, ['push', '-q', 'origin', 'HEAD:refs/heads/lane/mech-top']);
+    f.fetch();
+    const top = gitOk(f.author, ['rev-parse', 'HEAD']).trim();
+    expect(isAncestor(f.clone, base, live)).toBe(true);
+    expect(isAncestor(f.clone, top, live)).toBe(false);
+    expect(isAncestor(f.clone, base, top)).toBe(true);
+    expect(isAncestor(f.clone, advanced, top)).toBe(true);
+    expect(f.runGit(['merge-tree', '--write-tree', '--no-messages', advanced, base]).status).toBe(1);
+
+    const plan = await planRebuild({
+      git: f.runGit, headSha: live, mainRef: 'origin/main', edgeResolve: false,
+      overlays: [{ ref: 'lane/mech-base' }, { ref: 'lane/mech-top' }],
+    });
+    expect(plan.ok).toBe(true);
+    expect(plan.applied.map((a) => a.ref)).toEqual(['lane/mech-top']);
+    expect(plan.decisions.find((d) => d.ref === 'lane/mech-base'))
+      .toMatchObject({ action: 'skip', reason: 'pinned-contained-in-applied' });
+    expect(isAncestor(f.clone, base, plan.finalSha)).toBe(true);
+    expect(plan.decisions.some((d) => d.action === 'remove')).toBe(false);
+    expect(plan.establishedLost).toEqual([]);
+    expect(plan.alerts.map((a) => a.kind)).not.toContain('established-overlay-dropped');
+  });
+
+  it.each([
+    ['flag', false], ['mechanism', false], ['flag', true], ['mechanism', true],
+  ])('a clean %s-pinned base stays before a conflicting top (preceding overlay: %s)', async (pin, prefix) => {
+    const f = fixture();
+    const file = pin === 'flag' ? TAKEOVER : MECH;
+    const start = f.push('lane/start', f.init, { [file]: '0\n', 'g.txt': '0\n' });
+    advanceMain(f, start);
+    const base = f.push('lane/base', start, { [file]: '1\n' });
+    const p = f.push('lane/p', start, { [file]: '2\n' });
+    const main = f.push('lane/reverted-main', p, { [file]: '0\n' });
+    advanceMain(f, prefix ? p : main);
+    const before = prefix ? [{ ref: 'lane/prefix' }] : [];
+    if (prefix) f.push('lane/prefix', main, { 'prefix.txt': 'preceding overlay\n' });
+    f.fetch();
+    const headSha = prefix ? await f.build([...before, { ref: 'lane/base', pinned: true }], f.init) : base;
+    gitOk(f.author, ['checkout', '-q', '-B', 'lane/top', base]);
+    const merge = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'merge', '--no-commit', '--no-ff', p], { cwd: f.author });
+    expect(merge.status).toBe(1);
+    write(f.author, file, '1\n');
+    write(f.author, 'g.txt', '1\n');
+    gitOk(f.author, ['add', '-A']);
+    gitOk(f.author, ['commit', '-q', '-m', 'top resolves base and P']);
+    gitOk(f.author, ['push', '-q', 'origin', 'HEAD:refs/heads/lane/top']);
+    const top = gitOk(f.author, ['rev-parse', 'HEAD']).trim();
+    f.fetch();
+    expect(f.runGit(['merge-tree', '--write-tree', '--no-messages', main, base]).status).toBe(0);
+    expect(f.runGit(['merge-tree', '--write-tree', '--no-messages', main, top]).status).toBe(1);
+    const plan = await planRebuild({
+      git: f.runGit, headSha, mainRef: 'origin/main', stackMode: 'tops', edgeResolve: false,
+      overlays: [...before, { ref: 'lane/base', ...(pin === 'flag' ? { pinned: true } : {}) }, { ref: 'lane/top', pinned: true }],
+    });
+    expect(plan.ok, JSON.stringify(plan)).toBe(true);
+    expect(plan.applied.map((a) => a.ref)).toEqual([...before.map((o) => o.ref), 'lane/base', 'lane/top']);
+    expect(plan.establishedLost).toEqual([]);
+    expect(gitOk(f.clone, ['show', `${plan.finalSha}:${file}`])).toBe('1\n');
+    expect(gitOk(f.clone, ['show', `${plan.finalSha}:g.txt`])).toBe('1\n');
+    for (const sha of [base, top]) expect(isAncestor(f.clone, sha, plan.finalSha)).toBe(true);
+  });
+
+  it.each(['tops', 'independent'])('an established unpinned base keeps priority over a conflicting newcomer in %s mode', async (stackMode) => {
+    const f = fixture();
+    const base = f.push('lane/base', f.init, { [TAKEOVER]: lines({ 2: 'established base' }) });
+    f.push('lane/newcomer', f.init, { [TAKEOVER]: lines({ 2: 'conflicting newcomer' }) });
+    f.push('lane/top', base, { [LADDER]: lines({ 3: 'containing top' }) });
+    f.fetch();
+    const plan = await planRebuild({
+      git: f.runGit, headSha: base, mainRef: 'origin/main', edgeResolve: false, stackMode,
+      overlays: ['lane/base', 'lane/newcomer', 'lane/top'].map((ref) => ({ ref })),
+    });
+    expect(plan.ok).toBe(true);
+    expect(plan.decisions.map((d) => d.ref)).toEqual(['lane/base', 'lane/newcomer', 'lane/top']);
+    expect(plan.decisions.find((d) => d.ref === 'lane/base')).toMatchObject({ action: 'apply' });
+    expect(plan.decisions.find((d) => d.ref === 'lane/newcomer')).toMatchObject({ action: 'drop', reason: 'conflict' });
+    expect(plan.applied.map((a) => a.ref)).toEqual(['lane/base', 'lane/top']);
+    expect(plan.alerts.map((a) => a.kind)).toContain('overlay-newcomer-parked');
+  });
+
+  it('an established mechanism-pinned base keeps priority over a conflicting newcomer before its containing top', async () => {
+    const f = fixture();
+    const mechMain = f.push('lane/mech-main', f.init, {
+      [MECH]: lines(), 'scripts/lib/daemon-rebuild.mjs': lines(),
+    });
+    advanceMain(f, mechMain);
+    const base = f.push('lane/mech-base', mechMain, {
+      [MECH]: lines({ 2: 'established mechanism' }), [TAKEOVER]: lines({ 2: 'established work' }),
+    });
+    f.fetch();
+    const live = await f.build([{ ref: 'lane/mech-base' }], mechMain);
+    const newcomer = f.push('lane/newcomer', mechMain, { [TAKEOVER]: lines({ 2: 'conflicting newcomer' }) });
+    const top = f.push('lane/mech-top', base, { [LADDER]: lines({ 3: 'containing top' }) });
+    f.fetch();
+    expect(isAncestor(f.clone, base, live)).toBe(true);
+    expect(isAncestor(f.clone, base, top)).toBe(true);
+    expect(f.runGit(['merge-tree', '--write-tree', '--no-messages', base, newcomer]).status).toBe(1);
+    const plan = await planRebuild({
+      git: f.runGit, headSha: live, mainRef: 'origin/main', edgeResolve: false,
+      overlays: ['lane/mech-base', 'lane/newcomer', 'lane/mech-top'].map((ref) => ({ ref })),
+    });
+    expect(plan.ok).toBe(true);
+    expect(plan.decisions.map((d) => d.ref)).toEqual(['lane/mech-base', 'lane/newcomer', 'lane/mech-top']);
+    expect(plan.decisions.find((d) => d.ref === 'lane/mech-base')).toMatchObject({ action: 'apply' });
+    expect(plan.decisions.find((d) => d.ref === 'lane/newcomer')).toMatchObject({ action: 'drop', reason: 'conflict' });
+    expect(plan.applied.map((a) => a.ref)).toEqual(['lane/mech-base', 'lane/mech-top']);
+    expect(plan.alerts.map((a) => a.kind)).toContain('overlay-newcomer-parked');
+    expect(plan.establishedLost).toEqual([]);
+    expect(isAncestor(f.clone, base, plan.finalSha)).toBe(true);
+    expect(isAncestor(f.clone, top, plan.finalSha)).toBe(true);
+    expect(isAncestor(f.clone, newcomer, plan.finalSha)).toBe(false);
+    expect(plan.decisions.some((d) => d.action === 'remove')).toBe(false);
+  });
+
+  it('an unpinned base in tops mode keeps its original position before its containing top', async () => {
+    const f = fixture();
+    const base = f.push('lane/base', f.init, { [TAKEOVER]: lines({ 2: 'base' }) });
+    f.push('lane/top', base, { [LADDER]: lines({ 3: 'top' }) });
+    f.fetch();
+    const plan = await planRebuild({
+      git: f.runGit, headSha: base, mainRef: 'origin/main',
+      overlays: [{ ref: 'lane/base' }, { ref: 'lane/top' }],
+    });
+    expect(plan.ok).toBe(true);
+    expect(plan.decisions.map((d) => d.ref)).toEqual(['lane/base', 'lane/top']);
+    expect(plan.decisions[0]).toMatchObject({ action: 'skip', reason: 'stack-contained' });
+    expect(plan.applied.map((a) => a.ref)).toEqual(['lane/top']);
+  });
+
+  it.each([
+    ['lane/base', 'lane/newcomer', 'lane/top-a', 'lane/top-b'],
+    ['lane/top-a', 'lane/top-b', 'lane/newcomer', 'lane/base'],
+  ])('a clean pinned base preserves its position among containing overlays: %j', async (...refs) => {
+    const f = fixture();
+    const base = f.push('lane/base', f.init, { [TAKEOVER]: lines({ 2: 'base' }) });
+    f.push('lane/newcomer', f.init, { 'newcomer.txt': 'unrelated' });
+    f.push('lane/top-a', base, { 'top-a.txt': 'first containing overlay' });
+    f.push('lane/top-b', base, { 'top-b.txt': 'last containing overlay' });
+    f.fetch();
+    // Establish every listed tip so established-first priority preserves this list order.
+    const live = await f.build(refs.map((ref) => ({ ref })));
+    const plan = await planRebuild({
+      git: f.runGit, headSha: live, mainRef: 'origin/main',
+      overlays: refs.map((ref) => ({ ref, ...(ref === 'lane/base' ? { pinned: true } : {}) })),
+    });
+    expect(plan.ok).toBe(true);
+    expect(plan.decisions.map((d) => d.ref)).toEqual(refs);
+    expect(plan.decisions.find((d) => d.ref === 'lane/base'))
+      .toMatchObject(refs[0] === 'lane/base'
+        ? { action: 'apply' } : { action: 'skip', reason: 'pinned-contained-in-applied' });
+    expect(isAncestor(f.clone, base, plan.finalSha)).toBe(true);
+    expect(plan.decisions.some((d) => d.action === 'remove')).toBe(false);
+  });
+
+  it.each([
+    { reviewedEdge: false, nested: false }, { reviewedEdge: true, nested: false },
+    { reviewedEdge: false, nested: true }, { reviewedEdge: true, nested: true },
+  ])('an unresolved pinned base waits after its last container (reviewed edge: $reviewedEdge, nested: $nested)', async ({ reviewedEdge, nested }) => {
+    const f = fixture();
+    const base = f.push('lane/base', f.init, { [TAKEOVER]: lines({ 2: 'base' }) });
+    const main = f.push('lane/advanced-main', f.init, { [TAKEOVER]: lines({ 2: 'advanced main' }) });
+    advanceMain(f, main);
+    gitOk(f.author, ['checkout', '-q', '-B', 'lane/top-a', base]);
+    const merge = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'merge', '--no-commit', '--no-ff', main], { cwd: f.author });
+    expect(merge.status).toBe(1);
+    write(f.author, TAKEOVER, lines({ 2: 'consolidated base and main' }));
+    gitOk(f.author, ['add', '-A']);
+    gitOk(f.author, ['commit', '-q', '-m', 'consolidated top']);
+    gitOk(f.author, ['push', '-q', 'origin', 'HEAD:refs/heads/lane/top-a']);
+    const topA = gitOk(f.author, ['rev-parse', 'HEAD']).trim();
+    // Sibling containers resolve the same base/main conflict independently. A nested container instead
+    // carries top-a, so tops mode must set top-a aside rather than apply it separately.
+    const topBBase = nested ? topA : gitOk(f.author, [
+      'commit-tree', `${topA}^{tree}`, '-p', base, '-p', main, '-m', 'independent containing merge',
+    ]).trim();
+    const topB = f.push('lane/top-b', topBBase, { 'top-b.txt': 'last container\n' });
+    if (reviewedEdge) gitOk(f.author, ['push', '-q', 'origin', `${topA}:refs/heads/edge/lane/base`]);
+    f.fetch();
+    for (const top of [topA, topB]) expect(isAncestor(f.clone, base, top)).toBe(true);
+    expect(isAncestor(f.clone, topA, topB)).toBe(nested);
+    expect(isAncestor(f.clone, topB, topA)).toBe(false);
+    const plan = await planRebuild({
+      git: f.runGit, headSha: base, mainRef: 'origin/main', edgeResolve: reviewedEdge,
+      overlays: [{ ref: 'lane/base', pinned: true, ...(reviewedEdge ? { edgeResolution: { sha: topA } } : {}) },
+        { ref: 'lane/top-a' }, { ref: 'lane/top-b' }],
+    });
+    expect(plan.ok, JSON.stringify(plan)).toBe(true);
+    expect(plan.decisions.map((d) => d.ref)).toEqual(reviewedEdge
+      ? ['lane/base', 'lane/top-a', 'lane/top-b'] : ['lane/top-a', 'lane/top-b', 'lane/base']);
+    expect(plan.decisions.find((d) => d.ref === 'lane/base')).toMatchObject(reviewedEdge
+      ? { action: 'apply', reason: 'applied-edge-ref' } : { action: 'skip', reason: 'pinned-contained-in-applied' });
+    expect(plan.decisions.find((d) => d.ref === 'lane/top-a')).toMatchObject(nested
+      ? { action: 'skip', reason: 'stack-contained', tops: ['lane/top-b'] }
+      : reviewedEdge ? { action: 'remove', reason: 'in-main' } : { action: 'apply', reason: 'applied' });
+    expect(plan.applied.map((a) => a.ref)).toEqual(reviewedEdge
+      ? ['lane/base', 'lane/top-b'] : nested ? ['lane/top-b'] : ['lane/top-a', 'lane/top-b']);
+    expect(plan.establishedLost).toEqual([]);
+    for (const sha of [base, topA, topB]) expect(isAncestor(f.clone, sha, plan.finalSha)).toBe(true);
+    expect(gitOk(f.clone, ['show', `${plan.finalSha}:${TAKEOVER}`])).toBe(lines({ 2: 'consolidated base and main' }));
+    expect(gitOk(f.clone, ['show', `${plan.finalSha}:top-b.txt`])).toBe('last container\n');
+  });
+
+  it('an unreadable base merge cannot authorize deferral', async () => {
+    const f = fixture();
+    const base = f.push('lane/base', f.init, { [TAKEOVER]: lines({ 2: 'base' }) });
+    f.push('lane/top', base, { 'top.txt': 'top\n' });
+    f.fetch();
+    const git = (args, opts) => (args[0] === 'merge-tree' && args[4] === base
+      ? { status: 128, stdout: '', stderr: 'unreadable' } : f.runGit(args, opts));
+    const plan = await planRebuild({
+      git, headSha: base, mainRef: 'origin/main', edgeResolve: false,
+      overlays: [{ ref: 'lane/base', pinned: true }, { ref: 'lane/top', pinned: true }],
+    });
+    expect(plan).toMatchObject({ ok: false, reason: 'pinned-overlay-conflict',
+      detail: { ref: 'lane/base', pinnedBy: 'flag', dropReason: 'merge-tree-failed' } });
+  });
+
+  it.each(['null', 'absent', 'not-contained', 'unreadable'])('does not defer a pinned base when running-head containment is %s', async (evidence) => {
+    const f = fixture();
+    const base = f.push('lane/base', f.init, { [TAKEOVER]: lines({ 2: 'base' }) });
+    f.push('lane/top', base, { 'top.txt': 'containing top' });
+    f.fetch();
+    const headSha = evidence === 'null' ? null : evidence === 'absent' ? undefined : evidence === 'not-contained' ? f.init : base;
+    const git = (args, opts) => (evidence === 'unreadable' && args[0] === 'merge-base'
+      && args[1] === '--is-ancestor' && args[2] === base && args[3] === headSha
+      ? { status: 128, stdout: '', stderr: 'unreadable' } : f.runGit(args, opts));
+    const plan = await planRebuild({
+      git, headSha, mainRef: 'origin/main',
+      overlays: [{ ref: 'lane/base', pinned: true }, { ref: 'lane/top' }],
+    });
+    expect(plan.ok).toBe(true);
+    expect(plan.decisions.map((d) => d.ref)).toEqual(['lane/base', 'lane/top']);
+    expect(plan.decisions[0]).toMatchObject({ action: 'apply' });
+    expect(isAncestor(f.clone, base, plan.finalSha)).toBe(true);
+  });
+
+  it.each([false, true])('a conflicting top preserves normal handling of its established mechanism-pinned base (base conflicts: %s)', async (baseConflicts) => {
+    const f = fixture();
+    const mechMain = f.push('lane/mech-main', f.init, { [MECH]: lines(), 'scripts/lib/daemon-rebuild.mjs': lines() });
+    advanceMain(f, mechMain);
+    const base = f.push('lane/mech-base', mechMain, { [MECH]: lines({ 2: 'base mechanism' }) });
+    f.fetch();
+    const live = await f.build([{ ref: 'lane/mech-base' }], mechMain);
+    const top = f.push('lane/mech-top', base, { [MECH]: lines({ 2: 'base mechanism', 10: 'top mechanism' }) });
+    const advanced = f.push('lane/advanced-main', mechMain, {
+      [MECH]: lines({ ...(baseConflicts ? { 2: 'main mechanism' } : {}), 10: 'advanced mechanism' }),
+    });
+    advanceMain(f, advanced);
+    const attempted = [];
+    const git = (args, opts) => {
+      if (args[0] === 'merge-tree' && args[3] === advanced) attempted.push(args[4]);
+      return f.runGit(args, opts);
+    };
+    const plan = await planRebuild({
+      git, headSha: live, mainRef: 'origin/main', edgeResolve: false,
+      overlays: [{ ref: 'lane/mech-base' }, { ref: 'lane/mech-top' }],
+    });
+    expect(plan.ok, JSON.stringify(plan)).toBe(true);
+    expect(attempted.slice(0, baseConflicts ? 3 : 1)).toEqual(baseConflicts ? [base, top, base] : [base]);
+    expect(plan.decisions.find((d) => d.ref === 'lane/mech-top'))
+      .toMatchObject({ action: 'skip', reason: 'pinned-overlay-conflict-skipped' });
+    expect(plan.decisions.find((d) => d.ref === 'lane/mech-base')).toMatchObject(baseConflicts
+      ? { action: 'skip', reason: 'pinned-overlay-conflict-skipped' }
+      : { action: 'apply' });
+    expect(plan.establishedLost.some((o) => o.ref === 'lane/mech-base')).toBe(baseConflicts);
+    expect(isAncestor(f.clone, base, plan.finalSha)).toBe(!baseConflicts);
+    expect(plan.decisions.some((d) => d.action === 'remove')).toBe(false);
+    if (baseConflicts) {
+      const refused = await planRebuild({
+        git: f.runGit, headSha: live, mainRef: 'origin/main', edgeResolve: false,
+        overlays: [{ ref: 'lane/mech-base', pinned: true }, { ref: 'lane/mech-top' }],
+      });
+      expect(refused).toMatchObject({
+        ok: false, reason: 'pinned-overlay-conflict',
+        detail: { ref: 'lane/mech-base', pinnedBy: 'flag', dropReason: 'conflict' },
+      });
+    }
   });
 
   it.each([

@@ -167,9 +167,10 @@ export async function planOverlayStacks({
   }
   const anc = (a, b) => a !== b && git(['merge-base', '--is-ancestor', a, b]).status === 0;
   const outLines = (r) => (r.status === 0 ? String(r.stdout ?? '').split('\n').filter((l) => l.trim()) : []);
-  // The overlay heads one daemon build merged, as `{ref, pr, sha}`: the second parent of each two-parent
+  // The overlay heads one daemon build merged, as `{ref, pr, sha}`: the second parent of each
   // `daemon-rebuild: merge overlay <ref> [(PR #n)] onto …` commit the rebuild identity committed on the build's
-  // first-parent line above main (newest 200). Local and daemon-made: an overlay's own commits sit on second-parent
+  // first-parent line above main (newest 200). An approved edge adds a third parent without changing that identity.
+  // Local and daemon-made: an overlay's own commits sit on second-parent
   // lines and carry their author's committer, so they never count. Cached per build.
   const buildCache = new Map();
   const mergedBy = (build) => {
@@ -181,7 +182,7 @@ export async function planOverlayStacks({
         const [parents, committer, ...rest] = l.split('\t');
         const ps = parents.split(' ');
         const hit = rest.join('\t').match(/^daemon-rebuild: merge overlay (\S+) (?:\(PR #(\d+)\) )?onto /);
-        if (!hit || committer !== REBUILD_COMMITTER || ps.length !== 2 || !OID.test(ps[1])) continue;
+        if (!hit || committer !== REBUILD_COMMITTER || ![2, 3].includes(ps.length) || !OID.test(ps[1])) continue;
         merged.push({ ref: hit[1], pr: hit[2] != null ? Number(hit[2]) : null, sha: ps[1] });
       }
       buildCache.set(build, merged);
@@ -313,8 +314,9 @@ export async function planOverlayStacks({
  * Held item 212 — in `stackMode: 'tops'` (default) stacked overlays are planned as stacks (see {@link planOverlayStacks}):
  * only the tops apply, and a base contained in a top, or a base that moved away from its children, is SKIPPED (stays
  * registered) and comes back on its own only if none of its tops could apply. Exceptions: a PINNED base is never set
- * aside (it applies on its own; listed after a top that contains it, it is `skip`ped as `pinned-contained-in-applied`
- * rather than removed as `in-main`), and an overlay already an ancestor of main is not part of any stack.
+ * aside (on conflict it is deferred after its last strictly containing tip when established priority permits, then `skip`ped
+ * as `pinned-contained-in-applied` if carried by the applied top, rather than removed as `in-main`), and an overlay
+ * already an ancestor of main is not part of any stack.
  * @param {{git:(args:string[], opts?:{env?:object})=>{status:number,stdout:string,stderr:string},
  *   headSha:string, mainRef:string, overlays?:Array<{ref:string, pr?:number|null}>,
  *   prState?:(pr:number)=>(Promise<string|null>|string|null), mainOnly?:boolean, edgeResolve?:boolean,
@@ -375,7 +377,7 @@ export async function planRebuild({
         const [parents, committer, ...subject] = line.split('\t');
         const ps = parents.split(' ');
         const hit = subject.join('\t').match(/^daemon-rebuild: merge overlay (\S+) (?:\(PR #(\d+)\) )?onto /);
-        if (!hit || committer !== REBUILD_COMMITTER || ps.length !== 2 || !OID.test(ps[1])) continue;
+        if (!hit || committer !== REBUILD_COMMITTER || ![2, 3].includes(ps.length) || !OID.test(ps[1])) continue;
         recordedRefs.add(hit[1]);
         if (!registered.has(hit[1]) || registered.get(hit[1]) !== prKey(hit[2])) continue;
         // A graduated old tip is already carried by main; only its new, unproven changes can be dropped now.
@@ -409,6 +411,25 @@ export async function planRebuild({
   const toProcess = [
     ...listed.filter((o) => establishedRefs.has(o?.ref)), ...listed.filter((o) => !establishedRefs.has(o?.ref)),
   ];
+  // In tops mode only, a conflicting pinned base already in the running build may wait for its containers.
+  // Discover candidates here, but try each base at its normal position first: merging a clean base can change
+  // the merge base for its top and make that top clean too. Containment alone cannot justify reordering it.
+  const deferredContainers = new Map();
+  if (stackMode === 'tops' && headSha) {
+    const entries = toProcess.map((raw) => ({
+      raw, sha: raw?.ref ? verifyRev(git, `refs/remotes/origin/${raw.ref}^{commit}`) : null,
+    }));
+    for (const base of entries) {
+      if (!base.sha || git(['merge-base', '--is-ancestor', base.sha, headSha]).status !== 0
+        || !pinnedStatus(git, base.raw, mainSha, base.sha).pinned
+        || git(['merge-base', '--is-ancestor', base.sha, mainSha]).status !== 1) continue;
+      // Registered repairs keep the original's conflict/loss decision until adoption cleanup retires it.
+      const containers = entries.filter((top) => top.raw?.reason !==`auto-rebase of ${base.raw.ref}`
+        && top.sha && top.sha !== base.sha
+        && git(['merge-base', '--is-ancestor', base.sha, top.sha]).status === 0);
+      if (containers.length > 0) deferredContainers.set(base.raw, containers.map((top) => top.raw));
+    }
+  }
   if (mainOnly && overlays.length > 0) {
     alerts.push({ kind: 'overlays-refused-main-only', detail: { count: overlays.length } });
   }
@@ -497,7 +518,8 @@ export async function planRebuild({
     });
   }
 
-  for (const raw of toProcess) {
+  for (let index = 0; index < toProcess.length; index++) {
+    const raw = toProcess[index];
     const ref = raw?.ref;
     const pr = raw?.pr ?? null;
 
@@ -573,6 +595,20 @@ export async function planRebuild({
       if (edgeResolve) resolution = resolveOverlayConflict({ git, cur, ovSha, ref, approvedEdgeSha: recordedEdgeSha(raw) });
       if (resolution?.ok) tree = resolution.tree;
       else {
+        const containers = deferredContainers.get(raw);
+        deferredContainers.delete(raw); // At most one deferral per base; failed tops keep ordinary pin handling.
+        if (containers) {
+          const lastContainer = Math.max(-1, ...containers.map((top) => toProcess.indexOf(top)));
+          // Only proven containers may cross established priority. Recheck the current order after earlier moves.
+          const blocked = establishedRefs.has(ref) && toProcess.slice(index + 1, lastContainer + 1)
+            .some((entry) => !establishedRefs.has(entry?.ref) && !containers.includes(entry));
+          if (lastContainer > index && !blocked) {
+            toProcess.splice(index, 1);
+            toProcess.splice(lastContainer, 0, raw);
+            index--;
+            continue;
+          }
+        }
         const files = resolution?.files ?? conflictFilesOf(mt.stdout);
         // overlay-pin — a moving branch whose NEW tip conflicts with the stack keeps the head this clone last adopted
         // it at, instead of dropping out of the build (which x9diisp then turns into a whole-clone hold). Only when
@@ -641,12 +677,14 @@ export async function planRebuild({
       continue;
     }
 
-    // 6. mint the merge commit — fixed identity, date = the later of the two parents' committer dates, so the
-    //    same (cur, ovSha) pair always mints the identical sha (see file header — DETERMINISM).
+    // 6. Keep the overlay as second parent for adopted-head tracking. An approved edge must also be an
+    // ancestor: a later overlay with the same tree may be removed as redundant, so copying only the edge's
+    // tree would lose its history. Replay has no approved edge and keeps the ordinary two-parent shape.
+    const parents = [cur, ovSha, ...(resolution?.edgeSha ? [resolution.edgeSha] : [])];
     const message = `daemon-rebuild: merge overlay ${ref}${pr != null ? ` (PR #${pr})` : ''} onto ${cur}`
       + (resolution?.ok ? ` (resolved via ${resolution.via})` : '');
-    const ct = git(['commit-tree', tree, '-p', cur, '-p', ovSha, '-m', message], {
-      env: rebuildCommitEnv(git, cur, ovSha),
+    const ct = git(['commit-tree', tree, ...parents.flatMap((sha) => ['-p', sha]), '-m', message], {
+      env: rebuildCommitEnv(git, ...parents),
     });
     const newSha = String(ct.stdout ?? '').trim();
     if (ct.status !== 0 || !newSha) {
