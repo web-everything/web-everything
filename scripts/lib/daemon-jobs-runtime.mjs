@@ -271,7 +271,11 @@ export function launchJob({ store, id, kindDef, snapshot, evict = evictSnapshots
   // Housekeeping runs only after the child exists and its pid is durable: a recursive snapshot delete
   // can outlast the tick watchdog, but must never strand a launching record without a spawned child.
   try {
-    const referenced = store.list().records
+    const { records, corrupt } = store.list();
+    // An unreadable record may belong to a live child whose snapshot references are unknown.
+    // Fail closed until the record is repaired; the new child is already durably spawned.
+    if (corrupt.length > 0) return spawned;
+    const referenced = records
       .filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status))
       .flatMap((r) => r.job.snapshotKeys);
     evict({ jobsDir: store.dir, referenced });

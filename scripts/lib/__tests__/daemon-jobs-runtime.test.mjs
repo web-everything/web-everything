@@ -334,6 +334,39 @@ describe('launchJob snapshot eviction', () => {
     expect(store.read('launching').job.snapshotKeys).toEqual(['code:current']);
   });
 
+  it.each(['{"job":', '{"job":{}}'])('skips eviction for a corrupt job record (%s), then resumes after repair', (corruptJson) => {
+    for (const type of ['code', 'node-modules']) seedStores(type, ['running', 'old', 'recent', 'newest']);
+    enqueueJob({ store, kindDef: noop, id: 'running', codeSha: 'running' });
+    store.update('running', (r) => markClaimed(markLaunching(r, {
+      at: new Date().toISOString(), snapshotKeys: ['code:running', 'node-modules:running'],
+    }), { at: new Date().toISOString(), handle: formatJobHandle({ host: 'h', pid: 99, procStart: 'x' }), host: 'h', pid: 99, procStart: 'x' }));
+    const recordPath = runPath('running', dir);
+    const validJson = readFileSync(recordPath, 'utf8');
+    writeFileSync(recordPath, corruptJson);
+    expect(store.list().corrupt).toEqual(['running']);
+    const evict = vi.fn(evictSnapshots);
+    const spawnFn = vi.fn(() => 4242);
+
+    const out = launch({ evict, spawnFn });
+
+    expect(spawnFn).toHaveBeenCalledOnce();
+    expect(out.job.timeline.at(-1)).toMatchObject({ event: 'spawned', pid: 4242 });
+    expect(store.read('launching').job.timeline.at(-1)).toMatchObject({ event: 'spawned', pid: 4242 });
+    expect(evict).not.toHaveBeenCalled();
+    expect(storesLeft('code')).toEqual(['current', 'newest', 'old', 'recent', 'running']);
+    expect(storesLeft('node-modules')).toEqual(['newest', 'old', 'recent', 'running']);
+    expect(readFileSync(recordPath, 'utf8')).toBe(corruptJson);
+
+    writeFileSync(recordPath, validJson);
+    enqueueJob({ store, kindDef: noop, id: 'after-repair', codeSha: 'current' });
+    launchJob({ store, id: 'after-repair', kindDef: noop, snapshot: { materialize: () => {} }, spawnFn, evict });
+    expect(evict).toHaveBeenCalledOnce();
+    for (const type of ['code', 'node-modules']) {
+      expect(storesLeft(type)).toContain('running');
+      expect(storesLeft(type)).not.toContain('old');
+    }
+  });
+
   it('keeps old code and node-modules stores referenced by a running job', () => {
     for (const type of ['code', 'node-modules']) seedStores(type, ['running', 'old', 'newest']);
     enqueueJob({ store, kindDef: noop, id: 'running', codeSha: 'running' });
