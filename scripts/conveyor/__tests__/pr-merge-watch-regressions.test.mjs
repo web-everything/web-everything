@@ -56,7 +56,7 @@ beforeEach(() => {
     const [path, query] = args[1].split('?');
     const params = new URLSearchParams(query);
     if (path.endsWith('/check-runs')) return { check_runs: [] };
-    if (path.includes('/commits/')) return { sha: head, commit: { committer: { date: headTime } } };
+    if (path.includes('/commits/')) return { sha: path.split('/').at(-1), commit: { committer: { date: headTime } } };
     if (path.endsWith('/timeline')) return [];
     if (path === `repos/${repo}/pulls` && params.get('state') === 'open') {
       const offset = (Number(params.get('page')) - 1) * 100;
@@ -152,6 +152,112 @@ describe('merge-watch durable readiness and delivery guarantees', () => {
     expect(log.mock.calls.flat().join(' ')).toMatch(/operator must inspect/);
   });
 
+  it('budget exhaustion resumes remaining PRs and merge checks on subsequent ticks', async () => {
+    prs = Array.from({ length: 60 }, (_, i) => ready(i + 1));
+    fs.mkdirSync(stateDir);
+    fs.writeFileSync(join(stateDir, `${encodeURIComponent(repo)}.json`), JSON.stringify({ prs: {
+      999: { merged: false, heads: { [head]: { since: null, alerted: false } } },
+    } }));
+    const previous = gh.getMockImplementation();
+    gh.mockImplementation(args => args[1] === `repos/${repo}/pulls/999`
+      ? { number: 999, state: 'closed', merged_at: at(0) } : previous(args));
+    for (let i = 0; i < 10; i++) {
+      gh.mockClear();
+      await tick(i * (threshold + 1));
+      expect(gh.mock.calls.length).toBeLessThanOrEqual(128);
+    }
+    const events = emitEvent.mock.calls.map(([event]) => event);
+    expect(events.filter(e => e.kind === 'pr-merged')).toEqual([{ kind: 'pr-merged', repo, pr: 999 }]);
+    expect(new Set(events.filter(e => e.kind === 'pr-ready-not-merging').map(e => e.pr)))
+      .toEqual(new Set(prs.map(p => p.number)));
+    expect(events.filter(e => e.kind === 'pr-ready-not-merging')).toHaveLength(60);
+  });
+
+  it('retires a long-lived closed-unmerged set so later ticks spend no requests on it', async () => {
+    prs = [];
+    fs.mkdirSync(stateDir);
+    fs.writeFileSync(join(stateDir, `${encodeURIComponent(repo)}.json`), JSON.stringify({
+      prs: Object.fromEntries(Array.from({ length: 200 }, (_, i) => [i + 1,
+        { merged: false, heads: { [head]: { since: null, alerted: false } } }])),
+    }));
+    const previous = gh.getMockImplementation();
+    gh.mockImplementation(args => /\/pulls\/\d+$/.test(args[1])
+      ? { number: Number(args[1].split('/').at(-1)), state: 'closed', merged_at: null } : previous(args));
+    for (let i = 0; i < 3; i++) await tick(i);
+    const state = JSON.parse(fs.readFileSync(join(stateDir, `${encodeURIComponent(repo)}.json`), 'utf8'));
+    expect(state.prs).toEqual({});
+    gh.mockClear();
+    expect((await tick(4)).incomplete).toBe(false);
+    expect(gh).toHaveBeenCalledTimes(1);
+    expect(emitEvent).not.toHaveBeenCalled();
+  });
+
+  it('retires unpublished superseded head receipts instead of growing state on every push', async () => {
+    for (let i = 0; i < 20; i++) {
+      prs[0].headRefOid = i.toString(16).padStart(40, '0');
+      await tick(i);
+    }
+    const state = JSON.parse(fs.readFileSync(join(stateDir, `${encodeURIComponent(repo)}.json`), 'utf8'));
+    expect(Object.keys(state.prs[17].heads)).toEqual([prs[0].headRefOid]);
+  });
+
+  it('keeps delivered head identities when pruning so returning to an old head never alerts twice', async () => {
+    await tick(0);
+    await tick(threshold + 1);
+    prs[0].headRefOid = 'b'.repeat(40);
+    await tick(threshold + 2);
+    prs[0].headRefOid = head;
+    await tick(threshold + 3);
+    await tick(3 * threshold);
+    expect(emitEvent.mock.calls.filter(([e]) => e.kind === 'pr-ready-not-merging')).toHaveLength(1);
+  });
+
+  it('retires polling for an alerted unmerged close and preserves deduplication when it reopens', async () => {
+    await tick(0);
+    await tick(threshold + 1);
+    Object.assign(prs[0], { state: 'CLOSED', merged_at: null });
+    await tick(threshold + 2);
+    gh.mockClear();
+    await tick(threshold + 3);
+    expect(gh).toHaveBeenCalledTimes(1); // Discovery only; no closed PR lookup.
+    prs[0].state = 'OPEN';
+    await tick(threshold + 4);
+    await tick(3 * threshold);
+    expect(emitEvent.mock.calls.filter(([e]) => e.kind === 'pr-ready-not-merging')).toHaveLength(1);
+  });
+
+  it.each([{}, { repo, number: -1 }, { repo, number: '17' }, { repo: 17, number: null }])(
+    'rejects malformed persisted scheduling evidence %j before any GitHub reads', async cursor => {
+      fs.mkdirSync(stateDir);
+      fs.writeFileSync(join(stateDir, 'cursor.json'), JSON.stringify(cursor));
+      expect((await tick(0)).incomplete).toBe(true);
+      expect(gh).not.toHaveBeenCalled();
+      expect(emitEvent).not.toHaveBeenCalled();
+      expect(log.mock.calls.flat().join(' ')).toMatch(/operator must inspect/);
+    });
+
+  it('compacts historical merged receipts without reading their PRs again', async () => {
+    prs = [];
+    fs.mkdirSync(stateDir);
+    fs.writeFileSync(join(stateDir, `${encodeURIComponent(repo)}.json`), JSON.stringify({ prs: {
+      17: { merged: true, heads: { [head]: { since: null, alerted: true } } },
+    } }));
+    await tick(0);
+    expect(gh).toHaveBeenCalledTimes(1);
+    const state = JSON.parse(fs.readFileSync(join(stateDir, `${encodeURIComponent(repo)}.json`), 'utf8'));
+    expect(state.prs[17]).toEqual({ merged: true, heads: {} });
+  });
+
+  it('rejects a non-boolean retirement marker before any GitHub reads', async () => {
+    fs.mkdirSync(stateDir);
+    fs.writeFileSync(join(stateDir, `${encodeURIComponent(repo)}.json`), JSON.stringify({ prs: {
+      17: { merged: false, closed: 'yes', heads: {} },
+    } }));
+    expect((await tick(0)).incomplete).toBe(true);
+    expect(gh).not.toHaveBeenCalled();
+    expect(emitEvent).not.toHaveBeenCalled();
+  });
+
   it('an oversized comment thread stops at ten pages and requires operator inspection', async () => {
     fullCommentPages = 11;
     const result = await tick(0);
@@ -164,6 +270,20 @@ describe('merge-watch durable readiness and delivery guarantees', () => {
 });
 
 describe('merge-watch settings resolver contract', () => {
+  it('discovers a non-default value from the real pr-merge-watch.json file through readSettings', () => {
+    config.tool = undefined; // Use real filesystem IO, including directory discovery and JSON parsing.
+    const dir = join(root, 'settings');
+    fs.mkdirSync(dir);
+    const shipped = JSON.parse(fs.readFileSync(new URL('../../settings/pr-merge-watch.json', import.meta.url), 'utf8'));
+    shipped.prMergeWatch.readyNotMergingMinutes = 7;
+    fs.writeFileSync(join(dir, 'pr-merge-watch.json'), JSON.stringify(shipped));
+    const resolved = resolveMergeWatchSettings({ log, env: {
+      WE_PLATFORM_PREFERENCES_FILE: join(root, 'absent-platform.json'),
+    }, settingsFiles: { dir, legacyPath: null } });
+    expect(resolved.readyNotMergingMinutes).toBe(7);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('readyNotMergingMinutes=7 (tool)'));
+  });
+
   function resolve(platform, tool, override) {
     const platformFile = join(root, 'platform.json');
     fs.writeFileSync(platformFile, JSON.stringify({ prMergeWatch: platform }));
