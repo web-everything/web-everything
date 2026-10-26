@@ -110,3 +110,9 @@ it('recognizes assembled prepare PRs without treating per-card retention refs as
   expect(isBuilderPr({ headRefName: 'lane/prepare-batch-x123abc-2' })).toBe(true);
   expect(isBuilderPr({ headRefName: 'lane/prep-7101' })).toBe(false);
 });
+
+it('cap scope accepts already-resolved real files, including an explicitly unknown list', () => {
+  expect(countOpenPrsForCap([{ ...pr(1, ['code.js']), realFiles: ['backlog/123-card.md'] }]).cardOnly).toBe(1);
+  expect(countOpenPrsForCap([{ ...pr(1, ['backlog/123-card.md']), realFiles: ['code.js'] }]).counted).toBe(1);
+  expect(countOpenPrsForCap([{ ...pr(1, ['backlog/123-card.md']), realFiles: null }]).counted).toBe(1);
+});
