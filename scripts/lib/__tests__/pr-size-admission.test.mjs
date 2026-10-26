@@ -50,7 +50,7 @@ const evidence = '100\t50\tscripts/operations/a.mjs\0'
   + '101\t0\tdocs/agent/a.md\0'
   + '900\t0\tscripts/operations/__tests__/a.test.mjs\0';
 const HEAD_SHA = '1'.repeat(40), BASE_SHA = '2'.repeat(40);
-const cardKey = (pr = 5854, sha = HEAD_SHA, repo = 'web-everything/web-everything') => createHash('sha256').update(JSON.stringify([repo, pr, sha])).digest('hex');
+const cardKey = (sha = HEAD_SHA, repo = 'web-everything/web-everything') => createHash('sha256').update(JSON.stringify([repo, sha])).digest('hex');
 const KEY = cardKey();
 const request = { ref: 'lane/size-admission', pr: 5854, base: 'main', sha: HEAD_SHA, body: 'Existing PR description.', repo: 'web-everything/web-everything' };
 const cardResult = { verdict: { num: 9001, id: 'xsplit1', rel: 'backlog/xsplit1-split.md' } };
@@ -322,6 +322,18 @@ describe('shared admission effects', () => {
     expectSizeNote(second.body);
   });
 
+  it.each(['## Other\ntext', '<!-- author-note -->', '&lt;!-- author-note -->'])
+  ('retry preserves author content between the Size heading and admission marker (%s)', async (inserted) => {
+    const io = effects();
+    const preserved = `${request.body}\n\n## Size\nold note\n\n${inserted}\n`;
+    const suffix = '\n## Testing\nKeep trailing content.\n';
+    const body = `${preserved}<!-- size-admission:${KEY} -->\n${suffix}`;
+    const result = await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, body });
+    expect(result.body.startsWith(preserved + suffix)).toBe(true);
+    expect(result.body.match(new RegExp(`<!-- size-admission:${KEY} -->`, 'g'))).toHaveLength(1);
+    expectSizeNote(result.body);
+  });
+
   it('301 non-test lines proceed with one split card naming PR and file groups, reviewers escalated and body noting both', async () => {
     const io = effects();
     const run = sizeAdmission.createSizeAdmissionRunner(io);
@@ -388,6 +400,17 @@ describe('shared admission effects', () => {
     expect(result.body).not.toMatch(/split card (?!not filed)\S+ filed/);
   });
 
+  it.each([false, true])('first run with pr=null then re-run with pr=N on the same head files exactly ONE card (saved body: %s)', async (savedBody) => {
+    const io = effects();
+    const first = await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, pr: null });
+    const second = await sizeAdmission.createSizeAdmissionRunner(io)({ ...request,
+      body: savedBody ? first.body : request.body });
+    expect(io.fileItem).toHaveBeenCalledTimes(1);
+    expect(io.publishSplitCard).toHaveBeenCalledTimes(2);
+    expect(second.body.match(/^## Size$/gm)).toHaveLength(1);
+    expectSizeNote(second.body);
+  });
+
   it('same-head retries reuse the card store across fresh runners: one card and one Size section', async () => {
     const io = effects();
     const first = await sizeAdmission.createSizeAdmissionRunner(io)(request);
@@ -445,10 +468,10 @@ describe('shared admission effects', () => {
     } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
 
-  it('a different ref cannot inherit another ref’s split-card marker', async () => {
-    const io = effects();
+  it('a different head cannot inherit another head’s split-card marker', async () => {
+    const io = effects({ diffStat: ({ sha }) => ({ text: evidence, sha, baseSha: BASE_SHA }) });
     const first = await sizeAdmission.createSizeAdmissionRunner(io)(request);
-    await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, ref: 'lane/other', pr: 5855, body: first.body });
+    await sizeAdmission.createSizeAdmissionRunner(io)({ ...request, ref: 'lane/other', pr: 5855, sha: '3'.repeat(40), body: first.body });
     expect(io.fileItem).toHaveBeenCalledTimes(2);
   });
 });
@@ -928,7 +951,7 @@ describe('size admission trust boundaries', () => {
     } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
 
-  it('reused branches cannot reuse an unrelated prior card for another repo, PR, or head', async () => {
+  it('reused branches isolate cards by repo and head while PR numbering preserves identity', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'size-identity-'));
     mkdirSync(join(cwd, 'backlog'));
     const fileItem = vi.fn((fields) => {
@@ -940,12 +963,13 @@ describe('size admission trust boundaries', () => {
       diffStat: () => ({ ...over, sha: input.sha }), fileItem,
       publishSplitCard: effects().publishSplitCard })(input);
     try {
-      for (const input of [frozen, { ...frozen, pr: 999 }, { ...frozen, sha: '3'.repeat(40) },
+      for (const input of [frozen, { ...frozen, sha: '3'.repeat(40) },
         { ...frozen, repo: 'other/repository' }]) await run(input);
-      expect(fileItem).toHaveBeenCalledTimes(4);
+      expect(fileItem).toHaveBeenCalledTimes(3);
       await run(frozen);
+      await run({ ...frozen, pr: 999 }); // PR numbers are not card identity
       await run({ ...frozen, ref: 'lane/renamed' }); // branch labels are not card identity
-      expect(fileItem).toHaveBeenCalledTimes(4);
+      expect(fileItem).toHaveBeenCalledTimes(3);
     } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
 
@@ -965,7 +989,7 @@ describe('size admission trust boundaries', () => {
     const cwd = mkdtempSync(join(tmpdir(), 'size-card-store-'));
     if (mode === 'ambiguous') {
       mkdirSync(join(cwd, 'backlog'));
-      const key = cardKey(frozen.pr, frozen.sha, frozen.repo);
+      const key = cardKey(frozen.sha, frozen.repo);
       for (const id of ['777', '888']) writeFileSync(join(cwd, `backlog/${id}-split.md`), `size-split-key:${key}. Prior filing.`);
     }
     const io = effects({ cwd, diffStat: () => over });

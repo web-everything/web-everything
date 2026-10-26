@@ -296,11 +296,11 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = crea
       try { repo = (await import('../conveyor/infra-blocked.mjs')).originSlugOf(cwd); } catch { /* no reusable identity */ }
     }
     const head = FULL_SHA.test(sha) ? sha : pinnedSha;
-    // A missing identity must not reuse another request's card. Null PR is provisional;
-    // once the forge assigns a number, admission uses that exact repository/PR/head tuple.
+    // A missing identity must not reuse another request's card. Repository/head stays
+    // stable when the forge assigns a PR number after the initial admission.
     const key = typeof repo === 'string' && repo && FULL_SHA.test(head)
       && (request.pr == null || (Number.isSafeInteger(request.pr) && request.pr > 0))
-      ? createHash('sha256').update(JSON.stringify([repo, request.pr ?? null, head])).digest('hex') : null;
+      ? createHash('sha256').update(JSON.stringify([repo, head])).digest('hex') : null;
     const markerKey = key || createHash('sha256').update(randomUUID()).digest('hex');
     const filingRequest = { ...request, repo, sha: head, baseSha, key: markerKey };
     const groups = new Map(), files = new Set();
@@ -328,7 +328,7 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = crea
     let cardId = null, cardPublished = false, cardNote;
     try {
       let card;
-      // Only the trusted store can answer whether this repository/PR/head has a card.
+      // Only the trusted store can answer whether this repository/head has a card.
       // Editable body text is used below solely to replace a displayed note.
       try { card = await lookupSplitCard({ ...filingRequest, key }); } catch { /* ambiguity files a new card */ }
       if (!splitCardId(card?.num || card?.id) || card?.outcome === 'refused') {
@@ -364,7 +364,14 @@ export function createSizeAdmissionRunner({ cwd = process.cwd(), diffStat = crea
     let previousBody = body;
     if (existing) {
       const start = body.lastIndexOf('\n\n## Size\n', existing.index);
-      if (start >= 0) previousBody = body.slice(0, start) + body.slice(existing.index + existing[0].length).replace(/^\n/, '');
+      const between = start >= 0 ? body.slice(start + '\n\n## Size\n'.length, existing.index)
+        .replace(new RegExp(`^<!-- size-published:${markerKey} -->\\n`, 'm'), '') : '';
+      // Only our own publication marker belongs to the replaceable note. Any other
+      // heading/comment makes its boundaries ambiguous: preserve the author's text.
+      const replaceNote = start >= 0 && !/(?:^|[\r\n])##[ \t]|(?:<|&lt;)!--/.test(between);
+      let end = existing.index + existing[0].length;
+      if ((existing.index === 0 || body[existing.index - 1] === '\n') && body[end] === '\n') end++;
+      previousBody = body.slice(0, replaceNote ? start : existing.index) + body.slice(end);
     }
     if (Buffer.byteLength(previousBody) > BODY_BYTES) previousBody = boundedText(previousBody, BODY_BYTES)
       + '\n\nPR description truncated; human review of the full diff is required.';

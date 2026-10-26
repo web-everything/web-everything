@@ -5,8 +5,11 @@
 `scripts/lib/__tests__/pr-size-admission.test.mjs` exercises Git with real shadow refs and
 round-trips hostile filenames through `planFileItem` and `js-yaml`. Size evidence must carry
 full head/base SHAs; mock symbolic SHA strings no longer represent valid Git evidence.
-Retry fixtures need a trusted card store keyed by repository, PR number and head SHA.
+Retry fixtures need a trusted card store keyed by repository and head SHA; assigning a PR
+number after creation must reuse the initial card. Cover retries with and without a saved body.
 Body markers are display hints; publication must be confirmed again from the store/publisher.
+When another heading or comment intervenes before an admission marker, retries remove only
+that marker and preserve the author's text. Ordinary retries still replace their own Size note.
 Unknown or stale evidence and unreadable/ambiguous stores file conservatively and request reviewers.
 
 The legacy `file-item` scope flag is a comma list whose renderer supplies YAML double quotes.
