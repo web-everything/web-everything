@@ -368,7 +368,7 @@ describe('planCatchUp', () => {
 
   it.each(['now', 'urgent'])('does not raise rank for a non-operator priority:%s label', (value) => {
     const plan = planCatchUp({ priority: { mode: 'enforce' }, queued: 0, capacity: 1, prs: [
-      candidate(5715, null, { labels: [`priority:${value}`], override: { value, byOperator: false } }),
+      candidate(5715, null, { labels: [...READY_PR.labels, { name: `priority:${value}` }], override: { value, byOperator: false } }),
       candidate(42, 100),
     ] });
     expect(plan.run).toEqual([{ num: 42, readyAt: 100 }]);
