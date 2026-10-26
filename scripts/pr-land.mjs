@@ -1210,8 +1210,10 @@ async function runCli() {
       try {
         let liveBody = '', liveBodyRead = false;
         try { liveBody = forge.viewPr(prNum, 'body').body || ''; liveBodyRead = true; } catch { /* fetch miss — never replace an unread body */ }
-        const reconciled = liveBodyRead ? reconcileEscalationReasonBlock(liveBody, verdict.reasons) : { changed: false };
-        if (reconciled.changed) forge.editBody(prNum, reconciled.body);
+        if (liveBodyRead) {
+          const reconciled = reconcileEscalationReasonBlock(liveBody, verdict.reasons);
+          if (reconciled.changed) forge.editBody(prNum, reconciled.body);
+        }
       } catch { /* best-effort — the label already carries the signal */ }
     }
     // #2832 — the producer applies `ready-to-merge` (applyLabel, on green) BEFORE this escalation verdict. When
