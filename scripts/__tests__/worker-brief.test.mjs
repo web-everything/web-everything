@@ -10,6 +10,14 @@ const defaultProof = 'Prove the change on the live case with before/after eviden
 const io = () => ({ stdout: { write: vi.fn() }, stderr: { write: vi.fn() }, writeFile: vi.fn(), newOwner: () => 'tok12345' });
 
 describe('renderWorkerBrief', () => {
+  it('requires detaching long operations and resuming until the job finishes', () => {
+    expect(renderWorkerBrief(params)).toContain('For any op that may exceed 9 min, use --detach then repeated --wait-for calls; never end a turn while a job is still-running.');
+  });
+
+  it('mentions exit code 75 for a still-running operation', () => {
+    expect(renderWorkerBrief(params)).toMatch(/exit code\s+`?75`?/i);
+  });
+
   it('keeps the main-based lane and overlap-only stacking instructions in step 3', () => {
     const brief = renderWorkerBrief(params);
     const lane = brief.slice(brief.indexOf('3. **Lane.**'), brief.indexOf('4. **Codex'));

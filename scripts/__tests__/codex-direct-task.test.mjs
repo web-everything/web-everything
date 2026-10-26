@@ -17,6 +17,7 @@ import { keepAliveScript } from '../lib/test-keepalive.mjs';
 import { CODEX_TASK_RULES, CODEX_REVIEW_TASK_RULES } from '../lib/build-policy.mjs';
 import {
   startDetachedJob, waitForJob, readJobRecord, writeJobRecord, cliExitCode, jobIsAlive, readPidStart, readPidState,
+  normalizeWaitAlias,
   PID_START_TIMEOUT_MS, JOB_RECORD_INIT_DEADLINE_MS,
   CODEX_CLI,
   DEFAULT_TIMEOUT_MS,
@@ -63,6 +64,35 @@ function flagValue(argv, flag) {
   const i = argv.indexOf(flag);
   return i === -1 ? undefined : argv[i + 1];
 }
+
+describe('normalizeWaitAlias — resumable long-op CLI', () => {
+  it.each([
+    ['--wait-for=resume-job', '--max-wait-ms=250'],
+    ['--max-wait-ms=250', '--wait-for=resume-job'],
+  ])('rewrites the wait alias %j without mutating its input', (...args) => {
+    const original = [...args];
+    expect(normalizeWaitAlias(args)).toEqual(['wait', '--job=resume-job', '--max-ms=250']);
+    expect(args).toEqual(original);
+  });
+
+  it.each([
+    [],
+    ['wait', '--job=resume-job', '--max-ms=250'],
+    ['--task=build the widget', '--detach'],
+    ['--max-wait-ms=250'],
+  ])('leaves arguments without --wait-for unchanged: %j', (...args) => {
+    expect(normalizeWaitAlias(args)).toEqual(args);
+  });
+
+  it('mentions --wait-for in --help', () => {
+    const child = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', '--help'], {
+      encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(0);
+    expect(child.stdout).toContain('--wait-for');
+  });
+});
 
 describe('defaultExecFn — real child-process output buffering', () => {
   it('returns the full stdout when output exceeds Node’s default 1 MiB buffer', () => {
