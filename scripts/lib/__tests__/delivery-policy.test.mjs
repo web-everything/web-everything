@@ -387,9 +387,9 @@ describe('delivery policy values', () => {
     expect(policy(result)).toEqual(DELIVERY_POLICY_FAILSAFE);
     expect(result.warnings).toHaveLength(1);
   });
-  it.each(['__proto__', 'constructor', 'toString'])('refuses defaults whose field is inherited, not own (%s)', async name => {
-    const pad = name === '__proto__' ? 'padding' : name;
-    put(defaultFile, `export const PLATFORM_DELIVERY_POLICY_DEFAULTS = { ...${JSON.stringify(defaults)}, prCi: { __proto__: { mainStateParity: 'on' }, ${pad}: 'on' } };`);
+  it('refuses defaults with the right own-key count where one required field is only inherited', async () => {
+    const { mainStateParity, ...own } = defaults.prCi;
+    put(defaultFile, `export const PLATFORM_DELIVERY_POLICY_DEFAULTS = { ...${JSON.stringify(defaults)}, prCi: { __proto__: { mainStateParity: ${JSON.stringify(mainStateParity)} }, ...${JSON.stringify(own)}, padding: ${JSON.stringify(mainStateParity)} } };`);
     const result = await load();
     expect(policy(result)).toEqual(DELIVERY_POLICY_FAILSAFE);
     expect(result.warnings).toHaveLength(1);
@@ -1312,5 +1312,32 @@ describe('policy journal', () => {
     const line = readFileSync(env.WE_POLICY_EVENTS_FILE, 'utf8');
     expect(Buffer.byteLength(line)).toBeLessThanOrEqual(4096);
     for (const field of ['key', 'event', 'subject', 'reason']) expect(JSON.parse(line)[field]).toMatch(/…$/);
+  });
+});
+
+describe('policy file path identity', () => {
+  const entry = (name, link = false) => ({ name, isSymbolicLink: () => link, isFile: () => !link });
+  const hostile = { mergeGate: { onMainRed: 'off' } };
+  it.each([
+    ['case alias', () => [entry('WebEverything.config.json')]],
+    ['symlink', () => [entry(rootFile, true)]],
+    ['unicode variant', () => [entry('webeverything.config.json\u0301')]],
+  ])('refuses the conventional root file when its stored entry is a %s', async (_name, listing) => {
+    put(rootFile, hostile);
+    const result = await load({ readdir: () => listing() });
+    expect(result.mergeGate.onMainRed).toBe(defaults.mergeGate.onMainRed);
+    expect(result.warnings).toEqual([expect.stringMatching(/policy config/)]);
+  });
+  it('accepts the exact stored name', async () => {
+    put(rootFile, hostile);
+    const result = await load({ readdir: () => [entry(rootFile)] });
+    expect(result.mergeGate.onMainRed).toBe('off');
+  });
+  it('refuses NFC/NFD variants of a stored name', () => {
+    const nfc = 'caf\u00e9.json', nfd = nfc.normalize('NFD');
+    const check = (stored, wanted) => deliveryPolicy.assertStoredEntryName('d', wanted, () => [entry(stored)]);
+    expect(() => check(nfc, nfc)).not.toThrow();
+    expect(() => check(nfd, nfc)).toThrow(/identity/);
+    expect(() => check(nfc, nfd)).toThrow(/identity/);
   });
 });
