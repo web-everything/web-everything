@@ -1,5 +1,5 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
-import { mkdirSync, readFileSync, statSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { hostname } from 'node:os';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
@@ -7,7 +7,7 @@ import { listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operation
 import { readFilteredInOrder } from './stream-filter-runs.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
-import { redTeamEnabled, redTeamOwedFor } from './review-red-team-policy.mjs';
+import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { readRedTeamProbes } from './red-team-gate.mjs';
 import { completedRedTeamSeat } from './red-team-run-result.mjs';
 
@@ -24,14 +24,37 @@ export function readRedTeamStatus({ repo, pr, head, env = process.env } = {}) {
 }
 
 /** A status is written before settling speculation or starting the sequential pass; crashes leave a dead pid. */
-export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = null }, { env = process.env, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime } = {}) {
+export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = null, retryCount }, { env = process.env, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime } = {}) {
   const head = loopPayload?.findings?.read?.netBasis?.rev;
   if (!/^[a-f0-9]{40}$/i.test(head ?? '')) return;
   const path = statusPath({ repo, pr, head }, env);
   mkdirSync(dirname(path), { recursive: true });
+  // Retry admission survives running/finished rewrites, including lost seat-row appends.
+  const prior = readRedTeamStatus({ repo, pr, head, env });
+  const spent = prior?.retryCount;
+  if (spent !== undefined && (!Number.isSafeInteger(spent) || spent < 0)) throw Error('invalid red-team retry count');
+  if (retryCount !== undefined && (!Number.isSafeInteger(retryCount) || retryCount < 0)) throw Error('invalid red-team retry count');
+  const retryMarker = `${path}.retry-1`;
+  // The exclusive create is the spend: status read/write/read cannot arbitrate workers.
+  // Keep the marker even if the subsequent write fails; an operator must inspect that attempt.
+  if (retryCount === 1) {
+    if (spent >= 1) throw Object.assign(Error('retry already admitted'), { code: 'RED_TEAM_RETRY_ADMITTED' });
+    let fd;
+    try { fd = openSync(retryMarker, 'wx', 0o600); }
+    catch (e) {
+      if (e.code === 'EEXIST') throw Object.assign(Error('retry already admitted'), { code: 'RED_TEAM_RETRY_ADMITTED' });
+      throw e;
+    }
+    closeSync(fd);
+  }
+  let claimed = 0;
+  try { statSync(retryMarker); claimed = 1; }
+  catch (e) { if (e.code !== 'ENOENT') throw e; }
+  const durableRetryCount = Math.max(spent ?? 0, retryCount ?? 0, claimed);
   // skipCardOnly is the writer's resolved setting, NOT evidence that this PR is card-only.
   // Consumers must classify the stored net read; the drain may resolve a different setting in its own process.
-  writeJsonAtomic(path, { repo, pr, head, loopPayload, status, result, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly,
+  writeJsonAtomic(path, { repo, pr, head, loopPayload, status, result,
+    ...(durableRetryCount > 0 ? { retryCount: durableRetryCount } : {}), skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly,
     pid: process.pid, host, pidNamespace: namespace, pidStart: readPidStart(process.pid) });
 }
 
@@ -42,13 +65,14 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   const seats = readScorecards().filter(row => row.dispatchKind === 'review-seat' && row.seat === 'red-team'
     && row.repo === repo && Number(row.pr) === Number(pr) && row.rev === head);
   const recorded = seats.length > 0;
-  const seatEvidence = { seatRecorded: recorded, completedRecorded: seats.some(completedRedTeamSeat) };
+  const seatEvidence = { seatRecorded: recorded, completedRecorded: seats.some(completedRedTeamSeat),
+    failedSeatCount: seats.filter(row => !completedRedTeamSeat(row)).length };
   // Runs are immutable in identity but updated in place: choose the latest read of this exact repo/PR/head.
-  const latestRun = () => {
+  const latestRun = (exactHead = true) => {
     // Read, test and drop one run at a time (xwu9oxh S1a): same reads, order and errors as map-then-filter.
     const hits = readFilteredInOrder(list(runsDir).filter(id => id.startsWith('review-pr-')), id => read(id, runsDir),
       run => run?.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr)
-        && run.findings?.read?.netBasis?.rev === head, (run, id) => ({ id, run }))
+        && (!exactHead || run.findings?.read?.netBasis?.rev === head), (run, id) => ({ id, run }))
       .map(hit => ({ ...hit, at: statSync(join(runsDir, `${hit.id}.json`)).mtimeMs }));
     hits.sort((a, b) => b.at - a.at);
     return { run: hits[0]?.run ?? null, at: hits[0]?.at ?? 0 };
@@ -92,6 +116,18 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
       ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(resultStatus), recorded: recorded || resultStatus === 'ran' };
   }
   const loopPayload = latestRun().run;
+  if (!loopPayload && !recorded) {
+    const older = latestRun(false).run;
+    const oldHead = older?.findings?.read?.netBasis?.rev;
+    if (oldHead && oldHead !== head && redTeamCardOnly(older.findings.read)) {
+      const old = readDrainRedTeamEvidence({ repo, pr, head: oldHead, env, runsDir, list, read,
+        isAlive, host, namespace, readPidStart, readScorecards });
+      const prior = old.status;
+      if (prior?.status === 'finished' && prior.skipCardOnly === true
+        && (typeof prior.result === 'string' ? prior.result : prior.result?.status) === 'skipped'
+        && !old.recorded && !old.inFlight && !old.queued) return old;
+    }
+  }
   // An owing run with no job status yet: only the job's process knows its card-only skip decision, so hold the head
   // (skip off) until that status records it. The never-scheduled deadline still applies if no job ever writes one.
   return { loopPayload, inFlight: false, scheduled: recorded || owes(loopPayload), recorded, ...seatEvidence, ...(owes(loopPayload) ? { skipCardOnly: false } : {}) };

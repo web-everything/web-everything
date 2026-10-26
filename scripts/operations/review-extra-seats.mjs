@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { recordRedTeamStatus, readRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
 import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
-import { completedRedTeamSeat, redTeamStatusWithoutRun } from '../lib/red-team-run-result.mjs';
+import { failedRedTeamRetry, completedRedTeamSeat, redTeamStatusWithoutRun } from '../lib/red-team-run-result.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { execRead } from '../lib/proc-read.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
@@ -1424,7 +1424,7 @@ function redTeamRecoveryGuard({ pr, repo, head, redTeamMode, redTeamAdmission },
     reason: `${reason}; inspect stored evidence before retrying — no call launched` });
   if (!['fresh', 'resume'].includes(redTeamMode) || typeof repo !== 'string' || !repo.trim()
     || !Number.isSafeInteger(Number(pr)) || Number(pr) <= 0 || !isPinnedRev(head)) return refuse('invalid red-team recovery identity or mode');
-  let records, status, comments;
+  let records, status, comments, admittedStatus;
   try {
     records = io.readRecords({ strict: true });
     if (!Array.isArray(records)) throw Error('invalid scorecards');
@@ -1442,6 +1442,7 @@ function redTeamRecoveryGuard({ pr, repo, head, redTeamMode, redTeamAdmission },
       if (prior !== null && (!prior || prior.repo !== repo || Number(prior.pr) !== Number(pr) || prior.head !== head)) return refuse('prior red-team status identity mismatch');
       const result = ['ran', 'resumed'].includes(normalizeRedTeamResult(prior?.result).priorResult) ? prior.result : null;
       if (JSON.stringify(status.result) !== JSON.stringify(result)) return refuse('red-team admission result changed');
+      admittedStatus = status;
       status = prior;
     }
   } catch { return refuse('red-team status unreadable'); }
@@ -1451,9 +1452,25 @@ function redTeamRecoveryGuard({ pr, repo, head, redTeamMode, redTeamAdmission },
   } catch { return refuse('PR comments unreadable'); }
   if (redTeamForHead(comments, pr, head)) return refuse('red-team result already on head', true);
   if (redTeamMode === 'fresh') {
-    if (status != null && !redTeamStatusWithoutRun(status)) return refuse('prior red-team status; not re-run');
-    if (seatRows(records).some(row => row.seat === RED_TEAM_SEAT.seat && row.repo === repo
-      && Number(row.pr) === Number(pr) && row.rev === head)) return refuse('prior red-team seat row; not re-run');
+    const rows = seatRows(records).filter(row => row.seat === RED_TEAM_SEAT.seat && row.repo === repo
+      && Number(row.pr) === Number(pr) && row.rev === head);
+    const retry = failedRedTeamRetry(status, { failedSeatCount: rows.filter(row => !completedRedTeamSeat(row)).length,
+      completedRecorded: rows.some(completedRedTeamSeat) });
+    if (!retry && status != null && !redTeamStatusWithoutRun(status)) return refuse('prior red-team status; not re-run');
+    if (!retry && rows.length > 0) return refuse('prior red-team seat row; not re-run');
+    if (retry) {
+      // Spend before any provider work. A missing seat row can never restore this allowance.
+      try {
+        if (admittedStatus) {
+          if (admittedStatus.retryCount !== 1) return refuse('retry admission not durably recorded');
+        } else {
+          if (typeof io.redTeamStatus !== 'function') return refuse('retry admission writer unavailable');
+          io.redTeamStatus({ repo, pr, loopPayload: status.loopPayload, status: 'queued', result: status.result, retryCount: 1 });
+          const stored = io.readRedTeamStatus({ repo, pr, head });
+          if (stored?.status !== 'queued' || stored.retryCount !== 1) return refuse('retry admission readback mismatch');
+        }
+      } catch (e) { return refuse(e.code === 'RED_TEAM_RETRY_ADMITTED' ? 'retry already admitted' : 'retry admission could not be persisted'); }
+    }
   } else {
     const { priorResult, priorComment } = normalizeRedTeamResult(status?.result);
     if (status?.status !== 'finished' || (!['ran', 'resumed'].includes(priorResult) && status.result !== 'resumed')
