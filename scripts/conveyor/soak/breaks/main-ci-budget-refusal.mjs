@@ -7,6 +7,7 @@ import { DEFAULT_MAIN_WORKFLOW_NAME } from '../../main-red-recovery.mjs';
 import { runGhSync, writeBudgetBlock } from '../../../lib/gh-throttle.mjs';
 
 const SOURCE = 'scripts/conveyor/ci-red-recovery-watch.mjs';
+const REPO = 'main-ci-fixture/example';
 
 export default {
   id: 'main-ci-budget-refusal',
@@ -28,7 +29,7 @@ export default {
       let reads = 0;
       let submissions = 0;
       const events = [];
-      const options = { apply: true, repo: 'web-everything/web-everything', recordPath,
+      const options = { apply: true, repo: REPO, recordPath,
         emitEvent: event => { events.push(event); },
         readMainRuns: () => {
           // Simulate another watcher exhausting core after this history read succeeds.
@@ -41,7 +42,7 @@ export default {
             throttle: { lockRoot: root, env: {}, now: () => clock, sleep: () => {}, cap: 4,
               exec: actualArgs => {
                 check(JSON.stringify(actualArgs) === JSON.stringify(['api', '-X', 'POST',
-                  'repos/web-everything/web-everything/actions/runs/123/rerun']), 'unexpected GitHub operation');
+                  `repos/${REPO}/actions/runs/123/rerun`]), 'unexpected GitHub operation');
                 submissions++;
                 return '';
               } },
