@@ -24,6 +24,14 @@ describe('repeated deterministic standards failure', () => {
     const again = decideStuckDequeues({ entries: [entry('a')], tracker: first.tracker, max: 99, nowMs });
     expect(again.dequeue).toEqual([]);
   });
+  it('resets failure and rebuild history when the same PR re-enters between sweeps', () => {
+    const first = decideStuckDequeues({ entries: [entry('a')], tracker: {}, max: 99, nowMs });
+    const nextEntry = entry('b', { enqueuedAt: '2026-10-26T11:00:00Z' });
+    const second = decideStuckDequeues({ entries: [nextEntry], tracker: first.tracker, max: 99, nowMs });
+    expect(second.dequeue).toEqual([]);
+    expect(second.tracker[5969].count).toBe(0);
+    expect(second.tracker[5969].fails).toEqual([oid('b')]);
+  });
   it('a different failing check never counts', () => {
     const e = (g) => entry(g, { failedChecks: ['smoke'] });
     const first = decideStuckDequeues({ entries: [e('a')], tracker: {}, max: 99, nowMs });
@@ -52,6 +60,25 @@ describe('repeated deterministic standards failure', () => {
   it('an old tracker without the failure list still works', () => {
     const r = decideStuckDequeues({ entries: [entry('b')], tracker: { 5969: { oid: oid('a'), count: 0 } }, max: 99, nowMs });
     expect(r.dequeue).toEqual([]);
+  });
+  it('drops legacy history without an enqueue identity instead of attributing it to the current entry', () => {
+    const legacy = { 5969: { oid: oid('a'), count: 98, fails: [oid('a')] } };
+    const r = decideStuckDequeues({ entries: [entry('b')], tracker: legacy, max: 2, nowMs });
+    expect(r.dequeue).toEqual([]);
+    expect(r.tracker[5969]).toEqual({ enqueuedAt: entry('b').enqueuedAt, oid: oid('b'), count: 0, fails: [oid('b')] });
+  });
+  it('does not accumulate failures when the enqueue identity is unreadable', () => {
+    const first = decideStuckDequeues({ entries: [entry('a', { enqueuedAt: undefined })], tracker: {}, max: 1, nowMs });
+    const second = decideStuckDequeues({ entries: [entry('b', { enqueuedAt: undefined })], tracker: first.tracker, max: 1, nowMs });
+    expect(second.dequeue).toEqual([]);
+    expect(second.tracker[5969].count).toBe(0);
+    expect(second.tracker[5969].fails).toEqual([oid('b')]);
+  });
+  it('keeps the same enqueue identity across equivalent timestamp spellings', () => {
+    const first = decideStuckDequeues({ entries: [entry('a')], tracker: {}, max: 99, nowMs });
+    const second = decideStuckDequeues({ entries: [entry('b', { enqueuedAt: '2026-10-26T10:39:00.000Z' })], tracker: first.tracker, max: 99, nowMs });
+    expect(second.dequeue).toEqual([expect.objectContaining({ kind: 'standards-failed-twice' })]);
+    expect(second.tracker[5969].count).toBe(1);
   });
 });
 
@@ -90,7 +117,7 @@ describe('incomplete check contexts are unknown', () => {
     expect(result.error).toBeUndefined();
     expect(result.entries).toHaveLength(1);
     expect(result.entries[0]).not.toHaveProperty('failedChecks');
-    const tracker = { 5969: { oid: oid('b'), count: 1, fails: [oid('a'), oid('b')] } };
+    const tracker = { 5969: { enqueuedAt: nodes[0].enqueuedAt, oid: oid('b'), count: 1, fails: [oid('a'), oid('b')] } };
     const decision = decideStuckDequeues({ entries: result.entries, tracker, max: 99, nowMs });
     expect(decision.dequeue).toEqual([]);
     expect(decision.tracker[5969].fails).toEqual([oid('a'), oid('b')]);

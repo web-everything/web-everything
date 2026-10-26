@@ -44,7 +44,9 @@ export function decideStuckDequeues({ entries, tracker, max, nowMs = Date.now() 
   const dequeue = [];
   for (const entry of entries) {
     const previous = tracker?.[entry.num];
-    const validPrevious = typeof previous?.oid === 'string' && /^[a-f0-9]{40}$/i.test(previous.oid)
+    const entryTime = Date.parse(entry.enqueuedAt);
+    const sameEntry = Number.isFinite(entryTime) && Date.parse(previous?.enqueuedAt) === entryTime;
+    const validPrevious = sameEntry && typeof previous?.oid === 'string' && /^[a-f0-9]{40}$/i.test(previous.oid)
       && Number.isSafeInteger(previous.count) && previous.count >= 0 && previous.count < Number.MAX_SAFE_INTEGER;
     const count = validPrevious ? previous.count + (previous.oid !== entry.groupOid ? 1 : 0) : 0;
     const fails = validPrevious && Array.isArray(previous.fails)
@@ -54,7 +56,7 @@ export function decideStuckDequeues({ entries, tracker, max, nowMs = Date.now() 
       fails.push(entry.groupOid);
       if (fails.length > 5) fails.shift();
     }
-    next[entry.num] = { oid: entry.groupOid, count, ...(fails.length ? { fails } : {}) };
+    next[entry.num] = { enqueuedAt: entry.enqueuedAt, oid: entry.groupOid, count, ...(fails.length ? { fails } : {}) };
     const kind = entry.state === 'UNMERGEABLE' ? 'unmergeable'
       : standardsFailing && fails.length >= 2 ? 'standards-failed-twice'
       : entry.state === 'AWAITING_CHECKS' && count >= max ? 'rebuilds' : null;

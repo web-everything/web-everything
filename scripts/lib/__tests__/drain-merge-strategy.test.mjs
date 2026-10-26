@@ -1496,7 +1496,9 @@ describe('drain pre-stage queue admission', () => {
     expect(s.enqueue(c, HEAD, { prepared, comments: prepared.comments })).toMatchObject({ enqueued: true });
     // Both admission and the post-enqueue clearance dedupe read the live thread.
     expect(calls.filter(call => call.includes('--slurp'))).toHaveLength(2);
-    expect(calls.some(call => call[0] === 'git' && ['fetch', 'diff'].includes(call[1]))).toBe(false);
+    // Workflow preparation can be reused; identity admission always reads fresh Git evidence.
+    expect(calls.some(call => call[0] === 'git' && call[1] === 'fetch' && call.includes(HEAD))).toBe(true);
+    expect(calls.some(call => call[0] === 'git' && call[1] === 'diff' && call.includes('backlog/'))).toBe(true);
   });
   // PR #5480 red-team finding: the prepared file list is bound to the base branch and tip it was read against,
   // so a PR retargeted (or whose base moved) between pre-stage and enqueue is re-read against the live base.

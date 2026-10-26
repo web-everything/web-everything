@@ -60,10 +60,10 @@ describe('decideStuckDequeues', () => {
 
   it('records first sight at zero, ignores the same OID, increments on a changed group OID and prunes departed PRs', () => {
     const first = decide([entry()], { 42: { oid, count: 2 } });
-    expect(first).toEqual({ dequeue: [], tracker: { 5977: { oid, count: 0 } } });
+    expect(first).toEqual({ dequeue: [], tracker: { 5977: { enqueuedAt, oid, count: 0 } } });
     expect(decide([entry()], first.tracker)).toEqual(first);
     const changed = decide([entry({ groupOid: 'b'.repeat(40) })], first.tracker);
-    expect(changed).toEqual({ dequeue: [], tracker: { 5977: { oid: 'b'.repeat(40), count: 1 } } });
+    expect(changed).toEqual({ dequeue: [], tracker: { 5977: { enqueuedAt, oid: 'b'.repeat(40), count: 1 } } });
     expect(decide([], changed.tracker)).toEqual({ dequeue: [], tracker: {} });
   });
 
@@ -91,13 +91,13 @@ describe('decideStuckDequeues', () => {
   });
 
   it('names distinct rebuild count and max at and beyond the configured threshold', () => {
-    const result = decide([entry()], { 5977: { oid, count: 4 } }, 3);
+    const result = decide([entry()], { 5977: { enqueuedAt, oid, count: 4 } }, 3);
     expect(result.dequeue).toEqual([{ num: 5977, kind: 'rebuilds', reason: expect.any(String) }]);
     for (const text of ['#5977', 'AWAITING_CHECKS', '4', '3']) expect(result.dequeue[0].reason).toContain(text);
   });
 
   it('never dequeues a MERGEABLE entry even with a high rebuild count', () => {
-    expect(decide([entry({ state: 'MERGEABLE' })], { 5977: { oid, count: 99 } }).dequeue).toEqual([]);
+    expect(decide([entry({ state: 'MERGEABLE' })], { 5977: { enqueuedAt, oid, count: 99 } }).dequeue).toEqual([]);
   });
 
   it('honors a max of one at the first group rebuild', () => {
@@ -108,7 +108,7 @@ describe('decideStuckDequeues', () => {
   });
 
   it('reports an UNMERGEABLE entry as unmergeable even when it also exceeds the rebuild max', () => {
-    expect(decide([entry({ state: 'UNMERGEABLE' })], { 5977: { oid, count: 99 } }).dequeue)
+    expect(decide([entry({ state: 'UNMERGEABLE' })], { 5977: { enqueuedAt, oid, count: 99 } }).dequeue)
       .toEqual([{ num: 5977, kind: 'unmergeable', reason: expect.any(String) }]);
   });
 
@@ -217,20 +217,33 @@ describe('sweepStuckEntries', () => {
   });
 
   it('loads tracker JSON and saves changed OIDs for the next pass', () => {
-    const h = sweepIo({ nodes: [node()], state: JSON.stringify({ 5977: { oid: 'b'.repeat(40), count: 1 }, 42: { oid, count: 8 } }) });
+    const h = sweepIo({ nodes: [node()], state: JSON.stringify({ 5977: { enqueuedAt, oid: 'b'.repeat(40), count: 1 }, 42: { oid, count: 8 } }) });
     expect(h.run()).toEqual({ dequeued: [] });
     expect(h.readFile.mock.calls[0][0]).toBe(h.options.statePath);
     const [path, json] = h.writeFile.mock.calls.at(-1);
     expect(path).toBe(h.options.statePath);
-    expect(JSON.parse(json)).toEqual({ 5977: { oid, count: 2 } });
+    expect(JSON.parse(json)).toEqual({ 5977: { enqueuedAt, oid, count: 2 } });
     expect(h.emit).not.toHaveBeenCalled();
   });
 
   it('uses the persisted rebuild count to dequeue the head on its third OID change', () => {
-    const h = sweepIo({ nodes: [node()], state: JSON.stringify({ 5977: { oid: 'b'.repeat(40), count: 2 } }) });
+    const h = sweepIo({ nodes: [node()], state: JSON.stringify({ 5977: { enqueuedAt, oid: 'b'.repeat(40), count: 2 } }) });
     expect(h.run().dequeued).toEqual([5977]);
     expect(h.emit).toHaveBeenCalledWith(expect.objectContaining({ pr: 5977,
       detail: { kind: 'rebuilds', state: 'AWAITING_CHECKS', reason: expect.stringContaining('3') } }));
+  });
+
+  it('retains a fresh queue entry when persisted failures and rebuilds belong to its previous enqueue', () => {
+    const newEnqueuedAt = '2026-10-26T11:00:00Z';
+    const h = sweepIo({ nodes: [node({ enqueuedAt: newEnqueuedAt,
+      headCommit: { oid, statusCheckRollup: { state: 'FAILURE' } },
+      checks: { statusCheckRollup: { contexts: { pageInfo: { hasNextPage: false }, nodes: [
+        { __typename: 'CheckRun', name: 'standards', conclusion: 'FAILURE' },
+      ] } } } })], state: JSON.stringify({ 5977: { enqueuedAt, oid: 'b'.repeat(40), count: 2, fails: ['b'.repeat(40)] } }) });
+    expect(h.run()).toEqual({ dequeued: [] });
+    expect(JSON.parse(h.writeFile.mock.calls.at(-1)[1])[5977]).toEqual({ enqueuedAt: newEnqueuedAt, oid, count: 0, fails: [oid] });
+    expect(h.timeline).toEqual([]);
+    expect(h.emit).not.toHaveBeenCalled();
   });
 
   it.each(['failure', 'unconfirmed', 'already absent'])('isolates a dequeue %s, continues with other entries and emits only for successful removals', mode => {
