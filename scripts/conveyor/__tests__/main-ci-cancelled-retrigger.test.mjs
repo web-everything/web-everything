@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import { sweepMainCancelledRetrigger, rerunMainCancelledRun, formatMainCancelledReport, main,
   mainRetriggerRecordPath, withMainRetriggerLock } from '../ci-red-recovery-watch.mjs';
 import { DEFAULT_MAIN_WORKFLOW_NAME } from '../main-red-recovery.mjs';
+import { budgetBlockedMessage, runGhSync, writeBudgetBlock } from '../../lib/gh-throttle.mjs';
 
 const sha = 'a'.repeat(40);
 const now = Date.parse('2026-10-26T12:00:00Z');
@@ -368,6 +369,68 @@ describe('main cancelled CI retrigger: local throttle rejection', () => {
     expect(f.tick().applied[0].ok).toBe(false);
     expect(f.record()).toEqual({});
     expect(f.tick().applied[0].ok).toBe(true);
+  });
+});
+
+describe('main cancelled CI retrigger: local budget refusal', () => {
+  const block = { resource: 'core', until: '2026-10-26T12:01:00.000Z' };
+  const budgetError = shape => shape === 'structured'
+    ? Object.assign(Error('budget blocked'), { budgetBlocked: block })
+    : Object.assign(Error('Command failed'), {
+      stderr: shape === 'buffer' ? Buffer.from(budgetBlockedMessage(block)) : budgetBlockedMessage(block),
+    });
+
+  it.each(['structured', 'string', 'buffer'])('classifies a %s budget refusal as confirmed non-submission', shape => {
+    expect(rerunMainCancelledRun(123, { exec: () => { throw budgetError(shape); } }))
+      .toMatchObject({ ok: false, uncertain: false });
+  });
+
+  it.each(['structured', 'string', 'buffer'])('rolls back a %s refusal thrown by an injected rerunner', shape => {
+    const f = fixture();
+    f.options.rerun.mockImplementationOnce(() => { throw budgetError(shape); });
+    expect(f.tick().applied[0].ok).toBe(false);
+    expect(f.record()).toEqual({});
+    expect(f.options.emitEvent).not.toHaveBeenCalled();
+    expect(f.tick().applied[0].ok).toBe(true);
+    expect(f.options.rerun).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['API rate limit exceeded', 'call not sent', 'gh-throttle: GitHub core API rate limit exceeded'])
+    ('keeps incomplete non-submission evidence uncertain (%s)', stderr => {
+      const exec = () => { throw Object.assign(Error('Command failed'), { stderr }); };
+      expect(rerunMainCancelledRun(123, { exec }).uncertain).toBe(true);
+    });
+
+  it('retries after a real shared core-budget block activates between the history read and rerun POST', () => {
+    const root = mkdtempSync(join(tmpdir(), 'main-retrigger-budget-'));
+    try {
+      const f = fixture();
+      let clock = now;
+      const reset = now + 60_000;
+      const submitted = vi.fn(() => '');
+      f.options.readMainRuns.mockImplementationOnce(() => {
+        writeBudgetBlock(root, 'app', 'core', { untilMs: reset, nowMs: clock });
+        return [run()];
+      });
+      f.options.rerun = (runId, opts) => rerunMainCancelledRun(runId, { ...opts,
+        exec: (_bin, args, execOpts) => runGhSync(args, { ...execOpts, env: { GH_TOKEN: 'ghs_test_budget' },
+          throttle: { lockRoot: root, env: {}, now: () => clock, exec: submitted, sleep: () => {}, cap: 4 } }),
+      });
+      const refused = f.tick();
+      expect(refused.applied[0]).toMatchObject({ ok: false, error: expect.stringContaining('call not sent') });
+      expect(submitted).not.toHaveBeenCalled();
+      expect(f.record()).toEqual({});
+      expect(f.options.emitEvent).not.toHaveBeenCalled();
+      clock = reset + 1;
+      f.options.now = clock;
+      expect(f.tick().applied[0].ok).toBe(true);
+      expect(submitted).toHaveBeenCalledOnce();
+      expect(submitted.mock.calls[0][0]).toEqual(['api', '-X', 'POST', 'repos/web-everything/web-everything/actions/runs/123/rerun']);
+      expect(f.record()[sha].reserved).toBeUndefined();
+      expect(f.options.emitEvent).toHaveBeenCalledOnce();
+      f.tick();
+      expect(submitted).toHaveBeenCalledOnce();
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
 

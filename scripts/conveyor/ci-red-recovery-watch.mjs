@@ -1420,6 +1420,15 @@ function writeMainRetriggerRecord(path, record) {
   }
 }
 
+/** Local refusals prove that no rerun was submitted; generic rate-limit/transport errors do not. */
+function isMainRerunNotSubmitted(error) {
+  if (isGhThrottled(error) || error?.budgetBlocked) return true;
+  // The gh shim preserves the budget refusal on stderr, but cannot preserve custom Error properties.
+  const stderr = error?.stderr;
+  return (typeof stderr === 'string' || Buffer.isBuffer(stderr)) &&
+    /^gh-throttle: GitHub (?:core|graphql) API rate limit exceeded for this identity — shared backoff until [^\r\n]+, call not sent \(#gh-graphql-budget\)\r?$/m.test(String(stderr));
+}
+
 export function rerunMainCancelledRun(runId, { repo = null, exec = execFileSyncThrottled } = {}) {
   try {
     const out = exec('gh', ['api', '-X', 'POST', `repos/${repoSlug(repo)}/actions/runs/${runId}/rerun`], {
@@ -1433,8 +1442,8 @@ export function rerunMainCancelledRun(runId, { repo = null, exec = execFileSyncT
     const error = describeExecError(e);
     // An explicit API rejection is retryable; a timeout/transport failure may
     // have lost the acknowledgement after GitHub accepted the rerun.
-    // A local throttle rejection is raised before gh runs: nothing was submitted, so it is safe to retry.
-    return { ok: false, error, uncertain: !isGhThrottled(e) && !/\bHTTP 4(?!08)\d\d\b/.test(error) };
+    // Local slot/budget refusals happen before submission and can safely release the reservation.
+    return { ok: false, error, uncertain: !isMainRerunNotSubmitted(e) && !/\bHTTP 4(?!08)\d\d\b/.test(error) };
   }
 }
 
@@ -1586,7 +1595,7 @@ function sweepMainCancelledLocked({ repo = null, defaultBranch = 'main', apply =
     // Injectable rerunners may return ok:false for a confirmed rejection;
     // uncertain:true (or a thrown error) retains the reservation for inspection.
     try { outcome = rerun(runId, { repo }); }
-    catch (e) { outcome = { ok: false, uncertain: !isGhThrottled(e), error: describeExecError(e) }; }
+    catch (e) { outcome = { ok: false, uncertain: !isMainRerunNotSubmitted(e), error: describeExecError(e) }; }
     if (outcome?.ok !== true) {
       let error = outcome?.error ?? 'rerun did not confirm success';
       if (outcome?.ok === false && outcome.uncertain !== true) {
