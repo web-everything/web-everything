@@ -20,7 +20,8 @@ export default {
     const { openReferralFindings } = await load('scripts/operations/record-referral-ruling.mjs');
     const { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey,
       renderReferralRecord } = await load('scripts/lib/jury-core.mjs');
-    const repo = 'web-everything/web-everything', number = 5925, head = 'a'.repeat(40);
+    const { CONSTELLATION_REPOS } = await load('scripts/lib/constellation-repos.mjs');
+    const repo = CONSTELLATION_REPOS.we.slug, number = 5925, head = 'a'.repeat(40);
     const body = '<!-- authored-by-actor: author -->';
     const card = 'we:backlog/x1b8hlo-follow-up.md';
     const cardReadable = ref => ref === card;
