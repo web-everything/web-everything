@@ -1753,9 +1753,7 @@ export async function finishSpeculativeRedTeam({ pr, repo, loopPayload, pass, en
     }
     let records = [];
     try { records = io.readRecords(); } catch { records = []; }
-    const prior = redTeamPanelSeatOwed(loopPayload, env)
-      ? verifiedPriorRedTeamRow(records, { repo, pr, rev: pass.rev, env })
-      : priorRedTeamRow(records, pr, pass.rev, repo);
+    const prior = verifiedPriorRedTeamRow(records, { repo, pr, rev: pass.rev, env });
     if (prior) return { status: 'superseded', reason: `a completed red-team seat row for #${pr} at ${String(pass.rev).slice(0, 12)} landed meanwhile` };
     const recording = loopPayload?.replay !== true;
     return await completeRedTeam({ pr, repo, loopPayload, pass, post, record: recording }, io);

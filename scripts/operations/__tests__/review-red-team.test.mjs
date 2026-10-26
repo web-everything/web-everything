@@ -108,6 +108,24 @@ function fakeIo(over = {}) {
 }
 
 describe('speculative red-team repository isolation', () => {
+  it.each(['valid', 'missing', 'tampered'])('post-accept supersession requires matching saved provenance: %s', async proof => {
+    const { io, calls, rows } = fakeIo();
+    const loopPayload = payload('accept');
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, read: loopPayload.findings.read,
+      env: { WE_RED_TEAM_TIMING: 'post-accept' }, resume: false }, io);
+    expect(pass.status).toBe('speculated');
+    const saved = [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND, seat: 'red-team',
+      pr: 5, repo: REPO, rev: REV, status: 'ok', callId: 'later-call' }];
+    const env = attestRows(saved);
+    if (proof === 'missing') rmSync(env.OPERATION_RUNS_DIR, { recursive: true, force: true });
+    if (proof === 'tampered') saved[0].changedFiles = ['changed-after-attestation.mjs'];
+    io.readRecords = () => saved;
+    const result = await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload, pass, env }, io);
+    expect(result.status).toBe(proof === 'valid' ? 'superseded' : 'ran');
+    expect(calls.filter(c => c[0] === 'post')).toHaveLength(proof === 'valid' ? 0 : 1);
+    expect(rows.filter(row => row.dispatchKind === REVIEW_SEAT_DISPATCH_KIND)).toHaveLength(proof === 'valid' ? 0 : 1);
+  });
+
   it.each([REPO, 'other/repo', undefined])('only a clean row from the target repository supersedes a pass: %s', async rowRepo => {
     const { io, calls, rows } = fakeIo();
     const loopPayload = payload('accept');
@@ -577,6 +595,16 @@ describe('x00g3tt — review-job: the red team is the post-accept hook, after th
     expect(calls.map((c) => c[0])).toEqual(['report', 'report', 'release', 'unclaim', 'seats', 'red-team']);
     expect(calls.at(-1)[1]).toMatchObject({ pr: 10, repo: REPO, lanePath: '/lanes/lane-7' });
     expect(out).toMatchObject({ outcome: 'auto-cleared', verdict: 'accept', redTeam: { status: 'ran', confirmedMissCount: 1, comment: 'posted' } });
+  });
+
+  it('post-accept completion persists structured findings and publication metadata', () => {
+    const redTeamStatus = vi.fn();
+    const { io } = jobIo(payload('accept'), { redTeamStatus });
+    const out = runReviewJob({ pr: 10, repo: REPO, pid: 99 }, io);
+    expect(out.redTeam).toMatchObject({ status: 'ran', comment: 'posted', confirmedMissCount: 1 });
+    expect(redTeamStatus).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'finished', result: out.redTeam,
+    }));
   });
 
   it('a bounced review never reaches the red team', () => {

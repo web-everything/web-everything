@@ -877,7 +877,7 @@ function finishRedTeamOutcome({ redTeam, processResult, out, seatsBox, io, recor
         : seatsBox.priorRedTeamResult != null && !['ran', 'resumed'].includes(out.redTeam?.status)
           ? seatsBox.priorRedTeamResult : out.redTeam?.status === 'skipped'
             ? { status: 'skipped', ...(out.redTeam.policy === 'card-only' ? { policy: 'card-only' } : {}) }
-            : seatsBox.panelSeat && !seatsBox.input.redTeamMode ? out.redTeam ?? null : out.redTeam?.status ?? null;
+            : out.redTeam ?? null;
       io.redTeamStatus?.({ ...seatsBox.input, status: guardDeferred && prior ? prior.status : 'finished', result });
     }
   }
