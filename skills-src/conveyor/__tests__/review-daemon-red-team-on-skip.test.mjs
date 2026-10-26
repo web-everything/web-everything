@@ -53,7 +53,7 @@ it.each(['fresh', 'resume'])('real reconcile recovers a queued accepted head in 
     verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } } }));
   const out = runReviewTick({ repo, readPrs: () => [rawPr], readAgents: () => [], reconcile,
     holdReconcile: () => [], acquirableLanes: () => 1, tagRound: vi.fn(), tagStatus: vi.fn(), statusCandidates: () => [],
-    redTeamOnSkip: options => runRedTeamOnSkip({ ...options, dispatch, readEvidence,
+    redTeamOnSkip: options => runRedTeamOnSkip({ ...options, dispatch, readEvidence, readReviews: () => [],
       readStatus: () => mode === 'resume' ? { status: 'finished', result: 'ran' } : null,
       setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map() }),
   });

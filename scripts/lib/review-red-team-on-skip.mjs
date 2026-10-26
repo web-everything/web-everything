@@ -217,6 +217,9 @@ const safeLine = value => String(value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, 
 export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log = () => {}, dryRun = false,
   env = process.env, setting, readEvidence = readDrainRedTeamEvidence, readStatus = readRedTeamStatus,
   readCarry = key => readRedTeamCarry({ ...key, env }),
+  readReviews = ({ repo, pr }) => JSON.parse(runGhSync([
+    'pr', 'view', String(pr), '--repo', repo, '--json', 'reviews',
+  ], { env, encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 })).reviews,
   exec = execFileSync, cwd = process.cwd(), mainRef = 'origin/main',
   proveMove = move => proveCardOnlyHeadMove({ ...move, exec, cwd, mainRef }),
   now = Date.now, lastDispatch: history = lastDispatch, preferLane, settle = settleRedTeamSkip, syncLabels = syncRedTeamStatusLabels } = {}) {
@@ -225,7 +228,26 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   try {
     const at = now();
     const resolved = setting ?? resolveReviewRedTeamOnSkip({ env, log: note }).value;
-    rows.push(...planRedTeamOnSkip({ repo, refusals: plan?.refusals, rawPrs, readEvidence, readStatus,
+    const refusals = plan?.refusals ?? [];
+    // Reconcile rows omit formal reviews. Read only accepted recovery candidates,
+    // once per PR, without mutating the daemon's shared snapshot. Failed/oversized
+    // reads stay unknown: the planner requires operator inspection before clearing.
+    const planningPrs = (rawPrs ?? []).map(rawPr => {
+      const pr = Number(rawPr?.number), head = rawPr?.headRefOid;
+      if (!resolved.enabled || Array.isArray(rawPr?.reviews) || !isRealHead(head)
+        || !refusals.some(r => r?.kind === 'already-reviewed-head' && Number(r.prNumber) === pr
+          && (r.headSha == null || r.headSha === head))
+        || !Array.isArray(rawPr.comments) || redTeamForHead(rawPr.comments, pr, head)
+        || !Array.isArray(rawPr.labels) || !rawPr.labels.some(label =>
+          (typeof label === 'string' ? label : label?.name) === 'review:accepted')) return rawPr;
+      let reviews;
+      try {
+        const result = readReviews({ repo, pr });
+        if (Array.isArray(result)) reviews = result;
+      } catch { /* Unknown reviews must keep policy-clear closed. */ }
+      return { ...rawPr, reviews };
+    });
+    rows.push(...planRedTeamOnSkip({ repo, refusals, rawPrs: planningPrs, readEvidence, readStatus,
       now: at, setting: resolved, lastDispatch: history, proveMove, readCarry }));
     for (const row of rows) {
       let started = false;

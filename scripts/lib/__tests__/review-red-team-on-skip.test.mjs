@@ -10,6 +10,16 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
+vi.mock('../gh-throttle.mjs', async importOriginal => ({
+  ...await importOriginal(), runGhSync: vi.fn(),
+}));
+// Pin the live merger identity alongside legacy authors; hermetic settings omit
+// the host's configured App roles. Exercise the real marker-authorship gate.
+vi.mock('../github-app-identity.mjs', async importOriginal => {
+  const original = await importOriginal();
+  return { ...original, readBotLogins: () => [...original.readBotLogins(), 'plateau-merger', 'plateau-merger[bot]'] };
+});
+
 const repo = 'web-everything/web-everything', head = 'a'.repeat(40), pr = 5762;
 const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
 function fixture(over = {}) {
@@ -406,6 +416,95 @@ function runFixture(over = {}) {
     readEvidence: f.readEvidence, readStatus: f.readStatus, now: () => f.now, lastDispatch: f.lastDispatch,
     syncLabels: vi.fn(), capacity: { lanes: 1, budget: { left: 1 } }, dispatch: vi.fn(() => ({ jobPid: 42 })), ...over };
 }
+describe('daemon rows without formal reviews', () => {
+  function daemonOptions(number = 5929) {
+    const old = (number === 5929 ? '37709504' : 'b64a14a4').padEnd(40, '0');
+    const live = (number === 5929 ? '98caad11' : '682e81b3').padEnd(40, '0');
+    const fingerprint = 'd'.repeat(64), contribution = 'e'.repeat(64);
+    const markers = (sha, diff) => `<!-- reviewed-sha: ${sha} -->\n<!-- reviewed-diff: ${diff} -->\n<!-- reviewed-contribution: ${contribution} -->`;
+    const comment = (body, login, createdAt) => ({ body, author: { login }, createdAt });
+    const rawPr = { number, state: 'OPEN', headRefName: `lane/recovery-${number}`, headRefOid: live,
+      baseRefName: 'main', mergeStateStatus: 'CLEAN', labels: [{ name: 'review:accepted' }],
+      comments: [
+        comment(`✅ review — accepted\n\nCard-only change; no implementation findings.\n${markers(old, fingerprint)}`,
+          'web-everything', '2026-10-24T12:00:00Z'),
+        comment(`${redTeamMarker(number, old)}\nRed team not required on this head: card-only diff`,
+          'web-everything', '2026-10-24T12:01:00Z'),
+        comment(`📌 review — acceptance re-stamped after a rebase (no new review)\n\n${number === 5910 ? 'Merged origin/main; contribution unchanged.' : 'Net diff unchanged after rebase.'}\n${markers(live, number === 5910 ? 'f'.repeat(64) : fingerprint)}`,
+          'plateau-merger', '2026-10-24T13:00:00Z'),
+      ], statusCheckRollup: [{ name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
+    return runFixture({ rawPrs: [rawPr],
+      plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: number, headSha: live }] },
+      readEvidence: () => ({ inFlight: false, queued: false, recorded: false, seatRecorded: false }),
+      readReviews: vi.fn(() => []),
+      proveMove: vi.fn(() => { throw Error('acceptance re-stamp does not require a linear head move'); }),
+    });
+  }
+
+  it.each([5929, 5910])('carries daemon PR #%s policy-clear once after re-stamp (including a merge)', number => {
+    const o = daemonOptions(number), raw = o.rawPrs[0];
+    runGhSync.mockReset();
+    runGhSync.mockImplementation((_args, options) => {
+      raw.comments.push({ body: options.input, author: { login: 'web-everything' } });
+    });
+    try {
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'carry', head: raw.headRefOid });
+      expect(o.readReviews).toHaveBeenCalledOnce();
+      expect(o.readReviews).toHaveBeenCalledWith({ repo, pr: number });
+      expect(raw).not.toHaveProperty('reviews');
+      expect(runGhSync).toHaveBeenCalledOnce();
+      expect(runGhSync).toHaveBeenCalledWith([
+        'pr', 'comment', String(number), `--repo=${repo}`, '--body-file', '-',
+      ], expect.objectContaining({ input: expect.stringContaining(redTeamMarker(number, raw.headRefOid)) }));
+      expect(o.syncLabels).toHaveBeenCalledOnce();
+      expect(o.syncLabels).toHaveBeenCalledWith(expect.objectContaining({ repo, pr: number, head: raw.headRefOid }));
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'red-team result already on head' });
+      expect(o.readReviews).toHaveBeenCalledTimes(1);
+      expect(runGhSync).toHaveBeenCalledTimes(1);
+      expect(o.proveMove).not.toHaveBeenCalled();
+    } finally { runGhSync.mockReset(); }
+  });
+
+  it.each(['throws', 'oversized', 'malformed', 'changes-requested'])('refuses publication when formal review read is %s', kind => {
+    const o = daemonOptions();
+    o.readReviews.mockImplementation(() => {
+      if (kind === 'throws' || kind === 'oversized') throw Error(kind === 'oversized' ? 'ENOBUFS' : 'offline');
+      return kind === 'malformed' ? {} : [{ state: 'CHANGES_REQUESTED', submittedAt: '2026-10-24T14:00:00Z', author: { login: 'reviewer' } }];
+    });
+    runGhSync.mockClear();
+    // A standing formal hold invalidates the source acceptance before the
+    // publication guard; an unreadable channel reaches the guard and stays closed.
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: kind === 'changes-requested'
+      ? 'stored review does not owe a red team' : 'PR reviews unreadable; inspect formal reviews before policy-clear' });
+    expect(runGhSync).not.toHaveBeenCalled();
+    expect(o.syncLabels).not.toHaveBeenCalled();
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('default reader uses throttled gh with bounded output and timeout', () => {
+    const o = daemonOptions(); delete o.readReviews; o.dryRun = true;
+    runGhSync.mockReset(); runGhSync.mockReturnValue(JSON.stringify({ reviews: [] }));
+    try {
+      expect(runRedTeamOnSkip(o).rows[0].action).toBe('carry');
+      expect(runGhSync).toHaveBeenCalledOnce();
+      expect(runGhSync).toHaveBeenCalledWith(['pr', 'view', '5929', '--repo', repo, '--json', 'reviews'],
+        expect.objectContaining({ encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 }));
+    } finally { runGhSync.mockReset(); }
+  });
+
+  it.each(['disabled', 'not-refused', 'unaccepted', 'unreadable-comments', 'changed-head', 'reviews-present'])(
+    'avoids formal review reads for %s PRs', kind => {
+      const o = daemonOptions();
+      if (kind === 'disabled') o.setting.enabled = false;
+      if (kind === 'not-refused') o.plan.refusals = [];
+      if (kind === 'unaccepted') o.rawPrs[0].labels = [];
+      if (kind === 'unreadable-comments') delete o.rawPrs[0].comments;
+      if (kind === 'changed-head') o.plan.refusals[0].headSha = head;
+      if (kind === 'reviews-present') { o.rawPrs[0].reviews = []; o.dryRun = true; }
+      runRedTeamOnSkip(o);
+      expect(o.readReviews).not.toHaveBeenCalled();
+    });
+});
 describe('runRedTeamOnSkip', () => {
   it.each(['finished-error', 'missing'])('an error seat row with %s status skips without dispatch', kind => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-skip-'));
@@ -802,7 +901,9 @@ describe('R100 recovery regressions', () => {
     });
     it.each([undefined, null, {}])('refuses unreadable formal reviews %j for operator inspection', reviews => {
       const o = options(); o.rawPrs[0].reviews = reviews;
+      o.readReviews = vi.fn(() => reviews);
       expectSkip(o, 'PR reviews unreadable; inspect formal reviews before policy-clear');
+      expect(o.readReviews).toHaveBeenCalledWith({ repo, pr });
     });
     if (kind !== 'carry') {
       it.each(['missing', 'untrusted', 'wrong-head'])('refuses %s acceptance evidence', evidence => {
