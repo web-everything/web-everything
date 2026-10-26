@@ -4,11 +4,23 @@
 
 `daemon-overlay-auto-retire.test.mjs` uses local Git repositories for ancestry, squash/content
 equivalence, deleted-branch recorded commits, and equal-tip carrier preservation. Retirement
-uses `removeOverlay`'s `requireRef` and `expectedOverlay` guards: container withdrawal or source
-re-registration preserves the source. Git uncertainty preserves registrations. `autoRetire`
-resolves through the policy cascade; shadow audit entries graduate after a full day from
-`shadowSince`. Inject `now` when testing that boundary. Run this suite through heavy admission.
-Preparation refreshes main and overlay tips before retirement; failed fetch evidence skips auto-retirement.
+uses `removeOverlay`'s `requireRef`, `expectedRequiredOverlay` and `expectedOverlay` guards: container
+withdrawal, container replacement or source re-registration preserves the source. Both identities are
+checked under the list mutex; mutable `stackBases` cache updates keep the same identity. Git uncertainty
+preserves registrations. `autoRetire` resolves through the policy cascade; only tool-sourced shadow
+graduates after a full day from `shadowSince`. Explicit platform/environment shadow stays observe-only.
+Test every mode source before, at and after the cutoff. Inject `now` at that boundary.
+Run this suite through heavy admission.
+Preparation records per-ref fetch evidence: refreshed tips may be classified; a successful remote absence
+check (`ls-remote --exit-code` status 2 with empty stdout) permits recorded-SHA evidence, ignoring cached tips.
+Failed/unknown fetches and unsafe names preserve registrations. They do not block retirement of independently
+verified overlays. Remaining unavailable registrations hold the rebuild with a `fetch-failed` result and an
+`overlay-fetch-unverifiable` alert, preventing the planner's `ref-gone` path from removing them. The next tick
+retries; restore or re-register deleted branches from recorded SHAs when their content is still needed.
+The command allowlist test restricts classification to local Git reads/merge-tree object creation; it forbids
+network and worktree mutations. `mainOnly` and corrupt state have separate preparation regressions.
+The `overlay-auto-retire-evidence` daemon soak reproduces explicit shadow, deleted remote branches and
+container replacement using real disposable repositories. The soak registry discovers its module automatically.
 Cherry records historical patch equivalence and omits merge commits. All patch-based retirement requires
 current whole-tree equivalence, even when every cherry line is negative. Regressions cover a cached landed
 tip advanced remotely, unique merge-resolution content, and an equivalent main patch subsequently reverted.

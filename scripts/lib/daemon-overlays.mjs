@@ -336,16 +336,23 @@ export function recordEdgeResolution(root, ref, {
  * retires `ref` for its replacement never leaves the list without both. `expectedOverlay`, when supplied, must still
  * match a present `ref` entry under the same mutex, so a concurrent re-registration is never removed. `stackBases` is
  * left out of that comparison: the rebuild rewrites it on its own ({@link persistStackBases}), which is no re-registration.
- * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedOverlay?:object}} [o]
+ * `expectedRequiredOverlay` also compares the required container's registration identity under that mutex;
+ * its presence alone cannot authorize removal after concurrent replacement.
+ * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedOverlay?:object, expectedRequiredOverlay?:object}} [o]
  * @returns {{removed:boolean, list:Array<object>}}
  */
-export function removeOverlay(root, ref, { env = process.env, why, requireRef, expectedOverlay } = {}) {
+export function removeOverlay(root, ref, { env = process.env, why, requireRef, expectedOverlay, expectedRequiredOverlay } = {}) {
   void why; // caller bookkeeping only — see JSDoc above.
   return withListLock(root, env, (pause) => {
     const list = readOverlaysForWrite(root, env);
     pause();
     if (requireRef !== undefined && !list.some((o) => o && o.ref === requireRef)) {
       throw new Error('replacement registration unavailable');
+    }
+    if (expectedRequiredOverlay !== undefined && (!requireRef || !expectedRequiredOverlay
+      || expectedRequiredOverlay.ref !== requireRef
+      || !isDeepStrictEqual(registrationIdentity(list.find((o) => o?.ref === requireRef)), registrationIdentity(expectedRequiredOverlay)))) {
+      throw new Error('replacement registration changed; refusing removal');
     }
     const idx = list.findIndex((o) => o && o.ref === ref);
     if (expectedOverlay !== undefined && idx !== -1 && !isDeepStrictEqual(registrationIdentity(list[idx]), registrationIdentity(expectedOverlay))) {

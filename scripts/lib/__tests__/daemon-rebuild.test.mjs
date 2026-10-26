@@ -729,7 +729,7 @@ describe('rebuildClone', () => {
     expect(existsSync(join(cloneDir, 'c.txt'))).toBe(false);
   });
 
-  it('removes an overlay whose ref was deleted on origin', async () => {
+  it('preserves a deleted overlay without recorded commit evidence and holds the rebuild', async () => {
     const { originDir, cloneDir, env } = makeFixture();
     pushBranch(originDir, 'lane/gone', (dir) => writeFile(dir, 'd.txt', 'hello d\n'));
     addOverlay(cloneDir, { ref: 'lane/gone' }, { env });
@@ -740,8 +740,10 @@ describe('rebuildClone', () => {
       root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
     });
 
-    expect(readOverlays(cloneDir, { env })).toEqual([]);
-    expect(result.alerts.some((a) => a.kind === 'overlay-auto-dropped' && a.detail?.reason === 'ref-gone')).toBe(true);
+    expect(readOverlays(cloneDir, { env }).map((o) => o.ref)).toEqual(['lane/gone']);
+    expect(result).toMatchObject({ moved: false, reason: 'fetch-failed' });
+    expect(result.alerts.some((a) => a.kind === 'overlay-fetch-unverifiable')).toBe(true);
+    expect(runSmoke).not.toHaveBeenCalled();
     expect(existsSync(join(cloneDir, 'd.txt'))).toBe(false);
   });
 
@@ -974,8 +976,10 @@ describe('rebuildClone', () => {
   // local commit and froze the rebuild with `local-commits`, forever, on a perfectly safe clone.
   it('an adopted overlay squash-merged + branch-deleted on origin is auto-dropped next rebuild — never refused as local-commits', async () => {
     const { originDir, cloneDir, env } = makeFixture();
-    pushBranch(originDir, 'lane/squash-drop', (dir) => writeFile(dir, 'squash-drop.txt', 'overlay content\n'));
+    env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'on';
+    const sha = pushBranch(originDir, 'lane/squash-drop', (dir) => writeFile(dir, 'squash-drop.txt', 'overlay content\n'));
     addOverlay(cloneDir, { ref: 'lane/squash-drop' }, { env });
+    writeOverlays(cloneDir, readOverlays(cloneDir, { env }).map((o) => ({ ...o, sha })), { env });
 
     const runSmoke = passSmoke();
     const first = await rebuildClone({
@@ -998,7 +1002,8 @@ describe('rebuildClone', () => {
     expect(second.reason).not.toBe('local-commits');
     expect(second.moved).toBe(true);
     expect(readOverlays(cloneDir, { env })).toEqual([]);
-    expect(second.alerts.some((a) => a.kind === 'overlay-auto-dropped' && a.detail?.reason === 'ref-gone')).toBe(true);
+    const events = readFileSync(overlayFilePath(cloneDir, env).replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(events).toContainEqual(expect.objectContaining({ by: 'auto-retire', ref: 'lane/squash-drop', sha, reason: 'landed-by-content' }));
     expect(existsSync(join(cloneDir, 'squash-drop.txt'))).toBe(true);
     // Lands on PLAIN main — no overlay merge commit left in the picture.
     expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(gitOk(cloneDir, ['rev-parse', 'origin/main']).trim());
@@ -1873,7 +1878,8 @@ describe('rebuildClone — pinned overlays never conflict-drop (self-destruct gu
       root: cloneDir, env, runSmoke: passSmoke(), prState: async () => null, lockOpts: LOCK_OPTS,
     });
     expect(result.moved).toBe(false);
-    expect(result.reason).toBe('pinned-overlay-unavailable');
+    expect(result.reason).toBe('fetch-failed');
+    expect(result.alerts.some((a) => a.kind === 'overlay-fetch-unverifiable')).toBe(true);
     expect(readOverlays(cloneDir, { env }).map((o) => o.ref)).toEqual(['lane/pinned-gone']);
   });
 

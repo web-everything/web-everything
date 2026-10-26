@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -31,6 +31,22 @@ const retire = (overlays, options = {}) => {
   return autoRetireOverlays({ root, env, overlays, git, mainSha: 'origin/main', ...options });
 };
 const audit = () => readFileSync(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+const prepare = (options = {}) => prepareRebuild({
+  root, env: { ...env, WE_DAEMON_STATE_DIR: join(base, 'state'), WE_DAEMON_AUTO_REBASE: '0' },
+  run: git, now: Date.now, mainOnly: false,
+  prState: async () => 'OPEN', prBaseChain: async () => [], ...options,
+});
+const localOrigin = () => {
+  const origin = join(base, 'origin.git');
+  ok('clone', '--bare', '-q', root, origin);
+  ok('remote', 'add', 'origin', origin);
+  return origin;
+};
+const expectNoRetirement = () => {
+  const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
+  expect(existsSync(file) ? audit().filter((e) => e.by === 'auto-retire') : []).toEqual([]);
+  expect(existsSync(env.WE_DAEMON_EVENTS) ? readFileSync(env.WE_DAEMON_EVENTS, 'utf8') : '').not.toContain('overlay-retired');
+};
 
 beforeEach(() => {
   base = mkdtempSync(join(tmpdir(), 'we-auto-retire-'));
@@ -47,6 +63,132 @@ beforeEach(() => {
 afterEach(() => rmSync(base, { recursive: true, force: true }));
 
 describe('real Git retirement evidence', () => {
+  it.each(['sha', 'headSha', 'tipSha'])('preparation retires a deleted remote branch using recorded %s and independently refreshed overlays', async (field) => {
+    localOrigin();
+    track('deleted');
+    track('main-overlay');
+    ok('push', '-q', 'origin', 'main:refs/heads/main-overlay');
+    register([{ ref: 'deleted', [field]: initial }, { ref: 'main-overlay' }]);
+    await prepare();
+    expect(readOverlayState(root, { env }).overlays).toEqual([]);
+    expect(audit().filter((e) => e.by === 'auto-retire').map((e) => e.ref)).toEqual(['deleted', 'main-overlay']);
+    expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).toContain('overlay-retired');
+  });
+
+  it.each(['failure', 'throw', 'malformed', 'fetch-throw', 'fetch-error'])('failed overlay fetch preserves cached landed registrations after successful main fetch (%s)', async (kind) => {
+    branch('feature');
+    commit('feature', 'live unmerged content');
+    localOrigin();
+    branch('main');
+    track('feature', initial);
+    const overlays = [{ ref: 'feature', sha: initial }];
+    register(overlays);
+    let mainFetched = false;
+    const prepared = await prepare({ run: (args) => {
+      if (args[0] === 'fetch' && args.some((arg) => arg.includes('refs/heads/feature:'))) {
+        if (kind === 'fetch-throw') throw new Error('fetch unavailable');
+        if (kind === 'fetch-error') return { status: 0, error: new Error('incomplete fetch') };
+        return { status: 1, stderr: 'transient failure' };
+      }
+      if (args[0] === 'ls-remote' && ['throw', 'malformed'].includes(kind)) {
+        if (kind === 'throw') throw new Error('remote unavailable');
+        return { status: 2, stdout: 'incomplete remote response' };
+      }
+      const result = git(args);
+      if (args[0] === 'fetch' && result.status === 0) mainFetched = true;
+      return result;
+    } });
+    expect(mainFetched).toBe(true);
+    expect(prepared.result.reason).toBe('fetch-failed');
+    expect(prepared.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-fetch-unverifiable' }));
+    expect(readOverlayState(root, { env }).overlays).toEqual(overlays);
+    expectNoRetirement();
+  });
+
+  it('an unverifiable overlay does not block independently refreshed landed overlays', async () => {
+    localOrigin();
+    track('uncertain');
+    register([{ ref: 'uncertain', sha: initial }, { ref: 'main' }]);
+    await prepare({ run: (args) => args[0] === 'ls-remote'
+      ? { status: 128, stderr: 'unavailable' } : git(args) });
+    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'uncertain', sha: initial }]);
+    expect(audit().filter((e) => e.by === 'auto-retire').map((e) => e.ref)).toEqual(['main']);
+  });
+
+  it('mainOnly preserves landed registrations without retirement events', async () => {
+    localOrigin();
+    const overlays = [{ ref: 'deleted', sha: initial }];
+    register(overlays);
+    await prepare({ mainOnly: true });
+    expect(readOverlayState(root, { env }).overlays).toEqual(overlays);
+    expectNoRetirement();
+  });
+
+  it('corrupt overlay state refuses preparation without retirement events', async () => {
+    localOrigin();
+    register([{ ref: 'main' }]);
+    writeFileSync(overlayFilePath(root, env), '{broken');
+    const prepared = await prepare();
+    expect(prepared.result.reason).toBe('overlay-state-corrupt');
+    expect(readFileSync(overlayFilePath(root, env), 'utf8')).toBe('{broken');
+    expectNoRetirement();
+  });
+
+  it.each(['feat/a+b', 'feat#1'])('preparation and classification preserve unsafe ref %s with a stale landed tip', async (ref) => {
+    branch(ref);
+    commit('feature', 'live unmerged content');
+    localOrigin();
+    branch('main');
+    track(ref, initial);
+    const overlays = [{ ref, sha: initial }];
+    register(overlays);
+    expect(classify(overlays)[0]).toMatchObject({ class: 'needed', reason: 'git-unverifiable' });
+    await prepare();
+    expect(readOverlayState(root, { env }).overlays).toEqual(overlays);
+    expectNoRetirement();
+  });
+
+  it('confirmed missing refs ignore cached tips and preserve unmerged recorded content', async () => {
+    branch('deleted');
+    const sha = commit('feature', 'unmerged recorded content');
+    branch('main');
+    localOrigin();
+    ok('push', '-q', 'origin', '--delete', 'deleted');
+    track('deleted', initial);
+    const overlays = [{ ref: 'deleted', sha }];
+    register(overlays);
+    await prepare({ run: (args) => args[0] === 'update-ref' && args[1] === '-d' && args[2] === 'refs/remotes/origin/deleted'
+      ? { status: 1 } : git(args) });
+    expect(readOverlayState(root, { env }).overlays).toEqual(overlays);
+    expectNoRetirement();
+  });
+
+  it('classification requires per-ref confirmation and never falls back after a successful refresh loses its tracking ref', () => {
+    branch('feature');
+    const sha = commit('feature', 'needed content');
+    track('feature', initial);
+    const overlays = [{ ref: 'feature', sha }];
+    for (const evidence of ['unverifiable', undefined]) {
+      expect(classifyOverlays({ overlays, git, refEvidence: new Map([['feature', evidence]]) })[0])
+        .toMatchObject({ class: 'needed', reason: 'git-unverifiable' });
+    }
+    expect(classifyOverlays({ overlays, git, refEvidence: new Map([['feature', 'missing']]) })[0])
+      .toMatchObject({ class: 'needed', reason: 'unmerged-content', sha });
+    ok('update-ref', '-d', 'refs/remotes/origin/feature');
+    expect(classifyOverlays({ overlays: [{ ref: 'feature', sha: initial }], git, refEvidence: new Map([['feature', 'refreshed']]) })[0])
+      .toMatchObject({ class: 'needed', reason: 'git-unverifiable' });
+  });
+
+  it('invalid registry entries hold preparation without overwriting the registry', async () => {
+    localOrigin();
+    const overlays = [null, { ref: '--invalid' }];
+    register(overlays);
+    const prepared = await prepare();
+    expect(prepared.result.reason).toBe('fetch-failed');
+    expect(readOverlayState(root, { env }).overlays).toEqual(overlays);
+    expectNoRetirement();
+  });
+
   it('preparation fetches a newer remote tip before retiring a cached landed tip', async () => {
     branch('feature');
     const newer = commit('feature', 'new unmerged work');
@@ -232,6 +374,61 @@ describe('real Git retirement evidence', () => {
     expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'lower' }]);
   });
 
+  it('container re-registration with unrelated content preserves the contained source', async () => {
+    branch('lower'); commit('lower', 'lower'); track('lower');
+    const top = commit('top', 'top'); track('top');
+    const original = [{ ref: 'lower' }, { ref: 'top', sha: top, addedAt: 'original' }];
+    const replacement = { ref: 'top', sha: initial, addedAt: 'replacement' };
+    const result = await retire(original, {
+      removeOverlay: (r, ref, opts) => {
+        register([original[0], replacement]);
+        return removeOverlay(r, ref, opts);
+      },
+    });
+    expect(result.retired).toEqual([]);
+    expect(readOverlayState(root, { env }).overlays).toEqual([original[0], replacement]);
+    expectNoRetirement();
+  });
+
+  it('container stack-base cache updates preserve its registration identity', async () => {
+    branch('lower'); commit('lower', 'lower'); track('lower');
+    commit('top', 'top'); track('top');
+    const result = await retire([{ ref: 'lower' }, { ref: 'top' }], {
+      removeOverlay: (r, ref, opts) => {
+        register([{ ref: 'lower' }, { ref: 'top', stackBases: ['lower'] }]);
+        return removeOverlay(r, ref, opts);
+      },
+    });
+    expect(result.retired.map((row) => row.ref)).toEqual(['lower']);
+  });
+
+  it('classification issues only permitted local Git commands across evidence paths', () => {
+    branch('lower'); commit('lower', 'lower'); track('lower');
+    commit('top', 'top'); track('top');
+    const commands = new Set();
+    const forbidden = [];
+    const rows = classifyOverlays({ overlays: [{ ref: 'lower' }, { ref: 'top' }, { ref: 'deleted', sha: initial }, { ref: 'unknown' }], git: (args) => {
+      const [command, ...options] = args;
+      const oid = '[0-9a-f]{40,64}';
+      const permitted = {
+        'rev-parse': /^(?:--verify --end-of-options [^ ]+\^\{commit\}|--verify [0-9a-f]{40,64}\^\{tree\})$/,
+        'for-each-ref': /^--format=%\(refname\) %\(objectname\) refs\/remotes\/origin\/[a-z]+$/,
+        'merge-base': new RegExp(`^--is-ancestor ${oid} ${oid}$`),
+        cherry: new RegExp(`^${oid} ${oid}$`),
+        'merge-tree': new RegExp(`^--write-tree --no-messages ${oid} ${oid}$`),
+      };
+      if (!permitted[command]?.test(options.join(' '))) {
+        forbidden.push(args);
+        throw new Error(`forbidden command: ${args.join(' ')}`);
+      }
+      commands.add(command);
+      return git(args);
+    } });
+    expect(rows.map((row) => row.class)).toEqual(['contained', 'needed', 'landed', 'needed']);
+    expect(forbidden).toEqual([]);
+    expect([...commands].sort()).toEqual(['cherry', 'for-each-ref', 'merge-base', 'merge-tree', 'rev-parse']);
+  });
+
   it('concurrent re-registration prevents removal', async () => {
     const result = await retire([{ ref: 'gone', sha: initial }], {
       removeOverlay: (r, ref, opts) => {
@@ -245,6 +442,35 @@ describe('real Git retirement evidence', () => {
 });
 
 describe('policy cascade and shadow graduation', () => {
+  it.each(['off', 'on'])('explicit environment %s remains unchanged after the tool cutoff', (mode) => {
+    env.WE_DAEMON_OVERLAY_AUTO_RETIRE = mode;
+    expect(resolveAutoRetireMode(env, { now: '2026-10-29T12:00:00Z' })).toMatchObject({ mode, source: 'env' });
+  });
+  it.each(['standard', 'platform', 'tool', 'env'])('%s shadow honors mode provenance before, at and after graduation', (source) => {
+    delete env.WE_DAEMON_OVERLAY_AUTO_RETIRE;
+    const settingsPath = join(base, 'settings.json');
+    writeFileSync(settingsPath, JSON.stringify({ autoRetire: {
+      shadowSince: '2026-10-26T12:00:00Z', ...(['tool', 'env'].includes(source) ? { mode: 'shadow' } : {}),
+    } }));
+    if (source === 'platform') writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, JSON.stringify({ autoRetire: { mode: 'shadow' } }));
+    if (source === 'env') env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'shadow';
+    for (const now of ['2026-10-27T11:59:59Z', '2026-10-27T12:00:00Z', '2026-10-29T12:00:00Z']) {
+      const graduated = source === 'tool' && now !== '2026-10-27T11:59:59Z';
+      expect(resolveAutoRetireMode(env, { settingsPath, now })).toMatchObject({
+        mode: graduated ? 'on' : 'shadow', source: `${source}${graduated ? ' (shadow elapsed)' : ''}`,
+      });
+    }
+  });
+
+  it('explicit environment shadow remains observe-only after graduation', async () => {
+    env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'shadow';
+    const overlays = [{ ref: 'deleted', sha: initial }];
+    const result = await retire(overlays, { now: () => Date.parse('2026-10-29T12:00:00Z') });
+    expect(result.retired).toEqual([]);
+    expect(result.wouldRetire.map((row) => row.ref)).toEqual(['deleted']);
+    expect(readOverlayState(root, { env }).overlays).toEqual(overlays);
+  });
+
   it('defaults to shadow, and the shipped setting graduates at exactly one day', () => {
     delete env.WE_DAEMON_OVERLAY_AUTO_RETIRE;
     expect(resolveAutoRetireMode(env, { settingsPath: join(base, 'missing') }).mode).toBe('shadow');

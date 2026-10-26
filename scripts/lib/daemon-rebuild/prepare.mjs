@@ -265,16 +265,26 @@ export async function prepareRebuild({
   for (const ref of fetchResult.goneRefs) alert('overlay-ref-gone-on-fetch', { ref });
 
   const fetchedMainSha = verifyRev(git, 'origin/main^{commit}');
-  // Failed individual fetches do not distinguish deleted branches from transient errors. Preserve registrations
-  // for auto-retirement unless this pass refreshed every overlay as well as main; never classify cached tips.
-  if (!mainOnly && !overlayState.corrupt && fetchedMainSha && fetchResult.goneRefs.length === 0) {
+  // Per-ref confirmation allows recorded-SHA retirement for deleted branches without trusting failed fetches
+  // or names the fetch layer skipped. One unavailable ref cannot block retirement of independently verified ones.
+  if (!mainOnly && !overlayState.corrupt && fetchedMainSha) {
     try {
-      const retired = await autoRetireOverlays({ root, env, overlays: overlaysBefore, git, mainSha: fetchedMainSha, now, removeOverlay, appendOverlayEvent });
+      const retired = await autoRetireOverlays({ root, env, overlays: overlaysBefore, git, mainSha: fetchedMainSha,
+        refEvidence: fetchResult.refEvidence, now, removeOverlay, appendOverlayEvent });
       if (retired.retired.length) {
         const fresh = readOverlayState(root, { env });
         if (!fresh.corrupt) overlaysBefore = fresh.overlays;
       }
     } catch (error) { alert('overlay-auto-retire-failed', { error: String(error?.message || error) }); }
+  }
+  // The planner otherwise drops missing refs as ref-gone. Preserve every remaining registration whose tip this
+  // pass could not refresh, including deleted branches whose recorded content is still needed. Retry on the next
+  // tick; operators can restore/re-register a missing branch from its recorded SHA. Never build from cached tips.
+  const unverified = overlaysBefore.filter((o) => fetchResult.refEvidence.get(o?.ref) !== 'refreshed');
+  if (!mainOnly && unverified.length) {
+    const detail = { refs: unverified.map((o) => o?.ref), message: 'Overlay tips unavailable; preserving registrations and retrying next tick. Restore or re-register deleted branches from their recorded SHA.' };
+    alert('overlay-fetch-unverifiable', detail);
+    return terminal({ moved: false, reason: 'fetch-failed', detail });
   }
   pruneLandedBacklogSidecars({ git, root, paths: unsafe.untracked, mainSha: fetchedMainSha, alert });
   const remaining = collectUntrackedPaths(git);

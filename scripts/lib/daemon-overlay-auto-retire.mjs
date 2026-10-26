@@ -5,12 +5,13 @@ import { fileURLToPath } from 'node:url';
 import { cascadePolicy, logCascadeSources } from './policy-cascade.mjs';
 import { removeOverlay as removeDefault, appendOverlayEvent as auditDefault } from './daemon-overlays.mjs';
 import { appendDaemonEvent as eventDefault } from './daemon-events.mjs';
+import { isSafeBranchName } from './daemon-self-sync.mjs';
 
 const SETTINGS = join(dirname(fileURLToPath(import.meta.url)), 'daemon-rebuild-settings.json');
 const SHA = /^[0-9a-f]{40,64}$/;
 const time = (now) => new Date(typeof now === 'function' ? now() : now).getTime();
 
-/** Standard → platform → tool → environment; shadow graduates after one full day. */
+/** Standard → platform → tool → environment; only tool shadow graduates after one full day. */
 export function resolveAutoRetireMode(env = process.env, { settingsPath = SETTINGS, now = Date.now } = {}) {
   let tool;
   try { tool = JSON.parse(readFileSync(settingsPath, 'utf8')).autoRetire; } catch { /* unset */ }
@@ -19,7 +20,7 @@ export function resolveAutoRetireMode(env = process.env, { settingsPath = SETTIN
     envValues: { mode: env?.WE_DAEMON_OVERLAY_AUTO_RETIRE?.trim() || undefined },
     valid: { mode: (v) => ['off', 'shadow', 'on'].includes(v), shadowSince: (v) => typeof v === 'string' && Number.isFinite(Date.parse(v)) },
   });
-  const graduated = r.value.mode === 'shadow' && time(now) - Date.parse(r.value.shadowSince) >= 86_400_000;
+  const graduated = r.sources.mode === 'tool' && r.value.mode === 'shadow' && time(now) - Date.parse(r.value.shadowSince) >= 86_400_000;
   const mode = graduated ? 'on' : r.value.mode;
   const source = `${r.sources.mode}${graduated ? ' (shadow elapsed)' : ''}`;
   logCascadeSources('autoRetire.effective', { value: { mode }, sources: { mode: source } }, { env });
@@ -27,7 +28,7 @@ export function resolveAutoRetireMode(env = process.env, { settingsPath = SETTIN
 }
 
 /** Git runner takes argv and returns spawnSync-shaped results. No worktree or network mutations. */
-export function classifyOverlays({ overlays, git, mainSha = 'origin/main' }) {
+export function classifyOverlays({ overlays, git, mainSha = 'origin/main', refEvidence }) {
   const call = (args, allowed = [0]) => {
     const r = git(args);
     if (!r || r.error || !allowed.includes(r.status)) throw new Error('git-unverifiable');
@@ -41,13 +42,17 @@ export function classifyOverlays({ overlays, git, mainSha = 'origin/main' }) {
   let main;
   try { main = rev(mainSha); } catch { /* every entry stays needed */ }
   const rows = overlays.map((overlay) => {
-    const row = { ref: overlay.ref, class: 'needed', reason: 'git-unverifiable', sha: null };
+    const row = { ref: overlay?.ref, class: 'needed', reason: 'git-unverifiable', sha: null };
     try {
-      if (!main || typeof overlay.ref !== 'string' || /[\s*?\[\\]/.test(overlay.ref)) return row;
+      if (!main || !isSafeBranchName(overlay?.ref)) return row;
+      const evidence = refEvidence?.get(overlay.ref);
+      if (refEvidence && !['refreshed', 'missing'].includes(evidence)) return row;
       const tracking = `refs/remotes/origin/${overlay.ref}`;
-      const refs = String(call(['for-each-ref', '--format=%(refname) %(objectname)', tracking]).stdout ?? '').trim().split('\n');
+      // A confirmed absence uses recorded evidence even if deleting the cached tracking ref failed.
+      const refs = evidence === 'missing' ? [] : String(call(['for-each-ref', '--format=%(refname) %(objectname)', tracking]).stdout ?? '').trim().split('\n');
       const remote = refs.find((line) => line.startsWith(`${tracking} `))?.split(' ')[1];
-      // Recorded commit fields are fallback evidence only when the remote-tracking branch is absent.
+      if (evidence === 'refreshed' && !remote) return row;
+      // Recorded commits are fallback evidence for absent branches, never for a failed refresh.
       const recorded = overlay.sha ?? overlay.headSha ?? overlay.tipSha;
       if (!remote && !SHA.test(recorded ?? '')) return row;
       row.sha = rev(remote || recorded);
@@ -90,14 +95,14 @@ export function classifyOverlays({ overlays, git, mainSha = 'origin/main' }) {
   return rows;
 }
 
-/** Best-effort retirement; list mutex guards both source identity and container presence. */
+/** Best-effort retirement; list mutex guards both source and container registration identities. */
 export async function autoRetireOverlays({
-  root, env = process.env, overlays, git, mainSha, now = Date.now,
+  root, env = process.env, overlays, git, mainSha, refEvidence, now = Date.now,
   removeOverlay = removeDefault, appendOverlayEvent = auditDefault, appendDaemonEvent = eventDefault,
 }) {
   const { mode, source } = resolveAutoRetireMode(env, { now });
   const result = { retired: [], wouldRetire: [], kept: [] };
-  const rows = classifyOverlays({ overlays, git, mainSha });
+  const rows = classifyOverlays({ overlays, git, mainSha, refEvidence });
   for (const row of rows) {
     if (mode === 'off' || row.class === 'needed') { result.kept.push(row); continue; }
     const event = { ref: row.ref, by: 'auto-retire', reason: row.reason, sha: row.sha };
@@ -108,8 +113,10 @@ export async function autoRetireOverlays({
         continue;
       }
       const removed = removeOverlay(root, row.ref, {
-        env, why: row.reason, expectedOverlay: overlays.find((o) => o.ref === row.ref),
-        ...(row.container ? { requireRef: row.container } : {}),
+        env, why: row.reason, expectedOverlay: overlays.find((o) => o?.ref === row.ref),
+        ...(row.container ? {
+          requireRef: row.container, expectedRequiredOverlay: overlays.find((o) => o?.ref === row.container),
+        } : {}),
       });
       if (!removed.removed) { result.kept.push(row); continue; }
       result.retired.push(row);
