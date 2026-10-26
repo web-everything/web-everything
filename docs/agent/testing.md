@@ -33,6 +33,9 @@ remain isolated as unavailable overlays. For native audit subprocess imports, co
 The `overlay-auto-retire-evidence` daemon soak reproduces explicit shadow, deleted remote branches in all modes,
 unavailable overlays beside healthy ones, repeated shadow ticks and container replacement using real disposable
 repositories. The soak registry discovers its module automatically.
+Plan-only soak probes must release any returned build lease and remove its active token before the next
+preparation, matching `rebuildClone` cleanup. A successful preparation otherwise leaves the next probe held
+as `rebuild-in-progress`, even when its overlay plan is healthy.
 Cherry records historical patch equivalence and omits merge commits. All patch-based retirement requires
 current whole-tree equivalence, even when every cherry line is negative. Regressions cover a cached landed
 tip advanced remotely, unique merge-resolution content, and an equivalent main patch subsequently reverted.

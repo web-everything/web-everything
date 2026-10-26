@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { prepareRebuild } from '../../../lib/daemon-rebuild/prepare.mjs';
+import { ACTIVE_BUILD_TOKENS, releaseBuildLease } from '../../../lib/daemon-rebuild/lease.mjs';
+import { readRebuildState, writeRebuildState } from '../../../lib/daemon-rebuild/state.mjs';
 import { overlayFilePath, readOverlayState, removeOverlay, writeOverlays } from '../../../lib/daemon-overlays.mjs';
 import { autoRetireOverlays } from '../../../lib/daemon-overlay-auto-retire.mjs';
 
@@ -44,6 +46,20 @@ export default {
       ok('add', file); ok('commit', '-qm', file);
       return ok('rev-parse', 'HEAD');
     };
+    const prepare = async (run = git) => {
+      const prepared = await prepareRebuild({ root, env, run, now: Date.now, mainOnly: false,
+        prState: async () => 'OPEN', prBaseChain: async () => [] });
+      // These probes stop at planning. Cancel their build leases before the next probe, as rebuildClone
+      // does on exit; otherwise a successful probe blocks the next one as rebuild-in-progress.
+      if (prepared.lease) {
+        try {
+          const state = readRebuildState(root, env);
+          releaseBuildLease(state, prepared.lease);
+          writeRebuildState(root, state, env);
+        } finally { ACTIVE_BUILD_TOKENS.delete(prepared.lease.token); }
+      }
+      return prepared;
+    };
     try {
       writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, '{}');
       ok('init', '-q', '-b', 'main');
@@ -69,8 +85,7 @@ export default {
       for (const mode of ['off', 'shadow', 'on']) {
         env.WE_DAEMON_OVERLAY_AUTO_RETIRE = mode;
         writeOverlays(root, overlays, { env });
-        const prepared = await prepareRebuild({ root, env, run: git, now: Date.now, mainOnly: false,
-          prState: async () => 'OPEN', prBaseChain: async () => [] });
+        const prepared = await prepare();
         if (prepared.result?.reason !== 'up-to-date') {
           violation('stale-registration-blocks-main', `${mode}: deleted landed registration blocked preparation (${prepared.result?.reason})`);
         }
@@ -87,9 +102,8 @@ export default {
       ok('update-ref', 'refs/remotes/origin/feature', initial);
       const uncertain = [{ ref: 'feature', sha: initial }];
       writeOverlays(root, uncertain, { env });
-      const held = await prepareRebuild({ root, env, run: (args) => args[0] === 'fetch' && args.some((arg) => arg.includes('refs/heads/feature:'))
-        ? { status: 1, stderr: 'transient fetch error' } : git(args), now: Date.now, mainOnly: false,
-        prState: async () => 'OPEN', prBaseChain: async () => [] });
+      const held = await prepare((args) => args[0] === 'fetch' && args.some((arg) => arg.includes('refs/heads/feature:'))
+        ? { status: 1, stderr: 'transient fetch error' } : git(args));
       if (held.result?.reason !== 'up-to-date' || held.result?.plan?.decisions.length
         || !readOverlayState(root, { env }).overlays.some((o) => o.ref === 'feature')) {
         violation('failed-fetch-lost-registration', 'an unconfirmed overlay blocked main, used a cached tip or lost its registration');
@@ -115,8 +129,7 @@ export default {
       ok('push', '-q', 'origin', `${lower}:refs/heads/lower`);
       ok('checkout', '-q', 'main');
       writeOverlays(root, stack, { env });
-      const available = await prepareRebuild({ root, env, run: git, now: Date.now, mainOnly: false,
-        prState: async () => 'OPEN', prBaseChain: async () => [] });
+      const available = await prepare();
       if (available.terminal || available.plan?.applied.map((o) => o.ref).join(',') !== 'lower'
         || !readOverlayState(root, { env }).overlays.some((o) => o.ref === 'lower')) {
         violation('missing-container-lost-available-source', 'a missing recorded top retired the refreshed lower overlay out of the rebuild');
@@ -127,11 +140,10 @@ export default {
       ok('reset', '--hard', initial);
       const stale = [{ ref: 'missing-no-sha' }, { ref: 'unsafe@name' }, { ref: 'feature' }];
       writeOverlays(root, stale, { env });
-      const healthy = await prepareRebuild({ root, env, run: git, now: Date.now, mainOnly: false,
-        prState: async () => 'OPEN', prBaseChain: async () => [] });
+      const healthy = await prepare();
       if (healthy.terminal || healthy.plan?.mainSha !== nextMain || healthy.plan?.applied.map((o) => o.ref).join(',') !== 'feature'
         || readOverlayState(root, { env }).overlays.length !== stale.length) {
-        violation('single-stale-registration-blocks-healthy-overlay', 'a deleted no-sha or unsafe registration stopped the healthy overlay plan');
+        violation('single-stale-registration-blocks-healthy-overlay', `a deleted no-sha or unsafe registration stopped the healthy overlay plan (${healthy.result?.reason ?? 'non-terminal plan'})`);
       }
     } catch (error) { violation('crash', String(error?.message ?? error)); }
     finally { rmSync(root, { recursive: true, force: true }); }
