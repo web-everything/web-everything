@@ -11,7 +11,7 @@ import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly, redTeamPanelSeatOwed } from './review-red-team-policy.mjs';
 import { readRedTeamProbes } from './red-team-gate.mjs';
 import { completedRedTeamSeat } from './red-team-run-result.mjs';
-import { readRedTeamCarry } from './red-team-carry-machine.mjs';
+import { readRedTeamCarry, eligibleRedTeamCarryPayload } from './red-team-carry-machine.mjs';
 import { readFilteredInOrder } from './stream-filter-runs.mjs';
 
 export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDir(env)), 'red-team-status');
@@ -81,7 +81,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   // One scorecard read for this whole call, shared with the saved-result check below (xwu9oxh S2, per operation).
   // An injected reader keeps the saved-result check on its own fresh read, as before.
   const scorecardSnapshot = readScorecards === undefined ? scorecardOperationSnapshot(resolveScorecardStorePath(env)) : undefined;
-  const rows = readScorecards === undefined ? snapshotStoreRecords(scorecardSnapshot) : readScorecards();
+  const rows = readScorecards === undefined ? snapshotStoreRecords(scorecardSnapshot, { strict: true }) : readScorecards();
   const recorded = rows.some(row => row?.dispatchKind === 'review-seat' && row.seat === 'red-team'
     && sameRepo(row.repo, repo) && Number(row.pr) === Number(pr) && String(row.rev ?? '').toLowerCase() === head);
   let attempted = attemptedRedTeamRun(rows, { repo, pr, head });
@@ -124,7 +124,9 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   // Carry identities retain the writer's casing; both lookups keep the journal's strict validation.
   const carry = readRedTeamCarry({ repo, pr, head, env })
     ?? (originalHead !== head ? readRedTeamCarry({ repo, pr, head: originalHead, env }) : null);
-  const carriedFrom = carry?.loopPayload.carriedFrom ?? status?.loopPayload?.carriedFrom;
+  const carriedFrom = carry?.loopPayload.carriedFrom
+    ?? (matchingStatus && eligibleRedTeamCarryPayload(status.loopPayload, status.head)
+      ? status.loopPayload.carriedFrom : undefined);
   if (carriedFrom) {
     const latest = latestRun(false).run;
     const laterPanel = latest && String(latest.findings?.read?.netBasis?.rev ?? '').toLowerCase() !== String(carriedFrom).toLowerCase();

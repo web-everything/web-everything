@@ -21,6 +21,60 @@ function fixture() {
   return { io, payload };
 }
 describe('drain request through the review job red-team path', () => {
+  function admissionFixture({ failedSeatCount = 1, retryCount } = {}) {
+    const f = fixture();
+    const prior = { repo: request.repo, pr: request.pr, head: request.head,
+      loopPayload: f.payload, status: 'finished', result: 'ran',
+      ...(retryCount === undefined ? {} : { retryCount }) };
+    let stored = prior;
+    const writeStatus = vi.fn(input => { stored = { ...input, head: request.head, pid: process.pid }; });
+    const production = createReviewJobIo({
+      env: { WE_RED_TEAM_TIMING: 'post-accept', WE_RED_TEAM_STATUS_LABELS: '0' },
+      readStatus: () => stored, writeStatus,
+      readEvidence: () => ({ inFlight: false, queued: false, seatRecorded: true,
+        completedRecorded: false, failedSeatCount }),
+    });
+    f.io.redTeamStatus = vi.fn(production.redTeamStatus);
+    return { ...f, prior, writeStatus };
+  }
+
+  it('queues fresh drain requests with prior admission evidence', () => {
+    const { io, prior, writeStatus } = admissionFixture();
+    const out = runReviewJob({ ...request, drainRedTeamRequest: request }, io);
+    expect(out).toMatchObject({ outcome: 'ran' });
+    expect(io.redTeamStatus).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      status: 'queued', redTeamMode: 'fresh', preflightFresh: true,
+    }));
+    expect(writeStatus).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      status: 'queued', redTeamMode: 'fresh', result: 'ran', retryCount: 1,
+    }), expect.any(Object));
+    expect(io.runRedTeam).toHaveBeenCalledTimes(1);
+    expect(io.runRedTeam).toHaveBeenCalledWith(expect.objectContaining({
+      redTeamMode: 'fresh', loopPayload: prior.loopPayload,
+      redTeamAdmission: { pid: process.pid, prior: {
+        repo: prior.repo, pr: prior.pr, head: prior.head, status: 'finished', result: 'ran',
+      } },
+    }));
+    expect(writeStatus.mock.invocationCallOrder[0]).toBeLessThan(io.runRedTeam.mock.invocationCallOrder[0]);
+  });
+
+  it.each([
+    { failedSeatCount: 2 },
+    { failedSeatCount: 1, retryCount: 1 },
+    { failedSeatCount: 2, retryCount: 1 },
+  ])('refuses exhausted retries before spawning: %j', history => {
+    const { io, writeStatus } = admissionFixture(history);
+    const out = runReviewJob({ ...request, drainRedTeamRequest: request }, io);
+    expect(out).toMatchObject({ refused: true, outcome: 'refused-red-team-admission',
+      label: expect.stringContaining('inspect stored evidence before retrying') });
+    expect(io.runRedTeam).not.toHaveBeenCalled();
+    expect(writeStatus).not.toHaveBeenCalled();
+    expect(io.recordSavedRedTeamResult).not.toHaveBeenCalled();
+    expect(io.finishDrainRedTeamRequest).not.toHaveBeenCalled();
+    expect(io.releaseLane).toHaveBeenCalledOnce();
+    expect(io.unclaim).toHaveBeenCalledOnce();
+  });
+
   it('uses the existing exact-head review and finishes only after saving provenance', () => {
     const { io, payload } = fixture();
     runReviewJob({ ...request, drainRedTeamRequest: request }, io);

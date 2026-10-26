@@ -38,8 +38,13 @@ export function runDrainRedTeamJob({ pr, repo, drainRedTeamRequest: request, pre
     if (!lanePath) return result({ outcome: 'deferred-no-lane' });
     io.updateRecord?.({ ...record, cwd: lanePath, actorId });
     if (!ready()) return result({ outcome: 'deferred' });
-    const input = { pr: planned.pr, repo: planned.repo, lanePath, loopPayload, slug };
-    io.redTeamStatus?.({ ...input, status: 'running' });
+    let input = { pr: planned.pr, repo: planned.repo, lanePath, loopPayload, slug, redTeamMode: 'fresh' };
+    try {
+      const queued = io.redTeamStatus?.({ ...input, status: 'queued', preflightFresh: true });
+      if (queued?.redTeamAdmission) input = { ...input, redTeamAdmission: queued.redTeamAdmission };
+    } catch (error) {
+      return result({ refused: true, outcome: 'refused-red-team-admission', label: error.message });
+    }
     const redTeam = io.runRedTeam(input);
     if (['ran', 'resumed', 'already-ran'].includes(redTeam?.status) && redTeam.callId) {
       // The existing writer checks the persisted seat and run identity before minting provenance.

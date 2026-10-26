@@ -28,11 +28,18 @@ export function scorecardOperationSnapshot(path) {
 }
 
 /**
- * `readStore({ path }).records` from a snapshot: any read or parse failure, or a value without a `records`
- * array, is an empty history, as `readStore` degrades.
+ * Accounting retains readStore's empty-history fallback. Admission opts into strict
+ * reading: unreadable evidence must never restore a spent retry allowance.
  */
-export function snapshotStoreRecords(snapshot) {
+export function snapshotStoreRecords(snapshot, { strict = false } = {}) {
   const r = snapshot.read();
-  if (!r.ok || 'parseError' in r) return [];
-  return r.value && Array.isArray(r.value.records) ? r.value.records : [];
+  if (!r.ok) {
+    if (!strict || r.error?.code === 'ENOENT') return [];
+    throw new Error('saved red-team evidence unreadable', { cause: r.error });
+  }
+  if ('parseError' in r || !Array.isArray(r.value?.records)) {
+    if (!strict) return [];
+    throw new Error('saved red-team evidence malformed');
+  }
+  return r.value.records;
 }

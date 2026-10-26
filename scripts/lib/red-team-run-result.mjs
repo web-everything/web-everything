@@ -28,3 +28,11 @@ export function failedRedTeamRetry(status, { failedSeatCount, completedRecorded 
     && completedRecorded === false && failedSeatCount === 1
     && (result?.comment?.status ?? result?.comment) !== 'posted';
 }
+
+/** The job preflight and shared runner enforce the same fresh-seat history bound. */
+export function freshRedTeamRefusal(status, evidence) {
+  if (failedRedTeamRetry(status, evidence)) return null;
+  if (status != null && !redTeamStatusWithoutRun(status)) return 'prior red-team status; not re-run';
+  if (evidence.seatRecorded) return 'prior red-team seat row; not re-run';
+  return null;
+}

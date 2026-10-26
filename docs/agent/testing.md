@@ -135,6 +135,22 @@ success. Failures remain open for retry. No operator command or operation is add
 Focused coverage: `review-job-drain-red-team.test.mjs`, `review-job.test.mjs` and
 `skills-src/conveyor/__tests__/review-daemon.test.mjs`.
 
+Drain requests queue with `redTeamMode: fresh` and pass the queued admission's prior
+evidence to the runner. Their preflight shares the runner's failed-seat bound and
+refuses spent retries before spawning it. Scorecard admission reads remain strict
+when saved-result reuse is disabled; only ENOENT means absent history. Compatibility
+status carry metadata must match repo/PR/head and the carry journal's payload validator
+before it participates in carry conflict detection.
+Named defenses: **queues fresh drain requests with prior admission evidence** and
+**refuses exhausted retries before spawning** in `review-job-drain-red-team.test.mjs`
+assert queued mode/prior, retry spend, effect order and zero runner calls on refusal.
+Refusal cases separately pin two failed seats without a retry marker, one failed seat
+with a spent retry, and both conditions together.
+**rejects unreadable scorecards with saved reuse disabled**, **treats only ENOENT as
+absent history**, and **ignores compatibility carry metadata with mismatched identity
+or invalid payload** in `drain-red-team-evidence.test.mjs` cover read/parse/shape failures,
+missing versus unreadable stores, and rejected carry conflicts with a valid mixed-case control.
+
 Shared seat policy must not import `review-pr.mjs`: label acceptance reads that
 policy, while the operation loads the label/stack/merge graph. Vitest can wait
 indefinitely on that circular graph before collecting any tests. Keep the shared
@@ -154,6 +170,10 @@ and send-back effects retain the existing acceptance predicate.
 Missing/unrun seat evidence on a reviewed head stays held in drain beyond the pending
 deadline; it cannot use the never-scheduled escape or trigger a second post-accept pass.
 The focused timing, review-seat and drain-seat suites cover this boundary.
+`review-red-team-policy.test.mjs` names the pinned card-only exemption with
+`skipCardOnly` at its default, explicitly enabled and explicitly disabled, alongside
+pinned code-head controls for all three settings. These cases exercise the real
+policy cascade with isolated optional layers and assert the setting's source.
 
 
 ## Paused prevention filing obligations

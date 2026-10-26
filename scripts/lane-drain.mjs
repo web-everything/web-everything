@@ -1230,7 +1230,7 @@ export function numberPendingHashes(CWD, { dryRun = false, minNext = 1 } = {}) {
   const identitySetting = resolveNumberingCommitIdentitySetting();
   const identityArgs = numberingCommitIdentityArgs(CWD, { setting: identitySetting });
   process.stderr.write(`policy · drain.numberingCommitIdentity=${identitySetting.value} (${identitySetting.source})${identityArgs.length ? ` → ${identityArgs[0].slice(9)}` : ''}\n`);
-  const committed = quietGit(CWD, ['commit', ...identityArgs, '-m', assertNoClosingKeywordRef(`drain: JIT-number ${summary} at land (#2288)`, 'JIT-number commit message'), '--', ...paths]) != null;
+  const committed = quietGit(CWD, ['commit', '-m', assertNoClosingKeywordRef(`drain: JIT-number ${summary} at land (#2288)`, 'JIT-number commit message'), ...identityArgs, '--', ...paths]) != null;
   if (committed && identityArgs.length && quietGit(CWD, ['log', '-1', '--format=%an <%ae>']) !== identityArgs[0].slice(9))
     process.stderr.write(`  ⚠ drain.numberingCommitIdentity: the numbering commit's author is not ${identityArgs[0].slice(9)} — CI may not trust it\n`);
   return finish({ assigned, held, committed, unresolvedReferences, droppedDuplicates: dupDropped, renamed: [...renames, ...livePathRenames].map((r) => r.to), changedPaths: paths });

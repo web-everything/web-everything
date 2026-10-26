@@ -4591,8 +4591,9 @@ async function runCli() {
   const onlyPr = flags.only != null ? String(flags.only) : (flags.couple != null ? String(flags.couple) : (flags.pr != null ? String(flags.pr) : null));
   const fastDrain = onlyPr != null ? resolveFastDrainScopeSetting() : { scope: 'full' };
   if (onlyPr != null) process.stderr.write(`${fastDrain.line}\n`);
-  const fastDrainListing = onlyPr != null ? resolveFastDrainListingSetting() : { listing: 'live' };
-  const listingSnapshot = onlyPr != null && fastDrainListing.listing !== 'live' && typeof flags['listing-snapshot'] === 'string' ? flags['listing-snapshot'] : null;
+  const fastDrainListing = { ...(onlyPr != null ? resolveFastDrainListingSetting() : { listing: 'live' }),
+    snapshotPath: onlyPr != null && typeof flags['listing-snapshot'] === 'string' ? flags['listing-snapshot'] : null };
+  const listingSnapshot = fastDrainListing.listing !== 'live' ? fastDrainListing.snapshotPath : null;
   if (onlyPr != null) process.stderr.write(`${fastDrainListing.line}\n`);
   // #2683 — the target repo for `--only=<pr>`. PR numbers are per-repo (WE #12 ≠ FUI #12), so a bare `--only=12`
   // on the DEFAULT constellation scope would match a same-numbered PR in EVERY repo. `--only-repo=<slug>` names
@@ -5333,7 +5334,8 @@ async function runCli() {
     try {
       const slug = repo || localSlug;
       let listed = {};
-      const roundPath = listingSnapshot && isFastDrainTarget(repo, { number: onlyPr }) ? listingSnapshot : null;
+      const roundPath = fastDrainListing.listing !== 'live' && fastDrainListing.snapshotPath
+        && isFastDrainTarget(repo, { number: onlyPr }) ? fastDrainListing.snapshotPath : null;
       const fields = RECONCILE ? SWEEP_LIST_FIELDS
         : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '');
       const readTarget = () => __t.timeAsync('listing.target', async () => {
@@ -6889,6 +6891,8 @@ async function runCli() {
   // fresh full classification the cascade runs per candidate before enqueue (`revalidateFresh`: CI/CodeQL,
   // review:held-mechanical, labels, mergeability, pinned head). Returns Map num → admitted head; a refusal or read
   // error leaves the PR out (form() refuses any member not in the map at its own head).
+  const revalidateCandidate = (candidate, options) => revalidateFresh(candidate.repo, candidate.num, {
+    ...options, queueRequiredChecks: queueRequiredChecksOf(candidate.repo) });
   const cardGroupAdmission = async (pool) => {
     const admitted = new Map();
     const cands = pool.filter(v => isLocalRepo(v.repo) && v.listedFilesComplete === true && Array.isArray(v.listedFiles) && v.listedFiles.length
@@ -6898,7 +6902,7 @@ async function runCli() {
       try {
         const hold = await preEnqueueHold(c, { forGroup: true });
         if (hold) { process.stderr.write(`  card-group: #${c.num} not admitted (${hold.kind}: ${hold.reason})\n`); continue; }
-        const r = await revalidateFresh(c.repo, c.num, { queueRequiredChecks: queueRequiredChecksOf(c.repo), requiredCheck: REQUIRED,
+        const r = await revalidateCandidate(c, { requiredCheck: REQUIRED,
           allowPendingReview: false, defaultBranch: defaultBranchOf(c.repo), expectedHeadSha: head });
         if (r.decision !== 'merge') { process.stderr.write(`  card-group: #${c.num} ${r.status ? `left out — ${r.status}` : 'not admitted'} (fresh re-read: ${r.reason})\n`); continue; }
         admitted.set(Number(c.num), r.headSha || head);
@@ -7156,7 +7160,7 @@ async function runCli() {
           // (review gate included) actually judged; a push since then refuses the merge instead of landing an
           // unjudged head under a still-present `review:accepted` label. `revalidated.headSha` is that pinned SHA.
           const reliefAllowsPendingNow = (escalationRelief.prs || []).includes(Number(c.num)) || (!!escalationRelief.passWide && !!label);
-          const revalidated = await revalidateFresh(c.repo, c.num, {
+          const revalidated = await revalidateCandidate(c, {
             queueRequiredChecks: queueRequiredChecksOf(c.repo),
             requiredCheck: REQUIRED, allowPendingReview: reliefAllowsPendingNow, defaultBranch: defaultBranchOf(c.repo),
             expectedHeadSha: c.listedHeadSha || c.headSha || null,

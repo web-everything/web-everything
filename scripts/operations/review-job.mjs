@@ -99,7 +99,7 @@ import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, bu
 import { liveResultGateState, redTeamForHead, readRedTeamTiming, readRedTeamProbes, readConfirmedBreaks, planRedTeamActions, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
 import { normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
-import { failedRedTeamRetry, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
+import { failedRedTeamRetry, freshRedTeamRefusal, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../lib/red-team-carry-io.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
@@ -394,12 +394,21 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           // separately requires the stored read's netBasis.rev to equal status.head.
           // A null result is eligible only when normalized from the original queued
           // writer above. An ordinary finished/null prior must reach the guard intact.
-          const retry = input.redTeamMode === 'fresh' && failedRedTeamRetry(admissionPrior, readEvidence(key));
+          const evidence = input.redTeamMode === 'fresh' ? readEvidence(key) : undefined;
+          const retry = input.redTeamMode === 'fresh' && failedRedTeamRetry(admissionPrior, evidence);
           if (input.redTeamMode === 'fresh'
             && (admissionPrior?.retryCount === undefined || admissionPrior.retryCount === 0)
             && !retry
             && (redTeamSkipNeedsSettlement(admissionPrior)
             || redTeamStatusWithoutRun(admissionPrior, { originalStatus: prior }))) admissionPrior = null;
+          if (input.preflightFresh === true) {
+            if (input.redTeamMode !== 'fresh' || !Number.isSafeInteger(evidence?.failedSeatCount)
+              || typeof evidence.completedRecorded !== 'boolean' || typeof evidence.seatRecorded !== 'boolean') {
+              throw Error('red-team admission evidence unreadable; inspect stored evidence before retrying');
+            }
+            const refusal = freshRedTeamRefusal(admissionPrior, evidence);
+            if (refusal) throw Error(`${refusal}; inspect stored evidence before retrying`);
+          }
           if (['ran', 'resumed'].includes(normalizeRedTeamResult(admissionPrior?.result).priorResult)) priorResult = admissionPrior.result;
           input = { ...input, result: priorResult, ...(retry ? { retryCount: 1 } : {}) };
         }
@@ -949,7 +958,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
 /** One settlement path for panel and post-accept timing: malformed or unpublished outcomes retain recovery evidence. */
 function completeJobRedTeam({ out, seatsBox, redTeam, io, recordSeats, accepted, spec }) {
   let redTeamCompletionDeferredByCap = false;
-  if (redTeam !== undefined) {
+  if (redTeam !== undefined || (accepted && typeof io.runRedTeam === 'function')) {
     // Diagnostic formatting must never prevent settlement, the finished write or the gate.
     // String coercion can itself throw for malformed JSON objects such as { toString: null }.
     const diagnosticText = (value, fallback) => {
@@ -977,7 +986,10 @@ function completeJobRedTeam({ out, seatsBox, redTeam, io, recordSeats, accepted,
       // A stored review run is not evidence of an unpublished red-team run.
       const reviewOnly = completed && !deferred && reviewOnlyRedTeamResult(redTeam);
       let wellFormed = false;
-      try { out.redTeam = summarizeRedTeam(redTeam); wellFormed = true; }
+      try {
+        const summary = summarizeRedTeam(redTeam);
+        if (summary) { out.redTeam = summary; wellFormed = true; }
+      }
       catch { /* malformed findings must not suppress settlement or erase retry evidence */ }
       attestSavedRedTeam(io, out.runId, seatsBox.input, redTeam);
       recordSeats(redTeam?.seat ? [redTeam.seat] : []);
@@ -1029,7 +1041,9 @@ function completeJobRedTeam({ out, seatsBox, redTeam, io, recordSeats, accepted,
           ? seatsBox.priorRedTeamResult : out.redTeam?.status === 'skipped'
             ? { status: 'skipped', ...(out.redTeam.policy === 'card-only' ? { policy: 'card-only' } : {}) }
             : out.redTeam?.status === 'disabled' ? 'disabled'
-              : seatsBox.input.redTeamMode === undefined ? out.redTeam : out.redTeam?.status ?? null;
+              : seatsBox.panelSeat || (seatsBox.input.redTeamMode === undefined
+                && ['ran', 'resumed'].includes(out.redTeam?.status) && out.redTeam?.comment != null)
+                ? out.redTeam : out.redTeam?.status ?? null;
       io.redTeamStatus?.({ ...seatsBox.input, status: guardDeferred && prior ? prior.status : 'finished', result });
     }
   }

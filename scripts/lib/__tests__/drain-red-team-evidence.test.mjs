@@ -88,9 +88,76 @@ describe('invalid status carry cannot suppress failed-seat recovery', () => {
     writeFileSync(path, JSON.stringify(invalidStatus(f, loopPayload, { repo: 'foreign/repository' })));
     expect(eligible(), 'foreign invalid carry must not suppress the drain consumer request').toEqual(absent);
   });
+
+  it('ignores compatibility carry metadata with mismatched identity or invalid payload', () => {
+    const { f, path, loopPayload } = failedSeatFixture();
+    const absent = readDrainRedTeamEvidence(f);
+    const status = invalidStatus(f, loopPayload);
+    status.loopPayload.carriedFrom = 'a'.repeat(40);
+    const variants = [
+      { ...status, repo: 'foreign/repository' },
+      { ...status, pr: f.pr + 1 },
+      { ...status, head: 'c'.repeat(40) },
+      { ...status, loopPayload: { ...status.loopPayload, carriedFrom: 'not-a-sha' } },
+      { ...status, loopPayload: { ...status.loopPayload, carriedFrom: 'g'.repeat(40) } },
+      { ...status, loopPayload: { ...status.loopPayload, findings: { read: { netBasis: { rev: 'c'.repeat(40) } } } } },
+    ];
+    variants.forEach(candidate => {
+      writeFileSync(path, JSON.stringify(candidate));
+      const evidence = readDrainRedTeamEvidence(f);
+      expect(evidence.carryConflict, JSON.stringify(candidate)).toBeUndefined();
+      expect(evidence).toMatchObject({ scheduled: true, noUsableResult: true, failedSeatCount: 1 });
+      if (candidate.repo !== f.repo || candidate.pr !== f.pr || candidate.head !== f.head) expect(evidence).toEqual(absent);
+    });
+    // Valid provenance still participates, with case-insensitive repo/head identity.
+    writeFileSync(path, JSON.stringify({ ...status, repo: f.repo.toUpperCase(), head: f.head.toUpperCase(),
+      loopPayload: { ...status.loopPayload, findings: { ...status.loopPayload.findings,
+        read: { ...status.loopPayload.findings.read, netBasis: { rev: f.head.toUpperCase() } } } } }));
+    expect(readDrainRedTeamEvidence(f)).toMatchObject({ carryConflict: true, noUsableResult: false });
+  });
 });
 
 describe('scorecard read failures stay closed with saved-result reading disabled', () => {
+  it.each(['EIO', 'EACCES', 'parse failure', 'missing records'])(
+    'rejects unreadable scorecards with saved reuse disabled (%s)', fault => {
+      const f = fixture();
+      f.readScorecards = undefined;
+      f.env.WE_RED_TEAM_DRAIN_READS_SAVED_RESULT = 'off';
+      const path = resolveScorecardStorePath(f.env);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, fault === 'parse failure' ? '{truncated'
+        : JSON.stringify(fault === 'missing records' ? {} : { records: [] }));
+      const actualRead = vi.mocked(readFileSync).getMockImplementation();
+      vi.mocked(readFileSync).mockImplementation((file, ...args) => {
+        if (file === path && ['EIO', 'EACCES'].includes(fault)) throw Object.assign(Error('injected read failure'), { code: fault });
+        return actualRead(file, ...args);
+      });
+      try {
+        expect(() => readDrainRedTeamEvidence(f)).toThrow(/saved red-team evidence (unreadable|malformed)/);
+        expect(readFileSync).toHaveBeenCalledWith(path, 'utf8');
+      } finally { vi.mocked(readFileSync).mockImplementation(actualRead); }
+    });
+
+  it('treats only ENOENT as absent history', () => {
+    const f = fixture();
+    f.readScorecards = undefined;
+    f.env.WE_RED_TEAM_DRAIN_READS_SAVED_RESULT = 'off';
+    const path = resolveScorecardStorePath(f.env);
+    const actualRead = vi.mocked(readFileSync).getMockImplementation();
+    let code = 'ENOENT';
+    vi.mocked(readFileSync).mockImplementation((file, ...args) => {
+      if (file === path) throw Object.assign(Error('injected missing/unreadable store'), { code });
+      return actualRead(file, ...args);
+    });
+    try {
+      expect(readDrainRedTeamEvidence(f)).toMatchObject({ attempted: false, recorded: false,
+        scheduled: false, noUsableResult: true, failedSeatCount: 0 });
+      expect(readFileSync).toHaveBeenCalledWith(path, 'utf8');
+      code = 'EIO';
+      expect(() => readDrainRedTeamEvidence(f)).toThrow('saved red-team evidence unreadable');
+    } finally { vi.mocked(readFileSync).mockImplementation(actualRead); }
+  });
+
   it.each(['EIO', 'parse failure'])('refuses %s instead of returning an empty failed-seat history', fault => {
     const f = fixture();
     f.readScorecards = undefined;

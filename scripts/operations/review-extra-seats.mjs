@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { recordRedTeamStatus, readRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
 import { normalizeRedTeamResult } from '../lib/review-red-team-on-skip.mjs';
-import { failedRedTeamRetry, completedRedTeamSeat, redTeamStatusWithoutRun } from '../lib/red-team-run-result.mjs';
+import { failedRedTeamRetry, completedRedTeamSeat, freshRedTeamRefusal } from '../lib/red-team-run-result.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { execRead } from '../lib/proc-read.mjs';
 import { readSnapshotPrView } from '../lib/review-pr-snapshot.mjs';
@@ -1465,8 +1465,9 @@ function redTeamRecoveryGuard({ pr, repo, head, redTeamMode, redTeamAdmission },
       && Number(row.pr) === Number(pr) && row.rev === head);
     const retry = failedRedTeamRetry(status, { failedSeatCount: rows.filter(row => !completedRedTeamSeat(row)).length,
       completedRecorded: rows.some(completedRedTeamSeat) });
-    if (!retry && status != null && !redTeamStatusWithoutRun(status)) return refuse('prior red-team status; not re-run');
-    if (!retry && rows.length > 0) return refuse('prior red-team seat row; not re-run');
+    const refusal = freshRedTeamRefusal(status, { failedSeatCount: rows.filter(row => !completedRedTeamSeat(row)).length,
+      completedRecorded: rows.some(completedRedTeamSeat), seatRecorded: rows.length > 0 });
+    if (refusal) return refuse(refusal);
     if (retry) {
       // Spend before any provider work. A missing seat row can never restore this allowance.
       try {

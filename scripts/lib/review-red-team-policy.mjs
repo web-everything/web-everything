@@ -1,4 +1,4 @@
-import { readRedTeamTiming } from './red-team-gate.mjs';
+import { readRedTeamTiming, readRedTeamProbes } from './red-team-gate.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 /** Shared scheduling policy; importing it never loads a review dispatcher or CLI. */
 import { redTeamRequired, VERDICTS } from './jury-core.mjs';
@@ -55,10 +55,11 @@ export function redTeamOwedForAcceptedPr(loopPayload) {
 }
 
 
-/** A pinned reviewed head owes the panel seat regardless of the panel verdict. */
+/** A pinned reviewed head owes the panel seat regardless of verdict, retaining the card-only exemption. */
 export function redTeamPanelSeatOwed(loopPayload, env = process.env) {
   return readRedTeamTiming({ env }).value.timing === 'panel-seat'
-    && /^[a-f0-9]{40}$/i.test(loopPayload?.findings?.read?.netBasis?.rev ?? '');
+    && /^[a-f0-9]{40}$/i.test(loopPayload?.findings?.read?.netBasis?.rev ?? '')
+    && !(readRedTeamProbes({ env }).value.skipCardOnly && redTeamCardOnly(loopPayload?.findings?.read));
 }
 
 /** Net diff includes rename/copy sources; unknown paths cannot justify skipping. */
