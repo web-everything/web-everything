@@ -1,6 +1,5 @@
 ---
 kind: epic
-size: 13
 status: open
 scope: ["we:scripts/conveyor/"]
 dateOpened: "2026-10-26"
