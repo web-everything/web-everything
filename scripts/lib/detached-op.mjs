@@ -9,7 +9,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { pidIdentity } from './pid-alive.mjs';
+import { pidIdentity, pidIdentityStamp } from './pid-alive.mjs';
 import { writeLineSync } from './write-all-sync.mjs';
 
 export const resolveDetachedOpsDir = (env = process.env) => env.DETACHED_OPS_DIR
@@ -40,12 +40,13 @@ function writeRecord(path, record) {
   writeFileSync(tmp, `${JSON.stringify(record)}\n`, { mode: 0o600 });
   renameSync(tmp, path);
 }
-function alive(pid) {
+function alive(pid, { runnerStart = null, runnerArgv = null } = {}) {
   try { process.kill(pid, 0); }
   catch (error) { if (error.code === 'ESRCH') return false; if (error.code !== 'EPERM') throw error; }
-  // Signal zero also succeeds for unreaped zombies. Require positive death
-  // evidence; an unreadable identity must not mark a potentially live runner dead.
-  return pidIdentity(pid).alive !== false;
+  // Signal zero also succeeds for unreaped zombies and for a pid reused by an unrelated
+  // process. Require positive death evidence (zombie, gone, or a birth-stamp mismatch);
+  // an unreadable identity must not mark a potentially live runner dead.
+  return pidIdentity(pid, { expectStart: runnerStart, expectArgv: runnerArgv }).alive !== false;
 }
 function tail(path) {
   let fd;
@@ -79,6 +80,8 @@ export async function startDetachedOp({ argv, kind, dir = resolveDetachedOpsDir(
       { detached: true, stdio: ['ignore', ...fds], env: childEnv });
     if (child.once) await new Promise((done, reject) => { child.once('spawn', done); child.once('error', reject); });
     record.pid = child.pid;
+    // Birth stamp lets waiters tell the runner from a later process that reuses its pid.
+    Object.assign(record, pidIdentityStamp(child.pid));
     writeRecord(path, record);
     child.unref();
     return record;
@@ -95,6 +98,7 @@ export async function waitForOp({ id, maxWaitMs = 540000, dir = resolveDetachedO
       if (record.id !== id || !['running', 'done', 'failed'].includes(record.status)
         || !Number.isInteger(record.pid) || record.pid <= 0
         || typeof record.stdoutPath !== 'string' || typeof record.stderrPath !== 'string'
+        || ![record.runnerStart, record.runnerArgv].every(v => v === undefined || v === null || typeof v === 'string')
         || (record.status === 'running' && record.exitCode !== null)
         || (record.status === 'done' && record.exitCode !== 0)
         || (record.status === 'failed' && (!Number.isInteger(record.exitCode) || record.exitCode <= 0))) {
@@ -104,7 +108,7 @@ export async function waitForOp({ id, maxWaitMs = 540000, dir = resolveDetachedO
     const result = { ...record, stdoutTail: tail(record.stdoutPath), stderrTail: tail(record.stderrPath) };
     if (record.status !== 'running') return { ...result, code: record.status === 'done' ? 0 : 1 };
     if (deadRunnerObserved) return { ...result, status: 'failed', code: 1, reason: 'runner-died' };
-    if (!isAlive(record.pid)) {
+    if (!isAlive(record.pid, record)) {
       // The runner publishes its terminal record before exiting. Re-read and
       // validate it once before classifying a stale running snapshot as runner-died.
       deadRunnerObserved = true;

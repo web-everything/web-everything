@@ -135,7 +135,7 @@ describe('detached operation lifecycle', () => {
     });
     expect(clock.now()).toBe(250);
     expect(clock.sleep).toHaveBeenCalled();
-    expect(isAlive).toHaveBeenCalledWith(record.pid);
+    expect(isAlive).toHaveBeenCalledWith(record.pid, expect.objectContaining({ id: record.id }));
     expect(JSON.parse(readFileSync(join(dir, `${record.id}.json`), 'utf8'))).toEqual(record);
   });
 
@@ -161,7 +161,7 @@ describe('detached operation lifecycle', () => {
     const isAlive = vi.fn(() => false);
     expect(await waitForOp({ id: record.id, maxWaitMs: 250, dir, ...clock, isAlive }))
       .toMatchObject({ id: record.id, status: 'failed', code: 1, reason: 'runner-died' });
-    expect(isAlive).toHaveBeenCalledWith(record.pid);
+    expect(isAlive).toHaveBeenCalledWith(record.pid, expect.objectContaining({ id: record.id }));
     expect(clock.sleep).not.toHaveBeenCalled();
   });
 
@@ -176,7 +176,7 @@ describe('detached operation lifecycle', () => {
       expect(result).toMatchObject(code === 1
         ? { status: 'failed', code: 1, reason: 'runner-died' }
         : { status: 'running', code: 75 });
-      expect(identity).toHaveBeenCalledWith(record.pid);
+      expect(identity).toHaveBeenCalledWith(record.pid, { expectStart: null, expectArgv: null });
       if (code === 1) expect(clock.sleep).not.toHaveBeenCalled();
     } finally {
       identity.mockRestore();
@@ -192,10 +192,49 @@ describe('detached operation lifecycle', () => {
     try {
       const result = await waitForOp({ id: record.id, maxWaitMs: 250, dir, ...fakeClock() });
       expect(result.code).toBe(alive === false ? 1 : 75);
-      expect(identity).toHaveBeenCalledWith(record.pid);
+      expect(identity).toHaveBeenCalledWith(record.pid, { expectStart: null, expectArgv: null });
     } finally {
       kill.mockRestore();
       identity.mockRestore();
+    }
+  });
+
+  it('reports runner-died when the recorded pid was reused by an unrelated live process', async () => {
+    // Reproduces the PID-reuse break: the pid answers signal zero, but its birth stamp differs from the runner's.
+    const record = writeRecord({ pid: process.pid, runnerStart: 'Sat Jan  1 00:00:00 2000', runnerArgv: 'detached-op.mjs --run-record' });
+    const clock = fakeClock();
+    expect(await waitForOp({ id: record.id, maxWaitMs: 250, dir, ...clock }))
+      .toMatchObject({ status: 'failed', code: 1, reason: 'runner-died' });
+    expect(clock.sleep).not.toHaveBeenCalled();
+  });
+
+  it('keeps a live runner whose recorded birth stamp still matches', async () => {
+    const stamp = pidProbes.pidIdentityStamp(process.pid);
+    expect(stamp.runnerStart).toEqual(expect.any(String));
+    const record = writeRecord({ pid: process.pid, ...stamp });
+    expect(await waitForOp({ id: record.id, maxWaitMs: 250, dir, ...fakeClock() }))
+      .toMatchObject({ status: 'running', code: 75 });
+  });
+
+  it('rejects a record whose birth stamp is not a string or null', async () => {
+    const record = writeRecord({ pid: process.pid, runnerStart: 7 });
+    expect(await waitForOp({ id: record.id, maxWaitMs: 250, dir, ...fakeClock() }))
+      .toMatchObject({ status: 'failed', code: 1, reason: 'invalid-record' });
+  });
+
+  it('stamps the launched runner birth identity into the running record', async () => {
+    const stamp = vi.spyOn(pidProbes, 'pidIdentityStamp')
+      .mockReturnValue({ runnerStart: 'Mon Oct 26 21:00:00 2026', runnerArgv: 'node detached-op.mjs' });
+    try {
+      const record = await startDetachedOp({
+        argv: [process.execPath, '-e', ''], kind: 'acceptance', dir, env: {},
+        spawnFn: () => ({ pid: 43210, unref: vi.fn() }),
+      });
+      expect(stamp).toHaveBeenCalledWith(43210);
+      expect(record).toMatchObject({ runnerStart: 'Mon Oct 26 21:00:00 2026', runnerArgv: 'node detached-op.mjs' });
+      expect(JSON.parse(readFileSync(join(dir, `${record.id}.json`), 'utf8'))).toEqual(record);
+    } finally {
+      stamp.mockRestore();
     }
   });
 
