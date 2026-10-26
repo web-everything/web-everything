@@ -146,6 +146,22 @@ exercise diagnostic propagation through a real-git rebuild fixture. Run these su
 
 ## Red-team re-check evidence
 
+Recovery distinguishes a policy-clear from a completed seat and a failed execution. A trusted
+acceptance re-stamp at the live head can carry only the policy-clear of its preceding trusted
+acceptance record. A newer result on another revision, including one posted after the live-head
+re-stamp, or missing/untrusted source acceptance
+refuses carry; recovery never searches older revisions for a convenient clear.
+Both carry and stored clear pass formal reviews into `latestAcceptRecord`; unreadable reviews
+refuse publication and require operator inspection. A standing formal CHANGES_REQUESTED blocks both.
+Stored clear (null status or finished/not-owed) requires a trusted acceptance record whose SHA is
+the live head, alongside the matching stored read, no seats, and no deferral. An accepted label
+alone cannot establish that boundary; keep real accept comments in R100 clear-success fixtures.
+One non-completed seat with finished/ran permits one fresh retry under the daemon cooldown;
+two failed seats retain the refusal and require operator inspection. Completed seats retain
+result/effects-only resume. Preserve the failed status through queued admission so the shared
+seat guard can independently recheck the same bound. The R100 regressions in
+`review-red-team-on-skip`, `drain-red-team-evidence`, and `review-job-red-team-only` cover these paths.
+
 The post-accept re-check reads a separate, self-contained checkout pinned to `read.netBasis.rev`,
 never the released review lane's current HEAD or the red-team probe's working tree. Its Claude
 juror uses `judge-spawn.mjs` with `Read`, `Glob`, and `Grep` only, in an independent lane-shaped
@@ -2453,3 +2469,13 @@ omissions are reported as truncation. Clone paths must be absolute. The drain ta
 prototype-load settings, not the plist's data clone; tests inject those settings. Matrix and PR table cells strip
 Cc/Cf controls and are width-capped; table mode keeps the truncated-listing warning.
 
+
+Recovery retries must spend their allowance in the head-bound red-team status before the model call.
+Keep `retryCount` when writing running/finished statuses: a failed scorecard append is not evidence
+that no model ran. Exercise both review-job admission and the shared runner with an append failure,
+then verify that a later planner and admission pass refuse another call even after cooldown.
+
+Retry admission uses an exclusive-create `<status-basename>.retry-1` marker before the model call.
+An existing marker refuses with `retry already admitted`; never roll back another worker's status
+or remove the marker on failure. Inspect the head-bound evidence before operator recovery.
+Interleave two admissions after both read the old status and assert exactly one model call.

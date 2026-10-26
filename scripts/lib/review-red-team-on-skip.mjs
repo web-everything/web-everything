@@ -5,12 +5,43 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readDrainRedTeamEvidence, readRedTeamStatus } from './drain-red-team-evidence.mjs';
-import { redTeamForHead } from './red-team-gate.mjs';
+import { redTeamForHead, redTeamMarker, parseRedTeamComment } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
-import { isRealHead } from './red-team-skip-outcome.mjs';
-import { cascadePolicy } from './policy-cascade.mjs';
-import { redTeamStatusWithoutRun } from './red-team-run-result.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
+import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from './red-team-skip-outcome.mjs';
+import { runGhSync } from './gh-throttle.mjs';
+import { publishAttention } from '../operations/needs-you-feed.mjs';
+import { cascadePolicy } from './policy-cascade.mjs';
+import { failedRedTeamRetry, redTeamStatusWithoutRun } from './red-team-run-result.mjs';
+
+import { redTeamRequired } from './jury-core.mjs';
+import { latestAcceptRecord } from './accept-carry-forward.mjs';
+import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
+import { RED_TEAM_STATUS_LABELS } from './red-team-status-label-meta.mjs';
+
+// review-labels.mjs exports names only. Fail closed for every review hold namespace,
+// including future merge holds, rather than maintaining a partial list here.
+function conflictsWithPolicyClear(label) {
+  const name = typeof label === 'string' ? label : label?.name;
+  return typeof name === 'string' && (
+    (name.startsWith('review:') && name !== 'review:accepted')
+    || name.startsWith('review-status:')
+    || (RED_TEAM_STATUS_LABELS.includes(name) && name !== 'red-team:clear')
+  );
+}
+
+/** Live holds supersede both carried and stored policy-clears. PURE. */
+function publishableClearGuard({ labels, acceptance }) {
+  if (acceptance?.laterVerdict || acceptance?.laterBodyDerivedHold) {
+    return 'later verdict or hold supersedes acceptance';
+  }
+  if (acceptance?.reviewsUnreadable) return 'PR reviews unreadable; inspect formal reviews before policy-clear';
+  if (!Array.isArray(labels)) return 'PR labels unreadable';
+  if (labels.some(conflictsWithPolicyClear)) {
+    return 'conflicting label prevents policy-clear';
+  }
+  return null;
+}
 
 /** Normalize both persisted production result shapes at the recovery boundary. */
 export function normalizeRedTeamResult(result) {
@@ -89,11 +120,64 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (evidence?.carryConflict) return skip('later review supersedes the carry');
       const unfinishedCarry = evidence?.carry && evidence.carry.step !== 'done';
       if (redTeamForHead(rawPr.comments, pr, head) && !unfinishedCarry) return skip('red-team result already on head');
+      const accepted = Array.isArray(rawPr.labels) && rawPr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'review:accepted');
+      if (evidence?.inFlight || evidence?.queued) return skip('red-team pass in flight');
+      const reviews = Array.isArray(rawPr.reviews) ? rawPr.reviews : null;
+      const acceptance = accepted ? latestAcceptRecord(rawPr.comments, reviews) : null;
+      if (acceptance?.sha === head
+        && evidence?.inFlight === false && evidence.recorded !== true && evidence.seatRecorded !== true
+        && evidence.completedRecorded !== true && readStatus({ repo, pr, head }) == null
+        && /^📌 review — acceptance re-stamped after a rebase \(no new review\)/.test(rawPr.comments[acceptance.index]?.body ?? '')) {
+        const priorComments = rawPr.comments.slice(0, acceptance.index);
+        // The re-stamp carries the preceding trusted acceptance, never an arbitrary old clear.
+        // Unknown source evidence leaves normal recovery/operator inspection in charge.
+        const source = latestAcceptRecord(priorComments, reviews);
+        const comment = priorComments.findLast(c => {
+          const parsed = parseRedTeamComment(c?.body);
+          return parsed?.pr === pr && redTeamForHead([c], pr, parsed.rev);
+        });
+        const parsed = parseRedTeamComment(comment?.body);
+        const result = source && redTeamForHead(rawPr.comments, pr, source.sha);
+        // Late results on any revision also supersede the proposed source clear.
+        const latestResult = rawPr.comments.findLast(c => {
+          const parsed = parseRedTeamComment(c?.body);
+          return parsed?.pr === pr && redTeamForHead([c], pr, parsed.rev);
+        });
+        if (source && !source.laterVerdict && !source.laterBodyDerivedHold && source.sha !== head && parsed?.rev === source.sha
+          && latestResult === comment && result && result.findings.length === 0
+          && comment.body.split(/\r?\n/).filter(line => line.trim()).length === 2
+          && /^Red team not required on this head: [^\r\n]+$/m.test(comment.body)) {
+          const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance });
+          if (refusal) return skip(refusal);
+          return { ...row, action: 'carry', from: source.sha, why: 'prior policy-clear across acceptance re-stamp' };
+        }
+      }
       const movedCardOnly = cardOnlyHeadMoveCandidate(evidence, head)
         && proveMove({ fromSha: evidence.loopPayload.findings.read.netBasis.rev, toSha: head })?.ok === true;
       const status = unfinishedCarry ? evidence.status : readStatus({ repo, pr, head });
       const pendingCardOnly = cardOnlySkipSettlementCandidate({ ...evidence, status }, head);
-      if (!movedCardOnly && !pendingCardOnly && !redTeamOwedFor(evidence?.loopPayload)) return skip('stored review does not owe a red team');
+      const owed = redTeamOwedFor(evidence?.loopPayload);
+      if (!movedCardOnly && !pendingCardOnly && (!owed || accepted)) {
+        if (evidence?.inFlight || evidence?.queued) return skip('red-team pass in flight');
+        if (evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
+          && accepted
+          && (() => {
+            const status = readStatus({ repo, pr, head });
+            // An accepting review with no status still owes its normal pass.
+            return (status == null && !owed) || (status?.status === 'finished'
+              && normalizeRedTeamResult(status.result).priorResult === 'not-owed'
+              && classifyRedTeamSkip(typeof status.result === 'string' ? { status: status.result } : status.result, { accepted }).kind === 'policy'
+              && evidence.seatRecorded === false);
+          })()
+          && redTeamRequired(evidence.loopPayload?.verdict?.verdict)
+          && evidence.recorded !== true && evidence.seatRecorded !== true) {
+          if (acceptance?.sha !== head) return skip('stored review does not owe a red team');
+          const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance });
+          if (refusal) return skip(refusal);
+          return { ...row, action: 'clear', why: 'not owed (stored review)' };
+        }
+        if (!owed) return skip('stored review does not owe a red team');
+      }
       if (!movedCardOnly && evidence.loopPayload?.findings?.read?.netBasis?.rev !== head) return skip('stored review does not match live head');
       if (evidence.inFlight || evidence.queued) return skip('red-team pass in flight');
       const { priorResult: prior, priorComment: comment } = normalizeRedTeamResult(status?.result);
@@ -104,9 +188,9 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       let mode;
       if (movedCardOnly && (status != null || evidence.completedRecorded === true)) return skip('live head already has red-team state');
       if (comment === 'posted') return skip('result posted; comment not visible yet');
-      // Any seat row (including an error) blocks a new call. Successful execution
+      // Only one explicitly failed seat permits a fresh retry. Successful execution
       // can resume effects even when its verdict contains confirmed breaks.
-      if (movedCardOnly) mode = 'fresh';
+      if (movedCardOnly || failedRedTeamRetry(status, evidence)) mode = 'fresh';
       else if (status?.status === 'finished' && (['ran', 'resumed'].includes(prior) || status.result === 'resumed')
         && (completedSeat || (!placeholder && typeof status.result === 'object'
           && evidence.recorded === true && evidence.completedRecorded !== false))) {
@@ -135,7 +219,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   readCarry = key => readRedTeamCarry({ ...key, env }),
   exec = execFileSync, cwd = process.cwd(), mainRef = 'origin/main',
   proveMove = move => proveCardOnlyHeadMove({ ...move, exec, cwd, mainRef }),
-  now = Date.now, lastDispatch: history = lastDispatch, preferLane } = {}) {
+  now = Date.now, lastDispatch: history = lastDispatch, preferLane, settle = settleRedTeamSkip, syncLabels = syncRedTeamStatusLabels } = {}) {
   const rows = [], dispatched = [], notStarted = [];
   const note = line => { try { log(safeLine(line)); } catch { /* diagnostic only */ } };
   try {
@@ -145,6 +229,42 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       now: at, setting: resolved, lastDispatch: history, proveMove, readCarry }));
     for (const row of rows) {
       let started = false;
+      if (row.action === 'carry') {
+        if (dryRun) row.why = 'dry run (carry)';
+        else {
+          try {
+            const body = `${redTeamMarker(row.prNumber, row.head)}\nRed team not required on this head: prior policy-clear carried from ${row.from.slice(0, 8)} across a content-preserving rebase (acceptance re-stamped)`;
+            runGhSync(['pr', 'comment', String(row.prNumber), `--repo=${repo}`, '--body-file', '-'],
+              { input: body, env, timeout: 60_000, maxBuffer: 1024 * 1024 });
+            syncLabels({ repo, pr: row.prNumber, head: row.head, env, log: note });
+          } catch (error) { row.action = 'skip'; row.why = `carry failed: ${safeErrorText(error)}`; }
+        }
+      }
+      if (row.action === 'clear') {
+        if (dryRun) row.why = 'dry run (clear)';
+        else {
+          try {
+            const rawPr = rawPrs.find(p => Number(p?.number) === row.prNumber);
+            const result = settle({ redTeam: { status: 'not-owed' }, repo, pr: row.prNumber,
+              head: row.head, readHead: row.head, accepted: true, comments: rawPr.comments, reason: row.why,
+              io: { env, log: note,
+                postComment: ({ repo, pr, body }) => runGhSync([
+                  'pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-',
+                ], { input: body, env, timeout: 60_000, maxBuffer: 1024 * 1024 }),
+                publishNeedsYou: publishAttention,
+              } });
+            if (['policy-clear', 'already'].includes(result?.outcome)) {
+              syncLabels({ repo, pr: row.prNumber, head: row.head, env, log: note });
+            } else {
+              row.action = 'skip';
+              row.why = `clear failed: ${result?.reason ?? result?.outcome ?? 'unknown outcome'}`;
+            }
+          } catch (error) {
+            row.action = 'skip';
+            row.why = `clear failed: ${safeErrorText(error)}`;
+          }
+        }
+      }
       if (row.action === 'dispatch') {
         const budget = capacity?.budget;
         if (!(capacity?.lanes > 0) || (budget && !(budget.left > 0))
@@ -179,7 +299,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         }
         if (!started) { row.action = 'skip'; notStarted.push({ prNumber: row.prNumber, reason: row.why }); }
       }
-      note(`review-daemon: ${repo}#${row.prNumber} already-reviewed-head — red team ${started ? `dispatched (${row.mode})` : 'not dispatched'} for head ${String(row.head ?? 'unknown').slice(0, 12)}: ${row.why}`);
+      note(`review-daemon: ${repo}#${row.prNumber} already-reviewed-head — red team ${started ? `dispatched (${row.mode})` : ['clear', 'carry'].includes(row.action) && !dryRun ? 'cleared' : 'not dispatched'} for head ${String(row.head ?? 'unknown').slice(0, 12)}: ${row.why}`);
     }
   } catch {
     rows.push({ prNumber: null, head: null, action: 'skip', why: 'red-team recovery inputs unreadable' });

@@ -92,7 +92,7 @@ import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, bu
 import { liveResultGateState, readRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
 import { normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
-import { redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
+import { failedRedTeamRetry, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../lib/red-team-carry-io.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
@@ -386,21 +386,27 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           // separately requires the stored read's netBasis.rev to equal status.head.
           // A null result is eligible only when normalized from the original queued
           // writer above. An ordinary finished/null prior must reach the guard intact.
-          if (input.redTeamMode === 'fresh' && (redTeamSkipNeedsSettlement(admissionPrior)
+          const retry = input.redTeamMode === 'fresh' && failedRedTeamRetry(admissionPrior, readEvidence(key));
+          if (input.redTeamMode === 'fresh'
+            && (admissionPrior?.retryCount === undefined || admissionPrior.retryCount === 0)
+            && !retry
+            && (redTeamSkipNeedsSettlement(admissionPrior)
             || redTeamStatusWithoutRun(admissionPrior, { originalStatus: prior }))) admissionPrior = null;
           if (['ran', 'resumed'].includes(normalizeRedTeamResult(admissionPrior?.result).priorResult)) priorResult = admissionPrior.result;
-          input = { ...input, result: priorResult };
+          input = { ...input, result: priorResult, ...(retry ? { retryCount: 1 } : {}) };
         }
         attempted = true;
         writeStatus(input, { env });
         if (queued) {
           const stored = readStatus(key);
           if (stored?.status !== 'queued' || stored.pid !== process.pid
-            || JSON.stringify(stored.result) !== JSON.stringify(priorResult)) throw Error('queued red-team status readback mismatch');
+            || JSON.stringify(stored.result) !== JSON.stringify(priorResult)
+            || (input.retryCount === 1 && stored.retryCount !== 1)) throw Error('queued red-team status readback mismatch');
         }
       } catch (e) {
         if (queued) {
-          if (attempted) {
+          // A losing exclusive retry claim never wrote the status; preserve the winner.
+          if (attempted && e.code !== 'RED_TEAM_RETRY_ADMITTED') {
             try {
               const path = join(redTeamStatusDir(env), `${encodeURIComponent(input.repo)}-${Number(input.pr)}-${head}.json`);
               if (prior == null) rmSync(path, { force: true });
@@ -418,7 +424,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       } catch (e) { process.stderr.write(`review-job: red-team status label sync failed: ${e.message}\n`); }
       return { priorResult, ...(queued && input.redTeamMode ? { redTeamAdmission: { pid: process.pid,
         prior: admissionPrior == null ? null : { repo: admissionPrior.repo, pr: admissionPrior.pr, head: admissionPrior.head,
-          status: admissionPrior.status, result: admissionPrior.result } } } : {}) };
+          status: admissionPrior.status, result: admissionPrior.result,
+          ...(admissionPrior.retryCount !== undefined ? { retryCount: admissionPrior.retryCount } : {}) } } } : {}) };
     },
     root,
     fetchRedTeamHead: ({ lanePath, pr, head }) => {
