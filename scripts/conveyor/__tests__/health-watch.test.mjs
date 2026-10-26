@@ -52,6 +52,48 @@ let dir;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'health-watch-test-')); });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
+describe('bundle repair and fix-ready tick wiring', () => {
+  const flagsFor = () => ({
+    'state-root': dir, 'logs-dir': join(dir, 'logs'), 'lock-root': join(dir, 'locks'),
+    'self-sync-dir': join(dir, 'sync'), 'fix-ready-store': join(dir, 'ready.jsonl'),
+    'no-gh': true, 'no-diagnose': true, 'no-investigate': true,
+  });
+
+  it('forwards the self-sync snapshot, time and dry-run flag to the repair supervisor', async () => {
+    const runBundleRepairs = vi.fn(() => ({ off: 'disabled' }));
+    const now = '2026-10-22T12:00:00Z';
+    const result = await tick({ ...flagsFor(), now, 'dry-run': true }, {
+      collectInventory: () => ({}), smells: [], runBundleRepairs,
+    });
+    expect(runBundleRepairs).toHaveBeenCalledTimes(1);
+    expect(runBundleRepairs).toHaveBeenCalledWith({
+      dir: healthDir(dir), selfSync: [], now: Date.parse(now), dryRun: true,
+    });
+    expect(result.bundleRepair).toEqual({ off: 'disabled' });
+  });
+
+  it('keeps a supervisor failure visible without failing the tick and honors the opt-out', async () => {
+    const runBundleRepairs = vi.fn(() => { throw Error('repair ledger unreadable'); });
+    const deps = { collectInventory: () => ({}), smells: [], runBundleRepairs };
+    const failed = await tick(flagsFor(), deps);
+    expect(failed.probeErrors.bundleRepair).toBe('repair ledger unreadable');
+    expect(failed.bundleRepair).toBeNull();
+    await tick({ ...flagsFor(), 'no-bundle-repair': true }, deps);
+    expect(runBundleRepairs).toHaveBeenCalledTimes(1);
+  });
+
+  it('probes the selected fix-ready store and reports unreadable evidence', async () => {
+    const flags = flagsFor();
+    mkdirSync(flags['fix-ready-store']);
+    const failed = await tick(flags, { collectInventory: () => ({}), smells: [] });
+    expect(failed.probeErrors.fixReady).toBeTruthy();
+    expect(failed.bundleRepair).toBeNull();
+    rmSync(flags['fix-ready-store'], { recursive: true });
+    const clean = await tick(flags, { collectInventory: () => ({}), smells: [] });
+    expect(clean.probeErrors.fixReady).toBeUndefined();
+  });
+});
+
 describe('lane scan cache target isolation', () => {
   it.each([
     { flags: {}, fixtureTick: false, allowed: true },
