@@ -1,5 +1,9 @@
 # Testing — Three-Tier Strategy
 
+## R123 automatic CI answers
+
+The three-candidate tick bound must demonstrate progress across ticks, including persistent holds and unreadable candidate threads. `stand-down-auto-proceed.test.mjs` exercises a real per-repository cursor under a temporary ledger root, preserving input order and the per-tick bound while a fourth recovered PR eventually receives an answer. Pin cursor persistence, wraparound, removed candidates and repository isolation; malformed, unreadable or unwritable cursor state must retain every hold with an operator fallback. Other writer fixtures inject scheduling IO so they never consult the host's durable cursor. Required-check fixtures carry a consistent app identity. Pin ambiguous same-name app history and missing app identity as operator holds at both the classifier and writer boundary; a newer success cannot mask another app's failure. The paged REST fixture must preserve app identity alongside failed rerun history.
+
 ## Established-overlay auto-rebase
 
 Operator withdrawal wins over a detached repair: the worker rechecks its source registration
