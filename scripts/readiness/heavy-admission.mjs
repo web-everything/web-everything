@@ -1750,7 +1750,7 @@ function parseFlags(argv) {
   return { flags, positionals };
 }
 
-async function main(argv) {
+export async function main(argv) {
   // `run`'s command tail lives after a literal `--` and must never be parsed as this CLI's OWN flags (a
   // `--coverage` meant for the wrapped command would otherwise be read as a flag of THIS script).
   const dashDashIdx = argv.indexOf('--');
@@ -1763,7 +1763,10 @@ async function main(argv) {
     process.exit(await handleDetachCli(preArgv, detachOptions));
   }
   if (detachFlags.detach && positionals[0] === 'run') {
-    const record = await startDetachedOp({ kind: detachOptions.kind,
+    // This worker outlives the caller's slot, so it must acquire admission itself.
+    const env = { ...process.env };
+    delete env[ADMISSION_HELD_ENV];
+    const record = await startDetachedOp({ kind: detachOptions.kind, env,
       argv: [process.execPath, detachOptions.scriptPath, ...detachFlags.rest,
         ...(dashDashIdx === -1 ? [] : argv.slice(dashDashIdx))] });
     detachOptions.out(JSON.stringify(record));

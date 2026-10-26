@@ -176,6 +176,19 @@ describe('detached operation lifecycle', () => {
     expect(clock.sleep).not.toHaveBeenCalled();
   });
 
+  it('re-reads only once even if a replacement running record has a different pid', async () => {
+    const record = writeRecord();
+    const clock = fakeClock();
+    const isAlive = vi.fn(() => {
+      writeRecord({ pid: record.pid + 1 });
+      return false;
+    });
+    expect(await waitForOp({ id: record.id, maxWaitMs: 250, dir, ...clock, isAlive }))
+      .toMatchObject({ status: 'failed', code: 1, reason: 'runner-died' });
+    expect(isAlive).toHaveBeenCalledOnce();
+    expect(clock.sleep).not.toHaveBeenCalled();
+  });
+
   it('fails closed with unknown-job for an unknown id', async () => {
     const clock = fakeClock();
     const isAlive = vi.fn();

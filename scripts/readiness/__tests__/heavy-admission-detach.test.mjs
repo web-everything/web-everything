@@ -4,7 +4,13 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { tryAcquireSlot } from '../heavy-admission.mjs';
+import { main, tryAcquireSlot } from '../heavy-admission.mjs';
+import { startDetachedOp } from '../../lib/detached-op.mjs';
+
+vi.mock('../../lib/detached-op.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, startDetachedOp: vi.fn(actual.startDetachedOp) };
+});
 
 const CLI = resolve(process.cwd(), 'scripts/readiness/heavy-admission.mjs');
 const waitModes = [['bare', []], ['run', ['run']], ['status', ['status']]];
@@ -48,8 +54,32 @@ function detach(source, tail = []) {
 function wait(id, { mode = [], maxWaitMs = 20_000, status = 0 } = {}) {
   return JSON.parse(cli([...mode, `--wait-for=${id}`, `--max-wait-ms=${maxWaitMs}`], status));
 }
+function holdSlot() {
+  const nowMs = Date.now();
+  expect(tryAcquireSlot({ lockRoot, cap: 1, owner: 'test-holder',
+    nowMs, nowIso: new Date(nowMs).toISOString() }).ok).toBe(true);
+}
 
 describe('heavy-admission detached CLI', () => {
+  it('passes a fresh environment without inherited admission ownership to startDetachedOp', async () => {
+    const stopped = new Error('stop before launching the detached runner');
+    vi.stubEnv('WE_HEAVY_ADMISSION_HELD', '1');
+    vi.stubEnv('DETACHED_OPS_DIR', env.DETACHED_OPS_DIR);
+    startDetachedOp.mockRejectedValueOnce(stopped);
+    try {
+      await expect(main(['run', '--detach', '--', process.execPath, '-e', '']))
+        .rejects.toBe(stopped);
+      const options = startDetachedOp.mock.lastCall[0];
+      expect(options.env).toBeDefined();
+      expect(options.env).not.toHaveProperty('WE_HEAVY_ADMISSION_HELD');
+      expect(options.env.DETACHED_OPS_DIR).toBe(env.DETACHED_OPS_DIR);
+      expect(process.env.WE_HEAVY_ADMISSION_HELD).toBe('1');
+    } finally {
+      vi.unstubAllEnvs();
+      startDetachedOp.mockClear();
+    }
+  });
+
   it.each(waitModes)('detaches hi under admission and waits without a command tail (mode %s)', (_label, mode) => {
     const id = detach("if (process.env.WE_HEAVY_ADMISSION_HELD !== '1') process.exit(9); console.log('hi')");
     expect(wait(id, { mode })).toMatchObject({ id, status: 'done', exitCode: 0, stdoutTail: 'hi\n' });
@@ -84,7 +114,7 @@ describe('heavy-admission detached CLI', () => {
   }, 30_000);
 
   it('defers a detached command with inherited ownership when the pool stays full', () => {
-    expect(tryAcquireSlot({ lockRoot, cap: 1, owner: 'test-holder' }).ok).toBe(true);
+    holdSlot();
     env.WE_HEAVY_ADMISSION_HELD = '1';
     const record = JSON.parse(cli(['run', '--detach', '--wait-ms=250', '--',
       process.execPath, '-e', "console.log('overlap')"]));
@@ -113,7 +143,7 @@ describe('heavy-admission detached CLI', () => {
   }, 30_000);
 
   it.each(waitModes)('fails closed on an unknown job without acquiring a full pool (mode %s)', (_label, mode) => {
-    expect(tryAcquireSlot({ lockRoot, cap: 1, owner: 'test-holder' }).ok).toBe(true);
+    holdSlot();
     expect(wait('unknown-job', { mode, maxWaitMs: 250, status: 1 })).toMatchObject({
       id: 'unknown-job', status: 'failed', reason: 'unknown-job',
     });

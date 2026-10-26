@@ -82,7 +82,7 @@ export async function startDetachedOp({ argv, kind, dir = resolveDetachedOpsDir(
 export async function waitForOp({ id, maxWaitMs = 540000, dir = resolveDetachedOpsDir(),
   now = Date.now, sleep: pause = sleep, isAlive = alive } = {}) {
   const deadline = now() + budget(maxWaitMs);
-  let deadRunnerPid = null;
+  let deadRunnerObserved = false;
   for (;;) {
     let record;
     try {
@@ -98,11 +98,11 @@ export async function waitForOp({ id, maxWaitMs = 540000, dir = resolveDetachedO
     } catch (error) { return { id, status: 'failed', code: 1, reason: error.code === 'ENOENT' ? 'unknown-job' : 'invalid-record' }; }
     const result = { ...record, stdoutTail: tail(record.stdoutPath), stderrTail: tail(record.stderrPath) };
     if (record.status !== 'running') return { ...result, code: record.status === 'done' ? 0 : 1 };
-    if (record.pid === deadRunnerPid) return { ...result, status: 'failed', code: 1, reason: 'runner-died' };
+    if (deadRunnerObserved) return { ...result, status: 'failed', code: 1, reason: 'runner-died' };
     if (!isAlive(record.pid)) {
       // The runner publishes its terminal record before exiting. Re-read and
-      // validate it before classifying a stale running snapshot as runner-died.
-      deadRunnerPid = record.pid;
+      // validate it once before classifying a stale running snapshot as runner-died.
+      deadRunnerObserved = true;
       continue;
     }
     if (now() >= deadline) return { ...result, code: 75 };
