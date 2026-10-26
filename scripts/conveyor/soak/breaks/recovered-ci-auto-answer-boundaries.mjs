@@ -60,7 +60,18 @@ export default {
     const dryRunWrites = [...writes];
     if (writes.length) violations.push(`dry-run wrote ${writes.join(',')}`);
     writes.length = 0;
+    const dispatchOptions = { repo: 'we', reconcile, checkStaleness: () => ({ fresh: true }),
+      netScope: null, prStack: null, resolveProfile: () => ({ capabilities: { fix: false } }) };
+    runReconcileFixDispatch(dispatchOptions);
+    const defaultDispatchWrites = [...writes];
+    if (writes.length) violations.push(`default dispatch wrote ${writes.join(',')}`);
+    writes.length = 0;
+    runReconcileFixDispatch({ ...dispatchOptions, allowStandDownAutoProceed: false });
+    const optedOutDispatchWrites = [...writes];
+    if (writes.length) violations.push(`opted-out dispatch wrote ${writes.join(',')}`);
+    writes.length = 0;
     runReconcileFixDispatch({ repo: 'we', reconcile, checkStaleness: () => ({ fresh: true }),
+      allowStandDownAutoProceed: true,
       netScope: null, prStack: null, resolveProfile: () => ({ capabilities: { fix: false } }) });
     if (writes.join(',') !== 'cursor,reserve,post') violations.push('mutating dispatch did not explicitly enable automatic answers');
     writes.length = 0;
@@ -98,7 +109,7 @@ export default {
       });
       if (crossRepoWrites.length) violations.push('a WE outage released a genuine FrontierUI failure');
     }
-    return { violations, dryRunWrites, mainReads, crossRepoWrites };
+    return { violations, dryRunWrites, defaultDispatchWrites, optedOutDispatchWrites, mainReads, crossRepoWrites };
   },
   judge(report) { return report.violations; },
 };

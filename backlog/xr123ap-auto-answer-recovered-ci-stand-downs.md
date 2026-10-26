@@ -15,6 +15,13 @@ The pure classifier is we:scripts/conveyor/stand-down-auto-proceed.mjs. Its inje
 
 Focused evidence lives in we:scripts/conveyor/__tests__/stand-down-auto-proceed.test.mjs and the reconciliation wiring test in we:scripts/conveyor/__tests__/reconcile-pass.test.mjs. Deployment and live GitHub observation are left to the human review and deployment flow.
 
+## Review prevention — PR #5981, 2026-10-26
+
+- Keep R123 writes opt-in on the exported dispatcher. The production caller inventory in we:scripts/conveyor/__tests__/stand-down-auto-proceed.test.mjs requires explicit false from the live smoke and orphan redispatch, and true only from the mutating CLI. The existing registered we:scripts/conveyor/soak/breaks/recovered-ci-auto-answer-boundaries.mjs now checks default-off and explicit-off calls for zero cursor, reservation and post operations, alongside the enabled positive control.
+- `holds pending checks despite an acceptable conclusion` changes the run status while preserving valid identity, timestamp and otherwise acceptable evidence. Queued, in-progress and waiting states retain the hold with zero reservations/posts for success, cancellation, skipping and main-attributed failure.
+- `holds when rerun success does not follow the stand-down` covers success before and exactly at the stand-down. `holds when the earlier failure follows the stand-down` covers a failure immediately afterward. The positive boundary control accepts a failure at the stand-down followed immediately by success. Every case exercises the classifier and writer boundary.
+- Targeted in-memory mutation probes confirmed the named negative fixtures discriminate five changes: removing the completed-status requirement; removing the success-after comparison or relaxing `>` to `>=`; removing the failure-at-or-before comparison or reversing `<=` to `>=`. Each baseline retained its hold and each mutant released it. Repeat mutation verification with the declared mutation-check transaction or an isolated verification copy; never remove guards from the working lane to manufacture red evidence. Local proof-only instructions reserve after-fix Vitest execution for the launcher gate.
+
 ## Acceptance
 
 - Cases (a), (b), and (c) produce a strict, trusted answer that supersedes the CI stand-down exactly once.
