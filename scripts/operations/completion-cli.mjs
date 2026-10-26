@@ -156,10 +156,10 @@ export function runReport(flags, { emitEvent = appendDaemonEvent } = {}) {
       now: () => new Date().toISOString(),
     });
     writeCompletion(record);
-    const alreadyBlocked = existing?.status === 'done' && existing.kind === 'fix'
+    const alreadyBlocked = existing?.status === 'done' && ['fix', 'ci-heal'].includes(existing.kind)
       && existing.outcome === 'blocked-on-permission'
       && (existing.sessionId ?? null) === (record.sessionId ?? null);
-    if (record.kind === 'fix' && record.outcome === 'blocked-on-permission' && !alreadyBlocked) {
+    if (['fix', 'ci-heal'].includes(record.kind) && record.outcome === 'blocked-on-permission' && !alreadyBlocked) {
       try {
         Promise.resolve(emitEvent({
           kind: 'fixer-blocked', pr: record.pr, detail: { command: record.denied },

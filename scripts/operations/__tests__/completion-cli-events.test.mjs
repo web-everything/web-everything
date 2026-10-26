@@ -37,9 +37,9 @@ const blockedEvent = (command = 'npm run release') => ({
   kind: 'fixer-blocked', pr: '42', detail: { command },
 });
 
-function seedBlocked(sessionId) {
+function seedBlocked(sessionId, kind = 'fix', session = 'fix-42') {
   const record = applyCompletionUpdate(
-    newCompletionRecord({ session: 'fix-42', kind: 'fix', pr: '42', sessionId }),
+    newCompletionRecord({ session, kind, pr: '42', sessionId }),
     { status: 'done', outcome: 'blocked-on-permission', denied: 'old denied command' },
   );
   writeCompletion(record);
@@ -82,21 +82,36 @@ describe('runReport fixer-blocked coordination events', () => {
     expect(emitEvent.mock.calls).toEqual([[blockedEvent(result.record.denied)]]);
   });
 
-  it('emits for a ci-heal session whose completion record has kind fix', () => {
+  it.each([false, true])('emits once for a started ci-heal completion (explicit done kind: %s)', (explicitKind) => {
     const emitEvent = vi.fn();
-    const result = runReport(blockedFlags({ session: 'ci-heal-42' }), { emitEvent });
+    runReport({
+      session: 'ci-heal-42', kind: 'ci-heal', pr: '42', status: 'started', 'session-id': 'owner-A',
+    }, { emitEvent });
+    expect(emitEvent).not.toHaveBeenCalled();
+    const flags = {
+      session: 'ci-heal-42', status: 'done', outcome: 'blocked-on-permission',
+      denied: 'git push', 'session-id': 'owner-A',
+      ...(explicitKind ? { kind: 'ci-heal' } : {}),
+    };
+    const result = runReport(flags, { emitEvent });
 
+    expect(result.record).toMatchObject({ kind: 'ci-heal', status: 'done', sessionId: 'owner-A' });
     expect(tryReadCompletion('ci-heal-42')).toMatchObject(result.record);
-    expect(emitEvent.mock.calls).toEqual([[blockedEvent()]]);
+    expect(emitEvent.mock.calls).toEqual([[blockedEvent('git push')]]);
+    runReport(flags, { emitEvent });
+    expect(emitEvent.mock.calls).toEqual([[blockedEvent('git push')]]);
   });
 
-  it.each(['owner-A', null])('suppresses a re-report using the previous on-disk blocked record (sessionId %s)', (sessionId) => {
-    seedBlocked(sessionId);
+  it.each([
+    ['fix', 'owner-A'], ['fix', null], ['ci-heal', 'owner-A'], ['ci-heal', null],
+  ])('suppresses a re-report using the previous on-disk blocked record (kind %s, sessionId %s)', (kind, sessionId) => {
+    const session = `${kind}-42`;
+    seedBlocked(sessionId, kind, session);
     const emitEvent = vi.fn();
-    const result = runReport(blockedFlags({ 'session-id': sessionId ?? '', denied: 'different denied command' }), { emitEvent });
+    const result = runReport(blockedFlags({ session, kind, 'session-id': sessionId ?? '', denied: 'different denied command' }), { emitEvent });
 
     expect(result.changed).toBe(true);
-    expect(tryReadCompletion('fix-42')).toMatchObject({
+    expect(tryReadCompletion(session)).toMatchObject({
       outcome: 'blocked-on-permission', sessionId, denied: 'different denied command',
     });
     expect(emitEvent).not.toHaveBeenCalled();
@@ -120,12 +135,13 @@ describe('runReport fixer-blocked coordination events', () => {
     expect(emitEvent.mock.calls).toEqual([[blockedEvent()]]);
   });
 
-  it('emits again for a new generation reusing the same session slug', () => {
-    seedBlocked('owner-A');
+  it.each(['fix', 'ci-heal'])('emits again for a new generation reusing the same %s session slug', (kind) => {
+    const session = `${kind}-42`;
+    seedBlocked('owner-A', kind, session);
     const emitEvent = vi.fn();
-    runReport({ session: 'fix-42', kind: 'fix', pr: '42', status: 'started', 'session-id': 'owner-B' }, { emitEvent });
+    runReport({ session, kind, pr: '42', status: 'started', 'session-id': 'owner-B' }, { emitEvent });
     expect(emitEvent).not.toHaveBeenCalled();
-    const result = runReport(blockedFlags({ 'session-id': 'owner-B' }), { emitEvent });
+    const result = runReport(blockedFlags({ session, kind, 'session-id': 'owner-B' }), { emitEvent });
 
     expect(result.record.sessionId).toBe('owner-B');
     expect(emitEvent.mock.calls).toEqual([[blockedEvent()]]);
