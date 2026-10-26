@@ -24,6 +24,17 @@ function fakeGit(entries, { failOn } = {}) {
 }
 
 describe('reclaimStaleCandidates', () => {
+  it('does not run worktree prune when reclaiming a stale candidate', () => {
+    const dead = own('80466-851559f8');
+    const { run, calls } = fakeGit([{ path: dead, locked: true }]);
+    const r = reclaimStaleCandidates({ root: ROOT, run, env: ENV, pidAlive: () => false, rm: () => {} });
+    expect(r.reclaimed).toEqual([dead]);
+    expect(calls).toEqual([
+      'worktree list --porcelain',
+      `worktree unlock ${dead}`,
+      `worktree remove --force ${dead}`,
+    ]);
+  });
   it('unlocks + removes (that path only) a locked own-clone candidate whose pid is dead, and nothing else', () => {
     const dead = own('80466-851559f8');
     const { run, calls } = fakeGit([{ path: ROOT }, { path: dead, locked: true, reason: 'initializing' }]);
@@ -88,6 +99,22 @@ describe('reclaim honesty', () => {
 });
 
 describe('materializeCandidate', () => {
+  it('retains the caller worktree prune after reclaim and before worktree add', () => {
+    const dead = own('80466-851559f8');
+    const path = own('1-ff');
+    const { run, calls } = fakeGit([{ path: dead, locked: true }]);
+    const r = materializeCandidate({ root: ROOT, sha: 'abc', run, env: ENV, path, pidAlive: () => false, rm: () => {} });
+    expect(r.ok).toBe(true);
+    expect(r.reclaimed).toEqual([dead]);
+    expect(calls).toEqual([
+      'worktree list --porcelain',
+      `worktree unlock ${dead}`,
+      `worktree remove --force ${dead}`,
+      `worktree remove --force ${path}`,
+      'worktree prune',
+      `worktree add --detach --quiet ${path} abc`,
+    ]);
+  });
   it('reclaims before adding and reports it via log', () => {
     const dead = own('80466-851559f8');
     const { run, calls } = fakeGit([{ path: dead, locked: true }]);
