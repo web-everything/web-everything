@@ -19,9 +19,9 @@ beforeEach(() => {
 afterEach(() => rmSync(scratch, { recursive: true, force: true }));
 
 describe('daemon event asynchronous failure isolation', () => {
-  it('appendDaemonEvent returns false when storage rejects asynchronously', async () => {
+  it.each(['rebuild-failed', 'pr-looping', 'pr-no-progress', 'ci-job-overdue'])('appendDaemonEvent returns false when storage rejects asynchronously (%s)', async kind => {
     const appendFile = vi.fn().mockRejectedValue(new Error('storage unavailable'));
-    await expect(appendDaemonEvent({ kind: 'rebuild-failed', detail: { reason: 'held' } }, {
+    await expect(appendDaemonEvent({ kind, detail: { reason: 'held' } }, {
       env: { WE_DAEMON_EVENTS: join(scratch, 'events.jsonl') }, appendFile,
     })).resolves.toBe(false);
     expect(appendFile).toHaveBeenCalledTimes(1);

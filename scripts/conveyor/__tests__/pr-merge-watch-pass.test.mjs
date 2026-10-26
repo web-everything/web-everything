@@ -52,7 +52,7 @@ function acceptedRedTeamClearAndClean(pr, now) {
     && pr.mergeStateStatus === 'CLEAN' && humanReviewHold(pr, Date.parse(now)).length === 0;
 }
 
-let root, stateDir, prs, gh, emitEvent, log;
+let root, stateDir, prs, gh, emitEvent, log, headTime;
 const modulePath = join(process.cwd(), 'scripts/conveyor/pass-daemons/pr-merge-watch-pass.mjs');
 let passInstance = 0;
 const loadPass = () => import(/* @vite-ignore */ `${modulePath}?instance=${passInstance}`);
@@ -79,6 +79,7 @@ beforeEach(() => {
   vi.stubEnv('WE_PLATFORM_PREFERENCES_FILE', platform);
   vi.stubEnv('WE_PR_MERGE_WATCH_READY_MINUTES', undefined);
   vi.stubEnv('WE_POLICY_CASCADE_LOG', '1');
+  headTime = at(0);
   prs = new Map([[REPO, [readyPr()]]]);
   emitEvent = vi.fn().mockResolvedValue(true);
   log = vi.fn();
@@ -95,6 +96,9 @@ beforeEach(() => {
       throw Error(`unexpected gh call: ${JSON.stringify(args)}`);
     }
     const endpoint = args.find(a => /^repos\//.test(a));
+    if (endpoint.includes('/commits/') && endpoint.includes('/check-runs')) return { check_runs: [] };
+    if (endpoint.includes('/commits/')) return { sha: endpoint.split('/').at(-1), commit: { committer: { date: headTime } } };
+    if (endpoint.includes('/timeline?')) return [];
     const m = /^repos\/([^/]+\/[^/]+)\/(pulls|issues)(?:\/(\d+))?(\/comments)?(?:\?(.*))?$/.exec(endpoint ?? '');
     if (!m) throw Error(`unexpected gh endpoint: ${endpoint}`);
     const [, repo, resource, number, comments, query] = m;
@@ -123,8 +127,9 @@ afterEach(() => {
 
 async function tick(minutes, overrides = {}) {
   const { runMergeWatch } = await loadPass();
+  headTime = at(minutes);
   return runMergeWatch({ repos: [REPO], gh, now: at(minutes), stateDir,
-    settings: { readyNotMergingMinutes: 60 }, emitEvent, log, ...overrides });
+    settings: { readyNotMergingMinutes: 60 }, emitEvent, log, signalLogs: () => [], ...overrides });
 }
 
 describe('runMergeWatch — acceptedRedTeamClearAndClean (humanReviewHold + final acceptance + CLEAN)', () => {
@@ -317,7 +322,7 @@ describe('standalone merge-watch one-shot and --watch', () => {
     const abort = new AbortController();
     let minute = 0;
     const runPass = vi.fn(() => runMergeWatch({ repos: [REPO], gh, stateDir, now: at(minute),
-      settings: { readyNotMergingMinutes: 60 }, emitEvent, log }));
+      settings: { readyNotMergingMinutes: 60 }, emitEvent, log, signalLogs: () => [] }));
     const sleep = vi.fn(async () => {
       if (minute === 0) {
         prs.set(REPO, [readyPr({ state: 'CLOSED', merged_at: at(1) })]);

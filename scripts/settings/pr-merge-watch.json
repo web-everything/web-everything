@@ -1,4 +1,4 @@
 {
-  "$comment": "prMergeWatch resolves standard → platform → tool → WE_PR_MERGE_WATCH_READY_MINUTES, logging the effective value and source. Alert only after strictly more than readyNotMergingMinutes of observed readiness.",
-  "prMergeWatch": { "readyNotMergingMinutes": 60 }
+  "$comment": "prMergeWatch resolves standard → platform → tool → environment, logging values and sources. WE_PR_MERGE_WATCH_{READY_MINUTES,NO_PROGRESS_DRAFT_MINUTES,NO_PROGRESS_MINUTES,CI_JOB_OVERDUE_FACTOR} override scalar thresholds. Minutes are nonnegative; CI factor is positive. Thresholds are strict; progress starts at the current head committer date and advances only on real transitions.",
+  "prMergeWatch": { "readyNotMergingMinutes": 60, "noProgressDraftMinutes": 240, "noProgressMinutes": 180, "ciJobOverdueFactor": 2 }
 }

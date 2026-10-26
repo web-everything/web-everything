@@ -2,6 +2,7 @@
 /** Read-only PR watcher. Durable timers start at observed readiness, never PR age.
  * Receipts advance only after delivery; interrupted publication may be retried.
  */
+import { runMergeWatchSignals } from './pr-merge-watch-signals.mjs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -15,16 +16,19 @@ import { handoffHome } from '../../operations/handoff-home.mjs';
 const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
 const sha = v => typeof v === 'string' && /^[a-f0-9]{40}$/i.test(v);
 const minutesValid = v => typeof v === 'number' && Number.isFinite(v) && v >= 0;
-// This setting is scalar: a nested object must not become valid numeric cascade leaves.
-const thresholdLayer = layer => ({ readyNotMergingMinutes: object(layer?.readyNotMergingMinutes)
-  ? undefined : layer?.readyNotMergingMinutes });
+const defaults = { readyNotMergingMinutes: 60, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2 };
+const envKeys = ['READY_MINUTES', 'NO_PROGRESS_DRAFT_MINUTES', 'NO_PROGRESS_MINUTES', 'CI_JOB_OVERDUE_FACTOR'];
+const thresholdLayer = layer => Object.fromEntries(Object.keys(defaults).map(key =>
+  [key, object(layer?.[key]) ? undefined : layer?.[key]]));
 export function resolveMergeWatchSettings({ env = process.env, log = console.error } = {}) {
-  const raw = env.WE_PR_MERGE_WATCH_READY_MINUTES;
   const result = resolveCascade({
-    standard: { readyNotMergingMinutes: 60 }, platform: thresholdLayer(readPlatformPreferences({ env }).prefs.prMergeWatch),
+    standard: defaults, platform: thresholdLayer(readPlatformPreferences({ env }).prefs.prMergeWatch),
     tool: thresholdLayer(readSettings().prMergeWatch),
-    envValues: { readyNotMergingMinutes: raw?.trim() ? Number(raw) : undefined },
-    valid: { readyNotMergingMinutes: minutesValid },
+    envValues: Object.fromEntries(Object.keys(defaults).map((key, i) => {
+      const raw = env[`WE_PR_MERGE_WATCH_${envKeys[i]}`];
+      return [key, raw?.trim() ? Number(raw) : undefined];
+    })),
+    valid: Object.fromEntries(Object.keys(defaults).map(key => [key, v => minutesValid(v) && (key !== 'ciJobOverdueFactor' || v > 0)])),
   });
   log(formatCascadeSourcesLine('prMergeWatch', result));
   return result.value;
@@ -32,15 +36,15 @@ export function resolveMergeWatchSettings({ env = process.env, log = console.err
 
 export async function runMergeWatch({ repos = [], gh, now = new Date().toISOString(),
   stateDir = join(handoffHome(), 'pr-merge-watch'), settings, emitEvent = appendDaemonEvent,
-  log = console.error } = {}) {
+  log = console.error, signalLogs } = {}) {
   // Load the analysis graph after the shared gate graph has finished evaluating.
   const { atomicJson, readOptionalJson, ghJson, repoFilenameKey } = await import('../../operations/coroner-pr-postmortem.mjs');
   const { defaultListPrComments } = await import('../pr-comments-list.mjs');
   const { listOpenPrs } = await import('./pr-postmortem-pass.mjs');
   gh ??= ghJson;
-  const config = settings ?? resolveMergeWatchSettings({ log });
+  const config = settings ? { ...defaults, ...settings } : resolveMergeWatchSettings({ log });
   const stamp = Date.parse(now);
-  if (!Number.isFinite(stamp) || !minutesValid(config.readyNotMergingMinutes)) throw Error('invalid merge-watch time/settings');
+  if (!Number.isFinite(stamp) || Object.entries(config).some(([k, v]) => !minutesValid(v) || (k === 'ciJobOverdueFactor' && v <= 0))) throw Error('invalid merge-watch time/settings');
   let calls = 0, delivered = 0, incomplete = false;
   const read = args => {
     if (++calls > 128) throw Error('GitHub evidence tick budget exceeded');
@@ -58,6 +62,7 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
       if (!object(state.prs) || Object.entries(state.prs).some(([n, p]) =>
         !/^[1-9]\d*$/.test(n) || !object(p) || !object(p.heads) || typeof p.merged !== 'boolean'
         || Object.entries(p.heads).some(([h, r]) => !sha(h) || !object(r) || typeof r.alerted !== 'boolean'
+          || (r.signals !== undefined && (!object(r.signals) || Object.entries(r.signals).some(([k, v]) => !/^(progress|ci:\d+|loop:[a-f0-9]{64})$/.test(k) || v !== true)))
           || !(r.since === null || (Number.isFinite(r.since) && r.since <= stamp))))) throw Error('invalid saved evidence');
       const save = () => atomicJson(file, state);
       const send = async event => {
@@ -92,6 +97,7 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
             receipt.alerted = true;
             save();
           }
+          await runMergeWatchSignals({ repo, pr, receipt, now: stamp, config, read, send, save, failure, signalLogs });
         } catch { failure(); }
       }
       for (const [number, tracked] of Object.entries(state.prs)) {

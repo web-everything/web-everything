@@ -37,13 +37,14 @@ const ready = number => ({
   comments: [], mergeStateStatus: 'CLEAN',
   createdAt: at(-10_000), updatedAt: at(-1000),
 });
-let root, stateDir, prs, gh, emitEvent, log, fullCommentPages;
+let root, stateDir, prs, gh, emitEvent, log, fullCommentPages, headTime;
 beforeEach(() => {
   if (!process.env.TMPDIR) throw Error('TMPDIR must be set for this hermetic fixture');
   root = fs.mkdtempSync(join(process.env.TMPDIR, 'merge-watch-regression-'));
   stateDir = join(root, 'state');
   config.tool = {};
   prs = [ready(17)];
+  headTime = at(0);
   fullCommentPages = 0;
   emitEvent = vi.fn().mockResolvedValue(true);
   log = vi.fn();
@@ -54,6 +55,9 @@ beforeEach(() => {
     if (args[0] !== 'api' || args.length !== 2) throw Error('unexpected or mutating GitHub call');
     const [path, query] = args[1].split('?');
     const params = new URLSearchParams(query);
+    if (path.endsWith('/check-runs')) return { check_runs: [] };
+    if (path.includes('/commits/')) return { sha: head, commit: { committer: { date: headTime } } };
+    if (path.endsWith('/timeline')) return [];
     if (path === `repos/${repo}/pulls` && params.get('state') === 'open') {
       const offset = (Number(params.get('page')) - 1) * 100;
       return prs.filter(p => p.state === 'OPEN').slice(offset, offset + 100)
@@ -69,8 +73,8 @@ beforeEach(() => {
   });
 });
 afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
-const tick = minute => runMergeWatch({ repos: [repo], gh, now: at(minute), stateDir,
-  settings: { readyNotMergingMinutes: threshold }, emitEvent, log });
+const tick = minute => { headTime = at(minute); return runMergeWatch({ repos: [repo], gh, now: at(minute), stateDir,
+  settings: { readyNotMergingMinutes: threshold }, emitEvent, log, signalLogs: () => [] }); };
 const receipt = () => JSON.parse(fs.readFileSync(join(stateDir, `${encodeURIComponent(repo)}.json`), 'utf8'))
   .prs[17].heads[head];
 const mergedReceipt = () => JSON.parse(fs.readFileSync(join(stateDir, `${encodeURIComponent(repo)}.json`), 'utf8'))
@@ -175,8 +179,8 @@ describe('merge-watch settings resolver contract', () => {
     ['tool overrides platform', { readyNotMergingMinutes: 40 }, { readyNotMergingMinutes: 20 }, undefined, 20, 'tool'],
     ['environment overrides tool', { readyNotMergingMinutes: 40 }, { readyNotMergingMinutes: 20 }, '5', 5, 'env'],
   ])('%s and logs the effective value/source', (_name, platform, tool, env, value, source) => {
-    expect(resolve(platform, tool, env)).toEqual({ readyNotMergingMinutes: value });
-    expect(log).toHaveBeenCalledWith(`policy-cascade · prMergeWatch: readyNotMergingMinutes=${value} (${source})`);
+    expect(resolve(platform, tool, env)).toEqual({ readyNotMergingMinutes: value, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2 });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining(`readyNotMergingMinutes=${value} (${source})`));
   });
 
   it.each([
@@ -191,17 +195,17 @@ describe('merge-watch settings resolver contract', () => {
     ['negative environment value', {}, { readyNotMergingMinutes: 20 }, '-1', 20, 'tool'],
     ['non-finite environment value', {}, { readyNotMergingMinutes: 20 }, 'Infinity', 20, 'tool'],
   ])('ignores invalid %s, retaining and logging the lower layer', (_name, platform, tool, env, value, source) => {
-    expect(resolve(platform, tool, env)).toEqual({ readyNotMergingMinutes: value });
+    expect(resolve(platform, tool, env)).toEqual({ readyNotMergingMinutes: value, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2 });
     expect(log.mock.calls.flat().join(' ')).toContain(`readyNotMergingMinutes=${value} (${source})`);
   });
 
   it.each(['', '   '])('an empty environment override (%j) preserves tool provenance', env => {
-    expect(resolve({}, { readyNotMergingMinutes: 20 }, env)).toEqual({ readyNotMergingMinutes: 20 });
-    expect(log).toHaveBeenCalledWith('policy-cascade · prMergeWatch: readyNotMergingMinutes=20 (tool)');
+    expect(resolve({}, { readyNotMergingMinutes: 20 }, env)).toEqual({ readyNotMergingMinutes: 20, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2 });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('readyNotMergingMinutes=20 (tool)'));
   });
 
   it('accepts zero as a valid environment threshold and logs env provenance', () => {
-    expect(resolve({}, { readyNotMergingMinutes: 20 }, '0')).toEqual({ readyNotMergingMinutes: 0 });
-    expect(log).toHaveBeenCalledWith('policy-cascade · prMergeWatch: readyNotMergingMinutes=0 (env)');
+    expect(resolve({}, { readyNotMergingMinutes: 20 }, '0')).toEqual({ readyNotMergingMinutes: 0, noProgressDraftMinutes: 240, noProgressMinutes: 180, ciJobOverdueFactor: 2 });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('readyNotMergingMinutes=0 (env)'));
   });
 });
