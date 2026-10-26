@@ -8,7 +8,7 @@ const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 export default {
   id: 'automation-operator-ruling-orphan',
   title: 'automation-posted operator rulings recover an unowned referral bounce',
-  card: 'x1b8hlo / PR #5925',
+  card: '5726 / PR #5925',
   fixedBy: { sha: 'pending', where: 'lane/port-c-orphan-rearm', paths: ['scripts/conveyor/orphan-fix-round.mjs'] },
   fixPresent(root) {
     const source = readFileSync(join(root, 'scripts/conveyor/orphan-fix-round.mjs'), 'utf8');

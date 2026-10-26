@@ -1,4 +1,5 @@
 ---
+bornAs: xx32ch4
 kind: story
 size: 2
 status: open
