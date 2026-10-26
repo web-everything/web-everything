@@ -225,6 +225,64 @@ describe('runMergeWatch — acceptedRedTeamClearAndClean (humanReviewHold + fina
     expect(emitEvent.mock.calls).toEqual([[{ kind: 'pr-merged', repo: REPO, pr: 17 }]]);
   });
 
+  it.each(['CLOSED view', 'unavailable view', 'unavailable comments', 'comment page cap', 'invalid comment author'])(
+    'emits pr-merged when discovery precedes the first successful evidence read: %s', async failure => {
+      const read = gh.getMockImplementation();
+      gh.mockImplementation(args => {
+        if (args[0] === 'pr' && args[1] === 'view') {
+          if (failure === 'CLOSED view') {
+            prs.set(REPO, [readyPr({ state: 'CLOSED', merged_at: at(0) })]);
+          }
+          if (failure === 'unavailable view') throw Error('view unavailable');
+        }
+        if (args.some(arg => arg.includes('/comments?'))) {
+          if (failure === 'unavailable comments') throw Error('comments unavailable');
+          if (failure === 'comment page cap') return Array.from({ length: 100 }, () => ({
+            body: '', user: { login: 'web-everything' }, created_at: at(0),
+          }));
+          if (failure === 'invalid comment author') return [{ body: '', user: null, created_at: at(0) }];
+        }
+        return read(args);
+      });
+      await tick(0);
+      expect(emitEvent).not.toHaveBeenCalled();
+      const saved = JSON.parse(fs.readFileSync(join(stateDir, `${encodeURIComponent(REPO)}.json`), 'utf8'));
+      expect(saved.prs[17]).toEqual({ heads: {}, merged: false });
+      prs.set(REPO, [readyPr({ state: 'CLOSED', merged_at: at(1) })]);
+      gh.mockImplementation(read);
+      await restartPass();
+      await tick(2);
+      await restartPass();
+      await tick(3);
+      expect(emitEvent.mock.calls).toEqual([[{ kind: 'pr-merged', repo: REPO, pr: 17 }]]);
+    },
+  );
+
+  it('persists every discovered PR before evidence reads, including jobs deferred by the tick budget', async () => {
+    prs.set(REPO, Array.from({ length: 140 }, (_, i) => readyPr({ number: i + 1 })));
+    const read = gh.getMockImplementation();
+    const snapshots = [];
+    gh.mockImplementation(args => {
+      if (args[0] === 'pr' && args[1] === 'view') {
+        const file = join(stateDir, `${encodeURIComponent(REPO)}.json`);
+        snapshots.push(fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : null);
+        throw Error('view unavailable');
+      }
+      return read(args);
+    });
+    await tick(0);
+    expect(snapshots.length).toBeGreaterThan(0);
+    expect(snapshots.length).toBeLessThan(140);
+    expect(Object.keys(snapshots[0]?.prs ?? {})).toHaveLength(140);
+    expect(emitEvent).not.toHaveBeenCalled();
+    prs.set(REPO, prs.get(REPO).map(pr => ({ ...pr, state: 'CLOSED', merged_at: at(1) })));
+    gh.mockImplementation(read);
+    for (let minute = 2; minute < 6; minute++) await tick(minute);
+    expect(emitEvent).toHaveBeenCalledTimes(140);
+    expect(new Set(emitEvent.mock.calls.map(([event]) => event.pr)).size).toBe(140);
+    expect(emitEvent.mock.calls.every(([event]) => event.kind === 'pr-merged')).toBe(true);
+  });
+
   it('closed without merged_at is not proof of a merge', async () => {
     await tick(0);
     prs.set(REPO, [readyPr({ state: 'CLOSED', merged_at: null })]);

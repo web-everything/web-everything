@@ -99,6 +99,21 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
         delivered++;
       };
       const open = listOpenPrs(repo, { gh: read });
+      // Persist discovery before readiness reads or budget deferral.
+      // Empty heads schedule merge checks without claiming any readiness evidence.
+      let discovered = false;
+      for (const listed of open) {
+        if (!state.prs[listed.number]) {
+          state.prs[listed.number] = { heads: {}, merged: false };
+          discovered = true;
+        }
+        const tracked = state.prs[listed.number];
+        if (tracked.closed !== undefined) {
+          delete tracked.closed; // Reopened PRs need merge checks even if evidence fails.
+          discovered = true;
+        }
+      }
+      if (discovered) save();
       const jobs = new Map(open.map(p => [p.number, p]));
       for (const [number, tracked] of Object.entries(state.prs)) {
         if (!tracked.merged && !tracked.closed && !jobs.has(Number(number))) jobs.set(Number(number), null);
@@ -146,8 +161,7 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
           pr.comments = defaultListPrComments({ number: pr.number, repo, gh: read, maxPages: 10 });
           if (pr.comments.some(c => typeof c.body !== 'string' || typeof c.author?.login !== 'string'
             || !Number.isFinite(Date.parse(c.createdAt)))) throw Error('incomplete comment evidence');
-          const tracked = state.prs[pr.number] ??= { heads: {}, merged: false };
-          delete tracked.closed; // Open discovery reactivates a retired, reopened PR.
+          const tracked = state.prs[pr.number];
           for (const [head, receipt] of Object.entries(tracked.heads)) if (head !== pr.headRefOid) {
             receipt.since = null;
             // Unpublished superseded heads retire; delivered identities remain for deduplication.
