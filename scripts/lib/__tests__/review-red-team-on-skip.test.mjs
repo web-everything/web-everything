@@ -1,21 +1,184 @@
+import { latestAcceptRecord } from '../accept-carry-forward.mjs';
+import { proveCardOnlyHeadMove } from '../card-only-head-move.mjs';
+import * as numbering from '../numbering-carry.mjs';
 import { describe, it, expect, vi } from 'vitest';
 import { normalizeRedTeamResult, planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
 import { readDrainRedTeamEvidence } from '../drain-red-team-evidence.mjs';
+import { redTeamForHead, redTeamMarker } from '../red-team-gate.mjs';
+import { runGhSync } from '../gh-throttle.mjs';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+
+vi.mock('../gh-throttle.mjs', async importOriginal => ({
+  ...await importOriginal(), runGhSync: vi.fn(),
+}));
 
 const repo = 'web-everything/web-everything', head = 'a'.repeat(40), pr = 5762;
 const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
 function fixture(over = {}) {
   return { repo, refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }],
-    rawPrs: [{ number: pr, headRefOid: head, comments: [] }],
+    rawPrs: [{ number: pr, headRefOid: head, comments: [], reviews: [] }],
     readEvidence: () => ({ loopPayload: payload(), recorded: false }), readStatus: () => null,
     now: 2_000_000, setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(), ...over };
 }
 const decide = over => planRedTeamOnSkip(fixture(over))[0];
+
+describe('R100 — #5910 accepted stored review does not owe a red team', () => {
+  const storedHead = '682e81b3ae1c'.padEnd(40, '0'), storedPr = 5910;
+  function storedFixture(over = {}) {
+    return fixture({
+      refusals: [{ kind: 'already-reviewed-head', prNumber: storedPr, headSha: storedHead }],
+      // This R100 fixture previously had only a label; a real accepted head needs its trusted accept comment.
+      rawPrs: [{ number: storedPr, headRefOid: storedHead, labels: ['review:accepted'], reviews: [],
+        comments: [{ body: `✅ review — accepted\n<!-- reviewed-sha: ${storedHead} -->`, author: { login: 'web-everything' } }] }],
+      readEvidence: () => ({ loopPayload: {
+        verdict: { verdict: 'needs-human', humanRequired: false },
+        findings: { read: { netBasis: { rev: storedHead },
+          diffText: 'diff --git a/backlog/5910-card.md b/backlog/5910-card.md\n+update',
+          netChangedFiles: ['backlog/5910-card.md'], netRenameSources: [] } },
+      } }),
+      ...over,
+    });
+  }
+  function storedRun(over = {}) {
+    const f = storedFixture();
+    const evidence = f.readEvidence();
+    evidence.loopPayload.verdict = { verdict: 'accept' };
+    evidence.seatRecorded = false;
+    return runFixture({ ...f, readEvidence: () => evidence,
+      readStatus: () => ({ status: 'finished', result: 'not-owed' }),
+      plan: { refusals: f.refusals }, now: () => f.now, ...over });
+  }
+
+  it.each([['review:accepted'], [{ name: 'review:accepted' }]].map(labels => [labels]))(
+    'refuses historical non-accepting stored review despite accepted labels %j', labels => {
+      const f = storedFixture(); f.rawPrs[0].labels = labels;
+      expect(planRedTeamOnSkip(f)).toEqual([{ prNumber: storedPr, head: storedHead,
+        action: 'skip', why: 'stored review does not owe a red team' }]);
+    });
+
+  it.each(['inFlight', 'queued'])('skips an accepted not-owed review while %s', key => {
+    const f = storedFixture(), evidence = { ...f.readEvidence(), [key]: true };
+    f.readEvidence = () => evidence;
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'skip', why: 'red-team pass in flight' });
+  });
+
+  it('skips an accepted not-owed review with a prior error status row', () => {
+    const readStatus = vi.fn(() => ({ status: 'finished', head: storedHead, result: 'error' }));
+    expect(planRedTeamOnSkip(storedFixture({ readStatus }))[0])
+      .toMatchObject({ action: 'skip', why: 'stored review does not owe a red team' });
+    expect(readStatus).toHaveBeenCalledWith({ repo, pr: storedPr, head: storedHead });
+  });
+
+  it('skips an accepted not-owed review with recorded red-team evidence', () => {
+    const f = storedFixture(), evidence = { ...f.readEvidence(), recorded: true };
+    f.readEvidence = () => evidence;
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'skip', why: 'stored review does not owe a red team' });
+  });
+
+  it('fails closed when prior status is unreadable for an accepted not-owed review', () => {
+    const f = storedFixture({ readStatus: () => { throw Error('unreadable'); } });
+    expect(planRedTeamOnSkip(f)[0])
+      .toMatchObject({ action: 'skip', why: 'red-team evidence unreadable; inspect stored evidence before retrying' });
+  });
+
+  it.each([[], ['review:human'], undefined, null, 'review:accepted'].map(labels => [labels]))(
+    'keeps the existing skip without readable accepted labels %j', labels => {
+      const f = storedFixture(); f.rawPrs[0].labels = labels;
+      expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'skip', why: 'stored review does not owe a red team' });
+    });
+
+  it.each(['b'.repeat(40), undefined])('keeps the existing skip for a mismatched or missing stored head %j', rev => {
+    const f = storedFixture(), evidence = f.readEvidence();
+    evidence.loopPayload.findings.read.netBasis.rev = rev;
+    f.readEvidence = () => evidence;
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'skip', why: 'stored review does not owe a red team' });
+  });
+
+  it('fails closed on unreadable stored evidence or comments on an accepted head', () => {
+    const f = storedFixture({ readEvidence: () => { throw Error('unreadable'); } });
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'skip', why: 'red-team evidence unreadable; inspect stored evidence before retrying' });
+    f.rawPrs[0].comments = undefined;
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'skip', why: 'PR comments unreadable' });
+  });
+
+  it('default settlement posts the head-bound reasoned marker once without consuming dispatch capacity', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-stored-clear-'));
+    const take = vi.fn(), log = vi.fn();
+    const o = storedRun({ env: { WE_SHARED_RUNS_DIR: join(dir, 'runs') }, log,
+      capacity: { lanes: 0, budget: { left: 0 }, remainingStarts: 0, take } });
+    runGhSync.mockImplementation((_args, options) => {
+      o.rawPrs[0].comments.push({ body: options.input, author: { login: 'web-everything' } });
+    });
+    try {
+      expect(runRedTeamOnSkip(o)).toMatchObject({
+        rows: [{ action: 'clear', why: 'not owed (stored review)' }], dispatched: [], notStarted: [],
+      });
+      expect(runGhSync).toHaveBeenCalledOnce();
+      expect(runGhSync).toHaveBeenCalledWith([
+        'pr', 'comment', String(storedPr), `--repo=${repo}`, '--body-file', '-',
+      ], expect.objectContaining({ input: expect.stringContaining('not owed (stored review)') }));
+      expect(o.rawPrs[0].comments.at(-1).body.split('\n')[0]).toBe(redTeamMarker(storedPr, storedHead));
+      expect(redTeamForHead(o.rawPrs[0].comments, storedPr, storedHead)).toEqual({ pr: storedPr, rev: storedHead, findings: [] });
+      expect(redTeamForHead(o.rawPrs[0].comments, storedPr, 'b'.repeat(40))).toBeNull();
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'red-team result already on head' });
+      expect(runGhSync).toHaveBeenCalledOnce();
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('red team cleared'));
+      expect(o.capacity).toEqual({ lanes: 0, budget: { left: 0 }, remainingStarts: 0, take });
+      expect(take).not.toHaveBeenCalled();
+      expect(o.dispatch).not.toHaveBeenCalled();
+      expect(o.lastDispatch.size).toBe(0);
+    } finally {
+      runGhSync.mockReset();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['policy-clear', 'already'])('retains clear for settlement outcome %s', outcome => {
+    const settle = vi.fn(() => ({ outcome })), o = storedRun({ settle });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'clear', why: 'not owed (stored review)' });
+    expect(settle).toHaveBeenCalledOnce();
+    expect(o.syncLabels).toHaveBeenCalledOnce();
+    expect(settle).toHaveBeenCalledWith(expect.objectContaining({
+      redTeam: { status: 'not-owed' }, repo, pr: storedPr, head: storedHead, readHead: storedHead,
+      accepted: true, comments: o.rawPrs[0].comments, reason: 'not owed (stored review)',
+    }));
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['throws', () => { throw Error('offline'); }, 'offline'],
+    ['throws an unprintable value', () => { throw { message: { toString: null } }; }, 'unprintable error'],
+    ['returns non-policy', () => ({ outcome: 'non-policy', reason: 'post failed' }), 'post failed'],
+    ['returns unknown', () => undefined, 'unknown outcome'],
+  ])('settlement that %s becomes a skip without throwing', (_name, settle, why) => {
+    const o = storedRun({ settle });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: `clear failed: ${why}` });
+    expect(o.dispatch).not.toHaveBeenCalled();
+    expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 } });
+    expect(o.lastDispatch.size).toBe(0);
+  });
+
+  it('dry run preserves the clear plan without settling or spending capacity', () => {
+    const settle = vi.fn(), o = storedRun({ settle, dryRun: true });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'clear', why: 'dry run (clear)' });
+    expect(settle).not.toHaveBeenCalled();
+    expect(o.dispatch).not.toHaveBeenCalled();
+    expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 } });
+    expect(o.lastDispatch.size).toBe(0);
+  });
+
+  it('a red-team result already on the head keeps the existing skip and never settles', () => {
+    const settle = vi.fn(), readEvidence = vi.fn(), o = storedRun({ settle, readEvidence });
+    o.rawPrs[0].comments.push({ body: redTeamMarker(storedPr, storedHead), author: { login: 'web-everything' } });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'red-team result already on head' });
+    expect(settle).not.toHaveBeenCalled();
+    expect(readEvidence).not.toHaveBeenCalled();
+  });
+});
 
 describe('planRedTeamOnSkip — heal a previously skipped card-only head', () => {
   const cardPayload = () => {
@@ -247,7 +410,7 @@ function runFixture(over = {}) {
   const f = fixture();
   return { repo, plan: { refusals: f.refusals }, rawPrs: f.rawPrs, setting: f.setting,
     readEvidence: f.readEvidence, readStatus: f.readStatus, now: () => f.now, lastDispatch: f.lastDispatch,
-    capacity: { lanes: 1, budget: { left: 1 } }, dispatch: vi.fn(() => ({ jobPid: 42 })), ...over };
+    syncLabels: vi.fn(), capacity: { lanes: 1, budget: { left: 1 } }, dispatch: vi.fn(() => ({ jobPid: 42 })), ...over };
 }
 describe('runRedTeamOnSkip', () => {
   it.each(['finished-error', 'missing'])('an error seat row with %s status skips without dispatch', kind => {
@@ -379,5 +542,377 @@ describe('PR 5890 review-pr status payloads', () => {
     expect(decide({ readStatus: () => ({ repo, pr, head, status: 'finished', result: 'ran', loopPayload: { ...payload(), op: 'review-pr' } }),
       readEvidence: () => ({ loopPayload: payload(), recorded: true, seatRecorded: true, completedRecorded: true }) }))
       .toMatchObject({ action: 'dispatch', mode: 'resume' });
+  });
+});
+
+
+describe('card-only head move recovery', () => {
+  const fromSha = 'b'.repeat(40);
+  const oldPayload = () => ({ verdict: { verdict: 'changes' }, findings: { read: {
+    netBasis: { rev: fromSha }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
+  } } });
+  const oldEvidence = () => {
+    const loopPayload = oldPayload();
+    return { loopPayload, recorded: false, seatRecorded: false, completedRecorded: false, inFlight: false,
+      status: { head: fromSha, status: 'finished', result: 'skipped', skipCardOnly: true, loopPayload } };
+  };
+  it.each(['numbering-only', 'card-only'])('%s move dispatches fresh despite a not-owed old review', kind => {
+    const proveMove = vi.fn(() => ({ ok: true, kind }));
+    expect(decide({ readEvidence: oldEvidence, proveMove })).toMatchObject({ action: 'dispatch', mode: 'fresh' });
+    expect(proveMove).toHaveBeenCalledWith({ fromSha, toSha: head });
+  });
+  it.each(['code change', 'unprovable move'])('keeps the skip for %s', reason => {
+    expect(decide({ readEvidence: oldEvidence, proveMove: () => ({ ok: false, reason }) }).action).toBe('skip');
+  });
+  it.each([
+    { recorded: true }, { seatRecorded: true }, { inFlight: true }, { queued: true },
+    { status: null }, { completedRecorded: true },
+  ])('does not dispatch with existing or unknown evidence %j', over => {
+    expect(decide({ readEvidence: () => ({ ...oldEvidence(), ...over }), proveMove: () => ({ ok: true }) }).action).toBe('skip');
+  });
+  it.each(['missing head', 'code read', 'not skipped', 'skip disabled'])('refuses %s provenance', kind => {
+    const evidence = oldEvidence();
+    if (kind === 'missing head') delete evidence.loopPayload.findings.read.netBasis.rev;
+    if (kind === 'code read') evidence.loopPayload.findings.read.netChangedFiles = ['scripts/code.mjs'];
+    if (kind === 'not skipped') evidence.status.result = 'ran';
+    if (kind === 'skip disabled') evidence.status.skipCardOnly = false;
+    expect(decide({ readEvidence: () => evidence, proveMove: () => ({ ok: true }) }).action).toBe('skip');
+  });
+  it('observes cooldown and existing live-head state after the proof', () => {
+    const base = { readEvidence: oldEvidence, proveMove: () => ({ ok: true }) };
+    expect(decide({ ...base, lastDispatch: new Map([[`${repo}#${pr}@${head}`, 200_001]]) }).why).toBe('retry cooldown active');
+    expect(decide({ ...base, readStatus: () => ({ status: 'finished' }) }).action).toBe('skip');
+  });
+  it('runner uses the injected move proof and dispatches the normal red-team-only job', () => {
+    const dispatch = vi.fn(() => ({ jobPid: 42 }));
+    const out = runRedTeamOnSkip({ ...fixture(), plan: { refusals: fixture().refusals },
+      now: () => 2_000_000, readEvidence: oldEvidence, proveMove: () => ({ ok: true }),
+      capacity: { lanes: 1 }, dispatch });
+    expect(out.dispatched).toHaveLength(1);
+    expect(dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' });
+  });
+});
+
+describe('proveCardOnlyHeadMove', () => {
+  const fromSha = 'b'.repeat(40), toSha = head;
+  it('reuses the numbering detector before checking card paths', () => {
+    const proof = { ok: true, kind: 'numbering-only' };
+    const detector = vi.spyOn(numbering, 'proveNumberingOnlyMove').mockReturnValue(proof);
+    const exec = vi.fn();
+    try {
+      expect(proveCardOnlyHeadMove({ exec, fromSha, toSha, cwd: 'checkout', mainRef: 'main' })).toBe(proof);
+      expect(detector).toHaveBeenCalledWith({ exec, fromSha, toSha, cwd: 'checkout', mainRef: 'main' });
+      expect(exec).not.toHaveBeenCalled();
+    } finally { detector.mockRestore(); }
+  });
+  const c1 = 'c'.repeat(40);
+  const fake = ({ ancestor = true, revList = `${c1} ${fromSha}`, tree }) => vi.fn((file, args) => {
+    if (args[0] === 'merge-base') { if (!ancestor) throw Error('not ancestor'); return ''; }
+    if (args[0] === 'rev-list') return revList;
+    if (args[0] === 'diff-tree') return tree;
+    throw Error('not numbering');
+  });
+  it.each([
+    ['backlog/123-card.md\0', true],
+    ['backlog/123-card.md\0scripts/code.mjs\0', false],
+    ['scripts/code.mjs\0backlog/123-moved.md\0', false],
+    ['', false], ['backlog/123-card.md', false], ['x'.repeat(1024 * 1024 + 1) + '\0', false],
+  ])('fails closed unless every commit contains only card paths (case %#)', (tree, ok) => {
+    const exec = fake({ tree });
+    expect(proveCardOnlyHeadMove({ exec, fromSha, toSha, cwd: 'checkout' }).ok).toBe(ok);
+  });
+  it('refuses a non-descendant head, a merge commit, and submodule-blind diffs', () => {
+    expect(proveCardOnlyHeadMove({ exec: fake({ ancestor: false, tree: 'backlog/1-a.md\0' }), fromSha, toSha }).ok).toBe(false);
+    expect(proveCardOnlyHeadMove({ exec: fake({ revList: `${c1} ${fromSha} ${'d'.repeat(40)}`, tree: 'backlog/1-a.md\0' }), fromSha, toSha }).ok).toBe(false);
+    const exec = fake({ tree: 'backlog/1-a.md\0' });
+    proveCardOnlyHeadMove({ exec, fromSha, toSha });
+    expect(exec).toHaveBeenCalledWith('git', expect.arrayContaining(['diff-tree', '--ignore-submodules=none', '--no-ext-diff']), expect.anything());
+  });
+  it('refuses missing heads and unreadable Git evidence', () => {
+    const exec = () => { throw Error('missing commit'); };
+    expect(proveCardOnlyHeadMove({ exec, toSha }).ok).toBe(false);
+    expect(proveCardOnlyHeadMove({ exec, fromSha, toSha }).ok).toBe(false);
+  });
+});
+
+
+describe('R100 recovery regressions', () => {
+  const old = 'b'.repeat(40);
+  const trusted = body => ({ body, author: { login: 'web-everything' } });
+  const carryOptions = () => runFixture({
+    rawPrs: [{ number: pr, headRefOid: head, labels: ['review:accepted'], reviews: [], comments: [
+      trusted(`✅ review — accepted\n<!-- reviewed-sha: ${old} -->`),
+      trusted(`${redTeamMarker(pr, old)}\nRed team not required on this head: card-only diff`),
+      trusted(`📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${head} -->`),
+    ] }], readEvidence: () => ({ inFlight: false, recorded: false }),
+  });
+  const publicationOptions = kind => {
+    const o = kind === 'carry' ? carryOptions() : runFixture({
+      readEvidence: () => ({ loopPayload: payload(), recorded: false, seatRecorded: false }),
+      readStatus: () => kind === 'finished/not-owed' ? { status: 'finished', result: 'not-owed' } : null,
+    });
+    if (kind !== 'carry') {
+      o.rawPrs[0].labels = ['review:accepted'];
+      o.rawPrs[0].comments = [trusted(`✅ review — accepted\n<!-- reviewed-sha: ${head} -->`)];
+    }
+    o.settle = vi.fn(() => ({ outcome: 'policy-clear' }));
+    return o;
+  };
+  describe.each(['carry', 'finished/not-owed'])('%s acceptance evidence audit', kind => {
+    function options() {
+      const o = publicationOptions(kind);
+      o.rawPrs[0].reviews = [];
+      for (const comment of o.rawPrs[0].comments) comment.createdAt = '2026-10-09T14:00:00Z';
+      return o;
+    }
+    function expectSkip(o, why) {
+      runGhSync.mockClear();
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', ...(why ? { why } : {}) });
+      expect(runGhSync).not.toHaveBeenCalled();
+      expect(o.settle).not.toHaveBeenCalled();
+      expect(o.syncLabels).not.toHaveBeenCalled();
+      expect(o.dispatch).not.toHaveBeenCalled();
+    }
+    it('publishes with readable reviews and established acceptance on the live head', () => {
+      const o = options();
+      expect(runRedTeamOnSkip(o).rows[0].action).toBe(kind === 'carry' ? 'carry' : 'clear');
+    });
+    it('refuses a formal CHANGES_REQUESTED review after acceptance', () => {
+      const o = options();
+      o.rawPrs[0].reviews = [{ state: 'CHANGES_REQUESTED', submittedAt: '2026-10-09T15:00:00Z',
+        author: { login: 'reviewer' } }];
+      expectSkip(o);
+    });
+    it.each([undefined, null, {}])('refuses unreadable formal reviews %j for operator inspection', reviews => {
+      const o = options(); o.rawPrs[0].reviews = reviews;
+      expectSkip(o, 'PR reviews unreadable; inspect formal reviews before policy-clear');
+    });
+    if (kind !== 'carry') {
+      it.each(['missing', 'untrusted', 'wrong-head'])('refuses %s acceptance evidence', evidence => {
+        const o = options();
+        if (evidence === 'missing') o.rawPrs[0].comments = [];
+        if (evidence === 'untrusted') o.rawPrs[0].comments[0].author.login = 'stranger';
+        if (evidence === 'wrong-head') o.rawPrs[0].comments[0].body = o.rawPrs[0].comments[0].body.replace(head, old);
+        expectSkip(o, 'stored review does not owe a red team');
+      });
+    }
+  });
+  describe.each(['carry', 'finished/not-owed'])('%s publication guard', kind => {
+    it.each(['Please hold this acceptance', 'manifest baseline mismatch', '🔁 review — changes requested'])(
+      'refuses a later hold comment after acceptance: %s', body => {
+        const o = publicationOptions(kind);
+        o.rawPrs[0].comments.push(trusted(body));
+        runGhSync.mockClear();
+        expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
+          why: 'later verdict or hold supersedes acceptance' });
+        expect(runGhSync).not.toHaveBeenCalled();
+        expect(o.settle).not.toHaveBeenCalled();
+        expect(o.syncLabels).not.toHaveBeenCalled();
+        expect(o.dispatch).not.toHaveBeenCalled();
+      });
+    it.each(['red-team:blocked', 'red-team:pending', 'review:changes', 'review:human', 'review:pending',
+      'review:held-mechanical', 'review:awaiting-advisory', 'review:prep', 'review:future-hold',
+      'review-status:pending', 'review-status:future-hold']
+      .flatMap(label => [label, { name: label }]))('refuses a conflicting label %j', label => {
+      const o = publicationOptions(kind);
+      o.rawPrs[0].labels.push(label);
+      runGhSync.mockClear();
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
+        why: 'conflicting label prevents policy-clear' });
+      expect(runGhSync).not.toHaveBeenCalled();
+      expect(o.settle).not.toHaveBeenCalled();
+      expect(o.syncLabels).not.toHaveBeenCalled();
+      expect(o.dispatch).not.toHaveBeenCalled();
+    });
+  });
+  it.each(['fresh', 'resume'].flatMap(mode => [
+    ...['red-team:blocked', 'red-team:pending', 'review:changes', 'review:human', 'review:pending']
+      .flatMap(label => [label, { name: label }]).map(label => ({ mode, label })),
+    ...['Please hold this acceptance', 'manifest baseline mismatch', '🔁 review — changes requested']
+      .map(body => ({ mode, body })),
+  ]))('publication guard preserves the complete $mode dispatch plan with $label / $body', ({ mode, label, body }) => {
+    const o = publicationOptions('null-status');
+    const completed = mode === 'resume';
+    const input = fixture({ rawPrs: o.rawPrs,
+      readEvidence: () => ({ loopPayload: payload(), recorded: completed,
+        seatRecorded: completed, completedRecorded: completed }),
+      readStatus: () => completed ? { status: 'finished', result: 'ran' } : null,
+    });
+    const expected = planRedTeamOnSkip(input);
+    expect(expected).toEqual([{ prNumber: pr, head, action: 'dispatch', mode,
+      why: completed ? 'recorded pass needs its result comment/effects' : 'head never had a red-team pass' }]);
+    if (label) input.rawPrs[0].labels.push(label);
+    if (body) input.rawPrs[0].comments.push(trusted(body));
+    expect(planRedTeamOnSkip(input)).toEqual(expected);
+  });
+  it.each(['untrusted', 'extra-prose', 'malformed-marker'])(
+    'source policy-clear remains a possible hold with %s', kind => {
+      const comments = carryOptions().rawPrs[0].comments.slice(0, 2);
+      if (kind === 'untrusted') comments[1].author.login = 'stranger';
+      if (kind === 'extra-prose') comments[1].body += '\nPlease hold this acceptance';
+      if (kind === 'malformed-marker') comments[1].body = comments[1].body.replace(old, 'bad');
+      expect(latestAcceptRecord(comments).laterVerdict).toBe(true);
+    });
+  it.each(['status', 'recorded', 'seatRecorded', 'completedRecorded', 'blocked-label', 'withheld'])(
+    'refuses policy carry with live-head %s evidence', kind => {
+      const o = carryOptions();
+      if (kind === 'status' || kind === 'withheld') o.readStatus = () => ({ status: 'finished',
+        result: kind === 'withheld' ? { status: 'ran', comment: 'withheld' } : 'error' });
+      else if (kind === 'blocked-label') o.rawPrs[0].labels.push('red-team:blocked');
+      else o.readEvidence = () => ({ inFlight: false, [kind]: true });
+      expect(runRedTeamOnSkip(o).rows[0].action).not.toBe('carry');
+      expect(o.syncLabels).not.toHaveBeenCalled();
+    });
+  it.each(['Please hold this acceptance', 'manifest baseline mismatch'])(
+    'refuses policy carry after a later hold: %s', body => {
+      const o = carryOptions();
+      o.rawPrs[0].comments.push(trusted(body));
+      expect(runRedTeamOnSkip(o).rows[0].action).not.toBe('carry');
+      expect(o.syncLabels).not.toHaveBeenCalled();
+    });
+  it.each(['Please hold this acceptance', 'manifest baseline mismatch', '🔁 review — changes requested'])(
+    'refuses policy carry when the source acceptance was held before re-stamp: %s', body => {
+      const o = carryOptions();
+      o.rawPrs[0].comments.splice(2, 0, trusted(body));
+      runGhSync.mockClear();
+      expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+      expect(runGhSync).not.toHaveBeenCalled();
+      expect(o.syncLabels).not.toHaveBeenCalled();
+    });
+  it.each([null, 'finished'].flatMap(status =>
+    ['changes', 'needs-human', undefined].flatMap(verdict =>
+      [undefined, 'red-team:blocked', 'red-team:pending', 'review:changes', 'review:human', 'review:pending']
+        .map(label => [status, verdict, label]))))(
+    'refuses stored clear with status %s, verdict %s, label %s', (status, verdict, label) => {
+      const o = runFixture({
+        readEvidence: () => ({ loopPayload: { verdict: { verdict }, findings: { read: { netBasis: { rev: head } } } },
+          recorded: false, seatRecorded: false }),
+        readStatus: () => status && ({ status, result: 'not-owed' }),
+      });
+      o.rawPrs[0].labels = ['review:accepted', ...(label ? [{ name: label }] : [])];
+      runGhSync.mockClear();
+      expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+      expect(runGhSync).not.toHaveBeenCalled();
+      expect(o.syncLabels).not.toHaveBeenCalled();
+      expect(o.dispatch).not.toHaveBeenCalled();
+    });
+  it.each(['red-team:blocked', 'red-team:pending', 'review:changes', 'review:human', 'review:pending'])(
+    'refuses clear of an accepting finished/not-owed review carrying %s', label => {
+      const o = runFixture({ readEvidence: () => ({ loopPayload: payload(), recorded: false, seatRecorded: false }),
+        readStatus: () => ({ status: 'finished', result: 'not-owed' }) });
+      o.rawPrs[0].labels = ['review:accepted', label];
+      // Keep a real accepted head so this fixture exercises the label guard.
+      o.rawPrs[0].comments = [trusted(`✅ review — accepted\n<!-- reviewed-sha: ${head} -->`)];
+      expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+      expect(o.syncLabels).not.toHaveBeenCalled();
+    });
+  it('keeps an accepting review with null status owed rather than clearing it', () => {
+    const o = runFixture();
+    o.rawPrs[0].labels = ['review:accepted'];
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('dispatch');
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+  it('carries prior policy-clear across trusted acceptance re-stamp once and syncs labels', () => {
+    const o = carryOptions();
+    runGhSync.mockImplementation((_args, options) => o.rawPrs[0].comments.push(trusted(options.input)));
+    try {
+      expect(runRedTeamOnSkip(o).rows[0].action).toBe('carry');
+      expect(o.rawPrs[0].comments.at(-1).body).toContain(`${redTeamMarker(pr, head)}\nRed team not required on this head: prior policy-clear carried from ${old.slice(0, 8)} across a content-preserving rebase (acceptance re-stamped)`);
+      expect(o.syncLabels).toHaveBeenCalledOnce();
+      expect(runRedTeamOnSkip(o).rows[0].why).toBe('red-team result already on head');
+      expect(o.syncLabels).toHaveBeenCalledOnce();
+    } finally { runGhSync.mockReset(); }
+  });
+  it.each(['missing', 'untrusted', 'wrong-head', 'blocked', 'ran', 'unaccepted', 'inFlight', 'queued', 'unknown-evidence', 'old-untrusted', 'ran-with-policy-quote', 'superseded-clear', 'missing-source', 'untrusted-source', 'mismatched-source', 'late-source-result'])(
+    'refuses carry for %s', kind => {
+      const o = carryOptions(), comments = o.rawPrs[0].comments;
+      if (kind === 'missing') comments.pop();
+      if (kind === 'untrusted') comments[2].author.login = 'stranger';
+      if (kind === 'wrong-head') comments[2].body = comments[2].body.replace(head, old);
+      if (['blocked', 'ran'].includes(kind)) comments[1].body = `${redTeamMarker(pr, old)}\nRed team ${kind}`;
+      if (kind === 'old-untrusted') comments[1].author.login = 'stranger';
+      if (kind === 'ran-with-policy-quote') comments[1].body += '\nRed team ran';
+      if (kind === 'superseded-clear') comments.splice(2, 0, trusted(`${redTeamMarker(pr, old)}\nRed team ran`));
+      if (kind === 'late-source-result') comments.push(trusted(`${redTeamMarker(pr, old)}\nRed team ran`));
+      if (kind === 'missing-source') comments.shift();
+      if (kind === 'untrusted-source') comments[0].author.login = 'stranger';
+      if (kind === 'mismatched-source') comments[0].body = comments[0].body.replace(old, 'c'.repeat(40));
+      if (kind === 'unknown-evidence') o.readEvidence = () => null;
+      if (kind === 'unaccepted') o.rawPrs[0].labels = [];
+      if (['inFlight', 'queued'].includes(kind)) o.readEvidence = () => ({ [kind]: true });
+      expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+      expect(o.syncLabels).not.toHaveBeenCalled();
+    });
+  it.each([true, false])('refuses ancient policy-clear when a newer blocked revision precedes the live-head re-stamp (source accepted: %s)', acceptedSource => {
+    const o = carryOptions(), source = 'c'.repeat(40);
+    o.rawPrs[0].comments.splice(2, 0,
+      ...(acceptedSource ? [trusted(`✅ review — accepted\n<!-- reviewed-sha: ${source} -->`)] : []),
+      trusted(`${redTeamMarker(pr, source)}\nRed team blocked`));
+    runGhSync.mockClear();
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+    expect(runGhSync).not.toHaveBeenCalled();
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+  it('refuses carry when a trusted blocked result on another revision arrives after the live-head re-stamp', () => {
+    const o = carryOptions();
+    o.rawPrs[0].comments.push(trusted(`${redTeamMarker(pr, 'c'.repeat(40))}\nRed team blocked`));
+    runGhSync.mockClear();
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+    expect(runGhSync).not.toHaveBeenCalled();
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+  it.each(['untrusted', 'other-pr'])('refuses carry when a late %s result supersedes acceptance under latestAcceptRecord', kind => {
+    const o = carryOptions();
+    const late = trusted(`${redTeamMarker(kind === 'other-pr' ? pr + 1 : pr, 'c'.repeat(40))}\nRed team blocked`);
+    if (kind === 'untrusted') late.author.login = 'stranger';
+    o.rawPrs[0].comments.push(late);
+    runGhSync.mockImplementation(() => {});
+    try {
+      expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+      expect(runGhSync).not.toHaveBeenCalled();
+      expect(o.syncLabels).not.toHaveBeenCalled();
+    } finally { runGhSync.mockReset(); }
+  });
+  it.each(['not-owed', { status: 'not-owed' }])('finished %j clears accepted matching stored review and syncs', result => {
+    const o = runFixture({ readEvidence: () => ({ loopPayload: payload(), seatRecorded: false, recorded: false }),
+      readStatus: () => ({ status: 'finished', result }) });
+    o.rawPrs[0].labels = ['review:accepted'];
+    // This R100 clear-success fixture previously lacked the accept comment establishing the accepted head.
+    o.rawPrs[0].comments = [trusted(`✅ review — accepted\n<!-- reviewed-sha: ${head} -->`)];
+    runGhSync.mockImplementation((_args, options) => o.rawPrs[0].comments.push(trusted(options.input)));
+    try {
+      expect(runRedTeamOnSkip(o).rows[0].action).toBe('clear');
+      expect(redTeamForHead(o.rawPrs[0].comments, pr, head)).toMatchObject({ pr, rev: head });
+      expect(o.syncLabels).toHaveBeenCalledOnce();
+    } finally { runGhSync.mockReset(); }
+  });
+  it.each(['unaccepted', 'seat-recorded', 'running', 'queued'])('finished not-owed refuses %s evidence', kind => {
+    const evidence = { loopPayload: payload(), seatRecorded: false, recorded: false };
+    const o = runFixture({ readEvidence: () => evidence,
+      readStatus: () => ({ status: ['running', 'queued'].includes(kind) ? kind : 'finished', result: 'not-owed' }) });
+    o.rawPrs[0].labels = kind === 'unaccepted' ? [] : ['review:accepted'];
+    if (kind === 'seat-recorded') evidence.seatRecorded = true;
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+  it.each(['error', 'skipped', 'ran', { status: 'not-owed', deferredByGuard: true }, { status: 'not-owed', deferredByCap: true }])('non-policy or deferred %j never clears an accepting stored review', result => {
+    const o = runFixture({ readEvidence: () => ({ loopPayload: payload(), seatRecorded: false }),
+      readStatus: () => ({ status: 'finished', result }) });
+    o.rawPrs[0].labels = ['review:accepted'];
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe(result === 'ran' ? 'dispatch' : 'skip');
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+  it.each([1, 2, 3])('ran with %i failed seats permits only one bounded fresh retry', failedSeatCount => {
+    const o = runFixture({ readEvidence: () => ({ loopPayload: payload(), recorded: true, seatRecorded: true, completedRecorded: false, failedSeatCount }),
+      readStatus: () => ({ status: 'finished', result: 'ran' }) });
+    const row = runRedTeamOnSkip(o).rows[0];
+    expect(row).toMatchObject(failedSeatCount === 1 ? { action: 'dispatch', mode: 'fresh' }
+      : { action: 'skip', why: 'prior result ran (status finished); not re-run' });
+    expect(o.syncLabels).not.toHaveBeenCalled();
+    if (failedSeatCount === 1) expect(runRedTeamOnSkip(o).rows[0].why).toBe('retry cooldown active');
+  });
+  it('ran with completed seat retains effects-only resume instead of fresh retry or clear', () => {
+    expect(decide({ readEvidence: () => ({ loopPayload: payload(), recorded: true, completedRecorded: true, failedSeatCount: 1 }),
+      readStatus: () => ({ status: 'finished', result: 'ran' }) })).toMatchObject({ action: 'dispatch', mode: 'resume' });
   });
 });
