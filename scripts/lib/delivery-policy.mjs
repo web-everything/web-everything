@@ -542,8 +542,11 @@ async function transpileDefaults(source, env) {
     const defaults = module.PLATFORM_DELIVERY_POLICY_DEFAULTS;
     if (!object(defaults) || Object.keys(defaults).length !== Object.keys(domains).length) throw Error('Incomplete defaults');
     for (const [key, fields] of Object.entries(domains)) {
-      if (!object(defaults[key]) || Object.keys(defaults[key]).length !== Object.keys(fields).length) throw Error('Incomplete defaults');
-      for (const [field, domain] of Object.entries(fields)) if (!valid(defaults[key][field], domain)) throw Error('Invalid default');
+      if (!Object.hasOwn(defaults, key) || !object(defaults[key]) || Object.keys(defaults[key]).length !== Object.keys(fields).length) throw Error('Incomplete defaults');
+      for (const [field, domain] of Object.entries(fields)) {
+        if (!Object.hasOwn(defaults[key], field)) throw Error('Incomplete defaults');
+        if (!valid(defaults[key][field], domain)) throw Error('Invalid default');
+      }
     }
     return defaults;
   } finally {
