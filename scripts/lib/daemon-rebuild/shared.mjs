@@ -17,13 +17,13 @@ export const REBUILD_IDENTITY_ENV = Object.freeze({
 
 export const OVERLAY_EDGE_RESOLVE_ENV = 'WE_DAEMON_OVERLAY_EDGE_RESOLVE';
 
-export function rebuildCommitEnv(git, a, b) {
+export function rebuildCommitEnv(git, ...parents) {
   const committerDate = (sha) => {
     const r = git(['log', '-1', '--format=%ct', sha]);
     const n = Number(String(r.stdout ?? '').trim());
     return r.status === 0 && Number.isFinite(n) ? n : 0;
   };
-  const date = `@${Math.max(committerDate(a), committerDate(b))} +0000`;
+  const date = `@${Math.max(...parents.map(committerDate))} +0000`;
   return { ...REBUILD_IDENTITY_ENV, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date };
 }
 

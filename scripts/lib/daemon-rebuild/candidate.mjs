@@ -122,7 +122,8 @@ export const DISPATCH_CWD_ROOT_ENV = 'WE_DISPATCH_CWD_ROOT';
 /**
  * The env the live smoke runs with when its tree is a disposable candidate worktree instead of `root`.
  * Best-effort reads the live clone's origin as LANE_POOL_CANONICAL_ORIGIN so the candidate need not trust
- * its shared, pool-owned Git config. An already-set env value wins; a failed read leaves the guard closed.
+ * its shared, pool-owned Git config. Configured local paths are anchored to `root` before changing cwd.
+ * An already-set env value wins; a failed read leaves the guard closed.
  *
  * x5wbsbc, live 2026-09-26 12:11-12:40 ET on `wev-review-daemon`: every rebuild since #2731 was
  * `smoke-rejected` (sticky) on `lane-acquire-release` — "no lanes provisioned for web-everything under
@@ -147,7 +148,10 @@ export function candidateSmokeEnv({ root, env = process.env }) {
         cwd: root, env: scrubGitRepoEnv(out), encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024,
       });
       const url = origin.stdout?.trim();
-      if (origin.status === 0 && url) out.LANE_POOL_CANONICAL_ORIGIN = url;
+      if (origin.status === 0 && url) {
+        // Match lane-pool's configured-origin handling before the env makes it an explicit origin.
+        out.LANE_POOL_CANONICAL_ORIGIN = /^[^/]*:/.test(url) ? url : resolvePath(root, url);
+      }
     } catch { /* best-effort — lane-pool still requires an explicit canonical origin */ }
   }
   out.LANE_POOL_ROOT = defaultPoolRoot(root, out);

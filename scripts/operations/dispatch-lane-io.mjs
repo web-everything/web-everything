@@ -3,7 +3,7 @@ import { applyTestsFirstPolicy } from '../lib/tests-first-policy.mjs';
 import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
 import { resolveClaudeHelperRoute } from '../lib/claude-helper-route.mjs';
 import { resolveCodexTaskRoute } from '../lib/codex-task-route.mjs';
-import { conflictHelperAllowRules } from '../lib/conflict-helper-allow.mjs';
+import { conflictHelperAllowRules, rearmReviewAllowRules } from '../lib/conflict-helper-allow.mjs';
 import { composeOperatorTaskBrief, planOperatorPostBuild } from './operator-task-brief.mjs';
 import { observeHealAttempt } from './probation-heal-run.mjs';
 import { dispatchProviderAvailable } from '../lib/dispatch-provider-availability.mjs';
@@ -2324,7 +2324,9 @@ export function dispatchLaneGrant(payload, { root = REPO_ROOT, exists = existsSy
     ? [laneDirFor(lane, { root, exists, repoKey })]
     : laneRootsFor(root, exists, repoKey);
   const rules = dirs.flatMap((d) => [`Edit(${d}/**)`, `Write(${d}/**)`]);
-  if (['fix', 'ci-heal'].includes(payload?.launchKind)) rules.push(...conflictHelperAllowRules(root));
+  if (['fix', 'ci-heal'].includes(payload?.launchKind)) {
+    rules.push(...conflictHelperAllowRules(root), ...rearmReviewAllowRules(root));
+  }
   return { additionalDirectories: dirs, allow: rules };
 }
 

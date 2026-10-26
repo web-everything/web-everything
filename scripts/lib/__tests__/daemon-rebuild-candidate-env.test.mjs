@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { candidateSmokeEnv } from '../daemon-rebuild/candidate.mjs';
 import { scrubGitRepoEnv } from '../lane-git-hardening.mjs';
 
@@ -29,10 +29,28 @@ describe('candidateSmokeEnv canonical origin', () => {
     expect(env.LANE_POOL_CANONICAL_ORIGIN).toBeUndefined();
   });
 
-  it.each(['https://example.com/explicit.git', ''])('keeps an already-set env value (%j)', value => {
+  it.each(['https://example.com/explicit.git', '../explicit.git', ''])('keeps an already-set env value (%j)', value => {
     expect(candidateSmokeEnv({ root, env: { LANE_POOL_CANONICAL_ORIGIN: value } })
       .LANE_POOL_CANONICAL_ORIGIN).toBe(value);
   });
+
+  it.each(['../origin.git', 'origin.git', './origin.git', '../origin with spaces.git', './origin:local.git'])(
+    'anchors configured local origin %j to the live root before the candidate uses it', value => {
+      git(['remote', 'set-url', 'origin', value]);
+      const smokeEnv = candidateSmokeEnv({ root, env: {} });
+      const candidate = join(root, 'state', 'project.candidate-1-abc');
+      expect(smokeEnv.LANE_POOL_CANONICAL_ORIGIN).toBe(resolve(root, value));
+      expect(resolve(candidate, smokeEnv.LANE_POOL_CANONICAL_ORIGIN)).toBe(resolve(root, value));
+    },
+  );
+
+  it.each(['/absolute/origin.git', 'git@example.com:project.git', 'ssh://git@example.com/project.git',
+    'file:///absolute/origin.git'])(
+    'preserves configured absolute or transport origin %j', value => {
+      git(['remote', 'set-url', 'origin', value]);
+      expect(candidateSmokeEnv({ root, env: {} }).LANE_POOL_CANONICAL_ORIGIN).toBe(value);
+    },
+  );
 
   it('leaves the env unset when the root has no origin', () => {
     git(['remote', 'remove', 'origin']);

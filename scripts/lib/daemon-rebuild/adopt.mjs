@@ -93,9 +93,10 @@ export function matchReadyCandidate({
  * Is a ready record's `adopt` provably a build {@link planRebuild} could have minted — never an arbitrary commit
  * someone wrote into the state file? All of: its `mainSha` is on the current main history (an ancestor of, or
  * equal to, `mainTip`); walking back from `finalSha`, each carried overlay is exactly one merge commit whose
- * parents are `[previous step, overlay sha]`, bottoming out at `mainSha` (so an overlay-free record must BE
- * `mainSha`); and every carried overlay sha is on its registered ref's current remote-tracking tip. Any git
- * failure reads as unverified — the caller then just smokes the live plan instead.
+ * parents are `[previous step, overlay sha]` (plus the approved edge sha for an edge resolution), bottoming out
+ * at `mainSha` (so an overlay-free record must BE `mainSha`); and every carried overlay sha is on its registered
+ * ref's current remote-tracking tip. Any git failure reads as unverified — the caller then just smokes
+ * the live plan instead.
  * @param {{git:(args:string[])=>{status:number|null, stdout?:string}, adopt:object, mainTip:string}} o
  */
 export function readyBuildVerified({
@@ -114,7 +115,10 @@ export function readyBuildVerified({
     const r = git(['rev-list', '--parents', '-n', '1', cur]);
     if (r.status !== 0) return false;
     const [self, prev, ov, ...extra] = String(r.stdout ?? '').trim().split(/\s+/);
-    if (!self || !prev || ov !== a.sha || extra.length > 0) return false;
+    if (!self || !prev || ov !== a.sha) return false;
+    // Older edge builds have two parents. A new third parent is allowed only for the recorded edge;
+    // the current approval and its tree are verified below. Never trust arbitrary additional ancestry.
+    if (extra.length > 0 && (a.resolvedVia !== 'edge-ref' || extra.length !== 1 || extra[0] !== a.edgeSha)) return false;
     // The overlay sha is still on its ref — or, once the branch is gone (merged + auto-deleted), on main.
     const tip = verifyRev(git, `refs/remotes/origin/${a.ref}^{commit}`);
     // overlay-pin: a PINNED head that was force-pushed off its ref fails this on purpose (fail closed): the ready
@@ -128,6 +132,7 @@ export function readyBuildVerified({
       const approvedEdgeSha = approvedEdgeShaFor(a.ref);
       if (a.resolvedVia === 'edge-ref' && (!approvedEdgeSha || a.edgeSha !== approvedEdgeSha)) return false;
       const resolved = resolveOverlayConflict({ git, cur: prev, ovSha: a.sha, ref: a.ref, approvedEdgeSha });
+      if (a.resolvedVia === 'edge-ref' && resolved.edgeSha !== a.edgeSha) return false;
       minted = resolved.ok ? resolved.tree : '';
     } else {
       const mt = git(['merge-tree', '--write-tree', '--no-messages', prev, a.sha]);

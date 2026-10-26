@@ -37,7 +37,18 @@ build contains (git ancestry; an unreadable answer still holds), so the repair c
 In tops mode, deferring a pinned base behind its containing overlays requires proof that its exact
 registered tip is already in the running HEAD and in each containing overlay's tip. Missing HEAD,
 non-containment or unreadable ancestry preserves ordinary pin handling. The stack-tops regressions
-cover those closed paths. Registered auto-rebase repairs do not trigger deferral; the mechanism-pinned
+cover those closed paths. Deferral also requires an unresolved conflict at the base's ordinary position against
+the accumulated build. A clean base retains its position: applying it can make a containing top
+merge cleanly even when that top conflicts directly with main because of a newer merge base.
+The clean-base regressions cover explicit and mechanism pins, including a preceding overlay that
+makes the base clean; `pinned-stack-clean-base-order` replays adoption through the daemon soak harness.
+Each conflicting base can be deferred only once; failed tops return it to ordinary pin handling.
+Reviewed edge resolution runs before deferral, and an unreadable merge cannot authorize reordering.
+Edge-resolved rebuilds retain the registered overlay tip as their second parent and the approved edge tip
+as a third parent. Copying only its tree loses ancestry when a later overlay has identical content.
+History readers accept both merge shapes; ready-build verification allows only the approved edge as the
+extra parent, still checks current approval and content, and accepts persisted two-parent builds.
+Registered auto-rebase repairs do not trigger deferral; the mechanism-pinned
 auto-rebase cases preserve the original's conflict/loss decision, repair adoption and loss protection.
 Per-ref JSON sidecars next to the overlay
 list survive ticks; per-ref markers expire after 30 minutes without a heartbeat. Live detached
@@ -241,6 +252,12 @@ Rebuild candidates must also work with the old live daemon's smoke environment: 
 `WE_SMOKE_LIVE_CLONE` and `LANE_POOL_ROOT`, but may omit `LANE_POOL_CANONICAL_ORIGIN`.
 The canonical-origin CLI fixture covers the named candidate's verified Git owner under a fake pool;
 forged markers, lane owners and unreadable ownership must retain the explicit-origin refusal.
+The candidate-env fixture also checks that configured local origins are anchored to the live root before
+export, so changing to the candidate directory preserves the destination; explicit env values keep precedence.
+The inherited origin applies only without `--reference`, `--repo` or `--pool`; those selectors resolve
+their own primary. The CLI fixture exercises recovery against separate local bare repositories and
+checks that cross-pool release never publishes another pool's work to the inherited origin, including
+when that pool's primary is missing or has no origin.
 
 Boot each entry in a fresh child to preserve cold import graphs. `rebuildSmoke.bootConcurrency`
 (default 3) bounds initial boots; after those children drain, `rebuildSmoke.bootSignalRetries`
@@ -896,6 +913,17 @@ pass `requireLock: true` through scorecard migration and append, refusing the sh
 unlocked fallback on timeout. A refused scorecard write is reported on stderr without undoing a
 successful build. Operation records use UUID filenames and atomic rename; call logs use append-only
 writes, so they do not replace a sibling process's records.
+
+## Antigravity quota hold evidence
+
+Exercise holds with an injected temporary `dir` in
+`scripts/lib/__tests__/antigravity-run-evidence.test.mjs`. Explicit Claude and Gemini
+requests read their own backend folders; default or unrecognized models scan
+`anthropic`, `google`, and `unknown`. Legacy root JSON holds use the known served
+model's backend, falling back to the requested model's backend; unattributed legacy
+holds apply globally. Reads leave legacy files untouched. A skipped run retains
+`servedModel: 'unknown'` and `modelEvidence: 'not-launched'`; `heldBackend` and
+`heldModel` identify the observation responsible for the refusal.
 
 ## Shadow reviewer agreement evidence
 

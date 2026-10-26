@@ -14,6 +14,8 @@ import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { isLaneLocus, workspaceRootOf } from '../guard-lane.mjs';
 import { daemonCloneRoots, isDaemonCloneRealpath } from '../lib/daemon-clone-registry.mjs';
 import { resolveStallSweepSettings } from '../conveyor/pr-stall-sweep.mjs';
+import { rulingNeeded } from '../lib/ruling-ledger.mjs';
+import { appendDaemonEvent } from '../lib/daemon-events.mjs';
 
 export const CHECKOUT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 function readOptional(path, fallback) {
@@ -177,6 +179,14 @@ export function monitorCommand(path = feedPath()) {
   path = checkedFeedPath(path);
   return `tail -n 0 -F '${path.replace(/'/g, "'\\''")}' | grep --line-buffered NEEDS-YOU`;
 }
+async function readLivePr(item, { gh, cwd }, fields = 'labels,headRefOid') {
+  const opts = { cwd, encoding: 'utf8', timeout: 60000, killSignal: 'SIGKILL', maxBuffer: 256 * 1024 * 1024 };
+  const view = JSON.parse(String(await gh('gh', ['pr', 'view', String(item.pr), '--repo', item.repo, '--json', fields], opts)));
+  const pages = JSON.parse(String(await gh('gh', ['api', '--paginate', '--slurp', `repos/${item.repo}/issues/${item.pr}/comments?per_page=100`], opts)));
+  if (!Array.isArray(pages) || !pages.every(Array.isArray) || !view || typeof view.headRefOid !== 'string' || !view.headRefOid.trim()) throw new Error('unreadable live PR');
+  const comments = pages.flat().map((c) => ({ author: { login: c.user?.login ?? '' }, body: c.body ?? '', createdAt: c.created_at }));
+  return { ...view, number: item.pr, comments };
+}
 /**
  * Drop "your review" items whose LIVE PR no longer qualifies (red team not clear on the live head, sent back, a fix
  * claim open): operator-queue's report can lag the labels by a tick, and a notification cannot be taken back. A PR
@@ -194,12 +204,8 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
     // Bounded work: past the pass deadline an item is KEPT unjudged, never dropped on missing evidence.
     if (Date.now() >= deadline) { log(`needs-you-feed ${item.repo}#${item.pr} gate deadline reached, keeping`); out[index] = item; return; }
     try {
-      const opts = { cwd, encoding: 'utf8', timeout: 60000, killSignal: 'SIGKILL', maxBuffer: 256 * 1024 * 1024 };
-      const view = JSON.parse(String(await gh('gh', ['pr', 'view', String(item.pr), '--repo', item.repo, '--json', 'labels,headRefOid'], opts)));
-      const pages = JSON.parse(String(await gh('gh', ['api', '--paginate', '--slurp', `repos/${item.repo}/issues/${item.pr}/comments?per_page=100`], opts)));
-      if (!Array.isArray(pages) || !view || typeof view.headRefOid !== 'string' || !view.headRefOid.trim()) throw new Error('unreadable live PR');
-      const comments = pages.flat().map((c) => ({ author: { login: c.user?.login ?? '' }, body: c.body ?? '', createdAt: c.created_at }));
-      const reasons = humanReviewHold({ number: item.pr, headRefOid: view.headRefOid, labels: view.labels ?? [], comments }, now,
+      const view = await readLivePr(item, { gh, cwd });
+      const reasons = humanReviewHold({ ...view, labels: view.labels ?? [] }, now,
         { fixClaimLive: fixClaimLive(item.repo, item.pr) });
       if (reasons.length) { held.push({ item, reasons }); return; }
       // Publish the head that was actually checked, not a stale one from the report or a later lookup.
@@ -211,6 +217,40 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
   const kept = out.filter(Boolean);
   kept.incomplete = items.incomplete;
   return { kept, held };
+}
+/**
+ * Missing evidence keeps the alert; coordination event failures cannot undo a proven suppression.
+ * Defended in scripts/operations/__tests__/needs-you-suppress.test.mjs by:
+ * - "fails closed to KEEP with no event when the live PR is unreadable: %s"
+ * - "fails closed to KEEP when lookup throws, without emitting a suppression event"
+ * - "still suppresses when emitEvent %s" (including rejects).
+ */
+export async function gateRulingItems(items, { gh = execFileSyncThrottled, cwd, log = console.error,
+  deadlineMs = 120000, concurrency = 4, lookup = rulingNeeded, emitEvent = appendDaemonEvent } = {}) {
+  const deadline = Date.now() + deadlineMs, out = new Array(items.length);
+  const judge = async (index) => {
+    const item = items[index];
+    out[index] = item;
+    if (item.kind !== 'ruling-needed') return;
+    // Report prose can outlive the head it describes; only live ledger evidence authorizes suppression.
+    if (Date.now() >= deadline) { log(`needs-you-feed ${item.repo}#${item.pr} ruling gate deadline reached, keeping`); return; }
+    try {
+      const pr = await readLivePr(item, { gh, cwd }, 'labels,headRefOid,body,createdAt');
+      if (!/^[a-f0-9]{40}$/i.test(pr.headRefOid) || !Array.isArray(pr.labels) || typeof pr.body !== 'string'
+        || !Number.isFinite(Date.parse(pr.createdAt))) throw new Error('incomplete live PR');
+      if (await lookup(pr) !== null) return;
+    } catch (error) { log(`needs-you-feed ${item.repo}#${item.pr} ruling gate unreadable, keeping: ${error.message}`); return; }
+    out[index] = undefined;
+    const detail = 'all confirmed findings already ruled';
+    log(`needs-you-feed ${item.repo}#${item.pr} needs-you-suppressed: ${detail}`);
+    try { await emitEvent({ kind: 'needs-you-suppressed', repo: item.repo, pr: item.pr, detail }); }
+    catch (error) { log(`needs-you-feed suppression event failed: ${error.message}`); }
+  };
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.max(1, concurrency) }, async () => { while (next < items.length) await judge(next++); }));
+  const kept = out.filter(Boolean);
+  kept.incomplete = items.incomplete;
+  return { kept };
 }
 export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled, home = homedir(), now = new Date(), checkoutRoot = CHECKOUT_ROOT,
   env = process.env, settings = resolveSettings({ env, home, file: readSettings(checkoutRoot) }), log = console.error, owns = () => true,
@@ -229,7 +269,7 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
   if (failedRead) report.incomplete = true;
   const gated = !liveGate ? { kept: itemsFromReport(report), held: [] } : await gateReadyItems(itemsFromReport(report), report, { gh, cwd: checkoutRoot, now: new Date(now).getTime(), log });
   for (const { item, reasons } of gated.held) log(`needs-you-feed ${item.repo}#${item.pr} held back from your review: ${reasons.join('; ')}`);
-  const items = gated.kept;
+  const items = !liveGate ? gated.kept : (await gateRulingItems(gated.kept, { gh, cwd: checkoutRoot, log })).kept;
   // Resolve before locking: gh admission/network waits must not hold the feed-state lock.
   for (const item of items) if (!item.head) {
     try {

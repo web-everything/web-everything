@@ -49,7 +49,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  *   --name=<slug>        pool key under the root (default: derived from the origin URL basename)
  *   --branch=<ref>       integration branch (default: detected origin/HEAD, else `main`)
  *   env LANE_POOL_ROOT   pool root (default: ~/workspace/.lanes)
- *   env LANE_POOL_CANONICAL_ORIGIN  trusted clone source, equivalent to --origin when that flag is absent;
+ *   env LANE_POOL_CANONICAL_ORIGIN  trusted clone source when --origin/--reference/--repo/--pool are absent;
  *                                   daemon candidate smokes inherit it from the live clone's origin
  *
  * SAFETY (#2267): a lane is safe scratch ONLY for work that is clean-and-up-to-date, or that this guard
@@ -355,7 +355,11 @@ try {
 
 // ── repo descriptor resolution ──────────────────────────────────────────────────────────────────────
 function resolveRepo(repoFlags = flags) {
-  repoFlags = { ...repoFlags, origin: repoFlags.origin || process.env.LANE_POOL_CANONICAL_ORIGIN?.trim() };
+  // The inherited smoke origin belongs to the caller. Explicit repository/pool selection (including
+  // cross-pool recovery's recursive calls) must resolve that primary's own origin instead.
+  const inheritedOrigin = !repoFlags.reference && !repoFlags.repo && !repoFlags.pool
+    ? process.env.LANE_POOL_CANONICAL_ORIGIN?.trim() : undefined;
+  repoFlags = { ...repoFlags, origin: repoFlags.origin || inheritedOrigin };
   const repoPath = resolve(expandHome(repoFlags.repo) || (CWD_TOP_LEVEL ? process.cwd() : CHECKOUT_ROOT));
   const referencePath = resolve(expandHome(repoFlags.reference) || repoPath);
   // An inherited lane Git context must not override an explicitly selected primary.

@@ -186,15 +186,20 @@ it('reconciles the answered PR into a fix and carries the verbatim ruling throug
 it('carries the ruling into an ownership-confirmed resumed fix as well', () => {
   const candidate = 'cand-0000-0000-0000-000000000000';
   const head = 'deadbeef'.repeat(5);
+  // This prompt fixture uses a synthetic lane; real permission migration is covered in reconcile-fix-dispatch.test.mjs.
+  const grantConflictHelper = vi.fn(() => ({ ok: true }));
   const spawnAgent = vi.fn(() => 'backgrounded · candxxxx\n');
   const result = tryResumeFix({ pr: 3181, itemNum: null, laneRef: 'lane/answer-test', scope: ['we:scripts/prepare.mjs'],
     isConflict: true, body: buildAuthorActorMarker(candidate), headRefOid: head, operatorAnswer: record }, {
-    root: '/repo', spawnAgent,
+    root: '/repo', spawnAgent, grantConflictHelper,
     listAgentsAll: () => [{ sessionId: candidate, id: 'candxxxx', cwd: '/lanes/lane-4', name: 'fix-3181' }],
     resolveHead: () => head, acquireClaim: () => ({ ok: true }), releaseClaim: () => {},
     ensureSessionCwd: (cwd) => cwd, sessionCwdFor: () => '/tmp/answer-resume',
   });
   expect(result.resumed).toBe(true);
+  expect(grantConflictHelper).toHaveBeenCalledTimes(1);
+  expect(grantConflictHelper).toHaveBeenCalledWith('/lanes/lane-4');
+  expect(spawnAgent).toHaveBeenCalledTimes(1);
   expect(spawnAgent.mock.calls[0][0].at(-1)).toContain(reason);
 });
 

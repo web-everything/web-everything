@@ -2,9 +2,10 @@
 bornAs: xnwberf
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/lib/git-transport-branch.mjs"]
 dateOpened: "2026-10-12"
+dateResolved: "2026-10-26"
 tags: []
 ---
 
