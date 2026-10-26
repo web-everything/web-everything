@@ -1684,6 +1684,10 @@ bornAs alias checks for hashes.
 
 ### Enqueue catch-up ordering
 
+Catch-up children share `--listing-snapshot` within one round; the target is always re-read live. Replay
+fresh, expired, foreign and malformed round files, and candidates missing labels or base `main`.
+
+
 The enqueue catch-up regression must exercise spawned fast drains, not only the planner:
 `duePending` can otherwise undo the selected priority order. Queue fill depth comes from
 `mergeQueue.enqueueOnEvent.catchUp.maxQueued`, independently of `mergeDelivery.batchSize`.
@@ -1705,6 +1709,8 @@ Probe busy scheduling from round completion with room and an unqueued runnable P
 scheduling with a full queue or backed-off work. Never start a second drain for an active PR; a
 wake that arrives during its run stays pending until the run ends, unless that run verified the enqueue;
 shutdown must kill every child and prevent further starts. Inject all GitHub reads in these tests.
+
+
 
 ## Referral rulings answering stand-downs
 

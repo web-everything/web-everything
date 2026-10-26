@@ -125,7 +125,7 @@ import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, re
 // are re-exported ONLY (mirrors `pr-land.mjs`'s own `forge-land-provider.mjs` split of used-here vs.
 // re-exported-only names) — every existing importer of THIS file keeps resolving all five unchanged.
 import { runRenamedPrRefresh, resolveRefreshSettings, logRefreshSettings } from './lib/renamed-pr-refresh.mjs';
-import { shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, mergeLiveTargetIntoRows, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached, readLegacyLocalManifestAt } from './lib/fast-drain-scope.mjs';
+import { shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, readFastDrainRoundListing, readFastDrainRoundSnapshot, mergeLiveTargetIntoRows, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached, readLegacyLocalManifestAt } from './lib/fast-drain-scope.mjs';
 import { isTrustedMarkerAuthor, isOperatorAuthored } from './lib/marker-authorship.mjs';
 import { isAiGeneratedPr, hasLabel } from './lib/ai-pr-authorship.mjs';
 import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } from './lib/no-search-backed-pr-list.mjs';
@@ -2298,7 +2298,7 @@ export function partitionListings(listings) {
 }
 
 export function buildLiveListingsByRepo(listings) {
-  return new Map((Array.isArray(listings) ? listings : []).map((l) => [l.repo, l.rows]));
+  return new Map((Array.isArray(listings) ? listings : []).filter((l) => l.listing !== 'snapshot').map((l) => [l.repo, l.rows]));
 }
 
 /** #4308 — GitHub's own files-connection page size a listing was fetched with is not independently known at the
@@ -4438,6 +4438,7 @@ async function runCli() {
   const fastDrain = onlyPr != null ? resolveFastDrainScopeSetting() : { scope: 'full' };
   if (onlyPr != null) process.stderr.write(`${fastDrain.line}\n`);
   const fastDrainListing = onlyPr != null ? resolveFastDrainListingSetting() : { listing: 'live' };
+  const listingSnapshot = onlyPr != null && fastDrainListing.listing !== 'live' && typeof flags['listing-snapshot'] === 'string' ? flags['listing-snapshot'] : null;
   if (onlyPr != null) process.stderr.write(`${fastDrainListing.line}\n`);
   // #2683 — the target repo for `--only=<pr>`. PR numbers are per-repo (WE #12 ≠ FUI #12), so a bare `--only=12`
   // on the DEFAULT constellation scope would match a same-numbered PR in EVERY repo. `--only-repo=<slug>` names
@@ -5154,61 +5155,82 @@ async function runCli() {
     };
     try {
       const slug = repo || localSlug;
-      let listed;
-      let snapshotSeed;
-      // Snapshot rows seed heavy fields only. The open set must still be listed live:
-      // refreshing only the target can miss a newly opened blockedBy/stack/couple sibling.
-      if (slug && onlyPr != null && fastDrainListing.listing === 'snapshot' && isFastDrainTarget(repo, { number: onlyPr })) {
-        const fields = RECONCILE ? SWEEP_LIST_FIELDS
-          : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '');
-        try {
-          const snap = __t.time('listing.snapshot', () => readSharedOpenPrs({ repo: slug, fields: `${fields},updatedAt`, caller: 'merge-ai-prs.mjs' }));
-          if (snap == null) {
-            process.stderr.write('fast-drain: listing fell back to live (snapshot disabled/unavailable)\n');
-          } else {
-            const targetRow = await __t.timeAsync('listing.target', async () => {
-              const { stdout } = await execFileP('gh', ['pr', 'view', String(onlyPr), '--repo', slug, '--json', `${fields},updatedAt,state`],
-                { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-              return JSON.parse(stdout.trim() || 'null');
-            });
-            snapshotSeed = mergeLiveTargetIntoRows(snap, targetRow, onlyPr);
+      let listed = {};
+      const roundPath = listingSnapshot && isFastDrainTarget(repo, { number: onlyPr }) ? listingSnapshot : null;
+      const fields = RECONCILE ? SWEEP_LIST_FIELDS
+        : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '');
+      const readTarget = () => __t.timeAsync('listing.target', async () => {
+        const { stdout } = await execFileP('gh', ['pr', 'view', String(onlyPr), '--repo', slug, '--json', `${fields},updatedAt,state`],
+          { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+        const target = JSON.parse(stdout.trim() || 'null');
+        return target ? (await resolveListedChecks(repo, [target]))[0] : null;
+      });
+      const listLive = async () => {
+        let snapshotSeed;
+        // Snapshot rows seed heavy fields only. The open set must still be listed live:
+        // refreshing only the target can miss a newly opened blockedBy/stack/couple sibling.
+        if (!roundPath && slug && onlyPr != null && fastDrainListing.listing === 'snapshot' && isFastDrainTarget(repo, { number: onlyPr })) {
+          const fields = RECONCILE ? SWEEP_LIST_FIELDS
+            : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '');
+          try {
+            const snap = __t.time('listing.snapshot', () => readSharedOpenPrs({ repo: slug, fields: `${fields},updatedAt`, caller: 'merge-ai-prs.mjs' }));
+            if (snap == null) {
+              process.stderr.write('fast-drain: listing fell back to live (snapshot disabled/unavailable)\n');
+            } else {
+              const targetRow = await readTarget();
+              snapshotSeed = mergeLiveTargetIntoRows(snap, targetRow, onlyPr);
+            }
+          } catch {
+            process.stderr.write('fast-drain: listing fell back to live (snapshot or live target read failed)\n');
           }
-        } catch {
-          process.stderr.write('fast-drain: listing fell back to live (snapshot or live target read failed)\n');
         }
-      }
-      if (slug) {
-        const paging = resolvePrListPaging();
-        const heavyFields = ['body', ...((RECONCILE || workflowEditSetting.value !== 'off') ? ['files'] : [])];
-        // Seed body/files from the host-shared snapshot (its heavy copies persist across drain processes); a seed
-        // row is used only when its updatedAt + head SHA match the LIVE page row, so it never serves stale content.
-        let seed = snapshotSeed || [];
-        if (!snapshotSeed) {
-          try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' })) || []; } catch { seed = []; }
+        if (slug) {
+          const paging = resolvePrListPaging();
+          const heavyFields = ['body', ...((RECONCILE || workflowEditSetting.value !== 'off') ? ['files'] : [])];
+          // Seed body/files from the host-shared snapshot (its heavy copies persist across drain processes); a seed
+          // row is used only when its updatedAt + head SHA match the LIVE page row, so it never serves stale content.
+          let seed = snapshotSeed || [];
+          if (!snapshotSeed) {
+            try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' })) || []; } catch { seed = []; }
+          }
+          listed = __t.time('listing.pages', () => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging,
+            heavyFields, needsHeavy: RECONCILE ? () => true : operatorSelects, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
+            maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain page)' } } }));
+          drainHeavyCacheByRepo.set(repo, listed.cache);
+        } else if (!slug) {
+          // Cwd repo identity unresolved: retain the legacy gh discovery path only here.
+          const sized = candidateListLimit(repo);
+          let rows = await run(sized);
+          if (rows.length >= sized) rows = await run(OPEN_PR_LIST_LIMIT);
+          listed = { rows, truncated: rows.length >= OPEN_PR_LIST_LIMIT };
         }
-        listed = __t.time('listing.pages', () => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging,
-          heavyFields, needsHeavy: RECONCILE ? () => true : operatorSelects, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
-          maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain page)' } } }));
-        drainHeavyCacheByRepo.set(repo, listed.cache);
-      } else if (!slug) {
-        // Cwd repo identity unresolved: retain the legacy gh discovery path only here.
-        const sized = candidateListLimit(repo);
-        let rows = await run(sized);
-        if (rows.length >= sized) rows = await run(OPEN_PR_LIST_LIMIT);
-        listed = { rows, truncated: rows.length >= OPEN_PR_LIST_LIMIT };
-      }
-      const rows = await __t.timeAsync('listing.checks', () => resolveListedChecks(repo, listed.rows));
+        return __t.timeAsync('listing.checks', () => resolveListedChecks(repo, listed.rows));
+      };
+      const rows = roundPath && slug
+        ? await readFastDrainRoundListing({ path: roundPath, repo: slug, onlyPr, readTarget,
+          defaultBranch: () => defaultBranchByRepo.get(repo) ?? null,
+          listLive: async () => { const rows = await listLive(); await resolveDefaultBranch(repo); return rows; } })
+        : await listLive();
       const listedRows = Array.isArray(rows) ? rows : [];
       const truncated = Array.isArray(rows) && isDegradedOpenPrListing(rows.length, OPEN_PR_LIST_LIMIT);
       // Preparation observes the same release-label and operator label filter as the full drain.
       const prs = listedRows.filter(operatorSelects);
       if (listed.truncated || truncated) process.stderr.write(`  ⚠️  DEGRADED drain listing for ${repoTag(repo) || 'cwd'}: the open-PR list hit the --limit ${OPEN_PR_LIST_LIMIT} cap — it MAY be truncated, so a ${label || 'candidate'} PR past it can be missing this pass (#no-label-search)\n`);
-      return { repo, prs, rows };
+      // A round listing is candidate evidence only, even after its target is refreshed.
+      // Context must re-list live to discover newly opened blockers/carriers/siblings.
+      return { repo, prs, rows, listing: roundPath ? 'snapshot' : 'live' };
     }
     catch (e) { return { repo, err: describeGhListError(e) }; }
   };
   const resolveDefaultBranch = async (repo) => {
     if (defaultBranchByRepo.has(repo)) return;
+    if (listingSnapshot && isFastDrainTarget(repo, { number: onlyPr })) {
+      const snap = readFastDrainRoundSnapshot({ path: listingSnapshot, repo: repo || localSlug });
+      if (typeof snap?.defaultBranch === 'string' && snap.defaultBranch.trim()) {
+        defaultBranchByRepo.set(repo, snap.defaultBranch);
+        return;
+      }
+    }
     try {
       const { stdout } = await execFileP('gh', ['repo', 'view', ...(repo ? [repo] : []), '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name'], { encoding: 'utf8' });
       const name = stdout.trim();
@@ -5217,7 +5239,8 @@ async function runCli() {
       if (!AS_JSON) process.stderr.write(`  ⚠ ${repo || 'cwd repo'}: default branch unresolved (${String(e.message || e).split('\n')[0]}) — the non-default-base hold is off for it this pass (#3674)\n`);
     }
   };
-  let [listings] = await __t.timeAsync('listing', () => Promise.all([mapWithConcurrency(REPOS, REPOS.length, listOne), __t.timeAsync('listing.defaultBranch', () => Promise.all(REPOS.map(resolveDefaultBranch)))]));
+  let [listings] = await __t.timeAsync('listing', () => Promise.all([mapWithConcurrency(REPOS, REPOS.length, listOne), __t.timeAsync('listing.defaultBranch', () => Promise.all(REPOS.filter(repo => !(listingSnapshot && isFastDrainTarget(repo, { number: onlyPr }))).map(resolveDefaultBranch)))]));
+  if (listingSnapshot) await Promise.all(REPOS.filter(repo => isFastDrainTarget(repo, { number: onlyPr })).map(resolveDefaultBranch));
   // One repo's failed listing no longer kills the pass: it is logged as failed and the other repos proceed
   // (`partitionListings`). Only when EVERY repo failed is it the old bad-env hard-fail. The failed repo is absent
   // from the live rows, so the context re-list also fails and the couple gate fails closed for it.
@@ -5225,7 +5248,7 @@ async function runCli() {
   if (failedListings.length && !okListings.length) { const listErr = failedListings[0]; fail('gh-error', `gh pr list${listErr.repo ? ` --repo ${listErr.repo}` : ''} failed [${listErr.err.kind}]: ${listErr.err.text}${listErr.err.hint ? ` — ${listErr.err.hint}` : ''}`, 4); }
   for (const l of failedListings) process.stderr.write(`⚠️  DRAIN LISTING UNREADABLE — ✗ repo ${l.repo || 'cwd'} FAILED to list [${l.err.kind}]: ${l.err.text} — candidates for this repo are UNKNOWN (not 0); retrying next pass\n`);
   listings = okListings;
-  // #4108 — this pass's already-fetched live rows per repo (snapshot data only seeds heavy fields).
+  // #4108 — reuse only this pass's live listings; round snapshot rows never serve context.
   // See `buildLiveListingsByRepo`'s docblock for why
   // it is `rows`, never `prs`), reused below so `collectContext` need not re-list any repo in `REPOS`. `l.rows`
   // is always an array here (never undefined): the `listErr` check above already `fail()`-exited on any entry
