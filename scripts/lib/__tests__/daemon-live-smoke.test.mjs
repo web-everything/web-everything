@@ -211,6 +211,75 @@ function withNewCheckDefaults(fn) {
   });
 }
 
+describe('runBounded failure details', () => {
+  const runCheck = (name, error, releaseOnly = false) => SMOKE_CHECKS.find((c) => c.name === name).run({
+    root: '/x', repos: ['example/repo'], env: {}, ghChildEnv: {}, budgets: resolveSmokeBudgets({}),
+    runChild: async (_cmd, args) => {
+      if (releaseOnly && args[1] === 'acquire') return '{"lane":1}';
+      throw error;
+    },
+  });
+
+  it.each([
+    ['reconcile-dry-run'], ['lane-pool-list'], ['lane-acquire-release'], ['lane-acquire-release', true],
+    ['gh-api-repo'], ['gh-pr-list'], ['dispatch-dry-run'], ['tree-stays-clean'],
+  ])('%s keeps the real error after an informational stderr preamble (release=%s)', async (name, releaseOnly) => {
+    const row = await runCheck(name, Object.assign(new Error('exited 1: pr-snapshot: smoke sample 3'), {
+      stderr: 'pr-snapshot: smoke sample 3\n\nError: reconcile could not read state\n',
+    }), releaseOnly);
+    expect(row.ok).toBe(false);
+    expect(row.detail).toContain('exited 1: pr-snapshot: smoke sample 3');
+    expect(row.stderrTail).toContain('Error: reconcile could not read state');
+    expect(row.detail).not.toContain('Error: reconcile could not read state');
+    expect(row.detail).not.toContain('\n');
+  });
+
+  it('bounds the stderr tail to six lines, 300 characters per line and 1200 total, retaining the last error', async () => {
+    const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: info'), {
+      stderr: ['omitted preamble', ...Array.from({ length: 5 }, (_, i) => `${i}: ${'x'.repeat(400)}`),
+        '', '\u001bError: final failure ghp_secretToken\u0000', ''].join('\n'),
+    }));
+    const tail = row.stderrTail.slice('example/repo: '.length);
+    expect(tail.length).toBeLessThanOrEqual(1200);
+    expect(tail.split(' | ').length).toBeLessThanOrEqual(6);
+    expect(tail.split(' | ').every((line) => line.length <= 300)).toBe(true);
+    expect(tail).not.toContain('omitted preamble');
+    expect(tail).not.toContain('ghp_secretToken');
+    expect(tail).not.toMatch(/[\p{Cc}\p{Cf}]/u);
+    expect(tail).toContain('Error: final failure ghp_<redacted>');
+  });
+
+  it.each(['lane-pool-list', 'lane-acquire-release', 'reconcile-dry-run', 'gh-api-repo',
+    'gh-pr-list', 'dispatch-dry-run', 'tree-stays-clean'])(
+    '%s never classifies diagnostic stderr as busy-pool, env-timeout or transient', async (name) => {
+      let now = 0;
+      const stderr = 'gave up waiting for the shared acquirability-scan lock; scan exceeded its 120000ms budget; connect ETIMEDOUT';
+      const row = await SMOKE_CHECKS.find((c) => c.name === name).run({
+        root: '/x', repos: ['example/repo'], env: {}, ghChildEnv: {}, budgets: resolveSmokeBudgets({}),
+        clock: () => now, hostBusy: () => true,
+        runChild: async () => {
+          now += 240000;
+          throw Object.assign(new Error('exited 1: ordinary failure'), { stderr });
+        },
+      });
+      expect(row.ok).toBe(false);
+      expect(row.skipped).not.toBe(true);
+      expect(row.stderrTail).toContain(stderr);
+      expect(row.detail).not.toContain(stderr);
+      expect(isEnvTimeoutRow({ ...row, ms: now })).toBe(false);
+      expect(classifySmokeFailure([row])).toBe('code');
+    },
+  );
+
+  it('keeps the exact reconcile timeout-kill row even when the child captured stderr', async () => {
+    const row = await runCheck('reconcile-dry-run', Object.assign(new Error('timed out after 120000ms (process group killed)'), {
+      stderr: 'pr-snapshot: smoke sample 3\nError: interrupted\n',
+    }));
+    expect(row.detail).toBe('reconcile-pass dry-run (1/1 repo(s) — example/repo) failed: timed out after 120000ms (process group killed)');
+    expect(isEnvTimeoutRow({ ...row, ms: 120005 })).toBe(true);
+  });
+});
+
 describe('decideSmokeVerdict — pure', () => {
   it('every check passing → pass', () => expect(decideSmokeVerdict([{ ok: true }, { ok: true }])).toBe(true));
   it('one check failing → fail', () => expect(decideSmokeVerdict([{ ok: true }, { ok: false }])).toBe(false));

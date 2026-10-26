@@ -93,6 +93,7 @@ import { collectImportClosure, closureHits } from './import-closure.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { gitRun } from './main-staleness.mjs';
 import { DAEMON_BOOT_SMOKE_CHECK, DEFAULT_DAEMON_BOOT_MS } from './daemon-boot-smoke.mjs';
+import { redactDetail } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
 
 /** Set to `1`/`true`/`yes` to disable the whole gate — every merge is adopted unconditionally, exactly like
  *  before this file existed. The one intentionally fail-OPEN switch in this module. */
@@ -265,6 +266,14 @@ const failureLine = (e) => {
   return err && err !== lines[0] ? `${lines[0]} — ${err.trim()}` : lines[0];
 };
 
+// Diagnostic stderr is separate from detail: classifiers must see only the original summary.
+const childFailureDiagnostics = (e) => {
+  const tail = String(e?.stderr ?? '').split(/\r?\n/)
+    .map((line) => line.replace(/[\p{Cc}\p{Cf}]/gu, '').trim()).filter(Boolean).slice(-6)
+    .map((line) => redactDetail(line).slice(0, 300)).join(' | ').slice(-1200);
+  return tail ? { stderrTail: tail } : {};
+};
+
 // ── BUSY-POOL SKIP (live 2026-10-03 21:16-21:39 ET, `wev-review-daemon`) ─────────────────────────────────────────
 // A rebuild smoke took ~1000s: `lane-pool list` 206s and `lane-acquire-release` 181s. Not a bug in the tree — the
 // host was loaded and the pool busy: `list --acquirable` probes lanes one by one (git per lane, ~2.5s each under
@@ -354,7 +363,7 @@ async function checkLanePoolList(ctx) {
   } catch (e) {
     const detail = `lane-pool list --acquirable failed: ${firstLine(e)}`;
     return busyPoolSkip({ what: 'lane-pool list', detail, elapsedMs: (ctx.clock ?? Date.now)() - t0, capMs, ctx })
-      ?? { ok: false, detail };
+      ?? { ok: false, detail, ...childFailureDiagnostics(e) };
   }
 }
 
@@ -385,7 +394,7 @@ async function checkLaneAcquireRelease(ctx) {
   } catch (e) {
     const detail = `lane-pool acquire --purpose=smoke failed: ${firstLine(e)}`;
     const skip = busyPoolSkip({ what: 'lane-pool acquire', detail, elapsedMs: (ctx.clock ?? Date.now)() - t0, capMs: budgets.laneAcquireWaitMs, ctx });
-    if (!skip) return { ok: false, detail };
+    if (!skip) return { ok: false, detail, ...childFailureDiagnostics(e) };
     // A killed acquire may have written a lease just before it died: release this smoke session's leases (best-effort).
     try {
       await runChild('node', ['scripts/lane-pool.mjs', 'release', '--all-pools', `--session=${sessionSlug}`], { cwd: root, timeoutMs: budgets.laneReleaseMs, env });
@@ -401,7 +410,7 @@ async function checkLaneAcquireRelease(ctx) {
     // A stuck release still leaves a REAL lease held against the live pool — surfacing it as a gate failure
     // (never swallowed) is deliberate: a leaked smoke lease is exactly the kind of thing that should block
     // adopting the code that caused it, not just get logged and forgotten.
-    return { ok: false, detail: `acquired lane-${laneNum} but release failed (lease leaked — needs a hand release): ${firstLine(e)}`, lane: laneNum };
+    return { ok: false, detail: `acquired lane-${laneNum} but release failed (lease leaked — needs a hand release): ${firstLine(e)}`, lane: laneNum, ...childFailureDiagnostics(e) };
   }
 }
 
@@ -442,7 +451,7 @@ async function checkGhApiRepo({ ghChildEnv, budgets, runChild }) {
     await runChild('gh', ['api', '--method', 'GET', `repos/${slug}`], { env: ghChildEnv, timeoutMs: budgets.ghApiMs });
     return { ok: true, detail: `gh api --method GET repos/${slug} ok` };
   } catch (e) {
-    return { ok: false, detail: `gh api --method GET repos/${slug} failed: ${failureLine(e)}` };
+    return { ok: false, detail: `gh api --method GET repos/${slug} failed: ${failureLine(e)}`, ...childFailureDiagnostics(e) };
   }
 }
 
@@ -452,12 +461,13 @@ async function checkGhPrList({ ghChildEnv, budgets, runChild }) {
     await runChild('gh', ['pr', 'list', '--limit', '1', '--repo', slug, '--json', 'number'], { env: ghChildEnv, timeoutMs: budgets.ghPrListMs });
     return { ok: true, detail: `gh pr list --repo ${slug} --limit 1 ok` };
   } catch (e) {
-    return { ok: false, detail: `gh pr list --repo ${slug} --limit 1 failed: ${failureLine(e)}` };
+    return { ok: false, detail: `gh pr list --repo ${slug} --limit 1 failed: ${failureLine(e)}`, ...childFailureDiagnostics(e) };
   }
 }
 
 async function checkReconcileDryRun({ root, repos, budgets, runChild, env }) {
   const failures = [];
+  const stderrTails = [];
   for (const slug of repos) {
     try {
       // x5wbsbc — `env` too (like every lane-pool check, #4139): a candidate smoke's env carries the LIVE
@@ -465,6 +475,8 @@ async function checkReconcileDryRun({ root, repos, budgets, runChild, env }) {
       await runChild('node', ['scripts/conveyor/reconcile-pass.mjs', `--repo=${slug}`, '--json'], { cwd: root, timeoutMs: budgets.reconcileMs, env });
     } catch (e) {
       failures.push(`${slug}: ${firstLine(e)}`);
+      const { stderrTail } = childFailureDiagnostics(e);
+      if (stderrTail) stderrTails.push(`${slug}: ${stderrTail}`);
     }
   }
   // Every failure a runBounded kill at its own cap → one row shaped like dispatch's, so ENV_TIMEOUT_PATTERNS sees it.
@@ -473,7 +485,7 @@ async function checkReconcileDryRun({ root, repos, budgets, runChild, env }) {
     return { ok: false, detail: `reconcile-pass dry-run (${failures.length}/${repos.length} repo(s) — ${kills.map((m) => m[1]).join(', ')}) failed: ${kills[0][2]}` };
   }
   if (failures.length) {
-    return { ok: false, detail: `reconcile-pass dry-run failed for ${failures.length}/${repos.length} repo(s): ${failures.join('; ')}` };
+    return { ok: false, detail: `reconcile-pass dry-run failed for ${failures.length}/${repos.length} repo(s): ${failures.join('; ')}`, ...(stderrTails.length ? { stderrTail: stderrTails.join('; ') } : {}) };
   }
   return { ok: true, detail: `reconcile-pass dry-run ok for ${repos.length} repo(s)` };
 }
@@ -682,7 +694,7 @@ async function checkDispatchDryRun({ root, budgets, runChild, env }) {
       cwd: root, timeoutMs: budgets.dispatchDryRunMs, env: childEnv,
     });
   } catch (e) {
-    return { ok: false, detail: `dispatch dry-run child failed: ${failureLine(e)}` };
+    return { ok: false, detail: `dispatch dry-run child failed: ${failureLine(e)}`, ...childFailureDiagnostics(e) };
   } finally {
     try { rmSync(ledgerDir, { recursive: true, force: true }); } catch { /* best effort */ }
   }
@@ -731,7 +743,7 @@ async function checkTreeStaysClean({ root, budgets, runChild, env, beforePorcela
   try {
     out = await runChild('git', ['status', '--porcelain'], { cwd: root, timeoutMs: budgets.treeStaysCleanMs, env });
   } catch (e) {
-    return { ok: false, detail: `git status --porcelain failed: ${firstLine(e)}` };
+    return { ok: false, detail: `git status --porcelain failed: ${firstLine(e)}`, ...childFailureDiagnostics(e) };
   }
   const after = String(out || '').trim();
   if (!after) return { ok: true, detail: 'git status --porcelain empty — tree stayed clean' };
