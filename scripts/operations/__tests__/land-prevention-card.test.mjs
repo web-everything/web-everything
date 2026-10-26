@@ -301,13 +301,22 @@ describe('landPreventionCard — dedupe before filing', () => {
     } finally { cleanup(); }
   });
 
-  it('lands a mention-only filing through the ordinary PR path when every member has batching disabled', async () => {
+  it.each(['off', 'shadow', 'on', 'load-error', 'write-error'])('lands a mention-only filing through the ordinary PR path with widening %s', async mode => {
     const acquire = setup();
     try {
       const { exec, calls } = scriptedExec([acquire, 'staged', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'labelled', 'released']);
       const batch = vi.fn(async () => ({ batched: false, disabled: true }));
+      const logs = [];
       const result = await realLandPreventionCard(input(), {
-        exec, dedupe, batch, pendingDir: join(lane, 'pending'), write: () => {},
+        exec, dedupe, batch, pendingDir: join(lane, 'pending'),
+        loadWidenMode: () => {
+          if (mode === 'load-error') throw new Error('settings unreadable');
+          return { mode: mode === 'write-error' ? 'shadow' : mode, source: 'test', invalid: [] };
+        },
+        write: line => {
+          if (mode === 'write-error' && line.includes('card-batch-widen')) throw new Error('output unavailable');
+          logs.push(line);
+        },
       });
 
       expect(result).toMatchObject({ ok: true, step: 'done', num: null, rel: null, pr: 5555, mentions: 1 });
@@ -318,6 +327,8 @@ describe('landPreventionCard — dedupe before filing', () => {
         .toEqual(['commit', 'verify', 'open-pr']);
       expect(calls.some(({ args }) => args.includes('file-item'))).toBe(false);
       expect(calls.at(-1).args).toContain('release');
+      expect(logs.filter(line => line.includes('card-batch-widen'))).toHaveLength(['shadow', 'on'].includes(mode) ? 1 : 0);
+      if (['shadow', 'on'].includes(mode)) expect(logs.join('')).toContain('would batch #4706');
     } finally { cleanup(); }
   });
 

@@ -94,6 +94,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { fileIntoBatch, cardIdOf } from './card-batch-file.mjs';
 import { cardBatchStateDir } from './card-batch-io.mjs';
 import { loadPreventionBatchSettings, formatPreventionBatchSettings } from '../lib/card-batch-settings.mjs';
+import { loadWidenMode, emitWouldBatch } from '../lib/card-batch-shadow.mjs';
 import { cardOnlyEligibility } from '../lib/card-batch-policy.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
 import {
@@ -536,6 +537,7 @@ async function landPreventionCardImpl(input, {
   batch = fileIntoBatch,
   loadPreventionBatchSettings: loadBatchSettings = loadPreventionBatchSettings,
   loadFilingSettings = loadPreventionBatchSettings,
+  loadWidenMode: loadWiden = loadWidenMode,
   sleep: wait = sleep,
   drainLimit = {},
   acquireWait,
@@ -784,6 +786,15 @@ async function landPreventionCardImpl(input, {
 
     // The commit / verify gate / open-PR path takes up to 70 + 45 minutes: it never runs inside a tick. The card stays owed / in the spool.
     if (inTick) return deferTick('tick-deferred', 'this filing needs its own PR (batching disabled or sidecar mentions), which cannot run inside the tick');
+
+    if (mentioned.length) {
+      // Shadow observation must never change filing or its failure behavior.
+      try { emitWouldBatch({
+        loadWiden, cards: [rel ? (num ?? cardIdOf(rel)) : null, ...mentioned.map((m) => m.card.id)],
+        paths: [rel, ...mentioned.flatMap((m) => m.paths)].filter(Boolean),
+        write: (line) => write(`land-prevention-card: ${line}\n`),
+      }); } catch { /* argument building must not affect landing either */ }
+    }
 
     write(`land-prevention-card: committing ${[rel, ...mentioned.flatMap((m) => m.paths)].filter(Boolean).join(', ')}…\n`);
     try {

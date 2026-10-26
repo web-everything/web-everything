@@ -27,7 +27,11 @@ import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+// Enabled production-wiring cases must not depend on the prototype's committed filing pause.
+beforeEach(() => vi.stubEnv('WE_PREVENTION_FILING_ENABLED', 'true'));
+afterEach(() => vi.unstubAllEnvs());
 
 import { createRegistry } from '../registry.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';

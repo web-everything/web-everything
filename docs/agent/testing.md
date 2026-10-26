@@ -2447,3 +2447,92 @@ omissions are reported as truncation. Clone paths must be absolute. The drain ta
 prototype-load settings, not the plist's data clone; tests inject those settings. Matrix and PR table cells strip
 Cc/Cf controls and are width-capped; table mode keeps the truncated-listing warning.
 
+
+## Paused review recovery
+
+The ruling ledger omits unattempted referrals and suppresses findings after an operator verdict.
+A same-head pause can therefore need a separate report source: `pausedReviewRulingNeeded`
+reads `liveReferralState` with the gate's PR body, creation time and readable-card rule, then
+uses review-run evidence to prove the pause. Its findings flow through the existing operator
+queue and needs-you feed. Partly ruled heads list only pending findings.
+The pause notifier raises a ruling-needed notice rather than minting an automatic
+same-head wake. Historical `paused-review-auto-rearm` receipts do not reset the
+same-head counting window. Main's live-release, explicit operator events and
+bounded missing-verdict retries retain their existing eligibility. No labels change.
+Focused tests cover hold/feed/daemon integration, receipt dedupe, historical auto-rearm
+markers, reason-token holds and explicit operator wakes. No live GitHub writes are needed.
+
+
+## Label provisioning cache
+
+Provision-only land and drain callers use `scripts/lib/label-cache.mjs`.
+Main’s review/CI/stand-down callers retain their tested force-update contract. Per-repo label names live in atomic JSON files under
+`.conveyor/label-cache` in the running WE checkout, shared by its processes. PR state and merge
+admission are never cached here. `labels.cache.ttlMs` defaults to 3600000; 0 disables caching.
+The source-logged cascade reads the platform `labels` block, then the `labels` block in
+`scripts/settings/labels.json`, then `WE_LABELS_CACHE_TTL_MS` (nonnegative integer milliseconds).
+A cached miss refreshes once before creation; creation adds the name without extending the
+list timestamp. Failed list/cache IO falls back to provisioning; failed creation is excused
+only if a fresh list confirms another process created the label. Focused coverage lives in
+`scripts/lib/__tests__/label-cache.test.mjs`; adapter argv tests select uncached provisioning explicitly.
+
+
+## Immutable PR field sharing
+
+`scripts/lib/review-pr-snapshot.mjs` shares `files`, `commits` and the replay reader's `gh pr diff` across review readers
+in atomic on-disk snapshots, keyed by host, repo, PR, head SHA and live base SHA.
+`review.prSnapshot.ttlMs` defaults to 120000; 0 disables it. The source-logged cascade
+reads the platform `review.prSnapshot` block, then `prSnapshot` in
+`scripts/review-settings.json`, then `WE_REVIEW_PR_SNAPSHOT_TTL_MS`.
+Metadata, comments, reviews, labels and mergeability stay live. Net and stack diff
+bases also stay live: the current main/stack can change without the PR head moving.
+Missing, expired, corrupt or unwritable caches fall back to fresh PR fields.
+Focused coverage: `scripts/lib/__tests__/review-pr-snapshot.test.mjs`.
+
+
+## Shared PR context for jurors and fixers
+
+`review-pr-snapshot.mjs#readPinnedPrContext` shares informational body/files/commits/refs
+and comments by host + repo + PR + full examined head SHA, with atomic publication and
+a cross-process refresh lock. `scripts/pr-context.mjs <PR> --repo=<slug> --head=<full SHA>`
+is the agent read port; it and the fix context pack use the complete paginated comment
+reader, and cache that completeness separately from the CLI's capped comment connection.
+A miss reads comments before the final view, rejects a mismatched PR/head, and never stores
+a failed read. A different head selects a different file. An expired entry never serves.
+The TTL uses the existing source-logged `review.prSnapshot.ttlMs` cascade documented above;
+no separate context TTL or off-switch exists.
+
+`review-pr-io.mjs#ghPrView` and unpinned `review-detail` reads remain live and seed this
+context from their response. Juror requests carry the actual PR, examined SHA and absolute
+WE script path, so sibling-repo jurors can use the same port. Fix/CI dispatchers pass their
+planned head to the pack. Round history shares commit context, while its complete thread
+stays live because repeated-finding guards consume it. All label, merge, CI, head-revalidation
+and pre-mutation authority reads remain live; cached context cannot grant permission to act.
+Net/stack diffs continue using live bases. The older immutable-field adapter retains its
+head + base discriminator and live-metadata behavior.
+
+Regression coverage: `scripts/lib/__tests__/pr-context-sharing.test.mjs` stubs gh and counts
+calls across separate readers, changed heads, expiration, failures, context packs, the CLI,
+review detail and juror request construction. The source scan inventory is in
+[pr-read-inventory.md](pr-read-inventory.md).
+
+
+## Review fetch sharing
+
+The review daemon scopes `review.fetch.sharedPerTick` (default `true`) to one tick through
+`scripts/lib/review-fetch.mjs`. The cascade reads `fetch.sharedPerTick` from the review platform
+preference and `scripts/review-settings.json`; `WE_REVIEW_FETCH_SHARED_PER_TICK=true|false`
+overrides it. The cascade logs the winning source. Review readers share branch tracking refs
+per real clone path and remote, with targeted fetches for uncovered refs; failed shared fetches
+retain each reader's existing fallback. No tick context means no command changes. Keep this
+context inside the review daemon; merge admission must continue using its existing fresh reads.
+Regression coverage uses real local Git repositories in `scripts/lib/__tests__/review-fetch.test.mjs`.
+
+
+## Card-batch widening shadow
+
+`cardBatchWiden.mode` resolves standard → platform → repo → environment, logging its source.
+`off` disables observation; `shadow` and the reserved `on` value only log which new and existing
+cards would share a batch. The filer still opens its ordinary PR, and settings/formatting/output
+failures cannot affect filing. `scripts/lib/__tests__/card-batch-shadow.test.mjs` pins the
+cascade and failure containment; filer integration is covered by `land-prevention-card.test.mjs`.
