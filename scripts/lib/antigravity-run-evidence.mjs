@@ -26,22 +26,29 @@ export function agyRunEvidence({ stdout = '', stderr = '', requestedModel, now =
     fallbackDecision: exhausted ? 'skip-quota-exhausted' : mismatch ? 'skip-backend-mismatch' : modelMismatch ? 'skip-model-mismatch' : 'none' };
 }
 export function readAgyHold(model, { dir = agyEvidenceDir(), now = Date.now() } = {}) {
-  // A CLI-default launch has no known backend before init: conservatively sit out an active hold.
-  if (!model) {
-    for (const candidate of ['claude-sonnet-4-6', 'gemini-3.1-pro', 'default']) {
-      const hold = readAgyHold(candidate, { dir, now });
-      if (hold) return { ...hold, requestedModel: 'default' };
-    }
-    return null;
+  const readRows = (folder) => {
+    try {
+      return readdirSync(folder).filter((name) => name.endsWith('.json'))
+        .map((name) => JSON.parse(readFileSync(join(folder, name), 'utf8')));
+    } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+  };
+  // Default and unrecognized launches have no known backend before init.
+  const backend = agyBackend(model);
+  const backends = backend === 'unknown' ? ['anthropic', 'google', 'unknown'] : [backend];
+  // Read the old global layout without rewriting it. Unattributed legacy holds remain global.
+  const holds = readRows(dir).map((row) => ({ row,
+    heldBackend: [row.servedModel, row.requestedModel].map(agyBackend).find((value) => value !== 'unknown') ?? 'unknown' }))
+    .filter(({ heldBackend }) => heldBackend === 'unknown' || backends.includes(heldBackend));
+  for (const heldBackend of backends) {
+    holds.push(...readRows(join(dir, heldBackend)).map((row) => ({ row, heldBackend })));
   }
-  try {
-    const folder = join(dir, agyBackend(model));
-    const row = readdirSync(folder).filter((name) => name.endsWith('.json'))
-      .map((name) => JSON.parse(readFileSync(join(folder, name), 'utf8')))
-      .filter((entry) => Date.parse(entry.quotaResetsAt) > now)
-      .sort((a, b) => Date.parse(b.quotaResetsAt) - Date.parse(a.quotaResetsAt))[0];
-    return row ? { ...row, requestedModel: model || 'default', servedModel: 'unknown', servedBackend: 'unknown', modelEvidence: 'not-launched', fallbackDecision: 'skip-quota-hold' } : null;
-  } catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+  const hold = holds.filter(({ row }) => Date.parse(row.quotaResetsAt) > now)
+    .sort((a, b) => Date.parse(b.row.quotaResetsAt) - Date.parse(a.row.quotaResetsAt))[0];
+  if (!hold) return null;
+  const { row, heldBackend } = hold;
+  const heldModel = row.servedModel && row.servedModel !== 'unknown' ? row.servedModel : row.requestedModel || 'unknown';
+  return { ...row, requestedModel: model || 'default', servedModel: 'unknown', servedBackend: 'unknown', modelEvidence: 'not-launched',
+    fallbackDecision: 'skip-quota-hold', heldBackend, heldModel };
 }
 export function saveAgyHold(evidence, { dir = agyEvidenceDir() } = {}) {
   if (evidence.quotaState !== 'exhausted') return;
@@ -55,7 +62,8 @@ export function saveAgyHold(evidence, { dir = agyEvidenceDir() } = {}) {
   renameSync(temp, file);
 }
 export function agyEvidenceError(evidence) {
-  const error = new Error(`antigravity: ${evidence.fallbackDecision}; requested ${evidence.requestedModel}; reported ${evidence.servedModel}; quota reset ${evidence.quotaResetsAt ?? 'unknown'}`);
+  const heldBy = evidence.heldBackend ? ` (held by ${evidence.heldBackend} model ${evidence.heldModel ?? 'unknown'})` : '';
+  const error = new Error(`antigravity: ${evidence.fallbackDecision}; requested ${evidence.requestedModel}; reported ${evidence.servedModel}; quota reset ${evidence.quotaResetsAt ?? 'unknown'}${heldBy}`);
   error.telemetry = evidence;
   return error;
 }

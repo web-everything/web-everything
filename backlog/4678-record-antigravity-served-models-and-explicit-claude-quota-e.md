@@ -23,6 +23,7 @@ Investigate the 2026-09-30 operator exhaustion report using read-only local evid
 ## Progress
 
 2026-09-30 — Filed first through `node we:scripts/operations/run.mjs file-item`.
+2026-10-25 — Gap: holds were already per backend folder, so a Claude hold never blocked an explicit gemini model; only a run with no model hit the global scan, and the refusal did not say which family set the hold. Refusal now names the holding backend and model; the global scan covers every backend and legacy root-level hold files; tests added for claude-vs-gemini isolation and no-model global.
 
 **Before: read-only machine evidence.** Matched the daemon review records to saved agy judge transcripts by `sessionId`, selecting transcript modification dates of September 30 in the machine timezone. Exactly 114 `antigravity-review` rows matched: every stream had `init.init.model = gemini-3.1-pro` and terminal `SUCCESS`. The observed interval was 01:28:54–19:29:27 EDT. Example sessions: `b9ba70d0-9869-4bda-a772-e2d76abb2bc5` and `c1e66940-32c2-4e0a-a3b8-c1fdf9c98bcb`. These rows had no telemetry model; the enclosing operation's `sonnet` is not evidence of the agy backend. The saved streams are under the machine's `.antigravity-judge-transcripts` home directory; daemon records were read from the operator-specified external checkout and never modified.
 
