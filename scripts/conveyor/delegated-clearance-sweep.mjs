@@ -186,6 +186,15 @@ export function sweepDelegatedClearance({ prs, repo = null, dryRun = false, sett
         if (!dryRun) writeState(state);
       }
     }
+    // Observe ruling baselines before head-keyed memo suppression. A replacement ruling
+    // must retain this head even when an earlier ruling (or R11) already handled it.
+    for (const p of held) {
+      const a = approvalFor(approvals, repo, p.number);
+      if (a && sha(p.headRefOid) && !state.observed[observedKey(a)]) {
+        state.observed[observedKey(a)] = a.approvedHead ?? p.headRefOid;
+        if (!dryRun) writeState(state);
+      }
+    }
     const shadow = !Number.isFinite(Date.parse(setting.shadowUntil)) || now() < Date.parse(setting.shadowUntil);
     held = held.filter(p => {
       const key = `${repo ?? ''}#${p.number}@${p.headRefOid}`;
@@ -196,13 +205,6 @@ export function sweepDelegatedClearance({ prs, repo = null, dryRun = false, sett
       return !state.memo[`${key}:attempt`] && !state.memo[`${key}:pre-approval-void`]
         && !(shadow && state.memo[`${key}:would-approve`]);
     });
-    for (const p of held) {
-      const a = approvalFor(approvals, repo, p.number);
-      if (a && sha(p.headRefOid) && !state.observed[observedKey(a)]) {
-        state.observed[observedKey(a)] = a.approvedHead ?? p.headRefOid;
-        if (!dryRun) writeState(state);
-      }
-    }
     if (state.commentCursors !== undefined && (!state.commentCursors || typeof state.commentCursors !== 'object'
       || Array.isArray(state.commentCursors) || Object.values(state.commentCursors).some(n => !Number.isSafeInteger(n) || n < 0))) {
       throw new Error('invalid complete comment read cursor; operator review required');

@@ -9,6 +9,7 @@ import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { handoffHome } from '../../operations/handoff-home.mjs';
 import { planDelegatedClearance, sweepDelegatedClearance, resolveDelegatedClearance } from '../delegated-clearance-sweep.mjs';
 
 const head = 'a'.repeat(40), prior = 'b'.repeat(40);
@@ -33,6 +34,67 @@ function harness(extra = {}) {
 }
 describe('R130 delegated clearance', () => {
   afterEach(() => vi.unstubAllEnvs());
+  it.each(['replacement', 'new-after-R11'])('replacement ruling observes the current head despite an existing shadow memo: %s', origin => {
+    let currentApprovals = origin === 'replacement' ? approvals : [];
+    const h = harness({ setting: {}, readPreApprovals: () => currentApprovals,
+      readMovedFiles: vi.fn(() => ['backlog/123-card.md', 'src/unreviewed.js']) });
+    expect(sweepDelegatedClearance(h)[0].delegated).toBe('would-approve');
+    currentApprovals = [{ ...approvals[0], rulingId: 'R131' }];
+    sweepDelegatedClearance(h);
+    const baseline = h.readState().observed['o/r#5925:R131'];
+    const moved = { ...pr(), headRefOid: prior,
+      comments: pr().comments.map(c => ({ ...c, body: c.body.replaceAll(head, prior) })) };
+    let persisted = structuredClone(h.readState());
+    const resumed = harness({ prs: [moved], readPreApprovals: () => currentApprovals,
+      readState: () => persisted, writeState: next => { persisted = structuredClone(next); },
+      readMovedFiles: h.readMovedFiles });
+    expect(sweepDelegatedClearance(resumed)).toEqual([]);
+    expect(resumed.runLabel).not.toHaveBeenCalled();
+    expect(baseline).toBe(head);
+    expect(persisted.observed['o/r#5925:R131']).toBe(head);
+    expect(resumed.readMovedFiles).toHaveBeenCalledWith(expect.objectContaining({ approvedHead: head, head: prior }));
+  });
+  it.each(['attempt', 'pre-approval-void'])('observes a new ruling before a legacy head memo suppresses work: %s', kind => {
+    let persisted = { observed: {}, memo: { [`o/r#5925@${head}:${kind}`]: true } };
+    const h = harness({ readPreApprovals: () => approvals, readState: () => persisted,
+      writeState: next => { persisted = structuredClone(next); } });
+    sweepDelegatedClearance(h);
+    expect(persisted.observed['o/r#5925:R122']).toBe(head);
+    expect(h.runLabel).not.toHaveBeenCalled();
+  });
+  it.each([
+    { deadline: undefined, live: false },
+    { deadline: 'invalid deadline', live: false },
+    { deadline: '2026-10-27T00:00:00Z', live: false },
+    { deadline: '2026-10-25T00:00:00Z', live: true },
+  ])('invalid shadow deadline never invokes live clearance (deadline=$deadline)', ({ deadline, live }) => {
+    const h = harness({ setting: { shadowUntil: deadline } });
+    expect(sweepDelegatedClearance(h)[0].delegated).toBe(live ? 'auto-approved' : 'would-approve');
+    expect(h.runLabel).toHaveBeenCalledTimes(live ? 1 : 0);
+  });
+  it('defaults memo and pre-approval files to the operations handoff home', () => {
+    const setting = resolveDelegatedClearance({ env: {}, platform: {}, tool: {}, log: () => {} });
+    expect(setting.stateFile).toBe(join(handoffHome(), 'state', 'delegated-clearance.json'));
+    expect(setting.preApprovalsFile).toBe(join(handoffHome(), 'delegated-pre-approvals.json'));
+  });
+  it.each([
+    { files: ['backlog/123-card.md', 'src/bug.js'], allowed: false },
+    { files: ['backlog/x/y.md'], allowed: false },
+    { files: ['backlog/evil.js'], allowed: false },
+    { files: ['backlog/x.md.js'], allowed: false },
+    { files: ['backlog/123-card.md', 'backlog/456-card.md'], allowed: true },
+    { files: [], allowed: true },
+  ])('enforces card-only head movement for $files', ({ files, allowed }) => {
+    for (const shadow of [true, false]) {
+      const h = harness({ setting: shadow ? {} : harness().setting,
+        readPreApprovals: () => [{ ...approvals[0], approvedHead: prior }],
+        shape: () => ({ humanRequired: true }), readMovedFiles: vi.fn(() => files) });
+      const results = sweepDelegatedClearance(h);
+      expect(h.readMovedFiles).toHaveBeenCalledWith(expect.objectContaining({ approvedHead: prior, head }));
+      expect(results.map(r => r.delegated)).toEqual(allowed ? [shadow ? 'would-approve' : 'auto-approved'] : []);
+      expect(h.runLabel).toHaveBeenCalledTimes(allowed && !shadow ? 1 : 0);
+    }
+  });
   it.each(['shadow', 'live', 'pre-approved', 'status-context'])('clears the review-gate hold cycle in %s mode', mode => {
     const p = pr();
     p.statusCheckRollup.push(mode === 'status-context' ? { context: 'review-gate', state: 'FAILURE' }
@@ -352,6 +414,11 @@ describe('R130 delegated clearance', () => {
     expect(h.runLabel).toHaveBeenCalledWith(expect.objectContaining({ repo: 'o/r', num: 5925, head,
       body: expect.stringMatching(/R130.*R11[\s\S]*Ok[\s\S]*scripts\/example.mjs[\s\S]*humanRequired[\s\S]*false[\s\S]*aaaa/),
       args: expect.arrayContaining(['--to=clear-human', '--actor=daemon-delegate-R130', '--channel=daemon', `--expect-head=${head}`]) }));
+    const delegationArg = h.runLabel.mock.calls[0][0].args.find(arg => arg.startsWith('--delegation-json='));
+    const delegation = JSON.parse(delegationArg.slice('--delegation-json='.length));
+    const lifetime = Date.parse(delegation.expires) - h.now();
+    expect(lifetime).toBeGreaterThan(0);
+    expect(lifetime).toBeLessThanOrEqual(300000);
     expect(h.emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'auto-approved', head }));
   });
   it('leaves humanRequired without a named pre-approval alone', () => {
