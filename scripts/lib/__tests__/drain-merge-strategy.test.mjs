@@ -2204,6 +2204,12 @@ describe('live queue file-overlap admission', () => {
     expect(h.s.queueOverlapHold(candidate, HEAD)?.kind).toBe('queue-file-overlap');
     expect(h.s.enqueue(candidate, HEAD).kind).toBe('queue-file-overlap');
   });
+  it('names the blocker queue age and CI state in the skip reason when the queue read carries them', () => {
+    const enqueuedAt = new Date(1_000_000 - 81 * 60_000).toISOString();
+    const nodes = [{ state: 'AWAITING_CHECKS', enqueuedAt, headCommit: { oid: 'a'.repeat(40), statusCheckRollup: { state: 'PENDING' } }, pullRequest: { number: 43 } }];
+    const h = setup({ now: () => 1_000_000, queueFacts: { data: { repository: { mergeQueue: { entries: { pageInfo: { hasNextPage: false }, nodes } } } } } });
+    expect(h.s.queueOverlapHold(candidate, HEAD).reason).toBe(`#43 share ${card}; blocker #43 queued 81 min, state AWAITING_CHECKS, CI PENDING`);
+  });
   it('pre-check shares the enqueue reason, caches only its own reads and expires after 30s', () => {
     let time = 1_000;
     const h = setup({ now: () => time });
