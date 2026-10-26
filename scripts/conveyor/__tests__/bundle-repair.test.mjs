@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { buildAgentArgv } from '../../operations/dispatch-lane-io.mjs';
 
 import {
-  BUNDLE_REPAIR_BOT, BUNDLE_REPAIR_STANDARD, HOLD_RULES, assertBriefSafe, cloneName, heldRefs, holdIdFor,
+  BUNDLE_REPAIR_BOT, BUNDLE_REPAIR_STANDARD, BUNDLE_REPAIR_VALID, HOLD_RULES, assertBriefSafe, cloneName, heldRefs, holdIdFor,
   planBundleRepairs, planReconcile, validateOutcome,
 } from '../bundle-repair-core.mjs';
 import {
@@ -70,6 +70,91 @@ describe('planBundleRepairs — trigger and budget', () => {
     expect(cloneName('/ws/wev-health-watch')).toBe('health-watch');
     expect(cloneName('/ws/.lanes/we-drain-daemon/code')).toBe('we-drain-code');
     expect(heldRefs({ failed: 'lane/a (PR #12), lane/b: conflict with main' })).toEqual(['lane/a', 'lane/b']);
+  });
+});
+
+describe('planBundleRepairs — bounded dispatch-failed retries', () => {
+  const SHA = 'b'.repeat(40);
+  const c = clone(60);
+  const prior = (o = {}) => ({
+    holdId: holdIdFor(c, c.held), cloneKey: KEY, status: 'dispatch-failed',
+    dispatcherSha: 'a'.repeat(40), endedAt: NOW - MIN, dispatchRetries: 0, ...o,
+  });
+  const plan = (entry, o = {}) => planBundleRepairs({
+    clones: [c], ledger: [entry], settings: on({ dispatchRetryBackoffMinutes: 60, maxDispatchRetries: 2 }),
+    now: NOW, dispatcherSha: SHA, ...o,
+  });
+  const expectHeld = (p, reason) => {
+    expect(p.dispatch).toEqual([]);
+    expect(p.held).toEqual([expect.objectContaining({ rule: HOLD_RULES.ONE_PER_HOLD, reason: expect.stringMatching(reason) })]);
+  };
+
+  it('escalated (real repair failure) stays sticky despite a new sha and elapsed backoff', () => {
+    expectHeld(plan(prior({ status: 'escalated', endedAt: NOW - 120 * MIN })), /escalated/);
+  });
+
+  it.each(['cleared', 'repaired', 'shadow'])('%s stays sticky despite a new sha and elapsed backoff', (status) => {
+    expectHeld(plan(prior({ status, endedAt: NOW - 120 * MIN })), new RegExp(status));
+  });
+
+  it('dispatch-failed + new sha retries before backoff', () => {
+    const p = plan(prior());
+    expect(p.held).toEqual([]);
+    expect(p.dispatch).toEqual([expect.objectContaining({ retryOf: { dispatchRetries: 1, previousStatus: 'dispatch-failed' } })]);
+  });
+
+  it('dispatch-failed + same sha before backoff holds with an explanatory reason', () => {
+    expectHeld(plan(prior({ dispatcherSha: SHA })), /backoff|sha.*unchanged/i);
+  });
+
+  it('dispatch-failed + same sha after backoff retries at the exact boundary', () => {
+    const p = plan(prior({ dispatcherSha: SHA, endedAt: NOW - 60 * MIN }));
+    expect(p.dispatch).toEqual([expect.objectContaining({ retryOf: { dispatchRetries: 1, previousStatus: 'dispatch-failed' } })]);
+  });
+
+  it('legacy entry without dispatcherSha retries on a known sha', () => {
+    const entry = prior();
+    delete entry.dispatcherSha;
+    delete entry.dispatchRetries;
+    expect(plan(entry).dispatch).toEqual([expect.objectContaining({ retryOf: { dispatchRetries: 1, previousStatus: 'dispatch-failed' } })]);
+  });
+
+  it('maxDispatchRetries 0 never retries even with a changed sha and elapsed backoff', () => {
+    expectHeld(plan(prior({ endedAt: NOW - 120 * MIN }), { settings: on({ maxDispatchRetries: 0 }) }), /retr(?:y|ies)|used|limit/i);
+  });
+
+  it('null sha never sha-retries; backoff alone decides', () => {
+    expectHeld(plan(prior(), { dispatcherSha: null }), /backoff|sha/i);
+    expect(plan(prior({ endedAt: NOW - 60 * MIN }), { dispatcherSha: null }).dispatch).toHaveLength(1);
+  });
+
+  it('empty sha never sha-retries before backoff', () => {
+    expectHeld(plan(prior(), { dispatcherSha: '' }), /backoff|sha/i);
+  });
+
+  it.each([
+    { dispatchRetries: '0' }, { dispatchRetries: NaN }, { dispatchRetries: Infinity },
+    { endedAt: String(NOW - 120 * MIN) }, { endedAt: NaN }, { endedAt: Infinity }, { endedAt: undefined },
+  ])('malformed dispatchRetries/endedAt held even with a new sha: %j', (bad) => {
+    expectHeld(plan(prior(bad)), /./);
+  });
+
+  it('retry eligibility still obeys live-per-clone before one-per-hold', () => {
+    const p = plan(prior(), { ledger: [prior(), { cloneKey: KEY, holdId: 'older', status: 'running' }] });
+    expect(p.dispatch).toEqual([]);
+    expect(p.held[0].rule).toBe(HOLD_RULES.ONE_PER_CLONE);
+  });
+
+  it('retry eligibility still obeys maxConcurrent after one-per-hold', () => {
+    const p = plan(prior(), { ledger: [prior(), { cloneKey: 'other', holdId: 'other', status: 'running' }] });
+    expect(p.dispatch).toEqual([]);
+    expect(p.held[0].rule).toBe(HOLD_RULES.MAX_CONCURRENT);
+  });
+
+  it('retry never happens in shadow mode, when disabled, or when killed', () => {
+    for (const o of [{ settings: on({ mode: 'shadow' }) }, { settings: on({ enabled: false }) }, { killed: true }]) {
+      expect(plan(prior(), o).dispatch).toEqual([]);
+    }
   });
 });
 
@@ -223,6 +308,124 @@ describe('runBundleRepairs (IO shell, every seam injected)', () => {
     return { dir, published, dispatched, stopped, seams };
   };
   const settings = (o) => ({ settingsResolved: { settings: on(o), sources: {}, invalid: [] } });
+  const seedDispatchFailure = (dir, o = {}) => {
+    const c = clone(60);
+    const entry = {
+      holdId: holdIdFor(c, c.held), cloneKey: KEY, root: ROOT, name: 'review',
+      status: 'dispatch-failed', startedAt: NOW - 2 * MIN, endedAt: NOW - MIN,
+      dispatcherSha: 'a'.repeat(40), dispatchRetries: 0, escalations: ['dispatch-failed'], ...o,
+    };
+    mkdirSync(join(dir, 'bundle-repair'), { recursive: true });
+    writeFileSync(ledgerPath(dir), JSON.stringify([entry]));
+    return entry;
+  };
+
+  it.each([
+    ['sha-changed', 'b'.repeat(40), NOW],
+    ['backoff', 'a'.repeat(40), NOW + 59 * MIN],
+  ])('runBundleRepairs replaces the old entry before launch and logs the retry line (%s)', async (reason, sha, now) => {
+    const { dir, seams } = setup();
+    const old = seedDispatchFailure(dir);
+    const log = vi.fn();
+    const resolveDispatcherSha = vi.fn(() => sha);
+    let reservation;
+    const dispatch = vi.fn(async () => { reservation = readLedger(dir); return { handle: 'retry-handle' }; });
+    const s = await runBundleRepairs({ ...seams, now, log, dispatch, resolveDispatcherSha, ...settings({ maxDispatchRetries: 2 }) });
+    expect(resolveDispatcherSha).toHaveBeenCalledOnce();
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(s.dispatched).toHaveLength(1);
+    expect(reservation).toEqual([expect.objectContaining({
+      holdId: old.holdId, status: 'running', launching: true, dispatchRetries: 1, dispatcherSha: sha, escalations: [],
+    })]);
+    const entries = readLedger(dir);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ holdId: old.holdId, status: 'running', handle: 'retry-handle', dispatchRetries: 1, dispatcherSha: sha });
+    const retryLine = `bundle-repair[retry]: relaunching ${entries[0].session} for clone review after dispatch-failed (attempt 1/2, reason ${reason})`;
+    const launchedLine = `bundle-repair: launched ${entries[0].session} for clone review`;
+    const lines = log.mock.calls.map(([line]) => line);
+    expect(lines).toContain(retryLine);
+    expect(lines).toContain(launchedLine);
+    expect(lines.indexOf(retryLine)).toBeLessThan(lines.indexOf(launchedLine));
+  });
+
+  it.each([0, 1, 2, 5])('retries bounded at maxDispatchRetries=%i: exactly N relaunches then held across failing passes', async (maxDispatchRetries) => {
+    const { dir, published, seams } = setup();
+    const old = seedDispatchFailure(dir);
+    const dispatch = vi.fn(async () => { throw Object.assign(new Error('cannot resolve --model'), { notApplied: true }); });
+    // Every pass changes sha AND clears backoff; neither may bypass the retry budget.
+    for (let pass = 1; pass <= maxDispatchRetries + 1; pass += 1) {
+      const sha = String(pass).repeat(40);
+      const now = NOW + pass * 60 * MIN;
+      const s = await runBundleRepairs({
+        ...seams, now, dispatch, resolveDispatcherSha: () => sha,
+        ...settings({ maxDispatchRetries, dispatchRetryBackoffMinutes: 60 }),
+      });
+      expect(dispatch).toHaveBeenCalledTimes(Math.min(pass, maxDispatchRetries));
+      const entries = readLedger(dir);
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toMatchObject({ holdId: old.holdId, status: 'dispatch-failed', dispatchRetries: Math.min(pass, maxDispatchRetries) });
+      if (pass <= maxDispatchRetries) {
+        expect(s.failed).toHaveLength(1);
+        expect(entries[0]).toMatchObject({ dispatcherSha: sha, endedAt: now, escalations: ['dispatch-failed'] });
+        expect(s.escalated).toEqual([{ holdId: old.holdId, reason: 'dispatch-failed' }]);
+      } else {
+        expect(s.held[0]).toMatchObject({ rule: HOLD_RULES.ONE_PER_HOLD, reason: expect.stringMatching(/retr(?:y|ies)|used|limit/i) });
+      }
+      expect(published).toHaveLength(Math.min(pass, maxDispatchRetries));
+    }
+  });
+
+  it('every new live reservation records dispatcherSha before dispatch', async () => {
+    const { dir, seams } = setup();
+    const sha = 'b'.repeat(40);
+    let reservation;
+    await runBundleRepairs({
+      ...seams, resolveDispatcherSha: () => sha, ...settings(),
+      dispatch: async () => { reservation = readLedger(dir); return { handle: 'h1' }; },
+    });
+    expect(reservation).toEqual([expect.objectContaining({ status: 'running', dispatcherSha: sha })]);
+    expect(readLedger(dir)[0].dispatcherSha).toBe(sha);
+  });
+
+  it('retry starts fresh escalation dedup so a second dispatch failure escalates again', async () => {
+    const { dir, seams, published } = setup();
+    seedDispatchFailure(dir);
+    let reservation;
+    const s = await runBundleRepairs({
+      ...seams, resolveDispatcherSha: () => 'b'.repeat(40), ...settings(),
+      dispatch: async () => {
+        reservation = readLedger(dir)[0];
+        throw Object.assign(new Error('refusing to start without --model'), { notApplied: true });
+      },
+    });
+    expect(reservation).toMatchObject({ escalations: [], dispatchRetries: 1, dispatcherSha: 'b'.repeat(40) });
+    expect(s.escalated).toEqual([{ holdId: reservation.holdId, reason: 'dispatch-failed' }]);
+    expect(published).toHaveLength(1);
+    expect(readLedger(dir)[0]).toMatchObject({ status: 'dispatch-failed', dispatchRetries: 1, dispatcherSha: 'b'.repeat(40), escalations: ['dispatch-failed'] });
+  });
+
+  it('unreadable ledger throws and dispatches nothing even with retry enabled and a known sha', async () => {
+    const { dir, dispatched, seams } = setup();
+    // A directory at the ledger path reliably fails readFileSync, even for a privileged test runner.
+    mkdirSync(ledgerPath(dir), { recursive: true });
+    await expect(runBundleRepairs({
+      ...seams, resolveDispatcherSha: () => 'b'.repeat(40), ...settings({ maxDispatchRetries: 2 }),
+    })).rejects.toThrow(/unknown ledger/);
+    expect(dispatched).toEqual([]);
+  });
+
+  it('unreadable dispatcher sha never causes a sha retry; backoff still retries with null recorded', async () => {
+    const { dir, dispatched, seams } = setup();
+    seedDispatchFailure(dir);
+    const resolveDispatcherSha = () => null;
+    const before = await runBundleRepairs({ ...seams, resolveDispatcherSha, ...settings() });
+    expect(dispatched).toEqual([]);
+    expect(before.held[0].rule).toBe(HOLD_RULES.ONE_PER_HOLD);
+    await runBundleRepairs({ ...seams, resolveDispatcherSha, now: NOW + 59 * MIN, ...settings() });
+    expect(dispatched).toHaveLength(1);
+    expect(readLedger(dir)).toEqual([expect.objectContaining({ dispatcherSha: null, dispatchRetries: 1, status: 'running' })]);
+  });
+
   const repairedOutcome = (dir) => {
     const entry = readLedger(dir)[0];
     mkdirSync(join(dir, 'bundle-repair', 'outcomes'), { recursive: true });
@@ -535,6 +738,51 @@ describe('no operator credential', () => {
 });
 
 describe('settings via the cascade', () => {
+  it('retry settings leaves have standard defaults and inclusive integer bounds', () => {
+    expect(BUNDLE_REPAIR_STANDARD).toMatchObject({ dispatchRetryBackoffMinutes: 60, maxDispatchRetries: 2 });
+    for (const [leaf, valid, invalid] of [
+      ['dispatchRetryBackoffMinutes', [1, 60, 1440], [0, 1441, 1.5, '60', null, NaN, Infinity]],
+      ['maxDispatchRetries', [0, 2, 5], [-1, 6, 1.5, '2', null, NaN, Infinity]],
+    ]) {
+      expect(BUNDLE_REPAIR_VALID[leaf]).toBeTypeOf('function');
+      for (const value of valid) expect(BUNDLE_REPAIR_VALID[leaf](value)).toBe(true);
+      for (const value of invalid) expect(BUNDLE_REPAIR_VALID[leaf](value)).toBe(false);
+    }
+  });
+
+  it('retry settings leaves appear in the cascade with effective values and logged sources', async () => {
+    const log = vi.fn();
+    const env = { WE_POLICY_CASCADE_LOG: '1' };
+    const std = await resolveBundleRepairSettings({ env, platform: null, tool: {}, log });
+    expect(std.settings).toMatchObject({ dispatchRetryBackoffMinutes: 60, maxDispatchRetries: 2 });
+    expect(std.sources).toMatchObject({ dispatchRetryBackoffMinutes: 'standard', maxDispatchRetries: 'standard' });
+    const platform = { dispatchRetryBackoffMinutes: 90, maxDispatchRetries: 3 };
+    const plat = await resolveBundleRepairSettings({ env, platform, tool: {}, log });
+    expect(plat.settings).toMatchObject(platform);
+    expect(plat.sources).toMatchObject({ dispatchRetryBackoffMinutes: 'platform', maxDispatchRetries: 'platform' });
+    const tool = await resolveBundleRepairSettings({ env, platform, tool: { dispatchRetryBackoffMinutes: 120, maxDispatchRetries: 0 }, log });
+    expect(tool.settings).toMatchObject({ dispatchRetryBackoffMinutes: 120, maxDispatchRetries: 0 });
+    expect(tool.sources).toMatchObject({ dispatchRetryBackoffMinutes: 'tool', maxDispatchRetries: 'tool' });
+    for (const [value, source] of [[60, 'standard'], [90, 'platform'], [120, 'tool']]) {
+      expect(log).toHaveBeenCalledWith(expect.stringContaining(`dispatchRetryBackoffMinutes=${value} (${source})`));
+    }
+    for (const [value, source] of [[2, 'standard'], [3, 'platform'], [0, 'tool']]) {
+      expect(log).toHaveBeenCalledWith(expect.stringContaining(`maxDispatchRetries=${value} (${source})`));
+    }
+  });
+
+  it.each([
+    ['dispatchRetryBackoffMinutes', 0, 60], ['dispatchRetryBackoffMinutes', 1441, 60],
+    ['dispatchRetryBackoffMinutes', 1.5, 60], ['dispatchRetryBackoffMinutes', '60', 60],
+    ['maxDispatchRetries', -1, 2], ['maxDispatchRetries', 6, 2],
+    ['maxDispatchRetries', 1.5, 2], ['maxDispatchRetries', '2', 2],
+  ])('invalid retry setting %s=%s falls to standard and is reported', async (leaf, value, fallback) => {
+    const r = await resolveBundleRepairSettings({ env: { WE_POLICY_CASCADE_LOG: '0' }, platform: null, tool: { [leaf]: value } });
+    expect(r.settings[leaf]).toBe(fallback);
+    expect(r.sources[leaf]).toBe('standard');
+    expect(r.invalid.join()).toContain(leaf);
+  });
+
   it('standard default is off + shadow; tool and env layers override with their source named; invalid ignored', async () => {
     const env = { WE_POLICY_CASCADE_LOG: '0' };
     const std = await resolveBundleRepairSettings({ env, tool: undefined, platform: null });
