@@ -40,7 +40,7 @@ export default {
     let hang = true;
     let head = 'a'.repeat(40);
     const handle = createEnqueueOnEvent({
-      cwd: root, localSlug: REPO, env: {}, now: () => time,
+      cwd: root, localSlug: REPO, defaultBranch: 'main', env: {}, now: () => time,
       // Shorten only the child's wall clock; policy remains the production three-listing backoff.
       timeoutMs: 50,
       resolveSetting: () => ({
@@ -49,12 +49,16 @@ export default {
           maxQueued: 1, missSmellAfter: 3, blockedBackoffRounds: 6, timeoutBackoffRounds: 3 },
       }),
       log: line => { lines.push(line); log(line); },
-      readCandidates: async () => ({ ok: true, queued: 0, prs: [{ num: NUM, readyAt: 0 }] }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [{
+        num: NUM, readyAt: 0, labels: [{ name: 'ready-to-merge' }],
+        baseRefName: 'main', mergeStateStatus: 'CLEAN',
+      }] }),
       readCapacity: () => ({ capacity: 1, source: 'soak' }),
       readPriorities: () => ({ priority: {}, buildPriority: [], mainFix: null }),
       readQueueDepth: async () => ({ ok: true, queued: 0, queuedNums: [] }),
       readPr: async () => ({
         state: 'OPEN', isDraft: false, headRefOid: head, labels: [{ name: 'ready-to-merge' }],
+        baseRefName: 'main', mergeStateStatus: 'CLEAN',
         statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
       }),
       readMembership: async () => ({ ok: true, inQueue: true }),

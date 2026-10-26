@@ -58,7 +58,9 @@
  *   GitHub's merge queue. A mark with no PR number (`repo#?`) or a full-sweep mark (`*`) is left to the full pass.
  */
 import { createPrestageCache, resolvePrestageSettings } from './drain-prestage.mjs';
-import { createHash } from 'node:crypto';
+import { rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { randomUUID, createHash } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -83,6 +85,7 @@ import { readFreeze } from '../readiness/red-main-remediation.mjs';
 import { extractManifestFromBody, repoKeyFromSlug } from '../readiness/lane-manifest.mjs';
 import { parseVerdictComment } from './review-log-claims.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
+import { execFileSyncThrottled } from './gh-throttle.mjs';
 
 export const ENQUEUE_ON_EVENT_POLICY = 'mergeQueue.enqueueOnEvent';
 export const ENQUEUE_ON_EVENT_ENV = 'WE_ENQUEUE_ON_EVENT';
@@ -207,8 +210,8 @@ export function duePending(pending, { now, debounceSeconds }) {
 }
 
 /** The fast-drain argv (node script + args). The drain's own single-PR path; `--this-repo` keeps the listing local. PURE. */
-export function fastDrainArgs({ scriptRoot, num }) {
-  return [join(scriptRoot, 'scripts', 'merge-ai-prs.mjs'), `--only=${num}`, `--label=${READY_LABEL}`, '--this-repo', '--json'];
+export function fastDrainArgs({ scriptRoot, num, listingSnapshot }) {
+  return [join(scriptRoot, 'scripts', 'merge-ai-prs.mjs'), `--only=${num}`, `--label=${READY_LABEL}`, '--this-repo', '--json', ...(listingSnapshot ? [`--listing-snapshot=${listingSnapshot}`] : [])];
 }
 
 /** What the fast drain's JSON said about the target PR, in a few words. PURE. */
@@ -264,6 +267,16 @@ function fastDrainUsedNoRoom(json, num) {
   return hit(json.skipReasons) || hit(json.skipped);
 }
 
+/** Definite no-op holds, shared by the listing planner and the fresh wake read. */
+export function catchUpSkipReason(pr, defaultBranch = 'main') {
+  if (!pr || !Array.isArray(pr.labels) || pr.labels.some(l => typeof l?.name !== 'string')) return 'labels unreadable';
+  for (const name of ['red-team:blocked', 'review:changes']) if (pr.labels.some(l => l.name === name)) return name;
+  if (pr.baseRefName !== defaultBranch) return `base is not ${defaultBranch} (${pr.baseRefName ?? 'unreadable'})`;
+  if (pr.mergeStateStatus === 'DIRTY' || pr.mergeStateStatus === 'CONFLICTING') return pr.mergeStateStatus;
+  if (pr.mergeable === 'CONFLICTING') return 'CONFLICTING';
+  return null;
+}
+
 /**
  * Is the PR worth a fast drain right now? A WAKE filter, never the gate: it only skips a run the drain would certainly
  * no-op (a fast drain lists and classifies for ~1 min, and most green-check events are for PRs that are not queued yet
@@ -272,11 +285,13 @@ function fastDrainUsedNoRoom(json, num) {
  * @param {{state?:string, isDraft?:boolean, labels?:Array<{name:string}>, statusCheckRollup?:Array<object>}|null} pr
  * @returns {{wake:boolean, reason:string}}
  */
-export function wakeWorthy(pr) {
+export function wakeWorthy(pr, defaultBranch = 'main') {
   if (!isObj(pr)) return { wake: true, reason: 'PR unread — the drain decides' };
   if (pr.state && pr.state !== 'OPEN') return { wake: false, reason: `PR is ${String(pr.state).toLowerCase()}` };
   if (pr.isDraft) return { wake: false, reason: 'draft' };
   const labels = (Array.isArray(pr.labels) ? pr.labels : []).map((l) => l?.name);
+  const hold = catchUpSkipReason(pr, defaultBranch);
+  if (hold) return { wake: false, reason: hold };
   if (!labels.includes(READY_LABEL)) return { wake: false, reason: `no ${READY_LABEL} label yet` };
   const running = (Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [])
     .filter((c) => (c?.__typename === 'StatusContext' ? ['PENDING', 'EXPECTED'].includes(String(c.state).toUpperCase()) : c?.status && c.status !== 'COMPLETED'));
@@ -298,7 +313,7 @@ export function prHeadSignature(pr) {
 /** Default PR read for {@link wakeWorthy}: one `gh pr view`. Resolves null on any failure. */
 export function readPrForWake({ repo, num, env = process.env, execFileImpl = execFile }) {
   return new Promise((res) => {
-    execFileImpl('gh', ['pr', 'view', String(num), '--repo', repo, '--json', 'state,isDraft,labels,statusCheckRollup,headRefOid,updatedAt'], { env, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 60_000 }, (err, stdout) => {
+    execFileImpl('gh', ['pr', 'view', String(num), '--repo', repo, '--json', 'state,isDraft,labels,statusCheckRollup,headRefOid,updatedAt,baseRefName,mergeStateStatus,mergeable'], { env, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 60_000 }, (err, stdout) => {
       if (err) { res(null); return; }
       try { res(JSON.parse(String(stdout || 'null'))); } catch { res(null); }
     });
@@ -323,7 +338,7 @@ export async function readMergeQueueMembership({ repo, num, env = process.env, e
 }
 
 export const CATCH_UP_QUERY = `query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){
-  pullRequests(states:OPEN,labels:["ready-to-merge"],first:100,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number body isDraft isInMergeQueue labels(first:30){nodes{name}}} pageInfo{hasNextPage endCursor}}
+  pullRequests(states:OPEN,labels:["ready-to-merge"],first:100,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number body isDraft isInMergeQueue baseRefName mergeStateStatus mergeable labels(first:100){nodes{name} pageInfo{hasNextPage}}} pageInfo{hasNextPage endCursor}}
   mergeQueue(branch:"main"){entries(first:100){totalCount}}}}`;
 
 /**
@@ -371,7 +386,7 @@ function ghGraphql({ query, owner, name, cursor, env, execFileImpl }) {
  * when each got its label and first acceptance (ready-time fallback when acceptance is unreadable). Never rejects.
  * @returns {Promise<{ok:true, prs:Array<{num:number, isDraft:boolean, inQueue:boolean, labels:string[], override?:{value:'now'|'urgent', byOperator:boolean}, readyAt:(number|null)}>, queued:number}|{ok:false, error:string}>}
  */
-export async function readCatchUpCandidates({ repo, env = process.env, execFileImpl = execFile, readComments = readCompletePrComments }) {
+export async function readCatchUpCandidates({ repo, defaultBranch = 'main', env = process.env, execFileImpl = execFile, readComments = readCompletePrComments }) {
   const [owner, name] = String(repo ?? '').split('/');
   if (!owner || !name) return { ok: false, error: `not an owner/name repo: ${JSON.stringify(repo)}` };
   const prs = [];
@@ -385,8 +400,7 @@ export async function readCatchUpCandidates({ repo, env = process.env, execFileI
     if (!Array.isArray(nodes)) return { ok: false, error: 'no pullRequests in the GraphQL answer' };
     if (typeof pageInfo?.hasNextPage !== 'boolean') return { ok: false, error: 'no pullRequests pageInfo in the GraphQL answer' };
     if (cursor === undefined) queued = list.repository.mergeQueue?.entries?.totalCount ?? 0;
-    prs.push(...nodes.map((pr) => ({ ...(pr.body ? { itemIds: [extractManifestFromBody(pr.body)?.item].filter((id) => id != null).map(String) } : {}), num: pr.number, isDraft: pr.isDraft === true, inQueue: pr.isInMergeQueue === true,
-      labels: (pr.labels?.nodes || []).map((label) => label?.name).filter((name) => typeof name === 'string'), readyAt: null })));
+    prs.push(...nodes.map((pr) => ({ ...(pr.body ? { itemIds: [extractManifestFromBody(pr.body)?.item].filter((id) => id != null).map(String) } : {}), num: pr.number, labels: pr.labels?.pageInfo?.hasNextPage === false ? pr.labels.nodes : null, baseRefName: pr.baseRefName, mergeStateStatus: pr.mergeStateStatus, mergeable: pr.mergeable, isDraft: pr.isDraft === true, inQueue: pr.isInMergeQueue === true, readyAt: null })));
     if (!pageInfo.hasNextPage) break;
     const next = pageInfo.endCursor;
     if (typeof next !== 'string' || !next || seenCursors.has(next)) return { ok: false, error: 'invalid pullRequests pagination cursor' };
@@ -394,7 +408,7 @@ export async function readCatchUpCandidates({ repo, env = process.env, execFileI
     cursor = next;
   }
   for (const pr of prs) {
-    const label = pr.labels.find((name) => PRIORITY_RESERVE_LABELS.includes(name));
+    const label = (pr.labels || []).map(label => typeof label === 'string' ? label : label?.name).find(name => PRIORITY_RESERVE_LABELS.includes(name));
     if (!label) continue;
     // Match the drain's operator override provenance; this changes ordering only.
     const byOperator = await new Promise((resolve) => {
@@ -412,7 +426,7 @@ export async function readCatchUpCandidates({ repo, env = process.env, execFileI
     });
     pr.override = { value: label.slice('priority:'.length), byOperator };
   }
-  const open = prs.filter((p) => !p.isDraft && !p.inQueue);
+  const open = prs.filter((p) => !p.isDraft && !p.inQueue && !catchUpSkipReason(p, defaultBranch));
   // Keep each aliased timeline query bounded even when the listing spans many pages.
   for (let offset = 0; offset < open.length; offset += 100) {
     const batch = open.slice(offset, offset + 100);
@@ -450,11 +464,11 @@ export async function readCatchUpQueueDepth({ repo, env = process.env, execFileI
 
 /** PURE: ordered candidates that fit the current queue, leaving eligibility to the drain. */
 export function planCatchUp({ prs, queued, capacity, pendingNums = [], order = 'priority-then-first-accept',
-  priority, buildPriority = [], mainFix = null, repo, now = 0 }) {
+  priority, buildPriority = [], mainFix = null, repo, now = 0, defaultBranch = 'main' }) {
   const pending = new Set(pendingNums);
   const skipped = []; const candidates = [];
   for (const pr of prs) {
-    const reason = pr.isDraft ? 'draft' : pr.inQueue ? 'already queued' : pending.has(pr.num) ? 'already pending' : null;
+    const reason = pr.isDraft ? 'draft' : pr.inQueue ? 'already queued' : pending.has(pr.num) ? 'already pending' : catchUpSkipReason(pr, defaultBranch);
     if (reason) skipped.push({ num: pr.num, reason });
     else candidates.push(pr);
   }
@@ -512,15 +526,16 @@ const lastJsonLine = (s) => {
 
 /**
  * The daemon-side handle.
- * @param {{cwd:string, localSlug:string, scriptRoot?:()=>string, allowed?:()=>boolean, log?:(m:string)=>void,
+ * @param {{cwd:string, localSlug:string, defaultBranch?:string, execFileSyncImpl?:Function, scriptRoot?:()=>string, allowed?:()=>boolean, log?:(m:string)=>void,
  *   env?:object, now?:()=>number, spawnImpl?:Function, resolveSetting?:Function, timeoutMs?:number, readPr?:Function, readMembership?:Function, readCandidates?:Function, readQueueDepth?:Function, readCapacity?:Function, readPriorities?:Function}} o
  *   `cwd` the drain's data clone (the fast drain runs there, like a pass). `scriptRoot()` the pass code root (data
  *   clone, or the code clone carrying overlays). `allowed()` true only while the caller sleeps between passes.
  */
 export function createEnqueueOnEvent({
-  cwd, localSlug, scriptRoot = () => cwd, allowed = () => true, log = (m) => process.stderr.write(`${m}\n`),
+  cwd, localSlug, defaultBranch, execFileSyncImpl = execFileSyncThrottled,
+  scriptRoot = () => cwd, allowed = () => true, log = (m) => process.stderr.write(`${m}\n`),
   env = process.env, now = () => Date.now(), spawnImpl = spawn, resolveSetting = () => resolveEnqueueOnEventSetting({ env }),
-  readCandidates = ({ repo }) => readCatchUpCandidates({ repo, env }), readCapacity = (s) => readQueueCapacity(s),
+  readCandidates = ({ repo }) => readCatchUpCandidates({ repo, env, defaultBranch }), readCapacity = (s) => readQueueCapacity(s),
   readPriorities = () => ({ priority: readBuildQueuePrioritySettings({ env }), buildPriority: readBuildPrioritySettings({ env }).ids, mainFix: readMainFixPriority({ env }) }),
   readMainFixPr = () => readMainFixPriority({ env, now: now() }),
   readRedMainState = () => readMainRedState({ env, now: now() }),
@@ -581,6 +596,15 @@ export function createEnqueueOnEvent({
   const backoff = new Map();
   const lastHolds = new Map();
   const overlapBlockers = new Map();
+  let listingSnapshot = null;
+  const snapshotPrefix = `we-fast-drain-${process.pid}-${randomUUID()}`;
+  const clearSnapshot = () => {
+    if (listingSnapshot) {
+      for (const path of [listingSnapshot, `${listingSnapshot}.locks`]) {
+        try { rmSync(path, { force: true, recursive: true }); } catch { /* best effort */ }
+      }
+    }
+  };
   let catchUpRound = 0; // successful listings, never ticks
   let pending = new Map();
   let running = null; // the serialized tick/catch-up promise
@@ -635,6 +659,17 @@ export function createEnqueueOnEvent({
       (mainFix.repo ?? 'we') === repoKeyFromSlug(repo) && [mainFix.pr, ...(mainFix.prs || [])].includes(num);
     let s = readSetting();
     if (!await honourSetting(s)) return [];
+    if (!defaultBranch) {
+      try {
+        const branch = execFileSyncImpl('gh', ['repo', 'view', localSlug, '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name'],
+          { cwd, env, encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
+        if (typeof branch !== 'string' || !branch.trim() || branch.trim() === 'null') throw new Error('default branch unreadable');
+        defaultBranch = branch.trim();
+      } catch {
+        log('enqueue-on-event: default branch unreadable — deferring wakes and catch-up; retrying on next tick');
+        return [];
+      }
+    }
     let catchUpLater = [].values();
     let listedPrs = null;
     let batchingDeferred = false;
@@ -680,6 +715,8 @@ export function createEnqueueOnEvent({
       if (!result.ok) log(`enqueue-on-event: catch-up could not list ready PRs (${result.error}) — retrying in ${s.catchUp.intervalMinutes} min`);
       else {
         catchUpRound++;
+        clearSnapshot();
+        listingSnapshot = join(tmpdir(), `${snapshotPrefix}-${catchUpRound}.json`);
         let catchUpPrs = result.prs;
         if (throughput.redMainSkipCatchUp) {
           const signal = redMainSignal({ mainRedState: await readRedMainState(), priority: mainFix,
@@ -730,9 +767,10 @@ export function createEnqueueOnEvent({
         const priorities = await readPriorities();
         const stale = [...pending.values()].filter(p => !ownsFix(p.num, p.repo) && stalePending(p)).map(p => p.num);
         if (stale.length) log(`enqueue-on-event: catch-up plans stale pending event work ${stale.map(n => `#${n}`).join(' ')} in normal order (pending >= ${staleMs / 60_000} min with no live fast drain — catchUp.stalePendingMinutes (${s.sources?.['catchUp.stalePendingMinutes'] || 'standard'}))`);
-        const plan = planCatchUp({ ...result, prs: catchUpPrs, capacity: capacity - reserved, ...priorities, mainFix: mainFix ?? priorities.mainFix, repo: localSlug, now: now(), order: s.catchUp.order, pendingNums: [...pending.values()].filter(p => (p.catchUp || !ownsFix(p.num, p.repo)) && !stale.includes(p.num)).map(p => p.num) });
+        const plan = planCatchUp({ ...result, defaultBranch, prs: catchUpPrs, capacity: capacity - reserved, ...priorities, mainFix: mainFix ?? priorities.mainFix, repo: localSlug, now: now(), order: s.catchUp.order, pendingNums: [...pending.values()].filter(p => (p.catchUp || !ownsFix(p.num, p.repo)) && !stale.includes(p.num)).map(p => p.num) });
         const nums = (ps) => ps.map((n) => `#${n}`).join(' ');
         log(`enqueue-on-event: catch-up listed ${result.prs.length} ready-to-merge PR(s), ${result.queued} in the merge queue, room ${Math.max(0, capacity - result.queued)} (capacity ${capacity} from ${source}) — ${plan.run.length ? `fast drain for ${nums(plan.run.map((p) => p.num))} (${s.catchUp.order ?? 'priority-then-first-accept'})` : 'nothing to run'}${plan.later.length ? `; later: ${nums(plan.later)}` : ''}${plan.skipped.length ? `; skipped: ${plan.skipped.map((p) => `#${p.num} ${p.reason}`).join(', ')}` : ''}`);
+        for (const skip of plan.skipped) log(`enqueue-on-event: catch-up #${skip.num} — skipped: ${skip.reason}`);
         for (const { num } of plan.run) queueCatchUp(num);
         catchUpLater = plan.later.values();
       }
@@ -784,8 +822,9 @@ export function createEnqueueOnEvent({
       if (held && (!backoffRounds || !signature || signature !== held.signature || catchUpRound > held.untilRound)) backoff.delete(p.num);
       if (pr && (pr.state && pr.state !== 'OPEN' || !pr.labels?.some(l => l?.name === READY_LABEL))) backoff.delete(p.num);
       const stagedGreen = greenEvent(p) && staged(p);
-      const w = stagedGreen && pr?.state === 'OPEN' && !pr.isDraft
-        && pr.labels?.some(l => l?.name === READY_LABEL) ? { wake: true } : wakeWorthy(pr);
+      const hold = pr ? catchUpSkipReason(pr, defaultBranch) : null;
+      const w = hold ? { wake: false, reason: hold } : stagedGreen && pr?.state === 'OPEN' && !pr.isDraft
+        && pr.labels?.some(l => l?.name === READY_LABEL) ? { wake: true } : wakeWorthy(pr, defaultBranch);
       if (!w.wake) {
         log(`${prefix} ${taken.causes.join(', ')} — not woken: ${w.reason}`);
         ran.push({ ...metadata, num: p.num, code: null, what: `not woken: ${w.reason}`, outcome: 'skipped' });
@@ -828,7 +867,7 @@ export function createEnqueueOnEvent({
       attempted.add(p.num);
       activeNums.add(p.num);
       const startedAt = now();
-      const args = fastDrainArgs({ scriptRoot: scriptRoot(), num: p.num });
+      const args = fastDrainArgs({ scriptRoot: scriptRoot(), num: p.num, listingSnapshot: p.catchUp ? listingSnapshot : null });
       if (greenEvent(p)) args.push('--from-green-event');
       if (p.catchUp) catchUpRoom--; // keep the bound across ticks and window closures; unknown results consume room
       if (ownsFix(p.num, p.repo)) log(`enqueue-on-event: main-fix #${p.num} first (red main)`);
@@ -940,7 +979,7 @@ export function createEnqueueOnEvent({
             if (throughput.catchUpSkipUnchangedHolds && lastHolds.has(p.num) && pr?.headRefOid) {
               try { unchanged = unchangedHold(lastHolds.get(p.num), pr, await readMemoEvidence({ repo: localSlug, num: p.num, head: pr.headRefOid, overlapYield: lastHolds.get(p.num)?.overlapYield }), { now: now(), maxMin: throughput.catchUpSkipMaxMin ?? 15 }); } catch { /* retry */ }
             }
-            if (!unchanged && pr && wakeWorthy(pr).wake && !(held && catchUpRound <= held.untilRound && held.signature === prHeadSignature(pr))) { busy = true; break; }
+            if (!unchanged && pr && wakeWorthy(pr, defaultBranch).wake && !(held && catchUpRound <= held.untilRound && held.signature === prHeadSignature(pr))) { busy = true; break; }
           }
         }
       }
@@ -975,7 +1014,7 @@ export function createEnqueueOnEvent({
     /** Resolves when no fast drain is in flight (call before a full pass or a clone refresh). */
     idle() { return running ? running.then(() => undefined, () => undefined) : Promise.resolve(); },
     /** Stop the in-flight fast drain (the daemon calls this on its own exit, like it stops its pass child). */
-    kill() { stopped = true; for (const child of children) { try { child.kill('SIGTERM'); } catch { /* gone */ } } },
+    kill() { stopped = true; if (running) running.then(clearSnapshot, clearSnapshot); else clearSnapshot(); for (const child of children) { try { child.kill('SIGTERM'); } catch { /* gone */ } } },
     misses: () => new Map(misses),
     blocked: () => new Map(backoff),
     pending: () => [...pending.values()],
