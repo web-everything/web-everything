@@ -79,6 +79,30 @@ export function validateTaskMetadata(task) {
   if (task.outcome !== null && !TASK_OUTCOMES.includes(task.outcome)) errors.push('job.task.outcome must be null or a semantic outcome');
   if (task.resultRef !== null && (typeof task.resultRef !== 'string' || task.resultRef.length > 256 ||
     /\s/.test(task.resultRef) || !/^results\/[A-Za-z0-9][A-Za-z0-9._-]*\.json$/.test(task.resultRef))) errors.push('job.task.resultRef must be null or a relative results JSON reference');
+  if (Object.hasOwn(task, 'execution')) {
+    const ex = task.execution;
+    const counts = v => isPlainObject(v) && ['read', 'write'].every(k => Number.isSafeInteger(v[k]) && v[k] >= 0);
+    const times = v => isPlainObject(v) && Object.values(v).every(n => Number.isFinite(n) && n >= 0);
+    const effect = v => isPlainObject(v) && typeof v.effectId === 'string' && v.effectId.startsWith(`${task.id}:`) &&
+      ['intent', 'applied'].includes(v.status) && isPlainObject(v.declaration) && isPlainObject(v.inputs) &&
+      typeof v.precondition === 'string';
+    const attempt = (key, v) => /^[1-9][0-9]*$/.test(key) && positiveInteger(v?.attempt) && String(v.attempt) === key;
+    if (!isPlainObject(ex) || ['effects', 'results', 'timings'].some(k => !isPlainObject(ex[k]))) {
+      errors.push('job.task.execution must carry effects, results and timings objects');
+    } else {
+      if (Object.entries(ex.effects).some(([key, v]) => !effect(v) || key !== v.effectId)) errors.push('job.task.execution.effects is malformed');
+      for (const [key, v] of Object.entries(ex.results)) {
+        if (!isPlainObject(v) || !attempt(key, v) || v.v !== 1 || v.taskId !== task.id || !TASK_OUTCOMES.includes(v.outcome) ||
+          !Array.isArray(v.effects) || !v.effects.every(effect) || !Array.isArray(v.recordedReads) || !times(v.timings) || !counts(v.gh) ||
+          (Object.hasOwn(v, 'reason') && typeof v.reason !== 'string')) errors.push('job.task.execution.results is malformed');
+      }
+      for (const [key, v] of Object.entries(ex.timings)) {
+        if (!isPlainObject(v) || !attempt(key, v) || v.taskId !== task.id || v.type !== 'task-timing' || v.key !== `${task.id}:${key}` ||
+          !TASK_OUTCOMES.includes(v.outcome) || !Number.isSafeInteger(v.failureCount) || v.failureCount < 0 ||
+          !times(v.timings) || !counts(v.gh)) errors.push('job.task.execution.timings is malformed');
+      }
+    }
+  }
   return errors;
 }
 
