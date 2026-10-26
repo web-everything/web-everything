@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import ts from 'typescript';
 import { PLATFORM_DELIVERY_POLICY_DEFAULTS as defaults } from '../../../config/deliveryPolicyDefaults';
 import * as gate from '../gate-config.mjs';
+import * as deliveryPolicy from '../delivery-policy.mjs';
 import { DELIVERY_POLICY_FAILSAFE, loadDeliveryPolicy, POLICY_EVENT_REASON_MAX, policyEventsPath, readPolicyEvents, recordPolicyEvent } from '../delivery-policy.mjs';
 
 const defaultFile = 'config/deliveryPolicyDefaults.ts';
@@ -38,10 +39,133 @@ beforeEach(() => {
   root = join(dir, 'repo');
   mkdirSync(root);
   mkdirSync(join(dir, 'state'));
-  env = { WE_DAEMON_STATE_DIR: join(dir, 'state'), WE_POLICY_EVENTS_FILE: join(dir, 'events.jsonl') };
+  env = { WE_DAEMON_STATE_DIR: join(dir, 'state'), WE_POLICY_EVENTS_FILE: join(dir, 'state/events.jsonl') };
   put(defaultFile, readFileSync(resolve(defaultFile), 'utf8'));
 });
 afterEach(() => { vi.restoreAllMocks(); gate.POLICY_SPEC_BASENAMES.delete('repair-policy.json'); gate.POLICY_SPEC_BASENAMES.delete('repair-policy.txt'); rmSync(dir, { recursive: true, force: true }); });
+
+describe('trusted policy paths', () => {
+  it('reads a plain confined file and accepts a realpath-resolved allowed base', () => {
+    const file = put('nested/policy.json', '{"safe":true}');
+    const base = join(dir, 'repo-alias');
+    symlinkSync(root, base, 'dir');
+    const trusted = deliveryPolicy.resolveTrustedConfigPath('nested/policy.json', { root: base, allowedRoots: [base] });
+    expect(trusted.real).toBe(file);
+    expect(trusted.read()).toBe('{"safe":true}');
+  });
+
+  it.each(['../outside.json', '../repo-other/policy.json'])('refuses normalized escape %s before reading', path => {
+    put(path, '{"unsafe":true}');
+    expect(() => deliveryPolicy.resolveTrustedConfigPath(path, { root, allowedRoots: [root] })).toThrow(/Outside root/);
+  });
+
+  it.each(['leaf', 'parent'])('refuses a symlinked %s even when its target stays inside the allowed root', kind => {
+    const file = put('nested/policy.json', '{"unsafe":true}');
+    const path = kind === 'leaf' ? 'linked.json' : 'linked/policy.json';
+    symlinkSync(kind === 'leaf' ? file : join(root, 'nested'), join(root, kind === 'leaf' ? path : 'linked'));
+    expect(() => deliveryPolicy.resolveTrustedConfigPath(path, { root, allowedRoots: [root] })).toThrow(/symlink refused/);
+  });
+
+  it.each(['leaf', 'parent', 'regular replacement'])('refuses a %s swapped between validation and fd read', kind => {
+    const file = put('nested/policy.json', '{"safe":true}');
+    const target = put('target/policy.json', '{"unsafe":true}');
+    const trusted = deliveryPolicy.resolveTrustedConfigPath('nested/policy.json', {
+      root, allowedRoots: [root], beforeRead() {
+        if (kind === 'parent') {
+          renameSync(join(root, 'nested'), join(root, 'original'));
+          symlinkSync(join(root, 'target'), join(root, 'nested'), 'dir');
+        } else {
+          renameSync(file, file + '.original');
+          if (kind === 'leaf') symlinkSync(target, file);
+          else writeFileSync(file, '{"unsafe":true}');
+        }
+      },
+    });
+    expect(() => trusted.read()).toThrow(/symlink refused|changed|ELOOP/);
+  });
+
+  it('refuses directories, oversized files, and files grown after validation', () => {
+    expect(() => deliveryPolicy.resolveTrustedConfigPath('config', { root })).toThrow(/Unreadable or oversized/);
+    put('oversized.json', ' '.repeat(1024 * 1024 + 1));
+    expect(() => deliveryPolicy.resolveTrustedConfigPath('oversized.json', { root })).toThrow(/Unreadable or oversized/);
+    const file = put('growing.json', '{}');
+    const trusted = deliveryPolicy.resolveTrustedConfigPath('growing.json', { root, beforeRead() {
+      writeFileSync(file, ' '.repeat(1024 * 1024 + 1));
+    } });
+    expect(() => trusted.read()).toThrow(/Unreadable or oversized/);
+  });
+
+  it('bounds total fd IO to MAX_SOURCE_BYTES + 1 when the inode grows during reading', () => {
+    const maxSourceBytes = 1024 * 1024;
+    const initial = '{"safe":true}';
+    const file = put('growing-during-read.json', initial);
+    const original = statSync(file);
+    // Native ESM builtins need syncBuiltinESMExports; isolate that patch in a bounded child.
+    const observed = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { resolveTrustedConfigPath } from './scripts/lib/delivery-policy.mjs';
+      const [root, file, limit] = process.argv.slice(1);
+      const trusted = resolveTrustedConfigPath(file, { root });
+      const read = fs.readSync;
+      const observed = { ranges: [] };
+      const identity = fd => {
+        const { dev, ino, size } = fs.fstatSync(fd);
+        return { dev, ino, size };
+      };
+      fs.readSync = (fd, buffer, offset, length, position) => {
+        // Force short reads so the real loop must enforce its remaining budget across calls.
+        const bytes = read(fd, buffer, offset, Math.min(length, 64 * 1024), position);
+        observed.ranges.push({ position, length, bytes });
+        if (observed.ranges.length === 1) {
+          // Growth follows the first actual read, after the helper's size check.
+          observed.atFirstRead = identity(fd);
+          fs.writeFileSync(file, 'x'.repeat(3 * Number(limit)), { flag: 'a' });
+          observed.afterGrowth = identity(fd);
+        }
+        return bytes;
+      };
+      syncBuiltinESMExports();
+      try { trusted.read(); } catch (error) { observed.error = error.message; }
+      process.stdout.write(JSON.stringify(observed));
+    `, root, file, String(maxSourceBytes)], {
+      cwd: resolve('.'), encoding: 'utf8', timeout: 5000, killSignal: 'SIGKILL', maxBuffer: 65536,
+    }));
+
+    expect(observed.error).toMatch(/Unreadable or oversized/);
+    expect(observed.atFirstRead).toEqual({ dev: original.dev, ino: original.ino, size: initial.length });
+    expect(observed.afterGrowth).toEqual({ dev: original.dev, ino: original.ino, size: initial.length + 3 * maxSourceBytes });
+    expect(observed.ranges.length).toBeGreaterThan(1);
+    expect(observed.ranges[0].bytes).toBe(initial.length);
+    let total = 0;
+    for (const range of observed.ranges) {
+      expect(range.position).toBe(total);
+      expect(range.position + range.length).toBeLessThanOrEqual(maxSourceBytes + 1);
+      total += range.bytes;
+    }
+    expect(total).toBe(maxSourceBytes + 1);
+  });
+
+  it.each(['leaf', 'parent', 'missing leaf'])('refuses a journal %s swapped before fd append without changing the target', kind => {
+    const target = put('target/events.jsonl', 'original\n');
+    if (kind === 'leaf') put('nested/events.jsonl', 'trusted\n');
+    else mkdirSync(join(root, 'nested'));
+    const file = join(root, 'nested/events.jsonl');
+    const trusted = deliveryPolicy.resolveTrustedConfigPath(file, {
+      root, create: true, beforeRead() {
+        if (kind === 'parent') {
+          renameSync(join(root, 'nested'), join(root, 'original'));
+          symlinkSync(join(root, 'target'), join(root, 'nested'), 'dir');
+        } else {
+          if (kind === 'leaf') renameSync(file, file + '.original');
+          symlinkSync(target, file);
+        }
+      },
+    });
+    expect(() => trusted.append('unsafe\n')).toThrow(/symlink refused|changed|ELOOP|EEXIST/);
+    expect(readFileSync(target, 'utf8')).toBe('original\n');
+  });
+});
 
 describe('delivery policy values', () => {
   it.each([
@@ -270,16 +394,33 @@ describe('trust, confinement and reach set', () => {
       expect(result.filesRead).toEqual([]);
     }
   });
-  it('preserves external WE_POLICY_CONFIG through a symlinked parent in daemon state', async () => {
+  it('refuses external WE_POLICY_CONFIG through a symlinked parent in daemon state without reading it', async () => {
     const state = join(dir, 'state');
     mkdirSync(join(state, 'variant'));
     const target = join(state, 'variant/override.json');
     writeFileSync(target, JSON.stringify({ mergeGate: { onMainRed: 'off' } }));
     symlinkSync('variant', join(state, 'selector'), 'dir');
     const result = await load({ env: { ...env, WE_POLICY_CONFIG: join(state, 'selector/override.json') } });
-    expect(result.mergeGate.onMainRed).toBe('off');
-    expect(result.warnings).toEqual([]);
-    expect(result.filesRead).toEqual([defaultFile, target]);
+    expect(result.mergeGate.onMainRed).toBe('halt');
+    expect(result.warnings).toEqual(['WE_POLICY_CONFIG symlink refused']);
+    expect(result.filesRead).toEqual([defaultFile]);
+  });
+  it('refuses a symlinked WE_POLICY_CONFIG leaf without reading its target', async () => {
+    const target = join(dir, 'state/target.json');
+    writeFileSync(target, JSON.stringify({ mergeGate: { onMainRed: 'off' } }));
+    const path = join(dir, 'state/override.json');
+    symlinkSync(target, path);
+    const result = await load({ env: { ...env, WE_POLICY_CONFIG: path } });
+    expect(result.mergeGate.onMainRed).toBe('halt');
+    expect(result.warnings).toEqual(['WE_POLICY_CONFIG symlink refused']);
+    expect(result.filesRead).toEqual([defaultFile]);
+  });
+  it('refuses a WE_POLICY_CONFIG dot-dot escape without reading it', async () => {
+    put('../outside.json', { mergeGate: { onMainRed: 'off' } });
+    const result = await load({ env: { ...env, WE_POLICY_CONFIG: '../outside.json' } });
+    expect(result.mergeGate.onMainRed).toBe('halt');
+    expect(result.warnings).toEqual(['WE_POLICY_CONFIG is outside registered repo sources and daemon state']);
+    expect(result.filesRead).toEqual([defaultFile]);
   });
   it('unregistered pointers are refused locally, at base, recursively and inside env config', async () => {
     put('ungated.json', { onMainRed: 'off' });
@@ -527,6 +668,40 @@ describe('trust, confinement and reach set', () => {
 });
 
 describe('policy journal', () => {
+  it.each(['leaf', 'parent'])('refuses a symlinked journal %s for both append and read', kind => {
+    const state = env.WE_DAEMON_STATE_DIR;
+    mkdirSync(join(state, 'target'));
+    const target = join(state, 'target/events.jsonl');
+    const original = JSON.stringify({ at: new Date().toISOString(), event: 'untrusted' }) + '\n';
+    writeFileSync(target, original);
+    const path = join(state, kind === 'leaf' ? 'linked.jsonl' : 'linked/events.jsonl');
+    symlinkSync(kind === 'leaf' ? target : join(state, 'target'), join(state, kind === 'leaf' ? 'linked.jsonl' : 'linked'));
+    const journalEnv = { ...env, WE_POLICY_EVENTS_FILE: path };
+    recordPolicyEvent({ key: 'mergeGate', event: 'refused' }, journalEnv);
+    expect(readFileSync(target, 'utf8')).toBe(original);
+    expect(readPolicyEvents({ env: journalEnv })).toEqual([]);
+  });
+
+  it('refuses an escaping journal without creating parents, and ignores oversized journals', () => {
+    const outsideEnv = { ...env, WE_POLICY_EVENTS_FILE: join(dir, 'outside/missing/events.jsonl') };
+    recordPolicyEvent({ event: 'refused' }, outsideEnv);
+    expect(() => statSync(join(dir, 'outside'))).toThrow(/ENOENT/);
+    expect(readPolicyEvents({ env: outsideEnv })).toEqual([]);
+    const oversized = ' '.repeat(1024 * 1024 + 1);
+    writeFileSync(env.WE_POLICY_EVENTS_FILE, oversized);
+    recordPolicyEvent({ event: 'refused' }, env);
+    expect(readFileSync(env.WE_POLICY_EVENTS_FILE, 'utf8')).toBe(oversized);
+    expect(readPolicyEvents({ env })).toEqual([]);
+  });
+
+  it('creates missing journal directories and reads the default journal in the configured logs root', () => {
+    const logs = join(dir, 'new-logs/nested');
+    const journalEnv = { WE_DAEMON_STATE_DIR: env.WE_DAEMON_STATE_DIR, HEALTH_WATCH_LOGS_DIR: logs };
+    recordPolicyEvent({ key: 'mergeGate', event: 'refused' }, journalEnv);
+    expect(readPolicyEvents({ env: journalEnv })).toMatchObject([{ key: 'mergeGate', event: 'refused' }]);
+    expect(statSync(join(logs, 'policy-events.jsonl')).isFile()).toBe(true);
+  });
+
   it('records the reported eight-level shared array graph within a bounded child process', () => {
     execFileSync(process.execPath, ['--max-old-space-size=128', '--input-type=module', '-e', `
       import { recordPolicyEvent } from './scripts/lib/delivery-policy.mjs';

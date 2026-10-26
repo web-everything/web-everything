@@ -1,7 +1,7 @@
 /** Delivery-flow policy: human-gated values, base-ref isolation, and a best-effort event journal. */
 import { build } from 'esbuild';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -31,6 +31,115 @@ const object = value => value !== null && typeof value === 'object' && !Array.is
 const valid = (value, domain) => Array.isArray(domain) ? domain.includes(value) : Number.isSafeInteger(value) && value >= domain;
 const clone = value => structuredClone(value);
 const inside = (root, path) => { const rel = relative(root, path); return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`)); };
+
+/**
+ * One trust boundary for worktree policy sources and the journal. Only the canonical
+ * allowed base may contain symlinks; every component below it is checked with lstat.
+ * create permits missing journal directories/leaf; beforeRead is a race-test hook.
+ */
+export function resolveTrustedConfigPath(p, { root = process.cwd(), allowedRoots = [root], create = false, beforeRead } = {}) {
+  const requested = resolve(root, p);
+  const refused = (message, code) => Object.assign(Error(message), { code });
+  const symlink = () => refused(`Policy symlink refused: ${p}`, 'POLICY_SYMLINK');
+  const changed = () => Error(`Policy source changed during access: ${p}`);
+  const unreadable = () => Error(`Unreadable or oversized policy source: ${p}`);
+  const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
+  let base, anchor, real;
+  for (const allowed of allowedRoots) {
+    const lexical = resolve(root, allowed);
+    // Missing journal bases are anchored at their nearest existing, canonical parent.
+    let existing = lexical;
+    for (;;) {
+      try { anchor = realpathSync(existing); break; } catch (error) {
+        if (error.code !== 'ENOENT' || dirname(existing) === existing) throw error;
+        existing = dirname(existing);
+      }
+    }
+    const canonical = resolve(anchor, relative(existing, lexical));
+    if (inside(lexical, requested)) real = resolve(canonical, relative(lexical, requested));
+    else if (inside(canonical, requested)) real = requested;
+    else continue;
+    base = canonical;
+    break;
+  }
+  if (!base || !inside(base, real)) throw refused(`Outside root: ${p}`, 'POLICY_OUTSIDE_ROOT');
+
+  const directories = [];
+  let current = anchor;
+  let sourceStat;
+  const parts = relative(anchor, real).split(sep).filter(Boolean);
+  // Include the base in the snapshot so replacing it after resolution is refused too.
+  for (let i = 0; i <= parts.length; i++) {
+    const leaf = i === parts.length;
+    let stat;
+    try { stat = lstatSync(current); } catch (error) {
+      if (!create || error.code !== 'ENOENT') throw error;
+      if (!leaf) {
+        mkdirSync(current);
+        stat = lstatSync(current);
+      }
+    }
+    if (stat?.isSymbolicLink()) throw symlink();
+    if (leaf) {
+      if (stat && (!stat.isFile() || stat.size > MAX_SOURCE_BYTES)) throw unreadable();
+      sourceStat = stat;
+      break;
+    }
+    if (!stat.isDirectory()) throw unreadable();
+    directories.push({ path: current, stat });
+    current = join(current, parts[i]);
+  }
+
+  function checkDirectories() {
+    for (const directory of directories) {
+      const now = lstatSync(directory.path);
+      if (now.isSymbolicLink()) throw symlink();
+      if (!now.isDirectory() || !same(directory.stat, now)) throw changed();
+    }
+  }
+  function access(append, data) {
+    beforeRead?.();
+    if (!append && !sourceStat) throw changed();
+    // Check before creation as well, so a known parent swap cannot create a leaf there.
+    checkDirectories();
+    let fd;
+    try {
+      const flags = (append ? constants.O_WRONLY | constants.O_APPEND : constants.O_RDONLY)
+        | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0)
+        | (append && !sourceStat ? constants.O_CREAT | constants.O_EXCL : 0);
+      fd = openSync(real, flags, 0o600);
+      const stat = fstatSync(fd);
+      if (!stat.isFile() || stat.size > MAX_SOURCE_BYTES) throw unreadable();
+      if (sourceStat && !same(sourceStat, stat)) throw changed();
+      // A parent swap can redirect open even with O_NOFOLLOW. Verify the captured
+      // directory inodes before using the fd, never reopen a validated pathname.
+      checkDirectories();
+      const leaf = lstatSync(real);
+      if (leaf.isSymbolicLink()) throw symlink();
+      if (!same(leaf, stat)) throw changed();
+      if (append) {
+        if (stat.size + Buffer.byteLength(data) > MAX_SOURCE_BYTES) throw unreadable();
+        writeFileSync(fd, data);
+        sourceStat = fstatSync(fd);
+        return;
+      }
+      // Bound allocation and IO even if another writer grows the inode after fstat.
+      const buffer = Buffer.alloc(MAX_SOURCE_BYTES + 1);
+      let bytes = 0, count;
+      while (bytes < buffer.length && (count = readSync(fd, buffer, bytes, buffer.length - bytes, bytes))) bytes += count;
+      if (bytes > MAX_SOURCE_BYTES) throw unreadable();
+      return buffer.toString('utf8', 0, bytes);
+    } finally {
+      if (fd !== undefined) closeSync(fd);
+    }
+  }
+  return { real, version: sourceStat?.mtimeMs,
+    read: () => access(false), append: data => {
+      if (!create) throw Error('Policy source is read-only');
+      return access(true, data);
+    } };
+}
+
 const clean = (value, max) => {
   const text = String(value ?? '').replace(/[\x00-\x1f\x7f-\x9f]/g, '');
   return text.length > max ? text.slice(0, max - 1) + '…' : text;
@@ -83,15 +192,19 @@ export function recordPolicyEvent(input, env = process.env) {
     if (bytes() > 4096) delete event.detail;
     // Non-detail text is bounded too; keep the identity fields even for multibyte input.
     if (bytes() > 4096) event.reason = '…';
-    const path = policyEventsPath(env);
-    mkdirSync(dirname(path), { recursive: true });
-    appendFileSync(path, JSON.stringify(event) + '\n', { mode: 0o600 });
+    const journal = resolveTrustedConfigPath(policyEventsPath(env), {
+      allowedRoots: [process.cwd(), daemonStateDir(env), defaultLogsDir(env)], create: true,
+    });
+    journal.append(JSON.stringify(event) + '\n');
   } catch { /* A failed journal must never stop the daemon. */ }
 }
 
 export function readPolicyEvents({ sinceMs = 0, env = process.env } = {}) {
   try {
-    return readFileSync(policyEventsPath(env), 'utf8').split('\n').flatMap(line => {
+    const journal = resolveTrustedConfigPath(policyEventsPath(env), {
+      allowedRoots: [process.cwd(), daemonStateDir(env), defaultLogsDir(env)],
+    });
+    return journal.read().split('\n').flatMap(line => {
       try { const entry = JSON.parse(line); return object(entry) && Date.parse(entry.at) >= sinceMs ? [entry] : []; } catch { return []; }
     });
   } catch { return []; }
@@ -165,14 +278,8 @@ export async function loadDeliveryPolicy({ root = process.cwd(), env = process.e
         if (!match || match[2] !== normalized) throw Error(`Not a regular policy blob: ${path}`);
         return { path: normalized, version: commit, read: () => git(['show', `${commit}:${normalized}`]) };
       }
-      if (lstatSync(absolute).isSymbolicLink()) throw Error(`Policy symlink refused: ${path}`);
-      const real = realpathSync(absolute);
-      // Refuse symlinked parents as well as the leaf before consulting cached content.
-      if (!external && real !== resolve(realpathSync(root), relative(root, absolute))) throw Error(`Policy symlink refused: ${path}`);
-      if (!external && !inside(root, real)) throw Error(`Outside root: ${path}`);
-      const stat = statSync(real);
-      if (!stat.isFile() || stat.size > MAX_SOURCE_BYTES) throw Error(`Unreadable or oversized policy source: ${path}`);
-      return { path: external ? real : relative(root, real).split(sep).join('/'), version: stat.mtimeMs, read: () => readFileSync(real, 'utf8') };
+      const trusted = resolveTrustedConfigPath(path, { root, allowedRoots: external ? [daemonStateDir(env)] : [root] });
+      return { path: external ? trusted.real : relative(root, trusted.real).split(sep).join('/'), version: trusted.version, read: trusted.read };
     }
     async function read(location, kind) {
       return cached(`${root}:${commit || 'worktree'}:${location.path}:${kind}`, location.version, async () => {
@@ -204,10 +311,16 @@ export async function loadDeliveryPolicy({ root = process.cwd(), env = process.e
         if (env.GITHUB_ACTIONS || commit) throw Error('WE_POLICY_CONFIG ignored for PR/Actions gates');
         const requested = resolve(root, env.WE_POLICY_CONFIG);
         if (!requested.endsWith('.json')) throw Error('WE_POLICY_CONFIG must be JSON');
-        const real = realpathSync(requested);
-        if (lstatSync(requested).isSymbolicLink()) throw Error('WE_POLICY_CONFIG symlink refused');
+        let real;
+        try {
+          ({ real } = resolveTrustedConfigPath(env.WE_POLICY_CONFIG, { root, allowedRoots: [root, daemonStateDir(env)] }));
+        } catch (error) {
+          if (error.code === 'POLICY_SYMLINK') throw Error('WE_POLICY_CONFIG symlink refused');
+          if (error.code === 'POLICY_OUTSIDE_ROOT') throw Error('WE_POLICY_CONFIG is outside registered repo sources and daemon state');
+          throw error;
+        }
         const inRoot = inside(root, real);
-        if (inRoot ? !isPolicySpecPath(relative(root, real).split(sep).join('/')) : !inside(realpathSync(daemonStateDir(env)), real)) throw Error('WE_POLICY_CONFIG is outside registered repo sources and daemon state');
+        if (inRoot && !isPolicySpecPath(relative(root, real).split(sep).join('/'))) throw Error('WE_POLICY_CONFIG is outside registered repo sources and daemon state');
         sourcePath = inRoot ? relative(root, real).split(sep).join('/') : real;
         external = !inRoot;
         envSource = true;
@@ -252,7 +365,8 @@ export async function loadDeliveryPolicy({ root = process.cwd(), env = process.e
       } catch (error) { warn(error.message); }
     }
     // Independent post-check over every opened value source, even if an earlier guard was bypassed.
-    const exempt = file => external && envSource && file === sourcePath && !inside(root, file) && inside(realpathSync(daemonStateDir(env)), file);
+    const exempt = file => external && envSource && file === sourcePath && !inside(root, file)
+      && resolveTrustedConfigPath(file, { root, allowedRoots: [daemonStateDir(env)] }).real === file;
     for (const file of filesRead) {
       const allowed = exempt(file) || registered(file);
       if (allowed) continue;
