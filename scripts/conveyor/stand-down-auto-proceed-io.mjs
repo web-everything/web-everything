@@ -104,9 +104,11 @@ export function enrichPrsWithStandDownAutoProceed(prs, { repo, requiredChecks, d
   return prs.map(pr => {
     if (!hasAutoProceedCandidate(pr)) return pr;
     if (!selected.has(pr)) { log(`R123 PR #${pr.number}: deferred by 3-PR tick bound; operator answer remains available`); return pr; }
+    // Keep the latest complete thread even when a later decision or IO step refuses the write.
+    let fresh = pr;
     try {
       const comments = readComments(pr.number, { repo });
-      const fresh = { ...pr, comments };
+      fresh = { ...pr, comments };
       // Cheap first pass rejects judgment holds without reading checks or main history.
       if (!hasAutoProceedCandidate(fresh)) return fresh;
       const checks = readChecks({ repo, head: pr.headRefOid });
@@ -117,9 +119,10 @@ export function enrichPrsWithStandDownAutoProceed(prs, { repo, requiredChecks, d
       if (decision.action !== 'auto-proceed') { log(`R123 PR #${pr.number}: ${decision.why}`); return fresh; }
       // A later operator question/answer may have arrived during check reads. Reclassify that full thread.
       const currentComments = readComments(pr.number, { repo });
-      const current = classifyStandDownAutoProceed({ pr: { ...pr, comments: currentComments }, requiredChecks, checks,
+      fresh = { ...pr, comments: currentComments };
+      const current = classifyStandDownAutoProceed({ pr: fresh, requiredChecks, checks,
         redMainContext: context, prScopedChecks: scoped });
-      if (current.action !== 'auto-proceed' || current.standDownId !== decision.standDownId) return pr;
+      if (current.action !== 'auto-proceed' || current.standDownId !== decision.standDownId) return fresh;
       if (headReader({ repo, number: pr.number }) !== pr.headRefOid) throw new Error('head moved; operator hold retained');
       if (!reserve({ repo, number: pr.number, standDownId: decision.standDownId, env })) {
         log(`R123 PR #${pr.number}: answer already reserved; inspect thread before any manual retry`); return fresh;
@@ -130,7 +133,7 @@ export function enrichPrsWithStandDownAutoProceed(prs, { repo, requiredChecks, d
       return { ...fresh, comments: [...currentComments, comment] };
     } catch (e) {
       log(`R123 PR #${pr.number}: operator answer required; inspect thread/reservation: ${String(e.message).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 300)}`);
-      return pr;
+      return fresh;
     }
   });
 }

@@ -3,7 +3,8 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildStandDownComment, isLoadFlakeStandDown, standDownComments } from '../stand-down.mjs';
+import { annotateLapsedStandDowns, buildStandDownComment, isLoadFlakeStandDown, standDownComments } from '../stand-down.mjs';
+import { countUnresolvedStandDowns, planReconcile } from '../reconcile-core.mjs';
 import { AUTOMATION_LOGINS } from '../../lib/marker-authorship.mjs';
 import { buildOperatorAnswer, parseOperatorAnswer, isOperatorAnswerStandDownSuperseded } from '../stand-down-answer-core.mjs';
 import { autoProceedStandDowns, hasAutoProceedCandidate, classifyStandDownAutoProceed } from '../stand-down-auto-proceed.mjs';
@@ -395,6 +396,56 @@ it.each(['head-moved', 'new-question', 'unreadable-thread', 'unreadable-checks',
     });
     expect(posts).toBe(scenario === 'untrusted-post' ? 1 : 0);
     expect(isOperatorAnswerStandDownSuperseded(result[0].comments, 0)).toBe(false);
+  });
+it.each(['new-question', 'new-ci-hold', 'operator-answer', 'reservation-denied', 'head-moved',
+  'reservation-error', 'post-error', 'untrusted-post', 'second-read-error', 'checks-error'])(
+  'preserves the latest complete thread for downstream planning: %s', scenario => {
+    const original = [stand('fix-loop-exhausted')];
+    const lapse = snapshot => annotateLapsedStandDowns(snapshot, {
+      lapseOnNewHead: 'off', redMainLapse: () => true, onLapse: () => {},
+    });
+    const snapshot = lapse({ ...pr(original), labels: ['review:changes'] });
+    expect(countUnresolvedStandDowns(snapshot.comments)).toBe(0);
+    const first = [...original, { id: 'NOTE1', author, body: 'first refresh' }];
+    const extra = scenario === 'new-question' ? stand('needs-judgment', 'SD2')
+      : scenario === 'new-ci-hold' ? stand('gate-red', 'SD2')
+        : scenario === 'operator-answer' ? { author, body: buildOperatorAnswer({
+          standDownId: 'SD1', actor: 'operator', channel: 'test', reason: 'handled',
+        }) } : { id: 'NOTE2', author, body: 'second refresh' };
+    const latest = [...first, extra];
+    let reads = 0;
+    const reserve = vi.fn(() => {
+      if (scenario === 'reservation-error') throw new Error('reservation failed');
+      return scenario !== 'reservation-denied';
+    });
+    const post = vi.fn(({ body }) => {
+      if (scenario === 'post-error') throw new Error('ambiguous write');
+      return { body, author: { login: 'outsider' } };
+    });
+    const [result] = enrichPrsWithStandDownAutoProceed([snapshot], {
+      repo: 'org/repo', requiredChecks: ['test'], readContext: () => redMainContext,
+      readScopedChecks: () => [], readComments: () => {
+        if (++reads === 1) return first;
+        if (scenario === 'second-read-error') throw new Error('thread unavailable');
+        return latest;
+      }, readChecks: () => {
+        if (scenario === 'checks-error') throw new Error('checks unavailable');
+        return evidence(rerun);
+      }, readHead: () => scenario === 'head-moved' ? 'b'.repeat(40) : head,
+      reserve, post, log: () => {},
+    });
+    expect(result.comments).toEqual(['second-read-error', 'checks-error'].includes(scenario) ? first : latest);
+    if (['new-question', 'new-ci-hold', 'operator-answer'].includes(scenario)) {
+      expect(reserve).not.toHaveBeenCalled();
+      expect(post).not.toHaveBeenCalled();
+    }
+    if (['new-question', 'new-ci-hold'].includes(scenario)) {
+      const refreshed = lapse(result);
+      expect(countUnresolvedStandDowns(refreshed.comments)).toBe(1);
+      const plan = planReconcile({ prs: [refreshed], agents: [], requiredChecks: ['test'] });
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals.map(row => row.kind)).toContain('stood-down');
+    }
   });
 it('bounds candidate reads and leaves an operator-visible fallback', () => {
   let reads = 0;
