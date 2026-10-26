@@ -180,6 +180,13 @@ describe('sweepStuckEntries', () => {
     expect(h.timeline.findIndex(e => e[0] === 'emit')).toBeGreaterThan(comment);
   });
 
+  it('forgets the rebuild history of a dequeued PR so a re-enqueue starts at zero', () => {
+    const h = sweepIo();
+    h.run();
+    const last = JSON.parse(h.writeFile.mock.calls.at(-1)[1]);
+    expect(last[5977]).toBeUndefined();
+  });
+
   it('a queue read error causes no dequeue, tracker mutation or event', () => {
     const h = sweepIo({ queueError: 'offline' });
     expect(h.run()).toEqual({ dequeued: [], error: expect.any(String) });
