@@ -59,6 +59,8 @@ import { prStatusOperation, PR_STATUS_OP, finishPrStatus } from './pr-status.mjs
 import { createPrReader } from './pr-status-io.mjs';
 import { judgeSweepFactsOperation, JUDGE_SWEEP_FACTS_OP, finishJudgeSweep } from './judge-sweep-facts.mjs';
 import { createJudgeSweepFactsReader } from './judge-sweep-facts-io.mjs';
+import { prTraceOperation, PR_TRACE_OP, finishPrTrace } from './pr-trace.mjs';
+import { createPrTraceReader } from './pr-trace-io.mjs';
 import { adoptionMatrixOperation, ADOPTION_MATRIX_OP, finishAdoptionMatrix } from './adoption-matrix.mjs';
 import { createAdoptionMatrixReader } from './adoption-matrix-io.mjs';
 import { staleStateOperation, STALE_STATE_OP } from './stale-state.mjs';
@@ -123,6 +125,8 @@ import { createRunReader, createRecordVerdictSinks } from './record-verdict-io.m
 import { validateRequest, APPLIABLE_TARGETS } from '../apply-review-request.mjs';
 import { verifyOperation, VERIFY_OP } from './verify.mjs';
 import { createChecksRunner } from './verify-io.mjs';
+import { prSizeOperation, PR_SIZE_OP, finishPrSize } from './pr-size.mjs';
+import { createPrSizeReader } from './pr-size-io.mjs';
 import { mutationCheckOperation, MUTATION_CHECK_OP, revertRedCheckOperation, REVERT_RED_CHECK_OP } from './mutation-check.mjs';
 import { createMutationCheckSinks, createRevertRedCheckSinks } from './mutation-check-io.mjs';
 import { exploreOperation, EXPLORE_OP } from './explore.mjs';
@@ -182,6 +186,7 @@ import { writeAllSync } from '../lib/write-all-sync.mjs';
  */
 
 export const OPERATIONS = Object.freeze({
+  [PR_TRACE_OP]: () => ({ declaration: prTraceOperation({ readFacts: createPrTraceReader() }), sinks: {}, finish: finishPrTrace }),
   [JUDGE_SWEEP_FACTS_OP]: () => ({
     declaration: judgeSweepFactsOperation({ readFacts: createJudgeSweepFactsReader() }),
     sinks: {},
@@ -253,6 +258,10 @@ export const OPERATIONS = Object.freeze({
   // and `gate-health` do.
   [VERIFY_OP]: () => ({
     declaration: verifyOperation({ runChecks: createChecksRunner() }),
+  }),
+  [PR_SIZE_OP]: () => ({
+    declaration: prSizeOperation({ readDiff: createPrSizeReader() }),
+    finish: finishPrSize,
   }),
   // #x4omld5 — put the bug back and prove the guard goes red. UNLIKE `verify` above it has a SINK, and that
   // is deliberate: its probe writes to a source file, so declaring the transaction as an `effect` keeps the
@@ -754,7 +763,7 @@ if (IS_CLI) {
   try {
     cliPreflight(name);
     assertRunnerFreshness({ declaration, moduleUrl: import.meta.url,
-      zeroWrites: controlPolicy.zeroWrites || [ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) });
+      zeroWrites: controlPolicy.zeroWrites || [PR_TRACE_OP, ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) });
   } catch (e) {
     writeAllSync(2, `${String(e?.message ?? e)}\n`);
     process.exit(1);
@@ -764,7 +773,7 @@ if (IS_CLI) {
   const controlPreview = controlPolicy.memoryStore;
   const cliStores = controlPreview ? { store: createMemoryRunStore(), callLog: undefined }
     : name === RUNNER_ACTIVITY_OP ? createRunnerActivityCliStores()
-    : [ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
+    : [PR_TRACE_OP, ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP, PR_SIZE_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
     : { store: createFileRunStore(), callLog: createFileCallLogStore() };
   runOperationCli({
     declaration,

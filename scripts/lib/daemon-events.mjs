@@ -1,4 +1,6 @@
-/** Best-effort coordination events shared by daemon processes. */
+/** Best-effort coordination events shared by daemon processes.
+ * PR watcher kinds: pr-merged, pr-ready-not-merging, pr-looping, pr-no-progress, ci-job-overdue.
+ * This shared writer deliberately accepts open event kinds. */
 import { appendFile as appendFileDefault, mkdir } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { handoffHome } from '../operations/handoff-home.mjs';

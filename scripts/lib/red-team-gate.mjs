@@ -20,6 +20,7 @@
  *   What this never does: weaken a gate, accept anything, or touch `review:human`. A send-back only ever adds a hold.
  *   Fail closed: a confirmed finding with no stated impact counts as `broken`.
  */
+import { resolveDisposition } from './red-team-disposition.mjs';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -519,17 +520,22 @@ function firstReviewIndex(records, pr, head) {
   return first ? first.at : null;
 }
 
+/** Gate decisions that (re)hold a break; operator-block records from any author only add a hold. */
+const HOLDING_OUTCOMES = Object.freeze([GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK, 'operator-block']);
 /**
  * Did the operator rule on the head's confirmed breaks? The gate handed THIS result over (a `round-cap` record that
  * decides it), and a trusted clear-human ceremony for that head came after the result and every send-back/cap record.
  * Only the ceremony's own comment counts: a restamp repeats the cleared-human marker for a ruling made on another
  * head. A carried result defers to the ruling on the head it was carried from, read from the thread before the carry.
- * PURE.
+ * Returns the validated ceremony record, or false. PURE.
  */
-function operatorRuled(records, pr, head) {
+function operatorRuled(records, pr, head, index) {
   const trusted = records.filter(r => isTrustedMarkerAuthor(r.c));
   if (parseLatestHumanClearedSha(trusted.filter(r => !r.from).map(r => r.c)) !== head) return false;
   const lastAt = (rs, test) => rs.reduce((found, r) => (test(r) ? r : found), null);
+  // A per-finding block supersedes the standing clearance only for its named holds.
+  const holds = r => HOLDING_OUTCOMES.includes(r.gate.outcome) && (r.gate.outcome !== 'operator-block'
+    || gateActionLines(recordBody(r)).some(({ action, indices }) => (action === 'send-back' || action === 'held') && (!indices.length || indices.includes(index))));
   const rulingHeads = new Set();
   // Each carry removes its own comment and every later record, so even a cyclic head chain terminates.
   for (let sha = head, rs = trusted, want = null; sha && rs.length;) {
@@ -553,9 +559,9 @@ function operatorRuled(records, pr, head) {
     const reaccepted = cleared && trusted.some(r => !r.from && r.at > cleared.at && parseLatestHumanClearedSha([r.c]) === null
       && reviewed(recordBody(r)));
     if (cap && cleared && !reaccepted && cleared.at > result.at && gates.every(r =>
-      ![GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK].includes(r.gate.outcome) || cleared.at > r.at)) return true;
+      !holds(r) || cleared.at > r.at)) return cleared;
     // A ruling inherited through a carry cannot approve this head's own later gate decisions.
-    if (gates.some(r => !r.from && [GATE_OUTCOMES.ROUND_CAP, GATE_OUTCOMES.SENT_BACK].includes(r.gate.outcome))) return false;
+    if (gates.some(r => !r.from && holds(r))) return false;
     if (!result.from) return false;
     rs = rs.filter(r => r.at < result.at);
     sha = result.from;
@@ -601,8 +607,9 @@ function gateActionLines(body) {
  * Every gate decision (per-finding actions, the send-back outcome, the round-cap hand-over) applies only to the result
  * it decides ({@link gateRecordsFor}), so a record for an earlier same-head result never releases a newer one's
  * finding. A carried result also keeps the actions bound to the result it was carried from (the same findings,
- * re-keyed); the newer head's own records win. Operator card actions never carry: only a direct record on the live
- * head releases its named result. With anyState off, legacy card/advisory records keep their existing result binding.
+ * re-keyed); the newer head's own records win. Human operator blocks retain gateRecordsFor's binding, including
+ * legacy records and carries. Operator card actions never carry: only a direct record on the live head releases
+ * its named result. With anyState off, legacy card/advisory records keep their existing binding.
  */
 export function readRedTeamDisposition({ comments, pr, head, setting, env = process.env, repo = null, standingRuling = null, operatorRulings } = {}) {
   const live = String(head ?? '').toLowerCase();
@@ -611,6 +618,8 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
   const plan = planRedTeamActions(result, setting ?? readConfirmedBreaks({ env }).value);
   const anyState = (operatorRulings ?? readOperatorRulings({ env }).value).anyState === true;
   const actions = new Map();
+  const rulings = [];
+  const ordinaryHolds = new Map();
   const grants = gateRoundGrants(comments, pr, repo, standingRuling);
   let legacyHeld = false, liveGates = [];
   // Each carry removes its own comment and every later record, so even a cyclic head chain terminates.
@@ -626,7 +635,9 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     for (const r of gates) {
       for (const line of gateActionLines(recordBody(r))) {
         const { indices } = line;
+        const block = r.gate.outcome === 'operator-block';
         let { action } = line;
+        if (block && (RELEASING_ACTIONS.has(action) || action === 'operator-card')) continue;
         if (action === 'operator-card') {
           // Operator card releases bind to the exact head/result; verdict carries cannot inherit them.
           if (!first || r.from || r.gate.result !== want) continue;
@@ -651,6 +662,14 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
           if (operatorRelease && (!first || r.from || (anyState && r.gate.result !== want))) continue;
           // A stale cap POST cannot overwrite the per-finding send-back that superseded its decision.
           if (action === 'held' && own.get(index) === 'send-back' && supersededCaps.has(r)) continue;
+          if ((action === 'held' || action === 'send-back') && !(block && action === 'send-back' && isHumanOperatorComment(r.c))) {
+            ordinaryHolds.set(index, Math.max(ordinaryHolds.get(index) ?? -1, r.at));
+          }
+          if (RELEASING_ACTIONS.has(action) || (block && action === 'send-back' && isHumanOperatorComment(r.c))) {
+            rulings.push({ kind: action === 'send-back' ? 'block' : action === 'card' ? 'card' : 'not-real',
+              source: operatorRelease || (block && isHumanOperatorComment(r.c)) ? 'operator' : 'automatic',
+              keys: [index], at: r.at, action });
+          }
           own.set(index, action);
         }
       }
@@ -664,7 +683,7 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
   // Audited grants unseen by the cap decision let a later send-back stand, even if the cap POST arrives last.
   // Without a repo there is no grant credit and the cap keeps winning.
   const outcome = sendBackStepState(liveGates, grants).outcome;
-  const ruled = operatorRuled(records, pr, live);
+  const dispositions = new Map(), findingRulings = new Map();
   const sendBack = [], held = [];
   for (const f of result?.findings ?? []) {
     const recorded = actions.get(f.index);
@@ -672,25 +691,41 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     const action = (recorded === 'send-back' && outcome === GATE_OUTCOMES.ROUND_CAP ? 'held' : recorded)
       ?? (legacyHeld && f.confirmed ? 'held' : null) ?? (plan.sendBack.includes(f)
         ? outcome === GATE_OUTCOMES.ROUND_CAP ? 'held' : 'send-back' : null);
-    if (action === 'held' && !ruled) held.push(f);
-    if (action === 'send-back') sendBack.push(f);
+    // Indexed gate holds retire older releases; legacy unindexed holds are only
+    // fallback evidence. Operator blocks remain live across ordinary gate holds.
+    const evidence = rulings.filter(r => r.kind === 'block' || r.at > (ordinaryHolds.get(f.index) ?? -1));
+    // operatorRuled validates the ceremony, carry chain, cap handover and later
+    // accept/hold invalidations. A ceremony clears only held actions; a standing
+    // send-back still belongs to the fixer even when the ceremony is live.
+    const clearance = operatorRuled(records, pr, live, f.index);
+    if (clearance && action === 'held') evidence.push({
+      kind: 'clear-human', source: 'operator', keys: [f.index], at: clearance.at,
+    });
+    const disposition = resolveDisposition(f.index, evidence);
+    dispositions.set(f.index, disposition);
+    findingRulings.set(f.index, evidence);
+    const effectiveAction = disposition.state === 'held'
+      ? outcome === GATE_OUTCOMES.ROUND_CAP ? 'held' : 'send-back'
+      : disposition.state === 'open' ? action : null;
+    if (effectiveAction === 'held') held.push(f);
+    if (effectiveAction === 'send-back') sendBack.push(f);
   }
-  return { result, sendBack, held, since: commentCreatedAt(capRecord) ?? null, outcome };
+  return { result, sendBack, held, dispositions, rulings: findingRulings, since: commentCreatedAt(capRecord) ?? null, outcome };
 }
 
 /**
  * The live head's latest result; per finding the actions a HUMAN OPERATOR's named gate record (`operator-*`,
  * `result=` this result) took on it, in thread order; and every finding ANY trusted record already carded for this
  * result (the gate's own card filing too). `record-red-team-ruling` dedups on this (no second card). PURE.
- * @returns {{resultId:(string|null), ruled:Map<number, string[]>, carded:Set<number>}}
+ * @returns {{resultId:(string|null), ruled:Map<number, string[]>, carded:Set<number>, blocked:Set<number>}}
  */
 export function operatorRulingsOnLiveResult(comments, pr, head) {
   const live = String(head ?? '').toLowerCase();
   const records = indexedRecords(comments);
   const hit = latestResult(records, pr, live);
   const ruled = new Map();
-  const carded = new Set();
-  if (!hit) return { resultId: null, ruled, carded };
+  const carded = new Set(), blocked = new Set();
+  if (!hit) return { resultId: null, ruled, carded, blocked };
   const id = redTeamResultId(hit.parsed);
   for (const r of gateRecordsFor(records, pr, live, hit).sort(threadOrder)) {
     // Identical reposts keep their result id, but earlier operator rulings do not apply to them.
@@ -701,10 +736,12 @@ export function operatorRulingsOnLiveResult(comments, pr, head) {
     for (const { action, indices } of gateActionLines(recordBody(r))) {
       const card = action === 'card' || action === 'operator-card';
       if (card && (AUTOMATION_RELEASE_OUTCOMES.has(r.gate.outcome) || operator)) for (const index of indices) carded.add(index);
-      if (!operator) continue;
+      if (!operator || (r.gate.outcome === 'operator-block' && r.from)) continue;
       const a = action === 'operator-card' ? 'card' : action;
       for (const index of indices) ruled.set(index, [...(ruled.get(index) ?? []), a]);
     }
   }
-  return { resultId: id, ruled, carded };
+  const disposition = readRedTeamDisposition({ comments, pr, head, operatorRulings: { anyState: true } });
+  for (const [index, resolved] of disposition.dispositions) if (resolved.by?.kind === 'block') blocked.add(index);
+  return { resultId: id, ruled, carded, blocked };
 }

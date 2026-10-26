@@ -27,6 +27,22 @@ export function unescapeTsvField(s) {
   return out;
 }
 
+/** Complete REST thread within a page cap. Every request uses the caller's budgeted
+ * reader; a full final page is inconclusive and throws rather than returning a prefix.
+ */
+function readBoundedPrComments(number, { repo, gh, maxPages }) {
+  if (!Number.isSafeInteger(maxPages) || maxPages < 1) throw Error('invalid comment page cap');
+  const comments = [];
+  for (let page = 1; page <= maxPages; page++) {
+    const rows = gh(['api', `repos/${repo}/issues/${number}/comments?per_page=100&page=${page}`]);
+    if (!Array.isArray(rows) || rows.length > 100 || rows.some(c =>
+      !c || typeof c !== 'object' || Array.isArray(c))) throw Error('incomplete comment evidence');
+    comments.push(...rows.map(c => ({ ...c, author: c.user ?? c.author, createdAt: c.created_at ?? c.createdAt })));
+    if (rows.length < 100) return comments;
+  }
+  throw Error('comment evidence exceeds page cap');
+}
+
 /**
  * we:scripts/conveyor/pr-comments-list.mjs#defaultListPrComments — `#3383`'s idempotency read for the
  * grace-expired stand-down routing: a COMPLETE, injectable read of every issue comment on the PR, so
@@ -54,10 +70,13 @@ export function unescapeTsvField(s) {
  * read, EVERY comment this function returned failed that check, so `alreadyStoodDown`/the fresh-path stand-down
  * dedup silently never matched a real stand-down at all. Adding `.user.login` here fixes that latent gap too,
  * not only the three #4118 marker readers it was added for.
- * @param {{number:number|string, repo?:string|null, exec?:Function}} o
+ * Supply `gh` (parsed JSON per request) for bounded pagination sharing a caller's
+ * request budget. Reaching `maxPages` without a short page fails closed.
+ * @param {{number:number|string, repo?:string|null, exec?:Function, gh?:Function, maxPages?:number}} o
  * @returns {Array<{body:string, createdAt:?string, author:?{login:string}}>}
  */
-export function defaultListPrComments({ number, repo, exec = execFileSyncThrottled }) {
+export function defaultListPrComments({ number, repo, exec = execFileSyncThrottled, gh, maxPages = 10 }) {
+  if (gh) return readBoundedPrComments(number, { repo, gh, maxPages });
   const path = repo ? `repos/${repo}/issues/${number}/comments` : `repos/{owner}/{repo}/issues/${number}/comments`;
   const argv = ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', path, '--jq', '.[] | [.body, .created_at, .user.login, .node_id, .html_url] | @tsv'];
   // #x5n4zn3 — was bare (no timeout).
