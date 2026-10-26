@@ -96,6 +96,24 @@ describe('stack relation comes from GitHub baseRefName (live 2026-10-11 deadlock
     [TOP, { reach: new Set([TOP, BOTTOM]), first: [TOP] }],
   ]);
 
+  it('finds a trusted declared lane base across different authors when containment is proven', () => {
+    expect(findStackBases([bottom(), { ...top(), author: 'another-actor' }], graph())).toEqual(new Map([
+      [4757, { pr: 4756, ref: bottom().headRefName, head: BOTTOM, contained: BOTTOM }],
+    ]));
+  });
+  it.each([4756, 4757])('rejects a cross-author declared base when PR #%i is untrusted', (pr) => {
+    const prs = [bottom(), { ...top(), author: 'another-actor' }].map(r => ({ ...r, untrusted: r.pr === pr }));
+    expect(findStackBases(prs, graph())).toEqual(new Map());
+  });
+  it('does not infer a cross-author stack from ancestry when both PRs target main', () => {
+    expect(findStackBases([bottom(), { ...top(), author: 'another-actor', baseRefName: 'main' }], graph())).toEqual(new Map());
+  });
+  it('rejects a cross-author declared base without containment evidence', () => {
+    const g = graph();
+    g.get(TOP).reach.delete(BOTTOM);
+    expect(findStackBases([bottom(), { ...top(), author: 'another-actor' }], g)).toEqual(new Map());
+  });
+
   it('does not invert #4756 below #4792 because of ancestry', () => {
     const prs = [row(4756, bottom().headRefName, TOP, 'main'),
       row(4792, 'lane/last-takeover-review', BOTTOM, 'lane/takeover-budget')];
@@ -527,9 +545,10 @@ describe('readStackBases — the same trust rule as the fix daemon', () => {
     expect(sameStackActor({ author: 'a' }, { author: 'b' })).toBe(false);
     expect(sameStackActor({ author: null }, { author: null })).toBe(false);
   });
-  it('findStackBases applies the ownership rule by default', () => {
-    expect(findStackBases(rows().map((r) => ({ ...r, author: r.pr === 4631 ? 'someone-else' : r.author })), sets())).toEqual(new Map());
-    expect(findStackBases(rows().map(({ author: _a, ...r }) => r), sets())).toEqual(new Map());
+  it('findStackBases does not form ancestry-only stacks across authors or with unknown authors', () => {
+    const prs = rows().map((r) => ({ ...r, baseRefName: 'main' }));
+    expect(findStackBases(prs.map((r) => ({ ...r, author: r.pr === 4631 ? 'someone-else' : r.author })), sets())).toEqual(new Map());
+    expect(findStackBases(prs.map(({ author: _a, ...r }) => r), sets())).toEqual(new Map());
   });
 });
 

@@ -9,7 +9,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
-  assessScopeBloat, scopeBloatLimits, cardIdFromTitle, parseCardScope, inScope, enrichPrsWithScopeBloat,
+  assessScopeBloat, scopeBloatLimits, cardIdFromTitle, readCardScope, parseCardScope, inScope, enrichPrsWithScopeBloat,
   recordScopeBloatRefresh, scopeBloatRefreshFor, MARKER_RETRIES_PER_HEAD, SCOPE_BLOAT_REASON,
 } from '../scope-bloat.mjs';
 import { planReconcile as planReconcileCoreWithTiming } from '../reconcile-core.mjs';
@@ -94,6 +94,22 @@ describe('assessScopeBloat — replay of #4361', () => {
 });
 
 describe('card scope helpers', () => {
+  it.each([
+    'Red team: x (stacked on #5942)',
+    '(after #5942)',
+    'foo, stacked on #5942',
+    'foo #5942',
+  ])('does not treat an incidental reference as a card: %s', (title) => {
+    expect(cardIdFromTitle(title)).toBeNull();
+  });
+
+  it.each([
+    'WE #xykwe0h: build — settle builds',
+    'WE #xykwe0h: build — x (stacked on #5942)',
+  ])('keeps the leading WE card reference: %s', (title) => {
+    expect(cardIdFromTitle(title)).toBe('xykwe0h');
+  });
+
   it('reads the card id out of a PR title and the scope out of frontmatter (inline and block forms)', () => {
     expect(cardIdFromTitle('WE #xykwe0h: build — settle builds')).toBe('xykwe0h');
     expect(cardIdFromTitle('no id here')).toBeNull();
@@ -146,6 +162,58 @@ describe('enrichPrsWithScopeBloat — the io shell fails open and remembers the 
   const pr = (over = {}) => ({ number: 4361, title: 'WE #xykwe0h: build', headRefName: 'lane/build-outcomes', headRefOid: 'a'.repeat(40),
     files: FILES_4361.map((path) => ({ path, additions: 1, deletions: 0 })), comments: [], ...over });
   const readers = { readNet: () => OWN, readScope: () => CARD_SCOPE, readBaseSha: () => 'base0', repo: 'web-everything/web-everything', env: {} };
+
+  it('marks an unresolved lane base unknown without claiming scope bloat', () => {
+    const base = 'lane/unresolved-bottom';
+    const events = [];
+    const [out] = enrichPrsWithScopeBloat([pr({ number: 5943, baseRefName: base })], {
+      ...readers, readStacks: () => new Map(), emitEvent: (event) => events.push(event),
+    });
+    const detail = { reason: 'stack-base-unresolved', base };
+    expect(out.scopeBloat).toBeUndefined();
+    expect(out.scopeBloatUnknown).toEqual(detail);
+    expect(events).toEqual([{ kind: 'scope-bloat-unknown', pr: 5943, detail }]);
+  });
+
+  it('leaves a clean main-based PR untouched without emitting an unknown event', () => {
+    const events = [];
+    const input = pr({ number: 5944, baseRefName: 'main', files: OWN });
+    const [out] = enrichPrsWithScopeBloat([input], {
+      ...readers, readStacks: () => new Map(), emitEvent: (event) => events.push(event),
+    });
+    expect(out).toEqual(input);
+    expect(out.scopeBloatUnknown).toBeUndefined();
+    expect(events).toEqual([]);
+  });
+
+  it('does not mark a resolved lane stack base unknown', () => {
+    const events = [];
+    const stack = { pr: 5942, ref: 'lane/resolved-bottom', head: '2'.repeat(40),
+      contained: '2'.repeat(40), tree: '3'.repeat(40), topHead: 'a'.repeat(40) };
+    const [out] = enrichPrsWithScopeBloat([pr({ number: 5945, baseRefName: stack.ref })], {
+      ...readers, readStacks: () => new Map([[5945, stack]]), readStackFiles: () => OWN,
+      emitEvent: (event) => events.push(event),
+    });
+    expect(out.stackBase).toMatchObject({ pr: 5942, ref: stack.ref });
+    expect(out.scopeBloat).toBeUndefined();
+    expect(out.scopeBloatUnknown).toBeUndefined();
+    expect(events).toEqual([]);
+  });
+
+  it('does not read card 5942 scope while enriching a red-team title mentioning its stack', () => {
+    const scopes = [];
+    const calls = [];
+    const run = (args) => {
+      calls.push(args);
+      return args[0] === 'ls-tree' ? 'backlog/5942-bottom.md\n' : '---\nscope: [we:bottom-only/]\n---\n';
+    };
+    enrichPrsWithScopeBloat([pr({ number: 5946, title: 'Red team: x (stacked on #5942)', baseRefName: 'main' })], {
+      ...readers, readStacks: () => new Map(),
+      readScope: (options) => { const scope = readCardScope({ ...options, run }); scopes.push(scope); return scope; },
+    });
+    expect(scopes).toEqual([null]);
+    expect(calls).toEqual([]);
+  });
 
   it('annotates a bloated PR and leaves a clean one alone', () => {
     const [bloated] = enrichPrsWithScopeBloat([pr()], readers);
