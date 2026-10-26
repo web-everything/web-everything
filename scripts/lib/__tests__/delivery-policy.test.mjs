@@ -95,6 +95,85 @@ describe('trusted policy paths', () => {
     expect(() => trusted.read()).toThrow(/Unreadable or oversized/);
   });
 
+  it.each(['leaf', 'parent'])('keeps reading the opened fd after a %s swap during a short read', kind => {
+    const source = '{"safe":true}';
+    const file = put('nested/policy.json', source);
+    const target = put('target/policy.json', '{"safe":false}');
+    const original = statSync(file);
+    // Isolate native ESM patches from Vitest and the other filesystem fixtures.
+    const observed = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { dirname } from 'node:path';
+      import { resolveTrustedConfigPath } from './scripts/lib/delivery-policy.mjs';
+      const [root, file, target, kind] = process.argv.slice(1);
+      const trusted = resolveTrustedConfigPath(file, { root });
+      const read = fs.readSync;
+      const open = fs.openSync;
+      const observed = { opens: 0, identities: [] };
+      let descriptor;
+      fs.openSync = (...args) => { observed.opens++; return open(...args); };
+      fs.readSync = (fd, buffer, offset, length, position) => {
+        descriptor = fd;
+        const { dev, ino } = fs.fstatSync(fd);
+        observed.identities.push({ dev, ino });
+        const bytes = read(fd, buffer, offset, Math.min(length, 4), position);
+        if (observed.identities.length === 1) {
+          const replaced = kind === 'leaf' ? file : dirname(file);
+          fs.renameSync(replaced, replaced + '.original');
+          fs.symlinkSync(kind === 'leaf' ? target : dirname(target), replaced);
+        }
+        return bytes;
+      };
+      syncBuiltinESMExports();
+      observed.source = trusted.read();
+      try { fs.fstatSync(descriptor); } catch (error) { observed.closed = error.code; }
+      fs.readSync = read;
+      fs.openSync = open;
+      syncBuiltinESMExports();
+      // Imported daemon modules may retain handles; the synchronous probe is complete.
+      process.stdout.write(JSON.stringify(observed), () => process.exit(0));
+    `, root, file, target, kind], {
+      cwd: resolve('.'), encoding: 'utf8', timeout: 5000, killSignal: 'SIGKILL', maxBuffer: 65536,
+    }));
+    expect(observed.source).toBe(source);
+    expect(observed.opens).toBe(1);
+    expect(observed.identities.length).toBeGreaterThan(1);
+    for (const identity of observed.identities) expect(identity).toEqual({ dev: original.dev, ino: original.ino });
+    expect(observed.closed).toBe('EBADF');
+    expect(readFileSync(file, 'utf8')).toBe('{"safe":false}');
+  });
+
+  it.each(['defaults', 'pointer', 'repo env', 'state env'])('rejects a symlinked parent before reusing cached %s values', async kind => {
+    const base = kind === 'state env' ? env.WE_DAEMON_STATE_DIR : root;
+    const directory = join(base, kind === 'defaults' ? 'config' : 'nested');
+    const file = join(directory, kind === 'defaults' ? 'deliveryPolicyDefaults.ts' : kind === 'pointer' ? 'repair-policy.json' : rootFile);
+    const source = kind === 'defaults'
+      ? readFileSync(join(root, defaultFile), 'utf8').replace("onMainRed: 'halt'", "onMainRed: 'off'")
+      : kind === 'pointer' ? { onMainRed: 'off' } : { mergeGate: { onMainRed: 'off' } };
+    put(file, source);
+    if (kind === 'pointer') {
+      gate.POLICY_SPEC_BASENAMES.add('repair-policy.json');
+      put(rootFile, { mergeGate: './nested/repair-policy.json' });
+    }
+    const options = kind.endsWith('env') ? { env: { ...env, WE_POLICY_CONFIG: file } } : {};
+    const warm = await load(options);
+    expect(warm.mergeGate.onMainRed).toBe('off');
+    expect(warm.warnings).toEqual([]);
+    const original = statSync(file);
+    renameSync(directory, directory + '.original');
+    symlinkSync(directory + '.original', directory, 'dir');
+    // The leaf and its mtime are unchanged: only the path's trust has changed.
+    expect(statSync(file).ino).toBe(original.ino);
+    expect(statSync(file).mtimeMs).toBe(original.mtimeMs);
+    const refused = await load(options);
+    expect(refused.mergeGate.onMainRed).toBe('halt');
+    expect(refused.sources.mergeGate.onMainRed).toBe('default');
+    expect(refused.warnings).toHaveLength(1);
+    expect(refused.warnings[0]).toMatch(/symlink refused|defaults unreadable/);
+    expect(refused.filesRead).toEqual(kind === 'defaults' ? [] : kind === 'pointer' ? [defaultFile, rootFile] : [defaultFile]);
+  });
+
   it('bounds total fd IO to MAX_SOURCE_BYTES + 1 when the inode grows during reading', () => {
     const maxSourceBytes = 1024 * 1024;
     const initial = '{"safe":true}';
