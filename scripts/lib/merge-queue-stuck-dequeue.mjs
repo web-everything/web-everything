@@ -84,5 +84,9 @@ export function sweepStuckEntries({ repo, exec = execFileSync, max, nowMs = Date
       try { Promise.resolve(emit(event)).catch(() => {}); } catch { /* Events are best effort. */ }
     } catch (e) { log(`⚠ merge-queue dequeue #${d.num} failed (${errorText(e)}) — retry next pass`); }
   }
+  if (dequeued.length) { // a PR that re-enters the queue must not inherit the rebuild count that got it removed
+    for (const num of dequeued) delete decision.tracker[num];
+    try { writeFile(statePath, `${JSON.stringify(decision.tracker)}\n`); } catch { /* next pass rewrites it */ }
+  }
   return { dequeued };
 }
