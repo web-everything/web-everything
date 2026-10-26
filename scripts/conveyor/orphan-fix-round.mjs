@@ -90,7 +90,9 @@ export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT
   const verdict = latestChangesVerdict(trusted);
   if (!verdict) return none('no trusted changes verdict on the thread');
   const vAt = atMs(verdict);
-  const after = trusted.filter((c) => atMs(c) > vAt);
+  // GitHub timestamps have second precision; the thread also orders comments within that second.
+  const vIndex = trusted.indexOf(verdict);
+  const after = trusted.slice(vIndex + 1);
   if (after.some((c) => lead(c).startsWith(REARM_COMMENT_MARKER) && rearmCoversVerdict(c.body, verdict))) {
     return none('already re-armed after the latest verdict');
   }
@@ -100,14 +102,15 @@ export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT
     // The sanctioned writer posts the operator's assertion through automation credentials.
     // Use the referral gate's parser to validate both that provenance and the operator assertion.
     const ruling = after.filter((c) => lead(c).startsWith('## Operator ruling on mandatory referrals') && parseOperatorRulingComment(c)?.record)
-      .reduce((latest, c) => !latest || atMs(c) >= atMs(latest) ? c : latest, null);
-    if (reviewed && head && (head.startsWith(reviewed) || reviewed.startsWith(head)) && ruling) {
-      try {
-        const gate = openReferralFindings({ comments: pr.comments, repo, pr: pr.number, head: pr.headRefOid,
-          body: pr.body ?? '', createdAt: pr.createdAt ?? '', cardReadable });
+      .at(-1);
+    try {
+      // Validate even without a valid ruling: malformed-only history must not reach fix-round recovery.
+      const gate = openReferralFindings({ comments: pr.comments, repo, pr: pr.number, head: pr.headRefOid,
+        body: pr.body ?? '', createdAt: pr.createdAt ?? '', cardReadable });
+      if (gate.malformed || gate.protectionMalformed) return none('malformed referral history — it stays with a person');
+      if (reviewed && head && (head.startsWith(reviewed) || reviewed.startsWith(head)) && ruling) {
         const { open, ruled } = gate;
-        // A malformed or disputed referral history, or any gate-level pending/blocked hold, is not a settled ruling.
-        if (gate.malformed || gate.protectionMalformed) throw new Error('malformed referral history');
+        // A disputed referral history, or any gate-level pending/blocked hold, is not a settled ruling.
         const settled = !gate.pending?.length && !gate.blocked?.length && !gate.disputed?.length;
         const ctx = { verdictAt: new Date(vAt).toISOString(), rulingAt: new Date(atMs(ruling)).toISOString() };
         if (!open.length && ruled.length && settled && countUnresolvedStandDowns(annotateLapsedStandDowns(pr)?.comments) > 0) {
@@ -116,7 +119,9 @@ export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT
         if (!open.length && ruled.length && settled) return { decision: 'rearm', ...ctx,
           reason: `operator ruling ${ctx.rulingAt} answered every referral finding the send-back blocked on head ${head.slice(0, 9)} (card/not-real) — no fix is owed, so the review is re-armed; review:human, if present, stays` };
         if (open.length || !settled) return { ...none(`operator ruling ${ctx.rulingAt} is partial: ${open.length} referral finding(s) still open on head ${head.slice(0, 9)} (${open.filter(isBlockedFinding).length} blocked, ${open.filter(isAwaitingRuling).length} awaiting a ruling or re-check) — it stays with a person`), ...ctx };
-      } catch { /* An unreadable gate falls back to the existing fix-round rules. */ }
+      }
+    } catch {
+      return none('malformed referral history — it stays with a person');
     }
   }
   const roundEvents = after.filter((c) => lead(c).startsWith(FIX_END_MARKER) || lead(c).startsWith(FIX_BEGIN_MARKER));

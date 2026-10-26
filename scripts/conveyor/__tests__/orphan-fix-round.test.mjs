@@ -15,6 +15,7 @@ import { runFixerStuckReclaimPass, formatFixerStuckReclaimLines } from '../fixer
 import { buildVerdictComment, buildRearmVerdictBinding, rearmVerdictKey, latestChangesVerdict } from '../../review-set-label.mjs';
 import { parseLatestHumanClearedSha } from '../../lib/review-escalation.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
+import * as referralGate from '../../operations/record-referral-ruling.mjs';
 
 const BOT = { login: 'web-everything' };
 const c = (createdAt, body, author = BOT) => ({ createdAt, body, author });
@@ -29,6 +30,12 @@ const pr4715 = (comments, extra = {}) => ({ number: 4715, labels: [{ name: 'revi
 
 it('recovers a concurrent same-head send-back after the pinned re-arm marker and operator ruling (PR #5925)', async () => {
   const { default: scenario } = await import('../soak/breaks/pinned-rearm-orphan-marker.mjs');
+  const report = await scenario.run({ log: line => console.log(line) });
+  expect(scenario.judge(report)).toEqual([]);
+});
+
+it('replays same-second operator rulings and malformed history through the orphan IO shell (PR #5925)', async () => {
+  const { default: scenario } = await import('../soak/breaks/automation-operator-ruling-orphan.mjs');
   const report = await scenario.run({ log: line => console.log(line) });
   expect(scenario.judge(report)).toEqual([]);
 });
@@ -51,6 +58,17 @@ describe('verdict-bound orphan re-arm markers', () => {
   it('normalizes GraphQL and REST identity and timestamp fields to the same binding', () => {
     const rest = { node_id: verdict.id, id: 42, created_at: new Date(verdict.createdAt).toISOString(), body: verdict.body };
     expect(rearmVerdictKey(rest)).toBe(rearmVerdictKey(verdict));
+  });
+
+  it('honors a bound re-arm marker later in the thread in the verdict timestamp second', () => {
+    const sameSecondMarker = { ...marker(buildRearmVerdictBinding(verdict)), createdAt: verdict.createdAt };
+    expect(planOrphanFixRound({ pr: pr4715([verdict, sameSecondMarker, EVIDENCE, END]), nowMs: NOW }).reason)
+      .toBe('already re-armed after the latest verdict');
+  });
+
+  it('does not let a marker before the verdict suppress recovery despite its later timestamp', () => {
+    expect(planOrphanFixRound({ pr: pr4715([marker(buildRearmVerdictBinding(verdict)), verdict, EVIDENCE, END]), nowMs: NOW }).decision)
+      .toBe('rearm');
   });
 
   it('selects the latest trusted verdict even when two verdicts have identical bodies and timestamps', () => {
@@ -235,6 +253,51 @@ describe('planOrphanFixRound — #5608 operator referral rulings', () => {
       rulingAt: new Date(rulingAt).toISOString(), reason: expect.stringContaining('no fix is owed') });
   });
 
+  it('re-arms when the verdict and later operator ruling have identical createdAt', () => {
+    const answer = { ...ruling(2, { at: verdictAt }), createdAt: verdictAt };
+    expect(plan(thread(answer))).toMatchObject({ decision: 'rearm', rulingAt: new Date(verdictAt).toISOString() });
+  });
+
+  it('selects the latest ruling by thread position even when its timestamp is earlier', () => {
+    const pr = thread();
+    pr.comments.push({ ...ruling(2, { at: verdictAt }), createdAt: verdictAt });
+    expect(plan(pr)).toMatchObject({ decision: 'rearm', rulingAt: new Date(verdictAt).toISOString() });
+  });
+
+  it('keeps a malformed operator ruling after a blocked-referral verdict with a person even after a fix round', () => {
+    const answer = c(rulingAt,
+      '## Operator ruling on mandatory referrals\n\n<!-- mandatory-referral-operator-ruling-v1: not-base64 -->');
+    const pr = thread(answer, { labels: ['review:changes'] });
+    pr.comments.push(EVIDENCE, END);
+    expect(plan(pr)).toEqual({ decision: 'none', reason: 'malformed referral history — it stays with a person' });
+  });
+
+  it.each(['malformed', 'protectionMalformed'])('fails closed for gate.%s despite a completed fix round', (flag) => {
+    const pr = thread(ruling(), { labels: ['review:changes'] });
+    pr.comments.push(EVIDENCE, END);
+    const gate = referralGate.openReferralFindings({ comments: pr.comments, repo, pr: pr.number, head: HEAD,
+      body, createdAt: pr.createdAt, cardReadable: () => true });
+    const spy = vi.spyOn(referralGate, 'openReferralFindings').mockReturnValueOnce({ ...gate, [flag]: true });
+    try {
+      expect(plan(pr)).toEqual({ decision: 'none', reason: 'malformed referral history — it stays with a person' });
+      expect(spy).toHaveBeenCalledOnce();
+    } finally { spy.mockRestore(); }
+  });
+
+  it.each(['disputed', 'pending', 'blocked'])('keeps gate.%s with a person when open is empty and ruled is non-empty', (flag) => {
+    const pr = thread(ruling(), { labels: ['review:changes'] });
+    pr.comments.push(EVIDENCE, END);
+    const gate = referralGate.openReferralFindings({ comments: pr.comments, repo, pr: pr.number, head: HEAD,
+      body, createdAt: pr.createdAt, cardReadable: () => true });
+    expect(gate.open).toEqual([]);
+    expect(gate.ruled).not.toHaveLength(0);
+    const spy = vi.spyOn(referralGate, 'openReferralFindings').mockReturnValueOnce({ ...gate, [flag]: ['unresolved hold'] });
+    try {
+      expect(plan(pr)).toMatchObject({ decision: 'none', reason: expect.stringContaining('partial: 0 referral finding(s) still open') });
+      expect(spy).toHaveBeenCalledOnce();
+    } finally { spy.mockRestore(); }
+  });
+
   it('does not re-arm a fully carded thread while a stand-down is unresolved', () => {
     const pr = thread();
     pr.comments.splice(2, 0, c('2026-10-10T12:30:00Z', `${STAND_DOWN_MARKER}\n\nneeds a person`));
@@ -320,9 +383,11 @@ describe('planOrphanFixRound — #5608 operator referral rulings', () => {
     }
   });
 
-  it('falls through if the gate reader throws', () => {
-    expect(plan(thread(), { cardReadable: () => { throw new Error('unreadable'); } }).reason)
-      .toContain('no fix round since the latest verdict');
+  it('fails closed if the gate reader throws even after a fix round', () => {
+    const pr = thread(ruling(), { labels: ['review:changes'] });
+    pr.comments.push(EVIDENCE, END);
+    expect(plan(pr, { cardReadable: () => { throw new Error('unreadable'); } }))
+      .toEqual({ decision: 'none', reason: 'malformed referral history — it stays with a person' });
   });
 
   it.each(['chalbert', 'web-everything'])('passes a ruling posted by %s through the IO shell', async (login) => {

@@ -11,12 +11,14 @@ export default {
   card: 'x1b8hlo / PR #5925',
   fixedBy: { sha: 'pending', where: 'lane/port-c-orphan-rearm', paths: ['scripts/conveyor/orphan-fix-round.mjs'] },
   fixPresent(root) {
-    return readFileSync(join(root, 'scripts/conveyor/orphan-fix-round.mjs'), 'utf8')
-      .includes('parseOperatorRulingComment(c)?.record');
+    const source = readFileSync(join(root, 'scripts/conveyor/orphan-fix-round.mjs'), 'utf8');
+    return source.includes('trusted.slice(vIndex + 1)')
+      && source.includes("return none('malformed referral history — it stays with a person')");
   },
   async run({ sourceRoot = ROOT, log } = {}) {
     const load = rel => import(pathToFileURL(join(sourceRoot, rel)).href);
     const { runOrphanFixRoundPass, CHANGES_VERDICT_PREFIX } = await load('scripts/conveyor/orphan-fix-round.mjs');
+    const { FIX_END_MARKER } = await load('scripts/conveyor/fix-procedure.mjs');
     const { openReferralFindings } = await load('scripts/operations/record-referral-ruling.mjs');
     const { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey,
       renderReferralRecord } = await load('scripts/lib/jury-core.mjs');
@@ -35,19 +37,28 @@ export default {
       rulings: [{ id: `${runId}:0`, key, reviewerId: reviewer.id, lens: 'correctness', result: 'block',
         rationale: 'checked', evidence: ['diff'] }] };
     const violations = [];
-    for (const result of ['card', 'not-real']) {
+    for (const [result, history] of ['card', 'not-real'].flatMap(result =>
+      ['later', 'same-second', 'malformed'].map(history => [result, history]))) {
+      const answerAt = history === 'same-second' ? '12:00' : '13:00';
       const pr = { number, body, createdAt: '2026-10-24T12:00:00Z', headRefOid: head, isDraft: false,
         labels: ['review:changes', 'review:human'], comments: [
           comment('11:00', renderReferralRecord(record)),
           comment('12:00', `${CHANGES_VERDICT_PREFIX}\n\n### Blocked referral findings\n\non head \`${head}\``),
-          comment('13:00', buildOperatorRulingComment({ version: 1, repo, pr: number, head,
+          comment(answerAt, buildOperatorRulingComment({ version: 1, repo, pr: number, head,
             actor: 'chalbert', channel: 'claude-code-chat', reason: 'Operator answered the referral',
-            at: '2026-10-25T13:00:00Z', clearerId: 'session-5925',
+            at: `2026-10-25T${answerAt}:00Z`, clearerId: 'session-5925',
             rulings: [{ runId, key, result, ...(result === 'card' ? { card } : {}) }] })),
         ] };
+      if (history === 'malformed') {
+        pr.labels = ['review:changes'];
+        pr.comments.push(comment('13:01', '## Operator ruling on mandatory referrals\n\n<!-- mandatory-referral-operator-ruling-v1: not-base64 -->'),
+          comment('13:02', '## 🔧 conveyor fix — evidence\n\nFindings addressed'), comment('13:03', FIX_END_MARKER));
+      }
       const gate = openReferralFindings({ comments: pr.comments, repo, pr: number, head, body,
         createdAt: pr.createdAt, cardReadable });
-      if (gate.open.length || gate.ruled.length !== 1 || gate.pending.length || gate.blocked.length || gate.disputed.length
+      if (history === 'malformed') {
+        if (!gate.malformed && !gate.protectionMalformed) violations.push(`${result}: malformed fixture did not close the gate`);
+      } else if (gate.open.length || gate.ruled.length !== 1 || gate.pending.length || gate.blocked.length || gate.disputed.length
         || gate.malformed || gate.protectionMalformed) violations.push(`${result}: fixture did not settle the referral gate`);
       const calls = [];
       const pass = await runOrphanFixRoundPass({ repos: [{ key: 'we', slug: repo }], env: {},
@@ -57,9 +68,11 @@ export default {
         redispatch: async () => { throw new Error('no fix is owed'); },
         escalate: async () => { throw new Error('settled ruling needs no escalation'); },
       });
-      if (calls.length !== 1 || calls[0]?.head !== head || calls[0]?.pr !== number || calls[0]?.slug !== repo
+      if (history === 'malformed') {
+        if (calls.length || pass.rows.length) violations.push(`${result}: malformed history triggered recovery`);
+      } else if (calls.length !== 1 || calls[0]?.head !== head || calls[0]?.pr !== number || calls[0]?.slug !== repo
         || pass.rows[0]?.result !== 're-armed') violations.push(`${result}: settled automation ruling never reached pinned re-arm`);
-      log?.(`${result}: open=${gate.open.length}, rearm calls=${calls.length}`);
+      log?.(`${result}/${history}: open=${gate.open.length}, rearm calls=${calls.length}`);
     }
     return { violations };
   },
