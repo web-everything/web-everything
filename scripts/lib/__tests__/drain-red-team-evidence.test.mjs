@@ -8,6 +8,7 @@ import { historicalCardOnlySkipCandidate, readDrainRedTeamEvidence, recordRedTea
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { redTeamOwedFor } from '../review-red-team-policy.mjs';
 import { pidStartTime } from '../pid-alive.mjs';
+import { resumeRedTeamCarry } from '../red-team-carry-machine.mjs';
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -41,6 +42,31 @@ describe('historical fallback predicate clauses', () => {
 });
 
 describe('drain reads actual head-bound review scheduler inputs', () => {
+  it.each(['missing status', 'real panel status', 'same-head panel', 'different-head panel'])(
+    'unfinished journal discovery handles %s without manufacturing a verdict', kind => {
+      const f = fixture(), from = 'a'.repeat(40);
+      const loopPayload = { verdict: null, carriedFrom: from, findings: { read: {
+        netBasis: { rev: f.head }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
+      } } };
+      // Power loss immediately after the journal rename, before the compatibility status.
+      expect(() => resumeRedTeamCarry({ ...f, loopPayload }, { env: f.env, eligible: () => true,
+        intentRecorded: () => false, recordIntent: () => { throw Error('crash'); },
+      })).toThrow('crash');
+      if (kind === 'real panel status') {
+        recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'ran' }, f);
+      } else if (kind.includes('panel')) {
+        writeRun({ ...newRunRecord({ id: 'review-pr-later-panel', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
+          ...payload(kind === 'same-head panel' ? f.head : 'c'.repeat(40)) }, f.runsDir);
+      }
+      const evidence = readDrainRedTeamEvidence(f);
+      if (kind === 'missing status') {
+        expect(evidence).toMatchObject({ carry: { step: 'intent' }, loopPayload: { verdict: null },
+          status: { status: 'finished', result: { status: 'skipped', policy: 'card-only' } } });
+      } else {
+        expect(evidence.carryConflict).toBe(true);
+        expect(evidence.carry).toBeUndefined();
+      }
+    });
   it.each(['accept', 'changes'])('a carried %s verdict is never exposed as a live-head panel verdict', verdict => {
     const f = fixture(), carriedFrom = 'c'.repeat(40);
     const loopPayload = { ...payload(f.head), carriedFrom, verdict: { verdict } };

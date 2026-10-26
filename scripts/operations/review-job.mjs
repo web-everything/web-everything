@@ -94,6 +94,9 @@ import { liveResultGateState, readRedTeamProbes, redTeamForHead, redTeamGateMark
 import { normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
 import { redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
+import { createRedTeamCarryIo } from '../lib/red-team-carry-io.mjs';
+import { createGhProvider } from '../lib/review-label-provider.mjs';
+import { RED_TEAM_STATUS_LABEL_META } from '../lib/red-team-status-label-meta.mjs';
 import { publishAttention } from './needs-you-feed.mjs';
 
 import { randomUUID } from 'node:crypto';
@@ -327,15 +330,29 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
   const readComments = ({ repo, pr }) => readCompletePrComments(Number(pr), {
     repo, exec: (file, args, options) => exec(file, args, { ...options, cwd: root, env }),
   });
+  const provider = createGhProvider({ exec: (args, options) => exec('gh', args,
+    { ...options, cwd: root, env, timeout: 60_000 }) });
+  const postComment = ({ repo, pr, body }) => exec('gh', [
+    'pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-',
+  ], { input: body, cwd: root, env, timeout: 60_000, maxBuffer: 1024 * 1024 });
   return {
     redTeamResultVisible: ({ repo, pr, head }) => Boolean(redTeamForHead(readComments({ repo, pr }), pr, head)),
     settleRedTeamSkip: input => settleRedTeamSkip({ ...input, io: {
       env,
       log: line => process.stderr.write(`${line}\n`),
       readComments,
-      postComment: ({ repo, pr, body }) => exec('gh', [
-        'pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-',
-      ], { input: body, cwd: root, env, timeout: 60_000, maxBuffer: 1024 * 1024 }),
+      postComment,
+      ...(input.carry ? { carry: createRedTeamCarryIo({ env, readStatus, writeStatus, readEvidence,
+        readLive: ({ repo, pr }) => provider.readPrState(repo, pr), readComments,
+        lanePath: input.carry.lanePath,
+        skipPolicy: () => readRedTeamProbes({ env, log: line => process.stderr.write(`${line}\n`) }).value.skipCardOnly,
+        proveMove: move => proveCardOnlyHeadMove({ ...move,
+          exec: (file, args, options) => exec(file, args, { ...options, env: laneGitHardeningEnv(env) }) }),
+        applyLabel: ({ repo, pr }) => {
+          provider.ensureLabel(repo, 'red-team:clear', RED_TEAM_STATUS_LABEL_META['red-team:clear']);
+          provider.setLabels(repo, pr, { add: 'red-team:clear', remove: ['red-team:pending'] });
+        }, postResult: postComment,
+      }) } : {}),
       publishNeedsYou: isUnderTest(env) || isUnderTest(process.env) ? () => {} : item => publishAttention(item),
     } }),
     clearRedTeamQueued: ({ repo, pr, head }) => {
@@ -788,7 +805,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   const spec = seatsBox.speculative ?? null;
   // Card xyyuvyz — EVERY head the panel accepts, a `review:human` advisory accept included (`redTeamOwedFor`); once
   // per head is the pass's own `(pr, rev)` row + comment marker.
-  const accepted = Boolean(seatsBox.input) && !seatsBox.admissionFailed && (seatsBox.cardOnlyRecovery || redTeamOwedFor(seatsBox.input.loopPayload));
+  const accepted = Boolean(seatsBox.input) && !seatsBox.admissionFailed && redTeamOwedFor(seatsBox.input.loopPayload);
   // #4194 — THE ADDED NON-CLAUDE SEATS (advisory lenses + one extra juror on Codex/Gemini), beside Claude's
   // mandatory seats and strictly AFTER the arc is over: the verdict is labelled, `done` is reported, the lane is
   // released and the job slot dropped — so the seats never delay the pipeline and nothing they do can touch the
@@ -819,9 +836,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   }
   let redTeamCompletionDeferredByCap = false;
   if (accepted && (out.redTeamSpeculative?.result || typeof io.runRedTeam === 'function')) {
-    let redTeam = seatsBox.cardOnlyRecovery
-      ? { status: 'skipped', policy: 'card-only', reason: 'red team skipped: card-only' }
-      : out.redTeamSpeculative?.result ?? null;
+    let redTeam = out.redTeamSpeculative?.result ?? null;
     if (!redTeam) {
       try {
         redTeam = io.runRedTeam(seatsBox.input);
@@ -1033,7 +1048,7 @@ function runReviewArc({
     const finishArc = input => {
       seatsBox.laneHead = head;
       // Both modes persist and verify admission while the job claim still excludes another writer.
-      if (input && (seatsBox.cardOnlyRecovery || redTeamOwedFor(input.loopPayload)) && (seatsBox.speculative || typeof io.runRedTeam === 'function')) {
+      if (input && redTeamOwedFor(input.loopPayload) && (seatsBox.speculative || typeof io.runRedTeam === 'function')) {
         try {
           const queued = io.redTeamStatus({ ...input, status: 'queued',
             ...(seatsBox.speculative ? { speculativePid: seatsBox.speculative.pid } : {}) });
@@ -1052,6 +1067,11 @@ function runReviewArc({
       if (!['fresh', 'resume'].includes(redTeamMode)) throw Error('unknown red-team mode; inspect recovery settings before retrying');
       const stored = io.readRedTeamOnlyPayload({ pr: planned.pr, repo: planned.repo, head });
       let loopPayload = stored?.loopPayload;
+      if (stored?.carryConflict) {
+        classified = { outcome: 'red-team-not-owed', reason: 'later review supersedes the carry' };
+        return result({ ...classified, lanePath });
+      }
+      let cardOnlyRecovery = false;
       const movedCardOnly = redTeamMode === 'fresh' && stored?.head === head && cardOnlyHeadMoveCandidate(stored, head);
       const pendingCardOnly = redTeamMode === 'fresh' && stored?.head === head
         && (!redTeamOwedFor(loopPayload) || loopPayload?.carriedFrom != null)
@@ -1060,7 +1080,7 @@ function runReviewArc({
       // a model against the old read; this path only settles the card-only policy exemption.
       if (movedCardOnly
         && io.proveCardOnlyHeadMove?.({ fromSha: loopPayload.findings.read.netBasis.rev, toSha: head, lanePath })?.ok === true) {
-        seatsBox.cardOnlyRecovery = true;
+        cardOnlyRecovery = true;
         // This head was proved eligible for settlement, not read by the panel. Retain
         // the original review in its run/status and never copy its verdict onto this head.
         loopPayload = { ...loopPayload, carriedFrom: loopPayload.carriedFrom ?? loopPayload.findings.read.netBasis.rev,
@@ -1070,11 +1090,11 @@ function runReviewArc({
       // A prior carry may have persisted this head before its policy comment failed.
       // Non-accept payloads can retry that settlement, but must never reach a model.
       if (pendingCardOnly) {
-        seatsBox.cardOnlyRecovery = true;
-        if (loopPayload.carriedFrom != null) loopPayload = { ...loopPayload, verdict: null };
+        cardOnlyRecovery = true;
+        loopPayload = { ...loopPayload, carriedFrom: loopPayload.carriedFrom ?? head, verdict: null };
       }
       const pinned = stored?.head === head && loopPayload?.findings?.read?.netBasis?.rev === head;
-      if (!pinned || (!seatsBox.cardOnlyRecovery && (loopPayload?.carriedFrom != null || !redTeamOwedFor(loopPayload)))) {
+      if (!pinned || (!cardOnlyRecovery && (loopPayload?.carriedFrom != null || !redTeamOwedFor(loopPayload)))) {
         classified = { outcome: 'red-team-not-owed', reason: pinned ? 'stored review does not owe a red team' : 'stored review does not match live head' };
         return result({ ...classified, lanePath });
       }
@@ -1090,7 +1110,7 @@ function runReviewArc({
       } catch {
         return refuse('reviewed head could not be fetched into the lane; retry next tick');
       }
-      if (seatsBox.cardOnlyRecovery) {
+      if (cardOnlyRecovery) {
         // Historical provenance cannot authorize today's policy. Resolve after the
         // potentially slow proof/fetch, before admission writes or settlement.
         let skipCardOnly = false;
@@ -1099,6 +1119,13 @@ function runReviewArc({
           classified = { outcome: 'red-team-not-owed', reason: 'live card-only skip policy is disabled or unreadable' };
           return result({ ...classified, lanePath });
         }
+        // Carry publication owns its journal, compatibility status, label and comment while
+        // this job still holds the lane/claim. It never enters queued model admission.
+        const redTeam = { status: 'skipped', policy: 'card-only', reason: 'red team skipped: card-only' };
+        const settled = io.settleRedTeamSkip({ repo: planned.repo, pr: planned.pr, head, readHead: head,
+          redTeam, carry: { loopPayload, lanePath } });
+        classified = { outcome: 'red-team-only' };
+        return result({ ...classified, lanePath, redTeam: { ...redTeam, ...settled } });
       }
       classified = { outcome: 'red-team-only' };
       return finishArc({ pr: planned.pr, repo: planned.repo, lanePath, loopPayload, slug, redTeamMode });

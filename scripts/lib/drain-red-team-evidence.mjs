@@ -10,6 +10,7 @@ import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
 import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { readRedTeamProbes } from './red-team-gate.mjs';
 import { completedRedTeamSeat } from './red-team-run-result.mjs';
+import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 
 export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDir(env)), 'red-team-status');
 const statusPath = ({ repo, pr, head }, env) => join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
@@ -70,6 +71,27 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     status = JSON.parse(readFileSync(statusPath({ repo, pr, head }, env), 'utf8'));
     statusAt = statSync(statusPath({ repo, pr, head }, env)).mtimeMs;
   } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  const carry = readRedTeamCarry({ repo, pr, head, env });
+  const carriedFrom = carry?.loopPayload.carriedFrom ?? status?.loopPayload?.carriedFrom;
+  if (carriedFrom) {
+    const latest = latestRun(false).run;
+    const laterPanel = latest && latest.findings?.read?.netBasis?.rev !== carriedFrom;
+    const ownStatus = status === undefined || (status?.repo === repo && Number(status.pr) === Number(pr) && status.head === head
+      && (status.loopPayload?.carriedFrom === carriedFrom || (status.head === carriedFrom && status.skipCardOnly === true))
+      && status.status === 'finished'
+      && (status.result === 'skipped' || (status.result?.status === 'skipped' && status.result.policy === 'card-only')));
+    if (laterPanel || (carry && !ownStatus) || recorded) {
+      return { loopPayload: latest, status, carryConflict: true, inFlight: false,
+        recorded, ...seatEvidence, scheduled: false };
+    }
+    if (carry) {
+      // The journal survives a crash before the compatibility status exists. Never invent an accept.
+      const projected = { repo, pr, head, loopPayload: carry.loopPayload, status: 'finished',
+        result: { status: 'skipped', policy: 'card-only' }, skipCardOnly: true };
+      return { carry, status: projected, loopPayload: carry.loopPayload, inFlight: false,
+        recorded: false, ...seatEvidence, scheduled: false, skipCardOnly: true };
+    }
+  }
   if (status?.repo === repo && Number(status.pr) === Number(pr) && status.head === head) {
     // A finished status from an earlier review of this same head never supersedes a newer accepting run (a re-review
     // of an unchanged head labels its accept before its job writes `queued`).

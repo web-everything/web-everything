@@ -211,6 +211,15 @@ Carried settlement payloads retain `carriedFrom` (the original reviewed head) an
 their live `netBasis.rev` identifies settlement, not a panel read. The drain reader also strips
 any verdict on a marked carry before exposing it to scheduling consumers. Persisted comment-failure
 tests must prove that the payload cannot authorize a post-accept model pass and remains retryable.
+Carry publication uses a separate `(repo, pr, head, kind)` journal in `red-team-status/carry`:
+intent → clear label → result comment → done. The shared file lock serializes resumes; the
+journal is not a panel verdict or a queued model job. Each unfinished step checks live policy,
+head, holds and superseding review evidence, then its own observable postcondition before acting.
+Crash tests must cover each boundary, including a successful remote effect whose reply/journal
+write is lost. Recovery discovery must include an unfinished journal even when the result comment
+is already visible. A later real panel or changed head refuses recovery; it cannot inherit the
+carry's null verdict. A contended lock or unreadable evidence leaves the journal for the next
+recovery tick and reports an inspect/retry diagnostic; it never authorizes a model call.
 The moved-card cases in `review-red-team-on-skip.test.mjs`, `drain-red-team-evidence.test.mjs`
 and `review-job-red-team-only.test.mjs` pin selection, fail-closed proof and real comment settlement.
 Keep these files in the affected-test gate whenever the moved-card readers, proof or job wiring change:
