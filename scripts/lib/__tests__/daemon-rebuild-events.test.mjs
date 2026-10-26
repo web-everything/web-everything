@@ -10,13 +10,14 @@ import ts from 'typescript';
 vi.mock('../daemon-rebuild/prepare.mjs', () => ({ prepareRebuild: vi.fn() }));
 vi.mock('../daemon-rebuild/smoke.mjs', () => ({ smokeAndAdopt: vi.fn() }));
 
-import { FAILURE_REASONS, rebuildClone } from '../daemon-rebuild/rebuild.mjs';
+import * as rebuild from '../daemon-rebuild/rebuild.mjs';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 import { smokeAndAdopt } from '../daemon-rebuild/smoke.mjs';
 import { finalizeRebuild } from '../daemon-rebuild/adopt.mjs';
 import { writeRebuildState } from '../daemon-rebuild/state.mjs';
 
 const sha = 'b'.repeat(40);
+const { FAILURE_REASONS, rebuildClone } = rebuild;
 const prevHead = 'a'.repeat(40);
 let scratch;
 let options;
@@ -77,7 +78,8 @@ describe('rebuildClone coordination events', () => {
     expectEvent('rebuild-adopted', { sha });
   });
 
-  it.each(['quarantined', 'established-overlay-conflict', 'still-rejected'])(
+  it.each(['quarantined', 'established-overlay-conflict', 'still-rejected',
+    'error: build unavailable', 'established-overlay-conflict: lane/example'])(
     'emits rebuild-failed once for a prepare refusal: %s', async (reason) => {
       terminal({ moved: false, reason });
       expect(await rebuildClone(options)).toEqual({ moved: false, reason, alerts: [] });
@@ -85,6 +87,16 @@ describe('rebuildClone coordination events', () => {
       expectEvent('rebuild-failed', { reason });
     },
   );
+
+  it('emits exactly one failure event for every declared failure reason', async () => {
+    expect(rebuild.REBUILD_FAILURE_REASONS).toBeInstanceOf(Array);
+    for (const reason of rebuild.REBUILD_FAILURE_REASONS) {
+      options.emitEvent.mockClear();
+      terminal({ moved: false, reason });
+      await rebuildClone(options);
+      expectEvent('rebuild-failed', { reason });
+    }
+  });
 
   it.each(['smoke-threw', 'dispatch-smoke-failed', 'smoke-reused-env-failed'])(
     'emits rebuild-failed once for a smoke refusal: %s', async (reason) => {
@@ -109,6 +121,14 @@ describe('rebuildClone coordination events', () => {
     expect(options.emitEvent).not.toHaveBeenCalled();
   });
 
+  it.each(['xxx-pending', 'reader-priority', 'tick-in-progress', 'disabled', 'smoke-backoff', 'switch-busy'])(
+    'does not invent a failure for an unknown or waiting result: %s', async reason => {
+      terminal({ moved: false, reason });
+      await rebuildClone(options);
+      expect(options.emitEvent).not.toHaveBeenCalled();
+    },
+  );
+
   it.each(['already-adopted', 'recovered-adopted', 'ready-adopted', 'skipped-unrelated'])(
     'does not announce an adoption completed by an earlier tick: %s', async (reason) => {
       const result = { moved: false, adopted: true, reason, head: sha };
@@ -125,6 +145,12 @@ describe('rebuildClone coordination events', () => {
     },
   );
 
+  it.each([undefined, '', 'abc', 'z'.repeat(40)])('does not emit an adoption without a valid head: %j', async head => {
+    terminal({ moved: true, adopted: true, head });
+    await rebuildClone(options);
+    expect(options.emitEvent).not.toHaveBeenCalled();
+  });
+
   it.each([
     'tick-in-progress', 'reader-priority', 'concurrent-mover', 'smoke-backoff', 'held-after-rollback',
     'disabled', 'dirty', 'dirty-tree', 'local-commits', 'index-locked', 'switch-busy',
@@ -133,6 +159,37 @@ describe('rebuildClone coordination events', () => {
     terminal({ moved: false, reason });
     await rebuildClone(options);
     expect(options.emitEvent).not.toHaveBeenCalled();
+  });
+
+  it('inherits the isolated event sink when callers inject an env without an event path', async () => {
+    const path = join(scratch, 'ambient-events.jsonl');
+    vi.stubEnv('WE_DAEMON_EVENTS', path);
+    delete options.env.WE_DAEMON_EVENTS;
+    terminal({ moved: true, adopted: true, head: sha });
+    try {
+      await rebuildClone(options);
+      expect(options.emitEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: 'rebuild-adopted' }), {
+        env: expect.objectContaining({ WE_DAEMON_EVENTS: path }),
+      });
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('writes through the default emitter to the test sink with no caller event override', async () => {
+    const path = process.env.WE_DAEMON_EVENTS;
+    expect(path.startsWith(process.env.TMPDIR)).toBe(true);
+    delete options.env.WE_DAEMON_EVENTS;
+    delete options.emitEvent;
+    terminal({ moved: true, adopted: true, head: sha });
+    await rebuildClone(options);
+    const events = readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(events.at(-1)).toMatchObject({ kind: 'rebuild-adopted', detail: { sha } });
+  });
+
+  it('accepts a full SHA-256 adoption head', async () => {
+    const head = 'c'.repeat(64);
+    terminal({ moved: true, adopted: true, head });
+    await rebuildClone(options);
+    expectEvent('rebuild-adopted', { sha: head });
   });
 
   it('passes real already-adopted and recovered-adopted helper results through the wrapper without events', async () => {

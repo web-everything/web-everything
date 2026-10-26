@@ -43,6 +43,9 @@ export const FAILURE_REASONS = new Set([
   'worktree-add-failed', 'error',
 ]);
 
+// Array view for event-contract consumers, sharing the explicit failure classification.
+export const REBUILD_FAILURE_REASONS = Object.freeze([...FAILURE_REASONS]);
+
 /**
  * Rebuild `root` fresh from `origin/main` + its registered overlay list. See the file header (xa4qo7n) for the
  * full three-step design — {@link prepareRebuild} (locked, fast) → build + smoke a disposable candidate
@@ -60,16 +63,19 @@ export const FAILURE_REASONS = new Set([
 export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options } = {}) {
   const result = await rebuildCloneInternal(options);
   try {
+    const eventOptions = { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } };
     // adopted also describes a sibling's completed swap or crash recovery.
     // Only moved proves this invocation actually changed the running build.
     if (result.moved === true) {
-      await emitEvent({
-        kind: 'rebuild-adopted', daemon: basename(options.root), detail: { sha: result.head },
-      }, { env: options.env });
+      if (typeof result.head === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(result.head)) {
+        await emitEvent({
+          kind: 'rebuild-adopted', daemon: basename(options.root), detail: { sha: result.head },
+        }, eventOptions);
+      }
     } else if (typeof result.reason === 'string' && FAILURE_REASONS.has(result.reason.split(':', 1)[0])) {
       await emitEvent({
         kind: 'rebuild-failed', daemon: basename(options.root), detail: { reason: result.reason },
-      }, { env: options.env });
+      }, eventOptions);
     }
   } catch { /* Event failures must never change the rebuild outcome. */ }
   return result;
