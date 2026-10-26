@@ -2441,3 +2441,17 @@ omissions are reported as truncation. Clone paths must be absolute. The drain ta
 prototype-load settings, not the plist's data clone; tests inject those settings. Matrix and PR table cells strip
 Cc/Cf controls and are width-capped; table mode keeps the truncated-listing warning.
 
+
+### Red-team disposition precedence
+
+`red-team-disposition.test.mjs` pins all ranked pairs in both temporal and input
+orders, alongside shared-reader regressions for carry, repost, per-key blocks and
+legacy holds. Keep the oracle independent of `DISPOSITION_PRECEDENCE`.
+The pure resolver consumes validated live rulings; the thread adapter owns trust,
+head/result binding, carry eligibility and ceremony validity. Compatibility notes
+beside the table are deliberate: later indexed gate holds retire older releases,
+unindexed legacy holds do not. Operator blocks outrank clear-human regardless of
+recency; recency breaks ties only within a rank. Clear-human clears only keys
+the block does not name. A `NOT sent back` line is an ordinary hold even
+inside an operator-block record. Preserve these fixtures when changing liveness;
+rank alone cannot describe the historical wire protocol.
