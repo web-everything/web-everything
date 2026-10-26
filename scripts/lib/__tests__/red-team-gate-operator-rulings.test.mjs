@@ -35,6 +35,35 @@ const carried = bot([
   result.body.replace(H, N),
 ].join('\n'), '2026-10-21T21:00:00Z');
 
+describe('clear-human held-only compatibility', () => {
+  it.each([false, true])('a standing send-back survives a live clear-human ceremony (anyState=%s)', anyState => {
+    const repo = 'o/r';
+    const at = '2026-10-21T18:00:00Z';
+    const grant = human(buildRoundExtensionComment({ repo, pr: P, by: 1, actor: 'chalbert',
+      channel: 'chat', reason: 'one more round', at }), at);
+    const grants = gateRoundGrants([grant], P, repo).map(g => g.id);
+    expect(grants).toHaveLength(1);
+    const comments = [...live, grant,
+      bot(`${redTeamGateMarker(P, H, 'sent-back', rid, grants)}\n- 1 confirmed break(s) sent back to the fixer (#1).`, '2026-10-21T19:00:00Z'),
+      human(['✅ review — `review:human` cleared via the sanctioned path', '',
+        'Cleared by chalbert via `review-set-label.mjs --to=clear-human` (gate-self).', '',
+        buildReviewedShaMarker(H), buildClearedHumanMarker('chalbert')].join('\n'), '2026-10-21T20:00:00Z')];
+    const context = { comments, repo, pr: P, head: H, setting: CONFIRMED_BREAKS_DEFAULTS,
+      operatorRulings: { anyState } };
+    // With only the cap action, this very ceremony is live and clears its held break.
+    const capped = readRedTeamDisposition({ ...context, comments: [...live, comments.at(-1)] });
+    expect(capped.dispositions.get(1).state).toBe('cleared');
+    expect(held(capped)).toEqual([]);
+    const d = readRedTeamDisposition(context);
+    expect(d.outcome).toBe('sent-back');
+    expect(d.held).toEqual([]);
+    expect(d.sendBack.map(f => f.index)).toEqual([1]);
+    expect(redTeamEnqueueHold({ ...context, env: {} })).not.toBeNull();
+    expect(planRedTeamStatusLabels({ ...context, labels: ['red-team:clear'], env: {} }))
+      .toEqual({ add: 'red-team:blocked', remove: ['red-team:clear'] });
+  });
+});
+
 describe('operator-block held actions (shared reader)', () => {
   it.each([
     ['indexed send-back', '- 1 confirmed break(s) sent back to the fixer (#1).', rid, [1]],

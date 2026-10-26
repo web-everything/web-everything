@@ -124,7 +124,10 @@ export function rulableBreaks({ comments, labels, pr, head, setting, scope, ruli
   const disposition = readRedTeamDisposition({ comments, repo, pr, head, setting, standingRuling, operatorRulings: scope });
   const resolved = f => resolveDisposition(f.index, disposition.rulings.get(f.index) ?? []);
   const releasable = f => {
-    const evidence = disposition.rulings.get(f.index) ?? [];
+    // Any-state rulings may classify a ceremony-cleared finding. The ceremony
+    // clears a hold, but does not veto a proposed card/not-real; blocks still do.
+    const evidence = (disposition.rulings.get(f.index) ?? [])
+      .filter(r => !anyState || r.kind !== 'clear-human');
     const proposed = { kind: ruling, source: 'operator', keys: [f.index],
       at: evidence.reduce((latest, r) => Math.max(latest, r.at), -1) + 1 };
     return resolveDisposition(f.index, [...evidence, proposed]).by === proposed;

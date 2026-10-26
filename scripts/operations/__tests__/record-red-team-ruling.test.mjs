@@ -17,6 +17,7 @@ import { applyRedTeamGate } from '../red-team-gate-apply.mjs';
 import { parseAdvisories, trustedAdvisoryComments } from '../../lib/advisory-labels.mjs';
 import { parseLandPreventionCardArgv, runLandPreventionCardCli } from '../land-prevention-card.mjs';
 import { parseFilingItems, planDedupe } from '../../lib/card-dedupe.mjs';
+import { buildReviewedShaMarker, buildClearedHumanMarker } from '../../lib/review-escalation.mjs';
 
 const ledgerIO = (rows = []) => ({
   readEvents: async () => ({ status: 'ok', rows: [...rows] }),
@@ -40,6 +41,43 @@ const CARD = 'we:backlog/x.md';
 const card = { requested: CARD, ref: CARD, readable: true, reason: 'readable' };
 const read = (over = {}) => ({ identity: OP, card, head: HEAD, labels: [{ name: 'review:human' }], comments: thread(), setting: CONFIRMED_BREAKS_DEFAULTS, now: '2026-10-20T20:55:00-04:00', ...over });
 const input = (over = {}) => ({ repo, pr: PR, card: CARD, break: '1', ruling: 'card', actor: 'chalbert', channel: 'claude-code-chat', reason: 'card it, ship the PR', ...over });
+
+describe('any-state rulings after clear-human', () => {
+  it.each(['card', 'not-real'])('plans and records %s for a ceremony-cleared finding', async ruling => {
+    const comments = thread([{ author: OP, createdAt: '2026-10-20T23:50:00Z', body: [
+      '✅ review — `review:human` cleared via the sanctioned path', '',
+      'Cleared by chalbert via `review-set-label.mjs --to=clear-human` (gate-self).', '',
+      buildReviewedShaMarker(HEAD), buildClearedHumanMarker('chalbert'),
+    ].join('\n') }]);
+    const scope = { value: { anyState: true } };
+    const context = { comments, repo, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: scope.value };
+    expect(readRedTeamDisposition(context).dispositions.get(1).state).toBe('cleared');
+    const request = input({ ruling, ...(ruling === 'not-real' ? { card: undefined, cause: 'other' } : {}) });
+    const snapshot = () => read({ comments, scope, card: ruling === 'card' ? card : undefined });
+    // Default cap-only eligibility still requires a live hold.
+    expect(() => planRedTeamRuling({ ...snapshot(), scope: { value: { anyState: false } } }, request))
+      .toThrow(/no red-team break is held/);
+    if (ruling === 'card') {
+      expect(planRedTeamRuling({ ...snapshot(), card: undefined }, { ...request, card: undefined }))
+        .toMatchObject({ indices: [1], cardInput: expect.any(Object) });
+    }
+    const plan = planRedTeamRuling(snapshot(), request);
+    expect(plan.indices).toEqual([1]);
+    const rows = [];
+    const sinks = createRecordRedTeamRulingSinks({
+      readThread: () => ({ headRefOid: HEAD, labels: [], comments: [...comments] }),
+      readScope: () => scope, readStandingRulingScope: () => null, resolveIdentity: () => OP,
+      resolveCard: ref => ({ ref, readable: true }),
+      post: (_repo, _pr, body) => comments.push({ author: OP, createdAt: '2026-10-21T00:00:00Z', body }),
+      ...ledgerIO(rows), syncLabels: () => null,
+    });
+    await sinks[plan.effect](plan);
+    expect(readRedTeamDisposition(context).dispositions.get(1).state)
+      .toBe(ruling === 'card' ? 'released carded' : 'released not-real');
+    if (ruling === 'not-real') expect(rows).toHaveLength(1);
+    expect(() => planRedTeamRuling(snapshot(), request)).toThrow(/no confirmed red-team break/);
+  });
+});
 
 describe('cap-only existing-card declaration', () => {
   it.each([

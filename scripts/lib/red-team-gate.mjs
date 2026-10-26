@@ -695,9 +695,10 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
     // fallback evidence. Operator blocks remain live across ordinary gate holds.
     const evidence = rulings.filter(r => r.kind === 'block' || r.at > (ordinaryHolds.get(f.index) ?? -1));
     // operatorRuled validates the ceremony, carry chain, cap handover and later
-    // accept/hold invalidations. Only a still-live ceremony enters precedence.
+    // accept/hold invalidations. A ceremony clears only held actions; a standing
+    // send-back still belongs to the fixer even when the ceremony is live.
     const clearance = operatorRuled(records, pr, live, f.index);
-    if (clearance) evidence.push({
+    if (clearance && action === 'held') evidence.push({
       kind: 'clear-human', source: 'operator', keys: [f.index], at: clearance.at,
     });
     const disposition = resolveDisposition(f.index, evidence);
