@@ -14,7 +14,7 @@ import { cascadePolicy } from './policy-cascade.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun } from './red-team-run-result.mjs';
 
 import { redTeamRequired } from './jury-core.mjs';
-import { latestAcceptRecord } from './accept-carry-forward.mjs';
+import { latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { RED_TEAM_STATUS_LABELS } from './red-team-status-label-meta.mjs';
 
@@ -98,6 +98,11 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
     const head = rawPr?.headRefOid ?? null;
     const row = { prNumber: pr, head, action: 'skip' };
     const skip = why => ({ ...row, why });
+    const dispatchDecision = decision => {
+      const last = lastDispatch.get(`${repo}#${pr}@${head}`);
+      if (last != null && now - last < setting.retryCooldownMin * 60_000) return skip('retry cooldown active');
+      return { ...row, ...decision };
+    };
     try {
       if (!setting.enabled) return skip('reviewRedTeamOnSkip.enabled=false');
       if (!isRealHead(head) || (refusal.headSha != null && refusal.headSha !== head)) return skip('live head missing or changed');
@@ -140,6 +145,24 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const movedCardOnly = cardOnlyHeadMoveCandidate(evidence, head)
         && proveMove({ fromSha: evidence.loopPayload.findings.read.netBasis.rev, toSha: head })?.ok === true;
       const owed = redTeamOwedFor(evidence?.loopPayload);
+      // A missing live-head review requires the full loop; stale reads cannot authorize a red-team-only pass.
+      const storedHead = evidence?.loopPayload?.findings?.read?.netBasis?.rev;
+      const needsReview = !movedCardOnly && accepted
+        && (evidence?.loopPayload == null || (isRealHead(storedHead) && storedHead !== head))
+        && evidence?.inFlight === false && !evidence.queued
+        && evidence.recorded === false && evidence.seatRecorded === false
+        && evidence.completedRecorded !== true && evidence.cleanRecorded !== true
+        && (evidence.status == null || (isRealHead(evidence.status.head) && evidence.status.head !== head))
+        && readStatus({ repo, pr, head }) == null;
+      if (needsReview) {
+        const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance });
+        if (refusal) return skip(refusal);
+        // Formal holds apply even without an acceptance comment. No timestamp
+        // floor: a missing acceptance cannot establish that a review was cleared.
+        if (reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
+        if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
+        return dispatchDecision({ action: 'review', why: 'unprovable head move needs a full review' });
+      }
       if (!movedCardOnly && (!owed || accepted)) {
         if (evidence?.inFlight || evidence?.queued) return skip('red-team pass in flight');
         if (evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
@@ -184,9 +207,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         || (evidence.seatRecorded === undefined && evidence.recorded === false))) mode = 'fresh';
       else if (status == null && evidence.recorded === false) mode = 'fresh';
       else return skip(`prior result ${typeof prior === 'string' ? prior : 'unknown'} (status ${status?.status ?? 'missing'}); not re-run`);
-      const last = lastDispatch.get(`${repo}#${pr}@${head}`);
-      if (last != null && now - last < setting.retryCooldownMin * 60_000) return skip('retry cooldown active');
-      return { ...row, action: 'dispatch', mode, why: mode === 'resume' ? 'recorded pass needs its result comment/effects' : 'head never had a red-team pass' };
+      return dispatchDecision({ action: 'dispatch', mode, why: mode === 'resume' ? 'recorded pass needs its result comment/effects' : 'head never had a red-team pass' });
     } catch { return skip('red-team evidence unreadable; inspect stored evidence before retrying'); }
   });
 }
@@ -270,16 +291,17 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           }
         }
       }
-      if (row.action === 'dispatch') {
+      if (row.action === 'dispatch' || row.action === 'review') {
         const budget = capacity?.budget;
         if (!(capacity?.lanes > 0) || (budget && !(budget.left > 0))
           || (capacity.remainingStarts != null && !(capacity.remainingStarts > 0))) row.why = 'no review capacity left';
-        else if (dryRun) row.why = `dry run (${row.mode})`;
+        else if (dryRun) row.why = `dry run (${row.mode ?? row.action})`;
         else {
           const reserved = budget && Number.isFinite(budget.left);
           if (reserved) budget.left--;
           try {
-            const result = dispatch({ pr: row.prNumber, repo, redTeamOnly: true, redTeamMode: row.mode,
+            const result = dispatch({ pr: row.prNumber, repo,
+              ...(row.action === 'dispatch' ? { redTeamOnly: true, redTeamMode: row.mode } : {}),
               ...(preferLane != null ? { preferLane } : {}) });
             if (result?.skipped || !Number.isInteger(result?.jobPid)) {
               const refundable = result?.skipped !== 'live-job'
@@ -291,7 +313,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
               if (capacity.remainingStarts != null) capacity.remainingStarts--;
               capacity.take?.();
               history.set(`${repo}#${row.prNumber}@${row.head}`, at);
-              dispatched.push({ prNumber: row.prNumber, jobPid: result.jobPid, mode: row.mode });
+              dispatched.push({ prNumber: row.prNumber, jobPid: result.jobPid, mode: row.mode ?? row.action });
               started = true;
             }
           } catch {
@@ -304,7 +326,9 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         }
         if (!started) { row.action = 'skip'; notStarted.push({ prNumber: row.prNumber, reason: row.why }); }
       }
-      note(`review-daemon: ${repo}#${row.prNumber} already-reviewed-head — red team ${started ? `dispatched (${row.mode})` : ['clear', 'carry'].includes(row.action) && !dryRun ? 'cleared' : 'not dispatched'} for head ${String(row.head ?? 'unknown').slice(0, 12)}: ${row.why}`);
+      if (started && row.action === 'review') {
+        note(`review-daemon: ${repo}#${row.prNumber} already-reviewed-head — fresh review dispatched for unprovable head move ${String(row.head).slice(0, 12)}`);
+      } else note(`review-daemon: ${repo}#${row.prNumber} already-reviewed-head — red team ${started ? `dispatched (${row.mode})` : ['clear', 'carry'].includes(row.action) && !dryRun ? 'cleared' : 'not dispatched'} for head ${String(row.head ?? 'unknown').slice(0, 12)}: ${row.why}`);
     }
   } catch {
     rows.push({ prNumber: null, head: null, action: 'skip', why: 'red-team recovery inputs unreadable' });

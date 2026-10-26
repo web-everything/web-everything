@@ -339,6 +339,17 @@ Recovery defaults to a 30-minute retry cooldown through
 `reviewRedTeamOnSkip` (tool: `scripts/settings/review-red-team-on-skip.json`; environment:
 `WE_REVIEW_RED_TEAM_ON_SKIP`, `WE_REVIEW_RED_TEAM_ON_SKIP_RETRY_COOLDOWN_MIN`). Focused cases
 live in `review-red-team-on-skip.test.mjs` and `review-job-red-team-only.test.mjs`.
+An accepted head move with no trusted carry and no stored review at the live head recovers through
+an ordinary full review, provided live-head status/seat evidence is explicitly absent and the shared
+hold guard permits it. It shares recovery's per-head cooldown and dispatch capacity; it publishes
+no policy-clear. Unknown evidence stays skipped for operator inspection. The **unprovable accepted
+head move — fresh full review** replay covers the planner and effects boundary; **plain recovery
+dispatch spawns an ordinary job and runs its full loop plus red team** proves accepted labels do not
+require a dispatcher bypass option.
+Full-review recovery requires readable formal reviews independently of acceptance comments.
+It applies `laterReviewHold` without a timestamp floor; an unreadable channel or formal
+hold stays skipped for operator inspection. The same replay pins both refusals with
+empty comments and absent live-head evidence, and allows a readable empty review list.
 Red-team-only admission strictly persists `queued` and reads back that status with the current
 process's pid before releasing the job slot. A write/read failure or mismatch refuses with
 `red-team-not-owed` and `queued red-team status could not be persisted`, without running the

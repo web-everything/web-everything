@@ -474,10 +474,10 @@ describe('daemon rows without formal reviews', () => {
       return kind === 'malformed' ? {} : [{ state: 'CHANGES_REQUESTED', submittedAt: '2026-10-24T14:00:00Z', author: { login: 'reviewer' } }];
     });
     runGhSync.mockClear();
-    // A standing formal hold invalidates the source acceptance before the
-    // publication guard; an unreadable channel reaches the guard and stays closed.
+    // Neither policy carry nor fresh-review recovery may cross a standing formal hold
+    // or an unreadable formal-review channel.
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: kind === 'changes-requested'
-      ? 'stored review does not owe a red team' : 'PR reviews unreadable; inspect formal reviews before policy-clear' });
+      ? 'later verdict or hold supersedes acceptance' : 'PR reviews unreadable; inspect formal reviews before policy-clear' });
     expect(runGhSync).not.toHaveBeenCalled();
     expect(o.syncLabels).not.toHaveBeenCalled();
     expect(o.dispatch).not.toHaveBeenCalled();
@@ -1011,5 +1011,110 @@ describe('R100 recovery regressions', () => {
   it('ran with completed seat retains effects-only resume instead of fresh retry or clear', () => {
     expect(decide({ readEvidence: () => ({ loopPayload: payload(), recorded: true, completedRecorded: true, failedSeatCount: 1 }),
       readStatus: () => ({ status: 'finished', result: 'ran' }) })).toMatchObject({ action: 'dispatch', mode: 'resume' });
+  });
+});
+
+
+describe('unprovable accepted head move — fresh full review', () => {
+  const old = 'b'.repeat(40);
+  function moved(over = {}) {
+    const loopPayload = payload();
+    loopPayload.findings.read.netBasis.rev = old;
+    return runFixture({
+      rawPrs: [{ number: pr, headRefOid: head, labels: ['review:accepted'], reviews: [], comments: [
+        { body: `✅ review — accepted\n<!-- reviewed-sha: ${old} -->`, author: { login: 'web-everything' } },
+        { body: `${redTeamMarker(pr, old)}\nRed team not required on this head: card-only diff`, author: { login: 'web-everything' } },
+      ] }],
+      // Old review/red-team file survives a merge commit with no trusted re-stamp.
+      readEvidence: () => ({ loopPayload, inFlight: false, queued: false, recorded: false, seatRecorded: false }),
+      proveMove: vi.fn(() => ({ ok: false, reason: 'merge commit' })),
+      log: vi.fn(), settle: vi.fn(), ...over,
+    });
+  }
+  it.each(['old', 'absent', 'no-prior-clear'])('dispatches one full review with %s payload, then observes per-head cooldown', kind => {
+    const o = moved();
+    if (kind === 'no-prior-clear') o.rawPrs[0].comments.pop();
+    if (kind === 'absent') o.readEvidence = () => ({ inFlight: false, recorded: false, seatRecorded: false });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review', head });
+    expect(o.dispatch).toHaveBeenCalledTimes(1); expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+    expect(o.settle).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled();
+    expect(o.log).toHaveBeenCalledWith(`review-daemon: ${repo}#${pr} already-reviewed-head — fresh review dispatched for unprovable head move ${head.slice(0, 12)}`);
+    o.capacity = { lanes: 1, budget: { left: 1 } };
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'retry cooldown active' });
+    expect(o.dispatch).toHaveBeenCalledTimes(1);
+  });
+  it('refuses a standing formal CHANGES_REQUESTED without an acceptance comment or live-head evidence', () => {
+    const o = moved({ readEvidence: () => ({ inFlight: false, recorded: false, seatRecorded: false }) });
+    o.rawPrs[0].comments = [];
+    o.rawPrs[0].reviews = [{ state: 'CHANGES_REQUESTED', submittedAt: '2026-10-01T00:00:00Z',
+      author: { login: 'reviewer' } }];
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
+      why: 'formal review hold prevents full review; inspect formal reviews' });
+    expect(o.dispatch).not.toHaveBeenCalled();
+    expect(o.lastDispatch.size).toBe(0);
+  });
+  it.each([undefined, null, {}])('refuses unreadable formal reviews %j without an acceptance comment or live-head evidence', reviews => {
+    const o = moved({ readEvidence: () => ({ inFlight: false, recorded: false, seatRecorded: false }) });
+    o.rawPrs[0].comments = [];
+    o.rawPrs[0].reviews = reviews;
+    o.readReviews = vi.fn(() => reviews);
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
+      why: 'PR reviews unreadable; inspect formal reviews before full review' });
+    expect(o.readReviews).toHaveBeenCalledWith({ repo, pr });
+    expect(o.dispatch).not.toHaveBeenCalled();
+    expect(o.lastDispatch.size).toBe(0);
+  });
+  it('allows readable empty formal reviews without an acceptance comment or live-head evidence', () => {
+    const o = moved({ readEvidence: () => ({ inFlight: false, recorded: false, seatRecorded: false }) });
+    o.rawPrs[0].comments = [];
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review', head });
+    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+  });
+  it.each(['review:human', 'review:held-mechanical', 'review-status:reviewing', 'red-team:blocked', 'red-team:pending'])(
+    'does not re-review a held PR with %s', label => {
+      const o = moved(); o.rawPrs[0].labels.push(label);
+      expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+      expect(o.dispatch).not.toHaveBeenCalled();
+    });
+  it.each(['inFlight', 'queued', 'recorded', 'seatRecorded', 'completedRecorded', 'status', 'unknown'])(
+    'fails closed with live-head %s evidence', kind => {
+      const o = moved(), evidence = o.readEvidence();
+      if (kind === 'status') o.readStatus = () => ({ head, status: 'finished', result: 'error' });
+      else if (kind === 'unknown') o.readEvidence = () => null;
+      else o.readEvidence = () => ({ ...evidence, [kind]: true });
+      expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+      expect(o.dispatch).not.toHaveBeenCalled();
+    });
+  it.each([{ lanes: 0 }, { lanes: 1, budget: { left: 0 } }, { lanes: 1, remainingStarts: 0 }])(
+    'shares dispatch capacity checks %j', capacity => {
+      const o = moved({ capacity });
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'no review capacity left' });
+      expect(o.dispatch).not.toHaveBeenCalled(); expect(o.lastDispatch.size).toBe(0);
+    });
+  it('dry run spends no capacity, cooldown, or publication effects', () => {
+    const o = moved({ dryRun: true });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'dry run (review)' });
+    expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 } });
+    expect(o.lastDispatch.size).toBe(0); expect(o.dispatch).not.toHaveBeenCalled();
+    expect(o.settle).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+  it.each(['result', 'invalid-head', 'unaccepted', 'unknown-stored-head', 'unreadable-status'])(
+    'does not start a full review with %s', kind => {
+      const o = moved();
+      if (kind === 'result') o.rawPrs[0].comments.push({ body: `${redTeamMarker(pr, head)}\nRed team not required on this head: card-only diff`, author: { login: 'web-everything' } });
+      if (kind === 'invalid-head') o.rawPrs[0].headRefOid = 'unknown';
+      if (kind === 'unaccepted') o.rawPrs[0].labels = [];
+      if (kind === 'unknown-stored-head') {
+        const evidence = o.readEvidence(); delete evidence.loopPayload.findings.read.netBasis.rev;
+        o.readEvidence = () => evidence;
+      }
+      if (kind === 'unreadable-status') o.readStatus = () => { throw Error('unreadable'); };
+      expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+      expect(o.dispatch).not.toHaveBeenCalled();
+    });
+  it('keeps the red-team-only dispatch for an owed stored payload at the live head', () => {
+    const o = moved({ readEvidence: () => ({ loopPayload: payload(), inFlight: false, recorded: false, seatRecorded: false }) });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'dispatch', mode: 'fresh' });
+    expect(o.dispatch).toHaveBeenCalledTimes(1); expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: 'fresh' });
   });
 });
