@@ -717,6 +717,17 @@ unlocked fallback on timeout. A refused scorecard write is reported on stderr wi
 successful build. Operation records use UUID filenames and atomic rename; call logs use append-only
 writes, so they do not replace a sibling process's records.
 
+## Antigravity quota hold evidence
+
+Exercise holds with an injected temporary `dir` in
+`scripts/lib/__tests__/antigravity-run-evidence.test.mjs`. Explicit Claude and Gemini
+requests read their own backend folders; default or unrecognized models scan
+`anthropic`, `google`, and `unknown`. Legacy root JSON holds use the known served
+model's backend, falling back to the requested model's backend; unattributed legacy
+holds apply globally. Reads leave legacy files untouched. A skipped run retains
+`servedModel: 'unknown'` and `modelEvidence: 'not-launched'`; `heldBackend` and
+`heldModel` identify the observation responsible for the refusal.
+
 ## Shadow reviewer agreement evidence
 
 The agy mandatory-seat shadows are off by default (operator 2026-10-16).
