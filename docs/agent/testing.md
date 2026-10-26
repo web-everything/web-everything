@@ -34,6 +34,11 @@ missing or unreadable evidence retains the old registration and pending file and
 A mechanism-pinned original is never set aside as stack-contained, so the plan still lists it as lost
 beside its applied repair. `prepareRebuild` does not hold for a lost overlay whose current tip the
 build contains (git ancestry; an unreadable answer still holds), so the repair can be adopted and cleaned up.
+In tops mode, deferring a pinned base behind its containing overlays requires proof that its exact
+registered tip is already in the running HEAD and in each containing overlay's tip. Missing HEAD,
+non-containment or unreadable ancestry preserves ordinary pin handling. The stack-tops regressions
+cover those closed paths. Registered auto-rebase repairs do not trigger deferral; the mechanism-pinned
+auto-rebase cases preserve the original's conflict/loss decision, repair adoption and loss protection.
 Per-ref JSON sidecars next to the overlay
 list survive ticks; per-ref markers expire after 30 minutes without a heartbeat. Live detached
 workers touch their own token's marker every minute with an unrefed interval, cleared in `finally`.
