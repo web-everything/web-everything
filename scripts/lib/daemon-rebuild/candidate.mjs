@@ -5,11 +5,11 @@
 import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { join, dirname, basename, isAbsolute, resolve as resolvePath } from 'node:path';
-import { stateDir } from './state.mjs';
+import { readRebuildState, stateDir } from './state.mjs';
 import { cloneKey } from '../daemon-overlays.mjs';
 import { makeGit } from './shared.mjs';
 import { rmSync, mkdirSync, existsSync, symlinkSync, readFileSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { defaultPoolRoot, workspaceFor } from '../lane-pool-paths.mjs';
 import { scrubGitRepoEnv } from '../lane-git-hardening.mjs';
 
@@ -99,8 +99,9 @@ function defaultPidAlive(pid) {
 /**
  * Reclaim THIS clone's own stale candidate worktrees: registered under `<stateDir>/<cloneKey>.candidate-<pid>-<hex>`,
  * git-locked (a killed `worktree add` leaves the lock "initializing"), and whose owner pid (from the name) is
- * provably dead. Unlock + `worktree remove --force` on that exact path + prune. Fail closed: another clone's
- * prefix, an unlocked tree, an unparseable name, a live or unknown owner, a failed listing or unlock — untouched.
+ * provably dead, with a matching lease record naming this host. Unlock + `worktree remove --force` on that
+ * exact path + prune. Fail closed: missing or foreign-host lease evidence, another clone's prefix, an unlocked
+ * tree, an unparseable name, a live or unknown owner, a failed listing or unlock — untouched.
  * (The owner's start time is not recorded in the name or lock, so a reused pid reads as alive: safe side.)
  * @returns {{reclaimed:string[], skipped:{path:string, why:string}[]}}
  */
@@ -109,7 +110,8 @@ export function reclaimStaleCandidates({ root, run, env, pidAlive = defaultPidAl
   const git = makeGit({ run, cwd: root, env, timeoutMs: 60_000 });
   const list = git(['worktree', 'list', '--porcelain']);
   if (list.status !== 0) return { reclaimed, skipped };
-  const dir = stateDir(env);
+  const dir = resolvePath(stateDir(env));
+  const building = readRebuildState(root, env).building;
   const namePrefix = `${cloneKey(root)}.candidate-`;
   for (const block of String(list.stdout || '').split(/\n\n+/)) {
     const lines = block.split('\n');
@@ -118,6 +120,9 @@ export function reclaimStaleCandidates({ root, run, env, pidAlive = defaultPidAl
     if (!lines.some((l) => l === 'locked' || l.startsWith('locked '))) continue;
     const pid = Number(/^(\d+)-[0-9a-f]+$/.exec(basename(path).slice(namePrefix.length))?.[1]);
     if (!Number.isInteger(pid) || pid <= 0) { skipped.push({ path, why: 'owner-unknown' }); continue; }
+    if (building?.host !== hostname() || building.path !== path || building.pid !== pid) {
+      skipped.push({ path, why: 'lease-owner-unknown-or-foreign' }); continue;
+    }
     if (pidAlive(pid) !== false) { skipped.push({ path, why: 'owner-alive-or-unknown' }); continue; }
     const unlock = git(['worktree', 'unlock', path]);
     if (unlock.status !== 0) { skipped.push({ path, why: `unlock-failed: ${String(unlock.stderr || '').trim().split('\n')[0]}` }); continue; }
