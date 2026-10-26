@@ -3052,12 +3052,12 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     rmSync(`${ledgerDir}-locks`, { recursive: true, force: true });
   });
   // The caller read `accepted`; by the child's own read a reviewer has flipped it to `changes`.
-  function run(argv, labels, { comments = [], omitComments = false, readComments = () => comments, headRefOid = 'a'.repeat(40), freshState = {}, swapState = freshState, postSwapState = null } = {}) {
+  function run(argv, labels, { comments = [], omitComments = false, readComments = () => comments, headRefOid = 'a'.repeat(40), secondHead = headRefOid, freshState = {}, swapState = freshState, postSwapState = null } = {}) {
     const calls = [];
     const initial = { labels: labels.map((name) => ({ name })), headRefOid, headRefName: 'lane/x', state: 'OPEN', isDraft: false, body: '',
       ...(omitComments ? {} : { comments }) };
-    const readPrState = vi.fn().mockReturnValueOnce(initial).mockReturnValueOnce({ ...initial, ...freshState })
-      .mockReturnValue({ ...initial, ...swapState });
+    const readPrState = vi.fn().mockReturnValueOnce(initial).mockReturnValueOnce({ ...initial, headRefOid: secondHead, ...freshState })
+      .mockReturnValue({ ...initial, headRefOid: secondHead, ...swapState });
     const provider = {
       name: 'stub',
       currentRepo: () => 'o/n',
@@ -3096,6 +3096,19 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
     const { exitCode, calls } = run(['9', '--repo=o/n', '--only-if=accepted'], [REVIEW_LABELS.accepted]);
     expect(exitCode).toBe(0);
     expect(calls).toContain('setLabels');
+  });
+
+  it('pinned plain rearm refuses a head change between the swap head check and clearance reread without setting labels', () => {
+    const expectedHead = 'a'.repeat(40);
+    const result = run(['9', '--repo=o/n', `--expect-head=${expectedHead}`], [REVIEW_LABELS.changes], {
+      headRefOid: expectedHead,
+      secondHead: expectedHead,
+      swapState: { headRefOid: 'b'.repeat(40) },
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.payload.error).toContain('live head differs from --expect-head');
+    expect(result.readPrState).toHaveBeenCalledTimes(3);
+    expect(result.calls).not.toContain('setLabels');
   });
 
   it('without the flag a live review:changes is still re-armed (fix-agent path)', () => {
@@ -3487,6 +3500,34 @@ describe('runReviewLabelCli — --only-if=accepted interleaving (#4333)', () => 
       expect(result.ledgerWrites).toEqual([]);
       expect(result.payload.reason).toBe('head carries a human clearance — a rearm never undoes it');
     }
+  });
+
+  it('plain rearm with a matching --expect-head succeeds', () => {
+    const { exitCode, calls } = run(['9', '--repo=o/n', `--expect-head=${'a'.repeat(40)}`], [REVIEW_LABELS.changes]);
+    expect(exitCode).toBe(0);
+    expect(calls).toEqual(['postComment', 'setLabels']);
+  });
+
+  it('plain rearm refuses a different live head before any write', () => {
+    const { exitCode, calls, payload } = run(['9', '--repo=o/n', `--expect-head=${'b'.repeat(40)}`], [REVIEW_LABELS.changes]);
+    expect(exitCode).toBe(1);
+    expect(payload.error).toContain('live head differs from --expect-head');
+    expect(calls).toEqual([]);
+  });
+
+  it.each(['b'.repeat(40), null])('plain rearm refuses a changed or missing second head before the label write: %s', secondHead => {
+    const { exitCode, calls, payload } = run(['9', '--repo=o/n', `--expect-head=${'a'.repeat(40)}`],
+      [REVIEW_LABELS.changes], { secondHead });
+    expect(exitCode).toBe(1);
+    expect(payload.error).toContain('live head differs from --expect-head');
+    expect(calls).toEqual(['postComment']);
+  });
+
+  it.each(['', 'abcdef0', 'z'.repeat(40), 'a'.repeat(41)])('plain rearm refuses non-40-hex --expect-head=%s', head => {
+    const { exitCode, calls, payload } = run(['9', '--repo=o/n', `--expect-head=${head}`], [REVIEW_LABELS.changes]);
+    expect(exitCode).not.toBe(0);
+    expect(payload.error).toContain('full 40-hex SHA');
+    expect(calls).toEqual([]);
   });
 
   it('only-if fails closed on any value other than accepted, before any write', () => {

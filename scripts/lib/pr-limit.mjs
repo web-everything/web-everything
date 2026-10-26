@@ -17,6 +17,8 @@
  * now" — so the override that lifts it must be visible to every lane/session on this machine at once, the
  * same reason `~/.claude/github-app-token` and other machine-wide operator state live under `~/.claude`.
  */
+import { resolveLimitStatePath } from './pr-limit-state-path.mjs';
+export { resolveLimitStatePath } from './pr-limit-state-path.mjs';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -741,12 +743,6 @@ export function readOwnBranches(cwd, { run = gitRun } = {}) {
 function realpathSafe(p) { try { return realpathSync(p); } catch { return resolve(String(p || '.')); } }
 
 // ── THIN FS SHELL (the boundary) ────────────────────────────────────────────────────────────────────────
-
-/** The canonical store path: `WE_PR_LIMIT_STATE_FILE` override wins, else `~/.claude/conveyor/pr-limit.json`. */
-export function resolveLimitStatePath(env = process.env, home = homedir()) {
-  const override = env?.WE_PR_LIMIT_STATE_FILE;
-  return override && String(override).trim() ? String(override).trim() : join(home, '.claude', 'conveyor', 'pr-limit.json');
-}
 
 /** Read + parse the store. FAILS OPEN: a missing/corrupt file reads as {@link emptyLimitState}
  *  (enforcement stays on) — never throws. */

@@ -1144,8 +1144,10 @@ export function runReviewLabelCli({
   if (onlyIf !== null && !['accepted', 'missing'].includes(onlyIf)) {
     fail("invalid --only-if — expected 'accepted' or 'missing'");
   }
-  if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, missing re-arm or a pinned accept');
+  const pinnedRearm = to === 'rearm' && expectHeadFlag !== undefined;
+  if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && !pinnedRearm && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, re-arm or a pinned accept');
   if (onlyIf === 'missing' && (!/^[0-9a-f]{40}$/.test(expectedHead || '') || newHeadArg)) fail('missing re-arm requires --expect-head=<full 40-hex SHA>');
+  if (pinnedRearm && !/^[0-9a-f]{40}$/.test(expectedHead || '')) fail('re-arm requires --expect-head=<full 40-hex SHA>');
   if (onlyIf !== null && to !== 'rearm') {
     fail('--only-if is only valid with the rearm target');
   }
@@ -1323,7 +1325,7 @@ export function runReviewLabelCli({
   if (to === 'rearm' && !prCommentsReadable) refuseRearm('comments unreadable — cannot prove no human clearance');
   if (to === 'rearm' && !/^[0-9a-f]{7,40}$/i.test(headSha.trim())) refuseRearm('head unreadable — cannot prove no human clearance');
 
-  if ((guardedRestamp || pinnedAccept || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
+  if ((guardedRestamp || pinnedAccept || pinnedRearm || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
   if (expectNoReadiness && hasReviewLabel(currentLabels, READY_TO_MERGE_LABEL)) {
     fail('missing review handoff refused: producer readiness appeared after the caller observation', 1);
   }
@@ -1838,6 +1840,7 @@ export function runReviewLabelCli({
     try { fresh = provider.readPrState(repo, pr); } catch (e) { fail(ghErr(e, 'gh pr view failed'), 1); }
     if (!Array.isArray(fresh.comments)) refuseRearm('comments unreadable — cannot prove no human clearance');
     if (typeof fresh.headRefOid !== 'string' || !/^[0-9a-f]{7,40}$/i.test(fresh.headRefOid.trim())) refuseRearm('head unreadable — cannot prove no human clearance');
+    if (pinnedRearm && onlyIf !== 'missing' && fresh.headRefOid.trim() !== expectedHead) fail('live head differs from --expect-head', 1);
     const freshComments = fullThread(fresh.comments, fresh.headRefOid).filter(isTrustedMarkerAuthor);
     if (headEverHumanCleared(freshComments, fresh.headRefOid.trim())) refuseRearm('head carries a human clearance — a rearm never undoes it');
     return { fresh, freshComments };
@@ -1930,6 +1933,11 @@ export function runReviewLabelCli({
   // `gh pr edit --remove-label` is never handed an absent label (which errors).
   const applySwap = () => {
     try {
+      if (pinnedRearm && onlyIf !== 'missing') {
+        if (provider.readPrState(repo, pr).headRefOid !== expectedHead) {
+          throw new Error('live head differs from --expect-head');
+        }
+      }
       if (['accepted', 'restamp', 'clear-human'].includes(to)) {
         const fresh = provider.readPrState(repo, pr);
         if (fresh.headRefOid !== headSha && !(to === 'restamp' && newHeadArg && !mandatoryReferralState(fresh.comments).records.length)) throw new Error('head changed before acceptance; hold retained');
