@@ -411,7 +411,7 @@ export async function prepareRebuild({
       const [parents, committer, ...rest] = l.split('\t');
       const ps = String(parents ?? '').split(' ');
       const hit = rest.join('\t').match(/^daemon-rebuild: merge overlay (\S+) /);
-      if (hit && committer === REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL && ps.length === 2) live.push({ ref: hit[1], sha: ps[1] });
+      if (hit && committer === REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL && [2, 3].includes(ps.length)) live.push({ ref: hit[1], sha: ps[1] });
     }
     if (state.adopted?.head === head) for (const a of state.adopted.applied ?? []) if (a?.ref && a.sha) live.push({ ref: a.ref, sha: a.sha });
     return live;

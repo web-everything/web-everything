@@ -21,9 +21,9 @@
  * exception is post-fetch pruning of untracked provisional backlog cards proven landed on pinned main.
  *
  * DETERMINISM. The identity `daemon-rebuild <daemon-rebuild@localhost>` and `GIT_AUTHOR_DATE`/
- * `GIT_COMMITTER_DATE` pinned to `@<the later of the two parents' committer dates> +0000` (see
+ * `GIT_COMMITTER_DATE` pinned to `@<the latest parent committer date> +0000` (see
  * {@link REBUILD_IDENTITY_ENV} and the date computation in {@link planRebuild}) mean `commit-tree` is called
- * with the SAME five inputs (tree, two parents, message, identity+date) whenever the same overlay is applied
+ * with the SAME inputs (tree, ordered parents, message, identity+date) whenever the same overlay is applied
  * onto the same `main`, whatever machine or however many times it runs — git commit objects are content-
  * addressed, so identical inputs mint the IDENTICAL sha. This is what makes `rebuildClone`'s own idempotency
  * check ("already at `finalSha`? nothing to do") and the reject-cache ("already rejected these exact inputs?
