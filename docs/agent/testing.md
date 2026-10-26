@@ -1118,6 +1118,22 @@ failures remain best effort (empty reads, skipped writes). Journals reaching the
 limit require operator rotation before further reads/appends. Regression home:
 `scripts/lib/__tests__/delivery-policy.test.mjs`.
 
+Policy defaults use a code-owned runtime import allow-list (currently empty).
+Check source before bundling, generated output after bundling, and the exact bytes at
+the runtime import boundary. Computed imports, template specifiers (including plain
+templates), concatenation, unlisted literals, `import.meta`, and dynamic code constructors
+must be refused. Type-only imports are erased; strings and comments are inert data.
+The `policy runtime import allow-list` tests pair an approved literal with isolated
+refusals at both scan and runtime boundaries. Keep each refusal independent of unrelated
+forbidden syntax so a second guard cannot mask a regression.
+
+Journal append tests cover exclusive lock creation, owner-token checks before writes and
+release, and size checks after acquisition. A stale lock with a live or unknown PID must
+remain held. Competing stale removers must serialize through the same generation guard
+as normal release, then recheck ownership; an abandoned generation guard requires
+operator cleanup after checking that no writer is active. Preserve the synchronized
+two-writer tests, including the case with capacity for only one more record.
+
 ## Quality guidelines
 Real Git fixtures must pass `-c gc.auto=0 -c maintenance.auto=false` on their Git invocations.
 A large seed commit can launch detached maintenance/repack that outlives `execFileSync`, racing

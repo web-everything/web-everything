@@ -481,9 +481,12 @@ describe('policy runtime import allow-list', () => {
     "import('node:fs')", 'import(`path`)', "import('path' + '')",
     'import.meta', "require(x)", "require('node:fs')", 'const r = require;',
     "export { x } from 'node:fs';", "import x = require('node:fs');", 'import(',
-  ])('refuses unknown or incomplete source and bundled syntax: %s', source => {
+  ])('refuses unknown or incomplete syntax at scan and runtime boundaries: %s', async source => {
     const guard = deliveryPolicy.createPolicyImportGuard(['path'], () => 'node:path');
     expect(() => guard.check(source)).toThrow(/Policy defaults/);
+    // Isolate each import shape: an unrelated forbidden global or statement
+    // must not be the reason the runtime boundary rejects these exact bytes.
+    await expect(guard.importModule(source)).rejects.toThrow(/Policy defaults runtime import refused/);
   });
 
   it('ignores strings, comments, regexes and erased type imports, but scans template expressions', () => {
