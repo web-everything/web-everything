@@ -5,6 +5,11 @@ import { join } from 'node:path';
 import { dispatchTimeoutRetry, timeoutGithubEffects } from '../ci-heal-pr-dispatch.mjs';
 import { readTimeoutBudget } from '../../conveyor/timeout-retry-state.mjs';
 
+// Dispatch coverage uses a deterministic birth number; allocator transport has its own suite.
+vi.mock('../../lib/card-number-allocator.mjs', () => ({
+  allocateCardNumber: () => ({ ok: true, num: '900001' }),
+}));
+
 // Dispatch-level coverage of the infra-cancelled re-run path (PR #4024 review): the planner tests pin WHEN a re-run
 // is planned; these pin what the dispatch then DOES — which endpoint, which cap, which job states it will touch, and
 // that an infra re-run never files a flaky-test follow-up card.
@@ -19,7 +24,10 @@ const observe = (conclusion) => (e, j) => ({ repo: e.repo, head: e.head, runHead
 
 async function harness(fn) {
   const dir = mkdtempSync(join(tmpdir(), 'infra-rerun-'));
-  try { await fn(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
+  try {
+    mkdirSync(join(dir, 'backlog'));
+    await fn(dir);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
 describe('infra-cancelled dispatch', () => {
@@ -46,13 +54,18 @@ describe('infra-cancelled dispatch', () => {
 
   it('an ordinary (non-infra) timeout is still capped at 2 confirmed re-runs', async () => harness(async (dir) => {
     const request = vi.fn(() => ({ status: 'confirmed' }));
-    const opts = { dir, repo, effects: { observe: observe('failure'), request }, fileFollowup: vi.fn(async () => {}) };
+    const fileFollowup = vi.fn(async () => {});
+    const opts = { dir, root: dir, repo, effects: { observe: observe('failure'), request }, fileFollowup };
     const statuses = [];
     for (let attempt = 1; attempt <= 4; attempt++) {
       statuses.push((await dispatchTimeoutRetry(timeoutEvidence({ jobs: [{ run: 10, job: 20, attempt }] }), opts)).status);
     }
     expect(statuses).toEqual(['requested', 'requested', 'refused', 'refused']);
     expect(request).toHaveBeenCalledTimes(2);
+    expect(fileFollowup).toHaveBeenCalledTimes(1);
+    expect(fileFollowup.mock.calls[0][0]).toMatchObject({
+      num: '900001', abs: join(dir, 'backlog', '900001-investigate-timeout-retries-for-pr-4023-at-aaaaaaaa.md'),
+    });
   }));
 
   it('files NO flaky-test follow-up card for infra re-runs (at 2 or at the cap), but still files one for ordinary timeouts at 2', async () => harness(async (dir) => {
@@ -61,7 +74,6 @@ describe('infra-cancelled dispatch', () => {
     for (let attempt = 1; attempt <= 7; attempt++) await dispatchTimeoutRetry(infraEvidence({ jobs: [{ run: 10, job: 20, attempt }] }), infraOpts);
     expect(infraFile).not.toHaveBeenCalled();
 
-    mkdirSync(join(dir, 'backlog'), { recursive: true }); // the follow-up planner reads the (empty) backlog for the next card number
     const timeoutFile = vi.fn(async () => {});
     const timeoutOpts = { dir, repo, root: dir, effects: { observe: observe('failure'), request: () => ({ status: 'confirmed' }) }, fileFollowup: timeoutFile };
     for (let attempt = 1; attempt <= 2; attempt++) await dispatchTimeoutRetry(timeoutEvidence({ pr: 4024, jobs: [{ run: 10, job: 20, attempt }] }), timeoutOpts);
