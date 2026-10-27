@@ -169,7 +169,7 @@ describe('enrichPrsWithScopeBloat — the io shell holds unknown stack diffs and
     const [out] = enrichPrsWithScopeBloat([pr({ number: 5943, baseRefName: base })], {
       ...readers, readStacks: () => new Map(), emitEvent: (event) => events.push(event),
     });
-    const detail = { reason: 'stack-base-unresolved', base };
+    const detail = { reason: 'stack-base-unresolved', base, cause: 'unknown' };
     expect(out.scopeBloat).toEqual({
       reason: 'scope-bloat', unknown: true, files: 0, alreadyOnMain: [], outsideScope: [], stale: false, wide: false,
       why: `${detail.reason}: the PR's stack base could not be resolved, so its own diff is unknown — a person or fixer must settle the base before a review reads it`,
@@ -198,7 +198,7 @@ describe('enrichPrsWithScopeBloat — the io shell holds unknown stack diffs and
     const input = pr({ ...missing, baseRefName: base, scopeBloat: { stale: true } });
     const options = { ...readers, readStacks: () => new Map(), emitEvent: (event) => events.push(event) };
     const [out] = enrichPrsWithScopeBloat([input], options);
-    const detail = { reason: 'stack-base-unresolved', base };
+    const detail = { reason: 'stack-base-unresolved', base, cause: 'unknown' };
     expect(out.scopeBloat).toEqual({
       reason: 'scope-bloat', unknown: true, files: 0, alreadyOnMain: [], outsideScope: [], stale: false, wide: false,
       why: `${detail.reason}: the PR's stack base could not be resolved, so its own diff is unknown — a person or fixer must settle the base before a review reads it`,
@@ -565,5 +565,100 @@ describe('stack-aware review (held item 177)', () => {
     expect(again.scopeBloatUnknown).toEqual(detail);
     expect(mainReads).toBe(0);
     expect(events).toEqual([{ kind: 'scope-bloat-unknown', pr: 4632, daemon: 'scope-bloat', detail }]);
+  });
+});
+
+
+describe('enrichPrsWithScopeBloat — stack base resolution from the four live shapes', () => {
+  const sha = n => n.toString(16).padStart(40, '0');
+  const shapes = [
+    [5996, 'lane/drain-poison-guard', 'lane/drain-poison-guard-base', null],
+    [5997, 'lane/ci-heal-read-timeout', 'lane/r123-auto-proceed', 5981],
+    [5983, 'lane/r130-delegated-sweep', 'lane/r130-clear-human-guard', 5982],
+    [6003, 'lane/hetzner-ci-routing', 'lane/ci-speed', 6002],
+  ];
+  const input = (shape, variant) => ({ number: shape[0], headRefName: shape[1], baseRefName: shape[2],
+    headRefOid: sha(10000 + shape[0] + variant * 100), title: 'Stack resolution regression',
+    author: 'app/plateau-worker', isCrossRepository: false,
+    files: FILES_4361.map(path => ({ path })), comments: [] });
+  const readers = {
+    repo: 'web-everything/web-everything', env: {}, netScope: { scopeBloat: false },
+    readNet: () => { throw new Error('a declared stack must not fall back to main'); },
+    readScope: () => CARD_SCOPE, readBaseSha: () => sha(20000),
+    readStackFiles: () => { throw new Error('an unresolved stack must not read files'); },
+  };
+
+  it.each(shapes)('assesses #%s against its resolved base tree and exposes only numbered stack bases', (number, headRefName, baseRefName, bottom) => {
+    const pr = input([number, headRefName, baseRefName, bottom], 1);
+    const stack = { pr: bottom, ref: baseRefName, head: sha(number + 30000),
+      contained: sha(number + 30000), tree: sha(number + 40000), topHead: pr.headRefOid };
+    const calls = [];
+    const stackReads = [];
+    const events = [];
+    const [out] = enrichPrsWithScopeBloat([pr], { ...readers,
+      readStacks: (list, options) => { calls.push({ list, options }); return new Map([[number, stack]]); },
+      readStackFiles: base => { stackReads.push(base); return SPRAWL_FILES; },
+      emitEvent: event => events.push(event),
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].list).toEqual([pr]);
+    expect(calls[0].options?.diag).toBeInstanceOf(Map);
+    expect(stackReads).toEqual([stack]);
+    expect(out.scopeBloat).toEqual(assessScopeBloat({ prFiles: SPRAWL_FILES, netFiles: SPRAWL_FILES, cardScope: CARD_SCOPE, env: {} }));
+    expect(out.scopeBloat).toMatchObject({ wide: true, stale: false });
+    expect(out.scopeBloatUnknown).toBeUndefined();
+    expect(events).toEqual([]);
+    if (bottom === null) expect(out).not.toHaveProperty('stackBase');
+    else expect(out.stackBase).toEqual({ pr: bottom, ref: baseRefName, head: stack.head, contained: stack.contained });
+  });
+
+  it.each(shapes)('holds unresolved #%s with the per-PR diagnostic from readStacks', (number, headRefName, baseRefName, bottom) => {
+    const pr = input([number, headRefName, baseRefName, bottom], 2);
+    const cause = bottom === null ? 'base-not-contained' : 'no-containment';
+    const events = [];
+    const calls = [];
+    const [out] = enrichPrsWithScopeBloat([pr], { ...readers,
+      readStacks: (list, { diag } = {}) => {
+        calls.push(list);
+        expect(diag).toBeInstanceOf(Map);
+        diag.set(number, { cause });
+        return new Map();
+      },
+      emitEvent: event => events.push(event),
+    });
+    expect(calls).toEqual([[pr]]);
+    const detail = { reason: 'stack-base-unresolved', base: baseRefName, cause };
+    expect(out.scopeBloatUnknown).toEqual(detail);
+    expect(out.scopeBloat).toMatchObject({ unknown: true });
+    expect(events).toEqual([{ kind: 'scope-bloat-unknown', pr: number, daemon: 'scope-bloat', detail }]);
+  });
+
+  it('uses unknown when the stack reader supplies no diagnostic', () => {
+    const pr = input(shapes[0], 3);
+    const events = [];
+    const [out] = enrichPrsWithScopeBloat([pr], { ...readers, readStacks: () => new Map(),
+      emitEvent: event => events.push(event) });
+    const detail = { reason: 'stack-base-unresolved', base: pr.baseRefName, cause: 'unknown' };
+    expect(out.scopeBloatUnknown).toEqual(detail);
+    expect(out.scopeBloat).toMatchObject({ unknown: true });
+    expect(events).toEqual([{ kind: 'scope-bloat-unknown', pr: pr.number, daemon: 'scope-bloat', detail }]);
+  });
+
+  it('holds every declared base with stack-read-failed when readStacks throws, reading once per batch', () => {
+    const prs = shapes.map(shape => input(shape, 4));
+    const events = [];
+    let reads = 0;
+    const out = enrichPrsWithScopeBloat(prs, { ...readers,
+      readStacks: () => { reads += 1; throw new Error('stack reader unavailable'); },
+      emitEvent: event => events.push(event),
+    });
+    expect(reads).toBe(1);
+    expect(events).toHaveLength(4);
+    for (const pr of out) {
+      const detail = { reason: 'stack-base-unresolved', base: pr.baseRefName, cause: 'stack-read-failed' };
+      expect(pr.scopeBloatUnknown).toEqual(detail);
+      expect(pr.scopeBloat).toMatchObject({ unknown: true });
+      expect(events).toContainEqual({ kind: 'scope-bloat-unknown', pr: pr.number, daemon: 'scope-bloat', detail });
+    }
   });
 });

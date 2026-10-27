@@ -803,3 +803,166 @@ describe('readBottomLanded on a real git graph — the reviewer\'s case: the bot
     } finally { g.cleanup(); }
   });
 });
+
+
+describe('readStackBases — declared lane bases (live #5996 #5997 #5983 #6003)', () => {
+  const sha = n => n.toString(16).padStart(40, '0');
+  const shapes = [
+    { number: 5996, headRefName: 'lane/drain-poison-guard', baseRefName: 'lane/drain-poison-guard-base', bottom: null },
+    { number: 5997, headRefName: 'lane/ci-heal-read-timeout', baseRefName: 'lane/r123-auto-proceed', bottom: 5981 },
+    { number: 5983, headRefName: 'lane/r130-delegated-sweep', baseRefName: 'lane/r130-clear-human-guard', bottom: 5982 },
+    { number: 6003, headRefName: 'lane/hetzner-ci-routing', baseRefName: 'lane/ci-speed', bottom: 6002 },
+  ].map((p, i) => ({ ...p, headRefOid: sha(100 + i), baseTip: sha(200 + i) }));
+  const MAIN = sha(300);
+  const TREE = sha(301);
+  const fixture = (extra = 0) => {
+    const refs = new Map();
+    const tips = new Map();
+    const sets = new Map();
+    const record = p => ({ author: 'app/plateau-worker', isCrossRepository: false, baseRefName: 'main', ...p });
+    // Unrelated records deliberately precede the real shapes, including beyond a 200-row boundary.
+    for (let i = 0; i < extra; i += 1) {
+      const headRefOid = sha(1000 + i);
+      const headRefName = `lane/unrelated-${i}`;
+      refs.set(7000 + i, record({ headRefName, headRefOid }));
+      tips.set(headRefName, headRefOid);
+      sets.set(headRefOid, { first: [headRefOid], reach: [headRefOid] });
+    }
+    for (const p of shapes) {
+      refs.set(p.number, record({ headRefName: p.headRefName, headRefOid: p.headRefOid, baseRefName: p.baseRefName }));
+      if (p.bottom != null) refs.set(p.bottom, record({ headRefName: p.baseRefName, headRefOid: p.baseTip }));
+      tips.set(p.headRefName, p.headRefOid);
+      tips.set(p.baseRefName, p.baseTip);
+      sets.set(p.headRefOid, { first: [p.headRefOid, p.baseTip], reach: [p.headRefOid, p.baseTip] });
+      sets.set(p.baseTip, { first: [p.baseTip], reach: [p.baseTip] });
+    }
+    // The daemon supplies only these three fields, not GitHub's author/fork/base evidence.
+    const listed = [...refs].map(([number, p]) => ({ number, headRefName: p.headRefName, headRefOid: p.headRefOid }));
+    const fakeGit = args => {
+      if (args[0] === 'cat-file') return '';
+      if (args[0] === 'rev-list') {
+        const head = args[args.indexOf('--end-of-options') + 1];
+        const commits = sets.get(head);
+        if (!commits) throw new Error('head unreadable');
+        return (args.includes('--first-parent') ? commits.first : commits.reach).join('\n');
+      }
+      if (args[0] === 'merge-base') return `${MAIN}\n`;
+      if (args[0] === 'merge-tree') return `${TREE}\n`;
+      throw new Error(`unexpected git ${args.join(' ')}`);
+    };
+    const read = (options = {}) => readStackBases({ root: '/repo', env: {}, settingOn: true,
+      prs: listed, readRefs: () => refs, readLanes: () => tips, run: fakeGit, ...options });
+    return { refs, tips, sets, listed, fakeGit, read };
+  };
+  const expected = p => ({ pr: p.bottom, ref: p.baseRefName, head: p.baseTip,
+    contained: p.baseTip, tree: TREE, topHead: p.headRefOid });
+
+  it('resolves #5997 over open #5981 from GitHub records', () => {
+    const f = fixture();
+    const diag = new Map();
+    expect(f.read({ diag }).get(5997)).toEqual(expected(shapes[1]));
+    expect(diag.has(5997)).toBe(false);
+  });
+
+  it('resolves #5983 over #5982 and #6003 over #6002 together with all four shapes and unrelated PRs', () => {
+    const f = fixture(3);
+    const diag = new Map();
+    const out = f.read({ prlessBase: true, diag });
+    for (const p of shapes) expect(out.get(p.number)).toEqual(expected(p));
+    expect(diag.size).toBe(0);
+  });
+
+  it('keeps #5996 unresolved by default so review-side callers never receive pr:null', () => {
+    const out = fixture().read();
+    expect(out.has(5996)).toBe(false);
+    expect([...out.values()].every(base => typeof base.pr === 'number')).toBe(true);
+  });
+
+  it('resolves #5996 against its contained origin branch tip only with prlessBase:true', () => {
+    const diag = new Map();
+    expect(fixture().read({ prlessBase: true, diag }).get(5996)).toEqual(expected(shapes[0]));
+    expect(diag.has(5996)).toBe(false);
+  });
+
+  it('leaves a prless base unresolved when its tip is absent from origin tips', () => {
+    const f = fixture();
+    f.tips.delete(shapes[0].baseRefName);
+    expect(f.read({ prlessBase: true }).has(5996)).toBe(false);
+  });
+
+  it('leaves a prless base unresolved when the top does not contain its tip', () => {
+    const f = fixture();
+    f.sets.set(shapes[0].headRefOid, { first: [shapes[0].headRefOid], reach: [shapes[0].headRefOid] });
+    expect(f.read({ prlessBase: true }).has(5996)).toBe(false);
+  });
+
+  it('leaves a prless base unresolved when the top author is unknown', () => {
+    const f = fixture();
+    f.refs.get(5996).author = null;
+    expect(f.read({ prlessBase: true }).has(5996)).toBe(false);
+  });
+
+  it('leaves a prless base unresolved when the top is a fork', () => {
+    const f = fixture();
+    f.refs.get(5996).isCrossRepository = true;
+    expect(f.read({ prlessBase: true }).has(5996)).toBe(false);
+  });
+
+  it('leaves a prless base unresolved when the top head is not the origin tip', () => {
+    const f = fixture();
+    f.tips.set(shapes[0].headRefName, sha(400));
+    expect(f.read({ prlessBase: true }).has(5996)).toBe(false);
+  });
+
+  it.each([
+    ['refs-unreadable', 'empty GitHub refs', 5997, () => ({ readRefs: () => new Map() })],
+    ['tips-unreadable', 'null origin tips, including the early return', 5997, () => ({ readLanes: () => null })],
+    ['top-untrusted', 'fork top', 5997, f => { f.refs.get(5997).isCrossRepository = true; }],
+    ['top-untrusted', 'top differs from origin tip', 5997, f => { f.tips.set(shapes[1].headRefName, sha(401)); }],
+    ['base-pr-untrusted', 'fork base PR', 5997, f => { f.refs.get(5981).isCrossRepository = true; }],
+    ['base-pr-untrusted', 'base PR differs from origin tip', 5997, f => { f.tips.set(shapes[1].baseRefName, sha(402)); }],
+    ['base-pr-actor-mismatch', 'different base author', 5997, f => { f.refs.get(5981).author = 'someone-else'; }],
+    ['base-pr-actor-mismatch', 'unknown base author', 5997, f => { f.refs.get(5981).author = null; }],
+    ['no-containment', 'trusted open base not contained', 5997, f => {
+      f.sets.set(shapes[1].headRefOid, { first: [shapes[1].headRefOid], reach: [shapes[1].headRefOid] });
+    }],
+    ['base-branch-missing', 'prless branch absent from origin', 5996, f => { f.tips.delete(shapes[0].baseRefName); }],
+    ['base-not-contained', 'prless tip not contained', 5996, f => {
+      f.sets.set(shapes[0].headRefOid, { first: [shapes[0].headRefOid], reach: [shapes[0].headRefOid] });
+    }],
+    ['tree-unreadable', 'synthetic tree read fails', 5997, f => ({ run: args => {
+      if (args[0] === 'merge-tree') throw new Error('tree unreadable');
+      return f.fakeGit(args);
+    } })],
+    ['head-unreadable', 'top commit sets unreadable', 5997, f => { f.sets.delete(shapes[1].headRefOid); }],
+    ['head-unreadable', 'base commit sets unreadable', 5997, f => { f.sets.delete(shapes[1].baseTip); }],
+  ])('records %s for %s', (cause, _name, number, configure) => {
+    const f = fixture();
+    const options = configure(f) || {};
+    const diag = new Map();
+    const out = f.read({ prlessBase: true, diag, ...options });
+    expect(out.has(number)).toBe(false);
+    expect(diag.get(number)).toEqual({ cause });
+    // Whole-reader failures must diagnose every listed declared lane base, even on an early return.
+    if (cause === 'refs-unreadable' || cause === 'tips-unreadable') {
+      for (const p of shapes) expect(diag.get(p.number)).toEqual({ cause });
+    }
+    for (const resolved of out.keys()) expect(diag.has(resolved)).toBe(false);
+  });
+
+  it('resolves all four shapes after 250 unrelated open PRs without a 200-cap or ordering dependence', () => {
+    const f = fixture(250);
+    const diag = new Map();
+    const out = f.read({ prlessBase: true, diag });
+    for (const p of shapes) expect(out.get(p.number)).toEqual(expected(p));
+    expect(diag.size).toBe(0);
+  });
+
+  it('rejects a stale caller bottom head even when GitHub and origin agree on its current head', () => {
+    const f = fixture();
+    f.listed.find(p => p.number === 5981).headRefOid = sha(403);
+    const diag = new Map();
+    expect(f.read({ prlessBase: true, diag }).has(5997)).toBe(false);
+    expect(diag.get(5997)).toEqual({ cause: 'base-pr-untrusted' });
+  });
+});
