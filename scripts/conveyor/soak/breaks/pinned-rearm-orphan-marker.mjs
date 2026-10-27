@@ -10,7 +10,7 @@ const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 export default {
   id: 'pinned-rearm-orphan-marker',
   title: 'pinned re-arm never leaves an orphan marker suppressing recovery',
-  card: 'PR #5925 / x1b8hlo: head movement and concurrent send-back',
+  card: 'PR #5925 / 5726: head movement and concurrent send-back',
   fixedBy: { sha: 'pending', where: 'lane/port-c-orphan-rearm', paths: ['scripts/review-set-label.mjs', 'scripts/conveyor/orphan-fix-round.mjs'] },
   fixPresent(root) {
     return readFileSync(join(root, 'scripts/review-set-label.mjs'), 'utf8').includes('pinnedPlainRearm');

@@ -14,9 +14,10 @@ function assess(readDiff) {
 }
 
 describe('pr-size', () => {
-  it('reads a real committed diff with local main fallback and excludes working-tree edits', async () => {
+  it('reads a real committed diff against the remote-tracking base and excludes working-tree edits', async () => {
     await withRealRepo(async ({ root, git, commit }) => {
       commit({ 'example.mjs': 'base\n' }, 'base');
+      git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
       git(['checkout', '-b', 'size-fixture']);
       commit({ 'example.mjs': 'base\ncommitted\n' }, 'change');
       writeFileSync(join(root, 'example.mjs'), 'base\ncommitted\nuncommitted\n');

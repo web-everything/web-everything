@@ -180,7 +180,7 @@ it('unreadable facts defer and incomplete comments cannot authorize effects', as
   }
 });
 
-it('task enqueue persists policy provenance and refuses invalid cascade layers', () => {
+it('task policy persists the 300000ms default and cascade provenance', () => {
   const first = enqueueItemTask(options());
   expect(first.job.task.timeoutMs).toBe(300000);
   expect(first.job.task.sources.timeoutMs).toBe('standard');
@@ -197,6 +197,19 @@ it('task enqueue persists policy provenance and refuses invalid cascade layers',
   const next = enqueueItemTask({ ...options(2, 'policy/repo'), policyOptions: { platform: null, env: {}, tool: { timeoutMs: 500 } } });
   expect(next.job.task.sources.timeoutMs).toBe('tool');
   expect(next.job.task.timeoutMs).toBe(500);
+  for (const [index, layer] of ['standard', 'platform', 'tool', 'envValues'].entries()) {
+    const record = enqueueItemTask({ ...options(1, `layer${index}/repo`), policyOptions: {
+      platform: null, env: {}, [layer]: { timeoutMs: 1000 + index },
+    } });
+    expect(store.read(record.id).job.task).toMatchObject({ timeoutMs: 1000 + index,
+      policy: { timeoutMs: 1000 + index }, sources: { timeoutMs: layer === 'envValues' ? 'env' : layer } });
+  }
+  // Even a later valid override cannot conceal a malformed lower layer.
+  for (const layer of ['platform', 'tool']) {
+    expect(() => enqueueItemTask({ ...options(1, 'masked/repo'), policyOptions: {
+      platform: null, env: {}, [layer]: { timeoutMs: -1 }, envValues: { timeoutMs: 500 },
+    } })).toThrow(/policy refused.*invalid overrides/);
+  }
 });
 
 

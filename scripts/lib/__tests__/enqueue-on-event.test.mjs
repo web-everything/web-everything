@@ -2,6 +2,7 @@
  * @file Event-driven enqueue eligibility, policy resolution, debounce, and injected fast-drain runs.
  */
 import { describe, it, expect, vi } from 'vitest';
+import { existsSync, writeFileSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -17,7 +18,8 @@ import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs'
 const REPO = 'web-everything/web-everything';
 const GREEN = 'check_suite.completed=success@12';
 const mark = (num = 42, cause = GREEN) => ({ key: `${REPO}#${num}`, cause });
-const READY_PR = { state: 'OPEN', isDraft: false, labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
+const CANDIDATE_FIELDS = { baseRefName: 'main', mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE', labels: { nodes: [{ name: 'ready-to-merge' }], pageInfo: { hasNextPage: false } } };
+const READY_PR = { baseRefName: 'main', mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE', state: 'OPEN', isDraft: false, labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
 
 function resolveSetting(tool = {}, extra = {}) {
   return resolveEnqueueOnEventSetting({
@@ -53,7 +55,7 @@ function setup(extra = {}) {
     return child;
   };
   const handle = createEnqueueOnEvent({
-    cwd: '/clone', localSlug: REPO, scriptRoot: () => '/code', env: {},
+    cwd: '/clone', localSlug: REPO, defaultBranch: 'main', scriptRoot: () => '/code', env: {},
     now: () => time, spawnImpl, log: (line) => lines.push(line),
     resolveSetting: () => ({ enabled: true, debounceSeconds: 15, line: 'x' }),
     readQueueDepth: async () => ({ ok: true, queued: 0 }),
@@ -316,7 +318,7 @@ describe('summarizeFastDrain — queue-mode accounting (live 2026-10-13, #5202)'
 });
 
 const CATCH_UP_SETTING = { enabled: true, debounceSeconds: 15, catchUp: { enabled: true, intervalMinutes: 10, concurrency: 1, maxQueued: 3, order: 'priority-then-first-accept' } };
-const candidate = (num, readyAt = null, extra = {}) => ({ num, readyAt, isDraft: false, inQueue: false, ...extra });
+const candidate = (num, readyAt = null, extra = {}) => ({ num, readyAt, isDraft: false, inQueue: false, labels: READY_PR.labels, baseRefName: 'main', mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE', ...extra });
 const catchUpSetup = (extra = {}) => setup({
   resolveSetting: () => CATCH_UP_SETTING,
   readCandidates: async () => ({ ok: true, prs: [candidate(43, 200), candidate(42, 100), candidate(44)], queued: 1 }),
@@ -374,11 +376,11 @@ describe('readCatchUpCandidates', () => {
       calls.push(args);
       const repository = calls.length === 1
         ? { pullRequests: {
-          nodes: Array.from({ length: 100 }, (_, i) => ({ number: i + 1, isDraft: true })),
+          nodes: Array.from({ length: 100 }, (_, i) => ({ ...CANDIDATE_FIELDS, number: i + 1, isDraft: true })),
           pageInfo: { hasNextPage: true, endCursor: 'page-one' },
         }, mergeQueue: { entries: { totalCount: 2 } } }
         : calls.length === 2
-          ? { pullRequests: { nodes: [{ number: 101, isDraft: false, isInMergeQueue: false }],
+          ? { pullRequests: { nodes: [{ ...CANDIDATE_FIELDS, number: 101, isDraft: false, isInMergeQueue: false }],
             pageInfo: { hasNextPage: false, endCursor: 'page-two' } } }
           : { p101: { timelineItems: { nodes: [{ createdAt: '2026-10-01', label: { name: 'ready-to-merge' } }] } } };
       cb(null, JSON.stringify({ data: { repository } }));
@@ -412,7 +414,7 @@ describe('readCatchUpCandidates', () => {
       calls.push(args);
       const n = calls.length;
       if (n <= 2) {
-        const nodes = Array.from({ length: n === 1 ? 100 : 1 }, (_, i) => ({ number: n === 1 ? i + 1 : 101 }));
+        const nodes = Array.from({ length: n === 1 ? 100 : 1 }, (_, i) => ({ ...CANDIDATE_FIELDS, number: n === 1 ? i + 1 : 101 }));
         cb(null, JSON.stringify({ data: { repository: { pullRequests: { nodes,
           pageInfo: { hasNextPage: n === 1, endCursor: `page-${n}` },
         }, mergeQueue: null } } }));
@@ -457,9 +459,9 @@ describe('readCatchUpCandidates', () => {
       const data = calls.length === 1
         ? { repository: {
           pullRequests: { nodes: [
-            { number: 42, isDraft: false, isInMergeQueue: true },
-            { number: 43, isDraft: true, isInMergeQueue: false },
-            { number: 44, isDraft: false, isInMergeQueue: false },
+            { ...CANDIDATE_FIELDS, number: 42, isDraft: false, isInMergeQueue: true },
+            { ...CANDIDATE_FIELDS, number: 43, isDraft: true, isInMergeQueue: false },
+            { ...CANDIDATE_FIELDS, number: 44, isDraft: false, isInMergeQueue: false },
           ], pageInfo: { hasNextPage: false, endCursor: null } },
           mergeQueue: { entries: { totalCount: 4 } },
         } }
@@ -480,7 +482,7 @@ describe('readCatchUpCandidates', () => {
     let n = 0;
     const result = await readCatchUpCandidates({ repo: REPO, readComments: () => [], execFileImpl: (_c, _a, _o, cb) => {
       n += 1;
-      if (n === 1) cb(null, JSON.stringify({ data: { repository: { pullRequests: { nodes: [{ number: 7, isDraft: false, isInMergeQueue: false }], pageInfo: { hasNextPage: false, endCursor: null } }, mergeQueue: null } } }));
+      if (n === 1) cb(null, JSON.stringify({ data: { repository: { pullRequests: { nodes: [{ ...CANDIDATE_FIELDS, number: 7, isDraft: false, isInMergeQueue: false }], pageInfo: { hasNextPage: false, endCursor: null } }, mergeQueue: null } } }));
       else cb(new Error('HTTP 502'));
     } });
     expect(result).toEqual({ ok: true, queued: 0, prs: [candidate(7, null)] });
@@ -895,7 +897,7 @@ describe('catch-up fill and stable acceptance ordering', () => {
     }, execFileImpl: (_cmd, _args, _opts, cb) => {
       const query = _args.find(a => a.startsWith('query='));
       const repository = query.includes('pullRequests(') ? {
-        pullRequests: { nodes: [5025, 5026, 5027].map(number => ({ number })), pageInfo: { hasNextPage: false } },
+        pullRequests: { nodes: [5025, 5026, 5027].map(number => ({ ...CANDIDATE_FIELDS, number })), pageInfo: { hasNextPage: false } },
         mergeQueue: { entries: { totalCount: 0 } },
       } : Object.fromEntries([5025, 5026, 5027].map(num => [`p${num}`, {
         timelineItems: { nodes: [{ createdAt: `2026-10-13T${num === 5025 ? '19:11' : num === 5026 ? '17:00' : '18:00'}:00Z`, label: { name: 'ready-to-merge' } }] },
@@ -931,7 +933,7 @@ it('reads an acceptance beyond the first comments page', async () => {
     execFileImpl: (_cmd, args, _opts, cb) => {
       calls++;
       const repository = calls === 1 ? {
-        pullRequests: { nodes: [{ number: 42 }], pageInfo: { hasNextPage: false } },
+        pullRequests: { nodes: [{ ...CANDIDATE_FIELDS, number: 42 }], pageInfo: { hasNextPage: false } },
         mergeQueue: { entries: { totalCount: 0 } },
       } : { p42: { timelineItems: { nodes: [] } } };
       expect(args.find(a => a.startsWith('query='))).not.toContain('comments(');
@@ -947,7 +949,7 @@ it('keeps ready time when the complete comment read fails', async () => {
     readComments: (number, opts) => readCompletePrComments(number, { ...opts, exec: () => { throw new Error('HTTP 502'); } }),
     execFileImpl: (_cmd, args, _opts, cb) => {
       const repository = args.includes(`query=${CATCH_UP_QUERY}`) ? {
-        pullRequests: { nodes: [{ number: 42 }], pageInfo: { hasNextPage: false } },
+        pullRequests: { nodes: [{ ...CANDIDATE_FIELDS, number: 42 }], pageInfo: { hasNextPage: false } },
       } : { p42: { timelineItems: { nodes: [{ createdAt: '2026-10-02', label: { name: 'ready-to-merge' } }] } } };
       cb(null, JSON.stringify({ data: { repository } }));
     },
@@ -1628,4 +1630,160 @@ describe('pre-staged green events', () => {
     expect(calls).toHaveLength(1);
     expect(handle.pending()).toHaveLength(0);
   });
+});
+
+
+describe('catch-up round listing and admission', () => {
+  const holds = [
+    ['red-team:blocked', { labels: [...READY_PR.labels, { name: 'red-team:blocked' }] }],
+    ['review:changes', { labels: [...READY_PR.labels, { name: 'review:changes' }] }],
+    ['base is not main', { baseRefName: 'lane/stack' }],
+    ['CONFLICTING', { mergeable: 'CONFLICTING' }],
+    ['DIRTY', { mergeStateStatus: 'DIRTY' }],
+  ];
+  it('shares one snapshot path per round, rotates it, and leaves event children unchanged', async () => {
+    const { handle, calls, advance } = catchUpSetup();
+    await handle.catchUp();
+    const snapshot = args => args.find(a => a.startsWith('--listing-snapshot='));
+    const first = snapshot(calls[0].args);
+    expect(first).toEqual(expect.stringContaining('--listing-snapshot='));
+    expect(calls.slice(0, 2).map(c => snapshot(c.args))).toEqual([first, first]);
+    const path = first.slice('--listing-snapshot='.length);
+    writeFileSync(path, '{}');
+    handle.notePoll({ marked: [mark(99)] });
+    advance(16_000);
+    await handle.tick();
+    expect(snapshot(calls.at(-1).args)).toBeUndefined();
+    advance(600_000);
+    await handle.catchUp();
+    expect(snapshot(calls.at(-1).args)).not.toBe(first);
+    expect(existsSync(path)).toBe(false);
+    handle.kill();
+  });
+  it.each(holds)('planCatchUp spends no slot on %s', (reason, patch) => {
+    const plan = planCatchUp({ prs: [candidate(1, 0, patch), candidate(2, 1)], capacity: 1, queued: 0 });
+    expect(plan.run.map(p => p.num)).toEqual([2]);
+    expect(plan.skipped).toEqual([{ num: 1, reason: expect.stringContaining(reason) }]);
+  });
+  it.each(holds)('fresh re-read prevents a child after the head changes to %s', async (reason, patch) => {
+    const { handle, calls, lines } = catchUpSetup({
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42)] }),
+      readPr: async () => ({ ...READY_PR, headRefOid: 'new-head', ...patch }),
+    });
+    await handle.catchUp();
+    expect(calls).toHaveLength(0);
+    expect(lines.some(l => l.includes('not woken:') && l.includes(reason))).toBe(true);
+  });
+  it('reads all pre-filter fields in the live wake query', async () => {
+    await enqueueModule.readPrForWake({ repo: REPO, num: 42, execFileImpl: (_cmd, args, _opts, cb) => {
+      expect(args.at(-1).split(',')).toEqual(expect.arrayContaining(['labels', 'baseRefName', 'mergeStateStatus', 'mergeable']));
+      cb(null, JSON.stringify(READY_PR));
+    } });
+  });
+});
+
+
+it.each([
+  ['labels unreadable', { labels: null }],
+  ['labels unreadable', { labels: [null] }],
+  ['base is not main', { baseRefName: undefined }],
+])('incomplete readable evidence spends no catch-up slot or child: %s', async (reason, patch) => {
+  expect(planCatchUp({ prs: [candidate(42, 0, patch)], queued: 0, capacity: 1 }).skipped)
+    .toEqual([{ num: 42, reason: expect.stringContaining(reason) }]);
+  const { handle, calls } = catchUpSetup({ readPr: async () => ({ ...READY_PR, ...patch }) });
+  await handle.catchUp();
+  expect(calls).toHaveLength(0);
+});
+
+it('carries candidate hold fields, rejects truncated label evidence, and logs each skipped PR', async () => {
+  const raw = [
+    { ...CANDIDATE_FIELDS, number: 1, labels: { nodes: [{ name: 'red-team:blocked' }], pageInfo: { hasNextPage: false } } },
+    { ...CANDIDATE_FIELDS, number: 2, labels: { nodes: [{ name: 'review:changes' }], pageInfo: { hasNextPage: false } } },
+    { ...CANDIDATE_FIELDS, number: 3, baseRefName: 'dev' },
+    { ...CANDIDATE_FIELDS, number: 4, mergeable: 'CONFLICTING' },
+    { ...CANDIDATE_FIELDS, number: 5, mergeStateStatus: 'DIRTY' },
+    { ...CANDIDATE_FIELDS, number: 6, labels: { nodes: [], pageInfo: { hasNextPage: true } } },
+  ];
+  const result = await readCatchUpCandidates({ repo: REPO, execFileImpl: (_cmd, args, _opts, cb) => {
+    expect(args).toContain(`query=${CATCH_UP_QUERY}`);
+    expect(CATCH_UP_QUERY).toContain('baseRefName mergeStateStatus mergeable labels(first:100)');
+    cb(null, JSON.stringify({ data: { repository: { pullRequests: { nodes: raw, pageInfo: { hasNextPage: false } } } } }));
+  } });
+  expect(result.prs[0].labels).toEqual([{ name: 'red-team:blocked' }]);
+  expect(result.prs[2].baseRefName).toBe('dev');
+  expect(result.prs[3].mergeable).toBe('CONFLICTING');
+  expect(result.prs[4].mergeStateStatus).toBe('DIRTY');
+  const { handle, calls, lines } = catchUpSetup({ readCandidates: async () => result });
+  await handle.catchUp();
+  expect(calls).toHaveLength(0);
+  for (let n = 1; n <= 6; n++) expect(lines.some(l => l.startsWith(`enqueue-on-event: catch-up #${n} — skipped:`))).toBe(true);
+});
+
+
+it('catch-up holds compare with the supplied default branch and retain main as fallback', () => {
+  expect(enqueueModule.catchUpSkipReason({ ...READY_PR, baseRefName: 'trunk' }, 'trunk')).toBeNull();
+  expect(enqueueModule.catchUpSkipReason(READY_PR, 'trunk')).toBe('base is not trunk (main)');
+  expect(enqueueModule.catchUpSkipReason(READY_PR)).toBeNull();
+  expect(enqueueModule.catchUpSkipReason({ ...READY_PR, baseRefName: 'trunk' })).toBe('base is not main (trunk)');
+  expect(enqueueModule.catchUpSkipReason({ ...READY_PR, labels: null }, 'trunk')).toBe('labels unreadable');
+  expect(wakeWorthy({ ...READY_PR, baseRefName: 'trunk' }, 'trunk').wake).toBe(true);
+  expect(planCatchUp({ prs: [candidate(42, 0, { baseRefName: 'trunk' })], queued: 0, capacity: 1, defaultBranch: 'trunk' }).run.map(p => p.num)).toEqual([42]);
+});
+
+it('threads a known default branch through the catch-up plan and fresh wake read', async () => {
+  const { handle, calls } = catchUpSetup({ defaultBranch: 'trunk',
+    readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42, 0, { baseRefName: 'trunk' })] }),
+    readPr: async () => ({ ...READY_PR, baseRefName: 'trunk' }),
+  });
+  await handle.catchUp();
+  expect(calls).toHaveLength(1);
+  handle.kill();
+});
+
+it.each(['event', 'catch-up'])('production initialization resolves trunk before admitting a ready %s PR', async mode => {
+  const execFileSyncImpl = vi.fn(() => 'trunk\n');
+  const { handle, calls, advance } = catchUpSetup({
+    defaultBranch: undefined, execFileSyncImpl,
+    readCandidates: async () => ({ ok: true, queued: 0,
+      prs: mode === 'catch-up' ? [candidate(42, 0, { baseRefName: 'trunk' })] : [] }),
+    readPr: async () => ({ ...READY_PR, baseRefName: 'trunk' }),
+  });
+  try {
+    if (mode === 'event') {
+      handle.notePoll({ ok: true, marked: [mark()] });
+      advance(15_000);
+    }
+    const result = await (mode === 'event' ? handle.tick() : handle.catchUp());
+    expect(execFileSyncImpl).toHaveBeenCalledOnce();
+    expect(execFileSyncImpl).toHaveBeenCalledWith('gh',
+      ['repo', 'view', REPO, '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name'],
+      expect.objectContaining({ cwd: '/clone', env: {}, timeout: 60_000 }));
+    expect(calls).toHaveLength(1);
+    expect(result[0]).toMatchObject({ num: 42, outcome: 'enqueued', verified: true });
+    await handle.tick();
+    expect(execFileSyncImpl).toHaveBeenCalledOnce();
+  } finally { handle.kill(); }
+});
+
+it.each(['', 'null', undefined, new Error('unreadable')])('defers without a resolved default branch and retries the retained event: %s', async answer => {
+  const execFileSyncImpl = vi.fn().mockImplementationOnce(() => {
+    if (answer instanceof Error) throw answer;
+    return answer;
+  }).mockReturnValue('trunk');
+  const readCandidates = vi.fn(async () => ({ ok: true, queued: 0, prs: [] }));
+  const { handle, calls, lines, advance } = catchUpSetup({
+    defaultBranch: undefined, execFileSyncImpl, readCandidates,
+    readPr: async () => ({ ...READY_PR, baseRefName: 'trunk' }),
+  });
+  try {
+    handle.notePoll({ ok: true, marked: [mark()] });
+    advance(15_000);
+    expect(await handle.tick()).toEqual([]);
+    expect(calls).toHaveLength(0);
+    expect(readCandidates).not.toHaveBeenCalled();
+    expect(lines).toContain('enqueue-on-event: default branch unreadable — deferring wakes and catch-up; retrying on next tick');
+    expect((await handle.tick())[0]).toMatchObject({ num: 42, outcome: 'enqueued', verified: true });
+    expect(calls).toHaveLength(1);
+    expect(execFileSyncImpl).toHaveBeenCalledTimes(2);
+  } finally { handle.kill(); }
 });

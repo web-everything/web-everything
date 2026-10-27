@@ -65,7 +65,7 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
     if (args[0] === 'pr' && args[1] === 'view' && args.includes('headRefOid,labels,reviews') && readLive) return JSON.stringify(readLive());
     if (args[0] === 'pr' && args[1] === 'view') { onView[args[2]]?.(); return JSON.stringify(ghView[args[2]] ?? { state: 'OPEN', headRefOid: HEAD, labels, id: 'PR_NODE' }); }
     if (args[0] === 'api' && args[1] === 'graphql') {
-      if (args.some(a => a.includes('mergeQueue(branch:'))) return JSON.stringify(queueFacts ?? { data: { repository: { mergeQueue: { entries: {
+      if (args.some(a => a.includes('mergeQueue(branch:'))) return JSON.stringify((typeof queueFacts === 'function' ? queueFacts(args) : queueFacts) ?? { data: { repository: { mergeQueue: { entries: {
         nodes: !removed && queued ? [{ pullRequest: { id: 'PR_NODE', number: 5283 } }] : [], pageInfo: { hasNextPage: false },
       } } } } });
       if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: !removed && (queued || mutated) && (inQueue ?? true), headRefOid: HEAD } } } });
@@ -83,6 +83,7 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
   const writeState = (_p, s) => { stored = JSON.parse(JSON.stringify(s)); };
   const s = createDrainMergeStrategy({
     ...strategyExtra,
+    writeFile: strategyExtra.writeFile ?? vi.fn(),
     dryRun, env, labelProvider, readRedTeamEvidence: () => { if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }, requestRedTeam, publishNeedsYou, redTeamDeadline, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
     cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
     postConflictFinding, ...(now ? { now } : {}), resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(withLock ? { withLock } : {}),
@@ -1408,6 +1409,80 @@ describe('queue safeguard overrides and untracked queue entries', () => {
     const h = harness({ strategy: 'github-merge-queue', queued: true });
     h.s.dequeueSendBacks([{ number: 5283, labels: [] }]);
     expect(h.calls.some(c => c.some(a => String(a).includes('dequeuePullRequest')))).toBe(false);
+  });
+
+  it('empty discovery clears rebuild history before re-enqueue', () => {
+    const enqueuedAt = '2026-10-26T10:39:00Z';
+    let nodes = [];
+    let h;
+    const writeFile = vi.fn((_path, json) => h.setState(JSON.parse(json)));
+    h = harness({ strategy: 'github-merge-queue', queued: true, env: { WE_UNDER_TEST: '1' },
+      queueFacts: () => ({ data: { repository: { mergeQueue: { entries: { pageInfo: { hasNextPage: false }, nodes } } } } }),
+      strategyExtra: { writeFile } });
+    const pass = (group, time = enqueuedAt) => {
+      nodes = group ? [{ state: 'AWAITING_CHECKS', enqueuedAt: time,
+        headCommit: { oid: group.repeat(40), statusCheckRollup: { state: 'PENDING' } },
+        pullRequest: { id: 'PR_NODE', number: 5283 } }] : [];
+      h.s.dequeueSendBacks([{ number: 99, labels: ['review:changes'] }]);
+    };
+    for (const group of ['a', 'b', 'c']) pass(group);
+    expect(h.state()[5283].count).toBe(2);
+    const calls = h.calls.length;
+    pass(null);
+    expect(h.state()).toEqual({});
+    expect(h.calls.length - calls).toBe(1);
+    pass('d', '2026-10-26T11:59:00Z');
+    expect(h.state()[5283].count).toBe(0);
+    expect(h.calls.some(c => c.some(a => String(a).includes('dequeuePullRequest')))).toBe(false);
+  });
+
+  it('dequeueSendBacks sweeps an UNMERGEABLE queue entry each pass even without send-back rows', () => {
+    const queueFacts = { data: { repository: { mergeQueue: { entries: { pageInfo: { hasNextPage: false }, nodes: [{
+      state: 'UNMERGEABLE', enqueuedAt: '2026-10-26T10:39:00Z',
+      headCommit: { oid: HEAD, statusCheckRollup: { state: 'PENDING' } }, pullRequest: { id: 'PR_NODE', number: 5283 },
+    }] } } } } };
+    const h = harness({ strategy: 'github-merge-queue', queued: true, queueFacts, env: { WE_UNDER_TEST: '1' }, strategyExtra: { writeFile: vi.fn() } });
+    h.s.dequeueSendBacks([]);
+    h.s.dequeueSendBacks([]);
+    const stateReads = h.calls.filter(c => c.some(a => String(a).includes('statusCheckRollup')));
+    expect(stateReads).toHaveLength(2);
+    expect(h.calls.filter(c => c.some(a => String(a).includes('dequeuePullRequest')))).toHaveLength(1);
+    const comments = h.calls.filter(c => c[1] === 'pr' && c[2] === 'comment');
+    expect(comments).toHaveLength(1);
+    expect(comments[0].at(-1)).toContain('UNMERGEABLE');
+  });
+
+  it('dequeueSendBacks warns and dequeues nothing when the stuck-entry queue read is unreadable', () => {
+    const h = harness({ strategy: 'github-merge-queue', queued: true,
+      queueFacts: { errors: [{ message: 'offline' }] }, env: { WE_UNDER_TEST: '1' }, strategyExtra: { writeFile: vi.fn() } });
+    h.s.dequeueSendBacks([{ number: 5283, labels: ['ready-to-merge'] }]);
+    expect(h.calls.some(c => c.some(a => String(a).includes('statusCheckRollup')))).toBe(true);
+    expect(h.calls.some(c => c.some(a => String(a).includes('dequeuePullRequest')))).toBe(false);
+    expect(h.calls.some(c => c[1] === 'pr' && c[2] === 'comment')).toBe(false);
+    expect(h.logs.join('')).toMatch(/(?:⚠|warn).*queue|queue.*(?:unreadable|failed|offline)/i);
+  });
+
+  it('a failed stuck-state query still runs the existing send-back sweep', () => {
+    const queueFacts = args => args.some(a => a.includes('statusCheckRollup'))
+      ? { errors: [{ message: 'stuck states unavailable' }] }
+      : { data: { repository: { mergeQueue: { entries: { pageInfo: { hasNextPage: false }, nodes: [{ pullRequest: { id: 'PR_NODE', number: 5283 } }] } } } } };
+    const h = harness({ strategy: 'github-merge-queue', queued: true, labels: ['review:changes'], queueFacts,
+      env: { WE_UNDER_TEST: '1' }, strategyExtra: { writeFile: vi.fn() } });
+    h.s.dequeueSendBacks([{ number: 5283, labels: ['review:changes'] }]);
+    expect(h.calls.some(c => c.some(a => String(a).includes('statusCheckRollup')))).toBe(true);
+    expect(h.logs.join('')).toContain('stuck states unavailable');
+    expect(h.calls.filter(c => c.some(a => String(a).includes('dequeuePullRequest')))).toHaveLength(1);
+    expect(h.calls.find(c => c[1] === 'pr' && c[2] === 'comment').at(-1)).toContain('review:changes');
+  });
+
+  it.each([
+    { dryRun: true, repo: null, strategy: 'github-merge-queue' },
+    { dryRun: false, repo: 'other/repo', strategy: 'github-merge-queue' },
+    { dryRun: false, repo: null, strategy: 'drain-direct' },
+  ])('does not sweep outside the live local enqueue repo: %j', ({ dryRun, repo, strategy }) => {
+    const h = harness({ strategy, dryRun, env: { WE_UNDER_TEST: '1' }, strategyExtra: { writeFile: vi.fn() } });
+    h.s.dequeueSendBacks([], repo);
+    expect(h.calls).toEqual([]);
   });
 });
 

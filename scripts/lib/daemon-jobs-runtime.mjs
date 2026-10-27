@@ -22,17 +22,17 @@
  */
 
 import { spawn, execFileSync } from 'node:child_process';
-import { closeSync, openSync, readFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 
-import { withFileLock } from './atomic-json-file.mjs';
+import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import {
   DEFAULT_BACKOFF_BASE_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_HEARTBEAT_STALE_MS, DEFAULT_LAUNCH_GRACE_MS,
   SLEEP_GAP_THRESHOLD_MS, admitJobs, classifyJob, detectSleep, markClaimed, markCheckpoint, markFailed,
   markHeartbeat, markLaunching, markQueued, markRequeued, markSpawned, markStepError, markStopped, markSucceeded,
-  planReattach,
+  planReattach, taskDeadlineDecision,
 } from './daemon-jobs.mjs';
 import { codeRef, ensureCodeSnapshot, ensureNodeModulesStore, linkNodeModules, nodeModulesRef } from './daemon-job-snapshots.mjs';
 import { TERMINAL_JOB_STATUSES, formatJobHandle, isJobRecord, normalizeProcStart, parseJobHandle } from '../operations/job-record.mjs';
@@ -278,30 +278,38 @@ const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
  */
 export async function stopHandle(handle, {
   probe = (h) => probeHandle(h), kill = (pid, sig) => process.kill(pid, sig), termGraceMs = 5_000, killGraceMs = 5_000,
-  pollMs = 100, sleep = defaultSleep,
+  pollMs = 100, sleep = defaultSleep, requireConfirmedDeath = false,
 } = {}) {
   const { pid } = parseJobHandle(handle) || {};
-  if (!pid) return { gone: true, signal: null };
+  if (!pid) return { gone: !requireConfirmedDeath, signal: null };
+  const observe = () => {
+    try { return probe(handle); } catch (error) {
+      if (requireConfirmedDeath) return 'unknown';
+      throw error;
+    }
+  };
+  const isGone = state => requireConfirmedDeath ? state === 'dead' : state !== 'alive';
   const waitGone = async (budget) => {
     for (let waited = 0; waited <= budget; waited += pollMs) {
-      if (probe(handle) !== 'alive') return true;
+      if (isGone(observe())) return true;
       await sleep(pollMs);
     }
-    return probe(handle) !== 'alive';
+    return isGone(observe());
   };
   // Every signal goes to the job's process group (a detached launch leads one), so no subprocess outlives the
   // job; a handle that leads no group is signalled by pid. Subprocesses the job starts after SIGTERM (its own
   // cleanup, e.g. a lane release) are spared it, and the grace lets them finish.
   const send = (sig) => {
     try {
-      if (probe(handle) !== 'alive') return;
+      if (observe() !== 'alive') return;
       try { kill(-pid, sig); } catch { kill(pid, sig); }
     } catch { /* raced its own exit */ }
   };
   // Once the job pid is gone, SIGKILL whatever is left of its group (a grandchild the job did not wait for).
   // While any member lives the group id stays reserved, so it cannot name a newer process.
   const sweepGroup = () => { try { kill(-pid, 0); kill(-pid, 'SIGKILL'); } catch { /* no group left */ } };
-  if (probe(handle) !== 'alive') return { gone: true, signal: null };
+  const initial = observe();
+  if (initial !== 'alive') return { gone: isGone(initial), signal: null };
   send('SIGTERM');
   send('SIGCONT');
   if (await waitGone(termGraceMs)) { sweepGroup(); return { gone: true, signal: 'SIGTERM' }; }
@@ -339,23 +347,37 @@ export function readBootTime({ execFn = execFileSync, readFile = readFileSync } 
  * unused, the host has not rebooted since the job started, and every member started between the job's start
  * and `notAfterMs` (when it was last known alive, plus the staleness window). A group whose id was reused
  * after the job died has members started later, so it is never touched. Anything unreadable skips the reap.
- * @returns {boolean} whether a leftover group was killed
+ * With requireConfirmedDeath, true means the group is confirmed absent (including after SIGKILL),
+ * not merely signalled. Refusal, unreadable evidence, and pending exit all return false for a later tick.
+ * @returns {boolean} whether a leftover group was killed, or confirmed absent in strict mode
  */
 export function reapDeadGroup(handle, {
   notAfterMs, host = hostName(), aliases = null, readStart = readProcStart, groupStarts = readGroupStarts,
-  bootTime = readBootTime, kill = (pid, sig) => process.kill(pid, sig),
+  bootTime = readBootTime, kill = (pid, sig) => process.kill(pid, sig), requireConfirmedDeath = false,
 } = {}) {
   const h = parseJobHandle(handle);
-  if (!h?.pid || !Number.isFinite(notAfterMs)) return false;
+  if (!h?.pid) return false;
   const local = aliases ?? (arguments[1]?.host !== undefined ? new Set([host]) : localHostAliases());
   if (h.host !== host && !local.has(h.host)) return false;
+  const groupGone = () => {
+    try { kill(-h.pid, 0); return false; } catch (error) { return error?.code === 'ESRCH' ? true : null; }
+  };
+  if (requireConfirmedDeath) {
+    const gone = groupGone();
+    if (gone !== false) return gone === true;
+  }
+  if (!Number.isFinite(notAfterMs)) return false;
   try { if (readStart(h.pid)) return false; } catch { return false; }
   const startedMs = Date.parse(h.procStart);
-  const boot = bootTime();
+  let boot, members;
+  try { boot = bootTime(); } catch { return false; }
   if (!Number.isFinite(startedMs) || !Number.isFinite(boot) || boot > startedMs) return false;
-  const members = groupStarts(h.pid);
+  try { members = groupStarts(h.pid); } catch { return false; }
   if (!members?.length || members.some((t) => !Number.isFinite(t) || t < startedMs - 1000 || t > notAfterMs)) return false;
-  try { kill(-h.pid, 'SIGKILL'); return true; } catch { return false; }
+  try {
+    kill(-h.pid, 'SIGKILL');
+    return requireConfirmedDeath ? groupGone() === true : true;
+  } catch (error) { return requireConfirmedDeath && error?.code === 'ESRCH'; }
 }
 
 /**
@@ -375,10 +397,46 @@ export function createTickClock({ wallNow = Date.now, monoNow = () => performanc
 
 const sameGeneration = (a, b) => a.job.status === b.job.status && a.job.handle === b.job.handle && a.job.attempts === b.job.attempts;
 
+/** Publish from authoritative per-attempt evidence, under the same lock as child writes.
+ * Output corruption is repairable; these files must never enter root run enumeration.
+ */
+function repairTaskResults(store, id, guard = fn => fn) {
+  return store.update(id, guard(r => {
+    const results = r.job.task?.execution?.results;
+    if (!results || !Object.keys(results).length) return null;
+    let changed = false;
+    mkdirSync(join(store.dir, 'results'), { recursive: true });
+    for (const [attempt, result] of Object.entries(results)) {
+      const ref = `results/${id}-${attempt}.json`;
+      let published;
+      try { published = JSON.parse(readFileSync(join(store.dir, ref), 'utf8')); } catch { /* repair */ }
+      if (JSON.stringify(published) !== JSON.stringify(result)) writeJsonAtomic(join(store.dir, ref), result);
+      if (Number(attempt) === r.job.attempts && r.job.task.resultRef !== ref) {
+        r.job.task.resultRef = ref;
+        changed = true;
+      }
+    }
+    return changed ? r : null;
+  }));
+}
+
+/** Complete a saved semantic attempt without replay or another failure charge. */
+function completeTaskResult(r, { at, now, backoffBaseMs }) {
+  const result = r.job.task.execution?.results?.[r.job.attempts];
+  if (!result) throw new JobRefusal('task-incomplete', 'task semantic completion is required before job success');
+  if (result.outcome !== 'failed') return markSucceeded(r, { at });
+  if (r.job.task.failureCount >= r.job.maxAttempts) {
+    return markFailed(r, { at, reason: result.reason ?? result.outcome });
+  }
+  return markRequeued(r, { at, now, backoffBaseMs, resume: false, reason: result.reason ?? result.outcome });
+}
+
 /**
  * ONE reattach-and-admit pass. Run at boot and every tick.
  * @param {{store: object, kinds: Map<string, object>, maxConcurrent: number, clock?: object, observation?: object,
  *   probe?: Function, stop?: Function, launch?: Function, staleMs?: number, launchGraceMs?: number, reapGroup?: Function,
+ *   // reapGroup(handle, cutoff, { requireConfirmedDeath: true }) must return true only for confirmed absence.
+ *   releaseTaskClaim?: (record: object) => void, // synchronous, attempt-scoped port; must throw on refusal
  *   deadlineAt?: (record: object) => number|null, backoffBaseMs?: number, snapshot?: object, heartbeatIntervalMs?: number, log?: Function}} o
  * @returns {Promise<{slept: boolean, gapMs: number, actions: object[], corrupt: string[]}>}
  */
@@ -386,44 +444,116 @@ export async function reattachTick({
   store, kinds, maxConcurrent, clock, observation, probe = (h) => probeHandle(h), stop = (h, o = {}) => stopHandle(h, { probe, ...o }),
   launch = launchJob, staleMs = DEFAULT_HEARTBEAT_STALE_MS, launchGraceMs = DEFAULT_LAUNCH_GRACE_MS,
   backoffBaseMs = DEFAULT_BACKOFF_BASE_MS, snapshot, heartbeatIntervalMs, log = () => {}, deadlineAt = () => null,
-  reapGroup = (h, notAfterMs) => reapDeadGroup(h, { notAfterMs }),
+  releaseTaskClaim = () => {},
+  reapGroup = (h, notAfterMs, options) => reapDeadGroup(h, { ...options, notAfterMs }),
 }) {
   const obs = observation ?? (clock ? clock.observe() : { now: Date.now(), slept: false, gapMs: 0 });
   const { now, slept, gapMs } = obs;
+  const tryReleaseTaskClaim = record => {
+    try { releaseTaskClaim(record); return true; } catch (error) {
+      log(`daemon-jobs: cannot release task claim ${record.id} — retains owner and slot; inspect claim before recovery: ${error?.message ?? String(error)}`);
+      return false;
+    }
+  };
   if (slept) log(`daemon-jobs: host slept (wall-vs-monotonic gap ${Math.round(gapMs)}ms) — skipping the staleness check this tick`);
   const actions = [];
+  const confirmTaskGroupGone = (record, state) => {
+    if (!record.job.handle) return true; // unclaimed launch; no process group was recorded
+    const lastAliveMs = Date.parse(record.job.heartbeatAt ?? record.job.startedAt ?? '');
+    try {
+      if (reapGroup(record.job.handle, lastAliveMs + staleMs, { requireConfirmedDeath: true }) === true) return true;
+    } catch { /* unavailable cleanup evidence retains exclusion too */ }
+    actions.push({ id: record.id, state, action: 'stop-failed' });
+    log(`daemon-jobs: cannot confirm task process group gone ${record.id} (${record.job.handle}) — retains claim and slot; inspect group before recovery`);
+    return false;
+  };
   const { records, corrupt } = store.list();
   for (const id of corrupt) log(`daemon-jobs: job record ${id} is corrupt — left untouched, fix or delete it`);
 
-  for (const r of records) {
-    const liveness = r.job.handle ? probe(r.job.handle) : null;
+  for (let r of records) {
+    // Repair even terminal records, before classifyJob's terminal shortcut.
+    if (r.job.task?.execution?.results) r = repairTaskResults(store, r.id) ?? r;
+    const isTask = Object.hasOwn(r.job, 'task');
+    const observeOwner = () => {
+      try { return probe(r.job.handle); } catch (error) {
+        if (isTask) return 'unknown';
+        throw error;
+      }
+    };
+    const liveness = r.job.handle ? observeOwner() : null;
     const state = classifyJob(r, { now, liveness, staleMs, launchGraceMs, sleepDetected: slept });
+    const taskDeadline = isTask ? taskDeadlineDecision(r, { now }) : null;
+    const deadline = isTask ? taskDeadline?.deadlineAt : deadlineAt(r);
+    const expired = Number.isFinite(deadline) && now >= deadline && state !== 'terminal' && (isTask || state !== 'foreign');
+    const savedResult = r.job.task?.execution?.results?.[r.job.attempts];
+    if (savedResult && state !== 'terminal' && state !== 'queued' && state !== 'waiting' && (liveness === 'dead' || !expired)) {
+      if (liveness !== 'dead') continue; // publication does not revoke a live/unknown owner
+      if (!confirmTaskGroupGone(r, state)) continue;
+      store.update(r.id, f => {
+        if (!sameGeneration(f, r)) return null;
+        if (!tryReleaseTaskClaim(f)) return null;
+        return completeTaskResult(f, { at: iso(now), now, backoffBaseMs });
+      });
+      continue;
+    }
     const kindDef = kinds.get(r.job.kind) ?? null;
-    const deadline = deadlineAt(r);
-    const expired = Number.isFinite(deadline) && now >= deadline && state !== 'terminal' && state !== 'foreign';
-    const plan = expired ? { type: 'fail', stopFirst: liveness === 'alive',
-      reason: `deadline exceeded; ${r.job.attempts}/${r.job.maxAttempts} attempts; last error: ${r.job.error ?? 'not completed'}` }
-      : planReattach(r, state, { kindDef });
+    const plan = isTask && (expired || state === 'dead' || state === 'stalled')
+      ? { type: !kindDef || r.job.task.failureCount + 1 >= r.job.maxAttempts ? 'fail' : 'requeue',
+        stopFirst: !!r.job.handle && (expired || state === 'stalled'), resume: kindDef?.resumable,
+        reason: expired ? 'task deadline exceeded' : state === 'dead' ? 'handle dead' : 'heartbeat stale on a live pid' }
+      : expired ? { type: 'fail', stopFirst: liveness === 'alive',
+        reason: `deadline exceeded; ${r.job.attempts}/${r.job.maxAttempts} attempts; last error: ${r.job.error ?? 'not completed'}` }
+        : planReattach(r, state, { kindDef });
+    // Unknown task ownership never enters the unclaimed-launch recovery path.
+    if (isTask && r.job.handle && state !== 'terminal' && liveness !== 'alive' && liveness !== 'dead') {
+      actions.push({ id: r.id, state, action: 'stop-failed' });
+      log(`daemon-jobs: cannot confirm task owner ${r.id} (${r.job.handle}) — retains claim and slot; inspect owner before recovery`);
+      continue;
+    }
     if (plan.type === 'none') continue;
     const lastAliveMs = Date.parse(r.job.heartbeatAt ?? r.job.startedAt ?? '');
-    if (liveness === 'dead' && Number.isFinite(lastAliveMs) && reapGroup(r.job.handle, lastAliveMs + staleMs)) log(`daemon-jobs: job ${r.id} died with subprocesses still running — killed its process group`);
+    let stopped;
     if (plan.stopFirst) {
-      const res = await stop(r.job.handle, kindDef?.stopGraceMs ? { termGraceMs: kindDef.stopGraceMs } : {});
-      if (!res.gone) {
+      const res = await stop(r.job.handle, {
+        ...(kindDef?.stopGraceMs ? { termGraceMs: kindDef.stopGraceMs } : {}),
+        ...(isTask ? { requireConfirmedDeath: true } : {}),
+      });
+      if (!res.gone || (isTask && observeOwner() !== 'dead')) {
         actions.push({ id: r.id, state, action: 'stop-failed' });
         log(`daemon-jobs: could not stop stalled job ${r.id} (${r.job.handle}) — it keeps its slot; alerting`);
         continue;
       }
-      store.update(r.id, (f) => (sameGeneration(f, r) ? markStopped(f, { at: iso(Date.now()), signal: res.signal, handle: r.job.handle }) : null));
+      stopped = { at: iso(Date.now()), signal: res.signal, handle: r.job.handle };
+      if (!isTask) store.update(r.id, (f) => (sameGeneration(f, r) ? markStopped(f, stopped) : null));
+    }
+    // The owner can die after the tick's probe but before stopHandle's first observation. Reap after
+    // stopping too, using the dead-group identity checks before releasing exclusion or requeuing.
+    if (isTask) {
+      if (!confirmTaskGroupGone(r, state)) continue;
+    } else if ((liveness === 'dead' || stopped) && Number.isFinite(lastAliveMs) && reapGroup(r.job.handle, lastAliveMs + staleMs)) {
+      log(`daemon-jobs: job ${r.id} died with subprocesses still running — killed its process group`);
     }
     const at = iso(Date.now());
     const written = store.update(r.id, (f) => {
       if (!sameGeneration(f, r)) return null; // the child claimed or finished since we looked — re-judge next tick
+      if (isTask) {
+        // Synchronous claim port under the record lock: a concurrent finish/new attempt wins.
+        if (!tryReleaseTaskClaim(f)) return null;
+        if (stopped) f = markStopped(f, stopped);
+        // stop() can await a semantic completion without changing handle, attempt or status.
+        if (f.job.task.execution?.results?.[f.job.attempts]) return completeTaskResult(f, { at, now, backoffBaseMs });
+        f = { ...f, job: { ...f.job, task: { ...f.job.task,
+          failureCount: f.job.task.failureCount + 1, outcome: 'failed' } } };
+      }
       return plan.type === 'fail'
         ? markFailed(f, { at, reason: plan.reason })
-        : markRequeued(f, { at, now: Date.now(), reason: plan.reason, resume: plan.resume, backoffBaseMs });
+        : markRequeued(f, { at, now: isTask ? now : Date.now(), reason: plan.reason, resume: plan.resume, backoffBaseMs });
     });
     if (!written) continue;
+    if (isTask && written.job.task.execution?.results?.[written.job.attempts]) {
+      repairTaskResults(store, r.id);
+      continue;
+    }
     actions.push({ id: r.id, state, action: plan.type, reason: plan.reason });
     if (plan.type === 'fail') log(`daemon-jobs: job ${r.id} (${r.job.kind}) FAILED — ${plan.reason}`);
     else log(`daemon-jobs: job ${r.id} (${r.job.kind}) ${state} — requeued (${plan.reason})`);
@@ -497,9 +627,11 @@ export async function runJob({
   if (!claimed) return { outcome: 'refused', code: 'no-record', error: `no job record ${id}` };
 
   const own = (fn) => (r) => {
-    if (r.job.handle !== me.handle) throw new JobRefusal('superseded', `job ${id} no longer names this process`);
+    if (!r || r.job.handle !== me.handle || (claimed.job.task && (r.job.attempts !== attempt || r.job.status !== 'running'))) throw new JobRefusal('superseded', `job ${id} no longer names this process`);
     return fn(r);
   };
+  const task = claimed.job.task ? { task: claimed.job.task, attempt, handle: me.handle,
+    record: { read: () => own(r => r)(store.read(id)), update: fn => store.update(id, own(fn)) } } : undefined;
   let superseded = null;
   const beat = setInterval(() => {
     try { store.update(id, own((r) => markHeartbeat(r, { at: iso(now()) }))); } catch (e) { if (e instanceof JobRefusal) superseded = e; }
@@ -513,15 +645,16 @@ export async function runJob({
       const step = steps[i];
       let patch;
       try {
-        patch = await step.run({ jobId: id, input: record.input, data: record.job.checkpoint.data, step: i });
+        patch = await step.run({ jobId: id, input: record.input, data: record.job.checkpoint.data, step: i, ...(task ? { task } : {}) });
       } catch (e) {
         store.update(id, own((r) => markStepError(r, { at: iso(now()), step: i, error: e?.message ?? e })));
         return { outcome: 'error', error: String(e?.message ?? e) };
       }
       record = store.update(id, own((r) => markCheckpoint(r, { at: iso(now()), step: i + 1, data: patch && typeof patch === 'object' ? patch : {} })));
     }
-    store.update(id, own((r) => markSucceeded(r, { at: iso(now()) })));
-    return { outcome: 'succeeded' };
+    if (task) repairTaskResults(store, id, own);
+    const finished = store.update(id, own((r) => task ? completeTaskResult(r, { at: iso(now()), now: now() }) : markSucceeded(r, { at: iso(now()) })));
+    return finished.job.status === 'succeeded' ? { outcome: 'succeeded' } : { outcome: 'error', error: finished.job.task.outcome };
   } catch (e) {
     if (e instanceof JobRefusal) return { outcome: 'refused', code: e.code, error: e.message };
     throw e;

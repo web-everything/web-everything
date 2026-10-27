@@ -5,7 +5,8 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync } from 'nod
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { planOpen } from '../open-pr.mjs';
-import { createPrLandRunner, createPrDiffStatReader } from '../open-pr-io.mjs';
+import { createPrLandRunner, createPrDiffStatReader as legacyDiffStatReader } from '../open-pr-io.mjs';
+import { createPrDiffStatReader } from '../../lib/pr-size-admission.mjs';
 import { prepareItemFromRef } from '../prepare-pr.mjs';
 
 const title = 'WE #4368: prepare — [subject unavailable for 4368]';
@@ -136,6 +137,10 @@ describe('prepare guard scope (only prepare-item PRs are guarded)', () => {
     expect(spawn.mock.calls[0][1]).toContain('--title=WE #4400: author decision forks');
   });
 
+  it('the legacy prepare import re-exports the shared size reader', () => {
+    expect(legacyDiffStatReader).toBe(createPrDiffStatReader);
+  });
+
   it('the default git runner has an explicit large maxBuffer (no 1 MB ENOBUFS cliff on the backlog listing)', () => {
     const sha = 'a'.repeat(40);
     const text = '1\t0\tbacklog/card.md\0';
@@ -145,7 +150,7 @@ describe('prepare guard scope (only prepare-item PRs are guarded)', () => {
       return Buffer.from(`${sha}\n`);
     });
     const read = createPrDiffStatReader({ cwd: '/repo', exec });
-    expect(read({ base: 'main', sha: 'HEAD' })).toEqual({ text, sha });
+    expect(read({ base: 'main', sha: 'HEAD' })).toEqual({ text, sha, baseSha: sha });
     expect(exec).toHaveBeenCalledTimes(4);
     for (const [command, , options] of exec.mock.calls) {
       expect(command).toBe('git');
