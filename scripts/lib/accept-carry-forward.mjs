@@ -231,6 +231,13 @@ export function isKnownMachineBody(body, comment = undefined) {
       return isNonBlockingRedTeamGate(text);
     }
     if (text.startsWith(RED_TEAM_COMMENT_MARKER)) {
+      const parsed = parseRedTeamComment(text);
+      // The skip settlement writer's complete policy-clear envelope is also non-blocking.
+      // Extra prose, malformed markers, and unauthenticated authors remain possible holds.
+      const lines = text.split(/\r?\n/).filter(line => line.trim());
+      if (parsed && SHA_RE.test(parsed.rev) && lines.length === 2
+        && lines[0] === redTeamMarker(parsed.pr, parsed.rev)
+        && /^Red team not required on this head: [^\r\n]+$/.test(lines[1])) return true;
       return isNonBlockingRedTeamAdvisory(text);
     }
   }

@@ -14,8 +14,19 @@ export function reviewOnlyRedTeamResult(result) {
  */
 export function redTeamStatusWithoutRun(row, { originalStatus } = {}) {
   if (row?.status !== 'finished') return false;
+  // The durable retry spend survives missing seat rows and legacy placeholder results.
+  if (row.retryCount !== undefined && row.retryCount !== 0) return false;
   return (row.result === null && originalStatus?.status === 'queued')
     || row.result === 'ran' || row.result === 'resumed'
     || (row.result?.status === 'resumed'
       && !Array.isArray(row.result.findings) && !row.result.provider && !row.result.model);
+}
+
+/** One failed execution may retry; absent counts and completed seats retain their existing guards. */
+export function failedRedTeamRetry(status, { failedSeatCount, completedRecorded } = {}) {
+  const result = status?.result;
+  return (status?.retryCount === undefined || status.retryCount === 0)
+    && status?.status === 'finished' && (typeof result === 'string' ? result : result?.status) === 'ran'
+    && completedRecorded === false && failedSeatCount === 1
+    && (result?.comment?.status ?? result?.comment) !== 'posted';
 }
