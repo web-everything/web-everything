@@ -11,12 +11,15 @@
  *   • the NUMSTAT PARSE + BUCKETING → renames and binaries are the two shapes that silently corrupt a line
  *     count, and this repo renames a file every time a backlog card is JIT-numbered.
  *
- * Nothing here shells out to git except the one end-to-end case, which asserts SHAPE and invariants against
- * the live repository — never a specific number, which would re-break every week.
+ * Repository coverage ratchets read the tracked tree only. The end-to-end history case uses a tiny local
+ * repository with dated commits, so neither runtime nor expected output depends on the live history.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { outputMixFixture } from '../../__tests__/fixtures/output-mix-fixture.mjs';
 import {
   CLASSES,
   WEEK_COUNT,
@@ -451,16 +454,21 @@ describe('ratioLabel', () => {
   });
 });
 
-describe('computeOutputMix — against the live repository', () => {
-  // main-red 2026-10-27: fails independent of checkout; root cause carded.
-  it.skip('derives the current week plus four completed weeks, and never throws', () => {
-    const mix = computeOutputMix({ today: '2026-08-09' });
-    expect(mix.fresh).toBe(true);
+describe('computeOutputMix — real Git history', () => {
+  const sandbox = mkdtempSync(join(tmpdir(), 'output-mix-'));
+  afterAll(() => rmSync(sandbox, { recursive: true, force: true }));
+
+  it('derives the current week plus four completed weeks, and never throws', () => {
+    const { repoRoot } = outputMixFixture(join(sandbox, 'repo'));
+    const mix = computeOutputMix({ repoRoot, today: '2026-08-09' });
+    expect(mix.fresh, mix.reason).toBe(true);
     expect(mix.weeks).toHaveLength(WEEK_COUNT);
     expect(mix.trend).toHaveLength(WEEK_COUNT - 1);
     expect(mix.current.start).toBe('2026-08-03');
-    // Deliberately NOT an exact number — that would re-break every week. The invariant is that the three
-    // classes partition the week's additions exactly, which is what makes the two headline numbers honest.
+    expect(mix.weeks.map(w => [w.product, w.machinery, w.other, w.total])).toEqual([
+      [1, 2, 3, 6], [2, 4, 6, 12], [3, 6, 9, 18], [4, 8, 12, 24], [5, 10, 15, 30],
+    ]);
+    // The three classes partition each week's additions exactly.
     for (const w of mix.weeks) expect(w.product + w.machinery + w.other).toBe(w.total);
   });
 
