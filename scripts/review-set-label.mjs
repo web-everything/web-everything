@@ -1992,6 +1992,7 @@ export function runReviewLabelCli({
     }
     const ledgerVerdict = verdictForLabelTarget(to);
     let clearingLedgerMiss = false;
+    let approvalRefusal = '';
     try {
       const appended = appendVerdict(buildVerdictRecord({
         repo,
@@ -2026,6 +2027,15 @@ export function runReviewLabelCli({
         // harmless (clearing is idempotent).
         let approval;
         try {
+          // The verdict append can block on ledger transport. A push or a new hold
+          // during that append must not receive a later, headless approval row.
+          if (guardedClearHuman) {
+            const fresh = provider.readPrState(repo, pr);
+            if (fresh.headRefOid !== headSha) throw new Error('head changed before acceptance; hold retained');
+            assertMandatoryReferralsCleared(fresh, { repo, pr, ...referralOptions });
+            assertGuardedClearHumanEligible(fresh.labels);
+            if (!approvalValid(validatedApproval, Date.now())) throw new Error('delegated clearance refused: delegation expired between ledger appends');
+          }
           approval = appendApproval(buildLedgerEvent({
             type: EVENT_TYPES.APPROVAL,
             repo,
@@ -2040,6 +2050,7 @@ export function runReviewLabelCli({
           }));
         } catch (e) { approval = { ok: false, errors: [String((e && e.message) || e).split('\n')[0]] }; }
         if (!approval?.ok) {
+          approvalRefusal = (approval?.errors ?? []).join('; ');
           process.stderr.write(`review-set-label: approval-ledger append REFUSED (#5649) — ${(approval?.errors ?? []).join('; ')}\n`);
           clearingLedgerMiss = true;
         }
@@ -2049,7 +2060,7 @@ export function runReviewLabelCli({
     }
     // Outside the try on purpose: a stubbed or real `process.exit` must never be swallowed by the non-fatal catch above.
     if (clearingLedgerMiss) {
-      fail('verdict-ledger write refused for a clearing verdict (F4): the label is NOT swapped; retry once the ledger transport is reachable', 1);
+      fail(`verdict-ledger write refused for a clearing verdict (F4): the label is NOT swapped; ${approvalRefusal || 'retry once the ledger transport is reachable'}`, 1);
     }
     ledgerRecorded = true;
   };

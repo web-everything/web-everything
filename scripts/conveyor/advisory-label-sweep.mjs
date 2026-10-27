@@ -83,12 +83,13 @@ export function carriesAdvisoryLabel(pr) {
  * @param {{exec?: Function, repo?: string|null}} [o]
  * @returns {Array<object>}
  */
-export function defaultListPrs({ exec = execFileSyncThrottled, repo = null, fields = 'number,labels,headRefOid,comments' } = {}) {
+export function defaultListPrs({ exec = execFileSyncThrottled, repo = null, fields } = {}) {
+  // Keep the default read visible to the line-local PR-comment-read ratchet.
+  const jsonFields = fields === undefined ? ['--json', 'number,labels,headRefOid,comments'] : ['--json', fields];
   // #gh-graphql-budget — read the host-shared open-PR snapshot (one right-sized list per repo per TTL for the
   // whole fleet) instead of a private `gh pr list`; null = not applicable (tests, cwd repo) → the direct read below.
-  if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields }); if (shared) return shared; }
-  const argv = ['pr', 'list', '--state', 'open', '--limit', String(PR_LIST_LIMIT),
-    '--json', fields];
+  if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: jsonFields[1] }); if (shared) return shared; }
+  const argv = ['pr', 'list', '--state', 'open', '--limit', String(PR_LIST_LIMIT), ...jsonFields];
   if (repo) argv.push('--repo', repo);
   // #x5n4zn3 — was bare (no timeout).
   const out = exec('gh', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });

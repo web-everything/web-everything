@@ -2532,7 +2532,8 @@ shadow/live behavior, durable void memos, or default-reader reconciler compositi
 
 `scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` crosses every label in
 `DELEGATED_CLEARANCE_INELIGIBLE_LABELS`, plus unreadable/malformed labels and failed reads,
-with each admission read including the initial observation: before comment, before swap, and
+with each admission read including the initial observation: before comment, before swap,
+between the verdict and approval appends, and
 (already accepted only) before reassertion. Keep a trusted matching repark marker in these
 fixtures so the reassert write is reachable. Refusal exits 1 and permits no subsequent writes;
 only a refusal before the first write can promise zero writes for the entire invocation.
@@ -2542,9 +2543,15 @@ The first write-time admission read also precedes both clearance ledger appends,
 either comment/label order. A second-read refusal must leave zero ledger rows and
 retain the label-input human hold. Validate delegation expiry with the shared
 `approvalValid` predicate on the schema-built approval, then check it again before
-the first append in case it expired during the reads. The
+the first append in case it expired during the reads. A fresh head, referral, label and
+expiry check also separates the two appends. A refusal there leaves the head-bound verdict
+but no approval or forge writes. Later refusals explicitly assert the complete prior ledger
+row set: both rows can already exist, and cannot be rolled back. These writes are not an
+atomic transaction with GitHub; this guard detects changes observed after the verdict
+append, not changes occurring after the subsequent read. The
 `clear-human-admission-ledger` soak replay covers expired delegation, a second-read
-`review:changes`, both write orders, fixed and argv targets, and retries against a
+`review:changes`, a head change and newly mirrored human hold between ledger appends,
+both write orders, fixed and argv targets, and retries against a
 disposable home ledger.
 
 Delegated `runReviewLabelCli` forge-write inventory (including called helpers):
@@ -2570,8 +2577,12 @@ Guarantee-to-test map (case names are parameterized Vitest titles):
 | Live delegation expiry | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `refuses $name delegation expiry without any durable write` | Missing, malformed and expired timestamps refuse with zero ledger/comment/label writes; human hold remains. |
 | Expiry during admission | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `refuses delegation expiring during read %s before both ledger appends` | Expiry equal to the current clock refuses before either append. |
 | Second-read refusal leaves no clearance authority | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `retains the human hold with zero ledger appends when review:changes arrives on the second read (accepted=%s)` | Both write orders exit 1, append nothing, and preserve the evaluated human hold. |
+| Recheck between appends | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `retains a new head human hold arriving between ledger appends (accepted=%s)` | New head and mirrored hold leave only the original verdict and label-input rows; no approval/comment/label write; evaluated human hold remains. |
+| Expiry during verdict persistence | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `refuses delegation expiring between ledger appends before comment or label writes` | Exactly one verdict row, no approval or forge writes. |
 | Head pin at every admission boundary | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `refuses a moved head at read $injectAt ($boundary), with no subsequent writes` | Exit 1, boundary diagnostic, only explicitly enumerated prior writes. |
-| Initial and later label eligibility | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `refuses $label at read $injectAt ($boundary), with no subsequent comment or label writes` | Every blocker/read failure refuses; no writes after refusal. |
+| Initial and later label eligibility | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `refuses $label at read $injectAt ($boundary), with no subsequent comment or label writes` | Every blocker/read failure refuses; no writes after refusal; exact earlier ledger row set asserted at every boundary. |
+| Mechanical handoff exclusion and forge write inventory | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `delegated clear-human reaches only enumerated provider writes, excluding mechanical handoff (accepted=%s)` | Both write orders assert exact comment/label call counts and arguments, no add/remove calls, and the ledger row set. |
+| Delegation cannot select handoff targets | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `refuses delegated flags on %s before mechanical handoff or any durable write` | Accepted/changes/restamp/rearm refuse before PR reads or durable writes. |
 | Operator recovery remains best effort | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `preserves operator best-effort reassertion on %s` | Read failure/head movement leaves exit 0 with no reassert write. |
 | List field projection | `we:scripts/conveyor/__tests__/advisory-label-sweep.test.mjs` | `passes $name list fields unchanged to forge argv` | Default and explicit fields reach the exact JSON argument. |
 | View field projection and complete comments | `we:scripts/conveyor/__tests__/advisory-label-sweep.test.mjs` | `passes $name view fields and replaces projected comments with the complete thread` | Exact argv; paginated thread replaces projected comments. |
