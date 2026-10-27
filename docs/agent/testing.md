@@ -33,7 +33,9 @@ inputs establish only that refusal; they never authorize building from a stale t
 the soak adopt a pin, advance main, fail its refresh, assert preserved content/HEAD/registration, and retry
 with a healthy fetch to verify recovery. The next tick retries;
 restore or re-register deleted branches from recorded SHAs when their content is still needed.
-Containment carriers must have refreshed fetch evidence when preparation supplies it. Select maximal carriers
+Omitting the entire per-ref evidence map also preserves registrations, including cached and recorded landed
+tips. Direct classifier/retirement fixtures must supply explicit fetch outcomes; cached refs alone are no proof.
+Containment carriers must have refreshed fetch evidence. Select maximal carriers
 only among those available refs: a missing larger or equal tip must not displace a refreshed overlay from the
 plan. Preparation regressions cover missing tops, equal tips, a missing top above a live containing branch,
 and retirement into a refreshed top; the soak also checks a refreshed source beneath a missing recorded top.
@@ -76,6 +78,9 @@ registry storage without `.git` writes. The retirement soak checks the real cand
 after a closed container and after an open container is force-pushed to unrelated content. In `on` mode a
 `retiring` audit line is written before removal; if it fails, nothing is removed. A failed `removed` line or
 `overlay-retired` event after removal is returned in `auditFailures` and preparation alerts on it.
+Preparation regressions separately cover restored sources whose live tips advanced, early retirement of a
+landed carrier with unmerged archives, edge-resolved adopted inputs, distinct outer/nested archive SHAs,
+deferred tip persistence failures, and forwarding post-removal audit failures to the daemon alert.
 
 Refreshed tips carry `{sha, reg}` from classification through preparation's deferred persistence. Compare
 `reg` with `registrationIdentity` under the list lock; reject plain SHA values and changed/vanished registrations.

@@ -72,13 +72,14 @@ export default {
       ok('update-ref', 'refs/remotes/origin/main', initial);
       const overlays = [{ ref: 'deleted', sha: initial }];
       writeOverlays(root, overlays, { env });
-      const shadow = await autoRetireOverlays({ root, env, overlays, git, now: () => Date.parse('2026-10-29T12:00:00Z') });
+      const refEvidence = new Map([['deleted', 'missing']]);
+      const shadow = await autoRetireOverlays({ root, env, overlays, git, refEvidence, now: () => Date.parse('2026-10-29T12:00:00Z') });
       if (shadow.retired.length || readOverlayState(root, { env }).overlays.length !== 1) {
         violation('explicit-shadow-promoted', 'operator shadow removed a registration after the tool graduation date');
       }
       const auditFile = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
       const firstAudit = readFileSync(auditFile, 'utf8');
-      await autoRetireOverlays({ root, env, overlays, git });
+      await autoRetireOverlays({ root, env, overlays, git, refEvidence });
       if (readFileSync(auditFile, 'utf8') !== firstAudit) {
         violation('shadow-audit-unbounded', 'a second observation appended the same ref, sha and reason');
       }
@@ -122,6 +123,7 @@ export default {
       const stack = [{ ref: 'lower', sha: lower }, { ref: 'top', sha: top }];
       writeOverlays(root, stack, { env });
       const replaced = await autoRetireOverlays({ root, env, overlays: stack, git,
+        refEvidence: new Map(stack.map((o) => [o.ref, 'refreshed'])),
         removeOverlay: (r, ref, opts) => {
           writeOverlays(root, [stack[0], { ref: 'top', sha: initial, addedAt: 'replacement' }], { env });
           return removeOverlay(r, ref, opts);
@@ -253,8 +255,17 @@ export async function registrationEvidenceReplay() {
         && entries().some((o) => o.ref === 'nested'), { archives, restoredSource, restored: entries() });
     }
 
+    // Cached and recorded landed tips cannot authorize retirement without this tick's fetch evidence.
+    for (const overlay of [{ ref: 'feature' }, { ref: 'gone', sha: landed }]) {
+      writeOverlays(root, [overlay], { env });
+      const unverified = await autoRetireOverlays({ root, env, overlays: entries(), git });
+      check(`omitted-freshness-preserves-${overlay.ref}`, unverified.retired.length === 0
+        && entries().some((o) => o.ref === overlay.ref), { retired: unverified.retired, entries: entries() });
+    }
+
     writeOverlays(root, [{ ref: 'gone', sha: landed }], { env });
     const failedEvent = await autoRetireOverlays({ root, env, overlays: entries(), git,
+      refEvidence: new Map([['gone', 'missing']]),
       appendDaemonEvent: async () => { throw new Error('injected daemon event failure'); } });
     check('daemon-event-failure-is-reported', entries().length === 0 && failedEvent.retired.length === 1
       && failedEvent.auditFailures[0]?.kind === 'overlay-retired'

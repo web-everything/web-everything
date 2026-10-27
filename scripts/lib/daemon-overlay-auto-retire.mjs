@@ -49,7 +49,8 @@ export function classifyOverlays({ overlays, git, mainSha = 'origin/main', refEv
     try {
       if (!main || !isSafeBranchName(overlay?.ref)) return row;
       const evidence = refEvidence?.get(overlay.ref);
-      if (refEvidence && !['refreshed', 'missing'].includes(evidence)) return row;
+      // Omitted evidence is unknown freshness, not permission to trust cached tracking refs.
+      if (!['refreshed', 'missing'].includes(evidence)) return row;
       const tracking = `refs/remotes/origin/${overlay.ref}`;
       // A confirmed absence uses recorded evidence even if deleting the cached tracking ref failed.
       const refs = evidence === 'missing' ? [] : String(call(['for-each-ref', '--format=%(refname) %(objectname)', tracking]).stdout ?? '').trim().split('\n');
@@ -93,7 +94,7 @@ export function classifyOverlays({ overlays, git, mainSha = 'origin/main', refEv
   const contains = (a, b) => ancestors.get(`${a.ref}\n${b.ref}`) === true;
   // Preparation excludes unavailable refs from the plan, even when their recorded commits prove containment.
   // Elect maxima only among refreshed carriers so a missing larger/equal tip cannot displace an available one.
-  const carriers = candidates.filter((r) => !refEvidence || refEvidence.get(r.ref) === 'refreshed');
+  const carriers = candidates.filter((r) => refEvidence?.get(r.ref) === 'refreshed');
   // Strict maxima stay registered. Equal tips elect the last eligible registration, preventing mutual retirement.
   const tops = carriers.filter((a, i) => !carriers.some((b, j) => a !== b && contains(a, b) && (!contains(b, a) || j > i)));
   for (const a of candidates) {

@@ -356,6 +356,8 @@ export async function prepareRebuild({
       const carries = (sha) => {
         if (!FULL_SHA_RE.test(sha ?? '') || !FULL_SHA_RE.test(plan.finalSha ?? '')) throw new Error('invalid archived commit');
         if (covered.has(sha)) return covered.get(sha);
+        // A restored source may have advanced beyond its archived SHA. Prove the archive is in the
+        // proposed build by ancestry; requiring equality with the live tip would hold recovery forever.
         const ancestor = git(['merge-base', '--is-ancestor', sha, plan.finalSha]);
         if (ancestor.error || ![0, 1].includes(ancestor.status)) throw new Error('archive ancestry unavailable');
         let present = ancestor.status === 0;

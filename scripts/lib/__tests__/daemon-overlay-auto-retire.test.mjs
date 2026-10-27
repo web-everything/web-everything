@@ -26,10 +26,13 @@ const commit = (file, text) => {
 const track = (ref, sha = 'HEAD') => ok('update-ref', `refs/remotes/origin/${ref}`, sha);
 const branch = (ref, from = initial) => ok('checkout', '-q', '-B', ref, from);
 const register = (overlays) => writeOverlays(root, overlays, { env });
-const classify = (overlays) => classifyOverlays({ overlays, git, mainSha: 'origin/main' });
+// These disposable local fixtures explicitly model the fetch outcome; production gets it from fetch.
+const fixtureEvidence = (overlays) => new Map(overlays.map((o) => [o.ref,
+  git(['show-ref', '--verify', `refs/remotes/origin/${o.ref}`]).status === 0 ? 'refreshed' : 'missing']));
+const classify = (overlays) => classifyOverlays({ overlays, git, mainSha: 'origin/main', refEvidence: fixtureEvidence(overlays) });
 const retire = (overlays, options = {}) => {
   register(overlays);
-  return autoRetireOverlays({ root, env, overlays, git, mainSha: 'origin/main', ...options });
+  return autoRetireOverlays({ root, env, overlays, git, mainSha: 'origin/main', refEvidence: fixtureEvidence(overlays), ...options });
 };
 const audit = () => readFileSync(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
 const prepare = (options = {}) => prepareRebuild({
@@ -164,7 +167,9 @@ describe('real Git retirement evidence', () => {
       } });
       expect(result.retired, kind).toEqual([]);
       expect(result.wouldRetire, kind).toEqual([]);
-      expect(readOverlayState(root, { env }).overlays, kind).toEqual(overlays);
+      expect(readOverlayState(root, { env }).overlays, kind).toEqual(overlays.map((o) => ({
+        ...o, tipSha: ok('rev-parse', `refs/remotes/origin/${o.ref}`),
+      })));
       expectNoRetirement();
     }
   });
@@ -301,9 +306,9 @@ describe('real Git retirement evidence', () => {
     env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'shadow';
     const overlays = [{ ref: 'deleted', sha: initial }];
     register(overlays);
-    await autoRetireOverlays({ root, env, overlays, git });
+    await autoRetireOverlays({ root, env, overlays, git, refEvidence: new Map([['deleted', 'missing']]) });
     const first = readFileSync(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'), 'utf8');
-    const second = await autoRetireOverlays({ root, env, overlays, git });
+    const second = await autoRetireOverlays({ root, env, overlays, git, refEvidence: new Map([['deleted', 'missing']]) });
     expect(second.wouldRetire).toHaveLength(1);
     expect(readFileSync(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'), 'utf8')).toBe(first);
   });
@@ -533,7 +538,7 @@ describe('real Git retirement evidence', () => {
     const result = await retire([{ ref: 'feature' }]);
     expect(result.retired).toEqual([]);
     expect(result.kept[0]).toMatchObject({ ref: 'feature', class: 'needed', reason: 'unmerged-content' });
-    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'feature' }]);
+    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'feature', tipSha: ok('rev-parse', 'origin/feature') }]);
   });
 
   it('retires a contained overlay while its consolidated top remains, with both audit trails', async () => {
@@ -545,7 +550,8 @@ describe('real Git retirement evidence', () => {
     track('top');
     const result = await retire([{ ref: 'lower' }, { ref: 'top' }]);
     expect(result.retired).toEqual([expect.objectContaining({ ref: 'lower', class: 'contained', sha: lower })]);
-    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'top', retiredSources: [{ entry: { ref: 'lower' }, sha: lower }] }]);
+    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'top', tipSha: ok('rev-parse', 'origin/top'),
+      retiredSources: [{ entry: { ref: 'lower' }, sha: lower }] }]);
     expect(audit()).toEqual([
       expect.objectContaining({ kind: 'retiring', by: 'auto-retire', ref: 'lower', sha: lower, container: 'top' }),
       expect.objectContaining({ kind: 'removed', by: 'auto-retire', ref: 'lower', sha: lower }),
@@ -592,7 +598,7 @@ describe('real Git retirement evidence', () => {
     expect(result.retired).toEqual([]);
     expect(result.wouldRetire).toEqual([]);
     expect(result.kept[0]).toMatchObject({ ref: 'feature', class: 'needed', reason: 'unmerged-content' });
-    expect(readOverlayState(root, { env }).overlays).toEqual(overlays);
+    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'feature', tipSha: tip }]);
   });
 
   it('keeps still-needed and conflicting overlays', async () => {
@@ -681,7 +687,7 @@ describe('real Git retirement evidence', () => {
       ref: entry.ref, sha, class: 'contained', container: topRef,
     })));
     expect(result.kept).toEqual([expect.objectContaining({ ref: topRef, sha: top, class: 'needed', reason: 'unmerged-content' })]);
-    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: topRef, retiredSources: sources }]);
+    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: topRef, tipSha: top, retiredSources: sources }]);
 
     expect(removeOverlay(root, topRef, { env, why: 'pr-closed' }).reinstated).toEqual(refs);
     expect(readOverlayState(root, { env }).overlays).toEqual(sources.map(({ entry, sha }) => ({ ...entry, tipSha: sha })));
@@ -707,7 +713,7 @@ describe('real Git retirement evidence', () => {
       },
     });
     expect(result.retired).toEqual([]);
-    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'lower' }]);
+    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'lower', tipSha: ok('rev-parse', 'origin/lower') }]);
   });
 
   it('container re-registration with unrelated content preserves the contained source', async () => {
@@ -722,7 +728,9 @@ describe('real Git retirement evidence', () => {
       },
     });
     expect(result.retired).toEqual([]);
-    expect(readOverlayState(root, { env }).overlays).toEqual([original[0], replacement]);
+    expect(readOverlayState(root, { env }).overlays).toEqual([
+      { ...original[0], tipSha: ok('rev-parse', 'origin/lower') }, replacement,
+    ]);
     expectNoRetirement();
   });
 
@@ -743,7 +751,8 @@ describe('real Git retirement evidence', () => {
     commit('top', 'top'); track('top');
     const commands = new Set();
     const forbidden = [];
-    const rows = classifyOverlays({ overlays: [{ ref: 'lower' }, { ref: 'top' }, { ref: 'deleted', sha: initial }, { ref: 'unknown' }], git: (args) => {
+    const rows = classifyOverlays({ overlays: [{ ref: 'lower' }, { ref: 'top' }, { ref: 'deleted', sha: initial }, { ref: 'unknown' }],
+      refEvidence: new Map([['lower', 'refreshed'], ['top', 'refreshed'], ['deleted', 'missing'], ['unknown', 'missing']]), git: (args) => {
       const [command, ...options] = args;
       const oid = '[0-9a-f]{40,64}';
       const permitted = {
