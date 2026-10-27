@@ -4,7 +4,7 @@ import { compute } from './step-kinds.mjs';
 import { measureNonTestLines, OPEN_PR_MAX_NON_TEST_LINES } from './open-pr.mjs';
 
 export const PR_SIZE_OP = 'pr-size';
-const scope = 'committed HEAD vs origin/main (local main fallback); working-tree changes excluded';
+const scope = 'committed HEAD vs refs/remotes/origin/main (local main ignored); working-tree changes excluded';
 
 export function prSizeOperation({ readDiff } = {}) {
   if (typeof readDiff !== 'function') throw new TypeError('pr-size: needs an injected readDiff()');
