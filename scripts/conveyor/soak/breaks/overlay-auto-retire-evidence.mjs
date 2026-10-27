@@ -1,0 +1,250 @@
+/** PR #5964: retirement must honor explicit shadow and fresh per-ref evidence. */
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { prepareRebuild } from '../../../lib/daemon-rebuild/prepare.mjs';
+import { rebuildClone } from '../../../lib/daemon-rebuild.mjs';
+import { ACTIVE_BUILD_TOKENS, releaseBuildLease } from '../../../lib/daemon-rebuild/lease.mjs';
+import { readRebuildState, writeRebuildState } from '../../../lib/daemon-rebuild/state.mjs';
+import { addOverlay, overlayFilePath, readOverlayState, removeOverlay, writeOverlays } from '../../../lib/daemon-overlays.mjs';
+import { autoRetireOverlays } from '../../../lib/daemon-overlay-auto-retire.mjs';
+
+export default {
+  id: 'overlay-auto-retire-evidence',
+  title: 'stale overlays preserve registrations and adopted pins without repeating shadow audit',
+  card: 'PR #5964',
+  fixedBy: { sha: 'pr-5964-repair', where: 'lane/overlay-auto-retire', paths: [
+    'scripts/lib/daemon-overlay-auto-retire.mjs', 'scripts/lib/daemon-rebuild/prepare.mjs',
+    'scripts/lib/daemon-rebuild/edge-fetch.mjs', 'scripts/lib/daemon-overlays.mjs',
+  ] },
+  fixPresent(root) {
+    try {
+      return readFileSync(join(root, 'scripts/lib/daemon-overlay-auto-retire.mjs'), 'utf8').includes("r.sources.mode === 'tool'")
+        && readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8').includes('refEvidence: fetchResult.refEvidence')
+        && readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8').includes('const plan = unavailablePinned ??')
+        && readFileSync(join(root, 'scripts/lib/daemon-overlays.mjs'), 'utf8').includes('expectedRequiredOverlay')
+        && readFileSync(join(root, 'scripts/lib/daemon-overlays.mjs'), 'utf8').includes('retiredSources')
+        && readFileSync(join(root, 'scripts/lib/daemon-overlay-auto-retire.mjs'), 'utf8').includes('persistTipShas');
+    } catch { return false; }
+  },
+  async run() {
+    const root = mkdtempSync(join(tmpdir(), 'overlay-retire-soak-'));
+    const violations = [];
+    const violation = (invariant, detail) => violations.push({ invariant, detail, daemon: 'rebuild', tick: 0 });
+    const env = {
+      WE_DAEMON_OVERLAY_DIR: join(root, 'store'), WE_DAEMON_STATE_DIR: join(root, 'state'),
+      WE_DAEMON_EVENTS: join(root, 'events.jsonl'), WE_PLATFORM_PREFERENCES_FILE: join(root, 'prefs.json'),
+      WE_DAEMON_AUTO_REBASE: '0', WE_DAEMON_OVERLAY_AUTO_RETIRE: 'shadow',
+      WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks'), WE_DAEMON_REBUILD_SKIP_UNRELATED: '0',
+    };
+    const git = (args) => spawnSync('git', ['-c', 'user.name=Soak', '-c', 'user.email=soak@example.test', ...args], {
+      cwd: root, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+    });
+    const ok = (...args) => {
+      const result = git(args);
+      if (result.status !== 0) throw new Error(String(result.stderr));
+      return String(result.stdout).trim();
+    };
+    const commit = (file) => {
+      writeFileSync(join(root, file), file);
+      ok('add', file); ok('commit', '-qm', file);
+      return ok('rev-parse', 'HEAD');
+    };
+    const prepare = async (run = git) => {
+      const prepared = await prepareRebuild({ root, env, run, now: Date.now, mainOnly: false,
+        prState: async () => 'OPEN', prBaseChain: async () => [] });
+      // These probes stop at planning. Cancel their build leases before the next probe, as rebuildClone
+      // does on exit; otherwise a successful probe blocks the next one as rebuild-in-progress.
+      if (prepared.lease) {
+        try {
+          const state = readRebuildState(root, env);
+          releaseBuildLease(state, prepared.lease);
+          writeRebuildState(root, state, env);
+        } finally { ACTIVE_BUILD_TOKENS.delete(prepared.lease.token); }
+      }
+      return prepared;
+    };
+    try {
+      writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, '{}');
+      ok('init', '-q', '-b', 'main');
+      const initial = commit('base');
+      ok('update-ref', 'refs/remotes/origin/main', initial);
+      const overlays = [{ ref: 'deleted', sha: initial }];
+      writeOverlays(root, overlays, { env });
+      const shadow = await autoRetireOverlays({ root, env, overlays, git, now: () => Date.parse('2026-10-29T12:00:00Z') });
+      if (shadow.retired.length || readOverlayState(root, { env }).overlays.length !== 1) {
+        violation('explicit-shadow-promoted', 'operator shadow removed a registration after the tool graduation date');
+      }
+      const auditFile = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
+      const firstAudit = readFileSync(auditFile, 'utf8');
+      await autoRetireOverlays({ root, env, overlays, git });
+      if (readFileSync(auditFile, 'utf8') !== firstAudit) {
+        violation('shadow-audit-unbounded', 'a second observation appended the same ref, sha and reason');
+      }
+      env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'on';
+      ok('clone', '--bare', '-q', root, join(root, 'origin.git'));
+      ok('remote', 'add', 'origin', join(root, 'origin.git'));
+      writeOverlays(root, overlays, { env });
+      const previousEvents = readFileSync(auditFile, 'utf8').trim().split('\n').length;
+      for (const mode of ['off', 'shadow', 'on']) {
+        env.WE_DAEMON_OVERLAY_AUTO_RETIRE = mode;
+        writeOverlays(root, overlays, { env });
+        const prepared = await prepare();
+        if (prepared.result?.reason !== 'up-to-date') {
+          violation('stale-registration-blocks-main', `${mode}: deleted landed registration blocked preparation (${prepared.result?.reason})`);
+        }
+      }
+      const retiredEvents = readFileSync(auditFile, 'utf8').trim().split('\n').slice(previousEvents).map(JSON.parse);
+      if (readOverlayState(root, { env }).overlays.length || !retiredEvents.some((e) => e.by === 'auto-retire' && e.ref === 'deleted')) {
+        violation('deleted-landed-overlay-retained', 'a confirmed missing branch with a recorded main commit was not retired');
+      }
+      // A live remote branch whose fetch fails must not be retired using its stale cached main tip.
+      ok('checkout', '-qb', 'feature');
+      commit('feature');
+      ok('push', '-q', 'origin', 'feature');
+      ok('checkout', '-q', 'main');
+      ok('update-ref', 'refs/remotes/origin/feature', initial);
+      const uncertain = [{ ref: 'feature', sha: initial }];
+      writeOverlays(root, uncertain, { env });
+      const held = await prepare((args) => args[0] === 'fetch' && args.some((arg) => arg.includes('refs/heads/feature:'))
+        ? { status: 1, stderr: 'transient fetch error' } : git(args));
+      if (held.result?.reason !== 'up-to-date' || held.result?.plan?.decisions.length
+        || !readOverlayState(root, { env }).overlays.some((o) => o.ref === 'feature')) {
+        violation('failed-fetch-lost-registration', 'an unconfirmed overlay blocked main, used a cached tip or lost its registration');
+      }
+      // Containment was proved against this registration, then a different registration took its name.
+      ok('checkout', '-qb', 'lower');
+      const lower = commit('lower');
+      ok('update-ref', 'refs/remotes/origin/lower', lower);
+      const top = commit('top');
+      ok('update-ref', 'refs/remotes/origin/top', top);
+      const stack = [{ ref: 'lower', sha: lower }, { ref: 'top', sha: top }];
+      writeOverlays(root, stack, { env });
+      const replaced = await autoRetireOverlays({ root, env, overlays: stack, git,
+        removeOverlay: (r, ref, opts) => {
+          writeOverlays(root, [stack[0], { ref: 'top', sha: initial, addedAt: 'replacement' }], { env });
+          return removeOverlay(r, ref, opts);
+        },
+      });
+      if (replaced.retired.length || !readOverlayState(root, { env }).overlays.some((o) => o.ref === 'lower')) {
+        violation('replaced-container-lost-source', 'the source was removed after its containing registration was replaced');
+      }
+      // Only lower is on origin. The recorded top contains it but cannot carry this rebuild.
+      ok('push', '-q', 'origin', `${lower}:refs/heads/lower`);
+      ok('checkout', '-q', 'main');
+      writeOverlays(root, stack, { env });
+      const available = await prepare();
+      if (available.terminal || available.plan?.applied.map((o) => o.ref).join(',') !== 'lower'
+        || !readOverlayState(root, { env }).overlays.some((o) => o.ref === 'lower')) {
+        violation('missing-container-lost-available-source', 'a missing recorded top retired the refreshed lower overlay out of the rebuild');
+      }
+      ok('checkout', '-q', 'main');
+      const nextMain = commit('main-advanced');
+      ok('push', '-q', 'origin', 'main');
+      ok('reset', '--hard', initial);
+      const stale = [{ ref: 'missing-no-sha' }, { ref: 'unsafe@name' }, { ref: 'feature' }];
+      writeOverlays(root, stale, { env });
+      const healthy = await prepare();
+      if (healthy.terminal || healthy.plan?.mainSha !== nextMain || healthy.plan?.applied.map((o) => o.ref).join(',') !== 'feature'
+        || readOverlayState(root, { env }).overlays.length !== stale.length) {
+        violation('single-stale-registration-blocks-healthy-overlay', `a deleted no-sha or unsafe registration stopped the healthy overlay plan (${healthy.result?.reason ?? 'non-terminal plan'})`);
+      }
+      // Adopt a pinned feature, then lose only its refresh while main advances. The running
+      // feature must survive the outage, and the next healthy tick must catch up with main.
+      writeOverlays(root, [{ ref: 'feature', pinned: true }], { env });
+      const rebuild = (run = git) => rebuildClone({ root, env, run,
+        runSmoke: async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }),
+        prState: async () => 'OPEN', prBaseChain: async () => [], lockOpts: { waitMs: 2000, pollMs: 20 } });
+      const adopted = await rebuild();
+      if (!adopted.adopted || readFileSync(join(root, 'feature'), 'utf8') !== 'feature') {
+        throw new Error(`pinned fixture was not adopted: ${adopted.reason}`);
+      }
+      const pinnedHead = ok('rev-parse', 'HEAD');
+      const advanced = ok('commit-tree', `${nextMain}^{tree}`, '-p', nextMain, '-m', 'advance main during outage');
+      ok('push', '-q', 'origin', `${advanced}:refs/heads/main`);
+      const failed = await rebuild((args) => args[0] === 'fetch' && args.some((a) => a.includes('refs/heads/feature:'))
+        ? { status: 1, stdout: '', stderr: 'injected refresh failure' } : git(args));
+      if (failed.moved || failed.reason !== 'pinned-overlay-unavailable' || ok('rev-parse', 'HEAD') !== pinnedHead
+        || readRebuildState(root, env).held?.lastGood !== pinnedHead
+        || readFileSync(join(root, 'feature'), 'utf8') !== 'feature'
+        || !readOverlayState(root, { env }).overlays.some((o) => o.ref === 'feature' && o.pinned)) {
+        violation('failed-refresh-loses-adopted-pin', `expected last-good hold, got ${failed.reason}`);
+      }
+      const recovered = await rebuild();
+      if (!recovered.adopted || readFileSync(join(root, 'feature'), 'utf8') !== 'feature'
+        || readRebuildState(root, env).held) {
+        violation('pinned-refresh-does-not-recover', `healthy retry failed: ${recovered.reason}`);
+      }
+    } catch (error) { violation('crash', String(error?.message ?? error)); }
+    finally { rmSync(root, { recursive: true, force: true }); }
+    await retirementRecovery(violation);
+    return { violations };
+  },
+  judge(report) { return report.violations.map((v) => `[${v.invariant}] ${v.detail}`); },
+};
+
+/** PR #5964 advisory round, 'on' mode: a registration added without a sha retires once its landed branch is
+ *  deleted, and a container closed on a later tick leaves the source retired into it registered. */
+async function retirementRecovery(violation) {
+  const root = mkdtempSync(join(tmpdir(), 'overlay-retire-on-soak-'));
+  const env = {
+    WE_DAEMON_OVERLAY_DIR: join(root, 'store'), WE_DAEMON_STATE_DIR: join(root, 'state'),
+    WE_DAEMON_EVENTS: join(root, 'events.jsonl'), WE_PLATFORM_PREFERENCES_FILE: join(root, 'prefs.json'),
+    WE_DAEMON_AUTO_REBASE: '0', WE_DAEMON_OVERLAY_AUTO_RETIRE: 'on',
+  };
+  const git = (args) => spawnSync('git', ['-c', 'user.name=Soak', '-c', 'user.email=soak@example.test', ...args], {
+    cwd: root, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+  });
+  const ok = (...args) => {
+    const result = git(args);
+    if (result.status !== 0) throw new Error(String(result.stderr));
+    return String(result.stdout).trim();
+  };
+  const commit = (file) => {
+    writeFileSync(join(root, file), file);
+    ok('add', file); ok('commit', '-qm', file);
+    return ok('rev-parse', 'HEAD');
+  };
+  const refs = () => readOverlayState(root, { env }).overlays.map((o) => o.ref).join(',');
+  const prepare = async (prState = async () => 'OPEN') => {
+    const prepared = await prepareRebuild({ root, env, run: git, now: Date.now, mainOnly: false, prState, prBaseChain: async () => [] });
+    if (prepared.lease) {
+      try {
+        const state = readRebuildState(root, env);
+        releaseBuildLease(state, prepared.lease);
+        writeRebuildState(root, state, env);
+      } finally { ACTIVE_BUILD_TOKENS.delete(prepared.lease.token); }
+    }
+    return prepared;
+  };
+  try {
+    writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, '{}');
+    ok('init', '-q', '-b', 'main');
+    const initial = commit('base');
+    ok('checkout', '-qb', 'feature'); commit('feature');
+    ok('checkout', '-qb', 'lower', initial); const lower = commit('lower');
+    ok('checkout', '-qb', 'top', lower); commit('top');
+    ok('checkout', '-q', 'main');
+    ok('clone', '--bare', '-q', root, join(root, 'origin.git'));
+    ok('remote', 'add', 'origin', join(root, 'origin.git'));
+    // A daemon clone already knows origin/main before preparation's local-commit safety check.
+    // Creating a bare remote alone leaves this hand-built fixture without any tracking refs.
+    ok('fetch', '-q', 'origin', '+refs/heads/main:refs/remotes/origin/main');
+    addOverlay(root, { ref: 'feature', pr: 1 }, { env });
+    addOverlay(root, { ref: 'lower', pr: 2 }, { env });
+    addOverlay(root, { ref: 'top', pr: 3 }, { env });
+    const first = await prepare();
+    if (first.terminal) violation('retirement-preparation-refused', `first preparation stopped before the candidate build (${first.result?.reason})`);
+    if (refs() !== 'feature,top') violation('contained-source-not-retired', `expected feature,top after the first tick, got ${refs()}`);
+    // feature squash-lands and GitHub deletes its branch; top's PR is closed unmerged on the same tick.
+    ok('checkout', '-q', 'feature', '--', 'feature'); ok('commit', '-qm', 'squash feature');
+    ok('push', '-q', 'origin', 'main');
+    ok('push', '-q', 'origin', '--delete', 'feature');
+    await prepare(async (pr) => (pr === 3 ? 'CLOSED' : 'OPEN'));
+    const after = readOverlayState(root, { env }).overlays.map((o) => o.ref);
+    if (after.includes('feature')) violation('deleted-landed-branch-never-retires', 'an addOverlay registration stayed after its landed branch was deleted');
+    if (!after.includes('lower')) violation('closed-container-loses-retired-source', `lower's open PR content left the registry with its closed container (${after.join(',')})`);
+  } catch (error) { violation('crash', String(error?.message ?? error)); }
+  finally { rmSync(root, { recursive: true, force: true }); }
+}
