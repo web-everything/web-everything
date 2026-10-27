@@ -313,6 +313,31 @@ describe('durable head-bound red-team admission', () => {
 });
 
 describe('drain policy cascade', () => {
+  it('defaults queueRebuildMax to three and logs standard provenance', () => {
+    const lines = [];
+    const r = readDrainQueueSafety({ env: {}, tool: {}, platform: {}, log: l => lines.push(l) });
+    expect(r.value.queueRebuildMax).toBe(3);
+    expect(r.sources.queueRebuildMax).toBe('standard');
+    expect(lines.join('')).toContain('queueRebuildMax=3 (standard)');
+  });
+  it('resolves queueRebuildMax through platform, tool and environment and logs the effective source', () => {
+    const lines = [];
+    const platform = { queueRebuildMax: 5 };
+    const tool = { queueRebuildMax: 4 };
+    const r = readDrainQueueSafety({ env: { WE_DRAIN_QUEUE_REBUILD_MAX: '2' }, tool, platform, log: l => lines.push(l) });
+    expect(r.value.queueRebuildMax).toBe(2);
+    expect(r.sources.queueRebuildMax).toBe('env');
+    expect(lines.join('')).toContain('queueRebuildMax=2 (env)');
+    expect(readDrainQueueSafety({ env: {}, tool, platform })).toMatchObject({ value: { queueRebuildMax: 4 }, sources: { queueRebuildMax: 'tool' } });
+    expect(readDrainQueueSafety({ env: {}, tool: {}, platform })).toMatchObject({ value: { queueRebuildMax: 5 }, sources: { queueRebuildMax: 'platform' } });
+  });
+  it.each(['0', '-1', '1.5', 'NaN', 'Infinity', 'typo'])('invalid queue rebuild env %s falls back to the next valid layer', value => {
+    const env = { WE_DRAIN_QUEUE_REBUILD_MAX: value };
+    expect(readDrainQueueSafety({ env, tool: { queueRebuildMax: 4 }, platform: {} }))
+      .toMatchObject({ value: { queueRebuildMax: 4 }, sources: { queueRebuildMax: 'tool' } });
+    expect(readDrainQueueSafety({ env, tool: {}, platform: {} }))
+      .toMatchObject({ value: { queueRebuildMax: 3 }, sources: { queueRebuildMax: 'standard' } });
+  });
   it('defaults both safeguards on and logs their sources', () => {
     const lines = [];
     const r = readDrainQueueSafety({ env: {}, tool: {}, platform: {}, log: l => lines.push(l) });
