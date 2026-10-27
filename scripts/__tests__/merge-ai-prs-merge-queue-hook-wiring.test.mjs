@@ -133,6 +133,8 @@ function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]],
         // hook OFF = no settings file at all: the built-in default (a test run never reads the live file)
         ...(hookOn ? { WE_MERGE_QUEUE_SETTINGS_FILE: settings } : {}), ...(mainFixPr ? { WE_MERGE_QUEUE_MAIN_FIX_FILE: mainFixFile } : {}),
         WE_COORDINATION_ROOT: coord,
+        // Exercise real retries without spending the production 20 s per UNKNOWN read.
+        WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC: '1',
         ...(approvedHeadPlan ? { MQ_APPROVED_HEAD: '1', WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'on', WE_DRAIN_MERGE_STRATEGY: approvedHeadPlan.strategy } : {}), ...extraEnv },
     });
     expect(r.error, r.stderr).toBeUndefined();
@@ -235,7 +237,7 @@ describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () =
 
   // Review of #4619 (test-coverage): the UNKNOWN-mergeability retry was only unit-tested as a helper. Through the real
   // CLI: the fresh pre-merge re-read answers UNKNOWN once (GitHub recomputing after the cascade's own previous merge),
-  // the retry re-reads, and the PR reaches `gh pr merge` instead of being refused on a transient. (3 s retry wait ×1.)
+  // the retry re-reads, and the PR reaches `gh pr merge` instead of being refused on a transient. (1 s retry wait ×1.)
   it('a transient UNKNOWN mergeability on the fresh pre-merge re-read is re-read and the PR still merges', () => {
     const { attempts, stderr } = runCli({ hookOn: true, ages: [[3001, 5]], env: { MQ_UNKNOWN_FIRST: '1', WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES: '1' } });
     expect(attempts).toEqual([3001]);
@@ -349,9 +351,12 @@ function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, e
     const r = spawnSync(process.execPath, ['--import', preload, script, `--repos=${LOCAL},${FUI}${secondImplPassAges ? `,${PA}` : ''}`, '--label=ready-to-merge',
       '--no-drain-lease', '--no-red-main-freeze', '--json'], { // reconcile ON: a couple's gate needs the complete open-PR context
       cwd: dir, encoding: 'utf8', timeout: 60_000 * TIMEOUT_SCALE,
-      env: { ...process.env, ...daemonAppEnv(dir), WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir, WE_MERGE_QUEUE_SETTINGS_FILE: settings, WE_COORDINATION_ROOT: coord, ...extraEnv },
+      // Both halves can need a retry; pin the fixture wait independently of the production 20 s default.
+      env: { ...process.env, ...daemonAppEnv(dir), WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir, WE_MERGE_QUEUE_SETTINGS_FILE: settings, WE_COORDINATION_ROOT: coord,
+        WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC: '1', ...extraEnv },
     });
     expect(r.error, r.stderr).toBeUndefined();
+    expect(r.status, r.stderr).toBe(0);
     const read = (s) => (existsSync(fixture + s) ? readFileSync(fixture + s, 'utf8').trim().split('\n').filter(Boolean) : []);
     return { stdout: r.stdout, stderr: r.stderr, attempts: read('.attempts'), api: read('.api') };
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -391,6 +396,12 @@ describe('review of #4619 — the WE-carrier pre-check keeps a couple together',
     const { attempts } = runCouple({ implPassAges: [5], carrierPassAges: [5], env: { MQ_UNKNOWN_FIRST: '1', WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES: '1' } });
     expect(attempts).toEqual([`${FUI}#501`, `${LOCAL}#4001`]);
   }, 90_000 * TIMEOUT_SCALE);
+
+  it('with retries off, the same transient UNKNOWN holds the couple before either half lands', () => {
+    const { attempts, stderr } = runCouple({ implPassAges: [5], carrierPassAges: [5], env: { MQ_UNKNOWN_FIRST: '1', WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES: '0' } });
+    expect(attempts).toEqual([]);
+    expect(stderr).toMatch(/mergeable=UNKNOWN/);
+  }, 90000);
 
   // Residual (review of #4619): a third-party merge moves a sibling's repo between the preflight and its own turn, past the
   // pin. Two repos cannot merge atomically, so the split is REPORTED (JSON coupleSplit), never silent.
