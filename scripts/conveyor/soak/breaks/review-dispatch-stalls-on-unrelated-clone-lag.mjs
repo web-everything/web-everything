@@ -89,13 +89,15 @@ export default {
       git(seed, 'push', '-q', 'origin', 'HEAD:main');
       git(dir, 'clone', '-q', origin, clone);
       mkdirSync(join(seed, 'scripts/backlog'), { recursive: true });
+      // frontmatter.mjs now belongs to the review closure via collision healing.
+      // Keep this off-path scenario on backlog code that reviews do not import.
       for (let i = 0; i < 21; i += 1) {
-        writeFileSync(join(seed, i % 2 ? 'scripts/lane-pool.mjs' : 'scripts/backlog/frontmatter.mjs'), `// v${i}\n`);
+        writeFileSync(join(seed, i % 2 ? 'scripts/lane-pool.mjs' : 'scripts/backlog/capacity.mjs'), `// v${i}\n`);
         git(seed, 'add', '.');
         git(seed, 'commit', '-q', '-m', `drain landing ${i}`);
       }
       git(seed, 'push', '-q', 'origin', 'HEAD:main');
-      log?.('managed clone is 21 commits behind origin/main, only in lane-pool / backlog code');
+      log?.('managed clone is 21 commits behind origin/main, only in lane-pool / backlog capacity code');
 
       const childFile = join(dir, 'child.mjs');
       writeFileSync(childFile, CHILD);

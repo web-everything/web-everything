@@ -64,6 +64,7 @@ const ALL_EFFORTS = Object.freeze(Object.keys(CODEX_EFFORT_MAP));
 const THROUGH_MAX = Object.freeze(ALL_EFFORTS.slice(0, -1));
 export const CODEX_MODEL_CATALOGUE = Object.freeze({
   'gpt-6.1-sol': ALL_EFFORTS,
+  'gpt-6.1-terra': ALL_EFFORTS, // R140 one-week trial; CLI 0.162.1 lists low..ultra
   'gpt-6-astra': ALL_EFFORTS,
   'gpt-6-sol': ALL_EFFORTS,
   'gpt-6-luna': THROUGH_MAX,
