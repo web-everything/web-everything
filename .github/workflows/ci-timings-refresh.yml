@@ -33,7 +33,7 @@ jobs:
         run: |
           refs=$(git ls-remote --heads origin refs/heads/ci/refresh-test-timings)
           if [ -n "$refs" ]; then
-            echo "Refresh branch already exists; review its PR before another refresh."
+            echo "Refresh branch already exists; preserving it and checking for an open PR."
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
@@ -67,7 +67,7 @@ jobs:
       # here; an operator must provision them and rerun, with no github.token fallback.
       - name: Mint publication token (GitHub App)
         id: publication-token
-        if: steps.timings.outputs.changed == 'true'
+        if: steps.branch.outputs.exists == 'true' || steps.timings.outputs.changed == 'true'
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ vars.WE_APP_ID }}
@@ -77,27 +77,30 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
       - name: Propose updated timings
-        if: steps.timings.outputs.changed == 'true'
+        if: steps.branch.outputs.exists == 'true' || steps.timings.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ steps.publication-token.outputs.token }}
         run: |
-          if git diff --quiet -- scripts/ci/test-timings.json; then
-            echo "Timings unchanged."
-            exit 0
-          fi
           # Recheck before publishing; never overwrite an existing operator/automation branch.
           refs=$(git ls-remote --heads origin refs/heads/ci/refresh-test-timings)
-          if [ -n "$refs" ]; then
-            echo "Refresh branch appeared during the run; skipping publication."
-            exit 0
+          if [ -z "$refs" ]; then
+            if git diff --quiet -- scripts/ci/test-timings.json; then
+              echo "Timings unchanged."
+              exit 0
+            fi
+            git switch -c ci/refresh-test-timings
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add scripts/ci/test-timings.json
+            git commit -m 'ci: refresh measured unit test timings'
+            # Checkout persists no github.token header; Git and gh both use the App token.
+            gh auth setup-git --hostname github.com
+            # Create-only: the empty lease refuses if the branch appeared after the recheck.
+            git push --force-with-lease=refs/heads/ci/refresh-test-timings: origin HEAD:refs/heads/ci/refresh-test-timings
           fi
-          git switch -c ci/refresh-test-timings
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add scripts/ci/test-timings.json
-          git commit -m 'ci: refresh measured unit test timings'
-          # Checkout persists no github.token header; Git and gh both use the App token.
-          gh auth setup-git --hostname github.com
-          # Create-only: the empty lease refuses if the branch appeared after the recheck.
-          git push --force-with-lease=refs/heads/ci/refresh-test-timings: origin HEAD:refs/heads/ci/refresh-test-timings
-          gh pr create --base main --head ci/refresh-test-timings --title 'ci: refresh measured unit test timings' --body 'Refresh unit shard timings from the latest successful main CI push. Requires one report per CI unit shard and 90% current test-file coverage; only current test files are kept, and soak timings are preserved.'
+          # Resume publication after an earlier push whose PR creation failed. A failed
+          # lookup must stop this step rather than treating an unknown PR state as absent.
+          open_prs=$(gh pr list --head ci/refresh-test-timings --state open --json number --jq 'length')
+          if [ "$open_prs" = 0 ]; then
+            gh pr create --base main --head ci/refresh-test-timings --title 'ci: refresh measured unit test timings' --body 'Refresh unit shard timings from the latest successful main CI push. Requires one report per CI unit shard and 90% current test-file coverage; only current test files are kept, and soak timings are preserved.'
+          fi
