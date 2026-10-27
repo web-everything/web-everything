@@ -600,11 +600,13 @@ describe('isReviewCodePath (#4387)', () => {
       'scripts/operations/review-pr.mjs', 'scripts/operations/review-dispatch.mjs', 'scripts/operations/cli-adapter.mjs',
       'scripts/operations/review-loop-cli.mjs', 'scripts/lib/judge-spawn.mjs', 'scripts/lib/jury-core.mjs',
       'scripts/lib/codex-judge-spawn.mjs', 'scripts/lib/review-policy.contract.json', 'scripts/lib/main-staleness.mjs',
+      // Collision healing now imports these through the review sandbox closure.
+      'scripts/backlog/frontmatter.mjs', 'scripts/lib/card-number-allocator.mjs',
     ].every(isReviewCodePath)).toBe(true);
   });
   it('rejects unrelated code, backlog cards, nested dirs, and non-strings', () => {
     expect([
-      'scripts/backlog/frontmatter.mjs', 'scripts/lane-pool.mjs', 'backlog/4387-review.md',
+      'scripts/backlog/capacity.mjs', 'scripts/lane-pool.mjs', 'backlog/4387-review.md',
       'scripts/lib/__tests__/review-core.test.mjs', 'docs/review/x.mjs', '', null, undefined,
     ].some(isReviewCodePath)).toBe(false);
   });
@@ -694,18 +696,24 @@ describe('dispatchReview — managed clone behind origin/main (#4387)', () => {
   const managed = () => { prevEnv = process.env.WE_DAEMON_MANAGED_CLONE; process.env.WE_DAEMON_MANAGED_CLONE = '1'; };
 
   it('behind only in code OFF the review path: the review dispatches (before #4387: refused)', () => {
-    const root = behindClone('scripts/backlog/frontmatter.mjs', 'scripts/lane-pool.mjs', 'backlog/1-card.md');
+    const root = behindClone('scripts/backlog/capacity.mjs', 'scripts/lane-pool.mjs', 'backlog/1-card.md');
     managed();
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
       expect(run(root)).toHaveLength(1);
-      expect(stderr.mock.calls.map((c) => String(c[0])).join('')).toMatch(/3 commit\(s\) behind origin\/main .*scripts\/backlog\/frontmatter\.mjs.*tolerating the lag/);
+      expect(stderr.mock.calls.map((c) => String(c[0])).join('')).toMatch(/3 commit\(s\) behind origin\/main .*scripts\/backlog\/capacity\.mjs.*tolerating the lag/);
     } finally { stderr.mockRestore(); }
     expect(git(root, 'rev-list', '--count', 'HEAD..origin/main').trim()).toBe('3'); // the clone is never moved
   });
 
   it('behind in a review-path file: still refuses, before spawning', () => {
     const root = behindClone('scripts/lane-pool.mjs', 'scripts/operations/review-pr.mjs');
+    managed();
+    expect(() => run(root)).toThrow(/2 commit\(s\) behind origin\/main.*STALE code from this checkout/s);
+  });
+
+  it('behind in frontmatter imported by collision healing: still refuses, before spawning', () => {
+    const root = behindClone('scripts/lane-pool.mjs', 'scripts/backlog/frontmatter.mjs');
     managed();
     expect(() => run(root)).toThrow(/2 commit\(s\) behind origin\/main.*STALE code from this checkout/s);
   });

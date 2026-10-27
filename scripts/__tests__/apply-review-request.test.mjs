@@ -473,11 +473,13 @@ describe('no other code on the ledger path pushes (C3)', () => {
   // and are not on the ledger-append call path. They are pinned by count rather than ignored: a NEW push in any
   // file here, or in a file newly pulled into the closure, changes this map and must be reviewed on purpose.
   // (`fix-procedure.mjs` counts three because one hit is the `cmd === 'push'` CLI verb, not a git call.)
+  // The allocator's two atomic pushes create number-reservations/card-ids refs, not ledger transport refs.
   const KNOWN_PUSH_SITES = {
     [TRANSPORT]: 1,
     'scripts/lib/rebase-drop-manifest.mjs': 1,
     'scripts/lib/nnn-collision-heal.mjs': 1,
     'scripts/conveyor/fix-procedure.mjs': 3,
+    'scripts/lib/card-number-allocator.mjs': 2,
   };
   const rel = (f) => f.slice(REPO_ROOT.length + 1).split(sep).join('/');
 

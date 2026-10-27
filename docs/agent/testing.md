@@ -1678,6 +1678,66 @@ and cache replay assertions on that fallback. Keep the fake host's throttle stor
 suite cannot consume its budget. Numbering fixtures likewise pass a private `lockRoot` to the real
 mutex instead of acquiring the developer's shared drain lock.
 
+### Card numbers at birth
+
+`card-number-allocator.mjs` shares the drain numbering mutex and persists host reservations
+before releasing it. Allocator tests must inject temporary `lockRoot` and `statePath` values;
+remote-claim probes use an injected transport, never the live remote. Producers fall back to
+hash paths on unavailable or truncated canonical main or remote-ref evidence; `backlog.cardNumbering.remote=required`
+refuses instead. `WE_NUMBER_AT_BIRTH=off` retains hash naming. Numeric cards carry their fresh
+hash only in `bornAs`. The drain's existing hash-only selection leaves these cards untouched.
+CLI probes must also isolate `HOME` and Git transport so they cannot reserve production card numbers.
+The create-only `refs/card-ids/<HASH_RE id>` mapping and number reservation share one blob and
+one atomic push with empty-ref leases. Test replay with separate host state, two distinct ids,
+and races on either claim; neither ref may be replaced. Settings resolve through the shared
+cascade with each leaf’s source logged under `backlog.cardNumbering.*`.
+
+Deferred numbering uses the same atomic remote reservations even when birth numbering is off.
+With a configured remote, an unavailable canonical tree or reservation listing holds the hash cards;
+only repositories without any remote retain local-only numbering. Test an outstanding birth claim
+against the actual deferred-numbering dry run, and test allocation/replay races through the shared core.
+Refresh canonical evidence before scanning landed `bornAs` identities. Cover a stale checkout
+whose pending hash already landed without reservation refs: identical content deduplicates and
+differing content holds, with no new claim. Deferred-numbering fixtures inject the `execFile`
+option on `numberPendingHashes` and mock the shared process reader, so every Git path uses
+the same fixture without depending on captured builtin imports or patching native ESM bindings.
+Review staleness fixtures must use off-path files from the current sandbox import closure.
+Collision healing now pulls `backlog/frontmatter.mjs` onto that path; cover its refusal and
+use `backlog/capacity.mjs` for tolerated unrelated lag in both dispatch modes and the soak.
+Both collision planners refuse to move a `bornAs` card or a reserved source number. Remote-backed
+heals never reuse a gap below the frontier: trees and reservation refs cannot show whether a gap
+held a legacy card deleted before reservation refs existed. They take a fresh number above every
+reserved, canonical and local number, claim all targets atomically before rewriting, and refuse
+for manual repair when the number range is exhausted. The manual `yield` command uses the same
+guards, including with `--force`. Claims survive a failed rewrite or publish.
+Test reserved legacy sources without `bornAs` independently in both planners and in `yield --force`.
+Exercise `yield` and the renumber CLI with a stub Git transport: leave an untraced gap below the
+frontier, include a canonical-tree number, and snapshot every backlog file at push time to prove
+the claim precedes any write or delete. Rejected claims, unavailable evidence, and an exhausted
+range must preserve all files; a renumber dry run must neither claim nor write. No-op renumber runs (including
+base-owned or entirely published duplicates) must not read remote numbering evidence.
+The allocator suite pins the held-fix-claim refusal before constraint reads or reservation
+pushes, and asserts that reservations survive both failed index rewrites and failed publication.
+It also observes the allocator's log callback for each effective setting and its source.
+Remote-backed gap selection uses current trees and reservation refs, without historical deletion
+evidence; the historical-number reuse policy is tracked in
+#7317.
+Canonical tree reads use NUL-delimited paths; cover Unicode, quotes, backslashes and embedded newlines.
+Allocation and replay must obey the five-digit numeric ID grammar, including contention at 99999.
+Numbering evidence reads leave tracking refs unchanged by default: fetch with an empty refmap
+into a unique per-call `refs/tmp/numbering-*` ref without writing `FETCH_HEAD`, then delete the
+private ref in `finally`. Interleaved readers must retain their own trees; failed fetches or
+tree reads must still attempt cleanup. Collision healing cannot change a rebuild's parent
+after its tree was computed. Deferred numbering explicitly opts into refreshing tracking
+before its `bornAs` scan, while reading numeric evidence from its own private ref too.
+Cover a remote main advance during the actual `rebaseDropManifest` collision-healing path and
+assert that the committed parent and tree still describe the same main snapshot.
+Permanent reservation listings use a bounded 32 MiB budget in both the parser and subprocess,
+enough for paired number/card-id refs throughout the five-digit range, including SHA-256 OIDs.
+Canonical path reads use the same budget so a full backlog does not hit a smaller output cap.
+Cover 8,500 claims, allocation of 99999, replay after a lost push response, and oversized refusal;
+also exercise the shared Git runner to catch adapters that silently discard `maxBuffer`.
+
 ### Dispatched conflict resolution
 
 `we:scripts/conveyor/resolve-conflict.mjs` uses index stages only inside a lane clone with
