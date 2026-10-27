@@ -129,6 +129,21 @@ describe('main CI truth follows the tip (2026-10-11 incident)', () => {
 });
 
 describe('best-effort tip IO', () => {
+  it('preserves numeric total_count as checksTotal when the check-runs page is partial', () => {
+    const one = check('test');
+    const exec = (bin, argv) => {
+      expect(bin).toBe('gh');
+      if (argv[1] === 'repos/example/repo/commits/main') return `${TIP_SHA}\n`;
+      if (argv[1] === `repos/example/repo/commits/${TIP_SHA}/check-runs?per_page=100`) {
+        return JSON.stringify({ total_count: 2, check_runs: [one] });
+      }
+      throw new Error(`unexpected read: ${argv}`);
+    };
+    const tip = readMainTip({ exec, repoSlug: 'example/repo', requiredChecks: ['test'] });
+    expect(tip).toMatchObject({ checksTotal: 2, checkRuns: [one] });
+    expect(typeof tip?.checksTotal).toBe('number');
+  });
+
   it('builds the tip from GitHub facts and reads the required set through injection', () => {
     const { runs, tip } = replay();
     const exec = (bin, argv) => {
