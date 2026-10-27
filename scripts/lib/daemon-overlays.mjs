@@ -39,7 +39,7 @@ import {
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
@@ -137,6 +137,7 @@ export function readOverlays(root, { env = process.env } = {}) {
 // A holder that died is detected by age (`LIST_LOCK_STALE_MS`) and its lock is broken.
 
 const LIST_LOCK_STALE_MS = 30_000;
+const SHA_RE = /^[0-9a-f]{40,64}$/;
 const LIST_LOCK_WAIT_MS = 20_000;
 const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
@@ -246,11 +247,11 @@ export async function readOverrideViewerLogin() {
   } catch { return null; }
 }
 
-/** Registration intent excludes the rebuild's mutable base-chain cache. */
+/** Registration intent excludes the rebuild's own caches: base chain, last refreshed tip, retired sources. */
 export function registrationIdentity(entry) {
   if (entry == null) return entry;
-  const { stackBases, ...identity } = entry;
-  void stackBases;
+  const { stackBases, tipSha, retiredSources, ...identity } = entry;
+  void stackBases; void tipSha; void retiredSources;
   return identity;
 }
 
@@ -269,15 +270,18 @@ export function addOverlay(root, {
       throw new Error('source registration unavailable or changed; refusing replacement');
     }
     const idx = list.findIndex((o) => o && o.ref === ref);
+    // Even identical metadata or timestamps denote a new registration, not refreshed build evidence.
+    const registrationId = randomUUID();
     if (idx === -1) {
       list.push({
-        ref, pr: pr ?? null, addedAt: now || new Date().toISOString(), addedBy: addedBy ?? null, reason: reason ?? null,
+        ref, registrationId, pr: pr ?? null, addedAt: now || new Date().toISOString(), addedBy: addedBy ?? null, reason: reason ?? null,
         ...(pinned === true ? { pinned: true } : {}),
         ...(bases ? { stackBases: bases } : {}),
         ...(conflictOverride ? { conflictOverride } : {}),
       });
     } else {
-      const next = { ...list[idx], pr: pr ?? null, reason: reason ?? null };
+      const next = { ...list[idx], registrationId, pr: pr ?? null, reason: reason ?? null };
+      delete next.tipSha;
       if (pinned === true) next.pinned = true;
       else if (pinned === false) delete next.pinned;
       if (bases) next.stackBases = bases;
@@ -325,6 +329,28 @@ export function recordEdgeResolution(root, ref, {
   return list;
 }
 
+/** Restore the latest absent registration of each ref, also recovering older/already-active nested sources. */
+function collectRetiredSources(list, sources, { strict = false } = {}) {
+  const seen = new Set(list.map((o) => o?.ref));
+  const back = [];
+  const skipped = [];
+  const collect = (items) => {
+    const snapshots = Array.isArray(items) ? items : [];
+    const latest = new Map(snapshots.map((s) => [s?.entry?.ref, s]));
+    for (const s of snapshots) {
+      const safe = isSafeBranchName(s?.entry?.ref);
+      if (!safe && strict) throw new Error('invalid archived source');
+      if (!safe || seen.has(s.entry.ref) || latest.get(s.entry.ref) !== s) {
+        skipped.push(s?.entry?.ref ?? null); collect(s?.entry?.retiredSources); continue;
+      }
+      seen.add(s.entry.ref);
+      back.push(s);
+    }
+  };
+  collect(sources);
+  return { back, skipped };
+}
+
 /**
  * Remove one overlay entry by ref, if present. Idempotent — removing an absent ref is not an error, just
  * `removed:false`. `why` is accepted for the caller's own bookkeeping (e.g. the CLI's audit event / a
@@ -336,10 +362,20 @@ export function recordEdgeResolution(root, ref, {
  * retires `ref` for its replacement never leaves the list without both. `expectedOverlay`, when supplied, must still
  * match a present `ref` entry under the same mutex, so a concurrent re-registration is never removed. `stackBases` is
  * left out of that comparison: the rebuild rewrites it on its own ({@link persistStackBases}), which is no re-registration.
- * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedOverlay?:object}} [o]
- * @returns {{removed:boolean, list:Array<object>}}
+ * `expectedRequiredOverlay` also compares the required container's registration identity under that mutex;
+ * its presence alone cannot authorize removal after concurrent replacement.
+ * `retireInto` (with `requireRef`) moves the removed entry into the container's `retiredSources` in the same write;
+ * a plain `requireRef` swap moves only the entry's own `retiredSources` onto the replacement. Any other removal of
+ * an entry carrying `retiredSources` puts those sources back in its place (a source registered again meanwhile is
+ * skipped, its own nested sources still come back), so a container dropped later (pr-closed, ref-gone, smoke,
+ * operator) never takes their content with it.
+ * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedOverlay?:object, expectedRequiredOverlay?:object,
+ *   retireInto?:boolean, retiredSha?:string|null}} [o]
+ * @returns {{removed:boolean, list:Array<object>, reinstated?:string[]}}
  */
-export function removeOverlay(root, ref, { env = process.env, why, requireRef, expectedOverlay } = {}) {
+export function removeOverlay(root, ref, {
+  env = process.env, why, requireRef, expectedOverlay, expectedRequiredOverlay, retireInto = false, retiredSha = null,
+} = {}) {
   void why; // caller bookkeeping only — see JSDoc above.
   return withListLock(root, env, (pause) => {
     const list = readOverlaysForWrite(root, env);
@@ -347,14 +383,88 @@ export function removeOverlay(root, ref, { env = process.env, why, requireRef, e
     if (requireRef !== undefined && !list.some((o) => o && o.ref === requireRef)) {
       throw new Error('replacement registration unavailable');
     }
+    if (expectedRequiredOverlay !== undefined && (!requireRef || !expectedRequiredOverlay
+      || expectedRequiredOverlay.ref !== requireRef
+      || !isDeepStrictEqual(registrationIdentity(list.find((o) => o?.ref === requireRef)), registrationIdentity(expectedRequiredOverlay)))) {
+      throw new Error('replacement registration changed; refusing removal');
+    }
     const idx = list.findIndex((o) => o && o.ref === ref);
     if (expectedOverlay !== undefined && idx !== -1 && !isDeepStrictEqual(registrationIdentity(list[idx]), registrationIdentity(expectedOverlay))) {
       throw new Error('registration changed; refusing removal');
     }
     if (idx === -1) return { removed: false, list };
-    const next = list.slice(0, idx).concat(list.slice(idx + 1));
+    const entry = list[idx];
+    const own = Array.isArray(entry.retiredSources) ? entry.retiredSources : [];
+    // A replacement (`requireRef`) supersedes the removed entry: retired INTO it, the entry moves with its own
+    // sources nested; in a plain swap (auto-rebase) only those sources move, since the replacement carries them.
+    const swap = requireRef !== undefined && requireRef !== ref;
+    const moved = !swap ? [] : retireInto ? [{ entry, sha: retiredSha }] : own;
+    const { back, skipped } = collectRetiredSources(list, swap ? [] : own);
+    const restored = back.map((s) => (SHA_RE.test(s.sha ?? '') ? { ...s.entry, tipSha: s.sha } : s.entry));
+    const next = list.slice(0, idx).concat(restored, list.slice(idx + 1));
+    if (swap && moved.length) {
+      const c = next.findIndex((o) => o?.ref === requireRef);
+      const prior = Array.isArray(next[c].retiredSources) ? next[c].retiredSources : [];
+      // A ref may have multiple registrations with different content and nested sources. Retain every
+      // snapshot; ref-only deduplication here silently discards the earlier registration's recovery data.
+      next[c] = { ...next[c], retiredSources: [...prior, ...moved] };
+    }
+    // Audit before the write: a failed append throws and leaves the list (container included) unchanged.
+    for (const s of back) appendOverlayEvent(root, { kind: 'reinstated', ref: s.entry.ref, from: ref, sha: s.sha ?? null }, { env });
+    if (skipped.length) appendOverlayEvent(root, { kind: 'reinstate-skipped', refs: skipped, from: ref }, { env });
     writeOverlays(root, next, { env });
-    return { removed: true, list: next };
+    return { removed: true, list: next, reinstated: back.map((s) => s.entry.ref) };
+  });
+}
+
+/**
+ * Restore archived inputs before replanning a build that no longer carries them. Keep the archive on
+ * its carrier until that carrier is removed by a verified plan: a missing or rewritten source branch
+ * must not erase the obligation to preserve the archived commit on the next tick.
+ */
+export function reinstateOverlaySources(root, ref, { env = process.env, expectedOverlay } = {}) {
+  return withListLock(root, env, () => {
+    const list = readOverlaysForWrite(root, env);
+    const idx = list.findIndex((o) => o?.ref === ref);
+    if (idx === -1 || !isDeepStrictEqual(list[idx], expectedOverlay)) {
+      throw new Error('archive carrier changed; refusing reinstatement');
+    }
+    const { back, skipped } = collectRetiredSources(list, list[idx].retiredSources, { strict: true });
+    for (const s of back) appendOverlayEvent(root, {
+      kind: 'reinstated', ref: s.entry.ref, from: ref, sha: s.sha ?? null,
+    }, { env });
+    if (back.length && skipped.length) appendOverlayEvent(root, { kind: 'reinstate-skipped', refs: skipped, from: ref }, { env });
+    const restored = back.map((s) => (SHA_RE.test(s.sha ?? '') ? { ...s.entry, tipSha: s.sha } : s.entry));
+    const next = list.slice(0, idx).concat(restored, list.slice(idx));
+    if (back.length) writeOverlays(root, next, { env });
+    return { list: next, reinstated: back.map((s) => s.entry.ref) };
+  });
+}
+
+/**
+ * Record each refreshed overlay's remote tip as `tipSha` — retirement evidence once its branch is deleted.
+ * Fresh read under the list lock; the identity captured at refresh must still match. Unbound, replaced and
+ * vanished registrations are skipped. Rebuild caches are excluded from that identity, so cache writes commute.
+ * @param {string} root
+ * @param {Map<string,{sha:string,reg:object}>} tips ref → full sha and registration identity captured at refresh
+ * @param {{env?:NodeJS.ProcessEnv}} [o]
+ * @returns {{written:number}}
+ */
+export function persistTipShas(root, tips, { env = process.env } = {}) {
+  if (!(tips instanceof Map) || tips.size === 0) return { written: 0 };
+  return withListLock(root, env, () => {
+    const list = readOverlaysForWrite(root, env).slice();
+    let written = 0;
+    for (let i = 0; i < list.length; i += 1) {
+      const evidence = list[i] && tips.get(list[i].ref);
+      const { sha, reg } = evidence ?? {};
+      if (!reg || !isDeepStrictEqual(registrationIdentity(list[i]), reg)
+        || !SHA_RE.test(sha ?? '') || list[i].tipSha === sha) continue;
+      list[i] = { ...list[i], tipSha: sha };
+      written += 1;
+    }
+    if (written > 0) writeOverlays(root, list, { env });
+    return { written };
   });
 }
 
@@ -369,7 +479,19 @@ export function removeOverlay(root, ref, { env = process.env, why, requireRef, e
 export function appendOverlayEvent(root, event, { env = process.env } = {}) {
   const file = eventsFilePath(root, env);
   mkdirSync(dirname(file), { recursive: true });
-  appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`, 'utf8');
+  const append = () => appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`, 'utf8');
+  if (event.kind !== 'auto-retire-shadow') { append(); return; }
+  // Shadow ticks repeatedly observe the same evidence. A durable marker per exact tuple avoids scanning an
+  // ever-growing audit log; the list mutex serializes the check/append/mark across processes. Mark AFTER the
+  // append so a failed write cannot suppress the observation on the next tick.
+  return withListLock(root, env, () => {
+    const key = createHash('sha256').update(JSON.stringify([event.ref, event.sha, event.reason])).digest('hex');
+    const marker = join(`${file}.shadow`, key);
+    try { statSync(marker); return; } catch (error) { if (error?.code !== 'ENOENT') throw error; }
+    mkdirSync(dirname(marker), { recursive: true });
+    append();
+    writeFileSync(marker, '', 'utf8');
+  });
 }
 
 // ── overlay stacks (held item 212) ─────────────────────────────────────────────────────────────────────────────

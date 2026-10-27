@@ -1,5 +1,101 @@
 # Testing — Three-Tier Strategy
 
+## Overlay auto-retirement
+
+`daemon-overlay-auto-retire.test.mjs` uses local Git repositories for ancestry, squash/content
+equivalence, deleted-branch recorded commits, and equal-tip carrier preservation. Retirement
+uses `removeOverlay`'s `requireRef`, `expectedRequiredOverlay` and `expectedOverlay` guards: container
+withdrawal, container replacement or source re-registration preserves the source. Both identities are
+checked under the list mutex; mutable `stackBases` cache updates keep the same identity. Git uncertainty
+preserves registrations. `autoRetire` resolves through the policy cascade; only tool-sourced shadow
+graduates after a full day from `shadowSince`. Explicit platform/environment shadow stays observe-only.
+Test every mode source before, at and after the cutoff. Inject `now` at that boundary.
+Historical rebuild and stack-cache fixtures explicitly disable retirement; retirement and auto-rebase
+integration fixtures explicitly enable it, so the shipped shadow cutoff cannot change their intent.
+The historical overlay-pin suite and `overlay-pin-carried-base-retry` soak also disable retirement:
+their adopted-input and retained-registration assertions require the original overlays to remain registered.
+Contained explicit, mechanism and unverifiable pins stay registered for the planner's safety checks.
+Auto-retirement defers both pending-swap registrations to verified cleanup, including when auto-rebase is
+disabled or adoption recovery rolls back. Malformed or unreadable pending evidence defers retirement and
+raises `overlay-auto-retire-failed`; unrelated landed registrations remain eligible with readable evidence.
+Successful retirement also emits the existing `overlay-auto-dropped` rebuild alert (`in-main` for landed
+content), which health monitoring uses to clear previous conflict-drop warnings.
+Run this suite through heavy admission.
+Preparation records per-ref fetch evidence: refreshed tips may be classified; a successful remote absence
+check (`ls-remote --exit-code` status 2 with empty stdout) permits recorded-SHA evidence, ignoring cached tips.
+Failed/unknown fetches and unsafe names preserve registrations. They do not block retirement of independently
+verified overlays. Remaining unavailable unpinned registrations emit an `overlay-fetch-unverifiable` alert and are
+excluded from the plan and saved-candidate eligibility, preventing both stale-tip adoption and the planner's
+`ref-gone` removal. In off, shadow and on modes, main and healthy overlays still advance when unavailable
+overlays are unpinned. An unavailable explicit pin, or a mechanism pin identified from the current adopted
+build's inputs, refuses with `pinned-overlay-unavailable` and holds the verified last-good build. Historical
+inputs establish only that refusal; they never authorize building from a stale tip. Rebuild regressions and
+the soak adopt a pin, advance main, fail its refresh, assert preserved content/HEAD/registration, and retry
+with a healthy fetch to verify recovery. The next tick retries;
+restore or re-register deleted branches from recorded SHAs when their content is still needed.
+Containment carriers must have refreshed fetch evidence when preparation supplies it. Select maximal carriers
+only among those available refs: a missing larger or equal tip must not displace a refreshed overlay from the
+plan. Preparation regressions cover missing tops, equal tips, a missing top above a live containing branch,
+and retirement into a refreshed top; the soak also checks a refreshed source beneath a missing recorded top.
+Shadow audit observations dedupe by exact `(ref, sha, reason)` using durable markers under the list mutex;
+repeat observations still appear in `wouldRetire`. Audit append precedes marking so failed writes retry.
+The command allowlist test restricts classification to local Git reads/merge-tree object creation; it forbids
+network and worktree mutations. `mainOnly` and corrupt state have separate preparation regressions.
+Malformed registry records (non-objects or missing/non-string/empty refs) hold preparation before fetch or
+retirement and require operator repair of the stored list. Structurally valid entries with unsafe branch names
+remain isolated as unavailable overlays. For native audit subprocess imports, construct the module URL with
+`fileURLToPath` and `pathToFileURL`; Vite rewrites static `new URL(relative, import.meta.url)` as a web asset.
+The `overlay-auto-retire-evidence` daemon soak reproduces explicit shadow, deleted remote branches in all modes,
+unavailable overlays beside healthy ones, repeated shadow ticks and container replacement using real disposable
+repositories. The soak registry discovers its module automatically.
+Plan-only soak probes must release any returned build lease and remove its active token before the next
+preparation, matching `rebuildClone` cleanup. A successful preparation otherwise leaves the next probe held
+as `rebuild-in-progress`, even when its overlay plan is healthy.
+Cherry records historical patch equivalence and omits merge commits. All patch-based retirement requires
+current whole-tree equivalence, even when every cherry line is negative. Regressions cover a cached landed
+tip advanced remotely, unique merge-resolution content, and an equivalent main patch subsequently reverted.
+Deleted-branch evidence comes from the registration's own `tipSha` (the last refreshed remote tip, written by
+`persistTipShas` outside `registrationIdentity` after the plan passes pinned and established-content checks),
+else the adopted build's applied tip; edge-resolved inputs are
+skipped. A regression registers through `addOverlay`, squash-lands, deletes the branch and asserts retirement.
+Refused pin/established-content plans preserve registered tips; the overlay-pin tests compare the full list
+before and after repeated refusals. Hand-built daemon fixtures must seed `origin/main` before preparation:
+the local-commit safety check runs before fetch, and a bare remote alone creates no tracking refs.
+A contained source moves into its container's `retiredSources` in the same locked write. Removing that
+container by any path (planner `pr-closed`/`ref-gone`, smoke, auto-rebase, operator) reinstates the sources in
+its place, nested sources included; an auto-rebase swap instead moves them onto the replacement. A source
+registered again meanwhile is skipped (audited `reinstate-skipped`) but its own nested sources still come back.
+Sources a retirement reinstates in the same tick are not fetched yet, so preparation neither alerts on them nor
+holds for a pin until the next tick when their content is already in the candidate. Archived carriers are
+protected from early retirement until preparation checks all archived commits (including nested snapshots)
+against the proposed build, by ancestry or whole-tree equivalence. Missing content restores sources while
+retaining the archive as a retry obligation, fetches their branches, and replans in the same preparation.
+No progress, missing sources, or unverifiable evidence holds the build; off/shadow still honor existing archives.
+`daemon-rebuild-retired-sources.test.mjs` exercises preparation with injected Git/planner results and real
+registry storage without `.git` writes. The retirement soak checks the real candidate commit and source file
+after a closed container and after an open container is force-pushed to unrelated content. In `on` mode a
+`retiring` audit line is written before removal; if it fails, nothing is removed. A failed `removed` line or
+`overlay-retired` event after removal is returned in `auditFailures` and preparation alerts on it.
+
+Refreshed tips carry `{sha, reg}` from classification through preparation's deferred persistence. Compare
+`reg` with `registrationIdentity` under the list lock; reject plain SHA values and changed/vanished registrations.
+Every `addOverlay` call creates a new `registrationId` and clears inherited `tipSha`, including identical
+metadata and timestamps. Keep the legacy registration fields readable; no migration is needed for old lists.
+Ref-only adopted-build fallback is limited to legacy entries without `registrationId`; a new registration
+cannot borrow an older registration's applied SHA when its branch disappears before a successful refresh.
+The registration-race regression covers refresh → same-ref replacement → persistence → missing-branch
+retirement, and the preparation regression replaces a registration during PR-state lookup before persistence.
+Whenever adding a rebuild-written retirement evidence field, bind it to the captured registration and clear it
+on re-registration. Add a named failure-injection test for each reported dependency failure: the pre-removal
+audit, post-removal audit, `appendDaemonEvent` (`overlay-retired`), and `persistTipShas` (`tip-sha`). Off-mode
+tests use throwing spies and assert zero Git, audit, removal and persistence calls; shadow still classifies.
+Retirement and replacement swaps append archive snapshots even when a ref repeats. Withdrawal restores the
+latest archived registration of each ref and recovers older nested sources; test both swap branches.
+The exported `registrationEvidenceReplay` in the existing `overlay-auto-retire-evidence` soak runs these
+send-back cases through real list storage with injected Git results. It can run without network or `.git`
+writes; it is a deterministic replay, not a claim about production daemon state. When collecting fix evidence,
+record every required proof separately, and explicitly mark live probes or verify verdicts unavailable.
+
 ## PR size admission trust-boundary fixtures
 
 `scripts/lib/__tests__/pr-size-admission.test.mjs` exercises Git with real shadow refs and
