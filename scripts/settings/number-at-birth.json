@@ -1,0 +1,9 @@
+{
+  "$comment": "Birth numbering: backlog.cardNumbering.numberAtBirth.enabled on|off (WE_NUMBER_AT_BIRTH); remote best-effort|required (WE_CARD_NUMBERING_REMOTE). Standard -> platform backlog -> tool -> environment, with per-leaf provenance logged. Best-effort falls back to hash naming on unknown remote evidence; required refuses. Remote claims are atomic and create-only; burned numbers are never reused.",
+  "backlog": {
+    "cardNumbering": {
+      "numberAtBirth": { "enabled": "on" },
+      "remote": "best-effort"
+    }
+  }
+}
