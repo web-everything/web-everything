@@ -112,14 +112,17 @@ export function readMainTip({ exec = execFileSyncThrottled, repoSlug = DEFAULT_R
     const checksOf = (commit) => {
       const page = ghJson(exec, ['api', `repos/${repoSlug}/commits/${commit}/check-runs?per_page=100`]);
       if (!Array.isArray(page?.check_runs)) throw new Error('main check-runs read returned no list');
-      return page.check_runs.map(({ id, name, status, conclusion }) => ({ id, name, status, conclusion }));
+      return {
+        checksTotal: page.total_count,
+        checkRuns: page.check_runs.map(({ id, name, status, conclusion }) => ({ id, name, status, conclusion })),
+      };
     };
     const checks = requiredChecks ?? readRequired({ repo: repoSlug }).checks;
     if (!Array.isArray(checks) || !checks.length) return null;
     const newest = [...runs].filter((r) => r.headSha === sha).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
-    const tip = { sha, runStatus: newest?.status ?? null, checkRuns: checksOf(sha), requiredChecks: checks };
+    const tip = { sha, runStatus: newest?.status ?? null, ...checksOf(sha), requiredChecks: checks };
     const state = mainRedState(runs);
-    if (state.status === 'red' && state.latestRed.sha !== sha) tip.redCheckRuns = checksOf(state.latestRed.sha);
+    if (state.status === 'red' && state.latestRed.sha !== sha) tip.redCheckRuns = checksOf(state.latestRed.sha).checkRuns;
     return tip;
   } catch { return null; }
 }
