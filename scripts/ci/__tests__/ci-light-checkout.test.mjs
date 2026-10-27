@@ -11,11 +11,13 @@ const raw = readFileSync(new URL('../../../.github/workflows/ci.yml', import.met
 const { jobs } = yaml.load(raw);
 const fetchMain = 'git fetch --no-tags --filter=blob:none --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main';
 // Historical full-history WE checkouts; `test` is intentionally gone from this roster.
-const historyJobs = ['changes', 'standards', 'test-shard', 'integration', 'daemon-soak-scope', 'test-selection-measure'];
+const historyJobs = ['changes', 'standards', 'integration', 'daemon-soak-scope', 'test-selection-measure'];
 
 describe('ci.yml shallow checkouts with blobless main history', () => {
-  it('contains no fetch-depth: 0, including stale comments', () => {
-    expect(raw).not.toMatch(/fetch-depth:\s*0\b/);
+  it('only the unit test-shard job uses fetch-depth: 0 (live-git-history tests need full history)', () => {
+    expect(raw.match(/fetch-depth:\s*0\b/g)).toHaveLength(1);
+    const c = jobs['test-shard'].steps.find((s) => s.uses?.startsWith('actions/checkout@') && s.with?.path === 'web-everything');
+    expect(c.with['fetch-depth']).toBe(0);
   });
 
   it.each(historyJobs)('%s retains its history-dependent checkout at depth 50', (name) => {
