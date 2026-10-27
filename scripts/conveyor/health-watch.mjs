@@ -86,6 +86,7 @@ import { probeDaemonCloneBranches } from '../lib/daemon-clone-branch-probe.mjs';
 import { workspaceOf } from '../lib/automation-home.mjs';
 import { probeBuildSessions, probeExternalRuns } from './build-supervision.mjs';
 import { probeAndOwnMainCi } from './main-ci-red-io.mjs';
+import { runMainRedAlert } from './health-watch-main-red.mjs';
 import { collectCredentialInventory, normalizeInventory } from './credential-inventory.mjs';
 import { readGithubAppStatus, defaultCachePath } from '../lib/github-app-auth-env.mjs';
 import { resolvePrLimit, readLimitState, isGlobalOffNow } from '../lib/pr-limit.mjs';
@@ -1283,6 +1284,9 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
       dir, now, config, weRoot: REPO_ROOT, dryRun: !!flags['dry-run'] || !!fixture,
       ...(fixture ? { readRuns: () => JSON.parse(readFileSync(fixture, 'utf8')), readPrs: () => [], listAgents: async () => [], gates: async () => ({ killed: false, fixGate: null }) } : {}),
     }));
+  }
+  if (!flags['dry-run'] && !fixtureTick && !Object.keys(flags).some(key => key.endsWith('-fixture'))) {
+    await attempt('mainRedAlert', () => runMainRedAlert({ probe: probes.mainCiRuns, dir, now, config }));
   }
   // #4066 `open-prs-over-limit` — fs/env only; pairs with the gh-cadenced `prs` read below.
   probes.prLimit = attempt('prLimit', () => probePrLimit());
