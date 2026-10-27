@@ -215,6 +215,7 @@ describe('ENGINE_BASENAMES / isEngineTierPath — #2412 layer 4\'s "is this the 
 
 
 describe('delivery policy trust boundary (#5113 Part A)', () => {
+  // A real esbuild bundle plus a cold TypeScript import can exceed 5s under coverage/load.
   it('every file the loader reads is gated, including an honoured pointer target', async () => {
     const { loadDeliveryPolicy } = await import('../delivery-policy.mjs');
     await fixture(async ({ root }) => {
@@ -230,7 +231,7 @@ describe('delivery policy trust boundary (#5113 Part A)', () => {
         for (const file of result.filesRead) expect(isPolicySpecPath(file)).toBe(true);
       } finally { POLICY_SPEC_BASENAMES.delete('repair-policy.json'); }
     });
-  });
+  }, 30000);
 
   describe('shipped human-review surfaces', () => {
     beforeEach(() => vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', undefined));
