@@ -158,7 +158,8 @@ describe('PR #5331 production wiring and complete threads', () => {
     readMainTip: () => ({ sha: mainSha, committedAt: later }), checkClaim: () => null,
     refresh: vi.fn(() => ({ ok: false, error: 'conflict' })), postComment: vi.fn() });
   const cli = (sweepOptions, overrides = {}) => ({ sweepOptions, sweepHung: vi.fn(() => ({})),
-    sweepMissingRun: vi.fn(() => ({})), writeLine: vi.fn(), writeAll: vi.fn(), ...overrides });
+    sweepMissingRun: vi.fn(() => ({})), sweepMainCancelled: vi.fn(() => ({})),
+    writeLine: vi.fn(), writeAll: vi.fn(), ...overrides });
 
   it.each([0, 2, 3])('signature and exhausted recovery honor unresolved holds with %s heals', healCount => {
     const stop = { ...trusted(buildStandDownComment({ reason: 'needs-judgment', head: headSha })), id: 'IC_hold' };
@@ -216,6 +217,7 @@ describe('PR #5331 production wiring and complete threads', () => {
       await watcher.main(['sweep', '--apply', '--json'], calls);
       expect(calls.sweepHung).toHaveBeenCalledOnce();
       expect(calls.sweepMissingRun).toHaveBeenCalledOnce();
+      expect(calls.sweepMainCancelled).toHaveBeenCalledOnce();
       expect(calls.writeLine.mock.calls.flat().join(' ')).toContain('transient read/write failure');
       expect(process.exitCode).toBe(1);
     } finally { process.exitCode = previousExitCode; }
