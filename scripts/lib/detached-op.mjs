@@ -145,28 +145,42 @@ export async function collectOwnedProcesses(record, { deadline = Date.now() + SC
         if (Date.now() >= deadline) return { members: [], complete: false };
         await Promise.all(names.slice(i, i + 16).map(async name => {
           const pid = Number(name);
+          if (pid === record.pid || pid === process.pid) return;
+          let row, processComplete = true;
           try {
             if ((await io.stat(`/proc/${pid}`)).uid !== uid) return;
-            const row = await linuxRow(pid, scope, io, bootId, signal);
+            row = await linuxRow(pid, scope, io, bootId, signal);
             if (row.state.startsWith('Z')) return;
-            rows.push(row);
             const env = await io.readFile(`/proc/${pid}/environ`, { encoding: 'utf8', signal });
             if (env.split('\0').includes(`WE_DETACHED_OP=${record.id}`)) marked.add(pid);
             const fds = await io.readdir(`/proc/${pid}/fd`);
-            if (fds.length > 4096) { complete = false; return; }
-            for (const fd of fds) {
+            if (fds.length > 4096) processComplete = false;
+            for (const fd of fds.length > 4096 ? [] : fds) {
               try {
                 const info = await io.stat(`/proc/${pid}/fd/${fd}`);
                 if (logs.some(log => log.dev === info.dev && log.ino === info.ino)) {
                   const fdinfo = await io.readFile(`/proc/${pid}/fdinfo/${fd}`, { encoding: 'utf8', signal });
                   const flags = /^flags:\s+([0-7]+)$/m.exec(fdinfo);
-                  if (!flags) complete = false;
+                  if (!flags) processComplete = false;
                   // Log readers (including --wait-for itself) do not own operation work.
                   else if ((Number.parseInt(flags[1], 8) & 3) !== 0) logged.add(pid);
                 }
-              } catch (error) { if (error.code !== 'ENOENT') complete = false; }
+              } catch (error) { if (!['ENOENT', 'ESRCH'].includes(error.code)) processComplete = false; }
             }
-          } catch (error) { if (!['ENOENT', 'ESRCH'].includes(error.code)) complete = false; }
+          } catch (error) {
+            if (['ENOENT', 'ESRCH'].includes(error.code)) return;
+            processComplete = false;
+          }
+          if (!processComplete) {
+            // Exiting processes can lose proc permissions before their directory disappears.
+            // Only proven death/reuse clears that error; a live or unreadable owner stays unknown.
+            try {
+              const current = await linuxRow(pid, scope, io, bootId, signal);
+              if (current.state.startsWith('Z') || (row && !sameProcess(identity(row), identity(current)))) return;
+            } catch (error) { if (['ENOENT', 'ESRCH'].includes(error.code)) return; }
+            complete = false;
+          }
+          if (row) rows.push(row);
         }));
       }
     } else if (platform === 'darwin') {

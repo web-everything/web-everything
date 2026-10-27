@@ -525,6 +525,45 @@ describe('process ownership model (T1–T11)', () => {
       return args[0] === 'eww' ? marker : rows.join('\n');
     } };
   }
+  function linuxExitSnapshot({ at = 'fdinfo', code = 'EACCES', after = 'Z', oversized = false,
+    excluded = false } = {}) {
+    let failed = false;
+    const error = value => Object.assign(new Error(value), { code: value });
+    const fail = () => { failed = true; throw error(code); };
+    const io = {
+      readFile: vi.fn(async path => {
+        if (path.endsWith('/boot_id')) return 'boot';
+        if (path.endsWith('/stat')) {
+          if (failed && ['ENOENT', 'ESRCH', 'EACCES'].includes(after)) throw error(after);
+          const fields = [failed && after === 'Z' ? 'Z' : 'S', '1', '101', ...Array(16).fill('0'),
+            failed && after === 'reused' ? '456' : '123'];
+          return `101 (fixture) ${fields.join(' ')}`;
+        }
+        if (path.endsWith('/environ')) {
+          if (at === 'environ') fail();
+          return 'WE_DETACHED_OP=job\0';
+        }
+        if (path.includes('/fdinfo/')) return fail();
+        throw new Error(`unexpected read ${path}`);
+      }),
+      readdir: vi.fn(async path => {
+        if (path === '/proc') return excluded ? [String(record.pid), String(process.pid), '101'] : ['101'];
+        if (oversized) { failed = true; return Array.from({ length: 4097 }, (_, i) => String(i)); }
+        return ['1'];
+      }),
+      stat: vi.fn(async path => {
+        if (path === record.stdoutPath) return { dev: 1, ino: 1 };
+        if (path === record.stderrPath) return { dev: 1, ino: 2 };
+        if (path.includes('/fd/')) {
+          if (at === 'fd') fail();
+          return { dev: 1, ino: 1 };
+        }
+        if (excluded && path !== '/proc/101') throw error('EACCES');
+        return { uid: 501 };
+      }),
+    };
+    return { platform: 'linux', uid: 501, io };
+  }
 
   it('T1: Linux identity uses start ticks and boot id, including names containing parentheses', async () => {
     const fields = ['S', '1', '101', ...Array(16).fill('0'), '45678'];
@@ -599,6 +638,49 @@ describe('process ownership model (T1–T11)', () => {
       { platform: 'linux', io, uid: 501 });
     expect(result.complete).toBe(true);
     expect(result.members.map(p => p.pid).sort()).toEqual([101, 102, 103, 104, 105]);
+  });
+
+  it.each(['fd', 'fdinfo'])('T9: a disappearing Linux descriptor (%s ESRCH) does not poison cleanup', async at => {
+    const result = await collectOwnedProcesses({ ...record, commandIdentity: null, members: [] },
+      linuxExitSnapshot({ at, code: 'ESRCH', after: 'S' }));
+    expect(result).toEqual({ complete: true,
+      members: [{ pid: 101, platform: 'linux', start: '123', bootId: 'boot', scope }] });
+  });
+
+  it.each(['environ', 'fd', 'fdinfo'])('T9: Linux %s permission loss is cleared only after confirmed exit', async at => {
+    for (const code of ['EACCES', 'EPERM']) {
+      for (const after of ['Z', 'ENOENT', 'ESRCH', 'reused']) {
+        expect(await collectOwnedProcesses(record, linuxExitSnapshot({ at, code, after })))
+          .toEqual({ complete: true, members: [] });
+      }
+    }
+  });
+
+  it.each(['environ', 'fd', 'fdinfo'])('T9: Linux %s denial for a live or unreadable process stays incomplete', async at => {
+    for (const after of ['S', 'EACCES']) {
+      const result = await collectOwnedProcesses(record, linuxExitSnapshot({ at, after }));
+      expect(result.complete).toBe(false);
+      expect(result.members).toEqual(at === 'environ' ? []
+        : [{ pid: 101, platform: 'linux', start: '123', bootId: 'boot', scope }]);
+    }
+  });
+
+  it('T9: Linux runner and observer permissions cannot poison discovery of eligible owners', async () => {
+    const options = linuxExitSnapshot({ at: 'fdinfo', code: 'ENOENT', excluded: true });
+    expect((await collectOwnedProcesses(record, options)).complete).toBe(true);
+    for (const method of ['stat', 'readFile', 'readdir']) {
+      expect(options.io[method].mock.calls.flat().some(path => typeof path === 'string'
+        && [record.pid, process.pid].some(pid => path === `/proc/${pid}` || path.startsWith(`/proc/${pid}/`))))
+        .toBe(false);
+    }
+  });
+
+  it('T9: oversized Linux descriptor scans stay bounded and require confirmed death to clear', async () => {
+    for (const after of ['S', 'Z']) {
+      const options = linuxExitSnapshot({ oversized: true, after });
+      expect((await collectOwnedProcesses(record, options)).complete).toBe(after === 'Z');
+      expect(options.io.stat.mock.calls.some(([path]) => path.includes('/fd/'))).toBe(false);
+    }
   });
 
   it('T4: stalled platform probes and ownership scans respect their deadline', async () => {
