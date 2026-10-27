@@ -19,3 +19,20 @@ export function redTeamStatusWithoutRun(row, { originalStatus } = {}) {
     || (row.result?.status === 'resumed'
       && !Array.isArray(row.result.findings) && !row.result.provider && !row.result.model);
 }
+
+/** One failed execution may retry; absent counts and completed seats retain their existing guards. */
+export function failedRedTeamRetry(status, { failedSeatCount, completedRecorded } = {}) {
+  const result = status?.result;
+  return (status?.retryCount === undefined || status.retryCount === 0)
+    && status?.status === 'finished' && (typeof result === 'string' ? result : result?.status) === 'ran'
+    && completedRecorded === false && failedSeatCount === 1
+    && (result?.comment?.status ?? result?.comment) !== 'posted';
+}
+
+/** The job preflight and shared runner enforce the same fresh-seat history bound. */
+export function freshRedTeamRefusal(status, evidence) {
+  if (failedRedTeamRetry(status, evidence)) return null;
+  if (status != null && !redTeamStatusWithoutRun(status)) return 'prior red-team status; not re-run';
+  if (evidence.seatRecorded) return 'prior red-team seat row; not re-run';
+  return null;
+}

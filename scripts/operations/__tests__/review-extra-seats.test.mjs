@@ -1,3 +1,5 @@
+import { provenanceRun } from '../../lib/__tests__/fixtures/saved-red-team-provenance.mjs';
+import { writeRun } from '../run-store.mjs';
 import { readRoutingPolicy } from '../../lib/dispatch-routing-policy-io.mjs';
 /**
  * #4194 — ADDED NON-CLAUDE REVIEW SEATS: advisory lenses + one extra juror routed to Codex/Gemini through the
@@ -13,7 +15,7 @@ import {
   reviewSeatRoutes, ROUTED_ADVISORY_LENSES, EXTRA_JUROR_MANDATE, REVIEW_SEAT_MODELS,
 } from '../review-dispatch.mjs';
 import {
-  runExtraSeats, extraSeatsEnabled, resolveDailyCap, callsUsedToday, callsUsedTodayForProvider, quotaHold,
+  finishSpeculativeRedTeam, redTeamReadFingerprint, RED_TEAM_SEAT, runExtraSeats, extraSeatsEnabled, resolveDailyCap, callsUsedToday, callsUsedTodayForProvider, quotaHold,
   PROBE_INTERVAL_ENV, DEFAULT_PROBE_INTERVAL_MS, resolveProbeIntervalMs, probeDue, quotaHoldOrProbe,
   claudeFindingsFromLoop, buildSeatTask, parseSeatAnswer, classifySeatCall, buildSeatRows, seatCallArgv, capDay,
   renderSeatSummary, EXTRA_SEATS_ENV, DAILY_CAP_ENV, DEFAULT_DAILY_CAP, PROVIDER_CAP_ENV, PROVIDER_CAP_DEFAULT,
@@ -666,6 +668,7 @@ describe('#4194 review-job — the seats run AFTER the arc, and can never change
   function fakeJobIo(over = {}) {
     const calls = [];
     const io = {
+    redTeamTimingSetting: () => ({ value: { timing: 'post-accept' }, sources: { timing: 'tool' }, invalid: [] }),
       root: '/daemon',
       now: (() => { let t = 1_000; return () => { t += 10; return t; }; })(),
       newActorId: () => 'actor',
@@ -917,4 +920,102 @@ it('keeps distinct per-seat policy models in separate calls and reserves both un
   expect(calls.filter(c => c[0] === 'seat').map(c => c[1].model).sort()).toEqual(['gpt-6-astra', 'gpt-6-sol']);
   expect(calls.filter(c => c[0] === 'reserve')).toEqual([['reserve', 'codex', 2, 2]]);
   expect(result.seats.find(s => s.lens === 'claim-accuracy').model).toBe('gpt-6-sol');
+});
+
+
+describe('speculative red-team supersession provenance', () => {
+  function historyReadFixture(faultRead, code) {
+    const loopPayload = { ...LOOP_PAYLOAD, verdict: { verdict: 'accept' },
+      findings: { ...LOOP_PAYLOAD.findings, judge: { findings: [] } } };
+    const pass = { status: 'speculated', rev: loopPayload.findings.read.netBasis.rev,
+      readFingerprint: redTeamReadFingerprint(loopPayload.findings.read),
+      callId: 'fresh-call', provider: 'codex', model: 'm', call: { status: 'ok' },
+      parsed: { [RED_TEAM_SEAT.key]: { ok: true, verdict: 'accept', findings: [] } },
+      findings: [], recheckStatus: 'not-needed', evidence: {}, quota: {}, startedAt: NOW, finishedAt: NOW };
+    let readAttempts = 0;
+    const publications = [];
+    const f = fakeSeatIo({
+      readRecords: () => {
+        if (++readAttempts === faultRead) throw Object.assign(new Error(`injected scorecard ${code}`), { code });
+        return [];
+      },
+      listComments: () => [],
+      postComment: () => publications.push('postComment'),
+      redTeamStatus: () => publications.push('redTeamStatus'),
+      logTrial: () => { publications.push('logTrial'); return true; },
+    });
+    return { ...f, loopPayload, pass, publications, readAttempts: () => readAttempts };
+  }
+
+  it.each([
+    { phase: 'supersession', faultRead: 1 },
+    { phase: 'completion', faultRead: 2 },
+  ])('fails closed on EIO at the $phase history read: no append, publication, or accept', async ({ phase, faultRead }) => {
+    // Completion's first (supersession) read succeeds, isolating its own error handling.
+    const f = historyReadFixture(faultRead, 'EIO');
+    const result = await finishSpeculativeRedTeam({ pr: 5, repo: REPO,
+      loopPayload: f.loopPayload, pass: f.pass, env: { WE_RED_TEAM_TIMING: 'post-accept' } }, f.io);
+
+    expect(f.readAttempts(), 'the injected read must actually be reached').toBeGreaterThanOrEqual(faultRead);
+    expect({ appended: f.rows.length, publications: f.publications, foldedVerdict: result.foldedVerdict },
+      `EIO at the ${phase} read must not become empty history and authorize effects or acceptance`)
+      .toEqual({ appended: 0, publications: [], foldedVerdict: expect.not.stringMatching(/^accept$/) });
+    expect(f.calls.filter(([kind]) => kind === 'reserve' || kind === 'seat')).toEqual([]);
+  });
+
+  it.each([
+    { phase: 'supersession', faultRead: 1 },
+    { phase: 'completion', faultRead: 2 },
+  ])('ENOENT at the $phase history read still permits completion with empty history', async ({ faultRead }) => {
+    const f = historyReadFixture(faultRead, 'ENOENT');
+    const result = await finishSpeculativeRedTeam({ pr: 5, repo: REPO,
+      loopPayload: f.loopPayload, pass: f.pass, env: { WE_RED_TEAM_TIMING: 'post-accept' } }, f.io);
+
+    expect(f.readAttempts()).toBe(2);
+    expect(result).toMatchObject({ status: 'ran', foldedVerdict: 'accept', rowsWritten: 1,
+      comment: { status: 'posted' } });
+    expect(f.rows).toHaveLength(1);
+    expect(f.rows[0]).toMatchObject({ seat: 'red-team', callId: 'fresh-call', rev: f.pass.rev, status: 'ok' });
+    expect(f.publications).toEqual(['postComment', 'redTeamStatus']);
+    expect(f.calls.filter(([kind]) => kind === 'reserve' || kind === 'seat')).toEqual([]);
+  });
+
+  it.each([
+    { name: 'an unattested matching row cannot supersede a completed speculative pass', proof: 'missing' },
+    { name: 'a matching row with mismatched attestation cannot supersede a completed speculative pass', proof: 'mismatched' },
+    { name: 'an attested matching row supersedes a completed speculative pass without writing new evidence', proof: 'valid' },
+  ])('finishSpeculativeRedTeam: $name', async ({ proof }) => {
+    const root = mkdtempSync(join(tmpdir(), 'extra-seats-supersession-'));
+    try {
+      const env = { CONVEYOR_STATE_ROOT: root, OPERATION_RUNS_DIR: join(root, 'runs'), WE_RED_TEAM_TIMING: 'post-accept' };
+      const rev = 'a'.repeat(40);
+      const records = [{ dispatchKind: 'review-seat', seat: 'red-team', repo: REPO, pr: 5,
+        rev, callId: 'prior-call', status: 'ok', findings: [], recheckStatus: 'not-needed' }];
+      if (proof !== 'missing') {
+        const run = provenanceRun({ env, rows: records });
+        if (proof === 'mismatched') run.findings.savedRedTeamResult.sha256 = '0'.repeat(64);
+        writeRun(run, env.OPERATION_RUNS_DIR);
+      }
+      const loopPayload = { ...LOOP_PAYLOAD, verdict: { verdict: 'accept' },
+        findings: { ...LOOP_PAYLOAD.findings, judge: { findings: [] } } };
+      const pass = { status: 'speculated', rev, readFingerprint: redTeamReadFingerprint(loopPayload.findings.read),
+        callId: 'fresh-call', provider: 'codex', model: 'm', call: { status: 'ok' },
+        parsed: { [RED_TEAM_SEAT.key]: { ok: true, verdict: 'accept', findings: [] } },
+        findings: [], recheckStatus: 'not-needed', evidence: {}, quota: {}, startedAt: NOW, finishedAt: NOW };
+      const { io, rows, calls } = fakeSeatIo({ readRecords: () => records });
+      const result = await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload, pass, env, post: false }, io);
+      expect(result.status).toBe(proof === 'valid' ? 'superseded' : 'ran');
+      if (proof !== 'valid') {
+        expect(rows.some(row => row.callId === 'fresh-call')).toBe(true);
+        expect(result).toMatchObject({ callId: 'fresh-call', rev, foldedVerdict: 'accept', rowsWritten: 1 });
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({ dispatchKind: 'review-seat', seat: 'red-team',
+          repo: REPO, pr: 5, rev, callId: 'fresh-call', status: 'ok' });
+      } else {
+        expect(result.reason).toContain('landed meanwhile');
+        expect(rows).toEqual([]);
+      }
+      expect(calls.filter(([kind]) => kind === 'reserve' || kind === 'seat')).toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
 });

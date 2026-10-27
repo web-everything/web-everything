@@ -1,5 +1,5 @@
 /** Cap-held card rulings: declaration and retry-safe automatic filing, with injected IO. */
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -307,7 +307,15 @@ describe('cap-only existing-card declaration', () => {
 describe('automatic card filing with shared durable claims', () => {
   const repo = 'web-everything/web-everything';
   const roots = [];
-  afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+  beforeEach(() => {
+    // Exercise filing independently of the operator's live pause setting and owed-card state.
+    vi.stubEnv('WE_PREVENTION_FILING_ENABLED', '1');
+    vi.stubEnv('WE_CARD_BATCH_STATE_DIR', root());
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  });
   const root = () => { const dir = mkdtempSync(join(tmpdir(), 'ruling-coordination-')); roots.push(dir); return dir; };
   const two = () => [redTeam(HEAD, [
     { summary: 'one', category: 'edge-case', impactIfUnfixed: 'broken', file: 'a.mjs', line: 1, confirmedByRecheck: true },
@@ -467,6 +475,14 @@ describe('automatic card filing with shared durable claims', () => {
     expect(() => f.act(p)).toThrow(/no release record written/);
     expect(heldAfter(f.comments)).toHaveLength(1);
     expect(f.cards).toHaveLength(1);
+  });
+  it('spawnStableCardJob records an owed filing without spawning when filing is paused', () => {
+    vi.stubEnv('WE_PREVENTION_FILING_ENABLED', '0');
+    const p = payloadFor(), spawnDetached = vi.fn();
+    expect(spawnStableCardJob(p.cardInput, p.session, {}, {
+      resolveSettingsEnv: () => null, spawnDetached,
+    })).toMatchObject({ ok: false, skipped: true, step: 'paused' });
+    expect(spawnDetached).not.toHaveBeenCalled();
   });
   it('spawnStableCardJob passes the receipt binding and overrides the random session in detached argv', () => {
     const p = payloadFor(), calls = [];

@@ -65,6 +65,7 @@ import {
   strandedNumberingRecords,
 } from '../lib/numbering-carry.mjs';
 import { readNetDiffAtHead } from '../merge-ai-prs.mjs';
+import { computeClearanceCoverage, latestOperatorClearanceRecord } from '../lib/approval-binding.mjs';
 import { assertMandatoryReferralsCleared } from '../review-set-label.mjs';
 import { latestAcceptRecord, resolveAcceptCarryForward } from '../lib/accept-carry-forward.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
@@ -156,6 +157,28 @@ const strandedChecked = new Map();
 export const STRANDED_RECHECK_MS = 30 * 60_000;
 export const STRANDED_BACKOFF_MS = 5 * 60_000;
 export function _resetStrandedCheckMemo() { strandedChecked.clear(); }
+
+/**
+ * IO (read-only git): the approval-binding coverage for the heal, from this checkout when it is the PR's repo, else the
+ * repo's sibling clone; no checkout → no proof → not covered (the sha rule stands). Never throws.
+ */
+export function healClearanceCoverage({ slug, comments, headSha, exec = execFileSync, cloneDirFor = defaultCloneDirFor, reviews = undefined } = {}) {
+  try {
+    const clearance = latestOperatorClearanceRecord(comments);
+    const head = String(headSha ?? '').toLowerCase();
+    if (!clearance || clearance.sha === head) return computeClearanceCoverage({ comments, liveHead: head });
+    let origin = '';
+    try { origin = String(exec('git', ['remote', 'get-url', 'origin'], { encoding: 'utf8' })).trim(); } catch { /* other checkout */ }
+    const originSlug = origin.replace(/^.*github\.com[:/]/i, '').replace(/\.git$/i, '').replace(/\/$/, '');
+    const cwd = originSlug.toLowerCase() === String(slug ?? '').toLowerCase() ? undefined : cloneDirFor(slug);
+    if (cwd === null) return computeClearanceCoverage({ comments, liveHead: head });
+    const run = (c, a, o) => exec(c, a, { ...o, ...(cwd ? { cwd } : {}) });
+    return computeClearanceCoverage({ comments, liveHead: head, exec: run, reviews,
+      readNetDiff: (sha) => readNetDiffAtHead({ exec: run, headSha: sha, headRef: sha }) });
+  } catch (e) {
+    return { covers: false, liveHead: String(headSha ?? '').toLowerCase(), reason: `clearance coverage unreadable: ${String(e?.message ?? e).split('\n')[0]}` };
+  }
+}
 
 export function sweepReviewHoldLabels({
   repo = null, listPrs = defaultListPrs, provider = createGhProvider(), dryRun = false, settings, runRuling, acceptCarry,
@@ -311,6 +334,10 @@ export function sweepReviewHoldLabels({
         acceptedSha: latestAcceptRecord(state.comments)?.sha ?? null,
         headSha: state.headRefOid,
         fetchOk: true,
+        // approval-binding (2026-10-21): the operator's clearance covers this head by sha or by a trusted git proof of
+        // the same net change — then neither the mutual-exclusivity heal nor the stale-accept heal may drop it.
+        clearanceCoverage: healClearanceCoverage({ slug: repoOf(), comments: state.comments, headSha: state.headRefOid, exec,
+          reviews: () => provider.readPrReviews(repoOf(), pr.number) }),
       });
       if (heal.heal) {
         // Account for this pass's own successful cleanup; GitHub rejects removing an absent label.
