@@ -92,6 +92,43 @@ describe('planMainRedAlert — proven tip recovery regressions', () => {
     expect(green.next.unknownEmitted).toBe(false);
   });
 
+  it.each([100, 101])('fails closed once after an alert for %i checks even via tip-required-checks', (count) => {
+    const tip = { ...passingTip(), requiredChecks: ['check-1'], checkRuns: successfulChecks(count) };
+    const state = mainRedState(redRuns(), { tip });
+    expect(state.status).toBe('green');
+    expect(state.via).toBe('tip-required-checks');
+    expect(tip.checkRuns).toHaveLength(count);
+
+    const red = plan();
+    expect(kinds(red)).toEqual(['main-red']);
+    const unknown = plan({ prev: red.next, runs: redRuns(), tip });
+    expect.soft(kinds(unknown)).toEqual(['main-status-unknown']);
+    expect.soft(unknown.next.fingerprint).toBe(red.next.fingerprint);
+    expect.soft(unknown.next.fingerprintParts).toEqual(red.next.fingerprintParts);
+    expect.soft(unknown.next.unknownEmitted).toBe(true);
+
+    const repeated = plan({ prev: unknown.next, runs: redRuns(), tip });
+    expect.soft(repeated.items).toEqual([]);
+    expect.soft(repeated.next.fingerprint).toBe(red.next.fingerprint);
+    expect.soft(repeated.next.unknownEmitted).toBe(true);
+  });
+
+  it.each([1, 99])('clears an alert for %i checks below the page limit via tip-required-checks', (count) => {
+    const tip = { ...passingTip(), requiredChecks: ['check-1'], checkRuns: successfulChecks(count) };
+    const state = mainRedState(redRuns(), { tip });
+    expect(state.status).toBe('green');
+    expect(state.via).toBe('tip-required-checks');
+    expect(tip.checkRuns).toHaveLength(count);
+
+    const red = plan();
+    expect(kinds(red)).toEqual(['main-red']);
+    const green = plan({ prev: red.next, runs: redRuns(), tip });
+    expect(kinds(green)).toEqual(['main-green']);
+    expect(green.next.fingerprint).toBeNull();
+    expect(green.next.unknownEmitted).toBe(false);
+    expect(plan({ prev: green.next, runs: redRuns(), tip }).items).toEqual([]);
+  });
+
   it.each([
     ['queued required check', { ...passingTip(), runStatus: 'in_progress',
       checkRuns: [{ id: 1, name: 'test', status: 'queued', conclusion: null }],
