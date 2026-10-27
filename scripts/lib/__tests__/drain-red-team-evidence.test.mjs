@@ -16,6 +16,7 @@ import { redTeamOwedFor } from '../review-red-team-policy.mjs';
 import { pidStartTime } from '../pid-alive.mjs';
 import { readRedTeamCarry, resumeRedTeamCarry } from '../red-team-carry-machine.mjs';
 import { staleRedTeamRequestEligibility } from '../drain-merge-strategy.mjs';
+import { redTeamSkipNeedsSettlement } from '../review-red-team-on-skip.mjs';
 
 vi.mock('node:fs', async importOriginal => {
   const actual = await importOriginal();
@@ -116,6 +117,36 @@ describe('invalid status carry cannot suppress failed-seat recovery', () => {
   const recoveryState = evidence => ({ carryConflict: evidence.carryConflict, scheduled: evidence.scheduled,
     noUsableResult: evidence.noUsableResult, failedSeatCount: evidence.failedSeatCount });
 
+  it('a skipped code-diff status with valid carriedFrom cannot suppress failed-seat recovery', () => {
+    const { f, path, loopPayload } = failedSeatFixture();
+    expect(readRedTeamCarry(f)).toBeNull();
+    const status = { repo: f.repo, pr: f.pr, head: f.head, status: 'finished',
+      result: 'skipped', skipCardOnly: true, loopPayload };
+    expect(redTeamSkipNeedsSettlement(status)).toBe(false);
+    writeFileSync(path, JSON.stringify(status));
+    const ordinary = recoveryState(readDrainRedTeamEvidence(f));
+    expect(ordinary).toEqual({ carryConflict: undefined, scheduled: true, noUsableResult: true, failedSeatCount: 1 });
+
+    writeFileSync(path, JSON.stringify({ ...status, loopPayload: { ...loopPayload, carriedFrom: 'a'.repeat(40) } }));
+    expect(recoveryState(readDrainRedTeamEvidence(f)),
+      'skipCardOnly is a setting; a code diff cannot authorize carry or hide the failed seat').toEqual(ordinary);
+  });
+
+  it('merge-strategy keeps the failed-seat request eligible for a skipped code diff with valid carriedFrom', () => {
+    const { f, path, loopPayload } = failedSeatFixture();
+    expect(readRedTeamCarry(f)).toBeNull();
+    const status = { repo: f.repo, pr: f.pr, head: f.head, status: 'finished',
+      result: 'skipped', skipCardOnly: true, loopPayload };
+    const eligible = () => staleRedTeamRequestEligibility({ ...f, evidence: readDrainRedTeamEvidence(f),
+      enabled: true, labels: ['review:accepted', 'ready-to-merge'] });
+    writeFileSync(path, JSON.stringify(status));
+    const ordinary = eligible();
+    expect(ordinary).toEqual({ eligible: true, reason: 'stale rows with no usable result' });
+
+    writeFileSync(path, JSON.stringify({ ...status, loopPayload: { ...loopPayload, carriedFrom: 'a'.repeat(40) } }));
+    expect(eligible(), 'code-diff skip metadata must not suppress the drain consumer request').toEqual(ordinary);
+  });
+
   it.each(nonCarryStatuses)('valid carriedFrom on %s cannot suppress failed-seat recovery', (_kind, fields) => {
     const { f, path, loopPayload } = failedSeatFixture();
     expect(readRedTeamCarry(f)).toBeNull();
@@ -203,7 +234,8 @@ describe('invalid status carry cannot suppress failed-seat recovery', () => {
     // Valid provenance still participates, with case-insensitive repo/head identity.
     writeFileSync(path, JSON.stringify({ ...status, repo: f.repo.toUpperCase(), head: f.head.toUpperCase(),
       loopPayload: { ...status.loopPayload, findings: { ...status.loopPayload.findings,
-        read: { ...status.loopPayload.findings.read, netBasis: { rev: f.head.toUpperCase() } } } } }));
+        read: { diffText: 'diff --git a/backlog/123-card.md b/backlog/123-card.md\n+card update\n',
+          netChangedFiles: ['backlog/123-card.md'], netBasis: { rev: f.head.toUpperCase() } } } } }));
     expect(readDrainRedTeamEvidence(f)).toMatchObject({ carryConflict: true, noUsableResult: false });
   });
 });
