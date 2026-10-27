@@ -16,6 +16,7 @@ const planOf = args => planLabelStateReconcile({ reviews: [], ...args });
 function review(number, overrides = {}) {
   return { id: 'review-pr-accepted', op: 'review-pr', findings: {
     read: { repo, pr: number, netBasis: { rev: head } }, confirm: 'accept',
+    record: { applied: true, effects: [{ type: 'review.label-swap', status: 'applied' }] },
     referralVerdict: { verdict: 'accept', pendingReferrals: [], blockedReferrals: [],
       lenses: ['correctness', 'security'], lensVerdicts: { correctness: 'accept', security: 'accept' }, ...overrides },
   }, stepTimings: [{ step: 'read', startedAt: '2026-10-26T01:00:00Z' },
@@ -33,6 +34,28 @@ function referral(number, ruled) {
 }
 
 describe('planLabelStateReconcile', () => {
+  it.each(['failed', 'pending', 'missing', 'advisory-only', 'stack-only'])
+  ('%s publication cannot authorize clearing review holds', kind => {
+    const stored = review(42);
+    stored.input = { actor: 'author' };
+    stored.findings.record = { applied: false, effects: [{ type: 'review.label-swap', status: kind,
+      error: 'accepting actor matches PR author' }] };
+    if (kind === 'missing') delete stored.findings.record;
+    if (kind === 'advisory-only' || kind === 'stack-only') stored.findings.record = { applied: true,
+      effects: [{ type: kind === 'advisory-only' ? 'review.advisory-note' : 'review.stack-hold', status: 'applied' }] };
+    expect(reviewRunEvidence(stored)).toMatchObject({ completedAt: expect.any(Number), parked: false,
+      persistenceFailed: false });
+    expect(planOf({ repo, pr: pr(42, ['review:changes', 'fix-waiting:host-busy'], []), review: stored })).toBeNull();
+  });
+  it.each(['updatedAt', 'updated_at', 'missing', 'invalid', 'same-time'])
+  ('an older objection with %s edit timing retains holds', kind => {
+    const objection = { ...comment('🔁 review — changes requested'), createdAt: '2026-10-26T00:59:00Z' };
+    if (kind === 'updatedAt' || kind === 'updated_at') objection[kind] = '2026-10-26T01:02:00Z';
+    if (kind === 'invalid') objection.updatedAt = 'invalid';
+    if (kind === 'same-time') objection.updatedAt = '2026-10-26T01:00:00Z';
+    expect(planOf({ repo, pr: pr(42, ['review:changes', 'fix-waiting:host-busy'], [objection]),
+      review: review(42) })).toBeNull();
+  });
   it.each([5973, 5970])('#%s: ACCEPTS on the live head replaces blocked and preserves ready', number => {
     const plan = planOf({ repo, pr: pr(number, ['red-team:blocked', 'red-team:pending', 'ready-to-merge']) });
     expect(plan.to).toEqual(['ready-to-merge', 'red-team:clear']);
@@ -80,7 +103,7 @@ describe('planLabelStateReconcile', () => {
     const observed = reviewRunEvidence(stored);
     expect(observed.completedAt).toBe(Date.parse('2026-10-26T01:01:00Z'));
     const verdict = { author: { login: 'chalbert' }, body: `${heading}\nRemaining blocker`,
-      createdAt: '2026-10-26T01:02:00Z' };
+      createdAt: '2026-10-26T01:02:00Z', updatedAt: '2026-10-26T01:02:00Z' };
     const live = pr(42, ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held', 'ready-to-merge'], [verdict]);
     expect(planOf({ repo, pr: live, review: stored }).to)
       .toEqual(['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held']);
@@ -95,19 +118,19 @@ describe('planLabelStateReconcile', () => {
     const verdict = comment('🔁 review — changes requested\nRemaining blocker');
     if (kind === 'invalid') verdict.createdAt = 'invalid';
     // The run read the thread at 01:00:00 and finished advise at 01:01:00; it never saw either verdict.
-    if (kind === 'same-time') verdict.createdAt = '2026-10-26T01:00:00Z';
-    if (kind === 'during-run') verdict.createdAt = '2026-10-26T01:00:30Z';
+    if (kind === 'same-time') verdict.createdAt = verdict.updatedAt = '2026-10-26T01:00:00Z';
+    if (kind === 'during-run') verdict.createdAt = verdict.updatedAt = '2026-10-26T01:00:30Z';
     if (kind === 'REST') {
       delete verdict.author;
       verdict.user = { login: 'chalbert' };
-      verdict.created_at = '2026-10-26T01:02:00Z';
+      verdict.created_at = verdict.updated_at = '2026-10-26T01:02:00Z';
     }
     expect(planOf({ repo, pr: pr(42,
       ['review:changes', 'fix-waiting:host-busy'], [verdict]), review: review(42) })).toBeNull();
   });
   it.each(['older', 'untrusted', 'quoted'])('%s changes text cannot veto a settled accept', kind => {
     const verdict = { ...comment('🔁 review — changes requested'), createdAt: '2026-10-26T01:02:00Z' };
-    if (kind === 'older') verdict.createdAt = '2026-10-26T00:59:00Z';
+    if (kind === 'older') verdict.createdAt = verdict.updatedAt = '2026-10-26T00:59:00Z';
     if (kind === 'untrusted') verdict.author.login = 'attacker';
     if (kind === 'quoted') verdict.body = `Quoted example:\n${verdict.body}`;
     expect(planOf({ repo, pr: pr(42,
@@ -219,6 +242,30 @@ describe('sweepLabelStateReconcile', () => {
     return { repo, prs: [live], provider, emit, readPr: vi.fn(() => live), readComments: () => live.comments,
       readReviews: () => [reviewRunEvidence(stored)], readReview: () => stored, readRedTeam: () => null };
   }
+  it('a failed self-acceptance record preserves holds through the sweep', () => {
+    const io = fixture(), stored = review(5954);
+    stored.input = { actor: 'author' };
+    delete stored.findings.record;
+    stored.effects = [{ step: 'record', type: 'review.label-swap', status: 'failed',
+      error: 'accepting actor matches PR author' }];
+    io.readReview = () => stored;
+    const [row] = sweepLabelStateReconcile(io);
+    expect(row.labelsReconciled.to).toEqual(['review:changes', 'fix-waiting:host-busy', 'red-team:clear']);
+    expect(io.provider.setLabels).toHaveBeenCalledWith(repo, 5954, {
+      add: 'red-team:clear', remove: ['red-team:blocked'] });
+  });
+  it('an old comment edited into changes before the final write preserves holds', () => {
+    const io = fixture(), live = io.prs[0];
+    const old = { ...comment('Operator note'), createdAt: '2026-10-26T00:59:00Z',
+      updatedAt: '2026-10-26T00:59:00Z' };
+    let reads = 0;
+    io.readComments = () => [...live.comments, ++reads > 1 ? { ...old,
+      body: '🔁 review — changes requested', updatedAt: '2026-10-26T01:02:00Z' } : old];
+    const [row] = sweepLabelStateReconcile(io);
+    expect(row.labelsReconciled.to).toEqual(['review:changes', 'fix-waiting:host-busy', 'red-team:clear']);
+    expect(io.provider.setLabels).toHaveBeenCalledWith(repo, 5954, {
+      add: 'red-team:clear', remove: ['red-team:blocked'] });
+  });
   it('writes through the shared provider and emits before/after with result IDs and SHA only on changes', () => {
     const io = fixture(), [row] = sweepLabelStateReconcile(io);
     expect(io.provider.ensureLabel).toHaveBeenCalledWith(repo, 'red-team:clear', expect.any(Object));

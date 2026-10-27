@@ -22,6 +22,8 @@ export default {
       && planner.includes('laterReviewHold(reviews')
       && planner.includes('const fresh = readLive()')
       && planner.includes('at >= observed.startedAt')
+      && planner.includes('publishedAccept')
+      && planner.includes('c.updatedAt ?? c.updated_at')
       && reader.includes("fields = 'number,state,labels,headRefOid'");
   },
   async run({ sourceRoot = ROOT, log } = {}) {
@@ -47,28 +49,50 @@ export default {
     // write, and a native GitHub change request must each keep the holds.
     // during-run-changes: posted after the run read the thread but before its advise step finished.
     const holding = ['changes', 'later-changes', 'awaiting-confirm', 'racing-changes', 'native-changes',
-      'during-run-changes'];
+      'during-run-changes', 'edited-changes', 'rest-edited-changes', 'unknown-edit', 'racing-edit'];
     for (const scenario of ['changes', 'accept', 'abstain', 'later-changes', 'newer-accept',
-      'awaiting-confirm', 'racing-changes', 'native-changes', 'during-run-changes']) {
+      'awaiting-confirm', 'racing-changes', 'native-changes', 'during-run-changes',
+      'failed-self-accept', 'edited-changes', 'rest-edited-changes', 'unknown-edit', 'racing-edit']) {
       const confirm = ['changes', 'abstain'].includes(scenario) ? scenario
         : scenario === 'awaiting-confirm' ? undefined : 'accept';
       let labels = ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held', 'ready-to-merge'];
       const review = { id: 'review-pr-accepted', op: 'review-pr', input: { reason: 'remaining operator blocker' }, findings: {
         read: { repo, pr: number, netBasis: { rev: head } }, ...(confirm ? { confirm } : {}),
+        record: { applied: true, effects: [{ type: 'review.label-swap', status: 'applied' }] },
         referralVerdict: { verdict: 'accept', pendingReferrals: [], blockedReferrals: [],
           lenses: ['correctness', 'security'], lensVerdicts: { correctness: 'accept', security: 'accept' } },
       }, stepTimings: [{ step: 'read', startedAt: '2026-10-26T01:00:00Z' },
         { step: 'advise', finishedAt: '2026-10-26T01:01:00Z' }] };
+      if (scenario === 'failed-self-accept') {
+        review.input.actor = 'author';
+        delete review.findings.record;
+        review.effects = [{ step: 'record', type: 'review.label-swap', status: 'failed',
+          error: 'accepting actor matches PR author' }];
+      }
       if (confirm === 'abstain' && !planRecordDecision(review).abstain) violations.push('abstain: unexpectedly records');
       const comments = confirm === 'changes' ? [] : [settled];
       const operatorChanges = { author: { login: 'chalbert' },
-        body: '🔁 review — changes requested\nRemaining operator blocker', createdAt: '2026-10-26T01:02:00Z' };
+        body: '🔁 review — changes requested\nRemaining operator blocker', createdAt: '2026-10-26T01:02:00Z',
+        updatedAt: '2026-10-26T01:02:00Z' };
       if (['later-changes', 'newer-accept'].includes(scenario)) comments.push(operatorChanges);
-      if (scenario === 'during-run-changes') comments.push({ ...operatorChanges, createdAt: '2026-10-26T01:00:30Z' });
+      if (scenario === 'during-run-changes') comments.push({ ...operatorChanges,
+        createdAt: '2026-10-26T01:00:30Z', updatedAt: '2026-10-26T01:00:30Z' });
+      const edited = { ...operatorChanges, createdAt: '2026-10-26T00:59:00Z' };
+      if (scenario === 'rest-edited-changes') {
+        edited.updated_at = edited.updatedAt;
+        delete edited.updatedAt;
+      }
+      if (scenario === 'unknown-edit') delete edited.updatedAt;
+      if (['edited-changes', 'rest-edited-changes', 'unknown-edit'].includes(scenario)) comments.push(edited);
       // racing-changes: the verdict is posted after the first thread read, before the final one.
       let threadReads = 0;
-      const readComments = () => (scenario === 'racing-changes' && ++threadReads > 1
-        ? [...comments, operatorChanges] : comments);
+      const readComments = () => {
+        threadReads++;
+        if (scenario === 'racing-changes' && threadReads > 1) return [...comments, operatorChanges];
+        if (scenario === 'racing-edit') return [...comments, threadReads > 1 ? edited
+          : { ...edited, body: 'Operator note', updatedAt: edited.createdAt }];
+        return comments;
+      };
       const reviews = scenario === 'native-changes'
         ? [{ state: 'CHANGES_REQUESTED', user: { login: 'chalbert' }, submitted_at: '2026-10-26T01:02:00Z' }] : [];
       if (scenario === 'newer-accept') review.stepTimings = [
@@ -86,7 +110,7 @@ export default {
           setLabels(_repo, _pr, { remove }) { labels = labels.filter(l => !remove.includes(l)); } } };
       const rows = sweepLabelStateReconcile(io);
       if (rows.some(row => row.error)) violations.push(`${scenario}: sweep failed`);
-      const expected = ['abstain', 'awaiting-confirm'].includes(scenario)
+      const expected = ['abstain', 'awaiting-confirm', 'failed-self-accept'].includes(scenario)
         ? ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held', 'ready-to-merge']
         : holding.includes(scenario)
           ? ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held'] : ['ready-to-merge'];

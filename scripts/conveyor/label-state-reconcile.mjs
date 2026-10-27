@@ -6,6 +6,7 @@ import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
 import { liveReferralState } from '../lib/referral-live-context.mjs';
 import { readRun } from '../operations/run-store.mjs';
+import { REVIEW_EFFECTS } from '../operations/review-pr-constants.mjs';
 import { readReviewRunEvidence, reviewRunEvidence } from './review-referral-hold.mjs';
 import { defaultReadPr } from './advisory-label-sweep.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
@@ -47,12 +48,20 @@ export function planLabelStateReconcile({ repo, pr, review = null, redTeam = nul
     const confirmedChanges = review.findings?.confirm === 'changes';
     // Only an affirmative recorded accept clears: an unanswered confirm may still end in abstain or changes.
     const confirmedAccept = review.findings?.confirm === 'accept';
+    // Panel completion and confirmation precede the publication-time independence check. Only the
+    // successful label-swap effect proves that check passed; failed/pending/staged/advisory runs cannot clear.
+    const publishedAccept = review.findings?.record?.effects?.some(e =>
+      e.type === REVIEW_EFFECTS.LABEL && e.status === 'applied') === true;
     // A completed panel cannot erase a trusted verdict/hold it never read: anything posted since the run read
     // the thread (startedAt), including while it was still running. Unknown or tied times cannot prove the
     // accept supersedes it; a newer completed accept can reconcile it next tick.
     const laterHold = pr.comments.some(c => {
       if (!isTrustedMarkerAuthor(c) || !isLaterVerdictBody(c?.body)) return false;
-      const at = Date.parse(c.createdAt ?? c.created_at ?? '');
+      const created = Date.parse(c.createdAt ?? c.created_at ?? '');
+      const edited = Date.parse(c.updatedAt ?? c.updated_at ?? '');
+      // Creation alone cannot date the current objection. Legacy readers without edit metadata keep
+      // the hold; invalid or missing timestamps cannot prove this accept read the current comment body.
+      const at = Math.max(created, edited);
       return !Number.isFinite(at) || at >= observed.startedAt;
     }) || (Array.isArray(reviews) && laterReviewHold(reviews, new Date(observed.startedAt).toISOString()));
     const referrals = liveReferralState(pr, { repo, pr: pr.number });
@@ -60,7 +69,7 @@ export function planLabelStateReconcile({ repo, pr, review = null, redTeam = nul
       && Array.isArray(verdict?.pendingReferrals) && !verdict.pendingReferrals.length
       && Array.isArray(verdict?.blockedReferrals) && !verdict.blockedReferrals.length;
     // Unreadable native reviews cannot prove no formal change request stands, so they never clear.
-    if (confirmedAccept && Array.isArray(reviews) && !laterHold && verdict?.verdict === 'accept' && settled && !after.has('red-team:blocked')) {
+    if (confirmedAccept && publishedAccept && Array.isArray(reviews) && !laterHold && verdict?.verdict === 'accept' && settled && !after.has('red-team:blocked')) {
       after.delete('review:changes');
       for (const label of after) if (label.startsWith('fix-waiting:')) after.delete(label);
     }
