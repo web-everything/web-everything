@@ -30,7 +30,7 @@ import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
 import { coversFile } from '../readiness/scope-lease.mjs';
 import { readNetSets, resolveNetScopeSettings, scopeFilesFor } from './net-scope.mjs';
-import { readStackBases, stackNetFiles } from './review-stack-base.mjs';
+import { readStackBases, resolveStackAwareReview, stackNetFiles } from './review-stack-base.mjs';
 
 export const SCOPE_BLOAT_REASON = 'scope-bloat';
 export const SCOPE_BLOAT_DEFAULTS = Object.freeze({ alreadyOnMain: 3, outsideScope: 10, minFiles: 12 });
@@ -219,6 +219,7 @@ export function enrichPrsWithScopeBloat(prs, { repo = null, defaultBranch = 'mai
   const limits = scopeBloatLimits(env);
   const diag = new Map();
   let stackReadFailed = false;
+  const stackAware = resolveStackAwareReview(env);
   let stacks = null; // read once per call, lazily, for declared lane bases or PRs big enough to judge
   const stackBases = () => {
     if (stacks == null) {
@@ -235,12 +236,12 @@ export function enrichPrsWithScopeBloat(prs, { repo = null, defaultBranch = 'mai
   return prs.map((pr) => {
     try {
       if (!pr || pr.isDraft) return pr;
-      // A head that cannot be read stays unreadable whatever `main` does: remember that per head, not per main tip, so it
+      // A failed main diff stays cached whatever `main` does: remember that per head, not per main tip, so it
       // costs one failed read (cat-file, fetch, diff; 30 s each) rather than one per main advance.
       const headKey = `${pr.number}:${pr.headRefOid ?? 'nohead'}`;
-      const laneBase = pr.baseRefName !== defaultBranch && /^lane\//.test(pr.baseRefName ?? '');
+      const laneBase = stackAware && pr.baseRefName !== defaultBranch && /^lane\//.test(pr.baseRefName ?? '');
       const listed = Array.isArray(pr.files) ? pr.files.length : 0;
-      const stackBase = laneBase || listed >= Math.min(limits.alreadyOnMain || Infinity, limits.minFiles || Infinity) ? stackBases().get(Number(pr.number)) ?? null : null;
+      const stackBase = stackAware && (laneBase || listed >= Math.min(limits.alreadyOnMain || Infinity, limits.minFiles || Infinity)) ? stackBases().get(Number(pr.number)) ?? null : null;
       const unknown = (detail) => {
         if (!unknowns.has(headKey)) {
           unknowns.add(headKey);
@@ -255,7 +256,8 @@ export function enrichPrsWithScopeBloat(prs, { repo = null, defaultBranch = 'mai
       if (laneBase && !stackBase) return unknown({ reason: 'stack-base-unresolved', base: pr.baseRefName,
         cause: stackReadFailed ? 'stack-read-failed' : diag.get(Number(pr.number))?.cause ?? 'unknown' });
       if (!pr.headRefOid || !Array.isArray(pr.files)) return pr;
-      if (unreadable.has(headKey)) return pr;
+      // A cached main-diff failure says nothing about a stack diff after retargeting or stack discovery.
+      if (!stackBase && unreadable.has(headKey)) return pr;
       const stackInfo = stackBase && Number.isInteger(stackBase.pr)
         ? { pr: stackBase.pr, ref: stackBase.ref, head: stackBase.head, contained: stackBase.contained } : null;
       const key = `${headKey}:${baseTip()}${stackBase ? `:stack:${stackBase.tree}` : ''}`;

@@ -18,6 +18,7 @@ const planReconcileCore = options => planReconcileCoreWithTiming({ reviewTiming:
 import { planFixesFromReconcile, withScopeBloat } from '../reconcile-fix-dispatch.mjs';
 import { buildRebaseOntoMainComment } from '../main-red-recovery.mjs';
 import { readNetFiles } from '../scope-bloat.mjs';
+import { readStackBases } from '../review-stack-base.mjs';
 import { refreshScopeBloatedPr, runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
 
 const OWN = [
@@ -158,10 +159,140 @@ describe('card scope helpers', () => {
   });
 });
 
+describe('PR-less bases already on main — resolver and scope-bloat wiring', () => {
+  const BASE = 'b'.repeat(40);
+  const TOP = 'c'.repeat(40);
+  const ROOT = 'd'.repeat(40);
+  const MAIN = 'e'.repeat(40);
+  const TREE = 'f'.repeat(40);
+  const fixture = (shape, ancestryError = null) => {
+    // Full ancestry differs from the off-main sets: BASE is excluded from both rev-list reads.
+    const parents = new Map([[ROOT, []], [BASE, [ROOT]], [MAIN, [BASE]],
+      [TOP, shape === 'second-parent' ? [ROOT, BASE] : [shape === 'uncontained' ? ROOT : BASE]]]);
+    const reachable = (head, first = false) => {
+      const seen = new Set();
+      const visit = node => {
+        if (seen.has(node)) return;
+        seen.add(node);
+        const next = parents.get(node) ?? [];
+        for (const parent of first ? next.slice(0, 1) : next) visit(parent);
+      };
+      visit(head);
+      return seen;
+    };
+    const topHead = shape === 'equal-tip' ? BASE : TOP;
+    const pr = { number: 60100 + ['first-parent', 'second-parent', 'equal-tip', 'uncontained'].indexOf(shape), headRefName: 'lane/top', headRefOid: topHead,
+      baseRefName: 'lane/base', title: 'fix ancestry', files: [{ path: 'own.mjs' }] };
+    const refs = new Map([[pr.number, { ...pr, author: 'app/plateau-worker', isCrossRepository: false }]]);
+    const tips = new Map([[pr.headRefName, topHead], [pr.baseRefName, BASE]]);
+    const ancestryCalls = [];
+    const run = args => {
+      if (args[0] === 'cat-file') return '';
+      if (args[0] === 'rev-list') {
+        expect(args.at(-1)).toBe('^origin/main');
+        return [...reachable(args.at(-2), args.includes('--first-parent'))]
+          .filter(sha => !reachable(MAIN).has(sha)).join('\n');
+      }
+      if (args[0] === 'merge-base' && args.includes('--is-ancestor')) {
+        ancestryCalls.push(args);
+        expect(args).toEqual(['merge-base', '--is-ancestor', '--end-of-options', BASE, topHead]);
+        if (ancestryError) throw Object.assign(new Error('ancestry read failed'), { status: ancestryError });
+        if (!reachable(topHead).has(BASE)) throw Object.assign(new Error('not an ancestor'), { status: 1 });
+        return '';
+      }
+      if (args[0] === 'merge-base') return BASE;
+      if (args[0] === 'merge-tree') return TREE;
+      throw new Error(`unexpected git command: ${args.join(' ')}`);
+    };
+    const read = (options = {}) => readStackBases({ root: '/repo', env: {}, prs: [pr], settingOn: true,
+      prlessBase: true, readRefs: () => refs, readLanes: () => tips, run, log: () => {}, ...options });
+    return { pr, read, ancestryCalls, expected: { pr: null, ref: pr.baseRefName,
+      head: BASE, contained: BASE, tree: TREE, topHead } };
+  };
+
+  it.each(['first-parent', 'second-parent', 'equal-tip'])('resolves a main-reachable base through %s ancestry and removes the unknown hold', shape => {
+    const f = fixture(shape);
+    const diag = new Map();
+    expect(f.read({ diag }).get(f.pr.number)).toEqual(f.expected);
+    expect(diag.size).toBe(0);
+    expect(f.ancestryCalls).toHaveLength(1);
+    const events = [];
+    const stackReads = [];
+    const [out] = enrichPrsWithScopeBloat([f.pr], {
+      repo: 'web-everything/web-everything', env: {}, readBaseSha: () => MAIN,
+      readNet: () => { throw new Error('must read the resolved stack diff'); },
+      readStacks: (_prs, { diag }) => f.read({ diag }),
+      readStackFiles: base => { stackReads.push(base); return ['own.mjs']; },
+      emitEvent: event => events.push(event),
+    });
+    expect(stackReads).toEqual([f.expected]);
+    expect(out.scopeBloatUnknown).toBeUndefined();
+    expect(out.scopeBloat).toBeUndefined();
+    expect(events).toEqual([]);
+  });
+
+  it.each([
+    ['uncontained', null, 'base-not-contained'],
+    ['first-parent', 128, 'head-unreadable'],
+  ])('holds %s ancestry with read status %s', (shape, status, cause) => {
+    const f = fixture(shape, status);
+    const diag = new Map();
+    expect(f.read({ diag }).has(f.pr.number)).toBe(false);
+    expect(diag.get(f.pr.number)).toEqual({ cause });
+    expect(f.ancestryCalls).toHaveLength(1);
+  });
+
+  it('keeps main-reachable PR-less bases out of review-side results', () => {
+    const f = fixture('first-parent');
+    const diag = new Map();
+    expect(f.read({ prlessBase: false, diag }).size).toBe(0);
+    expect(diag.get(f.pr.number)).toEqual({ cause: 'base-branch-missing' });
+    expect(f.ancestryCalls).toEqual([]);
+  });
+});
+
 describe('enrichPrsWithScopeBloat — the io shell holds unknown stack diffs and remembers the refresh', () => {
   const pr = (over = {}) => ({ number: 4361, title: 'WE #xykwe0h: build', headRefName: 'lane/build-outcomes', headRefOid: 'a'.repeat(40),
     files: FILES_4361.map((path) => ({ path, additions: 1, deletions: 0 })), comments: [], ...over });
   const readers = { readNet: () => OWN, readScope: () => CARD_SCOPE, readBaseSha: () => 'base0', repo: 'web-everything/web-everything', env: {} };
+
+  it.each(['off', 'false', '0', 'no', ' OFF ', false, 0])('uses main-based assessment for lane PRs when stack-aware review is %s', (mode) => {
+    const env = { WE_STACK_AWARE_REVIEW: mode };
+    const events = [];
+    let stackReads = 0;
+    let laneReads = 0;
+    let stackDiffReads = 0;
+    let mainReads = 0;
+    const inputs = [
+      pr({ number: 59991, baseRefName: 'lane/bottom', files: [{ path: OWN[0] }] }),
+      pr({ number: 59992, baseRefName: 'lane/bottom' }),
+    ];
+    const [clean, bloated] = enrichPrsWithScopeBloat(inputs, {
+      ...readers, env, readBaseSha: () => `stack-disabled-${typeof mode}-${String(mode)}`,
+      readNet: () => { mainReads += 1; return OWN; },
+      readStacks: (prs) => {
+        stackReads += 1;
+        return readStackBases({ prs, env,
+          readRefs: () => { laneReads += 1; return []; },
+          readLanes: () => { laneReads += 1; return []; },
+          run: () => { throw new Error('disabled stack review must not read git'); },
+        });
+      },
+      readStackFiles: () => { stackDiffReads += 1; return OWN; },
+      emitEvent: (event) => events.push(event),
+    });
+    expect(clean).toEqual(inputs[0]);
+    expect(bloated.scopeBloat).toMatchObject({ stale: true });
+    expect(bloated.scopeBloat.unknown).toBeUndefined();
+    expect(bloated.scopeBloat.alreadyOnMain.length).toBeGreaterThanOrEqual(3);
+    expect(bloated.scopeBloatUnknown).toBeUndefined();
+    expect(bloated.stackBase).toBeUndefined();
+    expect(mainReads).toBe(1);
+    expect(stackReads).toBe(0);
+    expect(laneReads).toBe(0);
+    expect(stackDiffReads).toBe(0);
+    expect(events).toEqual([]);
+  });
 
   it('holds an unresolved lane base with unknown scope bloat', () => {
     const base = 'lane/unresolved-bottom';
@@ -280,6 +411,52 @@ describe('enrichPrsWithScopeBloat — the io shell holds unknown stack diffs and
     const readNet = () => { reads += 1; throw new Error('no such ref'); };
     for (const sha of ['m1', 'm2', 'm3']) enrichPrsWithScopeBloat([pr({ number: 70, headRefOid: '7'.repeat(40) })], { ...readers, readNet, readBaseSha: () => sha });
     expect(reads).toBe(1);
+  });
+
+  it.each([
+    ['throwing stack diff', 59993, () => { throw new Error('stack diff unavailable'); }, true, false],
+    ['missing stack diff', 59994, () => null, true, false],
+    ['clean stack diff', 59995, () => OWN, false, false],
+    ['wide stack diff', 59996, () => SPRAWL_FILES, false, true],
+  ])('assesses a retargeted unchanged head after a cached main-diff failure: %s', (_, number, stackFiles, unknown, wide) => {
+    const input = pr({ number, baseRefName: 'main', files: OWN.slice(0, 3) });
+    const stack = { pr: 5942, ref: 'lane/bottom', head: '2'.repeat(40),
+      contained: '2'.repeat(40), tree: '3'.repeat(40), topHead: input.headRefOid };
+    const events = [];
+    let mainReads = 0;
+    let stackReads = 0;
+    const options = { ...readers,
+      readNet: () => { mainReads += 1; throw new Error('main diff unavailable'); },
+      readStacks: (prs) => new Map(prs[0].baseRefName === stack.ref ? [[number, stack]] : []),
+      readStackFiles: () => { stackReads += 1; return stackFiles(); },
+      emitEvent: (event) => events.push(event),
+    };
+    expect(enrichPrsWithScopeBloat([input], options)[0]).toEqual(input);
+    const retargeted = { ...input, baseRefName: stack.ref };
+    for (let pass = 0; pass < 2; pass += 1) {
+      const [out] = enrichPrsWithScopeBloat([retargeted], options);
+      if (unknown) {
+        expect(out.scopeBloatUnknown).toEqual({ reason: 'stack-diff-unreadable', base: stack.ref });
+        expect(out.scopeBloat).toMatchObject({ unknown: true, stale: false, wide: false });
+        const plan = planReconcileCore({ requiredChecks: ['gate'], agents: [], durableCounts: {},
+          now: Date.parse('2026-10-27T19:12:02Z'),
+          prs: [{ ...out, state: 'OPEN', labels: [{ name: 'review:pending' }], mergeStateStatus: 'CLEAN',
+            statusCheckRollup: [{ name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' }] }],
+        });
+        expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', mode: 'scope-bloat-rebase',
+          prNumber: number, scopeBloat: expect.objectContaining({ unknown: true }) })]);
+      } else {
+        expect(out.stackBase).toMatchObject({ pr: stack.pr, ref: stack.ref });
+        expect(out.scopeBloatUnknown).toBeUndefined();
+        if (wide) expect(out.scopeBloat).toMatchObject({ wide: true, stale: false });
+        else expect(out.scopeBloat).toBeUndefined();
+      }
+    }
+    expect(stackReads).toBe(unknown ? 2 : 1);
+    expect(events).toEqual(unknown ? [{ kind: 'scope-bloat-unknown', pr: number, daemon: 'scope-bloat',
+      detail: { reason: 'stack-diff-unreadable', base: stack.ref } }] : []);
+    expect(enrichPrsWithScopeBloat([input], options)[0]).toEqual(input);
+    expect(mainReads).toBe(1);
   });
 
   it('MIN_FILES=0 never reads a card or flags a wide PR', () => {

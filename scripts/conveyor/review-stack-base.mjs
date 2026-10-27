@@ -510,9 +510,21 @@ export function readStackBases({ root = ROOT, env = process.env, prs = null, rea
         if (!SHA.test(String(head ?? ''))) cause = 'base-branch-missing';
         else if (!sets.has(head)) cause = 'head-unreadable';
         else {
-          const contained = containedCommit(sets, head, top.headRefOid);
-          if (contained !== head) cause = 'base-not-contained';
-          else bases.set(top.pr, { pr: null, ref: top.baseRefName, head, contained });
+          let contained = containedCommit(sets, head, top.headRefOid);
+          // Off-main sets intentionally omit landed commits. A declared PR-less base can still
+          // name one, but being on main alone does not prove that this top contains its exact tip.
+          if (!sets.get(head).first.length) {
+            try {
+              run(['merge-base', '--is-ancestor', '--end-of-options', head, top.headRefOid]);
+              contained = head;
+            } catch (error) {
+              cause = error?.status === 1 ? 'base-not-contained' : 'head-unreadable';
+            }
+          }
+          if (!cause) {
+            if (contained !== head) cause = 'base-not-contained';
+            else bases.set(top.pr, { pr: null, ref: top.baseRefName, head, contained });
+          }
         }
       }
       if (cause) { bases.delete(top.pr); diagnose(top.pr, cause); }
