@@ -12,6 +12,8 @@ graduates after a full day from `shadowSince`. Explicit platform/environment sha
 Test every mode source before, at and after the cutoff. Inject `now` at that boundary.
 Historical rebuild and stack-cache fixtures explicitly disable retirement; retirement and auto-rebase
 integration fixtures explicitly enable it, so the shipped shadow cutoff cannot change their intent.
+The historical overlay-pin suite and `overlay-pin-carried-base-retry` soak also disable retirement:
+their adopted-input and retained-registration assertions require the original overlays to remain registered.
 Contained explicit, mechanism and unverifiable pins stay registered for the planner's safety checks.
 Auto-retirement defers both pending-swap registrations to verified cleanup, including when auto-rebase is
 disabled or adoption recovery rolls back. Malformed or unreadable pending evidence defers retirement and
