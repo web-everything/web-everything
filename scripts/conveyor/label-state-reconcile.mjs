@@ -9,13 +9,16 @@ import { readRun } from '../operations/run-store.mjs';
 import { readReviewRunEvidence, reviewRunEvidence } from './review-referral-hold.mjs';
 import { defaultReadPr } from './advisory-label-sweep.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
-import { isLaterVerdictBody } from '../lib/accept-carry-forward.mjs';
+import { isLaterVerdictBody, laterReviewHold } from '../lib/accept-carry-forward.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 
 const names = labels => labels.map(l => typeof l === 'string' ? l : l.name);
 
-/** Pure: all inputs are observations; only exact SHA equality permits a stored result to decide. */
-export function planLabelStateReconcile({ repo, pr, review = null, redTeam = null } = {}) {
+/**
+ * Pure: all inputs are observations; only exact SHA equality permits a stored result to decide.
+ * `reviews` is the PR's native GitHub reviews; anything but an array is unreadable and never clears a review hold.
+ */
+export function planLabelStateReconcile({ repo, pr, review = null, redTeam = null, reviews = null } = {}) {
   const from = names(pr.labels), after = new Set(from), evidence = {};
   const head = pr.headRefOid;
   if (!/^[a-f0-9]{40}$/.test(head ?? '') || !Array.isArray(pr.comments)) return null;
@@ -42,18 +45,21 @@ export function planLabelStateReconcile({ repo, pr, review = null, redTeam = nul
     const verdict = review.findings?.referralVerdict ?? review.verdict;
     // Confirmation is the recorded operator decision; an accepted panel cannot supersede changes.
     const confirmedChanges = review.findings?.confirm === 'changes';
+    // Only an affirmative recorded accept clears: an unanswered confirm may still end in abstain or changes.
+    const confirmedAccept = review.findings?.confirm === 'accept';
     // A completed panel cannot erase a subsequent trusted verdict/hold. Unknown or tied times
     // cannot prove the accept supersedes it; a newer completed accept can reconcile it next tick.
     const laterHold = pr.comments.some(c => {
       if (!isTrustedMarkerAuthor(c) || !isLaterVerdictBody(c?.body)) return false;
       const at = Date.parse(c.createdAt ?? c.created_at ?? '');
       return !Number.isFinite(at) || at >= observed.completedAt;
-    });
+    }) || (Array.isArray(reviews) && laterReviewHold(reviews, new Date(observed.completedAt).toISOString()));
     const referrals = liveReferralState(pr, { repo, pr: pr.number });
     const settled = !referrals.malformed && !referrals.pending.length && !referrals.blocked.length
       && Array.isArray(verdict?.pendingReferrals) && !verdict.pendingReferrals.length
       && Array.isArray(verdict?.blockedReferrals) && !verdict.blockedReferrals.length;
-    if (!confirmedChanges && !laterHold && verdict?.verdict === 'accept' && settled && !after.has('red-team:blocked')) {
+    // Unreadable native reviews cannot prove no formal change request stands, so they never clear.
+    if (confirmedAccept && Array.isArray(reviews) && !laterHold && verdict?.verdict === 'accept' && settled && !after.has('red-team:blocked')) {
       after.delete('review:changes');
       for (const label of after) if (label.startsWith('fix-waiting:')) after.delete(label);
     }
@@ -80,9 +86,18 @@ export function sweepLabelStateReconcile({ prs = [], repo, resolveRepo = () => r
     try {
       const slug = repo ?? resolveRepo();
       if (!slug) throw Error('missing repository');
-      const pr = readPr({ repo: slug, number: candidate.number, fields: 'number,state,headRefOid,labels,body,createdAt' });
-      if (pr?.state !== 'OPEN' || pr.number !== candidate.number || !Array.isArray(pr.labels)) continue;
-      pr.comments = readComments(pr.number, { repo: slug });
+      // Labels, thread and native reviews: everything a hold can arrive through. Unreadable reviews stay null.
+      const readLive = () => {
+        const live = readPr({ repo: slug, number: candidate.number, fields: 'number,state,headRefOid,labels,body,createdAt' });
+        if (live?.state !== 'OPEN' || live.number !== candidate.number || !Array.isArray(live.labels)) return null;
+        live.comments = readComments(live.number, { repo: slug });
+        let native = null;
+        try { native = provider.readPrReviews(slug, live.number); } catch { /* unreadable never clears */ }
+        return { pr: live, native };
+      };
+      const first = readLive();
+      if (!first) continue;
+      const { pr } = first;
       let review = null, redTeam = null;
       // Independent evidence planes: an unavailable run store cannot invalidate a recorded red-team result.
       try {
@@ -92,11 +107,13 @@ export function sweepLabelStateReconcile({ prs = [], repo, resolveRepo = () => r
         if (latest?.head === pr.headRefOid) review = readReview(latest.id);
       } catch { /* unknown review state never clears its labels */ }
       try { redTeam = readRedTeam({ repo: slug, pr: pr.number, head: pr.headRefOid }); } catch { /* retain unknown state */ }
-      const plan = planLabelStateReconcile({ repo: slug, pr, review, redTeam });
+      if (!planLabelStateReconcile({ repo: slug, pr, review, redTeam, reviews: first.native })) continue;
+      // Evidence reads can span a push or a new verdict. Never apply the old head's clearance to the new head,
+      // and re-plan from the final read so a hold that arrived meanwhile is honoured.
+      const fresh = readLive();
+      if (!fresh || fresh.pr.headRefOid !== pr.headRefOid) continue;
+      const plan = planLabelStateReconcile({ repo: slug, pr: fresh.pr, review, redTeam, reviews: fresh.native });
       if (!plan) continue;
-      // Evidence reads can span a push. Never apply the old head's clearance to the new head.
-      const fresh = readPr({ repo: slug, number: pr.number, fields: 'number,state,headRefOid' });
-      if (fresh?.number !== pr.number || fresh.state !== 'OPEN' || fresh.headRefOid !== pr.headRefOid) continue;
       if (!dryRun) {
         for (const label of plan.add) provider.ensureLabel(slug, label, RED_TEAM_STATUS_LABEL_META[label]);
         provider.setLabels(slug, pr.number, { add: plan.add.join(',') || null, remove: plan.remove });

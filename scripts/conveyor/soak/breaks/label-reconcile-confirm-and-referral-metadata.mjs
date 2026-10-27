@@ -18,6 +18,9 @@ export default {
     return planner.includes("review.findings?.confirm === 'changes'")
       && planner.includes("review.findings?.confirm !== 'abstain'")
       && planner.includes('!laterHold')
+      && planner.includes("review.findings?.confirm === 'accept'")
+      && planner.includes('laterReviewHold(reviews')
+      && planner.includes('const fresh = readLive()')
       && reader.includes("fields = 'number,state,labels,headRefOid'");
   },
   async run({ sourceRoot = ROOT, log } = {}) {
@@ -39,21 +42,31 @@ export default {
         rationale: 'checked independently', evidence: ['diff'] }],
     }) };
     const violations = [];
-    for (const scenario of ['changes', 'accept', 'abstain', 'later-changes', 'newer-accept']) {
-      const confirm = ['later-changes', 'newer-accept'].includes(scenario) ? 'accept' : scenario;
+    // Round 3 (red team on c3bd94bd0): an unanswered confirm, a verdict landing between the plan and the
+    // write, and a native GitHub change request must each keep the holds.
+    const holding = ['changes', 'later-changes', 'awaiting-confirm', 'racing-changes', 'native-changes'];
+    for (const scenario of ['changes', 'accept', 'abstain', 'later-changes', 'newer-accept',
+      'awaiting-confirm', 'racing-changes', 'native-changes']) {
+      const confirm = ['changes', 'abstain'].includes(scenario) ? scenario
+        : scenario === 'awaiting-confirm' ? undefined : 'accept';
       let labels = ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held', 'ready-to-merge'];
       const review = { id: 'review-pr-accepted', op: 'review-pr', input: { reason: 'remaining operator blocker' }, findings: {
-        read: { repo, pr: number, netBasis: { rev: head } }, confirm,
+        read: { repo, pr: number, netBasis: { rev: head } }, ...(confirm ? { confirm } : {}),
         referralVerdict: { verdict: 'accept', pendingReferrals: [], blockedReferrals: [],
           lenses: ['correctness', 'security'], lensVerdicts: { correctness: 'accept', security: 'accept' } },
       }, stepTimings: [{ step: 'read', startedAt: '2026-10-26T01:00:00Z' },
         { step: 'advise', finishedAt: '2026-10-26T01:01:00Z' }] };
       if (confirm === 'abstain' && !planRecordDecision(review).abstain) violations.push('abstain: unexpectedly records');
       const comments = confirm === 'changes' ? [] : [settled];
-      if (['later-changes', 'newer-accept'].includes(scenario)) comments.push({
-        author: { login: 'chalbert' }, body: '🔁 review — changes requested\nRemaining operator blocker',
-        createdAt: '2026-10-26T01:02:00Z',
-      });
+      const operatorChanges = { author: { login: 'chalbert' },
+        body: '🔁 review — changes requested\nRemaining operator blocker', createdAt: '2026-10-26T01:02:00Z' };
+      if (['later-changes', 'newer-accept'].includes(scenario)) comments.push(operatorChanges);
+      // racing-changes: the verdict is posted after the first thread read, before the final one.
+      let threadReads = 0;
+      const readComments = () => (scenario === 'racing-changes' && ++threadReads > 1
+        ? [...comments, operatorChanges] : comments);
+      const reviews = scenario === 'native-changes'
+        ? [{ state: 'CHANGES_REQUESTED', user: { login: 'chalbert' }, submitted_at: '2026-10-26T01:02:00Z' }] : [];
       if (scenario === 'newer-accept') review.stepTimings = [
         { step: 'read', startedAt: '2026-10-26T01:03:00Z' },
         { step: 'advise', finishedAt: '2026-10-26T01:04:00Z' },
@@ -64,15 +77,14 @@ export default {
       };
       const io = { repo, prs: [{ number, labels }],
         readPr: args => defaultReadPr({ ...args, exec, readComments: () => comments }),
-        readComments: () => comments, readReviews: () => [reviewRunEvidence(review)], readReview: () => review,
-        readRedTeam: () => null, emit: () => {}, provider: { ensureLabel() {}, setLabels(_repo, _pr, { remove }) {
-          labels = labels.filter(l => !remove.includes(l));
-        } } };
+        readComments, readReviews: () => [reviewRunEvidence(review)], readReview: () => review,
+        readRedTeam: () => null, emit: () => {}, provider: { ensureLabel() {}, readPrReviews: () => reviews,
+          setLabels(_repo, _pr, { remove }) { labels = labels.filter(l => !remove.includes(l)); } } };
       const rows = sweepLabelStateReconcile(io);
       if (rows.some(row => row.error)) violations.push(`${scenario}: sweep failed`);
-      const expected = confirm === 'abstain'
+      const expected = ['abstain', 'awaiting-confirm'].includes(scenario)
         ? ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held', 'ready-to-merge']
-        : ['changes', 'later-changes'].includes(scenario)
+        : holding.includes(scenario)
           ? ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held'] : ['ready-to-merge'];
       if (JSON.stringify(labels) !== JSON.stringify(expected)) violations.push(`${scenario}: unexpected labels ${labels.join(',')}`);
       // The next tick must be stable after either a hold or a clearance.

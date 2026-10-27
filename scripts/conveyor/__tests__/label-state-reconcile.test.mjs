@@ -11,9 +11,11 @@ const red = (pr, rev = head, broken = false) => comment(`<!-- we:red-team-adviso
   ? '1. [**confirmed**] (edge-case, broken) `scripts/x.mjs:1` — break' : 'ACCEPTS'}`);
 const pr = (number, labels, comments = [red(number)]) => ({ number, state: 'OPEN', headRefOid: head,
   labels, comments, body: '<!-- authored-by-actor: author -->', createdAt: '2026-01-01T00:00:00Z' });
+// A read native-review channel with no reviews; `reviews: null` (unreadable) is tested explicitly.
+const planOf = args => planLabelStateReconcile({ reviews: [], ...args });
 function review(number, overrides = {}) {
   return { id: 'review-pr-accepted', op: 'review-pr', findings: {
-    read: { repo, pr: number, netBasis: { rev: head } },
+    read: { repo, pr: number, netBasis: { rev: head } }, confirm: 'accept',
     referralVerdict: { verdict: 'accept', pendingReferrals: [], blockedReferrals: [],
       lenses: ['correctness', 'security'], lensVerdicts: { correctness: 'accept', security: 'accept' }, ...overrides },
   }, stepTimings: [{ step: 'read', startedAt: '2026-10-26T01:00:00Z' },
@@ -32,28 +34,28 @@ function referral(number, ruled) {
 
 describe('planLabelStateReconcile', () => {
   it.each([5973, 5970])('#%s: ACCEPTS on the live head replaces blocked and preserves ready', number => {
-    const plan = planLabelStateReconcile({ repo, pr: pr(number, ['red-team:blocked', 'red-team:pending', 'ready-to-merge']) });
+    const plan = planOf({ repo, pr: pr(number, ['red-team:blocked', 'red-team:pending', 'ready-to-merge']) });
     expect(plan.to).toEqual(['ready-to-merge', 'red-team:clear']);
     expect(plan.evidence.redTeam).toEqual({ id: expect.any(String), sha: head });
   });
   it('#5954: all bounced findings not-real and accepted lenses clear changes and every fix wait', () => {
     const live = pr(5954, ['review:changes', 'red-team:blocked', 'fix-waiting:host-busy', 'fix-waiting:claim-held'],
       [referral(5954, true), red(5954)]);
-    const plan = planLabelStateReconcile({ repo, pr: live, review: review(5954) });
+    const plan = planOf({ repo, pr: live, review: review(5954) });
     expect(plan.to).toEqual(['red-team:clear']);
     expect(plan.evidence.review).toEqual({ id: 'review-pr-accepted', sha: head });
-    expect(planLabelStateReconcile({ repo, pr: { ...live, labels: plan.to }, review: review(5954) })).toBeNull();
+    expect(planOf({ repo, pr: { ...live, labels: plan.to }, review: review(5954) })).toBeNull();
   });
   it('an accepted review preserves changes and every fix wait when same-head stored red-team changes block', () => {
     const live = pr(42, ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held',
       'red-team:blocked', 'ready-to-merge']);
     const redTeam = { repo, pr: 42, head, status: 'finished', result: { foldedVerdict: 'changes' } };
-    const plan = planLabelStateReconcile({ repo, pr: live, review: review(42), redTeam });
+    const plan = planOf({ repo, pr: live, review: review(42), redTeam });
     expect(plan.to).toEqual(['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held', 'red-team:blocked']);
     expect(plan.remove).toEqual(['ready-to-merge']);
   });
   it('an unruled finding preserves review:changes and fix wait, dropping ready', () => {
-    const plan = planLabelStateReconcile({ repo, pr: pr(42, ['review:changes', 'fix-waiting:host-busy', 'ready-to-merge'],
+    const plan = planOf({ repo, pr: pr(42, ['review:changes', 'fix-waiting:host-busy', 'ready-to-merge'],
       [referral(42, false)]), review: review(42) });
     expect(plan.to).toEqual(['review:changes', 'fix-waiting:host-busy']);
   });
@@ -61,7 +63,7 @@ describe('planLabelStateReconcile', () => {
     const stored = review(42);
     stored.findings.confirm = 'changes';
     stored.input = { reason: 'operator confirmed a remaining blocker' };
-    const plan = planLabelStateReconcile({ repo, pr: pr(42,
+    const plan = planOf({ repo, pr: pr(42,
       ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held', 'ready-to-merge'], []), review: stored });
     expect(plan.to).toEqual(['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held']);
     expect(plan.remove).toEqual(['ready-to-merge']);
@@ -69,7 +71,7 @@ describe('planLabelStateReconcile', () => {
   it('a superseding explicit accept can clear a previously confirmed changes decision', () => {
     const stored = review(42);
     stored.findings.confirm = 'accept';
-    expect(planLabelStateReconcile({ repo, pr: pr(42,
+    expect(planOf({ repo, pr: pr(42,
       ['review:changes', 'fix-waiting:host-busy'], []), review: stored }).to).toEqual([]);
   });
   it.each(['🔁 review — changes requested', '🔁 human review — changes requested'])
@@ -80,13 +82,13 @@ describe('planLabelStateReconcile', () => {
     const verdict = { author: { login: 'chalbert' }, body: `${heading}\nRemaining blocker`,
       createdAt: '2026-10-26T01:02:00Z' };
     const live = pr(42, ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held', 'ready-to-merge'], [verdict]);
-    expect(planLabelStateReconcile({ repo, pr: live, review: stored }).to)
+    expect(planOf({ repo, pr: live, review: stored }).to)
       .toEqual(['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held']);
     stored.findings.confirm = 'accept';
     stored.stepTimings = [{ step: 'read', startedAt: '2026-10-26T01:03:00Z' },
       { step: 'advise', finishedAt: '2026-10-26T01:04:00Z' }];
     expect(reviewRunEvidence(stored).completedAt).toBeGreaterThan(Date.parse(verdict.createdAt));
-    expect(planLabelStateReconcile({ repo, pr: live, review: stored }).to).toEqual(['ready-to-merge']);
+    expect(planOf({ repo, pr: live, review: stored }).to).toEqual(['ready-to-merge']);
   });
   it.each(['missing', 'invalid', 'same-time', 'REST'])
   ('a trusted changes verdict with %s timing cannot be cleared by the stored accept', kind => {
@@ -98,7 +100,7 @@ describe('planLabelStateReconcile', () => {
       verdict.user = { login: 'chalbert' };
       verdict.created_at = '2026-10-26T01:02:00Z';
     }
-    expect(planLabelStateReconcile({ repo, pr: pr(42,
+    expect(planOf({ repo, pr: pr(42,
       ['review:changes', 'fix-waiting:host-busy'], [verdict]), review: review(42) })).toBeNull();
   });
   it.each(['older', 'untrusted', 'quoted'])('%s changes text cannot veto a settled accept', kind => {
@@ -106,7 +108,7 @@ describe('planLabelStateReconcile', () => {
     if (kind === 'older') verdict.createdAt = '2026-10-26T01:00:00Z';
     if (kind === 'untrusted') verdict.author.login = 'attacker';
     if (kind === 'quoted') verdict.body = `Quoted example:\n${verdict.body}`;
-    expect(planLabelStateReconcile({ repo, pr: pr(42,
+    expect(planOf({ repo, pr: pr(42,
       ['review:changes', 'fix-waiting:host-busy'], [verdict]), review: review(42) }).to).toEqual([]);
   });
   it('abstain records nothing and the accepted panel cannot remove review holds', () => {
@@ -115,29 +117,60 @@ describe('planLabelStateReconcile', () => {
     expect(planRecordDecision(stored)).toEqual({ abstain: true });
     expect(reviewRunEvidence(stored)).toMatchObject({ completedAt: expect.any(Number), parked: false,
       persistenceFailed: false });
-    expect(planLabelStateReconcile({ repo, pr: pr(42,
+    expect(planOf({ repo, pr: pr(42,
       ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held', 'ready-to-merge'], []), review: stored }))
       .toBeNull();
+  });
+  it('an unanswered confirmation preserves review holds, so a later abstain has nothing to restore', () => {
+    const stored = review(42);
+    delete stored.findings.confirm;
+    expect(reviewRunEvidence(stored)).toMatchObject({ completedAt: expect.any(Number), parked: false,
+      persistenceFailed: false });
+    expect(planOf({ repo, pr: pr(42,
+      ['review:changes', 'fix-waiting:host-busy', 'ready-to-merge'], []), review: stored })).toBeNull();
+    stored.findings.confirm = 'abstain';
+    expect(planRecordDecision(stored)).toEqual({ abstain: true });
+  });
+  it.each(['CHANGES_REQUESTED', 'COMMENTED'])('a later native %s review preserves holds and drops ready', state => {
+    const reviews = [{ state, user: { login: 'chalbert' }, submitted_at: '2026-10-26T01:02:00Z' }];
+    expect(planOf({ repo, reviews, pr: pr(42,
+      ['review:changes', 'fix-waiting:host-busy', 'ready-to-merge'], []), review: review(42) }).to)
+      .toEqual(['review:changes', 'fix-waiting:host-busy']);
+  });
+  it('a standing older native CHANGES_REQUESTED review preserves holds', () => {
+    const reviews = [{ state: 'CHANGES_REQUESTED', user: { login: 'chalbert' }, submitted_at: '2026-10-26T00:00:00Z' }];
+    expect(planOf({ repo, reviews, pr: pr(42, ['review:changes', 'fix-waiting:host-busy'], []),
+      review: review(42) })).toBeNull();
+  });
+  it('an approval superseding an older native change request permits clearance', () => {
+    const reviews = [{ state: 'CHANGES_REQUESTED', user: { login: 'chalbert' }, submitted_at: '2026-10-26T00:00:00Z' },
+      { state: 'APPROVED', user: { login: 'chalbert' }, submitted_at: '2026-10-26T00:30:00Z' }];
+    expect(planOf({ repo, reviews, pr: pr(42, ['review:changes', 'fix-waiting:host-busy'], []),
+      review: review(42) }).to).toEqual([]);
+  });
+  it.each([null, undefined])('unreadable native reviews (%s) cannot clear review holds', reviews => {
+    expect(planLabelStateReconcile({ repo, reviews, pr: pr(42, ['review:changes', 'fix-waiting:host-busy'], []),
+      review: review(42) })).toBeNull();
   });
   it('an explicit accept cannot bypass unresolved referrals', () => {
     const stored = review(42);
     stored.findings.confirm = 'accept';
-    expect(planLabelStateReconcile({ repo, pr: pr(42,
+    expect(planOf({ repo, pr: pr(42,
       ['review:changes', 'fix-waiting:host-busy', 'ready-to-merge'], [referral(42, false)]), review: stored }).to)
       .toEqual(['review:changes', 'fix-waiting:host-busy']);
   });
   it('a confirmed red-team break on head preserves blocked and drops ready', () => {
-    const plan = planLabelStateReconcile({ repo, pr: pr(42, ['red-team:blocked', 'ready-to-merge'], [red(42, head, true)]) });
+    const plan = planOf({ repo, pr: pr(42, ['red-team:blocked', 'ready-to-merge'], [red(42, head, true)]) });
     expect(plan.to).toEqual(['red-team:blocked']);
   });
   it('same-head stored changes override an ACCEPTS comment and drop ready', () => {
     const live = pr(42, ['red-team:blocked', 'red-team:pending', 'ready-to-merge']);
     const redTeam = { repo, pr: 42, head, status: 'finished', result: { foldedVerdict: 'changes' } };
-    const plan = planLabelStateReconcile({ repo, pr: live, redTeam });
+    const plan = planOf({ repo, pr: live, redTeam });
     expect(plan.to).toEqual(['red-team:blocked']);
     expect(plan.add).not.toContain('red-team:clear');
     expect(plan.remove).not.toContain('red-team:blocked');
-    expect(planLabelStateReconcile({ repo, pr: live, redTeam: { ...redTeam, head: otherHead } }).to)
+    expect(planOf({ repo, pr: live, redTeam: { ...redTeam, head: otherHead } }).to)
       .toEqual(['ready-to-merge', 'red-team:clear']);
   });
   it.each(['parked resumed-unfinished', 'persistence-failed', 'incomplete'])
@@ -152,10 +185,10 @@ describe('planLabelStateReconcile', () => {
     const live = pr(42, ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held'], []);
     expect(reviewRunEvidence(stored)).toMatchObject(kind === 'incomplete' ? { incomplete: true }
       : kind === 'persistence-failed' ? { parked: false, persistenceFailed: true } : { parked: true });
-    expect(planLabelStateReconcile({ repo, pr: live, review: stored })).toBeNull();
+    expect(planOf({ repo, pr: live, review: stored })).toBeNull();
   });
   it('a result on another head cannot clear blocked beside a current unruled review', () => {
-    const plan = planLabelStateReconcile({ repo, review: review(42), pr: pr(42,
+    const plan = planOf({ repo, review: review(42), pr: pr(42,
       ['review:changes', 'red-team:blocked', 'ready-to-merge'], [red(42, otherHead), referral(42, false)]) });
     expect(plan.to).toEqual(['review:changes', 'red-team:blocked']);
   });
@@ -164,14 +197,14 @@ describe('planLabelStateReconcile', () => {
     stored.findings.read.netBasis.rev = otherHead;
     const comments = kind === 'missing' ? [] : [kind === 'forged'
       ? { ...red(42), author: { login: 'attacker' } } : red(42, otherHead)];
-    expect(planLabelStateReconcile({ repo, pr: pr(42, ['red-team:blocked', 'review:changes', 'ready-to-merge'], comments),
+    expect(planOf({ repo, pr: pr(42, ['red-team:blocked', 'review:changes', 'ready-to-merge'], comments),
       review: kind === 'missing' ? null : stored })).toBeNull();
   });
   it('finished stored red-team status is usable only with matching repo, PR and SHA', () => {
     const live = pr(42, ['red-team:blocked'], []);
     const status = { repo, pr: 42, head, status: 'finished', result: { foldedVerdict: 'accept' } };
-    expect(planLabelStateReconcile({ repo, pr: live, redTeam: status }).to).toEqual(['red-team:clear']);
-    expect(planLabelStateReconcile({ repo, pr: live, redTeam: { ...status, head: otherHead } })).toBeNull();
+    expect(planOf({ repo, pr: live, redTeam: status }).to).toEqual(['red-team:clear']);
+    expect(planOf({ repo, pr: live, redTeam: { ...status, head: otherHead } })).toBeNull();
   });
 });
 
@@ -179,7 +212,7 @@ describe('sweepLabelStateReconcile', () => {
   function fixture() {
     const live = pr(5954, ['review:changes', 'red-team:blocked', 'fix-waiting:host-busy'], [referral(5954, true), red(5954)]);
     const stored = review(5954);
-    const provider = { setLabels: vi.fn(), ensureLabel: vi.fn() }, emit = vi.fn();
+    const provider = { setLabels: vi.fn(), ensureLabel: vi.fn(), readPrReviews: vi.fn(() => []) }, emit = vi.fn();
     return { repo, prs: [live], provider, emit, readPr: vi.fn(() => live), readComments: () => live.comments,
       readReviews: () => [reviewRunEvidence(stored)], readReview: () => stored, readRedTeam: () => null };
   }
@@ -202,7 +235,7 @@ describe('sweepLabelStateReconcile', () => {
     io.readPr = args => defaultReadPr({ ...args, exec, readComments: io.readComments });
     expect(sweepLabelStateReconcile(io)[0]?.labelsReconciled.to).toEqual(['red-team:clear']);
     expect(exec.mock.calls[0][1].at(-1)).toBe('number,state,headRefOid,labels,body,createdAt');
-    expect(exec.mock.calls[1][1].at(-1)).toBe('number,state,headRefOid');
+    expect(exec.mock.calls[1][1].at(-1)).toBe('number,state,headRefOid,labels,body,createdAt');
     expect(io.provider.setLabels).toHaveBeenCalledWith(repo, 5954, {
       add: 'red-team:clear', remove: ['review:changes', 'red-team:blocked', 'fix-waiting:host-busy'] });
   });
@@ -217,6 +250,38 @@ describe('sweepLabelStateReconcile', () => {
     expect(row.labelsReconciled.to).toEqual(['review:changes', 'fix-waiting:host-busy', 'red-team:clear']);
     expect(io.provider.setLabels).toHaveBeenCalledWith(repo, 5954, {
       add: 'red-team:clear', remove: ['red-team:blocked'] });
+  });
+  it('a same-head changes verdict arriving before the write cancels the stale clearance', () => {
+    const io = fixture(), live = io.prs[0];
+    const later = { ...comment('🔁 review — changes requested\nRemaining blocker'), createdAt: '2026-10-26T01:02:00Z' };
+    let reads = 0;
+    io.readComments = () => (++reads > 1 ? [...live.comments, later] : live.comments);
+    const rows = sweepLabelStateReconcile(io);
+    expect(rows[0]?.labelsReconciled.to).toEqual(['review:changes', 'fix-waiting:host-busy', 'red-team:clear']);
+    expect(io.provider.setLabels).toHaveBeenCalledWith(repo, 5954, { add: 'red-team:clear', remove: ['red-team:blocked'] });
+  });
+  it('a native change request arriving before the write cancels the stale clearance', () => {
+    const io = fixture();
+    io.provider.readPrReviews.mockReturnValueOnce([]).mockReturnValueOnce(
+      [{ state: 'CHANGES_REQUESTED', user: { login: 'chalbert' }, submitted_at: '2026-10-26T01:02:00Z' }]);
+    const rows = sweepLabelStateReconcile(io);
+    expect(rows[0]?.labelsReconciled.to).toEqual(['review:changes', 'fix-waiting:host-busy', 'red-team:clear']);
+    expect(io.provider.readPrReviews).toHaveBeenCalledWith(repo, 5954);
+  });
+  it('the sweep reads native reviews; a standing change request or unreadable reviews keep review holds', () => {
+    for (const reader of [() => [{ state: 'CHANGES_REQUESTED', user: { login: 'chalbert' },
+      submitted_at: '2026-10-26T01:02:00Z' }], () => { throw Error('reviews unreadable'); }]) {
+      const io = fixture();
+      io.provider.readPrReviews.mockImplementation(reader);
+      const [row] = sweepLabelStateReconcile(io);
+      expect(row.labelsReconciled.to).toEqual(['review:changes', 'fix-waiting:host-busy', 'red-team:clear']);
+    }
+  });
+  it('a stale plan with nothing left to change after the final read writes nothing', () => {
+    const io = fixture(), live = io.prs[0];
+    io.readPr.mockReturnValueOnce(live).mockReturnValueOnce({ ...live, labels: ['red-team:clear'] });
+    expect(sweepLabelStateReconcile(io)).toEqual([]);
+    expect(io.provider.setLabels).not.toHaveBeenCalled();
   });
   it('the production PR reader preserves its default fields for existing callers', () => {
     const exec = vi.fn(() => '{}');
