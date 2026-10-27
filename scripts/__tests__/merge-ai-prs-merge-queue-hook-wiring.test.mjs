@@ -315,6 +315,11 @@ if (a[0] === 'api') {
 process.exit(0);
 `;
 
+// A couple pass spawns the drain over fake gh/git shims for two repos and takes 40-90 s on a loaded host (CI shard or laptop), so
+// the child's own timeout sits well above that; the vitest per-test timeout sits above the child's.
+const COUPLE_RUN_TIMEOUT_MS = 240000;
+const COUPLE_TEST_TIMEOUT_MS = 300000;
+
 function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, env: extraEnv = {} }) {
   const dir = mkdtempSync(join(tmpdir(), 'drain-mq-couple-'));
   try {
@@ -348,7 +353,7 @@ function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, e
     const preload = 'data:text/javascript,' + encodeURIComponent("import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module'; os.homedir = () => process.env.MQ_HOME; syncBuiltinESMExports();");
     const r = spawnSync(process.execPath, ['--import', preload, script, `--repos=${LOCAL},${FUI}${secondImplPassAges ? `,${PA}` : ''}`, '--label=ready-to-merge',
       '--no-drain-lease', '--no-red-main-freeze', '--json'], { // reconcile ON: a couple's gate needs the complete open-PR context
-      cwd: dir, encoding: 'utf8', timeout: 60000,
+      cwd: dir, encoding: 'utf8', timeout: COUPLE_RUN_TIMEOUT_MS,
       env: { ...process.env, ...daemonAppEnv(dir), WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir, WE_MERGE_QUEUE_SETTINGS_FILE: settings, WE_COORDINATION_ROOT: coord, ...extraEnv },
     });
     expect(r.error, r.stderr).toBeUndefined();
@@ -364,33 +369,35 @@ describe('review of #4619 — the WE-carrier pre-check keeps a couple together',
     expect(stderr).toMatch(/"kind":"couple-held"[^\n]*its WE carrier is not merge-fresh \(merge-queue\)/);
     expect(stderr).toMatch(/"num":4001[^\n]*merge-queue: refresh \(pass-too-old\)/);
     expect(attempts).toEqual([]);
-  }, 90000);
+  }, COUPLE_TEST_TIMEOUT_MS);
 
   it('both halves fresh: the impl half lands, then its carrier (control — the gate does not block a healthy couple)', () => {
     const { attempts, stderr } = runCouple({ implPassAges: [5], carrierPassAges: [5] });
     expect(attempts).toEqual([`${FUI}#501`, `${LOCAL}#4001`]);
-  }, 90000);
+  }, COUPLE_TEST_TIMEOUT_MS);
 
   it('the carrier pass ages out between the pre-check and its own turn: the couple still lands together, never split', () => {
     // 25 min old when the pre-check reads it (fresh), 31 min old when the carrier is judged again after the impl merged.
     const { attempts, stderr } = runCouple({ implPassAges: [5], carrierPassAges: [25, 31] });
     expect(attempts).toEqual([`${FUI}#501`, `${LOCAL}#4001`]);
     expect(stderr).not.toMatch(/COUPLE SPLIT/);
-  }, 90000);
+  }, COUPLE_TEST_TIMEOUT_MS);
 
   it('a carrier with TWO impl halves: the second half\'s pre-check honours the first one\'s clearance, so neither lands alone', () => {
     // Pre-check for the first half reads the carrier's pass at 25 min (fresh); by the second half's pre-check it is 31 min old.
     const { attempts, stderr } = runCouple({ implPassAges: [5], secondImplPassAges: [5], carrierPassAges: [25, 31] });
     expect(attempts).toEqual([`${FUI}#501`, `${PA}#601`, `${LOCAL}#4001`]);
     expect(stderr).not.toMatch(/COUPLE SPLIT/);
-  }, 90000);
+  }, COUPLE_TEST_TIMEOUT_MS);
 
   // The carrier pre-check is the other `revalidateFresh` call site: a transient UNKNOWN on every fresh read in the couple
   // (impl half and carrier) is re-read, and the couple still lands together.
   it('a transient UNKNOWN on the couple\'s fresh reads (impl half and the carrier pre-check) is re-read and the couple lands', () => {
-    const { attempts } = runCouple({ implPassAges: [5], carrierPassAges: [5], env: { MQ_UNKNOWN_FIRST: '1', WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES: '1' } });
+    // The re-poll wait defaults to 20 s per UNKNOWN read; the couple has two (impl half + carrier), which alone is 40 s of idle
+    // wait. A 1 s wait keeps the retry exercised without the wall-clock cost.
+    const { attempts } = runCouple({ implPassAges: [5], carrierPassAges: [5], env: { MQ_UNKNOWN_FIRST: '1', WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES: '1', WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC: '1' } });
     expect(attempts).toEqual([`${FUI}#501`, `${LOCAL}#4001`]);
-  }, 90000);
+  }, COUPLE_TEST_TIMEOUT_MS);
 
   // Residual (review of #4619): a third-party merge moves a sibling's repo between the preflight and its own turn, past the
   // pin. Two repos cannot merge atomically, so the split is REPORTED (JSON coupleSplit), never silent.
@@ -401,7 +408,7 @@ describe('review of #4619 — the WE-carrier pre-check keeps a couple together',
     expect(split).toHaveLength(1);
     expect(split[0].landedImpls).toEqual([{ num: 501, repo: FUI }]);
     expect(split[0].unlandedImpl).toEqual({ num: 601, repo: PA });
-  }, 90000);
+  }, COUPLE_TEST_TIMEOUT_MS);
 
   // Review of #4619 (codex-correctness, CONFIRMED): the pre-check judged only the carrier, so with two impl halves the
   // first could merge and the second then be refreshed-and-skipped by its own gate, leaving the couple split. Every
@@ -414,5 +421,5 @@ describe('review of #4619 — the WE-carrier pre-check keeps a couple together',
     expect(attempts).toEqual([]);
     expect(stderr).toMatch(/merge-queue: refresh \(pass-too-old\)/);
     expect(stderr).not.toMatch(/COUPLE SPLIT/);
-  }, 90000);
+  }, COUPLE_TEST_TIMEOUT_MS);
 });
