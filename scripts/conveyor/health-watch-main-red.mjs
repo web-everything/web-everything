@@ -122,7 +122,7 @@ function readAlertDetails({ state, config }) {
     if (!isGhDeferred(out)) {
       const prs = JSON.parse(String(out));
       // A full page cannot prove the count; retain null rather than undercounting.
-      if (Array.isArray(prs) && prs.length < 200) {
+      if (Array.isArray(prs) && prs.length < 200 && prs.every((pr) => Array.isArray(pr?.labels))) {
         details.blockedReadyPrs = prs.filter((pr) => (pr?.labels ?? []).some((l) => l?.name === 'ready-to-merge')).length;
       }
     }
