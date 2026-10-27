@@ -55,7 +55,7 @@ export function resolveOperatorPriorityPrs({ env = process.env, readTool = readS
   return { prs: new Set(resolved.value.priority.map(prNumber)), source: resolved.sources.priority };
 }
 
-const matchedHolderStates = (state, holderStates) => (holderStates ?? []).filter(s =>
+const matchedHolderStates = (state, holderStates) => typeof state.baseRefName === 'string' && state.baseRefName !== 'main' ? [] : (holderStates ?? []).filter(s =>
   (s === 'in-merge-queue' && state.inMergeQueue === true)
   || (state.labels ?? []).some(label => (typeof label === 'string' ? label : label?.name) === s));
 
@@ -81,7 +81,8 @@ export function parseHolderStates(json) {
         || typeof node.isInMergeQueue !== 'boolean' || !Array.isArray(node.labels?.nodes)
         || !node.labels.nodes.every(label => typeof label?.name === 'string')) return null;
       states.set(Number(node.number), { labels: node.labels.nodes.map(label => label.name),
-        inMergeQueue: node.isInMergeQueue, headRefOid: node.headRefOid });
+        inMergeQueue: node.isInMergeQueue, headRefOid: node.headRefOid,
+        ...(typeof node.baseRefName === 'string' ? { baseRefName: node.baseRefName } : {}) });
     }
     return states;
   } catch { return null; }
@@ -105,7 +106,7 @@ export function createHolderStateReader({ repo, // owner/name slug (ghRepoSlug);
         repository(owner: $owner, name: $name) {
           pullRequests(states: OPEN, first: 100, after: $cursor) {
             pageInfo { hasNextPage endCursor }
-            nodes { number headRefOid isInMergeQueue labels(first: 50) { nodes { name } } }
+            nodes { number headRefOid baseRefName isInMergeQueue labels(first: 50) { nodes { name } } }
           }
         }
       }`;

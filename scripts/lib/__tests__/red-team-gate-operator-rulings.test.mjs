@@ -6,6 +6,7 @@ import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { buildRoundExtensionComment } from '../../conveyor/round-extension-mark.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
 import { planRedTeamStatusLabels } from '../red-team-status-labels.mjs';
+import { buildReviewedShaMarker, buildClearedHumanMarker } from '../review-escalation.mjs';
 
 const H = '61782334289124cd4fcb51d0bdadb6ef3c795e82';
 const P = 5502;
@@ -33,6 +34,105 @@ const carried = bot([
   'Review verdict carried across an identical contribution.',
   result.body.replace(H, N),
 ].join('\n'), '2026-10-21T21:00:00Z');
+
+describe('clear-human held-only compatibility', () => {
+  it.each([false, true])('a standing send-back survives a live clear-human ceremony (anyState=%s)', anyState => {
+    const repo = 'o/r';
+    const at = '2026-10-21T18:00:00Z';
+    const grant = human(buildRoundExtensionComment({ repo, pr: P, by: 1, actor: 'chalbert',
+      channel: 'chat', reason: 'one more round', at }), at);
+    const grants = gateRoundGrants([grant], P, repo).map(g => g.id);
+    expect(grants).toHaveLength(1);
+    const comments = [...live, grant,
+      bot(`${redTeamGateMarker(P, H, 'sent-back', rid, grants)}\n- 1 confirmed break(s) sent back to the fixer (#1).`, '2026-10-21T19:00:00Z'),
+      human(['✅ review — `review:human` cleared via the sanctioned path', '',
+        'Cleared by chalbert via `review-set-label.mjs --to=clear-human` (gate-self).', '',
+        buildReviewedShaMarker(H), buildClearedHumanMarker('chalbert')].join('\n'), '2026-10-21T20:00:00Z')];
+    const context = { comments, repo, pr: P, head: H, setting: CONFIRMED_BREAKS_DEFAULTS,
+      operatorRulings: { anyState } };
+    // With only the cap action, this very ceremony is live and clears its held break.
+    const capped = readRedTeamDisposition({ ...context, comments: [...live, comments.at(-1)] });
+    expect(capped.dispositions.get(1).state).toBe('cleared');
+    expect(held(capped)).toEqual([]);
+    const d = readRedTeamDisposition(context);
+    expect(d.outcome).toBe('sent-back');
+    expect(d.held).toEqual([]);
+    expect(d.sendBack.map(f => f.index)).toEqual([1]);
+    expect(redTeamEnqueueHold({ ...context, env: {} })).not.toBeNull();
+    expect(planRedTeamStatusLabels({ ...context, labels: ['red-team:clear'], env: {} }))
+      .toEqual({ add: 'red-team:blocked', remove: ['red-team:clear'] });
+  });
+});
+
+describe('operator-block held actions (shared reader)', () => {
+  it.each([
+    ['indexed send-back', '- 1 confirmed break(s) sent back to the fixer (#1).', rid, [1]],
+    ['indexed hold', '- 1 confirmed break(s) NOT sent back: cap (#1).', rid, [1]],
+    ['legacy unindexed hold', '- 1 confirmed break(s) NOT sent back: cap.', null, [1, 2, 3]],
+  ].flatMap(([format, line, id, expected]) => [['human', human], ['bot', bot]].flatMap(([author, who]) =>
+    [false, true].map(anyState => [format, author, anyState, line, id, expected, who]))))(
+    '%s by %s supersedes only its covered clear-human findings (anyState=%s)',
+    (_format, _author, anyState, line, id, expected, who) => {
+      const comments = [result,
+        gate(bot, 'round-cap', '- 3 confirmed break(s) NOT sent back: cap (#1, #2, #3).', '2026-10-21T17:12:20Z'),
+        human(['✅ review — `review:human` cleared via the sanctioned path', '',
+          'Cleared by chalbert via `review-set-label.mjs --to=clear-human` (gate-self).', '',
+          buildReviewedShaMarker(H), buildClearedHumanMarker('chalbert')].join('\n'), '2026-10-21T20:00:00Z')];
+      const disposition = () => readRedTeamDisposition({ comments, pr: P, head: H,
+        setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState } });
+      expect(held(disposition())).toEqual([]);
+      expect(redTeamEnqueueHold({ comments, pr: P, head: H, env: {} })).toBeNull();
+
+      comments.push(gate(who, 'operator-block', line, '2026-10-21T20:30:00Z', id));
+      // An indexed block leaves the other clearances standing; a legacy line without
+      // indices must conservatively supersede the ceremony for every confirmed finding.
+      expect(disposition().held.map(f => f.index)).toEqual(expected);
+      expect(disposition().sendBack).toEqual([]);
+      expect(redTeamEnqueueHold({ comments, pr: P, head: H, env: {} })).not.toBeNull();
+      expect(planRedTeamStatusLabels({ comments, pr: P, head: H, labels: ['review:human', 'red-team:clear'], env: {} }))
+        .toEqual({ add: 'red-team:blocked', remove: ['red-team:clear'] });
+    });
+
+  it.each([
+    ['human', 'indexed', human, '- 1 confirmed break(s) NOT sent back: cap (#1).', rid, [1]],
+    ['bot', 'indexed', bot, '- 1 confirmed break(s) NOT sent back: cap (#1).', rid, [1]],
+    ['human', 'legacy unindexed', human, '- 1 confirmed break(s) NOT sent back: cap.', null, [1, 2, 3]],
+    ['bot', 'legacy unindexed', bot, '- 1 confirmed break(s) NOT sent back: cap.', null, [1, 2, 3]],
+  ])('preserves a %s-authored %s hold without a round-cap record', (_author, _format, who, line, id, expected) => {
+    const d = disp([result, gate(who, 'operator-block', line, '2026-10-21T20:30:00Z', id)]);
+    expect(d.held.map(f => f.index)).toEqual(expected);
+    expect(d.sendBack).toEqual([]);
+  });
+
+  it.each([['human', human], ['bot', bot]])('keeps a %s-authored held line at ordinary priority', (_author, who) => {
+    const comments = [result,
+      gate(who, 'operator-block', '- 1 confirmed break(s) NOT sent back: cap (#1).', '2026-10-21T20:30:00Z'),
+      gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:40:00Z')];
+    const d = readRedTeamDisposition({ comments, pr: P, head: H, setting: CONFIRMED_BREAKS_DEFAULTS,
+      operatorRulings: { anyState: true } });
+    expect(d.held).toEqual([]);
+    expect(d.sendBack).toEqual([]);
+  });
+
+  it.each([['human', human], ['bot', bot]])('does not let a %s-authored held line lower an existing human block', (_author, who) => {
+    const comments = [result,
+      gate(human, 'operator-block', '- 1 confirmed break(s) sent back to the fixer (#1).', '2026-10-21T20:20:00Z'),
+      gate(who, 'operator-block', '- 1 confirmed break(s) NOT sent back: cap (#1).', '2026-10-21T20:30:00Z'),
+      gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:40:00Z')];
+    const d = readRedTeamDisposition({ comments, pr: P, head: H, setting: CONFIRMED_BREAKS_DEFAULTS,
+      operatorRulings: { anyState: true } });
+    expect(d.held).toEqual([]);
+    expect(d.sendBack.map(f => f.index)).toEqual([1]);
+  });
+
+  it.each(operatorReleaseLines.flatMap(([format, line]) =>
+    [['human', human], ['bot', bot]].map(([author, who]) => [format, author, line, who])))('ignores %s release lines in a %s-authored block record', (_format, _author, line, who) => {
+    const d = readRedTeamDisposition({ comments: [...live, gate(who, 'operator-block', line, '2026-10-21T20:30:00Z')],
+      pr: P, head: H, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } });
+    expect(d.held.map(f => f.index)).toEqual([1]);
+    expect(d.sendBack).toEqual([]);
+  });
+});
 
 describe('operator card release at the cap (shared reader)', () => {
   it.each([

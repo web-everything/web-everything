@@ -107,7 +107,7 @@ function world(fn) {
 }
 
 const collisionCalls = calls => calls.filter(a => JSON.stringify(a)
-  === JSON.stringify(['git', 'ls-tree', '-r', '--name-only', 'origin/lane/readme', '--', 'backlog/']));
+  === JSON.stringify(['git', 'ls-tree', '-r', '--name-only', '-z', 'origin/lane/readme', '--', 'backlog/']));
 const rebaseCalls = calls => calls.filter(a => JSON.stringify(a)
   === JSON.stringify(['git', 'merge-tree', '--write-tree', 'origin/main', 'origin/lane/readme']));
 

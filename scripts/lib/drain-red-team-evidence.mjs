@@ -7,9 +7,10 @@ import { listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operation
 import { readFilteredInOrder } from './stream-filter-runs.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
-import { redTeamEnabled, redTeamOwedFor } from './review-red-team-policy.mjs';
+import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { readRedTeamProbes } from './red-team-gate.mjs';
 import { completedRedTeamSeat } from './red-team-run-result.mjs';
+import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 
 export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDir(env)), 'red-team-status');
 const statusPath = ({ repo, pr, head }, env) => join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
@@ -35,6 +36,14 @@ export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = nu
     pid: process.pid, host, pidNamespace: namespace, pidStart: readPidStart(process.pid) });
 }
 
+/** Each conjunct is independently pinned by the historical fallback predicate tests. PURE. */
+export function historicalCardOnlySkipCandidate(old) {
+  const prior = old?.status;
+  return prior?.status === 'finished' && prior.skipCardOnly === true
+    && (typeof prior.result === 'string' ? prior.result : prior.result?.status) === 'skipped'
+    && !old.recorded && !old.inFlight && !old.queued;
+}
+
 /** Absence of a review payload is not an accept. Labels alone never schedule a post-accept pass. */
 export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   runsDir = resolveRunsDir(), list = listRunIds, read = readRun, isAlive = pidAlive, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
@@ -44,11 +53,11 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   const recorded = seats.length > 0;
   const seatEvidence = { seatRecorded: recorded, completedRecorded: seats.some(completedRedTeamSeat) };
   // Runs are immutable in identity but updated in place: choose the latest read of this exact repo/PR/head.
-  const latestRun = () => {
+  const latestRun = (exactHead = true) => {
     // Read, test and drop one run at a time (xwu9oxh S1a): same reads, order and errors as map-then-filter.
     const hits = readFilteredInOrder(list(runsDir).filter(id => id.startsWith('review-pr-')), id => read(id, runsDir),
       run => run?.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr)
-        && run.findings?.read?.netBasis?.rev === head, (run, id) => ({ id, run }))
+        && (!exactHead || run.findings?.read?.netBasis?.rev === head), (run, id) => ({ id, run }))
       .map(hit => ({ ...hit, at: statSync(join(runsDir, `${hit.id}.json`)).mtimeMs }));
     hits.sort((a, b) => b.at - a.at);
     return { run: hits[0]?.run ?? null, at: hits[0]?.at ?? 0 };
@@ -62,6 +71,27 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     status = JSON.parse(readFileSync(statusPath({ repo, pr, head }, env), 'utf8'));
     statusAt = statSync(statusPath({ repo, pr, head }, env)).mtimeMs;
   } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  const carry = readRedTeamCarry({ repo, pr, head, env });
+  const carriedFrom = carry?.loopPayload.carriedFrom ?? status?.loopPayload?.carriedFrom;
+  if (carriedFrom) {
+    const latest = latestRun(false).run;
+    const laterPanel = latest && latest.findings?.read?.netBasis?.rev !== carriedFrom;
+    const ownStatus = status === undefined || (status?.repo === repo && Number(status.pr) === Number(pr) && status.head === head
+      && (status.loopPayload?.carriedFrom === carriedFrom || (status.head === carriedFrom && status.skipCardOnly === true))
+      && status.status === 'finished'
+      && (status.result === 'skipped' || (status.result?.status === 'skipped' && status.result.policy === 'card-only')));
+    if (laterPanel || (carry && !ownStatus) || recorded) {
+      return { loopPayload: latest, status, carryConflict: true, inFlight: false,
+        recorded, ...seatEvidence, scheduled: false };
+    }
+    if (carry) {
+      // The journal survives a crash before the compatibility status exists. Never invent an accept.
+      const projected = { repo, pr, head, loopPayload: carry.loopPayload, status: 'finished',
+        result: { status: 'skipped', policy: 'card-only' }, skipCardOnly: true };
+      return { carry, status: projected, loopPayload: carry.loopPayload, inFlight: false,
+        recorded: false, ...seatEvidence, scheduled: false, skipCardOnly: true };
+    }
+  }
   if (status?.repo === repo && Number(status.pr) === Number(pr) && status.head === head) {
     // A finished status from an earlier review of this same head never supersedes a newer accepting run (a re-review
     // of an unchanged head labels its accept before its job writes `queued`).
@@ -88,10 +118,22 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
         live = !start || !status.pidStart || start === status.pidStart;
       }
     }
-    return { status, loopPayload: status.loopPayload, ...seatEvidence, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
+    // Settlement provenance cannot stand in for a panel verdict, even if an older
+    // writer retained one. Keep the status intact for recovery's provenance checks.
+    const loopPayload = status.loopPayload?.carriedFrom != null ? { ...status.loopPayload, verdict: null } : status.loopPayload;
+    return { status, loopPayload, ...seatEvidence, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
       ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(resultStatus), recorded: recorded || resultStatus === 'ran' };
   }
   const loopPayload = latestRun().run;
+  if (!loopPayload && !recorded) {
+    const older = latestRun(false).run;
+    const oldHead = older?.findings?.read?.netBasis?.rev;
+    if (oldHead && oldHead !== head && redTeamCardOnly(older.findings.read)) {
+      const old = readDrainRedTeamEvidence({ repo, pr, head: oldHead, env, runsDir, list, read,
+        isAlive, host, namespace, readPidStart, readScorecards });
+      if (historicalCardOnlySkipCandidate(old)) return old;
+    }
+  }
   // An owing run with no job status yet: only the job's process knows its card-only skip decision, so hold the head
   // (skip off) until that status records it. The never-scheduled deadline still applies if no job ever writes one.
   return { loopPayload, inFlight: false, scheduled: recorded || owes(loopPayload), recorded, ...seatEvidence, ...(owes(loopPayload) ? { skipCardOnly: false } : {}) };

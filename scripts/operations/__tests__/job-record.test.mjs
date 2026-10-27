@@ -94,6 +94,33 @@ describe('job run record', () => {
     for (const outcome of ['acted', 'nothing-owed', 'superseded', 'deferred-claim-held', 'deferred-read', 'failed']) {
       expect(validateJobBlock({ ...rec.job, task: { ...task, outcome, resultRef: 'results/task-review-1-1.json' } })).toEqual([]);
     }
+    const result = { v: 1, taskId: task.id, attempt: 1, outcome: 'acted', effects: [], recordedReads: [],
+      timings: { act: 1 }, gh: { read: 1, write: 0 } };
+    const execution = { effects: {}, results: { 1: result }, timings: { 1: { type: 'task-timing', key: `${task.id}:1`,
+      taskId: task.id, attempt: 1, outcome: 'acted', failureCount: 0, timings: result.timings, gh: result.gh } } };
+    rec.job.task = { ...task, execution };
+    writeRun(rec, dir);
+    expect(readRun(rec.id, dir).job.task.execution).toEqual(execution);
+    for (const precondition of ['none', { ifMatch: 'abc' }, { expected: { head: 'abc' }, allowed: ['open', 'draft'] }]) {
+      const entry = { effectId: `${task.id}:dispatch`, status: 'intent', declaration: {}, inputs: {}, precondition };
+      const saved = { ...execution, effects: { [entry.effectId]: entry }, results: { 1: { ...result, effects: [entry] } } };
+      rec.job.task = { ...task, execution: saved };
+      writeRun(rec, dir);
+      expect(readRun(rec.id, dir).job.task.execution).toEqual(saved);
+    }
+    for (const precondition of [undefined, null, '', 'if-match', {}, [], 1, false]) {
+      const entry = { effectId: `${task.id}:dispatch`, status: 'intent', declaration: {}, inputs: {}, precondition };
+      expect(validateJobBlock({ ...rec.job, task: { ...task, execution: {
+        effects: { [entry.effectId]: entry }, results: { 1: { ...result, effects: [entry] } }, timings: {},
+      } } }).join()).toMatch(/execution.effects.*execution.results/);
+    }
+    for (const execution of [null, [], {}, { effects: [], results: {}, timings: {} },
+      ...[0, 2, '1'].map(attempt => ({ effects: {}, results: { 1: { ...result, attempt } }, timings: {} })),
+      ...[{ v: 2 }, { outcome: 'success' }, { taskId: 'other' }, { effects: {} }, { gh: { read: -1, write: 0 } },
+        { timings: { act: -1 } }].map(patch => ({ effects: {}, results: { 1: { ...result, ...patch } }, timings: {} })),
+      { effects: {}, results: {}, timings: { 1: {} } }, { effects: { x: { status: 'unknown' } }, results: {}, timings: {} }]) {
+      expect(validateJobBlock({ ...rec.job, task: { ...task, execution } }).join()).toMatch(/task.execution/);
+    }
     const bad = [
       null, [], {}, { ...task, id: 'review:owner/repo:42:2' }, { ...task, kind: 'other' },
       ...['Owner/repo', '../repo', 'owner/repo/extra', 'owner/repo\n', 'o/'.concat('r'.repeat(101))].map(repo => ({ ...task, repo })),

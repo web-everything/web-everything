@@ -1,7 +1,7 @@
 // @vitest-environment node
 // #5027 — pins the Arm-runner experiment switch in ci.yml: ONLY `test-shard` reads `vars.WE_SHARD_RUNNER`
 // (falling back to x86), every other job stays on `ubuntu-latest`, and the matrix stays single-axis so
-// `strategy.job-total` remains the shard divisor.
+// the coverage divisor remains matrix length minus the no-coverage group.
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import yaml from 'js-yaml';
@@ -28,9 +28,9 @@ describe('ci.yml test-shard runner switch (#5027)', () => {
     for (const name of ['test', 'changes', 'daemon-soak-scope', 'soak-shard']) expect(jobs[name]).toBeDefined();
   });
 
-  it('keeps the shard matrix single-dimension so strategy.job-total stays the divisor', () => {
+  it('keeps ten shards on a single matrix axis, with nine coverage shards', () => {
     const matrix = jobs['test-shard'].strategy.matrix;
     expect(Object.keys(matrix)).toEqual(['shard']);
-    expect(Array.isArray(matrix.shard)).toBe(true);
+    expect(matrix.shard).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
   });
 });
