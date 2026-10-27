@@ -1,5 +1,4 @@
 {
-  "scripts/conveyor/advisory-label-sweep.mjs": 1,
   "scripts/conveyor/ci-heal-owed.mjs": 1,
   "scripts/conveyor/convert-advisory-dispatch.mjs": 1,
   "scripts/conveyor/load-flake-reverify.mjs": 2,
