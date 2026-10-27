@@ -120,7 +120,7 @@ import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { inFlight, notApplied } from './effect-executor.mjs';
 import { createFileRunStore } from './run-store.mjs';
 import { workerTierFor, probationWorkerForRoute } from '../lib/provider-routing.mjs';
-import { parseGroupMembers, dispatchStillHolds, DEFAULT_EXPECTED_WITHIN_MINUTES, DISPATCH_EFFECT, DISPATCH_LISTING_GRACE_MINUTES, LAUNCH_KINDS } from './dispatch-lane.mjs';
+import { parseGroupMembers, dispatchStillHolds, DEFAULT_EXPECTED_WITHIN_MINUTES, DISPATCH_EFFECT, DISPATCH_LISTING_GRACE_MINUTES, LAUNCH_KINDS, BUNDLE_REPAIR_KIND } from './dispatch-lane.mjs';
 // #3383 — the spawned session is a WORKER; a hook-driven tick-once must never run in it (see session-role.mjs).
 import { markWorkerEnv, workerMarkerSettingsEnv } from './session-role.mjs';
 // #3902 — the blocking-spawn primitive `spawnAgentToCompletion` (below) is built on, for the same reason
@@ -2618,7 +2618,7 @@ export function buildAgentArgv({
   } else {
     const explicit = extractModelFlag(args);
     const kind = payload?.launchKind ?? 'build';
-    const tier = [...LAUNCH_KINDS, 'review', 'inspect'].includes(kind)
+    const tier = [...LAUNCH_KINDS, BUNDLE_REPAIR_KIND, 'review', 'inspect'].includes(kind)
       ? workerTierFor({ kind }).tier : null;
     const model = explicit.found ? explicit.value : tier === 'sonnet'
       ? claudeSpawnAlias(resolveClaudeHelperRoute().model) : CLAUDE_SPAWN_MODEL_BY_TIER[tier];
