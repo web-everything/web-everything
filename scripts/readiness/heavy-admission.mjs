@@ -413,9 +413,15 @@ export function decideRemote({ policy, loadPerCore, argv }) {
   return { remote: above, reason: `${enabled}; loadPerCore=${loadPerCore} ${above ? '>' : '<='} ${remote.loadPerCoreThreshold}` };
 }
 
-/** Attempt remote execution before taking a local slot; only a confirmed exit code handles the command. */
+/** Attempt remote execution before taking a local slot. A timed-out attempt may fall back only after
+ * the executor acknowledges abort with { mode: 'cancelled', terminated: true }; an abort request alone
+ * cannot prove remote termination. Allow up to one second for acknowledgement, then refuse a local rerun. */
 export async function runWithRemoteDecision({
-  argv, policy, cwd, loadPerCore = () => loadavg()[0] / cpus().length,
+  argv, policy, cwd, env,
+  timeoutMs = classifyCommandKind(argv.map(shellQuoteWord).join(' '), env) === 'files'
+    ? resolveFastRunTimeoutMs(env)
+    : env ? resolveCeilingMs(env) : DEFAULT_ADMISSION_CEILING_MS,
+  loadPerCore = () => loadavg()[0] / cpus().length,
   remoteExec = async (options) => (await import('./remote-exec.mjs')).runRemote(options),
   log = (line) => process.stderr.write(line),
 }) {
@@ -424,13 +430,38 @@ export async function runWithRemoteDecision({
   const decision = decideRemote({ policy, loadPerCore: load, argv });
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
   if (!decision.remote) return { handled: false };
-  let reason;
+  let reason; let timer;
+  const controller = new AbortController();
+  const timedOut = Symbol('remote-timeout');
   try {
-    const result = await remoteExec({ argv, cwd });
-    if (result?.mode === 'remote' && Number.isInteger(result.code)) return { handled: true, exitCode: result.code };
-    reason = result?.reason ?? 'unconfirmed remote result';
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        resolve(timedOut);
+        controller.abort();
+      }, timeoutMs);
+    });
+    const remote = Promise.resolve(remoteExec({ argv, cwd, signal: controller.signal }));
+    const result = await Promise.race([remote, timeout]);
+    if (result === timedOut) {
+      const termination = await Promise.race([
+        remote.catch(() => null),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(null), 1000);
+        }),
+      ]);
+      if (termination?.mode !== 'cancelled' || termination.terminated !== true) {
+        log('heavy-admission: remote failed (remote-timeout) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying.\n');
+        return { handled: true, exitCode: 124 };
+      }
+      reason = 'remote-timeout';
+    } else {
+      if (result?.mode === 'remote' && Number.isInteger(result.code)) return { handled: true, exitCode: result.code };
+      reason = result?.reason ?? 'unconfirmed remote result';
+    }
   } catch (error) { reason = error?.message ?? error; }
-  log(`heavy-admission: remote failed (fallback: ${oneLine(reason)}) - falling back to local admission\n`);
+  finally { clearTimeout(timer); }
+  const failure = reason === 'remote-timeout' ? reason : `fallback: ${oneLine(reason)}`;
+  log(`heavy-admission: remote failed (${failure}) - falling back to local admission\n`);
   return { handled: false };
 }
 
@@ -1951,7 +1982,10 @@ async function main(argv) {
     }
     const bypass = admissionBypassReason({ env: process.env, poolExists: existsSync(poolRootOf(lockRoot)) });
     if (!bypass && !useContainer && !process.env[ADMISSION_HELD_ENV]) {
-      const result = await runWithRemoteDecision({ argv: argv.slice(dashDashIdx + 1), policy, cwd: repo ?? process.cwd() });
+      const result = await runWithRemoteDecision({
+        argv: argv.slice(dashDashIdx + 1), policy, cwd: repo ?? process.cwd(),
+        timeoutMs: classifyCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
+      });
       if (result.handled) process.exit(result.exitCode);
     }
     if (useContainer) {
