@@ -47,12 +47,12 @@ describe('settings source cascade', () => {
     writeFileSync(path, JSON.stringify({ redMainQuarantine: { [key]: 'on' } }));
     expect(resolveQuarantineSettings({ ...base, platform: { [key]: false } }).sources[key]).toBe('platform');
   });
-  it('reports sources for job coverage overrides and keeps the mode stop', () => {
+  it('reports sources for job coverage overrides and ships the mode quarantine', () => {
     const file = join(temp(), 'settings.json');
     writeFileSync(file, JSON.stringify({ redMainQuarantine: { derivedJobs: ['custom'], unitJobPattern: '^custom$' } }));
     expect(resolveQuarantineSettings({ file, env: {}, platform: null })).toMatchObject({ value: { derivedJobs: ['custom'], unitJobPattern: '^custom$' }, sources: { derivedJobs: 'tool', unitJobPattern: 'tool' } });
     expect(resolveQuarantineSettings({ file, platform: null, env: { WE_RED_MAIN_QUARANTINE_DERIVED_JOBS: 'test, daemon-soak', WE_RED_MAIN_QUARANTINE_UNIT_JOB_PATTERN: '^integration$' } })).toMatchObject({ sources: { derivedJobs: 'env', unitJobPattern: 'env' } });
-    expect(JSON.parse(readFileSync(new URL('../../settings/red-main-hold.json', import.meta.url), 'utf8')).redMainMode).toBe('stop');
+    expect(JSON.parse(readFileSync(new URL('../../settings/red-main-hold.json', import.meta.url), 'utf8')).redMainMode).toBe('quarantine');
   });
 });
 
