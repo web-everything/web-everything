@@ -204,6 +204,12 @@ describe('planRedTeamOnSkip — heal a previously skipped card-only head', () =>
         .toMatchObject({ action: 'dispatch', mode: 'fresh' });
     });
 
+  it.each([1, 2])('card-only settlement cannot restore a spent retry count of %i', retryCount => {
+    const status = { ...heal().readStatus(), retryCount };
+    expect(decide(heal({ readStatus: () => status })))
+      .toMatchObject({ action: 'skip', why: 'red-team retry already spent; inspect stored evidence' });
+  });
+
   it.each([{ status: 'skipped' }, { status: 'skipped', reason: 'quota exhausted' },
     { status: 'skipped', reason: 'red team skipped: card-only' }])(
     'policy-absent object %j never heals even with a complete card-only read', result => {
@@ -432,7 +438,7 @@ describe('daemon rows without formal reviews', () => {
           'web-everything', '2026-10-24T12:00:00Z'),
         comment(`${redTeamMarker(number, old)}\nRed team not required on this head: card-only diff`,
           'web-everything', '2026-10-24T12:01:00Z'),
-        comment(`📌 review — acceptance re-stamped after a rebase (no new review)\n\n${number === 5910 ? 'Merged origin/main; contribution unchanged.' : 'Net diff unchanged after rebase.'}\n${markers(live, number === 5910 ? 'f'.repeat(64) : fingerprint)}`,
+        comment(`📌 review — acceptance re-stamped after a rebase (no new review)\n\n${number === 5910 ? 'Merged origin/main; contribution unchanged.' : 'Net diff unchanged after rebase.'}\n${markers(live, number === 5910 ? 'f'.repeat(64) : fingerprint)}\n<!-- numbering-restamp: from=${old} to=${live} -->`,
           'plateau-merger', '2026-10-24T13:00:00Z'),
       ], statusCheckRollup: [{ name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
     return runFixture({ rawPrs: [rawPr],
@@ -861,7 +867,7 @@ describe('R100 recovery regressions', () => {
     rawPrs: [{ number: pr, headRefOid: head, labels: ['review:accepted'], reviews: [], comments: [
       trusted(`✅ review — accepted\n<!-- reviewed-sha: ${old} -->`),
       trusted(`${redTeamMarker(pr, old)}\nRed team not required on this head: card-only diff`),
-      trusted(`📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${head} -->`),
+      trusted(`📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${head} -->\n<!-- numbering-restamp: from=${old} to=${head} -->`),
     ] }], readEvidence: () => ({ inFlight: false, recorded: false }),
   });
   const publicationOptions = kind => {
@@ -1063,6 +1069,31 @@ describe('R100 recovery regressions', () => {
       expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
       expect(o.syncLabels).not.toHaveBeenCalled();
     });
+  it.each(['matching', 'mismatching', 'missing', 'wrong-target', 'malformed'])(
+    'binds B policy-clear to the declared source in an A/B/C history: %s', provenance => {
+      const o = carryOptions(), newer = 'c'.repeat(40);
+      const comments = o.rawPrs[0].comments;
+      comments.splice(1, 1,
+        trusted(`✅ review — accepted\n<!-- reviewed-sha: ${newer} -->`),
+        trusted(`${redTeamMarker(pr, newer)}\nRed team not required on this head: card-only diff`));
+      const marker = `<!-- numbering-restamp: from=${old} to=${head} -->`;
+      const replacement = provenance === 'matching' ? `<!-- numbering-restamp: from=${newer} to=${head} -->`
+        : provenance === 'missing' ? ''
+          : provenance === 'wrong-target' ? `<!-- numbering-restamp: from=${newer} to=${old} -->`
+            : provenance === 'malformed' ? `<!-- numbering-restamp: from=unknown to=${head} -->` : marker;
+      comments.at(-1).body = comments.at(-1).body.replace(marker, replacement);
+      runGhSync.mockClear();
+      const row = runRedTeamOnSkip(o).rows[0];
+      if (provenance === 'matching') {
+        expect(row).toMatchObject({ action: 'carry', from: newer });
+        expect(runGhSync).toHaveBeenCalledOnce();
+        expect(o.syncLabels).toHaveBeenCalledOnce();
+      } else {
+        expect(row.action).not.toBe('carry');
+        expect(runGhSync).not.toHaveBeenCalled();
+        expect(o.syncLabels).not.toHaveBeenCalled();
+      }
+    });
   it.each([true, false])('refuses ancient policy-clear when a newer blocked revision precedes the live-head re-stamp (source accepted: %s)', acceptedSource => {
     const o = carryOptions(), source = 'c'.repeat(40);
     o.rawPrs[0].comments.splice(2, 0,
@@ -1131,9 +1162,23 @@ describe('R100 recovery regressions', () => {
     expect(o.syncLabels).not.toHaveBeenCalled();
     if (failedSeatCount === 1) expect(runRedTeamOnSkip(o).rows[0].why).toBe('retry cooldown active');
   });
-  it('ran with completed seat retains effects-only resume instead of fresh retry or clear', () => {
+  it.each([1, 2].flatMap(retryCount => [0, 1, 2].flatMap(failedSeatCount =>
+    ['ran', { status: 'ran' }, 'resumed', { status: 'resumed' }].map(result => ({ retryCount, failedSeatCount, result })))))(
+    'spent retry refuses fresh dispatch with $failedSeatCount seat rows, count=$retryCount, result=$result', ({ retryCount, failedSeatCount, result }) => {
+      const o = runFixture({
+        readEvidence: () => ({ loopPayload: payload(), inFlight: false, queued: false,
+          recorded: failedSeatCount > 0, seatRecorded: failedSeatCount > 0, completedRecorded: false, failedSeatCount }),
+        readStatus: () => ({ status: 'finished', result, retryCount }),
+      });
+      o.rawPrs[0].labels = ['review:accepted'];
+      o.rawPrs[0].comments = [trusted(`✅ review — accepted\n<!-- reviewed-sha: ${head} -->`)];
+      expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
+      expect(o.dispatch).not.toHaveBeenCalled();
+      expect(o.syncLabels).not.toHaveBeenCalled();
+    });
+  it.each([undefined, 0, 1, 2])('ran with completed seat retains effects-only resume with retryCount=%s', retryCount => {
     expect(decide({ readEvidence: () => ({ loopPayload: payload(), recorded: true, completedRecorded: true, failedSeatCount: 1 }),
-      readStatus: () => ({ status: 'finished', result: 'ran' }) })).toMatchObject({ action: 'dispatch', mode: 'resume' });
+      readStatus: () => ({ status: 'finished', result: 'ran', retryCount }) })).toMatchObject({ action: 'dispatch', mode: 'resume' });
   });
 });
 

@@ -85,6 +85,10 @@ export default {
         { number: 9008, queued: true, evidence: evidence({ recorded: true }),
           status: { status: 'finished', result: 'resumed' } },
       ];
+      // A spent retry cannot become a never-started pass when the seat store loses its rows.
+      cases.push({ number: 9010, queued: true,
+        evidence: evidence({ seatRecorded: false, completedRecorded: false, failedSeatCount: 0 }),
+        status: { status: 'finished', result: 'ran', retryCount: 1 } });
       const byPr = new Map(cases.map(c => [c.number, c]));
       const history = new Map(), starts = [];
       let at = 2_000_000;

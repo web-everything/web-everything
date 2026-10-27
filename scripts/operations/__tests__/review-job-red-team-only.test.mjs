@@ -1827,6 +1827,23 @@ describe('R100 failed-seat recovery admission', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it.each([1, 2].flatMap(retryCount => [0, 1, 2, 'completed'].flatMap(seatCount =>
+    ['ran', { status: 'ran' }, 'resumed', { status: 'resumed' }].map(result => ({ retryCount, seatCount, result })))))(
+    'spent retry refuses fresh execution with $seatCount seat rows, count=$retryCount, result=$result', ({ retryCount, seatCount, result }) => {
+      const loopPayload = payload();
+      loopPayload.findings.read.diffText = 'diff --git a/scripts/a.mjs b/scripts/a.mjs\n+code';
+      const records = Array.from({ length: seatCount === 'completed' ? 1 : seatCount }, () => ({
+        dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: seatCount === 'completed' ? 'ok' : 'unparseable',
+      }));
+      const observed = runSharedRecovery({ repo, pr, loopPayload, redTeamMode: 'fresh' }, {
+        status: { status: 'finished', result, retryCount }, records, probeFresh: true,
+        comments: [{ body: `✅ review — accepted\n<!-- reviewed-sha: ${head} -->`, author: { login: 'web-everything' } }],
+      });
+      expect(observed.result).toMatchObject({ deferredByGuard: true });
+      expect(observed.calls).toMatchObject({ model: 0, reserve: 0, provider: 0 });
+      expect(observed.comments).toHaveLength(1);
+    });
+
   it.each([1, 2, 3, 'completed'])(
     'production admission and shared guard permit exactly one failed seat retry: %s', count => {
       const dir = mkdtempSync(join(tmpdir(), 'red-team-failed-retry-'));

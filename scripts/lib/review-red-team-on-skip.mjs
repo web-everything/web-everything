@@ -16,6 +16,7 @@ import { failedRedTeamRetry, redTeamStatusWithoutRun } from './red-team-run-resu
 
 import { redTeamRequired } from './jury-core.mjs';
 import { latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
+import { restampRecord } from './numbering-carry.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { RED_TEAM_STATUS_LABELS } from './red-team-status-label-meta.mjs';
 
@@ -134,8 +135,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         && evidence.completedRecorded !== true && readStatus({ repo, pr, head }) == null
         && /^📌 review — acceptance re-stamped after a rebase \(no new review\)/.test(rawPr.comments[acceptance.index]?.body ?? '')) {
         const priorComments = rawPr.comments.slice(0, acceptance.index);
-        // The re-stamp carries the preceding trusted acceptance, never an arbitrary old clear.
-        // Unknown source evidence leaves normal recovery/operator inspection in charge.
+        // Share numbering's trusted provenance parser; comment order alone cannot bind a carry.
+        const restamp = restampRecord(rawPr.comments[acceptance.index]);
         const source = latestAcceptRecord(priorComments, reviews);
         const comment = priorComments.findLast(c => {
           const parsed = parseRedTeamComment(c?.body);
@@ -148,7 +149,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           const parsed = parseRedTeamComment(c?.body);
           return parsed?.pr === pr && redTeamForHead([c], pr, parsed.rev);
         });
-        if (source && !source.laterVerdict && !source.laterBodyDerivedHold && source.sha !== head && parsed?.rev === source.sha
+        if (restamp?.to === head && source?.sha === restamp.from
+          && !source.laterVerdict && !source.laterBodyDerivedHold && source.sha !== head && parsed?.rev === source.sha
           && latestResult === comment && result && result.findings.length === 0
           && comment.body.split(/\r?\n/).filter(line => line.trim()).length === 2
           && /^Red team not required on this head: [^\r\n]+$/m.test(comment.body)) {
@@ -223,6 +225,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         || (evidence.seatRecorded === undefined && evidence.recorded === false))) mode = 'fresh';
       else if (status == null && evidence.recorded === false) mode = 'fresh';
       else return skip(`prior result ${typeof prior === 'string' ? prior : 'unknown'} (status ${status?.status ?? 'missing'}); not re-run`);
+      // Even a policy-settlement fallback must not turn a spent retry into fresh provider work.
+      if (mode === 'fresh' && status?.retryCount >= 1) return skip('red-team retry already spent; inspect stored evidence');
       return dispatchDecision({ action: 'dispatch', mode, why: mode === 'resume' ? 'recorded pass needs its result comment/effects' : 'head never had a red-team pass' });
     } catch { return skip('red-team evidence unreadable; inspect stored evidence before retrying'); }
   });

@@ -2516,6 +2516,15 @@ Recovery retries must spend their allowance in the head-bound red-team status be
 Keep `retryCount` when writing running/finished statuses: a failed scorecard append is not evidence
 that no model ran. Exercise both review-job admission and the shared runner with an append failure,
 then verify that a later planner and admission pass refuse another call even after cooldown.
+Cross spent counts (1 and greater), bare/object `ran` and `resumed` results, and zero/one/multiple
+seat rows in planner and shared-runner regressions. An empty store must never restore a spent retry;
+the shared `redTeamStatusWithoutRun` predicate must reject it before placeholder classification.
+
+Policy-clear carry must bind the source acceptance and policy-clear SHA to the trusted re-stamp's
+declared `from`, with its `to` equal to the live head. Reuse numbering-carry's `restampRecord` parser.
+Keep a three-head regression: acceptance A, acceptance B, clear B, re-stamp A-to-C must not publish
+or sync labels; changing only the declared source to B permits carry. Missing or malformed provenance
+must also refuse carry. Never infer the declared source from comment order alone.
 
 Retry admission uses an exclusive-create `<status-basename>.retry-1` marker before the model call.
 An existing marker refuses with `retry already admitted`; never roll back another worker's status
