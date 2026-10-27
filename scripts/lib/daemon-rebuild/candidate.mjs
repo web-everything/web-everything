@@ -105,7 +105,7 @@ function defaultPidAlive(pid) {
  * (The owner's start time is not recorded in the name or lock, so a reused pid reads as alive: safe side.)
  * @returns {{reclaimed:string[], skipped:{path:string, why:string}[]}}
  */
-export function reclaimStaleCandidates({ root, run, env, pidAlive = defaultPidAlive, rm = rmSync, keepPath }) {
+export function reclaimStaleCandidates({ root, run, env, pidAlive = defaultPidAlive, rm = rmSync, keepPath, onlyPath }) {
   const reclaimed = []; const skipped = [];
   const git = makeGit({ run, cwd: root, env, timeoutMs: 60_000 });
   const list = git(['worktree', 'list', '--porcelain']);
@@ -116,7 +116,7 @@ export function reclaimStaleCandidates({ root, run, env, pidAlive = defaultPidAl
   for (const block of String(list.stdout || '').split(/\n\n+/)) {
     const lines = block.split('\n');
     const path = lines.find((l) => l.startsWith('worktree '))?.slice('worktree '.length);
-    if (!path || path === keepPath || dirname(path) !== dir || !basename(path).startsWith(namePrefix)) continue;
+    if (!path || path === keepPath || (onlyPath && path !== onlyPath) || dirname(path) !== dir || !basename(path).startsWith(namePrefix)) continue;
     if (!lines.some((l) => l === 'locked' || l.startsWith('locked '))) continue;
     const pid = Number(/^(\d+)-[0-9a-f]+$/.exec(basename(path).slice(namePrefix.length))?.[1]);
     if (!Number.isInteger(pid) || pid <= 0) { skipped.push({ path, why: 'owner-unknown' }); continue; }
@@ -163,6 +163,9 @@ function ensureNodeModulesExcluded({ root, git }) {
  *  the NEXT {@link materializeCandidate} call to clear before it reuses it. */
 export function removeCandidate({ root, path, run, env }) {
   const git = makeGit({ run, cwd: root, env, timeoutMs: 60_000 });
+  // claimBuildLease calls us BEFORE replacing state.building. Reclaim a locked leftover now, while its
+  // same-host lease evidence still exists; materializeCandidate will only see the replacement lease.
+  try { reclaimStaleCandidates({ root, run, env, onlyPath: path }); } catch { /* best-effort, like teardown below */ }
   try { git(['worktree', 'remove', '--force', path]); } catch { /* best-effort */ }
   try { rmSync(path, { recursive: true, force: true }); } catch { /* best-effort */ }
   try { git(['worktree', 'prune']); } catch { /* best-effort */ }

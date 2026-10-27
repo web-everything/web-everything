@@ -5,7 +5,8 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { reclaimStaleCandidates, materializeCandidate, candidateWorktreePath } from '../daemon-rebuild/candidate.mjs';
 import { cloneKey } from '../daemon-overlays.mjs';
-import { rebuildStatePath, writeRebuildState } from '../daemon-rebuild/state.mjs';
+import { readRebuildState, rebuildStatePath, writeRebuildState } from '../daemon-rebuild/state.mjs';
+import { ACTIVE_BUILD_TOKENS, claimBuildLease } from '../daemon-rebuild/lease.mjs';
 
 const ROOT = '/nonexistent/clone';
 const STATE = mkdtempSync(join(tmpdir(), 'stale-cand-'));
@@ -142,6 +143,57 @@ describe('reclaim honesty', () => {
 });
 
 describe('materializeCandidate', () => {
+  it.each([
+    ['same-host dead owner', {}, false, true],
+    ['foreign host', { host: `${hostname()}-other` }, false, false],
+    ['missing host', { host: undefined }, false, false],
+    ['live owner', {}, true, false],
+    ['unknown owner', {}, null, false],
+  ])('lease takeover preserves reclaim evidence for a %s', (_label, overrides, alive, shouldReclaim) => {
+    const dead = own('80466-851559f8');
+    recordLease(dead, { startedAt: '2000-01-01T00:00:00.000Z', ...overrides });
+    const calls = [];
+    let registered = true;
+    let locked = true;
+    const run = (args) => {
+      calls.push(args.join(' '));
+      if (args[0] === 'worktree' && args[1] === 'list') {
+        return { status: 0, stdout: porcelain(registered ? [{ path: dead, locked }] : []), stderr: '' };
+      }
+      if (args[0] === 'worktree' && args[1] === 'unlock' && args[2] === dead) {
+        expect(readRebuildState(ROOT, ENV).building.path).toBe(dead);
+        locked = false;
+      }
+      if (args[0] === 'worktree' && args[1] === 'remove' && args[3] === dead) {
+        if (locked) return { status: 1, stdout: '', stderr: 'fatal: worktree is locked' };
+        registered = false;
+      }
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    const kill = vi.spyOn(process, 'kill').mockImplementation((pid) => {
+      expect(pid).toBe(80466);
+      if (alive === true) return true;
+      throw Object.assign(new Error('owner probe'), { code: alive === false ? 'ESRCH' : 'EPERM' });
+    });
+    let lease;
+    try {
+      const state = readRebuildState(ROOT, ENV);
+      lease = claimBuildLease({ state, plan: { finalSha: 'abc', inputsKey: 'inputs' }, root: ROOT, run, env: ENV, nowMs: Date.now() });
+      expect(lease).not.toBeNull();
+      writeRebuildState(ROOT, state, ENV);
+      const r = materializeCandidate({ root: ROOT, sha: 'abc', run, env: ENV, path: lease.path, pidAlive: () => alive, rm: () => {} });
+      expect(r.ok).toBe(true);
+      expect(readRebuildState(ROOT, ENV).building.token).toBe(lease.token);
+      expect(calls.includes(`worktree unlock ${dead}`)).toBe(shouldReclaim);
+      expect(registered).toBe(!shouldReclaim);
+      if (shouldReclaim) {
+        expect(calls.indexOf(`worktree unlock ${dead}`)).toBeLessThan(calls.indexOf(`worktree remove --force ${dead}`));
+      }
+    } finally {
+      kill.mockRestore();
+      if (lease) ACTIVE_BUILD_TOKENS.delete(lease.token);
+    }
+  });
   it('preserves a foreign-host candidate while materializing a new attempt', () => {
     const dead = own('80466-851559f8');
     recordLease(dead, { host: `${hostname()}-other` });
