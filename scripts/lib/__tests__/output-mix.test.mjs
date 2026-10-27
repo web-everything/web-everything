@@ -451,8 +451,14 @@ describe('ratioLabel', () => {
   });
 });
 
+// A shallow CI checkout lacks the weeks this fixed `today` reads, and the hermetic guard forbids a deepening
+// network fetch here, so this one live-history case is skipped there (the other cases use fixtures).
+const SHALLOW = (() => {
+  try { return execFileSync('git', ['-C', ROOT, 'rev-parse', '--is-shallow-repository'], { encoding: 'utf8' }).trim() === 'true'; } catch { return false; }
+})();
+
 describe('computeOutputMix — against the live repository', () => {
-  it('derives the current week plus four completed weeks, and never throws', () => {
+  it.skipIf(SHALLOW)('derives the current week plus four completed weeks, and never throws', () => {
     const mix = computeOutputMix({ today: '2026-08-09' });
     expect(mix.fresh).toBe(true);
     expect(mix.weeks).toHaveLength(WEEK_COUNT);
