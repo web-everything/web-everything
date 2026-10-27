@@ -317,7 +317,9 @@ jobs:
     needs: [changes]
     if: ${{ !cancelled() && (github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) }}
     uses: ./.github/workflows/hetzner-jobs.yml
-    secrets: inherit
+    secrets:
+      WE_APP_PRIVATE_KEY: ${{ secrets.WE_APP_PRIVATE_KEY }}
+      FUI_READ_TOKEN: ${{ secrets.FUI_READ_TOKEN }}
 
   # Coverage merging and host-path checks run independently; the required test job only reads results.
   coverage-merge:

@@ -1,11 +1,18 @@
 # Trusted merge-group and main-push suites run on persistent Hetzner runners.
 # Runner labels: [self-hosted, hetzner, we]; the runner hook wipes the workspace.
-# Required check names live ONLY in ci.yml: test, smoke, daemon-soak.
+# Required checks stay in their hosted workflows: ci.yml (test, smoke, daemon-soak),
+# soak-replay-gate.yml and merge-gate.yml.
 # Called jobs appear as hetzner / test-shard (N) and hetzner / integration;
 # those are not required contexts.
 name: Hetzner jobs
 
-on: workflow_call
+on:
+  workflow_call:
+    secrets:
+      WE_APP_PRIVATE_KEY:
+        required: false
+      FUI_READ_TOKEN:
+        required: false
 
 permissions:
   contents: read
@@ -30,10 +37,9 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: web-everything
-          fetch-depth: 50 # tests that shell check-standards need origin/main history for the backlog scope guards
-      - name: Fetch main history (blobless)
-        working-directory: web-everything
-        run: git fetch --no-tags --filter=blob:none --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
+          persist-credentials: false
+          # Fetch branch history during authenticated checkout; later steps have no stored token.
+          fetch-depth: 0 # tests that shell check-standards need origin/main history for the backlog scope guards
       - name: Mint FUI read token (GitHub App)
         id: fui-app-token
         if: ${{ (vars.WE_APP_ID != '') }}
@@ -50,6 +56,7 @@ jobs:
           repository: frontier-ui/frontierui
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
@@ -131,10 +138,9 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: web-everything
-          fetch-depth: 50
-      - name: Fetch main history (blobless)
-        working-directory: web-everything
-        run: git fetch --no-tags --filter=blob:none --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
+          persist-credentials: false
+          # Fetch branch history during authenticated checkout; later steps have no stored token.
+          fetch-depth: 0
       - name: Mint FUI read token (GitHub App)
         id: fui-app-token
         if: vars.WE_APP_ID != ''
@@ -151,6 +157,7 @@ jobs:
           repository: frontier-ui/frontierui
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:

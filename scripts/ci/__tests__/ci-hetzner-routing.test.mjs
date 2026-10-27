@@ -66,7 +66,24 @@ describe('Hetzner reusable CI workflow contract', () => {
       return !repository || repository === '${{ github.repository }}' || /(?:^|\/)web-everything$/i.test(repository);
     });
     expect(checkouts.length).toBeGreaterThan(0);
-    for (const checkout of checkouts) expect(checkout.with?.ref).toBe('${{ github.sha }}');
+    for (const checkout of checkouts) {
+      expect(checkout.with?.ref).toBe('${{ github.sha }}');
+      // Checkout fetches origin/main while authenticated, before removing credentials.
+      expect(checkout.with?.['fetch-depth']).toBe(0);
+    }
+  });
+
+  it.each(['test-shard', 'integration'])('%s never persists WE or FUI checkout credentials', (name) => {
+    const checkouts = stepsUsing(hetznerWorkflow().jobs[name], 'actions/checkout');
+    expect(checkouts).toHaveLength(2);
+    for (const checkout of checkouts) expect(checkout.with?.['persist-credentials']).toBe(false);
+  });
+
+  it('declares exactly the two secrets passed explicitly by the caller', () => {
+    expect(hetznerWorkflow().on.workflow_call.secrets).toEqual({
+      WE_APP_PRIVATE_KEY: { required: false },
+      FUI_READ_TOKEN: { required: false },
+    });
   });
 
   it('uploads the coverage and timing artifact names consumed by the caller', () => {
@@ -80,10 +97,13 @@ describe('Hetzner reusable CI workflow contract', () => {
 });
 
 describe('ci.yml routes trusted events to Hetzner and preserves hosted PR checks', () => {
-  it('calls the local workflow at the tested commit, inherits secrets and waits for changes', () => {
+  it('calls the local workflow at the tested commit, passes only needed secrets and waits for changes', () => {
     expect(jobs.hetzner).toBeDefined();
     expect(jobs.hetzner.uses).toBe('./.github/workflows/hetzner-jobs.yml');
-    expect(jobs.hetzner.secrets).toBe('inherit');
+    expect(jobs.hetzner.secrets).toEqual({
+      WE_APP_PRIVATE_KEY: '${{ secrets.WE_APP_PRIVATE_KEY }}',
+      FUI_READ_TOKEN: '${{ secrets.FUI_READ_TOKEN }}',
+    });
     expect(dependencies(jobs.hetzner)).toContain('changes');
     // Keep the rationale next to the caller, including why @main is inappropriate.
     const caller = raw.match(/(?:^ *#.*\n)*^  hetzner:\n[\s\S]*?(?=^  [\w-]+:|$(?![\s\S]))/m)?.[0];
@@ -122,10 +142,28 @@ describe('ci.yml routes trusted events to Hetzner and preserves hosted PR checks
     }
   });
 
-  it.each(['test', 'smoke', 'daemon-soak'])('preserves the required %s check id/name on ubuntu-latest only', (name) => {
-    expect(jobs[name]).toBeDefined();
-    expect(jobs[name].name ?? name).toBe(name);
-    expect(jobs[name]['runs-on']).toBe('ubuntu-latest');
+  it.each([
+    ['test', 'ci.yml'],
+    ['smoke', 'ci.yml'],
+    ['daemon-soak', 'ci.yml'],
+    ['soak-replay-gate', 'soak-replay-gate.yml'],
+    ['merge-gate', 'merge-gate.yml'],
+  ])('preserves the required %s check id/name on ubuntu-latest in %s only', (name, file) => {
+    const owner = yaml.load(readFileSync(new URL(`../../../.github/workflows/${file}`, import.meta.url), 'utf8'));
+    const job = owner.jobs[name];
+    expect(job).toBeDefined();
+    // merge-gate deliberately renames skipped, irrelevant-label runs. Its real runs
+    // must still report the required context, including relevant label events.
+    for (const event of [{ action: 'synchronize' }, {}, { action: 'labeled', label: { name: 'review:human' } }, { action: 'unlabeled', label: { name: 'ready-to-merge' } }]) {
+      const checkName = job.name?.startsWith('${{')
+        ? runInNewContext(job.name.replace(/^\$\{\{\s*|\s*\}\}$/g, ''), {
+          github: { event }, startsWith: (value, prefix) => value.startsWith(prefix),
+        }, { timeout: 100 }) : job.name ?? name;
+      expect(checkName).toBe(name);
+    }
+    expect(job['runs-on']).toBe('ubuntu-latest');
+    expect(job.uses).toBeUndefined();
+    expect(job.steps.length).toBeGreaterThan(0);
     const reusableJobs = hetznerWorkflow().jobs;
     expect(reusableJobs).not.toHaveProperty(name);
     expect(Object.entries(reusableJobs).some(([id, job]) => (job.name ?? id) === name)).toBe(false);

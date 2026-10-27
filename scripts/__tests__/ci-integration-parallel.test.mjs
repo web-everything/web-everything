@@ -12,6 +12,15 @@ const job = (name) => {
 };
 
 describe('ci.yml: integration suite runs as its own parallel job', () => {
+  it.each(['ci.yml', 'hetzner-jobs.yml'])('%s integration executes test:integration:vitest', (workflow) => {
+    const text = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', '.github', 'workflows', workflow), 'utf8');
+    const integration = yaml.load(text).jobs.integration;
+    const suiteSteps = integration.steps.filter((step) => step.run?.trim() === 'npm run test:integration:vitest');
+    expect(suiteSteps).toHaveLength(1);
+    expect(suiteSteps[0]['working-directory']).toBe('web-everything');
+    expect(suiteSteps[0].if).toBe(workflow === 'ci.yml' ? "${{ steps.gate.outputs.run == 'true' }}" : undefined);
+  });
+
   it('integration needs only `changes`, so it starts beside the shards', () => {
     expect(job('integration')).toMatch(/^    needs: changes$/m);
     expect(job('integration')).toContain('npm run test:integration:vitest');
