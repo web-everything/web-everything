@@ -62,6 +62,16 @@ describe('parseDarwinReclaimableMemoryMb', () => {
     expect(hostLoad.parseDarwinMemoryHeadroomMb(vmStat, swap)).toBe(1464.5);
   });
 
+  it('parses a normal Pages inactive count line with padding and a trailing period', () => {
+    const vm = vmStat.replace('Pages inactive: 999999.', 'Pages inactive:   123456.');
+    expect(hostLoad.parseDarwinReclaimableMemoryMb(vm, swapUsage)).toBe(3137);
+  });
+
+  it.each(['999999garbage.', '12x.'])('throws on malformed Pages inactive count %j', (count) => {
+    const vm = vmStat.replace('Pages inactive: 999999.', `Pages inactive: ${count}`);
+    expect(() => hostLoad.parseDarwinReclaimableMemoryMb(vm, swapUsage)).toThrow('unparseable reclaimable memory');
+  });
+
   it('throws when Pages inactive is missing', () => {
     expect(hostLoad.parseDarwinReclaimableMemoryMb).toBeTypeOf('function');
     const missingInactive = vmStat.replace('Pages inactive: 999999.', '');
@@ -160,6 +170,13 @@ describe('readHostMemoryReading Darwin pressure probe', () => {
     expect(probe.free).not.toHaveBeenCalled();
   });
 
+  it.each(['999999garbage.', '12x.'])('throws on malformed inactive count %j after normal pressure', (count) => {
+    const vm = vmStat.replace('Pages inactive: 999999.', `Pages inactive: ${count}`);
+    const probe = probes({ vm });
+    expect(() => hostLoad.readHostMemoryReading(probe)).toThrow('unparseable reclaimable memory');
+    expect(probe.free).not.toHaveBeenCalled();
+  });
+
   it.each(['linux', 'win32'])('uses only os.freemem off Darwin (%s)', (platform) => {
     const probe = { ...probes(), platform };
     expect(hostLoad.readHostMemoryReading(probe)).toEqual({ mb: 3072, source: 'os.freemem' });
@@ -251,6 +268,14 @@ describe('hostLoadAdmission with the default memoryReading', () => {
     const result = admission(options);
     expect(result.admitted).toBe(false);
     expect(result.reason).toContain('host memory unknown:');
+    expect(native.free).not.toHaveBeenCalled();
+  });
+
+  it.each(['999999garbage.', '12x.'])('holds on malformed inactive count %j after normal pressure', (count) => {
+    const vm = vmStat.replace('Pages inactive: 999999.', `Pages inactive: ${count}`);
+    const result = admission({ vm });
+    expect(result.admitted).toBe(false);
+    expect(result.reason).toContain('host memory unknown: unparseable reclaimable memory');
     expect(native.free).not.toHaveBeenCalled();
   });
 

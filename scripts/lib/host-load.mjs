@@ -39,7 +39,7 @@ export function parseDarwinMemoryHeadroomMb(vmStat, swapUsage) {
  * Pure; incomplete or invalid evidence throws rather than implying unlimited memory. */
 export function parseDarwinReclaimableMemoryMb(vmStat, swapUsage) {
   const page = Number(/page size of (\d+) bytes/.exec(vmStat)?.[1]);
-  const inactive = Number(/Pages inactive:\s+(\d+)/.exec(vmStat)?.[1] ?? NaN);
+  const inactive = Number(/^Pages inactive:\s+(\d+)\.?\s*$/m.exec(vmStat)?.[1] ?? NaN);
   const headroom = parseDarwinMemoryHeadroomMb(vmStat, swapUsage);
   const mb = headroom + inactive * page / 1048576;
   if (!Number.isFinite(page) || page <= 0 || !Number.isFinite(inactive)
