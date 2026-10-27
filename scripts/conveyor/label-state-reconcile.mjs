@@ -29,10 +29,10 @@ export function planLabelStateReconcile({ repo, pr, review = null, redTeam = nul
     && redTeam.status === 'finished' && ['accept', 'changes'].includes(redTeam.result?.foldedVerdict) ? redTeam : null;
   let redBlocked = false, reviewBlocked = false;
   if (result || status) {
-    const plan = status?.result.foldedVerdict === 'changes'
-      ? { add: 'red-team:blocked', remove: ['red-team:clear', 'red-team:pending'] }
-      : planRedTeamStatusLabels({ repo, pr: pr.number, head, labels: from, comments: pr.comments,
-        env: {}, evidence: status ? { status } : {} });
+    // Live send-back/held dispositions include policy and operator rulings. A stored verdict
+    // is only a fallback when no live result exists; it cannot undo a recorded release.
+    const plan = planRedTeamStatusLabels({ repo, pr: pr.number, head, labels: from, comments: pr.comments,
+      env: {}, evidence: status ? { status } : {} });
     if (plan.add) after.add(plan.add);
     for (const label of plan.remove) after.delete(label);
     redBlocked = after.has('red-team:blocked');
@@ -59,9 +59,9 @@ export function planLabelStateReconcile({ repo, pr, review = null, redTeam = nul
       if (!isTrustedMarkerAuthor(c) || !isLaterVerdictBody(c?.body)) return false;
       const created = Date.parse(c.createdAt ?? c.created_at ?? '');
       const edited = Date.parse(c.updatedAt ?? c.updated_at ?? '');
-      // Creation alone cannot date the current objection. Legacy readers without edit metadata keep
-      // the hold; invalid or missing timestamps cannot prove this accept read the current comment body.
-      const at = Math.max(created, edited);
+      // The production comment reader supplies creation time without edit metadata. Use it as the
+      // fallback; known later edits still hold, and unknown creation times still fail closed.
+      const at = Math.max(created, Number.isFinite(edited) ? edited : created);
       return !Number.isFinite(at) || at >= observed.startedAt;
     }) || (Array.isArray(reviews) && laterReviewHold(reviews, new Date(observed.startedAt).toISOString()));
     const referrals = liveReferralState(pr, { repo, pr: pr.number });
