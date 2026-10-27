@@ -392,12 +392,14 @@ it('proves paged check completeness and preserves failed rerun history', () => {
   const runs = Array.from({ length: 101 }, (_, i) => run(i + 1, i ? 'success' : 'failure'));
   const calls = [];
   const result = readAutoProceedChecks({ repo: 'org/repo', head, requiredChecks: [] }, { read: argv => {
-    calls.push(argv); return { total_count: 101, check_runs: calls.length === 1 ? runs.slice(0, 100) : runs.slice(100) };
+    calls.push(argv);
+    if (argv[1].includes('/statuses?')) return [];
+    return { total_count: 101, check_runs: calls.length === 1 ? runs.slice(0, 100) : runs.slice(100) };
   } });
   expect(result).toEqual(evidence(runs));
   expect(result.runs.every(r => r.app.id === 15368 && r.app.slug === 'github-actions')).toBe(true);
   expect(result.runs.every(r => r.check_suite.id === 901)).toBe(true);
-  expect(calls).toHaveLength(2);
+  expect(calls).toHaveLength(3);
   expect(calls[0][1]).toContain('filter=all');
 });
 
@@ -405,16 +407,142 @@ const apiChecks = () => rerun.map(({ actions, ...r }) => ({ ...r,
   details_url: `https://github.com/org/repo/actions/runs/700/job/${r.id + 100}` }));
 const apiJob = (r, attempt = r.id) => ({ id: r.id + 100, run_id: 700, run_attempt: attempt,
   head_sha: head, name: r.name, check_run_url: `https://api.github.com/repos/org/repo/check-runs/${r.id}` });
+it.each(['failure', 'error', 'pending', 'unknown'])(
+  'retains a required legacy status %s beside another app cancelled check', state => {
+    const post = vi.fn(), reserve = vi.fn(() => true), calls = [];
+    const [result] = enrichPrsWithStandDownAutoProceed([pr()], {
+      repo: 'org/repo', requiredChecks: ['test'], readComments: () => pr().comments,
+      readHead: () => head, readContext: () => null, readScopedChecks: () => [],
+      readChecks: input => readAutoProceedChecks(input, { read: argv => {
+        calls.push(argv[1]);
+        if (argv[1].includes('/statuses?')) return [{ id: 10, context: 'test', state }];
+        return { total_count: 1, check_runs: [{ ...run(2, 'cancelled'), app: { id: 42, slug: 'another-app' } }] };
+      } }), reserve, post, log: () => {},
+    });
+    expect(post).not.toHaveBeenCalled();
+    expect(reserve).not.toHaveBeenCalled();
+    expect(countUnresolvedStandDowns(result.comments)).toBe(1);
+    expect(calls.some(path => path.includes('/statuses?'))).toBe(true);
+  });
+
+it.each([
+  [], [{ id: 10, context: 'test', state: 'success' }],
+  [{ id: 10, context: 'optional', state: 'failure' }],
+])('accepts complete green or unrelated commit statuses: %j', statuses => {
+  const checks = readAutoProceedChecks({ repo: 'org/repo', head, requiredChecks: ['test'] }, {
+    read: argv => argv[1].includes('/statuses?') ? statuses : { total_count: 1, check_runs: [run(2, 'cancelled')] },
+  });
+  assertAuthorizationBoundary(args(checks.runs), 'auto-proceed');
+});
+
+it.each(['unreadable', 'malformed', 'duplicate', 'oversized', 'later-failure', 'mixed-results'])(
+  'fails closed on commit status evidence: %s', scenario => {
+    let pages = 0;
+    expect(() => readAutoProceedChecks({ repo: 'org/repo', head, requiredChecks: ['test'] }, { read: argv => {
+      if (!argv[1].includes('/statuses?')) return { total_count: 1, check_runs: [run(2, 'cancelled')] };
+      pages++;
+      if (scenario === 'unreadable') throw new Error('status feed unavailable');
+      if (scenario === 'malformed') return { statuses: [] };
+      if (scenario === 'mixed-results') return [
+        { id: 11, context: 'test', state: 'success' }, { id: 10, context: 'test', state: 'failure' },
+      ];
+      if (pages === 2 && scenario === 'later-failure') return [{ id: 101, context: 'test', state: 'failure' }];
+      return Array.from({ length: 100 }, (_, i) => ({ id: i + 1 + (scenario === 'duplicate' ? 0 : (pages - 1) * 100),
+        context: 'test', state: 'success' }));
+    } })).toThrow(/status/);
+    expect(pages).toBe(scenario === 'oversized' ? 10 : ['duplicate', 'later-failure'].includes(scenario) ? 2 : 1);
+  });
+
+it('proves complete multi-page statuses before accepting recovery', () => {
+  const calls = [];
+  const checks = readAutoProceedChecks({ repo: 'org/repo', head, requiredChecks: ['test'] }, { read: argv => {
+    calls.push(argv[1]);
+    if (!argv[1].includes('/statuses?')) return { total_count: 1, check_runs: [run(2, 'cancelled')] };
+    return argv[1].endsWith('page=1') ? Array.from({ length: 100 }, (_, i) =>
+      ({ id: i + 1, context: 'test', state: 'success' })) : [];
+  } });
+  expect(calls).toHaveLength(3);
+  assertAuthorizationBoundary(args(checks.runs), 'auto-proceed');
+});
+
+it.each(['failure', 'pending', 'missing', 'unreadable', 'status-failure', 'main-red-failure'])(
+  'rechecks CI before posting after attempt 2 succeeds: %s', scenario => {
+    let reads = 0;
+    const post = vi.fn(), reserve = vi.fn(() => true);
+    const [result] = enrichPrsWithStandDownAutoProceed([pr()], {
+      repo: 'org/repo', requiredChecks: ['test'], readComments: () => pr().comments,
+      readHead: () => head, readContext: () => redMainContext, readScopedChecks: () => [],
+      readChecks: input => {
+        const later = ++reads > 1;
+        if (later && scenario === 'unreadable') throw new Error('checks unavailable');
+        return readAutoProceedChecks(input, { read: argv => {
+          if (argv[1].includes('/statuses?')) return later && scenario === 'status-failure'
+            ? [{ id: 10, context: 'test', state: 'failure' }] : [];
+          if (argv[1].includes('/jobs/')) {
+            const id = Number(argv[1].split('/').at(-1)) - 100;
+            return apiJob(run(id, 'success'));
+          }
+          const runs = later && scenario === 'missing' ? [] : apiChecks();
+          if (later && ['failure', 'pending', 'main-red-failure'].includes(scenario)) runs.push({
+            ...run(3, 'failure', scenario === 'main-red-failure' ? '2026-10-13T23:00:00Z' : undefined),
+            status: scenario === 'pending' ? 'in_progress' : 'completed',
+            details_url: 'https://github.com/org/repo/actions/runs/700/job/103' });
+          return { total_count: runs.length, check_runs: runs };
+        } });
+      }, reserve, post, log: () => {},
+    });
+    expect(post).not.toHaveBeenCalled();
+    expect(reserve).not.toHaveBeenCalled();
+    expect(reads).toBe(2);
+    expect(countUnresolvedStandDowns(result.comments)).toBe(1);
+  });
+
+it('retains the hold when a main-red exception gains another failed attempt before posting', () => {
+  let reads = 0;
+  const post = vi.fn(), reserve = vi.fn(() => true);
+  const snapshot = pr([stand('fix-loop-exhausted')]);
+  enrichPrsWithStandDownAutoProceed([snapshot], {
+    repo: 'org/repo', requiredChecks: ['test'], readComments: () => snapshot.comments,
+    readContext: () => redMainContext, readScopedChecks: () => [], readHead: () => head,
+    readChecks: () => evidence(++reads === 1 ? [rerun[0]] : [rerun[0], {
+      ...run(3, 'failure', '2026-10-13T23:00:00Z'), actions: { runId: 700, attempt: 3 },
+    }]), reserve, post, log: () => {},
+  });
+  expect(reads).toBe(2);
+  expect(post).not.toHaveBeenCalled();
+  expect(reserve).not.toHaveBeenCalled();
+});
+
+it.each([false, true])('uses fresh successful attempt evidence and rechecks the head (moved: %s)', moved => {
+  let reads = 0;
+  const events = [], post = vi.fn(({ body }) => { events.push('post'); return { body, author }; });
+  enrichPrsWithStandDownAutoProceed([pr()], {
+    repo: 'org/repo', requiredChecks: ['test'], readComments: () => pr().comments,
+    readContext: () => null, readScopedChecks: () => [],
+    readChecks: () => {
+      events.push('checks');
+      return evidence(++reads === 1 ? rerun : [...rerun,
+        { ...run(3, 'success'), actions: { runId: 700, attempt: 3 } }]);
+    },
+    readHead: () => { events.push('head'); return moved ? 'b'.repeat(40) : head; },
+    reserve: () => { events.push('reserve'); return true; }, post, log: () => {},
+  });
+  expect(events).toEqual(moved ? ['checks', 'checks', 'head'] : ['checks', 'checks', 'head', 'reserve', 'post']);
+  if (moved) expect(post).not.toHaveBeenCalled();
+  else expect(post.mock.calls[0][0].body).toContain('"attempt":3');
+});
+
 it.each([false, true])('binds REST job attempts through classification and posting (independent: %s)', independent => {
   const runs = apiChecks(), calls = [];
   const checks = readAutoProceedChecks({ repo: 'org/repo', head, requiredChecks: ['test'] }, { read: argv => {
     calls.push(argv[1]);
+    if (argv[1].includes('/statuses?')) return [];
     if (argv[1].includes('/commits/')) return { total_count: runs.length, check_runs: runs };
     const r = runs.find(r => argv[1].endsWith(`/jobs/${r.id + 100}`));
     expect(r).toBeDefined();
     return apiJob(r, independent ? 1 : r.id);
   } });
-  expect(calls).toHaveLength(3);
+  expect(calls).toHaveLength(4);
   assertAuthorizationBoundary(args(checks.runs), independent ? 'hold' : 'auto-proceed',
     independent ? /ambiguous rerun lineage/ : undefined);
 });
