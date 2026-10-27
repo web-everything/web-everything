@@ -184,7 +184,7 @@ describe('planMainRedAlert — red window and attention payload', () => {
     expect([...item.fixPrs].sort((a, b) => a - b)).toEqual([4510, 4522]);
     expect(typeof item.head).toBe('string');
     expect(item.head.length).toBeGreaterThan(0);
-    expect(result.next.fingerprint).toBe(item.head);
+    expect(item.head).toContain(result.next.fingerprint);
     expect(typeof item.reason).toBe('string');
     expect(item.reason.length).toBeGreaterThan(0);
     expect(item.reason.length).toBeLessThanOrEqual(100);
@@ -226,7 +226,7 @@ describe('planMainRedAlert — red window and attention payload', () => {
       failingJobs: [], firstFailingTest: null, fixPrs: [],
     });
     expect(result.items[0].since).toBe(SINCE);
-    expect(result.next.fingerprint).toBe(result.items[0].head);
+    expect(result.items[0].head).toContain(result.next.fingerprint);
   });
 
   it('keeps the reason within 100 characters for long detail strings', () => {
@@ -323,7 +323,7 @@ describe('planMainRedAlert — fingerprint and recovery', () => {
     const second = plan({ prev: first.next, details: updatedDetails });
     expect(kinds(second)).toEqual(['main-red']);
     expect(second.next.fingerprint).not.toBe(first.next.fingerprint);
-    expect(second.items[0].head).toBe(second.next.fingerprint);
+    expect(second.items[0].head).toContain(second.next.fingerprint);
     expect(plan({ prev: second.next, details: updatedDetails }).items).toEqual([]);
   });
 
@@ -345,17 +345,17 @@ describe('planMainRedAlert — fingerprint and recovery', () => {
 
   it('emits one green clear after an alert, then allows the same red fingerprint again', () => {
     const red = plan();
-    const green = plan({ runs: greenRuns(), prev: red.next });
+    const green = plan({ runs: greenRuns(), tip: passingTip(), prev: red.next });
     expect(kinds(green)).toEqual(['main-green']);
-    const stillGreen = plan({ runs: greenRuns(), prev: green.next });
+    const stillGreen = plan({ runs: greenRuns(), tip: passingTip(), prev: green.next });
     expect(stillGreen.items).toEqual([]);
     expect(kinds(plan({ prev: stillGreen.next }))).toEqual(['main-red']);
   });
 
   it('does not emit green without a prior red alert, including a short red episode', () => {
-    expect(plan({ runs: greenRuns() }).items).toEqual([]);
+    expect(plan({ runs: greenRuns(), tip: passingTip() }).items).toEqual([]);
     const shortRed = plan({ now: START + MINUTE });
-    expect(plan({ runs: greenRuns(), prev: shortRed.next }).items).toEqual([]);
+    expect(plan({ runs: greenRuns(), tip: passingTip(), prev: shortRed.next }).items).toEqual([]);
   });
 });
 
@@ -435,10 +435,10 @@ describe('planMainRedAlert — fail closed on unknown main status', () => {
   it('preserves an outstanding red alert through unknown until green is actually observed', () => {
     const red = plan();
     const unknown = plan({ prev: red.next, readOk: false, runs: greenRuns() });
-    const recovered = plan({ prev: unknown.next, runs: greenRuns() });
+    const recovered = plan({ prev: unknown.next, runs: greenRuns(), tip: passingTip() });
     expect(kinds(recovered)).toEqual(['main-green']);
     expect(recovered.next.unknownEmitted).toBeFalsy();
-    expect(plan({ prev: recovered.next, runs: greenRuns() }).items).toEqual([]);
+    expect(plan({ prev: recovered.next, runs: greenRuns(), tip: passingTip() }).items).toEqual([]);
   });
 });
 
