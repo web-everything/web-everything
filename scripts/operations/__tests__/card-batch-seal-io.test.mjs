@@ -552,3 +552,57 @@ it('launches the seal worker as the worker App role even when the caller is the 
   expect(spawn.mock.calls[0][2].env.WE_GITHUB_APP_ROLE).toBe('worker');
   expect(spawn.mock.calls[0][2].env.PATH).toBe(process.env.PATH);
 });
+it('acquires the seal lane against the primary checkout so a lane-clone job is not refused for lacking an origin', async () => {
+  const f = fixture({ maxCards: 1 });
+  await publishBatch(f.input, { ...f.opts, reference: '/primary/checkout' });
+  const [, args] = f.exec.mock.calls.find(([, a]) => a[1] === 'acquire');
+  expect(args).toContain('--reference=/primary/checkout');
+});
+it('defaults the acquire reference to the derived primary checkout, never the running lane clone', async () => {
+  const f = fixture({ maxCards: 1 });
+  const primary = join(f.dir, 'web-everything');
+  mkdirSync(primary);
+  const root = join(f.dir, '.lanes', 'web-everything', 'lane-3');
+  mkdirSync(root, { recursive: true });
+  await publishBatch(f.input, { ...f.opts, root });
+  const [, args] = f.exec.mock.calls.find(([, a]) => a[1] === 'acquire');
+  expect(args).toContain(`--reference=${primary}`);
+  expect(args).not.toContain(`--reference=${root}`);
+});
+it.each([false, true])('preserves the trusted env origin for a custom-pool root (busy pinned lane: %s)', async busy => {
+  const f = fixture({ maxCards: 1 });
+  const root = join(f.dir, 'custom-pool', 'lane-3');
+  mkdirSync(root, { recursive: true });
+  vi.stubEnv('LANE_POOL_CANONICAL_ORIGIN', 'https://github.com/org/repo.git');
+  if (busy) writeFileSync(f.statePath, JSON.stringify({ ...f.state, sealLane: 3 }));
+  const attempts = [];
+  const exec = (cmd, args, options) => {
+    if (args[1] === 'acquire') {
+      attempts.push(args);
+      if (busy && args.includes('--lane=3')) throw new Error('lane busy');
+    }
+    return f.exec(cmd, args, options);
+  };
+  expect((await publishBatch(f.input, { ...f.opts, root, exec })).action).toBe('sealed');
+  expect(attempts).toHaveLength(busy ? 2 : 1);
+  for (const args of attempts) expect(args.some(arg => arg.startsWith('--reference='))).toBe(false);
+});
+it('a failed acquire leaves the batch resumable: the next tick relaunches the job and the hold stays', async () => {
+  const f = fixture({ maxCards: 1 });
+  writeFileSync(f.statePath, JSON.stringify({ ...f.state, pr: 9, holdApplied: true, openedAt: 0 }));
+  const exec = vi.fn((cmd, args, o) => { if (args[1] === 'acquire') throw new Error('requires a canonical origin'); return f.exec(cmd, args, o); });
+  await expect(publishBatch(f.input, { ...f.opts, exec, reference: '/p' })).rejects.toThrow(/canonical origin/);
+  expect(f.calls.some(c => c.includes('--remove-label'))).toBe(false);
+  const spawn = vi.fn(() => ({ once: (e, cb) => { if (e === 'spawn') cb(); }, unref() {} }));
+  const jobs = await sealDueBatches({ now: 10 * 60_000, stateDir: f.dir, policy: f.opts.policy, spawn });
+  expect(jobs).toHaveLength(1);
+});
+it('an unreadable batch state never launches a seal or touches labels (fail closed)', async () => {
+  const f = fixture({ maxCards: 1 });
+  writeFileSync(f.statePath, '{not json');
+  const spawn = vi.fn();
+  await expect(sealDueBatches({ now: 10 * 60_000, stateDir: f.dir, policy: f.opts.policy, spawn })).rejects.toThrow();
+  expect(spawn).not.toHaveBeenCalled();
+  await expect(publishBatch(f.input, f.opts)).rejects.toThrow();
+  expect(f.calls.some(c => c.includes('--remove-label') || c.includes('ready'))).toBe(false);
+});

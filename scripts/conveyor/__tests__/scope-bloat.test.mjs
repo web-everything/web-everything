@@ -18,6 +18,7 @@ const planReconcileCore = options => planReconcileCoreWithTiming({ reviewTiming:
 import { planFixesFromReconcile, withScopeBloat } from '../reconcile-fix-dispatch.mjs';
 import { buildRebaseOntoMainComment } from '../main-red-recovery.mjs';
 import { readNetFiles } from '../scope-bloat.mjs';
+import { readStackBases } from '../review-stack-base.mjs';
 import { refreshScopeBloatedPr, runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
 
 const OWN = [
@@ -162,6 +163,44 @@ describe('enrichPrsWithScopeBloat — the io shell holds unknown stack diffs and
   const pr = (over = {}) => ({ number: 4361, title: 'WE #xykwe0h: build', headRefName: 'lane/build-outcomes', headRefOid: 'a'.repeat(40),
     files: FILES_4361.map((path) => ({ path, additions: 1, deletions: 0 })), comments: [], ...over });
   const readers = { readNet: () => OWN, readScope: () => CARD_SCOPE, readBaseSha: () => 'base0', repo: 'web-everything/web-everything', env: {} };
+
+  it.each(['off', 'false', '0', 'no', ' OFF ', false, 0])('uses main-based assessment for lane PRs when stack-aware review is %s', (mode) => {
+    const env = { WE_STACK_AWARE_REVIEW: mode };
+    const events = [];
+    let stackReads = 0;
+    let laneReads = 0;
+    let stackDiffReads = 0;
+    let mainReads = 0;
+    const inputs = [
+      pr({ number: 59991, baseRefName: 'lane/bottom', files: [{ path: OWN[0] }] }),
+      pr({ number: 59992, baseRefName: 'lane/bottom' }),
+    ];
+    const [clean, bloated] = enrichPrsWithScopeBloat(inputs, {
+      ...readers, env, readBaseSha: () => `stack-disabled-${typeof mode}-${String(mode)}`,
+      readNet: () => { mainReads += 1; return OWN; },
+      readStacks: (prs) => {
+        stackReads += 1;
+        return readStackBases({ prs, env,
+          readRefs: () => { laneReads += 1; return []; },
+          readLanes: () => { laneReads += 1; return []; },
+          run: () => { throw new Error('disabled stack review must not read git'); },
+        });
+      },
+      readStackFiles: () => { stackDiffReads += 1; return OWN; },
+      emitEvent: (event) => events.push(event),
+    });
+    expect(clean).toEqual(inputs[0]);
+    expect(bloated.scopeBloat).toMatchObject({ stale: true });
+    expect(bloated.scopeBloat.unknown).toBeUndefined();
+    expect(bloated.scopeBloat.alreadyOnMain.length).toBeGreaterThanOrEqual(3);
+    expect(bloated.scopeBloatUnknown).toBeUndefined();
+    expect(bloated.stackBase).toBeUndefined();
+    expect(mainReads).toBe(1);
+    expect(stackReads).toBe(0);
+    expect(laneReads).toBe(0);
+    expect(stackDiffReads).toBe(0);
+    expect(events).toEqual([]);
+  });
 
   it('holds an unresolved lane base with unknown scope bloat', () => {
     const base = 'lane/unresolved-bottom';
