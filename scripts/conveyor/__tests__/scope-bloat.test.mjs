@@ -9,7 +9,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
-  assessScopeBloat, scopeBloatLimits, cardIdFromTitle, parseCardScope, inScope, enrichPrsWithScopeBloat,
+  assessScopeBloat, scopeBloatLimits, cardIdFromTitle, readCardScope, parseCardScope, inScope, enrichPrsWithScopeBloat,
   recordScopeBloatRefresh, scopeBloatRefreshFor, MARKER_RETRIES_PER_HEAD, SCOPE_BLOAT_REASON,
 } from '../scope-bloat.mjs';
 import { planReconcile as planReconcileCoreWithTiming } from '../reconcile-core.mjs';
@@ -18,6 +18,7 @@ const planReconcileCore = options => planReconcileCoreWithTiming({ reviewTiming:
 import { planFixesFromReconcile, withScopeBloat } from '../reconcile-fix-dispatch.mjs';
 import { buildRebaseOntoMainComment } from '../main-red-recovery.mjs';
 import { readNetFiles } from '../scope-bloat.mjs';
+import { readStackBases } from '../review-stack-base.mjs';
 import { refreshScopeBloatedPr, runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
 
 const OWN = [
@@ -94,6 +95,22 @@ describe('assessScopeBloat — replay of #4361', () => {
 });
 
 describe('card scope helpers', () => {
+  it.each([
+    'Red team: x (stacked on #5942)',
+    '(after #5942)',
+    'foo, stacked on #5942',
+    'foo #5942',
+  ])('does not treat an incidental reference as a card: %s', (title) => {
+    expect(cardIdFromTitle(title)).toBeNull();
+  });
+
+  it.each([
+    'WE #xykwe0h: build — settle builds',
+    'WE #xykwe0h: build — x (stacked on #5942)',
+  ])('keeps the leading WE card reference: %s', (title) => {
+    expect(cardIdFromTitle(title)).toBe('xykwe0h');
+  });
+
   it('reads the card id out of a PR title and the scope out of frontmatter (inline and block forms)', () => {
     expect(cardIdFromTitle('WE #xykwe0h: build — settle builds')).toBe('xykwe0h');
     expect(cardIdFromTitle('no id here')).toBeNull();
@@ -142,10 +159,134 @@ describe('card scope helpers', () => {
   });
 });
 
-describe('enrichPrsWithScopeBloat — the io shell fails open and remembers the refresh', () => {
+describe('enrichPrsWithScopeBloat — the io shell holds unknown stack diffs and remembers the refresh', () => {
   const pr = (over = {}) => ({ number: 4361, title: 'WE #xykwe0h: build', headRefName: 'lane/build-outcomes', headRefOid: 'a'.repeat(40),
     files: FILES_4361.map((path) => ({ path, additions: 1, deletions: 0 })), comments: [], ...over });
   const readers = { readNet: () => OWN, readScope: () => CARD_SCOPE, readBaseSha: () => 'base0', repo: 'web-everything/web-everything', env: {} };
+
+  it.each(['off', 'false', '0', 'no', ' OFF ', false, 0])('uses main-based assessment for lane PRs when stack-aware review is %s', (mode) => {
+    const env = { WE_STACK_AWARE_REVIEW: mode };
+    const events = [];
+    let stackReads = 0;
+    let laneReads = 0;
+    let stackDiffReads = 0;
+    let mainReads = 0;
+    const inputs = [
+      pr({ number: 59991, baseRefName: 'lane/bottom', files: [{ path: OWN[0] }] }),
+      pr({ number: 59992, baseRefName: 'lane/bottom' }),
+    ];
+    const [clean, bloated] = enrichPrsWithScopeBloat(inputs, {
+      ...readers, env, readBaseSha: () => `stack-disabled-${typeof mode}-${String(mode)}`,
+      readNet: () => { mainReads += 1; return OWN; },
+      readStacks: (prs) => {
+        stackReads += 1;
+        return readStackBases({ prs, env,
+          readRefs: () => { laneReads += 1; return []; },
+          readLanes: () => { laneReads += 1; return []; },
+          run: () => { throw new Error('disabled stack review must not read git'); },
+        });
+      },
+      readStackFiles: () => { stackDiffReads += 1; return OWN; },
+      emitEvent: (event) => events.push(event),
+    });
+    expect(clean).toEqual(inputs[0]);
+    expect(bloated.scopeBloat).toMatchObject({ stale: true });
+    expect(bloated.scopeBloat.unknown).toBeUndefined();
+    expect(bloated.scopeBloat.alreadyOnMain.length).toBeGreaterThanOrEqual(3);
+    expect(bloated.scopeBloatUnknown).toBeUndefined();
+    expect(bloated.stackBase).toBeUndefined();
+    expect(mainReads).toBe(1);
+    expect(stackReads).toBe(0);
+    expect(laneReads).toBe(0);
+    expect(stackDiffReads).toBe(0);
+    expect(events).toEqual([]);
+  });
+
+  it('holds an unresolved lane base with unknown scope bloat', () => {
+    const base = 'lane/unresolved-bottom';
+    const events = [];
+    const [out] = enrichPrsWithScopeBloat([pr({ number: 5943, baseRefName: base })], {
+      ...readers, readStacks: () => new Map(), emitEvent: (event) => events.push(event),
+    });
+    const detail = { reason: 'stack-base-unresolved', base };
+    expect(out.scopeBloat).toEqual({
+      reason: 'scope-bloat', unknown: true, files: 0, alreadyOnMain: [], outsideScope: [], stale: false, wide: false,
+      why: `${detail.reason}: the PR's stack base could not be resolved, so its own diff is unknown — a person or fixer must settle the base before a review reads it`,
+    });
+    expect(out.scopeBloatUnknown).toEqual(detail);
+    expect(events).toEqual([{ kind: 'scope-bloat-unknown', pr: 5943, daemon: 'scope-bloat', detail }]);
+  });
+
+  it('leaves a clean main-based PR untouched without emitting an unknown event', () => {
+    const events = [];
+    const input = pr({ number: 5944, baseRefName: 'main', files: OWN });
+    const [out] = enrichPrsWithScopeBloat([input], {
+      ...readers, readStacks: () => new Map(), emitEvent: (event) => events.push(event),
+    });
+    expect(out).toEqual(input);
+    expect(out.scopeBloatUnknown).toBeUndefined();
+    expect(events).toEqual([]);
+  });
+
+  it.each([
+    ['files absent', { number: 5947, files: undefined }],
+    ['headRefOid absent', { number: 5948, headRefOid: undefined }],
+  ])('marks an unresolved lane base unknown with %s and emits once per PR/head', (_, missing) => {
+    const base = 'lane/unresolved-bottom';
+    const events = [];
+    const input = pr({ ...missing, baseRefName: base, scopeBloat: { stale: true } });
+    const options = { ...readers, readStacks: () => new Map(), emitEvent: (event) => events.push(event) };
+    const [out] = enrichPrsWithScopeBloat([input], options);
+    const detail = { reason: 'stack-base-unresolved', base };
+    expect(out.scopeBloat).toEqual({
+      reason: 'scope-bloat', unknown: true, files: 0, alreadyOnMain: [], outsideScope: [], stale: false, wide: false,
+      why: `${detail.reason}: the PR's stack base could not be resolved, so its own diff is unknown — a person or fixer must settle the base before a review reads it`,
+    });
+    expect(out.scopeBloatUnknown).toEqual(detail);
+    const [again] = enrichPrsWithScopeBloat([input], options);
+    expect(again.scopeBloat.unknown).toBe(true);
+    expect(again.scopeBloatUnknown).toEqual(detail);
+    expect(events).toEqual([{ kind: 'scope-bloat-unknown', pr: input.number, daemon: 'scope-bloat', detail }]);
+  });
+
+  it('skips drafts with an unresolved lane base and missing evidence', () => {
+    const events = [];
+    const input = pr({ isDraft: true, baseRefName: 'lane/unresolved-bottom', files: undefined, headRefOid: undefined });
+    const [out] = enrichPrsWithScopeBloat([input], {
+      ...readers, readStacks: () => new Map(), emitEvent: (event) => events.push(event),
+    });
+    expect(out).toBe(input);
+    expect(events).toEqual([]);
+  });
+
+  it('does not mark a resolved lane stack base unknown', () => {
+    const events = [];
+    const stack = { pr: 5942, ref: 'lane/resolved-bottom', head: '2'.repeat(40),
+      contained: '2'.repeat(40), tree: '3'.repeat(40), topHead: 'a'.repeat(40) };
+    const [out] = enrichPrsWithScopeBloat([pr({ number: 5945, baseRefName: stack.ref })], {
+      ...readers, readStacks: () => new Map([[5945, stack]]), readStackFiles: () => OWN,
+      emitEvent: (event) => events.push(event),
+    });
+    expect(out.stackBase).toMatchObject({ pr: 5942, ref: stack.ref });
+    expect(out.scopeBloat).toBeUndefined();
+    expect(out.scopeBloatUnknown).toBeUndefined();
+    expect(events).toEqual([]);
+  });
+
+  it('does not read card 5942 scope while enriching a red-team title mentioning its stack', () => {
+    const scopes = [];
+    const calls = [];
+    const run = (args) => {
+      calls.push(args);
+      return args[0] === 'ls-tree' ? 'backlog/5942-bottom.md\n' : '---\nscope: [we:bottom-only/]\n---\n';
+    };
+    enrichPrsWithScopeBloat([pr({ number: 5946, title: 'Red team: x (stacked on #5942)', baseRefName: 'main' })], {
+      ...readers, readStacks: () => new Map(),
+      readScope: (options) => { const scope = readCardScope({ ...options, run }); scopes.push(scope); return scope; },
+    });
+    expect(scopes).toEqual([null]);
+    expect(calls).toEqual([]);
+  });
 
   it('annotates a bloated PR and leaves a clean one alone', () => {
     const [bloated] = enrichPrsWithScopeBloat([pr()], readers);
@@ -424,16 +565,44 @@ describe('stack-aware review (held item 177)', () => {
     expect(out.stackBase).toBeUndefined();
   });
 
-  it('falls back to the main basis when the stack file read throws', () => {
+  it('marks the stack diff unknown without falling back to main when the stack file read throws', () => {
     let stackReads = 0;
     let mainReads = 0;
+    const events = [];
     const [out] = enrichPrsWithScopeBloat([pr()], { ...readers('fallback'),
       readStackFiles: () => { stackReads += 1; throw new Error('unreadable stack tree'); },
       readNet: () => { mainReads += 1; return ALL23; },
+      emitEvent: (event) => events.push(event),
     });
     expect(stackReads).toBe(1);
-    expect(mainReads).toBe(1);
-    expect(out.scopeBloat).toMatchObject({ wide: true });
-    expect(out.scopeBloat.outsideScope).toEqual(BOTTOM_ONLY);
+    expect(mainReads).toBe(0);
+    const detail = { reason: 'stack-diff-unreadable', base: stack.ref };
+    expect(out.scopeBloat).toEqual({
+      reason: 'scope-bloat', unknown: true, files: 0, alreadyOnMain: [], outsideScope: [], stale: false, wide: false,
+      why: `${detail.reason}: the PR's stack base could not be resolved, so its own diff is unknown — a person or fixer must settle the base before a review reads it`,
+    });
+    expect(out.scopeBloatUnknown).toEqual(detail);
+    expect(events).toEqual([{ kind: 'scope-bloat-unknown', pr: 4631, daemon: 'scope-bloat', detail }]);
+  });
+
+  it('marks a non-array stack diff unknown and emits once per PR/head without reading main', () => {
+    const input = { ...pr(), number: 4632, scopeBloat: { wide: true } };
+    const events = [];
+    let mainReads = 0;
+    const options = { ...readers('fallback'), readStacks: () => new Map([[4632, stack]]),
+      readStackFiles: () => null, readNet: () => { mainReads += 1; return ALL23; },
+      emitEvent: (event) => events.push(event) };
+    const [out] = enrichPrsWithScopeBloat([input], options);
+    const detail = { reason: 'stack-diff-unreadable', base: stack.ref };
+    expect(out.scopeBloat).toEqual({
+      reason: 'scope-bloat', unknown: true, files: 0, alreadyOnMain: [], outsideScope: [], stale: false, wide: false,
+      why: `${detail.reason}: the PR's stack base could not be resolved, so its own diff is unknown — a person or fixer must settle the base before a review reads it`,
+    });
+    expect(out.scopeBloatUnknown).toEqual(detail);
+    const [again] = enrichPrsWithScopeBloat([input], options);
+    expect(again.scopeBloat.unknown).toBe(true);
+    expect(again.scopeBloatUnknown).toEqual(detail);
+    expect(mainReads).toBe(0);
+    expect(events).toEqual([{ kind: 'scope-bloat-unknown', pr: 4632, daemon: 'scope-bloat', detail }]);
   });
 });

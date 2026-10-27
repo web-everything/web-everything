@@ -18,17 +18,18 @@
  *     `WE_REVIEW_SCOPE_BLOAT_MIN_FILES` (default 12) files, so a small PR never reads a card. (The already-on-main read is gated
  *     only by the PR having at least `ALREADY_ON_MAIN` files, so a small stale PR is still caught.)
  *
- * PURE except the `enrich*` functions at the bottom, which are the io shell and fail OPEN: an unreadable diff or card
- * is "no claim", never a hold.
+ * PURE except the `enrich*` functions at the bottom, which are the io shell: an unreadable diff or card is "no claim".
+ * An unresolved declared lane base is explicitly unknown, never assessed against main.
  */
 import { execFileSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { countRebaseOntoMainComments } from './main-red-recovery.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { appendDaemonEvent } from '../lib/daemon-events.mjs';
 import { coversFile } from '../readiness/scope-lease.mjs';
 import { readNetSets, resolveNetScopeSettings, scopeFilesFor } from './net-scope.mjs';
-import { readStackBases, stackNetFiles } from './review-stack-base.mjs';
+import { readStackBases, resolveStackAwareReview, stackNetFiles } from './review-stack-base.mjs';
 
 export const SCOPE_BLOAT_REASON = 'scope-bloat';
 export const SCOPE_BLOAT_DEFAULTS = Object.freeze({ alreadyOnMain: 3, outsideScope: 10, minFiles: 12 });
@@ -110,9 +111,9 @@ export function assessScopeBloat({ prFiles, netFiles = null, cardScope = null, e
     why: `the diff is mostly not this PR's own change: ${parts.join('; ')} — refresh onto main or rebase before a review reads it` };
 }
 
-/** The card id a PR names in its title, e.g. "WE #xykwe0h: build — ..." -> "xykwe0h". Null when none. */
+/** The leading "WE #<id>:" card reference, e.g. "WE #xykwe0h: build — ..." -> "xykwe0h". Incidental PR references do not count. */
 export function cardIdFromTitle(title) {
-  const m = /#([0-9a-z]{3,8})\b/i.exec(String(title ?? ''));
+  const m = /^WE #([0-9a-z]{3,8}):/i.exec(String(title ?? ''));
   return m ? m[1].toLowerCase() : null;
 }
 
@@ -152,6 +153,7 @@ export function readCardScope({ title, base = 'main', root = ROOT, run = git } =
 
 const memo = new Map();
 const unreadable = new Set();
+const unknowns = new Set();
 const refreshes = new Map();
 const refreshKey = (pr, head) => `${pr}:${head}`;
 
@@ -190,8 +192,9 @@ export function readBaseSha({ base = 'main', root = ROOT, run = git } = {}) {
 }
 
 /**
- * Attach `pr.scopeBloat` to each open, non-draft PR whose diff is bloated. FAILS OPEN per PR: any read error leaves the
- * PR unannotated. Memoized per (PR, head, base tip), so a PR that stays bloated on an unmoved `main` costs one git read,
+ * Attach `pr.scopeBloat` to each open, non-draft PR whose diff is bloated. An unresolved lane base or unreadable stack diff fails closed
+ * with a `scopeBloat` hold, `scopeBloatUnknown`, and a best-effort event, once per (PR, head) within a bounded process memo. Other read errors
+ * leave the PR unannotated. Memoized per (PR, head, base tip), so a PR that stays bloated on an unmoved `main` costs one git read,
  * not one per tick, while a `main` that advances (another lane's commits landing turn files of this diff into
  * already-on-main files) reassesses the same head. This reads the local `origin/<base>`; it does not fetch it.
  * Only the Web Everything repo is read (the git root is this clone); other repos pass through.
@@ -208,10 +211,12 @@ export function enrichPrsWithScopeBloat(prs, { repo = null, defaultBranch = 'mai
   // was refused as scope-bloat until #4624 landed. Real git only when the other reads are real too (a test injecting
   // `readNet` never shells out); injectable; `null` = no stack detection (today).
   readStacks = readNet === readNetFiles ? ((list) => readStackBases({ root, env, prs: list })) : null,
-  readStackFiles = (base) => stackNetFiles({ tree: base.tree, topHead: base.topHead, root }) } = {}) {
+  readStackFiles = (base) => stackNetFiles({ tree: base.tree, topHead: base.topHead, root }),
+  emitEvent = appendDaemonEvent } = {}) {
   if (!Array.isArray(prs) || (repo && repoKeyForSlug(repo) !== 'we')) return prs;
   const limits = scopeBloatLimits(env);
-  let stacks = null; // read once per call, lazily, and only when some PR is big enough to be judged at all
+  const stackAware = resolveStackAwareReview(env);
+  let stacks = null; // read once per call, lazily, for declared lane bases or PRs big enough to judge
   const stackBases = () => {
     if (stacks == null) { try { stacks = (readStacks && readStacks(prs.filter((p) => p && !p.isDraft))) || new Map(); } catch { stacks = new Map(); } }
     return stacks;
@@ -223,25 +228,38 @@ export function enrichPrsWithScopeBloat(prs, { repo = null, defaultBranch = 'mai
   };
   return prs.map((pr) => {
     try {
-      if (pr?.isDraft || !pr?.headRefOid || !Array.isArray(pr.files)) return pr;
+      if (!pr || pr.isDraft) return pr;
       // A head that cannot be read stays unreadable whatever `main` does: remember that per head, not per main tip, so it
       // costs one failed read (cat-file, fetch, diff; 30 s each) rather than one per main advance.
-      const headKey = `${pr.number}:${pr.headRefOid}`;
+      const headKey = `${pr.number}:${pr.headRefOid ?? 'nohead'}`;
+      const laneBase = stackAware && pr.baseRefName !== defaultBranch && /^lane\//.test(pr.baseRefName ?? '');
+      const listed = Array.isArray(pr.files) ? pr.files.length : 0;
+      const stackBase = stackAware && (laneBase || listed >= Math.min(limits.alreadyOnMain || Infinity, limits.minFiles || Infinity)) ? stackBases().get(Number(pr.number)) ?? null : null;
+      const unknown = (detail) => {
+        if (!unknowns.has(headKey)) {
+          unknowns.add(headKey);
+          if (unknowns.size > 500) unknowns.delete(unknowns.values().next().value);
+          try { Promise.resolve(emitEvent({ kind: 'scope-bloat-unknown', pr: pr.number, daemon: 'scope-bloat', detail })).catch(() => {}); } catch { /* best effort */ }
+        }
+        return { ...pr, scopeBloatUnknown: detail, scopeBloat: {
+          reason: 'scope-bloat', unknown: true, files: 0, alreadyOnMain: [], outsideScope: [], stale: false, wide: false,
+          why: `${detail.reason}: the PR's stack base could not be resolved, so its own diff is unknown — a person or fixer must settle the base before a review reads it`,
+        } };
+      };
+      if (laneBase && !stackBase) return unknown({ reason: 'stack-base-unresolved', base: pr.baseRefName });
+      if (!pr.headRefOid || !Array.isArray(pr.files)) return pr;
       if (unreadable.has(headKey)) return pr;
-      const listed = pr.files.length;
-      const stackBase = listed >= Math.min(limits.alreadyOnMain || Infinity, limits.minFiles || Infinity) ? stackBases().get(Number(pr.number)) ?? null : null;
       const stackInfo = stackBase ? { pr: stackBase.pr, ref: stackBase.ref, head: stackBase.head, contained: stackBase.contained } : null;
       const key = `${headKey}:${baseTip()}${stackBase ? `:stack:${stackBase.tree}` : ''}`;
       if (!memo.has(key) && stackBase) {
         // A stacked top: its own files are the diff from the stack base. They are by construction not on main and are
-        // judged against the card's scope as usual. An unreadable stack diff falls through to the main basis (today).
+        // judged against the card's scope as usual. An unreadable stack diff cannot be judged against main.
         let own = null;
         try { own = readStackFiles(stackBase); } catch { own = null; }
-        if (Array.isArray(own)) {
-          const scope = scopeSignalOn(limits) && own.length >= limits.minFiles ? readScope({ title: pr.title ?? '', base: defaultBranch, root }) : null;
-          memo.set(key, assessScopeBloat({ prFiles: own, netFiles: own, cardScope: scope, env }));
-          if (memo.size > 500) memo.delete(memo.keys().next().value);
-        }
+        if (!Array.isArray(own)) return unknown({ reason: 'stack-diff-unreadable', base: stackBase.ref });
+        const scope = scopeSignalOn(limits) && own.length >= limits.minFiles ? readScope({ title: pr.title ?? '', base: defaultBranch, root }) : null;
+        memo.set(key, assessScopeBloat({ prFiles: own, netFiles: own, cardScope: scope, env }));
+        if (memo.size > 500) memo.delete(memo.keys().next().value);
       }
       if (!memo.has(key)) {
         let mergeBaseNet = null;
