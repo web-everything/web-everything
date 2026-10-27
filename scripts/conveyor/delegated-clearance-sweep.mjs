@@ -39,6 +39,7 @@ function parseShadowDeadline(value) {
   if (!match || match[0] !== value) return NaN;
   // Date.parse normalizes impossible dates such as February 30; those must stay in shadow too.
   const day = Date.parse(`${match[1]}T00:00:00Z`);
+  // utc-day-slice-ok: round-trip the input calendar date anchored at UTC midnight to reject normalized impossible dates.
   if (!Number.isFinite(day) || new Date(day).toISOString().slice(0, 10) !== match[1]) return NaN;
   return Date.parse(value);
 }
