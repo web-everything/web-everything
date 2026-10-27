@@ -179,11 +179,14 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
         live = !start || !status.pidStart || start === status.pidStart;
       }
     }
-    // A proven carry or explicit skipped-carry result cannot supply a panel verdict.
+    // A skipped carry cannot supply a panel verdict even when its eligibility proof fails.
     // Legacy skip metadata alone cannot erase a real verdict.
-    const loopPayload = carriedFrom || (statusCarriedFrom && status.result?.policy === 'card-only')
+    const skippedCarry = !!status.loopPayload?.carriedFrom && (status.result === 'skipped'
+      || (status.result?.status === 'skipped' && status.result.policy === 'card-only'));
+    const ineligibleCarry = skippedCarry && !carriedFrom;
+    const loopPayload = carriedFrom || skippedCarry
       ? { ...status.loopPayload, verdict: null } : status.loopPayload;
-    return withUsability({ ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), status, ...seatEvidence, loopPayload, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
+    return withUsability({ ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), ...(ineligibleCarry ? { ineligibleCarry: true } : {}), status, ...seatEvidence, loopPayload, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
       ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: attempted || redTeamPanelSeatOwed(status.loopPayload, env) || ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(resultStatus),
       recorded: recorded || resultStatus === 'ran',
       // A pass whose job died while running started and left no usable result, like one that errored.

@@ -92,9 +92,10 @@ export function staleRedTeamRequestEligibility({ evidence = {}, repo, pr, head, 
     return refuse('review payload does not match head');
   // The label check above verified a live accept: an operator-accepted needs-human head owes the red team too,
   // the same head the hold counts as owed (live gap #5549: held 1680 min with no request ever filed).
-  if (!redTeamOwedForAcceptedPr(evidence.loopPayload)
+  // An ineligible carry has no trusted panel verdict and cannot discharge the failed seat's obligation.
+  if (!evidence.ineligibleCarry && (!redTeamOwedForAcceptedPr(evidence.loopPayload)
     || !redTeamOwedOnHead({ read: evidence.loopPayload?.findings?.read,
-      evidence: { scheduled: true, skipCardOnly: evidence.skipCardOnly }, skipCardOnly }))
+      evidence: { scheduled: true, skipCardOnly: evidence.skipCardOnly }, skipCardOnly })))
     return refuse('red team not owed');
   if (panelSeat) {
     const repoKey = repoKeyForSlug(repo);
