@@ -28,6 +28,11 @@ import { daemonCloneRoots } from '../lib/daemon-clone-registry.mjs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
+// These cases only prove the guard does not hang or backtrack catastrophically on adversarial input. A
+// catastrophic regression is exponential (seconds to forever), so a generous bound still catches it and
+// does not flake under coverage on a busy shared runner (was 250 ms; saw 252 ms).
+const HANG_BUDGET_MS = 2000;
+
 // xxna58l (#3383) — the raw-heavy-command arm (a raw eleventy/vitest/playwright invocation reached directly,
 // or through this file's own nested-command extraction) denies a raw command for an UNRELATED reason (it
 // skips the #3461 admission queue) than every arm that predates it. Older corpora asserting "always allowed"
@@ -324,7 +329,7 @@ describe('guard-bash — a dispatched agent may never reference the usage-report
     ]) {
       const start = performance.now();
       usageReportSecretReadReason(cmd, 'build');
-      expect(performance.now() - start, cmd.slice(0, 20)).toBeLessThan(250);
+      expect(performance.now() - start, cmd.slice(0, 20)).toBeLessThan(HANG_BUDGET_MS);
     }
   });
   it('is wired into reason()/decide() so a real dispatched Bash call is actually denied end to end', () => {
@@ -1309,7 +1314,7 @@ describe('guard-bash — sed/tee/perl write-shape tables + ReDoS bound (#2108 re
     ]) {
       const t = performance.now();
       reason(cmd);
-      expect(performance.now() - t, cmd.slice(0, 40)).toBeLessThan(250);
+      expect(performance.now() - t, cmd.slice(0, 40)).toBeLessThan(HANG_BUDGET_MS);
     }
   });
 });
@@ -1403,7 +1408,7 @@ describe('guard-bash — differential write-shape table (#2108 review r5)', () =
   ])('bounds %s scanning', (_name, cmd) => {
     const start = performance.now();
     reason(cmd);
-    expect(performance.now() - start).toBeLessThan(250);
+    expect(performance.now() - start).toBeLessThan(HANG_BUDGET_MS);
   });
 });
 
@@ -3210,7 +3215,7 @@ describe('guard-bash — every script-scanning regex is linear on hostile runs (
     ('bounds wrapper %s with run %s', (_wrapper, _run, cmd) => {
       const start = performance.now();
       fileWriteTargets(cmd);
-      expect(performance.now() - start).toBeLessThan(250);
+      expect(performance.now() - start).toBeLessThan(HANG_BUDGET_MS);
     });
   it.each([
     "sed -n '1s/a/b/w backlog/x.md' f",
@@ -3226,7 +3231,7 @@ describe('guard-bash — every script-scanning regex is linear on hostile runs (
     const cmd = `sed -n '${' '.repeat(3000)}x' f`;
     const start = performance.now();
     fileWriteTargets(cmd);
-    expect(performance.now() - start).toBeLessThan(250);
+    expect(performance.now() - start).toBeLessThan(HANG_BUDGET_MS);
   });
 });
 
