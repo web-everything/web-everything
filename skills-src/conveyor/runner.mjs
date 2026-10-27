@@ -36,7 +36,8 @@
  *     passes, prints the surface, and heartbeats the real singleton lease.
  */
 
-import { dirname, join } from 'node:path';
+import { runPassAsTimedJob } from './pass-daemon.mjs';
+import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { mkdirSync, writeFileSync, renameSync, appendFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -301,25 +302,44 @@ export const MECHANICAL_PASS_NAMES = Object.freeze([
   'hiccup-sink',
 ]);
 
+export function runTimedPasses({ passes, runPass = runPassAsTimedJob }) {
+  return Promise.all(passes.map(pass => Promise.resolve().then(() => runPass(pass))));
+}
+
 export function makeCliMechanicalPasses({
-  scriptsDir, repo = null, hiccupSession, exec = execFileSync,
+  scriptsDir, repo = null, hiccupSession, runPass, exec,
   fetchOpenPrs = defaultFetchOpenPrs, repos = CONSTELLATION_REPOS,
   unsupportedPath, skipPasses = new Set(),
 } = {}) {
+  // Retain the historical injected command port for existing callers. Production
+  // always uses detached timed jobs; an injected runPass takes precedence.
+  runPass ??= exec ? async ({ entry }, { root }) => ({ code: 0, signal: null,
+    output: exec('node', [join(root, entry.script), ...entry.args], {
+      encoding: 'utf8', stdio: ['ignore', entry.capture ? 'pipe' : 'ignore', 'pipe'], maxBuffer: 32 * 1024 * 1024,
+    }) }) : runPassAsTimedJob;
   const skip = (name) => skipPasses.has(name);
   return async ({ out } = {}) => {
     const warn = (path, key, e) => process.stderr.write(
       `⚠ mechanical pass ${path} [${key}] failed (non-fatal): ${summarizeMechanicalPassError(e)}\n`,
     );
+    const pending = [];
     const run = (path, args, key, slug, capture = false) => {
-      try {
-        return { ok: true, output: exec('node', [join(scriptsDir, path), ...args, ...(slug ? [`--repo=${slug}`] : [])], {
-          encoding: 'utf8', stdio: ['ignore', capture ? 'pipe' : 'ignore', 'pipe'], maxBuffer: 32 * 1024 * 1024,
-        }) };
-      } catch (error) {
-        warn(path, key, error);
-        return { ok: false, error };
-      }
+      const root = resolve(scriptsDir, '..');
+      const name = path.split('/').pop().replace(/\.mjs$/, '');
+      const perPr = ['review-dispatch', 'review-round-tag', 'review-status-tag'].includes(name);
+      const pass = { passName: perPr ? `${name}:${args[0]}` : name,
+        repo: slug ?? repos.we?.slug ?? CONSTELLATION_REPOS.we.slug,
+        entry: { script: relative(root, join(scriptsDir, path)),
+          args: [...args, ...(slug ? [`--repo=${slug}`] : [])], capture, quiet: true } };
+      const job = runTimedPasses({ passes: [pass], runPass: descriptor => runPass(descriptor, { root }) })
+        .then(([result]) => {
+          if (result.code !== 0 || result.spawnError || result.outcome) {
+            throw Object.assign(new Error(result.spawnError ?? result.outcome ?? `exit code ${result.code} (${result.signal ?? ''})`), { stderr: result.stderr });
+          }
+          return { ok: true, output: result.output };
+        }).catch(error => { warn(path, key, error); return { ok: false, error }; });
+      pending.push(job);
+      return job;
     };
     // WE-only: retries WE backlog infrastructure holds.
     if (!skip('infra-blocked')) run('conveyor/infra-blocked.mjs', ['retry'], 'we', repo);
@@ -343,7 +363,9 @@ export function makeCliMechanicalPasses({
       process.stderr.write(`⚠ unsupported-repo: ${repo} is not a constellation repo; skipping PR-facing passes\n`);
     }
     let duplicateRan = false;
-    for (const [key, { slug }] of selected) {
+    for (const [key, { slug }] of selected) pending.push((async () => {
+      const repoPending = [];
+      const runRepo = (...args) => { const job = run(...args); repoPending.push(job); return job; };
       let prsFile = null;
       try {
         let prsArgs = [];
@@ -353,34 +375,34 @@ export function makeCliMechanicalPasses({
           writeFileSync(prsFile, JSON.stringify(prs), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
           prsArgs = [`--prs-file=${prsFile}`];
         } catch (e) { warn('open-pr-fetch', key, e); }
-        if (!skip('reconcile-fix-dispatch')) run('conveyor/reconcile-fix-dispatch.mjs', prsArgs, key, slug);
+        if (!skip('reconcile-fix-dispatch')) runRepo('conveyor/reconcile-fix-dispatch.mjs', prsArgs, key, slug);
         // xs5b4fj — the SAME reconcile-pass.mjs plan `reconcile-fix-dispatch.mjs` just read above also carries
         // `kind:'ci-heal'` entries (a red required check, nothing live working it); `operations/
         // ci-heal-pr-dispatch.mjs#runReconcileCiHealDispatch` is the ONLY code that ever acts on one, and until
         // this line nothing in the tree ever called it — every ci-heal-owed PR (live-confirmed: chalbert/
         // web-everything #2635, #2636) sat forever with a correct plan and no dispatcher reading it.
-        if (!skip('ci-heal-pr-dispatch')) run('operations/ci-heal-pr-dispatch.mjs', prsArgs, key, slug);
+        if (!skip('ci-heal-pr-dispatch')) runRepo('operations/ci-heal-pr-dispatch.mjs', prsArgs, key, slug);
         // draft-first PRs (operator-approved 2026-09-27) — the SAME reconcile-pass plan above also carries
         // `kind:'promote-draft'` entries (a draft PR whose required checks just went all-green); this is the
         // ONLY dispatcher that ever acts on one (`gh pr ready`), mirroring ci-heal-pr-dispatch's own line
         // right above it exactly.
-        if (!skip('promote-draft-pr-dispatch')) run('operations/promote-draft-pr-dispatch.mjs', prsArgs, key, slug);
-        if (!skip('ci-queue-watch')) run('conveyor/ci-queue-watch.mjs', ['sweep'], key, slug);
+        if (!skip('promote-draft-pr-dispatch')) runRepo('operations/promote-draft-pr-dispatch.mjs', prsArgs, key, slug);
+        if (!skip('ci-queue-watch')) runRepo('conveyor/ci-queue-watch.mjs', ['sweep'], key, slug);
         // Already runs as its own pass-daemon watcher (skills-src/conveyor/pass-daemon.mjs) — a resident
         // Dispatcher must skip this to avoid double-running it.
-        if (!skip('parked-pr-conflict-watch')) run('conveyor/parked-pr-conflict-watch.mjs', ['sweep', ...prsArgs], key, slug);
-        if (!skip('advisory-label-sweep')) run('conveyor/advisory-label-sweep.mjs', ['sweep', ...prsArgs], key, slug);
+        if (!skip('parked-pr-conflict-watch')) runRepo('conveyor/parked-pr-conflict-watch.mjs', ['sweep', ...prsArgs], key, slug);
+        if (!skip('advisory-label-sweep')) runRepo('conveyor/advisory-label-sweep.mjs', ['sweep', ...prsArgs], key, slug);
         // #x01u7az — the one-time-and-ongoing cleanup for the two review-hold/advisory strays
         // `we:scripts/review-set-label.mjs#decideSetLabel`'s `rearm`/`clear-human` fix stops PRODUCING going
         // forward (a stray review:pending beside a live review:human; a stray advisory:* once review:human is
         // gone) — see that module's own header for the live PRs (#2549, #2578) this cleans up. Piggybacks on the
         // SAME shared open-PR snapshot as its sibling sweep, one line above.
-        if (!skip('review-hold-reconcile')) run('conveyor/review-hold-reconcile.mjs', ['sweep', ...prsArgs], key, slug);
+        if (!skip('review-hold-reconcile')) runRepo('conveyor/review-hold-reconcile.mjs', ['sweep', ...prsArgs], key, slug);
         // GROUP (skipped as ONE unit): reconcile-pass → review-dispatch (per PR) → review-round-tag /
         // review-status-tag — the exact sequence skills-src/conveyor/review-daemon.mjs now runs standalone,
         // per PR (#3876). A resident Dispatcher must skip 'reconcile-pass' whole to avoid duplicating it.
-        if (!skip('reconcile-pass')) {
-          const result = run('conveyor/reconcile-pass.mjs', ['--json', ...prsArgs], key, slug, true);
+        if (!skip('reconcile-pass')) repoPending.push((async () => {
+          const result = await runRepo('conveyor/reconcile-pass.mjs', ['--json', ...prsArgs], key, slug, true);
           if (result.ok) {
             try {
               const plan = JSON.parse(result.output);
@@ -394,7 +416,7 @@ export function makeCliMechanicalPasses({
               const ciHeals = (plan.dispatch ?? []).filter((d) => d?.kind === 'ci-heal');
               const unsupported = [];
               for (const d of reviews) {
-                const dispatched = run('operations/review-dispatch.mjs', [`--pr=${d.prNumber}`], key, slug);
+                const dispatched = await runRepo('operations/review-dispatch.mjs', [`--pr=${d.prNumber}`], key, slug);
                 if (!dispatched.ok) {
                   const why = String(dispatched.error.stderr || dispatched.error.message || dispatched.error).trim().replace(/\s+/g, ' ');
                   if (key !== 'we' && why.includes('unsupported-repo')) {
@@ -402,10 +424,10 @@ export function makeCliMechanicalPasses({
                   }
                   continue;
                 }
-                run('conveyor/review-round-tag.mjs', [String(d.prNumber), `--round=${(d.attempts ?? 0) + 1}`], key, slug);
+                await runRepo('conveyor/review-round-tag.mjs', [String(d.prNumber), `--round=${(d.attempts ?? 0) + 1}`], key, slug);
               }
               for (const c of selectStatusCandidates(reviews, plan.refusals, fixes, ciHeals)) {
-                run('conveyor/review-status-tag.mjs', [String(c.prNumber)], key, slug);
+                await runRepo('conveyor/review-status-tag.mjs', [String(c.prNumber)], key, slug);
               }
               if (key !== 'we') {
                 // Each producer replaces its own actions, preserving the sibling producer's refusals.
@@ -414,18 +436,20 @@ export function makeCliMechanicalPasses({
               }
             } catch (e) { warn('review-reconcile', key, e); }
           }
-        }
+        })());
         // WE-only: duplicate item numbers refer to WE backlog ids, not cross-repo deliveries.
         if (!skip('duplicate-pr-watch') && (key === 'we' || repo !== null)) {
-          run('conveyor/duplicate-pr-watch.mjs', ['sweep', ...prsArgs], 'we', repo);
+          runRepo('conveyor/duplicate-pr-watch.mjs', ['sweep', ...prsArgs], 'we', repo);
           duplicateRan = true;
         }
-        if (!skip('parked-pr-progress-watch')) run('conveyor/parked-pr-progress-watch.mjs', ['sweep', ...prsArgs], key, slug);
+        if (!skip('parked-pr-progress-watch')) runRepo('conveyor/parked-pr-progress-watch.mjs', ['sweep', ...prsArgs], key, slug);
       } finally {
+        await Promise.all(repoPending);
         if (prsFile) { try { unlinkSync(prsFile); } catch { /* best-effort cleanup */ } }
       }
-    }
+    })());
     if (!duplicateRan && !skip('duplicate-pr-watch')) run('conveyor/duplicate-pr-watch.mjs', ['sweep'], 'we', repo);
+    await Promise.all(pending);
     // WE-only: hiccups describe suppressed item-keyed WE builds.
     if (!skip('hiccup-sink')) {
       try {
@@ -721,7 +745,10 @@ async function main(argv) {
         selfSync,
       }),
       emit: makeCliEmit({ json, statusPath: STATUS_PATH, traceDir: TRACE_DIR }),
-      mechanicalPasses: makeCliMechanicalPasses({ scriptsDir: SCRIPTS_DIR, repo, hiccupSession, skipPasses }),
+      mechanicalPasses: (() => {
+        const passes = makeCliMechanicalPasses({ scriptsDir: SCRIPTS_DIR, repo, hiccupSession, skipPasses });
+        return context => { void passes(context).catch(error => console.error(summarizeMechanicalPassError(error))); };
+      })(),
       sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
       intervalMs,
       maxTicks,

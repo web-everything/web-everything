@@ -4,9 +4,13 @@
  * @description Unit proof of #3871's generic single-pass daemon — the pure loop only (no real child process,
  *   no real timer, no real lease): injected effects, mirroring #3870's own `runDaemonLoop` tests.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { createJobStore } from '../../../scripts/lib/daemon-jobs-runtime.mjs';
+import { keepAliveScript } from '../../../scripts/lib/test-keepalive.mjs';
 import { EventEmitter } from 'node:events';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -266,16 +270,79 @@ describe('realSleep — regression, live-caught on the sibling #3870/#3876 daemo
 // instance of the SAME script, e.g. parked-pr-conflict-watch-we vs -frontierui, shares) — this is what lets
 // `main()` set GH_CALLER=<passName> so the sidecar log attributes precisely.
 describe('spawnPassOnce — env passthrough to the child process (#gh-write-burst)', () => {
+  let dir;
+  let ports;
+  beforeEach(() => {
+    dir = mkdtempSync(join(process.env.TMPDIR, 'pass-env-'));
+    ports = { store: createJobStore(join(dir, 'jobs')), readStart: () => 'fixture-start',
+      policyOptions: { platform: null, env: {} } };
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
   const fakeChild = () => {
     const emitter = new EventEmitter();
+    emitter.pid = 7000;
     // A real ChildProcess emits 'close' once stdio is drained, right after 'exit'; spawnPassOnce finishes on 'close'.
     setImmediate(() => { emitter.emit('exit', 0, null); emitter.emit('close', 0, null); });
     return emitter;
   };
 
+  it('times out a real hung child and confirms its process is gone', async () => {
+    writeFileSync(join(dir, 'hang.mjs'), keepAliveScript({ maxLifetimeMs: 10_000 }));
+    let pid;
+    const lines = [];
+    const result = await spawnPassOnce({ script: 'hang.mjs' }, {
+      store: ports.store, root: dir, readStart: () => 'fixture-start',
+      // The sandbox restricts ps; this fixture owns the fresh child and probes
+      // its actual pid/group with signal 0 while using the real stopHandle.
+      probe: () => {
+        try { process.kill(pid, 0); return 'alive'; }
+        catch (error) { return error.code === 'ESRCH' ? 'dead' : 'unknown'; }
+      },
+      reapGroup: () => {
+        try { process.kill(-pid, 0); return false; }
+        catch (error) { return error.code === 'ESRCH'; }
+      },
+      policyOptions: { platform: null, env: {}, tool: { timeoutMs: 100 } },
+      spawnFn: (...args) => { const child = spawn(...args); pid = child.pid; return child; },
+      log: line => lines.push(line),
+    });
+    expect(result).toEqual({ outcome: 'timeout' });
+    expect(() => process.kill(pid, 0)).toThrow();
+    expect(lines.filter(line => line.includes('task-timing'))).toHaveLength(1);
+  });
+
+  it('preserves a synchronous spawn failure as a pass result', async () => {
+    const result = await spawnPassOnce({ script: 'scripts/x.mjs' }, {
+      ...ports, root: dir, log: () => {},
+      spawnFn: () => { throw new Error('fixture spawn refused'); },
+    });
+    expect(result).toEqual({ code: null, signal: null, spawnError: 'fixture spawn refused' });
+    expect(ports.store.list().records[0].job.status).toBe('failed');
+  });
+
+  it('refuses oversized captured output with an operator-visible fallback', async () => {
+    const result = await spawnPassOnce({ script: 'scripts/x.mjs', capture: true }, {
+      ...ports, root: dir, log: () => {},
+      spawnFn: () => {
+        const child = new EventEmitter();
+        child.pid = 7000;
+        child.stdout = new EventEmitter();
+        setImmediate(() => {
+          child.stdout.emit('data', Buffer.alloc(32 * 1024 * 1024 + 1, 97));
+          child.emit('exit', 0, null);
+          child.emit('close', 0, null);
+        });
+        return child;
+      },
+    });
+    expect(result.spawnError).toMatch(/exceeded 32 MiB; inspect pass output before retrying/);
+    expect(Buffer.byteLength(result.output)).toBeLessThanOrEqual(32 * 1024 * 1024);
+    expect(ports.store.list().records[0].job.status).toBe('failed');
+  });
+
   it('defaults to process.env when no env override is given (unchanged for every existing caller)', async () => {
     const spawnFn = vi.fn(() => fakeChild());
-    await spawnPassOnce({ script: 'scripts/x.mjs' }, { root: '/repo', spawnFn });
+    await spawnPassOnce({ script: 'scripts/x.mjs' }, { ...ports, root: '/repo', spawnFn });
     const [, , opts] = spawnFn.mock.calls.at(-1);
     expect(opts.env).toBe(process.env);
   });
@@ -283,7 +350,7 @@ describe('spawnPassOnce — env passthrough to the child process (#gh-write-burs
   it('forwards an explicit env override unchanged — this is how GH_CALLER=<passName> reaches the child', async () => {
     const spawnFn = vi.fn(() => fakeChild());
     const env = { ...process.env, GH_CALLER: 'parked-pr-conflict-watch-we' };
-    await spawnPassOnce({ script: 'scripts/x.mjs' }, { root: '/repo', env, spawnFn });
+    await spawnPassOnce({ script: 'scripts/x.mjs' }, { ...ports, root: '/repo', env, spawnFn });
     const [, , opts] = spawnFn.mock.calls.at(-1);
     expect(opts.env).toBe(env);
     expect(opts.env.GH_CALLER).toBe('parked-pr-conflict-watch-we');
@@ -299,7 +366,7 @@ it('health responder uses its own existing lease key and stops after lease loss'
 });
 
 it('two real processes contend on the responder runner-lock; losing owner cannot heartbeat or release', async () => {
-  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { mkdtempSync, rmSync, writeFileSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
   const { spawnSync } = await import('node:child_process');
