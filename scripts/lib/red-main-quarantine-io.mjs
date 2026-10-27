@@ -19,9 +19,9 @@
  *   node scripts/lib/red-main-quarantine-io.mjs show
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync, appendFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, appendFileSync, mkdirSync, realpathSync } from 'node:fs';
 import { writeAllSync } from './write-all-sync.mjs'; // a CLI's stdout must be drained before any process.exit
-import { resolve, dirname, join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFromTransportBranch, stageOnTransportBranch, assertPushRef } from './git-transport-branch.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
@@ -553,6 +553,10 @@ function cli(argv) {
   process.exit(2);
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
+const isEntryPoint = () => {
+  try { return !!process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)); }
+  catch { return false; }
+};
+if (isEntryPoint()) {
   try { cli(process.argv.slice(2)); } catch (e) { process.stderr.write(`${e.message}\n`); process.exit(1); }
 }

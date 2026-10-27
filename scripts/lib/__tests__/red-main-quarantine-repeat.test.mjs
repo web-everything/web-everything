@@ -1,8 +1,10 @@
 // @vitest-environment node
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { planSafetyNet, addEntries, validateQuarantineList } from '../red-main-quarantine.mjs';
 import { runSafetyNet, resolveQuarantineSettings, readTouchedFiles } from '../red-main-quarantine-io.mjs';
 import { NOTIFY_EVEN_IN_SHADOW } from '../../conveyor/health-smells-notify-list.mjs';
@@ -16,6 +18,18 @@ const temp = () => { const d = mkdtempSync(join(tmpdir(), 'repeat-quarantine-'))
 afterEach(() => dirs.splice(0).forEach((d) => rmSync(d, { recursive: true, force: true })));
 const plan = (o = {}) => planSafetyNet({ status: 'red', firstRedSha: rows[0].headSha, failedJobs: ['integration'], jobFailures: { integration: failure }, repeatRuns: rows, latestRunId: 2, touchedFiles: () => [], now, ...o });
 const proof = { kind: 'repeat-failed', runIds: [1, 2], shas: rows.map((r) => r.headSha), count: 2 };
+describe('quarantine CLI entry guard', () => {
+  it.each(['directory', 'file'])('runs through a symlinked %s and prints usage without remote IO', (kind) => {
+    const cli = fileURLToPath(new URL('../red-main-quarantine-io.mjs', import.meta.url));
+    const link = join(temp(), 'entry');
+    symlinkSync(kind === 'directory' ? dirname(cli) : cli, link);
+    const out = spawnSync(process.execPath, [kind === 'directory' ? join(link, 'red-main-quarantine-io.mjs') : link], {
+      encoding: 'utf8', timeout: 20_000,
+    });
+    expect(out.status, out.error?.message ?? out.stderr).toBe(2);
+    expect(out.stderr).toContain('usage: red-main-quarantine-io.mjs');
+  }, 30_000);
+});
 describe('R157 repeat failure quarantine', () => {
   it('twice-fails-untouched adds with 24h expiry, owner card, audit event and live notice', () => {
     let list = { version: 1, entries: [] }; let events;
@@ -26,7 +40,10 @@ describe('R157 repeat failure quarantine', () => {
     expect(list.entries[0]).toMatchObject({ test: file, proof, expiresAt: now + 86400000 });
     expect(events).toContainEqual(expect.objectContaining({ type: 'card-owed', test: file, expiresAt: now + 86400000 }));
     expect(events).toContainEqual(expect.objectContaining({ type: 'quarantine-added', proof }));
-    expect(smell.evaluate({ mainCiRuns: {} }, { now, quarantineSafetyNet: () => out })).toEqual([expect.objectContaining({ breach: true, subject: `quarantine:${file}` })]);
+    expect(smell.evaluate({ mainCiRuns: {} }, { now, quarantineSafetyNet: () => out })).toEqual([expect.objectContaining({
+      breach: true, subject: `quarantine:${file}`,
+      summary: expect.stringContaining('deterministic-failure quarantine, not flake evidence'),
+    })]);
   });
   it('planner records distinct run proof', () => expect(plan()).toMatchObject({ action: 'add', entries: [{ test: file, proof }] }));
   it('once => none', () => expect(plan({ repeatRuns: [rows[1]] })).toMatchObject({ action: 'none', why: expect.any(String) }));
@@ -64,6 +81,58 @@ describe('R157 repeat failure quarantine', () => {
     expect(write).not.toHaveBeenCalled();
   });
   it('duplicate run ids do not count twice', () => expect(plan({ repeatRuns: [rows[1], rows[1]] }).action).toBe('none'));
+  it('repeat evidence IO caps run and log reads at ten runs and maxTests logs per run', () => {
+    const history = Array.from({ length: 15 }, (_, i) => ({
+      ...rows[0], databaseId: i + 1, headSha: (i + 1).toString(16).padStart(40, '0'), attempt: 1,
+      createdAt: new Date(now - (30 - i) * 60_000).toISOString(),
+      updatedAt: new Date(now - (29 - i) * 60_000).toISOString(),
+    }));
+    const readJobs = vi.fn((id) => ({ failed: [
+      { id: id * 10 + 1, name: 'integration' }, { id: id * 10 + 2, name: 'test-shard (1)' },
+    ], jobs: [] }));
+    const readLog = vi.fn(() => failure);
+    const write = vi.fn(({ change }) => change({ version: 1, entries: [] }));
+    const out = runSafetyNet({ now, dir: temp(), mainCiRuns: { runs: history, failing: { runId: 15, jobs: ['integration'] } },
+      settings: { value: { ...resolveQuarantineSettings({ env: {} }).value, maxTests: 2 }, sources: {} },
+      mode: { value: 'quarantine', source: 'test' }, touchedFiles: () => [], readJobs, readLog,
+      readList: () => ({ ok: true, list: { version: 1, entries: [] } }), write, log: () => {} });
+    expect(out.error).toBeUndefined();
+    expect(out.plan.action).toBe('add');
+    // The latest run is read once for the current failure and reused by repeat evidence.
+    expect(readJobs.mock.calls.map(([id]) => id)).toEqual([15, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+    expect(readLog.mock.calls.map(([id]) => id)).toEqual([151,
+      ...Array.from({ length: 9 }, (_, i) => [(i + 6) * 10 + 1, (i + 6) * 10 + 2]).flat()]);
+    expect(write).toHaveBeenCalledOnce();
+  });
+  it('repeat evidence IO skips all logs for a historical run exceeding maxTests jobs', () => {
+    const readJobs = vi.fn((id) => ({ failed: id === 1
+      ? [{ id: 11, name: 'integration' }, { id: 12, name: 'test-shard (1)' }, { id: 13, name: 'soak-shard (1)' }]
+      : [{ id: 21, name: 'integration' }], jobs: [] }));
+    const readLog = vi.fn(() => failure);
+    const write = vi.fn();
+    const out = runSafetyNet({ now, dir: temp(), mainCiRuns: { runs: rows.map((r) => ({ ...r, attempt: 1 })), failing: { runId: 2, jobs: ['integration'] } },
+      settings: { value: { ...resolveQuarantineSettings({ env: {} }).value, maxTests: 2 }, sources: {} },
+      mode: { value: 'quarantine', source: 'test' }, touchedFiles: () => [], readJobs, readLog,
+      readList: () => ({ ok: true, list: { version: 1, entries: [] } }), write, log: () => {} });
+    expect(out.error).toBeUndefined();
+    expect(out.plan.action).toBe('none');
+    expect(readJobs.mock.calls.map(([id]) => id)).toEqual([2, 1]);
+    expect(readLog.mock.calls.map(([id]) => id)).toEqual([21]);
+    expect(write).not.toHaveBeenCalled();
+  });
+  it.each(['1; x', '1/../x', 0, -1, '', null])('repeat evidence IO rejects malformed run id %s before reading jobs', (databaseId) => {
+    const readJobs = vi.fn(() => ({ failed: [{ id: 21, name: 'integration' }], jobs: [] }));
+    const readLog = vi.fn(() => failure);
+    const write = vi.fn();
+    const out = runSafetyNet({ now, dir: temp(), mainCiRuns: { runs: [{ ...rows[0], databaseId, attempt: 1 }, { ...rows[1], attempt: 1 }], failing: { runId: 2, jobs: ['integration'] } },
+      mode: { value: 'quarantine', source: 'test' }, touchedFiles: () => [], readJobs, readLog,
+      readList: () => ({ ok: true, list: { version: 1, entries: [] } }), write, log: () => {} });
+    expect(out.error).toBeUndefined();
+    expect(out.plan.action).toBe('none');
+    expect(readJobs.mock.calls.map(([id]) => id)).toEqual([2]);
+    expect(readLog.mock.calls.map(([id]) => id)).toEqual([21]);
+    expect(write).not.toHaveBeenCalled();
+  });
   it('touched file between runs => none', () => expect(plan({ touchedFiles: () => [file] }).action).toBe('none'));
   it('touchedFiles unknown => none', () => expect(plan({ touchedFiles: () => null }).action).toBe('none'));
   it('touchedFiles throws => none', () => expect(plan({ touchedFiles: () => { throw Error('unknown'); } }).action).toBe('none'));

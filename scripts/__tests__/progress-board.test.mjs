@@ -510,6 +510,21 @@ describe('the output-mix section', () => {
     expect(r.stdout).toBe('imported\n');
   }, 30_000);
 
+  it.each(['directory', 'file'])('renders the CLI through a symlinked %s', (kind) => {
+    const link = join(sandbox, `entry-${kind}`);
+    symlinkSync(kind === 'directory' ? dirname(CLI) : CLI, link);
+    const out = join(sandbox, `symlink-${kind}.html`);
+    const r = spawnSync(process.execPath, [kind === 'directory' ? join(link, 'progress-board.mjs') : link,
+      `--state=${statePath}`, `--out=${out}`, '--no-gh'], {
+      encoding: 'utf8',
+      env: { ...process.env, WE_BOARD_NOW: NOW, WE_BOARD_NO_GH: '1', WE_BOARD_NO_GIT: '1' },
+      timeout: 20_000,
+    });
+    expect(r.status, r.error?.message ?? r.stderr).toBe(0);
+    expect(existsSync(out), `CLI exited without writing the board: ${r.stdout}`).toBe(true);
+    expect(readFileSync(out, 'utf8')).toContain('progress-board:generated');
+  }, 30_000);
+
   /**
    * The one case that runs the REAL derivation through the CLI. Every other `cli()` call in this file forces
    * `WE_BOARD_NO_GIT=1` for runtime, which means `main()`'s own call into `computeOutputMix` — the ROOT it
