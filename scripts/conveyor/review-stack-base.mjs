@@ -23,6 +23,8 @@
  *
  * Stack relations come only from GitHub's baseRefName naming an open, trusted lane PR's head branch. Ancestry
  * refines the contained commit but never establishes or reverses the relation; cyclic waits are dropped.
+ * Scope readers may opt into resolving a pushed lane branch without a PR after checking for an open base PR;
+ * otherwise an unresolved declared base remains unknown with a diagnostic cause.
  *
  * SETTING `stackAwareReview` (`on` | `off`), policy cascade (we:scripts/lib/policy-cascade.mjs): built-in default
  * `on` → platform preference `stackAwareReview` → tool override (`we:scripts/settings/stack-aware-review.json`) → env
@@ -47,6 +49,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const STACK_AWARE_REVIEW_DEFAULT = 'on';
 export const STACK_AWARE_REVIEW_ENV = 'WE_STACK_AWARE_REVIEW';
 export const STACK_MARKER = 'reviewed-stack';
+export const OPEN_PR_REF_LIMIT = 200; // must match readOpenPrRefs --limit
 
 const SHA = /^[0-9a-f]{40}$/;
 const LANE_REF = /^lane\/[A-Za-z0-9._/-]{1,200}$/;
@@ -110,11 +113,12 @@ export function stackAnswers(sets) {
 
 /**
  * Every stacked top among the open PRs, with its base. PURE: reuses `pr-stack.mjs#detectStacks` (the fix daemon's
- * detector), restricted to GitHub-declared bases with widened containment answers.
+ * detector), restricted to GitHub-declared bases with widened containment answers. A trusted declared base is
+ * authoritative across authors; ancestry detection alone still requires the ownership rule.
  * @param {Array<{pr:number, headRefName:string|null, headRefOid:string|null, baseRefName?:string|null, untrusted?:boolean}>} prs open PRs
  * @param {OffMainSets} sets
- * @param {{allowPair?:Function, log?:Function}} [o] `allowPair` — the ownership rule for a pair; by default the SAME one the fix daemon
- *   applies (`pr-stack.mjs#sameStackActor`: both PRs by the same, known actor), so a stack never forms between authors.
+ * @param {{allowPair?:Function, log?:Function}} [o] `allowPair` — the ownership rule for ancestry detection; by default the SAME one the fix daemon
+ *   applies (`pr-stack.mjs#sameStackActor`: both PRs by the same, known actor). Declared bases require trust and containment, regardless of author.
  * @returns {Map<number, {pr:number, ref:string, head:string, contained:string}>} top PR → its stack base
  */
 export function findStackBases(prs, sets, { allowPair = sameStackActor, log = (m) => process.stderr.write(m + '\n') } = {}) {
@@ -133,7 +137,7 @@ export function findStackBases(prs, sets, { allowPair = sameStackActor, log = (m
   const byHeadRef = new Map(trusted.filter((p) => LANE_REF.test(String(p.headRefName ?? ''))).map((p) => [p.headRefName, p]));
   for (const top of trusted) {
     const bottom = LANE_REF.test(String(top.baseRefName ?? '')) ? byHeadRef.get(top.baseRefName) : null;
-    if (!bottom || bottom.pr === top.pr || !allowPair(top, bottom)) continue;
+    if (!bottom || bottom.pr === top.pr) continue;
     const contained = containedCommit(sets, bottom.headRefOid, top.headRefOid);
     if (contained && SHA.test(contained)) {
       out.set(top.pr, { pr: bottom.pr, ref: bottom.headRefName, head: bottom.headRefOid, contained });
@@ -419,42 +423,109 @@ export function readBottomLanded({ marker, repo, root = ROOT, run = gitRun(root)
 }
 
 /**
- * Resolve every stacked top among the open PRs, end to end. Fails open to an empty Map.
+ * Resolve an open base PR first, then (with `prlessBase`) a pushed lane branch without a PR.
+ * Unresolved declared bases get a diagnostic cause. Fails open to an empty Map on unreadable evidence.
  * @param {{root?:string, env?:object, prs?:Array<{number:number, headRefName:string, headRefOid:string, isCrossRepository?:boolean}>,
- *   readRefs?:Function, readLanes?:Function, run?:Function, settingOn?:boolean}} o
+ *   readRefs?:Function, readLanes?:Function, run?:Function, settingOn?:boolean, prlessBase?:boolean, diag?:Map<number,{cause:string}>}} o
  *   `prs` — the open-PR list when the caller already has it (the reconcile pass does); otherwise it is read.
- * @returns {Map<number, {pr:number, ref:string, head:string, contained:string, tree:string, topHead:string}>}
+ * @returns {Map<number, {pr:number|null, ref:string, head:string, contained:string, tree:string, topHead:string}>}
  */
 export function readStackBases({ root = ROOT, env = process.env, prs = null, readRefs = readOpenPrRefs,
   readLanes = readOriginLaneTips, run = gitRun(root), settingOn = resolveStackAwareReview(env),
-  log = (m) => process.stderr.write(m + '\n') } = {}) {
+  prlessBase = false, diag = null, log = (m) => process.stderr.write(m + '\n') } = {}) {
   const out = new Map();
+  let rows = [];
+  let failure = 'refs-unreadable';
+  const diagnose = (pr, cause) => { try { diag?.set(pr, { cause }); } catch { /* best effort */ } };
+  const diagnoseAll = (cause) => {
+    for (const row of rows) if (!out.has(row.pr) && LANE_REF.test(row.baseRefName ?? '')) diagnose(row.pr, cause);
+  };
   try {
     if (!settingOn) return out;
-    const tips = readLanes(root);
-    if (!tips) return out;
     // Trust boundary: the SAME rule as the fix daemon's `pr-stack.mjs#readStacksForPass` (shared helpers, not a copy).
     // Base ref, fork status and AUTHOR always come from GitHub's own open-PR record, never from the caller's list (which may
-    // lack them): a PR with no record is a fork, and a pair needs one known actor on both sides (`sameStackActor`,
-    // applied by `findStackBases`). The caller's list only says which PRs, at which head, to look at.
+    // lack them): a PR with no record is a fork. Ancestry detection needs one known actor on both sides (`sameStackActor`);
+    // a trusted declared base is authoritative across authors. The caller's list only says which PRs, at which head, to look at.
     const refs = readRefs(root);
     const listed = Array.isArray(prs)
       ? prs.map((p) => ({ pr: Number(p.number), headRefName: p.headRefName ?? null, headRefOid: p.headRefOid ?? null }))
       : [...refs.entries()].map(([n, r]) => ({ pr: n, headRefName: r.headRefName, headRefOid: r.headRefOid }));
-    const rows = listed.map((r) => ({ ...r, baseRefName: refs.get(r.pr)?.baseRefName ?? null, ...stackRowFlags(refs.get(r.pr)) }));
-    const trusted = flagUntrustedStackRows(rows, tips)
+    rows = listed.map((r) => ({ ...r, baseRefName: refs.get(r.pr)?.baseRefName ?? null, ...stackRowFlags(refs.get(r.pr)) }));
+    if (!refs.size) {
+      for (const row of listed) diagnose(row.pr, 'refs-unreadable');
+      return out;
+    }
+    for (const row of listed) if (!refs.has(row.pr)) diagnose(row.pr, 'pr-record-missing');
+    failure = 'tips-unreadable';
+    const tips = readLanes(root);
+    if (!tips) { diagnoseAll(failure); return out; }
+    rows = flagUntrustedStackRows(rows, tips);
+    const rowsByPr = new Map(rows.map((row) => [row.pr, row]));
+    const openBases = new Map();
+    for (const [pr, ref] of refs) {
+      // Fork branch names belong to another repository and cannot own an origin base.
+      if (stackRowFlags(ref).fork) continue;
+      const previous = openBases.get(ref.headRefName);
+      const previousRow = previous ? rowsByPr.get(previous[0]) : null;
+      const row = rowsByPr.get(pr);
+      if (!previous || ((!previousRow || previousRow.untrusted) && row && !row.untrusted)) {
+        openBases.set(ref.headRefName, [pr, ref]);
+      }
+    }
+    failure = 'head-unreadable';
+    const trusted = rows
       .filter((r) => Number.isInteger(r.pr) && !r.untrusted && LANE_REF.test(r.headRefName));
-    const missing = trusted.filter((r) => { try { run(['cat-file', '-e', `${r.headRefOid}^{commit}`]); return false; } catch { return true; } });
+    // Include branch-only base tips in the same fetch/commit-set reads as PR heads.
+    const heads = [...trusted];
+    if (prlessBase) for (const top of trusted) {
+      if (!LANE_REF.test(top.baseRefName ?? '') || openBases.has(top.baseRefName)) continue;
+      const tip = tips.get(top.baseRefName);
+      if (SHA.test(String(tip ?? ''))) heads.push({ headRefName: top.baseRefName, headRefOid: tip });
+    }
+    const missing = heads.filter((r) => { try { run(['cat-file', '-e', `${r.headRefOid}^{commit}`]); return false; } catch { return true; } });
     if (missing.length) {
       try { run(['fetch', '-q', '--end-of-options', 'origin', ...missing.map((r) => r.headRefName)]); } catch { /* left unknown */ }
     }
-    const sets = readOffMainSets(trusted.map((r) => r.headRefOid), { root, run });
-    for (const [top, base] of findStackBases(trusted, sets, { log })) {
+    const sets = readOffMainSets(heads.map((r) => r.headRefOid), { root, run });
+    const bases = findStackBases(trusted, sets, { log });
+    for (const top of rows) {
+      if (!LANE_REF.test(top.baseRefName ?? '')) continue;
+      let cause = null;
+      const openBase = openBases.get(top.baseRefName);
+      const bottom = openBase ? rowsByPr.get(openBase[0]) : null;
+      if (top.untrusted || (prlessBase && !top.author)) cause = 'top-untrusted';
+      else if (openBase && (!bottom || bottom.untrusted)) cause = 'base-pr-untrusted';
+      // Preserve the review detector's declared-base semantics; the opt-in scope reader requires a known shared actor.
+      else if (prlessBase && bottom && !sameStackActor(top, bottom)) cause = 'base-pr-actor-mismatch';
+      else if (!sets.has(top.headRefOid) || (bottom && !sets.has(bottom.headRefOid))) cause = 'head-unreadable';
+      else if (openBase) { if (!bases.has(top.pr)) cause = 'no-containment'; }
+      else if (!prlessBase) cause = 'base-branch-missing';
+      // At the read limit an unseen open PR may own this base; keep the main basis until ownership is provable.
+      else if (refs.size >= OPEN_PR_REF_LIMIT) cause = 'refs-incomplete';
+      else {
+        const head = tips.get(top.baseRefName);
+        if (!SHA.test(String(head ?? ''))) cause = 'base-branch-missing';
+        else if (!sets.has(head)) cause = 'head-unreadable';
+        else {
+          const contained = containedCommit(sets, head, top.headRefOid);
+          if (contained !== head) cause = 'base-not-contained';
+          else bases.set(top.pr, { pr: null, ref: top.baseRefName, head, contained });
+        }
+      }
+      if (cause) { bases.delete(top.pr); diagnose(top.pr, cause); }
+    }
+    for (const [top, base] of bases) {
       const topHead = trusted.find((r) => r.pr === top).headRefOid;
       const tree = stackBaseTree({ contained: base.contained, topHead, root, run });
       if (tree) out.set(top, { ...base, tree, topHead });
+      else diagnose(top, 'tree-unreadable');
     }
-  } catch { /* fail open */ }
+  } catch {
+    // A failed GitHub read may leave no rows from which to recover the declared bases.
+    if (!rows.length && Array.isArray(prs)) {
+      for (const pr of prs) diagnose(Number(pr?.number), failure);
+    } else diagnoseAll(failure);
+  }
   return out;
 }
 
