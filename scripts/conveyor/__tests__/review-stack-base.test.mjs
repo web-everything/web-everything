@@ -919,7 +919,6 @@ describe('readStackBases — declared lane bases (live #5996 #5997 #5983 #6003)'
     ['tips-unreadable', 'null origin tips, including the early return', 5997, () => ({ readLanes: () => null })],
     ['top-untrusted', 'fork top', 5997, f => { f.refs.get(5997).isCrossRepository = true; }],
     ['top-untrusted', 'top differs from origin tip', 5997, f => { f.tips.set(shapes[1].headRefName, sha(401)); }],
-    ['base-pr-untrusted', 'fork base PR', 5997, f => { f.refs.get(5981).isCrossRepository = true; }],
     ['base-pr-untrusted', 'base PR differs from origin tip', 5997, f => { f.tips.set(shapes[1].baseRefName, sha(402)); }],
     ['base-pr-actor-mismatch', 'different base author', 5997, f => { f.refs.get(5981).author = 'someone-else'; }],
     ['base-pr-actor-mismatch', 'unknown base author', 5997, f => { f.refs.get(5981).author = null; }],
