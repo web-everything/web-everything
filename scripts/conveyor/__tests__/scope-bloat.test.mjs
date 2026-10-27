@@ -159,6 +159,98 @@ describe('card scope helpers', () => {
   });
 });
 
+describe('PR-less bases already on main — resolver and scope-bloat wiring', () => {
+  const BASE = 'b'.repeat(40);
+  const TOP = 'c'.repeat(40);
+  const ROOT = 'd'.repeat(40);
+  const MAIN = 'e'.repeat(40);
+  const TREE = 'f'.repeat(40);
+  const fixture = (shape, ancestryError = null) => {
+    // Full ancestry differs from the off-main sets: BASE is excluded from both rev-list reads.
+    const parents = new Map([[ROOT, []], [BASE, [ROOT]], [MAIN, [BASE]],
+      [TOP, shape === 'second-parent' ? [ROOT, BASE] : [shape === 'uncontained' ? ROOT : BASE]]]);
+    const reachable = (head, first = false) => {
+      const seen = new Set();
+      const visit = node => {
+        if (seen.has(node)) return;
+        seen.add(node);
+        const next = parents.get(node) ?? [];
+        for (const parent of first ? next.slice(0, 1) : next) visit(parent);
+      };
+      visit(head);
+      return seen;
+    };
+    const topHead = shape === 'equal-tip' ? BASE : TOP;
+    const pr = { number: 60100 + ['first-parent', 'second-parent', 'equal-tip', 'uncontained'].indexOf(shape), headRefName: 'lane/top', headRefOid: topHead,
+      baseRefName: 'lane/base', title: 'fix ancestry', files: [{ path: 'own.mjs' }] };
+    const refs = new Map([[pr.number, { ...pr, author: 'app/plateau-worker', isCrossRepository: false }]]);
+    const tips = new Map([[pr.headRefName, topHead], [pr.baseRefName, BASE]]);
+    const ancestryCalls = [];
+    const run = args => {
+      if (args[0] === 'cat-file') return '';
+      if (args[0] === 'rev-list') {
+        expect(args.at(-1)).toBe('^origin/main');
+        return [...reachable(args.at(-2), args.includes('--first-parent'))]
+          .filter(sha => !reachable(MAIN).has(sha)).join('\n');
+      }
+      if (args[0] === 'merge-base' && args.includes('--is-ancestor')) {
+        ancestryCalls.push(args);
+        expect(args).toEqual(['merge-base', '--is-ancestor', '--end-of-options', BASE, topHead]);
+        if (ancestryError) throw Object.assign(new Error('ancestry read failed'), { status: ancestryError });
+        if (!reachable(topHead).has(BASE)) throw Object.assign(new Error('not an ancestor'), { status: 1 });
+        return '';
+      }
+      if (args[0] === 'merge-base') return BASE;
+      if (args[0] === 'merge-tree') return TREE;
+      throw new Error(`unexpected git command: ${args.join(' ')}`);
+    };
+    const read = (options = {}) => readStackBases({ root: '/repo', env: {}, prs: [pr], settingOn: true,
+      prlessBase: true, readRefs: () => refs, readLanes: () => tips, run, log: () => {}, ...options });
+    return { pr, read, ancestryCalls, expected: { pr: null, ref: pr.baseRefName,
+      head: BASE, contained: BASE, tree: TREE, topHead } };
+  };
+
+  it.each(['first-parent', 'second-parent', 'equal-tip'])('resolves a main-reachable base through %s ancestry and removes the unknown hold', shape => {
+    const f = fixture(shape);
+    const diag = new Map();
+    expect(f.read({ diag }).get(f.pr.number)).toEqual(f.expected);
+    expect(diag.size).toBe(0);
+    expect(f.ancestryCalls).toHaveLength(1);
+    const events = [];
+    const stackReads = [];
+    const [out] = enrichPrsWithScopeBloat([f.pr], {
+      repo: 'web-everything/web-everything', env: {}, readBaseSha: () => MAIN,
+      readNet: () => { throw new Error('must read the resolved stack diff'); },
+      readStacks: (_prs, { diag }) => f.read({ diag }),
+      readStackFiles: base => { stackReads.push(base); return ['own.mjs']; },
+      emitEvent: event => events.push(event),
+    });
+    expect(stackReads).toEqual([f.expected]);
+    expect(out.scopeBloatUnknown).toBeUndefined();
+    expect(out.scopeBloat).toBeUndefined();
+    expect(events).toEqual([]);
+  });
+
+  it.each([
+    ['uncontained', null, 'base-not-contained'],
+    ['first-parent', 128, 'head-unreadable'],
+  ])('holds %s ancestry with read status %s', (shape, status, cause) => {
+    const f = fixture(shape, status);
+    const diag = new Map();
+    expect(f.read({ diag }).has(f.pr.number)).toBe(false);
+    expect(diag.get(f.pr.number)).toEqual({ cause });
+    expect(f.ancestryCalls).toHaveLength(1);
+  });
+
+  it('keeps main-reachable PR-less bases out of review-side results', () => {
+    const f = fixture('first-parent');
+    const diag = new Map();
+    expect(f.read({ prlessBase: false, diag }).size).toBe(0);
+    expect(diag.get(f.pr.number)).toEqual({ cause: 'base-branch-missing' });
+    expect(f.ancestryCalls).toEqual([]);
+  });
+});
+
 describe('enrichPrsWithScopeBloat — the io shell holds unknown stack diffs and remembers the refresh', () => {
   const pr = (over = {}) => ({ number: 4361, title: 'WE #xykwe0h: build', headRefName: 'lane/build-outcomes', headRefOid: 'a'.repeat(40),
     files: FILES_4361.map((path) => ({ path, additions: 1, deletions: 0 })), comments: [], ...over });
