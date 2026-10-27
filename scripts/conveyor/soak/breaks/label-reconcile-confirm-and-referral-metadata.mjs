@@ -21,6 +21,7 @@ export default {
       && planner.includes("review.findings?.confirm === 'accept'")
       && planner.includes('laterReviewHold(reviews')
       && planner.includes('const fresh = readLive()')
+      && planner.includes('at >= observed.startedAt')
       && reader.includes("fields = 'number,state,labels,headRefOid'");
   },
   async run({ sourceRoot = ROOT, log } = {}) {
@@ -44,9 +45,11 @@ export default {
     const violations = [];
     // Round 3 (red team on c3bd94bd0): an unanswered confirm, a verdict landing between the plan and the
     // write, and a native GitHub change request must each keep the holds.
-    const holding = ['changes', 'later-changes', 'awaiting-confirm', 'racing-changes', 'native-changes'];
+    // during-run-changes: posted after the run read the thread but before its advise step finished.
+    const holding = ['changes', 'later-changes', 'awaiting-confirm', 'racing-changes', 'native-changes',
+      'during-run-changes'];
     for (const scenario of ['changes', 'accept', 'abstain', 'later-changes', 'newer-accept',
-      'awaiting-confirm', 'racing-changes', 'native-changes']) {
+      'awaiting-confirm', 'racing-changes', 'native-changes', 'during-run-changes']) {
       const confirm = ['changes', 'abstain'].includes(scenario) ? scenario
         : scenario === 'awaiting-confirm' ? undefined : 'accept';
       let labels = ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held', 'ready-to-merge'];
@@ -61,6 +64,7 @@ export default {
       const operatorChanges = { author: { login: 'chalbert' },
         body: '🔁 review — changes requested\nRemaining operator blocker', createdAt: '2026-10-26T01:02:00Z' };
       if (['later-changes', 'newer-accept'].includes(scenario)) comments.push(operatorChanges);
+      if (scenario === 'during-run-changes') comments.push({ ...operatorChanges, createdAt: '2026-10-26T01:00:30Z' });
       // racing-changes: the verdict is posted after the first thread read, before the final one.
       let threadReads = 0;
       const readComments = () => (scenario === 'racing-changes' && ++threadReads > 1

@@ -47,13 +47,14 @@ export function planLabelStateReconcile({ repo, pr, review = null, redTeam = nul
     const confirmedChanges = review.findings?.confirm === 'changes';
     // Only an affirmative recorded accept clears: an unanswered confirm may still end in abstain or changes.
     const confirmedAccept = review.findings?.confirm === 'accept';
-    // A completed panel cannot erase a subsequent trusted verdict/hold. Unknown or tied times
-    // cannot prove the accept supersedes it; a newer completed accept can reconcile it next tick.
+    // A completed panel cannot erase a trusted verdict/hold it never read: anything posted since the run read
+    // the thread (startedAt), including while it was still running. Unknown or tied times cannot prove the
+    // accept supersedes it; a newer completed accept can reconcile it next tick.
     const laterHold = pr.comments.some(c => {
       if (!isTrustedMarkerAuthor(c) || !isLaterVerdictBody(c?.body)) return false;
       const at = Date.parse(c.createdAt ?? c.created_at ?? '');
-      return !Number.isFinite(at) || at >= observed.completedAt;
-    }) || (Array.isArray(reviews) && laterReviewHold(reviews, new Date(observed.completedAt).toISOString()));
+      return !Number.isFinite(at) || at >= observed.startedAt;
+    }) || (Array.isArray(reviews) && laterReviewHold(reviews, new Date(observed.startedAt).toISOString()));
     const referrals = liveReferralState(pr, { repo, pr: pr.number });
     const settled = !referrals.malformed && !referrals.pending.length && !referrals.blocked.length
       && Array.isArray(verdict?.pendingReferrals) && !verdict.pendingReferrals.length
@@ -98,21 +99,25 @@ export function sweepLabelStateReconcile({ prs = [], repo, resolveRepo = () => r
       const first = readLive();
       if (!first) continue;
       const { pr } = first;
-      let review = null, redTeam = null;
       // Independent evidence planes: an unavailable run store cannot invalidate a recorded red-team result.
-      try {
-        reviews ??= readReviews();
-        const latest = reviews.filter(r => r.repo === slug && r.pr === pr.number)
-          .sort((a, b) => b.startedAt - a.startedAt)[0];
-        if (latest?.head === pr.headRefOid) review = readReview(latest.id);
-      } catch { /* unknown review state never clears its labels */ }
-      try { redTeam = readRedTeam({ repo: slug, pr: pr.number, head: pr.headRefOid }); } catch { /* retain unknown state */ }
-      if (!planLabelStateReconcile({ repo: slug, pr, review, redTeam, reviews: first.native })) continue;
-      // Evidence reads can span a push or a new verdict. Never apply the old head's clearance to the new head,
-      // and re-plan from the final read so a hold that arrived meanwhile is honoured.
+      // `uncached` re-reads the run index so a newer same-head run started mid-sweep is seen before a write.
+      const readStored = (uncached = false) => {
+        let review = null, redTeam = null;
+        try {
+          if (uncached || !reviews) reviews = readReviews();
+          const latest = reviews.filter(r => r.repo === slug && r.pr === pr.number)
+            .sort((a, b) => b.startedAt - a.startedAt)[0];
+          if (latest?.head === pr.headRefOid) review = readReview(latest.id);
+        } catch { /* unknown review state never clears its labels */ }
+        try { redTeam = readRedTeam({ repo: slug, pr: pr.number, head: pr.headRefOid }); } catch { /* retain unknown state */ }
+        return { review, redTeam };
+      };
+      if (!planLabelStateReconcile({ repo: slug, pr, ...readStored(), reviews: first.native })) continue;
+      // Evidence reads can span a push, a new verdict or a new run. Never apply the old head's clearance to the
+      // new head, and re-plan from a final read of every plane so a hold that arrived meanwhile is honoured.
       const fresh = readLive();
       if (!fresh || fresh.pr.headRefOid !== pr.headRefOid) continue;
-      const plan = planLabelStateReconcile({ repo: slug, pr: fresh.pr, review, redTeam, reviews: fresh.native });
+      const plan = planLabelStateReconcile({ repo: slug, pr: fresh.pr, ...readStored(true), reviews: fresh.native });
       if (!plan) continue;
       if (!dryRun) {
         for (const label of plan.add) provider.ensureLabel(slug, label, RED_TEAM_STATUS_LABEL_META[label]);

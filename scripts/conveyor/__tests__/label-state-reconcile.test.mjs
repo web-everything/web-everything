@@ -90,11 +90,13 @@ describe('planLabelStateReconcile', () => {
     expect(reviewRunEvidence(stored).completedAt).toBeGreaterThan(Date.parse(verdict.createdAt));
     expect(planOf({ repo, pr: live, review: stored }).to).toEqual(['ready-to-merge']);
   });
-  it.each(['missing', 'invalid', 'same-time', 'REST'])
+  it.each(['missing', 'invalid', 'same-time', 'during-run', 'REST'])
   ('a trusted changes verdict with %s timing cannot be cleared by the stored accept', kind => {
     const verdict = comment('🔁 review — changes requested\nRemaining blocker');
     if (kind === 'invalid') verdict.createdAt = 'invalid';
-    if (kind === 'same-time') verdict.createdAt = '2026-10-26T01:01:00Z';
+    // The run read the thread at 01:00:00 and finished advise at 01:01:00; it never saw either verdict.
+    if (kind === 'same-time') verdict.createdAt = '2026-10-26T01:00:00Z';
+    if (kind === 'during-run') verdict.createdAt = '2026-10-26T01:00:30Z';
     if (kind === 'REST') {
       delete verdict.author;
       verdict.user = { login: 'chalbert' };
@@ -105,7 +107,7 @@ describe('planLabelStateReconcile', () => {
   });
   it.each(['older', 'untrusted', 'quoted'])('%s changes text cannot veto a settled accept', kind => {
     const verdict = { ...comment('🔁 review — changes requested'), createdAt: '2026-10-26T01:02:00Z' };
-    if (kind === 'older') verdict.createdAt = '2026-10-26T01:00:00Z';
+    if (kind === 'older') verdict.createdAt = '2026-10-26T00:59:00Z';
     if (kind === 'untrusted') verdict.author.login = 'attacker';
     if (kind === 'quoted') verdict.body = `Quoted example:\n${verdict.body}`;
     expect(planOf({ repo, pr: pr(42,
@@ -131,8 +133,9 @@ describe('planLabelStateReconcile', () => {
     stored.findings.confirm = 'abstain';
     expect(planRecordDecision(stored)).toEqual({ abstain: true });
   });
-  it.each(['CHANGES_REQUESTED', 'COMMENTED'])('a later native %s review preserves holds and drops ready', state => {
-    const reviews = [{ state, user: { login: 'chalbert' }, submitted_at: '2026-10-26T01:02:00Z' }];
+  it.each([['CHANGES_REQUESTED', '01:02'], ['COMMENTED', '01:02'], ['CHANGES_REQUESTED', '01:00:30']])
+  ('a later native %s review (%s, after the run read the thread) preserves holds and drops ready', (state, time) => {
+    const reviews = [{ state, user: { login: 'chalbert' }, submitted_at: `2026-10-26T${time.padEnd(8, ':00')}Z` }];
     expect(planOf({ repo, reviews, pr: pr(42,
       ['review:changes', 'fix-waiting:host-busy', 'ready-to-merge'], []), review: review(42) }).to)
       .toEqual(['review:changes', 'fix-waiting:host-busy']);
@@ -276,6 +279,21 @@ describe('sweepLabelStateReconcile', () => {
       const [row] = sweepLabelStateReconcile(io);
       expect(row.labelsReconciled.to).toEqual(['review:changes', 'fix-waiting:host-busy', 'red-team:clear']);
     }
+  });
+  it('a newer same-head run recorded before the write is re-read and its changes confirmation keeps holds', () => {
+    const io = fixture(), accepted = review(5954), changed = review(5954);
+    changed.id = 'review-pr-newer';
+    changed.findings.confirm = 'changes';
+    changed.stepTimings = [{ step: 'read', startedAt: '2026-10-26T02:00:00Z' },
+      { step: 'advise', finishedAt: '2026-10-26T02:01:00Z' }];
+    let indexReads = 0;
+    io.readReviews = () => (++indexReads > 1 ? [reviewRunEvidence(accepted), reviewRunEvidence(changed)]
+      : [reviewRunEvidence(accepted)]);
+    io.readReview = id => (id === changed.id ? changed : accepted);
+    const [row] = sweepLabelStateReconcile(io);
+    expect(indexReads).toBe(2);
+    expect(row.labelsReconciled.to).toEqual(['review:changes', 'fix-waiting:host-busy', 'red-team:clear']);
+    expect(row.labelsReconciled.evidence.review).toEqual({ id: 'review-pr-newer', sha: head });
   });
   it('a stale plan with nothing left to change after the final read writes nothing', () => {
     const io = fixture(), live = io.prs[0];
