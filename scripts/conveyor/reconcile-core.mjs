@@ -1164,6 +1164,75 @@ export function markIdleFinishedSessions(agents, idleFinishedInfoFor, nowMs, thr
 }
 
 /**
+ * we:scripts/conveyor/reconcile-core.mjs#releasedFixClaim — the PR's CURRENT released fix claim, or null.
+ * Live case (PR #5492, 2026-10-20): the fixer posted `🔓 conveyor fix-end` at head b0be22ada, yet its pre-warmed
+ * bg-spare process stayed alive for 2h, so review and fix dispatch both refused the PR as `live-process`.
+ * Returns the latest `{ releasedAtMs, head, who }` plus per-session `releases` only when ALL hold
+ * (fail closed on every doubt):
+ *   - the latest trusted fix marker (begin or end) on the thread is a fix-END, so no claim is held now;
+ *   - that end names a head sha, and it is the PR's CURRENT head (a release at an older head says nothing
+ *     about work on this one);
+ *   - every marker's `createdAt` is readable and ordering is unambiguous;
+ *   - every marker names a non-blank identity (`**Who:**` for begin, release line for end).
+ * Earlier releases at this head remain evidence for their own sessions, until that session claims again.
+ * @param {object} pr
+ * @returns {{releasedAtMs:number, head:string, who:string, releases:Array<{releasedAtMs:number, head:string, who:string}>}|null}
+ */
+export function releasedFixClaim(pr) {
+  const head = String(pr?.headRefOid ?? '');
+  if (!head) return null;
+  const markers = (Array.isArray(pr?.comments) ? pr.comments : [])
+    .filter((c) => isTrustedMarkerAuthor(c) && typeof c?.body === 'string')
+    .map((c) => ({ c, body: c.body.trimStart(), at: Date.parse(c.createdAt) }))
+    .filter((m) => m.body.startsWith(FIX_BEGIN_MARKER) || m.body.startsWith(FIX_END_MARKER));
+  if (!markers.length || markers.some((m) => !Number.isFinite(m.at))) return null;
+  markers.sort((a, b) => a.at - b.at);
+  const last = markers.at(-1);
+  // Equal timestamps are ambiguous ordering: array order must never decide, so fail closed.
+  if (markers.some((m, i) => i > 0 && markers[i - 1].at === m.at)) return null;
+  if (!last.body.startsWith(FIX_END_MARKER)) return null; // a later fix-begin = claim held again
+  const named = /at `([0-9a-f]{7,40})`/.exec(last.body)?.[1];
+  if (!named || !sameHeadSha(named, head)) return null;
+  const who = /^`([^`\r\n]*)` released the fix claim\b/m.exec(last.body)?.[1];
+  if (!who?.trim()) return null;
+  const releasesBySession = new Map();
+  for (const marker of markers) {
+    const isEnd = marker.body.startsWith(FIX_END_MARKER);
+    const identity = (isEnd
+      ? /^`([^`\r\n]*)` released the fix claim\b/m
+      : /^\*\*Who:\*\* `([^`\r\n]*)`/m).exec(marker.body)?.[1];
+    if (!identity?.trim()) return null; // cannot safely attribute a later claim to a session
+    releasesBySession.delete(identity); // a renewed claim or invalid release supersedes its earlier evidence
+    const releaseHead = isEnd && /at `([0-9a-f]{7,40})`/.exec(marker.body)?.[1];
+    if (releaseHead && sameHeadSha(releaseHead, head)) {
+      releasesBySession.set(identity, { releasedAtMs: marker.at, head, who: identity });
+    }
+  }
+  return { releasedAtMs: last.at, head, who, releases: [...releasesBySession.values()] };
+}
+
+/**
+ * we:scripts/conveyor/reconcile-core.mjs#isReleasedClaimSession — is this live-pid session provably the
+ * finished one behind a RELEASED fix claim? True only when the claim was released at this head
+ * ({@link releasedFixClaim}) AND its non-empty string `sessionId` exactly matches one release's `who`
+ * AND the session started BEFORE that release (a session started later is new work)
+ * AND it is not a reviewer (reviews hold no fix claim) AND it is not blocked on a permission prompt
+ * (that stays its own, louder kind). Missing/mismatched identity or unreadable `startedAt` => false (still live).
+ */
+export function isReleasedClaimSession(agent, claimRelease) {
+  if (!claimRelease || !Number.isFinite(claimRelease.releasedAtMs)) return false;
+  if (!agent || agent.pidAlive !== true) return false; // only a PROBED-live pid is exempted; unknown stays liveness-unknown
+  if (typeof agent.sessionId !== 'string' || !agent.sessionId) return false;
+  if (agent.awaitingInfraCooloff === true) return false;
+  if (isAwaitingPermission(agent) || agent.permissionBlocked === true) return false;
+  if (/^review-/.test(String(agent.name ?? '')) || /^review-/.test(String(agent.sessionSlug ?? ''))) return false;
+  const started = startedAtMs(agent.startedAt);
+  const releases = Array.isArray(claimRelease.releases) ? claimRelease.releases : [claimRelease];
+  return Number.isFinite(started) && releases.some((release) => release.who === agent.sessionId
+    && Number.isFinite(release.releasedAtMs) && started < release.releasedAtMs);
+}
+
+/**
  * we:scripts/conveyor/reconcile-core.mjs#assessLiveness — the liveness verdict for ONE PR, over the sessions
  * bound to it. Pure, and it is refusal 4 in code.
  *
@@ -1241,9 +1310,10 @@ export function markIdleFinishedSessions(agents, idleFinishedInfoFor, nowMs, thr
  * @param {Array<{agent:object, cwd:string, sha:string}>} bound
  * @returns {{kind:string, pid:number|null, cwd:string, sha:string, sessionId:string|null, why:string}|null}
  */
-export function assessLiveness(bound) {
+export function assessLiveness(bound, { claimRelease = null } = {}) {
   const isFinished = (agent) => {
     if (agent?.awaitingInfraCooloff === true) return false; // #4149 — the record's cool-off outranks `state`
+    if (isReleasedClaimSession(agent, claimRelease)) return true;
     const state = String(agent?.state ?? '').toLowerCase();
     return state === 'done' || state === 'stopped' || agent?.selfReportedDone === true || agent?.hung === true
       || agent?.authExpired === true || agent?.idleFinished === true;
@@ -2569,7 +2639,19 @@ export function planReconcile({
       });
     }
 
-    const live = assessLiveness(bound);
+    // Released-claim sessions (PR #5492): a live pid whose fix claim was released at this head does not count.
+    // Logged with its reason; the unreleased/unknown case falls through to the unchanged liveness ranks.
+    const claimRelease = releasedFixClaim(pr);
+    for (const b of bound) {
+      if (b.agent?.pidAlive === true && isReleasedClaimSession(b.agent, claimRelease)) {
+        notes.push({
+          kind: 'released-claim-session-ignored', prNumber, pid: Number.isInteger(b.agent.pid) ? b.agent.pid : null,
+          sessionId: b.agent.sessionId ?? null, cwd: b.cwd, head: claimRelease.head,
+          text: `PR #${prNumber}: ignoring live pid ${b.agent.pid ?? '?'} (${b.cwd}) — its fix claim was released (fix-end at ${String(claimRelease.head).slice(0, 9)}) and no new claim is held, so it is finished work, not live work`,
+        });
+      }
+    }
+    const live = assessLiveness(bound, { claimRelease });
     if (live) {
       refuse(live.kind, {
         pid: live.pid, cwd: live.cwd, sha: live.sha, sessionId: live.sessionId, why: live.why,
@@ -2788,9 +2870,46 @@ export function planReconcile({
     const bouncedRealRed = isBouncedRealRed({ pr, phase, check, requiredChecks });
     // At the review-fix cap an unused operator-directed round still belongs to the existing fix path below.
     // Routing it through CI healing would refuse at the cap before that path can carry the allowance.
-    const ciRepairOwed = phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red')
-      || (bouncedRealRed && !(sendBackRound && roundAttempts() >= effectiveRoundCap));
-    if (!(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
+    // Ignore cancellations when identifying a review-gate-only failure; retain CI repair if review cannot accept them.
+    // Inspect all visible checks so a non-required failure still keeps its repair owner.
+    const reviewRollup = collapseRollupToLatestPerName(pr?.statusCheckRollup);
+    const visibleRealRed = reviewRollup
+      .filter(row => FAILED_CHECK_CONCLUSIONS.filter(c => c !== 'CANCELLED')
+        .includes(String(row?.conclusion || row?.state || '').toUpperCase()))
+      .filter(row => row?.name !== 'merge-gate' || !reviewHoldGatesOnlyRed([row], ['merge-gate']))
+      .map(row => row?.name || row?.context);
+    const reviewHoldHasRealRed = withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))
+      // Required review gates keep the existing review-ci / review-hold-red refusals.
+      && !requiredChecks?.includes('review-gate')
+      // A non-required merge-gate is reported only; required failures still route via check.state below.
+      && visibleRealRed.includes('review-gate') && visibleRealRed.some(name => name !== 'review-gate' && name !== 'merge-gate');
+    const reviewGateOnlyRed = withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))
+      && !requiredChecks?.includes('review-gate')
+      && visibleRealRed.length > 0 && visibleRealRed.every(name => name === 'review-gate');
+    const reviewGateHasChanges = withPhase.labels.some(l => ['review:changes', ADVISORY_LABELS.CHANGES].includes(l));
+    // Leave operator-directed repairs to the ruling branches below, including their caps and ladder.
+    const reviewGateRulingOwed = reviewGateOnlyRed && (pr?.ignoredRulings?.matches?.length > 0
+      || (Array.isArray(pr?.blockRuledReferrals) && pr.blockRuledReferrals.length > 0));
+    const cancelledReviewWork = reviewGateOnlyRed && reviewRollup
+      .some(row => String(row?.status).toLowerCase() === 'completed' && String(row?.conclusion).toLowerCase() === 'cancelled');
+    // The #5925 exception is only cancelled smoke; other evidence and review timing stay intact.
+    const reviewPr = { ...pr, statusCheckRollup: reviewRollup.map(row =>
+      (row?.name ?? row?.context) === 'smoke' && String(row?.status).toLowerCase() === 'completed' && String(row?.conclusion).toLowerCase() === 'cancelled'
+        ? { ...row, conclusion: 'neutral' } : row) };
+    const cancelledReviewNeedsRepair = cancelledReviewWork && !reviewStartGate({
+      headSha: reviewPr.headRefOid, requiredChecks, checks: reviewPr.statusCheckRollup, policy: reviewPr.reviewTiming,
+    }).allowed;
+    // A rejected cancellation or changes label keeps CI ownership; operator rulings keep their repair ladder.
+    const ciRepairOwed = (!reviewGateOnlyRed || (!reviewGateRulingOwed && (reviewGateHasChanges || cancelledReviewNeedsRepair))) && (phase === 'ci-red' || (phase === 'needs-human' && (check.state === 'red' || reviewHoldHasRealRed))
+      || (bouncedRealRed && !(sendBackRound && roundAttempts() >= effectiveRoundCap)));
+    if (reviewGateOnlyRed && !reviewGateHasChanges && !reviewGateRulingOwed
+        && !cancelledReviewNeedsRepair
+        && (phase === 'ci-red' || (phase === 'needs-human' && (cancelledReviewWork || check.state !== 'green')))) {
+      dispatchReviewRow({ pr: reviewPr, requiredChecks, withPhase, base, attempts: roundAttempts(),
+        roundCap: effectiveRoundCap, now, refuse, refuseCapExhausted, dispatch });
+      continue;
+    }
+    if (!reviewHoldHasRealRed && !(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
         && reviewCi.affected.every(row => row.name === 'review-gate')) {
       refuse('review-ci', { ...withPhase, ci: reviewCi, why: 'required review-gate must succeed before review; resolve the review-dependent required-check configuration' });
       continue;
@@ -2903,7 +3022,7 @@ export function planReconcile({
     }
 
     const heldGates = ciRepairOwed ? splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required : [];
-    const reviewHoldRed = ciRepairOwed
+    const reviewHoldRed = ciRepairOwed && !reviewHoldHasRealRed
       && withPhase.labels.some(l => ['review:human', 'review:pending', 'review:changes', 'review:held-mechanical'].includes(l))
       && reviewHoldGatesOnlyRed(pr?.statusCheckRollup, requiredChecks);
     if (reviewHoldRed) {
@@ -3274,7 +3393,7 @@ export function planReconcile({
     // attached. How far up the fixer-escalation ladder it goes (resend, stronger model with a failing test first,
     // cross-provider when available, then the operator as a needs-you note, an arbiter later) is the configured
     // ladder's call, counted in heads it came back on plus fixer turns that ended without a new head.
-    if (phase === 'needs-human' && pr?.ignoredRulings?.matches?.length) {
+    if ((phase === 'needs-human' || reviewGateRulingOwed) && pr?.ignoredRulings?.matches?.length) {
       const ig = pr.ignoredRulings;
       const files = ig.matches.map((m) => m.finding.file ?? '(no file)');
       // WHICH RUNG: the configured ladder (`we:scripts/lib/fixer-escalation-policy.mjs`) decides from how many heads the
@@ -3311,7 +3430,7 @@ export function planReconcile({
     // Live 2026-10-12, #5009: a carried operator block survived on the new head, but verdict write-back was
     // refused (0 juror findings), leaving the label stuck `review:pending`. The current-head block ruling
     // owes a fix regardless of which review label landed.
-    if ((phase === 'needs-human' || phase === 'needs-review') && Array.isArray(pr?.blockRuledReferrals) && pr.blockRuledReferrals.length) {
+    if ((phase === 'needs-human' || phase === 'needs-review' || reviewGateRulingOwed) && Array.isArray(pr?.blockRuledReferrals) && pr.blockRuledReferrals.length) {
       const attempts = roundAttempts();
       // An operator ruling WITH A DIRECTION on this head grants ONE directed takeover round past the cap
       // (`fix.operatorRulingExtraRounds`), its brief carrying the ruling text verbatim. Once per ruling; see
