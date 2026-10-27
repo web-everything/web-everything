@@ -26,17 +26,30 @@
  *                                    (the CI shards upload theirs as `timing-<suite>-<shard>` artifacts)
  */
 
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { dirname, join, relative, resolve, sep } from 'node:path';
+import { readFileSync, writeFileSync, existsSync, realpathSync, mkdtempSync, symlinkSync, rmSync } from 'node:fs';
+import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = resolve(HERE, '..', '..');
 export const TIMINGS_FILE = join(HERE, 'test-timings.json');
 
+/** Timings are portable POSIX repository-relative filenames, never checkout paths. */
+export function assertTimingKeys(timings) {
+  for (const map of [timings.unit ?? {}, timings.soak ?? {}]) {
+    for (const key of Object.keys(map)) {
+      if (!key || key.includes('\\') || /^[A-Za-z]:/.test(key) || key.split('/').some(part => !part || part === '.' || part === '..')) {
+        throw new Error('Invalid timing key: expected a repository-relative filename without parent traversal. Regenerate timings from reports in the matching checkout.');
+      }
+    }
+  }
+}
+
 export function loadTimings(file = TIMINGS_FILE) {
   if (!existsSync(file)) return { unit: {}, soak: {} };
   const parsed = JSON.parse(readFileSync(file, 'utf8'));
+  assertTimingKeys(parsed);
   return { unit: parsed.unit ?? {}, soak: parsed.soak ?? {} };
 }
 
@@ -80,12 +93,27 @@ export function parseShardArg(argv) {
 /** Every unit-suite test file, repo-relative with posix separators, resolved by vitest itself from vitest.config.ts. */
 export async function listUnitTestFiles(repoRoot = REPO_ROOT) {
   const { createVitest } = await import('vitest/node');
-  const ctx = await createVitest('test', { watch: false, run: true, root: repoRoot, config: join(repoRoot, 'vitest.config.ts') });
+  // An ESM wrapper uses Vite's native ESM config loading. Its CommonJS loader
+  // realpaths the config via ancestor-by-ancestor lstat, crossing host lane roots
+  // even though discovery only needs files inside this repository.
+  const scratch = mkdtempSync(join(tmpdir(), 'shard-inventory-'));
+  let ctx;
   try {
+    const config = join(scratch, 'vitest.config.mts');
+    symlinkSync(join(repoRoot, 'node_modules'), join(scratch, 'node_modules'), 'dir');
+    writeFileSync(join(scratch, 'package.json'), JSON.stringify({ type: 'module', workspaces: [] }));
+    writeFileSync(config, `export { default } from ${JSON.stringify(join(repoRoot, 'vitest.config.ts'))};\n`);
+    // Isolate Vite's workspace/config searches in scratch; glob the real repo via
+    // test.dir using its unchanged include/exclude rules. No tests execute here.
+    ctx = await createVitest('test', { watch: false, run: true, root: scratch, dir: repoRoot, config, setupFiles: [], globalSetup: [], reporters: [] }, {
+      server: { watch: null },
+      css: { postcss: {} },
+    });
     const pairs = await ctx.globTestFiles([]);
     return pairs.map((p) => relative(repoRoot, Array.isArray(p) ? p[1] : p).split(sep).join('/')).sort();
   } finally {
-    await ctx.close();
+    try { await ctx?.close(); }
+    finally { rmSync(scratch, { recursive: true, force: true }); }
   }
 }
 
@@ -102,14 +130,28 @@ export function ambiguousFilters(shardFilesList, allFiles) {
 /** Fold vitest `--reporter=json` reports into `{ repoRelativeFile: seconds }` (largest sample wins per file). */
 export function timingsFromReports(reports, repoRoot = REPO_ROOT) {
   const out = {};
+  // Resolve existing filesystem aliases before checking containment (e.g. a temp
+  // directory reached through a symlink). Missing historical paths remain lexical.
+  const root = existsSync(repoRoot) ? realpathSync(repoRoot) : resolve(repoRoot);
   for (const report of reports) {
     for (const r of report.testResults ?? []) {
-      const rel = relative(repoRoot, r.name).split(sep).join('/');
+      const filename = resolve(repoRoot, r.name);
+      const canonical = existsSync(filename) ? realpathSync(filename)
+        : existsSync(dirname(filename)) ? join(realpathSync(dirname(filename)), basename(filename)) : filename;
+      const rel = relative(root, canonical).split(sep).join('/');
+      assertTimingKeys({ unit: { [rel]: 0 } });
       const secs = Math.max(0, (r.endTime - r.startTime) / 1000);
       if (Number.isFinite(secs)) out[rel] = Math.max(out[rel] ?? 0, Math.round(secs * 100) / 100);
     }
   }
   return out;
+}
+
+/** Shared --update format: replace one suite, preserve the other, and sort file keys. */
+export function formatUpdatedTimings(all, suite, timings) {
+  const sorted = Object.fromEntries(Object.entries(timings).sort(([a], [b]) => (a < b ? -1 : 1)));
+  assertTimingKeys({ ...all, [suite]: sorted });
+  return `${JSON.stringify({ _doc: 'Measured seconds per test file, used by scripts/ci/shard-assign.mjs to balance CI shards. Refresh with --update.', ...all, [suite]: sorted }, null, 1)}\n`;
 }
 
 async function main(argv) {
@@ -120,9 +162,9 @@ async function main(argv) {
   if (update) {
     const reports = update.slice('--update='.length).split(',').filter(Boolean).map((p) => JSON.parse(readFileSync(p, 'utf8')));
     const all = loadTimings();
-    all[suite] = Object.fromEntries(Object.entries(timingsFromReports(reports)).sort(([a], [b]) => (a < b ? -1 : 1)));
-    writeFileSync(TIMINGS_FILE, `${JSON.stringify({ _doc: 'Measured seconds per test file, used by scripts/ci/shard-assign.mjs to balance CI shards. Refresh with --update.', ...all }, null, 1)}\n`);
-    process.stdout.write(`updated ${suite}: ${Object.keys(all[suite]).length} files\n`);
+    const timings = timingsFromReports(reports);
+    writeFileSync(TIMINGS_FILE, formatUpdatedTimings(all, suite, timings));
+    process.stdout.write(`updated ${suite}: ${Object.keys(timings).length} files\n`);
     return 0;
   }
 
@@ -159,7 +201,7 @@ async function main(argv) {
   return 0;
 }
 
-const IS_CLI = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+const IS_CLI = process.argv[1] && realpathSync(resolve(process.argv[1])) === fileURLToPath(import.meta.url);
 if (IS_CLI) {
   main(process.argv.slice(2)).then(
     (code) => { process.exitCode = code; },
