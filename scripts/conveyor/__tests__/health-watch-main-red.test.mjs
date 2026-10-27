@@ -40,6 +40,58 @@ const passingTip = () => ({
 });
 
 describe('planMainRedAlert — proven tip recovery regressions', () => {
+  const successfulChecks = (count) => Array.from({ length: count }, (_, index) => ({
+    id: index + 1, name: `check-${index + 1}`, status: 'completed', conclusion: 'success',
+  }));
+
+  it.each([100, 101])('fails closed once after an alert for %i successful checks with only matching-SHA recovery proof', (count) => {
+    // No required check appears in this possibly truncated page, so only the workflow SHA matches.
+    const tip = { ...passingTip(), checkRuns: successfulChecks(count) };
+    const state = mainRedState(greenRuns(), { tip });
+    expect(state.status).toBe('green');
+    expect(state.via).not.toBe('tip-required-checks');
+    expect(state.latestGreen.sha).toBe(tip.sha);
+    expect(tip.checkRuns).toHaveLength(count);
+
+    const red = plan();
+    expect(kinds(red)).toEqual(['main-red']);
+    const unknown = plan({ prev: red.next, runs: greenRuns(), tip });
+    expect.soft(kinds(unknown)).toEqual(['main-status-unknown']);
+    expect.soft(unknown.next.fingerprint).toBe(red.next.fingerprint);
+    expect.soft(unknown.next.fingerprintParts).toEqual(red.next.fingerprintParts);
+    expect.soft(unknown.next.unknownEmitted).toBe(true);
+
+    const repeated = plan({ prev: unknown.next, runs: greenRuns(), tip });
+    expect.soft(repeated.items).toEqual([]);
+    expect.soft(repeated.next.fingerprint).toBe(red.next.fingerprint);
+    expect.soft(repeated.next.unknownEmitted).toBe(true);
+  });
+
+  it.each([1, 99])('clears an alert for %i successful checks with matching-SHA recovery proof below the page limit', (count) => {
+    const tip = { ...passingTip(), checkRuns: successfulChecks(count) };
+    const state = mainRedState(greenRuns(), { tip });
+    expect(state.status).toBe('green');
+    expect(state.via).not.toBe('tip-required-checks');
+    expect(state.latestGreen.sha).toBe(tip.sha);
+
+    const green = plan({ prev: plan().next, runs: greenRuns(), tip });
+    expect(kinds(green)).toEqual(['main-green']);
+    expect(green.next.fingerprint).toBeNull();
+    expect(green.next.unknownEmitted).toBe(false);
+  });
+
+  it.each([1, 99, 100, 101])('clears an alert via tip-required-checks with %i successful checks regardless of the page limit', (count) => {
+    const tip = { ...passingTip(), requiredChecks: ['check-1'], checkRuns: successfulChecks(count) };
+    const state = mainRedState(redRuns(), { tip });
+    expect(state.status).toBe('green');
+    expect(state.via).toBe('tip-required-checks');
+
+    const green = plan({ prev: plan().next, runs: redRuns(), tip });
+    expect(kinds(green)).toEqual(['main-green']);
+    expect(green.next.fingerprint).toBeNull();
+    expect(green.next.unknownEmitted).toBe(false);
+  });
+
   it.each([
     ['queued required check', { ...passingTip(), runStatus: 'in_progress',
       checkRuns: [{ id: 1, name: 'test', status: 'queued', conclusion: null }],
