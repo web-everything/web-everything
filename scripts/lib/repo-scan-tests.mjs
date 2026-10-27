@@ -50,6 +50,13 @@ export const REPO_SCAN_TESTS = Object.freeze([
     inputs: ['scripts/operations/__tests__/health-watch-lane-scan-boundary.test.mjs'],
   },
   {
+    test: 'scripts/lib/__tests__/constellation-ownership.test.mjs',
+    scope: 'full',
+    why: 'checks ownership coverage and CLI file/line totals against the complete tracked inventory; every repository path contributes, so changed-file scoping would lose the whole-repo assertions',
+    matches: () => true,
+    inputs: ['config/constellation-ownership.json', 'scripts/lib/constellation-ownership.mjs', 'scripts/lib/__tests__/constellation-ownership.test.mjs'],
+  },
+  {
     test: 'scripts/lib/__tests__/lane-git-diet.test.mjs',
     scope: 'files',
     why: 'every script naming an ops/* ref is a listed by-name reader or a known non-reader (lane fetches exclude ops/*)',
