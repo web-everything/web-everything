@@ -1,12 +1,15 @@
 import { describe, it, expect, vi } from 'vitest';
 import { isEvidenceReadTimeout, EVIDENCE_READ_BACKOFF_MS } from '../evidence-read-retry.mjs';
-import { readTimeoutEvidence } from '../reconcile-pass.mjs';
+import { enrichPrsWithMainRedFacts, readTimeoutEvidence } from '../reconcile-pass.mjs';
 import { planReconcile, REFUSAL_KINDS } from '../reconcile-core.mjs';
 
 const head = 'a'.repeat(40);
 const repo = 'web-everything/web-everything';
 const pr = { number: 5987, headRefOid: head };
 const timeoutError = () => Object.assign(new Error('spawnSync gh ETIMEDOUT'), { code: 'ETIMEDOUT' });
+const goTimeoutError = () => Object.assign(new Error('Command failed: gh api repos/x/y'), {
+  stderr: Buffer.from('Get "https://api.github.com/repos/x/y": dial tcp 140.82.112.6:443: i/o timeout\n'),
+});
 
 describe('evidence-read timeout is unknown, never ineligible', () => {
   it('classifies only timeouts as read timeouts', () => {
@@ -17,8 +20,50 @@ describe('evidence-read timeout is unknown, never ineligible', () => {
     expect(isEvidenceReadTimeout(new Error('incomplete-diff'))).toBe(false);
   });
 
-  it('retries a timed-out read with bounded backoff, then returns unknown (not a plain ineligible reason)', () => {
-    const exec = vi.fn(() => { throw timeoutError(); });
+  it.each(['CI timed out', 'ETIMEDOUT', 'CI\nspawnSync gh ETIMEDOUT', 'CI\r\u2028timed out',
+    'Get "https://api.github.com": dial tcp: i/o timeout', '`timed out`', '"timed out"', '--ETIMEDOUT', '../timed out'])('does not classify validation data as a timeout: %j', (name) => {
+    expect(isEvidenceReadTimeout(new Error(`unparseable-required-check-url:${name}`))).toBe(false);
+  });
+
+  it('keeps Go network timeouts retryable', () => {
+    expect(isEvidenceReadTimeout(new Error('Get "https://api.github.com/repos/x/y": dial tcp 140.82.112.6:443: i/o timeout'))).toBe(true);
+    expect(isEvidenceReadTimeout(new Error('Get "https://api.github.com/repos/x/y": net/http: TLS handshake timeout'))).toBe(true);
+    expect(isEvidenceReadTimeout(new Error('Get "https://api.github.com/repos/x/y": context deadline exceeded (Client.Timeout exceeded while awaiting headers)'))).toBe(true);
+    expect(isEvidenceReadTimeout(new Error('Get "https://api.github.com/repos/x/y": dial tcp 140.82.112.6:443: connect: operation timed out'))).toBe(true);
+    expect(isEvidenceReadTimeout(Object.assign(new Error('Command failed: gh api repos/x/y'), {
+      stderr: Buffer.from('Get "https://api.github.com/repos/x/y": dial tcp 140.82.112.6:443: i/o timeout\n'),
+    }))).toBe(true);
+    expect(isEvidenceReadTimeout(new Error('Get "https://api.github.com/repos/timed out/x": no such host'))).toBe(false);
+    expect(isEvidenceReadTimeout(new SyntaxError('Unexpected token in "CI timed out"'))).toBe(false);
+  });
+
+  it.each(['CI timed out', 'ETIMEDOUT'])('keeps malformed check %j ineligible so ordinary ci-heal can proceed', (name) => {
+    const pause = vi.spyOn(Atomics, 'wait').mockReturnValue('ok');
+    try {
+      const readJobAttempt = vi.fn();
+      const p = {
+        ...pr, state: 'OPEN', headRefName: 'lane/x', labels: [], comments: [], mergeStateStatus: 'CLEAN',
+        statusCheckRollup: [{ name, status: 'completed', conclusion: 'failure', detailsUrl: '' }],
+      };
+      const { prs, ...mainFacts } = enrichPrsWithMainRedFacts([p], {
+        repo, requiredChecks: [name], readJobAttempt, readBudget: () => ({ confirmed: 0, pending: false }),
+        readMainRuns: () => [{ status: 'completed', conclusion: 'success', headSha: 'b'.repeat(40), updatedAt: '2026-10-26T19:00:00Z' }],
+        readAheadBy: () => 1, readMainLatestCheckRuns: () => [], readMainFixedSignatureFacts: () => null,
+      });
+      expect(prs[0].owedCiRerunRetry).toEqual({ eligible: false, reason: `unparseable-required-check-url:${name}` });
+      expect(readJobAttempt).not.toHaveBeenCalled();
+      expect(pause).not.toHaveBeenCalled();
+      const out = planReconcile({ prs, ...mainFacts, now: Date.parse('2026-10-26T20:00:00Z'),
+        requiredChecks: [name], reviewTiming: { startAfter: 'ci-green' } });
+      expect(out.refusals.map(r => r.kind)).not.toContain('timeout-evidence-unknown');
+      expect(out.dispatch.map(d => d.kind)).toContain('ci-heal');
+    } finally {
+      pause.mockRestore();
+    }
+  });
+
+  it.each([timeoutError, goTimeoutError])('retries a timed-out read with bounded backoff, then returns unknown (not a plain ineligible reason): %s', (error) => {
+    const exec = vi.fn(() => { throw error(); });
     const sleep = vi.fn();
     const result = readTimeoutEvidence(pr, { repo, exec, sleep, facts: () => null });
     expect(result).toMatchObject({ eligible: false, unknown: true });
@@ -41,12 +86,12 @@ describe('evidence-read timeout is unknown, never ineligible', () => {
     expect(result).toMatchObject({ eligible: false, reason: 'timeout-evidence:stale-head' });
   });
 
-  it('a non-timeout failure is not retried', () => {
-    const exec = vi.fn(() => { throw new Error('HTTP 404'); });
+  it.each([new Error('HTTP 404'), new SyntaxError('Unexpected token in "CI timed out"')])('a non-timeout failure is not retried: %s', (error) => {
+    const exec = vi.fn(() => { throw error; });
     const sleep = vi.fn();
     const result = readTimeoutEvidence(pr, { repo, exec, sleep, facts: () => null });
     expect(result.unknown).toBeUndefined();
-    expect(result).toEqual({ eligible: false, reason: 'timeout-evidence:HTTP 404' });
+    expect(result).toEqual({ eligible: false, reason: `timeout-evidence:${error.message}` });
     expect(exec).toHaveBeenCalledTimes(1);
     expect(sleep).not.toHaveBeenCalled();
   });
