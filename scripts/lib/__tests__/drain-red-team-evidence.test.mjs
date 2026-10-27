@@ -116,12 +116,16 @@ describe('invalid status carry cannot suppress failed-seat recovery', () => {
   ];
   const recoveryState = evidence => ({ carryConflict: evidence.carryConflict, scheduled: evidence.scheduled,
     noUsableResult: evidence.noUsableResult, failedSeatCount: evidence.failedSeatCount });
+  const skippedResults = [
+    ['string skipped', 'skipped'],
+    ['object card-only skip', { status: 'skipped', policy: 'card-only' }],
+  ];
 
-  it('a skipped code-diff status with valid carriedFrom cannot suppress failed-seat recovery', () => {
+  it.each(skippedResults)('%s code-diff status with valid carriedFrom and no journal cannot suppress failed-seat recovery', (_kind, result) => {
     const { f, path, loopPayload } = failedSeatFixture();
     expect(readRedTeamCarry(f)).toBeNull();
     const status = { repo: f.repo, pr: f.pr, head: f.head, status: 'finished',
-      result: 'skipped', skipCardOnly: true, loopPayload };
+      result, skipCardOnly: true, loopPayload };
     expect(redTeamSkipNeedsSettlement(status)).toBe(false);
     writeFileSync(path, JSON.stringify(status));
     const ordinary = recoveryState(readDrainRedTeamEvidence(f));
@@ -132,11 +136,11 @@ describe('invalid status carry cannot suppress failed-seat recovery', () => {
       'skipCardOnly is a setting; a code diff cannot authorize carry or hide the failed seat').toEqual(ordinary);
   });
 
-  it('merge-strategy keeps the failed-seat request eligible for a skipped code diff with valid carriedFrom', () => {
+  it.each(skippedResults)('merge-strategy keeps the failed-seat request eligible, not red team not owed, for %s code diff with valid carriedFrom and no journal', (_kind, result) => {
     const { f, path, loopPayload } = failedSeatFixture();
     expect(readRedTeamCarry(f)).toBeNull();
     const status = { repo: f.repo, pr: f.pr, head: f.head, status: 'finished',
-      result: 'skipped', skipCardOnly: true, loopPayload };
+      result, skipCardOnly: true, loopPayload };
     const eligible = () => staleRedTeamRequestEligibility({ ...f, evidence: readDrainRedTeamEvidence(f),
       enabled: true, labels: ['review:accepted', 'ready-to-merge'] });
     writeFileSync(path, JSON.stringify(status));
@@ -145,6 +149,18 @@ describe('invalid status carry cannot suppress failed-seat recovery', () => {
 
     writeFileSync(path, JSON.stringify({ ...status, loopPayload: { ...loopPayload, carriedFrom: 'a'.repeat(40) } }));
     expect(eligible(), 'code-diff skip metadata must not suppress the drain consumer request').toEqual(ordinary);
+  });
+
+  it.each(skippedResults)('%s code-diff status with valid carriedFrom and no journal cannot supply a panel accept verdict', (_kind, result) => {
+    const { f, path, loopPayload } = failedSeatFixture();
+    expect(readRedTeamCarry(f)).toBeNull();
+    writeFileSync(path, JSON.stringify({ repo: f.repo, pr: f.pr, head: f.head, status: 'finished',
+      result, skipCardOnly: true, loopPayload: { ...loopPayload, carriedFrom: 'a'.repeat(40) } }));
+
+    const evidence = readDrainRedTeamEvidence(f);
+    expect(evidence.status.loopPayload.verdict).toEqual({ verdict: 'accept' });
+    expect(evidence.loopPayload?.verdict?.verdict,
+      'settlement provenance cannot stand in for a panel verdict, even when carry is ineligible').not.toBe('accept');
   });
 
   it.each(nonCarryStatuses)('valid carriedFrom on %s cannot suppress failed-seat recovery', (_kind, fields) => {
