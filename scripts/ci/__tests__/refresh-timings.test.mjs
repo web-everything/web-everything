@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import yaml from 'js-yaml';
-import { downloadReports, expectedUnitReports, foldReports, main, refreshFromDir } from '../refresh-timings.mjs';
+import { downloadReports, expectedUnitShards, foldReports, main, refreshFromDir } from '../refresh-timings.mjs';
 import { REPO_ROOT, timingsFromReports } from '../shard-assign.mjs';
 
 // Public contracts for Phase 2:
@@ -25,8 +25,13 @@ function writeReport(index, body) {
   writeFileSync(file, JSON.stringify(body));
   return file;
 }
+// Shard reports are numbered 1..count, matching the fixture ci.yml matrix.
 function seed(count = 10, coverage = 10) {
-  return Array.from({ length: count }, (_, i) => writeReport(i, report(files[i % coverage], 1234 + i * 100)));
+  return Array.from({ length: count }, (_, i) => writeReport(i + 1, report(files[i % coverage], 1234 + i * 100)));
+}
+// Extra test results ride in an existing shard's report, never as a stray report file.
+function withResults(file, ...extra) {
+  return { testResults: [report(file).testResults[0], ...extra] };
 }
 function cli(args = [`--dir=${dir}`]) {
   // Copy the future implementation into a throwaway repo: CLI defaults must never write real timings.
@@ -85,7 +90,7 @@ describe('refresh-timings recursive report fold', () => {
 describe('refresh-timings safety rails', () => {
   it('refuses an outside-checkout report even with complete inventory coverage, preserving existing bytes', async () => {
     seed();
-    writeReport(20, { testResults: [{ name: join(root, 'outside.test.mjs'), startTime: 0, endTime: 1000 }] });
+    writeReport(10, withResults(files[9], { name: join(root, 'outside.test.mjs'), startTime: 0, endTime: 1000 }));
     const result = await refreshFromDir({ dir, timingsFile, repoRoot });
     expect(result.ok).toBe(false);
     expect(result.reason).toMatch(/repository-relative/);
@@ -94,17 +99,17 @@ describe('refresh-timings safety rails', () => {
 
   it('refuses fewer than ten reports despite complete file coverage and leaves bytes untouched', async () => {
     seed(9);
-    writeReport(0, { testResults: files.map((file) => report(file).testResults[0]) });
+    writeReport(1, { testResults: files.map((file) => report(file).testResults[0]) });
     const result = await refreshFromDir({ dir, timingsFile, repoRoot });
     expect(result.ok).toBe(false);
-    expect(result.reason).toMatch(/report|10|ten/i);
+    expect(result.reason).toMatch(/missing timing-unit-10\.json/);
     expect(readFileSync(timingsFile, 'utf8')).toBe(original);
   });
 
   it('refuses ten reports covering only 80% of current tests, without writing', async () => {
     seed(10, 8);
     // Obsolete entries cannot inflate the coverage numerator.
-    writeReport(20, { testResults: Array.from({ length: 30 }, (_, i) => report(`removed-${i}.test.mjs`).testResults[0]) });
+    writeReport(10, withResults(files[1], ...Array.from({ length: 30 }, (_, i) => report(`removed-${i}.test.mjs`).testResults[0])));
     const result = await refreshFromDir({ dir, timingsFile, repoRoot });
     expect(result.ok).toBe(false);
     expect(result.reason).toMatch(/coverage|90|stale/i);
@@ -170,7 +175,7 @@ describe('refresh-timings writer compatibility', () => {
   it('writes only currently discovered test files, dropping obsolete report entries', async () => {
     seed();
     // A CI run built before a test file was renamed or deleted still reports the old name.
-    writeReport(20, report('tests/renamed-away.test.mjs'));
+    writeReport(10, withResults(files[9], report('tests/renamed-away.test.mjs').testResults[0]));
     const result = await refreshFromDir({ dir, timingsFile, repoRoot });
     expect(result.ok).toBe(true);
     expect(Object.keys(JSON.parse(readFileSync(timingsFile, 'utf8')).unit)).toEqual([...files].sort());
@@ -180,19 +185,40 @@ describe('refresh-timings writer compatibility', () => {
 describe('refresh-timings report threshold follows the CI unit shard matrix', () => {
   it('needs one report per ci.yml unit shard, not a fixed ten', async () => {
     writeCi([1, 2, 3, 4, 5]);
-    expect(expectedUnitReports(repoRoot)).toBe(5);
+    expect(expectedUnitShards(repoRoot)).toEqual([1, 2, 3, 4, 5]);
     seed(4);
-    writeReport(0, { testResults: files.map((file) => report(file).testResults[0]) });
-    expect((await refreshFromDir({ dir, timingsFile, repoRoot })).reason).toMatch(/Found 4 unit reports; need at least 5/);
+    writeReport(1, { testResults: files.map((file) => report(file).testResults[0]) });
+    expect((await refreshFromDir({ dir, timingsFile, repoRoot })).reason).toMatch(/Found 4 unit reports; need exactly one per CI unit shard \(5\): missing timing-unit-5\.json/);
     expect(readFileSync(timingsFile, 'utf8')).toBe(original);
     seed(5);
-    writeReport(0, { testResults: files.map((file) => report(file).testResults[0]) });
+    writeReport(1, { testResults: files.map((file) => report(file).testResults[0]) });
     expect((await refreshFromDir({ dir, timingsFile, repoRoot })).ok).toBe(true);
   });
 
-  it('matches the real ci.yml unit shard count', () => {
+  it('a duplicate shard report cannot pad the count to stand in for a missing shard', async () => {
+    seed(9);
+    writeReport(1, { testResults: files.map((file) => report(file).testResults[0]) });
+    const copy = join(dir, 'second-download', 'timing-unit-1.json');
+    mkdirSync(dirname(copy), { recursive: true });
+    copyFileSync(join(dir, 'artifact-1', 'nested', 'timing-unit-1.json'), copy);
+    const result = await refreshFromDir({ dir, timingsFile, repoRoot });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/Found 10 unit reports.*missing timing-unit-10\.json; duplicate timing-unit-1\.json/);
+    expect(readFileSync(timingsFile, 'utf8')).toBe(original);
+  });
+
+  it('refuses a report from a shard the matrix does not have, even with every shard present', async () => {
+    seed();
+    writeReport(11, report(files[0]));
+    const result = await refreshFromDir({ dir, timingsFile, repoRoot });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/unexpected timing-unit-11\.json/);
+    expect(readFileSync(timingsFile, 'utf8')).toBe(original);
+  });
+
+  it('matches the real ci.yml unit shards', () => {
     const ci = yaml.safeLoad(readFileSync(join(REPO_ROOT, '.github', 'workflows', 'ci.yml'), 'utf8'));
-    expect(expectedUnitReports()).toBe(ci.jobs['test-shard'].strategy.matrix.shard.length);
+    expect(expectedUnitShards()).toEqual(ci.jobs['test-shard'].strategy.matrix.shard);
   });
 
   it.each([
@@ -203,7 +229,7 @@ describe('refresh-timings report threshold follows the CI unit shard matrix', ()
   ])('refuses on %s and preserves the file', async (_, mutate) => {
     seed();
     mutate();
-    expect(() => expectedUnitReports(repoRoot)).toThrow(/shard/i);
+    expect(() => expectedUnitShards(repoRoot)).toThrow(/shard/i);
     const result = await refreshFromDir({ dir, timingsFile, repoRoot });
     expect(result.ok).toBe(false);
     expect(result.reason).toMatch(/shard/i);

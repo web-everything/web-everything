@@ -12,13 +12,14 @@ import { readFileSync, realpathSync } from 'node:fs';
 import yaml from 'js-yaml';
 import { REPO_ROOT, TIMINGS_FILE, listUnitTestFiles, timingsFromReports, loadTimings, formatUpdatedTimings } from './shard-assign.mjs';
 
-/** Recursively parse unit reports only; malformed or unreadable evidence throws. */
-export async function foldReports(dir) {
+/** Recursively parse unit reports only; malformed or unreadable evidence throws. Report filenames are appended to `names`. */
+export async function foldReports(dir, names = []) {
   const reports = [];
   for (const entry of (await readdir(dir, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
     const path = join(dir, entry.name);
-    if (entry.isDirectory()) reports.push(...await foldReports(path));
+    if (entry.isDirectory()) reports.push(...await foldReports(path, names));
     else if (/^timing-unit-.*\.json$/.test(entry.name)) {
+      names.push(entry.name);
       if (!entry.isFile()) throw new Error(`Invalid report file: ${entry.name}`);
       const report = JSON.parse(await readFile(path, 'utf8'));
       if (!report || !Array.isArray(report.testResults) || report.testResults.some(r =>
@@ -32,8 +33,8 @@ export async function foldReports(dir) {
   return reports;
 }
 
-/** One timing-unit-* report per CI unit shard: the length of ci.yml's test-shard matrix. Unreadable or unexpected shapes throw. */
-export function expectedUnitReports(repoRoot = REPO_ROOT) {
+/** The CI unit shard ids from ci.yml's test-shard matrix; each uploads one timing-unit-<id> report. Unreadable or unexpected shapes throw. */
+export function expectedUnitShards(repoRoot = REPO_ROOT) {
   let shards;
   try {
     shards = yaml.safeLoad(readFileSync(join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8'))?.jobs?.['test-shard']?.strategy?.matrix?.shard;
@@ -43,7 +44,18 @@ export function expectedUnitReports(repoRoot = REPO_ROOT) {
   if (!Array.isArray(shards) || !shards.length || !shards.every(Number.isInteger) || new Set(shards).size !== shards.length) {
     throw new Error('ci.yml test-shard matrix is not a non-empty list of distinct shard numbers');
   }
-  return shards.length;
+  return shards;
+}
+
+/** Exactly one report per shard: a duplicate or stray file must not stand in for a missing shard. */
+function shardReportProblem(names, shards) {
+  const expected = shards.map(shard => `timing-unit-${shard}.json`);
+  const missing = expected.filter(name => !names.includes(name));
+  const duplicate = [...new Set(names.filter((name, i) => names.indexOf(name) !== i))];
+  const unexpected = names.filter(name => !expected.includes(name));
+  const problems = [['missing', missing], ['duplicate', duplicate], ['unexpected', unexpected]]
+    .filter(([, list]) => list.length).map(([kind, list]) => `${kind} ${list.join(', ')}`);
+  return problems.length ? `Found ${names.length} unit reports; need exactly one per CI unit shard (${shards.length}): ${problems.join('; ')}` : null;
 }
 
 /** Validate all evidence before atomically replacing the unit map, preserving soak timings. */
@@ -51,9 +63,10 @@ export async function refreshFromDir({ dir, timingsFile = TIMINGS_FILE, repoRoot
   const { writeFile: write = writeFile, rename: move = rename } = io;
   let pending;
   try {
-    const reports = await foldReports(dir);
-    const minReports = expectedUnitReports(repoRoot);
-    if (reports.length < minReports) return { ok: false, reason: `Found ${reports.length} unit reports; need at least ${minReports} (one per CI unit shard). Download all timing-unit-* artifacts from a successful full CI run.` };
+    const names = [];
+    const reports = await foldReports(dir, names);
+    const problem = shardReportProblem(names, expectedUnitShards(repoRoot));
+    if (problem) return { ok: false, reason: `${problem}. Download all timing-unit-* artifacts from one successful full CI run.` };
     const measured = timingsFromReports(reports, repoRoot);
     const files = await listUnitTestFiles(repoRoot);
     // Keep current files only: a run built before a rename/delete still reports the old name.
