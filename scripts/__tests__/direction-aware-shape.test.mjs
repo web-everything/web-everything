@@ -16,13 +16,15 @@ import { createChecksRunner, VERIFY_LANE_CLI } from '../operations/verify-io.mjs
 import { execFileSync } from 'node:child_process';
 
 const runner = 'scripts/operations/run.mjs';
-// Include registration wiring: a complete named array alone clears the current permission detector.
+// Self-contained registration is provable without stored-array consumer evidence.
 const diffHunks = `diff --git a/${runner} b/${runner}
 --- a/${runner}
 +++ b/${runner}
 @@ -1,0 +1 @@
 +  [PR_TRACE_OP]: () => ({ declaration: prTraceOperation({ readFacts: createPrTraceReader() }), sinks: {}, finish: finishPrTrace }),
-@@ -10,4 +11,5 @@
+`;
+// Keep the historical #5961 array shape as an explicit conservative regression.
+const listHunk = `@@ -10,4 +11,5 @@
  const zeroWrites = [
    HEALTH_OP,
 +  PR_TRACE_OP,
@@ -72,22 +74,42 @@ describe('R131 direction-aware shape wiring', () => {
     expect(humanRequiredProposed).toBe(true);
     expect(humanRequiredProposedReason).toBe('no new op reference');
   });
-  it('proves a complete read-only list addition even when hunks clear the current hold', () => {
-    const listOnly = diffHunks.slice(0, diffHunks.indexOf('@@'))
-      + diffHunks.slice(diffHunks.indexOf('@@ -10'));
+  it('keeps a complete stored read-only list human even when hunks clear the current hold', () => {
+    const listOnly = diffHunks.slice(0, diffHunks.indexOf('@@')) + listHunk;
     expect(scoreEscalation({ ...evidence, diffHunks: listOnly }).humanRequired).toBe(false);
     const { humanRequiredProposed, humanRequiredProposedReason, ...current } = buildShapePlan({ ...evidence, diffHunks: listOnly });
     const { humanRequiredProposed: ignored, humanRequiredProposedReason: ignoredReason, ...before } = buildShapePlan({ changedFiles: [runner] });
     expect(current).toEqual(before);
-    expect(humanRequiredProposed).toBe(false);
-    expect(humanRequiredProposedReason).toBe('adds only read-only ops: pr-trace');
+    expect(humanRequiredProposed).toBe(true);
+    expect(humanRequiredProposedReason).toBe('unprovable list membership: human review required');
+    expect(scoreEscalation({ changedFiles: [runner], readOnlyOps: evidence.readOnlyOps,
+      proposalDiffHunks: listOnly, directionAwareLive: true }))
+      .toMatchObject({ humanRequired: true, humanRequiredProposed: true });
+  });
+  it('#5961 keeps stored-array edits human beside provable read-only wiring', async () => {
+    const diff = diffHunks + listHunk;
+    const expected = { humanRequired: true, humanRequiredProposed: true,
+      humanRequiredProposedReason: 'unprovable list membership: human review required' };
+    expect(scoreEscalation({ ...evidence, diffHunks: diff })).toMatchObject(expected);
+    expect(scoreEscalation({ ...evidence, diffHunks: diff, directionAwareLive: true })).toMatchObject(expected);
+    expect(buildShapePlan({ ...evidence, diffHunks: diff })).toMatchObject(expected);
+    for (const mode of ['shadow', 'live']) {
+      const appendEvent = vi.fn();
+      const write = vi.fn();
+      await runShape({ files: runner, 'diff-file': 'fixture.diff', pr: '5961' }, true, {
+        readFile: () => diff, loadOps: async () => evidence.readOnlyOps,
+        resolveMode: () => mode, appendEvent, write, exit: vi.fn(),
+      });
+      expect(JSON.parse(write.mock.calls[0][1])).toMatchObject(expected);
+      expect(appendEvent).not.toHaveBeenCalled();
+    }
   });
   it('keeps the proposal false when the no-hunks decision never required a human', () => {
     expect(buildShapePlan({ changedFiles: ['scripts/example.mjs'], diffHunks }))
       .toMatchObject({ humanRequired: false, humanRequiredProposed: false,
         humanRequiredProposedReason: 'not human-required today' });
   });
-  it('#5961 keeps the current hold in shadow and publishes the read-only proposal', () => {
+  it('keeps the current hold in shadow and publishes the self-contained read-only proposal', () => {
     expect(scoreEscalation(evidence)).toMatchObject({ humanRequired: true,
       humanRequiredProposed: false, humanRequiredProposedReason: 'adds only read-only ops: pr-trace' });
   });
