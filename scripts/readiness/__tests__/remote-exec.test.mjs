@@ -57,6 +57,116 @@ function expectNoSecrets(exec) {
   for (const value of Object.values(forbiddenEnv)) expect(transport).not.toContain(value);
 }
 
+// Exercise the transport and generated shell locally, without SSH or a registry.
+function realRemoteFixture(files) {
+  const f = fixture();
+  const root = join(cwd, 'server');
+  const bin = join(cwd, 'bin');
+  const npmCli = realpathSync(spawnSync('which', ['npm'], { encoding: 'utf8' }).stdout.trim());
+  const quote = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
+  mkdirSync(root);
+  mkdirSync(bin);
+  writeFileSync(join(cwd, 'user.npmrc'), '');
+  writeFileSync(join(cwd, 'global.npmrc'), '');
+  symlinkSync(process.execPath, join(bin, 'node'));
+  writeFileSync(join(bin, 'npm'), `#!/bin/bash\nexec ${quote(process.execPath)} ${quote(npmCli)} --offline --cache=${quote(join(cwd, 'npm-cache'))} --userconfig=${quote(join(cwd, 'user.npmrc'))} --globalconfig=${quote(join(cwd, 'global.npmrc'))} "$@"\n`, { mode: 0o755 });
+  const runs = [];
+  f.listFiles.mockResolvedValue(files);
+  const fakeExec = f.exec;
+  f.exec = vi.fn(async (call) => {
+    if (call.file === 'rsync') {
+      const args = call.args.filter((arg, i, all) => !arg.startsWith('--rsync-path=') && arg !== '-e' && all[i - 1] !== '-e');
+      args[args.length - 1] = join(root, runId) + '/';
+      const result = spawnSync('rsync', args, { cwd, input: call.input, encoding: 'utf8', timeout: 10000 });
+      return { code: result.status, stdout: result.stdout };
+    }
+    if (isRun(call)) {
+      const script = call.input.replaceAll('/srv/forge-exec', root)
+        .replaceAll('PATH=/usr/local/bin:/usr/bin:/bin', `PATH=${quote(`${bin}:/usr/bin:/bin`)}`);
+      const result = spawnSync('bash', ['-c', script], { cwd, encoding: 'utf8', timeout: 20000 });
+      runs.push(result);
+      return { code: result.status, stdout: result.stdout };
+    }
+    if (isReceipt(call)) {
+      const receipt = join(root, runId, '.exit-code');
+      return { code: existsSync(receipt) ? 0 : 1, stdout: existsSync(receipt) ? readFileSync(receipt, 'utf8') : '' };
+    }
+    if (isCleanup(call)) {
+      rmSync(join(root, runId), { recursive: true, force: true });
+      return { code: 0, stdout: '' };
+    }
+    return fakeExec(call);
+  });
+  return { ...f, root, bin, runs };
+}
+
+describe('remote snapshot regressions', () => {
+  it('copies rsync comment-like and shell-special filenames literally through the real transport', async () => {
+    const files = ['#required-fixture.json', ';required-fixture.json', 'two words', "quote'`$()", '--option', 'é\u2028fixture', '＃invisible\u200b', 'tab\tfile', 'trailing '];
+    const f = realRemoteFixture(['package-lock.json', ...files]);
+    for (const file of files) writeFileSync(join(cwd, file), `contents: ${file}`);
+    // Inspect the real rsync result before allowing the mocked remote command.
+    const transport = f.exec;
+    const transferred = new Map();
+    f.exec = vi.fn(async (call) => {
+      if (isRun(call)) {
+        for (const file of files) {
+          const path = join(f.root, runId, file);
+          transferred.set(file, existsSync(path) ? readFileSync(path, 'utf8') : null);
+        }
+        return { code: 0, stdout: '' };
+      }
+      if (isReceipt(call)) return { code: 0, stdout: '0\n' };
+      return transport(call);
+    });
+    expect(await runRemote(f)).toEqual({ mode: 'remote', code: 0 });
+    for (const file of files) expect(transferred.get(file), file).toBe(`contents: ${file}`);
+  });
+
+  it.each(['root', 'workspace'])('rejects a changed %s manifest against an unchanged lock on both warm and cold caches', async (kind) => {
+    const manifest = { name: 'fixture', version: '1.0.0', workspaces: ['packages/*'], scripts: { 'test:unit': 'node -e "console.log(\'COMMAND_RAN\')"' } };
+    const worker = { name: 'worker', version: '1.0.0' };
+    const packages = {
+      '': { name: 'fixture', version: '1.0.0', workspaces: manifest.workspaces },
+      'packages/worker': worker,
+      'node_modules/worker': { resolved: 'packages/worker', link: true },
+    };
+    const files = ['package.json', 'package-lock.json', 'packages/worker/package.json', 'vendor/missing-lock-dependency/package.json'];
+    mkdirSync(join(cwd, 'vendor/missing-lock-dependency'), { recursive: true });
+    writeFileSync(join(cwd, 'vendor/missing-lock-dependency/package.json'), JSON.stringify({ name: 'missing-lock-dependency', version: '1.0.0' }));
+    mkdirSync(join(cwd, 'packages/worker'), { recursive: true });
+    writeFileSync(join(cwd, 'packages/worker/package.json'), JSON.stringify(worker));
+    let changedManifest = manifest;
+    let changedPath = join(cwd, 'package.json');
+    if (kind === 'workspace') {
+      changedManifest = worker;
+      changedPath = join(cwd, 'packages/worker/package.json');
+    }
+    writeFileSync(join(cwd, 'package.json'), JSON.stringify(manifest));
+    writeFileSync(join(cwd, 'package-lock.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', lockfileVersion: 3, packages }));
+    const f = realRemoteFixture(files);
+    // Populate, then prove a valid cache hit can still execute.
+    for (const attempt of [1, 2]) {
+      expect(await runRemote(f), `valid attempt ${attempt}: ${f.runs.at(-1)?.stderr}`).toEqual({ mode: 'remote', code: 0 });
+      expect(f.runs.at(-1).stdout).toContain('COMMAND_RAN');
+    }
+    changedManifest.dependencies = { 'missing-lock-dependency': kind === 'root' ? 'file:vendor/missing-lock-dependency' : 'file:../../vendor/missing-lock-dependency' };
+    writeFileSync(changedPath, JSON.stringify(changedManifest));
+    const validation = spawnSync(join(f.bin, 'npm'), ['ci', '--dry-run', '--include=dev', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd, encoding: 'utf8', timeout: 20000 });
+    expect(validation.status).not.toBe(0);
+    expect(validation.stderr).toContain('Missing: missing-lock-dependency@1.0.0 from lock file');
+    for (const state of ['warm', 'cold']) {
+      if (state === 'cold') rmSync(join(f.root, '.cache'), { recursive: true, force: true });
+      const log = vi.fn();
+      expect(await runWithRemoteFallback({ ...f, log }), state).toBe(7);
+      expect(f.runs.at(-1).status, f.runs.at(-1).stderr).toBe(97);
+      expect(f.runs.at(-1).stderr).toContain('npm ci');
+      expect(f.runs.at(-1).stdout).not.toContain('COMMAND_RAN');
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('ambiguous-result'));
+    }
+  }, 120000);
+});
+
 describe('isAllowedCommand', () => {
   it.each(['test:unit', 'check:standards'])('allows exactly the npm run %s prefix, including extra args', (script) => {
     expect(isAllowedCommand(['npm', 'run', script])).toBe(true);
@@ -133,6 +243,7 @@ describe('buildRemoteScript', () => {
 const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(trace)}, JSON.stringify({args, env:process.env, cwd:process.cwd()}) + '\\n');
 if (args[0] === 'ci') {
+  if (args.includes('--dry-run')) process.exit(0);
   mkdirSync('node_modules', {recursive:true});
   if (process.env.NODE_ENV !== 'production' || args.includes('--include=dev')) writeFileSync('node_modules/vitest', 'dev dependency');
   process.exit(0);
@@ -168,7 +279,8 @@ ${script.replaceAll('/srv/forge-exec', root)}`;
       expect(existsSync(marker)).toBe(false);
     }
     const rows = readFileSync(trace, 'utf8').trim().split('\n').map(JSON.parse);
-    expect(rows.filter((row) => row.args[0] === 'ci')).toHaveLength(1);
+    expect(rows.filter((row) => row.args[0] === 'ci' && !row.args.includes('--dry-run'))).toHaveLength(1);
+    expect(rows.filter((row) => row.args[0] === 'ci' && row.args.includes('--dry-run'))).toHaveLength(1);
     const runs = rows.filter((row) => row.args[0] === 'run');
     expect(runs).toHaveLength(2);
     expect(runs[0].env.NODE_ENV).toBe('production');
@@ -183,6 +295,16 @@ ${script.replaceAll('/srv/forge-exec', root)}`;
 });
 
 describe('runRemote', () => {
+  it('falls back before copying when literal inventory framing exceeds the byte limit', async () => {
+    const f = fixture();
+    // Prefix and NUL are part of the 4 MiB transport budget.
+    f.listFiles.mockResolvedValue(['a'.repeat(4 * 1024 * 1024 - 2)]);
+    const log = vi.fn();
+    expect(await runWithRemoteFallback({ ...f, log })).toBe(7);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('copy-failed'));
+    expect(callsOf(f.exec).some((call) => call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+
   it.each(['test:unit', 'check:standards'])('falls back before transport for %s when the snapshot requires the unsynchronized sibling', async (command) => {
     const f = fixture();
     f.argv = ['npm', 'run', command, '--', 'blocks/__tests__/unit/resource-loader/ResourceLoader.test.ts'];
@@ -249,6 +371,8 @@ describe('runRemote', () => {
     expect(calls).toContainEqual(expect.objectContaining({ file: 'ssh', args: ['custom-forge', 'true'] }));
     const copy = calls.find((call) => call.file === 'rsync');
     expect(copy.args.join(' ')).toMatch(/--files-from(?:=|\s)-/);
+    expect(copy.args).toContain('--from0');
+    expect(copy.input.split('\0')).toEqual(['./package-lock.json', './src/a file.mjs', '']);
     expect(copy.args.join(' ')).toMatch(/--rsync-path(?:=|\s)sudo -u forge-exec rsync/);
     expect(copy.args.join(' ')).toContain(`custom-forge:${runDir}`);
     expect(copy.input).toContain('package-lock.json');

@@ -50,6 +50,11 @@ if [ ! -d ${quote(`${cache}/node_modules`)} ]; then
   if ! ${cleanEnv} npm ci --include=dev --ignore-scripts --no-audit --no-fund >.npm-ci.log 2>&1; then tail -n 20 .npm-ci.log >&2; exit 97; fi
   rm -f .npm-ci.log
   mv node_modules ${quote(`${cache}/node_modules`)}
+else
+  # A lock hash does not cover root/workspace manifests. Validate the copied
+  # snapshot with npm before trusting a warm cache; never fetch or run scripts.
+  if ! ${cleanEnv} npm ci --dry-run --offline --include=dev --ignore-scripts --no-audit --no-fund >.npm-ci.log 2>&1; then tail -n 20 .npm-ci.log >&2; exit 97; fi
+  rm -f .npm-ci.log
 fi
 touch ${quote(cacheRoot)} ${quote(cache)}
 cp -a --reflink=auto ${quote(`${cache}/node_modules`)} node_modules 2>/dev/null || cp -a ${quote(`${cache}/node_modules`)} node_modules
@@ -93,7 +98,9 @@ function safeFiles(files) {
     if (parts.some((part) => part === '..' || part === '.')) throw new Error('Unsafe file path');
     return !parts.some((part) => /^(?:node_modules|\.git|\.env(?:\..*)?|\.secrets|\.ssh|\.aws|\.claude|\.codex|\.npmrc|\.netrc|credentials(?:\..*)?|.*\.(?:pem|key))$/i.test(part));
   });
-  const input = [...new Set(safe)].join('\n') + '\n';
+  // openrsync still treats leading #/; as comments with --from0. Anchor every
+  // validated relative path so both rsync implementations read it literally.
+  const input = [...new Set(safe)].map((path) => `./${path}\0`).join('');
   if (Buffer.byteLength(input) > LIMIT) throw new Error('File inventory limit exceeded');
   return input;
 }
@@ -125,7 +132,7 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
     // are supported; do not turn a missing remote dependency into a test failure.
     if (files.includes('vitest.shared.ts')) return fallback('unsupported-sibling-dependency');
     // No --mkpath: macOS openrsync lacks it; rsync creates the final run dir under the existing /srv/forge-exec.
-    const copied = await exec({ file: 'rsync', args: ['-a', '--delete', '--files-from=-', '--rsync-path=sudo -u forge-exec rsync', '-e', `ssh ${SSH_OPTIONS.join(' ')}`, './', `${host}:${dir}/`], cwd, input: inventory });
+    const copied = await exec({ file: 'rsync', args: ['-a', '--delete', '--from0', '--files-from=-', '--rsync-path=sudo -u forge-exec rsync', '-e', `ssh ${SSH_OPTIONS.join(' ')}`, './', `${host}:${dir}/`], cwd, input: inventory });
     if (copied.code !== 0) throw new Error('Copy failed');
   } catch { await cleanup(); return fallback('copy-failed'); }
   try {
