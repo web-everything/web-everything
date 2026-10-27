@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { mainRedState } from '../main-ci-red-core.mjs';
+import { diffFeed, parseFeedLine } from '../../operations/needs-you-feed.mjs';
 import {
   mainRedAlertSettings, planMainRedAlert, runMainRedAlert,
 } from '../health-watch-main-red.mjs';
@@ -36,6 +37,122 @@ const kinds = (result) => result.items.map((item) => item.kind);
 const passingTip = () => ({
   sha: TIP_SHA, runStatus: 'completed', requiredChecks: ['test'],
   checkRuns: [{ id: 1, name: 'test', status: 'completed', conclusion: 'success' }],
+});
+
+describe('planMainRedAlert — proven tip recovery regressions', () => {
+  it.each([
+    ['queued required check', { ...passingTip(), runStatus: 'in_progress',
+      checkRuns: [{ id: 1, name: 'test', status: 'queued', conclusion: null }],
+    }],
+    ['in-progress required check', { ...passingTip(), runStatus: 'in_progress',
+      checkRuns: [{ id: 1, name: 'test', status: 'in_progress', conclusion: null }],
+    }],
+    ['pending non-required check without required-check success', { ...passingTip(), checkRuns: [
+      { id: 1, name: 'test', status: 'completed', conclusion: 'neutral' },
+      { id: 2, name: 'smoke', status: 'in_progress', conclusion: null },
+    ] }],
+    ['unreadable requiredChecks', { ...passingTip(), requiredChecks: null }],
+    ['missing requiredChecks', { ...passingTip(), requiredChecks: undefined }],
+    ['malformed requiredChecks', { ...passingTip(), requiredChecks: 'test' }],
+    ['historical green SHA with completed non-red tip checks', {
+      ...passingTip(), sha: 'd'.repeat(40),
+      checkRuns: [{ id: 1, name: 'test', status: 'completed', conclusion: 'neutral' }],
+    }],
+  ])('fails closed once after an alert for %s, then clears only on proven recovery', (_name, tip) => {
+    const red = plan();
+    // Historical workflow success is still reported, but the tip has not proved success.
+    const state = mainRedState(greenRuns(), { tip });
+    expect(state.status).toBe('green');
+    expect(state.via).not.toBe('tip-required-checks');
+
+    const unknown = plan({ prev: red.next, runs: greenRuns(), tip });
+    expect.soft(kinds(unknown)).toEqual(['main-status-unknown']);
+    expect.soft(unknown.next.fingerprint).toBe(red.next.fingerprint);
+    expect.soft(unknown.next.fingerprintParts).toEqual(red.next.fingerprintParts);
+    expect.soft(unknown.next.unknownEmitted).toBe(true);
+    const repeated = plan({ prev: unknown.next, runs: greenRuns(), tip });
+    expect.soft(repeated.items).toEqual([]);
+    expect.soft(repeated.next.fingerprint).toBe(red.next.fingerprint);
+    expect.soft(repeated.next.unknownEmitted).toBe(true);
+
+    const recovered = plan({ prev: repeated.next, runs: greenRuns(), tip: passingTip() });
+    expect.soft(kinds(recovered)).toEqual(['main-green']);
+    expect.soft(recovered.next.unknownEmitted).toBe(false);
+    expect.soft(plan({ prev: recovered.next, runs: greenRuns(), tip: passingTip() }).items).toEqual([]);
+  });
+
+  it('allows a matching latest green SHA with every tip check completed and non-red', () => {
+    const tip = { ...passingTip(), checkRuns: [
+      { id: 1, name: 'test', status: 'completed', conclusion: 'neutral' },
+      { id: 2, name: 'smoke', status: 'completed', conclusion: 'success' },
+    ] };
+    const state = mainRedState(greenRuns(), { tip });
+    expect(state.via).not.toBe('tip-required-checks');
+    expect(state.latestGreen.sha).toBe(tip.sha);
+    const green = plan({ prev: plan().next, runs: greenRuns(), tip });
+    expect(kinds(green)).toEqual(['main-green']);
+    expect(green.next.fingerprint).toBeNull();
+  });
+});
+
+describe('planMainRedAlert — durable feed transition regressions', () => {
+  it('emits all three A -> B -> A red events through real diffFeed with accumulated openKeys', () => {
+    const first = plan();
+    const changed = plan({ prev: first.next, details: { ...details(), failingJobs: ['smoke'] } });
+    const returned = plan({ prev: changed.next });
+    const transitions = [first, changed, returned];
+    let openKeys = [];
+    const events = [];
+    for (const transition of transitions) {
+      expect(kinds(transition)).toEqual(['main-red']);
+      // publishAttention retains every key: a later event cannot rely on old keys being cleared.
+      const feed = diffFeed(openKeys, transition.items, START + 30 * MINUTE, { incomplete: true });
+      openKeys = feed.openKeys;
+      events.push(...feed.lines.map(parseFeedLine));
+    }
+    expect.soft(events.map((event) => event.kind)).toEqual(['main-red', 'main-red', 'main-red']);
+    expect.soft(events.map((event) => event.failingJobs)).toEqual([
+      [...details().failingJobs].sort(), ['smoke'], [...details().failingJobs].sort(),
+    ]);
+    expect.soft(openKeys).toHaveLength(3);
+    expect.soft(returned.next.fingerprint).toBe(first.next.fingerprint);
+    expect.soft(new Set(transitions.map((result) => result.items[0].head)).size).toBe(3);
+    for (const [index, result] of transitions.entries()) {
+      expect.soft(result.next.seq).toBe(index + 1);
+      expect.soft(result.items[0].head).toContain(result.next.fingerprint);
+      expect.soft(result.items[0].head).toContain(String(index + 1));
+    }
+  });
+
+  it('persists and increments seq per emitted red, unknown and green item, preserving it on quiet ticks', () => {
+    const red = plan({ prev: { seq: 40 } });
+    const quietRed = plan({ prev: red.next });
+    const unknown = plan({ prev: quietRed.next, readOk: false });
+    const quietUnknown = plan({ prev: unknown.next, readOk: false });
+    const recoveredRed = plan({ prev: quietUnknown.next });
+    const secondUnknown = plan({ prev: recoveredRed.next, readOk: false });
+    const green = plan({ prev: secondUnknown.next, runs: greenRuns(), tip: passingTip() });
+    const quietGreen = plan({ prev: green.next, runs: greenRuns(), tip: passingTip() });
+    const secondRed = plan({ prev: quietGreen.next });
+    const secondGreen = plan({ prev: secondRed.next, runs: greenRuns(), tip: passingTip() });
+    const emitted = [red, unknown, secondUnknown, green, secondRed, secondGreen];
+    expect(emitted.map(kinds)).toEqual([
+      ['main-red'], ['main-status-unknown'], ['main-status-unknown'],
+      ['main-green'], ['main-red'], ['main-green'],
+    ]);
+    // Deliberately reuse the same tick and red fingerprint: seq must distinguish repeated episodes.
+    expect.soft(new Set(emitted.flatMap((result) => result.items.map((item) => item.head))).size).toBe(6);
+    for (const [index, result] of emitted.entries()) {
+      expect.soft(result.next.seq).toBe(41 + index);
+      expect.soft(result.items[0].head).toContain(String(41 + index));
+    }
+    for (const [quiet, prior] of [
+      [quietRed, red], [quietUnknown, unknown], [recoveredRed, unknown], [quietGreen, green],
+    ]) {
+      expect.soft(quiet.items).toEqual([]);
+      expect.soft(quiet.next.seq).toBe(prior.next.seq);
+    }
+  });
 });
 
 describe('mainRedAlertSettings', () => {
