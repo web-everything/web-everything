@@ -6,6 +6,10 @@ ceremony autonomously. Like the `clear-human` ceremony in we:scripts/review-set-
 records the named actor, channel, and explicit instruction. Attribution is a recorded assertion; the
 posting principal is authenticated by GitHub and checked against the existing automation/operator identities.
 
+Operator ruling R123 additionally authorizes the bounded CI recovery cases documented in
+we:scripts/conveyor/stand-down-auto-proceed.md. That automation uses the same builder and strict parser;
+judgment questions still require an explicit operator answer.
+
 The CLI requires a PR, `--repo`, nonblank `--reason`, `--actor` (GitHub login), and `--channel`. It reads
 comments and posts one machine-marked answer targeting the latest unresolved terminal stand-down's
 comment ID. No unresolved stand-down means refusal. A repeated invocation after the answer is visible

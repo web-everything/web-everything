@@ -214,6 +214,8 @@ export async function defaultRedispatch({ slug, pr }) {
   const only = (rows) => (rows ?? []).filter((r) => Number(r.prNumber ?? r.pr) === Number(pr));
   const result = runReconcileFixDispatch({
     repo: slug,
+    // This targeted redispatch must not answer stand-downs on other PRs read by the planner.
+    allowStandDownAutoProceed: false,
     reconcile: (opts) => { const r = runReconcilePass(opts); return { ...r, dispatch: only(r.dispatch).filter((d) => d.kind === 'fix'), refusals: only(r.refusals) }; },
     netScope: applyNetScopeToReconcile,
     prStack: null,
