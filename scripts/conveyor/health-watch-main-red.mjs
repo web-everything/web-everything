@@ -115,14 +115,16 @@ function readAlertDetails({ state, config }) {
   } catch { /* owners unavailable */ }
   try {
     const out = execFileSyncThrottled('gh', ['pr', 'list', '--repo', DEFAULT_REPO_SLUG,
-      '--state', 'open', '--label', 'ready-to-merge', '--json', 'number', '--limit', '100'], {
+      '--state', 'open', '--json', 'number,labels', '--limit', '200'], {
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024,
       timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
     });
     if (!isGhDeferred(out)) {
       const prs = JSON.parse(String(out));
       // A full page cannot prove the count; retain null rather than undercounting.
-      if (Array.isArray(prs) && prs.length < 100) details.blockedReadyPrs = prs.length;
+      if (Array.isArray(prs) && prs.length < 200) {
+        details.blockedReadyPrs = prs.filter((pr) => (pr?.labels ?? []).some((l) => l?.name === 'ready-to-merge')).length;
+      }
     }
   } catch { /* ready PRs unavailable */ }
   return details;
