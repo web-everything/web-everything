@@ -288,13 +288,14 @@ describe('refresh-timings CI artifact download trust boundary', () => {
     ['no successful run', '[]'],
     ['a non-numeric run id', '[{"databaseId":"1;touch x"}]'],
     ['a missing run id', '[{}]'],
+    ['a run id with a trailing newline', '[{"databaseId":"4242\\n"}]'],
   ])('refuses before any download when latest finds %s', async (_, runList) => {
     const { calls, exec } = recorder(runList);
     await expect(downloadReports('latest', '/scratch/reports', { exec })).rejects.toThrow(/No valid CI run ID/);
     expect(calls.map(({ args }) => args[1])).toEqual(['list']);
   });
 
-  it.each(['1;x', '$(id)', '1 2', '-1', ''])('refuses explicit run id %j before any gh call', async (run) => {
+  it.each(['1;x', '$(id)', '1 2', '-1', '', '77\n', '77\r', '77\u2028', '77\u2029'])('refuses explicit run id %j before any gh call', async (run) => {
     const { calls, exec } = recorder();
     await expect(downloadReports(run, '/scratch/reports', { exec })).rejects.toThrow(/No valid CI run ID/);
     expect(calls).toEqual([]);
@@ -305,6 +306,11 @@ describe('refresh-timings CI artifact download trust boundary', () => {
     [['--run=1;x']],
     [['--run=']],
     [['--run=12a']],
+    [['--run=77\n']],
+    [['--run=latest\r']],
+    [['--run=77\u2028']],
+    [['--run=77\u2029']],
+    [['--dir=reports\n']],
     [['--dir=']],
     [['--run=latest', '--dir=x']],
     [['--update=x']],
