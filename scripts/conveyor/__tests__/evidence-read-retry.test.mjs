@@ -10,6 +10,15 @@ const timeoutError = () => Object.assign(new Error('spawnSync gh ETIMEDOUT'), { 
 const goTimeoutError = () => Object.assign(new Error('Command failed: gh api repos/x/y'), {
   stderr: Buffer.from('Get "https://api.github.com/repos/x/y": dial tcp 140.82.112.6:443: i/o timeout\n'),
 });
+const misleadingCheckNames = [
+  'CI timed out', 'ETIMEDOUT', 'CI\nspawnSync gh ETIMEDOUT', 'CI\r\u2028timed out',
+  'Get "https://api.github.com": dial tcp: i/o timeout',
+  'CI\nGet "https://api.github.com": dial tcp: i/o timeout',
+  'CI\rGet "https://api.github.com": dial tcp: i/o timeout',
+  'CI\u2028Get "https://api.github.com": dial tcp: i/o timeout',
+  '`timed out`', '"timed out"', '--ETIMEDOUT', '../timed out',
+  '\u200btimed out', 'ＣＩ timed out', 'CI timed' + ' out',
+];
 
 describe('evidence-read timeout is unknown, never ineligible', () => {
   it('classifies only timeouts as read timeouts', () => {
@@ -20,8 +29,7 @@ describe('evidence-read timeout is unknown, never ineligible', () => {
     expect(isEvidenceReadTimeout(new Error('incomplete-diff'))).toBe(false);
   });
 
-  it.each(['CI timed out', 'ETIMEDOUT', 'CI\nspawnSync gh ETIMEDOUT', 'CI\r\u2028timed out',
-    'Get "https://api.github.com": dial tcp: i/o timeout', '`timed out`', '"timed out"', '--ETIMEDOUT', '../timed out'])('does not classify validation data as a timeout: %j', (name) => {
+  it.each(misleadingCheckNames)('does not classify validation data as a timeout: %j', (name) => {
     expect(isEvidenceReadTimeout(new Error(`unparseable-required-check-url:${name}`))).toBe(false);
   });
 
@@ -37,7 +45,7 @@ describe('evidence-read timeout is unknown, never ineligible', () => {
     expect(isEvidenceReadTimeout(new SyntaxError('Unexpected token in "CI timed out"'))).toBe(false);
   });
 
-  it.each(['CI timed out', 'ETIMEDOUT'])('keeps malformed check %j ineligible so ordinary ci-heal can proceed', (name) => {
+  it.each(misleadingCheckNames)('keeps malformed check %j ineligible so ordinary ci-heal can proceed', (name) => {
     const pause = vi.spyOn(Atomics, 'wait').mockReturnValue('ok');
     try {
       const readJobAttempt = vi.fn();
