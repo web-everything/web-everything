@@ -159,6 +159,44 @@ describe('card scope helpers', () => {
   });
 });
 
+describe('cross-author numbered stacks — resolver and scope-bloat wiring', () => {
+  it('assesses Alice’s declared stack on Bob’s PR without an unknown hold', () => {
+    const base = 'b'.repeat(40);
+    const head = 'c'.repeat(40);
+    const tree = 'd'.repeat(40);
+    const pr = { number: 60101, headRefName: 'lane/alice', headRefOid: head,
+      baseRefName: 'lane/bob', title: 'Declared stack', files: [{ path: 'own.mjs' }] };
+    const refs = new Map([
+      [pr.number, { ...pr, author: 'alice', isCrossRepository: false }],
+      [60102, { headRefName: pr.baseRefName, headRefOid: base, baseRefName: 'main', author: 'bob', isCrossRepository: false }],
+    ]);
+    const tips = new Map([[pr.headRefName, head], [pr.baseRefName, base]]);
+    const run = args => {
+      if (args[0] === 'cat-file') return '';
+      if (args[0] === 'rev-list') return args.at(-2) === head ? `${head}\n${base}` : base;
+      if (args[0] === 'merge-base') return base;
+      if (args[0] === 'merge-tree') return tree;
+      throw new Error(`unexpected git command: ${args.join(' ')}`);
+    };
+    const stackReads = [];
+    const events = [];
+    const bottom = { number: 60102, ...refs.get(60102), title: 'Base PR', files: [{ path: 'base.mjs' }] };
+    const [out] = enrichPrsWithScopeBloat([pr, bottom], {
+      repo: 'web-everything/web-everything', env: {}, netScope: { scopeBloat: false }, readBaseSha: () => base,
+      readNet: () => { throw new Error('must assess the declared stack diff'); },
+      readStacks: (prs, { diag }) => readStackBases({ root: '/repo', env: {}, prs, diag,
+        settingOn: true, prlessBase: true, readRefs: () => refs, readLanes: () => tips, run, log: () => {} }),
+      readStackFiles: stack => { stackReads.push(stack); return ['own.mjs']; },
+      emitEvent: event => events.push(event),
+    });
+    expect(stackReads).toEqual([{ pr: 60102, ref: pr.baseRefName, head: base, contained: base, tree, topHead: head }]);
+    expect(out.stackBase).toEqual({ pr: 60102, ref: pr.baseRefName, head: base, contained: base });
+    expect(out.scopeBloatUnknown).toBeUndefined();
+    expect(out.scopeBloat).toBeUndefined();
+    expect(events).toEqual([]);
+  });
+});
+
 describe('PR-less bases already on main — resolver and scope-bloat wiring', () => {
   const BASE = 'b'.repeat(40);
   const TOP = 'c'.repeat(40);
