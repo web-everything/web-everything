@@ -1,3 +1,4 @@
+// @vitest-environment node
 /** @file Contract tests for the forge remote runner; implementation is intentionally pending. */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync } from 'node:fs';
@@ -135,7 +136,7 @@ process.exit(3);
     // The env shim supplies a test npm on PATH while retaining the script's env -i semantics.
     // The rm shim observes the receipt just before the EXIT trap removes it.
     const harness = `
-env() { command env "$@" PATH=${quote(`${bin}:/usr/bin:/bin`)}; }
+env() { local a=("$@") i; for i in "\${!a[@]}"; do case "\${a[$i]}" in PATH=*) a[\$i]=PATH=${quote(`${bin}:/usr/bin:/bin`)};; esac; done; command env "\${a[@]}"; }
 rm() {
   if [ -f ${quote(join(root, runId, '.exit-code'))} ]; then
     command cp ${quote(join(root, runId, '.exit-code'))} ${quote(exitSnapshot)};
