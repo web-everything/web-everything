@@ -32,6 +32,14 @@
       "reason": "Main red after #6002: shallow/blobless checkout breaks live-git tests; fix PR lane/main-fix-shallow-history in progress (operator R157)",
       "addedAt": 1793105522290,
       "expiresAt": 1793191922290
+    },
+    {
+      "test": "scripts/__tests__/merge-ai-prs-merge-queue-hook-wiring.test.mjs",
+      "brokenSha": "bf7e0a0b34",
+      "owner": "card:merge-queue-removals-5981-5954",
+      "reason": "frozen-timestamp date rot: 'transient UNKNOWN on the couple's fresh reads' fails in merge_group shard 6 (run 40539289321), ejected #5954",
+      "addedAt": 1793120537153,
+      "expiresAt": 1793206937153
     }
   ],
   "mode": "stop"
