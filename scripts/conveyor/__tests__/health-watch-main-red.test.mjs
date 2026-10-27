@@ -122,6 +122,62 @@ describe('planMainRedAlert — red window and attention payload', () => {
 });
 
 describe('planMainRedAlert — fingerprint and recovery', () => {
+  it.each([
+    ['unavailable details', null],
+    ['omitted details', undefined],
+    ['missing detail fields', {}],
+    ['unavailable failing jobs', { ...details(), failingJobs: null }],
+    ['unavailable failing test', { ...details(), firstFailingTest: null }],
+    ['unavailable fix PRs', { ...details(), fixPrs: null }],
+    ['all detail reads unavailable', {
+      failingJobs: null, firstFailingTest: null, blockedReadyPrs: null, fixPrs: null,
+    }],
+  ])('carries forward fingerprint parts through %s and identical recovery', (_name, unavailable) => {
+    const first = plan();
+    const failedRead = plan({ prev: first.next, details: unavailable, now: START + 31 * MINUTE });
+    const recovered = plan({ prev: failedRead.next, now: START + 32 * MINUTE });
+
+    expect.soft(failedRead.items).toEqual([]);
+    expect.soft(failedRead.next.fingerprint).toBe(first.next.fingerprint);
+    expect.soft(recovered.items).toEqual([]);
+    expect.soft(recovered.next.fingerprint).toBe(first.next.fingerprint);
+  });
+
+  it('carries forward only unavailable parts while fingerprinting a proven detail change', () => {
+    const first = plan();
+    const changed = { ...details(), failingJobs: ['smoke'] };
+    const expected = plan({ prev: first.next, details: changed });
+    const partial = plan({ prev: first.next, details: { ...changed, fixPrs: null } });
+
+    expect(kinds(partial)).toEqual(['main-red']);
+    expect.soft(partial.next.fingerprint).toBe(expected.next.fingerprint);
+    expect.soft(partial.items[0].fixPrs).toEqual(expected.items[0].fixPrs);
+    expect.soft(plan({ prev: partial.next, details: changed }).items).toEqual([]);
+  });
+
+  it('gives separate green episodes distinct feed keys containing their red since-timestamps', () => {
+    const firstRed = plan();
+    const firstGreen = plan({ prev: firstRed.next, runs: greenRuns(), tip: passingTip() });
+    const secondSince = '2026-10-26T13:00:00.000Z';
+    const secondRed = plan({ prev: firstGreen.next, now: START + 90 * MINUTE,
+      runs: [run(RED_SHA, 'failure', secondSince, 4), ...greenRuns()],
+    });
+    const secondGreen = plan({ prev: secondRed.next, runs: greenRuns(), tip: passingTip(),
+      now: START + 91 * MINUTE,
+    });
+    expect(kinds(firstRed)).toEqual(['main-red']);
+    expect(kinds(secondRed)).toEqual(['main-red']);
+    expect(kinds(firstGreen)).toEqual(['main-green']);
+    expect(kinds(secondGreen)).toEqual(['main-green']);
+    const [first] = firstGreen.items;
+    const [second] = secondGreen.items;
+    expect.soft(first.head).toContain(SINCE);
+    expect.soft(second.head).toContain(secondSince);
+    const key = (item) => `${item.repo}#${item.pr}@${item.head}:${item.kind}`;
+    expect(key(second)).not.toBe(key(first));
+    expect(plan({ prev: secondGreen.next, runs: greenRuns(), tip: passingTip() }).items).toEqual([]);
+  });
+
   it('deduplicates identical red state on later ticks using persisted next', () => {
     const first = plan();
     const second = plan({ prev: first.next, now: START + 60 * MINUTE });
@@ -187,6 +243,54 @@ describe('planMainRedAlert — fingerprint and recovery', () => {
 });
 
 describe('planMainRedAlert — fail closed on unknown main status', () => {
+  it.each([
+    ['null tip', null],
+    ['unreadable tip', undefined],
+    ['unreadable tip checks', { ...passingTip(), checkRuns: null }],
+    ['missing tip checks', { ...passingTip(), checkRuns: [] }],
+    ['red required check on the tip', { ...passingTip(),
+      checkRuns: [{ id: 1, name: 'test', status: 'completed', conclusion: 'failure' }],
+    }],
+    ['red non-required check on the tip', { ...passingTip(), checkRuns: [
+      ...passingTip().checkRuns,
+      { id: 2, name: 'smoke', status: 'completed', conclusion: 'failure' },
+    ] }],
+  ])('never clears an emitted red on old green runs with %s; reports unknown once', (_name, tip) => {
+    const red = plan();
+    const unknown = plan({ prev: red.next, runs: greenRuns(), tip, now: START + 31 * MINUTE });
+    expect.soft(kinds(unknown)).toEqual(['main-status-unknown']);
+    expect.soft(unknown.next.fingerprint).toBe(red.next.fingerprint);
+    expect.soft(unknown.next.unknownEmitted).toBeTruthy();
+    const repeated = plan({ prev: unknown.next, runs: greenRuns(), tip, now: START + 32 * MINUTE });
+    expect.soft(repeated.items).toEqual([]);
+    expect.soft(repeated.next.fingerprint).toBe(red.next.fingerprint);
+
+    const provenGreen = plan({ prev: repeated.next, runs: greenRuns(), tip: passingTip(),
+      now: START + 33 * MINUTE,
+    });
+    expect.soft(kinds(provenGreen)).toEqual(['main-green']);
+    expect.soft(provenGreen.next.unknownEmitted).toBeFalsy();
+  });
+
+  it('keys unknown episodes by their start tick and suppresses repeats only within each episode', () => {
+    const firstNow = START + 31 * MINUTE;
+    const secondNow = START + 34 * MINUTE;
+    const red = plan();
+    const first = plan({ prev: red.next, readOk: false, now: firstNow });
+    const repeated = plan({ prev: first.next, readOk: false, now: firstNow + MINUTE });
+    expect(repeated.items).toEqual([]);
+    const recovered = plan({ prev: repeated.next, now: START + 33 * MINUTE });
+    expect(recovered.items).toEqual([]);
+    const second = plan({ prev: recovered.next, readOk: false, now: secondNow });
+    expect(kinds(first)).toEqual(['main-status-unknown']);
+    expect(kinds(second)).toEqual(['main-status-unknown']);
+    expect.soft(first.items[0].head).toContain(String(firstNow));
+    expect.soft(second.items[0].head).toContain(String(secondNow));
+    const key = (item) => `${item.repo}#${item.pr}@${item.head}:${item.kind}`;
+    expect.soft(key(second.items[0])).not.toBe(key(first.items[0]));
+    expect(plan({ prev: second.next, readOk: false, now: secondNow + MINUTE }).items).toEqual([]);
+  });
+
   it.each([
     ['failed read despite green runs', { runs: greenRuns(), readOk: false }],
     ['missing runs', { runs: undefined }],
