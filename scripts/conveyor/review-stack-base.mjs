@@ -49,6 +49,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const STACK_AWARE_REVIEW_DEFAULT = 'on';
 export const STACK_AWARE_REVIEW_ENV = 'WE_STACK_AWARE_REVIEW';
 export const STACK_MARKER = 'reviewed-stack';
+export const OPEN_PR_REF_LIMIT = 200; // must match readOpenPrRefs --limit
 
 const SHA = /^[0-9a-f]{40}$/;
 const LANE_REF = /^lane\/[A-Za-z0-9._/-]{1,200}$/;
@@ -486,13 +487,15 @@ export function readStackBases({ root = ROOT, env = process.env, prs = null, rea
       else if (!sets.has(top.headRefOid) || (bottom && !sets.has(bottom.headRefOid))) cause = 'head-unreadable';
       else if (openBase) { if (!bases.has(top.pr)) cause = 'no-containment'; }
       else if (!prlessBase) cause = 'base-branch-missing';
+      // At the read limit an unseen open PR may own this base; keep the main basis until ownership is provable.
+      else if (refs.size >= OPEN_PR_REF_LIMIT) cause = 'refs-incomplete';
       else {
         const head = tips.get(top.baseRefName);
         if (!SHA.test(String(head ?? ''))) cause = 'base-branch-missing';
         else if (!sets.has(head)) cause = 'head-unreadable';
         else {
           const contained = containedCommit(sets, head, top.headRefOid);
-          if (!contained || !SHA.test(contained)) cause = 'base-not-contained';
+          if (contained !== head) cause = 'base-not-contained';
           else bases.set(top.pr, { pr: null, ref: top.baseRefName, head, contained });
         }
       }
