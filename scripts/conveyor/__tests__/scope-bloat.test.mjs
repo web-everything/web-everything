@@ -321,6 +321,52 @@ describe('enrichPrsWithScopeBloat — the io shell holds unknown stack diffs and
     expect(reads).toBe(1);
   });
 
+  it.each([
+    ['throwing stack diff', 59993, () => { throw new Error('stack diff unavailable'); }, true, false],
+    ['missing stack diff', 59994, () => null, true, false],
+    ['clean stack diff', 59995, () => OWN, false, false],
+    ['wide stack diff', 59996, () => SPRAWL_FILES, false, true],
+  ])('assesses a retargeted unchanged head after a cached main-diff failure: %s', (_, number, stackFiles, unknown, wide) => {
+    const input = pr({ number, baseRefName: 'main', files: OWN.slice(0, 3) });
+    const stack = { pr: 5942, ref: 'lane/bottom', head: '2'.repeat(40),
+      contained: '2'.repeat(40), tree: '3'.repeat(40), topHead: input.headRefOid };
+    const events = [];
+    let mainReads = 0;
+    let stackReads = 0;
+    const options = { ...readers,
+      readNet: () => { mainReads += 1; throw new Error('main diff unavailable'); },
+      readStacks: (prs) => new Map(prs[0].baseRefName === stack.ref ? [[number, stack]] : []),
+      readStackFiles: () => { stackReads += 1; return stackFiles(); },
+      emitEvent: (event) => events.push(event),
+    };
+    expect(enrichPrsWithScopeBloat([input], options)[0]).toEqual(input);
+    const retargeted = { ...input, baseRefName: stack.ref };
+    for (let pass = 0; pass < 2; pass += 1) {
+      const [out] = enrichPrsWithScopeBloat([retargeted], options);
+      if (unknown) {
+        expect(out.scopeBloatUnknown).toEqual({ reason: 'stack-diff-unreadable', base: stack.ref });
+        expect(out.scopeBloat).toMatchObject({ unknown: true, stale: false, wide: false });
+        const plan = planReconcileCore({ requiredChecks: ['gate'], agents: [], durableCounts: {},
+          now: Date.parse('2026-10-27T19:12:02Z'),
+          prs: [{ ...out, state: 'OPEN', labels: [{ name: 'review:pending' }], mergeStateStatus: 'CLEAN',
+            statusCheckRollup: [{ name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' }] }],
+        });
+        expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', mode: 'scope-bloat-rebase',
+          prNumber: number, scopeBloat: expect.objectContaining({ unknown: true }) })]);
+      } else {
+        expect(out.stackBase).toMatchObject({ pr: stack.pr, ref: stack.ref });
+        expect(out.scopeBloatUnknown).toBeUndefined();
+        if (wide) expect(out.scopeBloat).toMatchObject({ wide: true, stale: false });
+        else expect(out.scopeBloat).toBeUndefined();
+      }
+    }
+    expect(stackReads).toBe(unknown ? 2 : 1);
+    expect(events).toEqual(unknown ? [{ kind: 'scope-bloat-unknown', pr: number, daemon: 'scope-bloat',
+      detail: { reason: 'stack-diff-unreadable', base: stack.ref } }] : []);
+    expect(enrichPrsWithScopeBloat([input], options)[0]).toEqual(input);
+    expect(mainReads).toBe(1);
+  });
+
   it('MIN_FILES=0 never reads a card or flags a wide PR', () => {
     let scopeReads = 0;
     const files = SPRAWL_FILES.map((path) => ({ path }));
