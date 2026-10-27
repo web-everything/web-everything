@@ -1,7 +1,7 @@
 // @vitest-environment node
-/** @file Contract tests for the forge remote runner; implementation is intentionally pending. */
+/** @file Contract and execution tests for the Forge remote runner. */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, symlinkSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
@@ -98,6 +98,12 @@ describe('validateRunId', () => {
 });
 
 describe('buildRemoteScript', () => {
+  it('installs dev dependencies under production and invalidates the old incomplete cache profile', () => {
+    const script = buildRemoteScript({ runId, lockHash, env: { NODE_ENV: 'production' }, argv });
+    expect(script).toMatch(/npm ci --include=dev\b/);
+    expect(script).toContain(`/srv/forge-exec/.cache/${lockHash}/dev-v1/node_modules`);
+    expect(script).toContain("NODE_ENV='production'");
+  });
   it('names the run/cache paths, enables nounset, installs an EXIT trap, and excludes secrets', () => {
     const script = buildRemoteScript({ runId, lockHash, env: { ...allowedEnv, ...forbiddenEnv }, argv });
     expect(typeof script).toBe('string');
@@ -123,19 +129,25 @@ describe('buildRemoteScript', () => {
     mkdirSync(bin);
     mkdirSync(join(root, '.cache'), { recursive: true });
     const recorder = join(cwd, 'npm.mjs');
-    writeFileSync(recorder, `import { appendFileSync, mkdirSync } from 'node:fs';
+    writeFileSync(recorder, `import { appendFileSync, mkdirSync, existsSync, writeFileSync } from 'node:fs';
 const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(trace)}, JSON.stringify({args, env:process.env, cwd:process.cwd()}) + '\\n');
-if (args[0] === 'ci') { mkdirSync('node_modules', {recursive:true}); process.exit(0); }
+if (args[0] === 'ci') {
+  mkdirSync('node_modules', {recursive:true});
+  if (process.env.NODE_ENV !== 'production' || args.includes('--include=dev')) writeFileSync('node_modules/vitest', 'dev dependency');
+  process.exit(0);
+}
+if (!existsSync('node_modules/vitest')) process.exit(98);
 process.exit(3);
 `);
     const quote = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
     writeFileSync(join(bin, 'npm'), `#!/bin/bash\nexec ${quote(process.execPath)} ${quote(recorder)} "$@"\n`, { mode: 0o755 });
     const env = { CI: hostile[0], LANG: hostile[1], ...forbiddenEnv };
-    const script = buildRemoteScript({ runId, lockHash, env, argv: [...argv, ...hostile] });
+    // An old production-only cache must not satisfy the new install profile.
+    mkdirSync(join(root, '.cache', lockHash, 'node_modules'), { recursive: true });
     // The env shim supplies a test npm on PATH while retaining the script's env -i semantics.
     // The rm shim observes the receipt just before the EXIT trap removes it.
-    const harness = `
+    const harnessFor = (script) => `
 env() { local a=("$@") i; for i in "\${!a[@]}"; do case "\${a[$i]}" in PATH=*) a[\$i]=PATH=${quote(`${bin}:/usr/bin:/bin`)};; esac; done; command env "\${a[@]}"; }
 rm() {
   if [ -f ${quote(join(root, runId, '.exit-code'))} ]; then
@@ -145,8 +157,9 @@ rm() {
 }
 ${script.replaceAll('/srv/forge-exec', root)}`;
     for (const attempt of [1, 2]) {
+      const script = buildRemoteScript({ runId, lockHash, env: { ...env, ...(attempt === 1 ? { NODE_ENV: 'production' } : {}) }, argv: [...argv, ...hostile] });
       mkdirSync(join(root, runId), { recursive: true });
-      const result = spawnSync('bash', ['-c', harness], {
+      const result = spawnSync('bash', ['-c', harnessFor(script)], {
         cwd, encoding: 'utf8', env: { ...forbiddenEnv, PATH: `${bin}:/usr/bin:/bin` },
       });
       expect(result.status, `attempt ${attempt}: ${result.stderr}`).toBe(3);
@@ -158,6 +171,8 @@ ${script.replaceAll('/srv/forge-exec', root)}`;
     expect(rows.filter((row) => row.args[0] === 'ci')).toHaveLength(1);
     const runs = rows.filter((row) => row.args[0] === 'run');
     expect(runs).toHaveLength(2);
+    expect(runs[0].env.NODE_ENV).toBe('production');
+    expect(runs[1].env).not.toHaveProperty('NODE_ENV');
     for (const row of runs) {
       expect(row.args).toEqual([...argv.slice(1), ...hostile]);
       expect(row.cwd).toBe(join(root, runId));
@@ -168,6 +183,17 @@ ${script.replaceAll('/srv/forge-exec', root)}`;
 });
 
 describe('runRemote', () => {
+  it.each(['test:unit', 'check:standards'])('falls back before transport for %s when the snapshot requires the unsynchronized sibling', async (command) => {
+    const f = fixture();
+    f.argv = ['npm', 'run', command, '--', 'blocks/__tests__/unit/resource-loader/ResourceLoader.test.ts'];
+    f.listFiles.mockResolvedValue(['package-lock.json', 'vitest.shared.ts']);
+    writeFileSync(join(cwd, 'vitest.shared.ts'), "export const fuiPlugsRoot = resolve(repoRoot, '../frontierui/plugs');\n");
+    const log = vi.fn();
+    expect(await runWithRemoteFallback({ ...f, log })).toBe(7);
+    expect(f.local).toHaveBeenCalledWith(f.argv);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('unsupported-sibling-dependency'));
+    expect(callsOf(f.exec).some((call) => call.file === 'rsync' || isRun(call))).toBe(false);
+  });
   it('falls back without exec for a command outside the allowlist', async () => {
     const f = fixture();
     expect(await runRemote({ ...f, argv: ['npm', 'run', 'build'] }))
@@ -270,6 +296,99 @@ describe('parseArgs', () => {
 });
 
 describe('forge-setup.sh', () => {
+  function directorySetup() {
+    const setup = readFileSync(new URL('../forge-setup.sh', import.meta.url), 'utf8');
+    const body = setup.match(/python3 - <<'DIRECTORIES'\n([\s\S]*?)\nDIRECTORIES/);
+    expect(body, 'setup must use descriptor-anchored directory operations').not.toBeNull();
+    return body[1];
+  }
+
+  it.each(['forge-exec', 'forge-exec/.cache'])('rejects a symlink at %s without changing its target', (path) => {
+    const srv = join(cwd, 'srv');
+    const target = join(cwd, 'target');
+    mkdirSync(srv);
+    mkdirSync(target, { mode: 0o755 });
+    if (path.includes('/')) mkdirSync(join(srv, 'forge-exec'));
+    symlinkSync(target, join(srv, path));
+    const setup = readFileSync(new URL('../forge-setup.sh', import.meta.url), 'utf8');
+    const body = setup.match(/python3 - <<'DIRECTORIES'\n([\s\S]*?)\nDIRECTORIES/);
+    // The legacy branch lets the real symlink regression discriminate the old
+    // shell setup too, rather than failing only because its implementation differs.
+    const script = body
+      ? `python3 - <<'DIRECTORIES'\n${directoryHarness(body[1], srv)}\nDIRECTORIES`
+      : `set -euo pipefail\nchown() { :; }\n${setup.slice(setup.indexOf('\nfi\n') + 4, setup.indexOf('# ops')).replaceAll('/srv/forge-exec', join(srv, 'forge-exec'))}`;
+    const result = spawnSync('bash', ['-c', script], { encoding: 'utf8' });
+    expect(result.status, result.stderr).not.toBe(0);
+    expect(statSync(target).mode & 0o7777).toBe(0o755);
+    expect(existsSync(join(target, '.cache'))).toBe(false);
+  });
+
+  // Exercise the real no-follow opens and modes without requiring root or a system account.
+  function directoryHarness(body, srv) {
+    return `import os, grp, types
+original_fstat = os.fstat
+owners = {}
+os.fstat = lambda fd: types.SimpleNamespace(st_uid=0, st_mode=original_fstat(fd).st_mode)
+os.fchown = lambda fd, uid, gid: owners.__setitem__(original_fstat(fd).st_ino, (uid, gid))
+grp.getgrnam = lambda name: types.SimpleNamespace(gr_gid=os.getgid())
+${body.replaceAll('"/srv"', JSON.stringify(srv))}
+assert owners[os.stat(${JSON.stringify(join(srv, 'forge-exec'))}).st_ino] == (0, os.getgid())
+assert owners[os.stat(${JSON.stringify(join(srv, 'forge-exec/.cache'))}).st_ino] == (0, os.getgid())`;
+  }
+
+  it('keeps parent entries protected on rerun and freezes the parent before opening the cache', () => {
+    const body = directorySetup();
+    const srv = join(cwd, 'srv');
+    mkdirSync(srv);
+    const harness = directoryHarness(body, srv).replace('original_fstat = os.fstat', `original_open = os.open
+def checked_open(path, flags, *args, **kwargs):
+    if path == '.cache':
+        assert flags & os.O_NOFOLLOW
+        assert os.stat(${JSON.stringify(join(srv, 'forge-exec'))}).st_mode & 0o7777 == 0o700
+        assert owners.get(os.stat(${JSON.stringify(join(srv, 'forge-exec'))}).st_ino) == (0, os.getgid())
+    return original_open(path, flags, *args, **kwargs)
+os.open = checked_open
+original_fstat = os.fstat`);
+    for (const attempt of [1, 2]) {
+      const result = spawnSync('python3', ['-c', harness], { encoding: 'utf8' });
+      expect(result.status, `attempt ${attempt}: ${result.stderr}`).toBe(0);
+      expect(statSync(join(srv, 'forge-exec')).mode & 0o7777).toBe(0o1770);
+      expect(statSync(join(srv, 'forge-exec/.cache')).mode & 0o7777).toBe(0o2770);
+    }
+  });
+
+  it('rejects a cache swapped to a symlink immediately before opening it', () => {
+    const srv = join(cwd, 'srv');
+    const target = join(cwd, 'target');
+    mkdirSync(srv);
+    mkdirSync(target, { mode: 0o755 });
+    const harness = directoryHarness(directorySetup(), srv).replace('original_fstat = os.fstat', `original_open = os.open
+def swapping_open(path, flags, *args, **kwargs):
+    if path == '.cache':
+        os.rename('.cache', '.cache.saved', src_dir_fd=kwargs['dir_fd'], dst_dir_fd=kwargs['dir_fd'])
+        os.symlink(${JSON.stringify(target)}, '.cache', dir_fd=kwargs['dir_fd'])
+    return original_open(path, flags, *args, **kwargs)
+os.open = swapping_open
+original_fstat = os.fstat`);
+    const result = spawnSync('python3', ['-c', harness], { encoding: 'utf8' });
+    expect(result.status, result.stderr).not.toBe(0);
+    expect(statSync(target).mode & 0o7777).toBe(0o755);
+    // A failed migration leaves the root closed, so an operator can repair it.
+    expect(statSync(join(srv, 'forge-exec')).mode & 0o7777).toBe(0o700);
+  });
+
+  it.each([0o775, 0o757])('refuses a writable trusted parent (mode %s)', (mode) => {
+    const srv = join(cwd, 'srv');
+    mkdirSync(srv, { mode });
+    // mkdir respects umask, so explicitly expose the untrusted write bits.
+    // The harness changes only its scratch parent before executing setup.
+    const forced = directoryHarness(directorySetup(), srv).replace('original_fstat = os.fstat', `os.chmod(${JSON.stringify(srv)}, ${mode})\noriginal_fstat = os.fstat`);
+    const unsafe = spawnSync('python3', ['-c', forced], { encoding: 'utf8' });
+    expect(unsafe.status, unsafe.stderr).not.toBe(0);
+    expect(unsafe.stderr).toContain('/srv must be root-owned');
+    expect(existsSync(join(srv, 'forge-exec'))).toBe(false);
+  });
+
   it('creates the restricted user, run root and cache with strict bash and idempotency guards', () => {
     const setup = readFileSync(new URL('../forge-setup.sh', import.meta.url), 'utf8');
     expect(setup).toContain('set -euo pipefail');
@@ -277,6 +396,7 @@ describe('forge-setup.sh', () => {
     expect(setup).toContain('/srv/forge-exec');
     expect(setup).toContain('.cache');
     expect(setup).toMatch(/\bid\s+(?:-[a-zA-Z]+\s+)*forge-exec\b/);
-    expect(setup).toMatch(/\bmkdir\s+-p\b/);
+    expect(setup).toContain('os.mkdir("forge-exec", 0o700, dir_fd=with_parent)');
+    expect(setup).toContain('os.mkdir(".cache", 0o700, dir_fd=root)');
   });
 });
