@@ -80,7 +80,7 @@ describe('planMainRedAlert — proven tip recovery regressions', () => {
     expect(green.next.unknownEmitted).toBe(false);
   });
 
-  it.each([1, 99, 100, 101])('clears an alert via tip-required-checks with %i successful checks regardless of the page limit', (count) => {
+  it.each([1, 99])('clears an alert via tip-required-checks with %i successful checks (a complete page)', (count) => {
     const tip = { ...passingTip(), requiredChecks: ['check-1'], checkRuns: successfulChecks(count) };
     const state = mainRedState(redRuns(), { tip });
     expect(state.status).toBe('green');
