@@ -7,8 +7,9 @@ import { describe, it, expect, vi } from 'vitest';
 import { cardOnlyHeadMoveCandidate, normalizeRedTeamResult, planRedTeamOnSkip, runRedTeamOnSkip, resolveReviewRedTeamOnSkip } from '../review-red-team-on-skip.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { resetCascadeLogForTest } from '../policy-cascade.mjs';
-import { readDrainRedTeamEvidence } from '../drain-red-team-evidence.mjs';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
+import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
+import { mkdtempSync, rmSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -54,6 +55,7 @@ describe('R100 — #5910 accepted stored review does not owe a red team', () => 
     const evidence = f.readEvidence();
     evidence.loopPayload.verdict = { verdict: 'accept' };
     evidence.seatRecorded = false;
+    evidence.status = { status: 'finished', result: 'not-owed' };
     return runFixture({ ...f, readEvidence: () => evidence,
       readStatus: () => ({ status: 'finished', result: 'not-owed' }),
       plan: { refusals: f.refusals }, now: () => f.now, ...over });
@@ -514,6 +516,47 @@ describe('daemon rows without formal reviews', () => {
     });
 });
 describe('runRedTeamOnSkip', () => {
+  it.each(['not-owed', { status: 'not-owed' }].flatMap(result =>
+    ['changes', 'accept'].map(verdict => [result, verdict])))(
+    'never clears a newer accepting review using an obsolete %j status with verdict %s', (result, verdict) => {
+      const dir = mkdtempSync(join(tmpdir(), 'red-team-stale-not-owed-'));
+      const runsDir = join(dir, 'runs');
+      const env = { WE_SHARED_RUNS_DIR: runsDir };
+      const input = { repo, pr, head, runsDir, env, readScorecards: () => [] };
+      try {
+        recordRedTeamStatus({ repo, pr, loopPayload: { ...payload(), verdict: { verdict } },
+          status: 'finished', result }, { env });
+        const statusFile = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
+        utimesSync(statusFile, new Date(1000), new Date(1000));
+        const id = 'review-pr-newer-accept';
+        writeRun({ ...newRunRecord({ id, op: 'review-pr', input: { repo, pr } }), ...payload() }, runsDir);
+        utimesSync(join(runsDir, `${id}.json`), new Date(2000), new Date(2000));
+        const evidence = readDrainRedTeamEvidence(input);
+        expect(evidence).toMatchObject({ scheduled: true, skipCardOnly: false, seatRecorded: false,
+          recorded: false, loopPayload: { verdict: { verdict: 'accept' } } });
+        expect(evidence.status).toBeUndefined();
+        const o = runFixture({ readEvidence: () => readDrainRedTeamEvidence(input),
+          readStatus: () => readRedTeamStatus(input) });
+        o.rawPrs[0].labels = ['review:accepted'];
+        o.rawPrs[0].comments = [{ body: `✅ review — accepted\n<!-- reviewed-sha: ${head} -->`,
+          author: { login: 'web-everything' }, createdAt: new Date(2000).toISOString() }];
+        runGhSync.mockClear();
+        const out = runRedTeamOnSkip(o);
+        expect(out.rows[0].action).not.toBe('clear');
+        expect(o.syncLabels).not.toHaveBeenCalled();
+        expect(runGhSync).not.toHaveBeenCalled();
+
+        // Once this accepting review writes its own status, the clear is valid again.
+        recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'finished', result }, { env });
+        utimesSync(statusFile, new Date(3000), new Date(3000));
+        expect(readDrainRedTeamEvidence(input)).toMatchObject({ scheduled: false,
+          status: { status: 'finished', result, loopPayload: { verdict: { verdict: 'accept' } } } });
+        o.settle = vi.fn(() => ({ outcome: 'policy-clear' }));
+        expect(runRedTeamOnSkip(o).rows[0].action).toBe('clear');
+        expect(o.settle).toHaveBeenCalledOnce();
+        expect(o.syncLabels).toHaveBeenCalledOnce();
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
   it.each(['finished-error', 'missing'])('an error seat row with %s status skips without dispatch', kind => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-skip-'));
     try {
@@ -872,7 +915,8 @@ describe('R100 recovery regressions', () => {
   });
   const publicationOptions = kind => {
     const o = kind === 'carry' ? carryOptions() : runFixture({
-      readEvidence: () => ({ loopPayload: payload(), recorded: false, seatRecorded: false }),
+      readEvidence: () => ({ loopPayload: payload(), recorded: false, seatRecorded: false,
+        status: kind === 'finished/not-owed' ? { status: 'finished', result: 'not-owed' } : null }),
       readStatus: () => kind === 'finished/not-owed' ? { status: 'finished', result: 'not-owed' } : null,
     });
     if (kind !== 'carry') {
@@ -1012,7 +1056,7 @@ describe('R100 recovery regressions', () => {
     'refuses stored clear with status %s, verdict %s, label %s', (status, verdict, label) => {
       const o = runFixture({
         readEvidence: () => ({ loopPayload: { verdict: { verdict }, findings: { read: { netBasis: { rev: head } } } },
-          recorded: false, seatRecorded: false }),
+          recorded: false, seatRecorded: false, status: status && ({ status, result: 'not-owed' }) }),
         readStatus: () => status && ({ status, result: 'not-owed' }),
       });
       o.rawPrs[0].labels = ['review:accepted', ...(label ? [{ name: label }] : [])];
@@ -1024,7 +1068,8 @@ describe('R100 recovery regressions', () => {
     });
   it.each(['red-team:blocked', 'red-team:pending', 'review:changes', 'review:human', 'review:pending'])(
     'refuses clear of an accepting finished/not-owed review carrying %s', label => {
-      const o = runFixture({ readEvidence: () => ({ loopPayload: payload(), recorded: false, seatRecorded: false }),
+      const o = runFixture({ readEvidence: () => ({ loopPayload: payload(), recorded: false, seatRecorded: false,
+        status: { status: 'finished', result: 'not-owed' } }),
         readStatus: () => ({ status: 'finished', result: 'not-owed' }) });
       o.rawPrs[0].labels = ['review:accepted', label];
       // Keep a real accepted head so this fixture exercises the label guard.
@@ -1125,7 +1170,8 @@ describe('R100 recovery regressions', () => {
     } finally { runGhSync.mockReset(); }
   });
   it.each(['not-owed', { status: 'not-owed' }])('finished %j clears accepted matching stored review and syncs', result => {
-    const o = runFixture({ readEvidence: () => ({ loopPayload: payload(), seatRecorded: false, recorded: false }),
+    const o = runFixture({ readEvidence: () => ({ loopPayload: payload(), seatRecorded: false, recorded: false,
+      status: { status: 'finished', result } }),
       readStatus: () => ({ status: 'finished', result }) });
     o.rawPrs[0].labels = ['review:accepted'];
     // This R100 clear-success fixture previously lacked the accept comment establishing the accepted head.
@@ -1138,7 +1184,8 @@ describe('R100 recovery regressions', () => {
     } finally { runGhSync.mockReset(); }
   });
   it.each(['unaccepted', 'seat-recorded', 'running', 'queued'])('finished not-owed refuses %s evidence', kind => {
-    const evidence = { loopPayload: payload(), seatRecorded: false, recorded: false };
+    const evidence = { loopPayload: payload(), seatRecorded: false, recorded: false,
+      status: { status: ['running', 'queued'].includes(kind) ? kind : 'finished', result: 'not-owed' } };
     const o = runFixture({ readEvidence: () => evidence,
       readStatus: () => ({ status: ['running', 'queued'].includes(kind) ? kind : 'finished', result: 'not-owed' }) });
     o.rawPrs[0].labels = kind === 'unaccepted' ? [] : ['review:accepted'];
@@ -1146,8 +1193,28 @@ describe('R100 recovery regressions', () => {
     expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
     expect(o.syncLabels).not.toHaveBeenCalled();
   });
+  it.each([
+    { status: 'queued', result: null },
+    { status: 'running', result: null },
+    { status: 'finished', result: 'error' },
+    { status: 'finished', result: { status: 'not-owed', deferredByGuard: true } },
+    { status: 'finished', result: { status: 'not-owed', deferredByCap: true } },
+    null,
+  ].flatMap(status => ['selected', 'live'].map(source => [source, status])))(
+    'refuses clear when the %s status disagrees with not-owed: %j', (source, status) => {
+      const o = publicationOptions('finished/not-owed');
+      if (source === 'live') o.readStatus = () => status;
+      else {
+        const evidence = o.readEvidence();
+        o.readEvidence = () => ({ ...evidence, status });
+      }
+      runRedTeamOnSkip(o);
+      expect(o.settle).not.toHaveBeenCalled();
+      expect(o.syncLabels).not.toHaveBeenCalled();
+    });
   it.each(['error', 'skipped', 'ran', { status: 'not-owed', deferredByGuard: true }, { status: 'not-owed', deferredByCap: true }])('non-policy or deferred %j never clears an accepting stored review', result => {
-    const o = runFixture({ readEvidence: () => ({ loopPayload: payload(), seatRecorded: false }),
+    const o = runFixture({ readEvidence: () => ({ loopPayload: payload(), seatRecorded: false,
+      status: { status: 'finished', result } }),
       readStatus: () => ({ status: 'finished', result }) });
     o.rawPrs[0].labels = ['review:accepted'];
     expect(runRedTeamOnSkip(o).rows[0].action).toBe(result === 'ran' ? 'dispatch' : 'skip');

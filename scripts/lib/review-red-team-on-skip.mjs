@@ -189,10 +189,12 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           && (() => {
             const status = readStatus({ repo, pr, head });
             // An accepting review with no status still owes its normal pass.
-            return (status == null && !owed) || (status?.status === 'finished'
-              && normalizeRedTeamResult(status.result).priorResult === 'not-owed'
-              && !status.result?.deferredByGuard && !status.result?.deferredByCap
-              && evidence.seatRecorded === false);
+            // Both the selected evidence and the live status must permit clearing:
+            // a raw reread must not resurrect a status discarded for a newer acceptance.
+            return (status == null && !owed) || (evidence.seatRecorded === false
+              && [evidence.status, status].every(candidate => candidate?.status === 'finished'
+                && normalizeRedTeamResult(candidate.result).priorResult === 'not-owed'
+                && !candidate.result?.deferredByGuard && !candidate.result?.deferredByCap));
           })()
           && redTeamRequired(evidence.loopPayload?.verdict?.verdict)
           && evidence.recorded !== true && evidence.seatRecorded !== true) {
