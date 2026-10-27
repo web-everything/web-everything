@@ -59,7 +59,7 @@ describe('R157 repeat failure quarantine', () => {
     const out = runSafetyNet({ now, dir: temp(), mainCiRuns: { runs: [{ ...rows[0], headSha: rows[1].headSha, createdAt }, rows[1]], failing: { runId: 2, jobs: ['integration'] } },
       touchedFiles: () => [], readJobs, readLog: () => failure,
       readList: () => ({ ok: true, list: { version: 1, entries: [] } }), write, log: () => {} });
-    expect(out.plan).toMatchObject({ action: 'none', why: expect.stringMatching(/insufficient|createdAt|chronolog|timestamp/) });
+    expect(out.plan).toMatchObject({ action: 'none', why: expect.stringMatching(/not a proven flake|insufficient|createdAt|chronolog|timestamp/) });
     expect(readJobs.mock.calls.some(([id]) => id === 1)).toBe(false);
     expect(write).not.toHaveBeenCalled();
   });
