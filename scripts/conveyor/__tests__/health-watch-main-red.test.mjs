@@ -39,6 +39,133 @@ const passingTip = () => ({
   checkRuns: [{ id: 1, name: 'test', status: 'completed', conclusion: 'success' }],
 });
 
+describe('planMainRedAlert — recovery requires affirmative conclusions on every tip check', () => {
+  describe.each(['workflow-SHA', 'tip-required-checks'])('%s recovery', (via) => {
+    const recoveryInput = (check) => ({
+      runs: via === 'workflow-SHA' ? greenRuns() : redRuns(),
+      tip: {
+        ...passingTip(),
+        // Keep the workflow-SHA case independent of required-check recovery.
+        requiredChecks: via === 'workflow-SHA' ? ['not-on-page'] : ['test'],
+        checkRuns: [...passingTip().checkRuns, { id: 2, name: 'smoke', ...check }],
+      },
+    });
+
+    it.each([
+      ['completed', 'cancelled'],
+      ['completed', 'skipped'],
+      ['completed', 'timed_out'],
+      ['completed', null],
+      ['queued', 'success'],
+      ['in_progress', 'neutral'],
+    ])('fails closed once for a %s tip check with conclusion %j, preserving the outstanding alert', (status, conclusion) => {
+      const observation = recoveryInput({ status, conclusion });
+      const state = mainRedState(observation.runs, { tip: observation.tip });
+      expect(state.status).toBe('green');
+      if (via === 'tip-required-checks') expect(state.via).toBe(via);
+      else {
+        expect(state.via).not.toBe('tip-required-checks');
+        expect(state.latestGreen.sha).toBe(observation.tip.sha);
+      }
+
+      const red = plan();
+      const unknown = plan({ ...observation, prev: red.next });
+      expect.soft(kinds(unknown)).toEqual(['main-status-unknown']);
+      expect.soft(unknown.next.fingerprint).toBe(red.next.fingerprint);
+      expect.soft(unknown.next.fingerprintParts).toEqual(red.next.fingerprintParts);
+      expect.soft(unknown.next.unknownEmitted).toBe(true);
+
+      const repeated = plan({ ...observation, prev: unknown.next, now: START + 31 * MINUTE });
+      expect.soft(repeated.items).toEqual([]);
+      expect.soft(repeated.next.fingerprint).toBe(red.next.fingerprint);
+      expect.soft(repeated.next.fingerprintParts).toEqual(red.next.fingerprintParts);
+      expect.soft(repeated.next.unknownEmitted).toBe(true);
+
+      const recovered = plan({
+        ...recoveryInput({ status: 'completed', conclusion: 'neutral' }), prev: repeated.next,
+      });
+      expect.soft(kinds(recovered)).toEqual(['main-green']);
+      expect.soft(recovered.next.fingerprint).toBeNull();
+      expect.soft(recovered.next.unknownEmitted).toBe(false);
+    });
+
+    it.each(['success', 'neutral'])('clears only when every tip check is completed with success or neutral (%s)', (conclusion) => {
+      const observation = recoveryInput({ status: 'completed', conclusion });
+      const recovered = plan({ ...observation, prev: plan().next });
+      expect(kinds(recovered)).toEqual(['main-green']);
+      expect(recovered.next.fingerprint).toBeNull();
+      expect(recovered.next.unknownEmitted).toBe(false);
+    });
+  });
+});
+
+describe('runMainRedAlert — feed deduplication after publish succeeds and state persistence fails', () => {
+  it.each([
+    ['main-status-unknown', 'empty persisted state'],
+    ['main-status-unknown', 'outstanding red alert'],
+    ['main-status-unknown', 'legacy alert without seq'],
+    ['main-red', 'empty persisted state'],
+    ['main-red', 'changed alert details'],
+    ['main-green', 'outstanding red alert'],
+  ])('replays the same %s head from %s at a later tick without a duplicate feed event', async (kind, scenario) => {
+    const initial = scenario === 'empty persisted state' ? {} : plan({ prev: { seq: 40 } }).next;
+    if (scenario === 'legacy alert without seq') delete initial.seq;
+    const oldState = structuredClone(initial);
+    let persisted = structuredClone(initial);
+    let openKeys = [];
+    const events = [];
+    const feedBatches = [];
+    let tickNow = START + 30 * MINUTE;
+    const writeError = new Error('simulated state write failure after successful publish');
+    const readState = vi.fn(async () => structuredClone(persisted));
+    const writeState = vi.fn()
+      .mockRejectedValueOnce(writeError)
+      .mockImplementation(async (_dir, next) => { persisted = structuredClone(next); });
+    const publish = vi.fn(async (item) => {
+      const feed = diffFeed(openKeys, [item], tickNow, { incomplete: true });
+      openKeys = feed.openKeys;
+      feedBatches.push(feed.lines);
+      events.push(...feed.lines.map(parseFeedLine));
+    });
+    const args = {
+      dir: 'unused-injected-state', readState, writeState, publish,
+      probe: kind === 'main-status-unknown' ? null : kind === 'main-green'
+        ? { runs: greenRuns(), tip: passingTip() } : { runs: redRuns() },
+      readDetails: vi.fn(async () => scenario === 'changed alert details'
+        ? { ...details(), failingJobs: ['smoke'] } : details()),
+    };
+
+    await expect(runMainRedAlert({ ...args, now: tickNow })).rejects.toBe(writeError);
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(writeState).toHaveBeenCalledTimes(1);
+    expect(persisted).toEqual(oldState);
+    expect(feedBatches[0]).toHaveLength(1);
+    expect(events.map((event) => event.kind)).toEqual([kind]);
+
+    tickNow += MINUTE;
+    const retried = await runMainRedAlert({ ...args, now: tickNow });
+    expect(readState.mock.results).toHaveLength(2);
+    expect(await readState.mock.results[1].value).toEqual(oldState);
+    expect(publish).toHaveBeenCalledTimes(2);
+    expect(kinds(retried)).toEqual([kind]);
+    const [firstItem, replayedItem] = publish.mock.calls.map(([item]) => item);
+    expect.soft(replayedItem.head).toBe(firstItem.head);
+    expect.soft(firstItem.head).not.toContain(String(START + 30 * MINUTE));
+    expect.soft(replayedItem.head).not.toContain(String(tickNow));
+    expect.soft(feedBatches[1]).toEqual([]);
+    expect.soft(events.map((event) => event.kind)).toEqual([kind]);
+    expect.soft(openKeys).toHaveLength(1);
+    expect(persisted).toEqual(retried.next);
+    expect(persisted.seq).toBe((oldState.seq ?? 0) + 1);
+
+    tickNow += MINUTE;
+    const quiet = await runMainRedAlert({ ...args, now: tickNow });
+    expect(quiet.items).toEqual([]);
+    expect(publish).toHaveBeenCalledTimes(2);
+    expect(writeState).toHaveBeenCalledTimes(3);
+  });
+});
+
 describe('planMainRedAlert — proven tip recovery regressions', () => {
   const successfulChecks = (count) => Array.from({ length: count }, (_, index) => ({
     id: index + 1, name: `check-${index + 1}`, status: 'completed', conclusion: 'success',
