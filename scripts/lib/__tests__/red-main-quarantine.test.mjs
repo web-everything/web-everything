@@ -18,9 +18,9 @@ const TEST = 'skills-src/conveyor/__tests__/reconcile-fix-dispatch-daemon.test.m
 const listWith = (tests, sha = SHA, now = NOW) => addEntries(null, { tests, brokenSha: sha, owner: 'main-fix-7e5137663', reason: 'red on main', actor: 'red-main-safety-net', now }).list;
 
 describe('quarantine — settings', () => {
-  it('mode defaults to stop; the shipped platform preference is stop; env can switch it', () => {
+  it('mode defaults to stop; the shipped platform preference is quarantine; env can switch it', () => {
     expect(resolveRedMainMode({ env: {}, file: '/nonexistent' })).toEqual({ value: 'stop', source: 'default' });
-    expect(resolveRedMainMode({ env: {} }).value).toBe('stop');
+    expect(resolveRedMainMode({ env: {} }).value).toBe('quarantine');
     expect(resolveRedMainMode({ env: { WE_DRAIN_RED_MAIN_MODE: 'quarantine' } })).toEqual({ value: 'quarantine', source: 'env' });
   });
 });
