@@ -38,6 +38,8 @@ export function planMainRedAlert(input = {}) {
   const provenGreen = tipReadable && (state.via === 'tip-required-checks'
     || (state.latestGreen?.sha === tip.sha
       && Array.isArray(tip.requiredChecks) && tip.requiredChecks.length > 0
+      // A full check page may be truncated; retain unknown until required checks prove recovery.
+      && tip.checkRuns.length < 100
       && tip.checkRuns.every((check) => check?.name && check.status === 'completed')
       && !tipVerdicts.includes('pending')));
   if (!['red', 'green'].includes(state.status) || (state.status === 'green' && !provenGreen)) {
