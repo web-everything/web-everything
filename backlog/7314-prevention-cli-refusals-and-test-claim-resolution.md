@@ -18,6 +18,22 @@ PR #5982's review found undocumented coverage gaps in delegated clearance and te
 - [A2] A doc-claim rule resolves every backticked test/suite reference in `we:docs/agent/testing.md` to a repository file or exact test/describe title, including parameterized titles and repository-qualified paths. A missing file or invented case must fail; prose/code identifiers that are not test claims must not be misclassified.
 - [A3] An executable guarantee-to-test manifest maps each claimed guarantee to a file, exact case title, and observable assertion. The selected CI gate must run the mapped tests. Cover delegated pin/delegation/new-head refusals and head changes at each admission boundary. Add sweep argv integration, shadow/live reads, memo persistence, and default-reader gate rejection only when those behaviors exist.
 - [A4] Focused rule tests cover aliases, renamed cases, multiline diagnostics, dynamic messages, unreadable files, and unknown assertion mappings. Unknown evidence fails with a diagnostic naming the missing mapping.
+- [A5] A parameterized refusal test claiming no writes must assert every durable sink at every boundary, including an explicit expected row set when earlier writes are allowed. PR #5982's later-read ledger omission motivates this rule.
+- [A6] The PR-comment-read ratchet detects `--json` field lists carried through variables or parameter defaults, or requires a recorded justification for a baseline decrease without removal of the read. PR #5982 restores the visible literal and baseline locally; general data-flow detection remains owed.
+
+## Planned named tests (not implemented by this card)
+
+All cases below belong to the planned `scripts/lib/__tests__/cli-refusal-claim-guard.test.mjs`;
+they describe the observable gate result, not claims of existing coverage.
+
+| Guarantee | Planned exact case title | Assertion |
+| --- | --- | --- |
+| A1 | `rejects an uncovered CLI refusal and accepts its named exit mapping` | An uncovered diagnostic fails; its mapped regression passes. |
+| A2 | `resolves parameterized test titles and rejects missing files or invented cases` | Real titles resolve; missing/invented claims fail; ordinary identifiers are ignored. |
+| A3 | `runs every selected guarantee mapping and rejects unknown assertions` | Manifest selection contains every mapped case; an unknown assertion blocks selection. |
+| A4 | `fails closed for stale aliases, dynamic diagnostics and unreadable evidence` | Renamed/unknown mappings and unreadable input identify the missing evidence; mapped multiline diagnostics pass. |
+| A5 | `rejects a refusal matrix that omits a durable sink at a later boundary` | Omitting ledger assertions at any boundary fails; an explicit prior-row set passes. |
+| A6 | `detects comment fields in defaults and variables and rejects unexplained baseline decreases` | Moving the same read into a default/variable cannot reduce the ratchet count silently. |
 
 ## Non-goals
 

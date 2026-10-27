@@ -1,9 +1,10 @@
 /** @file The `advisory:*` staleness sweep — labels come off a PR whose head moved, and only those. No `gh`. */
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { publishStoredRedTeamResult } from '../../lib/red-team-withheld-publish.mjs';
 import { describe, expect, it } from 'vitest';
+import { findTruncatedCommentReads } from '../../lib/pr-comment-read-guard.mjs';
 
 import {
   defaultListUnpublishedStatuses, LIST_COMMENTS_CAP, carriesAdvisoryLabel, commentsMayBeTruncated, defaultListPrs, defaultReadPr, sweepAdvisoryLabels as realSweep,
@@ -15,6 +16,13 @@ const HEAD = 'fd37ce270'.padEnd(40, 'a');
 const NEW_HEAD = 'b'.repeat(40);
 
 describe('advisory reader field projection', () => {
+  it('keeps the default list comment read visible to the truncation ratchet', () => {
+    const source = readFileSync('scripts/conveyor/advisory-label-sweep.mjs', 'utf8');
+    const baseline = JSON.parse(readFileSync('scripts/pr-comment-read-baseline.json', 'utf8'));
+    expect(findTruncatedCommentReads(source).filter(site => site.kind === 'json-comments')).toHaveLength(1);
+    expect(baseline['scripts/conveyor/advisory-label-sweep.mjs']).toBe(1);
+  });
+
   it.each([
     { name: 'default', fields: undefined, expected: 'number,labels,headRefOid,comments' },
     { name: 'explicit', fields: 'number,state,statusCheckRollup', expected: 'number,state,statusCheckRollup' },
