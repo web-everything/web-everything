@@ -857,6 +857,20 @@ describe('readStackBases — declared lane bases (live #5996 #5997 #5983 #6003)'
   const expected = p => ({ pr: p.bottom, ref: p.baseRefName, head: p.baseTip,
     contained: p.baseTip, tree: TREE, topHead: p.headRefOid });
 
+  it.each([MAIN, shapes[0].baseTip])('resolves a PR-less base already on main at %s without a containment diagnostic', head => {
+    const f = fixture();
+    const p = shapes[0];
+    f.tips.set(p.baseRefName, head);
+    // rev-list <base> ^origin/main is empty both at main's tip and for an older landed tip.
+    f.sets.set(head, { first: [], reach: [] });
+    f.sets.set(p.headRefOid, { first: [p.headRefOid], reach: [p.headRefOid] });
+    const diag = new Map();
+    expect(f.read({ prlessBase: true, diag }).get(p.number)).toEqual({
+      ...expected(p), head, contained: head,
+    });
+    expect(diag.has(p.number)).toBe(false);
+  });
+
   it('resolves #5997 over open #5981 from GitHub records', () => {
     const f = fixture();
     const diag = new Map();

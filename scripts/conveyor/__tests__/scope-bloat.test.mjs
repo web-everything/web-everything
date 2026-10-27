@@ -765,6 +765,30 @@ describe('enrichPrsWithScopeBloat — stack base resolution from the four live s
     readStackFiles: () => { throw new Error('an unresolved stack must not read files'); },
   };
 
+  it.each(['off', 'false', '0'])('preserves ordinary one-file assessment with WE_STACK_AWARE_REVIEW=%s', setting => {
+    const pr = { ...input(shapes[0], 10), baseRefName: 'lane/base', files: [{ path: OWN[0] }] };
+    const events = [];
+    let stackReads = 0;
+    const [out] = enrichPrsWithScopeBloat([pr], { ...readers,
+      env: { WE_STACK_AWARE_REVIEW: setting },
+      readStacks: (prs, { diag }) => {
+        stackReads += 1;
+        return readStackBases({ prs, diag, settingOn: false });
+      },
+      emitEvent: event => events.push(event),
+    });
+    expect(out).toEqual(pr);
+    expect(out.scopeBloatUnknown).toBeUndefined();
+    expect(out.scopeBloat).toBeUndefined();
+    expect(stackReads).toBe(0);
+    expect(events).toEqual([]);
+    // The reader's explicit switch also means no computation, with no failure diagnostic.
+    const diag = new Map();
+    expect(readStackBases({ prs: [pr], diag, settingOn: false,
+      readRefs: () => { throw new Error('disabled reader must not read refs'); } })).toEqual(new Map());
+    expect(diag.size).toBe(0);
+  });
+
   it.each(shapes)('assesses #%s against its resolved base tree and exposes only numbered stack bases', (number, headRefName, baseRefName, bottom) => {
     const pr = input([number, headRefName, baseRefName, bottom], 1);
     const stack = { pr: bottom, ref: baseRefName, head: sha(number + 30000),
