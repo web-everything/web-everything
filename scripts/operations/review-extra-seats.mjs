@@ -81,6 +81,7 @@ export { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTe
 import { expectationForLens, huntBriefForLens } from '../lib/review-core.mjs';
 import { verifySavedRedTeamProvenance } from '../lib/saved-red-team-provenance.mjs';
 import { appendScorecard, readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
+import { scorecardOperationSnapshot, snapshotStoreRecords } from '../lib/scorecard-operation-snapshot.mjs';
 import { scrubPublish } from '../lib/secret-scrub.mjs';
 import { parseDelegationMarker } from '../lib/delegation-marker.mjs';
 import { logDelegationTrial } from '../conveyor/log-delegation-trial.mjs';
@@ -1521,9 +1522,8 @@ export async function speculateRedTeam({
     const settings = readRedTeamProbes({ env, log: io.log });
     const now = io.now();
     let records = [];
-    try { records = io.readRecords(); } catch (e) {
-      if (resumeOnly) return { status: 'skipped', reason: 'resume-only: scorecard store unreadable — no call launched' };
-      io.log(`red team: could not read the scorecard store (${e.message}) — treating it as empty`);
+    try { records = io.readRecords({ strict: true }); } catch (e) {
+      if (e.code !== 'ENOENT') return { status: 'skipped', reason: `${resumeOnly ? 'resume-only: ' : ''}scorecard store unreadable — no call launched` };
     }
     const completed = priorRedTeamRow(records, pr, rev, repo);
     const prior = resumeOnly ? completed
@@ -1843,7 +1843,7 @@ export function createRedTeamIo({ env = process.env, root = REPO_ROOT, storePath
   return {
     ...base,
     readRecords: ({ strict = false } = {}) => strict
-      ? readStore({ path: storePath ?? resolveScorecardStorePath(env), strict: true }).records : base.readRecords(),
+      ? snapshotStoreRecords(scorecardOperationSnapshot(storePath ?? resolveScorecardStorePath(env)), { strict: true }) : base.readRecords(),
     readRedTeamStatus: input => readRedTeamStatus({ ...input, env }),
     readRecoveryComments: ({ pr, repo }) => readCompletePrComments(pr, { repo,
       exec: (file, args, options) => execRead(file, args, { ...options, cwd: root, env }) }),

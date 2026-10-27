@@ -124,17 +124,18 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   // Carry identities retain the writer's casing; both lookups keep the journal's strict validation.
   const carry = readRedTeamCarry({ repo, pr, head, env })
     ?? (originalHead !== head ? readRedTeamCarry({ repo, pr, head: originalHead, env }) : null);
+  const ownStatus = carriedFrom => status === undefined || (matchingStatus
+    && (String(status.loopPayload?.carriedFrom ?? '').toLowerCase() === String(carriedFrom).toLowerCase() || (String(status.head ?? '').toLowerCase() === String(carriedFrom).toLowerCase() && status.skipCardOnly === true))
+    && status.status === 'finished'
+    && (status.result === 'skipped' || (status.result?.status === 'skipped' && status.result.policy === 'card-only')));
   const carriedFrom = carry?.loopPayload.carriedFrom
-    ?? (matchingStatus && eligibleRedTeamCarryPayload(status.loopPayload, status.head)
+    ?? (matchingStatus && status.skipCardOnly === true && ownStatus(status.loopPayload?.carriedFrom)
+      && eligibleRedTeamCarryPayload(status.loopPayload, status.head)
       ? status.loopPayload.carriedFrom : undefined);
   if (carriedFrom) {
     const latest = latestRun(false).run;
     const laterPanel = latest && String(latest.findings?.read?.netBasis?.rev ?? '').toLowerCase() !== String(carriedFrom).toLowerCase();
-    const ownStatus = status === undefined || (sameRepo(status?.repo, repo) && Number(status.pr) === Number(pr) && String(status.head ?? '').toLowerCase() === head
-      && (String(status.loopPayload?.carriedFrom ?? '').toLowerCase() === String(carriedFrom).toLowerCase() || (String(status.head ?? '').toLowerCase() === String(carriedFrom).toLowerCase() && status.skipCardOnly === true))
-      && status.status === 'finished'
-      && (status.result === 'skipped' || (status.result?.status === 'skipped' && status.result.policy === 'card-only')));
-    if (laterPanel || (carry && !ownStatus) || recorded) {
+    if (laterPanel || (carry && !ownStatus(carriedFrom)) || recorded) {
       return { attempted, ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), noUsableResult: false, loopPayload: latest, status, carryConflict: true, inFlight: false,
         recorded, ...seatEvidence, scheduled: false };
     }
@@ -172,9 +173,9 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
         live = !start || !status.pidStart || start === status.pidStart;
       }
     }
-    // Settlement provenance cannot stand in for a panel verdict, even if an older
-    // writer retained one. Keep the status intact for recovery's provenance checks.
-    const loopPayload = status.loopPayload?.carriedFrom != null ? { ...status.loopPayload, verdict: null } : status.loopPayload;
+    // Valid settlement provenance cannot stand in for a panel verdict, even if an
+    // older writer retained one. Unrelated status metadata cannot erase a real verdict.
+    const loopPayload = carriedFrom ? { ...status.loopPayload, verdict: null } : status.loopPayload;
     return withUsability({ ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), status, ...seatEvidence, loopPayload, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
       ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: attempted || redTeamPanelSeatOwed(status.loopPayload, env) || ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(resultStatus),
       recorded: recorded || resultStatus === 'ran',

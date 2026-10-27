@@ -1390,8 +1390,29 @@ export function runRedTeamOnlyJob({ pr, repo, head, requestPath, laneWaitMs = RE
     // The lane wait can be long: re-check the head right before the run, so a moved head never gets an old-head pass.
     const again = String(io.readLiveHead({ pr: planned.pr, repo: planned.repo }) ?? '').toLowerCase();
     if (again !== h) return finish({ outcome: 'head-moved', reason: `PR head moved to ${again.slice(0, 12) || '-'} while waiting for a lane` });
-    const input = { pr: planned.pr, repo: planned.repo, lanePath, loopPayload: req.loopPayload, slug };
-    io.redTeamStatus?.({ ...input, status: 'queued' });
+    let input = { pr: planned.pr, repo: planned.repo, lanePath, loopPayload: req.loopPayload, slug, redTeamMode: 'fresh' };
+    try {
+      let redTeamAdmission;
+      if (typeof io.readRedTeamOnlyPayload === 'function') {
+        const evidence = io.readRedTeamOnlyPayload({ pr: planned.pr, repo: planned.repo, head: h });
+        if (!Number.isSafeInteger(evidence?.failedSeatCount)
+          || typeof evidence.completedRecorded !== 'boolean' || typeof evidence.seatRecorded !== 'boolean') {
+          throw Error('red-team admission evidence unreadable; inspect stored evidence before retrying');
+        }
+        const refusal = freshRedTeamRefusal(evidence.status, evidence);
+        if (refusal) throw Error(`${refusal}; inspect stored evidence before retrying`);
+        const prior = evidence.status;
+        redTeamAdmission = { pid: process.pid, prior: prior == null ? null : {
+          repo: prior.repo, pr: prior.pr, head: prior.head, status: prior.status, result: prior.result,
+          ...(prior.retryCount !== undefined ? { retryCount: prior.retryCount } : {}),
+        } };
+      }
+      const queued = io.redTeamStatus?.({ ...input, status: 'queued', preflightFresh: true });
+      redTeamAdmission = queued?.redTeamAdmission ?? redTeamAdmission;
+      if (redTeamAdmission) input = { ...input, redTeamAdmission };
+    } catch (error) {
+      return finish({ outcome: 'refused', reason: tail(error?.message ?? error, 300) });
+    }
     let redTeam;
     try { redTeam = io.runRedTeam(input); } catch (e) { redTeam = { status: 'error', reason: tail(e?.message ?? e, 300) }; }
     let gate = null;
