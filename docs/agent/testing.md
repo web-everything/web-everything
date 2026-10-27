@@ -1,5 +1,41 @@
 # Testing — Three-Tier Strategy
 
+## PR size admission trust-boundary fixtures
+
+`scripts/lib/__tests__/pr-size-admission.test.mjs` exercises Git with real shadow refs and
+round-trips hostile filenames through `planFileItem` and `js-yaml`. Size evidence must carry
+full head/base SHAs; mock symbolic SHA strings no longer represent valid Git evidence.
+Retry fixtures need a trusted card store keyed by repository and head SHA; assigning a PR
+number after creation must reuse the initial card. Cover retries with and without a saved body.
+Body markers are display hints; publication must be confirmed again from the store/publisher.
+Size sections use exact `<!-- pr-size:begin -->` and `<!-- pr-size:end -->` markers on
+their own lines. One unambiguous plain pair replaces the enclosed display text, even if
+edited; no pair appends a fresh section. Malformed, partial, nested, duplicate or nonplain
+markers preserve the entire body and append a fresh section. Identical retries are byte-stable,
+including after a conservative append. No machine-local state is read or created (R126).
+Test replacement across a fresh HOME and preserve all bytes before and after the pair,
+including CRLF. PR text remains untrusted: neither delimiters nor enclosed receipts authorize
+card filing or publication, which must be checked through the trusted store/publisher (R115).
+The fresh-HOME child also records and rejects synchronous file open/read/write and subprocess
+attempts after module loading, with diff/card effects injected. Assert no attempts on creation
+or retries: an empty directory alone cannot detect a secret read whose failure was swallowed.
+Without pinned evidence, the display key hashes repo, PR-or-ref, requested SHA and base; it
+does not make an unresolved head eligible for trusted card lookup.
+pr-land re-reads the live body after card filing and skips the note when it changed or is unreadable.
+Author text is never truncated or escaped: past the forge body limit the note is skipped and the
+body returned unchanged (no edit), and every fallback, including the runner's outer catch, returns
+the caller's body. Reviewers are still requested in each case.
+Unknown or stale evidence and unreadable/ambiguous stores file conservatively and request reviewers.
+
+The legacy `file-item` scope flag is a comma list whose renderer supplies YAML double quotes.
+Size admission JSON-escapes each scalar's contents before bounding entries; it also escapes YAML
+line separators and trailing whitespace. Comma-bearing paths are omitted with an explicit count.
+Every incomplete summary names human review of the full diff as its fallback. Keep these tests
+in the shared suite and run it and the scoped producer/prepare suites through heavy admission.
+Identity, path and published batch-ref validators use explicit absolute-end assertions
+(`(?![\s\S])`). Keep the named trailing-newline regressions and the CR/CRLF/Unicode
+line-separator suffix cases in that required scoped gate.
+
 ## Established-overlay auto-rebase
 
 Operator withdrawal wins over a detached repair: the worker rechecks its source registration
@@ -549,12 +585,13 @@ R125: `measureNonTestLines` excludes pure data from the 300-line budget and repo
 and `.csv`, under a `config/` or `data/` directory segment at any depth. Exact `dataPaths` add exceptions
 only for those four extensions; `dataExtensions` may select only within that set. Code and markdown
 cannot become data exemptions. Absolute paths and paths with empty, `.` or `..` segments always count.
-The IO caller resolves `prSize` through the shared policy cascade and `scripts/pr-size-settings.json`;
+The shared producer admission resolves `prSize` through the shared policy cascade and `scripts/pr-size-settings.json`;
 JSON-array env overrides are `WE_PR_SIZE_DATA_EXTENSIONS`, `WE_PR_SIZE_DATA_DIRS`, and `WE_PR_SIZE_DATA_PATHS`.
-Invalid present settings at any layer throw and refuse submission as `pr-size-unreadable`; only an absent
-tool settings file uses lower layers and built-in defaults. Restore valid settings before retrying.
+Invalid present settings at any layer make size unknown, file a split card conservatively and request
+extra reviewers without refusing PR creation; only an absent tool settings file uses lower layers and
+built-in defaults. Restore valid settings before retrying measurement.
 The counter defaults to dependency-free frozen built-ins to preserve the declaration's import safety.
-Keep the classification, settings provenance, refusal detail, binary/overflow refusal, and conservative
+Keep the classification, settings provenance, data accounting, binary/overflow errors, and conservative
 rename cases in `scripts/operations/__tests__/open-pr-size-cap.test.mjs`.
 
 `fix.alertAtRoundCap` publishes through the needs-you feed as soon as the notes pass observes exhaustion,
@@ -1158,6 +1195,39 @@ plugs/__tests__/e2e/sw-fixtures/          # static fixture server + SW/page + re
 | Store | Yes | Maybe | If in demo |
 | Demo feature | No | No | Yes |
 
+## Delivery policy path probes
+
+All worktree delivery-policy sources and journal IO use `resolveTrustedConfigPath` in
+`scripts/lib/delivery-policy.mjs`. Canonical allowed bases may resolve platform aliases;
+symlinks below those bases are refused, including parents whose targets stay inside the base.
+Use its `beforeRead` hook to swap a leaf or directory after validation: reads/appends must
+refuse the swap or retain the originally validated inode. The fd's device/inode and size
+are checked before IO, and reads are bounded even if a concurrent writer grows the file.
+Cache hits still check paths; the existing mtime-based content cache remains intentional.
+
+Explicit journal redirects must stay inside the working directory, daemon state, or the
+configured logs root. Fixtures should put journals under their isolated daemon state.
+Invalid policy sources retain defaults (or the protective failsafe) with warnings; journal
+failures remain best effort (empty reads, skipped writes). Journals reaching the 1 MiB source
+limit require operator rotation before further reads/appends. Regression home:
+`scripts/lib/__tests__/delivery-policy.test.mjs`.
+
+Policy defaults use a code-owned runtime import allow-list (currently empty).
+Check source before bundling, generated output after bundling, and the exact bytes at
+the runtime import boundary. Computed imports, template specifiers (including plain
+templates), concatenation, unlisted literals, `import.meta`, and dynamic code constructors
+must be refused. Type-only imports are erased; strings and comments are inert data.
+The `policy runtime import allow-list` tests pair an approved literal with isolated
+refusals at both scan and runtime boundaries. Keep each refusal independent of unrelated
+forbidden syntax so a second guard cannot mask a regression.
+
+Journal append tests cover exclusive lock creation, owner-token checks before writes and
+release, and size checks after acquisition. A stale lock with a live or unknown PID must
+remain held. Competing stale removers must serialize through the same generation guard
+as normal release, then recheck ownership; an abandoned generation guard requires
+operator cleanup after checking that no writer is active. Preserve the synchronized
+two-writer tests, including the case with capacity for only one more record.
+
 ## Quality guidelines
 Real Git fixtures must pass `-c gc.auto=0 -c maintenance.auto=false` on their Git invocations.
 A large seed commit can launch detached maintenance/repack that outlives `execFileSync`, racing
@@ -1643,6 +1713,66 @@ and cache replay assertions on that fallback. Keep the fake host's throttle stor
 suite cannot consume its budget. Numbering fixtures likewise pass a private `lockRoot` to the real
 mutex instead of acquiring the developer's shared drain lock.
 
+### Card numbers at birth
+
+`card-number-allocator.mjs` shares the drain numbering mutex and persists host reservations
+before releasing it. Allocator tests must inject temporary `lockRoot` and `statePath` values;
+remote-claim probes use an injected transport, never the live remote. Producers fall back to
+hash paths on unavailable or truncated canonical main or remote-ref evidence; `backlog.cardNumbering.remote=required`
+refuses instead. `WE_NUMBER_AT_BIRTH=off` retains hash naming. Numeric cards carry their fresh
+hash only in `bornAs`. The drain's existing hash-only selection leaves these cards untouched.
+CLI probes must also isolate `HOME` and Git transport so they cannot reserve production card numbers.
+The create-only `refs/card-ids/<HASH_RE id>` mapping and number reservation share one blob and
+one atomic push with empty-ref leases. Test replay with separate host state, two distinct ids,
+and races on either claim; neither ref may be replaced. Settings resolve through the shared
+cascade with each leaf’s source logged under `backlog.cardNumbering.*`.
+
+Deferred numbering uses the same atomic remote reservations even when birth numbering is off.
+With a configured remote, an unavailable canonical tree or reservation listing holds the hash cards;
+only repositories without any remote retain local-only numbering. Test an outstanding birth claim
+against the actual deferred-numbering dry run, and test allocation/replay races through the shared core.
+Refresh canonical evidence before scanning landed `bornAs` identities. Cover a stale checkout
+whose pending hash already landed without reservation refs: identical content deduplicates and
+differing content holds, with no new claim. Deferred-numbering fixtures inject the `execFile`
+option on `numberPendingHashes` and mock the shared process reader, so every Git path uses
+the same fixture without depending on captured builtin imports or patching native ESM bindings.
+Review staleness fixtures must use off-path files from the current sandbox import closure.
+Collision healing now pulls `backlog/frontmatter.mjs` onto that path; cover its refusal and
+use `backlog/capacity.mjs` for tolerated unrelated lag in both dispatch modes and the soak.
+Both collision planners refuse to move a `bornAs` card or a reserved source number. Remote-backed
+heals never reuse a gap below the frontier: trees and reservation refs cannot show whether a gap
+held a legacy card deleted before reservation refs existed. They take a fresh number above every
+reserved, canonical and local number, claim all targets atomically before rewriting, and refuse
+for manual repair when the number range is exhausted. The manual `yield` command uses the same
+guards, including with `--force`. Claims survive a failed rewrite or publish.
+Test reserved legacy sources without `bornAs` independently in both planners and in `yield --force`.
+Exercise `yield` and the renumber CLI with a stub Git transport: leave an untraced gap below the
+frontier, include a canonical-tree number, and snapshot every backlog file at push time to prove
+the claim precedes any write or delete. Rejected claims, unavailable evidence, and an exhausted
+range must preserve all files; a renumber dry run must neither claim nor write. No-op renumber runs (including
+base-owned or entirely published duplicates) must not read remote numbering evidence.
+The allocator suite pins the held-fix-claim refusal before constraint reads or reservation
+pushes, and asserts that reservations survive both failed index rewrites and failed publication.
+It also observes the allocator's log callback for each effective setting and its source.
+Remote-backed gap selection uses current trees and reservation refs, without historical deletion
+evidence; the historical-number reuse policy is tracked in
+#7317.
+Canonical tree reads use NUL-delimited paths; cover Unicode, quotes, backslashes and embedded newlines.
+Allocation and replay must obey the five-digit numeric ID grammar, including contention at 99999.
+Numbering evidence reads leave tracking refs unchanged by default: fetch with an empty refmap
+into a unique per-call `refs/tmp/numbering-*` ref without writing `FETCH_HEAD`, then delete the
+private ref in `finally`. Interleaved readers must retain their own trees; failed fetches or
+tree reads must still attempt cleanup. Collision healing cannot change a rebuild's parent
+after its tree was computed. Deferred numbering explicitly opts into refreshing tracking
+before its `bornAs` scan, while reading numeric evidence from its own private ref too.
+Cover a remote main advance during the actual `rebaseDropManifest` collision-healing path and
+assert that the committed parent and tree still describe the same main snapshot.
+Permanent reservation listings use a bounded 32 MiB budget in both the parser and subprocess,
+enough for paired number/card-id refs throughout the five-digit range, including SHA-256 OIDs.
+Canonical path reads use the same budget so a full backlog does not hit a smaller output cap.
+Cover 8,500 claims, allocation of 99999, replay after a lost push response, and oversized refusal;
+also exercise the shared Git runner to catch adapters that silently discard `maxBuffer`.
+
 ### Dispatched conflict resolution
 
 `we:scripts/conveyor/resolve-conflict.mjs` uses index stages only inside a lane clone with
@@ -1741,6 +1871,13 @@ bornAs alias checks for hashes.
 
 ### Enqueue catch-up ordering
 
+Catch-up children share `--listing-snapshot` within one round; the target is always re-read live. Replay
+fresh, expired, foreign and malformed round files, and candidates missing labels or base `main`.
+Queue eviction must use fresh, unfiltered rows even when candidates come from that round file.
+The CLI regressions in `scripts/__tests__/merge-ai-prs.test.mjs` cover newly held manually queued PRs
+with no follow-up record, omitted snapshot rows, reconciliation off, and failed eviction reads.
+
+
 The enqueue catch-up regression must exercise spawned fast drains, not only the planner:
 `duePending` can otherwise undo the selected priority order. Queue fill depth comes from
 `mergeQueue.enqueueOnEvent.catchUp.maxQueued`, independently of `mergeDelivery.batchSize`.
@@ -1762,6 +1899,8 @@ Probe busy scheduling from round completion with room and an unqueued runnable P
 scheduling with a full queue or backed-off work. Never start a second drain for an active PR; a
 wake that arrives during its run stays pending until the run ends, unless that run verified the enqueue;
 shutdown must kill every child and prevent further starts. Inject all GitHub reads in these tests.
+
+
 
 ## Referral rulings answering stand-downs
 

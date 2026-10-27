@@ -3,9 +3,11 @@ bornAs: xx7o40x
 kind: story
 size: 5
 parent: "6122"
-status: open
+status: resolved
 scope: ["we:scripts/lib/card-number-allocator.mjs", "we:scripts/backlog.mjs"]
 dateOpened: "2026-10-19"
+dateStarted: "2026-10-25"
+dateResolved: "2026-10-25"
 tags: []
 ---
 
