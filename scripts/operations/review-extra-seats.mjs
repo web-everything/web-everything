@@ -1690,7 +1690,10 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
     const recheckStatus = publishableRecheckStatus(pass.recheckStatus);
     const findings = pass.findings.map(withFileReadEvidence);
     let records = [];
-    try { records = io.readRecords(); } catch (e) { io.log(`red team: could not read the scorecard store (${e.message}) — treating it as empty`); }
+    try { records = io.readRecords({ strict: true }); } catch (e) {
+      if (e.code !== 'ENOENT') return { status: 'error', reason: `scorecard store unreadable: ${String(e?.message ?? e).slice(0, MAX_TEXT)}`,
+        foldedVerdict: foldRedTeamVerdict({ ran: false }) };
+    }
     const [seatRow] = buildSeatRows({
       evidence, startedAt: pass.startedAt, finishedAt: pass.finishedAt,
       callId, pr, repo, provider, model, effort, seats: [RED_TEAM_SEAT], call, parsed, claudeFindings, claudeVerdict: verdict, quota, durationMs,
@@ -1778,7 +1781,10 @@ export async function finishSpeculativeRedTeam({ pr, repo, loopPayload, pass, en
       return { status: 'stale', reason: `the jurors raised ${jurorFindings.length} finding(s) the speculative brief could not carry (the sequential brief lists them so the red team does not repeat them)` };
     }
     let records = [];
-    try { records = io.readRecords(); } catch { records = []; }
+    try { records = io.readRecords({ strict: true }); } catch (e) {
+      if (e.code !== 'ENOENT') return { status: 'error', reason: `scorecard store unreadable: ${String(e?.message ?? e).slice(0, MAX_TEXT)}`,
+        foldedVerdict: foldRedTeamVerdict({ ran: false }) };
+    }
     if (verifiedPriorRedTeamRow(records, { repo, pr, rev: pass.rev, env })) return { status: 'superseded', reason: `a completed red-team seat row for #${pr} at ${String(pass.rev).slice(0, 12)} landed meanwhile` };
     const recording = loopPayload?.replay !== true;
     return await completeRedTeam({ pr, repo, loopPayload, pass, post, record: recording }, io);

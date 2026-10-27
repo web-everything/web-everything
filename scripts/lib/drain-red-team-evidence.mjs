@@ -133,10 +133,11 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     && (String(status.loopPayload?.carriedFrom ?? '').toLowerCase() === String(carriedFrom).toLowerCase() || (String(status.head ?? '').toLowerCase() === String(carriedFrom).toLowerCase() && status.skipCardOnly === true))
     && status.status === 'finished'
     && (status.result === 'skipped' || (status.result?.status === 'skipped' && status.result.policy === 'card-only')));
+  const statusCarriedFrom = matchingStatus && status.skipCardOnly === true && ownStatus(status.loopPayload?.carriedFrom)
+    && eligibleRedTeamCarryPayload(status.loopPayload, status.head)
+    ? status.loopPayload.carriedFrom : undefined;
   const carriedFrom = carry?.loopPayload.carriedFrom
-    ?? (matchingStatus && status.skipCardOnly === true && ownStatus(status.loopPayload?.carriedFrom)
-      && eligibleRedTeamCarryPayload(status.loopPayload, status.head)
-      ? status.loopPayload.carriedFrom : undefined);
+    ?? (redTeamCardOnly(status?.loopPayload?.findings?.read) ? statusCarriedFrom : undefined);
   if (carriedFrom) {
     const latest = latestRun(false).run;
     const laterPanel = latest && String(latest.findings?.read?.netBasis?.rev ?? '').toLowerCase() !== String(carriedFrom).toLowerCase();
@@ -178,9 +179,10 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
         live = !start || !status.pidStart || start === status.pidStart;
       }
     }
-    // Valid settlement provenance cannot stand in for a panel verdict, even if an
-    // older writer retained one. Unrelated status metadata cannot erase a real verdict.
-    const loopPayload = carriedFrom ? { ...status.loopPayload, verdict: null } : status.loopPayload;
+    // A proven carry or explicit skipped-carry result cannot supply a panel verdict.
+    // Legacy skip metadata alone cannot erase a real verdict.
+    const loopPayload = carriedFrom || (statusCarriedFrom && status.result?.policy === 'card-only')
+      ? { ...status.loopPayload, verdict: null } : status.loopPayload;
     return withUsability({ ...(untrustedSavedResult ? { untrustedSavedResult: true } : {}), status, ...seatEvidence, loopPayload, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
       ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: attempted || redTeamPanelSeatOwed(status.loopPayload, env) || ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(resultStatus),
       recorded: recorded || resultStatus === 'ran',
