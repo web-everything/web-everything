@@ -7,7 +7,7 @@ import { prepareRebuild } from '../../../lib/daemon-rebuild/prepare.mjs';
 import { rebuildClone } from '../../../lib/daemon-rebuild.mjs';
 import { ACTIVE_BUILD_TOKENS, releaseBuildLease } from '../../../lib/daemon-rebuild/lease.mjs';
 import { readRebuildState, writeRebuildState } from '../../../lib/daemon-rebuild/state.mjs';
-import { addOverlay, overlayFilePath, readOverlayState, removeOverlay, writeOverlays } from '../../../lib/daemon-overlays.mjs';
+import { addOverlay, overlayFilePath, persistTipShas, readOverlayState, registrationIdentity, removeOverlay, writeOverlays } from '../../../lib/daemon-overlays.mjs';
 import { autoRetireOverlays } from '../../../lib/daemon-overlay-auto-retire.mjs';
 
 export default {
@@ -179,10 +179,102 @@ export default {
     } catch (error) { violation('crash', String(error?.message ?? error)); }
     finally { rmSync(root, { recursive: true, force: true }); }
     await retirementRecovery(violation);
+    for (const check of await registrationEvidenceReplay()) {
+      if (!check.ok) violation(check.name, JSON.stringify(check.observed));
+    }
     return { violations };
   },
   judge(report) { return report.violations.map((v) => `[${v.invariant}] ${v.detail}`); },
 };
+
+/** Send-back #5964 replay: real list locks/storage, injected Git evidence, no Git writes or network.
+ * Exported so restricted repair lanes can run the same scenario before and after source edits. */
+export async function registrationEvidenceReplay() {
+  const root = mkdtempSync(join(tmpdir(), 'overlay-registration-replay-'));
+  const env = { WE_DAEMON_OVERLAY_DIR: join(root, 'store'), WE_DAEMON_EVENTS: join(root, 'events.jsonl'),
+    WE_PLATFORM_PREFERENCES_FILE: join(root, 'prefs.json'), WE_DAEMON_OVERLAY_AUTO_RETIRE: 'shadow' };
+  const landed = 'a'.repeat(40), needed = 'b'.repeat(40), mergedTree = 'c'.repeat(40), mainTree = 'd'.repeat(40);
+  const checks = [];
+  const check = (name, ok, observed) => checks.push({ name, ok, observed });
+  const entries = () => readOverlayState(root, { env }).overlays;
+  const git = (args) => {
+    if (args[0] === 'rev-parse') return { status: 0, stdout: args.at(-1).endsWith('^{tree}') ? mainTree
+      : args.at(-1).startsWith(needed) ? needed : landed };
+    if (args[0] === 'for-each-ref') return { status: 0, stdout: `refs/remotes/origin/feature ${landed}` };
+    if (args[0] === 'merge-base') return { status: args[2] === landed ? 0 : 1, stdout: '' };
+    if (args[0] === 'cherry') return { status: 0, stdout: `+ ${needed}` };
+    if (args[0] === 'merge-tree') return { status: 0, stdout: mergedTree };
+    throw new Error(`unexpected Git call ${args[0]}`);
+  };
+  try {
+    writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, '{}');
+    const old = { ref: 'feature', sha: landed, tipSha: landed, registeredAt: 'old' };
+    writeOverlays(root, [old], { env });
+    let refreshed;
+    await autoRetireOverlays({ root, env, overlays: [old], git, refEvidence: new Map([['feature', 'refreshed']]),
+      persistTipShas: (_root, tips) => { refreshed = tips; } });
+    check('refresh-carries-registration-identity', refreshed.get('feature')?.reg?.registeredAt === 'old', refreshed.get('feature'));
+    writeOverlays(root, [{ ...old, sha: needed }], { env });
+    addOverlay(root, { ref: 'feature' }, { env });
+    check('reregistration-clears-inherited-tip', entries()[0].tipSha === undefined, entries()[0]);
+    const persisted = persistTipShas(root, refreshed, { env });
+    check('replacement-rejects-old-refresh', persisted.written === 0 && entries()[0].tipSha === undefined, { persisted, entry: entries()[0] });
+    env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'on';
+    const retired = await autoRetireOverlays({ root, env, overlays: entries(), git, refEvidence: new Map([['feature', 'missing']]) });
+    check('missing-replacement-stays-registered', retired.retired.length === 0 && entries()[0]?.sha === needed, { retired: retired.retired, entries: entries() });
+
+    const input = { ref: 'same', now: '2026-10-27T12:00:00Z' };
+    const first = addOverlay(root, input, { env }).find((o) => o.ref === 'same');
+    const tips = new Map([['same', { sha: landed, reg: registrationIdentity(first) }]]);
+    const matching = persistTipShas(root, tips, { env });
+    const second = addOverlay(root, input, { env }).find((o) => o.ref === 'same');
+    check('same-metadata-reregistration-is-distinct', JSON.stringify(registrationIdentity(first)) !== JSON.stringify(registrationIdentity(second)), { first, second });
+    const stale = persistTipShas(root, tips, { env });
+    check('matching-only-tip-persistence', matching.written === 1 && stale.written === 0, { matching, stale });
+
+    const noEvidence = addOverlay(root, { ref: 'missing' }, { env }).find((o) => o.ref === 'missing');
+    const adoptedFallback = await autoRetireOverlays({ root, env, overlays: [noEvidence], git,
+      refEvidence: new Map([['missing', 'missing']]), recordedShas: new Map([['missing', landed]]) });
+    check('replacement-rejects-unbound-adopted-tip', adoptedFallback.retired.length === 0
+      && entries().some((o) => o.ref === 'missing'), adoptedFallback);
+
+    const oldArchive = { entry: { ref: 'source', sha: landed, retiredSources: [{ entry: { ref: 'nested' }, sha: landed }] }, sha: landed };
+    const replacement = { ref: 'source', sha: needed };
+    for (const retireInto of [true, false]) {
+      writeOverlays(root, [{ ref: 'carrier', retiredSources: [oldArchive] },
+        retireInto ? replacement : { ref: 'swap', retiredSources: [{ entry: replacement, sha: needed }] }], { env });
+      removeOverlay(root, retireInto ? 'source' : 'swap', { env, requireRef: 'carrier', retireInto, retiredSha: needed });
+      const archives = entries()[0].retiredSources;
+      removeOverlay(root, 'carrier', { env });
+      const restoredSource = entries().find((o) => o.ref === 'source');
+      removeOverlay(root, 'source', { env });
+      check(`repeated-archive-preserves-nested-source-${retireInto}`, archives.length === 2 && restoredSource?.tipSha === needed
+        && entries().some((o) => o.ref === 'nested'), { archives, restoredSource, restored: entries() });
+    }
+
+    writeOverlays(root, [{ ref: 'gone', sha: landed }], { env });
+    const failedEvent = await autoRetireOverlays({ root, env, overlays: entries(), git,
+      appendDaemonEvent: async () => { throw new Error('injected daemon event failure'); } });
+    check('daemon-event-failure-is-reported', entries().length === 0 && failedEvent.retired.length === 1
+      && failedEvent.auditFailures[0]?.kind === 'overlay-retired'
+      && failedEvent.auditFailures[0]?.error === 'injected daemon event failure', failedEvent);
+
+    env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'shadow';
+    writeOverlays(root, [old], { env });
+    const failedTips = await autoRetireOverlays({ root, env, overlays: entries(), git,
+      refEvidence: new Map([['feature', 'refreshed']]), persistTipShas: () => { throw new Error('injected tip failure'); } });
+    check('tip-failure-is-reported', failedTips.auditFailures[0]?.kind === 'tip-sha', failedTips.auditFailures);
+
+    env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'off';
+    const calls = [];
+    const forbidden = (name) => () => { calls.push(name); throw new Error(name); };
+    const disabled = await autoRetireOverlays({ root, env, overlays: entries(), git: forbidden('git'),
+      appendOverlayEvent: forbidden('audit'), appendDaemonEvent: forbidden('event'),
+      removeOverlay: forbidden('remove'), persistTipShas: forbidden('tips') });
+    check('off-has-zero-side-effects', calls.length === 0 && disabled.kept.length === 1, { calls, disabled });
+    return checks;
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}
 
 /** PR #5964 advisory round, 'on' mode: a registration added without a sha retires once its landed branch is
  *  deleted, and a container closed on a later tick leaves the source retired into it registered. */

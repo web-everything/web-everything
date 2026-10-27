@@ -39,7 +39,7 @@ import {
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
@@ -270,15 +270,18 @@ export function addOverlay(root, {
       throw new Error('source registration unavailable or changed; refusing replacement');
     }
     const idx = list.findIndex((o) => o && o.ref === ref);
+    // Even identical metadata or timestamps denote a new registration, not refreshed build evidence.
+    const registrationId = randomUUID();
     if (idx === -1) {
       list.push({
-        ref, pr: pr ?? null, addedAt: now || new Date().toISOString(), addedBy: addedBy ?? null, reason: reason ?? null,
+        ref, registrationId, pr: pr ?? null, addedAt: now || new Date().toISOString(), addedBy: addedBy ?? null, reason: reason ?? null,
         ...(pinned === true ? { pinned: true } : {}),
         ...(bases ? { stackBases: bases } : {}),
         ...(conflictOverride ? { conflictOverride } : {}),
       });
     } else {
-      const next = { ...list[idx], pr: pr ?? null, reason: reason ?? null };
+      const next = { ...list[idx], registrationId, pr: pr ?? null, reason: reason ?? null };
+      delete next.tipSha;
       if (pinned === true) next.pinned = true;
       else if (pinned === false) delete next.pinned;
       if (bases) next.stackBases = bases;
@@ -379,8 +382,12 @@ export function removeOverlay(root, ref, {
     const skipped = [];
     // A source registered again meanwhile stays as it is, but whatever was retired into it still comes back.
     const collect = (sources) => {
-      for (const s of Array.isArray(sources) ? sources : []) {
-        if (!isSafeBranchName(s?.entry?.ref) || seen.has(s.entry.ref)) { skipped.push(s?.entry?.ref ?? null); collect(s?.entry?.retiredSources); continue; }
+      const snapshots = Array.isArray(sources) ? sources : [];
+      const latest = new Map(snapshots.map((s) => [s?.entry?.ref, s]));
+      for (const s of snapshots) {
+        if (!isSafeBranchName(s?.entry?.ref) || seen.has(s.entry.ref) || latest.get(s.entry.ref) !== s) {
+          skipped.push(s?.entry?.ref ?? null); collect(s?.entry?.retiredSources); continue;
+        }
         seen.add(s.entry.ref);
         back.push(s);
       }
@@ -391,8 +398,9 @@ export function removeOverlay(root, ref, {
     if (swap && moved.length) {
       const c = next.findIndex((o) => o?.ref === requireRef);
       const prior = Array.isArray(next[c].retiredSources) ? next[c].retiredSources : [];
-      const refs = new Set(moved.map((s) => s?.entry?.ref));
-      next[c] = { ...next[c], retiredSources: [...prior.filter((s) => !refs.has(s?.entry?.ref)), ...moved] };
+      // A ref may have multiple registrations with different content and nested sources. Retain every
+      // snapshot; ref-only deduplication here silently discards the earlier registration's recovery data.
+      next[c] = { ...next[c], retiredSources: [...prior, ...moved] };
     }
     // Audit before the write: a failed append throws and leaves the list (container included) unchanged.
     for (const s of back) appendOverlayEvent(root, { kind: 'reinstated', ref: s.entry.ref, from: ref, sha: s.sha ?? null }, { env });
@@ -403,10 +411,11 @@ export function removeOverlay(root, ref, {
 }
 
 /**
- * Record each refreshed overlay's remote tip as `tipSha` — retirement evidence once its branch is deleted. Same
- * shape as {@link persistStackBases}: fresh read under the list lock, writes only changed entries, skips vanished ones.
+ * Record each refreshed overlay's remote tip as `tipSha` — retirement evidence once its branch is deleted.
+ * Fresh read under the list lock; the identity captured at refresh must still match. Unbound, replaced and
+ * vanished registrations are skipped. Rebuild caches are excluded from that identity, so cache writes commute.
  * @param {string} root
- * @param {Map<string,string>} tips ref → full sha
+ * @param {Map<string,{sha:string,reg:object}>} tips ref → full sha and registration identity captured at refresh
  * @param {{env?:NodeJS.ProcessEnv}} [o]
  * @returns {{written:number}}
  */
@@ -416,8 +425,10 @@ export function persistTipShas(root, tips, { env = process.env } = {}) {
     const list = readOverlaysForWrite(root, env).slice();
     let written = 0;
     for (let i = 0; i < list.length; i += 1) {
-      const sha = list[i] && tips.get(list[i].ref);
-      if (!SHA_RE.test(sha ?? '') || list[i].tipSha === sha) continue;
+      const evidence = list[i] && tips.get(list[i].ref);
+      const { sha, reg } = evidence ?? {};
+      if (!reg || !isDeepStrictEqual(registrationIdentity(list[i]), reg)
+        || !SHA_RE.test(sha ?? '') || list[i].tipSha === sha) continue;
       list[i] = { ...list[i], tipSha: sha };
       written += 1;
     }

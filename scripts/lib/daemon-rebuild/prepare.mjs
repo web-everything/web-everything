@@ -281,7 +281,8 @@ export async function prepareRebuild({
         refEvidence: fetchResult.refEvidence, recordedShas, now, removeOverlay, appendOverlayEvent,
         protectedRefs: realAutoRebase.pendingSwapRefs({ root, env }),
         // A refused plan must preserve the registered tips as well as the running tree. Keep this tick's
-        // fresh evidence in memory until both pinned and established-content checks accept the plan.
+        // fresh {sha, reg} evidence in memory until both pinned and established-content checks accept the plan.
+        // Preserve the identity captured before classification; never rebind it to a later same-ref registration.
         persistTipShas: (_root, tips) => { refreshedTips = tips; } });
       if (retired.auditFailures.length) alert('overlay-auto-retire-audit-failed', { failures: retired.auditFailures });
       for (const ref of retired.reinstated) reinstatedNow.add(ref);

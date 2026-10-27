@@ -4,7 +4,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cascadePolicy, logCascadeSources } from './policy-cascade.mjs';
 import {
-  removeOverlay as removeDefault, appendOverlayEvent as auditDefault, persistTipShas as persistTipsDefault,
+  removeOverlay as removeDefault, appendOverlayEvent as auditDefault, persistTipShas as persistTipsDefault, registrationIdentity,
 } from './daemon-overlays.mjs';
 import { appendDaemonEvent as eventDefault } from './daemon-events.mjs';
 import { isSafeBranchName } from './daemon-self-sync.mjs';
@@ -56,8 +56,10 @@ export function classifyOverlays({ overlays, git, mainSha = 'origin/main', refEv
       const remote = refs.find((line) => line.startsWith(`${tracking} `))?.split(' ')[1];
       if (evidence === 'refreshed' && !remote) return row;
       // Recorded commits are fallback evidence for absent branches, never for a failed refresh: the registration's
-      // own fields (`tipSha`, the last refreshed tip, wins as the newest), else the adopted build's applied tip.
-      const recorded = overlay.tipSha ?? overlay.sha ?? overlay.headSha ?? recordedShas?.get(overlay.ref);
+      // own fields (`tipSha`, the last refreshed tip, wins as the newest), else a legacy adopted build's tip.
+      // Adopted tips are keyed only by ref and cannot establish evidence for a new registration generation.
+      const recorded = overlay.tipSha ?? overlay.sha ?? overlay.headSha
+        ?? (overlay.registrationId == null ? recordedShas?.get(overlay.ref) : undefined);
       if (!remote && !SHA.test(recorded ?? '')) return row;
       row.sha = rev(remote || recorded);
       if (call(['merge-base', '--is-ancestor', row.sha, main], [0, 1]).status === 0) {
@@ -118,9 +120,14 @@ export async function autoRetireOverlays({
 }) {
   const { mode, source } = resolveAutoRetireMode(env, { now });
   const result = { retired: [], wouldRetire: [], kept: [], auditFailures: [], reinstated: [] };
+  if (mode === 'off') {
+    result.kept = overlays.map((o) => ({ ref: o?.ref, class: 'needed', reason: 'auto-retire-disabled', sha: null }));
+    return result;
+  }
+  const registrations = new Map(overlays.map((o) => [o?.ref, registrationIdentity(o)]));
   const rows = classifyOverlays({ overlays, git, mainSha, refEvidence, recordedShas });
   for (const row of rows) {
-    if (mode === 'off' || row.class === 'needed') { result.kept.push(row); continue; }
+    if (row.class === 'needed') { result.kept.push(row); continue; }
     const event = { ref: row.ref, by: 'auto-retire', reason: row.reason, sha: row.sha };
     try {
       // Verified swap cleanup owns its registrations. Containment alone also cannot replace the planner's
@@ -162,8 +169,8 @@ export async function autoRetireOverlays({
   }
   // Only a tip this run refreshed is evidence; a cached tracking ref (no refEvidence) never is.
   const tips = new Map(rows.filter((r) => refEvidence?.get(r.ref) === 'refreshed' && SHA.test(r.sha ?? '')
-    && !result.retired.includes(r)).map((r) => [r.ref, r.sha]));
-  if (mode !== 'off' && tips.size) {
+    && !result.retired.includes(r)).map((r) => [r.ref, { sha: r.sha, reg: registrations.get(r.ref) }]));
+  if (tips.size) {
     try { persistTipShas(root, tips, { env }); }
     catch (error) { result.auditFailures.push({ ref: null, kind: 'tip-sha', error: String(error?.message || error) }); }
   }

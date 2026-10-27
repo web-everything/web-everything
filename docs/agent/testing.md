@@ -70,6 +70,25 @@ holds for a pin until the next tick. Tests drive the planner to close a containe
 `retiring` audit line is written before removal; if it fails, nothing is removed. A failed `removed` line or
 `overlay-retired` event after removal is returned in `auditFailures` and preparation alerts on it.
 
+Refreshed tips carry `{sha, reg}` from classification through preparation's deferred persistence. Compare
+`reg` with `registrationIdentity` under the list lock; reject plain SHA values and changed/vanished registrations.
+Every `addOverlay` call creates a new `registrationId` and clears inherited `tipSha`, including identical
+metadata and timestamps. Keep the legacy registration fields readable; no migration is needed for old lists.
+Ref-only adopted-build fallback is limited to legacy entries without `registrationId`; a new registration
+cannot borrow an older registration's applied SHA when its branch disappears before a successful refresh.
+The registration-race regression covers refresh → same-ref replacement → persistence → missing-branch
+retirement, and the preparation regression replaces a registration during PR-state lookup before persistence.
+Whenever adding a rebuild-written retirement evidence field, bind it to the captured registration and clear it
+on re-registration. Add a named failure-injection test for each reported dependency failure: the pre-removal
+audit, post-removal audit, `appendDaemonEvent` (`overlay-retired`), and `persistTipShas` (`tip-sha`). Off-mode
+tests use throwing spies and assert zero Git, audit, removal and persistence calls; shadow still classifies.
+Retirement and replacement swaps append archive snapshots even when a ref repeats. Withdrawal restores the
+latest archived registration of each ref and recovers older nested sources; test both swap branches.
+The exported `registrationEvidenceReplay` in the existing `overlay-auto-retire-evidence` soak runs these
+send-back cases through real list storage with injected Git results. It can run without network or `.git`
+writes; it is a deterministic replay, not a claim about production daemon state. When collecting fix evidence,
+record every required proof separately, and explicitly mark live probes or verify verdicts unavailable.
+
 ## PR size admission trust-boundary fixtures
 
 `scripts/lib/__tests__/pr-size-admission.test.mjs` exercises Git with real shadow refs and

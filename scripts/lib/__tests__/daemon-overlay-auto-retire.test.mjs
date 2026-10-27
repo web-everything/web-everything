@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { autoRetireOverlays, classifyOverlays, resolveAutoRetireMode } from '../daemon-overlay-auto-retire.mjs';
-import { addOverlay, appendOverlayEvent, overlayFilePath, readOverlayState, removeOverlay, writeOverlays } from '../daemon-overlays.mjs';
+import { addOverlay, appendOverlayEvent, overlayFilePath, persistTipShas, readOverlayState, registrationIdentity, removeOverlay, writeOverlays } from '../daemon-overlays.mjs';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 
 let root, env, base, initial;
@@ -65,6 +65,85 @@ beforeEach(() => {
 afterEach(() => rmSync(base, { recursive: true, force: true }));
 
 describe('real Git retirement evidence', () => {
+  it('re-registration between refresh and persistence rejects stale retirement evidence', async () => {
+    const old = { ref: 'feature', sha: initial, tipSha: initial, registeredAt: 'old' };
+    register([old]);
+    track('feature', initial);
+    let refreshedTips;
+    await autoRetireOverlays({ root, env: { ...env, WE_DAEMON_OVERLAY_AUTO_RETIRE: 'shadow' },
+      overlays: [old], git, refEvidence: new Map([['feature', 'refreshed']]),
+      persistTipShas: (_root, tips) => { refreshedTips = tips; } });
+    expect(refreshedTips.get('feature')).toEqual({ sha: initial, reg: registrationIdentity(old) });
+    branch('feature');
+    const needed = commit('needed', 'unmerged replacement');
+    register([{ ...old, sha: needed }]);
+    addOverlay(root, { ref: 'feature' }, { env });
+    const replacement = readOverlayState(root, { env }).overlays[0];
+    expect(replacement.tipSha).toBeUndefined();
+    expect(persistTipShas(root, refreshedTips, { env })).toEqual({ written: 0 });
+    ok('update-ref', '-d', 'refs/remotes/origin/feature');
+    const result = await autoRetireOverlays({ root, env, overlays: [replacement], git,
+      refEvidence: new Map([['feature', 'missing']]) });
+    expect(result.retired).toEqual([]);
+    expect(result.kept).toEqual([expect.objectContaining({ ref: 'feature', sha: needed, reason: 'unmerged-content' })]);
+    expect(readOverlayState(root, { env }).overlays).toEqual([replacement]);
+  });
+
+  it('an identical re-registration rejects earlier tips even with the same timestamp', () => {
+    const entry = { ref: 'feature', now: '2026-10-27T12:00:00Z' };
+    const [old] = addOverlay(root, entry, { env });
+    const tips = new Map([['feature', { sha: initial, reg: registrationIdentity(old) }]]);
+    const [replacement] = addOverlay(root, entry, { env });
+    expect(registrationIdentity(replacement)).not.toEqual(registrationIdentity(old));
+    expect(persistTipShas(root, tips, { env })).toEqual({ written: 0 });
+    removeOverlay(root, 'feature', { env });
+    addOverlay(root, entry, { env });
+    expect(persistTipShas(root, tips, { env })).toEqual({ written: 0 });
+  });
+
+  it('persists matching registration tips and refuses unbound, replaced and vanished evidence', () => {
+    const entry = { ref: 'feature', sha: initial, registeredAt: 'old' };
+    const tips = new Map([['feature', { sha: initial, reg: registrationIdentity(entry) }]]);
+    register([entry]);
+    expect(persistTipShas(root, tips, { env })).toEqual({ written: 1 });
+    expect(persistTipShas(root, tips, { env })).toEqual({ written: 0 });
+    for (const replacement of [{ ...entry, sha: 'f'.repeat(40) }, { ...entry, registeredAt: 'new' }]) {
+      register([replacement]);
+      expect(persistTipShas(root, tips, { env })).toEqual({ written: 0 });
+      expect(persistTipShas(root, new Map([['feature', initial]]), { env })).toEqual({ written: 0 });
+      expect(readOverlayState(root, { env }).overlays).toEqual([replacement]);
+    }
+    register([]);
+    expect(persistTipShas(root, tips, { env })).toEqual({ written: 0 });
+  });
+
+  it('preparation preserves a same-ref replacement made after refresh before deferred tip persistence', async () => {
+    branch('feature'); commit('feature', 'old content'); branch('main'); localOrigin();
+    addOverlay(root, { ref: 'feature', pr: 1 }, { env });
+    let replacement;
+    const prepared = await prepare({ prState: async () => {
+      if (!replacement) [replacement] = addOverlay(root, { ref: 'feature', pr: 1 }, { env });
+      return 'OPEN';
+    } });
+    expect(prepared.terminal).toBe(false);
+    expect(replacement).toBeDefined();
+    expect(readOverlayState(root, { env }).overlays).toEqual([replacement]);
+    expect(replacement.tipSha).toBeUndefined();
+  });
+
+  it.each([true, false])('repeated source retirement preserves both archives and nested sources (retireInto=%s)', (retireInto) => {
+    const old = { entry: { ref: 'source', sha: initial, retiredSources: [{ entry: { ref: 'nested' }, sha: initial }] }, sha: initial };
+    const current = { entry: { ref: 'source', sha: 'b'.repeat(40) }, sha: 'b'.repeat(40) };
+    register([{ ref: 'carrier', retiredSources: [old] }, retireInto ? current.entry : { ref: 'swap', retiredSources: [current] }]);
+    removeOverlay(root, retireInto ? 'source' : 'swap', { env, requireRef: 'carrier', retireInto, retiredSha: current.sha });
+    expect(readOverlayState(root, { env }).overlays[0].retiredSources).toEqual([old, current]);
+    removeOverlay(root, 'carrier', { env });
+    expect(readOverlayState(root, { env }).overlays.find((o) => o.ref === 'source')).toEqual({ ...current.entry, tipSha: current.sha });
+    // The older nested registration survives withdrawal of both the carrier and the newest source.
+    removeOverlay(root, 'source', { env });
+    expect(readOverlayState(root, { env }).overlays.map((o) => o.ref)).toEqual(['nested']);
+  });
+
   it.each(['on', 'shadow'])('%s preserves contained explicit, mechanism and unverifiable pins', async (mode) => {
     env.WE_DAEMON_OVERLAY_AUTO_RETIRE = mode;
     branch('lower');
@@ -723,6 +802,16 @@ describe('PR #5964 advisory round: evidence, containment recovery and audit orde
       .toMatchObject({ class: 'landed', sha: initial });
   });
 
+  it('re-registered missing branches cannot borrow a previous adopted registration SHA', async () => {
+    addOverlay(root, { ref: 'feature' }, { env });
+    const overlays = addOverlay(root, { ref: 'feature' }, { env });
+    const result = await autoRetireOverlays({ root, env, overlays, git,
+      refEvidence: new Map([['feature', 'missing']]), recordedShas: new Map([['feature', initial]]) });
+    expect(result.retired).toEqual([]);
+    expect(result.kept).toEqual([expect.objectContaining({ ref: 'feature', reason: 'git-unverifiable' })]);
+    expect(readOverlayState(root, { env }).overlays).toEqual(overlays);
+  });
+
   it('removing a container reinstates the overlays retired into it', async () => {
     branch('lower'); const lower = commit('lower', 'lower'); track('lower');
     commit('top', 'top'); track('top');
@@ -813,6 +902,27 @@ describe('PR #5964 advisory round: evidence, containment recovery and audit orde
     expect(result.auditFailures).toEqual([expect.objectContaining({ ref: 'gone', error: 'disk full' })]);
     expect(audit()).toEqual([expect.objectContaining({ kind: 'retiring', ref: 'gone', sha: initial })]);
   });
+
+  it('reports an overlay-retired daemon event failure in auditFailures after removal', async () => {
+    const events = [];
+    const result = await retire([{ ref: 'gone', sha: initial }], {
+      appendDaemonEvent: async (event) => { events.push(event); throw new Error('daemon event disk full'); },
+    });
+    expect(events).toEqual([expect.objectContaining({ kind: 'overlay-retired', detail: { ref: 'gone', reason: 'ancestor-of-main' } })]);
+    expect(result.retired.map((r) => r.ref)).toEqual(['gone']);
+    expect(result.kept).toEqual([]);
+    expect(result.auditFailures).toEqual([{ ref: 'gone', kind: 'overlay-retired', error: 'daemon event disk full' }]);
+    expect(readOverlayState(root, { env }).overlays).toEqual([]);
+    expect(audit().map((e) => e.kind)).toEqual(['retiring', 'removed']);
+  });
+
+  it('reports a refreshed tip persistence failure in auditFailures', async () => {
+    branch('feature'); commit('feature', 'needed'); track('feature');
+    const result = await retire([{ ref: 'feature' }], { refEvidence: new Map([['feature', 'refreshed']]),
+      persistTipShas: () => { throw new Error('tip disk full'); } });
+    expect(result.retired).toEqual([]);
+    expect(result.auditFailures).toEqual([{ ref: null, kind: 'tip-sha', error: 'tip disk full' }]);
+  });
 });
 
 describe('policy cascade and shadow graduation', () => {
@@ -865,11 +975,20 @@ describe('policy cascade and shadow graduation', () => {
     expect(resolveAutoRetireMode(env, { settingsPath }).source).toBe('tool');
   });
 
-  it('off keeps even landed overlays', async () => {
+  it('off keeps even landed overlays without Git, audit, removal or persistence calls', async () => {
     env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'off';
-    const result = await retire([{ ref: 'gone', sha: initial }]);
+    const calls = [];
+    const forbidden = (kind) => () => { calls.push(kind); throw new Error(`off invoked ${kind}`); };
+    const result = await retire([{ ref: 'gone', sha: initial }], {
+      git: forbidden('git'), appendOverlayEvent: forbidden('audit'), appendDaemonEvent: forbidden('event'),
+      removeOverlay: forbidden('remove'), persistTipShas: forbidden('tips'),
+      refEvidence: new Map([['gone', 'refreshed']]),
+    });
     expect(result.retired).toEqual([]);
     expect(result.wouldRetire).toEqual([]);
     expect(result.kept).toHaveLength(1);
+    expect(calls).toEqual([]);
+    expect(result.auditFailures).toEqual([]);
+    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'gone', sha: initial }]);
   });
 });
