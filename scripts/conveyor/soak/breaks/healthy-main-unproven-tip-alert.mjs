@@ -1,4 +1,4 @@
-/** PR #6009: a healthy main's new tip must not ask for operator attention while CI starts. */
+/** PR #6009: healthy tips stay quiet and a red alert recovers with disabled optional jobs. */
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -42,6 +42,33 @@ export default {
         if (state.fingerprint || state.unknownEmitted || state.seq !== 0) {
           violations.push(`${name}: healthy main persisted alert state`);
         }
+      }
+      // Replay the live recovery through persisted state and the real attention feed.
+      const stateDir = join(dir, 'recovery');
+      const path = join(dir, 'recovery.jsonl');
+      const redRuns = [{ ...successfulRuns[0], conclusion: 'failure' }];
+      const options = { dir: stateDir, now: AT, probe: { runs: redRuns },
+        publish: item => publishAttention(item, { path, now: AT }),
+        readDetails: () => ({ failingJobs: ['unit'], firstFailingTest: 'unit > fails', fixPrs: [] }) };
+      await runMainRedAlert(options);
+      const empty = await runMainRedAlert({ ...options,
+        readDetails: () => ({ failingJobs: ['unit'], firstFailingTest: null, fixPrs: [] }) });
+      if (empty.next.fingerprintParts.firstFailingTest !== null) {
+        violations.push('recovery: successful empty annotations retained a stale failing test');
+      }
+      const tip = { sha: TIP_SHA, runStatus: 'completed', requiredChecks: ['test'], checksTotal: 2,
+        checkRuns: [
+          { id: 1, name: 'test', status: 'completed', conclusion: 'success' },
+          { id: 2, name: 'visual', status: 'completed', conclusion: 'skipped' },
+        ] };
+      await runMainRedAlert({ ...options, probe: { runs: [...redRuns,
+        { ...successfulRuns[0], headSha: TIP_SHA, databaseId: 2, createdAt: '2026-10-26T12:25:00.000Z' }], tip } });
+      const state = JSON.parse(readFileSync(join(stateDir, 'main-red-alert.json'), 'utf8'));
+      if (state.fingerprint || state.fingerprintParts || state.unknownEmitted) {
+        violations.push('recovery: optional visual skip prevented the green clear');
+      }
+      if (replay({ path }).map(item => item.kind).join(',') !== 'main-red,main-red,main-green') {
+        violations.push('recovery: feed did not publish the detail clear followed by main-green');
       }
       return { violations };
     } finally { rmSync(dir, { recursive: true, force: true }); }
