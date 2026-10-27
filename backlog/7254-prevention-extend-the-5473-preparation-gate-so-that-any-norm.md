@@ -16,7 +16,7 @@ Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outsta
 2. `we:backlog/7199-prevention-decision-preparation-coverage-and-citation-checks.md:38` — Add a review-lens checklist item for tools that dereference author-supplied paths (confine to the repo root, reject symlink escapes, test each). Longer term, make a shared path-confinement helper a standards-checked dependency.
 3. `we:backlog/7199-prevention-decision-preparation-coverage-and-citation-checks.md:71` — Have the manifest gate treat "n/a" edge-case dispositions that make a negative claim as claims needing a case or an explicit "not tested" marker.
 
-Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 4 → #xg637ec.
+Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 4 → #7293.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5953@bb7efb874ab0e04c2742faa9c04533ee18ec1e08
 

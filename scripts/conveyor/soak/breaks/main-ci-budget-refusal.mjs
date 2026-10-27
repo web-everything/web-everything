@@ -13,7 +13,7 @@ const REPO = 'main-ci-fixture/example';
 export default {
   id: 'main-ci-budget-refusal',
   title: 'main CI retries after a local budget refusal without duplicating a submitted rerun',
-  card: 'PR #5975 red-team send-back x1b8hlo',
+  card: 'PR #5975 red-team send-back 5726',
   fixedBy: { sha: 'HEAD', where: 'lane/main-ci-retrigger', paths: [SOURCE] },
   fixPresent(root) {
     return readFileSync(join(root, SOURCE), 'utf8').includes('function isMainRerunNotSubmitted(');
