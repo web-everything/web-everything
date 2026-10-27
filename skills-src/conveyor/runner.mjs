@@ -328,7 +328,7 @@ export function makeCliMechanicalPasses({
       const name = path.split('/').pop().replace(/\.mjs$/, '');
       const perPr = ['review-dispatch', 'review-round-tag', 'review-status-tag'].includes(name);
       const pass = { passName: perPr ? `${name}:${args[0]}` : name,
-        repo: slug ?? repos.we?.slug ?? 'web-everything/web-everything',
+        repo: slug ?? repos.we?.slug ?? CONSTELLATION_REPOS.we.slug,
         entry: { script: relative(root, join(scriptsDir, path)),
           args: [...args, ...(slug ? [`--repo=${slug}`] : [])], capture, quiet: true } };
       const job = runTimedPasses({ passes: [pass], runPass: descriptor => runPass(descriptor, { root }) })

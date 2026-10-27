@@ -47,6 +47,7 @@
  */
 
 import { createHash } from 'node:crypto';
+import { CONSTELLATION_REPOS } from '../../scripts/lib/constellation-repos.mjs';
 import { enqueueItemTask } from '../../scripts/lib/daemon-item-tasks.mjs';
 import { defineJobKind, markClaimed, markSucceeded, markFailed, taskDeadlineDecision } from '../../scripts/lib/daemon-jobs.mjs';
 import { createJobStore, launchJob, reattachTick, probeHandle, stopHandle, hostName, readProcStart, reapDeadGroup } from '../../scripts/lib/daemon-jobs-runtime.mjs';
@@ -443,7 +444,7 @@ async function executeTimedPass({ passName, repo, entry }, ports) {
 
 export function spawnPassOnce(entry, ports = {}) {
   const args = entry.args ?? [];
-  const repo = ports.repo ?? args.find(a => a.startsWith('--repo='))?.slice(7) ?? 'web-everything/web-everything';
+  const repo = ports.repo ?? args.find(a => a.startsWith('--repo='))?.slice(7) ?? CONSTELLATION_REPOS.we.slug;
   return runPassAsTimedJob({ passName: ports.passName ?? entry.script, repo, entry }, ports);
 }
 
