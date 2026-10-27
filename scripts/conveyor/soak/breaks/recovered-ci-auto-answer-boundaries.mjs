@@ -89,6 +89,7 @@ export default {
         details_url: `https://github.com/${weSlug}/actions/runs/700/job/${r.id}` }));
       const [retained] = io.enrichPrsWithStandDownAutoProceed([pr], { ...writerOptions,
         readChecks: input => io.readAutoProceedChecks(input, { read: argv => {
+          if (argv[1].includes('/statuses?')) return [];
           if (argv[1].includes('/commits/')) return { total_count: 2, check_runs: checks };
           const id = Number(argv[1].split('/').at(-1));
           return { id, run_id: 700, run_attempt: 1, name: 'test', head_sha: head,
@@ -99,6 +100,42 @@ export default {
       if (writes.includes('reserve') || writes.includes('post') || countUnresolvedStandDowns(retained.comments) !== 1) {
         violations.push(`independent same-name job ${conclusion} released a failed job in the same attempt`);
       }
+    }
+
+    // Legacy statuses and check-runs are independent sources for the same required name.
+    writes.length = 0;
+    const [statusHeld] = io.enrichPrsWithStandDownAutoProceed([pr], { ...writerOptions,
+      readChecks: input => io.readAutoProceedChecks(input, { read: argv => {
+        if (argv[1].includes('/statuses?')) return [{ id: 201, context: 'test', state: 'failure' }];
+        return { total_count: 1, check_runs: [{ ...run(102, 'cancelled'), app: { id: 42, slug: 'unrelated-app' } }] };
+      } }),
+    });
+    const legacyStatusWrites = [...writes];
+    if (writes.includes('reserve') || writes.includes('post') || countUnresolvedStandDowns(statusHeld.comments) !== 1) {
+      violations.push('cancelled unrelated app check masked a failing required legacy status');
+    }
+
+    // Attempt 2 recovers, then attempt 3 fails on the same SHA during the posting window.
+    writes.length = 0;
+    let checkReads = 0;
+    const [rerunHeld] = io.enrichPrsWithStandDownAutoProceed([pr], { ...writerOptions,
+      readChecks: input => {
+        const checks = [run(101, 'failure'), run(102, 'success')];
+        if (++checkReads > 1) checks.push({ ...run(103, 'failure'), actions: { runId: 700, attempt: 3 } });
+        return io.readAutoProceedChecks(input, { read: argv => {
+          if (argv[1].includes('/statuses?')) return [];
+          if (argv[1].includes('/commits/')) return { total_count: checks.length, check_runs: checks.map(r => ({ ...r,
+            details_url: `https://github.com/${weSlug}/actions/runs/700/job/${r.id}` })) };
+          const id = Number(argv[1].split('/').at(-1));
+          return { id, run_id: 700, run_attempt: id - 100, name: 'test', head_sha: head,
+            check_run_url: `https://api.github.com/repos/${weSlug}/check-runs/${id}` };
+        } });
+      },
+    });
+    const failedRerunRace = { checkReads, writes: [...writes] };
+    if (checkReads !== 2 || writes.includes('reserve') || writes.includes('post')
+      || countUnresolvedStandDowns(rerunHeld.comments) !== 1) {
+      violations.push('new failed attempt posted an answer using the earlier successful snapshot');
     }
 
     // A recovered main can lapse the original hold before the writer refreshes the thread.
@@ -158,7 +195,7 @@ export default {
       if (crossRepoWrites.length) violations.push('a WE outage released a genuine FrontierUI failure');
     }
     return { violations, dryRunWrites, defaultDispatchWrites, optedOutDispatchWrites, mainReads, crossRepoWrites,
-      refreshedThreadRace, sameAttemptWrites };
+      refreshedThreadRace, sameAttemptWrites, legacyStatusWrites, failedRerunRace };
   },
   judge(report) { return report.violations; },
 };

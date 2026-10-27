@@ -42,11 +42,37 @@ export function readAutoProceedChecks({ repo, head, requiredChecks }, { read = g
     total = data.total_count;
     runs.push(...data.check_runs);
     if (runs.length === total && new Set(runs.map(r => r.id)).size === total) {
-      return { head, complete: true, runs: readRerunLineage(runs, { repo, head, requiredChecks, read }) };
+      const verifiedRuns = readRerunLineage(runs, { repo, head, requiredChecks, read });
+      requireGreenCommitStatuses({ repo, head, requiredChecks, read });
+      return { head, complete: true, runs: verifiedRuns };
     }
     if (data.check_runs.length !== 100 || runs.length >= total) break;
   }
   throw new Error('operator answer required: check pagination incomplete');
+}
+
+/** A same-name check cannot excuse a legacy status. Read all pages, never an aggregate state. */
+function requireGreenCommitStatuses({ repo, head, requiredChecks, read }) {
+  const ids = new Set();
+  for (let page = 1; page <= 10; page++) {
+    const statuses = read(['api', `repos/${repo}/commits/${head}/statuses?per_page=100&page=${page}`]);
+    if (!Array.isArray(statuses) || statuses.length > 100) {
+      throw new Error('operator answer required: incomplete commit status feed');
+    }
+    for (const status of statuses) {
+      if (!Number.isSafeInteger(status?.id) || status.id < 1 || ids.has(status.id)
+        || typeof status.context !== 'string' || !status.context
+        || !['success', 'failure', 'error', 'pending'].includes(status.state)) {
+        throw new Error('operator answer required: invalid or overlapping commit status evidence');
+      }
+      ids.add(status.id);
+      if ((!Array.isArray(requiredChecks) || requiredChecks.includes(status.context)) && status.state !== 'success') {
+        throw new Error('operator answer required: non-green required commit status');
+      }
+    }
+    if (statuses.length < 100) return;
+  }
+  throw new Error('operator answer required: commit status pagination incomplete (1000 status limit)');
 }
 
 /** Check-run IDs order creations, not attempts. Bind duplicate names to actual Actions jobs. */
@@ -148,13 +174,24 @@ export function enrichPrsWithStandDownAutoProceed(prs, { repo, requiredChecks, d
       const current = classifyStandDownAutoProceed({ pr: fresh, requiredChecks, checks,
         redMainContext: context, prScopedChecks: scoped });
       if (current.action !== 'auto-proceed' || current.standDownId !== decision.standDownId) return fresh;
+      // A rerun can start or fail on the same SHA while comments/main history are read.
+      // Revalidate both feeds before reserving the sole post, and publish the fresh evidence.
+      const latestChecks = readChecks({ repo, head: pr.headRefOid, requiredChecks });
+      const latest = classifyStandDownAutoProceed({ pr: fresh, requiredChecks, checks: latestChecks,
+        redMainContext: context, prScopedChecks: scoped });
+      const knownFailures = new Set(checks.runs.filter(r => String(r.conclusion).toUpperCase() === 'FAILURE').map(r => r.id));
+      if (latest.action !== 'auto-proceed' || latest.standDownId !== decision.standDownId
+        || latestChecks.runs.some(r => requiredChecks.includes(r.name)
+          && String(r.conclusion).toUpperCase() === 'FAILURE' && !knownFailures.has(r.id))) {
+        log(`R123 PR #${pr.number}: checks changed before post; operator hold retained`); return fresh;
+      }
       if (headReader({ repo, number: pr.number }) !== pr.headRefOid) throw new Error('head moved; operator hold retained');
       if (!reserve({ repo, number: pr.number, standDownId: decision.standDownId, env })) {
         log(`R123 PR #${pr.number}: answer already reserved; inspect thread before any manual retry`); return fresh;
       }
-      const posted = post({ repo, number: pr.number, body: decision.body });
+      const posted = post({ repo, number: pr.number, body: latest.body });
       const comment = { ...posted, author: posted?.author ?? posted?.user };
-      if (comment.body !== decision.body || !parseOperatorAnswer(comment)) throw new Error('posted answer principal/record unverified; inspect thread');
+      if (comment.body !== latest.body || !parseOperatorAnswer(comment)) throw new Error('posted answer principal/record unverified; inspect thread');
       return { ...fresh, comments: [...currentComments, comment] };
     } catch (e) {
       log(`R123 PR #${pr.number}: operator answer required; inspect thread/reservation: ${String(e.message).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 300)}`);
