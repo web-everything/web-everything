@@ -131,7 +131,7 @@ describe('#5755 independent timed pass jobs', () => {
     const onRun = vi.fn();
     const pending = runPassDaemonLoop({
       runPass: () => runPassAsTimedJob(descriptor('branch-drift'), f.ports),
-      sleep, intervalMs: 10, maxRuns: 4, onRun,
+      sleep, intervalMs: 10, maxRuns: 4, tickWhileRunning: true, onRun,
     });
     await vi.advanceTimersByTimeAsync(35);
     expect(sleep.mock.calls.length).toBeGreaterThanOrEqual(3);

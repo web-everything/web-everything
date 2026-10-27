@@ -142,7 +142,7 @@ export const MAIN_ONLY_PASSES = new Set(['merge-orphan-sweep']);
 export async function runPassDaemonLoop({
   runPass, sleep, isAlive = () => true, onRun = () => {}, onRunError = () => {},
   refreshAuth = async () => {}, onRefreshError = () => {},
-  intervalMs, maxRuns = Infinity,
+  intervalMs, maxRuns = Infinity, tickWhileRunning = false,
   failureAlertAfter = 0, onConsecutiveFailures = () => {},
 }) {
   if (typeof runPass !== 'function') throw new TypeError('runPassDaemonLoop requires a runPass effect');
@@ -160,6 +160,16 @@ export async function runPassDaemonLoop({
       try { onConsecutiveFailures({ count: streak, detail }); } catch { /* alerting must never stop the loop */ }
     }
   };
+  const runOnce = async (startedRun) => {
+    try {
+      const result = await runPass();
+      onRun(result, startedRun);
+      noteRun(failed(result), result);
+    } catch (error) {
+      onRunError(error, startedRun);
+      noteRun(true, { error: String((error && error.message) || error) });
+    }
+  };
   let inFlight = null;
   for (;;) {
     if (!inFlight) {
@@ -169,22 +179,13 @@ export async function runPassDaemonLoop({
         if (isGithubAppAuthGuardError(error)) throw error;
         onRefreshError(error, run);
       }
-      const startedRun = run;
-      inFlight = (async () => {
-        try {
-          const result = await runPass();
-          onRun(result, startedRun);
-          noteRun(failed(result), result);
-        } catch (error) {
-          onRunError(error, startedRun);
-          noteRun(true, { error: String(error?.message || error) });
-        } finally { inFlight = null; }
-      })();
-      // Drain immediate promise continuations (including wrapped effects) before
-      // deciding whether the next interval still belongs to an active run.
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
+      if (tickWhileRunning) {
+        // Opt-in (#5755): the pass is a bounded timed job, so the loop keeps its cadence while it runs.
+        inFlight = runOnce(run).finally(() => { inFlight = null; });
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      } else await runOnce(run);
     }
     if (!isAlive()) { await inFlight; return { runs: run + 1, stoppedReason: 'lease-lost' }; }
     if (run + 1 >= maxRuns) { await inFlight; return { runs: run + 1, stoppedReason: 'max-runs' }; }
@@ -538,7 +539,7 @@ async function main(argv) {
     runPass: runPassSelfSynced,
     sleep: realSleep,
     isAlive: () => alive,
-    intervalMs,
+    intervalMs, tickWhileRunning: true,
     failureAlertAfter,
     onConsecutiveFailures: ({ count, detail }) => alertConsecutiveFailures(passName, count, detail),
     refreshAuth: () => ensureFreshGithubAppEnv(FLEET_APP_AUTH_OPTS),
