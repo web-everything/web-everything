@@ -1,16 +1,16 @@
 // @repo-scanning-test scope=full — ownership coverage and CLI totals require the complete tracked inventory.
 import { describe, expect, it } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { classify, totals } from '../constellation-ownership.mjs';
+import { classify, existingTrackedPaths, totals } from '../constellation-ownership.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const map = JSON.parse(readFileSync(resolve(root, 'config/constellation-ownership.json'), 'utf8'));
-const tracked = execFileSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 })
-  .split('\0').filter(Boolean);
+const tracked = existingTrackedPaths(execFileSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 })
+  .split('\0').filter(Boolean));
 const proposed = ['config/constellation-ownership.json', 'scripts/lib/constellation-ownership.mjs',
   'scripts/lib/__tests__/constellation-ownership.test.mjs'];
 const paths = [...new Set([...tracked, ...proposed])];
@@ -32,7 +32,8 @@ describe('constellation ownership', () => {
     expect(reclassified.length).toBeGreaterThan(0);
     expect(reclassified).toEqual(files.filter(file => file.original && file.original !== file.destination)
       .map(({ path, original, destination }) => ({ path, original, destination })));
-    expect(reclassified).toContainEqual({ path: 'scripts/gen-inventory.mjs', original: 'standard-def', destination: 'plateau' });
+    expect(classify(['scripts/gen-inventory.mjs'], map).reclassified)
+      .toContainEqual({ path: 'scripts/gen-inventory.mjs', original: 'standard-def', destination: 'plateau' });
     console.log('S4 reclassified paths:\n' + JSON.stringify(reclassified, null, 2));
   });
 
@@ -99,9 +100,58 @@ describe('constellation ownership', () => {
       if (targetState === 'existing') writeFileSync(join(scratch, 'target.txt'), 'one\ntwo\nthree\n');
       const link = join(scratch, 'link.txt');
       symlinkSync('target.txt', link);
+      expect(existingTrackedPaths([relative(root, link)])).toEqual([relative(root, link)]);
       // Use the default filesystem reader, not the injected buffer-counting seam.
       const result = totals([{ path: relative(root, link), destination: 'plateau' }]);
       expect(result.plateau).toEqual({ files: 1, lines: 1 });
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['ENOENT', 'ENOTDIR', 'EACCES'])('handles working-tree inventory errors in the CLI (%s)', code => {
+    // Select present paths so deleting a particular fixture cannot break the scanner itself.
+    const deleted = code === 'ENOENT' ? tracked.find(path => path.startsWith('backlog/'))
+      : classify(tracked, map).reclassified[0]?.path;
+    expect(deleted).toBeDefined();
+    const preload = `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const lstat = fs.lstatSync;
+      fs.lstatSync = (path, ...args) => {
+        if (String(path) === ${JSON.stringify(resolve(root, deleted))}) {
+          throw Object.assign(new Error('simulated unstaged deletion'), { code: ${JSON.stringify(code)} });
+        }
+        return lstat(path, ...args);
+      };
+      syncBuiltinESMExports();
+    `;
+    const child = spawnSync(process.execPath,
+      ['--import', 'data:text/javascript,' + encodeURIComponent(preload),
+        'scripts/lib/constellation-ownership.mjs', 'classify', '--json'],
+      { cwd: root, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 30_000 });
+    if (code === 'EACCES') {
+      expect(child.status).toBe(1);
+      expect(child.stderr).toBe('"simulated unstaged deletion"\n');
+      expect(child.stdout).toBe('');
+      return;
+    }
+    expect(child.stderr).toBe('');
+    expect(child.status).toBe(0);
+    const result = JSON.parse(child.stdout);
+    const remaining = tracked.filter(path => path !== deleted);
+    expect(result.files.map(file => file.path)).toEqual(remaining);
+    expect(result.reclassified.some(file => file.path === deleted)).toBe(false);
+    expect(result.totals).toEqual(totals(classify(remaining, map).files));
+  });
+
+  it('filters absent paths and missing or non-directory parents without dropping existing files', () => {
+    const scratch = mkdtempSync(join(tmpdir(), 'constellation-ownership-'));
+    try {
+      writeFileSync(join(scratch, 'present.txt'), 'one\n');
+      const paths = ['missing.txt', 'missing/child.txt', 'present.txt/child.txt', 'present.txt']
+        .map(path => relative(root, join(scratch, path)));
+      expect(existingTrackedPaths(paths)).toEqual([relative(root, join(scratch, 'present.txt'))]);
     } finally {
       rmSync(scratch, { recursive: true, force: true });
     }

@@ -65,6 +65,20 @@ export function classify(paths, map) {
   };
 }
 
+/** Keep index paths still present in the working tree, including dangling symlinks. */
+export function existingTrackedPaths(paths) {
+  return paths.filter(path => {
+    try {
+      lstatSync(resolve(root, path));
+      return true;
+    } catch (error) {
+      // A removed parent, or one replaced by a file, also removes its index children.
+      if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return false;
+      throw error;
+    }
+  });
+}
+
 function readTracked(path) {
   const filename = resolve(root, path);
   const stat = lstatSync(filename);
@@ -95,7 +109,7 @@ function main(args) {
   const map = JSON.parse(readFileSync(resolve(root, 'config/constellation-ownership.json'), 'utf8'));
   const paths = execFileSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 })
     .split('\0').filter(Boolean);
-  const result = classify(paths, map);
+  const result = classify(existingTrackedPaths(paths), map);
   result.totals = totals(result.files);
   if (args[1] === '--json') process.stdout.write(JSON.stringify(result, null, 2) + '\n');
   else {
