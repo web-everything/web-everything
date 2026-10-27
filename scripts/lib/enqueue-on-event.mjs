@@ -22,6 +22,7 @@
  *   clone, feeds it each feed poll (`notePoll`), and calls `tick()` ONLY while it sleeps between passes (never during
  *   a clone refresh or a pass: both use the same clone). Before its next pass it awaits `idle()`. So a fast drain and
  *   a full pass never run at the same time in one clone.
+ *   With a separate code clone, pending daemon refreshes pause new starts; in-flight drains finish normally.
  *
  * SETTING `mergeQueue.enqueueOnEvent` — `{ enabled: boolean, debounceSeconds: number, timeoutSeconds: number,
  *   catchUp: { enabled: boolean, intervalMinutes: number, concurrency: number, busyIntervalSeconds: number, maxQueued: number, missSmellAfter: number, blockedBackoffRounds: number, timeoutBackoffRounds: number, order: string } }`, resolved through the shared
@@ -73,6 +74,8 @@ import { extractManifestFromBody, repoKeyFromSlug } from '../readiness/lane-mani
 import { parseVerdictComment } from './review-log-claims.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
+import { readOverlays } from './daemon-overlays.mjs';
+import { readRebuildState } from './daemon-rebuild/state.mjs';
 
 export const ENQUEUE_ON_EVENT_POLICY = 'mergeQueue.enqueueOnEvent';
 export const ENQUEUE_ON_EVENT_ENV = 'WE_ENQUEUE_ON_EVENT';
@@ -83,6 +86,26 @@ const READY_LABEL = 'ready-to-merge';
 const ELIGIBLE_LABELS = Object.freeze(['review:accepted', READY_LABEL]);
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+/** Bound refresh priority so stale or stuck overlay registrations cannot starve catch-up. */
+export function overlayRefreshPending({ overlays, rebuildState, now, maxAgeMs = 3600000 }) {
+  const clear = { pending: false, reason: null };
+  if (!isObj(rebuildState)) return clear;
+  if (rebuildState.building) {
+    const startedAt = Date.parse(rebuildState.building.startedAt);
+    // A build record with no readable start, or older than the bound, is stale (dead builder): never starve catch-up on it.
+    return Number.isFinite(startedAt) && now - startedAt <= maxAgeMs ? { pending: true, reason: 'building' } : clear;
+  }
+  if (['rejected', 'held', 'quarantine', 'unverified'].some((key) => rebuildState[key])) return clear;
+  const adoptedAt = Date.parse(rebuildState.adopted?.at);
+  if (Array.isArray(overlays) && overlays.some((overlay) => {
+    const addedAt = Date.parse(overlay?.addedAt);
+    return Number.isFinite(addedAt) && addedAt <= now && now - addedAt <= maxAgeMs
+      && (!Number.isFinite(adoptedAt) || addedAt > adoptedAt);
+  })) return { pending: true, reason: 'unadopted-overlay' };
+  return clear;
+}
+
 const validInterval = (v) => Number.isFinite(v) && v >= 1 && v <= 240;
 const CATCH_UP_VALID = {
   enabled: (v) => typeof v === 'boolean',
@@ -491,7 +514,7 @@ const lastJsonLine = (s) => {
 
 /**
  * The daemon-side handle.
- * @param {{cwd:string, localSlug:string, defaultBranch?:string, execFileSyncImpl?:Function, scriptRoot?:()=>string, allowed?:()=>boolean, log?:(m:string)=>void,
+ * @param {{cwd:string, localSlug:string, defaultBranch?:string, execFileSyncImpl?:Function, scriptRoot?:()=>string, allowed?:()=>boolean, refreshPending?:Function, log?:(m:string)=>void,
  *   env?:object, now?:()=>number, spawnImpl?:Function, resolveSetting?:Function, timeoutMs?:number, readPr?:Function, readMembership?:Function, readCandidates?:Function, readQueueDepth?:Function, readCapacity?:Function, readPriorities?:Function}} o
  *   `cwd` the drain's data clone (the fast drain runs there, like a pass). `scriptRoot()` the pass code root (data
  *   clone, or the code clone carrying overlays). `allowed()` true only while the caller sleeps between passes.
@@ -500,6 +523,13 @@ export function createEnqueueOnEvent({
   cwd, localSlug, defaultBranch, execFileSyncImpl = execFileSyncThrottled,
   scriptRoot = () => cwd, allowed = () => true, log = (m) => process.stderr.write(`${m}\n`),
   env = process.env, now = () => Date.now(), spawnImpl = spawn, resolveSetting = () => resolveEnqueueOnEventSetting({ env }),
+  refreshPending = () => {
+    try {
+      const root = scriptRoot();
+      if (root === cwd) return { pending: false };
+      return overlayRefreshPending({ overlays: readOverlays(root, { env }), rebuildState: readRebuildState(root, env), now: now() });
+    } catch { return { pending: false }; }
+  },
   readCandidates = ({ repo }) => readCatchUpCandidates({ repo, env, defaultBranch }), readCapacity = (s) => readQueueCapacity(s),
   readPriorities = () => ({ priority: readBuildQueuePrioritySettings({ env }), buildPriority: readBuildPrioritySettings({ env }).ids, mainFix: readMainRedPriority({ env }) }),
   readQueueDepth = ({ repo }) => readCatchUpQueueDepth({ repo, env }),
@@ -569,6 +599,17 @@ export function createEnqueueOnEvent({
   }
 
   async function runDue({ catchUpOnly = false } = {}) {
+    let refreshLogged = false;
+    const mayStart = () => {
+      if (!allowed()) return false;
+      const refresh = refreshPending();
+      if (!refresh.pending) return true;
+      if (!refreshLogged) {
+        log(`enqueue-on-event: catch-up paused — daemon refresh pending (${refresh.reason}) — retrying on next tick`);
+        refreshLogged = true;
+      }
+      return false;
+    };
     let s = readSetting();
     if (!await honourSetting(s)) return [];
     if (!defaultBranch) {
@@ -605,7 +646,7 @@ export function createEnqueueOnEvent({
         for (const num of catchUpLater) { if (queueCatchUp(num)) break; }
       }
     };
-    if (catchUpDue(s, now()) && allowed() && ![...pending.values()].some(p => greenEvent(p) && staged(p))) {
+    if (catchUpDue(s, now()) && mayStart() && ![...pending.values()].some(p => greenEvent(p) && staged(p))) {
       lastCatchUpAt = now();
       nextCatchUpAt = now() + s.catchUp.intervalMinutes * 60_000;
       catchUpRoom = 0; // an unreadable queue cannot authorize retained work
@@ -632,7 +673,7 @@ export function createEnqueueOnEvent({
     }
     const ran = [];
     for (;;) {
-      if (stopped || !allowed()) break;
+      if (stopped || !mayStart()) break;
       if (active.size >= concurrency) { await Promise.race(active.values()); continue; }
       if (ran.length) { // a fast drain takes minutes: honour a setting changed while it ran
         s = readSetting();
@@ -669,7 +710,7 @@ export function createEnqueueOnEvent({
         if (p.catchUp) refillCatchUp();
         continue;
       }
-      if (!allowed()) { pending = new Map(pending).set(key, taken); break; } // the window closed during the read
+      if (!mayStart()) { pending = new Map(pending).set(key, taken); break; } // the window closed during the read
       // An event folded into retained catch-up work is new information too.
       const blocked = p.catchUp && taken.causes.every(c => c === 'catch-up') && backoff.get(p.num);
       if (blocked) {
@@ -690,7 +731,7 @@ export function createEnqueueOnEvent({
           refillCatchUp();
           continue;
         }
-        if (stopped || !allowed() || batchingDeferred || !depth?.ok || capacity - depth.queued - active.size <= 0) {
+        if (stopped || !mayStart() || batchingDeferred || !depth?.ok || capacity - depth.queued - active.size <= 0) {
           if (!batchingDeferred) pending = new Map(pending).set(key, taken);
           break;
         }
