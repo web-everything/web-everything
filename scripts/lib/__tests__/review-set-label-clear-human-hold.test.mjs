@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { buildVerdictComment, runReviewLabelCli } from '../../review-set-label.mjs';
 import { DELEGATED_CLEARANCE_INELIGIBLE_LABELS } from '../review-labels.mjs';
+import { appendVerdict, EVENT_TYPES } from '../verdict-ledger.mjs';
+import labelInputHold from '../pr-state/holds/label-input.mjs';
 
 vi.mock('../verdict-ledger.mjs', async importOriginal => ({
   ...await importOriginal(),
@@ -10,17 +12,23 @@ vi.mock('../verdict-ledger.mjs', async importOriginal => ({
 const head = 'a'.repeat(40);
 
 function run({ evidence, delegated = true, accepted = false, injectAt = 2, repark = false, readError = false,
-  args, movedHead }) {
+  args, movedHead, onRead = () => {} }) {
   const initialLabels = ['review:human', ...(accepted ? ['review:accepted'] : [])];
   const output = [];
   let reads = 0;
   const events = [];
+  const ledger = [];
+  vi.mocked(appendVerdict).mockImplementation(record => {
+    ledger.push(record);
+    return { ok: true, record };
+  });
   const comments = repark ? [{ author: { login: 'web-everything' },
     body: `<!-- human-surface-repark: ${head} -->` }] : [];
   const provider = {
     readPostingIdentity: () => ({ login: 'chalbert', type: 'User' }),
     readPrState: vi.fn(() => {
       const blocked = ++reads >= injectAt;
+      onRead(reads);
       events.push(blocked ? 'blocked-read' : 'eligible-read');
       if (blocked && readError) throw new Error('labels unavailable');
       return { state: 'OPEN', headRefOid: blocked && movedHead ? movedHead : head, comments, body: '',
@@ -50,7 +58,12 @@ function run({ evidence, delegated = true, accepted = false, injectAt = 2, repar
     if (typeof error.exitCode !== 'number') throw error;
     exitCode = error.exitCode;
   } finally { exit.mockRestore(); }
-  return { provider, output: output.join(''), exitCode, events };
+  const holds = labelInputHold.evaluate({
+    view: { events: [{ type: EVENT_TYPES.LABEL_INPUT, change: 'added', label: 'review:human',
+      sender: 'operator' }, ...ledger] },
+    facts: { head: { sha: head }, now: Date.now() },
+  });
+  return { provider, output: output.join(''), exitCode, events, ledger, holds };
 }
 
 describe('delegated clear-human final label guard', () => {
@@ -67,6 +80,45 @@ describe('delegated clear-human final label guard', () => {
   ];
   const delegation = '--delegation-json=' + JSON.stringify({
     by: 'operator', scope: 'test', expires: '2099-01-01T00:00:00Z',
+  });
+  it.each([
+    { name: 'expired', expires: '2000-01-01T00:00:00Z' },
+    { name: 'missing', expires: undefined },
+    { name: 'unparsable', expires: 'not-a-date' },
+    { name: 'ISO-shaped but unparsable', expires: '2099-99-99T00:00:00Z' },
+    { name: 'empty', expires: '' },
+    { name: 'null', expires: null },
+  ])('refuses $name delegation expiry without any durable write', ({ expires }) => {
+    const result = run({ injectAt: Infinity, args: [`--expect-head=${head}`,
+      '--delegation-json=' + JSON.stringify({ by: 'operator', scope: 'review:human', expires })] });
+    expect(result.ledger).toEqual([]);
+    expect(result.events).toEqual([]);
+    expect(result.exitCode).toBe(2);
+    expect(result.output).toContain('--delegation-json');
+    expect(result.holds).toEqual([expect.objectContaining({ code: 'label-input:review:human' })]);
+  });
+
+  it.each([1, 2])('refuses delegation expiring during read %s before both ledger appends', expireAt => {
+    const expiry = Date.parse('2099-01-01T00:00:00Z');
+    const now = vi.spyOn(Date, 'now').mockReturnValue(expiry - 1);
+    try {
+      const result = run({ injectAt: Infinity, onRead: read => {
+        if (read === expireAt) now.mockReturnValue(expiry);
+      } });
+      expect(result.exitCode).toBe(1);
+      expect(result.ledger).toEqual([]);
+      expect(result.events).toEqual(['eligible-read', 'eligible-read']);
+      expect(result.holds).toEqual([expect.objectContaining({ code: 'label-input:review:human' })]);
+    } finally { now.mockRestore(); }
+  });
+
+  it.each([false, true])('retains the human hold with zero ledger appends when review:changes arrives on the second read (accepted=%s)', accepted => {
+    const result = run({ accepted, evidence: ['review:human', 'review:changes'], injectAt: 2 });
+    expect(result.exitCode).toBe(1);
+    expect(result.provider.readPrState).toHaveBeenCalledTimes(2);
+    expect(result.ledger).toEqual([]);
+    expect(result.holds).toEqual([expect.objectContaining({ code: 'label-input:review:human' })]);
+    expect(result.events).toEqual(['eligible-read', 'blocked-read']);
   });
   it.each([
     { name: 'short --expect-head', args: ['--expect-head=abcdef0', delegation] },
@@ -101,6 +153,7 @@ describe('delegated clear-human final label guard', () => {
       expect(result.events.filter(event => event.endsWith('write'))).toEqual(testCase.priorWrites);
       expect(result.provider.addLabels).not.toHaveBeenCalled();
       expect(result.provider.removeLabels).not.toHaveBeenCalled();
+      if (testCase.injectAt <= 2) expect(result.ledger).toEqual([]);
       expect(result.output).toContain(testCase.injectAt === 1 ? 'live head differs from --expect-head'
         : testCase.injectAt === 4 ? 'delegated clearance refused: post-clearance re-check failed'
           : 'head changed before acceptance; hold retained');
@@ -124,6 +177,7 @@ describe('delegated clear-human final label guard', () => {
       expect(result.events.filter(event => event.endsWith('write'))).toEqual(testCase.priorWrites);
       expect(result.provider.addLabels).not.toHaveBeenCalled();
       expect(result.provider.removeLabels).not.toHaveBeenCalled();
+      if (testCase.injectAt <= 2) expect(result.ledger).toEqual([]);
       if (testCase.injectAt === 2) {
         expect(result.provider.postComment).not.toHaveBeenCalled();
         expect(result.provider.setLabels).not.toHaveBeenCalled();
@@ -141,6 +195,9 @@ describe('delegated clear-human final label guard', () => {
     expect(result.provider.setLabels).toHaveBeenLastCalledWith('o/r', '7', {
       add: 'review:accepted', remove: ['review:human'],
     });
+    expect(result.ledger).toHaveLength(2);
+    expect(result.ledger[1].type).toBe(EVENT_TYPES.APPROVAL);
+    expect(result.holds).toBeNull();
   });
 
   it('preserves operator reassertion over an operator hold with a matching repark marker', () => {
