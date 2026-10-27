@@ -1629,7 +1629,7 @@ pushes, and asserts that reservations survive both failed index rewrites and fai
 It also observes the allocator's log callback for each effective setting and its source.
 Remote-backed gap selection uses current trees and reservation refs, without historical deletion
 evidence; the historical-number reuse policy is tracked in
-#xpg1c2d.
+#7317.
 Canonical tree reads use NUL-delimited paths; cover Unicode, quotes, backslashes and embedded newlines.
 Allocation and replay must obey the five-digit numeric ID grammar, including contention at 99999.
 Numbering evidence reads leave tracking refs unchanged by default: fetch with an empty refmap

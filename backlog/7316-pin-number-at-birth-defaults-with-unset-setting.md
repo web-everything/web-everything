@@ -1,4 +1,5 @@
 ---
+bornAs: xjvujg4
 kind: task
 status: open
 scope: ["we:scripts/lib/__tests__/card-number-allocator.test.mjs", "we:scripts/backlog/__tests__/number-at-birth-cli.test.mjs", "we:scripts/settings/number-at-birth.json"]

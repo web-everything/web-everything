@@ -1,4 +1,5 @@
 ---
+bornAs: xgyc95h
 kind: task
 status: open
 scope: ["we:scripts/operations/scaffold-io.mjs", "we:scripts/operations/scaffold.mjs", "we:scripts/operations/file-item.mjs", "we:scripts/operations/__tests__/scaffold-io.test.mjs", "we:scripts/operations/__tests__/file-item-io.test.mjs"]
