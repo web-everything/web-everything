@@ -2660,6 +2660,15 @@ HEAD drift and missing/unreadable lease evidence during awaited provider resolut
 assert refusal before `merge-tree --write-tree`, `read-tree`, replay, commit or push.
 Keep an unchanged-head/holder case that reaches the real reset path.
 
+Keep disk-backed lease tests that omit the `readLease` injection: valid and foreign
+markers, missing files, malformed JSON, missing holders, JSON null, and read errors
+must exercise the production reader at `.git/.lane-lease`. A worktree marker is not
+ownership evidence. Use a directory at the marker path for a deterministic read
+error, including under root. After an agent leaves edits, change or remove its lease
+and assert refusal before file reads for staging, index writes, commit, push, re-arm,
+or lane release. Pair these cases with identical edits under an unchanged lease
+that reach staging and push, so an inert fixture cannot prove the guard.
+
 For a read-only observation, run
 `node scripts/operations/fix-run.mjs --probe-lane-head --lane-path=<absolute lane path> --pr=<PR> --holder=<original acquired holder> [--repo=owner/repo]`.
 The probe prints the observed lease, HEAD, current GitHub PR head and pure

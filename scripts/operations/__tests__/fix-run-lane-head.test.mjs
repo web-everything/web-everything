@@ -1,5 +1,9 @@
-import { describe, it, expect, vi } from 'vitest';
-import { laneHeadCheck, ensureLaneHead, probeLaneHead, runFixCli, LauncherError, parseAcquiredLanePath } from '../fix-run.mjs';
+import { describe, it, expect, vi, onTestFinished } from 'vitest';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { LEASE_FILENAME } from '../../lib/lane-lease.mjs';
+import { laneHeadCheck, ensureLaneHead, probeLaneHead, readLaneLease, runFixCli, LauncherError, parseAcquiredLanePath } from '../fix-run.mjs';
 
 const holder = 'conveyor-fix-lane-10-eaae3ffe';
 const foreign = 'orchestrator-slots-lane-10-4fef772b';
@@ -7,7 +11,7 @@ const prHead = '6509e66bc'.padEnd(40, '0');
 const oldHead = '9904fc5'.padEnd(40, '0');
 const lease = { holder };
 
-function fixture({ head = prHead, owner = holder } = {}) {
+function fixture({ head = prHead, owner = holder, lanePath = '/lanes/lane-10' } = {}) {
   const state = { head, owner, dirty: '', spawnHead: null };
   const calls = [];
   const run = vi.fn((cmd, args, opts) => {
@@ -15,7 +19,7 @@ function fixture({ head = prHead, owner = holder } = {}) {
     if (cmd === 'gh') return JSON.stringify({ title: 'T', headRefOid: prHead });
     if (args.includes('acquire')) {
       if (args.includes('--lane=10')) state.head = prHead;
-      return JSON.stringify({ path: '/lanes/lane-10', holder });
+      return JSON.stringify({ path: lanePath, holder });
     }
     if (args.includes('rev-parse') && args.at(-1) === 'HEAD') return state.head;
     if (args.includes('status')) return state.dirty;
@@ -32,6 +36,135 @@ function fixture({ head = prHead, owner = holder } = {}) {
   return { state, calls, run, readLease, spawn, recordOutcome, appendLoopRow, releaseClaim, io };
 }
 const argv = ['--pr=5759', '--session=fix-5759', '--ref=lane/pr', '--prompt-file=/p', '--provider=codex'];
+
+// Keep subprocesses stubbed, but omit io.readLease to exercise the production disk reader.
+function diskLeaseFixture(options = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'fix-lane-lease-'));
+  onTestFinished(() => rmSync(root, { recursive: true, force: true }));
+  const lanePath = join(root, 'lane-10');
+  const gitDir = join(lanePath, '.git');
+  mkdirSync(gitDir, { recursive: true });
+  const marker = join(gitDir, LEASE_FILENAME);
+  const setLease = kind => {
+    rmSync(marker, { recursive: true, force: true });
+    if (kind === 'missing') return;
+    if (kind === 'unreadable') { mkdirSync(marker); return; }
+    const contents = {
+      owned: JSON.stringify({ holder }), foreign: JSON.stringify({ holder: foreign }),
+      malformed: '{"holder":', 'missing holder': '{}', null: 'null',
+    };
+    writeFileSync(marker, contents[kind]);
+  };
+  setLease('owned');
+  // A plausible worktree marker must never substitute for the allocator's .git marker.
+  writeFileSync(join(lanePath, LEASE_FILENAME), JSON.stringify({ holder }));
+  const f = fixture({ ...options, lanePath });
+  delete f.io.readLease;
+  return { ...f, lanePath, gitDir, marker, setLease };
+}
+
+const invalidDiskLeases = ['foreign', 'missing', 'malformed', 'unreadable', 'missing holder', 'null'];
+
+describe('production on-disk fixer lease reader', () => {
+  it('reads the allocator marker, returns null for a missing file, and propagates parse and IO errors', () => {
+    const f = diskLeaseFixture();
+    expect(readLaneLease(f.lanePath)).toEqual({ holder });
+    f.setLease('foreign');
+    expect(readLaneLease(f.lanePath)).toEqual({ holder: foreign });
+    f.setLease('missing');
+    expect(readLaneLease(f.lanePath)).toBeNull();
+    f.setLease('malformed');
+    expect(() => readLaneLease(f.lanePath)).toThrow(SyntaxError);
+    // A directory gives a deterministic read error even when tests run as root.
+    f.setLease('unreadable');
+    expect(() => readLaneLease(f.lanePath)).toThrow(/EISDIR/);
+  });
+
+  it('starts and releases an unchanged lane using the default reader', async () => {
+    const f = diskLeaseFixture();
+    expect((await runFixCli(argv, f.io)).code).toBe(0);
+    expect(f.spawn).toHaveBeenCalledOnce();
+    expect(f.state.spawnHead).toBe(prHead);
+    expect(f.readLease).not.toHaveBeenCalled();
+    expect(f.calls.filter(c => c.args.includes('release'))).toHaveLength(1);
+  });
+
+  it('recovers a clean wrong head using the real marker and the acquired holder', async () => {
+    const f = diskLeaseFixture({ head: oldHead });
+    expect((await runFixCli(argv, f.io)).code).toBe(0);
+    expect(f.state.spawnHead).toBe(prHead);
+    const recovery = f.calls.find(c => c.args.includes('--lane=10') && c.args.includes('acquire'));
+    expect(recovery.args).toContain(`--expect-holder=${holder}`);
+    expect(f.readLease).not.toHaveBeenCalled();
+  });
+
+  it.each(invalidDiskLeases)('refuses a %s disk lease before recovery or spawn', async kind => {
+    const f = diskLeaseFixture({ head: oldHead });
+    f.setLease(kind);
+    expect((await runFixCli(argv, f.io)).code).toBe(1);
+    expect(f.spawn).not.toHaveBeenCalled();
+    expect(f.calls.filter(c => c.args.includes('acquire'))).toHaveLength(1);
+    expect(f.calls.some(c => c.args.some(arg => ['add', 'update-index', 'commit', 'push', 'release'].includes(arg)))).toBe(false);
+    expect(f.recordOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: 'failed', reason: expect.stringContaining('refusing to start the agent'),
+    }));
+    expect(f.releaseClaim).toHaveBeenCalledOnce();
+    expect(f.readLease).not.toHaveBeenCalled();
+  });
+});
+
+describe('ownership loss before post-agent staging', () => {
+  function stagedFixture() {
+    const f = diskLeaseFixture();
+    const stageEntry = vi.fn(() => ({ data: Buffer.from('repair\n'), mode: '100644' }));
+    const pendingRearm = { read: () => null, write: vi.fn(), clear: vi.fn() };
+    f.io.stageEntry = stageEntry;
+    f.io.pendingRearm = pendingRearm;
+    f.io.run = (cmd, args, opts) => {
+      const value = f.run(cmd, args, opts);
+      if (cmd === 'git' && args.includes('--absolute-git-dir')) return f.gitDir;
+      if (cmd === 'git' && args.includes('commit')) f.state.head = 'a'.repeat(40);
+      return value;
+    };
+    f.spawn.mockImplementation(async () => {
+      writeFileSync(join(f.lanePath, 'repair.txt'), 'repair\n');
+      f.state.dirty = ' M repair.txt\0';
+    });
+    return { ...f, stageEntry, pendingRearm };
+  }
+
+  it.each(invalidDiskLeases)('refuses a %s lease left by the agent before reading or staging its edits', async kind => {
+    const f = stagedFixture();
+    const edit = f.spawn.getMockImplementation();
+    f.spawn.mockImplementation(async () => { await edit(); f.setLease(kind); });
+    expect((await runFixCli(argv, f.io)).code).toBe(1);
+    expect(f.spawn).toHaveBeenCalledOnce();
+    expect(f.state.dirty).toBe(' M repair.txt\0');
+    expect(readFileSync(join(f.lanePath, 'repair.txt'), 'utf8')).toBe('repair\n');
+    expect(f.stageEntry).not.toHaveBeenCalled();
+    expect(f.calls.some(c => c.cmd === 'git' && c.args.some(arg =>
+      ['--absolute-git-dir', 'add', 'update-index', 'commit', 'push'].includes(arg)))).toBe(false);
+    expect(f.calls.some(c => c.args.includes('release') || c.args.some(arg => arg.endsWith('rearm-review.mjs')))).toBe(false);
+    expect(f.pendingRearm.write).not.toHaveBeenCalled();
+    expect(f.recordOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: 'failed', reason: expect.stringContaining('refusing to push or stage files'),
+    }));
+    expect(f.releaseClaim).toHaveBeenCalledOnce();
+    expect(f.readLease).not.toHaveBeenCalled();
+  });
+
+  it('stages, commits and pushes the same edits when the disk lease remains owned', async () => {
+    const f = stagedFixture();
+    expect((await runFixCli(argv, f.io)).code).toBe(0);
+    expect(f.spawn).toHaveBeenCalledOnce();
+    expect(f.stageEntry).toHaveBeenCalledWith(f.lanePath, 'repair.txt');
+    for (const command of ['add', 'update-index', 'commit', 'push']) {
+      expect(f.calls.some(c => c.cmd === 'git' && c.args.includes(command))).toBe(true);
+    }
+    expect(f.pendingRearm.write).toHaveBeenCalledOnce();
+    expect(f.readLease).not.toHaveBeenCalled();
+  });
+});
 
 function resetFixture({ drift } = {}) {
   const f = fixture();
