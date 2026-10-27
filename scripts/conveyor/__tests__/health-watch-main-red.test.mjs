@@ -39,6 +39,20 @@ const passingTip = () => ({
   checkRuns: [{ id: 1, name: 'test', status: 'completed', conclusion: 'success' }],
 });
 
+describe('planMainRedAlert — healthy main stays quiet while tip checks are unproven', () => {
+  it.each([
+    ['pending', { ...passingTip(), checkRuns: [{ name: 'test', status: 'in_progress', conclusion: null }] }],
+    ['empty', { ...passingTip(), checksTotal: 0, checkRuns: [] }],
+    ['null', null],
+    ['skipped', { ...passingTip(), checkRuns: [{ name: 'test', status: 'completed', conclusion: 'skipped' }] }],
+  ])('emits no items for a %s tip without an outstanding red alert', (_name, tip) => {
+    const result = plan({ runs: greenRuns(), tip });
+    expect(result.items).toEqual([]);
+    expect(result.next.unknownEmitted).toBeFalsy();
+    expect(result.next.fingerprint).toBeFalsy();
+  });
+});
+
 describe('planMainRedAlert — recovery requires affirmative conclusions on every tip check', () => {
   describe.each(['workflow-SHA', 'tip-required-checks'])('%s recovery', (via) => {
     const recoveryInput = (check) => ({
@@ -493,6 +507,26 @@ describe('planMainRedAlert — red window and attention payload', () => {
 });
 
 describe('planMainRedAlert — fingerprint and recovery', () => {
+  it.each([
+    ['SHA', TIP_SHA, SINCE],
+    ['since timestamp', RED_SHA, '2026-10-26T12:01:00.000Z'],
+  ])('does not carry unavailable details across red episodes when the %s changes', (_name, sha, since) => {
+    const first = plan();
+    const result = plan({ prev: first.next, details: {
+      failingJobs: null, firstFailingTest: null, blockedReadyPrs: null, fixPrs: null,
+    }, runs: [run(sha, 'failure', since, 4), redRuns()[1]] });
+
+    expect(kinds(result)).toEqual(['main-red']);
+    expect(result.items[0]).toMatchObject({
+      firstRedSha: sha, since, failingJobs: [], firstFailingTest: null,
+      fixPrs: [], blockedReadyPrs: null,
+    });
+    expect(result.next.fingerprintParts).toEqual({
+      firstRedSha: sha, since, failingJobs: [], firstFailingTest: null, fixPrs: [],
+    });
+    expect(result.next.fingerprint).not.toBe(first.next.fingerprint);
+  });
+
   it.each([
     ['unavailable details', null],
     ['omitted details', undefined],

@@ -43,6 +43,9 @@ export function planMainRedAlert(input = {}) {
     || (state.latestGreen?.sha === tip.sha
       && Array.isArray(tip.requiredChecks) && tip.requiredChecks.length > 0
       && !tipVerdicts.includes('pending')));
+  // Healthy workflow runs commonly precede the new tip's checks. Only an
+  // outstanding red alert needs unavailable recovery evidence surfaced here.
+  if (state.status === 'green' && !provenGreen && !prev.fingerprint) return { items, next };
   if (!['red', 'green'].includes(state.status) || (state.status === 'green' && !provenGreen)) {
     if (!prev.unknownEmitted) emit({ ...base, kind: 'main-status-unknown',
       head: 'main-status-unknown', reason: 'Main CI status is unavailable' });
