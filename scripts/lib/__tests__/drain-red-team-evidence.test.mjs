@@ -52,6 +52,43 @@ describe('invalid status carry cannot suppress failed-seat recovery', () => {
       loopPayload: { ...loopPayload, verdict: null, carriedFrom: 'not-a-sha' }, ...over };
   }
 
+  const nonCarryStatuses = [
+    ['error result', { status: 'finished', result: 'error', skipCardOnly: false }],
+    ['finished ran result', { status: 'finished', result: 'ran', skipCardOnly: false }],
+    ['object error result', { status: 'finished', result: { status: 'error' }, skipCardOnly: false }],
+    ['skip with card-only disabled', { status: 'finished', result: 'skipped', skipCardOnly: false }],
+    ['skip with another policy', { status: 'finished', result: { status: 'skipped', policy: 'daily-cap' }, skipCardOnly: false }],
+  ];
+  const recoveryState = evidence => ({ carryConflict: evidence.carryConflict, scheduled: evidence.scheduled,
+    noUsableResult: evidence.noUsableResult, failedSeatCount: evidence.failedSeatCount });
+
+  it.each(nonCarryStatuses)('valid carriedFrom on %s cannot suppress failed-seat recovery', (_kind, fields) => {
+    const { f, path, loopPayload } = failedSeatFixture();
+    expect(readRedTeamCarry(f)).toBeNull();
+    const status = { repo: f.repo, pr: f.pr, head: f.head, loopPayload, ...fields };
+    writeFileSync(path, JSON.stringify(status));
+    const ordinary = recoveryState(readDrainRedTeamEvidence(f));
+    expect(ordinary).toEqual({ carryConflict: undefined, scheduled: true, noUsableResult: true, failedSeatCount: 1 });
+
+    writeFileSync(path, JSON.stringify({ ...status, loopPayload: { ...loopPayload, carriedFrom: 'a'.repeat(40) } }));
+    expect(recoveryState(readDrainRedTeamEvidence(f)),
+      'a valid SHA alone must not turn a non-carry status into conflicting carry evidence').toEqual(ordinary);
+  });
+
+  it.each(nonCarryStatuses)('merge-strategy keeps the failed-seat request eligible with valid carriedFrom on %s', (_kind, fields) => {
+    const { f, path, loopPayload } = failedSeatFixture();
+    expect(readRedTeamCarry(f)).toBeNull();
+    const status = { repo: f.repo, pr: f.pr, head: f.head, loopPayload, ...fields };
+    const eligible = () => staleRedTeamRequestEligibility({ ...f, evidence: readDrainRedTeamEvidence(f),
+      enabled: true, labels: ['review:accepted', 'ready-to-merge'] });
+    writeFileSync(path, JSON.stringify(status));
+    const ordinary = eligible();
+    expect(ordinary).toEqual({ eligible: true, reason: 'stale rows with no usable result' });
+
+    writeFileSync(path, JSON.stringify({ ...status, loopPayload: { ...loopPayload, carriedFrom: 'a'.repeat(40) } }));
+    expect(eligible(), 'non-carry status metadata must not suppress the drain consumer request').toEqual(ordinary);
+  });
+
   it.each([
     ['foreign repo', { repo: 'foreign/repository' }],
     ['other PR', { pr: 99999 }],
