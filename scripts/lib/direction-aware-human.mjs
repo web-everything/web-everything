@@ -2,12 +2,16 @@
 import { PROTECTION_PATHS } from './human-review-surfaces.mjs';
 import { SANDBOX_TOKEN_RE } from './permission-change.mjs';
 import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { cascadePolicy, platformPreference } from './policy-cascade.mjs';
+
+const SETTINGS_PATH = join(dirname(fileURLToPath(import.meta.url)), '../settings/direction-aware-human.json');
 
 /** R131: standard → platform → tool → environment; shadow is the safe fallback. */
 export function resolveDirectionAwareMode({ env = process.env, readFile = readFileSync } = {}) {
   let tool;
-  try { tool = JSON.parse(String(readFile(new URL('../settings/direction-aware-human.json', import.meta.url), 'utf8')))?.directionAwareHuman; } catch { /* absent layer */ }
+  try { tool = JSON.parse(String(readFile(SETTINGS_PATH, 'utf8')))?.directionAwareHuman; } catch { /* absent layer */ }
   const valid = value => value === 'shadow' || value === 'live';
   const raw = env?.WE_DIRECTION_AWARE_HUMAN;
   const platform = platformPreference('directionAwareHuman', { env, readFile });

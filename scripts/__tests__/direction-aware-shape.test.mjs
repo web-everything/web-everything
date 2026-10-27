@@ -6,9 +6,9 @@ import { resolveDirectionAwareMode } from '../lib/direction-aware-human.mjs';
 import { loadReadOnlyOps } from '../lib/read-only-ops.mjs';
 import * as importClosure from '../lib/import-closure.mjs';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
-import { join, resolve, relative } from 'node:path';
+import { dirname, join, resolve, relative } from 'node:path';
 import { tmpdir } from 'node:os';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { op, isReadOnlyOperation } from '../operations/registry.mjs';
 import { compute, effect } from '../operations/step-kinds.mjs';
 import { verifyOperation } from '../operations/verify.mjs';
@@ -179,9 +179,21 @@ describe('R131 direction-aware shape wiring', () => {
     }
   });
   it('ships shadow mode in the real scripts/settings/direction-aware-human.json', () => {
-    const settings = JSON.parse(readFileSync(new URL('../settings/direction-aware-human.json', import.meta.url), 'utf8'));
+    const settingsPath = join(dirname(fileURLToPath(import.meta.url)), '../settings/direction-aware-human.json');
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf8'));
     expect(settings.directionAwareHuman).toBe('shadow');
-    expect(resolveDirectionAwareMode({ env: {} })).toBe('shadow');
+    const readFile = vi.fn(readFileSync);
+    expect(resolveDirectionAwareMode({ env: {}, readFile })).toBe('shadow');
+    expect(readFile).toHaveBeenCalledWith(settingsPath, 'utf8');
+  });
+  it('reads an explicit live tool setting from the module-relative filesystem path', () => {
+    const settingsPath = join(dirname(fileURLToPath(import.meta.url)), '../settings/direction-aware-human.json');
+    const readFile = vi.fn((path, encoding) => {
+      if (path === settingsPath && encoding === 'utf8') return '{"directionAwareHuman":"live"}';
+      throw new Error('unexpected settings path');
+    });
+    expect(resolveDirectionAwareMode({ env: {}, readFile })).toBe('live');
+    expect(readFile).toHaveBeenCalledWith(settingsPath, 'utf8');
   });
   it('defaults to shadow, honours live env, and fails closed on invalid values', () => {
     const readFile = () => { throw new Error('missing'); };
