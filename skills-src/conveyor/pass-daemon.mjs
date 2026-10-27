@@ -341,7 +341,8 @@ export function runPassAsTimedJob({ passName, repo, entry }, ports = {}) {
 
 async function executeTimedPass({ passName, repo, entry }, ports) {
   const { store, env, root = REPO_ROOT, now = Date.now, host = hostName(), readStart = readProcStart } = ports;
-  const log = typeof ports.log === 'function' ? ports.log : line => (ports.log ?? console).error(line);
+  // A legacy {log,error} sink carries only relayed child output; diagnostics go to the process log.
+  const log = typeof ports.log === 'function' ? ports.log : line => console.error(line);
   const alert = ports.alert ?? (detail => log(`pass-daemon: ALERT ${JSON.stringify(detail)}`));
   const probe = ports.probe ?? probeHandle;
   const stop = ports.stop ?? ((handle, options) => stopHandle(handle, { ...options, probe }));
