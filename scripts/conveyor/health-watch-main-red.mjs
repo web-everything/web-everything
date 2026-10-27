@@ -35,11 +35,11 @@ export function planMainRedAlert(input = {}) {
     ? [...latestCheckVerdicts(tip.checkRuns).values()] : [];
   const tipReadable = !!tip?.sha && tipVerdicts.length > 0
     && !tipVerdicts.includes('red');
-  const provenGreen = tipReadable && (state.via === 'tip-required-checks'
+  // A full check page may be truncated; retain unknown on either recovery path.
+  const provenGreen = tipReadable && tip.checkRuns.length < 100
+    && (state.via === 'tip-required-checks'
     || (state.latestGreen?.sha === tip.sha
       && Array.isArray(tip.requiredChecks) && tip.requiredChecks.length > 0
-      // A full check page may be truncated; retain unknown until required checks prove recovery.
-      && tip.checkRuns.length < 100
       && tip.checkRuns.every((check) => check?.name && check.status === 'completed')
       && !tipVerdicts.includes('pending')));
   if (!['red', 'green'].includes(state.status) || (state.status === 'green' && !provenGreen)) {
