@@ -22,7 +22,7 @@ export default {
     try {
       return readFileSync(join(root, 'scripts/lib/daemon-overlay-auto-retire.mjs'), 'utf8').includes("r.sources.mode === 'tool'")
         && readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8').includes('refEvidence: fetchResult.refEvidence')
-        && readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8').includes('const plan = unavailablePinned ??')
+        && readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8').includes('plan = unavailablePinned ??')
         && readFileSync(join(root, 'scripts/lib/daemon-overlays.mjs'), 'utf8').includes('expectedRequiredOverlay')
         && readFileSync(join(root, 'scripts/lib/daemon-overlays.mjs'), 'utf8').includes('retiredSources')
         && readFileSync(join(root, 'scripts/lib/daemon-overlay-auto-retire.mjs'), 'utf8').includes('persistTipShas');
@@ -179,6 +179,7 @@ export default {
     } catch (error) { violation('crash', String(error?.message ?? error)); }
     finally { rmSync(root, { recursive: true, force: true }); }
     await retirementRecovery(violation);
+    await retirementRecovery(violation, { rewrite: true });
     for (const check of await registrationEvidenceReplay()) {
       if (!check.ok) violation(check.name, JSON.stringify(check.observed));
     }
@@ -278,7 +279,7 @@ export async function registrationEvidenceReplay() {
 
 /** PR #5964 advisory round, 'on' mode: a registration added without a sha retires once its landed branch is
  *  deleted, and a container closed on a later tick leaves the source retired into it registered. */
-async function retirementRecovery(violation) {
+async function retirementRecovery(violation, { rewrite = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'overlay-retire-on-soak-'));
   const env = {
     WE_DAEMON_OVERLAY_DIR: join(root, 'store'), WE_DAEMON_STATE_DIR: join(root, 'state'),
@@ -333,10 +334,25 @@ async function retirementRecovery(violation) {
     ok('checkout', '-q', 'feature', '--', 'feature'); ok('commit', '-qm', 'squash feature');
     ok('push', '-q', 'origin', 'main');
     ok('push', '-q', 'origin', '--delete', 'feature');
-    await prepare(async (pr) => (pr === 3 ? 'CLOSED' : 'OPEN'));
+    // A force push keeps top's PR open but replaces its tree with unrelated content. Both paths must
+    // restore lower into THIS preparation's candidate, not merely leave a registration for a later tick.
+    if (rewrite) {
+      ok('checkout', '-qb', 'rewrite-top', initial);
+      const unrelated = commit('unrelated');
+      ok('checkout', '-q', 'main');
+      ok('push', '-q', '--force', 'origin', `${unrelated}:refs/heads/top`);
+    }
+    const second = await prepare(async (pr) => (!rewrite && pr === 3 ? 'CLOSED' : 'OPEN'));
     const after = readOverlayState(root, { env }).overlays.map((o) => o.ref);
     if (after.includes('feature')) violation('deleted-landed-branch-never-retires', 'an addOverlay registration stayed after its landed branch was deleted');
     if (!after.includes('lower')) violation('closed-container-loses-retired-source', `lower's open PR content left the registry with its closed container (${after.join(',')})`);
+    const candidate = second.plan ?? second.result?.plan;
+    if (!candidate?.applied.some((o) => o.ref === 'lower')
+      || git(['merge-base', '--is-ancestor', lower, candidate.finalSha]).status !== 0
+      || git(['cat-file', '-e', `${candidate.finalSha}:lower`]).status !== 0) {
+      violation(rewrite ? 'force-pushed-container-loses-source-in-build' : 'closed-container-loses-source-in-build',
+        `the next candidate must carry lower's commit and file (${second.result?.reason ?? 'candidate'})`);
+    }
   } catch (error) { violation('crash', String(error?.message ?? error)); }
   finally { rmSync(root, { recursive: true, force: true }); }
 }

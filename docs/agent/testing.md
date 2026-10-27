@@ -66,7 +66,14 @@ container by any path (planner `pr-closed`/`ref-gone`, smoke, auto-rebase, opera
 its place, nested sources included; an auto-rebase swap instead moves them onto the replacement. A source
 registered again meanwhile is skipped (audited `reinstate-skipped`) but its own nested sources still come back.
 Sources a retirement reinstates in the same tick are not fetched yet, so preparation neither alerts on them nor
-holds for a pin until the next tick. Tests drive the planner to close a container on a later tick. In `on` mode a
+holds for a pin until the next tick when their content is already in the candidate. Archived carriers are
+protected from early retirement until preparation checks all archived commits (including nested snapshots)
+against the proposed build, by ancestry or whole-tree equivalence. Missing content restores sources while
+retaining the archive as a retry obligation, fetches their branches, and replans in the same preparation.
+No progress, missing sources, or unverifiable evidence holds the build; off/shadow still honor existing archives.
+`daemon-rebuild-retired-sources.test.mjs` exercises preparation with injected Git/planner results and real
+registry storage without `.git` writes. The retirement soak checks the real candidate commit and source file
+after a closed container and after an open container is force-pushed to unrelated content. In `on` mode a
 `retiring` audit line is written before removal; if it fails, nothing is removed. A failed `removed` line or
 `overlay-retired` event after removal is returned in `auditFailures` and preparation alerts on it.
 

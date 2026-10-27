@@ -329,6 +329,28 @@ export function recordEdgeResolution(root, ref, {
   return list;
 }
 
+/** Restore the latest absent registration of each ref, also recovering older/already-active nested sources. */
+function collectRetiredSources(list, sources, { strict = false } = {}) {
+  const seen = new Set(list.map((o) => o?.ref));
+  const back = [];
+  const skipped = [];
+  const collect = (items) => {
+    const snapshots = Array.isArray(items) ? items : [];
+    const latest = new Map(snapshots.map((s) => [s?.entry?.ref, s]));
+    for (const s of snapshots) {
+      const safe = isSafeBranchName(s?.entry?.ref);
+      if (!safe && strict) throw new Error('invalid archived source');
+      if (!safe || seen.has(s.entry.ref) || latest.get(s.entry.ref) !== s) {
+        skipped.push(s?.entry?.ref ?? null); collect(s?.entry?.retiredSources); continue;
+      }
+      seen.add(s.entry.ref);
+      back.push(s);
+    }
+  };
+  collect(sources);
+  return { back, skipped };
+}
+
 /**
  * Remove one overlay entry by ref, if present. Idempotent — removing an absent ref is not an error, just
  * `removed:false`. `why` is accepted for the caller's own bookkeeping (e.g. the CLI's audit event / a
@@ -377,22 +399,7 @@ export function removeOverlay(root, ref, {
     // sources nested; in a plain swap (auto-rebase) only those sources move, since the replacement carries them.
     const swap = requireRef !== undefined && requireRef !== ref;
     const moved = !swap ? [] : retireInto ? [{ entry, sha: retiredSha }] : own;
-    const seen = new Set(list.map((o) => o?.ref));
-    const back = [];
-    const skipped = [];
-    // A source registered again meanwhile stays as it is, but whatever was retired into it still comes back.
-    const collect = (sources) => {
-      const snapshots = Array.isArray(sources) ? sources : [];
-      const latest = new Map(snapshots.map((s) => [s?.entry?.ref, s]));
-      for (const s of snapshots) {
-        if (!isSafeBranchName(s?.entry?.ref) || seen.has(s.entry.ref) || latest.get(s.entry.ref) !== s) {
-          skipped.push(s?.entry?.ref ?? null); collect(s?.entry?.retiredSources); continue;
-        }
-        seen.add(s.entry.ref);
-        back.push(s);
-      }
-    };
-    if (!swap) collect(own);
+    const { back, skipped } = collectRetiredSources(list, swap ? [] : own);
     const restored = back.map((s) => (SHA_RE.test(s.sha ?? '') ? { ...s.entry, tipSha: s.sha } : s.entry));
     const next = list.slice(0, idx).concat(restored, list.slice(idx + 1));
     if (swap && moved.length) {
@@ -407,6 +414,30 @@ export function removeOverlay(root, ref, {
     if (skipped.length) appendOverlayEvent(root, { kind: 'reinstate-skipped', refs: skipped, from: ref }, { env });
     writeOverlays(root, next, { env });
     return { removed: true, list: next, reinstated: back.map((s) => s.entry.ref) };
+  });
+}
+
+/**
+ * Restore archived inputs before replanning a build that no longer carries them. Keep the archive on
+ * its carrier until that carrier is removed by a verified plan: a missing or rewritten source branch
+ * must not erase the obligation to preserve the archived commit on the next tick.
+ */
+export function reinstateOverlaySources(root, ref, { env = process.env, expectedOverlay } = {}) {
+  return withListLock(root, env, () => {
+    const list = readOverlaysForWrite(root, env);
+    const idx = list.findIndex((o) => o?.ref === ref);
+    if (idx === -1 || !isDeepStrictEqual(list[idx], expectedOverlay)) {
+      throw new Error('archive carrier changed; refusing reinstatement');
+    }
+    const { back, skipped } = collectRetiredSources(list, list[idx].retiredSources, { strict: true });
+    for (const s of back) appendOverlayEvent(root, {
+      kind: 'reinstated', ref: s.entry.ref, from: ref, sha: s.sha ?? null,
+    }, { env });
+    if (back.length && skipped.length) appendOverlayEvent(root, { kind: 'reinstate-skipped', refs: skipped, from: ref }, { env });
+    const restored = back.map((s) => (SHA_RE.test(s.sha ?? '') ? { ...s.entry, tipSha: s.sha } : s.entry));
+    const next = list.slice(0, idx).concat(restored, list.slice(idx));
+    if (back.length) writeOverlays(root, next, { env });
+    return { list: next, reinstated: back.map((s) => s.entry.ref) };
   });
 }
 

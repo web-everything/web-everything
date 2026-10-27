@@ -2,7 +2,7 @@
  * Split out of daemon-rebuild.mjs (move-only).
  */
 
-import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
+import { makeGit, verifyRev, FULL_SHA_RE, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
 import {
   alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, readReadyCandidate,
 } from './state.mjs';
@@ -21,6 +21,7 @@ import {
 } from './local-state.mjs';
 import {
   readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode, persistStackBases, persistTipShas,
+  reinstateOverlaySources,
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild, pinnedStatus, PINNED_OVERLAY_GONE_MESSAGE } from './plan.mjs';
@@ -279,7 +280,9 @@ export async function prepareRebuild({
         .filter((a) => a?.ref && a.sha && !a.resolvedVia).map((a) => [a.ref, a.sha]));
       const retired = await autoRetireOverlays({ root, env, overlays: overlaysBefore, git, mainSha: fetchedMainSha,
         refEvidence: fetchResult.refEvidence, recordedShas, now, removeOverlay, appendOverlayEvent,
-        protectedRefs: realAutoRebase.pendingSwapRefs({ root, env }),
+        // Existing archives must survive until the proposed build proves it carries their sources.
+        protectedRefs: new Set([...realAutoRebase.pendingSwapRefs({ root, env }),
+          ...overlaysBefore.filter((o) => o.retiredSources?.length).map((o) => o.ref)]),
         // A refused plan must preserve the registered tips as well as the running tree. Keep this tick's
         // fresh {sha, reg} evidence in memory until both pinned and established-content checks accept the plan.
         // Preserve the identity captured before classification; never rebind it to a later same-ref registration.
@@ -298,7 +301,7 @@ export async function prepareRebuild({
   }
   // Preserve unavailable registrations without building from cached tips. Unpinned overlays may be skipped,
   // but an unavailable pin must use the normal refusal/last-good hold path before any new build is adopted.
-  const overlaysForPlan = overlaysBefore.filter((o) => fetchResult.refEvidence.get(o?.ref) === 'refreshed');
+  let overlaysForPlan = overlaysBefore.filter((o) => fetchResult.refEvidence.get(o?.ref) === 'refreshed');
   const unverified = overlaysBefore.filter((o) => fetchResult.refEvidence.get(o?.ref) !== 'refreshed' && !reinstatedNow.has(o?.ref));
   let unavailablePinned = null;
   if (!mainOnly) {
@@ -334,12 +337,84 @@ export async function prepareRebuild({
   // Held item 212 — stacked overlay PRs apply as stacks (only their tops) unless `overlay.stackMode` says independent.
   // The PR base chains come from gh, else from each entry's recorded `stackBases`, else ancestry alone.
   const stack = resolveOverlayStackMode(env);
-  const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysForPlan, env });
-  const plan = unavailablePinned ?? await planRebuild({
-    git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysForPlan, prState, mainOnly, edgeResolve,
-    stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
-    prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
-  });
+  let chainOf;
+  let plan;
+  const recoveredRefs = new Set();
+  // A carrier can be rewritten, closed, missing or conflict-skipped. Validate against the actual candidate,
+  // not merely a registered ref. Each retry adds a previously absent source; no-progress refuses the build.
+  for (;;) {
+    chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysForPlan, env });
+    plan = unavailablePinned ?? await planRebuild({
+      git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysForPlan, prState, mainOnly, edgeResolve,
+      stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
+      prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
+    });
+    if (!plan.ok || mainOnly) break;
+    const uncovered = [];
+    try {
+      const covered = new Map();
+      const carries = (sha) => {
+        if (!FULL_SHA_RE.test(sha ?? '') || !FULL_SHA_RE.test(plan.finalSha ?? '')) throw new Error('invalid archived commit');
+        if (covered.has(sha)) return covered.get(sha);
+        const ancestor = git(['merge-base', '--is-ancestor', sha, plan.finalSha]);
+        if (ancestor.error || ![0, 1].includes(ancestor.status)) throw new Error('archive ancestry unavailable');
+        let present = ancestor.status === 0;
+        if (!present) {
+          // Squash-landed/rebased content is safe only with whole-tree equivalence, as in retirement.
+          const merged = git(['merge-tree', '--write-tree', '--no-messages', plan.finalSha, sha]);
+          if (merged.error || ![0, 1].includes(merged.status)) throw new Error('archive content unavailable');
+          if (merged.status === 0) {
+            const tree = verifyRev(git, `${plan.finalSha}^{tree}`);
+            const mergedTree = String(merged.stdout ?? '').split('\n')[0].trim();
+            if (!FULL_SHA_RE.test(tree ?? '') || !FULL_SHA_RE.test(mergedTree)) throw new Error('archive tree unavailable');
+            present = tree === mergedTree;
+          }
+        }
+        covered.set(sha, present);
+        return present;
+      };
+      for (const carrier of overlaysBefore) {
+        const pending = [...(carrier.retiredSources ?? [])];
+        let missing = false;
+        while (pending.length) {
+          const source = pending.pop();
+          if (!carries(source?.sha)) missing = true;
+          pending.push(...(source.entry?.retiredSources ?? []));
+        }
+        if (missing) uncovered.push(carrier);
+      }
+      if (!uncovered.length) break;
+      const restored = [];
+      for (const carrier of uncovered) {
+        const recovery = reinstateOverlaySources(root, carrier.ref, { env, expectedOverlay: carrier });
+        for (const ref of recovery.reinstated) {
+          if (!recoveredRefs.has(ref)) restored.push(ref);
+          recoveredRefs.add(ref);
+        }
+        overlaysBefore = recovery.list;
+      }
+      if (!restored.length) {
+        alert('overlay-source-unavailable', { refs: uncovered.map((o) => o.ref),
+          message: 'Archived content is absent from the proposed build; restore its source branch or land it on main.' });
+        return terminal({ moved: false, reason: 'overlay-source-unavailable' });
+      }
+      const required = new Set([...restored, ...overlaysForPlan.map((o) => o.ref)]);
+      const refreshed = fetchMainAndOverlays({ git, overlays: overlaysBefore, edgeResolve });
+      if (!refreshed.ok || [...required].some((ref) => refreshed.refEvidence.get(ref) !== 'refreshed')) {
+        alert('overlay-source-unavailable', { refs: uncovered.map((o) => o.ref), message: 'Restored sources could not be refreshed; retrying next tick.' });
+        return terminal({ moved: false, reason: 'overlay-source-unavailable' });
+      }
+      // Re-fetch can advance any tip. Never reuse deferred retirement evidence across the recovery
+      // plan; its registration snapshot predates reinstatement. Previously available pins must also
+      // stay available; unrelated already-unavailable registrations remain excluded as before.
+      refreshedTips = new Map();
+      for (const [ref, evidence] of refreshed.refEvidence) fetchResult.refEvidence.set(ref, evidence);
+      overlaysForPlan = overlaysBefore.filter((o) => fetchResult.refEvidence.get(o.ref) === 'refreshed');
+    } catch (error) {
+      alert('overlay-source-unverifiable', { error: String(error?.message ?? error) });
+      return terminal({ moved: false, reason: 'overlay-source-unverifiable' });
+    }
+  }
   // The chains gh answered completely are written back onto the entries (only when they changed), so a rebuild that
   // cannot reach gh later still knows the stacks. Best effort: a busy or unwritable list never fails the rebuild.
   // A chain only names a stack's members; setting a base aside still needs hard evidence it moved (planOverlayStacks).
