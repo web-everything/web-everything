@@ -1,8 +1,10 @@
 export const EVIDENCE_READ_BACKOFF_MS = [500, 1500, 4000];
 
 export function isEvidenceReadTimeout(error) {
-  if (error?.code === 'ETIMEDOUT' || error?.message === 'evidence-read-deadline'
-    || error?.message === 'spawnSync gh ETIMEDOUT') return true;
+  // evidence-read-deadline is the scan budget checked BEFORE starting a request.
+  // Successful but slow scans fall back to ordinary healing instead of retrying
+  // the same pages forever. Only an actual request timeout makes evidence unknown.
+  if (error?.code === 'ETIMEDOUT' || error?.message === 'spawnSync gh ETIMEDOUT') return true;
   // Validation/parse errors can quote arbitrary check names. Only a Go HTTP
   // transport diagnostic (gh stderr, or the bare diagnostic) is timeout evidence.
   // Anchor the entire diagnostic: a newline embedded in a name must not qualify.

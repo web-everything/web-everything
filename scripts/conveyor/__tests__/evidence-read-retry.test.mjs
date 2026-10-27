@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { isEvidenceReadTimeout, EVIDENCE_READ_BACKOFF_MS } from '../evidence-read-retry.mjs';
-import { enrichPrsWithMainRedFacts, readTimeoutEvidence } from '../reconcile-pass.mjs';
+import { enrichPrsWithMainRedFacts, enrichPrsWithTimeoutEvidence, readTimeoutEvidence } from '../reconcile-pass.mjs';
 import { planReconcile, REFUSAL_KINDS } from '../reconcile-core.mjs';
 
 const head = 'a'.repeat(40);
@@ -24,7 +24,7 @@ describe('evidence-read timeout is unknown, never ineligible', () => {
   it('classifies only timeouts as read timeouts', () => {
     expect(isEvidenceReadTimeout(timeoutError())).toBe(true);
     expect(isEvidenceReadTimeout(new Error('spawnSync gh ETIMEDOUT'))).toBe(true);
-    expect(isEvidenceReadTimeout(new Error('evidence-read-deadline'))).toBe(true);
+    expect(isEvidenceReadTimeout(new Error('evidence-read-deadline'))).toBe(false);
     expect(isEvidenceReadTimeout(new Error('stale-head'))).toBe(false);
     expect(isEvidenceReadTimeout(new Error('incomplete-diff'))).toBe(false);
   });
@@ -92,6 +92,58 @@ describe('evidence-read timeout is unknown, never ineligible', () => {
     const result = readTimeoutEvidence(pr, { repo, exec, sleep: vi.fn(), facts: () => null });
     expect(result.unknown).toBeUndefined();
     expect(result).toMatchObject({ eligible: false, reason: 'timeout-evidence:stale-head' });
+  });
+
+  it('dispatches ci-heal on the first tick for 1,000 files with successful 1.5 s reads and WE_FIX_FACTS=0', () => {
+    vi.stubEnv('WE_FIX_FACTS', '0');
+    let clock = 0;
+    const dateNow = vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    const sleep = vi.fn();
+    const files = Array.from({ length: 1000 }, (_, i) => ({ filename: `src/file-${i}.ts`, status: 'modified' }));
+    const prefix = `repos/${repo}/pulls/${pr.number}`;
+    const exec = vi.fn((_cmd, args) => {
+      clock += 1500;
+      if (args[1] === prefix) return JSON.stringify({ head: { sha: head }, base: { sha: 'b'.repeat(40) },
+        state: 'open', changed_files: files.length });
+      const page = /\/files\?per_page=100&page=(\d+)$/.exec(args[1]);
+      if (page) return JSON.stringify(files.slice((Number(page[1]) - 1) * 100, Number(page[1]) * 100));
+      throw new Error(`unexpected evidence read: ${args[1]}`);
+    });
+    try {
+      const p = { ...pr, state: 'OPEN', headRefName: 'lane/x', labels: [], comments: [], mergeStateStatus: 'CLEAN',
+        statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'failure',
+          detailsUrl: `https://github.com/${repo}/actions/runs/10/job/20` }] };
+      const prs = enrichPrsWithTimeoutEvidence([p], { repo, enabled: true,
+        read: (item, opts) => readTimeoutEvidence(item, { ...opts, exec, sleep, facts: () => null }),
+        readBudget: () => ({ confirmed: 0, pending: false }) });
+      expect(prs[0].timeoutRetry).toEqual({ eligible: false, reason: 'timeout-evidence:evidence-read-deadline' });
+      const out = planReconcile({ prs, now: Date.parse('2026-10-26T20:00:00Z'),
+        requiredChecks: ['gate'], reviewTiming: { startAfter: 'ci-green' } });
+      expect(out.refusals.map(r => r.kind)).not.toContain('timeout-evidence-unknown');
+      expect(out.dispatch.map(d => d.kind)).toContain('ci-heal');
+      expect(exec).toHaveBeenCalledTimes(10);
+      expect(clock).toBe(15_000);
+      expect(sleep).not.toHaveBeenCalled();
+    } finally {
+      dateNow.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('keeps a request timeout unknown even when it consumes the entire scan budget', () => {
+    let clock = 0;
+    const dateNow = vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    const exec = vi.fn(() => { clock += 15_000; throw timeoutError(); });
+    const sleep = vi.fn();
+    try {
+      const result = readTimeoutEvidence(pr, { repo, exec, sleep, facts: () => null });
+      expect(result).toMatchObject({ eligible: false, unknown: true });
+      expect(result.reason).toBe('timeout-evidence-unknown:spawnSync gh ETIMEDOUT');
+      expect(exec).toHaveBeenCalledTimes(4);
+      expect(sleep.mock.calls).toEqual([[500], [1500], [4000]]);
+    } finally {
+      dateNow.mockRestore();
+    }
   });
 
   it.each([new Error('HTTP 404'), new SyntaxError('Unexpected token in "CI timed out"')])('a non-timeout failure is not retried: %s', (error) => {
