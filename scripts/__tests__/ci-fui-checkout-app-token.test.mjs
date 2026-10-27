@@ -57,7 +57,7 @@ describe('FUI sibling checkout uses a GitHub App token', () => {
     });
   }
 
-  it('covers all 9 checkouts, including the independent standards job', () => {
-    expect(total).toBe(9);
+  it('covers all 8 checkouts after removing FUI from the test gate, including the independent standards job', () => {
+    expect(total).toBe(8);
   });
 });

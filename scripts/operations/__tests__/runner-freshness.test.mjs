@@ -95,6 +95,7 @@ describe('runner freshness policy', () => {
         "perf-snapshot",
         "pr-ownership",
         "pr-reconcile",
+        "pr-size",
         "pr-status",
         "pr-sweep",
         "pr-trace",
