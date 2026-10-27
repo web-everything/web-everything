@@ -13,7 +13,7 @@ import yaml from 'js-yaml';
 
 const raw = readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8');
 const step = yaml.load(raw).jobs['test-shard'].steps.find((s) => /^Unit suite shard/.test(s.name ?? ''));
-const script = step.run.replaceAll('${{ matrix.shard }}', '1').replaceAll('${{ strategy.job-total }}', '4');
+const script = step.run.replaceAll('${{ matrix.shard }}', '1').replaceAll('${{ strategy.job-total }}', '10');
 
 let dir;
 beforeEach(() => {

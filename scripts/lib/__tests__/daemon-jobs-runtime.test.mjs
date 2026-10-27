@@ -7,7 +7,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawn } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,8 +17,10 @@ import {
   JOB_ATTEMPT_ENV, JOB_ID_ENV, createJobStore, enqueueJob, hostName, launchJob, localHostAliases, probeHandle, readProcStart,
   reapDeadGroup, reattachTick, runJob, selfHandle, stopHandle,
 } from '../daemon-jobs-runtime.mjs';
-import { defineJobKind, kindRegistry, markClaimed, markLaunching } from '../daemon-jobs.mjs';
+import { defineJobKind, kindRegistry, markClaimed, markLaunching, markSucceeded } from '../daemon-jobs.mjs';
+import { createRecordingFacts, runItemTask, enqueueItemTask } from '../daemon-item-tasks.mjs';
 import { formatJobHandle } from '../../operations/job-record.mjs';
+import { runPath } from '../../operations/run-store.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RUNTIME = resolve(HERE, '..', 'daemon-jobs-runtime.mjs');
@@ -461,4 +463,585 @@ describe('stopping a job that owns subprocesses', () => {
     expect(stop).toHaveBeenCalledWith(expect.any(String), { termGraceMs: 45_000 });
     expect(() => defineJobKind({ kind: 'bad', entry: 'job.mjs', stopGraceMs: 0 })).toThrow(/stopGraceMs/);
   });
+});
+
+describe('reapDeadGroup confirmed absence contract', () => {
+  const started = Date.parse('2026-10-19T00:00:00Z');
+  const handle = formatJobHandle({ host: 'h', pid: 999999, procStart: new Date(started).toUTCString() });
+  const base = { host: 'h', requireConfirmedDeath: true, notAfterMs: started + 60000,
+    readStart: () => null, bootTime: () => started - 60000, groupStarts: () => [started + 1000] };
+  const gone = () => { throw Object.assign(Error('gone'), { code: 'ESRCH' }); };
+
+  it('distinguishes confirmed absence from missing timestamps and unreadable probes', () => {
+    expect(reapDeadGroup(handle, { ...base, notAfterMs: NaN, kill: gone })).toBe(true);
+    for (const code of ['EPERM', 'EIO', undefined]) {
+      expect(reapDeadGroup(handle, { ...base, kill: () => { throw Object.assign(Error('unknown'), { code }); } })).toBe(false);
+    }
+  });
+
+  it.each(['late', 'old', 'rebooted', 'boot-unknown', 'members-unknown', 'empty-scan', 'read-throws', 'reused', 'cutoff-unknown'])(
+    'retains a present group when identity evidence is %s', mode => {
+      const kill = vi.fn();
+      const variants = {
+        late: { groupStarts: () => [started + 120000] }, old: { groupStarts: () => [started - 60000] },
+        rebooted: { bootTime: () => started + 1000 }, 'boot-unknown': { bootTime: () => null },
+        'members-unknown': { groupStarts: () => null }, 'empty-scan': { groupStarts: () => [] },
+        'read-throws': { groupStarts: () => { throw Error('ps failed'); } },
+        reused: { readStart: () => 'another owner' }, 'cutoff-unknown': { notAfterMs: NaN },
+      };
+      expect(reapDeadGroup(handle, { ...base, ...variants[mode], kill })).toBe(false);
+      expect(kill.mock.calls).toEqual([[-999999, 0]]);
+    });
+
+  it.each(['pending', 'refused', 'gone', 'raced-exit'])('requires confirmed absence after SIGKILL: %s', mode => {
+    let signalled = false;
+    const kill = vi.fn((pid, signal) => {
+      if (signal === 'SIGKILL') {
+        signalled = true;
+        if (mode === 'refused') throw Object.assign(Error('denied'), { code: 'EPERM' });
+        if (mode === 'raced-exit') gone();
+      } else if (signalled && mode === 'gone') gone();
+    });
+    expect(reapDeadGroup(handle, { ...base, kill })).toBe(['gone', 'raced-exit'].includes(mode));
+    expect(kill).toHaveBeenCalledWith(-999999, 'SIGKILL');
+  });
+});
+
+
+function queuedTask(item = 1, timeoutMs = 1000) {
+  return enqueueItemTask({ store, kindDef: noop, repo: 'owner/repo', item, seq: 1, codeSha: 's',
+    acting: true, resourceKind: 'build', policyOptions: { platform: null, env: {}, tool: { timeoutMs } } });
+}
+const taskOwner = { handle: 'test:123:start', host: 'test', pid: 123, procStart: 'start' };
+function runningTask(item, launchedAt, now) {
+  const task = queuedTask(item);
+  return store.update(task.id, r => markClaimed(markLaunching(r, { at: new Date(launchedAt).toISOString() }),
+    { ...taskOwner, at: new Date(now).toISOString() }));
+}
+
+it('task deadlines coexist with legacy absolute deadlines', async () => {
+  const now = Date.now();
+  const active = runningTask(1, now - 999, now);
+  const queued = queuedTask(2);
+  const backoff = queuedTask(3);
+  store.update(backoff.id, r => ({ ...r, job: { ...r.job, launchedAt: new Date(now - 99999).toISOString(),
+    nextAttemptAt: new Date(now + 99999).toISOString() } }));
+  for (const kind of ['resource-sampler', 'needs-you-feed']) {
+    const def = defineJobKind({ kind, entry: 'job.mjs' });
+    enqueueJob({ store, kindDef: def, codeSha: 's', id: kind });
+    store.update(kind, r => markClaimed(markLaunching(r, { at: new Date(now - 900000).toISOString() }),
+      { ...taskOwner, handle: 'test:124:start', pid: 124, at: new Date(now).toISOString() }));
+  }
+  enqueueJob({ store, kindDef: noop, codeSha: 's', id: 'coroner-queued' });
+  const legacyDeadline = vi.fn(r => r.id === 'coroner-queued' ? now : null);
+  const tick = (time, adoptedStore = store) => reattachTick({ store: adoptedStore, kinds, maxConcurrent: 3,
+    observation: { now: time, slept: true }, deadlineAt: legacyDeadline, launch: vi.fn(),
+    reapGroup: () => true, probe: h => h === taskOwner.handle ? 'dead' : 'alive' });
+  // A live probe avoids ordinary crash recovery; neither generation nor store recreation extends the task.
+  const first = await reattachTick({ store, kinds, maxConcurrent: 3, observation: { now, slept: false },
+    deadlineAt: legacyDeadline, launch: vi.fn(), probe: () => 'alive' });
+  expect(first.actions).toEqual([expect.objectContaining({ id: 'coroner-queued', action: 'fail' })]);
+  expect(legacyDeadline.mock.calls.every(([r]) => !r.job.task)).toBe(true);
+  store.update(active.id, r => ({ ...r, input: { ...r.input, schedulerGeneration: 'adopted' } }));
+  await tick(now + 1, createJobStore(dir));
+  expect(store.read(active.id).job).toMatchObject({ status: 'queued', task: { failureCount: 1 } });
+  expect(store.read(active.id).job.launchedAt).toBe(new Date(now - 999).toISOString());
+  for (const r of [queued, backoff]) expect(store.read(r.id).job.task.failureCount).toBe(0);
+  for (const id of ['resource-sampler', 'needs-you-feed']) {
+    // Ordinary records have no task policy or resource declaration, even after adoption.
+    expect(store.read(id).job.task).toBeUndefined();
+    expect(store.read(id).job.status).toBe('running');
+  }
+});
+
+it('task timeout escalates before claim release and retains unconfirmed owners', async () => {
+  const now = Date.now(), signals = [], releases = [];
+  const active = runningTask(1, now - 1000, now);
+  let live = true;
+  const probe = () => live ? 'alive' : 'dead';
+  const launch = vi.fn();
+  const releaseTaskClaim = r => { expect(live).toBe(false); releases.push([r.id, r.job.attempts]); };
+  const stop = (h, options) => stopHandle(h, { ...options, probe, termGraceMs: 0, killGraceMs: 0,
+    sleep: async () => {}, kill: (pid, signal) => {
+      expect(releases).toEqual([]); expect(store.read(active.id).job.status).toBe('running');
+      signals.push([pid, signal]); if (signal === 'SIGKILL') live = false;
+    } });
+  await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now, slept: true },
+    probe, stop, launch, releaseTaskClaim, reapGroup: () => !live });
+  expect(signals.slice(0, 3)).toEqual([[-123, 'SIGTERM'], [-123, 'SIGCONT'], [-123, 'SIGKILL']]);
+  expect(releases).toEqual([[active.id, 1]]);
+  expect(store.read(active.id).job).toMatchObject({ status: 'queued', task: { failureCount: 1 } });
+  expect(launch).not.toHaveBeenCalled();
+
+  for (const [index, answer] of ['foreign', undefined, 'throw', 'alive'].entries()) {
+    const owner = runningTask(index + 2, now - 1000, now);
+    const uncertain = () => { if (answer === 'throw') throw Error('probe unavailable'); return answer; };
+    const kill = vi.fn(), release = vi.fn();
+    const out = await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now }, probe: uncertain,
+      stop: (h, options) => stopHandle(h, { ...options, probe: uncertain, kill,
+        termGraceMs: 0, killGraceMs: 0, sleep: async () => {} }), launch, releaseTaskClaim: release });
+    expect(out.actions).toContainEqual(expect.objectContaining({ id: owner.id, action: 'stop-failed' }));
+    expect(store.read(owner.id).job).toMatchObject({ status: 'running', handle: taskOwner.handle, task: { failureCount: 0 } });
+    expect(release).not.toHaveBeenCalled();
+    if (answer !== 'alive') {
+      expect(kill).not.toHaveBeenCalled();
+      expect((await stopHandle(taskOwner.handle, { requireConfirmedDeath: true, probe: uncertain, kill })).gone).toBe(false);
+      expect(kill).not.toHaveBeenCalled();
+      // Losing probe evidence after SIGTERM must not trigger the dead-group sweep either.
+      let observedAlive = true;
+      const interruptedKill = vi.fn(() => { observedAlive = false; });
+      expect((await stopHandle(taskOwner.handle, { requireConfirmedDeath: true,
+        probe: () => observedAlive ? 'alive' : uncertain(), kill: interruptedKill,
+        termGraceMs: 0, killGraceMs: 0, sleep: async () => {} })).gone).toBe(false);
+      expect(interruptedKill.mock.calls).toEqual([[-123, 'SIGTERM']]);
+    }
+    expect(() => enqueueItemTask({ store, kindDef: noop, repo: 'owner/repo', item: index + 2, seq: 2,
+      codeSha: 's', acting: true, resourceKind: 'build' })).toThrow(/active tuple/);
+    expect(launch).not.toHaveBeenCalled();
+  }
+  // Even a stop adapter claiming success cannot substitute for positive death evidence.
+  const retained = await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now }, probe: () => 'foreign',
+    stop: async () => ({ gone: true }), launch, releaseTaskClaim: vi.fn(() => { throw Error('must retain'); }) });
+  expect(retained.actions.every(a => a.action === 'stop-failed')).toBe(true);
+
+  for (const r of store.list().records) store.update(r.id, f => markSucceeded(f, { at: new Date(now).toISOString() }));
+  for (const [index, race] of ['finish', 'attempt', 'handle'].entries()) {
+    const owner = runningTask(index + 10, now - 1000, now), release = vi.fn();
+    let dead = false;
+    await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now }, probe: () => dead ? 'dead' : 'alive',
+      stop: async () => {
+        store.update(owner.id, r => race === 'finish' ? markSucceeded(r, { at: new Date(now).toISOString() })
+          : { ...r, job: { ...r.job, ...(race === 'attempt' ? { attempts: r.job.attempts + 1 } : { handle: 'test:456:new' }) } });
+        dead = true; return { gone: true, signal: 'SIGKILL' };
+      }, launch, releaseTaskClaim: release, reapGroup: () => true });
+    expect(release).not.toHaveBeenCalled();
+    expect(store.read(owner.id).job.task.failureCount).toBe(0);
+    store.update(owner.id, r => markSucceeded(r, { at: new Date(now).toISOString() }));
+  }
+  const unclaimed = queuedTask(20);
+  store.update(unclaimed.id, r => {
+    const launched = markLaunching(r, { at: new Date(now - 1000).toISOString() });
+    return { ...launched, job: { ...launched.job, attempts: 10 } };
+  });
+  const noStop = vi.fn();
+  await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now }, stop: noStop, launch });
+  expect(noStop).not.toHaveBeenCalled();
+  expect(store.read(unclaimed.id).job).toMatchObject({ status: 'queued', attempts: 10, task: { failureCount: 1 } });
+  // Timeout exhaustion uses semantic failures, independently of the monotonic attempt token.
+  const exhausted = runningTask(21, now - 1000, now);
+  store.update(exhausted.id, r => ({ ...r, job: { ...r.job, task: { ...r.job.task, failureCount: 2 } } }));
+  await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now }, probe: () => 'dead', launch, reapGroup: () => true });
+  expect(store.read(exhausted.id).job).toMatchObject({ status: 'failed', attempts: 1, task: { failureCount: 3 } });
+});
+
+
+it.each([false, true])('reaps a task group when the owner dies between the tick probe and stop, saved result=%s', async saved => {
+  const now = Date.now(), owner = runningTask(900, now - 1000, now);
+  if (saved) store.update(owner.id, r => ({ ...r, job: { ...r.job, task: { ...r.job.task,
+    execution: { effects: {}, timings: {}, results: { 1: { v: 1, taskId: r.job.task.id, attempt: 1,
+      outcome: 'acted', effects: [], recordedReads: [], timings: {}, gh: { read: 0, write: 0 } } } },
+  } } }));
+  let observations = 0, descendantAlive = true;
+  const probe = () => ++observations === 1 ? 'alive' : 'dead';
+  const kill = vi.fn();
+  const reapGroup = vi.fn(() => { descendantAlive = false; return true; });
+  const release = vi.fn(() => { expect(descendantAlive).toBe(false); });
+  await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now }, probe,
+    stop: (h, options) => stopHandle(h, { ...options, probe, kill }),
+    reapGroup, releaseTaskClaim: release, launch: vi.fn() });
+  expect(kill).not.toHaveBeenCalled(); // stopHandle first sees a dead owner
+  expect(reapGroup).toHaveBeenCalledWith(owner.job.handle, now + 60000, { requireConfirmedDeath: true });
+  expect(release).toHaveBeenCalledTimes(1);
+  expect(store.read(owner.id).job).toMatchObject({ status: saved ? 'succeeded' : 'queued',
+    task: { failureCount: saved ? 0 : 1 } });
+});
+
+it.each(['dead', 'stop-race', 'saved-result', 'exhausted'])('retains task exclusion when production reaper refuses a late descendant: %s', async mode => {
+  const now = Date.now(), heartbeat = now - 300000, started = heartbeat - 60000;
+  const owner = runningTask(902, started, heartbeat);
+  const handle = formatJobHandle({ host: hostName(), pid: 999999, procStart: new Date(started).toUTCString() });
+  store.update(owner.id, r => {
+    r.job.handle = handle;
+    if (mode === 'exhausted') r.job.task.failureCount = 2;
+    if (mode === 'saved-result') r.job.task.execution = { effects: {}, timings: {}, results: { 1: {
+      v: 1, taskId: r.job.task.id, attempt: 1, outcome: 'acted', effects: [], recordedReads: [], timings: {}, gh: { read: 0, write: 0 },
+    } } };
+    return r;
+  });
+  const before = store.read(owner.id), release = vi.fn(), launch = vi.fn(), logs = [];
+  let descendantAlive = true, observations = 0;
+  const kill = vi.fn((pid, signal) => {
+    if (!descendantAlive) throw Object.assign(Error('gone'), { code: 'ESRCH' });
+    if (signal === 'SIGKILL') descendantAlive = false;
+  });
+  const reapGroup = (h, notAfterMs, options) => reapDeadGroup(h, { ...options, notAfterMs,
+    readStart: () => null, bootTime: () => started - 60000,
+    groupStarts: () => descendantAlive ? [heartbeat + 120000] : [], kill });
+  queuedTask(903);
+  const tick = () => reattachTick({ store, kinds, maxConcurrent: 1, observation: { now },
+    probe: () => mode === 'stop-race' && ++observations === 1 ? 'alive' : 'dead',
+    stop: async () => ({ gone: true, signal: null }), reapGroup,
+    releaseTaskClaim: release, launch, log: message => logs.push(message) });
+  await tick();
+  expect(descendantAlive).toBe(true);
+  expect(release).not.toHaveBeenCalled();
+  expect(launch).not.toHaveBeenCalled();
+  expect(() => enqueueItemTask({ store, kindDef: noop, repo: 'owner/repo', item: 902, seq: 2,
+    codeSha: 's', acting: true, resourceKind: 'build' })).toThrow(/active tuple/);
+  expect(store.read(owner.id).job).toMatchObject({ status: before.job.status, handle,
+    attempts: before.job.attempts, task: { failureCount: before.job.task.failureCount } });
+  expect(logs.some(message => message.includes('group') && message.includes('retains'))).toBe(true);
+  // A later tick can recover once the descendant actually disappears.
+  descendantAlive = false;
+  await tick();
+  expect(release).toHaveBeenCalledTimes(1);
+  expect(store.read(owner.id).job.status).toBe(mode === 'saved-result' ? 'succeeded' : mode === 'exhausted' ? 'failed' : 'queued');
+});
+
+it.each(['false', 'undefined', 'throw'])('unconfirmed cleanup (%s) retains its owner while another task recovers', async answer => {
+  const now = Date.now(), owner = runningTask(904, now - 1000, now), other = runningTask(905, now - 1000, now);
+  store.update(other.id, r => ({ ...r, job: { ...r.job, handle: 'test:456:other' } }));
+  const before = store.read(owner.id), release = vi.fn(), launch = vi.fn();
+  const out = await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now }, probe: () => 'dead',
+    releaseTaskClaim: release, launch, reapGroup: handle => {
+      if (handle !== owner.job.handle) return true;
+      if (answer === 'throw') throw Error('cleanup unavailable');
+      return answer === 'false' ? false : undefined;
+    } });
+  expect(store.read(owner.id)).toEqual(before);
+  expect(store.read(other.id).job.status).toBe('queued');
+  expect(release.mock.calls.map(([r]) => r.id)).toEqual([other.id]);
+  expect(launch).not.toHaveBeenCalled();
+  expect(out.actions).toContainEqual(expect.objectContaining({ id: owner.id, action: 'stop-failed' }));
+});
+
+function childTaskStep(id, { act = () => ({}), timing = () => {}, mutate = () => {}, onRead = () => {}, onClaim = () => {}, names = ['first'], precondition = 'none' } = {}) {
+  const facts = () => createRecordingFacts({ load: () => ({ identity: { repo: 'owner/repo', item: store.read(id).job.task.item },
+    observedAt: 1, source: 'live-pr', complete: true, data: { head: 'abc' } }),
+    expectedIdentity: { repo: 'owner/repo', item: store.read(id).job.task.item }, now: 1, snapshotMaxAgeMs: 100 });
+  return { name: 'task', run: async ({ task }) => {
+    mutate(task);
+    return runItemTask({ ...task, read: () => { onRead(); return facts(); }, plan: f => { f.read('head'); return names.map(name => ({ name,
+      inputs: ['head'], fences: ['head'], appliedProbe: 'worker-run', precondition })); },
+      budgets: { read: 10, write: 10 }, runStore: { find: () => null },
+      claim: { acquire: () => { onClaim(); return 'claim'; }, assert: () => true, release: () => {} },
+      effects: { fence: facts, act: context => {
+        expect(store.read(id).job.task.execution.effects[context.effectId].status).toBe('intent');
+        return act(context);
+      } }, timing });
+  } };
+}
+const runTaskChild = (id, step, attempt = 1) => runJob({ steps: [step], env: jobEnv(id, attempt),
+  host: 'test', pid: 123, readStart: () => 'start' });
+
+it.each([false, true])('structured preconditions persist through child intent, act and result, rejected=%s', async rejected => {
+  const owner = queuedTask(901, 300000), precondition = { ifMatch: 'abc' };
+  store.update(owner.id, r => markLaunching(r, { at: new Date().toISOString() }));
+  const act = vi.fn(context => {
+    expect(context.precondition).toEqual(precondition);
+    expect(store.read(owner.id).job.task.execution.effects[context.effectId]).toMatchObject({ status: 'intent', precondition });
+    if (rejected) throw Error('server precondition rejected');
+    return { applied: true };
+  });
+  await runTaskChild(owner.id, childTaskStep(owner.id, { precondition, act }));
+  expect(act).toHaveBeenCalledTimes(1);
+  const saved = store.read(owner.id);
+  const result = saved.job.task.execution.results[1];
+  expect(result.outcome).toBe(rejected ? 'failed' : 'acted');
+  expect(result.effects[0]).toMatchObject({ precondition, status: rejected ? 'intent' : 'applied' });
+  expect(JSON.parse(readFileSync(join(dir, `results/${owner.id}-1.json`), 'utf8'))).toEqual(result);
+});
+
+it.each([1, 3, 4])('persisted failed results with failureCount=%s complete in the child and dead-owner recovery', async failureCount => {
+  const now = Date.now(), launch = vi.fn(), release = vi.fn();
+  for (const recover of [false, true]) {
+    const r = queuedTask(recover ? 402 : 401, 300000);
+    store.update(r.id, f => markLaunching(f, { at: new Date(now).toISOString() }));
+    const result = { v: 1, taskId: r.job.task.id, attempt: 1, outcome: 'failed',
+      ...(failureCount === 1 ? { reason: 'effect refused' } : {}),
+      effects: [], recordedReads: [], timings: {}, gh: { read: 0, write: 0 } };
+    const child = await runTaskChild(r.id, { name: 'persist failure', run: ({ task }) => {
+      task.record.update(f => {
+        f.job.checkpoint = { step: 0, data: { retained: true } };
+        Object.assign(f.job.task, { outcome: 'failed', failureCount,
+          execution: { effects: {}, results: { 1: result }, timings: {} } });
+        return f;
+      });
+      if (recover) throw Error('crash after persistence');
+      return { completed: true };
+    } });
+    expect(child).toEqual({ outcome: 'error', error: recover ? 'crash after persistence' : 'failed' });
+    const tick = () => reattachTick({ store, kinds, maxConcurrent: 1, observation: { now },
+      probe: () => 'dead', launch, releaseTaskClaim: release, reapGroup: () => true });
+    await tick();
+    const finished = store.read(r.id);
+    expect(finished.job).toMatchObject({ status: failureCount >= 3 ? 'failed' : 'queued', attempts: 1,
+      handle: null, task: { outcome: 'failed', failureCount, execution: { results: { 1: result } } } });
+    if (failureCount >= 3) {
+      expect(finished.job.error).toBe('failed');
+      expect(finished.job.finishedAt).toEqual(expect.any(String));
+    } else {
+      expect(finished.job.checkpoint).toEqual({ step: 0, data: {} });
+      expect(Date.parse(finished.job.nextAttemptAt)).toBeGreaterThan(now);
+      expect(finished.job.timeline).toContainEqual(expect.objectContaining({ event: 'requeued', resume: false, reason: 'effect refused' }));
+    }
+    expect(JSON.parse(readFileSync(join(dir, `results/${r.id}-1.json`), 'utf8'))).toEqual(result);
+    await tick();
+    expect(store.read(r.id)).toEqual(finished);
+  }
+  expect(release).toHaveBeenCalledTimes(1);
+  expect(launch).not.toHaveBeenCalled();
+});
+
+it('result repair skips unchanged record and sidecar writes on repeated terminal ticks', async () => {
+  const r = queuedTask(403, 300000);
+  store.update(r.id, f => markLaunching(f, { at: new Date().toISOString() }));
+  expect(await runTaskChild(r.id, childTaskStep(r.id))).toEqual({ outcome: 'succeeded' });
+  const recordPath = runPath(r.id, dir), resultPath = join(dir, `results/${r.id}-1.json`);
+  const saved = store.read(r.id);
+  const sentinel = new Date('2000-01-01T00:00:00Z');
+  utimesSync(recordPath, sentinel, sentinel);
+  utimesSync(resultPath, sentinel, sentinel);
+  const tick = () => reattachTick({ store, kinds, maxConcurrent: 1 });
+  await tick();
+  await tick();
+  expect(statSync(recordPath).mtimeMs).toBe(sentinel.getTime());
+  expect(statSync(resultPath).mtimeMs).toBe(sentinel.getTime());
+  rmSync(resultPath);
+  await tick();
+  expect(JSON.parse(readFileSync(resultPath, 'utf8'))).toEqual(saved.job.task.execution.results[1]);
+  expect(statSync(recordPath).mtimeMs).toBe(sentinel.getTime());
+  expect(store.read(r.id)).toEqual(saved);
+});
+
+it.each([false, true])('overdue persisted results escalate the owner, confirmed death=%s', async confirmed => {
+  const now = Date.now(), owner = runningTask(301, now - 1000, now);
+  const result = { v: 1, taskId: owner.job.task.id, attempt: 1, outcome: 'acted',
+    effects: [], recordedReads: [], timings: {}, gh: { read: 0, write: 0 } };
+  store.update(owner.id, r => ({ ...r, job: { ...r.job, task: { ...r.job.task, outcome: 'acted',
+    execution: { effects: {}, results: { 1: result }, timings: {} } } } }));
+  let alive = true;
+  const signals = [], release = vi.fn(), launch = vi.fn();
+  const probe = () => alive ? 'alive' : 'dead';
+  const out = await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now }, probe, launch,
+    releaseTaskClaim: release, reapGroup: () => !alive, stop: (h, options) => stopHandle(h, { ...options, probe,
+      termGraceMs: 0, killGraceMs: 0, sleep: async () => {}, kill: (pid, signal) => {
+        signals.push(signal);
+        expect(release).not.toHaveBeenCalled();
+        if (confirmed && signal === 'SIGKILL') alive = false;
+      } }) });
+  expect(signals.slice(0, 3)).toEqual(['SIGTERM', 'SIGCONT', 'SIGKILL']);
+  expect(store.read(owner.id).job).toMatchObject({ status: confirmed ? 'succeeded' : 'running',
+    handle: confirmed ? null : taskOwner.handle, task: { failureCount: 0 } });
+  expect(release).toHaveBeenCalledTimes(confirmed ? 1 : 0);
+  if (!confirmed) expect(out.actions).toContainEqual(expect.objectContaining({ id: owner.id, action: 'stop-failed' }));
+  expect(JSON.parse(readFileSync(join(dir, `results/${owner.id}-1.json`), 'utf8'))).toEqual(result);
+  expect(launch).not.toHaveBeenCalled();
+});
+
+it.each(['saved', 'dead', 'stopped'])('claim-release refusal under lock retains the %s record and continues the tick', async mode => {
+  const now = Date.now();
+  runningTask(302, now - 1000, now);
+  runningTask(303, now - 1000, now);
+  const [owner, other] = store.list().records;
+  if (mode === 'saved') store.update(owner.id, r => ({ ...r, job: { ...r.job, task: { ...r.job.task,
+    resultRef: `results/${owner.id}-1.json`, execution: { effects: {}, timings: {}, results: { 1: {
+      v: 1, taskId: owner.job.task.id, attempt: 1, outcome: 'acted',
+      effects: [], recordedReads: [], timings: {}, gh: { read: 0, write: 0 } } } } } } }));
+  const before = store.read(owner.id), launch = vi.fn(), logs = [];
+  const waiting = queuedTask(305);
+  let stopped = false;
+  const release = vi.fn(r => {
+    expect(existsSync(join(dir, `${r.id}.json.lock`))).toBe(true);
+    if (r.id === owner.id) throw Error('claim release refused');
+  });
+  await expect(reattachTick({ store, kinds, maxConcurrent: 1, observation: { now }, launch,
+    probe: () => mode === 'stopped' && !stopped ? 'alive' : 'dead',
+    stop: async () => { stopped = true; return { gone: true, signal: 'SIGKILL' }; },
+    reapGroup: () => true, releaseTaskClaim: release, log: m => logs.push(m) })).resolves.toBeDefined();
+  expect(store.read(owner.id)).toEqual(before);
+  expect(store.read(other.id).job).toMatchObject({ status: 'queued', task: { failureCount: 1 } });
+  expect(store.read(waiting.id).job.status).toBe('queued');
+  expect(release.mock.calls.map(([r]) => r.id)).toEqual([owner.id, other.id]);
+  expect(logs.some(m => m.includes(owner.id) && m.includes('claim release refused'))).toBe(true);
+  expect(launch).not.toHaveBeenCalled();
+});
+
+it('a handle with no parsed pid cannot confirm death or release a task owner', async () => {
+  const kill = vi.fn(), release = vi.fn(), launch = vi.fn(), now = Date.now();
+  expect(await stopHandle('no-pid', { requireConfirmedDeath: true, kill })).toEqual({ gone: false, signal: null });
+  const owner = runningTask(304, now - 1000, now);
+  const before = store.read(owner.id);
+  await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now }, probe: () => 'alive',
+    stop: (h, options) => stopHandle('no-pid', { ...options, kill }), releaseTaskClaim: release, launch });
+  expect(store.read(owner.id)).toEqual(before);
+  expect(kill).not.toHaveBeenCalled();
+  expect(release).not.toHaveBeenCalled();
+  expect(launch).not.toHaveBeenCalled();
+});
+
+it.each(['acted', 'nothing-owed', 'superseded', 'deferred-claim-held', 'deferred-read'])(
+  'non-failure outcome %s succeeds in the child and after persisted-result recovery', async outcome => {
+    const now = Date.now(), launch = vi.fn(), release = vi.fn();
+    for (const recover of [false, true]) {
+      const r = queuedTask(recover ? 202 : 201, 300000);
+      store.update(r.id, f => markLaunching(f, { at: new Date(now).toISOString() }));
+      const result = { v: 1, taskId: r.job.task.id, attempt: 1, outcome,
+        effects: [], recordedReads: [], timings: {}, gh: { read: 0, write: 0 } };
+      const child = await runTaskChild(r.id, { name: 'semantic completion', run: ({ task }) => {
+        task.record.update(f => {
+          f.job.task.outcome = outcome;
+          f.job.task.execution = { effects: {}, results: { 1: result }, timings: {} };
+          return f;
+        });
+        if (recover) throw Error('crash after semantic persistence');
+      } });
+      expect(child.outcome).toBe(recover ? 'error' : 'succeeded');
+      const tick = () => reattachTick({ store, kinds, maxConcurrent: 1, observation: { now },
+        probe: () => 'dead', launch, releaseTaskClaim: release, reapGroup: () => true });
+      await tick();
+      await tick();
+      expect(store.read(r.id).job).toMatchObject({ status: 'succeeded', attempts: 1,
+        task: { outcome, failureCount: 0, execution: { results: { 1: result } } } });
+      expect(JSON.parse(readFileSync(join(dir, `results/${r.id}-1.json`), 'utf8'))).toEqual(result);
+    }
+    expect(launch).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+it('confirmed-dead task owners before deadline exhaust semantic failures independently of launch attempts', async () => {
+  const now = Date.now(), launch = vi.fn(), release = vi.fn();
+  const retry = runningTask(203, now - 1, now), exhausted = runningTask(204, now - 1, now);
+  store.update(retry.id, r => ({ ...r, job: { ...r.job, attempts: 10 } }));
+  store.update(exhausted.id, r => ({ ...r, job: { ...r.job, task: { ...r.job.task, failureCount: 2 } } }));
+  const tick = () => reattachTick({ store, kinds, maxConcurrent: 1, observation: { now },
+    probe: () => 'dead', launch, releaseTaskClaim: release, reapGroup: () => true });
+  await tick();
+  expect(store.read(retry.id).job).toMatchObject({ status: 'queued', attempts: 10,
+    task: { outcome: 'failed', failureCount: 1 } });
+  expect(Date.parse(store.read(retry.id).job.nextAttemptAt)).toBeGreaterThan(now);
+  expect(store.read(exhausted.id).job).toMatchObject({ status: 'failed', attempts: 1,
+    task: { outcome: 'failed', failureCount: 3 } });
+  await tick();
+  expect(store.read(retry.id).job.task.failureCount).toBe(1);
+  expect(store.read(exhausted.id).job.task.failureCount).toBe(3);
+  expect(release).toHaveBeenCalledTimes(2);
+  expect(launch).not.toHaveBeenCalled();
+});
+
+it('task results repair publication without replay and retain partial success', async () => {
+  const now = Date.now(), act = vi.fn(({ effect }) => {
+    if (effect.name === 'second') throw Error('partial failure');
+    return { receipt: 'first-applied' };
+  });
+  const r = queuedTask(101, 300000);
+  store.update(r.id, f => markLaunching(f, { at: new Date(now).toISOString() }));
+  const crash = () => { throw Error('crash after persistence'); };
+  expect(await runTaskChild(r.id, childTaskStep(r.id, { names: ['first', 'second'], act, timing: crash }))).toMatchObject({ outcome: 'error' });
+  const saved = store.read(r.id).job.task.execution.results[1];
+  expect(saved).toMatchObject({ v: 1, attempt: 1, outcome: 'failed', effects: [
+    expect.objectContaining({ status: 'applied', evidence: { receipt: 'first-applied' } }), expect.objectContaining({ status: 'intent' })] });
+  const reaped = vi.fn(() => true); // confirmed empty group, not merely "nothing killed"
+  const release = vi.fn(() => { expect(reaped).toHaveBeenCalled(); }), launch = vi.fn();
+  const tick = probe => reattachTick({ store: createJobStore(dir), kinds, maxConcurrent: 1,
+    observation: { now, slept: false }, probe: () => probe, launch, releaseTaskClaim: release, reapGroup: reaped });
+  await tick('alive');
+  const ref1 = `results/${r.id}-1.json`;
+  expect(JSON.parse(readFileSync(join(dir, ref1), 'utf8'))).toEqual(saved);
+  expect(store.read(r.id).job).toMatchObject({ status: 'running', handle: taskOwner.handle, task: { failureCount: 1 } });
+  expect(release).not.toHaveBeenCalled();
+  writeFileSync(join(dir, ref1), '{');
+  writeFileSync(join(dir, 'torn-root.json'), '{');
+  expect((await tick('alive')).corrupt).toEqual(['torn-root']);
+  expect(readFileSync(join(dir, 'torn-root.json'), 'utf8')).toBe('{');
+  expect(JSON.parse(readFileSync(join(dir, ref1), 'utf8'))).toEqual(saved);
+  await tick('dead');
+  expect(store.read(r.id).job).toMatchObject({ status: 'queued', task: { failureCount: 1 } });
+  store.update(r.id, f => markLaunching(f, { at: new Date(now).toISOString() }));
+  expect(await runTaskChild(r.id, childTaskStep(r.id, { timing: crash }), 2)).toMatchObject({ outcome: 'error' });
+  const success = store.read(r.id).job.task.execution.results[2];
+  expect(success.outcome).toBe('acted');
+  await tick('dead');
+  expect(store.read(r.id).job).toMatchObject({ status: 'succeeded', task: { failureCount: 1, resultRef: `results/${r.id}-2.json` } });
+  rmSync(join(dir, `results/${r.id}-2.json`));
+  await tick('dead');
+  await tick('dead');
+  expect(JSON.parse(readFileSync(join(dir, `results/${r.id}-2.json`), 'utf8'))).toEqual(success);
+  expect(JSON.parse(readFileSync(join(dir, ref1), 'utf8'))).toEqual(saved);
+  expect(store.read(r.id).job.task.execution.results).toEqual({ 1: saved, 2: success });
+  expect(act).toHaveBeenCalledTimes(2);
+  expect(launch).not.toHaveBeenCalled();
+  expect(release).toHaveBeenCalledTimes(2);
+});
+
+it('task child hooks persist intent before act and refuse stale writers', async () => {
+  const r = queuedTask(102, 300000);
+  store.update(r.id, f => markLaunching(f, { at: new Date().toISOString() }));
+  let hooks;
+  const out = await runTaskChild(r.id, childTaskStep(r.id, { mutate: task => { hooks = task; }, timing: () => {
+    expect(store.read(r.id).job.status).toBe('running');
+    expect(store.read(r.id).job.task.execution.results[1].outcome).toBe('acted');
+  } }));
+  expect(out.outcome).toBe('succeeded');
+  expect(() => hooks.record.update(f => f)).toThrow(expect.objectContaining({ code: 'superseded' }));
+  expect(() => hooks.record.read()).toThrow(expect.objectContaining({ code: 'superseded' }));
+  for (const change of ['attempt', 'status', 'handle']) {
+    const next = queuedTask(103 + ['attempt', 'status', 'handle'].indexOf(change), 300000);
+    store.update(next.id, f => markLaunching(f, { at: new Date().toISOString() }));
+    const act = vi.fn(), onRead = vi.fn(), onClaim = vi.fn();
+    const step = childTaskStep(next.id, { act, onRead, onClaim, mutate: () => store.update(next.id, f => ({ ...f, job: { ...f.job,
+      ...(change === 'attempt' ? { attempts: 2 } : change === 'status' ? { status: 'succeeded' } : { handle: 'test:456:other' }) } })) });
+    expect(await runTaskChild(next.id, step)).toMatchObject({ outcome: 'refused', code: 'superseded' });
+    expect(act).not.toHaveBeenCalled();
+    expect(onRead).not.toHaveBeenCalled();
+    expect(onClaim).not.toHaveBeenCalled();
+    expect(store.read(next.id).job.task.execution).toBeUndefined();
+  }
+  const late = queuedTask(107);
+  store.update(late.id, f => markLaunching(f, { at: new Date(0).toISOString() }));
+  await reattachTick({ store, kinds, maxConcurrent: 1, observation: { now: Date.now(), slept: false }, launch: vi.fn() });
+  const step = { name: 'no reads claims effects', run: vi.fn() };
+  expect(await runTaskChild(late.id, step)).toMatchObject({ outcome: 'refused', code: 'not-this-launch' });
+  expect(step.run).not.toHaveBeenCalled();
+  const incomplete = queuedTask(108);
+  store.update(incomplete.id, f => markLaunching(f, { at: new Date().toISOString() }));
+  expect(await runTaskChild(incomplete.id, { name: 'missing semantic result', run: () => ({}) })).toMatchObject({ outcome: 'refused', code: 'task-incomplete' });
+  expect(store.read(incomplete.id).job.status).toBe('running');
+});
+
+
+it('legacy child steps retain their checkpoint and context without task hooks', async () => {
+  launchingRecord('legacy-hooks');
+  const run = vi.fn(ctx => { expect(ctx).not.toHaveProperty('task'); return { kept: 1 }; });
+  expect(await runJob({ steps: [{ name: 'legacy', run }], env: jobEnv('legacy-hooks'),
+    host: 'test', pid: 123, readStart: () => 'start' })).toEqual({ outcome: 'succeeded' });
+  expect(store.read('legacy-hooks').job.checkpoint).toEqual({ step: 1, data: { kept: 1 } });
+});
+
+
+it('task timeout honors semantic completion persisted while stopping without another failure charge', async () => {
+  const now = Date.now(), owner = runningTask(109, now - 1000, now);
+  store.update(owner.id, r => ({ ...r, job: { ...r.job, task: { ...r.job.task, failureCount: 2 } } }));
+  const result = { v: 1, taskId: owner.job.task.id, attempt: 1, outcome: 'acted',
+    effects: [], recordedReads: [], timings: {}, gh: { read: 0, write: 0 } };
+  let alive = true;
+  const stop = vi.fn(async () => {
+    store.update(owner.id, r => ({ ...r, job: { ...r.job, task: { ...r.job.task, outcome: 'acted',
+      execution: { effects: {}, results: { 1: result }, timings: {} } } } }));
+    alive = false;
+    return { gone: true, signal: 'SIGTERM' };
+  });
+  const release = vi.fn(() => { expect(alive).toBe(false); }), launch = vi.fn();
+  const tick = () => reattachTick({ store, kinds, maxConcurrent: 1, observation: { now, slept: false },
+    probe: () => alive ? 'alive' : 'dead', stop, releaseTaskClaim: release, launch, reapGroup: () => !alive });
+  const out = await tick();
+  expect(store.read(owner.id).job).toMatchObject({ status: 'succeeded', attempts: 1,
+    task: { outcome: 'acted', failureCount: 2, execution: { results: { 1: result } } } });
+  expect(out.actions.some(a => a.action === 'fail' || a.action === 'requeue')).toBe(false);
+  expect(JSON.parse(readFileSync(join(dir, `results/${owner.id}-1.json`), 'utf8'))).toEqual(result);
+  await tick();
+  expect(store.read(owner.id).job.task.failureCount).toBe(2);
+  expect(stop).toHaveBeenCalledTimes(1);
+  expect(release).toHaveBeenCalledTimes(1);
+  expect(launch).not.toHaveBeenCalled();
 });

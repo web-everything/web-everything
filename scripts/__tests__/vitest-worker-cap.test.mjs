@@ -8,6 +8,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import micromatch from 'micromatch';
+import unitConfig from '../../vitest.config';
 import integrationConfig from '../../vitest.integration.config';
 import { resolveMaxTestWorkers, VITEST_MAX_WORKERS_ENV, DEFAULT_VITEST_MAX_WORKERS } from '../../vitest.shared';
 import { resolveCap } from '../readiness/heavy-admission.mjs';
@@ -67,6 +68,17 @@ describe('every vitest config applies the shared ceiling', () => {
 
   it('keeps the integration config serial forks pin (a correctness pin, not a speed one)', () => {
     expect(read('vitest.integration.config.ts')).toMatch(/forks:\s*\{\s*singleFork: true/);
+  });
+
+  it('keeps established-overlay rebuild coverage in the blocking serial integration tier', () => {
+    const file = 'scripts/lib/__tests__/daemon-rebuild-keep-established.test.mjs';
+    expect(micromatch.isMatch(file, unitConfig.test.exclude)).toBe(true);
+    expect(micromatch.isMatch(file, integrationConfig.test.include)).toBe(true);
+    expect(micromatch.isMatch(file, integrationConfig.test.exclude ?? [])).toBe(false);
+    const pool = integrationConfig.test.poolMatchGlobs.find(([glob]) => micromatch.isMatch(file, glob))?.[1]
+      ?? integrationConfig.test.pool;
+    expect(pool).toBe('forks');
+    expect(integrationConfig.test.poolOptions.forks.singleFork).toBe(true);
   });
 
   it('serializes repository-wide scanner parity checks with daemon scenarios', () => {

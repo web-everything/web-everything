@@ -133,7 +133,7 @@ describe('fresh main basis (#5619: frozen event base.sha after the drain merged 
     expect(step).toContain('BASE_REF: ${{ github.event.pull_request.base.ref }}');
     expect(step).toContain('BASE_SHA: ${{ github.event.pull_request.base.sha }}');
     expect(step.slice(step.indexOf('run: |'))).not.toContain('${{'); // no expression interpolated into the script
-    expect(step).toContain("if git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'; then");
+    expect(step).toContain("if git fetch --no-tags --filter=blob:none --depth=1000000 origin '+refs/heads/main:refs/remotes/origin/main'; then");
     expect(step).toContain('--base-ref="$BASE_REF" --fresh-main-sha="$FRESH_MAIN_SHA"');
   });
 });

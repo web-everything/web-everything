@@ -33,7 +33,7 @@ import { op } from './registry.mjs';
 import { DECLARED_HOMES } from './declared-homes.mjs';
 import { compute, effect } from './step-kinds.mjs';
 import { HOME_REASONS } from './pr-land-reasons.mjs';
-import { BUILT_IN_PR_SIZE_SETTINGS } from '../lib/pr-size-defaults.mjs';
+export { measureNonTestLines, OPEN_PR_MAX_NON_TEST_LINES } from '../lib/pr-size-accounting.mjs';
 
 /**
  * card xiqtf7w — the ONE way a PR says it replaces another open PR. A PR that folds in another open PR's fix must
@@ -47,61 +47,6 @@ export const SUPERSEDES_LINE_GUIDANCE = 'A PR that folds in another open PR\'s f
   + '(the fix daemon stands #N down once this PR merges; prose such as "is superseded by this PR" is not read).';
 
 export const OPEN_PR_OP = 'open-pr';
-
-export const OPEN_PR_MAX_NON_TEST_LINES = 300;
-
-/** Pure git --numstat -z accounting (also accepts legacy unquoted newline rows).
- * Binary rows are unmeasurable; malformed or incomplete evidence must never become a zero-sized diff.
- * IO callers pass cascade-resolved prSize settings; standalone callers use frozen built-in defaults.
- * Data is excluded only from the line budget, never from review. Both rename paths must qualify.
- */
-export function measureNonTestLines(numstatText, settings = BUILT_IN_PR_SIZE_SETTINGS) {
-  if (typeof numstatText !== 'string') throw new Error('numstat must be text');
-  if (!numstatText) return { lines: 0, dataLines: 0, exempt: false };
-  const nulDelimited = numstatText.includes('\0');
-  if (nulDelimited && !numstatText.endsWith('\0')) throw new Error('unterminated numstat record');
-  const rows = nulDelimited ? numstatText.slice(0, -1).split('\0') : numstatText.replace(/\n$/, '').split('\n');
-  let lines = 0;
-  let dataLines = 0;
-  let exempt = true;
-  const isData = path => {
-    const segments = path.split('/');
-    if (segments.some(segment => !segment || segment === '.' || segment === '..')) return false;
-    const filename = segments.pop();
-    const dot = filename.lastIndexOf('.');
-    if (dot === -1 || !BUILT_IN_PR_SIZE_SETTINGS.dataExtensions.includes(filename.slice(dot))) return false;
-    if (settings.dataPaths.includes(path)) return true;
-    return settings.dataExtensions.includes(filename.slice(dot))
-      && segments.some(segment => settings.dataDirs.includes(segment));
-  };
-  for (let i = 0; i < rows.length; i++) {
-    const match = /^(\d+|-)\t(\d+|-)\t([\s\S]*)$/.exec(rows[i]);
-    if (!match) throw new Error('unreadable numstat line');
-    const [, additions, deletions] = match;
-    let paths = [match[3]];
-    // -z represents a rename as counts + empty path, then the old and new paths.
-    if (nulDelimited && !paths[0]) {
-      const source = rows[++i];
-      const destination = rows[++i];
-      if (!source || !destination) throw new Error('incomplete numstat rename');
-      paths = [source, destination];
-    }
-    if (paths.some((path) => !path || (!nulDelimited && /[\t\r\n]|^"/.test(path)))) throw new Error('unreadable numstat path');
-    if ((additions === '-') !== (deletions === '-')) throw new Error('unreadable numstat counts');
-    if (additions === '-') throw new Error('unmeasurable numstat counts');
-    const changed = Number(additions) + Number(deletions);
-    if (!Number.isSafeInteger(changed)) throw new Error('numstat count exceeds safe integer range');
-    exempt = exempt && paths.every((path) => path.startsWith('backlog/'));
-    if (paths.every(isData)) {
-      dataLines += changed;
-      if (!Number.isSafeInteger(dataLines)) throw new Error('numstat data total exceeds safe integer range');
-    } else if (!paths.every((path) => /(^|\/)__tests__\//.test(path) || /(^|\/)[^/]*\.(test|spec)\.[^/]+$/.test(path))) {
-      lines += changed;
-      if (!Number.isSafeInteger(lines)) throw new Error('numstat total exceeds safe integer range');
-    }
-  }
-  return { lines, dataLines, exempt };
-}
 
 /** The one effect: hand the planned argv to the home. */
 export const SUBMIT_PR_EFFECT = 'open-pr.submit';
