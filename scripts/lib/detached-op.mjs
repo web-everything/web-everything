@@ -11,6 +11,7 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { pidIdentity, pidIdentityStamp } from './pid-alive.mjs';
 import { writeLineSync } from './write-all-sync.mjs';
+import { killProcessTree } from './bounded-child.mjs';
 
 export const resolveDetachedOpsDir = (env = process.env) => env.DETACHED_OPS_DIR
   || join(homedir(), 'workspace', '.operations', 'coordination', 'detached-ops');
@@ -154,18 +155,46 @@ async function runRecord(args) {
   }
   const fds = [];
   let exitCode = 1;
+  let child;
+  let cancelledCode = null;
+  const handlers = new Map();
+  const stopCommand = () => {
+    if (!child?.pid) return;
+    // Sweep descendants that created their own groups, then the command's group
+    // (including reparented children). SIGKILL also stops signal-ignoring work.
+    killProcessTree(child.pid);
+    try { process.kill(-child.pid, 'SIGKILL'); }
+    catch (error) {
+      // A failed signal must not crash the runner while its child is still live.
+      if (error.code !== 'ESRCH') console.error(error.message);
+    }
+  };
+  for (const [signal, code] of [['SIGTERM', 143], ['SIGINT', 130], ['SIGHUP', 129]]) {
+    const handler = () => {
+      if (cancelledCode !== null) return;
+      cancelledCode = code;
+      stopCommand();
+    };
+    handlers.set(signal, handler);
+    process.on(signal, handler);
+  }
   try {
     fds.push(openSync(record.stdoutPath, 'a'));
     fds.push(openSync(record.stderrPath, 'a'));
     const argv = args.slice(args.indexOf('--') + 1);
     exitCode = await new Promise((done, reject) => {
-      const child = spawn(argv[0], argv.slice(1), { stdio: ['ignore', ...fds] });
+      // Isolate the command group so cancellation cannot kill this record writer.
+      child = spawn(argv[0], argv.slice(1), { detached: true, stdio: ['ignore', ...fds] });
       child.once('error', reject);
       child.once('exit', code => done(code ?? 1));
     });
   } catch (error) { console.error(error.message); }
   finally { for (const fd of fds) closeSync(fd); }
+  // Keep the runner alive until its child exits; waiters must not see a terminal
+  // record while cancellation is still leaving the command running.
+  exitCode = cancelledCode ?? exitCode;
   writeRecord(path, { ...record, status: exitCode === 0 ? 'done' : 'failed', exitCode });
+  for (const [signal, handler] of handlers) process.removeListener(signal, handler);
   process.exitCode = exitCode;
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

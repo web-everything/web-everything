@@ -1,7 +1,7 @@
 /** @file Real admission CLI detach, bounded wait and command-tail preservation contract. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { main, tryAcquireSlot } from '../heavy-admission.mjs';
@@ -61,6 +61,56 @@ function holdSlot() {
 }
 
 describe('heavy-admission detached CLI', () => {
+  it.each([
+    ['SIGTERM', 143, false], ['SIGINT', 130, false], ['SIGHUP', 129, false], ['SIGTERM', 143, true],
+  ])('stops the command subtree after runner %s (exit %s, detached descendant %s)', async (signal, exitCode, detached) => {
+    const started = join(root, 'command-started');
+    const survived = join(root, 'command-survived');
+    const descendantStarted = join(root, 'descendant-started');
+    const descendantSurvived = join(root, 'descendant-survived');
+    const descendantSource = `
+      const fs = require('node:fs');
+      process.on('SIGTERM', () => {});
+      fs.writeFileSync(${JSON.stringify(descendantStarted)}, String(process.pid));
+      setInterval(() => fs.writeFileSync(${JSON.stringify(descendantSurvived)}, 'DESCENDANT_SURVIVED'), 50);
+      setTimeout(() => process.exit(0), 20000);
+    `;
+    const source = `
+      const fs = require('node:fs');
+      require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(descendantSource)}],
+        { detached: ${detached}, stdio: 'ignore' });
+      process.on('SIGTERM', () => {});
+      process.on('SIGINT', () => {});
+      process.on('SIGHUP', () => {});
+      fs.writeFileSync(${JSON.stringify(started)}, String(process.pid));
+      setInterval(() => fs.writeFileSync(${JSON.stringify(survived)}, 'COMMAND_SURVIVED'), 50);
+      setTimeout(() => process.exit(0), 20000);
+    `;
+    const record = JSON.parse(cli(['run', '--detach', '--', process.execPath, '-e', source]));
+    let commandPid, descendantPid;
+    try {
+      await vi.waitFor(() => expect(existsSync(started)).toBe(true), { timeout: 12000, interval: 25 });
+      commandPid = Number(readFileSync(started, 'utf8'));
+      await vi.waitFor(() => expect(existsSync(descendantStarted)).toBe(true), { timeout: 12000, interval: 25 });
+      descendantPid = Number(readFileSync(descendantStarted, 'utf8'));
+      process.kill(record.pid, signal);
+      const result = wait(record.id, { status: 1 });
+      expect(result).toMatchObject({ status: 'failed', code: 1, exitCode });
+      rmSync(survived, { force: true });
+      rmSync(descendantSurvived, { force: true });
+      await new Promise(done => setTimeout(done, 250));
+      expect(existsSync(survived), 'command kept executing after wait reported terminal failure').toBe(false);
+      expect(existsSync(descendantSurvived), 'descendant kept executing after wait reported terminal failure').toBe(false);
+      expect(result.reason).not.toBe('runner-died');
+      // A forcibly stopped admission holder is reclaimed on the next acquisition.
+      expect(cli(['run', '--', process.execPath, '-e', "console.log('reclaimed')"])).toBe('reclaimed');
+    } finally {
+      if (descendantPid) { try { process.kill(descendantPid, 'SIGKILL'); } catch {} }
+      if (commandPid) { try { process.kill(commandPid, 'SIGKILL'); } catch {} }
+      try { process.kill(-record.pid, 'SIGKILL'); } catch {}
+    }
+  }, 30_000);
+
   it('passes a fresh environment without inherited admission ownership to startDetachedOp', async () => {
     const stopped = new Error('stop before launching the detached runner');
     vi.stubEnv('WE_HEAVY_ADMISSION_HELD', '1');
