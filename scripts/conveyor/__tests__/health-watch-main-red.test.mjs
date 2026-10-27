@@ -35,7 +35,7 @@ const input = (overrides = {}) => ({
 const plan = (overrides = {}) => planMainRedAlert(input(overrides));
 const kinds = (result) => result.items.map((item) => item.kind);
 const passingTip = () => ({
-  sha: TIP_SHA, runStatus: 'completed', requiredChecks: ['test'],
+  sha: TIP_SHA, runStatus: 'completed', requiredChecks: ['test'], checksTotal: 1,
   checkRuns: [{ id: 1, name: 'test', status: 'completed', conclusion: 'success' }],
 });
 
@@ -47,6 +47,7 @@ describe('planMainRedAlert — recovery requires affirmative conclusions on ever
         ...passingTip(),
         // Keep the workflow-SHA case independent of required-check recovery.
         requiredChecks: via === 'workflow-SHA' ? ['not-on-page'] : ['test'],
+        checksTotal: 2,
         checkRuns: [...passingTip().checkRuns, { id: 2, name: 'smoke', ...check }],
       },
     });
@@ -87,6 +88,43 @@ describe('planMainRedAlert — recovery requires affirmative conclusions on ever
       expect.soft(kinds(recovered)).toEqual(['main-green']);
       expect.soft(recovered.next.fingerprint).toBeNull();
       expect.soft(recovered.next.unknownEmitted).toBe(false);
+    });
+
+    it.each([
+      ['missing', undefined],
+      ['larger than the returned page', 2],
+      ['smaller than the returned page', 0],
+      ['a string instead of a number', '1'],
+    ])('fails closed once when checksTotal is %s, preserving the outstanding alert', (_name, checksTotal) => {
+      const observation = {
+        runs: via === 'workflow-SHA' ? greenRuns() : redRuns(),
+        tip: {
+          ...passingTip(),
+          requiredChecks: via === 'workflow-SHA' ? ['not-on-page'] : ['test'],
+          checksTotal,
+        },
+      };
+      if (checksTotal === undefined) delete observation.tip.checksTotal;
+      const state = mainRedState(observation.runs, { tip: observation.tip });
+      expect(state.status).toBe('green');
+      if (via === 'tip-required-checks') expect(state.via).toBe(via);
+      else {
+        expect(state.via).not.toBe('tip-required-checks');
+        expect(state.latestGreen.sha).toBe(observation.tip.sha);
+      }
+
+      const red = plan();
+      const unknown = plan({ ...observation, prev: red.next });
+      expect.soft(kinds(unknown)).toEqual(['main-status-unknown']);
+      expect.soft(unknown.next.fingerprint).toBe(red.next.fingerprint);
+      expect.soft(unknown.next.fingerprintParts).toEqual(red.next.fingerprintParts);
+      expect.soft(unknown.next.unknownEmitted).toBe(true);
+
+      const repeated = plan({ ...observation, prev: unknown.next, now: START + 31 * MINUTE });
+      expect.soft(repeated.items).toEqual([]);
+      expect.soft(repeated.next.fingerprint).toBe(red.next.fingerprint);
+      expect.soft(repeated.next.fingerprintParts).toEqual(red.next.fingerprintParts);
+      expect.soft(repeated.next.unknownEmitted).toBe(true);
     });
 
     it.each(['success', 'neutral'])('clears only when every tip check is completed with success or neutral (%s)', (conclusion) => {
@@ -173,7 +211,7 @@ describe('planMainRedAlert — proven tip recovery regressions', () => {
 
   it.each([100, 101])('fails closed once after an alert for %i successful checks with only matching-SHA recovery proof', (count) => {
     // No required check appears in this possibly truncated page, so only the workflow SHA matches.
-    const tip = { ...passingTip(), checkRuns: successfulChecks(count) };
+    const tip = { ...passingTip(), checksTotal: count, checkRuns: successfulChecks(count) };
     const state = mainRedState(greenRuns(), { tip });
     expect(state.status).toBe('green');
     expect(state.via).not.toBe('tip-required-checks');
@@ -195,7 +233,7 @@ describe('planMainRedAlert — proven tip recovery regressions', () => {
   });
 
   it.each([1, 99])('clears an alert for %i successful checks with matching-SHA recovery proof below the page limit', (count) => {
-    const tip = { ...passingTip(), checkRuns: successfulChecks(count) };
+    const tip = { ...passingTip(), checksTotal: count, checkRuns: successfulChecks(count) };
     const state = mainRedState(greenRuns(), { tip });
     expect(state.status).toBe('green');
     expect(state.via).not.toBe('tip-required-checks');
@@ -208,7 +246,7 @@ describe('planMainRedAlert — proven tip recovery regressions', () => {
   });
 
   it.each([1, 99])('clears an alert via tip-required-checks with %i successful checks (a complete page)', (count) => {
-    const tip = { ...passingTip(), requiredChecks: ['check-1'], checkRuns: successfulChecks(count) };
+    const tip = { ...passingTip(), requiredChecks: ['check-1'], checksTotal: count, checkRuns: successfulChecks(count) };
     const state = mainRedState(redRuns(), { tip });
     expect(state.status).toBe('green');
     expect(state.via).toBe('tip-required-checks');
@@ -220,7 +258,7 @@ describe('planMainRedAlert — proven tip recovery regressions', () => {
   });
 
   it.each([100, 101])('fails closed once after an alert for %i checks even via tip-required-checks', (count) => {
-    const tip = { ...passingTip(), requiredChecks: ['check-1'], checkRuns: successfulChecks(count) };
+    const tip = { ...passingTip(), requiredChecks: ['check-1'], checksTotal: count, checkRuns: successfulChecks(count) };
     const state = mainRedState(redRuns(), { tip });
     expect(state.status).toBe('green');
     expect(state.via).toBe('tip-required-checks');
@@ -241,7 +279,7 @@ describe('planMainRedAlert — proven tip recovery regressions', () => {
   });
 
   it.each([1, 99])('clears an alert for %i checks below the page limit via tip-required-checks', (count) => {
-    const tip = { ...passingTip(), requiredChecks: ['check-1'], checkRuns: successfulChecks(count) };
+    const tip = { ...passingTip(), requiredChecks: ['check-1'], checksTotal: count, checkRuns: successfulChecks(count) };
     const state = mainRedState(redRuns(), { tip });
     expect(state.status).toBe('green');
     expect(state.via).toBe('tip-required-checks');
@@ -263,7 +301,7 @@ describe('planMainRedAlert — proven tip recovery regressions', () => {
     ['in-progress required check', { ...passingTip(), runStatus: 'in_progress',
       checkRuns: [{ id: 1, name: 'test', status: 'in_progress', conclusion: null }],
     }],
-    ['pending non-required check without required-check success', { ...passingTip(), checkRuns: [
+    ['pending non-required check without required-check success', { ...passingTip(), checksTotal: 2, checkRuns: [
       { id: 1, name: 'test', status: 'completed', conclusion: 'neutral' },
       { id: 2, name: 'smoke', status: 'in_progress', conclusion: null },
     ] }],
@@ -298,7 +336,7 @@ describe('planMainRedAlert — proven tip recovery regressions', () => {
   });
 
   it('allows a matching latest green SHA with every tip check completed and non-red', () => {
-    const tip = { ...passingTip(), checkRuns: [
+    const tip = { ...passingTip(), checksTotal: 2, checkRuns: [
       { id: 1, name: 'test', status: 'completed', conclusion: 'neutral' },
       { id: 2, name: 'smoke', status: 'completed', conclusion: 'success' },
     ] };
@@ -580,11 +618,11 @@ describe('planMainRedAlert — fail closed on unknown main status', () => {
     ['null tip', null],
     ['unreadable tip', undefined],
     ['unreadable tip checks', { ...passingTip(), checkRuns: null }],
-    ['missing tip checks', { ...passingTip(), checkRuns: [] }],
+    ['missing tip checks', { ...passingTip(), checksTotal: 0, checkRuns: [] }],
     ['red required check on the tip', { ...passingTip(),
       checkRuns: [{ id: 1, name: 'test', status: 'completed', conclusion: 'failure' }],
     }],
-    ['red non-required check on the tip', { ...passingTip(), checkRuns: [
+    ['red non-required check on the tip', { ...passingTip(), checksTotal: 2, checkRuns: [
       ...passingTip().checkRuns,
       { id: 2, name: 'smoke', status: 'completed', conclusion: 'failure' },
     ] }],
@@ -605,7 +643,7 @@ describe('planMainRedAlert — fail closed on unknown main status', () => {
     expect.soft(provenGreen.next.unknownEmitted).toBeFalsy();
   });
 
-  it('keys unknown episodes by their start tick and suppresses repeats only within each episode', () => {
+  it('keys unknown episodes by persisted sequence and suppresses repeats only within each episode', () => {
     const firstNow = START + 31 * MINUTE;
     const secondNow = START + 34 * MINUTE;
     const red = plan();
@@ -617,8 +655,10 @@ describe('planMainRedAlert — fail closed on unknown main status', () => {
     const second = plan({ prev: recovered.next, readOk: false, now: secondNow });
     expect(kinds(first)).toEqual(['main-status-unknown']);
     expect(kinds(second)).toEqual(['main-status-unknown']);
-    expect.soft(first.items[0].head).toContain(String(firstNow));
-    expect.soft(second.items[0].head).toContain(String(secondNow));
+    expect.soft(first.items[0].head).toBe(`main-status-unknown:${red.next.seq + 1}`);
+    expect.soft(second.items[0].head).toBe(`main-status-unknown:${recovered.next.seq + 1}`);
+    expect.soft(plan({ prev: red.next, readOk: false, now: secondNow }).items[0].head)
+      .toBe(first.items[0].head);
     const key = (item) => `${item.repo}#${item.pr}@${item.head}:${item.kind}`;
     expect.soft(key(second.items[0])).not.toBe(key(first.items[0]));
     expect(plan({ prev: second.next, readOk: false, now: secondNow + MINUTE }).items).toEqual([]);
