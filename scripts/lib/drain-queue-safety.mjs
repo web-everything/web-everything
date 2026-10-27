@@ -42,9 +42,11 @@ export function sendBackReason(labels) {
 
 /** Only head-bound scheduled work is owed; acceptance and status labels cannot invent a run. */
 export function postAcceptRedTeamOwed(loopPayload, env = process.env, evidence = {}) {
-  const panel = redTeamPanelSeatOwed(loopPayload, env);
+  const skipCardOnly = typeof evidence.skipCardOnly === 'boolean'
+    ? evidence.skipCardOnly : readRedTeamProbes({ env }).value.skipCardOnly;
+  const panel = redTeamPanelSeatOwed(loopPayload, env, skipCardOnly);
   return redTeamOwedOnHead({ read: loopPayload?.findings?.read,
-    evidence: { ...evidence, scheduled: evidence.scheduled || panel }, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly });
+    evidence: { ...evidence, scheduled: evidence.scheduled || panel }, skipCardOnly });
 }
 
 // `clearanceCoverage` (approval-binding): a coverage verdict or a lazy `(head) => verdict`, so an operator ruling recorded

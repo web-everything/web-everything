@@ -214,7 +214,7 @@ describe('drain throughput', () => {
   });
   it.each([true, false])('catch-up respects its hold setting (%s) and wakes on new evidence', async enabled => {
     let time = 1000, evidence = { recorded: false };
-    const pr = { state: 'OPEN', headRefOid: 'a'.repeat(40), labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [] };
+    const pr = { baseRefName: 'main', mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE', state: 'OPEN', headRefOid: 'a'.repeat(40), labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [] };
     const spawnImpl = vi.fn((command, args, options) => {
       expect(options.env.WE_DRAIN_CATCH_UP_SNAPSHOT).toBe(enabled ? '1' : undefined);
       if (enabled) expect(options.env.WE_DRAIN_ROUND_SNAPSHOT).toMatch(/catch-up-rounds\/o_r-\d+-r\d+\.json$/);
@@ -226,10 +226,10 @@ describe('drain throughput', () => {
       });
       return child;
     });
-    const handle = createEnqueueOnEvent({ cwd: process.cwd(), localSlug: 'o/r', env: {}, now: () => time, log: () => {}, spawnImpl,
+    const handle = createEnqueueOnEvent({ cwd: process.cwd(), localSlug: 'o/r', defaultBranch: 'main', env: {}, now: () => time, log: () => {}, spawnImpl,
       resolveThroughput: () => ({ value: { catchUpSkipUnchangedHolds: enabled } }),
       resolveSetting: () => ({ enabled: true, debounceSeconds: 0, catchUp: { enabled: true, intervalMinutes: 1, concurrency: 2, maxQueued: 3 } }),
-      readCandidates: async () => ({ ok: true, queued: 0, prs: [{ num: 1, inQueue: false, isDraft: false }] }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [{ num: 1, inQueue: false, isDraft: false, baseRefName: 'main', mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE', labels: [{ name: 'ready-to-merge' }] }] }),
       readCapacity: () => ({ capacity: 3, source: 'test' }), readPriorities: () => ({}),
       readPr: async () => pr, readHoldEvidence: () => evidence,
       readQueueDepth: async () => ({ ok: true, queued: 0, queuedNums: [] }),
@@ -248,7 +248,7 @@ describe('drain throughput', () => {
   it.each(['deadline', 'merged', 'head', 'numbering', 'ttl', 'read-failure'])('ends an unchanged catch-up skip on %s', async change => {
     let time = 1000, owed = true, fail = false;
     const sibling = { state: 'OPEN', headRefOid: 'sibling-a', labels: [] };
-    const pr = { state: 'OPEN', headRefOid: 'a'.repeat(40), labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [] };
+    const pr = { baseRefName: 'main', mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE', state: 'OPEN', headRefOid: 'a'.repeat(40), labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [] };
     const kind = change === 'numbering' ? 'numbering' : 'overlap-yield';
     const overlapYield = { pr: 2, repo: 'o/r', untilMs: time + (change === 'ttl' ? 600_000 : 180_000) };
     const spawnImpl = vi.fn(() => {
@@ -259,10 +259,10 @@ describe('drain throughput', () => {
       });
       return child;
     });
-    const handle = createEnqueueOnEvent({ cwd: process.cwd(), localSlug: 'o/r', env: {}, now: () => time, log: () => {}, spawnImpl,
+    const handle = createEnqueueOnEvent({ cwd: process.cwd(), localSlug: 'o/r', defaultBranch: 'main', env: {}, now: () => time, log: () => {}, spawnImpl,
       resolveThroughput: () => ({ value: { catchUpSkipUnchangedHolds: true, catchUpSkipMaxMin: 5 } }),
       resolveSetting: () => ({ enabled: true, debounceSeconds: 0, catchUp: { enabled: true, intervalMinutes: 1, concurrency: 2, maxQueued: 3 } }),
-      readCandidates: async () => ({ ok: true, queued: 0, prs: [{ num: 1, inQueue: false, isDraft: false }] }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [{ num: 1, inQueue: false, isDraft: false, baseRefName: 'main', mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE', labels: [{ name: 'ready-to-merge' }] }] }),
       readCapacity: () => ({ capacity: 3, source: 'test' }), readPriorities: () => ({}),
       readPr: async ({ num }) => { if (fail && num === 2) throw Error('read failed'); return num === 2 ? sibling : pr; },
       readHoldEvidence: () => { if (fail) throw Error('read failed'); return { recorded: false }; },
@@ -292,7 +292,7 @@ describe('drain throughput', () => {
     if (change === 'unattempted-retry-deadline') pending.retryAt = 121_000;
     if (change === 'unattempted-child-deadline') pending.retryAt = 41_000;
     if (change === 'pending-deadline') pending.requestedAt = 1_000;
-    const pr = { state: 'OPEN', headRefOid: head, labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [] };
+    const pr = { baseRefName: 'main', mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE', state: 'OPEN', headRefOid: head, labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [] };
     const spawnImpl = vi.fn(() => {
       const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.kill = vi.fn();
       queueMicrotask(() => {
@@ -302,10 +302,10 @@ describe('drain throughput', () => {
       });
       return child;
     });
-    const handle = createEnqueueOnEvent({ cwd: process.cwd(), localSlug: 'o/r', env: {}, now: () => time, log: () => {}, spawnImpl,
+    const handle = createEnqueueOnEvent({ cwd: process.cwd(), localSlug: 'o/r', defaultBranch: 'main', env: {}, now: () => time, log: () => {}, spawnImpl,
       resolveThroughput: () => ({ value: { catchUpSkipUnchangedHolds: true, catchUpSkipMaxMin: 15 } }),
       resolveSetting: () => ({ enabled: true, debounceSeconds: 0, catchUp: { enabled: true, intervalMinutes: 1, concurrency: 2, maxQueued: 3 } }),
-      readCandidates: async () => ({ ok: true, queued: 0, prs: [{ num: 1, inQueue: false, isDraft: false }] }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [{ num: 1, inQueue: false, isDraft: false, baseRefName: 'main', mergeStateStatus: 'CLEAN', mergeable: 'MERGEABLE', labels: [{ name: 'ready-to-merge' }] }] }),
       readCapacity: () => ({ capacity: 3 }), readPriorities: () => ({}), readPr: async () => pr,
       readHoldEvidence: () => ({ recorded: false }), readHoldQueueState: () => state,
       resolveQueueSafety: () => ({ value: { redTeamPendingMaxMin: 4, redTeamRequestCooldownMin: 3 } }),

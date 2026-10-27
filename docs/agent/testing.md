@@ -175,6 +175,13 @@ The focused timing, review-seat and drain-seat suites cover this boundary.
 pinned code-head controls for all three settings. These cases exercise the real
 policy cascade with isolated optional layers and assert the setting's source.
 
+Drain must apply the producer's recorded `skipCardOnly` decision when deciding both
+whether a panel seat was owed and whether scheduling evidence requires its result.
+Resolving only the second decision against producer evidence loses an owed card-only
+seat when the consumer now skips cards. The `producer requires cards despite caller
+setting` case in `drain-queue-safety.test.mjs` covers that direction; its companion
+case covers a producer exemption despite the consumer requiring cards.
+
 
 ## Paused prevention filing obligations
 
