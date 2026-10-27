@@ -34,17 +34,17 @@ export function planMainRedAlert(input = {}) {
   const tipVerdicts = Array.isArray(tip?.checkRuns)
     ? [...latestCheckVerdicts(tip.checkRuns).values()] : [];
   const tipReadable = !!tip?.sha && tipVerdicts.length > 0
-    && !tipVerdicts.includes('red');
+    && tip.checkRuns.every((check) => check?.name && check.status === 'completed'
+      && ['success', 'neutral'].includes(check.conclusion));
   // A full check page may be truncated; retain unknown on either recovery path.
   const provenGreen = tipReadable && tip.checkRuns.length < 100
     && (state.via === 'tip-required-checks'
     || (state.latestGreen?.sha === tip.sha
       && Array.isArray(tip.requiredChecks) && tip.requiredChecks.length > 0
-      && tip.checkRuns.every((check) => check?.name && check.status === 'completed')
       && !tipVerdicts.includes('pending')));
   if (!['red', 'green'].includes(state.status) || (state.status === 'green' && !provenGreen)) {
     if (!prev.unknownEmitted) emit({ ...base, kind: 'main-status-unknown',
-      head: `main-status-unknown:${now}`, reason: 'Main CI status is unavailable' });
+      head: 'main-status-unknown', reason: 'Main CI status is unavailable' });
     next.unknownEmitted = true;
     return { items, next };
   }
