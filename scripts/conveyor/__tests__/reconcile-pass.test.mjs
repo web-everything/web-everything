@@ -28,6 +28,8 @@ import { FALLBACK_REQUIRED_STATUS_CHECKS } from '../../lib/required-status-check
 import { enrichPrsWithMechanicalRound } from '../mechanical-round-cap.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
+// Load the dispatcher's dependency graph during collection, outside the test's timeout.
+import { planFixDispatchClaimStatus } from '../reconcile-fix-dispatch.mjs';
 
 it('R123 wires the automatic answer before main-red enrichment and terminal refusal planning', async () => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
@@ -59,7 +61,6 @@ it('R123 wires the automatic answer before main-red enrichment and terminal refu
 
 it.each([undefined, false, 'true', 1])('read-only reconcile and dry-run claim planning never invoke the R123 writer (%s)', async enabled => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
-  const { planFixDispatchClaimStatus } = await import('../reconcile-fix-dispatch.mjs');
   const writer = vi.fn(prs => prs);
   const options = { ...xxOptions(), env: {}, readPrs: () => [], enrichStandDownAutoProceed: writer,
     allowStandDownAutoProceed: enabled };
