@@ -864,6 +864,58 @@ describe('readStackBases — declared lane bases (live #5996 #5997 #5983 #6003)'
     expect(diag.has(5997)).toBe(false);
   });
 
+  it.each([
+    ['refs-auth-failed', 'refs-auth-failed'],
+    ['arbitrary private failure text', 'refs-unreadable'],
+  ])('diagnoses every listed PR with %s, bounded to %s', (failure, cause) => {
+    const f = fixture();
+    const diag = new Map();
+    const refs = Object.assign(new Map(), { failure });
+    expect(f.read({ diag, readRefs: () => refs }).size).toBe(0);
+    expect(diag).toEqual(new Map(f.listed.map(p => [p.number, { cause }])));
+  });
+
+  it('diagnoses refs-read-threw for every listed PR when readRefs throws before rows exist', () => {
+    const f = fixture();
+    const diag = new Map();
+    expect(f.read({ diag, readRefs: () => { throw new Error('HTTP 401: private diagnostic'); } }).size).toBe(0);
+    expect(diag).toEqual(new Map(f.listed.map(p => [p.number, { cause: 'refs-read-threw' }])));
+  });
+
+  it.each([false, true])('fetches exactly the declared base missing locally (fetch fails: %s)', (fetchFails) => {
+    const f = fixture();
+    const p = shapes[0]; // Branch-only base: no open PR head supplies this commit.
+    const calls = [];
+    let haveBase = false;
+    const run = args => {
+      calls.push(args);
+      if (args[0] === 'cat-file' && args[2] === `${p.baseTip}^{commit}` && !haveBase) {
+        throw new Error('base commit missing locally');
+      }
+      if (args[0] === 'fetch') {
+        if (fetchFails) throw new Error('HTTP 401: git fetch failed');
+        haveBase = true;
+        return '';
+      }
+      if (args[0] === 'rev-list' && args.includes(p.baseTip) && !haveBase) {
+        throw new Error('base commit still missing locally');
+      }
+      return f.fakeGit(args);
+    };
+    const diag = new Map();
+    const out = f.read({ prlessBase: true, diag, run });
+    expect(calls.filter(args => args[0] === 'fetch')).toEqual([
+      ['fetch', '-q', '--end-of-options', 'origin', p.baseRefName],
+    ]);
+    if (fetchFails) {
+      expect(out.has(p.number)).toBe(false);
+      expect(diag.get(p.number)).toEqual({ cause: 'head-unreadable' });
+    } else {
+      expect(out.get(p.number)).toEqual(expected(p));
+      expect(diag.has(p.number)).toBe(false);
+    }
+  });
+
   it('resolves #5983 over #5982 and #6003 over #6002 together with all four shapes and unrelated PRs', () => {
     const f = fixture(3);
     const diag = new Map();
