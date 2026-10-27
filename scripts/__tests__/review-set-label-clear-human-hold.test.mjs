@@ -233,9 +233,9 @@ describe('clear-human CLI hold ceremony', () => {
     expect(warn.mock.calls[0][0]).toContain('offline');
     expect(provider.setLabels).not.toHaveBeenCalled();
   });
-  it('does not re-apply at a moved head', () => {
+  it('reports a moved head so delegated callers can refuse without re-applying', () => {
     const provider = { readPrState: () => ({ headRefOid: 'b'.repeat(40), labels: ['review:human'] }), setLabels: vi.fn() };
-    expect(reassertHumanClearance({ provider, repo: 'o/n', pr: 7, headSha: head })).toEqual({ reapplied: false });
+    expect(reassertHumanClearance({ provider, repo: 'o/n', pr: 7, headSha: head })).toEqual({ reapplied: false, error: true });
     expect(provider.setLabels).not.toHaveBeenCalled();
   });
   it('does not read a hold when review:human is present', () => {
