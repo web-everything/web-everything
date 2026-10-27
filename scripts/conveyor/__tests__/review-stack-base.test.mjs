@@ -1046,3 +1046,79 @@ describe('readStackBases — PR-less exact tip and complete ownership evidence',
     if (!prlessBase) expect(diag.get(5996)).toEqual({ cause: 'base-branch-missing' });
   });
 });
+
+describe('readStackBases — fork name collisions and missing individual records', () => {
+  const fixture = (numbered = true) => {
+    const number = numbered ? 5997 : 5996;
+    const headRefName = 'lane/drain-poison-guard';
+    const baseRefName = 'lane/drain-poison-guard-base';
+    const record = (over = {}) => ({ author: AUTHOR, isCrossRepository: false, baseRefName: 'main', ...over });
+    const refs = new Map([
+      [number, record({ headRefName, headRefOid: TOP, baseRefName })],
+      ...(numbered ? [[5981, record({ headRefName: baseRefName, headRefOid: BOTTOM })]] : []),
+    ]);
+    const tips = new Map([[headRefName, TOP], [baseRefName, BOTTOM]]);
+    const run = args => {
+      if (args[0] === 'cat-file') return '';
+      if (args[0] === 'rev-list') {
+        const head = args[args.indexOf('--end-of-options') + 1];
+        if (head === TOP) return [TOP, BOTTOM].join('\n');
+        if (head === BOTTOM) return BOTTOM;
+        throw new Error('unknown commit');
+      }
+      if (args[0] === 'merge-base') return OLDER;
+      if (args[0] === 'merge-tree') return TREE;
+      throw new Error(`unexpected git command: ${args[0]}`);
+    };
+    const listed = () => [...refs].map(([number, ref]) => ({ number, headRefName: ref.headRefName, headRefOid: ref.headRefOid }));
+    const read = (options = {}) => readStackBases({ root: '/repo', env: {}, settingOn: true,
+      prs: listed(), readRefs: () => refs, readLanes: () => tips, run, log: () => {}, ...options });
+    const prependCollision = isCrossRepository => {
+      const entries = [...refs];
+      refs.clear();
+      refs.set(7001, record({ headRefName: baseRefName, headRefOid: STRAY, isCrossRepository }));
+      for (const [pr, ref] of entries) refs.set(pr, ref);
+    };
+    return { number, refs, read, listed, prependCollision,
+      expected: { pr: numbered ? 5981 : null, ref: baseRefName, head: BOTTOM,
+        contained: BOTTOM, tree: TREE, topHead: TOP } };
+  };
+
+  it.each([false, true])('preserves the numbered result despite an earlier fork name collision with prlessBase:%s', prlessBase => {
+    const f = fixture();
+    const before = f.read({ prlessBase });
+    f.prependCollision(true);
+    const diag = new Map();
+    const after = f.read({ prlessBase, diag });
+    expect(after).toEqual(before);
+    expect(after.get(f.number)).toEqual(f.expected);
+    expect(diag.has(f.number)).toBe(false);
+    if (!prlessBase) expect(f.read()).toEqual(before);
+  });
+
+  it.each([true, undefined])('resolves the #5996 PR-less shape despite a matching fork/unknown-status name (%s)', status => {
+    const f = fixture(false);
+    f.prependCollision(status);
+    const diag = new Map();
+    expect(f.read({ prlessBase: true, diag }).get(f.number)).toEqual(f.expected);
+    expect(diag.has(f.number)).toBe(false);
+  });
+
+  it.each([false, true])('prefers a trusted non-fork base over an earlier stale non-fork PR with prlessBase:%s', prlessBase => {
+    const f = fixture();
+    f.prependCollision(false);
+    const diag = new Map();
+    expect(f.read({ prlessBase, diag }).get(f.number)).toEqual(f.expected);
+    expect(diag.has(f.number)).toBe(false);
+  });
+
+  it.each([false, true])('reports pr-record-missing for a listed top absent from nonempty refs with prlessBase:%s', prlessBase => {
+    const f = fixture();
+    const prs = f.listed();
+    f.refs.delete(f.number);
+    expect(f.refs.size).toBeGreaterThan(0);
+    const diag = new Map();
+    expect(f.read({ prs, prlessBase, diag }).has(f.number)).toBe(false);
+    expect(diag.get(f.number)).toEqual({ cause: 'pr-record-missing' });
+  });
+});

@@ -455,17 +455,30 @@ export function readStackBases({ root = ROOT, env = process.env, prs = null, rea
       for (const row of listed) diagnose(row.pr, 'refs-unreadable');
       return out;
     }
+    for (const row of listed) if (!refs.has(row.pr)) diagnose(row.pr, 'pr-record-missing');
     failure = 'tips-unreadable';
     const tips = readLanes(root);
     if (!tips) { diagnoseAll(failure); return out; }
     rows = flagUntrustedStackRows(rows, tips);
+    const rowsByPr = new Map(rows.map((row) => [row.pr, row]));
+    const openBases = new Map();
+    for (const [pr, ref] of refs) {
+      // Fork branch names belong to another repository and cannot own an origin base.
+      if (stackRowFlags(ref).fork) continue;
+      const previous = openBases.get(ref.headRefName);
+      const previousRow = previous ? rowsByPr.get(previous[0]) : null;
+      const row = rowsByPr.get(pr);
+      if (!previous || ((!previousRow || previousRow.untrusted) && row && !row.untrusted)) {
+        openBases.set(ref.headRefName, [pr, ref]);
+      }
+    }
     failure = 'head-unreadable';
     const trusted = rows
       .filter((r) => Number.isInteger(r.pr) && !r.untrusted && LANE_REF.test(r.headRefName));
     // Include branch-only base tips in the same fetch/commit-set reads as PR heads.
     const heads = [...trusted];
     if (prlessBase) for (const top of trusted) {
-      if (!LANE_REF.test(top.baseRefName ?? '') || [...refs.values()].some((r) => r.headRefName === top.baseRefName)) continue;
+      if (!LANE_REF.test(top.baseRefName ?? '') || openBases.has(top.baseRefName)) continue;
       const tip = tips.get(top.baseRefName);
       if (SHA.test(String(tip ?? ''))) heads.push({ headRefName: top.baseRefName, headRefOid: tip });
     }
@@ -478,8 +491,8 @@ export function readStackBases({ root = ROOT, env = process.env, prs = null, rea
     for (const top of rows) {
       if (!LANE_REF.test(top.baseRefName ?? '')) continue;
       let cause = null;
-      const openBase = [...refs.entries()].find(([, r]) => r.headRefName === top.baseRefName);
-      const bottom = openBase ? rows.find((r) => r.pr === openBase[0]) : null;
+      const openBase = openBases.get(top.baseRefName);
+      const bottom = openBase ? rowsByPr.get(openBase[0]) : null;
       if (top.untrusted || (prlessBase && !top.author)) cause = 'top-untrusted';
       else if (openBase && (!bottom || bottom.untrusted)) cause = 'base-pr-untrusted';
       // Preserve the review detector's declared-base semantics; the opt-in scope reader requires a known shared actor.
