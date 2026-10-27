@@ -25,6 +25,12 @@ export default {
     const blocked = [{ key: 'blocked', finding: { file: 'example.mjs' } }];
     const variants = [
       { name: 'cancelled smoke', expected: 'review' },
+      { name: 'missing smoke on old base', expected: 'fix', mode: 'stale-base-rebase',
+        reviewTiming: { startAfter: 'ci-green' },
+        over: { baseRefName: 'main', statusCheckRollup: rollup.filter(row => row.name !== 'smoke') } },
+      { name: 'required merge gate held only for review', expected: 'review', requiredChecks: ['test', 'smoke', 'merge-gate'],
+        over: { statusCheckRollup: rollup.map(row => row.name === 'smoke' ? check('smoke') : row)
+          .concat({ ...check('merge-gate', 'FAILURE'), mergeGateReviewHold: { holds: ['review-gate'], jobId: 5874001 } }) } },
       ...['review:changes', 'advisory:changes'].map(label => ({ name: label, expected: 'ci-heal',
         over: { labels: [...pull.labels, { name: label }] } })),
       { name: 'block ruling', expected: 'fix', over: { blockRuledReferrals: blocked } },
@@ -50,11 +56,18 @@ export default {
       for (const variant of variants) {
         const pr = { ...pull, ...variant.over };
         const requiredChecks = variant.requiredChecks ?? ['test', 'smoke'];
+        // Exercise the recording guard before the planner: accepting this stand-down would suppress the retry.
+        if (variant.reviewTiming && pr.timeoutRetry?.infraCancelled
+            && pr.statusCheckRollup.some(row => row.name === 'smoke' && row.conclusion === 'CANCELLED')
+            && !notCiBreakRecordRefusal({ headSha: head, pr, requiredChecks })) {
+          violations.push(`tick ${tick} ${variant.name}: retry-eligible smoke accepted as not-a-ci-break`);
+        }
         const plan = planReconcile({ prs: [pr], agents: [], requiredChecks,
           ...(variant.reviewTiming ? { reviewTiming: variant.reviewTiming } : {}),
           now: Date.parse('2026-10-26T12:00:00Z') + tick * 60000 });
         const kinds = plan.dispatch.map(row => row.kind);
         const safe = variant.expected ? kinds.length === 1 && kinds[0] === variant.expected
+          && (!variant.mode || plan.dispatch[0].mode === variant.mode)
           : kinds.length === 0 && plan.refusals.some(row => row.kind === variant.refusal);
         log?.(`tick ${tick} ${variant.name}: ${kinds.join(',') || plan.refusals.map(row => row.kind).join(',')}`);
         if (!safe) violations.push(`tick ${tick} ${variant.name}: expected ${variant.expected ?? variant.refusal}, got ${kinds.join(',') || plan.refusals.map(row => row.kind).join(',')}`);

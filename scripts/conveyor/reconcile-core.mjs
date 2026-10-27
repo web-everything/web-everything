@@ -2905,9 +2905,14 @@ export function planReconcile({
     if (reviewGateOnlyRed && !reviewGateHasChanges && !reviewGateRulingOwed
         && !cancelledReviewNeedsRepair
         && (phase === 'ci-red' || (phase === 'needs-human' && (cancelledReviewWork || check.state !== 'green')))) {
+      const dispatchCount = dispatch.length;
       dispatchReviewRow({ pr: reviewPr, requiredChecks, withPhase, base, attempts: roundAttempts(),
         roundCap: effectiveRoundCap, now, refuse, refuseCapExhausted, dispatch });
-      continue;
+      // A refused review does not own a missing required job: let the stale-base repair below try.
+      // Successful dispatches and all other review holds retain their existing priority.
+      const reviewRefusal = refusals.at(-1);
+      if (dispatch.length !== dispatchCount || reviewRefusal?.kind !== 'review-ci'
+          || !reviewRefusal.ci?.affected?.some(row => row.reason === 'missing')) continue;
     }
     if (!reviewHoldHasRealRed && !(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
         && reviewCi.affected.every(row => row.name === 'review-gate')) {

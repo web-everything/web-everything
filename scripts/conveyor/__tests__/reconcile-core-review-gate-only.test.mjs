@@ -17,6 +17,34 @@ const plan = (pull, options = {}) => planReconcile({ prs: [{ ...pull, statusChec
   requiredChecks: ['test', 'smoke'], ...options });
 
 describe('review-gate-only red belongs to review', () => {
+  it('missing required smoke falls through refused review to stale-base repair', () => {
+    const result = plan(pr({ baseRefName: 'main', statusCheckRollup: [checks[0], checks[2]] }),
+      { reviewTiming: { startAfter: 'ci-green' } });
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'fix', mode: 'stale-base-rebase',
+      staleBase: { missing: ['smoke'], defaultBranch: 'main' } })]);
+  });
+
+  it('a required merge-gate red only from the non-required review hold dispatches review', () => {
+    const result = plan(pr({ statusCheckRollup: [...checks, { ...check('merge-gate', 'FAILURE'),
+      mergeGateReviewHold: { holds: ['review-gate'], jobId: 5874001 } }] }),
+    { requiredChecks: ['test', 'smoke', 'merge-gate'] });
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'review' })]);
+  });
+
+  it('retry-eligible cancelled smoke refuses stand-down so pending review retains its retry', () => {
+    const pull = pr({ labels: [{ name: 'review:pending' }],
+      statusCheckRollup: [checks[0], check('smoke', 'CANCELLED'), checks[2]],
+      timeoutRetry: { eligible: true, infraCancelled: true, pr: 5925, head: HEAD, cap: 6,
+        jobs: [{ run: 10, job: 20, attempt: 1 }] },
+      timeoutRetryBudget: { confirmed: 0, rejected: 0, pending: false } });
+    const refusal = notCiBreakRecordRefusal({ headSha: HEAD, pr: pull, requiredChecks: ['test', 'smoke'] });
+    if (!refusal) pull.comments.push({ author: { login: 'web-everything' },
+      body: buildCiHealEscalationComment({ headSha: HEAD, outcome: 'not-a-ci-break' }) });
+    expect(plan(pull, { reviewTiming: { startAfter: 'ci-green' } }).dispatch)
+      .toEqual([expect.objectContaining({ kind: 'ci-timeout-rerun' })]);
+    expect(refusal).toContain('retry');
+  });
+
   it.each(['review:human', 'review:pending'])('%s dispatches review rather than ci-heal', label => {
     const result = plan(pr({ labels: [{ name: label }] }));
     expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'review', prNumber: 5925 })]);
