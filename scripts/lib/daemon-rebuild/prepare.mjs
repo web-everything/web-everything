@@ -279,12 +279,17 @@ export async function prepareRebuild({
         .filter((a) => a?.ref && a.sha && !a.resolvedVia).map((a) => [a.ref, a.sha]));
       const retired = await autoRetireOverlays({ root, env, overlays: overlaysBefore, git, mainSha: fetchedMainSha,
         refEvidence: fetchResult.refEvidence, recordedShas, now, removeOverlay, appendOverlayEvent,
+        protectedRefs: realAutoRebase.pendingSwapRefs({ root, env }),
         // A refused plan must preserve the registered tips as well as the running tree. Keep this tick's
         // fresh evidence in memory until both pinned and established-content checks accept the plan.
         persistTipShas: (_root, tips) => { refreshedTips = tips; } });
       if (retired.auditFailures.length) alert('overlay-auto-retire-audit-failed', { failures: retired.auditFailures });
       for (const ref of retired.reinstated) reinstatedNow.add(ref);
       if (retired.retired.length) {
+        // Health monitoring consumes the existing removal alert to clear earlier conflict-drop warnings.
+        for (const row of retired.retired) {
+          alert('overlay-auto-dropped', { ref: row.ref, reason: row.class === 'landed' ? 'in-main' : row.reason });
+        }
         const fresh = readOverlayState(root, { env });
         if (!fresh.corrupt) overlaysBefore = fresh.overlays;
       }

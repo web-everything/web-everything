@@ -10,6 +10,14 @@ checked under the list mutex; mutable `stackBases` cache updates keep the same i
 preserves registrations. `autoRetire` resolves through the policy cascade; only tool-sourced shadow
 graduates after a full day from `shadowSince`. Explicit platform/environment shadow stays observe-only.
 Test every mode source before, at and after the cutoff. Inject `now` at that boundary.
+Historical rebuild and stack-cache fixtures explicitly disable retirement; retirement and auto-rebase
+integration fixtures explicitly enable it, so the shipped shadow cutoff cannot change their intent.
+Contained explicit, mechanism and unverifiable pins stay registered for the planner's safety checks.
+Auto-retirement defers both pending-swap registrations to verified cleanup, including when auto-rebase is
+disabled or adoption recovery rolls back. Malformed or unreadable pending evidence defers retirement and
+raises `overlay-auto-retire-failed`; unrelated landed registrations remain eligible with readable evidence.
+Successful retirement also emits the existing `overlay-auto-dropped` rebuild alert (`in-main` for landed
+content), which health monitoring uses to clear previous conflict-drop warnings.
 Run this suite through heavy admission.
 Preparation records per-ref fetch evidence: refreshed tips may be classified; a successful remote absence
 check (`ls-remote --exit-code` status 2 with empty stdout) permits recorded-SHA evidence, ignoring cached tips.

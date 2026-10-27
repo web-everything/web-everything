@@ -65,6 +65,78 @@ beforeEach(() => {
 afterEach(() => rmSync(base, { recursive: true, force: true }));
 
 describe('real Git retirement evidence', () => {
+  it.each(['on', 'shadow'])('%s preserves contained explicit, mechanism and unverifiable pins', async (mode) => {
+    env.WE_DAEMON_OVERLAY_AUTO_RETIRE = mode;
+    branch('lower');
+    mkdirSync(join(root, 'scripts', 'lib'), { recursive: true });
+    const lower = commit('scripts/lib/daemon-rebuild.mjs', 'live rebuild mechanism');
+    track('lower');
+    branch('top', lower);
+    commit('top', 'contains the pinned source');
+    track('top');
+    branch('main');
+    for (const kind of ['explicit', 'mechanism', 'merge-base-failed', 'diff-failed', 'diff-error']) {
+      const overlays = [{ ref: 'lower', ...(kind === 'explicit' ? { pinned: true } : {}) }, { ref: 'top' }];
+      const result = await retire(overlays, { git: (args) => {
+        if (kind === 'merge-base-failed' && args[0] === 'merge-base' && args[1] !== '--is-ancestor') return { status: 128 };
+        if (kind === 'diff-failed' && args[0] === 'diff') return { status: 128 };
+        if (kind === 'diff-error' && args[0] === 'diff') return { status: 0, error: new Error('incomplete diff') };
+        return git(args);
+      } });
+      expect(result.retired, kind).toEqual([]);
+      expect(result.wouldRetire, kind).toEqual([]);
+      expect(readOverlayState(root, { env }).overlays, kind).toEqual(overlays);
+      expectNoRetirement();
+    }
+  });
+
+  it.each(['complete', 'legacy', 'invalid-json', 'invalid-ref', 'unreadable'])(
+    'preparation preserves pending swap registrations with %s evidence while auto-rebase is disabled', async (shape) => {
+      branch('lower');
+      const lower = commit('lower', 'unmerged source');
+      branch('top', lower);
+      const top = commit('top', 'registered repair');
+      branch('main');
+      localOrigin();
+      register([{ ref: 'lower' }, { ref: 'top' }]);
+      const pending = `${overlayFilePath(root, env)}.auto-rebase`;
+      mkdirSync(pending);
+      const file = join(pending, 'lower.json');
+      if (shape === 'unreadable') mkdirSync(file);
+      else writeFileSync(file, shape === 'invalid-json' ? '{' : JSON.stringify({
+        old: shape === 'invalid-ref' ? '--unsafe' : 'lower', new: 'top', newSha: top,
+        ...(shape === 'complete' ? { oldOverlay: { ref: 'lower' } } : {}),
+      }));
+      const prepared = await prepare();
+      expect(prepared.terminal).toBe(false);
+      expect(prepared.plan.applied.map((o) => o.ref)).toEqual(['top']);
+      expect(readOverlayState(root, { env }).overlays.map((o) => o.ref)).toEqual(['lower', 'top']);
+      expect(existsSync(file)).toBe(true);
+      if (['invalid-json', 'invalid-ref', 'unreadable'].includes(shape)) {
+        expect(prepared.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-auto-retire-failed' }));
+      }
+      expectNoRetirement();
+    },
+  );
+
+  it('pending swap protection leaves unrelated landed registrations eligible for retirement', async () => {
+    branch('lower');
+    const lower = commit('lower', 'unmerged source');
+    branch('top', lower);
+    const top = commit('top', 'registered repair');
+    branch('main');
+    localOrigin();
+    register([{ ref: 'lower' }, { ref: 'top' }, { ref: 'main' }]);
+    const pending = `${overlayFilePath(root, env)}.auto-rebase`;
+    mkdirSync(pending);
+    writeFileSync(join(pending, 'lower.json'), JSON.stringify({ old: 'lower', new: 'top', newSha: top }));
+    const prepared = await prepare();
+    expect(prepared.terminal).toBe(false);
+    expect(readOverlayState(root, { env }).overlays.map((o) => o.ref)).toEqual(['lower', 'top']);
+    expect(audit().filter((e) => e.kind === 'removed').map((e) => e.ref)).toEqual(['main']);
+    expect(prepared.alerts).toContainEqual({ kind: 'overlay-auto-dropped', detail: { ref: 'main', reason: 'in-main' } });
+  });
+
   it.each(['missing-top', 'missing-equal', 'missing-above-live-top', 'refreshed-top'])(
     'preparation retains an available carrier of unmerged content (%s)', async (shape) => {
       branch('lower');

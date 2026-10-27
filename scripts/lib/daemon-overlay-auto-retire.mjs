@@ -8,6 +8,7 @@ import {
 } from './daemon-overlays.mjs';
 import { appendDaemonEvent as eventDefault } from './daemon-events.mjs';
 import { isSafeBranchName } from './daemon-self-sync.mjs';
+import { pinnedStatus } from './daemon-rebuild/plan.mjs';
 
 const SETTINGS = join(dirname(fileURLToPath(import.meta.url)), 'daemon-rebuild-settings.json');
 const SHA = /^[0-9a-f]{40,64}$/;
@@ -107,11 +108,13 @@ export function classifyOverlays({ overlays, git, mainSha = 'origin/main', refEv
  * a later `removed` line or `overlay-retired` event that fails lands in `auditFailures` for the caller to alert.
  * A contained source moves into its container's `retiredSources`, so removing the container later reinstates it.
  * Sources reinstated by this run's own removals are listed in `reinstated`; this run fetched none of them.
+ * Contained pins and `protectedRefs` remain registered for planner and verified swap cleanup checks.
  */
 export async function autoRetireOverlays({
   root, env = process.env, overlays, git, mainSha, refEvidence, recordedShas, now = Date.now,
   removeOverlay = removeDefault, appendOverlayEvent = auditDefault, appendDaemonEvent = eventDefault,
   persistTipShas = persistTipsDefault,
+  protectedRefs = new Set(),
 }) {
   const { mode, source } = resolveAutoRetireMode(env, { now });
   const result = { retired: [], wouldRetire: [], kept: [], auditFailures: [], reinstated: [] };
@@ -120,6 +123,17 @@ export async function autoRetireOverlays({
     if (mode === 'off' || row.class === 'needed') { result.kept.push(row); continue; }
     const event = { ref: row.ref, by: 'auto-retire', reason: row.reason, sha: row.sha };
     try {
+      // Verified swap cleanup owns its registrations. Containment alone also cannot replace the planner's
+      // pin checks: a containing tip may omit the older mechanism the running build still carries.
+      if (protectedRefs.has(row.ref) || (row.class === 'contained'
+        && pinnedStatus((args) => {
+          const result = git(args);
+          if (!result || result.error) throw new Error('pin-unverifiable');
+          return result;
+        }, overlays.find((o) => o?.ref === row.ref), mainSha ?? 'origin/main', row.sha).pinned)) {
+        result.kept.push(row);
+        continue;
+      }
       if (mode === 'shadow') {
         appendOverlayEvent(root, { ...event, kind: 'auto-retire-shadow', mode, source }, { env });
         result.wouldRetire.push(row);

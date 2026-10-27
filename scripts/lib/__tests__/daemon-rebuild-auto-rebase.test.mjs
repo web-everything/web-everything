@@ -51,7 +51,8 @@ function fixture({ extraModule = false, workerTest = true, baseFiles = {}, branc
   ok(root, ['commit', '-qam', 'hotfix']); ok(root, ['push', '-q', 'origin', ref]);
   const oldSha = ok(root, ['rev-parse', 'HEAD']);
   ok(root, ['checkout', '-q', 'main']);
-  const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(base, 'overlays'), WE_DAEMON_STATE_DIR: join(base, 'state'), WE_PLATFORM_PREFERENCES_FILE: join(base, 'missing'), WE_DAEMON_AUTO_REBASE: '1', WE_DAEMON_REBUILD_SKIP_UNRELATED: '0' };
+  // Exercise swap ownership with retirement explicitly enabled, independent of shadow graduation or the host.
+  const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(base, 'overlays'), WE_DAEMON_STATE_DIR: join(base, 'state'), WE_PLATFORM_PREFERENCES_FILE: join(base, 'missing'), WE_DAEMON_AUTO_REBASE: '1', WE_DAEMON_OVERLAY_AUTO_RETIRE: 'on', WE_DAEMON_REBUILD_SKIP_UNRELATED: '0' };
   addOverlay(root, overlay, { env });
   const moveMain = () => {
     for (const [file, content] of Object.entries(mainFiles)) write(root, file, content);

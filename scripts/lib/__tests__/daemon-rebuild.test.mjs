@@ -126,6 +126,8 @@ function makeFixture() {
     WE_DAEMON_STATE_DIR: stateDir,
     WE_DAEMON_CLONE_LOCK_ROOT: lockDir,
     WE_DAEMON_OVERLAY_DIR: overlayDir,
+    // Historical planner fixtures retain their registry semantics; retirement cases opt in explicitly.
+    WE_DAEMON_OVERLAY_AUTO_RETIRE: 'off',
   };
   return { base, originDir, cloneDir, stateDir, lockDir, overlayDir, env };
 }
@@ -670,8 +672,9 @@ describe('rebuildClone', () => {
     expect(slow?.detail).toMatchObject({ ms: 209_000, checks: 'lane-acquire-release:171834ms' });
   });
 
-  it('removes an overlay whose content already landed on main in a different (squashed) form', async () => {
+  it.each(['off', 'shadow', 'on'])('%s removes an overlay whose content already landed on main in a different (squashed) form', async (mode) => {
     const { originDir, cloneDir, env } = makeFixture();
+    env.WE_DAEMON_OVERLAY_AUTO_RETIRE = mode;
     pushBranch(originDir, 'lane/squashed', (dir) => writeFile(dir, 'squash.txt', 'same content\n'));
     // main picks up the SAME content plus an unrelated change in ONE commit — a different patch-id than the
     // overlay's own commit, so `git cherry` will NOT see it as upstream-equivalent; only the tree-equality
