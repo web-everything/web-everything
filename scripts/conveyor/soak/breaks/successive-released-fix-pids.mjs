@@ -11,7 +11,7 @@ const AUTHOR = { login: 'web-everything' };
 export default {
   id: 'successive-released-fix-pids',
   title: 'successive releases at one head keep every released fixer PID finished',
-  card: 'PR #5968 / x1b8hlo item 1',
+  card: 'PR #5968 / 5726 item 1',
   fixedBy: { sha: 'HEAD', where: 'lane/port-1023a-j', paths: [CORE] },
   fixPresent(root) {
     return readFileSync(join(root, CORE), 'utf8').includes('releasesBySession');
