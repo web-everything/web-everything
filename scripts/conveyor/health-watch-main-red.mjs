@@ -38,6 +38,7 @@ export function planMainRedAlert(input = {}) {
       && ['success', 'neutral'].includes(check.conclusion));
   // A full check page may be truncated; retain unknown on either recovery path.
   const provenGreen = tipReadable && tip.checkRuns.length < 100
+    && tip.checksTotal === tip.checkRuns.length
     && (state.via === 'tip-required-checks'
     || (state.latestGreen?.sha === tip.sha
       && Array.isArray(tip.requiredChecks) && tip.requiredChecks.length > 0
