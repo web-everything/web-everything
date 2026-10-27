@@ -33,6 +33,42 @@ function fixture() {
 }
 const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
 
+describe('readRedTeamStatus legacy filename compatibility', () => {
+  it('returns the legacy-filename status for a mixed-case repo/head when the normalized file is absent', () => {
+    const f = { ...fixture(), repo: 'Web-Everything/Web-Everything', head: 'B'.repeat(40) };
+    const status = { repo: f.repo, pr: f.pr, head: f.head, status: 'running',
+      pid: process.pid, loopPayload: payload(f.head) };
+    const legacy = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+    mkdirSync(dirname(legacy), { recursive: true });
+    writeFileSync(legacy, JSON.stringify(status));
+
+    expect(readDrainRedTeamEvidence(f).status).toEqual(status);
+    expect(readRedTeamStatus(f)).toEqual(status);
+  });
+
+  it.each(['legacy', 'normalized'])('returns the newer %s-filename status by mtime when both files exist', newer => {
+    const f = { ...fixture(), repo: 'Web-Everything/Web-Everything', head: 'B'.repeat(40) };
+    const paths = {
+      legacy: join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`),
+      normalized: join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo.toLowerCase())}-${f.pr}-${f.head.toLowerCase()}.json`),
+    };
+    const statuses = {
+      legacy: { repo: f.repo, pr: f.pr, head: f.head, status: 'running', pid: process.pid, loopPayload: payload(f.head) },
+      normalized: { repo: f.repo, pr: f.pr, head: f.head, status: 'queued', pid: process.pid, loopPayload: payload(f.head) },
+    };
+    mkdirSync(redTeamStatusDir(f.env), { recursive: true });
+    // Fix mtimes explicitly: neither filesystem resolution nor write order chooses the winner.
+    for (const name of ['legacy', 'normalized']) {
+      writeFileSync(paths[name], JSON.stringify(statuses[name]));
+      const at = 1_700_000_000 + (name === newer ? 60 : 0);
+      utimesSync(paths[name], at, at);
+    }
+
+    expect(readDrainRedTeamEvidence(f).status).toEqual(statuses[newer]);
+    expect(readRedTeamStatus(f)).toEqual(statuses[newer]);
+  });
+});
+
 describe('invalid status carry cannot suppress failed-seat recovery', () => {
   function failedSeatFixture() {
     const f = fixture();

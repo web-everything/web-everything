@@ -3,7 +3,7 @@ import { settleRedTeamSkip } from '../../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../../lib/red-team-carry-io.mjs';
 import { readRedTeamCarry } from '../../lib/red-team-carry-machine.mjs';
 import { describe, it, expect, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -857,6 +857,75 @@ describe('red-team-only review job', () => {
         expect(read()).toEqual(prior);
       } finally { rmSync(dir, { recursive: true, force: true }); }
     });
+  it.each(['legacy', 'normalized'])('admission refuses a live %s-filename running writer before queued writes or provider/model calls', filename => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-legacy-live-writer-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), CONVEYOR_STATE_ROOT: dir };
+    const mixedRepo = 'Web-Everything/Web-Everything';
+    const loopPayload = payload();
+    Object.assign(loopPayload.findings.read, { diffText: '+code', netChangedFiles: ['scripts/example.mjs'] });
+    const key = { repo: mixedRepo, pr, head, env };
+    const prior = { repo: mixedRepo, pr, head, status: 'running', pid: process.pid, loopPayload };
+    const path = join(redTeamStatusDir(env),
+      `${encodeURIComponent(filename === 'legacy' ? mixedRepo : mixedRepo.toLowerCase())}-${pr}-${head}.json`);
+    const writeStatus = vi.fn(recordRedTeamStatus);
+    const readEvidence = input => readDrainRedTeamEvidence({ ...input, list: () => [], readScorecards: () => [] });
+    const production = createReviewJobIo({ env, writeStatus, readEvidence });
+    let refusal, observed = { calls: { provider: 0, model: 0 } };
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, JSON.stringify(prior));
+      expect(readEvidence(key)).toMatchObject({ inFlight: true, status: prior });
+      // Exercise the admission boundary with the caller's mixed-case identity. The
+      // job planner canonicalizes repo slugs, so it cannot reproduce this caller.
+      // If admitted, follow the real handoff into the shared seat's provider sentinel.
+      try {
+        const input = { repo: mixedRepo, pr, loopPayload, redTeamMode: 'fresh' };
+        const admission = production.redTeamStatus({ ...input, status: 'queued' });
+        observed = runSharedRecovery({ ...input, redTeamAdmission: admission.redTeamAdmission },
+          { status: readRedTeamStatus(key) });
+      } catch (error) { refusal = error.message; }
+
+      expect({ refused: Boolean(refusal), queuedWrites: writeStatus.mock.calls.filter(([input]) => input.status === 'queued').length,
+        providerCalls: observed.calls.provider, modelCalls: observed.calls.model }).toEqual({
+        refused: true, queuedWrites: 0, providerCalls: 0, modelCalls: 0,
+      });
+      expect(refusal).toMatch(/writer.*(live|unknown)/);
+      expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(prior);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each(['fresh', 'resume'].flatMap(redTeamMode => ['inFlight', 'queued'].map(flag => ({ redTeamMode, flag }))))(
+    'admission refuses $redTeamMode recovery when drain evidence reports $flag even if the status reader returns null', ({ redTeamMode, flag }) => {
+      const dir = mkdtempSync(join(tmpdir(), 'red-team-null-status-live-evidence-'));
+      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), CONVEYOR_STATE_ROOT: dir };
+      const readStatus = vi.fn(input => readRedTeamStatus(input));
+      const writeStatus = vi.fn(recordRedTeamStatus);
+      const readEvidence = vi.fn(() => ({ inFlight: flag === 'inFlight', queued: flag === 'queued',
+        seatRecorded: false, completedRecorded: false, failedSeatCount: 0 }));
+      const production = createReviewJobIo({ env, readStatus, writeStatus, readEvidence });
+      let observed = { calls: { provider: 0, model: 0 } };
+      const io = fakeIo({ redTeamStatus: production.redTeamStatus,
+        runRedTeam: vi.fn(input => {
+          observed = runSharedRecovery(input, { status: readRedTeamStatus({ repo, pr, head, env }) });
+          return observed.result;
+        }),
+      });
+      try {
+        expect(readRedTeamStatus({ repo, pr, head, env })).toBeNull();
+        const out = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode }, io);
+
+        expect(readStatus.mock.results[0].value).toBeNull();
+        expect({ outcome: out.outcome, queuedWrites: writeStatus.mock.calls.filter(([input]) => input.status === 'queued').length,
+          providerCalls: observed.calls.provider, modelCalls: observed.calls.model }).toEqual({
+          outcome: 'blocked-on-infra', queuedWrites: 0, providerCalls: 0, modelCalls: 0,
+        });
+        expect(out.label).toMatch(/inspect|retry/);
+        expect(io.runRedTeam).not.toHaveBeenCalled();
+        expect(io.runRedTeamGate).not.toHaveBeenCalled();
+        expect(readRedTeamStatus({ repo, pr, head, env })).toBeNull();
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
   it.each(['queued', 'running'])('allows recovery after the previous %s writer is confirmed dead', status => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-dead-writer-'));
     const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
