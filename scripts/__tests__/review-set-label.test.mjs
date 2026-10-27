@@ -4813,13 +4813,13 @@ describe('#5649 — approval rows at the label home', () => {
   it('--approval-kind=judge with a valid delegation is stored; a malformed delegation is refused before any write', () => {
     const delegation = { by: 'operator', scope: 'review:human', expires: '2099-01-01T00:00:00.000Z' };
     const s = sink();
-    const ok = run(stubProvider(['review:human']), [...CLEAR, '--approval-kind=judge', `--delegation-json=${JSON.stringify(delegation)}`], { appendApproval: s.fn });
+    const ok = run(stubProvider(['review:human']), [...CLEAR, `--expect-head=${'a'.repeat(40)}`, '--approval-kind=judge', `--delegation-json=${JSON.stringify(delegation)}`], { appendApproval: s.fn });
     expect(ok.exitCode).toBe(0);
     expect(s.seen[0]).toMatchObject({ approval: 'judge', delegation });
     for (const bad of ['--delegation-json={not json', '--delegation-json={"by":"x"}', '--delegation-json=null', '--approval-kind=--evil', '--approval-kind=root']) {
       rmSync(ledgerDir, { recursive: true, force: true }); mkdirSync(ledgerDir, { recursive: true });
       const p = stubProvider(['review:human']);
-      const r = run(p, [...CLEAR, bad]);
+      const r = run(p, [...CLEAR, ...(bad.startsWith('--delegation-json=') ? [`--expect-head=${'a'.repeat(40)}`] : []), bad]);
       expect(r.exitCode).not.toBe(0);
       expect(p.calls).toEqual([]);
       expect(readdirSync(ledgerDir)).toEqual([]);
@@ -4842,7 +4842,7 @@ describe('#5649 — approval rows at the label home', () => {
       for (const withDelegation of [false, true]) {
         rmSync(ledgerDir, { recursive: true, force: true }); mkdirSync(ledgerDir, { recursive: true });
         const p = stubProvider(['review:human']);
-        const r = run(p, [...CLEAR, `--approval-kind=${kind}`, ...(withDelegation ? [`--delegation-json=${JSON.stringify(delegation)}`] : [])]);
+        const r = run(p, [...CLEAR, `--approval-kind=${kind}`, ...(withDelegation ? [`--expect-head=${'a'.repeat(40)}`, `--delegation-json=${JSON.stringify(delegation)}`] : [])]);
         expect(r.exitCode, `${kind} ${withDelegation}`).toBe(0);
         const all = rows();
         expect(all.map((x) => x.type ?? 'verdict')).toEqual(['verdict', 'approval']);
