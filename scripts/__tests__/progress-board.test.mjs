@@ -16,7 +16,7 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { outputMixRepo } from '../lib/__tests__/helpers/output-mix-repo.mjs';
 import {
   classifyPr,
@@ -496,6 +496,19 @@ describe('the output-mix section', () => {
     const h = renderPage(buildModel(SEED, PRS));
     expect(h).toContain('could not be computed');
   });
+
+  it('does not run the CLI when imported by another progress-board.mjs', () => {
+    // The copied CLI's shared dependencies import the original board too. A basename-only entry guard
+    // runs that original against the full checkout before the copied board ever reads its tiny fixture.
+    const entry = join(sandbox, 'progress-board.mjs');
+    writeFileSync(entry, `import ${JSON.stringify(pathToFileURL(CLI).href)};\nprocess.stdout.write('imported\\n');\n`);
+    const r = spawnSync(process.execPath, [entry, '--help'], {
+      encoding: 'utf8',
+      timeout: 20_000,
+    });
+    expect(r.status, r.error?.message ?? r.stderr).toBe(0);
+    expect(r.stdout).toBe('imported\n');
+  }, 30_000);
 
   /**
    * The one case that runs the REAL derivation through the CLI. Every other `cli()` call in this file forces
