@@ -18,6 +18,10 @@ import { readOverlayConflictWakes } from '../overlay-conflict-wake.mjs';
 
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
+// Like daemon-rebuild.test.mjs, these cases create real Git repos and run multiple rebuilds.
+// Keep a finite hang guard without depending on a loaded CI worker finishing within Vitest's default 5s.
+vi.setConfig({ testTimeout: 60_000 });
+
 const temps = [];
 afterEach(() => { while (temps.length) rmSync(temps.pop(), { recursive: true, force: true }); });
 const mktemp = (p) => { const d = mkdtempSync(join(tmpdir(), p)); temps.push(d); return d; };

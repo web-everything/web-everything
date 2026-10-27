@@ -7,7 +7,8 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { ensureCodeSnapshot, evictSnapshots, snapshotsRoot } from '../daemon-job-snapshots.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -295,6 +296,146 @@ describe('stopHandle on a real process', () => {
     expect(res).toEqual({ gone: true, signal: null });
     expect(readProcStart(child.pid)).toBeTruthy();
     child.kill('SIGKILL');
+  });
+});
+
+describe('launchJob snapshot eviction', () => {
+  const seedStores = (type, keys) => {
+    keys.forEach((key, i) => {
+      const path = join(snapshotsRoot(dir), type, key);
+      if (type === 'code') ensureCodeSnapshot({ jobsDir: dir, codeSha: key, materialize: () => {} });
+      else mkdirSync(path, { recursive: true });
+      utimesSync(path, 1000 + i, 1000 + i);
+    });
+  };
+  const storesLeft = (type) => readdirSync(join(snapshotsRoot(dir), type)).sort();
+  const launch = (options = {}) => {
+    enqueueJob({ store, kindDef: noop, id: 'launching', codeSha: 'current' });
+    return launchJob({ store, id: 'launching', kindDef: noop, snapshot: { materialize: () => {} }, spawnFn: () => 4242, ...options });
+  };
+
+  it('evicts old unreferenced stores beyond the newest two, including terminal references, preserving job JSON and logs', () => {
+    for (const type of ['code', 'node-modules']) seedStores(type, ['old1', 'old2', 'recent1', 'recent2']);
+    for (const [i, status] of ['succeeded', 'failed'].entries()) {
+      const id = `terminal-${status}`;
+      enqueueJob({ store, kindDef: noop, id, codeSha: `old${i + 1}` });
+      store.update(id, (r) => ({ ...r, job: { ...r.job, status, snapshotKeys: [`code:old${i + 1}`, `node-modules:old${i + 1}`] } }));
+      writeFileSync(join(dir, `${id}.log`), 'job output');
+    }
+
+    expect(launch().job.status).toBe('launching');
+
+    expect(storesLeft('code')).toEqual(['current', 'recent2']);
+    expect(storesLeft('node-modules')).toEqual(['recent1', 'recent2']);
+    for (const status of ['succeeded', 'failed']) {
+      expect(store.read(`terminal-${status}`).job.status).toBe(status);
+      expect(existsSync(join(dir, `terminal-${status}.log`))).toBe(true);
+    }
+    expect(store.read('launching').job.snapshotKeys).toEqual(['code:current']);
+  });
+
+  it.each(['{"job":', '{"job":{}}'])('skips eviction for a corrupt job record (%s), then resumes after repair', (corruptJson) => {
+    for (const type of ['code', 'node-modules']) seedStores(type, ['running', 'old', 'recent', 'newest']);
+    enqueueJob({ store, kindDef: noop, id: 'running', codeSha: 'running' });
+    store.update('running', (r) => markClaimed(markLaunching(r, {
+      at: new Date().toISOString(), snapshotKeys: ['code:running', 'node-modules:running'],
+    }), { at: new Date().toISOString(), handle: formatJobHandle({ host: 'h', pid: 99, procStart: 'x' }), host: 'h', pid: 99, procStart: 'x' }));
+    const recordPath = runPath('running', dir);
+    const validJson = readFileSync(recordPath, 'utf8');
+    writeFileSync(recordPath, corruptJson);
+    expect(store.list().corrupt).toEqual(['running']);
+    const evict = vi.fn(evictSnapshots);
+    const spawnFn = vi.fn(() => 4242);
+
+    const out = launch({ evict, spawnFn });
+
+    expect(spawnFn).toHaveBeenCalledOnce();
+    expect(out.job.timeline.at(-1)).toMatchObject({ event: 'spawned', pid: 4242 });
+    expect(store.read('launching').job.timeline.at(-1)).toMatchObject({ event: 'spawned', pid: 4242 });
+    expect(evict).not.toHaveBeenCalled();
+    expect(storesLeft('code')).toEqual(['current', 'newest', 'old', 'recent', 'running']);
+    expect(storesLeft('node-modules')).toEqual(['newest', 'old', 'recent', 'running']);
+    expect(readFileSync(recordPath, 'utf8')).toBe(corruptJson);
+
+    writeFileSync(recordPath, validJson);
+    enqueueJob({ store, kindDef: noop, id: 'after-repair', codeSha: 'current' });
+    launchJob({ store, id: 'after-repair', kindDef: noop, snapshot: { materialize: () => {} }, spawnFn, evict });
+    expect(evict).toHaveBeenCalledOnce();
+    for (const type of ['code', 'node-modules']) {
+      expect(storesLeft(type)).toContain('running');
+      expect(storesLeft(type)).not.toContain('old');
+    }
+  });
+
+  it('keeps old code and node-modules stores referenced by a running job', () => {
+    for (const type of ['code', 'node-modules']) seedStores(type, ['running', 'old', 'newest']);
+    enqueueJob({ store, kindDef: noop, id: 'running', codeSha: 'running' });
+    store.update('running', (r) => markClaimed(markLaunching(r, {
+      at: new Date().toISOString(), snapshotKeys: ['code:running', 'node-modules:running'],
+    }), { at: new Date().toISOString(), handle: formatJobHandle({ host: 'h', pid: 99, procStart: 'x' }), host: 'h', pid: 99, procStart: 'x' }));
+
+    launch();
+
+    expect(storesLeft('code')).toEqual(['current', 'running']);
+    expect(storesLeft('node-modules')).toEqual(['newest', 'running']);
+  });
+
+  it('keeps the launching job\'s own older snapshot after stamping its references', () => {
+    seedStores('code', ['current', 'old', 'newest']);
+
+    const out = launch();
+
+    expect(out.job).toMatchObject({ status: 'launching', snapshotKeys: ['code:current'] });
+    expect(storesLeft('code')).toEqual(['current', 'newest']);
+  });
+
+  it('still spawns the job when the injected eviction throws', () => {
+    const evict = vi.fn(() => { throw new Error('eviction failed'); });
+    const spawnFn = vi.fn(() => 4242);
+
+    const out = launch({ evict, spawnFn });
+
+    expect(evict).toHaveBeenCalledOnce();
+    expect(evict).toHaveBeenCalledWith({ jobsDir: dir, referenced: ['code:current'] });
+    expect(spawnFn).toHaveBeenCalledOnce();
+    expect(out.job).toMatchObject({ status: 'launching', attempts: 1 });
+    expect(store.read('launching').job.timeline.at(-1)).toMatchObject({ event: 'spawned', pid: 4242 });
+  });
+
+  it('spawns and persists the child before a slow snapshot delete exceeds the tick watchdog', () => {
+    for (const type of ['code', 'node-modules']) seedStores(type, ['old', 'recent', 'newest']);
+    const events = [];
+    const atDelete = [];
+    let clock = Date.now();
+    const slowDelete = (ref) => {
+      events.push('delete');
+      const record = store.read('launching');
+      atDelete.push({ spawnedPid: record.job.timeline.findLast((e) => e.event === 'spawned')?.pid, event: record.job.timeline.at(-1).event });
+      clock += 180_001; // Model a recursive delete outlasting the health tick's watchdog, without waiting.
+      const colon = ref.indexOf(':');
+      rmSync(join(snapshotsRoot(dir), ref.slice(0, colon), ref.slice(colon + 1)), { recursive: true, force: true });
+    };
+    const out = launch({
+      now: () => clock,
+      spawnFn: () => { events.push('spawn'); return 4242; },
+      evict: (options) => {
+        for (const ref of evictSnapshots({ ...options, dryRun: true }).evicted) slowDelete(ref);
+      },
+    });
+
+    expect(atDelete.length).toBeGreaterThanOrEqual(2); // Both code and node-modules have victims.
+    expect(events[0]).toBe('spawn');
+    expect(atDelete).toEqual(atDelete.map(() => ({ spawnedPid: 4242, event: 'spawned' })));
+    expect(out.job.timeline.at(-1)).toMatchObject({ event: 'spawned', pid: 4242 });
+    expect(store.read('launching').job.timeline.at(-1)).toMatchObject({ event: 'spawned', pid: 4242 });
+  });
+
+  it('skips housekeeping when spawning fails', () => {
+    const evict = vi.fn();
+    const out = launch({ evict, spawnFn: () => { throw new Error('spawn refused'); } });
+
+    expect(out.job.error).toBe('spawn failed: spawn refused');
+    expect(evict).not.toHaveBeenCalled();
   });
 });
 
