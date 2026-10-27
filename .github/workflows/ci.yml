@@ -179,7 +179,8 @@ jobs:
     # 2026-10-14 RE-SIZED 15 -> 25: the 2026-09-25 sample above is stale (shards then ran ~4 min; they now take ~9-11 min
     # on a normal runner). Main went red at 8cd0b3d12 with no code cause: shard 2 needed ~14 min on a slow runner and the
     # 15-min cap cancelled it. 25 min = ~1.8x the slowest observed; a HUNG shard is still killed within the half hour.
-    timeout-minutes: 25
+    # Raised 25 -> 40: shard 2 hit the 25-min cap (run 40432754185); #6002 rebalance is the real fix.
+    timeout-minutes: 40
     strategy:
       # Don't cancel sibling shards when one fails — the `test` aggregator reports the combined red, and
       # cancelling would hide which other shards also failed.
