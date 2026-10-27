@@ -30,6 +30,39 @@ describe('R157 repeat failure quarantine', () => {
   });
   it('planner records distinct run proof', () => expect(plan()).toMatchObject({ action: 'add', entries: [{ test: file, proof }] }));
   it('once => none', () => expect(plan({ repeatRuns: [rows[1]] })).toMatchObject({ action: 'none', why: expect.any(String) }));
+  it('planner refuses repeatFailureCount below two even with one failing run', () => {
+    expect(plan({ settings: { repeatFailureCount: 1 }, repeatRuns: [rows[1]] })).toMatchObject({ action: 'none', why: expect.stringMatching(/count|bound/) });
+  });
+  it('persisted repeat proof with count 1 is refused', () => {
+    const added = addEntries(null, { tests: [file], brokenSha: rows[0].headSha, actor: 'operator', owner: 'operator', reason: 'repeat', proof, now });
+    expect(added.ok).toBe(true);
+    expect(validateQuarantineList({ ...added.list, entries: [{ ...added.list.entries[0], proof: { ...proof, count: 1, runIds: [2] } }] })).toMatchObject({ ok: false });
+  });
+  it('two rows with no timestamps => none with an operator-visible why', () => {
+    expect(plan({ repeatRuns: rows.map((r) => ({ ...r, createdAt: undefined })) })).toMatchObject({ action: 'none', why: expect.stringMatching(/createdAt|chronolog|timestamp/) });
+  });
+  it('unparseable timestamp => none with an operator-visible why', () => {
+    expect(plan({ repeatRuns: [{ ...rows[0], createdAt: 'invalid' }, rows[1]] })).toMatchObject({ action: 'none', why: expect.stringMatching(/createdAt|chronolog|timestamp/) });
+  });
+  it('tied timestamps => none with an operator-visible why', () => {
+    expect(plan({ repeatRuns: [{ ...rows[0], createdAt: rows[1].createdAt }, rows[1]] })).toMatchObject({ action: 'none', why: expect.stringMatching(/createdAt|chronolog|timestamp/) });
+  });
+  it('out-of-order evidence => none with an operator-visible why', () => {
+    expect(plan({ repeatRuns: [...rows].reverse(), latestRunId: 1 })).toMatchObject({ action: 'none', why: expect.stringMatching(/createdAt|chronolog|timestamp/) });
+  });
+  it('distinct heads are not required for chronologically distinct failing runs', () => {
+    expect(plan({ repeatRuns: [{ ...rows[0], headSha: rows[1].headSha }, rows[1]] })).toMatchObject({ action: 'add', entries: [{ proof: { ...proof, shas: [rows[1].headSha, rows[1].headSha] } }] });
+  });
+  it.each([undefined, 'invalid'])('IO excludes a malformed row sharing a red run sha (%s) => none', (createdAt) => {
+    const readJobs = vi.fn(() => ({ failed: [{ id: 10, name: 'integration' }], jobs: [] }));
+    const write = vi.fn();
+    const out = runSafetyNet({ now, dir: temp(), mainCiRuns: { runs: [{ ...rows[0], headSha: rows[1].headSha, createdAt }, rows[1]], failing: { runId: 2, jobs: ['integration'] } },
+      touchedFiles: () => [], readJobs, readLog: () => failure,
+      readList: () => ({ ok: true, list: { version: 1, entries: [] } }), write, log: () => {} });
+    expect(out.plan).toMatchObject({ action: 'none', why: expect.stringMatching(/insufficient|createdAt|chronolog|timestamp/) });
+    expect(readJobs.mock.calls.some(([id]) => id === 1)).toBe(false);
+    expect(write).not.toHaveBeenCalled();
+  });
   it('duplicate run ids do not count twice', () => expect(plan({ repeatRuns: [rows[1], rows[1]] }).action).toBe('none'));
   it('touched file between runs => none', () => expect(plan({ touchedFiles: () => [file] }).action).toBe('none'));
   it('touchedFiles unknown => none', () => expect(plan({ touchedFiles: () => null }).action).toBe('none'));
@@ -55,6 +88,20 @@ describe('R157 repeat failure quarantine', () => {
   });
 });
 describe('repeat settings cascade', () => {
+  it('env COUNT=1 falls back to default 2 with provenance and still needs two runs (once => none)', () => {
+    const settings = resolveQuarantineSettings({ file: join(temp(), 'absent.json'), platform: null, env: { WE_RED_MAIN_QUARANTINE_REPEAT_FAILURE_COUNT: '1' } });
+    expect(settings).toMatchObject({ value: { repeatFailureCount: 2 }, sources: { repeatFailureCount: 'standard' } });
+    expect(settings.invalid.join(' ')).toContain('repeatFailureCount');
+    expect(plan({ settings: settings.value, repeatRuns: [rows[1]] }).action).toBe('none');
+    expect(plan({ settings: settings.value }).action).toBe('add');
+  });
+  it('settings COUNT=1 is rejected at platform and tool layers with provenance', () => {
+    const path = join(temp(), 'settings.json');
+    writeFileSync(path, JSON.stringify({ redMainQuarantine: { repeatFailureCount: 1 } }));
+    const settings = resolveQuarantineSettings({ file: path, platform: { repeatFailureCount: 1 }, env: {} });
+    expect(settings).toMatchObject({ value: { repeatFailureCount: 2 }, sources: { repeatFailureCount: 'standard' } });
+    expect(settings.invalid.join(' ')).toContain('repeatFailureCount');
+  });
   it.each([['repeatFailureProof', true, false, 'on', true, 'REPEAT_FAILURE_PROOF'], ['repeatFailureCount', 2, 3, '4', 4, 'REPEAT_FAILURE_COUNT']])('%s resolves standard, platform, tool and env with provenance', (key, standard, override, raw, value, suffix) => {
     const path = join(temp(), 'settings.json'); const base = { file: path, env: {}, platform: null };
     expect(resolveQuarantineSettings(base)).toMatchObject({ value: { [key]: standard }, sources: { [key]: 'standard' } });

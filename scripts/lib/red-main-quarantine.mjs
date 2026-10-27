@@ -192,7 +192,7 @@ const validFlakeProof = (p) => p && (typeof p.runId === 'string' || typeof p.run
 const validRunId = (id) => (typeof id === 'string' || typeof id === 'number') && /^[1-9]\d*$/.test(String(id));
 const validSha = (sha) => typeof sha === 'string' && /^[0-9a-f]{7,40}$/.test(sha);
 const validRepeatProof = (p) => p?.kind === 'repeat-failed'
-  && Number.isInteger(p.count) && p.count >= 1 && p.count <= 10
+  && Number.isInteger(p.count) && p.count >= 2 && p.count <= 10
   && Array.isArray(p.runIds) && p.runIds.length === p.count && p.runIds.every(validRunId)
   && new Set(p.runIds.map(String)).size === p.count
   && Array.isArray(p.shas) && p.shas.length === 2 && p.shas.every(validSha);
@@ -201,8 +201,16 @@ const validRepeatProof = (p) => p?.kind === 'repeat-failed'
 export const REPEAT_RUN_LIMIT = 10;
 function repeatProofFor(file, { repeatRuns, latestRunId, touchedFiles, count }) {
   const no = (why) => ({ why });
-  if (!Number.isInteger(count) || count < 1 || count > REPEAT_RUN_LIMIT) return no('repeat count exceeds evidence bound — STOP; operator repair required');
+  if (!Number.isInteger(count) || count < 2 || count > REPEAT_RUN_LIMIT) return no('repeat count exceeds evidence bound — STOP; operator repair required');
   if (!Array.isArray(repeatRuns) || repeatRuns.length > REPEAT_RUN_LIMIT) return no('repeat history exceeds evidence bound — STOP; operator repair required');
+  let previousCreatedAt = -Infinity;
+  for (const run of repeatRuns) {
+    const createdAt = typeof run?.createdAt === 'string' ? Date.parse(run.createdAt) : NaN;
+    if (!Number.isFinite(createdAt) || createdAt <= previousCreatedAt) {
+      return no('repeat createdAt chronology missing, invalid or not strictly increasing — STOP; operator repair required');
+    }
+    previousCreatedAt = createdAt;
+  }
   const seen = new Set();
   const runs = repeatRuns.filter((r) => {
     if (!validRunId(r?.databaseId) || seen.has(String(r.databaseId))) return false;
@@ -268,7 +276,7 @@ export function planSafetyNet({ status, firstRedSha = null, failedJobs = null, j
         if (!proof && s.requireProvenFlake) {
           const repeat = s.repeatFailureProof ? repeatProofFor(file, { repeatRuns, latestRunId, touchedFiles, count: s.repeatFailureCount }) : { why: 'repeat proof disabled' };
           if (!repeat.proof) {
-            const detail = repeat.why === 'insufficient distinct failing main runs' ? '' : `; ${repeat.why}`;
+            const detail = `; ${repeat.why}`;
             return none(`not a proven flake: ${job} (no green re-run of the failing commit${detail})`);
           }
           proof = repeat.proof;
