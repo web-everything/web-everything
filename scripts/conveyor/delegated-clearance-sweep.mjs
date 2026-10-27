@@ -4,6 +4,7 @@
  * Platform preference `delegatedClearance`: {shadowUntil, preApprovalsFile, stateFile}; env overrides
  * WE_DELEGATED_CLEARANCE_SHADOW_UNTIL / WE_DELEGATED_CLEARANCE_PRE_APPROVALS_FILE / WE_DELEGATED_CLEARANCE_STATE_FILE.
  * Absent/invalid shadowUntil stays in shadow indefinitely: an operator sets an elapsed ISO time to go live.
+ * Accepted form: YYYY-MM-DDTHH:mm:ss[.fraction](Z|±HH:mm), with a valid calendar date and explicit timezone.
  * External pre-approvals example (the orchestrator seeds the real R122, never this repository):
  * [{repo:"owner/repository",pr:5925,rulingId:"R122",operatorQuote:"<operator's exact words>",approvedHead:"<optional 40-hex SHA>",
  * conditions:{redTeamClear:true,accepted:true,allowedHeadMove:"card-only"},
@@ -32,6 +33,15 @@ import { defaultReadPr } from './advisory-label-sweep.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 
 const sha = v => typeof v === 'string' && /^[a-f0-9]{40}$/.test(v);
+function parseShadowDeadline(value) {
+  if (typeof value !== 'string') return NaN;
+  const match = /^(\d{4}-\d{2}-\d{2})T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.exec(value);
+  if (!match || match[0] !== value) return NaN;
+  // Date.parse normalizes impossible dates such as February 30; those must stay in shadow too.
+  const day = Date.parse(`${match[1]}T00:00:00Z`);
+  if (!Number.isFinite(day) || new Date(day).toISOString().slice(0, 10) !== match[1]) return NaN;
+  return Date.parse(value);
+}
 const repoKey = v => typeof v === 'string' && /^[\w.-]+\/[\w.-]+$/.test(v) ? v.toLowerCase() : null;
 const approvalFor = (approvals, repo, num) => {
   const key = repoKey(repo);
@@ -195,7 +205,8 @@ export function sweepDelegatedClearance({ prs, repo = null, dryRun = false, sett
         if (!dryRun) writeState(state);
       }
     }
-    const shadow = !Number.isFinite(Date.parse(setting.shadowUntil)) || now() < Date.parse(setting.shadowUntil);
+    const deadline = parseShadowDeadline(setting.shadowUntil);
+    const shadow = !Number.isFinite(deadline) || now() < deadline;
     held = held.filter(p => {
       const key = `${repo ?? ''}#${p.number}@${p.headRefOid}`;
       const a = approvalFor(approvals, repo, p.number);

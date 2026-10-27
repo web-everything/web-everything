@@ -65,8 +65,27 @@ describe('R130 delegated clearance', () => {
   it.each([
     { deadline: undefined, live: false },
     { deadline: 'invalid deadline', live: false },
+    { deadline: '0', live: false },
+    { deadline: '1', live: false },
+    { deadline: 0, live: false },
+    { deadline: null, live: false },
+    { deadline: '', live: false },
+    { deadline: '10/25/2026', live: false },
+    { deadline: 'Sun, 25 Oct 2026 00:00:00 GMT', live: false },
+    { deadline: '2026-10-25', live: false },
+    { deadline: '2026-10-25T00:00:00', live: false },
+    { deadline: '2026-10-25 00:00:00Z', live: false },
+    { deadline: ' 2026-10-25T00:00:00Z', live: false },
+    { deadline: '2026-10-25T00:00:00Z\n', live: false },
+    { deadline: '2026-13-25T00:00:00Z', live: false },
+    { deadline: '2026-02-30T00:00:00Z', live: false },
+    { deadline: '2026-10-25T24:00:00Z', live: false },
     { deadline: '2026-10-27T00:00:00Z', live: false },
     { deadline: '2026-10-25T00:00:00Z', live: true },
+    { deadline: '2026-10-25T00:00:00.123Z', live: true },
+    { deadline: '2026-10-25T23:30:00-01:00', live: false },
+    { deadline: '2026-10-26T00:30:00+01:00', live: true },
+    { deadline: '2026-10-26T00:00:00Z', live: true },
   ])('invalid shadow deadline never invokes live clearance (deadline=$deadline)', ({ deadline, live }) => {
     const h = harness({ setting: { shadowUntil: deadline } });
     expect(sweepDelegatedClearance(h)[0].delegated).toBe(live ? 'auto-approved' : 'would-approve');
