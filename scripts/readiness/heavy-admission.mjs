@@ -1759,7 +1759,7 @@ export async function main(argv) {
   const { flags, positionals } = parseFlags(detachFlags.rest);
   const detachOptions = { scriptPath: fileURLToPath(import.meta.url), kind: 'heavy-admission',
     out: (line) => writeAllSync(1, `${line}\n`) };
-  if (detachFlags.waitFor !== null) {
+  if (detachFlags.waitFor !== null || detachFlags.cancel !== undefined) {
     process.exit(await handleDetachCli(preArgv, detachOptions));
   }
   if (detachFlags.detach && positionals[0] === 'run') {
@@ -1953,7 +1953,7 @@ export async function main(argv) {
     const { exitCode } = await runUnderAdmission(runOpts);
     process.exit(exitCode);
   }
-  process.stderr.write(`usage: heavy-admission.mjs <status|load-status|queue-status|acquire|release|run|reap> [--apply] [--ttl-minutes=] [--repo=] [--cap=] [--max-per-core=] [--min-idle-pct=] [--min-pressure-level=] [--window=] [--owner=] [--lane=] [--num=] [--json] [--ceiling-ms=] [--wait-ms=] [-- <command…>]\n`);
+  process.stderr.write(`usage: heavy-admission.mjs <status|load-status|queue-status|acquire|release|run|reap> [--apply] [--ttl-minutes=] [--repo=] [--cap=] [--max-per-core=] [--min-idle-pct=] [--min-pressure-level=] [--window=] [--owner=] [--lane=] [--num=] [--json] [--ceiling-ms=] [--wait-ms=] [-- <command…>]\nDetached operations: run --detach -- <command…>; --wait-for=<id> | --cancel=<id> [--max-wait-ms=<n>]\n`);
   process.exit(3);
 }
 

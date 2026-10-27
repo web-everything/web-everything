@@ -72,7 +72,7 @@ describe('maybeHandleDetach', () => {
 
   it('spawns run.mjs prototype-load with remaining argv, persists a running record and prints its id', async () => {
     const { record, spawnFn, unref } = await launch();
-    expect(spawnFn).toHaveBeenCalledOnce();
+    expect(spawnFn).toHaveBeenCalledTimes(2);
     const [command, argv, options] = spawnFn.mock.calls[0];
     expect(command).toBe(process.execPath);
     expect(argv.slice(argv.indexOf('--') + 1)).toEqual([
@@ -80,7 +80,7 @@ describe('maybeHandleDetach', () => {
     ]);
     expect(argv).not.toContain('--detach');
     expect(options).toMatchObject({ detached: true, env: { DETACHED_OPS_DIR: dir } });
-    expect(unref).toHaveBeenCalledOnce();
+    expect(unref).toHaveBeenCalledTimes(2);
     expect(record).toMatchObject({ kind: 'prototype-load', status: 'running', exitCode: null });
     expect(JSON.parse(readFileSync(join(dir, `${record.id}.json`), 'utf8'))).toEqual(record);
   });
@@ -104,6 +104,26 @@ describe('maybeHandleDetach', () => {
     writeFileSync(path, JSON.stringify({ ...record, status: 'failed', exitCode: 3 }));
     expect(await wait()).toBe(1);
     expect(JSON.parse(out.mock.lastCall[0])).toMatchObject({ id: record.id, status: 'failed', exitCode: 3 });
-    expect(spawnFn).toHaveBeenCalledOnce();
+    expect(spawnFn).toHaveBeenCalledTimes(2);
+  });
+
+  it('T10: routes prototype-load cancellation through the shared record without launching work', async () => {
+    const { record, spawnFn } = await launch();
+    const out = vi.fn();
+    let time = 0;
+    expect(await maybeHandleDetach(PROTOTYPE_LOAD_OP, [`--cancel=${record.id}`, '--max-wait-ms=250'], {
+      out, spawnFn, isAlive: async () => null, now: () => time, sleep: async ms => { time += ms; },
+    })).toBe(75);
+    expect(JSON.parse(out.mock.lastCall[0])).toMatchObject({ id: record.id, code: 75, liveness: 'unknown' });
+    expect(readFileSync(join(dir, `${record.id}.json.cancel`), 'utf8')).toBe('SIGTERM\n');
+    expect(spawnFn).toHaveBeenCalledTimes(2);
+  });
+
+  it('T10: real prototype-load CLI rejects an unknown cancellation id', () => {
+    const result = spawnSync(process.execPath, [scriptPath, PROTOTYPE_LOAD_OP, '--cancel=missing'], {
+      env: process.env, encoding: 'utf8', timeout: 15000,
+    });
+    expect(result.status, result.stderr).toBe(1);
+    expect(JSON.parse(result.stdout)).toMatchObject({ code: 1, reason: 'unknown-job' });
   });
 });

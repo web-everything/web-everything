@@ -729,10 +729,11 @@ export function operatorControlCliPolicy(name, argv) {
   return { zeroWrites: preview, memoryStore: preview };
 }
 
-// prototype-load also accepts --detach, --wait-for=<id>, and --max-wait-ms=<ms>.
+// prototype-load also accepts --detach, --wait-for=<id>, --cancel=<id> and --max-wait-ms=<ms>.
 export async function maybeHandleDetach(name, rest, options) {
   if (name !== PROTOTYPE_LOAD_OP || !rest.some((arg) => arg === '--detach'
-    || arg === '--wait-for' || arg.startsWith('--wait-for='))) return null;
+    || arg === '--wait-for' || arg.startsWith('--wait-for=')
+    || arg === '--cancel' || arg.startsWith('--cancel='))) return null;
   return handleDetachCli([name, ...rest], { scriptPath: fileURLToPath(import.meta.url), kind: 'prototype-load', ...options });
 }
 

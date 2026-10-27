@@ -176,8 +176,8 @@ describe('heavy-admission detached CLI', () => {
 
   it.each([false, true])('preserves all detach-like flags after -- (detached=%s)', detached => {
     const source = "console.log(process.argv.slice(1).join(','))";
-    const tail = ['--', '--detach', '--wait-for=wrapped', '--max-wait-ms=wrapped'];
-    const expected = '--detach,--wait-for=wrapped,--max-wait-ms=wrapped';
+    const tail = ['--', '--detach', '--wait-for=wrapped', '--max-wait-ms=wrapped', '--cancel=wrapped'];
+    const expected = '--detach,--wait-for=wrapped,--max-wait-ms=wrapped,--cancel=wrapped';
     if (detached) {
       const id = detach(source, tail);
       expect(wait(id)).toMatchObject({ id, stdoutTail: `${expected}\n`, exitCode: 0 });
@@ -198,4 +198,30 @@ describe('heavy-admission detached CLI', () => {
       id: 'unknown-job', status: 'failed', reason: 'unknown-job',
     });
   });
+
+  it.each(waitModes)('T10: cancellation takes no admission slot (mode %s)', (_label, mode) => {
+    holdSlot();
+    expect(JSON.parse(cli([...mode, '--cancel=missing', '--max-wait-ms=250'], 1)))
+      .toMatchObject({ code: 1, reason: 'unknown-job' });
+    expect(JSON.parse(cli(['status'])).heldCount).toBe(1);
+  });
+
+  it('T10: real cancellation stops a running admission job and leaves its slot reclaimable', async () => {
+    const started = join(root, 'cancel-started');
+    const pulse = join(root, 'cancel-pulse');
+    const id = detach(`
+      const fs = require('node:fs');
+      fs.writeFileSync(${JSON.stringify(started)}, 'ready');
+      process.on('SIGTERM', () => {});
+      setInterval(() => fs.writeFileSync(${JSON.stringify(pulse)}, 'alive'), 25);
+      setTimeout(() => process.exit(0), 20000);
+    `);
+    await vi.waitFor(() => expect(existsSync(started)).toBe(true), { timeout: 10000 });
+    expect(JSON.parse(cli([`--cancel=${id}`, '--max-wait-ms=15000'], 1)))
+      .toMatchObject({ code: 1, status: 'failed', exitCode: 143, reason: 'cancelled' });
+    rmSync(pulse, { force: true });
+    await new Promise(done => setTimeout(done, 250));
+    expect(existsSync(pulse)).toBe(false);
+    expect(cli(['run', '--', process.execPath, '-e', "console.log('reclaimed')"])).toBe('reclaimed');
+  }, 30000);
 });
