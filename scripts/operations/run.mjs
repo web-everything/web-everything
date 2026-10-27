@@ -29,6 +29,7 @@ import { readLatestDecisions } from '../conveyor/health-responder-state.mjs';
 import { healthRespondOperation, HEALTH_RESPOND_OP } from './health-respond.mjs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { handleDetachCli } from '../lib/detached-op.mjs';
 
 import { operatorSessionBootstrapOperation, finishBootstrap } from './operator-session-bootstrap.mjs';
 import { bootstrapPlan } from './operator-session-bootstrap-io.mjs';
@@ -728,6 +729,14 @@ export function operatorControlCliPolicy(name, argv) {
   return { zeroWrites: preview, memoryStore: preview };
 }
 
+// prototype-load also accepts --detach, --wait-for=<id>, --cancel=<id> and --max-wait-ms=<ms>.
+export async function maybeHandleDetach(name, rest, options) {
+  if (name !== PROTOTYPE_LOAD_OP || !rest.some((arg) => arg === '--detach'
+    || arg === '--wait-for' || arg.startsWith('--wait-for=')
+    || arg === '--cancel' || arg.startsWith('--cancel='))) return null;
+  return handleDetachCli([name, ...rest], { scriptPath: fileURLToPath(import.meta.url), kind: 'prototype-load', ...options });
+}
+
 // The standard main check used across `we:scripts` — importing this module (tests do) must not run the CLI.
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (IS_CLI) {
@@ -736,6 +745,8 @@ if (IS_CLI) {
     writeAllSync(1, `${rootUsage()}\n`);
     process.exit(name ? 0 : 2);
   }
+  const detachCode = await maybeHandleDetach(name, rest);
+  if (typeof detachCode === 'number') process.exit(detachCode);
   let resolved;
   let controlPolicy;
   try {

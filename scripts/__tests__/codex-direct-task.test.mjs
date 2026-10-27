@@ -17,6 +17,7 @@ import { keepAliveScript } from '../lib/test-keepalive.mjs';
 import { CODEX_TASK_RULES, CODEX_REVIEW_TASK_RULES } from '../lib/build-policy.mjs';
 import {
   startDetachedJob, waitForJob, readJobRecord, writeJobRecord, cliExitCode, jobIsAlive, readPidStart, readPidState,
+  normalizeWaitAlias,
   PID_START_TIMEOUT_MS, JOB_RECORD_INIT_DEADLINE_MS,
   CODEX_CLI,
   DEFAULT_TIMEOUT_MS,
@@ -63,6 +64,35 @@ function flagValue(argv, flag) {
   const i = argv.indexOf(flag);
   return i === -1 ? undefined : argv[i + 1];
 }
+
+describe('normalizeWaitAlias — resumable long-op CLI', () => {
+  it.each([
+    ['--wait-for=resume-job', '--max-wait-ms=250'],
+    ['--max-wait-ms=250', '--wait-for=resume-job'],
+  ])('rewrites the wait alias %j without mutating its input', (...args) => {
+    const original = [...args];
+    expect(normalizeWaitAlias(args)).toEqual(['wait', '--job=resume-job', '--max-ms=250']);
+    expect(args).toEqual(original);
+  });
+
+  it.each([
+    [],
+    ['wait', '--job=resume-job', '--max-ms=250'],
+    ['--task=build the widget', '--detach'],
+    ['--max-wait-ms=250'],
+  ])('leaves arguments without --wait-for unchanged: %j', (...args) => {
+    expect(normalizeWaitAlias(args)).toEqual(args);
+  });
+
+  it('mentions --wait-for in --help', () => {
+    const child = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', '--help'], {
+      encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(0);
+    expect(child.stdout).toContain('--wait-for');
+  });
+});
 
 describe('defaultExecFn — real child-process output buffering', () => {
   it('returns the full stdout when output exceeds Node’s default 1 MiB buffer', () => {
@@ -2388,8 +2418,9 @@ describe('detached jobs', () => {
     const spawnFn = vi.fn(() => { queueMicrotask(() => child.emit('spawn')); return child; });
     const args = ['--task=literal $(no-shell)', detachFlag, '--dir=checkout'];
     const readStart = vi.fn(() => 'Fri Oct 23 20:10:13 2026');
+    const env = { WE_HEAVY_ADMISSION_HELD: '1', KEEP_ME: 'preserved' };
     const job = await startDetachedJob({ args, jobsDir, spawnFn, now: () => 0, random: () => 'random',
-      nodePath: 'node', scriptPath: 'scripts/codex-direct-task.mjs', env: {}, readStart });
+      nodePath: 'node', scriptPath: 'scripts/codex-direct-task.mjs', env, readStart });
     expect(readStart).toHaveBeenCalledWith(321);
     expect(job).toEqual({ id: '0-random', pid: 321, pidStart: 'Fri Oct 23 20:10:13 2026', status: 'running', startedAt: new Date(0).toISOString(),
       resultPath: join(jobsDir, '0-random.result.json'), exitCode: null, recordPath: join(jobsDir, '0-random.json') });
@@ -2397,7 +2428,8 @@ describe('detached jobs', () => {
     expect(readJobRecord(job.id, { jobsDir })).toEqual(record);
     expect(child.unref).toHaveBeenCalledOnce();
     expect(spawnFn).toHaveBeenCalledWith('node', ['scripts/codex-direct-task.mjs', args[0], args[2], '--json', '--no-stream', '--job=0-random'],
-      { detached: true, stdio: ['ignore', expect.any(Number), expect.any(Number)], env: { CODEX_JOBS_DIR: jobsDir } });
+      { detached: true, stdio: ['ignore', expect.any(Number), expect.any(Number)], env: { CODEX_JOBS_DIR: jobsDir, KEEP_ME: 'preserved' } });
+    expect(env).toEqual({ WE_HEAVY_ADMISSION_HELD: '1', KEEP_ME: 'preserved' });
     const spawnOptions = spawnFn.mock.calls[0][2];
     expect(spawnOptions.detached).toBe(true);
     expect(spawnOptions.stdio).not.toBe('pipe');
