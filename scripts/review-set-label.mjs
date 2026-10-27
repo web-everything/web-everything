@@ -157,6 +157,7 @@ import {
 import {
   buildVerdictRecord, buildLedgerEvent, appendVerdict, verdictForLabelTarget, verdictClears, APPROVAL_KINDS, EVENT_TYPES,
 } from './lib/verdict-ledger.mjs';
+import { approvalValid } from './lib/pr-state/holds/verdict.mjs';
 // #2979 — the NET diff vs current main, NOT `gh pr diff`'s three-dot output (see the fingerprint block in
 // `runReviewLabelCli` for why that distinction is the whole point). Imported from the CLI that owns it, the same
 // way `we:scripts/fetch-parked.mjs` already does — it is the single home of the #2450 net-diff basis.
@@ -1258,6 +1259,7 @@ export function runReviewLabelCli({
   const delegationFlag = argv.find((a) => a.startsWith('--delegation-json='));
   const approvalKind = approvalKindFlag ? approvalKindFlag.slice('--approval-kind='.length).trim() : 'clear-human';
   let approvalDelegation = null;
+  let validatedApproval = null;
   if ((approvalKindFlag || delegationFlag) && to !== 'clear-human') {
     fail('--approval-kind / --delegation-json apply only to --to=clear-human; nothing was changed');
   }
@@ -1273,9 +1275,12 @@ export function runReviewLabelCli({
     }
     // The shape check IS the schema: a placeholder repo/pr/time stand in for the real ones only to run `buildLedgerEvent`.
     try {
-      buildLedgerEvent({ type: EVENT_TYPES.APPROVAL, repo: 'o/n', pr: 1, at: new Date().toISOString(), source: 'review-set-label',
+      validatedApproval = buildLedgerEvent({ type: EVENT_TYPES.APPROVAL, repo: 'o/n', pr: 1, at: new Date().toISOString(), source: 'review-set-label',
         approval: approvalKind, delegation: approvalDelegation });
     } catch { fail('--delegation-json must be an object {by, scope, expires (ISO time)} and fit the approval kind; nothing was changed'); }
+    if (!approvalValid(validatedApproval, Date.now())) {
+      fail('--delegation-json must have a valid, future expires time; nothing was changed');
+    }
   }
   // A BOUNCE WITH NO FINDINGS IS UNACTIONABLE, so it is refused (#xd6moh1). `review:changes` tells the author
   // to fix something; the findings are the only place that says WHAT. Without them the PR is parked behind a
@@ -1977,67 +1982,78 @@ export function runReviewLabelCli({
   };
   recheckMissingRearm();
 
-  const ledgerVerdict = verdictForLabelTarget(to);
-  let clearingLedgerMiss = false;
-  try {
-    const appended = appendVerdict(buildVerdictRecord({
-      repo,
-      pr: Number(pr),
-      verdict: ledgerVerdict,
-      at: new Date().toISOString(),
-      // The operator's quoted `--reason` when there is one (the `clear-human` honesty tax), else the pure
-      // decider's own reason — so a row always says WHY, from whichever source actually had a reason.
-      reason: clearReason || decision.reason,
-      // THE CONTENT WITNESSES — recorded, never used as the key. See the header of `lib/verdict-ledger.mjs`
-      // for the two proven defects (#3046 gap divergence, `#3052` heading divergence, both open under
-      // `#3054`) that make this digest unfit to FIND a record by, and fine to STORE beside one.
-      headSha,
-      reviewedDiff: normalizeDiffFingerprint(reviewedDiff),
-      reviewedContribution: normalizeContributionFingerprint(reviewedDiff),
-      declaredActor: actor,
-      session: clearerId,
-      channel: normalizeChannel(channelArg),
-      independence: independence ? independence.status : null,
-      source: 'review-set-label',
-    }));
-    if (!appended.ok) {
-      process.stderr.write(`review-set-label: verdict-ledger append REFUSED (#3007 shadow) — ${appended.errors.join('; ')}\n`);
-      // F4 (`#verdict-ledger-pr-state-store` rule 4): a CLEARING verdict whose git write missed does NOT clear.
-      // Any refused append of a CLEARING verdict is fatal (the git miss, or the home write failing after git landed);
-      // a holding target still swaps (the hold must apply even when the ledger is down).
-      clearingLedgerMiss = verdictClears(ledgerVerdict);
-    } else if (to === 'clear-human') {
-      // #5649 — the audit row beside the clearing verdict. Only `clear-human` writes one: an ordinary `accepted` is a
-      // verdict, not an approval. A refused append blocks the swap (F4), so a clearance never lands without its row.
-      // The two appends are not atomic: a retry after a lost approval appends a second clearing verdict, which is
-      // harmless (clearing is idempotent).
-      let approval;
-      try {
-        approval = appendApproval(buildLedgerEvent({
-          type: EVENT_TYPES.APPROVAL,
-          repo,
-          pr: Number(pr),
-          at: appended.record?.at ?? new Date().toISOString(),
-          approval: approvalKind,
-          delegation: approvalDelegation,
-          declaredActor: actor,
-          session: clearerId,
-          channel: normalizeChannel(channelArg),
-          source: 'review-set-label',
-        }));
-      } catch (e) { approval = { ok: false, errors: [String((e && e.message) || e).split('\n')[0]] }; }
-      if (!approval?.ok) {
-        process.stderr.write(`review-set-label: approval-ledger append REFUSED (#5649) — ${(approval?.errors ?? []).join('; ')}\n`);
-        clearingLedgerMiss = true;
-      }
+  // Delegated clearance records are themselves clearance authority. Delay BOTH appends until the
+  // first write-time admission read succeeds, in either write order. Later checks still run normally.
+  let ledgerRecorded = false;
+  const recordLedger = () => {
+    if (ledgerRecorded) return;
+    if (validatedApproval && !approvalValid(validatedApproval, Date.now())) {
+      fail('--delegation-json expired before clearance; nothing was changed', 1);
     }
-  } catch (e) {
-    process.stderr.write(`review-set-label: verdict-ledger append failed (#3007 shadow, non-fatal) — ${String((e && e.message) || e).split('\n')[0]}\n`);
-  }
-  // Outside the try on purpose: a stubbed or real `process.exit` must never be swallowed by the non-fatal catch above.
-  if (clearingLedgerMiss) {
-    fail('verdict-ledger write refused for a clearing verdict (F4): the label is NOT swapped; retry once the ledger transport is reachable', 1);
-  }
+    const ledgerVerdict = verdictForLabelTarget(to);
+    let clearingLedgerMiss = false;
+    try {
+      const appended = appendVerdict(buildVerdictRecord({
+        repo,
+        pr: Number(pr),
+        verdict: ledgerVerdict,
+        at: new Date().toISOString(),
+        // The operator's quoted `--reason` when there is one (the `clear-human` honesty tax), else the pure
+        // decider's own reason — so a row always says WHY, from whichever source actually had a reason.
+        reason: clearReason || decision.reason,
+        // THE CONTENT WITNESSES — recorded, never used as the key. See the header of `lib/verdict-ledger.mjs`
+        // for the two proven defects (#3046 gap divergence, `#3052` heading divergence, both open under
+        // `#3054`) that make this digest unfit to FIND a record by, and fine to STORE beside one.
+        headSha,
+        reviewedDiff: normalizeDiffFingerprint(reviewedDiff),
+        reviewedContribution: normalizeContributionFingerprint(reviewedDiff),
+        declaredActor: actor,
+        session: clearerId,
+        channel: normalizeChannel(channelArg),
+        independence: independence ? independence.status : null,
+        source: 'review-set-label',
+      }));
+      if (!appended.ok) {
+        process.stderr.write(`review-set-label: verdict-ledger append REFUSED (#3007 shadow) — ${appended.errors.join('; ')}\n`);
+        // F4 (`#verdict-ledger-pr-state-store` rule 4): a CLEARING verdict whose git write missed does NOT clear.
+        // Any refused append of a CLEARING verdict is fatal (the git miss, or the home write failing after git landed);
+        // a holding target still swaps (the hold must apply even when the ledger is down).
+        clearingLedgerMiss = verdictClears(ledgerVerdict);
+      } else if (to === 'clear-human') {
+        // #5649 — the audit row beside the clearing verdict. Only `clear-human` writes one: an ordinary `accepted` is a
+        // verdict, not an approval. A refused append blocks the swap (F4), so a clearance never lands without its row.
+        // The two appends are not atomic: a retry after a lost approval appends a second clearing verdict, which is
+        // harmless (clearing is idempotent).
+        let approval;
+        try {
+          approval = appendApproval(buildLedgerEvent({
+            type: EVENT_TYPES.APPROVAL,
+            repo,
+            pr: Number(pr),
+            at: appended.record?.at ?? new Date().toISOString(),
+            approval: approvalKind,
+            delegation: approvalDelegation,
+            declaredActor: actor,
+            session: clearerId,
+            channel: normalizeChannel(channelArg),
+            source: 'review-set-label',
+          }));
+        } catch (e) { approval = { ok: false, errors: [String((e && e.message) || e).split('\n')[0]] }; }
+        if (!approval?.ok) {
+          process.stderr.write(`review-set-label: approval-ledger append REFUSED (#5649) — ${(approval?.errors ?? []).join('; ')}\n`);
+          clearingLedgerMiss = true;
+        }
+      }
+    } catch (e) {
+      process.stderr.write(`review-set-label: verdict-ledger append failed (#3007 shadow, non-fatal) — ${String((e && e.message) || e).split('\n')[0]}\n`);
+    }
+    // Outside the try on purpose: a stubbed or real `process.exit` must never be swallowed by the non-fatal catch above.
+    if (clearingLedgerMiss) {
+      fail('verdict-ledger write refused for a clearing verdict (F4): the label is NOT swapped; retry once the ledger transport is reachable', 1);
+    }
+    ledgerRecorded = true;
+  };
+  if (!guardedClearHuman) recordLedger();
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — THE SWAP: add the verdict label, remove the stale ones
   // (argv array, no shell). Intersect the decision's removals with the labels the PR ACTUALLY carries so
@@ -2074,6 +2090,7 @@ export function runReviewLabelCli({
       }
     }
     try {
+      recordLedger();
       provider.setLabels(repo, pr, { add: decision.addLabel, remove: removals });
     } catch (e) {
       fail(ghErr(e, 'gh pr edit failed'), 1);
@@ -2108,6 +2125,7 @@ export function runReviewLabelCli({
           assertMandatoryReferralsCleared(fresh, { repo, pr, ...referralOptions });
           assertGuardedClearHumanEligible(fresh.labels);
         }
+        recordLedger();
         provider.postComment(repo, pr, commentBody);
         return;
       } catch (e) { commentFailure = ghErr(e, 'gh pr comment failed'); }
