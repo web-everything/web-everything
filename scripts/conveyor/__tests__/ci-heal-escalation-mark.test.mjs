@@ -371,12 +371,14 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
     ];
     expect(refusal({ pr: { ...fixture, statusCheckRollup }, requiredChecks: [name, 'smoke'] })).toContain(name);
   });
-  it('recording cancellation allowance does not change verdict-reader refusal', async () => {
-    const { unsettledRequiredChecks } = await import('../ci-heal-verdict-recheck.mjs');
+  it('recording and verdict readers agree on cancelled smoke without declaring CI green', async () => {
+    const { unsettledRequiredChecks, contradictingChecks, ciGreenForEscalation } = await import('../ci-heal-verdict-recheck.mjs');
     const statusCheckRollup = [{ name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED' }];
     const pull = { ...fixture, statusCheckRollup };
     expect(refusal({ pr: pull, requiredChecks: ['smoke'] })).toBeNull();
-    expect(unsettledRequiredChecks({ rollup: statusCheckRollup, requiredChecks: ['smoke'] }).red).toEqual(['smoke']);
+    expect(unsettledRequiredChecks({ rollup: statusCheckRollup, requiredChecks: ['smoke'] }).red).toEqual([]);
+    expect(contradictingChecks({ escalation, headSha: head, rollup: statusCheckRollup, requiredChecks: ['smoke'] })).toEqual([]);
+    expect(ciGreenForEscalation({ rollup: statusCheckRollup, requiredChecks: ['smoke'] })).toBe(false);
     expect(pull.statusCheckRollup[0].conclusion).toBe('CANCELLED');
   });
   it('a newer real failure still refuses after an older cancellation', () => {
@@ -385,6 +387,13 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
       { name: 'smoke', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-26T11:00:00Z' },
     ];
     expect(refusal({ pr: { ...fixture, statusCheckRollup }, requiredChecks: ['smoke'] })).toContain('red: smoke');
+    expect(planVerdictVoid({ ...planOptions(), pr: { ...fixture, statusCheckRollup },
+      readRequiredChecks: () => ['smoke'] })).toMatchObject({ body: expect.stringContaining('red: smoke') });
+  });
+  it.each(['test', 'standards', 'daemon-soak'])('cancelled required %s still voids a not-a-ci-break verdict', name => {
+    const pull = { ...fixture, statusCheckRollup: [{ name, status: 'COMPLETED', conclusion: 'CANCELLED' }] };
+    expect(planVerdictVoid({ ...planOptions(), pr: pull, readRequiredChecks: () => [name] }))
+      .toMatchObject({ body: expect.stringContaining(`red: ${name}`) });
   });
   it('does not judge a different head or unknown required set', () => {
     expect(refusal({ headSha: 'abcdef0123456789' })).toBeNull();

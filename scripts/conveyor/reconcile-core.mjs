@@ -2871,8 +2871,9 @@ export function planReconcile({
     // At the review-fix cap an unused operator-directed round still belongs to the existing fix path below.
     // Routing it through CI healing would refuse at the cap before that path can carry the allowance.
     // Ignore cancellations when identifying a review-gate-only failure; retain CI repair if review cannot accept them.
-    // Inspect all visible checks so a non-required failure still keeps its repair owner.
+    // Optional failures are reported, but only required failures create CI repair ownership.
     const reviewRollup = collapseRollupToLatestPerName(pr?.statusCheckRollup);
+    const reviewFailures = splitFailingChecks(reviewRollup, requiredChecks);
     const visibleRealRed = reviewRollup
       .filter(row => FAILED_CHECK_CONCLUSIONS.filter(c => c !== 'CANCELLED')
         .includes(String(row?.conclusion || row?.state || '').toUpperCase()))
@@ -2882,10 +2883,11 @@ export function planReconcile({
       // Required review gates keep the existing review-ci / review-hold-red refusals.
       && !requiredChecks?.includes('review-gate')
       // A non-required merge-gate is reported only; required failures still route via check.state below.
-      && visibleRealRed.includes('review-gate') && visibleRealRed.some(name => name !== 'review-gate' && name !== 'merge-gate');
+      && visibleRealRed.includes('review-gate') && visibleRealRed.some(name => name !== 'review-gate'
+        && reviewFailures.required.includes(name));
     const reviewGateOnlyRed = withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))
       && !requiredChecks?.includes('review-gate')
-      && visibleRealRed.length > 0 && visibleRealRed.every(name => name === 'review-gate');
+      && visibleRealRed.includes('review-gate') && !reviewHoldHasRealRed;
     const reviewGateHasChanges = withPhase.labels.some(l => ['review:changes', ADVISORY_LABELS.CHANGES].includes(l));
     // Leave operator-directed repairs to the ruling branches below, including their caps and ladder.
     const reviewGateRulingOwed = reviewGateOnlyRed && (pr?.ignoredRulings?.matches?.length > 0
@@ -2902,18 +2904,6 @@ export function planReconcile({
     // A rejected cancellation or changes label keeps CI ownership; operator rulings keep their repair ladder.
     const ciRepairOwed = (!reviewGateOnlyRed || (!reviewGateRulingOwed && (reviewGateHasChanges || cancelledReviewNeedsRepair))) && (phase === 'ci-red' || (phase === 'needs-human' && (check.state === 'red' || reviewHoldHasRealRed))
       || (bouncedRealRed && !(sendBackRound && roundAttempts() >= effectiveRoundCap)));
-    if (reviewGateOnlyRed && !reviewGateHasChanges && !reviewGateRulingOwed
-        && !cancelledReviewNeedsRepair
-        && (phase === 'ci-red' || (phase === 'needs-human' && (cancelledReviewWork || check.state !== 'green')))) {
-      const dispatchCount = dispatch.length;
-      dispatchReviewRow({ pr: reviewPr, requiredChecks, withPhase, base, attempts: roundAttempts(),
-        roundCap: effectiveRoundCap, now, refuse, refuseCapExhausted, dispatch });
-      // A refused review does not own a missing required job: let the stale-base repair below try.
-      // Successful dispatches and all other review holds retain their existing priority.
-      const reviewRefusal = refusals.at(-1);
-      if (dispatch.length !== dispatchCount || reviewRefusal?.kind !== 'review-ci'
-          || !reviewRefusal.ci?.affected?.some(row => row.reason === 'missing')) continue;
-    }
     if (!reviewHoldHasRealRed && !(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
         && reviewCi.affected.every(row => row.name === 'review-gate')) {
       refuse('review-ci', { ...withPhase, ci: reviewCi, why: 'required review-gate must succeed before review; resolve the review-dependent required-check configuration' });
@@ -2934,7 +2924,7 @@ export function planReconcile({
     // guard / timeout-evidence refusal then held with nobody working it). Authenticated by comment author in
     // {@link operatorFixBudget}, never by text; one-shot; counted against the round grants; the loop guard stays
     // for automatic ci-heals.
-    const sendBack = (ciRepairOwed || (phase === 'bounced' && !withPhase.labels.includes(CONFLICT_LABEL)))
+    const sendBack = (ciRepairOwed || reviewGateOnlyRed || (phase === 'bounced' && !withPhase.labels.includes(CONFLICT_LABEL)))
       ? operatorSendBackRearm(pr, operatorBudget) : null;
     if (sendBack) {
       const attempts = roundAttempts();
@@ -3474,6 +3464,23 @@ export function planReconcile({
           + ' — the fix that changes the head is owed, not another review of the same head',
       });
       continue;
+    }
+
+    // Review-owned red is considered only after operator send-backs, CI repair, and ruled repairs.
+    if (!ciRepairOwed && reviewGateOnlyRed && !reviewGateHasChanges && !reviewGateRulingOwed
+        && !cancelledReviewNeedsRepair && ['ci-red', 'needs-human', 'needs-review'].includes(phase)) {
+      const dispatchCount = dispatch.length;
+      dispatchReviewRow({ pr: reviewPr, requiredChecks, withPhase, base, attempts: roundAttempts(),
+        roundCap: effectiveRoundCap, now, refuse, refuseCapExhausted, dispatch,
+        extra: { nonRequiredRed: reviewFailures.nonRequired } });
+      for (const row of dispatch.slice(dispatchCount)) {
+        if (reviewFailures.nonRequired.length) row.why += ` (not required, reported only: ${reviewFailures.nonRequired.join(', ')})`;
+      }
+      // A refused review does not own a missing required job: let the stale-base repair below try.
+      // Successful dispatches and all other review holds retain their existing priority.
+      const reviewRefusal = refusals.at(-1);
+      if (dispatch.length !== dispatchCount || reviewRefusal?.kind !== 'review-ci'
+          || !reviewRefusal.ci?.affected?.some(row => row.reason === 'missing')) continue;
     }
 
     // ── ADVISORY-FIX (#xkmu3gv) — its OWN branch, ahead of the generic `OWED` table, the same way `ci-red` sits

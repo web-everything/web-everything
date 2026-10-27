@@ -2,6 +2,7 @@
 import { describe, it, expect } from 'vitest';
 import { planReconcile } from '../reconcile-core.mjs';
 import { buildCiHealEscalationComment, notCiBreakRecordRefusal } from '../ci-heal-escalation-mark.mjs';
+import { planVerdictVoid } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
 
 const HEAD = 'a'.repeat(40);
 const check = (name, conclusion) => ({ name, status: 'COMPLETED', conclusion });
@@ -91,10 +92,32 @@ describe('review-gate-only red belongs to review', () => {
     expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
   });
 
-  it('a failed non-required check alongside review-gate retains ci-heal ownership and dispatches no review', () => {
-    const result = plan(pr({ statusCheckRollup: [...checks, check('optional-ci', 'FAILURE')] }));
-    expect(result.dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-heal' }));
-    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+  it.each(['review:human', 'review:pending'])('%s reports optional red and dispatches review before and after stand-down', label => {
+    const pull = pr({ labels: [{ name: label }], statusCheckRollup: [...checks, check('optional-ci', 'FAILURE')] });
+    for (let tick = 0; tick < 2; tick++) {
+      const result = plan(pull);
+      expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'review',
+        nonRequiredRed: expect.arrayContaining(['optional-ci']), why: expect.stringContaining('optional-ci') })]);
+      pull.comments.push({ author: { login: 'web-everything' },
+        body: buildCiHealEscalationComment({ headSha: HEAD, outcome: 'not-a-ci-break' }) });
+    }
+  });
+
+  it.each([false, true])('authenticated send-back owns review-hold red with optional failure=%s', optional => {
+    const pull = pr({ statusCheckRollup: [...checks, ...(optional ? [check('optional-ci', 'FAILURE')] : [])],
+      comments: [{ id: 'op-send-back', createdAt: '2026-10-26T11:00:00Z', author: { login: 'chalbert' },
+        body: '🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nMUST FIX: rename the export.' }] });
+    expect(plan(pull).dispatch).toEqual([expect.objectContaining({ kind: 'fix', mode: 'operator-send-back',
+      operatorSendBack: expect.objectContaining({ verdictId: 'op-send-back' }) })]);
+  });
+
+  it.each(['untrusted', 'spent'])('%s send-back cannot claim the review owner', variant => {
+    const comments = [{ id: 'op-send-back', createdAt: '2026-10-26T11:00:00Z',
+      author: { login: variant === 'untrusted' ? 'rando' : 'chalbert' },
+      body: '🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nMUST FIX: rename the export.' }];
+    if (variant === 'spent') comments.push({ author: { login: 'web-everything' },
+      body: '🔧 conveyor fix — re-armed for re-review' });
+    expect(plan(pr({ comments })).dispatch).toEqual([expect.objectContaining({ kind: 'review' })]);
   });
 
   it.each([false, true].flatMap(requiredGate => ['none', 'test', 'optional-ci'].map(realRed => [requiredGate, realRed])))(
@@ -107,7 +130,7 @@ describe('review-gate-only red belongs to review', () => {
         expect(result.dispatch).toEqual([]);
         expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'review-ci' }));
       } else {
-        expect(result.dispatch).toEqual([expect.objectContaining({ kind: realRed === 'none' ? 'review' : 'ci-heal' })]);
+        expect(result.dispatch).toEqual([expect.objectContaining({ kind: realRed === 'test' ? 'ci-heal' : 'review' })]);
       }
     });
 
@@ -164,7 +187,7 @@ describe('review-gate-only red belongs to review', () => {
     if (requiredGate) {
       expect(result.dispatch).toEqual([]);
       expect(result.refusals.map(row => row.kind)).toEqual(['review-hold-red']);
-    } else expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal' })]);
+    } else expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'review' })]);
   });
 
   it('missing check evidence cannot dispatch review', () => {
@@ -176,7 +199,10 @@ describe('review-gate-only red belongs to review', () => {
 
   it('recorded not-a-ci-break stand-down prevents another ci-heal on the same head', () => {
     // Without a review label the existing escalation path, rather than the review-hold shortcut, owns this head.
-    const pull = pr({ labels: [], statusCheckRollup: [checks[0], check('smoke', 'CANCELLED'), checks[2]] });
+    const pull = pr({ labels: [], statusCheckRollup: [checks[0], check('smoke', 'CANCELLED'), checks[2]],
+      timeoutRetry: { eligible: true, infraCancelled: true, pr: 5925, head: HEAD, cap: 6,
+        jobs: [{ run: 10, job: 20, attempt: 1 }] },
+      timeoutRetryBudget: { confirmed: 6, rejected: 0, pending: false } });
     expect(plan(pull).dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-heal' }));
     expect(notCiBreakRecordRefusal({ headSha: HEAD, pr: pull, requiredChecks: ['test', 'smoke'] })).toBeNull();
     pull.comments.push({ author: { login: 'web-everything' },
@@ -184,5 +210,11 @@ describe('review-gate-only red belongs to review', () => {
     const result = plan(pull);
     expect(result.dispatch.some(row => row.kind === 'ci-heal')).toBe(false);
     expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'ci-heal-escalated', headSha: HEAD }));
+    const voidRow = planVerdictVoid({ note: { kind: 'ci-heal-escalated', outcome: 'not-a-ci-break',
+      headSha: HEAD, prNumber: pull.number }, pr: pull, repo: 'web-everything/web-everything',
+      verdictSettings: { recheckNotCiBreak: true }, readRequiredChecks: () => ['test', 'smoke'] });
+    expect(voidRow).toBeNull();
+    if (voidRow) pull.comments.push({ author: { login: 'web-everything' }, body: voidRow.body });
+    expect(plan(pull).dispatch.some(row => row.kind === 'ci-heal')).toBe(false);
   });
 });

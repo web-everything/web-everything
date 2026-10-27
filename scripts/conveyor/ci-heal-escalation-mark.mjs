@@ -57,7 +57,7 @@ import { collectCiAuthDiagnosis, renderCiAuthDiagnosis } from './ci-auth-diagnos
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { isBudgetRefusal, postPrComment, recordOwedWrite, resolveOwedRepo } from './ci-heal-owed.mjs';
-import { resolveCiHealVerdictSettings, unsettledRequiredChecks } from './ci-heal-verdict-recheck.mjs';
+import { isCancelledSmoke, resolveCiHealVerdictSettings, unsettledRequiredChecks } from './ci-heal-verdict-recheck.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { DEFAULT_INFRA_CANCELLED_MAX_RERUNS } from './infra-cancelled.mjs';
 
@@ -339,11 +339,6 @@ export function needsHumanVoidState(comments, headSha) {
   return { escalationIndex, voided: voids.some(v => v.index > escalationIndex), voidCount: voids.length };
 }
 
-function isCancelledSmoke(row) {
-  return (row?.name ?? row?.context) === 'smoke'
-    && String(row?.status).toLowerCase() === 'completed' && String(row?.conclusion).toLowerCase() === 'cancelled';
-}
-
 /**
  * Refuse a premature not-a-ci-break record on the current head. Review-gate is the hold this verdict explains.
  * Cancelled smoke is settled only after any eligible infrastructure retry (including an in-flight request).
@@ -367,10 +362,8 @@ export function notCiBreakRecordRefusal({ headSha, pr, requiredChecks }) {
       return 'Cancelled smoke still has an infrastructure retry pending or owed; resolve the retry before recording not-a-ci-break.';
     }
   }
-  // Only smoke may be cancelled (#5925); every other required check must supply its result.
-  // Local to recording this stand-down: other verdict readers retain their cancellation policy.
-  const rollup = latest.map(row => isCancelledSmoke(row) ? { ...row, conclusion: 'success' } : row);
-  const u = unsettledRequiredChecks({ rollup, requiredChecks });
+  // Share the cancelled-smoke exception with the verdict reader, after preserving retry ownership above.
+  const u = unsettledRequiredChecks({ rollup: latest, requiredChecks });
   const parts = [];
   if (u.pending.length) parts.push(`still running: ${u.pending.join(', ')}`);
   if (u.missing.length) parts.push(`not started: ${u.missing.join(', ')}`);

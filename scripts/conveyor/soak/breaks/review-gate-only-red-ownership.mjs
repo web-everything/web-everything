@@ -10,21 +10,37 @@ export default {
   card: 'PR #5925 incident and PR #5972 review findings, 2026-10-26',
   fixedBy: { sha: 'HEAD', where: 'lane/review-gate-only-red', paths: [
     'scripts/conveyor/reconcile-core.mjs', 'scripts/conveyor/ci-heal-escalation-mark.mjs',
+    'scripts/conveyor/ci-heal-verdict-recheck.mjs',
   ] },
   fixPresent(root) {
-    return readFileSync(join(root, 'scripts/conveyor/reconcile-core.mjs'), 'utf8').includes('reviewGateRulingOwed');
+    return readFileSync(join(root, 'scripts/conveyor/reconcile-core.mjs'), 'utf8').includes('reviewFailures.required')
+      && readFileSync(join(root, 'scripts/conveyor/ci-heal-verdict-recheck.mjs'), 'utf8').includes('notCiBreakCheckStates');
   },
   async run({ sourceRoot = ROOT, log } = {}) {
     const { planReconcile } = await import(pathToFileURL(join(sourceRoot, 'scripts/conveyor/reconcile-core.mjs')).href);
-    const { notCiBreakRecordRefusal } = await import(pathToFileURL(join(sourceRoot, 'scripts/conveyor/ci-heal-escalation-mark.mjs')).href);
+    const { notCiBreakRecordRefusal, buildCiHealEscalationComment } = await import(pathToFileURL(join(sourceRoot, 'scripts/conveyor/ci-heal-escalation-mark.mjs')).href);
+    const { planVerdictVoid } = await import(pathToFileURL(join(sourceRoot, 'skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs')).href);
     const head = 'a'.repeat(40);
     const check = (name, conclusion = 'SUCCESS') => ({ name, status: 'COMPLETED', conclusion });
     const rollup = [check('standards'), check('test-shard (1)'), check('test'), check('smoke', 'CANCELLED'), check('review-gate', 'FAILURE')];
     const pull = { number: 5925, state: 'OPEN', isDraft: false, headRefName: 'lane/review-gate-only',
       headRefOid: head, mergeStateStatus: 'CLEAN', comments: [], labels: [{ name: 'review:human' }], statusCheckRollup: rollup };
     const blocked = [{ key: 'blocked', finding: { file: 'example.mjs' } }];
+    const standDown = { author: { login: 'web-everything' },
+      body: buildCiHealEscalationComment({ headSha: head, outcome: 'not-a-ci-break' }) };
     const variants = [
       { name: 'cancelled smoke', expected: 'review' },
+      { name: 'optional red before and after stand-down', expected: 'review', recordAfterTick: true,
+        over: { statusCheckRollup: rollup.map(row => row.name === 'smoke' ? check('smoke') : row)
+          .concat(check('optional-ci', 'FAILURE')) } },
+      { name: 'operator send-back before review', expected: 'fix', mode: 'operator-send-back',
+        over: { comments: [{ id: 'op-send-back', createdAt: '2026-10-26T11:00:00Z', author: { login: 'chalbert' },
+          body: '🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nMUST FIX: rename the export.' }] } },
+      { name: 'spent smoke retry keeps recorded verdict', refusal: 'ci-heal-escalated', checkVoid: true,
+        over: { labels: [], comments: [standDown],
+          timeoutRetry: { eligible: true, infraCancelled: true, head, pr: pull.number, cap: 6,
+            jobs: [{ run: 10, job: 20, attempt: 1 }] },
+          timeoutRetryBudget: { confirmed: 6, rejected: 0, pending: false } } },
       { name: 'missing smoke on old base', expected: 'fix', mode: 'stale-base-rebase',
         reviewTiming: { startAfter: 'ci-green' },
         over: { baseRefName: 'main', statusCheckRollup: rollup.filter(row => row.name !== 'smoke') } },
@@ -55,7 +71,17 @@ export default {
     for (let tick = 0; tick < 3; tick++) {
       for (const variant of variants) {
         const pr = { ...pull, ...variant.over };
+        if (variant.recordAfterTick && tick > 0) pr.comments = [standDown];
         const requiredChecks = variant.requiredChecks ?? ['test', 'smoke'];
+        if (variant.checkVoid) {
+          const voidRow = planVerdictVoid({ note: { kind: 'ci-heal-escalated', outcome: 'not-a-ci-break',
+            headSha: head, prNumber: pull.number }, pr, repo: 'review-gate-fixture/example',
+            verdictSettings: { recheckNotCiBreak: true }, readRequiredChecks: () => requiredChecks });
+          if (voidRow) {
+            violations.push(`tick ${tick} ${variant.name}: permitted cancelled smoke verdict was voided`);
+            pr.comments = [...pr.comments, { author: { login: 'web-everything' }, body: voidRow.body }];
+          }
+        }
         // Exercise the recording guard before the planner: accepting this stand-down would suppress the retry.
         if (variant.reviewTiming && pr.timeoutRetry?.infraCancelled
             && pr.statusCheckRollup.some(row => row.name === 'smoke' && row.conclusion === 'CANCELLED')
@@ -66,6 +92,10 @@ export default {
           ...(variant.reviewTiming ? { reviewTiming: variant.reviewTiming } : {}),
           now: Date.parse('2026-10-26T12:00:00Z') + tick * 60000 });
         const kinds = plan.dispatch.map(row => row.kind);
+        if (variant.recordAfterTick && (!plan.dispatch[0]?.nonRequiredRed?.includes('optional-ci')
+            || !plan.dispatch[0]?.why?.includes('optional-ci'))) {
+          violations.push(`tick ${tick} ${variant.name}: optional failure was not reported`);
+        }
         const safe = variant.expected ? kinds.length === 1 && kinds[0] === variant.expected
           && (!variant.mode || plan.dispatch[0].mode === variant.mode)
           : kinds.length === 0 && plan.refusals.some(row => row.kind === variant.refusal);
