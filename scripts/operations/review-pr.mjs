@@ -247,10 +247,10 @@ import {
 import { decideSetLabel, presentRemoveLabels } from '../review-set-label.mjs';
 // #3335 — THE CALLER'S OWN DERIVATION, IMPORTED. `buildShapePlan` is the pure function behind
 // `review-core-cli.mjs shape`, i.e. the exact thing the caller ran to produce the `careLevel` it declares. The
-// check below re-runs THAT function over the NET file list, so a disagreement can only ever mean the two file
+// check below re-runs the shared pure function over the NET file list, so a disagreement can only ever mean the two file
 // lists differ — never that the caller and the operation hold two different derivations. `CARE_LEVEL_ORDER` is
 // the band ordering the comparison is made on; both are pure, and neither is restated here.
-import { buildShapePlan } from '../review-core-cli.mjs';
+import { buildShapePlan } from '../lib/review-shape.mjs';
 import {
   CARE_LEVELS, CARE_LEVEL_ORDER, REVIEW_PR_CHANNEL, REVIEW_LABELS, hasReviewLabel,
 } from '../lib/review-escalation.mjs';

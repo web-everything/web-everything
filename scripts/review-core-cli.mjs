@@ -83,19 +83,16 @@ import {
   panelRigorFromReasons,
   editorPolicyFromReasons,
   deriveJurorInvite,
-  // #3335 — read to say whether `review-pr --lens=` can actually SEAT the lens #3309's router picked. Its
-  // `input.lens` enum is `[...PANEL_LENSES]`, and the decision-prose lens set is not in it.
+  // The shape CLI names the supported lenses when the routed seat is unreachable.
   PANEL_LENSES,
 } from './lib/review-core.mjs';
 import { renderPanelComment, deriveResolutionBasis } from './lib/review-render.mjs';
-// #3335 — the two pure derivations the `shape` subcommand COMPOSES and never restates. `scoreEscalation` turns a
-// file list into `{reasons, signals, humanRequired, careLevel}`; `routeReviewShape` (#3309) turns that same list
-// plus the care level into the lens VOCABULARY and the `panelRigorForCareLevel` dial. Neither is re-implemented
-// here — see `buildShapePlan`'s docblock for the scope carve between #3309 and this item.
-import { CARE_LEVELS, scoreEscalation } from './lib/review-escalation.mjs';
-import { routeReviewShape } from './lib/decision-routing.mjs';
-import { reviewNeedFor } from './lib/review-need.mjs';
+import { buildShapePlan } from './lib/review-shape.mjs';
+export { buildShapePlan } from './lib/review-shape.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
+import { resolveDirectionAwareMode } from './lib/direction-aware-human.mjs';
+import { loadReadOnlyOps } from './lib/read-only-ops.mjs';
+import { appendDaemonEvent } from './lib/daemon-events.mjs';
 
 // ── tiny flags parser (matches push-if-green.mjs) ─────────────────────────────────────────────────────
 /**
@@ -483,79 +480,19 @@ function runRigor(flags, asJson) {
 }
 
 /**
- * #3335 — THE SHAPE A TOUCH-SET EARNS. PURE. The derivation a review CALLER runs BEFORE it composes the run
- * command, because the caller is the only actor that holds the touch-set at that moment: `review-pr`'s `read` is
- * step 1 and is what computes `netChangedFiles`, and `--resume` refuses input flags on purpose, so the shape
- * cannot be revised once the run has started.
- *
- * IT COMPOSES; IT DOES NOT RE-TAXONOMIZE. Two calls, no third opinion:
- *   • `scoreEscalation({changedFiles})` (`we:scripts/lib/review-escalation.mjs`) → `reasons` / `humanRequired`;
- *   • `routeReviewShape({changedFiles, escalation})` (`we:scripts/lib/decision-routing.mjs`) → the care level,
- *     `panelRigorForCareLevel`'s `rounds` / `jurorsPerLens`, the lens set and the mandatory floor.
- * The care level this returns is `scoreEscalation`'s own, so it agrees with `rigor --reasons=<these reasons>` by
- * construction rather than by coincidence — `careLevelFromReasons` is the reasons→care bridge for a consumer
- * that holds only the decorated strings, and both roads end at `deriveCareLevel`. A named test drives both.
- *
- * WHAT IS #3309's AND NOT THIS ITEM'S. `routeReviewShape` / `classifyReviewSubject` decide WHICH SUBJECT is under
- * review (code vs prose) and therefore which lens VOCABULARY the seats draw from; they deliberately do not dial
- * rigor. That axis is REUSED here, not re-derived — `subject`, `earnedLenses` and `mandatoryFloor` are its output
- * passed through. This item owns the caller-side half: reaching that derivation from a file list, declaring the
- * result to the operation, and letting `read` refuse a declaration the PR contradicts.
- *
- * `--lens` SUBSTITUTES, IT DOES NOT ADD, which is why `seatLens` is reported separately from `earnedLenses`.
- * `review-pr` has exactly ONE caller-chosen seat (`judge`); `--lens` replaces what that seat judges under, and
- * pointing it at an advisory lens DISPLACES the mandatory `correctness` seat rather than adding a check. So the
- * honest reading for a one-seat operation is TWO BANDS, not four:
- *   • `careLevel === 'none'` — the dial asks for no panel at all, so the floor lens is proportionate.
- *   • anything escalated — one seat cannot deliver what the dial asks, so the seat goes to a MANDATORY lens
- *     (`seatLens`) and the SHORTFALL (`earnedLenses` minus what actually sat) is recorded rather than implied away.
- *
- * @param {{changedFiles?: string[], careLevel?: string}} o - `changedFiles` is the PR's touch-set, from
- *   `gh pr view <pr> --json files --jq '[.files[].path]'`; `careLevel` overrides the derived band and is ignored
- *   unless it names a real one (`routeReviewShape`'s own rule).
- * @returns {{careLevel: string, reasons: string[], humanRequired: boolean, earnedLenses: string[],
- *   mandatoryFloor: string[], subject: string, rounds: number, jurorsPerLens: number, seatLens: string,
- *   escalated: boolean, changedFiles: string[], trail: string[]}}
- */
-export function buildShapePlan({ changedFiles = [], careLevel, commits = null } = {}) {
-  const files = (Array.isArray(changedFiles) ? changedFiles : [])
-    .filter((f) => typeof f === 'string' && f.trim().length > 0)
-    .map((f) => f.trim());
-  const escalation = scoreEscalation({ changedFiles: files });
-  // The score is handed ACROSS so the router does not pay for a second `scoreEscalation` over the same list —
-  // and, more importantly, so the reasons printed below and the subject routed here are provably one score.
-  const plan = routeReviewShape({ changedFiles: files, escalation, careLevel });
-  return {
-    careLevel: plan.careLevel,
-    reasons: [...escalation.reasons],
-    humanRequired: escalation.humanRequired === true,
-    earnedLenses: [...plan.lenses],
-    mandatoryFloor: [...plan.mandatoryLenses],
-    subject: plan.subject,
-    rounds: plan.rounds,
-    jurorsPerLens: plan.jurorsPerLens,
-    seatLens: plan.seatLens,
-    // STATED, NOT ASSUMED: `review-pr`'s `input.lens` enum is `[...PANEL_LENSES]`, and #3309's decision-prose
-    // lens set (`root-cause` / `completeness`) is not in it. So on the prose route the seat lens this reports is
-    // the RIGHT one and is not reachable from the command line today — wiring that vocabulary into the operation
-    // is #3309's follow-on, not this item, and a caller must be told rather than handed a flag that is refused.
-    seatLensReachable: PANEL_LENSES.includes(plan.seatLens),
-    escalated: plan.careLevel !== CARE_LEVELS.NONE,
-    changedFiles: files,
-    trail: [...plan.trail],
-    need: reviewNeedFor({ changedFiles, careLevel, commits }),
-  };
-}
-
-/**
  * #3335 — the `shape` subcommand: given a PR's changed-file list, print the shape its TOUCH-SET earns. The
  * caller runs this BEFORE it composes `run.mjs review-pr …` and passes the derived `careLevel` back to the
  * operation as `--careLevel=`, where `read` re-scores the NET file list and refuses a declaration the PR
  * contradicts. Input is `--files=a,b,c`, or a JSON array / `{changedFiles}` / `{files}` on --file/stdin, so
  * `gh pr view <pr> --json files --jq '[.files[].path]'` pipes in unmodified.
  * Optional `--commits-file` reads a JSON array or `gh pr view --json commits` output for author routing.
+ * R131: `--diff-file` supplies unified hunks; `--ops-root` supplies PR-head dependency bytes for comparison.
+ * Missing evidence preserves the hold. `--pr` records differing shadow proposals best-effort.
  */
-function runShape(flags, asJson) {
+export async function runShape(flags, asJson, {
+  readFile = readFileSync, loadOps = loadReadOnlyOps, resolveMode = resolveDirectionAwareMode,
+  appendEvent = appendDaemonEvent, write = writeAllSync, exit = code => process.exit(code),
+} = {}) {
   let files = [];
   if (typeof flags.files === 'string') files = flags.files.split(',').map((s) => s.trim()).filter(Boolean);
   else {
@@ -592,17 +529,31 @@ function runShape(flags, asJson) {
   }
   let plan;
   try {
-    plan = buildShapePlan({ changedFiles: files, commits, careLevel: typeof flags.careLevel === 'string' ? flags.careLevel : undefined });
+    let diffHunks = null;
+    try { if (typeof flags['diff-file'] === 'string') diffHunks = readFile(flags['diff-file'], 'utf8'); } catch { /* unavailable hunks */ }
+    const readOnlyOps = await loadOps(flags['ops-root']);
+    plan = buildShapePlan({ changedFiles: files, commits, diffHunks, readOnlyOps,
+      careLevel: typeof flags.careLevel === 'string' ? flags.careLevel : undefined });
+    if (resolveMode() === 'live') plan.humanRequired = plan.humanRequiredProposed;
   } catch (e) {
     return fail(String(e && e.message || e), 1);
   }
 
-  if (asJson) {
-    writeAllSync(1, `${JSON.stringify(plan)}\n`);
-    return process.exit(0);
+  if (plan.humanRequired !== plan.humanRequiredProposed && /^\d+$/.test(String(flags.pr ?? ''))) {
+    const pr = Number(flags.pr);
+    let timer;
+    try { await Promise.race([Promise.resolve().then(() => appendEvent({ kind: 'shape-shadow-diff', pr, daemon: 'review-core-cli',
+      detail: { pr, current: plan.humanRequired, proposed: plan.humanRequiredProposed, reason: plan.humanRequiredProposedReason } })),
+      new Promise(resolve => { timer = setTimeout(resolve, 2000); })]);
+    } catch { /* best effort */ } finally { clearTimeout(timer); }
   }
-  writeAllSync(1,
+  if (asJson) {
+    write(1, `${JSON.stringify(plan)}\n`);
+    return exit(0);
+  }
+  write(1,
     `care-level: ${plan.careLevel}   humanRequired: ${plan.humanRequired}   subject: ${plan.subject}\n`
+    + `humanRequiredProposed: ${plan.humanRequiredProposed} (${plan.humanRequiredProposedReason})\n`
     + `earned: ${plan.earnedLenses.length} lens(es) (${plan.earnedLenses.join(', ') || '(none)'}) `
     + `× ${plan.jurorsPerLens} juror(s)/lens × ${plan.rounds} round(s)\n`
     + `tier: ${plan.need.tier} (${plan.need.tierReasons.join('; ')})  tools: ${Object.entries(plan.need.needsTools).map(([lens, tools]) => `${lens}=${tools}`).join(',')}  cross-provider seat: ${plan.need.crossProvider.required ?? 'none'}\n`
@@ -619,7 +570,7 @@ function runShape(flags, asJson) {
         + '  does not seat is a SHORTFALL the verdict must state, not imply away.\n'
       : '  care `none` — the dial asks for no panel at all, so the floor lens is proportionate.\n'),
   );
-  return process.exit(0);
+  return exit(0);
 }
 
 /**
