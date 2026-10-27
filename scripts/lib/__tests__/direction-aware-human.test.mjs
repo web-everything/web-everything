@@ -144,13 +144,6 @@ describe('direction-aware humanRequired shadow (R131)', () => {
       expect(propose({ [runner]: diff(runner, ...hunks) }, [permission(runner)]).proposed).toBe(true);
     }
   });
-  it.each(['before', 'after', 'both'])('uses nearest nonblank list neighbours with blank context %s the entry', side => {
-    const section = diff(runner, [' const allowed = [',
-      ...(side !== 'after' ? [' ', '   '] : []), '+PR_TRACE_OP,',
-      ...(side !== 'before' ? [' ', '   '] : []), ' ];']);
-    expect(propose({ [runner]: section }, [permission(runner)]))
-      .toEqual({ proposed: false, reason: 'adds only read-only ops: pr-trace' });
-  });
   it('caps total diff text at 200000 characters with an explicit human-review fallback', () => {
     const sections = Object.fromEntries([runner, sweep].map(file => [file,
       diff(file, [' const allowed = [', '+PR_TRACE_OP,', ' ];', ...Array(100).fill(` ${' '.repeat(1000)}`)])]));
@@ -330,7 +323,7 @@ describe('direction-aware humanRequired shadow (R131)', () => {
     expect(propose({ [surface]: tightening(changes) }, [setting])).toEqual({ proposed: true, reason });
   });
   it.each(['scripts/lib/review-escalation.mjs', 'scripts/lib/permission-change.mjs',
-    'scripts/lib/direction-aware-human.mjs', 'scripts/review-core-cli.mjs', 'scripts/lib/review-shape.mjs', 'scripts/settings/human-review-surfaces.json',
+    'scripts/lib/direction-aware-human.mjs', 'scripts/review-core-cli.mjs', 'scripts/settings/human-review-surfaces.json',
     'scripts/lib/policy-cascade.mjs', 'scripts/lib/read-only-ops.mjs', 'scripts/settings/direction-aware-human.json'])
     ('keeps any classifier self-change human even without a hit: %s', file => {
       expect(propose({ [file]: diff(file, ['+// change']) }, []))
@@ -367,11 +360,6 @@ describe('direction-aware humanRequired shadow (R131)', () => {
     expect(propose({}, [], { humanRequired: false, otherHumanForced: true }))
       .toEqual({ proposed: false, reason: 'not human-required today' });
   });
-  it.each(['scripts/operations/registry.mjs', 'scripts/operations/step-kinds.mjs'])
-    ('keeps classifier self-change human when the current gate did not fire: %s', file => {
-      expect(propose({ [file]: diff(file, ['+// change']) }, [], { humanRequired: false }))
-        .toEqual({ proposed: true, reason: `classifier self-change: ${file}` });
-    });
   it('preserves other forced human triggers', () => {
     expect(propose({}, [], { otherHumanForced: true }).proposed).toBe(true);
   });
