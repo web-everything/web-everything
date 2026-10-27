@@ -9,7 +9,7 @@ import {
   runRemote, runWithRemoteFallback, parseArgs,
 } from '../remote-exec.mjs';
 
-const argv = ['npm', 'run', 'test:unit', 'a.test.mjs'];
+const argv = ['npm', 'run', 'test:unit', '--', 'a.test.mjs'];
 const runId = 'abcdef-1';
 const runDir = `/srv/forge-exec/${runId}`;
 const lockHash = 'a'.repeat(64);
@@ -168,6 +168,20 @@ describe('remote snapshot regressions', () => {
 });
 
 describe('isAllowedCommand', () => {
+  it.each(['test:unit', 'check:standards'])('rejects npm options before the argument separator for %s', (script) => {
+    for (const args of [
+      ['--script-shell=/usr/bin/true'], ['--script-shell', '/usr/bin/true'],
+      ['--ignore-scripts'], ['--if-present'], ['--help'], ['--workspace=other'],
+      ['a.test.mjs', '--script-shell=/usr/bin/true'],
+      ['--script-shell=/usr/bin/true', '--', 'a.test.mjs'],
+      ['—', '--script-shell=/usr/bin/true'], ['--\u200b', '--help'],
+    ]) {
+      expect(isAllowedCommand(['npm', 'run', script, ...args]), JSON.stringify(args)).toBe(false);
+      expect(() => buildRemoteScript({ runId, lockHash, argv: ['npm', 'run', script, ...args] }))
+        .toThrow('Invalid remote execution parameters');
+    }
+    expect(isAllowedCommand(['npm', 'run', script, '--', '--script-shell=/usr/bin/true'])).toBe(true);
+  });
   it.each(['test:unit', 'check:standards'])('allows exactly the npm run %s prefix, including extra args', (script) => {
     expect(isAllowedCommand(['npm', 'run', script])).toBe(true);
     expect(isAllowedCommand(['npm', 'run', script, '--', 'a.test.mjs'])).toBe(true);
@@ -392,7 +406,16 @@ describe('runRemote', () => {
 
 describe('runWithRemoteFallback', () => {
   it.each([
-    ['command-not-allowed', { argv: ['npm', 'run', 'build'] }, {}],
+    ['npm', 'run', 'build'],
+    ['npm', 'run', 'test:unit', '--script-shell=/usr/bin/true'],
+    ['npm', 'run', 'check:standards', '--ignore-scripts'],
+  ])('refuses disallowed argv without remote or local execution: %j', async (...command) => {
+    const f = { ...fixture(), argv: command };
+    await expect(runWithRemoteFallback(f)).rejects.toThrow('command-not-allowed');
+    expect(f.exec).not.toHaveBeenCalled();
+    expect(f.local).not.toHaveBeenCalled();
+  });
+  it.each([
     ['forge-unreachable', {}, { probeCode: 255 }],
     ['copy-failed', {}, { copyCode: 23 }],
     ['ambiguous-result', {}, { receipt: '' }],

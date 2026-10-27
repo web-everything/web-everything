@@ -13,8 +13,10 @@ const quote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
 const newRunId = () => `${new Date().toISOString().replace(/[^0-9tz]/gi, '').toLowerCase()}-${randomBytes(4).toString('hex')}`;
 
 export function isAllowedCommand(argv) {
+  // Only task arguments may follow the script name; npm options can skip or replace execution.
   return Array.isArray(argv) && argv.length >= 3 && argv.every((arg) => typeof arg === 'string' && !arg.includes('\0'))
-    && argv[0] === 'npm' && argv[1] === 'run' && ['test:unit', 'check:standards'].includes(argv[2]);
+    && argv[0] === 'npm' && argv[1] === 'run' && ['test:unit', 'check:standards'].includes(argv[2])
+    && (argv.length === 3 || argv[3] === '--');
 }
 
 export function filterEnv(env = {}) {
@@ -147,6 +149,8 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
 }
 
 export async function runWithRemoteFallback(options = {}) {
+  // A rejected command must not regain execution through local fallback.
+  if (!isAllowedCommand(options.argv)) throw new Error('command-not-allowed: use npm run <allowed-task> -- <task-args>');
   const result = await runRemote(options);
   if (result.mode === 'remote') return result.code;
   const log = options.log ?? ((message) => process.stderr.write(`${message}\n`));
