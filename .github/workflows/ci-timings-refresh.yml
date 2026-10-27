@@ -5,10 +5,10 @@ on:
     - cron: '23 6 * * 1'
   workflow_dispatch:
 
+# github.token only downloads artifacts and checks out; publication uses the App token below.
 permissions:
   actions: read
-  contents: write
-  pull-requests: write
+  contents: read
 
 concurrency:
   group: ci-refresh-test-timings
@@ -98,5 +98,6 @@ jobs:
           git commit -m 'ci: refresh measured unit test timings'
           # Checkout persists no github.token header; Git and gh both use the App token.
           gh auth setup-git --hostname github.com
-          git push origin HEAD:refs/heads/ci/refresh-test-timings
-          gh pr create --base main --head ci/refresh-test-timings --title 'ci: refresh measured unit test timings' --body 'Refresh unit shard timings from the latest successful main CI push. Requires at least ten reports and 90% current test-file coverage; soak timings are preserved.'
+          # Create-only: the empty lease refuses if the branch appeared after the recheck.
+          git push --force-with-lease=refs/heads/ci/refresh-test-timings: origin HEAD:refs/heads/ci/refresh-test-timings
+          gh pr create --base main --head ci/refresh-test-timings --title 'ci: refresh measured unit test timings' --body 'Refresh unit shard timings from the latest successful main CI push. Requires one report per CI unit shard and 90% current test-file coverage; only current test files are kept, and soak timings are preserved.'

@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { assignByTime, median, ambiguousFilters, timingsFromReports, parseShardArg, listUnitTestFiles, loadTimings, assertTimingKeys, formatUpdatedTimings } from '../shard-assign.mjs';
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { assignByTime, median, ambiguousFilters, timingsFromReports, parseShardArg, listUnitTestFiles, loadTimings, assertTimingKeys, formatUpdatedTimings, REPO_ROOT } from '../shard-assign.mjs';
 
 describe('shard-assign — balance by measured time (card 11)', () => {
   const files = ['a', 'b', 'c', 'd', 'e', 'f'];
@@ -79,4 +82,26 @@ describe('shard-assign — persisted unit timing freshness', () => {
     expect(Object.keys(unit).filter(file => !files.has(file))).toEqual([]);
   }, 30_000);
 
+  it('discovery preserves include/exclude rules without executing tests, setupFiles or globalSetup', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'shard-discovery-'));
+    try {
+      const sentinels = join(root, 'sentinels');
+      mkdirSync(sentinels);
+      const touch = (name) => `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(join(sentinels, name))}, '');\n`;
+      for (const dir of ['tests/deep', 'tests/skip', 'other']) mkdirSync(join(root, dir), { recursive: true });
+      for (const [file, name] of [['tests/a.test.mjs', 'a'], ['tests/deep/b.test.mjs', 'b'], ['tests/skip/c.test.mjs', 'c'], ['other/d.test.mjs', 'd'], ['tests/helper.mjs', 'helper']]) {
+        writeFileSync(join(root, file), touch(name));
+      }
+      writeFileSync(join(root, 'setup.mjs'), touch('setup'));
+      writeFileSync(join(root, 'global.mjs'), `${touch('global')}export default () => {};\n`);
+      writeFileSync(join(root, 'vitest.config.ts'), `export default { test: ${JSON.stringify({
+        include: ['tests/**/*.test.mjs'], exclude: ['tests/skip/**'], setupFiles: ['./setup.mjs'], globalSetup: ['./global.mjs'],
+      })} };\n`);
+      symlinkSync(join(REPO_ROOT, 'node_modules'), join(root, 'node_modules'), 'dir');
+      expect(await listUnitTestFiles(root)).toEqual(['tests/a.test.mjs', 'tests/deep/b.test.mjs']);
+      expect(readdirSync(sentinels)).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

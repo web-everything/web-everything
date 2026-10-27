@@ -1,10 +1,12 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { foldReports, refreshFromDir } from '../refresh-timings.mjs';
+import yaml from 'js-yaml';
+import { downloadReports, expectedUnitReports, foldReports, main, refreshFromDir } from '../refresh-timings.mjs';
 import { REPO_ROOT, timingsFromReports } from '../shard-assign.mjs';
 
 // Public contracts for Phase 2:
@@ -26,17 +28,24 @@ function writeReport(index, body) {
 function seed(count = 10, coverage = 10) {
   return Array.from({ length: count }, (_, i) => writeReport(i, report(files[i % coverage], 1234 + i * 100)));
 }
-function cli() {
+function cli(args = [`--dir=${dir}`]) {
   // Copy the future implementation into a throwaway repo: CLI defaults must never write real timings.
   const scripts = join(repoRoot, 'scripts', 'ci');
   mkdirSync(scripts, { recursive: true });
   for (const name of ['refresh-timings.mjs', 'shard-assign.mjs']) {
     copyFileSync(new URL(`../${name}`, import.meta.url), join(scripts, name));
   }
-  return spawnSync(process.execPath, [join(scripts, 'refresh-timings.mjs'), `--dir=${dir}`], {
+  return spawnSync(process.execPath, [join(scripts, 'refresh-timings.mjs'), ...args], {
     cwd: repoRoot, encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024,
   });
 }
+// The minimum report count is one per CI unit shard, read from the checkout's ci.yml.
+function writeCi(shards) {
+  const ci = join(repoRoot, '.github', 'workflows', 'ci.yml');
+  mkdirSync(dirname(ci), { recursive: true });
+  writeFileSync(ci, yaml.safeDump({ jobs: { 'test-shard': { strategy: { matrix: { shard: shards } } } } }));
+}
+const tenShards = Array.from({ length: 10 }, (_, i) => i + 1);
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'refresh-timings-'));
   repoRoot = join(root, 'repo');
@@ -49,6 +58,7 @@ beforeEach(() => {
   writeFileSync(join(repoRoot, 'vitest.config.ts'), "export default { test: { include: ['tests/**/*.test.mjs'] } };\n");
   symlinkSync(join(REPO_ROOT, 'node_modules'), join(repoRoot, 'node_modules'), 'dir');
   writeFileSync(timingsFile, original);
+  writeCi(tenShards);
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
@@ -156,4 +166,133 @@ describe('refresh-timings writer compatibility', () => {
     expect(Object.keys(unit)).toEqual([...Object.keys(unit)].sort());
     expect(unit).not.toHaveProperty('removed.test.mjs');
   });
+
+  it('writes only currently discovered test files, dropping obsolete report entries', async () => {
+    seed();
+    // A CI run built before a test file was renamed or deleted still reports the old name.
+    writeReport(20, report('tests/renamed-away.test.mjs'));
+    const result = await refreshFromDir({ dir, timingsFile, repoRoot });
+    expect(result.ok).toBe(true);
+    expect(Object.keys(JSON.parse(readFileSync(timingsFile, 'utf8')).unit)).toEqual([...files].sort());
+  });
+});
+
+describe('refresh-timings report threshold follows the CI unit shard matrix', () => {
+  it('needs one report per ci.yml unit shard, not a fixed ten', async () => {
+    writeCi([1, 2, 3, 4, 5]);
+    expect(expectedUnitReports(repoRoot)).toBe(5);
+    seed(4);
+    writeReport(0, { testResults: files.map((file) => report(file).testResults[0]) });
+    expect((await refreshFromDir({ dir, timingsFile, repoRoot })).reason).toMatch(/Found 4 unit reports; need at least 5/);
+    expect(readFileSync(timingsFile, 'utf8')).toBe(original);
+    seed(5);
+    writeReport(0, { testResults: files.map((file) => report(file).testResults[0]) });
+    expect((await refreshFromDir({ dir, timingsFile, repoRoot })).ok).toBe(true);
+  });
+
+  it('matches the real ci.yml unit shard count', () => {
+    const ci = yaml.safeLoad(readFileSync(join(REPO_ROOT, '.github', 'workflows', 'ci.yml'), 'utf8'));
+    expect(expectedUnitReports()).toBe(ci.jobs['test-shard'].strategy.matrix.shard.length);
+  });
+
+  it.each([
+    ['a missing ci.yml', () => rmSync(join(repoRoot, '.github'), { recursive: true })],
+    ['an empty shard matrix', () => writeCi([])],
+    ['a non-list shard matrix', () => writeCi('${{ fromJSON(vars.SHARDS) }}')],
+    ['duplicate shard ids', () => writeCi([1, 1, 2])],
+  ])('refuses on %s and preserves the file', async (_, mutate) => {
+    seed();
+    mutate();
+    expect(() => expectedUnitReports(repoRoot)).toThrow(/shard/i);
+    const result = await refreshFromDir({ dir, timingsFile, repoRoot });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/shard/i);
+    expect(readFileSync(timingsFile, 'utf8')).toBe(original);
+  });
+});
+
+describe('refresh-timings atomic replacement', () => {
+  const leftovers = () => readdirSync(dirname(timingsFile)).filter(name => name.endsWith('.pending'));
+
+  it('a staged write that fails part-way leaves the destination bytes intact and no staging file', async () => {
+    seed();
+    const io = {
+      writeFile: async (path, data, options) => { await writeFile(path, data.slice(0, 10), options); throw new Error('disk full'); },
+    };
+    const result = await refreshFromDir({ dir, timingsFile, repoRoot, io });
+    expect(result).toMatchObject({ ok: false, reason: expect.stringMatching(/disk full/) });
+    expect(readFileSync(timingsFile, 'utf8')).toBe(original);
+    expect(leftovers()).toEqual([]);
+  });
+
+  it('a failed rename leaves the destination bytes intact and no staging file', async () => {
+    seed();
+    const io = { rename: async () => { throw new Error('rename refused'); } };
+    const result = await refreshFromDir({ dir, timingsFile, repoRoot, io });
+    expect(result).toMatchObject({ ok: false, reason: expect.stringMatching(/rename refused/) });
+    expect(readFileSync(timingsFile, 'utf8')).toBe(original);
+    expect(leftovers()).toEqual([]);
+  });
+});
+
+describe('refresh-timings CI artifact download trust boundary', () => {
+  const recorder = (runList = '[{"databaseId":4242}]') => {
+    const calls = [];
+    const exec = (cmd, args, options) => { calls.push({ cmd, args, options }); return args[1] === 'list' ? runList : ''; };
+    return { calls, exec };
+  };
+
+  it('latest selects only the newest successful ci.yml push on main, then downloads unit artifacts by argv', async () => {
+    const { calls, exec } = recorder();
+    await downloadReports('latest', '/scratch/reports', { exec });
+    expect(calls.map(({ cmd, args }) => [cmd, args])).toEqual([
+      ['gh', ['run', 'list', '--workflow=ci.yml', '--branch=main', '--status=success', '--event=push', '--limit=1', '--json=databaseId']],
+      ['gh', ['run', 'download', '4242', '--pattern=timing-unit-*', '--dir', '/scratch/reports']],
+    ]);
+    for (const { options } of calls) expect(options).toMatchObject({ cwd: REPO_ROOT, timeout: 120_000, maxBuffer: 1024 * 1024 });
+  });
+
+  it('an explicit numeric run downloads without a run lookup', async () => {
+    const { calls, exec } = recorder();
+    await downloadReports('77', '/scratch/reports', { exec });
+    expect(calls.map(({ args }) => args)).toEqual([['run', 'download', '77', '--pattern=timing-unit-*', '--dir', '/scratch/reports']]);
+  });
+
+  it.each([
+    ['no successful run', '[]'],
+    ['a non-numeric run id', '[{"databaseId":"1;touch x"}]'],
+    ['a missing run id', '[{}]'],
+  ])('refuses before any download when latest finds %s', async (_, runList) => {
+    const { calls, exec } = recorder(runList);
+    await expect(downloadReports('latest', '/scratch/reports', { exec })).rejects.toThrow(/No valid CI run ID/);
+    expect(calls.map(({ args }) => args[1])).toEqual(['list']);
+  });
+
+  it.each(['1;x', '$(id)', '1 2', '-1', ''])('refuses explicit run id %j before any gh call', async (run) => {
+    const { calls, exec } = recorder();
+    await expect(downloadReports(run, '/scratch/reports', { exec })).rejects.toThrow(/No valid CI run ID/);
+    expect(calls).toEqual([]);
+  });
+
+  it.each([
+    [[]],
+    [['--run=1;x']],
+    [['--run=']],
+    [['--run=12a']],
+    [['--dir=']],
+    [['--run=latest', '--dir=x']],
+    [['--update=x']],
+  ])('main rejects argv %j with usage', async (argv) => {
+    await expect(main(argv)).rejects.toThrow(/^usage: refresh-timings\.mjs/);
+  });
+
+  it('strips terminal control characters from refusal messages written to workflow logs', () => {
+    seed();
+    writeFileSync(join(dir, 'timing-unit-\u001b]8;;evil\u0007.json'), '{}');
+    const result = cli();
+    expect(result.status).toBe(2);
+    const line = result.stderr.split('\n').find(text => text.includes('Invalid unit report'));
+    expect(line).toContain('evil');
+    expect(line).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+  }, 20_000);
 });

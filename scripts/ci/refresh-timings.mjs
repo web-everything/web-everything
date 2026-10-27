@@ -8,7 +8,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { realpathSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
+import yaml from 'js-yaml';
 import { REPO_ROOT, TIMINGS_FILE, listUnitTestFiles, timingsFromReports, loadTimings, formatUpdatedTimings } from './shard-assign.mjs';
 
 /** Recursively parse unit reports only; malformed or unreadable evidence throws. */
@@ -31,22 +32,40 @@ export async function foldReports(dir) {
   return reports;
 }
 
+/** One timing-unit-* report per CI unit shard: the length of ci.yml's test-shard matrix. Unreadable or unexpected shapes throw. */
+export function expectedUnitReports(repoRoot = REPO_ROOT) {
+  let shards;
+  try {
+    shards = yaml.safeLoad(readFileSync(join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8'))?.jobs?.['test-shard']?.strategy?.matrix?.shard;
+  } catch (error) {
+    throw new Error(`Cannot read the CI unit shard matrix (${error.message})`);
+  }
+  if (!Array.isArray(shards) || !shards.length || !shards.every(Number.isInteger) || new Set(shards).size !== shards.length) {
+    throw new Error('ci.yml test-shard matrix is not a non-empty list of distinct shard numbers');
+  }
+  return shards.length;
+}
+
 /** Validate all evidence before atomically replacing the unit map, preserving soak timings. */
-export async function refreshFromDir({ dir, timingsFile = TIMINGS_FILE, repoRoot = REPO_ROOT }) {
+export async function refreshFromDir({ dir, timingsFile = TIMINGS_FILE, repoRoot = REPO_ROOT, io = {} }) {
+  const { writeFile: write = writeFile, rename: move = rename } = io;
   let pending;
   try {
     const reports = await foldReports(dir);
-    if (reports.length < 10) return { ok: false, reason: `Found ${reports.length} unit reports; need at least 10. Download all timing-unit-* artifacts from a successful full CI run.` };
-    const timings = timingsFromReports(reports, repoRoot);
+    const minReports = expectedUnitReports(repoRoot);
+    if (reports.length < minReports) return { ok: false, reason: `Found ${reports.length} unit reports; need at least ${minReports} (one per CI unit shard). Download all timing-unit-* artifacts from a successful full CI run.` };
+    const measured = timingsFromReports(reports, repoRoot);
     const files = await listUnitTestFiles(repoRoot);
-    const covered = files.filter(file => Object.hasOwn(timings, file)).length;
+    // Keep current files only: a run built before a rename/delete still reports the old name.
+    const timings = Object.fromEntries(files.filter(file => Object.hasOwn(measured, file)).map(file => [file, measured[file]]));
+    const covered = Object.keys(timings).length;
     if (!files.length || covered / files.length < 0.9) {
       return { ok: false, reason: `Unit timing coverage ${covered}/${files.length} is below 90%. Use a current successful full CI run or rerun CI on main.` };
     }
     const output = formatUpdatedTimings(loadTimings(timingsFile), 'unit', timings);
     pending = `${timingsFile}.${randomUUID()}.pending`;
-    await writeFile(pending, output, { flag: 'wx' });
-    await rename(pending, timingsFile);
+    await write(pending, output, { flag: 'wx' });
+    await move(pending, timingsFile);
     return { ok: true, reason: `Updated unit timings from ${reports.length} reports: ${covered}/${files.length} current files covered.` };
   } catch (error) {
     return { ok: false, reason: `Timing refresh refused: ${error.message}. Check the downloaded reports and retry with complete CI evidence.` };
