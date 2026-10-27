@@ -12,13 +12,22 @@ const job = (name) => {
 };
 
 describe('ci.yml: integration suite runs as its own parallel job', () => {
+  it.each(['ci.yml', 'hetzner-jobs.yml'])('%s integration executes test:integration:vitest', (workflow) => {
+    const text = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', '.github', 'workflows', workflow), 'utf8');
+    const integration = yaml.load(text).jobs.integration;
+    const suiteSteps = integration.steps.filter((step) => step.run?.trim() === 'npm run test:integration:vitest');
+    expect(suiteSteps).toHaveLength(1);
+    expect(suiteSteps[0]['working-directory']).toBe('web-everything');
+    expect(suiteSteps[0].if).toBe(workflow === 'ci.yml' ? "${{ steps.gate.outputs.run == 'true' }}" : undefined);
+  });
+
   it('integration needs only `changes`, so it starts beside the shards', () => {
     expect(job('integration')).toMatch(/^    needs: changes$/m);
     expect(job('integration')).toContain('npm run test:integration:vitest');
   });
-  it('the integration job runs even on card-only PRs (never job-skipped) and fails closed', () => {
+  it('the integration job runs even on card-only PRs (within its hosted event path) and fails closed', () => {
     const j = job('integration');
-    expect(j).toMatch(/if: \$\{\{ !cancelled\(\) \}\}/);
+    expect(yaml.load(yml).jobs.integration.if).toBe("${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}");
     expect(j).toContain('needs.changes.result');
   });
   it('`test` no longer runs the suite itself but still goes red when integration is not success', () => {

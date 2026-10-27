@@ -12,6 +12,7 @@
  */
 import { describe, it, expect, beforeEach, afterAll } from 'vitest';
 import { PR_STATUS_STATES } from '../conveyor/pr-status-label.mjs';
+import { outputMixFixture } from './fixtures/output-mix-fixture.mjs';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -499,15 +500,17 @@ describe('the output-mix section', () => {
   /**
    * The one case that runs the REAL derivation through the CLI. Every other `cli()` call in this file forces
    * `WE_BOARD_NO_GIT=1` for runtime, which means `main()`'s own call into `computeOutputMix` — the ROOT it
-   * resolves, the `today` it passes, the wiring into `buildModel` — is otherwise never executed under test:
-   * the module could throw at that seam and 216 green tests would say nothing. Asserts SHAPE only, never a
-   * number, because the number moves every week.
+   * resolves, the `today` it passes, the wiring into `buildModel` — is otherwise never executed under test.
+   * Point Git at a dated fixture using its standard repository selectors: the actual CLI and Git still run,
+   * but a growing/blobless CI checkout cannot trigger expensive history reads or lazy network fetches.
    */
-  // main-red 2026-10-27: same output-mix live-git root cause; carded.
-  it.skip('runs the real git derivation end to end when it is NOT disabled', () => {
+  it('runs the real git derivation end to end when it is NOT disabled', () => {
+    const { repoRoot, env } = outputMixFixture(join(sandbox, `git-${seq}`));
     const r = spawnSync(process.execPath, [CLI, `--state=${statePath}`, `--out=${outPath}`, '--no-gh'], {
       encoding: 'utf8',
-      env: { ...process.env, WE_BOARD_NOW: NOW, WE_BOARD_NO_GH: '1', WE_BOARD_NO_GIT: '' },
+      timeout: 30_000,
+      env: { ...env, GIT_DIR: join(repoRoot, '.git'), GIT_WORK_TREE: repoRoot,
+        WE_BOARD_NOW: NOW, WE_BOARD_NO_GH: '1', WE_BOARD_NO_GIT: '' },
     });
     expect(r.status, r.stderr).toBe(0);
     const h = readFileSync(outPath, 'utf8');
@@ -516,6 +519,8 @@ describe('the output-mix section', () => {
     // A real read produces grouped, signed figures in the machinery column — not the honest-note fallback.
     expect(h).toMatch(/Machinery \+ bookkeeping/);
     expect(h).toMatch(/>\+[\d,]+<\/div>/);
+    expect(h).toContain('<div class="n">+5</div><div class="k">Product lines this week</div>');
+    expect(h).toContain('<div class="n">+10</div><div class="k">Machinery + bookkeeping</div>');
   }, 30_000);
 });
 
