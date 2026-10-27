@@ -21,6 +21,7 @@ export default {
       && planner.includes("review.findings?.confirm === 'accept'")
       && planner.includes('laterReviewHold(reviews')
       && planner.includes('const fresh = readLive()')
+      && planner.includes('writeHead.headRefOid !== pr.headRefOid')
       && planner.includes('at >= observed.startedAt')
       && planner.includes('publishedAccept')
       && planner.includes('c.updatedAt ?? c.updated_at')
@@ -118,6 +119,47 @@ export default {
       // The next tick must be stable after either a hold or a clearance.
       io.prs[0].labels = labels;
       if (sweepLabelStateReconcile(io).length) violations.push(`${scenario}: repeated reconciliation`);
+    }
+    // Round 4: both metadata snapshots still name A when the final evidence read pushes B.
+    // Exercise the production metadata reader, stored ACCEPTS, and label writer together.
+    for (const phase of ['native', 'stored', 'provision']) {
+      let liveHead = head, nativeReads = 0, storedReads = 0, writes = 0, events = 0;
+      let labels = ['red-team:blocked'];
+      const pushed = 'b'.repeat(40);
+      const exec = () => JSON.stringify({ number, state: 'OPEN', headRefOid: liveHead,
+        labels, body, createdAt: '2026-01-01T00:00:00Z' });
+      const io = { repo, prs: [{ number, labels }],
+        readPr: args => defaultReadPr({ exec, readComments: () => [], ...args }),
+        readComments: () => [], readReviews: () => [], readReview: () => null,
+        readRedTeam: ({ head: requestedHead }) => {
+          if (++storedReads === 2 && phase === 'stored') liveHead = pushed;
+          return requestedHead === head
+            ? { repo, pr: number, head, status: 'finished', result: { foldedVerdict: 'accept' } } : null;
+        },
+        emit: () => { events++; },
+        provider: {
+          readPrReviews() {
+            if (++nativeReads === 2 && phase === 'native') liveHead = pushed;
+            return [];
+          },
+          ensureLabel() { if (phase === 'provision') liveHead = pushed; },
+          setLabels(_repo, _pr, { add, remove }) {
+            writes++;
+            labels = labels.filter(l => !remove.includes(l));
+            if (add) labels.push(...add.split(','));
+          },
+        },
+      };
+      const rows = sweepLabelStateReconcile(io);
+      if (liveHead !== pushed || writes || events || rows.length || labels.join(',') !== 'red-team:blocked') {
+        violations.push(`push-during-${phase}: stale clearance (writes=${writes}, events=${events}, labels=${labels})`);
+      }
+      // Head B has no result; retry must retain the hold without applying A's evidence.
+      io.prs[0].labels = labels;
+      const writesBeforeRetry = writes, eventsBeforeRetry = events;
+      if (sweepLabelStateReconcile(io).length || writes !== writesBeforeRetry || events !== eventsBeforeRetry) {
+        violations.push(`push-during-${phase}: unsafe retry`);
+      }
     }
     log?.(`label reconciliation: ${violations.length} violation(s)`);
     return { violations };

@@ -83,7 +83,7 @@ export function planLabelStateReconcile({ repo, pr, review = null, redTeam = nul
   return add.length || remove.length ? { from, to, add, remove, evidence } : null;
 }
 
-/** IO shell: one live metadata/thread read per candidate; read failures leave labels untouched for the next pass. */
+/** IO shell: re-read evidence and then the live head; read failures leave labels untouched for the next pass. */
 export function sweepLabelStateReconcile({ prs = [], repo, resolveRepo = () => repo, dryRun = false,
   provider = createGhProvider(), readPr = defaultReadPr, readComments = readCompletePrComments,
   readReviews = readReviewRunEvidence, readReview = readRun, readRedTeam = readRedTeamStatus,
@@ -130,6 +130,11 @@ export function sweepLabelStateReconcile({ prs = [], repo, resolveRepo = () => r
       if (!plan) continue;
       if (!dryRun) {
         for (const label of plan.add) provider.ensureLabel(slug, label, RED_TEAM_STATUS_LABEL_META[label]);
+        // Evidence reads and label provisioning may span a push. Keep this metadata-only read next to
+        // the write: defaultReadPr's thread read must not open another evidence-read race afterward.
+        const writeHead = readPr({ repo: slug, number: pr.number, fields: 'number,state,headRefOid',
+          readComments: () => [] });
+        if (writeHead?.state !== 'OPEN' || writeHead.number !== pr.number || writeHead.headRefOid !== pr.headRefOid) continue;
         provider.setLabels(slug, pr.number, { add: plan.add.join(',') || null, remove: plan.remove });
         void emit({ kind: 'labels-reconciled', repo: slug, pr: pr.number,
           detail: { pr: pr.number, from: plan.from, to: plan.to, evidence: plan.evidence } });

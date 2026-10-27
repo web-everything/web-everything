@@ -374,6 +374,51 @@ describe('sweepLabelStateReconcile', () => {
     expect(io.provider.setLabels).not.toHaveBeenCalled();
     expect(io.emit).not.toHaveBeenCalled();
   });
+  it.each(['comments', 'native', 'index', 'review', 'red-team', 'provision'])
+  ('a push during the final %s read or preparation cancels clearance', phase => {
+    const io = fixture();
+    let liveHead = head;
+    io.readPr.mockImplementation(() => ({ ...io.prs[0], headRefOid: liveHead }));
+    const target = phase === 'native' || phase === 'provision' ? io.provider : io;
+    const key = { comments: 'readComments', native: 'readPrReviews', index: 'readReviews',
+      review: 'readReview', 'red-team': 'readRedTeam', provision: 'ensureLabel' }[phase];
+    const original = target[key];
+    let reads = 0;
+    target[key] = (...args) => {
+      const result = original(...args);
+      if (++reads === (phase === 'provision' ? 1 : 2)) liveHead = otherHead;
+      return result;
+    };
+    expect(sweepLabelStateReconcile(io)).toEqual([]);
+    expect(liveHead).toBe(otherHead);
+    expect(io.provider.setLabels).not.toHaveBeenCalled();
+    expect(io.emit).not.toHaveBeenCalled();
+  });
+  it.each(['missing', 'closed', 'wrong-pr', 'missing-head', 'unreadable'])
+  ('a %s final metadata read cannot authorize a label write', kind => {
+    const io = fixture(), live = io.prs[0];
+    io.readPr.mockReturnValueOnce(live).mockReturnValueOnce(live).mockImplementation(() => {
+      if (kind === 'unreadable') throw Error('final head unreadable');
+      if (kind === 'missing') return null;
+      return { ...live, ...(kind === 'closed' ? { state: 'CLOSED' }
+        : kind === 'wrong-pr' ? { number: 42 } : { headRefOid: undefined }) };
+    });
+    const rows = sweepLabelStateReconcile(io);
+    expect(rows).toEqual(kind === 'unreadable'
+      ? [{ num: live.number, labelsReconciled: 'skipped', error: 'final head unreadable' }] : []);
+    expect(io.provider.setLabels).not.toHaveBeenCalled();
+    expect(io.emit).not.toHaveBeenCalled();
+  });
+  it('the final production head read performs no further evidence reads', () => {
+    const io = fixture(), live = io.prs[0];
+    io.readComments = vi.fn(io.readComments);
+    const exec = vi.fn(() => JSON.stringify(live));
+    io.readPr = args => defaultReadPr({ exec, readComments: io.readComments, ...args });
+    expect(sweepLabelStateReconcile(io)[0]?.labelsReconciled.to).toEqual(['red-team:clear']);
+    expect(exec).toHaveBeenCalledTimes(3);
+    expect(io.readComments).toHaveBeenCalledTimes(4);
+    expect(exec.mock.calls[2][1].at(-1)).toBe('number,state,headRefOid');
+  });
   it('a failed label write does not emit a change event', () => {
     const io = fixture(); io.provider.setLabels.mockImplementation(() => { throw Error('write failed'); });
     expect(sweepLabelStateReconcile(io)[0].error).toBe('write failed');
