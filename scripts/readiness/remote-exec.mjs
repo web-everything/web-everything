@@ -30,6 +30,7 @@ export function buildRemoteScript({ runId, lockHash, env = {}, argv, retainRun =
   if (!validateRunId(runId) || !/^[a-f0-9]{64}$/.test(lockHash) || !isAllowedCommand(argv)) {
     throw new Error('Invalid remote execution parameters');
   }
+  if (argv[2] === 'check:standards') throw new Error('Standards checks require the local checkout Git context');
   const dir = `${ROOT}/${runId}`;
   const cache = `${ROOT}/.cache/${lockHash}`;
   const cleanEnv = `env -i PATH=/usr/local/bin:/usr/bin:/bin ${Object.entries(filterEnv(env)).map(([k, v]) => `${k}=${quote(v)}`).join(' ')}`;
@@ -89,7 +90,7 @@ function safeFiles(files) {
     if (typeof path !== 'string' || !path || path.startsWith('/') || /[\0\r\n]/.test(path)) throw new Error('Invalid file path');
     const parts = path.split('/');
     if (parts.some((part) => part === '..' || part === '.')) throw new Error('Unsafe file path');
-    return !parts.some((part) => /^(?:node_modules|\.git|\.env(?:\..*)?|\.secrets|\.ssh|\.aws|\.claude|\.codex|\.npmrc|\.netrc|credentials(?:\..*)?|.*\.(?:pem|key))$/i.test(part));
+    return !parts.some((part) => /^(?:node_modules|\.git|\.git-credentials(?:[.~_-].*)?|id_(?:rsa|dsa|ecdsa|ed25519|xmss)(?:[.~_-].*)?|identity(?:[.~_-].*)?|\.env(?:\..*)?|\.secrets|\.ssh|\.aws|\.claude|\.codex|\.npmrc|\.netrc|credentials(?:\..*)?|.*\.(?:pem|key))$/i.test(part));
   });
   const input = [...new Set(safe)].join('\n') + '\n';
   if (Buffer.byteLength(input) > LIMIT) throw new Error('File inventory limit exceeded');
@@ -100,6 +101,10 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
   const fallback = (reason) => ({ mode: 'fallback', reason });
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
   if (!validateRunId(runId) || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host)) return fallback('invalid-parameters');
+  // Standards uses the index, origin/main and history as well as work-tree detection.
+  // A synthetic git init would change those checks; keep it on local admission until
+  // the transport can provide faithful Git context without copying private Git state.
+  if (argv[2] === 'check:standards') return fallback('git-context-required');
   try {
     if ((await exec({ file: 'ssh', args: [host, 'true'], cwd })).code !== 0) return fallback('forge-unreachable');
   } catch { return fallback('forge-unreachable'); }

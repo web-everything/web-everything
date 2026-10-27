@@ -4,6 +4,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { runWithRemoteDecision, resolveAdmissionPolicy } from '../heavy-admission.mjs';
 import {
   isAllowedCommand, filterEnv, validateRunId, buildRemoteScript,
   runRemote, runWithRemoteFallback, parseArgs,
@@ -98,6 +99,11 @@ describe('validateRunId', () => {
 });
 
 describe('buildRemoteScript', () => {
+  it('refuses standards scripts without the checkout Git context', () => {
+    expect(() => buildRemoteScript({ runId, lockHash, argv: ['npm', 'run', 'check:standards'] }))
+      .toThrow(/git context/i);
+  });
+
   it('names the run/cache paths, enables nounset, installs an EXIT trap, and excludes secrets', () => {
     const script = buildRemoteScript({ runId, lockHash, env: { ...allowedEnv, ...forbiddenEnv }, argv });
     expect(typeof script).toBe('string');
@@ -168,6 +174,46 @@ ${script.replaceAll('/srv/forge-exec', root)}`;
 });
 
 describe('runRemote', () => {
+  it.each([[], ['--', '--files=scripts/example.mjs']].map((args) => [args]))('falls back before transport for standards needing Git context: %j', async (args) => {
+    const f = fixture();
+    expect(await runRemote({ ...f, argv: ['npm', 'run', 'check:standards', ...args] }))
+      .toEqual({ mode: 'fallback', reason: 'git-context-required' });
+    expect(f.exec).not.toHaveBeenCalled();
+    expect(f.listFiles).not.toHaveBeenCalled();
+  });
+
+  it.each(['above-threshold', 'always'])('keeps standards on local admission through the real remote executor in %s mode', async (mode) => {
+    const f = fixture();
+    const log = vi.fn();
+    const policy = resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode } } });
+    expect(await runWithRemoteDecision({
+      argv: ['npm', 'run', 'check:standards'], cwd, policy, loadPerCore: () => 10, log,
+      remoteExec: (options) => runRemote({ ...f, ...options }),
+    })).toEqual({ handled: false });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('git-context-required'));
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+
+  it.each(['injected', 'git'])('excludes conventional credential and private-key paths from the %s transport inventory', async (inventory) => {
+    const f = fixture();
+    const safe = ['package-lock.json', 'src/a file.mjs', 'src/identity.mjs', 'docs/key-handling.md'];
+    const secrets = [
+      '.git', '.git/config', '.git-credentials', '.git-credentials.backup', 'nested/.GIT-CREDENTIALS',
+      '.git-credentials~', '.git-credentials-old',
+      'id_rsa', 'keys/ID_RSA', 'id_dsa', 'id_ecdsa', 'id_ed25519', 'id_ecdsa_sk', 'id_ed25519_sk', 'id_xmss',
+      'keys/id_rsa.backup', 'keys/id_rsa~', 'keys/id_ed25519.pub', 'identity', 'keys/identity.pub',
+      '.env', 'nested/.env.local', '.npmrc', '.netrc', 'credentials', 'credentials.json',
+      'credentials/token', '.ssh/config', '.aws/config', 'keys/server.pem', 'keys/server.KEY',
+    ];
+    f.listFiles.mockResolvedValue([...safe, ...secrets]);
+    const exec = vi.fn(async (call) => call.file === 'git'
+      ? { code: 0, stdout: [...safe, ...secrets].join('\0') + '\0' } : f.exec(call));
+    const options = { ...f, exec };
+    if (inventory === 'git') delete options.listFiles;
+    expect(await runRemote(options)).toEqual({ mode: 'remote', code: 0 });
+    expect(callsOf(exec).find((call) => call.file === 'rsync').input).toBe(safe.join('\n') + '\n');
+  });
+
   it('falls back without exec for a command outside the allowlist', async () => {
     const f = fixture();
     expect(await runRemote({ ...f, argv: ['npm', 'run', 'build'] }))
@@ -241,6 +287,20 @@ describe('runRemote', () => {
 });
 
 describe('runWithRemoteFallback', () => {
+  it('preserves the local standards result and logs the Git-context fallback reason', async () => {
+    const f = fixture();
+    const standardArgs = ['npm', 'run', 'check:standards', '--', '--files=scripts/example.mjs'];
+    const log = vi.fn();
+    const local = vi.fn(async (args) => {
+      expect(args).toEqual(standardArgs);
+      return 9;
+    });
+    expect(await runWithRemoteFallback({ ...f, argv: standardArgs, local, log })).toBe(9);
+    expect(local).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('git-context-required'));
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['command-not-allowed', { argv: ['npm', 'run', 'build'] }, {}],
     ['forge-unreachable', {}, { probeCode: 255 }],
