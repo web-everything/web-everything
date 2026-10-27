@@ -424,7 +424,8 @@ export function readBottomLanded({ marker, repo, root = ROOT, run = gitRun(root)
 
 /**
  * Resolve an open base PR first, then (with `prlessBase`) a pushed lane branch without a PR.
- * Unresolved declared bases get a diagnostic cause. Fails open to an empty Map on unreadable evidence.
+ * Unresolved declared bases get a diagnostic cause. Unreadable refs diagnose every listed PR with a fixed cause;
+ * a thrown refs read uses refs-read-threw. Fails open to an empty Map on unreadable evidence.
  * @param {{root?:string, env?:object, prs?:Array<{number:number, headRefName:string, headRefOid:string, isCrossRepository?:boolean}>,
  *   readRefs?:Function, readLanes?:Function, run?:Function, settingOn?:boolean, prlessBase?:boolean, diag?:Map<number,{cause:string}>}} o
  *   `prs` — the open-PR list when the caller already has it (the reconcile pass does); otherwise it is read.
@@ -435,7 +436,7 @@ export function readStackBases({ root = ROOT, env = process.env, prs = null, rea
   prlessBase = false, diag = null, log = (m) => process.stderr.write(m + '\n') } = {}) {
   const out = new Map();
   let rows = [];
-  let failure = 'refs-unreadable';
+  let failure = 'refs-read-threw';
   const diagnose = (pr, cause) => { try { diag?.set(pr, { cause }); } catch { /* best effort */ } };
   const diagnoseAll = (cause) => {
     for (const row of rows) if (!out.has(row.pr) && LANE_REF.test(row.baseRefName ?? '')) diagnose(row.pr, cause);
@@ -452,7 +453,9 @@ export function readStackBases({ root = ROOT, env = process.env, prs = null, rea
       : [...refs.entries()].map(([n, r]) => ({ pr: n, headRefName: r.headRefName, headRefOid: r.headRefOid }));
     rows = listed.map((r) => ({ ...r, baseRefName: refs.get(r.pr)?.baseRefName ?? null, ...stackRowFlags(refs.get(r.pr)) }));
     if (!refs.size) {
-      for (const row of listed) diagnose(row.pr, 'refs-unreadable');
+      const cause = ['refs-auth-failed', 'refs-rate-limited', 'refs-timeout', 'refs-parse-failed'].includes(refs.failure)
+        ? refs.failure : 'refs-unreadable';
+      for (const row of listed) diagnose(row.pr, cause);
       return out;
     }
     for (const row of listed) if (!refs.has(row.pr)) diagnose(row.pr, 'pr-record-missing');

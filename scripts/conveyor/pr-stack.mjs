@@ -422,7 +422,17 @@ export function readOriginLaneTips(dir, { run = args => execFileSync('git', ['-C
     return tips;
   } catch { return null; }
 }
-// What GitHub reports for the open PRs (branch name, head, fork or not), keyed by number; an empty Map when it cannot be read.
+// Only fixed causes cross the diagnostic boundary; command output may contain private data.
+export function classifyGhFailure(e) {
+  if (e instanceof SyntaxError) return 'refs-parse-failed';
+  const text = `${e?.message ?? ''}\n${e?.stderr ?? ''}`;
+  if (e?.status === 429 || /\bHTTP\s+429\b|rate limit/i.test(text)) return 'refs-rate-limited';
+  if ([401, 403].includes(e?.status) || /\bHTTP\s+(?:401|403)\b|bad credentials|authentication failed|not logged in|gh auth login|resource not accessible by integration/i.test(text)) return 'refs-auth-failed';
+  if (e?.code === 'ETIMEDOUT' || e?.signal === 'SIGTERM' || [502, 503, 504].includes(e?.status)
+    || /\bHTTP\s+(?:502|503|504)\b|timed out|timeout/i.test(text)) return 'refs-timeout';
+  return 'refs-unreadable';
+}
+// What GitHub reports for the open PRs, keyed by number; read failures attach a fixed failure cause to the Map.
 export function readOpenPrRefs(dir, { repo = CONSTELLATION_REPOS.we.slug, run = args => execFileSync('gh', args, { cwd: dir, encoding: 'utf8', timeout: 60e3, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }) } = {}) {
   const refs = new Map();
   try {
@@ -430,7 +440,7 @@ export function readOpenPrRefs(dir, { repo = CONSTELLATION_REPOS.we.slug, run = 
       if (Number.isInteger(row?.number)) refs.set(row.number, { headRefName: row.headRefName ?? null, headRefOid: row.headRefOid ?? null, baseRefName: row.baseRefName ?? null, isCrossRepository: row.isCrossRepository !== false,
         author: typeof row.author?.login === 'string' && row.author.login ? row.author.login.toLowerCase() : null });
     }
-  } catch { /* unreadable: the PRs stay unverified */ }
+  } catch (e) { refs.failure = classifyGhFailure(e); /* unreadable: the PRs stay unverified */ }
   return refs;
 }
 // THE ONE TRUST RULE for taking part in a NEW stack, shared by the fix daemon (`readStacksForPass` below) and the
