@@ -29,7 +29,7 @@ import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
 import { coversFile } from '../readiness/scope-lease.mjs';
 import { readNetSets, resolveNetScopeSettings, scopeFilesFor } from './net-scope.mjs';
-import { readStackBases, stackNetFiles } from './review-stack-base.mjs';
+import { readStackBases, resolveStackAwareReview, stackNetFiles } from './review-stack-base.mjs';
 
 export const SCOPE_BLOAT_REASON = 'scope-bloat';
 export const SCOPE_BLOAT_DEFAULTS = Object.freeze({ alreadyOnMain: 3, outsideScope: 10, minFiles: 12 });
@@ -215,6 +215,7 @@ export function enrichPrsWithScopeBloat(prs, { repo = null, defaultBranch = 'mai
   emitEvent = appendDaemonEvent } = {}) {
   if (!Array.isArray(prs) || (repo && repoKeyForSlug(repo) !== 'we')) return prs;
   const limits = scopeBloatLimits(env);
+  const stackAware = resolveStackAwareReview(env);
   let stacks = null; // read once per call, lazily, for declared lane bases or PRs big enough to judge
   const stackBases = () => {
     if (stacks == null) { try { stacks = (readStacks && readStacks(prs.filter((p) => p && !p.isDraft))) || new Map(); } catch { stacks = new Map(); } }
@@ -231,9 +232,9 @@ export function enrichPrsWithScopeBloat(prs, { repo = null, defaultBranch = 'mai
       // A head that cannot be read stays unreadable whatever `main` does: remember that per head, not per main tip, so it
       // costs one failed read (cat-file, fetch, diff; 30 s each) rather than one per main advance.
       const headKey = `${pr.number}:${pr.headRefOid ?? 'nohead'}`;
-      const laneBase = pr.baseRefName !== defaultBranch && /^lane\//.test(pr.baseRefName ?? '');
+      const laneBase = stackAware && pr.baseRefName !== defaultBranch && /^lane\//.test(pr.baseRefName ?? '');
       const listed = Array.isArray(pr.files) ? pr.files.length : 0;
-      const stackBase = laneBase || listed >= Math.min(limits.alreadyOnMain || Infinity, limits.minFiles || Infinity) ? stackBases().get(Number(pr.number)) ?? null : null;
+      const stackBase = stackAware && (laneBase || listed >= Math.min(limits.alreadyOnMain || Infinity, limits.minFiles || Infinity)) ? stackBases().get(Number(pr.number)) ?? null : null;
       const unknown = (detail) => {
         if (!unknowns.has(headKey)) {
           unknowns.add(headKey);
