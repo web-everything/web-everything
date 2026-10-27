@@ -1,6 +1,7 @@
 /** Shared admission for background work; operator interactive commands bypass this check.
- * Structured memory readings prefer macOS pressure (normal admits; warn/critical hold),
- * falling back to pages + free swap, pages alone, then os.freemem with provenance.
+ * Structured memory readings prefer macOS pressure: warn/critical hold; normal requires
+ * measured reclaimable headroom (including inactive pages) to meet the configured floor.
+ * Pressure failure falls back to pages + free swap, pages alone, then os.freemem with provenance.
  * The numeric compatibility reader retains the original headroom probes.
  * Unavailable memory and measured low headroom refuse admission. Malformed readings,
  * non-denial probe errors and legacy numeric-reader failures also fail closed.
@@ -34,6 +35,19 @@ export function parseDarwinMemoryHeadroomMb(vmStat, swapUsage) {
   if (![page, free, spec].every(Number.isFinite) || swapFree === undefined) throw Error('unparseable vm_stat/swapusage');
   return ((free + spec + (Number.isFinite(purge) ? purge : 0)) * page) / 1048576 + Number(swapFree);
 }
+/** Measured reclaimable MB under normal pressure: legacy headroom plus inactive pages.
+ * Pure; incomplete or invalid evidence throws rather than implying unlimited memory. */
+export function parseDarwinReclaimableMemoryMb(vmStat, swapUsage) {
+  const page = Number(/page size of (\d+) bytes/.exec(vmStat)?.[1]);
+  const inactive = Number(/Pages inactive:\s+(\d+)/.exec(vmStat)?.[1] ?? NaN);
+  const headroom = parseDarwinMemoryHeadroomMb(vmStat, swapUsage);
+  const mb = headroom + inactive * page / 1048576;
+  if (!Number.isFinite(page) || page <= 0 || !Number.isFinite(inactive)
+    || !Number.isFinite(headroom) || headroom < 0 || !Number.isFinite(mb) || mb < 0) {
+    throw Error('unparseable reclaimable memory');
+  }
+  return mb;
+}
 /** Parse the macOS pressure sysctl's exact integer value. Pure; unknown levels throw. */
 export function parseDarwinMemoryPressureLevel(text) {
   if (typeof text !== 'string') throw Error('unparseable memory pressure level');
@@ -66,14 +80,14 @@ function readMemoryReading({ env = process.env, platform = process.platform, exe
   }
   if (platform === 'darwin') {
     const opts = { encoding: 'utf8', timeout: 5000 };
+    let level;
     if (probePressure) {
       try {
-        const level = parseDarwinMemoryPressureLevel(exec('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level'], opts));
-        // Finite compatibility values encode admission, not measured free memory.
-        return { mb: level === 'normal' ? Number.MAX_SAFE_INTEGER : 0, source: 'memory-pressure', level };
+        level = parseDarwinMemoryPressureLevel(exec('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level'], opts));
       } catch {
         // Unavailable or unknown pressure must still pass the existing headroom checks.
       }
+      if (level === 'warn' || level === 'critical') return { mb: 0, source: 'memory-pressure', level };
     }
     let vm;
     try {
@@ -90,8 +104,9 @@ function readMemoryReading({ env = process.env, platform = process.platform, exe
       if (!isMemoryProbeDenied(e)) throw e;
       return { mb: pagesMb, source: 'vm_stat' };
     }
-    const mb = parseDarwinMemoryHeadroomMb(vm, swap);
+    const mb = level === 'normal' ? parseDarwinReclaimableMemoryMb(vm, swap) : parseDarwinMemoryHeadroomMb(vm, swap);
     if (!Number.isFinite(mb) || mb < 0) throw Error('invalid swap headroom');
+    if (level === 'normal') return { mb, source: 'memory-pressure', level };
     return { mb, source: 'vm_stat+swap' };
   }
   return readFreeMemoryReading(free);
@@ -121,7 +136,9 @@ export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => o
     if (!Number.isFinite(min) || min <= 0) throw Error('invalid host memory threshold');
     const { mb, source, level } = memoryReading({ env });
     if (!Number.isFinite(mb) || mb < 0) throw Error('unknown host memory');
-    const description = source === 'memory-pressure' ? `host memory pressure ${level}` : `host memory headroom ${Math.round(mb)}MB (free+swap)`;
+    const description = source === 'memory-pressure'
+      ? `host memory pressure ${level}; reclaimable headroom ${Math.round(mb)}MB`
+      : `host memory headroom ${Math.round(mb)}MB (free+swap)`;
     const reason = `${description}; host.minMemoryHeadroomMb=${min} (${policy.sources?.['host.minMemoryHeadroomMb'] ?? 'standard'}); source=${source}`;
     return mb >= min ? { admitted: true, reason: `${loadVerdict.reason}; ${reason}` } : { admitted: false, reason };
   } catch (e) { return { admitted: false, reason: `host memory unknown: ${e.message}` }; }

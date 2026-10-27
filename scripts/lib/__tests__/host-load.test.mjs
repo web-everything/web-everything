@@ -21,9 +21,12 @@ const vmStat = [
 ].join('\n');
 // (65536 + 8192 + 3584) * 16384 / MB = 1208; no free swap.
 const swapUsage = 'vm.swapusage: total = 1024.00M  used = 1024.00M  free = 0.00M';
+const reclaimableMb = 16832.984375; // 1208MB + 999999 inactive pages at 16KB/page.
+const lowVmStat = vmStat.replace('Pages inactive: 999999.', 'Pages inactive: 0.');
 const denied = () => Object.assign(new Error('Operation not permitted'), { code: 'EPERM' });
 
-function probes({ pressure = '1\n', pressureError, denySwap = false, denyVm = false } = {}) {
+function probes({ pressure = '1\n', pressureError, denySwap = false, denyVm = false,
+  vm = vmStat, swap = swapUsage, vmError, swapError } = {}) {
   const exec = vi.fn((command, args) => {
     if (command === 'sysctl' && args.length === 2
       && args[0] === '-n' && args[1] === pressureArgs[1]) {
@@ -32,11 +35,13 @@ function probes({ pressure = '1\n', pressureError, denySwap = false, denyVm = fa
     }
     if (command === 'vm_stat' && args.length === 0) {
       if (denyVm) throw denied();
-      return vmStat;
+      if (vmError) throw vmError;
+      return vm;
     }
     if (command === 'sysctl' && args.length === 1 && args[0] === 'vm.swapusage') {
       if (denySwap) throw denied();
-      return swapUsage;
+      if (swapError) throw swapError;
+      return swap;
     }
     throw new Error(`Unexpected probe: ${command} ${JSON.stringify(args)}`);
   });
@@ -47,6 +52,23 @@ const policy = {
   settings: { host: { maxLoadPerCore: 2, minMemoryHeadroomMb: 2048 } },
   sources: {},
 };
+
+describe('parseDarwinReclaimableMemoryMb', () => {
+  it('counts inactive pages and free swap in measured reclaimable memory', () => {
+    expect(hostLoad.parseDarwinReclaimableMemoryMb).toBeTypeOf('function');
+    const swap = 'vm.swapusage: total = 1024.00M  used = 767.50M  free = 256.50M';
+    expect(hostLoad.parseDarwinReclaimableMemoryMb(vmStat, swap)).toBe(17089.484375);
+    // Existing callers retain their pages-only definition, excluding inactive pages.
+    expect(hostLoad.parseDarwinMemoryHeadroomMb(vmStat, swap)).toBe(1464.5);
+  });
+
+  it('throws when Pages inactive is missing', () => {
+    expect(hostLoad.parseDarwinReclaimableMemoryMb).toBeTypeOf('function');
+    const missingInactive = vmStat.replace('Pages inactive: 999999.', '');
+    expect(() => hostLoad.parseDarwinReclaimableMemoryMb(missingInactive, swapUsage)).toThrow();
+    expect(hostLoad.parseDarwinMemoryHeadroomMb(missingInactive, swapUsage)).toBe(1208);
+  });
+});
 
 describe('parseDarwinMemoryPressureLevel', () => {
   it.each([
@@ -67,7 +89,7 @@ describe('parseDarwinMemoryPressureLevel', () => {
 
 describe('readHostMemoryReading Darwin pressure probe', () => {
   it.each([
-    ['1\n', 'normal', Number.MAX_SAFE_INTEGER],
+    ['1\n', 'normal', reclaimableMb],
     ['2\n', 'warn', 0],
     ['4\n', 'critical', 0],
   ])('uses pressure %j first and returns finite headroom for %s', (pressure, level, mb) => {
@@ -75,7 +97,9 @@ describe('readHostMemoryReading Darwin pressure probe', () => {
     const reading = hostLoad.readHostMemoryReading(probe);
     expect(reading).toEqual({ mb, source: 'memory-pressure', level });
     expect(Number.isFinite(reading.mb)).toBe(true);
-    expect(probe.exec.mock.calls).toEqual([['sysctl', pressureArgs, opts]]);
+    expect(probe.exec.mock.calls).toEqual(level === 'normal' ? [
+      ['sysctl', pressureArgs, opts], ['vm_stat', [], opts], ['sysctl', ['vm.swapusage'], opts],
+    ] : [['sysctl', pressureArgs, opts]]);
     expect(probe.free).not.toHaveBeenCalled();
   });
 
@@ -107,6 +131,35 @@ describe('readHostMemoryReading Darwin pressure probe', () => {
     expect(probe.free).toHaveBeenCalledOnce();
   });
 
+  it('falls back to pages only when swap is denied after normal pressure', () => {
+    const probe = probes({ denySwap: true });
+    expect(hostLoad.readHostMemoryReading(probe)).toEqual({ mb: 1208, source: 'vm_stat' });
+    expect(probe.free).not.toHaveBeenCalled();
+  });
+
+  it('falls back to os.freemem when vm_stat is denied after normal pressure', () => {
+    const probe = probes({ denyVm: true });
+    expect(hostLoad.readHostMemoryReading(probe)).toEqual({ mb: 3072, source: 'os.freemem' });
+    expect(probe.free).toHaveBeenCalledOnce();
+  });
+
+  it.each(['vmError', 'swapError'])('throws on a non-denial %s after normal pressure', (key) => {
+    const error = Object.assign(new Error('memory probe failed'), { code: 'EIO' });
+    const probe = probes({ [key]: error });
+    expect(() => hostLoad.readHostMemoryReading(probe)).toThrow(error);
+    expect(probe.free).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { vm: 'garbage' },
+    { vm: vmStat.replace('Pages inactive: 999999.', '') },
+    { swap: 'garbage' },
+  ])('throws on incomplete memory evidence after normal pressure: %j', (options) => {
+    const probe = probes(options);
+    expect(() => hostLoad.readHostMemoryReading(probe)).toThrow();
+    expect(probe.free).not.toHaveBeenCalled();
+  });
+
   it.each(['linux', 'win32'])('uses only os.freemem off Darwin (%s)', (platform) => {
     const probe = { ...probes(), platform };
     expect(hostLoad.readHostMemoryReading(probe)).toEqual({ mb: 3072, source: 'os.freemem' });
@@ -134,18 +187,70 @@ describe('hostLoadAdmission with the default memoryReading', () => {
     Object.defineProperty(process, 'platform', platformDescriptor);
   });
 
-  function admission({ pressure = '1', env = {}, load = () => [1] } = {}) {
-    const probe = probes({ pressure });
+  function admission({ pressure = '1', env = {}, load = () => [1], ...probeOptions } = {}) {
+    const probe = probes({ pressure, ...probeOptions });
     native.exec.mockImplementation(probe.exec);
     // Deliberately omit memory and memoryReading to exercise the default reader.
     return hostLoad.hostLoadAdmission({ policy, interactive: false, env, load, cores: () => 8 });
   }
 
-  it('admits normal pressure despite 1208MB vm_stat headroom below the 2048MB minimum', () => {
+  it('normal above floor admits', () => {
     const result = admission();
     expect(result.admitted).toBe(true);
     expect(result.reason).toContain('source=memory-pressure');
     expect(native.exec).toHaveBeenNthCalledWith(1, 'sysctl', pressureArgs, opts);
+    expect(native.free).not.toHaveBeenCalled();
+  });
+
+  it('normal below floor holds', () => {
+    const result = admission({ vm: lowVmStat });
+    expect(result.admitted).toBe(false);
+    expect(result.reason).toContain('source=memory-pressure');
+    expect(result.reason).toContain('host.minMemoryHeadroomMb=2048');
+    expect(native.exec).toHaveBeenCalledWith('vm_stat', [], opts);
+    expect(native.exec).toHaveBeenCalledWith('sysctl', ['vm.swapusage'], opts);
+    expect(native.free).not.toHaveBeenCalled();
+  });
+
+  it('normal exactly at floor admits', () => {
+    const vm = vmStat.replace('Pages inactive: 999999.', 'Pages inactive: 53760.');
+    const result = admission({ vm });
+    expect(result.admitted).toBe(true);
+    expect(result.reason).toContain('source=memory-pressure');
+    expect(native.exec).toHaveBeenCalledWith('vm_stat', [], opts);
+  });
+
+  it('warn holds', () => {
+    const result = admission({ pressure: '2' });
+    expect(result.admitted).toBe(false);
+    expect(result.reason).toContain('source=memory-pressure');
+    expect(native.exec.mock.calls).toEqual([['sysctl', pressureArgs, opts]]);
+    expect(native.free).not.toHaveBeenCalled();
+  });
+
+  it('holds on pages-only fallback when swap is denied after normal pressure', () => {
+    const result = admission({ denySwap: true });
+    expect(result.admitted).toBe(false);
+    expect(result.reason).toContain('headroom 1208MB');
+    expect(result.reason).toContain('source=vm_stat');
+    expect(native.free).not.toHaveBeenCalled();
+  });
+
+  it.each(['vmError', 'swapError'])('holds on non-denial %s after normal pressure', (key) => {
+    const result = admission({ [key]: Object.assign(new Error('memory probe failed'), { code: 'EIO' }) });
+    expect(result.admitted).toBe(false);
+    expect(result.reason).toContain('host memory unknown: memory probe failed');
+    expect(native.free).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { vm: 'garbage' },
+    { vm: vmStat.replace('Pages inactive: 999999.', '') },
+    { swap: 'garbage' },
+  ])('holds on incomplete memory evidence after normal pressure: %j', (options) => {
+    const result = admission(options);
+    expect(result.admitted).toBe(false);
+    expect(result.reason).toContain('host memory unknown:');
     expect(native.free).not.toHaveBeenCalled();
   });
 
