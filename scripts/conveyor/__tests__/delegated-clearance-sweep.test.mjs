@@ -265,12 +265,14 @@ describe('R130 delegated clearance', () => {
     const call = h.runLabel.mock.calls[0][0], output = [];
     const provider = { readPostingIdentity: vi.fn(() => { throw new Error('validation complete; no network'); }) };
     const exit = vi.spyOn(process, 'exit').mockImplementation(() => { throw new Error('exit'); });
+    // The CLI checks delegation expiry against the wall clock; pin it to the sweep's clock.
+    vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(h.now());
     try {
       expect(() => runReviewLabelCli({ argv: [String(call.num), `--repo=${call.repo}`, ...call.args],
         allowClearHuman: true, provider, emit: s => output.push(s) })).toThrow('exit');
       expect(provider.readPostingIdentity).toHaveBeenCalledTimes(1);
       expect(output.join('')).toContain('validation complete; no network');
-    } finally { exit.mockRestore(); }
+    } finally { exit.mockRestore(); vi.useRealTimers(); }
   });
   it('the real CLI refuses a moved head before any write', () => {
     const h = harness(); sweepDelegatedClearance(h);
@@ -278,13 +280,14 @@ describe('R130 delegated clearance', () => {
     const provider = { readPostingIdentity: () => ({ login: 'chalbert', type: 'User' }),
       readPrState: vi.fn(() => ({ ...pr(), headRefOid: prior })), setLabels: vi.fn(), postComment: vi.fn() };
     const exit = vi.spyOn(process, 'exit').mockImplementation(() => { throw new Error('exit'); });
+    vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(h.now());
     try {
       expect(() => runReviewLabelCli({ argv: [String(call.num), `--repo=${call.repo}`, ...call.args],
         allowClearHuman: true, provider, emit: s => output.push(s) })).toThrow('exit');
       expect(output.join('')).toContain('live head differs from --expect-head');
       expect(provider.setLabels).not.toHaveBeenCalled();
       expect(provider.postComment).not.toHaveBeenCalled();
-    } finally { exit.mockRestore(); }
+    } finally { exit.mockRestore(); vi.useRealTimers(); }
   });
   it.each(['missing-delegation', 'null-delegation', 'invalid-head', 'new-head'])('the real CLI rejects invalid pinned clearance: %s', invalid => {
     const h = harness(); sweepDelegatedClearance(h);
