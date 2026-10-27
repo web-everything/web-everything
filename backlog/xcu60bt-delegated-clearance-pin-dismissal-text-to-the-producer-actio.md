@@ -19,7 +19,7 @@ PR #5983 deferred its later-round advisory coverage suggestion to a card. Add na
 
 ### Named planned cases (A1–A3)
 
-Add these cases to `scripts/conveyor/__tests__/delegated-clearance-sweep.test.mjs`; these are planned tests, not claims of existing coverage. Use a complete synthetic thread with an older confirmed break, a matching pre-approval and injected state, event and label sinks.
+Add these cases to `we:scripts/conveyor/__tests__/delegated-clearance-sweep.test.mjs`; these are planned tests, not claims of existing coverage. Use a complete synthetic thread with an older confirmed break, a matching pre-approval and injected state, event and label sinks.
 
 - **A1 — `dismissal after a blank line leaves the approval void`**: put a matching dismissal line after the blank line terminating the trusted operator's action block. Assert `pre-approval-void` and zero label-writer calls.
 - **A1 — `quoted dismissal in findings leaves the approval void`**: put the same line in a Markdown blockquote in the findings below the action block. Assert `pre-approval-void` and zero label-writer calls.
