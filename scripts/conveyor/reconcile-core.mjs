@@ -2076,6 +2076,8 @@ export function missingReviewLabel(pr) {
 
 
 export function planReconcile({
+  // Injectable review decision for exercising dispatch/refusal/no-op handoffs; production uses the shared gates.
+  dispatchReviewRow: dispatchReview = dispatchReviewRow,
   repo = 'we', prs = [], agents = [], durableCounts = {}, now = 0, roundCap = NEGOTIATION_ROUND_CAP, ciHealCap: ciHealCapArg = null,
   // `ciHeal.*` budget cascade ({@link resolveCiHealBudget}); the IO shell may pass the resolved layers. An explicit
   // `ciHealCap` still wins (source `caller`).
@@ -2421,7 +2423,7 @@ export function planReconcile({
         let reviewRefusal = null;
         if (takeover.hold === 'review-human-hold' && headSha && !advisoryIsCurrent && !alreadyReviewed && !unpinnedAdvisory) {
           const rowsBefore = dispatch.length;
-          dispatchReviewRow({
+          dispatchReview({
             pr, requiredChecks, withPhase: extra, base, attempts: extra.attempts, roundCap: extra.cap, now, dispatch,
             refuse: (kind, x) => { reviewRefusal = { kind, why: x?.why }; refuseFn(kind, x); },
             refuseCapExhausted: () => {},
@@ -2860,7 +2862,7 @@ export function planReconcile({
       if (!headSha || advisoryIsCurrent || alreadyReviewed || unpinnedAdvisory) return;
       const folded = foldReviewRefusalInto(refusals[refusals.length - 1], withPhase, 'humanHandoffAdvisory');
       // Card 273, #5157: review-pr INVARIANT 2 never accepts a review:human PR.
-      dispatchReviewRow({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(),
+      dispatchReview({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(),
         roundCap: effectiveRoundCap, now, refuse: folded, refuseCapExhausted: capExhaustedVia(folded), dispatch,
         extra: { humanHandoffAdvisory: true }, advisoryReview: { head: headSha, reason, ciWaived: true,
           why: reason === 'human-handoff'
@@ -3102,7 +3104,7 @@ export function planReconcile({
           refuse(fixHold.kind, { ...withPhase, why: fixHold.why });
           if (withPhase.labels.includes('review:pending')) {
             const foldRefusal = foldReviewRefusalInto(refusals[refusals.length - 1], withPhase, 'owedCiRerun');
-            dispatchReviewRow({
+            dispatchReview({
               pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, now,
               refuse: foldRefusal, refuseCapExhausted: capExhaustedVia(foldRefusal), dispatch,
               extra: { owedCiRerun: true },
@@ -3119,7 +3121,7 @@ export function planReconcile({
           const foldReview = row => {
             if (!withPhase.labels.includes('review:pending')) return;
             const foldRefusal = foldReviewRefusalInto(row, withPhase, 'owedCiRerun');
-            dispatchReviewRow({
+            dispatchReview({
               pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, now,
               refuse: foldRefusal, refuseCapExhausted: capExhaustedVia(foldRefusal), dispatch,
               extra: { owedCiRerun: true },
@@ -3171,7 +3173,7 @@ export function planReconcile({
           // same refusal row. Required checks must succeed even when their failure belongs to main.
           if (withPhase.labels.includes('review:pending')) {
             const foldRefusal = foldReviewRefusalInto(refusals[refusals.length - 1], withPhase, 'owedCiRerun');
-            dispatchReviewRow({
+            dispatchReview({
               pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, now,
               refuse: foldRefusal, refuseCapExhausted: capExhaustedVia(foldRefusal), dispatch,
               extra: { owedCiRerun: true },
@@ -3262,7 +3264,7 @@ export function planReconcile({
           // A comment claiming CI is irrelevant cannot override a required check's actual result.
           if (isNotCiBreak && withPhase.labels.includes('review:pending')) {
             const foldRefusal = foldReviewRefusalInto(refusals[refusals.length - 1], withPhase, 'ciHealNotCiBreak');
-            dispatchReviewRow({
+            dispatchReview({
               pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, now,
               refuse: foldRefusal, refuseCapExhausted: capExhaustedVia(foldRefusal), dispatch,
               extra: { ciHealNotCiBreak: true },
@@ -3470,7 +3472,8 @@ export function planReconcile({
     if (!ciRepairOwed && reviewGateOnlyRed && !reviewGateHasChanges && !reviewGateRulingOwed
         && !cancelledReviewNeedsRepair && ['ci-red', 'needs-human', 'needs-review'].includes(phase)) {
       const dispatchCount = dispatch.length;
-      dispatchReviewRow({ pr: reviewPr, requiredChecks, withPhase, base, attempts: roundAttempts(),
+      const refusalCount = refusals.length;
+      dispatchReview({ pr: reviewPr, requiredChecks, withPhase, base, attempts: roundAttempts(),
         roundCap: effectiveRoundCap, now, refuse, refuseCapExhausted, dispatch,
         extra: { nonRequiredRed: reviewFailures.nonRequired } });
       for (const row of dispatch.slice(dispatchCount)) {
@@ -3478,7 +3481,7 @@ export function planReconcile({
       }
       // A refused review does not own a missing required job: let the stale-base repair below try.
       // Successful dispatches and all other review holds retain their existing priority.
-      const reviewRefusal = refusals.at(-1);
+      const reviewRefusal = refusals.length > refusalCount ? refusals.at(-1) : null;
       if (dispatch.length !== dispatchCount || reviewRefusal?.kind !== 'review-ci'
           || !reviewRefusal.ci?.affected?.some(row => row.reason === 'missing')) continue;
     }
@@ -3781,7 +3784,7 @@ export function planReconcile({
     // All three checks (the head guard, no-findings, the cap) live in {@link dispatchReviewRow} — the ONE copy,
     // shared with the ci-red-parallel review above (PR #2783 review: the review decision was duplicated here).
     if (OWED[phase] === 'review') {
-      dispatchReviewRow({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, refuse, refuseCapExhausted, dispatch, now });
+      dispatchReview({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, refuse, refuseCapExhausted, dispatch, now });
       continue;
     }
 

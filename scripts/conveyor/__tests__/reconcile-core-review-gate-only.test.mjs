@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { planReconcile } from '../reconcile-core.mjs';
 import { buildCiHealEscalationComment, notCiBreakRecordRefusal } from '../ci-heal-escalation-mark.mjs';
 import { planVerdictVoid } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
@@ -18,6 +18,24 @@ const plan = (pull, options = {}) => planReconcile({ prs: [{ ...pull, statusChec
   requiredChecks: ['test', 'smoke'], ...options });
 
 describe('review-gate-only red belongs to review', () => {
+  it('a silent review decision cannot inherit a previous PR missing-check refusal', () => {
+    const pulls = [5924, 5925].map(number => pr({ number, baseRefName: 'main',
+      statusCheckRollup: [...fastChecks, checks[0], checks[2]] }));
+    const dispatchReviewRow = vi.fn(({ pr: pull, refuse, withPhase }) => {
+      if (pull.number === 5924) refuse('review-ci', { ...withPhase,
+        ci: { affected: [{ name: 'smoke', reason: 'missing' }] } });
+      // The second call deliberately neither dispatches nor refuses.
+    });
+    const result = planReconcile({ prs: pulls, agents: [], requiredChecks: ['test', 'smoke'],
+      reviewTiming: { startAfter: 'ci-green' }, dispatchReviewRow });
+    expect(dispatchReviewRow.mock.calls.map(([args]) => args.pr.number)).toEqual([5924, 5925]);
+    expect(result.refusals.filter(row => row.kind === 'review-ci')).toEqual([
+      expect.objectContaining({ prNumber: 5924 }),
+    ]);
+    expect(result.dispatch).toEqual([expect.objectContaining({ prNumber: 5924,
+      kind: 'fix', mode: 'stale-base-rebase' })]);
+  });
+
   it('missing required smoke falls through refused review to stale-base repair', () => {
     const result = plan(pr({ baseRefName: 'main', statusCheckRollup: [checks[0], checks[2]] }),
       { reviewTiming: { startAfter: 'ci-green' } });

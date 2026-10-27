@@ -69,6 +69,22 @@ export default {
     ];
     const violations = [];
     for (let tick = 0; tick < 3; tick++) {
+      const silentReview = planReconcile({
+        prs: [5924, 5925].map(number => ({ ...pull, number, baseRefName: 'main',
+          statusCheckRollup: rollup.filter(row => row.name !== 'smoke') })),
+        agents: [], requiredChecks: ['test', 'smoke'], reviewTiming: { startAfter: 'ci-green' },
+        now: Date.parse('2026-10-26T12:00:00Z') + tick * 60000,
+        dispatchReviewRow: ({ pr, refuse, withPhase }) => {
+          if (pr.number === 5924) refuse('review-ci', { ...withPhase,
+            ci: { affected: [{ name: 'smoke', reason: 'missing' }] } });
+          // The next PR has a silent decision, so it must not inherit this refusal.
+        },
+      });
+      if (silentReview.dispatch.length !== 1 || silentReview.dispatch[0].prNumber !== 5924
+          || silentReview.dispatch[0].mode !== 'stale-base-rebase') {
+        violations.push(`tick ${tick}: silent review inherited another PR's stale-base repair`);
+      }
+      log?.(`tick ${tick} silent review: ${silentReview.dispatch.map(row => `${row.prNumber}:${row.mode}`).join(',')}`);
       for (const variant of variants) {
         const pr = { ...pull, ...variant.over };
         if (variant.recordAfterTick && tick > 0) pr.comments = [standDown];

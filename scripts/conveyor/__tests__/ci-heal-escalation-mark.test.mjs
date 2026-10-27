@@ -7,7 +7,7 @@
  *   same head with nothing durable recorded).
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync, mkdtempSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -21,6 +21,7 @@ import {
 import { collectCiAuthDiagnosis } from '../ci-auth-diagnosis.mjs';
 import { owedWriteAlreadyLive } from '../ci-heal-owed.mjs';
 import { budgetBlockedMessage } from '../../lib/gh-throttle.mjs';
+import { timeoutKey } from '../timeout-retry-state.mjs';
 
 const AUTOMATION = { login: 'web-everything' };
 const HEAD = '70326866f0f299ddd005f9da54f0b87a3c169ac4'; // PR #2783's real head, 2026-09-27
@@ -340,13 +341,18 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
     ];
     expect(refusal({ pr: { ...fixture, statusCheckRollup }, requiredChecks: ['test', 'smoke', 'review-gate'] })).toBeNull();
   });
-  it.each(['IN_PROGRESS', 'MISSING', 'FAILURE'])('cancelled smoke does not excuse %s real work', state => {
+  it.each([
+    ['IN_PROGRESS', 'still running'],
+    ['MISSING', 'not started'],
+    ['FAILURE', 'red'],
+  ])('cancelled smoke does not excuse %s real work', (state, category) => {
     const statusCheckRollup = [
       { name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED' },
       { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
       ...(state === 'MISSING' ? [] : [{ name: 'test', status: state === 'IN_PROGRESS' ? state : 'COMPLETED', conclusion: state === 'FAILURE' ? state : null }]),
     ];
-    expect(refusal({ pr: { ...fixture, statusCheckRollup }, requiredChecks: ['test', 'smoke', 'review-gate'] })).toContain('test');
+    expect(refusal({ pr: { ...fixture, statusCheckRollup }, requiredChecks: ['test', 'smoke', 'review-gate'] }))
+      .toContain(`— ${category}: test. `);
   });
   it.each([
     ['eligible', { confirmed: 0, rejected: 0, pending: false }, true],
@@ -441,6 +447,32 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
       .toEqual({ refusal: expect.stringContaining('retry') });
     expect(enrichRetry).toHaveBeenCalledWith(expect.objectContaining({ number: 4535, headRefOid: head }), { repo: fixture.repo });
   });
+  it.each([false, true])('default retry enrichment reads the durable pending=%s budget through its production import', async pending => {
+    const dir = mkdtempSync(join(tmpdir(), 'ci-heal-default-retry-'));
+    try {
+      vi.stubEnv('WE_GH_THROTTLE_LOCK_ROOT', dir);
+      vi.stubEnv('WE_CI_TIMEOUT_RERUN_ENABLED', '1');
+      const evidence = { repo: fixture.repo, pr: 4535, head };
+      mkdirSync(join(dir, 'ci-timeout-reruns'));
+      writeFileSync(join(dir, 'ci-timeout-reruns', `${timeoutKey(evidence)}.json`), JSON.stringify({
+        version: 1, evidence, requests: pending ? [{ status: 'pending' }] : [],
+      }));
+      const opts = recordOptions();
+      // No check origin: the production classifier can read the local budget without network IO.
+      // No enrichRetry injection: exercise defaultEnrichRetry and its real dynamic import.
+      opts.readPr.mockReturnValue({ headRefOid: head, statusCheckRollup: [
+        { name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED' },
+      ] });
+      opts.readRequired.mockResolvedValue({ checks: ['smoke'] });
+      expect(await checkNotCiBreakRecordable(opts)).toEqual({ refusal: pending
+        ? 'Cancelled smoke still has an infrastructure retry pending or owed; resolve the retry before recording not-a-ci-break.'
+        : null });
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it.each(['throw', 'classified-error'])('recording IO refuses unreadable cancelled smoke retry evidence: %s', async mode => {
     const opts = recordOptions();
     opts.readPr.mockReturnValue({ ...fixture, statusCheckRollup: [
