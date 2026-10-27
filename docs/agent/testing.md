@@ -138,8 +138,10 @@ Capture skips non-regular files and platforms without `O_NOFOLLOW`; inspection, 
 When copying `scripts/` into a throwaway checkout, link that checkout's `node_modules` to the source
 checkout's installed dependencies. Run the copied entry point so its `import.meta.url` still resolves
 mutations inside the fixture. Node resolves package imports from the copied modules' location, even
-when the child process runs from another directory. Keep the dependency link at the fixture root when
-moving its `scripts/` subtree for locus guards, and remove the fixture during teardown.
+when the child process runs from another directory. Copy repository-relative imports outside `scripts/`
+too: the transcript checker needs `skills-src/inspect-codex-transcript/` at the fixture root. When moving
+`scripts/` for locus guards, move that dependency alongside it and retain access to `node_modules`.
+Remove the fixture during teardown.
 
 ## Daemon entry boot smoke
 
