@@ -469,6 +469,9 @@ const REVIEW_CODE_PATH_FILES = new Set([
   'scripts/lib/card-only-head-move.mjs', 'scripts/lib/red-team-carry-machine.mjs', 'scripts/lib/red-team-carry-io.mjs',
   'scripts/lib/rebase-verdict-carry.mjs', 'scripts/lib/red-team-gate.mjs', 'scripts/lib/drain-red-team-evidence.mjs',
   'scripts/lib/red-team-status-labels.mjs',
+  'scripts/lib/saved-red-team-provenance.mjs', 'scripts/lib/drain-saved-red-team.mjs',
+  'scripts/lib/drain-red-team-requests.mjs',
+  'scripts/lib/red-team-rerequest.mjs', 'scripts/lib/lane-git-hardening.mjs', 'scripts/lib/proc-read.mjs',
   // 117 S3b — the review session and the review job now launch / record through the unified worker wrapper.
   'scripts/operations/worker-wrapper-launch.mjs', 'scripts/operations/worker-wrapper.mjs',
 ]);

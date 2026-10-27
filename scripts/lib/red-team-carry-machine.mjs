@@ -7,6 +7,8 @@ import { withFileLock, writeJsonAtomic } from './atomic-json-file.mjs';
 
 const steps = ['intent', 'label', 'comment', 'done'];
 const sha = value => typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value);
+export const eligibleRedTeamCarryPayload = (payload, head) => sha(payload?.carriedFrom)
+  && payload?.findings?.read?.netBasis?.rev === head;
 function identity({ repo, pr, head, kind = 'card-only' }) {
   if (typeof repo !== 'string' || !repo || !Number.isSafeInteger(Number(pr)) || Number(pr) <= 0
     || !sha(head) || kind !== 'card-only') throw Error('invalid carry identity; inspect stored evidence before retrying');
@@ -22,8 +24,7 @@ export function readRedTeamCarry({ env = process.env, ...key }) {
     const state = JSON.parse(readFileSync(carryPath(key, env), 'utf8'));
     if (state?.version !== 1 || !steps.includes(state.step)
       || JSON.stringify(identity(state)) !== JSON.stringify(identity(key))
-      || state.loopPayload?.verdict !== null || !sha(state.loopPayload?.carriedFrom)
-      || state.loopPayload?.findings?.read?.netBasis?.rev !== state.head) {
+      || state.loopPayload?.verdict !== null || !eligibleRedTeamCarryPayload(state.loopPayload, state.head)) {
       throw Error('invalid carry journal; inspect stored evidence before retrying');
     }
     return state;
@@ -44,7 +45,7 @@ export function resumeRedTeamCarry(input, io) {
     if (state?.step === 'done') return { outcome: 'already' };
     if (!state) {
       const payload = input.loopPayload;
-      if (!sha(payload?.carriedFrom) || payload?.findings?.read?.netBasis?.rev !== key.head) {
+      if (!eligibleRedTeamCarryPayload(payload, key.head)) {
         throw Error('invalid carry payload; inspect stored evidence before retrying');
       }
       state = { ...key, version: 1, step: 'intent', loopPayload: { ...payload, verdict: null } };

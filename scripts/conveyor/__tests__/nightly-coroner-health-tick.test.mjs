@@ -47,7 +47,7 @@ it('queues only on enabled live ticks and records a failure without crashing', a
 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
-it('keeps job failures out of the probe streak and closes the episode after the next successful night', async () => {
+it('keeps unresolved job failures in the probe streak after the next successful night', async () => {
   const root = mkdtempSync(join(tmpdir(), 'nightly-coroner-health-ledger-'));
   const dir = healthDir(root); mkdirSync(dir, { recursive: true });
   const ps = join(root, 'ps.txt'); writeFileSync(ps, '');
@@ -62,22 +62,22 @@ it('keeps job failures out of the probe streak and closes the episode after the 
     store.update(first.enqueued, (r) => ({ ...r, job: { ...r.job, status: 'failed', error: 'lane contention' } }));
     for (const now of ['2026-10-17T03:00:00Z', '2026-10-17T03:01:00Z', '2026-10-17T03:02:00Z']) {
       const out = await tick({ ...flags, now }, { runNightlyCoronerJob: job, publishCoronerFailure: publish });
-      expect(out.probeErrors.nightlyCoronerJob).toBeUndefined();
+      expect(out.probeErrors.nightlyCoronerJob).toContain('lane contention');
     }
     const failedState = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8'));
     expect(Object.values(failedState.episodes).some((ep) => ep.subject === first.enqueued)).toBe(true);
-    expect(publish).not.toHaveBeenCalled();
+    expect(publish).toHaveBeenCalled();
     const feed = readFileSync(statusFeed, 'utf8');
     const next = await job({ now: Date.parse('2026-10-18T02:17:00Z') });
     store.update(next.enqueued, (r) => ({ ...r, job: { ...r.job, status: 'succeeded' } }));
     for (const now of ['2026-10-18T03:00:00Z', '2026-10-18T03:01:00Z', '2026-10-18T03:02:00Z']) {
       const out = await tick({ ...flags, now }, { runNightlyCoronerJob: job, publishCoronerFailure: publish });
-      expect(out.probeErrors.nightlyCoronerJob).toBeUndefined();
+      expect(out.probeErrors.nightlyCoronerJob).toContain('lane contention');
     }
     const recovered = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8'));
-    expect(Object.values(recovered.episodes).filter((ep) => ep.smell === 'nightly-coroner-failed')).toEqual([]);
-    expect(recovered.history.some((ep) => ep.subject === first.enqueued && ep.status === 'closed')).toBe(true);
-    expect(publish).not.toHaveBeenCalled();
+    expect(Object.values(recovered.episodes).some(ep => ep.subject === first.enqueued)).toBe(true);
+    expect(recovered.history.some((ep) => ep.subject === first.enqueued && ep.status === 'closed')).toBe(false);
+    expect(publish).toHaveBeenCalled();
     expect(readFileSync(statusFeed, 'utf8')).toBe(feed);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

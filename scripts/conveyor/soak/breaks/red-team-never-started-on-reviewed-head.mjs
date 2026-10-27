@@ -106,6 +106,8 @@ export default {
             setting, lastDispatch: history, now: () => at,
             readEvidence: ({ pr }) => byPr.get(pr).evidence,
             readStatus: ({ pr }) => byPr.get(pr).status,
+            // Accepted recovery candidates read formal reviews separately from the PR snapshot.
+            readReviews: () => [],
             dispatch: args => {
               starts.push(args);
               check(args.repo === repo && args.redTeamOnly === true, `${phase}: start must use the red-team-only job for this repo`);

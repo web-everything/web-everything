@@ -1,14 +1,27 @@
 // @vitest-environment node
-import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { beforeEach as beforeTimingFixture, afterEach as afterTimingFixture, vi as timingFixture } from 'vitest';
+beforeTimingFixture(() => timingFixture.stubEnv('WE_RED_TEAM_TIMING', 'post-accept'));
+afterTimingFixture(() => timingFixture.unstubAllEnvs());
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { saveProvenanceFixtures } from './fixtures/saved-red-team-provenance.mjs';
+import { resolveScorecardStorePath } from '../../conveyor/run-scorecard-store.mjs';
+import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
+import { dirname, join } from 'node:path';
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
-import { historicalCardOnlySkipCandidate, readDrainRedTeamEvidence, recordRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
+import { historicalCardOnlySkipCandidate, readDrainRedTeamEvidence, recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { redTeamOwedFor } from '../review-red-team-policy.mjs';
 import { pidStartTime } from '../pid-alive.mjs';
-import { resumeRedTeamCarry } from '../red-team-carry-machine.mjs';
+import { readRedTeamCarry, resumeRedTeamCarry } from '../red-team-carry-machine.mjs';
+import { staleRedTeamRequestEligibility } from '../drain-merge-strategy.mjs';
+import { redTeamSkipNeedsSettlement } from '../review-red-team-on-skip.mjs';
+
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, readFileSync: vi.fn(actual.readFileSync) };
+});
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -17,9 +30,372 @@ function fixture() {
   roots.push(root);
   const runsDir = join(root, 'runs');
   return { repo: 'web-everything/web-everything', pr: 5439, head: 'b'.repeat(40), runsDir,
-    readScorecards: () => [], env: { WE_SHARED_RUNS_DIR: runsDir } };
+    readScorecards: () => [], env: { WE_RED_TEAM_TIMING: 'post-accept', WE_SHARED_RUNS_DIR: runsDir, CONVEYOR_STATE_ROOT: root } };
 }
 const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
+
+describe('readRedTeamStatus legacy filename compatibility', () => {
+  it('returns the legacy-filename status for a mixed-case repo/head when the normalized file is absent', () => {
+    const f = { ...fixture(), repo: 'Web-Everything/Web-Everything', head: 'B'.repeat(40) };
+    const status = { repo: f.repo, pr: f.pr, head: f.head, status: 'running',
+      pid: process.pid, loopPayload: payload(f.head) };
+    const legacy = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+    mkdirSync(dirname(legacy), { recursive: true });
+    writeFileSync(legacy, JSON.stringify(status));
+
+    expect(readDrainRedTeamEvidence(f).status).toEqual(status);
+    expect(readRedTeamStatus(f)).toEqual(status);
+  });
+
+  it.each(['legacy', 'normalized'])('returns the newer %s-filename status by mtime when both files exist', newer => {
+    const f = { ...fixture(), repo: 'Web-Everything/Web-Everything', head: 'B'.repeat(40) };
+    const paths = {
+      legacy: join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`),
+      normalized: join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo.toLowerCase())}-${f.pr}-${f.head.toLowerCase()}.json`),
+    };
+    const statuses = {
+      legacy: { repo: f.repo, pr: f.pr, head: f.head, status: 'running', pid: process.pid, loopPayload: payload(f.head) },
+      normalized: { repo: f.repo, pr: f.pr, head: f.head, status: 'queued', pid: process.pid, loopPayload: payload(f.head) },
+    };
+    mkdirSync(redTeamStatusDir(f.env), { recursive: true });
+    const probe = join(redTeamStatusDir(f.env), 'case-probe');
+    writeFileSync(probe, 'probe');
+    let caseSensitive = false;
+    try {
+      expect(readFileSync(join(redTeamStatusDir(f.env), 'CASE-PROBE'), 'utf8')).toBe('probe');
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      caseSensitive = true;
+    }
+    // Fix mtimes explicitly: neither filesystem resolution nor write order chooses the winner.
+    for (const name of ['legacy', 'normalized']) {
+      writeFileSync(paths[name], JSON.stringify(statuses[name]));
+      const at = 1_700_000_000 + (name === newer ? 60 : 0);
+      utimesSync(paths[name], at, at);
+    }
+
+    if (caseSensitive) {
+      expect(readDrainRedTeamEvidence(f).status).toEqual(statuses[newer]);
+      expect(readRedTeamStatus(f)).toEqual(statuses[newer]);
+    } else {
+      // Both spellings alias one file; the normalized record was written last.
+      const drainStatus = readDrainRedTeamEvidence(f).status;
+      const status = readRedTeamStatus(f);
+      expect(drainStatus).toEqual(statuses.normalized);
+      expect(status).toEqual(statuses.normalized);
+      expect(status).toEqual(drainStatus);
+    }
+  });
+});
+
+describe('invalid status carry cannot suppress failed-seat recovery', () => {
+  function failedSeatFixture() {
+    const f = fixture();
+    const loopPayload = payload(f.head);
+    loopPayload.findings.read.diffText = 'diff --git a/scripts/a.mjs b/scripts/a.mjs\n+code';
+    loopPayload.findings.read.netChangedFiles = ['scripts/a.mjs'];
+    writeRun({ ...newRunRecord({ id: 'review-pr-live', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
+      ...loopPayload }, f.runsDir);
+    f.readScorecards = () => [{ dispatchKind: 'review-seat', seat: 'red-team', repo: f.repo,
+      pr: f.pr, rev: f.head, status: 'unparseable' }];
+    const path = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+    mkdirSync(dirname(path), { recursive: true });
+    return { f, path, loopPayload };
+  }
+  function invalidStatus(f, loopPayload, over = {}) {
+    return { repo: f.repo, pr: f.pr, head: f.head, status: 'finished', result: 'skipped', skipCardOnly: true,
+      loopPayload: { ...loopPayload, verdict: null, carriedFrom: 'not-a-sha' }, ...over };
+  }
+
+  const nonCarryStatuses = [
+    ['error result', { status: 'finished', result: 'error', skipCardOnly: false }],
+    ['finished ran result', { status: 'finished', result: 'ran', skipCardOnly: false }],
+    ['object error result', { status: 'finished', result: { status: 'error' }, skipCardOnly: false }],
+    ['skip with card-only disabled', { status: 'finished', result: 'skipped', skipCardOnly: false }],
+    ['skip with another policy', { status: 'finished', result: { status: 'skipped', policy: 'daily-cap' }, skipCardOnly: false }],
+  ];
+  const recoveryState = evidence => ({ carryConflict: evidence.carryConflict, scheduled: evidence.scheduled,
+    noUsableResult: evidence.noUsableResult, failedSeatCount: evidence.failedSeatCount });
+  const skippedResults = [
+    ['string skipped', 'skipped'],
+    ['object card-only skip', { status: 'skipped', policy: 'card-only' }],
+  ];
+
+  it.each(skippedResults)('%s code-diff status with valid carriedFrom and no journal cannot suppress failed-seat recovery', (_kind, result) => {
+    const { f, path, loopPayload } = failedSeatFixture();
+    expect(readRedTeamCarry(f)).toBeNull();
+    const status = { repo: f.repo, pr: f.pr, head: f.head, status: 'finished',
+      result, skipCardOnly: true, loopPayload };
+    expect(redTeamSkipNeedsSettlement(status)).toBe(false);
+    writeFileSync(path, JSON.stringify(status));
+    const ordinary = recoveryState(readDrainRedTeamEvidence(f));
+    expect(ordinary).toEqual({ carryConflict: undefined, scheduled: true, noUsableResult: true, failedSeatCount: 1 });
+
+    writeFileSync(path, JSON.stringify({ ...status, loopPayload: { ...loopPayload, carriedFrom: 'a'.repeat(40) } }));
+    expect(recoveryState(readDrainRedTeamEvidence(f)),
+      'skipCardOnly is a setting; a code diff cannot authorize carry or hide the failed seat').toEqual(ordinary);
+  });
+
+  it.each(skippedResults)('merge-strategy keeps the failed-seat request eligible, not red team not owed, for %s code diff with valid carriedFrom and no journal', (_kind, result) => {
+    const { f, path, loopPayload } = failedSeatFixture();
+    expect(readRedTeamCarry(f)).toBeNull();
+    const status = { repo: f.repo, pr: f.pr, head: f.head, status: 'finished',
+      result, skipCardOnly: true, loopPayload };
+    const eligible = () => staleRedTeamRequestEligibility({ ...f, evidence: readDrainRedTeamEvidence(f),
+      enabled: true, labels: ['review:accepted', 'ready-to-merge'] });
+    writeFileSync(path, JSON.stringify(status));
+    const ordinary = eligible();
+    expect(ordinary).toEqual({ eligible: true, reason: 'stale rows with no usable result' });
+
+    writeFileSync(path, JSON.stringify({ ...status, loopPayload: { ...loopPayload, carriedFrom: 'a'.repeat(40) } }));
+    expect(eligible(), 'code-diff skip metadata must not suppress the drain consumer request').toEqual(ordinary);
+  });
+
+  it.each(skippedResults)('%s code-diff status with valid carriedFrom and no journal cannot supply a panel accept verdict', (_kind, result) => {
+    const { f, path, loopPayload } = failedSeatFixture();
+    expect(readRedTeamCarry(f)).toBeNull();
+    writeFileSync(path, JSON.stringify({ repo: f.repo, pr: f.pr, head: f.head, status: 'finished',
+      result, skipCardOnly: true, loopPayload: { ...loopPayload, carriedFrom: 'a'.repeat(40) } }));
+
+    const evidence = readDrainRedTeamEvidence(f);
+    expect(evidence.status.loopPayload.verdict).toEqual({ verdict: 'accept' });
+    expect(evidence.loopPayload?.verdict?.verdict,
+      'settlement provenance cannot stand in for a panel verdict, even when carry is ineligible').not.toBe('accept');
+  });
+
+  it.each(nonCarryStatuses)('valid carriedFrom on %s cannot suppress failed-seat recovery', (_kind, fields) => {
+    const { f, path, loopPayload } = failedSeatFixture();
+    expect(readRedTeamCarry(f)).toBeNull();
+    const status = { repo: f.repo, pr: f.pr, head: f.head, loopPayload, ...fields };
+    writeFileSync(path, JSON.stringify(status));
+    const ordinary = recoveryState(readDrainRedTeamEvidence(f));
+    expect(ordinary).toEqual({ carryConflict: undefined, scheduled: true, noUsableResult: true, failedSeatCount: 1 });
+
+    writeFileSync(path, JSON.stringify({ ...status, loopPayload: { ...loopPayload, carriedFrom: 'a'.repeat(40) } }));
+    expect(recoveryState(readDrainRedTeamEvidence(f)),
+      'a valid SHA alone must not turn a non-carry status into conflicting carry evidence').toEqual(ordinary);
+  });
+
+  it.each(nonCarryStatuses)('merge-strategy keeps the failed-seat request eligible with valid carriedFrom on %s', (_kind, fields) => {
+    const { f, path, loopPayload } = failedSeatFixture();
+    expect(readRedTeamCarry(f)).toBeNull();
+    const status = { repo: f.repo, pr: f.pr, head: f.head, loopPayload, ...fields };
+    const eligible = () => staleRedTeamRequestEligibility({ ...f, evidence: readDrainRedTeamEvidence(f),
+      enabled: true, labels: ['review:accepted', 'ready-to-merge'] });
+    writeFileSync(path, JSON.stringify(status));
+    const ordinary = eligible();
+    expect(ordinary).toEqual({ eligible: true, reason: 'stale rows with no usable result' });
+
+    writeFileSync(path, JSON.stringify({ ...status, loopPayload: { ...loopPayload, carriedFrom: 'a'.repeat(40) } }));
+    expect(eligible(), 'non-carry status metadata must not suppress the drain consumer request').toEqual(ordinary);
+  });
+
+  it.each([
+    ['foreign repo', { repo: 'foreign/repository' }],
+    ['other PR', { pr: 99999 }],
+    ['other head', { head: 'c'.repeat(40) }],
+  ])('ignores a %s status with invalid carriedFrom when no journal exists', (_kind, over) => {
+    const { f, path, loopPayload } = failedSeatFixture();
+    expect(readRedTeamCarry(f)).toBeNull();
+    const absent = readDrainRedTeamEvidence(f);
+    expect(absent).toMatchObject({ scheduled: true, noUsableResult: true, failedSeatCount: 1 });
+    writeFileSync(path, JSON.stringify(invalidStatus(f, loopPayload, over)));
+    expect(readDrainRedTeamEvidence(f), 'a status for another identity must behave exactly like absent status').toEqual(absent);
+  });
+
+  it.each(['not-a-sha', 'a'.repeat(39), 'g'.repeat(40)])(
+    'matching status with ineligible carriedFrom %s cannot create a carry conflict', carriedFrom => {
+      const { f, path, loopPayload } = failedSeatFixture();
+      expect(readRedTeamCarry(f)).toBeNull();
+      const status = invalidStatus(f, loopPayload);
+      status.loopPayload.carriedFrom = carriedFrom;
+      writeFileSync(path, JSON.stringify(status));
+      const evidence = readDrainRedTeamEvidence(f);
+      expect({ carryConflict: evidence.carryConflict, scheduled: evidence.scheduled,
+        noUsableResult: evidence.noUsableResult, failedSeatCount: evidence.failedSeatCount },
+      'invalid carry provenance must not enter the carry branch or hide a missing result')
+        .toEqual({ carryConflict: undefined, scheduled: true, noUsableResult: true, failedSeatCount: 1 });
+    });
+
+  it('merge-strategy keeps the failed-seat request eligible despite a foreign invalid-carry status', () => {
+    const { f, path, loopPayload } = failedSeatFixture();
+    const eligible = () => staleRedTeamRequestEligibility({ ...f, evidence: readDrainRedTeamEvidence(f),
+      enabled: true, labels: ['review:accepted', 'ready-to-merge'] });
+    const absent = eligible();
+    expect(absent).toEqual({ eligible: true, reason: 'stale rows with no usable result' });
+    writeFileSync(path, JSON.stringify(invalidStatus(f, loopPayload, { repo: 'foreign/repository' })));
+    expect(eligible(), 'foreign invalid carry must not suppress the drain consumer request').toEqual(absent);
+  });
+
+  it('ignores compatibility carry metadata with mismatched identity or invalid payload', () => {
+    const { f, path, loopPayload } = failedSeatFixture();
+    const absent = readDrainRedTeamEvidence(f);
+    const status = invalidStatus(f, loopPayload);
+    status.loopPayload.carriedFrom = 'a'.repeat(40);
+    const variants = [
+      { ...status, repo: 'foreign/repository' },
+      { ...status, pr: f.pr + 1 },
+      { ...status, head: 'c'.repeat(40) },
+      { ...status, loopPayload: { ...status.loopPayload, carriedFrom: 'not-a-sha' } },
+      { ...status, loopPayload: { ...status.loopPayload, carriedFrom: 'g'.repeat(40) } },
+      { ...status, loopPayload: { ...status.loopPayload, findings: { read: { netBasis: { rev: 'c'.repeat(40) } } } } },
+    ];
+    variants.forEach(candidate => {
+      writeFileSync(path, JSON.stringify(candidate));
+      const evidence = readDrainRedTeamEvidence(f);
+      expect(evidence.carryConflict, JSON.stringify(candidate)).toBeUndefined();
+      expect(evidence).toMatchObject({ scheduled: true, noUsableResult: true, failedSeatCount: 1 });
+      if (candidate.repo !== f.repo || candidate.pr !== f.pr || candidate.head !== f.head) expect(evidence).toEqual(absent);
+    });
+    // Valid provenance still participates, with case-insensitive repo/head identity.
+    writeFileSync(path, JSON.stringify({ ...status, repo: f.repo.toUpperCase(), head: f.head.toUpperCase(),
+      loopPayload: { ...status.loopPayload, findings: { ...status.loopPayload.findings,
+        read: { diffText: 'diff --git a/backlog/123-card.md b/backlog/123-card.md\n+card update\n',
+          netChangedFiles: ['backlog/123-card.md'], netBasis: { rev: f.head.toUpperCase() } } } } }));
+    expect(readDrainRedTeamEvidence(f)).toMatchObject({ carryConflict: true, noUsableResult: false });
+  });
+});
+
+describe('scorecard read failures stay closed with saved-result reading disabled', () => {
+  it.each(['EIO', 'EACCES', 'parse failure', 'missing records'])(
+    'rejects unreadable scorecards with saved reuse disabled (%s)', fault => {
+      const f = fixture();
+      f.readScorecards = undefined;
+      f.env.WE_RED_TEAM_DRAIN_READS_SAVED_RESULT = 'off';
+      const path = resolveScorecardStorePath(f.env);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, fault === 'parse failure' ? '{truncated'
+        : JSON.stringify(fault === 'missing records' ? {} : { records: [] }));
+      const actualRead = vi.mocked(readFileSync).getMockImplementation();
+      vi.mocked(readFileSync).mockImplementation((file, ...args) => {
+        if (file === path && ['EIO', 'EACCES'].includes(fault)) throw Object.assign(Error('injected read failure'), { code: fault });
+        return actualRead(file, ...args);
+      });
+      try {
+        expect(() => readDrainRedTeamEvidence(f)).toThrow(/saved red-team evidence (unreadable|malformed)/);
+        expect(readFileSync).toHaveBeenCalledWith(path, 'utf8');
+      } finally { vi.mocked(readFileSync).mockImplementation(actualRead); }
+    });
+
+  it('treats only ENOENT as absent history', () => {
+    const f = fixture();
+    f.readScorecards = undefined;
+    f.env.WE_RED_TEAM_DRAIN_READS_SAVED_RESULT = 'off';
+    const path = resolveScorecardStorePath(f.env);
+    const actualRead = vi.mocked(readFileSync).getMockImplementation();
+    let code = 'ENOENT';
+    vi.mocked(readFileSync).mockImplementation((file, ...args) => {
+      if (file === path) throw Object.assign(Error('injected missing/unreadable store'), { code });
+      return actualRead(file, ...args);
+    });
+    try {
+      expect(readDrainRedTeamEvidence(f)).toMatchObject({ attempted: false, recorded: false,
+        scheduled: false, noUsableResult: true, failedSeatCount: 0 });
+      expect(readFileSync).toHaveBeenCalledWith(path, 'utf8');
+      code = 'EIO';
+      expect(() => readDrainRedTeamEvidence(f)).toThrow('saved red-team evidence unreadable');
+    } finally { vi.mocked(readFileSync).mockImplementation(actualRead); }
+  });
+
+  it.each(['EIO', 'parse failure'])('refuses %s instead of returning an empty failed-seat history', fault => {
+    const f = fixture();
+    f.readScorecards = undefined;
+    const path = resolveScorecardStorePath(f.env);
+    mkdirSync(dirname(path), { recursive: true });
+    const rows = Array.from({ length: 2 }, () => ({ dispatchKind: 'review-seat', seat: 'red-team',
+      repo: f.repo, pr: f.pr, rev: f.head, status: 'unparseable' }));
+    writeFileSync(path, fault === 'parse failure' ? '{truncated' : JSON.stringify({ version: 1, records: rows }));
+    const actualRead = vi.mocked(readFileSync).getMockImplementation();
+    if (fault === 'EIO') vi.mocked(readFileSync).mockImplementation((file, ...args) => {
+      if (file === path) throw Object.assign(Error('injected scorecard EIO'), { code: 'EIO' });
+      return actualRead(file, ...args);
+    });
+    try {
+      // The same fault already refuses when saved-result validation is enabled.
+      expect(() => readDrainRedTeamEvidence({ ...f,
+        env: { ...f.env, WE_RED_TEAM_DRAIN_READS_SAVED_RESULT: 'on' } })).toThrow(/unreadable|malformed/);
+      expect(() => readDrainRedTeamEvidence({ ...f,
+        env: { ...f.env, WE_RED_TEAM_DRAIN_READS_SAVED_RESULT: 'off' } }),
+      `saved-result off must not turn ${fault} into attempted:false / failedSeatCount:0`)
+        .toThrow(/unreadable|malformed/);
+    } finally { vi.mocked(readFileSync).mockImplementation(actualRead); }
+  });
+});
+
+describe('carry and saved-result merge guarantees', () => {
+  function journal(f) {
+    const loopPayload = { verdict: null, carriedFrom: 'a'.repeat(40), findings: { read: {
+      netBasis: { rev: f.head }, diffText: '+card', netChangedFiles: ['backlog/123-card.md'],
+    } } };
+    expect(() => resumeRedTeamCarry({ ...f, loopPayload }, { env: f.env, eligible: () => true,
+      intentRecorded: () => false, recordIntent: () => { throw Error('crash'); },
+    })).toThrow('crash');
+    return loopPayload;
+  }
+
+  it.each(['lower', 'upper'])('projects a %s-case carry without scheduling a pass when no saved result exists', casing => {
+    const f = fixture();
+    if (casing === 'upper') f.head = f.head.toUpperCase();
+    const loopPayload = journal(f);
+    const evidence = readDrainRedTeamEvidence({ ...f, head: f.head.toUpperCase() });
+    expect(evidence).toEqual({ carry: expect.objectContaining({ step: 'intent', loopPayload }),
+      status: { repo: f.repo, pr: f.pr, head: f.head.toLowerCase(), loopPayload, status: 'finished',
+        result: { status: 'skipped', policy: 'card-only' }, skipCardOnly: true },
+      loopPayload, attempted: false, noUsableResult: false, inFlight: false, recorded: false,
+      seatRecorded: false, completedRecorded: false, failedSeatCount: 0, scheduled: false, skipCardOnly: true });
+  });
+
+  it.each(['later panel', 'recorded seat', 'different status'])(
+    'detects carryConflict for %s with an upper-case head input', kind => {
+      const f = fixture();
+      journal(f);
+      if (kind === 'later panel') writeRun({
+        ...newRunRecord({ id: 'review-pr-conflict', op: 'review-pr', input: { repo: f.repo.toUpperCase(), pr: f.pr } }),
+        ...payload('c'.repeat(40)),
+      }, f.runsDir);
+      if (kind === 'recorded seat') f.readScorecards = () => [{ dispatchKind: 'review-seat', seat: 'red-team',
+        repo: f.repo.toUpperCase(), pr: f.pr, rev: f.head.toUpperCase(), status: 'error' }];
+      if (kind === 'different status') recordRedTeamStatus({ ...f, loopPayload: payload(f.head),
+        status: 'finished', result: 'ran' }, f);
+      const evidence = readDrainRedTeamEvidence({ ...f, head: f.head.toUpperCase() });
+      expect(evidence.carryConflict).toBe(true);
+      expect(evidence.scheduled).toBe(false);
+      expect(evidence.noUsableResult).toBe(false);
+      expect(evidence.attempted).toBe(kind !== 'later panel');
+      expect(evidence.carry).toBeUndefined();
+    });
+
+  it('does not mistake a case-only source revision difference or its own status for a later panel', () => {
+    const f = fixture(), loopPayload = journal(f);
+    writeRun({ ...newRunRecord({ id: 'review-pr-source', op: 'review-pr', input: { repo: f.repo.toUpperCase(), pr: f.pr } }),
+      ...payload(loopPayload.carriedFrom.toUpperCase()) }, f.runsDir);
+    recordRedTeamStatus({ ...f, repo: f.repo.toUpperCase(), loopPayload: { ...loopPayload,
+      carriedFrom: loopPayload.carriedFrom.toUpperCase(), findings: { read: { ...loopPayload.findings.read,
+        netBasis: { rev: f.head.toUpperCase() } } } }, status: 'finished',
+      result: { status: 'skipped', policy: 'card-only' } }, f);
+    const evidence = readDrainRedTeamEvidence({ ...f, head: f.head.toUpperCase() });
+    expect(evidence.carryConflict).toBeUndefined();
+    expect(evidence.carry.step).toBe('intent');
+    expect(evidence.loopPayload.verdict).toBeNull();
+    expect(evidence.scheduled).toBe(false);
+    expect(evidence.noUsableResult).toBe(false);
+  });
+
+  it.each(['lower', 'upper'])('marks an untrusted ok row on a non-carried %s-case head', casing => {
+    const f = fixture();
+    const rev = casing === 'upper' ? f.head.toUpperCase() : f.head;
+    const row = { dispatchKind: 'review-seat', seat: 'red-team', repo: f.repo, pr: f.pr, rev, status: 'ok' };
+    const path = resolveScorecardStorePath(f.env);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({ version: 1, records: [row] }));
+    const evidence = readDrainRedTeamEvidence({ ...f, head: rev, readScorecards: undefined });
+    expect(evidence.untrustedSavedResult).toBe(true);
+    expect(evidence.noUsableResult).toBe(true);
+    expect(evidence.attempted).toBe(true);
+    expect(evidence.scheduled).toBe(true);
+    expect(evidence.carry).toBeUndefined();
+  });
+});
 
 describe('historical fallback predicate clauses', () => {
   const evidence = () => ({ status: { status: 'finished', skipCardOnly: true, result: 'skipped' },
@@ -78,9 +454,63 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     expect(evidence.status.loopPayload.verdict).toEqual({ verdict });
     expect(loopPayload.verdict).toEqual({ verdict });
   });
+  it('preserves spent retry admission through running and finished writes, including an explicit zero', () => {
+    const f = fixture(), loopPayload = payload(f.head);
+    recordRedTeamStatus({ ...f, loopPayload, status: 'queued', retryCount: 1 }, { env: f.env });
+    recordRedTeamStatus({ ...f, loopPayload, status: 'running' }, { env: f.env });
+    expect(readRedTeamStatus(f).retryCount).toBe(1);
+    recordRedTeamStatus({ ...f, loopPayload, status: 'finished', result: 'ran', retryCount: 0 }, { env: f.env });
+    expect(readRedTeamStatus(f).retryCount).toBe(1);
+  });
+  it('refuses an existing retry marker even after stale status restoration, and isolates heads', () => {
+    const f = fixture(), loopPayload = payload(f.head);
+    recordRedTeamStatus({ ...f, loopPayload, status: 'finished', result: 'ran' }, { env: f.env });
+    const path = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+    const stale = readFileSync(path, 'utf8');
+    recordRedTeamStatus({ ...f, loopPayload, status: 'queued', retryCount: 1 }, { env: f.env });
+    writeFileSync(path, stale);
+    expect(() => recordRedTeamStatus({ ...f, loopPayload, status: 'queued', retryCount: 1 }, { env: f.env }))
+      .toThrow('retry already admitted');
+    expect(readFileSync(path, 'utf8')).toBe(stale);
+    recordRedTeamStatus({ ...f, loopPayload, status: 'running' }, { env: f.env });
+    expect(readRedTeamStatus(f).retryCount).toBe(1);
+    const other = { ...f, head: 'c'.repeat(40) };
+    recordRedTeamStatus({ ...other, loopPayload: payload(other.head), status: 'queued', retryCount: 1 }, { env: f.env });
+    expect(readRedTeamStatus(other).retryCount).toBe(1);
+  });
+
+  it('keeps the retry spent when status persistence fails after the exclusive create', () => {
+    const f = fixture(), loopPayload = payload(f.head);
+    expect(() => recordRedTeamStatus({ ...f, loopPayload, status: 'queued', retryCount: 1 },
+      { env: f.env, readPidStart: () => { throw Error('injected metadata failure'); } })).toThrow('injected metadata failure');
+    expect(readRedTeamStatus(f)).toBeNull();
+    expect(() => recordRedTeamStatus({ ...f, loopPayload, status: 'queued', retryCount: 1 }, { env: f.env }))
+      .toThrow('retry already admitted');
+    recordRedTeamStatus({ ...f, loopPayload, status: 'finished', retryCount: 0 }, { env: f.env });
+    expect(readRedTeamStatus(f).retryCount).toBe(1);
+  });
+
+  it('refuses historical spent retry counts without a marker', () => {
+    const f = fixture(), loopPayload = payload(f.head);
+    recordRedTeamStatus({ ...f, loopPayload, status: 'finished' }, { env: f.env });
+    const path = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+    writeFileSync(path, JSON.stringify({ ...readRedTeamStatus(f), retryCount: 1 }));
+    expect(() => recordRedTeamStatus({ ...f, loopPayload, status: 'queued', retryCount: 1 }, { env: f.env }))
+      .toThrow('retry already admitted');
+  });
+
+  it('refuses to overwrite unreadable retry evidence so an operator can inspect it', () => {
+    const f = fixture(), loopPayload = payload(f.head);
+    recordRedTeamStatus({ ...f, loopPayload, status: 'queued', retryCount: 1 }, { env: f.env });
+    const path = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+    writeFileSync(path, '{broken');
+    expect(() => recordRedTeamStatus({ ...f, loopPayload, status: 'running' }, { env: f.env })).toThrow();
+    expect(readFileSync(path, 'utf8')).toBe('{broken');
+  });
+
   it('does not invent an accept when no review run exists', () => {
     expect(readDrainRedTeamEvidence(fixture())).toEqual({ loopPayload: null, recorded: false,
-      seatRecorded: false, completedRecorded: false, scheduled: false, inFlight: false });
+      seatRecorded: false, completedRecorded: false, failedSeatCount: 0, scheduled: false, inFlight: false, attempted: false, noUsableResult: true });
   });
   it('pins the accepted-label boundary with empty status and run stores', () => {
     const f = fixture();
@@ -95,7 +525,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     expect(readDrainRedTeamEvidence(f).queued).toBeUndefined();
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), labels: ['review:accepted'], comments: [] })).toMatch(/no recorded result/);
     // A disabled scheduler or a non-accepting run schedules nothing; the job's finished status supersedes the run.
-    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence({ ...f, env: { ...f.env, WE_REVIEW_RED_TEAM: 'off' } }), comments: [] })).toBeNull();
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence({ ...f, env: { WE_RED_TEAM_TIMING: 'post-accept', ...f.env, WE_REVIEW_RED_TEAM: 'off' } }), comments: [] })).toBeNull();
     writeRun({ ...run, verdict: { verdict: 'changes' } }, f.runsDir);
     expect(readDrainRedTeamEvidence(f).scheduled).toBe(false);
     writeRun(run, f.runsDir);
@@ -139,20 +569,55 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     const f = fixture();
     const cardOnly = { ...payload(f.head), findings: { read: { netBasis: { rev: f.head }, netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] } } };
     const live = { ...f, isAlive: () => true, readPidStart: () => 'start' };
-    recordRedTeamStatus({ ...f, loopPayload: cardOnly, status: 'queued' }, { ...f, env: { ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, readPidStart: () => 'start' });
+    recordRedTeamStatus({ ...f, loopPayload: cardOnly, status: 'queued' }, { ...f, env: { WE_RED_TEAM_TIMING: 'post-accept', ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, readPidStart: () => 'start' });
     expect(readDrainRedTeamEvidence(live).skipCardOnly).toBe(false);
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(live), comments: [] })).toMatch(/no recorded result/);
-    recordRedTeamStatus({ ...f, loopPayload: cardOnly, status: 'queued' }, { ...f, env: { ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, readPidStart: () => 'start' });
-    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(live), env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, comments: [] })).toBeNull();
+    recordRedTeamStatus({ ...f, loopPayload: cardOnly, status: 'queued' }, { ...f, env: { WE_RED_TEAM_TIMING: 'post-accept', ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, readPidStart: () => 'start' });
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(live), env: { WE_RED_TEAM_TIMING: 'post-accept', WE_RED_TEAM_SKIP_CARD_ONLY: 'false' }, comments: [] })).toBeNull();
+  });
+  it('holds a card-only run until the job records its skip decision, then honours that decision', () => {
+    const f = fixture();
+    const read = { netBasis: { rev: f.head }, netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] };
+    writeRun({ ...newRunRecord({ id: 'review-pr-5439', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), verdict: { verdict: 'accept' }, findings: { read } }, f.runsDir);
+    // No job status yet: only the job knows its card-only decision, so the head is held (main's guard).
+    expect(readDrainRedTeamEvidence(f).skipCardOnly).toBe(false);
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), env: { WE_RED_TEAM_TIMING: 'post-accept', WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, comments: [] })).not.toBeNull();
+    recordRedTeamStatus({ ...f, loopPayload: { verdict: { verdict: 'accept' }, findings: { read } }, status: 'queued' }, { ...f, env: { WE_RED_TEAM_TIMING: 'post-accept', ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, readPidStart: () => 'start' });
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => 'start' }), comments: [] })).toBeNull();
   });
   it('holds an owing card-only run until the job records its skip decision', () => {
     const f = fixture();
     const read = { netBasis: { rev: f.head }, netChangedFiles: ['backlog/123-card.md'], netRenameSources: [] };
     writeRun({ ...newRunRecord({ id: 'review-pr-5439', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), verdict: { verdict: 'accept' }, findings: { read } }, f.runsDir);
     expect(readDrainRedTeamEvidence(f).skipCardOnly).toBe(false);
-    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, comments: [] })).toMatch(/no recorded result/);
+    expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence(f), env: { WE_RED_TEAM_TIMING: 'post-accept', WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, comments: [] })).toMatch(/no recorded result/);
     recordRedTeamStatus({ ...f, loopPayload: { verdict: { verdict: 'accept' }, findings: { read } }, status: 'queued' }, { ...f, env: { ...f.env, WE_RED_TEAM_SKIP_CARD_ONLY: 'true' }, readPidStart: () => 'start' });
     expect(redTeamEnqueueHold({ ...f, ...readDrainRedTeamEvidence({ ...f, isAlive: () => true, readPidStart: () => 'start' }), comments: [] })).toBeNull();
+  });
+  it('keeps a pre-normalization status record held', () => {
+    const f = { ...fixture(), repo: 'Web-Everything/Web-Everything', head: 'B'.repeat(40) };
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, f);
+    const canonical = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo.toLowerCase())}-${f.pr}-${f.head.toLowerCase()}.json`);
+    const legacy = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+    renameSync(canonical, legacy);
+    const evidence = readDrainRedTeamEvidence({ ...f, isAlive: () => false });
+    expect(evidence).toMatchObject({ scheduled: true, attempted: true });
+    expect(redTeamEnqueueHold({ ...f, ...evidence, comments: [] })).toMatch(/no recorded result/);
+  });
+  it('keeps a case-mismatched recorded attempt held', () => {
+    const f = { ...fixture(), head: 'B'.repeat(40) };
+    const rows = [{ dispatchKind: 'review-seat', seat: 'red-team', repo: f.repo, pr: f.pr, rev: f.head, status: 'unparseable' }];
+    const evidence = readDrainRedTeamEvidence({ ...f, readScorecards: () => rows });
+    expect(evidence).toMatchObject({ recorded: true, attempted: true });
+    expect(redTeamEnqueueHold({ ...f, ...evidence, comments: [] })).toMatch(/no recorded result/);
+  });
+  it('keeps an errored attempt held when a newer accepting review exists', () => {
+    const f = fixture();
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result: 'error' }, f);
+    const path = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+    utimesSync(path, new Date(0), new Date(0));
+    writeRun({ ...newRunRecord({ id: 'review-pr-newer', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), ...payload(f.head) }, f.runsDir);
+    expect(readDrainRedTeamEvidence(f)).toMatchObject({ scheduled: true, attempted: true });
   });
   it('does not mistake a reused pid for the original red-team process', () => {
     const f = fixture();
@@ -192,7 +657,7 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     expect(pidStartTime(42, (cmd, args, opts) => {
       expect(cmd).toBe('ps');
       expect(args).toEqual(['-p', '42', '-o', 'lstart=']);
-      expect(opts).toMatchObject({ timeout: 5000, maxBuffer: 4096, env: { LC_ALL: 'C', TZ: 'UTC' } });
+      expect(opts).toMatchObject({ timeout: 5000, maxBuffer: 4096, env: { WE_RED_TEAM_TIMING: 'post-accept', LC_ALL: 'C', TZ: 'UTC' } });
       return '  Fri Oct 16 12:34:56 2026\n';
     })).toBe('Fri Oct 16 12:34:56 2026');
     expect(pidStartTime(42, () => { throw new Error('unavailable'); })).toBeNull();
@@ -293,5 +758,32 @@ it.each(['non-card read', 'missing read paths', 'non-card rename source', 'skipC
         pr: f.pr, rev: variant === 'live-head seat' ? f.head : oldHead }] : [] });
     expect(evidence).toEqual({ loopPayload: null, recorded: variant === 'live-head seat',
       seatRecorded: variant === 'live-head seat', completedRecorded: false,
-      scheduled: variant === 'live-head seat', inFlight: false });
+      failedSeatCount: variant === 'live-head seat' ? 1 : 0, scheduled: variant === 'live-head seat', inFlight: false,
+      attempted: variant === 'live-head seat', noUsableResult: true });
   });
+
+it.each([['unparseable', 1, false], ['error', 1, false], ['ok', 0, true]])(
+  'counts failed %s seats only for the exact repo/PR/head', (status, failedSeatCount, completedRecorded) => {
+    const f = fixture();
+    const row = { dispatchKind: 'review-seat', seat: 'red-team', repo: f.repo, pr: f.pr, rev: f.head, status };
+    f.readScorecards = () => [row, { ...row, rev: 'a'.repeat(40) }, { ...row, repo: 'another/repo' }];
+    expect(readDrainRedTeamEvidence(f)).toMatchObject({ failedSeatCount, completedRecorded, seatRecorded: true });
+  });
+
+it('replays #5461 saved and posted old-head breaks without treating them as live-head work', () => {
+  const f = { ...fixture(), pr: 5461, head: 'ff45ed96c40644e5537370df84b6b30328b1a73e' };
+  const oldHead = '4752c275333c66228ea55c4b6d65f4038c760d38';
+  const findings = [{ summary: 'old break', confirmedByRecheck: true, impactIfUnfixed: 'broken', category: 'security' }];
+  const row = { dispatchKind: 'review-seat', seat: 'red-team', repo: f.repo, pr: f.pr, rev: oldHead,
+    status: 'ok', recheckStatus: 'ok', confirmedMissCount: 1, findings };
+  const path = resolveScorecardStorePath(f.env);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify({ version: 1, records: [row] }));
+  saveProvenanceFixtures(f.env);
+  recordRedTeamStatus({ ...f, loopPayload: payload(oldHead), status: 'finished', result: { status: 'ran' } }, f);
+  const evidence = readDrainRedTeamEvidence({ ...f, readScorecards: () => [row] });
+  expect(evidence).toMatchObject({ loopPayload: null, scheduled: false, attempted: false, recorded: false, inFlight: false });
+  const comments = [{ author: { login: 'web-everything' }, body: renderRedTeamComment({ pr: f.pr, rev: oldHead, findings, recheckStatus: 'ok' }) }];
+  expect(redTeamEnqueueHold({ ...f, ...evidence, comments, requestPending: true })).toBe('post-accept red team has no recorded result on the live head');
+  expect(redTeamEnqueueHold({ ...f, ...evidence, comments, head: oldHead })).toContain('requiring send-back');
+});
