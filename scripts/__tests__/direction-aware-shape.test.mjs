@@ -136,20 +136,28 @@ describe('R131 direction-aware shape wiring', () => {
     expect(scoreEscalation({ ...evidence, changedFiles: [runner, 'scripts/lib/permission-change.mjs'] }))
       .toMatchObject({ humanRequired: true, humanRequiredProposed: true });
   });
-  it.each(['registry.mjs', 'step-kinds.mjs'])
-    ('keeps a classifier-only %s change human in live shape output', async file => {
-      const path = `scripts/operations/${file}`;
+  it.each(['scripts/operations/registry.mjs', 'scripts/operations/step-kinds.mjs',
+    'scripts/lib/review-shape.mjs'])
+    ('keeps a classifier-only %s change human in live shape output', async path => {
       const diff = `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-// before\n+// after\n`;
       const input = { changedFiles: [path], diffHunks: diff };
       expect(scoreEscalation(input)).toMatchObject({ humanRequired: false, humanRequiredProposed: true });
       expect(scoreEscalation({ ...input, directionAwareLive: true }))
         .toMatchObject({ humanRequired: true, humanRequiredProposed: true });
-      const write = vi.fn();
-      await runShape({ files: path, 'diff-file': 'fixture.diff' }, true, {
-        readFile: () => diff, loadOps: async () => new Set(), resolveMode: () => 'live', write, exit: vi.fn(),
-      });
-      expect(JSON.parse(write.mock.calls[0][1])).toMatchObject({ humanRequired: true,
-        humanRequiredProposed: true, humanRequiredProposedReason: `classifier self-change: ${path}` });
+      for (const hunks of [null, diff]) {
+        expect(sharedShapePlan({ ...input, diffHunks: hunks }))
+          .toMatchObject({ humanRequired: false, humanRequiredProposed: true,
+            humanRequiredProposedReason: `classifier self-change: ${path}` });
+      }
+      for (const mode of ['shadow', 'live']) {
+        const expected = { humanRequired: mode === 'live', humanRequiredProposed: true,
+          humanRequiredProposedReason: `classifier self-change: ${path}` };
+        const write = vi.fn();
+        await runShape({ files: path, 'diff-file': 'fixture.diff' }, true, {
+          readFile: () => diff, loadOps: async () => new Set(), resolveMode: () => mode, write, exit: vi.fn(),
+        });
+        expect(JSON.parse(write.mock.calls[0][1])).toMatchObject(expected);
+      }
     });
   it('keeps humanRequired true in live mode for guard relocation across scopes', () => {
     const rows = [' function authorize(op) {', '-  if (!allowed.includes(op)) return false;',
