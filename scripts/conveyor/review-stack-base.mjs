@@ -496,10 +496,9 @@ export function readStackBases({ root = ROOT, env = process.env, prs = null, rea
       let cause = null;
       const openBase = openBases.get(top.baseRefName);
       const bottom = openBase ? rowsByPr.get(openBase[0]) : null;
-      if (top.untrusted || (prlessBase && !top.author)) cause = 'top-untrusted';
+      // The branch-only fallback requires a known author; numbered declared bases retain their existing trust rules.
+      if (top.untrusted || (prlessBase && !openBase && !top.author)) cause = 'top-untrusted';
       else if (openBase && (!bottom || bottom.untrusted)) cause = 'base-pr-untrusted';
-      // Preserve the review detector's declared-base semantics; the opt-in scope reader requires a known shared actor.
-      else if (prlessBase && bottom && !sameStackActor(top, bottom)) cause = 'base-pr-actor-mismatch';
       else if (!sets.has(top.headRefOid) || (bottom && !sets.has(bottom.headRefOid))) cause = 'head-unreadable';
       else if (openBase) { if (!bases.has(top.pr)) cause = 'no-containment'; }
       else if (!prlessBase) cause = 'base-branch-missing';

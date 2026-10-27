@@ -930,6 +930,21 @@ describe('readStackBases — declared lane bases (live #5996 #5997 #5983 #6003)'
     }
   });
 
+  it.each([
+    ['cross-author', 'alice', 'bob'],
+    ['unknown base author', 'alice', null],
+    ['unknown top author', null, 'bob'],
+  ])('preserves declared numbered stacks with %s when opting into PR-less bases', (_name, topAuthor, baseAuthor) => {
+    const f = fixture();
+    f.refs.get(5997).author = topAuthor;
+    f.refs.get(5981).author = baseAuthor;
+    for (const prlessBase of [false, true]) {
+      const diag = new Map();
+      expect(f.read({ prlessBase, diag }).get(5997)).toEqual(expected(shapes[1]));
+      expect(diag.has(5997)).toBe(false);
+    }
+  });
+
   it('resolves #5983 over #5982 and #6003 over #6002 together with all four shapes and unrelated PRs', () => {
     const f = fixture(3);
     const diag = new Map();
@@ -986,8 +1001,7 @@ describe('readStackBases — declared lane bases (live #5996 #5997 #5983 #6003)'
     ['top-untrusted', 'fork top', 5997, f => { f.refs.get(5997).isCrossRepository = true; }],
     ['top-untrusted', 'top differs from origin tip', 5997, f => { f.tips.set(shapes[1].headRefName, sha(401)); }],
     ['base-pr-untrusted', 'base PR differs from origin tip', 5997, f => { f.tips.set(shapes[1].baseRefName, sha(402)); }],
-    ['base-pr-actor-mismatch', 'different base author', 5997, f => { f.refs.get(5981).author = 'someone-else'; }],
-    ['base-pr-actor-mismatch', 'unknown base author', 5997, f => { f.refs.get(5981).author = null; }],
+    ['top-untrusted', 'PR-less top author unknown', 5996, f => { f.refs.get(5996).author = null; }],
     ['no-containment', 'trusted open base not contained', 5997, f => {
       f.sets.set(shapes[1].headRefOid, { first: [shapes[1].headRefOid], reach: [shapes[1].headRefOid] });
     }],
