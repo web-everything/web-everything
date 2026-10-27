@@ -5,3 +5,5 @@
 {"type":"quarantine-mode","at":1793105522290,"actor":"operator","mode":"quarantine"}
 {"type":"quarantine-mode","at":1793106147839,"actor":"red-main-safety-net","mode":"stop"}
 {"type":"quarantine-added","at":1793120537153,"actor":"operator","test":"scripts/__tests__/merge-ai-prs-merge-queue-hook-wiring.test.mjs","brokenSha":"bf7e0a0b34","owner":"card:merge-queue-removals-5981-5954","reason":"frozen-timestamp date rot: 'transient UNKNOWN on the couple's fresh reads' fails in merge_group shard 6 (run 40539289321), ejected #5954","addedAt":1793120537153,"expiresAt":1793206937153}
+{"type":"quarantine-fix-prs","at":1793124561015,"actor":"red-main-safety-net","fixPrs":[6015]}
+{"type":"quarantine-mode","at":1793124561015,"actor":"red-main-safety-net","mode":"quarantine"}
