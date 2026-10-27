@@ -19,13 +19,27 @@ export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDi
 const statusPath = ({ repo, pr, head }, env) => join(redTeamStatusDir(env),
   `${encodeURIComponent(String(repo).toLowerCase())}-${Number(pr)}-${String(head).toLowerCase()}.json`);
 
+// Keep pre-normalization records authoritative for every status consumer too.
+function readLatestRedTeamStatus({ repo, pr, head }, env) {
+  const legacyPath = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
+  let status, statusAt = 0;
+  for (const path of new Set([statusPath({ repo, pr, head }, env), legacyPath])) {
+    try {
+      const candidate = JSON.parse(readFileSync(path, 'utf8'));
+      const at = statSync(path).mtimeMs;
+      if (status === undefined || at > statusAt) { status = candidate; statusAt = at; }
+    } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  }
+  return { status, statusAt };
+}
+
 /** Read the head-bound status; unreadable evidence is an error, absence is null. */
 export function readRedTeamStatus({ repo, pr, head, env = process.env } = {}) {
-  try {
-    const status = JSON.parse(readFileSync(statusPath({ repo, pr, head }, env), 'utf8'));
-    if (!status || status.repo !== repo || Number(status.pr) !== Number(pr) || status.head !== head) throw Error('red-team status identity mismatch');
-    return status;
-  } catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+  const { status } = readLatestRedTeamStatus({ repo, pr, head }, env);
+  if (status === undefined) return null;
+  if (!status || !sameRepo(status.repo, repo) || Number(status.pr) !== Number(pr)
+    || String(status.head ?? '').toLowerCase() !== String(head).toLowerCase()) throw Error('red-team status identity mismatch');
+  return status;
 }
 
 /** A status is written before settling speculation or starting the sequential pass; crashes leave a dead pid. */
@@ -75,7 +89,6 @@ export function historicalCardOnlySkipCandidate(old) {
 export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   runsDir = resolveRunsDir(), list = listRunIds, read = readRun, isAlive = pidAlive, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime,
   readScorecards } = {}) {
-  const legacyStatusPath = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
   const originalHead = head;
   head = String(head ?? '').toLowerCase();
   // One scorecard read for this whole call, shared with the saved-result check below (xwu9oxh S2, per operation).
@@ -109,15 +122,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   // owes a pass holds until the job's status supersedes it. It is not a live queue entry: the drain's
   // never-scheduled deadline still applies when no job ever picks it up.
   const owes = run => (redTeamPanelSeatOwed(run, env) || (redTeamEnabled(env) && redTeamOwedFor(run)));
-  let status, statusAt = 0;
-  // Keep pre-normalization status records authoritative during the transition too.
-  for (const path of new Set([statusPath({ repo, pr, head }, env), legacyStatusPath])) {
-    try {
-      const candidate = JSON.parse(readFileSync(path, 'utf8'));
-      const at = statSync(path).mtimeMs;
-      if (!status || at > statusAt) { status = candidate; statusAt = at; }
-    } catch (e) { if (e.code !== 'ENOENT') throw e; }
-  }
+  const { status, statusAt } = readLatestRedTeamStatus({ repo, pr, head: originalHead }, env);
   const matchingStatus = sameRepo(status?.repo, repo) && Number(status.pr) === Number(pr)
     && String(status.head ?? '').toLowerCase() === head;
   if (matchingStatus) attempted ||= attemptedRedTeamRun([], { repo, pr, head }, status.result);

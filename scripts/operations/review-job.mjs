@@ -394,7 +394,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           // separately requires the stored read's netBasis.rev to equal status.head.
           // A null result is eligible only when normalized from the original queued
           // writer above. An ordinary finished/null prior must reach the guard intact.
-          const evidence = input.redTeamMode === 'fresh' ? readEvidence(key) : undefined;
+          const evidence = input.redTeamMode ? readEvidence(key) : undefined;
+          if (evidence?.inFlight || evidence?.queued) throw Error('red-team writer is live or unknown');
           const retry = input.redTeamMode === 'fresh' && failedRedTeamRetry(admissionPrior, evidence);
           if (input.redTeamMode === 'fresh'
             && (admissionPrior?.retryCount === undefined || admissionPrior.retryCount === 0)

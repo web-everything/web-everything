@@ -57,6 +57,15 @@ describe('readRedTeamStatus legacy filename compatibility', () => {
       normalized: { repo: f.repo, pr: f.pr, head: f.head, status: 'queued', pid: process.pid, loopPayload: payload(f.head) },
     };
     mkdirSync(redTeamStatusDir(f.env), { recursive: true });
+    const probe = join(redTeamStatusDir(f.env), 'case-probe');
+    writeFileSync(probe, 'probe');
+    let caseSensitive = false;
+    try {
+      expect(readFileSync(join(redTeamStatusDir(f.env), 'CASE-PROBE'), 'utf8')).toBe('probe');
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      caseSensitive = true;
+    }
     // Fix mtimes explicitly: neither filesystem resolution nor write order chooses the winner.
     for (const name of ['legacy', 'normalized']) {
       writeFileSync(paths[name], JSON.stringify(statuses[name]));
@@ -64,8 +73,17 @@ describe('readRedTeamStatus legacy filename compatibility', () => {
       utimesSync(paths[name], at, at);
     }
 
-    expect(readDrainRedTeamEvidence(f).status).toEqual(statuses[newer]);
-    expect(readRedTeamStatus(f)).toEqual(statuses[newer]);
+    if (caseSensitive) {
+      expect(readDrainRedTeamEvidence(f).status).toEqual(statuses[newer]);
+      expect(readRedTeamStatus(f)).toEqual(statuses[newer]);
+    } else {
+      // Both spellings alias one file; the normalized record was written last.
+      const drainStatus = readDrainRedTeamEvidence(f).status;
+      const status = readRedTeamStatus(f);
+      expect(drainStatus).toEqual(statuses.normalized);
+      expect(status).toEqual(statuses.normalized);
+      expect(status).toEqual(drainStatus);
+    }
   });
 });
 
