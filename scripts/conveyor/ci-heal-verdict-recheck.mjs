@@ -7,7 +7,8 @@
  * so with no new push the stale verdict made `reconcile-core.mjs` refuse every heal on that head (`ci-heal-escalated`)
  * for hours, and the notes half told the operator it "needs your decision".
  *
- * `not-a-ci-break` means "every required check is green; only the review gate is red". A required check other than
+ * `not-a-ci-break` permits completed cancelled smoke after its retry is settled; other required checks must be green.
+ * A required check other than
  * `review-gate` whose LATEST run on this head completed failing contradicts it. Two uses:
  *   - {@link contradictingChecks}: the daemon voids a contradicted verdict (a void comment, see
  *     `ci-heal-escalation-mark.mjs#CI_HEAL_VERDICT_VOID_MARKER`); the ordinary ci-heal path (caps included) resumes.
@@ -110,6 +111,20 @@ export function requiredCheckStates({ rollup, requiredChecks }) {
   return out;
 }
 
+/** Only a completed cancelled smoke is settled for a not-a-ci-break verdict (#5925). */
+export function isCancelledSmoke(row) {
+  return (row?.name ?? row?.context) === 'smoke'
+    && String(row?.status).toLowerCase() === 'completed' && String(row?.conclusion).toLowerCase() === 'cancelled';
+}
+
+// Recording and invalidation must judge the same latest result. The recording caller additionally
+// checks whether a smoke retry is owed; this exception never declares CI green for needs-human retirement.
+function notCiBreakCheckStates({ rollup, requiredChecks }) {
+  const latest = collapseRollupToLatestPerName(rollup);
+  return requiredCheckStates({ requiredChecks,
+    rollup: latest.map(row => isCancelledSmoke(row) ? { ...row, conclusion: 'success' } : row) });
+}
+
 /**
  * The required checks that contradict a `not-a-ci-break` verdict on THIS head: names whose latest run completed
  * failing. `[]` when the escalation is not `not-a-ci-break`, names another head, or nothing is red. PURE.
@@ -118,7 +133,7 @@ export function requiredCheckStates({ rollup, requiredChecks }) {
  */
 export function contradictingChecks({ escalation, headSha, rollup, requiredChecks }) {
   if (escalation?.outcome !== 'not-a-ci-break' || !sameSha(escalation.headSha, headSha)) return [];
-  return requiredCheckStates({ rollup, requiredChecks }).red;
+  return notCiBreakCheckStates({ rollup, requiredChecks }).red;
 }
 
 /** {@link contradictingChecks} as a yes/no. PURE. */
@@ -128,10 +143,11 @@ export function notCiBreakContradicted(o) {
 
 /**
  * Prevention at the source: the required checks (minus `review-gate`) that keep a `not-a-ci-break` verdict from being
- * recordable yet — still running, not started, or red. `[]` means they all finished green. PURE.
+ * recordable yet — still running, not started, or red. Cancelled smoke is settled here; the recording caller
+ * must additionally check its retry budget. PURE.
  * @returns {{pending: string[], missing: string[], red: string[]}}
  */
 export function unsettledRequiredChecks({ rollup, requiredChecks }) {
-  const s = requiredCheckStates({ rollup, requiredChecks });
+  const s = notCiBreakCheckStates({ rollup, requiredChecks });
   return { pending: s.pending, missing: s.missing, red: s.red };
 }

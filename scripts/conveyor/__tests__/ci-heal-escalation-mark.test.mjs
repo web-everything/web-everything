@@ -332,6 +332,69 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
     const statusCheckRollup = fixture.requiredChecks.map((name) => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' }));
     expect(refusal({ pr: { ...fixture, statusCheckRollup } })).toBeNull();
   });
+  it('#5925: cancelled smoke and red review-gate allow a not-a-ci-break record', () => {
+    const statusCheckRollup = [
+      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED' },
+      { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+    ];
+    expect(refusal({ pr: { ...fixture, statusCheckRollup }, requiredChecks: ['test', 'smoke', 'review-gate'] })).toBeNull();
+  });
+  it.each(['IN_PROGRESS', 'MISSING', 'FAILURE'])('cancelled smoke does not excuse %s real work', state => {
+    const statusCheckRollup = [
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED' },
+      { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+      ...(state === 'MISSING' ? [] : [{ name: 'test', status: state === 'IN_PROGRESS' ? state : 'COMPLETED', conclusion: state === 'FAILURE' ? state : null }]),
+    ];
+    expect(refusal({ pr: { ...fixture, statusCheckRollup }, requiredChecks: ['test', 'smoke', 'review-gate'] })).toContain('test');
+  });
+  it.each([
+    ['eligible', { confirmed: 0, rejected: 0, pending: false }, true],
+    ['partly spent', { confirmed: 1, rejected: 4, pending: false }, true],
+    ['pending', { confirmed: 6, rejected: 0, pending: true }, true],
+    ['unknown budget', undefined, true],
+    ['confirmed cap', { confirmed: 6, rejected: 0, pending: false }, false],
+    ['rejected cap', { confirmed: 0, rejected: 6, pending: false }, false],
+    ['custom cap', { confirmed: 1, rejected: 0, pending: false }, false, 1],
+  ])('cancelled smoke stand-down respects %s infra retry budget', (_name, timeoutRetryBudget, held, cap = 6) => {
+    const pull = { ...fixture, statusCheckRollup: [{ name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED' }],
+      timeoutRetry: { eligible: true, infraCancelled: true, head, pr: 4535, cap }, timeoutRetryBudget };
+    const result = refusal({ pr: pull, requiredChecks: ['smoke'] });
+    if (held) expect(result).toContain('retry');
+    else expect(result).toBeNull();
+  });
+  it.each(['test', 'standards', 'daemon-soak'])('cancelled required %s refuses not-a-ci-break recording', name => {
+    const statusCheckRollup = [
+      { name, status: 'COMPLETED', conclusion: 'CANCELLED' },
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+    ];
+    expect(refusal({ pr: { ...fixture, statusCheckRollup }, requiredChecks: [name, 'smoke'] })).toContain(name);
+  });
+  it('recording and verdict readers agree on cancelled smoke without declaring CI green', async () => {
+    const { unsettledRequiredChecks, contradictingChecks, ciGreenForEscalation } = await import('../ci-heal-verdict-recheck.mjs');
+    const statusCheckRollup = [{ name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED' }];
+    const pull = { ...fixture, statusCheckRollup };
+    expect(refusal({ pr: pull, requiredChecks: ['smoke'] })).toBeNull();
+    expect(unsettledRequiredChecks({ rollup: statusCheckRollup, requiredChecks: ['smoke'] }).red).toEqual([]);
+    expect(contradictingChecks({ escalation, headSha: head, rollup: statusCheckRollup, requiredChecks: ['smoke'] })).toEqual([]);
+    expect(ciGreenForEscalation({ rollup: statusCheckRollup, requiredChecks: ['smoke'] })).toBe(false);
+    expect(pull.statusCheckRollup[0].conclusion).toBe('CANCELLED');
+  });
+  it('a newer real failure still refuses after an older cancellation', () => {
+    const statusCheckRollup = [
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED', startedAt: '2026-10-26T10:00:00Z' },
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-26T11:00:00Z' },
+    ];
+    expect(refusal({ pr: { ...fixture, statusCheckRollup }, requiredChecks: ['smoke'] })).toContain('red: smoke');
+    expect(planVerdictVoid({ ...planOptions(), pr: { ...fixture, statusCheckRollup },
+      readRequiredChecks: () => ['smoke'] })).toMatchObject({ body: expect.stringContaining('red: smoke') });
+  });
+  it.each(['test', 'standards', 'daemon-soak'])('cancelled required %s still voids a not-a-ci-break verdict', name => {
+    const pull = { ...fixture, statusCheckRollup: [{ name, status: 'COMPLETED', conclusion: 'CANCELLED' }] };
+    expect(planVerdictVoid({ ...planOptions(), pr: pull, readRequiredChecks: () => [name] }))
+      .toMatchObject({ body: expect.stringContaining(`red: ${name}`) });
+  });
   it('does not judge a different head or unknown required set', () => {
     expect(refusal({ headSha: 'abcdef0123456789' })).toBeNull();
     expect(refusal({ requiredChecks: [] })).toBeNull();
@@ -356,6 +419,40 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
     expect(await checkNotCiBreakRecordable(opts)).toEqual({ refusal: expect.stringContaining('red: test') });
     expect(opts.readPr).toHaveBeenCalledWith({ pr: 4535, repo: fixture.repo });
     expect(opts.readRequired).toHaveBeenCalledWith({ repo: fixture.repo });
+  });
+  it('recording IO refuses a cancelled required test instead of recording a stand-down', async () => {
+    const opts = recordOptions();
+    opts.readPr.mockReturnValue({ ...fixture, statusCheckRollup: [
+      { name: 'test', status: 'COMPLETED', conclusion: 'CANCELLED' },
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'SUCCESS' },
+    ] });
+    opts.readRequired.mockResolvedValue({ checks: ['test', 'smoke'] });
+    expect(await checkNotCiBreakRecordable(opts)).toEqual({ refusal: expect.stringContaining('red: test') });
+  });
+  it('recording IO enriches raw cancelled smoke with retry evidence before permitting stand-down', async () => {
+    const opts = recordOptions();
+    const pull = { ...fixture, statusCheckRollup: [{ name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED' }] };
+    opts.readPr.mockReturnValue(pull);
+    opts.readRequired.mockResolvedValue({ checks: ['smoke'] });
+    const enrichRetry = vi.fn(async facts => ({ ...facts,
+      timeoutRetry: { eligible: true, infraCancelled: true, head, pr: 4535 },
+      timeoutRetryBudget: { confirmed: 0, rejected: 0, pending: false } }));
+    expect(await checkNotCiBreakRecordable({ ...opts, enrichRetry }))
+      .toEqual({ refusal: expect.stringContaining('retry') });
+    expect(enrichRetry).toHaveBeenCalledWith(expect.objectContaining({ number: 4535, headRefOid: head }), { repo: fixture.repo });
+  });
+  it.each(['throw', 'classified-error'])('recording IO refuses unreadable cancelled smoke retry evidence: %s', async mode => {
+    const opts = recordOptions();
+    opts.readPr.mockReturnValue({ ...fixture, statusCheckRollup: [
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED' },
+    ] });
+    opts.readRequired.mockResolvedValue({ checks: ['smoke'] });
+    const enrichRetry = async facts => {
+      if (mode === 'throw') throw new Error('offline');
+      return { ...facts, timeoutRetry: { eligible: false, reason: 'timeout-evidence:offline' } };
+    };
+    expect(await checkNotCiBreakRecordable({ ...opts, enrichRetry }))
+      .toEqual({ refusal: expect.stringContaining('retry state') });
   });
 
   const note = { kind: 'ci-heal-escalated', outcome: 'not-a-ci-break', headSha: head, prNumber: 4535 };
