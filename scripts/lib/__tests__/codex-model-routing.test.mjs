@@ -249,6 +249,10 @@ describe('per-task model AND effort routing (2026-10-12)', () => {
     expect(codexModelSupportsEffort('x', 'high')).toBe(true);
     expect(codexModelSupportsEffort('x', 'bogus')).toBe(false);
     expect(codexModelSupportsEffort('gpt-5.5', 'max')).toBe(false);
+    // R140 trial: gpt-6.1-terra is catalogued with every effort the CLI (0.162.1 `codex debug models`) lists.
+    expect(CODEX_MODEL_CATALOGUE['gpt-6.1-terra']).toEqual(Object.keys(CODEX_EFFORT_MAP));
+    for (const effort of Object.keys(CODEX_EFFORT_MAP)) expect(codexModelSupportsEffort('gpt-6.1-terra', effort)).toBe(true);
+    expect(codexModelSupportsEffort('gpt-6.1-terra', 'turbo')).toBe(false);
   });
   it('logs every route, exactly formatted, and logging never throws', () => {
     const r = route({ kind: 'fix' });

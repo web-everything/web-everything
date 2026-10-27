@@ -15,7 +15,7 @@
  * tier (escalate + agent-reviewable — they obey the gate the WE child defines, they do not define it).
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -37,6 +37,9 @@ import {
   isPolicyDerivationPath,
   readPolicySpecRegistryAt,
 } from '../gate-config.mjs';
+// Static, not a dynamic import in the test body: the loader pulls in typescript + esbuild, and that cold load
+// must land in collection, not inside the 5s per-test budget (main went red on exactly this at 60e078b6d).
+import { loadDeliveryPolicy } from '../delivery-policy.mjs';
 
 // The phase-1 drain-daemon gate-deciding files (WE #2480). Each maps a registered basename to the shipped
 // home path the daemon actually lives at, so the regression proves the basename match TRAVELS to the real
@@ -215,6 +218,22 @@ describe('ENGINE_BASENAMES / isEngineTierPath — #2412 layer 4\'s "is this the 
 
 
 describe('delivery policy trust boundary (#5113 Part A)', () => {
+  it('every file the loader reads is gated, including an honoured pointer target', async () => {
+    await fixture(async ({ root }) => {
+      mkdirSync(join(root, 'config'));
+      writeFileSync(join(root, 'config/deliveryPolicyDefaults.ts'), readFileSync(resolve('config/deliveryPolicyDefaults.ts')));
+      writeFileSync(join(root, 'webeverything.config.json'), JSON.stringify({ mergeGate: './repair-policy.json' }));
+      writeFileSync(join(root, 'repair-policy.json'), JSON.stringify({ onMainRed: 'off' }));
+      POLICY_SPEC_BASENAMES.add('repair-policy.json');
+      try {
+        const result = await loadDeliveryPolicy({ root, env: { WE_POLICY_EVENTS_FILE: join(root, 'events.jsonl') } });
+        expect(result.mergeGate.onMainRed).toBe('off');
+        expect(result.filesRead).toEqual(['config/deliveryPolicyDefaults.ts', 'webeverything.config.json', 'repair-policy.json']);
+        for (const file of result.filesRead) expect(isPolicySpecPath(file)).toBe(true);
+      } finally { POLICY_SPEC_BASENAMES.delete('repair-policy.json'); }
+    });
+  });
+
   describe('shipped human-review surfaces', () => {
     beforeEach(() => vi.stubEnv('WE_HUMAN_REVIEW_SURFACES', undefined));
     afterEach(() => vi.unstubAllEnvs());
@@ -252,6 +271,14 @@ describe('delivery policy trust boundary (#5113 Part A)', () => {
     expect(producerReviewLabel(scoreEscalation({ changedFiles: [path], humanSurfaces: 'broad' }))).toBe('review:human');
   });
 
+  it('registers the delivery policy loader as engine tier without a leash', () => {
+    const entry = TRUST_CHAIN.find(member => member.file === 'delivery-policy.mjs');
+    expect(entry).toMatchObject({ tier: 'engine', homes: ['scripts/lib/delivery-policy.mjs'] });
+    expect(entry.leash).toBeUndefined();
+    expect(isEngineTierPath('scripts/lib/delivery-policy.mjs')).toBe(true);
+    expect(isPolicySpecPath('scripts/lib/delivery-policy.mjs')).toBe(false);
+  });
+
   async function fixture(run) {
     const root = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'delivery-registry-'));
     const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024 });
@@ -269,6 +296,57 @@ describe('delivery policy trust boundary (#5113 Part A)', () => {
       rmSync(root, { recursive: true, force: true });
     }
   }
+
+  it.each(['timeout', 'output limit'])('forcibly stops a SIGTERM-resistant registry at its %s', mode => {
+    const root = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'registry-bound-'));
+    const marker = join(root, 'child.json');
+    try {
+      // Stub only read-only Git responses: keep the production loader and its Node child real.
+      // A separate supervisor bounds the regression itself if execFileSync never returns.
+      const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
+        import childProcess from 'node:child_process';
+        import { syncBuiltinESMExports } from 'node:module';
+        const execFileSync = childProcess.execFileSync;
+        const commit = 'a'.repeat(40);
+        const source = [
+          "import { writeFileSync } from 'node:fs';",
+          "import { dirname } from 'node:path';",
+          "import { fileURLToPath } from 'node:url';",
+          "export const POLICY_SPEC_BASENAMES = new Set(['fixture.json']);",
+          "process.on('SIGTERM', () => {});",
+          'writeFileSync(' + JSON.stringify(process.argv[1]) + ', JSON.stringify({ pid: process.pid, scratch: dirname(fileURLToPath(import.meta.url)) }));',
+          process.argv[2] === 'output limit' ? "writeFileSync(1, 'x'.repeat(2 * 1024 * 1024));" : '',
+          'Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);',
+        ].join(';');
+        childProcess.execFileSync = (file, args, options) => {
+          if (file !== 'git') return execFileSync(file, args, options);
+          if (args[0] === 'rev-parse') return commit;
+          if (args[0] === 'show' && args[1] === commit + ':scripts/lib/gate-config.mjs') return source;
+          if (args[0] === 'show' && args[1] === commit + ':scripts/lib/rules-loader.cjs') return '';
+          throw Error('Unexpected Git read');
+        };
+        syncBuiltinESMExports();
+        const { readPolicySpecRegistryAt } = await import(process.argv[3]);
+        const registry = await readPolicySpecRegistryAt(commit, { root: process.argv[4] });
+        process.stdout.write(JSON.stringify({ registry }));
+      `, marker, mode, pathToFileURL(resolve('scripts/lib/gate-config.mjs')).href, root], {
+        encoding: 'utf8', timeout: 15000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
+        env: { ...process.env, TMPDIR: root }, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      expect(result.error, 'loader must return before the supervisor kills it').toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({ registry: null });
+      const child = JSON.parse(readFileSync(marker, 'utf8'));
+      expect(() => process.kill(child.pid, 0)).toThrow();
+      expect(existsSync(child.scratch)).toBe(false);
+    } finally {
+      if (existsSync(marker)) {
+        const { pid } = JSON.parse(readFileSync(marker, 'utf8'));
+        try { process.kill(pid, 'SIGKILL'); } catch { /* Already reaped by the loader. */ }
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 20000);
 
   it('a registered pointer target edited alone forces review:human with the root config untouched', async () => {
     await fixture(async ({ root, registryPath }) => {
