@@ -639,6 +639,7 @@ const DISPATCH_DRY_RUN_LINES = [
   "record('reconcile-fix-pass', null, () => {",
   "  const stubDispatch = (planned) => ({ agentId: null, sessionSlug: 'stub-fix', pr: planned.pr, itemNum: planned.itemNum, lane: planned.lane, unknownTokens: [], resumed: false });",
   "  const r = runReconcileFixDispatch({",
+  "    allowStandDownAutoProceed: false, // A smoke never writes R123 cursors, reservations or answers.",
   "    repo: WE_SLUG, dispatch: stubDispatch, tryResume: () => ({ resumed: false, resumeAttempt: null }),",
   "    pickFreeLanes: () => [90201, 90202, 90203, 90204, 90205], checkStaleness: skipStaleness,",
   "  });",
