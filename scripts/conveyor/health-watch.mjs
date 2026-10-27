@@ -1285,7 +1285,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
       ...(fixture ? { readRuns: () => JSON.parse(readFileSync(fixture, 'utf8')), readPrs: () => [], listAgents: async () => [], gates: async () => ({ killed: false, fixGate: null }) } : {}),
     }));
   }
-  if (!flags['dry-run'] && !fixtureTick && !Object.keys(flags).some(key => key.endsWith('-fixture'))) {
+  if (!flags['dry-run'] && !flags['no-gh'] && !fixtureTick && !Object.keys(flags).some(key => key.endsWith('-fixture'))) {
     await attempt('mainRedAlert', () => runMainRedAlert({ probe: probes.mainCiRuns, dir, now, config }));
   }
   // #4066 `open-prs-over-limit` — fs/env only; pairs with the gh-cadenced `prs` read below.

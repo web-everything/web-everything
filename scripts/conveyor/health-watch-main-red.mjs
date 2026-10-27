@@ -7,7 +7,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
-import { mainRedState, findOwnerPrs, mainCiRedSettings } from './main-ci-red-core.mjs';
+import { mainRedState, latestCheckVerdicts, findOwnerPrs, mainCiRedSettings } from './main-ci-red-core.mjs';
 import { DEFAULT_REPO_SLUG, readRunJobs, readFailingTests, readOpenPrsForOwner } from './main-ci-red-io.mjs';
 
 export function mainRedAlertSettings(config = {}) {
@@ -15,39 +15,54 @@ export function mainRedAlertSettings(config = {}) {
   return { mainRedAlertAfterMin: Number.isFinite(value) && value >= 0 ? value : 20 };
 }
 
-export function planMainRedAlert({ runs, tip, readOk = true, now, prev = {},
-  settings = mainRedAlertSettings(), details } = {}) {
+export function planMainRedAlert(input = {}) {
+  const { runs, tip, readOk = true, now, prev = {},
+    settings = mainRedAlertSettings(), details } = input;
   const next = { ...prev };
   const items = [];
   const base = { repo: DEFAULT_REPO_SLUG, pr: 0 };
   const state = readOk ? mainRedState(runs, { tip }) : { status: 'unknown' };
-  if (!['red', 'green'].includes(state.status)) {
+  // Legacy run-only callers omit tip; the IO adapter always supplies it, including
+  // undefined on a failed read. Completed historical runs cannot clear that hold.
+  const tipUnavailable = Object.hasOwn(input, 'tip') && (!tip?.sha
+    || !Array.isArray(tip.checkRuns) || !tip.checkRuns.length
+    || [...latestCheckVerdicts(tip.checkRuns).values()].includes('red'));
+  if (!['red', 'green'].includes(state.status) || (state.status === 'green' && tipUnavailable)) {
     if (!prev.unknownEmitted) items.push({ ...base, kind: 'main-status-unknown',
-      head: 'main-status-unknown', reason: 'Main CI status is unavailable' });
+      head: `main-status-unknown:${now}`, reason: 'Main CI status is unavailable' });
     next.unknownEmitted = true;
     return { items, next };
   }
   next.unknownEmitted = false;
   if (state.status === 'green') {
-    if (prev.fingerprint) items.push({ ...base, kind: 'main-green', head: prev.fingerprint,
+    if (prev.fingerprint) items.push({ ...base, kind: 'main-green',
+      head: `${prev.fingerprint}:${prev.fingerprintParts?.since ?? 'unknown'}`,
       reason: 'Main CI is green again' });
     next.fingerprint = null;
+    next.fingerprintParts = null;
     return { items, next };
   }
   if (now - state.redSinceMs < settings.mainRedAlertAfterMin * 60_000) return { items, next };
-  const failingJobs = [...new Set(details?.failingJobs ?? [])].sort();
-  const fixPrs = [...new Set(details?.fixPrs ?? [])].sort((a, b) => a - b);
-  const firstFailingTest = details?.firstFailingTest ?? null;
   const firstRedSha = state.firstRed.sha;
   const since = new Date(state.redSinceMs).toISOString();
+  // Carry unavailable reads only within the same red episode. Empty arrays are
+  // observed changes, and old state without parts starts with unknown details.
+  const previousParts = prev.fingerprintParts;
+  const carried = previousParts?.firstRedSha === firstRedSha && previousParts?.since === since
+    ? previousParts : {};
+  const failingJobs = [...new Set(details?.failingJobs ?? carried.failingJobs ?? [])].sort();
+  const fixPrs = [...new Set(details?.fixPrs ?? carried.fixPrs ?? [])].sort((a, b) => a - b);
+  const firstFailingTest = details?.firstFailingTest ?? carried.firstFailingTest ?? null;
+  const fingerprintParts = { firstRedSha, since, failingJobs, firstFailingTest, fixPrs };
   const fingerprint = createHash('sha256')
-    .update(JSON.stringify({ firstRedSha, since, failingJobs, firstFailingTest, fixPrs })).digest('hex');
+    .update(JSON.stringify(fingerprintParts)).digest('hex');
   if (fingerprint !== prev.fingerprint) items.push({ ...base, kind: 'main-red', head: fingerprint,
     since, firstRedSha, failingJobs, firstFailingTest, fixPrs,
     blockedReadyPrs: details?.blockedReadyPrs ?? null,
     reason: `Main CI red since ${since}: ${firstFailingTest || failingJobs[0] || firstRedSha.slice(0, 7)}`.slice(0, 100),
   });
   next.fingerprint = fingerprint;
+  next.fingerprintParts = fingerprintParts;
   return { items, next };
 }
 
