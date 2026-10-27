@@ -170,7 +170,7 @@ describe('delegated clear-human final label guard', () => {
     expect(result.events).toEqual([]);
   });
 
-  it.each(readBoundaries)(
+  it.each(readBoundaries.filter(boundary => boundary.injectAt < 5))(
     'refuses a moved head at read $injectAt ($boundary), with no subsequent writes', testCase => {
       const result = run({ ...testCase, movedHead: 'b'.repeat(40), repark: true });
       expect(result.exitCode).toBe(1);
@@ -181,8 +181,7 @@ describe('delegated clear-human final label guard', () => {
       expect(result.provider.removeLabels).not.toHaveBeenCalled();
       expectBoundaryLedger(result, testCase.injectAt);
       expect(result.output).toContain(testCase.injectAt === 1 ? 'live head differs from --expect-head'
-        : testCase.injectAt === 5 ? 'delegated clearance refused: post-clearance re-check failed'
-          : 'head changed before acceptance; hold retained');
+        : 'head changed before acceptance; hold retained');
     },
   );
   const blockers = [...DELEGATED_CLEARANCE_INELIGIBLE_LABELS.map(label => ({
@@ -192,7 +191,9 @@ describe('delegated clear-human final label guard', () => {
   { label: 'malformed labels', evidence: ['review:human', { name: null }] },
   { label: 'failed read', readError: true }];
 
-  it.each(readBoundaries.flatMap(boundary => blockers.map(blocker => ({ ...boundary, ...blocker }))))(
+  it.each(readBoundaries.flatMap(boundary => blockers
+    .filter(blocker => boundary.injectAt < 5 || !blocker.readError)
+    .map(blocker => ({ ...boundary, ...blocker }))))(
     'refuses $label at read $injectAt ($boundary), with no subsequent comment or label writes', testCase => {
       const result = run({ ...testCase, repark: true });
       expect(result.exitCode).toBe(1);
@@ -209,6 +210,26 @@ describe('delegated clear-human final label guard', () => {
         expect(result.provider.setLabels).not.toHaveBeenCalled();
       }
       if (!testCase.readError) expect(result.output).toContain('delegated clearance refused');
+    },
+  );
+
+  it.each(['read failure', 'head movement'])(
+    'reports delegated clearance success and warns on post-clearance %s without further writes', failure => {
+      const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      try {
+        const result = run({ accepted: true, repark: true, injectAt: 5,
+          readError: failure === 'read failure', movedHead: failure === 'head movement' ? 'b'.repeat(40) : undefined });
+        expect(result.exitCode).toBe(0);
+        expect(JSON.parse(result.output)).toMatchObject({ to: 'clear-human', decision: { allowed: true } });
+        expect(result.output).not.toContain('refused');
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('post-clearance'));
+        expect(result.provider.readPrState).toHaveBeenCalledTimes(5);
+        expect(result.events.slice(result.events.indexOf('blocked-read'))).toEqual(['blocked-read']);
+        expect(result.events.filter(event => event.endsWith('write'))).toEqual(['label-write', 'comment-write']);
+        expect(result.provider.addLabels).not.toHaveBeenCalled();
+        expect(result.provider.removeLabels).not.toHaveBeenCalled();
+        expectBoundaryLedger(result, 5);
+      } finally { warn.mockRestore(); }
     },
   );
 

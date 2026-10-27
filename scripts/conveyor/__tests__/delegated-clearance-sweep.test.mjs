@@ -182,6 +182,25 @@ describe('R130 delegated clearance', () => {
     const results = sweepDelegatedClearance(h);
     expect(results[0].delegated).toBe(['not-real', 'dismissed'].includes(ruling) ? 'auto-approved' : 'pre-approval-void');
   });
+  it.each([
+    { name: 'producer action with header', text: '**Red-team gate** operator ruling\n- 1 finding(s) left advisory (#1).', dismissed: true },
+    { name: 'producer action without header', text: '- 1 finding(s) left advisory (#1).', dismissed: true },
+    { name: 'quoted finding', text: '**Red-team gate** operator ruling\n- Retained for review.\n\n> - 1 finding(s) left advisory (#1).', dismissed: false },
+    { name: 'fenced finding', text: '**Red-team gate** operator ruling\n- Retained for review.\n\n```text\n- 1 finding(s) left advisory (#1).\n```', dismissed: false },
+    { name: 'prose below actions', text: '**Red-team gate** operator ruling\n- Retained for review.\nExplanation follows.\n- 1 finding(s) left advisory (#1).', dismissed: false },
+    { name: 'blank line ends actions', text: '**Red-team gate** operator ruling\n- Retained for review.\n\n- 1 finding(s) left advisory (#1).', dismissed: false },
+    { name: 'later finding cannot extend partial action', text: '**Red-team gate** operator ruling\n- 1 finding(s) left advisory (#2).\n\n- 1 finding(s) left advisory (#1).', dismissed: false },
+  ])('unresolvedBreaks reads only the producer action block: $name', ({ text, dismissed }) => {
+    const p = pr();
+    const broken = `<!-- we:red-team-advisory pr=5925 rev=${prior} -->\n1. [**confirmed**] (correctness, broken) `
+      + '`src/a.js:1` — historical break';
+    p.comments.splice(1, 0, bot(broken), { author: { login: 'chalbert' },
+      body: redTeamGateMarker(5925, prior, 'operator-not-real', redTeamResultId(parseRedTeamComment(broken)))
+        + `\n${text}` });
+    const h = harness({ prs: [p], readPreApprovals: () => approvals });
+    expect(sweepDelegatedClearance(h)[0].delegated).toBe(dismissed ? 'auto-approved' : 'pre-approval-void');
+    expect(h.runLabel).toHaveBeenCalledTimes(dismissed ? 1 : 0);
+  });
   it.each(DELEGATED_CLEARANCE_INELIGIBLE_LABELS)('the sweep refuses an existing %s hold', label => {
     const p = pr(); p.labels.push(label);
     const h = harness({ prs: [p] });

@@ -28,10 +28,10 @@ they describe the observable gate result, not claims of existing coverage.
 
 | Guarantee | Planned exact case title | Assertion |
 | --- | --- | --- |
-| A1 | `rejects an uncovered CLI refusal and accepts its named exit mapping` | An uncovered diagnostic fails; its mapped regression passes. |
-| A2 | `resolves parameterized test titles and rejects missing files or invented cases` | Real titles resolve; missing/invented claims fail; ordinary identifiers are ignored. |
-| A3 | `runs every selected guarantee mapping and rejects unknown assertions` | Manifest selection contains every mapped case; an unknown assertion blocks selection. |
-| A4 | `fails closed for stale aliases, dynamic diagnostics and unreadable evidence` | Renamed/unknown mappings and unreadable input identify the missing evidence; mapped multiline diagnostics pass. |
+| A1 | `rejects an uncovered CLI refusal and accepts its named exit mapping` | A newly added `fail(...)` diagnostic without a named regression fails; a regression referencing that diagnostic or an explicit exit-path mapping passes. |
+| A2 | `resolves parameterized test titles and rejects missing files or invented cases` | Repository-qualified files and exact parameterized test/describe titles resolve; missing files and invented cases fail; ordinary prose/code identifiers are ignored. |
+| A3 | `runs every selected guarantee mapping and rejects unknown assertions` | The selected CI gate executes every mapped file and exact case title with its observable assertion; omission of a mapped test or an unknown assertion blocks selection. |
+| A4 | `fails closed for stale aliases, dynamic diagnostics and unreadable evidence` | Table rows cover aliases, renamed cases, multiline diagnostics, dynamic messages, unreadable files, and unknown assertion mappings. Unresolved evidence fails naming the missing mapping; explicitly mapped multiline/dynamic diagnostics pass. |
 | A5 | `rejects a refusal matrix that omits a durable sink at a later boundary` | Omitting ledger assertions at any boundary fails; an explicit prior-row set passes. |
 | A6 | `detects comment fields in defaults and variables and rejects unexplained baseline decreases` | Moving the same read into a default/variable cannot reduce the ratchet count silently. |
 

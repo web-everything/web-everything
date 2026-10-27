@@ -2637,9 +2637,11 @@ shadow/live behavior, durable void memos, or default-reader reconciler compositi
 with each admission read including the initial observation: before comment, before swap,
 between the verdict and approval appends, and
 (already accepted only) before reassertion. Keep a trusted matching repark marker in these
-fixtures so the reassert write is reachable. Refusal exits 1 and permits no subsequent writes;
+fixtures so the reassert write is reachable. Same-head eligibility refusal exits 1 and permits no subsequent writes;
 only a refusal before the first write can promise zero writes for the entire invocation.
-The later presentation-only `readLabels` does not authorize writes.
+Post-clearance read failure or head movement warns and preserves success for the completed clearance,
+without a reassertion write. Earlier admission failures still exit 1. The later presentation-only
+`readLabels` does not authorize writes.
 
 The first write-time admission read also precedes both clearance ledger appends, in
 either comment/label order. A second-read refusal must leave zero ledger rows and
@@ -2662,7 +2664,7 @@ Delegated `runReviewLabelCli` forge-write inventory (including called helpers):
 | --- | --- |
 | `postComment` in the verdict step | Shared delegated eligibility assertion on its fresh PR read. |
 | `setLabels` in `applySwap` | Same assertion on its independent fresh PR read. |
-| `setLabels` in `reassertHumanClearance` | Already accepted only; same assertion before inspecting the repark marker. Read failure exits 1 for delegation. |
+| `setLabels` in `reassertHumanClearance` | Already accepted only; same-head eligibility assertion before inspecting the repark marker. Recovery read failure or head movement warns, skips reassertion, and preserves clearance success. |
 | `postComment` in `runApprovalPreventionFiling` | Conditional prevention receipt after clearance; reassert refusal exits before this call. |
 
 There are no delegated `addLabels` or `removeLabels` calls. Mechanical handoff's comment,
@@ -2682,7 +2684,8 @@ Guarantee-to-test map (case names are parameterized Vitest titles):
 | Recheck between appends | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `retains a new head human hold arriving between ledger appends (accepted=%s)` | New head and mirrored hold leave only the original verdict and label-input rows; no approval/comment/label write; evaluated human hold remains. |
 | Expiry during verdict persistence | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `refuses delegation expiring between ledger appends before comment or label writes` | Exactly one verdict row, no approval or forge writes. |
 | Head pin at every admission boundary | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `refuses a moved head at read $injectAt ($boundary), with no subsequent writes` | Exit 1, boundary diagnostic, only explicitly enumerated prior writes. |
-| Initial and later label eligibility | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `refuses $label at read $injectAt ($boundary), with no subsequent comment or label writes` | Every blocker/read failure refuses; no writes after refusal; exact earlier ledger row set asserted at every boundary. |
+| Initial and later label eligibility | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `refuses $label at read $injectAt ($boundary), with no subsequent comment or label writes` | Every same-head blocker and admission read failure refuses; no writes after refusal; exact earlier ledger row set asserted at every boundary. |
+| Post-clearance observation failure | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `reports delegated clearance success and warns on post-clearance %s without further writes` | Recovery read failure/head movement exits 0, reports success, warns, preserves both ledger rows, and issues no further writes. The `clear-human-post-clearance` soak replay also exercises the real ledger. |
 | Mechanical handoff exclusion and forge write inventory | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `delegated clear-human reaches only enumerated provider writes, excluding mechanical handoff (accepted=%s)` | Both write orders assert exact comment/label call counts and arguments, no add/remove calls, and the ledger row set. |
 | Delegation cannot select handoff targets | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `refuses delegated flags on %s before mechanical handoff or any durable write` | Accepted/changes/restamp/rearm refuse before PR reads or durable writes. |
 | Operator recovery remains best effort | `we:scripts/lib/__tests__/review-set-label-clear-human-hold.test.mjs` | `preserves operator best-effort reassertion on %s` | Read failure/head movement leaves exit 0 with no reassert write. |

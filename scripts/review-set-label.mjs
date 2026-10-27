@@ -321,8 +321,8 @@ export function isHumanSurfacePark({ provider, repo, pr, labels, headSha, commen
  * PR #5273 — after a swap-first `clear-human` (the PR was already accepted), re-read once its comment is posted and
  * undo a human-surface park that landed after the swap. Only that park: any other hold is left alone. A failed read
  * is reported, not fatal: the clearance is already durable, and the sweep heals its own park on a later tick.
- * Delegated callers supply their eligibility assertion and treat a reported error as fatal; operator callers keep
- * the best-effort behavior. Eligibility refusal propagates before any reassertion write.
+ * Delegated callers supply their eligibility assertion. Recovery read failures and head moves stay best-effort
+ * for every caller; a same-head eligibility refusal still propagates before any reassertion write.
  */
 export function reassertHumanClearance({ provider, repo, pr, headSha, assertEligible = () => {}, warn = s => process.stderr.write(s) }) {
   let fresh;
@@ -331,11 +331,14 @@ export function reassertHumanClearance({ provider, repo, pr, headSha, assertElig
     warn(`review-set-label: post-clearance label re-check failed (${String(e?.message ?? e).split('\n')[0]}); confirm review:human is gone\n`);
     return { reapplied: false, error: true };
   }
+  if (String(fresh?.headRefOid).toLowerCase() !== String(headSha).toLowerCase()) {
+    warn(`review-set-label: post-clearance head changed; clearance remains recorded for ${headSha}; inspect the current head before retrying\n`);
+    return { reapplied: false, error: true };
+  }
   // Outside the recovery catch: a delegated refusal must exit, never become a successful no-op.
   // Validate even when the repark marker is absent or labels are unreadable.
   assertEligible(fresh?.labels);
   try {
-    if (String(fresh.headRefOid).toLowerCase() !== String(headSha).toLowerCase()) return { reapplied: false, error: true };
     if (!Array.isArray(fresh.labels)) return { reapplied: false };
     if (!isHumanSurfacePark({ provider, repo, pr, labels: fresh.labels, headSha, comments: fresh.comments })) return { reapplied: false };
     provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
@@ -2233,9 +2236,9 @@ export function runReviewLabelCli({
   // (Comment-first order needs no extra read: the swap's own fresh read already follows the comment.)
   // The re-park re-reads after its own write too, so at least one side sees the other.
   if (to === 'clear-human' && acceptanceAlreadyLive) {
-    const result = reassertHumanClearance({ provider, repo, pr, headSha,
+    // Clearance is already durable. Recovery warns on read/head failures and performs no further swap.
+    reassertHumanClearance({ provider, repo, pr, headSha,
       assertEligible: assertGuardedClearHumanEligible });
-    if (guardedClearHuman && result.error) fail('delegated clearance refused: post-clearance re-check failed; operator review required', 1);
   }
 
   // #4258-shape — THE APPROVAL-TIME PREVENTION-FILING DEFAULT (operator, 2026-09-27). Runs ONLY for the two
