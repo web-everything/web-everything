@@ -137,7 +137,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         const priorComments = rawPr.comments.slice(0, acceptance.index);
         // Share numbering's trusted provenance parser; comment order alone cannot bind a carry.
         const restamp = restampRecord(rawPr.comments[acceptance.index]);
-        const source = latestAcceptRecord(priorComments, reviews);
+        // Select the declared source without dropping intervening verdicts or holds.
+        const source = restamp ? latestAcceptRecord(priorComments, reviews, { sha: restamp.from }) : null;
         const comment = priorComments.findLast(c => {
           const parsed = parseRedTeamComment(c?.body);
           return parsed?.pr === pr && redTeamForHead([c], pr, parsed.rev);

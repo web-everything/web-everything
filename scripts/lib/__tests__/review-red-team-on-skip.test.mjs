@@ -1114,6 +1114,31 @@ describe('R100 recovery regressions', () => {
       expect(runRedTeamOnSkip(o).rows[0].action).toBe('skip');
       expect(o.syncLabels).not.toHaveBeenCalled();
     });
+  it('selects acceptance A in an A then B history for a declared A-to-C carry, retaining the later verdict', () => {
+    const o = carryOptions(), newer = 'c'.repeat(40);
+    const comments = o.rawPrs[0].comments;
+    comments.splice(1, 0, trusted(`✅ review — accepted\n<!-- reviewed-sha: ${newer} -->`));
+    const source = latestAcceptRecord(comments.slice(0, -1), [], { sha: old });
+    expect(source).toMatchObject({ sha: old, index: 0, laterVerdict: true });
+    // B supersedes A: selecting A must not discard B or publish B's clearance as A-to-C.
+    runGhSync.mockClear();
+    expect(runRedTeamOnSkip(o).rows[0].action).not.toBe('carry');
+    expect(runGhSync).not.toHaveBeenCalled();
+    expect(o.syncLabels).not.toHaveBeenCalled();
+  });
+  it.each(['missing', 'untrusted'])(
+    'falls back to the normal red-team run when the declared from acceptance is %s', kind => {
+      const o = carryOptions(), missing = 'd'.repeat(40);
+      const comments = o.rawPrs[0].comments;
+      if (kind === 'missing') comments.at(-1).body = comments.at(-1).body.replace(`from=${old}`, `from=${missing}`);
+      else comments[0].author.login = 'stranger';
+      o.readEvidence = () => ({ loopPayload: payload(), inFlight: false, recorded: false });
+      expect(latestAcceptRecord(comments.slice(0, -1), [], { sha: kind === 'missing' ? missing : old })).toBeNull();
+      runGhSync.mockClear();
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'dispatch', mode: 'fresh' });
+      expect(runGhSync).not.toHaveBeenCalled();
+      expect(o.syncLabels).not.toHaveBeenCalled();
+    });
   it.each(['matching', 'mismatching', 'missing', 'wrong-target', 'malformed'])(
     'binds B policy-clear to the declared source in an A/B/C history: %s', provenance => {
       const o = carryOptions(), newer = 'c'.repeat(40);
