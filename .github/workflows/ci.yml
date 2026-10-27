@@ -94,7 +94,7 @@ jobs:
         run: |
           FRESH_MAIN_SHA=""
           if [ "$BASE_REF" = "main" ]; then
-            if git fetch --no-tags --filter=blob:none --depth=1000000 origin '+refs/heads/main:refs/remotes/origin/main'; then
+            if git fetch --no-tags --depth=1000000 origin '+refs/heads/main:refs/remotes/origin/main'; then
               FRESH_MAIN_SHA=$(git rev-parse --verify --end-of-options 'refs/remotes/origin/main^{commit}') || FRESH_MAIN_SHA=""
             else
               echo "ci-card-only: main fetch failed; full suite" >&2
@@ -122,7 +122,7 @@ jobs:
           fetch-depth: 50 # backlog scope guards compare the PR against origin/main
       - name: Fetch main history (blobless)
         working-directory: web-everything
-        run: git fetch --no-tags --filter=blob:none --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
+        run: git fetch --no-tags --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
       - name: Mint FUI read token (GitHub App)
         id: fui-app-token
         if: vars.WE_APP_ID != ''
@@ -214,7 +214,7 @@ jobs:
       - name: Fetch main history (blobless)
         if: ${{ needs.changes.outputs.light != 'true' }}
         working-directory: web-everything
-        run: git fetch --no-tags --filter=blob:none --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
+        run: git fetch --no-tags --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
       - name: Mint FUI read token (GitHub App)
         id: fui-app-token
         if: ${{ needs.changes.outputs.light != 'true' && (vars.WE_APP_ID != '') }}
@@ -439,7 +439,7 @@ jobs:
       - name: Fetch main history (blobless)
         if: ${{ steps.gate.outputs.run == 'true' }}
         working-directory: web-everything
-        run: git fetch --no-tags --filter=blob:none --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
+        run: git fetch --no-tags --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
       - name: Mint FUI read token (GitHub App)
         id: fui-app-token
         if: vars.WE_APP_ID != ''
@@ -530,7 +530,7 @@ jobs:
         with:
           fetch-depth: 50
       - name: Fetch main history (blobless)
-        run: git fetch --no-tags --filter=blob:none --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
+        run: git fetch --no-tags --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
 
       - name: Does this PR touch daemon code?
         id: scope
@@ -769,7 +769,7 @@ jobs:
           fetch-depth: 50
       - name: Fetch main history (blobless)
         working-directory: web-everything
-        run: git fetch --no-tags --filter=blob:none --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
+        run: git fetch --no-tags --depth=1000000 origin +refs/heads/main:refs/remotes/origin/main
       - name: Mint FUI read token (GitHub App)
         id: fui-app-token
         if: vars.WE_APP_ID != ''
