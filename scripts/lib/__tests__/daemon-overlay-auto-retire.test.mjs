@@ -491,6 +491,51 @@ describe('real Git retirement evidence', () => {
     expect(lower).not.toBe(top);
   });
 
+  it('retires three independent unmerged registrations into their merged top and reinstates them on withdrawal', async () => {
+    const refs = ['hw-top-1022c', 'hw-top-1022e', 'bundle-repair-retry'];
+    const sources = refs.map((ref) => {
+      branch(ref, initial);
+      commit(`${ref}-base`, `${ref} base content`);
+      const sha = commit(ref, `${ref} unmerged content`);
+      track(ref);
+      return { entry: { ref }, sha };
+    });
+    const topRef = 'hw-unfreeze-deadline';
+    branch(topRef, initial);
+    commit(topRef, 'top unmerged content');
+    for (const ref of refs) ok('merge', '--no-ff', '-m', `merge ${ref}`, ref);
+    const top = ok('rev-parse', 'HEAD');
+    track(topRef);
+    const overlays = [...sources.map(({ entry }) => entry), { ref: topRef }];
+    for (const overlay of overlays) {
+      expect(classify([overlay])[0]).toMatchObject({ ref: overlay.ref, class: 'needed', reason: 'unmerged-content' });
+    }
+
+    const moved = [];
+    const result = await retire(overlays, {
+      removeOverlay: (r, ref, opts) => {
+        // The registered carrier exists before each source is removed; the same write preserves the source.
+        const before = readOverlayState(r, { env }).overlays;
+        expect(before).toContainEqual({ ref });
+        expect(before).toContainEqual({ ref: topRef, ...(moved.length ? { retiredSources: [...moved] } : {}) });
+        const removed = removeOverlay(r, ref, opts);
+        moved.push(sources.find(({ entry }) => entry.ref === ref));
+        const after = readOverlayState(r, { env }).overlays;
+        expect(after.some((entry) => entry.ref === ref)).toBe(false);
+        expect(after).toContainEqual({ ref: topRef, retiredSources: [...moved] });
+        return removed;
+      },
+    });
+    expect(result.retired).toEqual(sources.map(({ entry, sha }) => expect.objectContaining({
+      ref: entry.ref, sha, class: 'contained', container: topRef,
+    })));
+    expect(result.kept).toEqual([expect.objectContaining({ ref: topRef, sha: top, class: 'needed', reason: 'unmerged-content' })]);
+    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: topRef, retiredSources: sources }]);
+
+    expect(removeOverlay(root, topRef, { env, why: 'pr-closed' }).reinstated).toEqual(refs);
+    expect(readOverlayState(root, { env }).overlays).toEqual(sources.map(({ entry, sha }) => ({ ...entry, tipSha: sha })));
+  });
+
   it('missing main, missing recorded objects and Git errors keep registrations', () => {
     track('feature');
     ok('update-ref', '-d', 'refs/remotes/origin/main');
