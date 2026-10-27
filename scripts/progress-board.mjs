@@ -1943,4 +1943,6 @@ export function main(argv = process.argv.slice(2)) {
   return 0;
 }
 
-if (process.argv[1] && process.argv[1].endsWith('progress-board.mjs')) process.exitCode = main();
+// Shared dependencies can import this board from a copied CLI with the same filename. Only the actual
+// entry point may render; the imported original must not scan its own checkout's history as well.
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) process.exitCode = main();
