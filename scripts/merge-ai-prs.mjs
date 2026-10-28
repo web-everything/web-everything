@@ -4397,8 +4397,9 @@ export function drainGateInputs({ score, labels, deviation = null, netScored = f
 }
 
 /** Best-effort removal before the de-escalated park applies review:pending. Dry runs never write. */
-export function removeDeescalatedHumanLabels({ gate, labels, dryRun, pr, repo }, { exec = execFileSync } = {}) {
-  if (!gate.deescalatedHuman || dryRun) return;
+export function removeDeescalatedHumanLabels({ gate, labels, dryRun, pr, repo, applyOk = false }, { exec = execFileSync } = {}) {
+  // Fail closed: only an explicit applyOk===true (review:pending applied or already present) lets the hold go.
+  if (!gate.deescalatedHuman || dryRun || applyOk !== true) return;
   for (const label of (gate.removeLabels || []).filter((l) => hasReviewLabel(labels, l))) {
     try {
       exec('gh', ['pr', 'edit', String(pr), ...(repo ? ['--repo', repo] : []), '--remove-label', label],
@@ -6128,7 +6129,7 @@ async function runCli() {
           }
           // 6027: a de-escalated park removes the sticky review:human only AFTER the pending label was applied
           // (never leave a PR with neither label if the add fails).
-          if (applyLabelOk) removeDeescalatedHumanLabels({ gate, labels: v.prLabels, dryRun: candidateDryRun, pr: v.num, repo: v.repo });
+          removeDeescalatedHumanLabels({ gate, labels: v.prLabels, dryRun: candidateDryRun, pr: v.num, repo: v.repo, applyOk: applyLabelOk });
           // mechanical-dispatcher — the companion "not yet advised" label, only for a review:human park (never
           // for a plain review:pending one). Same shared guard, same best-effort posture as the add above.
           if (gate.applyLabel === REVIEW_LABELS.human && shouldApplyReviewLabel(REVIEW_LABELS.awaitingAdvisory, v.prLabels)) {

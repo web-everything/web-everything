@@ -771,14 +771,14 @@ describe('#6027 — fresh net score de-escalation through the drain handoff', ()
   it('removes the de-escalated human label through argv', () => {
     const exec = vi.fn();
     removeDeescalatedHumanLabels({ gate: drain(), labels: [REVIEW_LABELS.human],
-      dryRun: false, pr: 6027, repo: 'owner/repo' }, { exec });
+      dryRun: false, pr: 6027, repo: 'owner/repo', applyOk: true }, { exec });
     expect(exec).toHaveBeenCalledTimes(1);
     expect(exec).toHaveBeenCalledWith('gh',
       ['pr', 'edit', '6027', '--repo', 'owner/repo', '--remove-label', REVIEW_LABELS.human],
       { stdio: ['ignore', 'ignore', 'pipe'] });
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
     expect(src).toMatch(/catch \{ applyLabelOk = false;/);
-    const call = src.indexOf('if (applyLabelOk) removeDeescalatedHumanLabels({ gate, labels: v.prLabels');
+    const call = src.indexOf('removeDeescalatedHumanLabels({ gate, labels: v.prLabels');
     expect(call).toBeGreaterThan(src.indexOf("'--add-label', gate.applyLabel"));
   });
 
@@ -791,10 +791,18 @@ describe('#6027 — fresh net score de-escalation through the drain handoff', ()
     expect(exec).not.toHaveBeenCalled();
   });
 
+  it('never removes review:human unless the pending add succeeded (applyOk must be exactly true)', () => {
+    for (const applyOk of [false, undefined, null, 'true', 1]) {
+      const exec = vi.fn();
+      removeDeescalatedHumanLabels({ gate: drain(), labels: [REVIEW_LABELS.human], dryRun: false, pr: 6027, repo: 'owner/repo', applyOk }, { exec });
+      expect(exec).not.toHaveBeenCalled();
+    }
+  });
+
   it('treats a failed label removal as best-effort', () => {
     const exec = vi.fn(() => { throw new Error('label edit failed'); });
     expect(() => removeDeescalatedHumanLabels({ gate: drain(), labels: [REVIEW_LABELS.human],
-      dryRun: false, pr: 6027, repo: 'owner/repo' }, { exec })).not.toThrow();
+      dryRun: false, pr: 6027, repo: 'owner/repo', applyOk: true }, { exec })).not.toThrow();
     expect(exec).toHaveBeenCalledOnce();
   });
 
