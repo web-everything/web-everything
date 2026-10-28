@@ -2260,10 +2260,12 @@ export function recordQueueCapRefusal({
   let starved = false;
   if (plan.starvation) {
     try {
-      postComment({ repo, pr, body: buildFixStarvedCapacityComment({ headSha, ...plan.starvation }) });
-      starved = true;
-      notify({ title: '🔔 conveyor — host capacity starved',
-        body: `PR #${pr}: host capacity has deferred the fix for ${plan.starvation.hours} hours; inspect host capacity` });
+      const posted = postComment({ repo, pr, body: buildFixStarvedCapacityComment({ headSha, ...plan.starvation }) });
+      if (posted?.ok === true) {
+        starved = true;
+        notify({ title: '🔔 conveyor — host capacity starved',
+          body: `PR #${pr}: host capacity has deferred the fix for ${plan.starvation.hours} hours; inspect host capacity` });
+      }
     } catch { /* best-effort; an unposted alert can be retried on the next pass */ }
   }
   return { attempts: 0, deferredForCapacity: plan.deferredForCapacity, capExhausted: false, starved };

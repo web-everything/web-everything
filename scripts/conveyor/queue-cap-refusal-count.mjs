@@ -104,6 +104,8 @@ export function summarizeCapacityDeferral(comments, { headSha = null } = {}) {
   const bodies = capacityBodies(comments, QUEUE_CAP_REFUSAL_MARKER, headSha);
   const timedBodies = [...bodies, ...capacityBodies(comments, CAPACITY_BASELINE_MARKER, headSha)];
   const times = timedBodies.flatMap(body => [...body.matchAll(/^<!-- queue-cap-deferred-at: (.+) -->\r?$/gm)]
+    .filter(match => /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(match[1])
+      && Number.isFinite(Date.parse(match[1])))
     .map(match => capacityIso(match[1])).filter(Boolean)).sort();
   return { deferredForCapacity: bodies.length, firstAt: times[0] ?? null, lastAt: times.at(-1) ?? null };
 }

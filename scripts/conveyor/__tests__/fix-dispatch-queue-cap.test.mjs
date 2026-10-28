@@ -5,7 +5,7 @@
  *   ≤ the max, and a budget shared across both passes sees every dispatch before it. Every read is a stub — no
  *   real GitHub, lane pool or host queue.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   runReconcileFixDispatch, queueBudgetFrom, planQueueCapRefusal, recordQueueCapRefusal,
 } from '../reconcile-fix-dispatch.mjs';
@@ -112,8 +112,8 @@ describe('#4229 — planQueueCapRefusal (pure)', () => {
     for (let pass = 0; pass < 6; pass += 1) {
       const plan = planQueueCapRefusal({ pr: 1854, comments });
       expect(plan).toMatchObject({ attempts: 0, capExhausted: false, postMarker: pass < 3, starvation: null });
-      // Once marker writes stop, the durable count may saturate at the spam cap.
-      expect(plan.deferredForCapacity).toBeGreaterThanOrEqual(Math.min(pass + 1, 3));
+      // Once marker writes stop, the durable count saturates at the spam cap.
+      expect(plan.deferredForCapacity).toBe(Math.min(pass + 1, 3));
       expect(plan.note ?? null).toBeNull();
       expect(JSON.stringify(plan)).not.toMatch(/round-cap-exhausted|take it over|needs your decision/i);
       if (plan.postMarker) comments.push(markerComment());
@@ -161,7 +161,7 @@ describe('#4229 — recordQueueCapRefusal (IO shell over injected fakes — no r
         notify: (o) => notified.push(o),
       });
       expect(result).toMatchObject({ attempts: 0, capExhausted: false, starved: false });
-      expect(result.deferredForCapacity).toBeGreaterThanOrEqual(Math.min(pass + 1, 3));
+      expect(result.deferredForCapacity).toBe(Math.min(pass + 1, 3));
     }
     expect(posted).toHaveLength(QUEUE_CAP_REFUSAL_CAP);
     expect(posted.every((o) => o.body.startsWith(QUEUE_CAP_REFUSAL_MARKER))).toBe(true);
@@ -269,7 +269,7 @@ describe('#4229 — runReconcileFixDispatch: the durable count survives across p
     expect(outcomes.map((o) => o.attemptsBeforeThisPass)).toEqual([0, 1, 2, 3]);
     expect(outcomes.map((o) => o.refusal.attempts)).toEqual([0, 0, 0, 0]);
     expect(outcomes.slice(0, 3).map((o) => o.refusal.deferredForCapacity)).toEqual([1, 2, 3]);
-    expect(outcomes[3].refusal.deferredForCapacity).toBeGreaterThanOrEqual(3);
+    expect(outcomes[3].refusal.deferredForCapacity).toBe(3);
     expect(outcomes.map((o) => o.refusal.capExhausted)).toEqual([false, false, false, false]);
     // Only three capacity markers: later passes keep retrying without further thread spam.
     expect(posted).toHaveLength(3);
@@ -327,11 +327,11 @@ describe('#4229 — runReconcileFixDispatch: the durable count survives across p
     }).result.refusals[0];
     const first = [1, 2, 3, 4, 5].map(() => pass('aaa111'));
     expect(first.map((r) => r.attempts)).toEqual([0, 0, 0, 0, 0]);
-    expect(first.slice(0, 3).map((r) => r.deferredForCapacity)).toEqual([1, 2, 3]);
+    expect(first.map((r) => r.deferredForCapacity)).toEqual([1, 2, 3, 3, 3]);
     expect(notified).toHaveLength(0);
     const second = [1, 2, 3, 4, 5].map(() => pass('bbb222'));
     expect(second.map((r) => r.attempts)).toEqual([0, 0, 0, 0, 0]);
-    expect(second.slice(0, 3).map((r) => r.deferredForCapacity)).toEqual([1, 2, 3]);
+    expect(second.map((r) => r.deferredForCapacity)).toEqual([1, 2, 3, 3, 3]);
     expect(second.map((r) => r.capExhausted)).toEqual([false, false, false, false, false]);
     expect(posted.filter((p) => p.body.includes(QUEUE_CAP_REFUSAL_MARKER))).toHaveLength(6);
     expect(posted.filter((p) => p.body.includes(NOTE_COMMENT_MARKER))).toHaveLength(0);
@@ -385,7 +385,7 @@ describe('#4229 — runReconcileFixDispatch: the durable count survives across p
     expect(outcomes.every((o) => o.pr === realPr && o.kind === 'queue-cap')).toBe(true);
     expect(outcomes.map((o) => o.attempts)).toEqual([0, 0, 0, 0]);
     expect(outcomes.slice(0, 3).map((o) => o.deferredForCapacity)).toEqual([1, 2, 3]);
-    expect(outcomes[3].deferredForCapacity).toBeGreaterThanOrEqual(3);
+    expect(outcomes[3].deferredForCapacity).toBe(3);
     expect(outcomes.map((o) => o.capExhausted)).toEqual([false, false, false, false]);
     expect(posted.filter((p) => p.body.includes(NOTE_COMMENT_MARKER))).toHaveLength(0);
     expect(JSON.stringify(posted)).not.toMatch(/round-cap-exhausted|take it over/i);
@@ -441,6 +441,34 @@ describe('capacity deferral marker helpers', () => {
       .toEqual({ deferredForCapacity: 0, firstAt: null, lastAt: null });
   });
 
+  it('legacy markers without a deferred-at line count toward deferredForCapacity but never create starvation evidence', () => {
+    const comments = Array.from({ length: 3 }, () => ({
+      ...capacityMarker(null), createdAt: isoHoursAgo(99),
+    }));
+    expect(summarizeCapacityDeferral(comments, { headSha: CAPACITY_HEAD }))
+      .toEqual({ deferredForCapacity: 3, firstAt: null, lastAt: null });
+    expect(planQueueCapRefusal({ pr: 42, comments, headSha: CAPACITY_HEAD, now: CAPACITY_NOW }))
+      .toMatchObject({ deferredForCapacity: 3, firstAt: null, postMarker: false, postBaseline: true, starvation: null });
+  });
+
+  it.each([
+    '2026-13-45', 'tomorrow', '1e12', '', '2026-10-28',
+    '2026-10-28 05:00:00Z', '2026-10-28T05:00:00', '2026-10-28T05:00:00+00:00',
+    '2026-10-28T05:00:00.1Z', '2026-10-28T05:00:00.0000Z', '2026-13-45T05:00:00Z',
+  ])('malformed deferred-at %j counts as a deferral but supplies no starvation timestamp', at => {
+    const comments = [capacityMarker(at)];
+    expect(summarizeCapacityDeferral(comments, { headSha: CAPACITY_HEAD }))
+      .toEqual({ deferredForCapacity: 1, firstAt: null, lastAt: null });
+    expect(planQueueCapRefusal({ pr: 42, comments, headSha: CAPACITY_HEAD, now: CAPACITY_NOW }).starvation).toBeNull();
+  });
+
+  it.each(['2026-10-28T05:00:00Z', '2026-10-28T05:00:00.000Z'])(
+    'valid UTC deferred-at %s supplies starvation evidence', at => {
+      expect(summarizeCapacityDeferral([capacityMarker(at)], { headSha: CAPACITY_HEAD }))
+        .toEqual({ deferredForCapacity: 1, firstAt: isoHoursAgo(7), lastAt: isoHoursAgo(7) });
+    },
+  );
+
   it('buildFixStarvedCapacityComment identifies host capacity, no failed fix and no used attempt', () => {
     expect(FIX_STARVED_CAPACITY_MARKER).toBe('⏳ conveyor — fix starved on host capacity (fix-starved-capacity)');
     const body = buildFixStarvedCapacityComment({ headSha: CAPACITY_HEAD, hours: 7, deferredForCapacity: 3, firstAt: isoHoursAgo(7) });
@@ -486,18 +514,57 @@ describe('host capacity starvation is elapsed-time based, never round exhaustion
     const pass = () => recordQueueCapRefusal({
       pr: 42, repo: 'o/n', headSha: CAPACITY_HEAD, now: CAPACITY_NOW, why: 'queue busy',
       readPrComments: () => thread,
-      postComment: o => { posted.push(o); thread.push({ body: o.body, author: AUTOMATION }); },
+      postComment: o => { posted.push(o); thread.push({ body: o.body, author: AUTOMATION }); return { ok: true }; },
       notify: o => notified.push(o),
     });
     expect(pass()).toMatchObject({ attempts: 0, capExhausted: false, deferredForCapacity: 3, starved: true });
     expect(posted).toHaveLength(1);
     expect(posted[0].body.split('\n')[0]).toBe(FIX_STARVED_CAPACITY_MARKER);
     expect(notified).toEqual([expect.objectContaining({ title: '🔔 conveyor — host capacity starved', body: expect.stringMatching(/host capacity/i) })]);
+    expect(notified[0].body).toContain('PR #42');
     expect(pass()).toMatchObject({ attempts: 0, capExhausted: false, starved: false });
     expect(posted).toHaveLength(1);
     expect(notified).toHaveLength(1);
     expectNoRepairExhaustion(posted, notified);
   });
+
+  it.each(['ok:false', 'throw', 'missing result'])(
+    'REPLAY — PR #2756: failed alert publisher (%s) never notifies or sets starved; recovery posts exactly one durable alert', failure => {
+      const thread = [capacityMarker(isoHoursAgo(7)), capacityMarker(isoHoursAgo(6)), capacityMarker(isoHoursAgo(5))];
+      const posted = [];
+      const notified = [];
+      const publisher = vi.fn(() => {
+        if (failure === 'throw') throw new Error('publisher unavailable');
+        return failure === 'ok:false' ? { ok: false } : undefined;
+      });
+      const pass = () => recordQueueCapRefusal({
+        pr: 2756, repo: 'o/n', headSha: CAPACITY_HEAD, now: CAPACITY_NOW,
+        readPrComments: () => thread, postComment: publisher, notify: o => notified.push(o),
+      });
+      expect(pass()).toMatchObject({ deferredForCapacity: 3, starved: false });
+      expect(publisher).toHaveBeenCalledTimes(1);
+      expect(publisher.mock.calls[0][0].body).toContain(FIX_STARVED_CAPACITY_MARKER);
+      expect(hasFixStarvedCapacityAlert(thread, { headSha: CAPACITY_HEAD })).toBe(false);
+      expect(posted).toEqual([]);
+      expect(notified).toEqual([]);
+
+      publisher.mockImplementation(o => {
+        posted.push(o);
+        thread.push({ body: o.body, author: AUTOMATION });
+        return { ok: true };
+      });
+      expect(pass()).toMatchObject({ deferredForCapacity: 3, starved: true });
+      expect(pass()).toMatchObject({ deferredForCapacity: 3, starved: false });
+      expect(publisher).toHaveBeenCalledTimes(2);
+      expect(posted).toHaveLength(1);
+      expect(posted[0].body.split('\n')[0]).toBe(FIX_STARVED_CAPACITY_MARKER);
+      expect(hasFixStarvedCapacityAlert(thread, { headSha: CAPACITY_HEAD })).toBe(true);
+      expect(notified).toHaveLength(1);
+      expect(notified[0].body).toContain('PR #2756');
+      expect(notified[0].body).toMatch(/host capacity/i);
+      expectNoRepairExhaustion(posted, notified);
+    },
+  );
 
   it.each([[7, undefined, 1], [5, undefined, 0], [3, 2, 1]])(
     'dispatch threads its clock and settings: %ih old, threshold %s -> %i alert', (age, threshold, alerts) => {
@@ -509,7 +576,7 @@ describe('host capacity starvation is elapsed-time based, never round exhaustion
         reconcile: reconcileStub(fixEntries([1854]).map(e => ({ ...e, headRefOid: CAPACITY_HEAD }))),
         ...(threshold === undefined ? {} : { fixSettings: { capacityStarvationHours: threshold } }),
         readPrComments: () => thread,
-        postQueueCapComment: o => { posted.push(o); thread.push({ body: o.body, author: AUTOMATION }); },
+        postQueueCapComment: o => { posted.push(o); thread.push({ body: o.body, author: AUTOMATION }); return { ok: true }; },
         notifyQueueCapOperator: o => notified.push(o),
       };
       const pass = () => runFix([1854], { tryAdmit: saturated }, options);
@@ -519,7 +586,10 @@ describe('host capacity starvation is elapsed-time based, never round exhaustion
       pass();
       expect(posted.filter(o => o.body.startsWith(FIX_STARVED_CAPACITY_MARKER))).toHaveLength(alerts);
       expect(notified).toHaveLength(alerts);
-      for (const notification of notified) expect(notification).toMatchObject({ title: '🔔 conveyor — host capacity starved', body: expect.stringMatching(/host capacity/i) });
+      for (const notification of notified) {
+        expect(notification).toMatchObject({ title: '🔔 conveyor — host capacity starved', body: expect.stringMatching(/host capacity/i) });
+        expect(notification.body).toContain('PR #1854');
+      }
       expectNoRepairExhaustion(posted, notified);
     },
   );
@@ -532,7 +602,7 @@ describe('host capacity starvation is elapsed-time based, never round exhaustion
       now,
       reconcile: reconcileStub(fixEntries([1854]).map(e => ({ ...e, headRefOid: head }))),
       readPrComments: () => thread,
-      postQueueCapComment: o => { posted.push(o); thread.push({ body: o.body, author: AUTOMATION }); },
+      postQueueCapComment: o => { posted.push(o); thread.push({ body: o.body, author: AUTOMATION }); return { ok: true }; },
       notifyQueueCapOperator: o => notified.push(o),
     }).result.refusals[0];
     pass(CAPACITY_HEAD, CAPACITY_NOW);
