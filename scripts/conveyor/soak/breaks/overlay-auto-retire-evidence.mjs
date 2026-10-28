@@ -499,6 +499,8 @@ async function registrationLifecycle(violation, { sequential = false } = {}) {
     }
     if (entries().find((o) => o.ref === 'y')?.pr !== 22) violation('reregistration-lost', `Y/PR22 left the registry (${refs()})`);
 
+    // Retirement off: the landed Z must stay registered for the pin decision itself to be observed.
+    env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'off';
     writeOverlays(root, [{ ref: 'z', pr: null, addedAt: '2026-01-01T00:00:00.000Z' }], { env });
     ok('checkout', '-qb', 'z', initial); const zTip = commit('scripts/lib/daemon-rebuild/plan.mjs');
     ok('checkout', '-q', 'main');
