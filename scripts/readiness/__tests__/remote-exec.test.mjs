@@ -3,7 +3,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
+import { spawnKeepAlive } from '../../lib/test-keepalive.mjs';
 import { runWithRemoteDecision, resolveAdmissionPolicy } from '../heavy-admission.mjs';
 import {
   isAllowedCommand, filterEnv, validateRunId, buildRemoteScript,
@@ -221,7 +222,7 @@ describe('runRemote', () => {
 
   it.each(['rejected SSH', 'SSH 255', 'receipt unavailable', 'receipt rejected'])(
     'refuses both local callers after %s while a dispatched child survives', async (loss) => {
-      const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+      const child = spawnKeepAlive();
       const closed = new Promise((resolve) => child.once('close', resolve));
       try {
         const f = fixture({ runCode: loss === 'SSH 255' ? 255 : 0, receiptCode: 1 });
