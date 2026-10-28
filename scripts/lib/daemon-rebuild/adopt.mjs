@@ -12,6 +12,7 @@ import { finalClosureScope, isExcludable } from './closure-scope.mjs';
 import { resolveClosureScopedConflict, resolveOverlayConflict } from './overlay-strategies.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
+import { resolveClosureScopeMode } from './skip-unrelated.mjs';
 
 /**
  * PURE: may the ready candidate `ready` be adopted now, instead of smoking `plan`? Returns
@@ -101,8 +102,14 @@ export function matchReadyCandidate({
  * @param {{git:(args:string[])=>{status:number|null, stdout?:string}, adopt:object, mainTip:string}} o
  */
 export function readyBuildVerified({
-  git, adopt, mainTip, prevHead, approvedEdgeShaFor = () => null, entries = [], env = {},
+  git, adopt, mainTip, prevHead, approvedEdgeShaFor = () => null, entries = [], env = {}, closureScopeMode,
 }) {
+  if ((closureScopeMode ?? resolveClosureScopeMode(env).mode) === 'on') {
+    try {
+      const runtimeEntries = typeof entries === 'function' ? entries() : entries;
+      if (!Array.isArray(runtimeEntries) || !runtimeEntries.length) return false;
+    } catch { return false; }
+  }
   const isAncestor = (a, b) => git(['merge-base', '--is-ancestor', a, b]).status === 0;
   if (!adopt?.finalSha || !adopt.mainSha || !mainTip || !isAncestor(adopt.mainSha, mainTip)) return false;
   // Never a rollback: the record's main must be at or past the main the current head was built on.
