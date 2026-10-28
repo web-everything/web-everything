@@ -2,22 +2,53 @@
 import { op } from './registry.mjs';
 import { compute } from './step-kinds.mjs';
 import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
+import { readFileSync } from 'node:fs';
+import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
 
 export const JUDGE_SWEEP_FACTS_OP = 'judge-sweep-facts';
 export const JUDGE_SWEEP_REPO = CONSTELLATION_REPOS[DEFAULT_REPO_KEY].slug;
 
+const STALL_DEFAULTS = Object.freeze({ fixerInfraLoop: 3, needsHumanAgedHours: 6,
+  draftWithdrawnAgedHours: 4, waitingFixerMinutes: 45 });
+
+/** Missing or invalid layers fall through to the next valid, finite positive threshold. */
+export function resolveStallThresholds({ env = process.env, readFile = readFileSync, platform, log } = {}) {
+  let tool, envValues;
+  try { tool = JSON.parse(String(readFile(new URL('../settings/judge-sweep-stall.json', import.meta.url), 'utf8')))?.judgeSweepStall; } catch { /* absent layer */ }
+  try { envValues = JSON.parse(env.WE_JUDGE_SWEEP_STALL); } catch { /* absent layer */ }
+  const pick = value => value && typeof value === 'object' && !Array.isArray(value)
+    ? Object.fromEntries(Object.keys(STALL_DEFAULTS).filter(k => Object.hasOwn(value, k)).map(k => [k, value[k]])) : {};
+  const plat = platform === undefined ? platformPreference('judgeSweepStall', { env, readFile }) : platform;
+  return cascadePolicy('judgeSweepStall', pick(tool), {
+    standard: STALL_DEFAULTS, platform: pick(plat), envValues: pick(envValues), env, log,
+    valid: v => typeof v === 'number' && Number.isFinite(v) && v > 0,
+  }).value;
+}
+
 /** First match wins, including when a worker is running on a PR already near its cap. */
-export function needsJudgment(pr) {
+export function needsJudgment(pr, thresholds = STALL_DEFAULTS) {
+  const limits = { ...STALL_DEFAULTS, ...thresholds };
   const yes = reason => ({ needsJudgment: true, reason });
   const no = reason => ({ needsJudgment: false, reason });
   // Unknown evidence always needs attention. Operator fallback: inspect this PR's evidence and rerun.
   if (pr.evidenceErrors?.length) return yes('evidence-unavailable: inspect PR evidence and rerun');
   // A mandatory referral awaits a ruling even when a worker or CI is making progress.
   if (pr.openReferrals?.some(r => r.ruled === false && r.superseded !== true)) return yes('unruled-referral');
+  if (Number.isFinite(pr.infraFailStreak) && pr.infraFailStreak >= limits.fixerInfraLoop) return yes('fixer-infra-loop');
+  const headAge = Number.isFinite(pr.minutesSinceHeadChange) ? pr.minutesSinceHeadChange : pr.minutesSinceUpdate;
+  if (pr.labels.some(l => ['review-status:needs-human', 'status:needs-human'].includes(l))
+    && headAge > limits.needsHumanAgedHours * 60) return yes('needs-human-aged');
+  if ((pr.isDraft === true || pr.labels.includes('review-status:draft-withdrawn'))
+    && headAge > limits.draftWithdrawnAgedHours * 60) return yes('draft-withdrawn-aged');
   // With readable evidence and no unruled referral, a live fixer, CI, or recent fix-loop means the PR is moving.
   if (pr.fixerRunning) return no('fixer running');
   if (pr.inCi) return no('in CI');
   if (Number.isFinite(pr.minutesSinceFixLoop) && pr.minutesSinceFixLoop < 60) return no('fix-loop active (<60 min)');
+  if (pr.labels.includes('ready-to-merge')) return no('awaiting-merge');
+  if (pr.labels.includes('review:accepted') && pr.labels.includes('review:human')) return yes('awaiting-operator');
+  if (pr.fixerRunning === false && pr.labels.some(l => ['status:answered-waiting-fixer', 'review:changes'].includes(l))
+    && (pr.minutesSinceFixDispatch === null || (Number.isFinite(pr.minutesSinceFixDispatch)
+      && pr.minutesSinceFixDispatch > limits.waitingFixerMinutes))) return yes('waiting-fixer-not-dispatched');
   const capHold = pr.labels.some(l => /round-limit|cap-exhausted/.test(l));
   if (capHold || (Number.isInteger(pr.round) && Number.isInteger(pr.cap) && pr.round >= pr.cap)) return yes('at-cap');
   if (pr.redTeam?.latestOutcome === 'round-cap' && pr.redTeam.state === 'blocked'
@@ -39,10 +70,10 @@ export function needsJudgment(pr) {
   return no('waiting on review');
 }
 
-export function buildJudgeSweepBundle({ generatedAt, elapsedMs, prs }) {
+export function buildJudgeSweepBundle({ generatedAt, elapsedMs, prs, thresholds }) {
   const rows = prs.map(pr => {
     const { verdictHistory, ignoredFindingReturned, fixerRunning, inCi, owner, ...facts } = pr;
-    return { ...facts, ...needsJudgment(pr) };
+    return { ...facts, ...needsJudgment(pr, thresholds) };
   });
   const count = rows.filter(pr => pr.needsJudgment).length;
   return { generatedAt, elapsedMs, counts: { needsJudgment: count, noAction: rows.length - count }, prs: rows };
