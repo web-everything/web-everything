@@ -3,7 +3,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   resolveFixSettings, takeoverRung, takeoverMarkers, takeoverMarkerBody, takeoverVoidMarkerBody, withTakeover,
   launchProvedNotStarted, takeoverReviewCap,
-  FIX_SETTINGS_FILE,
+  FIX_SETTINGS_FILE, FIX_SETTINGS_DEFAULTS,
 } from '../fix-takeover.mjs';
 // The planner moved to the takeover-budget module (fix.takeoverBudget, progress guard, gate holds).
 import { planTakeover, resolveTakeoverBudget } from '../takeover-budget.mjs';
@@ -90,6 +90,40 @@ describe('fix settings cascade (card xx0055i)', () => {
     expect(resolveFixSettings({ env: { WE_FIX_ROUND_CAP_ACTION: ' Takeover ' }, read: () => '{}' }).roundCapAction).toBe('takeover');
     expect(resolveFixSettings({ env: { WE_FIX_ROUND_CAP_ACTION: ' ' }, read: () => JSON.stringify({ fix: { roundCapAction: 'person' } }) }).roundCapAction).toBe('person');
     expect(resolveFixSettings({ env: {}, read: () => JSON.stringify({ fix: { roundCapAction: null } }) }).sources.roundCapAction).toBe('built-in');
+  });
+});
+
+describe('capacity starvation hours settings cascade', () => {
+  it('defaults to 6 hours with built-in provenance', () => {
+    expect(FIX_SETTINGS_DEFAULTS.capacityStarvationHours).toBe(6);
+    expect(resolveFixSettings({ env: {}, read: () => '{}' })).toMatchObject({
+      capacityStarvationHours: 6, sources: { capacityStarvationHours: 'built-in' },
+    });
+  });
+
+  it('environment overrides the settings file with numeric value and env provenance', () => {
+    expect(resolveFixSettings({ env: { WE_FIX_CAPACITY_STARVATION_HOURS: '2' },
+      read: () => JSON.stringify({ fix: { capacityStarvationHours: 9 } }) })).toMatchObject({
+      capacityStarvationHours: 2, sources: { capacityStarvationHours: 'env' },
+    });
+  });
+
+  it.each([1, 999, '3'])('settings-file override %s resolves as a number with settings provenance', value => {
+    expect(resolveFixSettings({ env: {}, read: () => JSON.stringify({ fix: { capacityStarvationHours: value } }) }))
+      .toMatchObject({ capacityStarvationHours: Number(value), sources: { capacityStarvationHours: 'settings' } });
+  });
+
+  it.each(['bogus', '0', '-1', '1.5', '1000', 'Infinity', ''])('invalid env %s falls through to settings, then default', bad => {
+    const env = { WE_FIX_CAPACITY_STARVATION_HOURS: bad };
+    expect(resolveFixSettings({ env, read: () => JSON.stringify({ fix: { capacityStarvationHours: 4 } }) }))
+      .toMatchObject({ capacityStarvationHours: 4, sources: { capacityStarvationHours: 'settings' } });
+    expect(resolveFixSettings({ env, read: () => '{}' }))
+      .toMatchObject({ capacityStarvationHours: 6, sources: { capacityStarvationHours: 'built-in' } });
+  });
+
+  it.each([0, -1, 1.5, 1000, false, [2], {}, null, 'nope'])('invalid file value %j falls through to default', bad => {
+    expect(resolveFixSettings({ env: {}, read: () => JSON.stringify({ fix: { capacityStarvationHours: bad } }) }))
+      .toMatchObject({ capacityStarvationHours: 6, sources: { capacityStarvationHours: 'built-in' } });
   });
 });
 
