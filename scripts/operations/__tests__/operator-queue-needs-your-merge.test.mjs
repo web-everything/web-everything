@@ -14,11 +14,24 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { evaluatePr, evaluateCeremonyOwed, evaluateNeedsYourMerge, needsYourMergeCommand, needsYourMergePrecheck, main } from '../operator-queue.mjs';
 
+import { renderRedTeamComment } from '../review-extra-seats.mjs';
+import { redTeamForHead, readRedTeamDisposition, redTeamGateMarker, liveResultGateState, CONFIRMED_BREAKS_DEFAULTS } from '../../lib/red-team-gate.mjs';
+import { mainRedState } from '../../conveyor/main-ci-red-core.mjs';
+
 const REPO = 'web-everything/web-everything';
 const HEAD = 'c'.repeat(40);
 const green = (name) => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' });
+// Same renderer + trusted automation author as red-team-gate.test.mjs.
+const bot = (body, createdAt = '2026-10-26T22:55:00Z') => ({ author: { login: 'web-everything' }, body, createdAt });
+const result = (number, head = HEAD, findings = []) => bot(renderRedTeamComment({
+  pr: number, rev: head, provider: 'codex', model: 'gpt-6.1-sol', recheckStatus: 'ok',
+  foldedVerdict: findings.length ? 'changes' : 'accept', findings,
+}));
+const MAIN_GREEN = mainRedState([{ databaseId: 3196001, workflowName: 'CI', event: 'push',
+  status: 'completed', conclusion: 'success', headSha: 'a'.repeat(40),
+  createdAt: '2026-10-26T22:50:00Z', updatedAt: '2026-10-26T22:54:00Z' }]);
 const pr = (over = {}) => ({ number: 5298, title: 'fix red main: CI caps', headRefOid: HEAD, mergeable: 'MERGEABLE', isDraft: false,
-  labels: ['ready-to-merge', 'review:accepted'].map((name) => ({ name })), comments: [],
+  labels: ['ready-to-merge', 'review:accepted'].map((name) => ({ name })), comments: [result(over.number ?? 5298, over.headRefOid ?? HEAD)],
   statusCheckRollup: [green('test'), green('merge-gate'), { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' }], ...over });
 const WF = [{ filename: '.github/workflows/ci.yml' }, { filename: 'scripts/x.mjs' }];
 const COMMAND = `git pull --ff-only origin main && node scripts/run-fresh.mjs land-human-only --pr=5298 --repo=${REPO} --actor=<your login> --channel=<where you said it> --reason='<your words>'`;
@@ -105,7 +118,7 @@ echo 'console.log("FRESH_LAUNCHER", JSON.stringify(process.argv.slice(2)))' > sc
   });
 });
 
-const run = (args = [], listing = [pr()], files = WF, queue = { isInMergeQueue: false, headRefOid: HEAD }) => {
+const run = (args = [], listing = [pr()], files = WF, queue = { isInMergeQueue: false, headRefOid: HEAD }, options = {}) => {
   execFileSync.mockImplementation((cmd, argv) => {
     const a = argv.join(' ');
     if (a.startsWith('pr list')) return JSON.stringify(listing);
@@ -116,7 +129,14 @@ const run = (args = [], listing = [pr()], files = WF, queue = { isInMergeQueue: 
   });
   const log = vi.spyOn(console, 'log').mockImplementation(() => {});
   vi.spyOn(console, 'error').mockImplementation(() => {});
-  main([`--repo=${REPO}`, ...args], { unsupportedPath: '/nonexistent-operator-queue-test/unsupported-repo.json' });
+  // main() seams: readMainCi({ repo }) returns mainRedState's verdict (real default uses
+  // probeMainCiRuns + mainRedState); readNetDiff({ repo, headSha, base }) returns
+  // readPinnedChangedFiles's { files: string[] } / { error } shape. Both are synchronous.
+  main([`--repo=${REPO}`, ...args], { unsupportedPath: '/nonexistent-operator-queue-test/unsupported-repo.json',
+    readMainCi: () => MAIN_GREEN,
+    readNetDiff: () => ({ files: files.map(f => typeof f === 'string' ? f : f.filename ?? f.path) }),
+    ...options,
+  });
   return log.mock.calls.map(([line]) => line).join('\n');
 };
 
@@ -151,5 +171,102 @@ describe('needs your merge — under NEEDS YOU', () => {
   });
   it('a PR touching no workflow file gets no row', () => {
     expect(JSON.parse(run(['--json'], [pr()], [{ filename: 'scripts/x.mjs' }])).needsYourMerge).toBeUndefined();
+  });
+});
+
+
+describe('R170 — ask to enqueue only when certain', () => {
+  const reportFor = (candidate, options = {}, queue = { isInMergeQueue: false, headRefOid: HEAD }) =>
+    JSON.parse(run(['--json'], [candidate], WF, queue, options));
+  const expectSilent = report => expect(report.needsYourMerge ?? []).toEqual([]);
+
+  it('#6001 at 22:56Z asks with ready label, trusted clear current-head red team, green main and workflow NET diff', () => {
+    const candidate = pr({ number: 6001 });
+    expect(redTeamForHead(candidate.comments, 6001, HEAD)).not.toBeNull();
+    expect(readRedTeamDisposition({ comments: candidate.comments, pr: 6001, head: HEAD,
+      setting: CONFIRMED_BREAKS_DEFAULTS }).sendBack).toEqual([]);
+    expect(MAIN_GREEN.status).toBe('green');
+    const readMainCi = vi.fn(() => MAIN_GREEN);
+    const readNetDiff = vi.fn(() => ({ files: ['.github/workflows/ci.yml', 'scripts/x.mjs'] }));
+    const report = reportFor(candidate, { readMainCi, readNetDiff });
+    expect(report.needsYourMerge).toEqual([{ repo: REPO, number: 6001, title: candidate.title,
+      paths: ['.github/workflows/ci.yml'], command: needsYourMergeCommand({ repo: REPO, number: 6001 }) }]);
+    expect(readMainCi).toHaveBeenCalledWith(expect.objectContaining({ repo: REPO }));
+    expect(readNetDiff).toHaveBeenCalledWith(expect.objectContaining({ repo: REPO, headSha: HEAD, base: 'main' }));
+  });
+
+  it.each([5990, 6011])('#%s red-team pending and no ready-to-merge label stays quiet with a pending note', number => {
+    const candidate = pr({ number, labels: [{ name: 'review:accepted' }], comments: [] });
+    const report = reportFor(candidate);
+    expectSilent(report);
+    expect(report.needsYourMergePending).toContainEqual(expect.objectContaining({
+      repo: REPO, number, title: candidate.title, reason: expect.stringMatching(/^pending: .+/),
+    }));
+  });
+
+  it.each([
+    ['no result yet', []],
+    ['only a stale-head result', [result(6001, 'd'.repeat(40))]],
+    ['only an untrusted result', [{ ...result(6001), author: { login: 'mallory' } }]],
+    ['comments unreadable', undefined],
+  ])('ready-to-merge is silent with %s', (_name, comments) => {
+    expectSilent(reportFor(pr({ number: 6001, comments })));
+  });
+
+  it('#6006 already queued by the drain stays silent', () => {
+    expectSilent(reportFor(pr({ number: 6006 }), {}, { isInMergeQueue: true, headRefOid: HEAD }));
+  });
+
+  it.each([5981, 6014, 5999, 6008])('#%s without ready-to-merge stays silent even with clear red team and green main', number => {
+    expectSilent(reportFor(pr({ number, labels: [{ name: 'review:accepted' }] })));
+  });
+
+  it.each([undefined, null])('unreadable labels (%s) stay silent', labels => {
+    expectSilent(reportFor(pr({ labels })));
+  });
+
+  it.each([
+    ['red', () => ({ status: 'red' })],
+    ['pending', () => ({ status: 'pending' })],
+    ['unknown', () => ({ status: 'unknown' })],
+    ['reader throws', () => { throw new Error('main CI unreadable'); }],
+    ['unreadable response', () => undefined],
+  ])('main CI %s stays silent despite workflow NET diff', (_name, readMainCi) => {
+    expectSilent(reportFor(pr(), { readMainCi }));
+  });
+
+  it.each([5993, 5954])('#%s stale REST workflow file cannot override a NET diff with no workflow changes', number => {
+    const readNetDiff = vi.fn(() => ({ files: ['scripts/x.mjs'] }));
+    // run() still offers the historical REST workflow response, deliberately disagreeing with NET diff.
+    expectSilent(reportFor(pr({ number }), { readNetDiff }));
+    expect(readNetDiff).toHaveBeenCalledWith(expect.objectContaining({ repo: REPO, headSha: HEAD, base: 'main' }));
+    expect(execFileSync.mock.calls.some(([, argv]) => argv.some(a => /pulls\/\d+\/files/.test(a)))).toBe(false);
+  });
+
+  it('workflow present only in NET diff asks even when REST lists no workflow', () => {
+    const report = JSON.parse(run(['--json'], [pr()], [{ filename: 'scripts/x.mjs' }],
+      { isInMergeQueue: false, headRefOid: HEAD }, { readNetDiff: () => ({ files: ['.github/workflows/ci.yml'] }) }));
+    expect(report.needsYourMerge).toHaveLength(1);
+  });
+
+  it.each([
+    ['error result', () => ({ error: 'merge-base diff unreadable' })],
+    ['reader throws', () => { throw new Error('git diff failed'); }],
+    ['missing files', () => ({})],
+  ])('NET diff %s stays silent without falling back to REST workflow files', (_name, readNetDiff) => {
+    expectSilent(reportFor(pr(), { readNetDiff }));
+  });
+
+  it.each(['sent-back', 'round-cap'])('current-head red-team %s finding stays silent despite stale accepted/ready labels', outcome => {
+    const number = 6001;
+    const finding = { summary: 'workflow skips required CI', category: 'edge-case', impactIfUnfixed: 'broken',
+      file: '.github/workflows/ci.yml', line: 31, confirmedByRecheck: true, failure_scenario: 'enqueue this head' };
+    const review = result(number, HEAD, [finding]);
+    const resultId = liveResultGateState([review], number, HEAD).resultId;
+    const line = outcome === 'sent-back' ? '- 1 confirmed break(s) sent back (#1).' : '- 1 confirmed break(s) NOT sent back: cap (#1).';
+    const comments = [review, bot(`${redTeamGateMarker(number, HEAD, outcome, resultId)}\n**Red-team gate** on head \`${HEAD.slice(0, 12)}\`:\n${line}`, '2026-10-26T22:56:00Z')];
+    const disposition = readRedTeamDisposition({ comments, pr: number, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS });
+    expect(disposition.sendBack.length + disposition.held.length).toBeGreaterThan(0);
+    expectSilent(reportFor(pr({ number, comments })));
   });
 });
