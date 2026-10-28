@@ -1,5 +1,21 @@
 # Testing — Three-Tier Strategy
 
+## Closure-scope foundations
+
+`daemon-clone-entries.test.mjs`, `closure-scope.test.mjs` and
+`daemon-rebuild-tree-reader.test.mjs` cover the pure R171 helpers. Clone entry discovery
+throws on unreadable LaunchAgents evidence, including a missing directory; inject a directory
+and plutil runner for portable tests. Scope computation accepts a snapshot reader plus a
+`Map<repoPath, source|null>` of overlay changes, or local Git trees and per-overlay changed
+paths. Use the same reader for imports and spawned-script basename lookup; never let a tree
+walk fall back to the checkout's tracked-file index. Tree batch output is byte-framed (UTF-8
+character counts cannot delimit blobs). `makeGit` forwards explicit batch stdin and encoding.
+Incomplete/missing dependencies and closures above 4,000 files return a failure reason:
+the future planner must retain the conflict for a full merge or manual rebase. Existing
+closure callers retain their defaults; strict resolution and the file bound are opt-in.
+The fixpoint helper returns additions without mutating scope; the planner owns the three-replan
+limit. These foundations do not enable scoped rebuild behavior.
+
 ## Overlay auto-retirement
 
 `daemon-overlay-auto-retire.test.mjs` uses local Git repositories for ancestry, squash/content
