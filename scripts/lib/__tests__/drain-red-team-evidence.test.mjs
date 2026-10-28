@@ -107,7 +107,8 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     const f = fixture(), loopPayload = payload(f.head);
     expect(() => recordRedTeamStatus({ ...f, loopPayload, status: 'queued', retryCount: 1 },
       { env: f.env, readPidStart: () => { throw Error('injected metadata failure'); } })).toThrow('injected metadata failure');
-    expect(readRedTeamStatus(f)).toBeNull();
+    // Readers fail closed on the orphaned marker; the writer below must still record the settlement.
+    expect(() => readRedTeamStatus(f)).toThrow('red-team retry marker has no status');
     expect(() => recordRedTeamStatus({ ...f, loopPayload, status: 'queued', retryCount: 1 }, { env: f.env }))
       .toThrow('retry already admitted');
     recordRedTeamStatus({ ...f, loopPayload, status: 'finished', retryCount: 0 }, { env: f.env });
