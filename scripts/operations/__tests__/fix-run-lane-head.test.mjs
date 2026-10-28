@@ -146,8 +146,10 @@ describe('ownership loss before post-agent staging', () => {
       ['--absolute-git-dir', 'add', 'update-index', 'commit', 'push'].includes(arg)))).toBe(false);
     expect(f.calls.some(c => c.args.includes('release') || c.args.some(arg => arg.endsWith('rearm-review.mjs')))).toBe(false);
     expect(f.pendingRearm.write).not.toHaveBeenCalled();
+    // Missing/foreign/holder-less leases are the distinct, same-refusal 'lease-lost' outcome; other bad markers stay 'failed'.
     expect(f.recordOutcome).toHaveBeenCalledWith(expect.objectContaining({
-      outcome: 'failed', reason: expect.stringContaining('refusing to push or stage files'),
+      outcome: ['foreign', 'missing', 'missing holder', 'null'].includes(kind) ? 'lease-lost' : 'failed',
+      reason: expect.stringContaining('refusing to push or stage files'),
     }));
     expect(f.releaseClaim).toHaveBeenCalledOnce();
     expect(f.readLease).not.toHaveBeenCalled();

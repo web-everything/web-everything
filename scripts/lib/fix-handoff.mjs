@@ -15,7 +15,7 @@ export function signalFixDispatch({ repo, pr, label }, { dir = fixHandoffDir(), 
     return true;
   } catch (e) { log(`fix-handoff: signal failed: ${e.message}`); return false; }
 }
-export function createFixHandoffSleep({ dir = fixHandoffDir() } = {}) {
+export function createFixHandoffSleep({ dir = fixHandoffDir(), statPollMs = 1000, watchDir = watch } = {}) {
   mkdirSync(dir, { recursive: true });
   let seen = read(dir);
   return ms => new Promise(resolve => {
@@ -23,9 +23,9 @@ export function createFixHandoffSleep({ dir = fixHandoffDir() } = {}) {
     const file = join(dir, 'wake');
     const finish = reason => { clearTimeout(timer); unwatchFile(file, check); try { watcher?.close(); } catch { /* already closed */ } resolve(reason); };
     const check = () => { const value = read(dir); if (value !== seen) { seen = value; finish('handoff'); } };
-    // Event-driven wake first (immediate, even on a loaded host); the 1s stat poll stays as the fallback where fs.watch is unavailable.
-    try { watcher = watch(dir, check); watcher.on('error', () => {}); } catch { /* poll only */ }
-    watchFile(file, { interval: 1000 }, check);
+    // Event-driven wake first; the stat poll (1s by default) stays as the fallback where fs.watch is unavailable.
+    try { watcher = watchDir(dir, check); watcher.on('error', () => {}); } catch { /* poll only */ }
+    watchFile(file, { interval: statPollMs }, check);
     timer = setTimeout(() => finish('interval'), ms);
     check(); // watch before read: includes events that arrived during the preceding tick
   });

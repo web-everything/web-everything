@@ -229,11 +229,14 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       settings: { sources: policy.sources, values: policy.value, log: formatCascadeSourcesLine('prototypeLoad', policy), errors: platform.errors } };
     let stage = 'bad-input';
     const stop = (reason, details = {}) => { Object.assign(out, details, { stopReason: reason }); return out; };
-    // Once the replacement is registered, failures name the retained contained registrations.
+    // Once the replacement is registered, failures name retained contained registrations
+    // and explain recovery when stale registrations may block adoption.
     const keptNote = () => {
       if (!out.registered) return '';
       const kept = (out.contained || []).filter((ref) => !out.removed.includes(ref));
-      return kept.length ? ` Prior registrations retained: ${kept.join(', ')}.` : '';
+      const stale = out.adopted ? [] : kept.filter((ref) => out.stale.includes(ref));
+      return (kept.length ? ` Prior registrations retained: ${kept.join(', ')}.` : '')
+        + (stale.length ? ` If stale registrations block adoption, rebase and retest them, include their new tips in a tested replacement, and rerun: ${stale.join(', ')}.` : '');
     };
     try {
       const daemon = Object.hasOwn(config.daemons || {}, input.daemon) ? config.daemons[input.daemon] : null;

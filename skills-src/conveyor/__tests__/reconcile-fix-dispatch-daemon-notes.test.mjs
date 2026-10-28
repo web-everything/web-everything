@@ -262,3 +262,43 @@ it('publishes a cap immediately even when its durable note was already posted', 
     safety: { value: { alertAtRoundCap: true }, sources: { alertAtRoundCap: 'test' } }, postComment: () => { throw Error('already posted'); } });
   expect(publish).toHaveBeenCalledWith(expect.objectContaining({ pr: 5403, kind: 'at-round-limit', head: pr.headRefOid }));
 });
+
+describe('runReconcileNotesAllRepos — an INFO note is a log line only (live #5758/#5729/#5485, 2026-10-21)', () => {
+  const info = { kind: 'released-claim-session-ignored', prNumber: 5758, pid: 4242, handle: 'abc', cwd: '/d/x', releasedAtMs: 1, text: 'PR #5758: ignoring live pid 4242 — finished work' };
+  it('no PR comment, no needs-you event, no parking; handed to the finished-session reaper', () => {
+    const tick = () => ({ notes: [info], prsByNumber: new Map([[5758, { number: 5758, comments: [], labels: [] }]]) });
+    const postComment = vi.fn(() => ({ ok: true }));
+    const publish = vi.fn();
+    const parkToHuman = vi.fn(() => ({ ok: true }));
+    const reapFinished = vi.fn(() => ({ rows: [{ repo: 'repo-a', prNumber: 5758, pid: 4242, decision: 'reap', result: 'stopped', reason: 'r' }] }));
+    const out = runReconcileNotesAllRepos({ repos: ['repo-a'], tick, postComment, publish, parkToHuman, reapFinished, dryRun: false,
+      safety: { value: { alertAtRoundCap: true }, sources: {} } });
+    expect(postComment).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
+    expect(parkToHuman).not.toHaveBeenCalled();
+    expect(out.comments).toEqual([]);
+    expect(out.notes).toEqual([{ ...info, repo: 'repo-a' }]);
+    expect(reapFinished).toHaveBeenCalledWith({ notes: [{ ...info, repo: 'repo-a' }], dryRun: false });
+    expect(out.finishedSessionReap.rows[0]).toMatchObject({ result: 'stopped' });
+    expect(formatNoteLine({ ...info, repo: 'repo-a' })).toMatch(/^reconcile-fix-dispatch-daemon: info released-claim-session-ignored/);
+    expect(formatNoteLine({ kind: 'awaiting-permission', prNumber: 1, text: 't' })).toMatch(/: note awaiting-permission/);
+  });
+  it('a reaper that throws never breaks the notes pass', () => {
+    const tick = () => ({ notes: [info], prsByNumber: new Map() });
+    const out = runReconcileNotesAllRepos({ repos: ['repo-a'], tick, dryRun: true, reapFinished: () => { throw new Error('boom'); } });
+    expect(out.finishedSessionReap).toMatchObject({ rows: [], error: expect.stringContaining('boom') });
+  });
+});
+
+describe('runReconcileNotesAllRepos — the unbound finished-session pass runs after the note path (live 2026-10-21 14:25Z)', () => {
+  it('passes the note-path pids as skipPids and merges its rows; an unbound failure never breaks the pass', () => {
+    const info = { kind: 'released-claim-session-ignored', prNumber: 5758, pid: 41862, text: 't' };
+    const tick = () => ({ notes: [info], prsByNumber: new Map() });
+    const reapUnbound = vi.fn(() => ({ rows: [{ pid: 95540, decision: 'reap', result: 'stopped', unbound: true }] }));
+    const out = runReconcileNotesAllRepos({ repos: ['repo-a'], tick, dryRun: true, reapFinished: () => ({ rows: [] }), reapUnbound });
+    expect(reapUnbound).toHaveBeenCalledWith({ skipPids: new Set([41862]), dryRun: true });
+    expect(out.finishedSessionReap.rows).toEqual([expect.objectContaining({ pid: 95540, unbound: true })]);
+    const bad = runReconcileNotesAllRepos({ repos: ['repo-a'], tick, dryRun: true, reapFinished: () => ({ rows: [] }), reapUnbound: () => { throw new Error('boom'); } });
+    expect(bad.finishedSessionReap.rows).toEqual([]);
+  });
+});

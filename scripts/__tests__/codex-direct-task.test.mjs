@@ -64,6 +64,18 @@ function flagValue(argv, flag) {
   return i === -1 ? undefined : argv[i + 1];
 }
 
+describe('codex-runner detached wait contract', () => {
+  it('retries only on exit 75 and stops and reports terminal nonzero exits', () => {
+    const runner = readFileSync(join(process.cwd(), '.claude/agents/codex-runner.md'), 'utf8');
+    const instruction = runner.split('\n').find(line => line.startsWith('- **Long Codex tasks:**'));
+    expect(instruction).toContain('codex-direct-task wait --job=<id>');
+    expect(instruction).toContain('Repeat only on exit 75 (still running).');
+    expect(instruction).toContain('Stop on exit 0 (success)');
+    expect(instruction).toContain('stop and report any other nonzero exit as a terminal failure.');
+    expect(instruction).not.toMatch(/until it exits 0/);
+  });
+});
+
 describe('defaultExecFn — real child-process output buffering', () => {
   it('returns the full stdout when output exceeds Node’s default 1 MiB buffer', () => {
     const outputSize = 2 * 1024 * 1024;
@@ -1314,6 +1326,40 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
   }
 
   describe('#x8wbivt Fork 4 — codexDirectTask wires the quota signal into its report', () => {
+    it.each(['warn', 'fail', 'missing'])('reports own transcript before quota deletion and preserves warn exit status (%s)', async mode => {
+      const dir = mkdtempSync(join(tmpdir(), 'we-codex-transcript-test-'));
+      const sessions = join(dir, 'sessions');
+      mkdirSync(sessions);
+      const rollout = join(sessions, 'rollout-t1.jsonl');
+      const fixture = JSON.stringify({ payload: { type: 'function_call', name: 'exec_command', arguments: '{"cmd":"gh issue list"}' } });
+      if (mode !== 'missing') writeFileSync(rollout, fixture);
+      // A different run must never be inspected, even when this run has no rollout.
+      writeFileSync(join(sessions, 'rollout-other.jsonl'), fixture);
+      vi.stubEnv('WE_COORDINATION_ROOT', join(dir, 'coordination'));
+      const { fn: spawnFn } = fakeSpawn('{"type":"thread.started","thread_id":"t1"}\n{"type":"turn.completed","usage":{}}\n');
+      const execFn = (bin, args) => args.includes('--absolute-git-dir') ? join(dir, 'git-metadata') : args.includes('rev-parse') ? 'sha0\n' : '';
+      const collectQuotaFn = vi.fn(() => {
+        if (mode !== 'missing') {
+          expect(JSON.parse(readFileSync(join(dir, 'coordination', 'codex-transcript-check.jsonl'), 'utf8')).threadId).toBe('t1');
+          rmSync(rollout);
+        }
+        return { quota: null, rolloutFile: rollout, deleted: mode !== 'missing' };
+      });
+      const log = vi.fn();
+      try {
+        const report = await codexDirectTask({ task: 'fixture', dir, gate: 'none', stream: false, spawnFn, execFn, collectQuotaFn, clearRolloutAfterRun: true, log,
+          env: { ...process.env, CODEX_HOME: dir, WE_CODEX_TRANSCRIPT_CHECK_MODE: mode === 'fail' ? 'fail' : 'warn' } });
+        expect(collectQuotaFn).toHaveBeenCalledOnce();
+        if (mode === 'missing') expect(report.transcriptCheck.error).toMatch(/not found/);
+        else {
+          expect(report.transcriptCheck).toMatchObject({ mode, rolloutFile: rollout, verdict: mode, flags: [{ kind: 'network', detail: 'gh issue list' }] });
+          expect(log).toHaveBeenCalledWith(`codex-transcript-check · verdict=${mode} flags=network`);
+        }
+        expect(cliExitCode(report)).toBe(mode === 'fail' ? 1 : 0);
+        expect(cliExitCode(report, { json: true })).toBe(mode === 'fail' ? 1 : 0);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
     it('surfaces quotaUsedPercent/quotaWindowMinutes/quotaResetsAt/quotaPlanType via the injected readQuotaFn (default: read-only)', async () => {
       const stdout = '{"type":"thread.started","thread_id":"t1"}\n{"type":"turn.completed","usage":{}}\n';
       const { fn: spawnFn } = fakeSpawn(stdout);
@@ -1995,6 +2041,33 @@ describe('detached jobs', () => {
     const f = fixture();
     expect(await waitForJob({ ...f.options, isAlive: () => false })).toMatchObject({ status: 'failed', exitCode: 1, code: 1 });
     expect(f.writeRecord).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed', exitCode: 1, finishedAt: new Date(0).toISOString() }));
+  });
+
+  it.each(Array.from({ length: 255 }, (_, index) => index + 1))(
+    'terminal task exit %s never requests another wait on either terminal read path', async exitCode => {
+      const f = fixture();
+      f.child.emit('exit', exitCode);
+      const expected = { status: 'failed', exitCode, code: exitCode === 75 ? 1 : exitCode };
+      expect(await waitForJob(f.options)).toMatchObject(expected);
+      const raced = fixture();
+      expect(await waitForJob({ ...raced.options, isAlive: () => false,
+        updateRecord: () => ({ ...raced.options.readRecord(), status: 'failed', exitCode }),
+      })).toMatchObject(expected);
+    },
+  );
+
+  it('terminal task exit 75 does not request another wait and preserves exitCode in CLI JSON', () => {
+    const record = { id: 'terminal-75', pid: 123, status: 'failed', exitCode: 75,
+      resultPath: 'terminal-75.result.json' };
+    writeJobRecord(record, { jobsDir });
+    const run = spawnSync(process.execPath, ['scripts/codex-direct-task.mjs', 'wait', `--job=${record.id}`], {
+      encoding: 'utf8', timeout: 4000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, CODEX_JOBS_DIR: jobsDir },
+    });
+    expect(run.error).toBeUndefined();
+    expect(run.status, run.stderr).toBe(1);
+    expect(JSON.parse(run.stdout)).toEqual({ status: 'failed', exitCode: 75, resultPath: record.resultPath });
+    expect(readJobRecord(record.id, { jobsDir })).toEqual(record);
   });
 
   it.each([

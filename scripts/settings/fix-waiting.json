@@ -1,0 +1,3 @@
+{
+  "$comment": "fix-waiting: fixWaiting.hostBusyAlertMinutes defaults to 30 minutes. Set a non-negative number here to override the platform/default; WE_FIX_WAITING_HOST_BUSY_ALERT_MINUTES overrides it. Waiting observes host-load refusals only; the priority projection only adds deferrals or reorders waiters. Send-back priority uses fixWaiting.waitingFreshMs (default 360000, maximum 900000; WE_FIX_WAITING_FRESH_MS) and dispatchedFreshMs (default/maximum 86400000; WE_FIX_WAITING_DISPATCHED_FRESH_MS). Waiting records only defer build/graduation launches; dispatched records only classify matching fixer sessions in heavyAdmission.priority.mode=enforce. Both resolve standard \u2192 platform \u2192 tool \u2192 env with source logging."
+}
