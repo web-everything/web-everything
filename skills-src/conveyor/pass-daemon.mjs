@@ -172,26 +172,31 @@ export async function runPassDaemonLoop({
     }
   };
   let inFlight = null;
-  for (;;) {
-    if (!inFlight) {
-      try {
-        await refreshAuth();
-      } catch (error) {
-        if (isGithubAppAuthGuardError(error)) throw error;
-        onRefreshError(error, run);
+  try {
+    for (;;) {
+      if (!inFlight) {
+        try {
+          await refreshAuth();
+        } catch (error) {
+          if (isGithubAppAuthGuardError(error)) throw error;
+          onRefreshError(error, run);
+        }
+        if (tickWhileRunning) {
+          // Opt-in (#5755): the pass is a bounded timed job, so the loop keeps its cadence while it runs.
+          inFlight = runOnce(run).finally(() => { inFlight = null; });
+          await Promise.resolve();
+          await Promise.resolve();
+          await Promise.resolve();
+        } else await runOnce(run);
       }
-      if (tickWhileRunning) {
-        // Opt-in (#5755): the pass is a bounded timed job, so the loop keeps its cadence while it runs.
-        inFlight = runOnce(run).finally(() => { inFlight = null; });
-        await Promise.resolve();
-        await Promise.resolve();
-        await Promise.resolve();
-      } else await runOnce(run);
+      if (!isAlive()) { await inFlight; return { runs: run + 1, stoppedReason: 'lease-lost' }; }
+      if (run + 1 >= maxRuns) { await inFlight; return { runs: run + 1, stoppedReason: 'max-runs' }; }
+      await sleep(intervalMs);
+      run += 1;
     }
-    if (!isAlive()) { await inFlight; return { runs: run + 1, stoppedReason: 'lease-lost' }; }
-    if (run + 1 >= maxRuns) { await inFlight; return { runs: run + 1, stoppedReason: 'max-runs' }; }
-    await sleep(intervalMs);
-    run += 1;
+  } finally {
+    // Error exits must preserve the monitor just like max-runs and lease loss.
+    await inFlight;
   }
 }
 
@@ -496,11 +501,14 @@ async function main(argv) {
   }, heartbeatIntervalMs);
   heartbeatTimer.unref?.();
 
+  let activePass = null;
   let stopping = false;
-  const shutdown = (signal) => {
+  const shutdown = async (signal) => {
     if (stopping) return;
     stopping = true;
-    console.error(`pass-daemon: ${signal} — releasing "${passName}"'s lease and exiting.`);
+    alive = false;
+    console.error(`pass-daemon: ${signal} — waiting for "${passName}" before releasing its lease and exiting.`);
+    await Promise.allSettled([activePass]);
     clearInterval(heartbeatTimer);
     releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key });
     process.exit(0);
@@ -510,8 +518,9 @@ async function main(argv) {
 
   // xdpemd4 — self-sync this watcher's clone between runs, same contract every other resident daemon already
   // has (see the file header). A no-op unless DAEMON_SELF_SYNC_BRANCH (or plain main-tracking self-sync) is
-  // opted into; `restartOntoNewCode` mirrors `shutdown` (release the lease, exit 0) so launchd's KeepAlive
-  // brings this pass back up on the freshly-merged code, exactly like `review-daemon.mjs`'s own restart path.
+  // opted into. Self-sync runs before the next spawn, with no previous pass in flight.
+  // Do not await activePass here: it contains this very callback. Release the lease
+  // and exit so launchd brings this pass back up on the freshly-merged code.
   const restartOntoNewCode = () => {
     if (stopping) return;
     stopping = true;
@@ -552,7 +561,7 @@ async function main(argv) {
   const failureAlertAfter = resolveFailureAlertAfter(entry, process.env);
   console.error(`pass-daemon: started "${passName}" (${entry.script}) on interval ${intervalMs}ms, heartbeat every ${heartbeatIntervalMs}ms.`);
   const { stoppedReason } = await runPassDaemonLoop({
-    runPass: runPassSelfSynced,
+    runPass: () => (activePass = runPassSelfSynced()),
     sleep: realSleep,
     isAlive: () => alive,
     intervalMs, tickWhileRunning: true,
