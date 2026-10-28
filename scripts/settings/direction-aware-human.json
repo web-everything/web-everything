@@ -1,0 +1,4 @@
+{
+  "$comment": "Operator ruling R131: direction-aware human review ships in shadow mode only.",
+  "directionAwareHuman": "shadow"
+}
