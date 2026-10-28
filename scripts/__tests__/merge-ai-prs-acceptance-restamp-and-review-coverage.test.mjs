@@ -15,7 +15,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { readDrainAcceptance, decideDrainReviewGate, reconcileDrainReviewPending, classifyPr, needsAcceptanceRestamp, restampAcceptance, computeNetDiffSignals, drainReasonMarker, buildDrainReasonComment, hasDrainReasonComment, LAND_REASON, applyEscalationRelief, REVIEW_COVERAGE_KIND, REVIEW_COVERAGE_GAP_META, reviewRecordKind, recordedReviewRecords, readReviewRecord, reviewCoverageGaps, buildReviewCoverageReason } from '../merge-ai-prs.mjs';
-import { drainGateInputs, permissionChangeForCandidate } from '../merge-ai-prs.mjs';
+import { drainGateInputs, permissionChangeForCandidate, removeDeescalatedHumanLabels } from '../merge-ai-prs.mjs';
 import { normalizeDiffFingerprint, normalizeContributionFingerprint, decideReviewGate, scoreEscalation, REVIEW_LABELS, acceptanceCoversHead } from '../lib/review-escalation.mjs';
 
 
@@ -765,6 +765,33 @@ describe('#6027 — fresh net score de-escalation through the drain handoff', ()
   it('parks a fresh humanRequired=false score without a pin for independent review, removing review:human', () => {
     expect(drain()).toMatchObject({ action: 'park', applyLabel: REVIEW_LABELS.pending,
       humanRequired: false, deescalatedHuman: true, removeLabels: [REVIEW_LABELS.human] });
+  });
+
+  it('removes the de-escalated human label through argv before pending is applied', () => {
+    const exec = vi.fn();
+    removeDeescalatedHumanLabels({ gate: drain(), labels: [REVIEW_LABELS.human],
+      dryRun: false, pr: 6027, repo: 'owner/repo' }, { exec });
+    expect(exec).toHaveBeenCalledExactlyOnceWith('gh',
+      ['pr', 'edit', '6027', '--repo', 'owner/repo', '--remove-label', REVIEW_LABELS.human],
+      { stdio: ['ignore', 'ignore', 'pipe'] });
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
+    expect(src).toMatch(/removeDeescalatedHumanLabels\(\{ gate, labels: v\.prLabels, dryRun: candidateDryRun, pr: v\.num, repo: v\.repo \}\);\s*if \(gate\.applyLabel && !candidateDryRun\)/);
+  });
+
+  it('never removes labels during a dry run or for a retained human hold', () => {
+    const exec = vi.fn();
+    for (const [gate, dryRun] of [[drain(), true], [drain({ humanPinned: true }), false],
+      [drain({ score: { ...score, humanRequired: true } }), false], [drain({ netScored: false }), false]]) {
+      removeDeescalatedHumanLabels({ gate, labels: [REVIEW_LABELS.human], dryRun, pr: 6027 }, { exec });
+    }
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('treats a failed label removal as best-effort', () => {
+    const exec = vi.fn(() => { throw new Error('label edit failed'); });
+    expect(() => removeDeescalatedHumanLabels({ gate: drain(), labels: [REVIEW_LABELS.human],
+      dryRun: false, pr: 6027 }, { exec })).not.toThrow();
+    expect(exec).toHaveBeenCalledOnce();
   });
 
   it('keeps review:human when an operator pin is present despite a fresh low score', () => {

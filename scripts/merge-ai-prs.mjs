@@ -4384,14 +4384,27 @@ export function permissionChangeForCandidate(score) {
  * The full input object `runCli` hands `decideDrainReviewGate` for one candidate. Pure. One named place for every
  * score-derived gate input (`escalate`, `humanRequired`, `engineTier`, `permissionChange`) so a new signal cannot be
  * scored yet silently never reach the gate, and a test can drive a real `scoreEscalation` result straight through.
- * @param {{score: object, labels: any, deviation?: string|null}} candidate
+ * @param {{score: object, labels: any, deviation?: string|null, netScored?: boolean, humanPinned?: boolean}} candidate
  */
-export function drainGateInputs({ score, labels, deviation = null }) {
+export function drainGateInputs({ score, labels, deviation = null, netScored = false, humanPinned = false }) {
   return {
     escalate: score.escalate, humanRequired: score.humanRequired, labels,
+    // 6027: a sticky review:human is dropped only on a fresh scored net diff and no operator pin (decideReviewGate).
+    humanScoreFresh: netScored === true, humanPinned: humanPinned === true,
     engineTier: engineTierForCandidate(score), deviation,
     permissionChange: permissionChangeForCandidate(score),
   };
+}
+
+/** Best-effort removal before the de-escalated park applies review:pending. Dry runs never write. */
+export function removeDeescalatedHumanLabels({ gate, labels, dryRun, pr, repo }, { exec = execFileSync } = {}) {
+  if (!gate.deescalatedHuman || dryRun) return;
+  for (const label of (gate.removeLabels || []).filter((l) => hasReviewLabel(labels, l))) {
+    try {
+      exec('gh', ['pr', 'edit', String(pr), ...repoFlag(repo), '--remove-label', label],
+        { stdio: ['ignore', 'ignore', 'pipe'] });
+    } catch { /* label best-effort */ }
+  }
 }
 
 /**
@@ -6042,8 +6055,11 @@ async function runCli() {
       // `blockedBy` resolves. Flip `engineTierForCandidate` to delegate to `basisTouchesEngineTier(score)` once
       // `#2410` ships that writer — do not re-inline the computation here when that day comes, keep it in one
       // named, tested place.
+      // No reliable operator human-pin record exists here. parseOperatorClearance records a clearance,
+      // not a ruling to retain review:human, and its bare actor record may be forged or stale.
+      const humanPinned = false;
       const gate = decideDrainReviewGate(
-        drainGateInputs({ score, labels: v.prLabels, deviation: v.deviation }),
+        drainGateInputs({ score, labels: v.prLabels, deviation: v.deviation, netScored, humanPinned }),
         { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo), dryRun: candidateDryRun, ...workflowReadOptions(v) });
       if (gate.action === 'defer') {
         v.decision = 'skip';
@@ -6095,6 +6111,8 @@ async function runCli() {
         // redundant `gh pr edit --add-label` call when the verdict label is already present (never a
         // double-apply). `shouldApplyReviewLabel` is the SAME shared gate `pr-land.mjs` uses at open, so
         // producer- and drain-applied verdicts can never drift on what "already labelled" means.
+        // 6027: a de-escalated park (fresh net score humanRequired=false) removes the sticky review:human it replaced.
+        removeDeescalatedHumanLabels({ gate, labels: v.prLabels, dryRun: candidateDryRun, pr: v.num, repo: v.repo });
         if (gate.applyLabel && !candidateDryRun) {
           if (shouldApplyReviewLabel(gate.applyLabel, v.prLabels)) {
             // #3215 — the ledger is written FIRST, before the `gh` transport call, same ordering rationale as
