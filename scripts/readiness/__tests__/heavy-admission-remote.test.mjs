@@ -2,7 +2,9 @@
 /** Contract tests for the pending remote admission exports; all execution and load IO is injected. */
 import { describe, it, expect, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { decideRemote, runWithRemoteDecision, resolveAdmissionPolicy, DEFAULT_ADMISSION_CEILING_MS, DEFAULT_FAST_RUN_TIMEOUT_MS } from '../heavy-admission.mjs';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { main, decideRemote, runWithRemoteDecision, resolveAdmissionPolicy, DEFAULT_ADMISSION_CEILING_MS, DEFAULT_FAST_RUN_TIMEOUT_MS } from '../heavy-admission.mjs';
 
 const argv = ['npm', 'run', 'test:unit', '--', 'a file.test.mjs', '$(must-stay-literal)'];
 const remoteDefaults = { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3 };
@@ -40,6 +42,37 @@ function expectFallback(log, reason) {
 }
 
 describe('remote admission policy', () => {
+  it('ignores conflicting tool remote settings on the shared pool', () => {
+    const remote = { enabled: true, mode: 'always', loadPerCoreThreshold: 5 };
+    const policy = resolveAdmissionPolicy({
+      platform: { remote }, tool: { remote: { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 99 } }, env: {},
+    });
+    expect(policy.settings.remote).toEqual(remote);
+    for (const leaf of Object.keys(remote)) {
+      expect(policy.sources[`remote.${leaf}`]).toBe('platform');
+      expect(policy.ignored).toContainEqual(expect.stringContaining(`tool.remote.${leaf}=`));
+    }
+  });
+
+  it('main run routes through the decision and exits remotely without creating a local slot', async () => {
+    const root = mkdtempSync(join(process.env.TMPDIR, 'remote-main-'));
+    const pool = join(root, 'pool');
+    mkdirSync(pool);
+    const prefs = join(root, 'preferences.json');
+    writeFileSync(prefs, JSON.stringify({ heavyAdmission: { remote: { enabled: true, mode: 'always' } } }));
+    const exited = new Error('test exit');
+    const exit = vi.spyOn(process, 'exit').mockImplementation(() => { throw exited; });
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    for (const [key, value] of Object.entries({ LANE_POOL_ROOT: pool, WE_PLATFORM_PREFERENCES: prefs,
+      CI: '', WE_HEAVY_ADMISSION: 'on', WE_HEAVY_ADMISSION_HELD: '', WE_HEAVY_ADMISSION_CONTAINER: '', WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES: '' })) vi.stubEnv(key, value);
+    try {
+      const remoteExec = vi.fn(async () => ({ mode: 'remote', code: 23 }));
+      await expect(main(['run', `--repo=${root}`, '--', ...argv], { remoteExec })).rejects.toBe(exited);
+      expect(remoteExec).toHaveBeenCalledWith(expect.objectContaining({ argv, cwd: root, signal: expect.any(AbortSignal) }));
+      expect(exit).toHaveBeenCalledWith(23);
+      expect(existsSync(join(pool, '.admission'))).toBe(false);
+    } finally { exit.mockRestore(); stderr.mockRestore(); vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); }
+  });
   it('defaults to disabled, above-threshold, threshold 3, with standard sources', () => {
     const policy = resolveAdmissionPolicy({});
     expect(policy.settings.remote).toEqual(remoteDefaults);

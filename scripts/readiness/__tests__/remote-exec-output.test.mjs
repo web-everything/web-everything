@@ -18,6 +18,28 @@ function capturedChild() {
 }
 
 describe('remote-exec captured output boundary', () => {
+  it('does not spawn for an already aborted request', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(defaultExec({ file: 'ssh', args: [], signal: controller.signal })).resolves.toEqual({ mode: 'cancelled', terminated: true });
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it.each(['ssh', 'rsync'])('kills %s on abort but waits for close before acknowledging termination', async file => {
+    const child = capturedChild();
+    const controller = new AbortController();
+    let settled = false;
+    const pending = defaultExec({ file, args: [], signal: controller.signal }).then(value => { settled = true; return value; });
+    controller.abort();
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    child.emit('error', new Error('transport interrupted'));
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    child.emit('close', null, 'SIGKILL');
+    expect(await pending).toEqual({ mode: 'cancelled', terminated: true });
+  });
   it('accepts exactly 4 MiB combined across stdout and stderr without terminating', async () => {
     const child = capturedChild();
     const result = defaultExec({ file: 'ssh', args: ['forge', 'true'] });

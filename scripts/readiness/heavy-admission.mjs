@@ -445,7 +445,7 @@ export async function runWithRemoteDecision({
         controller.abort();
       }, timeoutMs);
     });
-    const remote = Promise.resolve(remoteExec({ argv, cwd, signal: controller.signal }));
+    const remote = Promise.resolve(remoteExec({ argv, cwd, env, signal: controller.signal }));
     const result = await Promise.race([remote, timeout]);
     if (result === timedOut) {
       const termination = await Promise.race([
@@ -463,7 +463,7 @@ export async function runWithRemoteDecision({
       if (result?.mode === 'remote' && Number.isInteger(result.code)) return { handled: true, exitCode: result.code };
       // Only an explicit pre-execution fallback is safe. Throws and malformed
       // replies may come from an executor whose remote child is still alive.
-      if (result?.mode !== 'fallback') return refuseLocal(result?.reason ?? 'unconfirmed remote result');
+      if (result?.mode !== 'fallback' && !(result?.mode === 'not-started' && result.terminated === true)) return refuseLocal(result?.reason ?? 'unconfirmed remote result');
       reason = result?.reason ?? 'unconfirmed remote result';
     }
   } catch (error) { return refuseLocal(error?.message ?? error); }
@@ -1827,7 +1827,8 @@ function parseFlags(argv) {
   return { flags, positionals };
 }
 
-async function main(argv) {
+// @test-only-export-ok: exercise CLI routing through the real decision before slot acquisition.
+export async function main(argv, { remoteExec } = {}) {
   // `run`'s command tail lives after a literal `--` and must never be parsed as this CLI's OWN flags (a
   // `--coverage` meant for the wrapped command would otherwise be read as a flag of THIS script).
   const dashDashIdx = argv.indexOf('--');
@@ -1992,6 +1993,7 @@ async function main(argv) {
     if (!bypass && !useContainer && !process.env[ADMISSION_HELD_ENV]) {
       const result = await runWithRemoteDecision({
         argv: argv.slice(dashDashIdx + 1), policy, cwd: repo ?? process.cwd(),
+        env: process.env, remoteExec,
         timeoutMs: classifyCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
       });
       if (result.handled) process.exit(result.exitCode);
