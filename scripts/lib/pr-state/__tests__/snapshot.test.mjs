@@ -13,7 +13,7 @@ function fixture() {
     { id: 'C2', author: { login: 'reviewer' }, body: 'Edited evidence',
       createdAt: '2026-10-28T11:00:00Z', lastEditedAt: UPDATED },
     { id: 'C1', author: { login: 'operator' }, body: 'Original evidence',
-      createdAt: '2026-10-28T10:00:00Z' },
+      createdAt: '2026-10-28T10:00:00Z', lastEditedAt: null },
   ];
   const connection = nodes => ({ nodes, pageInfo: { hasNextPage: false } });
   const pullRequest = {
@@ -99,7 +99,7 @@ describe('readSnapshot', () => {
     await expect(async () => readSnapshot(f.input)).rejects.toThrow();
   });
 
-  it.each(['id', 'author', 'body', 'createdAt'])('fails closed without comment %s', async key => {
+  it.each(['id', 'author', 'body', 'createdAt', 'lastEditedAt'])('fails closed without comment %s', async key => {
     const f = fixture();
     delete f.pullRequest.comments.nodes[0][key];
     await expect(async () => readSnapshot(f.input)).rejects.toThrow();

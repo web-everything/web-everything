@@ -111,7 +111,7 @@ export async function readSnapshot({ repo, pr, expectedHead, now, io } = {}) {
   const comments = connection(p, 'comments').map(c => {
     requireEvidence(object(c), 'comment');
     return { id: c.id, author: c.author?.login, body: c.body, createdAt: c.createdAt,
-      lastEditedAt: c.lastEditedAt === undefined ? null : c.lastEditedAt };
+      lastEditedAt: c.lastEditedAt }; // GraphQL always returns it (null = never edited); absent = partial read
   }).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
   commentsValid(comments);
   const reviews = structuredClone(connection(p, 'reviews'));

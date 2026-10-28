@@ -26,7 +26,7 @@ export function admitClearHuman(snapshot, { delegation, config } = {}) {
   }
   for (const key of snapshot.openReferrals) reasons.push(`open-referral:${key}`);
   if (snapshot.redTeam.rulingNeeded) reasons.push('red-team-ruling-needed');
-  const decision = decideSetLabel({ to: 'clear-human', currentLabels: [...snapshot.labels],
+  const decision = decideSetLabel({ to: 'clear-human', currentLabels: [...snapshot.labels].sort(),
     humanOnlyHold: snapshot.humanOnlyHold, redTeamRulingHold: snapshot.redTeam.rulingNeeded });
   requireEvidence(typeof decision?.allowed === 'boolean', 'decideSetLabel.allowed');
   if (!decision.allowed) reasons.push('decide-refused');

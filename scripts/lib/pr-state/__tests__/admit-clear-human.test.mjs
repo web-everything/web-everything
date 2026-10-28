@@ -44,7 +44,7 @@ describe('admitClearHuman', () => {
         commentVersion: commentVersion(snapshot.comments) },
     });
     expect(result.basis).not.toBe(snapshot.holdEventIds);
-    expect(calls.decide).toEqual([{ to: 'clear-human', currentLabels: snapshot.labels,
+    expect(calls.decide).toEqual([{ to: 'clear-human', currentLabels: [...snapshot.labels].sort(),
       humanOnlyHold: false, redTeamRulingHold: false }]);
     expect(calls.score).toEqual([snapshot.netDiff]);
   });
@@ -86,7 +86,7 @@ describe('admitClearHuman', () => {
     const result = admitClearHuman(f.snapshot, f.options);
     expect(result.reasons).toEqual([]);
     expect(result.admit).toBe(true);
-    expect(f.calls.decide).toEqual([{ to: 'clear-human', currentLabels: f.snapshot.labels,
+    expect(f.calls.decide).toEqual([{ to: 'clear-human', currentLabels: [...f.snapshot.labels].sort(),
       humanOnlyHold: true, redTeamRulingHold: false }]);
   });
 
@@ -94,7 +94,7 @@ describe('admitClearHuman', () => {
     const f = fixture();
     f.snapshot.redTeam = { resultId: 'RT1', rulingNeeded: true };
     admitClearHuman(f.snapshot, f.options);
-    expect(f.calls.decide).toEqual([{ to: 'clear-human', currentLabels: f.snapshot.labels,
+    expect(f.calls.decide).toEqual([{ to: 'clear-human', currentLabels: [...f.snapshot.labels].sort(),
       humanOnlyHold: false, redTeamRulingHold: true }]);
   });
 
@@ -125,6 +125,14 @@ describe('admitClearHuman', () => {
     const result = admitClearHuman(shuffled, f.options);
     expect(result).toEqual(first);
     expect(result.fence).toEqual(first.fence);
+  });
+
+  it('hands the label policy a canonical label order, so an order-sensitive policy cannot change admission', () => {
+    const f = fixture();
+    f.options.config.decideSetLabel = ({ currentLabels }) => ({ allowed: currentLabels[0] === 'area:docs' });
+    const reversed = structuredClone(f.snapshot);
+    reversed.labels.reverse();
+    expect(admitClearHuman(reversed, f.options)).toEqual(admitClearHuman(f.snapshot, f.options));
   });
 
   it('does not mutate any part of the input snapshot', () => {
