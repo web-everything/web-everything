@@ -272,15 +272,17 @@ export function addOverlay(root, {
     const idx = list.findIndex((o) => o && o.ref === ref);
     // Even identical metadata or timestamps denote a new registration, not refreshed build evidence.
     const registrationId = randomUUID();
+    // When this registration began: an adopted input recorded before it cannot be its input ({@link sameRegistration}).
+    const registeredAt = now || new Date().toISOString();
     if (idx === -1) {
       list.push({
-        ref, registrationId, pr: pr ?? null, addedAt: now || new Date().toISOString(), addedBy: addedBy ?? null, reason: reason ?? null,
+        ref, registrationId, registeredAt, pr: pr ?? null, addedAt: registeredAt, addedBy: addedBy ?? null, reason: reason ?? null,
         ...(pinned === true ? { pinned: true } : {}),
         ...(bases ? { stackBases: bases } : {}),
         ...(conflictOverride ? { conflictOverride } : {}),
       });
     } else {
-      const next = { ...list[idx], registrationId, pr: pr ?? null, reason: reason ?? null };
+      const next = { ...list[idx], registrationId, registeredAt, pr: pr ?? null, reason: reason ?? null };
       // Evidence belongs to the previous registration, even when the ref and metadata match.
       // Keep retiredSources as recovery obligations, not proof that this new tip contains them;
       // preparation revalidates those archives against the candidate before adopting it.
@@ -339,24 +341,33 @@ export function recordEdgeResolution(root, ref, {
 /**
  * Does an adopted build's applied input come from this registration? Matched on registrationId, and PR when both
  * name one, so a re-registered ref never inherits the previous registration's pin or tip. A record or entry from
- * before applied inputs carried a registrationId cannot prove a new registration: ref + PR decides, failing closed.
+ * before applied inputs carried a registrationId cannot prove a new registration: ref + PR decides, failing closed —
+ * except that an unbound input never belongs to a registration made after its build was adopted (`adoptedAt`).
+ * @param {{adoptedAt?: string}} [o]
  */
-export function sameRegistration(applied, entry) {
+export function sameRegistration(applied, entry, { adoptedAt } = {}) {
   const id = registrationIdentity(entry);
   if (!applied || !id || applied.ref !== id.ref) return false;
   const prOf = (pr) => (pr == null || pr === '' ? null : Number(pr));
   if (prOf(applied.pr) != null && prOf(id.pr) != null && prOf(applied.pr) !== prOf(id.pr)) return false;
-  if (applied.registrationId == null || id.registrationId == null) return true;
+  if (applied.registrationId == null) {
+    const registered = Date.parse(id.registeredAt ?? '');
+    const adopted = Date.parse(adoptedAt ?? '');
+    return !(Number.isFinite(registered) && Number.isFinite(adopted) && registered > adopted);
+  }
+  if (id.registrationId == null) return true;
   return applied.registrationId === id.registrationId;
 }
 
 /**
  * Every archived snapshot (all carriers, nested included) that is no longer the current registration of its ref:
- * - only the newest archive counts: latest `retiredAt` instant, tie-broken by registrationId. A legacy unstamped
- *   snapshot is older than any stamped one, and unstamped ones keep archive order (later wins);
+ * - only the newest archive counts: latest `retiredAt` instant, then registration time, tie-broken by
+ *   registrationId. A legacy unstamped snapshot is older than any stamped one; unstamped ones are ordered by
+ *   registration time (`registeredAt`, else `addedAt`), then outer before nested (a nested one was archived first);
  * - `applied` (ref → registrationId the candidate build applies from a fresh tip) also supersedes every archive
- *   of a different registration of that ref: they all predate it, a ref having one registration at a time. Mere
- *   registration is not enough — a re-registration with a missing or rewritten branch supplies no content.
+ *   of a different registration of that ref, including a legacy archive with no registrationId: they all predate
+ *   it, a ref having one registration at a time. Mere registration is not enough — a re-registration with a
+ *   missing or rewritten branch supplies no content.
  * @param {Array<object>} list
  * @param {{applied?: Map<string, string|null>}} [o]
  * @returns {Set<object>}
@@ -367,9 +378,12 @@ export function supersededSnapshots(list, { applied = new Map() } = {}) {
   const latest = new Map();
   const superseded = new Set();
   let seq = 0;
-  const key = (s, n) => {
+  const key = (s, n, depth) => {
     const at = typeof s.retiredAt === 'string' ? Date.parse(s.retiredAt) : NaN;
-    return Number.isFinite(at) ? [1, at, String(s.entry?.registrationId ?? ''), n] : [0, 0, '', n];
+    const reg = Date.parse(s.entry?.registeredAt ?? s.entry?.addedAt ?? '');
+    const registered = Number.isFinite(reg) ? reg : 0;
+    return Number.isFinite(at) ? [1, at, registered, String(s.entry?.registrationId ?? ''), n]
+      : [0, registered, -depth, '', n];
   };
   const newer = (a, b) => {
     for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return a[i] > b[i];
@@ -382,8 +396,8 @@ export function supersededSnapshots(list, { applied = new Map() } = {}) {
       const ref = s.entry?.ref;
       if (isSafeBranchName(ref)) {
         const current = active.get(ref);
-        if (current != null && s.entry.registrationId != null && s.entry.registrationId !== current) superseded.add(s);
-        const k = key(s, seq += 1);
+        if (current != null && s.entry.registrationId !== current) superseded.add(s);
+        const k = key(s, seq += 1, depth);
         const cur = latest.get(ref);
         if (!cur) latest.set(ref, { s, k });
         else if (newer(k, cur.k)) { superseded.add(cur.s); latest.set(ref, { s, k }); }

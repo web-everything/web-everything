@@ -26,7 +26,7 @@ export default {
         && readFileSync(join(root, 'scripts/lib/daemon-overlays.mjs'), 'utf8').includes('expectedRequiredOverlay')
         && readFileSync(join(root, 'scripts/lib/daemon-overlays.mjs'), 'utf8').includes('retiredSources')
         && readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8').includes('supersededSnapshots(overlaysBefore)')
-        && readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8').includes('sameRegistration(o, raw)')
+        && readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8').includes('sameRegistration(o, raw, { adoptedAt')
         && readFileSync(join(root, 'scripts/lib/daemon-overlay-auto-retire.mjs'), 'utf8').includes('persistTipShas');
     } catch { return false; }
   },
@@ -387,7 +387,10 @@ async function retirementRecovery(violation, { rewrite = false } = {}) {
  *     must restore X/PR2 from C2, never the obsolete X/PR1 from C1, and the build must proceed — also when C2
  *     closes a tick before C1 (`sequential`): the registered X/PR2 then supersedes C1's X/PR1 archive.
  *  2. Y/PR21 is adopted carrying a mechanism file and squash-lands; Y is re-registered as PR22 with its branch
- *     gone. The new registration must not inherit PR21's adopted pin (no pinned-overlay-unavailable hold). */
+ *     gone. The new registration must not inherit PR21's adopted pin (no pinned-overlay-unavailable hold).
+ *  3. Today's live registries: Z was registered before registrationIds existed (pr null) and its adopted input is
+ *     unbound. While that registration stands the pin holds; a pr-less re-registration after the adoption must not
+ *     inherit it. */
 async function registrationLifecycle(violation, { sequential = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'overlay-lifecycle-soak-'));
   const env = {
@@ -495,6 +498,27 @@ async function registrationLifecycle(violation, { sequential = false } = {}) {
       violation('reregistration-inherits-adopted-pin', 'Y/PR22 was held on the mechanism pin of the adopted Y/PR21 input');
     }
     if (entries().find((o) => o.ref === 'y')?.pr !== 22) violation('reregistration-lost', `Y/PR22 left the registry (${refs()})`);
+
+    writeOverlays(root, [{ ref: 'z', pr: null, addedAt: '2026-01-01T00:00:00.000Z' }], { env });
+    ok('checkout', '-qb', 'z', initial); const zTip = commit('scripts/lib/daemon-rebuild/plan.mjs');
+    ok('checkout', '-q', 'main');
+    // Z squash-lands; its branch was never kept, and the clone still runs the build that applied it, unbound.
+    ok('checkout', '-q', 'z', '--', 'scripts/lib/daemon-rebuild/plan.mjs'); ok('commit', '-qm', 'squash z');
+    ok('push', '-q', 'origin', 'main');
+    const adoptLegacy = () => writeRebuildState(root, { ...readRebuildState(root, env), held: null, adopted: {
+      head: ok('rev-parse', 'HEAD'), mainSha: initial, applied: [{ ref: 'z', pr: null, sha: zTip }], inputsKey: null,
+      at: new Date(Date.now() - 60_000).toISOString() } }, env);
+    adoptLegacy();
+    const kept = await prepare();
+    if (kept.result?.reason !== 'pinned-overlay-unavailable') {
+      violation('legacy-pin-dropped', `the legacy Z registration its build applied must stay pinned (${kept.result?.reason ?? 'candidate'})`);
+    }
+    adoptLegacy();
+    addOverlay(root, { ref: 'z' }, { env });
+    const legacy = await prepare();
+    if (legacy.result?.reason === 'pinned-overlay-unavailable') {
+      violation('legacy-reregistration-inherits-adopted-pin', 'a pr-less Z re-registered after adoption was held on the unbound adopted Z input');
+    }
   } catch (error) { violation('crash', String(error?.message ?? error)); }
   finally { rmSync(root, { recursive: true, force: true }); }
 }

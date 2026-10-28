@@ -4,7 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 import { autoRetireOverlays } from '../daemon-overlay-auto-retire.mjs';
-import { addOverlay, overlayFilePath, readOverlayState, reinstateOverlaySources, removeOverlay, writeOverlays } from '../daemon-overlays.mjs';
+import {
+  addOverlay, overlayFilePath, readOverlayState, reinstateOverlaySources, removeOverlay, supersededSnapshots, writeOverlays,
+} from '../daemon-overlays.mjs';
 import { writeRebuildState } from '../daemon-rebuild/state.mjs';
 
 // Exercise preparation and real registry storage without network or .git writes.
@@ -413,6 +415,72 @@ describe('archived sources remain represented in preparation', () => {
         detail: expect.objectContaining({ refs: ['x'] }) }));
     }
     expect(f.refs()).toEqual(['x']);
+  });
+
+  // Live overlay lists predate registrationIds and mostly carry `pr: null`, so most adopted inputs are unbound:
+  // ref + PR cannot tell registrations apart. Such an input pins only a registration that existed at adoption.
+  it.each([
+    { name: 're-registered after the build was adopted', registeredAt: '2026-10-03T00:00:00.000Z', pinned: false },
+    { name: 'registered before the build was adopted', registeredAt: '2026-10-01T00:00:00.000Z', pinned: true },
+    { name: 'a legacy registration with no registeredAt', registeredAt: undefined, pinned: true },
+  ])('an unbound pr-less adopted input pins a registration only if it predates the adoption: $name', async ({ registeredAt, pinned }) => {
+    const f = fixture();
+    writeOverlays(root, [{ ref: 'x', pr: null, registrationId: 'r2', ...(registeredAt ? { registeredAt } : {}),
+      addedAt: '2026-09-01T00:00:00.000Z' }], { env: f.env });
+    writeRebuildState(root, { adopted: { head: '1'.repeat(40), mainSha: '1'.repeat(40), at: '2026-10-02T00:00:00.000Z',
+      applied: [{ ref: 'x', pr: null, sha: A }] } }, f.env);
+    const next = await f.prepare({ run: (args) => {
+      if (args[0] === 'fetch' && args.some((a) => a.includes('heads/x:'))) return { status: 1, stdout: '' };
+      if (args[0] === 'diff' && args.includes(A)) return { status: 0, stdout: 'scripts/lib/daemon-rebuild.mjs\n' };
+      return f.git(args);
+    } });
+    if (pinned) expect(next.result.reason).toBe('pinned-overlay-unavailable');
+    else expect(next.result.reason).not.toBe('pinned-overlay-unavailable');
+    expect(f.refs()).toEqual(['x']);
+  });
+
+  it('a re-registration records when it began, so an older unbound adopted input never pins it', () => {
+    const f = fixture();
+    writeOverlays(root, [{ ref: 'x', pr: null, addedAt: '2026-09-01T00:00:00.000Z' }], { env: f.env });
+    const [x] = addOverlay(root, { ref: 'x', now: '2026-10-03T00:00:00.000Z' }, { env: f.env });
+    expect(x).toMatchObject({ addedAt: '2026-09-01T00:00:00.000Z', registeredAt: '2026-10-03T00:00:00.000Z' });
+  });
+
+  it('a legacy archive with no registrationId is released once the build applies the ref\'s re-registration', async () => {
+    const f = fixture();
+    f.env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'off';
+    writeOverlays(root, [{ ref: 'c1', pr: 11, addedAt: '2026-09-01T00:00:00.000Z',
+      retiredSources: [{ entry: { ref: 'x', pr: null, addedAt: '2026-08-01T00:00:00.000Z' }, sha: A }] }], { env: f.env });
+    addOverlay(root, { ref: 'x' }, { env: f.env });
+    model.planner = async ({ overlays }) => ({ ok: true, upToDate: true, mainSha: '1'.repeat(40), finalSha: F,
+      applied: overlays.map((o) => ({ ref: o.ref, pr: o.pr, sha: B })),
+      decisions: overlays.map((o) => ({ ref: o.ref, pr: o.pr, action: 'apply', reason: 'applied' })),
+      alerts: [], establishedLost: [], inputsKey: 'test' });
+    const run = (args) => {
+      const [cmd, ...rest] = args;
+      if (cmd === 'rev-parse' && /\/(x|c1)(\^\{commit\})?$/.test(rest.at(-1))) return { status: 0, stdout: B };
+      if (cmd === 'for-each-ref' && /\/(x|c1)$/.test(rest.at(-1))) return { status: 0, stdout: `${rest.at(-1)} ${B}` };
+      if (cmd === 'merge-base' && rest[0] === '--is-ancestor' && rest[1] === B && rest[2] === F) return { status: 0, stdout: '' };
+      return f.git(args);
+    };
+    const next = await f.prepare({ run });
+    expect(next.alerts.filter((a) => a.kind === 'overlay-source-unavailable')).toEqual([]);
+    expect(next.result.reason).toBe('up-to-date');
+  });
+
+  it('unstamped archives are ordered by registration time, then outer before nested — never by carrier order', () => {
+    const pr1 = { entry: { ref: 'x', pr: 1, addedAt: '2026-09-01T00:00:00.000Z' }, sha: A };
+    const pr2 = { entry: { ref: 'x', pr: 2, addedAt: '2026-09-02T00:00:00.000Z' }, sha: B };
+    for (const list of [[{ ref: 'c2', retiredSources: [pr2] }, { ref: 'c1', retiredSources: [pr1] }],
+      [{ ref: 'c1', retiredSources: [pr1] }, { ref: 'c2', retiredSources: [pr2] }]]) {
+      const superseded = supersededSnapshots(list);
+      expect([superseded.has(pr1), superseded.has(pr2)]).toEqual([true, false]);
+    }
+    const at = '2026-09-01T00:00:00.000Z';
+    const inner = { entry: { ref: 'x', pr: 1, addedAt: at }, sha: A };
+    const outer = { entry: { ref: 'x', pr: 2, addedAt: at, retiredSources: [{ entry: { ref: 'c1', retiredSources: [inner] }, sha: F }] }, sha: B };
+    const superseded = supersededSnapshots([{ ref: 'c3', retiredSources: [outer] }]);
+    expect([superseded.has(inner), superseded.has(outer)]).toEqual([true, false]);
   });
 
   it('restoration preserves duplicate snapshots and recovers older nested sources', () => {

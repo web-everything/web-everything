@@ -278,7 +278,8 @@ export async function prepareRebuild({
       // recorded. Edge-resolved entries applied a resolution commit, not the overlay's own tip, so they are skipped.
       // Only the registration that build applied may use its tip (a re-registered ref is a different input).
       const recordedShas = new Map((state.adopted?.head === prevHead ? state.adopted.applied ?? [] : [])
-        .filter((a) => a?.ref && a.sha && !a.resolvedVia && overlaysBefore.some((o) => sameRegistration(a, o)))
+        .filter((a) => a?.ref && a.sha && !a.resolvedVia
+          && overlaysBefore.some((o) => sameRegistration(a, o, { adoptedAt: state.adopted?.at })))
         .map((a) => [a.ref, a.sha]));
       const retired = await autoRetireOverlays({ root, env, overlays: overlaysBefore, git, mainSha: fetchedMainSha,
         refEvidence: fetchResult.refEvidence, recordedShas, now, removeOverlay, appendOverlayEvent,
@@ -312,7 +313,7 @@ export async function prepareRebuild({
       // mechanism this clone runs; use them only to refuse a loss, never as fresh build/retirement inputs.
       // Only an input of this same registration counts: a re-registered ref never inherits the old pin.
       const adopted = state.adopted?.head === prevHead
-        ? state.adopted.applied?.find((o) => sameRegistration(o, raw)) : null;
+        ? state.adopted.applied?.find((o) => sameRegistration(o, raw, { adoptedAt: state.adopted.at })) : null;
       const pin = pinnedStatus(git, raw, state.adopted?.mainSha ?? fetchedMainSha, adopted?.sha);
       if (!pin.pinned) continue;
       unavailablePinned = {
