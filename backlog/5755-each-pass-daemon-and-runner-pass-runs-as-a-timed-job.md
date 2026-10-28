@@ -3,10 +3,11 @@ bornAs: x9bxzp0
 kind: story
 size: 3
 parent: "5767"
-status: open
+status: resolved
 blockedBy: ["5754"]
 scope: ["we:skills-src/conveyor/pass-daemon.mjs", "we:skills-src/conveyor/runner.mjs"]
 dateOpened: "2026-10-10"
+dateResolved: "2026-10-28"
 tags: []
 ---
 

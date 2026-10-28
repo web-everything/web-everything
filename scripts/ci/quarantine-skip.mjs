@@ -3,7 +3,7 @@
  * @file scripts/ci/quarantine-skip.mjs
  * @description CI's red-main QUARANTINE skip step (card xx7ckd6 N1; the rules are pure in
  *   we:scripts/lib/red-main-quarantine.mjs#decideCiSkip). Prints the vitest args that skip the quarantined test files
- *   for THIS job — `--exclude=<file> …` on one line, or an empty line — for the unit-suite steps of
+ *   for THIS job — `--exclude=<file> …` on one line, or an empty line — for the unit, integration and soak steps of
  *   we:.github/workflows/ci.yml to append to their `npm run` line.
  *
  *   The list is read FRESH from the `ops/quarantine` branch at job start (`git fetch` of that ref,

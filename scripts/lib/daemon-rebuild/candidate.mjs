@@ -4,12 +4,12 @@
 
 import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { join, dirname, isAbsolute, resolve as resolvePath } from 'node:path';
-import { stateDir } from './state.mjs';
+import { join, dirname, basename, isAbsolute, resolve as resolvePath } from 'node:path';
+import { readRebuildState, stateDir } from './state.mjs';
 import { cloneKey } from '../daemon-overlays.mjs';
 import { makeGit } from './shared.mjs';
 import { rmSync, mkdirSync, existsSync, symlinkSync, readFileSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { defaultPoolRoot, workspaceFor } from '../lane-pool-paths.mjs';
 import { scrubGitRepoEnv } from '../lane-git-hardening.mjs';
 
@@ -60,16 +60,22 @@ export function candidateWorktreePath(root, env = process.env, token = `manual-$
  * @returns {{ok:true, path:string}|{ok:false, reason:string}}
  */
 export function materializeCandidate({
-  root, sha, run, env, path = candidateWorktreePath(root, env),
+  root, sha, run, env, path = candidateWorktreePath(root, env), pidAlive = defaultPidAlive, rm = rmSync, log,
 }) {
   const git = makeGit({ run, cwd: root, env, timeoutMs: 120_000 });
+  // Live 2026-10-26 (wev-fix-daemon): a killed attempt left its candidate LOCKED ("initializing"), and the rebuild
+  // could never adopt again. Reclaim OUR OWN dead-owner leftovers first; a live or unknown owner is never touched.
+  const { reclaimed } = reclaimStaleCandidates({ root, run, env, pidAlive, rm, keepPath: path });
+  for (const p of reclaimed) log?.error?.(`daemon-rebuild: reclaimed stale candidate worktree ${p} (owner pid dead, lock cleared)`);
   git(['worktree', 'remove', '--force', path]);
-  try { rmSync(path, { recursive: true, force: true }); } catch { /* best-effort teardown of a stale attempt */ }
+  try { rm(path, { recursive: true, force: true }); } catch { /* best-effort teardown of a stale attempt */ }
   git(['worktree', 'prune']);
   mkdirSync(dirname(path), { recursive: true });
   const add = git(['worktree', 'add', '--detach', '--quiet', path, sha]);
   if (add.status !== 0) {
-    return { ok: false, reason: `worktree-add-failed: ${String(add.stderr || add.stdout || '').trim().split('\n')[0]}` };
+    const msg = String(add.stderr || add.stdout || '').trim().split('\n').find((l) => l.trim())
+      || `git worktree add exited ${add.status} with no output (timeout or kill?)`;
+    return { ok: false, reason: `worktree-add-failed: ${msg}`, reclaimed };
   }
   try {
     const nodeModules = join(root, 'node_modules');
@@ -78,7 +84,58 @@ export function materializeCandidate({
       symlinkSync(nodeModules, join(path, 'node_modules'), 'dir');
     }
   } catch { /* best-effort — see docblock above */ }
-  return { ok: true, path };
+  return { ok: true, path, reclaimed };
+}
+
+/** true = alive, false = provably gone (ESRCH), null = unknown (never treated as dead). */
+function defaultPidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) {
+    if (e?.code === 'ESRCH') return false;
+    if (e?.code === 'EPERM') return true;
+    return null;
+  }
+}
+
+/**
+ * Reclaim THIS clone's own stale candidate worktrees: registered under `<stateDir>/<cloneKey>.candidate-<pid>-<hex>`,
+ * git-locked (a killed `worktree add` leaves the lock "initializing"), and whose owner pid (from the name) is
+ * provably dead, with a matching lease record naming this host. Unlock + `worktree remove --force` on that
+ * exact path + prune. Fail closed: missing or foreign-host lease evidence, another clone's prefix, an unlocked
+ * tree, an unparseable name, a live or unknown owner, a failed listing or unlock — untouched.
+ * (The owner's start time is not recorded in the name or lock, so a reused pid reads as alive: safe side.)
+ * @returns {{reclaimed:string[], skipped:{path:string, why:string}[]}}
+ */
+export function reclaimStaleCandidates({ root, run, env, pidAlive = defaultPidAlive, rm = rmSync, keepPath, onlyPath }) {
+  const reclaimed = []; const skipped = [];
+  const git = makeGit({ run, cwd: root, env, timeoutMs: 60_000 });
+  const list = git(['worktree', 'list', '--porcelain']);
+  if (list.status !== 0) return { reclaimed, skipped };
+  const dir = resolvePath(stateDir(env));
+  const building = readRebuildState(root, env).building;
+  const namePrefix = `${cloneKey(root)}.candidate-`;
+  for (const block of String(list.stdout || '').split(/\n\n+/)) {
+    const lines = block.split('\n');
+    const path = lines.find((l) => l.startsWith('worktree '))?.slice('worktree '.length);
+    if (!path || path === keepPath || (onlyPath && path !== onlyPath) || dirname(path) !== dir || !basename(path).startsWith(namePrefix)) continue;
+    if (!lines.some((l) => l === 'locked' || l.startsWith('locked '))) continue;
+    const pid = Number(/^(\d+)-[0-9a-f]+$/.exec(basename(path).slice(namePrefix.length))?.[1]);
+    if (!Number.isInteger(pid) || pid <= 0) { skipped.push({ path, why: 'owner-unknown' }); continue; }
+    if (building?.host !== hostname() || building.path !== path || building.pid !== pid) {
+      skipped.push({ path, why: 'lease-owner-unknown-or-foreign' }); continue;
+    }
+    if (pidAlive(pid) !== false) { skipped.push({ path, why: 'owner-alive-or-unknown' }); continue; }
+    const unlock = git(['worktree', 'unlock', path]);
+    if (unlock.status !== 0) { skipped.push({ path, why: `unlock-failed: ${String(unlock.stderr || '').trim().split('\n')[0]}` }); continue; }
+    const removed = git(['worktree', 'remove', '--force', path]);
+    if (removed.status !== 0) {
+      // Not claimed as reclaimed; the caller's own prune (it follows) clears a registration whose dir is now gone.
+      try { rm(path, { recursive: true, force: true }); } catch { /* best-effort */ }
+      skipped.push({ path, why: `remove-failed: ${String(removed.stderr || '').trim().split('\n')[0]}` });
+      continue;
+    }
+    reclaimed.push(path);
+  }
+  return { reclaimed, skipped };
 }
 
 /**
@@ -106,6 +163,9 @@ function ensureNodeModulesExcluded({ root, git }) {
  *  the NEXT {@link materializeCandidate} call to clear before it reuses it. */
 export function removeCandidate({ root, path, run, env }) {
   const git = makeGit({ run, cwd: root, env, timeoutMs: 60_000 });
+  // claimBuildLease calls us BEFORE replacing state.building. Reclaim a locked leftover now, while its
+  // same-host lease evidence still exists; materializeCandidate will only see the replacement lease.
+  try { reclaimStaleCandidates({ root, run, env, onlyPath: path }); } catch { /* best-effort, like teardown below */ }
   try { git(['worktree', 'remove', '--force', path]); } catch { /* best-effort */ }
   try { rmSync(path, { recursive: true, force: true }); } catch { /* best-effort */ }
   try { git(['worktree', 'prune']); } catch { /* best-effort */ }

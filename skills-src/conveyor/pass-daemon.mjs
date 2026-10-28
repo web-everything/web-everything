@@ -46,6 +46,13 @@
  * convention of its own. Unset (the default), this is a no-op: `withSelfSync` ticks straight through.
  */
 
+import { createHash } from 'node:crypto';
+import { CONSTELLATION_REPOS } from '../../scripts/lib/constellation-repos.mjs';
+import { enqueueItemTask } from '../../scripts/lib/daemon-item-tasks.mjs';
+import { defineJobKind, markClaimed, markSucceeded, markFailed, taskDeadlineDecision } from '../../scripts/lib/daemon-jobs.mjs';
+import { createJobStore, launchJob, reattachTick, probeHandle, stopHandle, hostName, readProcStart, reapDeadGroup } from '../../scripts/lib/daemon-jobs-runtime.mjs';
+import { daemonJobsDir } from '../../scripts/operations/run-store.mjs';
+import { formatJobHandle, TERMINAL_JOB_STATUSES } from '../../scripts/operations/job-record.mjs';
 import { spawn } from 'node:child_process';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -136,7 +143,7 @@ export const MAIN_ONLY_PASSES = new Set(['merge-orphan-sweep']);
 export async function runPassDaemonLoop({
   runPass, sleep, isAlive = () => true, onRun = () => {}, onRunError = () => {},
   refreshAuth = async () => {}, onRefreshError = () => {},
-  intervalMs, maxRuns = Infinity,
+  intervalMs, maxRuns = Infinity, tickWhileRunning = false,
   failureAlertAfter = 0, onConsecutiveFailures = () => {},
 }) {
   if (typeof runPass !== 'function') throw new TypeError('runPassDaemonLoop requires a runPass effect');
@@ -154,25 +161,42 @@ export async function runPassDaemonLoop({
       try { onConsecutiveFailures({ count: streak, detail }); } catch { /* alerting must never stop the loop */ }
     }
   };
-  for (;;) {
-    try {
-      await refreshAuth();
-    } catch (error) {
-      if (isGithubAppAuthGuardError(error)) throw error;
-      onRefreshError(error, run);
-    }
+  const runOnce = async (startedRun) => {
     try {
       const result = await runPass();
-      onRun(result, run);
+      onRun(result, startedRun);
       noteRun(failed(result), result);
     } catch (error) {
-      onRunError(error, run);
+      onRunError(error, startedRun);
       noteRun(true, { error: String((error && error.message) || error) });
     }
-    if (!isAlive()) return { runs: run + 1, stoppedReason: 'lease-lost' };
-    if (run + 1 >= maxRuns) return { runs: run + 1, stoppedReason: 'max-runs' };
-    await sleep(intervalMs);
-    run += 1;
+  };
+  let inFlight = null;
+  try {
+    for (;;) {
+      if (!inFlight) {
+        try {
+          await refreshAuth();
+        } catch (error) {
+          if (isGithubAppAuthGuardError(error)) throw error;
+          onRefreshError(error, run);
+        }
+        if (tickWhileRunning) {
+          // Opt-in (#5755): the pass is a bounded timed job, so the loop keeps its cadence while it runs.
+          inFlight = runOnce(run).finally(() => { inFlight = null; });
+          await Promise.resolve();
+          await Promise.resolve();
+          await Promise.resolve();
+        } else await runOnce(run);
+      }
+      if (!isAlive()) { await inFlight; return { runs: run + 1, stoppedReason: 'lease-lost' }; }
+      if (run + 1 >= maxRuns) { await inFlight; return { runs: run + 1, stoppedReason: 'max-runs' }; }
+      await sleep(intervalMs);
+      run += 1;
+    }
+  } finally {
+    // Error exits must preserve the monitor just like max-runs and lease loss.
+    await inFlight;
   }
 }
 
@@ -238,11 +262,25 @@ export function passEnvFor(passName, env = process.env) {
   return { ...env, GH_CALLER: passName };
 }
 
-export function spawnPassOnce({ script, args = [] }, { root = REPO_ROOT, log = console, env = process.env, spawnFn = spawn } = {}) {
+function spawnPassChild({ script, args = [] }, { root = REPO_ROOT, log = console, env = process.env, spawnFn = spawn, onChild = () => {}, capture = false, quiet = false } = {}) {
   return new Promise((resolve) => {
     // 68b: the child's output is relayed line by line through this process's own (stamped, de-duplicated, rotated)
     // console instead of inherited, so the big health-watch logs get timestamps and a size cap too.
-    const child = spawnFn(process.execPath, [join(root, script), ...args], { stdio: ['ignore', 'pipe', 'pipe'], env });
+    const child = spawnFn(process.execPath, [join(root, script), ...args], { cwd: root, detached: true, stdio: ['ignore', 'pipe', 'pipe'], env });
+    onChild(child);
+    let output = '';
+    const outputDecoder = new StringDecoder('utf8');
+    let stderr = '';
+    child.stderr?.on('data', chunk => {
+      if (stderr.length < MAX_RELAY_LINE_CHARS) stderr = (stderr + chunk).slice(-MAX_RELAY_LINE_CHARS);
+    });
+    let outputBytes = 0;
+    let outputError;
+    if (capture) child.stdout?.on('data', chunk => {
+      outputBytes += Buffer.byteLength(chunk);
+      if (outputBytes <= 32 * 1024 * 1024) output += typeof chunk === 'string' ? chunk : outputDecoder.write(chunk);
+      else outputError = 'pass output exceeded 32 MiB; inspect pass output before retrying';
+    });
     // Each relayed line is stamped ONCE, by this process's log: a stamp the child already wrote is dropped first, or
     // `<ISO> <ISO> name: tick` would no longer parse as a `name:` line. A StringDecoder keeps a multi-byte character
     // split across two chunks whole.
@@ -273,7 +311,7 @@ export function spawnPassOnce({ script, args = [] }, { root = REPO_ROOT, log = c
       });
       return () => { pending += decoder.end(); if (pending) { write(stripLogTimestamp(pending)); pending = ''; } };
     };
-    const flushOut = relay(child.stdout, (l) => log.log(l));
+    const flushOut = relay(child.stdout, (l) => { if (!capture && !quiet) log.log(l); });
     const flushErr = relay(child.stderr, (l) => log.error(l));
     // Finish on 'close' (stdio fully drained), not 'exit' (which can fire with pipe data still unread). A grandchild
     // that inherited the pipes can hold 'close' off forever, so 'exit' arms a short grace timer as a backstop.
@@ -284,13 +322,158 @@ export function spawnPassOnce({ script, args = [] }, { root = REPO_ROOT, log = c
       finished = true;
       if (graceTimer) clearTimeout(graceTimer);
       flushOut(); flushErr();
+      if (capture && !outputError) output += outputDecoder.end();
       if (code !== 0) log.error(`pass-daemon: ${script} exited ${signal ? `on ${signal}` : `with code ${code}`}`);
-      resolve({ code, signal });
+      resolve({ code, signal, ...(capture ? { output } : {}), ...(code !== 0 && quiet ? { stderr } : {}), ...(outputError ? { spawnError: outputError } : {}) });
     };
     child.on('exit', (code, signal) => { graceTimer = setTimeout(() => finish(code, signal), CLOSE_GRACE_MS); graceTimer.unref?.(); });
     child.on('close', (code, signal) => finish(code, signal));
     child.on('error', (e) => { log.error(`pass-daemon: failed to spawn ${script}: ${String((e && e.message) || e)}`); resolve({ code: null, signal: null, spawnError: String((e && e.message) || e) }); });
   });
+}
+
+// Adapter for opaque pass CLIs: exclusion/policy, launch and deadline recovery belong to
+// the shared task/job layer. Only the CLI's original result and timing projection live here.
+const activePasses = new Map();
+export function runPassAsTimedJob({ passName, repo, entry }, ports = {}) {
+  const env = ports.env ?? process.env;
+  const store = ports.store ?? createJobStore(daemonJobsDir('conveyor-passes', env));
+  const key = JSON.stringify([store.dir, passName, repo]);
+  if (activePasses.has(key)) return activePasses.get(key);
+  const pending = executeTimedPass({ passName, repo, entry }, { ...ports, store, env });
+  activePasses.set(key, pending);
+  pending.finally(() => { if (activePasses.get(key) === pending) activePasses.delete(key); }).catch(() => {});
+  return pending;
+}
+
+async function executeTimedPass({ passName, repo, entry }, ports) {
+  const { store, env, root = REPO_ROOT, now = Date.now, host = hostName(), readStart = readProcStart } = ports;
+  // A legacy {log,error} sink carries only relayed child output; diagnostics go to the process log.
+  const log = typeof ports.log === 'function' ? ports.log : line => console.error(line);
+  const alert = ports.alert ?? (detail => log(`pass-daemon: ALERT ${JSON.stringify(detail)}`));
+  const probe = ports.probe ?? probeHandle;
+  const stop = ports.stop ?? ((handle, options) => stopHandle(handle, { ...options, probe }));
+  const reapGroup = ports.reapGroup ?? (ports.probe
+    ? handle => probe(handle) === 'dead'
+    : (handle, notAfterMs, options) => reapDeadGroup(handle, { ...options, notAfterMs }));
+  const observeOwner = handle => {
+    try { return probe(handle); } catch { return 'unknown'; }
+  };
+  const confirmGroupGone = handle => {
+    try {
+      return observeOwner(handle) === 'dead'
+        && reapGroup(handle, now(), { requireConfirmedDeath: true }) === true;
+    } catch { return false; }
+  };
+  const kindDef = defineJobKind({ kind: `pass-${createHash('sha256').update(passName).digest('hex').slice(0, 24)}`, entry: entry.script,
+    codeMode: 'mutates-tree', prepareWorktree: () => root, maxAttempts: 1, resumable: false });
+  const listed = store.list();
+  if (listed.corrupt.length) throw new Error(`pass job store corrupt: ${listed.corrupt.join(', ')}; inspect and repair before retrying`);
+  let record = listed.records.find(r => r.job.task?.kind === kindDef.kind && r.job.task.repo === repo &&
+    r.job.task.item === 1 && !TERMINAL_JOB_STATUSES.includes(r.job.status));
+  if (record?.job.passQuarantine) return { outcome: 'quarantined' };
+  const seq = listed.records.reduce((latest, r) => r.job.kind === kindDef.kind && r.job.task?.repo === repo
+    ? Math.max(latest, r.job.task.seq) : latest, 0) + 1;
+  if (!record) record = enqueueItemTask({ store, kindDef, repo, item: 1, seq,
+    codeSha: ports.codeSha ?? null, acting: false, resourceKind: 'light', now: now(),
+    policyOptions: { env, ...ports.policyOptions } });
+  log(`pass-daemon: ${passName} timeoutMs=${record.job.task.timeoutMs} source=${record.job.task.sources.timeoutMs}`);
+  const id = record.id;
+  const at = () => new Date(now()).toISOString();
+  const finish = (result, outcome, quarantine = false) => {
+    let timing;
+    store.update(id, r => {
+      if (r.job.passResult) return null;
+      timing = { type: 'task-timing', taskId: r.job.task.id, attempt: r.job.attempts,
+        outcome, elapsedMs: Math.max(0, now() - Date.parse(r.job.launchedAt)) };
+      r.job.passResult = result;
+      r.job.passTiming = timing;
+      if (quarantine) r.job.passQuarantine = true;
+      else if (!TERMINAL_JOB_STATUSES.includes(r.job.status)) r = outcome === 'failed'
+        ? markFailed(r, { at: at(), reason: result.spawnError ?? `exit code ${result.code}` })
+        : markSucceeded(r, { at: at() });
+      return r;
+    });
+    if (timing) log(JSON.stringify(timing));
+    if (quarantine && timing) alert({ passName, repo, id, reason: 'Cannot confirm pass gone; operator must inspect and recover the retained job before retrying' });
+    return store.read(id).job.passResult;
+  };
+  let childResult;
+  let unclaimedPid;
+  if (record.job.status === 'queued') {
+    record = launchJob({ store, id, kindDef, now, env, snapshot: ports.snapshot,
+      spawnFn: ({ cwd }) => {
+        let child;
+        childResult = spawnPassChild(entry, { root: cwd, env, spawnFn: ports.spawnFn ?? spawn,
+          log: typeof ports.log === 'function' ? { log, error: log } : ports.log ?? console,
+          capture: entry.capture, quiet: entry.quiet, onChild: c => { child = c; } });
+        const pid = child?.pid;
+        unclaimedPid = pid;
+        const procStart = readStart(pid);
+        const handle = formatJobHandle({ host, pid, procStart });
+        store.update(id, r => markClaimed(r, { at: at(), handle, host, pid, procStart }));
+        unclaimedPid = null;
+        return pid;
+      } });
+  }
+  if (unclaimedPid) {
+    store.update(id, r => { r.job.pid = unclaimedPid; return r; });
+    childResult?.catch(() => {});
+    return finish({ outcome: 'quarantined' }, 'quarantined', true);
+  }
+  let result;
+  childResult = childResult?.catch(error => ({ code: null, signal: null, spawnError: String(error?.message || error) }));
+  childResult?.then(value => { result = value; });
+  for (;;) {
+    record = store.read(id);
+    if (record.job.passResult) return record.job.passResult;
+    const deadline = taskDeadlineDecision(record, { now: now() });
+    const awaitingClaim = !childResult && record.job.status === 'launching' && !record.job.handle;
+    if (deadline?.expired) {
+      if (awaitingClaim) {
+        // The launcher may already have a child and still be reading its start
+        // identity. Keep its claim and result untouched so a late claim still
+        // enforces this deadline; an absent handle is not proof of death.
+        alert({ passName, repo, id, reason: 'Pass deadline expired before its handle was recorded; operator must inspect the retained launch' });
+        return { outcome: 'quarantined' };
+      }
+      // Scope recovery to this pass: an unrelated slow stop cannot hold up its siblings.
+      const scopedStore = { ...store, list: () => ({ records: [store.read(id)], corrupt: [] }) };
+      const recovery = await reattachTick({ store: scopedStore, kinds: new Map([[kindDef.kind, kindDef]]),
+        maxConcurrent: 1, observation: { now: now(), slept: false, gapMs: 0 },
+        probe, stop, reapGroup, staleMs: Number.MAX_SAFE_INTEGER, log });
+      const quarantine = recovery.actions.some(a => a.action === 'stop-failed')
+        || !TERMINAL_JOB_STATUSES.includes(store.read(id).job.status);
+      return finish({ outcome: quarantine ? 'quarantined' : 'timeout' }, quarantine ? 'quarantined' : 'timeout', quarantine);
+    }
+    if (result) {
+      // A child result does not prove its subprocess group is gone.
+      // Keep the durable claim and alert if reaping cannot confirm absence.
+      if (record.job.handle && !confirmGroupGone(record.job.handle)) {
+        return finish({ outcome: 'quarantined' }, 'quarantined', true);
+      }
+      return finish(result, result.code === 0 && !result.spawnError ? 'acted' : 'failed');
+    }
+    if (TERMINAL_JOB_STATUSES.includes(record.job.status)) return finish({ code: null, signal: null,
+      spawnError: record.job.error ?? 'pass exited without a recorded result' }, 'failed');
+    // Reattached owners have no local ChildProcess; judge them through shared recovery.
+    if (!childResult && !awaitingClaim && observeOwner(record.job.handle) !== 'alive') {
+      const quarantine = !confirmGroupGone(record.job.handle);
+      return finish(quarantine ? { outcome: 'quarantined' } : { code: null, signal: null,
+        spawnError: 'pass owner exited without a recorded result' }, quarantine ? 'quarantined' : 'failed', quarantine);
+    }
+    let timer;
+    try {
+      await Promise.race([...(childResult && !result ? [childResult] : []),
+        new Promise(resolve => { timer = setTimeout(resolve, Math.min(1000, Math.max(1, deadline.deadlineAt - now()))); })]);
+    } finally { clearTimeout(timer); }
+  }
+}
+
+export function spawnPassOnce(entry, ports = {}) {
+  const args = entry.args ?? [];
+  const repo = ports.repo ?? args.find(a => a.startsWith('--repo='))?.slice(7) ?? CONSTELLATION_REPOS.we.slug;
+  return runPassAsTimedJob({ passName: ports.passName ?? entry.script, repo, entry }, ports);
 }
 
 async function main(argv) {
@@ -326,11 +509,14 @@ async function main(argv) {
   }, heartbeatIntervalMs);
   heartbeatTimer.unref?.();
 
+  let activePass = null;
   let stopping = false;
-  const shutdown = (signal) => {
+  const shutdown = async (signal) => {
     if (stopping) return;
     stopping = true;
-    console.error(`pass-daemon: ${signal} — releasing "${passName}"'s lease and exiting.`);
+    alive = false;
+    console.error(`pass-daemon: ${signal} — waiting for "${passName}" before releasing its lease and exiting.`);
+    await Promise.allSettled([activePass]);
     clearInterval(heartbeatTimer);
     releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key });
     process.exit(0);
@@ -340,8 +526,9 @@ async function main(argv) {
 
   // xdpemd4 — self-sync this watcher's clone between runs, same contract every other resident daemon already
   // has (see the file header). A no-op unless DAEMON_SELF_SYNC_BRANCH (or plain main-tracking self-sync) is
-  // opted into; `restartOntoNewCode` mirrors `shutdown` (release the lease, exit 0) so launchd's KeepAlive
-  // brings this pass back up on the freshly-merged code, exactly like `review-daemon.mjs`'s own restart path.
+  // opted into. Self-sync runs before the next spawn, with no previous pass in flight.
+  // Do not await activePass here: it contains this very callback. Release the lease
+  // and exit so launchd brings this pass back up on the freshly-merged code.
   const restartOntoNewCode = () => {
     if (stopping) return;
     stopping = true;
@@ -374,18 +561,18 @@ async function main(argv) {
   // pinned to, and the pass child spawns from THERE (a switch mid-tick never moves a running child's tree).
   const tickContext = {};
   const runPassSelfSynced = passDaemonSelfSyncEnabled()
-    ? withSelfSync({ tickOnce: () => spawnPassOnce(entry, { env: passEnv(), root: tickContext.tickRoot ?? REPO_ROOT }) }, {
+    ? withSelfSync({ tickOnce: () => spawnPassOnce(entry, { passName, env: passEnv(), root: tickContext.tickRoot ?? REPO_ROOT }) }, {
       root: REPO_ROOT, onRestart: restartOntoNewCode, mainOnly, env: selfSyncEnv, tickContext,
     }).tickOnce
-    : () => spawnPassOnce(entry, { env: passEnv() });
+    : () => spawnPassOnce(entry, { passName, env: passEnv() });
 
   const failureAlertAfter = resolveFailureAlertAfter(entry, process.env);
   console.error(`pass-daemon: started "${passName}" (${entry.script}) on interval ${intervalMs}ms, heartbeat every ${heartbeatIntervalMs}ms.`);
   const { stoppedReason } = await runPassDaemonLoop({
-    runPass: runPassSelfSynced,
+    runPass: () => (activePass = runPassSelfSynced()),
     sleep: realSleep,
     isAlive: () => alive,
-    intervalMs,
+    intervalMs, tickWhileRunning: true,
     failureAlertAfter,
     onConsecutiveFailures: ({ count, detail }) => alertConsecutiveFailures(passName, count, detail),
     refreshAuth: () => ensureFreshGithubAppEnv(FLEET_APP_AUTH_OPTS),

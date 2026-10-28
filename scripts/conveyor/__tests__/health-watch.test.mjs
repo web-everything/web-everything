@@ -1490,7 +1490,15 @@ describe('operator-hold-aged: real log, persisted state, shadow-mode delivery', 
   const rec = (at, holds, repo = WE) => `${new Date(at).toISOString()} review-daemon: operator-holds ${JSON.stringify({ version: 1, repo, observedAt: at, intervalMs: 120_000, holds })}\n`;
   const setup = () => {
     const logsDir = join(dir, 'logs');
-    const flags = { 'state-root': join(dir, 'state'), 'logs-dir': logsDir, 'lock-root': join(dir, 'locks'), 'self-sync-dir': join(dir, 'sync'), 'no-gh': true, 'no-diagnose': true };
+    // Hermetic machine probes: the real `ps`, load average and heavy-admission queue vary with the runner's load, so
+    // an unrelated smell could open and close between two ticks and read as an operator-hold transition.
+    const fixtures = join(dir, 'fixtures');
+    mkdirSync(fixtures, { recursive: true });
+    const psPath = join(fixtures, 'ps.txt'); writeFileSync(psPath, '  PID  PPID %CPU     ELAPSED COMMAND\n    1     0   0.0  05-01:00:00 /sbin/launchd\n');
+    const loadPath = join(fixtures, 'load.json'); writeFileSync(loadPath, JSON.stringify({ load1: 0.5, load5: 0.5, load15: 0.5, cpuCount: 8 }));
+    const heavyPath = join(fixtures, 'heavy.json'); writeFileSync(heavyPath, JSON.stringify({ cap: 2, fastSlots: 0, heldCount: 0, freeCount: 2, held: [], waiting: [] }));
+    const flags = { 'state-root': join(dir, 'state'), 'logs-dir': logsDir, 'lock-root': join(dir, 'locks'), 'self-sync-dir': join(dir, 'sync'), 'no-gh': true, 'no-diagnose': true,
+      'ps-fixture': psPath, 'machine-load-fixture': loadPath, 'heavy-status-file': heavyPath };
     for (const name of ['logs-dir', 'lock-root', 'self-sync-dir']) mkdirSync(flags[name], { recursive: true });
     const log = join(logsDir, 'review-daemon.log');
     const hold = [{ prNumber: 4433, kind: 'cap-exhausted' }];
@@ -1545,7 +1553,7 @@ describe('operator-hold-aged: real log, persisted state, shadow-mode delivery', 
     const full = rec(start + 38 * minute, []);
     appendFileSync(log, full.slice(0, 60));
     const partial = await tick({ ...flags, now: new Date(start + 40 * minute).toISOString() });
-    expect(partial.transitions.some((t) => t.type === 'closed')).toBe(false);
+    expect(partial.transitions.some((t) => t.type === 'closed' && t.key.startsWith('operator-hold-aged'))).toBe(false);
     appendFileSync(log, full.slice(60));
     const done = await tick({ ...flags, now: new Date(start + 42 * minute).toISOString() });
     expect(done.transitions.some((t) => t.type === 'closed' && t.key.startsWith('operator-hold-aged'))).toBe(true);
@@ -1558,7 +1566,7 @@ describe('operator-hold-aged: real log, persisted state, shadow-mode delivery', 
     for (const at of [6, 12, 18, 24, 30, 36]) await run(at, hold);
     rmSync(log);
     const out = await tick({ ...flags, now: new Date(start + 60 * minute).toISOString() });
-    expect(out.transitions.some((t) => t.type === 'closed')).toBe(false);
+    expect(out.transitions.some((t) => t.type === 'closed' && t.key.startsWith('operator-hold-aged'))).toBe(false);
     const persisted = JSON.parse(readFileSync(join(healthDir(flags['state-root']), 'state.json'), 'utf8'));
     expect(Object.keys(persisted.episodes).some((k) => k.startsWith('operator-hold-aged'))).toBe(true);
   });
