@@ -23,6 +23,70 @@ describe('resolveDaemonEntries', () => {
     expect(resolveDaemonEntries({})).toEqual({ entries: DAEMON_ENTRY_MODULES, overridden: false });
   });
 
+  it('boots the fixed list for a minimal clone without daemon entries', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'boot-smoke-minimal-'));
+    try {
+      const r = await checkDaemonEntriesBoot({ root, env: { WE_SMOKE_LIVE_CLONE: root },
+        runChild: async () => '{"ok":true}' });
+      expect(r.ok).toBe(true);
+      expect(r.entries.map(entry => entry.entry)).toEqual(DAEMON_ENTRY_MODULES);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('boots the fixed list when only a candidate root is supplied', async () => {
+    const r = await checkDaemonEntriesBoot({ root: '.', env: {}, runChild: async () => '{"ok":true}' });
+    expect(r.ok).toBe(true);
+    expect(r.entries.map(entry => entry.entry)).toEqual(DAEMON_ENTRY_MODULES);
+  });
+
+  it('fails closed on missing fixed entries in a real boot of a minimal clone', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'boot-smoke-missing-'));
+    try {
+      const r = await checkDaemonEntriesBoot({ root, env: { ...process.env, WE_SMOKE_LIVE_CLONE: root, [DAEMON_ENTRIES_ENV]: '' },
+        budgets: { daemonBootMs: 15_000 }, diagnosticsDir: join(root, 'diagnostics') });
+      expect(r.ok).toBe(false);
+      expect(r.entries).toHaveLength(DAEMON_ENTRY_MODULES.length);
+      expect(r.entries.every(entry => !entry.ok && entry.kind === 'import failed')).toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('fails closed on an unreadable live clone when the boot tree has daemon entries', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'boot-smoke-live-'));
+    let spawned = false;
+    try {
+      const r = await checkDaemonEntriesBoot({ root: process.cwd(), env: { WE_SMOKE_LIVE_CLONE: join(root, 'missing') },
+        runChild: async () => { spawned = true; return '{"ok":true}'; } });
+      expect(r.ok).toBe(false);
+      expect(r.detail).toContain('runtime entries unreadable');
+      expect(spawned).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('uses cloneRuntimeEntries when a clone root is known', () => {
+    let observed;
+    const runtimeEntries = options => { observed = options; return [...DAEMON_ENTRY_MODULES, 'clone.mjs']; };
+    expect(resolveDaemonEntries({}, { root: 'clone-root', runtimeEntries }).entries).toContain('clone.mjs');
+    expect(observed).toEqual({ root: 'clone-root', entries: [] });
+  });
+
+  it('discovers LaunchAgents against the live clone while booting a disposable candidate', () => {
+    let observed;
+    const runtimeEntries = options => { observed = options; return DAEMON_ENTRY_MODULES; };
+    resolveDaemonEntries({ WE_SMOKE_LIVE_CLONE: 'live-clone' }, { root: 'candidate-tree', runtimeEntries });
+    expect(observed.root).toBe('live-clone');
+  });
+
+  it('fails closed when clone entry discovery is unreadable', async () => {
+    let spawned = false;
+    const r = await checkDaemonEntriesBoot({ root: 'clone-root', env: {},
+      runtimeEntries() { throw new Error('plist unreadable'); },
+      runChild: async () => { spawned = true; return '{"ok":true}'; },
+    });
+    expect(r.ok).toBe(false);
+    expect(r.detail).toContain('runtime entries unreadable');
+    expect(spawned).toBe(false);
+  });
+
   it('parses a comma-separated override, trimming whitespace and dropping empties, and reports overridden:true', () => {
     expect(resolveDaemonEntries({ [DAEMON_ENTRIES_ENV]: ' a.mjs, b.mjs ,,c.mjs' }))
       .toEqual({ entries: ['a.mjs', 'b.mjs', 'c.mjs'], overridden: true });
@@ -82,7 +146,8 @@ describe('checkDaemonEntriesBoot — injected runChild (no real subprocess)', ()
   let diagnosticsDir;
   beforeEach(() => { diagnosticsDir = mkdtempSync(join(tmpdir(), 'we-boot-diag-')); });
   afterEach(() => rmSync(diagnosticsDir, { recursive: true, force: true }));
-  const ctx = (runChild) => ({ root: '/candidate', budgets: { daemonBootMs: 1000 }, runChild, env: {}, diagnosticsDir });
+  const ctx = (runChild) => ({ root: '/candidate', runtimeEntries: () => DAEMON_ENTRY_MODULES,
+    budgets: { daemonBootMs: 1000 }, runChild, env: {}, diagnosticsDir });
 
   it('passes when every entry reports ok', async () => {
     const r = await checkDaemonEntriesBoot(ctx(async () => '{"ok":true}'));
@@ -329,7 +394,7 @@ describe('checkDaemonEntriesBoot — real subprocess, real dynamic import (no fa
   });
 
   it('boots every REAL production daemon entry clean on this tree (the wiring test)', async () => {
-    const r = await checkDaemonEntriesBoot({ root: process.cwd(), budgets: { daemonBootMs: 45_000 } });
+    const r = await checkDaemonEntriesBoot({ root: process.cwd(), runtimeEntries: () => DAEMON_ENTRY_MODULES, budgets: { daemonBootMs: 45_000 } });
     expect(r.ok).toBe(true);
     for (const entry of DAEMON_ENTRY_MODULES) expect(r.detail).toContain(entry);
   }, 60_000);

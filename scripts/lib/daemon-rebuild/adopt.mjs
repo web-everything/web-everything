@@ -8,7 +8,8 @@ import { hostname } from 'node:os';
 import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
-import { resolveOverlayConflict } from './overlay-strategies.mjs';
+import { finalClosureScope, isExcludable } from './closure-scope.mjs';
+import { resolveClosureScopedConflict, resolveOverlayConflict } from './overlay-strategies.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
 
@@ -100,7 +101,7 @@ export function matchReadyCandidate({
  * @param {{git:(args:string[])=>{status:number|null, stdout?:string}, adopt:object, mainTip:string}} o
  */
 export function readyBuildVerified({
-  git, adopt, mainTip, prevHead, approvedEdgeShaFor = () => null,
+  git, adopt, mainTip, prevHead, approvedEdgeShaFor = () => null, entries = [], env = {},
 }) {
   const isAncestor = (a, b) => git(['merge-base', '--is-ancestor', a, b]).status === 0;
   if (!adopt?.finalSha || !adopt.mainSha || !mainTip || !isAncestor(adopt.mainSha, mainTip)) return false;
@@ -108,6 +109,17 @@ export function readyBuildVerified({
   const headBase = prevHead ? String(git(['merge-base', prevHead, mainTip]).stdout ?? '').trim() : '';
   if (!headBase || !isAncestor(headBase, adopt.mainSha)) return false;
   const applied = Array.isArray(adopt.applied) ? adopt.applied : [];
+  let finalScope;
+  if (applied.some(a => a?.resolvedVia === 'closure-scope' || a?.excluded !== undefined)) {
+    const final = finalClosureScope({ git, sha: adopt.finalSha, entries, env });
+    if (!final.ok) return false;
+    finalScope = final.scope;
+    for (const a of applied) {
+      if (a?.resolvedVia !== 'closure-scope' && a?.excluded !== undefined) return false;
+      if (a?.resolvedVia === 'closure-scope' && (!Array.isArray(a.excluded) || !a.excluded.length
+        || new Set(a.excluded).size !== a.excluded.length || !a.excluded.every(p => isExcludable(p, finalScope)))) return false;
+    }
+  }
   let cur = adopt.finalSha;
   for (let i = applied.length - 1; i >= 0; i -= 1) {
     const a = applied[i];
@@ -126,7 +138,11 @@ export function readyBuildVerified({
     if (tip ? !isAncestor(a.sha, tip) : !isAncestor(a.sha, mainTip)) return false;
     // The merge's tree is exactly what planRebuild mints for (prev, overlay) — never an arbitrary tree.
     let minted;
-    if (a.resolvedVia) {
+    if (a.resolvedVia === 'closure-scope') {
+      const resolved = resolveClosureScopedConflict({ git, cur: prev, ovSha: a.sha, scope: finalScope });
+      if (!resolved?.ok || JSON.stringify(resolved.excluded) !== JSON.stringify(a.excluded)) return false;
+      minted = resolved.tree;
+    } else if (a.resolvedVia) {
       // An edge-resolved build is only as trusted as the operator's CURRENT recorded approval: the record's own
       // `edgeSha` must still equal it, and the tree is re-derived through that same approved edge.
       const approvedEdgeSha = approvedEdgeShaFor(a.ref);

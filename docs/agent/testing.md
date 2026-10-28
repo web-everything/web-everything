@@ -11,10 +11,22 @@ paths. Use the same reader for imports and spawned-script basename lookup; never
 walk fall back to the checkout's tracked-file index. Tree batch output is byte-framed (UTF-8
 character counts cannot delimit blobs). `makeGit` forwards explicit batch stdin and encoding.
 Incomplete/missing dependencies and closures above 4,000 files return a failure reason:
-the future planner must retain the conflict for a full merge or manual rebase. Existing
+the planner retains the conflict for a full merge or manual rebase. Existing
 closure callers retain their defaults; strict resolution and the file bound are opt-in.
 The fixpoint helper returns additions without mutating scope; the planner owns the three-replan
-limit. These foundations do not enable scoped rebuild behavior.
+limit. `daemon-rebuild-closure-scope.test.mjs` uses local refs (no network) to exercise
+scoped merges, real-overlay ancestry, final-tree verification and the three-replan fallback.
+`closureScope.mode` follows the policy cascade with standard `shadow`; shadow reports
+"would resolve, excluded N" while preserving the ordinary plan. Explicit `on` applies scopes;
+`off` disables the strategy. Candidate boot discovery uses `WE_SMOKE_LIVE_CLONE` for clone
+LaunchAgents; a generic smoke root alone keeps the fixed daemon entry list. Minimal boot trees
+with none of those entries also keep the fixed list: real child imports fail on missing modules,
+while injected-child fixtures need no host LaunchAgents. An injected `runtimeEntries` explicitly
+selects discovery against the supplied root in hermetic boot fixtures. With daemon entries present
+in the boot tree, an unreadable live clone or plist fails smoke before spawning children; checking
+the live root's entries instead could silently bypass discovery for a bad live-root path. Scope
+discovery likewise retains the conflict on unreadable evidence. Final closure checks run before smoke and
+again when reconstructing persisted scoped candidates.
 
 ## Overlay auto-retirement
 

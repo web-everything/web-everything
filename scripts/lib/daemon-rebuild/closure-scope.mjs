@@ -93,3 +93,10 @@ export function fixpointExtend({ scope, excluded, finalClosure }) {
   }
   return [...new Set(excluded)].filter(p => finalClosure.files.has(p) && !scope.has(p));
 }
+
+/** Pre-smoke and persisted-candidate evidence, read from the final Git tree rather than the checkout. */
+export function finalClosureScope({ git, sha, entries = [], env = {} }) {
+  try {
+    return computeClosureScope({ git, mainSha: sha, entries: typeof entries === 'function' ? entries() : entries, env });
+  } catch { return { ok: false, reason: 'entries-unreadable' }; }
+}

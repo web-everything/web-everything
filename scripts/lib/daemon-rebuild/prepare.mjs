@@ -25,6 +25,8 @@ import {
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild, pinnedStatus, PINNED_OVERLAY_GONE_MESSAGE } from './plan.mjs';
+import { cloneRuntimeEntries } from '../daemon-clone-entries.mjs';
+import { resolveClosureScopeMode } from './skip-unrelated.mjs';
 import { autoRetireOverlays } from '../daemon-overlay-auto-retire.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
@@ -41,7 +43,7 @@ import {
  * smoke a candidate — see {@link rebuildClone}).
  */
 export async function prepareRebuild({
-  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase,
+  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, entries = [], prBaseChain, prForcePushes, autoRebase = realAutoRebase,
 }) {
   // Tests reaching the hold must opt in before launching a detached repair or cleaning up swaps.
   if (process.env.VITEST === 'true' && env?.WE_DAEMON_AUTO_REBASE === undefined) {
@@ -337,6 +339,8 @@ export async function prepareRebuild({
   // Held item 212 — stacked overlay PRs apply as stacks (only their tops) unless `overlay.stackMode` says independent.
   // The PR base chains come from gh, else from each entry's recorded `stackBases`, else ancestry alone.
   const stack = resolveOverlayStackMode(env);
+  const closureScopeMode = resolveClosureScopeMode(env).mode;
+  const runtimeEntries = () => cloneRuntimeEntries({ root, entries });
   let chainOf;
   let plan;
   const recoveredRefs = new Set();
@@ -346,6 +350,7 @@ export async function prepareRebuild({
     chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysForPlan, env });
     plan = unavailablePinned ?? await planRebuild({
       git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysForPlan, prState, mainOnly, edgeResolve,
+      entries: runtimeEntries, env, closureScopeMode,
       stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
       prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
     });
@@ -592,7 +597,7 @@ export async function prepareRebuild({
         treeOf: (sha) => verifyRev(git, `${sha}^{tree}`),
         stillWanted: (ref) => wantedRefs.has(ref),
         verifyBuilt: (adopt) => readyBuildVerified({
-          git, adopt, mainTip: plan.mainSha, prevHead,
+          git, adopt, mainTip: plan.mainSha, prevHead, entries: runtimeEntries, env,
           approvedEdgeShaFor: (ref) => recordedEdgeSha((overlaysBefore || []).find((o) => o?.ref === ref)),
         }),
         overlayTip: (ref) => verifyRev(git, `refs/remotes/origin/${ref}^{commit}`),

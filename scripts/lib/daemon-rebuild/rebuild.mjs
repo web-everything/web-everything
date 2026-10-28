@@ -70,7 +70,9 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
     if (result.moved === true) {
       if (typeof result.head === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(result.head)) {
         await emitEvent({
-          kind: 'rebuild-adopted', daemon: basename(options.root), detail: { sha: result.head },
+          kind: 'rebuild-adopted', daemon: basename(options.root), detail: { sha: result.head,
+            ...(result.plan?.applied?.some(a => a.resolvedVia === 'closure-scope') ? { resolvedVia: 'closure-scope' } : {}),
+          },
         }, eventOptions);
       }
     } else if (typeof result.reason === 'string' && FAILURE_REASONS.has(result.reason.split(':', 1)[0])) {
@@ -149,7 +151,7 @@ async function rebuildCloneInternal({
     && pendingReady.prevHead === verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
   const startedMs = now();
   const prep = await withWriteLock(root, () => prepareRebuild({
-    root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider,
+    root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider, entries,
   }), readyOnHead ? finalizeLockOpts : admissionLockOpts);
 
   if (prep.ok) {

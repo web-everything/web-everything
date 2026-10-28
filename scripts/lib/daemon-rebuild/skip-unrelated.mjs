@@ -8,6 +8,7 @@
  * The clone is then fast-moved to the target (see `prepareRebuild`) without the ~100-140s smoke.
  * Applies to EVERY daemon that uses daemon-self-sync (drain, review, fix, ...), not only the drain.
  */
+import { cascadePolicy, logCascadeSources } from '../policy-cascade.mjs';
 import { isCodePath } from '../main-staleness.mjs';
 import { closureHits, collectImportClosure } from '../import-closure.mjs';
 import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
@@ -34,6 +35,20 @@ export function resolveSkipUnrelated(env = process.env, { path = daemonRebuildSe
     if (typeof v === 'boolean') return v;
   } catch { /* missing/corrupt file = default */ }
   return true;
+}
+
+/** Standard shadow never auto-graduates: enabling scoped adoption requires an explicit layer. */
+export function resolveClosureScopeMode(env = process.env, { settingsPath = daemonRebuildSettingsPath() } = {}) {
+  let tool;
+  try { tool = JSON.parse(readFileSync(settingsPath, 'utf8')).closureScope; } catch { /* unset */ }
+  const r = cascadePolicy('closureScope', tool, {
+    env, standard: { mode: 'shadow' },
+    envValues: { mode: env?.WE_DAEMON_CLOSURE_SCOPE?.trim() || undefined },
+    valid: { mode: v => ['off', 'shadow', 'on'].includes(v) },
+  });
+  const mode = r.value.mode, source = r.sources.mode;
+  logCascadeSources('closureScope.effective', { value: { mode }, sources: { mode: source } }, { env });
+  return { mode, source };
 }
 
 export const MANIFEST_RE = /(^|\/)(package(-lock)?\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?)$/;
