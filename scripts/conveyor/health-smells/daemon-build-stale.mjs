@@ -8,22 +8,26 @@ import { MINUTE, HOUR } from '../health-watch-core.mjs';
 const DEFAULT_MAX_MS = 2 * HOUR;
 const RECOMMENDATION = 'Inspect the owning daemon rebuild logs and repair its refresh/rebuild path; do not reset the clone by hand.';
 
-const io = {
-  listStates() {
-    const directory = join(homedir(), '.claude', 'daemon-self-sync-state');
+export function createStateLister({ readdir = readdirSync, read = readFileSync, directory = join(homedir(), '.claude', 'daemon-self-sync-state') } = {}) {
+  return () => {
     let names;
     try {
-      names = readdirSync(directory);
+      names = readdir(directory);
     } catch (error) {
       if (error.code === 'ENOENT') return [];
-      throw error;
+      // Fail closed: an unreadable state directory is its own breach, never a thrown (skipped) evaluation.
+      return [{ cloneKey: 'state-directory', raw: null }];
     }
     return names.filter((name) => name.endsWith('.rebuild.json')).map((name) => {
       let raw = null;
-      try { raw = readFileSync(join(directory, name), 'utf8'); } catch { /* Report unreadable state. */ }
+      try { raw = read(join(directory, name), 'utf8'); } catch { /* Report unreadable state. */ }
       return { cloneKey: name.slice(0, -'.rebuild.json'.length), raw };
     });
-  },
+  };
+}
+
+const io = {
+  listStates: createStateLister(),
   mergesSince(sha) {
     const repoRoot = fileURLToPath(new URL('../../../', import.meta.url));
     const output = execFileSync('git', [

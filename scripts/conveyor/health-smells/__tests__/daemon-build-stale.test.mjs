@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import daemonBuildStale, { decide, evaluate } from '../daemon-build-stale.mjs';
+import daemonBuildStale, { createStateLister, decide, evaluate } from '../daemon-build-stale.mjs';
 import { validateSmellShape } from '../../health-smells-shape.mjs';
 
 // Exercise the real registry loader against an in-memory directory listing. Do not
@@ -84,6 +84,15 @@ describe('daemon-build-stale', () => {
     expect(result.summary).toContain('#6014');
     expect(result.summary).not.toContain('#2748');
     expect(result.measure.prs).not.toContain(2748);
+  });
+
+  it('fails closed when the state directory itself cannot be read', async () => {
+    const readdir = () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); };
+    const io = { listStates: createStateLister({ readdir, directory: 'state' }), mergesSince: vi.fn() };
+    const results = await evaluate({}, { now: NOW, io });
+    expect(results).toHaveLength(1);
+    expect(results[0].breach).toBe(true);
+    expect(results[0].summary).toMatch(/state unreadable/i);
   });
 
   it('does not breach when the oldest missing merge is thirty minutes old', async () => {
