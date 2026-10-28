@@ -276,8 +276,7 @@ export function planSafetyNet({ status, firstRedSha = null, failedJobs = null, j
         if (!proof && s.requireProvenFlake) {
           const repeat = s.repeatFailureProof ? repeatProofFor(file, { repeatRuns, latestRunId, touchedFiles, count: s.repeatFailureCount }) : { why: 'repeat proof disabled' };
           if (!repeat.proof) {
-            const detail = repeat.why === 'insufficient distinct failing main runs' ? '' : `; ${repeat.why}`;
-            return none(`not a proven flake: ${job} (no green re-run of the failing commit${detail})`);
+            return none(`not a proven flake: ${job} (no green re-run of the failing commit; ${repeat.why})`);
           }
           proof = repeat.proof;
         }
