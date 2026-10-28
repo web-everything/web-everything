@@ -13,6 +13,7 @@ afterEach(() => vi.unstubAllEnvs());
 const argv = ['--pr=7', '--session=fix-7', '--ref=lane/7-x', '--prompt-file=/p.md', '--provider=codex', '--repo=o/r', '--lane-repo=/w'];
 function mk(heads, { merging: startMerging = false } = {}) {
   const initialHead = heads.shift();
+  let laneHead = initialHead;
   const calls = [];
   let merging = startMerging;
   const run = vi.fn((cmd, args, opts) => {
@@ -22,8 +23,12 @@ function mk(heads, { merging: startMerging = false } = {}) {
     if (args.includes('--absolute-git-dir')) return tmpdir();
     if (args.includes('--git-path')) return merging ? 'MERGE_HEAD' : '';
     if (args.includes('merge')) merging = true;
-    if (args.includes('commit')) merging = false;
-    if (args.includes('--verify') && args.includes('HEAD')) return initialHead;
+    if (args.includes('commit')) {
+      merging = false;
+      laneHead = heads[0] ?? laneHead;
+    }
+    if (args.includes('--verify') && args.includes('HEAD')) return laneHead;
+    if (args.includes('--verify') && args.at(-1) === `${laneHead}^1`) return initialHead;
     if (args[0] === 'rev-parse') return heads.shift();
     return '';
   });
