@@ -80,10 +80,16 @@ export function evaluateEligibility(pr, { scoreNet, redTeamClearAtHead } = {}) {
     evidence: { head, accepted, redTeam: 'clear', shape: { humanRequired: false, files: shape?.files ?? null }, checks: 'pass apart from the review hold' } };
 }
 
-/** Record the clearance through the sanctioned CLI (argv array, no shell). */
-export async function clearHumanViaCli({ pr, reason, actor, repo = null, exec = execFileSync }) {
+/**
+ * Record the clearance through the sanctioned CLI (argv array, no shell). FAILS CLOSED: `review-set-label.mjs`
+ * cannot yet pin `--expect-head` for `--to=clear-human`, so a push between this pass's head read and the CLI's own
+ * read could clear a head this pass never evaluated. Until the CLI gains a head pin (follow-up), the live `on`
+ * mode refuses here; shadow mode never reaches this writer. Tests inject a pinned writer.
+ */
+export async function clearHumanViaCli({ pr, head, reason, actor, repo = null, exec = execFileSync, headPinSupported = false }) {
+  if (!headPinSupported) throw new Error('review-set-label cannot pin the head for clear-human yet; refusing to clear an unpinned head');
   exec(process.execPath, ['scripts/review-set-label.mjs', String(pr), '--to=clear-human', `--actor=${actor}`, `--reason=${reason}`,
-    ...(repo ? [`--repo=${repo}`] : [])], { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024 });
+    `--expect-head=${head}`, ...(repo ? [`--repo=${repo}`] : [])], { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024 });
 }
 
 /** Reads platform preferences + declared settings + env; an unreadable layer is skipped (default stays shadow). */
