@@ -149,9 +149,9 @@ export function mergeRequiredCheckRuns(pr, requiredCheck, stdout) {
  * #xkfv491), but the REST `commits/<sha>/check-runs` feed (`we:scripts/operations/pr-status-io.mjs#checksArgv`)
  * is NEWEST-first, so a positional "last wins" silently kept the OLDEST run there. When EVERY run carries a
  * numeric run `id` (REST rows do — `checksArgv` selects it; GitHub run ids are monotonic by creation), the
- * highest id wins regardless of order. Otherwise (the rollup, which carries no id) the last entry wins, as
- * before. Timestamps are deliberately NOT used: the rollup reports a queued run's `startedAt` as the zero date,
- * which would rank the newest run oldest.
+ * highest id wins regardless of order. Otherwise use timestamps via {@link latestByTime}, preserving the
+ * positional fallback when timestamps are unavailable. In-flight runs outrank completed runs even when their
+ * `startedAt` is the zero date.
  * @param {Array<object>} runs non-empty
  * @returns {object}
  */
@@ -166,7 +166,8 @@ function latestOf(runs) {
  * listed FAILURE@17:27 BEFORE its superseded SUCCESS@17:13, so "last wins" read stale green — the fix daemon saw
  * no red check and owed no ci-heal, while the review dispatch gate, reading REST by run id, saw the real red).
  * A run still in flight (no real `completedAt` — absent or the zero date) is the newest; otherwise the greatest
- * `completedAt` wins, ties broken by position (later wins). Any run with no usable timestamp at all keeps the
+ * `completedAt` wins, falling back to a real `startedAt` for completed runs whose completion timestamp is
+ * unavailable. Ties are broken by position (later wins). Any run with no usable timestamp at all keeps the
  * old positional rule for the whole group.
  */
 function latestByTime(runs) {
@@ -175,6 +176,10 @@ function latestByTime(runs) {
     if (Number.isFinite(done) && done > Date.parse('2000-01-01T00:00:00Z')) return done;
     const status = String(c?.status ?? '').toUpperCase();
     if (status && status !== 'COMPLETED') return Infinity; // queued / in progress: the newest run
+    if (status === 'COMPLETED') {
+      const started = Date.parse(c?.startedAt);
+      if (Number.isFinite(started) && started > Date.parse('2000-01-01T00:00:00Z')) return started;
+    }
     return null;
   };
   const stamps = runs.map(stamp);
