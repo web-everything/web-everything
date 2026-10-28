@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { resolveHumanReviewSurfaces } from '../../lib/human-review-surfaces.mjs';
+import * as judgeSweepFacts from '../judge-sweep-facts.mjs';
 import { buildJudgeSweepBundle, finishJudgeSweep, judgeSweepFactsOperation, needsJudgment, JUDGE_SWEEP_REPO } from '../judge-sweep-facts.mjs';
 import { createJudgeSweepFactsReader, createShapeCache, operatorGh } from '../judge-sweep-facts-io.mjs';
 import { resolveOperation } from '../run.mjs';
@@ -120,6 +121,149 @@ describe('deterministic first-match judge classification', () => {
   });
 });
 
+// Keep facts() historical: new observations are opt-in so old callers exercise absent fields.
+const stallDefaults = { fixerInfraLoop: 3, needsHumanAgedHours: 6, draftWithdrawnAgedHours: 4, waitingFixerMinutes: 45 };
+const judgmentReason = (patch, id, thresholds) => {
+  expect(needsJudgment(facts(patch), thresholds)).toEqual({
+    needsJudgment: true, reason: expect.stringMatching(new RegExp(`^${id}`)),
+  });
+};
+
+describe('stall judgment reasons and compatibility', () => {
+  it.each([
+    ['idle', {}], ['recent fix loop', { minutesSinceFixLoop: 5 }],
+    ['fixer running', { fixerRunning: true }], ['in CI', { inCi: true }],
+    ['at cap', { round: 5 }],
+    ['all active at cap', { minutesSinceFixLoop: 5, fixerRunning: true, inCi: true, round: 5 }],
+  ])('prioritizes fixer-infra-loop over %s', (_name, activity) => {
+    judgmentReason({ ...activity, infraFailStreak: 3 }, 'fixer-infra-loop');
+    judgmentReason({ ...activity, infraFailStreak: 4 }, 'fixer-infra-loop');
+    expect(needsJudgment(facts({ ...activity, infraFailStreak: 2 }))).toEqual(needsJudgment(facts(activity)));
+  });
+  it.each(['review-status:needs-human', 'status:needs-human'])('ages %s by head time, falling back to update time', label => {
+    judgmentReason({ labels: [label], minutesSinceHeadChange: 361 }, 'needs-human-aged');
+    judgmentReason({ labels: [label], minutesSinceHeadChange: null, minutesSinceUpdate: 361 }, 'needs-human-aged');
+    judgmentReason({ labels: [label], minutesSinceUpdate: 361 }, 'needs-human-aged');
+    for (const minutesSinceHeadChange of [0, 360]) {
+      expect(needsJudgment(facts({ labels: [label], minutesSinceHeadChange, minutesSinceUpdate: 900, owner: 'alice' })))
+        .toEqual({ needsJudgment: false, reason: 'owner present' });
+    }
+  });
+  it('uses needs-human-aged only with readable evidence and keeps evidence-unavailable first otherwise', () => {
+    const aged = { labels: ['status:needs-human'], minutesSinceHeadChange: 361 };
+    judgmentReason({ ...aged, evidenceErrors: [] }, 'needs-human-aged');
+    expect(needsJudgment(facts({ ...aged, evidenceErrors: ['comments unreadable'] }))).toEqual({
+      needsJudgment: true, reason: 'evidence-unavailable: inspect PR evidence and rerun',
+    });
+    expect(needsJudgment(facts({ infraFailStreak: 3, evidenceErrors: ['ledger unreadable'] }))).toEqual({
+      needsJudgment: true, reason: 'evidence-unavailable: inspect PR evidence and rerun',
+    });
+  });
+  it.each([{ isDraft: true }, { labels: ['review-status:draft-withdrawn'] }])('ages withdrawn drafts: %j', draft => {
+    judgmentReason({ ...draft, minutesSinceHeadChange: 241 }, 'draft-withdrawn-aged');
+    judgmentReason({ ...draft, minutesSinceHeadChange: null, minutesSinceUpdate: 241 }, 'draft-withdrawn-aged');
+    for (const minutesSinceHeadChange of [0, 240]) {
+      expect(needsJudgment(facts({ ...draft, minutesSinceHeadChange, minutesSinceUpdate: 900, owner: 'alice' })))
+        .toEqual({ needsJudgment: false, reason: 'owner present' });
+    }
+  });
+  it('does not age a nondraft or an unlabelled PR', () => {
+    expect(needsJudgment(facts({ isDraft: false, minutesSinceHeadChange: 900 })))
+      .toEqual({ needsJudgment: false, reason: 'waiting on review' });
+  });
+  it.each(['status:answered-waiting-fixer', 'review:changes'])('detects %s without a recent dispatch', label => {
+    for (const minutesSinceFixDispatch of [null, 46]) {
+      judgmentReason({ labels: [label], minutesSinceFixDispatch }, 'waiting-fixer-not-dispatched');
+    }
+    for (const minutesSinceFixDispatch of [0, 45]) {
+      expect(needsJudgment(facts({ labels: [label], minutesSinceFixDispatch })))
+        .toEqual(needsJudgment(facts({ labels: [label] })));
+    }
+    expect(needsJudgment(facts({ labels: [label], minutesSinceFixDispatch: null, fixerRunning: true })))
+      .toEqual({ needsJudgment: false, reason: 'fixer running' });
+    expect(needsJudgment(facts({ labels: [label], minutesSinceFixDispatch: null, fixerRunning: null })).reason)
+      .not.toMatch(/^waiting-fixer-not-dispatched/);
+  });
+  it('uses supplied thresholds for each new reason', () => {
+    const thresholds = { fixerInfraLoop: 5, needsHumanAgedHours: 8, draftWithdrawnAgedHours: 7, waitingFixerMinutes: 90 };
+    const cases = [
+      ['fixer-infra-loop', { infraFailStreak: 4 }, { infraFailStreak: 5 }],
+      ['needs-human-aged', { labels: ['status:needs-human'], minutesSinceHeadChange: 480 },
+        { labels: ['status:needs-human'], minutesSinceHeadChange: 481 }],
+      ['draft-withdrawn-aged', { isDraft: true, minutesSinceHeadChange: 420 }, { isDraft: true, minutesSinceHeadChange: 421 }],
+      ['waiting-fixer-not-dispatched', { labels: ['review:changes'], minutesSinceFixDispatch: 90 },
+        { labels: ['review:changes'], minutesSinceFixDispatch: 91 }],
+    ];
+    for (const [id, below, above] of cases) {
+      expect(needsJudgment(facts(below), thresholds).reason).not.toMatch(new RegExp(`^${id}`));
+      judgmentReason(above, id, thresholds);
+    }
+  });
+  it.each([
+    { round: 5 }, { round: 6 }, { labels: ['status:round-limit'] }, { labels: ['status:cap-exhausted'] },
+  ])('does not classify accepted or merge-ready PRs as at-cap: %j', cap => {
+    const capLabels = cap.labels ?? [];
+    for (const labels of [['ready-to-merge'], ['review:accepted', 'ready-to-merge']]) {
+      expect(needsJudgment(facts({ ...cap, labels: [...capLabels, ...labels] })))
+        .toEqual({ needsJudgment: false, reason: 'awaiting-merge' });
+    }
+    judgmentReason({ ...cap, labels: [...capLabels, 'review:accepted', 'review:human'] }, 'awaiting-operator');
+    expect(needsJudgment(facts(cap))).toEqual({ needsJudgment: true, reason: 'at-cap' });
+  });
+  it('pins historical bundle rows and results when all new observations are absent or null', () => {
+    const old = [facts({ round: 5 }), facts({ number: 2, inCi: true }), facts({ number: 3, labels: ['review:changes'] })];
+    const expectedRows = [
+      { number: 1, round: 5, needsJudgment: true, reason: 'at-cap' },
+      { number: 2, round: 1, needsJudgment: false, reason: 'in CI' },
+      { number: 3, round: 1, needsJudgment: false, reason: 'waiting for fixes' },
+    ].map(row => ({ title: 'fixture', labels: row.number === 3 ? ['review:changes'] : [], headSha: SHA, cap: 5,
+      redTeam: { state: 'unknown', latestResultId: null, latestOutcome: null }, latestVerdict: null,
+      openReferrals: [], openSendBacks: [], lastFixLoop: null, humanRequired: null,
+      minutesSinceUpdate: 1, evidenceErrors: [], ...row }));
+    expect(buildJudgeSweepBundle({ generatedAt: at(0), elapsedMs: 12, prs: old })).toEqual({
+      generatedAt: at(0), elapsedMs: 12, counts: { needsJudgment: 1, noAction: 2 }, prs: expectedRows,
+    });
+    for (const row of old) {
+      expect(needsJudgment({ ...row, infraFailStreak: null, isDraft: null,
+        minutesSinceHeadChange: null })).toEqual(needsJudgment(row));
+    }
+  });
+  it('retains old bundle fields alongside new observations and updated counts', () => {
+    const observation = { infraFailStreak: 3, isDraft: false, minutesSinceHeadChange: 30, minutesSinceFixDispatch: 5 };
+    const input = facts({ ...observation, minutesSinceFixLoop: 5, verdictHistory: [], ignoredFindingReturned: false });
+    const { fixerRunning, inCi, owner, verdictHistory, ignoredFindingReturned, ...publicFacts } = input;
+    const bundle = buildJudgeSweepBundle({ generatedAt: at(0), elapsedMs: 12, prs: [input] });
+    expect(bundle).toEqual({ generatedAt: at(0), elapsedMs: 12, counts: { needsJudgment: 1, noAction: 0 },
+      prs: [{ ...publicFacts, needsJudgment: true, reason: expect.stringMatching(/^fixer-infra-loop/) }] });
+  });
+});
+
+describe('stall threshold policy cascade (injected IO only)', () => {
+  const resolve = (tool, env = {}, platform = null) => judgeSweepFacts.resolveStallThresholds({
+    env, platform, readFile: () => JSON.stringify({ judgeSweepStall: tool }),
+  });
+  it('exports a resolver with the standard defaults', () => {
+    expect(judgeSweepFacts.resolveStallThresholds).toBeTypeOf('function');
+    expect(resolve(undefined)).toMatchObject(stallDefaults);
+  });
+  it('resolves standard then platform then tool then the JSON environment override', () => {
+    const platform = { fixerInfraLoop: 4, needsHumanAgedHours: 7, draftWithdrawnAgedHours: 5, waitingFixerMinutes: 60 };
+    const tool = { fixerInfraLoop: 5, needsHumanAgedHours: 8, draftWithdrawnAgedHours: 6, waitingFixerMinutes: 75 };
+    const envValue = { fixerInfraLoop: 6, needsHumanAgedHours: 9, draftWithdrawnAgedHours: 7, waitingFixerMinutes: 90 };
+    expect(resolve(undefined, {}, platform)).toMatchObject(platform);
+    expect(resolve(tool, {}, platform)).toMatchObject(tool);
+    expect(resolve(tool, { WE_JUDGE_SWEEP_STALL: JSON.stringify(envValue) }, platform)).toMatchObject(envValue);
+  });
+  it.each(['{bad json', 'null', '[]', JSON.stringify({ fixerInfraLoop: -1, needsHumanAgedHours: 'six',
+    draftWithdrawnAgedHours: -4, waitingFixerMinutes: null })])('falls through invalid env values to defaults: %s', raw => {
+    expect(resolve(undefined, { WE_JUDGE_SWEEP_STALL: raw })).toMatchObject(stallDefaults);
+  });
+  it('falls through unreadable settings with an empty environment to standard defaults', () => {
+    expect(judgeSweepFacts.resolveStallThresholds({ env: {}, platform: null,
+      readFile: () => { throw new Error('unreadable'); } })).toMatchObject(stallDefaults);
+  });
+});
+
 describe('injected reader and shared evidence readers', () => {
   it('lists once, includes every PR, and reads comments for in-flight first-round PRs', () => {
     const f = fixture({ gh: vi.fn(() => JSON.stringify([pr({ statusCheckRollup: [{ name: 'test', status: 'IN_PROGRESS' }] }), pr({ number: 2 })])),
@@ -133,6 +277,66 @@ describe('injected reader and shared evidence readers', () => {
     const args = f.gh.mock.calls[0][0];
     expect(args.slice(0, 2)).toEqual(['pr', 'list']);
     for (const field of ['labels', 'headRefOid', 'baseRefOid', 'updatedAt', 'files', 'author']) expect(args.at(-1)).toContain(field);
+  });
+  it('retries a thrown comment read once and clears evidence errors after success', () => {
+    const readComments = vi.fn().mockImplementationOnce(() => { throw new Error('transient'); })
+      .mockReturnValueOnce([]);
+    const f = fixture({ readComments });
+    const row = f.read().prs[0];
+    expect(readComments).toHaveBeenCalledTimes(2);
+    expect(readComments.mock.calls[1][0]).toEqual(readComments.mock.calls[0][0]);
+    expect(row.evidenceErrors).toEqual([]);
+    expect(needsJudgment(row)).toEqual({ needsJudgment: false, reason: 'waiting on review' });
+  });
+  it.each([true, false])('reads draft state and the latest listed commit time (draft=%s)', isDraft => {
+    const gh = vi.fn(() => JSON.stringify([pr({ isDraft, updatedAt: at(1),
+      commits: [{ oid: OLD, committedDate: at(500) }, { oid: SHA, committedDate: at(241) }] })]));
+    const f = fixture({ gh });
+    expect(f.read().prs[0]).toMatchObject({ isDraft, minutesSinceHeadChange: 241, minutesSinceUpdate: 1 });
+    expect(gh.mock.calls[0][0].at(-1)).toContain('isDraft');
+    expect(gh.mock.calls[0][0].at(-1)).toContain('commits');
+  });
+  it('reports unknown head age and no dispatch as null when listing commits and fix rows are absent', () => {
+    expect(fixture().read().prs[0]).toMatchObject({ minutesSinceHeadChange: null, minutesSinceFixDispatch: null });
+  });
+  const fixRow = (minutes, patch = {}) => ({ repo: 'we', pr: 1, head: SHA, kind: 'outcome',
+    outcome: 'failed', infra: true, session: `fixture-${minutes}`, at: at(minutes), ...patch });
+  it('counts three trailing infra failures for this head, ignoring dispatches and unrelated rows', () => {
+    const rows = [fixRow(10), fixRow(30), fixRow(20),
+      fixRow(1, { repo: 'frontierui' }), fixRow(2, { pr: 2 }), fixRow(3, { head: OLD }),
+      fixRow(4, { kind: 'fix', outcome: undefined, infra: undefined }),
+      fixRow(40, { outcome: 'pushed', infra: false })];
+    const row = fixture({ readFixRows: () => rows }).read().prs[0];
+    expect(row).toMatchObject({ infraFailStreak: 3, minutesSinceFixDispatch: 4 });
+    judgmentReason(row, 'fixer-infra-loop');
+  });
+  it('resets the infra failure streak on a pushed outcome and starts counting anew', () => {
+    const rows = [fixRow(30), fixRow(20), fixRow(10)];
+    const f = fixture({ readFixRows: () => rows });
+    expect(f.read().prs[0].infraFailStreak).toBe(3);
+    rows.push(fixRow(5, { outcome: 'pushed', infra: false }));
+    expect(f.read().prs[0].infraFailStreak).toBe(0);
+    rows.push(fixRow(1));
+    expect(f.read().prs[0].infraFailStreak).toBe(1);
+  });
+  it('counts failed lease reasons case-insensitively when infra is not true', () => {
+    const row = fixture({ readFixRows: () => [fixRow(3, { infra: false, reason: 'LEASE unavailable' }),
+      fixRow(2, { infra: undefined, reason: 'lease busy' }), fixRow(1)] }).read().prs[0];
+    expect(row.infraFailStreak).toBe(3);
+  });
+  it.each([
+    { outcome: 'no-change', infra: false },
+    { outcome: 'failed', infra: false, reason: 'unit tests failed' },
+    { outcome: 'pushed', infra: false, reason: 'lease recovered' },
+  ])('stops counting consecutive infra failures at %j', reset => {
+    const row = fixture({ readFixRows: () => [fixRow(40), fixRow(30), fixRow(20, reset), fixRow(10)] }).read().prs[0];
+    expect(row.infraFailStreak).toBe(1);
+  });
+  it.each(['ci-heal', 'fix', 'rearm'])('ages the newest %s dispatch for the PR, ignoring newer outcomes', kind => {
+    const row = fixture({ readFixRows: () => [fixRow(80, { kind: 'fix' }),
+      fixRow(46, { kind, head: OLD }), fixRow(1, { outcome: 'pushed', infra: false }),
+      fixRow(2, { kind, repo: 'frontierui' }), fixRow(3, { kind, pr: 2 })] }).read().prs[0];
+    expect(row.minutesSinceFixDispatch).toBe(46);
   });
   it('uses ledger rounds instead of a label guess and retains the latest fix-loop outcome', () => {
     const f = fixture({ readLedgerRows: () => ['b', 'c', 'd', 'e'].map(h => ({ repo: REPO, pr: 1, type: 'review-run', headSha: h.repeat(40), at: at(20) })),
@@ -221,14 +425,14 @@ describe('injected reader and shared evidence readers', () => {
       expect(readComments).toHaveBeenCalledTimes(1);
       expect(gh).toHaveBeenCalledTimes(1);
     });
-  it('fails closed when an in-flight referral comment read fails', () => {
+  it('fails closed after exactly two failed in-flight referral comment reads', () => {
     const readComments = vi.fn(() => { throw new Error('offline'); });
     const f = fixture({ gh: () => JSON.stringify([pr({
       statusCheckRollup: [{ name: 'test', status: 'IN_PROGRESS' }] })]), readComments });
     expect(buildJudgeSweepBundle(f.read()).prs[0]).toMatchObject({ needsJudgment: true,
       reason: 'evidence-unavailable: inspect PR evidence and rerun',
       evidenceErrors: ['comment evidence unreadable or budget exhausted'] });
-    expect(readComments).toHaveBeenCalledTimes(1);
+    expect(readComments).toHaveBeenCalledTimes(2);
   });
   it('fails closed on malformed markers, a failed comment read, and unavailable process evidence', () => {
     for (const overrides of [
