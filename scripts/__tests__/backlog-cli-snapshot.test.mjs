@@ -44,6 +44,8 @@ beforeAll(() => {
   // import.meta.url) resolves inside the throwaway clone, not the real repo — the mutation genuinely
   // lands only in `clone/backlog/*`, never touches this lane's real `backlog/`.
   cpSync(WE_SCRIPTS_DIR, join(clone, 'scripts'), { recursive: true, filter: skipTestDirs });
+  cpSync(join(dirname(WE_SCRIPTS_DIR), 'skills-src/conveyor/daemon-manifest.mjs'),
+    join(clone, 'skills-src/conveyor/daemon-manifest.mjs'));
   // Copied CLI imports need installed packages while their ROOT stays inside this fixture.
   symlinkSync(join(dirname(WE_SCRIPTS_DIR), 'node_modules'), join(clone, 'node_modules'), 'dir');
   // `claim`/`resolve`/etc unconditionally re-save reservations/claims state alongside the frontmatter
@@ -475,6 +477,8 @@ describe('backlog.mjs CLI — overlap-yield-config (#4308)', () => {
   it('refuses to mutate the config from a primary checkout (lane-guard), file untouched', () => {
     const primary = join(clone, 'ws', 'webeverything');
     mkdirSync(primary, { recursive: true });
+    cpSync(join(clone, 'skills-src/conveyor/daemon-manifest.mjs'),
+      join(primary, 'skills-src/conveyor/daemon-manifest.mjs'));
     renameSync(join(clone, 'scripts'), join(primary, 'scripts'));
     try {
       const cfg = join(primary, 'scripts', 'drain-overlap-yield-config.json');
