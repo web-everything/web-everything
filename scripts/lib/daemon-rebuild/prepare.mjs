@@ -590,8 +590,13 @@ export async function prepareRebuild({
   for (const d of plan.decisions) {
     if (d.pr != null && (d.action === 'apply' || d.action === 'remove') && !d.pinned) clearOverlayConflictWake(env, d.pr);
     if (d.action === 'remove') {
-      try { removeOverlay(root, d.ref, { env, why: d.reason, expectRegistrationId: snap.get(d.ref) }); }
-      catch (error) {
+      try {
+        const removed = removeOverlay(root, d.ref, { env, why: d.reason, expectRegistrationId: snap.get(d.ref) });
+        if (removed.removed) {
+          ourRemoved.add(d.ref); snap.delete(d.ref);
+          for (const ref of removed.reinstated ?? []) ourRestored.set(ref, removed.list.find((o) => o.ref === ref)?.registrationId);
+        }
+      } catch (error) {
         if (!/registration changed/.test(String(error?.message))) throw error;
         alert('overlay-registration-changed', {});
         continue;
