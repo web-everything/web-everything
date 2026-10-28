@@ -428,7 +428,15 @@ async function executeTimedPass({ passName, repo, entry }, ports) {
     record = store.read(id);
     if (record.job.passResult) return record.job.passResult;
     const deadline = taskDeadlineDecision(record, { now: now() });
+    const awaitingClaim = !childResult && record.job.status === 'launching' && !record.job.handle;
     if (deadline?.expired) {
+      if (awaitingClaim) {
+        // The launcher may already have a child and still be reading its start
+        // identity. Keep its claim and result untouched so a late claim still
+        // enforces this deadline; an absent handle is not proof of death.
+        alert({ passName, repo, id, reason: 'Pass deadline expired before its handle was recorded; operator must inspect the retained launch' });
+        return { outcome: 'quarantined' };
+      }
       // Scope recovery to this pass: an unrelated slow stop cannot hold up its siblings.
       const scopedStore = { ...store, list: () => ({ records: [store.read(id)], corrupt: [] }) };
       const recovery = await reattachTick({ store: scopedStore, kinds: new Map([[kindDef.kind, kindDef]]),
@@ -449,7 +457,7 @@ async function executeTimedPass({ passName, repo, entry }, ports) {
     if (TERMINAL_JOB_STATUSES.includes(record.job.status)) return finish({ code: null, signal: null,
       spawnError: record.job.error ?? 'pass exited without a recorded result' }, 'failed');
     // Reattached owners have no local ChildProcess; judge them through shared recovery.
-    if (!childResult && observeOwner(record.job.handle) !== 'alive') {
+    if (!childResult && !awaitingClaim && observeOwner(record.job.handle) !== 'alive') {
       const quarantine = !confirmGroupGone(record.job.handle);
       return finish(quarantine ? { outcome: 'quarantined' } : { code: null, signal: null,
         spawnError: 'pass owner exited without a recorded result' }, quarantine ? 'quarantined' : 'failed', quarantine);

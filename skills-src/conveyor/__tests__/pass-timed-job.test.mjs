@@ -100,6 +100,36 @@ function timingLines(f) {
 }
 
 describe('#5755 independent timed pass jobs', () => {
+  it.each([false, true])('keeps deadline ownership across reattachment before claim (expired=%s)', async expired => {
+    const f = fixture();
+    const pass = descriptor('launch-race');
+    let reattached;
+    let duringLaunch;
+    const pending = runPassAsTimedJob(pass, {
+      ...f.ports,
+      readStart: () => {
+        if (expired) vi.setSystemTime(Date.now() + 101);
+        // The launch has spawned but has not published its handle. Re-enter before
+        // activePasses is populated, as an independent adapter process would.
+        reattached = runPassAsTimedJob(pass, { ...f.ports, store: createJobStore(f.store.dir) });
+        duringLaunch = f.store.list().records[0].job;
+        return 'fixture-start';
+      },
+    });
+    expect(duringLaunch).toMatchObject({ status: 'launching', handle: null });
+    expect(duringLaunch.passResult).toBeUndefined();
+    expect(duringLaunch.passQuarantine).toBeUndefined();
+    expect(f.alerts).toHaveLength(expired ? 1 : 0);
+    await vi.advanceTimersByTimeAsync(150);
+    await expect(pending).resolves.toEqual({ outcome: 'timeout' });
+    expect(f.children[0].state).toBe('dead');
+    expect(f.signals).toContainEqual({ pid: -f.children[0].pid, signal: 'SIGKILL' });
+    expect(f.spawnFn).toHaveBeenCalledTimes(1);
+    await expect(reattached).resolves.toMatchObject({ outcome: expired ? 'quarantined' : 'timeout' });
+    expect(f.store.list().records[0].job).toMatchObject({ passResult: { outcome: 'timeout' }, handle: null });
+    expect(timingLines(f)).toEqual([expect.objectContaining({ outcome: 'timeout' })]);
+  });
+
   it.each([0, 7])('confirms the process group gone before completing child exit %s', async code => {
     const f = fixture();
     const reapGroup = vi.fn(() => true);
