@@ -263,37 +263,42 @@ export function sweepDelegatedClearance({ prs, repo = null, dryRun = false, sett
       if (c.approval && c.broken.length) { publish('pre-approval-void'); results.push({ num: c.num, delegated: 'pre-approval-void', detail: basis }); continue; }
       // A void belongs to the ruling and survives every subsequent head.
       if ((c.approval && state.memo[voidKey(c.approval)]) || state.memo[`${key}:attempt`]) continue;
-      const files = filesValid(readNetFiles({ repo, ...c }));
-      const scored = shape(files);
-      if (typeof scored?.humanRequired !== 'boolean') throw new Error('shape incomplete; human review required');
-      if (!c.approval && scored.humanRequired) continue;
-      if (c.approval) {
-        const approvedHead = c.approval.approvedHead ?? state.observed[observedKey(c.approval)];
-        if (!sha(approvedHead)) throw new Error('approved head unknown; human review required');
-        if (approvedHead !== c.head && (c.approval.conditions.allowedHeadMove !== 'card-only'
-          || !filesValid(readMovedFiles({ repo, ...c, approvedHead }), true).every(f => /^backlog\/[^/]+\.md$/.test(f)))) continue;
+      // One candidate's unreadable or oversized evidence refuses only that candidate; the rest of the batch still runs.
+      try {
+        const files = filesValid(readNetFiles({ repo, ...c }));
+        const scored = shape(files);
+        if (typeof scored?.humanRequired !== 'boolean') throw new Error('shape incomplete; human review required');
+        if (!c.approval && scored.humanRequired) continue;
+        if (c.approval) {
+          const approvedHead = c.approval.approvedHead ?? state.observed[observedKey(c.approval)];
+          if (!sha(approvedHead)) throw new Error('approved head unknown; human review required');
+          if (approvedHead !== c.head && (c.approval.conditions.allowedHeadMove !== 'card-only'
+            || !filesValid(readMovedFiles({ repo, ...c, approvedHead }), true).every(f => /^backlog\/[^/]+\.md$/.test(f)))) continue;
+        }
+        if (dryRun) { results.push({ num: c.num, delegated: 'would-try', detail: basis }); continue; }
+        if (shadow) { publish('would-approve'); results.push({ num: c.num, delegated: 'would-approve', detail: basis }); continue; }
+        const reason = `${basis}: operator R130 "Ok"${c.approval ? `; ${c.approval.rulingId}: ${c.approval.operatorQuote}` : ''}`;
+        const body = `${reason}\n\nNet files (git main three-dot head):\n${JSON.stringify(files)}\n\nShape: ${JSON.stringify(scored)}\n\nHead: ${c.head}`;
+        const args = ['--to=clear-human', '--actor=daemon-delegate-R130', '--channel=daemon', `--expect-head=${c.head}`,
+          `--reason=${reason}`, `--delegation-json=${JSON.stringify({ by: 'operator R130', scope: `${basis} PR ${c.num} head ${c.head}`, expires: new Date(now() + 300000).toISOString() })}`];
+        const fresh = readPr({ repo, number: c.num, readComments });
+        const replanned = planDelegatedClearance([fresh], { repo, preApprovals: approvals })[0];
+        if (replanned?.broken.length && c.approval) publish('pre-approval-void');
+        const before = complete.find(p => p.number === c.num);
+        const gates = p => JSON.stringify([names(p).sort(), p.mergeable, p.isDraft === true,
+          p.statusCheckRollup?.map(ch => JSON.stringify(ch)).sort()]);
+        if (!replanned || replanned.broken.length || fresh.headRefOid !== c.head || gates(fresh) !== gates(before)) {
+          results.push({ num: c.num, delegated: 'aborted', detail: 'live clearance evidence changed or incomplete; retry next tick or request operator review' });
+          continue;
+        }
+        state.memo[`${key}:attempt`] = true; writeState(state);
+        let r;
+        try { r = runLabel({ repo, ...c, args, body }); } catch (e) { r = { ok: false, detail: String(e.message) }; }
+        publish(r?.ok === true ? 'auto-approved' : 'approval-refused');
+        results.push({ num: c.num, delegated: r?.ok === true ? 'auto-approved' : 'refused', detail: r?.detail ?? 'CLI refused; operator intervention required' });
+      } catch (e) {
+        results.push({ num: c.num, delegated: 'sweep-failed', detail: `${String(e?.message ?? e).replace(/[\x00-\x1f]/g, ' ').slice(0, 450)}; operator review required` });
       }
-      if (dryRun) { results.push({ num: c.num, delegated: 'would-try', detail: basis }); continue; }
-      if (shadow) { publish('would-approve'); results.push({ num: c.num, delegated: 'would-approve', detail: basis }); continue; }
-      const reason = `${basis}: operator R130 "Ok"${c.approval ? `; ${c.approval.rulingId}: ${c.approval.operatorQuote}` : ''}`;
-      const body = `${reason}\n\nNet files (git main three-dot head):\n${JSON.stringify(files)}\n\nShape: ${JSON.stringify(scored)}\n\nHead: ${c.head}`;
-      const args = ['--to=clear-human', '--actor=daemon-delegate-R130', '--channel=daemon', `--expect-head=${c.head}`,
-        `--reason=${reason}`, `--delegation-json=${JSON.stringify({ by: 'operator R130', scope: `${basis} PR ${c.num} head ${c.head}`, expires: new Date(now() + 300000).toISOString() })}`];
-      const fresh = readPr({ repo, number: c.num, readComments });
-      const replanned = planDelegatedClearance([fresh], { repo, preApprovals: approvals })[0];
-      if (replanned?.broken.length && c.approval) publish('pre-approval-void');
-      const before = complete.find(p => p.number === c.num);
-      const gates = p => JSON.stringify([names(p).sort(), p.mergeable, p.isDraft === true,
-        p.statusCheckRollup?.map(ch => JSON.stringify(ch)).sort()]);
-      if (!replanned || replanned.broken.length || fresh.headRefOid !== c.head || gates(fresh) !== gates(before)) {
-        results.push({ num: c.num, delegated: 'aborted', detail: 'live clearance evidence changed or incomplete; retry next tick or request operator review' });
-        continue;
-      }
-      state.memo[`${key}:attempt`] = true; writeState(state);
-      let r;
-      try { r = runLabel({ repo, ...c, args, body }); } catch (e) { r = { ok: false, detail: String(e.message) }; }
-      publish(r?.ok === true ? 'auto-approved' : 'approval-refused');
-      results.push({ num: c.num, delegated: r?.ok === true ? 'auto-approved' : 'refused', detail: r?.detail ?? 'CLI refused; operator intervention required' });
     }
   } catch (e) { results.push({ num: 0, delegated: 'sweep-failed', detail: String(e?.message ?? e).replace(/[\x00-\x1f]/g, ' ').slice(0, 500) }); }
   return results;

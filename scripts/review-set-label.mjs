@@ -2074,6 +2074,9 @@ export function runReviewLabelCli({
             at: appended.record?.at ?? new Date().toISOString(),
             approval: approvalKind,
             delegation: approvalDelegation,
+            // Bind the approval to the head it was granted for: a row appended after a push must never
+            // release a hold on the new head (holds/verdict.mjs#approvalReleases).
+            headSha,
             declaredActor: actor,
             session: clearerId,
             channel: normalizeChannel(channelArg),
@@ -2267,12 +2270,13 @@ export function runReviewLabelCli({
   // (Comment-first order needs no extra read: the swap's own fresh read already follows the comment.)
   // The re-park re-reads after its own write too, so at least one side sees the other.
   if (to === 'clear-human' && acceptanceAlreadyLive) {
-    const result = reassertHumanClearance({ provider, repo, pr, headSha,
+    // Clearance is already durable. Recovery warns on read/head failures and performs no further swap;
+    // a same-head eligibility or delegation-expiry refusal still exits before any reassertion write.
+    reassertHumanClearance({ provider, repo, pr, headSha,
       assertEligible: labels => {
         assertGuardedClearHumanEligible(labels);
         assertDelegationCurrent();
       } });
-    if (guardedClearHuman && result.error) fail('delegated clearance refused: post-clearance re-check failed; operator review required', 1);
   }
   delegatedLedgerStarted = false;
 

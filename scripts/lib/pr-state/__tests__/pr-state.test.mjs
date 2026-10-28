@@ -95,7 +95,7 @@ describe('hold rules', () => {
     expect(state([added, verdict(VERDICTS.ACCEPTED, 9)], facts()).holds).toEqual([]);
   });
   it('an approval lifts a human hold unless its delegation expired', () => {
-    const approval = d => ev('approval', 5, { approval: 'judge', delegation: d });
+    const approval = d => ev('approval', 5, { approval: 'judge', delegation: d, headSha: H1 });
     const human = verdict(VERDICTS.HUMAN, 1);
     expect(state([human, approval(null)], facts()).lifecycleState).toBe('READY-TO-MERGE');
     const expired = { by: 'op', scope: 'pr', expires: at(10) };
@@ -180,7 +180,7 @@ describe('replays: no ruling needed', () => {
 });
 
 describe('fail closed: every hold rule defaults to deny (review of PR #4326)', () => {
-  const approval = (m, d) => ev('approval', m, { approval: 'judge', delegation: d });
+  const approval = (m, d, headSha = H1) => ev('approval', m, { approval: 'judge', delegation: d, headSha });
   const expired = { by: 'op', scope: 'pr', expires: at(10) };
   const live10 = { by: 'op', scope: 'pr', expires: at(600) };
   const held = out => expect(out.lifecycleState).toBe('NEEDS-OPERATOR');
@@ -202,6 +202,18 @@ describe('fail closed: every hold rule defaults to deny (review of PR #4326)', (
     it('an approval that PRECEDES the human verdict lifts nothing', () => {
       held(state([approval(0, null), verdict(VERDICTS.HUMAN, 1)], facts()));
     });
+    // PR #5983 red-team: a headless approval row appended after the PR moved to head B must not release B's hold.
+    it.each([['verdict-based human hold', [verdict(VERDICTS.HUMAN, 1, H2)]],
+      ['hand-added human label', [verdict(VERDICTS.ACCEPTED, 1, H2), ev('label-input', 4, { label: 'review:human', sender: 'someone', change: 'added' })]]])(
+      '%s: an approval granted for head A never releases the hold on head B', (_n, base) => {
+        const onB = facts({ now: at(60), head: { sha: H2, committedAt: at(3) } });
+        held(state([...base, approval(5, live10, H1)], onB));
+        held(state([...base, approval(5, null, H1)], onB));
+        held(state([...base, approval(5, live10, null)], onB)); // delegated and headless: releases nothing
+        held(state([...base, approval(5, live10, H2)], facts({ now: at(60), head: undefined })));
+        expect(state([...base, approval(5, live10, H2)], onB).lifecycleState).toBe('READY-TO-MERGE');
+        expect(state([...base, approval(5, null, null)], onB).lifecycleState).toBe('READY-TO-MERGE'); // legacy, non-delegated
+      });
   });
 
   describe('a clearing verdict lifts a hand-added hold only if it covers the current head', () => {

@@ -15,8 +15,19 @@ export function approvalValid(e, now) {
   return Number.isFinite(expires) && Number.isFinite(at) && expires > at;
 }
 
-/** Does a later, valid approval exist after position `from` in `events`? An unknown position (-1) answers no. */
-export const approvalLiftsAfter = (events, from, now) => from >= 0 && events.slice(from + 1).some(e => approvalValid(e, now));
+/**
+ * Does approval row `e` release a hold on `head`? It must be valid ({@link approvalValid}) and bound to `head`: a
+ * row carrying a head releases only that head, and a delegated row without a head releases nothing (default deny).
+ * Only a legacy, non-delegated row without a head keeps its old head-free meaning.
+ */
+export function approvalReleases(e, now, head) {
+  if (!approvalValid(e, now)) return false;
+  if (e.headSha == null || e.headSha === '') return !e.delegation;
+  return sameHead(e.headSha, head);
+}
+
+/** Does a later approval releasing `head` exist after position `from` in `events`? An unknown position (-1) answers no. */
+export const approvalLiftsAfter = (events, from, now, head) => from >= 0 && events.slice(from + 1).some(e => approvalReleases(e, now, head));
 
 /**
  * Does a clearing verdict row still cover `head`? THE one coverage predicate (the verdict rule and the label-input

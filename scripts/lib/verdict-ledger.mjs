@@ -601,6 +601,9 @@ const EVENT_PAYLOAD = Object.freeze({
   [EVENT_TYPES.APPROVAL]: [
     ['approval', oneOf(APPROVAL_KINDS), (v) => v],
     ['delegation', (v) => delegationOrNull(v) !== undefined, delegationOrNull],
+    // The head the approval was granted for. Optional for legacy rows; a delegated approval without one releases
+    // nothing (holds/verdict.mjs#approvalReleases). Absent stays absent, so a legacy row keeps its event id.
+    ['headSha', (v) => v == null || v === '' || shaOrNull(v) !== null, (v) => (v == null || v === '' ? undefined : shaOrNull(v))],
   ],
   [EVENT_TYPES.SEND_BACK]: [
     ['cause', oneOf(SEND_BACK_CAUSES), (v) => v],

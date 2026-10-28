@@ -541,6 +541,18 @@ describe('R130 delegated clearance', () => {
     expect(sweepDelegatedClearance(h)[0]).toMatchObject({ delegated: 'sweep-failed', detail: expect.stringContaining('human review') });
     expect(h.runLabel).not.toHaveBeenCalled();
   });
+  // PR #5983 red-team: one oversized candidate used to end the whole sweep, and the wrapped cursor starved the rest.
+  it('an oversized candidate refuses only itself; later valid candidates in the batch still clear', () => {
+    const rows = [1, 2, 3].map(number => ({ ...pr(), number,
+      comments: pr().comments.map(c => ({ ...c, body: c.body.replace('pr=5925', `pr=${number}`) })) }));
+    const h = harness({ prs: rows, readNetFiles: vi.fn(({ num }) => (num === 1 ? Array(1001).fill('x') : [`scripts/pr-${num}.mjs`])) });
+    const results = sweepDelegatedClearance(h);
+    expect(results).toContainEqual({ num: 1, delegated: 'sweep-failed', detail: expect.stringContaining('operator review required') });
+    expect(h.runLabel).toHaveBeenCalledTimes(2);
+    expect(h.runLabel).toHaveBeenCalledWith(expect.objectContaining({ num: 2 }));
+    expect(h.runLabel).toHaveBeenCalledWith(expect.objectContaining({ num: 3 }));
+    expect(results.filter(r => r.delegated === 'auto-approved').map(r => r.num)).toEqual([2, 3]);
+  });
   it('dry run writes neither events, state nor labels', () => {
     const h = harness({ dryRun: true }); sweepDelegatedClearance(h);
     expect(h.emit).not.toHaveBeenCalled(); expect(h.writeState).not.toHaveBeenCalled(); expect(h.runLabel).not.toHaveBeenCalled();

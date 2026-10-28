@@ -150,7 +150,7 @@ describe('delegated clear-human final label guard', () => {
     // Account for EVERY durable row even at refusals after a successful write.
     expect(result.ledger).toEqual(injectAt <= 2 ? [] : [
       expect.objectContaining({ coverage: expect.objectContaining({ headSha: head }) }),
-      ...(injectAt === 3 ? [] : [expect.objectContaining({ type: EVENT_TYPES.APPROVAL,
+      ...(injectAt === 3 ? [] : [expect.objectContaining({ type: EVENT_TYPES.APPROVAL, headSha: head,
         delegation: { by: 'operator', scope: 'test', expires: '2099-01-01T00:00:00Z' } })]),
       ...(Number.isFinite(injectAt) ? [expect.objectContaining({ type: EVENT_TYPES.LABEL_INPUT,
         change: 'added', label: 'review:human', sender: 'refused delegated clearance' })] : []),
@@ -282,7 +282,8 @@ describe('delegated clear-human final label guard', () => {
         expect(result.events.filter(event => event.endsWith('write'))).toEqual(['label-write', 'comment-write']);
         expect(result.provider.addLabels).not.toHaveBeenCalled();
         expect(result.provider.removeLabels).not.toHaveBeenCalled();
-        expectBoundaryLedger(result, 5);
+        // A completed clearance keeps exactly its verdict and approval rows: no refused-clearance hold is appended.
+        expectBoundaryLedger(result, Infinity);
       } finally { warn.mockRestore(); }
     },
   );
@@ -298,7 +299,20 @@ describe('delegated clear-human final label guard', () => {
     });
     expect(result.ledger).toHaveLength(2);
     expect(result.ledger[1].type).toBe(EVENT_TYPES.APPROVAL);
+    expect(result.ledger[1].headSha).toBe(head);
     expect(result.holds).toBeNull();
+  });
+
+  // PR #5983 red-team: the approval row can land after the PR moved to head B and a new human hold was added there.
+  it('an approval appended for head A never releases a later human hold on head B', () => {
+    const result = run({ injectAt: Infinity });
+    expect(result.exitCode).toBe(0);
+    const approval = result.ledger.find(row => row.type === EVENT_TYPES.APPROVAL);
+    expect(approval.headSha).toBe(head);
+    const holdOnB = { type: EVENT_TYPES.LABEL_INPUT, change: 'added', label: 'review:human', sender: 'operator' };
+    const evaluate = sha => labelInputHold.evaluate({ view: { events: [holdOnB, approval] }, facts: { head: { sha }, now: Date.now() } });
+    expect(evaluate('b'.repeat(40))).toEqual([expect.objectContaining({ code: 'label-input:review:human' })]);
+    expect(evaluate(head)).toBeNull();
   });
 
   it('preserves operator reassertion over an operator hold with a matching repark marker', () => {
