@@ -24,7 +24,7 @@ function state(adopted = { mainSha: MAIN_SHA, applied: [] }) {
 function merges(oldestAgeMs) {
   // Newest first: using the first timestamp would miss the five-hour breach.
   return [
-    { sha: 'c'.repeat(40), ctMs: NOW - 10 * MINUTE, subject: 'Refresh dispatcher (#6026)' },
+    { sha: 'c'.repeat(40), ctMs: NOW - 10 * MINUTE, subject: 'Merge pull request #6026 from x/z' },
     { sha: 'b'.repeat(40), ctMs: NOW - oldestAgeMs, subject: 'Merge pull request #6014 from x/y' },
   ];
 }
@@ -61,7 +61,7 @@ function expectUnreadable(result) {
 }
 
 describe('daemon-build-stale', () => {
-  it('breaches at five hours and names the clone, merge count, oldest age and both PR subject formats', async () => {
+  it('breaches at five hours and names the clone, merge count, oldest age and the merged PRs', async () => {
     const { results: [result], io } = await run();
     expect(io.mergesSince).toHaveBeenCalledTimes(1);
     expect(io.mergesSince).toHaveBeenCalledWith(MAIN_SHA);
@@ -72,6 +72,18 @@ describe('daemon-build-stale', () => {
     expect(result.summary).toMatch(/\b5\s*(?:h\b|hours?\b)/i);
     expect(result.summary).toContain('#6014');
     expect(result.summary).toContain('#6026');
+  });
+
+  it('does not count a drain commit whose (#N) is not a merged PR', async () => {
+    const commits = [
+      ...merges(5 * HOUR),
+      { sha: 'e'.repeat(40), ctMs: NOW - 6 * HOUR, subject: 'drain: mark card 5755 resolved on land (#2748)' },
+    ];
+    const { results: [result] } = await run({ commits });
+    expect(result.breach).toBe(true);
+    expect(result.summary).toContain('#6014');
+    expect(result.summary).not.toContain('#2748');
+    expect(result.measure.prs).not.toContain(2748);
   });
 
   it('does not breach when the oldest missing merge is thirty minutes old', async () => {

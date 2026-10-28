@@ -72,7 +72,7 @@ export function decide({ states, now, maxMs = DEFAULT_MAX_MS }) {
       ? `${Math.floor(age / HOUR)} hours ${Math.floor((age % HOUR) / MINUTE)} minutes`
       : `${Math.floor(age / MINUTE)} minutes`;
     const prs = [...new Set(merges.flatMap(({ subject }) => {
-      const match = /#(\d+)/.exec(subject);
+      const match = /^Merge pull request #(\d+) from /.exec(subject);
       return match ? [Number(match[1])] : [];
     }))].sort((a, b) => a - b);
     const displayedPrs = prs.slice(0, 15).map((pr) => `#${pr}`).join(', ');
