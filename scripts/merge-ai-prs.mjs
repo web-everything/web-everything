@@ -6115,6 +6115,7 @@ async function runCli() {
         // double-apply). `shouldApplyReviewLabel` is the SAME shared gate `pr-land.mjs` uses at open, so
         // producer- and drain-applied verdicts can never drift on what "already labelled" means.
         if (gate.applyLabel && !candidateDryRun) {
+          let applyLabelOk = true; // already present => nothing to add
           if (shouldApplyReviewLabel(gate.applyLabel, v.prLabels)) {
             // #3215 — the ledger is written FIRST, before the `gh` transport call, same ordering rationale as
             // `review-set-label.mjs`'s Phase-1 write: this hold is already DECIDED (the gate verdict above is
@@ -6123,11 +6124,11 @@ async function runCli() {
             // never this park.
             const ledgered = recordDrainVerdict({ repo: v.repo || localSlug, pr: v.num, applyLabel: gate.applyLabel, reason: v.reason, headSha: v.headSha ?? null });
             if (!ledgered.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger append (#3215, drain hold, non-fatal) — ${ledgered.errors.join('; ')}\n`);
-            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', gate.applyLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
+            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', gate.applyLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { applyLabelOk = false; /* label best-effort */ }
           }
           // 6027: a de-escalated park removes the sticky review:human only AFTER the pending label was applied
           // (never leave a PR with neither label if the add fails).
-          removeDeescalatedHumanLabels({ gate, labels: v.prLabels, dryRun: candidateDryRun, pr: v.num, repo: v.repo });
+          if (applyLabelOk) removeDeescalatedHumanLabels({ gate, labels: v.prLabels, dryRun: candidateDryRun, pr: v.num, repo: v.repo });
           // mechanical-dispatcher — the companion "not yet advised" label, only for a review:human park (never
           // for a plain review:pending one). Same shared guard, same best-effort posture as the add above.
           if (gate.applyLabel === REVIEW_LABELS.human && shouldApplyReviewLabel(REVIEW_LABELS.awaitingAdvisory, v.prLabels)) {

@@ -777,7 +777,8 @@ describe('#6027 — fresh net score de-escalation through the drain handoff', ()
       ['pr', 'edit', '6027', '--repo', 'owner/repo', '--remove-label', REVIEW_LABELS.human],
       { stdio: ['ignore', 'ignore', 'pipe'] });
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
-    const call = src.indexOf('removeDeescalatedHumanLabels({ gate, labels: v.prLabels');
+    expect(src).toMatch(/catch \{ applyLabelOk = false;/);
+    const call = src.indexOf('if (applyLabelOk) removeDeescalatedHumanLabels({ gate, labels: v.prLabels');
     expect(call).toBeGreaterThan(src.indexOf("'--add-label', gate.applyLabel"));
   });
 
@@ -813,7 +814,7 @@ describe('#6027 — fresh net score de-escalation through the drain handoff', ()
     expect(exec).not.toHaveBeenCalled();
   });
 
-  it('keeps review:human when the acceptance read defers, despite a fresh low score', () => {
+  it('keeps review:human on a deferred acceptance read (no label change)', () => {
     const exec = vi.fn(() => { throw new Error('comments unavailable'); });
     const gate = decideDrainReviewGate(drainGateInputs(inputs({
       humanPinned: undefined, labels: [REVIEW_LABELS.human, REVIEW_LABELS.accepted],
