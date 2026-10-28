@@ -6,6 +6,7 @@ import {createHash} from 'node:crypto';
 import {spawn, spawnSync} from 'node:child_process';
 import {once} from 'node:events';
 import {createRunner, digestInput, digestArgv, supervisorSource} from '../forge-exec-run.mjs';
+import * as manifestAPI from '../forge-exec-run.mjs';
 let root, runner, request, work;
 const argv = ['npm','run','test:unit','--','two words',"a'b",'$(touch marker)','line\nbreak'];
 const hash = data => createHash('sha256').update(data).digest('hex');
@@ -554,4 +555,198 @@ exec /usr/bin/sudo -n /usr/bin/python3 -I -c ${quote(task)}
   expect(cleanup).toHaveBeenCalledTimes(1);
   await expect(stat(join(root,'runs',request.run))).rejects.toThrow();
   expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.consumed']);
+});
+
+
+// Manifest acceptance contract (Round 1): isTestFile(path:Buffer) -> boolean;
+// verifyManifest(root, manifest, manifestDigest, {fs?} = {}) -> {entries, testPaths}.
+// entries = [{path:Buffer, sha256:string, executable:boolean}], testPaths = Buffer[].
+// fs defaults to node:fs/promises (lstat/readFile/readdir, Buffer paths/names).
+// Wire manifest = {paths:base64(NUL-terminated byte paths), hashes:hexSHA256[],
+//   executable:boolean[], excluded:base64(NUL-terminated excluded byte paths)};
+// manifestDigest = sha256(JSON.stringify(manifest)), in that property order.
+// Both path lists are strictly byte-sorted; excluded files must be absent.
+// Invalid UTF-8 is a valid byte path; invalid/non-canonical base64 is not.
+describe('certified snapshot equals selected inventory: Forge acceptance', () => {
+  const nul = paths => Buffer.concat(paths.flatMap(path => [path, Buffer.from([0])]));
+  function makeManifest(entries, excluded = []) {
+    const ordered = [...entries].sort((a,b) => Buffer.compare(a.path,b.path));
+    const manifest = {
+      paths:nul(ordered.map(entry => entry.path)).toString('base64'),
+      hashes:ordered.map(entry => entry.sha256),
+      executable:ordered.map(entry => entry.executable),
+      excluded:nul([...excluded].sort(Buffer.compare)).toString('base64'),
+    };
+    return {manifest, manifestDigest:hash(JSON.stringify(manifest))};
+  }
+  async function snapshot(names = ['package-lock.json']) {
+    const entries = await Promise.all(names.map(async name => {
+      const path = Buffer.isBuffer(name) ? name : Buffer.from(name);
+      const absolute = Buffer.concat([Buffer.from(work+'/'),path]);
+      return {path, sha256:hash(await readFile(absolute)), executable:!!((await stat(absolute)).mode & 0o111)};
+    }));
+    return makeManifest(entries);
+  }
+  async function verify(manifest, digest, options) {
+    expect(manifestAPI.verifyManifest, 'export the pre-execution exact snapshot verifier').toBeTypeOf('function');
+    return manifestAPI.verifyManifest(work, manifest, digest, options);
+  }
+  async function expectNoExecutionOrReceipt() {
+    expect(await readFile(join(root,'install.log'),'utf8').catch(error => {
+      if (error.code !== 'ENOENT') throw error;
+      return '';
+    })).toBe('');
+    expect(await runner.finish(request)).toBeNull();
+  }
+
+  it.each([
+    ['identity.test.mjs', true], ['credentials.test.mjs', true], ['keys/identity.spec.tsx', true],
+    ['a.test.js', true], ['a.spec.cjs', true], ['a.test.mts', true], ['a.spec.jsx', true],
+    ['a.test.txt', false], ['a.test.mjs.bak', false], ['a.test.mjs/source.js', false],
+    ['test.mjs', false], ['a.TEST.js', false],
+  ])('uses the one shared basename predicate for %s => %s', (path, expected) => {
+    expect(manifestAPI.isTestFile).toBeTypeOf('function');
+    expect(manifestAPI.isTestFile(Buffer.from(path))).toBe(expected);
+  });
+
+  it.each(['extra file','missing file','hash mismatch','extra test file','exec bit mismatch'])
+  ('rejects %s before installation even when inputDigest matches the current disk', async fault => {
+    await writeFile(join(work,'identity.test.mjs'),'original assertion');
+    Object.assign(request, await snapshot(['package-lock.json','identity.test.mjs']));
+    if (fault === 'extra file') await writeFile(join(work,'extra.json'),'extra');
+    if (fault === 'extra test file') await writeFile(join(work,'credentials.test.mjs'),'hidden assertion');
+    if (fault === 'missing file') await rm(join(work,'identity.test.mjs'));
+    if (fault === 'hash mismatch') await writeFile(join(work,'identity.test.mjs'),'different assertion');
+    if (fault === 'exec bit mismatch') request.manifest.executable[0] = !request.manifest.executable[0];
+    // Re-sign malformed evidence so the exact-tree checks, not only its digest,
+    // must reject it. Existing inputDigest verification cannot catch this family.
+    request.manifestDigest = hash(JSON.stringify(request.manifest));
+    request.inputDigest = await digestInput(work);
+    await expect(runner.run(request)).rejects.toThrow(/manifest|inventory|snapshot|test set/i);
+    await expectNoExecutionOrReceipt();
+  });
+
+  it.each(['invalid base64','non-canonical base64','duplicate','unsorted','newline','CR','absolute','parent','dot','empty component','missing terminator','hash count','bad hash','excluded test'])
+  ('rejects %s manifest before executing and never produces green evidence', async fault => {
+    Object.assign(request, await snapshot());
+    const manifest = request.manifest;
+    if (fault === 'invalid base64') manifest.paths = '%%%';
+    if (fault === 'non-canonical base64') manifest.paths += '\n';
+    if (fault === 'duplicate') {
+      manifest.paths = nul([Buffer.from('package-lock.json'),Buffer.from('package-lock.json')]).toString('base64');
+      manifest.hashes.push(manifest.hashes[0]); manifest.executable.push(false);
+    }
+    if (fault === 'unsorted') {
+      await writeFile(join(work,'z.txt'),'z');
+      manifest.paths = nul([Buffer.from('z.txt'),Buffer.from('package-lock.json')]).toString('base64');
+      manifest.hashes = [hash('z'),hash('lock')]; manifest.executable = [false,false];
+    }
+    const unsafe = {'newline':'bad\nname.test.mjs', CR:'bad\rname', absolute:'/outside', parent:'../outside', dot:'./file', 'empty component':'a//file'};
+    if (fault in unsafe) manifest.paths = nul([Buffer.from(unsafe[fault])]).toString('base64');
+    if (fault === 'missing terminator') manifest.paths = Buffer.from('package-lock.json').toString('base64');
+    if (fault === 'hash count') manifest.hashes = [];
+    if (fault === 'bad hash') manifest.hashes = ['not-sha256'];
+    if (fault === 'excluded test') manifest.excluded = nul([Buffer.from('credentials.test.mjs')]).toString('base64');
+    request.manifestDigest = hash(JSON.stringify(manifest));
+    request.inputDigest = await digestInput(work);
+    await expect(runner.run(request)).rejects.toThrow(/manifest|inventory|snapshot|path|base64|hash|test/i);
+    await expectNoExecutionOrReceipt();
+  });
+
+  it('refuses a manifestDigest that does not bind the supplied inventory', async () => {
+    Object.assign(request, await snapshot());
+    request.manifestDigest = '0'.repeat(64);
+    await expect(runner.run(request)).rejects.toThrow(/manifest|digest/i);
+    await expectNoExecutionOrReceipt();
+  });
+
+  it('refuses an excluded non-test file that is present on disk', async () => {
+    const selected = await snapshot();
+    selected.manifest.excluded = nul([Buffer.from('.env')]).toString('base64');
+    Object.assign(request, selected, {manifestDigest:hash(JSON.stringify(selected.manifest))});
+    await writeFile(join(work,'.env'),'must not arrive');
+    request.inputDigest = await digestInput(work);
+    await expect(runner.run(request)).rejects.toThrow(/manifest|excluded|extra|snapshot/i);
+    await expectNoExecutionOrReceipt();
+  });
+
+  it.each(['leaf symlink','parent symlink','directory leaf','non-regular leaf'])('verifyManifest fails closed on %s', async kind => {
+    // Assert availability outside rejects: a missing export is not evidence
+    // that an unsafe file was inspected and refused.
+    expect(manifestAPI.verifyManifest).toBeTypeOf('function');
+    const path = Buffer.from(kind === 'parent symlink' ? 'linked/identity.test.mjs' : 'identity.test.mjs');
+    const {manifest,manifestDigest} = makeManifest([{path,sha256:hash('assertion'),executable:false}]);
+    const fs = {
+      readdir:vi.fn(async () => [kind === 'parent symlink' ? Buffer.from('linked') : path]),
+      lstat:vi.fn(async value => {
+        const rootPath = Buffer.from(value).equals(Buffer.from(work));
+        return {isSymbolicLink:()=>!rootPath && kind.includes('symlink'),
+          isDirectory:()=>rootPath || kind === 'directory leaf',
+          isFile:()=>!rootPath && !['directory leaf','non-regular leaf'].includes(kind), mode:0o100644};
+      }),
+      readFile:vi.fn(async () => Buffer.from('assertion')),
+    };
+    await expect(verify(manifest,manifestDigest,{fs})).rejects.toThrow(/symlink|regular|directory|manifest|inventory/i);
+  });
+
+  it('verifies non-UTF-8 byte paths using Buffer filesystem IO without a lossy decode', async () => {
+    const path = Buffer.concat([Buffer.from('raw-'),Buffer.from([0xff]),Buffer.from('.test.mjs')]);
+    const {manifest,manifestDigest} = makeManifest([{path,sha256:hash('assertion'),executable:false}]);
+    const fs = {
+      readdir:vi.fn(async (_base, options) => {
+        expect(options.encoding).toBe('buffer'); return [path];
+      }),
+      lstat:vi.fn(async value => ({isDirectory:()=>Buffer.from(value).equals(Buffer.from(work)),
+        isSymbolicLink:()=>false, isFile:()=>!Buffer.from(value).equals(Buffer.from(work)), mode:0o100644})),
+      readFile:vi.fn(async value => {
+        expect(Buffer.isBuffer(value)).toBe(true);
+        expect(value).toEqual(Buffer.concat([Buffer.from(work+'/'),path]));
+        return Buffer.from('assertion');
+      }),
+    };
+    const verified = await verify(manifest,manifestDigest,{fs});
+    expect(verified.entries).toEqual([{path,sha256:hash('assertion'),executable:false}]);
+    expect(verified.testPaths).toEqual([path]);
+    expect(fs.readFile).toHaveBeenCalled();
+  });
+
+  it('PARITY: the manifest test subset equals the on-disk and executed test set byte-for-byte', async () => {
+    const tests = ['identity.test.mjs','credentials-check.spec.ts','é.test.mjs','nested/key-handler.test.cjs'];
+    const support = ['notes.test.txt','nested/support.js'];
+    await mkdir(join(work,'nested'));
+    for (const name of [...tests,...support]) await writeFile(join(work,name),'fixture');
+    Object.assign(request, await snapshot(['package-lock.json',...tests,...support]));
+    const verified = await verify(request.manifest,request.manifestDigest);
+    const expected = tests.map(name => Buffer.from(name)).sort(Buffer.compare);
+    expect(verified.testPaths).toEqual(expected);
+    expect(verified.entries.filter(entry => manifestAPI.isTestFile(entry.path)).map(entry => entry.path)).toEqual(expected);
+    // Independent task process discovers and actually loads every matching file;
+    // do not use isTestFile to generate its observed set (that would mirror a bug).
+    for (const name of tests) await writeFile(join(work,name),'globalThis.loaded = (globalThis.loaded || 0) + 1;');
+    Object.assign(request, await snapshot(['package-lock.json',...tests,...support]));
+    request.inputDigest = await digestInput(work);
+    await writeFile(join(root,'bin','npm'), `#!${process.execPath}
+const fs = require('node:fs');
+const vm = require('node:vm');
+if (process.argv[2] === 'ci') process.exit(0);
+const observed = [];
+function walk(base, prefix = '') {
+  for (const name of fs.readdirSync(base, {encoding:'buffer'})) {
+    const rel = Buffer.concat([Buffer.from(prefix),name]);
+    const full = Buffer.concat([Buffer.from(process.cwd()+'/'),rel]);
+    if (fs.lstatSync(full).isDirectory()) walk(full, rel.toString()+'/');
+    else if (/\\.(test|spec)\\.[cm]?[jt]sx?$/.test(name.toString())) {
+      vm.runInThisContext(fs.readFileSync(full,'utf8')); observed.push(rel);
+    }
+  }
+}
+walk(process.cwd());
+observed.sort(Buffer.compare);
+fs.writeFileSync(${JSON.stringify(join(root,'executed.json'))}, JSON.stringify(observed.map(path => path.toString('base64'))));
+if (globalThis.loaded !== ${tests.length}) process.exit(9);
+`, {mode:0o755});
+    expect((await runner.run(request)).code).toBe(0);
+    expect(JSON.parse(await readFile(join(root,'executed.json'),'utf8'))).toEqual(expected.map(path => path.toString('base64')));
+    expect(await runner.finish(request)).toMatchObject({phase:'test',code:0,manifestDigest:request.manifestDigest});
+  });
 });

@@ -10,6 +10,8 @@ import {
   runRemote, runWithRemoteFallback, parseArgs,
 } from '../remote-exec.mjs';
 import { createRunner, digestInput, digestArgv } from '../forge-exec-run.mjs';
+import * as remoteManifestAPI from '../remote-exec.mjs';
+import * as forgeManifestAPI from '../forge-exec-run.mjs';
 
 const argv = ['npm', 'run', 'test:unit', '--', 'a.test.mjs'];
 const runId = 'abcdef-1';
@@ -776,5 +778,186 @@ describe('receipt field binding', () => {
   it('rejects install-phase evidence even with matching status', async () => {
     expect(await runRemote(fixture({runCode:97,receipt:(_n,v)=>JSON.stringify({...v,phase:'install'})})))
       .toEqual({mode:'fallback',reason:'ambiguous-result'});
+  });
+});
+
+
+// Manifest acceptance contract (Round 1):
+// buildManifest({cwd, exec, fs?}) -> {entries:[{path:Buffer, sha256, executable:boolean}],
+//   excluded:Buffer[], manifestDigest}. fs defaults to node:fs/promises; injected
+//   lstat/readFile/readdir use Buffer paths and readdir({encoding:'buffer'}).
+// isTestFile(path:Buffer) -> boolean is the shared basename predicate.
+// Wire manifest = {paths:base64(NUL-terminated entries), hashes:string[],
+//   executable:boolean[], excluded:base64(NUL-terminated excluded paths)}.
+// manifestDigest = sha256(JSON.stringify(wire manifest)) in that property order.
+// entries and excluded are separately strictly byte-sorted. Excluded tests must
+// throw; identity/keyword names outside a forbidden component remain selected.
+// Namespace access keeps absent future exports as explicit contract assertion
+// failures, rather than preventing collection of the behavioural regressions.
+describe('certified snapshot equals selected inventory: client acceptance', () => {
+  const sha = value => createHash('sha256').update(value).digest('hex');
+  const nul = paths => Buffer.concat(paths.flatMap(path => [path, Buffer.from([0])]));
+  const wire = manifest => ({
+    paths:nul(manifest.entries.map(entry => entry.path)).toString('base64'),
+    hashes:manifest.entries.map(entry => entry.sha256),
+    executable:manifest.entries.map(entry => entry.executable),
+    excluded:nul(manifest.excluded).toString('base64'),
+  });
+  async function build(options) {
+    expect(remoteManifestAPI.buildManifest, 'export the single inventory builder').toBeTypeOf('function');
+    return remoteManifestAPI.buildManifest(options);
+  }
+  function gitInventory(paths, stage = Buffer.alloc(0)) {
+    return vi.fn(async call => {
+      expect(call.file).toBe('git');
+      expect(call.args).toContain('-z');
+      return {code:0, stdout:call.args.includes('-s') || call.args.includes('--stage') ? stage : nul(paths)};
+    });
+  }
+  // This stub certifies only what the client sends, including the new binding.
+  // It deliberately accepts the old protocol too, so omission is observable.
+  function acceptingTransport(paths, stage = Buffer.alloc(0)) {
+    let state;
+    return vi.fn(async call => {
+      if (call.file === 'git') return {code:0, stdout:call.args.includes('-s') || call.args.includes('--stage') ? stage : nul(paths)};
+      if (isPrepare(call)) {
+        state = JSON.parse(call.input);
+        return {code:0, stdout:JSON.stringify({run:'r-'+state.nonce})};
+      }
+      if (isRun(call)) {state = JSON.parse(call.input); return {code:0, stdout:''};}
+      if (isReceipt(call)) {
+        const receipt = {v:1, nonce:state.nonce, run:state.run, inputDigest:state.inputDigest,
+          argvDigest:state.argvDigest, lock:state.lock, phase:'test', code:0};
+        if (state.manifestDigest !== undefined) receipt.manifestDigest = state.manifestDigest;
+        return {code:0, stdout:JSON.stringify(receipt)};
+      }
+      return {code:0, stdout:''};
+    });
+  }
+
+  it('selects identity.test.mjs and credential/key-word tests without filtering them', async () => {
+    const paths = ['identity.test.mjs', 'credentials-check.test.mjs', 'key-management.spec.ts', 'package-lock.json'].map(value => Buffer.from(value));
+    for (const path of paths.slice(0, 3)) writeFileSync(Buffer.concat([Buffer.from(cwd+'/'), path]), 'assertion');
+    const manifest = await build({cwd, exec:gitInventory(paths)});
+    expect(manifest.entries.map(entry => entry.path)).toEqual([...paths].sort(Buffer.compare));
+    expect(manifest.excluded).toEqual([]);
+    for (const entry of manifest.entries) {
+      expect(Buffer.isBuffer(entry.path)).toBe(true);
+      expect(entry.sha256).toBe(sha(readFileSync(Buffer.concat([Buffer.from(cwd+'/'), entry.path]))));
+      expect(entry.executable).toBe(false);
+    }
+    expect(manifest.manifestDigest).toBe(sha(JSON.stringify(wire(manifest))));
+  });
+
+  it.each(['credentials.test.mjs', 'fixture.key/identity.test.mjs', '.env/identity.spec.ts'])
+  ('fails closed instead of silently dropping a test excluded by the secret rule: %s', async name => {
+    const f = fixture();
+    const parts = name.split('/');
+    if (parts.length > 1) mkdirSync(join(cwd, parts[0]));
+    writeFileSync(join(cwd, name), 'must run');
+    f.listFiles.mockResolvedValue(['package-lock.json', name]);
+    expect(await runRemote(f)).toEqual({mode:'fallback', reason:'copy-failed'});
+    expect(callsOf(f.exec).some(isRun)).toBe(false);
+    expect(callsOf(f.exec).some(call => call.file === 'rsync')).toBe(false);
+    expect(await runWithRemoteFallback({...f, log:vi.fn()})).toBe(7);
+    expect(f.local).toHaveBeenCalledTimes(1);
+  });
+
+  it('records excluded non-test secrets explicitly rather than losing inventory evidence', async () => {
+    writeFileSync(join(cwd, '.env'), 'DO_NOT_COPY');
+    const manifest = await build({cwd, exec:gitInventory(['.env', 'package-lock.json'].map(value => Buffer.from(value)))});
+    expect(manifest.entries.map(entry => entry.path)).toEqual([Buffer.from('package-lock.json')]);
+    expect(manifest.excluded).toEqual([Buffer.from('.env')]);
+  });
+
+  it('carries 0xff byte paths through buildManifest without requiring APFS filename support', async () => {
+    const path = Buffer.concat([Buffer.from('raw-'), Buffer.from([0xff]), Buffer.from('.test.mjs')]);
+    const data = Buffer.from('raw test content');
+    const fs = {
+      lstat:vi.fn(async value => ({isDirectory:()=>Buffer.from(value).equals(Buffer.from(cwd)),
+        isFile:()=>!Buffer.from(value).equals(Buffer.from(cwd)), isSymbolicLink:()=>false, mode:0o100755})),
+      readFile:vi.fn(async value => {
+        expect(Buffer.isBuffer(value)).toBe(true);
+        expect(value).toEqual(Buffer.concat([Buffer.from(cwd+'/'), path]));
+        return data;
+      }),
+    };
+    const manifest = await build({cwd, exec:gitInventory([path]), fs});
+    expect(manifest.entries).toEqual([{path, sha256:sha(data), executable:true}]);
+    expect(manifest.manifestDigest).toBe(sha(JSON.stringify(wire(manifest))));
+    expect(fs.readFile).toHaveBeenCalled();
+  });
+
+  it('uses exactly the manifest bytes for rsync stdin, selected digest, and run request', async () => {
+    const paths = ['identity.test.mjs', 'credentials-check.spec.ts', 'é.test.mjs', 'package-lock.json'].map(value => Buffer.from(value));
+    for (const path of paths.slice(0, 3)) writeFileSync(Buffer.concat([Buffer.from(cwd+'/'), path]), 'must run');
+    const manifest = await build({cwd, exec:gitInventory(paths)});
+    const exec = acceptingTransport(paths);
+    expect(await runRemote({argv, cwd, runId, exec})).toEqual({mode:'remote', code:0});
+    const copy = callsOf(exec).find(call => call.file === 'rsync');
+    expect(copy.args).toEqual(expect.arrayContaining(['--from0','--files-from=-']));
+    expect(Buffer.isBuffer(copy.input)).toBe(true);
+    expect(copy.input).toEqual(Buffer.concat(manifest.entries.flatMap(({path}) => [Buffer.from('./'),path,Buffer.from([0])])));
+    const sent = JSON.parse(callsOf(exec).find(isRun).input);
+    expect(sent.manifest).toEqual(wire(manifest));
+    expect(sent.manifestDigest).toBe(manifest.manifestDigest);
+    expect(sent.inputDigest).toBe(await digestInput(cwd, manifest.entries.map(entry => entry.path)));
+    // No second git inventory query may select a different snapshot.
+    expect(callsOf(exec).filter(call => call.file === 'git' && call.args.includes('-co'))).toHaveLength(1);
+  });
+
+  it('transports and digests an actual 0xff filename byte-exactly when the filesystem supports it', async ctx => {
+    const path = Buffer.concat([Buffer.from('raw-'),Buffer.from([0xff]),Buffer.from('.test.mjs')]);
+    const absolute = Buffer.concat([Buffer.from(cwd+'/'),path]);
+    try {writeFileSync(absolute, 'raw assertion');}
+    catch (error) {
+      // APFS can report EPERM for invalid UTF-8 even in a writable directory.
+      if (!['EILSEQ', 'EINVAL', 'ENOTSUP'].includes(error.code)
+        && !(process.platform === 'darwin' && error.code === 'EPERM')) throw error;
+      ctx.skip(); return;
+    }
+    if (!readdirSync(cwd, {encoding:'buffer'}).some(name => name.equals(path))) {ctx.skip(); return;}
+    const paths = [path, Buffer.from('package-lock.json')];
+    const exec = acceptingTransport(paths);
+    expect(await runRemote({argv, cwd, runId, exec})).toEqual({mode:'remote', code:0});
+    const ordered = [...paths].sort(Buffer.compare);
+    expect(callsOf(exec).find(call => call.file === 'rsync').input)
+      .toEqual(Buffer.concat(ordered.flatMap(name => [Buffer.from('./'),name,Buffer.from([0])])));
+    const sent = JSON.parse(callsOf(exec).find(isRun).input);
+    expect(Buffer.from(sent.manifest.paths, 'base64')).toEqual(nul(ordered));
+    expect(sent.inputDigest).toBe(await digestInput(cwd, ordered));
+    writeFileSync(absolute, 'changed assertion');
+    expect(await digestInput(cwd, ordered)).not.toBe(sent.inputDigest);
+  });
+
+  it('resolves an injected gitlink and sends its tests, or falls back before certification', async () => {
+    mkdirSync(join(cwd, 'vendor'));
+    writeFileSync(join(cwd, 'vendor/nested.test.mjs'), 'submodule assertion');
+    const stage = Buffer.from('160000 '+ 'a'.repeat(40)+' 0\tvendor\0');
+    const transport = acceptingTransport([Buffer.from('package-lock.json'), Buffer.from('vendor')], stage);
+    const exec = vi.fn(async call => {
+      if (call.file === 'git' && call.cwd === join(cwd,'vendor')) return {code:0,
+        stdout:call.args.includes('-s') || call.args.includes('--stage')
+          ? Buffer.from('100644 '+ 'b'.repeat(40)+' 0\tnested.test.mjs\0')
+          : Buffer.from('nested.test.mjs\0')};
+      return transport(call);
+    });
+    const result = await runRemote({argv, cwd, runId, exec});
+    if (result.mode === 'fallback') {
+      expect(['copy-failed','gitlink-unsupported']).toContain(result.reason);
+      expect(callsOf(exec).some(isRun)).toBe(false);
+    } else {
+      expect(result).toEqual({mode:'remote', code:0});
+      const sent = JSON.parse(callsOf(exec).find(isRun).input);
+      expect(Buffer.from(sent.manifest.paths,'base64').includes(Buffer.from('vendor/nested.test.mjs\0'))).toBe(true);
+      expect(callsOf(exec).find(call => call.file === 'rsync').input.includes(Buffer.from('./vendor/nested.test.mjs\0'))).toBe(true);
+    }
+    // Gitlink classification must be based on the index, not guessed from a directory.
+    expect(callsOf(exec).some(call => call.file === 'git' && (call.args.includes('-s') || call.args.includes('--stage')))).toBe(true);
+  });
+
+  it.each(['missing', 'wrong'])('rejects a %s manifestDigest in an otherwise matching green receipt', async kind => {
+    const f = fixture({receipt:(_nonce,value) => JSON.stringify(kind === 'missing' ? value : {...value,manifestDigest:'0'.repeat(64)})});
+    expect(await runRemote(f)).toEqual({mode:'fallback', reason:'ambiguous-result'});
   });
 });
