@@ -109,6 +109,73 @@ function realRemoteFixture(files) {
 }
 
 describe('remote snapshot regressions', () => {
+  it('falls back instead of certifying a snapshot missing a failing identity.test.mjs', async () => {
+    const files = ['package-lock.json', 'package.json', 'vitest.config.mjs', 'smoke.test.mjs', 'identity.test.mjs'];
+    const f = realRemoteFixture(files);
+    writeFileSync(join(cwd, 'package.json'), JSON.stringify({ scripts: { 'test:unit': 'vitest run' } }));
+    writeFileSync(join(cwd, 'vitest.config.mjs'), "export default { test: { environment: 'node', include: ['*.test.mjs'] } };");
+    writeFileSync(join(cwd, 'smoke.test.mjs'), "import {it,expect} from 'vitest'; it('smoke',()=>expect(true).toBe(true));");
+    writeFileSync(join(cwd, 'identity.test.mjs'), "import {it,expect} from 'vitest'; it('identity',()=>expect(true).toBe(false));");
+    const modules = realpathSync(new URL('../../../node_modules', import.meta.url));
+    const vitest = join(modules, 'vitest', 'vitest.mjs');
+    symlinkSync(modules, join(cwd, 'node_modules'), 'dir');
+    // Reuse installed test dependencies offline, but execute actual Vitest in
+    // the transported checkout if a mutation removes the inventory guard.
+    writeFileSync(join(f.bin, 'npm'), `#!${process.execPath}
+if (process.argv[2] === 'ci') {
+  require('node:fs').symlinkSync(${JSON.stringify(modules)}, 'node_modules', 'dir');
+  process.exit(0);
+}
+const result = require('node:child_process').spawnSync(process.execPath, [${JSON.stringify(vitest)}, 'run'], {stdio:'inherit'});
+process.exit(result.status ?? 1);
+`, { mode: 0o755 });
+    f.local = vi.fn(async () => {
+      const result = spawnSync(process.execPath, [vitest, 'run'], { cwd, encoding: 'utf8', timeout: 10000 });
+      expect(result.stdout + result.stderr).toContain('identity.test.mjs');
+      return result.status;
+    });
+    f.argv = ['npm', 'run', 'test:unit'];
+    // The transport would return a bound exit-zero receipt for the filtered
+    // snapshot. Removing the dropped-inventory guard must make this test red.
+    expect(await runRemote(f)).toEqual({ mode: 'fallback', reason: 'filtered-inventory' });
+    expect(await runWithRemoteDecision({ argv: f.argv, cwd,
+      policy: resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always' } } }),
+      remoteExec: options => runRemote({ ...f, ...options }), log: vi.fn(),
+    })).toEqual({ handled: false });
+    expect(await runWithRemoteFallback({ ...f, log: vi.fn() })).toBe(1);
+    expect(f.local).toHaveBeenCalledTimes(1);
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+  }, 15000);
+
+  it('falls back locally with the local exit code while another remote run holds the worker', async () => {
+    const f = realRemoteFixture(['package-lock.json']);
+    writeFileSync(join(f.bin, 'npm'), `#!${process.execPath}
+const fs = require('node:fs');
+if (process.argv[2] === 'ci') process.exit(0);
+fs.writeFileSync(${JSON.stringify(join(cwd, 'ready'))}, '');
+const timer = setInterval(() => {
+  if (fs.existsSync(${JSON.stringify(join(cwd, 'release'))})) { clearInterval(timer); process.exit(3); }
+}, 10);
+setTimeout(() => process.exit(2), 5000).unref();
+`, { mode: 0o755 });
+    const first = runRemote(f);
+    try {
+      await vi.waitFor(() => expect(existsSync(join(cwd, 'ready'))).toBe(true));
+      const log = vi.fn();
+      expect(await runWithRemoteFallback({ ...f, log })).toBe(7);
+      expect(f.local).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('worker-busy'));
+      expect(await runWithRemoteDecision({ argv: f.argv, cwd,
+        policy: resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always' } } }),
+        remoteExec: options => runRemote({ ...f, ...options }), log: vi.fn(),
+      })).toEqual({ handled: false });
+      expect(existsSync(join(f.root, 'receipts', 'worker-active'))).toBe(true);
+    } finally {
+      writeFileSync(join(cwd, 'release'), '');
+      expect(await first).toEqual({ mode: 'remote', code: 3 });
+    }
+  }, 15000);
+
   it.each(['snapshot', 'stale remote'])('falls back when a %s receipt says 97 and npm ci fails before the command', async (source) => {
     writeFileSync(join(cwd, '.exit-code'), '97\n');
     const f = realRemoteFixture(['package-lock.json', '.exit-code']);
@@ -387,19 +454,20 @@ describe('runRemote', () => {
       expect(callsOf(exec).some(isRun)).toBe(false);
     } finally { release?.(); vi.useRealTimers(); }
   });
-  it.each(['injected', 'git'])('excludes conventional credential and private-key paths from the %s transport inventory', async (inventory) => {
+  it.each(['injected', 'git'])('falls back for every credential path in the %s inventory without copying secrets', async (inventory) => {
     const f = fixture();
     const safe = [
       'package-lock.json', 'src/a file.mjs', 'src/identity.mjs', 'docs/key-handling.md',
       ...['js', 'cjs', 'ts', 'mts', 'cts', 'jsx', 'tsx'].map((ext) => `src/identity.${ext}`),
     ];
     const secrets = [
-      '.git', '.git/config', '.git-credentials', '.git-credentials.backup', 'nested/.GIT-CREDENTIALS',
+      '.git-credentials', '.git-credentials.backup', 'nested/.GIT-CREDENTIALS',
       '.git-credentials~', '.git-credentials-old',
       'id_custom', 'nested/id_backup', '.envrc', '.environment', 'id_rsa', 'keys/ID_RSA', 'id_dsa', 'id_ecdsa', 'id_ed25519', 'id_ecdsa_sk', 'id_ed25519_sk', 'id_xmss',
       'keys/id_rsa.backup', 'keys/id_rsa~', 'keys/id_ed25519.pub', 'identity', 'keys/identity.pub',
       'keys/IDENTITY', 'keys/IDENTITY.PUB', 'keys/identity.backup', 'keys/identity~',
       'keys/identity-old', 'keys/identity_old', 'keys/identity.pub.backup', 'keys/identity.mjs.backup',
+      'keys/identity.\u2028backup', 'keys/id_\u2029backup', 'keys/credentials.\u2028json',
       'keys/identity.pem', 'keys/identity.key', '.ssh/identity.mjs', 'credentials/identity.ts',
       '.env', 'nested/.env.local', '.npmrc', '.netrc', 'credentials', 'credentials.json',
       'credentials/token', '.ssh/config', '.aws/config', 'keys/server.pem', 'keys/server.KEY',
@@ -408,13 +476,32 @@ describe('runRemote', () => {
       mkdirSync(join(cwd, file, '..'), { recursive: true });
       writeFileSync(join(cwd, file), 'fixture');
     }
-    f.listFiles.mockResolvedValue([...safe, ...secrets]);
+    let files;
+    f.listFiles.mockImplementation(async () => files);
     const exec = vi.fn(async (call) => call.file === 'git'
-      ? { code: 0, stdout: [...safe, ...secrets].join('\0') + '\0' } : f.exec(call));
+      ? { code: 0, stdout: files.join('\0') + '\0' } : f.exec(call));
     const options = { ...f, exec };
     if (inventory === 'git') delete options.listFiles;
+    for (const secret of secrets) {
+      files = [...safe, secret];
+      expect(await runRemote(options), secret).toEqual({ mode: 'fallback', reason: 'filtered-inventory' });
+    }
+    expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call))).toBe(false);
+    files = [...safe, '.git/config', 'node_modules/ignored', '.exit-code', 'nested/.GIT/config'];
     expect(await runRemote(options)).toEqual({ mode: 'remote', code: 0 });
     expect(callsOf(exec).find((call) => call.file === 'rsync').input).toBe(safe.map(file => `./${file}\0`).join(''));
+  });
+
+  it('uses the same rsync rules for identity source exceptions and credential-like prefixes', async () => {
+    const files = ['package-lock.json', 'src/IDENTITY.MJS', 'src/identity.ts', 'credentials-helper.mjs', '.git-credentials-helper.mjs'];
+    // The last file is denied by both rules; the hyphenated credentials helper is safe.
+    const f = realRemoteFixture(files.slice(0, -1));
+    mkdirSync(join(cwd, 'src'));
+    for (const file of files.slice(1)) writeFileSync(join(cwd, file), 'fixture');
+    writeFileSync(join(f.bin, 'npm'), '#!/bin/bash\nexit 0\n', { mode: 0o755 });
+    expect(await runRemote(f)).toEqual({ mode: 'remote', code: 0 });
+    f.listFiles.mockResolvedValue(files);
+    expect(await runRemote(f)).toEqual({ mode: 'fallback', reason: 'filtered-inventory' });
   });
   it.each(['probe', 'inventory', 'prepare', 'copy', 'dispatch boundary'])(
     'cancels the real executor during %s without ever dispatching the command', async (stage) => {
@@ -664,7 +751,7 @@ describe('runRemote', () => {
     const copy = calls.find((call) => call.file === 'rsync');
     expect(copy.args.join(' ')).toMatch(/--files-from(?:=|\s)-/);
     expect(copy.args).toContain('--from0');
-    expect(copy.args).toContain('--exclude=.exit-code');
+    expect(copy.args).toContain('--exclude=.[eE][xX][iI][tT]-[cC][oO][dD][eE]');
     expect(calls.findIndex(isPrepare)).toBeLessThan(calls.indexOf(copy));
     expect(sshText(calls.find(isPrepare))).toBe('custom-forge sudo -n -u ops /usr/local/libexec/forge-exec-run prepare');
     expect(copy.input.split('\0')).toEqual(['./package-lock.json', './src/a file.mjs', '']);
@@ -830,6 +917,16 @@ original_fstat = os.fstat`);
 });
 
 describe('receipt field binding', () => {
+  it.each(['v','nonce','run','inputDigest','argvDigest','lock','phase','code'])('rejects mismatched worker-busy %s evidence', async field => {
+    const f = fixture({ runCode: 75, receipt: (_n, value) => JSON.stringify({ ...value, phase: 'not-started',
+      [field]: field === 'v' ? 2 : field === 'code' ? 0 : 'wrong' }) });
+    expect(await runWithRemoteFallback({ ...f, log: vi.fn() })).toBe(124);
+    expect(f.local).not.toHaveBeenCalled();
+  });
+  it('requires the dedicated worker-busy code on a not-started receipt', async () => {
+    expect(await runRemote(fixture({ receipt: (_n, v) => JSON.stringify({ ...v, phase: 'not-started' }) })))
+      .toEqual({ mode: 'uncertain', reason: 'ambiguous-result', terminated: false });
+  });
   it.each(['v','nonce','run','inputDigest','argvDigest','lock','phase','code'])('rejects mismatched %s', async field => {
     const f = fixture({receipt: (_nonce,value) => JSON.stringify({...value,[field]:field === 'v' ? 2 : field === 'code' ? 1 : 'wrong'})});
     expect(await runRemote(f)).toEqual({mode:'uncertain',reason:'ambiguous-result',terminated:false});

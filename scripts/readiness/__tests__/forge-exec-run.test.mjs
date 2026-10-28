@@ -71,14 +71,24 @@ else {
       await vi.waitFor(async () => expect((await stat(join(root,'ready'))).isFile()).toBe(true));
       await expect(runner.finish(request)).rejects.toThrow('Remote termination unconfirmed');
       expect((await stat(work)).isDirectory()).toBe(true);
-      await expect(other.run(second)).rejects.toThrow('Worker execution busy');
+      expect(await other.run(second)).toMatchObject({code:75});
+      await expect(other.run(second)).rejects.toThrow();
     } finally {
       await writeFile(join(root,'release'),'');
       await first;
     }
     expect(await readFile(join(victim,'assertions.cjs'),'utf8')).toBe('process.exit(0)');
-    await expect(other.run(second)).rejects.toThrow('Input digest mismatch');
-    expect(await other.finish(second)).toBeNull();
+    const receiptPath = join(root,'receipts',second.run+'.receipt');
+    expect((await stat(receiptPath)).mode & 0o777).toBe(0o600);
+    expect(await other.finish(second)).toEqual({v:1,nonce:second.nonce,run:second.run,
+      inputDigest:second.inputDigest,argvDigest:second.argvDigest,lock:second.lock,phase:'not-started',code:75});
+    // Retrying requires fresh prepared state and still rechecks the input digest.
+    const retry = await other.prepare({nonce:second.nonce});
+    const retryWork = join(root,'runs',retry.run,'work');
+    await writeFile(join(retryWork,'package-lock.json'),'different lock');
+    await writeFile(join(retryWork,'assertions.cjs'),'process.exit(0)');
+    await expect(other.run({...second,...retry})).rejects.toThrow('Input digest mismatch');
+    expect(await other.finish({...second,...retry})).toBeNull();
     expect(await runner.finish(request)).toMatchObject({phase:'test',code:0});
   }, 15000);
   it('keeps an abandoned execution guard closed even after finish and pruning age', async () => {
@@ -86,8 +96,8 @@ else {
     await mkdir(active,{mode:0o700});
     const expired = new Date(Date.now()-30*24*60*60*1000);
     await utimes(active,expired,expired);
-    await expect(runner.run(request)).rejects.toThrow('Worker execution busy');
-    expect(await runner.finish(request)).toBeNull();
+    expect(await runner.run(request)).toMatchObject({code:75});
+    expect(await runner.finish(request)).toMatchObject({phase:'not-started',code:75});
     expect((await stat(active)).isDirectory()).toBe(true);
   });
   it('retains the execution guard when a worker command rejects instead of confirming shutdown', async () => {
@@ -99,7 +109,19 @@ process.stdout.write('x'.repeat(4*1024*1024+1));
     expect((await stat(work)).isDirectory()).toBe(true);
     expect((await stat(join(root,'receipts','worker-active'))).isDirectory()).toBe(true);
     const next = await runner.prepare({nonce:request.nonce});
-    await expect(runner.run({...request,...next})).rejects.toThrow('Worker execution busy');
+    expect(await runner.run({...request,...next})).toMatchObject({code:75});
+    expect(await runner.finish({...request,...next})).toMatchObject({phase:'not-started',code:75});
+    await expect(runner.finish(request)).rejects.toThrow('Remote termination unconfirmed');
+  });
+  it('keeps busy state unconsumed when the protected not-started receipt is missing', async () => {
+    const active = join(root,'receipts','worker-active');
+    await mkdir(active,{mode:0o700});
+    expect(await runner.run(request)).toMatchObject({code:75});
+    await rm(join(root,'receipts',request.run+'.receipt'));
+    await expect(runner.finish(request)).rejects.toThrow('Remote non-execution unconfirmed');
+    expect((await stat(work)).isDirectory()).toBe(true);
+    expect((await stat(active)).isDirectory()).toBe(true);
+    await expect(runner.run(request)).rejects.toThrow();
   });
   it('rejects Git-dependent standards requests at the server boundary', async () => {
     const command = ['npm','run','check:standards'];
@@ -214,13 +236,13 @@ await runner.run(JSON.parse(process.argv[3]));`;
       const [message] = await once(holder,'message',{signal:AbortSignal.timeout(10000)});
       expect(message).toBe('install');
       const blocked = await nextRequest();
-      await expect(runner.run(blocked)).rejects.toThrow('Worker execution busy');
-      expect(await runner.finish(blocked)).toBeNull();
+      expect(await runner.run(blocked)).toMatchObject({code:75});
+      expect(await runner.finish(blocked)).toMatchObject({phase:'not-started',code:75});
       holder.kill('SIGKILL');
       expect(await exited).toEqual([null,'SIGKILL']);
       const interrupted = await nextRequest();
-      await expect(runner.run(interrupted)).rejects.toThrow('Worker execution busy');
-      expect(await runner.finish(interrupted)).toBeNull();
+      expect(await runner.run(interrupted)).toMatchObject({code:75});
+      expect(await runner.finish(interrupted)).toMatchObject({phase:'not-started',code:75});
       // Simulate explicit operator recovery only after the orphan is killed.
       const pid = Number(await readFile(join(root,'install-pid'),'utf8'));
       process.kill(-pid,'SIGKILL');

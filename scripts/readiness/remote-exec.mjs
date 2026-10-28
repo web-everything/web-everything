@@ -78,22 +78,43 @@ export function defaultExec({ file, args, cwd, input, inherit = false, signal })
   });
 }
 
+// These basename globs are shared by inventory validation and rsync. Expand
+// letters for rsync's case-sensitive matching rather than maintaining a second,
+// subtly different credential denylist at the transport boundary.
+const omittedFiles = ['.exit-code', 'node_modules', '.git'];
+const credentialFiles = ['.git-credentials', '.git-credentials[-.~_]*', 'id_*',
+  'identity', 'identity[-.~_]*', '.env*', '.secrets', '.ssh', '.aws', '.claude',
+  '.codex', '.npmrc', '.netrc', 'credentials', 'credentials.*', '*.pem', '*.key'];
+const identitySources = ['js', 'mjs', 'cjs', 'ts', 'mts', 'cts', 'jsx', 'tsx'].map(ext => `identity.${ext}`);
+const basenamePattern = glob => new RegExp(`^${glob.replaceAll('.', '\\.').replaceAll('*', '.*')}$`, 'is');
+const omittedPatterns = omittedFiles.map(basenamePattern);
+const credentialPatterns = credentialFiles.map(basenamePattern);
+const identityPatterns = identitySources.map(basenamePattern);
+const rsyncPattern = glob => glob.replace(/[a-z]/g, letter => `[${letter}${letter.toUpperCase()}]`);
+const inventoryFilters = [
+  ...omittedFiles.map(name => `--exclude=${rsyncPattern(name)}`),
+  ...identitySources.map(name => `--include=${rsyncPattern(name)}`),
+  ...credentialFiles.map(name => `--exclude=${rsyncPattern(name)}`),
+];
+
 function safeFiles(files) {
   if (!Array.isArray(files)) throw new Error('Invalid file inventory');
+  const dropped = [];
   const safe = files.filter((path) => {
     if (typeof path !== 'string' || !path || path.startsWith('/') || /[\0\r\n]/.test(path)) throw new Error('Invalid file path');
     const parts = path.split('/');
     if (parts.some((part) => part === '..' || part === '.')) throw new Error('Unsafe file path');
-    return !parts.some((part) => {
-      if (/^identity\.(?:[cm]?[jt]s|[jt]sx)$/i.test(part)) return false;
-      return /^(?:\.exit-code|node_modules|\.git|\.git-credentials(?:[.~_-].*)?|id_.*|identity(?:[.~_-].*)?|\.env.*|\.secrets|\.ssh|\.aws|\.claude|\.codex|\.npmrc|\.netrc|credentials(?:\..*)?|.*\.(?:pem|key))$/i.test(part);
-    });
+    const reason = parts.some(part => omittedPatterns.some(pattern => pattern.test(part))) ? 'generated'
+      : parts.some(part => !identityPatterns.some(pattern => pattern.test(part))
+        && credentialPatterns.some(pattern => pattern.test(part))) ? 'credential' : null;
+    if (reason) dropped.push({ path, reason });
+    return !reason;
   });
   // openrsync still treats leading #/; as comments with --from0. Anchor every
   // validated relative path so both rsync implementations read it literally.
   const input = [...new Set(safe)].map((path) => `./${path}\0`).join('');
   if (Buffer.byteLength(input) > LIMIT) throw new Error('File inventory limit exceeded');
-  return input;
+  return { input, dropped };
 }
 
 export async function runRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, signal } = {}) {
@@ -152,16 +173,16 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
         if(result.code !== 0 || typeof result.stdout !== 'string' || Buffer.byteLength(result.stdout)>LIMIT) throw new Error('Inventory unavailable');
         return result.stdout.split(result.stdout.includes('\0')?'\0':'\n').filter(Boolean);
       })();
-      const inventory = safeFiles(files);
+      const { input: inventory, dropped } = safeFiles(files);
       checkAbort();
+      if(dropped.some(file => file.reason !== 'generated')) return fallback('filtered-inventory');
       if(files.includes('vitest.shared.ts')) return fallback('unsupported-sibling-dependency');
       const prepared = await ssh('prepare',{nonce,label:runId});
       if(prepared.code !== 0 || typeof prepared.stdout !== 'string' || prepared.stdout.length>1024) throw new Error('Prepare failed');
       run = JSON.parse(prepared.stdout).run;
       if(typeof run !== 'string' || !/^r-[a-f0-9]{32}$/.test(run)) {run=undefined; throw new Error('Invalid server run');}
       checkAbort();
-      const copied = await execute({file:'rsync',args:['-a','--delete','--exclude=.exit-code',
-        ...['node_modules','.git','.git-credentials*','id_*','identity','identity.pub*','.env*','.secrets','.ssh','.aws','.claude','.codex','.npmrc','.netrc','credentials*','*.pem','*.key'].map(name=>`--exclude=${name}`),
+      const copied = await execute({file:'rsync',args:['-a','--delete',...inventoryFilters,
         '--from0','--files-from=-','--rsync-path=sudo -u forge-exec rsync','-e',`ssh ${SSH_OPTIONS.join(' ')}`,
         './',`${host}:${ROOT}/${run}/work/`],cwd,input:inventory,signal});
       checkAbort();
@@ -179,6 +200,7 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
       if (signal?.aborted || result.code === 255) return uncertain();
       const receipt = await finish();
       if(!receipt || receipt.code!==0 || typeof receipt.stdout!=='string' || Buffer.byteLength(receipt.stdout)>4096) return uncertain();
+      if(result.code===75 && verifyReceipt(receipt.stdout,expected,result.code,'not-started')) return fallback('worker-busy');
       if(verifyReceipt(receipt.stdout,expected,result.code,'install')) return {mode:'not-started',reason:'install-failed',code:result.code,terminated:true};
       if(!verifyReceipt(receipt.stdout,expected,result.code)) return uncertain();
       return {mode:'remote',code:result.code};

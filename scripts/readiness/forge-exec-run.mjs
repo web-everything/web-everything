@@ -183,16 +183,16 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
       return {...result,code};
     } finally {await rm(status,{force:true});}
   }
-  async function exclusiveWorker(action) {
+  async function exclusiveWorker(action, busy) {
     // All work still shares one uid. Serialize across ALL profiles and runners,
     // before hashing input, until the supervisor has reaped every descendant.
     // An atomic directory persists across wrapper/supervisor death. Never age
     // it out: an orphan could still modify another run under the shared uid.
     const active=join(receipts,'worker-active');
-    await mkdir(active,{mode:0o700}).catch(error=>{
-      if(error.code==='EEXIST') throw new Error('Worker execution busy or interrupted; use local fallback. Operator must stop all forge-exec processes before removing /srv/forge-receipts/worker-active');
+    try {await mkdir(active,{mode:0o700});} catch(error) {
+      if(error.code==='EEXIST') return busy();
       throw error;
-    });
+    }
     let settled=true;
     const command=async (...args)=>{
       settled=false;
@@ -293,15 +293,28 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
       const receipt={...prepared,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code};
       await writeFile(statePath(request.run,'receipt'),JSON.stringify(receipt),{flag:'wx',mode:0o600});
       return result;
+      }, async () => {
+        // This attempt never acquired the worker and cannot execute any command.
+        // Retire prepared state before publishing evidence so it cannot be retried
+        // later against a stale not-started receipt. Leave the holder's lock alone.
+        await rename(statePath(request.run,'prepared'),statePath(request.run,'not-started'));
+        const receipt={...prepared,inputDigest:request.inputDigest,argvDigest:request.argvDigest,
+          lock:request.lock,phase:'not-started',code:75};
+        await writeFile(statePath(request.run,'receipt'),JSON.stringify(receipt),{flag:'wx',mode:0o600});
+        return {code:75,stdout:'',stderr:'Worker execution busy or interrupted; use local fallback.'};
       });
     },
     async finish(request) {
       // Only the protected state is evidence; receipt-like files in work are data.
       let phase='running';
-      try {await state(request,phase);} catch {phase='prepared'; await state(request,phase);}
+      try {await state(request,phase);} catch {
+        phase='not-started';
+        try {await state(request,phase);} catch {phase='prepared'; await state(request,phase);}
+      }
       let receipt;
       try {receipt=JSON.parse(await readPinned(statePath(request.run,'receipt')));} catch(e) {if(e.code!=='ENOENT') throw e;}
       if (phase==='running' && (!receipt || !['install','test'].includes(receipt.phase))) throw new Error('Remote termination unconfirmed');
+      if (phase==='not-started' && (!receipt || receipt.phase!=='not-started' || receipt.code!==75)) throw new Error('Remote non-execution unconfirmed');
       const container=join(runs,request.run);
       await directory(container,true);
       // The worker owns work and may remove ops' write permission. Only the
