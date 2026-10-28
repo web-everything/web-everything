@@ -27,6 +27,7 @@ export default {
       && planner.includes('c.updatedAt ?? c.updated_at')
       && planner.includes('Math.max(created, edited)')
       && planner.includes('readCompletePrCommentEditHistory(number, options)')
+      && planner.includes('comment thread changed during read')
       && planner.indexOf('provider.ensureLabel(') < planner.indexOf('const fresh = readLive()')
       && !planner.includes("status?.result.foldedVerdict === 'changes'")
       && reader.includes("fields = 'number,state,labels,headRefOid'");
@@ -60,11 +61,14 @@ export default {
     for (const scenario of ['changes', 'accept', 'abstain', 'later-changes', 'newer-accept',
       'awaiting-confirm', 'racing-changes', 'native-changes', 'during-run-changes',
       'failed-self-accept', 'edited-changes', 'rest-edited-changes', 'unknown-edit', 'racing-edit',
-      'production-comments', 'production-edited', 'production-unedited', 'degraded-stored-changes', 'not-real-stored-changes',
+      'production-comments', 'production-edited', 'production-unedited', 'production-racing-edit',
+      'degraded-stored-changes', 'not-real-stored-changes',
       'provision-changes', 'provision-edit', 'provision-native']) {
       const confirm = ['changes', 'abstain'].includes(scenario) ? scenario
         : scenario === 'awaiting-confirm' ? undefined : 'accept';
       let labels = ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held', 'ready-to-merge'];
+      const racingEdit = scenario === 'production-racing-edit';
+      if (racingEdit) labels = labels.filter(l => l !== 'ready-to-merge');
       const review = { id: 'review-pr-accepted', op: 'review-pr', input: { reason: 'remaining operator blocker' }, findings: {
         read: { repo, pr: number, netBasis: { rev: head } }, ...(confirm ? { confirm } : {}),
         record: { applied: true, effects: [{ type: 'review.label-swap', status: 'applied' }] },
@@ -108,14 +112,18 @@ export default {
           body: `<!-- we:red-team-gate pr=${number} rev=${head} outcome=operator-not-real -->\n- 1 finding(s) left advisory (#1).` });
       }
       // racing-changes: the verdict is posted after the first thread read, before the final one.
-      let threadReads = 0;
+      let threadReads = 0, editReads = 0;
       const readComments = () => {
         threadReads++;
-        if (['production-edited', 'production-unedited'].includes(scenario)) return readLabelReconcileComments(number, { repo,
+        if (racingEdit || ['production-edited', 'production-unedited'].includes(scenario)) return readLabelReconcileComments(number, { repo,
           exec: (_cmd, argv) => {
+            if (racingEdit && !argv.includes('graphql') && editReads < 2) {
+              return 'Operator note\t2026-10-26T00:59:00Z\tchalbert\tIC_old\thttps://example.test/comment\n';
+            }
             if (!argv.includes('graphql')) return '🔁 review — changes requested\t2026-10-26T00:59:00Z\tchalbert\tIC_old\thttps://example.test/comment\n';
             const connection = argv.some(a => a.includes('lastEditedAt'))
-              ? { nodes: [{ id: 'IC_old', lastEditedAt: scenario === 'production-edited' ? '2026-10-26T01:02:00Z' : null }],
+              ? { nodes: [{ id: 'IC_old', lastEditedAt: scenario === 'production-edited' || (racingEdit && ++editReads > 1)
+                ? '2026-10-26T01:02:00Z' : null }],
                 pageInfo: { hasNextPage: false, endCursor: null } } : { totalCount: 1 };
             return JSON.stringify({ data: { repository: { pullRequest: { comments: connection } } } });
           } });
@@ -154,6 +162,17 @@ export default {
             if (add) labels.push(...add.split(','));
           } } };
       const rows = sweepLabelStateReconcile(io);
+      if (racingEdit) {
+        const held = ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held'];
+        if (rows[0]?.error !== 'comment thread changed during read' || JSON.stringify(labels) !== JSON.stringify(held)) {
+          violations.push(`${scenario}: torn read cleared holds (${labels.join(',')})`);
+        }
+        io.prs[0].labels = labels;
+        if (sweepLabelStateReconcile(io).length || JSON.stringify(labels) !== JSON.stringify(held)) {
+          violations.push(`${scenario}: retry failed to preserve the fresh objection`);
+        }
+        continue;
+      }
       if (rows.some(row => row.error)) violations.push(`${scenario}: sweep failed`);
       const expected = ['abstain', 'awaiting-confirm', 'failed-self-accept'].includes(scenario)
         ? ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held', 'ready-to-merge']

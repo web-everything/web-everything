@@ -464,6 +464,59 @@ describe('shared red-team disposition inputs', () => {
 });
 
 describe('sweepLabelStateReconcile', () => {
+  function threadReader(before, after, raceOnRead = 1) {
+    let editReads = 0;
+    const calls = [];
+    const exec = (_cmd, argv) => {
+      if (!argv.includes('graphql')) {
+        calls.push('body');
+        return 'Operator note\t2026-10-26T00:59:00Z\tchalbert\tIC_old\thttps://example.test/comment\n';
+      }
+      const history = argv.some(a => a.includes('lastEditedAt'));
+      calls.push(history ? 'edits' : 'count');
+      const comments = history ? { nodes: ++editReads >= raceOnRead * 2 ? after : before,
+        pageInfo: { hasNextPage: false, endCursor: null } } : { totalCount: 1 };
+      return JSON.stringify({ data: { repository: { pullRequest: { comments } } } });
+    };
+    return { calls, read: (number, options) => readLabelReconcileComments(number, { ...options, exec }) };
+  }
+  const unedited = [{ id: 'IC_old', lastEditedAt: null }];
+  const edited = [{ id: 'IC_old', lastEditedAt: '2026-10-26T01:02:00Z' }];
+  it('a comment edited between the body and edit-history reads fails closed', () => {
+    const reader = threadReader(unedited, edited);
+    expect(() => reader.read(5954, { repo })).toThrow('comment thread changed during read');
+    expect(reader.calls).toEqual(['edits', 'body', 'count', 'edits']);
+  });
+  it.each(['added', 'deleted', 'replaced', 'duplicate'])('a comment %s between edit snapshots fails closed', kind => {
+    const after = kind === 'added' ? [...unedited, { id: 'IC_new', lastEditedAt: null }]
+      : kind === 'deleted' ? [] : kind === 'duplicate' ? [...unedited, ...unedited]
+        : [{ id: 'IC_new', lastEditedAt: null }];
+    expect(() => threadReader(unedited, after).read(5954, { repo }))
+      .toThrow('comment thread changed during read');
+  });
+  it.each([1, 2])('an edit during sweep read %s preserves holds without clearance', raceOnRead => {
+    const io = fixture(), reader = threadReader(unedited, edited, raceOnRead);
+    io.prs[0].labels = ['review:changes', 'fix-waiting:host-busy'];
+    const labels = [...io.prs[0].labels];
+    io.readComments = reader.read;
+    expect(sweepLabelStateReconcile(io)).toEqual([{ num: 5954, error: 'comment thread changed during read' }]);
+    expect(io.provider.setLabels).not.toHaveBeenCalled();
+    expect(io.emit).not.toHaveBeenCalled();
+    expect(io.prs[0].labels).toEqual(labels);
+    expect(io.prs[0].labels).not.toContain('ready-to-merge');
+  });
+  it.each([[unedited], [edited]])('an unchanged thread retains its verified edit stamp (%j)', snapshot => {
+    const reader = threadReader(snapshot, snapshot);
+    expect(reader.read(5954, { repo })[0].updatedAt)
+      .toBe(snapshot[0].lastEditedAt ?? '2026-10-26T00:59:00Z');
+    expect(reader.calls).toEqual(['edits', 'body', 'count', 'edits']);
+    const io = fixture();
+    io.prs[0].labels = ['review:changes', 'fix-waiting:host-busy'];
+    io.readComments = reader.read;
+    expect(sweepLabelStateReconcile(io)[0].labelsReconciled.to).toEqual([]);
+    expect(io.provider.setLabels).toHaveBeenCalledWith(repo, 5954,
+      { add: null, remove: ['review:changes', 'fix-waiting:host-busy'] });
+  });
   it.each(['injected', 'process', 'default'])
   ('the sweep carries the %s policy through both plans to the label writer', kind => {
     const io = fixture(), live = io.prs[0];

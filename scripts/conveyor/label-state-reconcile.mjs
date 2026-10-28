@@ -16,11 +16,17 @@ import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 
 const names = labels => labels.map(l => typeof l === 'string' ? l : l.name);
 
-/** The shared body reader omits edit times. Join the complete edit metadata by node ID before trusting age. */
+/** The body reader omits edit times. Require stable edit snapshots around it before trusting age. */
 export function readLabelReconcileComments(number, options = {}) {
+  const before = readCompletePrCommentEditHistory(number, options);
   const comments = readCompletePrComments(number, options);
   const edits = readCompletePrCommentEditHistory(number, options);
   const byId = new Map(edits.map(c => [c.id, c.lastEditedAt]));
+  const beforeById = new Map(before.map(c => [c.id, c.lastEditedAt]));
+  if (beforeById.size !== before.length || byId.size !== edits.length || beforeById.size !== byId.size
+    || before.some(c => !byId.has(c.id) || byId.get(c.id) !== c.lastEditedAt)) {
+    throw Error('comment thread changed during read');
+  }
   if (byId.size !== edits.length || byId.size !== comments.length || comments.some(c => !byId.has(c.id))) {
     throw Error('comment edit metadata does not cover the complete thread');
   }
