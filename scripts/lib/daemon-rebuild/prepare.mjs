@@ -428,14 +428,19 @@ export async function prepareRebuild({
     }
   }
   // Adopted inputs name the registration each tip came from, so a later re-registration of the same ref is told
-  // apart from it (unavailable pins and retirement evidence above, via sameRegistration). Legacy entries stay as-is.
+  // apart from it (unavailable pins and retirement evidence above, via sameRegistration). An input left unbound
+  // (a legacy registration, or a `pinnedFrom` tip) records when its inputs were captured instead: taken after every
+  // registry read this plan used, so only a registration made later is told apart — adoption time comes after smoke
+  // or a crash recovery and would let a re-registration in between inherit the pin.
   if (plan.ok && Array.isArray(plan.applied)) {
     const registrations = new Map(overlaysForPlan.map((o) => [o?.ref, o]));
+    const capturedAt = nowIso();
     // A tip pinned at the previously adopted head (`pinnedFrom`) may predate this registration: leave it unbound.
     plan.applied = plan.applied.map((a) => {
       const o = registrations.get(a?.ref);
+      if (!a || typeof a !== 'object' || a.registrationId != null) return a;
       return o?.registrationId != null && !a.pinnedFrom && sameRegistration({ ref: a.ref, pr: a.pr }, o)
-        ? { ...a, registrationId: o.registrationId } : a;
+        ? { ...a, registrationId: o.registrationId } : { ...a, capturedAt: a.capturedAt ?? capturedAt };
     });
   }
   // The chains gh answered completely are written back onto the entries (only when they changed), so a rebuild that

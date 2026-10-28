@@ -342,7 +342,8 @@ export function recordEdgeResolution(root, ref, {
  * Does an adopted build's applied input come from this registration? Matched on registrationId, and PR when both
  * name one, so a re-registered ref never inherits the previous registration's pin or tip. A record or entry from
  * before applied inputs carried a registrationId cannot prove a new registration: ref + PR decides, failing closed —
- * except that an unbound input never belongs to a registration made after its build was adopted (`adoptedAt`).
+ * except that an unbound input never belongs to a registration made after its inputs were captured
+ * (`applied.capturedAt`, else the build's `adoptedAt`).
  * @param {{adoptedAt?: string}} [o]
  */
 export function sameRegistration(applied, entry, { adoptedAt } = {}) {
@@ -352,7 +353,7 @@ export function sameRegistration(applied, entry, { adoptedAt } = {}) {
   if (prOf(applied.pr) != null && prOf(id.pr) != null && prOf(applied.pr) !== prOf(id.pr)) return false;
   if (applied.registrationId == null) {
     const registered = Date.parse(id.registeredAt ?? '');
-    const adopted = Date.parse(adoptedAt ?? '');
+    const adopted = Date.parse(applied.capturedAt ?? adoptedAt ?? '');
     return !(Number.isFinite(registered) && Number.isFinite(adopted) && registered > adopted);
   }
   if (id.registrationId == null) return true;
@@ -363,7 +364,7 @@ export function sameRegistration(applied, entry, { adoptedAt } = {}) {
  * Every archived snapshot (all carriers, nested included) that is no longer the current registration of its ref:
  * - only the newest archive counts: latest `retiredAt` instant, then registration time, tie-broken by
  *   registrationId. A legacy unstamped snapshot is older than any stamped one; unstamped ones are ordered by
- *   registration time (`registeredAt`, else `addedAt`), then outer before nested (a nested one was archived first);
+ *   registration time (`registeredAt`, else `addedAt`), then archive order (later wins);
  * - `applied` (ref → registrationId the candidate build applies from a fresh tip) also supersedes every archive
  *   of a different registration of that ref, including a legacy archive with no registrationId: they all predate
  *   it, a ref having one registration at a time. Mere registration is not enough — a re-registration with a
@@ -378,12 +379,14 @@ export function supersededSnapshots(list, { applied = new Map() } = {}) {
   const latest = new Map();
   const superseded = new Set();
   let seq = 0;
-  const key = (s, n, depth) => {
+  const key = (s, n) => {
     const at = typeof s.retiredAt === 'string' ? Date.parse(s.retiredAt) : NaN;
     const reg = Date.parse(s.entry?.registeredAt ?? s.entry?.addedAt ?? '');
     const registered = Number.isFinite(reg) ? reg : 0;
+    // Unstamped ties keep archive order: nesting depth cannot say which archive is newer (a carrier holding a newer
+    // archive can itself be retired into one holding an older archive).
     return Number.isFinite(at) ? [1, at, registered, String(s.entry?.registrationId ?? ''), n]
-      : [0, registered, -depth, '', n];
+      : [0, registered, 0, '', n];
   };
   const newer = (a, b) => {
     for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return a[i] > b[i];
@@ -397,7 +400,7 @@ export function supersededSnapshots(list, { applied = new Map() } = {}) {
       if (isSafeBranchName(ref)) {
         const current = active.get(ref);
         if (current != null && s.entry.registrationId !== current) superseded.add(s);
-        const k = key(s, seq += 1, depth);
+        const k = key(s, seq += 1);
         const cur = latest.get(ref);
         if (!cur) latest.set(ref, { s, k });
         else if (newer(k, cur.k)) { superseded.add(cur.s); latest.set(ref, { s, k }); }

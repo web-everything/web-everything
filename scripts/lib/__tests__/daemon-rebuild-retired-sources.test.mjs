@@ -111,7 +111,8 @@ describe('archived sources remain represented in preparation', () => {
       return f.git(args);
     } });
     expect(next.result.reason).toBe('up-to-date');
-    expect(next.result.plan.applied).toContainEqual({ ref: 'lower', sha: '8'.repeat(40) });
+    // `lower` is a legacy (unbound) registration, so its input carries the plan's capture time.
+    expect(next.result.plan.applied).toContainEqual({ ref: 'lower', sha: '8'.repeat(40), capturedAt: expect.any(String) });
     expect(ancestry).toContainEqual(['2'.repeat(40), '4'.repeat(40)]);
     expect(model.plans).toEqual([['top'], ['lower', 'top']]);
     expect(f.refs()).toEqual(['lower', 'top']);
@@ -468,7 +469,7 @@ describe('archived sources remain represented in preparation', () => {
     expect(next.result.reason).toBe('up-to-date');
   });
 
-  it('unstamped archives are ordered by registration time, then outer before nested — never by carrier order', () => {
+  it('unstamped archives are ordered by registration time, then archive order — never by carrier order alone', () => {
     const pr1 = { entry: { ref: 'x', pr: 1, addedAt: '2026-09-01T00:00:00.000Z' }, sha: A };
     const pr2 = { entry: { ref: 'x', pr: 2, addedAt: '2026-09-02T00:00:00.000Z' }, sha: B };
     for (const list of [[{ ref: 'c2', retiredSources: [pr2] }, { ref: 'c1', retiredSources: [pr1] }],
@@ -476,11 +477,40 @@ describe('archived sources remain represented in preparation', () => {
       const superseded = supersededSnapshots(list);
       expect([superseded.has(pr1), superseded.has(pr2)]).toEqual([true, false]);
     }
-    const at = '2026-09-01T00:00:00.000Z';
-    const inner = { entry: { ref: 'x', pr: 1, addedAt: at }, sha: A };
-    const outer = { entry: { ref: 'x', pr: 2, addedAt: at, retiredSources: [{ entry: { ref: 'c1', retiredSources: [inner] }, sha: F }] }, sha: B };
-    const superseded = supersededSnapshots([{ ref: 'c3', retiredSources: [outer] }]);
-    expect([superseded.has(inner), superseded.has(outer)]).toEqual([true, false]);
+    // Tied registration time: archive order decides, whatever the nesting (C2, holding the newer X/PR2, was
+    // retired into C1 after C1 archived X/PR1).
+    const older = { entry: { ref: 'x', pr: 1 }, sha: A };
+    const newer = { entry: { ref: 'x', pr: 2 }, sha: B };
+    const superseded = supersededSnapshots([{ ref: 'c1', retiredSources: [older,
+      { entry: { ref: 'c2', retiredSources: [newer] }, sha: F }] }]);
+    expect([superseded.has(older), superseded.has(newer)]).toEqual([true, false]);
+  });
+
+  it('an unbound input captured before a re-registration never pins it, even when adopted after it', async () => {
+    const f = fixture();
+    writeOverlays(root, [{ ref: 'x', pr: null, registrationId: 'r2', registeredAt: '2026-10-02T00:00:00.000Z',
+      addedAt: '2026-09-01T00:00:00.000Z' }], { env: f.env });
+    // Captured before X was re-registered; smoke (or a crash recovery) adopted it only afterwards.
+    writeRebuildState(root, { adopted: { head: '1'.repeat(40), mainSha: '1'.repeat(40), at: '2026-10-03T00:00:00.000Z',
+      applied: [{ ref: 'x', pr: null, sha: A, capturedAt: '2026-10-01T00:00:00.000Z' }] } }, f.env);
+    const next = await f.prepare({ run: (args) => {
+      if (args[0] === 'fetch' && args.some((a) => a.includes('heads/x:'))) return { status: 1, stdout: '' };
+      if (args[0] === 'diff' && args.includes(A)) return { status: 0, stdout: 'scripts/lib/daemon-rebuild.mjs\n' };
+      return f.git(args);
+    } });
+    expect(next.result.reason).not.toBe('pinned-overlay-unavailable');
+  });
+
+  it('a plan stamps unbound inputs with their capture time and binds the rest to their registration', async () => {
+    const f = fixture();
+    f.env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'off';
+    writeOverlays(root, [{ ref: 'lower', pr: 1 }, { ref: 'top', pr: 2, registrationId: 'r-top' }], { env: f.env });
+    const next = await f.prepare({ now: () => Date.parse('2026-10-05T00:00:00.000Z') });
+    expect(next.result.plan.applied).toEqual([
+      expect.objectContaining({ ref: 'lower', capturedAt: '2026-10-05T00:00:00.000Z' }),
+      expect.objectContaining({ ref: 'top', registrationId: 'r-top' }),
+    ]);
+    expect(next.result.plan.applied[1].capturedAt).toBeUndefined();
   });
 
   it('restoration preserves duplicate snapshots and recovers older nested sources', () => {
