@@ -9,7 +9,7 @@ import {
   isAllowedCommand, filterEnv, validateRunId,
   runRemote, runWithRemoteFallback, parseArgs,
 } from '../remote-exec.mjs';
-import { createRunner } from '../forge-exec-run.mjs';
+import { createRunner, digestInput, digestArgv } from '../forge-exec-run.mjs';
 
 const argv = ['npm', 'run', 'test:unit', '--', 'a.test.mjs'];
 const runId = 'abcdef-1';
@@ -106,6 +106,62 @@ function realRemoteFixture(files) {
 }
 
 describe('remote snapshot regressions', () => {
+  it('rejects real npm shrinkwrap precedence before caching and installs the next lock-only input cold', async () => {
+    const files = ['package.json', 'package-lock.json', 'probe.cjs', 'dependency-1.tgz', 'dependency-2.tgz'];
+    const dependencies = { 'cache-dependency': '*' };
+    writeFileSync(join(cwd,'package.json'), JSON.stringify({
+      name:'fixture', version:'1.0.0', dependencies, scripts:{'test:unit':'node probe.cjs'},
+    }));
+    writeFileSync(join(cwd,'probe.cjs'), "console.log('RESOLVED ' + require('cache-dependency/package.json').version)");
+    for (const version of [1, 2]) {
+      const source = join(cwd, `source-${version}`);
+      mkdirSync(join(source,'package'), {recursive:true});
+      writeFileSync(join(source,'package/package.json'), JSON.stringify({name:'cache-dependency',version:`${version}.0.0`}));
+      const archive = `dependency-${version}.tgz`;
+      const packed = spawnSync('tar', ['-czf',join(cwd,archive),'-C',source,'package'], {encoding:'utf8'});
+      expect(packed.status, packed.stderr).toBe(0);
+      writeFileSync(join(cwd,version === 1 ? 'package-lock.json' : 'npm-shrinkwrap.json'), JSON.stringify({
+        name:'fixture', version:'1.0.0', lockfileVersion:3, packages:{
+          '':{name:'fixture',version:'1.0.0',dependencies},
+          'node_modules/cache-dependency':{version:`${version}.0.0`,resolved:`file:${archive}`,
+            integrity:'sha512-'+createHash('sha512').update(readFileSync(join(cwd,archive))).digest('base64')},
+        },
+      }));
+    }
+    const f = realRemoteFixture(files);
+    // Establish the actual npm precedence using only local tarballs, without a registry.
+    const baseline = spawnSync(join(f.bin,'npm'), ['ci','--ignore-scripts','--no-audit','--no-fund'], {cwd,encoding:'utf8',timeout:20000});
+    expect(baseline.status, baseline.stderr).toBe(0);
+    expect(JSON.parse(readFileSync(join(cwd,'node_modules/cache-dependency/package.json'),'utf8')).version).toBe('2.0.0');
+    const npmWrapper = readFileSync(join(f.bin,'npm'),'utf8');
+    writeFileSync(join(f.bin,'npm'), npmWrapper.replace('#!/bin/bash\n', '#!/bin/bash\nprintf "%s\\n" "$*" >> "$HOME/install.log"\n'));
+    const runner = createRunner({testRoot:f.root,testPath:`${f.bin}:/usr/bin:/bin`});
+    const lock = createHash('sha256').update(readFileSync(join(cwd,'package-lock.json'))).digest('hex');
+    for (const dual of [true, false]) {
+      const nonce = (dual ? 'b' : 'c').repeat(32);
+      const prepared = await runner.prepare({nonce});
+      const work = join(f.root,'runs',prepared.run,'work');
+      for (const file of [...files,...(dual ? ['npm-shrinkwrap.json'] : [])]) writeFileSync(join(work,file),readFileSync(join(cwd,file)));
+      // HOME is fixed by the wrapper; create it so the real npm adapter can log calls.
+      mkdirSync(join(work,'.forge-home'));
+      const request = {...prepared,nonce,argv,env:{CI:'true'},lock,argvDigest:digestArgv(argv),inputDigest:await digestInput(work)};
+      try {
+        if (dual) {
+          await expect(runner.run(request)).rejects.toThrow(/shrinkwrap/i);
+          expect(existsSync(join(work,'.forge-home/install.log'))).toBe(false);
+          expect(existsSync(join(f.root,'cache',lock))).toBe(false);
+        } else {
+          const result = await runner.run(request);
+          expect(result, result.stderr).toMatchObject({code:0});
+          expect(result.stdout).toContain('RESOLVED 1.0.0');
+          const installs = readFileSync(join(work,'.forge-home/install.log'),'utf8');
+          expect(installs).toContain('ci --include=dev --ignore-scripts --no-audit --no-fund');
+          expect(installs).not.toContain('--dry-run');
+          expect(existsSync(join(f.root,'cache',lock,'dev-v4/dependencies.tar'))).toBe(true);
+        }
+      } finally { await runner.finish(request); }
+    }
+  }, 120000);
   it.each(['parent', 'nested parent', 'leaf', 'dangling parent'])('rejects a %s symlink before invoking rsync', async (kind) => {
     const f = fixture();
     const external = join(cwd,'external');
