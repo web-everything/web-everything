@@ -6,6 +6,8 @@ import { join } from 'node:path';
 import { makeCliMechanicalPasses, MECHANICAL_PASS_NAMES } from '../../../../skills-src/conveyor/runner.mjs';
 import { runPassAsTimedJob } from '../../../../skills-src/conveyor/pass-daemon.mjs';
 import { createJobStore } from '../../../lib/daemon-jobs-runtime.mjs';
+import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
+import { keepAliveScript } from '../../../lib/test-keepalive.mjs';
 
 export default {
   id: 'runner-snapshot-blocks-deadlines',
@@ -47,7 +49,7 @@ export default {
       policyOptions: { platform: null, tool: { timeoutMs: 30 }, env: {}, log() {} },
       log() {}, alert() {},
     };
-    writeFileSync(join(root, 'hung.mjs'), 'setTimeout(() => {}, 5000);');
+    writeFileSync(join(root, 'hung.mjs'), keepAliveScript({ anchorPid: process.pid, maxLifetimeMs: 5000 }));
     writeFileSync(join(root, 'blocked-fetch.mjs'), `
       const until = Date.now() + 400;
       while (Date.now() < until) {}
@@ -56,7 +58,7 @@ export default {
     const existing = runPassAsTimedJob({ passName: 'existing', repo: 'fixture/repo', entry: { script: 'hung.mjs', quiet: true } }, ports);
     try {
       const passes = makeCliMechanicalPasses({
-        scriptsDir: join(root, 'scripts'), repo: 'web-everything/web-everything',
+        scriptsDir: join(root, 'scripts'), repo: CONSTELLATION_REPOS.we.slug,
         skipPasses: new Set(MECHANICAL_PASS_NAMES.filter(name => !['infra-blocked', 'parked-pr-progress-watch'].includes(name))),
         // This is the old discovery port: the pre-fix runner executes it inline.
         // The repaired runner instead dispatches discovery through runPass below.
