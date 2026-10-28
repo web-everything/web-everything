@@ -171,6 +171,12 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
         writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, 'utf8')), pid: process.pid + 1 }));
         return {};
       }],
+      ['the owning process start time (a reused pid)', (f, lp) => {
+        admit(f, lp);
+        const path = statusFile(f);
+        writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, 'utf8')), pidStart: 'an-earlier-process' }));
+        return {};
+      }],
       ['the owning host', (f, lp) => { admit(f, lp); return { opts: { host: 'another-host' } }; }],
       ['the owning pid namespace', (f, lp) => { admit(f, lp); return { opts: { namespace: 'another-namespace' } }; }],
     ])('refuses to refund without %s, and the retry stays spent', (_clause, arrange) => {
@@ -185,8 +191,10 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     it('a crash after the refund removed the marker still counts the queued retry as spent', () => {
       const f = fixture(), loopPayload = payload(f.head);
       admit(f, loopPayload);
-      expect(() => settle(f, loopPayload, {}, { readPidStart: () => { throw Error('crash after refund'); } }))
-        .toThrow('crash after refund');
+      // The ownership check reads the start time; the status write's read then crashes.
+      let reads = 0;
+      const readPidStart = pid => { if (++reads > 1) throw Error('crash after refund'); return pidStartTime(pid); };
+      expect(() => settle(f, loopPayload, {}, { readPidStart })).toThrow('crash after refund');
       expect(existsSync(`${statusFile(f)}.retry-1`)).toBe(false);
       expect(readRedTeamStatus(f)).toMatchObject({ status: 'queued', retryCount: 1 });
       expect(() => admit(f, loopPayload)).toThrow('retry already admitted');

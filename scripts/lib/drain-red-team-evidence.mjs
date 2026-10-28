@@ -61,8 +61,10 @@ export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = nu
   // moves the status to running, so only the still-queued admission record may refund; anything else keeps it.
   // A crash after removing the marker leaves the queued retryCount, which still counts as spent.
   // Any other record keeps the spend: the write below then proceeds as an ordinary settlement.
+  // The start time rules out a later process that reused a dead admitter's pid.
   const refund = refundRetry === true && retryCount === undefined && prior?.status === 'queued' && prior.retryCount === 1
-    && prior.pid === process.pid && prior.host === host && prior.pidNamespace === namespace;
+    && prior.pid === process.pid && prior.host === host && prior.pidNamespace === namespace
+    && prior.pidStart === readPidStart(process.pid);
   if (refund) rmSync(retryMarker, { force: true });
   // The exclusive create is the spend: status read/write/read cannot arbitrate workers.
   // Keep the marker even if the subsequent write fails; an operator must inspect that attempt.
