@@ -123,7 +123,8 @@ describe('deterministic first-match judge classification', () => {
 });
 
 // Keep facts() historical: new observations are opt-in so old callers exercise absent fields.
-const stallDefaults = { fixerInfraLoop: 3, needsHumanAgedHours: 6, draftWithdrawnAgedHours: 4, waitingFixerMinutes: 45 };
+const stallDefaults = { fixerInfraLoop: 3, needsHumanAgedHours: 6, draftWithdrawnAgedHours: 4, waitingFixerMinutes: 45,
+  unownedMinutes: 45 };
 const judgmentReason = (patch, id, thresholds) => {
   expect(needsJudgment(facts(patch), thresholds)).toEqual({
     needsJudgment: true, reason: expect.stringMatching(new RegExp(`^${id}`)),
@@ -214,13 +215,14 @@ describe('stall judgment reasons and compatibility', () => {
   it('pins historical bundle rows and results when all new observations are absent or null', () => {
     const old = [facts({ round: 5 }), facts({ number: 2, inCi: true }), facts({ number: 3, labels: ['review:changes'] })];
     const expectedRows = [
-      { number: 1, round: 5, needsJudgment: true, reason: 'at-cap' },
-      { number: 2, round: 1, needsJudgment: false, reason: 'in CI' },
-      { number: 3, round: 1, needsJudgment: false, reason: 'waiting for fixes' },
+      { number: 1, round: 5, needsJudgment: true, reason: 'at-cap', nextOwner: 'judge' },
+      { number: 2, round: 1, needsJudgment: false, reason: 'in CI', nextOwner: 'nobody' },
+      { number: 3, round: 1, needsJudgment: false, reason: 'waiting for fixes', nextOwner: 'nobody' },
     ].map(row => ({ title: 'fixture', labels: row.number === 3 ? ['review:changes'] : [], headSha: SHA, cap: 5,
       redTeam: { state: 'unknown', latestResultId: null, latestOutcome: null }, latestVerdict: null,
       openReferrals: [], openSendBacks: [], lastFixLoop: null, humanRequired: null,
-      minutesSinceUpdate: 1, evidenceErrors: [], ...row }));
+      minutesSinceUpdate: 1, evidenceErrors: [], ownerSince: 1,
+      nextStep: expect.stringMatching(/^[^\r\n]+$/), ...row }));
     expect(buildJudgeSweepBundle({ generatedAt: at(0), elapsedMs: 12, prs: old })).toEqual({
       generatedAt: at(0), elapsedMs: 12, counts: { needsJudgment: 1, noAction: 2 }, prs: expectedRows,
     });
@@ -235,7 +237,8 @@ describe('stall judgment reasons and compatibility', () => {
     const { fixerRunning, inCi, owner, verdictHistory, ignoredFindingReturned, ...publicFacts } = input;
     const bundle = buildJudgeSweepBundle({ generatedAt: at(0), elapsedMs: 12, prs: [input] });
     expect(bundle).toEqual({ generatedAt: at(0), elapsedMs: 12, counts: { needsJudgment: 1, noAction: 0 },
-      prs: [{ ...publicFacts, needsJudgment: true, reason: expect.stringMatching(/^fixer-infra-loop/) }] });
+      prs: [{ ...publicFacts, needsJudgment: true, reason: expect.stringMatching(/^fixer-infra-loop/),
+        nextOwner: 'judge', nextStep: expect.stringMatching(/^[^\r\n]+$/), ownerSince: 5 }] });
   });
 });
 
@@ -245,6 +248,7 @@ describe('stall threshold policy cascade (injected IO only)', () => {
   });
   it('exports a resolver with the standard defaults', () => {
     expect(judgeSweepFactsIo.resolveStallThresholds).toBeTypeOf('function');
+    expect(judgeSweepFacts.STALL_DEFAULTS).toEqual(stallDefaults);
     expect(resolve(undefined)).toMatchObject(stallDefaults);
   });
   it('resolves standard then platform then tool then the JSON environment override', () => {
@@ -262,6 +266,137 @@ describe('stall threshold policy cascade (injected IO only)', () => {
   it('falls through unreadable settings with an empty environment to standard defaults', () => {
     expect(judgeSweepFactsIo.resolveStallThresholds({ env: {}, platform: null,
       readFile: () => { throw new Error('unreadable'); } })).toMatchObject(stallDefaults);
+  });
+});
+
+describe('next responsible owner from existing facts', () => {
+  const ownerCases = [
+    ['fixer', { fixerRunning: true }],
+    ...['status:answered-waiting-fixer', 'review:changes'].flatMap(label => [
+      ['fixer', { labels: [label], minutesSinceFixDispatch: 0 }],
+      ['fixer', { labels: [label], minutesSinceFixDispatch: 45 }],
+      ['nobody', { labels: [label], minutesSinceFixDispatch: null }],
+      ['nobody', { labels: [label], minutesSinceFixDispatch: 46 }],
+    ]),
+    ['drain', { labels: ['review:accepted', 'ready-to-merge'] }],
+    ...['review:accepted', 'review:human', 'status:needs-you'].map(label => ['operator', { labels: [label] }]),
+    ['red-team', { redTeam: { state: 'pending' } }],
+    ['red-team', { labels: ['red-team:pending'] }],
+    ...['review:pending', 'status:awaiting-review'].map(label => ['review', { labels: [label] }]),
+    ['judge', { evidenceErrors: ['comments unreadable'] }],
+    ['judge', { infraFailStreak: 3 }],
+    ['judge', { round: 5 }],
+    ['judge', { openReferrals: [{ ruled: false, superseded: false }] }],
+    ['judge', { labels: ['status:needs-human'], minutesSinceHeadChange: 361 }],
+    ['judge', { labels: ['review-status:needs-human'], minutesSinceHeadChange: 361 }],
+    ['orchestrator', { labels: ['review-status:draft-withdrawn'] }],
+    ['orchestrator', { isDraft: true }],
+    ['orchestrator', { labels: ['status:needs-human'] }],
+    ['orchestrator', { labels: ['review-status:needs-human'] }],
+    ['nobody', {}],
+  ];
+  it.each(ownerCases)('derives %s with a nonempty one-line next step from %j', (nextOwner, patch) => {
+    const input = facts(patch);
+    const before = structuredClone(input);
+    const result = judgeSweepFacts.deriveNextOwner(input);
+    expect(result).toEqual({ nextOwner, nextStep: expect.any(String) });
+    expect(result.nextStep.trim()).not.toBe('');
+    expect(result.nextStep).not.toMatch(/[\r\n]/);
+    expect(judgeSweepFacts.deriveNextOwner(input)).toEqual(result);
+    expect(input).toEqual(before);
+  });
+  it('keeps a running fixer responsible for a needs-human PR', () => {
+    expect(judgeSweepFacts.deriveNextOwner(facts({ fixerRunning: true, labels: ['status:needs-human'] })))
+      .toMatchObject({ nextOwner: 'fixer' });
+  });
+  it('adds owner, next step and numeric age to every bundle row without mutating inputs', () => {
+    const prs = ownerCases.map(([, patch], i) => facts({ ...patch, number: i + 1 }));
+    const before = structuredClone(prs);
+    const bundle = buildJudgeSweepBundle({ generatedAt: at(0), elapsedMs: 12, prs });
+    expect(bundle.prs).toHaveLength(prs.length);
+    bundle.prs.forEach((row, i) => {
+      expect(row).toMatchObject({ ...judgeSweepFacts.deriveNextOwner(prs[i]), ownerSince: 1 });
+      expect(Number.isFinite(row.ownerSince)).toBe(true);
+    });
+    expect(prs).toEqual(before);
+  });
+  it.each([
+    [{ minutesSinceFixLoop: 12, minutesSinceUpdate: 90 }, 12],
+    [{ minutesSinceFixLoop: 0, minutesSinceUpdate: 90 }, 0],
+    [{ minutesSinceFixLoop: null, minutesSinceUpdate: 23 }, 23],
+    [{ minutesSinceUpdate: 23 }, 23],
+  ])('derives ownerSince from fix-loop age with update age as fallback: %j', (patch, ownerSince) => {
+    expect(buildJudgeSweepBundle({ prs: [facts(patch)] }).prs[0].ownerSince).toBe(ownerSince);
+  });
+});
+
+describe('unowned is a last-resort stall reason', () => {
+  const unownedRow = (patch, thresholds) => buildJudgeSweepBundle({ thresholds,
+    prs: [facts({ minutesSinceUpdate: 1, minutesSinceFixLoop: 90, ...patch })] }).prs[0];
+  it.each([[], ['status:needs-human'], ['review-status:draft-withdrawn']])(
+    'judges an unowned PR after 45 minutes: %j', labels => {
+      const row = unownedRow({ labels });
+      expect(['orchestrator', 'nobody']).toContain(row.nextOwner);
+      expect(row).toMatchObject({ ownerSince: 90, needsJudgment: true, reason: expect.stringMatching(/^unowned/) });
+    });
+  it.each([0, 44, 45])('does not fire for nobody or orchestrator at owner age %s minutes', ownerSince => {
+    for (const labels of [[], ['status:needs-human'], ['review-status:draft-withdrawn']]) {
+      const row = unownedRow({ labels, minutesSinceFixLoop: ownerSince });
+      expect(row.ownerSince).toBe(ownerSince);
+      expect(row.reason).not.toMatch(/^unowned/);
+    }
+  });
+  it('uses the supplied unownedMinutes threshold with a strict greater-than boundary', () => {
+    expect(unownedRow({}, { unownedMinutes: 90 }).reason).not.toMatch(/^unowned/);
+    expect(unownedRow({ minutesSinceFixLoop: 91 }, { unownedMinutes: 90 }))
+      .toMatchObject({ needsJudgment: true, reason: expect.stringMatching(/^unowned/) });
+  });
+  it.each([
+    ['fixer', { fixerRunning: true }],
+    ['review', { labels: ['review:pending'] }],
+    ['red-team', { redTeam: { state: 'pending' } }],
+    ['drain', { labels: ['review:accepted', 'ready-to-merge'] }],
+    ['judge', { round: 5 }],
+    ['operator', { labels: ['status:needs-you'] }],
+  ])('never fires for %s even after the threshold', (nextOwner, patch) => {
+    const row = unownedRow(patch);
+    expect(row).toMatchObject({ nextOwner, ownerSince: 90 });
+    expect(row.reason).not.toMatch(/^unowned/);
+  });
+  it.each([
+    ['evidence-unavailable', { evidenceErrors: ['unreadable'] }],
+    ['unruled-referral', { openReferrals: [{ ruled: false }] }],
+    ['fixer-infra-loop', { infraFailStreak: 3 }],
+    ['needs-human-aged', { labels: ['status:needs-human'], minutesSinceHeadChange: 361 }],
+    ['draft-withdrawn-aged', { isDraft: true, minutesSinceHeadChange: 241 }],
+    ['at-cap', { round: 5 }],
+    ['stalled>45min-no-owner', { minutesSinceUpdate: 91 }],
+  ])('preserves existing %s precedence over unowned', (reason, patch) => {
+    // No recent fix loop: avoid the existing active-loop early return as well as the new age boundary.
+    expect(unownedRow(patch)).toMatchObject({ needsJudgment: true,
+      reason: expect.stringMatching(new RegExp(`^${reason}`)) });
+  });
+  it.each([[5972, 'status:answered-waiting-fixer'], [5996, 'review:changes']])(
+    '#%s waiting-fixer without dispatch keeps waiting-fixer-not-dispatched ahead of unowned', (number, label) => {
+      const row = unownedRow({ number, labels: [label], minutesSinceFixDispatch: null, minutesSinceUpdate: 120 });
+      expect(['orchestrator', 'nobody']).toContain(row.nextOwner);
+      expect(row).toMatchObject({ number, ownerSince: 90, needsJudgment: true, reason: 'waiting-fixer-not-dispatched' });
+    });
+});
+
+describe('unownedMinutes policy cascade with injected IO', () => {
+  const resolve = (platform, tool, envValue, log) => judgeSweepFactsIo.resolveStallThresholds({
+    platform, env: envValue === undefined ? {} : { WE_JUDGE_SWEEP_STALL: JSON.stringify({ unownedMinutes: envValue }) },
+    readFile: () => JSON.stringify({ judgeSweepStall: tool }), log,
+  });
+  it('resolves standard, platform, tool and environment values in order', () => {
+    expect(resolve(null).unownedMinutes).toBe(45);
+    expect(resolve({ unownedMinutes: 60 }).unownedMinutes).toBe(60);
+    expect(resolve({ unownedMinutes: 60 }, { unownedMinutes: 75 }).unownedMinutes).toBe(75);
+    expect(resolve({ unownedMinutes: 60 }, { unownedMinutes: 75 }, 90).unownedMinutes).toBe(90);
+  });
+  it.each([0, -1, '90', null, Infinity])('falls through invalid unownedMinutes %j to a valid lower layer', value => {
+    expect(resolve({ unownedMinutes: 60 }, { unownedMinutes: value }, value).unownedMinutes).toBe(60);
   });
 });
 
@@ -589,6 +724,99 @@ describe('shape cache and operator credential boundary', () => {
     const options = call.mock.calls[0][1];
     expect(options.env).not.toHaveProperty('GH_TOKEN');
     expect(options.env).not.toHaveProperty('GITHUB_TOKEN');
+  });
+});
+
+describe('pure sweep report coverage', () => {
+  const bundle = { prs: [{ number: 5996 }, { number: 12 }, { number: 5972 }] };
+  it('lists missing bundle PRs in numeric order and counts covered PRs once', () => {
+    const before = structuredClone(bundle);
+    const report = [5972, 5972, 9999];
+    expect(judgeSweepFacts.checkSweepCoverage(bundle, report)).toEqual({ missing: [12, 5996], covered: 1 });
+    expect(bundle).toEqual(before);
+    expect(report).toEqual([5972, 5972, 9999]);
+  });
+  it('handles complete, empty and wholly missing coverage', () => {
+    expect(judgeSweepFacts.checkSweepCoverage(bundle, [12, 5972, 5996])).toEqual({ missing: [], covered: 3 });
+    expect(judgeSweepFacts.checkSweepCoverage(bundle, [])).toEqual({ missing: [12, 5972, 5996], covered: 0 });
+    expect(judgeSweepFacts.checkSweepCoverage({ prs: [] }, [5972])).toEqual({ missing: [], covered: 0 });
+  });
+  it.each([undefined, null, {}, '5972', [5972, '5996'], [1.5], [NaN], [Infinity], [null]])(
+    'fails closed on non-array or non-integer report numbers: %j', report => {
+      expect(() => judgeSweepFacts.checkSweepCoverage(bundle, report)).toThrow(TypeError);
+    });
+  it.each([null, {}, { prs: null }, { prs: {} }, { prs: [null] },
+    { prs: [{ number: '5972' }] }, { prs: [{ number: 1.5 }] }])(
+    'fails closed on malformed bundle PR numbers: %j', input => {
+      expect(() => judgeSweepFacts.checkSweepCoverage(input, [])).toThrow(TypeError);
+    });
+  it('parses #N and PR N report tokens into numeric PR numbers', () => {
+    expect(judgeSweepFacts.parseReportPrNumbers('Handled #12, PR 5972.\n#5996.'))
+      .toEqual([12, 5972, 5996]);
+  });
+  it('ignores bare numbers and treats shell-looking report text as inert data', () => {
+    expect(judgeSweepFacts.parseReportPrNumbers('2026-10-28: 5972 items; $(touch sentinel); #5996'))
+      .toEqual([5996]);
+    expect(judgeSweepFacts.parseReportPrNumbers('')).toEqual([]);
+  });
+  it.each([null, undefined, 5972, ['#5972'], {}])('rejects non-text reports: %j', text => {
+    expect(() => judgeSweepFacts.parseReportPrNumbers(text)).toThrow(TypeError);
+  });
+});
+
+describe('coverage CLI with an injected report reader', () => {
+  const reportFile = 'reports/judge sweep $(touch sentinel).txt';
+  const outcome = (input = { checkCoverage: reportFile }) => ({ code: 0, lines: [],
+    run: { input, verdict: { prs: [{ number: 5996 }, { number: 5972 }, { number: 12 }] } } });
+  it('declares --check-coverage as a CLI input and carries the report path to finish', async () => {
+    const declaration = judgeSweepFactsOperation({ readFacts: fixture().read });
+    const registry = createRegistry();
+    registry.register(declaration);
+    const result = await runOperationCli({ declaration, registry, sinks: {}, store: createMemoryRunStore(),
+      argv: [`--check-coverage=${reportFile}`], newRunId: () => 'judge-sweep-coverage-fixture' });
+    expect(result.code).toBe(0);
+    expect(result.run.input.checkCoverage).toBe(reportFile);
+    const readFile = vi.fn(() => '#1');
+    expect(finishJudgeSweep(result, { readFile }).code).toBe(0);
+    expect(readFile.mock.calls[0][0]).toBe(reportFile);
+  });
+  it('lists every missing PR and returns nonzero when coverage is incomplete', () => {
+    const readFile = vi.fn(() => 'Reviewed PR 5972');
+    const result = finishJudgeSweep(outcome(), { readFile });
+    expect(readFile).toHaveBeenCalledTimes(1);
+    expect(readFile.mock.calls[0][0]).toBe(reportFile);
+    expect(result.code).not.toBe(0);
+    expect(result.lines.join('\n')).toMatch(/missing/i);
+    expect(result.lines.join('\n')).toMatch(/#12\b/);
+    expect(result.lines.join('\n')).toMatch(/#5996\b/);
+  });
+  it('returns zero when all bundle PRs appear as either supported token', () => {
+    const readFile = vi.fn(() => '#5996; PR 5972; PR 12; #5996');
+    const result = finishJudgeSweep(outcome(), { readFile });
+    expect(readFile).toHaveBeenCalledTimes(1);
+    expect(result.code).toBe(0);
+  });
+  it.each(['', 'Only 5996 and 5972 and 12, without PR tokens'])('does not claim coverage from report %j', text => {
+    expect(finishJudgeSweep(outcome(), { readFile: () => text }).code).not.toBe(0);
+  });
+  it('fails closed with an operator-visible report error when the report is unreadable', () => {
+    const result = finishJudgeSweep(outcome(), { readFile: () => { throw new Error('report unreadable'); } });
+    expect(result.code).not.toBe(0);
+    expect(result.lines.join('\n')).toMatch(/report|coverage/i);
+    expect(result.lines.join('\n')).toMatch(/read|inspect|rerun/i);
+  });
+  it('preserves an upstream failure without reading the report', () => {
+    const readFile = vi.fn();
+    const failure = { ...outcome(), code: 2, lines: ['evidence unavailable'] };
+    expect(finishJudgeSweep(failure, { readFile })).toEqual({ code: 2, lines: failure.lines });
+    expect(readFile).not.toHaveBeenCalled();
+  });
+  it('keeps the ordinary JSON path and does not read a report when no coverage flag was supplied', () => {
+    const readFile = vi.fn();
+    const result = finishJudgeSweep(outcome({}), { readFile });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.lines[0])).toEqual(outcome().run.verdict);
+    expect(readFile).not.toHaveBeenCalled();
   });
 });
 
