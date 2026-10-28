@@ -114,8 +114,10 @@ def children():
     for entry in os.listdir('/proc'):
         if not entry.isdigit(): continue
         try:
-            text = open('/proc/' + entry + '/stat').read()
-            parents[int(entry)] = int(text[text.rfind(')')+2:].split()[1])
+            # comm is arbitrary bytes and may itself contain spaces or ')'.
+            with open('/proc/' + entry + '/stat', 'rb') as stat:
+                data = stat.read()
+            parents[int(entry)] = int(data[data.rfind(b')')+2:].split()[1])
         except (FileNotFoundError, ProcessLookupError): pass
     found, frontier = set(), {os.getpid()}
     while frontier:

@@ -261,6 +261,45 @@ await runner.run(JSON.parse(process.argv[3]));`;
     expect(supervisorSource).toContain('os.waitpid(-1');
     expect(supervisorSource).toContain('stdin=subprocess.DEVNULL');
   });
+  it('completes supervisor cleanup with arbitrary bytes and delimiters in proc process names', async () => {
+    const status=join(root,'byte-name-status');
+    // Execute the shipped supervisor on every platform; only OS/process effects
+    // are mocked. Real file decoding reproduces the Linux stat failure on macOS.
+    const probe=String.raw`import builtins, ctypes, json, os, signal, subprocess, sys
+from unittest.mock import patch
+source, root, status = sys.argv[1:]
+entries = {
+    '101': b'101 (\xff) S 100 0 0\n',
+    '102': b'102 (a) \n\r\t\xfe)) S 101 0 0\n',
+    '103': b'103 (\xe2\x80\xa8\xe2\x80\x8b) S 102 0 0\n',
+    '104': b'104 (--\x60\x27../) S 999 0 0\n',
+}
+for pid, data in entries.items():
+    with open(os.path.join(root, pid), 'wb') as f: f.write(data)
+real_open = builtins.open
+def proc_open(path, *args, **kwargs):
+    return real_open(os.path.join(root, path.split('/')[2]), *args, **kwargs)
+killed = []
+def kill(pid, sig):
+    assert sig == signal.SIGKILL
+    killed.append(pid)
+def reap(*args):
+    assert set(killed) == {101, 102, 103}, killed
+    raise ChildProcessError()
+cfg = dict(uid=os.getuid(), gid=os.getgid(), argv=['unused'], cwd=root, env={}, status=status)
+with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as worker, \
+     patch.object(os, 'listdir', return_value=[*entries, 'self', '105']), \
+     patch.object(os, 'getpid', return_value=100), patch.object(builtins, 'open', side_effect=proc_open), \
+     patch.object(os, 'kill', side_effect=kill), patch.object(os, 'waitpid', side_effect=reap):
+    libc.return_value.prctl.return_value = 0
+    worker.return_value.wait.return_value = 3
+    sys.argv = ['supervisor', json.dumps(cfg)]
+    exec(source)
+`;
+    const result=spawnSync('python3',['-I','-c',probe,supervisorSource,root,status],{encoding:'utf8',timeout:10000});
+    expect(result.status,result.stderr).toBe(0);
+    expect(await readFile(status,'utf8')).toBe('3');
+  });
 });
 
 describe('setup and pruning contract', () => {
@@ -305,15 +344,16 @@ describe('setup and pruning contract', () => {
   });
 });
 
-it.skipIf(process.platform !== 'linux')('kills a real escaped setsid child through Linux subreaper adoption', async () => {
+it.skipIf(process.platform !== 'linux')('kills a real escaped setsid child with a non-UTF-8 process name through Linux subreaper adoption', async () => {
   const marker=join(root,'escaped-pid');
   const status=join(root,'supervised-status');
-  const task=String.raw`import os, sys, time
+  const task=String.raw`import ctypes, os, sys, time
 pid=os.fork()
 if pid:
     while not os.path.exists(sys.argv[1]): time.sleep(0.01)
     sys.exit(3)
 os.setsid()
+assert ctypes.CDLL(None).prctl(15, ctypes.c_char_p(b'\xff)\n\xfe)'), 0, 0, 0) == 0
 with open(sys.argv[1], 'w') as f: f.write(str(os.getpid()))
 time.sleep(30)
 `;
@@ -321,10 +361,15 @@ time.sleep(30)
     argv:['python3','-I','-c',task,marker],cwd:root,env:{PATH:process.env.PATH},
     uid:process.getuid(),gid:process.getgid(),status,
   })],{encoding:'utf8',timeout:10000});
-  expect(result.status,result.stderr).toBe(0);
-  expect(await readFile(status,'utf8')).toBe('3');
-  const pid=Number(await readFile(marker,'utf8'));
-  expect(()=>process.kill(pid,0)).toThrow();
+  const pid=Number(await readFile(marker,'utf8').catch(()=>0));
+  try {
+    expect(result.status,result.stderr).toBe(0);
+    expect(await readFile(status,'utf8')).toBe('3');
+    expect(pid).toBeGreaterThan(0);
+    expect(()=>process.kill(pid,0)).toThrow();
+  } finally {
+    if(pid) try {process.kill(pid,'SIGKILL');} catch(error) {if(error.code!=='ESRCH') throw error;}
+  }
 });
 
 describe('privileged finish cleanup', () => {
