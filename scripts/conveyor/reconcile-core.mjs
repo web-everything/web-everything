@@ -305,7 +305,7 @@ export const REFUSAL_KINDS = Object.freeze([
   // for it; this PR owes nothing further until that fix lands or its own head changes.
   'ci-heal-escalated', 'waiting-on-system-fix', 'review-hold-red',
   // A CI re-run this system requested whose result is not observed yet: held, not escalated, until the window.
-  'ci-timeout-rerun-in-flight',
+  'ci-timeout-rerun-in-flight', 'timeout-evidence-unknown',
   // `draft` (draft-first PRs, operator-approved 2026-09-27) — the PR is still a GitHub draft: no review is
   // dispatched, whatever `review:*` label it carries, until the `promote-draft` DISPATCH_KIND (above) has
   // un-drafted it. See {@link dispatchReviewRow}'s own gate.
@@ -1167,14 +1167,16 @@ export function markIdleFinishedSessions(agents, idleFinishedInfoFor, nowMs, thr
  * we:scripts/conveyor/reconcile-core.mjs#releasedFixClaim — the PR's CURRENT released fix claim, or null.
  * Live case (PR #5492, 2026-10-20): the fixer posted `🔓 conveyor fix-end` at head b0be22ada, yet its pre-warmed
  * bg-spare process stayed alive for 2h, so review and fix dispatch both refused the PR as `live-process`.
- * Returns `{ releasedAtMs, head, who }` only when ALL hold (fail closed on every doubt):
+ * Returns the latest `{ releasedAtMs, head, who }` plus per-session `releases` only when ALL hold
+ * (fail closed on every doubt):
  *   - the latest trusted fix marker (begin or end) on the thread is a fix-END, so no claim is held now;
  *   - that end names a head sha, and it is the PR's CURRENT head (a release at an older head says nothing
  *     about work on this one);
- *   - its `createdAt` is readable;
- *   - its `<who>` released the fix claim line names a non-blank identity.
+ *   - every marker's `createdAt` is readable and ordering is unambiguous;
+ *   - every marker names a non-blank identity (`**Who:**` for begin, release line for end).
+ * Earlier releases at this head remain evidence for their own sessions, until that session claims again.
  * @param {object} pr
- * @returns {{releasedAtMs:number, head:string, who:string}|null}
+ * @returns {{releasedAtMs:number, head:string, who:string, releases:Array<{releasedAtMs:number, head:string, who:string}>}|null}
  */
 export function releasedFixClaim(pr) {
   const head = String(pr?.headRefOid ?? '');
@@ -1187,19 +1189,32 @@ export function releasedFixClaim(pr) {
   markers.sort((a, b) => a.at - b.at);
   const last = markers.at(-1);
   // Equal timestamps are ambiguous ordering: array order must never decide, so fail closed.
-  if (markers.length > 1 && markers.at(-2).at === last.at) return null;
+  if (markers.some((m, i) => i > 0 && markers[i - 1].at === m.at)) return null;
   if (!last.body.startsWith(FIX_END_MARKER)) return null; // a later fix-begin = claim held again
   const named = /at `([0-9a-f]{7,40})`/.exec(last.body)?.[1];
   if (!named || !sameHeadSha(named, head)) return null;
   const who = /^`([^`\r\n]*)` released the fix claim\b/m.exec(last.body)?.[1];
   if (!who?.trim()) return null;
-  return { releasedAtMs: last.at, head, who };
+  const releasesBySession = new Map();
+  for (const marker of markers) {
+    const isEnd = marker.body.startsWith(FIX_END_MARKER);
+    const identity = (isEnd
+      ? /^`([^`\r\n]*)` released the fix claim\b/m
+      : /^\*\*Who:\*\* `([^`\r\n]*)`/m).exec(marker.body)?.[1];
+    if (!identity?.trim()) return null; // cannot safely attribute a later claim to a session
+    releasesBySession.delete(identity); // a renewed claim or invalid release supersedes its earlier evidence
+    const releaseHead = isEnd && /at `([0-9a-f]{7,40})`/.exec(marker.body)?.[1];
+    if (releaseHead && sameHeadSha(releaseHead, head)) {
+      releasesBySession.set(identity, { releasedAtMs: marker.at, head, who: identity });
+    }
+  }
+  return { releasedAtMs: last.at, head, who, releases: [...releasesBySession.values()] };
 }
 
 /**
  * we:scripts/conveyor/reconcile-core.mjs#isReleasedClaimSession — is this live-pid session provably the
  * finished one behind a RELEASED fix claim? True only when the claim was released at this head
- * ({@link releasedFixClaim}) AND its non-empty string `sessionId` exactly matches the release's `who`
+ * ({@link releasedFixClaim}) AND its non-empty string `sessionId` exactly matches one release's `who`
  * AND the session started BEFORE that release (a session started later is new work)
  * AND it is not a reviewer (reviews hold no fix claim) AND it is not blocked on a permission prompt
  * (that stays its own, louder kind). Missing/mismatched identity or unreadable `startedAt` => false (still live).
@@ -1207,11 +1222,14 @@ export function releasedFixClaim(pr) {
 export function isReleasedClaimSession(agent, claimRelease) {
   if (!claimRelease || !Number.isFinite(claimRelease.releasedAtMs)) return false;
   if (!agent || agent.pidAlive !== true) return false; // only a PROBED-live pid is exempted; unknown stays liveness-unknown
-  if (typeof agent.sessionId !== 'string' || !agent.sessionId || agent.sessionId !== claimRelease.who) return false;
+  if (typeof agent.sessionId !== 'string' || !agent.sessionId) return false;
+  if (agent.awaitingInfraCooloff === true) return false;
   if (isAwaitingPermission(agent) || agent.permissionBlocked === true) return false;
   if (/^review-/.test(String(agent.name ?? '')) || /^review-/.test(String(agent.sessionSlug ?? ''))) return false;
   const started = startedAtMs(agent.startedAt);
-  return Number.isFinite(started) && started < claimRelease.releasedAtMs;
+  const releases = Array.isArray(claimRelease.releases) ? claimRelease.releases : [claimRelease];
+  return Number.isFinite(started) && releases.some((release) => release.who === agent.sessionId
+    && Number.isFinite(release.releasedAtMs) && started < release.releasedAtMs);
 }
 
 /**
@@ -3300,6 +3318,16 @@ export function planReconcile({
             why: `main is green (CI success on ${String(pr.mainGreenNow.sha).slice(0, 9)}); the failed required jobs on head ${pr.headRefOid.slice(0, 8)} are re-run once to get a fresh result (${staleSpent + 1}/${staleCap}), no heal budget` });
           continue;
         }
+      }
+      // Unknown evidence blocks only policies that can act on that evidence.
+      const unknownEvidence = process.env.WE_CI_TIMEOUT_RERUN_ENABLED !== '0' && pr.timeoutRetry?.unknown
+        ? pr.timeoutRetry
+        : (staleCiRerun !== 'off' || owedCiRerun.rerun !== 'off') && pr.owedCiRerunRetry?.unknown
+          ? pr.owedCiRerunRetry : null;
+      if (unknownEvidence) {
+        refusals.push({ kind: 'timeout-evidence-unknown', prNumber,
+          why: `PR #${prNumber}: evidence read timed out; unknown, not ineligible — will re-read next tick (${unknownEvidence.reason})` });
+        continue;
       }
       if (pr.timeoutRetry && !pr.timeoutRetry.eligible) refusals.push({ kind: 'timeout-retry-ineligible', prNumber,
         why: `PR #${prNumber}: ${pr.timeoutRetry.reason}` });

@@ -803,3 +803,401 @@ describe('readBottomLanded on a real git graph — the reviewer\'s case: the bot
     } finally { g.cleanup(); }
   });
 });
+
+
+describe('readStackBases — declared lane bases (live #5996 #5997 #5983 #6003)', () => {
+  const sha = n => n.toString(16).padStart(40, '0');
+  const shapes = [
+    { number: 5996, headRefName: 'lane/drain-poison-guard', baseRefName: 'lane/drain-poison-guard-base', bottom: null },
+    { number: 5997, headRefName: 'lane/ci-heal-read-timeout', baseRefName: 'lane/r123-auto-proceed', bottom: 5981 },
+    { number: 5983, headRefName: 'lane/r130-delegated-sweep', baseRefName: 'lane/r130-clear-human-guard', bottom: 5982 },
+    { number: 6003, headRefName: 'lane/hetzner-ci-routing', baseRefName: 'lane/ci-speed', bottom: 6002 },
+  ].map((p, i) => ({ ...p, headRefOid: sha(100 + i), baseTip: sha(200 + i) }));
+  const MAIN = sha(300);
+  const TREE = sha(301);
+  const fixture = (extra = 0) => {
+    const refs = new Map();
+    const tips = new Map();
+    const sets = new Map();
+    const record = p => ({ author: 'app/plateau-worker', isCrossRepository: false, baseRefName: 'main', ...p });
+    // Unrelated records deliberately precede the real shapes, including beyond a 200-row boundary.
+    for (let i = 0; i < extra; i += 1) {
+      const headRefOid = sha(1000 + i);
+      const headRefName = `lane/unrelated-${i}`;
+      refs.set(7000 + i, record({ headRefName, headRefOid }));
+      tips.set(headRefName, headRefOid);
+      sets.set(headRefOid, { first: [headRefOid], reach: [headRefOid] });
+    }
+    for (const p of shapes) {
+      refs.set(p.number, record({ headRefName: p.headRefName, headRefOid: p.headRefOid, baseRefName: p.baseRefName }));
+      if (p.bottom != null) refs.set(p.bottom, record({ headRefName: p.baseRefName, headRefOid: p.baseTip }));
+      tips.set(p.headRefName, p.headRefOid);
+      tips.set(p.baseRefName, p.baseTip);
+      sets.set(p.headRefOid, { first: [p.headRefOid, p.baseTip], reach: [p.headRefOid, p.baseTip] });
+      sets.set(p.baseTip, { first: [p.baseTip], reach: [p.baseTip] });
+    }
+    // The daemon supplies only these three fields, not GitHub's author/fork/base evidence.
+    const listed = [...refs].map(([number, p]) => ({ number, headRefName: p.headRefName, headRefOid: p.headRefOid }));
+    const fakeGit = args => {
+      if (args[0] === 'cat-file') return '';
+      if (args[0] === 'rev-list') {
+        const head = args[args.indexOf('--end-of-options') + 1];
+        const commits = sets.get(head);
+        if (!commits) throw new Error('head unreadable');
+        return (args.includes('--first-parent') ? commits.first : commits.reach).join('\n');
+      }
+      if (args[0] === 'merge-base') return `${MAIN}\n`;
+      if (args[0] === 'merge-tree') return `${TREE}\n`;
+      throw new Error(`unexpected git ${args.join(' ')}`);
+    };
+    const read = (options = {}) => readStackBases({ root: '/repo', env: {}, settingOn: true,
+      prs: listed, readRefs: () => refs, readLanes: () => tips, run: fakeGit, ...options });
+    return { refs, tips, sets, listed, fakeGit, read };
+  };
+  const expected = p => ({ pr: p.bottom, ref: p.baseRefName, head: p.baseTip,
+    contained: p.baseTip, tree: TREE, topHead: p.headRefOid });
+
+  it.each([MAIN, shapes[0].baseTip])('resolves a PR-less base already on main at %s without a containment diagnostic', head => {
+    const f = fixture();
+    const p = shapes[0];
+    f.tips.set(p.baseRefName, head);
+    // rev-list <base> ^origin/main is empty both at main's tip and for an older landed tip.
+    f.sets.set(head, { first: [], reach: [] });
+    f.sets.set(p.headRefOid, { first: [p.headRefOid], reach: [p.headRefOid] });
+    const diag = new Map();
+    expect(f.read({ prlessBase: true, diag }).get(p.number)).toEqual({
+      ...expected(p), head, contained: head,
+    });
+    expect(diag.has(p.number)).toBe(false);
+  });
+
+  it('resolves #5997 over open #5981 from GitHub records', () => {
+    const f = fixture();
+    const diag = new Map();
+    expect(f.read({ diag }).get(5997)).toEqual(expected(shapes[1]));
+    expect(diag.has(5997)).toBe(false);
+  });
+
+  it.each([
+    ['refs-auth-failed', 'refs-auth-failed'],
+    ['arbitrary private failure text', 'refs-unreadable'],
+  ])('diagnoses every listed PR with %s, bounded to %s', (failure, cause) => {
+    const f = fixture();
+    const diag = new Map();
+    const refs = Object.assign(new Map(), { failure });
+    expect(f.read({ diag, readRefs: () => refs }).size).toBe(0);
+    expect(diag).toEqual(new Map(f.listed.map(p => [p.number, { cause }])));
+  });
+
+  it('diagnoses refs-read-threw for every listed PR when readRefs throws before rows exist', () => {
+    const f = fixture();
+    const diag = new Map();
+    expect(f.read({ diag, readRefs: () => { throw new Error('HTTP 401: private diagnostic'); } }).size).toBe(0);
+    expect(diag).toEqual(new Map(f.listed.map(p => [p.number, { cause: 'refs-read-threw' }])));
+  });
+
+  it.each([false, true])('fetches exactly the declared base missing locally (fetch fails: %s)', (fetchFails) => {
+    const f = fixture();
+    const p = shapes[0]; // Branch-only base: no open PR head supplies this commit.
+    const calls = [];
+    let haveBase = false;
+    const run = args => {
+      calls.push(args);
+      if (args[0] === 'cat-file' && args[2] === `${p.baseTip}^{commit}` && !haveBase) {
+        throw new Error('base commit missing locally');
+      }
+      if (args[0] === 'fetch') {
+        if (fetchFails) throw new Error('HTTP 401: git fetch failed');
+        haveBase = true;
+        return '';
+      }
+      if (args[0] === 'rev-list' && args.includes(p.baseTip) && !haveBase) {
+        throw new Error('base commit still missing locally');
+      }
+      return f.fakeGit(args);
+    };
+    const diag = new Map();
+    const out = f.read({ prlessBase: true, diag, run });
+    expect(calls.filter(args => args[0] === 'fetch')).toEqual([
+      ['fetch', '-q', '--end-of-options', 'origin', p.baseRefName],
+    ]);
+    if (fetchFails) {
+      expect(out.has(p.number)).toBe(false);
+      expect(diag.get(p.number)).toEqual({ cause: 'head-unreadable' });
+    } else {
+      expect(out.get(p.number)).toEqual(expected(p));
+      expect(diag.has(p.number)).toBe(false);
+    }
+  });
+
+  it.each([
+    ['cross-author', 'alice', 'bob'],
+    ['unknown base author', 'alice', null],
+    ['unknown top author', null, 'bob'],
+  ])('preserves declared numbered stacks with %s when opting into PR-less bases', (_name, topAuthor, baseAuthor) => {
+    const f = fixture();
+    f.refs.get(5997).author = topAuthor;
+    f.refs.get(5981).author = baseAuthor;
+    for (const prlessBase of [false, true]) {
+      const diag = new Map();
+      expect(f.read({ prlessBase, diag }).get(5997)).toEqual(expected(shapes[1]));
+      expect(diag.has(5997)).toBe(false);
+    }
+  });
+
+  it('resolves #5983 over #5982 and #6003 over #6002 together with all four shapes and unrelated PRs', () => {
+    const f = fixture(3);
+    const diag = new Map();
+    const out = f.read({ prlessBase: true, diag });
+    for (const p of shapes) expect(out.get(p.number)).toEqual(expected(p));
+    expect(diag.size).toBe(0);
+  });
+
+  it('keeps #5996 unresolved by default so review-side callers never receive pr:null', () => {
+    const out = fixture().read();
+    expect(out.has(5996)).toBe(false);
+    expect([...out.values()].every(base => typeof base.pr === 'number')).toBe(true);
+  });
+
+  it('resolves #5996 against its contained origin branch tip only with prlessBase:true', () => {
+    const diag = new Map();
+    expect(fixture().read({ prlessBase: true, diag }).get(5996)).toEqual(expected(shapes[0]));
+    expect(diag.has(5996)).toBe(false);
+  });
+
+  it('leaves a prless base unresolved when its tip is absent from origin tips', () => {
+    const f = fixture();
+    f.tips.delete(shapes[0].baseRefName);
+    expect(f.read({ prlessBase: true }).has(5996)).toBe(false);
+  });
+
+  it('leaves a prless base unresolved when the top does not contain its tip', () => {
+    const f = fixture();
+    f.sets.set(shapes[0].headRefOid, { first: [shapes[0].headRefOid], reach: [shapes[0].headRefOid] });
+    expect(f.read({ prlessBase: true }).has(5996)).toBe(false);
+  });
+
+  it('leaves a prless base unresolved when the top author is unknown', () => {
+    const f = fixture();
+    f.refs.get(5996).author = null;
+    expect(f.read({ prlessBase: true }).has(5996)).toBe(false);
+  });
+
+  it('leaves a prless base unresolved when the top is a fork', () => {
+    const f = fixture();
+    f.refs.get(5996).isCrossRepository = true;
+    expect(f.read({ prlessBase: true }).has(5996)).toBe(false);
+  });
+
+  it('leaves a prless base unresolved when the top head is not the origin tip', () => {
+    const f = fixture();
+    f.tips.set(shapes[0].headRefName, sha(400));
+    expect(f.read({ prlessBase: true }).has(5996)).toBe(false);
+  });
+
+  it.each([
+    ['refs-unreadable', 'empty GitHub refs', 5997, () => ({ readRefs: () => new Map() })],
+    ['tips-unreadable', 'null origin tips, including the early return', 5997, () => ({ readLanes: () => null })],
+    ['top-untrusted', 'fork top', 5997, f => { f.refs.get(5997).isCrossRepository = true; }],
+    ['top-untrusted', 'top differs from origin tip', 5997, f => { f.tips.set(shapes[1].headRefName, sha(401)); }],
+    ['base-pr-untrusted', 'base PR differs from origin tip', 5997, f => { f.tips.set(shapes[1].baseRefName, sha(402)); }],
+    ['top-untrusted', 'PR-less top author unknown', 5996, f => { f.refs.get(5996).author = null; }],
+    ['no-containment', 'trusted open base not contained', 5997, f => {
+      f.sets.set(shapes[1].headRefOid, { first: [shapes[1].headRefOid], reach: [shapes[1].headRefOid] });
+    }],
+    ['base-branch-missing', 'prless branch absent from origin', 5996, f => { f.tips.delete(shapes[0].baseRefName); }],
+    ['base-not-contained', 'prless tip not contained', 5996, f => {
+      f.sets.set(shapes[0].headRefOid, { first: [shapes[0].headRefOid], reach: [shapes[0].headRefOid] });
+    }],
+    ['tree-unreadable', 'synthetic tree read fails', 5997, f => ({ run: args => {
+      if (args[0] === 'merge-tree') throw new Error('tree unreadable');
+      return f.fakeGit(args);
+    } })],
+    ['head-unreadable', 'top commit sets unreadable', 5997, f => { f.sets.delete(shapes[1].headRefOid); }],
+    ['head-unreadable', 'base commit sets unreadable', 5997, f => { f.sets.delete(shapes[1].baseTip); }],
+  ])('records %s for %s', (cause, _name, number, configure) => {
+    const f = fixture();
+    const options = configure(f) || {};
+    const diag = new Map();
+    const out = f.read({ prlessBase: true, diag, ...options });
+    expect(out.has(number)).toBe(false);
+    expect(diag.get(number)).toEqual({ cause });
+    // Whole-reader failures must diagnose every listed declared lane base, even on an early return.
+    if (cause === 'refs-unreadable' || cause === 'tips-unreadable') {
+      for (const p of shapes) expect(diag.get(p.number)).toEqual({ cause });
+    }
+    for (const resolved of out.keys()) expect(diag.has(resolved)).toBe(false);
+  });
+
+  it('resolves the numbered shapes after 250 unrelated open PRs; the PR-less one stays unknown (list may be cut off)', () => {
+    const f = fixture(250);
+    const diag = new Map();
+    const out = f.read({ prlessBase: true, diag });
+    for (const p of shapes.filter(s => s.number !== 5996)) expect(out.get(p.number)).toEqual(expected(p));
+    expect(out.has(5996)).toBe(false);
+    expect(diag.get(5996)).toEqual({ cause: 'refs-incomplete' });
+    expect(diag.size).toBe(1);
+  });
+
+  it('rejects a stale caller bottom head even when GitHub and origin agree on its current head', () => {
+    const f = fixture();
+    f.listed.find(p => p.number === 5981).headRefOid = sha(403);
+    const diag = new Map();
+    expect(f.read({ prlessBase: true, diag }).has(5997)).toBe(false);
+    expect(diag.get(5997)).toEqual({ cause: 'base-pr-untrusted' });
+  });
+});
+
+import { OPEN_PR_REF_LIMIT } from '../review-stack-base.mjs';
+
+describe('readStackBases — PR-less exact tip and complete ownership evidence', () => {
+  const topRef = 'lane/drain-poison-guard';
+  const baseRef = 'lane/drain-poison-guard-base';
+  const numberedRef = 'lane/numbered-top';
+  const numberedBaseRef = 'lane/numbered-base';
+  const fixture = (refCount = 3, { olderOnly = false } = {}) => {
+    const refs = new Map([
+      [5996, { headRefName: topRef, headRefOid: TOP, baseRefName: baseRef, author: AUTHOR, isCrossRepository: false }],
+      [5997, { headRefName: numberedRef, headRefOid: LEFT, baseRefName: numberedBaseRef, author: AUTHOR, isCrossRepository: false }],
+      [5981, { headRefName: numberedBaseRef, headRefOid: RIGHT, baseRefName: 'main', author: AUTHOR, isCrossRepository: false }],
+    ]);
+    for (let i = refs.size; i < refCount; i++) {
+      refs.set(10000 + i, { headRefName: `unrelated-${i}`, headRefOid: STRAY, baseRefName: 'main', author: AUTHOR, isCrossRepository: false });
+    }
+    const tips = new Map([[topRef, TOP], [baseRef, BOTTOM], [numberedRef, LEFT], [numberedBaseRef, RIGHT]]);
+    const graph = new Map([
+      [TOP, { reach: [TOP, ...(olderOnly ? [] : [BOTTOM]), CONTAINED], first: [TOP] }],
+      [BOTTOM, { reach: [BOTTOM, CONTAINED], first: [BOTTOM, CONTAINED] }],
+      [LEFT, { reach: [LEFT, RIGHT], first: [LEFT] }],
+      [RIGHT, { reach: [RIGHT], first: [RIGHT] }],
+    ]);
+    const run = args => {
+      if (args[0] === 'cat-file') return '';
+      if (args[0] === 'rev-list') {
+        const entry = graph.get(args.at(-2));
+        if (!entry) throw new Error('unknown commit');
+        return (args.includes('--first-parent') ? entry.first : entry.reach).join('\n');
+      }
+      if (args[0] === 'merge-base') return OLDER;
+      if (args[0] === 'merge-tree') return TREE;
+      throw new Error(`unexpected git command: ${args[0]}`);
+    };
+    return {
+      graph,
+      read: (options = {}) => readStackBases({ root: '/repo', env: {}, settingOn: true,
+        readRefs: () => refs, readLanes: () => tips, run, prlessBase: true, log: () => {}, ...options }),
+    };
+  };
+
+  it('rejects an older merged base commit when the current PR-less base tip is not contained', () => {
+    const f = fixture(3, { olderOnly: true });
+    const graph = new Map([...f.graph].map(([head, entry]) => [head, { ...entry, reach: new Set(entry.reach) }]));
+    expect(containedCommit(graph, BOTTOM, TOP)).toBe(CONTAINED);
+    const diag = new Map();
+    expect(f.read({ diag }).has(5996)).toBe(false);
+    expect(diag.get(5996)).toEqual({ cause: 'base-not-contained' });
+  });
+
+  it('exports the PR-ref read limit of 200', () => {
+    expect(OPEN_PR_REF_LIMIT).toBe(200);
+  });
+
+  it.each([200, 201])('leaves #5996 unresolved with refs-incomplete at %i open PR refs', refCount => {
+    const diag = new Map();
+    expect(fixture(refCount).read({ diag }).has(5996)).toBe(false);
+    expect(diag.get(5996)).toEqual({ cause: 'refs-incomplete' });
+  });
+
+  it('resolves #5996 against the current PR-less base tip with 199 open PR refs', () => {
+    const diag = new Map();
+    expect(fixture(199).read({ diag }).get(5996)).toEqual({
+      pr: null, ref: baseRef, head: BOTTOM, contained: BOTTOM, tree: TREE, topHead: TOP,
+    });
+    expect(diag.has(5996)).toBe(false);
+  });
+
+  it.each([true, false])('preserves numbered base resolution at the limit with prlessBase:%s', prlessBase => {
+    const diag = new Map();
+    expect(fixture(200).read({ prlessBase, diag }).get(5997)).toEqual({
+      pr: 5981, ref: numberedBaseRef, head: RIGHT, contained: RIGHT, tree: TREE, topHead: LEFT,
+    });
+    expect(diag.has(5997)).toBe(false);
+    if (!prlessBase) expect(diag.get(5996)).toEqual({ cause: 'base-branch-missing' });
+  });
+});
+
+describe('readStackBases — fork name collisions and missing individual records', () => {
+  const fixture = (numbered = true) => {
+    const number = numbered ? 5997 : 5996;
+    const headRefName = 'lane/drain-poison-guard';
+    const baseRefName = 'lane/drain-poison-guard-base';
+    const record = (over = {}) => ({ author: AUTHOR, isCrossRepository: false, baseRefName: 'main', ...over });
+    const refs = new Map([
+      [number, record({ headRefName, headRefOid: TOP, baseRefName })],
+      ...(numbered ? [[5981, record({ headRefName: baseRefName, headRefOid: BOTTOM })]] : []),
+    ]);
+    const tips = new Map([[headRefName, TOP], [baseRefName, BOTTOM]]);
+    const run = args => {
+      if (args[0] === 'cat-file') return '';
+      if (args[0] === 'rev-list') {
+        const head = args[args.indexOf('--end-of-options') + 1];
+        if (head === TOP) return [TOP, BOTTOM].join('\n');
+        if (head === BOTTOM) return BOTTOM;
+        throw new Error('unknown commit');
+      }
+      if (args[0] === 'merge-base') return OLDER;
+      if (args[0] === 'merge-tree') return TREE;
+      throw new Error(`unexpected git command: ${args[0]}`);
+    };
+    const listed = () => [...refs].map(([number, ref]) => ({ number, headRefName: ref.headRefName, headRefOid: ref.headRefOid }));
+    const read = (options = {}) => readStackBases({ root: '/repo', env: {}, settingOn: true,
+      prs: listed(), readRefs: () => refs, readLanes: () => tips, run, log: () => {}, ...options });
+    const prependCollision = isCrossRepository => {
+      const entries = [...refs];
+      refs.clear();
+      refs.set(7001, record({ headRefName: baseRefName, headRefOid: STRAY, isCrossRepository }));
+      for (const [pr, ref] of entries) refs.set(pr, ref);
+    };
+    return { number, refs, read, listed, prependCollision,
+      expected: { pr: numbered ? 5981 : null, ref: baseRefName, head: BOTTOM,
+        contained: BOTTOM, tree: TREE, topHead: TOP } };
+  };
+
+  it.each([false, true])('preserves the numbered result despite an earlier fork name collision with prlessBase:%s', prlessBase => {
+    const f = fixture();
+    const before = f.read({ prlessBase });
+    f.prependCollision(true);
+    const diag = new Map();
+    const after = f.read({ prlessBase, diag });
+    expect(after).toEqual(before);
+    expect(after.get(f.number)).toEqual(f.expected);
+    expect(diag.has(f.number)).toBe(false);
+    if (!prlessBase) expect(f.read()).toEqual(before);
+  });
+
+  it.each([true, undefined])('resolves the #5996 PR-less shape despite a matching fork/unknown-status name (%s)', status => {
+    const f = fixture(false);
+    f.prependCollision(status);
+    const diag = new Map();
+    expect(f.read({ prlessBase: true, diag }).get(f.number)).toEqual(f.expected);
+    expect(diag.has(f.number)).toBe(false);
+  });
+
+  it.each([false, true])('prefers a trusted non-fork base over an earlier stale non-fork PR with prlessBase:%s', prlessBase => {
+    const f = fixture();
+    f.prependCollision(false);
+    const diag = new Map();
+    expect(f.read({ prlessBase, diag }).get(f.number)).toEqual(f.expected);
+    expect(diag.has(f.number)).toBe(false);
+  });
+
+  it.each([false, true])('reports pr-record-missing for a listed top absent from nonempty refs with prlessBase:%s', prlessBase => {
+    const f = fixture();
+    const prs = f.listed();
+    f.refs.delete(f.number);
+    expect(f.refs.size).toBeGreaterThan(0);
+    const diag = new Map();
+    expect(f.read({ prs, prlessBase, diag }).has(f.number)).toBe(false);
+    expect(diag.get(f.number)).toEqual({ cause: 'pr-record-missing' });
+  });
+});

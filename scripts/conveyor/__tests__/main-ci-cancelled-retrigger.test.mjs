@@ -560,15 +560,50 @@ describe('main cancelled CI retrigger: lock hardening', () => {
     expect(mainRetriggerRecordPath('a/b-c', '/h')).not.toBe(mainRetriggerRecordPath('a-b/c', '/h'));
   });
 
-  it('seeds a repository record from the pre-split shared file so an already-retriggered head is not rerun', () => {
+  it.each([
+    ['matching provenance', 'web-everything/frontierui', 'web-everything/frontierui', true],
+    ['foreign provenance', 'web-everything/frontierui', 'web-everything/web-everything', false],
+    ['missing provenance outside WE', 'web-everything/frontierui', undefined, false],
+    ['missing provenance in WE', 'web-everything/web-everything', undefined, true],
+    ['matching provenance in WE', 'web-everything/web-everything', 'web-everything/web-everything', true],
+    ['default WE repository', null, undefined, true],
+    ['WE alias', 'we', undefined, true],
+  ])('seeds the pre-split shared record only for its repository: %s', (_name, repo, provenance, inherited) => {
     inTemp(path => {
-      writeFileSync(join(dirname(path), 'main-ci-retrigger.json'), JSON.stringify({ [sha]: { runId: 123, retriggeredAt: new Date(now).toISOString() } }));
-      const repoPath = mainRetriggerRecordPath('web-everything/frontierui', dirname(path));
+      writeFileSync(join(dirname(path), 'main-ci-retrigger.json'), JSON.stringify({ [sha]: {
+        repo: provenance, runId: 123, retriggeredAt: new Date(now).toISOString(),
+      } }));
+      const repoPath = mainRetriggerRecordPath(repo, dirname(path));
       const rerun = vi.fn(() => ({ ok: true }));
-      const result = sweepMainCancelledRetrigger({ apply: true, now, repo: 'web-everything/frontierui', recordPath: repoPath, rerun,
+      const result = sweepMainCancelledRetrigger({ apply: true, now, repo, recordPath: repoPath, rerun,
         readMainRuns: () => [run({ updatedAt: '2026-10-26T12:30:00Z' })], emitEvent: vi.fn() });
-      expect(result.dispatch[0].action).toBe('main-ci-stuck');
-      expect(rerun).not.toHaveBeenCalled();
+      expect(result.applied).toEqual([{ action: inherited ? 'main-ci-stuck' : 'main-ci-retriggered', sha, runId: 123, ok: true }]);
+      expect(rerun).toHaveBeenCalledTimes(inherited ? 0 : 1);
+    });
+  });
+
+  it('does not consume another repository\'s retry for a shared SHA', () => {
+    inTemp(path => {
+      const rerun = vi.fn(() => ({ ok: true }));
+      const repos = [['web-everything/web-everything', 123], ['example/mirror', 456]];
+      for (let tick = 0; tick < 3; tick++) {
+        for (const [repo, runId] of repos) {
+          const result = sweepMainCancelledRetrigger({ apply: true, now, repo, rerun,
+            recordPath: mainRetriggerRecordPath(repo, dirname(path)), emitEvent: vi.fn(),
+            readMainRuns: () => [run({ databaseId: runId,
+              ...(tick > 0 ? { updatedAt: '2026-10-26T12:30:00Z' } : {}),
+            })],
+          });
+          expect(result.refusals).toEqual([]);
+          expect(result.applied.map(entry => entry.action)).toEqual(
+            tick === 0 ? ['main-ci-retriggered'] : tick === 1 ? ['main-ci-stuck'] : []);
+        }
+      }
+      expect(rerun.mock.calls).toEqual(repos.map(([repo, runId]) => [runId, { repo }]));
+      for (const [repo, runId] of repos) {
+        const record = JSON.parse(readFileSync(mainRetriggerRecordPath(repo, dirname(path)), 'utf8'));
+        expect(record[sha]).toMatchObject({ runId, stuck: true });
+      }
     });
   });
 

@@ -1412,15 +1412,23 @@ export function formatMissingRunReport({ dispatch = [], refusals = [], applied =
   return lines.join('\n');
 }
 
-function readMainRetriggerRecord(path) {
+function readMainRetriggerRecord(path, repo) {
   try { return JSON.parse(readFileSync(path, 'utf8')); }
   catch (e) {
     if (e.code !== 'ENOENT') throw e;
-    // A repository's first read seeds from the pre-split shared file, so a head already retriggered there
-    // is still remembered (entries are keyed by sha; foreign shas are inert and age out with the bound).
     const legacy = join(dirname(path), 'main-ci-retrigger.json');
     if (legacy === path) return {};
-    try { return JSON.parse(readFileSync(legacy, 'utf8')); }
+    try {
+      const record = JSON.parse(readFileSync(legacy, 'utf8'));
+      // A shared SHA does not establish repository identity. Unattributed legacy attempts
+      // belong only to WE; seeding another repository requires explicit matching provenance.
+      // Preserve malformed evidence for the caller's fail-closed validation.
+      if (!record || Array.isArray(record) || typeof record !== 'object') return record;
+      const slug = repoSlug(repo);
+      return Object.fromEntries(Object.entries(record).filter(([, entry]) =>
+        !entry || typeof entry !== 'object' || Array.isArray(entry) || entry.repo === slug ||
+        (entry.repo === undefined && slug === CONSTELLATION_REPOS.we.slug)));
+    }
     catch (le) { if (le.code === 'ENOENT') return {}; throw le; }
   }
 }
@@ -1551,7 +1559,7 @@ export function sweepMainCancelledRetrigger(options = {}) {
 function sweepMainCancelledLocked({ repo = null, defaultBranch = 'main', apply = false,
   readMainRuns = defaultReadMainRuns, rerun = rerunMainCancelledRun,
   recordPath,
-  readRecord = readMainRetriggerRecord, writeRecord: persistRecord = writeMainRetriggerRecord,
+  readRecord = path => readMainRetriggerRecord(path, repo), writeRecord: persistRecord = writeMainRetriggerRecord,
   emitEvent = event => appendDaemonEvent({ ...event, daemon: 'ci-red-recovery-watch' }),
   now = Date.now(), assertHeld = () => {},
 } = {}) {

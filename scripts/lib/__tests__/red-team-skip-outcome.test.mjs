@@ -261,3 +261,41 @@ describe('PR 5890 not-owed settlement (R100: not-owed on an accepted head is pol
     expect(f.io.publishNeedsYou).toHaveBeenCalledOnce();
   });
 });
+
+
+describe('stored-review not-owed settlement context', () => {
+  it('clears only the explicitly acceptance-checked recovery context once', () => {
+    const f = fixture(), context = { accepted: true, storedReviewPolicyClear: true };
+    expect(f.settle({ status: 'not-owed' }, context).outcome).toBe('policy-clear');
+    expect(f.comments[0].body).toContain('Red team not required on this head: not owed (stored review)');
+    expect(f.settle({ status: 'not-owed' }, context).outcome).toBe('already');
+    expect(f.io.postComment).toHaveBeenCalledOnce();
+  });
+  it.each([
+    { accepted: false }, { storedReviewPolicyClear: false }, { readHead: 'b'.repeat(40) },
+  ])('refuses incomplete stored-review authority %j', override => {
+    const f = fixture();
+    expect(f.settle({ status: 'not-owed' }, {
+      accepted: true, storedReviewPolicyClear: true, ...override,
+    }).outcome).toBe('non-policy');
+    expect(f.io.postComment).not.toHaveBeenCalled();
+  });
+  it.each(['deferredByGuard', 'deferredByCap'])('refuses a stored-review clear with %s', flag => {
+    const f = fixture();
+    expect(f.settle({ status: 'not-owed', [flag]: true }, {
+      accepted: true, storedReviewPolicyClear: true,
+    }).outcome).toBe('non-policy');
+    expect(f.io.postComment).not.toHaveBeenCalled();
+  });
+});
+
+// The overlay acceptance form and graduated stored-review form coexist. Explicit
+// recovery authority must never fall back to the legacy form when malformed.
+describe('not-owed settlement authority forms', () => {
+  it.each([false, undefined, null, 0, 1, 'true'])('explicit malformed recovery authority %j refuses legacy fallback', storedReviewPolicyClear => {
+    const f = fixture();
+    expect(f.settle({ status: 'not-owed' }, { accepted: true, storedReviewPolicyClear }).outcome).toBe('non-policy');
+    expect(f.io.postComment).not.toHaveBeenCalled();
+    expect(f.io.publishNeedsYou).toHaveBeenCalledOnce();
+  });
+});

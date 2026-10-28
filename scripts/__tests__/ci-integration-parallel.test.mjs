@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import yaml from 'js-yaml';
 
 const yml = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', '.github', 'workflows', 'ci.yml'), 'utf8');
 const job = (name) => {
@@ -23,7 +24,7 @@ describe('ci.yml: integration suite runs as its own parallel job', () => {
   it('`test` no longer runs the suite itself but still goes red when integration is not success', () => {
     const t = job('test');
     expect(t).not.toContain('npm run test:integration:vitest');
-    expect(t).toMatch(/needs: \[changes, test-shard, integration\]/);
+    expect(yaml.load(yml).jobs.test.needs).toEqual(expect.arrayContaining(['changes', 'test-shard', 'integration', 'standards', 'coverage-merge', 'host-paths']));
     expect(t).toContain('needs.integration.result');
   });
 });

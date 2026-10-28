@@ -28,6 +28,8 @@ import { openOperatorSendBacks } from '../lib/operator-send-backs.mjs';
 import { parseFindings } from '../review-corpus/mine-review-corpus.mjs';
 import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { resolveHumanReviewSurfaces } from '../lib/human-review-surfaces.mjs';
+import { STALL_DEFAULTS } from './judge-sweep-facts.mjs';
+import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
 export const JUDGE_SWEEP_REPO = CONSTELLATION_REPOS[DEFAULT_REPO_KEY].slug;
 
 const rootDir = () => join(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -37,6 +39,20 @@ const CACHE_BYTES = 128 * 1024;
 // Bump whenever review-core-cli's shape/human-required rules change. Old envelopes are disposable misses.
 const SHAPE_RULES_VERSION = 1;
 const RED_TEAM_JUDGMENT_LABELS = new Set(['red-team:blocked', 'red-team:clear']);
+/** Missing or invalid layers fall through to the next valid, finite positive threshold. */
+export function resolveStallThresholds({ env = process.env, readFile = readFileSync, platform, log } = {}) {
+  let tool, envValues;
+  try { tool = JSON.parse(String(readFile(new URL('../settings/judge-sweep-stall.json', import.meta.url), 'utf8')))?.judgeSweepStall; } catch { /* absent layer */ }
+  try { envValues = JSON.parse(env.WE_JUDGE_SWEEP_STALL); } catch { /* absent layer */ }
+  const pick = value => value && typeof value === 'object' && !Array.isArray(value)
+    ? Object.fromEntries(Object.keys(STALL_DEFAULTS).filter(k => Object.hasOwn(value, k)).map(k => [k, value[k]])) : {};
+  const plat = platform === undefined ? platformPreference('judgeSweepStall', { env, readFile }) : platform;
+  return cascadePolicy('judgeSweepStall', pick(tool), {
+    standard: STALL_DEFAULTS, platform: pick(plat), envValues: pick(envValues), env, log,
+    valid: v => typeof v === 'number' && Number.isFinite(v) && v > 0,
+  }).value;
+}
+
 const failure = what => new Error(`judge-sweep-facts: ${what}; inspect PR evidence and rerun a narrower/operator query`);
 
 /** Operator credential only, through the shared throttle. One attempt keeps the sweep budget inclusive of retries. */
@@ -110,6 +126,7 @@ function readRows(repo) {
 
 /** Injectable at every boundary; tests never need the host's credentials, process table, or ledgers. */
 export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.now(),
+  readFile = readFileSync,
   exec = execFileSync,
   readLedgerRows = readRows, readFixRows = readFixLoopRows,
   readJobs = () => parseLiveJobs(exec('ps', ['-axo', 'pid,etime,command'], {
@@ -122,21 +139,23 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
     env: { ...process.env, WE_HUMAN_REVIEW_SURFACES: humanSurfaces.categories.join(',') },
   })),
   baseCap = resolveRoundCap(process.env),
+  readStallThresholds = resolveStallThresholds,
   cardReadable = ref => referralCardReadable(ref, rootDir(), { readOnPr: () => {
     // Remote card verification would break this operation's list + comments-only call budget.
     throw failure('remote referral card requires operator verification');
   } }),
 } = {}) {
-  return ({ repo = JUDGE_SWEEP_REPO } = {}) => {
+  return ({ repo = JUDGE_SWEEP_REPO, checkCoverage } = {}) => {
     if (repo.length > 200 || !/^[\w.-]+\/[\w.-]+$/.test(repo)) throw failure('repo must be owner/name (at most 200 characters)');
     const start = now();
+    const thresholds = readStallThresholds();
     let calls = 0;
     const boundedGh = args => {
       if (++calls > MAX_CALLS) throw failure('128-call budget exhausted');
       return String(gh(args, { encoding: 'utf8', timeout: 60_000, maxBuffer: 32 * 1024 * 1024 }));
     };
     const argv = listArgv({ repo });
-    argv[argv.length - 1] += ',baseRefOid,updatedAt,files,changedFiles,author,assignees,body,createdAt,statusCheckRollup';
+    argv[argv.length - 1] += ',baseRefOid,updatedAt,files,changedFiles,author,assignees,body,createdAt,statusCheckRollup,isDraft';
     const listing = JSON.parse(boundedGh(argv));
     if (!Array.isArray(listing) || listing.length >= LIST_LIMIT) throw failure('open PR listing incomplete (limit 200); use an exhaustive operator listing');
     let ledger = [], fixRows = [], jobs = [];
@@ -177,7 +196,20 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
       const fixes = fixRows.filter(r => [repo, repoKeyForSlug(repo)].includes(r.repo) && r.pr === p.number)
         .sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
       const lastFixLoop = fixes.length ? { kind: fixes[0].kind, outcome: fixes[0].outcome ?? null, at: fixes[0].at } : null;
+      const outcomes = fixes.filter(r => r.kind === 'outcome' && r.head?.toLowerCase() === headSha);
+      let infraFailStreak = 0;
+      for (const row of outcomes) {
+        if (row.outcome !== 'failed' || !(row.infra === true || /lease/i.test(row.reason ?? ''))) break;
+        infraFailStreak++;
+      }
+      const lastDispatch = fixes.find(r => ['ci-heal', 'fix', 'rearm'].includes(r.kind));
+      const minutesSince = at => Number.isFinite(Date.parse(at)) ? Math.max(0, (start - Date.parse(at)) / 60_000) : null;
+      const lastCommit = Array.isArray(p.commits) ? p.commits.at(-1) : null;
       const result = { number: p.number, title: p.title, labels, headSha, round, cap: baseCap,
+        infraFailStreak: errors.includes('fix-loop ledger unreadable') ? null : infraFailStreak,
+        isDraft: typeof p.isDraft === 'boolean' ? p.isDraft : null,
+        minutesSinceHeadChange: minutesSince(lastCommit?.committedDate),
+        minutesSinceFixDispatch: minutesSince(lastDispatch?.at),
         redTeam: { state: 'unknown', latestResultId: null, latestOutcome: null }, latestVerdict: null,
         openReferrals: null, openSendBacks: null, lastFixLoop, humanRequired: null,
         minutesSinceFixLoop: lastFixLoop && Number.isFinite(Date.parse(lastFixLoop.at))
@@ -189,8 +221,17 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
       // Mandatory referrals can appear only in comments, even while a fixer or CI runs.
       const redTeamJudgmentLabel = labels.some(l => RED_TEAM_JUDGMENT_LABELS.has(l));
       try {
-        const comments = readComments({ number: p.number, repo, exec: commentsExec });
-        if (!Array.isArray(comments) || comments.some(c => typeof c?.body !== 'string' || !c.author?.login || !Number.isFinite(Date.parse(c.createdAt)))) throw failure('comments incomplete');
+        const readCommentEvidence = () => {
+          const comments = readComments({ number: p.number, repo, exec: commentsExec });
+          if (!Array.isArray(comments) || comments.some(c => typeof c?.body !== 'string' || !c.author?.login || !Number.isFinite(Date.parse(c.createdAt)))) throw failure('comments incomplete');
+          return comments;
+        };
+        let comments;
+        try { comments = readCommentEvidence(); }
+        catch (error) {
+          if (calls >= MAX_CALLS) throw error;
+          comments = readCommentEvidence();
+        }
         // List + comments cannot verify the ruling issue, comment edits, and card-only heads.
         // Explicitly withhold automatic grant credit and surface the missing evidence.
         const standingRuling = null;
@@ -254,6 +295,9 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
       }
       return result;
     });
-    return { generatedAt: new Date(start).toISOString(), elapsedMs: Math.max(0, now() - start), prs };
+    // An unreadable report leaves coverageReport unset; finish then fails closed as "unreadable".
+    let report = {};
+    if (checkCoverage !== undefined) { try { report = { coverageReport: readFile(checkCoverage, 'utf8') }; } catch { /* fail closed in finish */ } }
+    return { generatedAt: new Date(start).toISOString(), elapsedMs: Math.max(0, now() - start), prs, thresholds, ...report };
   };
 }

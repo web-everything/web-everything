@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import {
   appendGitRowsSync, createGitLedgerStore, appendLedgerRows, readLedgerFromGit, ledgerGitPath, LedgerAppendExhaustedError, LEDGER_TRANSPORT_BRANCH,
   resolveLedgerReadSettings, formatLedgerReadSettings, sizedLedgerRun, DEFAULT_LEDGER_READ_MAX_BYTES, LEDGER_READ_MAX_BYTES_ENV,
+  DEFAULT_APPEND_ATTEMPTS,
 } from '../verdict-ledger-io.mjs';
 import { buildVerdictRecord, buildLedgerEvent } from '../verdict-ledger.mjs';
 import { withBareOrigin, git, writeLocalIdentity } from '../../operations/__tests__/helpers/real-repo.mjs';
@@ -68,6 +69,74 @@ describe('appendLedgerRows: bounded retry, loud on exhaustion', () => {
     const f = failing(99);
     expect(() => appendLedgerRows(base({ run: f.run, attempts: 3 }))).toThrow(LedgerAppendExhaustedError);
     expect(f.pushes()).toBe(3);
+  });
+
+  it('default attempt cap is 8', () => {
+    expect.soft(DEFAULT_APPEND_ATTEMPTS).toBe(8);
+    const f = failing(Infinity);
+    expect(() => appendLedgerRows(base({ run: f.run }))).toThrow(LedgerAppendExhaustedError);
+    expect(f.pushes()).toBe(8);
+  });
+
+  it('backoff grows past the old 1600ms ceiling and is jittered across the whole window', () => {
+    const collect = (value) => {
+      const f = failing(Infinity);
+      const sleeps = [];
+      expect(() => appendLedgerRows(base({
+        run: f.run, attempts: 8, random: () => value, sleep: (ms) => sleeps.push(ms),
+      }))).toThrow(LedgerAppendExhaustedError);
+      expect(f.pushes()).toBe(8);
+      expect(sleeps).toHaveLength(7); // no sleep after the final failed attempt
+      return sleeps;
+    };
+    // Probe both ends and the middle of the proposed injected random seam. The near-one
+    // sample approximates each cap within a millisecond, allowing integer rounding.
+    const lower = collect(0);
+    const middle = collect(0.5);
+    const upper = collect(1 - Number.EPSILON);
+    expect.soft(upper.at(-1)).toBeGreaterThan(1600);
+    for (let i = 0; i < upper.length; i += 1) {
+      const cap = upper[i];
+      expect.soft(Number.isFinite(cap)).toBe(true);
+      expect.soft(cap).toBeGreaterThan(0);
+      if (i > 0) expect.soft(cap).toBeGreaterThanOrEqual(upper[i - 1]);
+      expect.soft(Math.abs(lower[i] - cap / 2)).toBeLessThanOrEqual(1);
+      expect.soft(Math.abs(middle[i] - cap * 0.75)).toBeLessThanOrEqual(1);
+      expect.soft(lower[i]).toBeGreaterThanOrEqual(cap / 2 - 1);
+      expect.soft(middle[i]).toBeGreaterThan(lower[i]);
+      expect.soft(middle[i]).toBeLessThan(cap);
+    }
+    // A fixed random stream must reproduce the same waits, without ambient Math.random.
+    expect(collect(0.5)).toEqual(middle);
+  });
+
+  it('a genuine auth/network failure still throws LedgerAppendExhaustedError after the cap, naming the last error', () => {
+    let pushes = 0;
+    const failures = [];
+    const sleeps = [];
+    const run = (args) => {
+      if (args[0] === 'push') {
+        pushes += 1;
+        const error = new Error(`git push failed on attempt ${pushes}: Permission denied (publickey)`);
+        error.stderr = `Permission denied (publickey) on attempt ${pushes}`;
+        failures.push(error);
+        throw error;
+      }
+      return args[0] === 'diff' ? 'verdict-ledger/x.jsonl' : '';
+    };
+    let caught;
+    try {
+      appendLedgerRows(base({ run, attempts: 3, sleep: (ms) => sleeps.push(ms) }));
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(LedgerAppendExhaustedError);
+    expect(caught.attempts).toBe(3);
+    expect(caught.errors.map(({ message }) => message))
+      .toEqual(failures.map(({ stderr }) => expect.stringContaining(stderr)));
+    expect(caught.message).toMatch(/last error: .*Permission denied \(publickey\) on attempt 3/);
+    expect(pushes).toBe(3);
+    expect(sleeps).toHaveLength(2);
   });
 
   it('accepts a v2 event row (ruling, send-back) with the same validation', () => {
@@ -170,6 +239,48 @@ describe('real git', () => {
       expect(seen.records.map((x) => x.pr).sort()).toEqual([100, 200]);
       // The origin's file holds exactly two rows: no row was overwritten, none duplicated.
       expect(ctx.showOnOrigin(LEDGER_TRANSPORT_BRANCH, ledgerGitPath(REPO)).trim().split('\n')).toHaveLength(2);
+    });
+  });
+
+  it('SIX LOST RACES: a writer that loses 6 pushes in a row still lands, and every rival row survives', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const rival = cloneOf(ctx, 'six-races-rival');
+      const records = Array.from({ length: 7 }, (_, i) => row(100 + i));
+      let pushes = 0;
+      let rejected = 0;
+      const run = (args, opts) => {
+        if (args[0] === 'push') {
+          pushes += 1;
+          expect(args).toEqual(['push', '--quiet', 'origin', 'HEAD:refs/heads/ops/review-requests']);
+          if (pushes <= 6) {
+            appendLedgerRows({ board: rival, repo: REPO, records: [records[pushes - 1]], sleep: noSleep });
+          }
+        }
+        try {
+          return git(args, opts);
+        } catch (error) {
+          if (args[0] === 'push') rejected += 1;
+          throw error;
+        }
+      };
+      const retries = [];
+      // Leave attempts omitted: sustained contention must succeed under the default policy.
+      const result = appendLedgerRows({
+        board: ctx.clone, repo: REPO, records: [records[6]], run, sleep: noSleep,
+        onRetry: ({ attempt }) => retries.push(attempt),
+      });
+      expect(result).toMatchObject({ status: 'appended', attempts: 7, rows: 1, duplicates: 0 });
+      expect(pushes).toBe(7);
+      expect(rejected).toBe(6);
+      expect(retries).toEqual([1, 2, 3, 4, 5, 6]);
+      const landed = ctx.showOnOrigin(LEDGER_TRANSPORT_BRANCH, ledgerGitPath(REPO))
+        .trim().split('\n').map((line) => JSON.parse(line));
+      expect(landed).toHaveLength(7);
+      expect(landed.map(({ pr }) => pr).sort((a, b) => a - b)).toEqual(records.map(({ pr }) => pr));
+      // Re-appending the same records proves the origin retains each record id exactly once.
+      expect(appendLedgerRows({ board: rival, repo: REPO, records, sleep: noSleep }))
+        .toMatchObject({ rows: 0, duplicates: 7 });
     });
   });
 

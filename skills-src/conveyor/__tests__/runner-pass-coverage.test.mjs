@@ -19,6 +19,7 @@ const templateText = [root, join(root, 'launchd')].flatMap((dir) =>
 
 /** Passes with no pass-daemon entry on purpose. Each needs a reason; an entry here is a claim a reviewer can check. */
 const EXCLUDED = {
+  'delegated-clear-human': 'R130 shadow-mode pass that runs inside the runner tick only; no separate daemon yet',
   'reconcile-fix-dispatch': 'owned by the fix-dispatch daemon (com.we.fix-dispatch-daemon), not a pass-daemon',
   'ci-heal-pr-dispatch': 'owned by the review/fix dispatch daemons, not a pass-daemon',
   'promote-draft-pr-dispatch': 'owned by the review/fix dispatch daemons, not a pass-daemon',
@@ -50,6 +51,10 @@ const entriesFor = (pass) => Object.keys(DAEMON_MANIFEST).filter((k) => k === pa
 const hasTemplate = (key) => templateText.includes(`--pass=${key}<`);
 
 describe('legacy runner passes still run somewhere', () => {
+  it('lists the delegated-clear-human pass (R130) in the runner pass names', () => {
+    expect(MECHANICAL_PASS_NAMES).toContain('delegated-clear-human');
+  });
+
   it('every runner pass has an installed daemon entry or a reasoned exclusion', () => {
     const orphans = MECHANICAL_PASS_NAMES.filter((pass) => !(pass in EXCLUDED) && !(pass in KNOWN_ORPHANS))
       .filter((pass) => !entriesFor(pass).some(hasTemplate));

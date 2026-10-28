@@ -130,7 +130,13 @@ export function settleRedTeamSkip(input = {}) {
     const { redTeam, pr, repo, comments } = input;
     const realHead = isRealHead(input.head);
     const head = realHead ? input.head : 'unknown';
-    const classified = classifyRedTeamSkip(redTeam, { accepted: input.accepted });
+    // Recovery requires explicit authority after acceptance/hold checks. The overlay's
+    // accepted-head form remains supported only when recovery authority is absent;
+    // an explicit false, unknown or malformed authority never falls back to it.
+    const storedClear = input.storedReviewPolicyClear === true && input.accepted === true
+      && redTeam?.status === 'not-owed' && !redTeam.deferredByGuard && !redTeam.deferredByCap;
+    const classified = storedClear ? { kind: 'policy', reason: 'not owed (stored review)' }
+      : classifyRedTeamSkip(redTeam, { accepted: !Object.hasOwn(input, 'storedReviewPolicyClear') && input.accepted === true });
     let { reason } = classified;
     const boundRead = isRealHead(input.readHead)
       && realHead && input.readHead.toLowerCase() === head.toLowerCase();
@@ -147,9 +153,8 @@ export function settleRedTeamSkip(input = {}) {
         const thread = comments ?? io.readComments({ repo, pr });
         if (!Array.isArray(thread)) throw Error('PR comments unreadable');
         if (redTeamForHead(thread, pr, head)) return { outcome: 'already' };
-        io.postComment({ repo, pr, body: `${redTeamMarker(pr, head)}\n\n${classified.notOwed
-          ? 'Red team not required on this head: red team reported not-owed on an accepted head (policy clear)'
-          : 'Red team not required on this head: card-only diff (policy redTeam.skipCardOnly)'}${
+        io.postComment({ repo, pr, body: `${redTeamMarker(pr, head)}\n\nRed team not required on this head: ${storedClear ? 'not owed (stored review)' : classified.notOwed
+          ? 'red team reported not-owed on an accepted head (policy clear)' : 'card-only diff (policy redTeam.skipCardOnly)'}${
           typeof input.reason === 'string' && input.reason.trim() ? ` — ${boundReason(input.reason)}` : ''}` });
         return { outcome: 'policy-clear' };
       } catch (error) {

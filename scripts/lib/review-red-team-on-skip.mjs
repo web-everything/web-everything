@@ -7,15 +7,16 @@ import { fileURLToPath } from 'node:url';
 import { readDrainRedTeamEvidence, readRedTeamStatus } from './drain-red-team-evidence.mjs';
 import { redTeamForHead, redTeamMarker, parseRedTeamComment } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
-import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from './red-team-skip-outcome.mjs';
+import { readRedTeamCarry } from './red-team-carry-machine.mjs';
+import { isRealHead, safeErrorText, settleRedTeamSkip } from './red-team-skip-outcome.mjs';
 import { runGhSync } from './gh-throttle.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun } from './red-team-run-result.mjs';
-import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 
 import { redTeamRequired } from './jury-core.mjs';
-import { latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
+import { isLaterVerdictBody, latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
+import { restampRecord, strandedNumberingRecords } from './numbering-carry.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { RED_TEAM_STATUS_LABELS } from './red-team-status-label-meta.mjs';
 
@@ -30,15 +31,25 @@ function conflictsWithPolicyClear(label) {
   );
 }
 
-/** Live holds supersede both carried and stored policy-clears. PURE. */
-function publishableClearGuard({ labels, acceptance }) {
+/** Live holds supersede both carried and stored policy-clears. PURE.
+ * Without an acceptance record nothing is "later", so any explicit hold comment stands (any author: fail closed).
+ */
+function publishableClearGuard({ labels, acceptance, comments, reviews }) {
   if (acceptance?.laterVerdict || acceptance?.laterBodyDerivedHold) {
     return 'later verdict or hold supersedes acceptance';
+  }
+  if (!acceptance && (!Array.isArray(comments) || comments.some(c => isLaterVerdictBody(c?.body)))) {
+    return 'explicit review hold comment prevents full review; inspect the PR thread';
   }
   if (acceptance?.reviewsUnreadable) return 'PR reviews unreadable; inspect formal reviews before policy-clear';
   if (!Array.isArray(labels)) return 'PR labels unreadable';
   if (labels.some(conflictsWithPolicyClear)) {
     return 'conflicting label prevents policy-clear';
+  }
+  // A trusted marker alone is not acceptance provenance. Use numbering's whole-thread
+  // validation, including stale forks, clearance changes and holds hidden by re-dating.
+  if (strandedNumberingRecords(comments, reviews).length) {
+    return 'invalid acceptance re-stamp; withdraw stranded records before recovery';
   }
   return null;
 }
@@ -134,9 +145,10 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         && evidence.completedRecorded !== true && readStatus({ repo, pr, head }) == null
         && /^📌 review — acceptance re-stamped after a rebase \(no new review\)/.test(rawPr.comments[acceptance.index]?.body ?? '')) {
         const priorComments = rawPr.comments.slice(0, acceptance.index);
-        // The re-stamp carries the preceding trusted acceptance, never an arbitrary old clear.
-        // Unknown source evidence leaves normal recovery/operator inspection in charge.
-        const source = latestAcceptRecord(priorComments, reviews);
+        // Share numbering's trusted provenance parser; comment order alone cannot bind a carry.
+        const restamp = restampRecord(rawPr.comments[acceptance.index]);
+        // Select the declared source without dropping intervening verdicts or holds.
+        const source = restamp ? latestAcceptRecord(priorComments, reviews, { sha: restamp.from }) : null;
         const comment = priorComments.findLast(c => {
           const parsed = parseRedTeamComment(c?.body);
           return parsed?.pr === pr && redTeamForHead([c], pr, parsed.rev);
@@ -148,11 +160,12 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           const parsed = parseRedTeamComment(c?.body);
           return parsed?.pr === pr && redTeamForHead([c], pr, parsed.rev);
         });
-        if (source && !source.laterVerdict && !source.laterBodyDerivedHold && source.sha !== head && parsed?.rev === source.sha
+        if (restamp?.to === head && source?.sha === restamp.from
+          && !source.laterVerdict && !source.laterBodyDerivedHold && source.sha !== head && parsed?.rev === source.sha
           && latestResult === comment && result && result.findings.length === 0
           && comment.body.split(/\r?\n/).filter(line => line.trim()).length === 2
           && /^Red team not required on this head: [^\r\n]+$/m.test(comment.body)) {
-          const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance });
+          const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews });
           if (refusal) return skip(refusal);
           return { ...row, action: 'carry', from: source.sha, why: 'prior policy-clear across acceptance re-stamp' };
         }
@@ -164,7 +177,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       const owed = redTeamOwedFor(evidence?.loopPayload);
       // A missing live-head review requires the full loop; stale reads cannot authorize a red-team-only pass.
       const storedHead = evidence?.loopPayload?.findings?.read?.netBasis?.rev;
-      const needsReview = !movedCardOnly && accepted
+      const needsReview = !movedCardOnly && !pendingCardOnly && !unfinishedCarry && accepted
         && (evidence?.loopPayload == null || (isRealHead(storedHead) && storedHead !== head))
         && evidence?.inFlight === false && !evidence.queued
         && evidence.recorded === false && evidence.seatRecorded === false
@@ -172,7 +185,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         && (evidence.status == null || (isRealHead(evidence.status.head) && evidence.status.head !== head))
         && readStatus({ repo, pr, head }) == null;
       if (needsReview) {
-        const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance });
+        const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews });
         if (refusal) return skip(refusal);
         // Formal holds apply even without an acceptance comment. No timestamp
         // floor: a missing acceptance cannot establish that a review was cleared.
@@ -180,26 +193,28 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
         return dispatchDecision({ action: 'review', why: 'unprovable head move needs a full review' });
       }
-      if (!movedCardOnly && (!owed || accepted)) {
+      if (!movedCardOnly && !pendingCardOnly && (!owed || accepted)) {
         if (evidence?.inFlight || evidence?.queued) return skip('red-team pass in flight');
         if (evidence?.loopPayload?.findings?.read?.netBasis?.rev === head
           && accepted
           && (() => {
             const status = readStatus({ repo, pr, head });
             // An accepting review with no status still owes its normal pass.
-            return (status == null && !owed) || (status?.status === 'finished'
-              && normalizeRedTeamResult(status.result).priorResult === 'not-owed'
-              && classifyRedTeamSkip(typeof status.result === 'string' ? { status: status.result } : status.result, { accepted }).kind === 'policy'
-              && evidence.seatRecorded === false);
+            // Both the selected evidence and the live status must permit clearing:
+            // a raw reread must not resurrect a status discarded for a newer acceptance.
+            return (status == null && !owed) || (evidence.seatRecorded === false
+              && [evidence.status, status].every(candidate => candidate?.status === 'finished'
+                && normalizeRedTeamResult(candidate.result).priorResult === 'not-owed'
+                && !candidate.result?.deferredByGuard && !candidate.result?.deferredByCap));
           })()
           && redTeamRequired(evidence.loopPayload?.verdict?.verdict)
           && evidence.recorded !== true && evidence.seatRecorded !== true) {
           if (acceptance?.sha !== head) return skip('stored review does not owe a red team');
-          const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance });
+          const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance, comments: rawPr.comments, reviews });
           if (refusal) return skip(refusal);
           return { ...row, action: 'clear', why: 'not owed (stored review)' };
         }
-        if (!owed && !pendingCardOnly) return skip('stored review does not owe a red team');
+        if (!owed) return skip('stored review does not owe a red team');
       }
       if (!movedCardOnly && evidence.loopPayload?.findings?.read?.netBasis?.rev !== head) return skip('stored review does not match live head');
       if (evidence.inFlight || evidence.queued) return skip('red-team pass in flight');
@@ -223,6 +238,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         || (evidence.seatRecorded === undefined && evidence.recorded === false))) mode = 'fresh';
       else if (status == null && evidence.recorded === false) mode = 'fresh';
       else return skip(`prior result ${typeof prior === 'string' ? prior : 'unknown'} (status ${status?.status ?? 'missing'}); not re-run`);
+      // Even a policy-settlement fallback must not turn a spent retry into fresh provider work.
+      if (mode === 'fresh' && status?.retryCount >= 1) return skip('red-team retry already spent; inspect stored evidence');
       return dispatchDecision({ action: 'dispatch', mode, why: mode === 'resume' ? 'recorded pass needs its result comment/effects' : 'head never had a red-team pass' });
     } catch { return skip('red-team evidence unreadable; inspect stored evidence before retrying'); }
   });
@@ -289,7 +306,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           try {
             const rawPr = rawPrs.find(p => Number(p?.number) === row.prNumber);
             const result = settle({ redTeam: { status: 'not-owed' }, repo, pr: row.prNumber,
-              head: row.head, readHead: row.head, accepted: true, comments: rawPr.comments, reason: row.why,
+              head: row.head, readHead: row.head, accepted: true, storedReviewPolicyClear: true, comments: rawPr.comments, reason: row.why,
               io: { env, log: note,
                 postComment: ({ repo, pr, body }) => runGhSync([
                   'pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-',
