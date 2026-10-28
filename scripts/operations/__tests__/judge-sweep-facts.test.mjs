@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { resolveHumanReviewSurfaces } from '../../lib/human-review-surfaces.mjs';
+import * as judgeSweepFacts from '../judge-sweep-facts.mjs';
+import * as judgeSweepFactsIo from '../judge-sweep-facts-io.mjs';
 import { buildJudgeSweepBundle, finishJudgeSweep, judgeSweepFactsOperation, needsJudgment, JUDGE_SWEEP_REPO } from '../judge-sweep-facts.mjs';
 import { createJudgeSweepFactsReader, createShapeCache, operatorGh } from '../judge-sweep-facts-io.mjs';
 import { resolveOperation } from '../run.mjs';
@@ -120,6 +122,284 @@ describe('deterministic first-match judge classification', () => {
   });
 });
 
+// Keep facts() historical: new observations are opt-in so old callers exercise absent fields.
+const stallDefaults = { fixerInfraLoop: 3, needsHumanAgedHours: 6, draftWithdrawnAgedHours: 4, waitingFixerMinutes: 45,
+  unownedMinutes: 45 };
+const judgmentReason = (patch, id, thresholds) => {
+  expect(needsJudgment(facts(patch), thresholds)).toEqual({
+    needsJudgment: true, reason: expect.stringMatching(new RegExp(`^${id}`)),
+  });
+};
+
+describe('stall judgment reasons and compatibility', () => {
+  it.each([
+    ['idle', {}], ['recent fix loop', { minutesSinceFixLoop: 5 }],
+    ['fixer running', { fixerRunning: true }], ['in CI', { inCi: true }],
+    ['at cap', { round: 5 }],
+    ['all active at cap', { minutesSinceFixLoop: 5, fixerRunning: true, inCi: true, round: 5 }],
+  ])('prioritizes fixer-infra-loop over %s', (_name, activity) => {
+    judgmentReason({ ...activity, infraFailStreak: 3 }, 'fixer-infra-loop');
+    judgmentReason({ ...activity, infraFailStreak: 4 }, 'fixer-infra-loop');
+    expect(needsJudgment(facts({ ...activity, infraFailStreak: 2 }))).toEqual(needsJudgment(facts(activity)));
+  });
+  it.each(['review-status:needs-human', 'status:needs-human'])('ages %s by head time, falling back to update time', label => {
+    judgmentReason({ labels: [label], minutesSinceHeadChange: 361 }, 'needs-human-aged');
+    judgmentReason({ labels: [label], minutesSinceHeadChange: null, minutesSinceUpdate: 361 }, 'needs-human-aged');
+    judgmentReason({ labels: [label], minutesSinceUpdate: 361 }, 'needs-human-aged');
+    for (const minutesSinceHeadChange of [0, 360]) {
+      expect(needsJudgment(facts({ labels: [label], minutesSinceHeadChange, minutesSinceUpdate: 900, owner: 'alice' })))
+        .toEqual({ needsJudgment: false, reason: 'owner present' });
+    }
+  });
+  it('uses needs-human-aged only with readable evidence and keeps evidence-unavailable first otherwise', () => {
+    const aged = { labels: ['status:needs-human'], minutesSinceHeadChange: 361 };
+    judgmentReason({ ...aged, evidenceErrors: [] }, 'needs-human-aged');
+    expect(needsJudgment(facts({ ...aged, evidenceErrors: ['comments unreadable'] }))).toEqual({
+      needsJudgment: true, reason: 'evidence-unavailable: inspect PR evidence and rerun',
+    });
+    expect(needsJudgment(facts({ infraFailStreak: 3, evidenceErrors: ['ledger unreadable'] }))).toEqual({
+      needsJudgment: true, reason: 'evidence-unavailable: inspect PR evidence and rerun',
+    });
+  });
+  it.each([{ isDraft: true }, { labels: ['review-status:draft-withdrawn'] }])('ages withdrawn drafts: %j', draft => {
+    judgmentReason({ ...draft, minutesSinceHeadChange: 241 }, 'draft-withdrawn-aged');
+    judgmentReason({ ...draft, minutesSinceHeadChange: null, minutesSinceUpdate: 241 }, 'draft-withdrawn-aged');
+    for (const minutesSinceHeadChange of [0, 240]) {
+      expect(needsJudgment(facts({ ...draft, minutesSinceHeadChange, minutesSinceUpdate: 900, owner: 'alice' })))
+        .toEqual({ needsJudgment: false, reason: 'owner present' });
+    }
+  });
+  it('does not age a nondraft or an unlabelled PR', () => {
+    expect(needsJudgment(facts({ isDraft: false, minutesSinceHeadChange: 900 })))
+      .toEqual({ needsJudgment: false, reason: 'waiting on review' });
+  });
+  it.each(['status:answered-waiting-fixer', 'review:changes'])('detects %s without a recent dispatch', label => {
+    for (const minutesSinceFixDispatch of [null, 46]) {
+      judgmentReason({ labels: [label], minutesSinceFixDispatch }, 'waiting-fixer-not-dispatched');
+    }
+    for (const minutesSinceFixDispatch of [0, 45]) {
+      expect(needsJudgment(facts({ labels: [label], minutesSinceFixDispatch })))
+        .toEqual(needsJudgment(facts({ labels: [label] })));
+    }
+    expect(needsJudgment(facts({ labels: [label], minutesSinceFixDispatch: null, fixerRunning: true })))
+      .toEqual({ needsJudgment: false, reason: 'fixer running' });
+    expect(needsJudgment(facts({ labels: [label], minutesSinceFixDispatch: null, fixerRunning: null })).reason)
+      .not.toMatch(/^waiting-fixer-not-dispatched/);
+  });
+  it('uses supplied thresholds for each new reason', () => {
+    const thresholds = { fixerInfraLoop: 5, needsHumanAgedHours: 8, draftWithdrawnAgedHours: 7, waitingFixerMinutes: 90 };
+    const cases = [
+      ['fixer-infra-loop', { infraFailStreak: 4 }, { infraFailStreak: 5 }],
+      ['needs-human-aged', { labels: ['status:needs-human'], minutesSinceHeadChange: 480 },
+        { labels: ['status:needs-human'], minutesSinceHeadChange: 481 }],
+      ['draft-withdrawn-aged', { isDraft: true, minutesSinceHeadChange: 420 }, { isDraft: true, minutesSinceHeadChange: 421 }],
+      ['waiting-fixer-not-dispatched', { labels: ['review:changes'], minutesSinceFixDispatch: 90 },
+        { labels: ['review:changes'], minutesSinceFixDispatch: 91 }],
+    ];
+    for (const [id, below, above] of cases) {
+      expect(needsJudgment(facts(below), thresholds).reason).not.toMatch(new RegExp(`^${id}`));
+      judgmentReason(above, id, thresholds);
+    }
+  });
+  it.each([
+    { round: 5 }, { round: 6 }, { labels: ['status:round-limit'] }, { labels: ['status:cap-exhausted'] },
+  ])('does not classify accepted or merge-ready PRs as at-cap: %j', cap => {
+    const capLabels = cap.labels ?? [];
+    for (const labels of [['ready-to-merge'], ['review:accepted', 'ready-to-merge']]) {
+      expect(needsJudgment(facts({ ...cap, labels: [...capLabels, ...labels] })))
+        .toEqual({ needsJudgment: false, reason: 'awaiting-merge' });
+    }
+    judgmentReason({ ...cap, labels: [...capLabels, 'review:accepted', 'review:human'] }, 'awaiting-operator');
+    expect(needsJudgment(facts(cap))).toEqual({ needsJudgment: true, reason: 'at-cap' });
+  });
+  it('pins historical bundle rows and results when all new observations are absent or null', () => {
+    const old = [facts({ round: 5 }), facts({ number: 2, inCi: true }), facts({ number: 3, labels: ['review:changes'] })];
+    const expectedRows = [
+      { number: 1, round: 5, needsJudgment: true, reason: 'at-cap', nextOwner: 'judge' },
+      { number: 2, round: 1, needsJudgment: false, reason: 'in CI', nextOwner: 'nobody' },
+      { number: 3, round: 1, needsJudgment: false, reason: 'waiting for fixes', nextOwner: 'nobody' },
+    ].map(row => ({ title: 'fixture', labels: row.number === 3 ? ['review:changes'] : [], headSha: SHA, cap: 5,
+      redTeam: { state: 'unknown', latestResultId: null, latestOutcome: null }, latestVerdict: null,
+      openReferrals: [], openSendBacks: [], lastFixLoop: null, humanRequired: null,
+      minutesSinceUpdate: 1, evidenceErrors: [], ownerSince: 1,
+      nextStep: expect.stringMatching(/^[^\r\n]+$/), ...row }));
+    expect(buildJudgeSweepBundle({ generatedAt: at(0), elapsedMs: 12, prs: old })).toEqual({
+      generatedAt: at(0), elapsedMs: 12, counts: { needsJudgment: 1, noAction: 2 }, prs: expectedRows,
+    });
+    for (const row of old) {
+      expect(needsJudgment({ ...row, infraFailStreak: null, isDraft: null,
+        minutesSinceHeadChange: null })).toEqual(needsJudgment(row));
+    }
+  });
+  it('retains old bundle fields alongside new observations and updated counts', () => {
+    const observation = { infraFailStreak: 3, isDraft: false, minutesSinceHeadChange: 30, minutesSinceFixDispatch: 5 };
+    const input = facts({ ...observation, minutesSinceFixLoop: 5, verdictHistory: [], ignoredFindingReturned: false });
+    const { fixerRunning, inCi, owner, verdictHistory, ignoredFindingReturned, ...publicFacts } = input;
+    const bundle = buildJudgeSweepBundle({ generatedAt: at(0), elapsedMs: 12, prs: [input] });
+    expect(bundle).toEqual({ generatedAt: at(0), elapsedMs: 12, counts: { needsJudgment: 1, noAction: 0 },
+      prs: [{ ...publicFacts, needsJudgment: true, reason: expect.stringMatching(/^fixer-infra-loop/),
+        nextOwner: 'judge', nextStep: expect.stringMatching(/^[^\r\n]+$/), ownerSince: 5 }] });
+  });
+});
+
+describe('stall threshold policy cascade (injected IO only)', () => {
+  const resolve = (tool, env = {}, platform = null) => judgeSweepFactsIo.resolveStallThresholds({
+    env, platform, readFile: () => JSON.stringify({ judgeSweepStall: tool }),
+  });
+  it('exports a resolver with the standard defaults', () => {
+    expect(judgeSweepFactsIo.resolveStallThresholds).toBeTypeOf('function');
+    expect(judgeSweepFacts.STALL_DEFAULTS).toEqual(stallDefaults);
+    expect(resolve(undefined)).toMatchObject(stallDefaults);
+  });
+  it('resolves standard then platform then tool then the JSON environment override', () => {
+    const platform = { fixerInfraLoop: 4, needsHumanAgedHours: 7, draftWithdrawnAgedHours: 5, waitingFixerMinutes: 60 };
+    const tool = { fixerInfraLoop: 5, needsHumanAgedHours: 8, draftWithdrawnAgedHours: 6, waitingFixerMinutes: 75 };
+    const envValue = { fixerInfraLoop: 6, needsHumanAgedHours: 9, draftWithdrawnAgedHours: 7, waitingFixerMinutes: 90 };
+    expect(resolve(undefined, {}, platform)).toMatchObject(platform);
+    expect(resolve(tool, {}, platform)).toMatchObject(tool);
+    expect(resolve(tool, { WE_JUDGE_SWEEP_STALL: JSON.stringify(envValue) }, platform)).toMatchObject(envValue);
+  });
+  it.each(['{bad json', 'null', '[]', JSON.stringify({ fixerInfraLoop: -1, needsHumanAgedHours: 'six',
+    draftWithdrawnAgedHours: -4, waitingFixerMinutes: null })])('falls through invalid env values to defaults: %s', raw => {
+    expect(resolve(undefined, { WE_JUDGE_SWEEP_STALL: raw })).toMatchObject(stallDefaults);
+  });
+  it('falls through unreadable settings with an empty environment to standard defaults', () => {
+    expect(judgeSweepFactsIo.resolveStallThresholds({ env: {}, platform: null,
+      readFile: () => { throw new Error('unreadable'); } })).toMatchObject(stallDefaults);
+  });
+});
+
+describe('next responsible owner from existing facts', () => {
+  const ownerCases = [
+    ['fixer', { fixerRunning: true }],
+    ...['status:answered-waiting-fixer', 'review:changes'].flatMap(label => [
+      ['fixer', { labels: [label], minutesSinceFixDispatch: 0 }],
+      ['fixer', { labels: [label], minutesSinceFixDispatch: 45 }],
+      ['nobody', { labels: [label], minutesSinceFixDispatch: null }],
+      ['nobody', { labels: [label], minutesSinceFixDispatch: 46 }],
+    ]),
+    ['drain', { labels: ['review:accepted', 'ready-to-merge'] }],
+    ...['review:accepted', 'review:human', 'status:needs-you'].map(label => ['operator', { labels: [label] }]),
+    ['red-team', { redTeam: { state: 'pending' } }],
+    ['red-team', { labels: ['red-team:pending'] }],
+    ...['review:pending', 'status:awaiting-review'].map(label => ['review', { labels: [label] }]),
+    ['judge', { evidenceErrors: ['comments unreadable'] }],
+    ['judge', { infraFailStreak: 3 }],
+    ['judge', { round: 5 }],
+    ['judge', { openReferrals: [{ ruled: false, superseded: false }] }],
+    ['judge', { labels: ['status:needs-human'], minutesSinceHeadChange: 361 }],
+    ['judge', { labels: ['review-status:needs-human'], minutesSinceHeadChange: 361 }],
+    ['orchestrator', { labels: ['review-status:draft-withdrawn'] }],
+    ['orchestrator', { isDraft: true }],
+    ['orchestrator', { labels: ['status:needs-human'] }],
+    ['orchestrator', { labels: ['review-status:needs-human'] }],
+    ['nobody', {}],
+  ];
+  it.each(ownerCases)('derives %s with a nonempty one-line next step from %j', (nextOwner, patch) => {
+    const input = facts(patch);
+    const before = structuredClone(input);
+    const result = judgeSweepFacts.deriveNextOwner(input);
+    expect(result).toEqual({ nextOwner, nextStep: expect.any(String) });
+    expect(result.nextStep.trim()).not.toBe('');
+    expect(result.nextStep).not.toMatch(/[\r\n]/);
+    expect(judgeSweepFacts.deriveNextOwner(input)).toEqual(result);
+    expect(input).toEqual(before);
+  });
+  it('keeps a running fixer responsible for a needs-human PR', () => {
+    expect(judgeSweepFacts.deriveNextOwner(facts({ fixerRunning: true, labels: ['status:needs-human'] })))
+      .toMatchObject({ nextOwner: 'fixer' });
+  });
+  it('adds owner, next step and numeric age to every bundle row without mutating inputs', () => {
+    const prs = ownerCases.map(([, patch], i) => facts({ ...patch, number: i + 1 }));
+    const before = structuredClone(prs);
+    const bundle = buildJudgeSweepBundle({ generatedAt: at(0), elapsedMs: 12, prs });
+    expect(bundle.prs).toHaveLength(prs.length);
+    bundle.prs.forEach((row, i) => {
+      expect(row).toMatchObject({ ...judgeSweepFacts.deriveNextOwner(prs[i]), ownerSince: 1 });
+      expect(Number.isFinite(row.ownerSince)).toBe(true);
+    });
+    expect(prs).toEqual(before);
+  });
+  it.each([
+    [{ minutesSinceFixLoop: 12, minutesSinceUpdate: 90 }, 12],
+    [{ minutesSinceFixLoop: 0, minutesSinceUpdate: 90 }, 0],
+    [{ minutesSinceFixLoop: null, minutesSinceUpdate: 23 }, 23],
+    [{ minutesSinceUpdate: 23 }, 23],
+  ])('derives ownerSince from fix-loop age with update age as fallback: %j', (patch, ownerSince) => {
+    expect(buildJudgeSweepBundle({ prs: [facts(patch)] }).prs[0].ownerSince).toBe(ownerSince);
+  });
+});
+
+describe('unowned is a last-resort stall reason', () => {
+  const unownedRow = (patch, thresholds) => buildJudgeSweepBundle({ thresholds,
+    prs: [facts({ minutesSinceUpdate: 1, minutesSinceFixLoop: 90, ...patch })] }).prs[0];
+  it.each([[], ['status:needs-human'], ['review-status:draft-withdrawn']])(
+    'judges an unowned PR after 45 minutes: %j', labels => {
+      const row = unownedRow({ labels });
+      expect(['orchestrator', 'nobody']).toContain(row.nextOwner);
+      expect(row).toMatchObject({ ownerSince: 90, needsJudgment: true, reason: expect.stringMatching(/^unowned/) });
+    });
+  it.each([0, 44, 45])('does not fire for nobody or orchestrator at owner age %s minutes', ownerSince => {
+    for (const labels of [[], ['status:needs-human'], ['review-status:draft-withdrawn']]) {
+      const row = unownedRow({ labels, minutesSinceFixLoop: ownerSince });
+      expect(row.ownerSince).toBe(ownerSince);
+      expect(row.reason).not.toMatch(/^unowned/);
+    }
+  });
+  it('uses the supplied unownedMinutes threshold with a strict greater-than boundary', () => {
+    expect(unownedRow({}, { unownedMinutes: 90 }).reason).not.toMatch(/^unowned/);
+    expect(unownedRow({ minutesSinceFixLoop: 91 }, { unownedMinutes: 90 }))
+      .toMatchObject({ needsJudgment: true, reason: expect.stringMatching(/^unowned/) });
+  });
+  it.each([
+    ['fixer', { fixerRunning: true }],
+    ['review', { labels: ['review:pending'] }],
+    ['red-team', { redTeam: { state: 'pending' } }],
+    ['drain', { labels: ['review:accepted', 'ready-to-merge'] }],
+    ['judge', { round: 5 }],
+    ['operator', { labels: ['status:needs-you'] }],
+  ])('never fires for %s even after the threshold', (nextOwner, patch) => {
+    const row = unownedRow(patch);
+    expect(row).toMatchObject({ nextOwner, ownerSince: 90 });
+    expect(row.reason).not.toMatch(/^unowned/);
+  });
+  it.each([
+    ['evidence-unavailable', { evidenceErrors: ['unreadable'] }],
+    ['unruled-referral', { openReferrals: [{ ruled: false }] }],
+    ['fixer-infra-loop', { infraFailStreak: 3 }],
+    ['needs-human-aged', { labels: ['status:needs-human'], minutesSinceHeadChange: 361 }],
+    ['draft-withdrawn-aged', { isDraft: true, minutesSinceHeadChange: 241 }],
+    ['at-cap', { round: 5 }],
+    ['stalled>45min-no-owner', { minutesSinceUpdate: 91 }],
+  ])('preserves existing %s precedence over unowned', (reason, patch) => {
+    // No recent fix loop: avoid the existing active-loop early return as well as the new age boundary.
+    expect(unownedRow(patch)).toMatchObject({ needsJudgment: true,
+      reason: expect.stringMatching(new RegExp(`^${reason}`)) });
+  });
+  it.each([[5972, 'status:answered-waiting-fixer'], [5996, 'review:changes']])(
+    '#%s waiting-fixer without dispatch keeps waiting-fixer-not-dispatched ahead of unowned', (number, label) => {
+      const row = unownedRow({ number, labels: [label], minutesSinceFixDispatch: null, minutesSinceUpdate: 120 });
+      expect(['orchestrator', 'nobody']).toContain(row.nextOwner);
+      expect(row).toMatchObject({ number, ownerSince: 90, needsJudgment: true, reason: 'waiting-fixer-not-dispatched' });
+    });
+});
+
+describe('unownedMinutes policy cascade with injected IO', () => {
+  const resolve = (platform, tool, envValue, log) => judgeSweepFactsIo.resolveStallThresholds({
+    platform, env: envValue === undefined ? {} : { WE_JUDGE_SWEEP_STALL: JSON.stringify({ unownedMinutes: envValue }) },
+    readFile: () => JSON.stringify({ judgeSweepStall: tool }), log,
+  });
+  it('resolves standard, platform, tool and environment values in order', () => {
+    expect(resolve(null).unownedMinutes).toBe(45);
+    expect(resolve({ unownedMinutes: 60 }).unownedMinutes).toBe(60);
+    expect(resolve({ unownedMinutes: 60 }, { unownedMinutes: 75 }).unownedMinutes).toBe(75);
+    expect(resolve({ unownedMinutes: 60 }, { unownedMinutes: 75 }, 90).unownedMinutes).toBe(90);
+  });
+  it.each([0, -1, '90', null, Infinity])('falls through invalid unownedMinutes %j to a valid lower layer', value => {
+    expect(resolve({ unownedMinutes: 60 }, { unownedMinutes: value }, value).unownedMinutes).toBe(60);
+  });
+});
+
 describe('injected reader and shared evidence readers', () => {
   it('lists once, includes every PR, and reads comments for in-flight first-round PRs', () => {
     const f = fixture({ gh: vi.fn(() => JSON.stringify([pr({ statusCheckRollup: [{ name: 'test', status: 'IN_PROGRESS' }] }), pr({ number: 2 })])),
@@ -133,6 +413,67 @@ describe('injected reader and shared evidence readers', () => {
     const args = f.gh.mock.calls[0][0];
     expect(args.slice(0, 2)).toEqual(['pr', 'list']);
     for (const field of ['labels', 'headRefOid', 'baseRefOid', 'updatedAt', 'files', 'author']) expect(args.at(-1)).toContain(field);
+  });
+  it('retries a thrown comment read once and clears evidence errors after success', () => {
+    const readComments = vi.fn().mockImplementationOnce(() => { throw new Error('transient'); })
+      .mockReturnValueOnce([]);
+    const f = fixture({ readComments });
+    const row = f.read().prs[0];
+    expect(readComments).toHaveBeenCalledTimes(2);
+    expect(readComments.mock.calls[1][0]).toEqual(readComments.mock.calls[0][0]);
+    expect(row.evidenceErrors).toEqual([]);
+    expect(needsJudgment(row)).toEqual({ needsJudgment: false, reason: 'waiting on review' });
+  });
+  it.each([true, false])('reads draft state and the latest listed commit time (draft=%s)', isDraft => {
+    const gh = vi.fn(() => JSON.stringify([pr({ isDraft, updatedAt: at(1),
+      commits: [{ oid: OLD, committedDate: at(500) }, { oid: SHA, committedDate: at(241) }] })]));
+    const f = fixture({ gh });
+    expect(f.read().prs[0]).toMatchObject({ isDraft, minutesSinceHeadChange: 241, minutesSinceUpdate: 1 });
+    expect(gh.mock.calls[0][0].at(-1)).toContain('isDraft');
+    // Listing 200 PRs with commits exceeds GitHub's GraphQL node limit, so it is read only when supplied.
+    expect(gh.mock.calls[0][0].at(-1)).not.toContain('commits');
+  });
+  it('reports unknown head age and no dispatch as null when listing commits and fix rows are absent', () => {
+    expect(fixture().read().prs[0]).toMatchObject({ minutesSinceHeadChange: null, minutesSinceFixDispatch: null });
+  });
+  const fixRow = (minutes, patch = {}) => ({ repo: 'we', pr: 1, head: SHA, kind: 'outcome',
+    outcome: 'failed', infra: true, session: `fixture-${minutes}`, at: at(minutes), ...patch });
+  it('counts three trailing infra failures for this head, ignoring dispatches and unrelated rows', () => {
+    const rows = [fixRow(10), fixRow(30), fixRow(20),
+      fixRow(1, { repo: 'frontierui' }), fixRow(2, { pr: 2 }), fixRow(3, { head: OLD }),
+      fixRow(4, { kind: 'fix', outcome: undefined, infra: undefined }),
+      fixRow(40, { outcome: 'pushed', infra: false })];
+    const row = fixture({ readFixRows: () => rows }).read().prs[0];
+    expect(row).toMatchObject({ infraFailStreak: 3, minutesSinceFixDispatch: 4 });
+    judgmentReason(row, 'fixer-infra-loop');
+  });
+  it('resets the infra failure streak on a pushed outcome and starts counting anew', () => {
+    const rows = [fixRow(30), fixRow(20), fixRow(10)];
+    const f = fixture({ readFixRows: () => rows });
+    expect(f.read().prs[0].infraFailStreak).toBe(3);
+    rows.push(fixRow(5, { outcome: 'pushed', infra: false }));
+    expect(f.read().prs[0].infraFailStreak).toBe(0);
+    rows.push(fixRow(1));
+    expect(f.read().prs[0].infraFailStreak).toBe(1);
+  });
+  it('counts failed lease reasons case-insensitively when infra is not true', () => {
+    const row = fixture({ readFixRows: () => [fixRow(3, { infra: false, reason: 'LEASE unavailable' }),
+      fixRow(2, { infra: undefined, reason: 'lease busy' }), fixRow(1)] }).read().prs[0];
+    expect(row.infraFailStreak).toBe(3);
+  });
+  it.each([
+    { outcome: 'no-change', infra: false },
+    { outcome: 'failed', infra: false, reason: 'unit tests failed' },
+    { outcome: 'pushed', infra: false, reason: 'lease recovered' },
+  ])('stops counting consecutive infra failures at %j', reset => {
+    const row = fixture({ readFixRows: () => [fixRow(40), fixRow(30), fixRow(20, reset), fixRow(10)] }).read().prs[0];
+    expect(row.infraFailStreak).toBe(1);
+  });
+  it.each(['ci-heal', 'fix', 'rearm'])('ages the newest %s dispatch for the PR, ignoring newer outcomes', kind => {
+    const row = fixture({ readFixRows: () => [fixRow(80, { kind: 'fix' }),
+      fixRow(46, { kind, head: OLD }), fixRow(1, { outcome: 'pushed', infra: false }),
+      fixRow(2, { kind, repo: 'frontierui' }), fixRow(3, { kind, pr: 2 })] }).read().prs[0];
+    expect(row.minutesSinceFixDispatch).toBe(46);
   });
   it('uses ledger rounds instead of a label guess and retains the latest fix-loop outcome', () => {
     const f = fixture({ readLedgerRows: () => ['b', 'c', 'd', 'e'].map(h => ({ repo: REPO, pr: 1, type: 'review-run', headSha: h.repeat(40), at: at(20) })),
@@ -221,14 +562,14 @@ describe('injected reader and shared evidence readers', () => {
       expect(readComments).toHaveBeenCalledTimes(1);
       expect(gh).toHaveBeenCalledTimes(1);
     });
-  it('fails closed when an in-flight referral comment read fails', () => {
+  it('fails closed after exactly two failed in-flight referral comment reads', () => {
     const readComments = vi.fn(() => { throw new Error('offline'); });
     const f = fixture({ gh: () => JSON.stringify([pr({
       statusCheckRollup: [{ name: 'test', status: 'IN_PROGRESS' }] })]), readComments });
     expect(buildJudgeSweepBundle(f.read()).prs[0]).toMatchObject({ needsJudgment: true,
       reason: 'evidence-unavailable: inspect PR evidence and rerun',
       evidenceErrors: ['comment evidence unreadable or budget exhausted'] });
-    expect(readComments).toHaveBeenCalledTimes(1);
+    expect(readComments).toHaveBeenCalledTimes(2);
   });
   it('fails closed on malformed markers, a failed comment read, and unavailable process evidence', () => {
     for (const overrides of [
@@ -383,6 +724,99 @@ describe('shape cache and operator credential boundary', () => {
     const options = call.mock.calls[0][1];
     expect(options.env).not.toHaveProperty('GH_TOKEN');
     expect(options.env).not.toHaveProperty('GITHUB_TOKEN');
+  });
+});
+
+describe('pure sweep report coverage', () => {
+  const bundle = { prs: [{ number: 5996 }, { number: 12 }, { number: 5972 }] };
+  it('lists missing bundle PRs in numeric order and counts covered PRs once', () => {
+    const before = structuredClone(bundle);
+    const report = [5972, 5972, 9999];
+    expect(judgeSweepFacts.checkSweepCoverage(bundle, report)).toEqual({ missing: [12, 5996], covered: 1 });
+    expect(bundle).toEqual(before);
+    expect(report).toEqual([5972, 5972, 9999]);
+  });
+  it('handles complete, empty and wholly missing coverage', () => {
+    expect(judgeSweepFacts.checkSweepCoverage(bundle, [12, 5972, 5996])).toEqual({ missing: [], covered: 3 });
+    expect(judgeSweepFacts.checkSweepCoverage(bundle, [])).toEqual({ missing: [12, 5972, 5996], covered: 0 });
+    expect(judgeSweepFacts.checkSweepCoverage({ prs: [] }, [5972])).toEqual({ missing: [], covered: 0 });
+  });
+  it.each([undefined, null, {}, '5972', [5972, '5996'], [1.5], [NaN], [Infinity], [null]])(
+    'fails closed on non-array or non-integer report numbers: %j', report => {
+      expect(() => judgeSweepFacts.checkSweepCoverage(bundle, report)).toThrow(TypeError);
+    });
+  it.each([null, {}, { prs: null }, { prs: {} }, { prs: [null] },
+    { prs: [{ number: '5972' }] }, { prs: [{ number: 1.5 }] }])(
+    'fails closed on malformed bundle PR numbers: %j', input => {
+      expect(() => judgeSweepFacts.checkSweepCoverage(input, [])).toThrow(TypeError);
+    });
+  it('parses #N and PR N report tokens into numeric PR numbers', () => {
+    expect(judgeSweepFacts.parseReportPrNumbers('Handled #12, PR 5972.\n#5996.'))
+      .toEqual([12, 5972, 5996]);
+  });
+  it('ignores bare numbers and treats shell-looking report text as inert data', () => {
+    expect(judgeSweepFacts.parseReportPrNumbers('2026-10-28: 5972 items; $(touch sentinel); #5996'))
+      .toEqual([5996]);
+    expect(judgeSweepFacts.parseReportPrNumbers('')).toEqual([]);
+  });
+  it.each([null, undefined, 5972, ['#5972'], {}])('rejects non-text reports: %j', text => {
+    expect(() => judgeSweepFacts.parseReportPrNumbers(text)).toThrow(TypeError);
+  });
+});
+
+describe('coverage CLI with an injected report reader', () => {
+  const reportFile = 'reports/judge sweep $(touch sentinel).txt';
+  const outcome = (input = { 'check-coverage': reportFile }) => ({ code: 0, lines: [],
+    run: { input, verdict: { prs: [{ number: 5996 }, { number: 5972 }, { number: 12 }] } } });
+  it('declares --check-coverage as a CLI input and carries the report path to finish', async () => {
+    const declaration = judgeSweepFactsOperation({ readFacts: fixture().read });
+    const registry = createRegistry();
+    registry.register(declaration);
+    const result = await runOperationCli({ declaration, registry, sinks: {}, store: createMemoryRunStore(),
+      argv: [`--check-coverage=${reportFile}`], newRunId: () => 'judge-sweep-coverage-fixture' });
+    expect(result.code).toBe(0);
+    expect(result.run.input['check-coverage']).toBe(reportFile);
+    const readFile = vi.fn(() => '#1');
+    expect(finishJudgeSweep(result, { readFile }).code).toBe(0);
+    expect(readFile.mock.calls[0][0]).toBe(reportFile);
+  });
+  it('lists every missing PR and returns nonzero when coverage is incomplete', () => {
+    const readFile = vi.fn(() => 'Reviewed PR 5972');
+    const result = finishJudgeSweep(outcome(), { readFile });
+    expect(readFile).toHaveBeenCalledTimes(1);
+    expect(readFile.mock.calls[0][0]).toBe(reportFile);
+    expect(result.code).not.toBe(0);
+    expect(result.lines.join('\n')).toMatch(/missing/i);
+    expect(result.lines.join('\n')).toMatch(/#12\b/);
+    expect(result.lines.join('\n')).toMatch(/#5996\b/);
+  });
+  it('returns zero when all bundle PRs appear as either supported token', () => {
+    const readFile = vi.fn(() => '#5996; PR 5972; PR 12; #5996');
+    const result = finishJudgeSweep(outcome(), { readFile });
+    expect(readFile).toHaveBeenCalledTimes(1);
+    expect(result.code).toBe(0);
+  });
+  it.each(['', 'Only 5996 and 5972 and 12, without PR tokens'])('does not claim coverage from report %j', text => {
+    expect(finishJudgeSweep(outcome(), { readFile: () => text }).code).not.toBe(0);
+  });
+  it('fails closed with an operator-visible report error when the report is unreadable', () => {
+    const result = finishJudgeSweep(outcome(), { readFile: () => { throw new Error('report unreadable'); } });
+    expect(result.code).not.toBe(0);
+    expect(result.lines.join('\n')).toMatch(/report|coverage/i);
+    expect(result.lines.join('\n')).toMatch(/read|inspect|rerun/i);
+  });
+  it('preserves an upstream failure without reading the report', () => {
+    const readFile = vi.fn();
+    const failure = { ...outcome(), code: 2, lines: ['evidence unavailable'] };
+    expect(finishJudgeSweep(failure, { readFile })).toEqual({ code: 2, lines: failure.lines });
+    expect(readFile).not.toHaveBeenCalled();
+  });
+  it('keeps the ordinary JSON path and does not read a report when no coverage flag was supplied', () => {
+    const readFile = vi.fn();
+    const result = finishJudgeSweep(outcome({}), { readFile });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.lines[0])).toEqual(outcome().run.verdict);
+    expect(readFile).not.toHaveBeenCalled();
   });
 });
 
