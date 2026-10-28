@@ -372,7 +372,7 @@ try { ({ workflowEditHold, readMergeQueueState, readPinnedChangedFiles } = await
 
 // Keep staged CLI copies runnable; absent evidence never permits a merge request.
 let probeMainCiRuns, mainRedState, repoProfile;
-try { ({ probeMainCiRuns } = await import('../conveyor/main-ci-red-io.mjs')); } catch { /* unavailable */ }
+try { ({ probeMainCiRuns } = await import('../conveyor/main-ci-red-probe.mjs')); } catch { /* unavailable */ }
 try { ({ mainRedState } = await import('../conveyor/main-ci-red-core.mjs')); } catch { /* unavailable */ }
 try { ({ repoProfile } = await import('../lib/repo-profile.mjs')); } catch { /* unavailable */ }
 
