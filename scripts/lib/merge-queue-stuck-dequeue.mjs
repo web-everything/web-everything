@@ -13,12 +13,19 @@ const validEntry = e => Number.isSafeInteger(e?.num) && e.num > 0
 export function readQueueEntryStates({ repo, exec = execFileSync }) {
   try {
     const [owner, name] = repo.split('/');
-    const data = graphql(exec, 'query($owner:String!,$name:String!){repository(owner:$owner,name:$name){mergeQueue(branch:"main"){entries(first:100){pageInfo{hasNextPage} nodes{state enqueuedAt headCommit{oid statusCheckRollup{state}} pullRequest{number}}}}}}', [`owner=${owner}`, `name=${name}`]);
+    const data = graphql(exec, 'query($owner:String!,$name:String!){repository(owner:$owner,name:$name){mergeQueue(branch:"main"){entries(first:100){pageInfo{hasNextPage} nodes{state enqueuedAt headCommit{oid statusCheckRollup{state}} checks: headCommit{statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} nodes{__typename ... on CheckRun{name conclusion} ... on StatusContext{context state}}}}} pullRequest{number}}}}}}', [`owner=${owner}`, `name=${name}`]);
     const page = data.repository?.mergeQueue?.entries;
     if (!Array.isArray(page?.nodes) || page.nodes.length > 100 || page.pageInfo?.hasNextPage !== false)
       throw new Error('merge queue unreadable or exceeds 100 entries; retry next pass or inspect the queue manually');
     const entries = page.nodes.map(n => ({ num: n?.pullRequest?.number, state: n?.state,
-      enqueuedAt: n?.enqueuedAt, groupOid: n?.headCommit === null ? null : n?.headCommit?.oid ?? undefined, ci: n?.headCommit?.statusCheckRollup?.state }));
+      enqueuedAt: n?.enqueuedAt, groupOid: n?.headCommit === null ? null : n?.headCommit?.oid ?? undefined, ci: n?.headCommit?.statusCheckRollup?.state,
+      ...(n?.checks?.statusCheckRollup?.contexts?.pageInfo?.hasNextPage === false
+        && Array.isArray(n?.checks?.statusCheckRollup?.contexts?.nodes)
+        && n.checks.statusCheckRollup.contexts.nodes.length <= 100 ? {
+        failedChecks: n.checks.statusCheckRollup.contexts.nodes.flatMap(check =>
+          check?.__typename === 'CheckRun' && ['FAILURE', 'TIMED_OUT', 'CANCELLED', 'STARTUP_FAILURE'].includes(check.conclusion) ? [check.name]
+            : check?.__typename === 'StatusContext' && ['FAILURE', 'ERROR'].includes(check.state) ? [check.context] : []),
+      } : {}) }));
     if (!entries.every(validEntry) || new Set(entries.map(e => e.num)).size !== entries.length)
       throw new Error('invalid merge queue entry; retry next pass');
     return { entries };
@@ -40,14 +47,26 @@ export function decideStuckDequeues({ entries, tracker, max, nowMs = Date.now() 
     const trackable = typeof entry.groupOid === 'string' && typeof entry.enqueuedAt === 'string'
       && Number.isFinite(Date.parse(entry.enqueuedAt));
     const previous = tracker?.[entry.num];
-    const validPrevious = trackable && previous?.enqueuedAt === entry.enqueuedAt
+    // Compare enqueue identity by instant, so equivalent spellings (`…:00Z` / `…:00.000Z`) stay one entry.
+    const validPrevious = trackable && typeof previous?.enqueuedAt === 'string'
+      && Date.parse(previous.enqueuedAt) === Date.parse(entry.enqueuedAt)
       && typeof previous?.oid === 'string' && /^[a-f0-9]{40}$/i.test(previous.oid)
       && Number.isSafeInteger(previous.count) && previous.count >= 0 && previous.count < Number.MAX_SAFE_INTEGER;
-    const count = validPrevious ? previous.count + (previous.oid !== entry.groupOid ? 1 : 0) : 0;
-    if (trackable) next[entry.num] = { oid: entry.groupOid, count, enqueuedAt: entry.enqueuedAt };
+    // Commit ids are hex in either case: compare and persist them lowercased, so one commit never counts twice.
+    const groupOid = trackable ? entry.groupOid.toLowerCase() : entry.groupOid;
+    const count = validPrevious ? previous.count + (previous.oid.toLowerCase() !== groupOid ? 1 : 0) : 0;
+    const fails = validPrevious && Array.isArray(previous.fails)
+      ? [...new Set(previous.fails.filter(oid => typeof oid === 'string' && /^[a-f0-9]{40}$/i.test(oid)).map(oid => oid.toLowerCase()))].slice(-5) : [];
+    const standardsFailing = entry.state !== 'MERGEABLE' && entry.ci === 'FAILURE' && entry.failedChecks?.includes('standards');
+    if (standardsFailing && trackable && !fails.includes(groupOid)) {
+      fails.push(groupOid);
+      if (fails.length > 5) fails.shift();
+    }
+    if (trackable) next[entry.num] = { oid: groupOid, count, enqueuedAt: entry.enqueuedAt, ...(fails.length ? { fails } : {}) };
     const kind = entry.state === 'UNMERGEABLE' ? 'unmergeable'
+      : standardsFailing && fails.length >= 2 ? 'standards-failed-twice'
       : entry.state === 'AWAITING_CHECKS' && count >= max ? 'rebuilds' : null;
-    if (kind) dequeue.push({ num: entry.num, kind, reason: `${describeBlocker(entry, nowMs)}${kind === 'rebuilds' ? `; group rebuilt ${count} times (max ${max})` : ''}` });
+    if (kind) dequeue.push({ num: entry.num, kind, reason: `${describeBlocker(entry, nowMs)}${kind === 'standards-failed-twice' ? `; standards job failed on ${fails.length} distinct group commits` : kind === 'rebuilds' ? `; group rebuilt ${count} times (max ${max})` : ''}` });
   }
   return { dequeue, tracker: next };
 }
