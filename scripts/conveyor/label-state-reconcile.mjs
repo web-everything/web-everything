@@ -121,13 +121,19 @@ export function sweepLabelStateReconcile({ prs = [], repo, resolveRepo = () => r
       if (!slug) throw Error('missing repository');
       // Labels, thread and native reviews: everything a hold can arrive through. Unreadable reviews stay null.
       const readLive = () => {
-        const live = readPr({ repo: slug, number: candidate.number, fields: 'number,state,headRefOid,labels,body,createdAt' });
-        if (live?.state !== 'OPEN' || live.number !== candidate.number || !Array.isArray(live.labels)) return null;
-        // Keep the reader's source intact so a later refresh can observe edits to its comments.
-        const comments = readComments(live.number, { repo: slug });
-        let native = null;
-        try { native = provider.readPrReviews(slug, live.number); } catch { /* unreadable never clears */ }
-        return { pr: { ...live, comments }, native };
+        try {
+          const live = readPr({ repo: slug, number: candidate.number, fields: 'number,state,headRefOid,labels,body,createdAt' });
+          if (live?.state !== 'OPEN' || live.number !== candidate.number || !Array.isArray(live.labels)) return null;
+          // Keep the reader's source intact so a later refresh can observe edits to its comments.
+          const comments = readComments(live.number, { repo: slug });
+          let native = null;
+          try { native = provider.readPrReviews(slug, live.number); } catch { /* unreadable never clears */ }
+          return { pr: { ...live, comments }, native };
+        } catch (e) {
+          // No usable evidence snapshot: report the read error and retry this PR next sweep.
+          results.push({ num: candidate.number, error: String(e?.message ?? e).split('\n')[0] });
+          return null;
+        }
       };
       const first = readLive();
       if (!first) continue;

@@ -799,12 +799,22 @@ describe('sweepLabelStateReconcile', () => {
     expect(io.provider.ensureLabel).not.toHaveBeenCalled();
     expect(io.emit).not.toHaveBeenCalled();
   });
-  it('an unreadable complete thread leaves labels untouched', () => {
+  it.each([1, 2])('an unreadable complete thread on read %s leaves labels untouched and can retry', failedRead => {
     const io = fixture();
-    const rows = sweepLabelStateReconcile({ ...io, readComments: () => { throw Error('incomplete thread'); } });
-    expect(rows[0].error).toBe('incomplete thread');
+    const labels = [...io.prs[0].labels];
+    const read = io.readComments;
+    let reads = 0;
+    io.readComments = (...args) => {
+      if (++reads === failedRead) throw Error('incomplete thread\nreader details');
+      return read(...args);
+    };
+    expect(sweepLabelStateReconcile(io)).toEqual([{ num: 5954, error: 'incomplete thread' }]);
+    expect(io.prs[0].labels).toEqual(labels);
     expect(io.provider.setLabels).not.toHaveBeenCalled();
     expect(io.emit).not.toHaveBeenCalled();
+    expect(sweepLabelStateReconcile(io)[0]?.labelsReconciled.to).toEqual(['red-team:clear']);
+    expect(io.provider.setLabels).toHaveBeenCalledTimes(1);
+    expect(io.emit).toHaveBeenCalledTimes(1);
   });
   it('a head move during the evidence reads leaves labels untouched', () => {
     const io = fixture();
