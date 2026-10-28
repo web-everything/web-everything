@@ -38,7 +38,9 @@ function gitEvidence({ collision = true, fail, mainKey = 'bornAs', mainValue = '
       case 'show': return text;
       case 'ls-remote': return `${'a'.repeat(40)}\trefs/heads/main\n`;
       case 'grep':
-        if (!collision || !new RegExp(args[args.indexOf('-E') + 1]).test(`${mainKey}: ${mainValue}`)) throw Object.assign(new Error('no match'), { status: 1 });
+        // `-F -e <hash>…`: a fixed-string match on any of the searched hashes.
+        if (!collision || !args.flatMap((arg, i) => (args[i - 1] === '-e' ? [arg] : [])).some(hash => `${mainKey}: ${mainValue}`.includes(hash)))
+          throw Object.assign(new Error('no match'), { status: 1 });
         return `origin/main:${mainCard}\0${mainKey}: ${mainValue}`;
       default: throw new Error(`unexpected git operation: ${args[0]}`);
     }
