@@ -1,4 +1,5 @@
 ---
+bornAs: xzf0juu
 kind: task
 status: open
 scope: ["we:scripts/codex-direct-task.mjs", "we:scripts/lib/codex-transcript-check.mjs", "we:scripts/lib/codex-transcript-policy.mjs", "we:scripts/__tests__/codex-direct-task.test.mjs", "we:scripts/lib/__tests__/codex-transcript-check.test.mjs"]

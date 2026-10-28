@@ -1,4 +1,5 @@
 ---
+bornAs: xgmvn7y
 kind: task
 status: open
 scope: ["we:scripts/lib/codex-transcript-check.mjs", "we:scripts/lib/__tests__/codex-transcript-check.test.mjs"]
