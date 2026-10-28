@@ -166,12 +166,12 @@ describe('overlay main sync', () => {
       .toContainEqual(expect.objectContaining({ kind: 'overlay-main-sync-shadow', ref }));
   });
 
-  it('mode cascade (default on, settings, env)', () => {
+  it('mode cascade (default shadow, settings, env)', () => {
     const base = temp(), settingsPath = join(base, 'settings.json'), preferences = join(base, 'preferences.json');
     const env = { WE_PLATFORM_PREFERENCES_FILE: preferences };
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     const resolve = e => resolveOverlayMainSyncMode(e, { settingsPath });
-    expect(resolve(env)).toEqual({ mode: 'on', source: 'standard' });
+    expect(resolve(env)).toEqual({ mode: 'shadow', source: 'standard' });
     write(base, 'preferences.json', JSON.stringify({ overlayMainSync: { mode: 'off' } }));
     expect(resolve(env)).toEqual({ mode: 'off', source: 'platform' });
     write(base, 'settings.json', JSON.stringify({ overlayMainSync: { mode: 'shadow' } }));

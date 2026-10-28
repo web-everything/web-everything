@@ -82,6 +82,7 @@ import { readVerifyMarker } from '../lib/lane-verify.mjs';
 // #4317 — the same "which paths are DAEMON clones" registry `guard-lane.mjs`/`guard-bash.mjs` already use, so
 // this probe's notion of "a daemon clone" can never drift from the guards'.
 import { daemonCloneRoots } from '../lib/daemon-clone-registry.mjs';
+import { kickOverlayMainSync } from '../lib/daemon-rebuild/overlay-main-sync.mjs';
 import { probeDaemonCloneBranches } from '../lib/daemon-clone-branch-probe.mjs';
 import { workspaceOf } from '../lib/automation-home.mjs';
 import { probeBuildSessions, probeExternalRuns } from './build-supervision.mjs';
@@ -1186,6 +1187,8 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // #4370 — fs-only, every tick. A fixture tick (any of the fixture-dir flags) reads only an explicit
   // `--lane-pool-root`, never the host's real pool.
   const fixtureTick = flags['logs-dir'] || flags['lock-root'] || flags['state-root'];
+  probes.overlayMainSync = fixtureTick || flags['dry-run'] || Object.keys(flags).some(key => key.endsWith('-fixture')) ? undefined
+    : attempt('overlayMainSync', () => daemonCloneRoots(workspaceOf(REPO_ROOT)).map(root => kickOverlayMainSync({ root })));
   probes.operationRuns = attempt('operationRuns', () => probeOperationRuns(fixtureTick ? { roots: [flags['state-root'] || logsDir], jobsRoot: null } : {}));
   probes.fixLoopLedger = attempt('fixLoopLedger', () => flags['fix-loop-ledger']
     ? readFixLoopRows({ env: { WE_FIX_LOOP_LEDGER: flags['fix-loop-ledger'] } })
