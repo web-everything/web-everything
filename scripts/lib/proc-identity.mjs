@@ -94,7 +94,7 @@ export function currentBootId(deps = {}) {
   }
 }
 
-function linuxProcess(pid, io) {
+function linuxStat(pid, io) {
   const stat = boundedText(io.readFile(`/proc/${pid}/stat`)).trim();
   const end = stat.lastIndexOf(')');
   if (!stat.startsWith(`${pid} (`) || end < 0) throw new Error('Malformed procfs stat');
@@ -104,11 +104,21 @@ function linuxProcess(pid, io) {
     throw new Error('Incomplete procfs stat');
   }
   const pgid = Number(fields[2]);
+  if (!positive(pgid)) throw new Error('Missing process group');
+  return { pid, pgid, startTime: fields[19], state: fields[0] };
+}
+
+function linuxProcess(pid, io) {
+  const before = linuxStat(pid, io);
   const status = boundedText(io.readFile(`/proc/${pid}/status`));
   const uidField = /^Uid:[\t ]+(\d+)(?:[\t ]|$)/m.exec(status);
   const uid = uidField ? Number(uidField[1]) : NaN;
-  if (!positive(pgid) || !unsigned(uid)) throw new Error('Missing process group or real uid');
-  return { pid, pgid, startTime: fields[19], uid, state: fields[0] };
+  if (!unsigned(uid)) throw new Error('Missing real uid');
+  // Bracket the UID read so a reused PID cannot combine two process identities.
+  // The final state also observes a process that exited during the status read.
+  const after = linuxStat(pid, io);
+  if (before.startTime !== after.startTime) throw new Error('Process changed during identity probe');
+  return { ...after, uid };
 }
 
 function psProcesses(output) {

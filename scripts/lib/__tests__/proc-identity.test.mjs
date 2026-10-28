@@ -118,6 +118,40 @@ describe('readIdentity parsers', () => {
     expect(readIdentity(PID, deps)).toEqual({ status: 'unknown', reason: expect.any(String) });
     expect(liveness(linuxIdentity, deps)).toBe('unknown');
   });
+
+  it('Linux PID reuse between stat and status invalidates identity, liveness and the whole group', () => {
+    const probe = (check) => {
+      const deps = linuxDeps();
+      const readFile = deps.readFile;
+      let replaced = false;
+      deps.readFile = (path) => {
+        if (path.endsWith('/status')) replaced = true;
+        if (path.endsWith('/stat') && replaced) return stat({ startTime: '987655' });
+        return readFile(path);
+      };
+      return check(deps);
+    };
+    expect(probe((deps) => readIdentity(PID, deps)).status).toBe('unknown');
+    expect(probe((deps) => liveness(linuxIdentity, deps))).toBe('unknown');
+    expect(probe((deps) => listGroup(PID, deps))).toEqual({ status: 'unknown', reason: expect.any(String) });
+  });
+
+  it.each(['Z', 'X', 'x'])('Linux transition to %s during the UID read never reports alive', (state) => {
+    const probe = (check) => {
+      const deps = linuxDeps();
+      const readFile = deps.readFile;
+      let exited = false;
+      deps.readFile = (path) => {
+        if (path.endsWith('/status')) exited = true;
+        if (path.endsWith('/stat') && exited) return stat({ state });
+        return readFile(path);
+      };
+      return check(deps);
+    };
+    expect(probe((deps) => readIdentity(PID, deps))).toEqual({ status: 'ok', identity: { ...linuxIdentity, state } });
+    expect(probe((deps) => liveness(linuxIdentity, deps))).toBe('dead');
+    expect(probe((deps) => listGroup(PID, deps))).toEqual({ status: 'ok', identities: [{ ...linuxIdentity, state }] });
+  });
 });
 
 describe('sameIdentity', () => {
