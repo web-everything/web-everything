@@ -78,6 +78,43 @@ function expectNoSecrets(exec) {
   const transport = JSON.stringify(callsOf(exec).map(({args,input}) => ({args,input})));
   for (const value of Object.values(forbiddenEnv)) expect(transport).not.toContain(value);
 }
+// Keep both checkouts inside this test's launcher-owned scratch directory.
+function siblingFixture({present = true, git = true, receipt} = {}) {
+  const f = fixture({receipt: receipt ?? ((_nonce, value, state) => JSON.stringify({
+    ...value, manifestDigest:state.manifestDigest,
+    ...(state.siblingManifestDigest === undefined ? {} : {siblingManifestDigest:state.siblingManifestDigest}),
+  }))});
+  f.cwd = join(cwd,'web-everything');
+  const sibling = join(cwd,'frontierui');
+  mkdirSync(f.cwd);
+  for (const name of ['package-lock.json','a.test.mjs']) {
+    writeFileSync(join(f.cwd,name),readFileSync(join(cwd,name)));
+  }
+  writeFileSync(join(f.cwd,'vitest.shared.ts'), "export const roots = ['../frontierui/plugs', '../frontierui/webtheme'];\n");
+  f.listFiles.mockResolvedValue(['package-lock.json','a.test.mjs','vitest.shared.ts']);
+  const gitAt = (dir, args) => {
+    const result = spawnSync('git',args,{cwd:dir,encoding:'utf8'});
+    expect(result.status, result.stderr).toBe(0);
+    return result.stdout.trim();
+  };
+  gitAt(f.cwd,['init','--quiet']);
+  if (present) {
+    mkdirSync(join(sibling,'plugs'),{recursive:true});
+    mkdirSync(join(sibling,'webtheme'));
+    writeFileSync(join(sibling,'plugs','runtime.js'),'export const plug = true;\n',{mode:0o755});
+    writeFileSync(join(sibling,'webtheme','theme.js'),'export const theme = true;\n');
+    writeFileSync(join(sibling,'README.md'),'outside aliased roots\n');
+    if (git) {
+      gitAt(sibling,['init','--quiet']);
+      gitAt(sibling,['add','.']);
+      gitAt(sibling,['-c','user.name=Fixture','-c','user.email=fixture@example.invalid',
+        '-c','commit.gpgsign=false','commit','--quiet','-m','sibling snapshot']);
+    }
+  }
+  const fake = f.exec;
+  f.exec = vi.fn(async call => call.file === 'git' ? remoteManifestAPI.defaultExec(call) : fake(call));
+  return {...f,sibling,gitAt};
+}
 function realRemoteFixture(files) {
   const f = fixture();
   f.listFiles.mockResolvedValue(files);
@@ -637,16 +674,19 @@ describe('runRemote', () => {
     expect(callsOf(f.exec).some((call) => call.file === 'rsync' || isRun(call))).toBe(false);
   });
 
-  it.each(['test:unit', 'check:standards'])('falls back before transport for %s when the snapshot requires the unsynchronized sibling', async (command) => {
-    const f = fixture();
-    f.argv = ['npm', 'run', command, '--', 'blocks/__tests__/unit/resource-loader/ResourceLoader.test.ts'];
-    f.listFiles.mockResolvedValue(['package-lock.json', 'vitest.shared.ts']);
-    writeFileSync(join(cwd, 'vitest.shared.ts'), "export const fuiPlugsRoot = resolve(repoRoot, '../frontierui/plugs');\n");
+  it.each(['test:unit', 'check:standards'])('handles the shared sibling for %s while keeping Git-dependent standards local', async (command) => {
+    const f = siblingFixture();
+    f.argv = ['npm', 'run', command, '--', 'a.test.mjs'];
     const log = vi.fn();
-    expect(await runWithRemoteFallback({ ...f, log })).toBe(7);
-    expect(f.local).toHaveBeenCalledWith(f.argv);
-    expect(log).toHaveBeenCalledWith(expect.stringContaining(command === 'check:standards' ? 'requires-git-worktree' : 'unsupported-sibling-dependency'));
-    expect(callsOf(f.exec).some((call) => call.file === 'rsync' || isRun(call))).toBe(false);
+    expect(await runWithRemoteFallback({ ...f, log })).toBe(command === 'test:unit' ? 0 : 7);
+    if (command === 'test:unit') {
+      expect(f.local).not.toHaveBeenCalled();
+      expect(callsOf(f.exec).filter(call => call.file === 'rsync')).toHaveLength(2);
+    } else {
+      expect(f.local).toHaveBeenCalledWith(f.argv);
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('requires-git-worktree'));
+      expect(f.exec).not.toHaveBeenCalled();
+    }
   });
   it('falls back without exec for a command outside the allowlist', async () => {
     const f = fixture();
@@ -875,6 +915,124 @@ original_fstat = os.fstat`);
     expect(setup).toMatch(/\bid\s+(?:-[a-zA-Z]+\s+)*forge-exec\b/);
     expect(setup).toContain('os.mkdir("forge-exec", 0o700, dir_fd=with_parent)');
     expect(setup).toContain('os.mkdir(".cache", 0o700, dir_fd=root)');
+  });
+});
+
+describe('sibling root snapshot acceptance', () => {
+  it('sends only aliased tracked directories as a second root and certifies its digest', async () => {
+    const f = siblingFixture();
+    // Unrelated sibling changes do not affect the aliased snapshot.
+    writeFileSync(join(f.sibling,'README.md'),'unrelated dirty file');
+    expect(await runRemote(f)).toEqual({mode:'remote',code:0});
+    const calls = callsOf(f.exec);
+    const copies = calls.filter(call => call.file === 'rsync');
+    expect(copies).toHaveLength(2);
+    const request = JSON.parse(calls.find(isRun).input);
+    const destination = `forge:/srv/forge-exec/${request.run}`;
+    expect(copies[0].args.at(-1)).toBe(`${destination}/work/`);
+    expect(copies[1].cwd).toBe(f.sibling);
+    expect(copies[1].args.at(-1)).toBe(`${destination}/frontierui/`);
+    expect(copies[1].args).toEqual(expect.arrayContaining([
+      '-a','-r','--no-links','--safe-links','--no-implied-dirs','--delete',
+      '--from0','--files-from=-','--rsync-path=sudo -u forge-exec rsync',
+    ]));
+    expect(copies[1].input).toEqual(Buffer.from('./plugs/runtime.js\0./webtheme/theme.js\0'));
+    const siblingWire = {
+      paths:Buffer.from('plugs/runtime.js\0webtheme/theme.js\0').toString('base64'),
+      hashes:['plugs/runtime.js','webtheme/theme.js'].map(name =>
+        createHash('sha256').update(readFileSync(join(f.sibling,name))).digest('hex')),
+      executable:[true,false], excluded:'',
+    };
+    expect(request.siblingManifest).toEqual(siblingWire);
+    expect(request.siblingManifestDigest).toBe(createHash('sha256').update(JSON.stringify(siblingWire)).digest('hex'));
+    expect(calls.findIndex(isPrepare)).toBeLessThan(calls.indexOf(copies[0]));
+    expect(calls.indexOf(copies[0])).toBeLessThan(calls.indexOf(copies[1]));
+    expect(calls.indexOf(copies[1])).toBeLessThan(calls.findIndex(isRun));
+    const inventories = calls.filter(call => call.file === 'git' && call.cwd === f.sibling && call.args[0] === 'ls-files');
+    expect(inventories).toHaveLength(3);
+    for (const call of inventories) expect(call.args.slice(-3)).toEqual(['--','plugs','webtheme']);
+  });
+
+  it('records sibling HEAD without including it in the manifest digest', async () => {
+    const f = siblingFixture();
+    expect(remoteManifestAPI.buildSiblingManifest).toBeTypeOf('function');
+    const firstHead = f.gitAt(f.sibling,['rev-parse','HEAD']);
+    const first = await remoteManifestAPI.buildSiblingManifest({cwd:f.cwd,exec:f.exec});
+    expect(Object.values(first)).toContain(firstHead);
+    writeFileSync(join(f.sibling,'README.md'),'a new unrelated commit');
+    f.gitAt(f.sibling,['add','README.md']);
+    f.gitAt(f.sibling,['-c','user.name=Fixture','-c','user.email=fixture@example.invalid',
+      '-c','commit.gpgsign=false','commit','--quiet','-m','unrelated change']);
+    const secondHead = f.gitAt(f.sibling,['rev-parse','HEAD']);
+    const second = await remoteManifestAPI.buildSiblingManifest({cwd:f.cwd,exec:f.exec});
+    expect(secondHead).not.toBe(firstHead);
+    expect(Object.values(second)).toContain(secondHead);
+    expect(second.manifestDigest).toBe(first.manifestDigest);
+  });
+
+  it.each(['missing','not-git','parent-git','modified','untracked'])('falls back before transfer for sibling %s', async kind => {
+    const f = siblingFixture({present:kind !== 'missing',git:!['not-git','parent-git'].includes(kind)});
+    if (kind === 'parent-git') f.gitAt(cwd,['init','--quiet']);
+    if (kind === 'modified') writeFileSync(join(f.sibling,'plugs','runtime.js'),'changed');
+    if (kind === 'untracked') writeFileSync(join(f.sibling,'plugs','extra.js'),'untracked');
+    const reason = kind === 'missing' ? 'sibling-missing' : ['not-git','parent-git'].includes(kind) ? 'sibling-not-git' : 'sibling-dirty';
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason});
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+    expect(remoteManifestAPI.buildSiblingManifest).toBeTypeOf('function');
+    await expect(remoteManifestAPI.buildSiblingManifest({cwd:f.cwd,exec:f.exec})).rejects.toMatchObject({code:reason});
+  });
+
+  it.each(['file symlink','directory symlink','missing alias','empty alias'])('refuses a clean but unsafe sibling: %s', async kind => {
+    const f = siblingFixture();
+    const outside = join(cwd,'outside');
+    mkdirSync(outside);
+    writeFileSync(join(outside,'outside.js'),'outside the sibling');
+    if (kind === 'file symlink') symlinkSync(join(outside,'outside.js'),join(f.sibling,'plugs','link'));
+    if (kind === 'directory symlink') {
+      rmSync(join(f.sibling,'plugs'),{recursive:true});
+      symlinkSync(outside,join(f.sibling,'plugs'));
+    }
+    if (kind === 'missing alias' || kind === 'empty alias') {
+      rmSync(join(f.sibling,'webtheme'),{recursive:true});
+      if (kind === 'empty alias') mkdirSync(join(f.sibling,'webtheme'));
+    }
+    f.gitAt(f.sibling,['add','-A']);
+    f.gitAt(f.sibling,['-c','user.name=Fixture','-c','user.email=fixture@example.invalid',
+      '-c','commit.gpgsign=false','commit','--quiet','-m','clean unsafe snapshot']);
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'sibling-unsafe'});
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+
+  it('omits the sibling wire and digest when the selected repo has no sibling dependency', async () => {
+    const f = fixture();
+    expect(await runRemote(f)).toEqual({mode:'remote',code:0});
+    const calls = callsOf(f.exec);
+    expect(calls.filter(call => call.file === 'rsync')).toHaveLength(1);
+    const request = JSON.parse(calls.find(isRun).input);
+    expect(request).not.toHaveProperty('siblingManifest');
+    expect(request).not.toHaveProperty('siblingManifestDigest');
+  });
+
+  it.each(['missing','wrong'])('rejects an otherwise matching receipt with %s siblingManifestDigest', async kind => {
+    const f = siblingFixture({receipt:(_nonce,value,state) => JSON.stringify({
+      ...value,manifestDigest:state.manifestDigest,
+      ...(kind === 'missing' ? {} : {siblingManifestDigest:'0'.repeat(64)}),
+    })});
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'ambiguous-result'});
+    expect(callsOf(f.exec).some(isRun)).toBe(true);
+  });
+
+  it('verifyReceipt binds the exact optional sibling digest key', () => {
+    const expected = {v:1,nonce:'b'.repeat(32),run:'r-'+'b'.repeat(32),inputDigest:'a'.repeat(64),
+      argvDigest:'c'.repeat(64),lock:'d'.repeat(64),manifestDigest:'e'.repeat(64)};
+    const bound = {...expected,siblingManifestDigest:'f'.repeat(64)};
+    const receipt = {...bound,phase:'test',code:0};
+    expect(remoteManifestAPI.verifyReceipt(JSON.stringify(receipt),bound,0)).toBe(true);
+    const {siblingManifestDigest, ...missing} = receipt;
+    expect(remoteManifestAPI.verifyReceipt(JSON.stringify(missing),bound,0)).toBe(false);
+    expect(remoteManifestAPI.verifyReceipt(JSON.stringify({...receipt,siblingManifestDigest:'0'.repeat(64)}),bound,0)).toBe(false);
+    expect(remoteManifestAPI.verifyReceipt(JSON.stringify(receipt),expected,0)).toBe(false);
+    expect(remoteManifestAPI.verifyReceipt(JSON.stringify(missing),expected,0)).toBe(true);
   });
 });
 

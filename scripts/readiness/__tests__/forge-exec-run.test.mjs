@@ -61,6 +61,79 @@ exit 3
     ...await snapshotBinding(work),inputDigest:await digestInput(work),argvDigest:digestArgv(argv)};
 });
 afterEach(async () => {await rm(root,{recursive:true,force:true});});
+describe('sibling root snapshot acceptance', () => {
+  const siblingRoot = () => join(root,'runs',request.run,'frontierui');
+  async function siblingSnapshot() {
+    const sibling = siblingRoot();
+    // Allow mismatch tests to reach run() even before prepare gains this root.
+    await mkdir(join(sibling,'plugs'),{recursive:true});
+    await mkdir(join(sibling,'webtheme'),{recursive:true});
+    await writeFile(join(sibling,'plugs','runtime.js'),'export const plug = true;\n');
+    await writeFile(join(sibling,'webtheme','theme.js'),'export const theme = true;\n');
+    const {manifest,manifestDigest} = await snapshotBinding(sibling);
+    Object.assign(request,{siblingManifest:manifest,siblingManifestDigest:manifestDigest});
+    return sibling;
+  }
+  async function expectNoExecutionOrReceipt() {
+    await expect(readFile(join(root,'install.log'))).rejects.toMatchObject({code:'ENOENT'});
+    await expect(readFile(join(work,'task-seen'))).rejects.toMatchObject({code:'ENOENT'});
+    expect(await runner.finish(request)).toBeNull();
+  }
+
+  it('prepare creates an empty sibling root beside work with mode 0755', async () => {
+    expect((await stat(siblingRoot())).mode & 0o777).toBe(0o755);
+    expect(await readdir(siblingRoot())).toEqual([]);
+    expect(await realpath(join(work,'..','frontierui'))).toBe(siblingRoot());
+  });
+
+  it('accepts the matching sibling snapshot and binds its digest in the test receipt', async () => {
+    const sibling = await siblingSnapshot();
+    expect((await runner.run(request)).code).toBe(3);
+    expect(await readFile(join(sibling,'plugs','runtime.js'),'utf8')).toBe('export const plug = true;\n');
+    expect(await runner.finish(request)).toEqual({v:1,nonce:request.nonce,run:request.run,
+      inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,
+      manifestDigest:request.manifestDigest,siblingManifestDigest:request.siblingManifestDigest,phase:'test',code:3});
+  });
+
+  it.each(['changed byte','extra file','missing file','file symlink','directory symlink','wrong digest'])
+  ('refuses sibling %s before installation and never certifies a receipt', async fault => {
+    const sibling = await siblingSnapshot();
+    const plug = join(sibling,'plugs','runtime.js');
+    const outside = join(root,'outside.js');
+    await writeFile(outside,'export const outside = true;');
+    if (fault === 'changed byte') await writeFile(plug,'export const plug = false;\n');
+    if (fault === 'extra file') await writeFile(join(sibling,'plugs','extra.js'),'extra');
+    if (fault === 'missing file') await rm(plug);
+    if (fault === 'file symlink') {
+      await rm(plug);
+      await symlink(outside,plug);
+    }
+    if (fault === 'directory symlink') {
+      await rm(join(sibling,'plugs'),{recursive:true});
+      await symlink(root,join(sibling,'plugs'));
+    }
+    if (fault === 'wrong digest') request.siblingManifestDigest = '0'.repeat(64);
+    await expect(runner.run(request)).rejects.toThrow(/manifest|inventory|snapshot|digest|symlink|regular|directory/i);
+    await expectNoExecutionOrReceipt();
+  });
+
+  it('accepts an empty sibling root without adding a sibling digest to the receipt', async () => {
+    await mkdir(siblingRoot(),{recursive:true});
+    expect((await runner.run(request)).code).toBe(3);
+    const receipt = await runner.finish(request);
+    expect(receipt).toMatchObject({phase:'test',code:3,manifestDigest:request.manifestDigest});
+    expect(receipt).not.toHaveProperty('siblingManifestDigest');
+  });
+
+  it('requires an empty sibling root when no sibling manifest was supplied', async () => {
+    await siblingSnapshot();
+    delete request.siblingManifest;
+    delete request.siblingManifestDigest;
+    await expect(runner.run(request)).rejects.toThrow(/manifest|inventory|snapshot|extra/i);
+    await expectNoExecutionOrReceipt();
+  });
+});
+
 describe('fixed wrapper security boundary', () => {
   it('real Vitest -t --help skips execution but cannot produce a certified success', async () => {
     const queue = fileURLToPath(new URL('../heavy-admission.mjs', import.meta.url));
