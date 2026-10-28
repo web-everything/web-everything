@@ -214,6 +214,18 @@ describe('#4229 — recordQueueCapRefusal (IO shell over injected fakes — no r
     expect(notified).toHaveLength(0);
   });
 
+  it.each([undefined, null, {}])('recordQueueCapRefusal with non-array readPrComments result %j fails closed without writes or notify', comments => {
+    const postComment = vi.fn();
+    const notify = vi.fn();
+    const result = recordQueueCapRefusal({
+      pr: 9, repo: 'o/n', why: 'saturated',
+      readPrComments: () => comments, postComment, notify,
+    });
+    expect(result).toEqual({ attempts: null, capExhausted: false, historyUnknown: true });
+    expect(postComment).not.toHaveBeenCalled();
+    expect(notify).not.toHaveBeenCalled();
+  });
+
   it('repeated read failures with working writes post NOTHING, before and after the marker cap — then resume counting once reads recover', () => {
     const ALWAYS_REFUSE = { tryAdmit: () => ({ admit: false, projectedMinutes: 45, maxWaitMinutes: 30, demandMinutes: 8 }) };
     let thread = [];
@@ -491,6 +503,14 @@ describe('capacity deferral marker helpers', () => {
     expectNoRepairExhaustion([{ body }], []);
   });
 
+  it('buildFixStarvedCapacityComment floors fractional elapsed hours to whole hours', () => {
+    const body = buildFixStarvedCapacityComment({
+      headSha: CAPACITY_HEAD, hours: 7 + 17_000 / HOUR, deferredForCapacity: 3, firstAt: isoHoursAgo(7),
+    });
+    expect(body).toContain('for 7 hours');
+    expect(body).not.toMatch(/\d+\.\d+ hours/);
+  });
+
   it('hasFixStarvedCapacityAlert ignores untrusted authors, quoted markers and other heads', () => {
     const body = `${FIX_STARVED_CAPACITY_MARKER}\n${queueCapHeadLine(CAPACITY_HEAD)}\n\nhost capacity`;
     const trusted = { body, author: AUTOMATION };
@@ -504,6 +524,31 @@ describe('capacity deferral marker helpers', () => {
 });
 
 describe('host capacity starvation is elapsed-time based, never round exhaustion', () => {
+  it.each([[7, 6], [6, 6], [3, 2]])(
+    'starvation plan, comment and notify show whole hours for %ih00m17s elapsed, at least the %ih threshold', (age, starvationHours) => {
+      const firstAt = isoHoursAgo(age);
+      const comments = [capacityMarker(firstAt), capacityMarker(firstAt), capacityMarker(firstAt)];
+      const options = { pr: 42, headSha: CAPACITY_HEAD, now: CAPACITY_NOW + 17_000, starvationHours };
+      const plan = planQueueCapRefusal({ ...options, comments });
+      expect(plan.starvation).toEqual({ hours: age, firstAt, deferredForCapacity: 3 });
+      expect(Number.isInteger(plan.starvation.hours)).toBe(true);
+      expect(plan.starvation.hours).toBeGreaterThanOrEqual(starvationHours);
+      const postComment = vi.fn(() => ({ ok: true }));
+      const notify = vi.fn();
+      expect(recordQueueCapRefusal({
+        ...options, repo: 'o/n', readPrComments: () => comments, postComment, notify,
+      })).toEqual({ attempts: 0, deferredForCapacity: 3, capExhausted: false, starved: true });
+      expect(postComment).toHaveBeenCalledTimes(1);
+      expect(postComment.mock.calls[0][0].body).toContain(`for ${age} hours`);
+      expect(postComment.mock.calls[0][0].body).not.toMatch(/\d+\.\d+ hours/);
+      expect(notify).toHaveBeenCalledTimes(1);
+      expect(notify).toHaveBeenCalledWith({
+        title: '🔔 conveyor — host capacity starved',
+        body: `PR #42: host capacity has deferred the fix for ${age} hours; inspect host capacity`,
+      });
+    },
+  );
+
   it.each([[7, undefined, true], [5, undefined, false], [6, undefined, false], [3, 2, true]])(
     'planner: %ih old first marker, threshold %s -> starvation %s', (age, starvationHours, starved) => {
       const plan = planQueueCapRefusal({
@@ -639,6 +684,24 @@ describe('recordQueueCapRefusal — capped legacy history baseline through injec
   const pr = 2756;
   const baselineAt = new Date(CAPACITY_NOW).toISOString();
 
+  it('capped legacy untimed markers with headSha null cannot establish a baseline or alert and remain deferrals with attempts 0', () => {
+    const comments = Array.from({ length: QUEUE_CAP_REFUSAL_CAP }, markerComment);
+    const postComment = vi.fn();
+    const notify = vi.fn();
+    const options = { pr, repo, headSha: null, now: CAPACITY_NOW };
+    expect(planQueueCapRefusal({ ...options, comments })).toEqual({
+      attempts: 0, deferredForCapacity: 3, firstAt: null, capExhausted: false,
+      postMarker: false, postBaseline: false, starvation: null,
+    });
+    const pass = now => recordQueueCapRefusal({
+      ...options, now, readPrComments: () => comments, postComment, notify,
+    });
+    expect(pass(CAPACITY_NOW)).toEqual({ attempts: 0, deferredForCapacity: 3, capExhausted: false, starved: false });
+    expect(pass(CAPACITY_NOW + 99 * HOUR)).toEqual({ attempts: 0, deferredForCapacity: 3, capExhausted: false, starved: false });
+    expect(postComment).not.toHaveBeenCalled();
+    expect(notify).not.toHaveBeenCalled();
+  });
+
   function legacyShell() {
     const thread = Array.from({ length: 3 }, () => ({
       body: buildQueueCapRefusalComment('legacy queue-cap refusal', CAPACITY_HEAD),
@@ -710,12 +773,14 @@ describe('recordQueueCapRefusal — capped legacy history baseline through injec
     expect(posted).toEqual([
       { repo, pr, body: buildCapacityBaselineComment(CAPACITY_HEAD, CAPACITY_NOW) },
       { repo, pr, body: buildFixStarvedCapacityComment({
-        headSha: CAPACITY_HEAD, hours: (alertAt - CAPACITY_NOW) / HOUR, deferredForCapacity: 3, firstAt: baselineAt,
+        headSha: CAPACITY_HEAD, hours: 6, deferredForCapacity: 3, firstAt: baselineAt,
       }) },
     ]);
     expect(posted.filter(comment => comment.body.startsWith(FIX_STARVED_CAPACITY_MARKER))).toHaveLength(1);
     expect(notified).toHaveLength(1);
     expect(notified[0]).toMatchObject({ title: '🔔 conveyor — host capacity starved', body: expect.stringContaining(`PR #${pr}`) });
+    expect(posted[1].body).toContain('for 6 hours');
+    expect(notified[0].body).toContain('for 6 hours');
     expect(summarizeCapacityDeferral(thread, { headSha: CAPACITY_HEAD })).toEqual({
       deferredForCapacity: 3, firstAt: baselineAt, lastAt: baselineAt,
     });

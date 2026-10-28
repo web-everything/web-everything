@@ -2197,7 +2197,8 @@ export function queueCapWhy(d) {
  * ONE EPISODE PER HEAD (PR #2760 review). With `headSha`, the cap counts only this head's markers, so a new head
  * pushed after an episode was surfaced starts a fresh count and starvation clock. Legacy untimed markers
  * count toward spam bounds but provide no evidence of elapsed starvation. Migration starts the clock at
- * the current refusal, never backdates it. A known head is required to persist an episode baseline.
+ * the current refusal, never backdates it. A known head is required to persist an episode baseline;
+ * capped untimed histories without one remain deferrals without a baseline or starvation alert.
  * @param {{pr:number, comments?:Array<object>|null, cap?:number, headSha?:(string|null), now?:number, starvationHours?:number}} o
  * @returns {{attempts:number, deferredForCapacity:number, firstAt:string|null, capExhausted:boolean, postMarker:boolean, postBaseline:boolean, starvation:object|null}}
  */
@@ -2209,9 +2210,9 @@ export function planQueueCapRefusal({
   const deferredForCapacity = summary.deferredForCapacity + (postMarker ? 1 : 0);
   const firstAt = summary.firstAt;
   const postBaseline = !!headSha && !postMarker && firstAt === null && Number.isFinite(new Date(now).getTime());
-  const hours = firstAt === null ? 0 : (now - Date.parse(firstAt)) / 3_600_000;
-  const starvation = hours > starvationHours && !hasFixStarvedCapacityAlert(comments, { headSha })
-    ? { hours, firstAt, deferredForCapacity } : null;
+  const elapsedHours = firstAt === null ? 0 : (now - Date.parse(firstAt)) / 3_600_000;
+  const starvation = elapsedHours > starvationHours && !hasFixStarvedCapacityAlert(comments, { headSha })
+    ? { hours: Math.max(starvationHours, Math.floor(elapsedHours)), firstAt, deferredForCapacity } : null;
   return {
     attempts: 0, deferredForCapacity, firstAt, capExhausted: false, postMarker, postBaseline, starvation,
   };

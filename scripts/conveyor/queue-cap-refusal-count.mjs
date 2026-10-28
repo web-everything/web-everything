@@ -21,6 +21,7 @@
  * few markers exist) and (b) whether a per-head host capacity starvation alert still needs posting after the
  * elapsed-time threshold. A refusal uses no repair attempt; the fix has not run or failed.
  * Capped untimed histories get one separate per-head baseline to start the clock without adding refusals.
+ * Without a known head, no baseline or elapsed-time alert can be established for an untimed history.
  *
  * PURE reader (this file, mirrors every sibling counter's split); the writer (posting the marker comment) lives
  * in the IO shell (`reconcile-fix-dispatch.mjs`), same split as every sibling counter in this directory.
@@ -116,7 +117,7 @@ export const FIX_STARVED_CAPACITY_MARKER = '⏳ conveyor — fix starved on host
 export function buildFixStarvedCapacityComment({ headSha, hours, deferredForCapacity, firstAt }) {
   const head = headSha ? `\n${queueCapHeadLine(headSha)}` : '';
   return `${FIX_STARVED_CAPACITY_MARKER}${head}\n\nHost capacity starvation: the fix has not failed; no attempt was used. `
-    + `The heavy-test queue has refused it for ${hours} hours (since ${firstAt}; ${deferredForCapacity} recorded capacity deferrals). `
+    + `The heavy-test queue has refused it for ${Math.floor(hours)} hours (since ${firstAt}; ${deferredForCapacity} recorded capacity deferrals). `
     + 'Please look at host capacity. Dispatch keeps retrying automatically.';
 }
 
