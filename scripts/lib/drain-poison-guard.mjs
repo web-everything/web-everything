@@ -56,11 +56,14 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
     const names = run(['diff', '-z', '--name-only', '--diff-filter=A', `origin/${base}...${headSha}`, '--', 'backlog/'])
       .split('\0').filter(path => /^backlog\/.+\.md$/.test(path));
     if (!names.length) return done({ ok: true });
-    // Every identity an added card carries is checked. Unparseable frontmatter falls back to every identity line in
-    // the file, so a malformed card can never slip a duplicate past the check.
+    // Every identity an added card carries is checked. Unparseable frontmatter on a top-level card falls back to every
+    // identity line in the file, so a malformed card can never slip a duplicate past the check. A file below a
+    // backlog subdirectory without frontmatter is not a card (the same rule as main below) and carries none.
     const added = names.flatMap(path => {
       const stem = path.split('/').pop().replace(/\.md$/, '').split('-')[0];
-      const hashes = new Set([...cardIdentities(run(['show', `${headSha}:${path}`])).ids, stem]);
+      const { parsed, ids } = cardIdentities(run(['show', `${headSha}:${path}`]));
+      if (!parsed && !TOP_LEVEL_CARD.test(path)) return [];
+      const hashes = new Set([...ids, stem]);
       return [...hashes].filter(hash => HASH.test(hash)).map(hash => ({ path, hash }));
     });
     let matches;
@@ -75,7 +78,7 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
       const split = line.indexOf('\0');
       if (!line.startsWith(prefix) || split < 0) continue;
       const mainCard = line.slice(prefix.length, split);
-      const hash = line.slice(split + 1).match(IDENTITY)?.[2];
+      const hash = line.slice(split + 1).replace(/\r$/, '').match(IDENTITY)?.[2];
       const card = added.find(card => card.hash === hash);
       if (!card || !mainCard.startsWith('backlog/')) continue;
       if (!owned.has(mainCard)) owned.set(mainCard, cardIdentities(run(['show', `${prefix}${mainCard}`])));
