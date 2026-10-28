@@ -8,6 +8,7 @@
  * The clone is then fast-moved to the target (see `prepareRebuild`) without the ~100-140s smoke.
  * Applies to EVERY daemon that uses daemon-self-sync (drain, review, fix, ...), not only the drain.
  */
+import { cascadePolicy, logCascadeSources } from '../policy-cascade.mjs';
 import { isCodePath } from '../main-staleness.mjs';
 import { closureHits, collectImportClosure } from '../import-closure.mjs';
 import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
@@ -36,13 +37,27 @@ export function resolveSkipUnrelated(env = process.env, { path = daemonRebuildSe
   return true;
 }
 
-const MANIFEST_RE = /(^|\/)(package(-lock)?\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?)$/;
-const CONFIG_RE = /(^|\/)(\.nvmrc|\.node-version|\.npmrc|daemon-[a-z-]*settings\.json)$/;
+/** Standard shadow never auto-graduates: enabling scoped adoption requires an explicit layer. */
+export function resolveClosureScopeMode(env = process.env, { settingsPath = daemonRebuildSettingsPath() } = {}) {
+  let tool;
+  try { tool = JSON.parse(readFileSync(settingsPath, 'utf8')).closureScope; } catch { /* unset */ }
+  const r = cascadePolicy('closureScope', tool, {
+    env, standard: { mode: 'shadow' },
+    envValues: { mode: env?.WE_DAEMON_CLOSURE_SCOPE?.trim() || undefined },
+    valid: { mode: v => ['off', 'shadow', 'on'].includes(v) },
+  });
+  const mode = r.value.mode, source = r.sources.mode;
+  logCascadeSources('closureScope.effective', { value: { mode }, sources: { mode: source } }, { env });
+  return { mode, source };
+}
+
+export const MANIFEST_RE = /(^|\/)(package(-lock)?\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?)$/;
+export const CONFIG_RE = /(^|\/)(\.nvmrc|\.node-version|\.npmrc|daemon-[a-z-]*settings\.json)$/;
 // A file a daemon can RUN or READ without statically importing it: a spawned shell/python/etc. script, a
 // workflow/config file, anything under the skill/prompt trees (read at runtime). None is in an import closure, so
 // "not in the closure" must never be read as "cannot change what runs" for these — they always take the smoke.
-const EXECUTABLE_RE = /\.(sh|bash|zsh|py|rb|pl|ya?ml|toml|html?|ts|mts|cts|tsx|jsx)$/i;
-const RUNTIME_READ_RE = /^(skills-src|\.claude)\//;
+export const EXECUTABLE_RE = /\.(sh|bash|zsh|py|rb|pl|ya?ml|toml|html?|ts|mts|cts|tsx|jsx)$/i;
+export const RUNTIME_READ_RE = /^(skills-src|\.claude)\//;
 
 /**
  * The files the candidate smoke itself exercises, beyond the calling daemon's own entries: every
@@ -67,6 +82,62 @@ const STRING_RE = /(['"`])([^'"`\n]*)\1/g;
 const SCRIPT_TOKEN_RE = /[^\s'"`()<>|;&=,]*\.(?:mjs|cjs|js|ts)(?=$|[\s?#:])/g;
 const NOT_WALKED_RE = /(^|\/)(node_modules|__tests__)\/|\.(test|spec)\.[cm]?[jt]s$/;
 const MAX_SPAWN_HOPS = 64;
+
+/** Read-only commit snapshot. `git(argv, options)` must forward input/encoding/maxBuffer.
+ * Throws on unknown trees, malformed/truncated object data or missing reads. Blobs are
+ * cached in bounded batches, never checked out; paths with tabs/newlines stay intact. */
+export function treeReader(git, sha) {
+  if (typeof sha !== 'string' || !sha || sha.startsWith('-')) throw new Error('invalid tree');
+  const result = git(['ls-tree', '-r', '-z', sha], { maxBuffer: 64 * 1024 * 1024 });
+  if (result.error || result.status !== 0) throw new Error('tree listing unreadable');
+  const listing = String(result.stdout ?? '');
+  if (listing && !listing.endsWith('\0')) throw new Error('tree listing truncated');
+  const objects = new Map();
+  for (const record of listing.split('\0').filter(Boolean)) {
+    const match = /^(\d{6}) (blob|commit) ([a-f0-9]{40,64})\t([\s\S]+)$/.exec(record);
+    if (!match) throw new Error('tree listing malformed');
+    // Symlinks and submodules are not readable source files in this snapshot.
+    if (match[2] === 'blob' && /^100/.test(match[1])) objects.set(match[4], match[3]);
+  }
+  const root = resolvePath('virtual-daemon-tree');
+  const key = path => relative(root, resolvePath(root, path));
+  const cache = new Map();
+  const scripts = [...objects.keys()].filter(p => /\.[cm]?[jt]s$/.test(p));
+  const byNameIndex = new Map();
+  for (const p of scripts) {
+    const name = norm(basename(p));
+    (byNameIndex.get(name) || byNameIndex.set(name, []).get(name)).push(p);
+  }
+  const readFile = path => {
+    const name = key(path);
+    if (!objects.has(name)) throw new Error('tree file unreadable');
+    if (!cache.has(name)) {
+      const batch = [name, ...scripts.filter(p => p !== name && !cache.has(p)).slice(0, 31)];
+      const res = git(['cat-file', '--batch'], { input: batch.map(p => objects.get(p)).join('\n') + '\n',
+        encoding: null, maxBuffer: 64 * 1024 * 1024 });
+      if (res.error || res.status !== 0) throw new Error('tree blobs unreadable');
+      const data = Buffer.from(res.stdout ?? '');
+      let offset = 0;
+      for (const p of batch) {
+        const end = data.indexOf(10, offset);
+        const header = data.subarray(offset, end).toString('ascii');
+        const match = /^([a-f0-9]{40,64}) blob (\d+)$/.exec(header);
+        if (end < 0 || !match || match[1] !== objects.get(p)) throw new Error('tree blob header invalid');
+        const size = Number(match[2]);
+        offset = end + 1;
+        if (!Number.isSafeInteger(size) || offset + size >= data.length || data[offset + size] !== 10) {
+          throw new Error('tree blob truncated');
+        }
+        cache.set(p, data.subarray(offset, offset + size).toString('utf8'));
+        offset += size + 1;
+      }
+      if (offset !== data.length) throw new Error('tree blob trailing data');
+    }
+    return cache.get(name);
+  };
+  return { root, readFile, exists: path => objects.has(key(path)),
+    listFiles: () => [...objects.keys()], byName: name => byNameIndex.get(norm(name)) || [] };
+}
 
 /** One comparison form for a name/path: git reports NFC-or-not, the clone's filesystem may be case-insensitive. */
 const norm = (s) => s.normalize('NFC').toLowerCase();
@@ -141,10 +212,11 @@ function collectSpawnedScripts({ root, files, readFile, exists, byName }) {
  * decideSkipRebuild ignores members and spawned names for an incomplete closure.
  */
 export function collectRunClosure({
-  root, entries, importClosure = collectImportClosure,
-  readFile = (p) => readFileSync(p, 'utf8'),
-  exists = (p) => { try { return statSync(p).isFile(); } catch { return false; } },
-  byName = trackedScriptIndex(resolvePath(root)),
+  root, entries, reader, importClosure = collectImportClosure,
+  readFile = reader?.readFile ?? ((p) => readFileSync(p, 'utf8')),
+  exists = reader?.exists ?? ((p) => { try { return statSync(p).isFile(); } catch { return false; } }),
+  byName = reader?.byName ?? trackedScriptIndex(resolvePath(root)),
+  maxFiles = Infinity, strict = false,
   stopWhenIncomplete = false,
 }) {
   const absRoot = resolvePath(root);
@@ -161,7 +233,7 @@ export function collectRunClosure({
     if (!presence.has(path)) presence.set(path, exists(path));
     return presence.get(path);
   };
-  const imports = () => importClosure({ root, entries: [...walked], readFile: readOnce, exists: existsOnce, parsed });
+  const imports = () => importClosure({ root, entries: [...walked], readFile: readOnce, exists: existsOnce, parsed, maxFiles, strict });
   const walked = new Set(entries);
   let closure = imports();
   if (!closure) return null;

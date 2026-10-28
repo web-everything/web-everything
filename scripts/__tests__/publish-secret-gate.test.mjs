@@ -22,7 +22,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, existsSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
+import { cpSync, mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, existsSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -46,6 +46,8 @@ beforeAll(() => {
   // the script silently does NOTHING and exits 0 — a green test proving only that nothing ran.
   clone = realpathSync(mkdtempSync(join(tmpdir(), 'we-publish-secret-gate-')));
   execFileSync('cp', ['-R', SCRIPTS, join(clone, 'scripts')]);
+  cpSync(join(ROOT, 'skills-src/conveyor/daemon-manifest.mjs'),
+    join(clone, 'skills-src/conveyor/daemon-manifest.mjs'));
   symlinkSync(join(ROOT, 'node_modules'), join(clone, 'node_modules'), 'dir');
   mkdirSync(join(clone, '.claude', 'skills', 'batch-backlog-items'), { recursive: true });
   mkdirSync(join(clone, 'backlog'), { recursive: true });
