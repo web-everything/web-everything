@@ -478,7 +478,7 @@ jobs:
       - name: Real-git integration suite (lane-pool, operations transport)
         if: ${{ steps.gate.outputs.run == 'true' }}
         working-directory: web-everything
-        run: npm run test:integration:vitest
+        run: npm run test:integration:vitest -- $(node scripts/ci/quarantine-skip.mjs --job="integration")
 
   # #4075 DAEMON SOAK HARNESS (card x0zg44l) — `npm run test:soak`: the REAL review + fix daemons, the real
   # rebuild/self-sync + live smoke gate, a real bare remote with main moving, fake GitHub + fake sessions, the
@@ -569,6 +569,9 @@ jobs:
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@v4
+        with:
+          # quarantine-skip must prove which files the PR changes against its merge base.
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -579,7 +582,7 @@ jobs:
         run: npm ci
 
       - name: Soak shard ${{ matrix.shard }}/${{ strategy.job-total }}
-        run: npm run test:soak:shard -- --shard=${{ matrix.shard }}/${{ strategy.job-total }}
+        run: npm run test:soak:shard -- --shard=${{ matrix.shard }}/${{ strategy.job-total }} $(node scripts/ci/quarantine-skip.mjs --job="soak-shard (${{ matrix.shard }})")
 
   # THE required `daemon-soak` check (name unchanged from before the split — see the header above for why that
   # matters). Skips green in ~10s when `daemon-soak-scope` SUCCEEDED and found no daemon code touched, same as the

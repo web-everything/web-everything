@@ -10,7 +10,7 @@ export default {
   closeAfter: 1,
   severity: 'medium',
   action: 'file',
-  recommendationHint: 'Fix or delete the quarantined flaky test before it expires.',
+  recommendationHint: 'Repair the quarantined failure before it expires; repeat-failed is a deterministic-failure quarantine, not flake evidence.',
   evaluate({ mainCiRuns }, ctx) {
     const { now } = ctx;
     const out = quarantineSafetyNetForTick(mainCiRuns, ctx);
@@ -19,7 +19,7 @@ export default {
       subject: `quarantine:${entry.test}`,
       breach: true,
       measure: { ...entry },
-      summary: `Quarantined flaky test ${entry.test}; job ${entry.job ?? 'unit shards'}; broken sha ${entry.brokenSha}; proof ${entry.proof ? JSON.stringify(entry.proof) : 'not recorded'}; expires ${new Date(entry.expiresAt).toISOString()}.`,
+      summary: `Quarantined test ${entry.test}${entry.proof?.kind === 'repeat-failed' ? ' (repeat-failed: deterministic-failure quarantine, not flake evidence)' : ''}; job ${entry.job ?? 'unit shards'}; broken sha ${entry.brokenSha}; proof ${entry.proof ? JSON.stringify(entry.proof) : 'not recorded'}; expires ${new Date(entry.expiresAt).toISOString()}.`,
       recommendation: `Fix or delete ${entry.test} before ${new Date(entry.expiresAt).toISOString()}.`,
     }));
   },
