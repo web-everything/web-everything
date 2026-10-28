@@ -40,7 +40,10 @@ function readStatusFile(path, { repo, pr, head }) {
     if (e.code !== 'ENOENT') throw e;
     return null;
   }
-  if (!status || status.repo !== repo || Number(status.pr) !== Number(pr) || status.head !== head) throw Error('red-team status identity mismatch');
+  if (!status || status.repo !== repo || !['number', 'string'].includes(typeof status.pr)
+    || Number(status.pr) !== Number(pr) || status.head !== head) {
+    throw Object.assign(Error('red-team status identity mismatch'), { code: 'RED_TEAM_STATUS_IDENTITY' });
+  }
   return [undefined, 0].includes(status.retryCount) && retryMarkerSpent(path) ? { ...status, retryCount: 1 } : status;
 }
 
@@ -52,7 +55,14 @@ export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = nu
   mkdirSync(dirname(path), { recursive: true });
   // Retry admission survives running/finished rewrites, including lost seat-row appends.
   // A marker left by a failed status write must not wedge this writer: `claimed` below keeps its spend.
-  const prior = readStatusFile(path, { repo, pr, head });
+  let prior;
+  try { prior = readStatusFile(path, { repo, pr, head }); }
+  catch (error) {
+    // Without a retry marker, ordinary writers may repair damaged JSON just as before retry admission.
+    // Preserve marked evidence for inspection, and propagate filesystem errors even without a marker.
+    if (retryMarkerSpent(path) || (!(error instanceof SyntaxError) && error.code !== 'RED_TEAM_STATUS_IDENTITY')) throw error;
+    prior = null;
+  }
   const spent = prior?.retryCount;
   if (spent !== undefined && (!Number.isSafeInteger(spent) || spent < 0)) throw Error('invalid red-team retry count');
   if (retryCount !== undefined && (!Number.isSafeInteger(retryCount) || retryCount < 0)) throw Error('invalid red-team retry count');

@@ -16,6 +16,9 @@ import { tmpdir } from 'node:os';
 vi.mock('../gh-throttle.mjs', async importOriginal => ({
   ...await importOriginal(), runGhSync: vi.fn(),
 }));
+vi.mock('../../operations/needs-you-feed.mjs', async importOriginal => ({
+  ...await importOriginal(), publishAttention: vi.fn(),
+}));
 // Pin the live merger identity alongside legacy authors; hermetic settings omit
 // the host's configured App roles. Exercise the real marker-authorship gate.
 vi.mock('../github-app-identity.mjs', async importOriginal => {
@@ -913,6 +916,52 @@ describe('R100 recovery regressions', () => {
       trusted(`📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${head} -->\n<!-- numbering-restamp: from=${old} to=${head} -->`),
     ] }], readEvidence: () => ({ inFlight: false, recorded: false }),
   });
+
+  it.each(['carry', 'clear'].flatMap(action => [
+    [action, 'post', 'offline', () => Error('offline')],
+    [action, 'post', 'unprintable error', () => ({ message: { toString: null } })],
+    [action, 'label sync', 'offline', () => Error('offline')],
+    [action, 'label sync', 'unprintable error', () => ({ message: { toString: null } })],
+  ]))('%s publication failing at %s (%s) skips without spending capacity', (action, stage, why, error) => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-publish-failure-'));
+    const o = action === 'carry' ? carryOptions() : runFixture({
+      rawPrs: [{ number: pr, headRefOid: head, labels: ['review:accepted'], reviews: [],
+        comments: [trusted(`✅ review — accepted\n<!-- reviewed-sha: ${head} -->`)] }],
+      readEvidence: () => ({ loopPayload: payload(), recorded: false, seatRecorded: false,
+        status: { status: 'finished', result: 'not-owed' } }),
+      readStatus: () => ({ status: 'finished', result: 'not-owed' }),
+    });
+    o.env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+    const raw = o.rawPrs[0];
+    const failure = action === 'clear' && stage === 'post'
+      ? `clear failed: policy-clear comment failed: ${why}` : `${action} failed: ${why}`;
+    runGhSync.mockReset();
+    runGhSync.mockImplementation((_args, options) => {
+      if (stage === 'post') throw error();
+      raw.comments.push(trusted(options.input));
+    });
+    if (stage === 'label sync') o.syncLabels.mockImplementation(() => { throw error(); });
+    try {
+      const out = runRedTeamOnSkip(o);
+      expect(out).toMatchObject({ rows: [{ action: 'skip', why: failure }],
+        dispatched: [], notStarted: [] });
+      expect(runGhSync).toHaveBeenCalledOnce();
+      expect(o.syncLabels).toHaveBeenCalledTimes(stage === 'post' ? 0 : 1);
+      expect(Boolean(redTeamForHead(raw.comments, pr, head))).toBe(stage === 'label sync');
+      expect(o.dispatch).not.toHaveBeenCalled();
+      expect(o.capacity).toEqual({ lanes: 1, budget: { left: 1 } });
+      expect(o.lastDispatch.size).toBe(0);
+      // A visible comment deduplicates the next tick; label repair belongs to the label sweep.
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: stage === 'post'
+        ? failure : 'red-team result already on head' });
+      expect(runGhSync).toHaveBeenCalledTimes(stage === 'post' ? 2 : 1);
+      expect(o.syncLabels).toHaveBeenCalledTimes(stage === 'post' ? 0 : 1);
+    } finally {
+      runGhSync.mockReset();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it.each(['carry', 'not-owed', 'full-review'].flatMap(mode =>
     ['stale fork', 'invalid ancestor', 'changed clearance'].map(kind => ({ mode, kind }))))(
     'refuses $mode publication with a canonical rejected re-stamp: $kind', ({ mode, kind }) => {

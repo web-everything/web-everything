@@ -307,6 +307,18 @@ negative answers without file reads remain unverifiable.
 
 ## Drain red-team disposition and retry evidence
 
+The status writer may repair truncated JSON, null JSON or a mismatched identity only when no retry
+marker exists; readers still reject that evidence. The writer-contract table in
+`drain-red-team-evidence.test.mjs` covers queued, running, finished, fresh-retry and refund writes,
+with and without a marker. Marked damage requires operator inspection; filesystem errors and invalid
+retry counts remain errors. Keep the negative refund table that varies queued state, explicit refund
+inputs, PID, process start time, host and namespace independently: a refused refund must preserve both
+the marker and spent count, and a later admission must still refuse. Existing review-job tests cover
+cap, guard and disabled deferrals through the production writer with zero model calls before refund.
+Run publication failures through both carry and clear: comment-post and label-sync failures become
+skip rows without spending dispatch capacity. A successful post followed by failed label sync remains
+visible to the next tick, which deduplicates the comment and leaves label repair to the label sweep.
+
 Moved card-only skips recover through the normal red-team-only review job. The planner requires a
 finished policy skip with a pinned card-only read and no seat, then proves the move with
 `card-only-head-move.mjs` (shared numbering proof, otherwise a complete no-renames card-path diff).

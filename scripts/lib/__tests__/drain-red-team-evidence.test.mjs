@@ -201,6 +201,60 @@ describe('drain reads actual head-bound review scheduler inputs', () => {
     });
   });
 
+  it.each(['queued', 'running', 'finished', 'fresh retry', 'refund'].flatMap(kind => [
+    [kind, 'truncated JSON', '{broken'],
+    [kind, 'null JSON', 'null'],
+    [kind, 'wrong identity', JSON.stringify({ repo: 'another/repo', pr: 5439, head: 'b'.repeat(40) })],
+    [kind, 'malformed PR identity', JSON.stringify({ repo: 'web-everything/web-everything',
+      pr: { toString: null, valueOf: null }, head: 'b'.repeat(40) })],
+  ]))('%s writes repair %s only when no retry marker exists', (kind, _damage, contents) => {
+    const f = fixture(), loopPayload = payload(f.head);
+    recordRedTeamStatus({ ...f, loopPayload, status: 'queued' }, { env: f.env });
+    const path = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+    writeFileSync(path, contents);
+    expect(() => readRedTeamStatus(f)).toThrow();
+    const status = kind === 'fresh retry' ? 'queued' : kind === 'refund' ? 'finished' : kind;
+    recordRedTeamStatus({ ...f, loopPayload, status,
+      ...(kind === 'fresh retry' ? { retryCount: 1 } : {}),
+      ...(kind === 'refund' ? { refundRetry: true } : {}),
+    }, { env: f.env });
+    expect(readRedTeamStatus(f)).toMatchObject({ repo: f.repo, pr: f.pr, head: f.head, status });
+    expect(readRedTeamStatus(f).retryCount).toBe(kind === 'fresh retry' ? 1 : undefined);
+    expect(existsSync(`${path}.retry-1`)).toBe(kind === 'fresh retry');
+  });
+
+  it.each(['queued', 'running', 'finished', 'fresh retry', 'refund'].flatMap(kind => [
+    [kind, 'truncated JSON', '{broken'],
+    [kind, 'null JSON', 'null'],
+    [kind, 'wrong identity', JSON.stringify({ repo: 'another/repo', pr: 5439, head: 'b'.repeat(40) })],
+    [kind, 'malformed PR identity', JSON.stringify({ repo: 'web-everything/web-everything',
+      pr: { toString: null, valueOf: null }, head: 'b'.repeat(40) })],
+  ]))('%s writes preserve %s beside a retry marker for operator inspection', (kind, _damage, contents) => {
+    const f = fixture(), loopPayload = payload(f.head);
+    recordRedTeamStatus({ ...f, loopPayload, status: 'queued', retryCount: 1 }, { env: f.env });
+    const path = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+    writeFileSync(path, contents);
+    const status = kind === 'fresh retry' ? 'queued' : kind === 'refund' ? 'finished' : kind;
+    expect(() => recordRedTeamStatus({ ...f, loopPayload, status,
+      ...(kind === 'fresh retry' ? { retryCount: 1 } : {}),
+      ...(kind === 'refund' ? { refundRetry: true } : {}),
+    }, { env: f.env })).toThrow();
+    expect(readFileSync(path, 'utf8')).toBe(contents);
+    expect(existsSync(`${path}.retry-1`)).toBe(true);
+  });
+
+  it.each([-1, 1.5, '1', null, Number.MAX_SAFE_INTEGER + 1])(
+    'never repairs a valid head-bound record with invalid retryCount %j', retryCount => {
+      const f = fixture(), loopPayload = payload(f.head);
+      recordRedTeamStatus({ ...f, loopPayload, status: 'queued' }, { env: f.env });
+      const path = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+      const contents = JSON.stringify({ ...readRedTeamStatus(f), retryCount });
+      writeFileSync(path, contents);
+      expect(() => recordRedTeamStatus({ ...f, loopPayload, status: 'running' }, { env: f.env }))
+        .toThrow('invalid red-team retry count');
+      expect(readFileSync(path, 'utf8')).toBe(contents);
+    });
+
   it('refuses to overwrite unreadable retry evidence so an operator can inspect it', () => {
     const f = fixture(), loopPayload = payload(f.head);
     recordRedTeamStatus({ ...f, loopPayload, status: 'queued', retryCount: 1 }, { env: f.env });
