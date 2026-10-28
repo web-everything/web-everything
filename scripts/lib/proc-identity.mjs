@@ -1,0 +1,184 @@
+import { execFileSync } from 'node:child_process';
+import { openSync, readSync, closeSync, opendirSync } from 'node:fs';
+
+const MAX_BYTES = 1024 * 1024;
+const MAX_ENTRIES = 65536;
+const TIMEOUT = 2000;
+const EXEC_OPTIONS = Object.freeze({ encoding: 'utf8', timeout: TIMEOUT, maxBuffer: MAX_BYTES, shell: false });
+const unknown = (reason) => ({ status: 'unknown', reason });
+const positive = (value) => Number.isSafeInteger(value) && value > 0;
+const unsigned = (value) => Number.isSafeInteger(value) && value >= 0;
+
+function boundedText(value) {
+  if (!(typeof value === 'string' || Buffer.isBuffer(value))) throw new Error('Non-text evidence');
+  if (Buffer.byteLength(value) > MAX_BYTES) throw new Error('Evidence exceeds 1 MiB; retry or inspect manually');
+  return value.toString();
+}
+
+// procfs reports zero file sizes, so enforce the limit while reading, not with stat.
+function readFile(path) {
+  const fd = openSync(path, 'r');
+  try {
+    const buffer = Buffer.alloc(MAX_BYTES + 1);
+    let length = 0;
+    const deadline = Date.now() + TIMEOUT;
+    while (length < buffer.length) {
+      if (Date.now() >= deadline) throw new Error('procfs read timed out; retry or inspect manually');
+      const count = readSync(fd, buffer, length, buffer.length - length, null);
+      if (!count) break;
+      length += count;
+    }
+    return boundedText(buffer.subarray(0, length));
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function readdir(path) {
+  const dir = opendirSync(path);
+  try {
+    const entries = [];
+    const deadline = Date.now() + TIMEOUT;
+    for (let entry; (entry = dir.readSync());) {
+      if (entries.length >= MAX_ENTRIES || Date.now() >= deadline) {
+        throw new Error('procfs scan limit reached; retry or inspect manually');
+      }
+      entries.push(entry.name);
+    }
+    return entries;
+  } finally {
+    dir.closeSync();
+  }
+}
+
+function dependencies(deps) {
+  return { platform: process.platform, readFile, readdir, exec: execFileSync, ...deps };
+}
+
+function exec(deps, file, args) {
+  return boundedText(deps.exec(file, args, { ...EXEC_OPTIONS }));
+}
+
+/** A missing or unreadable boot identifier is never a wildcard identity. */
+export function currentBootId(deps = {}) {
+  const io = dependencies(deps);
+  try {
+    const value = (io.platform === 'linux'
+      ? boundedText(io.readFile('/proc/sys/kernel/random/boot_id'))
+      : io.platform === 'darwin' ? exec(io, 'sysctl', ['-n', 'kern.bootsessionuuid']) : '').trim();
+    return /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i.test(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function linuxProcess(pid, io) {
+  const stat = boundedText(io.readFile(`/proc/${pid}/stat`)).trim();
+  const end = stat.lastIndexOf(')');
+  if (!stat.startsWith(`${pid} (`) || end < 0) throw new Error('Malformed procfs stat');
+  const fields = stat.slice(end + 1).trim().split(/\s+/);
+  if (fields.length < 20 || !/^[A-Za-z]$/.test(fields[0]) || !/^\d+$/.test(fields[19])) {
+    throw new Error('Incomplete procfs stat');
+  }
+  const pgid = Number(fields[2]);
+  const status = boundedText(io.readFile(`/proc/${pid}/status`));
+  const uidField = /^Uid:[\t ]+(\d+)(?:[\t ]|$)/m.exec(status);
+  const uid = uidField ? Number(uidField[1]) : NaN;
+  if (!positive(pgid) || !unsigned(uid)) throw new Error('Missing process group or real uid');
+  return { pid, pgid, startTime: fields[19], uid, state: fields[0] };
+}
+
+function psProcesses(output) {
+  const rows = output.trim() ? output.trim().split('\n') : [];
+  if (rows.length > MAX_ENTRIES) throw new Error('ps row limit reached; inspect manually');
+  if (rows.length && /^\s*UID\s+PID\s+PPID\s+PGID\s+STAT\s+STARTED\s*$/.test(rows[0])) rows.shift();
+  return rows.map((row) => {
+    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+([A-Za-z]\S*)\s+(.+?)\s*$/.exec(row);
+    if (!match) throw new Error('Malformed ps row');
+    const [, uid, pid, ppid, pgid, state, start] = match;
+    const startTime = start.trim().replace(/\s+/g, ' ');
+    if (!unsigned(Number(uid)) || !positive(Number(pid)) || !unsigned(Number(ppid)) || !positive(Number(pgid)) ||
+        !/^[A-Za-z]{3} [A-Za-z]{3} \d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/.test(startTime)) {
+      throw new Error('Incomplete ps identity');
+    }
+    return { pid: Number(pid), pgid: Number(pgid), uid: Number(uid), startTime, state: state[0] };
+  });
+}
+
+function identity({ pgid, ...entry }, bootId) {
+  return { ...entry, bootId };
+}
+
+export function readIdentity(pid, deps = {}) {
+  if (!positive(pid)) return unknown('Invalid pid');
+  const io = dependencies(deps);
+  let entry;
+  try {
+    if (io.platform === 'linux') {
+      try { entry = linuxProcess(pid, io); } catch (error) {
+        if (error.code === 'ENOENT' || error.code === 'ESRCH') return { status: 'gone' };
+        throw error;
+      }
+    } else if (io.platform === 'darwin') {
+      const rows = psProcesses(exec(io, 'ps', ['-o', 'uid,pid,ppid,pgid,stat,lstart', '-p', String(pid)]));
+      if (!rows.length) return { status: 'gone' };
+      if (rows.length !== 1 || rows[0].pid !== pid) return unknown('Unexpected ps identity');
+      entry = rows[0];
+    } else return unknown('Unsupported platform');
+    const bootId = currentBootId(io);
+    return bootId ? { status: 'ok', identity: identity(entry, bootId) } : unknown('Boot identity unavailable');
+  } catch {
+    return unknown('Process evidence unreadable, malformed or over limit; retry or inspect manually');
+  }
+}
+
+function validIdentity(value) {
+  return value && positive(value.pid) && unsigned(value.uid) &&
+    typeof value.startTime === 'string' && value.startTime.trim().length > 0 &&
+    typeof value.bootId === 'string' && value.bootId.trim().length > 0;
+}
+
+export function sameIdentity(a, b) {
+  return Boolean(validIdentity(a) && validIdentity(b) &&
+    ['pid', 'startTime', 'bootId', 'uid'].every((key) => a[key] === b[key]));
+}
+
+export function liveness(expected, deps = {}) {
+  if (!validIdentity(expected)) return 'unknown';
+  const result = readIdentity(expected.pid, deps);
+  if (result.status === 'gone') return 'dead';
+  if (result.status !== 'ok') return 'unknown';
+  return result.identity.state === 'Z' || !sameIdentity(expected, result.identity) ? 'dead' : 'alive';
+}
+
+/** Incomplete enumeration yields unknown, never a partial membership snapshot. */
+export function listGroup(pgid, deps = {}) {
+  if (!positive(pgid)) return unknown('Invalid process group');
+  const io = dependencies(deps);
+  try {
+    const bootId = currentBootId(io);
+    if (!bootId) return unknown('Boot identity unavailable');
+    let rows;
+    if (io.platform === 'darwin') {
+      rows = psProcesses(exec(io, 'ps', ['-A', '-o', 'uid,pid,ppid,pgid,stat,lstart']));
+    } else if (io.platform === 'linux') {
+      const names = io.readdir('/proc');
+      if (!Array.isArray(names) || names.length > MAX_ENTRIES) throw new Error('procfs entry limit');
+      rows = [];
+      const deadline = Date.now() + TIMEOUT;
+      for (const name of names) {
+        if (Date.now() >= deadline) throw new Error('procfs scan timeout');
+        if (typeof name !== 'string') throw new Error('Invalid procfs entry');
+        if (!/^\d+$/.test(name)) continue;
+        const pid = Number(name);
+        if (!positive(pid)) throw new Error('Invalid procfs pid');
+        try { rows.push(linuxProcess(pid, io)); } catch (error) {
+          if (error.code !== 'ENOENT' && error.code !== 'ESRCH') throw error;
+        }
+      }
+    } else return unknown('Unsupported platform');
+    return { status: 'ok', identities: rows.filter((row) => row.pgid === pgid).map((row) => identity(row, bootId)) };
+  } catch {
+    return unknown('Group evidence unreadable, malformed or over limit; retry or inspect manually');
+  }
+}
