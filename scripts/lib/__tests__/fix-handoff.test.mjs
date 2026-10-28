@@ -40,14 +40,28 @@ it('wakes an already sleeping daemon from the real filesystem event', async () =
     await expect(sleep(1)).resolves.toBe('interval');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
-it('wakes from the directory event well inside the 1s stat-poll interval (not load-sensitive)', async () => {
+it('wakes from the directory event with the stat poll outside the test window', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'fix-handoff-fast-'));
+  let timer;
   try {
-    const pending = createFixHandoffSleep({ dir })(60_000);
-    await new Promise(r => setTimeout(r, 100)); // let the poll's first stat run, so only an event (not the 1s poll) can wake it in time
+    const pending = createFixHandoffSleep({ dir, statPollMs: 600_000 })(60_000);
+    await new Promise(r => setTimeout(r, 100)); // let the watcher arm and the poll's initial stat complete
     signalFixDispatch({ repo: 'o/r', pr: 4, label: 'status:ci-red' }, { dir });
-    await expect(Promise.race([pending, new Promise(r => setTimeout(() => r('too-slow'), 700))])).resolves.toBe('handoff');
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+    await expect(Promise.race([pending, new Promise(r => { timer = setTimeout(() => r('too-slow'), 10_000); })])).resolves.toBe('handoff');
+  } finally { clearTimeout(timer); rmSync(dir, { recursive: true, force: true }); }
+}, 15_000);
+it('falls back to the stat poll when the directory event never fires', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fix-handoff-poll-'));
+  let watchAttempted = false;
+  let timer;
+  try {
+    const pending = createFixHandoffSleep({ dir, statPollMs: 50,
+      watchDir: () => { watchAttempted = true; throw new Error('directory watching unavailable'); } })(60_000);
+    await new Promise(r => setTimeout(r, 100)); // let the initial stat complete before changing the file
+    signalFixDispatch({ repo: 'o/r', pr: 5, label: 'status:ci-red' }, { dir });
+    await expect(Promise.race([pending, new Promise(r => { timer = setTimeout(() => r('too-slow'), 500); })])).resolves.toBe('handoff');
+    expect(watchAttempted).toBe(true);
+  } finally { clearTimeout(timer); rmSync(dir, { recursive: true, force: true }); }
 });
 it('a send-back reservation never waives the host gate', () => {
   const throttle = createResourceFixThrottle({ sendBackReservedSlots: 1, listClaims: () => [], readSnap: () => null,
