@@ -53,6 +53,14 @@ describe('sticky review:human de-escalation on a fresh net-diff score', () => {
     expect(g.deescalatedHuman).toBe(true);
   });
 
+  it('never turns a human hold into an immediate merge when the PR no longer escalates', () => {
+    const g = decideReviewGate({ ...base, escalate: false });
+    expect(g.action).not.toBe('merge');
+    expect(g.action).toBe('park');
+    expect(g.applyLabel).toBe(REVIEW_LABELS.pending);
+    expect(g.deescalatedHuman).toBe(true);
+  });
+
   it('a PR without the human label is unaffected', () => {
     const g = decideReviewGate({ ...base, labels: [REVIEW_LABELS.pending] });
     expect(g.applyLabel).toBe(REVIEW_LABELS.pending);
