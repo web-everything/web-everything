@@ -768,7 +768,7 @@ describe('#6027 — fresh net score de-escalation through the drain handoff', ()
       humanRequired: false, deescalatedHuman: true, removeLabels: [REVIEW_LABELS.human] });
   });
 
-  it('removes the de-escalated human label through argv before pending is applied', () => {
+  it('removes the de-escalated human label through argv', () => {
     const exec = vi.fn();
     removeDeescalatedHumanLabels({ gate: drain(), labels: [REVIEW_LABELS.human],
       dryRun: false, pr: 6027, repo: 'owner/repo' }, { exec });
@@ -777,7 +777,8 @@ describe('#6027 — fresh net score de-escalation through the drain handoff', ()
       ['pr', 'edit', '6027', '--repo', 'owner/repo', '--remove-label', REVIEW_LABELS.human],
       { stdio: ['ignore', 'ignore', 'pipe'] });
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
-    expect(src).toMatch(/removeDeescalatedHumanLabels\(\{ gate, labels: v\.prLabels, dryRun: candidateDryRun, pr: v\.num, repo: v\.repo \}\);\s*if \(gate\.applyLabel && !candidateDryRun\)/);
+    const call = src.indexOf('removeDeescalatedHumanLabels({ gate, labels: v.prLabels');
+    expect(call).toBeGreaterThan(src.indexOf("'--add-label', gate.applyLabel"));
   });
 
   it('never removes labels during a dry run or for a retained human hold', () => {
@@ -812,7 +813,7 @@ describe('#6027 — fresh net score de-escalation through the drain handoff', ()
     expect(exec).not.toHaveBeenCalled();
   });
 
-  it('keeps review:human on a comment read failure despite a fresh low score', () => {
+  it('keeps review:human when the acceptance read defers, despite a fresh low score', () => {
     const exec = vi.fn(() => { throw new Error('comments unavailable'); });
     const gate = decideDrainReviewGate(drainGateInputs(inputs({
       humanPinned: undefined, labels: [REVIEW_LABELS.human, REVIEW_LABELS.accepted],

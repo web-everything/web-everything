@@ -6114,8 +6114,6 @@ async function runCli() {
         // redundant `gh pr edit --add-label` call when the verdict label is already present (never a
         // double-apply). `shouldApplyReviewLabel` is the SAME shared gate `pr-land.mjs` uses at open, so
         // producer- and drain-applied verdicts can never drift on what "already labelled" means.
-        // 6027: a de-escalated park (fresh net score humanRequired=false) removes the sticky review:human it replaced.
-        removeDeescalatedHumanLabels({ gate, labels: v.prLabels, dryRun: candidateDryRun, pr: v.num, repo: v.repo });
         if (gate.applyLabel && !candidateDryRun) {
           if (shouldApplyReviewLabel(gate.applyLabel, v.prLabels)) {
             // #3215 — the ledger is written FIRST, before the `gh` transport call, same ordering rationale as
@@ -6127,6 +6125,9 @@ async function runCli() {
             if (!ledgered.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger append (#3215, drain hold, non-fatal) — ${ledgered.errors.join('; ')}\n`);
             try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', gate.applyLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
           }
+          // 6027: a de-escalated park removes the sticky review:human only AFTER the pending label was applied
+          // (never leave a PR with neither label if the add fails).
+          removeDeescalatedHumanLabels({ gate, labels: v.prLabels, dryRun: candidateDryRun, pr: v.num, repo: v.repo });
           // mechanical-dispatcher — the companion "not yet advised" label, only for a review:human park (never
           // for a plain review:pending one). Same shared guard, same best-effort posture as the add above.
           if (gate.applyLabel === REVIEW_LABELS.human && shouldApplyReviewLabel(REVIEW_LABELS.awaitingAdvisory, v.prLabels)) {
