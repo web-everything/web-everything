@@ -34,7 +34,7 @@ import {
   markHeartbeat, markLaunching, markQueued, markRequeued, markSpawned, markStepError, markStopped, markSucceeded,
   planReattach, taskDeadlineDecision,
 } from './daemon-jobs.mjs';
-import { codeRef, ensureCodeSnapshot, ensureNodeModulesStore, linkNodeModules, nodeModulesRef } from './daemon-job-snapshots.mjs';
+import { codeRef, ensureCodeSnapshot, ensureNodeModulesStore, evictSnapshots, linkNodeModules, nodeModulesRef } from './daemon-job-snapshots.mjs';
 import { TERMINAL_JOB_STATUSES, formatJobHandle, isJobRecord, normalizeProcStart, parseJobHandle } from '../operations/job-record.mjs';
 import { listRunIds, newJobRunRecord, newRunId, runPath, tryReadRun, writeRun } from '../operations/run-store.mjs';
 
@@ -234,10 +234,11 @@ export function spawnDetached({ entryPath, cwd, env, logPath }) {
 }
 
 /**
- * Launch one queued job: prepare its code, stamp `launching` (counting the attempt), spawn it detached.
+ * Launch one queued job: prepare its code, stamp `launching` (counting the attempt), spawn it detached,
+ * record its child, then evict idle snapshots best-effort.
  * Returns the written record, or `null` when the record was no longer `queued` (someone else got it).
  */
-export function launchJob({ store, id, kindDef, snapshot, now = () => Date.now(), spawnFn = spawnDetached, env = process.env, heartbeatIntervalMs }) {
+export function launchJob({ store, id, kindDef, snapshot, evict = evictSnapshots, now = () => Date.now(), spawnFn = spawnDetached, env = process.env, heartbeatIntervalMs }) {
   const current = store.read(id);
   if (!current || current.job.status !== 'queued') return null;
   let code;
@@ -266,7 +267,20 @@ export function launchJob({ store, id, kindDef, snapshot, now = () => Date.now()
     // Never launched: the attempt stays counted, the launch grace turns it into a dead launch next tick.
     return store.update(id, (r) => ({ ...r, job: { ...r.job, error: `spawn failed: ${e.message}` } }));
   }
-  return store.update(id, (r) => markSpawned(r, { at: iso(now()), pid }));
+  const spawned = store.update(id, (r) => markSpawned(r, { at: iso(now()), pid }));
+  // Housekeeping runs only after the child exists and its pid is durable: a recursive snapshot delete
+  // can outlast the tick watchdog, but must never strand a launching record without a spawned child.
+  try {
+    const { records, corrupt } = store.list();
+    // An unreadable record may belong to a live child whose snapshot references are unknown.
+    // Fail closed until the record is repaired; the new child is already durably spawned.
+    if (corrupt.length > 0) return spawned;
+    const referenced = records
+      .filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status))
+      .flatMap((r) => r.job.snapshotKeys);
+    evict({ jobsDir: store.dir, referenced });
+  } catch { /* Snapshot cleanup is best-effort; the child is already spawned and recorded. */ }
+  return spawned;
 }
 
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
