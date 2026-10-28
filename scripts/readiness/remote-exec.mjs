@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { readFile, realpath } from 'node:fs/promises';
-import { createHash, randomBytes } from 'node:crypto';
+import { lstat, realpath } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { digestInput, digestArgv } from './forge-exec-run.mjs';
+import { digestInput, digestArgv, digestLock } from './forge-exec-run.mjs';
 
 const ROOT = '/srv/forge-exec';
 const LIMIT = 4 * 1024 * 1024;
@@ -36,18 +36,19 @@ export function defaultExec({ file, args, cwd, input, inherit = false }) {
     const child = spawn(file, file === 'ssh' ? [...SSH_OPTIONS, ...args] : args, {
       cwd, stdio: [input === undefined ? 'inherit' : 'pipe', inherit ? 'inherit' : 'pipe', inherit ? 'inherit' : 'pipe'],
     });
-    let stdout = '';
+    const stdout = [];
     let bytes = 0;
     let exceeded = false;
     for (const stream of [child.stdout, child.stderr]) {
       stream?.on('data', (chunk) => {
         bytes += chunk.length;
         if (bytes > LIMIT) { exceeded = true; child.kill('SIGKILL'); return; }
-        if (stream === child.stdout) stdout += chunk.toString();
+        if (stream === child.stdout) stdout.push(chunk);
       });
     }
     child.on('error', reject);
-    child.on('close', (code) => exceeded ? reject(new Error('Captured output limit exceeded')) : resolve({ code: code ?? 1, stdout }));
+    child.on('close', (code) => exceeded ? reject(new Error('Captured output limit exceeded'))
+      : resolve({ code: code ?? 1, stdout: Buffer.concat(stdout).toString('utf8') }));
     if (input !== undefined) {
       child.stdin.on('error', () => {}); // A failed SSH may close stdin before reading.
       child.stdin.end(input);
@@ -60,7 +61,7 @@ function safeFiles(files) {
   const safe = files.filter((path) => {
     if (typeof path !== 'string' || !path || path.startsWith('/') || /[\0\r\n]/.test(path)) throw new Error('Invalid file path');
     const parts = path.split('/');
-    if (parts.some((part) => part === '..' || part === '.')) throw new Error('Unsafe file path');
+    if (parts.some((part) => !part || part === '..' || part === '.')) throw new Error('Unsafe file path');
     return !parts.some((part) => part === '.exit-code' || /^(?:node_modules|\.git|\.env(?:\..*)?|\.secrets|\.ssh|\.aws|\.claude|\.codex|\.npmrc|\.netrc|credentials(?:\..*)?|.*\.(?:pem|key))$/i.test(part));
   });
   // openrsync still treats leading #/; as comments with --from0. Anchor every
@@ -68,6 +69,21 @@ function safeFiles(files) {
   const input = [...new Set(safe)].map((path) => `./${path}\0`).join('');
   if (Buffer.byteLength(input) > LIMIT) throw new Error('File inventory limit exceeded');
   return input;
+}
+
+async function validateInventory(root, files) {
+  if (!(await lstat(root)).isDirectory()) throw new Error('Invalid input root');
+  for (const file of files) {
+    const parts = file.split('/');
+    let path = root;
+    for (const [index, part] of parts.entries()) {
+      path = join(path, part);
+      const info = await lstat(path);
+      if (info.isSymbolicLink()) throw new Error('Input symlink');
+      // A directory leaf would let recursive rsync send unlisted contents.
+      if (index === parts.length - 1 ? !info.isFile() : !info.isDirectory()) throw new Error('Invalid inventory component');
+    }
+  }
 }
 
 export async function runRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles } = {}) {
@@ -94,7 +110,6 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
   try {
     let expected;
     try {
-      const lock = createHash('sha256').update(await readFile(join(cwd,'package-lock.json'))).digest('hex');
       const files = listFiles ? await listFiles(cwd) : await (async () => {
         const result = await exec({file:'git',args:['ls-files','-co','--exclude-standard','-z'],cwd});
         if(result.code !== 0 || typeof result.stdout !== 'string' || Buffer.byteLength(result.stdout)>LIMIT) throw new Error('Inventory unavailable');
@@ -102,16 +117,20 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
       })();
       const inventory = safeFiles(files);
       if(files.includes('vitest.shared.ts')) return fallback('unsupported-sibling-dependency');
+      const selected = inventory.split('\0').filter(Boolean).map(name=>name.slice(2));
+      await validateInventory(cwd, selected);
+      const lock = await digestLock(cwd);
+      // Reject incomplete or linked input before transmitting any file bytes.
+      const inputDigest = await digestInput(cwd, selected);
       const prepared = await ssh('prepare',{nonce,label:runId});
       if(prepared.code !== 0 || typeof prepared.stdout !== 'string' || prepared.stdout.length>1024) throw new Error('Prepare failed');
       run = JSON.parse(prepared.stdout).run;
       if(typeof run !== 'string' || !/^r-[a-f0-9]{32}$/.test(run)) {run=undefined; throw new Error('Invalid server run');}
-      const copied = await exec({file:'rsync',args:['-a','--delete','--exclude=.exit-code',
+      const copied = await exec({file:'rsync',args:['-a','-r','--no-links','--safe-links','--no-implied-dirs','--delete','--exclude=.exit-code',
         ...['node_modules','.git','.env*','.secrets','.ssh','.aws','.claude','.codex','.npmrc','.netrc','credentials*','*.pem','*.key'].map(name=>`--exclude=${name}`),
         '--from0','--files-from=-','--rsync-path=sudo -u forge-exec rsync','-e',`ssh ${SSH_OPTIONS.join(' ')}`,
         './',`${host}:${ROOT}/${run}/work/`],cwd,input:inventory});
       if(copied.code !== 0) throw new Error('Copy failed');
-      const inputDigest = await digestInput(cwd, inventory.split('\0').filter(Boolean).map(name=>name.slice(2)));
       expected = {v:1,nonce,run,inputDigest,argvDigest:digestArgv(argv),lock};
     } catch {return fallback('copy-failed');}
     try {

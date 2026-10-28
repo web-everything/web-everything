@@ -41,6 +41,43 @@ exit 3
 });
 afterEach(async () => {await rm(root,{recursive:true,force:true});});
 describe('fixed wrapper security boundary', () => {
+  it('rejects dual lockfiles before a cold install and leaves the next lock-only run cold', async () => {
+    await writeFile(join(work,'npm-shrinkwrap.json'),'shrinkwrap');
+    request.inputDigest = await digestInput(work);
+    const first = await runner.run(request).then(value=>({value}),error=>({error:error.message}));
+    const installsBefore = await readFile(join(root,'install.log'),'utf8').catch(()=> '');
+    await runner.finish(request);
+    const next = await runner.prepare({nonce:request.nonce});
+    work = join(root,'runs',next.run,'work');
+    await writeFile(join(work,'package-lock.json'),'lock');
+    request = {...request,...next,inputDigest:await digestInput(work)};
+    expect((await runner.run(request)).code).toBe(3);
+    const installs = (await readFile(join(root,'install.log'),'utf8')).trim().split('\n');
+    expect(first.error).toMatch(/shrinkwrap/i);
+    expect(installsBefore).toBe('');
+    expect(installs).toHaveLength(1);
+    expect(installs[0]).not.toContain('--dry-run');
+  });
+  it('does not reuse archives from the old package-lock-only cache profile', async () => {
+    const old = join(root,'cache',request.lock,'dev-v3');
+    await mkdir(old,{recursive:true});
+    await writeFile(join(old,'dependencies.tar'),'historically poisoned');
+    await writeFile(join(old,'sha256'),hash('historically poisoned'));
+    expect((await runner.run(request)).code).toBe(3);
+    expect(await readFile(join(root,'install.log'),'utf8')).not.toContain('--dry-run');
+    expect(await readFile(join(old,'dependencies.tar'),'utf8')).toBe('historically poisoned');
+  });
+  it('preserves split UTF-8 in captured worker output', async () => {
+    await writeFile(join(root,'bin','npm'), `#!${process.execPath}
+if (process.argv[2] !== 'ci') {
+  const bytes = Buffer.from('é😀');
+  process.stdout.write(bytes.subarray(0,1));
+  process.stderr.write(bytes.subarray(0,3));
+  setTimeout(() => { process.stdout.write(bytes.subarray(1)); process.stderr.write(bytes.subarray(3)); }, 100);
+}
+`,{mode:0o755});
+    expect(await runner.run(request)).toMatchObject({code:0,stdout:'é😀',stderr:'é😀'});
+  });
   it('refuses an overlapping run and rechecks its input after the first worker substitutes its assertions', async () => {
     const other = createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin'});
     const prepared = await other.prepare({nonce:'c'.repeat(32)});
@@ -180,7 +217,7 @@ process.stdout.write('x'.repeat(4*1024*1024+1));
     work = join(root,'runs',third.run,'work');
     await writeFile(join(work,'package-lock.json'),'lock');
     request = {...request,run:third.run,inputDigest:await digestInput(work)};
-    await writeFile(join(root,'cache',request.lock,'dev-v3/dependencies.tar'),'tampered');
+    await writeFile(join(root,'cache',request.lock,'dev-v4/dependencies.tar'),'tampered');
     expect((await runner.run(request)).code).toBe(97);
     expect(await runner.finish(request)).toMatchObject({phase:'install',code:97});
   });
@@ -223,7 +260,7 @@ await runner.run(JSON.parse(process.argv[3]));`;
       await rm(join(root,'receipts','worker-active'),{recursive:true});
       await writeFile(npm,original,{mode:0o755});
       // Persisted sentinels from older wrappers must not block recovery either.
-      await mkdir(join(root,'cache',request.lock,'dev-v3','.busy'));
+      await mkdir(join(root,'cache',request.lock,'dev-v4','.busy'));
       const recovered = await nextRequest();
       expect((await runner.run(recovered)).code).toBe(3);
       expect(await runner.finish(recovered)).toMatchObject({phase:'test',code:3});
@@ -235,7 +272,7 @@ await runner.run(JSON.parse(process.argv[3]));`;
     }
   }, 15000);
   it('rejects symlinked cache lock files without changing their targets', async () => {
-    const profile = join(root,'cache',request.lock,'dev-v3');
+    const profile = join(root,'cache',request.lock,'dev-v4');
     await mkdir(profile,{recursive:true});
     const target = join(root,'lock-target');
     await writeFile(target,'untouched');

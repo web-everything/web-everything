@@ -18,6 +18,14 @@ function capturedChild() {
 }
 
 describe('remote-exec captured output boundary', () => {
+  it('preserves multibyte inventory names split across stdout chunks', async () => {
+    const child = capturedChild();
+    const result = defaultExec({file:'git',args:['ls-files','-z']});
+    const inventory = 'fixtures/é😀\u2028.txt\0';
+    for (const byte of Buffer.from(inventory)) child.stdout.emit('data',Buffer.from([byte]));
+    child.emit('close',0);
+    await expect(result).resolves.toEqual({code:0,stdout:inventory});
+  });
   it('accepts exactly 4 MiB combined across stdout and stderr without terminating', async () => {
     const child = capturedChild();
     const result = defaultExec({ file: 'ssh', args: ['forge', 'true'] });

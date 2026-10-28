@@ -106,6 +106,38 @@ function realRemoteFixture(files) {
 }
 
 describe('remote snapshot regressions', () => {
+  it.each(['parent', 'nested parent', 'leaf', 'dangling parent'])('rejects a %s symlink before invoking rsync', async (kind) => {
+    const f = fixture();
+    const external = join(cwd,'external');
+    mkdirSync(external);
+    writeFileSync(join(external,'id_ed25519'),'SYNTHETIC_PRIVATE_MARKER');
+    let file = 'fixtures/id_ed25519';
+    if (kind === 'nested parent') {
+      mkdirSync(join(cwd,'fixtures'));
+      symlinkSync(external,join(cwd,'fixtures','nested'));
+      file = 'fixtures/nested/id_ed25519';
+    } else if (kind === 'leaf') {
+      mkdirSync(join(cwd,'fixtures'));
+      symlinkSync(join(external,'id_ed25519'),join(cwd,file));
+    } else symlinkSync(kind === 'dangling parent' ? join(cwd,'absent') : external,join(cwd,'fixtures'));
+    f.listFiles.mockResolvedValue(['package-lock.json',file]);
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'copy-failed'});
+    expect(callsOf(f.exec).filter(call=>call.file==='rsync')).toHaveLength(0);
+    expect(callsOf(f.exec).some(isRun)).toBe(false);
+  });
+  it.each(['directory', 'missing'])('rejects a %s inventory leaf before invoking rsync', async kind => {
+    const f = fixture();
+    if (kind === 'directory') mkdirSync(join(cwd,'fixtures'));
+    f.listFiles.mockResolvedValue(['package-lock.json','fixtures']);
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'copy-failed'});
+    expect(callsOf(f.exec).filter(call=>call.file==='rsync')).toHaveLength(0);
+  });
+  it('rejects dual lockfiles at the client even if shrinkwrap is omitted from the inventory', async () => {
+    const f = fixture();
+    writeFileSync(join(cwd,'npm-shrinkwrap.json'),'shrinkwrap');
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'copy-failed'});
+    expect(callsOf(f.exec).filter(call=>call.file==='rsync')).toHaveLength(0);
+  });
   it.each(['snapshot', 'stale remote'])('falls back when a %s receipt says 97 and npm ci fails before the command', async (source) => {
     writeFileSync(join(cwd, '.exit-code'), '97\n');
     const f = realRemoteFixture(['package-lock.json', '.exit-code']);
@@ -206,7 +238,7 @@ console.log('RESOLVED ' + versions.join(','));
       expect(f.runs.at(-1).stdout).toContain('COMMAND_RAN');
     }
     const hash = createHash('sha256').update(readFileSync(join(cwd, 'package-lock.json'))).digest('hex');
-    writeFileSync(join(f.root, 'cache', hash, 'dev-v3/dependencies.tar'), 'corrupt archive');
+    writeFileSync(join(f.root, 'cache', hash, 'dev-v4/dependencies.tar'), 'corrupt archive');
     const log = vi.fn();
     expect(await runWithRemoteFallback({ ...f, log })).toBe(7);
     expect(f.runs.at(-1).stdout).not.toContain('COMMAND_RAN');
@@ -448,6 +480,8 @@ describe('runRemote', () => {
   });
   it('uses the injected file list as rsync stdin, excludes node_modules, and selects the restricted rsync user', async () => {
     const f = fixture();
+    mkdirSync(join(cwd,'src'));
+    writeFileSync(join(cwd,'src/a file.mjs'),'fixture');
     f.listFiles.mockResolvedValue(['package-lock.json', 'src/a file.mjs', 'node_modules/secret.js', 'src/node_modules/nested.js', '.exit-code', 'src/.exit-code', '.exit-code/forged']);
     await runRemote({ ...f, host: 'custom-forge' });
     expect(f.listFiles).toHaveBeenCalledWith(cwd);
@@ -456,6 +490,8 @@ describe('runRemote', () => {
     const copy = calls.find((call) => call.file === 'rsync');
     expect(copy.args.join(' ')).toMatch(/--files-from(?:=|\s)-/);
     expect(copy.args).toContain('--from0');
+    expect(copy.args).toEqual(expect.arrayContaining(['-r','--no-links','--safe-links','--no-implied-dirs']));
+    expect(copy.args).not.toContain('-L');
     expect(copy.args).toContain('--exclude=.exit-code');
     expect(calls.findIndex(isPrepare)).toBeLessThan(calls.indexOf(copy));
     expect(sshText(calls.find(isPrepare))).toBe('custom-forge sudo -n -u ops /usr/local/libexec/forge-exec-run prepare');
