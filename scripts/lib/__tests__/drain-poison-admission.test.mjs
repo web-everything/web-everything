@@ -128,7 +128,9 @@ describe('poison guard admission boundary', () => {
       expect(s.enqueue(c, headSha)).toEqual({ enqueued: true, already: false });
       expect(healLaneRefs).toHaveBeenCalledOnce();
       expect(healLaneRefs).toHaveBeenCalledWith(clone, expect.any(Object));
-      expect(deliver).not.toHaveBeenCalled();
+      // A real enqueue posts the drain's own clearance comment; the guard itself never comments or labels.
+      expect(deliver.mock.calls.filter(([args]) => args[1] === 'edit')).toEqual([]);
+      expect(deliver.mock.calls.filter(([args]) => args.some(arg => String(arg).includes('we-drain-poison')))).toEqual([]);
     });
     it.each([
       ['no located primary (the default)', () => ({ cwd: clone })],
