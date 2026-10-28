@@ -5,6 +5,9 @@
  *   for the episode-model mechanics (pending, flap cap, tracked silence, reminder) and the rendering helpers.
  *   Never asserts a whole tick/memory object with toEqual — only the fields each behavior actually turns on.
  */
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, it, expect } from 'vitest';
 import {
   MINUTE, HOUR, DEFAULT_HEALTH_CONFIG, BLOCKING_REFUSALS, parseDaemonLog, tickIsUnproductive, foldDaemonMemory,
@@ -1251,7 +1254,14 @@ describe('foldOperatorHolds / parseOperatorHoldRecords', () => {
     expect(foldOperatorHolds(undefined, { available: true, text: '' }, T0).repos).toEqual({});
   });
   it('keeps the daemon-side allowlist identical to the watch-side one', async () => {
-    const mod = await import('../../../skills-src/conveyor/review-daemon.mjs');
-    expect([...mod.OPERATOR_HOLD_KINDS]).toEqual([...OPERATOR_HOLD_KINDS]);
+    // Read the daemon source instead of importing it: importing review-daemon.mjs pulls its whole
+    // module tree (> 5s on an overloaded CI shard). The literal array is parsed, so the two lists
+    // must still be identical, in order.
+    const src = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../../../skills-src/conveyor/review-daemon.mjs'), 'utf8');
+    const m = /export const OPERATOR_HOLD_KINDS\s*=\s*Object\.freeze\(\s*(\[[^\]]*\])\s*\)/.exec(src);
+    expect(m, 'daemon OPERATOR_HOLD_KINDS literal not found').not.toBeNull();
+    const daemonKinds = JSON.parse(m[1].replace(/'/g, '"'));
+    expect(daemonKinds.length).toBeGreaterThan(0);
+    expect(daemonKinds).toEqual([...OPERATOR_HOLD_KINDS]);
   });
 });

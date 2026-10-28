@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { ledgerInfraRows, fixLoopConfig, fixLoopState, fixLoopBreaches, readFixLoopRows, appendFixLoopRow,
-  fixLoopLedgerPath, fixDispatchKillFile, fixDispatchKilled, hasFixHoldLabel, FIX_HOLD_LABEL, FIX_RUN_INFRA_PATTERNS, classifyFixRunOutcome, infraFailureCount, fixLoopDisposition, fixLoopRedMainLapse, fixLoopSessionRows } from '../fix-loop-ledger.mjs';
+  fixLoopLedgerPath, fixDispatchKillFile, fixDispatchKilled, hasFixHoldLabel, FIX_HOLD_LABEL, FIX_RUN_INFRA_PATTERNS, FIX_RUN_OUTCOME, classifyFixRunOutcome, infraFailureCount, fixLoopDisposition, fixLoopRedMainLapse, fixLoopSessionRows } from '../fix-loop-ledger.mjs';
 const now = Date.parse('2026-10-05T12:00:00Z'), head = 'a'.repeat(40);
 const row = (extra = {}) => ({ v: 1, at: new Date(now).toISOString(), repo: 'we', pr: 3990, head, kind: 'ci-heal', ...extra });
 const hermeticConfig = env => fixLoopConfig(env, { readPlatform: () => ({}), readRepo: () => ({}), readMainRuns: () => [] });
@@ -92,6 +92,24 @@ it('stub sessions from the daemon smoke never count as repair attempts (#4194 mi
 });
 
 // PRs #4992/#4993/#4965, 2026-10-12: launcher refusals are not repair sessions.
+it.each(Object.values(FIX_RUN_OUTCOME))('parses the fix-run %s terminal contract', outcome => {
+  for (const claim of ['released', 'not held / already released', 'release failed']) {
+    expect(classifyFixRunOutcome(`fix-run: PR #6030 ${outcome} (lease-lost: .git lease missing); claim ${claim}`))
+      .toEqual({ pr: 6030, outcome, reason: 'lease-lost: .git lease missing', infra: outcome === 'failed' });
+  }
+});
+
+it('keeps earlier infra failures aligned when the same session ends with lease loss', () => {
+  const lines = [
+    'fix-run: PR #6030 failed (EPERM); claim released',
+    'fix-run: PR #6030 lease-lost (lease-lost: .git lease missing); claim released',
+  ];
+  expect(lines.map(classifyFixRunOutcome).filter(Boolean)).toMatchObject([
+    { outcome: 'failed', infra: true }, { outcome: 'lease-lost', infra: false },
+  ]);
+  expect(infraFailureCount({ logText: lines.join('\n'), pr: 6030, sessions: 1 })).toBe(0);
+});
+
 it('classifies terminal outcomes without treating genuine runs as infrastructure', () => {
   for (const [line, pr, outcome, infra] of [
     ['fix-run: PR #4992 failed (no-finding: the PR has no changes-requested or advisory comment to apply); claim released', 4992, 'failed', true],

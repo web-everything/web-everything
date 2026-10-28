@@ -1,13 +1,14 @@
 import { describe, it, expect, vi, onTestFinished } from 'vitest';
-import { existsSync, ftruncateSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, ftruncateSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { assertLaneLease, defaultRenewLease, readLaneLease, runFixCli } from '../fix-run.mjs';
+import { classifyFixRunOutcome } from '../../conveyor/fix-loop-ledger.mjs';
 
 vi.mock('node:fs', async importOriginal => {
   const fs = await importOriginal();
-  return { ...fs, ftruncateSync: vi.fn(fs.ftruncateSync) };
+  return { ...fs, ftruncateSync: vi.fn(fs.ftruncateSync), writeSync: vi.fn(fs.writeSync) };
 });
 
 const holder = 'conveyor-fix-lane-10-eaae3ffe';
@@ -64,7 +65,7 @@ describe('defaultRenewLease on disk', () => {
     const renewed = JSON.parse(contents);
     expect(renewed).toEqual({ ...lease, renewedAt: expect.any(String) });
     expect(new Date(renewed.renewedAt).toISOString()).toBe(renewed.renewedAt);
-    expect(contents).toBe(`${JSON.stringify(renewed, null, 2)}\n`);
+    expect(contents).toBe(`${JSON.stringify(renewed, null, 2)}\n`.padEnd(before.size, ' '));
     const after = statSync(file);
     expect([after.dev, after.ino]).toEqual([before.dev, before.ino]);
   });
@@ -88,23 +89,38 @@ describe('defaultRenewLease on disk', () => {
     expect(readFileSync(file)).toEqual(contents);
   });
 
-  it('fails closed when an ownership check reads the lease during renewal', async () => {
+  it.each(['growing', 'shrinking', 'unicode'])('keeps a %s marker parseable at every renewal IO boundary for allocator readers', async kind => {
     const { lanePath, file } = diskLeaseFixture();
-    writeFileSync(file, JSON.stringify({ holder }));
+    const lease = { holder, ...(kind === 'shrinking' ? { renewedAt: 'x'.repeat(128) } : {}),
+      ...(kind === 'unicode' ? { note: '🍁é' } : {}) };
+    writeFileSync(file, JSON.stringify(lease) + (kind === 'unicode' ? ' '.repeat(512) : ''));
     const fs = await vi.importActual('node:fs');
-    let readError, ownershipError;
-    vi.mocked(ftruncateSync).mockImplementationOnce((fd, length) => {
+    onTestFinished(() => {
+      vi.mocked(ftruncateSync).mockReset().mockImplementation(fs.ftruncateSync);
+      vi.mocked(writeSync).mockReset().mockImplementation(fs.writeSync);
+    });
+    const observations = [];
+    const observe = () => {
+      try { observations.push(JSON.parse(readFileSync(file, 'utf8'))); }
+      catch { observations.push(null); } // lane-pool readLease treats corrupt JSON as an unleased lane.
+    };
+    vi.mocked(ftruncateSync).mockImplementation((fd, length) => {
       fs.ftruncateSync(fd, length);
-      try { readLaneLease(lanePath); } catch (e) { readError = e; }
-      try { assertLaneLease({ lanePath, holder }); } catch (e) { ownershipError = e; }
+      observe();
+    });
+    vi.mocked(writeSync).mockImplementation((...args) => {
+      observe();
+      const written = fs.writeSync(...args);
+      observe();
+      return written;
     });
 
     expect(defaultRenewLease({ lanePath, holder })).toBe(true);
+    expect(defaultRenewLease({ lanePath, holder })).toBe(true);
 
-    // Truncate + write deliberately trades atomic reader visibility for successor safety.
-    expect(readError).toBeInstanceOf(SyntaxError);
-    expect(ownershipError).toBeInstanceOf(Error);
-    expect(readLaneLease(lanePath)).toEqual({ holder, renewedAt: expect.any(String) });
+    expect(observations.length).toBeGreaterThanOrEqual(2);
+    expect(observations.every(lease => lease?.holder === holder)).toBe(true);
+    expect(readLaneLease(lanePath)).toEqual({ ...lease, renewedAt: expect.any(String) });
     expect(() => assertLaneLease({ lanePath, holder })).not.toThrow();
   });
 
@@ -116,11 +132,11 @@ describe('defaultRenewLease on disk', () => {
     if (kind === 'replaced') writeFileSync(successor, contents);
     const fs = await vi.importActual('node:fs');
     let observedDuringRenewal;
-    vi.mocked(ftruncateSync).mockImplementationOnce((fd, length) => {
+    vi.mocked(writeSync).mockImplementationOnce((...args) => {
       if (kind === 'deleted') rmSync(file);
       else renameSync(successor, file);
-      fs.ftruncateSync(fd, length);
       observedDuringRenewal = readLaneLease(lanePath);
+      return fs.writeSync(...args);
     });
 
     expect(defaultRenewLease({ lanePath, holder })).toBe(true);
@@ -137,6 +153,33 @@ describe('defaultRenewLease on disk', () => {
 });
 
 describe('fix-run lane lease heartbeat', () => {
+  it('defaults to renewal at 60 seconds, never earlier, and stops after the agent returns', async () => {
+    vi.useFakeTimers();
+    onTestFinished(() => vi.useRealTimers());
+    const f = fixture();
+    delete f.io.heartbeatMs;
+    let finish;
+    const started = new Promise(resolve => {
+      f.spawn.mockImplementation(() => {
+        resolve();
+        return new Promise(resolveSpawn => { finish = resolveSpawn; });
+      });
+    });
+    const running = runFixCli(argv, f.io);
+    await started;
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(f.renewLease).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.renewLease).toHaveBeenCalledTimes(1);
+    expect(f.renewLease).toHaveBeenCalledWith({ lanePath: f.lanePath, holder });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(f.renewLease).toHaveBeenCalledTimes(2);
+    finish();
+    expect((await running).code).toBe(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(f.renewLease).toHaveBeenCalledTimes(2);
+  });
+
   it('renews our lease at least twice while spawn is pending and stops after returning', async () => {
     const f = fixture();
     let pendingRenewals;
@@ -168,12 +211,16 @@ describe('fix-run lane lease heartbeat', () => {
 });
 
 describe('fix-run lease loss after the agent', () => {
-  it.each(['missing', 'foreign'])('records a %s lease as lease-lost without pushing', async kind => {
+  it.each([
+    ['missing', null], ['foreign', { holder: foreign }], ['missing-holder', {}], ['null-holder', { holder: null }],
+  ])('records a %s lease as lease-lost without pushing, staging, aborting or releasing the lane', async (_kind, lease) => {
     const f = fixture();
+    const output = [];
+    f.io.write = line => output.push(line);
     let callsAfterSpawn;
     f.spawn.mockImplementation(async () => {
       callsAfterSpawn = f.calls.length;
-      f.readLease.mockReturnValue(kind === 'missing' ? null : { holder: foreign });
+      f.readLease.mockReturnValue(lease);
     });
     const result = await runFixCli(argv, f.io);
     expect.soft(result.code).toBe(1);
@@ -184,13 +231,55 @@ describe('fix-run lease loss after the agent', () => {
     expect.soft(f.appendLoopRow).toHaveBeenCalledWith(expect.objectContaining({
       outcome: 'failed', infra: false, reason: expect.stringMatching(/^lease-lost:/),
     }));
-    expect.soft(f.calls.some(c => c.args.includes('push'))).toBe(false);
-    if (kind === 'foreign') {
-      expect.soft(f.calls.slice(callsAfterSpawn).some(c =>
+    expect.soft(output.map(classifyFixRunOutcome).filter(Boolean)).toEqual([
+      expect.objectContaining({ pr: 5759, outcome: 'lease-lost', infra: false }),
+    ]);
+    expect.soft(f.calls.some(c => c.args.some(arg => ['push', 'add', 'update-index', 'commit', '--abort'].includes(arg)))).toBe(false);
+    expect.soft(f.calls.slice(callsAfterSpawn).some(c =>
         c.args.some(arg => arg.endsWith('lane-pool.mjs'))
         && (c.args.includes('release') || c.args.includes('acquire')))).toBe(false);
-      expect(f.renewLease).not.toHaveBeenCalled();
-    }
+    expect(f.renewLease).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['missing', null], ['foreign', { holder: foreign }], ['missing-holder', {}], ['null-holder', { holder: null }],
+  ])('does not abort an active launcher merge after %s lease loss', async (_kind, lease) => {
+    const f = fixture();
+    let merging = false;
+    const run = f.run.getMockImplementation();
+    f.run.mockImplementation((cmd, args, opts) => {
+      if (args.includes('--git-path')) {
+        f.calls.push({ cmd, args, opts });
+        return 'MERGE_HEAD';
+      }
+      if (args.includes('merge') && args.includes('--no-commit')) {
+        f.calls.push({ cmd, args, opts });
+        merging = true;
+        f.state.dirty = 'UU file.txt\0';
+        throw new Error('merge conflict');
+      }
+      return run(cmd, args, opts);
+    });
+    Object.assign(f.io, {
+      fileExists: path => path.endsWith('MERGE_HEAD') && merging,
+      readFile: () => '<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> main\n',
+      writeErr: vi.fn(),
+    });
+    let readsAtLoss;
+    f.spawn.mockImplementation(async () => {
+      expect(merging).toBe(true);
+      readsAtLoss = f.readLease.mock.calls.length;
+      f.readLease.mockReturnValue(lease);
+    });
+    const result = await runFixCli([...argv, '--merge-onto=main'], f.io);
+    expect(f.spawn).toHaveBeenCalledOnce();
+    expect(result.code).toBe(1);
+    expect(f.recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'lease-lost' }));
+    expect(f.calls.some(c => c.args.includes('--abort'))).toBe(false);
+    // One post-agent guard and one release guard; abortMerge must not even be attempted.
+    expect(f.readLease.mock.calls.length - readsAtLoss).toBe(2);
+    expect(f.io.writeErr.mock.calls.flat().join('')).not.toContain('merge abort failed');
+    expect(f.calls.some(c => c.args.includes('release'))).toBe(false);
   });
 });
 
