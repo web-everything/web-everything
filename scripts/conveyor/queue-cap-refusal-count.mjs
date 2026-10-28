@@ -102,8 +102,9 @@ function capacityBodies(comments, marker, headSha) {
 
 /** Pure capacity evidence; legacy markers count but supply no elapsed-time evidence. */
 export function summarizeCapacityDeferral(comments, { headSha = null } = {}) {
-  const bodies = capacityBodies(comments, QUEUE_CAP_REFUSAL_MARKER, headSha);
-  const timedBodies = [...bodies, ...capacityBodies(comments, CAPACITY_BASELINE_MARKER, headSha)];
+  const trusted = (Array.isArray(comments) ? comments : []).filter(isTrustedMarkerAuthor);
+  const bodies = capacityBodies(trusted, QUEUE_CAP_REFUSAL_MARKER, headSha);
+  const timedBodies = [...bodies, ...capacityBodies(trusted, CAPACITY_BASELINE_MARKER, headSha)];
   const times = timedBodies.flatMap(body => [...body.matchAll(/^<!-- queue-cap-deferred-at: (.+) -->\r?$/gm)]
     .filter(match => /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(match[1])
       && capacityIso(match[1]) === (match[1].includes('.') ? match[1] : match[1].replace('Z', '.000Z')))
