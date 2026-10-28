@@ -32,6 +32,22 @@ const run = (id, conclusion, completed_at = '2026-10-13T23:40:00Z', name = 'test
 const pr = (comments = [stand()]) => ({ number: 5195, headRefOid: head, comments });
 const evidence = runs => ({ head, complete: true, runs });
 const bindings = names => names.map(context => ({ context, integration_id: 15368 }));
+
+it('reads required-check bindings from the module-relative filesystem policy under Vitest', () => {
+  expect(readRequiredCheckBindings()).toEqual(bindings([
+    'test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate',
+  ]));
+});
+
+it('passes an absolute module-relative policy path to the injected reader', () => {
+  const read = vi.fn(path => readFileSync(path, 'utf8'));
+  readRequiredCheckBindings({ read });
+  expect(read).toHaveBeenCalledTimes(1);
+  expect(read).toHaveBeenCalledWith(
+    resolve(dirname(fileURLToPath(import.meta.url)), '../../rulesets/main-required-checks.merge-queue.json'), 'utf8',
+  );
+});
+
 const args = (runs, extra = {}) => ({ pr: pr(), requiredChecks: ['test'], checks: evidence(runs),
   requiredCheckBindings: bindings(extra.requiredChecks ?? ['test']), ...extra });
 const redMainContext = {
