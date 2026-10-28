@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runPassAsTimedJob } from '../../../../skills-src/conveyor/pass-daemon.mjs';
 import { createJobStore, reapDeadGroup } from '../../../lib/daemon-jobs-runtime.mjs';
+import { keepAliveScript } from '../../../lib/test-keepalive.mjs';
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const alive = pid => {
@@ -37,10 +38,12 @@ export default {
     const startedMs = Date.now();
     const started = new Date(startedMs).toISOString();
     try {
+      // Anchor to the soak runner so the subprocess outlives the pass, with a
+      // hard lifetime bound if scenario cleanup is interrupted.
       writeFileSync(join(root, 'pass.mjs'), `
         import { spawn } from 'node:child_process';
         import { writeFileSync } from 'node:fs';
-        const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+        const child = spawn(process.execPath, ['-e', ${JSON.stringify(keepAliveScript({ anchorPid: process.pid, maxLifetimeMs: 10_000 }))}], { stdio: 'ignore' });
         writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));
         child.unref();
         setTimeout(() => process.exit(0), 200);
