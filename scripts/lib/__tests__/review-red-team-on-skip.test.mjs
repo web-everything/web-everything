@@ -913,6 +913,55 @@ describe('R100 recovery regressions', () => {
       trusted(`📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${head} -->\n<!-- numbering-restamp: from=${old} to=${head} -->`),
     ] }], readEvidence: () => ({ inFlight: false, recorded: false }),
   });
+  it.each(['carry', 'not-owed', 'full-review'].flatMap(mode =>
+    ['stale fork', 'invalid ancestor', 'changed clearance'].map(kind => ({ mode, kind }))))(
+    'refuses $mode publication with a canonical rejected re-stamp: $kind', ({ mode, kind }) => {
+      const o = carryOptions(), raw = o.rawPrs[0];
+      raw.reviews = [];
+      o.settle = vi.fn(() => ({ outcome: 'policy-clear' }));
+      if (mode === 'not-owed') {
+        const status = { status: 'finished', result: 'not-owed' };
+        o.readStatus = () => status;
+        o.readEvidence = () => ({ loopPayload: payload(), inFlight: false, recorded: false,
+          seatRecorded: false, status });
+      }
+      const intermediate = 'c'.repeat(40);
+      const restamp = (from, to) => trusted(`📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${to} -->\n<!-- numbering-restamp: from=${from} to=${to} -->`);
+      if (kind === 'stale fork') raw.comments.splice(2, 0, restamp(old, intermediate));
+      if (kind === 'invalid ancestor') {
+        raw.comments.splice(2, 0, restamp(intermediate, old));
+      }
+      if (kind === 'changed clearance') {
+        raw.comments[0].body += '\n<!-- cleared-human: reviewer -->';
+      }
+      if (mode === 'full-review') {
+        raw.comments.splice(1, 1);
+        o.readEvidence = () => ({ inFlight: false, recorded: false, seatRecorded: false });
+      }
+      expect(numbering.strandedNumberingRecords(raw.comments, raw.reviews)).not.toHaveLength(0);
+      runGhSync.mockClear();
+      expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
+        why: 'invalid acceptance re-stamp; withdraw stranded records before recovery' });
+      expect(runGhSync).not.toHaveBeenCalled();
+      expect(o.settle).not.toHaveBeenCalled();
+      expect(o.syncLabels).not.toHaveBeenCalled();
+      expect(o.dispatch).not.toHaveBeenCalled();
+    });
+
+  it('preserves policy-clear carry across a valid sequential re-stamp chain', () => {
+    const o = carryOptions(), raw = o.rawPrs[0], intermediate = 'c'.repeat(40);
+    raw.comments.splice(2, 0,
+      trusted(`📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${intermediate} -->\n<!-- numbering-restamp: from=${old} to=${intermediate} -->`),
+      trusted(`${redTeamMarker(pr, intermediate)}\nRed team not required on this head: card-only diff`));
+    raw.comments.at(-1).body = raw.comments.at(-1).body.replace(`from=${old}`, `from=${intermediate}`);
+    expect(numbering.strandedNumberingRecords(raw.comments, raw.reviews)).toEqual([]);
+    runGhSync.mockClear();
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'carry', from: intermediate });
+    expect(runGhSync).toHaveBeenCalledOnce();
+    expect(o.syncLabels).toHaveBeenCalledOnce();
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+
   const publicationOptions = kind => {
     const o = kind === 'carry' ? carryOptions() : runFixture({
       readEvidence: () => ({ loopPayload: payload(), recorded: false, seatRecorded: false,
