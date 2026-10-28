@@ -34,6 +34,8 @@ beforeAll(() => {
   for (const d of [laneRoot, plainRoot, elsewhere]) mkdirSync(d, { recursive: true });
   for (const root of [laneRoot, plainRoot]) {
     cpSync(WE_SCRIPTS_DIR, join(root, 'scripts'), { recursive: true });
+    cpSync(join(dirname(WE_SCRIPTS_DIR), 'skills-src/conveyor/daemon-manifest.mjs'),
+      join(root, 'skills-src/conveyor/daemon-manifest.mjs'));
     symlinkSync(join(dirname(WE_SCRIPTS_DIR), 'node_modules'), join(root, 'node_modules'), 'dir');
     mkdirSync(join(root, 'backlog'), { recursive: true });
   }
