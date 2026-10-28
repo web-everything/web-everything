@@ -79,12 +79,31 @@ describe('checkBornAsCollision', () => {
       const exec = fakeExec({ mainTexts: { [mainCard]: text } });
       expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ error: expect.stringContaining(`${mainCard} has no readable frontmatter`) });
     });
-  // The standards check reads `bornAs` with a YAML parser, which drops a trailing comment; the guard must agree.
-  it.each([['main', { main: `origin/main:${mainCard}\0bornAs: xgcpm6z # minted twice`, mainTexts: { [mainCard]: '---\nbornAs: xgcpm6z # minted twice\n---\n' } }],
-    ['the added card', { texts: { [newCard]: '---\nbornAs: "xgcpm6z"  # copied\n---\n' } }]])(
-    'reads a frontmatter identity with a trailing YAML comment on %s', (_, fixture) => {
-      expect(checkBornAsCollision({ exec: fakeExec(fixture), headSha: sha }).collision?.hash).toBe('xgcpm6z');
-    });
+  // The standards check reads `bornAs` with gray-matter (YAML); every spelling YAML accepts must mean the same here.
+  const spellings = [['a trailing comment', 'bornAs: xgcpm6z # minted twice'], ['a quoted value then a comment', 'bornAs: "xgcpm6z"# copied'],
+    ['a quoted key', '"bornAs": xgcpm6z'], ['a space before the colon', 'bornAs : xgcpm6z'], ['padding inside the quotes', 'bornAs: " xgcpm6z "']];
+  it.each(spellings)('reads a main card identity written with %s', (_, line) => {
+    const exec = fakeExec({ main: `origin/main:${mainCard}\0${line}`, mainTexts: { [mainCard]: `---\n${line}\nkind: story\n---\n` } });
+    expect(checkBornAsCollision({ exec, headSha: sha }).collision?.hash).toBe('xgcpm6z');
+  });
+  it.each(spellings)('reads an added card identity written with %s', (_, line) => {
+    const exec = fakeExec({ texts: { [newCard]: `---\n${line}\nkind: story\n---\n` } });
+    expect(checkBornAsCollision({ exec, headSha: sha }).collision?.hash).toBe('xgcpm6z');
+  });
+  it('ignores a main card line YAML does not read as bornAs (no space after the colon)', () => {
+    const exec = fakeExec({ mainTexts: { [mainCard]: '---\nbornAs:xgcpm6z\n---\n' } });
+    expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ ok: true });
+  });
+  it('falls back to identity lines when a frontmatter block is not valid YAML', () => {
+    const exec = fakeExec({ mainTexts: { [mainCard]: '---\nbornAs: xaaaaaa\nbornAs: xgcpm6z\n---\n' } });
+    expect(checkBornAsCollision({ exec, headSha: sha }).collision?.hash).toBe('xgcpm6z');
+  });
+  it('searches main for the added hashes as plain text, not for an identity key spelling', () => {
+    const exec = fakeExec();
+    checkBornAsCollision({ exec, headSha: sha });
+    const grep = exec.mock.calls.find(([, args]) => args[0] === 'grep')[1];
+    expect(grep.slice(0, 5)).toEqual(['grep', '-z', '-F', '-e', 'xgcpm6z']);
+  });
   it('treats a frontmatter-less file below a backlog subdirectory as no card', () => {
     const raised = 'backlog/raised-by/7233.md';
     const exec = fakeExec({ main: `origin/main:${raised}\0bornAs: xgcpm6z`, mainTexts: { [raised]: '- Also raised by:\nbornAs: xgcpm6z\n' } });
