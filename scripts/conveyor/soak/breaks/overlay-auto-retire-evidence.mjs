@@ -185,6 +185,7 @@ export default {
     await retirementRecovery(violation);
     await retirementRecovery(violation, { rewrite: true });
     await registrationLifecycle(violation);
+    await registrationLifecycle(violation, { sequential: true });
     for (const check of await registrationEvidenceReplay()) {
       if (!check.ok) violation(check.name, JSON.stringify(check.observed));
     }
@@ -383,10 +384,11 @@ async function retirementRecovery(violation, { rewrite = false } = {}) {
 
 /** PR #5964 send-back round 13, real Git and real preparation: which registration of a reused ref is current.
  *  1. X/PR1 retires into C1; X is re-registered as PR2 and retires into C2; PR1, C1 and C2 then close. Recovery
- *     must restore X/PR2 from C2, never the obsolete X/PR1 from C1, and the build must proceed.
+ *     must restore X/PR2 from C2, never the obsolete X/PR1 from C1, and the build must proceed — also when C2
+ *     closes a tick before C1 (`sequential`): the registered X/PR2 then supersedes C1's X/PR1 archive.
  *  2. Y/PR21 is adopted carrying a mechanism file and squash-lands; Y is re-registered as PR22 with its branch
  *     gone. The new registration must not inherit PR21's adopted pin (no pinned-overlay-unavailable hold). */
-async function registrationLifecycle(violation) {
+async function registrationLifecycle(violation, { sequential = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'overlay-lifecycle-soak-'));
   const env = {
     WE_DAEMON_OVERLAY_DIR: join(root, 'store'), WE_DAEMON_STATE_DIR: join(root, 'state'),
@@ -446,6 +448,15 @@ async function registrationLifecycle(violation) {
     addOverlay(root, { ref: 'c2', pr: 12 }, { env });
     await prepare();
     if (refs() !== 'c1,c2') violation('lifecycle-pr2-not-archived', `expected X/PR2 retired into c2, got ${refs()}`);
+    if (sequential) {
+      // C2 closes first and X/PR2 comes back from it; C1 closes on a later tick. X/PR2, now registered, is the
+      // current X: C1's X/PR1 archive is no longer owed (X/PR2 does not carry it, and it can never be restored).
+      closed.add(12);
+      const first = await prepare();
+      if (refs() !== 'c1,x' || first.result?.reason === 'overlay-source-unavailable') {
+        violation('sequential-close-pr2-not-restored', `C2 closing must restore X/PR2 beside C1, got ${refs()} (${first.result?.reason ?? 'candidate'})`);
+      }
+    }
     closed.add(11); closed.add(12);
     const recovered = await prepare();
     const x = entries().find((o) => o.ref === 'x');
@@ -457,6 +468,7 @@ async function registrationLifecycle(violation) {
       || git(['merge-base', '--is-ancestor', pr2, plan.finalSha]).status !== 0) {
       violation('newest-archive-missing-from-build', `the candidate must carry X/PR2 (${recovered.result?.reason ?? 'candidate'})`);
     }
+    if (sequential) return;
 
     writeOverlays(root, [], { env });
     ok('checkout', '-qb', 'y', initial); const mechanism = commit('scripts/lib/daemon-rebuild.mjs');

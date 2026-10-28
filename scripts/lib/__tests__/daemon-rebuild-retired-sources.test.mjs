@@ -318,6 +318,45 @@ describe('archived sources remain represented in preparation', () => {
     expect(next.result.plan.applied).toEqual([{ ref: 'x', pr: 2, sha: B, registrationId: pr2.registrationId }]);
   });
 
+  it('carriers closing one after another: the restored X/PR2 supersedes X/PR1 still archived in C1', async () => {
+    const f = fixture();
+    archivedTwice(f);
+    const closed = new Set([1, 12]);
+    model.planner = async ({ overlays, prState }) => {
+      const applied = [];
+      const decisions = [];
+      for (const o of overlays) {
+        const gone = (await prState(o.pr)) === 'CLOSED';
+        decisions.push({ ref: o.ref, pr: o.pr, action: gone ? 'remove' : 'apply', reason: gone ? 'pr-closed' : 'applied' });
+        if (!gone) applied.push({ ref: o.ref, pr: o.pr, sha: o.ref === 'c1' ? A : B });
+      }
+      const has = (ref) => applied.some((o) => o.ref === ref);
+      // G carries both C1 (X/PR1's commit A) and X/PR2 (B); F carries X/PR2 alone.
+      return { ok: true, upToDate: true, mainSha: '1'.repeat(40),
+        finalSha: has('x') && has('c1') ? G : has('x') ? F : has('c1') ? A : '1'.repeat(40),
+        applied, decisions, alerts: [], establishedLost: [], inputsKey: 'test' };
+    };
+    const G = 'd'.repeat(40);
+    const run = (args) => {
+      const [cmd, ...rest] = args;
+      if (cmd === 'rev-parse' && /\/x(\^\{commit\})?$/.test(rest.at(-1))) return { status: 0, stdout: B };
+      if (cmd === 'for-each-ref' && rest.at(-1).endsWith('/x')) return { status: 0, stdout: `${rest.at(-1)} ${B}` };
+      if (cmd === 'merge-base' && rest[0] === '--is-ancestor'
+        && ((rest[1] === B && [F, G].includes(rest[2])) || (rest[1] === A && rest[2] === G))) return { status: 0, stdout: '' };
+      return f.git(args);
+    };
+    const prState = async (pr) => (closed.has(pr) ? 'CLOSED' : 'OPEN');
+    // C2 closes first: X/PR2 comes back from it while C1 (still open) keeps X/PR1's archive.
+    const first = await f.prepare({ prState, run });
+    expect(first.result.reason).toBe('up-to-date');
+    expect(readOverlayState(root, { env: f.env }).overlays.map((o) => [o.ref, o.pr])).toEqual([['c1', 11], ['x', 2]]);
+    closed.add(11);
+    const next = await f.prepare({ prState, run });
+    expect(next.alerts.filter((a) => a.kind === 'overlay-source-unavailable')).toEqual([]);
+    expect(next.result.reason).toBe('up-to-date');
+    expect(readOverlayState(root, { env: f.env }).overlays).toEqual([expect.objectContaining({ ref: 'x', pr: 2 })]);
+  });
+
   it.each([false, true])('removing a carrier never restores a ref whose newer archive sits on another carrier (nested=%s)', (nested) => {
     const f = fixture();
     archivedTwice(f, { nested });

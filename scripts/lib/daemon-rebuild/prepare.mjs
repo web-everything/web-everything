@@ -426,9 +426,10 @@ export async function prepareRebuild({
   // apart from it (unavailable pins and retirement evidence above, via sameRegistration). Legacy entries stay as-is.
   if (plan.ok && Array.isArray(plan.applied)) {
     const registrations = new Map(overlaysForPlan.map((o) => [o?.ref, o]));
+    // A tip pinned at the previously adopted head (`pinnedFrom`) may predate this registration: leave it unbound.
     plan.applied = plan.applied.map((a) => {
       const o = registrations.get(a?.ref);
-      return o?.registrationId != null && (a.pr == null || o.pr == null || Number(a.pr) === Number(o.pr))
+      return o?.registrationId != null && !a.pinnedFrom && sameRegistration({ ref: a.ref, pr: a.pr }, o)
         ? { ...a, registrationId: o.registrationId } : a;
     });
   }

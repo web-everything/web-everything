@@ -344,23 +344,31 @@ export function recordEdgeResolution(root, ref, {
 export function sameRegistration(applied, entry) {
   const id = registrationIdentity(entry);
   if (!applied || !id || applied.ref !== id.ref) return false;
-  if (applied.pr != null && id.pr != null && Number(applied.pr) !== Number(id.pr)) return false;
+  const prOf = (pr) => (pr == null || pr === '' ? null : Number(pr));
+  if (prOf(applied.pr) != null && prOf(id.pr) != null && prOf(applied.pr) !== prOf(id.pr)) return false;
   if (applied.registrationId == null || id.registrationId == null) return true;
   return applied.registrationId === id.registrationId;
 }
 
 /**
- * Every archived snapshot (all carriers, nested included) that a newer archive of the same ref supersedes.
- * Newest = latest `retiredAt`, tie-broken by registrationId; a legacy unstamped snapshot is older than any
- * stamped one, and unstamped ones keep archive order (later wins), which is their retire order.
+ * Every archived snapshot (all carriers, nested included) that is no longer the current registration of its ref:
+ * - a ref registered now under a different registrationId supersedes all its archives (they all predate it, since
+ *   a ref has one registration at a time); the same registrationId — a restored archive — keeps them owed;
+ * - otherwise only the newest archive counts: latest `retiredAt` instant, tie-broken by registrationId. A legacy
+ *   unstamped snapshot is older than any stamped one, and unstamped ones keep archive order (later wins).
  * @param {Array<object>} list
  * @returns {Set<object>}
  */
 export function supersededSnapshots(list) {
+  const entries = Array.isArray(list) ? list : [];
+  const active = new Map(entries.filter((o) => o?.ref).map((o) => [o.ref, o.registrationId ?? null]));
   const latest = new Map();
   const superseded = new Set();
   let seq = 0;
-  const key = (s, n) => [s.retiredAt ? 1 : 0, String(s.retiredAt ?? ''), s.retiredAt ? String(s.entry?.registrationId ?? '') : '', n];
+  const key = (s, n) => {
+    const at = typeof s.retiredAt === 'string' ? Date.parse(s.retiredAt) : NaN;
+    return Number.isFinite(at) ? [1, at, String(s.entry?.registrationId ?? ''), n] : [0, 0, '', n];
+  };
   const newer = (a, b) => {
     for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return a[i] > b[i];
     return false;
@@ -371,6 +379,8 @@ export function supersededSnapshots(list) {
       if (!s || typeof s !== 'object') continue;
       const ref = s.entry?.ref;
       if (isSafeBranchName(ref)) {
+        const current = active.get(ref);
+        if (current != null && s.entry.registrationId != null && s.entry.registrationId !== current) superseded.add(s);
         const k = key(s, seq += 1);
         const cur = latest.get(ref);
         if (!cur) latest.set(ref, { s, k });
@@ -380,7 +390,7 @@ export function supersededSnapshots(list) {
       walk(s.entry?.retiredSources, depth + 1);
     }
   };
-  for (const o of Array.isArray(list) ? list : []) walk(o?.retiredSources, 0);
+  for (const o of entries) walk(o?.retiredSources, 0);
   return superseded;
 }
 
