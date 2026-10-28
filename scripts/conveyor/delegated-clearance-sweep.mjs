@@ -255,10 +255,15 @@ export function sweepDelegatedClearance({ prs, repo = null, dryRun = false, sett
       const key = `${repo ?? ''}#${c.num}@${c.head}`;
       const basis = c.approval ? `R130 / ${c.approval.rulingId}` : 'R130 / R11';
       const event = kind => ({ kind, repo, pr: c.num, head: c.head, basis, ...(c.approval ? { rulingId: c.approval.rulingId } : {}) });
+      // A memo whose write failed is withdrawn: a later candidate's successful write must not persist it.
+      const remember = memoKey => {
+        state.memo[memoKey] = true;
+        try { writeState(state); } catch (e) { delete state.memo[memoKey]; throw e; }
+      };
       const publish = kind => {
         const memoKey = kind === 'pre-approval-void' ? voidKey(c.approval) : `${key}:${kind}`;
         if (dryRun || state.memo[memoKey]) return;
-        state.memo[memoKey] = true; writeState(state); emit(event(kind));
+        remember(memoKey); emit(event(kind));
       };
       if (c.approval && c.broken.length) { publish('pre-approval-void'); results.push({ num: c.num, delegated: 'pre-approval-void', detail: basis }); continue; }
       // A void belongs to the ruling and survives every subsequent head.
@@ -291,7 +296,7 @@ export function sweepDelegatedClearance({ prs, repo = null, dryRun = false, sett
           results.push({ num: c.num, delegated: 'aborted', detail: 'live clearance evidence changed or incomplete; retry next tick or request operator review' });
           continue;
         }
-        state.memo[`${key}:attempt`] = true; writeState(state);
+        remember(`${key}:attempt`);
         let r;
         try { r = runLabel({ repo, ...c, args, body }); } catch (e) { r = { ok: false, detail: String(e.message) }; }
         publish(r?.ok === true ? 'auto-approved' : 'approval-refused');

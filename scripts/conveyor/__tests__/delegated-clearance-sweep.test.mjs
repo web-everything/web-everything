@@ -553,6 +553,22 @@ describe('R130 delegated clearance', () => {
     expect(h.runLabel).toHaveBeenCalledWith(expect.objectContaining({ num: 3 }));
     expect(results.filter(r => r.delegated === 'auto-approved').map(r => r.num)).toEqual([2, 3]);
   });
+  it('a failed attempt-memo write is withdrawn, so a later candidate never persists it and the next tick retries', () => {
+    const rows = [1, 2].map(number => ({ ...pr(), number,
+      comments: pr().comments.map(c => ({ ...c, body: c.body.replace('pr=5925', `pr=${number}`) })) }));
+    let state = { observed: {}, memo: {} }, failed = false;
+    const writeState = vi.fn(next => {
+      if (!failed && next.memo[`o/r#1@${head}:attempt`]) { failed = true; throw new Error('disk full'); }
+      state = structuredClone(next);
+    });
+    const h = harness({ prs: rows, readState: () => state, writeState });
+    const results = sweepDelegatedClearance(h);
+    expect(results).toContainEqual({ num: 1, delegated: 'sweep-failed', detail: expect.stringContaining('disk full') });
+    expect(h.runLabel.mock.calls.map(([a]) => a.num)).toEqual([2]);
+    expect(state.memo[`o/r#1@${head}:attempt`]).toBeUndefined();
+    sweepDelegatedClearance(h);
+    expect(h.runLabel.mock.calls.map(([a]) => a.num)).toEqual([2, 1]);
+  });
   it('dry run writes neither events, state nor labels', () => {
     const h = harness({ dryRun: true }); sweepDelegatedClearance(h);
     expect(h.emit).not.toHaveBeenCalled(); expect(h.writeState).not.toHaveBeenCalled(); expect(h.runLabel).not.toHaveBeenCalled();

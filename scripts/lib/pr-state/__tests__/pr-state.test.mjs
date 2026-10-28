@@ -214,6 +214,10 @@ describe('fail closed: every hold rule defaults to deny (review of PR #4326)', (
         expect(state([...base, approval(5, live10, H2)], onB).lifecycleState).toBe('READY-TO-MERGE');
         expect(state([...base, approval(5, null, null)], onB).lifecycleState).toBe('READY-TO-MERGE'); // legacy, non-delegated
       });
+    it('an approval row bound to an abbreviated or malformed head is refused at build time', () => {
+      for (const headSha of [H2.slice(0, 7), 'not-a-sha', `${H2}0`]) expect(() => approval(5, live10, headSha)).toThrow(/headSha/);
+      expect(approval(5, live10, H2.toUpperCase()).headSha).toBe(H2);
+    });
   });
 
   describe('a clearing verdict lifts a hand-added hold only if it covers the current head', () => {
