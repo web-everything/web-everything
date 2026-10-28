@@ -4401,7 +4401,7 @@ export function removeDeescalatedHumanLabels({ gate, labels, dryRun, pr, repo },
   if (!gate.deescalatedHuman || dryRun) return;
   for (const label of (gate.removeLabels || []).filter((l) => hasReviewLabel(labels, l))) {
     try {
-      exec('gh', ['pr', 'edit', String(pr), ...repoFlag(repo), '--remove-label', label],
+      exec('gh', ['pr', 'edit', String(pr), ...(repo ? ['--repo', repo] : []), '--remove-label', label],
         { stdio: ['ignore', 'ignore', 'pipe'] });
     } catch { /* label best-effort */ }
   }

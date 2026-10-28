@@ -771,7 +771,8 @@ describe('#6027 — fresh net score de-escalation through the drain handoff', ()
     const exec = vi.fn();
     removeDeescalatedHumanLabels({ gate: drain(), labels: [REVIEW_LABELS.human],
       dryRun: false, pr: 6027, repo: 'owner/repo' }, { exec });
-    expect(exec).toHaveBeenCalledExactlyOnceWith('gh',
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec).toHaveBeenCalledWith('gh',
       ['pr', 'edit', '6027', '--repo', 'owner/repo', '--remove-label', REVIEW_LABELS.human],
       { stdio: ['ignore', 'ignore', 'pipe'] });
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
@@ -790,7 +791,7 @@ describe('#6027 — fresh net score de-escalation through the drain handoff', ()
   it('treats a failed label removal as best-effort', () => {
     const exec = vi.fn(() => { throw new Error('label edit failed'); });
     expect(() => removeDeescalatedHumanLabels({ gate: drain(), labels: [REVIEW_LABELS.human],
-      dryRun: false, pr: 6027 }, { exec })).not.toThrow();
+      dryRun: false, pr: 6027, repo: 'owner/repo' }, { exec })).not.toThrow();
     expect(exec).toHaveBeenCalledOnce();
   });
 
