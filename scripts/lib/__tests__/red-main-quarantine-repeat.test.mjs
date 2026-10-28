@@ -46,6 +46,34 @@ describe('R157 repeat failure quarantine', () => {
     })]);
   });
   it('planner records distinct run proof', () => expect(plan()).toMatchObject({ action: 'add', entries: [{ test: file, proof }] }));
+  it.each([
+    ['fail/pass/fail on one SHA holds', [1, 3], [2], 'none', [3]],
+    ['fail/fail on one SHA adds', [1, 3], [], 'add', [1, 3]],
+    ['two failures after green add', [1, 3, 4], [2], 'add', [3, 4]],
+    ['latest of multiple greens resets proof', [1, 3, 5], [2, 4], 'none', [5]],
+    ['failure tied with green is excluded', [2, 3], [2], 'none', [3]],
+  ])('IO red window: %s', (_label, failedMinutes, greenMinutes, action, eligibleMinutes) => {
+    const run = (minute, conclusion, databaseId) => ({
+      ...rows[0], databaseId, headSha: rows[1].headSha, conclusion, attempt: 1,
+      createdAt: `2026-10-27T10:0${minute}:00Z`, updatedAt: `2026-10-27T10:1${minute}:00Z`,
+    });
+    const failures = failedMinutes.map((minute) => run(minute, 'failure', minute));
+    const greens = greenMinutes.map((minute) => run(minute, 'success', 100 + minute));
+    const latestRunId = failedMinutes.at(-1);
+    const readJobs = vi.fn(() => ({ failed: [{ id: 10, name: 'integration' }], jobs: [] }));
+    const write = vi.fn(({ change }) => change({ version: 1, entries: [] }));
+    const out = runSafetyNet({ now, dir: temp(),
+      mainCiRuns: { runs: [...failures, ...greens].reverse(), failing: { runId: latestRunId, jobs: ['integration'] } },
+      mode: { value: 'quarantine', source: 'test' }, touchedFiles: () => [], readJobs, readLog: () => failure,
+      readList: () => ({ ok: true, list: { version: 1, entries: [] } }), write, log: () => {} });
+    expect(out.plan.action).toBe(action);
+    expect(readJobs.mock.calls.map(([id]) => id)).toEqual([latestRunId, ...eligibleMinutes.filter((id) => id !== latestRunId)]);
+    if (action === 'none') expect(write).not.toHaveBeenCalled();
+    else {
+      expect(write).toHaveBeenCalledOnce();
+      expect(out.plan.entries[0].proof.runIds).toEqual(eligibleMinutes);
+    }
+  });
   it('once => none', () => expect(plan({ repeatRuns: [rows[1]] })).toMatchObject({ action: 'none', why: expect.any(String) }));
   it('planner refuses repeatFailureCount below two even with one failing run', () => {
     expect(plan({ settings: { repeatFailureCount: 1 }, repeatRuns: [rows[1]] })).toMatchObject({ action: 'none', why: expect.stringMatching(/count|bound/) });
@@ -81,6 +109,16 @@ describe('R157 repeat failure quarantine', () => {
     expect(write).not.toHaveBeenCalled();
   });
   it('duplicate run ids do not count twice', () => expect(plan({ repeatRuns: [rows[1], rows[1]] }).action).toBe('none'));
+  it.each([undefined, 'invalid'])('IO holds when a completed green has unknown chronology (%s)', (createdAt) => {
+    const write = vi.fn();
+    const out = runSafetyNet({ now, dir: temp(),
+      mainCiRuns: { runs: [...rows, { ...rows[0], databaseId: 3, conclusion: 'success', createdAt, attempt: 1 }], failing: { runId: 2, jobs: ['integration'] } },
+      mode: { value: 'quarantine', source: 'test' }, touchedFiles: () => [],
+      readJobs: () => ({ failed: [{ id: 10, name: 'integration' }], jobs: [] }), readLog: () => failure,
+      readList: () => ({ ok: true, list: { version: 1, entries: [] } }), write, log: () => {} });
+    expect(out.plan).toMatchObject({ action: 'none', why: expect.stringContaining('insufficient distinct failing main runs') });
+    expect(write).not.toHaveBeenCalled();
+  });
   it('repeat evidence IO caps run and log reads at ten runs and maxTests logs per run', () => {
     const history = Array.from({ length: 15 }, (_, i) => ({
       ...rows[0], databaseId: i + 1, headSha: (i + 1).toString(16).padStart(40, '0'), attempt: 1,

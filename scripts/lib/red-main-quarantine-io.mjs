@@ -225,9 +225,23 @@ export function readTouchedFiles(fromSha, toSha, { board = process.cwd(), run = 
 
 /** At most ten run reads and maxTests log reads per run. Unknown history never proves a repeat. */
 function readRepeatRuns(mainCiRuns, { state, jobFailures, readJobs, readLog, settings }) {
-  // SHA membership alone cannot admit a row that the red-window chronology excluded.
-  const candidates = (mainCiRuns?.runs ?? []).filter((r) => typeof r?.createdAt === 'string'
-    && Number.isFinite(Date.parse(r.createdAt)) && state.redShas?.includes(r.headSha)
+  const history = mainCiRuns?.runs ?? [];
+  const timestamp = (value) => typeof value === 'string' ? Date.parse(value) : NaN;
+  const failing = history.find((r) => String(r?.databaseId) === String(mainCiRuns?.failing?.runId));
+  const failingCreatedAt = timestamp(failing?.createdAt);
+  if (!Number.isFinite(failingCreatedAt)) return [];
+  let windowStart = -Infinity;
+  for (const run of history) {
+    if (run?.status !== 'completed' || run.conclusion !== 'success') continue;
+    const createdAt = timestamp(run.createdAt);
+    // Unknown green chronology cannot establish an uninterrupted red window.
+    if (!Number.isFinite(createdAt)) return [];
+    if (createdAt <= failingCreatedAt) windowStart = Math.max(windowStart, createdAt);
+  }
+  // Repeated runs can share a SHA across a green boundary; membership alone is insufficient.
+  const candidates = history.filter((r) => Number.isFinite(timestamp(r?.createdAt))
+    && timestamp(r.createdAt) > windowStart && timestamp(r.createdAt) <= failingCreatedAt
+    && state.redShas?.includes(r.headSha)
     && r.status === 'completed' && ['failure', 'timed_out'].includes(r.conclusion))
     .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
   const unique = [...new Map(candidates.map((r) => [String(r.databaseId), r])).values()];
