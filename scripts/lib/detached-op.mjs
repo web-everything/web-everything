@@ -6,6 +6,8 @@
  * Containment is best effort: cgroups are deferred. A descendant that removes its marker,
  * closes both logs and reparents before observation is unobservable; this is not a security
  * boundary. Incomplete scans or surviving known owners report escaped-descendants, never done.
+ * Linux permission barriers in unobserved processes born before the runner do not imply
+ * escaped descendants. Observed owners remain eligible regardless of their birth time.
  * CLI: --detach | --wait-for=<id> | --cancel=<id>, with --max-wait-ms=<250..540000>.
  * Wait/cancel return 0 for success, 1 for terminal failure, 75 while pending (including
  * unknown identity or reaper cleanup). Terminal records describe observed owners only.
@@ -79,6 +81,13 @@ export function sameProcess(a, b) {
     && a.scope === b.scope && a.bootId === b.bootId);
 }
 function identityKey(p) { return `${p.pid}\0${p.platform}\0${p.start}\0${p.bootId || ''}\0${p.scope}`; }
+function predatesRunner(row, record) {
+  const runner = record.runnerIdentity;
+  return row && runner?.platform === 'linux' && runner.pid === record.pid
+    && runner.scope === row.scope && runner.bootId === row.bootId
+    && typeof runner.start === 'string' && /^[0-9]+$/.test(runner.start)
+    && BigInt(row.start) < BigInt(runner.start);
+}
 async function linuxRow(pid, scope, io, bootId, signal) {
   const raw = await io.readFile(`/proc/${pid}/stat`, { encoding: 'utf8', signal });
   const end = raw.lastIndexOf(')');
@@ -135,6 +144,7 @@ export async function collectOwnedProcesses(record, { deadline = Date.now() + SC
     let rows = [], complete = true;
     const marked = new Set(), logged = new Set();
     const scope = record.recordPath;
+    const known = [record.commandIdentity, ...(record.members || [])].filter(Boolean);
     if (platform === 'linux') {
       const bootId = await io.readFile('/proc/sys/kernel/random/boot_id', { encoding: 'utf8', signal });
       const names = (await io.readdir('/proc')).filter(n => /^\d+$/.test(n));
@@ -146,37 +156,54 @@ export async function collectOwnedProcesses(record, { deadline = Date.now() + SC
         await Promise.all(names.slice(i, i + 16).map(async name => {
           const pid = Number(name);
           if (pid === record.pid || pid === process.pid) return;
-          let row, processComplete = true;
+          let row, processComplete = true, permissionOnly = true, logInodeObserved = false;
+          const markIncomplete = error => {
+            processComplete = false;
+            permissionOnly &&= ['EACCES', 'EPERM'].includes(error?.code);
+          };
           try {
             if ((await io.stat(`/proc/${pid}`)).uid !== uid) return;
             row = await linuxRow(pid, scope, io, bootId, signal);
             if (row.state.startsWith('Z')) return;
-            const env = await io.readFile(`/proc/${pid}/environ`, { encoding: 'utf8', signal });
-            if (env.split('\0').includes(`WE_DETACHED_OP=${record.id}`)) marked.add(pid);
+            try {
+              const env = await io.readFile(`/proc/${pid}/environ`, { encoding: 'utf8', signal });
+              if (env.split('\0').includes(`WE_DETACHED_OP=${record.id}`)) marked.add(pid);
+            } catch (error) {
+              if (['ENOENT', 'ESRCH'].includes(error.code)) return;
+              markIncomplete(error);
+            }
+            // Marker and log probes are independent: denied environ access must not
+            // hide a writable log holder, including one older than the runner.
             const fds = await io.readdir(`/proc/${pid}/fd`);
-            if (fds.length > 4096) processComplete = false;
+            if (fds.length > 4096) markIncomplete();
             for (const fd of fds.length > 4096 ? [] : fds) {
               try {
                 const info = await io.stat(`/proc/${pid}/fd/${fd}`);
                 if (logs.some(log => log.dev === info.dev && log.ino === info.ino)) {
+                  logInodeObserved = true;
                   const fdinfo = await io.readFile(`/proc/${pid}/fdinfo/${fd}`, { encoding: 'utf8', signal });
                   const flags = /^flags:\s+([0-7]+)$/m.exec(fdinfo);
-                  if (!flags) processComplete = false;
+                  if (!flags) markIncomplete();
                   // Log readers (including --wait-for itself) do not own operation work.
                   else if ((Number.parseInt(flags[1], 8) & 3) !== 0) logged.add(pid);
                 }
-              } catch (error) { if (!['ENOENT', 'ESRCH'].includes(error.code)) processComplete = false; }
+              } catch (error) { if (!['ENOENT', 'ESRCH'].includes(error.code)) markIncomplete(error); }
             }
           } catch (error) {
             if (['ENOENT', 'ESRCH'].includes(error.code)) return;
-            processComplete = false;
+            markIncomplete(error);
           }
           if (!processComplete) {
             // Exiting processes can lose proc permissions before their directory disappears.
-            // Only proven death/reuse clears that error; a live or unreadable owner stays unknown.
+            // Recheck birth identity before classifying a live owner or an unrelated older process.
             try {
               const current = await linuxRow(pid, scope, io, bootId, signal);
               if (current.state.startsWith('Z') || (row && !sameProcess(identity(row), identity(current)))) return;
+              // A process older than this runner cannot be its descendant. Do not
+              // let an unrelated host service's ptrace restrictions poison every job.
+              // Positive ownership, missing birth evidence and other scan errors still fail closed.
+              if (permissionOnly && predatesRunner(row, record) && !marked.has(pid) && !logInodeObserved
+                && !known.some(member => sameProcess(member, identity(row)))) return;
             } catch (error) { if (['ENOENT', 'ESRCH'].includes(error.code)) return; }
             complete = false;
           }
@@ -213,7 +240,6 @@ export async function collectOwnedProcesses(record, { deadline = Date.now() + SC
         flush();
       } else complete = false;
     } else return incomplete;
-    const known = [record.commandIdentity, ...(record.members || [])].filter(Boolean);
     const knownKeys = new Set(known.map(identityKey));
     const leader = rows.find(row => row.pid === record.commandIdentity?.pid);
     // A reused group leader revokes group ownership, even if the integer pgid matches.
