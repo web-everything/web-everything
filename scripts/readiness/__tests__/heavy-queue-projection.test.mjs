@@ -398,6 +398,65 @@ describe('waitersAheadOf — P0 > P1 > builds without preempting holders', () =>
 });
 
 describe('P1 queue budget — cap 3 plus one fast slot', () => {
+  it.each(['fix', 'ci-heal'])('%s retains held and pending backlog after excluding valid lower-priority waiters', (kind) => {
+    const pending = [{ demandMinutes: 7 }];
+    const b = {
+      ...queueBacklog({
+        held: [{ kind: 'FULL', priority: 'P3' }, { kind: 'selected', priority: 'P3' }],
+        waiting: [{ kind: 'FULL', priority: 'P3' }, { kind: 'selected', priority: 'P3' }],
+        pending,
+      }),
+      pending, slots: 2, heavySlots: 1, fastSlots: 1, maxWaitMinutes: 12,
+    };
+    const ahead = waitersAheadOf(b, kind);
+    expect(ahead).toMatchObject({
+      waiting: [], waitingMinutes: 0, waitingHeavyCount: 0,
+      heldRemainingMinutes: 21, heldHeavyCount: 1, pendingMinutes: 7,
+      backlogMinutes: 28, heavyBacklogMinutes: 18, shortBacklogMinutes: 10,
+      excludedBehindCount: 2, excludedBehindMinutes: 21,
+    });
+    expect(ahead.held).toBe(b.held);
+    expect(ahead.pending).toBe(pending);
+    expect(createQueueBudget(b).tryAdmit(kind)).toMatchObject({
+      admit: false, projectedMinutes: 13.25, aheadOnly: true, excludedBehindCount: 2,
+    });
+  });
+
+  it.each([
+    ['null row', null],
+    ['string row', 'unreadable'],
+    ['numeric row', 42],
+    ['undefined row', undefined],
+    ['array row with an otherwise readable cost', Object.assign([], { kind: 'selected', expectedMinutes: 3 })],
+    ['missing cost', { kind: 'selected', priority: 'P3' }],
+    ['null cost', { kind: 'selected', priority: 'P3', expectedMinutes: null }],
+    ['string cost', { kind: 'selected', priority: 'P3', expectedMinutes: '40' }],
+    ['NaN cost', { kind: 'selected', priority: 'P3', expectedMinutes: NaN }],
+    ['infinite cost', { kind: 'selected', priority: 'P3', expectedMinutes: Infinity }],
+    ['negative cost', { kind: 'selected', priority: 'P3', expectedMinutes: -1 }],
+  ])('closed path: retains the backlog contribution of a %s while excluding a valid lower-priority waiter', (_label, row) => {
+    // The aggregate snapshot includes 40 minutes attributed to the unreadable row.
+    // Its unknown cost must not erase that recorded demand or disable the cap.
+    const b = {
+      waiting: [row, { kind: 'selected', priority: 'P3', expectedMinutes: 3 }],
+      waitingMinutes: 43, backlogMinutes: 43, shortBacklogMinutes: 43,
+      heavyBacklogMinutes: 0, heldHeavyCount: 0, waitingHeavyCount: 0,
+      slots: 1, heavySlots: 1, fastSlots: 0, maxWaitMinutes: 30,
+    };
+    const ahead = waitersAheadOf(b, 'fix');
+    expect(ahead.waiting).toEqual([row]);
+    expect(ahead).toMatchObject({
+      waitingMinutes: 40, backlogMinutes: 40, shortBacklogMinutes: 40,
+      heavyBacklogMinutes: 0, waitingHeavyCount: 0,
+      excludedBehindCount: 1, excludedBehindMinutes: 3,
+    });
+    expect(createQueueBudget(b).tryAdmit('fix')).toMatchObject({
+      admit: false, projectedMinutes: 43.25, aheadOnly: true, excludedBehindCount: 1,
+    });
+    expect(b.waiting).toEqual([row, { kind: 'selected', priority: 'P3', expectedMinutes: 3 }]);
+    expect(b.backlogMinutes).toBe(43);
+  });
+
   const baseline = () => ({
     ...queueBacklog({
       held: Array.from({ length: 3 }, () => ({ kind: 'FULL', priority: 'P3' })),
