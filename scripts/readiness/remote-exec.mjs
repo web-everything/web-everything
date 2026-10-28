@@ -98,7 +98,7 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
   } catch { return fallback('forge-unreachable'); }
   const nonce = randomBytes(16).toString('hex');
   const ssh = (command, request, inherit = false) => exec({file:'ssh',
-    args:[host, `sudo -n -u ops /usr/local/libexec/forge-exec-run ${command}`],
+    args:[host, `sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs ${command}`],
     input:JSON.stringify(request), cwd, inherit});
   let run;
   let finished = false;

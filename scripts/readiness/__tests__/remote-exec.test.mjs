@@ -604,7 +604,7 @@ describe('runRemote', () => {
     expect(copy.args).not.toContain('-L');
     expect(copy.args).toContain('--exclude=.exit-code');
     expect(calls.findIndex(isPrepare)).toBeLessThan(calls.indexOf(copy));
-    expect(sshText(calls.find(isPrepare))).toBe('custom-forge sudo -n -u ops /usr/local/libexec/forge-exec-run prepare');
+    expect(sshText(calls.find(isPrepare))).toBe('custom-forge sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs prepare');
     expect(copy.input.split('\0')).toEqual(['./package-lock.json', './src/a file.mjs', '']);
     expect(copy.args.join(' ')).toMatch(/--rsync-path(?:=|\s)sudo -u forge-exec rsync/);
     expect(copy.args.join(' ')).toMatch(/custom-forge:\/srv\/forge-exec\/r-[a-f0-9]+\/work\//);

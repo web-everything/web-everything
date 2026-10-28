@@ -340,6 +340,50 @@ with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as 
 });
 
 describe('setup and pruning contract', () => {
+  it('executes the installed runner with Node 22.1 module resolution outside the repository package', async () => {
+    const setup=await readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');
+    const installer=setup.match(/<<'WRAPPER'\n([\s\S]*?)\nWRAPPER/)[1];
+    const local=join(root,'usr-local');
+    await mkdir(local,{mode:0o755});
+    // Run the shipped installer; only the privileged host directory and ownership
+    // operations are substituted. Copying, mode changes and atomic rename are real.
+    const harness=String.raw`import os, sys
+from types import SimpleNamespace
+from unittest.mock import patch
+installer, source, local = sys.argv[1:]
+real_open, real_fstat = os.open, os.fstat
+def local_open(path, *args, **kwargs):
+    return real_open(local if path == '/usr/local' else path, *args, **kwargs)
+def root_stat(fd):
+    st = real_fstat(fd)
+    return SimpleNamespace(st_uid=0, st_mode=st.st_mode)
+with patch.object(os, 'open', side_effect=local_open), \
+     patch.object(os, 'fstat', side_effect=root_stat), patch.object(os, 'fchown') as chown:
+    sys.argv = ['installer', source]
+    exec(installer)
+    assert chown.call_count == 1
+    assert chown.call_args.args[1:] == (0, 0)
+`;
+    const installed=spawnSync('python3',['-I','-c',harness,installer,
+      new URL('../forge-exec-run.mjs',import.meta.url).pathname,local],{
+      encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+    });
+    expect(installed.status,installed.stderr).toBe(0);
+    const names=await readdir(join(local,'libexec'));
+    expect(names).toHaveLength(1);
+    const entry=join(local,'libexec',names[0]);
+    expect((await stat(entry)).mode & 0o777).toBe(0o755);
+    // Disable newer Node's syntax detection to retain the Node 22.1 default.
+    // Execute the actual shebang path, with no surrounding type:module package.
+    const result=spawnSync(entry,[],{cwd:local,encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+      env:{PATH:join(root,'bin')+':/usr/bin:/bin',
+        NODE_OPTIONS:'--no-experimental-detect-module --experimental-default-type=commonjs'},
+    });
+    expect(result.status,result.stderr).toBe(254);
+    expect(result.stderr).toBe('forge-exec-run: Invalid subcommand\n');
+    const client=await readFile(new URL('../remote-exec.mjs',import.meta.url),'utf8');
+    expect(client).toContain('/usr/local/libexec/'+names[0]+' ${command}');
+  });
   it('installs a root-owned fixed wrapper, makes the old cache inert, and prunes only expired state', async () => {
     const setup=await readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');
     expect(setup).toContain('os.fchown(fd, 0, 0)');
@@ -368,16 +412,36 @@ describe('setup and pruning contract', () => {
     expect((await stat(work)).isDirectory()).toBe(true);
     expect((await stat(active)).isDirectory()).toBe(true);
   });
-  it('the production CLI rejects extra argv and oversized requests without accepting test-root environment overrides', () => {
+  it('the production CLI rejects extra argv and oversized requests', () => {
     const source=new URL('../forge-exec-run.mjs',import.meta.url);
     for(const args of [['prepare','extra'],['prepare']]) {
       const result=spawnSync(process.execPath,[source.pathname,...args],{
         input:args.length===1?'x'.repeat(4*1024*1024+1):'{}',encoding:'utf8',maxBuffer:1024*1024,
-        env:{PATH:process.env.PATH,FORGE_EXEC_TEST_ROOT:root},
+        env:{PATH:process.env.PATH},timeout:10000,
       });
       expect(result.status).toBe(254);
       expect(result.stderr).toContain(args.length===1?'Request limit exceeded':'Invalid subcommand');
     }
+  });
+  it('the production CLI reaches createRunner with a valid request and ignores test-root environment overrides', async () => {
+    const probe=join(root,'boundary-probe.mjs');
+    // Observe the real CLI's first filesystem operation after createRunner().
+    // Stop before any host mutation, even if a regression enables testRoot.
+    await writeFile(probe, `
+import fs from 'node:fs/promises';
+import {syncBuiltinESMExports} from 'node:module';
+fs.open = async path => { throw new Error('boundary-open:'+path); };
+fs.mkdir = async path => { throw new Error('boundary-mkdir:'+path); };
+syncBuiltinESMExports();
+`);
+    const result=spawnSync(process.execPath,['--import',probe,
+      new URL('../forge-exec-run.mjs',import.meta.url).pathname,'prepare'],{
+      input:JSON.stringify({nonce:'b'.repeat(32)}),encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+      env:{PATH:process.env.PATH,FORGE_EXEC_TEST_ROOT:root,FORGE_EXEC_TEST_PATH:join(root,'bin')},
+    });
+    expect(result.status,result.stderr).toBe(254);
+    expect(result.stderr).toBe('forge-exec-run: boundary-open:/srv/forge-exec\n');
+    expect(result.stdout).toBe('');
   });
 });
 
