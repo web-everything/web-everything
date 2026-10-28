@@ -286,7 +286,8 @@ it('#4545 malformed enrichment cannot prevent the original escalation', () => {
 describe('not-a-ci-break verdict invalidation — live #4535', async () => {
   const { vi } = await import('vitest');
   const { CI_HEAL_VERDICT_VOID_MARKER, buildCiHealVerdictVoidComment, parseCiHealVerdictVoids,
-    notCiBreakRecordRefusal, checkNotCiBreakRecordable } = await import('../ci-heal-escalation-mark.mjs');
+    notCiBreakRecordRefusal, checkNotCiBreakRecordable, needsHumanGateOnlyRefusal,
+    checkNeedsHumanEscalable } = await import('../ci-heal-escalation-mark.mjs');
   const { MAX_VERDICT_VOIDS_PER_HEAD, planVerdictVoid, runReconcileNotesAllRepos } = await import('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs');
   const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/ci-heal-verdict/pr4535-2026-10-09.json'), 'utf8'));
   const head = fixture.headRefOid;
@@ -339,6 +340,110 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
 
   const recordOptions = () => ({ pr: 4535, repo: fixture.repo, headSha: head, outcome: 'not-a-ci-break', settings,
     readPr: vi.fn(() => fixture), readRequired: vi.fn(async () => ({ checks: fixture.requiredChecks })) });
+
+  describe('gate-only red and cancelled-check recording regressions', () => {
+    const check = (name, conclusion, extra = {}) => ({ name, status: 'COMPLETED', conclusion, ...extra });
+    const gatePr = (statusCheckRollup = [check('test', 'SUCCESS'), check('review-gate', 'FAILURE')]) => ({
+      ...fixture, statusCheckRollup,
+    });
+    const humanRefusal = (overrides = {}) => needsHumanGateOnlyRefusal({
+      headSha: head, pr: gatePr(), requiredChecks: ['test'], ...overrides,
+    });
+    const humanOptions = () => ({ ...recordOptions(), outcome: 'needs-human',
+      readPr: vi.fn(() => gatePr()), readRequired: vi.fn(async () => ({ checks: ['test'] })) });
+
+    it('#6004/#5979: green required test plus red review-gate permits not-a-ci-break and refuses needs-human', () => {
+      expect(refusal({ pr: gatePr(), requiredChecks: ['test'] })).toBeNull();
+      const message = humanRefusal();
+      expect(message).toEqual(expect.any(String));
+      expect(message).toContain('review-gate');
+      expect(message).toMatch(/not (?:a )?CI break|review.{0,30}owed/i);
+      expect(message).toMatch(/(?:do not|cannot|refus\w*|must not)[\s\S]*needs-human/i);
+    });
+
+    it('a red merge-gate also refuses needs-human and names the gate', () => {
+      expect(humanRefusal({ pr: gatePr([check('test', 'SUCCESS'), check('merge-gate', 'FAILURE')]) }))
+        .toEqual(expect.stringContaining('merge-gate'));
+    });
+
+    it('does not refuse needs-human for a different head', () => {
+      expect(humanRefusal({ headSha: 'abcdef0123456789' })).toBeNull();
+    });
+
+    it('does not refuse needs-human for an empty required roster', () => {
+      expect(humanRefusal({ requiredChecks: [] })).toBeNull();
+    });
+
+    it('a real required test failure plus red review-gate may escalate needs-human', () => {
+      expect(humanRefusal({ pr: gatePr([check('test', 'FAILURE'), check('review-gate', 'FAILURE')]) })).toBeNull();
+    });
+
+    it('does not refuse needs-human when there are no red checks', () => {
+      expect(humanRefusal({ pr: gatePr([check('test', 'SUCCESS'), check('review-gate', 'SUCCESS')]) })).toBeNull();
+    });
+
+    it('optional CANCELLED smoke does not block recording not-a-ci-break', () => {
+      expect(refusal({ requiredChecks: ['test'], pr: gatePr([
+        check('test', 'SUCCESS'), check('smoke', 'CANCELLED'),
+      ]) })).toBeNull();
+    });
+
+    it('required CANCELLED test blocks recording as still running or pending, not as red', () => {
+      const message = refusal({ requiredChecks: ['test'], pr: gatePr([check('test', 'CANCELLED')]) });
+      expect(message).toEqual(expect.any(String));
+      expect(message).toMatch(/(?:still running|pending):[^.]*test/i);
+      expect(message).not.toMatch(/red:|IS a CI break/);
+    });
+
+    it('optional cancelled smoke cannot hide an IN_PROGRESS required test', () => {
+      const message = refusal({ requiredChecks: ['test'], pr: gatePr([
+        check('smoke', 'CANCELLED'), check('test', null, { status: 'IN_PROGRESS' }),
+      ]) });
+      expect(message).toEqual(expect.any(String));
+      expect(message).toMatch(/(?:still running|pending):[^.]*test/i);
+      expect(message).not.toContain('smoke');
+    });
+
+    it('checkNeedsHumanEscalable refuses gate-only red using injected PR and required-check readers', async () => {
+      const opts = humanOptions();
+      expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: humanRefusal() });
+      expect(opts.readPr).toHaveBeenCalledWith({ pr: 4535, repo: fixture.repo });
+      expect(opts.readRequired).toHaveBeenCalledWith({ repo: fixture.repo });
+    });
+
+    it('checkNeedsHumanEscalable permits a real CI failure with injected readers', async () => {
+      const opts = humanOptions();
+      opts.readPr.mockReturnValue(gatePr([check('test', 'FAILURE'), check('review-gate', 'FAILURE')]));
+      expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: null });
+    });
+
+    it.each(['not-a-ci-break', 'waiting-on-system-fix', 'inherited-from-base'])(
+      'checkNeedsHumanEscalable skips both readers for outcome %s', async outcome => {
+        const opts = { ...humanOptions(), outcome };
+        expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: null });
+        expect(opts.readPr).not.toHaveBeenCalled();
+        expect(opts.readRequired).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(['readPr', 'readRequired'])(
+      'checkNeedsHumanEscalable reports a warning and no refusal when %s fails', async reader => {
+        const opts = humanOptions();
+        opts[reader].mockImplementation(() => { throw new Error('offline'); });
+        expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: null, warning: expect.stringContaining('offline') });
+        if (reader === 'readPr') expect(opts.readRequired).not.toHaveBeenCalled();
+      },
+    );
+
+    it('checkNeedsHumanEscalable reports an asynchronous required-roster read failure', async () => {
+      const opts = humanOptions();
+      opts.readRequired.mockRejectedValue(new Error('required roster unavailable'));
+      expect(await checkNeedsHumanEscalable(opts)).toEqual({
+        refusal: null, warning: expect.stringContaining('required roster unavailable'),
+      });
+    });
+  });
+
   it.each([{ outcome: 'needs-human' }, { settings: { recheckNotCiBreak: false } }])('skips reads for %j', async (overrides) => {
     const opts = { ...recordOptions(), ...overrides };
     expect(await checkNotCiBreakRecordable(opts)).toEqual({ refusal: null });

@@ -187,6 +187,24 @@ describe('named check-state regressions', () => {
 });
 
 describe('summarize required checks', () => {
+  it('an explicit requiredNames roster overrides a row marked required:false', () => {
+    expect(summarize([settled('ci', 'failure', { required: false })], {
+      requiredNames: ['ci'],
+    })).toEqual({
+      redSet: new Set(['ci']), pendingSet: new Set(),
+      gateOnlyRed: false, allRequiredGreen: false,
+    });
+  });
+
+  it('matches requiredNames and holdGateNames case-insensitively and returns lowercase names', () => {
+    expect(summarize([
+      settled('ci', 'success'), settled('REVIEW-GATE', 'failure'),
+    ], { requiredNames: ['CI', 'Review-Gate'], holdGateNames: ['Review-Gate'] })).toEqual({
+      redSet: new Set(['review-gate']), pendingSet: new Set(),
+      gateOnlyRed: true, allRequiredGreen: false,
+    });
+  });
+
   it('marks an explicitly required name with no row as pending', () => {
     expect(summarize([settled('ci', 'success')], { requiredNames: ['ci', 'missing'] })).toEqual({
       redSet: new Set(), pendingSet: new Set(['missing']),

@@ -3,11 +3,92 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { requiredCheckStates, contradictingChecks, notCiBreakContradicted, unsettledRequiredChecks, ciGreenForEscalation, resolveVoidNeedsHumanWhenCiGreen, resolveCiHealVerdictSettings } from '../ci-heal-verdict-recheck.mjs';
+import * as verdictRecheck from '../ci-heal-verdict-recheck.mjs';
 
 const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/ci-heal-verdict/pr4535-2026-10-09.json'), 'utf8'));
 const input = { escalation: { outcome: 'not-a-ci-break', headSha: fixture.headRefOid }, headSha: fixture.headRefOid,
   rollup: fixture.statusCheckRollup, requiredChecks: fixture.requiredChecks };
 const green = fixture.requiredChecks.map((name) => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' }));
+
+describe('requiredCheckStates shared predicate regressions', () => {
+  it.each(['CANCELLED', 'STALE'])('required %s is pending, never red or missing', conclusion => {
+    expect(requiredCheckStates({ ...input, requiredChecks: ['Test'], rollup: [
+      { name: 'Test', status: 'COMPLETED', conclusion },
+    ] })).toEqual({ red: [], pending: ['Test'], missing: [], green: [] });
+  });
+
+  it.each([false, true])('numeric run_attempt beats timestamps in either row order (reverse=%s)', reverse => {
+    const rollup = [
+      { name: 'Test', status: 'COMPLETED', conclusion: 'SUCCESS', run_attempt: 2, id: 10,
+        startedAt: '2026-10-09T02:00:00Z', completedAt: '2026-10-09T02:01:00Z' },
+      { name: 'Test', status: 'COMPLETED', conclusion: 'FAILURE', run_attempt: 1, id: 99,
+        startedAt: '2026-10-09T04:00:00Z', completedAt: '2026-10-09T04:01:00Z' },
+    ];
+    expect(requiredCheckStates({ ...input, requiredChecks: ['Test'], rollup: reverse ? rollup.toReversed() : rollup }))
+      .toEqual({ red: [], pending: [], missing: [], green: ['Test'] });
+  });
+
+  it('the latest failed attempt cannot be hidden by an older green attempt', () => {
+    expect(requiredCheckStates({ ...input, requiredChecks: ['Test'], rollup: [
+      { name: 'Test', status: 'COMPLETED', conclusion: 'FAILURE', run_attempt: 2 },
+      { name: 'Test', status: 'COMPLETED', conclusion: 'SUCCESS', run_attempt: 1 },
+    ] })).toEqual({ red: ['Test'], pending: [], missing: [], green: [] });
+  });
+
+  it('an unknown completed conclusion fails closed red with its original-case name', () => {
+    expect(requiredCheckStates({ ...input, requiredChecks: ['Test'], rollup: [
+      { name: 'Test', status: 'COMPLETED', conclusion: 'FUTURE_UNKNOWN_CONCLUSION' },
+    ] })).toEqual({ red: ['Test'], pending: [], missing: [], green: [] });
+  });
+
+  it.each([
+    ['SUCCESS', 'green'], ['FAILURE', 'red'], ['ERROR', 'red'], ['PENDING', 'pending'], ['EXPECTED', 'pending'],
+  ])('legacy StatusContext %s remains %s and preserves original case', (state, bucket) => {
+    const expected = { red: [], pending: [], missing: [], green: [] };
+    expected[bucket] = ['Legacy-CI'];
+    expect(requiredCheckStates({ ...input, requiredChecks: ['Legacy-CI'], rollup: [
+      { __typename: 'StatusContext', context: 'Legacy-CI', state },
+    ] })).toEqual(expected);
+  });
+
+  it('missing contains only required names with no row, preserving all result names and the four-field shape', () => {
+    expect(requiredCheckStates({ ...input, requiredChecks: ['Test', 'Build', 'Absent'], rollup: [
+      { name: 'Test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { name: 'Build', status: 'IN_PROGRESS', conclusion: null },
+      { name: 'Optional', status: 'COMPLETED', conclusion: 'FAILURE' },
+    ] })).toEqual({ red: [], pending: ['Build'], missing: ['Absent'], green: ['Test'] });
+  });
+});
+
+describe('gateOnlyRedStates', () => {
+  it.each(['review-gate', 'merge-gate'])('includes red %s even when absent from the required roster', name => {
+    expect(verdictRecheck.gateOnlyRedStates({ ...input, rollup: [
+      ...green, { name, status: 'COMPLETED', conclusion: 'FAILURE' },
+    ] })).toEqual({ gateOnlyRed: true, red: [name] });
+  });
+
+  it('recognizes both gates red together', () => {
+    const result = verdictRecheck.gateOnlyRedStates({ ...input, rollup: [
+      ...green, ...['review-gate', 'merge-gate'].map(name => ({ name, status: 'COMPLETED', conclusion: 'FAILURE' })),
+    ] });
+    expect(result.gateOnlyRed).toBe(true);
+    expect(result.red.toSorted()).toEqual(['merge-gate', 'review-gate']);
+  });
+
+  it('a real required failure alongside a red gate is not gate-only red', () => {
+    const result = verdictRecheck.gateOnlyRedStates({ requiredChecks: ['test'], rollup: [
+      { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' },
+      { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+    ] });
+    expect(result.gateOnlyRed).toBe(false);
+    expect(result.red.toSorted()).toEqual(['review-gate', 'test']);
+  });
+
+  it('no red checks is not gate-only red', () => {
+    expect(verdictRecheck.gateOnlyRedStates({ ...input, rollup: green }))
+      .toEqual({ gateOnlyRed: false, red: [] });
+  });
+});
 
 describe('required check verdict recheck', () => {
   it('contradicts the real #4535 verdict only for test', () => {
