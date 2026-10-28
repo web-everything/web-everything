@@ -864,7 +864,7 @@ it('rotates after unreadable candidate threads instead of starving later PRs', (
   try {
     const snapshots = [1, 2, 3, 4].map(number => ({ ...pr(), number }));
     const reads = [];
-    const options = { repo: 'org/repo', env: { WE_FIX_LOOP_LEDGER: join(dir, 'ledger.jsonl') },
+    const options = { repo: 'org/repo', requiredChecks: ['test'], env: { WE_FIX_LOOP_LEDGER: join(dir, 'ledger.jsonl') },
       readComments: number => { reads.push(number); throw new Error('unreadable'); }, log: () => {},
     };
     enrichWithCursor(snapshots, options);
@@ -882,7 +882,7 @@ it.each(['malformed', 'wrong-repo', 'invalid-position', 'unreadable', 'unwritabl
       let reads = 0, writes = 0, reservations = 0, posts = 0;
       const snapshots = [pr()];
       const result = enrichWithCursor(snapshots, {
-        repo: 'org/repo', env: { WE_FIX_LOOP_LEDGER: join(dir, 'ledger.jsonl') },
+        repo: 'org/repo', requiredChecks: ['test'], env: { WE_FIX_LOOP_LEDGER: join(dir, 'ledger.jsonl') },
         selectCandidates: (candidates, options) => selectAutoProceedCandidates(candidates, { ...options,
           read: () => {
             if (scenario === 'unreadable') throw new Error('read denied');
