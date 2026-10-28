@@ -3294,7 +3294,11 @@ export function planReconcile({
           continue;
         }
       }
-      const unknownEvidence = pr.timeoutRetry?.unknown ? pr.timeoutRetry : pr.owedCiRerunRetry?.unknown ? pr.owedCiRerunRetry : null;
+      // Unknown evidence blocks only policies that can act on that evidence.
+      const unknownEvidence = process.env.WE_CI_TIMEOUT_RERUN_ENABLED !== '0' && pr.timeoutRetry?.unknown
+        ? pr.timeoutRetry
+        : (staleCiRerun !== 'off' || owedCiRerun.rerun !== 'off') && pr.owedCiRerunRetry?.unknown
+          ? pr.owedCiRerunRetry : null;
       if (unknownEvidence) {
         refusals.push({ kind: 'timeout-evidence-unknown', prNumber,
           why: `PR #${prNumber}: evidence read timed out; unknown, not ineligible — will re-read next tick (${unknownEvidence.reason})` });

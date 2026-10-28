@@ -12,6 +12,8 @@ const goTimeoutError = () => Object.assign(new Error('Command failed: gh api rep
 });
 const shimWarning = 'gh-shim: GitHub App role "worker" unavailable (worker: no fresh token cached) - using the legacy App for this call';
 const transportTimeout = 'Get "https://api.github.com/repos/x/y": dial tcp 140.82.112.6:443: i/o timeout';
+// Exact GO_NETWORK_ERROR fixture from helpers/fake-gh-shim.mjs (an executable shim).
+const goNetworkError = 'error connecting to api.github.com\ndial tcp 140.82.112.6:443: i/o timeout\n';
 const shimTimeoutError = () => Object.assign(new Error('Command failed: gh api repos/x/y'), {
   stderr: Buffer.from(`${shimWarning}\n${transportTimeout}\n`),
 });
@@ -21,6 +23,9 @@ const misleadingCheckNames = [
   'CI\nGet "https://api.github.com": dial tcp: i/o timeout',
   'CI\rGet "https://api.github.com": dial tcp: i/o timeout',
   'CI\u2028Get "https://api.github.com": dial tcp: i/o timeout',
+  'dial tcp 140.82.112.6:443: i/o timeout',
+  goNetworkError,
+  `"${goNetworkError}"`,
   '`timed out`', '"timed out"', '--ETIMEDOUT', '../timed out',
   '\u200btimed out', 'ＣＩ timed out', 'CI timed' + ' out',
 ];
@@ -68,6 +73,9 @@ describe('evidence-read timeout is unknown, never ineligible', () => {
     `${shimWarning}\ninvalid check name:\n${transportTimeout}\n`,
     `${shimWarning}\n${transportTimeout}\ninvalid response`,
     `gh-shim: ${transportTimeout}\n`,
+    `${shimWarning}\ninvalid check name:\n${goNetworkError}`,
+    `${shimWarning}\ninvalid check name: "dial tcp 140.82.112.6:443: i/o timeout"\n`,
+    `${goNetworkError}invalid response`,
   ])('does not infer a timeout from shim warnings or embedded diagnostic data: %j', (stderr) => {
     expect(isEvidenceReadTimeout(Object.assign(new Error('Command failed: gh api'), { stderr }))).toBe(false);
   });
@@ -77,9 +85,17 @@ describe('evidence-read timeout is unknown, never ineligible', () => {
     expect(isEvidenceReadTimeout(new Error(`unparseable-required-check-url:${shimWarning}\n${transportTimeout}`))).toBe(false);
   });
 
-  it.each(['timeout', 'owed re-run'])('retries warning-prefixed %s evidence and refuses ordinary healing when still unknown', (reader) => {
+  it.each(['timeout', 'owed re-run'].flatMap(reader => [
+    `${shimWarning}\n${transportTimeout}\n`,
+    goNetworkError,
+    `${shimWarning}\n${goNetworkError}${shimWarning}\n`,
+    `${shimWarning}\n${goNetworkError}`.replaceAll('\n', '\r\n'),
+    'dial tcp 140.82.112.6:443: i/o timeout\n',
+    'dial tcp [2606:50c0:8000::154]:443: i/o timeout\n',
+  ].map(stderr => [reader, stderr])))(
+    'retries %s evidence and refuses ordinary healing when still unknown: %j', (reader, stderr) => {
     const pause = vi.spyOn(Atomics, 'wait').mockReturnValue('ok');
-    const read = vi.fn(() => { throw shimTimeoutError(); });
+    const read = vi.fn(() => { throw Object.assign(new Error('Command failed: gh api'), { stderr: Buffer.from(stderr) }); });
     const p = { ...pr, state: 'OPEN', headRefName: 'lane/x', labels: [], comments: [], mergeStateStatus: 'CLEAN',
       statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'failure',
         detailsUrl: `https://github.com/${repo}/actions/runs/10/job/20` }] };
@@ -105,6 +121,40 @@ describe('evidence-read timeout is unknown, never ineligible', () => {
       pause.mockRestore();
     }
   });
+
+  it.each(['0', '1'].flatMap(timeoutEnabled => ['off', 'once-per-head'].flatMap(staleCiRerun =>
+    ['off', 'on'].flatMap(rerun => ['timeout', 'owed', 'both'].map(source =>
+      ({ timeoutEnabled, staleCiRerun, rerun, source }))))))(
+    'only enabled rerun policies block healing after repeated job-attempt timeouts: %j',
+    ({ timeoutEnabled, staleCiRerun, rerun, source }) => {
+      vi.stubEnv('WE_CI_TIMEOUT_RERUN_ENABLED', timeoutEnabled);
+      const pause = vi.spyOn(Atomics, 'wait').mockReturnValue('ok');
+      const readJobAttempt = vi.fn(() => { throw timeoutError(); });
+      try {
+        const p = { ...pr, state: 'OPEN', headRefName: 'lane/x', labels: [], comments: [], mergeStateStatus: 'CLEAN',
+          statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'failure',
+            detailsUrl: `https://github.com/${repo}/actions/runs/10/job/20` }] };
+        const result = enrichPrsWithMainRedFacts([p], { repo, requiredChecks: ['gate'], readJobAttempt,
+          readBudget: () => ({ confirmed: 0, pending: false }),
+          readMainRuns: () => [{ status: 'completed', conclusion: 'success', headSha: 'b'.repeat(40), updatedAt: '2026-10-26T19:00:00Z' }],
+          readAheadBy: () => 1, readMainLatestCheckRuns: () => [], readMainFixedSignatureFacts: () => null });
+        expect(result.prs[0].owedCiRerunRetry).toMatchObject({ eligible: false, unknown: true });
+        expect(readJobAttempt).toHaveBeenCalledTimes(4);
+        expect(pause.mock.calls.map(call => call[3])).toEqual(EVIDENCE_READ_BACKOFF_MS);
+        if (source !== 'owed') result.prs[0].timeoutRetry = result.prs[0].owedCiRerunRetry;
+        if (source === 'timeout') delete result.prs[0].owedCiRerunRetry;
+        const out = planReconcile({ ...result, now: Date.parse('2026-10-26T20:00:00Z'),
+          requiredChecks: ['gate'], reviewTiming: { startAfter: 'ci-green' },
+          staleCiRerun, owedCiRerun: { rerun, maxRerunsPerHead: 1 } });
+        const shouldBlock = (source !== 'owed' && timeoutEnabled === '1')
+          || (source !== 'timeout' && (staleCiRerun !== 'off' || rerun !== 'off'));
+        expect(out.refusals.some(r => r.kind === 'timeout-evidence-unknown')).toBe(shouldBlock);
+        expect(out.dispatch.map(d => d.kind)).toEqual(shouldBlock ? [] : ['ci-heal']);
+      } finally {
+        pause.mockRestore();
+        vi.unstubAllEnvs();
+      }
+    });
 
   it.each(misleadingCheckNames)('keeps malformed check %j ineligible so ordinary ci-heal can proceed', (name) => {
     const pause = vi.spyOn(Atomics, 'wait').mockReturnValue('ok');

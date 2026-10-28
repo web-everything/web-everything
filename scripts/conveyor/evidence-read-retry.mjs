@@ -8,13 +8,20 @@ export function isEvidenceReadTimeout(error) {
   // Validation/parse errors can quote arbitrary check names. Only a Go HTTP
   // transport diagnostic (gh stderr, or the bare diagnostic) is timeout evidence.
   // Only process stderr may contain shim warnings around the gh diagnostic.
-  // Keep the remaining diagnostic anchored as a whole: validation messages and
-  // arbitrary multiline payloads must not turn a quoted check name into a timeout.
+  // Classify complete lines, but require EVERY remaining line to be a transport
+  // diagnostic: validation text quoting one must not become timeout evidence.
   const diagnostic = (error?.stderr != null
     ? String(error.stderr).split(/\r?\n/).filter(line => !line.startsWith('gh-shim:')).join('\n')
     : String(error?.message ?? '')).trim();
-  const request = /^(?:Get|Head|Post|Put|Patch|Delete|Options) "https?:\/\/[^"\r\n]+": ([^\r\n]+)$/.exec(diagnostic);
-  return !!request && /(?:\bi\/o timeout|\bTLS handshake timeout|\bcontext deadline exceeded|\bClient\.Timeout exceeded while awaiting headers|\b(?:connection|operation) timed out)\)?$/.test(request[1]);
+  const lines = diagnostic.split(/\r?\n/);
+  const dialTimeout = /^dial tcp [^\s"']+: i\/o timeout$/;
+  // gh may prefix a bare dial error with this connection summary.
+  if (lines[0] === 'error connecting to api.github.com' && dialTimeout.test(lines[1] ?? '')) lines.shift();
+  return lines.every(line => {
+    if (dialTimeout.test(line)) return true;
+    const request = /^(?:Get|Head|Post|Put|Patch|Delete|Options) "https?:\/\/[^"\r\n]+": ([^\r\n]+)$/.exec(line);
+    return !!request && /(?:\bi\/o timeout|\bTLS handshake timeout|\bcontext deadline exceeded|\bClient\.Timeout exceeded while awaiting headers|\b(?:connection|operation) timed out)\)?$/.test(request[1]);
+  });
 }
 
 export function syncSleep(ms) {
