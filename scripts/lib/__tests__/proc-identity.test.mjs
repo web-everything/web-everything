@@ -7,7 +7,7 @@ const UID = 501;
 const BOOT = '8b61301a-27f4-4828-9ce1-9fc23bf14377';
 const OTHER_BOOT = '7b61301a-27f4-4828-9ce1-9fc23bf14377';
 const START = 'Tue Oct 28 13:30:00 2026';
-const HEADER = '  UID   PID  PPID  PGID STAT                  STARTED\n';
+const HEADER = ' RUID   PID  PPID  PGID STAT                  STARTED\n';
 const enoent = () => Object.assign(new Error('missing process'), { code: 'ENOENT' });
 
 function stat({ pid = PID, pgid = PID, startTime = '987654', state = 'S' } = {}) {
@@ -59,6 +59,36 @@ const linuxIdentity = { pid: PID, startTime: '987654', bootId: BOOT, uid: UID, s
 const darwinIdentity = { ...linuxIdentity, startTime: START };
 
 describe('readIdentity parsers', () => {
+  it.each(['Sgarbled', 'R?', 'S\u0000'])('macOS malformed state %s stays unknown throughout', (state) => {
+    const deps = darwinDeps({ output: HEADER + psRow({ state }) });
+    expect(readIdentity(PID, deps).status).toBe('unknown');
+    expect(liveness(darwinIdentity, deps)).toBe('unknown');
+    const groupDeps = darwinDeps({ output: HEADER + psRow() + psRow({ pid: PID + 1, state }) });
+    expect(listGroup(PID, groupDeps)).toEqual({ status: 'unknown', reason: expect.any(String) });
+  });
+
+  it.each(['+', '<', '>', 'A', 'E', 'L', 'N', 'S', 's', 'V', 'W', 'X'])('macOS accepts documented state modifier %s', (modifier) => {
+    const deps = darwinDeps({ output: HEADER + psRow({ state: `S${modifier}` }) });
+    expect(readIdentity(PID, deps)).toEqual({ status: 'ok', identity: darwinIdentity });
+    expect(liveness(darwinIdentity, deps)).toBe('alive');
+    expect(listGroup(PID, deps)).toEqual({ status: 'ok', identities: [darwinIdentity] });
+  });
+
+  it('macOS reads the real uid, not a differing effective uid', () => {
+    const deps = darwinDeps();
+    const exec = deps.exec;
+    deps.exec = vi.fn((file, args, options) => {
+      if (file === 'ps') {
+        const uid = args.includes('ruid,pid,ppid,pgid,stat,lstart') ? UID : UID + 1;
+        return HEADER + psRow({ uid });
+      }
+      return exec(file, args, options);
+    });
+    expect(readIdentity(PID, deps)).toEqual({ status: 'ok', identity: darwinIdentity });
+    expect(liveness({ ...darwinIdentity, uid: UID + 1 }, deps)).toBe('dead');
+    expect(listGroup(PID, deps)).toEqual({ status: 'ok', identities: [darwinIdentity] });
+  });
+
   it.each(['linux', 'darwin'])('%s unrecognised process state stays unknown throughout', (platform) => {
     const deps = platform === 'linux'
       ? linuxDeps({ processes: [{ pid: PID, state: 'Q' }] })
@@ -252,8 +282,8 @@ describe('bounded probes fail closed', () => {
     expect(readIdentity(PID, deps).status).toBe('ok');
     expect(currentBootId(deps)).toBe(BOOT);
     expect(listGroup(PID, deps).status).toBe('ok');
-    expect(deps.exec).toHaveBeenCalledWith('ps', ['-o', 'uid,pid,ppid,pgid,stat,lstart', '-p', String(PID)], expect.any(Object));
-    expect(deps.exec).toHaveBeenCalledWith('ps', ['-A', '-o', 'uid,pid,ppid,pgid,stat,lstart'], expect.any(Object));
+    expect(deps.exec).toHaveBeenCalledWith('ps', ['-o', 'ruid,pid,ppid,pgid,stat,lstart', '-p', String(PID)], expect.any(Object));
+    expect(deps.exec).toHaveBeenCalledWith('ps', ['-A', '-o', 'ruid,pid,ppid,pgid,stat,lstart'], expect.any(Object));
     expect(deps.exec).toHaveBeenCalledWith('sysctl', ['-n', 'kern.bootsessionuuid'], expect.any(Object));
     deps.exec.mock.calls.forEach(([file, args, options]) => {
       expect(['ps', 'sysctl']).toContain(file);
@@ -353,7 +383,7 @@ describe('listGroup', () => {
       return exec(file, ...args);
     });
     expect(listGroup(PID, deps)).toEqual({ status: 'unknown', reason: expect.any(String) });
-    expect(deps.exec).toHaveBeenCalledWith('ps', ['-A', '-o', 'uid,pid,ppid,pgid,stat,lstart'], expect.any(Object));
+    expect(deps.exec).toHaveBeenCalledWith('ps', ['-A', '-o', 'ruid,pid,ppid,pgid,stat,lstart'], expect.any(Object));
   });
 });
 

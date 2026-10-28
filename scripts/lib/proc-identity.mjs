@@ -124,14 +124,14 @@ function linuxProcess(pid, io) {
 function psProcesses(output) {
   const rows = output.trim() ? output.trim().split('\n') : [];
   if (rows.length > MAX_ENTRIES) throw new Error('ps row limit reached; inspect manually');
-  if (rows.length && /^\s*UID\s+PID\s+PPID\s+PGID\s+STAT\s+STARTED\s*$/.test(rows[0])) rows.shift();
+  if (rows.length && /^\s*RUID\s+PID\s+PPID\s+PGID\s+STAT\s+STARTED\s*$/.test(rows[0])) rows.shift();
   return rows.map((row) => {
     const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+([A-Za-z]\S*)\s+(.+?)\s*$/.exec(row);
     if (!match) throw new Error('Malformed ps row');
     const [, uid, pid, ppid, pgid, state, start] = match;
     const startTime = start.trim().replace(/\s+/g, ' ');
     if (!unsigned(Number(uid)) || !positive(Number(pid)) || !unsigned(Number(ppid)) || !positive(Number(pgid)) ||
-        !/^[IRSTUZ]$/.test(state[0]) || !validPsStart(startTime)) {
+        !/^[IRSTUZ][+<>AELNSsVWX]*$/.test(state) || !validPsStart(startTime)) {
       throw new Error('Incomplete ps identity');
     }
     return { pid: Number(pid), pgid: Number(pgid), uid: Number(uid), startTime, state: state[0] };
@@ -153,7 +153,7 @@ export function readIdentity(pid, deps = {}) {
         throw error;
       }
     } else if (io.platform === 'darwin') {
-      const rows = psProcesses(exec(io, 'ps', ['-o', 'uid,pid,ppid,pgid,stat,lstart', '-p', String(pid)]));
+      const rows = psProcesses(exec(io, 'ps', ['-o', 'ruid,pid,ppid,pgid,stat,lstart', '-p', String(pid)]));
       if (!rows.length) return { status: 'gone' };
       if (rows.length !== 1 || rows[0].pid !== pid) return unknown('Unexpected ps identity');
       entry = rows[0];
@@ -192,7 +192,7 @@ export function listGroup(pgid, deps = {}) {
     if (!bootId) return unknown('Boot identity unavailable');
     let rows;
     if (io.platform === 'darwin') {
-      rows = psProcesses(exec(io, 'ps', ['-A', '-o', 'uid,pid,ppid,pgid,stat,lstart']));
+      rows = psProcesses(exec(io, 'ps', ['-A', '-o', 'ruid,pid,ppid,pgid,stat,lstart']));
     } else if (io.platform === 'linux') {
       const names = io.readdir('/proc');
       if (!Array.isArray(names) || names.length > MAX_ENTRIES) throw new Error('procfs entry limit');
