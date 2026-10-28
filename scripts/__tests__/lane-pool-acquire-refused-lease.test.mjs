@@ -14,7 +14,7 @@
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, chmodSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -117,6 +117,48 @@ function setUpDanglingAheadCommit(lane) {
 }
 
 describe('#3407 — a refused acquire never leaves the lane held by the failed requester', () => {
+  it.each(['replacement', 'missing', 'corrupt', 'missing-holder'])('refuses --expect-holder with %s lease evidence without mutation', (kind) => {
+    expect(runPool(['provision', '--count=1', ...poolArgs()]).code).toBe(0);
+    const lane = join(poolRoot, 'refused', 'lane-1');
+    const marker = leaseMarker(lane);
+    const lease = kind === 'missing' ? null : kind === 'corrupt' ? '{' : JSON.stringify({
+      session: 'owner', holder: kind === 'replacement' ? 'replacement-holder' : undefined,
+      acquiredAt: '2000-01-01T00:00:00.000Z',
+    });
+    if (lease !== null) writeFileSync(marker, lease);
+    writeFileSync(join(lane, 'file.txt'), 'keep tracked work\n');
+    writeFileSync(join(lane, 'untracked.txt'), 'keep untracked work\n');
+    const head = readFileSync(join(lane, '.git', 'HEAD'), 'utf8');
+    const index = readFileSync(join(lane, '.git', 'index'));
+    const config = readFileSync(join(lane, '.git', 'config'), 'utf8');
+
+    const result = runPool(['acquire', '--lane=1', ...poolArgs(), '--session=owner', '--force', '--expect-holder=original-holder']);
+
+    expect(result.code).not.toBe(0);
+    expect(result.err).toMatch(/expected lease holder original-holder, found .*refusing acquire/);
+    expect(result.out.trim()).toBe('');
+    expect(existsSync(marker) ? readFileSync(marker, 'utf8') : null).toBe(lease);
+    expect(readFileSync(join(lane, '.git', 'HEAD'), 'utf8')).toBe(head);
+    expect(readFileSync(join(lane, '.git', 'index'))).toEqual(index);
+    expect(readFileSync(join(lane, '.git', 'config'), 'utf8')).toBe(config);
+    expect(readFileSync(join(lane, 'file.txt'), 'utf8')).toBe('keep tracked work\n');
+    expect(readFileSync(join(lane, 'untracked.txt'), 'utf8')).toBe('keep untracked work\n');
+  });
+
+  it('accepts --expect-holder matching the current lease and preserves its holder', () => {
+    expect(runPool(['provision', '--count=1', ...poolArgs()]).code).toBe(0);
+    const first = runPool(['acquire', '--lane=1', ...poolArgs(), '--session=owner', '--json']);
+    expect(first.code).toBe(0);
+    const { path: lane, holder } = JSON.parse(first.out);
+
+    const result = runPool(['acquire', '--lane=1', ...poolArgs(), '--session=owner', `--expect-holder=${holder}`, '--json'], { LANE_SESSION: holder });
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.out)).toMatchObject({ path: lane, holder });
+    expect(JSON.parse(readFileSync(leaseMarker(lane), 'utf8')).holder).toBe(holder);
+    expect(readFileSync(join(lane, 'file.txt'), 'utf8')).toBe('v1\n');
+  });
+
   it('EXPLICIT-LANE #3390 dirty/ahead refusal releases the lease it just claimed (the ALREADY-fixed call site — a regression guard, not new coverage)', () => {
     const provision = runPool(['provision', '--count=1', ...poolArgs()]);
     expect(provision.code).toBe(0);

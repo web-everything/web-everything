@@ -2,12 +2,16 @@
 import { PROTECTION_PATHS } from './human-review-surfaces.mjs';
 import { SANDBOX_TOKEN_RE } from './permission-change.mjs';
 import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { cascadePolicy, platformPreference } from './policy-cascade.mjs';
+
+const SETTINGS_PATH = join(dirname(fileURLToPath(import.meta.url)), '../settings/direction-aware-human.json');
 
 /** R131: standard → platform → tool → environment; shadow is the safe fallback. */
 export function resolveDirectionAwareMode({ env = process.env, readFile = readFileSync } = {}) {
   let tool;
-  try { tool = JSON.parse(String(readFile(new URL('../settings/direction-aware-human.json', import.meta.url), 'utf8')))?.directionAwareHuman; } catch { /* absent layer */ }
+  try { tool = JSON.parse(String(readFile(SETTINGS_PATH, 'utf8')))?.directionAwareHuman; } catch { /* absent layer */ }
   const valid = value => value === 'shadow' || value === 'live';
   const raw = env?.WE_DIRECTION_AWARE_HUMAN;
   const platform = platformPreference('directionAwareHuman', { env, readFile });
@@ -19,7 +23,7 @@ export function resolveDirectionAwareMode({ env = process.env, readFile = readFi
 
 const SURFACE = 'scripts/lib/human-review-surfaces.mjs';
 const CLASSIFIERS = new Set(['scripts/lib/review-escalation.mjs', 'scripts/lib/permission-change.mjs',
-  'scripts/lib/direction-aware-human.mjs', 'scripts/review-core-cli.mjs', 'scripts/settings/human-review-surfaces.json',
+  'scripts/lib/direction-aware-human.mjs', 'scripts/lib/review-shape.mjs', 'scripts/review-core-cli.mjs', 'scripts/settings/human-review-surfaces.json',
   'scripts/lib/policy-cascade.mjs', 'scripts/lib/merge-queue-enqueue.mjs', 'scripts/lib/read-only-ops.mjs', 'scripts/lib/import-closure.mjs', 'scripts/operations/registry.mjs',
   'scripts/operations/step-kinds.mjs', 'scripts/settings/direction-aware-human.json']);
 const ALLOW_LISTS = new Set(['scripts/operations/run.mjs', 'scripts/operations/scheduled-sweep.mjs',
@@ -192,12 +196,15 @@ function readOnlyAddition(rows, readOnlyOps, hunk) {
 /** Inputs are evidence from the caller; unavailable or malformed evidence preserves human review. */
 export function proposeHumanRequired({ humanRequired, otherHumanForced, hits, files, hunksOf,
   readOnlyOps, protectionPaths = PROTECTION_PATHS } = {}) {
+  // Self-changes require review even when today's touch-set did not force a hold.
+  if (Array.isArray(files)) {
+    for (const file of files) if (CLASSIFIERS.has(file)) return yes(`classifier self-change: ${file}`);
+  }
   if (humanRequired === false) return { proposed: false, reason: 'not human-required today' };
   if (otherHumanForced) return yes('other human-forced trigger');
   try {
     if (humanRequired !== true || !Array.isArray(files) || !files.length
       || files.some(f => typeof f !== 'string' || !f)) throw new Error('incomplete changed files');
-    for (const file of files) if (CLASSIFIERS.has(file)) return yes(`classifier self-change: ${file}`);
     if (!(readOnlyOps instanceof Set) || !readOnlyOps.size) return yes('empty readOnlyOps');
     if (!Array.isArray(protectionPaths) || protectionPaths.some(re => !(re instanceof RegExp))) throw new Error('invalid protectionPaths');
     const hunks = new Map(files.map(file => [file, hunksOf(file)]));

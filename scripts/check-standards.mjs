@@ -34,6 +34,7 @@ import { dirname, join, relative, resolve, isAbsolute, sep } from 'node:path';
 import { isLaneLocus, resolveReal } from './guard-lane.mjs';
 import { createRequire } from 'node:module';
 import { renderInventory, spliceInventory } from './gen-inventory.mjs';
+import { assertTimingKeys } from './ci/shard-assign.mjs';
 import { parseClaims, mineFiles, porcelainFiles, partitionFindings, partitionLocal, linkedFilesFor } from './readiness/claimScope.mjs';
 import { checkDemos } from './check-demos.mjs';
 import { buildReport, source as reportSource, finding as reportFinding, section as reportSection } from './lib/buildReport.mjs';
@@ -2553,7 +2554,7 @@ else try {
   // Timing merges have the same silent last-wins failure as package manifests.
   const timingSource = 'scripts/ci/test-timings.json';
   const timingRaw = readFileSync(join(ROOT, timingSource), 'utf8');
-  JSON.parse(timingRaw); // Invalid JSON must fail this check too.
+  assertTimingKeys(JSON.parse(timingRaw)); // Refuse invalid JSON and nonportable timing keys.
   for (const e of validateNoDuplicateManifestKeys(timingRaw, timingSource)) err(e.message, e.descriptor);
   // (1) gather every in-repo package.json manifest (root + nested, excluding node_modules) → name + exports.
   const manifests = [];
