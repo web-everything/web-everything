@@ -120,6 +120,19 @@ export default {
       readChecks: () => ({ head, complete: true, runs: [run(101, 'failure'), run(102, 'success', 902)] }) });
     if (writes.includes('reserve') || writes.includes('post')) violations.push('independent same-name workflow success released a failed suite');
 
+    // Cancellation/skip evidence must be newer than the hold it would release.
+    for (const conclusion of ['cancelled', 'skipped']) {
+      for (const completed_at of ['2026-10-13T11:59:00Z', comments[0].createdAt]) {
+        writes.length = 0;
+        const [held] = io.enrichPrsWithStandDownAutoProceed([pr], { ...writerOptions,
+          readChecks: () => ({ head, complete: true, runs: [{ ...run(102, conclusion), completed_at }] }),
+        });
+        if (writes.includes('reserve') || writes.includes('post') || countUnresolvedStandDowns(held.comments) !== 1) {
+          violations.push(`${conclusion} completed at ${completed_at} released a later or simultaneous stand-down`);
+        }
+      }
+    }
+
     // Use the real REST reader, classifier and writer: same suite/name does not prove a rerun.
     const sameAttemptWrites = {};
     for (const conclusion of ['success', 'cancelled', 'skipped']) {
@@ -192,7 +205,10 @@ export default {
     const [refreshed] = io.enrichPrsWithStandDownAutoProceed([lapsed], { ...writerOptions,
       readComments: () => ++threadReads === 1 ? parked : [...parked, question],
     });
-    const plannedPr = lapse(refreshed);
+    const plannedPr = refreshed;
+    if (JSON.stringify(plannedPr.comments[0].standDownLapsed) !== JSON.stringify(lapsed.comments[0].standDownLapsed)) {
+      violations.push('held candidate lost its snapshot lapse annotation after the thread refresh');
+    }
     const racePlan = planReconcile({ prs: [plannedPr], agents: [], requiredChecks: ['test'] });
     const refreshedThreadRace = { threadReads, writes: [...writes],
       unresolved: countUnresolvedStandDowns(plannedPr.comments),

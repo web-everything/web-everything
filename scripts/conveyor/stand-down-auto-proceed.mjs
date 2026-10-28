@@ -79,7 +79,8 @@ export function classifyStandDownAutoProceed({ pr, requiredChecks, checks, redMa
       && conclusion(old) === 'FAILURE'
       && Date.parse(old.completed_at) <= Date.parse(target.createdAt)));
   const kind = failures.length ? 'c' : reruns.length ? 'a'
-    : latest.some(r => ['CANCELLED', 'SKIPPED'].includes(conclusion(r))) ? 'b' : redMain ? 'c' : null;
+    : latest.some(r => ['CANCELLED', 'SKIPPED'].includes(conclusion(r))
+      && Date.parse(r.completed_at) > Date.parse(target.createdAt)) ? 'b' : redMain ? 'c' : null;
   if (!kind) return hold('operator answer required: no recovered CI evidence');
   const labels = { a: 'passed a later rerun on the same head', b: 'cancelled/skipped rather than failed', c: 'main\'s own CI was red; fixLoopRedMainLapse confirms the park no longer holds' };
   const details = JSON.stringify({ checks: runs.filter(r => requiredChecks.includes(r.name))
