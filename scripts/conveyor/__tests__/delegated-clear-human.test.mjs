@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  R11_REASON, resolveDelegatedClearHumanMode, evaluateEligibility, runDelegatedClearHuman,
+  clearHumanViaCli, R11_REASON, resolveDelegatedClearHumanMode, evaluateEligibility, runDelegatedClearHuman,
 } from '../delegated-clear-human.mjs';
 
 const HEAD = 'a'.repeat(40);
@@ -95,6 +95,11 @@ describe('runDelegatedClearHuman', () => {
     for (const mode of ['bogus', undefined, 'ON']) {
       await runDelegatedClearHuman({ prs: [pr()], mode, ...deps(), emit: async (e) => events.push(e), clearHuman: async (a) => calls.push(a) });
     }
+    expect(calls).toEqual([]);
+  });
+  it('the default CLI writer refuses until review-set-label can pin the head (fail closed)', async () => {
+    const calls = [];
+    await expect(clearHumanViaCli({ pr: 7, head: HEAD, reason: R11_REASON, actor: 'chalbert', exec: (...a) => calls.push(a) })).rejects.toThrow(/pin/);
     expect(calls).toEqual([]);
   });
   it('flags a head that moved right after the clear', async () => {
