@@ -275,6 +275,8 @@ describe('spawnPassOnce — env passthrough to the child process (#gh-write-burs
   beforeEach(() => {
     dir = mkdtempSync(join(process.env.TMPDIR, 'pass-env-'));
     ports = { store: createJobStore(join(dir, 'jobs')), readStart: () => 'fixture-start',
+      // Synthetic children own no real process group; never probe host pids for them.
+      probe: () => 'dead', reapGroup: () => true,
       policyOptions: { platform: null, env: {} } };
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));

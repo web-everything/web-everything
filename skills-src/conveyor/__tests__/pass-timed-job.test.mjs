@@ -100,6 +100,41 @@ function timingLines(f) {
 }
 
 describe('#5755 independent timed pass jobs', () => {
+  it.each([0, 7])('confirms the process group gone before completing child exit %s', async code => {
+    const f = fixture();
+    const reapGroup = vi.fn(() => true);
+    const pending = runPassAsTimedJob(descriptor('branch-drift'), { ...f.ports, reapGroup });
+    await vi.advanceTimersByTimeAsync(0);
+    const [record] = f.store.list().records;
+    f.children[0].finish(code);
+    await expect(pending).resolves.toEqual({ code, signal: null });
+    expect(reapGroup).toHaveBeenCalledWith(record.job.handle, Date.now(), { requireConfirmedDeath: true });
+    expect(f.store.read(record.id).job.handle).toBeNull();
+  });
+
+  it.each(['pending', 'throws', 'unknown-owner'])('retains exclusion when child-exit cleanup is %s', async mode => {
+    const f = fixture();
+    const reapGroup = vi.fn(() => {
+      if (mode === 'throws') throw new Error('group observation unavailable');
+      return false;
+    });
+    const ports = { ...f.ports, reapGroup };
+    const pass = descriptor('branch-drift');
+    const pending = runPassAsTimedJob(pass, ports);
+    await vi.advanceTimersByTimeAsync(0);
+    const [record] = f.store.list().records;
+    f.children[0].finish();
+    if (mode === 'unknown-owner') f.probe.mockReturnValue('unknown');
+    await expect(pending).resolves.toEqual({ outcome: 'quarantined' });
+    expect(f.store.read(record.id).job).toMatchObject({
+      status: 'running', handle: record.job.handle, passQuarantine: true,
+    });
+    expect(f.alerts).toHaveLength(1);
+    await expect(runPassAsTimedJob(pass, { ...ports, store: createJobStore(f.store.dir) }))
+      .resolves.toEqual({ outcome: 'quarantined' });
+    expect(f.spawnFn).toHaveBeenCalledTimes(1);
+  });
+
   it('runner completes other passes while one is slow, preserving result order', async () => {
     const f = fixture();
     const passes = ['branch-drift', 'lease-reaper', 'session-reaper'].map(name => descriptor(name));

@@ -351,6 +351,15 @@ async function executeTimedPass({ passName, repo, entry }, ports) {
   const reapGroup = ports.reapGroup ?? (ports.probe
     ? handle => probe(handle) === 'dead'
     : (handle, notAfterMs, options) => reapDeadGroup(handle, { ...options, notAfterMs }));
+  const observeOwner = handle => {
+    try { return probe(handle); } catch { return 'unknown'; }
+  };
+  const confirmGroupGone = handle => {
+    try {
+      return observeOwner(handle) === 'dead'
+        && reapGroup(handle, now(), { requireConfirmedDeath: true }) === true;
+    } catch { return false; }
+  };
   const kindDef = defineJobKind({ kind: `pass-${createHash('sha256').update(passName).digest('hex').slice(0, 24)}`, entry: entry.script,
     codeMode: 'mutates-tree', prepareWorktree: () => root, maxAttempts: 1, resumable: false });
   const listed = store.list();
@@ -424,13 +433,19 @@ async function executeTimedPass({ passName, repo, entry }, ports) {
         || !TERMINAL_JOB_STATUSES.includes(store.read(id).job.status);
       return finish({ outcome: quarantine ? 'quarantined' : 'timeout' }, quarantine ? 'quarantined' : 'timeout', quarantine);
     }
-    if (result) return finish(result, result.code === 0 && !result.spawnError ? 'acted' : 'failed');
+    if (result) {
+      // A child result does not prove its subprocess group is gone.
+      // Keep the durable claim and alert if reaping cannot confirm absence.
+      if (record.job.handle && !confirmGroupGone(record.job.handle)) {
+        return finish({ outcome: 'quarantined' }, 'quarantined', true);
+      }
+      return finish(result, result.code === 0 && !result.spawnError ? 'acted' : 'failed');
+    }
     if (TERMINAL_JOB_STATUSES.includes(record.job.status)) return finish({ code: null, signal: null,
       spawnError: record.job.error ?? 'pass exited without a recorded result' }, 'failed');
     // Reattached owners have no local ChildProcess; judge them through shared recovery.
-    if (!childResult && probe(record.job.handle) !== 'alive') {
-      const quarantine = probe(record.job.handle) !== 'dead'
-        || !reapGroup(record.job.handle, now(), { requireConfirmedDeath: true });
+    if (!childResult && observeOwner(record.job.handle) !== 'alive') {
+      const quarantine = !confirmGroupGone(record.job.handle);
       return finish(quarantine ? { outcome: 'quarantined' } : { code: null, signal: null,
         spawnError: 'pass owner exited without a recorded result' }, quarantine ? 'quarantined' : 'failed', quarantine);
     }
