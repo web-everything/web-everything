@@ -157,8 +157,16 @@ export function enrichPrsWithStandDownAutoProceed(prs, { repo, requiredChecks, d
     if (!selected.has(pr)) { log(`R123 PR #${pr.number}: deferred by 3-PR tick bound; operator answer remains available`); return pr; }
     // Keep the latest complete thread even when a later decision or IO step refuses the write.
     let fresh = pr;
+    // Lapse annotations belong to the snapshot, not GitHub's comment feed. Preserve them
+    // by identity across both reads, without carrying them onto an edited or new comment.
+    const lapsed = new Map(pr.comments.filter(c => c?.id != null && c.standDownLapsed).map(c => [c.id, c]));
+    const refreshComments = () => readComments(pr.number, { repo }).map(c => {
+      const previous = lapsed.get(c?.id);
+      return previous && previous.body === c.body
+        ? { ...c, standDownLapsed: previous.standDownLapsed } : c;
+    });
     try {
-      const comments = readComments(pr.number, { repo });
+      const comments = refreshComments();
       fresh = { ...pr, comments };
       // Cheap first pass rejects judgment holds without reading checks or main history.
       if (!hasAutoProceedCandidate(fresh)) return fresh;
@@ -169,7 +177,7 @@ export function enrichPrsWithStandDownAutoProceed(prs, { repo, requiredChecks, d
         redMainContext: context, prScopedChecks: scoped });
       if (decision.action !== 'auto-proceed') { log(`R123 PR #${pr.number}: ${decision.why}`); return fresh; }
       // A later operator question/answer may have arrived during check reads. Reclassify that full thread.
-      const currentComments = readComments(pr.number, { repo });
+      const currentComments = refreshComments();
       fresh = { ...pr, comments: currentComments };
       const current = classifyStandDownAutoProceed({ pr: fresh, requiredChecks, checks,
         redMainContext: context, prScopedChecks: scoped });

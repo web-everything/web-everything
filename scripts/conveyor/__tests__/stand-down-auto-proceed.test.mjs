@@ -103,6 +103,18 @@ it('holds when the earlier failure follows the stand-down', () => {
   assertAuthorizationBoundary(args([{ ...rerun[0], completed_at: '2026-10-13T22:55:01Z' }, rerun[1]]),
     'hold', /no recovered CI evidence/);
 });
+it.each(['cancelled', 'skipped'])('requires %s completion after the stand-down', conclusion => {
+  for (const completedAt of ['2026-10-13T22:54:59Z', at]) {
+    assertAuthorizationBoundary(args([run(2, conclusion, completedAt)]),
+      'hold', /no recovered CI evidence/);
+  }
+  for (const completedAt of [null, undefined, 'unknown']) {
+    assertAuthorizationBoundary(args([{ ...run(2, conclusion), completed_at: completedAt }]),
+      'hold', /missing, pending or unknown required check/);
+  }
+  const decision = assertAuthorizationBoundary(args([run(2, conclusion, '2026-10-13T22:55:01Z')]), 'auto-proceed');
+  expect(decision.kind).toBe('b');
+});
 it('accepts an earlier failure at the stand-down boundary and success immediately afterward', () => {
   assertAuthorizationBoundary(args([{ ...rerun[0], completed_at: at },
     { ...rerun[1], completed_at: '2026-10-13T22:55:01Z' }]), 'auto-proceed');
@@ -600,7 +612,32 @@ it.each(['head-moved', 'new-question', 'unreadable-thread', 'unreadable-checks',
     expect(posts).toBe(scenario === 'untrusted-post' ? 1 : 0);
     expect(isOperatorAnswerStandDownSuperseded(result[0].comments, 0)).toBe(false);
   });
-it.each(['new-question', 'new-ci-hold', 'operator-answer', 'reservation-denied', 'head-moved',
+it.each(['held', 'posted', 'edited'])('matches lapse annotations by comment ID on a %s refresh', scenario => {
+  const original = stand('fix-loop-exhausted');
+  const snapshot = annotateLapsedStandDowns(pr([original]), {
+    lapseOnNewHead: 'off', redMainLapse: () => true, onLapse: () => {},
+  });
+  const refreshed = [{ id: 'NOTE', author, body: 'new first comment' },
+    scenario === 'edited' ? stand('needs-judgment') : { ...original }];
+  const reserve = vi.fn(() => true);
+  const post = vi.fn(({ body }) => ({ body, author }));
+  const [result] = enrichPrsWithStandDownAutoProceed([snapshot], {
+    repo: 'org/repo', requiredChecks: ['test'], readContext: () => null, readScopedChecks: () => [],
+    readComments: () => refreshed, readHead: () => head,
+    readChecks: () => evidence(scenario === 'held' ? [run(2, 'failure')] : rerun),
+    reserve, post, log: () => {},
+  });
+  expect(snapshot.comments[0].standDownLapsed).toBeDefined();
+  expect(result.comments[0]).toEqual(refreshed[0]);
+  expect(result.comments[1].standDownLapsed).toEqual(scenario === 'edited'
+    ? undefined : snapshot.comments[0].standDownLapsed);
+  expect(result.comments[1].body).toBe(refreshed[1].body);
+  expect(refreshed[1].standDownLapsed).toBeUndefined();
+  expect(reserve).toHaveBeenCalledTimes(scenario === 'posted' ? 1 : 0);
+  expect(post).toHaveBeenCalledTimes(scenario === 'posted' ? 1 : 0);
+  if (scenario === 'edited') expect(countUnresolvedStandDowns(result.comments)).toBe(1);
+});
+it.each(['new-question', 'new-ci-hold', 'operator-answer', 'reservation-denied', 'head-moved', 'checks-hold',
   'reservation-error', 'post-error', 'untrusted-post', 'second-read-error', 'checks-error'])(
   'preserves the latest complete thread for downstream planning: %s', scenario => {
     const original = [stand('fix-loop-exhausted')];
@@ -633,19 +670,21 @@ it.each(['new-question', 'new-ci-hold', 'operator-answer', 'reservation-denied',
         return latest;
       }, readChecks: () => {
         if (scenario === 'checks-error') throw new Error('checks unavailable');
+        if (scenario === 'checks-hold') return evidence([run(2, 'failure')]);
         return evidence(rerun);
       }, readHead: () => scenario === 'head-moved' ? 'b'.repeat(40) : head,
       reserve, post, log: () => {},
     });
-    expect(result.comments).toEqual(['second-read-error', 'checks-error'].includes(scenario) ? first : latest);
+    const expected = ['second-read-error', 'checks-error', 'checks-hold'].includes(scenario) ? first : latest;
+    expect(result.comments).toEqual([snapshot.comments[0], ...expected.slice(1)]);
+    expect(result.comments[0].standDownLapsed).toEqual(snapshot.comments[0].standDownLapsed);
     if (['new-question', 'new-ci-hold', 'operator-answer'].includes(scenario)) {
       expect(reserve).not.toHaveBeenCalled();
       expect(post).not.toHaveBeenCalled();
     }
     if (['new-question', 'new-ci-hold'].includes(scenario)) {
-      const refreshed = lapse(result);
-      expect(countUnresolvedStandDowns(refreshed.comments)).toBe(1);
-      const plan = planReconcile({ prs: [refreshed], agents: [], requiredChecks: ['test'] });
+      expect(countUnresolvedStandDowns(result.comments)).toBe(1);
+      const plan = planReconcile({ prs: [result], agents: [], requiredChecks: ['test'] });
       expect(plan.dispatch).toEqual([]);
       expect(plan.refusals.map(row => row.kind)).toContain('stood-down');
     }
