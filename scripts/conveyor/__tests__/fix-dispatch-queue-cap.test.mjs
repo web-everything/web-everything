@@ -13,6 +13,7 @@ import { runReconcileCiHealDispatch } from '../../operations/ci-heal-pr-dispatch
 import {
   QUEUE_CAP_REFUSAL_MARKER, QUEUE_CAP_REFUSAL_CAP, countQueueCapRefusals,
   summarizeCapacityDeferral, FIX_STARVED_CAPACITY_MARKER, buildFixStarvedCapacityComment,
+  buildCapacityBaselineComment,
   hasFixStarvedCapacityAlert, buildQueueCapRefusalComment, queueCapHeadLine,
 } from '../queue-cap-refusal-count.mjs';
 import { NOTE_COMMENT_MARKER } from '../reconcile-note-comment.mjs';
@@ -630,5 +631,112 @@ describe('host capacity starvation is elapsed-time based, never round exhaustion
     expect(alerts[0].body).toContain(queueCapHeadLine(CAPACITY_HEAD));
     expect(alerts[1].body).toContain(queueCapHeadLine(newHead));
     expectNoRepairExhaustion(posted, notified);
+  });
+});
+
+describe('recordQueueCapRefusal — capped legacy history baseline through injected IO', () => {
+  const repo = 'web-everything/web-everything';
+  const pr = 2756;
+  const baselineAt = new Date(CAPACITY_NOW).toISOString();
+
+  function legacyShell() {
+    const thread = Array.from({ length: 3 }, () => ({
+      body: buildQueueCapRefusalComment('legacy queue-cap refusal', CAPACITY_HEAD),
+      author: AUTOMATION,
+    }));
+    const posted = [];
+    const notified = [];
+    const reads = [];
+    const pass = (now) => recordQueueCapRefusal({
+      pr, repo, headSha: CAPACITY_HEAD, now,
+      readPrComments: (number, options) => { reads.push({ number, options }); return thread; },
+      postComment: (comment) => {
+        posted.push(comment);
+        thread.push({ body: comment.body, author: AUTOMATION });
+        return { ok: true };
+      },
+      notify: (notification) => notified.push(notification),
+    });
+    return { thread, posted, notified, reads, pass };
+  }
+
+  it('posts exactly one baseline with a leading baseline marker, matching head and valid deferred-at for three untimed legacy markers', () => {
+    const { thread, posted, notified, reads, pass } = legacyShell();
+    expect(thread).toHaveLength(3);
+    expect(thread.every(comment => !comment.body.includes('queue-cap-deferred-at:'))).toBe(true);
+    expect(summarizeCapacityDeferral(thread, { headSha: CAPACITY_HEAD })).toEqual({
+      deferredForCapacity: 3, firstAt: null, lastAt: null,
+    });
+
+    expect(pass(CAPACITY_NOW)).toEqual({ attempts: 0, deferredForCapacity: 3, capExhausted: false, starved: false });
+
+    expect(reads).toEqual([{ number: pr, options: { repo } }]);
+    expect(posted).toEqual([{ repo, pr, body: buildCapacityBaselineComment(CAPACITY_HEAD, CAPACITY_NOW) }]);
+    const body = posted[0].body;
+    expect(body.split('\n')[0]).toBe('⏳ conveyor — host capacity clock started (queue-cap-baseline)');
+    expect(body.split('\n')).toContain(queueCapHeadLine(CAPACITY_HEAD));
+    const deferredAt = body.match(/^<!-- queue-cap-deferred-at: (.+) -->$/m)?.[1];
+    expect(deferredAt).toBe(baselineAt);
+    expect(Date.parse(deferredAt)).toBe(CAPACITY_NOW);
+    expect(notified).toEqual([]);
+  });
+
+  it('reads the persisted baseline as firstAt on a later pass without reposting it or counting it as a capacity deferral', () => {
+    const { thread, posted, notified, pass } = legacyShell();
+    pass(CAPACITY_NOW);
+
+    expect(summarizeCapacityDeferral(thread, { headSha: CAPACITY_HEAD })).toEqual({
+      deferredForCapacity: 3, firstAt: baselineAt, lastAt: baselineAt,
+    });
+    expect(pass(CAPACITY_NOW + HOUR)).toEqual({ attempts: 0, deferredForCapacity: 3, capExhausted: false, starved: false });
+    expect(posted).toEqual([{ repo, pr, body: buildCapacityBaselineComment(CAPACITY_HEAD, CAPACITY_NOW) }]);
+    expect(summarizeCapacityDeferral(thread, { headSha: CAPACITY_HEAD })).toEqual({
+      deferredForCapacity: 3, firstAt: baselineAt, lastAt: baselineAt,
+    });
+    expect(notified).toEqual([]);
+  });
+
+  it('posts exactly one fix-starved-capacity alert only after more than six hours from the persisted baseline', () => {
+    const { thread, posted, notified, pass } = legacyShell();
+    pass(CAPACITY_NOW);
+
+    expect(pass(CAPACITY_NOW + 6 * HOUR)).toEqual({ attempts: 0, deferredForCapacity: 3, capExhausted: false, starved: false });
+    expect(posted).toHaveLength(1);
+    expect(notified).toEqual([]);
+
+    const alertAt = CAPACITY_NOW + 6 * HOUR + 1;
+    expect(pass(alertAt)).toEqual({ attempts: 0, deferredForCapacity: 3, capExhausted: false, starved: true });
+    expect(pass(CAPACITY_NOW + 7 * HOUR)).toEqual({ attempts: 0, deferredForCapacity: 3, capExhausted: false, starved: false });
+    expect(posted).toEqual([
+      { repo, pr, body: buildCapacityBaselineComment(CAPACITY_HEAD, CAPACITY_NOW) },
+      { repo, pr, body: buildFixStarvedCapacityComment({
+        headSha: CAPACITY_HEAD, hours: (alertAt - CAPACITY_NOW) / HOUR, deferredForCapacity: 3, firstAt: baselineAt,
+      }) },
+    ]);
+    expect(posted.filter(comment => comment.body.startsWith(FIX_STARVED_CAPACITY_MARKER))).toHaveLength(1);
+    expect(notified).toHaveLength(1);
+    expect(notified[0]).toMatchObject({ title: '🔔 conveyor — host capacity starved', body: expect.stringContaining(`PR #${pr}`) });
+    expect(summarizeCapacityDeferral(thread, { headSha: CAPACITY_HEAD })).toEqual({
+      deferredForCapacity: 3, firstAt: baselineAt, lastAt: baselineAt,
+    });
+    expectNoRepairExhaustion(posted, notified);
+  });
+
+  it('ignores an untrusted-author baseline and starts a fresh trusted clock without a premature alert', () => {
+    const { thread, posted, notified, pass } = legacyShell();
+    thread.push({
+      body: buildCapacityBaselineComment(CAPACITY_HEAD, CAPACITY_NOW - 7 * HOUR),
+      author: { login: 'untrusted-outsider' },
+    });
+    expect(summarizeCapacityDeferral(thread, { headSha: CAPACITY_HEAD })).toEqual({
+      deferredForCapacity: 3, firstAt: null, lastAt: null,
+    });
+
+    expect(pass(CAPACITY_NOW)).toEqual({ attempts: 0, deferredForCapacity: 3, capExhausted: false, starved: false });
+    expect(posted).toEqual([{ repo, pr, body: buildCapacityBaselineComment(CAPACITY_HEAD, CAPACITY_NOW) }]);
+    expect(summarizeCapacityDeferral(thread, { headSha: CAPACITY_HEAD })).toEqual({
+      deferredForCapacity: 3, firstAt: baselineAt, lastAt: baselineAt,
+    });
+    expect(notified).toEqual([]);
   });
 });

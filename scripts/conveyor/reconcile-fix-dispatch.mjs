@@ -151,7 +151,7 @@ import { logFixPassPriorityShadow } from './delivery-priority-shadow.mjs';
  *  guard ran with the `review-dispatch` default label, so the log blamed a review step that never ran). */
 // Card xx0055i — round history + takeover at the round cap (imports kept here, away from the import block).
 import { buildRoundHistory, renderRoundHistory, withRoundHistory, readRoundHistoryInputs } from './fix-round-history.mjs';
-import { resolveFixSettings, takeoverMarkerBody, takeoverVoidMarkerBody, launchProvedNotStarted, withTakeover } from './fix-takeover.mjs';
+import { FIX_SETTINGS_DEFAULTS, resolveFixSettings, takeoverMarkerBody, takeoverVoidMarkerBody, launchProvedNotStarted, withTakeover } from './fix-takeover.mjs';
 import { isUnderTest as isUnderTestEnv } from '../lib/under-test.mjs';
 // Takeover budget — takeover 2+ is briefed with the previous takeover's diff and the review that rejected it.
 import { renderPreviousTakeover } from './takeover-budget.mjs';
@@ -2202,7 +2202,7 @@ export function queueCapWhy(d) {
  * @returns {{attempts:number, deferredForCapacity:number, firstAt:string|null, capExhausted:boolean, postMarker:boolean, postBaseline:boolean, starvation:object|null}}
  */
 export function planQueueCapRefusal({
-  pr, comments, cap = QUEUE_CAP_REFUSAL_CAP, headSha = null, now = Date.now(), starvationHours = 6,
+  pr, comments, cap = QUEUE_CAP_REFUSAL_CAP, headSha = null, now = Date.now(), starvationHours = FIX_SETTINGS_DEFAULTS.capacityStarvationHours,
 }) {
   const summary = summarizeCapacityDeferral(comments, { headSha });
   const postMarker = summary.deferredForCapacity < cap;
@@ -2239,7 +2239,7 @@ export function planQueueCapRefusal({
  * @returns {{attempts:(number|null), deferredForCapacity?:number, capExhausted:boolean, starved?:boolean, historyUnknown?:true}}
  */
 export function recordQueueCapRefusal({
-  pr, repo, why, cap = QUEUE_CAP_REFUSAL_CAP, headSha = null, now = Date.now(), starvationHours = 6,
+  pr, repo, why, cap = QUEUE_CAP_REFUSAL_CAP, headSha = null, now = Date.now(), starvationHours = FIX_SETTINGS_DEFAULTS.capacityStarvationHours,
   readPrComments = defaultReadPrComments, postComment = postNoteComment, notify = notifyDesktopChecked,
 } = {}) {
   let comments;
