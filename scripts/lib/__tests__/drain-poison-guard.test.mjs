@@ -16,13 +16,18 @@ const newCard = 'backlog/7274-new-card.md';
 const mainCard = 'backlog/7233-old-card.md';
 const cardText = (hash) => `---\nid: 7274\nbornAs: ${hash}\n---\nbody\n`;
 
-// A fake git: `added` = files the PR adds, `texts` = file text at the PR head, `main` = grep output lines.
-function fakeExec({ added = [newCard], texts = { [newCard]: cardText('xgcpm6z') }, main = `origin/main:${mainCard}:bornAs: xgcpm6z`, fetchFails = false, grepError = false } = {}) {
+// A fake git: `added` = files the PR adds, `texts` = file text at the PR head, `main` = grep output lines,
+// `mainTexts` = file text on main.
+function fakeExec({ added = [newCard], texts = { [newCard]: cardText('xgcpm6z') }, main = `origin/main:${mainCard}:bornAs: xgcpm6z`,
+  mainTexts = { [mainCard]: cardText('xgcpm6z') }, fetchFails = false, grepError = false } = {}) {
   return vi.fn((cmd, args) => {
     if (cmd !== 'git') throw new Error(`unexpected ${cmd}`);
     if (args[0] === 'fetch') { if (fetchFails) throw new Error('network down'); return ''; }
     if (args[0] === 'diff') return added.join('\n');
-    if (args[0] === 'show') return texts[args[1].split(':').slice(1).join(':')];
+    if (args[0] === 'show') {
+      const [rev, ...rest] = args[1].split(':');
+      return (rev.startsWith('origin/') ? mainTexts : texts)[rest.join(':')];
+    }
     if (args[0] === 'grep') {
       if (grepError) throw Object.assign(new Error('fatal: bad object'), { status: 128 });
       if (!main) throw Object.assign(new Error('no match'), { status: 1 });
@@ -53,6 +58,29 @@ describe('checkBornAsCollision', () => {
   });
   it('fails closed when main cannot be searched (not just "no match")', () => {
     expect(checkBornAsCollision({ exec: fakeExec({ grepError: true }), headSha: sha })).toEqual({ error: expect.stringContaining('bad object') });
+  });
+
+  // Red-team break on 9c66df06c: `git grep` hits a body example, so a unique card was refused and labelled.
+  const exampleBody = (own, example) => `---\nbornAs: ${own}\nkind: story\n---\n# Card\n\n\`\`\`yaml\n---\nbornAs: ${example}\n---\n\`\`\`\n`;
+  it('ignores an identity example in the body of a main card', () => {
+    const exec = fakeExec({ mainTexts: { [mainCard]: exampleBody('xaaaaaa', 'xgcpm6z') } });
+    expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ ok: true });
+  });
+  it('still reports a collision when the same main card also owns the hash in its frontmatter', () => {
+    const exec = fakeExec({ mainTexts: { [mainCard]: exampleBody('xgcpm6z', 'xgcpm6z') } });
+    expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ collision: { hash: 'xgcpm6z', path: newCard, mainCard } });
+  });
+  it('reads a CRLF or BOM-prefixed main card frontmatter as frontmatter', () => {
+    const exec = fakeExec({ mainTexts: { [mainCard]: '﻿---\r\nbornAs: xgcpm6z\r\n---\r\nbody\r\n' } });
+    expect(checkBornAsCollision({ exec, headSha: sha }).collision?.hash).toBe('xgcpm6z');
+  });
+  it('fails closed on a main card hit whose frontmatter cannot be parsed', () => {
+    const exec = fakeExec({ mainTexts: { [mainCard]: 'bornAs: xgcpm6z\nno frontmatter fence\n' } });
+    expect(checkBornAsCollision({ exec, headSha: sha }).collision?.hash).toBe('xgcpm6z');
+  });
+  it('takes the added card identity from its frontmatter, never from a body example', () => {
+    const exec = fakeExec({ texts: { [newCard]: '---\nkind: story\n---\nExample:\nbornAs: xgcpm6z\n' } });
+    expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ ok: true });
   });
 });
 
@@ -243,6 +271,40 @@ describe('checkBornAsCollision on a clone with a corrupt commit-graph', () => {
     expect(out.error).toMatch(/commit-graph|commit graph/);
     expect(out.healed).toBeUndefined();
     expect(existsSync(graph)).toBe(true);
+  });
+});
+
+// The red-team scenario on 9c66df06c, in real Git: main holds a card whose body shows an identity example.
+describe('checkBornAsCollision against real Git with a body identity example on main', () => {
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: devNull, GIT_CONFIG_NOSYSTEM: '1',
+    GIT_AUTHOR_NAME: 'fixture', GIT_AUTHOR_EMAIL: 'fixture@example.invalid', GIT_COMMITTER_NAME: 'fixture', GIT_COMMITTER_EMAIL: 'fixture@example.invalid' };
+  const git = (cwd, ...args) => execFileSync('git', args, { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const write = (dir, name, text) => { mkdirSync(join(dir, 'backlog'), { recursive: true }); writeFileSync(join(dir, 'backlog', name), text); };
+  let root, clone;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'poison-body-'));
+    const origin = join(root, 'origin.git'); clone = join(root, 'clone');
+    git(root, 'init', '-q', '--bare', '-b', 'main', origin);
+    git(root, 'clone', '-q', origin, clone);
+    write(clone, '1-existing.md', '---\nbornAs: xaaaaaa\n---\nExample card:\n\n```yaml\n---\nbornAs: xbbbbbb\n---\n```\n');
+    git(clone, 'add', '.'); git(clone, 'commit', '-qm', 'main'); git(clone, 'push', '-q', 'origin', 'HEAD:refs/heads/main');
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  const prAdding = (hash) => {
+    git(clone, 'checkout', '-q', '-B', 'pr', 'origin/main');
+    write(clone, '2-new.md', `---\nbornAs: ${hash}\n---\n`);
+    git(clone, 'add', '.'); git(clone, 'commit', '-qm', 'pr');
+    const head = git(clone, 'rev-parse', 'HEAD');
+    git(clone, 'push', '-q', 'origin', `${head}:refs/heads/lane/pr`);
+    return head;
+  };
+
+  it('admits a card whose identity only appears as an example in a main card body', () => {
+    expect(checkBornAsCollision({ exec: execFileSync, headSha: prAdding('xbbbbbb'), cwd: clone })).toEqual({ ok: true });
+  });
+  it('still refuses a card whose identity a main card owns in its frontmatter', () => {
+    expect(checkBornAsCollision({ exec: execFileSync, headSha: prAdding('xaaaaaa'), cwd: clone }))
+      .toEqual({ collision: { hash: 'xaaaaaa', path: 'backlog/2-new.md', mainCard: 'backlog/1-existing.md' } });
   });
 });
 

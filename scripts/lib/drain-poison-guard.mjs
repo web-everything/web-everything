@@ -7,6 +7,18 @@ const HASH = /^x[0-9a-z]{6}$/;
 const IDENTITY = /^(?:bornAs|id):[ \t]*(["']?)(x[0-9a-z]{6})\1[ \t]*$/m;
 
 /**
+ * A card's identities, read from its frontmatter only: a body may quote another card's `bornAs:` as an example.
+ * `null` when the text has no closed leading `---` block, so a caller can fail closed on it.
+ */
+function frontmatterIdentities(text) {
+  const lines = String(text ?? '').replace(/^﻿/, '').split(/\r?\n/);
+  if (lines[0].trimEnd() !== '---') return null;
+  const end = lines.findIndex((line, i) => i > 0 && line.trimEnd() === '---');
+  if (end < 0) return null;
+  return lines.slice(1, end).map(line => line.match(IDENTITY)?.[2]).filter(Boolean);
+}
+
+/**
  * Heal only a clone proven distinct from a located primary checkout: never the primary, never an unknown one.
  * `cwd` must be a clone root with its own `.git` directory, so a subdirectory or a worktree of the primary
  * (which share its git config and refs) never qualifies.
@@ -43,8 +55,7 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
       .split('\n').filter(path => /^backlog\/.+\.md$/.test(path));
     if (!names.length) return done({ ok: true });
     const added = names.map(path => {
-      const text = run(['show', `${headSha}:${path}`]);
-      const hash = text.match(IDENTITY)?.[2]
+      const hash = frontmatterIdentities(run(['show', `${headSha}:${path}`]))?.[0]
         ?? path.split('/').pop().replace(/\.md$/, '').split('-')[0];
       return { path, hash };
     }).filter(card => HASH.test(card.hash));
@@ -52,13 +63,19 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
     try { matches = run(['grep', '-E', '^(bornAs|id):', `origin/${base}`, '--', 'backlog/']); }
     catch (e) { if (e.status === 1) matches = ''; else throw e; }
     const prefix = `origin/${base}:`;
+    // `grep` also hits body lines, so each hit on an added hash is confirmed against that main card's frontmatter.
+    // A hit card without readable frontmatter still counts: unknown evidence never admits a duplicate.
+    const owned = new Map();
     for (const line of matches.split('\n')) {
       if (!line.startsWith(prefix)) continue;
       const match = line.slice(prefix.length).match(/^(backlog\/.*):((?:bornAs|id):.*)$/);
       if (!match) continue;
       const hash = match[2].match(IDENTITY)?.[2];
       const card = added.find(card => card.hash === hash);
-      if (card) return done({ collision: { hash: card.hash, path: card.path, mainCard: match[1] } });
+      if (!card) continue;
+      if (!owned.has(match[1])) owned.set(match[1], frontmatterIdentities(run(['show', `${prefix}${match[1]}`])));
+      const ids = owned.get(match[1]);
+      if (!ids || ids.includes(hash)) return done({ collision: { hash: card.hash, path: card.path, mainCard: match[1] } });
     }
     return done({ ok: true });
   } catch (e) { return done({ error: String(e?.message ?? e) }); }
