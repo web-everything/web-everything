@@ -326,6 +326,12 @@ mutations inside the fixture. Node resolves package imports from the copied modu
 when the child process runs from another directory. Keep the dependency link at the fixture root when
 moving its `scripts/` subtree for locus guards, and remove the fixture during teardown.
 
+The scripts import graph also reaches `skills-src/conveyor/daemon-manifest.mjs` through daemon
+runtime entry discovery. Copy that manifest to the same relative path in each fixture, including
+secondary copies made to exercise missing Git state or relocated scripts for locus guards. Copy
+the file rather than symlinking it: its relative imports must resolve against the fixture's own
+`scripts/` tree.
+
 ## Daemon entry boot smoke
 
 Rebuild candidates must also work with the old live daemon's smoke environment: it exports
