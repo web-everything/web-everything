@@ -15,3 +15,5 @@
 {"type":"quarantine-fix-prs","at":1793124979421,"actor":"red-main-safety-net","fixPrs":[]}
 {"type":"quarantine-added","at":1793196898055,"actor":"operator","test":"scripts/conveyor/soak/breaks/already-done-burst-unattributed.soak.test.mjs","brokenSha":"336b296c7","owner":"#6031","reason":"operator chalbert 2026-10-28 10:14 ET: #6014 made soak checkout full-depth (fetch-depth 0), so git-already-done ran a real git fetch and tripped the hermetic guard; test-only fix in #6031","addedAt":1793196898055,"expiresAt":1793283298055}
 {"type":"quarantine-fix-prs","at":1793197727571,"actor":"red-main-safety-net","fixPrs":[6031]}
+{"type":"quarantine-removed","at":1793202033967,"actor":"red-main-safety-net","test":"scripts/conveyor/soak/breaks/already-done-burst-unattributed.soak.test.mjs","brokenSha":"336b296c7","why":"main-green"}
+{"type":"quarantine-fix-prs","at":1793202033967,"actor":"red-main-safety-net","fixPrs":[]}
