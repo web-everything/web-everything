@@ -333,6 +333,19 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
     const statusCheckRollup = fixture.requiredChecks.map((name) => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' }));
     expect(refusal({ pr: { ...fixture, statusCheckRollup } })).toBeNull();
   });
+  it.each([
+    ['optional', ['test'], false],
+    ['required', ['test', 'smoke'], true],
+  ])('%s cancelled smoke with a pending retry only refuses when required', (_name, requiredChecks, refused) => {
+    const pull = { ...fixture, statusCheckRollup: [
+      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED' },
+    ], timeoutRetry: { eligible: true, infraCancelled: true, head, pr: 4535, cap: 6 },
+    timeoutRetryBudget: { confirmed: 6, rejected: 0, pending: true } };
+    const result = refusal({ pr: pull, requiredChecks });
+    if (refused) expect(result).toContain('retry');
+    else expect(result).toBeNull();
+  });
   it('#5925: cancelled smoke and red review-gate allow a not-a-ci-break record', () => {
     const statusCheckRollup = [
       { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },

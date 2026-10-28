@@ -340,7 +340,7 @@ export function needsHumanVoidState(comments, headSha) {
 
 /**
  * Refuse a premature not-a-ci-break record on the current head. Review-gate is the hold this verdict explains.
- * Cancelled smoke is settled only after any eligible infrastructure retry (including an in-flight request).
+ * Required cancelled smoke is settled only after any eligible infrastructure retry (including an in-flight request).
  * `pr` carries the current rollup and, when recording through the CLI, the planner's retry evidence and budget.
  */
 export function notCiBreakRecordRefusal({ headSha, pr, requiredChecks }) {
@@ -349,7 +349,7 @@ export function notCiBreakRecordRefusal({ headSha, pr, requiredChecks }) {
   if (!head || !prHead || !(prHead.startsWith(head) || head.startsWith(prHead))) return null;
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return null;
   const latest = collapseRollupToLatestPerName(pr?.statusCheckRollup);
-  if (latest.some(isCancelledSmoke)) {
+  if (requiredChecks.includes('smoke') && latest.some(isCancelledSmoke)) {
     const refusal = cancelledSmokeRetryRefusal(pr);
     if (refusal) return refusal;
   }

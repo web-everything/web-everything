@@ -95,7 +95,7 @@ export function latestCheckNamed(rollup, name) {
 /** Every conclusion (or legacy StatusContext `state`) that means a check DEFINITIVELY failed. The one list the
  *  drain's `isRequiredCheckFailed` and the card group's dissolve read (xym8nt4: a copy of it in card-group.mjs
  *  missed ACTION_REQUIRED/STARTUP_FAILURE, so a combined PR the drain would never land kept its sources held). */
-export const FAILED_CHECK_CONCLUSIONS = Object.freeze(['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE']);
+export const FAILED_CHECK_CONCLUSIONS = Object.freeze(['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE', 'STALE']);
 
 /** Did this (already latest) check row definitively fail? `null`/missing is not failed. Pure. */
 export function isFailedCheckRow(c) {
@@ -168,22 +168,39 @@ function latestOf(runs) {
  * A run still in flight (no real `completedAt` — absent or the zero date) is the newest; otherwise the greatest
  * `completedAt` wins, falling back to a real `startedAt` for completed runs whose completion timestamp is
  * unavailable. Ties are broken by position (later wins). Any run with no usable timestamp at all keeps the
- * old positional rule for the whole group.
+ * old positional rule for the whole group. Otherwise in-flight runs win before a mix of completion and
+ * fallback start timestamps fails closed to the last definitively failed run, then the last non-passing run
+ * (conclusion or legacy `state`, with success/neutral/skipped passing case-insensitively), or the positional
+ * last run if all runs pass.
  */
 function latestByTime(runs) {
+  const kinds = new Set();
   const stamp = (c) => {
     const done = Date.parse(c?.completedAt);
-    if (Number.isFinite(done) && done > Date.parse('2000-01-01T00:00:00Z')) return done;
+    if (Number.isFinite(done) && done > Date.parse('2000-01-01T00:00:00Z')) {
+      kinds.add('completedAt');
+      return done;
+    }
     const status = String(c?.status ?? '').toUpperCase();
     if (status && status !== 'COMPLETED') return Infinity; // queued / in progress: the newest run
     if (status === 'COMPLETED') {
       const started = Date.parse(c?.startedAt);
-      if (Number.isFinite(started) && started > Date.parse('2000-01-01T00:00:00Z')) return started;
+      if (Number.isFinite(started) && started > Date.parse('2000-01-01T00:00:00Z')) {
+        kinds.add('startedAt');
+        return started;
+      }
     }
     return null;
   };
   const stamps = runs.map(stamp);
   if (stamps.some((s) => s === null)) return runs[runs.length - 1];
+  const pending = stamps.lastIndexOf(Infinity);
+  if (pending !== -1) return runs[pending];
+  if (kinds.size > 1) {
+    return runs.findLast(isFailedCheckRow)
+      ?? runs.findLast((c) => !['success', 'neutral', 'skipped'].includes(String(c?.conclusion ?? c?.state ?? '').toLowerCase()))
+      ?? runs[runs.length - 1];
+  }
   let best = 0;
   for (let i = 1; i < runs.length; i++) if (stamps[i] >= stamps[best]) best = i;
   return runs[best];
