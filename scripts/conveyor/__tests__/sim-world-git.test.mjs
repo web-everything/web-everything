@@ -1,3 +1,5 @@
+// @vitest-environment node
+// Temporary clone imports need SSR loading, outside Vite's web file allowlist.
 /**
  * @file Pins no-clone commitToMain/createBranch plumbing, the slim sim template,
  * and the whole-scenario budget error.

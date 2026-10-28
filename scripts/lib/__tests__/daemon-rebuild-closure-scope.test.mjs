@@ -206,7 +206,7 @@ it('prepare discovers caller runtime entries lazily and emits the shadow would-r
     run: (args, options) => f.git(args, options), prState: async () => null, now: Date.now,
     entries: ['entry.mjs'], skipCheck: null, prBaseChain: async () => [],
   });
-  expect(discovery).toHaveBeenCalledWith({ root: f.root, entries: ['entry.mjs'] });
+  expect(discovery).toHaveBeenCalledWith({ root: f.root, entries: ['entry.mjs'], env });
   expect(result.alerts).toContainEqual({ kind: 'overlay-conflict-resolved', detail: expect.objectContaining({
     via: 'closure-scope', mode: 'shadow', excluded: ['unused.mjs'], message: expect.stringContaining('would resolve, excluded 1'),
   }) });
