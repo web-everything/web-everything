@@ -193,6 +193,9 @@ export function listGroup(pgid, deps = {}) {
     let rows;
     if (io.platform === 'darwin') {
       rows = psProcesses(exec(io, 'ps', ['-A', '-o', 'ruid,pid,ppid,pgid,stat,lstart']));
+      // An all-process census must include at least ps itself. Empty output is
+      // incomplete evidence, unlike an empty per-PID query in readIdentity.
+      if (!rows.length) throw new Error('Empty all-process census');
     } else if (io.platform === 'linux') {
       const names = io.readdir('/proc');
       if (!Array.isArray(names) || names.length > MAX_ENTRIES) throw new Error('procfs entry limit');

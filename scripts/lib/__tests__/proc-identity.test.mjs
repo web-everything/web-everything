@@ -331,6 +331,10 @@ describe('currentBootId', () => {
 });
 
 describe('listGroup', () => {
+  it.each(['', HEADER])('an empty macOS all-process census is unknown, not an empty group', (output) => {
+    expect(listGroup(PID, darwinDeps({ output }))).toEqual({ status: 'unknown', reason: expect.any(String) });
+  });
+
   it('an unreadable Linux member invalidates the whole group snapshot', () => {
     const deps = linuxDeps({ processes: [{ pid: PID }, { pid: PID + 1 }] });
     const readFile = deps.readFile;
