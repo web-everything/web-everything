@@ -1,14 +1,15 @@
 ---
+bornAs: xnpcayd
 kind: task
 status: open
-scope: ["we:scripts/lane-pool.mjs"]
+scope: ["we:scripts/review-set-label.mjs"]
 dateOpened: "2026-10-28"
 tags: []
 ---
 
-# lane-pool release: SALVAGE PUSH FAILED unknown transport config scope
+# review-set-label clear-human takes a head pin (--expect-head)
 
-2026-10-28 09:13 and 10:04 ET. lane-pool release warns 'SALVAGE PUSH FAILED: unknown transport config scope' on every release today (lane-6, lane-10, lane-11): a salvage push config regression. Inspect lane-6 before reuse.
+2026-10-28 09:34 ET. we:scripts/review-set-label.mjs --to=clear-human has no head pin, so #6027's delegated-clear-human pass refuses in 'on' mode by design. Add a head pin to the clear-human path (fits the #5982 rebuild S1: approval bound to head) before switching R130 live.
 
 ## Acceptance
 

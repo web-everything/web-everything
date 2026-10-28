@@ -1,14 +1,15 @@
 ---
+bornAs: xg0g2q7
 kind: task
 status: open
-scope: ["we:scripts/lib/__tests__/fix-handoff.test.mjs", "we:scripts/lib/fix-handoff.mjs"]
+scope: ["we:scripts/conveyor/lease-reaper.mjs"]
 dateOpened: "2026-10-28"
 tags: []
 ---
 
-# Make fix-handoff wake-from-directory-event test timing-independent
+# Confirm lease-reaper session-gone check is what removes fix-run lane leases
 
-2026-10-28. we:scripts/lib/__tests__/fix-handoff.test.mjs 'wakes from the directory event well inside the 1s stat-poll interval (not load-sensitive)' failed verify-lane twice under host load on the fix-run-lease-lost lane (head cc84008e). Inject the clock/watcher. Same family as #4207.
+2026-10-28 10:04 ET. Lease reaper's session-gone check (we:scripts/conveyor/lease-reaper.mjs ~:1074) is the suspected remover of fix-run lane leases (#5983/#5964 lease-lost loops); unproven. Confirm with reaper logs after #6030 is live.
 
 ## Acceptance
 

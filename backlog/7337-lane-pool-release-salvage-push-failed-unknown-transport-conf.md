@@ -1,14 +1,15 @@
 ---
+bornAs: xtyxepf
 kind: task
 status: open
-scope: ["we:scripts/forge-exec-run.mjs", "we:scripts/remote-exec.mjs"]
+scope: ["we:scripts/lane-pool.mjs"]
 dateOpened: "2026-10-28"
 tags: []
 ---
 
-# Re-check two unconfirmed #6008 security breaks on Forge after install
+# lane-pool release: SALVAGE PUSH FAILED unknown transport config scope
 
-2026-10-28 10:01 ET. #6008 red-team (e9d03968f9) raised 2 UNCONFIRMED security breaks: we:scripts/forge-exec-run.mjs:285 git deps may run prepare scripts during the inert install; we:scripts/remote-exec.mjs:129 source-parent symlink swap may disclose excluded files. Re-check both on Forge (real npm git-dep behaviour with --ignore-scripts; symlink race test).
+2026-10-28 09:13 and 10:04 ET. lane-pool release warns 'SALVAGE PUSH FAILED: unknown transport config scope' on every release today (lane-6, lane-10, lane-11): a salvage push config regression. Inspect lane-6 before reuse.
 
 ## Acceptance
 

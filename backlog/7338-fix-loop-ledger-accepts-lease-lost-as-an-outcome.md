@@ -1,15 +1,15 @@
 ---
-kind: story
-size: 3
+bornAs: xucwo0k
+kind: task
 status: open
-scope: ["we:scripts/verify-lane.mjs"]
+scope: ["we:scripts/conveyor/fix-loop-ledger.mjs"]
 dateOpened: "2026-10-28"
 tags: []
 ---
 
-# verify-lane records RED for a file that fails identically on main
+# fix-loop-ledger accepts lease-lost as an outcome
 
-2026-10-28 10:04 ET. we:scripts/verify-lane.mjs ~:889-893: 'Comparing 1 failing file(s) outside the diff with origin/main' ran but still recorded RED for a file failing identically on main (we:scripts/lib/__tests__/fix-handoff.test.mjs, lane-11 cc84008e). If base failures are meant to be demoted, measureBaseFailures/baseFailures handling is broken: trace and fix; a main-red test blocks every lane's verify.
+2026-10-28. we:scripts/conveyor/fix-loop-ledger.mjs:68 accepts only pushed|no-change|failed; widen it to accept lease-lost (until then fix-run writes failed/infra:false/reason 'lease-lost: ...'). From the fix-run-lease-lost worker.
 
 ## Acceptance
 

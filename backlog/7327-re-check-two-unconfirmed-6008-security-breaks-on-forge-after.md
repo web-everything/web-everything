@@ -1,14 +1,15 @@
 ---
+bornAs: x9k2ott
 kind: task
 status: open
-scope: ["we:scripts/conveyor/lease-reaper.mjs"]
+scope: ["we:scripts/forge-exec-run.mjs", "we:scripts/remote-exec.mjs"]
 dateOpened: "2026-10-28"
 tags: []
 ---
 
-# Confirm lease-reaper session-gone check is what removes fix-run lane leases
+# Re-check two unconfirmed #6008 security breaks on Forge after install
 
-2026-10-28 10:04 ET. Lease reaper's session-gone check (we:scripts/conveyor/lease-reaper.mjs ~:1074) is the suspected remover of fix-run lane leases (#5983/#5964 lease-lost loops); unproven. Confirm with reaper logs after #6030 is live.
+2026-10-28 10:01 ET. #6008 red-team (e9d03968f9) raised 2 UNCONFIRMED security breaks: we:scripts/forge-exec-run.mjs:285 git deps may run prepare scripts during the inert install; we:scripts/remote-exec.mjs:129 source-parent symlink swap may disclose excluded files. Re-check both on Forge (real npm git-dep behaviour with --ignore-scripts; symlink race test).
 
 ## Acceptance
 

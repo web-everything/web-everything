@@ -1,14 +1,15 @@
 ---
+bornAs: x3fukwa
 kind: task
 status: open
-scope: ["we:scripts/review-set-label.mjs"]
+scope: ["we:scripts/lib/__tests__/fix-handoff.test.mjs", "we:scripts/lib/fix-handoff.mjs"]
 dateOpened: "2026-10-28"
 tags: []
 ---
 
-# review-set-label clear-human takes a head pin (--expect-head)
+# Make fix-handoff wake-from-directory-event test timing-independent
 
-2026-10-28 09:34 ET. we:scripts/review-set-label.mjs --to=clear-human has no head pin, so #6027's delegated-clear-human pass refuses in 'on' mode by design. Add a head pin to the clear-human path (fits the #5982 rebuild S1: approval bound to head) before switching R130 live.
+2026-10-28. we:scripts/lib/__tests__/fix-handoff.test.mjs 'wakes from the directory event well inside the 1s stat-poll interval (not load-sensitive)' failed verify-lane twice under host load on the fix-run-lease-lost lane (head cc84008e). Inject the clock/watcher. Same family as #4207.
 
 ## Acceptance
 
