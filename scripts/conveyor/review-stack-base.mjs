@@ -110,11 +110,12 @@ export function stackAnswers(sets) {
 
 /**
  * Every stacked top among the open PRs, with its base. PURE: reuses `pr-stack.mjs#detectStacks` (the fix daemon's
- * detector), restricted to GitHub-declared bases with widened containment answers.
+ * detector), restricted to GitHub-declared bases with widened containment answers. A trusted declared base is
+ * authoritative across authors; ancestry detection alone still requires the ownership rule.
  * @param {Array<{pr:number, headRefName:string|null, headRefOid:string|null, baseRefName?:string|null, untrusted?:boolean}>} prs open PRs
  * @param {OffMainSets} sets
- * @param {{allowPair?:Function, log?:Function}} [o] `allowPair` — the ownership rule for a pair; by default the SAME one the fix daemon
- *   applies (`pr-stack.mjs#sameStackActor`: both PRs by the same, known actor), so a stack never forms between authors.
+ * @param {{allowPair?:Function, log?:Function}} [o] `allowPair` — the ownership rule for ancestry detection; by default the SAME one the fix daemon
+ *   applies (`pr-stack.mjs#sameStackActor`: both PRs by the same, known actor). Declared bases require trust and containment, regardless of author.
  * @returns {Map<number, {pr:number, ref:string, head:string, contained:string}>} top PR → its stack base
  */
 export function findStackBases(prs, sets, { allowPair = sameStackActor, log = (m) => process.stderr.write(m + '\n') } = {}) {
@@ -133,7 +134,7 @@ export function findStackBases(prs, sets, { allowPair = sameStackActor, log = (m
   const byHeadRef = new Map(trusted.filter((p) => LANE_REF.test(String(p.headRefName ?? ''))).map((p) => [p.headRefName, p]));
   for (const top of trusted) {
     const bottom = LANE_REF.test(String(top.baseRefName ?? '')) ? byHeadRef.get(top.baseRefName) : null;
-    if (!bottom || bottom.pr === top.pr || !allowPair(top, bottom)) continue;
+    if (!bottom || bottom.pr === top.pr) continue;
     const contained = containedCommit(sets, bottom.headRefOid, top.headRefOid);
     if (contained && SHA.test(contained)) {
       out.set(top.pr, { pr: bottom.pr, ref: bottom.headRefName, head: bottom.headRefOid, contained });
@@ -435,8 +436,8 @@ export function readStackBases({ root = ROOT, env = process.env, prs = null, rea
     if (!tips) return out;
     // Trust boundary: the SAME rule as the fix daemon's `pr-stack.mjs#readStacksForPass` (shared helpers, not a copy).
     // Base ref, fork status and AUTHOR always come from GitHub's own open-PR record, never from the caller's list (which may
-    // lack them): a PR with no record is a fork, and a pair needs one known actor on both sides (`sameStackActor`,
-    // applied by `findStackBases`). The caller's list only says which PRs, at which head, to look at.
+    // lack them): a PR with no record is a fork. Ancestry detection needs one known actor on both sides (`sameStackActor`);
+    // a trusted declared base is authoritative across authors. The caller's list only says which PRs, at which head, to look at.
     const refs = readRefs(root);
     const listed = Array.isArray(prs)
       ? prs.map((p) => ({ pr: Number(p.number), headRefName: p.headRefName ?? null, headRefOid: p.headRefOid ?? null }))

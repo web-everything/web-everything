@@ -96,6 +96,24 @@ describe('stack relation comes from GitHub baseRefName (live 2026-10-11 deadlock
     [TOP, { reach: new Set([TOP, BOTTOM]), first: [TOP] }],
   ]);
 
+  it('finds a trusted declared lane base across different authors when containment is proven', () => {
+    expect(findStackBases([bottom(), { ...top(), author: 'another-actor' }], graph())).toEqual(new Map([
+      [4757, { pr: 4756, ref: bottom().headRefName, head: BOTTOM, contained: BOTTOM }],
+    ]));
+  });
+  it.each([4756, 4757])('rejects a cross-author declared base when PR #%i is untrusted', (pr) => {
+    const prs = [bottom(), { ...top(), author: 'another-actor' }].map(r => ({ ...r, untrusted: r.pr === pr }));
+    expect(findStackBases(prs, graph())).toEqual(new Map());
+  });
+  it('does not infer a cross-author stack from ancestry when both PRs target main', () => {
+    expect(findStackBases([bottom(), { ...top(), author: 'another-actor', baseRefName: 'main' }], graph())).toEqual(new Map());
+  });
+  it('rejects a cross-author declared base without containment evidence', () => {
+    const g = graph();
+    g.get(TOP).reach.delete(BOTTOM);
+    expect(findStackBases([bottom(), { ...top(), author: 'another-actor' }], g)).toEqual(new Map());
+  });
+
   it('does not invert #4756 below #4792 because of ancestry', () => {
     const prs = [row(4756, bottom().headRefName, TOP, 'main'),
       row(4792, 'lane/last-takeover-review', BOTTOM, 'lane/takeover-budget')];
@@ -476,14 +494,18 @@ describe('readStackBases — the same trust rule as the fix daemon', () => {
     }
   });
   it.each([
-    ['different actors', { 4631: { author: 'someone-else' } }],
-    ['an unreadable author on the top', { 4631: { author: null } }],
-    ['an unreadable author on the bottom', { 4624: { author: null } }],
     ['a fork top', { 4631: { isCrossRepository: true } }],
     ['a fork bottom', { 4624: { isCrossRepository: true } }],
     ['a top with an unknown fork status', { 4631: { isCrossRepository: undefined } }],
   ])('forms no stack for %s', (_name, patch) => {
     for (const prs of [null, listed()]) expect(read(patch, { prs }).size).toBe(0);
+  });
+  it.each([
+    ['different actors', { 4631: { author: 'someone-else' } }],
+    ['an unreadable author on the top', { 4631: { author: null } }],
+    ['an unreadable author on the bottom', { 4624: { author: null } }],
+  ])('finds the declared stack for %s (GitHub\'s base ref is the authority)', (_name, patch) => {
+    for (const prs of [null, listed()]) expect(read(patch, { prs }).get(4631)?.pr).toBe(4624);
   });
   it('treats a PR GitHub has no record for as a fork (unknown means untrusted)', () => {
     for (const prs of [null, listed()]) {
@@ -491,9 +513,9 @@ describe('readStackBases — the same trust rule as the fix daemon', () => {
       expect(read({}, { prs, readRefs: () => refs }).size).toBe(0);
     }
   });
-  it('takes the author from GitHub\'s record, never from the caller\'s list', () => {
+  it('takes the fork status from GitHub\'s record, never from the caller\'s list', () => {
     const lying = listed().map((p) => ({ ...p, author: AUTHOR, isCrossRepository: false }));
-    expect(read({ 4631: { author: 'someone-else' } }, { prs: lying }).size).toBe(0);
+    expect(read({ 4631: { isCrossRepository: true } }, { prs: lying }).size).toBe(0);
   });
   it('takes baseRefName from GitHub refs even when the caller disagrees', () => {
     const caller = (baseRefName) => listed().map(p => ({ ...p, baseRefName }));
@@ -515,8 +537,7 @@ describe('readStackBases — the same trust rule as the fix daemon', () => {
     const daemon = (patch) => readStacksForPass({ root: '/repo', repoKey: 'we', planned: [], openPrFiles: [{ pr: 4624 }, { pr: 4631 }],
       settings: { detect: true }, readRefs: () => refsOf(patch), readLanes: lanes, isAncestor: (b, t) => b === BOTTOM && t === TOP,
       onMain: () => false, readMem: () => [], writeMem: () => {}, now: () => 0 }).pairs.length;
-    for (const patch of [{}, { 4631: { author: 'someone-else' } }, { 4631: { author: null } }, { 4624: { isCrossRepository: true } },
-      { 4631: { isCrossRepository: undefined } }]) {
+    for (const patch of [{}, { 4624: { isCrossRepository: true } }, { 4631: { isCrossRepository: undefined } }]) {
       expect(read(patch).size, JSON.stringify(patch)).toBe(daemon(patch));
     }
   });
@@ -527,9 +548,10 @@ describe('readStackBases — the same trust rule as the fix daemon', () => {
     expect(sameStackActor({ author: 'a' }, { author: 'b' })).toBe(false);
     expect(sameStackActor({ author: null }, { author: null })).toBe(false);
   });
-  it('findStackBases applies the ownership rule by default', () => {
-    expect(findStackBases(rows().map((r) => ({ ...r, author: r.pr === 4631 ? 'someone-else' : r.author })), sets())).toEqual(new Map());
-    expect(findStackBases(rows().map(({ author: _a, ...r }) => r), sets())).toEqual(new Map());
+  it('findStackBases does not form ancestry-only stacks across authors or with unknown authors', () => {
+    const prs = rows().map((r) => ({ ...r, baseRefName: 'main' }));
+    expect(findStackBases(prs.map((r) => ({ ...r, author: r.pr === 4631 ? 'someone-else' : r.author })), sets())).toEqual(new Map());
+    expect(findStackBases(prs.map(({ author: _a, ...r }) => r), sets())).toEqual(new Map());
   });
 });
 
