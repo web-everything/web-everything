@@ -29,6 +29,15 @@ it('keeps legacy status failures and a new failed attempt from releasing the hol
   expect(report.failedRerunRace).toEqual({ checkReads: 2, writes: ['cursor'] });
 });
 
+it('keeps wrong-app cancellation and success evidence from releasing the hold', () => {
+  expect(report.wrongAppWrites).toEqual({
+    'cancelled-test': ['cursor'],
+    'all-green-wrong-app': ['cursor'],
+    'green-sibling-wrong-app': ['cursor'],
+  });
+  expect(recoveredCi.judge(report)).toEqual([]);
+});
+
 it.each([
   ['standard', {}, {}, {}, true, 'standard'],
   ['platform off', { standDownAutoProceed: false }, {}, {}, false, 'platform'],

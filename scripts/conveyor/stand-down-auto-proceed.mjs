@@ -9,12 +9,23 @@ import { fenceUntrusted, FENCED_DATA_RULE } from '../lib/mandate-fence.mjs';
 
 const ciReason = c => /\n<!-- stand-down reason=(gate-red|fix-loop-exhausted)(?: head=[a-f0-9]{7,40})? -->$/i.test(c?.body ?? '');
 const hold = why => ({ action: 'hold', why });
-const appIdentity = r => Number.isSafeInteger(r?.app?.id) && r.app.id > 0 ? `id:${r.app.id}`
-  : typeof r?.app?.slug === 'string' && r.app.slug.trim() ? `slug:${r.app.slug}` : null;
+const appIdentity = r => Number.isSafeInteger(r?.app?.id) && r.app.id > 0 ? `id:${r.app.id}` : null;
 // Check suites distinguish independent workflows with the same app/name. Different suites may be
 // independent runs or reruns; without workflow lineage, retain the operator hold in either case.
 const checkIdentity = r => appIdentity(r) && Number.isSafeInteger(r?.check_suite?.id) && r.check_suite.id > 0
   ? `${appIdentity(r)}:suite:${r.check_suite.id}` : null;
+
+/** Null means unknown policy; other-app runs never supply evidence, including SUCCESS. */
+export function boundAutoProceedRuns(runs, requiredChecks, requiredCheckBindings) {
+  if (!Array.isArray(requiredCheckBindings) || !requiredCheckBindings.length
+    || requiredCheckBindings.some(c => typeof c?.context !== 'string' || !c.context
+      || !Number.isSafeInteger(c.integration_id) || c.integration_id < 1)
+    || new Set(requiredCheckBindings.map(c => c.context)).size !== requiredCheckBindings.length
+    || !Array.isArray(requiredChecks)
+    || requiredChecks.some(name => !requiredCheckBindings.some(c => c.context === name))) return null;
+  const ids = new Map(requiredCheckBindings.map(c => [c.context, c.integration_id]));
+  return runs.filter(r => requiredChecks.includes(r.name) && r.app?.id === ids.get(r.name));
+}
 
 /** Restore only same-head red-main annotations: R123 records their release durably instead. */
 export function autoProceedStandDowns(pr) {
@@ -34,7 +45,7 @@ export function hasAutoProceedCandidate(pr) {
 }
 
 /** Evidence is a complete REST filter=all check-run feed fetched for `checks.head`, never a rollup. */
-export function classifyStandDownAutoProceed({ pr, requiredChecks, checks, redMainContext,
+export function classifyStandDownAutoProceed({ pr, requiredChecks, requiredCheckBindings, checks, redMainContext,
   prScopedChecks = DEFAULT_PR_SCOPED_CHECKS } = {}) {
   if (!/^[a-f0-9]{40}$/i.test(pr?.headRefOid ?? '') || !Array.isArray(pr?.comments)) return hold('operator answer required: missing head/thread');
   if (pr.comments.length > 2000) return hold('operator answer required: thread exceeds 2000 comments');
@@ -48,9 +59,10 @@ export function classifyStandDownAutoProceed({ pr, requiredChecks, checks, redMa
   if (!Array.isArray(requiredChecks) || !requiredChecks.length || requiredChecks.some(n => typeof n !== 'string' || !n)) return hold('operator answer required: unknown required checks');
   if (checks?.head !== pr.headRefOid || checks?.complete !== true || !Array.isArray(checks.runs)) return hold('operator answer required: incomplete exact-head checks');
   if (checks.runs.length > 1000) return hold('operator answer required: check evidence exceeds 1000 runs');
-  const runs = checks.runs;
-  if (runs.some(r => !Number.isSafeInteger(r?.id) || r.id < 1 || typeof r.name !== 'string'
-    || r.head_sha !== pr.headRefOid) || new Set(runs.map(r => r.id)).size !== runs.length) return hold('operator answer required: invalid check evidence');
+  if (checks.runs.some(r => !Number.isSafeInteger(r?.id) || r.id < 1 || typeof r.name !== 'string'
+    || r.head_sha !== pr.headRefOid) || new Set(checks.runs.map(r => r.id)).size !== checks.runs.length) return hold('operator answer required: invalid check evidence');
+  const runs = boundAutoProceedRuns(checks.runs, requiredChecks, requiredCheckBindings);
+  if (runs === null) return hold('operator answer required: unreadable required-check integration policy');
   const requiredRuns = requiredChecks.map(name => runs.filter(r => r.name === name));
   if (requiredRuns.some(history => history.some(r => checkIdentity(r) === null)
     || new Set(history.map(checkIdentity)).size > 1)) return hold('operator answer required: ambiguous check identity');
@@ -84,7 +96,7 @@ export function classifyStandDownAutoProceed({ pr, requiredChecks, checks, redMa
   if (!kind) return hold('operator answer required: no recovered CI evidence');
   const labels = { a: 'passed a later rerun on the same head', b: 'cancelled/skipped rather than failed', c: 'main\'s own CI was red; fixLoopRedMainLapse confirms the park no longer holds' };
   const details = JSON.stringify({ checks: runs.filter(r => requiredChecks.includes(r.name))
-    .map(r => ({ check: r.name, runId: r.id, suiteId: r.check_suite.id, actions: r.actions,
+    .map(r => ({ check: r.name, appId: r.app.id, runId: r.id, suiteId: r.check_suite.id, actions: r.actions,
       conclusion: conclusion(r), completedAt: r.completed_at })),
   ...(kind === 'c' ? { mainWindows: redMainContext.config.redMainWindows,
     ledger: redMainContext.rows.filter(r => r.pr === pr.number && r.head === pr.headRefOid).map(r => ({ kind: r.kind, at: r.at })) } : {}) });

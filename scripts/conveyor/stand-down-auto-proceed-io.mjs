@@ -7,7 +7,8 @@ import { repoKeyForSlug, ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { fixLoopConfig, readFixLoopRows, fixLoopLedgerPath } from './fix-loop-ledger.mjs';
 import { parseOperatorAnswer } from './stand-down-answer-core.mjs';
-import { hasAutoProceedCandidate, classifyStandDownAutoProceed } from './stand-down-auto-proceed.mjs';
+import { hasAutoProceedCandidate, classifyStandDownAutoProceed, boundAutoProceedRuns } from './stand-down-auto-proceed.mjs';
+import { readRequiredCheckBindings } from '../lib/merge-queue-enqueue.mjs';
 import { DEFAULT_PR_SCOPED_CHECKS, resolvePrScopedChecks } from './main-red-recovery.mjs';
 import { withFileLock, writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 
@@ -32,7 +33,8 @@ export function readAutoProceedContext({ repo, defaultBranch = 'main', env = pro
 }
 
 /** Ten pages maximum, with total-count and unique-id proof; filter=all retains earlier failed attempts. */
-export function readAutoProceedChecks({ repo, head, requiredChecks }, { read = gh } = {}) {
+export function readAutoProceedChecks({ repo, head, requiredChecks,
+  requiredCheckBindings = readRequiredCheckBindings() }, { read = gh } = {}) {
   const runs = [];
   let total;
   for (let page = 1; page <= 10; page++) {
@@ -42,7 +44,7 @@ export function readAutoProceedChecks({ repo, head, requiredChecks }, { read = g
     total = data.total_count;
     runs.push(...data.check_runs);
     if (runs.length === total && new Set(runs.map(r => r.id)).size === total) {
-      const verifiedRuns = readRerunLineage(runs, { repo, head, requiredChecks, read });
+      const verifiedRuns = readRerunLineage(runs, { repo, head, requiredChecks, requiredCheckBindings, read });
       requireGreenCommitStatuses({ repo, head, requiredChecks, read });
       return { head, complete: true, runs: verifiedRuns };
     }
@@ -76,14 +78,17 @@ function requireGreenCommitStatuses({ repo, head, requiredChecks, read }) {
 }
 
 /** Check-run IDs order creations, not attempts. Bind duplicate names to actual Actions jobs. */
-function readRerunLineage(runs, { repo, head, requiredChecks, read }) {
+function readRerunLineage(runs, { repo, head, requiredChecks, requiredCheckBindings, read }) {
+  const bound = boundAutoProceedRuns(runs, requiredChecks ?? requiredCheckBindings?.map(c => c.context), requiredCheckBindings);
+  if (bound === null) throw new Error('operator answer required: unreadable required-check integration policy');
+  const boundIds = new Set(bound.map(r => r.id));
   const counts = new Map();
-  for (const r of runs) counts.set(r.name, (counts.get(r.name) ?? 0) + 1);
+  for (const r of bound) counts.set(r.name, (counts.get(r.name) ?? 0) + 1);
   let reads = 0;
   return runs.map(r => {
     // Never accept a lineage field from the check feed itself.
     const { actions: ignored, ...check } = r;
-    if (counts.get(r.name) < 2 || (Array.isArray(requiredChecks) && !requiredChecks.includes(r.name))) return check;
+    if (!boundIds.has(r.id) || counts.get(r.name) < 2) return check;
     const unavailable = () => { throw new Error('operator answer required: ambiguous rerun lineage'); };
     if (r.app?.slug !== 'github-actions' || typeof r.details_url !== 'string') return unavailable();
     const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/actions\/runs\/([1-9]\d*)\/job\/([1-9]\d*)$/.exec(r.details_url);
@@ -136,6 +141,7 @@ export function selectAutoProceedCandidates(candidates, { repo, env = process.en
 
 /** At most three candidate PRs/tick; all IO injectable. No retries after a write starts. */
 export function enrichPrsWithStandDownAutoProceed(prs, { repo, requiredChecks, defaultBranch = 'main',
+  readBindings = readRequiredCheckBindings,
   readRows = readFixLoopRows,
   readComments = (number, o) => readCompletePrComments(number, o), readHead: headReader = readHead,
   readChecks = readAutoProceedChecks, readContext = () => readAutoProceedContext({ repo, defaultBranch, env }, { readRows }),
@@ -146,10 +152,16 @@ export function enrichPrsWithStandDownAutoProceed(prs, { repo, requiredChecks, d
 } = {}) {
   const candidates = prs.filter(hasAutoProceedCandidate);
   if (!candidates.length) return prs;
-  let selected, context;
-  try { selected = new Set(selectCandidates(candidates, { repo, env })); }
+  let selected, context, requiredCheckBindings;
+  try {
+    requiredCheckBindings = readBindings();
+    if (boundAutoProceedRuns([], requiredChecks, requiredCheckBindings) === null) {
+      throw new Error('unreadable required-check integration policy');
+    }
+    selected = new Set(selectCandidates(candidates, { repo, env }));
+  }
   catch (e) {
-    log(`R123 candidate cursor unavailable; all holds retained; operator answer remains available: ${String(e.message).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 300)}`);
+    log(`R123 policy/candidate cursor unavailable; all holds retained; operator answer remains available: ${String(e.message).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 300)}`);
     return prs;
   }
   return prs.map(pr => {
@@ -170,27 +182,27 @@ export function enrichPrsWithStandDownAutoProceed(prs, { repo, requiredChecks, d
       fresh = { ...pr, comments };
       // Cheap first pass rejects judgment holds without reading checks or main history.
       if (!hasAutoProceedCandidate(fresh)) return fresh;
-      const checks = readChecks({ repo, head: pr.headRefOid, requiredChecks });
+      const checks = readChecks({ repo, head: pr.headRefOid, requiredChecks, requiredCheckBindings });
       try { context ??= readContext(); } catch { context = null; } // Cases a/b do not depend on main's ledger.
       const scoped = readScopedChecks() ?? DEFAULT_PR_SCOPED_CHECKS;
-      const decision = classifyStandDownAutoProceed({ pr: fresh, requiredChecks, checks,
+      const decision = classifyStandDownAutoProceed({ pr: fresh, requiredChecks, requiredCheckBindings, checks,
         redMainContext: context, prScopedChecks: scoped });
       if (decision.action !== 'auto-proceed') { log(`R123 PR #${pr.number}: ${decision.why}`); return fresh; }
       // A later operator question/answer may have arrived during check reads. Reclassify that full thread.
       const currentComments = refreshComments();
       fresh = { ...pr, comments: currentComments };
-      const current = classifyStandDownAutoProceed({ pr: fresh, requiredChecks, checks,
+      const current = classifyStandDownAutoProceed({ pr: fresh, requiredChecks, requiredCheckBindings, checks,
         redMainContext: context, prScopedChecks: scoped });
       if (current.action !== 'auto-proceed' || current.standDownId !== decision.standDownId) return fresh;
       // A rerun can start or fail on the same SHA while comments/main history are read.
       // Revalidate both feeds before reserving the sole post, and publish the fresh evidence.
-      const latestChecks = readChecks({ repo, head: pr.headRefOid, requiredChecks });
-      const latest = classifyStandDownAutoProceed({ pr: fresh, requiredChecks, checks: latestChecks,
+      const latestChecks = readChecks({ repo, head: pr.headRefOid, requiredChecks, requiredCheckBindings });
+      const latest = classifyStandDownAutoProceed({ pr: fresh, requiredChecks, requiredCheckBindings, checks: latestChecks,
         redMainContext: context, prScopedChecks: scoped });
       const knownFailures = new Set(checks.runs.filter(r => String(r.conclusion).toUpperCase() === 'FAILURE').map(r => r.id));
       if (latest.action !== 'auto-proceed' || latest.standDownId !== decision.standDownId
-        || latestChecks.runs.some(r => requiredChecks.includes(r.name)
-          && String(r.conclusion).toUpperCase() === 'FAILURE' && !knownFailures.has(r.id))) {
+        || boundAutoProceedRuns(latestChecks.runs, requiredChecks, requiredCheckBindings).some(r =>
+          String(r.conclusion).toUpperCase() === 'FAILURE' && !knownFailures.has(r.id))) {
         log(`R123 PR #${pr.number}: checks changed before post; operator hold retained`); return fresh;
       }
       if (headReader({ repo, number: pr.number }) !== pr.headRefOid) throw new Error('head moved; operator hold retained');
