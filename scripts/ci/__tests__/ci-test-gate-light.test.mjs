@@ -8,10 +8,11 @@ const raw = readFileSync(new URL('../../../.github/workflows/ci.yml', import.met
 const { jobs } = yaml.load(raw);
 const required = ['changes', 'test-shard', 'integration', 'standards', 'coverage-merge', 'host-paths'];
 
-function runGate({ light = 'false', results = {} } = {}) {
-  const values = Object.fromEntries(required.map((name) => [`needs.${name}.result`, results[name] ?? 'success']));
+function runGate({ light = 'false', results = {}, event = 'pull_request', job = 'test' } = {}) {
+  const values = Object.fromEntries([...required, 'hetzner'].map((name) => [`needs.${name}.result`, results[name] ?? 'success']));
   values['needs.changes.outputs.light'] = light;
-  const step = jobs.test.steps.find((s) => s.run);
+  values['github.event_name'] = event;
+  const step = jobs[job].steps.find((s) => s.run);
   expect(step).toBeDefined();
   const script = step.run.replace(/\$\{\{\s*([^}]+?)\s*\}\}/g, (_, expr) => {
     if (!(expr in values)) throw new Error(`Unmodelled gate expression: ${expr}`);
@@ -25,7 +26,7 @@ function runGate({ light = 'false', results = {} } = {}) {
 describe('ci.yml lightweight required test gate', () => {
   it('keeps the test status name, all dependencies, and !cancelled guard', () => {
     expect(jobs.test.name ?? 'test').toBe('test');
-    expect([...jobs.test.needs].sort()).toEqual([...required].sort());
+    expect([...jobs.test.needs].sort()).toEqual([...required, 'hetzner'].sort());
     expect(jobs.test.if).toBe('${{ !cancelled() }}');
   });
 
@@ -87,7 +88,7 @@ describe('ci.yml parallel coverage merge and host-path jobs', () => {
   it('merges only after successful full-run shards, using npm without FUI', () => {
     const merge = jobs['coverage-merge'];
     expect(merge).toBeDefined();
-    expect([...merge.needs].sort()).toEqual(['changes', 'test-shard']);
+    expect([...merge.needs].sort()).toEqual(['changes', 'hetzner', 'test-shard']);
     expect(merge.if).toBe("${{ !cancelled() && needs.changes.outputs.light != 'true' }}");
     expect(merge.steps.some((s) => s.run?.includes('needs.test-shard.result') && s.run.includes('success') && /exit [12]/.test(s.run))).toBe(true);
     const checkout = merge.steps.find((s) => s.uses?.startsWith('actions/checkout@'));
@@ -111,5 +112,25 @@ describe('ci.yml parallel coverage merge and host-path jobs', () => {
     expect(checkout.with?.['fetch-depth'] ?? 1).toBe(1);
     expect(host.steps.some((s) => s.run?.includes('node scripts/lint-host-paths.mjs'))).toBe(true);
     expect(jobs.standards.steps.some((s) => s.run?.includes('npm run check:standards'))).toBe(true);
+  });
+});
+
+// Execute the actual shell gates with the inactive jobs skipped, as GitHub reports them.
+describe.each(['pull_request', 'workflow_dispatch', 'merge_group', 'push'])('effective CI results on %s', (event) => {
+  const trusted = event === 'merge_group' || event === 'push';
+  const inactive = trusted ? { 'test-shard': 'skipped', integration: 'skipped' } : { hetzner: 'skipped' };
+  const active = trusted ? ['hetzner'] : ['test-shard', 'integration'];
+
+  it.each(['test', 'coverage-merge'])('%s accepts successful active jobs with the unused path skipped', (job) => {
+    expect(runGate({ event, job, results: inactive })).toBe(0);
+  });
+
+  describe.each(['test', 'coverage-merge'])('%s fails closed on the active path', (job) => {
+    const checked = job === 'test' ? active : [trusted ? 'hetzner' : 'test-shard'];
+    it.each(['failure', 'skipped', 'cancelled', '', 'unknown'])('rejects active result %j even when unused jobs succeeded', (result) => {
+      for (const name of checked) {
+        expect(runGate({ event, job, results: { [name]: result } })).not.toBe(0);
+      }
+    });
   });
 });
