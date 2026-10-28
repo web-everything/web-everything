@@ -4,10 +4,32 @@ import { openSync, readSync, closeSync, opendirSync } from 'node:fs';
 const MAX_BYTES = 1024 * 1024;
 const MAX_ENTRIES = 65536;
 const TIMEOUT = 2000;
-const EXEC_OPTIONS = Object.freeze({ encoding: 'utf8', timeout: TIMEOUT, maxBuffer: MAX_BYTES, shell: false });
+const EXEC_OPTIONS = Object.freeze({ encoding: 'utf8', timeout: TIMEOUT, maxBuffer: MAX_BYTES, shell: false, killSignal: 'SIGKILL' });
+const BOOT_ID = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i;
+const LINUX_START = /^(?:0|[1-9]\d{0,19})$/;
+const PS_START = /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) ([1-9]|[12]\d|3[01]) ([01]\d|2[0-3]):[0-5]\d:[0-5]\d (\d{4})$/;
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const unknown = (reason) => ({ status: 'unknown', reason });
 const positive = (value) => Number.isSafeInteger(value) && value > 0;
 const unsigned = (value) => Number.isSafeInteger(value) && value >= 0;
+
+function validBootId(value) {
+  return typeof value === 'string' && value.length === 36 && BOOT_ID.test(value);
+}
+
+function validPsStart(value) {
+  if (typeof value !== 'string' || value !== value.trim()) return false;
+  const match = PS_START.exec(value);
+  if (!match) return false;
+  const [, month, day, , year] = match;
+  const date = new Date(0);
+  date.setUTCFullYear(Number(year), MONTHS.indexOf(month), Number(day));
+  return date.getUTCMonth() === MONTHS.indexOf(month) && date.getUTCDate() === Number(day);
+}
+
+function validLinuxStart(value) {
+  return typeof value === 'string' && value === value.trim() && LINUX_START.test(value);
+}
 
 function boundedText(value) {
   if (!(typeof value === 'string' || Buffer.isBuffer(value))) throw new Error('Non-text evidence');
@@ -66,7 +88,7 @@ export function currentBootId(deps = {}) {
     const value = (io.platform === 'linux'
       ? boundedText(io.readFile('/proc/sys/kernel/random/boot_id'))
       : io.platform === 'darwin' ? exec(io, 'sysctl', ['-n', 'kern.bootsessionuuid']) : '').trim();
-    return /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i.test(value) ? value : null;
+    return validBootId(value) ? value : null;
   } catch {
     return null;
   }
@@ -77,7 +99,8 @@ function linuxProcess(pid, io) {
   const end = stat.lastIndexOf(')');
   if (!stat.startsWith(`${pid} (`) || end < 0) throw new Error('Malformed procfs stat');
   const fields = stat.slice(end + 1).trim().split(/\s+/);
-  if (fields.length < 20 || !/^[A-Za-z]$/.test(fields[0]) || !/^\d+$/.test(fields[19])) {
+  if (fields.length < 20 || !/^[RSDZTtWXxKPI]$/.test(fields[0]) ||
+      !/^\d+$/.test(fields[2]) || !validLinuxStart(fields[19])) {
     throw new Error('Incomplete procfs stat');
   }
   const pgid = Number(fields[2]);
@@ -98,7 +121,7 @@ function psProcesses(output) {
     const [, uid, pid, ppid, pgid, state, start] = match;
     const startTime = start.trim().replace(/\s+/g, ' ');
     if (!unsigned(Number(uid)) || !positive(Number(pid)) || !unsigned(Number(ppid)) || !positive(Number(pgid)) ||
-        !/^[A-Za-z]{3} [A-Za-z]{3} \d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/.test(startTime)) {
+        !/^[IRSTUZ]$/.test(state[0]) || !validPsStart(startTime)) {
       throw new Error('Incomplete ps identity');
     }
     return { pid: Number(pid), pgid: Number(pgid), uid: Number(uid), startTime, state: state[0] };
@@ -134,8 +157,7 @@ export function readIdentity(pid, deps = {}) {
 
 function validIdentity(value) {
   return value && positive(value.pid) && unsigned(value.uid) &&
-    typeof value.startTime === 'string' && value.startTime.trim().length > 0 &&
-    typeof value.bootId === 'string' && value.bootId.trim().length > 0;
+    (validLinuxStart(value.startTime) || validPsStart(value.startTime)) && validBootId(value.bootId);
 }
 
 export function sameIdentity(a, b) {
@@ -148,7 +170,7 @@ export function liveness(expected, deps = {}) {
   const result = readIdentity(expected.pid, deps);
   if (result.status === 'gone') return 'dead';
   if (result.status !== 'ok') return 'unknown';
-  return result.identity.state === 'Z' || !sameIdentity(expected, result.identity) ? 'dead' : 'alive';
+  return ['Z', 'X', 'x'].includes(result.identity.state) || !sameIdentity(expected, result.identity) ? 'dead' : 'alive';
 }
 
 /** Incomplete enumeration yields unknown, never a partial membership snapshot. */

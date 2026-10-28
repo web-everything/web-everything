@@ -59,6 +59,30 @@ const linuxIdentity = { pid: PID, startTime: '987654', bootId: BOOT, uid: UID, s
 const darwinIdentity = { ...linuxIdentity, startTime: START };
 
 describe('readIdentity parsers', () => {
+  it.each(['linux', 'darwin'])('%s unrecognised process state stays unknown throughout', (platform) => {
+    const deps = platform === 'linux'
+      ? linuxDeps({ processes: [{ pid: PID, state: 'Q' }] })
+      : darwinDeps({ output: HEADER + psRow({ state: 'Q' }) });
+    expect(readIdentity(PID, deps).status).toBe('unknown');
+    expect(liveness(platform === 'linux' ? linuxIdentity : darwinIdentity, deps)).toBe('unknown');
+    expect(listGroup(PID, deps).status).toBe('unknown');
+  });
+
+  it('a non-decimal Linux process group is malformed evidence', () => {
+    const deps = linuxDeps({ processes: [{ pid: PID, pgid: '1e4' }] });
+    expect(readIdentity(PID, deps).status).toBe('unknown');
+    expect(liveness(linuxIdentity, deps)).toBe('unknown');
+    expect(listGroup(PID, deps).status).toBe('unknown');
+  });
+
+  it('an impossible ps start timestamp is unknown, even when recorded identically', () => {
+    const startTime = 'Bad Foo 99 99:99:99 2026';
+    const deps = darwinDeps({ output: HEADER + psRow({ startTime }) });
+    expect(readIdentity(PID, deps).status).toBe('unknown');
+    expect(liveness({ ...darwinIdentity, startTime }, deps)).toBe('unknown');
+    expect(listGroup(PID, deps).status).toBe('unknown');
+  });
+
   it('Linux parses field 22 after the last comm parenthesis and reads the first status Uid', () => {
     expect(readIdentity(PID, linuxDeps())).toEqual({ status: 'ok', identity: linuxIdentity });
   });
@@ -109,6 +133,23 @@ describe('sameIdentity', () => {
 });
 
 describe('liveness identity checks', () => {
+  it.each(['linux', 'darwin'])('%s matching live identity is alive', (platform) => {
+    expect(liveness(platform === 'linux' ? linuxIdentity : darwinIdentity,
+      platform === 'linux' ? linuxDeps() : darwinDeps())).toBe('alive');
+  });
+
+  it.each([
+    ['bootId', 'unreadable'], ['bootId', ''], ['bootId', undefined],
+    ['startTime', 'unreadable'], ['startTime', ''], ['startTime', undefined],
+    ['uid', undefined], ['pid', undefined],
+  ])('invalid recorded %s (%s) stays unknown without probing', (key, value) => {
+    const expected = { ...linuxIdentity, [key]: value };
+    const deps = linuxDeps();
+    expect(liveness(expected, deps)).toBe('unknown');
+    expect(sameIdentity(expected, expected)).toBe(false);
+    expect(deps.readFile).not.toHaveBeenCalled();
+  });
+
   it('Linux pid reuse with a different start time is dead', () => {
     expect(liveness(linuxIdentity, linuxDeps({ processes: [{ pid: PID, startTime: '987655' }] }))).toBe('dead');
   });
@@ -126,6 +167,17 @@ describe('liveness identity checks', () => {
     const deps = platform === 'linux'
       ? linuxDeps({ processes: [{ pid: PID, state: 'Z' }] })
       : darwinDeps({ output: HEADER + psRow({ state: 'Z+' }) });
+    expect(liveness(platform === 'linux' ? linuxIdentity : darwinIdentity, deps)).toBe('dead');
+  });
+
+  it.each(['X', 'x'])('Linux dead state %s is never alive', (state) => {
+    expect(liveness(linuxIdentity, linuxDeps({ processes: [{ pid: PID, state }] }))).toBe('dead');
+  });
+
+  it.each(['linux', 'darwin'])('%s real uid mismatch is dead', (platform) => {
+    const deps = platform === 'linux'
+      ? linuxDeps({ processes: [{ pid: PID, uid: UID + 1 }] })
+      : darwinDeps({ output: HEADER + psRow({ uid: UID + 1 }) });
     expect(liveness(platform === 'linux' ? linuxIdentity : darwinIdentity, deps)).toBe('dead');
   });
 });
@@ -174,9 +226,22 @@ describe('bounded probes fail closed', () => {
       expect(Array.isArray(args)).toBe(true);
       expect(Number.isFinite(options.timeout)).toBe(true);
       expect(options.timeout).toBeGreaterThan(0);
+      expect(options.timeout).toBeLessThanOrEqual(2000);
       expect(Number.isFinite(options.maxBuffer)).toBe(true);
       expect(options.maxBuffer).toBeGreaterThan(0);
+      expect(options.maxBuffer).toBeLessThanOrEqual(1024 * 1024);
+      expect(options.shell).toBe(false);
+      expect(options.killSignal).toBe('SIGKILL');
     });
+  });
+
+  it.each(['stat', 'status'])('oversized Linux %s stays unknown throughout', (file) => {
+    const deps = linuxDeps();
+    const readFile = deps.readFile;
+    deps.readFile = (path) => path.endsWith(`/${file}`) ? 'x'.repeat(1024 * 1024 + 1) : readFile(path);
+    expect(readIdentity(PID, deps).status).toBe('unknown');
+    expect(liveness(linuxIdentity, deps)).toBe('unknown');
+    expect(listGroup(PID, deps).status).toBe('unknown');
   });
 });
 
@@ -189,9 +254,39 @@ describe('currentBootId', () => {
     const fail = () => { throw new Error('unavailable'); };
     expect(currentBootId({ platform, readFile: fail, exec: fail })).toBeNull();
   });
+
+  it.each(['linux', 'darwin'])('%s missing or oversized boot evidence stays unknown', (platform) => {
+    for (const bootId of ['', 'garbled', 'x'.repeat(1024 * 1024 + 1)]) {
+      const deps = platform === 'linux' ? linuxDeps({ bootId }) : darwinDeps({ bootId });
+      expect(currentBootId(deps)).toBeNull();
+      expect(readIdentity(PID, deps).status).toBe('unknown');
+      expect(liveness(platform === 'linux' ? linuxIdentity : darwinIdentity, deps)).toBe('unknown');
+      expect(listGroup(PID, deps).status).toBe('unknown');
+    }
+  });
 });
 
 describe('listGroup', () => {
+  it('an unreadable Linux member invalidates the whole group snapshot', () => {
+    const deps = linuxDeps({ processes: [{ pid: PID }, { pid: PID + 1 }] });
+    const readFile = deps.readFile;
+    deps.readFile = (path) => {
+      if (path === `/proc/${PID + 1}/status`) throw new Error('denied');
+      return readFile(path);
+    };
+    expect(listGroup(PID, deps)).toEqual({ status: 'unknown', reason: expect.any(String) });
+  });
+
+  it.each(['garbled', 'x'.repeat(1024 * 1024 + 1)])('incomplete macOS group output fails closed', (output) => {
+    expect(listGroup(PID, darwinDeps({ output })).status).toBe('unknown');
+  });
+
+  it('an oversized procfs directory fails closed', () => {
+    const deps = linuxDeps();
+    deps.readdir = () => Array(65537).fill(String(PID));
+    expect(listGroup(PID, deps).status).toBe('unknown');
+  });
+
   it('Linux scans procfs and includes only identities in the requested pgid, with their own uids', () => {
     const deps = linuxDeps({ processes: [{ pid: PID }, { pid: PID + 1, pgid: PID, uid: 502 }, { pid: PID + 2, pgid: 77 }] });
     const result = listGroup(PID, deps);
@@ -218,8 +313,13 @@ describe('listGroup', () => {
 
   it('macOS group probe timeout returns unknown with a reason', () => {
     const deps = darwinDeps();
-    deps.exec = () => { throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }); };
+    const exec = deps.exec;
+    deps.exec = vi.fn((file, ...args) => {
+      if (file === 'ps') throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' });
+      return exec(file, ...args);
+    });
     expect(listGroup(PID, deps)).toEqual({ status: 'unknown', reason: expect.any(String) });
+    expect(deps.exec).toHaveBeenCalledWith('ps', ['-A', '-o', 'uid,pid,ppid,pgid,stat,lstart'], expect.any(Object));
   });
 });
 
