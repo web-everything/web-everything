@@ -23,6 +23,7 @@ import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../conve
  */
 import { markFixPushAwaitingCi } from '../conveyor/fix-push-ci.mjs';
 import { execFileSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import * as nodeFs from 'node:fs';
 import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, realpathSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -37,7 +38,7 @@ import { PR_BASE_MERGE_TARGET, recordBorrowOutcome, recordRoutedOutcome, consecu
 import { appendFixLoopRow, isInfraFixRunOutcome } from '../conveyor/fix-loop-ledger.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { riskyLaneConfig, LANE_CONFIG_LIST_ARGS, laneGitConfigArgs, laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
-import { LEASE_FILENAME } from '../lib/lane-lease.mjs';
+import { LEASE_FILENAME, renewedLease } from '../lib/lane-lease.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 
 // LAZY on purpose: `deliver-item-wrapper.mjs` reaches `dispatch-providers/fix.mjs` (which imports this file) through
@@ -165,6 +166,8 @@ export function unmergedPaths(porcelain) {
 
 /** A refusal the launcher itself wrote: the only kind of error whose message may be posted to the public PR. */
 export class LauncherError extends Error {}
+
+export class LeaseLostError extends LauncherError {}
 
 const SCRATCH_RE = /^(?:\.fix-.*(?:commit-msg|commit-message).*\.txt|\.delivery-commit-msg-.*|\.converge-.*)$/;
 
@@ -454,6 +457,26 @@ export function readLaneLease(lanePath) {
   catch (e) { if (e.code === 'ENOENT') return null; throw e; }
 }
 
+/** Best-effort atomic renewal of an existing lease that still belongs to this launcher. */
+export function defaultRenewLease({ lanePath, holder } = {}) {
+  try {
+    const lease = readLaneLease(lanePath);
+    if (!holder || lease?.holder !== holder) return false;
+    const next = renewedLease(lease, new Date().toISOString());
+    if (!next) return false;
+    const file = join(lanePath, '.git', LEASE_FILENAME);
+    const tmp = `${file}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
+    try {
+      writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { flag: 'wx' });
+      if (readLaneLease(lanePath)?.holder !== holder) return false;
+      nodeFs.renameSync(tmp, file);
+    } finally {
+      rmSync(tmp, { force: true });
+    }
+    return true;
+  } catch { return false; }
+}
+
 /** Pure decision; clean must be positively observed before a reset can be proposed. */
 export function laneHeadCheck({ laneHead, prHead, lease, holder, clean = false }) {
   const mismatch = `${laneHead?.slice(0, 9) || 'unknown'}, not PR head ${prHead?.slice(0, 9) || 'unknown'}`;
@@ -481,11 +504,14 @@ export function inspectLaneHead({ lanePath, prHead, holder, run = sh, readLease 
 }
 
 export function assertLaneLease({ lanePath, holder, readLease = readLaneLease, phase = 'start the agent' }) {
+  let lease;
   try {
-    const lease = readLease(lanePath);
-    if (!holder || lease?.holder !== holder) throw new Error(`lease now held by ${lease?.holder || 'unknown'} (expected ${holder || 'unknown'})`);
+    lease = readLease(lanePath);
   } catch (e) {
     throw new LauncherError(`fix-run: ${basename(lanePath)} ${e.message}; refusing to ${phase}`);
+  }
+  if (!holder || lease?.holder !== holder) {
+    throw new LeaseLostError(`fix-run: ${basename(lanePath)} lease now held by ${lease?.holder || 'unknown'} (expected ${holder || 'unknown'}); refusing to ${phase}`);
   }
 }
 
@@ -589,6 +615,8 @@ export async function runFixCli(argv = [], {
   recordOutcome = recordBorrowOutcome,
   recordRouted = recordRoutedOutcome,
   readLease = readLaneLease,
+  renewLease = defaultRenewLease,
+  heartbeatMs = 60_000,
   readFile = readLaneFileSafe,
   stageEntry = laneStageEntry,
   fileExists = existsSync,
@@ -628,7 +656,8 @@ export async function runFixCli(argv = [], {
     if (head) {
       try {
         await appendLoopRow({ kind: 'outcome', repo, pr: Number(launch.pr), head, session: launch.sessionSlug,
-          outcome, infra: isInfraFixRunOutcome(outcome, reason), reason });
+          // The fix-loop ledger only accepts pushed|no-change|failed rows; a lease loss is a failed, non-infra row.
+          outcome: outcome === 'lease-lost' ? 'failed' : outcome, infra: isInfraFixRunOutcome(outcome, reason), reason });
       } catch (e) { writeErr(`fix-run: could not record fix-loop outcome: ${String(e?.message ?? e)}\n`); }
     }
     try {
@@ -894,21 +923,31 @@ export async function runFixCli(argv = [], {
       write(`fix-run: ${finalMessage}\n`);
     } else try {
       checkLane(unmerged.length ? before : preparedHead, !target);
-      spawned = await provider.spawn({
-        taskKind: launch.taskKind, usageTaskKind: launch.repairKind === 'ci-heal' ? 'ci-heal' : launch.taskKind, repo: launch.repo, pr, caller: 'fix-run.mjs',
-        sessionId: undefined, prompt: mergePrompt + (launch.repairKind === 'ci-heal'
-          ? SANDBOX_PREAMBLE.replace(/The reviewer's finding[\s\S]*?authoritative ask\.\n/, 'The failing checks and tests are in the CI FAILURE CONTEXT section below.\n')
-          : SANDBOX_PREAMBLE) + prContext + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
-        ...(launch.model ? { model: launch.model } : {}), ...(launch.effort ? { effort: launch.effort } : {}),
-      }, { resolveLane: () => lanePath, ...(launch.provider === 'codex' ? {
-        spawnAgent: async (...args) => {
-          try {
-            const result = await spawnCodex(...args);
-            finalMessage = agentFinalMessage(result);
-            return result;
-          } catch (e) { finalMessage = agentFinalMessage(e); throw e; }
-        },
-      } : {}) });
+      const heartbeat = setInterval(() => {
+        try {
+          if (readLease(lanePath)?.holder === holder) renewLease({ lanePath, holder });
+        } catch { /* Renewal is best-effort; the ownership guards still refuse mutations. */ }
+      }, heartbeatMs);
+      heartbeat.unref();
+      try {
+        spawned = await provider.spawn({
+          taskKind: launch.taskKind, usageTaskKind: launch.repairKind === 'ci-heal' ? 'ci-heal' : launch.taskKind, repo: launch.repo, pr, caller: 'fix-run.mjs',
+          sessionId: undefined, prompt: mergePrompt + (launch.repairKind === 'ci-heal'
+            ? SANDBOX_PREAMBLE.replace(/The reviewer's finding[\s\S]*?authoritative ask\.\n/, 'The failing checks and tests are in the CI FAILURE CONTEXT section below.\n')
+            : SANDBOX_PREAMBLE) + prContext + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
+          ...(launch.model ? { model: launch.model } : {}), ...(launch.effort ? { effort: launch.effort } : {}),
+        }, { resolveLane: () => lanePath, ...(launch.provider === 'codex' ? {
+          spawnAgent: async (...args) => {
+            try {
+              const result = await spawnCodex(...args);
+              finalMessage = agentFinalMessage(result);
+              return result;
+            } catch (e) { finalMessage = agentFinalMessage(e); throw e; }
+          },
+        } : {}) });
+      } finally {
+        clearInterval(heartbeat);
+      }
     } catch (e) {
       finalMessage = agentFinalMessage(e) || finalMessage;
       throw e;
@@ -981,11 +1020,15 @@ export async function runFixCli(argv = [], {
     return { code: 0, result };
   } catch (e) {
     writeErr(`fix-run: PR #${pr} FAILED: ${String(e?.message ?? e)}\n`);
-    outcome = 'failed'; reason = `${childFailureReason(e)}${finalMessage && !String(e?.message).includes(finalMessage) ? `: ${finalMessage}` : ''}`;
+    outcome = e instanceof LeaseLostError ? 'lease-lost' : 'failed';
+    reason = `${childFailureReason(e)}${finalMessage && !String(e?.message).includes(finalMessage) ? `: ${finalMessage}` : ''}`;
+    if (e instanceof LeaseLostError) reason = `lease-lost: ${reason.replace(/^fix-run:\s*/, '')}`;
     if (!finalMessage && e instanceof LauncherError) {
       finalMessage = e.message;
     }
-    try { abortMerge?.(); } catch (abortError) { writeErr(`fix-run: merge abort failed: ${abortError.message}\n`); }
+    if (!(e instanceof LeaseLostError)) {
+      try { abortMerge?.(); } catch (abortError) { writeErr(`fix-run: merge abort failed: ${abortError.message}\n`); }
+    }
     return { code: 1, result: null };
   } finally {
     removePrompt(launch.promptFile); // one-shot, untrusted text: gone on every exit, success or not
