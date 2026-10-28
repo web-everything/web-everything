@@ -13,7 +13,7 @@ it('the default fast checks exist and standards can finish independently of the 
 });
 it('card-only PRs get a scope receipt while every expensive shard step stays skipped', () => {
   const shard = jobs['test-shard'];
-  expect(shard.if).toBeUndefined();
+  expect(shard.if).toBe("${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}");
   const receipt = shard.steps.filter(s => s.name === 'Card-only unit scope receipt');
   expect(receipt).toHaveLength(1);
   expect(receipt[0].if).toContain("needs.changes.outputs.light == 'true'");
