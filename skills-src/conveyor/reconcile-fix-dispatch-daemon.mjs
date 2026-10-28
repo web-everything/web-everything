@@ -523,6 +523,7 @@ export function planVerdictVoid({ note, pr, repo, verdictSettings, readRequiredC
   // verdict, so the required-check set is never read.
   const anyRed = contradictingChecks({
     escalation: { outcome: note.outcome, headSha: note.headSha }, headSha: pr.headRefOid, rollup: pr.statusCheckRollup,
+    timeoutRetry: pr.timeoutRetry, timeoutRetryBudget: pr.timeoutRetryBudget,
     requiredChecks: [...new Set((pr.statusCheckRollup ?? []).map((r) => r?.name ?? r?.context).filter(Boolean))],
   });
   if (!anyRed.length) return null;
@@ -530,6 +531,7 @@ export function planVerdictVoid({ note, pr, repo, verdictSettings, readRequiredC
   try { requiredChecks = readRequiredChecks({ repo }) ?? []; } catch { return null; }
   const red = contradictingChecks({
     escalation: { outcome: note.outcome, headSha: note.headSha }, headSha: pr.headRefOid, rollup: pr.statusCheckRollup, requiredChecks,
+    timeoutRetry: pr.timeoutRetry, timeoutRetryBudget: pr.timeoutRetryBudget,
   });
   if (!red.length) return null;
   const head = String(note.headSha).toLowerCase();

@@ -11,6 +11,7 @@ export default {
   fixedBy: { sha: 'HEAD', where: 'lane/review-gate-only-red', paths: [
     'scripts/conveyor/reconcile-core.mjs', 'scripts/conveyor/ci-heal-escalation-mark.mjs',
     'scripts/conveyor/ci-heal-verdict-recheck.mjs',
+    'skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs',
   ] },
   fixPresent(root) {
     return readFileSync(join(root, 'scripts/conveyor/reconcile-core.mjs'), 'utf8').includes('reviewFailures.required')
@@ -41,6 +42,12 @@ export default {
           timeoutRetry: { eligible: true, infraCancelled: true, head, pr: pull.number, cap: 6,
             jobs: [{ run: 10, job: 20, attempt: 1 }] },
           timeoutRetryBudget: { confirmed: 6, rejected: 0, pending: false } } },
+      { name: 'later infra-cancelled smoke voids verdict and restores retry', expected: 'ci-timeout-rerun',
+        checkVoid: true, expectVoid: true,
+        over: { labels: [], comments: [standDown],
+          timeoutRetry: { eligible: true, infraCancelled: true, head, pr: pull.number, cap: 6,
+            jobs: [{ run: 10, job: 20, attempt: 1 }] },
+          timeoutRetryBudget: { confirmed: 0, rejected: 0, pending: false } } },
       { name: 'missing smoke on old base', expected: 'fix', mode: 'stale-base-rebase',
         reviewTiming: { startAfter: 'ci-green' },
         over: { baseRefName: 'main', statusCheckRollup: rollup.filter(row => row.name !== 'smoke') } },
@@ -93,8 +100,10 @@ export default {
           const voidRow = planVerdictVoid({ note: { kind: 'ci-heal-escalated', outcome: 'not-a-ci-break',
             headSha: head, prNumber: pull.number }, pr, repo: 'review-gate-fixture/example',
             verdictSettings: { recheckNotCiBreak: true }, readRequiredChecks: () => requiredChecks });
+          if (Boolean(voidRow) !== Boolean(variant.expectVoid)) {
+            violations.push(`tick ${tick} ${variant.name}: expected void=${Boolean(variant.expectVoid)}, got ${Boolean(voidRow)}`);
+          }
           if (voidRow) {
-            violations.push(`tick ${tick} ${variant.name}: permitted cancelled smoke verdict was voided`);
             pr.comments = [...pr.comments, { author: { login: 'web-everything' }, body: voidRow.body }];
           }
         }

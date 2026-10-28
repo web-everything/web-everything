@@ -3,6 +3,9 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { requiredCheckStates, contradictingChecks, notCiBreakContradicted, unsettledRequiredChecks, ciGreenForEscalation, resolveVoidNeedsHumanWhenCiGreen, resolveCiHealVerdictSettings } from '../ci-heal-verdict-recheck.mjs';
+import { buildCiHealEscalationComment, notCiBreakRecordRefusal } from '../ci-heal-escalation-mark.mjs';
+import { planReconcile } from '../reconcile-core.mjs';
+import { planVerdictVoid } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
 
 const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/ci-heal-verdict/pr4535-2026-10-09.json'), 'utf8'));
 const input = { escalation: { outcome: 'not-a-ci-break', headSha: fixture.headRefOid }, headSha: fixture.headRefOid,
@@ -40,6 +43,66 @@ describe('required check verdict recheck', () => {
   it('unknown required set claims nothing red', () => expect(contradictingChecks({ ...input, requiredChecks: [] })).toEqual([]));
   it('legacy StatusContext failures count', () => {
     expect(contradictingChecks({ ...input, rollup: [{ __typename: 'StatusContext', context: 'test', state: 'FAILURE' }] })).toEqual(['test']);
+  });
+});
+
+describe('cancelled smoke verdict retry ownership', () => {
+  const head = 'a'.repeat(40);
+  const check = (conclusion) => ({ name: 'smoke', status: 'COMPLETED', conclusion });
+  const retry = { eligible: true, infraCancelled: true, head, pr: 5972,
+    jobs: [{ run: 10, job: 20, attempt: 1 }] };
+  const pull = (over = {}) => ({ number: 5972, state: 'OPEN', isDraft: false,
+    headRefOid: head, headRefName: 'lane/verdict-retry', mergeStateStatus: 'CLEAN', labels: [],
+    statusCheckRollup: [check('CANCELLED')],
+    comments: [{ author: { login: 'web-everything' },
+      body: buildCiHealEscalationComment({ headSha: head, outcome: 'not-a-ci-break' }) }],
+    timeoutRetry: retry, timeoutRetryBudget: { confirmed: 0, rejected: 0, pending: false }, ...over });
+  const voidFor = (pr, requiredChecks = ['smoke']) => planVerdictVoid({ pr,
+    note: { kind: 'ci-heal-escalated', outcome: 'not-a-ci-break', headSha: head, prNumber: pr.number },
+    repo: 'web-everything/web-everything', verdictSettings: { recheckNotCiBreak: true },
+    readRequiredChecks: () => requiredChecks });
+
+  it('not-a-ci-break recorded, later smoke infra-cancelled with retry unspent: verdict is voided and retry dispatches', () => {
+    const pr = pull({ statusCheckRollup: [check('SUCCESS')] });
+    expect(notCiBreakRecordRefusal({ headSha: head, pr, requiredChecks: ['smoke'] })).toBeNull();
+    expect(voidFor(pr)).toBeNull();
+    pr.statusCheckRollup = [check('CANCELLED')];
+    const plan = () => planReconcile({ prs: [pr], agents: [], requiredChecks: ['smoke'] });
+    expect(plan().dispatch).toEqual([]);
+    const row = voidFor(pr);
+    expect(row).toMatchObject({ kind: 'ci-heal-verdict-void', alreadyPosted: false });
+    pr.comments.push({ author: { login: 'web-everything' }, body: row.body });
+    expect(plan().dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-timeout-rerun' }));
+  });
+
+  it.each([
+    ['pending request even at cap', { timeoutRetryBudget: { confirmed: 6, pending: true } }],
+    ['unknown spent budget', { timeoutRetryBudget: undefined }],
+    ['unreadable retry evidence', { timeoutRetry: { eligible: false, reason: 'timeout-evidence:read-failed' } }],
+    ['custom cap with one retry left', { timeoutRetry: { ...retry, cap: 3 }, timeoutRetryBudget: { confirmed: 1, rejected: 1 } }],
+  ])('cancelled smoke contradicts recorded verdict with %s', (_name, over) => {
+    const pr = pull(over);
+    expect(notCiBreakRecordRefusal({ headSha: head, pr, requiredChecks: ['smoke'] })).toBeTruthy();
+    expect(voidFor(pr)).toMatchObject({ kind: 'ci-heal-verdict-void', alreadyPosted: false });
+  });
+
+  it.each([
+    ['exhausted default cap', { timeoutRetryBudget: { confirmed: 6, pending: false } }],
+    ['rejections exhaust custom cap', { timeoutRetry: { ...retry, cap: 3 }, timeoutRetryBudget: { confirmed: 1, rejected: 2 } }],
+    ['ineligible retry', { timeoutRetry: { eligible: false } }],
+  ])('cancelled smoke with no retry owed stays settled: %s', (_name, over) => {
+    const pr = pull(over);
+    expect(notCiBreakRecordRefusal({ headSha: head, pr, requiredChecks: ['smoke'] })).toBeNull();
+    expect(voidFor(pr)).toBeNull();
+    expect(ciGreenForEscalation({ rollup: pr.statusCheckRollup, requiredChecks: ['smoke'] })).toBe(false);
+  });
+
+  it('retry evidence does not void optional smoke or superseded cancellation', () => {
+    expect(voidFor(pull(), ['test'])).toBeNull();
+    expect(voidFor(pull({ statusCheckRollup: [
+      { ...check('SUCCESS'), startedAt: '2026-10-27T02:00:00Z' },
+      { ...check('CANCELLED'), startedAt: '2026-10-27T01:00:00Z' },
+    ] }))).toBeNull();
   });
 });
 

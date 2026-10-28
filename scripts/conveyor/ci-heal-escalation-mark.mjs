@@ -57,9 +57,8 @@ import { collectCiAuthDiagnosis, renderCiAuthDiagnosis } from './ci-auth-diagnos
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { isBudgetRefusal, postPrComment, recordOwedWrite, resolveOwedRepo } from './ci-heal-owed.mjs';
-import { isCancelledSmoke, resolveCiHealVerdictSettings, unsettledRequiredChecks } from './ci-heal-verdict-recheck.mjs';
+import { cancelledSmokeRetryRefusal, isCancelledSmoke, resolveCiHealVerdictSettings, unsettledRequiredChecks } from './ci-heal-verdict-recheck.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
-import { DEFAULT_INFRA_CANCELLED_MAX_RERUNS } from './infra-cancelled.mjs';
 
 /**
  * we:scripts/conveyor/ci-heal-escalation-mark.mjs#CI_HEAL_ESCALATION_MARKER — the stable FIRST LINE of the
@@ -351,16 +350,8 @@ export function notCiBreakRecordRefusal({ headSha, pr, requiredChecks }) {
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return null;
   const latest = collapseRollupToLatestPerName(pr?.statusCheckRollup);
   if (latest.some(isCancelledSmoke)) {
-    const retry = pr?.timeoutRetry;
-    const budget = pr?.timeoutRetryBudget;
-    if (String(retry?.reason ?? '').startsWith('timeout-evidence:')) {
-      return `Cannot establish cancelled smoke retry state: ${retry.reason}`;
-    }
-    const spent = budget?.confirmed === undefined ? undefined : budget.confirmed + (budget.rejected ?? 0);
-    if (budget?.pending || (retry?.eligible && retry.infraCancelled
-        && (spent === undefined || spent < (retry.cap ?? DEFAULT_INFRA_CANCELLED_MAX_RERUNS)))) {
-      return 'Cancelled smoke still has an infrastructure retry pending or owed; resolve the retry before recording not-a-ci-break.';
-    }
+    const refusal = cancelledSmokeRetryRefusal(pr);
+    if (refusal) return refusal;
   }
   // Share the cancelled-smoke exception with the verdict reader, after preserving retry ownership above.
   const u = unsettledRequiredChecks({ rollup: latest, requiredChecks });

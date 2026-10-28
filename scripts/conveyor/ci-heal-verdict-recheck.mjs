@@ -28,6 +28,7 @@ import { fileURLToPath } from 'node:url';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.mjs';
 import { FAILING_CONCLUSIONS } from '../operations/pr-status.mjs';
+import { DEFAULT_INFRA_CANCELLED_MAX_RERUNS } from './infra-cancelled.mjs';
 
 export const CI_HEAL_VERDICT_ENV = 'WE_CI_HEAL_RECHECK_NOT_CI_BREAK';
 export const ciHealVerdictSettingsPath = () => join(dirname(fileURLToPath(import.meta.url)), 'ci-heal-verdict-settings.json');
@@ -117,23 +118,37 @@ export function isCancelledSmoke(row) {
     && String(row?.status).toLowerCase() === 'completed' && String(row?.conclusion).toLowerCase() === 'cancelled';
 }
 
-// Recording and invalidation must judge the same latest result. The recording caller additionally
-// checks whether a smoke retry is owed; this exception never declares CI green for needs-human retirement.
-function notCiBreakCheckStates({ rollup, requiredChecks }) {
+/** Shared recording/invalidation guard: cancelled smoke is settled only when no infra retry is pending or owed. */
+export function cancelledSmokeRetryRefusal({ timeoutRetry: retry, timeoutRetryBudget: budget } = {}) {
+  if (String(retry?.reason ?? '').startsWith('timeout-evidence:')) {
+    return `Cannot establish cancelled smoke retry state: ${retry.reason}`;
+  }
+  const spent = budget?.confirmed === undefined ? undefined : budget.confirmed + (budget.rejected ?? 0);
+  if (budget?.pending || (retry?.eligible && retry.infraCancelled
+      && (spent === undefined || spent < (retry.cap ?? DEFAULT_INFRA_CANCELLED_MAX_RERUNS)))) {
+    return 'Cancelled smoke still has an infrastructure retry pending or owed; resolve the retry before recording not-a-ci-break.';
+  }
+  return null;
+}
+
+// Recording and invalidation judge the same latest result and retry ownership. This exception never declares
+// CI green for needs-human retirement.
+function notCiBreakCheckStates({ rollup, requiredChecks, timeoutRetry, timeoutRetryBudget }) {
   const latest = collapseRollupToLatestPerName(rollup);
+  const retryRefusal = cancelledSmokeRetryRefusal({ timeoutRetry, timeoutRetryBudget });
   return requiredCheckStates({ requiredChecks,
-    rollup: latest.map(row => isCancelledSmoke(row) ? { ...row, conclusion: 'success' } : row) });
+    rollup: latest.map(row => isCancelledSmoke(row) && !retryRefusal ? { ...row, conclusion: 'success' } : row) });
 }
 
 /**
  * The required checks that contradict a `not-a-ci-break` verdict on THIS head: names whose latest run completed
  * failing. `[]` when the escalation is not `not-a-ci-break`, names another head, or nothing is red. PURE.
- * @param {{escalation:{outcome?:string, headSha?:string}|null, headSha:string, rollup:Array<object>, requiredChecks:string[]}} o
+ * @param {{escalation:{outcome?:string, headSha?:string}|null, headSha:string, rollup:Array<object>, requiredChecks:string[], timeoutRetry?:object, timeoutRetryBudget?:object}} o
  * @returns {string[]}
  */
-export function contradictingChecks({ escalation, headSha, rollup, requiredChecks }) {
+export function contradictingChecks({ escalation, headSha, rollup, requiredChecks, timeoutRetry, timeoutRetryBudget }) {
   if (escalation?.outcome !== 'not-a-ci-break' || !sameSha(escalation.headSha, headSha)) return [];
-  return notCiBreakCheckStates({ rollup, requiredChecks }).red;
+  return notCiBreakCheckStates({ rollup, requiredChecks, timeoutRetry, timeoutRetryBudget }).red;
 }
 
 /** {@link contradictingChecks} as a yes/no. PURE. */
@@ -143,11 +158,10 @@ export function notCiBreakContradicted(o) {
 
 /**
  * Prevention at the source: the required checks (minus `review-gate`) that keep a `not-a-ci-break` verdict from being
- * recordable yet — still running, not started, or red. Cancelled smoke is settled here; the recording caller
- * must additionally check its retry budget. PURE.
+ * recordable yet — still running, not started, or red. Cancelled smoke is settled after any owed retry. PURE.
  * @returns {{pending: string[], missing: string[], red: string[]}}
  */
-export function unsettledRequiredChecks({ rollup, requiredChecks }) {
-  const s = notCiBreakCheckStates({ rollup, requiredChecks });
+export function unsettledRequiredChecks({ rollup, requiredChecks, timeoutRetry, timeoutRetryBudget }) {
+  const s = notCiBreakCheckStates({ rollup, requiredChecks, timeoutRetry, timeoutRetryBudget });
   return { pending: s.pending, missing: s.missing, red: s.red };
 }
