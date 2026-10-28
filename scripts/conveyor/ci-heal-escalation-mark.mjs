@@ -57,7 +57,8 @@ import { collectCiAuthDiagnosis, renderCiAuthDiagnosis } from './ci-auth-diagnos
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { isBudgetRefusal, postPrComment, recordOwedWrite, resolveOwedRepo } from './ci-heal-owed.mjs';
-import { resolveCiHealVerdictSettings, unsettledRequiredChecks } from './ci-heal-verdict-recheck.mjs';
+import { cancelledSmokeRetryRefusal, isCancelledSmoke, resolveCiHealVerdictSettings, unsettledRequiredChecks } from './ci-heal-verdict-recheck.mjs';
+import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 
 /**
  * we:scripts/conveyor/ci-heal-escalation-mark.mjs#CI_HEAL_ESCALATION_MARKER — the stable FIRST LINE of the
@@ -338,23 +339,28 @@ export function needsHumanVoidState(comments, headSha) {
 }
 
 /**
- * card x9zznl9 — prevention at the source. Why the CLI must NOT record `not-a-ci-break` on this head yet, or `null`
- * when it may. The verdict claims every required check (bar `review-gate`) is green, so a pending, missing or red
- * one refuses it. `pr` is `{ headRefOid, statusCheckRollup }` for the PR now. A different head is not judged here
- * (the rollup describes another commit). Pure.
+ * Refuse a premature not-a-ci-break record on the current head. Review-gate is the hold this verdict explains.
+ * Cancelled smoke is settled only after any eligible infrastructure retry (including an in-flight request).
+ * `pr` carries the current rollup and, when recording through the CLI, the planner's retry evidence and budget.
  */
 export function notCiBreakRecordRefusal({ headSha, pr, requiredChecks }) {
   const head = String(headSha ?? '').trim().toLowerCase();
   const prHead = String(pr?.headRefOid ?? '').trim().toLowerCase();
   if (!head || !prHead || !(prHead.startsWith(head) || head.startsWith(prHead))) return null;
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return null;
-  const u = unsettledRequiredChecks({ rollup: pr?.statusCheckRollup, requiredChecks });
+  const latest = collapseRollupToLatestPerName(pr?.statusCheckRollup);
+  if (latest.some(isCancelledSmoke)) {
+    const refusal = cancelledSmokeRetryRefusal(pr);
+    if (refusal) return refusal;
+  }
+  // Share the cancelled-smoke exception with the verdict reader, after preserving retry ownership above.
+  const u = unsettledRequiredChecks({ rollup: latest, requiredChecks });
   const parts = [];
   if (u.pending.length) parts.push(`still running: ${u.pending.join(', ')}`);
   if (u.missing.length) parts.push(`not started: ${u.missing.join(', ')}`);
   if (u.red.length) parts.push(`red: ${u.red.join(', ')}`);
   if (!parts.length) return null;
-  return `not-a-ci-break needs every required check except review-gate finished green on this head — ${parts.join('; ')}. `
+  return `not-a-ci-break needs every required check except review-gate finished green on this head (only smoke may be cancelled) — ${parts.join('; ')}. `
     + (u.red.length ? 'A required check is red, so this IS a CI break: heal it or escalate needs-human.'
       : 'Wait for the checks to finish, then decide.');
 }
@@ -412,20 +418,34 @@ export function postOrOweCiHealEscalation({ pr, body, headSha, repo, post = post
 
 /**
  * card x9zznl9 — the CLI's IO for {@link notCiBreakRecordRefusal}: read the PR's head + check rollup and the repo's
- * required-check set, then judge. Returns `{ refusal: string|null, warning?: string }`. A failed read never blocks the
- * escalation (`refusal: null` plus a warning) — the daemon-side void still catches a verdict that turns out wrong.
+ * required-check set, then judge. Returns `{ refusal: string|null, warning?: string }`. A failed initial read leaves
+ * a warning for the daemon-side void. Once cancelled smoke is known, unreadable retry evidence refuses the record.
  * Off (`ci-heal-verdict-settings.json`) or any other outcome → `{ refusal: null }` with no read at all.
  */
 export async function checkNotCiBreakRecordable({ pr, repo, headSha, outcome, settings = resolveCiHealVerdictSettings(),
-  readPr = defaultReadPrChecks, readRequired = defaultReadRequiredChecks } = {}) {
+  readPr = defaultReadPrChecks, readRequired = defaultReadRequiredChecks, enrichRetry = defaultEnrichRetry } = {}) {
   if (outcome !== 'not-a-ci-break' || !settings?.recheckNotCiBreak) return { refusal: null };
   try {
-    const facts = readPr({ pr, repo });
-    const { checks } = await readRequired({ repo: repo ?? facts?.slug ?? null });
+    let facts = readPr({ pr, repo });
+    const slug = repo ?? facts?.slug ?? null;
+    const { checks } = await readRequired({ repo: slug });
+    if (collapseRollupToLatestPerName(facts?.statusCheckRollup).some(isCancelledSmoke)) {
+      try {
+        facts = await enrichRetry({ ...facts, number: pr }, { repo: slug });
+      } catch (error) {
+        return { refusal: `Cannot establish cancelled smoke retry state: ${String(error?.message || error).split('\n')[0]}` };
+      }
+    }
     return { refusal: notCiBreakRecordRefusal({ headSha, pr: facts, requiredChecks: checks }) };
   } catch (e) {
     return { refusal: null, warning: `could not re-check required checks before recording not-a-ci-break: ${String(e?.message || e).split('\n')[0]}` };
   }
+}
+
+async function defaultEnrichRetry(pr, { repo }) {
+  // Use the planner's classifier, mode, cap and durable budget rather than treating raw CLI checks as enriched.
+  const { enrichPrsWithTimeoutEvidence } = await import('./reconcile-pass.mjs');
+  return enrichPrsWithTimeoutEvidence([pr], { repo })[0];
 }
 
 function defaultReadPrChecks({ pr, repo }) {
