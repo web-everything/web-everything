@@ -139,7 +139,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
       return String(gh(args, { encoding: 'utf8', timeout: 60_000, maxBuffer: 32 * 1024 * 1024 }));
     };
     const argv = listArgv({ repo });
-    argv[argv.length - 1] += ',baseRefOid,updatedAt,files,changedFiles,author,assignees,body,createdAt,statusCheckRollup,isDraft,commits';
+    argv[argv.length - 1] += ',baseRefOid,updatedAt,files,changedFiles,author,assignees,body,createdAt,statusCheckRollup,isDraft';
     const listing = JSON.parse(boundedGh(argv));
     if (!Array.isArray(listing) || listing.length >= LIST_LIMIT) throw failure('open PR listing incomplete (limit 200); use an exhaustive operator listing');
     let ledger = [], fixRows = [], jobs = [];

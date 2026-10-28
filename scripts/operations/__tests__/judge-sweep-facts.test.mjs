@@ -294,7 +294,8 @@ describe('injected reader and shared evidence readers', () => {
     const f = fixture({ gh });
     expect(f.read().prs[0]).toMatchObject({ isDraft, minutesSinceHeadChange: 241, minutesSinceUpdate: 1 });
     expect(gh.mock.calls[0][0].at(-1)).toContain('isDraft');
-    expect(gh.mock.calls[0][0].at(-1)).toContain('commits');
+    // Listing 200 PRs with commits exceeds GitHub's GraphQL node limit, so it is read only when supplied.
+    expect(gh.mock.calls[0][0].at(-1)).not.toContain('commits');
   });
   it('reports unknown head age and no dispatch as null when listing commits and fix rows are absent', () => {
     expect(fixture().read().prs[0]).toMatchObject({ minutesSinceHeadChange: null, minutesSinceFixDispatch: null });
