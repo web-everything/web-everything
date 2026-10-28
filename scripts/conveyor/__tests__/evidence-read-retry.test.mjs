@@ -10,6 +10,11 @@ const timeoutError = () => Object.assign(new Error('spawnSync gh ETIMEDOUT'), { 
 const goTimeoutError = () => Object.assign(new Error('Command failed: gh api repos/x/y'), {
   stderr: Buffer.from('Get "https://api.github.com/repos/x/y": dial tcp 140.82.112.6:443: i/o timeout\n'),
 });
+const shimWarning = 'gh-shim: GitHub App role "worker" unavailable (worker: no fresh token cached) - using the legacy App for this call';
+const transportTimeout = 'Get "https://api.github.com/repos/x/y": dial tcp 140.82.112.6:443: i/o timeout';
+const shimTimeoutError = () => Object.assign(new Error('Command failed: gh api repos/x/y'), {
+  stderr: Buffer.from(`${shimWarning}\n${transportTimeout}\n`),
+});
 const misleadingCheckNames = [
   'CI timed out', 'ETIMEDOUT', 'CI\nspawnSync gh ETIMEDOUT', 'CI\r\u2028timed out',
   'Get "https://api.github.com": dial tcp: i/o timeout',
@@ -43,6 +48,62 @@ describe('evidence-read timeout is unknown, never ineligible', () => {
     }))).toBe(true);
     expect(isEvidenceReadTimeout(new Error('Get "https://api.github.com/repos/timed out/x": no such host'))).toBe(false);
     expect(isEvidenceReadTimeout(new SyntaxError('Unexpected token in "CI timed out"'))).toBe(false);
+  });
+
+  it.each([
+    `${shimWarning}\n${transportTimeout}\n`,
+    `${shimWarning}\n${shimWarning}\n${transportTimeout}\n`,
+    `${transportTimeout}\n${shimWarning}\n`,
+    `${shimWarning}\r\n${transportTimeout}\r\n${shimWarning}\r\n`,
+  ])('recognizes a transport timeout surrounded by shim warnings: %j', (stderr) => {
+    for (const value of [stderr, Buffer.from(stderr)]) {
+      expect(isEvidenceReadTimeout(Object.assign(new Error('Command failed: gh api'), { stderr: value }))).toBe(true);
+    }
+  });
+
+  it.each([
+    `${shimWarning}\n`,
+    `${shimWarning}\nHTTP 404: Not Found\n`,
+    `${shimWarning}\nGet "https://api.github.com/repos/x/y": no such host\n`,
+    `${shimWarning}\ninvalid check name:\n${transportTimeout}\n`,
+    `${shimWarning}\n${transportTimeout}\ninvalid response`,
+    `gh-shim: ${transportTimeout}\n`,
+  ])('does not infer a timeout from shim warnings or embedded diagnostic data: %j', (stderr) => {
+    expect(isEvidenceReadTimeout(Object.assign(new Error('Command failed: gh api'), { stderr }))).toBe(false);
+  });
+
+  it('does not strip shim-like check names from validation messages', () => {
+    expect(isEvidenceReadTimeout(new Error(`${shimWarning}\n${transportTimeout}`))).toBe(false);
+    expect(isEvidenceReadTimeout(new Error(`unparseable-required-check-url:${shimWarning}\n${transportTimeout}`))).toBe(false);
+  });
+
+  it.each(['timeout', 'owed re-run'])('retries warning-prefixed %s evidence and refuses ordinary healing when still unknown', (reader) => {
+    const pause = vi.spyOn(Atomics, 'wait').mockReturnValue('ok');
+    const read = vi.fn(() => { throw shimTimeoutError(); });
+    const p = { ...pr, state: 'OPEN', headRefName: 'lane/x', labels: [], comments: [], mergeStateStatus: 'CLEAN',
+      statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'failure',
+        detailsUrl: `https://github.com/${repo}/actions/runs/10/job/20` }] };
+    try {
+      const result = reader === 'timeout'
+        ? { prs: enrichPrsWithTimeoutEvidence([p], { repo, enabled: true,
+          read: (item, opts) => readTimeoutEvidence(item, { ...opts, exec: read, facts: () => null }),
+          readBudget: () => ({ confirmed: 0, pending: false }) }) }
+        : enrichPrsWithMainRedFacts([p], { repo, requiredChecks: ['gate'], readJobAttempt: read,
+          readBudget: () => ({ confirmed: 0, pending: false }),
+          readMainRuns: () => [{ status: 'completed', conclusion: 'success', headSha: 'b'.repeat(40), updatedAt: '2026-10-26T19:00:00Z' }],
+          readAheadBy: () => 1, readMainLatestCheckRuns: () => [], readMainFixedSignatureFacts: () => null });
+      const evidence = result.prs[0][reader === 'timeout' ? 'timeoutRetry' : 'owedCiRerunRetry'];
+      expect(evidence).toMatchObject({ eligible: false, unknown: true });
+      expect(read).toHaveBeenCalledTimes(4);
+      expect(pause.mock.calls.map((call) => call[3])).toEqual(EVIDENCE_READ_BACKOFF_MS);
+      const out = planReconcile({ ...result, now: Date.parse('2026-10-26T20:00:00Z'),
+        requiredChecks: ['gate'], reviewTiming: { startAfter: 'ci-green' } });
+      expect(out.refusals.map((r) => r.kind)).toContain('timeout-evidence-unknown');
+      expect(out.refusals.map((r) => r.kind)).not.toContain('timeout-retry-ineligible');
+      expect(out.dispatch).toEqual([]);
+    } finally {
+      pause.mockRestore();
+    }
   });
 
   it.each(misleadingCheckNames)('keeps malformed check %j ineligible so ordinary ci-heal can proceed', (name) => {
@@ -83,10 +144,10 @@ describe('evidence-read timeout is unknown, never ineligible', () => {
     expect(Math.max(...EVIDENCE_READ_BACKOFF_MS)).toBeLessThanOrEqual(5000);
   });
 
-  it('a later successful read yields a real cause, not unknown', () => {
+  it.each([timeoutError, shimTimeoutError])('a later successful read yields a real cause, not unknown: %s', (error) => {
     let n = 0;
     const exec = vi.fn(() => {
-      if (++n === 1) throw timeoutError();
+      if (++n === 1) throw error();
       return JSON.stringify({ head: { sha: 'b'.repeat(40) }, state: 'open' });
     });
     const result = readTimeoutEvidence(pr, { repo, exec, sleep: vi.fn(), facts: () => null });
