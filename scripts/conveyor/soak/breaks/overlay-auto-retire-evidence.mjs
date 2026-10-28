@@ -25,7 +25,7 @@ export default {
         && readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8').includes('plan = unavailablePinned ??')
         && readFileSync(join(root, 'scripts/lib/daemon-overlays.mjs'), 'utf8').includes('expectedRequiredOverlay')
         && readFileSync(join(root, 'scripts/lib/daemon-overlays.mjs'), 'utf8').includes('retiredSources')
-        && readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8').includes('supersededSnapshots(overlaysBefore)')
+        && readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8').includes('supersededSnapshots(overlaysBefore, { applied')
         && readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8').includes('sameRegistration(o, raw, { adoptedAt')
         && readFileSync(join(root, 'scripts/lib/daemon-overlay-auto-retire.mjs'), 'utf8').includes('persistTipShas');
     } catch { return false; }
