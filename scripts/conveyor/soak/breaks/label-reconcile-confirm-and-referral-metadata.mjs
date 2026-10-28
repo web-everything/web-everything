@@ -1,0 +1,232 @@
+/** Replay PR #5990: preserve later operator changes and abstention alongside settled referrals. */
+import { readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
+
+export default {
+  id: 'label-reconcile-confirm-and-referral-metadata',
+  title: 'label reconciliation erases operator changes or abstention, or strands independently settled referrals',
+  card: 'PR #5990',
+  fixedBy: { sha: 'HEAD', where: 'lane/labels-reconcile-main', paths: [
+    'scripts/conveyor/label-state-reconcile.mjs', 'scripts/conveyor/advisory-label-sweep.mjs',
+  ] },
+  fixPresent(root) {
+    const planner = readFileSync(join(root, 'scripts/conveyor/label-state-reconcile.mjs'), 'utf8');
+    const reader = readFileSync(join(root, 'scripts/conveyor/advisory-label-sweep.mjs'), 'utf8');
+    return planner.includes("review.findings?.confirm === 'changes'")
+      && planner.includes("review.findings?.confirm !== 'abstain'")
+      && planner.includes('!laterHold')
+      && planner.includes("review.findings?.confirm === 'accept'")
+      && planner.includes('laterReviewHold(reviews')
+      && planner.includes('const fresh = readLive()')
+      && planner.includes('writeHead.headRefOid !== pr.headRefOid')
+      && planner.includes('at >= observed.startedAt')
+      && planner.includes('publishedAccept')
+      && planner.includes('c.updatedAt ?? c.updated_at')
+      && planner.includes('Math.max(created, edited)')
+      && planner.includes('readCompletePrCommentEditHistory(number, options)')
+      && planner.includes('comment thread changed during read')
+      && planner.indexOf('provider.ensureLabel(') < planner.indexOf('const fresh = readLive()')
+      && !planner.includes("status?.result.foldedVerdict === 'changes'")
+      && reader.includes("fields = 'number,state,labels,headRefOid'");
+  },
+  async run({ sourceRoot = ROOT, log } = {}) {
+    const load = path => import(pathToFileURL(join(sourceRoot, path)).href);
+    const { sweepLabelStateReconcile, readLabelReconcileComments } = await load('scripts/conveyor/label-state-reconcile.mjs');
+    const { defaultReadPr } = await load('scripts/conveyor/advisory-label-sweep.mjs');
+    const { readCompletePrComments } = await load('scripts/conveyor/pr-comments-complete.mjs');
+    const { reviewRunEvidence } = await load('scripts/conveyor/review-referral-hold.mjs');
+    const { planRecordDecision } = await load('scripts/operations/review-pr.mjs');
+    const { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord }
+      = await load('scripts/lib/jury-core.mjs');
+    const repo = 'o/n', number = 5990, head = 'a'.repeat(40);
+    const body = '<!-- authored-by-actor: author -->';
+    const runId = 'review-pr-bounced', original = { summary: 'broken case', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+    const key = referralFindingKey('judge', original), reviewer = mandatoryReferralReviewer(runId);
+    const settled = { author: { login: 'web-everything' }, body: renderReferralRecord({
+      version: 1, repo, pr: number, head, runId, reviewer, authorBody: body, attempted: true,
+      referrals: [{ key, seat: 'judge', original, finding: normalizeFinding(original) }],
+      rulings: [{ id: 'r1', key, reviewerId: reviewer.id, lens: 'correctness', result: 'not-real',
+        rationale: 'checked independently', evidence: ['diff'] }],
+    }) };
+    const violations = [];
+    // Round 3 (red team on c3bd94bd0): an unanswered confirm, a verdict landing between the plan and the
+    // write, and a native GitHub change request must each keep the holds.
+    // during-run-changes: posted after the run read the thread but before its advise step finished.
+    const holding = ['changes', 'later-changes', 'awaiting-confirm', 'racing-changes', 'native-changes',
+      'during-run-changes', 'edited-changes', 'rest-edited-changes', 'racing-edit', 'unknown-edit',
+      'production-comments', 'production-edited', 'provision-changes', 'provision-edit', 'provision-native'];
+    for (const scenario of ['changes', 'accept', 'abstain', 'later-changes', 'newer-accept',
+      'awaiting-confirm', 'racing-changes', 'native-changes', 'during-run-changes',
+      'failed-self-accept', 'edited-changes', 'rest-edited-changes', 'unknown-edit', 'racing-edit',
+      'production-comments', 'production-edited', 'production-unedited', 'production-racing-edit',
+      'degraded-stored-changes', 'not-real-stored-changes',
+      'provision-changes', 'provision-edit', 'provision-native']) {
+      const confirm = ['changes', 'abstain'].includes(scenario) ? scenario
+        : scenario === 'awaiting-confirm' ? undefined : 'accept';
+      let labels = ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held', 'ready-to-merge'];
+      const racingEdit = scenario === 'production-racing-edit';
+      if (racingEdit) labels = labels.filter(l => l !== 'ready-to-merge');
+      const review = { id: 'review-pr-accepted', op: 'review-pr', input: { reason: 'remaining operator blocker' }, findings: {
+        read: { repo, pr: number, netBasis: { rev: head } }, ...(confirm ? { confirm } : {}),
+        record: { applied: true, effects: [{ type: 'review.label-swap', status: 'applied' }] },
+        referralVerdict: { verdict: 'accept', pendingReferrals: [], blockedReferrals: [],
+          lenses: ['correctness', 'security'], lensVerdicts: { correctness: 'accept', security: 'accept' } },
+      }, stepTimings: [{ step: 'read', startedAt: '2026-10-26T01:00:00Z' },
+        { step: 'advise', finishedAt: '2026-10-26T01:01:00Z' }] };
+      if (scenario === 'failed-self-accept') {
+        review.input.actor = 'author';
+        delete review.findings.record;
+        review.effects = [{ step: 'record', type: 'review.label-swap', status: 'failed',
+          error: 'accepting actor matches PR author' }];
+      }
+      if (confirm === 'abstain' && !planRecordDecision(review).abstain) violations.push('abstain: unexpectedly records');
+      const comments = confirm === 'changes' ? [] : [settled];
+      const provisioning = scenario.startsWith('provision-');
+      if (provisioning) labels.push('red-team:blocked');
+      const operatorChanges = { author: { login: 'chalbert' },
+        body: '🔁 review — changes requested\nRemaining operator blocker', createdAt: '2026-10-26T01:02:00Z',
+        updatedAt: '2026-10-26T01:02:00Z' };
+      if (['later-changes', 'newer-accept'].includes(scenario)) comments.push(operatorChanges);
+      if (scenario === 'during-run-changes') comments.push({ ...operatorChanges,
+        createdAt: '2026-10-26T01:00:30Z', updatedAt: '2026-10-26T01:00:30Z' });
+      const edited = { ...operatorChanges, createdAt: '2026-10-26T00:59:00Z' };
+      const oldNote = { ...edited, body: 'Operator note', updatedAt: edited.createdAt };
+      if (scenario === 'provision-edit') comments.push(oldNote);
+      if (scenario === 'rest-edited-changes') {
+        edited.updated_at = edited.updatedAt;
+        delete edited.updatedAt;
+      }
+      if (scenario === 'unknown-edit') delete edited.updatedAt;
+      if (['edited-changes', 'rest-edited-changes', 'unknown-edit'].includes(scenario)) comments.push(edited);
+      const storedChanges = ['degraded-stored-changes', 'not-real-stored-changes'].includes(scenario);
+      if (storedChanges) {
+        labels.push('red-team:blocked');
+        comments.push({ author: { login: 'web-everything' },
+          body: `<!-- we:red-team-advisory pr=${number} rev=${head} -->\n1. [**confirmed**] (edge-case, ${scenario === 'degraded-stored-changes' ? 'degraded' : 'broken'}) \`scripts/x.mjs:1\` — break` });
+        if (scenario === 'not-real-stored-changes') comments.push({ author: { login: 'web-everything' },
+          body: `<!-- we:red-team-gate pr=${number} rev=${head} outcome=round-cap -->\n- 1 confirmed break(s) NOT sent back: round cap (#1).`
+        }, { author: { login: 'chalbert' },
+          body: `<!-- we:red-team-gate pr=${number} rev=${head} outcome=operator-not-real -->\n- 1 finding(s) left advisory (#1).` });
+      }
+      // racing-changes: the verdict is posted after the first thread read, before the final one.
+      let threadReads = 0, editReads = 0;
+      const readComments = () => {
+        threadReads++;
+        if (racingEdit || ['production-edited', 'production-unedited'].includes(scenario)) return readLabelReconcileComments(number, { repo,
+          exec: (_cmd, argv) => {
+            if (racingEdit && !argv.includes('graphql') && editReads < 2) {
+              return 'Operator note\t2026-10-26T00:59:00Z\tchalbert\tIC_old\thttps://example.test/comment\n';
+            }
+            if (!argv.includes('graphql')) return '🔁 review — changes requested\t2026-10-26T00:59:00Z\tchalbert\tIC_old\thttps://example.test/comment\n';
+            const connection = argv.some(a => a.includes('lastEditedAt'))
+              ? { nodes: [{ id: 'IC_old', lastEditedAt: scenario === 'production-edited' || (racingEdit && ++editReads > 1)
+                ? '2026-10-26T01:02:00Z' : null }],
+                pageInfo: { hasNextPage: false, endCursor: null } } : { totalCount: 1 };
+            return JSON.stringify({ data: { repository: { pullRequest: { comments: connection } } } });
+          } });
+        if (scenario === 'production-comments') return readCompletePrComments(number, { repo,
+          exec: (_cmd, argv) => argv.includes('graphql')
+            ? JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 1 } } } } })
+            : '🔁 review — changes requested\t2026-10-26T00:59:00Z\tchalbert\tIC_old\thttps://example.test/comment\n' });
+        if (scenario === 'racing-changes' && threadReads > 1) return [...comments, operatorChanges];
+        if (scenario === 'racing-edit') return [...comments, threadReads > 1 ? edited
+          : { ...edited, body: 'Operator note', updatedAt: edited.createdAt }];
+        return structuredClone(comments);
+      };
+      const reviews = scenario === 'native-changes'
+        ? [{ state: 'CHANGES_REQUESTED', user: { login: 'chalbert' }, submitted_at: '2026-10-26T01:02:00Z' }] : [];
+      if (scenario === 'newer-accept') review.stepTimings = [
+        { step: 'read', startedAt: '2026-10-26T01:03:00Z' },
+        { step: 'advise', finishedAt: '2026-10-26T01:04:00Z' },
+      ];
+      const exec = (_cmd, argv) => {
+        const live = { number, state: 'OPEN', headRefOid: head, labels, body, createdAt: '2026-01-01T00:00:00Z' };
+        return JSON.stringify(Object.fromEntries(argv[argv.indexOf('--json') + 1].split(',').map(f => [f, live[f]])));
+      };
+      const io = { repo, prs: [{ number, labels }],
+        readPr: args => defaultReadPr({ ...args, exec, readComments: () => comments }),
+        readComments, readReviews: () => [reviewRunEvidence(review)], readReview: () => review,
+        readRedTeam: () => storedChanges || provisioning
+          ? { repo, pr: number, head, status: 'finished', result: { foldedVerdict: storedChanges ? 'changes' : 'accept' } } : null,
+        emit: () => {}, provider: { ensureLabel() {
+          if (scenario === 'provision-changes') comments.push(operatorChanges);
+          if (scenario === 'provision-edit') Object.assign(oldNote, edited);
+          if (scenario === 'provision-native') reviews.push({ state: 'CHANGES_REQUESTED',
+            user: { login: 'chalbert' }, submitted_at: '2026-10-26T01:02:00Z' });
+        }, readPrReviews: () => structuredClone(reviews),
+          setLabels(_repo, _pr, { add, remove }) {
+            labels = labels.filter(l => !remove.includes(l));
+            if (add) labels.push(...add.split(','));
+          } } };
+      const rows = sweepLabelStateReconcile(io);
+      if (racingEdit) {
+        const held = ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held'];
+        if (rows[0]?.error !== 'comment thread changed during read' || JSON.stringify(labels) !== JSON.stringify(held)) {
+          violations.push(`${scenario}: torn read cleared holds (${labels.join(',')})`);
+        }
+        io.prs[0].labels = labels;
+        if (sweepLabelStateReconcile(io).length || JSON.stringify(labels) !== JSON.stringify(held)) {
+          violations.push(`${scenario}: retry failed to preserve the fresh objection`);
+        }
+        continue;
+      }
+      if (rows.some(row => row.error)) violations.push(`${scenario}: sweep failed`);
+      const expected = ['abstain', 'awaiting-confirm', 'failed-self-accept'].includes(scenario)
+        ? ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held', 'ready-to-merge']
+        : holding.includes(scenario)
+          ? ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held', ...(provisioning ? ['red-team:clear'] : [])]
+          : storedChanges ? ['ready-to-merge', 'red-team:clear'] : ['ready-to-merge'];
+      if (JSON.stringify(labels) !== JSON.stringify(expected)) violations.push(`${scenario}: unexpected labels ${labels.join(',')}`);
+      // The next tick must be stable after either a hold or a clearance.
+      io.prs[0].labels = labels;
+      if (sweepLabelStateReconcile(io).length) violations.push(`${scenario}: repeated reconciliation`);
+    }
+    // Round 4: both metadata snapshots still name A when the final evidence read pushes B.
+    // Exercise the production metadata reader, stored ACCEPTS, and label writer together.
+    for (const phase of ['native', 'stored', 'provision']) {
+      let liveHead = head, nativeReads = 0, storedReads = 0, writes = 0, events = 0;
+      let labels = ['red-team:blocked'];
+      const pushed = 'b'.repeat(40);
+      const exec = () => JSON.stringify({ number, state: 'OPEN', headRefOid: liveHead,
+        labels, body, createdAt: '2026-01-01T00:00:00Z' });
+      const io = { repo, prs: [{ number, labels }],
+        readPr: args => defaultReadPr({ exec, readComments: () => [], ...args }),
+        readComments: () => [], readReviews: () => [], readReview: () => null,
+        readRedTeam: ({ head: requestedHead }) => {
+          if (++storedReads === 2 && phase === 'stored') liveHead = pushed;
+          return requestedHead === head
+            ? { repo, pr: number, head, status: 'finished', result: { foldedVerdict: 'accept' } } : null;
+        },
+        emit: () => { events++; },
+        provider: {
+          readPrReviews() {
+            if (++nativeReads === 2 && phase === 'native') liveHead = pushed;
+            return [];
+          },
+          ensureLabel() { if (phase === 'provision') liveHead = pushed; },
+          setLabels(_repo, _pr, { add, remove }) {
+            writes++;
+            labels = labels.filter(l => !remove.includes(l));
+            if (add) labels.push(...add.split(','));
+          },
+        },
+      };
+      const rows = sweepLabelStateReconcile(io);
+      if (liveHead !== pushed || writes || events || rows.length || labels.join(',') !== 'red-team:blocked') {
+        violations.push(`push-during-${phase}: stale clearance (writes=${writes}, events=${events}, labels=${labels})`);
+      }
+      // Head B has no result; retry must retain the hold without applying A's evidence.
+      io.prs[0].labels = labels;
+      const writesBeforeRetry = writes, eventsBeforeRetry = events;
+      if (sweepLabelStateReconcile(io).length || writes !== writesBeforeRetry || events !== eventsBeforeRetry) {
+        violations.push(`push-during-${phase}: unsafe retry`);
+      }
+    }
+    log?.(`label reconciliation: ${violations.length} violation(s)`);
+    return { violations };
+  },
+  judge: report => report.violations,
+};
