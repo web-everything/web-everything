@@ -2,7 +2,9 @@ const object = value => value !== null && typeof value === 'object' && !Array.is
 const text = value => typeof value === 'string' && value.length > 0;
 const sha = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/.test(value);
 const time = value => Number.isSafeInteger(value) && value >= 0;
-const date = value => typeof value === 'string' && Number.isFinite(Date.parse(value));
+const date = value => typeof value === 'string'
+  && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})(?![\s\S])/.test(value)
+  && Number.isFinite(Date.parse(value));
 const strings = value => Array.isArray(value) && value.every(text);
 const sorted = values => [...new Set(values)].sort();
 const policies = new Set(['send-back', 'hold', 'card', 'advisory']);
@@ -40,6 +42,8 @@ function validate(snapshot, options) {
   }
   for (const comment of snapshot.comments) {
     requireInput(typeof comment.body === 'string', 'snapshot.comments.body');
+    requireInput(date(comment.createdAt), 'snapshot.comments.createdAt');
+    requireInput(comment.lastEditedAt == null || date(comment.lastEditedAt), 'snapshot.comments.lastEditedAt');
   }
   for (const review of snapshot.reviews) {
     requireInput(reviewStates.has(review.state) && sha(review.commit?.oid), 'snapshot.reviews');
@@ -107,11 +111,9 @@ export function planLabelReconcile(snapshot, options) {
     }
     for (const comment of snapshot.comments) {
       if (!config.isLaterVerdictBody(comment.body)) continue;
-      const created = date(comment.createdAt) ? Date.parse(comment.createdAt) : NaN;
-      const edited = comment.lastEditedAt == null ? created
-        : date(comment.lastEditedAt) ? Date.parse(comment.lastEditedAt) : NaN;
-      if (!Number.isFinite(created) || !Number.isFinite(edited)
-        || !time(reviewRun?.startedAt) || Math.max(created, edited) >= reviewRun.startedAt) {
+      const created = Date.parse(comment.createdAt);
+      const edited = comment.lastEditedAt == null ? created : Date.parse(comment.lastEditedAt);
+      if (!time(reviewRun?.startedAt) || Math.max(created, edited) >= reviewRun.startedAt) {
         holds.add('later-verdict');
         record(comment.id);
       }

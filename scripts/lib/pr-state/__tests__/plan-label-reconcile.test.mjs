@@ -103,8 +103,6 @@ describe('label reconcile rules', () => {
     ] }],
     ['verdict at run start', { comments: [comment({ createdAt: iso(0) })] }],
     ['verdict after run start', { comments: [comment({ createdAt: iso(1) })] }],
-    ['unparseable creation time fails closed', { comments: [comment({ createdAt: 'unreadable' })] }],
-    ['unparseable edit time fails closed', { comments: [comment({ lastEditedAt: 'unreadable' })] }],
     ['resulting blocked label', { redTeam: { resultId: 'result-1', rulingNeeded: true } }],
     ['blocked label retained without evidence', { redTeam: { resultId: null, rulingNeeded: false },
       labels: ['review:changes', 'fix-waiting:review', 'red-team:blocked'] }],
@@ -161,6 +159,40 @@ describe('#5990 regressions', () => {
 });
 
 describe('explicit input validation', () => {
+  describe.each(['labelsVersion', 'createdAt', 'lastEditedAt'])('%s timestamps', field => {
+    it.each([
+      ['timezone-less datetime', iso(-1000).replace('Z', '')],
+      ['date only', '2026-09-21'],
+      ['non-ISO datetime', 'September 21, 2026 14:13:19 GMT'],
+      ['unparseable datetime', 'unreadable'],
+      ['invalid month', '2026-13-21T14:13:19Z'],
+      ['invalid offset', '2026-09-21T14:13:19+25:00'],
+      ['trailing newline', `${iso(-1000)}\n`],
+    ])('throws for %s during snapshot validation', (_name, value) => {
+      const s = snapshot(field === 'labelsVersion' ? { labelsVersion: value }
+        : { comments: [comment({ body: 'Thanks', [field]: value })] });
+      expect(() => plan(s)).toThrow(`Invalid snapshot.${field === 'labelsVersion' ? field : `comments.${field}`}`);
+    });
+  });
+
+  it.each([
+    ['+05:30', 330], ['-04:00', -240], ['+0530', 330], ['-0400', -240],
+  ])('numeric offset %s produces the same plans as Z timestamps', (suffix, minutes) => {
+    const withOffset = value => new Date(Date.parse(value) + minutes * 60_000)
+      .toISOString().replace('Z', suffix);
+    for (const editedAt of [-1, 0, 1]) {
+      const s = snapshot({ labels: ['review:changes'], reviewRun: run(),
+        comments: [comment({ lastEditedAt: iso(editedAt) })] });
+      const p = plan(s);
+      expect(p.reasons).toContain(editedAt < 0 ? 'review-hold-cleared' : 'review-hold-kept:later-verdict');
+      expect(plan({ ...s, labelsVersion: withOffset(s.labelsVersion),
+        comments: s.comments.map(c => ({ ...c,
+          createdAt: withOffset(c.createdAt), lastEditedAt: withOffset(c.lastEditedAt),
+        })),
+      })).toEqual(p);
+    }
+  });
+
   it.each([undefined, null, false, 1, {}, 'predicate'])('requires a function verdict predicate (%s)', value => {
     const o = options();
     if (value === undefined) delete o.config.isLaterVerdictBody;
