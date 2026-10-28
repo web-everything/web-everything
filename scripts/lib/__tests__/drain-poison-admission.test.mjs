@@ -82,6 +82,17 @@ describe('poison guard admission boundary', () => {
     expect(appendDaemonEvent).toHaveBeenCalledWith(expect.objectContaining({ detail: expect.objectContaining({ error: `unreadable ${fail}` }) }), expect.any(Object));
   });
 
+  // Live incident 2026-10-27 21:26Z: an unreadable check labelled approved #5998 and #5994 review:changes.
+  it.each(['fetch', 'diff', 'show', 'grep'])('skips enqueue on an unreadable %s with no PR comment and no label edit of any kind', fail => {
+    const deliver = vi.fn(() => '');
+    const { s, exec } = strategy(gitEvidence({ fail }), { deliver });
+    for (let pass = 0; pass < 2; pass++)
+      expect(s.enqueue(c, headSha)).toMatchObject({ enqueued: false, deferred: true, kind: 'bornas-unreadable' });
+    expect(enqueuePr).not.toHaveBeenCalled();
+    expect(deliver).not.toHaveBeenCalled();
+    expect(exec.mock.calls.some(([cmd, args]) => cmd === 'gh' && args[0] === 'pr' && ['edit', 'comment'].includes(args[1]))).toBe(false);
+  });
+
   it('fetches a remote-only PR head before reading its diff or cards', () => {
     let headAvailable = false;
     const evidence = gitEvidence({ collision: false });
@@ -233,7 +244,7 @@ describe('poison guard admission boundary', () => {
       expect(guardEnqueue({ c, repo, headSha, exec: evidence, emit, comment, seen: new Set() }))
         .toMatchObject({ enqueued: false, deferred: true, kind });
       expect(emit).toHaveBeenCalledOnce();
-      expect(comment).toHaveBeenCalledOnce();
+      expect(comment).toHaveBeenCalledTimes(kind === 'bornas-collision' ? 1 : 0);
     }
     await Promise.resolve();
   });

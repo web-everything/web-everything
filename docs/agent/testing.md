@@ -101,7 +101,10 @@ fresh Git evidence, including empty, stale, or truncated lists. Any wrapper subs
 output for a guard's command needs named positive and negative tests for every eligibility check.
 
 Infrastructure refusals must leave defect labels untouched. Test Git read failures through strategy
-admission, and keep raw command errors out of public comment bodies. Test notification retries after
+admission, and keep raw command errors out of public comment bodies. An unreadable check holds the
+enqueue with a note and makes no PR comment or label edit of any kind. Corruption heals once per check
+and retries the failed command once; prove it on a real temporary clone with a planted commit-graph
+naming a missing object, and prove that a network failure or a surviving corruption is not healed again. Test notification retries after
 comment and label failures independently, and deduplication across fresh strategy instances using
 the paginated thread and trusted leading markers. Scope queue failure/rebuild history to the enqueue
 identity; old persisted records without it start fresh. Keep enqueue result recording and event

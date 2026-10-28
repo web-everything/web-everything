@@ -532,7 +532,10 @@ export function createDrainMergeStrategy({
       }
       if (freshLabelHold) return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: freshLabelHold };
       // Prepared file lists do not substitute for fresh Git evidence at identity admission.
+      // A corrupt clone cache heals once and retries (logged); unreadable evidence holds the enqueue and never
+      // reaches `comment`, so only a proven collision can label the PR.
       const poison = guardEnqueue({ c, headSha, repo: slugOf(c.repo), exec, cwd,
+        log: line => log.write(`${line}\n`),
         emit: event => appendDaemonEvent(event, { env }),
         comment: (body, { kind, marker }) => {
           let commented = false;

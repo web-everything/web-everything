@@ -1,5 +1,9 @@
 // @vitest-environment node
-import { describe, it, expect, vi, beforeAll } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { devNull, tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // Register cases before loading the implementation, which is absent in this red phase.
 let checkBornAsCollision, guardEnqueue, enqueueOutcomeEvent;
@@ -97,12 +101,112 @@ describe('guardEnqueue', () => {
     expect(comment).toHaveBeenCalledTimes(2);
     expect(seen.size).toBe(1);
   });
-  it('keeps raw Git errors out of the public refusal reason and comment', () => {
+  it('keeps raw Git errors out of the public refusal reason and posts no comment', () => {
     const comment = vi.fn();
     const exec = () => { throw new Error('https://secret-token@example.invalid /private/clone'); };
     const out = guardEnqueue({ c, headSha: sha, repo: 'o/r', exec, comment, seen: new Set() });
     expect(out.reason).not.toContain('secret-token');
-    expect(comment.mock.calls[0][0]).not.toContain('/private/clone');
+    expect(comment).not.toHaveBeenCalled();
+  });
+  it('holds an unreadable check with a note and never calls the PR delivery callback', () => {
+    const comment = vi.fn();
+    for (let i = 0; i < 2; i++) {
+      expect(guardEnqueue({ c, headSha: sha, repo: 'o/r', exec: fakeExec({ fetchFails: true }), comment, seen: new Set() }))
+        .toEqual({ enqueued: false, deferred: true, kind: 'bornas-unreadable', reason: expect.stringContaining('check unreadable') });
+    }
+    expect(comment).not.toHaveBeenCalled();
+  });
+});
+
+describe('checkBornAsCollision corruption self-heal', () => {
+  const corrupt = () => Object.assign(new Error('Command failed: git fetch'),
+    { status: 128, stderr: 'fatal: You are attempting to fetch 9c7274dc, which is in the commit-graph file but not in the object database.' });
+  const healingExec = (failures, base = fakeExec({ main: '' })) => vi.fn((cmd, args, options) => {
+    if (failures[args[0]] > 0) { failures[args[0]]--; throw corrupt(); }
+    return base(cmd, args, options);
+  });
+
+  it.each(['fetch', 'diff', 'show'])('heals once and retries a corrupt %s', op => {
+    const heal = vi.fn(() => ({ actions: ['removed stale objects/info/commit-graph cache'] }));
+    const log = vi.fn();
+    const exec = healingExec({ [op]: 1 });
+    expect(checkBornAsCollision({ exec, headSha: sha, cwd: '/clone', heal, log }))
+      .toEqual({ ok: true, healed: ['removed stale objects/info/commit-graph cache'] });
+    expect(heal).toHaveBeenCalledOnce();
+    expect(heal).toHaveBeenCalledWith('/clone', { log });
+    expect(exec.mock.calls.filter(([, args]) => args[0] === op)).toHaveLength(2);
+  });
+  it('heals at most once per check, even when corruption survives the heal', () => {
+    const heal = vi.fn(() => ({ actions: [] }));
+    const out = checkBornAsCollision({ exec: healingExec({ fetch: 2 }), headSha: sha, cwd: '/clone', heal });
+    expect(out).toEqual({ error: expect.stringContaining('Command failed'), healed: [] });
+    expect(heal).toHaveBeenCalledOnce();
+  });
+  it('does not heal a network-style failure', () => {
+    const heal = vi.fn(() => ({ actions: [] }));
+    expect(checkBornAsCollision({ exec: fakeExec({ fetchFails: true }), headSha: sha, cwd: '/clone', heal }))
+      .toEqual({ error: expect.stringContaining('network down') });
+    expect(heal).not.toHaveBeenCalled();
+  });
+  it('treats grep exit status 1 as no matches, never as corruption', () => {
+    const heal = vi.fn(() => ({ actions: [] }));
+    expect(checkBornAsCollision({ exec: fakeExec({ main: '' }), headSha: sha, cwd: '/clone', heal })).toEqual({ ok: true });
+    expect(heal).not.toHaveBeenCalled();
+  });
+  it('never heals without an explicit clone directory', () => {
+    const heal = vi.fn(() => ({ actions: [] }));
+    expect(checkBornAsCollision({ exec: healingExec({ fetch: 1 }), headSha: sha, heal }).error).toContain('Command failed');
+    expect(heal).not.toHaveBeenCalled();
+  });
+  it('reports heal actions on the unreadable refusal event without commenting', () => {
+    const emit = vi.fn(); const comment = vi.fn();
+    const heal = () => ({ actions: ['set core.commitGraph=false'] });
+    const out = guardEnqueue({ c: { num: 5998, repo: 'o/r' }, headSha: sha, repo: 'o/r', exec: healingExec({ fetch: 2 }), cwd: '/clone', heal, emit, comment });
+    expect(out).toMatchObject({ kind: 'bornas-unreadable' });
+    expect(emit.mock.calls[0][0].detail).toMatchObject({ reason: 'bornas-unreadable', healed: ['set core.commitGraph=false'] });
+    expect(comment).not.toHaveBeenCalled();
+  });
+});
+
+// The live incident (2026-10-27 21:26Z): a commit-graph naming an object missing from the drain clone's object
+// store made `git fetch` fail. Plant the same corruption in a real temporary clone.
+describe('checkBornAsCollision on a clone with a corrupt commit-graph', () => {
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: devNull, GIT_CONFIG_NOSYSTEM: '1',
+    GIT_AUTHOR_NAME: 'fixture', GIT_AUTHOR_EMAIL: 'fixture@example.invalid', GIT_COMMITTER_NAME: 'fixture', GIT_COMMITTER_EMAIL: 'fixture@example.invalid' };
+  const git = (cwd, ...args) => execFileSync('git', args, { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const card = (dir, name, hash) => { mkdirSync(join(dir, 'backlog'), { recursive: true }); writeFileSync(join(dir, 'backlog', name), `---\nbornAs: ${hash}\n---\n`); };
+  let root, clone, head;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'poison-graph-'));
+    const origin = join(root, 'origin.git'); const seed = join(root, 'seed'); clone = join(root, 'clone');
+    git(root, 'init', '-q', '--bare', '-b', 'main', origin);
+    git(root, 'init', '-q', '-b', 'main', seed);
+    card(seed, '1-old.md', 'xaaaaaa');
+    git(seed, 'add', '.'); git(seed, 'commit', '-qm', 'seed'); git(seed, 'push', '-q', origin, 'main');
+    git(root, 'clone', '-q', origin, clone);
+    git(clone, 'checkout', '-q', '-b', 'work');
+    writeFileSync(join(clone, 'main-only.txt'), 'x\n'); git(clone, 'add', '.'); git(clone, 'commit', '-qm', 'main tip');
+    const tip = git(clone, 'rev-parse', 'HEAD');
+    card(clone, '2-new.md', 'xbbbbbb'); git(clone, 'add', '.'); git(clone, 'commit', '-qm', 'pr head');
+    head = git(clone, 'rev-parse', 'HEAD');
+    git(clone, 'push', '-q', 'origin', `${tip}:refs/heads/main`, `${head}:refs/heads/lane/pr`);
+    git(clone, 'commit-graph', 'write', '--reachable');
+    git(clone, 'checkout', '-q', 'main'); git(clone, 'branch', '-qD', 'work');
+    git(clone, 'update-ref', '-d', 'refs/remotes/origin/main');
+    git(clone, 'reflog', 'expire', '--expire=now', '--all');
+    for (const oid of [tip, head]) rmSync(join(clone, '.git', 'objects', oid.slice(0, 2), oid.slice(2)));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it('reproduces the incident: without a heal the planted graph makes the check unreadable', () => {
+    const out = checkBornAsCollision({ exec: execFileSync, headSha: head, cwd: clone, heal: () => ({ actions: [] }) });
+    expect(out.error).toMatch(/commit-graph|commit graph/);
+  });
+  it('heals the clone, retries the fetch once and reads the evidence', () => {
+    const lines = [];
+    expect(checkBornAsCollision({ exec: execFileSync, headSha: head, cwd: clone, log: line => lines.push(line) }))
+      .toEqual({ ok: true, healed: expect.arrayContaining([expect.stringContaining('commit-graph')]) });
+    expect(lines.join('\n')).toContain('lane-repair');
   });
 });
 
