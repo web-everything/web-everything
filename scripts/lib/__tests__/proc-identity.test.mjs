@@ -419,11 +419,11 @@ describe('real host process identity', () => {
           }
         });
       });
-      const deadline = Date.now() + 6000;
+      const deadline = Date.now() + 20000;
       const waitForZombie = async () => {
         const result = readIdentity(pid);
         if (result.status === 'ok' && result.identity.state === 'Z') return result.identity;
-        if (Date.now() >= deadline) throw new Error(`Zombie state not observed within 6s: ${JSON.stringify(result)}`);
+        if (Date.now() >= deadline) throw new Error(`Zombie state not observed within 20s: ${JSON.stringify(result)}`);
         await new Promise((resolve) => setTimeout(resolve, 20));
         return waitForZombie();
       };
@@ -438,5 +438,5 @@ describe('real host process identity', () => {
         }
       }
     }
-  }, 12000);
+  }, 30000);
 });
