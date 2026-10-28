@@ -159,6 +159,136 @@ describe('card scope helpers', () => {
   });
 });
 
+describe('cross-author numbered stacks — resolver and scope-bloat wiring', () => {
+  it('assesses Alice’s declared stack on Bob’s PR without an unknown hold', () => {
+    const base = 'b'.repeat(40);
+    const head = 'c'.repeat(40);
+    const tree = 'd'.repeat(40);
+    const pr = { number: 60101, headRefName: 'lane/alice', headRefOid: head,
+      baseRefName: 'lane/bob', title: 'Declared stack', files: [{ path: 'own.mjs' }] };
+    const refs = new Map([
+      [pr.number, { ...pr, author: 'alice', isCrossRepository: false }],
+      [60102, { headRefName: pr.baseRefName, headRefOid: base, baseRefName: 'main', author: 'bob', isCrossRepository: false }],
+    ]);
+    const tips = new Map([[pr.headRefName, head], [pr.baseRefName, base]]);
+    const run = args => {
+      if (args[0] === 'cat-file') return '';
+      if (args[0] === 'rev-list') return args.at(-2) === head ? `${head}\n${base}` : base;
+      if (args[0] === 'merge-base') return base;
+      if (args[0] === 'merge-tree') return tree;
+      throw new Error(`unexpected git command: ${args.join(' ')}`);
+    };
+    const stackReads = [];
+    const events = [];
+    const bottom = { number: 60102, ...refs.get(60102), title: 'Base PR', files: [{ path: 'base.mjs' }] };
+    const [out] = enrichPrsWithScopeBloat([pr, bottom], {
+      repo: 'web-everything/web-everything', env: {}, netScope: { scopeBloat: false }, readBaseSha: () => base,
+      readNet: () => { throw new Error('must assess the declared stack diff'); },
+      readStacks: (prs, { diag }) => readStackBases({ root: '/repo', env: {}, prs, diag,
+        settingOn: true, prlessBase: true, readRefs: () => refs, readLanes: () => tips, run, log: () => {} }),
+      readStackFiles: stack => { stackReads.push(stack); return ['own.mjs']; },
+      emitEvent: event => events.push(event),
+    });
+    expect(stackReads).toEqual([{ pr: 60102, ref: pr.baseRefName, head: base, contained: base, tree, topHead: head }]);
+    expect(out.stackBase).toEqual({ pr: 60102, ref: pr.baseRefName, head: base, contained: base });
+    expect(out.scopeBloatUnknown).toBeUndefined();
+    expect(out.scopeBloat).toBeUndefined();
+    expect(events).toEqual([]);
+  });
+});
+
+describe('PR-less bases already on main — resolver and scope-bloat wiring', () => {
+  const BASE = 'b'.repeat(40);
+  const TOP = 'c'.repeat(40);
+  const ROOT = 'd'.repeat(40);
+  const MAIN = 'e'.repeat(40);
+  const TREE = 'f'.repeat(40);
+  const fixture = (shape, ancestryError = null) => {
+    // Full ancestry differs from the off-main sets: BASE is excluded from both rev-list reads.
+    const parents = new Map([[ROOT, []], [BASE, [ROOT]], [MAIN, [BASE]],
+      [TOP, shape === 'second-parent' ? [ROOT, BASE] : [shape === 'uncontained' ? ROOT : BASE]]]);
+    const reachable = (head, first = false) => {
+      const seen = new Set();
+      const visit = node => {
+        if (seen.has(node)) return;
+        seen.add(node);
+        const next = parents.get(node) ?? [];
+        for (const parent of first ? next.slice(0, 1) : next) visit(parent);
+      };
+      visit(head);
+      return seen;
+    };
+    const topHead = shape === 'equal-tip' ? BASE : TOP;
+    const pr = { number: 60100 + ['first-parent', 'second-parent', 'equal-tip', 'uncontained'].indexOf(shape), headRefName: 'lane/top', headRefOid: topHead,
+      baseRefName: 'lane/base', title: 'fix ancestry', files: [{ path: 'own.mjs' }] };
+    const refs = new Map([[pr.number, { ...pr, author: 'app/plateau-worker', isCrossRepository: false }]]);
+    const tips = new Map([[pr.headRefName, topHead], [pr.baseRefName, BASE]]);
+    const ancestryCalls = [];
+    const run = args => {
+      if (args[0] === 'cat-file') return '';
+      if (args[0] === 'rev-list') {
+        expect(args.at(-1)).toBe('^origin/main');
+        return [...reachable(args.at(-2), args.includes('--first-parent'))]
+          .filter(sha => !reachable(MAIN).has(sha)).join('\n');
+      }
+      if (args[0] === 'merge-base' && args.includes('--is-ancestor')) {
+        ancestryCalls.push(args);
+        expect(args).toEqual(['merge-base', '--is-ancestor', '--end-of-options', BASE, topHead]);
+        if (ancestryError) throw Object.assign(new Error('ancestry read failed'), { status: ancestryError });
+        if (!reachable(topHead).has(BASE)) throw Object.assign(new Error('not an ancestor'), { status: 1 });
+        return '';
+      }
+      if (args[0] === 'merge-base') return BASE;
+      if (args[0] === 'merge-tree') return TREE;
+      throw new Error(`unexpected git command: ${args.join(' ')}`);
+    };
+    const read = (options = {}) => readStackBases({ root: '/repo', env: {}, prs: [pr], settingOn: true,
+      prlessBase: true, readRefs: () => refs, readLanes: () => tips, run, log: () => {}, ...options });
+    return { pr, read, ancestryCalls, expected: { pr: null, ref: pr.baseRefName,
+      head: BASE, contained: BASE, tree: TREE, topHead } };
+  };
+
+  it.each(['first-parent', 'second-parent', 'equal-tip'])('resolves a main-reachable base through %s ancestry and removes the unknown hold', shape => {
+    const f = fixture(shape);
+    const diag = new Map();
+    expect(f.read({ diag }).get(f.pr.number)).toEqual(f.expected);
+    expect(diag.size).toBe(0);
+    expect(f.ancestryCalls).toHaveLength(1);
+    const events = [];
+    const stackReads = [];
+    const [out] = enrichPrsWithScopeBloat([f.pr], {
+      repo: 'web-everything/web-everything', env: {}, readBaseSha: () => MAIN,
+      readNet: () => { throw new Error('must read the resolved stack diff'); },
+      readStacks: (_prs, { diag }) => f.read({ diag }),
+      readStackFiles: base => { stackReads.push(base); return ['own.mjs']; },
+      emitEvent: event => events.push(event),
+    });
+    expect(stackReads).toEqual([f.expected]);
+    expect(out.scopeBloatUnknown).toBeUndefined();
+    expect(out.scopeBloat).toBeUndefined();
+    expect(events).toEqual([]);
+  });
+
+  it.each([
+    ['uncontained', null, 'base-not-contained'],
+    ['first-parent', 128, 'head-unreadable'],
+  ])('holds %s ancestry with read status %s', (shape, status, cause) => {
+    const f = fixture(shape, status);
+    const diag = new Map();
+    expect(f.read({ diag }).has(f.pr.number)).toBe(false);
+    expect(diag.get(f.pr.number)).toEqual({ cause });
+    expect(f.ancestryCalls).toHaveLength(1);
+  });
+
+  it('keeps main-reachable PR-less bases out of review-side results', () => {
+    const f = fixture('first-parent');
+    const diag = new Map();
+    expect(f.read({ prlessBase: false, diag }).size).toBe(0);
+    expect(diag.get(f.pr.number)).toEqual({ cause: 'base-branch-missing' });
+    expect(f.ancestryCalls).toEqual([]);
+  });
+});
+
 describe('enrichPrsWithScopeBloat — the io shell holds unknown stack diffs and remembers the refresh', () => {
   const pr = (over = {}) => ({ number: 4361, title: 'WE #xykwe0h: build', headRefName: 'lane/build-outcomes', headRefOid: 'a'.repeat(40),
     files: FILES_4361.map((path) => ({ path, additions: 1, deletions: 0 })), comments: [], ...over });
@@ -208,7 +338,7 @@ describe('enrichPrsWithScopeBloat — the io shell holds unknown stack diffs and
     const [out] = enrichPrsWithScopeBloat([pr({ number: 5943, baseRefName: base })], {
       ...readers, readStacks: () => new Map(), emitEvent: (event) => events.push(event),
     });
-    const detail = { reason: 'stack-base-unresolved', base };
+    const detail = { reason: 'stack-base-unresolved', base, cause: 'unknown' };
     expect(out.scopeBloat).toEqual({
       reason: 'scope-bloat', unknown: true, files: 0, alreadyOnMain: [], outsideScope: [], stale: false, wide: false,
       why: `${detail.reason}: the PR's stack base could not be resolved, so its own diff is unknown — a person or fixer must settle the base before a review reads it`,
@@ -237,7 +367,7 @@ describe('enrichPrsWithScopeBloat — the io shell holds unknown stack diffs and
     const input = pr({ ...missing, baseRefName: base, scopeBloat: { stale: true } });
     const options = { ...readers, readStacks: () => new Map(), emitEvent: (event) => events.push(event) };
     const [out] = enrichPrsWithScopeBloat([input], options);
-    const detail = { reason: 'stack-base-unresolved', base };
+    const detail = { reason: 'stack-base-unresolved', base, cause: 'unknown' };
     expect(out.scopeBloat).toEqual({
       reason: 'scope-bloat', unknown: true, files: 0, alreadyOnMain: [], outsideScope: [], stale: false, wide: false,
       why: `${detail.reason}: the PR's stack base could not be resolved, so its own diff is unknown — a person or fixer must settle the base before a review reads it`,
@@ -650,5 +780,124 @@ describe('stack-aware review (held item 177)', () => {
     expect(again.scopeBloatUnknown).toEqual(detail);
     expect(mainReads).toBe(0);
     expect(events).toEqual([{ kind: 'scope-bloat-unknown', pr: 4632, daemon: 'scope-bloat', detail }]);
+  });
+});
+
+
+describe('enrichPrsWithScopeBloat — stack base resolution from the four live shapes', () => {
+  const sha = n => n.toString(16).padStart(40, '0');
+  const shapes = [
+    [5996, 'lane/drain-poison-guard', 'lane/drain-poison-guard-base', null],
+    [5997, 'lane/ci-heal-read-timeout', 'lane/r123-auto-proceed', 5981],
+    [5983, 'lane/r130-delegated-sweep', 'lane/r130-clear-human-guard', 5982],
+    [6003, 'lane/hetzner-ci-routing', 'lane/ci-speed', 6002],
+  ];
+  const input = (shape, variant) => ({ number: shape[0], headRefName: shape[1], baseRefName: shape[2],
+    headRefOid: sha(10000 + shape[0] + variant * 100), title: 'Stack resolution regression',
+    author: 'app/plateau-worker', isCrossRepository: false,
+    files: FILES_4361.map(path => ({ path })), comments: [] });
+  const readers = {
+    repo: 'web-everything/web-everything', env: {}, netScope: { scopeBloat: false },
+    readNet: () => { throw new Error('a declared stack must not fall back to main'); },
+    readScope: () => CARD_SCOPE, readBaseSha: () => sha(20000),
+    readStackFiles: () => { throw new Error('an unresolved stack must not read files'); },
+  };
+
+  it.each(['off', 'false', '0'])('preserves ordinary one-file assessment with WE_STACK_AWARE_REVIEW=%s', setting => {
+    const pr = { ...input(shapes[0], 10), baseRefName: 'lane/base', files: [{ path: OWN[0] }] };
+    const events = [];
+    let stackReads = 0;
+    const [out] = enrichPrsWithScopeBloat([pr], { ...readers,
+      env: { WE_STACK_AWARE_REVIEW: setting },
+      readStacks: (prs, { diag }) => {
+        stackReads += 1;
+        return readStackBases({ prs, diag, settingOn: false });
+      },
+      emitEvent: event => events.push(event),
+    });
+    expect(out).toEqual(pr);
+    expect(out.scopeBloatUnknown).toBeUndefined();
+    expect(out.scopeBloat).toBeUndefined();
+    expect(stackReads).toBe(0);
+    expect(events).toEqual([]);
+    // The reader's explicit switch also means no computation, with no failure diagnostic.
+    const diag = new Map();
+    expect(readStackBases({ prs: [pr], diag, settingOn: false,
+      readRefs: () => { throw new Error('disabled reader must not read refs'); } })).toEqual(new Map());
+    expect(diag.size).toBe(0);
+  });
+
+  it.each(shapes)('assesses #%s against its resolved base tree and exposes only numbered stack bases', (number, headRefName, baseRefName, bottom) => {
+    const pr = input([number, headRefName, baseRefName, bottom], 1);
+    const stack = { pr: bottom, ref: baseRefName, head: sha(number + 30000),
+      contained: sha(number + 30000), tree: sha(number + 40000), topHead: pr.headRefOid };
+    const calls = [];
+    const stackReads = [];
+    const events = [];
+    const [out] = enrichPrsWithScopeBloat([pr], { ...readers,
+      readStacks: (list, options) => { calls.push({ list, options }); return new Map([[number, stack]]); },
+      readStackFiles: base => { stackReads.push(base); return SPRAWL_FILES; },
+      emitEvent: event => events.push(event),
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].list).toEqual([pr]);
+    expect(calls[0].options?.diag).toBeInstanceOf(Map);
+    expect(stackReads).toEqual([stack]);
+    expect(out.scopeBloat).toEqual(assessScopeBloat({ prFiles: SPRAWL_FILES, netFiles: SPRAWL_FILES, cardScope: CARD_SCOPE, env: {} }));
+    expect(out.scopeBloat).toMatchObject({ wide: true, stale: false });
+    expect(out.scopeBloatUnknown).toBeUndefined();
+    expect(events).toEqual([]);
+    if (bottom === null) expect(out).not.toHaveProperty('stackBase');
+    else expect(out.stackBase).toEqual({ pr: bottom, ref: baseRefName, head: stack.head, contained: stack.contained });
+  });
+
+  it.each(shapes)('holds unresolved #%s with the per-PR diagnostic from readStacks', (number, headRefName, baseRefName, bottom) => {
+    const pr = input([number, headRefName, baseRefName, bottom], 2);
+    const cause = bottom === null ? 'base-not-contained' : 'no-containment';
+    const events = [];
+    const calls = [];
+    const [out] = enrichPrsWithScopeBloat([pr], { ...readers,
+      readStacks: (list, { diag } = {}) => {
+        calls.push(list);
+        expect(diag).toBeInstanceOf(Map);
+        diag.set(number, { cause });
+        return new Map();
+      },
+      emitEvent: event => events.push(event),
+    });
+    expect(calls).toEqual([[pr]]);
+    const detail = { reason: 'stack-base-unresolved', base: baseRefName, cause };
+    expect(out.scopeBloatUnknown).toEqual(detail);
+    expect(out.scopeBloat).toMatchObject({ unknown: true });
+    expect(events).toEqual([{ kind: 'scope-bloat-unknown', pr: number, daemon: 'scope-bloat', detail }]);
+  });
+
+  it('uses unknown when the stack reader supplies no diagnostic', () => {
+    const pr = input(shapes[0], 3);
+    const events = [];
+    const [out] = enrichPrsWithScopeBloat([pr], { ...readers, readStacks: () => new Map(),
+      emitEvent: event => events.push(event) });
+    const detail = { reason: 'stack-base-unresolved', base: pr.baseRefName, cause: 'unknown' };
+    expect(out.scopeBloatUnknown).toEqual(detail);
+    expect(out.scopeBloat).toMatchObject({ unknown: true });
+    expect(events).toEqual([{ kind: 'scope-bloat-unknown', pr: pr.number, daemon: 'scope-bloat', detail }]);
+  });
+
+  it('holds every declared base with stack-read-failed when readStacks throws, reading once per batch', () => {
+    const prs = shapes.map(shape => input(shape, 4));
+    const events = [];
+    let reads = 0;
+    const out = enrichPrsWithScopeBloat(prs, { ...readers,
+      readStacks: () => { reads += 1; throw new Error('stack reader unavailable'); },
+      emitEvent: event => events.push(event),
+    });
+    expect(reads).toBe(1);
+    expect(events).toHaveLength(4);
+    for (const pr of out) {
+      const detail = { reason: 'stack-base-unresolved', base: pr.baseRefName, cause: 'stack-read-failed' };
+      expect(pr.scopeBloatUnknown).toEqual(detail);
+      expect(pr.scopeBloat).toMatchObject({ unknown: true });
+      expect(events).toContainEqual({ kind: 'scope-bloat-unknown', pr: pr.number, daemon: 'scope-bloat', detail });
+    }
   });
 });
