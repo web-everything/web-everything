@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { planLabelStateReconcile, sweepLabelStateReconcile } from '../label-state-reconcile.mjs';
+import { planLabelStateReconcile, sweepLabelStateReconcile, readLabelReconcileComments } from '../label-state-reconcile.mjs';
 import { reviewRunEvidence } from '../review-referral-hold.mjs';
 import { planRecordDecision } from '../../operations/review-pr.mjs';
 import { defaultReadPr } from '../advisory-label-sweep.mjs';
@@ -58,7 +58,7 @@ describe('planLabelStateReconcile', () => {
       review: review(42) })).toBeNull();
   });
   it.each(['missing', 'invalid', 'REST-invalid'])
-  ('an older objection with %s edit timing falls back to its creation time', kind => {
+  ('an older objection with %s edit timing cannot prove clearance', kind => {
     const objection = { ...comment('🔁 review — changes requested'), createdAt: '2026-10-26T00:59:00Z' };
     if (kind === 'invalid') objection.updatedAt = 'invalid';
     if (kind === 'REST-invalid') {
@@ -67,7 +67,7 @@ describe('planLabelStateReconcile', () => {
       objection.updated_at = 'invalid';
     }
     expect(planOf({ repo, pr: pr(42, ['review:changes', 'fix-waiting:host-busy'], [objection]),
-      review: review(42) }).to).toEqual([]);
+      review: review(42) })).toBeNull();
   });
   it.each([5973, 5970])('#%s: ACCEPTS on the live head replaces blocked and preserves ready', number => {
     const plan = planOf({ repo, pr: pr(number, ['red-team:blocked', 'red-team:pending', 'ready-to-merge']) });
@@ -275,6 +275,69 @@ describe('planLabelStateReconcile', () => {
 });
 
 describe('sweepLabelStateReconcile', () => {
+  it.each(['later-edit', 'old-edit', 'never-edited', 'missing', 'duplicate', 'invalid', 'failed-page'])
+  ('production edit metadata (%s) is joined before planning clearance', kind => {
+    const io = fixture();
+    io.prs[0].labels = ['review:changes', 'fix-waiting:host-busy', 'ready-to-merge'];
+    const lastEditedAt = kind === 'never-edited' ? null : kind === 'invalid' ? 'invalid'
+      : kind === 'old-edit' ? '2026-10-26T00:59:30Z' : '2026-10-26T01:02:00Z';
+    const exec = vi.fn((_cmd, argv) => {
+      if (!argv.includes('graphql')) return '🔁 review — changes requested\t2026-10-26T00:59:00Z\tchalbert\tIC_old\thttps://example.test/comment\n';
+      if (!argv.some(a => a.includes('lastEditedAt'))) return JSON.stringify({ data: { repository: {
+        pullRequest: { comments: { totalCount: 1 } } } } });
+      if (kind === 'failed-page') throw Error('edit page unreadable');
+      const nodes = kind === 'missing' ? [] : [{ id: 'IC_old', lastEditedAt }];
+      if (kind === 'duplicate') nodes.push(nodes[0]);
+      return JSON.stringify({ data: { repository: { pullRequest: { comments: {
+        nodes, pageInfo: { hasNextPage: false, endCursor: null } } } } } });
+    });
+    io.readComments = (number, options) => readLabelReconcileComments(number, { ...options, exec });
+    const [row] = sweepLabelStateReconcile(io);
+    if (['missing', 'duplicate', 'invalid', 'failed-page'].includes(kind)) {
+      expect(row.error).toBeTruthy();
+      expect(io.provider.setLabels).not.toHaveBeenCalled();
+      expect(io.emit).not.toHaveBeenCalled();
+    } else {
+      expect(row.labelsReconciled.to).toEqual(kind === 'later-edit'
+        ? ['review:changes', 'fix-waiting:host-busy'] : ['ready-to-merge']);
+      expect(io.provider.setLabels).toHaveBeenCalledWith(repo, 5954, { add: null,
+        remove: kind === 'later-edit' ? ['ready-to-merge'] : ['review:changes', 'fix-waiting:host-busy'] });
+    }
+  });
+  it.each(['comment', 'edit', 'native', 'stored', 'unreadable'])
+  ('a same-head %s hold arriving during provisioning survives the final refresh', kind => {
+    const io = fixture(), live = io.prs[0], stored = review(5954);
+    live.labels.push('ready-to-merge');
+    const old = { ...comment('Operator note'), createdAt: '2026-10-26T00:59:00Z',
+      updatedAt: '2026-10-26T00:59:00Z' };
+    if (kind === 'edit') live.comments.push(old);
+    let provisioned = false;
+    io.readReview = () => stored;
+    io.provider.ensureLabel.mockImplementation(() => {
+      provisioned = true;
+      if (kind === 'comment') live.comments.push({ ...comment('🔁 review — changes requested'),
+        createdAt: '2026-10-26T01:02:00Z', updatedAt: '2026-10-26T01:02:00Z' });
+      if (kind === 'edit') Object.assign(old, { body: '🔁 review — changes requested', updatedAt: '2026-10-26T01:02:00Z' });
+      if (kind === 'native') io.provider.readPrReviews.mockReturnValue([
+        { state: 'CHANGES_REQUESTED', user: { login: 'chalbert' }, submitted_at: '2026-10-26T01:02:00Z' }]);
+      if (kind === 'stored') stored.findings.confirm = 'changes';
+    });
+    io.readComments = () => {
+      if (kind === 'unreadable' && provisioned) throw Error('thread unreadable after provisioning');
+      return structuredClone(live.comments);
+    };
+    const rows = sweepLabelStateReconcile(io);
+    expect(provisioned).toBe(true);
+    if (kind === 'unreadable') {
+      expect(rows[0].error).toBe('thread unreadable after provisioning');
+      expect(io.provider.setLabels).not.toHaveBeenCalled();
+      expect(io.emit).not.toHaveBeenCalled();
+    } else {
+      expect(rows[0]?.labelsReconciled.to).toEqual(['review:changes', 'fix-waiting:host-busy', 'red-team:clear']);
+      expect(io.provider.setLabels).toHaveBeenCalledWith(repo, 5954,
+        { add: 'red-team:clear', remove: ['red-team:blocked', 'ready-to-merge'] });
+    }
+  });
   function fixture() {
     const live = pr(5954, ['review:changes', 'red-team:blocked', 'fix-waiting:host-busy'], [referral(5954, true), red(5954)]);
     const stored = review(5954);
@@ -282,7 +345,7 @@ describe('sweepLabelStateReconcile', () => {
     return { repo, prs: [live], provider, emit, readPr: vi.fn(() => live), readComments: () => live.comments,
       readReviews: () => [reviewRunEvidence(stored)], readReview: () => stored, readRedTeam: () => null };
   }
-  it('the complete production comment reader permits a newer accepted review to clear an older objection', () => {
+  it('the complete production comment reader cannot authorize clearance without edit metadata', () => {
     const io = fixture();
     const exec = vi.fn((_cmd, argv) => argv.includes('graphql')
       ? JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 1 } } } } })
@@ -291,9 +354,9 @@ describe('sweepLabelStateReconcile', () => {
     io.readComments = (number, options) => readCompletePrComments(number, { ...options, exec });
     expect(io.readComments(5954, { repo })[0]).toEqual({ body: '🔁 review — changes requested',
       createdAt: '2026-10-26T00:59:00Z', author: { login: 'chalbert' }, id: 'IC_old', url: 'https://example.test/comment' });
-    expect(sweepLabelStateReconcile(io)[0]?.labelsReconciled.to).toEqual(['ready-to-merge']);
+    expect(sweepLabelStateReconcile(io)[0]?.labelsReconciled.to).toEqual(['review:changes', 'fix-waiting:host-busy']);
     expect(io.provider.setLabels).toHaveBeenCalledWith(repo, 5954, {
-      add: null, remove: ['review:changes', 'fix-waiting:host-busy'] });
+      add: null, remove: ['ready-to-merge'] });
   });
   it('a failed self-acceptance record preserves holds through the sweep', () => {
     const io = fixture(), stored = review(5954);
@@ -400,6 +463,30 @@ describe('sweepLabelStateReconcile', () => {
     io.readPr.mockReturnValueOnce(live).mockReturnValueOnce({ ...live, labels: ['red-team:clear'] });
     expect(sweepLabelStateReconcile(io)).toEqual([]);
     expect(io.provider.setLabels).not.toHaveBeenCalled();
+  });
+  it('a refreshed plan needing another label waits for the next tick to provision it', () => {
+    const io = fixture(), live = io.prs[0];
+    live.labels.push('ready-to-merge');
+    // A concurrent writer removed blocked while a fresh red-team objection arrived.
+    io.readPr.mockReturnValueOnce(live).mockReturnValue({ ...live,
+      labels: ['review:changes', 'fix-waiting:host-busy', 'ready-to-merge'] });
+    io.provider.ensureLabel.mockImplementation(() => { live.comments = [red(5954, head, true)]; });
+    expect(sweepLabelStateReconcile(io)).toEqual([]);
+    expect(io.provider.ensureLabel).toHaveBeenCalledTimes(1);
+    expect(io.provider.ensureLabel).toHaveBeenCalledWith(repo, 'red-team:clear', expect.any(Object));
+    expect(io.provider.setLabels).not.toHaveBeenCalled();
+    expect(io.emit).not.toHaveBeenCalled();
+    io.provider.ensureLabel.mockImplementation(() => {});
+    expect(sweepLabelStateReconcile(io)[0]?.labelsReconciled.to)
+      .toEqual(['review:changes', 'fix-waiting:host-busy', 'red-team:blocked']);
+    expect(io.provider.ensureLabel).toHaveBeenLastCalledWith(repo, 'red-team:blocked', expect.any(Object));
+  });
+  it('failed provisioning leaves labels and events untouched', () => {
+    const io = fixture();
+    io.provider.ensureLabel.mockImplementation(() => { throw Error('provision failed'); });
+    expect(sweepLabelStateReconcile(io)[0].error).toBe('provision failed');
+    expect(io.provider.setLabels).not.toHaveBeenCalled();
+    expect(io.emit).not.toHaveBeenCalled();
   });
   it('the production PR reader preserves its default fields for existing callers', () => {
     const exec = vi.fn(() => '{}');

@@ -79,7 +79,7 @@ import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { sweepAutoBlock } from './referral-auto-block.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { sweepAcceptCarry, defaultCloneDirFor } from './accept-carry-sweep.mjs';
-import { sweepLabelStateReconcile } from './label-state-reconcile.mjs';
+import { sweepLabelStateReconcile, readLabelReconcileComments } from './label-state-reconcile.mjs';
 
 /** Plain label names off a `gh --json labels` array (`[{name}]`) or a bare-string array. Pure. */
 function labelNames(labels) {
@@ -364,7 +364,8 @@ export function sweepReviewHoldLabels({
     results.push({ num: 0, autoBlock: 'sweep-failed', error: String((e && e.message) || e).split('\n')[0] });
   }
   // advisory:ruling-needed is reconciled only by pr-label-mirror --apply (G2).
-  results.push(...sweepLabelStateReconcile({ prs, repo, resolveRepo: repoOf, provider, dryRun, readPr, readComments, ...labelState }));
+  results.push(...sweepLabelStateReconcile({ prs, repo, resolveRepo: repoOf, provider, dryRun, readPr,
+    readComments: readComments === readCompletePrComments ? readLabelReconcileComments : readComments, ...labelState }));
   return results;
 }
 

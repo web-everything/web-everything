@@ -9,11 +9,26 @@ import { readRun } from '../operations/run-store.mjs';
 import { REVIEW_EFFECTS } from '../operations/review-pr-constants.mjs';
 import { readReviewRunEvidence, reviewRunEvidence } from './review-referral-hold.mjs';
 import { defaultReadPr } from './advisory-label-sweep.mjs';
-import { readCompletePrComments } from './pr-comments-complete.mjs';
+import { readCompletePrComments, readCompletePrCommentEditHistory } from './pr-comments-complete.mjs';
 import { isLaterVerdictBody, laterReviewHold } from '../lib/accept-carry-forward.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 
 const names = labels => labels.map(l => typeof l === 'string' ? l : l.name);
+
+/** The shared body reader omits edit times. Join the complete edit metadata by node ID before trusting age. */
+export function readLabelReconcileComments(number, options = {}) {
+  const comments = readCompletePrComments(number, options);
+  const edits = readCompletePrCommentEditHistory(number, options);
+  const byId = new Map(edits.map(c => [c.id, c.lastEditedAt]));
+  if (byId.size !== edits.length || byId.size !== comments.length || comments.some(c => !byId.has(c.id))) {
+    throw Error('comment edit metadata does not cover the complete thread');
+  }
+  return comments.map(c => {
+    const updatedAt = byId.get(c.id) ?? c.createdAt;
+    if (!Number.isFinite(Date.parse(updatedAt))) throw Error('comment edit metadata has invalid timing');
+    return { ...c, updatedAt };
+  });
+}
 
 /**
  * Pure: all inputs are observations; only exact SHA equality permits a stored result to decide.
@@ -59,9 +74,8 @@ export function planLabelStateReconcile({ repo, pr, review = null, redTeam = nul
       if (!isTrustedMarkerAuthor(c) || !isLaterVerdictBody(c?.body)) return false;
       const created = Date.parse(c.createdAt ?? c.created_at ?? '');
       const edited = Date.parse(c.updatedAt ?? c.updated_at ?? '');
-      // The production comment reader supplies creation time without edit metadata. Use it as the
-      // fallback; known later edits still hold, and unknown creation times still fail closed.
-      const at = Math.max(created, Number.isFinite(edited) ? edited : created);
+      // Both times must be known: creation alone cannot date an objection edited into an old note.
+      const at = Math.max(created, edited);
       return !Number.isFinite(at) || at >= observed.startedAt;
     }) || (Array.isArray(reviews) && laterReviewHold(reviews, new Date(observed.startedAt).toISOString()));
     const referrals = liveReferralState(pr, { repo, pr: pr.number });
@@ -85,7 +99,7 @@ export function planLabelStateReconcile({ repo, pr, review = null, redTeam = nul
 
 /** IO shell: re-read evidence and then the live head; read failures leave labels untouched for the next pass. */
 export function sweepLabelStateReconcile({ prs = [], repo, resolveRepo = () => repo, dryRun = false,
-  provider = createGhProvider(), readPr = defaultReadPr, readComments = readCompletePrComments,
+  provider = createGhProvider(), readPr = defaultReadPr, readComments = readLabelReconcileComments,
   readReviews = readReviewRunEvidence, readReview = readRun, readRedTeam = readRedTeamStatus,
   emit = appendDaemonEvent } = {}) {
   const results = [];
@@ -121,7 +135,12 @@ export function sweepLabelStateReconcile({ prs = [], repo, resolveRepo = () => r
         try { redTeam = readRedTeam({ repo: slug, pr: pr.number, head: pr.headRefOid }); } catch { /* retain unknown state */ }
         return { review, redTeam };
       };
-      if (!planLabelStateReconcile({ repo: slug, pr, ...readStored(), reviews: first.native })) continue;
+      const initialPlan = planLabelStateReconcile({ repo: slug, pr, ...readStored(), reviews: first.native });
+      if (!initialPlan) continue;
+      // Provision before refreshing evidence: provisioning can publish a same-head objection too.
+      if (!dryRun) {
+        for (const label of initialPlan.add) provider.ensureLabel(slug, label, RED_TEAM_STATUS_LABEL_META[label]);
+      }
       // Evidence reads can span a push, a new verdict or a new run. Never apply the old head's clearance to the
       // new head, and re-plan from a final read of every plane so a hold that arrived meanwhile is honoured.
       const fresh = readLive();
@@ -129,8 +148,9 @@ export function sweepLabelStateReconcile({ prs = [], repo, resolveRepo = () => r
       const plan = planLabelStateReconcile({ repo: slug, pr: fresh.pr, ...readStored(true), reviews: fresh.native });
       if (!plan) continue;
       if (!dryRun) {
-        for (const label of plan.add) provider.ensureLabel(slug, label, RED_TEAM_STATUS_LABEL_META[label]);
-        // Evidence reads and label provisioning may span a push. Keep this metadata-only read next to
+        // A changed plan may need a different label. Retry next tick rather than provision after the refresh.
+        if (plan.add.some(label => !initialPlan.add.includes(label))) continue;
+        // Evidence reads may span a push. Keep this metadata-only read next to
         // the write: defaultReadPr's thread read must not open another evidence-read race afterward.
         const writeHead = readPr({ repo: slug, number: pr.number, fields: 'number,state,headRefOid',
           readComments: () => [] });

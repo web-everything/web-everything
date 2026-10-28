@@ -25,13 +25,15 @@ export default {
       && planner.includes('at >= observed.startedAt')
       && planner.includes('publishedAccept')
       && planner.includes('c.updatedAt ?? c.updated_at')
-      && planner.includes('Number.isFinite(edited) ? edited : created')
+      && planner.includes('Math.max(created, edited)')
+      && planner.includes('readCompletePrCommentEditHistory(number, options)')
+      && planner.indexOf('provider.ensureLabel(') < planner.indexOf('const fresh = readLive()')
       && !planner.includes("status?.result.foldedVerdict === 'changes'")
       && reader.includes("fields = 'number,state,labels,headRefOid'");
   },
   async run({ sourceRoot = ROOT, log } = {}) {
     const load = path => import(pathToFileURL(join(sourceRoot, path)).href);
-    const { sweepLabelStateReconcile } = await load('scripts/conveyor/label-state-reconcile.mjs');
+    const { sweepLabelStateReconcile, readLabelReconcileComments } = await load('scripts/conveyor/label-state-reconcile.mjs');
     const { defaultReadPr } = await load('scripts/conveyor/advisory-label-sweep.mjs');
     const { readCompletePrComments } = await load('scripts/conveyor/pr-comments-complete.mjs');
     const { reviewRunEvidence } = await load('scripts/conveyor/review-referral-hold.mjs');
@@ -53,11 +55,13 @@ export default {
     // write, and a native GitHub change request must each keep the holds.
     // during-run-changes: posted after the run read the thread but before its advise step finished.
     const holding = ['changes', 'later-changes', 'awaiting-confirm', 'racing-changes', 'native-changes',
-      'during-run-changes', 'edited-changes', 'rest-edited-changes', 'racing-edit'];
+      'during-run-changes', 'edited-changes', 'rest-edited-changes', 'racing-edit', 'unknown-edit',
+      'production-comments', 'production-edited', 'provision-changes', 'provision-edit', 'provision-native'];
     for (const scenario of ['changes', 'accept', 'abstain', 'later-changes', 'newer-accept',
       'awaiting-confirm', 'racing-changes', 'native-changes', 'during-run-changes',
       'failed-self-accept', 'edited-changes', 'rest-edited-changes', 'unknown-edit', 'racing-edit',
-      'production-comments', 'degraded-stored-changes', 'not-real-stored-changes']) {
+      'production-comments', 'production-edited', 'production-unedited', 'degraded-stored-changes', 'not-real-stored-changes',
+      'provision-changes', 'provision-edit', 'provision-native']) {
       const confirm = ['changes', 'abstain'].includes(scenario) ? scenario
         : scenario === 'awaiting-confirm' ? undefined : 'accept';
       let labels = ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held', 'ready-to-merge'];
@@ -76,6 +80,8 @@ export default {
       }
       if (confirm === 'abstain' && !planRecordDecision(review).abstain) violations.push('abstain: unexpectedly records');
       const comments = confirm === 'changes' ? [] : [settled];
+      const provisioning = scenario.startsWith('provision-');
+      if (provisioning) labels.push('red-team:blocked');
       const operatorChanges = { author: { login: 'chalbert' },
         body: '🔁 review — changes requested\nRemaining operator blocker', createdAt: '2026-10-26T01:02:00Z',
         updatedAt: '2026-10-26T01:02:00Z' };
@@ -83,6 +89,8 @@ export default {
       if (scenario === 'during-run-changes') comments.push({ ...operatorChanges,
         createdAt: '2026-10-26T01:00:30Z', updatedAt: '2026-10-26T01:00:30Z' });
       const edited = { ...operatorChanges, createdAt: '2026-10-26T00:59:00Z' };
+      const oldNote = { ...edited, body: 'Operator note', updatedAt: edited.createdAt };
+      if (scenario === 'provision-edit') comments.push(oldNote);
       if (scenario === 'rest-edited-changes') {
         edited.updated_at = edited.updatedAt;
         delete edited.updatedAt;
@@ -103,6 +111,14 @@ export default {
       let threadReads = 0;
       const readComments = () => {
         threadReads++;
+        if (['production-edited', 'production-unedited'].includes(scenario)) return readLabelReconcileComments(number, { repo,
+          exec: (_cmd, argv) => {
+            if (!argv.includes('graphql')) return '🔁 review — changes requested\t2026-10-26T00:59:00Z\tchalbert\tIC_old\thttps://example.test/comment\n';
+            const connection = argv.some(a => a.includes('lastEditedAt'))
+              ? { nodes: [{ id: 'IC_old', lastEditedAt: scenario === 'production-edited' ? '2026-10-26T01:02:00Z' : null }],
+                pageInfo: { hasNextPage: false, endCursor: null } } : { totalCount: 1 };
+            return JSON.stringify({ data: { repository: { pullRequest: { comments: connection } } } });
+          } });
         if (scenario === 'production-comments') return readCompletePrComments(number, { repo,
           exec: (_cmd, argv) => argv.includes('graphql')
             ? JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: 1 } } } } })
@@ -110,7 +126,7 @@ export default {
         if (scenario === 'racing-changes' && threadReads > 1) return [...comments, operatorChanges];
         if (scenario === 'racing-edit') return [...comments, threadReads > 1 ? edited
           : { ...edited, body: 'Operator note', updatedAt: edited.createdAt }];
-        return comments;
+        return structuredClone(comments);
       };
       const reviews = scenario === 'native-changes'
         ? [{ state: 'CHANGES_REQUESTED', user: { login: 'chalbert' }, submitted_at: '2026-10-26T01:02:00Z' }] : [];
@@ -125,9 +141,14 @@ export default {
       const io = { repo, prs: [{ number, labels }],
         readPr: args => defaultReadPr({ ...args, exec, readComments: () => comments }),
         readComments, readReviews: () => [reviewRunEvidence(review)], readReview: () => review,
-        readRedTeam: () => storedChanges
-          ? { repo, pr: number, head, status: 'finished', result: { foldedVerdict: 'changes' } } : null,
-        emit: () => {}, provider: { ensureLabel() {}, readPrReviews: () => reviews,
+        readRedTeam: () => storedChanges || provisioning
+          ? { repo, pr: number, head, status: 'finished', result: { foldedVerdict: storedChanges ? 'changes' : 'accept' } } : null,
+        emit: () => {}, provider: { ensureLabel() {
+          if (scenario === 'provision-changes') comments.push(operatorChanges);
+          if (scenario === 'provision-edit') Object.assign(oldNote, edited);
+          if (scenario === 'provision-native') reviews.push({ state: 'CHANGES_REQUESTED',
+            user: { login: 'chalbert' }, submitted_at: '2026-10-26T01:02:00Z' });
+        }, readPrReviews: () => structuredClone(reviews),
           setLabels(_repo, _pr, { add, remove }) {
             labels = labels.filter(l => !remove.includes(l));
             if (add) labels.push(...add.split(','));
@@ -137,7 +158,7 @@ export default {
       const expected = ['abstain', 'awaiting-confirm', 'failed-self-accept'].includes(scenario)
         ? ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held', 'ready-to-merge']
         : holding.includes(scenario)
-          ? ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held']
+          ? ['review:changes', 'fix-waiting:host-busy', 'fix-waiting:claim-held', ...(provisioning ? ['red-team:clear'] : [])]
           : storedChanges ? ['ready-to-merge', 'red-team:clear'] : ['ready-to-merge'];
       if (JSON.stringify(labels) !== JSON.stringify(expected)) violations.push(`${scenario}: unexpected labels ${labels.join(',')}`);
       // The next tick must be stable after either a hold or a clearance.
