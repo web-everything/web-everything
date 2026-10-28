@@ -1,8 +1,10 @@
 /** @file Acceptance contract for resumable detached operations and runner liveness. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, fstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, fstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { keepAliveScript } from '../test-keepalive.mjs';
 import {
   resolveDetachedOpsDir, parseDetachFlags, startDetachedOp, waitForOp, handleDetachCli,
@@ -440,6 +442,80 @@ describe('detached operation lifecycle', () => {
       expect(await cancelOp({ dir, id: record.id })).toMatchObject({ code: 1, reason: 'unsupported-cancellation-record' });
     } finally { kill.mockRestore(); }
   });
+
+  it('T11: a nested detached Codex worker survives outer admission cleanup until its own cancellation sweep', async () => {
+    const jobPath = join(dir, 'inner-job.json');
+    const ready = join(dir, 'inner-ready');
+    const pulse = join(dir, 'inner-pulse');
+    const workerPath = join(dir, 'worker.cjs');
+    const launcherPath = join(dir, 'launcher.mjs');
+    const pool = join(dir, '.lanes');
+    mkdirSync(join(pool, '.admission', 'heavy'), { recursive: true });
+    // Replace only the expensive Codex workload. The real launch function, OS
+    // detachment, file descriptors, admission CLI and ownership sweeps all run.
+    writeFileSync(workerPath, keepAliveScript({ maxLifetimeMs: 60000, postlude: `
+      const fs = require('node:fs');
+      fs.writeFileSync(${JSON.stringify(ready)}, String(process.pid));
+      setInterval(() => fs.writeFileSync(${JSON.stringify(pulse)}, 'alive'), 25);
+    ` }));
+    writeFileSync(launcherPath, `
+      import { writeFileSync, existsSync } from 'node:fs';
+      import { setTimeout as sleep } from 'node:timers/promises';
+      import { startDetachedJob } from ${JSON.stringify(new URL('../../codex-direct-task.mjs', import.meta.url).href)};
+      const job = await startDetachedJob({ args: ['--detach'],
+        jobsDir: ${JSON.stringify(join(dir, 'jobs'))}, scriptPath: ${JSON.stringify(workerPath)} });
+      writeFileSync(${JSON.stringify(jobPath)}, JSON.stringify(job));
+      const deadline = Date.now() + 10000;
+      while (!existsSync(${JSON.stringify(ready)})) {
+        if (Date.now() >= deadline) throw new Error('inner worker did not start');
+        await sleep(25);
+      }
+    `);
+    const env = { ...process.env, LANE_POOL_ROOT: pool, DETACHED_OPS_DIR: dir,
+      WE_PLATFORM_PREFERENCES: join(dir, 'no-preferences.json'),
+      WE_HEAVY_ADMISSION_CAP: '1', WE_HEAVY_ADMISSION_FAST_SLOTS: '0',
+      WE_HEAVY_ADMISSION_RUN_WAIT_MS: '0', WE_HEAVY_ADMISSION_CONTAINER: '0',
+      WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES: '0', VITEST: 'true',
+      WE_TEST_HOST_LOAD1: '0', WE_TEST_HOST_MEMORY_MB: '16384',
+      WE_RESOURCE_SHADOW: 'off', WE_RESOURCE_CUTOVER: 'shadow' };
+    delete env.CI;
+    delete env.WE_HEAVY_ADMISSION;
+    delete env.WE_HEAVY_ADMISSION_HELD;
+    let outer, inner;
+    try {
+      const launched = spawnSync(process.execPath, [
+        fileURLToPath(new URL('../../readiness/heavy-admission.mjs', import.meta.url)),
+        'run', '--detach', '--', process.execPath, launcherPath,
+      ], { cwd: dir, env, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024 });
+      expect(launched.error, launched.stderr).toBeUndefined();
+      expect(launched.status, launched.stderr).toBe(0);
+      outer = JSON.parse(launched.stdout);
+      const finished = await waitForOp({ id: outer.id, dir, maxWaitMs: 20000 });
+      expect(finished).toMatchObject({ status: 'done', code: 0, cleanup: 'observed-owners-stopped' });
+      inner = JSON.parse(readFileSync(jobPath, 'utf8'));
+      const ownScope = inner.recordPath;
+      const living = await readProcess(inner.pid, { scope: ownScope });
+      expect(living.alive, 'outer completion killed the independently detached Codex worker').toBe(true);
+      rmSync(pulse, { force: true });
+      await vi.waitFor(() => expect(existsSync(pulse)).toBe(true), { timeout: 2000, interval: 25 });
+
+      // Codex jobs use signal cancellation. Sweep with this job's own identity
+      // and logs, proving isolation did not make the worker unkillable.
+      const cancelled = await sweepOwnedProcesses({ ...inner,
+        commandIdentity: living.identity, stdoutPath: inner.resultPath,
+        stderrPath: join(dir, 'jobs', `${inner.id}.stderr.log`),
+      }, { signal: 'SIGTERM' });
+      expect(cancelled).toEqual({ complete: true, members: [] });
+      expect((await readProcess(inner.pid, { scope: ownScope })).alive).toBe(false);
+      rmSync(pulse, { force: true });
+      await new Promise(done => setTimeout(done, 150));
+      expect(existsSync(pulse)).toBe(false);
+    } finally {
+      if (!inner && existsSync(jobPath)) inner = JSON.parse(readFileSync(jobPath, 'utf8'));
+      if (outer) await cancelOp({ id: outer.id, dir, maxWaitMs: 10000 });
+      if (inner) { try { process.kill(inner.pid, 'SIGKILL'); } catch {} }
+    }
+  }, 45000);
 
   it.each([['SIGTERM', 'marker'], ['SIGTERM', 'logs'], ['SIGKILL', 'marker'], ['SIGKILL', 'logs']])(
     'T5/T6/T7: runner %s stops a double-forked orphan owned only by %s', async (signal, ownership) => {

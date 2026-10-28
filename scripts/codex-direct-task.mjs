@@ -1236,9 +1236,11 @@ export async function startDetachedJob({
   const recordPath = jobRecordPath(jobsDir, id);
   fsDeps.mkdirSync(jobsDir, { recursive: true });
   const resultPath = join(jobsDir, `${id}.result.json`);
-  // A detached job's gate must acquire capacity after its launching wrapper exits.
+  // A detached job outlives its launching wrapper: acquire fresh admission and
+  // drop its ownership marker, as detached-op's observer/reaper environments do.
   const childEnv = { ...env, CODEX_JOBS_DIR: jobsDir };
   delete childEnv.WE_HEAVY_ADMISSION_HELD;
+  delete childEnv.WE_DETACHED_OP;
   const fds = [];
   try {
     fds.push(fsDeps.openSync(resultPath, 'w', 0o600));
