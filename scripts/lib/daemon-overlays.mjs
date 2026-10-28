@@ -94,7 +94,7 @@ function eventsFilePath(root, env = process.env) {
  * with an empty list — a caller decides whether/how to alert, this function only fails closed.
  * @param {string} root
  * @param {{env?:NodeJS.ProcessEnv}} [o]
- * @returns {{clone:string|null, overlays:Array<object>, corrupt:boolean}}
+ * @returns {{clone:string|null, overlays:Array<object>, generation:number, corrupt:boolean}}
  */
 export function readOverlayState(root, { env = process.env } = {}) {
   const file = overlayFilePath(root, env);
@@ -102,19 +102,19 @@ export function readOverlayState(root, { env = process.env } = {}) {
   try {
     raw = readFileSync(file, 'utf8');
   } catch (e) {
-    if (e && e.code === 'ENOENT') return { clone: null, overlays: [], corrupt: false };
-    return { clone: null, overlays: [], corrupt: true };
+    if (e && e.code === 'ENOENT') return { clone: null, overlays: [], generation: 0, corrupt: false };
+    return { clone: null, overlays: [], generation: 0, corrupt: true };
   }
   let parsed;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return { clone: null, overlays: [], corrupt: true };
+    return { clone: null, overlays: [], generation: 0, corrupt: true };
   }
   if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.overlays)) {
-    return { clone: null, overlays: [], corrupt: true };
+    return { clone: null, overlays: [], generation: 0, corrupt: true };
   }
-  return { clone: typeof parsed.clone === 'string' ? parsed.clone : null, overlays: parsed.overlays, corrupt: false };
+  return { clone: typeof parsed.clone === 'string' ? parsed.clone : null, overlays: parsed.overlays, generation: typeof parsed.generation === 'number' ? parsed.generation : 0, corrupt: false };
 }
 
 /**
@@ -184,17 +184,58 @@ function readOverlaysForWrite(root, env) {
  * always recomputed fresh from `root` at write time (never trusted from the prior file).
  * @param {string} root
  * @param {Array<object>} list
- * @param {{env?:NodeJS.ProcessEnv}} [o]
+ * @param {{env?:NodeJS.ProcessEnv, generation?:number}} [o]
  * @returns {Array<object>} the same `list`, for chaining
  */
-export function writeOverlays(root, list, { env = process.env } = {}) {
+export function writeOverlays(root, list, { env = process.env, generation = readOverlayState(root, { env }).generation } = {}) {
   const file = overlayFilePath(root, env);
   mkdirSync(dirname(file), { recursive: true });
-  const payload = JSON.stringify({ clone: resolveCloneRoot(root), overlays: list }, null, 2);
+  const payload = JSON.stringify({ clone: resolveCloneRoot(root), generation, overlays: list }, null, 2);
   const tmp = `${file}.tmp-${process.pid}`;
   writeFileSync(tmp, payload, 'utf8');
   renameSync(tmp, file);
   return list;
+}
+
+/** Adopted evidence is usable only for the same explicit registration. */
+export function appliedRowFor(adopted, ref, registrationId) {
+  if (typeof ref !== 'string' || !ref || typeof registrationId !== 'string' || !registrationId
+    || !Array.isArray(adopted?.applied)) return null;
+  return adopted.applied.find((row) => row?.ref === ref && row.registrationId === registrationId) ?? null;
+}
+
+/** Stamp legacy registrations once, sharing ids only with uniquely provable legacy inputs. */
+export function migrateRegistrationIds(root, { env = process.env, adopted } = {}) {
+  return withListLock(root, env, () => {
+    const stamped = [];
+    const current = readOverlaysForWrite(root, env);
+    if (current.some((o) => !o || typeof o !== 'object' || Array.isArray(o) || typeof o.ref !== 'string' || !o.ref)) {
+      return { list: current, stamped: [], unprovable: [], adopted };
+    }
+    const list = current.map((entry) => {
+      if (!entry || typeof entry.ref !== 'string' || entry.registrationId) return entry;
+      const registrationId = randomUUID();
+      stamped.push({ ref: entry.ref, registrationId });
+      return { ...entry, registrationId };
+    });
+    const unprovable = [];
+    let changed = false;
+    const applied = adopted?.applied?.map((row) => {
+      if (!row || row.registrationId) return row;
+      const matches = list.filter((entry) => entry?.ref === row.ref);
+      if (!matches.length) return row;
+      const entry = matches[0];
+      if (matches.length === 1 && stamped.some((s) => s.registrationId === entry.registrationId)
+        && (row.pr === undefined || row.pr === (entry.pr ?? null))) {
+        changed = true;
+        return { ...row, registrationId: entry.registrationId };
+      }
+      unprovable.push({ ref: row.ref });
+      return row;
+    });
+    if (stamped.length) writeOverlays(root, list, { env, generation: readOverlayState(root, { env }).generation + 1 });
+    return { list, stamped, unprovable, adopted: changed ? { ...adopted, applied } : adopted };
+  });
 }
 
 /**
@@ -288,7 +329,7 @@ export function addOverlay(root, {
       if (conflictOverride) next.conflictOverride = conflictOverride;
       list[idx] = next;
     }
-    return writeOverlays(root, list, { env });
+    return writeOverlays(root, list, { env, generation: readOverlayState(root, { env }).generation + 1 });
   });
 }
 
@@ -369,12 +410,12 @@ function collectRetiredSources(list, sources, { strict = false } = {}) {
  * an entry carrying `retiredSources` puts those sources back in its place (a source registered again meanwhile is
  * skipped, its own nested sources still come back), so a container dropped later (pr-closed, ref-gone, smoke,
  * operator) never takes their content with it.
- * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedOverlay?:object, expectedRequiredOverlay?:object,
+ * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedOverlay?:object, expectedRequiredOverlay?:object, expectRegistrationId?:string,
  *   retireInto?:boolean, retiredSha?:string|null}} [o]
  * @returns {{removed:boolean, list:Array<object>, reinstated?:string[]}}
  */
 export function removeOverlay(root, ref, {
-  env = process.env, why, requireRef, expectedOverlay, expectedRequiredOverlay, retireInto = false, retiredSha = null,
+  env = process.env, why, requireRef, expectedOverlay, expectedRequiredOverlay, expectRegistrationId, retireInto = false, retiredSha = null,
 } = {}) {
   void why; // caller bookkeeping only — see JSDoc above.
   return withListLock(root, env, (pause) => {
@@ -390,6 +431,9 @@ export function removeOverlay(root, ref, {
     }
     const idx = list.findIndex((o) => o && o.ref === ref);
     if (expectedOverlay !== undefined && idx !== -1 && !isDeepStrictEqual(registrationIdentity(list[idx]), registrationIdentity(expectedOverlay))) {
+      throw new Error('registration changed; refusing removal');
+    }
+    if (expectRegistrationId !== undefined && idx !== -1 && list[idx].registrationId !== expectRegistrationId) {
       throw new Error('registration changed; refusing removal');
     }
     if (idx === -1) return { removed: false, list };
@@ -412,7 +456,7 @@ export function removeOverlay(root, ref, {
     // Audit before the write: a failed append throws and leaves the list (container included) unchanged.
     for (const s of back) appendOverlayEvent(root, { kind: 'reinstated', ref: s.entry.ref, from: ref, sha: s.sha ?? null }, { env });
     if (skipped.length) appendOverlayEvent(root, { kind: 'reinstate-skipped', refs: skipped, from: ref }, { env });
-    writeOverlays(root, next, { env });
+    writeOverlays(root, next, { env, generation: readOverlayState(root, { env }).generation + 1 });
     return { removed: true, list: next, reinstated: back.map((s) => s.entry.ref) };
   });
 }
@@ -446,7 +490,7 @@ export function reinstateOverlaySources(root, ref, { env = process.env, expected
  * Fresh read under the list lock; the identity captured at refresh must still match. Unbound, replaced and
  * vanished registrations are skipped. Rebuild caches are excluded from that identity, so cache writes commute.
  * @param {string} root
- * @param {Map<string,{sha:string,reg:object}>} tips ref → full sha and registration identity captured at refresh
+ * @param {Map<string,{sha:string,reg:object,registrationId?:string}>} tips ref → full sha and registration identity captured at refresh
  * @param {{env?:NodeJS.ProcessEnv}} [o]
  * @returns {{written:number}}
  */
@@ -457,7 +501,8 @@ export function persistTipShas(root, tips, { env = process.env } = {}) {
     let written = 0;
     for (let i = 0; i < list.length; i += 1) {
       const evidence = list[i] && tips.get(list[i].ref);
-      const { sha, reg } = evidence ?? {};
+      const { sha, reg, registrationId } = evidence ?? {};
+      if (registrationId !== undefined && (!list[i].registrationId || list[i].registrationId !== registrationId)) continue;
       if (!reg || !isDeepStrictEqual(registrationIdentity(list[i]), reg)
         || !SHA_RE.test(sha ?? '') || list[i].tipSha === sha) continue;
       list[i] = { ...list[i], tipSha: sha };
