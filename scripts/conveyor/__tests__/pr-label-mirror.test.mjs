@@ -412,6 +412,16 @@ describe('#5649 planLabelInputRows', () => {
     expect(planLabelInputRows({ ...opts, events: [clear], headSha: HEAD, items: addition })).toEqual([]);
     expect(planLabelInputRows({ ...opts, events: [clear], headSha: 'b'.repeat(40), items: addition })).toHaveLength(1);
   });
+  it('an approval granted for head A never suppresses mirroring a hold on head B', () => {
+    const live = { by: 'judge', scope: 'review', expires: '2099-01-01T00:00:00Z' };
+    const approvalAt = headSha => buildLedgerEvent({ type: 'approval', repo: REPO, pr: 7, at: '2026-10-12T12:00:00Z',
+      source: 'review-set-label', approval: 'clear-human', delegation: live, headSha });
+    const opts = { ...base, liveLabels: ['review:human'], now: Date.parse('2026-10-12T13:00:00Z'), headSha: 'b'.repeat(40),
+      items: [tl('review:human', 'added', 'operator', '2026-10-12T11:00:00Z')] };
+    expect(planLabelInputRows({ ...opts, events: [approvalAt(HEAD)] })).toHaveLength(1);
+    expect(planLabelInputRows({ ...opts, events: [approvalAt(undefined)] })).toHaveLength(1);
+    expect(planLabelInputRows({ ...opts, events: [approvalAt('b'.repeat(40))] })).toEqual([]);
+  });
   it('a bot or missing actor is hand-made for added, not for removed', () => {
     expect(planLabelInputRows({ ...base, liveLabels: ['review:human'], items: [tl('review:human', 'added', 'ci[bot]', undefined, 'Bot')] })).toHaveLength(1);
     expect(planLabelInputRows({ ...base, liveLabels: ['review:human'], items: [tl('review:human', 'added', null, undefined, null)] })[0].sender).toBe('unknown');
@@ -614,6 +624,7 @@ describe('#5647 single ruling-needed writer', () => {
       'review-ledger-check.mjs': 'read-only label family comparison',
       'conveyor/pr-lifecycle.mjs': 'lifecycle render vocabulary',
       'lib/pr-state/holds/label-input.mjs': 'hold vocabulary',
+      'lib/review-labels.mjs': 'read-only R130 delegated-clearance ineligible-label vocabulary',
       'conveyor/review-hold-reconcile.mjs': 'read-only sweep diagnostics',
       'conveyor/referral-auto-block.mjs': 'documentation of the ruling signal',
       'conveyor/review-hold-ledger-shadow.mjs': 'documentation of the shadow input',

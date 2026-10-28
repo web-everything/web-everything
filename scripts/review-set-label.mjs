@@ -1,3 +1,4 @@
+import { DELEGATED_CLEARANCE_INELIGIBLE_LABELS } from './lib/review-labels.mjs';
 import { RED_TEAM_STATUS_LABELS } from './lib/red-team-status-label-meta.mjs';
 import { readConfirmedBreaks, redTeamRulingNeeded } from './lib/red-team-gate.mjs';
 import { standingRulingScope } from './conveyor/standing-ruling-io.mjs';
@@ -156,6 +157,7 @@ import {
 import {
   buildVerdictRecord, buildLedgerEvent, appendVerdict, verdictForLabelTarget, verdictClears, APPROVAL_KINDS, EVENT_TYPES,
 } from './lib/verdict-ledger.mjs';
+import { approvalValid } from './lib/pr-state/holds/verdict.mjs';
 // #2979 — the NET diff vs current main, NOT `gh pr diff`'s three-dot output (see the fingerprint block in
 // `runReviewLabelCli` for why that distinction is the whole point). Imported from the CLI that owns it, the same
 // way `we:scripts/fetch-parked.mjs` already does — it is the single home of the #2450 net-diff basis.
@@ -319,12 +321,27 @@ export function isHumanSurfacePark({ provider, repo, pr, labels, headSha, commen
  * PR #5273 — after a swap-first `clear-human` (the PR was already accepted), re-read once its comment is posted and
  * undo a human-surface park that landed after the swap. Only that park: any other hold is left alone. A failed read
  * is reported, not fatal: the clearance is already durable, and the sweep heals its own park on a later tick.
+ * Delegated callers supply their eligibility assertion. Recovery read failures and head moves stay best-effort
+ * for every caller; a same-head eligibility refusal still propagates before any reassertion write.
  */
-export function reassertHumanClearance({ provider, repo, pr, headSha, warn = s => process.stderr.write(s) }) {
+export function reassertHumanClearance({ provider, repo, pr, headSha, assertEligible = () => {}, warn = s => process.stderr.write(s) }) {
+  let fresh;
+  try { fresh = provider.readPrState(repo, pr); }
+  catch (e) {
+    warn(`review-set-label: post-clearance label re-check failed (${String(e?.message ?? e).split('\n')[0]}); confirm review:human is gone\n`);
+    return { reapplied: false, error: true };
+  }
+  if (String(fresh?.headRefOid).toLowerCase() !== String(headSha).toLowerCase()) {
+    warn(`review-set-label: post-clearance head changed; clearance remains recorded for ${headSha}; inspect the current head before retrying\n`);
+    return { reapplied: false, error: true };
+  }
+  // Outside the recovery catch: a delegated refusal must exit, never become a successful no-op.
+  // Validate even when the repark marker is absent or labels are unreadable.
+  assertEligible(fresh?.labels);
   try {
-    const fresh = provider.readPrState(repo, pr);
-    if (String(fresh.headRefOid).toLowerCase() !== String(headSha).toLowerCase() || !Array.isArray(fresh.labels)) return { reapplied: false };
+    if (!Array.isArray(fresh.labels)) return { reapplied: false };
     if (!isHumanSurfacePark({ provider, repo, pr, labels: fresh.labels, headSha, comments: fresh.comments })) return { reapplied: false };
+    assertEligible(fresh.labels);
     provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
     return { reapplied: true };
   } catch (e) {
@@ -1129,7 +1146,12 @@ export function runReviewLabelCli({
   // Shadows the module-level `fail` so EVERY refusal inside this function goes to the
   // injected emitter too. Without this the guards print past an in-process caller's collector (#3061); the
   // module-level one stays for the CLI bootstrap below, which owns fd 1 for real.
-  const fail = (message, code = 2) => { emit(`${JSON.stringify({ error: message })}\n`); process.exit(code); };
+  let retainRefusedClearance = () => '';
+  const fail = (message, code = 2) => {
+    const recovery = retainRefusedClearance();
+    emit(`${JSON.stringify({ error: message + recovery })}\n`);
+    process.exit(code);
+  };
   let repo = (argv.find((a) => a.startsWith('--repo=')) || '').slice('--repo='.length);
   const actorArg = (argv.find((a) => a.startsWith('--actor=')) || '').slice('--actor='.length);
   const actor = actorArg || defaultActor;
@@ -1185,9 +1207,18 @@ export function runReviewLabelCli({
   if (onlyIf !== null && !['accepted', 'missing'].includes(onlyIf)) {
     fail("invalid --only-if — expected 'accepted' or 'missing'");
   }
+  // Delegated clearances pin the observed head; delegation never bypasses operator identity or hold checks.
+  const guardedClearHuman = to === 'clear-human' && (expectHeadFlag !== undefined
+    || normalizeChannel(channelArg).toLowerCase() === 'daemon'
+    || argv.some(a => a === '--delegation-json' || a.startsWith('--delegation-json=')));
+  if (guardedClearHuman && (!/^[0-9a-f]{40}$/.test(expectedHead || '')
+    || argv.some(a => a === '--new-head' || a.startsWith('--new-head='))
+    || !argv.some(a => a.startsWith('--delegation-json=')))) {
+    fail('pinned clear-human requires --expect-head=<full 40-hex SHA> and --delegation-json (and no --new-head)');
+  }
   const pinnedRearm = to === 'rearm' && expectHeadFlag !== undefined;
   const pinnedPlainRearm = pinnedRearm && onlyIf !== 'missing';
-  if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && !pinnedRearm && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, re-arm or a pinned accept');
+  if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && !pinnedRearm && !guardedClearHuman && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, re-arm, a pinned accept or delegated clear-human');
   if (onlyIf === 'missing' && (!/^[0-9a-f]{40}$/.test(expectedHead || '') || newHeadArg)) fail('missing re-arm requires --expect-head=<full 40-hex SHA>');
   if (pinnedRearm && !/^[0-9a-f]{40}$/.test(expectedHead || '')) fail('re-arm requires --expect-head=<full 40-hex SHA>');
   if (onlyIf !== null && to !== 'rearm') {
@@ -1237,6 +1268,7 @@ export function runReviewLabelCli({
   const delegationFlag = argv.find((a) => a.startsWith('--delegation-json='));
   const approvalKind = approvalKindFlag ? approvalKindFlag.slice('--approval-kind='.length).trim() : 'clear-human';
   let approvalDelegation = null;
+  let validatedApproval = null;
   if ((approvalKindFlag || delegationFlag) && to !== 'clear-human') {
     fail('--approval-kind / --delegation-json apply only to --to=clear-human; nothing was changed');
   }
@@ -1252,9 +1284,12 @@ export function runReviewLabelCli({
     }
     // The shape check IS the schema: a placeholder repo/pr/time stand in for the real ones only to run `buildLedgerEvent`.
     try {
-      buildLedgerEvent({ type: EVENT_TYPES.APPROVAL, repo: 'o/n', pr: 1, at: new Date().toISOString(), source: 'review-set-label',
+      validatedApproval = buildLedgerEvent({ type: EVENT_TYPES.APPROVAL, repo: 'o/n', pr: 1, at: new Date().toISOString(), source: 'review-set-label',
         approval: approvalKind, delegation: approvalDelegation });
     } catch { fail('--delegation-json must be an object {by, scope, expires (ISO time)} and fit the approval kind; nothing was changed'); }
+    if (!approvalValid(validatedApproval, Date.now())) {
+      fail('--delegation-json must have a valid, future expires time; nothing was changed');
+    }
   }
   // A BOUNCE WITH NO FINDINGS IS UNACTIONABLE, so it is refused (#xd6moh1). `review:changes` tells the author
   // to fix something; the findings are the only place that says WHAT. Without them the PR is parked behind a
@@ -1329,11 +1364,22 @@ export function runReviewLabelCli({
   // #4708 — set when the referral gate accepted this head on an earlier head's carried clean review (see
   // `referralEvidenceCarry`); the durable comment then records which head, which run and which diff fingerprint.
   let referralCarry = null;
+  const assertGuardedClearHumanEligible = labels => {
+    if (!guardedClearHuman) return;
+    if (!Array.isArray(labels) || labels.some(l => {
+      const name = typeof l === 'string' ? l : l?.name;
+      return typeof name !== 'string' || !name;
+    })) fail('delegated clearance refused: live labels unreadable; operator review required', 1);
+    if (DELEGATED_CLEARANCE_INELIGIBLE_LABELS.some(l => hasReviewLabel(labels, l))) {
+      fail('delegated clearance refused: live hold/block label; operator review required', 1);
+    }
+  };
   try {
     const parsed = provider.readPrState(repo, pr);
     if (['accepted', 'restamp', 'clear-human'].includes(to)) {
       referralCarry = assertMandatoryReferralsCleared(parsed, { repo, pr, ...referralOptions })?.carry ?? null;
     }
+    assertGuardedClearHumanEligible(parsed.labels);
     currentLabels = onlyIf === 'missing' ? parsed.labels : Array.isArray(parsed.labels) ? parsed.labels : [];
     headSha = typeof parsed.headRefOid === 'string' ? parsed.headRefOid : '';
     // #2979 — the branch name the NET diff is resolved against (see the fingerprint block below). Same gh call,
@@ -1367,7 +1413,7 @@ export function runReviewLabelCli({
   if (to === 'rearm' && !prCommentsReadable) refuseRearm('comments unreadable — cannot prove no human clearance');
   if (to === 'rearm' && !/^[0-9a-f]{7,40}$/i.test(headSha.trim())) refuseRearm('head unreadable — cannot prove no human clearance');
 
-  if ((guardedRestamp || pinnedAccept || pinnedRearm || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
+  if ((guardedRestamp || pinnedAccept || pinnedRearm || guardedClearHuman || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
   if (expectNoReadiness && hasReviewLabel(currentLabels, READY_TO_MERGE_LABEL)) {
     fail('missing review handoff refused: producer readiness appeared after the caller observation', 1);
   }
@@ -1945,67 +1991,115 @@ export function runReviewLabelCli({
   };
   recheckMissingRearm();
 
-  const ledgerVerdict = verdictForLabelTarget(to);
-  let clearingLedgerMiss = false;
-  try {
-    const appended = appendVerdict(buildVerdictRecord({
-      repo,
-      pr: Number(pr),
-      verdict: ledgerVerdict,
-      at: new Date().toISOString(),
-      // The operator's quoted `--reason` when there is one (the `clear-human` honesty tax), else the pure
-      // decider's own reason — so a row always says WHY, from whichever source actually had a reason.
-      reason: clearReason || decision.reason,
-      // THE CONTENT WITNESSES — recorded, never used as the key. See the header of `lib/verdict-ledger.mjs`
-      // for the two proven defects (#3046 gap divergence, `#3052` heading divergence, both open under
-      // `#3054`) that make this digest unfit to FIND a record by, and fine to STORE beside one.
-      headSha,
-      reviewedDiff: normalizeDiffFingerprint(reviewedDiff),
-      reviewedContribution: normalizeContributionFingerprint(reviewedDiff),
-      declaredActor: actor,
-      session: clearerId,
-      channel: normalizeChannel(channelArg),
-      independence: independence ? independence.status : null,
-      source: 'review-set-label',
-    }));
-    if (!appended.ok) {
-      process.stderr.write(`review-set-label: verdict-ledger append REFUSED (#3007 shadow) — ${appended.errors.join('; ')}\n`);
-      // F4 (`#verdict-ledger-pr-state-store` rule 4): a CLEARING verdict whose git write missed does NOT clear.
-      // Any refused append of a CLEARING verdict is fatal (the git miss, or the home write failing after git landed);
-      // a holding target still swaps (the hold must apply even when the ledger is down).
-      clearingLedgerMiss = verdictClears(ledgerVerdict);
-    } else if (to === 'clear-human') {
-      // #5649 — the audit row beside the clearing verdict. Only `clear-human` writes one: an ordinary `accepted` is a
-      // verdict, not an approval. A refused append blocks the swap (F4), so a clearance never lands without its row.
-      // The two appends are not atomic: a retry after a lost approval appends a second clearing verdict, which is
-      // harmless (clearing is idempotent).
-      let approval;
-      try {
-        approval = appendApproval(buildLedgerEvent({
-          type: EVENT_TYPES.APPROVAL,
-          repo,
-          pr: Number(pr),
-          at: appended.record?.at ?? new Date().toISOString(),
-          approval: approvalKind,
-          delegation: approvalDelegation,
-          declaredActor: actor,
-          session: clearerId,
-          channel: normalizeChannel(channelArg),
-          source: 'review-set-label',
-        }));
-      } catch (e) { approval = { ok: false, errors: [String((e && e.message) || e).split('\n')[0]] }; }
-      if (!approval?.ok) {
-        process.stderr.write(`review-set-label: approval-ledger append REFUSED (#5649) — ${(approval?.errors ?? []).join('; ')}\n`);
-        clearingLedgerMiss = true;
-      }
+  // Delegated clearance records are themselves clearance authority. A later admission
+  // refusal must supersede even a partial append with a new human hold. Append ordering
+  // deliberately excludes all earlier clearances; a later independent approval can lift it.
+  // Arm BEFORE the append: a failed sink can have persisted a row in one ledger store.
+  let delegatedLedgerStarted = false;
+  retainRefusedClearance = () => {
+    if (!delegatedLedgerStarted) return '';
+    delegatedLedgerStarted = false; // a caught/stubbed exit must not append the recovery twice
+    try {
+      const held = appendVerdict(buildLedgerEvent({
+        type: EVENT_TYPES.LABEL_INPUT, repo, pr: Number(pr), at: new Date().toISOString(),
+        source: 'review-set-label', label: REVIEW_LABELS.human, change: 'added',
+        sender: 'refused delegated clearance',
+      }));
+      if (!held?.ok) throw new Error((held?.errors ?? ['unknown ledger failure']).join('; '));
+      return '; refused delegated clearance superseded by a durable human hold';
+    } catch (e) {
+      return `; HUMAN HOLD RECOVERY FAILED: ${String(e?.message ?? e).split('\n')[0]}; operator must repair the ledger before retrying`;
     }
-  } catch (e) {
-    process.stderr.write(`review-set-label: verdict-ledger append failed (#3007 shadow, non-fatal) — ${String((e && e.message) || e).split('\n')[0]}\n`);
-  }
-  // Outside the try on purpose: a stubbed or real `process.exit` must never be swallowed by the non-fatal catch above.
-  if (clearingLedgerMiss) {
-    fail('verdict-ledger write refused for a clearing verdict (F4): the label is NOT swapped; retry once the ledger transport is reachable', 1);
-  }
+  };
+  const assertDelegationCurrent = () => {
+    if (validatedApproval && !approvalValid(validatedApproval, Date.now())) {
+      fail('delegated clearance refused: delegation expired before clearance write', 1);
+    }
+  };
+  let ledgerRecorded = false;
+  const recordLedger = () => {
+    assertDelegationCurrent();
+    if (ledgerRecorded) return;
+    const ledgerVerdict = verdictForLabelTarget(to);
+    let clearingLedgerMiss = false;
+    let approvalRefusal = '';
+    try {
+      if (guardedClearHuman) delegatedLedgerStarted = true;
+      const appended = appendVerdict(buildVerdictRecord({
+        repo,
+        pr: Number(pr),
+        verdict: ledgerVerdict,
+        at: new Date().toISOString(),
+        // The operator's quoted `--reason` when there is one (the `clear-human` honesty tax), else the pure
+        // decider's own reason — so a row always says WHY, from whichever source actually had a reason.
+        reason: clearReason || decision.reason,
+        // THE CONTENT WITNESSES — recorded, never used as the key. See the header of `lib/verdict-ledger.mjs`
+        // for the two proven defects (#3046 gap divergence, `#3052` heading divergence, both open under
+        // `#3054`) that make this digest unfit to FIND a record by, and fine to STORE beside one.
+        headSha,
+        reviewedDiff: normalizeDiffFingerprint(reviewedDiff),
+        reviewedContribution: normalizeContributionFingerprint(reviewedDiff),
+        declaredActor: actor,
+        session: clearerId,
+        channel: normalizeChannel(channelArg),
+        independence: independence ? independence.status : null,
+        source: 'review-set-label',
+      }));
+      if (!appended.ok) {
+        process.stderr.write(`review-set-label: verdict-ledger append REFUSED (#3007 shadow) — ${appended.errors.join('; ')}\n`);
+        // F4 (`#verdict-ledger-pr-state-store` rule 4): a CLEARING verdict whose git write missed does NOT clear.
+        // Any refused append of a CLEARING verdict is fatal (the git miss, or the home write failing after git landed);
+        // a holding target still swaps (the hold must apply even when the ledger is down).
+        clearingLedgerMiss = verdictClears(ledgerVerdict);
+      } else if (to === 'clear-human') {
+        // #5649 — the audit row beside the clearing verdict. Only `clear-human` writes one: an ordinary `accepted` is a
+        // verdict, not an approval. A refused append blocks the swap (F4), so a clearance never lands without its row.
+        // The two appends are not atomic: a retry after a lost approval appends a second clearing verdict, which is
+        // harmless (clearing is idempotent).
+        let approval;
+        try {
+          // The verdict append can block on ledger transport. A push or a new hold
+          // during that append must not receive a later, headless approval row.
+          if (guardedClearHuman) {
+            const fresh = provider.readPrState(repo, pr);
+            if (fresh.headRefOid !== headSha) throw new Error('head changed before acceptance; hold retained');
+            assertMandatoryReferralsCleared(fresh, { repo, pr, ...referralOptions });
+            assertGuardedClearHumanEligible(fresh.labels);
+            if (!approvalValid(validatedApproval, Date.now())) throw new Error('delegated clearance refused: delegation expired between ledger appends');
+          }
+          approval = appendApproval(buildLedgerEvent({
+            type: EVENT_TYPES.APPROVAL,
+            repo,
+            pr: Number(pr),
+            at: appended.record?.at ?? new Date().toISOString(),
+            approval: approvalKind,
+            delegation: approvalDelegation,
+            // Bind the approval to the head it was granted for: a row appended after a push must never
+            // release a hold on the new head (holds/verdict.mjs#approvalReleases).
+            headSha,
+            declaredActor: actor,
+            session: clearerId,
+            channel: normalizeChannel(channelArg),
+            source: 'review-set-label',
+          }));
+        } catch (e) { approval = { ok: false, errors: [String((e && e.message) || e).split('\n')[0]] }; }
+        if (!approval?.ok) {
+          approvalRefusal = (approval?.errors ?? []).join('; ');
+          process.stderr.write(`review-set-label: approval-ledger append REFUSED (#5649) — ${(approval?.errors ?? []).join('; ')}\n`);
+          clearingLedgerMiss = true;
+        }
+      }
+    } catch (e) {
+      process.stderr.write(`review-set-label: verdict-ledger append failed (#3007 shadow, ${guardedClearHuman ? 'fatal' : 'non-fatal'}) — ${String((e && e.message) || e).split('\n')[0]}\n`);
+      if (guardedClearHuman) clearingLedgerMiss = true;
+    }
+    // Outside the try on purpose: a stubbed or real `process.exit` must never be swallowed by the non-fatal catch above.
+    if (clearingLedgerMiss) {
+      fail(`verdict-ledger write refused for a clearing verdict (F4): the label is NOT swapped; ${approvalRefusal || 'retry once the ledger transport is reachable'}`, 1);
+    }
+    ledgerRecorded = true;
+  };
+  if (!guardedClearHuman) recordLedger();
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — THE SWAP: add the verdict label, remove the stale ones
   // (argv array, no shell). Intersect the decision's removals with the labels the PR ACTUALLY carries so
@@ -2017,6 +2111,7 @@ export function runReviewLabelCli({
         const fresh = provider.readPrState(repo, pr);
         if (fresh.headRefOid !== headSha && !(to === 'restamp' && newHeadArg && !mandatoryReferralState(fresh.comments).records.length)) throw new Error('head changed before acceptance; hold retained');
         assertMandatoryReferralsCleared(fresh, { repo, pr, ...referralOptions });
+        assertGuardedClearHumanEligible(fresh.labels);
         // PR #5273: the human-surface sweep can park `review:human` after the first read; this clearance supersedes
         // that park at this head, so remove it too. Any other concurrent hold keeps the first read's view.
         if (to === 'clear-human' && !removals.includes(REVIEW_LABELS.human)
@@ -2041,6 +2136,8 @@ export function runReviewLabelCli({
       }
     }
     try {
+      recordLedger();
+      assertDelegationCurrent();
       provider.setLabels(repo, pr, { add: decision.addLabel, remove: removals });
     } catch (e) {
       fail(ghErr(e, 'gh pr edit failed'), 1);
@@ -2067,6 +2164,16 @@ export function runReviewLabelCli({
         try { assertPinnedRearmHead(); } catch (e) { fail(ghErr(e, 'gh pr comment failed'), 1); }
       }
       try {
+        // Delegated clearance must refuse a newly arrived hold before minting its marker,
+        // including on the comment-first path. The swap independently checks again.
+        if (guardedClearHuman) {
+          const fresh = provider.readPrState(repo, pr);
+          if (fresh.headRefOid !== headSha) throw new Error('head changed before acceptance; hold retained');
+          assertMandatoryReferralsCleared(fresh, { repo, pr, ...referralOptions });
+          assertGuardedClearHumanEligible(fresh.labels);
+        }
+        recordLedger();
+        assertDelegationCurrent();
         provider.postComment(repo, pr, commentBody);
         return;
       } catch (e) { commentFailure = ghErr(e, 'gh pr comment failed'); }
@@ -2162,7 +2269,16 @@ export function runReviewLabelCli({
   // `review:human` after the swap. When the comment went last, read once more after it and undo only that park.
   // (Comment-first order needs no extra read: the swap's own fresh read already follows the comment.)
   // The re-park re-reads after its own write too, so at least one side sees the other.
-  if (to === 'clear-human' && acceptanceAlreadyLive) reassertHumanClearance({ provider, repo, pr, headSha });
+  if (to === 'clear-human' && acceptanceAlreadyLive) {
+    // Clearance is already durable. Recovery warns on read/head failures and performs no further swap;
+    // a same-head eligibility or delegation-expiry refusal still exits before any reassertion write.
+    reassertHumanClearance({ provider, repo, pr, headSha,
+      assertEligible: labels => {
+        assertGuardedClearHumanEligible(labels);
+        assertDelegationCurrent();
+      } });
+  }
+  delegatedLedgerStarted = false;
 
   // #4258-shape — THE APPROVAL-TIME PREVENTION-FILING DEFAULT (operator, 2026-09-27). Runs ONLY for the two
   // targets that just recorded an acceptance above; `changes`/`rearm`/`restamp` never reach it (and

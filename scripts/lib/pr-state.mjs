@@ -53,8 +53,9 @@ export function ledgerView(events, facts) {
   const folded = scope ? foldVerdictLedger(mine.filter(isVerdictRow)).get(scope.pr) ?? null : null;
   const cur = folded?.current ?? null;
   let clears = !!folded?.clears;
-  // A human hold is lifted by a LATER valid approval (unexpired delegation, provable clock); an unknown position never lifts.
-  if (cur && !clears && cur.verdict === 'human' && approvalLiftsAfter(mine, mine.indexOf(cur), facts?.now)) clears = true;
+  // A human hold is lifted by a LATER valid approval bound to the current head (unexpired delegation, provable clock);
+  // an unknown position never lifts.
+  if (cur && !clears && cur.verdict === 'human' && approvalLiftsAfter(mine, mine.indexOf(cur), facts?.now, facts?.head?.sha)) clears = true;
   const lastExempt = mine.filter(e => e.type === EVENT_TYPES.REVIEW_EXEMPT).at(-1);
   const fullSha = value => typeof value === 'string' && /^[0-9a-f]{40}$/i.test(value);
   const reviewExempt = !cur && fullSha(lastExempt?.headSha) && fullSha(facts?.head?.sha)
