@@ -747,6 +747,60 @@ describe('PR #4446 — permission-change hold: score -> drain gate hand-off', ()
 
   it('the drain call site builds its gate input through drainGateInputs (not an inline copy)', () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
-    expect(src).toMatch(/const gate = decideDrainReviewGate\(\s*drainGateInputs\(\{\s*score,\s*labels: v\.prLabels,\s*deviation: v\.deviation\s*\}\),/);
+    expect(src).toMatch(/const gate = decideDrainReviewGate\(\s*drainGateInputs\(\{\s*score,\s*labels: v\.prLabels,\s*deviation: v\.deviation\s*,[^}]*\bnetScored\b[^}]*\bhumanPinned\b[^}]*\}\),/);
+  });
+});
+
+describe('#6027 — fresh net score de-escalation through the drain handoff', () => {
+  const score = { escalate: false, humanRequired: false, signals: {} };
+  const inputs = (extra = {}) => ({ score, labels: [REVIEW_LABELS.human],
+    netScored: true, humanPinned: false, ...extra });
+  const drain = (extra = {}) => decideDrainReviewGate(drainGateInputs(inputs(extra)), acceptanceOptions());
+  const expectKept = (gate) => {
+    expect(gate).toMatchObject({ action: 'park', applyLabel: REVIEW_LABELS.human, humanRequired: true });
+    expect(gate.deescalatedHuman).not.toBe(true);
+    expect(gate.removeLabels ?? []).not.toContain(REVIEW_LABELS.human);
+  };
+
+  it('parks a fresh humanRequired=false score without a pin for independent review, removing review:human', () => {
+    expect(drain()).toMatchObject({ action: 'park', applyLabel: REVIEW_LABELS.pending,
+      humanRequired: false, deescalatedHuman: true, removeLabels: [REVIEW_LABELS.human] });
+  });
+
+  it('keeps review:human when an operator pin is present despite a fresh low score', () => {
+    expectKept(drain({ humanPinned: true }));
+  });
+
+  it('keeps review:human when the fresh score still requires a human', () => {
+    expectKept(drain({ score: { ...score, escalate: true, humanRequired: true } }));
+  });
+
+  it.each([false, undefined, null, 'true', 1])('keeps review:human without proven net freshness (%s)', (netScored) => {
+    expectKept(drain({ netScored }));
+  });
+
+  it('passes fresh net evidence and an operator pin through drainGateInputs', () => {
+    expect(drainGateInputs(inputs({ humanPinned: true }))).toMatchObject({
+      humanScoreFresh: true, humanPinned: true,
+    });
+    expect(drainGateInputs(inputs())).toMatchObject({ humanScoreFresh: true, humanPinned: false });
+  });
+
+  it.each([undefined, null, false, 'true', 1])('only explicit true proves freshness or a pin (%s)', (value) => {
+    expect(drainGateInputs(inputs({ netScored: value, humanPinned: value }))).toMatchObject({
+      humanScoreFresh: false, humanPinned: false,
+    });
+  });
+
+  it('never de-escalates review:human beside review:accepted, even on a fresh low score', () => {
+    const view = acceptanceView();
+    view.headRefOid = REVIEWED;
+    const gate = decideDrainReviewGate(drainGateInputs(inputs({
+      labels: [REVIEW_LABELS.human, REVIEW_LABELS.accepted],
+    })), acceptanceOptions(view));
+    // A valid acceptance retains its existing precedence; no label removal is authorized.
+    expect(gate.action).toBe('merge');
+    expect(gate.deescalatedHuman).not.toBe(true);
+    expect(gate.removeLabels ?? []).not.toContain(REVIEW_LABELS.human);
   });
 });
