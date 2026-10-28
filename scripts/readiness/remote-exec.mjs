@@ -90,7 +90,12 @@ function safeFiles(files) {
     if (typeof path !== 'string' || !path || path.startsWith('/') || /[\0\r\n]/.test(path)) throw new Error('Invalid file path');
     const parts = path.split('/');
     if (parts.some((part) => part === '..' || part === '.')) throw new Error('Unsafe file path');
-    return !parts.some((part) => /^(?:node_modules|\.git|\.git-credentials(?:[.~_-].*)?|id_(?:rsa|dsa|ecdsa|ed25519|xmss)(?:[.~_-].*)?|identity(?:[.~_-].*)?|\.env(?:\..*)?|\.secrets|\.ssh|\.aws|\.claude|\.codex|\.npmrc|\.netrc|credentials(?:\..*)?|.*\.(?:pem|key))$/i.test(part));
+    return !parts.some((part) => {
+      // The legacy SSH key name also occurs in JS/TS modules. Exempt only
+      // complete source filenames so identity.pub and key backups stay excluded.
+      if (/^identity\.(?:[cm]?[jt]s|[jt]sx)$/i.test(part)) return false;
+      return /^(?:node_modules|\.git|\.git-credentials(?:[.~_-].*)?|id_(?:rsa|dsa|ecdsa|ed25519|xmss)(?:[.~_-].*)?|identity(?:[.~_-].*)?|\.env(?:\..*)?|\.secrets|\.ssh|\.aws|\.claude|\.codex|\.npmrc|\.netrc|credentials(?:\..*)?|.*\.(?:pem|key))$/i.test(part);
+    });
   });
   const input = [...new Set(safe)].join('\n') + '\n';
   if (Buffer.byteLength(input) > LIMIT) throw new Error('File inventory limit exceeded');

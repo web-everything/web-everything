@@ -196,12 +196,18 @@ describe('runRemote', () => {
 
   it.each(['injected', 'git'])('excludes conventional credential and private-key paths from the %s transport inventory', async (inventory) => {
     const f = fixture();
-    const safe = ['package-lock.json', 'src/a file.mjs', 'src/identity.mjs', 'docs/key-handling.md'];
+    const safe = [
+      'package-lock.json', 'src/a file.mjs', 'src/identity.mjs', 'docs/key-handling.md',
+      ...['js', 'cjs', 'ts', 'mts', 'cts', 'jsx', 'tsx'].map((ext) => `src/identity.${ext}`),
+    ];
     const secrets = [
       '.git', '.git/config', '.git-credentials', '.git-credentials.backup', 'nested/.GIT-CREDENTIALS',
       '.git-credentials~', '.git-credentials-old',
       'id_rsa', 'keys/ID_RSA', 'id_dsa', 'id_ecdsa', 'id_ed25519', 'id_ecdsa_sk', 'id_ed25519_sk', 'id_xmss',
       'keys/id_rsa.backup', 'keys/id_rsa~', 'keys/id_ed25519.pub', 'identity', 'keys/identity.pub',
+      'keys/IDENTITY', 'keys/IDENTITY.PUB', 'keys/identity.backup', 'keys/identity~',
+      'keys/identity-old', 'keys/identity_old', 'keys/identity.pub.backup', 'keys/identity.mjs.backup',
+      'keys/identity.pem', 'keys/identity.key', '.ssh/identity.mjs', 'credentials/identity.ts',
       '.env', 'nested/.env.local', '.npmrc', '.netrc', 'credentials', 'credentials.json',
       'credentials/token', '.ssh/config', '.aws/config', 'keys/server.pem', 'keys/server.KEY',
     ];
