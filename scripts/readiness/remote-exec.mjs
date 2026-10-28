@@ -2,7 +2,7 @@
 import { spawn } from 'node:child_process';
 import { readFile, realpath } from 'node:fs/promises';
 import { createHash, randomBytes } from 'node:crypto';
-import { join } from 'node:path';
+import { join, relative, resolve, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = '/srv/forge-exec';
@@ -12,7 +12,19 @@ const ENV_KEYS = ['CI', 'NODE_ENV', 'TZ', 'LANG', 'LC_ALL', 'FORCE_COLOR', 'NO_C
 const quote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
 const newRunId = () => `${new Date().toISOString().replace(/[^0-9tz]/gi, '').toLowerCase()}-${randomBytes(4).toString('hex')}`;
 
+// Admission receives the package script's expanded command. Run it through npm
+// remotely as well, so Vitest resolves from the installed local node_modules.
+function normalizeCommand(argv) {
+  if (!Array.isArray(argv)) return argv;
+  const offset = argv[0] === 'npx' ? 1 : 0;
+  if (argv[offset] === 'vitest' && argv[offset + 1] === 'run') {
+    return ['npm', 'run', 'test:unit', '--', ...argv.slice(offset + 2)];
+  }
+  return argv;
+}
+
 export function isAllowedCommand(argv) {
+  argv = normalizeCommand(argv);
   return Array.isArray(argv) && argv.length >= 3 && argv.every((arg) => typeof arg === 'string' && !arg.includes('\0'))
     && argv[0] === 'npm' && argv[1] === 'run' && ['test:unit', 'check:standards'].includes(argv[2]);
 }
@@ -27,6 +39,27 @@ function needsGitContext(argv) {
     !/^blocks\/(?:[a-zA-Z0-9_-]+\/)*[a-zA-Z0-9_-]+\.test\.[cm]?[jt]sx?(?![\s\S])/.test(file));
 }
 
+// A block path alone does not establish that its dependencies travel with it.
+// Reuse the repository's static dependency resolver and leave incomplete or
+// sibling-dependent selections on local admission before attempting transport.
+async function needsDependencyContext(argv, cwd) {
+  try {
+    const { createKeyContext } = await import('../lib/test-result-cache.mjs');
+    const root = await realpath(cwd);
+    const context = createKeyContext({ root, policy: { deny: [], allow: [] } });
+    const files = argv.slice(argv[3] === '--' ? 4 : 3);
+    for (const file of files) {
+      const closure = context.closureOf(resolve(root, file));
+      if (closure.error || closure.absent.length) return true;
+      for (const dependency of closure.files) {
+        const path = relative(root, await realpath(dependency));
+        if (isAbsolute(path) || path === '..' || path.startsWith('../') || !safeFiles([path]).trim()) return true;
+      }
+    }
+    return false;
+  } catch { return true; }
+}
+
 export function filterEnv(env = {}) {
   return Object.fromEntries(ENV_KEYS.filter((key) => Object.hasOwn(env, key) && typeof env[key] === 'string'
     && !env[key].includes('\0')).map((key) => [key, env[key]]));
@@ -37,12 +70,15 @@ export function validateRunId(id) {
 }
 
 export function buildRemoteScript({ runId, lockHash, env = {}, argv, retainRun = false }) {
+  argv = normalizeCommand(argv);
   if (!validateRunId(runId) || !/^[a-f0-9]{64}$/.test(lockHash) || !isAllowedCommand(argv)) {
     throw new Error('Invalid remote execution parameters');
   }
   if (argv[2] === 'check:standards') throw new Error('Standards checks require the local checkout Git context');
   const dir = `${ROOT}/${runId}`;
-  const cache = `${ROOT}/.cache/${lockHash}`;
+  // Old caches may contain a successful production-only install. Never reuse
+  // them now that this namespace guarantees the development toolchain.
+  const cache = `${ROOT}/.cache/${lockHash}-dev-v1`;
   const cleanEnv = `env -i PATH=/usr/local/bin:/usr/bin:/bin ${Object.entries(filterEnv(env)).map(([k, v]) => `${k}=${quote(v)}`).join(' ')}`;
   return `set -euo pipefail
 mkdir -p ${quote(dir)}
@@ -56,7 +92,7 @@ if command -v flock >/dev/null 2>&1; then
 fi
 if [ ! -d ${quote(`${cache}/node_modules`)} ]; then
   # Install output must not pollute the command's streamed output; show a tail only on failure.
-  if ! ${cleanEnv} npm ci --ignore-scripts --no-audit --no-fund >.npm-ci.log 2>&1; then tail -n 20 .npm-ci.log >&2; exit 97; fi
+  if ! ${cleanEnv} npm ci --include=dev --ignore-scripts --no-audit --no-fund >.npm-ci.log 2>&1; then tail -n 20 .npm-ci.log >&2; exit 97; fi
   rm -f .npm-ci.log
   mv node_modules ${quote(`${cache}/node_modules`)}
 fi
@@ -114,11 +150,13 @@ function safeFiles(files) {
 
 export async function runRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles } = {}) {
   const fallback = (reason) => ({ mode: 'fallback', reason });
+  argv = normalizeCommand(argv);
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
   if (!validateRunId(runId) || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host)) return fallback('invalid-parameters');
   // A synthetic index/history would change checkout-dependent tests. Keep these
   // commands local until transport can provide faithful, non-private Git context.
   if (needsGitContext(argv)) return fallback('git-context-required');
+  if (await needsDependencyContext(argv, cwd)) return fallback('dependency-context-required');
   try {
     if ((await exec({ file: 'ssh', args: [host, 'true'], cwd })).code !== 0) return fallback('forge-unreachable');
   } catch { return fallback('forge-unreachable'); }

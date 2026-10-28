@@ -30,6 +30,10 @@ beforeEach(() => {
   // Task scratch must stay under the launcher-provided TMPDIR.
   cwd = realpathSync(mkdtempSync(join(process.env.TMPDIR, 'remote-exec-test-')));
   writeFileSync(join(cwd, 'package-lock.json'), '{"lockfileVersion":3,"packages":{}}\n');
+  for (const file of ['blocks/a.test.mjs', 'blocks/nested/b.test.tsx', 'blocks/__tests__/unit/route-map.test.ts']) {
+    mkdirSync(join(cwd, file, '..'), { recursive: true });
+    writeFileSync(join(cwd, file), 'export {};\n');
+  }
 });
 afterEach(() => rmSync(cwd, { recursive: true, force: true }));
 
@@ -100,6 +104,31 @@ describe('validateRunId', () => {
 });
 
 describe('buildRemoteScript', () => {
+  it.each(['empty', 'legacy production'])('includes dev dependencies under production with an %s cache, then reuses it under test', (cacheState) => {
+    const root = join(cwd, 'forge-exec');
+    const bin = join(cwd, 'bin');
+    const trace = join(cwd, 'install-count');
+    mkdirSync(bin);
+    if (cacheState !== 'empty') mkdirSync(join(root, '.cache', lockHash, 'node_modules'), { recursive: true });
+    // An install models npm omit=dev under production; a test needs Vitest.
+    writeFileSync(join(bin, 'npm'), `#!/bin/bash
+if [ "$1" = ci ]; then
+  mkdir -p node_modules
+  echo install >> '${trace}'
+  if [ "\${NODE_ENV:-}" != production ] || [[ " $* " == *" --include=dev "* ]]; then touch node_modules/vitest; fi
+  exit 0
+fi
+test -f node_modules/vitest
+`, { mode: 0o755 });
+    for (const nodeEnv of ['production', 'test']) {
+      const script = buildRemoteScript({ runId, lockHash, env: { NODE_ENV: nodeEnv }, argv });
+      const harness = `env() { local a=("$@") i; for i in "\${!a[@]}"; do case "\${a[$i]}" in PATH=*) a[$i]='PATH=${bin}:/usr/bin:/bin';; esac; done; command env "\${a[@]}"; }\n`;
+      const result = spawnSync('bash', ['-c', harness + script.replaceAll('/srv/forge-exec', root)], { encoding: 'utf8' });
+      expect(result.status, `${nodeEnv}: ${result.stderr}`).toBe(0);
+    }
+    expect(readFileSync(trace, 'utf8')).toBe('install\n');
+  });
+
   it('refuses standards scripts without the checkout Git context', () => {
     expect(() => buildRemoteScript({ runId, lockHash, argv: ['npm', 'run', 'check:standards'] }))
       .toThrow(/git context/i);
@@ -175,6 +204,81 @@ ${script.replaceAll('/srv/forge-exec', root)}`;
 });
 
 describe('runRemote', () => {
+  it.each(['always', 'above-threshold'])('offloads the actual package-script argv through admission in %s mode', async (mode) => {
+    const pkg = JSON.parse(readFileSync(new URL('../../../package.json', import.meta.url), 'utf8'));
+    const command = pkg.scripts['test:unit'].split(' -- ')[1].split(' ');
+    const args = [...command, 'blocks/__tests__/unit/route-map.test.ts'];
+    const f = fixture();
+    const policy = resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode } } });
+    expect(await runWithRemoteDecision({ argv: args, cwd, policy, loadPerCore: () => 10, log: vi.fn(),
+      remoteExec: (options) => runRemote({ ...f, ...options }),
+    })).toEqual({ handled: true, exitCode: 0 });
+    expect(callsOf(f.exec).some(isRun)).toBe(true);
+    expect(callsOf(f.exec).find(isRun).input).toContain("'npm' 'run' 'test:unit' '--' 'blocks/__tests__/unit/route-map.test.ts'");
+  });
+
+  it('offloads the real route-map dependency closure through npx and the direct entry point', async () => {
+    const root = realpathSync(new URL('../../../', import.meta.url));
+    for (const prefix of [['npx', 'vitest', 'run'], ['npm', 'run', 'test:unit', '--']]) {
+      const f = fixture();
+      expect(await runRemote({ ...f, cwd: root,
+        argv: [...prefix, 'blocks/__tests__/unit/route-map.test.ts'],
+      })).toEqual({ mode: 'remote', code: 0 });
+      expect(callsOf(f.exec).some(isRun)).toBe(true);
+    }
+  });
+
+  it.each([
+    ['vitest', 'watch', 'blocks/a.test.mjs'],
+    ['npx', '--yes', 'vitest', 'run', 'blocks/a.test.mjs'],
+    ['vitest', 'run', '--config=other.ts', 'blocks/a.test.mjs'],
+    ['vitest', 'run', 'blocks/a.test.mjs', 'scripts/a.test.mjs'],
+    ['vitest', 'run', 'blocks/a.test.mjs\n'],
+  ].map((args) => [args]))('does not widen selection eligibility for expanded argv: %j', async (args) => {
+    const f = fixture();
+    expect(await runRemote({ ...f, argv: args })).toMatchObject({ mode: 'fallback' });
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+
+  it('keeps an available local sibling dependency local because transport omits it', async () => {
+    const root = join(cwd, 'checkout');
+    mkdirSync(join(root, 'blocks'), { recursive: true });
+    mkdirSync(join(cwd, 'frontierui/plugs'), { recursive: true });
+    writeFileSync(join(root, 'blocks/a.test.mjs'), "import '@frontierui/plugs/core';\n");
+    writeFileSync(join(cwd, 'frontierui/plugs/core.ts'), 'export {};\n');
+    const f = fixture();
+    expect(await runRemote({ ...f, cwd: root })).toEqual({ mode: 'fallback', reason: 'dependency-context-required' });
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+
+  it.each(['direct', 'transitive', 'mixed', 'missing', 'relative escape'])(
+    'keeps an untransported dependency local before SSH: %s', async (shape) => {
+      const f = fixture();
+      const entry = join(cwd, 'blocks/a.test.mjs');
+      if (shape === 'missing') rmSync(entry);
+      else if (shape === 'relative escape') writeFileSync(entry, "import '../../frontierui/plugs/core';\n");
+      else if (shape === 'transitive') {
+        writeFileSync(entry, "import './helper.mjs';\n");
+        writeFileSync(join(cwd, 'blocks/helper.mjs'), "export { default } from '@frontierui/webtheme/core';\n");
+      } else writeFileSync(entry, "import CustomAttribute from '@frontierui/plugs/webbehaviors/CustomAttribute';\n");
+      const args = shape === 'mixed' ? [...argv, 'blocks/__tests__/unit/route-map.test.ts'] : argv;
+      const log = vi.fn();
+      expect(await runWithRemoteFallback({ ...f, argv: args, log })).toBe(7);
+      expect(f.exec).not.toHaveBeenCalled();
+      expect(f.local).toHaveBeenCalledWith(args);
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('dependency-context-required'));
+    },
+  );
+
+  it('keeps the reported TrustedHtmlBehavior selection local with the real dependency closure', async () => {
+    const f = fixture();
+    const root = realpathSync(new URL('../../../', import.meta.url));
+    expect(await runRemote({ ...f, cwd: root,
+      argv: ['npm', 'run', 'test:unit', '--', 'blocks/__tests__/unit/trusted-html/TrustedHtmlBehavior.test.ts'],
+    })).toEqual({ mode: 'fallback', reason: 'dependency-context-required' });
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+
   it.each([
     [], ['--'], ['--', 'scripts/lib/__tests__/exec-output-guard.test.mjs'],
     ['--', 'scripts/__tests__/repo-scan-tests.test.mjs'],
