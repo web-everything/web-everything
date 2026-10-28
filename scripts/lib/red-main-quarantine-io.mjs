@@ -19,9 +19,9 @@
  *   node scripts/lib/red-main-quarantine-io.mjs show
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync, appendFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, appendFileSync, mkdirSync, realpathSync } from 'node:fs';
 import { writeAllSync } from './write-all-sync.mjs'; // a CLI's stdout must be drained before any process.exit
-import { resolve, dirname, join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFromTransportBranch, stageOnTransportBranch, assertPushRef } from './git-transport-branch.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
@@ -33,7 +33,7 @@ import { mainRedState } from '../conveyor/main-ci-red-core.mjs';
 import {
   QUARANTINE_BRANCH, QUARANTINE_REF, QUARANTINE_LIST_PATH, QUARANTINE_EVENTS_PATH,
   validateQuarantineList, addEntries, pruneOnGreen, testsToSkip, canWriteQuarantine, vitestExcludeArgs,
-  setFixPrs, setMode, activeEntries, parseVitestFailures, planSafetyNet, QUARANTINE_SAFETY_NET_DEFAULTS,
+  setFixPrs, setMode, activeEntries, parseVitestFailures, planSafetyNet, QUARANTINE_SAFETY_NET_DEFAULTS, REPEAT_RUN_LIMIT,
 } from './red-main-quarantine.mjs';
 
 const git = (args, opts) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000, killSignal: 'SIGKILL', ...opts });
@@ -88,6 +88,8 @@ export function writeQuarantineChange({ board = process.cwd(), actor, change, me
 export const SAFETY_NET_ACTOR = 'red-main-safety-net';
 /** Env overrides (the cascade's top layer) for the safety-net knobs. */
 export const QUARANTINE_SETTINGS_ENV = Object.freeze({
+  repeatFailureProof: 'WE_RED_MAIN_QUARANTINE_REPEAT_FAILURE_PROOF',
+  repeatFailureCount: 'WE_RED_MAIN_QUARANTINE_REPEAT_FAILURE_COUNT',
   ttlMin: 'WE_RED_MAIN_QUARANTINE_TTL_MIN',
   maxTests: 'WE_RED_MAIN_QUARANTINE_MAX_TESTS',
   unitJobPattern: 'WE_RED_MAIN_QUARANTINE_UNIT_JOB_PATTERN',
@@ -97,7 +99,8 @@ export const QUARANTINE_SETTINGS_ENV = Object.freeze({
 });
 const posInt = (v) => Number.isInteger(v) && v > 0;
 const QUARANTINE_SETTINGS_VALID = Object.freeze({
-  ttlMin: posInt, maxTests: posInt,
+  ttlMin: posInt, maxTests: posInt, repeatFailureCount: (v) => Number.isInteger(v) && v >= 2,
+  repeatFailureProof: (v) => typeof v === 'boolean',
   requireProvenFlake: (v) => typeof v === 'boolean', fileCardPerEntry: (v) => typeof v === 'boolean',
   unitJobPattern: (v) => { try { return typeof v === 'string' && v !== '' && !!new RegExp(v); } catch { return false; } },
   derivedJobs: (v) => Array.isArray(v) && v.every((x) => typeof x === 'string' && x !== ''),
@@ -120,6 +123,7 @@ export function resolveQuarantineSettings({ env = process.env, file = RED_MAIN_H
     env, ...(platform !== undefined ? { platform } : {}),
     standard: { ...QUARANTINE_SAFETY_NET_DEFAULTS, derivedJobs: [...QUARANTINE_SAFETY_NET_DEFAULTS.derivedJobs] },
     envValues: {
+      repeatFailureProof: bool('repeatFailureProof'), repeatFailureCount: num('repeatFailureCount'),
       requireProvenFlake: bool('requireProvenFlake'), fileCardPerEntry: bool('fileCardPerEntry'),
       ttlMin: num('ttlMin'), maxTests: num('maxTests'), unitJobPattern: str('unitJobPattern'),
       derivedJobs: derivedRaw === undefined ? undefined : derivedRaw.split(',').map((s) => s.trim()).filter(Boolean),
@@ -193,6 +197,60 @@ function readFlakeProof(mainCiRuns, { readJobs, now }) {
   return proof;
 }
 
+/** Local, bounded argv-only read. Missing objects / malformed output leave evidence unknown. */
+export function readTouchedFiles(fromSha, toSha, { board = process.cwd(), run = gitRead } = {}) {
+  if (![fromSha, toSha].every((s) => typeof s === 'string' && /^[0-9a-f]{7,40}$/.test(s))) return null;
+  try {
+    const opts = { cwd: board };
+    const parse = (out) => {
+      if (typeof out !== 'string' || (out && !out.endsWith('\0'))) throw new Error('incomplete git paths');
+      return out ? out.slice(0, -1).split('\0') : [];
+    };
+    const files = parse(run(['diff', '--name-only', '-z', fromSha, toSha, '--'], opts));
+    run(['merge-base', '--is-ancestor', fromSha, toSha], opts);
+    // Endpoint trees can hide a change followed by a revert. Inspect each intervening commit as well.
+    // More than 100 commits => unknown => STOP for operator repair, never silently truncate proof.
+    const history = run(['rev-list', '--max-count=101', '--parents', `${fromSha}..${toSha}`], opts);
+    if (typeof history !== 'string') return null;
+    const rows = history.trim() ? history.trim().split('\n') : [];
+    if (rows.length > 100) return null;
+    for (const row of rows) {
+      const [sha, parent] = row.split(' ');
+      if (![sha, parent].every((s) => /^[0-9a-f]{40}$/.test(s ?? ''))) return null;
+      files.push(...parse(run(['diff', '--name-only', '-z', parent, sha, '--'], opts)));
+    }
+    return [...new Set(files)];
+  } catch { return null; }
+}
+
+/** At most ten run reads and maxTests log reads per run. Unknown history never proves a repeat. */
+function readRepeatRuns(mainCiRuns, { state, jobFailures, readJobs, readLog, settings }) {
+  // SHA membership alone cannot admit a row that the red-window chronology excluded.
+  const candidates = (mainCiRuns?.runs ?? []).filter((r) => typeof r?.createdAt === 'string'
+    && Number.isFinite(Date.parse(r.createdAt)) && state.redShas?.includes(r.headSha)
+    && r.status === 'completed' && ['failure', 'timed_out'].includes(r.conclusion))
+    .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+  const unique = [...new Map(candidates.map((r) => [String(r.databaseId), r])).values()];
+  const runs = unique.slice(-REPEAT_RUN_LIMIT);
+  return runs.map((r) => {
+    if (String(r.databaseId) === String(mainCiRuns?.failing?.runId)) return { ...r, jobFailures };
+    const failures = {};
+    // Invalid ids cannot reach an IO reader.
+    if (!/^[1-9]\d*$/.test(String(r.databaseId))) return { ...r, jobFailures: failures };
+    try {
+      const jobs = readJobs(r.databaseId)?.failed;
+      const unitRe = new RegExp(settings.unitJobPattern);
+      const wanted = Array.isArray(jobs) ? jobs.filter((j) => unitRe.test(j.name)) : [];
+      if (wanted.length > settings.maxTests) return { ...r, jobFailures: failures };
+      for (const job of wanted) {
+        const f = readLog(job.id);
+        if (f?.complete === true) failures[job.name] = f;
+      }
+    } catch { /* Unknown evidence cannot count. */ }
+    return { ...r, jobFailures: failures };
+  });
+}
+
 /** One failed job's vitest failures from its log (`gh api …/jobs/<id>/logs`). Throws on an unreadable log. */
 export function readJobFailures(jobId, { exec, repoSlug }) {
   const text = exec('gh', ['api', `repos/${repoSlug}/actions/jobs/${jobId}/logs`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' });
@@ -245,6 +303,7 @@ export function runSafetyNet({
   mode = resolveRedMainMode(), settings = resolveQuarantineSettings(),
   exec = execFileSyncThrottled, readJobs = (runId, options = {}) => readFailedJobs(runId, { exec, repoSlug, ...options }),
   readLog = (jobId) => readJobFailures(jobId, { exec, repoSlug }),
+  touchedFiles = (fromSha, toSha) => readTouchedFiles(fromSha, toSha, { board }),
   readList = () => readListOrAbsent({ board }), write = (o) => writeQuarantineChange({ board, ...o }), log = (l) => console.error(l),
 } = {}) {
   if (!dir) return null;
@@ -330,10 +389,12 @@ export function runSafetyNet({
     }
     if (isLive && read.list?.mode === 'quarantine') out.liveEntries = activeEntries(read.list, { now });
     const flakeProof = settings.value.requireProvenFlake && state.status === 'red' ? readFlakeProof(mainCiRuns, { readJobs, now }) : {};
+    const repeatRuns = settings.value.repeatFailureProof && settings.value.requireProvenFlake && state.status === 'red'
+      ? readRepeatRuns(mainCiRuns, { state, jobFailures, readJobs, readLog, settings: settings.value }) : [];
     const pri = mainCiRuns?.priority;
     const fixPrs = pri ? (Array.isArray(pri.prs) ? pri.prs : [pri.pr]) : null;
     const plan = planSafetyNet({
-      status: state.status, firstRedSha: sha, failedJobs, jobFailures, flakeProof, list: read.list, fixPrs,
+      status: state.status, firstRedSha: sha, failedJobs, jobFailures, flakeProof, repeatRuns, latestRunId: mainCiRuns?.failing?.runId, touchedFiles, list: read.list, fixPrs,
       addedForRed: (isLive ? rec?.added : rec?.shadowAdded) ?? [], now, settings: settings.value,
     });
     out.plan = plan;
@@ -492,6 +553,10 @@ function cli(argv) {
   process.exit(2);
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
+const isEntryPoint = () => {
+  try { return !!process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)); }
+  catch { return false; }
+};
+if (isEntryPoint()) {
   try { cli(process.argv.slice(2)); } catch (e) { process.stderr.write(`${e.message}\n`); process.exit(1); }
 }
