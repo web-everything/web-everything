@@ -85,6 +85,10 @@ export default {
         { number: 9008, queued: true, evidence: evidence({ recorded: true }),
           status: { status: 'finished', result: 'resumed' } },
       ];
+      // A spent retry cannot become a never-started pass when the seat store loses its rows.
+      cases.push({ number: 9010, queued: true,
+        evidence: evidence({ seatRecorded: false, completedRecorded: false, failedSeatCount: 0 }),
+        status: { status: 'finished', result: 'ran', retryCount: 1 } });
       const byPr = new Map(cases.map(c => [c.number, c]));
       const history = new Map(), starts = [];
       let at = 2_000_000;
@@ -106,6 +110,8 @@ export default {
             setting, lastDispatch: history, now: () => at,
             readEvidence: ({ pr }) => byPr.get(pr).evidence,
             readStatus: ({ pr }) => byPr.get(pr).status,
+            // Accepted recovery candidates read formal reviews separately from the PR snapshot.
+            readReviews: () => [],
             dispatch: args => {
               starts.push(args);
               check(args.repo === repo && args.redTeamOnly === true, `${phase}: start must use the red-team-only job for this repo`);

@@ -463,7 +463,24 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         if (probe.code === 0) { out.adopted = true; break; }
         if (probe.code !== 1 && !missing) return stop('check-unverifiable', { adoption: probe, fallback: `Inspect the daemon clone adoption probe and rerun.${keptNote()}` });
         const remaining = deadline - now();
-        if (remaining <= 0) return stop('adoption-timeout', { fallback: `Check the daemon rebuild for the replacement and rerun.${keptNote()}` });
+        if (remaining <= 0) {
+          let reason = 'rebuild-state-unreadable';
+          let detail = 'Daemon rebuild state is unreadable; inspect the rebuild state and daemon before retrying.';
+          try {
+            const rebuild = JSON.parse(read(join(env.WE_DAEMON_STATE_DIR || join(env.HOME, '.claude/daemon-self-sync-state'), `${basename(state)}.rebuild.json`)));
+            if (!rebuild || typeof rebuild !== 'object' || Array.isArray(rebuild)) throw new Error('invalid rebuild state');
+            if (rebuild.building) {
+              if (typeof rebuild.building.target !== 'string' || typeof rebuild.building.startedAt !== 'string') throw new Error('incomplete build state');
+              reason = 'rebuild-building';
+              detail = `Daemon is building ${rebuild.building.target.slice(0, 7)} (started ${rebuild.building.startedAt}); check the build and rerun after it finishes.`;
+            } else {
+              reason = 'daemon-not-refreshing';
+              detail = `Daemon is not refreshing (last adoption: ${rebuild.adopted?.at || 'unknown'}); check daemon catch-up and rerun.`;
+            }
+          } catch { /* Unreadable evidence retains the timeout and every registration. */ }
+          out.adoption.reason = reason;
+          return stop('adoption-timeout', { fallback: `${detail}${keptNote()}` });
+        }
         await sleep(Math.min(config.adoption.pollMs, remaining));
       }
       stage = 'swap-remove-failed';

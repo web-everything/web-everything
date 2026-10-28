@@ -38,7 +38,7 @@ import { LEDGER_DIR, ledgerGitPath } from './verdict-ledger-path.mjs';
 
 export const LEDGER_TRANSPORT_BRANCH = 'ops/review-requests';
 export { LEDGER_DIR, ledgerGitPath };
-export const DEFAULT_APPEND_ATTEMPTS = 5;
+export const DEFAULT_APPEND_ATTEMPTS = 8;
 /** The ONLY ref the ledger push path may write (operator decision 2026-10-08): never main, never a lane, never a force. */
 export const LEDGER_PUSH_REF = `refs/heads/${LEDGER_TRANSPORT_BRANCH}`;
 
@@ -164,6 +164,7 @@ export function appendLedgerRows({
   attempts = DEFAULT_APPEND_ATTEMPTS,
   message = `verdict-ledger: append ${repo}`,
   sleep = defaultSleep,
+  random = Math.random,
   onRetry = null,
   ...seams // run / mkdir / write / read / rm / now, passed through to the transport
 } = {}) {
@@ -206,7 +207,8 @@ export function appendLedgerRows({
       errors.push(e);
       if (attempt < attempts) {
         if (onRetry) onRetry({ attempt, error: e });
-        sleep(Math.min(100 * 2 ** (attempt - 1), 1600) + Math.floor(Math.random() * 50));
+        const cap = Math.min(100 * 2 ** (attempt - 1), 6400);
+        sleep(cap / 2 + random() * cap / 2);
       }
     }
   }

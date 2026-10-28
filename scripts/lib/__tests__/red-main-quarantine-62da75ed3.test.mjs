@@ -39,7 +39,7 @@ it('replays the old coverage gap and records its none decision', () => {
 });
 it('requires proof when group evidence is absent', () => {
   const { out } = replay({ proof: false });
-  expect(out.plan).toMatchObject({ action: 'none', why: 'not a proven flake: integration (no green re-run of the failing commit)' });
+  expect(out.plan).toMatchObject({ action: 'none', why: 'not a proven flake: integration (no green re-run of the failing commit; insufficient distinct failing main runs)' });
 });
 it.each([
   ['unrelated base', (runs) => { runs.failing.groupEvidence.baseSha = 'deadbee'; }],

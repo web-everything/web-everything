@@ -1,20 +1,23 @@
 /** Shared admission for background work; operator interactive commands bypass this check.
- * Memory readings report provenance: macOS pages + free swap, pages alone, then os.freemem.
+ * Structured memory readings prefer macOS pressure: warn/critical hold; normal requires
+ * measured reclaimable headroom (including inactive pages) to meet the configured floor.
+ * Pressure failure falls back to pages + free swap, pages alone, then os.freemem with provenance.
+ * The numeric compatibility reader retains the original headroom probes.
  * Unavailable memory and measured low headroom refuse admission. Malformed readings,
  * non-denial probe errors and legacy numeric-reader failures also fail closed.
  * No network endpoint: body size/rate/CSRF do not apply. Scan/GC triggers use host single-flight locks.
  */
 import { createHash } from 'node:crypto';
-import { loadavg, cpus, freemem } from 'node:os';
+import * as os from 'node:os';
 import { mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import * as childProcess from 'node:child_process';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { loadHostOverloadSettings, hostStateRoot, boundedText, DEFAULT_MIN_MEMORY_HEADROOM_MB } from './host-overload-settings.mjs';
 /** Subprocess fixtures may supply a reading only under Vitest. Production always samples the host.
  * Keep the source injectable so tests can also prove the real-source fallback without sampling the host.
  */
-export function readHostLoad({ env = process.env, load = loadavg } = {}) {
+export function readHostLoad({ env = process.env, load = os.loadavg } = {}) {
   if (env.VITEST === 'true' && env.WE_TEST_HOST_LOAD1 !== undefined) {
     const value = Number(env.WE_TEST_HOST_LOAD1);
     if (env.WE_TEST_HOST_LOAD1.trim() === '' || !Number.isFinite(value) || value < 0) throw Error('invalid test host load');
@@ -32,6 +35,26 @@ export function parseDarwinMemoryHeadroomMb(vmStat, swapUsage) {
   if (![page, free, spec].every(Number.isFinite) || swapFree === undefined) throw Error('unparseable vm_stat/swapusage');
   return ((free + spec + (Number.isFinite(purge) ? purge : 0)) * page) / 1048576 + Number(swapFree);
 }
+/** Measured reclaimable MB under normal pressure: legacy headroom plus inactive pages.
+ * Pure; incomplete or invalid evidence throws rather than implying unlimited memory. */
+export function parseDarwinReclaimableMemoryMb(vmStat, swapUsage) {
+  const page = Number(/page size of (\d+) bytes/.exec(vmStat)?.[1]);
+  const inactive = Number(/^Pages inactive:\s+(\d+)\.?\s*$/m.exec(vmStat)?.[1] ?? NaN);
+  const headroom = parseDarwinMemoryHeadroomMb(vmStat, swapUsage);
+  const mb = headroom + inactive * page / 1048576;
+  if (!Number.isFinite(page) || page <= 0 || !Number.isFinite(inactive)
+    || !Number.isFinite(headroom) || headroom < 0 || !Number.isFinite(mb) || mb < 0) {
+    throw Error('unparseable reclaimable memory');
+  }
+  return mb;
+}
+/** Parse the macOS pressure sysctl's exact integer value. Pure; unknown levels throw. */
+export function parseDarwinMemoryPressureLevel(text) {
+  if (typeof text !== 'string') throw Error('unparseable memory pressure level');
+  const level = { 1: 'normal', 2: 'warn', 4: 'critical' }[text.trim()];
+  if (!['normal', 'warn', 'critical'].includes(level)) throw Error('unparseable memory pressure level');
+  return level;
+}
 function isMemoryProbeDenied(error) {
   if (error?.code === 'ETIMEDOUT' || error?.message === 'ETIMEDOUT') return false;
   return ['EPERM', 'EACCES', 'ENOENT'].includes(error?.code)
@@ -45,8 +68,11 @@ function readFreeMemoryReading(free) {
   if (mb < 0) throw Error('invalid free memory');
   return { mb, source: 'os.freemem' };
 }
-/** Headroom in MB with its probe source; only denied/unavailable probes fall back. Invalid readings throw. */
-export function readHostMemoryReading({ env = process.env, platform = process.platform, exec = execFileSync, free = freemem } = {}) {
+/** Pressure failure falls back to headroom; invalid headroom and non-denial errors still throw. */
+export function readHostMemoryReading(options = {}) {
+  return readMemoryReading(options, true);
+}
+function readMemoryReading({ env = process.env, platform = process.platform, exec = childProcess.execFileSync, free = os.freemem } = {}, probePressure = false) {
   if (env.VITEST === 'true' && env.WE_TEST_HOST_MEMORY_MB !== undefined) {
     const value = Number(env.WE_TEST_HOST_MEMORY_MB);
     if (env.WE_TEST_HOST_MEMORY_MB.trim() === '' || !Number.isFinite(value) || value < 0) throw Error('invalid test host memory');
@@ -54,6 +80,15 @@ export function readHostMemoryReading({ env = process.env, platform = process.pl
   }
   if (platform === 'darwin') {
     const opts = { encoding: 'utf8', timeout: 5000 };
+    let level;
+    if (probePressure) {
+      try {
+        level = parseDarwinMemoryPressureLevel(exec('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level'], opts));
+      } catch {
+        // Unavailable or unknown pressure must still pass the existing headroom checks.
+      }
+      if (level === 'warn' || level === 'critical') return { mb: 0, source: 'memory-pressure', level };
+    }
     let vm;
     try {
       vm = exec('vm_stat', [], opts);
@@ -69,17 +104,18 @@ export function readHostMemoryReading({ env = process.env, platform = process.pl
       if (!isMemoryProbeDenied(e)) throw e;
       return { mb: pagesMb, source: 'vm_stat' };
     }
-    const mb = parseDarwinMemoryHeadroomMb(vm, swap);
+    const mb = level === 'normal' ? parseDarwinReclaimableMemoryMb(vm, swap) : parseDarwinMemoryHeadroomMb(vm, swap);
     if (!Number.isFinite(mb) || mb < 0) throw Error('invalid swap headroom');
+    if (level === 'normal') return { mb, source: 'memory-pressure', level };
     return { mb, source: 'vm_stat+swap' };
   }
   return readFreeMemoryReading(free);
 }
 /** Numeric compatibility reader: unavailable memory is NaN; invalid readings still throw. */
 export function readHostMemoryHeadroomMb(options = {}) {
-  return readHostMemoryReading(options).mb ?? NaN;
+  return readMemoryReading(options).mb ?? NaN;
 }
-export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => cpus().length, memory,
+export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => os.cpus().length, memory,
   memoryReading = memory ? (options) => ({ mb: memory(options), source: 'injected' }) : readHostMemoryReading,
   interactive = !!process.stdin.isTTY, env = process.env, log } = {}) {
   if (interactive) return { admitted: true, reason: 'operator interactive command' };
@@ -98,9 +134,12 @@ export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => c
     // A hand-built policy without the leaf takes the standard value; a loaded policy always carries it.
     const min = policy.settings.host.minMemoryHeadroomMb ?? DEFAULT_MIN_MEMORY_HEADROOM_MB;
     if (!Number.isFinite(min) || min <= 0) throw Error('invalid host memory threshold');
-    const { mb, source } = memoryReading({ env });
+    const { mb, source, level } = memoryReading({ env });
     if (!Number.isFinite(mb) || mb < 0) throw Error('unknown host memory');
-    const reason = `host memory headroom ${Math.round(mb)}MB (free+swap); host.minMemoryHeadroomMb=${min} (${policy.sources?.['host.minMemoryHeadroomMb'] ?? 'standard'}); source=${source}`;
+    const description = source === 'memory-pressure'
+      ? `host memory pressure ${level}; reclaimable headroom ${Math.round(mb)}MB`
+      : `host memory headroom ${Math.round(mb)}MB (free+swap)`;
+    const reason = `${description}; host.minMemoryHeadroomMb=${min} (${policy.sources?.['host.minMemoryHeadroomMb'] ?? 'standard'}); source=${source}`;
     return mb >= min ? { admitted: true, reason: `${loadVerdict.reason}; ${reason}` } : { admitted: false, reason };
   } catch (e) { return { admitted: false, reason: `host memory unknown: ${e.message}` }; }
 }
@@ -112,7 +151,7 @@ export function hostSingleFlight(name, fn, { stateRoot = hostStateRoot() } = {})
 /** Demand-driven schedule: the maintenance command may be called each scheduler tick; only a due pass runs.
  * One host lock covers every pool and every git invocation, including after a restart. GC never detaches.
  */
-export function scheduledLaneGc(lanes, { stateRoot = hostStateRoot(), exec = execFileSync, admission = hostLoadAdmission,
+export function scheduledLaneGc(lanes, { stateRoot = hostStateRoot(), exec = childProcess.execFileSync, admission = hostLoadAdmission,
   schedule, interactive = false, nowMs = Date.now(), log = (m) => process.stderr.write(`${m}\n`), env = process.env } = {}) {
   try {
     schedule ??= loadHostOverloadSettings({ env, log }).settings.lanes.gc.schedule;

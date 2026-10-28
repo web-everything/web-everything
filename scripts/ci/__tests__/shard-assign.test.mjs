@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { assignByTime, median, ambiguousFilters, timingsFromReports, parseShardArg } from '../shard-assign.mjs';
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { assignByTime, median, ambiguousFilters, timingsFromReports, parseShardArg, listUnitTestFiles, loadTimings, assertTimingKeys, formatUpdatedTimings, REPO_ROOT } from '../shard-assign.mjs';
 
 describe('shard-assign — balance by measured time (card 11)', () => {
   const files = ['a', 'b', 'c', 'd', 'e', 'f'];
@@ -46,6 +49,18 @@ describe('shard-assign — vitest substring-filter guard', () => {
 });
 
 describe('shard-assign — timings from vitest json reports', () => {
+  it('rejects report filenames outside the checkout instead of storing parent-traversing keys', () => {
+    const report = { testResults: [{ name: '/other-checkout/a.test.mjs', startTime: 0, endTime: 1000 }] };
+    expect(() => timingsFromReports([report], '/repo')).toThrow(/repository-relative/);
+  });
+
+  it.each(['/absolute.test.mjs', '../outside.test.mjs', 'a/../../outside.test.mjs', 'C:/checkout/a.test.mjs', 'a\\b.test.mjs'])('rejects nonportable persisted timing key %s in the shared standards guard and writer', (key) => {
+    const unit = { [key]: 1 };
+    expect(() => assertTimingKeys({ unit })).toThrow(/repository-relative/);
+    expect(() => formatUpdatedTimings({ unit: {}, soak: {} }, 'unit', unit)).toThrow(/repository-relative/);
+    expect(() => assertTimingKeys({ soak: unit })).toThrow(/repository-relative/);
+  });
+
   it('maps absolute names to repo-relative seconds, keeping the largest sample', () => {
     const root = '/repo';
     const r1 = { testResults: [{ name: '/repo/a/x.test.mjs', startTime: 0, endTime: 2500 }] };
@@ -57,4 +72,36 @@ describe('shard-assign — timings from vitest json reports', () => {
     expect(parseShardArg(['--shard=2/4'])).toEqual({ shard: 2, total: 4 });
     expect(() => parseShardArg(['--shard=5/4'])).toThrow();
   });
+});
+
+
+describe('shard-assign — persisted unit timing freshness', () => {
+  it('committed unit timing keys match discovered test filenames', async () => {
+    const files = new Set(await listUnitTestFiles());
+    const unit = loadTimings().unit;
+    expect(Object.keys(unit).filter(file => !files.has(file))).toEqual([]);
+  }, 30_000);
+
+  it('discovery preserves include/exclude rules without executing tests, setupFiles or globalSetup', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'shard-discovery-'));
+    try {
+      const sentinels = join(root, 'sentinels');
+      mkdirSync(sentinels);
+      const touch = (name) => `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(join(sentinels, name))}, '');\n`;
+      for (const dir of ['tests/deep', 'tests/skip', 'other']) mkdirSync(join(root, dir), { recursive: true });
+      for (const [file, name] of [['tests/a.test.mjs', 'a'], ['tests/deep/b.test.mjs', 'b'], ['tests/skip/c.test.mjs', 'c'], ['other/d.test.mjs', 'd'], ['tests/helper.mjs', 'helper']]) {
+        writeFileSync(join(root, file), touch(name));
+      }
+      writeFileSync(join(root, 'setup.mjs'), touch('setup'));
+      writeFileSync(join(root, 'global.mjs'), `${touch('global')}export default () => {};\n`);
+      writeFileSync(join(root, 'vitest.config.ts'), `export default { test: ${JSON.stringify({
+        include: ['tests/**/*.test.mjs'], exclude: ['tests/skip/**'], setupFiles: ['./setup.mjs'], globalSetup: ['./global.mjs'],
+      })} };\n`);
+      symlinkSync(join(REPO_ROOT, 'node_modules'), join(root, 'node_modules'), 'dir');
+      expect(await listUnitTestFiles(root)).toEqual(['tests/a.test.mjs', 'tests/deep/b.test.mjs']);
+      expect(readdirSync(sentinels)).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

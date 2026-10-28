@@ -181,8 +181,9 @@ export const FIX_DISPATCH_DAEMON_REPOS = Object.values(CONSTELLATION_REPOS).map(
  *   outright refusals — a PR reconcile never even offered as a `fix`/`ci-heal` dispatch entry (#x0mn6x0, epic
  *   #4075/#3383; see `runReconcileFixDispatch`'s own `reconcileRefusalDetails` docblock for the full why).
  */
-export function runReconcileFixDispatchAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, tick = runReconcileFixDispatch, ...tickOpts } = {}) {
-  const perRepo = forEachRepo(repos, (repo) => tick({ ...tickOpts, repo }));
+export function runReconcileFixDispatchAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, tick = runReconcileFixDispatch,
+  allowStandDownAutoProceed = resolveFixSettings().standDownAutoProceed, ...tickOpts } = {}) {
+  const perRepo = forEachRepo(repos, (repo) => tick({ ...tickOpts, repo, allowStandDownAutoProceed }));
   const dispatched = [];
   const refusals = [];
   const reconcileRefusals = [];
@@ -763,6 +764,10 @@ export function runMissingRunRecoveryAllRepos({ repos = FIX_DISPATCH_DAEMON_REPO
 export async function runTickAllRepos({
   repos = FIX_DISPATCH_DAEMON_REPOS, fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick, promoteDraftTick, rulingStandDownTick, notesTick, notesDryRun,
   authGateOverride,
+  fixSettings = resolveFixSettings(),
+  // R123: resolve once per daemon pass, then carry permission through the fan-out and reconciliation.
+  // An explicit boolean overrides policy for tests and read-only callers.
+  allowStandDownAutoProceed = fixSettings.standDownAutoProceed,
   // #5137 slices 2+3 — the verify-verdict pass (we:scripts/conveyor/await-verify-pass.mjs). Injectable like every
   // other half; a test tick (fixTick/ciHealTick injected) never runs the real one.
   awaitVerifyTick,
@@ -852,7 +857,6 @@ export async function runTickAllRepos({
   }) : null;
   const executorSetting = resolveFixExecutorSetting();
   const chain = resolveFixExecutorChain();
-  const fixSettings = resolveFixSettings();
   const fixExecutorRoute = (planned) => routeFixExecutor(planned, {
     setting: executorSetting, chain, fixSettings, launcherAvailable: e => fixLauncherAvailable(e),
     criticalFor: planned => criticalWorkVerdict({ taskType: planned.kind === 'ci-heal' ? 'ci-heal' : 'fix', filesTouched: planned.scope ?? [] }).critical,
@@ -875,7 +879,8 @@ export async function runTickAllRepos({
     });
   };
   const fix = timed('fix', () => (authGate.paused ? pausedDispatchResult()
-    : runReconcileFixDispatchAllRepos({ repos, ...(fixTick ? { tick: fixTick } : { queueAdmission, dispatchThrottle, borrowGate, fixExecutorRoute }) })));
+    : runReconcileFixDispatchAllRepos({ repos, allowStandDownAutoProceed,
+      ...(fixTick ? { tick: fixTick } : { queueAdmission, dispatchThrottle, borrowGate, fixExecutorRoute }) })));
   const ciHeal = await timedAsync('ci-heal', async () => (authGate.paused ? pausedDispatchResult()
     : await runReconcileCiHealDispatchAllRepos({ repos, ...(ciHealTick ? { tick: ciHealTick } : { tick: routedCiHealTick, queueAdmission, dispatchThrottle }) })));
   if (dispatchThrottle) lastFixQueueLength = fixQueueLengthOf(fix, ciHeal);

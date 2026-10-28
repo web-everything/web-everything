@@ -439,7 +439,8 @@ describe('#4874 shape need', () => {
   it('adds need while preserving every existing card-plan field', () => {
     const { need, ...plan } = buildShapePlan({ changedFiles: cardFiles });
     expect(plan).toEqual({
-      careLevel: 'none', reasons: [], humanRequired: false, earnedLenses: [],
+      careLevel: 'none', reasons: [], humanRequired: false, humanRequiredProposed: false,
+      humanRequiredProposedReason: expect.any(String), earnedLenses: [],
       mandatoryFloor: ['root-cause', 'completeness'], subject: 'prose', rounds: 0,
       jurorsPerLens: 0, seatLens: 'root-cause', seatLensReachable: false,
       escalated: false, changedFiles: cardFiles,
