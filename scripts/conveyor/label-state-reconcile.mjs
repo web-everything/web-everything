@@ -114,10 +114,11 @@ export function sweepLabelStateReconcile({ prs = [], repo, resolveRepo = () => r
       const readLive = () => {
         const live = readPr({ repo: slug, number: candidate.number, fields: 'number,state,headRefOid,labels,body,createdAt' });
         if (live?.state !== 'OPEN' || live.number !== candidate.number || !Array.isArray(live.labels)) return null;
-        live.comments = readComments(live.number, { repo: slug });
+        // Keep the reader's source intact so a later refresh can observe edits to its comments.
+        const comments = readComments(live.number, { repo: slug });
         let native = null;
         try { native = provider.readPrReviews(slug, live.number); } catch { /* unreadable never clears */ }
-        return { pr: live, native };
+        return { pr: { ...live, comments }, native };
       };
       const first = readLive();
       if (!first) continue;
