@@ -86,6 +86,9 @@ const git = (args, cwd = clone) => execFileSync('git', args, { cwd, encoding: 'u
 beforeAll(() => {
   clone = mkdtempSync(join(tmpdir(), 'we-scope-reconcile-'));
   cpSync(WE_SCRIPTS_DIR, join(clone, 'scripts'), { recursive: true });
+  // The transcript check imports this skill module during CLI startup.
+  cpSync(join(WE_ROOT, 'skills-src', 'inspect-codex-transcript'),
+    join(clone, 'skills-src', 'inspect-codex-transcript'), { recursive: true });
   // backlog.mjs reads `scope:` through gray-matter via createRequire — resolution walks up from
   // <clone>/scripts, so the clone needs a node_modules to find it. We resolve `gray-matter`'s REAL
   // install location via this process's OWN module resolution (`createRequire(...).resolve(...)`)
@@ -220,6 +223,7 @@ describe('backlog.mjs resolve — the #2803 guard, wired (CLI)', () => {
     const bare = mkdtempSync(join(tmpdir(), 'we-scope-reconcile-nogit-'));
     try {
       cpSync(join(clone, 'scripts'), join(bare, 'scripts'), { recursive: true });
+      cpSync(join(clone, 'skills-src'), join(bare, 'skills-src'), { recursive: true });
       symlinkSync(join(WE_ROOT, 'node_modules'), join(bare, 'node_modules'), 'dir');
       mkdirSync(join(bare, '.claude', 'skills', 'batch-backlog-items'), { recursive: true });
       mkdirSync(join(bare, 'backlog'), { recursive: true });
