@@ -1898,7 +1898,7 @@ describe('R100 failed-seat recovery admission', () => {
     const recover = () => runRedTeamOnSkip({ repo, plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] },
       rawPrs: [{ number: pr, headRefOid: head, comments: [] }], readEvidence, readStatus: read,
       setting: { enabled: true, retryCooldownMin: 0 }, now: () => 9_000_000, lastDispatch: new Map(),
-      dispatch: () => ({ jobPid: 42 }) });
+      capacity: { lanes: 1 }, dispatch: () => ({ jobPid: 42 }) });
     return { dir, env, loopPayload, read, path, marker: `${path}.retry-1`, job, recover };
   }
 
@@ -1920,6 +1920,23 @@ describe('R100 failed-seat recovery admission', () => {
       const retried = f.job({});
       expect(retried.observed.calls).toMatchObject({ model: 1, retryCountAtCall: 1 });
       expect(f.read().retryCount).toBe(1);
+      expect(f.recover().rows[0].action).toBe('skip');
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  it('a deterministic no-call refusal keeps the spent retry instead of re-dispatching every cooldown', () => {
+    const records = [{ dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'unparseable' }];
+    const f = retryFixture({ prefix: 'red-team-keep-retry-', records,
+      evidence: { recorded: true, seatRecorded: true, completedRecorded: false, failedSeatCount: 1 } });
+    try {
+      recordRedTeamStatus({ repo, pr, loopPayload: f.loopPayload, status: 'finished', result: 'ran' }, { env: f.env });
+      const comments = [{ body: `${redTeamMarker(pr, head)}\nRed team not required on this head: card-only diff`, author: { login: 'web-everything' } }];
+      const settled = f.job({ comments });
+      expect(settled.observed.calls.model).toBe(0);
+      expect(settled.observed.result).toMatchObject({ status: 'not-owed' });
+      expect(settled.observed.result.deferredByGuard).toBeUndefined();
+      expect(f.read().retryCount).toBe(1);
+      expect(existsSync(f.marker)).toBe(true);
       expect(f.recover().rows[0].action).toBe('skip');
     } finally { rmSync(f.dir, { recursive: true, force: true }); }
   });

@@ -929,10 +929,12 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
           ? seatsBox.priorRedTeamResult : out.redTeam?.status === 'skipped'
             ? { status: 'skipped', ...(out.redTeam.policy === 'card-only' ? { policy: 'card-only' } : {}) }
             : out.redTeam?.status ?? null;
-      // Every skip and guard refusal precedes the model call. Return this admission's
-      // retry spend so the failed seat stays eligible once the cap or transient read clears.
+      // A cap or guard deferral precedes the model call. Return this admission's retry spend so the
+      // failed seat stays eligible once the cap or transient read clears. Deterministic skips (policy,
+      // no provider, no diff, result already on head) repeat on every run, so they keep the spend.
       const refundRetry = seatsBox.input?.redTeamAdmission?.retrySpent === true
-        && (guardDeferred || ['skipped', 'not-owed'].includes(out.redTeam?.status));
+        && (out.redTeam?.deferredByGuard === true
+          || (out.redTeam?.status === 'skipped' && out.redTeam.deferredByCap === true));
       io.redTeamStatus?.({ ...seatsBox.input, status: guardDeferred && prior ? prior.status : 'finished', result,
         ...(refundRetry ? { refundRetry: true } : {}) });
     }
