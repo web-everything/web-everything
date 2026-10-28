@@ -15,6 +15,8 @@
  * (card xrbu1bp, `we:scripts/conveyor/fix-resume.mjs`) `fix.resumeAcrossRounds` on|off (built-in on) and
  * `fix.strongerModelFromRound` (built-in 3, 0 = off). The file keeps them under a `fix` object, so the merged settings
  * view (`we:scripts/lib/settings-files.mjs`) carries the same `fix.*` paths the docs name.
+ * `fix.capacityStarvationHours` (built-in 6, integer 1..999) alerts on host capacity via the same cascade;
+ * `WE_FIX_CAPACITY_STARVATION_HOURS` overrides it. Refusals never use repair attempts.
  *
  * How MANY takeovers a PR gets, and when a further one is owed (the budget, the progress guard, gate holds), lives in
  * `we:scripts/conveyor/takeover-budget.mjs` (`fix.takeoverBudget`, default 2) — this module holds the marker, the
@@ -31,6 +33,7 @@ export const FIX_SETTINGS_DEFAULTS = Object.freeze({
   roundCapAction: 'takeover', roundHistory: 'on',
   // Card xrbu1bp — see `we:scripts/conveyor/fix-resume.mjs`.
   resumeAcrossRounds: 'on', strongerModelFromRound: 3,
+  capacityStarvationHours: 6,
 });
 export const FIX_TAKEOVER_MARKER = '<!-- conveyor-fix-takeover';
 
@@ -105,6 +108,8 @@ export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE
   // Card xrbu1bp — resume the previous round's session (on|off) and the round the stronger-model rung starts at (0 = off).
   const resume = pick(env.WE_FIX_RESUME_ACROSS_ROUNDS, fromFile.resumeAcrossRounds, (v) => ONOFF.includes(v), FIX_SETTINGS_DEFAULTS.resumeAcrossRounds);
   const from = pick(env.WE_FIX_STRONGER_MODEL_FROM_ROUND, fromFile.strongerModelFromRound, (v) => /^\d{1,2}$/.test(v), String(FIX_SETTINGS_DEFAULTS.strongerModelFromRound));
+  const capacity = pick(env.WE_FIX_CAPACITY_STARVATION_HOURS, fromFile.capacityStarvationHours,
+    v => /^\d{1,3}$/.test(v) && Number(v) >= 1, String(FIX_SETTINGS_DEFAULTS.capacityStarvationHours));
   // R123 is ruled on: automatic answers are enabled at the standard layer. A present malformed
   // switch fails closed; a missing layer inherits. Explicit dispatch arguments still take precedence.
   const autoProceed = value => value === undefined ? undefined : value === true;
@@ -128,11 +133,13 @@ export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE
   return {
     roundCapAction: action.value, roundHistory: history.value,
     resumeAcrossRounds: resume.value, strongerModelFromRound: Number(from.value),
+    capacityStarvationHours: Number(capacity.value),
     claudeEscalationModel: model.value.claudeEscalationModel,
     standDownAutoProceed: model.value.standDownAutoProceed,
     sources: {
       roundCapAction: action.source, roundHistory: history.source,
       resumeAcrossRounds: resume.source, strongerModelFromRound: from.source,
+      capacityStarvationHours: capacity.source,
       claudeEscalationModel: model.sources.claudeEscalationModel,
       standDownAutoProceed: model.sources.standDownAutoProceed,
     },
