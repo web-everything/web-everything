@@ -365,7 +365,8 @@ export function sweepReviewHoldLabels({
   }
   // advisory:ruling-needed is reconciled only by pr-label-mirror --apply (G2).
   results.push(...sweepLabelStateReconcile({ prs, repo, resolveRepo: repoOf, provider, dryRun, readPr,
-    readComments: readComments === readCompletePrComments ? readLabelReconcileComments : readComments, ...labelState }));
+    readComments: readComments === readCompletePrComments ? readLabelReconcileComments : readComments,
+    ...labelState, env: labelState?.env ?? process.env }));
   return results;
 }
 

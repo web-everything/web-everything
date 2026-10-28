@@ -5,6 +5,10 @@ import { planRecordDecision } from '../../operations/review-pr.mjs';
 import { defaultReadPr } from '../advisory-label-sweep.mjs';
 import { readCompletePrComments } from '../pr-comments-complete.mjs';
 import { readRedTeamDisposition } from '../../lib/red-team-gate.mjs';
+import * as redTeamGate from '../../lib/red-team-gate.mjs';
+import { buildRedTeamDispositionInputs } from '../../lib/red-team-disposition-inputs.mjs';
+import { syncRedTeamStatusLabels } from '../../lib/red-team-status-labels.mjs';
+import { buildRoundExtensionComment } from '../round-extension-mark.mjs';
 import { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
 
 const repo = 'o/n', head = 'a'.repeat(40), otherHead = 'b'.repeat(40);
@@ -15,6 +19,24 @@ const pr = (number, labels, comments = [red(number)]) => ({ number, state: 'OPEN
   labels, comments, body: '<!-- authored-by-actor: author -->', createdAt: '2026-01-01T00:00:00Z' });
 // A read native-review channel with no reviews; `reviews: null` (unreadable) is tested explicitly.
 const planOf = args => planLabelStateReconcile({ reviews: [], ...args });
+function standingRulingThread(impact = 'broken') {
+  const standingRuling = { ok: true, id: `${repo}#6000`, author: 'chalbert', by: 1, maxPerPr: 3,
+    repos: [repo], cardOnlyHeads: { [head]: true }, uneditedComments: ['IC_auto'] };
+  const result = { ...red(42, head, true), createdAt: '2026-10-21T17:00:00Z' };
+  result.body = result.body.replace('edge-case, broken', `edge-case, ${impact}`);
+  const id = redTeamGate.liveResultGateState([result], 42, head).resultId;
+  const cap = { ...comment(redTeamGate.redTeamGateMarker(42, head, 'round-cap', id, [])),
+    createdAt: '2026-10-21T17:10:00Z' };
+  const at = '2026-10-21T18:00:00Z';
+  const grant = { id: 'IC_auto', author: { login: 'web-everything[bot]', type: 'Bot' }, createdAt: at,
+    body: buildRoundExtensionComment({ repo, pr: 42, by: 1, actor: 'chalbert', channel: 'chat',
+      reason: 'one more round', at, standingRuling: standingRuling.id, head,
+      episode: `${repo}#42@${head}:review:12/12` }) };
+  // A human release after the grant is invalid: the pending round still belongs to automation.
+  const release = { author: { login: 'chalbert', type: 'User' }, createdAt: '2026-10-21T19:00:00Z',
+    body: `${redTeamGate.redTeamGateMarker(42, head, 'operator-not-real', id)}\n- 1 finding(s) left advisory (#1).` };
+  return { standingRuling, comments: [result, cap, grant, release] };
+}
 function review(number, overrides = {}) {
   return { id: 'review-pr-accepted', op: 'review-pr', findings: {
     read: { repo, pr: number, netBasis: { rev: head } }, confirm: 'accept',
@@ -289,6 +311,155 @@ describe('planLabelStateReconcile', () => {
     const status = { repo, pr: 42, head, status: 'finished', result: { foldedVerdict: 'accept' } };
     expect(planOf({ repo, pr: live, redTeam: status }).to).toEqual(['red-team:clear']);
     expect(planOf({ repo, pr: live, redTeam: { ...status, head: otherHead } })).toBeNull();
+  });
+});
+
+describe('shared red-team disposition inputs', () => {
+  const env = { WE_RED_TEAM_STATUS_LABELS: 'on', WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE: 'off' };
+  function fixture(comments, labels = ['red-team:blocked', 'ready-to-merge']) {
+    const live = pr(42, labels, comments);
+    return { repo, env, prs: [live], provider: { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrReviews: () => [] },
+      readPr: () => live, readComments: () => live.comments, readReviews: () => [], readRedTeam: () => null,
+      readGrantScope: vi.fn(() => null), emit: vi.fn() };
+  }
+  it('honours a verified automatic extension and rejects an operator-not-real release of its pending round', () => {
+    const { comments, standingRuling } = standingRulingThread();
+    expect(redTeamGate.gateRoundGrants(comments, 42, repo, standingRuling)).toHaveLength(1);
+    const io = fixture(comments);
+    io.readGrantScope.mockReturnValue(standingRuling);
+    expect(planOf({ repo, pr: io.prs[0], env, standingRuling }).to).toEqual(['red-team:blocked']);
+    expect(sweepLabelStateReconcile(io)[0].labelsReconciled.to).toEqual(['red-team:blocked']);
+    expect(io.provider.setLabels).toHaveBeenCalledWith(repo, 42, { add: null, remove: ['ready-to-merge'] });
+    expect(io.readGrantScope).toHaveBeenCalledTimes(2);
+    expect(io.readGrantScope).toHaveBeenCalledWith({ repo, pr: { number: 42, headRefOid: head, comments } });
+  });
+  it('re-resolves standing-ruling scope from the freshly read comments before the final plan', () => {
+    const { comments, standingRuling } = standingRulingThread();
+    const first = comments.filter(c => c.id !== 'IC_auto');
+    const io = fixture(first);
+    io.readComments = vi.fn().mockReturnValueOnce(first).mockReturnValueOnce(comments);
+    io.readGrantScope.mockImplementation(({ pr }) => pr.comments === comments ? standingRuling : null);
+    expect(sweepLabelStateReconcile(io)[0].labelsReconciled.to).toEqual(['red-team:blocked']);
+    expect(io.readGrantScope).toHaveBeenNthCalledWith(1, { repo, pr: { number: 42, headRefOid: head, comments: first } });
+    expect(io.readGrantScope).toHaveBeenNthCalledWith(2, { repo, pr: { number: 42, headRefOid: head, comments } });
+    expect(io.provider.setLabels).toHaveBeenCalledWith(repo, 42, { add: null, remove: ['ready-to-merge'] });
+  });
+  it('a throwing standing-ruling reader returns null scope and marks it unreadable', () => {
+    const { comments } = standingRulingThread();
+    const io = fixture(comments);
+    io.readGrantScope.mockImplementation(() => { throw Error('unreadable ruling'); });
+    const inputs = buildRedTeamDispositionInputs({ repo, pr: 42, head, comments: io.prs[0].comments,
+      env, readGrantScope: io.readGrantScope });
+    expect(inputs.standingRuling).toBeNull();
+    expect(inputs.scopeUnreadable).toBe(true);
+    expect(redTeamGate.gateRoundGrants(inputs.comments, 42, repo, inputs.standingRuling)).toEqual([]);
+  });
+  it.each(['initial', 'final'])('unreadable standing-ruling scope on the %s plan skips an operator-not-real release without writes, provisioning or events', phase => {
+    const { comments, standingRuling } = standingRulingThread();
+    const io = fixture(comments);
+    // Without the scope, this full thread would wrongly release the automation-owned pending round.
+    expect(planOf({ repo, pr: io.prs[0], env, standingRuling: null }).to)
+      .toEqual(['ready-to-merge', 'red-team:clear']);
+    expect(planOf({ repo, pr: io.prs[0], env, standingRuling }).add).toEqual([]);
+    io.readGrantScope.mockImplementation(() => { throw Error('unreadable ruling'); });
+    if (phase === 'final') io.readGrantScope.mockReturnValueOnce(standingRuling);
+    expect(sweepLabelStateReconcile(io)).toEqual([]);
+    expect(io.readGrantScope).toHaveBeenCalledTimes(phase === 'initial' ? 1 : 2);
+    expect(io.provider.setLabels).not.toHaveBeenCalled();
+    expect(io.provider.ensureLabel).not.toHaveBeenCalled();
+    expect(io.emit).not.toHaveBeenCalled();
+  });
+  it('an explicit null scope keeps the planner pure and never triggers grant IO', () => {
+    const readGrantScope = vi.fn(() => { throw Error('must not read'); });
+    const inputs = buildRedTeamDispositionInputs({ repo, pr: 42, head, comments: [], env,
+      standingRuling: null, readGrantScope });
+    expect(inputs).toEqual({ repo, pr: 42, head, comments: [], env, standingRuling: null, statusLabels: true });
+    expect(readGrantScope).not.toHaveBeenCalled();
+  });
+  it.each(['live accept', 'live changes', 'stored accept', 'stored changes'])
+  ('statusLabels=off suppresses all red-team writes and ready drops for %s', kind => {
+    const io = fixture(kind.startsWith('live') ? [red(42, head, kind.endsWith('changes'))] : [],
+      ['red-team:pending', 'red-team:blocked', 'red-team:clear', 'ready-to-merge']);
+    io.env = { ...env, WE_RED_TEAM_STATUS_LABELS: 'off' };
+    io.readRedTeam = () => kind.startsWith('stored')
+      ? { repo, pr: 42, head, status: 'finished', result: { foldedVerdict: kind.split(' ')[1] } } : null;
+    expect(sweepLabelStateReconcile(io)).toEqual([]);
+    expect(io.provider.ensureLabel).not.toHaveBeenCalled();
+    expect(io.provider.setLabels).not.toHaveBeenCalled();
+  });
+  it.each(['accept', 'changes'])('statusLabels=off preserves review-label handling for %s', verdict => {
+    const io = fixture([red(42, head, true)],
+      ['review:changes', 'fix-waiting:host-busy', 'red-team:pending', 'ready-to-merge']);
+    io.env = { ...env, WE_RED_TEAM_STATUS_LABELS: 'off' };
+    const stored = review(42);
+    stored.findings.confirm = verdict;
+    io.readReviews = () => [reviewRunEvidence(stored)];
+    io.readReview = () => stored;
+    const plan = sweepLabelStateReconcile(io)[0].labelsReconciled;
+    expect(plan.to).toEqual(verdict === 'accept' ? ['red-team:pending', 'ready-to-merge']
+      : ['review:changes', 'fix-waiting:host-busy', 'red-team:pending']);
+    expect(io.provider.setLabels).toHaveBeenCalledWith(repo, 42, { add: null,
+      remove: verdict === 'accept' ? ['review:changes', 'fix-waiting:host-busy'] : ['ready-to-merge'] });
+  });
+  it('statusLabels=off removes ready-to-merge for stored changes even when standing-ruling scope is unreadable', () => {
+    const { comments } = standingRulingThread();
+    const labels = ['review:changes', 'fix-waiting:host-busy', 'red-team:blocked', 'ready-to-merge'];
+    const io = fixture(comments, labels);
+    io.env = { ...env, WE_RED_TEAM_STATUS_LABELS: 'off' };
+    io.readGrantScope.mockImplementation(() => { throw Error('unreadable ruling'); });
+    const stored = review(42);
+    stored.findings.confirm = 'changes';
+    stored.findings.referralVerdict.verdict = 'changes';
+    io.readReviews = () => [reviewRunEvidence(stored)];
+    io.readReview = () => stored;
+    const rows = sweepLabelStateReconcile(io);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].labelsReconciled.to)
+      .toEqual(['review:changes', 'fix-waiting:host-busy', 'red-team:blocked']);
+    expect(io.readGrantScope).toHaveBeenCalledTimes(2);
+    expect(io.provider.setLabels).toHaveBeenCalledTimes(1);
+    expect(io.provider.setLabels).toHaveBeenCalledWith(repo, 42, { add: null, remove: ['ready-to-merge'] });
+    expect(io.provider.ensureLabel).not.toHaveBeenCalled();
+    expect(io.emit).toHaveBeenCalledTimes(1);
+  });
+  it.each(['injected', 'process'])('the %s confirmed-breaks policy reaches both grant-aware sweep plans', kind => {
+    const { comments, standingRuling } = standingRulingThread('degraded');
+    const run = policy => {
+      const io = fixture(comments);
+      const policyEnv = { ...env, WE_RED_TEAM_CONFIRMED_BREAKS: `degraded=${policy}` };
+      if (kind === 'injected') io.env = policyEnv;
+      else {
+        for (const [key, value] of Object.entries(policyEnv)) vi.stubEnv(key, value);
+        delete io.env;
+      }
+      io.readGrantScope.mockReturnValue(standingRuling);
+      return sweepLabelStateReconcile(io)[0].labelsReconciled;
+    };
+    try {
+      expect(run('advisory').to).toEqual(['ready-to-merge', 'red-team:clear']);
+      expect(run('send-back').to).toEqual(['red-team:blocked']);
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it('feeds exactly the normal reader inputs to both reconcile disposition reads on every plan', () => {
+    const { comments, standingRuling } = standingRulingThread();
+    const io = fixture(comments);
+    io.env = { ...env, WE_RED_TEAM_CONFIRMED_BREAKS: 'broken=send-back,degraded=send-back' };
+    io.readGrantScope.mockReturnValue(standingRuling);
+    const { statusLabels, ...expected } = buildRedTeamDispositionInputs({ repo, pr: 42, head, comments,
+      env: io.env, standingRuling });
+    expect(statusLabels).toBe(true);
+    const reader = vi.spyOn(redTeamGate, 'readRedTeamDisposition');
+    try {
+      syncRedTeamStatusLabels({ repo, pr: 42, head, comments, env: io.env, live: io.prs[0],
+        provider: io.provider, readGrantScope: io.readGrantScope });
+      expect(reader).toHaveBeenCalledTimes(1);
+      expect(reader).toHaveBeenCalledWith(expected);
+      const normalInputs = reader.mock.calls[0][0];
+      reader.mockClear();
+      sweepLabelStateReconcile(io);
+      expect(reader).toHaveBeenCalledTimes(4);
+      for (const [inputs] of reader.mock.calls) expect(inputs).toEqual(normalInputs);
+    } finally { reader.mockRestore(); }
   });
 });
 

@@ -1,6 +1,7 @@
 /** Reconcile derived labels from stored, live-head evidence. No evidence is never a clearance. */
 import { planRedTeamStatusLabels, RED_TEAM_STATUS_LABEL_META } from '../lib/red-team-status-labels.mjs';
 import { readRedTeamDisposition, redTeamResultId } from '../lib/red-team-gate.mjs';
+import { buildRedTeamDispositionInputs } from '../lib/red-team-disposition-inputs.mjs';
 import { readRedTeamStatus } from '../lib/drain-red-team-evidence.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
@@ -34,20 +35,22 @@ export function readLabelReconcileComments(number, options = {}) {
  * Pure: all inputs are observations; only exact SHA equality permits a stored result to decide.
  * `reviews` is the PR's native GitHub reviews; anything but an array is unreadable and never clears a review hold.
  */
-export function planLabelStateReconcile({ repo, pr, review = null, redTeam = null, reviews = null, env = process.env } = {}) {
+export function planLabelStateReconcile({ repo, pr, review = null, redTeam = null, reviews = null, env = process.env,
+  standingRuling = null } = {}) {
   const from = names(pr.labels), after = new Set(from), evidence = {};
   const head = pr.headRefOid;
   if (!/^[a-f0-9]{40}$/.test(head ?? '') || !Array.isArray(pr.comments)) return null;
-  const disposition = readRedTeamDisposition({ repo, pr: pr.number, head, comments: pr.comments, env });
+  const { statusLabels, ...inputs } = buildRedTeamDispositionInputs({ repo, pr: pr.number, head,
+    comments: pr.comments, env, standingRuling });
+  const disposition = readRedTeamDisposition(inputs);
   const result = disposition.result?.rev === head ? disposition.result : null;
   const status = redTeam?.repo === repo && Number(redTeam.pr) === pr.number && redTeam.head === head
     && redTeam.status === 'finished' && ['accept', 'changes'].includes(redTeam.result?.foldedVerdict) ? redTeam : null;
   let redBlocked = false, reviewBlocked = false;
-  if (result || status) {
+  if (statusLabels && (result || status)) {
     // Live send-back/held dispositions include policy and operator rulings. A stored verdict
     // is only a fallback when no live result exists; it cannot undo a recorded release.
-    const plan = planRedTeamStatusLabels({ repo, pr: pr.number, head, labels: from, comments: pr.comments,
-      env, evidence: status ? { status } : {} });
+    const plan = planRedTeamStatusLabels({ ...inputs, labels: from, evidence: status ? { status } : {} });
     if (plan.add) after.add(plan.add);
     for (const label of plan.remove) after.delete(label);
     redBlocked = after.has('red-team:blocked');
@@ -101,7 +104,7 @@ export function planLabelStateReconcile({ repo, pr, review = null, redTeam = nul
 export function sweepLabelStateReconcile({ prs = [], repo, resolveRepo = () => repo, dryRun = false, env = process.env,
   provider = createGhProvider(), readPr = defaultReadPr, readComments = readLabelReconcileComments,
   readReviews = readReviewRunEvidence, readReview = readRun, readRedTeam = readRedTeamStatus,
-  emit = appendDaemonEvent } = {}) {
+  readGrantScope, emit = appendDaemonEvent } = {}) {
   const results = [];
   let reviews;
   for (const candidate of prs) {
@@ -136,7 +139,14 @@ export function sweepLabelStateReconcile({ prs = [], repo, resolveRepo = () => r
         try { redTeam = readRedTeam({ repo: slug, pr: pr.number, head: pr.headRefOid }); } catch { /* retain unknown state */ }
         return { review, redTeam };
       };
-      const initialPlan = planLabelStateReconcile({ repo: slug, pr, ...readStored(), reviews: first.native, env });
+      const planLive = ({ pr: live, native }, stored) => {
+        const inputs = buildRedTeamDispositionInputs({ repo: slug, pr: live.number, head: live.headRefOid,
+          comments: live.comments, env, readGrantScope });
+        // Enabled red-team reconciliation needs readable scope to preserve automation-owned rounds.
+        if (inputs.statusLabels && inputs.scopeUnreadable) return null;
+        return planLabelStateReconcile({ ...inputs, pr: live, ...stored, reviews: native });
+      };
+      const initialPlan = planLive(first, readStored());
       if (!initialPlan) continue;
       // Provision before refreshing evidence: provisioning can publish a same-head objection too.
       if (!dryRun) {
@@ -148,7 +158,7 @@ export function sweepLabelStateReconcile({ prs = [], repo, resolveRepo = () => r
       const stored = readStored(true);
       const fresh = readLive();
       if (!fresh || fresh.pr.headRefOid !== pr.headRefOid) continue;
-      const plan = planLabelStateReconcile({ repo: slug, pr: fresh.pr, ...stored, reviews: fresh.native, env });
+      const plan = planLive(fresh, stored);
       if (!plan) continue;
       if (!dryRun) {
         // A changed plan may need a different label. Retry next tick rather than provision after the refresh.
