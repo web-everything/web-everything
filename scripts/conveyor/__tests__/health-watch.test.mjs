@@ -32,8 +32,11 @@ vi.mock('../review-tmp-health.mjs', async original => {
 const episodeReplay = vi.hoisted(() => ({ probes: null, send: vi.fn(() => ({ ok: true })) }));
 vi.mock('../health-watch-core.mjs', async (original) => {
   const real = await original();
-  return { ...real, runHealthTick: (state, probes, ...args) =>
-    real.runHealthTick(state, episodeReplay.probes ?? probes, ...args) };
+  return { ...real, runHealthTick: (state, probes, smells, ...args) =>
+    real.runHealthTick(state, episodeReplay.probes ?? probes, smells.map((s) => s.id === 'daemon-build-stale'
+      // Keep the real detector, with a healthy host fixture independent of local daemon state.
+      ? { ...s, evaluate: (probes, ctx) => s.evaluate(probes, { ...ctx, io: { listStates: () => [] } }) }
+      : s), ...args) };
 });
 vi.mock('../branch-sync.mjs', async (original) => ({
   ...await original(), notifyDesktopChecked: episodeReplay.send,
