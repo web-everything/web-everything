@@ -3,13 +3,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { existsSync, fstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { keepAliveScript } from '../test-keepalive.mjs';
 import {
   resolveDetachedOpsDir, parseDetachFlags, startDetachedOp, waitForOp, handleDetachCli,
   readProcess, probeRunner, collectOwnedProcesses, sweepOwnedProcesses, reapRecord, cancelOp,
 } from '../detached-op.mjs';
+
+// Resolve Node child paths without Vite's browser-asset URL transform.
+const TEST_DIR = dirname(fileURLToPath(import.meta.url));
 
 describe('resolveDetachedOpsDir', () => {
   it('uses the explicit DETACHED_OPS_DIR override', () => {
@@ -461,7 +464,7 @@ describe('detached operation lifecycle', () => {
     writeFileSync(launcherPath, `
       import { writeFileSync, existsSync } from 'node:fs';
       import { setTimeout as sleep } from 'node:timers/promises';
-      import { startDetachedJob } from ${JSON.stringify(new URL('../../codex-direct-task.mjs', import.meta.url).href)};
+      import { startDetachedJob } from ${JSON.stringify(pathToFileURL(join(TEST_DIR, '../../codex-direct-task.mjs')).href)};
       const job = await startDetachedJob({ args: ['--detach'],
         jobsDir: ${JSON.stringify(join(dir, 'jobs'))}, scriptPath: ${JSON.stringify(workerPath)} });
       writeFileSync(${JSON.stringify(jobPath)}, JSON.stringify(job));
@@ -484,7 +487,7 @@ describe('detached operation lifecycle', () => {
     let outer, inner;
     try {
       const launched = spawnSync(process.execPath, [
-        fileURLToPath(new URL('../../readiness/heavy-admission.mjs', import.meta.url)),
+        join(TEST_DIR, '../../readiness/heavy-admission.mjs'),
         'run', '--detach', '--', process.execPath, launcherPath,
       ], { cwd: dir, env, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024 });
       expect(launched.error, launched.stderr).toBeUndefined();
