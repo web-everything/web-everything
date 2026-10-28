@@ -431,6 +431,7 @@ export function runSafetyNet({
     if (rec && completedFailure && completeFailures && Number.isInteger(attempt) && attempt > 0) {
       rec.attempts ??= {};
       rec.attempts[String(attempt)] = { runId: failingRun.databaseId, createdAt: failingRun.createdAt,
+        updatedAt: failingRun.updatedAt, observedAt: now,
         headSha: failingRun.headSha, jobFailures: structuredClone(jobFailures) };
     }
     const previous = rec?.attempts?.[String(attempt - 1)];
@@ -439,7 +440,10 @@ export function runSafetyNet({
       && completedFailure && completeFailures
       && Object.values(previous.jobFailures ?? {}).length > 0
       && Object.values(previous.jobFailures).every((f) => f?.complete === true)
-      && Number.isFinite(Date.parse(failingRun.updatedAt)) && Date.parse(failingRun.updatedAt) > Date.parse(failingRun.createdAt)) {
+      // Attempt numbers alone do not establish freshness; old snapshots without updatedAt cannot supply proof.
+      && typeof previous.updatedAt === 'string' && Number.isFinite(Date.parse(previous.updatedAt))
+      && typeof failingRun.updatedAt === 'string' && Number.isFinite(Date.parse(failingRun.updatedAt))
+      && Date.parse(failingRun.updatedAt) > Date.parse(previous.updatedAt)) {
       const attemptRuns = [
         { databaseId: previous.runId, attempt: attempt - 1, headSha: previous.headSha,
           status: 'completed', conclusion: 'failure', createdAt: previous.createdAt, jobFailures: previous.jobFailures },

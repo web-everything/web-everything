@@ -154,6 +154,31 @@ describe('rerun IO and ledger', () => {
     expect(opts.rerun).not.toHaveBeenCalled();
     expect(() => readFileSync(io.ledgerPathIn(opts.dir))).toThrow();
   }));
+  it.each(['failure', 'timed_out', 'startup_failure'])('repeat-proof rerun that fails again is not re-run: %s', async (conclusion) => fixture(async (opts) => {
+    const first = await io.probeAndOwnMainCi({ ...opts,
+      readRuns: () => ({ runs: [{ ...green }, { ...red }], failing: { flake: { ...flake, reason: 'repeat-proof' } } }),
+    });
+    expect(first.rerun).toMatchObject({ reason: 'repeat-proof', status: 'issued' });
+    const second = await io.probeAndOwnMainCi({ ...opts,
+      readRuns: () => ({ runs: [{ ...green }, { ...red, attempt: 2, conclusion }] }),
+    });
+    expect(opts.rerun).toHaveBeenCalledTimes(1);
+    expect(second.rerun).toBeUndefined();
+    expect(second.mainRed).toMatchObject({ red: true, firstRedSha: red.headSha });
+    expect(second.decision.reason).not.toBe('flake-rerun-pending');
+    expect(JSON.parse(readFileSync(io.ledgerPathIn(opts.dir)))._reruns['2'].rounds).toBe(1);
+  }));
+  it.each([
+    { conclusion: 'skipped' }, { conclusion: 'failure', infraOnly: true },
+    { conclusion: 'timed_out', infraOnly: true },
+  ])('retries only an inconclusive verdict once: %j', async (finished) => fixture(async (opts) => {
+    await io.probeAndOwnMainCi(opts);
+    const out = await io.probeAndOwnMainCi({ ...opts,
+      readRuns: () => ({ runs: [{ ...green }, { ...red, attempt: 2, ...finished }] }),
+    });
+    expect(out.rerun).toMatchObject({ reason: 'inconclusive-rerun', status: 'issued' });
+    expect(opts.rerun).toHaveBeenCalledTimes(2);
+  }));
   it('records a failed issue once without retrying', async () => fixture(async (opts) => {
     opts.rerun.mockRejectedValue(new Error('offline\nmore'));
     expect((await io.probeAndOwnMainCi(opts)).rerun.status).toBe('failed');

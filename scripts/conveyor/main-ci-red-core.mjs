@@ -265,7 +265,9 @@ export function planMainCiRerun({ runs, tipSha, reruns = {}, flake = null, setti
   }
   // A flake rerun that finished with no verdict (cancelled / skipped / infra-only) settled nothing: try it once more, then
   // leave the hold to the owner. Only runs we ledgered as a flake rerun qualify, and only up to FLAKE_RERUN_ROUNDS tries.
-  const again = runs.find((r) => r.rerunInconclusive === true && Number(r.attempt) > 1 && reruns[r.databaseId]?.kind === 'flake' && (reruns[r.databaseId].rounds ?? 1) < FLAKE_RERUN_ROUNDS);
+  const again = runs.find((r) => r.rerunInconclusive === true
+    && (['cancelled', 'skipped'].includes(r.conclusion) || (RED.has(r.conclusion) && r.infraOnly === true))
+    && Number(r.attempt) > 1 && reruns[r.databaseId]?.kind === 'flake' && (reruns[r.databaseId].rounds ?? 1) < FLAKE_RERUN_ROUNDS);
   if (again) return { runId: again.databaseId, sha: again.headSha, kind: 'flake', reason: 'inconclusive-rerun', retry: true };
   const run = flake?.eligible && runs.find((r) => r.databaseId === flake.runId);
   if (run && unseen(run.databaseId)) return { runId: run.databaseId, sha: run.headSha, kind: 'flake', reason: flake.reason };

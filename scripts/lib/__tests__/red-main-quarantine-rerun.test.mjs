@@ -114,7 +114,8 @@ function harness({ values = {} } = {}) {
 }
 
 const snapshot = (run, jobFailures = { [job]: failure() }) => ({
-  runId: run.databaseId, createdAt: run.createdAt, headSha: run.headSha, jobFailures,
+  runId: run.databaseId, createdAt: run.createdAt, updatedAt: run.updatedAt, observedAt: now,
+  headSha: run.headSha, jobFailures,
 });
 
 describe('red-main passively collects repeat evidence; the conveyor owns reruns', () => {
@@ -180,6 +181,21 @@ describe('red-main passively collects repeat evidence; the conveyor owns reruns'
     expect(h.ledger().reds[sha].attempts).toMatchObject({
       1: snapshot(originalRun), 2: snapshot(rerun, { [job]: different }),
     });
+    h.noRerun();
+  });
+
+  it('rereads changed failure evidence when only the attempt changes', () => {
+    const h = harness();
+    h.tick();
+    const changed = { ...originalRun, attempt: 2 };
+    const different = failure('scripts/lib/__tests__/different.test.mjs');
+    h.readLog.mockReturnValue(different);
+    expect(h.tick(changed).plan.action).toBe('none');
+    expect(h.readLog).toHaveBeenCalledTimes(2);
+    expect(h.ledger().reds[sha].attempts).toMatchObject({
+      1: snapshot(originalRun), 2: snapshot(changed, { [job]: different }),
+    });
+    expect(h.write).not.toHaveBeenCalled();
     h.noRerun();
   });
 
@@ -250,12 +266,28 @@ describe('red-main passively collects repeat evidence; the conveyor owns reruns'
     h.noRerun();
   });
 
-  it.each([originalRun.createdAt, undefined, 'invalid'])('refuses attempt 2 without strictly later updatedAt: %s', (updatedAt) => {
+  it.each([originalRun.createdAt, '2026-10-28T10:05:00Z', originalRun.updatedAt, undefined, 'invalid'])('refuses attempt 2 without updatedAt strictly later than the stored attempt: %s', (updatedAt) => {
     const h = harness();
     h.tick();
     expect(h.tick({ ...rerun, updatedAt }).plan.action).toBe('none');
     expect(h.write).not.toHaveBeenCalled();
     h.noRerun();
+  });
+
+  it.each([undefined, 'invalid'])('refuses proof when the prior snapshot has no usable updatedAt: %s', (updatedAt) => {
+    const h = harness();
+    h.tick({ ...originalRun, updatedAt });
+    expect(h.tick(rerun).plan.action).toBe('none');
+    expect(h.write).not.toHaveBeenCalled();
+  });
+
+  it('compares attempt 3 to stored attempt 2 rather than attempt 1', () => {
+    const h = harness({ values: { repeatFailureProof: false } });
+    h.tick();
+    h.tick(rerun);
+    const settings = resolveQuarantineSettings({ env: {}, platform: null, file: join(temp(), 'absent.json') });
+    expect(h.tick({ ...rerun, attempt: 3, updatedAt: '2026-10-28T10:30:00Z' }, { settings }).plan.action).toBe('none');
+    expect(h.write).not.toHaveBeenCalled();
   });
 
   it('does not invent an earlier snapshot when first observing attempt 2', () => {
