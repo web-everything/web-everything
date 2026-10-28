@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { planSafetyNet, addEntries, validateQuarantineList } from '../red-main-quarantine.mjs';
+import { planSafetyNet, addEntries, decideCiSkip, validateQuarantineList } from '../red-main-quarantine.mjs';
 import { runSafetyNet, resolveQuarantineSettings, readTouchedFiles } from '../red-main-quarantine-io.mjs';
 import { NOTIFY_EVEN_IN_SHADOW } from '../../conveyor/health-smells-notify-list.mjs';
 import smell from '../../conveyor/health-smells/red-main-quarantined-test.mjs';
@@ -31,6 +31,70 @@ describe('quarantine CLI entry guard', () => {
   }, 30_000);
 });
 describe('R157 repeat failure quarantine', () => {
+  const jobOrders = [['integration', 'test-shard (10)'], ['test-shard (10)', 'integration']];
+  const skip = (list, job) => decideCiSkip({ mode: 'quarantine', read: { ok: true, list },
+    ctx: { known: true, onMain: false, prNumber: 99 }, changedFiles: [], now, job }).skip;
+  const publish = (list, entries, at = now) => entries.reduce((cur, e) => {
+    const out = addEntries(cur, { tests: [e.test], job: e.job, proof: e.proof, brokenSha: rows[0].headSha,
+      actor: 'red-main-safety-net', owner: 'operator', reason: 'repeat', now: at });
+    expect(out.ok).toBe(true);
+    return out.list;
+  }, list);
+  const twoJobs = (jobs, overrides = {}) => plan({ failedJobs: jobs,
+    jobFailures: Object.fromEntries(jobs.map((job) => [job, failure])), settings: { maxTests: 1 }, ...overrides });
+  it.each(jobOrders.map((jobs) => [jobs.join(' then '), jobs]))('covers both jobs, counts one file and owes one card: %s', (_label, jobs) => {
+    const p = twoJobs(jobs);
+    expect(p.action).toBe('add');
+    expect(p.entries.map((e) => e.job).sort()).toEqual([...jobs].sort());
+    expect(p.tests).toEqual([file]);
+    expect(p.cards).toHaveLength(1);
+    for (const job of jobs) expect(p.cards[0].title).toContain(job);
+    const list = publish(null, p.entries);
+    for (const job of jobs) expect(skip(list, job)).toEqual([file]);
+    expect(skip(list, 'soak-shard (1)')).toEqual([]);
+    expect(twoJobs(jobs, { list, addedForRed: [file] }).why).toContain('already quarantined');
+  });
+  it.each(jobOrders.map((jobs) => [jobs.join(' then '), jobs]))('repairs partial coverage without extending the file TTL: %s', (_label, jobs) => {
+    const list = publish(null, [{ test: file, job: jobs[0], proof }]);
+    const p = twoJobs(jobs, { list, addedForRed: [file], now: now + 60_000 });
+    expect(p.action).toBe('add');
+    expect(p.entries).toEqual([{ test: file, job: jobs[1], proof }]);
+    expect(p.cards).toHaveLength(1);
+    for (const job of jobs) expect(p.cards[0].title).toContain(job);
+    const repaired = publish(list, p.entries, now + 60_000);
+    for (const job of jobs) expect(skip(repaired, job)).toEqual([file]);
+    expect(repaired.entries.map((e) => e.expiresAt)).toEqual([list.entries[0].expiresAt, list.entries[0].expiresAt]);
+    expect(p.cards[0].expiresAt).toBe(list.entries[0].expiresAt);
+    const expired = twoJobs(jobs, { list: repaired, addedForRed: [file], now: list.entries[0].expiresAt });
+    expect(expired.action).toBe('prune');
+    expect(expired.why).toContain('expired');
+    expect(twoJobs(jobs, { list: { version: 1, entries: [] }, addedForRed: [file] }).action).toBe('none');
+  });
+  it('legacy untagged entries cover unit shards but still need integration coverage', () => {
+    const list = publish(null, [{ test: file, proof }]);
+    const p = twoJobs(jobOrders[0], { list, addedForRed: [file] });
+    expect(p.entries).toEqual([{ test: file, job: 'integration', proof }]);
+    const repaired = publish(list, p.entries);
+    for (const job of jobOrders[0]) expect(skip(repaired, job)).toEqual([file]);
+  });
+  it('the live writer persists both jobs and repairs a partially published list on a later tick', () => {
+    const dir = temp();
+    let list = { version: 1, entries: [] };
+    const jobs = jobOrders[0];
+    const tick = () => runSafetyNet({ now, dir,
+      mainCiRuns: { runs: rows, failing: { runId: 2, jobs } },
+      mode: { value: 'quarantine', source: 'test' }, touchedFiles: () => [],
+      readJobs: () => ({ failed: jobs.map((name, id) => ({ name, id: id + 10 })), jobs: [] }), readLog: () => failure,
+      readList: () => ({ ok: true, list }), write: ({ change }) => { const out = change(list); list = out.list; return out; }, log: () => {} });
+    const first = tick();
+    expect(first.applied).toBe(true);
+    for (const job of jobs) expect(skip(list, job)).toEqual([file]);
+    expect(first.events.filter((e) => e.type === 'card-owed')).toHaveLength(1);
+    list.entries = list.entries.filter((e) => e.job === jobs[0]);
+    expect(tick().plan).toMatchObject({ action: 'add', entries: [{ test: file, job: jobs[1] }] });
+    for (const job of jobs) expect(skip(list, job)).toEqual([file]);
+    expect(tick().plan.action).toBe('none');
+  });
   it('twice-fails-untouched adds with 24h expiry, owner card, audit event and live notice', () => {
     let list = { version: 1, entries: [] }; let events;
     const out = runSafetyNet({ now, dir: temp(), mainCiRuns: { runs: rows, failing: { runId: 2, jobs: ['integration'] } },
@@ -97,6 +161,15 @@ describe('R157 repeat failure quarantine', () => {
   });
   it('distinct heads are not required for chronologically distinct failing runs', () => {
     expect(plan({ repeatRuns: [{ ...rows[0], headSha: rows[1].headSha }, rows[1]] })).toMatchObject({ action: 'add', entries: [{ proof: { ...proof, shas: [rows[1].headSha, rows[1].headSha] } }] });
+  });
+  it('same-SHA proof still checks the touched-files window and refuses unknown or tied chronology', () => {
+    const repeatRuns = [{ ...rows[0], headSha: rows[1].headSha }, rows[1]];
+    const touchedFiles = vi.fn(() => ['scripts/unrelated.mjs']);
+    expect(plan({ repeatRuns, touchedFiles }).action).toBe('add');
+    expect(touchedFiles).toHaveBeenCalledWith(rows[1].headSha, rows[1].headSha);
+    expect(plan({ repeatRuns, touchedFiles: () => null }).action).toBe('none');
+    expect(plan({ repeatRuns, touchedFiles: () => [file] }).action).toBe('none');
+    expect(plan({ repeatRuns: repeatRuns.map((r) => ({ ...r, createdAt: rows[1].createdAt })) }).action).toBe('none');
   });
   it.each([undefined, 'invalid'])('IO excludes a malformed row sharing a red run sha (%s) => none', (createdAt) => {
     const readJobs = vi.fn(() => ({ failed: [{ id: 10, name: 'integration' }], jobs: [] }));

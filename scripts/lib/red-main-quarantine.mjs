@@ -74,8 +74,21 @@ export function testArea(entry) {
   return dir || null;
 }
 
+const isUnitShard = (name) => /^test-shard \(\d+\)$/.test(name);
+/** Legacy untagged entries apply only to unit shards, just as they do in CI. */
+const entryCoversJob = (entry, job) => job === null
+  ? entry.job === undefined || isUnitShard(entry.job)
+  : entry.job === undefined ? isUnitShard(job) : entry.job === job;
+
+/** Adding coverage for another job must not renew this file's quarantine for the same red. */
+function fileExpiry(entries, { test, brokenSha, now, ttlMs }) {
+  const expiry = now + Math.min(Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : QUARANTINE_DEFAULT_TTL_MS, QUARANTINE_MAX_TTL_MS);
+  return entries.reduce((end, e) => e.test === test && e.brokenSha === brokenSha && now < e.expiresAt
+    ? Math.min(end, e.expiresAt) : end, expiry);
+}
+
 /**
- * Add entries (idempotent per test) — returns the new list and the audit events. Refuses an unknown writer. PURE.
+ * Add entries (idempotent per test and job) — returns the new list and the audit events. Refuses an unknown writer. PURE.
  * @returns {{ok:boolean, list?:object, events?:object[], error?:string}}
  */
 export function addEntries(list, { tests = [], brokenSha, owner, reason, actor, now, ttlMs = QUARANTINE_DEFAULT_TTL_MS, area = null, job, proof }) {
@@ -84,8 +97,8 @@ export function addEntries(list, { tests = [], brokenSha, owner, reason, actor, 
   const entries = [...base.entries];
   const events = [];
   for (const test of tests) {
-    if (entries.some((e) => e.test === test && now < e.expiresAt)) continue;
-    const e = { test, brokenSha, owner, reason, addedAt: now, expiresAt: now + Math.min(Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : QUARANTINE_DEFAULT_TTL_MS, QUARANTINE_MAX_TTL_MS), ...(area ? { area } : {}), ...(job !== undefined ? { job } : {}), ...(proof ? { proof } : {}) };
+    if (entries.some((e) => e.test === test && now < e.expiresAt && (job === undefined ? e.job === undefined : entryCoversJob(e, job)))) continue;
+    const e = { test, brokenSha, owner, reason, addedAt: now, expiresAt: fileExpiry(entries, { test, brokenSha, now, ttlMs }), ...(area ? { area } : {}), ...(job !== undefined ? { job } : {}), ...(proof ? { proof } : {}) };
     entries.push(e);
     events.push({ type: 'quarantine-added', at: now, actor, ...e });
   }
@@ -280,7 +293,7 @@ export function planSafetyNet({ status, firstRedSha = null, failedJobs = null, j
           }
           proof = repeat.proof;
         }
-        if (!origins.has(file)) origins.set(file, { job, proof });
+        origins.set(JSON.stringify([file, job]), { test: file, job, proof });
       }
       files.push(...f.files);
       names.push(...f.tests.map((t) => (t.name ? `${t.file} > ${t.name}` : t.file)));
@@ -288,17 +301,23 @@ export function planSafetyNet({ status, firstRedSha = null, failedJobs = null, j
   }
   const uniq = [...new Set(files)];
   if (!uniq.length) return none('no unit job failed');
-  // A file quarantined once for THIS red is never re-added after it expires: the TTL bounds how long one break may be
-  // skipped, so a red that outlives it falls back to STOP instead of being quarantined forever (stale-entry guard).
+  // The ledger remains per file: missing job coverage can be added only while that file is still live for THIS red.
+  // addEntries inherits the original expiry, so adding a job cannot renew the file's TTL (stale-entry guard).
   const done = new Set(addedForRed ?? []);
-  const todo = uniq.filter((f) => !live.some((e) => e.test === f) && !done.has(f));
-  if (!todo.length) return none(uniq.some((f) => done.has(f) && !live.some((e) => e.test === f)) ? 'quarantine for this red expired — STOP until main is green' : 'failing tests already quarantined');
+  const retired = (file) => done.has(file) && !live.some((e) => e.test === file && e.brokenSha === firstRedSha);
+  const newEntries = [...origins.values()].filter(({ test, job }) =>
+    !live.some((e) => e.test === test && entryCoversJob(e, job)) && !retired(test));
+  const todo = [...new Set(newEntries.map((e) => e.test))];
+  if (!todo.length) return none(uniq.some(retired) ? 'quarantine for this red expired — STOP until main is green' : 'failing tests already quarantined');
   if (new Set([...live.map((e) => testFileOf(e.test)), ...todo]).size > s.maxTests) return none(`quarantine cap ${s.maxTests} reached`);
   const why = `main red since ${firstRedSha.slice(0, 9)} on ${todo.length} known failing test file(s)`;
-  const newEntries = todo.map((test) => ({ test, ...origins.get(test) }));
-  const expiresAt = now + Math.min(s.ttlMin * 60_000, QUARANTINE_MAX_TTL_MS);
-  const expiryET = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(expiresAt);
-  const cards = s.fileCardPerEntry ? newEntries.map(({ test, job }) => ({ test, job, brokenSha: firstRedSha, why, expiresAt, title: `Quarantined flaky test: ${test} (${job}) — fix or delete before ${expiryET} ET` })) : [];
+  const cards = s.fileCardPerEntry ? todo.map((test) => {
+    const jobs = [...new Set([...origins.values(), ...live].filter((e) => e.test === test).map((e) => e.job ?? 'unit shards'))].sort();
+    const job = jobs.join(', ');
+    const expiresAt = fileExpiry(live, { test, brokenSha: firstRedSha, now, ttlMs: s.ttlMin * 60_000 });
+    const expiryET = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(expiresAt);
+    return { test, job, jobs, brokenSha: firstRedSha, why, expiresAt, title: `Quarantined flaky test: ${test} (${job}) — fix or delete before ${expiryET} ET` };
+  }) : [];
   return { action: 'add', entries: newEntries, cards, tests: todo, names: [...new Set(names)], firstRedSha, why, fixPrs: fixDelta };
 }
 
@@ -333,10 +352,7 @@ export function decideCiSkip({ mode, read, ctx, changedFiles = null, now, job = 
   if (!read?.ok) return { skip: [], why: `quarantine list unreadable (${read?.error ?? 'unknown'}) — running everything` };
   if (!ctx?.known) return { skip: [], why: 'job context unknown — running everything' };
   const fixPrs = read.list.fixPrs ?? [];
-  const isUnitShard = (name) => /^test-shard \(\d+\)$/.test(name);
-  const list = { ...read.list, entries: read.list.entries.filter((e) => job === null
-    ? e.job === undefined || isUnitShard(e.job)
-    : e.job === undefined ? isUnitShard(job) : e.job === job) };
+  const list = { ...read.list, entries: read.list.entries.filter((e) => entryCoversJob(e, job)) };
   const tests = testsToSkip({ list, now, prNumber: ctx.prNumber, fixPrs, onMain: ctx.onMain });
   if (!tests.length) return { skip: [], why: ctx.onMain ? 'main runs every test' : fixPrs.includes(ctx.prNumber) ? `PR #${ctx.prNumber} is the main-fix PR — it runs the quarantined tests` : 'no live quarantine entry' };
   if (!Array.isArray(changedFiles)) return { skip: [], why: 'this PR\'s changed files are unknown — running everything' };
