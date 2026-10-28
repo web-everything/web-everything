@@ -95,6 +95,15 @@ describe('daemon-build-stale', () => {
     expect(results[0].summary).toMatch(/state unreadable/i);
   });
 
+  it('fails closed when the state directory is missing', async () => {
+    const readdir = () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); };
+    const io = { listStates: createStateLister({ readdir, directory: 'state' }), mergesSince: vi.fn() };
+    const results = await evaluate({}, { now: NOW, io });
+    expect(results).toHaveLength(1);
+    expect(results[0].breach).toBe(true);
+    expect(results[0].summary).toMatch(/state unreadable/i);
+  });
+
   it('does not breach when the oldest missing merge is thirty minutes old', async () => {
     const { results: [result] } = await run({ commits: merges(30 * MINUTE) });
     expect(result.subject).toBe(`daemon-build:${CLONE}`);

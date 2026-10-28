@@ -14,8 +14,7 @@ export function createStateLister({ readdir = readdirSync, read = readFileSync, 
     try {
       names = readdir(directory);
     } catch (error) {
-      if (error.code === 'ENOENT') return [];
-      // Fail closed: an unreadable state directory is its own breach, never a thrown (skipped) evaluation.
+      // Fail closed: a missing or unreadable state directory is its own breach, never silence or a thrown (skipped) evaluation.
       return [{ cloneKey: 'state-directory', raw: null }];
     }
     return names.filter((name) => name.endsWith('.rebuild.json')).map((name) => {
