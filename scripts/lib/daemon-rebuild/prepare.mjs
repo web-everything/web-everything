@@ -21,7 +21,7 @@ import {
 } from './local-state.mjs';
 import {
   readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode, persistStackBases, persistTipShas,
-  reinstateOverlaySources,
+  reinstateOverlaySources, sameRegistration, supersededSnapshots,
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild, pinnedStatus, PINNED_OVERLAY_GONE_MESSAGE } from './plan.mjs';
@@ -276,8 +276,10 @@ export async function prepareRebuild({
     try {
       // The adopted build's applied tips are evidence for a deleted branch registered before `tipSha` was
       // recorded. Edge-resolved entries applied a resolution commit, not the overlay's own tip, so they are skipped.
+      // Only the registration that build applied may use its tip (a re-registered ref is a different input).
       const recordedShas = new Map((state.adopted?.head === prevHead ? state.adopted.applied ?? [] : [])
-        .filter((a) => a?.ref && a.sha && !a.resolvedVia).map((a) => [a.ref, a.sha]));
+        .filter((a) => a?.ref && a.sha && !a.resolvedVia && overlaysBefore.some((o) => sameRegistration(a, o)))
+        .map((a) => [a.ref, a.sha]));
       const retired = await autoRetireOverlays({ root, env, overlays: overlaysBefore, git, mainSha: fetchedMainSha,
         refEvidence: fetchResult.refEvidence, recordedShas, now, removeOverlay, appendOverlayEvent,
         // Existing archives must survive until the proposed build proves it carries their sources.
@@ -308,8 +310,9 @@ export async function prepareRebuild({
     for (const raw of unverified) {
       // Fetch cleanup may have deleted the tracking ref. The last adopted inputs still identify the
       // mechanism this clone runs; use them only to refuse a loss, never as fresh build/retirement inputs.
+      // Only an input of this same registration counts: a re-registered ref never inherits the old pin.
       const adopted = state.adopted?.head === prevHead
-        ? state.adopted.applied?.find((o) => o.ref === raw.ref) : null;
+        ? state.adopted.applied?.find((o) => sameRegistration(o, raw)) : null;
       const pin = pinnedStatus(git, raw, state.adopted?.mainSha ?? fetchedMainSha, adopted?.sha);
       if (!pin.pinned) continue;
       unavailablePinned = {
@@ -375,12 +378,14 @@ export async function prepareRebuild({
         covered.set(sha, present);
         return present;
       };
+      // The same rule restoration uses: only the newest archive of a ref, across all carriers, is owed.
+      const superseded = supersededSnapshots(overlaysBefore);
       for (const carrier of overlaysBefore) {
         const pending = [...(carrier.retiredSources ?? [])];
         let missing = false;
         while (pending.length) {
           const source = pending.pop();
-          if (!carries(source?.sha)) missing = true;
+          if (!superseded.has(source) && !carries(source?.sha)) missing = true;
           pending.push(...(source.entry?.retiredSources ?? []));
         }
         if (missing) uncovered.push(carrier);
@@ -416,6 +421,16 @@ export async function prepareRebuild({
       alert('overlay-source-unverifiable', { error: String(error?.message ?? error) });
       return terminal({ moved: false, reason: 'overlay-source-unverifiable' });
     }
+  }
+  // Adopted inputs name the registration each tip came from, so a later re-registration of the same ref is told
+  // apart from it (unavailable pins and retirement evidence above, via sameRegistration). Legacy entries stay as-is.
+  if (plan.ok && Array.isArray(plan.applied)) {
+    const registrations = new Map(overlaysForPlan.map((o) => [o?.ref, o]));
+    plan.applied = plan.applied.map((a) => {
+      const o = registrations.get(a?.ref);
+      return o?.registrationId != null && (a.pr == null || o.pr == null || Number(a.pr) === Number(o.pr))
+        ? { ...a, registrationId: o.registrationId } : a;
+    });
   }
   // The chains gh answered completely are written back onto the entries (only when they changed), so a rebuild that
   // cannot reach gh later still knows the stacks. Best effort: a busy or unwritable list never fails the rebuild.

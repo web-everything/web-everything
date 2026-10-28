@@ -151,7 +151,9 @@ describe('real Git retirement evidence', () => {
     const current = { entry: { ref: 'source', sha: 'b'.repeat(40) }, sha: 'b'.repeat(40) };
     register([{ ref: 'carrier', retiredSources: [old] }, retireInto ? current.entry : { ref: 'swap', retiredSources: [current] }]);
     removeOverlay(root, retireInto ? 'source' : 'swap', { env, requireRef: 'carrier', retireInto, retiredSha: current.sha });
-    expect(readOverlayState(root, { env }).overlays[0].retiredSources).toEqual([old, current]);
+    // A retireInto archive is stamped with its retire time; a swap moves the existing archive unchanged.
+    expect(readOverlayState(root, { env }).overlays[0].retiredSources)
+      .toEqual([old, retireInto ? { ...current, retiredAt: expect.any(String) } : current]);
     removeOverlay(root, 'carrier', { env });
     expect(readOverlayState(root, { env }).overlays.find((o) => o.ref === 'source')).toEqual({ ...current.entry, tipSha: current.sha });
     // The older nested registration survives withdrawal of both the carrier and the newest source.
@@ -563,7 +565,7 @@ describe('real Git retirement evidence', () => {
     const result = await retire([{ ref: 'lower' }, { ref: 'top' }]);
     expect(result.retired).toEqual([expect.objectContaining({ ref: 'lower', class: 'contained', sha: lower })]);
     expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'top', tipSha: ok('rev-parse', 'origin/top'),
-      retiredSources: [{ entry: { ref: 'lower' }, sha: lower }] }]);
+      retiredSources: [{ entry: { ref: 'lower' }, sha: lower, retiredAt: expect.any(String) }] }]);
     expect(audit()).toEqual([
       expect.objectContaining({ kind: 'retiring', by: 'auto-retire', ref: 'lower', sha: lower, container: 'top' }),
       expect.objectContaining({ kind: 'removed', by: 'auto-retire', ref: 'lower', sha: lower }),
@@ -681,6 +683,7 @@ describe('real Git retirement evidence', () => {
     }
 
     const moved = [];
+    const stamped = (s) => ({ ...s, retiredAt: expect.any(String) });
     const result = await retire(overlays, {
       removeOverlay: (r, ref, opts) => {
         // The registered carrier exists before each source is removed; the same write preserves the source.
@@ -688,7 +691,7 @@ describe('real Git retirement evidence', () => {
         expect(before).toContainEqual({ ref });
         expect(before).toContainEqual({ ref: topRef, ...(moved.length ? { retiredSources: [...moved] } : {}) });
         const removed = removeOverlay(r, ref, opts);
-        moved.push(sources.find(({ entry }) => entry.ref === ref));
+        moved.push(stamped(sources.find(({ entry }) => entry.ref === ref)));
         const after = readOverlayState(r, { env }).overlays;
         expect(after.some((entry) => entry.ref === ref)).toBe(false);
         expect(after).toContainEqual({ ref: topRef, retiredSources: [...moved] });
@@ -699,7 +702,7 @@ describe('real Git retirement evidence', () => {
       ref: entry.ref, sha, class: 'contained', container: topRef,
     })));
     expect(result.kept).toEqual([expect.objectContaining({ ref: topRef, sha: top, class: 'needed', reason: 'unmerged-content' })]);
-    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: topRef, tipSha: top, retiredSources: sources }]);
+    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: topRef, tipSha: top, retiredSources: sources.map(stamped) }]);
 
     expect(removeOverlay(root, topRef, { env, why: 'pr-closed' }).reinstated).toEqual(refs);
     expect(readOverlayState(root, { env }).overlays).toEqual(sources.map(({ entry, sha }) => ({ ...entry, tipSha: sha })));

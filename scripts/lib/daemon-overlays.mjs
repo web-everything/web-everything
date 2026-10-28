@@ -336,18 +336,67 @@ export function recordEdgeResolution(root, ref, {
   return list;
 }
 
-/** Restore the latest absent registration of each ref, also recovering older/already-active nested sources. */
+/**
+ * Does an adopted build's applied input come from this registration? Matched on registrationId, and PR when both
+ * name one, so a re-registered ref never inherits the previous registration's pin or tip. A record or entry from
+ * before applied inputs carried a registrationId cannot prove a new registration: ref + PR decides, failing closed.
+ */
+export function sameRegistration(applied, entry) {
+  const id = registrationIdentity(entry);
+  if (!applied || !id || applied.ref !== id.ref) return false;
+  if (applied.pr != null && id.pr != null && Number(applied.pr) !== Number(id.pr)) return false;
+  if (applied.registrationId == null || id.registrationId == null) return true;
+  return applied.registrationId === id.registrationId;
+}
+
+/**
+ * Every archived snapshot (all carriers, nested included) that a newer archive of the same ref supersedes.
+ * Newest = latest `retiredAt`, tie-broken by registrationId; a legacy unstamped snapshot is older than any
+ * stamped one, and unstamped ones keep archive order (later wins), which is their retire order.
+ * @param {Array<object>} list
+ * @returns {Set<object>}
+ */
+export function supersededSnapshots(list) {
+  const latest = new Map();
+  const superseded = new Set();
+  let seq = 0;
+  const key = (s, n) => [s.retiredAt ? 1 : 0, String(s.retiredAt ?? ''), s.retiredAt ? String(s.entry?.registrationId ?? '') : '', n];
+  const newer = (a, b) => {
+    for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return a[i] > b[i];
+    return false;
+  };
+  const walk = (items, depth) => {
+    if (!Array.isArray(items) || depth > 64) return;
+    for (const s of items) {
+      if (!s || typeof s !== 'object') continue;
+      const ref = s.entry?.ref;
+      if (isSafeBranchName(ref)) {
+        const k = key(s, seq += 1);
+        const cur = latest.get(ref);
+        if (!cur) latest.set(ref, { s, k });
+        else if (newer(k, cur.k)) { superseded.add(cur.s); latest.set(ref, { s, k }); }
+        else superseded.add(s);
+      }
+      walk(s.entry?.retiredSources, depth + 1);
+    }
+  };
+  for (const o of Array.isArray(list) ? list : []) walk(o?.retiredSources, 0);
+  return superseded;
+}
+
+/** Restore the newest absent registration of each ref, also recovering older/already-active nested sources. */
 function collectRetiredSources(list, sources, { strict = false } = {}) {
   const seen = new Set(list.map((o) => o?.ref));
+  // "Newest" spans every carrier: one carrier's obsolete archive never wins because it was visited first.
+  const superseded = supersededSnapshots(list);
   const back = [];
   const skipped = [];
   const collect = (items) => {
     const snapshots = Array.isArray(items) ? items : [];
-    const latest = new Map(snapshots.map((s) => [s?.entry?.ref, s]));
     for (const s of snapshots) {
       const safe = isSafeBranchName(s?.entry?.ref);
       if (!safe && strict) throw new Error('invalid archived source');
-      if (!safe || seen.has(s.entry.ref) || latest.get(s.entry.ref) !== s) {
+      if (!safe || seen.has(s.entry.ref) || superseded.has(s)) {
         skipped.push(s?.entry?.ref ?? null); collect(s?.entry?.retiredSources); continue;
       }
       seen.add(s.entry.ref);
@@ -377,11 +426,11 @@ function collectRetiredSources(list, sources, { strict = false } = {}) {
  * skipped, its own nested sources still come back), so a container dropped later (pr-closed, ref-gone, smoke,
  * operator) never takes their content with it.
  * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedOverlay?:object, expectedRequiredOverlay?:object,
- *   retireInto?:boolean, retiredSha?:string|null}} [o]
+ *   retireInto?:boolean, retiredSha?:string|null, now?:string}} [o]
  * @returns {{removed:boolean, list:Array<object>, reinstated?:string[]}}
  */
 export function removeOverlay(root, ref, {
-  env = process.env, why, requireRef, expectedOverlay, expectedRequiredOverlay, retireInto = false, retiredSha = null,
+  env = process.env, why, requireRef, expectedOverlay, expectedRequiredOverlay, retireInto = false, retiredSha = null, now,
 } = {}) {
   void why; // caller bookkeeping only — see JSDoc above.
   return withListLock(root, env, (pause) => {
@@ -405,7 +454,8 @@ export function removeOverlay(root, ref, {
     // A replacement (`requireRef`) supersedes the removed entry: retired INTO it, the entry moves with its own
     // sources nested; in a plain swap (auto-rebase) only those sources move, since the replacement carries them.
     const swap = requireRef !== undefined && requireRef !== ref;
-    const moved = !swap ? [] : retireInto ? [{ entry, sha: retiredSha }] : own;
+    // `retiredAt` orders archives of one ref across carriers ({@link supersededSnapshots}).
+    const moved = !swap ? [] : retireInto ? [{ entry, sha: retiredSha, retiredAt: now || new Date().toISOString() }] : own;
     const { back, skipped } = collectRetiredSources(list, swap ? [] : own);
     const restored = back.map((s) => (SHA_RE.test(s.sha ?? '') ? { ...s.entry, tipSha: s.sha } : s.entry));
     const next = list.slice(0, idx).concat(restored, list.slice(idx + 1));

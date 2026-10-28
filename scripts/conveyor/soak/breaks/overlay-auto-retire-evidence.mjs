@@ -1,7 +1,7 @@
 /** PR #5964: retirement must honor explicit shadow and fresh per-ref evidence. */
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { prepareRebuild } from '../../../lib/daemon-rebuild/prepare.mjs';
 import { rebuildClone } from '../../../lib/daemon-rebuild.mjs';
@@ -25,6 +25,8 @@ export default {
         && readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8').includes('plan = unavailablePinned ??')
         && readFileSync(join(root, 'scripts/lib/daemon-overlays.mjs'), 'utf8').includes('expectedRequiredOverlay')
         && readFileSync(join(root, 'scripts/lib/daemon-overlays.mjs'), 'utf8').includes('retiredSources')
+        && readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8').includes('supersededSnapshots(overlaysBefore)')
+        && readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8').includes('sameRegistration(o, raw)')
         && readFileSync(join(root, 'scripts/lib/daemon-overlay-auto-retire.mjs'), 'utf8').includes('persistTipShas');
     } catch { return false; }
   },
@@ -182,6 +184,7 @@ export default {
     finally { rmSync(root, { recursive: true, force: true }); }
     await retirementRecovery(violation);
     await retirementRecovery(violation, { rewrite: true });
+    await registrationLifecycle(violation);
     for (const check of await registrationEvidenceReplay()) {
       if (!check.ok) violation(check.name, JSON.stringify(check.observed));
     }
@@ -374,6 +377,112 @@ async function retirementRecovery(violation, { rewrite = false } = {}) {
       violation(rewrite ? 'force-pushed-container-loses-source-in-build' : 'closed-container-loses-source-in-build',
         `the next candidate must carry lower's commit and file (${second.result?.reason ?? 'candidate'})`);
     }
+  } catch (error) { violation('crash', String(error?.message ?? error)); }
+  finally { rmSync(root, { recursive: true, force: true }); }
+}
+
+/** PR #5964 send-back round 13, real Git and real preparation: which registration of a reused ref is current.
+ *  1. X/PR1 retires into C1; X is re-registered as PR2 and retires into C2; PR1, C1 and C2 then close. Recovery
+ *     must restore X/PR2 from C2, never the obsolete X/PR1 from C1, and the build must proceed.
+ *  2. Y/PR21 is adopted carrying a mechanism file and squash-lands; Y is re-registered as PR22 with its branch
+ *     gone. The new registration must not inherit PR21's adopted pin (no pinned-overlay-unavailable hold). */
+async function registrationLifecycle(violation) {
+  const root = mkdtempSync(join(tmpdir(), 'overlay-lifecycle-soak-'));
+  const env = {
+    WE_DAEMON_OVERLAY_DIR: join(root, 'store'), WE_DAEMON_STATE_DIR: join(root, 'state'),
+    WE_DAEMON_EVENTS: join(root, 'events.jsonl'), WE_PLATFORM_PREFERENCES_FILE: join(root, 'prefs.json'),
+    WE_DAEMON_AUTO_REBASE: '0', WE_DAEMON_OVERLAY_AUTO_RETIRE: 'on',
+  };
+  const git = (args) => spawnSync('git', ['-c', 'user.name=Soak', '-c', 'user.email=soak@example.test', ...args], {
+    cwd: root, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+  });
+  const ok = (...args) => {
+    const result = git(args);
+    if (result.status !== 0) throw new Error(String(result.stderr));
+    return String(result.stdout).trim();
+  };
+  const commit = (file) => {
+    mkdirSync(dirname(join(root, file)), { recursive: true });
+    writeFileSync(join(root, file), file);
+    ok('add', file); ok('commit', '-qm', file);
+    return ok('rev-parse', 'HEAD');
+  };
+  const entries = () => readOverlayState(root, { env }).overlays;
+  const refs = () => entries().map((o) => o.ref).join(',');
+  const closed = new Set();
+  const prepare = async () => {
+    const prepared = await prepareRebuild({ root, env, run: git, now: Date.now, mainOnly: false,
+      prState: async (pr) => (closed.has(pr) ? 'CLOSED' : 'OPEN'), prBaseChain: async () => [] });
+    if (prepared.lease) {
+      try {
+        const state = readRebuildState(root, env);
+        releaseBuildLease(state, prepared.lease);
+        writeRebuildState(root, state, env);
+      } finally { ACTIVE_BUILD_TOKENS.delete(prepared.lease.token); }
+    }
+    return prepared;
+  };
+  try {
+    writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, '{}');
+    ok('init', '-q', '-b', 'main');
+    const initial = commit('base');
+    ok('checkout', '-qb', 'x', initial); const pr1 = commit('x-pr1');
+    ok('checkout', '-qb', 'c1', pr1); commit('c1');
+    ok('checkout', '-q', 'main');
+    ok('clone', '--bare', '-q', root, join(root, 'origin.git'));
+    ok('remote', 'add', 'origin', join(root, 'origin.git'));
+    ok('fetch', '-q', 'origin', '+refs/heads/main:refs/remotes/origin/main');
+    addOverlay(root, { ref: 'x', pr: 1 }, { env });
+    addOverlay(root, { ref: 'c1', pr: 11 }, { env });
+    await prepare();
+    if (refs() !== 'c1') violation('lifecycle-pr1-not-archived', `expected X/PR1 retired into c1, got ${refs()}`);
+    // PR1 is abandoned; PR2 reuses branch x with different content and is carried by C2.
+    ok('checkout', '-qB', 'x', initial); const pr2 = commit('x-pr2');
+    ok('checkout', '-qb', 'c2', pr2); commit('c2');
+    ok('checkout', '-q', 'main');
+    ok('push', '-q', '--force', 'origin', 'x', 'c2');
+    closed.add(1);
+    addOverlay(root, { ref: 'x', pr: 2 }, { env });
+    addOverlay(root, { ref: 'c2', pr: 12 }, { env });
+    await prepare();
+    if (refs() !== 'c1,c2') violation('lifecycle-pr2-not-archived', `expected X/PR2 retired into c2, got ${refs()}`);
+    closed.add(11); closed.add(12);
+    const recovered = await prepare();
+    const x = entries().find((o) => o.ref === 'x');
+    const plan = recovered.plan ?? recovered.result?.plan;
+    if (recovered.result?.reason === 'overlay-source-unavailable' || x?.pr !== 2) {
+      violation('obsolete-archive-restored', `closing both carriers restored ${x ? `X/PR${x.pr}` : 'nothing'} (${recovered.result?.reason ?? 'candidate'})`);
+    }
+    if (!plan?.applied?.some((o) => o.ref === 'x' && o.pr === 2)
+      || git(['merge-base', '--is-ancestor', pr2, plan.finalSha]).status !== 0) {
+      violation('newest-archive-missing-from-build', `the candidate must carry X/PR2 (${recovered.result?.reason ?? 'candidate'})`);
+    }
+
+    writeOverlays(root, [], { env });
+    ok('checkout', '-qb', 'y', initial); const mechanism = commit('scripts/lib/daemon-rebuild.mjs');
+    ok('checkout', '-q', 'main');
+    ok('push', '-q', 'origin', 'y');
+    addOverlay(root, { ref: 'y', pr: 21 }, { env });
+    const built = await prepare();
+    const builtPlan = built.plan ?? built.result?.plan;
+    const input = builtPlan?.applied?.find((o) => o.ref === 'y');
+    const pr21 = entries().find((o) => o.ref === 'y');
+    if (input?.sha !== mechanism || input.registrationId !== pr21?.registrationId) {
+      violation('adopted-input-lacks-registration', `the applied input must name its registration (${JSON.stringify(input)})`);
+    }
+    // PR21 squash-lands and its branch is deleted; the clone still runs the build that applied it.
+    ok('checkout', '-q', 'y', '--', 'scripts/lib/daemon-rebuild.mjs'); ok('commit', '-qm', 'squash y');
+    ok('push', '-q', 'origin', 'main');
+    ok('push', '-q', 'origin', '--delete', 'y');
+    writeRebuildState(root, { ...readRebuildState(root, env), adopted: { head: ok('rev-parse', 'HEAD'),
+      mainSha: initial, applied: builtPlan?.applied ?? [], inputsKey: builtPlan?.inputsKey ?? null } }, env);
+    closed.add(21);
+    addOverlay(root, { ref: 'y', pr: 22 }, { env });
+    const reregistered = await prepare();
+    if (reregistered.result?.reason === 'pinned-overlay-unavailable') {
+      violation('reregistration-inherits-adopted-pin', 'Y/PR22 was held on the mechanism pin of the adopted Y/PR21 input');
+    }
+    if (entries().find((o) => o.ref === 'y')?.pr !== 22) violation('reregistration-lost', `Y/PR22 left the registry (${refs()})`);
   } catch (error) { violation('crash', String(error?.message ?? error)); }
   finally { rmSync(root, { recursive: true, force: true }); }
 }

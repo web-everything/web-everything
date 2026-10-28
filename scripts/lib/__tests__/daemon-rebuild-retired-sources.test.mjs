@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 import { autoRetireOverlays } from '../daemon-overlay-auto-retire.mjs';
-import { overlayFilePath, readOverlayState, reinstateOverlaySources, writeOverlays } from '../daemon-overlays.mjs';
+import { addOverlay, overlayFilePath, readOverlayState, reinstateOverlaySources, removeOverlay, writeOverlays } from '../daemon-overlays.mjs';
 import { writeRebuildState } from '../daemon-rebuild/state.mjs';
 
 // Exercise preparation and real registry storage without network or .git writes.
@@ -30,8 +30,9 @@ vi.mock('../daemon-overlays.mjs', async (original) => {
 });
 vi.mock('../daemon-rebuild/plan.mjs', async (original) => ({
   ...await original(),
-  planRebuild: async ({ overlays }) => {
+  planRebuild: async ({ overlays, ...rest }) => {
     model.plans.push(overlays.map((o) => o.ref));
+    if (model.planner) return model.planner({ overlays, ...rest });
     const applied = overlays.filter((o) => !(model.closed && o.ref === 'top'));
     const carries = applied.some((o) => o.ref === 'lower' || (o.ref === 'top' && !model.rewritten));
     return { ok: true, upToDate: true, mainSha: '1'.repeat(40), finalSha: (carries ? '4' : '5').repeat(40),
@@ -47,7 +48,7 @@ afterEach(() => { if (root) rmSync(root, { recursive: true, force: true }); });
 function fixture() {
   root = mkdtempSync(join(tmpdir(), 'retired-sources-'));
   Object.assign(model, { plans: [], rewritten: false, closed: false, missing: false, gitError: false,
-    lowerTip: '2', persisted: [], failTips: false, failAudit: false });
+    lowerTip: '2', persisted: [], failTips: false, failAudit: false, planner: null });
   const env = { WE_DAEMON_OVERLAY_DIR: join(root, 'overlays'), WE_DAEMON_STATE_DIR: join(root, 'state'),
     WE_DAEMON_EVENTS: join(root, 'events'), WE_PLATFORM_PREFERENCES_FILE: join(root, 'preferences'),
     WE_DAEMON_AUTO_REBASE: '0', WE_DAEMON_OVERLAY_AUTO_RETIRE: 'on', WE_DAEMON_OVERLAY_EDGE_RESOLVE: '0' };
@@ -259,6 +260,102 @@ describe('archived sources remain represented in preparation', () => {
     mkdirSync(audit);
     expect(() => reinstateOverlaySources(root, 'top', { env: f.env, expectedOverlay: before[0] })).toThrow();
     expect(readOverlayState(root, { env: f.env }).overlays).toEqual(before);
+  });
+
+  // Send-back round 13, item 1: retire X/PR1 into C1, re-register X/PR2, retire it into C2 (optionally nested
+  // one level deeper in C3). Only the newest archive of X is current, whichever carrier is visited first.
+  const [A, B, F] = ['a', 'b', 'c'].map((c) => c.repeat(40));
+  function archivedTwice(f, { nested = false } = {}) {
+    f.env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'off';
+    writeOverlays(root, [], { env: f.env });
+    addOverlay(root, { ref: 'x', pr: 1 }, { env: f.env });
+    addOverlay(root, { ref: 'c1', pr: 11 }, { env: f.env });
+    removeOverlay(root, 'x', { env: f.env, requireRef: 'c1', retireInto: true, retiredSha: A, now: '2026-10-01T00:00:00.000Z' });
+    addOverlay(root, { ref: 'x', pr: 2 }, { env: f.env });
+    addOverlay(root, { ref: 'c2', pr: 12 }, { env: f.env });
+    removeOverlay(root, 'x', { env: f.env, requireRef: 'c2', retireInto: true, retiredSha: B, now: '2026-10-02T00:00:00.000Z' });
+    if (nested) {
+      addOverlay(root, { ref: 'c3', pr: 13 }, { env: f.env });
+      // C2 is a carrier whose tip is X/PR2's: any build carrying X/PR2 carries C2's archived commit too.
+      removeOverlay(root, 'c2', { env: f.env, requireRef: 'c3', retireInto: true, retiredSha: B, now: '2026-10-03T00:00:00.000Z' });
+    }
+    return readOverlayState(root, { env: f.env }).overlays;
+  }
+
+  it.each([false, true])('recovery restores the newest archive of a ref across carriers, never an obsolete one (nested=%s)', async (nested) => {
+    const f = fixture();
+    archivedTwice(f, { nested });
+    const pr2 = readOverlayState(root, { env: f.env }).overlays.flatMap(function all(o) {
+      return (o.retiredSources ?? []).flatMap((s) => [s.entry, ...all(s.entry)]);
+    }).find((e) => e.ref === 'x' && e.pr === 2);
+    const closed = new Set([1, 11, 12, 13]);
+    model.planner = async ({ overlays, prState }) => {
+      const applied = [];
+      const decisions = [];
+      for (const o of overlays) {
+        const gone = (await prState(o.pr)) === 'CLOSED';
+        decisions.push({ ref: o.ref, pr: o.pr, action: gone ? 'remove' : 'apply', reason: gone ? 'pr-closed' : 'applied' });
+        if (!gone) applied.push({ ref: o.ref, pr: o.pr, sha: B });
+      }
+      return { ok: true, upToDate: true, mainSha: '1'.repeat(40), finalSha: applied.length ? F : '1'.repeat(40),
+        applied, decisions, alerts: [], establishedLost: [], inputsKey: 'test' };
+    };
+    const next = await f.prepare({
+      prState: async (pr) => (closed.has(pr) ? 'CLOSED' : 'OPEN'),
+      run: (args) => {
+        const [cmd, ...rest] = args;
+        if (cmd === 'rev-parse' && /\/x(\^\{commit\})?$/.test(rest.at(-1))) return { status: 0, stdout: B };
+        if (cmd === 'for-each-ref' && rest.at(-1).endsWith('/x')) return { status: 0, stdout: `${rest.at(-1)} ${B}` };
+        if (cmd === 'merge-base' && rest[0] === '--is-ancestor' && rest[1] === B && rest[2] === F) return { status: 0, stdout: '' };
+        return f.git(args);
+      },
+    });
+    expect(next.alerts.filter((a) => a.kind === 'overlay-source-unavailable')).toEqual([]);
+    expect(next.result.reason).toBe('up-to-date');
+    const x = readOverlayState(root, { env: f.env }).overlays.find((o) => o.ref === 'x');
+    expect(x).toMatchObject({ pr: 2, registrationId: pr2.registrationId, tipSha: B });
+    // The adopted inputs name the registration they were built from (send-back item 2's evidence).
+    expect(next.result.plan.applied).toEqual([{ ref: 'x', pr: 2, sha: B, registrationId: pr2.registrationId }]);
+  });
+
+  it.each([false, true])('removing a carrier never restores a ref whose newer archive sits on another carrier (nested=%s)', (nested) => {
+    const f = fixture();
+    archivedTwice(f, { nested });
+    const first = removeOverlay(root, 'c1', { env: f.env });
+    expect(first.reinstated).toEqual([]);
+    expect(first.list.map((o) => o.ref)).toEqual([nested ? 'c3' : 'c2']);
+    const second = removeOverlay(root, nested ? 'c3' : 'c2', { env: f.env });
+    expect(second.reinstated).toEqual(nested ? ['c2'] : ['x']);
+    const x = nested ? removeOverlay(root, 'c2', { env: f.env }).list.find((o) => o.ref === 'x')
+      : second.list.find((o) => o.ref === 'x');
+    expect(x).toMatchObject({ pr: 2, tipSha: B });
+  });
+
+  // Send-back round 13, item 2: an adopted input pins only the registration it was built from.
+  it.each([
+    { name: 'a new PR re-registering the ref', applied: { pr: 1, registrationId: 'r1' }, pinned: false },
+    { name: 'a same-PR re-registration', applied: { pr: 2, registrationId: 'r1' }, pinned: false },
+    { name: 'a legacy record of another PR', applied: { pr: 1 }, pinned: false },
+    { name: 'the identical registration', applied: { pr: 2, registrationId: 'r2' }, pinned: true },
+    { name: 'a legacy record of the same PR (cannot prove a new registration)', applied: { pr: 2 }, pinned: true },
+  ])('an unavailable registration inherits a mechanism pin only from its own adopted input: $name', async ({ applied, pinned }) => {
+    const f = fixture();
+    writeOverlays(root, [{ ref: 'x', pr: 2, registrationId: 'r2', addedAt: '2026-10-02T00:00:00.000Z' }], { env: f.env });
+    writeRebuildState(root, { adopted: { head: '1'.repeat(40), mainSha: '1'.repeat(40),
+      applied: [{ ref: 'x', sha: A, ...applied }] } }, f.env);
+    const next = await f.prepare({ run: (args) => {
+      if (args[0] === 'fetch' && args.some((a) => a.includes('heads/x:'))) return { status: 1, stdout: '' };
+      if (args[0] === 'diff' && args.includes(A)) return { status: 0, stdout: 'scripts/lib/daemon-rebuild.mjs\n' };
+      return f.git(args);
+    } });
+    if (pinned) {
+      expect(next.result.reason).toBe('pinned-overlay-unavailable');
+    } else {
+      expect(next.result.reason).not.toBe('pinned-overlay-unavailable');
+      expect(next.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-fetch-unverifiable',
+        detail: expect.objectContaining({ refs: ['x'] }) }));
+    }
+    expect(f.refs()).toEqual(['x']);
   });
 
   it('restoration preserves duplicate snapshots and recovers older nested sources', () => {
