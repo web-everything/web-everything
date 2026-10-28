@@ -49,6 +49,10 @@ describe('evaluateEligibility', () => {
   ])('refuses: %s', (_n, p) => {
     expect(evaluateEligibility(p, deps()).eligible).toBe(false);
   });
+  it('ignores the review-gate hold check too', () => {
+    const p = pr({ statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS' }, { name: 'review-gate', conclusion: 'FAILURE' }] });
+    expect(evaluateEligibility(p, deps()).eligible).toBe(true);
+  });
   it('refuses when the net diff still scores humanRequired', () => {
     expect(evaluateEligibility(pr(), deps({ scoreNet: () => ({ scored: true, humanRequired: true }) })).eligible).toBe(false);
   });
