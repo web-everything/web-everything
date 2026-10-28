@@ -94,8 +94,9 @@ export function latestCheckNamed(rollup, name) {
 
 /** Every conclusion (or legacy StatusContext `state`) that means a check DEFINITIVELY failed. The one list the
  *  drain's `isRequiredCheckFailed` and the card group's dissolve read (xym8nt4: a copy of it in card-group.mjs
- *  missed ACTION_REQUIRED/STARTUP_FAILURE, so a combined PR the drain would never land kept its sources held). */
-export const FAILED_CHECK_CONCLUSIONS = Object.freeze(['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE', 'STALE']);
+ *  missed ACTION_REQUIRED/STARTUP_FAILURE, so a combined PR the drain would never land kept its sources held).
+ *  STALE is terminal without a definitive verdict; requiring SUCCESS still prevents landing it. */
+export const FAILED_CHECK_CONCLUSIONS = Object.freeze(['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE']);
 
 /** Did this (already latest) check row definitively fail? `null`/missing is not failed. Pure. */
 export function isFailedCheckRow(c) {
@@ -168,13 +169,15 @@ function latestOf(runs) {
  * A run still in flight (no real `completedAt` — absent or the zero date) is the newest; otherwise the greatest
  * `completedAt` wins, falling back to a real `startedAt` for completed runs whose completion timestamp is
  * unavailable. Ties are broken by position (later wins). Any run with no usable timestamp at all keeps the
- * old positional rule for the whole group. Otherwise in-flight runs win before a mix of completion and
- * fallback start timestamps fails closed to the last definitively failed run, then the last non-passing run
+ * old positional rule for the whole group. Otherwise in-flight runs win first. With mixed completion and
+ * fallback start timestamps, a sole start-only run wins when it began after every other run completed.
+ * Overlapping or ambiguous times fail closed to the last failed or stale run, then the last non-passing run
  * (conclusion or legacy `state`, with success/neutral/skipped passing case-insensitively), or the positional
  * last run if all runs pass.
  */
 function latestByTime(runs) {
   const kinds = new Set();
+  const startOnly = [];
   const stamp = (c) => {
     const done = Date.parse(c?.completedAt);
     if (Number.isFinite(done) && done > Date.parse('2000-01-01T00:00:00Z')) {
@@ -187,6 +190,7 @@ function latestByTime(runs) {
       const started = Date.parse(c?.startedAt);
       if (Number.isFinite(started) && started > Date.parse('2000-01-01T00:00:00Z')) {
         kinds.add('startedAt');
+        startOnly.push(c);
         return started;
       }
     }
@@ -197,7 +201,13 @@ function latestByTime(runs) {
   const pending = stamps.lastIndexOf(Infinity);
   if (pending !== -1) return runs[pending];
   if (kinds.size > 1) {
-    return runs.findLast(isFailedCheckRow)
+    // A start after every other completion proves ordering without comparing overlapping clocks.
+    if (startOnly.length === 1) {
+      const index = runs.indexOf(startOnly[0]);
+      if (stamps.every((stamp, i) => i === index || stamp < stamps[index])) return startOnly[0];
+    }
+    // STALE is unsafe freshness evidence, but is not a definitive failure for drain/group consumers.
+    return runs.findLast(c => isFailedCheckRow(c) || String(c?.conclusion ?? c?.state ?? '').toUpperCase() === 'STALE')
       ?? runs.findLast((c) => !['success', 'neutral', 'skipped'].includes(String(c?.conclusion ?? c?.state ?? '').toLowerCase()))
       ?? runs[runs.length - 1];
   }

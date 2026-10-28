@@ -69,11 +69,40 @@ describe('rollup collapse is order-independent without run ids (live #4290, 2026
     const success = { context: 'test', state: 'sUcCeSs', completedAt: '2026-10-27T10:00:00Z' };
     expect(collapseRollupToLatestPerName([failure, success])).toEqual([failure]);
   });
-  it.each(['SUCCESS', 'sUcCeSs', 'nEuTrAl', 'sKiPpEd'])('all-passing mixed timestamp kinds keep the positional last run: %s', conclusion => {
-    const started = run('test', 'SUCCESS', undefined, { startedAt: '2026-10-27T11:00:00Z' });
+  it.each(['SUCCESS', 'sUcCeSs', 'nEuTrAl', 'sKiPpEd'])('overlapping all-passing mixed timestamp kinds keep the positional last run: %s', conclusion => {
+    const started = run('test', 'SUCCESS', undefined, { startedAt: '2026-10-27T09:00:00Z' });
     const completed = run('test', conclusion, '2026-10-27T10:00:00Z');
     expect(collapseRollupToLatestPerName([started, completed])).toEqual([completed]);
     expect(collapseRollupToLatestPerName([completed, started])).toEqual([started]);
+  });
+  it.each(['SUCCESS', 'NEUTRAL', 'SKIPPED', 'FAILURE', 'CANCELLED', 'STALE'])(
+    'a completed rerun starting after every other completion supersedes prior failures: %s', conclusion => {
+      const older = run('merge-gate', 'FAILURE', '2026-10-27T10:00:00Z');
+      const newest = run('merge-gate', conclusion, undefined, { startedAt: '2026-10-27T11:00:00Z' });
+      for (const rows of [[older, newest], [newest, older]]) {
+        expect(collapseRollupToLatestPerName(rows)).toEqual([newest]);
+      }
+    });
+  it.each(['SUCCESS', 'sUcCeSs', 'nEuTrAl', 'sKiPpEd'])(
+    'a sole start after all completions proves the latest run even when all runs pass: %s', conclusion => {
+      const started = run('test', 'SUCCESS', undefined, { startedAt: '2026-10-27T11:00:00Z' });
+      const completed = run('test', conclusion, '2026-10-27T10:00:00Z');
+      expect(collapseRollupToLatestPerName([started, completed])).toEqual([started]);
+      expect(collapseRollupToLatestPerName([completed, started])).toEqual([started]);
+    });
+  it('equal start and completion timestamps do not prove the failure was superseded', () => {
+    const failure = run('test', 'FAILURE', '2026-10-27T10:00:00Z');
+    const success = run('test', 'SUCCESS', undefined, { startedAt: '2026-10-27T10:00:00Z' });
+    expect(collapseRollupToLatestPerName([failure, success])).toEqual([failure]);
+    expect(collapseRollupToLatestPerName([success, failure])).toEqual([failure]);
+  });
+  it('a later start cannot prove ordering against another start-only completed run', () => {
+    const failure = run('test', 'FAILURE', '2026-10-27T10:00:00Z');
+    const started = run('test', 'SUCCESS', undefined, { startedAt: '2026-10-27T11:00:00Z' });
+    const alsoStarted = run('test', 'SUCCESS', undefined, { startedAt: '2026-10-27T12:00:00Z' });
+    for (const rows of [[failure, started, alsoStarted], [alsoStarted, started, failure]]) {
+      expect(collapseRollupToLatestPerName(rows)).toEqual([failure]);
+    }
   });
   it('an in-flight rerun outranks both completed timestamp kinds in every input order', () => {
     const pending = { __typename: 'CheckRun', name: 'test', status: 'QUEUED', completedAt: '0001-01-01T00:00:00Z' };
