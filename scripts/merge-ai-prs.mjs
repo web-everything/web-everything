@@ -4386,11 +4386,11 @@ export function permissionChangeForCandidate(score) {
  * scored yet silently never reach the gate, and a test can drive a real `scoreEscalation` result straight through.
  * @param {{score: object, labels: any, deviation?: string|null, netScored?: boolean, humanPinned?: boolean}} candidate
  */
-export function drainGateInputs({ score, labels, deviation = null, netScored = false, humanPinned = false }) {
+export function drainGateInputs({ score, labels, deviation = null, netScored = false, humanPinned = true }) {
   return {
     escalate: score.escalate, humanRequired: score.humanRequired, labels,
-    // 6027: a sticky review:human is dropped only on a fresh scored net diff and no operator pin (decideReviewGate).
-    humanScoreFresh: netScored === true, humanPinned: humanPinned === true,
+    // 6027: unknown pin evidence retains review:human, even beside a fresh scored net diff.
+    humanScoreFresh: netScored === true, humanPinned: humanPinned !== false,
     engineTier: engineTierForCandidate(score), deviation,
     permissionChange: permissionChangeForCandidate(score),
   };
@@ -6055,9 +6055,12 @@ async function runCli() {
       // `blockedBy` resolves. Flip `engineTierForCandidate` to delegate to `basisTouchesEngineTier(score)` once
       // `#2410` ships that writer — do not re-inline the computation here when that day comes, keep it in one
       // named, tested place.
-      // No reliable operator human-pin record exists here. parseOperatorClearance records a clearance,
-      // not a ruling to retain review:human, and its bare actor record may be forged or stale.
-      const humanPinned = false;
+      // Fail closed: no source here proves the CURRENT review:human is exclusively score-driven.
+      // Even a trusted-author drain marker or ledger row cannot rule out an operator's later/concurrent
+      // hold on the same label (see decideTestGamingPark). Missing, incomplete or unreadable evidence
+      // cannot release it. De-escalation stays wired but inert until sound ownership proof exists;
+      // the operator's sanctioned clear-human ceremony remains the release path.
+      const humanPinned = true;
       const gate = decideDrainReviewGate(
         drainGateInputs({ score, labels: v.prLabels, deviation: v.deviation, netScored, humanPinned }),
         { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo), dryRun: candidateDryRun, ...workflowReadOptions(v) });

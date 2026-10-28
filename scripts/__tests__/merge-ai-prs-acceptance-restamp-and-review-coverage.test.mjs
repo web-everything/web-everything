@@ -753,6 +753,7 @@ describe('PR #4446 — permission-change hold: score -> drain gate hand-off', ()
 
 describe('#6027 — fresh net score de-escalation through the drain handoff', () => {
   const score = { escalate: false, humanRequired: false, signals: {} };
+  // Explicit false exercises the dormant de-escalation seam, not evidence of hold ownership.
   const inputs = (extra = {}) => ({ score, labels: [REVIEW_LABELS.human],
     netScored: true, humanPinned: false, ...extra });
   const drain = (extra = {}) => decideDrainReviewGate(drainGateInputs(inputs(extra)), acceptanceOptions());
@@ -799,6 +800,37 @@ describe('#6027 — fresh net score de-escalation through the drain handoff', ()
     expectKept(drain({ humanPinned: true }));
   });
 
+  it('keeps review:human with unproven provenance despite a fresh low score', () => {
+    const candidate = inputs();
+    delete candidate.humanPinned;
+    const gateInputs = drainGateInputs(candidate);
+    expect(gateInputs).toMatchObject({ humanScoreFresh: true, humanPinned: true });
+    const gate = decideDrainReviewGate(gateInputs, acceptanceOptions());
+    expectKept(gate);
+    const exec = vi.fn();
+    removeDeescalatedHumanLabels({ gate, labels: candidate.labels, dryRun: false, pr: 6027 }, { exec });
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('keeps review:human on a comment read failure despite a fresh low score', () => {
+    const exec = vi.fn(() => { throw new Error('comments unavailable'); });
+    const gate = decideDrainReviewGate(drainGateInputs(inputs({
+      humanPinned: undefined, labels: [REVIEW_LABELS.human, REVIEW_LABELS.accepted],
+    })), { ...acceptanceOptions(), exec });
+    expect(exec).toHaveBeenCalled();
+    expect(gate).toMatchObject({ action: 'defer', applyLabel: null });
+    expect(gate.deescalatedHuman).not.toBe(true);
+    expect(gate.removeLabels ?? []).not.toContain(REVIEW_LABELS.human);
+    const edit = vi.fn();
+    removeDeescalatedHumanLabels({ gate, labels: [REVIEW_LABELS.human], dryRun: false, pr: 6027 }, { exec: edit });
+    expect(edit).not.toHaveBeenCalled();
+  });
+
+  it('pins the production hold unconditionally until current score-driven ownership can be proven', () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
+    expect(src).toMatch(/const humanPinned = true;\s*const gate = decideDrainReviewGate\(\s*drainGateInputs\(\{\s*score,\s*labels: v\.prLabels,\s*deviation: v\.deviation,\s*netScored,\s*humanPinned\s*\}\)/);
+  });
+
   it('keeps review:human when the fresh score still requires a human', () => {
     expectKept(drain({ score: { ...score, escalate: true, humanRequired: true } }));
   });
@@ -814,10 +846,11 @@ describe('#6027 — fresh net score de-escalation through the drain handoff', ()
     expect(drainGateInputs(inputs())).toMatchObject({ humanScoreFresh: true, humanPinned: false });
   });
 
-  it.each([undefined, null, false, 'true', 1])('only explicit true proves freshness or a pin (%s)', (value) => {
+  it.each([undefined, null, false, 'true', 1])('only explicit true proves freshness; unknown pin evidence stays pinned (%s)', (value) => {
     expect(drainGateInputs(inputs({ netScored: value, humanPinned: value }))).toMatchObject({
-      humanScoreFresh: false, humanPinned: false,
+      humanScoreFresh: false, humanPinned: value !== false,
     });
+    if (value !== false) expectKept(drain({ humanPinned: value }));
   });
 
   it('never de-escalates review:human beside review:accepted, even on a fresh low score', () => {
