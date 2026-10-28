@@ -142,6 +142,10 @@ export async function buildSiblingManifest({cwd = process.cwd(), exec = defaultE
   try {
     const status = await git(['status','--porcelain','-z','--untracked-files=all','--',...SIBLING.paths]);
     if (status.code !== 0 || protocolText(status.stdout,LIMIT).length) throw new Error('Sibling is dirty or status unavailable');
+    // Index flags can hide modified bytes from status; only ordinary cached entries are safe.
+    const flags = await git(['ls-files','-v','-z','--',...SIBLING.paths]);
+    if (flags.code !== 0 || splitPaths(flags.stdout).some(record => record[0] !== 72 || record[1] !== 32 || record.length < 3))
+      throw new Error('Sibling index flags are unsafe or unavailable');
   } catch (error) {throw failure('sibling-dirty',error);}
   try {
     const manifest = await buildManifest({cwd:root,exec,fs,pathspecs:SIBLING.paths});

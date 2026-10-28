@@ -949,7 +949,7 @@ describe('sibling root snapshot acceptance', () => {
     expect(calls.indexOf(copies[0])).toBeLessThan(calls.indexOf(copies[1]));
     expect(calls.indexOf(copies[1])).toBeLessThan(calls.findIndex(isRun));
     const inventories = calls.filter(call => call.file === 'git' && call.cwd === f.sibling && call.args[0] === 'ls-files');
-    expect(inventories).toHaveLength(3);
+    expect(inventories).toHaveLength(4);
     for (const call of inventories) expect(call.args.slice(-3)).toEqual(['--','plugs','webtheme']);
   });
 
@@ -980,6 +980,16 @@ describe('sibling root snapshot acceptance', () => {
     expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
     expect(remoteManifestAPI.buildSiblingManifest).toBeTypeOf('function');
     await expect(remoteManifestAPI.buildSiblingManifest({cwd:f.cwd,exec:f.exec})).rejects.toMatchObject({code:reason});
+  });
+
+  it.each(['--assume-unchanged','--skip-worktree'])('falls back for modified sibling bytes hidden by %s', async flag => {
+    const f = siblingFixture();
+    f.gitAt(f.sibling,['update-index',flag,'--','plugs/runtime.js']);
+    writeFileSync(join(f.sibling,'plugs','runtime.js'),'changed bytes hidden from status');
+    expect(f.gitAt(f.sibling,['status','--porcelain','-z','--untracked-files=all','--','plugs','webtheme'])).toBe('');
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'sibling-dirty'});
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+    await expect(remoteManifestAPI.buildSiblingManifest({cwd:f.cwd,exec:f.exec})).rejects.toMatchObject({code:'sibling-dirty'});
   });
 
   it.each(['file symlink','directory symlink','missing alias','empty alias'])('refuses a clean but unsafe sibling: %s', async kind => {
