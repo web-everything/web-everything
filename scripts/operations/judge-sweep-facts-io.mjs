@@ -28,7 +28,8 @@ import { openOperatorSendBacks } from '../lib/operator-send-backs.mjs';
 import { parseFindings } from '../review-corpus/mine-review-corpus.mjs';
 import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { resolveHumanReviewSurfaces } from '../lib/human-review-surfaces.mjs';
-import { resolveStallThresholds } from './judge-sweep-facts.mjs';
+import { STALL_DEFAULTS } from './judge-sweep-facts.mjs';
+import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
 export const JUDGE_SWEEP_REPO = CONSTELLATION_REPOS[DEFAULT_REPO_KEY].slug;
 
 const rootDir = () => join(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -38,6 +39,20 @@ const CACHE_BYTES = 128 * 1024;
 // Bump whenever review-core-cli's shape/human-required rules change. Old envelopes are disposable misses.
 const SHAPE_RULES_VERSION = 1;
 const RED_TEAM_JUDGMENT_LABELS = new Set(['red-team:blocked', 'red-team:clear']);
+/** Missing or invalid layers fall through to the next valid, finite positive threshold. */
+export function resolveStallThresholds({ env = process.env, readFile = readFileSync, platform, log } = {}) {
+  let tool, envValues;
+  try { tool = JSON.parse(String(readFile(new URL('../settings/judge-sweep-stall.json', import.meta.url), 'utf8')))?.judgeSweepStall; } catch { /* absent layer */ }
+  try { envValues = JSON.parse(env.WE_JUDGE_SWEEP_STALL); } catch { /* absent layer */ }
+  const pick = value => value && typeof value === 'object' && !Array.isArray(value)
+    ? Object.fromEntries(Object.keys(STALL_DEFAULTS).filter(k => Object.hasOwn(value, k)).map(k => [k, value[k]])) : {};
+  const plat = platform === undefined ? platformPreference('judgeSweepStall', { env, readFile }) : platform;
+  return cascadePolicy('judgeSweepStall', pick(tool), {
+    standard: STALL_DEFAULTS, platform: pick(plat), envValues: pick(envValues), env, log,
+    valid: v => typeof v === 'number' && Number.isFinite(v) && v > 0,
+  }).value;
+}
+
 const failure = what => new Error(`judge-sweep-facts: ${what}; inspect PR evidence and rerun a narrower/operator query`);
 
 /** Operator credential only, through the shared throttle. One attempt keeps the sweep budget inclusive of retries. */

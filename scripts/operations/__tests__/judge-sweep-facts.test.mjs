@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { resolveHumanReviewSurfaces } from '../../lib/human-review-surfaces.mjs';
 import * as judgeSweepFacts from '../judge-sweep-facts.mjs';
+import * as judgeSweepFactsIo from '../judge-sweep-facts-io.mjs';
 import { buildJudgeSweepBundle, finishJudgeSweep, judgeSweepFactsOperation, needsJudgment, JUDGE_SWEEP_REPO } from '../judge-sweep-facts.mjs';
 import { createJudgeSweepFactsReader, createShapeCache, operatorGh } from '../judge-sweep-facts-io.mjs';
 import { resolveOperation } from '../run.mjs';
@@ -239,11 +240,11 @@ describe('stall judgment reasons and compatibility', () => {
 });
 
 describe('stall threshold policy cascade (injected IO only)', () => {
-  const resolve = (tool, env = {}, platform = null) => judgeSweepFacts.resolveStallThresholds({
+  const resolve = (tool, env = {}, platform = null) => judgeSweepFactsIo.resolveStallThresholds({
     env, platform, readFile: () => JSON.stringify({ judgeSweepStall: tool }),
   });
   it('exports a resolver with the standard defaults', () => {
-    expect(judgeSweepFacts.resolveStallThresholds).toBeTypeOf('function');
+    expect(judgeSweepFactsIo.resolveStallThresholds).toBeTypeOf('function');
     expect(resolve(undefined)).toMatchObject(stallDefaults);
   });
   it('resolves standard then platform then tool then the JSON environment override', () => {
@@ -259,7 +260,7 @@ describe('stall threshold policy cascade (injected IO only)', () => {
     expect(resolve(undefined, { WE_JUDGE_SWEEP_STALL: raw })).toMatchObject(stallDefaults);
   });
   it('falls through unreadable settings with an empty environment to standard defaults', () => {
-    expect(judgeSweepFacts.resolveStallThresholds({ env: {}, platform: null,
+    expect(judgeSweepFactsIo.resolveStallThresholds({ env: {}, platform: null,
       readFile: () => { throw new Error('unreadable'); } })).toMatchObject(stallDefaults);
   });
 });

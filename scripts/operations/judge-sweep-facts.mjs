@@ -2,28 +2,12 @@
 import { op } from './registry.mjs';
 import { compute } from './step-kinds.mjs';
 import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
-import { readFileSync } from 'node:fs';
-import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
 
 export const JUDGE_SWEEP_FACTS_OP = 'judge-sweep-facts';
 export const JUDGE_SWEEP_REPO = CONSTELLATION_REPOS[DEFAULT_REPO_KEY].slug;
 
-const STALL_DEFAULTS = Object.freeze({ fixerInfraLoop: 3, needsHumanAgedHours: 6,
+export const STALL_DEFAULTS = Object.freeze({ fixerInfraLoop: 3, needsHumanAgedHours: 6,
   draftWithdrawnAgedHours: 4, waitingFixerMinutes: 45 });
-
-/** Missing or invalid layers fall through to the next valid, finite positive threshold. */
-export function resolveStallThresholds({ env = process.env, readFile = readFileSync, platform, log } = {}) {
-  let tool, envValues;
-  try { tool = JSON.parse(String(readFile(new URL('../settings/judge-sweep-stall.json', import.meta.url), 'utf8')))?.judgeSweepStall; } catch { /* absent layer */ }
-  try { envValues = JSON.parse(env.WE_JUDGE_SWEEP_STALL); } catch { /* absent layer */ }
-  const pick = value => value && typeof value === 'object' && !Array.isArray(value)
-    ? Object.fromEntries(Object.keys(STALL_DEFAULTS).filter(k => Object.hasOwn(value, k)).map(k => [k, value[k]])) : {};
-  const plat = platform === undefined ? platformPreference('judgeSweepStall', { env, readFile }) : platform;
-  return cascadePolicy('judgeSweepStall', pick(tool), {
-    standard: STALL_DEFAULTS, platform: pick(plat), envValues: pick(envValues), env, log,
-    valid: v => typeof v === 'number' && Number.isFinite(v) && v > 0,
-  }).value;
-}
 
 /** First match wins, including when a worker is running on a PR already near its cap. */
 export function needsJudgment(pr, thresholds = STALL_DEFAULTS) {
