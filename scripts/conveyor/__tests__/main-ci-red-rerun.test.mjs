@@ -1,6 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as core from '../main-ci-red-core.mjs';
 import * as io from '../main-ci-red-io.mjs';
@@ -15,6 +14,64 @@ const flake = { runId: 2, eligible: true, reason: 'flaky-signature' };
 const classify = (overrides = {}) => core.classifyFlakeRun({ run: red, failedJobs: ['integration', 'test'], failures: [failure], settings, ...overrides });
 const plan = (overrides = {}) => core.planMainCiRerun({ runs: [green, red, tip], tipSha: tip.headSha, flake, settings, ...overrides });
 
+describe('repeat-proof reruns use the existing conveyor path', () => {
+  const deterministic = { file: 'scripts/lib/__tests__/hermetic-guard.test.mjs', title: 'rejects host IO', error: 'AssertionError: unexpected host IO' };
+  // Pin the switch for behavioral tests; test default declaration separately.
+  const proofSettings = { ...settings, mainCiRedRerunForProof: true };
+  const classifyProof = (overrides = {}) => classify({ failures: [deterministic], settings: proofSettings, ...overrides });
+
+  it('declares a true default, validates boolean overrides and reports setting provenance', () => {
+    const key = 'mainCiRedRerunForProof';
+    expect(core.MAIN_CI_RED_DEFAULTS[key]).toBe(true);
+    expect(core.mainCiRedSettings()[key]).toBe(true);
+    expect(core.mainCiRedSettingSource({}, key)).toBe('standard');
+    expect(core.mainCiRedSettings({ [key]: false })[key]).toBe(false);
+    expect(core.mainCiRedSettingSource({ [key]: false }, key)).toBe('health');
+    expect(core.mainCiRedSettings({ [key]: 'false' })[key]).toBe(true);
+    expect(core.mainCiRedSettingSource({ [key]: 'false' }, key)).toBe('standard');
+  });
+
+  it('classifies a deterministic file failure as eligible for repeat proof', () => {
+    expect(classifyProof()).toEqual({ eligible: true, reason: 'repeat-proof' });
+  });
+
+  it('preserves signature priority over repeat proof', () => {
+    expect(classifyProof({ failures: [failure] })).toEqual({ eligible: true, reason: 'flaky-signature' });
+  });
+
+  it('setting off preserves the old deterministic-failure behavior', () => {
+    expect(classifyProof({ settings: { ...proofSettings, mainCiRedRerunForProof: false } }))
+      .toEqual({ eligible: false, reason: 'not-flaky' });
+  });
+
+  it('attempt >1 still refuses a repeat-proof rerun', () => {
+    expect(classifyProof({ run: { ...red, attempt: 2 } })).toEqual({ eligible: false, reason: 'already-rerun' });
+  });
+
+  it('the global rerun-off switch wins even on attempt 2', () => {
+    expect(classifyProof({ run: { ...red, attempt: 2 }, settings: { ...proofSettings, mainCiRedFlakeRerun: false } }))
+      .toEqual({ eligible: false, reason: 'rerun-off' });
+  });
+
+  it.each([
+    [], null, undefined, {}, [null],
+    [{ title: 'missing file', error: 'AssertionError' }],
+    [{ ...deterministic, file: '' }],
+    [{ ...deterministic, file: 42 }], [deterministic, { title: 'missing file' }],
+  ])('fails closed for empty, incomplete or malformed test failure evidence: %j', (failures) => {
+    expect(classifyProof({ failures })).toEqual({ eligible: false, reason: 'not-flaky' });
+  });
+
+  it('plans exactly one repeat-proof rerun and none once its run id is ledgered', () => {
+    const flake = { runId: red.databaseId, ...classifyProof() };
+    expect(flake).toEqual({ runId: red.databaseId, eligible: true, reason: 'repeat-proof' });
+    const input = { runs: [green, red], tipSha: red.headSha, flake, settings: proofSettings };
+    const planned = core.planMainCiRerun(input);
+    expect(planned).toEqual({ runId: red.databaseId, sha: red.headSha, kind: 'flake', reason: 'repeat-proof' });
+    expect(core.planMainCiRerun({ ...input, reruns: { [red.databaseId]: { kind: 'flake', status: 'issued' } } })).toBeNull();
+  });
+});
+
 describe('flake rules and cancelled tip priority', () => {
   it('parses timestamped ANSI logs, deduplicates and tolerates junk', () => {
     expect(core.parseVitestFailures(`${log}\n${log}`)).toEqual([failure]);
@@ -22,7 +79,9 @@ describe('flake rules and cancelled tip priority', () => {
     expect(core.parseVitestFailures('FAIL a.test.mjs > title\n\ncontext\nTypeError: broken')).toEqual([{ file: 'a.test.mjs', title: 'title', error: 'TypeError: broken' }]);
     expect(core.parseVitestFailures('FAIL a > b\n1\n2\n3\n4\n5\n6\nError: late')[0].error).toBe('');
   });
-  it('requires all failures to match a signature or known flaky test', () => {
+  it('with repeat proof off, requires all failures to match a signature or known flaky test', () => {
+    const settings = { ...core.mainCiRedSettings(), mainCiRedRerunForProof: false };
+    const classify = (overrides = {}) => core.classifyFlakeRun({ run: red, failures: [failure], settings, ...overrides });
     expect(classify()).toEqual({ eligible: true, reason: 'flaky-signature' });
     const assertion = { file: 'other.test.mjs', title: 'assertion', error: 'AssertionError: mismatch' };
     expect(classify({ failures: [failure, assertion] }).eligible).toBe(false);
@@ -63,7 +122,7 @@ const exhaustRerunRounds = (dir) => {
 
 describe('rerun IO and ledger', () => {
   async function fixture(runTest) {
-    const dir = mkdtempSync(join(tmpdir(), 'main-red-rerun-'));
+    const dir = mkdtempSync(join(process.env.TMPDIR, 'main-red-rerun-'));
     const rerun = vi.fn(), dispatch = vi.fn(), publishState = vi.fn();
     const opts = { dir, now: Date.parse('2026-10-14T06:00:00Z'), readRuns: () => ({ runs: [green, red], failing: { flake } }), readPrs: () => [], rerun, dispatch, publishState,
       publishPriority: vi.fn(), gates: async () => ({ killed: false }), listAgents: async () => [] };

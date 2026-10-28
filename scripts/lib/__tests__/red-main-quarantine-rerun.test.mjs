@@ -1,7 +1,6 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resolveQuarantineSettings, runSafetyNet, SAFETY_NET_LEDGER } from '../red-main-quarantine-io.mjs';
 import { planSafetyNet, validateQuarantineList } from '../red-main-quarantine.mjs';
@@ -20,7 +19,7 @@ const originalRun = {
 const rerun = { ...originalRun, attempt: 2, updatedAt: '2026-10-28T11:00:00Z' };
 const dirs = [];
 function temp() {
-  const dir = mkdtempSync(join(tmpdir(), 'quarantine-rerun-'));
+  const dir = mkdtempSync(join(process.env.TMPDIR, 'quarantine-rerun-'));
   dirs.push(dir);
   return dir;
 }
@@ -87,17 +86,12 @@ describe('repeat-failure planner keys evidence by real run id and attempt', () =
   });
 });
 
-function harness({ values = {}, execError } = {}) {
+function harness({ values = {} } = {}) {
   const dir = temp();
   const ledgerPath = join(dir, SAFETY_NET_LEDGER);
   const ledger = () => JSON.parse(readFileSync(ledgerPath, 'utf8'));
   let list = { version: 1, entries: [] };
-  const persistedAtExec = [];
-  const exec = vi.fn(() => {
-    persistedAtExec.push(ledger().reds[sha]);
-    if (execError) throw execError;
-    return '';
-  });
+  const exec = vi.fn(() => '');
   const readJobs = vi.fn(() => ({ failed: [{ id: 501, name: job }], jobs: [] }));
   const readLog = vi.fn(() => failure());
   const readList = vi.fn(() => ({ ok: true, list }));
@@ -107,63 +101,47 @@ function harness({ values = {}, execError } = {}) {
     return result;
   });
   const settings = resolveQuarantineSettings({ env: {}, platform: null, file: join(dir, 'absent.json') });
-  // Pin the new switch here so behavior failures are independent of its default-resolution test.
-  settings.value = { ...settings.value, rerunFailedOnce: true, ...values };
+  settings.value = { ...settings.value, ...values };
   const tick = (run = originalRun, overrides = {}) => runSafetyNet({
     dir, now, repoSlug, mode: { value: 'quarantine', source: 'test' }, settings,
     mainCiRuns: { runs: [run], failing: { runId: run.databaseId, jobs: [job, 'daemon-soak'] } },
     exec, readJobs, readLog, readList, write, touchedFiles: () => [], log: () => {}, ...overrides,
   });
-  return { tick, ledger, ledgerPath, exec, persistedAtExec, readLog, write, list: () => list };
+  const noRerun = () => expect(exec.mock.calls.filter(([, argv]) => argv?.includes('rerun'))).toEqual([]);
+  return { tick, ledger, exec, noRerun, readLog, write, list: () => list };
 }
 
-describe('red-main rerunFailedOnce settings cascade', () => {
-  it('defaults to true with standard provenance and maps the environment switch', () => {
-    const file = join(temp(), 'absent.json');
-    const base = { env: {}, platform: null, file };
-    expect(resolveQuarantineSettings(base)).toMatchObject({ value: { rerunFailedOnce: true }, sources: { rerunFailedOnce: 'standard' } });
-    expect(resolveQuarantineSettings({ ...base, env: { WE_RED_MAIN_QUARANTINE_RERUN_FAILED_ONCE: 'off' } }))
-      .toMatchObject({ value: { rerunFailedOnce: false }, sources: { rerunFailedOnce: 'env' } });
-  });
-
-  it('resolves standard → platform → tool → environment and rejects invalid boolean values', () => {
-    const file = join(temp(), 'settings.json');
-    const base = { file, platform: { rerunFailedOnce: false }, env: {} };
-    expect(resolveQuarantineSettings(base)).toMatchObject({ value: { rerunFailedOnce: false }, sources: { rerunFailedOnce: 'platform' } });
-    writeFileSync(file, JSON.stringify({ redMainQuarantine: { rerunFailedOnce: true } }));
-    expect(resolveQuarantineSettings(base)).toMatchObject({ value: { rerunFailedOnce: true }, sources: { rerunFailedOnce: 'tool' } });
-    expect(resolveQuarantineSettings({ ...base, env: { WE_RED_MAIN_QUARANTINE_RERUN_FAILED_ONCE: 'off' } }))
-      .toMatchObject({ value: { rerunFailedOnce: false }, sources: { rerunFailedOnce: 'env' } });
-    expect(resolveQuarantineSettings({ ...base, env: { WE_RED_MAIN_QUARANTINE_RERUN_FAILED_ONCE: 'on' } }))
-      .toMatchObject({ value: { rerunFailedOnce: true }, sources: { rerunFailedOnce: 'env' } });
-    expect(resolveQuarantineSettings({ ...base, env: { WE_RED_MAIN_QUARANTINE_RERUN_FAILED_ONCE: 'garbage' } }))
-      .toMatchObject({ value: { rerunFailedOnce: true }, sources: { rerunFailedOnce: 'tool' } });
-    writeFileSync(file, JSON.stringify({ redMainQuarantine: { rerunFailedOnce: 'off' } }));
-    expect(resolveQuarantineSettings(base)).toMatchObject({ value: { rerunFailedOnce: false }, sources: { rerunFailedOnce: 'platform' } });
-  });
+const snapshot = (run, jobFailures = { [job]: failure() }) => ({
+  runId: run.databaseId, createdAt: run.createdAt, headSha: run.headSha, jobFailures,
 });
 
-describe('red-main requests one failed-job rerun for repeat evidence', () => {
-  it.each(['failure', 'timed_out'])('persists intent before requesting exactly one completed %s rerun without quarantine writes', (conclusion) => {
-    const h = harness();
-    const out = h.tick({ ...originalRun, conclusion });
-    expect(out.plan).toMatchObject({ action: 'none', why: expect.stringMatching(/not a proven flake/) });
-    expect(h.exec).toHaveBeenCalledOnce();
-    expect(h.exec).toHaveBeenCalledWith('gh', ['run', 'rerun', String(runId), '--repo', repoSlug, '--failed'], {
-      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, killSignal: 'SIGKILL',
-    });
-    const intent = {
-      rerunRequestedFor: sha,
-      rerun: { runId, attempt: 1, requestedAt: now, runKey: `${runId}@${originalRun.updatedAt}`, headSha: sha,
-        createdAt: originalRun.createdAt, jobFailures: { [job]: failure() } },
-    };
-    expect(h.persistedAtExec).toEqual([expect.objectContaining(intent)]);
-    expect(h.ledger().reds[sha]).toMatchObject(intent);
-    expect(out.rerun).toEqual({ requested: true, runId, sha });
-    expect(h.write).not.toHaveBeenCalled();
+describe('red-main passively collects repeat evidence; the conveyor owns reruns', () => {
+  it('removes the duplicate rerun setting from defaults and ignores its old env/tool/platform values', () => {
+    const config = join(temp(), 'settings.json');
+    writeFileSync(config, JSON.stringify({ redMainQuarantine: { rerunFailedOnce: true } }));
+    for (const settings of [
+      resolveQuarantineSettings({ env: {}, platform: null, file: join(temp(), 'absent.json') }),
+      resolveQuarantineSettings({ file: config, platform: { rerunFailedOnce: true },
+        env: { WE_RED_MAIN_QUARANTINE_RERUN_FAILED_ONCE: 'on' } }),
+    ]) {
+      expect(settings.value).not.toHaveProperty('rerunFailedOnce');
+      expect(settings.sources).not.toHaveProperty('rerunFailedOnce');
+    }
   });
 
-  it('quarantines the same file after a second failed attempt on the same run id', () => {
+  it('attempt 1 stores a passive snapshot, adds nothing and never executes a rerun', () => {
+    const h = harness();
+    const out = h.tick();
+    expect(out.plan.action).toBe('none');
+    expect(out.applied).toBe(false);
+    h.noRerun();
+    expect(h.write).not.toHaveBeenCalled();
+    expect(h.ledger().reds[sha]).toMatchObject({ attempts: { 1: snapshot(originalRun) } });
+    expect(h.ledger().reds[sha]).not.toHaveProperty('rerunRequestedFor');
+    expect(h.ledger().reds[sha]).not.toHaveProperty('rerun');
+  });
+
+  it('attempt 2 failing the same file adds quarantine with repeat-failed proof for attempts [1,2]', () => {
     const h = harness({ values: { ttlMin: 15 } });
     h.tick();
     const out = h.tick(rerun);
@@ -174,95 +152,116 @@ describe('red-main requests one failed-job rerun for repeat evidence', () => {
       proof: { kind: 'repeat-failed', runIds: [runId, runId], attempts: [1, 2], shas: [sha, sha], count: 2 },
       expiresAt: now + 15 * 60_000,
     })]);
-    expect(h.exec).toHaveBeenCalledOnce();
-    expect(h.ledger().reds[sha].rerun.jobFailures).toEqual({ [job]: failure() });
+    expect(h.ledger().reds[sha].attempts).toMatchObject({ 1: snapshot(originalRun), 2: snapshot(rerun) });
+    h.noRerun();
   });
 
-  it('does not count a changed updatedAt as another attempt without an attempt increment', () => {
-    const h = harness();
-    h.tick();
-    expect(h.tick({ ...originalRun, updatedAt: rerun.updatedAt }).plan.action).toBe('none');
-    expect(h.exec).toHaveBeenCalledOnce();
-    expect(h.write).not.toHaveBeenCalled();
-  });
-
-  it.each([originalRun.createdAt, undefined, 'invalid'])('refuses rerun evidence without strictly later updatedAt: %s', (updatedAt) => {
-    const h = harness();
-    h.tick();
-    expect(h.tick({ ...rerun, updatedAt }).plan.action).toBe('none');
-    expect(h.exec).toHaveBeenCalledOnce();
-    expect(h.write).not.toHaveBeenCalled();
-  });
-
-  it('keeps a file seen only on attempt 2 unproven and preserves attempt-1 evidence', () => {
-    const h = harness();
-    h.tick();
-    h.readLog.mockReturnValue(failure('scripts/lib/__tests__/different.test.mjs'));
-    expect(h.tick(rerun).plan.action).toBe('none');
-    expect(h.write).not.toHaveBeenCalled();
-    expect(h.ledger().reds[sha].rerun).toMatchObject({ jobFailures: { [job]: failure() } });
-  });
-
-  it('records passed-on-rerun as a flake before returning on green with an empty list', () => {
+  it('attempt 2 passing makes main green, adds nothing and records the flake outcome', () => {
     const h = harness();
     h.tick();
     const out = h.tick({ ...rerun, conclusion: 'success' });
     expect(out.plan).toMatchObject({ action: 'none', why: expect.stringContaining('green') });
     expect(out.rerun).toEqual({ outcome: 'flake' });
-    expect(h.ledger().reds[sha].rerun.outcome).toBe('passed-on-rerun (flake)');
+    expect(h.ledger().reds[sha]).toMatchObject({ attempts: { outcome: 'passed-on-rerun (flake)' } });
     expect(h.write).not.toHaveBeenCalled();
+    expect(h.list().entries).toEqual([]);
+    h.noRerun();
   });
 
-  it.each([false, true])('never retries a request across ticks, including exec error=%s', (throws) => {
-    const h = harness({ execError: throws ? new Error('rerun refused\nremote detail') : undefined });
+  it('attempt 2 failing a different file remains unproven and preserves both snapshots', () => {
+    const h = harness();
+    h.tick();
+    const different = failure('scripts/lib/__tests__/different.test.mjs');
+    h.readLog.mockReturnValue(different);
+    expect(h.tick(rerun).plan.action).toBe('none');
+    expect(h.write).not.toHaveBeenCalled();
+    expect(h.ledger().reds[sha].attempts).toMatchObject({
+      1: snapshot(originalRun), 2: snapshot(rerun, { [job]: different }),
+    });
+    h.noRerun();
+  });
+
+  it('notes a flake when main goes green after multiple observed failed attempts', () => {
+    const h = harness();
+    h.tick();
+    h.readLog.mockReturnValue(failure('scripts/lib/__tests__/different.test.mjs'));
+    h.tick(rerun);
+    const out = h.tick({ ...rerun, databaseId: runId + 1, headSha: 'b'.repeat(40), conclusion: 'success',
+      createdAt: '2026-10-28T11:30:00Z' });
+    expect(out.rerun).toEqual({ outcome: 'flake' });
+    expect(h.ledger().reds[sha]).toMatchObject({ attempts: { outcome: 'passed-on-rerun (flake)' } });
+    expect(h.write).not.toHaveBeenCalled();
+    h.noRerun();
+  });
+
+  it('same run id and same attempt never count twice, even with a changed updatedAt', () => {
+    const h = harness();
     h.tick();
     h.tick();
+    expect(h.tick({ ...originalRun, updatedAt: rerun.updatedAt }).plan.action).toBe('none');
+    expect(h.write).not.toHaveBeenCalled();
+    h.noRerun();
+  });
+
+  it.each([1, 2])('in-progress attempt %s adds nothing', (attempt) => {
+    const h = harness();
     h.tick();
-    expect(h.exec).toHaveBeenCalledOnce();
-    expect(h.ledger().reds[sha].rerunRequestedFor).toBe(sha);
-    if (throws) expect(h.ledger().reds[sha].rerun.error).toBe('rerun refused');
-    expect(h.write).not.toHaveBeenCalled();
-  });
-
-  it('does not rerun an in-progress workflow', () => {
-    const h = harness();
-    h.tick({ ...originalRun, status: 'in_progress', conclusion: null });
-    expect(h.exec).not.toHaveBeenCalled();
-    expect(h.ledger().reds[sha]?.rerunRequestedFor).toBeUndefined();
-    expect(h.write).not.toHaveBeenCalled();
-  });
-
-  it('keeps the old none plan when rerunFailedOnce is disabled', () => {
-    const h = harness({ values: { rerunFailedOnce: false } });
-    expect(h.tick().plan).toMatchObject({ action: 'none', why: expect.stringMatching(/not a proven flake/) });
-    expect(h.exec).not.toHaveBeenCalled();
-    expect(h.ledger().reds[sha].rerunRequestedFor).toBeUndefined();
-    expect(h.write).not.toHaveBeenCalled();
-  });
-
-  it.each([{ live: false }, { mode: { value: 'stop', source: 'test' } }])('reports a shadow request without executing or recording intent: %j', (overrides) => {
-    const h = harness();
-    const out = h.tick(originalRun, overrides);
-    expect(out.rerun).toEqual({ requested: false, shadow: true, wouldRequest: { runId, sha } });
-    expect(h.exec).not.toHaveBeenCalled();
-    expect(h.write).not.toHaveBeenCalled();
-    expect(h.ledger().reds[sha].rerunRequestedFor).toBeUndefined();
-    expect(h.ledger().reds[sha].rerun).toBeUndefined();
-  });
-
-  it('refuses incomplete evidence from any failed unit job', () => {
-    const h = harness();
-    const out = h.tick(originalRun, { mainCiRuns: { runs: [originalRun], failing: { runId, jobs: [job, 'integration', 'daemon-soak'] } } });
+    const out = h.tick({ ...rerun, attempt, status: 'in_progress', conclusion: null });
     expect(out.plan.action).toBe('none');
-    expect(h.exec).not.toHaveBeenCalled();
-    expect(h.ledger().reds[sha].rerunRequestedFor).toBeUndefined();
     expect(h.write).not.toHaveBeenCalled();
+    h.noRerun();
   });
 
-  it.each([0, -1, 'unknown'])('refuses an invalid rerun id: %s', (databaseId) => {
+  it.each([{ live: false }, { mode: { value: 'stop', source: 'test' } }])('shadow mode applies nothing: %j', (overrides) => {
     const h = harness();
-    h.tick({ ...originalRun, databaseId });
-    expect(h.exec).not.toHaveBeenCalled();
-    expect(h.ledger().reds[sha].rerunRequestedFor).toBeUndefined();
+    h.tick(originalRun, overrides);
+    const out = h.tick(rerun, overrides);
+    expect(out).toMatchObject({ shadow: true, applied: false, plan: { action: 'add' } });
+    expect(h.write).not.toHaveBeenCalled();
+    expect(h.list().entries).toEqual([]);
+    h.noRerun();
+  });
+
+  it.each([originalRun.createdAt, undefined, 'invalid'])('refuses attempt 2 without strictly later updatedAt: %s', (updatedAt) => {
+    const h = harness();
+    h.tick();
+    expect(h.tick({ ...rerun, updatedAt }).plan.action).toBe('none');
+    expect(h.write).not.toHaveBeenCalled();
+    h.noRerun();
+  });
+
+  it('does not invent an earlier snapshot when first observing attempt 2', () => {
+    const h = harness();
+    expect(h.tick(rerun).plan.action).toBe('none');
+    expect(h.write).not.toHaveBeenCalled();
+    h.noRerun();
+  });
+
+  it('requires the immediately preceding attempt, rather than jumping from attempt 1 to 3', () => {
+    const h = harness();
+    h.tick();
+    expect(h.tick({ ...rerun, attempt: 3 }).plan.action).toBe('none');
+    expect(h.write).not.toHaveBeenCalled();
+    h.noRerun();
+  });
+
+  it('resets snapshots on a new run id instead of combining attempts from different runs', () => {
+    const h = harness();
+    h.tick();
+    const next = { ...rerun, databaseId: runId + 1 };
+    expect(h.tick(next).plan.action).toBe('none');
+    expect(h.ledger().reds[sha].attempts).toEqual({ 2: snapshot(next) });
+    expect(h.write).not.toHaveBeenCalled();
+    h.noRerun();
+  });
+
+  it.each([1, 2])('refuses incomplete log evidence at attempt %s', (attempt) => {
+    const h = harness();
+    if (attempt === 2) h.tick();
+    h.readLog.mockReturnValue({ ...failure(), complete: false });
+    expect(h.tick(attempt === 1 ? originalRun : rerun).plan.action).toBe('none');
+    expect(h.ledger().reds[sha].attempts?.[String(attempt)]).toBeUndefined();
+    expect(h.write).not.toHaveBeenCalled();
+    h.noRerun();
   });
 });
