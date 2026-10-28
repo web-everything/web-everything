@@ -1902,16 +1902,17 @@ describe('R100 failed-seat recovery admission', () => {
     return { dir, env, loopPayload, read, path, marker: `${path}.retry-1`, job, recover };
   }
 
-  it.each(['cap', 'guard'])('a %s deferral with no model call refunds the spent retry so the planner re-dispatches', kind => {
+  it.each(['cap', 'guard', 'disabled'])('a %s deferral with no model call refunds the spent retry so the planner re-dispatches', kind => {
     const records = [{ dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'unparseable' }];
     const f = retryFixture({ prefix: 'red-team-refund-retry-', records,
       evidence: { recorded: true, seatRecorded: true, completedRecorded: false, failedSeatCount: 1 } });
     try {
       recordRedTeamStatus({ repo, pr, loopPayload: f.loopPayload, status: 'finished', result: 'ran' }, { env: f.env });
-      const deferred = f.job(kind === 'cap' ? { capDeferred: true } : { commentsUnreadable: true });
+      const deferred = f.job({ cap: { capDeferred: true }, guard: { commentsUnreadable: true },
+        disabled: { env: { ...f.env, WE_REVIEW_RED_TEAM: '0' } } }[kind]);
       expect(deferred.observed.calls.model).toBe(0);
-      expect(deferred.observed.result).toMatchObject(kind === 'cap'
-        ? { status: 'skipped', deferredByCap: true } : { status: 'not-owed', deferredByGuard: true });
+      expect(deferred.observed.result).toMatchObject({ cap: { status: 'skipped', deferredByCap: true },
+        guard: { status: 'not-owed', deferredByGuard: true }, disabled: { status: 'disabled' } }[kind]);
       expect(f.read()).toMatchObject({ status: 'finished', result: 'ran' });
       expect(f.read().retryCount).toBeUndefined();
       expect(existsSync(f.marker)).toBe(false);
@@ -1939,6 +1940,29 @@ describe('R100 failed-seat recovery admission', () => {
       expect(existsSync(f.marker)).toBe(true);
       expect(f.recover().rows[0].action).toBe('skip');
     } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  it('a normal review cap deferral beside a spent retry marker restores the replaced status instead of orphaning the marker', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-clear-marker-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+    const read = () => readRedTeamStatus({ repo, pr, head, env });
+    const marker = `${join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`)}.retry-1`;
+    const production = createReviewJobIo({ env });
+    const io = fakeIo({ redTeamStatus: vi.fn(production.redTeamStatus),
+      clearRedTeamQueued: vi.fn(production.clearRedTeamQueued),
+      runLoop: () => ({ status: 0, stdout: JSON.stringify({ ...payload(), stopped: 'complete', runId: 'review-pr-cap' }) }),
+      runRedTeam: () => ({ status: 'skipped', deferredByCap: true }),
+    });
+    try {
+      // A recovery retry that ended in a deterministic skip: the spend and its marker stand.
+      recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'queued', retryCount: 1 }, { env });
+      recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'finished', result: { status: 'skipped' } }, { env });
+      expect(read()).toMatchObject({ status: 'finished', retryCount: 1 });
+      runReviewJob({ repo, pr }, io);
+      expect(io.clearRedTeamQueued).toHaveBeenCalledOnce();
+      expect(read()).toMatchObject({ status: 'finished', result: { status: 'skipped' }, retryCount: 1 });
+      expect(existsSync(marker)).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it.each(['direct', 'admitted'].flatMap(path => ['restored', 'missing'].map(status => ({ path, status }))))(
