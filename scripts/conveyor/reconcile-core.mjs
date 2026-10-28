@@ -311,7 +311,7 @@ export const REFUSAL_KINDS = Object.freeze([
   // for it; this PR owes nothing further until that fix lands or its own head changes.
   'ci-heal-escalated', 'waiting-on-system-fix', 'review-hold-red',
   // A CI re-run this system requested whose result is not observed yet: held, not escalated, until the window.
-  'ci-timeout-rerun-in-flight',
+  'ci-timeout-rerun-in-flight', 'timeout-evidence-unknown',
   // `draft` (draft-first PRs, operator-approved 2026-09-27) — the PR is still a GitHub draft: no review is
   // dispatched, whatever `review:*` label it carries, until the `promote-draft` DISPATCH_KIND (above) has
   // un-drafted it. See {@link dispatchReviewRow}'s own gate.
@@ -3318,6 +3318,16 @@ export function planReconcile({
             why: `main is green (CI success on ${String(pr.mainGreenNow.sha).slice(0, 9)}); the failed required jobs on head ${pr.headRefOid.slice(0, 8)} are re-run once to get a fresh result (${staleSpent + 1}/${staleCap}), no heal budget` });
           continue;
         }
+      }
+      // Unknown evidence blocks only policies that can act on that evidence.
+      const unknownEvidence = process.env.WE_CI_TIMEOUT_RERUN_ENABLED !== '0' && pr.timeoutRetry?.unknown
+        ? pr.timeoutRetry
+        : (staleCiRerun !== 'off' || owedCiRerun.rerun !== 'off') && pr.owedCiRerunRetry?.unknown
+          ? pr.owedCiRerunRetry : null;
+      if (unknownEvidence) {
+        refusals.push({ kind: 'timeout-evidence-unknown', prNumber,
+          why: `PR #${prNumber}: evidence read timed out; unknown, not ineligible — will re-read next tick (${unknownEvidence.reason})` });
+        continue;
       }
       const retryRefusal = pr.timeoutRetry && !pr.timeoutRetry.eligible
         ? { kind: 'timeout-retry-ineligible', prNumber, why: `PR #${prNumber}: ${pr.timeoutRetry.reason}` } : null;

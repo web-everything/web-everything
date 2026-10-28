@@ -19,9 +19,9 @@
  *   node scripts/lib/red-main-quarantine-io.mjs show
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync, appendFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, appendFileSync, mkdirSync, realpathSync } from 'node:fs';
 import { writeAllSync } from './write-all-sync.mjs'; // a CLI's stdout must be drained before any process.exit
-import { resolve, dirname, join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFromTransportBranch, stageOnTransportBranch, assertPushRef } from './git-transport-branch.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
@@ -225,9 +225,23 @@ export function readTouchedFiles(fromSha, toSha, { board = process.cwd(), run = 
 
 /** At most ten run reads and maxTests log reads per run. Unknown history never proves a repeat. */
 function readRepeatRuns(mainCiRuns, { state, jobFailures, readJobs, readLog, settings }) {
-  // SHA membership alone cannot admit a row that the red-window chronology excluded.
-  const candidates = (mainCiRuns?.runs ?? []).filter((r) => typeof r?.createdAt === 'string'
-    && Number.isFinite(Date.parse(r.createdAt)) && state.redShas?.includes(r.headSha)
+  const history = mainCiRuns?.runs ?? [];
+  const timestamp = (value) => typeof value === 'string' ? Date.parse(value) : NaN;
+  const failing = history.find((r) => String(r?.databaseId) === String(mainCiRuns?.failing?.runId));
+  const failingCreatedAt = timestamp(failing?.createdAt);
+  if (!Number.isFinite(failingCreatedAt)) return [];
+  let windowStart = -Infinity;
+  for (const run of history) {
+    if (run?.status !== 'completed' || run.conclusion !== 'success') continue;
+    const createdAt = timestamp(run.createdAt);
+    // Unknown green chronology cannot establish an uninterrupted red window.
+    if (!Number.isFinite(createdAt)) return [];
+    if (createdAt <= failingCreatedAt) windowStart = Math.max(windowStart, createdAt);
+  }
+  // Repeated runs can share a SHA across a green boundary; membership alone is insufficient.
+  const candidates = history.filter((r) => Number.isFinite(timestamp(r?.createdAt))
+    && timestamp(r.createdAt) > windowStart && timestamp(r.createdAt) <= failingCreatedAt
+    && state.redShas?.includes(r.headSha)
     && r.status === 'completed' && ['failure', 'timed_out'].includes(r.conclusion))
     .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
   const unique = [...new Map(candidates.map((r) => [String(r.databaseId), r])).values()];
@@ -553,6 +567,10 @@ function cli(argv) {
   process.exit(2);
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
+const isEntryPoint = () => {
+  try { return !!process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)); }
+  catch { return false; }
+};
+if (isEntryPoint()) {
   try { cli(process.argv.slice(2)); } catch (e) { process.stderr.write(`${e.message}\n`); process.exit(1); }
 }

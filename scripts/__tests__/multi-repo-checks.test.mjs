@@ -118,3 +118,13 @@ it('the timeout reservation soak uses a repository-neutral fixture and still exe
   const { default: scenario } = await import('../conveyor/soak/breaks/timeout-retry-reservation-wedged-on-failed-observation.mjs');
   expect(scenario.judge(await scenario.run())).toEqual([]);
 }, 30_000); // imports + runs a soak scenario: over the 5s default under CI coverage load (seen red on PR #3890)
+
+it('the recovered CI soak resolves repository slugs without losing its cross-repository guard', async () => {
+  const file = 'scripts/conveyor/soak/breaks/recovered-ci-auto-answer-boundaries.mjs';
+  expect(scanMultiRepo(read(file))).toEqual([]);
+  const { default: scenario } = await import('../conveyor/soak/breaks/recovered-ci-auto-answer-boundaries.mjs');
+  const report = await scenario.run();
+  expect(scenario.judge(report)).toEqual([]);
+  expect(report.mainReads).toHaveLength(1);
+  expect(report.crossRepoWrites).toEqual([]);
+}, 30_000);

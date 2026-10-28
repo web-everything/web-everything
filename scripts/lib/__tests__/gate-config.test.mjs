@@ -37,6 +37,9 @@ import {
   isPolicyDerivationPath,
   readPolicySpecRegistryAt,
 } from '../gate-config.mjs';
+// Static, not a dynamic import in the test body: the loader pulls in typescript + esbuild, and that cold load
+// must land in collection, not inside the 5s per-test budget (main went red on exactly this at 60e078b6d).
+import { loadDeliveryPolicy } from '../delivery-policy.mjs';
 
 // The phase-1 drain-daemon gate-deciding files (WE #2480). Each maps a registered basename to the shipped
 // home path the daemon actually lives at, so the regression proves the basename match TRAVELS to the real
@@ -216,7 +219,6 @@ describe('ENGINE_BASENAMES / isEngineTierPath — #2412 layer 4\'s "is this the 
 
 describe('delivery policy trust boundary (#5113 Part A)', () => {
   it('every file the loader reads is gated, including an honoured pointer target', async () => {
-    const { loadDeliveryPolicy } = await import('../delivery-policy.mjs');
     await fixture(async ({ root }) => {
       mkdirSync(join(root, 'config'));
       writeFileSync(join(root, 'config/deliveryPolicyDefaults.ts'), readFileSync(resolve('config/deliveryPolicyDefaults.ts')));

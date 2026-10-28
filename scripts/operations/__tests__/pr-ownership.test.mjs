@@ -62,6 +62,8 @@ function reader({ fixDispatchPresent = false } = {}) {
     readPrs: () => PRS,
     enrichMainRed: (prs) => ({ prs, mainRedWindows: [], mainLatestCheckRuns: null }),
     enrichAlreadyLanded: (prs) => prs, enrichBaseRef: (prs) => prs, enrichSystemFix: (prs) => prs,
+    // Scope facts are fixture data too: the synthetic lane base must not read live origin tips.
+    enrichScopeBloat: (prs) => prs,
     resolveMainSha: () => null,
   }));
   const readAgents = vi.fn(() => AGENTS);

@@ -53,7 +53,32 @@ describe('planMainRedAlert — healthy main stays quiet while tip checks are unp
   });
 });
 
-describe('planMainRedAlert — recovery requires affirmative conclusions on every tip check', () => {
+describe('planMainRedAlert — recovery with skipped checks', () => {
+  it.each(['workflow-SHA', 'tip-required-checks'])('clears the alert with disabled optional visual skipped via %s', (via) => {
+    const tip = { ...passingTip(), requiredChecks: via === 'workflow-SHA' ? ['not-on-page'] : ['test'],
+      checksTotal: 2, checkRuns: [
+      ...passingTip().checkRuns,
+      { id: 2, name: 'visual', status: 'completed', conclusion: 'skipped' },
+    ] };
+    const recovered = plan({ prev: plan().next, tip,
+      runs: via === 'workflow-SHA' ? greenRuns() : redRuns() });
+    expect(kinds(recovered)).toEqual(['main-green']);
+    expect(recovered.next.fingerprint).toBeNull();
+    expect(recovered.next.fingerprintParts).toBeNull();
+  });
+
+  it('preserves the alert when a required check is skipped despite a successful tip workflow', () => {
+    const red = plan();
+    const tip = { ...passingTip(), checkRuns: [
+      { id: 1, name: 'test', status: 'completed', conclusion: 'skipped' },
+    ] };
+    const result = plan({ prev: red.next, runs: greenRuns(), tip });
+    expect(kinds(result)).toEqual(['main-status-unknown']);
+    expect(result.next.fingerprint).toBe(red.next.fingerprint);
+  });
+});
+
+describe('planMainRedAlert — recovery requires affirmative conclusions or optional skips on every tip check', () => {
   describe.each(['workflow-SHA', 'tip-required-checks'])('%s recovery', (via) => {
     const recoveryInput = (check) => ({
       runs: via === 'workflow-SHA' ? greenRuns() : redRuns(),
@@ -68,7 +93,6 @@ describe('planMainRedAlert — recovery requires affirmative conclusions on ever
 
     it.each([
       ['completed', 'cancelled'],
-      ['completed', 'skipped'],
       ['completed', 'timed_out'],
       ['completed', null],
       ['queued', 'success'],
@@ -532,10 +556,10 @@ describe('planMainRedAlert — fingerprint and recovery', () => {
     ['omitted details', undefined],
     ['missing detail fields', {}],
     ['unavailable failing jobs', { ...details(), failingJobs: null }],
-    ['unavailable failing test', { ...details(), firstFailingTest: null }],
+    ['unavailable failing test', { ...details(), firstFailingTest: undefined }],
     ['unavailable fix PRs', { ...details(), fixPrs: null }],
     ['all detail reads unavailable', {
-      failingJobs: null, firstFailingTest: null, blockedReadyPrs: null, fixPrs: null,
+      failingJobs: null, firstFailingTest: undefined, blockedReadyPrs: null, fixPrs: null,
     }],
   ])('carries forward fingerprint parts through %s and identical recovery', (_name, unavailable) => {
     const first = plan();

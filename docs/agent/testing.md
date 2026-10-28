@@ -1,5 +1,61 @@
 # Testing — Three-Tier Strategy
 
+## Direction-aware operation evidence (R131)
+
+In-process review callers import the pure shape derivation from `scripts/lib/review-shape.mjs`.
+Keep CLI evidence loading outside that module: unknown dynamic imports make daemon/promotion import
+closures incomplete and force conservative restart, smoke and staleness fallbacks.
+
+Shape shadow evidence must preserve every current file-only shape field. Pass hunks through the scorer's
+`proposalDiffHunks` input so the proposal proves changes against the historical hold and sensitive hits;
+clearing the hunk-aware gate alone cannot clear the proposal. Self-contained read-only import and registration
+wiring can be proven; stored-array additions retain human review without consumer evidence, even beside
+provable wiring. A harmless comment retains the hold with a `no new op reference` reason. Classifier
+self-changes retain proposed human review even when the current gate did not fire.
+Diff lines over 2000 characters require human review before parsing expressions.
+
+PR-head modules are untrusted data: never import them into the reviewer process, even in shadow mode.
+Read-only proof first requires an explicit IO audit in `read-only-ops.mjs`: only `heavy-queue`
+and `pr-reconcile` are currently admitted. Compute-only declarations alone cannot prove purity:
+injected IO can execute arbitrary commands, as `verify` does in run mode. Audit every mode before
+admitting an operation; unaudited operations retain human review. The verify regression exercises
+its real `createChecksRunner` with an injected spawn, then checks loader exclusion and live scoring;
+a separate regression rejects another unaudited compute-only operation with complete byte evidence.
+Proof also uses the reviewer checkout's registry and unchanged declaration plus every runner-imported `-io.mjs` module and their closures, regardless of operation name; new or
+unreadable operations retain human review. `direction-aware-shape.test.mjs` probes a top-level host-write
+attempt in native Node, dependency tampering, and live-mode holds on registry/step-kind changes.
+An operation reference in hunk context never proves allow-list membership: moving a write-capable
+import into `zeroWrites` beside a read-only addition must retain human review in live mode.
+Standalone entries and complete named arrays retain human review: insertions can change positional or
+length-based write guards regardless of an array's name, freezing, or neighbouring entries.
+Total diff text over 200000 characters retains human review with an oversized-diff reason.
+Removal matching consumes indexed normalized-text buckets while preserving same-hunk ordering.
+Allow-list additions accept only balanced import/registration wiring or
+balanced re-adds preserving a removed line's bracket counts and executable structure. Replacements
+must be identical apart from indentation. Replacement evidence
+must be the immediately preceding removed line in the same hunk; matching text elsewhere cannot
+prove control-flow scope. The guard-relocation regression also pins the live-mode human hold.
+Word conservation alone
+cannot prove semantics: the guard-inversion-with-comment regression must retain human review. Other structural
+lines retain human review, as does any net bracket-count change outside pure entries/wiring.
+Every removed allow-list line also needs a distinct added partner in the same hunk, in removal
+order, identical after stripping newly introduced op references from the addition and whitespace
+and commas from both. Unpaired deletions retain human review; the scheduled-sweep quiet-hours
+bypass and duplicate-guard regressions prevent borrowing another guard's replacement.
+The health early-return bypass and removed-bracket regressions pin these fail-closed paths;
+the #5961/#5962 fixture preserves the real import, registration and array-replacement shapes and retains
+human review. Shape wiring tests separately exercise provable registration and stored-array holds in
+shadow/live output, including event emission only when the current and proposed decisions differ.
+Sandbox tokens anywhere in a hunk and hidden separators/control characters in protection additions
+retain the hold. Missing/invalid tool mode stays shadow even when the platform requests live;
+dependency proof checks regular-file sizes before reads, and shadow event logging waits at most 2s.
+Review each "nearest", "only", and "never" qualifier in this document against a named test
+that would fail if the qualifier were removed; prose qualifiers require review, not a deterministic gate.
+The array cases cover complete, partial, positional and frozen lists. The shape tests
+read the shipped settings with an empty environment and require shadow mode. Loader rejection
+cases start with successful read-only evidence, then isolate missing trusted declarations,
+incomplete dependency graphs, and the accepted 512-file / rejected 513-file boundary.
+
 ## PR size admission trust-boundary fixtures
 
 `scripts/lib/__tests__/pr-size-admission.test.mjs` exercises Git with real shadow refs and
@@ -182,6 +238,23 @@ exercise diagnostic propagation through a real-git rebuild fixture. Run these su
 
 ## Red-team re-check evidence
 
+Recovery distinguishes a policy-clear from a completed seat and a failed execution. A trusted
+acceptance re-stamp at the live head can carry only the policy-clear of its preceding trusted
+acceptance record. A newer result on another revision, including one posted after the live-head
+re-stamp, or missing/untrusted source acceptance
+refuses carry; recovery never searches older revisions for a convenient clear.
+Stored-review recovery passes explicit `storedReviewPolicyClear` authority only after its acceptance/hold guards; ordinary job settlement still refuses contradictory `not-owed` results. The stored-context tests in `red-team-skip-outcome.test.mjs` require acceptance, a bound read and no guard/cap deferral.
+Both carry and stored clear pass formal reviews into `latestAcceptRecord`; unreadable reviews
+refuse publication and require operator inspection. A standing formal CHANGES_REQUESTED blocks both.
+Stored clear (null status or finished/not-owed) requires a trusted acceptance record whose SHA is
+the live head, alongside the matching stored read, no seats, and no deferral. An accepted label
+alone cannot establish that boundary; keep real accept comments in R100 clear-success fixtures.
+One non-completed seat with finished/ran permits one fresh retry under the daemon cooldown;
+two failed seats retain the refusal and require operator inspection. Completed seats retain
+result/effects-only resume. Preserve the failed status through queued admission so the shared
+seat guard can independently recheck the same bound. The R100 regressions in
+`review-red-team-on-skip`, `drain-red-team-evidence`, and `review-job-red-team-only` cover these paths.
+
 The post-accept re-check reads a separate, self-contained checkout pinned to `read.netBasis.rev`,
 never the released review lane's current HEAD or the red-team probe's working tree. Its Claude
 juror uses `judge-spawn.mjs` with `Read`, `Glob`, and `Grep` only, in an independent lane-shaped
@@ -233,6 +306,18 @@ The sequential and speculative paths skip before budget reservation and record t
 negative answers without file reads remain unverifiable.
 
 ## Drain red-team disposition and retry evidence
+
+The status writer may repair truncated JSON, null JSON or a mismatched identity only when no retry
+marker exists; readers still reject that evidence. The writer-contract table in
+`drain-red-team-evidence.test.mjs` covers queued, running, finished, fresh-retry and refund writes,
+with and without a marker. Marked damage requires operator inspection; filesystem errors and invalid
+retry counts remain errors. Keep the negative refund table that varies queued state, explicit refund
+inputs, PID, process start time, host and namespace independently: a refused refund must preserve both
+the marker and spent count, and a later admission must still refuse. Existing review-job tests cover
+cap, guard and disabled deferrals through the production writer with zero model calls before refund.
+Run publication failures through both carry and clear: comment-post and label-sync failures become
+skip rows without spending dispatch capacity. A successful post followed by failed label sync remains
+visible to the next tick, which deduplicates the comment and leaves label repair to the label sweep.
 
 Moved card-only skips recover through the normal red-team-only review job. The planner requires a
 finished policy skip with a pinned card-only read and no seat, then proves the move with
@@ -420,6 +505,17 @@ Recovery defaults to a 30-minute retry cooldown through
 `reviewRedTeamOnSkip` (tool: `scripts/settings/review-red-team-on-skip.json`; environment:
 `WE_REVIEW_RED_TEAM_ON_SKIP`, `WE_REVIEW_RED_TEAM_ON_SKIP_RETRY_COOLDOWN_MIN`). Focused cases
 live in `review-red-team-on-skip.test.mjs` and `review-job-red-team-only.test.mjs`.
+An accepted head move with no trusted carry and no stored review at the live head recovers through
+an ordinary full review, provided live-head status/seat evidence is explicitly absent and the shared
+hold guard permits it. It shares recovery's per-head cooldown and dispatch capacity; it publishes
+no policy-clear. Unknown evidence stays skipped for operator inspection. The **unprovable accepted
+head move — fresh full review** replay covers the planner and effects boundary; **plain recovery
+dispatch spawns an ordinary job and runs its full loop plus red team** proves accepted labels do not
+require a dispatcher bypass option.
+Full-review recovery requires readable formal reviews independently of acceptance comments.
+It applies `laterReviewHold` without a timestamp floor; an unreadable channel or formal
+hold stays skipped for operator inspection. The same replay pins both refusals with
+empty comments and absent live-head evidence, and allows a readable empty review list.
 Red-team-only admission strictly persists `queued` and reads back that status with the current
 process's pid before releasing the job slot. A write/read failure or mismatch refuses with
 `red-team-not-owed` and `queued red-team status could not be persisted`, without running the
@@ -2264,6 +2360,11 @@ head with them. Test an initially empty repository label catalog and a same-head
 age (using a recorded fixer push time when available), retaining its conflict, claim, head and retry-budget guards. The drain re-reads
 UNKNOWN listings before collecting head-bound context and also revalidates before
 merging, waiting for the configured delay at most three times per read stage.
+Hermetic drain CLI fixtures with synthetic UNKNOWN reads pin
+`WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC=0` while retaining the retry count and
+merge/hold assertions. Several read stages can otherwise exhaust a child-process
+deadline with production waits alone. Verify production delay defaults separately
+in the retry helper tests.
 
 ### Overlay dispatch launch timeouts
 
@@ -2642,6 +2743,25 @@ prototype-load settings, not the plist's data clone; tests inject those settings
 Cc/Cf controls and are width-capped; table mode keeps the truncated-listing warning.
 
 
+Recovery retries must spend their allowance in the head-bound red-team status before the model call.
+Keep `retryCount` when writing running/finished statuses: a failed scorecard append is not evidence
+that no model ran. Exercise both review-job admission and the shared runner with an append failure,
+then verify that a later planner and admission pass refuse another call even after cooldown.
+Cross spent counts (1 and greater), bare/object `ran` and `resumed` results, and zero/one/multiple
+seat rows in planner and shared-runner regressions. An empty store must never restore a spent retry;
+the shared `redTeamStatusWithoutRun` predicate must reject it before placeholder classification.
+
+Policy-clear carry must bind the source acceptance and policy-clear SHA to the trusted re-stamp's
+declared `from`, with its `to` equal to the live head. Reuse numbering-carry's `restampRecord` parser.
+Keep a three-head regression: acceptance A, acceptance B, clear B, re-stamp A-to-C must not publish
+or sync labels; changing only the declared source to B permits carry. Missing or malformed provenance
+must also refuse carry. Never infer the declared source from comment order alone.
+
+Retry admission uses an exclusive-create `<status-basename>.retry-1` marker before the model call.
+An existing marker refuses with `retry already admitted`; never roll back another worker's status
+or remove the marker on failure. Inspect the head-bound evidence before operator recovery.
+Interleave two admissions after both read the old status and assert exactly one model call.
+
 ### Red-team disposition precedence
 
 `red-team-disposition.test.mjs` pins all ranked pairs in both temporal and input
@@ -2744,3 +2864,45 @@ Regression coverage uses real local Git repositories in `scripts/lib/__tests__/r
 cards would share a batch. The filer still opens its ordinary PR, and settings/formatting/output
 failures cannot affect filing. `scripts/lib/__tests__/card-batch-shadow.test.mjs` pins the
 cascade and failure containment; filer integration is covered by `land-prevention-card.test.mjs`.
+
+
+## Fixer lane HEAD and lease probe
+
+`fix-run.mjs` retains the `holder` returned by `lane-pool acquire --json`; the ambient
+session is not proof that a later lease belongs to the fixer. It checks the on-disk
+`.git/.lane-lease` and exact PR head before starting the agent, preserves launcher
+merge preparation, and checks ownership again before staging and pushing. Only an
+owned, clean lane can be fetched/reset to the pinned PR SHA; recovery rechecks the
+lease and HEAD. These checks detect takeover but do not make the allocator atomic.
+
+Merge preparation rechecks the pinned PR head and holder after provider resolution,
+immediately before merge, and immediately before either clean or resolved-conflict
+merge commit. Drift refuses recovery and mutation, including aborting a merge in a
+lane whose head or holder changed. Each merge commit's first parent must equal the
+original pinned PR head before its SHA can authorize an agent launch or push.
+Inject head and holder changes during provider resolution, fetch and merge preparation
+in `fix-run-lane-head.test.mjs`; also reject missing or unexpected first-parent evidence.
+
+Repeated-finding scope resets recheck the original pinned HEAD and acquired holder
+immediately before `applyScopeReset`, with lane recovery disabled. Inject holder or
+HEAD drift and missing/unreadable lease evidence during awaited provider resolution;
+assert refusal before `merge-tree --write-tree`, `read-tree`, replay, commit or push.
+Keep an unchanged-head/holder case that reaches the real reset path.
+
+Keep disk-backed lease tests that omit the `readLease` injection: valid and foreign
+markers, missing files, malformed JSON, missing holders, JSON null, and read errors
+must exercise the production reader at `.git/.lane-lease`. A worktree marker is not
+ownership evidence. Use a directory at the marker path for a deterministic read
+error, including under root. After an agent leaves edits, change or remove its lease
+and assert refusal before file reads for staging, index writes, commit, push, re-arm,
+or lane release. Pair these cases with identical edits under an unchanged lease
+that reach staging and push, so an inert fixture cannot prove the guard.
+
+For a read-only observation, run
+`node scripts/operations/fix-run.mjs --probe-lane-head --lane-path=<absolute lane path> --pr=<PR> --holder=<original acquired holder> [--repo=owner/repo]`.
+The probe prints the observed lease, HEAD, current GitHub PR head and pure
+`laneHeadCheck` decision. Omitting `--holder` refuses ownership rather than treating
+the current occupant as ours. Git optional locks are disabled, so status does not
+refresh the index. The live PR head may have advanced since an incident; compare
+against the SHA the probe actually reports. Regression files: `fix-run-lane-head.test.mjs`,
+`fix-run.test.mjs`, and `fix-run-borrow-dies.test.mjs` under `scripts/operations/__tests__/`.

@@ -35,7 +35,9 @@ export function planMainRedAlert(input = {}) {
     ? [...latestCheckVerdicts(tip.checkRuns).values()] : [];
   const tipReadable = !!tip?.sha && tipVerdicts.length > 0
     && tip.checkRuns.every((check) => check?.name && check.status === 'completed'
-      && ['success', 'neutral'].includes(check.conclusion));
+      && (['success', 'neutral'].includes(check.conclusion)
+        || (check.conclusion === 'skipped' && Array.isArray(tip.requiredChecks)
+          && !tip.requiredChecks.includes(check.name))));
   // A full check page may be truncated; retain unknown on either recovery path.
   const provenGreen = tipReadable && tip.checkRuns.length < 100
     && tip.checksTotal === tip.checkRuns.length
@@ -71,7 +73,9 @@ export function planMainRedAlert(input = {}) {
     ? previousParts : {};
   const failingJobs = [...new Set(details?.failingJobs ?? carried.failingJobs ?? [])].sort();
   const fixPrs = [...new Set(details?.fixPrs ?? carried.fixPrs ?? [])].sort((a, b) => a - b);
-  const firstFailingTest = details?.firstFailingTest ?? carried.firstFailingTest ?? null;
+  // Undefined means unreadable; null is a successful read with no failing test.
+  const firstFailingTest = details?.firstFailingTest !== undefined
+    ? details.firstFailingTest : carried.firstFailingTest ?? null;
   const fingerprintParts = { firstRedSha, since, failingJobs, firstFailingTest, fixPrs };
   const fingerprint = createHash('sha256')
     .update(JSON.stringify(fingerprintParts)).digest('hex');
@@ -102,14 +106,14 @@ function writeAlertState(dir, next) {
 }
 
 function readAlertDetails({ state, config }) {
-  const details = { failingJobs: null, firstFailingTest: null, fixPrs: null, blockedReadyPrs: null };
+  const details = { failingJobs: null, firstFailingTest: undefined, fixPrs: null, blockedReadyPrs: null };
   if (state.status !== 'red') return details;
   try {
-    const jobs = readRunJobs(state.firstRed.runId);
+    const jobs = readRunJobs(state.latestRed.runId);
     if (jobs.complete) details.failingJobs = jobs.failed.map((job) => job.name);
     if (jobs.failed[0]) {
       try { details.firstFailingTest = readFailingTests(jobs.failed[0].id)[0] ?? null; } catch { /* annotations unavailable */ }
-    }
+    } else if (jobs.complete) details.firstFailingTest = null;
   } catch { /* jobs unavailable */ }
   try {
     const prs = readOpenPrsForOwner();

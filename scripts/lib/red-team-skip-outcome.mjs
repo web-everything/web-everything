@@ -128,7 +128,12 @@ export function settleRedTeamSkip(input = {}) {
     const { redTeam, pr, repo, comments } = input;
     const realHead = isRealHead(input.head);
     const head = realHead ? input.head : 'unknown';
-    const classified = classifyRedTeamSkip(redTeam);
+    // Only recovery's acceptance/hold-checked stored-review path may settle not-owed.
+    // Ordinary job settlement retains its contradictory-not-owed refusal.
+    const storedClear = input.storedReviewPolicyClear === true && input.accepted === true
+      && redTeam?.status === 'not-owed' && !redTeam.deferredByGuard && !redTeam.deferredByCap;
+    const classified = storedClear ? { kind: 'policy', reason: 'not owed (stored review)' }
+      : classifyRedTeamSkip(redTeam);
     let { reason } = classified;
     const boundRead = isRealHead(input.readHead)
       && realHead && input.readHead.toLowerCase() === head.toLowerCase();
@@ -145,7 +150,7 @@ export function settleRedTeamSkip(input = {}) {
         const thread = comments ?? io.readComments({ repo, pr });
         if (!Array.isArray(thread)) throw Error('PR comments unreadable');
         if (redTeamForHead(thread, pr, head)) return { outcome: 'already' };
-        io.postComment({ repo, pr, body: `${redTeamMarker(pr, head)}\n\nRed team not required on this head: card-only diff (policy redTeam.skipCardOnly)` });
+        io.postComment({ repo, pr, body: `${redTeamMarker(pr, head)}\n\nRed team not required on this head: ${storedClear ? 'not owed (stored review)' : 'card-only diff (policy redTeam.skipCardOnly)'}` });
         return { outcome: 'policy-clear' };
       } catch (error) {
         reason = `policy-clear comment failed: ${safeErrorText(error)}`;
