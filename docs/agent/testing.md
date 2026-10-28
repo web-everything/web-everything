@@ -1,5 +1,14 @@
 # Testing — Three-Tier Strategy
 
+The real-Git daemon rebuild suites `daemon-rebuild-keep-established.test.mjs` and
+`daemon-rebuild-fallback.test.mjs` run in the blocking integration tier's serial fork.
+Their multi-rebuild cases exceeded the five-second deadline in concurrent unit shards.
+Keep them excluded from the unit config, included in the integration config and pinned
+to `forks` with `singleFork: true`; `vitest-worker-cap.test.mjs` checks that routing.
+Run them with `npm run test:integration:vitest -- scripts/lib/__tests__/daemon-rebuild-fallback.test.mjs`
+(or the established-overlay path). CI's required `test` check depends on integration success;
+the assertions and deadlines remain unchanged.
+
 ## Closure-scope foundations
 
 `daemon-clone-entries.test.mjs`, `closure-scope.test.mjs` and

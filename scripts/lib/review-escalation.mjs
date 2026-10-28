@@ -2947,7 +2947,27 @@ export function decideDurableEscalationRecord({ changed, verified, liveBody, rea
  * second, independent verdict. `engineTier:false` (every pre-#2412 caller) reproduces prior behaviour exactly.
  * @param {{escalate:boolean, humanRequired?:boolean, labels?:Array, engineTier?:boolean}} o
  */
-export function decideReviewGate({
+export function decideReviewGate(input = {}) {
+  // Sticky review:human de-escalation (R11/R130 follow-up). The sticky rule below (#2362) keeps `review:human`
+  // forever once set, even when the NET diff vs current main no longer scores `humanRequired`. Drop it ONLY when
+  // the caller proves the score is fresh (`humanScoreFresh:true`: a scored net diff at the current head), the
+  // fresh score is humanRequired=false, no operator ruling pinned it (`humanPinned`), and no `review:accepted`
+  // rides beside it. Every other case (unproven score, true score, pin) is the unchanged fail-closed path.
+  const { humanScoreFresh = false, humanPinned = false, ...rest } = input || {};
+  const labels0 = rest.labels || [];
+  if (humanScoreFresh === true && rest.humanRequired === false && !humanPinned
+      && hasReviewLabel(labels0, REVIEW_LABELS.human) && !hasReviewLabel(labels0, REVIEW_LABELS.accepted)) {
+    const stripped = labels0.filter((l) => (typeof l === 'string' ? l : l && l.name) !== REVIEW_LABELS.human);
+    let g = decideReviewGateCore({ ...rest, humanRequired: false, labels: stripped });
+    // A human hold never turns into an immediate merge: if nothing else holds the PR, park it for an independent review.
+    if (g.action === 'merge') g = { action: 'park', reason: 'review:human dropped — awaiting an independent review (review:pending)', applyLabel: REVIEW_LABELS.pending, humanRequired: false };
+    return { ...g, deescalatedHuman: true, removeLabels: [REVIEW_LABELS.human],
+      reason: `${g.reason} (review:human dropped: fresh net-diff score is humanRequired=false, no operator pin)` };
+  }
+  return decideReviewGateCore(rest);
+}
+
+function decideReviewGateCore({
   escalate, humanRequired = false, labels = [], acceptedSha = null, headSha = null,
   acceptedDiff = null, headDiff = null, acceptedContribution = null, headContribution = null,
   operatorClearance = null, headReadFailed = false, engineTier = false, deviation = null, humanClearedSha = null, permissionChange = false,
