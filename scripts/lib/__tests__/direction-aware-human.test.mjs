@@ -329,6 +329,11 @@ describe('direction-aware humanRequired shadow (R131)', () => {
       expect(propose({ [file]: diff(file, ['+// change']) }, []))
         .toEqual({ proposed: true, reason: `classifier self-change: ${file}` });
     });
+  it.each(['scripts/lib/direction-aware-human.mjs', 'scripts/operations/registry.mjs', 'scripts/operations/step-kinds.mjs'])
+    ('requires classifier review before accepting a current non-human decision: %s', file => {
+      expect(propose({ [file]: null }, [], { humanRequired: false, readOnlyOps: new Set() }))
+        .toEqual({ proposed: true, reason: `classifier self-change: ${file}` });
+    });
   it('refuses empty read-only proof', () => {
     expect(propose({ [runner]: simple() }, [permission(runner)], { readOnlyOps: new Set() }))
       .toEqual({ proposed: true, reason: 'empty readOnlyOps' });
@@ -356,7 +361,7 @@ describe('direction-aware humanRequired shadow (R131)', () => {
   it('refuses an embedded carriage return in added protection comments', () => {
     expect(propose({ [surface]: tightening(['+  // harmless\r bypass();']) }, [setting]).proposed).toBe(true);
   });
-  it('never makes a non-human decision stricter', () => {
+  it('preserves a non-human decision without a classifier self-change', () => {
     expect(propose({}, [], { humanRequired: false, otherHumanForced: true }))
       .toEqual({ proposed: false, reason: 'not human-required today' });
   });
