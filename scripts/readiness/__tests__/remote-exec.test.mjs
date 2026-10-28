@@ -3,6 +3,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, symlinkSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
@@ -11,6 +12,7 @@ import {
 } from '../remote-exec.mjs';
 import { createRunner } from '../forge-exec-run.mjs';
 import { runWithRemoteDecision, resolveAdmissionPolicy } from '../heavy-admission.mjs';
+import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 
 const argv = ['npm', 'run', 'test:unit', '--', 'a.test.mjs'];
 const runId = 'abcdef-1';
@@ -26,8 +28,8 @@ const forbiddenEnv = {
 };
 let cwd;
 beforeEach(() => {
-  // Task scratch must stay under the launcher-provided TMPDIR.
-  cwd = realpathSync(mkdtempSync(join(process.env.TMPDIR, 'remote-exec-test-')));
+  // Respect the launcher's TMPDIR, with the OS default when CI leaves it unset.
+  cwd = realpathSync(mkdtempSync(join(tmpdir(), 'remote-exec-test-')));
   writeFileSync(join(cwd, 'package-lock.json'), '{"lockfileVersion":3,"packages":{}}\n');
 });
 afterEach(() => rmSync(cwd, { recursive: true, force: true }));
@@ -344,7 +346,9 @@ describe('runRemote', () => {
     const controller = new AbortController();
     const pidFile = join(cwd, 'transport.pid');
     const pending = defaultExec({ file: process.execPath,
-      args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);`],
+      args: ['-e', keepAliveScript({ maxLifetimeMs: 30_000,
+        postlude: `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
+      })],
       cwd, signal: controller.signal,
     });
     try {

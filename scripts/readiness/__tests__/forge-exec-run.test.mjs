@@ -2,6 +2,7 @@
 import {beforeEach, afterEach, describe, it, expect, vi} from 'vitest';
 import {mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat, readdir, utimes, realpath} from 'node:fs/promises';
 import {join} from 'node:path';
+import {tmpdir} from 'node:os';
 import {createHash} from 'node:crypto';
 import {spawn, spawnSync} from 'node:child_process';
 import {once} from 'node:events';
@@ -10,7 +11,7 @@ let root, runner, request, work;
 const argv = ['npm','run','test:unit','--','two words',"a'b",'$(touch marker)','line\nbreak'];
 const hash = data => createHash('sha256').update(data).digest('hex');
 beforeEach(async () => {
-  root = await realpath(await mkdtemp(join(process.env.TMPDIR,'forge-wrapper-')));
+  root = await realpath(await mkdtemp(join(tmpdir(),'forge-wrapper-')));
   const bin = join(root,'bin');
   await mkdir(bin);
   await symlink(process.execPath,join(bin,'node'));

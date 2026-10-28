@@ -4,6 +4,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { main, decideRemote, runWithRemoteDecision, resolveAdmissionPolicy, DEFAULT_ADMISSION_CEILING_MS, DEFAULT_FAST_RUN_TIMEOUT_MS } from '../heavy-admission.mjs';
 
 const argv = ['npm', 'run', 'test:unit', '--', 'a file.test.mjs', '$(must-stay-literal)'];
@@ -55,7 +56,7 @@ describe('remote admission policy', () => {
   });
 
   it('main run routes through the decision and exits remotely without creating a local slot', async () => {
-    const root = mkdtempSync(join(process.env.TMPDIR, 'remote-main-'));
+    const root = mkdtempSync(join(tmpdir(), 'remote-main-'));
     const pool = join(root, 'pool');
     mkdirSync(pool);
     const prefs = join(root, 'preferences.json');
