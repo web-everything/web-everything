@@ -215,7 +215,8 @@ describe('poison guard admission boundary', () => {
       labels: labelSignature(['ready-to-merge']), comments: [],
       preparedSurface: { headSha, base: 'main', baseSha: 'a'.repeat(40), files: [], ...surface } };
     expect(s.enqueue(c, headSha, { prepared })).toMatchObject({ enqueued: false, kind: 'bornas-collision' });
-    expect(evidence.mock.calls.map(([, args]) => args[0])).toEqual(['fetch', 'diff', 'show', 'grep']);
+    // The second `show` reads the main card's frontmatter to confirm the grep hit is an owned identity.
+    expect(evidence.mock.calls.map(([, args]) => args[0])).toEqual(['fetch', 'diff', 'show', 'grep', 'show']);
     expect(enqueuePr).not.toHaveBeenCalled();
   });
 
