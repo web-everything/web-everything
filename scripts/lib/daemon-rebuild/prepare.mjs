@@ -254,7 +254,7 @@ export async function prepareRebuild({
     return terminal({ moved: false, reason: 'head-unresolved' });
   }
 
-  // ── Step 2: fetch ────────────────────────────────────────────────────────────────────────────────────
+  // ── Step 2a: overlay snapshot ────────────────────────────────────────────────────────────────────────────────────
   // A corrupt overlay file reads as an empty list. Building on that would quietly rebuild onto main alone and
   // drop every registered fix, so refuse and alert instead (mainOnly ignores overlays anyway, so it proceeds).
   const overlayState = readOverlayState(root, { env });
@@ -296,6 +296,7 @@ export async function prepareRebuild({
     alert('overlay-registration-changed', {});
     return terminal({ moved: false, reason: 'overlay-registration-changed' });
   };
+  // ── Step 2: fetch ────────────────────────────────────────────────────────────────────────────────────
   const edgeResolve = env[OVERLAY_EDGE_RESOLVE_ENV] !== '0';
   // Heal dangling remote-tracking refs (and a clone that is itself broken) BEFORE the fetch: one such ref makes
   // `fetch --prune` reject the whole batch. Daemon clones are never acquired through lane-pool, so this is their only heal.
