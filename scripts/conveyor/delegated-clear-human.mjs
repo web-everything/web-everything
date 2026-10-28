@@ -18,6 +18,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { PLATFORM_PREFERENCES_PATH } from '../lib/merge-delivery-policy.mjs';
 import { readDeclaredSettings } from '../lib/settings-files.mjs';
+import { ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
 import { hasReviewLabel, REVIEW_LABELS, scoreEscalation } from '../lib/review-escalation.mjs';
 
@@ -82,7 +83,7 @@ export function evaluateEligibility(pr, { scoreNet, redTeamClearAtHead } = {}) {
 /** Record the clearance through the sanctioned CLI (argv array, no shell). */
 export async function clearHumanViaCli({ pr, reason, actor, repo = null, exec = execFileSync }) {
   exec(process.execPath, ['scripts/review-set-label.mjs', String(pr), '--to=clear-human', `--actor=${actor}`, `--reason=${reason}`,
-    ...(repo ? [`--repo=${repo}`] : [])], { stdio: ['ignore', 'pipe', 'pipe'] });
+    ...(repo ? [`--repo=${repo}`] : [])], { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024 });
 }
 
 /** Reads platform preferences + declared settings + env; an unreadable layer is skipped (default stays shadow). */
@@ -118,9 +119,9 @@ export async function runDelegatedClearHuman({ prs = [], mode = 'shadow', scoreN
 }
 
 /** Live readers (impure). The net score mirrors the drain: computeNetDiffSignals -> scoreEscalation. */
-export async function liveReaders({ cwd = process.cwd() } = {}) {
+export async function liveReaders({ cwd = process.cwd(), repo = ghRepoSlug('we') } = {}) {
   const { computeNetDiffSignals } = await import('../merge-ai-prs.mjs');
-  const exec = (cmd, args, opts) => execFileSync(cmd, args, { cwd, ...opts });
+  const exec = (cmd, args, opts) => execFileSync(cmd, args, { cwd, maxBuffer: 64 * 1024 * 1024, ...opts });
   return {
     scoreNet: (pr) => {
       const sig = computeNetDiffSignals({ exec, rev: pr.headRefName, baseRev: pr.baseRefName, fetchExtraRefs: [pr.headRefName] });
@@ -130,7 +131,7 @@ export async function liveReaders({ cwd = process.cwd() } = {}) {
       return { scored: true, humanRequired: s.humanRequired === true, files: sig.humanBasisFiles.length };
     },
     redTeamClearAtHead: async () => false, // replaced below (needs repo); see liveRedTeam
-    readLiveHead: (pr) => JSON.parse(execFileSync('gh', ['pr', 'view', String(pr.number), '--json', 'headRefOid'], { encoding: 'utf8' })).headRefOid,
+    readLiveHead: (pr) => JSON.parse(execFileSync('gh', ['pr', 'view', String(pr.number), '--repo', repo, '--json', 'headRefOid'], { encoding: 'utf8', maxBuffer: 1024 * 1024 })).headRefOid,
   };
 }
 
@@ -147,7 +148,7 @@ export async function liveRedTeam({ repo }) {
 
 async function main(argv) {
   const prsFile = argv.find((a) => a.startsWith('--prs-file='))?.slice('--prs-file='.length);
-  const repo = argv.find((a) => a.startsWith('--repo='))?.slice('--repo='.length) || 'web-everything/web-everything';
+  const repo = argv.find((a) => a.startsWith('--repo='))?.slice('--repo='.length) || ghRepoSlug('we');
   const modeArg = argv.find((a) => a.startsWith('--mode='))?.slice('--mode='.length);
   const prs = prsFile ? JSON.parse(readFileSync(prsFile, 'utf8'))
     : JSON.parse(execFileSync('gh', ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '200', '--json',
@@ -155,7 +156,7 @@ async function main(argv) {
   const resolved = loadDelegatedClearHumanMode();
   const mode = modeArg || resolved.value;
   process.stderr.write(`delegatedClearHuman.mode=${mode} (${modeArg ? 'flag' : resolved.source})\n`);
-  const readers = await liveReaders();
+  const readers = await liveReaders({ repo });
   readers.redTeamClearAtHead = await liveRedTeam({ repo });
   const out = await runDelegatedClearHuman({ prs, mode, ...readers });
   process.stdout.write(`${JSON.stringify(out)}\n`);
