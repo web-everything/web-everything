@@ -1,4 +1,5 @@
 ---
+bornAs: xdvjzt7
 kind: story
 status: open
 size: 2
