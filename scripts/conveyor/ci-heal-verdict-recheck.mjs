@@ -15,7 +15,7 @@
  *     still pending, missing, or red — the verdict can only be true once they have all finished green.
  *
  * Reuses the repo's own readers: `collapseRollupToLatestPerName` (latest run per check name), the shared
- * `FAILING_CONCLUSIONS` table, and `withoutImpliedRequiredChecks` (a required `integration` implied by `test`).
+ * check-state predicate, and `withoutImpliedRequiredChecks` (a required `integration` implied by `test`).
  * Declared setting `ci-heal-verdict-settings.json` (env `WE_CI_HEAL_RECHECK_NOT_CI_BREAK` beats the file);
  * missing, malformed or `off` = the behaviour before this card. PURE apart from the settings file read.
  */
@@ -26,7 +26,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.mjs';
-import { FAILING_CONCLUSIONS } from '../operations/pr-status.mjs';
+import { latestAttempts, summarize } from '../lib/check-state-predicate.mjs';
 
 export const CI_HEAL_VERDICT_ENV = 'WE_CI_HEAL_RECHECK_NOT_CI_BREAK';
 export const ciHealVerdictSettingsPath = () => join(dirname(fileURLToPath(import.meta.url)), 'ci-heal-verdict-settings.json');
@@ -85,29 +85,53 @@ const sameSha = (a, b) => {
   return x.length >= 7 && y.length >= 7 && (x.startsWith(y) || y.startsWith(x));
 };
 
+const gateNames = [REVIEW_GATE_CHECK, 'merge-gate'];
+const lowerName = name => String(name ?? '').toLowerCase();
+
+/** Adapt GraphQL rollups and legacy statuses without replacing the shared state policy. */
+function checkEvidence(rollup, requiredChecks) {
+  const rows = Array.isArray(rollup) ? rollup : [];
+  const hasAttempts = rows.some(row => row?.run_attempt != null);
+  const checks = (hasAttempts ? rows : collapseRollupToLatestPerName(rows)).map(row => {
+    const check = { ...row, name: row?.name ?? row?.context };
+    if (row?.status == null && row?.state != null) {
+      if (['pending', 'expected'].includes(lowerName(row.state))) check.status = 'pending';
+      else check.conclusion = row.state;
+    }
+    return check;
+  });
+  const latest = hasAttempts ? latestAttempts(checks) : checks;
+  const roster = withoutImpliedRequiredChecks(Array.isArray(requiredChecks) ? requiredChecks : [], latest)
+    .filter(name => !gateNames.includes(lowerName(name)));
+  return { checks, roster };
+}
+
 /**
- * The required checks (minus `review-gate`) on this head, split by their LATEST run. PURE.
+ * The required checks (minus review/merge gates) on this head, split by their LATEST run. PURE.
  * An empty/unknown required set returns nothing at all: with no list to judge against, nothing is claimed.
  * @returns {{red: string[], pending: string[], missing: string[], green: string[]}}
  */
 export function requiredCheckStates({ rollup, requiredChecks }) {
   const out = { red: [], pending: [], missing: [], green: [] };
-  const latest = collapseRollupToLatestPerName(rollup);
-  const required = withoutImpliedRequiredChecks(Array.isArray(requiredChecks) ? requiredChecks : [], latest)
-    .filter((name) => name !== REVIEW_GATE_CHECK);
-  for (const name of required) {
-    const run = latest.find((r) => (r?.name ?? r?.context) === name);
-    if (!run) { out.missing.push(name); continue; }
-    // A CheckRun carries status + conclusion; a legacy StatusContext carries only `state`.
-    const isRun = run.status != null;
-    if (isRun && String(run.status).toLowerCase() !== 'completed') { out.pending.push(name); continue; }
-    const conclusion = String((isRun ? run.conclusion : run.state) ?? '').toLowerCase();
-    if (FAILING_CONCLUSIONS.includes(conclusion) || conclusion === 'error') out.red.push(name);
-    else if (conclusion === 'success') out.green.push(name);
-    else if (conclusion === 'pending' || conclusion === 'expected') out.pending.push(name);
-    else out.green.push(name); // skipped/neutral: not red, and not what a not-a-ci-break verdict is about
+  const { checks, roster } = checkEvidence(rollup, requiredChecks);
+  const { redSet, pendingSet } = summarize(checks, { requiredNames: roster });
+  const observed = new Set(checks.map(row => lowerName(row.name)));
+  for (const name of roster) {
+    const key = lowerName(name);
+    if (!observed.has(key)) out.missing.push(name);
+    else if (redSet.has(key)) out.red.push(name);
+    else if (pendingSet.has(key)) out.pending.push(name);
+    else out.green.push(name);
   }
   return out;
+}
+
+/** Include hold gates even when they are absent from the required roster. Pure. */
+export function gateOnlyRedStates({ rollup, requiredChecks }) {
+  const { checks, roster } = checkEvidence(rollup, requiredChecks);
+  const { gateOnlyRed, redSet } = summarize(checks, { requiredNames: [...roster, ...gateNames] });
+  const originalNames = new Map((Array.isArray(requiredChecks) ? requiredChecks : []).map(name => [lowerName(name), name]));
+  return { gateOnlyRed, red: [...redSet].map(name => originalNames.get(name) ?? name) };
 }
 
 /**

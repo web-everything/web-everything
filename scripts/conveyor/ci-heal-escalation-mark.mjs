@@ -57,7 +57,7 @@ import { collectCiAuthDiagnosis, renderCiAuthDiagnosis } from './ci-auth-diagnos
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { isBudgetRefusal, postPrComment, recordOwedWrite, resolveOwedRepo } from './ci-heal-owed.mjs';
-import { resolveCiHealVerdictSettings, unsettledRequiredChecks } from './ci-heal-verdict-recheck.mjs';
+import { resolveCiHealVerdictSettings, unsettledRequiredChecks, gateOnlyRedStates } from './ci-heal-verdict-recheck.mjs';
 
 /**
  * we:scripts/conveyor/ci-heal-escalation-mark.mjs#CI_HEAL_ESCALATION_MARKER — the stable FIRST LINE of the
@@ -359,6 +359,17 @@ export function notCiBreakRecordRefusal({ headSha, pr, requiredChecks }) {
       : 'Wait for the checks to finish, then decide.');
 }
 
+/** Refuse a human CI escalation when only review/merge hold gates are red on this head. Pure. */
+export function needsHumanGateOnlyRefusal({ headSha, pr, requiredChecks }) {
+  const head = String(headSha ?? '').trim().toLowerCase();
+  const prHead = String(pr?.headRefOid ?? '').trim().toLowerCase();
+  if (!head || !prHead || !(prHead.startsWith(head) || head.startsWith(prHead))) return null;
+  if (!Array.isArray(requiredChecks) || !requiredChecks.length) return null;
+  const { gateOnlyRed, red } = gateOnlyRedStates({ rollup: pr?.statusCheckRollup, requiredChecks });
+  if (!gateOnlyRed) return null;
+  return `Refusing needs-human: only ${red.join(', ')} is red on this head. This is not a CI break; ordinary review is owed.`;
+}
+
 /**
  * xo7mr6l — the head's `needs-human` escalation, when it blames MAIN's own defect (structured `cause: main-defect`,
  * or the legacy prose shapes). Pure. Evidence only: it never closes anything by itself; the caller still needs
@@ -416,16 +427,26 @@ export function postOrOweCiHealEscalation({ pr, body, headSha, repo, post = post
  * escalation (`refusal: null` plus a warning) — the daemon-side void still catches a verdict that turns out wrong.
  * Off (`ci-heal-verdict-settings.json`) or any other outcome → `{ refusal: null }` with no read at all.
  */
-export async function checkNotCiBreakRecordable({ pr, repo, headSha, outcome, settings = resolveCiHealVerdictSettings(),
-  readPr = defaultReadPrChecks, readRequired = defaultReadRequiredChecks } = {}) {
-  if (outcome !== 'not-a-ci-break' || !settings?.recheckNotCiBreak) return { refusal: null };
+export async function checkNotCiBreakRecordable(options = {}) {
+  return checkEscalationRecordable(options, 'not-a-ci-break', notCiBreakRecordRefusal);
+}
+
+/** Both preflights use the same settings switch, readers, and read-failure policy. */
+async function checkEscalationRecordable({ pr, repo, headSha, outcome, settings = resolveCiHealVerdictSettings(),
+  readPr = defaultReadPrChecks, readRequired = defaultReadRequiredChecks }, expectedOutcome, refusalFor) {
+  if (outcome !== expectedOutcome || !settings?.recheckNotCiBreak) return { refusal: null };
   try {
-    const facts = readPr({ pr, repo });
+    const facts = await readPr({ pr, repo });
     const { checks } = await readRequired({ repo: repo ?? facts?.slug ?? null });
-    return { refusal: notCiBreakRecordRefusal({ headSha, pr: facts, requiredChecks: checks }) };
+    return { refusal: refusalFor({ headSha, pr: facts, requiredChecks: checks }) };
   } catch (e) {
-    return { refusal: null, warning: `could not re-check required checks before recording not-a-ci-break: ${String(e?.message || e).split('\n')[0]}` };
+    return { refusal: null, warning: `could not re-check required checks before recording ${expectedOutcome}: ${String(e?.message || e).split('\n')[0]}` };
   }
+}
+
+/** Mirror the not-a-ci-break preflight, including its setting and warning on failed reads. */
+export async function checkNeedsHumanEscalable(options = {}) {
+  return checkEscalationRecordable(options, 'needs-human', needsHumanGateOnlyRefusal);
 }
 
 function defaultReadPrChecks({ pr, repo }) {
@@ -525,6 +546,9 @@ async function main() {
   const recordable = await checkNotCiBreakRecordable({ pr, repo, headSha: flags.head, outcome: flags.outcome });
   if (recordable.warning) process.stderr.write(`⚠ ${recordable.warning}\n`);
   if (recordable.refusal) fail(`refusing to record not-a-ci-break on PR #${pr}: ${recordable.refusal}`);
+  const escalable = await checkNeedsHumanEscalable({ pr, repo, headSha: flags.head, outcome: flags.outcome });
+  if (escalable.warning) process.stderr.write(`⚠ ${escalable.warning}\n`);
+  if (escalable.refusal) fail(`refusing to record needs-human on PR #${pr}: ${escalable.refusal}`);
   let posted;
   try {
     posted = postOrOweCiHealEscalation({
