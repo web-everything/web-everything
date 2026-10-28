@@ -3,6 +3,7 @@ import { buildVerdictComment, runReviewLabelCli } from '../../review-set-label.m
 import { DELEGATED_CLEARANCE_INELIGIBLE_LABELS } from '../review-labels.mjs';
 import { appendVerdict, EVENT_TYPES, ledgerEventId } from '../verdict-ledger.mjs';
 import labelInputHold from '../pr-state/holds/label-input.mjs';
+import { mandatoryReferralReviewer, mandatoryReferralState, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
 
 vi.mock('../verdict-ledger.mjs', async importOriginal => ({
   ...await importOriginal(),
@@ -12,7 +13,8 @@ vi.mock('../verdict-ledger.mjs', async importOriginal => ({
 const head = 'a'.repeat(40);
 
 function run({ evidence, delegated = true, accepted = false, injectAt = 2, repark = false, readError = false,
-  args, movedHead, onRead = () => {}, onAppend = () => {}, afterVerdict = false, target = 'clear-human' }) {
+  args, movedHead, onRead = () => {}, onAppend = () => {}, readComments = () => [],
+  body = '', afterVerdict = false, target = 'clear-human' }) {
   const initialLabels = ['review:human', ...(accepted ? ['review:accepted'] : [])];
   const output = [];
   let reads = 0;
@@ -36,7 +38,8 @@ function run({ evidence, delegated = true, accepted = false, injectAt = 2, repar
       onRead(reads);
       events.push(blocked ? 'blocked-read' : 'eligible-read');
       if (blocked && readError) throw new Error('labels unavailable');
-      return { state: 'OPEN', headRefOid: blocked && movedHead ? movedHead : head, comments, body: '',
+      return { state: 'OPEN', headRefOid: blocked && movedHead ? movedHead : head,
+        comments: [...comments, ...readComments()], body,
         labels: blocked && !movedHead ? evidence : initialLabels };
     }),
     readLabels: () => initialLabels,
@@ -55,6 +58,7 @@ function run({ evidence, delegated = true, accepted = false, injectAt = 2, repar
         ...(args ?? (delegated ? [`--expect-head=${head}`, '--channel=daemon',
           '--delegation-json=' + JSON.stringify({ by: 'operator', scope: 'test', expires: '2099-01-01T00:00:00Z' })] : []))],
       allowClearHuman: true, provider, buildComment: buildVerdictComment,
+      referralOptions: { readRuns: () => [], env: {} },
       successResult: result => result, emit: line => output.push(line),
       signalFix: () => {}, fileApprovalPrevention: () => null,
       findFiledApprovalPrevention: () => null,
@@ -72,6 +76,51 @@ function run({ evidence, delegated = true, accepted = false, injectAt = 2, repar
 }
 
 describe('delegated clear-human final label guard', () => {
+  it.each([false, true].flatMap(accepted => ['pending', 'blocked'].map(referral => ({ accepted, referral }))))(
+    'retains the human hold when a $referral referral arrives between ledger appends (accepted=$accepted)',
+    ({ accepted, referral }) => {
+      const original = { summary: 'new referral during verdict persistence', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+      const runId = 'run-between-ledger-appends';
+      const reviewer = mandatoryReferralReviewer(runId);
+      const key = referralFindingKey('judgeAdvisory', original);
+      const authorBody = '<!-- authored-by-actor: author -->';
+      const record = { version: 1, repo: 'o/r', pr: 7, head, runId, reviewer, authorBody, attempted: true,
+        referrals: [{ key, seat: 'judgeAdvisory', original, finding: normalizeFinding(original) }],
+        rulings: referral === 'blocked' ? [{ id: 'block-new-referral', key, reviewerId: reviewer.id,
+          lens: reviewer.lens, result: 'block', rationale: 'Hold until repaired', evidence: ['live diff'] }] : [] };
+      const comment = { author: { login: 'web-everything' }, body: renderReferralRecord(record) };
+      const referralState = mandatoryReferralState([comment], { repo: 'o/r', pr: 7, head, body: authorBody });
+      expect(referralState.pending).toEqual(referral === 'pending' ? [key] : []);
+      expect(referralState.blocked).toEqual(referral === 'blocked' ? [key] : []);
+      let published = false;
+      const timeline = [];
+      const result = run({ accepted, body: authorBody, injectAt: Infinity,
+        onAppend: row => {
+          const type = row.type ?? EVENT_TYPES.VERDICT;
+          timeline.push(type);
+          if (type === EVENT_TYPES.VERDICT) published = true;
+        },
+        readComments: () => {
+          timeline.push(published ? 'read-referral' : 'read-clear');
+          return published ? [comment] : [];
+        },
+      });
+      expect(result.exitCode).toBe(1);
+      // Finding keys contain quotes escaped by the CLI's JSON error envelope.
+      const refusal = JSON.parse(result.output.split('\n')[0]);
+      expect(refusal.error).toContain(`mandatory referral hold: ${key}`);
+      expect(result.provider.readPrState).toHaveBeenCalledTimes(3);
+      expect(timeline).toEqual(['read-clear', 'read-clear', EVENT_TYPES.VERDICT,
+        'read-referral', EVENT_TYPES.LABEL_INPUT]);
+      expectBoundaryLedger(result, 3);
+      expect(result.holds).toEqual([expect.objectContaining({ code: 'label-input:review:human' })]);
+      expect(result.provider.postComment).not.toHaveBeenCalled();
+      expect(result.provider.setLabels).not.toHaveBeenCalled();
+      expect(result.provider.addLabels).not.toHaveBeenCalled();
+      expect(result.provider.removeLabels).not.toHaveBeenCalled();
+    },
+  );
+
   it.each([false, true])('retains a new head human hold arriving between ledger appends (accepted=%s)', accepted => {
     const result = run({ accepted, injectAt: Infinity, afterVerdict: true, movedHead: 'b'.repeat(40) });
     expect(result.exitCode).toBe(1);
