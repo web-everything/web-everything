@@ -23,7 +23,6 @@ import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../conve
  */
 import { markFixPushAwaitingCi } from '../conveyor/fix-push-ci.mjs';
 import { execFileSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
 import * as nodeFs from 'node:fs';
 import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, realpathSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -457,23 +456,25 @@ export function readLaneLease(lanePath) {
   catch (e) { if (e.code === 'ENOENT') return null; throw e; }
 }
 
-/** Best-effort atomic renewal of an existing lease that still belongs to this launcher. */
+/**
+ * Best-effort in-place renewal; a replaced lease stays on a different inode.
+ * Reader visibility is not atomic: concurrent ownership checks fail closed on incomplete JSON.
+ */
 export function defaultRenewLease({ lanePath, holder } = {}) {
   try {
-    const lease = readLaneLease(lanePath);
-    if (!holder || lease?.holder !== holder) return false;
-    const next = renewedLease(lease, new Date().toISOString());
-    if (!next) return false;
     const file = join(lanePath, '.git', LEASE_FILENAME);
-    const tmp = `${file}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
+    const fd = nodeFs.openSync(file, 'r+');
     try {
-      writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { flag: 'wx' });
-      if (readLaneLease(lanePath)?.holder !== holder) return false;
-      nodeFs.renameSync(tmp, file);
+      const lease = JSON.parse(readFileSync(fd, 'utf8'));
+      if (!holder || lease?.holder !== holder) return false;
+      const next = renewedLease(lease, new Date().toISOString());
+      if (!next) return false;
+      const contents = Buffer.from(`${JSON.stringify(next, null, 2)}\n`);
+      nodeFs.ftruncateSync(fd, 0);
+      return nodeFs.writeSync(fd, contents, 0, contents.length, 0) === contents.length;
     } finally {
-      rmSync(tmp, { force: true });
+      nodeFs.closeSync(fd);
     }
-    return true;
   } catch { return false; }
 }
 

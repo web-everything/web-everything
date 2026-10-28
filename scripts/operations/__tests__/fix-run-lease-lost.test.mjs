@@ -1,6 +1,14 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, onTestFinished } from 'vitest';
+import { existsSync, ftruncateSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { assertLaneLease, runFixCli } from '../fix-run.mjs';
+import { assertLaneLease, defaultRenewLease, readLaneLease, runFixCli } from '../fix-run.mjs';
+
+vi.mock('node:fs', async importOriginal => {
+  const fs = await importOriginal();
+  return { ...fs, ftruncateSync: vi.fn(fs.ftruncateSync) };
+});
 
 const holder = 'conveyor-fix-lane-10-eaae3ffe';
 const foreign = 'orchestrator-slots-lane-10-4fef772b';
@@ -34,6 +42,99 @@ function fixture({ head = prHead, owner = holder, lanePath = '/lanes/lane-10' } 
     renewLease, lanePath };
 }
 const argv = ['--pr=5759', '--session=fix-5759', '--ref=lane/pr', '--prompt-file=/p', '--provider=codex'];
+
+function diskLeaseFixture() {
+  const lanePath = mkdtempSync(join(tmpdir(), 'fix-renew-lease-'));
+  onTestFinished(() => rmSync(lanePath, { recursive: true, force: true }));
+  const gitDir = join(lanePath, '.git');
+  mkdirSync(gitDir);
+  return { lanePath, gitDir, file: join(gitDir, '.lane-lease') };
+}
+
+describe('defaultRenewLease on disk', () => {
+  it('renews an owned lease in place, setting renewedAt and keeping the holder', () => {
+    const { lanePath, file } = diskLeaseFixture();
+    const lease = { holder, acquiredAt: '2026-01-01T00:00:00.000Z' };
+    writeFileSync(file, JSON.stringify(lease) + ' '.repeat(512));
+    const before = statSync(file);
+
+    expect(defaultRenewLease({ lanePath, holder })).toBe(true);
+
+    const contents = readFileSync(file, 'utf8');
+    const renewed = JSON.parse(contents);
+    expect(renewed).toEqual({ ...lease, renewedAt: expect.any(String) });
+    expect(new Date(renewed.renewedAt).toISOString()).toBe(renewed.renewedAt);
+    expect(contents).toBe(`${JSON.stringify(renewed, null, 2)}\n`);
+    const after = statSync(file);
+    expect([after.dev, after.ino]).toEqual([before.dev, before.ino]);
+  });
+
+  it('returns false for a missing lease without creating a file', () => {
+    const { lanePath, gitDir, file } = diskLeaseFixture();
+
+    expect(defaultRenewLease({ lanePath, holder })).toBe(false);
+
+    expect(existsSync(file)).toBe(false);
+    expect(readdirSync(gitDir)).toEqual([]);
+  });
+
+  it('returns false and leaves a foreign lease byte-identical', () => {
+    const { lanePath, file } = diskLeaseFixture();
+    const contents = Buffer.from(`{ "holder": "${foreign}", "renewedAt": "2026-01-01T00:00:00.000Z" }\n`);
+    writeFileSync(file, contents);
+
+    expect(defaultRenewLease({ lanePath, holder })).toBe(false);
+
+    expect(readFileSync(file)).toEqual(contents);
+  });
+
+  it('fails closed when an ownership check reads the lease during renewal', async () => {
+    const { lanePath, file } = diskLeaseFixture();
+    writeFileSync(file, JSON.stringify({ holder }));
+    const fs = await vi.importActual('node:fs');
+    let readError, ownershipError;
+    vi.mocked(ftruncateSync).mockImplementationOnce((fd, length) => {
+      fs.ftruncateSync(fd, length);
+      try { readLaneLease(lanePath); } catch (e) { readError = e; }
+      try { assertLaneLease({ lanePath, holder }); } catch (e) { ownershipError = e; }
+    });
+
+    expect(defaultRenewLease({ lanePath, holder })).toBe(true);
+
+    // Truncate + write deliberately trades atomic reader visibility for successor safety.
+    expect(readError).toBeInstanceOf(SyntaxError);
+    expect(ownershipError).toBeInstanceOf(Error);
+    expect(readLaneLease(lanePath)).toEqual({ holder, renewedAt: expect.any(String) });
+    expect(() => assertLaneLease({ lanePath, holder })).not.toThrow();
+  });
+
+  it.each(['deleted', 'replaced'])('never recreates or overwrites a lease %s during renewal', async kind => {
+    const { lanePath, gitDir, file } = diskLeaseFixture();
+    writeFileSync(file, JSON.stringify({ holder }));
+    const contents = Buffer.from(`{ "holder": "${foreign}" }\n`);
+    const successor = join(gitDir, 'successor');
+    if (kind === 'replaced') writeFileSync(successor, contents);
+    const fs = await vi.importActual('node:fs');
+    let observedDuringRenewal;
+    vi.mocked(ftruncateSync).mockImplementationOnce((fd, length) => {
+      if (kind === 'deleted') rmSync(file);
+      else renameSync(successor, file);
+      fs.ftruncateSync(fd, length);
+      observedDuringRenewal = readLaneLease(lanePath);
+    });
+
+    expect(defaultRenewLease({ lanePath, holder })).toBe(true);
+
+    if (kind === 'deleted') {
+      expect(observedDuringRenewal).toBeNull();
+      expect(existsSync(file)).toBe(false);
+      expect(readdirSync(gitDir)).toEqual([]);
+    } else {
+      expect(observedDuringRenewal).toEqual({ holder: foreign });
+      expect(readFileSync(file)).toEqual(contents);
+    }
+  });
+});
 
 describe('fix-run lane lease heartbeat', () => {
   it('renews our lease at least twice while spawn is pending and stops after returning', async () => {
