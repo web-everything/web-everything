@@ -88,6 +88,7 @@ function harness({ gitExec, resolveRealFiles, priorityReserve, reservePath, stra
   const writeState = (_p, s) => { stored = JSON.parse(JSON.stringify(s)); };
   const s = createDrainMergeStrategy({
     ...strategyExtra,
+    writeFile: strategyExtra.writeFile ?? vi.fn(),
     ...(resolveRealFiles ? { resolveRealFiles } : {}),
     ...(priorityReserve ? { priorityReserve } : {}), ...(reservePath ? { reservePath } : {}),
     dryRun, env, labelProvider, readReviewAgents, readRedTeamEvidence: (o) => { if (evidenceFor) return evidenceFor(o); if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }, requestRedTeam, publishNeedsYou, redTeamDeadline, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
@@ -1859,6 +1860,32 @@ describe('queue safeguard overrides and untracked queue entries', () => {
     h.s.dequeueSendBacks([{ number: 5283, labels: [] }]);
     expect(h.calls.some(c => c.some(a => String(a).includes('dequeuePullRequest')))).toBe(false);
   });
+
+  it('empty discovery clears rebuild history before re-enqueue', () => {
+    const enqueuedAt = '2026-10-26T10:39:00Z';
+    let nodes = [];
+    let h;
+    const writeFile = vi.fn((_path, json) => h.setState(JSON.parse(json)));
+    h = harness({ strategy: 'github-merge-queue', queued: true, env: { WE_UNDER_TEST: '1' },
+      queueFacts: () => ({ data: { repository: { mergeQueue: { entries: { pageInfo: { hasNextPage: false }, nodes } } } } }),
+      strategyExtra: { writeFile } });
+    const pass = (group, time = enqueuedAt) => {
+      nodes = group ? [{ state: 'AWAITING_CHECKS', enqueuedAt: time,
+        headCommit: { oid: group.repeat(40), statusCheckRollup: { state: 'PENDING' } },
+        pullRequest: { id: 'PR_NODE', number: 5283 } }] : [];
+      h.s.dequeueSendBacks([{ number: 99, labels: ['review:changes'] }]);
+    };
+    for (const group of ['a', 'b', 'c']) pass(group);
+    expect(h.state()[5283].count).toBe(2);
+    const calls = h.calls.length;
+    pass(null);
+    expect(h.state()).toEqual({});
+    expect(h.calls.length - calls).toBe(1);
+    pass('d', '2026-10-26T11:59:00Z');
+    expect(h.state()[5283].count).toBe(0);
+    expect(h.calls.some(c => c.some(a => String(a).includes('dequeuePullRequest')))).toBe(false);
+  });
+
 
   it('dequeueSendBacks sweeps an UNMERGEABLE queue entry each pass even without send-back rows', () => {
     const queueFacts = { data: { repository: { mergeQueue: { entries: { pageInfo: { hasNextPage: false }, nodes: [{

@@ -12,12 +12,12 @@ describe('main regression coverage', () => {
 
 
 const file = 'backlog/1-card.md';
-function reader({ nodes = [{ pullRequest: { number: 7 } }], hasNextPage = false, files = [{ path: file }], error, viewError, resolveFiles } = {}) {
+function reader({ nodes = [{ pullRequest: { number: 7 } }], hasNextPage = false, pageInfo = { hasNextPage }, files = [{ path: file }], error, viewError, resolveFiles } = {}) {
   const exec = vi.fn((cmd, args) => {
     expect(cmd).toBe('gh');
     if (args[0] === 'api') {
       if (error) throw new Error(error);
-      return JSON.stringify({ data: { repository: { mergeQueue: { entries: { nodes, pageInfo: { hasNextPage } } } } } });
+      return JSON.stringify({ data: { repository: { mergeQueue: { entries: { nodes, pageInfo } } } } });
     }
     if (viewError) throw new Error(viewError);
     return JSON.stringify({ files, headRefOid: 'a'.repeat(40), headRefName: 'lane/queued', baseRefName: 'main' });
@@ -37,15 +37,19 @@ describe('readQueueEntryFiles fail-closed grouping reads', () => {
 
   it.each([
     ['more than 100 queue entries', { hasNextPage: true }],
+    ['missing pagination evidence', { pageInfo: null }],
+    ['pagination without hasNextPage', { pageInfo: {} }],
+    ['101 nodes despite hasNextPage false', { nodes: Array.from({ length: 101 }, (_, i) => ({ pullRequest: { number: i + 1 } })) }],
     ['missing queue page', { nodes: null }],
     ['invalid entry', { nodes: [{ pullRequest: null }] }],
     ['invalid PR number', { nodes: [{ pullRequest: { number: '7' } }] }],
     ['unreadable queue', { error: 'offline' }],
     ['unreadable file list', { viewError: 'view offline' }],
   ])('refuses %s before a group claim', (_, options) => {
-    const { result } = reader(options);
+    const { result, exec } = reader(options);
     expect(result.error).toBeTruthy();
     expect(queueBlocksGroup(result, { sources: [{ num: 1 }], files: [file] })).toMatch(/merge queue unreadable/);
+    if (options.pageInfo !== undefined || options.nodes?.length > 100) expect(exec).toHaveBeenCalledTimes(1);
   });
 
   it.each([

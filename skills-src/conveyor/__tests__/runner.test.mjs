@@ -30,6 +30,7 @@ import {
   MECHANICAL_PASS_NAMES, resolveSkipPasses, wireSelfSyncAndAppAuth,
 } from '../runner.mjs';
 import { localDateString } from '../../../scripts/lib/local-date.mjs';
+import { writeOpenPrSnapshot } from '../../../scripts/conveyor/open-pr-snapshot.mjs';
 
 // Keep real exports for transitive imports; inject the mocked exec into the runner.
 vi.mock('node:child_process', async (importOriginal) => {
@@ -46,6 +47,23 @@ vi.mock('../../../scripts/lib/gh-throttle.mjs', async (importOriginal) => {
     execFileSyncThrottled: (file, args, opts) => execFileSync(file, args, opts),
   };
 });
+
+// Translate the historical subprocess router at the new async timed-job boundary.
+// The committed assertions below continue to check the same argv and results.
+function runPassWithExec(exec) {
+  return async ({ entry }, { root }) => {
+    if (entry.script.endsWith('conveyor/open-pr-snapshot.mjs')) {
+      writeOpenPrSnapshot({
+        repo: entry.args.find(arg => arg.startsWith('--repo='))?.slice(7),
+        output: entry.args.find(arg => arg.startsWith('--output='))?.slice(9),
+      });
+      return { code: 0, signal: null };
+    }
+    return { code: 0, signal: null, output: exec('node', [join(root, entry.script), ...entry.args], {
+      encoding: 'utf8', stdio: ['ignore', entry.capture ? 'pipe' : 'ignore', 'pipe'], maxBuffer: 32 * 1024 * 1024,
+    }) };
+  };
+}
 
 const T0 = Date.parse('2026-07-27T12:00:00.000Z');
 const MIN = 60_000;
@@ -541,7 +559,7 @@ describe('makeCliMechanicalPasses — the review-reconcile dispatch block never 
     const cp = await import('node:child_process');
     cp.execFileSync.mockImplementation(execFileSync);
 
-    const mechanicalPasses = makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'web-everything/web-everything', exec: cp.execFileSync });
+    const mechanicalPasses = makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'web-everything/web-everything', runPass: runPassWithExec(cp.execFileSync) });
     await mechanicalPasses({ out: {} });
 
     const dispatchCalls = calls.filter((c) => c.join(' ').includes('review-dispatch.mjs'));
@@ -558,7 +576,7 @@ describe('makeCliMechanicalPasses — the review-reconcile dispatch block never 
     const cp = await import('node:child_process');
     cp.execFileSync.mockImplementation(execFileSync);
 
-    const mechanicalPasses = makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'web-everything/web-everything', exec: cp.execFileSync });
+    const mechanicalPasses = makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'web-everything/web-everything', runPass: runPassWithExec(cp.execFileSync) });
     await mechanicalPasses({ out: {} });
 
     const roundTagCalls = calls.filter((c) => c.join(' ').includes('review-round-tag.mjs'));
@@ -574,7 +592,7 @@ describe('makeCliMechanicalPasses — the review-reconcile dispatch block never 
     const cp = await import('node:child_process');
     cp.execFileSync.mockImplementation(execFileSync);
 
-    const mechanicalPasses = makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'web-everything/web-everything', exec: cp.execFileSync });
+    const mechanicalPasses = makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'web-everything/web-everything', runPass: runPassWithExec(cp.execFileSync) });
     await mechanicalPasses({ out: {} });
 
     const statusTagCalls = calls.filter((c) => c.join(' ').includes('review-status-tag.mjs'));
@@ -603,7 +621,7 @@ describe('makeCliMechanicalPasses — invokes the exact set of mechanical passes
     const cp = await import('node:child_process');
     cp.execFileSync.mockImplementation(execFileSync);
 
-    const mechanicalPasses = makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'web-everything/web-everything', exec: cp.execFileSync });
+    const mechanicalPasses = makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'web-everything/web-everything', runPass: runPassWithExec(cp.execFileSync) });
     await mechanicalPasses({ out: {} });
 
     // The exact relative script path (or literal flag) each call carries, in the order `execFileSync` saw them
@@ -617,12 +635,13 @@ describe('makeCliMechanicalPasses — invokes the exact set of mechanical passes
       'node /scripts/conveyor/branch-drift.mjs sweep --repo=web-everything/web-everything',
       'node /scripts/conveyor/lane-pool-health-watch.mjs --repo=web-everything/web-everything',
       'node /scripts/operations/operator-notify.mjs --once --repo=web-everything/web-everything',
+      'node /scripts/conveyor/ci-queue-watch.mjs sweep --repo=web-everything/web-everything',
       'node /scripts/conveyor/reconcile-fix-dispatch.mjs --repo=web-everything/web-everything',
       'node /scripts/operations/ci-heal-pr-dispatch.mjs --repo=web-everything/web-everything',
       'node /scripts/operations/promote-draft-pr-dispatch.mjs --repo=web-everything/web-everything',
-      'node /scripts/conveyor/ci-queue-watch.mjs sweep --repo=web-everything/web-everything',
       'node /scripts/conveyor/parked-pr-conflict-watch.mjs sweep --repo=web-everything/web-everything',
       'node /scripts/conveyor/advisory-label-sweep.mjs sweep --repo=web-everything/web-everything',
+      'node /scripts/conveyor/delegated-clear-human.mjs sweep --repo=web-everything/web-everything',
       'node /scripts/conveyor/review-hold-reconcile.mjs sweep --repo=web-everything/web-everything',
       'node /scripts/conveyor/reconcile-pass.mjs --json --repo=web-everything/web-everything',
       'node /scripts/conveyor/duplicate-pr-watch.mjs sweep --repo=web-everything/web-everything',
@@ -644,6 +663,7 @@ import { OPEN_PR_LIST_FIELDS } from '../../../scripts/conveyor/open-pr-fetch.mjs
 const consumers = {
   'parked-pr-conflict-watch.mjs': listConflicts,
   'advisory-label-sweep.mjs': listAdvisory,
+  'delegated-clear-human.mjs': listAdvisory,
   // #x01u7az — the sibling sweep piggybacks on the SAME shared snapshot AND the same standalone-fallback
   // reader (it reuses `advisory-label-sweep.mjs#defaultListPrs` directly rather than a second copy).
   'review-hold-reconcile.mjs': listAdvisory,
@@ -682,7 +702,7 @@ describe('one open-PR snapshot per mechanical tick', () => {
       return name === 'reconcile-pass.mjs' ? JSON.stringify({ dispatch: [], refusals: [] }) : '';
     });
     try {
-      const run = makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'web-everything/web-everything', exec: cp.execFileSync });
+      const run = makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'web-everything/web-everything', runPass: runPassWithExec(cp.execFileSync) });
       for (let i = 0; i < ticks; i++) await run({ out: {} });
       for (const snapshot of snapshots) expect(snapshot).toEqual(fixture);
       return { calls, files, warnings: stderr.mock.calls.map(([line]) => line) };
@@ -695,7 +715,7 @@ describe('one open-PR snapshot per mechanical tick', () => {
     return calls.filter(([cmd, script]) => cmd === 'node' && consumers[script.split('/').pop()]);
   }
 
-  it('fetches exactly once and invokes all six consumers once with the same live file, then deletes it', async () => {
+  it('fetches exactly once and invokes all seven consumers once with the same live file, then deletes it', async () => {
     const { calls, files } = await tick();
     const fetches = calls.filter(([cmd, ...args]) => cmd === 'gh' && args[0] === 'pr' && args[1] === 'list');
     expect(fetches).toEqual([['gh', 'pr', 'list', '--state', 'open', '--limit', '200', '--json', OPEN_PR_LIST_FIELDS, '--repo', 'web-everything/web-everything']]);
@@ -704,7 +724,7 @@ describe('one open-PR snapshot per mechanical tick', () => {
       expect(call.some((a) => a.startsWith('--prs-file='))).toBe(false);
     }
     expect(consumed.map((c) => c[1].split('/').pop())).toEqual(Object.keys(consumers));
-    expect(files).toHaveLength(6);
+    expect(files).toHaveLength(7);
     expect(new Set(files).size).toBe(1);
     for (const call of consumed) {
       expect(call).toContain(`--prs-file=${files[0]}`);
@@ -713,21 +733,21 @@ describe('one open-PR snapshot per mechanical tick', () => {
     expect(existsSync(files[0])).toBe(false);
   });
 
-  it('warns once on shared-fetch failure and all six consumers perform their standalone discovery without a flag', async () => {
+  it('warns once on shared-fetch failure and all seven consumers perform their standalone discovery without a flag', async () => {
     const { calls, files, warnings } = await tick({ fetchThrows: true });
     const consumed = consumerCalls(calls);
     expect(consumed.map((c) => c[1].split('/').pop())).toEqual(Object.keys(consumers));
     expect(consumed.flat().some((a) => a.startsWith('--prs-file='))).toBe(false);
     expect(files).toEqual([]);
-    expect(calls.filter(([cmd]) => cmd === 'gh')).toHaveLength(7); // failed shared attempt + six fallbacks
+    expect(calls.filter(([cmd]) => cmd === 'gh')).toHaveLength(8); // failed shared attempt + seven fallbacks
     expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toContain('mechanical pass open-pr-fetch [we] failed (non-fatal): shared discovery failed');
+    expect(warnings[0]).toContain('mechanical pass conveyor/open-pr-snapshot.mjs [we] failed (non-fatal): shared discovery failed');
   });
 
   it('cleans up even when consumers fail, still invoking every consumer', async () => {
     const { calls, files } = await tick({ consumerThrows: true });
-    expect(consumerCalls(calls)).toHaveLength(6);
-    expect(files).toHaveLength(6);
+    expect(consumerCalls(calls)).toHaveLength(7);
+    expect(files).toHaveLength(7);
     for (const file of files) expect(existsSync(file)).toBe(false);
   });
 
@@ -790,7 +810,7 @@ describe('makeCliMechanicalPasses — skipPasses omits exactly the named pass(es
     const cp = await import('node:child_process');
     cp.execFileSync.mockImplementation(execFileSync);
     const mechanicalPasses = makeCliMechanicalPasses({
-      scriptsDir: '/scripts', repo: 'web-everything/web-everything', exec: cp.execFileSync, skipPasses,
+      scriptsDir: '/scripts', repo: 'web-everything/web-everything', runPass: runPassWithExec(cp.execFileSync), skipPasses,
     });
     await mechanicalPasses({ out: {} });
     return calls.filter((c) => c[0] === 'node').map((c) => c[1]);

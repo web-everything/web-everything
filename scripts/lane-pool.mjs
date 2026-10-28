@@ -2174,6 +2174,18 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
 }
 
 async function cmdAcquire(repo) {
+  const assertExpectedHolder = (dir) => {
+    if (flags['expect-holder'] === undefined) return;
+    const expected = flags['expect-holder'];
+    const current = readLease(dir)?.holder;
+    if (typeof expected !== 'string' || !expected || current !== expected) {
+      fail(`${basename(dir)}: expected lease holder ${expected}, found ${current || 'no lease holder'} — refusing acquire; inspect the current lease before retrying.`);
+    }
+  };
+  if (flags['expect-holder'] !== undefined) {
+    if (flags.lane === undefined) fail('--expect-holder requires an explicit --lane=N');
+    assertExpectedHolder(laneDir(repo, Number(flags.lane)));
+  }
   // #2386 — `--base` and `--no-reset` are mutually exclusive: `--base=<ref>` means "reset this clone to <ref>",
   // and `--no-reset` skips the reset entirely. Honoring both would skip the reset yet still report the base as
   // applied (log line + JSON `base`), so an orchestrator stacking a serial batch would believe the lane sits on
@@ -2236,6 +2248,7 @@ async function cmdAcquire(repo) {
     // silently un-reserving it and WIPING the memory it exists to hold (the exact footgun #2350 prevents).
     // Only `--reserve` may touch a reserved lane (an idempotent re-reserve, which keeps `reserved:true`).
     const preExisting = readLease(dir);
+    assertExpectedHolder(dir);
     preClaimLease = preExisting;
     if (isReservedLease(preExisting)) {
       if (!flags.reserve) {
@@ -4705,7 +4718,7 @@ function cmdUnmap(repo) {
 const KNOWN_FLAGS = new Set([
   'acquirable', 'adopt', 'all', 'all-pools', 'base', 'branch', 'count', 'force', 'item', 'json', 'lane',
   'name', 'no-install', 'no-reap', 'no-reset', 'origin', 'pool', 'purpose', 'reference', 'release-reserved',
-  'repo', 'reserve', 'scope', 'session', 'ttl-minutes', 'wait-ms',
+  'repo', 'reserve', 'scope', 'session', 'expect-holder', 'ttl-minutes', 'wait-ms',
   // #xn432dz — list --acquirable's single-flight cache / early-stop / bounded-scan knobs.
   'limit', 'no-cache', 'cache-ttl-ms', 'scan-timeout-ms',
   // list --acquirable's per-lane "holds un-pushed work" memo (see VERDICT_MEMO_FILE).
@@ -4812,7 +4825,7 @@ if (!cmd || cmd === 'help' || cmd === '--help' || !COMMANDS[cmd]) {
   if (cmd && cmd !== 'help' && cmd !== '--help') process.stderr.write(`unknown command: ${cmd}\n`);
   process.stderr.write(
     'usage: lane-pool.mjs <apply-git-maintenance-config|gc|provision|refresh|status|list|path|acquire|adopt|release|remove|trim|reclaim|keep|map|unmap> [--count=N] [--lane=N] [--all] [--all-pools] [--acquirable] [--max-new=N] ' +
-      '[--item=NNN[,NNN…]] [--purpose=<slug>] [--session=<slug>] [--adopt] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--release-reserved] [--ttl-minutes=N] [--no-reset] [--no-reap] [--limit=N] [--no-cache] [--cache-ttl-ms=N] [--scan-timeout-ms=N] [--repo=<path>] [--pool=<name>] [--origin=<url>] ' +
+      '[--item=NNN[,NNN…]] [--purpose=<slug>] [--session=<slug>] [--expect-holder=<slug>] [--adopt] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--release-reserved] [--ttl-minutes=N] [--no-reset] [--no-reap] [--limit=N] [--no-cache] [--cache-ttl-ms=N] [--scan-timeout-ms=N] [--repo=<path>] [--pool=<name>] [--origin=<url>] ' +
       '[--reference=<path>] [--name=<slug>] [--branch=<ref>] [--no-install] [--force] [--json] [--max=N] [--dry-run] [--override] [--reason=<text>] ' +
       '[--no-free-list] [--free-list-max-age-ms=N] [--leased-only]  # trim: shrink a pool to --max lanes (default per-repo cap; env LANE_POOL_TRIM_MAX)\n' +
       '  # apply-git-maintenance-config [--dry-run] [--clone=<path> repeatable]: apply fixed Git config to all pool/daemon clones, or only selected clones\n' +

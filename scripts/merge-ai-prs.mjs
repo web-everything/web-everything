@@ -4591,9 +4591,8 @@ async function runCli() {
   const onlyPr = flags.only != null ? String(flags.only) : (flags.couple != null ? String(flags.couple) : (flags.pr != null ? String(flags.pr) : null));
   const fastDrain = onlyPr != null ? resolveFastDrainScopeSetting() : { scope: 'full' };
   if (onlyPr != null) process.stderr.write(`${fastDrain.line}\n`);
-  const fastDrainListing = { ...(onlyPr != null ? resolveFastDrainListingSetting() : { listing: 'live' }),
-    snapshotPath: onlyPr != null && typeof flags['listing-snapshot'] === 'string' ? flags['listing-snapshot'] : null };
-  const listingSnapshot = fastDrainListing.listing !== 'live' ? fastDrainListing.snapshotPath : null;
+  const fastDrainListing = onlyPr != null ? resolveFastDrainListingSetting() : { listing: 'live' };
+  const listingSnapshot = onlyPr != null && fastDrainListing.listing !== 'live' && typeof flags['listing-snapshot'] === 'string' ? flags['listing-snapshot'] : null;
   if (onlyPr != null) process.stderr.write(`${fastDrainListing.line}\n`);
   // #2683 — the target repo for `--only=<pr>`. PR numbers are per-repo (WE #12 ≠ FUI #12), so a bare `--only=12`
   // on the DEFAULT constellation scope would match a same-numbered PR in EVERY repo. `--only-repo=<slug>` names
@@ -5056,7 +5055,7 @@ async function runCli() {
       for (const { repo, p } of flat) { const k = prCacheKey(repo, p.number); out.set(k, readsRaw.get(k)?.value || {}); }
       return out;
     },
-    onListingFailed: (repo) => { if (!AS_JSON) process.stderr.write(`  ⚠️  FAILED open-PR listing for ${repoTag(repo) || 'cwd'}: gh pr list threw — the couple gate treats the open-PR context as INCOMPLETE this pass (fail closed; #xc7p3q9 B2).\n`); },
+    onListingFailed: (repo) => { process.stderr.write(`  ⚠️  FAILED open-PR listing for ${repoTag(repo) || 'cwd'}: gh pr list threw — the couple gate treats the open-PR context as INCOMPLETE this pass (fail closed; #xc7p3q9 B2).\n`); },
     onListingTruncated: (repo, n) => { if (!AS_JSON) process.stderr.write(`  ⚠️  DEGRADED open-PR listing for ${repoTag(repo) || 'cwd'}: ${n} PRs hit the --limit ${OPEN_PR_LIST_LIMIT} cap — the page MAY be truncated (oldest, longest-held blockers dropped first). The cross-item merge order derived from this listing is NOT trustworthy for the early-land decision this pass (#999/xq985wu F3).\n`); },
   });
 
@@ -5334,8 +5333,7 @@ async function runCli() {
     try {
       const slug = repo || localSlug;
       let listed = {};
-      const roundPath = fastDrainListing.listing !== 'live' && fastDrainListing.snapshotPath
-        && isFastDrainTarget(repo, { number: onlyPr }) ? fastDrainListing.snapshotPath : null;
+      const roundPath = listingSnapshot && isFastDrainTarget(repo, { number: onlyPr }) ? listingSnapshot : null;
       const fields = RECONCILE ? SWEEP_LIST_FIELDS
         : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '');
       const readTarget = () => __t.timeAsync('listing.target', async () => {
@@ -5412,7 +5410,7 @@ async function runCli() {
       if (listed.truncated || truncated) process.stderr.write(`  ⚠️  DEGRADED drain listing for ${repoTag(repo) || 'cwd'}: the open-PR list hit the --limit ${OPEN_PR_LIST_LIMIT} cap — it MAY be truncated, so a ${label || 'candidate'} PR past it can be missing this pass (#no-label-search)\n`);
       // A round listing is candidate evidence only, even after its target is refreshed.
       // Context must re-list live to discover newly opened blockers/carriers/siblings.
-      return { repo, prs, rows, listing: roundPath ? 'snapshot' : 'live' };
+      return { repo, prs, rows, listing: roundPath ? 'snapshot' : 'live', readLiveRows: listLive };
     }
     catch (e) { return { repo, err: describeGhListError(e) }; }
   };
@@ -5448,7 +5446,6 @@ async function runCli() {
   // is always an array here (never undefined): the `listErr` check above already `fail()`-exited on any entry
   // that lacks one (an errored `listOne` returns `{repo, err}`, no `rows`).
   const liveListingsByRepo = buildLiveListingsByRepo(listings);
-  for (const listing of listings) mergeStrategy.dequeueSendBacks(listing.rows, listing.repo);
   // #2421 — the shared open-PR listing + manifest reads + cross-repo item-openness set the reconcile below
   // needs, computed ONCE for this pass (RECONCILE-gated — same cost profile as the reconcile it feeds: free on
   // a bare, unlabelled sweep). #4108 — reuses `liveListingsByRepo` above instead of re-listing every repo in
@@ -5461,6 +5458,20 @@ async function runCli() {
     repoll: () => repollUnknownListings({ prsByRepo, read: fetchFreshPrForRevalidation, setting: UNKNOWN_RETRY, concurrency: resolvedMergePolicy.policy.concurrency.gateReads, localCheck: localMergeCheck, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) }),
     collect: () => (RECONCILE ? __t.timeAsync('listing', () => __t.timeAsync('listing.context', () => collectContext(liveListingsByRepo))) : reduceOpenPrContext({ listings: [], reads: new Map(), reconcileRan: false })),
   });
+  // Eviction needs live labels for ALL open PRs, including manually queued entries absent from follow-ups.
+  // Round snapshots are candidate evidence only. Reuse the live context listing when available; a bare
+  // fast drain must obtain its own fresh rows. Failed context reads already log and contribute no rows.
+  for (const listing of listings) {
+    if (DRY_RUN || !mergeStrategy.enqueues(listing.repo)) continue;
+    try {
+      const rows = listing.listing !== 'snapshot' ? listing.rows
+        : RECONCILE ? openPrContext.prsByRepo.get(listing.repo) ?? []
+          : await __t.timeAsync('listing.eviction', listing.readLiveRows);
+      mergeStrategy.dequeueSendBacks(rows, listing.repo);
+    } catch (e) {
+      process.stderr.write(`  ⚠ merge-queue dequeue sweep for ${repoTag(listing.repo) || 'cwd'} failed (${describeGhListError(e).text}) — retried next pass\n`);
+    }
+  }
   // #xc7p3q9 (R2) — the operator escape hatch symmetric to `--no-review-escalation`: `--assume-complete-context`
   // FORCES the context complete so a genuinely-stuck couple (e.g. a persistent read-noise fail-closed) can land
   // short of editing the script. Prints a LOUD one-line waiver. Off by default; the fail-closed gate stays live.

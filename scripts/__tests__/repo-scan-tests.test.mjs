@@ -29,16 +29,22 @@ describe('selectScanTests', () => {
     const { scoped, full, scopedFiles } = selectScanTests({ changedFiles: ['scripts/lib/new-thing.mjs'] });
     expect(scoped.map((e) => e.test)).toContain(MULTI);
     expect(scopedFiles).toEqual(['scripts/lib/new-thing.mjs']);
-    // The sole-writer, review-policy, and sandbox-list guards derive whole-tree facts.
+    // The ownership, sole-writer, review-policy, and sandbox-list guards derive whole-tree facts.
     expect(full.map((e) => [e.test, e.scope])).toEqual([
+      ['scripts/lib/__tests__/constellation-ownership.test.mjs', 'full'],
       ['scripts/conveyor/__tests__/pr-label-mirror.test.mjs', 'full'],
       ['scripts/lib/__tests__/review-policy.conformance.test.mjs', 'full'],
       ['scripts/lib/__tests__/permission-change.test.mjs', 'full'],
     ]);
   });
 
-  it('a docs-only or backlog-only change runs no scanner (cost stays zero)', () => {
-    expect(selectScanTests({ changedFiles: ['docs/agent/x.md', 'backlog/1-x.md'] })).toEqual({ scoped: [], full: [], widened: [], scopedFiles: [] });
+  it('docs and backlog changes select only the full ownership scan; no diff selects nothing', () => {
+    expect(selectScanTests({ changedFiles: ['docs/agent/x.md', 'backlog/1-x.md'] })).toEqual({
+      scoped: [],
+      full: [REPO_SCAN_TESTS.find((e) => e.test === 'scripts/lib/__tests__/constellation-ownership.test.mjs')],
+      widened: [],
+      scopedFiles: [],
+    });
     expect(scanCommands({ changedFiles: null })).toEqual([]);
   });
 
@@ -75,7 +81,7 @@ describe('the verify gate wires the scanners in', () => {
     if (args[0] === 'grep') return '';
     return '';
   };
-  it('a new scanned file adds the scoped scan to the gate command; docs-only leaves it unchanged', () => {
+  it('a new source adds scoped scans; docs-only runs the full ownership inventory', () => {
     // pin the policy: the shipped default is `auto`, which skips check:standards for a scripts/ diff — and this
     // assertion is about the scan half's position relative to the check:standards half
     const withScan = resolveDefaultGate({ runGit: git(['scripts/lib/new-thing.mjs']), env: { WE_VERIFY_STANDARDS: 'always' }, fileExists: () => true });
@@ -84,8 +90,8 @@ describe('the verify gate wires the scanners in', () => {
     expect(withScan.command.indexOf('vitest related')).toBeLessThan(withScan.command.indexOf(SCAN_FILES_ENV));
     expect(withScan.command.indexOf(SCAN_FILES_ENV)).toBeLessThan(withScan.command.indexOf('check:standards'));
     const docs = resolveDefaultGate({ runGit: git(['docs/readme.md']), env: {}, fileExists: () => true });
-    expect(docs.scanCommands).toEqual([]);
-    expect(docs.command).not.toContain(SCAN_FILES_ENV);
+    expect(docs.scanCommands).toEqual([`${SCAN_FILES_ENV}='[]' npx vitest run 'scripts/lib/__tests__/constellation-ownership.test.mjs' --testTimeout=15000 --hookTimeout=30000`]);
+    expect(docs.command).toContain(docs.scanCommands[0]);
     // a checkout without the scanner tests (a sibling repo, a fixture) gets no scan half, and so no missing-file failure
     expect(resolveDefaultGate({ runGit: git(['scripts/lib/new-thing.mjs']), env: {}, fileExists: () => false }).scanCommands).toEqual([]);
     expect(resolveDefaultGate({ runGit: git(['scripts/lib/new-thing.mjs']), env: {} }).scanCommands).toEqual([]);

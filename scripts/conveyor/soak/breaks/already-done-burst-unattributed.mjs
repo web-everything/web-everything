@@ -61,12 +61,23 @@ export default {
       '',
     ].join('\n'));
     chmodSync(join(bin, 'gh'), 0o755);
+    // The fixture's cwd is a throwaway SHALLOW repo with a github `origin`, never the host checkout: the local
+    // merged-PR index (`readGitAlreadyDone`) only steps aside for the `gh` path under a shallow clone, so running
+    // in the real checkout made this break depend on CI's clone depth (a full clone fetched origin/main — a live
+    // remote read — and never reached the `gh` burst under test).
+    const repo = mkdtempSync(join(tmpdir(), 'soak-already-done-burst-repo-'));
+    const gitEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_')));
+    const git = (...args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: gitEnv, maxBuffer: 1024 * 1024 }).trim();
+    git('init', '-q');
+    git('config', 'remote.origin.url','https://github.com/soak-org/soak-repo.git');
+    git('-c', 'user.name=soak', '-c', 'user.email=soak@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'seed');
+    writeFileSync(join(repo, '.git', 'shallow'), `${git('rev-parse', 'HEAD')}\n`);
     const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, WE_GH_THROTTLE_LOCK_ROOT: lockRoot };
     const violations = [];
     let report;
     try {
       const out = execFileSync(process.execPath, [FIXTURE, REPO_ROOT, String(COUNT)], {
-        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, timeout: 60_000, killSignal: 'SIGKILL',
+        cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, timeout: 60_000, killSignal: 'SIGKILL',
       });
       log?.(out.trim());
       report = JSON.parse(out.trim().split('\n').pop());

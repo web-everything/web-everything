@@ -1,5 +1,6 @@
 import { clearanceBindsHead } from './clearance-binding.mjs';
 import { RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
+import { proposeHumanRequired } from './direction-aware-human.mjs';
 /**
  * review-escalation.mjs — the DETERMINISTIC drain review-escalation rubric (#2171, under #2162).
  *
@@ -289,6 +290,7 @@ export const BLAST_RADIUS_ENGINE = [
   { file: 'wait-green.mjs',         role: 'green-wait',    desc: 'blocks the transport until the required check is green', homes: ['scripts/wait-green.mjs'] },
   // ── the review transport (CLIs around the policy-tier review-core; the router itself is trust-chain) ──────
   { file: 'review-core-cli.mjs',    role: 'review-cli',    desc: 'CLI wrapper that runs the shared review core in the transport', homes: ['scripts/review-core-cli.mjs'] },
+  { file: 'review-shape.mjs',       role: 'review-shape',  desc: 'pure shape derivation shared by the review CLI and operation', homes: ['scripts/lib/review-shape.mjs'] },
   { file: 'review-detail.mjs',      role: 'review-detail', desc: 'renders the review detail the drain stamps on a parked PR', homes: ['scripts/review-detail.mjs'] },
   { file: 'review-set-label.mjs',   role: 'review-clear',  desc: 'swaps a parked review label (…→accepted) so the drain may merge — the review-clear transport (the WE invariant-2 backstop)', homes: ['scripts/review-set-label.mjs'] },
   { file: 'lane-review.mjs',        role: 'lane-review',   desc: 'runs the lane\'s pre-PR review pass in the transport', homes: ['scripts/lane-review.mjs'] },
@@ -690,9 +692,13 @@ export function scoreEscalation({
   crossRepo = false,
   thresholds = {},
   diffHunks = null,
+  // Shape callers can supply proposal evidence while keeping today's file-only score intact.
+  proposalDiffHunks = diffHunks,
   basisNarrowed = true,
   deviation = null,
   humanSurfaces,
+  readOnlyOps = new Set(),
+  directionAwareLive = false,
 } = {}) {
   const resolvedSurfaces = humanSurfaces === undefined ? resolveHumanReviewSurfaces() : normalizeHumanSurfaces(humanSurfaces);
   const t = { ...DEFAULT_THRESHOLDS, ...thresholds };
@@ -764,6 +770,7 @@ export function scoreEscalation({
   }
 
   // Keep one permission-change token so every existing clearance consumer sees the same sensitive holds.
+  const otherHumanForced = humanForced;
   const permissionHits = sensitiveSurfaceHits(gateBasis, fileHunksOf, resolvedSurfaces);
   if (permissionHits.length) {
     humanForced = true;
@@ -851,7 +858,15 @@ export function scoreEscalation({
   // #2635 roster recompute) can select over the SAME honest basis this scored, instead of the own-delta.
   // #3343 — `basisUntrusted` rides the verdict so a consumer (and the human who has to clear a `review:human`)
   // can tell a verdict scored on the PR's own file set from one scored on the base tip. Never a permission.
-  return { humanSurfaces: resolvedSurfaces, escalate: reasons.length > 0, humanRequired: humanForced, careLevel, reasons, signals, basisFiles, basisUntrusted, diffHunks: hunks, diffHunksBasisFiles };
+  let proposal;
+  try {
+    proposal = proposeHumanRequired({ humanRequired: humanForced, otherHumanForced,
+      hits: permissionHits, files: gateBasis, hunksOf: fileHunksResolver(proposalDiffHunks), readOnlyOps });
+  } catch { proposal = { proposed: humanForced, reason: 'proposal error' }; }
+  return { humanSurfaces: resolvedSurfaces, escalate: reasons.length > 0,
+    humanRequired: directionAwareLive === true ? proposal.proposed : humanForced,
+    humanRequiredProposed: proposal.proposed, humanRequiredProposedReason: proposal.reason,
+    careLevel, reasons, signals, basisFiles, basisUntrusted, diffHunks: hunks, diffHunksBasisFiles };
 }
 
 /**
@@ -2947,7 +2962,27 @@ export function decideDurableEscalationRecord({ changed, verified, liveBody, rea
  * second, independent verdict. `engineTier:false` (every pre-#2412 caller) reproduces prior behaviour exactly.
  * @param {{escalate:boolean, humanRequired?:boolean, labels?:Array, engineTier?:boolean}} o
  */
-export function decideReviewGate({
+export function decideReviewGate(input = {}) {
+  // Sticky review:human de-escalation (R11/R130 follow-up). The sticky rule below (#2362) keeps `review:human`
+  // forever once set, even when the NET diff vs current main no longer scores `humanRequired`. Drop it ONLY when
+  // the caller proves the score is fresh (`humanScoreFresh:true`: a scored net diff at the current head), the
+  // fresh score is humanRequired=false, no operator ruling pinned it (`humanPinned`), and no `review:accepted`
+  // rides beside it. Every other case (unproven score, true score, pin) is the unchanged fail-closed path.
+  const { humanScoreFresh = false, humanPinned = false, ...rest } = input || {};
+  const labels0 = rest.labels || [];
+  if (humanScoreFresh === true && rest.humanRequired === false && !humanPinned
+      && hasReviewLabel(labels0, REVIEW_LABELS.human) && !hasReviewLabel(labels0, REVIEW_LABELS.accepted)) {
+    const stripped = labels0.filter((l) => (typeof l === 'string' ? l : l && l.name) !== REVIEW_LABELS.human);
+    let g = decideReviewGateCore({ ...rest, humanRequired: false, labels: stripped });
+    // A human hold never turns into an immediate merge: if nothing else holds the PR, park it for an independent review.
+    if (g.action === 'merge') g = { action: 'park', reason: 'review:human dropped — awaiting an independent review (review:pending)', applyLabel: REVIEW_LABELS.pending, humanRequired: false };
+    return { ...g, deescalatedHuman: true, removeLabels: [REVIEW_LABELS.human],
+      reason: `${g.reason} (review:human dropped: fresh net-diff score is humanRequired=false, no operator pin)` };
+  }
+  return decideReviewGateCore(rest);
+}
+
+function decideReviewGateCore({
   escalate, humanRequired = false, labels = [], acceptedSha = null, headSha = null,
   acceptedDiff = null, headDiff = null, acceptedContribution = null, headContribution = null,
   operatorClearance = null, headReadFailed = false, engineTier = false, deviation = null, humanClearedSha = null, permissionChange = false,

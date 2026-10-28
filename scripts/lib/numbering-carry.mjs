@@ -372,7 +372,7 @@ const RESTAMP_MARKER_LINE_RE = /^<!-- numbering-restamp: from=([0-9a-f]{40}) to=
  * emits counts — the headline as the first line and the marker as the last — so a quoted or juror-written marker
  * inside another trusted comment is never mistaken for one.
  */
-function restampRecord(c) {
+export function restampRecord(c) {
   const lines = (typeof c?.body === 'string' ? c.body.trimEnd().split(/\r?\n/) : []).map((l) => l.trimEnd());
   const m = lines[0] === RESTAMP_HEADLINE ? RESTAMP_MARKER_LINE_RE.exec(lines[lines.length - 1]) : null;
   const rec = m ? latestAcceptRecord([c]) : null;

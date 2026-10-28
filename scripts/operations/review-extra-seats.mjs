@@ -1466,6 +1466,9 @@ function redTeamRecoveryGuard({ pr, repo, head, redTeamMode, redTeamAdmission },
       && Number(row.pr) === Number(pr) && row.rev === head);
     const retry = failedRedTeamRetry(status, { failedSeatCount: rows.filter(row => !completedRedTeamSeat(row)).length,
       completedRecorded: rows.some(completedRedTeamSeat) });
+    // The status reader folds a surviving retry marker into retryCount. Check the admitted record too:
+    // admission may have replaced a restored placeholder prior with null while the marker still stands.
+    if (!retry && [status, admittedStatus].some(row => row?.retryCount !== undefined && row.retryCount !== 0)) return refuse('red-team retry already spent');
     const refusal = freshRedTeamRefusal(status, { failedSeatCount: rows.filter(row => !completedRedTeamSeat(row)).length,
       completedRecorded: rows.some(completedRedTeamSeat), seatRecorded: rows.length > 0 });
     if (refusal) return refuse(refusal);

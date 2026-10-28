@@ -54,7 +54,7 @@ import { standDownComments, standDownReason, standDownHeadChangeAt, annotateLaps
 import { healthSectionLines } from '../conveyor/health-watch-section.mjs';
 // Card x1b8hlo — the LIGHT red-team gate module (no heavy graph): a confirmed red-team break the setting sends back
 // keeps the PR out of NEEDS YOU while it is unresolved on the live head.
-import { CONFIRMED_BREAKS_DEFAULTS, readConfirmedBreaks, redTeamQueueReason, redTeamRulingNeeded } from '../lib/red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, readConfirmedBreaks, redTeamQueueReason, redTeamRulingNeeded, redTeamForHead, readRedTeamDisposition } from '../lib/red-team-gate.mjs';
 // Partial CLI copies may lack the verdict reader. Keep their queue runnable, but never excuse a check.
 let humanReviewOnlyHold, parsePrResultTable;
 let mergeGateVerdictImportError;
@@ -381,7 +381,14 @@ export function standDownRow(repo, pr) {
 // above: a staged CLI copy without the enqueue module simply shows no such rows.
 let workflowEditHold = null;
 let readMergeQueueState = null;
-try { ({ workflowEditHold, readMergeQueueState } = await import('../lib/merge-queue-enqueue.mjs')); } catch { /* no needs-your-merge rows */ }
+let readPinnedChangedFiles = null;
+try { ({ workflowEditHold, readMergeQueueState, readPinnedChangedFiles } = await import('../lib/merge-queue-enqueue.mjs')); } catch { /* no needs-your-merge rows */ }
+
+// Keep staged CLI copies runnable; absent evidence never permits a merge request.
+let probeMainCiRuns, mainRedState, repoProfile;
+try { ({ probeMainCiRuns } = await import('../conveyor/main-ci-red-probe.mjs')); } catch { /* unavailable */ }
+try { ({ mainRedState } = await import('../conveyor/main-ci-red-core.mjs')); } catch { /* unavailable */ }
+try { ({ repoProfile } = await import('../lib/repo-profile.mjs')); } catch { /* unavailable */ }
 
 const NEEDS_YOUR_MERGE_BLOCKING_LABELS = ['review:human', 'review:changes', 'review:pending', 'ci:failed', 'merge-status:conflicting'];
 
@@ -620,7 +627,10 @@ function readPrJson(args, { attempts, sleep, valid }) {
   }, { attempts, sleep });
 }
 
-export function main(args = process.argv.slice(2), { sleep = blockingSleep, pollAttempts, pollDelayMs, unsupportedPath } = {}) {
+export function main(args = process.argv.slice(2), { sleep = blockingSleep, pollAttempts, pollDelayMs, unsupportedPath,
+  readMainCi = ({ repo }) => { const probe = probeMainCiRuns({ repoSlug: repo }); return mainRedState(probe.runs, { tip: probe.tip }); },
+  readNetDiff = ({ repo, headSha, base }) => readPinnedChangedFiles({ headSha, base, cwd: repoProfile?.(repo)?.checkoutPath }),
+} = {}) {
   const standDownQueueSection = reviewSettings?.resolveReviewSettings().standDownQueueSection ?? 'needs-you';
   console.error(`operator-queue: standDownQueueSection=${standDownQueueSection} (source: ${reviewSettings ? reviewSettings.resolveReviewSettingSource('standDownQueueSection') : 'built-in'})`);
   const readAttempts = resolveReadAttempts({ env: process.env, file: readSettings() });
@@ -656,6 +666,8 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
   };
   if (rulingLedgerError) report.errors.push(`ruling-needed section unavailable: ${rulingLedgerError}`);
   if (sendBackLedgerError) report.errors.push(`operator send-back check unavailable: ${sendBackLedgerError}`);
+  // One lazy probe per repository per report, including failed probes.
+  const mainCiByRepo = new Map();
   if (savedRedTeamError) report.errors.push(`saved red-team ruling check unavailable: ${savedRedTeamError}`);
   let readFailures = 0;
   const failedRead = (subject, error) => {
@@ -736,26 +748,52 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
           readyNumbersThisRepo.add(pr.number);
         }
       }
-      // Card 334 — NEEDS YOUR MERGE: approved human-only PRs that pass every gate except the person-only enqueue.
+      // R170 — ask a person only on current, affirmative evidence at every gate.
+      // The committed contract tests live in scripts/operations/__tests__/operator-queue-needs-your-merge.test.mjs
+      // (the R170 describe block plus the queue-state cases above it).
       for (const pr of prs) {
-        if (readyNumbersThisRepo.has(pr.number) || !workflowEditHold || needsYourMergePrecheck(pr).length) continue;
-        // `gh pr view --json files` stops at 100 files, so the full list comes from the paginated REST read (renames
-        // carry `previous_filename`), checked against GitHub's own count.
-        let changed;
-        try {
-          const { changedFiles } = read(['pr', 'view', String(pr.number), '--repo', repo, '--json', 'changedFiles'],
-            (value) => value && Number.isInteger(value.changedFiles));
-          const pages = read(['api', '--paginate', '--slurp', `repos/${repo}/pulls/${pr.number}/files?per_page=100`], Array.isArray);
-          changed = { files: pages.flat(), changedFiles };
-        } catch (error) { failedRead(`${repo}#${pr.number}`, error); continue; }
-        const result = evaluateNeedsYourMerge(pr, changed);
-        if (!result.owed) continue;
+        if (readyNumbersThisRepo.has(pr.number)) continue;
+        // PRs outside the merge lane retain their existing triage sections.
+        if (!hasLabel(pr, 'review:accepted') && !hasLabel(pr, 'ready-to-merge')) continue;
+        const pending = (reason) => (report.needsYourMergePending ??= []).push({
+          repo, number: pr.number, title: pr.title, reason: `pending: ${reason}`,
+        });
+        const reasons = needsYourMergePrecheck(pr);
+        if (reasons.length) { pending(reasons.join('; ')); continue; }
+        if (!hasLabel(pr, 'ready-to-merge')) { pending('no ready-to-merge label'); continue; }
+        if (!redTeamForHead(pr.comments, pr.number, pr.headRefOid)) {
+          pending('no trusted red-team result on current head'); continue;
+        }
+        const disposition = readRedTeamDisposition({ comments: pr.comments, pr: pr.number,
+          head: pr.headRefOid, repo, setting: redTeamSetting });
+        if (disposition.sendBack.length || disposition.held.length) {
+          pending('red-team findings sent back or held on current head'); continue;
+        }
+        if (!workflowEditHold || !readMergeQueueState) { pending('merge evidence readers unavailable'); continue; }
         const queue = readMergeQueueState({ repo, pr: pr.number, readJson: (args) => read(args, (value) => value && typeof value === 'object') });
         if (queue.error || queue.head !== pr.headRefOid) {
-          failedRead(`${repo}#${pr.number}`, new Error(queue.error || 'PR head moved since the listing; re-run'));
+          const reason = queue.error || 'PR head moved since the listing; re-run';
+          pending(reason);
+          failedRead(`${repo}#${pr.number}`, new Error(reason));
           continue;
         }
-        if (queue.inQueue) continue;
+        if (queue.inQueue) { pending('already in merge queue'); continue; }
+        if (!mainCiByRepo.has(repo)) {
+          mainCiByRepo.set(repo, undefined);
+          try { mainCiByRepo.set(repo, readMainCi({ repo })); } catch { /* unknown remains closed */ }
+        }
+        if (mainCiByRepo.get(repo)?.status !== 'green') {
+          pending('main CI not known green for this repo'); continue;
+        }
+        let changed;
+        try { changed = readNetDiff({ repo, headSha: pr.headRefOid, base: 'main' }); }
+        catch { pending('NET diff unreadable'); continue; }
+        if (changed?.error || !Array.isArray(changed?.files)
+          || !changed.files.every(file => typeof file === 'string' && file.length > 0)) {
+          pending('NET diff unreadable'); continue;
+        }
+        const result = evaluateNeedsYourMerge(pr, { files: changed.files, changedFiles: changed.files.length });
+        if (!result.owed) { pending(result.reasons.join('; ')); continue; }
         (report.needsYourMerge ??= []).push({ repo, number: pr.number, title: pr.title, paths: result.paths,
           command: needsYourMergeCommand({ repo, number: pr.number }) });
         readyNumbersThisRepo.add(pr.number);

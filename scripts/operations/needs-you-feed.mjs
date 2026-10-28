@@ -72,6 +72,7 @@ export const REPORT_KINDS = new Set(['needs-you', 'ruling-needed', 'at-round-lim
 const shellArg = value => /^[\w/.:=-]+$/.test(String(value)) ? String(value) : `'${String(value).replace(/'/g, "'\\''")}'`;
 export function itemsFromReport(report) {
   const items = [];
+  // needsYourMergePending is diagnostic evidence, never an actionable feed item.
   for (const [field, baseKind] of [['ready', 'needs-you'], ['needsYourMerge', 'needs-you'], ['rulingNeeded', 'ruling-needed'], ['stoodDown', 'stood-down'], ['needsPerson', 'ruling-needed']]) {
     for (const row of report[field] ?? []) {
       const clues = [row.kind, row.reason, ...(row.findings ?? []).map(f => f.reason)].filter(Boolean).join(' ');

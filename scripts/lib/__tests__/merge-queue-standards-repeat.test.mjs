@@ -90,7 +90,8 @@ describe('incomplete check contexts are unknown', () => {
     expect(result.error).toBeUndefined();
     expect(result.entries).toHaveLength(1);
     expect(result.entries[0]).not.toHaveProperty('failedChecks');
-    const tracker = { 5969: { oid: oid('b'), count: 1, fails: [oid('a'), oid('b')] } };
+    // Main binds retained history to this enqueue; incomplete contexts must preserve it.
+    const tracker = { 5969: { oid: oid('b'), count: 1, enqueuedAt: nodes[0].enqueuedAt, fails: [oid('a'), oid('b')] } };
     const decision = decideStuckDequeues({ entries: result.entries, tracker, max: 99, nowMs });
     expect(decision.dequeue).toEqual([]);
     expect(decision.tracker[5969].fails).toEqual([oid('a'), oid('b')]);

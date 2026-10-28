@@ -5,24 +5,30 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { makeCliMechanicalPasses } from '../runner.mjs';
 import { CONSTELLATION_REPOS } from '../../../scripts/lib/constellation-repos.mjs';
 import { readUnsupported, recordUnsupported } from '../../../scripts/conveyor/unsupported-repo.mjs';
+import { writeOpenPrSnapshot } from '../../../scripts/conveyor/open-pr-snapshot.mjs';
 
 const dirs = [];
 afterEach(() => { vi.restoreAllMocks(); dirs.splice(0).forEach((dir) => rmSync(dir, { recursive: true, force: true })); });
-const perRepo = ['reconcile-fix-dispatch', 'ci-heal-pr-dispatch', 'promote-draft-pr-dispatch', 'parked-pr-conflict-watch', 'advisory-label-sweep', 'review-hold-reconcile', 'parked-pr-progress-watch', 'ci-queue-watch', 'reconcile-pass', 'review-dispatch', 'review-round-tag', 'review-status-tag'];
+const perRepo = ['open-pr-snapshot', 'reconcile-fix-dispatch', 'ci-heal-pr-dispatch', 'promote-draft-pr-dispatch', 'parked-pr-conflict-watch', 'advisory-label-sweep', 'delegated-clear-human', 'review-hold-reconcile', 'parked-pr-progress-watch', 'ci-queue-watch', 'reconcile-pass', 'review-dispatch', 'review-round-tag', 'review-status-tag'];
 const once = ['infra-blocked', 'lease-reaper', 'session-reaper', 'branch-drift', 'lane-pool-health-watch', 'duplicate-pr-watch'];
 async function sweep(repo = null, fail = null) {
   const dir = mkdtempSync(join(tmpdir(), 'runner-repos-')); dirs.push(dir);
   const unsupportedPath = join(dir, 'unsupported.json');
   const files = new Set();
+  const fetchOpenPrs = vi.fn(() => [{ number: 7 }]);
   const exec = vi.fn((_, args) => {
+    if (args[0].endsWith('conveyor/open-pr-snapshot.mjs')) {
+      writeOpenPrSnapshot({ repo: args.find(arg => arg.startsWith('--repo='))?.slice(7),
+        output: args.find(arg => arg.startsWith('--output='))?.slice(9) }, { fetchOpenPrs });
+      return '';
+    }
     const flag = args.find((arg) => arg.startsWith('--prs-file='));
     if (flag) { const file = flag.slice(11); files.add(file); expect(JSON.parse(readFileSync(file))).toEqual([{ number: 7 }]); }
     if (fail?.(args)) throw new Error('unsupported-repo: checkout missing');
     return JSON.stringify({ dispatch: [{ kind: 'review', prNumber: 7 }], refusals: [] });
   });
-  const fetchOpenPrs = vi.fn(() => [{ number: 7 }]);
   const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-  await makeCliMechanicalPasses({ scriptsDir: '/scripts', repo, exec, fetchOpenPrs, unsupportedPath })();
+  await makeCliMechanicalPasses({ scriptsDir: '/scripts', repo, exec, unsupportedPath })();
   for (const file of files) expect(existsSync(file)).toBe(false);
   return { exec, fetchOpenPrs, files, stderr, unsupportedPath };
 }
@@ -43,7 +49,13 @@ it('isolates child failures and records unsupported review work', async () => {
   expect(stderr.mock.calls.flat().join('')).toContain('operations/review-dispatch.mjs [frontierui] failed (non-fatal)');
   expect(readUnsupported({ path: unsupportedPath })).toEqual([expect.objectContaining({ repo: 'frontierui', prNumber: 7, action: 'review' })]);
   recordUnsupported({ repo: 'frontierui', rows: [{ action: 'fix', prNumber: 8 }, { action: 'review', prNumber: 7 }], path: unsupportedPath });
-  await makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'frontierui', exec: () => JSON.stringify({ dispatch: [], refusals: [] }), fetchOpenPrs: () => [], unsupportedPath })();
+  await makeCliMechanicalPasses({ scriptsDir: '/scripts', repo: 'frontierui', exec: (_, args) => {
+    if (args[0].endsWith('conveyor/open-pr-snapshot.mjs')) {
+      writeOpenPrSnapshot({ repo: args.find(arg => arg.startsWith('--repo='))?.slice(7),
+        output: args.find(arg => arg.startsWith('--output='))?.slice(9) }, { fetchOpenPrs: () => [] });
+    }
+    return JSON.stringify({ dispatch: [], refusals: [] });
+  }, unsupportedPath })();
   expect(readUnsupported({ path: unsupportedPath })).toEqual([expect.objectContaining({ action: 'fix', prNumber: 8 })]);
 });
 it('limits an explicit repo and refuses unknown explicit repos', async () => {

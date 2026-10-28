@@ -14,6 +14,8 @@ export function reviewOnlyRedTeamResult(result) {
  */
 export function redTeamStatusWithoutRun(row, { originalStatus } = {}) {
   if (row?.status !== 'finished') return false;
+  // The durable retry spend survives missing seat rows and legacy placeholder results.
+  if (row.retryCount !== undefined && row.retryCount !== 0) return false;
   return (row.result === null && originalStatus?.status === 'queued')
     || row.result === 'ran' || row.result === 'resumed'
     || (row.result?.status === 'resumed'

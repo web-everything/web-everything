@@ -355,7 +355,7 @@ describe('dispatchReviewJob — a managed clone behind origin/main (the default 
   });
 
   it('behind only in code OFF the review path: dispatches and logs the tolerated files', () => {
-    behind('scripts/lane-pool.mjs', 'scripts/backlog/frontmatter.mjs');
+    behind('scripts/lane-pool.mjs', 'scripts/backlog/capacity.mjs');
     const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
       expect(go()).toMatchObject({ jobPid: 77 });
@@ -365,6 +365,11 @@ describe('dispatchReviewJob — a managed clone behind origin/main (the default 
 
   it('behind in a file the review runs (review-loop-cli, or review-job\'s own imports): still refuses', () => {
     behind('scripts/lane-pool.mjs', 'scripts/operations/review-loop-cli.mjs');
+    expect(() => go()).toThrow(/2 commit\(s\) behind origin\/main.*STALE code/s);
+  });
+
+  it('behind in frontmatter imported by collision healing: still refuses', () => {
+    behind('scripts/lane-pool.mjs', 'scripts/backlog/frontmatter.mjs');
     expect(() => go()).toThrow(/2 commit\(s\) behind origin\/main.*STALE code/s);
   });
 });

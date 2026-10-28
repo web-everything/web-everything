@@ -8,7 +8,7 @@ import { dequeueSentBack } from './drain-queue-safety.mjs';
 const errorText = e => String(e?.message ?? e).split('\n')[0];
 const validEntry = e => Number.isSafeInteger(e?.num) && e.num > 0
   && typeof e.state === 'string' && e.state.length > 0
-  && typeof e.groupOid === 'string' && /^[a-f0-9]{40}$/i.test(e.groupOid);
+  && (e.groupOid === null || typeof e.groupOid === 'string' && /^[a-f0-9]{40}$/i.test(e.groupOid));
 
 export function readQueueEntryStates({ repo, exec = execFileSync }) {
   try {
@@ -18,7 +18,7 @@ export function readQueueEntryStates({ repo, exec = execFileSync }) {
     if (!Array.isArray(page?.nodes) || page.nodes.length > 100 || page.pageInfo?.hasNextPage !== false)
       throw new Error('merge queue unreadable or exceeds 100 entries; retry next pass or inspect the queue manually');
     const entries = page.nodes.map(n => ({ num: n?.pullRequest?.number, state: n?.state,
-      enqueuedAt: n?.enqueuedAt, groupOid: n?.headCommit?.oid, ci: n?.headCommit?.statusCheckRollup?.state,
+      enqueuedAt: n?.enqueuedAt, groupOid: n?.headCommit === null ? null : n?.headCommit?.oid ?? undefined, ci: n?.headCommit?.statusCheckRollup?.state,
       ...(n?.checks?.statusCheckRollup?.contexts?.pageInfo?.hasNextPage === false
         && Array.isArray(n?.checks?.statusCheckRollup?.contexts?.nodes)
         && n.checks.statusCheckRollup.contexts.nodes.length <= 100 ? {
@@ -43,8 +43,12 @@ export function decideStuckDequeues({ entries, tracker, max, nowMs = Date.now() 
   const next = {};
   const dequeue = [];
   for (const entry of entries) {
+    // A null group commit cannot prove a rebuild. Unknown enqueue identity cannot inherit history.
+    const trackable = typeof entry.groupOid === 'string' && typeof entry.enqueuedAt === 'string'
+      && Number.isFinite(Date.parse(entry.enqueuedAt));
     const previous = tracker?.[entry.num];
-    const validPrevious = typeof previous?.oid === 'string' && /^[a-f0-9]{40}$/i.test(previous.oid)
+    const validPrevious = trackable && previous?.enqueuedAt === entry.enqueuedAt
+      && typeof previous?.oid === 'string' && /^[a-f0-9]{40}$/i.test(previous.oid)
       && Number.isSafeInteger(previous.count) && previous.count >= 0 && previous.count < Number.MAX_SAFE_INTEGER;
     const count = validPrevious ? previous.count + (previous.oid !== entry.groupOid ? 1 : 0) : 0;
     const fails = validPrevious && Array.isArray(previous.fails)
@@ -54,7 +58,7 @@ export function decideStuckDequeues({ entries, tracker, max, nowMs = Date.now() 
       fails.push(entry.groupOid);
       if (fails.length > 5) fails.shift();
     }
-    next[entry.num] = { oid: entry.groupOid, count, ...(fails.length ? { fails } : {}) };
+    if (trackable) next[entry.num] = { oid: entry.groupOid, count, enqueuedAt: entry.enqueuedAt, ...(fails.length ? { fails } : {}) };
     const kind = entry.state === 'UNMERGEABLE' ? 'unmergeable'
       : standardsFailing && fails.length >= 2 ? 'standards-failed-twice'
       : entry.state === 'AWAITING_CHECKS' && count >= max ? 'rebuilds' : null;
@@ -71,8 +75,8 @@ function writeTracker(path, json) {
 }
 
 export function sweepStuckEntries({ repo, exec = execFileSync, max, nowMs = Date.now(), statePath,
-  readFile = readFileSync, writeFile = writeTracker, emit = () => {}, log = () => {}, dryRun = false }) {
-  const queue = readQueueEntryStates({ repo, exec });
+  readFile = readFileSync, writeFile = writeTracker, emit = () => {}, log = () => {}, dryRun = false,
+  queue = readQueueEntryStates({ repo, exec }) }) {
   if (queue.error) {
     log(`⚠ merge-queue stuck-entry read failed (${queue.error}) — retry next pass`);
     return { dequeued: [], error: queue.error };

@@ -17,6 +17,18 @@ afterEach(() => {
 const at = '2026-10-15T12:00:00.000Z';
 const item = { repo: 'owner/repo', pr: 12, head: 'abc', kind: 'needs-you', reason: 'ready', pick: 'pick 12' };
 describe('feed', () => {
+  it('does not publish quiet needsYourMergePending notes as needs-you items', () => {
+    const items = itemsFromReport({ needsYourMergePending: [{ repo: 'web-everything/web-everything',
+      number: 5990, title: 'fix CI workflow', reason: 'pending: no red-team result on current head' }] });
+    expect(items).toHaveLength(0);
+  });
+  it('still publishes one certain needsYourMerge row', () => {
+    const items = itemsFromReport({ needsYourMerge: [{ repo: 'web-everything/web-everything',
+      number: 6001, title: 'fix CI workflow', command: 'human merge' }] });
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ pr: 6001, kind: 'needs-you',
+      reason: 'approved, only a person may enqueue', command: 'human merge' });
+  });
   it('sanitizes every feed text field, including nested arrays and legacy evidence', () => {
     const unsafe = '\r\n\u0000\u001b\u009b\u2028\u2029\u202e\u200b';
     const text = 'safe `quote` "text" --flag ../path ';

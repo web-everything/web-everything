@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
 
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
+const TIMEOUT_SCALE = 3; // Allow extra time for CLI subprocesses on loaded shards.
 // The spawned CLI uses the real clock: anchor each test's fixtures to real now,
 // including its persisted refresh records, rather than aging them during the file run.
 let NOW;
@@ -53,13 +54,13 @@ if (a[0] === 'pr' && a[1] === 'view') {
   if (fresh) fs.writeFileSync(seen, String(n + 1));
   const unknown = process.env.MQ_UNKNOWN_FIRST && fresh && n === 0;
   const revalidation = (a[a.indexOf('--json') + 1] || '').endsWith('reviewDecision,labels,commits');
-  out({ ...p, ...(revalidation && process.env.MQ_FRESH_BEHIND ? { mergeStateStatus: 'BEHIND' } : {}), ...(unknown ? { mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' } : {}), state: landed(p.number) ? 'MERGED' : 'OPEN', mergedAt: landed(p.number) ? '2026-10-09T00:00:00Z' : null });
+  out({ ...p, ...(revalidation && process.env.MQ_FRESH_BEHIND ? { mergeStateStatus: 'BEHIND' } : {}), ...(unknown ? { mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' } : {}), state: landed(p.number) ? 'MERGED' : 'OPEN', mergedAt: landed(p.number) ? new Date().toISOString() : null });
 }
 if (a[0] === 'pr' && a[1] === 'merge') { fs.appendFileSync(F + '.attempts', a[2] + '\\n'); fs.writeFileSync(F + '.merged-' + a[2], ''); process.exit(0); }
 if (a[0] === 'run' && a[1] === 'rerun') { fs.appendFileSync(F + '.reruns', a[2] + '\\n'); process.exit(0); }
 if (a[0] === 'api') {
   if (process.env.MQ_APPROVED_HEAD && a.some(v => /issues\\/\\d+\\/comments$/.test(v))) {
-    process.stdout.write(prs[0].comments[0].body.split(String.fromCharCode(10)).join(String.fromCharCode(92) + 'n') + '\t2026-10-09T00:00:00Z\tchalbert\tIC_fixture');
+    process.stdout.write(prs[0].comments[0].body.split(String.fromCharCode(10)).join(String.fromCharCode(92) + 'n') + '\t' + new Date().toISOString() + '\tchalbert\tIC_fixture');
     process.exit(0);
   }
   const path = a[1];
@@ -130,11 +131,13 @@ function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]],
     const preload = 'data:text/javascript,' + encodeURIComponent("import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module'; os.homedir = () => process.env.MQ_HOME; syncBuiltinESMExports();");
     const r = spawnSync(process.execPath, ['--import', preload, script, approvedHeadPlan?.repo ? `--repos=${approvedHeadPlan.repo}` : '--this-repo', '--label=ready-to-merge',
       '--no-reconcile-labels', '--no-drain-lease', '--no-red-main-freeze', ...(approvedHeadPlan ? ['--dry-run'] : ['--json'])], {
-      cwd, encoding: 'utf8', timeout: 30000,
+      cwd, encoding: 'utf8', timeout: 30_000 * TIMEOUT_SCALE,
       env: { ...process.env, ...daemonAppEnv(dir), WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC: '0', WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir,
         // hook OFF = no settings file at all: the built-in default (a test run never reads the live file)
         ...(hookOn ? { WE_MERGE_QUEUE_SETTINGS_FILE: settings } : {}), ...(mainFixPr ? { WE_MERGE_QUEUE_MAIN_FIX_FILE: mainFixFile } : {}),
         WE_COORDINATION_ROOT: coord,
+        // Exercise real retries without spending the production 20-second wait per UNKNOWN read.
+        WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC: '0',
         ...(approvedHeadPlan ? { MQ_APPROVED_HEAD: '1', WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'on', WE_DRAIN_MERGE_STRATEGY: approvedHeadPlan.strategy } : {}), ...extraEnv },
     });
     expect(r.error, r.stderr).toBeUndefined();
@@ -158,7 +161,7 @@ describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () =
     expect(stderr.includes('approved human-surface head retained; merge queue owns freshness')).toBe(held);
     expect(stderr.includes('would rebase-drop manifest')).toBe(!held);
     if (held) expect(stderr).toMatch(/would ENQUEUE .*#3001/);
-  }, 30000);
+  }, 30_000 * TIMEOUT_SCALE);
   const throwingProof = { WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'on', MQ_PROOF_THROWS: '1' };
   it('an unreadable queue approval proof still reaches legacy rebase-drop', () => {
     const out = runCli({ hookOn: false, ages: [[3001, 5]], mergeStateStatus: 'BEHIND',
@@ -167,41 +170,41 @@ describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () =
     expect(out.stderr).toContain('approved-head proof unreadable');
     expect(out.stderr).toContain('would rebase-drop manifest');
     expect(out.stderr).not.toContain('approved human-surface head retained; merge queue owns freshness');
-  }, 30000);
+  }, 30_000 * TIMEOUT_SCALE);
   it('direct mode bypasses approval proof and still calls the legacy stale refresh', () => {
     const out = runCli({ hookOn: true, ages: [[3002, 120]], env: throwingProof });
     expect(out.proofErrors).toEqual([]);
     expect(out.refreshPins.some(line => line.includes('lane/leaf-3002'))).toBe(true);
     expect(JSON.stringify(out.result)).toContain('head-moved');
     expect(JSON.stringify(out.result)).not.toContain('approval-proof-unreadable');
-  }, 30000);
+  }, 30_000 * TIMEOUT_SCALE);
   it('direct mode bypasses approval proof and still attempts legacy rebase-drop', () => {
     const out = runCli({ hookOn: false, ages: [[3001, 5]], mergeStateStatus: 'BEHIND', env: throwingProof });
     expect(out.proofErrors).toEqual([]);
     expect(out.rebaseFetches.some(line => line.includes('lane/leaf-3001'))).toBe(true);
     expect(out.rebaseTrees.some(line => line.includes('origin/lane/leaf-3001'))).toBe(true);
     expect(JSON.stringify(out.result)).not.toContain('approved-head proof unreadable');
-  }, 30000);
+  }, 30_000 * TIMEOUT_SCALE);
   it('direct mode bypasses approval proof and preserves legacy revalidation', () => {
     const out = runCli({ hookOn: false, ages: [[3001, 5]], env: { ...throwingProof, MQ_FRESH_BEHIND: '1' } });
     expect(out.proofErrors).toEqual([]);
     expect(out.result.revalidationAborted?.[0]?.reason).toContain('merge state BEHIND');
     expect(out.attempts).toEqual([]);
-  }, 30000);
+  }, 30_000 * TIMEOUT_SCALE);
   it('hook ON: the fresh PR merges, the stale-pass PR never reaches gh pr merge and is refreshed instead', () => {
     const { result, stderr, attempts, api } = runCli({ hookOn: true });
     expect(attempts).toEqual([3001]);
     expect(result.merged.map((p) => p.num)).toEqual([3001]);
     expect(stderr).toMatch(/merge-queue: refresh \(pass-too-old\)/);
     expect(api.some((p) => p.includes('commits/sha-3002/check-runs'))).toBe(true);
-  }, 30000);
+  }, 30_000 * TIMEOUT_SCALE);
 
   it('a refresh that did not go through is NOT recorded, so the next pass retries it', () => {
     // The shim `git ls-remote` prints no tip, so the head pin refuses the refresh (unreadable tip ≠ judged head).
     const { stderr, refreshed } = runCli({ hookOn: true });
     expect(stderr).toMatch(/merge-queue: refresh \(pass-too-old\) → \S+ failed/);
     expect(refreshed).toBeNull();
-  }, 30000);
+  }, 30_000 * TIMEOUT_SCALE);
 
   // The record a refresh writes: the head AND the pass it was requested against (the fixture's check-run id is 7 and
   // its pass completed at `iso(120)`), plus when it was requested.
@@ -212,7 +215,7 @@ describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () =
     const { stderr, attempts } = runCli({ hookOn: true, seedRefreshed: seedFor() });
     expect(attempts).toEqual([3001]);
     expect(stderr).toMatch(/merge-queue: wait \(refresh-already-requested\)/);
-  }, 30000);
+  }, 30_000 * TIMEOUT_SCALE);
 
   it('a rerun that finished (a newer pass on the same head) does not strand the head: it is refreshed again', () => {
     // Review of #4619: the record used to be head-only, so the head stayed `wait` after its rerun finished.
@@ -220,41 +223,41 @@ describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () =
     expect(attempts).toEqual([3001]);
     expect(stderr).not.toMatch(/refresh-already-requested/);
     expect(stderr).toMatch(/merge-queue: refresh \(pass-too-old\)/);
-  }, 30000);
+  }, 30_000 * TIMEOUT_SCALE);
 
   it('a legacy head-only record (key → head) does not park the head either', () => {
     const seed = Object.fromEntries(['fixture/drain-mq#3002', 'cwd#3002'].map((k) => [k, 'sha-3002']));
     const { stderr } = runCli({ hookOn: true, seedRefreshed: seed });
     expect(stderr).not.toMatch(/refresh-already-requested/);
     expect(stderr).toMatch(/merge-queue: refresh \(pass-too-old\)/);
-  }, 30000);
+  }, 30_000 * TIMEOUT_SCALE);
 
   it('main-fix first (through the drain): the published main-fix PR lands before an older-numbered PR', () => {
     const both = [[3001, 5], [3002, 5]]; // both merge-fresh, so only the ORDER differs
     expect(runCli({ hookOn: true, ages: both }).attempts).toEqual([3001, 3002]); // control: no record → number order
     expect(runCli({ hookOn: true, ages: both, mainFixPr: 3002 }).attempts).toEqual([3002, 3001]);
-  }, 60000);
+  }, 60_000 * TIMEOUT_SCALE);
 
   // Review of #4619 (test-coverage): the UNKNOWN-mergeability retry was only unit-tested as a helper. Through the real
   // CLI: the fresh pre-merge re-read answers UNKNOWN once (GitHub recomputing after the cascade's own previous merge),
-  // the retry re-reads, and the PR reaches `gh pr merge` instead of being refused on a transient (the fixture pins the wait to zero).
+  // the retry re-reads, and the PR reaches `gh pr merge` instead of being refused on a transient (no fixture wait).
   it('a transient UNKNOWN mergeability on the fresh pre-merge re-read is re-read and the PR still merges', () => {
     const { attempts, stderr } = runCli({ hookOn: true, ages: [[3001, 5]], env: { MQ_UNKNOWN_FIRST: '1', WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES: '1' } });
     expect(attempts).toEqual([3001]);
     expect(stderr).not.toMatch(/mergeable=UNKNOWN/);
-  }, 30000);
+  }, 30_000 * TIMEOUT_SCALE);
 
   it('control: with the retry off (0) the same UNKNOWN is refused — the test above does exercise the retry', () => {
     const { attempts, result } = runCli({ hookOn: true, ages: [[3001, 5]], env: { MQ_UNKNOWN_FIRST: '1', WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES: '0' } });
     expect(attempts).toEqual([]);
     expect(JSON.stringify(result)).toMatch(/mergeable=UNKNOWN/);
-  }, 30000);
+  }, 30_000 * TIMEOUT_SCALE);
 
   it('hook OFF (built-in default): both merge exactly as today, no freshness reads', () => {
     const { attempts, api } = runCli({ hookOn: false });
     expect(attempts.sort()).toEqual([3001, 3002]);
     expect(api.filter((p) => p.includes('check-runs?check_name=test&per_page=100'))).toEqual([]);
-  }, 30000);
+  }, 30_000 * TIMEOUT_SCALE);
 });
 
 // ── Review of #4619 (correctness): the WE-carrier pre-check had no test. A couple = an impl half in a sibling repo
@@ -292,7 +295,7 @@ if (a[0] === 'pr' && a[1] === 'view') {
   const n = fs.existsSync(seen) ? Number(fs.readFileSync(seen, 'utf8')) : 0;
   if (fresh) fs.writeFileSync(seen, String(n + 1));
   const unknown = process.env.MQ_UNKNOWN_FIRST && fresh && n === 0;
-  out({ ...p, ...(unknown ? { mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' } : {}), state: landed ? 'MERGED' : 'OPEN', mergedAt: landed ? '2026-10-09T00:00:00Z' : null });
+  out({ ...p, ...(unknown ? { mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' } : {}), state: landed ? 'MERGED' : 'OPEN', mergedAt: landed ? new Date().toISOString() : null });
 }
 if (a[0] === 'pr' && a[1] === 'merge') { const s = slugOf(); fs.appendFileSync(F + '.attempts', s + '#' + a[2] + '\\n'); fs.writeFileSync(mark(s, a[2]), ''); process.exit(0); }
 if (a[0] === 'run' && a[1] === 'rerun') { fs.appendFileSync(F + '.reruns', a[2] + '\\n'); process.exit(0); }
@@ -316,6 +319,11 @@ if (a[0] === 'api') {
 }
 process.exit(0);
 `;
+
+// A couple pass spawns the drain over fake gh/git shims for two repos and takes 40-90 s on a loaded host (CI shard or laptop), so
+// the child's own timeout sits well above that; the vitest per-test timeout sits above the child's.
+const COUPLE_RUN_TIMEOUT_MS = 240_000 * TIMEOUT_SCALE;
+const COUPLE_TEST_TIMEOUT_MS = 300_000 * TIMEOUT_SCALE;
 
 function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, env: extraEnv = {} }) {
   const dir = mkdtempSync(join(tmpdir(), 'drain-mq-couple-'));
@@ -350,10 +358,13 @@ function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, e
     const preload = 'data:text/javascript,' + encodeURIComponent("import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module'; os.homedir = () => process.env.MQ_HOME; syncBuiltinESMExports();");
     const r = spawnSync(process.execPath, ['--import', preload, script, `--repos=${LOCAL},${FUI}${secondImplPassAges ? `,${PA}` : ''}`, '--label=ready-to-merge',
       '--no-drain-lease', '--no-red-main-freeze', '--json'], { // reconcile ON: a couple's gate needs the complete open-PR context
-      cwd: dir, encoding: 'utf8', timeout: 60000,
-      env: { ...process.env, ...daemonAppEnv(dir), WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC: '0', WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir, WE_MERGE_QUEUE_SETTINGS_FILE: settings, WE_COORDINATION_ROOT: coord, ...extraEnv },
+      cwd: dir, encoding: 'utf8', timeout: COUPLE_RUN_TIMEOUT_MS,
+      env: { ...process.env, ...daemonAppEnv(dir), WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir, WE_MERGE_QUEUE_SETTINGS_FILE: settings, WE_COORDINATION_ROOT: coord,
+        // Carrier pre-check and impl revalidation each retry; keep their real reads, omit production waits.
+        WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC: '0', ...extraEnv },
     });
     expect(r.error, r.stderr).toBeUndefined();
+    expect(r.status, r.stderr).toBe(0);
     const read = (s) => (existsSync(fixture + s) ? readFileSync(fixture + s, 'utf8').trim().split('\n').filter(Boolean) : []);
     return { stdout: r.stdout, stderr: r.stderr, attempts: read('.attempts'), api: read('.api') };
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -366,33 +377,44 @@ describe('review of #4619 — the WE-carrier pre-check keeps a couple together',
     expect(stderr).toMatch(/"kind":"couple-held"[^\n]*its WE carrier is not merge-fresh \(merge-queue\)/);
     expect(stderr).toMatch(/"num":4001[^\n]*merge-queue: refresh \(pass-too-old\)/);
     expect(attempts).toEqual([]);
-  }, 90000);
+  }, COUPLE_TEST_TIMEOUT_MS);
 
   it('both halves fresh: the impl half lands, then its carrier (control — the gate does not block a healthy couple)', () => {
     const { attempts, stderr } = runCouple({ implPassAges: [5], carrierPassAges: [5] });
     expect(attempts).toEqual([`${FUI}#501`, `${LOCAL}#4001`]);
-  }, 90000);
+  }, COUPLE_TEST_TIMEOUT_MS);
 
   it('the carrier pass ages out between the pre-check and its own turn: the couple still lands together, never split', () => {
     // 25 min old when the pre-check reads it (fresh), 31 min old when the carrier is judged again after the impl merged.
     const { attempts, stderr } = runCouple({ implPassAges: [5], carrierPassAges: [25, 31] });
     expect(attempts).toEqual([`${FUI}#501`, `${LOCAL}#4001`]);
     expect(stderr).not.toMatch(/COUPLE SPLIT/);
-  }, 90000);
+  }, COUPLE_TEST_TIMEOUT_MS);
 
   it('a carrier with TWO impl halves: the second half\'s pre-check honours the first one\'s clearance, so neither lands alone', () => {
     // Pre-check for the first half reads the carrier's pass at 25 min (fresh); by the second half's pre-check it is 31 min old.
     const { attempts, stderr } = runCouple({ implPassAges: [5], secondImplPassAges: [5], carrierPassAges: [25, 31] });
     expect(attempts).toEqual([`${FUI}#501`, `${PA}#601`, `${LOCAL}#4001`]);
     expect(stderr).not.toMatch(/COUPLE SPLIT/);
-  }, 90000);
+  }, COUPLE_TEST_TIMEOUT_MS);
 
   // The carrier pre-check is the other `revalidateFresh` call site: a transient UNKNOWN on every fresh read in the couple
   // (impl half and carrier) is re-read, and the couple still lands together.
   it('a transient UNKNOWN on the couple\'s fresh reads (impl half and the carrier pre-check) is re-read and the couple lands', () => {
-    const { attempts } = runCouple({ implPassAges: [5], carrierPassAges: [5], env: { MQ_UNKNOWN_FIRST: '1', WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES: '1' } });
+    // The re-poll wait defaults to 20 s per UNKNOWN read; the couple has two (impl half + carrier), which alone is 40 s of idle
+    // wait. A 1 s wait keeps the retry exercised without the wall-clock cost.
+    const { attempts } = runCouple({ implPassAges: [5], carrierPassAges: [5], env: { MQ_UNKNOWN_FIRST: '1', WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES: '1', WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC: '1' } });
     expect(attempts).toEqual([`${FUI}#501`, `${LOCAL}#4001`]);
-  }, 90000);
+  }, COUPLE_TEST_TIMEOUT_MS);
+
+  it('with retries off, an UNKNOWN carrier pre-check holds both members', () => {
+    const { attempts, stdout } = runCouple({ implPassAges: [5], carrierPassAges: [5], env: { MQ_UNKNOWN_FIRST: '1', WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES: '0' } });
+    expect(attempts).toEqual([]);
+    expect(JSON.parse(stdout.trim().split('\n').at(-1)).coupleHeld).toEqual(expect.arrayContaining([
+      expect.objectContaining({ num: 501, reason: expect.stringContaining('mergeable=UNKNOWN') }),
+      expect.objectContaining({ num: 4001, reason: expect.stringContaining('mergeable=UNKNOWN') }),
+    ]));
+  }, 90_000 * TIMEOUT_SCALE);
 
   // Residual (review of #4619): a third-party merge moves a sibling's repo between the preflight and its own turn, past the
   // pin. Two repos cannot merge atomically, so the split is REPORTED (JSON coupleSplit), never silent.
@@ -403,7 +425,7 @@ describe('review of #4619 — the WE-carrier pre-check keeps a couple together',
     expect(split).toHaveLength(1);
     expect(split[0].landedImpls).toEqual([{ num: 501, repo: FUI }]);
     expect(split[0].unlandedImpl).toEqual({ num: 601, repo: PA });
-  }, 90000);
+  }, COUPLE_TEST_TIMEOUT_MS);
 
   // Review of #4619 (codex-correctness, CONFIRMED): the pre-check judged only the carrier, so with two impl halves the
   // first could merge and the second then be refreshed-and-skipped by its own gate, leaving the couple split. Every
@@ -416,5 +438,5 @@ describe('review of #4619 — the WE-carrier pre-check keeps a couple together',
     expect(attempts).toEqual([]);
     expect(stderr).toMatch(/merge-queue: refresh \(pass-too-old\)/);
     expect(stderr).not.toMatch(/COUPLE SPLIT/);
-  }, 90000);
+  }, COUPLE_TEST_TIMEOUT_MS);
 });

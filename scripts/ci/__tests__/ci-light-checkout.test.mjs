@@ -14,10 +14,12 @@ const fetchMain = 'git fetch --no-tags --filter=blob:none --depth=1000000 origin
 const historyJobs = ['changes', 'standards', 'integration', 'daemon-soak-scope', 'test-selection-measure'];
 
 describe('ci.yml shallow checkouts with blobless main history', () => {
-  it('only the unit test-shard job uses fetch-depth: 0 (live-git-history tests need full history)', () => {
-    expect(raw.match(/fetch-depth:\s*0\b/g)).toHaveLength(1);
-    const c = jobs['test-shard'].steps.find((s) => s.uses?.startsWith('actions/checkout@') && s.with?.path === 'web-everything');
-    expect(c.with['fetch-depth']).toBe(0);
+  it('only unit test-shard and soak-shard use full history for live-git tests and quarantine ancestry', () => {
+    expect(raw.match(/fetch-depth:\s*0\b/g)).toHaveLength(2);
+    for (const [name, path] of [['test-shard', 'web-everything'], ['soak-shard', undefined]]) {
+      const c = jobs[name].steps.find((s) => s.uses?.startsWith('actions/checkout@') && s.with?.path === path);
+      expect(c.with['fetch-depth'], name).toBe(0);
+    }
   });
 
   it.each(historyJobs)('%s retains its history-dependent checkout at depth 50', (name) => {
