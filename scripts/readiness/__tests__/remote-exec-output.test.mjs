@@ -48,7 +48,7 @@ describe('remote-exec captured output boundary', () => {
     const inventory = 'fixtures/é😀\u2028.txt\0';
     for (const byte of Buffer.from(inventory)) child.stdout.emit('data',Buffer.from([byte]));
     child.emit('close',0);
-    await expect(result).resolves.toMatchObject({code:0,stdout:Buffer.from(inventory)});
+    await expect(result).resolves.toEqual({code:0,stdout:Buffer.from(inventory)});
   });
   it('accepts exactly 4 MiB combined across stdout and stderr without terminating', async () => {
     const child = capturedChild();
@@ -57,7 +57,7 @@ describe('remote-exec captured output boundary', () => {
     child.stderr.emit('data', Buffer.alloc(2 * 1024 * 1024, 'b'));
     child.emit('close', 0);
 
-    await expect(result).resolves.toMatchObject({ code: 0, stdout: Buffer.alloc(2 * 1024 * 1024, 'a') });
+    await expect(result).resolves.toEqual({ code: 0, stdout: Buffer.alloc(2 * 1024 * 1024, 'a') });
     expect(child.kill).not.toHaveBeenCalled();
   });
 

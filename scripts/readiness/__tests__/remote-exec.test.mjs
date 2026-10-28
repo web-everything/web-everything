@@ -44,7 +44,16 @@ const nonceOf = (input) => JSON.parse(input).nonce;
 function fixture({ probeCode = 0, copyCode = 0, prepareCode = 0, runCode = 0, receipt, receiptCode = 0 } = {}) {
   let state;
   const exec = vi.fn(async (call) => {
-    if (call.file === 'git') return { code: 0, stdout: 'package-lock.json\na.test.mjs\n' };
+    if (call.file === 'git') {
+      if (call.args.includes('-i')) return {code:0, stdout:Buffer.alloc(0)};
+      const files = ['package-lock.json', 'a.test.mjs'];
+      const records = call.args.includes('--stage') ? files.map(name => {
+        const content = readFileSync(join(cwd, name));
+        const oid = createHash('sha1').update(`blob ${content.length}\0`).update(content).digest('hex');
+        return `100644 ${oid} 0\t${name}`;
+      }) : files;
+      return { code: 0, stdout: Buffer.from(records.join('\0') + '\0') };
+    }
     if (call.file === 'rsync') return { code: copyCode, stdout: '' };
     if (isPrepare(call)) {
       state = JSON.parse(call.input);
@@ -55,7 +64,7 @@ function fixture({ probeCode = 0, copyCode = 0, prepareCode = 0, runCode = 0, re
     if (isReceipt(call)) {
       const value = {v:1, nonce:state.nonce, run:state.run, inputDigest:state.inputDigest,
         argvDigest:state.argvDigest, lock:state.lock, phase:'test', code:runCode};
-      return {code:receiptCode, stdout: typeof receipt === 'function' ? receipt(state.nonce, value) : receipt ?? JSON.stringify(value)};
+      return {code:receiptCode, stdout: typeof receipt === 'function' ? receipt(state.nonce, value, state) : receipt ?? JSON.stringify({...value, manifestDigest:state.manifestDigest})};
     }
     if (call.file === 'ssh' && call.args.at(-1) === 'true') return {code:probeCode, stdout:''};
     throw new Error(`Unexpected exec call: ${JSON.stringify(call)}`);
@@ -189,7 +198,8 @@ console.log('RESOLVED ' + probe('cache-dependency/package.json').version);
     expect(baseline.status, baseline.stderr).toBe(0);
     expect(JSON.parse(readFileSync(join(cwd,'node_modules/cache-dependency/package.json'),'utf8')).version).toBe('2.0.0');
     const npmWrapper = readFileSync(join(f.bin,'npm'),'utf8');
-    writeFileSync(join(f.bin,'npm'), npmWrapper.replace('#!/bin/bash\n', '#!/bin/bash\nprintf "%s\\n" "$*" >> "$HOME/install.log"\n'));
+    // Create the install-log parent only when npm runs, after snapshot verification.
+    writeFileSync(join(f.bin,'npm'), npmWrapper.replace('#!/bin/bash\n', '#!/bin/bash\nmkdir -p "$HOME"\nprintf "%s\\n" "$*" >> "$HOME/install.log"\n'));
     const runner = createRunner({testRoot:f.root,testPath:`${f.bin}:/usr/bin:/bin`});
     const lock = createHash('sha256').update(readFileSync(join(cwd,'package-lock.json'))).digest('hex');
     for (const dual of [true, false]) {
@@ -197,9 +207,9 @@ console.log('RESOLVED ' + probe('cache-dependency/package.json').version);
       const prepared = await runner.prepare({nonce});
       const work = join(f.root,'runs',prepared.run,'work');
       for (const file of [...files,...(dual ? ['npm-shrinkwrap.json'] : [])]) writeFileSync(join(work,file),readFileSync(join(cwd,file)));
-      // HOME is fixed by the wrapper; create it so the real npm adapter can log calls.
-      mkdirSync(join(work,'.forge-home'));
-      const request = {...prepared,nonce,argv,env:{CI:'true'},lock,argvDigest:digestArgv(argv),inputDigest:await digestInput(work)};
+      const manifest = await remoteManifestAPI.buildManifest({cwd:work, exec:f.exec, listFiles:async () => files});
+      const request = {...prepared,nonce,argv,env:{CI:'true'},lock,argvDigest:digestArgv(argv),inputDigest:await digestInput(work),
+        manifest:forgeManifestAPI.manifestWire(manifest),manifestDigest:manifest.manifestDigest};
       try {
         if (dual) {
           await expect(runner.run(request)).rejects.toThrow(/shrinkwrap/i);
@@ -426,6 +436,66 @@ console.log('RESOLVED ' + versions.join(','));
 });
 
 describe('isAllowedCommand', () => {
+  it.each(['--help','-h','--version','-v','--passWithNoTests','--pass-with-no-tests','--changed','--shard','--bail']
+    .flatMap(flag => [flag, flag+'=true', flag+'=false', flag+'=']))
+  ('rejects arguments outside the allowlist: %s on both sides before transport', async arg => {
+    const command = ['npm','run','test:unit','--','a.test.mjs',arg];
+    expect(isAllowedCommand(command)).toBe(false);
+    expect(forgeManifestAPI.allowedCommand(command)).toBe(false);
+    const f = fixture();
+    expect(await runRemote({...f,argv:command})).toEqual({mode:'fallback',reason:'command-not-allowed'});
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+  const discoveryFlags = ['--config','--root','--dir','--project','--workspace','--include','--exclude','--dangerouslyIgnoreUnhandledErrors','-c','-r'];
+  it.each(discoveryFlags.flatMap(flag => [[flag], [flag+'=other'], ...(flag.startsWith('--') ? [] : [[flag+'other']])]))
+  ('refuses discovery-changing argument %s on both sides before execution', async arg => {
+    const command = ['npm','run','test:unit','--','a.test.mjs',arg];
+    expect(isAllowedCommand(command)).toBe(false);
+    expect(forgeManifestAPI.allowedCommand(command)).toBe(false);
+    const f = fixture();
+    expect(await runRemote({...f,argv:command})).toEqual({mode:'fallback',reason:'command-not-allowed'});
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['--run'], ['--silent'], ['--no-color'],
+    ...['default','dot','verbose','basic','tap'].map(value => ['--reporter='+value]),
+    ['-t','two words'], ['--testNamePattern=two words'],
+    ['scripts/a.test.mjs', 'filter*.[test]'],
+  ].map(args => [args]))('allows supported arguments on both sides: %j', args => {
+    const command = ['npm','run','test:unit','--',...args];
+    expect(isAllowedCommand(command)).toBe(true);
+    expect(forgeManifestAPI.allowedCommand(command)).toBe(true);
+  });
+  it('allows positional filters and combined supported runner options on both sides', () => {
+    const command = ['npm','run','test:unit','--','scripts/a.test.mjs','--reporter=verbose','--run','--silent','--no-color','-t','case'];
+    expect(isAllowedCommand(command)).toBe(true);
+    expect(forgeManifestAPI.allowedCommand(command)).toBe(true);
+  });
+
+  it.each(['--help', '--version', '--config', '--run', '--shard=1/2', '-h', '-t', '-pattern'])
+  ('rejects dash-prefixed separate -t values: %s', async value => {
+    const command = ['npm','run','test:unit','--','-t',value];
+    expect(isAllowedCommand(command)).toBe(false);
+    expect(forgeManifestAPI.allowedCommand(command)).toBe(false);
+    const f = fixture();
+    expect(await runRemote({...f,argv:command})).toEqual({mode:'fallback',reason:'command-not-allowed'});
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    '--shard=1/2', '--bail=1', '--unknown', '--RUN', '--Silent', '--noColor',
+    '--test-name-pattern=case', '--TestNamePattern=case', '--reporter=json', '--reporter=DOT',
+    '--reporter', '--run=true', '--silent=false', '--no-color=true', '-t', '-tcase',
+    '--testNamePattern', '--', '--CONFIG=other', '--dangerously-ignore-unhandled-errors',
+  ])('fails closed for unsupported option spelling or missing value: %s', async arg => {
+    const command = ['npm','run','test:unit','--','a.test.mjs',arg];
+    expect(isAllowedCommand(command)).toBe(false);
+    expect(forgeManifestAPI.allowedCommand(command)).toBe(false);
+    const f = fixture();
+    expect(await runRemote({...f,argv:command})).toEqual({mode:'fallback',reason:'command-not-allowed'});
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+
   it.each(['test:unit', 'check:standards'])('rejects npm options before the argument separator for %s', (script) => {
     for (const args of [
       ['--script-shell=/usr/bin/true'], ['--script-shell', '/usr/bin/true'],
@@ -437,7 +507,7 @@ describe('isAllowedCommand', () => {
       expect(isAllowedCommand(['npm', 'run', script, ...args]), JSON.stringify(args)).toBe(false);
       expect(isAllowedCommand(['npm', 'run', script, ...args])).toBe(false);
     }
-    expect(isAllowedCommand(['npm', 'run', script, '--', '--script-shell=/usr/bin/true'])).toBe(true);
+    expect(isAllowedCommand(['npm', 'run', script, '--', '--script-shell=/usr/bin/true'])).toBe(script === 'check:standards');
   });
   it.each(['test:unit', 'check:standards'])('allows exactly the npm run %s prefix, including extra args', (script) => {
     expect(isAllowedCommand(['npm', 'run', script])).toBe(true);
@@ -479,6 +549,43 @@ describe('validateRunId', () => {
 });
 
 describe('runRemote', () => {
+  it.each(['scripts/__tests__/.env.local/hidden.test.mjs','scripts/__tests__/.env.local/hidden.js','hidden.spec.ts','dist/hidden.test.mjs','build/hidden.test.mjs'])
+  ('falls back for a Git-ignored test instead of certifying remote success: %s', async name => {
+    spawnSync('git',['init','--quiet'],{cwd});
+    writeFileSync(join(cwd,'.gitignore'), name+'\n');
+    mkdirSync(join(cwd, ...name.split('/').slice(0,-1)),{recursive:true});
+    writeFileSync(join(cwd,name),'must run');
+    const f = fixture();
+    const fake = f.exec;
+    f.exec = vi.fn(async call => call.file === 'git'
+      ? remoteManifestAPI.defaultExec(call) : fake(call));
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'ignored-test-file'});
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+  it('allows ignored non-tests and dependency/Git internals', async () => {
+    spawnSync('git',['init','--quiet'],{cwd});
+    writeFileSync(join(cwd,'.gitignore'),'secret.txt\nnode_modules/\n');
+    writeFileSync(join(cwd,'secret.txt'),'ignored asset');
+    mkdirSync(join(cwd,'node_modules'));
+    writeFileSync(join(cwd,'node_modules','dependency.test.mjs'),'dependency');
+    const f = fixture();
+    const fake = f.exec;
+    f.exec = vi.fn(async call => call.file === 'git'
+      ? remoteManifestAPI.defaultExec(call) : fake(call));
+    expect(await runRemote(f)).toEqual({mode:'remote',code:0});
+  });
+  it.each([
+    {code:1,stdout:Buffer.alloc(0)}, {code:0,stdout:''},
+    {code:0,stdout:Buffer.from('unterminated')},
+    {code:0,stdout:Buffer.alloc(4*1024*1024+1)},
+  ])('fails closed for unavailable, malformed or oversized ignored inventory %#', async result => {
+    const f = fixture();
+    const fake = f.exec;
+    f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i') ? result : fake(call));
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'copy-failed'});
+    expect(callsOf(f.exec).some(isPrepare)).toBe(false);
+  });
+
   it.each([[], ['--','--files=scripts/readiness/remote-exec.mjs']].map(args => [args]))('runs Git-dependent standards locally without preparing a snapshot: %j', async (args) => {
     const f = fixture();
     f.argv = ['npm','run','check:standards',...args];
@@ -502,7 +609,7 @@ describe('runRemote', () => {
 
   it('rejects a prior valid receipt when the caller reuses the run id', async () => {
     let priorReceipt;
-    const f = fixture({ receipt: (_nonce, value) => priorReceipt ??= JSON.stringify(value) });
+    const f = fixture({ receipt: (_nonce, value, request) => priorReceipt ??= JSON.stringify({...value, manifestDigest:request.manifestDigest}) });
     expect(await runRemote(f)).toEqual({ mode: 'remote', code: 0 });
     const log = vi.fn();
     expect(await runWithRemoteFallback({ ...f, log })).toBe(7);
@@ -607,12 +714,13 @@ describe('runRemote', () => {
     expect(copy.args).toContain('--exclude=.exit-code');
     expect(calls.findIndex(isPrepare)).toBeLessThan(calls.indexOf(copy));
     expect(sshText(calls.find(isPrepare))).toBe('custom-forge sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs prepare');
-    expect(copy.input.split('\0')).toEqual(['./package-lock.json', './src/a file.mjs', '']);
+    const input = copy.input.toString('latin1');
+    expect(input.split('\0')).toEqual(['./package-lock.json', './src/a file.mjs', '']);
     expect(copy.args.join(' ')).toMatch(/--rsync-path(?:=|\s)sudo -u forge-exec rsync/);
     expect(copy.args.join(' ')).toMatch(/custom-forge:\/srv\/forge-exec\/r-[a-f0-9]+\/work\//);
-    expect(copy.input).toContain('package-lock.json');
-    expect(copy.input).toContain('src/a file.mjs');
-    expect(copy.input).not.toContain('node_modules');
+    expect(input).toContain('package-lock.json');
+    expect(input).toContain('src/a file.mjs');
+    expect(input).not.toContain('node_modules');
     expectNoSecrets(f.exec);
   });
   it('defaults to git ls-files -co --exclude-standard when listFiles is omitted', async () => {
@@ -621,7 +729,7 @@ describe('runRemote', () => {
     expect(callsOf(f.exec)).toContainEqual(expect.objectContaining({
       file: 'git', args: expect.arrayContaining(['ls-files', '-co', '--exclude-standard']),
     }));
-    expect(callsOf(f.exec).find((call) => call.file === 'rsync').input).toContain('a.test.mjs');
+    expect(callsOf(f.exec).find((call) => call.file === 'rsync').input.toString('latin1')).toContain('a.test.mjs');
   });
 });
 
@@ -786,7 +894,7 @@ describe('receipt field binding', () => {
 // buildManifest({cwd, exec, fs?}) -> {entries:[{path:Buffer, sha256, executable:boolean}],
 //   excluded:Buffer[], manifestDigest}. fs defaults to node:fs/promises; injected
 //   lstat/readFile/readdir use Buffer paths and readdir({encoding:'buffer'}).
-// isTestFile(path:Buffer) -> boolean is the shared basename predicate.
+// isTestFile(path:Buffer) -> boolean is the shared test-file predicate.
 // Wire manifest = {paths:base64(NUL-terminated entries), hashes:string[],
 //   executable:boolean[], excluded:base64(NUL-terminated excluded paths)}.
 // manifestDigest = sha256(JSON.stringify(wire manifest)) in that property order.
@@ -805,13 +913,13 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
   });
   async function build(options) {
     expect(remoteManifestAPI.buildManifest, 'export the single inventory builder').toBeTypeOf('function');
-    return remoteManifestAPI.buildManifest(options);
+    return remoteManifestAPI.buildManifest({exec:gitInventory([]), ...options});
   }
   function gitInventory(paths, stage = Buffer.alloc(0)) {
     return vi.fn(async call => {
       expect(call.file).toBe('git');
       expect(call.args).toContain('-z');
-      return {code:0, stdout:call.args.includes('-s') || call.args.includes('--stage') ? stage : nul(paths)};
+      return {code:0, stdout:call.args.includes('-i') ? Buffer.alloc(0) : call.args.includes('-s') || call.args.includes('--stage') ? stage : nul(paths)};
     });
   }
   // This stub certifies only what the client sends, including the new binding.
@@ -819,7 +927,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
   function acceptingTransport(paths, stage = Buffer.alloc(0)) {
     let state;
     return vi.fn(async call => {
-      if (call.file === 'git') return {code:0, stdout:call.args.includes('-s') || call.args.includes('--stage') ? stage : nul(paths)};
+      if (call.file === 'git') return {code:0, stdout:call.args.includes('-i') ? Buffer.alloc(0) : call.args.includes('-s') || call.args.includes('--stage') ? stage : nul(paths)};
       if (isPrepare(call)) {
         state = JSON.parse(call.input);
         return {code:0, stdout:JSON.stringify({run:'r-'+state.nonce})};
@@ -836,7 +944,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
   }
 
   it('selects identity.test.mjs and credential/key-word tests without filtering them', async () => {
-    const paths = ['identity.test.mjs', 'credentials-check.test.mjs', 'key-management.spec.ts', 'package-lock.json'].map(value => Buffer.from(value));
+    const paths = ['identity.test.mjs', 'check-credentials.test.mjs', 'key-management.spec.ts', 'package-lock.json'].map(value => Buffer.from(value));
     for (const path of paths.slice(0, 3)) writeFileSync(Buffer.concat([Buffer.from(cwd+'/'), path]), 'assertion');
     const manifest = await build({cwd, exec:gitInventory(paths)});
     expect(manifest.entries.map(entry => entry.path)).toEqual([...paths].sort(Buffer.compare));
@@ -849,7 +957,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     expect(manifest.manifestDigest).toBe(sha(JSON.stringify(wire(manifest))));
   });
 
-  it.each(['credentials.test.mjs', 'fixture.key/identity.test.mjs', '.env/identity.spec.ts'])
+  it.each(['credentials.test.mjs', 'fixture.key/identity.test.mjs', '.env/identity.spec.ts', '__tests__/credentials.js', 'credentials-check.test.mjs', '.envrc/identity.test.mjs', '__tests__/credentials-backup.js'])
   ('fails closed instead of silently dropping a test excluded by the secret rule: %s', async name => {
     const f = fixture();
     const parts = name.split('/');
@@ -863,6 +971,49 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     expect(f.local).toHaveBeenCalledTimes(1);
   });
 
+  it.each(['credentials.test.mjs', 'fixture.key/identity.test.mjs', '.env/identity.spec.ts', '__tests__/credentials.js', 'credentials-check.test.mjs', '.envrc/identity.test.mjs', '__tests__/credentials-backup.js'])
+  ('runs locally before prepare or rsync when an excluded component contains a test: %s', async name => {
+    const f = fixture();
+    // Establish that this transport can certify the ordinary snapshot. A later
+    // fallback must come from the excluded test, not an unrelated fixture error.
+    expect(await runRemote(f)).toEqual({mode:'remote', code:0});
+    f.exec.mockClear();
+    const parts = name.split('/');
+    if (parts.length > 1) mkdirSync(join(cwd, parts[0]));
+    writeFileSync(join(cwd, name), 'must run locally');
+    f.listFiles.mockResolvedValue(['package-lock.json', 'a.test.mjs', name]);
+
+    expect(await runRemote(f)).toEqual({mode:'fallback', reason:'copy-failed'});
+    expect(await runWithRemoteFallback({...f, log:vi.fn()})).toBe(7);
+    expect(f.local).toHaveBeenCalledTimes(1);
+    expect(f.local).toHaveBeenCalledWith(f.argv);
+    const calls = callsOf(f.exec);
+    expect(calls.some(isPrepare)).toBe(false);
+    expect(calls.some(call => call.file === 'rsync')).toBe(false);
+    expect(calls.some(isRun)).toBe(false);
+  });
+
+  it.each([
+    'node_modules/dependency.js', '.git/config', '.env', '.env.local', '.envrc', '.environment',
+    '.secrets/value', '.ssh/config', '.aws/config', '.claude/config.json', '.codex/config.toml',
+    '.npmrc', '.netrc', 'credentials', 'credentials.json', 'credentials-backup.json',
+    'private.pem', 'private.key', '.exit-code',
+  ].flatMap(name => [name, `nested/${name}`]))
+  ('preserves former transport exclusions in the manifest and rsync inventory: %s', async name => {
+    mkdirSync(join(cwd, name, '..'), {recursive:true});
+    writeFileSync(join(cwd, name), 'DO_NOT_TRANSMIT');
+    const paths = [Buffer.from('package-lock.json'), Buffer.from(name)];
+    const manifest = await build({cwd, exec:gitInventory(paths)});
+    expect(manifest.entries.map(entry => entry.path)).toEqual([Buffer.from('package-lock.json')]);
+    expect(manifest.excluded).toEqual([Buffer.from(name)]);
+    const exec = acceptingTransport(paths);
+    expect(await runRemote({argv, cwd, runId, exec})).toEqual({mode:'remote', code:0});
+    const copy = callsOf(exec).find(call => call.file === 'rsync');
+    expect(copy.input).toEqual(Buffer.from('./package-lock.json\0'));
+    const sent = JSON.parse(callsOf(exec).find(isRun).input);
+    expect(sent.manifest).toEqual(wire(manifest));
+  });
+
   it('records excluded non-test secrets explicitly rather than losing inventory evidence', async () => {
     writeFileSync(join(cwd, '.env'), 'DO_NOT_COPY');
     const manifest = await build({cwd, exec:gitInventory(['.env', 'package-lock.json'].map(value => Buffer.from(value)))});
@@ -870,8 +1021,25 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     expect(manifest.excluded).toEqual([Buffer.from('.env')]);
   });
 
-  it('carries 0xff byte paths through buildManifest without requiring APFS filename support', async () => {
+  it('rejects undecodable test names before filesystem access or remote execution', async () => {
     const path = Buffer.concat([Buffer.from('raw-'), Buffer.from([0xff]), Buffer.from('.test.mjs')]);
+    await expect(build({cwd, listFiles:async () => [path, Buffer.from('raw-�.test.mjs')]}))
+      .rejects.toThrow('Input digest mismatch: undecodable test name');
+    const f = fixture();
+    f.listFiles.mockResolvedValue([path]);
+    expect(await runRemote(f)).toEqual({mode:'fallback', reason:'copy-failed'});
+    expect(callsOf(f.exec).some(isPrepare)).toBe(false);
+    expect(callsOf(f.exec).some(call => call.file === 'rsync')).toBe(false);
+    expect(callsOf(f.exec).some(isRun)).toBe(false);
+  });
+
+  it.each([['é.test.mjs', 'e\u0301.test.mjs'], ['A.test.mjs', 'a.test.mjs'], ['ß.test.mjs', 'SS.test.mjs']])
+  ('rejects colliding client test names %s and %s', async (a, b) => {
+    await expect(build({cwd, listFiles:async () => [a,b]})).rejects.toThrow('test name collision');
+  });
+
+  it('carries 0xff byte paths through buildManifest without requiring APFS filename support', async () => {
+    const path = Buffer.concat([Buffer.from('raw-'), Buffer.from([0xff]), Buffer.from('.txt')]);
     const data = Buffer.from('raw test content');
     const fs = {
       lstat:vi.fn(async value => ({isDirectory:()=>Buffer.from(value).equals(Buffer.from(cwd)),
@@ -889,7 +1057,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
   });
 
   it('uses exactly the manifest bytes for rsync stdin, selected digest, and run request', async () => {
-    const paths = ['identity.test.mjs', 'credentials-check.spec.ts', 'é.test.mjs', 'package-lock.json'].map(value => Buffer.from(value));
+    const paths = ['identity.test.mjs', 'check-credentials.spec.ts', 'é.test.mjs', 'package-lock.json'].map(value => Buffer.from(value));
     for (const path of paths.slice(0, 3)) writeFileSync(Buffer.concat([Buffer.from(cwd+'/'), path]), 'must run');
     const manifest = await build({cwd, exec:gitInventory(paths)});
     const exec = acceptingTransport(paths);
@@ -907,7 +1075,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
   });
 
   it('transports and digests an actual 0xff filename byte-exactly when the filesystem supports it', async ctx => {
-    const path = Buffer.concat([Buffer.from('raw-'),Buffer.from([0xff]),Buffer.from('.test.mjs')]);
+    const path = Buffer.concat([Buffer.from('raw-'),Buffer.from([0xff]),Buffer.from('.txt')]);
     const absolute = Buffer.concat([Buffer.from(cwd+'/'),path]);
     try {writeFileSync(absolute, 'raw assertion');}
     catch (error) {
