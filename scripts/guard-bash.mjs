@@ -3690,7 +3690,10 @@ function keychainExpansion(text) {
 function secretDirGlobMatch(text, lowerDir) {
   const name = lowerDir.slice(lowerDir.lastIndexOf('/') + 1);
   const home = lowerDir.slice(0, lowerDir.lastIndexOf('/') + 1);
+  const seen = new Set(); // a repeated word is the same answer (a hostile run repeats one pattern hundreds of times)
   for (const word of text.split(/[\s;|&<>()=`]+/)) {
+    if (seen.has(word)) continue;
+    seen.add(word);
     const rest = word.startsWith(home) ? word.slice(home.length) : word;
     const comps = rest.split('/').filter((c) => c && c !== '.');
     const underHome = rest !== word || /^(?:~|\$home|\$\{home)/.test(rest);

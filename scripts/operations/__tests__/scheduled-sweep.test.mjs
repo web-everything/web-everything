@@ -97,12 +97,12 @@ describe('report and wiring', () => {
     expect(xml).toContain('--pass=pr-movement-sweep');
     const plan = installPlan({ repoRoot: '/r', nodePath: '/n', home: '/h', apply: false });
     expect(plan.writes).toEqual([]);
-    expect(plan.commands.length).toBe(3);
+    expect(plan.commands.length).toBe(4);
     expect(plan.commands.join('\n')).toContain('launchctl bootstrap');
   });
   it('install is default-off when apply is OMITTED (the real default), and only --apply plans writes', () => {
     expect(installPlan({ repoRoot: '/r', nodePath: '/n', home: '/h' }).writes).toEqual([]);
-    expect(installPlan({ repoRoot: '/r', nodePath: '/n', home: '/h', apply: true }).writes).toHaveLength(3);
+    expect(installPlan({ repoRoot: '/r', nodePath: '/n', home: '/h', apply: true }).writes).toHaveLength(4);
   });
 });
 
@@ -264,5 +264,20 @@ describe('installer guarantees are enforced by tested code, not top-level script
     expect(src).not.toMatch(/child_process|spawn|exec(File)?Sync|execa/);
     const code = src.split('\n').filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l)).join('\n');
     expect(code).not.toMatch(/launchctl/);
+  });
+});
+
+
+describe('PR merge watcher installer selection', () => {
+  it('installs just --pass=pr-merge-watch and leaves sweep plists out', () => {
+    const plan = installPlan({ repoRoot: '/r', nodePath: '/n', home: '/h', apply: true, pass: 'pr-merge-watch' });
+    expect(plan.files.map(f => f.pass)).toEqual(['pr-merge-watch']);
+    expect(plan.writes).toEqual(plan.files);
+    expect(plan.commands).toHaveLength(1);
+    expect(plan.files[0].xml).toContain('--pass=pr-merge-watch');
+  });
+  it('filters an existing sweep and refuses an unknown or empty pass', () => {
+    expect(installPlan({ pass: 'opus-sweep', repoRoot: '/r', nodePath: '/n', home: '/h' }).files.map(f => f.pass)).toEqual(['opus-sweep']);
+    for (const pass of ['unknown', '']) expect(() => installPlan({ pass })).toThrow('unknown installable pass');
   });
 });

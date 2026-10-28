@@ -231,6 +231,13 @@ export function isKnownMachineBody(body, comment = undefined) {
       return isNonBlockingRedTeamGate(text);
     }
     if (text.startsWith(RED_TEAM_COMMENT_MARKER)) {
+      const parsed = parseRedTeamComment(text);
+      // The skip settlement writer's complete policy-clear envelope is also non-blocking.
+      // Extra prose, malformed markers, and unauthenticated authors remain possible holds.
+      const lines = text.split(/\r?\n/).filter(line => line.trim());
+      if (parsed && SHA_RE.test(parsed.rev) && lines.length === 2
+        && lines[0] === redTeamMarker(parsed.pr, parsed.rev)
+        && /^Red team not required on this head: [^\r\n]+$/.test(lines[1])) return true;
       return isNonBlockingRedTeamAdvisory(text);
     }
   }
@@ -292,17 +299,19 @@ const lastMatch = (re, body) => { re.lastIndex = 0; let m; let out = null; while
  * @param {Array|null|undefined} reviews — the PR's formal reviews (`pulls/{n}/reviews`): an array = read; `null` =
  *   UNREADABLE (the record is marked `reviewsUnreadable`, which {@link decideAcceptCarryForward} refuses as a retryable
  *   read miss); `undefined` = the caller has no review channel (pure thread analysis, e.g. the sweep's planning pass).
+ * @param {{sha?:string}} options — select the latest trusted acceptance of this canonical SHA, retaining all later
+ *   comments for hold detection. No matching acceptance returns null; omitting sha preserves latest-head selection.
  * @returns {{sha:string, diff:string|null, contribution:string|null, humanCleared:boolean, actor:string|null, index:number, at:string|null,
  *   laterBodyDerivedHold:boolean, laterVerdict:boolean, reviewsUnreadable:boolean}|null}
  */
-export function latestAcceptRecord(comments, reviews = undefined) {
+export function latestAcceptRecord(comments, reviews = undefined, { sha: sourceSha } = {}) {
   const list = Array.isArray(comments) ? comments : [];
   let rec = null;
   list.forEach((c, index) => {
     if (!isTrustedMarkerAuthor(c)) return;
     const body = typeof c?.body === 'string' ? c.body : '';
     const sha = body ? lastMatch(REVIEWED_SHA_RE, body) : null;
-    if (!sha) return;
+    if (!sha || (sourceSha !== undefined && sha !== sourceSha)) return;
     const human = CLEARED_HUMAN_RE.exec(body);
     rec = { sha, diff: lastMatch(REVIEWED_DIFF_RE, body), contribution: lastMatch(REVIEWED_CONTRIBUTION_RE, body), humanCleared: !!human, actor: human ? human[1] || null : null, index,
       at: typeof c?.createdAt === 'string' ? c.createdAt : (typeof c?.created_at === 'string' ? c.created_at : null) };

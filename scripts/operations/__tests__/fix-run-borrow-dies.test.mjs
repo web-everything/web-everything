@@ -55,10 +55,11 @@ describe('(4) the launch bug: the agent is given the reviewer finding', () => {
 describe('(1) a borrowed fix that ends releases its claim and records a reason', () => {
   const argv = ['--pr=7', '--session=fix-7', '--ref=lane/7-x', '--prompt-file=/p.md', '--repo=o/r', '--claim-repo=we'];
   const io = (over = {}) => {
-    const heads = ['aaa', 'aaa'];
+    const heads = ['aaa'];
     return {
+      readLease: () => ({ holder: 'test-holder' }),
       readComments: async () => PR.comments,
-      run: (c, a) => (c === 'gh' ? JSON.stringify({ title: 'T', body: 'B' }) : a.includes('acquire') ? '/lanes/lane-5\n' : a[0] === 'rev-parse' ? heads.shift() : ''),
+      run: (c, a) => (c === 'gh' ? JSON.stringify({ title: 'T', body: 'B', headRefOid: 'aaa' }) : a.includes('acquire') ? JSON.stringify({ path: '/lanes/lane-5', holder: 'test-holder' }) : a.includes('--verify') ? 'aaa' : a[0] === 'rev-parse' ? heads.shift() : ''),
       readPrompt: () => 'BRIEF', removePrompt: () => {}, resolveProvider: () => ({ spawn: async () => {} }),
       write: () => {}, writeErr: () => {}, pendingRearm: { read: () => null, write: () => {}, clear: () => {} }, ...over,
     };

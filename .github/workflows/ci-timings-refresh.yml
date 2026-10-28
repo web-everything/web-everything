@@ -1,0 +1,106 @@
+name: Refresh CI test timings
+
+on:
+  schedule:
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
+
+# github.token only downloads artifacts and checks out; publication uses the App token below.
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: ci-refresh-test-timings
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web-everything
+    steps:
+      # Match CI's checkout path: Vitest JSON contains absolute test filenames.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          path: web-everything
+          persist-credentials: false
+      - name: Check for an existing refresh branch
+        id: branch
+        run: |
+          refs=$(git ls-remote --heads origin refs/heads/ci/refresh-test-timings)
+          if [ -n "$refs" ]; then
+            echo "Refresh branch already exists; preserving it and checking for an open PR."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-node@v4
+        if: steps.branch.outputs.exists == 'false'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web-everything/package-lock.json
+      - name: Install
+        if: steps.branch.outputs.exists == 'false'
+        run: npm ci
+      - name: Refresh from the latest successful main CI push
+        if: steps.branch.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/ci/refresh-timings.mjs --run=latest
+      - name: Detect updated timings
+        id: timings
+        if: steps.branch.outputs.exists == 'false'
+        run: |
+          if git diff --quiet -- scripts/ci/test-timings.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      # Publication must use an App token so push/pull_request events start required CI.
+      # Configure WE_APP_ID + WE_APP_PRIVATE_KEY and install that App on this repository
+      # with Contents:Write and Pull requests:Write. Missing credentials/installation fail
+      # here; an operator must provision them and rerun, with no github.token fallback.
+      - name: Mint publication token (GitHub App)
+        id: publication-token
+        if: steps.branch.outputs.exists == 'true' || steps.timings.outputs.changed == 'true'
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.WE_APP_ID }}
+          private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Propose updated timings
+        if: steps.branch.outputs.exists == 'true' || steps.timings.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.publication-token.outputs.token }}
+        run: |
+          # Recheck before publishing; never overwrite an existing operator/automation branch.
+          refs=$(git ls-remote --heads origin refs/heads/ci/refresh-test-timings)
+          if [ -z "$refs" ]; then
+            if git diff --quiet -- scripts/ci/test-timings.json; then
+              echo "Timings unchanged."
+              exit 0
+            fi
+            git switch -c ci/refresh-test-timings
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add scripts/ci/test-timings.json
+            git commit -m 'ci: refresh measured unit test timings'
+            # Checkout persists no github.token header; Git and gh both use the App token.
+            gh auth setup-git --hostname github.com
+            # Create-only: the empty lease refuses if the branch appeared after the recheck.
+            git push --force-with-lease=refs/heads/ci/refresh-test-timings: origin HEAD:refs/heads/ci/refresh-test-timings
+          fi
+          # Resume publication after an earlier push whose PR creation failed. A failed
+          # lookup must stop this step rather than treating an unknown PR state as absent.
+          open_prs=$(gh pr list --head ci/refresh-test-timings --state open --json number --jq 'length')
+          if [ "$open_prs" = 0 ]; then
+            gh pr create --base main --head ci/refresh-test-timings --title 'ci: refresh measured unit test timings' --body 'Refresh unit shard timings from the latest successful main CI push. Requires one report per CI unit shard and 90% current test-file coverage; only current test files are kept, and soak timings are preserved.'
+          fi

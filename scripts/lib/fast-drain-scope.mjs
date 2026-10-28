@@ -1,3 +1,8 @@
+import { setTimeout as delay } from 'node:timers/promises';
+import { dirname } from 'node:path';
+import { readFileSync, statSync } from 'node:fs';
+import { writeJsonAtomic } from './atomic-json-file.mjs';
+import { withWriteLock } from './daemon-clone-lock.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 
@@ -116,4 +121,90 @@ export function readLegacyLocalManifestAt({ headRef, headSha, prNumber, git }) {
   // No usable head sha (the listing always supplies headRefOid, so this is not expected): no ref can be
   // verified as the head, and FETCH_HEAD may hold another process's PR — fail closed rather than guess.
   return unreadable;
+}
+
+
+/** TTL is opt-in configurable; invalid bounds retain the standard 180s live-refresh fallback. */
+function roundSnapshotTtl(env) {
+  const raw = env.WE_FAST_DRAIN_LISTING_SNAPSHOT_TTL_SEC;
+  const number = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : NaN;
+  const valid = Number.isFinite(number) && number >= 0;
+  return { seconds: valid ? number : 180, source: valid ? 'env' : 'standard' };
+}
+
+/** A round cache is advisory context only: reject incomplete, foreign or expired evidence. */
+export function readFastDrainRoundSnapshot({ path, repo, now = Date.now(), env = process.env,
+  read = (p) => { if (statSync(p).size > 64 * 1024 * 1024) throw new Error('snapshot too large'); return readFileSync(p, 'utf8'); },
+} = {}) {
+  const { seconds: ttlSec } = roundSnapshotTtl(env);
+  try {
+    const raw = read(path);
+    if (typeof raw !== 'string' || Buffer.byteLength(raw) > 64 * 1024 * 1024) return null;
+    const snap = JSON.parse(raw);
+    if (snap?.repo !== repo || typeof snap.writtenAt !== 'number' || !Number.isFinite(snap.writtenAt)
+      || now < snap.writtenAt || now - snap.writtenAt >= ttlSec * 1000 || !Array.isArray(snap.rows)
+      || !snap.rows.every(row => Number.isInteger(row?.number) && row.number > 0
+        && typeof row.headRefOid === 'string' && row.headRefOid.length > 0
+        && typeof row.baseRefName === 'string' && row.baseRefName.length > 0
+        && Array.isArray(row.labels) && row.labels.every(l => typeof l?.name === 'string')
+        && Array.isArray(row.statusCheckRollup))) return null;
+    return snap;
+  } catch { return null; }
+}
+
+/** The shared writer lock waits for readers, but refuses another writer immediately. Wait for that
+ * writer here so simultaneous cold children do not all fall back live. Directory identity stays stable
+ * across creation of the snapshot file (realpath of an absent file can differ on symlinked temp roots).
+ */
+export async function withFastDrainRoundLock(path, fn, { owner, waitMs = 180_000, pollMs = 1000, sleep = delay } = {}) {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const result = await withWriteLock(dirname(path), fn, { owner, lockRoot: `${path}.locks`,
+      waitMs: Math.max(0, deadline - Date.now()) });
+    if (result.ok || Date.now() >= deadline) return result;
+    await sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())));
+  }
+}
+
+/** Populate once across concurrent catch-up children; always replace the target with a live read.
+ * The shared host snapshot still seeds listLive's heavy fields. This short-lived round file saves the
+ * pages/checks reads too. A failed target read propagates; it can never resurrect the cached target.
+ */
+export async function readFastDrainRoundListing({ path, repo, onlyPr, env = process.env, now,
+  read, write = writeJsonAtomic, listLive, readTarget, defaultBranch = () => null,
+  log = line => process.stderr.write(`${line}\n`),
+  lock = fn => withFastDrainRoundLock(path, fn),
+}) {
+  const clock = () => now ?? Date.now();
+  const ttl = roundSnapshotTtl(env);
+  const populate = async () => {
+    const snap = readFastDrainRoundSnapshot({ path, repo, env, now: clock(), read });
+    if (snap) return { rows: snap.rows, hit: true };
+    const rows = await listLive();
+    try { write(path, { repo, writtenAt: clock(), rows, defaultBranch: defaultBranch() }); }
+    catch { /* Unwritable cache costs a live listing next time; it never authorizes a cached target. */ }
+    return { rows, hit: false };
+  };
+  // Hits do not need the population lock. Misses re-check inside it after a sibling's write.
+  const snap = readFastDrainRoundSnapshot({ path, repo, env, now: clock(), read });
+  let base;
+  let lockFallback = false;
+  if (snap) base = { rows: snap.rows, hit: true };
+  else {
+    let entered = false;
+    let locked;
+    try { locked = await lock(() => { entered = true; return populate(); }); }
+    catch (error) {
+      if (entered) throw error; // The live reader failed: propagate it, never retry it as a cache error.
+      locked = { ok: false };
+    }
+    lockFallback = !locked.ok;
+    base = locked.ok ? locked.value : await populate();
+  }
+  log(`fast-drain: ${base.hit ? 'served-from-snapshot' : 'listed-live'} (round listing; TTL=${ttl.seconds}s, source=${ttl.source}${lockFallback ? '; cache lock unavailable, live fallback' : ''})`);
+  const target = await readTarget();
+  if (!target || String(target.number) !== String(onlyPr) || !['OPEN', 'CLOSED', 'MERGED'].includes(target.state)) {
+    throw new Error('round listing live target unreadable');
+  }
+  return mergeLiveTargetIntoRows(base.rows, target, onlyPr);
 }

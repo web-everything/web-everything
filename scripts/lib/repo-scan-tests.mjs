@@ -50,6 +50,13 @@ export const REPO_SCAN_TESTS = Object.freeze([
     inputs: ['scripts/operations/__tests__/health-watch-lane-scan-boundary.test.mjs'],
   },
   {
+    test: 'scripts/lib/__tests__/constellation-ownership.test.mjs',
+    scope: 'full',
+    why: 'checks ownership coverage and CLI file/line totals against the complete tracked inventory; every repository path contributes, so changed-file scoping would lose the whole-repo assertions',
+    matches: () => true,
+    inputs: ['config/constellation-ownership.json', 'scripts/lib/constellation-ownership.mjs', 'scripts/lib/__tests__/constellation-ownership.test.mjs'],
+  },
+  {
     test: 'scripts/lib/__tests__/lane-git-diet.test.mjs',
     scope: 'files',
     why: 'every script naming an ops/* ref is a listed by-name reader or a known non-reader (lane fetches exclude ops/*)',
@@ -126,6 +133,7 @@ export const REPO_SCAN_TESTS = Object.freeze([
  * @type {Readonly<Record<string, string>>}
  */
 export const DEFERRED_SCAN_TESTS = Object.freeze({
+  'scripts/backlog/__tests__/number-at-birth-cli.test.mjs': 'false positive: readdirSync(join(root, ...)) enumerates only the mkdtempSync CLI fixture backlog, never the live repo; this is a hermetic CLI integration test, not a repo rule scanner',
   'scripts/__tests__/stdout-flush.test.mjs': 'its one-home drain-loop guard lives in a test the default vitest config excludes (runs under vitest.integration.config.ts with real child processes), so `vitest run <file>` cannot select it; CI runs it',
   'scripts/__tests__/check-standards.test.mjs': 'asserts over the real tracked tree via check-standards itself; the verify gate already runs `check:standards --local --files=<changed>`',
   'bun-trial/scripts/lib/__tests__/standards-sections.test.mjs': 'native bun:test copy of the entry below, run only by the bun trial (we:bun-trial/), never by vitest; vitest stays the gate',

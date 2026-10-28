@@ -190,3 +190,17 @@ describe('worker-brief hardening (items 90, 92)', () => {
     expect(skill).toMatch(/register` exits non-zero[\s\S]*stop and report/);
   });
 });
+describe('early PR-size guidance', () => {
+  it('requires a split plan for cards sized >= 8 before any build', () => {
+    const brief = renderWorkerBrief({ purpose: 'size-check', files: ['scripts/example.mjs'] });
+    expect(brief).toContain('If the card size is >= 8, ask for a split plan up front, before any build.');
+  });
+
+  it('checks size after the first Codex round before verify/converge and stops oversized builds', () => {
+    const brief = renderWorkerBrief({ purpose: 'size-check', files: ['scripts/example.mjs'] });
+    expect(brief).toContain('After the first Codex round and before verify/converge, run');
+    expect(brief).toContain('node scripts/operations/run.mjs pr-size --checkout=<lane>');
+    expect(brief).toContain('If over the limit, stop and propose a split plan instead of finishing the build.');
+    expect(brief.indexOf('pr-size --checkout=<lane>')).toBeLessThan(brief.indexOf('6. **One PR.**'));
+  });
+});

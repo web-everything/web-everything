@@ -3,9 +3,12 @@ bornAs: xfneuba
 kind: story
 size: 3
 parent: "5488"
-status: open
-scope: ["we:config/constellation-ownership.json", "we:scripts/lib/constellation-ownership.mjs", "we:scripts/lib/__tests__/constellation-ownership.test.mjs"]
+status: resolved
+scope: ["we:config/constellation-ownership.json", "we:scripts/lib/constellation-ownership.mjs", "we:scripts/lib/__tests__/constellation-ownership.test.mjs", "we:scripts/lib/repo-scan-tests.mjs", "we:scripts/__tests__/repo-scan-tests.test.mjs"]
 dateOpened: "2026-10-08"
+dateStarted: "2026-10-25"
+dateResolved: "2026-10-25"
+graduatedTo: none
 tags: []
 ---
 
