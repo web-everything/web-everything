@@ -706,6 +706,11 @@ export function validateLedgerEvent(raw) {
   for (const [name, check] of spec) {
     if (!check(raw[name])) errors.push(`bad \`${name}\`: ${JSON.stringify(raw[name])}`);
   }
+  // A delegated approval's optional head witness must identify the full commit, never a prefix.
+  if (raw.type === EVENT_TYPES.APPROVAL && raw.delegation && raw.headSha !== undefined
+    && (typeof raw.headSha !== 'string' || shaOrNull(raw.headSha)?.length !== 40)) {
+    errors.push('bad `headSha`: a delegated approval requires a full 40-character SHA');
+  }
   if (errors.length) return { valid: false, errors, record: null };
   const actor = raw.actor && typeof raw.actor === 'object' ? raw.actor : {};
   const record = {
