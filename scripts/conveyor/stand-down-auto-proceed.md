@@ -25,3 +25,11 @@ Focused fixtures: we:scripts/conveyor/__tests__/stand-down-auto-proceed.test.mjs
 Every completed comment refresh is retained for downstream planning, including when reclassification rejects a new question or changed target, a reservation is refused, or later IO fails. An unreadable refresh retains the last complete thread; an unverified posted answer is never appended.
 
 Reconciliation and the exported `runReconcileFixDispatch` function are read-only for R123 by default. Only a caller passing the literal boolean `allowStandDownAutoProceed: true` may invoke this writer, including its cursor and reservation writes. The mutating fix-dispatch CLI enables it explicitly. The daemon live smoke and targeted orphan redispatch explicitly pass false; dry-run claim planning, standalone reconcile CLI and other planning readers leave it disabled. Stubbing dispatch alone does not authorize R123 writes. The writer remains before main-red enrichment when enabled.
+
+The production daemon resolves `fix.standDownAutoProceed` once per tick and forwards it through
+`runTickAllRepos` → `runReconcileFixDispatchAllRepos` → `runReconcileFixDispatch` → `runReconcilePass`.
+Its policy cascade is standard **true** (R123) → platform preferences → `scripts/settings/fix.json`
+(`fix.standDownAutoProceed`, boolean) → `WE_FIX_STAND_DOWN_AUTO_PROCEED` (`true`/`1`/`on` to enable,
+`false`/`0`/`off` to disable). Present malformed switches disable automatic answers; absent switches inherit.
+The shared cascade logs the effective value and source. An explicit `allowStandDownAutoProceed` argument
+overrides the daemon setting; `false` prevents all R123 cursor, reservation and answer writes.

@@ -425,11 +425,12 @@ it.each(['failure', 'error', 'pending', 'unknown'])(
     expect(calls.some(path => path.includes('/statuses?'))).toBe(true);
   });
 
+// Object rows preserve the status arrays; it.each spreads array rows into callback arguments.
 it.each([
-  { statuses: [] },
-  { statuses: [{ id: 10, context: 'test', state: 'success' }] },
-  { statuses: [{ id: 10, context: 'optional', state: 'failure' }] },
-])('accepts complete green or unrelated commit statuses: %j', ({ statuses }) => {
+  { name: 'empty feed', statuses: [] },
+  { name: 'required success', statuses: [{ id: 10, context: 'test', state: 'success' }] },
+  { name: 'unrelated failure', statuses: [{ id: 10, context: 'optional', state: 'failure' }] },
+])('accepts complete green or unrelated commit statuses: $name', ({ statuses }) => {
   const checks = readAutoProceedChecks({ repo: 'org/repo', head, requiredChecks: ['test'] }, {
     read: argv => argv[1].includes('/statuses?') ? statuses : { total_count: 1, check_runs: [run(2, 'cancelled')] },
   });

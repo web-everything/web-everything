@@ -11,7 +11,7 @@ import { dirname, join } from 'node:path';
 import {
   runDaemonLoop, buildCliDaemonEffects, realSleep, RECONCILE_FIX_DISPATCH_LEASE_KEY, DEFAULT_INTERVAL_MS,
   runReconcileFixDispatchAllRepos, FIX_DISPATCH_DAEMON_REPOS, hasStaleMainRefusal,
-  runReconcileCiHealDispatchAllRepos, runTickAllRepos, formatRefusalLine,
+  runReconcileCiHealDispatchAllRepos, runTickAllRepos as realRunTickAllRepos, formatRefusalLine,
   runHungCiRecoveryAllRepos, formatHungActionLine,
   runMainRedRebaseAllRepos, formatMainRedRebaseActionLine,
   runMissingRunRecoveryAllRepos, formatMissingRunActionLine,
@@ -21,6 +21,10 @@ import {
 } from '../reconcile-fix-dispatch-daemon.mjs';
 import { CONSTELLATION_REPOS } from '../../../scripts/lib/constellation-repos.mjs';
 import { assertMainNotStale } from '../../../scripts/lib/main-staleness.mjs';
+
+// These historical fixtures exercise other daemon halves with R123 explicitly disabled.
+// stand-down-auto-proceed-daemon.test.mjs exercises the production policy defaults and writer.
+const runTickAllRepos = options => realRunTickAllRepos({ allowStandDownAutoProceed: false, ...options });
 
 // #3383 bug 1 — wired into withSelfSync's `hasStaleRefusal` option in main(); tested here in isolation
 // (pure, no IO) against the exact shape `runReconcileFixDispatchAllRepos` returns.
@@ -104,10 +108,10 @@ describe('runReconcileFixDispatchAllRepos — one runReconcileFixDispatch call p
     const tick = vi.fn(({ repo }) => (repo === 'repo-a'
       ? { dispatched: [{ pr: 10 }], refusals: [] }
       : { dispatched: [], refusals: [{ kind: 'unsupported-repo', prNumber: 20 }] }));
-    const out = runReconcileFixDispatchAllRepos({ repos: ['repo-a', 'repo-b'], tick });
+    const out = runReconcileFixDispatchAllRepos({ repos: ['repo-a', 'repo-b'], tick, allowStandDownAutoProceed: false });
     expect(tick).toHaveBeenCalledTimes(2);
-    expect(tick).toHaveBeenCalledWith({ repo: 'repo-a' });
-    expect(tick).toHaveBeenCalledWith({ repo: 'repo-b' });
+    expect(tick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false });
+    expect(tick).toHaveBeenCalledWith({ repo: 'repo-b', allowStandDownAutoProceed: false });
     expect(out.dispatched).toEqual([{ pr: 10, repo: 'repo-a' }]);
     expect(out.refusals).toEqual([{ kind: 'unsupported-repo', prNumber: 20, repo: 'repo-b' }]);
     expect(out.repos).toEqual([
@@ -405,7 +409,7 @@ describe('runTickAllRepos — the daemon tick now runs BOTH fix and ci-heal disp
       repos: ['repo-a', 'repo-b'], fixTick, ciHealTick, hungCiTick: noopHungCiTick, mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
     });
     expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a' }); // ci-heal still ran for repo-a despite fix's own failure there
-    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-b' }); // fix still ran for repo-b despite ci-heal's own failure there
+    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-b', allowStandDownAutoProceed: false }); // fix still ran for repo-b despite ci-heal's own failure there
     expect(out.refusals).toEqual(expect.arrayContaining([
       { repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'fix broke' },
       { repo: 'repo-b', prNumber: null, kind: 'tick-failed', why: 'ci-heal broke' },
@@ -768,7 +772,7 @@ describe('runTickAllRepos — now runs THREE halves: fix, ci-heal, and hung-ci-r
     const out = await runTickAllRepos({
       repos: ['repo-a', 'repo-b'], fixTick, ciHealTick, hungCiTick, mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
     });
-    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a' });
+    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false });
     expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a' });
     expect(out.refusals).toEqual(expect.arrayContaining([{ repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'hung-ci broke' }]));
   });
@@ -879,7 +883,7 @@ describe('runTickAllRepos — now runs FOUR halves: fix, ci-heal, hung-ci-recove
       repos: ['repo-a', 'repo-b'], fixTick, ciHealTick, hungCiTick: noopHungCiTick, mainRedRebaseTick,
       missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
     });
-    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a' });
+    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false });
     expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a' });
     expect(out.refusals).toEqual(expect.arrayContaining([{ repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'rebase broke' }]));
   });
@@ -993,7 +997,7 @@ describe('runTickAllRepos — now runs SIX halves, missing-run-recovery included
       repos: ['repo-a', 'repo-b'], fixTick, ciHealTick, hungCiTick: noopHungCiTick,
       mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
     });
-    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a' });
+    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false });
     expect(ciHealTick).toHaveBeenCalledWith({ repo: 'repo-a' });
     expect(out.refusals).toEqual(expect.arrayContaining([{ repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'trigger broke' }]));
   });
@@ -1094,7 +1098,7 @@ describe('runTickAllRepos — draft-first PRs: the promote-draft half rides THIS
       mainRedRebaseTick: noopMainRedRebaseTick, missingRunTick: noopMissingRunTick, notesTick: noopNotesTick,
       promoteDraftTick,
     });
-    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a' });
+    expect(fixTick).toHaveBeenCalledWith({ repo: 'repo-a', allowStandDownAutoProceed: false });
     expect(out.dispatched).toEqual(expect.arrayContaining([{ pr: 1, repo: 'repo-a' }]));
     expect(out.refusals).toEqual(expect.arrayContaining([{ repo: 'repo-a', prNumber: null, kind: 'tick-failed', why: 'promote-draft half: promote broke' }]));
   });

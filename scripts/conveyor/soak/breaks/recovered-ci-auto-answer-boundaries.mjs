@@ -5,20 +5,25 @@ import { readFileSync } from 'node:fs';
 
 export default {
   id: 'recovered-ci-auto-answer-boundaries',
-  title: 'recovered CI answers require mutation permission and repository/workflow identity',
+  title: 'daemon policy enables recovered CI answers while preserving mutation and identity boundaries',
   card: 'PR #5981 / R123',
   fixedBy: { sha: 'uncommitted', where: 'lane/r123-auto-proceed', paths: [
     'scripts/conveyor/reconcile-pass.mjs', 'scripts/conveyor/reconcile-fix-dispatch.mjs',
     'scripts/conveyor/stand-down-auto-proceed-io.mjs', 'scripts/conveyor/stand-down-auto-proceed.mjs',
+    'scripts/conveyor/fix-takeover.mjs', 'skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs',
   ] },
   fixPresent(root) {
-    return readFileSync(join(root, 'scripts/conveyor/reconcile-pass.mjs'), 'utf8').includes('allowStandDownAutoProceed === true');
+    return readFileSync(join(root, 'scripts/conveyor/reconcile-pass.mjs'), 'utf8').includes('allowStandDownAutoProceed === true')
+      && readFileSync(join(root, 'skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs'), 'utf8')
+        .includes('allowStandDownAutoProceed = fixSettings.standDownAutoProceed');
   },
   async run({ sourceRoot } = {}) {
     const root = sourceRoot ?? resolve(fileURLToPath(import.meta.url), '../../../../..');
     const load = p => import(pathToFileURL(join(root, p)).href);
     const { runReconcilePass } = await load('scripts/conveyor/reconcile-pass.mjs');
     const { planFixDispatchClaimStatus, runReconcileFixDispatch } = await load('scripts/conveyor/reconcile-fix-dispatch.mjs');
+    const { runTickAllRepos } = await load('skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs');
+    const { resolveFixSettings } = await load('scripts/conveyor/fix-takeover.mjs');
     const io = await load('scripts/conveyor/stand-down-auto-proceed-io.mjs');
     const { annotateLapsedStandDowns, buildStandDownComment } = await load('scripts/conveyor/stand-down.mjs');
     const { countUnresolvedStandDowns, planReconcile } = await load('scripts/conveyor/reconcile-core.mjs');
@@ -48,7 +53,7 @@ export default {
     const options = {
       readPrs: () => [pr], readAgents: () => [], enrich: same, env: {},
       readRequiredChecks: () => ({ checks: ['test'] }),
-      enrichStandDownAutoProceed: (prs, opts) => io.enrichPrsWithStandDownAutoProceed(prs, { ...opts, ...writerOptions }),
+      enrichStandDownAutoProceed: (prs, opts) => io.enrichPrsWithStandDownAutoProceed(prs, { ...writerOptions, ...opts }),
       excuseMergeGateHolds: same, enrichMainRed: prs => ({ prs, mainRedWindows: [] }),
       enrichAlreadyLanded: same, enrichBaseRef: same, enrichSystemFix: same, enrichEscalationBase: same,
       enrichFixClaims: same, enrichTimeouts: same, enrichReferralHolds: same, enrichReferralAutoResolve: same,
@@ -76,6 +81,40 @@ export default {
       allowStandDownAutoProceed: true,
       netScope: null, prStack: null, resolveProfile: () => ({ capabilities: { fix: false } }) });
     if (writes.join(',') !== 'cursor,reserve,post') violations.push('mutating dispatch did not explicitly enable automatic answers');
+    // Exercise the production daemon -> all-repo fan-out -> dispatch -> reconcile -> real writer.
+    // Only external effects are replaced; the permission must arrive through the daemon itself.
+    const daemonWrites = {};
+    const emptyTick = () => ({ dispatched: [], refusals: [] });
+    for (const [name, setting, override, expected] of [
+      ['standard', undefined, undefined, true], ['disabled', false, undefined, false],
+      ['enabled', true, undefined, true], ['explicit-off', true, false, false],
+      ['explicit-on', false, true, true],
+    ]) {
+      writes.length = 0;
+      const answerRepos = [];
+      const fixSettings = resolveFixSettings({ env: {}, platform: {},
+        read: () => JSON.stringify({ fix: { standDownAutoProceed: setting } }) });
+      const result = await runTickAllRepos({ repos: [weSlug, frontierSlug], fixSettings,
+        ...(override === undefined ? {} : { allowStandDownAutoProceed: override }),
+        fixTick: input => runReconcileFixDispatch({ ...dispatchOptions, ...input,
+          reconcile: input => runReconcilePass({ ...options, ...input,
+            enrichStandDownAutoProceed: (prs, opts) => io.enrichPrsWithStandDownAutoProceed(prs, {
+              ...writerOptions, ...opts, post: args => { answerRepos.push(args.repo); return writerOptions.post(args); },
+            }),
+          }),
+        }),
+        ciHealTick: emptyTick, hungCiTick: emptyTick, mainRedRebaseTick: emptyTick,
+        missingRunTick: emptyTick, promoteDraftTick: emptyTick, notesTick: emptyTick,
+      });
+      daemonWrites[name] = [...writes];
+      const want = expected ? 'cursor,reserve,post,cursor,reserve,post' : '';
+      if (writes.join(',') !== want || result.repos.some(row => row.error)) {
+        violations.push(`daemon ${name}: expected ${want || 'no writes'}, got ${writes.join(',') || 'no writes'}`);
+      }
+      if (answerRepos.join(',') !== (expected ? [weSlug, frontierSlug].join(',') : '')) {
+        violations.push(`daemon ${name}: answers escaped their reconciled repositories`);
+      }
+    }
     writes.length = 0;
     io.enrichPrsWithStandDownAutoProceed([pr], { ...writerOptions,
       readChecks: () => ({ head, complete: true, runs: [run(101, 'failure'), run(102, 'success', 902)] }) });
@@ -195,7 +234,7 @@ export default {
       if (crossRepoWrites.length) violations.push('a WE outage released a genuine FrontierUI failure');
     }
     return { violations, dryRunWrites, defaultDispatchWrites, optedOutDispatchWrites, mainReads, crossRepoWrites,
-      refreshedThreadRace, sameAttemptWrites, legacyStatusWrites, failedRerunRace };
+      refreshedThreadRace, sameAttemptWrites, legacyStatusWrites, failedRerunRace, daemonWrites };
   },
   judge(report) { return report.violations; },
 };
