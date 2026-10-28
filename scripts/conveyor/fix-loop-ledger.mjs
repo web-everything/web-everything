@@ -121,12 +121,17 @@ export const FIX_RUN_INFRA_PATTERNS = Object.freeze([
   /launch did not complete/i, /lane-pool/i, /Operation not permitted/i, /EPERM/i, /EACCES/i,
   /read-only file system/i, /index\.lock/i, /\.git\b/i, /sandbox/i, /could not (commit|push|stage)/i,
 ]);
+/** Shared with the launcher: every emitted terminal must participate in session-log alignment. */
+export const FIX_RUN_OUTCOME = Object.freeze({
+  FAILED: 'failed', NO_CHANGE: 'no-change', NO_CHANGE_UNPROVEN: 'no-change-unproven', PUSHED: 'pushed', LEASE_LOST: 'lease-lost',
+});
+const FIX_RUN_TERMINAL = new RegExp(`^fix-run: PR #(\\d+) (${Object.values(FIX_RUN_OUTCOME).join('|')}) \\((.*)\\); claim`);
 /** PURE. Only failed launcher infrastructure outcomes are discounted, including card 5947 (live #5045, 2026-10-13). */
 export function isInfraFixRunOutcome(outcome, reason) {
   return outcome === 'failed' && FIX_RUN_INFRA_PATTERNS.some(pattern => pattern.test(String(reason ?? '')));
 }
 export function classifyFixRunOutcome(line) {
-  const match = /^fix-run: PR #(\d+) (failed|no-change|no-change-unproven|pushed) \((.*)\); claim/.exec(line);
+  const match = FIX_RUN_TERMINAL.exec(line);
   if (!match) return null;
   const [, pr, outcome, reason] = match;
   return { pr: Number(pr), outcome, reason, infra: isInfraFixRunOutcome(outcome, reason) };
