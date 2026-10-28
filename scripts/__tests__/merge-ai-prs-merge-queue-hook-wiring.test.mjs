@@ -351,6 +351,7 @@ function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, e
     const r = spawnSync(process.execPath, ['--import', preload, script, `--repos=${LOCAL},${FUI}${secondImplPassAges ? `,${PA}` : ''}`, '--label=ready-to-merge',
       '--no-drain-lease', '--no-red-main-freeze', '--json'], { // reconcile ON: a couple's gate needs the complete open-PR context
       cwd: dir, encoding: 'utf8', timeout: 60_000 * TIMEOUT_SCALE,
+      // Both halves can need a retry; use the shared fixture timing instead of the production 20 s default.
       env: { ...process.env, ...daemonAppEnv(dir), ...retryTimingEnv, WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir, WE_MERGE_QUEUE_SETTINGS_FILE: settings, WE_COORDINATION_ROOT: coord, ...extraEnv },
     });
     expect(r.error, r.stderr).toBeUndefined();
@@ -395,7 +396,7 @@ describe('review of #4619 — the WE-carrier pre-check keeps a couple together',
     expect(attempts).toEqual([`${FUI}#501`, `${LOCAL}#4001`]);
   }, 90_000 * TIMEOUT_SCALE);
 
-  it('with retries disabled, the same transient UNKNOWN holds the whole couple', () => {
+  it('with retries off, the same transient UNKNOWN holds the couple before either half lands', () => {
     const { attempts, stderr } = runCouple({ implPassAges: [5], carrierPassAges: [5], env: { MQ_UNKNOWN_FIRST: '1', WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES: '0' } });
     expect(attempts).toEqual([]);
     expect(stderr).toContain('mergeable=UNKNOWN');
