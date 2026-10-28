@@ -92,7 +92,7 @@ import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, bu
 import { liveResultGateState, readRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
 import { normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
-import { redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
+import { failedRedTeamRetry, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../lib/red-team-carry-io.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
@@ -320,6 +320,8 @@ export function execReadRaw(file, args, options = {}) {
 
 /** The real effects, each one command. `root` is the checkout the arc runs from (the daemon's clone). */
 export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence } = {}) {
+  // The record each queued write replaced, so a deferral rollback can restore it beside a retry marker.
+  const replacedStatus = new Map();
   const node = (args, { actorId, timeoutMs, extraEnv = null } = {}) => spawnSync(process.execPath, args, {
     cwd: root,
     encoding: 'utf8',
@@ -356,7 +358,11 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       publishNeedsYou: isUnderTest(env) || isUnderTest(process.env) ? () => {} : item => publishAttention(item),
     } }),
     clearRedTeamQueued: ({ repo, pr, head }) => {
-      rmSync(join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`), { force: true });
+      const path = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
+      // Deleting the status beside a spent retry marker would leave an orphan every reader refuses.
+      // Restore the record this job's queued write replaced; without one, keep the status as it stands.
+      if (!existsSync(`${path}.retry-1`)) rmSync(path, { force: true });
+      else if (replacedStatus.get(path) != null) writeJsonAtomic(path, replacedStatus.get(path));
     },
     redTeamStatus: input => {
       const head = input.loopPayload?.findings?.read?.netBasis?.rev;
@@ -386,21 +392,28 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           // separately requires the stored read's netBasis.rev to equal status.head.
           // A null result is eligible only when normalized from the original queued
           // writer above. An ordinary finished/null prior must reach the guard intact.
-          if (input.redTeamMode === 'fresh' && (redTeamSkipNeedsSettlement(admissionPrior)
+          const retry = input.redTeamMode === 'fresh' && failedRedTeamRetry(admissionPrior, readEvidence(key));
+          if (input.redTeamMode === 'fresh'
+            && (admissionPrior?.retryCount === undefined || admissionPrior.retryCount === 0)
+            && !retry
+            && (redTeamSkipNeedsSettlement(admissionPrior)
             || redTeamStatusWithoutRun(admissionPrior, { originalStatus: prior }))) admissionPrior = null;
           if (['ran', 'resumed'].includes(normalizeRedTeamResult(admissionPrior?.result).priorResult)) priorResult = admissionPrior.result;
-          input = { ...input, result: priorResult };
+          input = { ...input, result: priorResult, ...(retry ? { retryCount: 1 } : {}) };
         }
         attempted = true;
         writeStatus(input, { env });
         if (queued) {
           const stored = readStatus(key);
           if (stored?.status !== 'queued' || stored.pid !== process.pid
-            || JSON.stringify(stored.result) !== JSON.stringify(priorResult)) throw Error('queued red-team status readback mismatch');
+            || JSON.stringify(stored.result) !== JSON.stringify(priorResult)
+            || (input.retryCount === 1 && stored.retryCount !== 1)) throw Error('queued red-team status readback mismatch');
+          replacedStatus.set(join(redTeamStatusDir(env), `${encodeURIComponent(input.repo)}-${Number(input.pr)}-${head}.json`), prior ?? null);
         }
       } catch (e) {
         if (queued) {
-          if (attempted) {
+          // A losing exclusive retry claim never wrote the status; preserve the winner.
+          if (attempted && e.code !== 'RED_TEAM_RETRY_ADMITTED') {
             try {
               const path = join(redTeamStatusDir(env), `${encodeURIComponent(input.repo)}-${Number(input.pr)}-${head}.json`);
               if (prior == null) rmSync(path, { force: true });
@@ -417,8 +430,10 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           evidence: readEvidence(key), env, log: line => process.stderr.write(`${line}\n`) });
       } catch (e) { process.stderr.write(`review-job: red-team status label sync failed: ${e.message}\n`); }
       return { priorResult, ...(queued && input.redTeamMode ? { redTeamAdmission: { pid: process.pid,
+        ...(input.retryCount === 1 ? { retrySpent: true } : {}),
         prior: admissionPrior == null ? null : { repo: admissionPrior.repo, pr: admissionPrior.pr, head: admissionPrior.head,
-          status: admissionPrior.status, result: admissionPrior.result } } } : {}) };
+          status: admissionPrior.status, result: admissionPrior.result,
+          ...(admissionPrior.retryCount !== undefined ? { retryCount: admissionPrior.retryCount } : {}) } } } : {}) };
     },
     root,
     fetchRedTeamHead: ({ lanePath, pr, head }) => {
@@ -921,7 +936,13 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
           ? seatsBox.priorRedTeamResult : out.redTeam?.status === 'skipped'
             ? { status: 'skipped', ...(out.redTeam.policy === 'card-only' ? { policy: 'card-only' } : {}) }
             : out.redTeam?.status ?? null;
-      io.redTeamStatus?.({ ...seatsBox.input, status: guardDeferred && prior ? prior.status : 'finished', result });
+      // A cap or guard deferral (including a disabled switch) precedes the model call. Return this
+      // admission's retry spend so the failed seat stays eligible once the cap, switch or transient read
+      // clears. Deterministic skips (policy, no provider, no diff, result on head) keep the spend.
+      const refundRetry = seatsBox.input?.redTeamAdmission?.retrySpent === true
+        && (guardDeferred || (out.redTeam?.status === 'skipped' && out.redTeam.deferredByCap === true));
+      io.redTeamStatus?.({ ...seatsBox.input, status: guardDeferred && prior ? prior.status : 'finished', result,
+        ...(refundRetry ? { refundRetry: true } : {}) });
     }
   }
   else if (spec && seatsBox.input && !seatsBox.admissionFailed) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: 'not-owed' });
