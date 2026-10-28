@@ -84,8 +84,15 @@ deferred tip persistence failures, and forwarding post-removal audit failures to
 
 Refreshed tips carry `{sha, reg}` from classification through preparation's deferred persistence. Compare
 `reg` with `registrationIdentity` under the list lock; reject plain SHA values and changed/vanished registrations.
-Every `addOverlay` call creates a new `registrationId` and clears inherited `tipSha`, including identical
-metadata and timestamps. Keep the legacy registration fields readable; no migration is needed for old lists.
+Every `addOverlay` call creates a new `registrationId` and clears inherited `tipSha`, `sha`, `headSha`,
+`adoptedTip` and cached `stackBases`, including identical metadata and timestamps. Explicit new `stackBases`
+replace the cleared cache. Keep `retiredSources` as recovery obligations: preparation must revalidate their
+content against the candidate, and removal must still restore them. Legacy SHA fields remain readable on
+registrations that have not been replaced; no migration is needed for old lists.
+The file-only `daemon-overlays.test.mjs` regression covers legacy `sha`, `headSha` and both together:
+register A → record evidence → re-register B → remote missing leaves B registered without A's evidence.
+It also rejects delayed A evidence and accepts a tip bound to B's identity. The deterministic soak replay
+checks the same lifecycle without manually replacing A's SHA before calling `addOverlay`.
 Ref-only adopted-build fallback is limited to legacy entries without `registrationId`; a new registration
 cannot borrow an older registration's applied SHA when its branch disappears before a successful refresh.
 The registration-race regression covers refresh → same-ref replacement → persistence → missing-branch

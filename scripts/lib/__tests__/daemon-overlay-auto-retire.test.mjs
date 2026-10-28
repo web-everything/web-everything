@@ -79,17 +79,29 @@ describe('real Git retirement evidence', () => {
     expect(refreshedTips.get('feature')).toEqual({ sha: initial, reg: registrationIdentity(old) });
     branch('feature');
     const needed = commit('needed', 'unmerged replacement');
-    register([{ ...old, sha: needed }]);
     addOverlay(root, { ref: 'feature' }, { env });
     const replacement = readOverlayState(root, { env }).overlays[0];
     expect(replacement.tipSha).toBeUndefined();
+    expect(replacement.sha).toBeUndefined();
+    expect(replacement.headSha).toBeUndefined();
     expect(persistTipShas(root, refreshedTips, { env })).toEqual({ written: 0 });
     ok('update-ref', '-d', 'refs/remotes/origin/feature');
-    const result = await autoRetireOverlays({ root, env, overlays: [replacement], git,
+    const unknown = await autoRetireOverlays({ root, env, overlays: [replacement], git,
+      refEvidence: new Map([['feature', 'missing']]) });
+    expect(unknown.retired).toEqual([]);
+    expect(readOverlayState(root, { env }).overlays).toEqual([replacement]);
+    // Refresh the new tip under the new identity before it can become deleted-branch evidence.
+    track('feature', needed);
+    await autoRetireOverlays({ root, env, overlays: [replacement], git,
+      refEvidence: new Map([['feature', 'refreshed']]) });
+    const refreshed = { ...replacement, tipSha: needed };
+    expect(readOverlayState(root, { env }).overlays).toEqual([refreshed]);
+    ok('update-ref', '-d', 'refs/remotes/origin/feature');
+    const result = await autoRetireOverlays({ root, env, overlays: [refreshed], git,
       refEvidence: new Map([['feature', 'missing']]) });
     expect(result.retired).toEqual([]);
     expect(result.kept).toEqual([expect.objectContaining({ ref: 'feature', sha: needed, reason: 'unmerged-content' })]);
-    expect(readOverlayState(root, { env }).overlays).toEqual([replacement]);
+    expect(readOverlayState(root, { env }).overlays).toEqual([refreshed]);
   });
 
   it('an identical re-registration rejects earlier tips even with the same timestamp', () => {

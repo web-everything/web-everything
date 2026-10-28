@@ -281,7 +281,14 @@ export function addOverlay(root, {
       });
     } else {
       const next = { ...list[idx], registrationId, pr: pr ?? null, reason: reason ?? null };
+      // Evidence belongs to the previous registration, even when the ref and metadata match.
+      // Keep retiredSources as recovery obligations, not proof that this new tip contains them;
+      // preparation revalidates those archives against the candidate before adopting it.
       delete next.tipSha;
+      delete next.sha;
+      delete next.headSha;
+      delete next.adoptedTip;
+      delete next.stackBases;
       if (pinned === true) next.pinned = true;
       else if (pinned === false) delete next.pinned;
       if (bases) next.stackBases = bases;

@@ -211,20 +211,30 @@ export async function registrationEvidenceReplay() {
   };
   try {
     writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, '{}');
-    const old = { ref: 'feature', sha: landed, tipSha: landed, registeredAt: 'old' };
+    const old = { ref: 'feature', sha: landed, headSha: landed, tipSha: landed,
+      adoptedTip: landed, stackBases: ['old-base'], registeredAt: 'old' };
     writeOverlays(root, [old], { env });
     let refreshed;
     await autoRetireOverlays({ root, env, overlays: [old], git, refEvidence: new Map([['feature', 'refreshed']]),
       persistTipShas: (_root, tips) => { refreshed = tips; } });
     check('refresh-carries-registration-identity', refreshed.get('feature')?.reg?.registeredAt === 'old', refreshed.get('feature'));
-    writeOverlays(root, [{ ...old, sha: needed }], { env });
     addOverlay(root, { ref: 'feature' }, { env });
-    check('reregistration-clears-inherited-tip', entries()[0].tipSha === undefined, entries()[0]);
+    const replacementEntry = entries()[0];
+    check('reregistration-clears-inherited-evidence',
+      ['tipSha', 'sha', 'headSha', 'adoptedTip', 'stackBases'].every((key) => !Object.hasOwn(replacementEntry, key)), replacementEntry);
     const persisted = persistTipShas(root, refreshed, { env });
     check('replacement-rejects-old-refresh', persisted.written === 0 && entries()[0].tipSha === undefined, { persisted, entry: entries()[0] });
     env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'on';
     const retired = await autoRetireOverlays({ root, env, overlays: entries(), git, refEvidence: new Map([['feature', 'missing']]) });
-    check('missing-replacement-stays-registered', retired.retired.length === 0 && entries()[0]?.sha === needed, { retired: retired.retired, entries: entries() });
+    check('missing-replacement-stays-registered', retired.retired.length === 0
+      && entries()[0]?.registrationId === replacementEntry.registrationId, { retired: retired.retired, entries: entries() });
+    const fresh = persistTipShas(root, new Map([['feature', {
+      sha: needed, reg: registrationIdentity(replacementEntry),
+    }]]), { env });
+    const neededResult = await autoRetireOverlays({ root, env, overlays: entries(), git,
+      refEvidence: new Map([['feature', 'missing']]) });
+    check('replacement-accepts-only-new-tip', fresh.written === 1 && neededResult.retired.length === 0
+      && entries()[0]?.tipSha === needed, { fresh, neededResult, entries: entries() });
 
     const input = { ref: 'same', now: '2026-10-27T12:00:00Z' };
     const first = addOverlay(root, input, { env }).find((o) => o.ref === 'same');

@@ -23,7 +23,10 @@ import {
   removeOverlay,
   appendOverlayEvent,
   recordEdgeResolution,
+  persistTipShas,
+  registrationIdentity,
 } from '../daemon-overlays.mjs';
+import { autoRetireOverlays } from '../daemon-overlay-auto-retire.mjs';
 
 const CLI_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'daemon-overlay.mjs');
 
@@ -43,6 +46,58 @@ afterEach(() => {
 function env() {
   return { WE_DAEMON_OVERLAY_DIR: overlayDir };
 }
+
+describe('re-registration discards retirement evidence', () => {
+  it('replaces containment cache while retaining archived source recovery obligations', () => {
+    const source = { ref: 'source', registrationId: 'source-registration' };
+    const archive = { entry: source, sha: 'a'.repeat(40) };
+    writeOverlays(cloneRoot, [{ ref: 'carrier', stackBases: ['old-base'], retiredSources: [archive] }], { env: env() });
+    const [replacement] = addOverlay(cloneRoot, { ref: 'carrier', stackBases: ['new-base'] }, { env: env() });
+    expect(replacement.stackBases).toEqual(['new-base']);
+    expect(replacement.retiredSources).toEqual([archive]);
+    removeOverlay(cloneRoot, 'carrier', { env: env() });
+    expect(readOverlays(cloneRoot, { env: env() })).toEqual([{ ...source, tipSha: archive.sha }]);
+  });
+
+  it.each(['sha', 'headSha', 'both'])('keeps replacement B when legacy %s evidence belongs to landed A', async (field) => {
+    const landed = 'a'.repeat(40), needed = 'b'.repeat(40);
+    const testEnv = { ...env(), WE_DAEMON_OVERLAY_AUTO_RETIRE: 'on',
+      WE_DAEMON_EVENTS: join(overlayDir, 'events.jsonl'),
+      WE_PLATFORM_PREFERENCES_FILE: join(overlayDir, 'prefs.json') };
+    writeFileSync(testEnv.WE_PLATFORM_PREFERENCES_FILE, '{}');
+    const [first] = addOverlay(cloneRoot, { ref: 'feature' }, { env: testEnv });
+    const old = { ...first, tipSha: landed, adoptedTip: landed, stackBases: ['old-base'],
+      ...(field !== 'headSha' ? { sha: landed } : {}), ...(field !== 'sha' ? { headSha: landed } : {}) };
+    writeOverlays(cloneRoot, [old], { env: testEnv });
+    const staleTips = new Map([['feature', { sha: landed, reg: registrationIdentity(old) }]]);
+    const [replacement] = addOverlay(cloneRoot, { ref: 'feature' }, { env: testEnv });
+    expect(replacement.registrationId).not.toBe(old.registrationId);
+    expect(persistTipShas(cloneRoot, staleTips, { env: testEnv })).toEqual({ written: 0 });
+    // The new branch tip is B, but its remote disappears before this registration can refresh it.
+    // Cached refs and adopted-build evidence still name A; neither may retire the replacement.
+    const git = (args) => {
+      if (args[0] === 'rev-parse') return { status: 0, stdout: args.at(-1).startsWith(needed) ? needed : landed };
+      if (args[0] === 'merge-base') return { status: args[2] === landed ? 0 : 1, stdout: '' };
+      if (args[0] === 'cherry') return { status: 0, stdout: `+ ${needed}` };
+      if (args[0] === 'merge-tree') return { status: 1, stdout: '' };
+      throw new Error(`unexpected Git call: ${args.join(' ')}`);
+    };
+    const retire = () => autoRetireOverlays({ root: cloneRoot, env: testEnv,
+      overlays: readOverlays(cloneRoot, { env: testEnv }), git,
+      refEvidence: new Map([['feature', 'missing']]), recordedShas: new Map([['feature', landed]]) });
+    expect((await retire()).retired).toEqual([]);
+    expect(readOverlays(cloneRoot, { env: testEnv })).toEqual([replacement]);
+    for (const key of ['tipSha', 'sha', 'headSha', 'adoptedTip', 'stackBases']) {
+      expect(replacement).not.toHaveProperty(key);
+    }
+    // Evidence captured for B's registration remains usable; rejecting A must not disable persistence.
+    expect(persistTipShas(cloneRoot, new Map([['feature', {
+      sha: needed, reg: registrationIdentity(replacement),
+    }]]), { env: testEnv })).toEqual({ written: 1 });
+    expect((await retire()).kept).toEqual([expect.objectContaining({ sha: needed, reason: 'unmerged-content' })]);
+    expect(readOverlays(cloneRoot, { env: testEnv })).toEqual([{ ...replacement, tipSha: needed }]);
+  });
+});
 
 // ── real-git fixture (epic #3383/#4075 overlay-conflict guard) ─────────────────────────────────────────────
 // The CLI's `add` now resolves `--ref` for real (`previewOverlayConflict`) before registering it, so any test
