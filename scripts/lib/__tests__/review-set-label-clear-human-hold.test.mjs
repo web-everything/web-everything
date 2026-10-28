@@ -106,7 +106,9 @@ describe('delegated clear-human final label guard', () => {
         },
       });
       expect(result.exitCode).toBe(1);
-      expect(result.output).toContain(`mandatory referral hold: ${key}`);
+      // Finding keys contain quotes escaped by the CLI's JSON error envelope.
+      const refusal = JSON.parse(result.output.split('\n')[0]);
+      expect(refusal.error).toContain(`mandatory referral hold: ${key}`);
       expect(result.provider.readPrState).toHaveBeenCalledTimes(3);
       expect(timeline).toEqual(['read-clear', 'read-clear', EVENT_TYPES.VERDICT,
         'read-referral', EVENT_TYPES.LABEL_INPUT]);
