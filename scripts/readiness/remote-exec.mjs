@@ -98,9 +98,21 @@ function safeFiles(files) {
 
 export async function runRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, signal } = {}) {
   const fallback = (reason) => ({ mode: 'fallback', reason });
-  const cancelled = () => ({ mode: 'cancelled', terminated: true });
+  let transportTerminated = true;
+  const cancelled = () => ({ mode: 'cancelled', terminated: transportTerminated });
   const uncertain = () => ({ mode: 'uncertain', reason: 'ambiguous-result', terminated: false });
   const checkAbort = () => { if (signal?.aborted) throw new Error('Remote execution cancelled'); };
+  const execute = async (request) => {
+    // A resolved/rejected adapter promise alone is not proof its child stopped.
+    // Cleanup has its own signal and must not overwrite the attempt's evidence.
+    const attempt = request.signal === signal;
+    if (attempt) transportTerminated = false;
+    const result = await exec(request);
+    if (attempt) transportTerminated = result?.mode === 'cancelled'
+      ? result.terminated === true
+      : result?.terminated !== false && Number.isInteger(result?.code) && result.code >= 0 && result.code <= 255;
+    return result;
+  };
   argv = normalizeCommand(argv);
   if (signal?.aborted) return cancelled();
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
@@ -110,7 +122,7 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
   if (!validateRunId(runId) || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host)) return fallback('invalid-parameters');
   try {
     checkAbort();
-    const probe = await exec({ file: 'ssh', args: [host, 'true'], cwd, signal });
+    const probe = await execute({ file: 'ssh', args: [host, 'true'], cwd, signal });
     if (signal?.aborted) return cancelled();
     if (probe.code !== 0) return fallback('forge-unreachable');
   } catch { return signal?.aborted ? cancelled() : fallback('forge-unreachable'); }
@@ -118,7 +130,7 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
   const ssh = (command, request, inherit = false, operationSignal = signal) => {
     const input = JSON.stringify(request);
     if (operationSignal?.aborted) return Promise.resolve(cancelled());
-    return exec({file:'ssh', args:[host, `sudo -n -u ops /usr/local/libexec/forge-exec-run ${command}`],
+    return execute({file:'ssh', args:[host, `sudo -n -u ops /usr/local/libexec/forge-exec-run ${command}`],
       input, cwd, inherit, signal: operationSignal});
   };
   let run;
@@ -136,7 +148,7 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
       const lock = createHash('sha256').update(await readFile(join(cwd,'package-lock.json'))).digest('hex');
       checkAbort();
       const files = listFiles ? await listFiles(cwd) : await (async () => {
-        const result = await exec({file:'git',args:['ls-files','-co','--exclude-standard','-z'],cwd,signal});
+        const result = await execute({file:'git',args:['ls-files','-co','--exclude-standard','-z'],cwd,signal});
         if(result.code !== 0 || typeof result.stdout !== 'string' || Buffer.byteLength(result.stdout)>LIMIT) throw new Error('Inventory unavailable');
         return result.stdout.split(result.stdout.includes('\0')?'\0':'\n').filter(Boolean);
       })();
@@ -148,7 +160,7 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
       run = JSON.parse(prepared.stdout).run;
       if(typeof run !== 'string' || !/^r-[a-f0-9]{32}$/.test(run)) {run=undefined; throw new Error('Invalid server run');}
       checkAbort();
-      const copied = await exec({file:'rsync',args:['-a','--delete','--exclude=.exit-code',
+      const copied = await execute({file:'rsync',args:['-a','--delete','--exclude=.exit-code',
         ...['node_modules','.git','.git-credentials*','id_*','identity','identity.pub*','.env*','.secrets','.ssh','.aws','.claude','.codex','.npmrc','.netrc','credentials*','*.pem','*.key'].map(name=>`--exclude=${name}`),
         '--from0','--files-from=-','--rsync-path=sudo -u forge-exec rsync','-e',`ssh ${SSH_OPTIONS.join(' ')}`,
         './',`${host}:${ROOT}/${run}/work/`],cwd,input:inventory,signal});

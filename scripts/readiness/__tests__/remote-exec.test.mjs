@@ -452,6 +452,44 @@ describe('runRemote', () => {
     expect(f.exec).not.toHaveBeenCalled();
   });
 
+  it.each(['probe', 'git inventory', 'prepare', 'copy'].flatMap(stage =>
+    ['false acknowledgement', 'missing acknowledgement', 'empty result', 'rejection'].map(outcome => [stage, outcome])))(
+    'refuses timeout fallback when %s returns %s without confirming child termination', async (stage, outcome) => {
+      const f = fixture();
+      const options = { ...f };
+      if (stage === 'git inventory') delete options.listFiles;
+      let entered;
+      const reached = new Promise(resolve => { entered = resolve; });
+      const exec = vi.fn(async call => {
+        if ((stage === 'probe' && call.args.at(-1) === 'true')
+          || (stage === 'git inventory' && call.file === 'git')
+          || (stage === 'prepare' && isPrepare(call))
+          || (stage === 'copy' && call.file === 'rsync')) {
+          entered();
+          await new Promise(resolve => call.signal.addEventListener('abort', resolve, { once: true }));
+          if (outcome === 'rejection') throw new Error('transport termination unknown');
+          if (outcome === 'empty result') return undefined;
+          return { mode: 'cancelled', ...(outcome === 'false acknowledgement' ? { terminated: false } : {}) };
+        }
+        return f.exec(call);
+      });
+      vi.useFakeTimers();
+      try {
+        let remote;
+        const pending = runWithRemoteDecision({ argv, cwd,
+          policy: resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always' } } }),
+          timeoutMs: 20, log: vi.fn(),
+          remoteExec: request => (remote = runRemote({ ...options, ...request, exec })),
+        });
+        await reached;
+        await vi.advanceTimersByTimeAsync(20);
+        expect(await remote).toEqual({ mode: 'cancelled', terminated: false });
+        expect(await pending).toEqual({ handled: true, exitCode: 124 });
+        expect(callsOf(exec).some(isRun)).toBe(false);
+      } finally { vi.useRealTimers(); }
+    },
+  );
+
   it.each(['probe', 'copy', 'run'])('cannot dispatch after admission returns 124 for an unresponsive %s', async (stage) => {
     const f = fixture();
     let entered, release, remote;
