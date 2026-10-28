@@ -4,9 +4,11 @@ import { realpath } from 'node:fs/promises';
 import * as filesystem from 'node:fs/promises';
 import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
 import { allowedCommand, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile } from './forge-exec-run.mjs';
 
 const ROOT = '/srv/forge-exec';
+const SIBLING = {dir:'../frontierui', paths:['plugs','webtheme']};
 const LIMIT = 4 * 1024 * 1024;
 const SSH_OPTIONS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'];
 const ENV_KEYS = ['CI', 'NODE_ENV', 'TZ', 'LANG', 'LC_ALL', 'FORCE_COLOR', 'NO_COLOR'];
@@ -61,10 +63,11 @@ export { isTestFile };
 // This exclusion policy is part of the manifest, never an independent rsync
 // filter. Test-shaped names under excluded components refuse remote admission.
 const excludedComponent = /^(?:node_modules|\.git|\.env.*|\.secrets|\.ssh|\.aws|\.claude|\.codex|\.npmrc|\.netrc|credentials.*|.*\.(?:pem|key)|\.exit-code)$/i;
-export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles} = {}) {
+export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, pathspecs} = {}) {
+  const scope = pathspecs === undefined ? [] : ['--', ...pathspecs];
   // Only dependency and Git internals are exempt. In particular, secret/hidden
   // directories and ambiguous dist/build directories may still contain tests.
-  const ignored = await exec({file:'git',args:['ls-files','-o','-i','--exclude-standard','-z'],cwd});
+  const ignored = await exec({file:'git',args:['ls-files','-o','-i','--exclude-standard','-z',...scope],cwd});
   if (ignored.code !== 0 || !Buffer.isBuffer(ignored.stdout)) throw new Error('Ignored byte inventory unavailable');
   for (const path of splitPaths(ignored.stdout)) {
     if (pathParts(path).slice(0,-1).some(part => part.equals(Buffer.from('node_modules')) || part.equals(Buffer.from('.git')))) continue;
@@ -76,10 +79,10 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     if (!Array.isArray(names) || names.some(name => !Buffer.isBuffer(name) && typeof name !== 'string')) throw new Error('Invalid inventory');
     files = names.map(name => Buffer.from(name));
   } else {
-    const result = await exec({file:'git',args:['ls-files','-co','--exclude-standard','-z'],cwd});
+    const result = await exec({file:'git',args:['ls-files','-co','--exclude-standard','-z',...scope],cwd});
     if (result.code !== 0 || !Buffer.isBuffer(result.stdout)) throw new Error('Byte inventory unavailable');
     files = splitPaths(result.stdout);
-    const stage = await exec({file:'git',args:['ls-files','--stage','-z'],cwd});
+    const stage = await exec({file:'git',args:['ls-files','--stage','-z',...scope],cwd});
     if (stage.code !== 0 || !Buffer.isBuffer(stage.stdout) || stage.stdout.length > LIMIT
       || (stage.stdout.length && stage.stdout.at(-1) !== 0)) throw new Error('Git index unavailable');
     let start = 0;
@@ -120,6 +123,38 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   return {...manifest,manifestDigest:digestManifest(wire)};
 }
 
+export async function buildSiblingManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem} = {}) {
+  const root = resolve(cwd,SIBLING.dir);
+  const failure = (code, cause) => Object.assign(new Error(code,{cause}),{code});
+  let info;
+  try {info = await fs.lstat(Buffer.from(root));}
+  catch (error) {throw failure(error.code === 'ENOENT' ? 'sibling-missing' : 'sibling-unsafe',error);}
+  if (info.isSymbolicLink() || !info.isDirectory()) throw failure('sibling-unsafe');
+  const git = args => exec({file:'git',args,cwd:root});
+  let head;
+  try {
+    const top = await git(['rev-parse','--show-toplevel']);
+    if (top.code !== 0 || protocolText(top.stdout,LIMIT).trimEnd() !== root) throw new Error('Sibling is not a Git root');
+    const revision = await git(['rev-parse','HEAD']);
+    head = protocolText(revision.stdout,1024).trimEnd();
+    if (revision.code !== 0 || !/^[a-f0-9]{40,64}$/.test(head)) throw new Error('Sibling HEAD unavailable');
+  } catch (error) {throw failure('sibling-not-git',error);}
+  try {
+    const status = await git(['status','--porcelain','-z','--untracked-files=all','--',...SIBLING.paths]);
+    if (status.code !== 0 || protocolText(status.stdout,LIMIT).length) throw new Error('Sibling is dirty or status unavailable');
+  } catch (error) {throw failure('sibling-dirty',error);}
+  try {
+    const manifest = await buildManifest({cwd:root,exec,fs,pathspecs:SIBLING.paths});
+    for (const path of SIBLING.paths) {
+      const st = await fs.lstat(Buffer.from(resolve(root,path)));
+      if (st.isSymbolicLink() || !st.isDirectory()
+        || !manifest.entries.some(entry => entry.path.subarray(0,path.length+1).equals(Buffer.from(path+'/'))))
+        throw new Error('Missing or empty aliased directory');
+    }
+    return {...manifest,cwd:root,head};
+  } catch (error) {throw failure('sibling-unsafe',error);}
+}
+
 // Only protocol JSON is decoded, never inventory bytes.
 function protocolText(stdout, limit) {
   if ((!Buffer.isBuffer(stdout) && typeof stdout !== 'string') || Buffer.byteLength(stdout) > limit) throw new Error('Invalid protocol output');
@@ -153,11 +188,11 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
     return ssh('finish', {nonce,run});
   };
   try {
-    let expected, expectedManifest;
+    let expected, expectedManifest, siblingManifest;
     try {
       const manifest = await buildManifest({cwd,exec,listFiles});
       const selected = manifest.entries.map(entry => entry.path);
-      if (selected.some(path => path.equals(Buffer.from('vitest.shared.ts')))) return fallback('unsupported-sibling-dependency');
+      if (selected.some(path => path.equals(Buffer.from('vitest.shared.ts')))) siblingManifest = await buildSiblingManifest({cwd,exec});
       // Anchor comment-like and option-like names for both rsync implementations.
       const inventory = Buffer.concat(selected.flatMap(path => [Buffer.from('./'),path,Buffer.from([0])]));
       const wire = manifestWire(manifest);
@@ -172,11 +207,20 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
         '--from0','--files-from=-','--rsync-path=sudo -u forge-exec rsync','-e',`ssh ${SSH_OPTIONS.join(' ')}`,
         './',`${host}:${ROOT}/${run}/work/`],cwd,input:inventory});
       if(copied.code !== 0) throw new Error('Copy failed');
+      if (siblingManifest) {
+        const inventory = Buffer.concat(siblingManifest.entries.flatMap(({path}) => [Buffer.from('./'),path,Buffer.from([0])]));
+        const copiedSibling = await exec({file:'rsync',args:['-a','-r','--no-links','--safe-links','--no-implied-dirs','--delete','--exclude=.exit-code',
+          '--from0','--files-from=-','--rsync-path=sudo -u forge-exec rsync','-e',`ssh ${SSH_OPTIONS.join(' ')}`,
+          './',`${host}:${ROOT}/${run}/frontierui/`],cwd:siblingManifest.cwd,input:inventory});
+        if (copiedSibling.code !== 0) throw new Error('Sibling copy failed');
+      }
       expected = {v:1,nonce,run,inputDigest,argvDigest:digestArgv(argv),lock,manifestDigest:manifest.manifestDigest};
+      if (siblingManifest) expected.siblingManifestDigest = siblingManifest.manifestDigest;
       expectedManifest = wire;
-    } catch (error) {return fallback(error.code === 'ignored-test-file' ? 'ignored-test-file' : 'copy-failed');}
+    } catch (error) {return fallback(['sibling-missing','sibling-not-git','sibling-dirty','sibling-unsafe','ignored-test-file'].includes(error.code) ? error.code : 'copy-failed');}
     try {
-      const result = await ssh('run',{...expected,manifest:expectedManifest,argv,env:filterEnv(env)},true);
+      const result = await ssh('run',{...expected,manifest:expectedManifest,
+        ...(siblingManifest ? {siblingManifest:manifestWire(siblingManifest)} : {}),argv,env:filterEnv(env)},true);
       const receipt = await finish();
       if(!receipt || receipt.code!==0) return fallback('ambiguous-result');
       if(!verifyReceipt(protocolText(receipt.stdout,4096),expected,result.code)) return fallback('ambiguous-result');
@@ -188,8 +232,13 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
 export function verifyReceipt(text, expected, code) {
   try {
     const receipt=JSON.parse(text);
+    const keys = ['argvDigest','code','inputDigest','lock','manifestDigest','nonce','phase','run','v'];
+    if (Object.hasOwn(expected,'siblingManifestDigest')) {
+      if (typeof expected.siblingManifestDigest !== 'string' || !/^[a-f0-9]{64}$/.test(expected.siblingManifestDigest)) return false;
+      keys.push('siblingManifestDigest');
+    }
     return receipt && typeof expected?.manifestDigest === 'string' && /^[a-f0-9]{64}$/.test(expected.manifestDigest)
-      && Object.keys(receipt).sort().join(',') === 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,v'
+      && Object.keys(receipt).sort().join(',') === keys.sort().join(',')
       && Object.entries(expected).every(([key,value])=>receipt[key]===value)
       && receipt.phase==='test' && Number.isInteger(code) && code>=0 && code<255 && receipt.code===code;
   } catch {return false;}

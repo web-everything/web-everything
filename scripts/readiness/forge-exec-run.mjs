@@ -393,8 +393,10 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
       await mkdir(join(runs,run),{mode:0o755}); // exclusive server-generated name
       const work=join(runs,run,'work');
       await mkdir(work,{mode:0o755});
+      const sibling=join(runs,run,'frontierui');
+      await mkdir(sibling,{mode:0o755});
       if(!testRoot) {
-        const result=await execute('/usr/bin/sudo',['-n','/usr/bin/chown','forge-exec:forge-exec',work]);
+        const result=await execute('/usr/bin/sudo',['-n','/usr/bin/chown','forge-exec:forge-exec',work,sibling]);
         if(result.code) throw new Error('Worker ownership failed');
       }
       await writeFile(statePath(run,'prepared'),JSON.stringify({v:1,nonce,run}),{flag:'wx',mode:0o600});
@@ -411,6 +413,9 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
       const lock = await digestLock(work);
       // Verify before npm or cache extraction can add generated files.
       await verifyManifest(work,request.manifest,request.manifestDigest);
+      const emptyWire = manifestWire({entries:[],excluded:[]});
+      await verifyManifest(join(container,'frontierui'),request.siblingManifest ?? emptyWire,
+        request.siblingManifestDigest ?? digestManifest(emptyWire));
       if(await digestInput(work)!==request.inputDigest || lock!==request.lock) throw new Error('Input digest mismatch');
       await rename(statePath(request.run,'prepared'),statePath(request.run,'running'));
       let phase='install',result={code:97,stdout:'',stderr:''};
@@ -458,6 +463,7 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
         result=await command(request.argv,work,{PATH:path,HOME:join(work,'.forge-home'),...request.env});
       } catch(error) {const code=phase==='install'?97:254; if(phase==='test') phase='supervisor'; result={code,stdout:result.stdout,stderr:String(error.message)};}
       const receipt={...prepared,manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code};
+      if (Object.hasOwn(request,'siblingManifestDigest')) receipt.siblingManifestDigest = request.siblingManifestDigest;
       await writeFile(statePath(request.run,'receipt'),JSON.stringify(receipt),{flag:'wx',mode:0o600});
       return result;
       });
