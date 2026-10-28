@@ -9,7 +9,7 @@ import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 import { enqueuePr } from '../merge-queue-enqueue.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { healLaneRefs } from '../lane-repair.mjs';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -118,6 +118,7 @@ describe('poison guard admission boundary', () => {
     beforeEach(() => {
       clone = mkdtempSync(join(tmpdir(), 'admission-clone-'));
       primary = mkdtempSync(join(tmpdir(), 'admission-primary-'));
+      for (const dir of [clone, primary]) mkdirSync(join(dir, '.git'));
     });
     afterEach(() => { for (const dir of [clone, primary]) rmSync(dir, { recursive: true, force: true }); });
 

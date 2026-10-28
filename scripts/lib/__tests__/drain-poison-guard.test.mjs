@@ -127,10 +127,15 @@ describe('checkBornAsCollision corruption self-heal', () => {
   });
 
   // Real directories: the heal requires the clone to be proven distinct from a located primary checkout.
-  let clone, primary;
+  let clone, primary, worktree;
   beforeAll(() => {
     clone = mkdtempSync(join(tmpdir(), 'poison-clone-'));
     primary = mkdtempSync(join(tmpdir(), 'poison-primary-'));
+    for (const dir of [clone, primary]) mkdirSync(join(dir, '.git'));
+    mkdirSync(join(primary, 'scripts'));
+    worktree = join(primary, 'worktree');
+    mkdirSync(worktree);
+    writeFileSync(join(worktree, '.git'), `gitdir: ${join(primary, '.git', 'worktrees', 'x')}\n`);
   });
   afterAll(() => { for (const dir of [clone, primary]) rmSync(dir, { recursive: true, force: true }); });
 
@@ -175,6 +180,8 @@ describe('checkBornAsCollision corruption self-heal', () => {
     ['an unknown primary', () => ({ cwd: clone, primary: null })],
     ['the primary checkout itself', () => ({ cwd: primary, primary })],
     ['a primary that does not exist', () => ({ cwd: clone, primary: join(primary, 'missing') })],
+    ['a subdirectory of the primary', () => ({ cwd: join(primary, 'scripts'), primary })],
+    ['a worktree of the primary (.git file)', () => ({ cwd: worktree, primary })],
   ])('never heals %s', (_name, where) => {
     const heal = vi.fn(() => ({ actions: [] }));
     expect(checkBornAsCollision({ exec: healingExec({ fetch: 1 }), headSha: sha, heal, ...where() }).error).toContain('Command failed');

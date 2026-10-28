@@ -1,14 +1,23 @@
 /** Fail-closed admission check for backlog identities already present on main. */
-import { realpathSync } from 'node:fs';
+import { lstatSync, realpathSync } from 'node:fs';
+import { join } from 'node:path';
 import { healLaneRefs, looksLikeCorruption } from './lane-repair.mjs';
 
 const HASH = /^x[0-9a-z]{6}$/;
 const IDENTITY = /^(?:bornAs|id):[ \t]*(["']?)(x[0-9a-z]{6})\1[ \t]*$/m;
 
-/** Heal only a clone proven distinct from a located primary checkout: never the primary, never an unknown one. */
+/**
+ * Heal only a clone proven distinct from a located primary checkout: never the primary, never an unknown one.
+ * `cwd` must be a clone root with its own `.git` directory, so a subdirectory or a worktree of the primary
+ * (which share its git config and refs) never qualifies.
+ */
 export function healableClone(cwd, primary) {
   if (typeof cwd !== 'string' || typeof primary !== 'string') return false;
-  try { return realpathSync(cwd) !== realpathSync(primary); } catch { return false; }
+  try {
+    if (!lstatSync(join(cwd, '.git')).isDirectory()) return false;
+    return realpathSync(join(cwd, '.git')) !== realpathSync(join(primary, '.git'))
+      && realpathSync(cwd) !== realpathSync(primary);
+  } catch { return false; }
 }
 
 export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primary = null, heal = healLaneRefs, log = () => {} }) {
