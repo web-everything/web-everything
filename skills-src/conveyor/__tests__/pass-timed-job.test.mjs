@@ -190,7 +190,6 @@ describe('#5755 independent timed pass jobs', () => {
     const enabled = ['infra-blocked', 'lease-reaper', 'session-reaper'];
     const mechanical = makeCliMechanicalPasses({
       scriptsDir: 'scripts', repo: REPO, exec, runPass,
-      fetchOpenPrs: vi.fn(() => []),
       skipPasses: new Set(MECHANICAL_PASS_NAMES.filter(name => !enabled.includes(name))),
     });
     const pending = mechanical({ out: {} });

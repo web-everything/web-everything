@@ -39,15 +39,13 @@
 import { runPassAsTimedJob } from './pass-daemon.mjs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { mkdirSync, writeFileSync, renameSync, appendFileSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, renameSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { randomUUID } from 'node:crypto';
-import { defaultFetchOpenPrs } from '../../scripts/conveyor/open-pr-fetch.mjs';
 import {
   RUNNER_LOCK_ROOT, runnerOwner,
   acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned,
 } from './runner-lock.mjs';
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../../scripts/lib/constellation-repos.mjs';
 import { readUnsupported, recordUnsupported } from '../../scripts/conveyor/unsupported-repo.mjs';
 import { selectStatusCandidates } from '../../scripts/conveyor/reconcile-core.mjs';
@@ -183,16 +181,18 @@ export async function runLoop({
 /** Build the real `tickOnce` effect: shell `tick-core.mjs`, pipe the bookkeeping payload in on STDIN, parse
  *  `{ decisions, nextState }` off STDOUT. This is the SAME core the main-session SKILL loop shells (§2b) — the
  *  runner and the SKILL can never disagree on a guard, because there is exactly ONE core. */
-function makeCliTickOnce({ tickCorePath, repo = null }) {
+export function makeCliTickOnce({ tickCorePath, repo = null }) {
   return async (payload) => {
-    const { execFileSync } = await import('node:child_process');
     const args = [tickCorePath];
     if (typeof repo === 'string' && repo) args.push(`--repo=${repo}`);
-    const out = execFileSync('node', args, {
-      input: JSON.stringify(payload || {}),
-      encoding: 'utf8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      maxBuffer: 64 * 1024 * 1024,
+    const input = JSON.stringify(payload || {});
+    // A later tick can overlap still-running passes; its subprocess must leave
+    // the same event loop free to enforce those passes' existing deadlines.
+    const out = await new Promise((resolve, reject) => {
+      const child = execFile(process.execPath, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
+        (error, stdout) => error ? reject(error) : resolve(stdout));
+      child.stdin.on('error', reject);
+      child.stdin.end(input);
     });
     return JSON.parse(out);
   };
@@ -308,7 +308,7 @@ export function runTimedPasses({ passes, runPass = runPassAsTimedJob }) {
 
 export function makeCliMechanicalPasses({
   scriptsDir, repo = null, hiccupSession, runPass, exec,
-  fetchOpenPrs = defaultFetchOpenPrs, repos = CONSTELLATION_REPOS,
+  repos = CONSTELLATION_REPOS,
   unsupportedPath, skipPasses = new Set(),
 } = {}) {
   // Retain the historical injected command port for existing callers. Production
@@ -318,6 +318,9 @@ export function makeCliMechanicalPasses({
       encoding: 'utf8', stdio: ['ignore', entry.capture ? 'pipe' : 'ignore', 'pipe'], maxBuffer: 32 * 1024 * 1024,
     }) }) : runPassAsTimedJob;
   const skip = (name) => skipPasses.has(name);
+  // Coalesce only pending discovery. Every tick still launches independent passes;
+  // shared files survive until all batches which acquired them have finished.
+  const snapshots = new Map();
   return async ({ out } = {}) => {
     const warn = (path, key, e) => process.stderr.write(
       `⚠ mechanical pass ${path} [${key}] failed (non-fatal): ${summarizeMechanicalPassError(e)}\n`,
@@ -362,18 +365,38 @@ export function makeCliMechanicalPasses({
     if (repo !== null && !selected.length) {
       process.stderr.write(`⚠ unsupported-repo: ${repo} is not a constellation repo; skipping PR-facing passes\n`);
     }
-    let duplicateRan = false;
+    const duplicateRan = !skip('duplicate-pr-watch') && selected.some(([key]) => key === 'we' || repo !== null);
     for (const [key, { slug }] of selected) pending.push((async () => {
       const repoPending = [];
       const runRepo = (...args) => { const job = run(...args); repoPending.push(job); return job; };
-      let prsFile = null;
+      if (!skip('ci-queue-watch')) runRepo('conveyor/ci-queue-watch.mjs', ['sweep'], key, slug);
+      let snapshot = null;
       try {
         let prsArgs = [];
         try {
-          const prs = fetchOpenPrs({ repo: slug });
-          prsFile = join(tmpdir(), `conveyor-open-prs-${randomUUID()}.json`);
-          writeFileSync(prsFile, JSON.stringify(prs), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-          prsArgs = [`--prs-file=${prsFile}`];
+          const consumers = ['reconcile-fix-dispatch', 'ci-heal-pr-dispatch', 'promote-draft-pr-dispatch',
+            'parked-pr-conflict-watch', 'advisory-label-sweep', 'review-hold-reconcile',
+            'reconcile-pass', 'parked-pr-progress-watch',
+            ...(key === 'we' || repo !== null ? ['duplicate-pr-watch'] : [])];
+          if (consumers.some(name => !skip(name))) {
+            snapshot = snapshots.get(key);
+            if (!snapshot) {
+              const dir = mkdtempSync(join(tmpdir(), 'conveyor-open-prs-'));
+              snapshot = { dir, file: join(dir, 'prs.json'), refs: 0 };
+              const owned = snapshot;
+              snapshots.set(key, owned);
+              // Fetching, enrichment and serialization all run in the timed child.
+              // Only its small completion result reaches the runner event loop.
+              owned.ready = runRepo('conveyor/open-pr-snapshot.mjs', [`--output=${owned.file}`], key, slug)
+                .finally(() => { if (snapshots.get(key) === owned) snapshots.delete(key); });
+            }
+            snapshot.refs++;
+            const fetched = await snapshot.ready;
+            if (fetched.ok) {
+              if (!existsSync(snapshot.file)) throw new Error('snapshot job completed without this tick\'s file; using standalone discovery');
+              prsArgs = [`--prs-file=${snapshot.file}`];
+            }
+          }
         } catch (e) { warn('open-pr-fetch', key, e); }
         if (!skip('reconcile-fix-dispatch')) runRepo('conveyor/reconcile-fix-dispatch.mjs', prsArgs, key, slug);
         // xs5b4fj — the SAME reconcile-pass.mjs plan `reconcile-fix-dispatch.mjs` just read above also carries
@@ -387,7 +410,6 @@ export function makeCliMechanicalPasses({
         // ONLY dispatcher that ever acts on one (`gh pr ready`), mirroring ci-heal-pr-dispatch's own line
         // right above it exactly.
         if (!skip('promote-draft-pr-dispatch')) runRepo('operations/promote-draft-pr-dispatch.mjs', prsArgs, key, slug);
-        if (!skip('ci-queue-watch')) runRepo('conveyor/ci-queue-watch.mjs', ['sweep'], key, slug);
         // Already runs as its own pass-daemon watcher (skills-src/conveyor/pass-daemon.mjs) — a resident
         // Dispatcher must skip this to avoid double-running it.
         if (!skip('parked-pr-conflict-watch')) runRepo('conveyor/parked-pr-conflict-watch.mjs', ['sweep', ...prsArgs], key, slug);
@@ -440,12 +462,13 @@ export function makeCliMechanicalPasses({
         // WE-only: duplicate item numbers refer to WE backlog ids, not cross-repo deliveries.
         if (!skip('duplicate-pr-watch') && (key === 'we' || repo !== null)) {
           runRepo('conveyor/duplicate-pr-watch.mjs', ['sweep', ...prsArgs], 'we', repo);
-          duplicateRan = true;
         }
         if (!skip('parked-pr-progress-watch')) runRepo('conveyor/parked-pr-progress-watch.mjs', ['sweep', ...prsArgs], key, slug);
       } finally {
         await Promise.all(repoPending);
-        if (prsFile) { try { unlinkSync(prsFile); } catch { /* best-effort cleanup */ } }
+        if (snapshot && --snapshot.refs === 0) {
+          try { rmSync(snapshot.dir, { recursive: true, force: true }); } catch { /* best-effort cleanup */ }
+        }
       }
     })());
     if (!duplicateRan && !skip('duplicate-pr-watch')) run('conveyor/duplicate-pr-watch.mjs', ['sweep'], 'we', repo);
