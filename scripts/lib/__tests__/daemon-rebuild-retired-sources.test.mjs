@@ -357,6 +357,24 @@ describe('archived sources remain represented in preparation', () => {
     expect(readOverlayState(root, { env: f.env }).overlays).toEqual([expect.objectContaining({ ref: 'x', pr: 2 })]);
   });
 
+  it('a re-registration the build does not apply never releases its ref\'s archive (branch gone, carrier closed)', async () => {
+    const f = fixture();
+    f.env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'off';
+    writeOverlays(root, [], { env: f.env });
+    addOverlay(root, { ref: 'x', pr: 2 }, { env: f.env });
+    addOverlay(root, { ref: 'c2', pr: 12 }, { env: f.env });
+    removeOverlay(root, 'x', { env: f.env, requireRef: 'c2', retireInto: true, retiredSha: B });
+    // Re-registered under a new registrationId while its branch is gone: nothing in the build supplies B.
+    addOverlay(root, { ref: 'x', pr: 2 }, { env: f.env });
+    const next = await f.prepare({
+      prState: async (pr) => (pr === 12 ? 'CLOSED' : 'OPEN'),
+      run: (args) => (args[0] === 'fetch' && args.some((a) => a.includes('heads/x:')) ? { status: 1, stdout: '' } : f.git(args)),
+    });
+    expect(next.result.reason).toBe('overlay-source-unavailable');
+    const c2 = readOverlayState(root, { env: f.env }).overlays.find((o) => o.ref === 'c2');
+    expect(c2.retiredSources).toEqual([expect.objectContaining({ sha: B, entry: expect.objectContaining({ ref: 'x', pr: 2 }) })]);
+  });
+
   it.each([false, true])('removing a carrier never restores a ref whose newer archive sits on another carrier (nested=%s)', (nested) => {
     const f = fixture();
     archivedTwice(f, { nested });

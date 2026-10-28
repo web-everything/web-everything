@@ -378,8 +378,12 @@ export async function prepareRebuild({
         covered.set(sha, present);
         return present;
       };
-      // The same rule restoration uses: only the newest archive of a ref, across all carriers, is owed.
-      const superseded = supersededSnapshots(overlaysBefore);
+      // The same rule restoration uses: only the newest archive of a ref, across all carriers, is owed. A newer
+      // registration releases a ref's archives only when this candidate applies it from its fresh tip.
+      const planned = new Map(overlaysForPlan.map((o) => [o?.ref, o]));
+      const superseded = supersededSnapshots(overlaysBefore, { applied: new Map((plan.applied ?? [])
+        .filter((a) => a?.ref && !a.pinnedFrom && planned.has(a.ref))
+        .map((a) => [a.ref, planned.get(a.ref).registrationId ?? null])) });
       for (const carrier of overlaysBefore) {
         const pending = [...(carrier.retiredSources ?? [])];
         let missing = false;

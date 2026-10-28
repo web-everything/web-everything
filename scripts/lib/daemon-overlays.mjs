@@ -352,16 +352,18 @@ export function sameRegistration(applied, entry) {
 
 /**
  * Every archived snapshot (all carriers, nested included) that is no longer the current registration of its ref:
- * - a ref registered now under a different registrationId supersedes all its archives (they all predate it, since
- *   a ref has one registration at a time); the same registrationId — a restored archive — keeps them owed;
- * - otherwise only the newest archive counts: latest `retiredAt` instant, tie-broken by registrationId. A legacy
- *   unstamped snapshot is older than any stamped one, and unstamped ones keep archive order (later wins).
+ * - only the newest archive counts: latest `retiredAt` instant, tie-broken by registrationId. A legacy unstamped
+ *   snapshot is older than any stamped one, and unstamped ones keep archive order (later wins);
+ * - `applied` (ref → registrationId the candidate build applies from a fresh tip) also supersedes every archive
+ *   of a different registration of that ref: they all predate it, a ref having one registration at a time. Mere
+ *   registration is not enough — a re-registration with a missing or rewritten branch supplies no content.
  * @param {Array<object>} list
+ * @param {{applied?: Map<string, string|null>}} [o]
  * @returns {Set<object>}
  */
-export function supersededSnapshots(list) {
+export function supersededSnapshots(list, { applied = new Map() } = {}) {
   const entries = Array.isArray(list) ? list : [];
-  const active = new Map(entries.filter((o) => o?.ref).map((o) => [o.ref, o.registrationId ?? null]));
+  const active = applied instanceof Map ? applied : new Map();
   const latest = new Map();
   const superseded = new Set();
   let seq = 0;
