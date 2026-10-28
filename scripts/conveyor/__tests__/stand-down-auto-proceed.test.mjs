@@ -426,9 +426,10 @@ it.each(['failure', 'error', 'pending', 'unknown'])(
   });
 
 it.each([
-  [], [{ id: 10, context: 'test', state: 'success' }],
-  [{ id: 10, context: 'optional', state: 'failure' }],
-])('accepts complete green or unrelated commit statuses: %j', statuses => {
+  { statuses: [] },
+  { statuses: [{ id: 10, context: 'test', state: 'success' }] },
+  { statuses: [{ id: 10, context: 'optional', state: 'failure' }] },
+])('accepts complete green or unrelated commit statuses: %j', ({ statuses }) => {
   const checks = readAutoProceedChecks({ repo: 'org/repo', head, requiredChecks: ['test'] }, {
     read: argv => argv[1].includes('/statuses?') ? statuses : { total_count: 1, check_runs: [run(2, 'cancelled')] },
   });
