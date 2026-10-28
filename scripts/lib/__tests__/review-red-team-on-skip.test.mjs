@@ -1330,6 +1330,19 @@ describe('unprovable accepted head move — fresh full review', () => {
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review', head });
     expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
   });
+  it.each([
+    '🔁 review — changes requested\n\nFix the guard.',
+    '🔁 human review — changes requested\n\nFix the guard.',
+    '🔁 review - changes requested\n\nFix the guard.',
+    '🛑 conveyor fix — stood down (needs-judgment)',
+  ])('refuses an explicit comment hold without an acceptance comment: %j', body => {
+    const o = moved({ readEvidence: () => ({ inFlight: false, recorded: false, seatRecorded: false }) });
+    o.rawPrs[0].comments = [{ body, author: { login: 'chalbert' } }];
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
+      why: 'explicit review hold comment prevents full review; inspect the PR thread' });
+    expect(o.dispatch).not.toHaveBeenCalled();
+    expect(o.lastDispatch.size).toBe(0);
+  });
   it.each(['review:human', 'review:held-mechanical', 'review-status:reviewing', 'red-team:blocked', 'red-team:pending'])(
     'does not re-review a held PR with %s', label => {
       const o = moved(); o.rawPrs[0].labels.push(label);

@@ -15,7 +15,7 @@ import { cascadePolicy } from './policy-cascade.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun } from './red-team-run-result.mjs';
 
 import { redTeamRequired } from './jury-core.mjs';
-import { latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
+import { isLaterVerdictBody, latestAcceptRecord, laterReviewHold } from './accept-carry-forward.mjs';
 import { restampRecord } from './numbering-carry.mjs';
 import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
 import { RED_TEAM_STATUS_LABELS } from './red-team-status-label-meta.mjs';
@@ -31,10 +31,15 @@ function conflictsWithPolicyClear(label) {
   );
 }
 
-/** Live holds supersede both carried and stored policy-clears. PURE. */
-function publishableClearGuard({ labels, acceptance }) {
+/** Live holds supersede both carried and stored policy-clears. PURE.
+ * Without an acceptance record nothing is "later", so any explicit hold comment stands (any author: fail closed).
+ */
+function publishableClearGuard({ labels, acceptance, comments }) {
   if (acceptance?.laterVerdict || acceptance?.laterBodyDerivedHold) {
     return 'later verdict or hold supersedes acceptance';
+  }
+  if (!acceptance && (!Array.isArray(comments) || comments.some(c => isLaterVerdictBody(c?.body)))) {
+    return 'explicit review hold comment prevents full review; inspect the PR thread';
   }
   if (acceptance?.reviewsUnreadable) return 'PR reviews unreadable; inspect formal reviews before policy-clear';
   if (!Array.isArray(labels)) return 'PR labels unreadable';
@@ -155,7 +160,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           && latestResult === comment && result && result.findings.length === 0
           && comment.body.split(/\r?\n/).filter(line => line.trim()).length === 2
           && /^Red team not required on this head: [^\r\n]+$/m.test(comment.body)) {
-          const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance });
+          const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance, comments: rawPr.comments });
           if (refusal) return skip(refusal);
           return { ...row, action: 'carry', from: source.sha, why: 'prior policy-clear across acceptance re-stamp' };
         }
@@ -175,7 +180,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         && (evidence.status == null || (isRealHead(evidence.status.head) && evidence.status.head !== head))
         && readStatus({ repo, pr, head }) == null;
       if (needsReview) {
-        const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance });
+        const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance, comments: rawPr.comments });
         if (refusal) return skip(refusal);
         // Formal holds apply even without an acceptance comment. No timestamp
         // floor: a missing acceptance cannot establish that a review was cleared.
@@ -200,7 +205,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           && redTeamRequired(evidence.loopPayload?.verdict?.verdict)
           && evidence.recorded !== true && evidence.seatRecorded !== true) {
           if (acceptance?.sha !== head) return skip('stored review does not owe a red team');
-          const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance });
+          const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance, comments: rawPr.comments });
           if (refusal) return skip(refusal);
           return { ...row, action: 'clear', why: 'not owed (stored review)' };
         }

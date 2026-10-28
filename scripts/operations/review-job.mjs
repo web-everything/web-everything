@@ -423,6 +423,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           evidence: readEvidence(key), env, log: line => process.stderr.write(`${line}\n`) });
       } catch (e) { process.stderr.write(`review-job: red-team status label sync failed: ${e.message}\n`); }
       return { priorResult, ...(queued && input.redTeamMode ? { redTeamAdmission: { pid: process.pid,
+        ...(input.retryCount === 1 ? { retrySpent: true } : {}),
         prior: admissionPrior == null ? null : { repo: admissionPrior.repo, pr: admissionPrior.pr, head: admissionPrior.head,
           status: admissionPrior.status, result: admissionPrior.result,
           ...(admissionPrior.retryCount !== undefined ? { retryCount: admissionPrior.retryCount } : {}) } } } : {}) };
@@ -928,7 +929,12 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
           ? seatsBox.priorRedTeamResult : out.redTeam?.status === 'skipped'
             ? { status: 'skipped', ...(out.redTeam.policy === 'card-only' ? { policy: 'card-only' } : {}) }
             : out.redTeam?.status ?? null;
-      io.redTeamStatus?.({ ...seatsBox.input, status: guardDeferred && prior ? prior.status : 'finished', result });
+      // Every skip and guard refusal precedes the model call. Return this admission's
+      // retry spend so the failed seat stays eligible once the cap or transient read clears.
+      const refundRetry = seatsBox.input?.redTeamAdmission?.retrySpent === true
+        && (guardDeferred || ['skipped', 'not-owed'].includes(out.redTeam?.status));
+      io.redTeamStatus?.({ ...seatsBox.input, status: guardDeferred && prior ? prior.status : 'finished', result,
+        ...(refundRetry ? { refundRetry: true } : {}) });
     }
   }
   else if (spec && seatsBox.input && !seatsBox.admissionFailed) io.redTeamStatus?.({ ...seatsBox.input, status: 'finished', result: 'not-owed' });

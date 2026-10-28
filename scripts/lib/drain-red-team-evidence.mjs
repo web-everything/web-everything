@@ -1,5 +1,5 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
-import { closeSync, mkdirSync, openSync, readFileSync, statSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { hostname } from 'node:os';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
@@ -15,17 +15,31 @@ import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDir(env)), 'red-team-status');
 const statusPath = ({ repo, pr, head }, env) => join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
 
-/** Read the head-bound status; unreadable evidence is an error, absence is null. */
+/** The exclusive retry marker is the durable spend; a status file restored without it cannot refund it. */
+function retryMarkerSpent(path) {
+  try { statSync(`${path}.retry-1`); return true; }
+  catch (e) { if (e.code === 'ENOENT') return false; throw e; }
+}
+
+/** Read the head-bound status; unreadable evidence is an error, absence is null.
+ * A surviving retry marker is folded into retryCount, and a marker without its status is incomplete evidence.
+ */
 export function readRedTeamStatus({ repo, pr, head, env = process.env } = {}) {
+  const path = statusPath({ repo, pr, head }, env);
+  let status;
   try {
-    const status = JSON.parse(readFileSync(statusPath({ repo, pr, head }, env), 'utf8'));
-    if (!status || status.repo !== repo || Number(status.pr) !== Number(pr) || status.head !== head) throw Error('red-team status identity mismatch');
-    return status;
-  } catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+    status = JSON.parse(readFileSync(path, 'utf8'));
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+    if (retryMarkerSpent(path)) throw Error('red-team retry marker has no status; inspect stored evidence');
+    return null;
+  }
+  if (!status || status.repo !== repo || Number(status.pr) !== Number(pr) || status.head !== head) throw Error('red-team status identity mismatch');
+  return [undefined, 0].includes(status.retryCount) && retryMarkerSpent(path) ? { ...status, retryCount: 1 } : status;
 }
 
 /** A status is written before settling speculation or starting the sequential pass; crashes leave a dead pid. */
-export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = null, retryCount }, { env = process.env, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime } = {}) {
+export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = null, retryCount, refundRetry = false }, { env = process.env, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime } = {}) {
   const head = loopPayload?.findings?.read?.netBasis?.rev;
   if (!/^[a-f0-9]{40}$/i.test(head ?? '')) return;
   const path = statusPath({ repo, pr, head }, env);
@@ -36,6 +50,13 @@ export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = nu
   if (spent !== undefined && (!Number.isSafeInteger(spent) || spent < 0)) throw Error('invalid red-team retry count');
   if (retryCount !== undefined && (!Number.isSafeInteger(retryCount) || retryCount < 0)) throw Error('invalid red-team retry count');
   const retryMarker = `${path}.retry-1`;
+  // A refund returns this writer's own spend after a settlement that launched no model call. A reservation
+  // moves the status to running, so only the still-queued admission record may refund; anything else keeps it.
+  // A crash after removing the marker leaves the queued retryCount, which still counts as spent.
+  // Any other record keeps the spend: the write below then proceeds as an ordinary settlement.
+  const refund = refundRetry === true && retryCount === undefined && prior?.status === 'queued' && prior.retryCount === 1
+    && prior.pid === process.pid && prior.host === host && prior.pidNamespace === namespace;
+  if (refund) rmSync(retryMarker, { force: true });
   // The exclusive create is the spend: status read/write/read cannot arbitrate workers.
   // Keep the marker even if the subsequent write fails; an operator must inspect that attempt.
   if (retryCount === 1) {
@@ -51,7 +72,7 @@ export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = nu
   let claimed = 0;
   try { statSync(retryMarker); claimed = 1; }
   catch (e) { if (e.code !== 'ENOENT') throw e; }
-  const durableRetryCount = Math.max(spent ?? 0, retryCount ?? 0, claimed);
+  const durableRetryCount = refund ? claimed : Math.max(spent ?? 0, retryCount ?? 0, claimed);
   // skipCardOnly is the writer's resolved setting, NOT evidence that this PR is card-only.
   // Consumers must classify the stored net read; the drain may resolve a different setting in its own process.
   writeJsonAtomic(path, { repo, pr, head, loopPayload, status, result,
