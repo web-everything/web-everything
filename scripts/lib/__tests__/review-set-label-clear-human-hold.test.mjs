@@ -12,7 +12,7 @@ vi.mock('../verdict-ledger.mjs', async importOriginal => ({
 const head = 'a'.repeat(40);
 
 function run({ evidence, delegated = true, accepted = false, injectAt = 2, repark = false, readError = false,
-  args, movedHead, onRead = () => {}, afterVerdict = false, target = 'clear-human' }) {
+  args, movedHead, onRead = () => {}, onAppend = () => {}, afterVerdict = false, target = 'clear-human' }) {
   const initialLabels = ['review:human', ...(accepted ? ['review:accepted'] : [])];
   const output = [];
   let reads = 0;
@@ -20,7 +20,8 @@ function run({ evidence, delegated = true, accepted = false, injectAt = 2, repar
   const ledger = [];
   vi.mocked(appendVerdict).mockImplementation(record => {
     ledger.push(record);
-    if (afterVerdict && record.type !== EVENT_TYPES.APPROVAL) {
+    onAppend(record);
+    if (afterVerdict && (record.type === undefined || record.type === EVENT_TYPES.VERDICT)) {
       ledger.push({ type: EVENT_TYPES.LABEL_INPUT, change: 'added', label: 'review:human',
         sender: 'operator', clearanceBaseline: [ledgerEventId(record)] });
     }
@@ -75,7 +76,7 @@ describe('delegated clear-human final label guard', () => {
     const result = run({ accepted, injectAt: Infinity, afterVerdict: true, movedHead: 'b'.repeat(40) });
     expect(result.exitCode).toBe(1);
     expect(result.ledger.map(row => row.type ?? EVENT_TYPES.VERDICT)).toEqual([
-      EVENT_TYPES.VERDICT, EVENT_TYPES.LABEL_INPUT,
+      EVENT_TYPES.VERDICT, EVENT_TYPES.LABEL_INPUT, EVENT_TYPES.LABEL_INPUT,
     ]);
     expect(result.holds).toEqual([expect.objectContaining({ code: 'label-input:review:human' })]);
     expect(result.provider.postComment).not.toHaveBeenCalled();
@@ -102,6 +103,8 @@ describe('delegated clear-human final label guard', () => {
       expect.objectContaining({ coverage: expect.objectContaining({ headSha: head }) }),
       ...(injectAt === 3 ? [] : [expect.objectContaining({ type: EVENT_TYPES.APPROVAL,
         delegation: { by: 'operator', scope: 'test', expires: '2099-01-01T00:00:00Z' } })]),
+      ...(Number.isFinite(injectAt) ? [expect.objectContaining({ type: EVENT_TYPES.LABEL_INPUT,
+        change: 'added', label: 'review:human', sender: 'refused delegated clearance' })] : []),
     ]);
   };
   const delegation = '--delegation-json=' + JSON.stringify({
@@ -180,6 +183,7 @@ describe('delegated clear-human final label guard', () => {
       expect(result.provider.addLabels).not.toHaveBeenCalled();
       expect(result.provider.removeLabels).not.toHaveBeenCalled();
       expectBoundaryLedger(result, testCase.injectAt);
+      expect(result.holds).toEqual([expect.objectContaining({ code: 'label-input:review:human' })]);
       expect(result.output).toContain(testCase.injectAt === 1 ? 'live head differs from --expect-head'
         : testCase.injectAt === 5 ? 'delegated clearance refused: post-clearance re-check failed'
           : 'head changed before acceptance; hold retained');
@@ -204,6 +208,7 @@ describe('delegated clear-human final label guard', () => {
       expect(result.provider.addLabels).not.toHaveBeenCalled();
       expect(result.provider.removeLabels).not.toHaveBeenCalled();
       expectBoundaryLedger(result, testCase.injectAt);
+      expect(result.holds).toEqual([expect.objectContaining({ code: 'label-input:review:human' })]);
       if (testCase.injectAt === 2) {
         expect(result.provider.postComment).not.toHaveBeenCalled();
         expect(result.provider.setLabels).not.toHaveBeenCalled();
@@ -259,18 +264,88 @@ describe('delegated clear-human final label guard', () => {
     },
   );
 
-  it('refuses delegation expiring between ledger appends before comment or label writes', () => {
+  it.each([false, true])('retains the human hold when delegation expires at read 3 between ledger appends (accepted=%s)', accepted => {
     const expiry = Date.parse('2099-01-01T00:00:00Z');
     const now = vi.spyOn(Date, 'now').mockReturnValue(expiry - 1);
     try {
-      const result = run({ injectAt: Infinity, onRead: read => {
+      const result = run({ accepted, injectAt: Infinity, onRead: read => {
         if (read === 3) now.mockReturnValue(expiry);
       } });
       expect(result.exitCode).toBe(1);
+      expect(result.holds).toEqual([expect.objectContaining({ code: 'label-input:review:human' })]);
       expectBoundaryLedger(result, 3);
       expect(result.events).toEqual(['eligible-read', 'eligible-read', 'eligible-read']);
       expect(result.output).toContain('delegation expired between ledger appends');
     } finally { now.mockRestore(); }
+  });
+
+  it.each([false, true])('refuses delegation expiring at read 4 with no subsequent label swap or comment (accepted=%s)', accepted => {
+    const expiry = Date.parse('2099-01-01T00:00:00Z');
+    const now = vi.spyOn(Date, 'now').mockReturnValue(expiry - 1);
+    try {
+      const result = run({ accepted, injectAt: Infinity, onRead: read => {
+        if (read === 4) now.mockReturnValue(expiry);
+      } });
+      expect(result.exitCode).toBe(1);
+      const writesAtExpiry = accepted ? ['label-write'] : ['comment-write'];
+      expect(result.events.filter(event => event.endsWith('write'))).toEqual(writesAtExpiry);
+      expect(result.events.at(-1)).toBe('eligible-read');
+      expect(result.holds).toEqual([expect.objectContaining({ code: 'label-input:review:human' })]);
+      if (accepted) expect(result.provider.postComment).not.toHaveBeenCalled();
+      else expect(result.provider.setLabels).not.toHaveBeenCalled();
+    } finally { now.mockRestore(); }
+  });
+
+  it('refuses delegation expiring at read 5 before accepted reassertion and retains the human hold', () => {
+    const expiry = Date.parse('2099-01-01T00:00:00Z');
+    const now = vi.spyOn(Date, 'now').mockReturnValue(expiry - 1);
+    try {
+      const result = run({ accepted: true, repark: true, injectAt: Infinity, onRead: read => {
+        if (read === 5) now.mockReturnValue(expiry);
+      } });
+      expect(result.exitCode).toBe(1);
+      expect(result.provider.setLabels).toHaveBeenCalledOnce();
+      expect(result.provider.postComment).toHaveBeenCalledOnce();
+      expect(result.events.at(-1)).toBe('eligible-read');
+      expect(result.holds).toEqual([expect.objectContaining({ code: 'label-input:review:human' })]);
+    } finally { now.mockRestore(); }
+  });
+
+  it.each([false, true])('refuses expiry during the approval append before the first provider write (accepted=%s)', accepted => {
+    const expiry = Date.parse('2099-01-01T00:00:00Z');
+    const now = vi.spyOn(Date, 'now').mockReturnValue(expiry - 1);
+    try {
+      const result = run({ accepted, injectAt: Infinity, onAppend: record => {
+        if (record.type === EVENT_TYPES.APPROVAL) now.mockReturnValue(expiry);
+      } });
+      expect(result.exitCode).toBe(1);
+      expect(result.provider.postComment).not.toHaveBeenCalled();
+      expect(result.provider.setLabels).not.toHaveBeenCalled();
+      expect(result.holds).toEqual([expect.objectContaining({ code: 'label-input:review:human' })]);
+    } finally { now.mockRestore(); }
+  });
+
+  it('retains the human hold when a verdict append throws after persisting its row', () => {
+    const result = run({ injectAt: Infinity, onAppend: record => {
+      if (record.type === undefined || record.type === EVENT_TYPES.VERDICT) throw new Error('ledger transport lost');
+    } });
+    expect(result.exitCode).toBe(1);
+    expect(result.provider.postComment).not.toHaveBeenCalled();
+    expect(result.provider.setLabels).not.toHaveBeenCalled();
+    expect(result.holds).toEqual([expect.objectContaining({ code: 'label-input:review:human' })]);
+    expect(result.ledger).toHaveLength(2);
+  });
+
+  it('reports human hold recovery failure and refuses further provider writes', () => {
+    const result = run({ injectAt: 3, evidence: ['review:human', 'review:changes'], onAppend: record => {
+      if (record.type === EVENT_TYPES.LABEL_INPUT) throw new Error('recovery sink unavailable');
+    } });
+    expect(result.exitCode).toBe(1);
+    expect(result.output).toContain('HUMAN HOLD RECOVERY FAILED: recovery sink unavailable');
+    expect(result.output).toContain('operator must repair the ledger before retrying');
+    expect(result.provider.postComment).not.toHaveBeenCalled();
+    expect(result.provider.setLabels).not.toHaveBeenCalled();
+    expect(result.ledger.filter(row => row.type === EVENT_TYPES.LABEL_INPUT)).toHaveLength(1);
   });
 
   it.each(['not-json', 'null', '{}', '[]'])(
