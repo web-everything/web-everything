@@ -139,12 +139,13 @@ describe('runWithRemoteDecision', () => {
     expectFallback(f.log, reason);
   });
 
-  it('remoteExec throws -> local fallback with the error reason', async () => {
+  it('remoteExec throws -> refuses local rerun with the error reason', async () => {
     const f = fixture();
     f.remoteExec.mockRejectedValue(new Error('injected transport failure'));
-    expect(await runWithRemoteDecision(f)).toEqual({ handled: false });
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: true, exitCode: 124 });
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
-    expectFallback(f.log, 'injected transport failure');
+    expect(f.log.mock.calls[1][0]).toContain('injected transport failure');
+    expect(f.log.mock.calls[1][0]).toContain('refusing local rerun');
   });
 
   it('a remoteExec pending until confirmed cancellation times out and falls back to local admission', async () => {
@@ -248,14 +249,14 @@ describe('runWithRemoteDecision', () => {
       vi.useFakeTimers();
       try {
         const f = fixture();
-        if (outcome === 'fallback') f.remoteExec.mockResolvedValue({ reason: 'unavailable' });
+        if (outcome === 'fallback') f.remoteExec.mockResolvedValue({ mode: 'fallback', reason: 'unavailable' });
         if (outcome === 'rejection') f.remoteExec.mockRejectedValue(new Error('unavailable'));
         if (outcome === 'synchronous throw') f.remoteExec.mockImplementation(() => { throw new Error('unavailable'); });
         if (outcome === 'timeout') f.remoteExec.mockImplementation(() => new Promise(() => {}));
         const pending = runWithRemoteDecision({ ...f, timeoutMs: 20 });
         if (outcome === 'timeout') await vi.advanceTimersByTimeAsync(1020);
         const expected = outcome === 'success' ? { handled: true, exitCode: 0 }
-          : outcome === 'timeout' ? { handled: true, exitCode: 124 } : { handled: false };
+          : outcome === 'fallback' ? { handled: false } : { handled: true, exitCode: 124 };
         expect(await pending).toEqual(expected);
         expect(vi.getTimerCount()).toBe(0);
       } finally { vi.useRealTimers(); }
@@ -274,11 +275,13 @@ describe('runWithRemoteDecision', () => {
     { mode: 'unknown', code: 0 },
     { code: 0 },
     {}, null, undefined, 0, 'remote',
-  ].map((result) => [result]))('never green on unconfirmed result %j -> local fallback', async (result) => {
+    { mode: 'uncertain', reason: 'ambiguous-result', terminated: false },
+  ].map((result) => [result]))('refuses local rerun on unconfirmed result %j', async (result) => {
     const f = fixture();
     f.remoteExec.mockResolvedValue(result);
-    expect(await runWithRemoteDecision(f)).toEqual({ handled: false });
+    expect(await runWithRemoteDecision(f)).toEqual({ handled: true, exitCode: 124 });
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
-    expectFallback(f.log);
+    expectLines(f.log, 2, 'remote');
+    expect(f.log.mock.calls[1][0]).toContain('refusing local rerun');
   });
 });

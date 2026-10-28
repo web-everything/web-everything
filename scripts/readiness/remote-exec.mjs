@@ -17,6 +17,16 @@ export function isAllowedCommand(argv) {
     && argv[0] === 'npm' && argv[1] === 'run' && ['test:unit', 'check:standards'].includes(argv[2]);
 }
 
+// The transport deliberately omits Git metadata. Only explicit runtime unit tests
+// from this Git-independent tree can run there. Tooling, mixed selections, filters
+// and broad runs need the real checkout, just like standards checks do.
+function needsGitContext(argv) {
+  if (argv[2] !== 'test:unit') return true;
+  const files = argv.slice(argv[3] === '--' ? 4 : 3);
+  return files.length === 0 || files.some((file) =>
+    !/^blocks\/(?:[a-zA-Z0-9_-]+\/)*[a-zA-Z0-9_-]+\.test\.[cm]?[jt]sx?(?![\s\S])/.test(file));
+}
+
 export function filterEnv(env = {}) {
   return Object.fromEntries(ENV_KEYS.filter((key) => Object.hasOwn(env, key) && typeof env[key] === 'string'
     && !env[key].includes('\0')).map((key) => [key, env[key]]));
@@ -106,10 +116,9 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
   const fallback = (reason) => ({ mode: 'fallback', reason });
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
   if (!validateRunId(runId) || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host)) return fallback('invalid-parameters');
-  // Standards uses the index, origin/main and history as well as work-tree detection.
-  // A synthetic git init would change those checks; keep it on local admission until
-  // the transport can provide faithful Git context without copying private Git state.
-  if (argv[2] === 'check:standards') return fallback('git-context-required');
+  // A synthetic index/history would change checkout-dependent tests. Keep these
+  // commands local until transport can provide faithful, non-private Git context.
+  if (needsGitContext(argv)) return fallback('git-context-required');
   try {
     if ((await exec({ file: 'ssh', args: [host, 'true'], cwd })).code !== 0) return fallback('forge-unreachable');
   } catch { return fallback('forge-unreachable'); }
@@ -130,21 +139,30 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
     const copied = await exec({ file: 'rsync', args: ['-a', '--delete', '--files-from=-', '--rsync-path=sudo -u forge-exec rsync', '-e', `ssh ${SSH_OPTIONS.join(' ')}`, './', `${host}:${dir}/`], cwd, input: safeFiles(files) });
     if (copied.code !== 0) throw new Error('Copy failed');
   } catch { await cleanup(); return fallback('copy-failed'); }
+  let confirmed = false;
+  const uncertain = () => ({ mode: 'uncertain', reason: 'ambiguous-result', terminated: false });
   try {
     const result = await ssh(buildRemoteScript({ runId, lockHash, env, argv, retainRun: true }), true);
     const receipt = await ssh(`head -c 32 -- ${quote(`${dir}/.exit-code`)}`);
-    if (receipt.code !== 0 || typeof receipt.stdout !== 'string' || !/^(?:0|[1-9][0-9]{0,2})\n?$/.test(receipt.stdout)) return fallback('ambiguous-result');
+    if (receipt.code !== 0 || typeof receipt.stdout !== 'string' || !/^(?:0|[1-9][0-9]{0,2})\n?$/.test(receipt.stdout)) return uncertain();
     const code = Number(receipt.stdout);
-    if (code >= 255 || code !== result.code) return fallback('ambiguous-result');
+    if (code >= 255 || code !== result.code) return uncertain();
+    confirmed = true;
     return { mode: 'remote', code };
-  } catch { return fallback('ambiguous-result'); }
-  finally { await cleanup(); }
+  } catch { return uncertain(); }
+  // Removing a directory cannot stop a surviving process. Preserve uncertain runs
+  // (including their eventual receipt) for operator inspection and daily pruning.
+  finally { if (confirmed) await cleanup(); }
 }
 
 export async function runWithRemoteFallback(options = {}) {
   const result = await runRemote(options);
   if (result.mode === 'remote') return result.code;
   const log = options.log ?? ((message) => process.stderr.write(`${message}\n`));
+  if (result.mode === 'uncertain') {
+    log(`remote-exec: ${result.reason}; remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying.`);
+    return 124;
+  }
   log(`remote-exec: falling back to local (${result.reason})`);
   const local = options.local ?? (async (argv) => (await defaultExec({ file: process.execPath,
     args: ['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=600000', '--', ...argv], cwd: options.cwd, inherit: true })).code);

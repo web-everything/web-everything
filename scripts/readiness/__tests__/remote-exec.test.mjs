@@ -1,16 +1,16 @@
 // @vitest-environment node
-/** @file Contract tests for the forge remote runner; implementation is intentionally pending. */
+/** @file Contract tests for the forge remote runner and its admission callers. */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { runWithRemoteDecision, resolveAdmissionPolicy } from '../heavy-admission.mjs';
 import {
   isAllowedCommand, filterEnv, validateRunId, buildRemoteScript,
   runRemote, runWithRemoteFallback, parseArgs,
 } from '../remote-exec.mjs';
 
-const argv = ['npm', 'run', 'test:unit', 'a.test.mjs'];
+const argv = ['npm', 'run', 'test:unit', '--', 'blocks/a.test.mjs'];
 const runId = 'abcdef-1';
 const runDir = `/srv/forge-exec/${runId}`;
 const lockHash = 'a'.repeat(64);
@@ -174,6 +174,80 @@ ${script.replaceAll('/srv/forge-exec', root)}`;
 });
 
 describe('runRemote', () => {
+  it.each([
+    [], ['--'], ['--', 'scripts/lib/__tests__/exec-output-guard.test.mjs'],
+    ['--', 'scripts/__tests__/repo-scan-tests.test.mjs'],
+    ['--', 'blocks/a.test.mjs', 'scripts/lib/__tests__/exec-output-guard.test.mjs'],
+    ['--', 'blocks'], ['--', '--changed'], ['--', 'blocks/../scripts/a.test.mjs'],
+    ['--', 'blocks/a.test.mjs\n'], ['--', 'blocks/a.test.mjs\r'],
+    ['--', 'blocks/a.test.mjs\u2028'], ['--', 'blocks/\u200ba.test.mjs'],
+    ['--', 'blocks/`a`.test.mjs'], ['--', "blocks/a'b.test.mjs"],
+    ['--', '--', 'blocks/a.test.mjs'], ['--', 'blocks/*.test.mjs'],
+    ['--', 'ｂlocks/a.test.mjs'], ['--', 'blocks/a.test.mjsscripts/b.test.mjs'],
+  ].map((args) => [args]))('keeps unit selections requiring checkout context local before transport: %j', async (args) => {
+    const f = fixture();
+    expect(await runRemote({ ...f, argv: ['npm', 'run', 'test:unit', ...args] }))
+      .toEqual({ mode: 'fallback', reason: 'git-context-required' });
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['blocks/__tests__/unit/route-map.test.ts'],
+    ['--', 'blocks/__tests__/unit/route-map.test.ts'],
+    ['--', 'blocks/a.test.mjs', 'blocks/nested/b.test.tsx'],
+  ].map((args) => [args]))('retains remote execution for explicit runtime tests: %j', async (args) => {
+    expect(await runRemote({ ...fixture(), argv: ['npm', 'run', 'test:unit', ...args] }))
+      .toEqual({ mode: 'remote', code: 0 });
+  });
+
+  it.each(['above-threshold', 'always'])(
+    'keeps the reported Git-dependent unit test local through both callers in %s mode', async (mode) => {
+      const f = fixture();
+      const args = ['npm', 'run', 'test:unit', '--', 'scripts/lib/__tests__/exec-output-guard.test.mjs'];
+      const log = vi.fn();
+      const policy = resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode } } });
+      expect(await runWithRemoteDecision({
+        argv: args, cwd, policy, loadPerCore: () => 10, log,
+        remoteExec: (options) => runRemote({ ...f, ...options }),
+      })).toEqual({ handled: false });
+      expect(await runWithRemoteFallback({ ...f, argv: args, log })).toBe(7);
+      expect(f.local).toHaveBeenCalledTimes(1);
+      expect(f.local).toHaveBeenCalledWith(args);
+      expect(f.exec).not.toHaveBeenCalled();
+      expect(f.listFiles).not.toHaveBeenCalled();
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('git-context-required'));
+    },
+  );
+
+  it.each(['rejected SSH', 'SSH 255', 'receipt unavailable', 'receipt rejected'])(
+    'refuses both local callers after %s while a dispatched child survives', async (loss) => {
+      const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+      const closed = new Promise((resolve) => child.once('close', resolve));
+      try {
+        const f = fixture({ runCode: loss === 'SSH 255' ? 255 : 0, receiptCode: 1 });
+        const exec = vi.fn(async (call) => {
+          if (isRun(call) && loss === 'rejected SSH') throw new Error('connection lost');
+          if (isReceipt(call) && loss === 'receipt rejected') throw new Error('connection lost');
+          return f.exec(call);
+        });
+        const log = vi.fn();
+        const options = { ...f, exec, log };
+        const policy = resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always' } } });
+        expect(await runWithRemoteDecision({
+          argv, cwd, policy, log, remoteExec: (opts) => runRemote({ ...options, ...opts }),
+        })).toEqual({ handled: true, exitCode: 124 });
+        expect(await runWithRemoteFallback(options)).toBe(124);
+        expect(f.local).not.toHaveBeenCalled();
+        expect(callsOf(exec).some(isCleanup)).toBe(false);
+        expect(log).toHaveBeenCalledWith(expect.stringContaining('refusing local rerun'));
+        expect(() => process.kill(child.pid, 0)).not.toThrow();
+      } finally {
+        child.kill('SIGKILL');
+        await closed;
+      }
+    },
+  );
+
   it.each([[], ['--', '--files=scripts/example.mjs']].map((args) => [args]))('falls back before transport for standards needing Git context: %j', async (args) => {
     const f = fixture();
     expect(await runRemote({ ...f, argv: ['npm', 'run', 'check:standards', ...args] }))
@@ -260,10 +334,10 @@ describe('runRemote', () => {
     { runCode: 0, receipt: '3\n' }, { runCode: 3, receipt: '0\n' },
     { runCode: 0, receipt: '0\n', receiptCode: 1 },
     { runCode: 255, receipt: '255\n' }, { runCode: 255, receipt: '0\n' },
-  ])('fails closed with ambiguous-result and attempts cleanup for %j', async (scenario) => {
+  ])('refuses reruns and preserves the run directory for ambiguous evidence: %j', async (scenario) => {
     const f = fixture(scenario);
-    expect(await runRemote(f)).toEqual({ mode: 'fallback', reason: 'ambiguous-result' });
-    expect(callsOf(f.exec).some(isCleanup)).toBe(true);
+    expect(await runRemote(f)).toEqual({ mode: 'uncertain', reason: 'ambiguous-result', terminated: false });
+    expect(callsOf(f.exec).some(isCleanup)).toBe(false);
     expectNoSecrets(f.exec);
   });
   it('uses the injected file list as rsync stdin, excludes node_modules, and selects the restricted rsync user', async () => {
@@ -293,6 +367,15 @@ describe('runRemote', () => {
 });
 
 describe('runWithRemoteFallback', () => {
+  it('refuses a local rerun for a missing receipt even when SSH reports success', async () => {
+    const f = fixture({ receipt: '' });
+    const log = vi.fn();
+    expect(await runWithRemoteFallback({ ...f, log })).toBe(124);
+    expect(f.local).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('refusing local rerun'));
+    expect(callsOf(f.exec).some(isCleanup)).toBe(false);
+  });
+
   it('preserves the local standards result and logs the Git-context fallback reason', async () => {
     const f = fixture();
     const standardArgs = ['npm', 'run', 'check:standards', '--', '--files=scripts/example.mjs'];
@@ -311,7 +394,6 @@ describe('runWithRemoteFallback', () => {
     ['command-not-allowed', { argv: ['npm', 'run', 'build'] }, {}],
     ['forge-unreachable', {}, { probeCode: 255 }],
     ['copy-failed', {}, { copyCode: 23 }],
-    ['ambiguous-result', {}, { receipt: '' }],
   ])('logs %s and returns the local code on fallback', async (reason, overrides, scenario) => {
     const f = { ...fixture(scenario), ...overrides };
     const log = vi.fn();

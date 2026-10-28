@@ -413,7 +413,8 @@ export function decideRemote({ policy, loadPerCore, argv }) {
   return { remote: above, reason: `${enabled}; loadPerCore=${loadPerCore} ${above ? '>' : '<='} ${remote.loadPerCoreThreshold}` };
 }
 
-/** Attempt remote execution before taking a local slot. A timed-out attempt may fall back only after
+/** Attempt remote execution before taking a local slot. Ambiguous executions refuse local reruns.
+ * A timed-out attempt may fall back only after
  * the executor acknowledges abort with { mode: 'cancelled', terminated: true }; an abort request alone
  * cannot prove remote termination. Allow up to one second for acknowledgement, then refuse a local rerun. */
 export async function runWithRemoteDecision({
@@ -430,6 +431,10 @@ export async function runWithRemoteDecision({
   const decision = decideRemote({ policy, loadPerCore: load, argv });
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
   if (!decision.remote) return { handled: false };
+  const refuseLocal = (reason) => {
+    log(`heavy-admission: remote failed (${oneLine(reason)}) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying.\n`);
+    return { handled: true, exitCode: 124 };
+  };
   let reason; let timer;
   const controller = new AbortController();
   const timedOut = Symbol('remote-timeout');
@@ -456,9 +461,12 @@ export async function runWithRemoteDecision({
       reason = 'remote-timeout';
     } else {
       if (result?.mode === 'remote' && Number.isInteger(result.code)) return { handled: true, exitCode: result.code };
+      // Only an explicit pre-execution fallback is safe. Throws and malformed
+      // replies may come from an executor whose remote child is still alive.
+      if (result?.mode !== 'fallback') return refuseLocal(result?.reason ?? 'unconfirmed remote result');
       reason = result?.reason ?? 'unconfirmed remote result';
     }
-  } catch (error) { reason = error?.message ?? error; }
+  } catch (error) { return refuseLocal(error?.message ?? error); }
   finally { clearTimeout(timer); }
   const failure = reason === 'remote-timeout' ? reason : `fallback: ${oneLine(reason)}`;
   log(`heavy-admission: remote failed (${failure}) - falling back to local admission\n`);
