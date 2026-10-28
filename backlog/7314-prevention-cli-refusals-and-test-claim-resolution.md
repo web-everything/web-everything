@@ -23,7 +23,7 @@ PR #5982's review found undocumented coverage gaps in delegated clearance and te
 
 ## Planned named tests (not implemented by this card)
 
-All cases below belong to the planned `scripts/lib/__tests__/cli-refusal-claim-guard.test.mjs`;
+All cases below belong to the planned `we:scripts/lib/__tests__/cli-refusal-claim-guard.test.mjs`;
 they describe the observable gate result, not claims of existing coverage.
 
 | Guarantee | Planned exact case title | Assertion |
