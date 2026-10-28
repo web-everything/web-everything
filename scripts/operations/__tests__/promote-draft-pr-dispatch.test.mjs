@@ -471,6 +471,11 @@ describe('isPromoteCodePath — the declared promote code path (#3806 incident)'
     expect(isPromoteCodePath('scripts/operations/cli-adapter.mjs')).toBe(false);
     expect(isPromoteCodePath('scripts/operations/__tests__/render-outcome-effect-refusal.test.mjs')).toBe(false);
   });
+  it('real closure: main CI evidence is on the path without the main-red owner dispatcher', () => {
+    expect(promoteCodeClosure()?.complete).toBe(true);
+    expect(isPromoteCodePath('scripts/conveyor/main-ci-red-probe.mjs')).toBe(true);
+    expect(isPromoteCodePath('scripts/conveyor/main-ci-red-io.mjs')).toBe(false);
+  });
   it('an unreadable closure fails closed: every code file counts', () => {
     expect(isPromoteCodePath('scripts/operations/cli-adapter.mjs', { closure: null })).toBe(true);
     expect(isPromoteCodePath('backlog/123-x.md', { closure: null })).toBe(false);
