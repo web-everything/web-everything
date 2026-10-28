@@ -128,7 +128,9 @@ describe('real Git retirement evidence', () => {
       if (!replacement) [replacement] = addOverlay(root, { ref: 'feature', pr: 1 }, { env });
       return 'OPEN';
     } });
-    expect(prepared.terminal).toBe(false);
+    expect(prepared.terminal).toBe(true);
+    expect(prepared.result.reason).toBe('overlay-registration-changed');
+    expect(prepared.alerts.map(a => a.kind)).toContain('overlay-registration-changed');
     expect(replacement).toBeDefined();
     expect(readOverlayState(root, { env }).overlays).toEqual([replacement]);
     expect(replacement.tipSha).toBeUndefined();
@@ -387,7 +389,7 @@ describe('real Git retirement evidence', () => {
     expect(prepared.result.reason).toBe('up-to-date');
     expect(prepared.result.plan.decisions).toEqual([]);
     expect(prepared.alerts).toContainEqual(expect.objectContaining({ kind: 'overlay-fetch-unverifiable' }));
-    expect(readOverlayState(root, { env }).overlays).toEqual(overlays);
+    expect(readOverlayState(root, { env }).overlays).toEqual(overlays.map(o => ({ ...o, registrationId: expect.any(String) })));
     expectNoRetirement();
   });
 
@@ -397,7 +399,7 @@ describe('real Git retirement evidence', () => {
     register([{ ref: 'uncertain', sha: initial }, { ref: 'main' }]);
     await prepare({ run: (args) => args[0] === 'ls-remote'
       ? { status: 128, stderr: 'unavailable' } : git(args) });
-    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'uncertain', sha: initial }]);
+    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'uncertain', sha: initial, registrationId: expect.any(String) }]);
     expect(audit().filter((e) => e.kind === 'removed').map((e) => e.ref)).toEqual(['main']);
   });
 
@@ -430,7 +432,7 @@ describe('real Git retirement evidence', () => {
     register(overlays);
     expect(classify(overlays)[0]).toMatchObject({ class: 'needed', reason: 'git-unverifiable' });
     await prepare();
-    expect(readOverlayState(root, { env }).overlays).toEqual(overlays);
+    expect(readOverlayState(root, { env }).overlays).toEqual(overlays.map(o => ({ ...o, registrationId: expect.any(String) })));
     expectNoRetirement();
   });
 
@@ -445,7 +447,7 @@ describe('real Git retirement evidence', () => {
     register(overlays);
     await prepare({ run: (args) => args[0] === 'update-ref' && args[1] === '-d' && args[2] === 'refs/remotes/origin/deleted'
       ? { status: 1 } : git(args) });
-    expect(readOverlayState(root, { env }).overlays).toEqual(overlays);
+    expect(readOverlayState(root, { env }).overlays).toEqual(overlays.map(o => ({ ...o, registrationId: expect.any(String) })));
     expectNoRetirement();
   });
 
@@ -502,7 +504,7 @@ describe('real Git retirement evidence', () => {
     expect(prepared.terminal, JSON.stringify(prepared)).toBe(false);
     expect(ok('rev-parse', 'refs/remotes/origin/feature')).toBe(newer);
     // The refreshed tip is recorded as later deleted-branch evidence; the registration itself is unchanged.
-    expect(readOverlayState(root, { env }).overlays).toEqual([{ ...overlays[0], tipSha: newer }]);
+    expect(readOverlayState(root, { env }).overlays).toEqual([{ ...overlays[0], tipSha: newer, registrationId: expect.any(String) }]);
     expect(prepared.plan.decisions).toContainEqual(expect.objectContaining({ ref: 'feature', action: 'apply', sha: newer }));
   });
 
@@ -516,7 +518,7 @@ describe('real Git retirement evidence', () => {
       run: git, now: Date.now, mainOnly: false,
     });
     expect(prepared.result.reason).toBe('fetch-failed');
-    expect(readOverlayState(root, { env }).overlays).toEqual(overlays);
+    expect(readOverlayState(root, { env }).overlays).toEqual(overlays.map(o => ({ ...o, registrationId: expect.any(String) })));
   });
 
   it('keeps unique merge-resolution content even when every cherry line is negative', async () => {

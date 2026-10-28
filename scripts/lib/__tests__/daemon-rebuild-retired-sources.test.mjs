@@ -175,7 +175,7 @@ describe('archived sources remain represented in preparation', () => {
     expect(model.persisted[0].get('top')).toMatchObject({ sha: '3'.repeat(40), reg: { ref: 'top', pr: 2 } });
     expect(next.alerts).toContainEqual({ kind: 'overlay-auto-retire-audit-failed',
       detail: { failures: [{ ref: null, kind: 'tip-sha', error: 'tip disk full' }] } });
-    expect(readOverlayState(root, { env: f.env }).overlays).toEqual([{ ref: 'top', pr: 2 }]);
+    expect(readOverlayState(root, { env: f.env }).overlays).toEqual([{ ref: 'top', pr: 2, registrationId: expect.any(String) }]);
   });
 
   it('preparation forwards retirement auditFailures to overlay-auto-retire-audit-failed', async () => {
