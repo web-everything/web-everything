@@ -61,6 +61,17 @@ const redMainContext = {
 const rerun = [run(1, 'failure', '2026-10-13T22:50:00Z'), run(2, 'success')]
   .map((r, i) => ({ ...r, actions: { runId: 700, attempt: i + 1 } }));
 
+it('reads the real ruleset through a module-relative filesystem path in the DOM environment', () => {
+  const path = resolve(dirname(fileURLToPath(import.meta.url)), '../../rulesets/main-required-checks.merge-queue.json');
+  const read = vi.fn((...argv) => readFileSync(...argv));
+  expect(readRequiredCheckBindings({ read })).toEqual(bindings([
+    'test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate',
+  ]));
+  expect(read).toHaveBeenCalledTimes(1);
+  expect(read).toHaveBeenCalledWith(path, 'utf8');
+  expect(readRequiredCheckBindings()).toEqual(readRequiredCheckBindings({ path }));
+});
+
 it.each(['cancelled-test', 'all-green-wrong-app', 'green-sibling-wrong-app'])(
   'retains the hold without posting when policy-bound runs are absent: %s', scenario => {
     const requiredChecks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'];
