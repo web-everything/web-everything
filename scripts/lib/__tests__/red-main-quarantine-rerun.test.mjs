@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resolveQuarantineSettings, runSafetyNet, SAFETY_NET_LEDGER } from '../red-main-quarantine-io.mjs';
+import { planSafetyNet, validateQuarantineList } from '../red-main-quarantine.mjs';
 
 const now = Date.parse('2026-10-28T12:00:00Z');
 const sha = 'a'.repeat(40);
@@ -24,6 +25,67 @@ function temp() {
   return dir;
 }
 afterEach(() => dirs.splice(0).forEach((dir) => rmSync(dir, { recursive: true, force: true })));
+
+describe('repeat-failure planner keys evidence by real run id and attempt', () => {
+  const rows = [originalRun, { ...rerun, createdAt: rerun.updatedAt }]
+    .map((run) => ({ ...run, jobFailures: { [job]: failure() } }));
+  const plan = (overrides = {}) => planSafetyNet({
+    status: 'red', firstRedSha: sha, failedJobs: [job, 'daemon-soak'],
+    jobFailures: { [job]: failure() }, repeatRuns: rows, latestRunId: runId, latestAttempt: 2,
+    touchedFiles: () => [], now, ...overrides,
+  });
+  const proof = { kind: 'repeat-failed', runIds: [runId, runId], attempts: [1, 2], shas: [sha, sha], count: 2 };
+  const validate = (evidence) => validateQuarantineList({ version: 1, entries: [{
+    test: file, job, brokenSha: sha, owner: 'operator', reason: 'repeat failure',
+    addedAt: now, expiresAt: now + 60_000, proof: evidence,
+  }] });
+
+  it('counts attempt 2 of the same real run id as a second failure', () => {
+    expect(plan()).toMatchObject({ action: 'add', entries: [{ test: file, job, proof }] });
+    expect(validate(proof)).toEqual({ ok: true, errors: [] });
+  });
+
+  it('does not count the same id and same attempt twice even with different timestamps', () => {
+    expect(plan({ repeatRuns: rows.map((row) => ({ ...row, attempt: 1 })), latestAttempt: 1 }).action).toBe('none');
+  });
+
+  it('requires the latest evidence to match both the requested run id and attempt', () => {
+    expect(plan({ latestAttempt: 3 }).action).toBe('none');
+    expect(plan({ latestRunId: runId + 1 }).action).toBe('none');
+  });
+
+  it('defaults absent run attempts and latestAttempt to 1 for distinct runs', () => {
+    const repeatRuns = rows.map(({ attempt, ...row }, i) => ({ ...row, databaseId: runId + i }));
+    expect(plan({ repeatRuns, latestRunId: runId + 1, latestAttempt: undefined }))
+      .toMatchObject({ action: 'add', entries: [{ proof: { ...proof, runIds: [runId, runId + 1], attempts: [1, 1] } }] });
+  });
+
+  it.each([0, -1, 1.5, '2', null])('refuses a non-positive-integer attempt: %s', (attempt) => {
+    expect(plan({ repeatRuns: [rows[0], { ...rows[1], attempt }], latestAttempt: attempt }).action).toBe('none');
+    expect(validate({ ...proof, attempts: [1, attempt] }).errors).toContain('entry 0: bad proof');
+  });
+
+  it.each([0, -1, 'unknown', 1.5])('keeps run id validation strict with attempt-keyed evidence: %s', (databaseId) => {
+    expect(plan({ repeatRuns: rows.map((row) => ({ ...row, databaseId })), latestRunId: databaseId }).action).toBe('none');
+    expect(validate({ ...proof, runIds: [databaseId, databaseId] }).errors).toContain('entry 0: bad proof');
+  });
+
+  it('rejects duplicate run ids with equal attempts, including numeric/string id aliases', () => {
+    for (const runIds of [[runId, runId], [runId, String(runId)]]) {
+      expect(validate({ ...proof, runIds, attempts: [2, 2] }).errors).toContain('entry 0: bad proof');
+    }
+  });
+
+  it.each([[], [1], [1, 2, 3], null, '1,2'])('rejects malformed or misaligned attempts: %j', (attempts) => {
+    expect(validate({ ...proof, attempts }).errors).toContain('entry 0: bad proof');
+  });
+
+  it('preserves legacy proof validation without attempts', () => {
+    const { attempts, ...legacy } = proof;
+    expect(validate({ ...legacy, runIds: [runId, runId + 1] })).toEqual({ ok: true, errors: [] });
+    expect(validate(legacy).errors).toContain('entry 0: bad proof');
+  });
+});
 
 function harness({ values = {}, execError } = {}) {
   const dir = temp();
@@ -92,7 +154,7 @@ describe('red-main requests one failed-job rerun for repeat evidence', () => {
     });
     const intent = {
       rerunRequestedFor: sha,
-      rerun: { runId, requestedAt: now, runKey: `${runId}@${originalRun.updatedAt}`, headSha: sha,
+      rerun: { runId, attempt: 1, requestedAt: now, runKey: `${runId}@${originalRun.updatedAt}`, headSha: sha,
         createdAt: originalRun.createdAt, jobFailures: { [job]: failure() } },
     };
     expect(h.persistedAtExec).toEqual([expect.objectContaining(intent)]);
@@ -108,13 +170,28 @@ describe('red-main requests one failed-job rerun for repeat evidence', () => {
     expect(out.plan.action).toBe('add');
     expect(out.applied).toBe(true);
     expect(h.write).toHaveBeenCalledOnce();
-    // Appending 1 is the documented synthetic attempt-1 id; the latest id remains real.
     expect(h.list().entries).toEqual([expect.objectContaining({ test: file, job, brokenSha: sha,
-      proof: { kind: 'repeat-failed', runIds: [Number(`${runId}1`), runId], shas: [sha, sha], count: 2 },
+      proof: { kind: 'repeat-failed', runIds: [runId, runId], attempts: [1, 2], shas: [sha, sha], count: 2 },
       expiresAt: now + 15 * 60_000,
     })]);
     expect(h.exec).toHaveBeenCalledOnce();
     expect(h.ledger().reds[sha].rerun.jobFailures).toEqual({ [job]: failure() });
+  });
+
+  it('does not count a changed updatedAt as another attempt without an attempt increment', () => {
+    const h = harness();
+    h.tick();
+    expect(h.tick({ ...originalRun, updatedAt: rerun.updatedAt }).plan.action).toBe('none');
+    expect(h.exec).toHaveBeenCalledOnce();
+    expect(h.write).not.toHaveBeenCalled();
+  });
+
+  it.each([originalRun.createdAt, undefined, 'invalid'])('refuses rerun evidence without strictly later updatedAt: %s', (updatedAt) => {
+    const h = harness();
+    h.tick();
+    expect(h.tick({ ...rerun, updatedAt }).plan.action).toBe('none');
+    expect(h.exec).toHaveBeenCalledOnce();
+    expect(h.write).not.toHaveBeenCalled();
   });
 
   it('keeps a file seen only on attempt 2 unproven and preserves attempt-1 evidence', () => {
