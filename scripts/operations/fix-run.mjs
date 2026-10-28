@@ -34,7 +34,7 @@ import { REPO_ROOT } from './detached-dispatch.mjs';
 // below deadlocks if `dispatch-providers/fix.mjs` imports it back.
 import { FIX_RUN_EXECUTORS } from './dispatch-providers/fix.mjs';
 import { PR_BASE_MERGE_TARGET, recordBorrowOutcome, recordRoutedOutcome, consecutiveUnproductiveOnHead, ROUTED_CODEX_MAX_UNPRODUCTIVE } from '../lib/fix-slot-borrow.mjs';
-import { appendFixLoopRow, isInfraFixRunOutcome } from '../conveyor/fix-loop-ledger.mjs';
+import { appendFixLoopRow, isInfraFixRunOutcome, FIX_RUN_OUTCOME } from '../conveyor/fix-loop-ledger.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { riskyLaneConfig, LANE_CONFIG_LIST_ARGS, laneGitConfigArgs, laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
 import { LEASE_FILENAME, renewedLease } from '../lib/lane-lease.mjs';
@@ -458,19 +458,22 @@ export function readLaneLease(lanePath) {
 
 /**
  * Best-effort in-place renewal; a replaced lease stays on a different inode.
- * Reader visibility is not atomic: concurrent ownership checks fail closed on incomplete JSON.
+ * One positioned write retains the old byte length with whitespace padding, avoiding
+ * an empty marker or a stale JSON suffix for allocator readers between IO calls.
  */
 export function defaultRenewLease({ lanePath, holder } = {}) {
   try {
     const file = join(lanePath, '.git', LEASE_FILENAME);
     const fd = nodeFs.openSync(file, 'r+');
     try {
-      const lease = JSON.parse(readFileSync(fd, 'utf8'));
+      const previous = readFileSync(fd);
+      const lease = JSON.parse(previous.toString('utf8'));
       if (!holder || lease?.holder !== holder) return false;
       const next = renewedLease(lease, new Date().toISOString());
       if (!next) return false;
-      const contents = Buffer.from(`${JSON.stringify(next, null, 2)}\n`);
-      nodeFs.ftruncateSync(fd, 0);
+      const json = Buffer.from(`${JSON.stringify(next, null, 2)}\n`);
+      const contents = Buffer.alloc(Math.max(previous.length, json.length), 0x20);
+      json.copy(contents);
       return nodeFs.writeSync(fd, contents, 0, contents.length, 0) === contents.length;
     } finally {
       nodeFs.closeSync(fd);
@@ -634,7 +637,7 @@ export async function runFixCli(argv = [], {
   let prHeadSha = null;
   let finalMessage = '';
   let abortMerge = null;
-  let outcome = 'failed';
+  let outcome = FIX_RUN_OUTCOME.FAILED;
   let reason = 'launch did not complete';
   const settle = async () => {
     if (!launch?.pr) return;
@@ -658,7 +661,8 @@ export async function runFixCli(argv = [], {
       try {
         await appendLoopRow({ kind: 'outcome', repo, pr: Number(launch.pr), head, session: launch.sessionSlug,
           // The fix-loop ledger only accepts pushed|no-change|failed rows; a lease loss is a failed, non-infra row.
-          outcome: outcome === 'lease-lost' ? 'failed' : outcome, infra: isInfraFixRunOutcome(outcome, reason), reason });
+          outcome: outcome === FIX_RUN_OUTCOME.LEASE_LOST ? FIX_RUN_OUTCOME.FAILED : outcome,
+          infra: isInfraFixRunOutcome(outcome, reason), reason });
       } catch (e) { writeErr(`fix-run: could not record fix-loop outcome: ${String(e?.message ?? e)}\n`); }
     }
     try {
@@ -763,7 +767,7 @@ export async function runFixCli(argv = [], {
       rearm(before);
       pendingRearm.clear(launch.repo, pr);
       const result = `PR #${pr} (already pushed ${before.slice(0, 9)}; re-armed review:pending after a failed earlier re-arm)`;
-      outcome = 'pushed'; reason = 'finished an earlier push';
+      outcome = FIX_RUN_OUTCOME.PUSHED; reason = 'finished an earlier push';
       write(`fix-run: PR #${pr} finished - ${result}\n`);
       return { code: 0, result };
     }
@@ -998,7 +1002,7 @@ export async function runFixCli(argv = [], {
     const after = run('git', ['rev-parse', 'HEAD'], { cwd: lanePath }).trim();
     let result;
     if (after === before) {
-      outcome = 'no-change'; reason = finalMessage || 'agent committed nothing';
+      outcome = FIX_RUN_OUTCOME.NO_CHANGE; reason = finalMessage || 'agent committed nothing';
       result = `no-change (${singleLine(reason)}; claim released, PR is re-planned)`;
     } else {
       // Defense in depth (config was already re-checked right after the agent): this push runs outside the sandbox with
@@ -1015,13 +1019,13 @@ export async function runFixCli(argv = [], {
       rearm(after);
       pendingRearm.clear(launch.repo, pr);
       result = `PR #${pr} (pushed ${after.slice(0, 9)}, re-armed review:pending)`;
-      outcome = 'pushed'; reason = finalMessage || `pushed ${after.slice(0, 9)}`;
+      outcome = FIX_RUN_OUTCOME.PUSHED; reason = finalMessage || `pushed ${after.slice(0, 9)}`;
     }
     write(`fix-run: PR #${pr} finished - ${result}\n`);
     return { code: 0, result };
   } catch (e) {
     writeErr(`fix-run: PR #${pr} FAILED: ${String(e?.message ?? e)}\n`);
-    outcome = e instanceof LeaseLostError ? 'lease-lost' : 'failed';
+    outcome = e instanceof LeaseLostError ? FIX_RUN_OUTCOME.LEASE_LOST : FIX_RUN_OUTCOME.FAILED;
     reason = `${childFailureReason(e)}${finalMessage && !String(e?.message).includes(finalMessage) ? `: ${finalMessage}` : ''}`;
     if (e instanceof LeaseLostError) reason = `lease-lost: ${reason.replace(/^fix-run:\s*/, '')}`;
     if (!finalMessage && e instanceof LauncherError) {
