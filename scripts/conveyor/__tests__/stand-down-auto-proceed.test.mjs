@@ -32,6 +32,22 @@ const run = (id, conclusion, completed_at = '2026-10-13T23:40:00Z', name = 'test
 const pr = (comments = [stand()]) => ({ number: 5195, headRefOid: head, comments });
 const evidence = runs => ({ head, complete: true, runs });
 const bindings = names => names.map(context => ({ context, integration_id: 15368 }));
+
+it('reads required-check bindings from the module-relative filesystem policy under Vitest', () => {
+  expect(readRequiredCheckBindings()).toEqual(bindings([
+    'test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate',
+  ]));
+});
+
+it('passes an absolute module-relative policy path to the injected reader', () => {
+  const read = vi.fn(path => readFileSync(path, 'utf8'));
+  readRequiredCheckBindings({ read });
+  expect(read).toHaveBeenCalledTimes(1);
+  expect(read).toHaveBeenCalledWith(
+    resolve(dirname(fileURLToPath(import.meta.url)), '../../rulesets/main-required-checks.merge-queue.json'), 'utf8',
+  );
+});
+
 const args = (runs, extra = {}) => ({ pr: pr(), requiredChecks: ['test'], checks: evidence(runs),
   requiredCheckBindings: bindings(extra.requiredChecks ?? ['test']), ...extra });
 const redMainContext = {
@@ -879,12 +895,13 @@ it.each(['malformed', 'wrong-repo', 'invalid-position', 'unreadable', 'unwritabl
     const dir = mkdtempSync(join(tmpdir(), 'r123-cursor-failure-'));
     try {
       const logs = [];
-      let reads = 0, writes = 0, reservations = 0, posts = 0;
+      let cursorReads = 0, reads = 0, writes = 0, reservations = 0, posts = 0;
       const snapshots = [pr()];
       const result = enrichWithCursor(snapshots, {
         repo: 'org/repo', requiredChecks: ['test'], env: { WE_FIX_LOOP_LEDGER: join(dir, 'ledger.jsonl') },
         selectCandidates: (candidates, options) => selectAutoProceedCandidates(candidates, { ...options,
           read: () => {
+            cursorReads++;
             if (scenario === 'unreadable') throw new Error('read denied');
             return scenario === 'malformed' ? '{' : JSON.stringify({ v: 1,
               repo: scenario === 'wrong-repo' ? 'other/repo' : 'org/repo',
@@ -897,6 +914,7 @@ it.each(['malformed', 'wrong-repo', 'invalid-position', 'unreadable', 'unwritabl
         log: line => logs.push(line),
       });
       expect(result).toBe(snapshots);
+      expect(cursorReads).toBe(1);
       expect({ reads, reservations, posts }).toEqual({ reads: 0, reservations: 0, posts: 0 });
       expect(writes).toBe(scenario === 'unwritable' ? 1 : 0);
       expect(logs).toHaveLength(1);

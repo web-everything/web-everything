@@ -350,6 +350,7 @@ export const GITHUB_ACTIONS_INTEGRATION_ID = 15368;
 
 /** Read the declared check/app bindings without guessing when policy is unavailable. */
 export function readRequiredCheckBindings({ read = readFileSync,
+  // Keep filesystem policy reads out of Vite's browser asset-URL rewriting in Vitest.
   path = join(dirname(fileURLToPath(import.meta.url)), '../rulesets/main-required-checks.merge-queue.json') } = {}) {
   const ruleset = JSON.parse(read(path, 'utf8'));
   const rules = ruleset?.rules?.filter(rule => rule?.type === 'required_status_checks');
