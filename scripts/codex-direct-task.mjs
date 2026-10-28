@@ -124,7 +124,6 @@ import {
   CODEX_EFFORT_MAP, CODEX_MODEL, CODEX_TIER_EFFORT, assertCodexModel, resolveCodexEffort, parseRolloutUsageBucket,
 } from './lib/codex-model-routing.mjs';
 import { resolveCodexTaskRoute } from './lib/codex-task-route.mjs';
-import { checkRunTranscript } from './lib/codex-transcript-check.mjs';
 
 // ── constants ─────────────────────────────────────────────────────────────────────────────────────
 export const CODEX_CLI = 'codex';
@@ -1137,6 +1136,8 @@ export async function codexDirectTask({
   let quota = null;
   let quotaRolloutFile = null;
   let quotaRolloutCleared = false;
+  // Lazy: codex-transcript-check pulls skills-src, which scripts-only copies (backlog CLI tests) lack.
+  const { checkRunTranscript } = await import('./lib/codex-transcript-check.mjs');
   const transcriptCheck = checkRunTranscript({ codexHome: resolveCodexHome(env), threadId: summary.threadId,
     ephemeral, findRolloutFile, env, emit });
   if (!ephemeral && summary.threadId) {
