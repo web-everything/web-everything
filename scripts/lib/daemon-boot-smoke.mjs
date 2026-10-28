@@ -315,7 +315,7 @@ export function resolveDaemonEntries(env = process.env, { root, runtimeEntries =
     return { entries: raw.split(',').map((s) => s.trim()).filter(Boolean), overridden: true };
   }
   const cloneRoot = env?.WE_SMOKE_LIVE_CLONE || root;
-  return { entries: cloneRoot ? runtimeEntries({ root: cloneRoot, entries: [] }) : DAEMON_ENTRY_MODULES, overridden: false };
+  return { entries: cloneRoot ? runtimeEntries({ root: cloneRoot, entries: [], env }) : DAEMON_ENTRY_MODULES, overridden: false };
 }
 
 /** A fixed, never-real marker base — resolving `rel` against THIS exact base is how {@link isSafeRelativeEntry}

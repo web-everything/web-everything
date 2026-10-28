@@ -7,8 +7,8 @@ import { spawnSync } from 'node:child_process';
 import { DAEMON_ENTRY_MODULES } from './daemon-boot-smoke.mjs';
 import { DAEMON_MANIFEST } from '../../skills-src/conveyor/daemon-manifest.mjs';
 
-export function cloneRuntimeEntries({ root, entries = [],
-  launchAgentsDir = join(homedir(), 'Library', 'LaunchAgents'), run = spawnSync,
+export function cloneRuntimeEntries({ root, entries = [], env = process.env,
+  launchAgentsDir = join(env.HOME || homedir(), 'Library', 'LaunchAgents'), run = spawnSync,
 }) {
   const realRoot = realpathSync(root);
   const inside = path => {

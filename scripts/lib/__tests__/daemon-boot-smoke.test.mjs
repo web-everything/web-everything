@@ -66,14 +66,16 @@ describe('resolveDaemonEntries', () => {
     let observed;
     const runtimeEntries = options => { observed = options; return [...DAEMON_ENTRY_MODULES, 'clone.mjs']; };
     expect(resolveDaemonEntries({}, { root: 'clone-root', runtimeEntries }).entries).toContain('clone.mjs');
-    expect(observed).toEqual({ root: 'clone-root', entries: [] });
+    expect(observed).toEqual({ root: 'clone-root', entries: [], env: {} });
   });
 
   it('discovers LaunchAgents against the live clone while booting a disposable candidate', () => {
     let observed;
     const runtimeEntries = options => { observed = options; return DAEMON_ENTRY_MODULES; };
-    resolveDaemonEntries({ WE_SMOKE_LIVE_CLONE: 'live-clone' }, { root: 'candidate-tree', runtimeEntries });
+    const env = { WE_SMOKE_LIVE_CLONE: 'live-clone', HOME: 'isolated-home' };
+    resolveDaemonEntries(env, { root: 'candidate-tree', runtimeEntries });
     expect(observed.root).toBe('live-clone');
+    expect(observed.env).toBe(env);
   });
 
   it('fails closed when clone entry discovery is unreadable', async () => {

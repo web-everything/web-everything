@@ -5,7 +5,10 @@
 `daemon-clone-entries.test.mjs`, `closure-scope.test.mjs` and
 `daemon-rebuild-tree-reader.test.mjs` cover the pure R171 helpers. Clone entry discovery
 throws on unreadable LaunchAgents evidence, including a missing directory; inject a directory
-and plutil runner for portable tests. Scope computation accepts a snapshot reader plus a
+and plutil runner for portable tests. Discovery uses the supplied environment's `HOME` in both
+planning and boot smoke. Simulator homes provide an empty `Library/LaunchAgents` directory,
+so in-process rebuilds and forked daemon hosts read the same isolated evidence without an entry
+override or a missing-directory bypass. Scope computation accepts a snapshot reader plus a
 `Map<repoPath, source|null>` of overlay changes, or local Git trees and per-overlay changed
 paths. Use the same reader for imports and spawned-script basename lookup; never let a tree
 walk fall back to the checkout's tracked-file index. Tree batch output is byte-framed (UTF-8

@@ -340,7 +340,7 @@ export async function prepareRebuild({
   // The PR base chains come from gh, else from each entry's recorded `stackBases`, else ancestry alone.
   const stack = resolveOverlayStackMode(env);
   const closureScopeMode = resolveClosureScopeMode(env).mode;
-  const runtimeEntries = () => cloneRuntimeEntries({ root, entries });
+  const runtimeEntries = () => cloneRuntimeEntries({ root, entries, env });
   let chainOf;
   let plan;
   const recoveredRefs = new Set();

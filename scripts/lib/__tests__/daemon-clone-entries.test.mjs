@@ -49,6 +49,36 @@ it('throws on unreadable LaunchAgents directory instead of silently narrowing en
   expect(() => cloneRuntimeEntries({ ...f, launchAgentsDir: join(f.dir, 'missing') })).toThrow();
 });
 
+it('discovers entries in the supplied environment HOME without changing the process HOME', () => {
+  const f = fixture();
+  const home = join(f.dir, 'home');
+  const agents = join(home, 'Library', 'LaunchAgents');
+  mkdirSync(agents, { recursive: true });
+  writeFileSync(join(agents, 'com.we.isolated.plist'), 'plist');
+  const ambientHome = process.env.HOME;
+  const calls = [];
+  const result = cloneRuntimeEntries({ root: f.root, env: { HOME: home },
+    run(bin, args) {
+      calls.push(args.at(-1));
+      return { status: 0, stdout: JSON.stringify({
+        ProgramArguments: ['node', join(realpathSync(f.root), 'isolated.mjs')],
+      }) };
+    },
+  });
+  expect(result).toContain('isolated.mjs');
+  expect(calls).toEqual([join(agents, 'com.we.isolated.plist')]);
+  expect(process.env.HOME).toBe(ambientHome);
+});
+
+it('fails closed when the supplied HOME has no readable LaunchAgents directory', () => {
+  const f = fixture();
+  let spawned = false;
+  expect(() => cloneRuntimeEntries({ root: f.root, env: { HOME: join(f.dir, 'missing-home') },
+    run() { spawned = true; },
+  })).toThrow();
+  expect(spawned).toBe(false);
+});
+
 it.each([
   { status: 1, stdout: '' }, { status: 0, stdout: '{' },
   { status: 0, stdout: '{}' }, { status: 0, stdout: '{"ProgramArguments":[42]}' },
