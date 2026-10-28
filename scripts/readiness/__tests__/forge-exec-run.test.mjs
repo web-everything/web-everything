@@ -2,7 +2,7 @@
 import {beforeEach, afterEach, describe, it, expect, vi} from 'vitest';
 import {mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat, readdir, utimes, realpath} from 'node:fs/promises';
 import {join} from 'node:path';
-import minimatch from 'minimatch';
+import micromatch from 'micromatch';
 import {createHash} from 'node:crypto';
 import {spawn, spawnSync} from 'node:child_process';
 import {once} from 'node:events';
@@ -945,15 +945,15 @@ if (globalThis.loaded !== ${tests.length}) process.exit(9);
 
   it('PARITY: every repository Vitest include glob selects only manifest test files', async () => {
     // Vitest 1.6 has no list command. Read the actual unit include array and use
-    // minimatch (installed locally), independently of isTestFile.
+    // micromatch (declared in package.json), independently of isTestFile.
     const config = await readFile(new URL('../../../vitest.config.ts', import.meta.url), 'utf8');
     const section = config.match(/^    include: \[([\s\S]*?)^    \],/m);
     expect(section, 'find the real test.include array, not coverage.include').not.toBeNull();
     const globs = [...section[1].matchAll(/^\s*'([^']+)'/gm)].map(match => match[1]);
     expect(globs.length).toBeGreaterThan(0);
-    const matches = name => globs.some(glob => minimatch(name, glob));
+    const matches = name => globs.some(glob => micromatch.isMatch(name, glob));
     // Expand each real glob into concrete root/nested and extension variants.
-    const positives = globs.flatMap(glob => minimatch.braceExpand(glob)
+    const positives = globs.flatMap(glob => micromatch.braces(glob, {expand: true})
       .flatMap(pattern => ['', 'nested/'].map(depth => pattern.replaceAll('**/', depth).replaceAll('*', 'identity'))));
     const names = [...new Set([...positives, 'scripts/__tests__/support.json',
       'scripts/__tests__/credentials.js', 'notes.test.txt', 'support.js'])];
