@@ -418,6 +418,22 @@ describe('archived sources remain represented in preparation', () => {
     expect(f.refs()).toEqual(['x']);
   });
 
+  // A bound input came from a registration that had an id; a legacy entry with none (e.g. restored from an archive
+  // made before ids existed) is some other registration, whatever its PR says.
+  it.each([null, 2])('a bound adopted input never pins a legacy registration with no registrationId (pr=%s)', async (pr) => {
+    const f = fixture();
+    writeOverlays(root, [{ ref: 'x', pr, addedAt: '2026-09-01T00:00:00.000Z' }], { env: f.env });
+    writeRebuildState(root, { adopted: { head: '1'.repeat(40), mainSha: '1'.repeat(40), at: '2026-10-02T00:00:00.000Z',
+      applied: [{ ref: 'x', pr: 2, sha: A, registrationId: 'r2' }] } }, f.env);
+    const next = await f.prepare({ run: (args) => {
+      if (args[0] === 'fetch' && args.some((a) => a.includes('heads/x:'))) return { status: 1, stdout: '' };
+      if (args[0] === 'diff' && args.includes(A)) return { status: 0, stdout: 'scripts/lib/daemon-rebuild.mjs\n' };
+      return f.git(args);
+    } });
+    expect(next.result.reason).not.toBe('pinned-overlay-unavailable');
+    expect(f.refs()).toEqual(['x']);
+  });
+
   // Live overlay lists predate registrationIds and mostly carry `pr: null`, so most adopted inputs are unbound:
   // ref + PR cannot tell registrations apart. Such an input pins only a registration that existed at adoption.
   it.each([

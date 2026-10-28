@@ -342,6 +342,7 @@ export function recordEdgeResolution(root, ref, {
  * Does an adopted build's applied input come from this registration? Matched on registrationId, and PR when both
  * name one, so a re-registered ref never inherits the previous registration's pin or tip. A record or entry from
  * before applied inputs carried a registrationId cannot prove a new registration: ref + PR decides, failing closed —
+ * a bound input never matches an entry without a registrationId, since binding requires one ({@link prepareRebuild}) —
  * except that an unbound input never belongs to a registration made after its inputs were captured
  * (`applied.capturedAt`, else the build's `adoptedAt`).
  * @param {{adoptedAt?: string}} [o]
@@ -356,8 +357,8 @@ export function sameRegistration(applied, entry, { adoptedAt } = {}) {
     const adopted = Date.parse(applied.capturedAt ?? adoptedAt ?? '');
     return !(Number.isFinite(registered) && Number.isFinite(adopted) && registered > adopted);
   }
-  if (id.registrationId == null) return true;
-  return applied.registrationId === id.registrationId;
+  // A bound input was bound only to a registration carrying an id: an entry without one is another registration.
+  return id.registrationId != null && applied.registrationId === id.registrationId;
 }
 
 /**
