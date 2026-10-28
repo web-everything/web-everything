@@ -4,6 +4,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, symlinkSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   isAllowedCommand, filterEnv, validateRunId, buildRemoteScript,
   runRemote, runWithRemoteFallback, parseArgs,
@@ -101,6 +102,72 @@ function realRemoteFixture(files) {
 }
 
 describe('remote snapshot regressions', () => {
+  it('preserves nested workspace dependencies across cold and warm runs', async () => {
+    const workspace = "packages/deep/worker's space";
+    const files = ['package.json', 'package-lock.json', `${workspace}/package.json`, 'probe.cjs'];
+    // Local tarballs force real npm to install conflicting versions without a registry.
+    for (const version of [1, 2]) {
+      const source = join(cwd, `source-${version}`);
+      mkdirSync(join(source, 'package'), { recursive: true });
+      writeFileSync(join(source, 'package/package.json'), JSON.stringify({ name: 'cache-dependency', version: `${version}.0.0` }));
+      const archive = `dependency-${version}.tgz`;
+      const packed = spawnSync('tar', ['-czf', join(cwd, archive), '-C', source, 'package'], { encoding: 'utf8' });
+      expect(packed.status, packed.stderr).toBe(0);
+      files.push(archive);
+    }
+    mkdirSync(join(cwd, workspace), { recursive: true });
+    writeFileSync(join(cwd, 'package.json'), JSON.stringify({
+      name: 'fixture', version: '1.0.0', workspaces: [workspace],
+      dependencies: { 'cache-dependency': 'file:dependency-1.tgz' },
+      scripts: { 'test:unit': 'node probe.cjs' },
+    }));
+    writeFileSync(join(cwd, workspace, 'package.json'), JSON.stringify({
+      name: 'worker', version: '1.0.0', dependencies: { 'cache-dependency': 'file:../../../dependency-2.tgz' },
+    }));
+    writeFileSync(join(cwd, 'probe.cjs'), `
+const assert = require('node:assert/strict');
+const { createRequire } = require('node:module');
+const worker = createRequire(require('node:path').resolve(${JSON.stringify(workspace)}, 'package.json'));
+const versions = [require('cache-dependency/package.json').version, worker('cache-dependency/package.json').version];
+assert.deepEqual(versions, ['1.0.0', '2.0.0']);
+assert.equal(require('worker/package.json').name, 'worker');
+console.log('RESOLVED ' + versions.join(','));
+`);
+    const f = realRemoteFixture(files);
+    const locked = spawnSync(join(f.bin, 'npm'), ['install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd, encoding: 'utf8', timeout: 20000 });
+    expect(locked.status, locked.stderr).toBe(0);
+    const lock = JSON.parse(readFileSync(join(cwd, 'package-lock.json'), 'utf8'));
+    expect(lock.packages[`${workspace}/node_modules/cache-dependency`].version).toBe('2.0.0');
+    for (const state of ['cold', 'warm']) {
+      const result = await runRemote(f);
+      expect(result, `${state}: ${f.runs.at(-1)?.stderr}`).toEqual({ mode: 'remote', code: 0 });
+      expect(f.runs.at(-1).stdout).toContain('RESOLVED 1.0.0,2.0.0');
+      expect(existsSync(join(f.root, runId))).toBe(false);
+    }
+  }, 120000);
+
+  it('reuses an empty dependency snapshot and falls back if the archive is corrupt', async () => {
+    writeFileSync(join(cwd, 'package.json'), JSON.stringify({
+      name: 'fixture', version: '1.0.0', scripts: { 'test:unit': 'node -e "console.log(\'COMMAND_RAN\')"' },
+    }));
+    writeFileSync(join(cwd, 'package-lock.json'), JSON.stringify({
+      name: 'fixture', version: '1.0.0', lockfileVersion: 3,
+      packages: { '': { name: 'fixture', version: '1.0.0' } },
+    }));
+    const f = realRemoteFixture(['package.json', 'package-lock.json']);
+    for (const state of ['cold', 'warm']) {
+      expect(await runRemote(f), `${state}: ${f.runs.at(-1)?.stderr}`).toEqual({ mode: 'remote', code: 0 });
+      expect(f.runs.at(-1).stdout).toContain('COMMAND_RAN');
+    }
+    const hash = createHash('sha256').update(readFileSync(join(cwd, 'package-lock.json'))).digest('hex');
+    writeFileSync(join(f.root, '.cache', hash, 'dev-v2/dependencies.tar'), 'corrupt archive');
+    const log = vi.fn();
+    expect(await runWithRemoteFallback({ ...f, log })).toBe(7);
+    expect(f.runs.at(-1).stdout).not.toContain('COMMAND_RAN');
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('ambiguous-result'));
+    expect(existsSync(join(f.root, runId))).toBe(false);
+  }, 120000);
+
   it('copies rsync comment-like and shell-special filenames literally through the real transport', async () => {
     const files = ['#required-fixture.json', ';required-fixture.json', 'two words', "quote'`$()", '--option', 'é\u2028fixture', '＃invisible\u200b', 'tab\tfile', 'trailing '];
     const f = realRemoteFixture(['package-lock.json', ...files]);
@@ -225,7 +292,7 @@ describe('buildRemoteScript', () => {
   it('installs dev dependencies under production and invalidates the old incomplete cache profile', () => {
     const script = buildRemoteScript({ runId, lockHash, env: { NODE_ENV: 'production' }, argv });
     expect(script).toMatch(/npm ci --include=dev\b/);
-    expect(script).toContain(`/srv/forge-exec/.cache/${lockHash}/dev-v1/node_modules`);
+    expect(script).toContain(`/srv/forge-exec/.cache/${lockHash}/dev-v2/dependencies.tar`);
     expect(script).toContain("NODE_ENV='production'");
   });
   it('names the run/cache paths, enables nounset, installs an EXIT trap, and excludes secrets', () => {
@@ -268,8 +335,9 @@ process.exit(3);
     const quote = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
     writeFileSync(join(bin, 'npm'), `#!/bin/bash\nexec ${quote(process.execPath)} ${quote(recorder)} "$@"\n`, { mode: 0o755 });
     const env = { CI: hostile[0], LANG: hostile[1], ...forbiddenEnv };
-    // An old production-only cache must not satisfy the new install profile.
+    // Neither an old production-only cache nor a root-only cache satisfies this profile.
     mkdirSync(join(root, '.cache', lockHash, 'node_modules'), { recursive: true });
+    mkdirSync(join(root, '.cache', lockHash, 'dev-v1/node_modules'), { recursive: true });
     // The env shim supplies a test npm on PATH while retaining the script's env -i semantics.
     // The rm shim observes the receipt just before the EXIT trap removes it.
     const harnessFor = (script) => `

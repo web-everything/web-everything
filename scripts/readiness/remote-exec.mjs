@@ -33,9 +33,9 @@ export function buildRemoteScript({ runId, lockHash, env = {}, argv, retainRun =
     throw new Error('Invalid remote execution parameters');
   }
   const dir = `${ROOT}/${runId}`;
-  // Version the install profile so an older production-only cache is never reused.
+  // Version the install profile so production-only and root-only caches are never reused.
   const cacheRoot = `${ROOT}/.cache/${lockHash}`;
-  const cache = `${cacheRoot}/dev-v1`;
+  const cache = `${cacheRoot}/dev-v2`;
   const cleanEnv = `env -i PATH=/usr/local/bin:/usr/bin:/bin ${Object.entries(filterEnv(env)).map(([k, v]) => `${k}=${quote(v)}`).join(' ')}`;
   return `set -euo pipefail
 mkdir -p ${quote(dir)}
@@ -47,19 +47,25 @@ if command -v flock >/dev/null 2>&1; then
   exec 9>${quote(`${cache}/.lock`)}
   flock -x 9
 fi
-if [ ! -d ${quote(`${cache}/node_modules`)} ]; then
+if [ ! -f ${quote(`${cache}/dependencies.tar`)} ]; then
   # Install output must not pollute the command's streamed output; show a tail only on failure.
   if ! ${cleanEnv} npm ci --include=dev --ignore-scripts --no-audit --no-fund >.npm-ci.log 2>&1; then tail -n 20 .npm-ci.log >&2; exit 97; fi
   rm -f .npm-ci.log
-  mv node_modules ${quote(`${cache}/node_modules`)}
+  # Keep every installed tree at its relative location, including workspace-local
+  # dependencies. Prune at node_modules: tar already includes its nested packages.
+  find . -type d -name node_modules -prune -print0 > .npm-deps.list
+  tar -cf .npm-deps.tar --null -T .npm-deps.list
+  # Publish only a complete archive; an interrupted writer leaves a cold cache.
+  mv .npm-deps.tar ${quote(`${cache}/dependencies.tar`)}
+  rm -f .npm-deps.list
 else
   # A lock hash does not cover root/workspace manifests. Validate the copied
   # snapshot with npm before trusting a warm cache; never fetch or run scripts.
   if ! ${cleanEnv} npm ci --dry-run --offline --include=dev --ignore-scripts --no-audit --no-fund >.npm-ci.log 2>&1; then tail -n 20 .npm-ci.log >&2; exit 97; fi
   rm -f .npm-ci.log
+  tar -xf ${quote(`${cache}/dependencies.tar`)}
 fi
 touch ${quote(cacheRoot)} ${quote(cache)}
-cp -a --reflink=auto ${quote(`${cache}/node_modules`)} node_modules 2>/dev/null || cp -a ${quote(`${cache}/node_modules`)} node_modules
 if command -v flock >/dev/null 2>&1; then flock -u 9; exec 9>&-; fi
 ran=1
 ${cleanEnv} ${argv.map(quote).join(' ')}
