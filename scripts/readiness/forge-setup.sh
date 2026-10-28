@@ -112,6 +112,9 @@ cat > /etc/cron.daily/forge-exec-prune <<'PRUNE'
 #!/bin/bash
 set -euo pipefail
 # Trusted roots cannot be replaced by the task. find does not follow symlinks.
+# worker-active is a protected directory, deliberately excluded from receipt
+# pruning. After interrupted execution, stop ALL forge-exec processes before
+# manually removing /srv/forge-receipts/worker-active; never expire it by age.
 find /srv/forge-exec -mindepth 1 -maxdepth 1 -type d -name 'r-*' -mmin +1440 -exec rm -rf -- {} +
 find /srv/forge-receipts -mindepth 1 -maxdepth 1 -type f -mmin +1440 -delete
 find /srv/forge-cache -mindepth 1 -maxdepth 1 -type d -mmin +20160 -exec rm -rf -- {} +

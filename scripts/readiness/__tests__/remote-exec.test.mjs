@@ -335,6 +335,18 @@ describe('validateRunId', () => {
 });
 
 describe('runRemote', () => {
+  it.each([[], ['--','--files=scripts/readiness/remote-exec.mjs']].map(args => [args]))('runs Git-dependent standards locally without preparing a snapshot: %j', async (args) => {
+    const f = fixture();
+    f.argv = ['npm','run','check:standards',...args];
+    // No vitest.shared.ts: the Git requirement alone must trigger fallback.
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'requires-git-worktree'});
+    const log = vi.fn();
+    expect(await runWithRemoteFallback({...f,log})).toBe(7);
+    expect(f.local).toHaveBeenCalledTimes(1);
+    expect(f.local).toHaveBeenCalledWith(f.argv);
+    expect(f.exec).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('requires-git-worktree'));
+  });
   it.each(['0\n', '97\n', `${'f'.repeat(32)}:0\n`])('falls back locally for an unbound receipt %j', async (receipt) => {
     const f = fixture({ runCode: receipt === '97\n' ? 97 : 0, receipt });
     const log = vi.fn();
@@ -382,7 +394,7 @@ describe('runRemote', () => {
     const log = vi.fn();
     expect(await runWithRemoteFallback({ ...f, log })).toBe(7);
     expect(f.local).toHaveBeenCalledWith(f.argv);
-    expect(log).toHaveBeenCalledWith(expect.stringContaining('unsupported-sibling-dependency'));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining(command === 'check:standards' ? 'requires-git-worktree' : 'unsupported-sibling-dependency'));
     expect(callsOf(f.exec).some((call) => call.file === 'rsync' || isRun(call))).toBe(false);
   });
   it('falls back without exec for a command outside the allowlist', async () => {

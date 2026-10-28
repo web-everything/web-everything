@@ -73,6 +73,9 @@ function safeFiles(files) {
 export async function runRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles } = {}) {
   const fallback = (reason) => ({ mode: 'fallback', reason });
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
+  // Standards inspects Git's work tree and index. The transported snapshot has
+  // neither, so run it through local admission instead of certifying a false failure.
+  if (argv[2] === 'check:standards') return fallback('requires-git-worktree');
   if (!validateRunId(runId) || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host)) return fallback('invalid-parameters');
   try {
     if ((await exec({ file: 'ssh', args: [host, 'true'], cwd })).code !== 0) return fallback('forge-unreachable');

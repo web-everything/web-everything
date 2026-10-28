@@ -2,7 +2,7 @@
 // Installed root:root 0755. No executable source or configuration comes from the task.
 import {spawn} from 'node:child_process';
 import {constants} from 'node:fs';
-import {open, mkdir, readdir, writeFile, rename, rm, lstat, realpath} from 'node:fs/promises';
+import {open, mkdir, readdir, writeFile, rename, rm, rmdir, lstat, realpath} from 'node:fs/promises';
 import {createHash, randomBytes} from 'node:crypto';
 import {join, relative} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -14,7 +14,7 @@ const sha = value => createHash('sha256').update(value).digest('hex');
 export const digestArgv = argv => sha(JSON.stringify(argv));
 export function allowedCommand(argv) {
   return Array.isArray(argv) && argv.length >= 3 && argv.every(a => typeof a === 'string' && !a.includes('\0'))
-    && argv[0] === 'npm' && argv[1] === 'run' && ['test:unit','check:standards'].includes(argv[2])
+    && argv[0] === 'npm' && argv[1] === 'run' && argv[2] === 'test:unit'
     && (argv.length === 3 || argv[3] === '--');
 }
 const ENV_KEYS = ['CI','NODE_ENV','TZ','LANG','LC_ALL','FORCE_COLOR','NO_COLOR'];
@@ -183,6 +183,26 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
       return {...result,code};
     } finally {await rm(status,{force:true});}
   }
+  async function exclusiveWorker(action) {
+    // All work still shares one uid. Serialize across ALL profiles and runners,
+    // before hashing input, until the supervisor has reaped every descendant.
+    // An atomic directory persists across wrapper/supervisor death. Never age
+    // it out: an orphan could still modify another run under the shared uid.
+    const active=join(receipts,'worker-active');
+    await mkdir(active,{mode:0o700}).catch(error=>{
+      if(error.code==='EEXIST') throw new Error('Worker execution busy or interrupted; use local fallback. Operator must stop all forge-exec processes before removing /srv/forge-receipts/worker-active');
+      throw error;
+    });
+    let settled=true;
+    const command=async (...args)=>{
+      settled=false;
+      const result=await workCommand(...args);
+      settled=true;
+      return result;
+    };
+    try {return await action(command);}
+    finally {if(settled) await rmdir(active);}
+  }
   async function cacheCommand(args,work,input) {
     const result=await execute('/usr/bin/tar',args,{cwd:work,env:{PATH:path,LANG:'C'},input});
     if(result.code) throw new Error('Cache archive command failed');
@@ -219,6 +239,7 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
       const prepared=await state(request,'prepared');
       if(!allowedCommand(request.argv) || !allowedEnv(request.env) || !hex(request.lock) || !hex(request.inputDigest)
         || request.argvDigest!==digestArgv(request.argv)) throw new Error('Invalid execution parameters');
+      return exclusiveWorker(async command => {
       const container=join(runs,request.run),work=join(container,'work');
       await directory(container,true); await directory(work);
       if(await digestInput(work)!==request.inputDigest || sha(await readPinned(join(work,'package-lock.json')))!==request.lock) throw new Error('Input digest mismatch');
@@ -247,12 +268,12 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
           if(warm) {
             const expected=(await readPinned(join(profile,'sha256'))).toString();
             if(!hex(expected) || await archiveDigest(archive)!==expected) throw new Error('Cache sha256 mismatch');
-            result=await workCommand([...ci,'--dry-run','--offline'],work,installEnv);
+            result=await command([...ci,'--dry-run','--offline'],work,installEnv);
             if(result.code) throw new Error('npm ci validation failed: '+result.stderr);
-            const extracted=await workCommand(['/usr/bin/tar','-xf','-'],work,installEnv,archive);
+            const extracted=await command(['/usr/bin/tar','-xf','-'],work,installEnv,archive);
             if(extracted.code) throw new Error('Cache extraction failed');
           } else {
-            result=await workCommand(ci,work,installEnv);
+            result=await command(ci,work,installEnv);
             if(result.code) throw new Error('npm ci failed: '+result.stderr);
             const temp=join(profile,'pending-'+randomBytes(8).toString('hex'));
             await cacheCommand(['-cf',temp,'--null','-T','-'],work,(await dependencies(work)).map(name=>name+'\0').join(''));
@@ -261,11 +282,12 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
           }
         } finally {await guard.close();}
         phase='test';
-        result=await workCommand(request.argv,work,{PATH:path,HOME:join(work,'.forge-home'),...request.env});
+        result=await command(request.argv,work,{PATH:path,HOME:join(work,'.forge-home'),...request.env});
       } catch(error) {const code=phase==='install'?97:254; if(phase==='test') phase='supervisor'; result={code,stdout:result.stdout,stderr:String(error.message)};}
       const receipt={...prepared,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code};
       await writeFile(statePath(request.run,'receipt'),JSON.stringify(receipt),{flag:'wx',mode:0o600});
       return result;
+      });
     },
     async finish(request) {
       // Only the protected state is evidence; receipt-like files in work are data.

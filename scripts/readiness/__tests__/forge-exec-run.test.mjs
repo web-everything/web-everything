@@ -1,6 +1,6 @@
 // @vitest-environment node
 import {beforeEach, afterEach, describe, it, expect, vi} from 'vitest';
-import {mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat, readdir, utimes} from 'node:fs/promises';
+import {mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat, readdir, utimes, realpath} from 'node:fs/promises';
 import {join} from 'node:path';
 import {createHash} from 'node:crypto';
 import {spawn, spawnSync} from 'node:child_process';
@@ -10,7 +10,7 @@ let root, runner, request, work;
 const argv = ['npm','run','test:unit','--','two words',"a'b",'$(touch marker)','line\nbreak'];
 const hash = data => createHash('sha256').update(data).digest('hex');
 beforeEach(async () => {
-  root = await mkdtemp(join(process.env.TMPDIR,'forge-wrapper-'));
+  root = await realpath(await mkdtemp(join(process.env.TMPDIR,'forge-wrapper-')));
   const bin = join(root,'bin');
   await mkdir(bin);
   await symlink(process.execPath,join(bin,'node'));
@@ -41,6 +41,67 @@ exit 3
 });
 afterEach(async () => {await rm(root,{recursive:true,force:true});});
 describe('fixed wrapper security boundary', () => {
+  it('refuses an overlapping run and rechecks its input after the first worker substitutes its assertions', async () => {
+    const other = createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin'});
+    const prepared = await other.prepare({nonce:'c'.repeat(32)});
+    const victim = join(root,'runs',prepared.run,'work');
+    await writeFile(join(victim,'package-lock.json'),'different lock');
+    await writeFile(join(victim,'assertions.cjs'),'process.exit(1)');
+    const second = {...request,...prepared,nonce:'c'.repeat(32),lock:hash('different lock'),inputDigest:await digestInput(victim)};
+    await writeFile(join(root,'bin','npm'), `#!/bin/bash
+if [ "$1" = ci ]; then exit 0; fi
+exec node '${join(root,'task.cjs')}'
+`, {mode:0o755});
+    await writeFile(join(root,'task.cjs'), `
+const fs = require('node:fs');
+if (process.cwd() === ${JSON.stringify(victim)}) require(${JSON.stringify(join(victim,'assertions.cjs'))});
+else {
+  fs.writeFileSync(${JSON.stringify(join(root,'ready'))}, '');
+  const timer = setInterval(() => {
+    if (!fs.existsSync(${JSON.stringify(join(root,'release'))})) return;
+    clearInterval(timer);
+    fs.writeFileSync(${JSON.stringify(join(victim,'assertions.cjs'))}, 'process.exit(0)');
+  }, 10);
+  setTimeout(() => process.exit(2), 5000).unref();
+}
+`);
+    const first = runner.run(request);
+    try {
+      await vi.waitFor(async () => expect((await stat(join(root,'ready'))).isFile()).toBe(true));
+      await expect(other.run(second)).rejects.toThrow('Worker execution busy');
+    } finally {
+      await writeFile(join(root,'release'),'');
+      await first;
+    }
+    expect(await readFile(join(victim,'assertions.cjs'),'utf8')).toBe('process.exit(0)');
+    await expect(other.run(second)).rejects.toThrow('Input digest mismatch');
+    expect(await other.finish(second)).toBeNull();
+    expect(await runner.finish(request)).toMatchObject({phase:'test',code:0});
+  }, 15000);
+  it('keeps an abandoned execution guard closed even after finish and pruning age', async () => {
+    const active = join(root,'receipts','worker-active');
+    await mkdir(active,{mode:0o700});
+    const expired = new Date(Date.now()-30*24*60*60*1000);
+    await utimes(active,expired,expired);
+    await expect(runner.run(request)).rejects.toThrow('Worker execution busy');
+    expect(await runner.finish(request)).toBeNull();
+    expect((await stat(active)).isDirectory()).toBe(true);
+  });
+  it('retains the execution guard when a worker command rejects instead of confirming shutdown', async () => {
+    await writeFile(join(root,'bin','npm'),`#!${process.execPath}
+process.stdout.write('x'.repeat(4*1024*1024+1));
+`,{mode:0o755});
+    expect(await runner.run(request)).toMatchObject({code:97,stderr:'Output limit exceeded'});
+    expect(await runner.finish(request)).toMatchObject({phase:'install',code:97});
+    expect((await stat(join(root,'receipts','worker-active'))).isDirectory()).toBe(true);
+    const next = await runner.prepare({nonce:request.nonce});
+    await expect(runner.run({...request,...next})).rejects.toThrow('Worker execution busy');
+  });
+  it('rejects Git-dependent standards requests at the server boundary', async () => {
+    const command = ['npm','run','check:standards'];
+    await expect(runner.run({...request,argv:command,argvDigest:digestArgv(command)})).rejects.toThrow('Invalid execution parameters');
+    await expect(stat(join(root,'install.log'))).rejects.toThrow();
+  });
   it.each([
     ['npm','--ignore-scripts','run','test:unit'], ['npm','run','test:unit','--help'],
     ['npm','run','test:unit','extra'], ['npm','run','build'], ['sh','-c','true'],
@@ -123,7 +184,7 @@ describe('fixed wrapper security boundary', () => {
     expect((await runner.run(request)).code).toBe(97);
     expect(await runner.finish(request)).toMatchObject({phase:'install',code:97});
   });
-  it('releases the cache profile lock when an installing wrapper is killed', async () => {
+  it('quarantines execution after wrapper death until an operator stops the worker and clears the guard', async () => {
     const npm = join(root,'bin','npm');
     const original = await readFile(npm,'utf8');
     await writeFile(npm,`#!${process.execPath}
@@ -149,10 +210,17 @@ await runner.run(JSON.parse(process.argv[3]));`;
       const [message] = await once(holder,'message',{signal:AbortSignal.timeout(10000)});
       expect(message).toBe('install');
       const blocked = await nextRequest();
-      expect(await runner.run(blocked)).toMatchObject({code:97,stderr:'Cache profile lock unavailable; use local fallback'});
-      expect(await runner.finish(blocked)).toMatchObject({phase:'install',code:97});
+      await expect(runner.run(blocked)).rejects.toThrow('Worker execution busy');
+      expect(await runner.finish(blocked)).toBeNull();
       holder.kill('SIGKILL');
       expect(await exited).toEqual([null,'SIGKILL']);
+      const interrupted = await nextRequest();
+      await expect(runner.run(interrupted)).rejects.toThrow('Worker execution busy');
+      expect(await runner.finish(interrupted)).toBeNull();
+      // Simulate explicit operator recovery only after the orphan is killed.
+      const pid = Number(await readFile(join(root,'install-pid'),'utf8'));
+      process.kill(-pid,'SIGKILL');
+      await rm(join(root,'receipts','worker-active'),{recursive:true});
       await writeFile(npm,original,{mode:0o755});
       // Persisted sentinels from older wrappers must not block recovery either.
       await mkdir(join(root,'cache',request.lock,'dev-v3','.busy'));
@@ -209,8 +277,10 @@ describe('setup and pruning contract', () => {
     const expired=new Date(Date.now()-16*24*60*60*1000);
     const oldRun=join(root,'runs','r-expired'), oldReceipt=join(root,'receipts','expired.receipt');
     const oldCache=join(root,'cache','expired'), newCache=join(root,'cache','fresh');
+    const active=join(root,'receipts','worker-active');
+    await mkdir(active,{mode:0o700});
     await mkdir(oldRun); await writeFile(oldReceipt,'old'); await mkdir(oldCache); await mkdir(newCache);
-    for(const path of [oldRun,oldReceipt,oldCache]) await utimes(path,expired,expired);
+    for(const path of [oldRun,oldReceipt,oldCache,active]) await utimes(path,expired,expired);
     const quote=value=>"'"+value.replaceAll("'", "'\\''")+"'";
     const local=prune.replaceAll('/srv/forge-exec',quote(join(root,'runs')))
       .replaceAll('/srv/forge-receipts',quote(join(root,'receipts')))
@@ -220,6 +290,7 @@ describe('setup and pruning contract', () => {
     for(const path of [oldRun,oldReceipt,oldCache]) await expect(stat(path)).rejects.toThrow();
     expect((await stat(newCache)).isDirectory()).toBe(true);
     expect((await stat(work)).isDirectory()).toBe(true);
+    expect((await stat(active)).isDirectory()).toBe(true);
   });
   it('the production CLI rejects extra argv and oversized requests without accepting test-root environment overrides', () => {
     const source=new URL('../forge-exec-run.mjs',import.meta.url);
