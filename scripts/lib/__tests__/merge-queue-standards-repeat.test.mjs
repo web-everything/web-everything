@@ -75,6 +75,12 @@ describe('repeated deterministic standards failure', () => {
     expect(first.tracker[5969]).toBeUndefined();
     expect(second.tracker[5969]).toBeUndefined();
   });
+  it('treats one commit spelled in a different hex case as the same group', () => {
+    const first = decideStuckDequeues({ entries: [entry('a')], tracker: {}, max: 99, nowMs });
+    const second = decideStuckDequeues({ entries: [entry('A')], tracker: first.tracker, max: 99, nowMs });
+    expect(second.dequeue).toEqual([]);
+    expect(second.tracker[5969]).toMatchObject({ oid: oid('a'), count: 0, fails: [oid('a')] });
+  });
   it('keeps the same enqueue identity across equivalent timestamp spellings', () => {
     const first = decideStuckDequeues({ entries: [entry('a')], tracker: {}, max: 99, nowMs });
     const second = decideStuckDequeues({ entries: [entry('b', { enqueuedAt: '2026-10-26T10:39:00.000Z' })], tracker: first.tracker, max: 99, nowMs });

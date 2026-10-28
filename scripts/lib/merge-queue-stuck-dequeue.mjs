@@ -52,15 +52,17 @@ export function decideStuckDequeues({ entries, tracker, max, nowMs = Date.now() 
       && Date.parse(previous.enqueuedAt) === Date.parse(entry.enqueuedAt)
       && typeof previous?.oid === 'string' && /^[a-f0-9]{40}$/i.test(previous.oid)
       && Number.isSafeInteger(previous.count) && previous.count >= 0 && previous.count < Number.MAX_SAFE_INTEGER;
-    const count = validPrevious ? previous.count + (previous.oid !== entry.groupOid ? 1 : 0) : 0;
+    // Commit ids are hex in either case: compare and persist them lowercased, so one commit never counts twice.
+    const groupOid = trackable ? entry.groupOid.toLowerCase() : entry.groupOid;
+    const count = validPrevious ? previous.count + (previous.oid.toLowerCase() !== groupOid ? 1 : 0) : 0;
     const fails = validPrevious && Array.isArray(previous.fails)
-      ? [...new Set(previous.fails.filter(oid => typeof oid === 'string' && /^[a-f0-9]{40}$/i.test(oid)))].slice(-5) : [];
+      ? [...new Set(previous.fails.filter(oid => typeof oid === 'string' && /^[a-f0-9]{40}$/i.test(oid)).map(oid => oid.toLowerCase()))].slice(-5) : [];
     const standardsFailing = entry.state !== 'MERGEABLE' && entry.ci === 'FAILURE' && entry.failedChecks?.includes('standards');
-    if (standardsFailing && trackable && !fails.includes(entry.groupOid)) {
-      fails.push(entry.groupOid);
+    if (standardsFailing && trackable && !fails.includes(groupOid)) {
+      fails.push(groupOid);
       if (fails.length > 5) fails.shift();
     }
-    if (trackable) next[entry.num] = { oid: entry.groupOid, count, enqueuedAt: entry.enqueuedAt, ...(fails.length ? { fails } : {}) };
+    if (trackable) next[entry.num] = { oid: groupOid, count, enqueuedAt: entry.enqueuedAt, ...(fails.length ? { fails } : {}) };
     const kind = entry.state === 'UNMERGEABLE' ? 'unmergeable'
       : standardsFailing && fails.length >= 2 ? 'standards-failed-twice'
       : entry.state === 'AWAITING_CHECKS' && count >= max ? 'rebuilds' : null;
