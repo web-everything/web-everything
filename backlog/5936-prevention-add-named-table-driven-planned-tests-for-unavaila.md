@@ -3,9 +3,10 @@ bornAs: xt2bbdn
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:backlog/5762-fixer-lease-generation-and-an-owner-check-before-every-enque.md"]
 dateOpened: "2026-10-12"
+dateResolved: "2026-10-27"
 tags: []
 ---
 

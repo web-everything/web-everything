@@ -1,0 +1,49 @@
+---
+bornAs: xuca7vb
+kind: story
+size: 3
+parent: "4075"
+status: closed
+closedReason: duplicate
+closedInto: "7233"
+dateClosed: "2026-10-26"
+scope: ["we:scripts/operations/needs-you-feed.mjs", "we:vitest.globalSetup.mjs", "we:scripts/operations/__tests__/needs-you-feed.test.mjs", "we:./__tests__/vitest.globalSetup.test.mjs"]
+dateOpened: "2026-10-25"
+tags: []
+---
+
+# Prevention — Return a discriminated result from the ledger, such as {status:'ruled'|'none'|'accepted'}, and su… (from web-everything/web-everything#5944 review)
+
+> **DUPLICATE OF #7233 — closed as such.** This copy was minted as #7274 with the same `bornAs` (`xgcpm6z`) as #7233, which main already held, so the drain would not enqueue it. It is re-keyed to a fresh hash id so the identity stays with #7233, the real item.
+
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+
+1. `we:scripts/operations/needs-you-feed.mjs:243` — Return a discriminated result from the ledger, such as `{status:'ruled'|'none'|'accepted'}`, and suppress only on the ruled status. Add a test per null cause.
+2. `we:vitest.globalSetup.mjs:30` — Add a deterministic test matrix covering child-process event writes under both hermetic and non-hermetic setup, with an explicit assertion that the seeded operator stream remains unchanged.
+3. `we:vitest.globalSetup.mjs:30` — Add the named subprocess isolation regression test to the deterministic test gate, including an explicit pre-existing operator event-path override.
+
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5944@da35416ed91c17012193cd33e34f09d86f6c4216
+
+## Acceptance
+
+- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+
+Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+
+Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+
+## Non-goals
+
+- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+
+## Edge cases this change must handle
+
+One line per class: either the handling, or `n/a: <why>`.
+
+1. **Untrusted text** — TODO: the handling, or n/a: <why>.
+2. **Truncated reads** — TODO: the handling, or n/a: <why>.
+3. **Shared state files** — TODO: the handling, or n/a: <why>.
+4. **Fail closed** — TODO: the handling, or n/a: <why>.
+5. **Identity scoping** — TODO: the handling, or n/a: <why>.
+6. **State over time** — TODO: the handling, or n/a: <why>.
+7. **Who wrote it** — TODO: the handling, or n/a: <why>.

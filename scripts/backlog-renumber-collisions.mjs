@@ -40,7 +40,8 @@ import { readdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { planRenumber, parseBacklogFilename } from './backlog/renumber-collisions.mjs';
+import { planRenumber, parseBacklogFilename, findCollisions } from './backlog/renumber-collisions.mjs';
+import { collisionNumberingConstraints, reserveCollisionNumbers } from './lib/card-number-allocator.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const DIR = join(ROOT, 'backlog');
@@ -93,10 +94,10 @@ function baseNums() {
   const ref = flag('base-ref');
   if (!ref) return [];
   try {
-    const out = execFileSync('git', ['ls-tree', '-r', '--name-only', ref, '--', 'backlog/'], { cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    const out = execFileSync('git', ['ls-tree', '-r', '--name-only', '-z', ref, '--', 'backlog/'], { cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
     const nums = [];
-    for (const line of out.split('\n')) {
-      const m = line.match(/^backlog\/(\d+)-.+\.md$/);
+    for (const line of out.split('\0')) {
+      const m = line.match(/^backlog\/(\d+)-[^/]+\.md$/);
       if (m) nums.push(m[1]);
     }
     return nums;
@@ -112,8 +113,8 @@ function ontoNames() {
   const ref = flag('onto-ref');
   if (!ref) return [];
   try {
-    const out = execFileSync('git', ['ls-tree', '-r', '--name-only', ref, '--', 'backlog/'], { cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-    return out.split('\n').map((l) => l.match(/^backlog\/(\d+-.+\.md)$/)?.[1]).filter(Boolean);
+    const out = execFileSync('git', ['ls-tree', '-r', '--name-only', '-z', ref, '--', 'backlog/'], { cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    return out.split('\0').map((l) => l.match(/^backlog\/(\d+-[^/]+\.md)$/)?.[1]).filter(Boolean);
   } catch {
     process.stderr.write(`${YEL}⚠ could not read published ids from onto-ref "${ref}" (${DIM}not found?${RST}${YEL}) — proceeding with the ordinal heuristic.${RST}\n`);
     return [];
@@ -130,19 +131,33 @@ function main() {
   }));
   const base = baseNums();
   const onto = ontoNames();
-  const plan = planRenumber(files, { baseNums: base, ontoNames: onto });
-
-  if (plan.collisions.length === 0) {
+  const baseSet = new Set(base);
+  const ontoSet = new Set(onto);
+  // Match the planner's published/base guards without allocating a provisional
+  // number: a local max+1 could be exhausted even when a remote gap is usable.
+  const needsNumber = findCollisions(files).some(({ num, files: group }) => {
+    const hasPublished = group.some(({ name }) => ontoSet.has(name));
+    return hasPublished ? group.some(({ name }) => !ontoSet.has(name)) : !baseSet.has(num);
+  });
+  if (!needsNumber) {
     if (JSON_MODE) process.stdout.write(JSON.stringify({ renumbered: [], writes: 0, deletes: 0, noop: true }) + '\n');
     else process.stdout.write(`${GRN}✓${RST} No new-item id collision on the merged tree — no-op.\n`);
     return 0;
   }
+  const numberingGit = (args, options = {}) => execFileSync('git', args, {
+    cwd: ROOT, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, ...options,
+  });
+  const constraints = collisionNumberingConstraints(numberingGit);
+  const plan = planRenumber(files, { baseNums: base, ontoNames: onto, ...constraints });
 
   if (DRY) {
     if (JSON_MODE) process.stdout.write(JSON.stringify({ dryRun: true, ...planSummary(plan) }) + '\n');
     else process.stdout.write(`${BLD}Renumber plan (dry-run — nothing written):${RST}\n${plan.summary}\n`);
     return 0;
   }
+
+  reserveCollisionNumbers(plan, numberingGit, constraints.reservationRemote);
 
   // Execute the refile: write every touched/new file, then unlink each yielded old file. fs ops — the
   // guard-bash `git mv`/`rm` block is on SHELL commands, not this sanctioned script's fs writes.

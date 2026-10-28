@@ -189,6 +189,9 @@ export default defineConfig({
       'scripts/__tests__/rust-scan-locus-prefix-parity.test.mjs',
       'scripts/__tests__/rust-scan-citation-check-parity.test.mjs',
       'scripts/__tests__/gate-entrypoint-integration.test.mjs',
+      // Real origin/author/clone fixtures with multiple rebuilds per test. CI shard 4 hit the 5s deadline;
+      // keep the assertions and deadline in the blocking integration tier's serial fork instead.
+      'scripts/lib/__tests__/daemon-rebuild-keep-established.test.mjs',
       'scripts/operations/__tests__/wake-cli.test.mjs',
       'scripts/__tests__/lane-pool-acquire-base.test.mjs',
       'scripts/__tests__/publish-secret-gate.test.mjs',

@@ -1,5 +1,5 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
-import { mkdirSync, readFileSync, statSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { hostname } from 'node:os';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
@@ -7,32 +7,104 @@ import { listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operation
 import { readFilteredInOrder } from './stream-filter-runs.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { pidAlive, pidNamespace, pidStartTime } from './pid-alive.mjs';
-import { redTeamEnabled, redTeamOwedFor } from './review-red-team-policy.mjs';
+import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { readRedTeamProbes } from './red-team-gate.mjs';
 import { completedRedTeamSeat } from './red-team-run-result.mjs';
+import { readRedTeamCarry } from './red-team-carry-machine.mjs';
 
 export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDir(env)), 'red-team-status');
 const statusPath = ({ repo, pr, head }, env) => join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
 
-/** Read the head-bound status; unreadable evidence is an error, absence is null. */
+/** The exclusive retry marker is the durable spend; a status file restored without it cannot refund it. */
+function retryMarkerSpent(path) {
+  try { statSync(`${path}.retry-1`); return true; }
+  catch (e) { if (e.code === 'ENOENT') return false; throw e; }
+}
+
+/** Read the head-bound status; unreadable evidence is an error, absence is null.
+ * A surviving retry marker is folded into retryCount, and a marker without its status is incomplete evidence.
+ */
 export function readRedTeamStatus({ repo, pr, head, env = process.env } = {}) {
+  const path = statusPath({ repo, pr, head }, env);
+  const status = readStatusFile(path, { repo, pr, head });
+  if (status === null && retryMarkerSpent(path)) throw Error('red-team retry marker has no status; inspect stored evidence');
+  return status;
+}
+
+/** Absence is null even beside a marker: only the writer may read that state, and it keeps the marker's spend. */
+function readStatusFile(path, { repo, pr, head }) {
+  let status;
   try {
-    const status = JSON.parse(readFileSync(statusPath({ repo, pr, head }, env), 'utf8'));
-    if (!status || status.repo !== repo || Number(status.pr) !== Number(pr) || status.head !== head) throw Error('red-team status identity mismatch');
-    return status;
-  } catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+    status = JSON.parse(readFileSync(path, 'utf8'));
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+    return null;
+  }
+  if (!status || status.repo !== repo || !['number', 'string'].includes(typeof status.pr)
+    || Number(status.pr) !== Number(pr) || status.head !== head) {
+    throw Object.assign(Error('red-team status identity mismatch'), { code: 'RED_TEAM_STATUS_IDENTITY' });
+  }
+  return [undefined, 0].includes(status.retryCount) && retryMarkerSpent(path) ? { ...status, retryCount: 1 } : status;
 }
 
 /** A status is written before settling speculation or starting the sequential pass; crashes leave a dead pid. */
-export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = null }, { env = process.env, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime } = {}) {
+export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = null, retryCount, refundRetry = false }, { env = process.env, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime } = {}) {
   const head = loopPayload?.findings?.read?.netBasis?.rev;
   if (!/^[a-f0-9]{40}$/i.test(head ?? '')) return;
   const path = statusPath({ repo, pr, head }, env);
   mkdirSync(dirname(path), { recursive: true });
+  // Retry admission survives running/finished rewrites, including lost seat-row appends.
+  // A marker left by a failed status write must not wedge this writer: `claimed` below keeps its spend.
+  let prior;
+  try { prior = readStatusFile(path, { repo, pr, head }); }
+  catch (error) {
+    // Without a retry marker, ordinary writers may repair damaged JSON just as before retry admission.
+    // Preserve marked evidence for inspection, and propagate filesystem errors even without a marker.
+    if (retryMarkerSpent(path) || (!(error instanceof SyntaxError) && error.code !== 'RED_TEAM_STATUS_IDENTITY')) throw error;
+    prior = null;
+  }
+  const spent = prior?.retryCount;
+  if (spent !== undefined && (!Number.isSafeInteger(spent) || spent < 0)) throw Error('invalid red-team retry count');
+  if (retryCount !== undefined && (!Number.isSafeInteger(retryCount) || retryCount < 0)) throw Error('invalid red-team retry count');
+  const retryMarker = `${path}.retry-1`;
+  // A refund returns this writer's own spend after a settlement that launched no model call. A reservation
+  // moves the status to running, so only the still-queued admission record may refund; anything else keeps it.
+  // A crash after removing the marker leaves the queued retryCount, which still counts as spent.
+  // Any other record keeps the spend: the write below then proceeds as an ordinary settlement.
+  // The start time rules out a later process that reused a dead admitter's pid.
+  const refund = refundRetry === true && retryCount === undefined && prior?.status === 'queued' && prior.retryCount === 1
+    && prior.pid === process.pid && prior.host === host && prior.pidNamespace === namespace
+    && prior.pidStart === readPidStart(process.pid);
+  if (refund) rmSync(retryMarker, { force: true });
+  // The exclusive create is the spend: status read/write/read cannot arbitrate workers.
+  // Keep the marker even if the subsequent write fails; an operator must inspect that attempt.
+  if (retryCount === 1) {
+    if (spent >= 1) throw Object.assign(Error('retry already admitted'), { code: 'RED_TEAM_RETRY_ADMITTED' });
+    let fd;
+    try { fd = openSync(retryMarker, 'wx', 0o600); }
+    catch (e) {
+      if (e.code === 'EEXIST') throw Object.assign(Error('retry already admitted'), { code: 'RED_TEAM_RETRY_ADMITTED' });
+      throw e;
+    }
+    closeSync(fd);
+  }
+  let claimed = 0;
+  try { statSync(retryMarker); claimed = 1; }
+  catch (e) { if (e.code !== 'ENOENT') throw e; }
+  const durableRetryCount = refund ? claimed : Math.max(spent ?? 0, retryCount ?? 0, claimed);
   // skipCardOnly is the writer's resolved setting, NOT evidence that this PR is card-only.
   // Consumers must classify the stored net read; the drain may resolve a different setting in its own process.
-  writeJsonAtomic(path, { repo, pr, head, loopPayload, status, result, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly,
+  writeJsonAtomic(path, { repo, pr, head, loopPayload, status, result,
+    ...(durableRetryCount > 0 ? { retryCount: durableRetryCount } : {}), skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly,
     pid: process.pid, host, pidNamespace: namespace, pidStart: readPidStart(process.pid) });
+}
+
+/** Each conjunct is independently pinned by the historical fallback predicate tests. PURE. */
+export function historicalCardOnlySkipCandidate(old) {
+  const prior = old?.status;
+  return prior?.status === 'finished' && prior.skipCardOnly === true
+    && (typeof prior.result === 'string' ? prior.result : prior.result?.status) === 'skipped'
+    && !old.recorded && !old.inFlight && !old.queued;
 }
 
 /** Absence of a review payload is not an accept. Labels alone never schedule a post-accept pass. */
@@ -42,13 +114,14 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   const seats = readScorecards().filter(row => row.dispatchKind === 'review-seat' && row.seat === 'red-team'
     && row.repo === repo && Number(row.pr) === Number(pr) && row.rev === head);
   const recorded = seats.length > 0;
-  const seatEvidence = { seatRecorded: recorded, completedRecorded: seats.some(completedRedTeamSeat) };
+  const seatEvidence = { seatRecorded: recorded, completedRecorded: seats.some(completedRedTeamSeat),
+    failedSeatCount: seats.filter(row => !completedRedTeamSeat(row)).length };
   // Runs are immutable in identity but updated in place: choose the latest read of this exact repo/PR/head.
-  const latestRun = () => {
+  const latestRun = (exactHead = true) => {
     // Read, test and drop one run at a time (xwu9oxh S1a): same reads, order and errors as map-then-filter.
     const hits = readFilteredInOrder(list(runsDir).filter(id => id.startsWith('review-pr-')), id => read(id, runsDir),
       run => run?.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr)
-        && run.findings?.read?.netBasis?.rev === head, (run, id) => ({ id, run }))
+        && (!exactHead || run.findings?.read?.netBasis?.rev === head), (run, id) => ({ id, run }))
       .map(hit => ({ ...hit, at: statSync(join(runsDir, `${hit.id}.json`)).mtimeMs }));
     hits.sort((a, b) => b.at - a.at);
     return { run: hits[0]?.run ?? null, at: hits[0]?.at ?? 0 };
@@ -62,6 +135,27 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     status = JSON.parse(readFileSync(statusPath({ repo, pr, head }, env), 'utf8'));
     statusAt = statSync(statusPath({ repo, pr, head }, env)).mtimeMs;
   } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  const carry = readRedTeamCarry({ repo, pr, head, env });
+  const carriedFrom = carry?.loopPayload.carriedFrom ?? status?.loopPayload?.carriedFrom;
+  if (carriedFrom) {
+    const latest = latestRun(false).run;
+    const laterPanel = latest && latest.findings?.read?.netBasis?.rev !== carriedFrom;
+    const ownStatus = status === undefined || (status?.repo === repo && Number(status.pr) === Number(pr) && status.head === head
+      && (status.loopPayload?.carriedFrom === carriedFrom || (status.head === carriedFrom && status.skipCardOnly === true))
+      && status.status === 'finished'
+      && (status.result === 'skipped' || (status.result?.status === 'skipped' && status.result.policy === 'card-only')));
+    if (laterPanel || (carry && !ownStatus) || recorded) {
+      return { loopPayload: latest, status, carryConflict: true, inFlight: false,
+        recorded, ...seatEvidence, scheduled: false };
+    }
+    if (carry) {
+      // The journal survives a crash before the compatibility status exists. Never invent an accept.
+      const projected = { repo, pr, head, loopPayload: carry.loopPayload, status: 'finished',
+        result: { status: 'skipped', policy: 'card-only' }, skipCardOnly: true };
+      return { carry, status: projected, loopPayload: carry.loopPayload, inFlight: false,
+        recorded: false, ...seatEvidence, scheduled: false, skipCardOnly: true };
+    }
+  }
   if (status?.repo === repo && Number(status.pr) === Number(pr) && status.head === head) {
     // A finished status from an earlier review of this same head never supersedes a newer accepting run (a re-review
     // of an unchanged head labels its accept before its job writes `queued`).
@@ -88,10 +182,22 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
         live = !start || !status.pidStart || start === status.pidStart;
       }
     }
-    return { status, loopPayload: status.loopPayload, ...seatEvidence, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
+    // Settlement provenance cannot stand in for a panel verdict, even if an older
+    // writer retained one. Keep the status intact for recovery's provenance checks.
+    const loopPayload = status.loopPayload?.carriedFrom != null ? { ...status.loopPayload, verdict: null } : status.loopPayload;
+    return { status, loopPayload, ...seatEvidence, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
       ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(resultStatus), recorded: recorded || resultStatus === 'ran' };
   }
   const loopPayload = latestRun().run;
+  if (!loopPayload && !recorded) {
+    const older = latestRun(false).run;
+    const oldHead = older?.findings?.read?.netBasis?.rev;
+    if (oldHead && oldHead !== head && redTeamCardOnly(older.findings.read)) {
+      const old = readDrainRedTeamEvidence({ repo, pr, head: oldHead, env, runsDir, list, read,
+        isAlive, host, namespace, readPidStart, readScorecards });
+      if (historicalCardOnlySkipCandidate(old)) return old;
+    }
+  }
   // An owing run with no job status yet: only the job's process knows its card-only skip decision, so hold the head
   // (skip off) until that status records it. The never-scheduled deadline still applies if no job ever writes one.
   return { loopPayload, inFlight: false, scheduled: recorded || owes(loopPayload), recorded, ...seatEvidence, ...(owes(loopPayload) ? { skipCardOnly: false } : {}) };

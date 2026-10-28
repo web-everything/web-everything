@@ -126,6 +126,13 @@ export const TRUST_CHAIN = [
     homes: ['config/deliveryPolicyDefaults.ts'],
   },
   {
+    role: 'delivery-policy-loader',
+    file: 'delivery-policy.mjs',
+    tier: 'engine',
+    desc: 'delivery-flow loader obeys the human-gated policy sources (#5113), like the lander',
+    homes: ['scripts/lib/delivery-policy.mjs'],
+  },
+  {
     role: 'escalation-rubric',
     file: 'review-escalation.mjs',
     tier: 'policy',
@@ -814,7 +821,8 @@ export async function readPolicySpecRegistryAt(ref, { root = resolve(dirname(fil
   let scratch;
   try {
     if (typeof ref !== 'string' || !ref.trim() || ref.startsWith('-')) return null;
-    const options = { cwd: root, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] };
+    // Imported base code can ignore SIGTERM; bounds must terminate it unconditionally.
+    const options = { cwd: root, encoding: 'utf8', timeout: 10000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] };
     // Resolve once so a moving branch cannot supply the registry and dependency from different commits.
     const commit = execFileSync('git', ['rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`], options).trim();
     if (!/^[a-f0-9]{40,64}$/.test(commit)) return null;

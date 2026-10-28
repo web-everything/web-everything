@@ -3,11 +3,12 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { repoKeyForSlug, ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { fixLoopConfig, readFixLoopRows, fixLoopLedgerPath } from './fix-loop-ledger.mjs';
 import { parseOperatorAnswer } from './stand-down-answer-core.mjs';
-import { hasAutoProceedCandidate, classifyStandDownAutoProceed } from './stand-down-auto-proceed.mjs';
+import { hasAutoProceedCandidate, classifyStandDownAutoProceed, boundAutoProceedRuns } from './stand-down-auto-proceed.mjs';
+import { readRequiredCheckBindings } from '../lib/merge-queue-enqueue.mjs';
 import { DEFAULT_PR_SCOPED_CHECKS, resolvePrScopedChecks } from './main-red-recovery.mjs';
 import { withFileLock, writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 
@@ -18,8 +19,22 @@ const gh = (args, options = {}) => JSON.parse(execFileSyncThrottled('gh', args, 
 const ISSUE_COMMENT_WRITE = 'comments';
 const readHead = ({ repo, number }) => gh(['pr', 'view', String(number), '--repo', repo, '--json', 'headRefOid']).headRefOid;
 
+/** Bind the history reader as well as the ledger filter to the reconciled repository. */
+export function readAutoProceedContext({ repo, defaultBranch = 'main', env = process.env }, {
+  readRows = readFixLoopRows,
+  readMainRuns = ({ repo, branch }) => gh(['run', 'list', '--repo', repo, '--branch', branch,
+    '--workflow', 'CI', '--limit', '60', '--json', 'conclusion,status,updatedAt']),
+} = {}) {
+  const key = repoKeyForSlug(repo);
+  if (!key) throw new Error('operator answer required: unknown main-history repository');
+  const slug = ghRepoSlug(repo);
+  return { repo: key, rows: readRows({ env }),
+    config: fixLoopConfig(env, { readMainRuns: () => readMainRuns({ repo: slug, branch: defaultBranch }) }) };
+}
+
 /** Ten pages maximum, with total-count and unique-id proof; filter=all retains earlier failed attempts. */
-export function readAutoProceedChecks({ repo, head }, { read = gh } = {}) {
+export function readAutoProceedChecks({ repo, head, requiredChecks,
+  requiredCheckBindings = readRequiredCheckBindings() }, { read = gh } = {}) {
   const runs = [];
   let total;
   for (let page = 1; page <= 10; page++) {
@@ -28,10 +43,64 @@ export function readAutoProceedChecks({ repo, head }, { read = gh } = {}) {
       || (total !== undefined && data.total_count !== total) || !Array.isArray(data.check_runs)) throw new Error('operator answer required: incomplete or oversized check feed (1000 run limit)');
     total = data.total_count;
     runs.push(...data.check_runs);
-    if (runs.length === total && new Set(runs.map(r => r.id)).size === total) return { head, complete: true, runs };
+    if (runs.length === total && new Set(runs.map(r => r.id)).size === total) {
+      const verifiedRuns = readRerunLineage(runs, { repo, head, requiredChecks, requiredCheckBindings, read });
+      requireGreenCommitStatuses({ repo, head, requiredChecks, read });
+      return { head, complete: true, runs: verifiedRuns };
+    }
     if (data.check_runs.length !== 100 || runs.length >= total) break;
   }
   throw new Error('operator answer required: check pagination incomplete');
+}
+
+/** A same-name check cannot excuse a legacy status. Read all pages, never an aggregate state. */
+function requireGreenCommitStatuses({ repo, head, requiredChecks, read }) {
+  const ids = new Set();
+  for (let page = 1; page <= 10; page++) {
+    const statuses = read(['api', `repos/${repo}/commits/${head}/statuses?per_page=100&page=${page}`]);
+    if (!Array.isArray(statuses) || statuses.length > 100) {
+      throw new Error('operator answer required: incomplete commit status feed');
+    }
+    for (const status of statuses) {
+      if (!Number.isSafeInteger(status?.id) || status.id < 1 || ids.has(status.id)
+        || typeof status.context !== 'string' || !status.context
+        || !['success', 'failure', 'error', 'pending'].includes(status.state)) {
+        throw new Error('operator answer required: invalid or overlapping commit status evidence');
+      }
+      ids.add(status.id);
+      if ((!Array.isArray(requiredChecks) || requiredChecks.includes(status.context)) && status.state !== 'success') {
+        throw new Error('operator answer required: non-green required commit status');
+      }
+    }
+    if (statuses.length < 100) return;
+  }
+  throw new Error('operator answer required: commit status pagination incomplete (1000 status limit)');
+}
+
+/** Check-run IDs order creations, not attempts. Bind duplicate names to actual Actions jobs. */
+function readRerunLineage(runs, { repo, head, requiredChecks, requiredCheckBindings, read }) {
+  const bound = boundAutoProceedRuns(runs, requiredChecks ?? requiredCheckBindings?.map(c => c.context), requiredCheckBindings);
+  if (bound === null) throw new Error('operator answer required: unreadable required-check integration policy');
+  const boundIds = new Set(bound.map(r => r.id));
+  const counts = new Map();
+  for (const r of bound) counts.set(r.name, (counts.get(r.name) ?? 0) + 1);
+  let reads = 0;
+  return runs.map(r => {
+    // Never accept a lineage field from the check feed itself.
+    const { actions: ignored, ...check } = r;
+    if (!boundIds.has(r.id) || counts.get(r.name) < 2) return check;
+    const unavailable = () => { throw new Error('operator answer required: ambiguous rerun lineage'); };
+    if (r.app?.slug !== 'github-actions' || typeof r.details_url !== 'string') return unavailable();
+    const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/actions\/runs\/([1-9]\d*)\/job\/([1-9]\d*)$/.exec(r.details_url);
+    if (!match || match[1] !== repo || !Number.isSafeInteger(Number(match[2]))
+      || !Number.isSafeInteger(Number(match[3]))) return unavailable();
+    if (++reads > 20) throw new Error('operator answer required: rerun lineage exceeds 20 job reads');
+    const job = read(['api', `repos/${repo}/actions/jobs/${match[3]}`]);
+    if (job?.id !== Number(match[3]) || job.run_id !== Number(match[2]) || job.head_sha !== head
+      || job.name !== r.name || job.check_run_url !== `https://api.github.com/repos/${repo}/check-runs/${r.id}`
+      || !Number.isSafeInteger(job.run_attempt) || job.run_attempt < 1) return unavailable();
+    return { ...check, actions: { runId: job.run_id, attempt: job.run_attempt } };
+  });
 }
 
 /** Exclusive, durable intent BEFORE the write: crashes/ambiguous responses require operator inspection. */
@@ -71,9 +140,11 @@ export function selectAutoProceedCandidates(candidates, { repo, env = process.en
 }
 
 /** At most three candidate PRs/tick; all IO injectable. No retries after a write starts. */
-export function enrichPrsWithStandDownAutoProceed(prs, { repo, requiredChecks,
+export function enrichPrsWithStandDownAutoProceed(prs, { repo, requiredChecks, defaultBranch = 'main',
+  readBindings = readRequiredCheckBindings,
+  readRows = readFixLoopRows,
   readComments = (number, o) => readCompletePrComments(number, o), readHead: headReader = readHead,
-  readChecks = readAutoProceedChecks, readContext = () => ({ rows: readFixLoopRows(), config: fixLoopConfig(), repo: repoKeyForSlug(repo) }),
+  readChecks = readAutoProceedChecks, readContext = () => readAutoProceedContext({ repo, defaultBranch, env }, { readRows }),
   readScopedChecks = resolvePrScopedChecks, reserve = reserveAutoProceed,
   selectCandidates = selectAutoProceedCandidates, env = process.env,
   post = ({ repo, number, body }) => gh(['api', `repos/${repo}/issues/${number}/${ISSUE_COMMENT_WRITE}`, '--method', 'POST', '--input', '-'], { input: JSON.stringify({ body }) }),
@@ -81,42 +152,70 @@ export function enrichPrsWithStandDownAutoProceed(prs, { repo, requiredChecks,
 } = {}) {
   const candidates = prs.filter(hasAutoProceedCandidate);
   if (!candidates.length) return prs;
-  let selected, context;
-  try { selected = new Set(selectCandidates(candidates, { repo, env })); }
+  let selected, context, requiredCheckBindings;
+  try {
+    requiredCheckBindings = readBindings();
+    if (boundAutoProceedRuns([], requiredChecks, requiredCheckBindings) === null) {
+      throw new Error('unreadable required-check integration policy');
+    }
+    selected = new Set(selectCandidates(candidates, { repo, env }));
+  }
   catch (e) {
-    log(`R123 candidate cursor unavailable; all holds retained; operator answer remains available: ${String(e.message).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 300)}`);
+    log(`R123 policy/candidate cursor unavailable; all holds retained; operator answer remains available: ${String(e.message).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 300)}`);
     return prs;
   }
   return prs.map(pr => {
     if (!hasAutoProceedCandidate(pr)) return pr;
     if (!selected.has(pr)) { log(`R123 PR #${pr.number}: deferred by 3-PR tick bound; operator answer remains available`); return pr; }
+    // Keep the latest complete thread even when a later decision or IO step refuses the write.
+    let fresh = pr;
+    // Lapse annotations belong to the snapshot, not GitHub's comment feed. Preserve them
+    // by identity across both reads, without carrying them onto an edited or new comment.
+    const lapsed = new Map(pr.comments.filter(c => c?.id != null && c.standDownLapsed).map(c => [c.id, c]));
+    const refreshComments = () => readComments(pr.number, { repo }).map(c => {
+      const previous = lapsed.get(c?.id);
+      return previous && previous.body === c.body
+        ? { ...c, standDownLapsed: previous.standDownLapsed } : c;
+    });
     try {
-      const comments = readComments(pr.number, { repo });
-      const fresh = { ...pr, comments };
+      const comments = refreshComments();
+      fresh = { ...pr, comments };
       // Cheap first pass rejects judgment holds without reading checks or main history.
       if (!hasAutoProceedCandidate(fresh)) return fresh;
-      const checks = readChecks({ repo, head: pr.headRefOid });
+      const checks = readChecks({ repo, head: pr.headRefOid, requiredChecks, requiredCheckBindings });
       try { context ??= readContext(); } catch { context = null; } // Cases a/b do not depend on main's ledger.
       const scoped = readScopedChecks() ?? DEFAULT_PR_SCOPED_CHECKS;
-      const decision = classifyStandDownAutoProceed({ pr: fresh, requiredChecks, checks,
+      const decision = classifyStandDownAutoProceed({ pr: fresh, requiredChecks, requiredCheckBindings, checks,
         redMainContext: context, prScopedChecks: scoped });
       if (decision.action !== 'auto-proceed') { log(`R123 PR #${pr.number}: ${decision.why}`); return fresh; }
       // A later operator question/answer may have arrived during check reads. Reclassify that full thread.
-      const currentComments = readComments(pr.number, { repo });
-      const current = classifyStandDownAutoProceed({ pr: { ...pr, comments: currentComments }, requiredChecks, checks,
+      const currentComments = refreshComments();
+      fresh = { ...pr, comments: currentComments };
+      const current = classifyStandDownAutoProceed({ pr: fresh, requiredChecks, requiredCheckBindings, checks,
         redMainContext: context, prScopedChecks: scoped });
-      if (current.action !== 'auto-proceed' || current.standDownId !== decision.standDownId) return pr;
+      if (current.action !== 'auto-proceed' || current.standDownId !== decision.standDownId) return fresh;
+      // A rerun can start or fail on the same SHA while comments/main history are read.
+      // Revalidate both feeds before reserving the sole post, and publish the fresh evidence.
+      const latestChecks = readChecks({ repo, head: pr.headRefOid, requiredChecks, requiredCheckBindings });
+      const latest = classifyStandDownAutoProceed({ pr: fresh, requiredChecks, requiredCheckBindings, checks: latestChecks,
+        redMainContext: context, prScopedChecks: scoped });
+      const knownFailures = new Set(checks.runs.filter(r => String(r.conclusion).toUpperCase() === 'FAILURE').map(r => r.id));
+      if (latest.action !== 'auto-proceed' || latest.standDownId !== decision.standDownId
+        || boundAutoProceedRuns(latestChecks.runs, requiredChecks, requiredCheckBindings).some(r =>
+          String(r.conclusion).toUpperCase() === 'FAILURE' && !knownFailures.has(r.id))) {
+        log(`R123 PR #${pr.number}: checks changed before post; operator hold retained`); return fresh;
+      }
       if (headReader({ repo, number: pr.number }) !== pr.headRefOid) throw new Error('head moved; operator hold retained');
       if (!reserve({ repo, number: pr.number, standDownId: decision.standDownId, env })) {
         log(`R123 PR #${pr.number}: answer already reserved; inspect thread before any manual retry`); return fresh;
       }
-      const posted = post({ repo, number: pr.number, body: decision.body });
+      const posted = post({ repo, number: pr.number, body: latest.body });
       const comment = { ...posted, author: posted?.author ?? posted?.user };
-      if (comment.body !== decision.body || !parseOperatorAnswer(comment)) throw new Error('posted answer principal/record unverified; inspect thread');
+      if (comment.body !== latest.body || !parseOperatorAnswer(comment)) throw new Error('posted answer principal/record unverified; inspect thread');
       return { ...fresh, comments: [...currentComments, comment] };
     } catch (e) {
       log(`R123 PR #${pr.number}: operator answer required; inspect thread/reservation: ${String(e.message).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 300)}`);
-      return pr;
+      return fresh;
     }
   });
 }

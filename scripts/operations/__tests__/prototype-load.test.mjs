@@ -50,6 +50,11 @@ function fixture(options = {}) {
       if (options.alertsReadError && p.endsWith('.alerts.jsonl')) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
       if (p.endsWith('.alerts.jsonl')) return options.alerts || '';
       if (p.endsWith('.events.jsonl')) return options.events || '';
+      if (p.endsWith('.rebuild.json')) {
+        if (options.rebuildStateReadError) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+        if (options.rebuildStateRaw !== undefined) return options.rebuildStateRaw;
+        if (options.rebuildState !== undefined) return JSON.stringify(options.rebuildState);
+      }
       const e = new Error('missing'); e.code = 'ENOENT'; throw e;
     },
     mkdirSync() {}, appendFileSync(p, line) { records.push({ path: p, ...JSON.parse(line) }); },
@@ -1314,6 +1319,41 @@ describe('prototype-load', () => {
   });
   it('adoption-timeout bounds injected polling and retains registration', async () => {
     const f = fixture({ timeout: true }); const r = await f.run(); expect(r.stopReason).toBe('adoption-timeout'); expect(r.registered).toBe(true); expect(r.adopted).toBe(false); expect(f.sleeps).toEqual([10, 10, 10]);
+  });
+  it.each([undefined, '/custom/rebuild-state'])('adoption timeout reports the active build from the daemon state directory: %s', async (directory) => {
+    const target = 'd'.repeat(40), startedAt = '2026-10-26T11:59:00.000Z';
+    const f = fixture({ timeout: true, env: directory ? { WE_DAEMON_STATE_DIR: directory } : {},
+      rebuildState: { building: { target, startedAt, pid: 123 } } });
+    const r = await f.run();
+    expect(r).toMatchObject({ stopReason: 'adoption-timeout', registered: true, adopted: false,
+      adoption: { reason: 'rebuild-building' } });
+    expect(r.fallback).toContain(target.slice(0, 7));
+    expect(r.fallback).toContain(startedAt);
+    expect(r.fallback).toContain('building');
+    expect(f.reads).toContain(`${directory || '/home/test/.claude/daemon-self-sync-state'}/test-clone-key.rebuild.json`);
+    expect(f.sleeps).toEqual([10, 10, 10]);
+  });
+  it.each([{}, { building: null }])('adoption timeout names an idle daemon and suggests catch-up with the last adoption: %j', async (state) => {
+    const adoptedAt = '2026-10-26T11:00:00.000Z';
+    const f = fixture({ timeout: true, rebuildState: { ...state, adopted: { at: adoptedAt, head: TREE } } });
+    const r = await f.run();
+    expect(r).toMatchObject({ stopReason: 'adoption-timeout', registered: true, adopted: false,
+      adoption: { reason: 'daemon-not-refreshing' } });
+    expect(r.fallback).toContain('catch-up');
+    expect(r.fallback).toContain(adoptedAt);
+    expect(f.reads).toContain('/home/test/.claude/daemon-self-sync-state/test-clone-key.rebuild.json');
+  });
+  it.each([
+    ['missing', {}],
+    ['permission denied', { rebuildStateReadError: true }],
+    ['malformed JSON', { rebuildStateRaw: '{broken' }],
+  ])('adoption timeout reports unreadable rebuild evidence: %s', async (_, options) => {
+    const f = fixture({ timeout: true, ...options });
+    const r = await f.run();
+    expect(r).toMatchObject({ stopReason: 'adoption-timeout', registered: true, adopted: false,
+      adoption: { reason: 'rebuild-state-unreadable' } });
+    expect(r.fallback).toMatch(/rebuild.state.*unreadable|unreadable.*rebuild.state/i);
+    expect(f.reads).toContain('/home/test/.claude/daemon-self-sync-state/test-clone-key.rebuild.json');
   });
   it('waits for a missing daemon commit to become available before adoption', async () => {
     const f = fixture({ missingCandidate: true });

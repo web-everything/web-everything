@@ -469,8 +469,54 @@ describe('trust boundary and branch names for idle bottoms', () => {
     expect(refs.get(1)).toEqual({ headRefName: 'lane/a', headRefOid: 'x', baseRefName: null, isCrossRepository: false, author: null });
     expect(run.mock.calls[0][0].join(' ')).toContain('baseRefName');
     expect(refs.get(2)).toMatchObject({ isCrossRepository: true, author: 'app/bot' });
+    expect(refs).toBeInstanceOf(Map);
+    expect(refs.failure).toBeUndefined();
     expect(readOpenPrRefs('/repo', { run: () => { throw Error('gh down'); } }).size).toBe(0);
     expect(readOpenPrRefs('/repo', { run: () => 'not json' }).size).toBe(0);
+  });
+  it('leaves failure undefined for a successful empty GitHub list', () => {
+    const refs = readOpenPrRefs('/repo', { run: () => '[]' });
+    expect(refs).toBeInstanceOf(Map);
+    expect(refs.size).toBe(0);
+    expect(refs.failure).toBeUndefined();
+  });
+  it.each([
+    ['refs-auth-failed', { message: 'HTTP 401: private diagnostic' }],
+    ['refs-auth-failed', { stderr: 'HTTP 403: private diagnostic' }],
+    ['refs-auth-failed', { message: 'Bad credentials: private diagnostic' }],
+    ['refs-auth-failed', { stderr: Buffer.from('authentication failed: private diagnostic') }],
+    ['refs-auth-failed', { message: 'not logged in: private diagnostic' }],
+    ['refs-auth-failed', { stderr: 'run gh auth login: private diagnostic' }],
+    ['refs-auth-failed', { message: 'Resource not accessible by integration: private diagnostic' }],
+    ['refs-auth-failed', { status: 401 }],
+    ['refs-auth-failed', { status: 403 }],
+    ['refs-rate-limited', { message: 'API rate limit exceeded: private diagnostic' }],
+    ['refs-rate-limited', { stderr: 'HTTP 429: private diagnostic' }],
+    ['refs-rate-limited', { message: 'secondary rate limit: private diagnostic' }],
+    ['refs-rate-limited', { status: 429 }],
+    ['refs-timeout', { code: 'ETIMEDOUT' }],
+    ['refs-timeout', { signal: 'SIGTERM' }],
+    ['refs-timeout', { message: 'request timed out: private diagnostic' }],
+    ['refs-timeout', { stderr: 'HTTP 502: private diagnostic' }],
+    ['refs-timeout', { message: 'HTTP 503: private diagnostic' }],
+    ['refs-timeout', { stderr: 'HTTP 504: private diagnostic' }],
+    ['refs-timeout', { status: 502 }],
+    ['refs-timeout', { status: 503 }],
+    ['refs-timeout', { status: 504 }],
+    ['refs-unreadable', { message: 'unexpected gh failure: private diagnostic', stderr: 'private stderr', status: 1, code: 'EUNKNOWN' }],
+  ])('returns an empty Map with only the fixed cause %s for %j', (cause, fields) => {
+    const error = Object.assign(new Error('private command diagnostic'), fields);
+    const refs = readOpenPrRefs('/repo', { run: () => { throw error; } });
+    expect(refs).toBeInstanceOf(Map);
+    expect(refs.size).toBe(0);
+    // Exact equality fences all message/stderr text out of the public cause.
+    expect(refs.failure).toBe(cause);
+  });
+  it('classifies malformed JSON as refs-parse-failed without exposing the payload', () => {
+    const refs = readOpenPrRefs('/repo', { run: () => 'private invalid JSON payload' });
+    expect(refs).toBeInstanceOf(Map);
+    expect(refs.size).toBe(0);
+    expect(refs.failure).toBe('refs-parse-failed');
   });
   it('detects nothing and leaves the memory untouched when origin cannot be listed', () => {
     const options = base({ readLanes: () => null });

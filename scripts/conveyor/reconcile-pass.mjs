@@ -62,6 +62,7 @@ import { FAILING_CONCLUSIONS, NON_BLOCKING_CONCLUSIONS, reduceCheckState } from 
 import { checksArgv, parseJsonLines, GH_TIMEOUT_MS } from '../operations/pr-status-io.mjs';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
 import { readTimeoutBudget } from './timeout-retry-state.mjs';
+import { EVIDENCE_READ_BACKOFF_MS, isEvidenceReadTimeout, syncSleep } from './evidence-read-retry.mjs';
 import { isInfraCancelledOnlyRun, isInfraCancelledJob, isAggregateGateFailure, classifyInfraCancelled, resolveInfraCancelledMode, DEFAULT_INFRA_CANCELLED_MAX_RERUNS, authoritativeCheckRuns } from './infra-cancelled.mjs';
 import { createHash } from 'node:crypto';
 import { posix } from 'node:path';
@@ -755,7 +756,10 @@ function owedCiRerunEvidence(pr, { repo, checks, readJobAttempt }) {
     return { eligible: true, repo, pr: pr.number, head: pr.headRefOid,
       signature: createHash('sha256').update(JSON.stringify(['owed-ci-rerun', pr.headRefOid, [...targets.keys()].sort()])).digest('hex'),
       jobs, variant: 'owed-ci-rerun', infraCancelled: true };
-  } catch (error) { return { eligible: false, reason: error.message }; }
+  } catch (error) {
+    if (isEvidenceReadTimeout(error)) return { eligible: false, unknown: true, reason: `timeout-evidence-unknown:${error.message}` };
+    return { eligible: false, reason: error.message };
+  }
 }
 
 /**
@@ -817,7 +821,7 @@ export function enrichPrsWithMainRedFacts(prs, {
       mainRedWindows, mainLatestCheckRuns, ...greenFix, comments: pr.comments, headSha: pr.headRefOid,
     }) ? readMainFixedSignatureFacts({ repo, detailsUrl: latestRequiredCheck(pr, check?.name)?.detailsUrl,
       failureCompletedAt: check?.completedAt, defaultBranch }) : null;
-    const owedCiRerunRetry = mainGreenNow?.red === false ? owedCiRerunEvidence(pr, { repo, checks, readJobAttempt }) : undefined;
+    const owedCiRerunRetry = mainGreenNow?.red === false ? readWithTimeoutRetry(() => owedCiRerunEvidence(pr, { repo, checks, readJobAttempt })) : undefined;
     let timeoutRetryBudget = pr.timeoutRetryBudget;
     if (owedCiRerunRetry && timeoutRetryBudget === undefined) {
       try { timeoutRetryBudget = readBudget({ repo, pr: pr.number, head: pr.headRefOid }); }
@@ -1471,6 +1475,8 @@ export function runReconcilePass({
   // Standing-ruling round grants (operator option B, 2026-10-20): verify the ruling + cited heads at read time.
   enrichStandingRulingGrants = enrichPrsWithStandingRulingGrants,
   enrichStandDownAutoProceed = enrichPrsWithStandDownAutoProceed,
+  // Planning/read-only callers must never create cursors, reservations or operator answers.
+  allowStandDownAutoProceed = false,
   // The fixer-escalation ladder (default + local override, models from the routing policy). Injectable for tests.
   loadLadder = loadFixerLadder,
   // Card xx0055i — the `fix.*` settings (policy cascade: env > we:scripts/settings/fix.json > built-in). Injectable.
@@ -1553,9 +1559,9 @@ export function runReconcilePass({
     repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, requiredChecks, readChecks, defaultBranch,
   });
   // Evidence is applied before every downstream CI reader, including main-red attribution.
-  const autoProceedPrs = enrichStandDownAutoProceed(hydrated.prs, {
-    repo: CONSTELLATION_REPOS[repoKey].slug, requiredChecks, env,
-  });
+  const autoProceedPrs = allowStandDownAutoProceed === true ? enrichStandDownAutoProceed(hydrated.prs, {
+    repo: CONSTELLATION_REPOS[repoKey].slug, requiredChecks, defaultBranch, env,
+  }) : hydrated.prs;
   let holdPrs = autoProceedPrs;
   try {
     holdPrs = excuseMergeGateHolds(autoProceedPrs, {
@@ -1828,7 +1834,20 @@ export function isDerivedTimeoutCheck(check, checks = []) {
  * This deliberately declines logs with aggregate/build failures: every failed check must carry a
  * complete test inventory. That includes the historical #3415 aggregate "test" failure.
  */
-export function readTimeoutEvidence(pr, { repo, exec = execFileSyncThrottled, ts, reader: readerOverride = null, facts: factsOverride = null } = {}) {
+export function readTimeoutEvidence(pr, opts = {}) {
+  return readWithTimeoutRetry(() => readTimeoutEvidenceOnce(pr, opts), opts.sleep);
+}
+
+/** Re-run a read that came back `unknown` (a timed-out gh read) with bounded backoff; any other result returns at once. */
+function readWithTimeoutRetry(readOnce, pause = syncSleep) {
+  for (let attempt = 0; ; attempt++) {
+    const result = readOnce();
+    if (!result?.unknown || attempt >= EVIDENCE_READ_BACKOFF_MS.length) return result;
+    pause(EVIDENCE_READ_BACKOFF_MS[attempt]);
+  }
+}
+
+function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, reader: readerOverride = null, facts: factsOverride = null } = {}) {
   const deadline = Date.now() + 15_000;
   // perf C1d — facts-first stale-head refusal, ETag reads and the immutable job/log/file cache live in `fix-facts.mjs`
   // (`WE_FIX_FACTS=0` = the plain `gh api` reads this function always made). An injected `exec` (tests, soak) keeps
@@ -1930,7 +1949,10 @@ export function readTimeoutEvidence(pr, { repo, exec = execFileSyncThrottled, ts
     const after = api(`repos/${repo}/pulls/${pr.number}`);
     if (after.head.sha !== head || after.base.sha !== pull.base.sha || after.changed_files !== pull.changed_files) throw new Error('stale-head-or-diff');
     return result;
-  } catch (error) { return { eligible: false, reason: `timeout-evidence:${error.message}` }; }
+  } catch (error) {
+    if (isEvidenceReadTimeout(error)) return { eligible: false, unknown: true, reason: `timeout-evidence-unknown:${error.message}` };
+    return { eligible: false, reason: `timeout-evidence:${error.message}` };
+  }
 }
 
 export function enrichPrsWithTimeoutEvidence(prs, {
