@@ -1,5 +1,3 @@
-import { isLaterVerdictBody } from '../accept-carry-forward.mjs';
-
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const text = value => typeof value === 'string' && value.length > 0;
 const sha = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/.test(value);
@@ -8,6 +6,7 @@ const date = value => typeof value === 'string' && Number.isFinite(Date.parse(va
 const strings = value => Array.isArray(value) && value.every(text);
 const sorted = values => [...new Set(values)].sort();
 const policies = new Set(['send-back', 'hold', 'card', 'advisory']);
+const reviewStates = new Set(['PENDING', 'COMMENTED', 'APPROVED', 'CHANGES_REQUESTED', 'DISMISSED']);
 
 function requireInput(condition, field) {
   if (!condition) throw new TypeError(`Invalid ${field}`);
@@ -16,6 +15,7 @@ function requireInput(condition, field) {
 function validate(snapshot, options) {
   const config = options?.config;
   requireInput(object(config), 'config');
+  requireInput(typeof config.isLaterVerdictBody === 'function', 'config.isLaterVerdictBody');
   requireInput(typeof config.statusLabels === 'boolean', 'config.statusLabels');
   requireInput(object(config.confirmedBreaks), 'config.confirmedBreaks');
   for (const field of ['broken', 'degraded', 'unconfirmed']) {
@@ -42,7 +42,7 @@ function validate(snapshot, options) {
     requireInput(typeof comment.body === 'string', 'snapshot.comments.body');
   }
   for (const review of snapshot.reviews) {
-    requireInput(text(review.state) && sha(review.commit?.oid), 'snapshot.reviews');
+    requireInput(reviewStates.has(review.state) && sha(review.commit?.oid), 'snapshot.reviews');
   }
   requireInput(snapshot.reviewRun == null || object(snapshot.reviewRun), 'snapshot.reviewRun');
 }
@@ -50,6 +50,7 @@ function validate(snapshot, options) {
 /**
  * Pure label reconciliation over caller-supplied, complete evidence. The caller
  * owns evidence collection and applying the plan against the labelsVersion.
+ * config.isLaterVerdictBody must supply the caller's pure verdict predicate.
  * Missing acceptance evidence preserves review holds; this never grants readiness.
  */
 export function planLabelReconcile(snapshot, options) {
@@ -105,7 +106,7 @@ export function planLabelReconcile(snapshot, options) {
       }
     }
     for (const comment of snapshot.comments) {
-      if (!isLaterVerdictBody(comment.body)) continue;
+      if (!config.isLaterVerdictBody(comment.body)) continue;
       const created = date(comment.createdAt) ? Date.parse(comment.createdAt) : NaN;
       const edited = comment.lastEditedAt == null ? created
         : date(comment.lastEditedAt) ? Date.parse(comment.lastEditedAt) : NaN;

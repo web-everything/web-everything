@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { isLaterVerdictBody } from '../../accept-carry-forward.mjs';
 import { planLabelReconcile } from '../plan-label-reconcile.mjs';
 
 const HEAD = 'a'.repeat(40);
@@ -6,6 +7,7 @@ const OTHER_HEAD = 'b'.repeat(40);
 const START = 1_790_000_000_000;
 const iso = offset => new Date(START + offset).toISOString();
 const config = () => ({
+  isLaterVerdictBody,
   statusLabels: true,
   confirmedBreaks: { broken: 'send-back', degraded: 'hold', unconfirmed: 'advisory' },
 });
@@ -159,6 +161,31 @@ describe('#5990 regressions', () => {
 });
 
 describe('explicit input validation', () => {
+  it.each([undefined, null, false, 1, {}, 'predicate'])('requires a function verdict predicate (%s)', value => {
+    const o = options();
+    if (value === undefined) delete o.config.isLaterVerdictBody;
+    else o.config.isLaterVerdictBody = value;
+    expect(() => plan(snapshot(), o)).toThrow(/config\.isLaterVerdictBody/);
+  });
+  it.each([false, true])('uses the injected verdict predicate returning %s', verdict => {
+    const o = options();
+    o.config.isLaterVerdictBody = vi.fn(() => verdict);
+    const p = plan(snapshot({ labels: ['review:changes'], reviewRun: run(),
+      comments: [comment({ body: 'caller-defined verdict', createdAt: iso(1) })] }), o);
+    expect(o.config.isLaterVerdictBody).toHaveBeenCalledTimes(1);
+    expect(o.config.isLaterVerdictBody).toHaveBeenCalledWith('caller-defined verdict');
+    expect(p.reasons).toContain(verdict ? 'review-hold-kept:later-verdict' : 'review-hold-cleared');
+  });
+  it.each(['PENDING', 'COMMENTED', 'APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'])('accepts review state %s', state => {
+    const p = plan(snapshot({ labels: ['review:changes'], reviewRun: run(),
+      reviews: [{ state, commit: { oid: HEAD } }] }));
+    expect(p.reasons).toContain(state === 'CHANGES_REQUESTED'
+      ? 'review-hold-kept:changes-requested' : 'review-hold-cleared');
+  });
+  it.each(['UNKNOWN', 'approved', 'CHANGES_REQUESTED\n', '', undefined, null, 1])('rejects invalid review state %s', state => {
+    expect(() => plan(snapshot({ reviews: [{ state, commit: { oid: HEAD } }] })))
+      .toThrow(/snapshot\.reviews/);
+  });
   it.each([
     ['config', o => { delete o.config; }],
     ['config', o => { o.config = null; }],
