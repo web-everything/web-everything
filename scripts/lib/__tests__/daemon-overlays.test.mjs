@@ -111,7 +111,7 @@ describe('cloneKey / overlayFilePath', () => {
 describe('readOverlays / readOverlayState', () => {
   it('missing file ⇒ [] and corrupt:false, never throws', () => {
     expect(readOverlays(cloneRoot, { env: env() })).toEqual([]);
-    expect(readOverlayState(cloneRoot, { env: env() })).toEqual({ clone: null, overlays: [], corrupt: false });
+    expect(readOverlayState(cloneRoot, { env: env() })).toEqual({ clone: null, overlays: [], generation: 0, corrupt: false });
   });
 
   it('corrupt (unparsable) file ⇒ [] and corrupt:true, never throws', () => {

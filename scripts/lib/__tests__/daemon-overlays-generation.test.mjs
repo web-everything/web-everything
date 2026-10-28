@@ -1,23 +1,25 @@
 /** Registration evidence must never cross a same-ref replacement, even with identical metadata. */
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import * as overlays from '../daemon-overlays.mjs';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
-import { writeRebuildState } from '../daemon-rebuild/state.mjs';
+import { finalizeRebuild, dropSuspectOverlays } from '../daemon-rebuild/adopt.mjs';
+import { readRebuildState, writeRebuildState } from '../daemon-rebuild/state.mjs';
 
-// Observe reads without replacing registry storage, locking, or the generation APIs under test.
-const seams = vi.hoisted(() => ({ visit: null }));
-vi.mock('../daemon-overlays.mjs', async (original) => {
-  const actual = await original();
-  return { ...actual, readOverlayState: (...args) => {
+// Spy after initialization: a partial importOriginal mock loads prepare through the
+// overlays → self-sync → rebuild cycle before that mock exists, bypassing its read seam.
+const seams = { visit: null };
+beforeEach(() => {
+  const read = overlays.readOverlayState;
+  vi.spyOn(overlays, 'readOverlayState').mockImplementation((...args) => {
     seams.visit?.('readOverlayState:before');
-    const result = actual.readOverlayState(...args);
+    const result = read(...args);
     seams.visit?.('readOverlayState:after');
     return result;
-  } };
+  });
 });
 // Preparation's repair helper uses its own subprocess runner. Keep this unrelated repair inert.
 vi.mock('../lane-repair.mjs', () => ({
@@ -32,6 +34,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{1
 const temps = [];
 afterEach(() => {
   seams.visit = null;
+  vi.restoreAllMocks();
   for (const dir of temps.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -139,7 +142,7 @@ describe('overlay registration generations', () => {
       const points = [];
       const baseline = await control.prepare({ available, visit: label => points.push(label) });
       if (!available) expect(baseline.result?.reason).toBe('pinned-overlay-unavailable');
-      else expect(baseline.result?.reason).toBe('up-to-date');
+      else { expect(baseline.terminal).toBe(false); expect(baseline.plan?.ok).toBe(true); }
       expect(points).toContain('readOverlayState:after');
       if (available) expect(points).toContain('prState:after-await');
       for (let point = 0; point < points.length; point++) {
@@ -323,5 +326,53 @@ describe('overlay registration generations', () => {
     const result = await f.prepare();
     expectNoBorrowedPin(result);
     expect(f.list()[0].registrationId).toBe(migrated.list[0].registrationId);
+  });
+
+  it.each(['already-adopted', 'moved'])('T10 adopt CAS: %s strips replaced ids and preserves matching evidence', async (branch) => {
+    const f = gitFixture();
+    const kept = overlays.addOverlay(f.root, { ref: 'lane/kept' }, { env: f.env }).find(o => o.ref === 'lane/kept');
+    const replacement = f.add();
+    const applied = [...f.adopted.applied, { ref: kept.ref, sha: SHA, registrationId: kept.registrationId },
+      { ref: 'lane/legacy', sha: SHA }];
+    const finalSha = branch === 'already-adopted' ? f.adopted.head : f.adopted.mainSha;
+    const result = await finalizeRebuild({ root: f.root, env: f.env, log: {}, now: () => Date.parse(NOW),
+      lease: { token: 'cas-test' }, prevHead: f.adopted.head, plan: { finalSha, mainSha: f.adopted.mainSha, inputsKey: 'cas', applied },
+      run: (args, options) => spawnSync('git', args, { ...options, env: f.env, cwd: f.root, encoding: 'utf8' }),
+    });
+    expect(result.adopted).toBe(true);
+    expect(result.moved).toBe(branch === 'moved');
+    expect(result.alerts.map(a => a.kind)).toContain('overlay-registration-changed');
+    const { registrationId, ...unbound } = applied[0];
+    expect(readRebuildState(f.root, f.env).adopted.applied).toEqual([unbound, ...applied.slice(1)]);
+    expect(overlays.appliedRowFor(readRebuildState(f.root, f.env).adopted, REF, replacement.registrationId)).toBeNull();
+    expect(f.list()).toContainEqual(replacement);
+  });
+
+  it('T10 adopt CAS: unreadable registry cannot establish registration evidence', async () => {
+    const f = gitFixture();
+    writeFileSync(f.file, '{broken');
+    const result = await finalizeRebuild({ root: f.root, env: f.env, log: {}, now: () => Date.parse(NOW),
+      lease: { token: 'cas-test' }, prevHead: f.adopted.head, plan: { finalSha: f.adopted.head, mainSha: f.adopted.mainSha,
+        inputsKey: 'unreadable', applied: f.adopted.applied },
+      run: (args, options) => spawnSync('git', args, { ...options, env: f.env, cwd: f.root, encoding: 'utf8' }),
+    });
+    expect(result.adopted).toBe(true);
+    expect(result.alerts.map(a => a.kind)).toContain('overlay-registration-changed');
+    const { registrationId, ...unbound } = f.adopted.applied[0];
+    expect(readRebuildState(f.root, f.env).adopted.applied).toEqual([unbound]);
+    expect(f.bytes()).toBe('{broken');
+  });
+
+  it('T10 adopt CAS: suspect replacement is kept without a drop event', () => {
+    const f = fixture();
+    const suspect = f.add();
+    const replacement = f.add();
+    const alert = vi.fn();
+    const before = f.bytes();
+    dropSuspectOverlays({ root: f.root, env: f.env, suspects: [suspect], failed: 'smoke', alert });
+    expect(f.bytes()).toBe(before);
+    expect(f.list()).toEqual([replacement]);
+    expect(alert.mock.calls).toEqual([['overlay-registration-changed', { ref: REF }]]);
+    expect(() => readFileSync(f.file.replace(/\.json$/, '.events.jsonl'), 'utf8')).toThrow(/ENOENT/);
   });
 });

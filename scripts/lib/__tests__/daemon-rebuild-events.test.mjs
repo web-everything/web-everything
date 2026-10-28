@@ -257,7 +257,7 @@ describe('rebuildClone coordination events', () => {
       'index-locked', 'local-commits', 'manifest-or-config-change', 'merge-in-progress',
       'needs-build', 'no-change', 'no-local-main', 'no-lockfile', 'no-result', 'non-store-changes',
       'none', 'none of ', 'not-on-main', 'not-state-files', 'operation-in-progress', 'origin/main ',
-      'other-base', 'overlay-no-longer-wanted', 'overlay-set-aside', 'pinned-conflict-skipped',
+      'other-base', 'overlay-no-longer-wanted', 'overlay-registration-changed', 'overlay-set-aside', 'pinned-conflict-skipped',
       'pinned-contained-in-applied', 'pinned-overlay-conflict-skipped', 'pr-closed', 'pr-merged',
       'ready-adopted', 'ready-pending', 'ready-recorded', 'rebuild-in-progress', 'rebuild-job-running',
       'rebuild-job-spaced', 'rebuild-job-started', 'recovered-adopted', 'ref-gone', 'ref-unresolved',

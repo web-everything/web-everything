@@ -19,6 +19,10 @@ import {
   findUnsafeLocalState, knownInputsOf, rollbackUnverified, collectUntrackedPaths, ensureSafeToMove,
   pruneLandedBacklogSidecars,
 } from './local-state.mjs';
+import {
+  readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode,
+  persistStackBases, persistTipShas, reinstateOverlaySources, migrateRegistrationIds, appliedRowFor,
+} from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild, pinnedStatus, PINNED_OVERLAY_GONE_MESSAGE } from './plan.mjs';
 import { cloneRuntimeEntries } from '../daemon-clone-entries.mjs';
@@ -41,11 +45,6 @@ import {
 export async function prepareRebuild({
   root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, entries = [], prBaseChain, prForcePushes, autoRebase = realAutoRebase,
 }) {
-  // Resolve registry operations after module initialization: overlays → self-sync → rebuild is a cycle.
-  const {
-    readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode,
-    persistStackBases, persistTipShas, reinstateOverlaySources, migrateRegistrationIds, appliedRowFor,
-  } = await import('../daemon-overlays.mjs');
   // Tests reaching the hold must opt in before launching a detached repair or cleaning up swaps.
   if (process.env.VITEST === 'true' && env?.WE_DAEMON_AUTO_REBASE === undefined) {
     env = { ...env, WE_DAEMON_AUTO_REBASE: '0' };
@@ -784,6 +783,7 @@ export async function prepareRebuild({
   // PR #2731 review — single flight: phase 2 runs unlocked, so without this a sibling daemon sharing the clone
   // could build + smoke the same candidate at the same time. Claimed HERE, under the write lock, so exactly one
   // caller wins; the loser returns at once and its next tick finds the winner's result.
+  if (!snapshotHolds()) return registrationChanged();
   const lease = claimBuildLease({
     state, plan, root, run, env: stEnv, nowMs: nowMs(),
   });
