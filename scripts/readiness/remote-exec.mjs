@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = '/srv/forge-exec';
 const LIMIT = 4 * 1024 * 1024;
+const RECEIPT = '.exit-code';
 const SSH_OPTIONS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'];
 const ENV_KEYS = ['CI', 'NODE_ENV', 'TZ', 'LANG', 'LC_ALL', 'FORCE_COLOR', 'NO_COLOR'];
 const quote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
@@ -28,8 +29,8 @@ export function validateRunId(id) {
   return typeof id === 'string' && /^[a-z0-9][a-z0-9-]{5,63}$/.test(id);
 }
 
-export function buildRemoteScript({ runId, lockHash, env = {}, argv, retainRun = false }) {
-  if (!validateRunId(runId) || !/^[a-f0-9]{64}$/.test(lockHash) || !isAllowedCommand(argv)) {
+export function buildRemoteScript({ runId, lockHash, receiptNonce = randomBytes(16).toString('hex'), env = {}, argv, retainRun = false }) {
+  if (!validateRunId(runId) || !/^[a-f0-9]{64}$/.test(lockHash) || !/^[a-f0-9]{32}$/.test(receiptNonce) || !isAllowedCommand(argv)) {
     throw new Error('Invalid remote execution parameters');
   }
   const dir = `${ROOT}/${runId}`;
@@ -39,7 +40,9 @@ export function buildRemoteScript({ runId, lockHash, env = {}, argv, retainRun =
   const cleanEnv = `env -i PATH=/usr/local/bin:/usr/bin:/bin ${Object.entries(filterEnv(env)).map(([k, v]) => `${k}=${quote(v)}`).join(' ')}`;
   return `set -euo pipefail
 mkdir -p ${quote(dir)}
-trap 'code=$?; trap - EXIT; if [ "\${ran:-0}" = 1 ]; then printf "%s\\n" "$code" > ${quote(`${dir}/.exit-code`)}; fi; ${retainRun ? ':' : `rm -rf -- ${quote(dir)}`}; exit "$code"' EXIT
+trap 'code=$?; trap - EXIT; ${retainRun ? ':' : `rm -rf -- ${quote(dir)}`}; exit "$code"' EXIT
+rm -f -- ${quote(`${dir}/${RECEIPT}`)}
+receipt_nonce=${quote(receiptNonce)}
 cd ${quote(dir)}
 mkdir -p ${quote(cache)}
 # Serialize cache creation on the Linux execution host.
@@ -67,8 +70,11 @@ else
 fi
 touch ${quote(cacheRoot)} ${quote(cache)}
 if command -v flock >/dev/null 2>&1; then flock -u 9; exec 9>&-; fi
-ran=1
-${cleanEnv} ${argv.map(quote).join(' ')}
+# Only a completed command can publish a receipt; setup failures leave none.
+code=0
+${cleanEnv} ${argv.map(quote).join(' ')} || code=$?
+printf "%s:%s\\n" "$receipt_nonce" "$code" > ${quote(`${dir}/${RECEIPT}`)}
+exit "$code"
 `;
 }
 
@@ -104,7 +110,7 @@ function safeFiles(files) {
     if (typeof path !== 'string' || !path || path.startsWith('/') || /[\0\r\n]/.test(path)) throw new Error('Invalid file path');
     const parts = path.split('/');
     if (parts.some((part) => part === '..' || part === '.')) throw new Error('Unsafe file path');
-    return !parts.some((part) => /^(?:node_modules|\.git|\.env(?:\..*)?|\.secrets|\.ssh|\.aws|\.claude|\.codex|\.npmrc|\.netrc|credentials(?:\..*)?|.*\.(?:pem|key))$/i.test(part));
+    return !parts.some((part) => part === RECEIPT || /^(?:node_modules|\.git|\.env(?:\..*)?|\.secrets|\.ssh|\.aws|\.claude|\.codex|\.npmrc|\.netrc|credentials(?:\..*)?|.*\.(?:pem|key))$/i.test(part));
   });
   // openrsync still treats leading #/; as comments with --from0. Anchor every
   // validated relative path so both rsync implementations read it literally.
@@ -121,6 +127,8 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
     if ((await exec({ file: 'ssh', args: [host, 'true'], cwd })).code !== 0) return fallback('forge-unreachable');
   } catch { return fallback('forge-unreachable'); }
   const dir = `${ROOT}/${runId}`;
+  // A caller may reuse a run id; bind receipts to this invocation independently.
+  const receiptNonce = randomBytes(16).toString('hex');
   const ssh = (script, inherit = false) => exec({ file: 'ssh',
     args: [host, inherit ? 'sudo -u forge-exec bash -s' : `sudo -u forge-exec bash -c ${quote(script)}`],
     ...(inherit ? { input: script } : {}), cwd, inherit });
@@ -139,15 +147,21 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
     // Conservatively use local admission for either command until sibling snapshots
     // are supported; do not turn a missing remote dependency into a test failure.
     if (files.includes('vitest.shared.ts')) return fallback('unsupported-sibling-dependency');
-    // No --mkpath: macOS openrsync lacks it; rsync creates the final run dir under the existing /srv/forge-exec.
-    const copied = await exec({ file: 'rsync', args: ['-a', '--delete', '--from0', '--files-from=-', '--rsync-path=sudo -u forge-exec rsync', '-e', `ssh ${SSH_OPTIONS.join(' ')}`, './', `${host}:${dir}/`], cwd, input: inventory });
+    // Clear stale receipts before transfer; rsync exclusions alone preserve them.
+    const prepared = await ssh(`mkdir -p ${quote(dir)} && rm -f -- ${quote(`${dir}/${RECEIPT}`)}`);
+    if (prepared.code !== 0) throw new Error('Run directory preparation failed');
+    // No --mkpath: macOS openrsync lacks it. Exclude receipts even for directory entries.
+    const copied = await exec({ file: 'rsync', args: ['-a', '--delete', `--exclude=${RECEIPT}`, '--from0', '--files-from=-', '--rsync-path=sudo -u forge-exec rsync', '-e', `ssh ${SSH_OPTIONS.join(' ')}`, './', `${host}:${dir}/`], cwd, input: inventory });
     if (copied.code !== 0) throw new Error('Copy failed');
   } catch { await cleanup(); return fallback('copy-failed'); }
   try {
-    const result = await ssh(buildRemoteScript({ runId, lockHash, env, argv, retainRun: true }), true);
-    const receipt = await ssh(`head -c 32 -- ${quote(`${dir}/.exit-code`)}`);
-    if (receipt.code !== 0 || typeof receipt.stdout !== 'string' || !/^(?:0|[1-9][0-9]{0,2})\n?$/.test(receipt.stdout)) return fallback('ambiguous-result');
-    const code = Number(receipt.stdout);
+    const result = await ssh(buildRemoteScript({ runId, lockHash, receiptNonce, env, argv, retainRun: true }), true);
+    // Read beyond the longest valid receipt (37 bytes) so trailing data is rejected.
+    const receipt = await ssh(`head -c 64 -- ${quote(`${dir}/${RECEIPT}`)}`);
+    if (receipt.code !== 0 || typeof receipt.stdout !== 'string') return fallback('ambiguous-result');
+    const match = /^([a-f0-9]{32}):(0|[1-9][0-9]{0,2})\n?$/.exec(receipt.stdout);
+    if (!match || match[0] !== receipt.stdout || match[1] !== receiptNonce) return fallback('ambiguous-result');
+    const code = Number(match[2]);
     if (code >= 255 || code !== result.code) return fallback('ambiguous-result');
     return { mode: 'remote', code };
   } catch { return fallback('ambiguous-result'); }

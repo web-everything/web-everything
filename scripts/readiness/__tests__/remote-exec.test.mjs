@@ -14,6 +14,7 @@ const argv = ['npm', 'run', 'test:unit', '--', 'a.test.mjs'];
 const runId = 'abcdef-1';
 const runDir = `/srv/forge-exec/${runId}`;
 const lockHash = 'a'.repeat(64);
+const receiptNonce = 'b'.repeat(32);
 const allowedEnv = {
   CI: 'true', NODE_ENV: 'test', TZ: 'UTC', LANG: 'C', LC_ALL: 'C', FORCE_COLOR: '0', NO_COLOR: '1',
 };
@@ -34,17 +35,21 @@ afterEach(() => rmSync(cwd, { recursive: true, force: true }));
 
 const sshText = (call) => call.args.join(' ');
 const isCleanup = (call) => call.file === 'ssh' && /\brm\s+-rf\b/.test(sshText(call));
-const isReceipt = (call) => call.file === 'ssh' && sshText(call).includes('.exit-code');
+const isReceipt = (call) => call.file === 'ssh' && sshText(call).includes('head -c');
+const isPrepare = (call) => call.file === 'ssh' && !call.inherit && sshText(call).includes('mkdir -p');
 const isRun = (call) => call.file === 'ssh' && call.inherit === true;
 const callsOf = (exec) => exec.mock.calls.map(([call]) => call);
+const nonceOf = (script) => script.match(/^receipt_nonce='([a-f0-9]{32})'$/m)?.[1];
 
-function fixture({ probeCode = 0, copyCode = 0, runCode = 0, receipt = `${runCode}\n`, receiptCode = 0 } = {}) {
+function fixture({ probeCode = 0, copyCode = 0, prepareCode = 0, runCode = 0, receipt, receiptCode = 0 } = {}) {
+  let nonce;
   const exec = vi.fn(async (call) => {
     if (call.file === 'git') return { code: 0, stdout: 'package-lock.json\na.test.mjs\n' };
     if (call.file === 'rsync') return { code: copyCode, stdout: '' };
     if (isCleanup(call)) return { code: 0, stdout: '' };
-    if (isRun(call)) return { code: runCode, stdout: '' };
-    if (isReceipt(call)) return { code: receiptCode, stdout: receipt };
+    if (isPrepare(call)) return { code: prepareCode, stdout: '' };
+    if (isRun(call)) { nonce = nonceOf(call.input); return { code: runCode, stdout: '' }; }
+    if (isReceipt(call)) return { code: receiptCode, stdout: typeof receipt === 'function' ? receipt(nonce) : receipt ?? `${nonce}:${runCode}\n` };
     if (call.file === 'ssh' && call.args.at(-1) === 'true') return { code: probeCode, stdout: '' };
     throw new Error(`Unexpected exec call: ${JSON.stringify(call)}`);
   });
@@ -75,6 +80,11 @@ function realRemoteFixture(files) {
   f.listFiles.mockResolvedValue(files);
   const fakeExec = f.exec;
   f.exec = vi.fn(async (call) => {
+    if (isPrepare(call)) {
+      const command = call.args.at(-1).replace(/^sudo -u forge-exec /, '').replaceAll('/srv/forge-exec', root);
+      const result = spawnSync('bash', ['-c', command], { cwd, encoding: 'utf8', timeout: 10000 });
+      return { code: result.status, stdout: result.stdout };
+    }
     if (call.file === 'rsync') {
       const args = call.args.filter((arg, i, all) => !arg.startsWith('--rsync-path=') && arg !== '-e' && all[i - 1] !== '-e');
       args[args.length - 1] = join(root, runId) + '/';
@@ -102,6 +112,47 @@ function realRemoteFixture(files) {
 }
 
 describe('remote snapshot regressions', () => {
+  it.each(['snapshot', 'stale remote'])('falls back when a %s receipt says 97 and npm ci fails before the command', async (source) => {
+    writeFileSync(join(cwd, '.exit-code'), '97\n');
+    const f = realRemoteFixture(['package-lock.json', '.exit-code']);
+    if (source === 'stale remote') {
+      mkdirSync(join(f.root, runId));
+      writeFileSync(join(f.root, runId, '.exit-code'), '97\n');
+    }
+    const transport = f.exec;
+    const receiptPresence = [];
+    f.exec = vi.fn(async (call) => {
+      if (call.file === 'rsync') receiptPresence.push(existsSync(join(f.root, runId, '.exit-code')));
+      const result = await transport(call);
+      // Observe the snapshot and failed runner before cleanup can hide a receipt.
+      if (call.file === 'rsync' || isRun(call)) receiptPresence.push(existsSync(join(f.root, runId, '.exit-code')));
+      return result;
+    });
+    writeFileSync(join(f.bin, 'npm'), '#!/bin/bash\nif [ "$1" = ci ]; then echo INJECTED_INSTALL_FAILURE >&2; exit 1; fi\necho COMMAND_RAN\n', { mode: 0o755 });
+    const log = vi.fn();
+    expect(await runWithRemoteFallback({ ...f, log })).toBe(7);
+    expect(f.runs).toHaveLength(1);
+    expect(f.runs[0].status).toBe(97);
+    expect(f.runs[0].stderr).toContain('INJECTED_INSTALL_FAILURE');
+    expect(f.runs[0].stdout).not.toContain('COMMAND_RAN');
+    expect(receiptPresence).toEqual([false, false, false]);
+    expect(f.local).toHaveBeenCalledTimes(1);
+    expect(f.local).toHaveBeenCalledWith(f.argv);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('ambiguous-result'));
+    expect(callsOf(f.exec).find((call) => call.file === 'rsync').input).not.toContain('.exit-code');
+    expect(existsSync(join(f.root, runId))).toBe(false);
+  });
+
+  it('confirms command exit 97 with a fresh receipt on cold and warm caches', async () => {
+    const f = realRemoteFixture(['package-lock.json']);
+    writeFileSync(join(f.bin, 'npm'), '#!/bin/bash\nif [ "$1" = ci ]; then exit 0; fi\necho COMMAND_RAN\nexit 97\n', { mode: 0o755 });
+    for (const state of ['cold', 'warm']) {
+      expect(await runRemote(f), state).toEqual({ mode: 'remote', code: 97 });
+      expect(f.runs.at(-1).stdout).toContain('COMMAND_RAN');
+      expect(f.local).not.toHaveBeenCalled();
+    }
+  });
+
   it('preserves nested workspace dependencies across cold and warm runs', async () => {
     const workspace = "packages/deep/worker's space";
     const files = ['package.json', 'package-lock.json', `${workspace}/package.json`, 'probe.cjs'];
@@ -175,15 +226,17 @@ console.log('RESOLVED ' + versions.join(','));
     // Inspect the real rsync result before allowing the mocked remote command.
     const transport = f.exec;
     const transferred = new Map();
+    let nonce;
     f.exec = vi.fn(async (call) => {
       if (isRun(call)) {
+        nonce = nonceOf(call.input);
         for (const file of files) {
           const path = join(f.root, runId, file);
           transferred.set(file, existsSync(path) ? readFileSync(path, 'utf8') : null);
         }
         return { code: 0, stdout: '' };
       }
-      if (isReceipt(call)) return { code: 0, stdout: '0\n' };
+      if (isReceipt(call)) return { code: 0, stdout: `${nonce}:0\n` };
       return transport(call);
     });
     expect(await runRemote(f)).toEqual({ mode: 'remote', code: 0 });
@@ -350,13 +403,13 @@ rm() {
 }
 ${script.replaceAll('/srv/forge-exec', root)}`;
     for (const attempt of [1, 2]) {
-      const script = buildRemoteScript({ runId, lockHash, env: { ...env, ...(attempt === 1 ? { NODE_ENV: 'production' } : {}) }, argv: [...argv, ...hostile] });
+      const script = buildRemoteScript({ runId, lockHash, receiptNonce, env: { ...env, ...(attempt === 1 ? { NODE_ENV: 'production' } : {}) }, argv: [...argv, ...hostile] });
       mkdirSync(join(root, runId), { recursive: true });
       const result = spawnSync('bash', ['-c', harnessFor(script)], {
         cwd, encoding: 'utf8', env: { ...forbiddenEnv, PATH: `${bin}:/usr/bin:/bin` },
       });
       expect(result.status, `attempt ${attempt}: ${result.stderr}`).toBe(3);
-      expect(readFileSync(exitSnapshot, 'utf8').trim()).toBe('3');
+      expect(readFileSync(exitSnapshot, 'utf8')).toBe(`${receiptNonce}:3\n`);
       expect(existsSync(join(root, runId))).toBe(false);
       expect(existsSync(marker)).toBe(false);
     }
@@ -377,6 +430,35 @@ ${script.replaceAll('/srv/forge-exec', root)}`;
 });
 
 describe('runRemote', () => {
+  it.each(['0\n', '97\n', `${'f'.repeat(32)}:0\n`])('falls back locally for an unbound receipt %j', async (receipt) => {
+    const f = fixture({ runCode: receipt === '97\n' ? 97 : 0, receipt });
+    const log = vi.fn();
+    expect(await runWithRemoteFallback({ ...f, log })).toBe(7);
+    expect(f.local).toHaveBeenCalledTimes(1);
+    expect(f.local).toHaveBeenCalledWith(f.argv);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('ambiguous-result'));
+  });
+
+  it('rejects a prior valid receipt when the caller reuses the run id', async () => {
+    let priorReceipt;
+    const f = fixture({ receipt: (nonce) => priorReceipt ??= `${nonce}:0\n` });
+    expect(await runRemote(f)).toEqual({ mode: 'remote', code: 0 });
+    const log = vi.fn();
+    expect(await runWithRemoteFallback({ ...f, log })).toBe(7);
+    const nonces = callsOf(f.exec).filter(isRun).map((call) => nonceOf(call.input));
+    expect(nonces[0]).toMatch(/^[a-f0-9]{32}$/);
+    expect(nonces[1]).not.toBe(nonces[0]);
+    expect(f.local).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('ambiguous-result'));
+  });
+
+  it('falls back before transfer or execution when stale receipt removal fails', async () => {
+    const f = fixture({ prepareCode: 1 });
+    expect(await runWithRemoteFallback({ ...f, log: vi.fn() })).toBe(7);
+    expect(callsOf(f.exec).some((call) => call.file === 'rsync' || isRun(call))).toBe(false);
+    expect(callsOf(f.exec).some(isCleanup)).toBe(true);
+  });
+
   it('falls back before copying when literal inventory framing exceeds the byte limit', async () => {
     const f = fixture();
     // Prefix and NUL are part of the 4 MiB transport budget.
@@ -419,7 +501,7 @@ describe('runRemote', () => {
     expect(sshText(callsOf(f.exec).find(isCleanup))).toContain(runDir);
     expectNoSecrets(f.exec);
   });
-  it.each([0, 3])('returns confirmed remote exit code %s and cleans up after reading the receipt', async (code) => {
+  it.each([0, 3, 97, 254])('returns confirmed remote exit code %s and cleans up after reading the receipt', async (code) => {
     const f = fixture({ runCode: code });
     expect(await runRemote(f)).toEqual({ mode: 'remote', code });
     const calls = callsOf(f.exec);
@@ -435,9 +517,12 @@ describe('runRemote', () => {
   it.each([
     { runCode: 0, receipt: '' }, { runCode: 0, receipt: 'not-a-number\n' },
     { runCode: 0, receipt: '0oops\n' }, { runCode: 0, receipt: '0\n3\n' },
-    { runCode: 0, receipt: '3\n' }, { runCode: 3, receipt: '0\n' },
-    { runCode: 0, receipt: '0\n', receiptCode: 1 },
-    { runCode: 255, receipt: '255\n' }, { runCode: 255, receipt: '0\n' },
+    { runCode: 0, receipt: (nonce) => `${nonce}:3\n` }, { runCode: 3, receipt: (nonce) => `${nonce}:0\n` },
+    { runCode: 0, receiptCode: 1 },
+    { runCode: 255 }, { runCode: 255, receipt: (nonce) => `${nonce}:0\n` },
+    ...['0\n\n', '0\r\n', '0\u2028', '00\n', '-1\n', '256\n', '0\ntrailing', '0'.repeat(100)].map((suffix) => ({
+      runCode: 0, receipt: (nonce) => `${nonce}:${suffix}`,
+    })),
   ])('fails closed with ambiguous-result and attempts cleanup for %j', async (scenario) => {
     const f = fixture(scenario);
     expect(await runRemote(f)).toEqual({ mode: 'fallback', reason: 'ambiguous-result' });
@@ -446,7 +531,7 @@ describe('runRemote', () => {
   });
   it('uses the injected file list as rsync stdin, excludes node_modules, and selects the restricted rsync user', async () => {
     const f = fixture();
-    f.listFiles.mockResolvedValue(['package-lock.json', 'src/a file.mjs', 'node_modules/secret.js', 'src/node_modules/nested.js']);
+    f.listFiles.mockResolvedValue(['package-lock.json', 'src/a file.mjs', 'node_modules/secret.js', 'src/node_modules/nested.js', '.exit-code', 'src/.exit-code', '.exit-code/forged']);
     await runRemote({ ...f, host: 'custom-forge' });
     expect(f.listFiles).toHaveBeenCalledWith(cwd);
     const calls = callsOf(f.exec);
@@ -454,6 +539,9 @@ describe('runRemote', () => {
     const copy = calls.find((call) => call.file === 'rsync');
     expect(copy.args.join(' ')).toMatch(/--files-from(?:=|\s)-/);
     expect(copy.args).toContain('--from0');
+    expect(copy.args).toContain('--exclude=.exit-code');
+    expect(calls.findIndex(isPrepare)).toBeLessThan(calls.indexOf(copy));
+    expect(sshText(calls.find(isPrepare))).toContain('rm -f --');
     expect(copy.input.split('\0')).toEqual(['./package-lock.json', './src/a file.mjs', '']);
     expect(copy.args.join(' ')).toMatch(/--rsync-path(?:=|\s)sudo -u forge-exec rsync/);
     expect(copy.args.join(' ')).toContain(`custom-forge:${runDir}`);
