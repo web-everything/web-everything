@@ -47,6 +47,31 @@ describe('readRedTeamStatus legacy filename compatibility', () => {
     expect(readRedTeamStatus(f)).toEqual(status);
   });
 
+  it.each([false, true])('blocks another retry and preserves a legacy spent retry (older normalized record: %s)', withNormalized => {
+    const f = { ...fixture(), repo: 'Web-Everything/Web-Everything', head: 'B'.repeat(40) };
+    const loopPayload = payload(f.head);
+    const legacy = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+    const normalized = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo.toLowerCase())}-${f.pr}-${f.head.toLowerCase()}.json`);
+    const status = { repo: f.repo, pr: f.pr, head: f.head, status: 'finished', loopPayload };
+    mkdirSync(redTeamStatusDir(f.env), { recursive: true });
+    if (withNormalized) {
+      writeFileSync(normalized, JSON.stringify(status));
+      utimesSync(normalized, 1_700_000_000, 1_700_000_000);
+    }
+    const spent = JSON.stringify({ ...status, retryCount: 1 });
+    writeFileSync(legacy, spent);
+    utimesSync(legacy, 1_700_000_060, 1_700_000_060);
+
+    expect(() => recordRedTeamStatus({ ...f, loopPayload, status: 'queued', retryCount: 1 }, { env: f.env }))
+      .toThrow('retry already admitted');
+    expect(readFileSync(legacy, 'utf8')).toBe(spent);
+    expect(existsSync(`${normalized}.retry-1`)).toBe(false);
+    for (const [nextStatus, retryCount] of [['running', undefined], ['finished', 0]]) {
+      recordRedTeamStatus({ ...f, loopPayload, status: nextStatus, retryCount }, { env: f.env });
+      expect(JSON.parse(readFileSync(normalized, 'utf8'))).toMatchObject({ status: nextStatus, retryCount: 1 });
+    }
+  });
+
   it.each(['legacy', 'normalized'])('returns the newer %s-filename status by mtime when both files exist', newer => {
     const f = { ...fixture(), repo: 'Web-Everything/Web-Everything', head: 'B'.repeat(40) };
     const paths = {

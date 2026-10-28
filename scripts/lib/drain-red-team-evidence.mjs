@@ -80,7 +80,10 @@ export function recordRedTeamStatus({ repo, pr, loopPayload, status, result = nu
   // Retry admission survives running/finished rewrites, including lost seat-row appends.
   // A marker left by a failed status write must not wedge this writer: `claimed` below keeps its spend.
   let prior;
-  try { prior = readStatusFile(path, { repo, pr, head }); }
+  try {
+    const { selectedPath } = readLatestRedTeamStatus({ repo, pr, head }, env);
+    prior = readStatusFile(selectedPath ?? path, { repo, pr, head });
+  }
   catch (error) {
     // Without a retry marker, ordinary writers may repair damaged JSON just as before retry admission.
     // Preserve marked evidence for inspection, and propagate filesystem errors even without a marker.
