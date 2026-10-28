@@ -55,8 +55,10 @@ describe('repeat-failure planner keys evidence by real run id and attempt', () =
 
   it('defaults absent run attempts and latestAttempt to 1 for distinct runs', () => {
     const repeatRuns = rows.map(({ attempt, ...row }, i) => ({ ...row, databaseId: runId + i }));
-    expect(plan({ repeatRuns, latestRunId: runId + 1, latestAttempt: undefined }))
-      .toMatchObject({ action: 'add', entries: [{ proof: { ...proof, runIds: [runId, runId + 1] } }] });
+    const out = plan({ repeatRuns, latestRunId: runId + 1, latestAttempt: undefined });
+    expect(out.action).toBe('add');
+    const { attempts, ...legacy } = { ...proof, runIds: [runId, runId + 1] };
+    expect(out.entries[0].proof).toEqual(legacy); // all-attempt-1 proof keeps its historical shape
   });
 
   it.each([0, -1, 1.5, '2', null])('refuses a non-positive-integer attempt: %s', (attempt) => {
