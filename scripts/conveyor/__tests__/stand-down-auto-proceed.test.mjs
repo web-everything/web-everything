@@ -11,6 +11,7 @@ import { autoProceedStandDowns, hasAutoProceedCandidate, classifyStandDownAutoPr
 import { enrichPrsWithStandDownAutoProceed as enrichWithCursor, readAutoProceedChecks, reserveAutoProceed,
   selectAutoProceedCandidates } from '../stand-down-auto-proceed-io.mjs';
 import { execFileSyncThrottled } from '../../lib/gh-throttle.mjs';
+import { readRequiredCheckBindings } from '../../lib/merge-queue-enqueue.mjs';
 
 vi.mock('../../lib/gh-throttle.mjs', async importOriginal => ({
   ...await importOriginal(), execFileSyncThrottled: vi.fn(() => { throw new Error('unexpected live IO'); }),
@@ -30,7 +31,9 @@ const run = (id, conclusion, completed_at = '2026-10-13T23:40:00Z', name = 'test
     head_sha: head, status: 'completed', conclusion, completed_at });
 const pr = (comments = [stand()]) => ({ number: 5195, headRefOid: head, comments });
 const evidence = runs => ({ head, complete: true, runs });
-const args = (runs, extra = {}) => ({ pr: pr(), requiredChecks: ['test'], checks: evidence(runs), ...extra });
+const bindings = names => names.map(context => ({ context, integration_id: 15368 }));
+const args = (runs, extra = {}) => ({ pr: pr(), requiredChecks: ['test'], checks: evidence(runs),
+  requiredCheckBindings: bindings(extra.requiredChecks ?? ['test']), ...extra });
 const redMainContext = {
   repo: 'we', now: Date.parse('2026-10-13T23:50:00Z'),
   rows: ['22:04:33', '22:13:35', '22:28:12', '22:40:50', '22:40:55', '22:52:26'].map((time, i) =>
@@ -41,6 +44,100 @@ const redMainContext = {
 };
 const rerun = [run(1, 'failure', '2026-10-13T22:50:00Z'), run(2, 'success')]
   .map((r, i) => ({ ...r, actions: { runId: 700, attempt: i + 1 } }));
+
+it.each(['cancelled-test', 'all-green-wrong-app', 'green-sibling-wrong-app'])(
+  'retains the hold without posting when policy-bound runs are absent: %s', scenario => {
+    const requiredChecks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'];
+    const runs = requiredChecks.map((name, i) => ({
+      ...run(i + 1, scenario !== 'all-green-wrong-app' && i === 0 ? 'cancelled' : 'success', undefined, name),
+      app: { id: scenario === 'all-green-wrong-app' || (scenario === 'cancelled-test' ? i === 0 : i === 1)
+        ? 42 : 15368, slug: 'github-actions' },
+    }));
+    const post = vi.fn(({ body }) => ({ author, body })), reserve = vi.fn(() => true);
+    const [result] = enrichPrsWithStandDownAutoProceed([pr()], {
+      repo: 'org/repo', requiredChecks, readComments: () => pr().comments,
+      readHead: () => head, readContext: () => redMainContext, readScopedChecks: () => [],
+      readChecks: input => readAutoProceedChecks(input, { read: argv =>
+        argv[1].includes('/statuses?') ? [] : { total_count: runs.length, check_runs: runs } }),
+      reserve, post, log: () => {},
+    });
+    expect(post).not.toHaveBeenCalled();
+    expect(reserve).not.toHaveBeenCalled();
+    expect(countUnresolvedStandDowns(result.comments)).toBe(1);
+    expect(classifyStandDownAutoProceed(args(runs, { requiredChecks, redMainContext })))
+      .toMatchObject({ action: 'hold', why: expect.stringMatching(/missing, pending or unknown required check/) });
+  });
+
+it.each(['unreadable', 'malformed', 'missing-rule', 'duplicate-rule', 'empty-checks',
+  'missing-id', 'null-id', 'string-id', 'zero-id', 'duplicate-context', 'missing-context'])(
+  'retains the hold without scheduling or posting when ruleset policy is %s', scenario => {
+    const policy = { rules: [{ type: 'required_status_checks', parameters: {
+      required_status_checks: bindings(['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate']),
+    } }] };
+    const rows = policy.rules[0].parameters.required_status_checks;
+    if (scenario === 'missing-rule') policy.rules = [];
+    if (scenario === 'duplicate-rule') policy.rules.push(policy.rules[0]);
+    if (scenario === 'empty-checks') rows.length = 0;
+    if (scenario === 'missing-id') delete rows[1].integration_id;
+    if (scenario === 'null-id') rows[1].integration_id = null;
+    if (scenario === 'string-id') rows[1].integration_id = '15368';
+    if (scenario === 'zero-id') rows[1].integration_id = 0;
+    if (scenario === 'duplicate-context') rows[1].context = 'test';
+    if (scenario === 'missing-context') rows.splice(1, 1);
+    const readBindings = () => readRequiredCheckBindings({ read: () => {
+      if (scenario === 'unreadable') throw new Error('ENOENT: ruleset unavailable');
+      return scenario === 'malformed' ? '{' : JSON.stringify(policy);
+    } });
+    const post = vi.fn(), reserve = vi.fn(), selectCandidates = vi.fn();
+    const [result] = enrichPrsWithStandDownAutoProceed([pr()], {
+      repo: 'org/repo', requiredChecks: ['test', 'smoke'], readBindings,
+      readComments: () => pr().comments, readHead: () => head, readContext: () => null,
+      readChecks: () => evidence([run(1, 'cancelled'), run(2, 'success', undefined, 'smoke')]),
+      selectCandidates, reserve, post, log: () => {},
+    });
+    expect(selectCandidates).not.toHaveBeenCalled();
+    expect(reserve).not.toHaveBeenCalled();
+    expect(post).not.toHaveBeenCalled();
+    expect(countUnresolvedStandDowns(result.comments)).toBe(1);
+  });
+
+it.each([undefined, null, [], [{ context: 'test' }], [{ context: 'test', integration_id: '15368' }]]
+  .map(requiredCheckBindings => ({ requiredCheckBindings })))(
+  'pure classifier refuses absent or invalid integration policy: %#', ({ requiredCheckBindings }) => {
+    expect(classifyStandDownAutoProceed(args([run(2, 'cancelled')], { requiredCheckBindings })))
+      .toMatchObject({ action: 'hold', why: expect.stringMatching(/integration policy/) });
+  });
+
+it('uses each policy integration ID rather than assuming the GitHub Actions constant', () => {
+  const requiredChecks = ['test', 'smoke'];
+  const requiredCheckBindings = [{ context: 'test', integration_id: 42 }, { context: 'smoke', integration_id: 15368 }];
+  const runs = [{ ...run(1, 'cancelled'), app: { id: 42 } }, run(2, 'success', undefined, 'smoke')];
+  assertAuthorizationBoundary(args(runs, { requiredChecks, requiredCheckBindings }), 'auto-proceed');
+  assertAuthorizationBoundary(args(runs.map(r => ({ ...r, app: { id: 42 } })),
+    { requiredChecks, requiredCheckBindings }), 'hold', /missing, pending or unknown/);
+});
+
+it.each([false, true])('ignores wrong-app history and new wrong-app failures before posting (late: %s)', late => {
+  let reads = 0;
+  const post = vi.fn(({ body }) => ({ body, author }));
+  const [result] = enrichPrsWithStandDownAutoProceed([pr()], {
+    repo: 'org/repo', requiredChecks: ['test'], readComments: () => pr().comments,
+    readHead: () => head, readContext: () => null, readScopedChecks: () => [],
+    readChecks: input => {
+      const runs = [run(1, 'cancelled')];
+      if (++reads > 1 || !late) runs.push({ ...run(2, 'failure'), app: { id: 42 }, check_suite: null });
+      return readAutoProceedChecks(input, { read: argv => {
+        if (argv[1].includes('/statuses?')) return [];
+        expect(argv[1]).toContain('/check-runs?'); // No Actions job lookup for ignored app history.
+        return { total_count: runs.length, check_runs: runs };
+      } });
+    }, reserve: () => true, post, log: () => {},
+  });
+  expect(reads).toBe(2);
+  expect(post).toHaveBeenCalledTimes(1);
+  expect(post.mock.calls[0][0].body).not.toContain('"appId":42');
+  expect(countUnresolvedStandDowns(result.comments)).toBe(0);
+});
 
 it.each(['success', 'cancelled', 'skipped'])(
   'retains a failed independent same-name job in the same suite beside %s', conclusion => {
@@ -260,28 +357,29 @@ it.each([
   { id: 42, slug: 'github-actions' },
 ])('holds when a newer successful same-name check is from another app: %j', app => {
   assertAuthorizationBoundary(args([rerun[0], { ...rerun[1], app }]),
-    'hold', /^operator answer required: ambiguous check identity$/);
+    'hold', /genuine required-check FAILURE/);
 });
-it.each([undefined, null, {}, { id: null, slug: '' }])('holds for missing app identity: %j', app => {
+it.each([undefined, null, {}, { id: null, slug: '' }, { id: '15368', slug: 'github-actions' }])('holds for missing app identity: %j', app => {
   assertAuthorizationBoundary(args([rerun[0], { ...rerun[1], app }]),
-    'hold', /^operator answer required: ambiguous check identity$/);
+    'hold', /genuine required-check FAILURE/);
   assertAuthorizationBoundary(args([{ ...rerun[0], app }, rerun[1]]),
-    'hold', /^operator answer required: ambiguous check identity$/);
+    'hold', /no recovered CI evidence/);
   assertAuthorizationBoundary(args([{ ...run(2, 'cancelled'), app }]),
-    'hold', /^operator answer required: ambiguous check identity$/);
+    'hold', /missing, pending or unknown required check/);
 });
-it('holds when a different app appears in older history despite a same-app successful rerun', () => {
+it('ignores a different app in older history beside a policy-bound successful rerun', () => {
   assertAuthorizationBoundary(args([
     { ...run(1, 'success'), app: { id: 42, slug: 'another-app' } },
     { ...rerun[0], id: 2 }, { ...rerun[1], id: 3 },
-  ]), 'hold', /^operator answer required: ambiguous check identity$/);
+  ]), 'auto-proceed');
 });
-it('accepts same-name same-app reruns with slug-only identity', () => {
-  assertAuthorizationBoundary(args(rerun.map(r => ({ ...r, app: { slug: 'github-actions' } }))), 'auto-proceed');
+it('holds same-name same-app reruns with slug-only identity', () => {
+  assertAuthorizationBoundary(args(rerun.map(r => ({ ...r, app: { slug: 'github-actions' } }))),
+    'hold', /missing, pending or unknown required check/);
 });
 it('holds when slug-only identities differ', () => {
   assertAuthorizationBoundary(args(rerun.map((r, i) => ({ ...r, app: { slug: i ? 'another-app' : 'github-actions' } }))),
-    'hold', /^operator answer required: ambiguous check identity$/);
+    'hold', /missing, pending or unknown required check/);
 });
 function assertAuthorizationBoundary(input, action, why) {
   const decision = classifyStandDownAutoProceed(input);
@@ -290,6 +388,7 @@ function assertAuthorizationBoundary(input, action, why) {
   const posts = [], reservations = [];
   const result = enrichPrsWithStandDownAutoProceed([input.pr], {
     repo: 'org/repo', requiredChecks: input.requiredChecks,
+    readBindings: () => input.requiredCheckBindings,
     readComments: () => input.pr.comments, readChecks: () => input.checks,
     readHead: () => input.pr.headRefOid, readContext: () => input.redMainContext,
     readScopedChecks: () => [], log: () => {},

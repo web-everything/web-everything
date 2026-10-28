@@ -10,6 +10,7 @@ export default {
   fixedBy: { sha: 'uncommitted', where: 'lane/r123-auto-proceed', paths: [
     'scripts/conveyor/reconcile-pass.mjs', 'scripts/conveyor/reconcile-fix-dispatch.mjs',
     'scripts/conveyor/stand-down-auto-proceed-io.mjs', 'scripts/conveyor/stand-down-auto-proceed.mjs',
+    'scripts/lib/merge-queue-enqueue.mjs',
     'scripts/conveyor/fix-takeover.mjs', 'skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs',
   ] },
   fixPresent(root) {
@@ -119,6 +120,34 @@ export default {
     io.enrichPrsWithStandDownAutoProceed([pr], { ...writerOptions,
       readChecks: () => ({ head, complete: true, runs: [run(101, 'failure'), run(102, 'success', 902)] }) });
     if (writes.includes('reserve') || writes.includes('post')) violations.push('independent same-name workflow success released a failed suite');
+
+    // Required names are authorized by ruleset integration IDs, never by agreement among observed apps.
+    const wrongAppWrites = {};
+    for (const scenario of ['cancelled-test', 'all-green-wrong-app', 'green-sibling-wrong-app']) {
+      writes.length = 0;
+      const requiredChecks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'];
+      const runs = requiredChecks.map((name, i) => ({ ...run(102 + i,
+        scenario !== 'all-green-wrong-app' && i === 0 ? 'cancelled' : 'success'), name,
+      app: { id: scenario === 'all-green-wrong-app' || (scenario === 'cancelled-test' ? i === 0 : i === 1)
+        ? 42 : 15368, slug: 'github-actions' } }));
+      // Green checks alone can release a main-red park, so exercise that authorization too.
+      const context = { repo: 'we', now: Date.parse('2026-10-13T23:50:00Z'),
+        rows: ['22:04:33', '22:13:35', '22:28:12', '22:40:50', '22:40:55', '22:52:26'].map((time, i) =>
+          ({ v: 1, repo: 'we', pr: pr.number, head, at: `2026-10-13T${time}Z`,
+            kind: i === 3 ? 'rearm' : i === 5 ? 'park' : 'ci-heal', reason: 'budget' })),
+        config: { maxSessions: 3, windowHours: 6, hold: true, rearmAfterMinutes: 120,
+          redMainDiscount: 'on', redMainWindows: [{ start: '2026-10-13T21:33:48Z', end: '2026-10-13T23:32:06Z' }] },
+      };
+      const [held] = io.enrichPrsWithStandDownAutoProceed([pr], { ...writerOptions, requiredChecks,
+        readContext: () => context,
+        readChecks: input => io.readAutoProceedChecks(input, { read: argv =>
+          argv[1].includes('/statuses?') ? [] : { total_count: runs.length, check_runs: runs } }),
+      });
+      wrongAppWrites[scenario] = [...writes];
+      if (writes.includes('reserve') || writes.includes('post') || countUnresolvedStandDowns(held.comments) !== 1) {
+        violations.push(`${scenario} released a hold without all policy-bound required checks`);
+      }
+    }
 
     // Cancellation/skip evidence must be newer than the hold it would release.
     for (const conclusion of ['cancelled', 'skipped']) {
@@ -250,7 +279,7 @@ export default {
       if (crossRepoWrites.length) violations.push('a WE outage released a genuine FrontierUI failure');
     }
     return { violations, dryRunWrites, defaultDispatchWrites, optedOutDispatchWrites, mainReads, crossRepoWrites,
-      refreshedThreadRace, sameAttemptWrites, legacyStatusWrites, failedRerunRace, daemonWrites };
+      refreshedThreadRace, sameAttemptWrites, legacyStatusWrites, failedRerunRace, daemonWrites, wrongAppWrites };
   },
   judge(report) { return report.violations; },
 };
