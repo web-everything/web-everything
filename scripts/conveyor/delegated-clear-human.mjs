@@ -98,8 +98,9 @@ export function loadDelegatedClearHumanMode({ env = process.env, readFile = read
 export async function runDelegatedClearHuman({ prs = [], mode = 'shadow', scoreNet, redTeamClearAtHead, readLiveHead,
   emit = (e) => appendDaemonEvent({ kind: e.kind, pr: e.pr, daemon: 'delegated-clear-human', detail: { head: e.head, evidence: e.evidence } }),
   clearHuman = clearHumanViaCli } = {}) {
-  const out = { mode, wouldApprove: [], cleared: [], refused: [] };
-  if (mode === 'off') return out;
+  const out = { mode, wouldApprove: [], cleared: [], headMovedAfterClear: [], refused: [] };
+  // Fail closed: only the three known modes act; anything else (typo, undefined) does nothing.
+  if (mode !== 'shadow' && mode !== 'on') return out;
   for (const pr of prs) {
     if (!hasReviewLabel(pr?.labels || [], REVIEW_LABELS.human)) continue;
     const r = evaluateEligibility(pr, { scoreNet, redTeamClearAtHead });
@@ -112,7 +113,11 @@ export async function runDelegatedClearHuman({ prs = [], mode = 'shadow', scoreN
     let live = null;
     try { live = readLiveHead(pr); } catch { live = null; }
     if (live !== r.evidence.head) { out.refused.push({ pr: pr.number, failed: ['live head moved since evaluation'] }); continue; }
-    try { await clearHuman({ pr: pr.number, head: r.evidence.head, reason: R11_REASON, actor: ACTOR }); out.cleared.push(pr.number); }
+    try { await clearHuman({ pr: pr.number, head: r.evidence.head, reason: R11_REASON, actor: ACTOR }); out.cleared.push(pr.number);
+      // The CLI cannot pin a head for clear-human, so re-read after the write and flag a push that raced it.
+      let after = null;
+      try { after = readLiveHead(pr); } catch { after = null; }
+      if (after !== r.evidence.head) out.headMovedAfterClear.push(pr.number); }
     catch (e) { out.refused.push({ pr: pr.number, failed: [`clear-human refused: ${String(e?.message || e).split('\n')[0]}`] }); }
   }
   return out;

@@ -2955,7 +2955,7 @@ export function decideReviewGate(input = {}) {
   // rides beside it. Every other case (unproven score, true score, pin) is the unchanged fail-closed path.
   const { humanScoreFresh = false, humanPinned = false, ...rest } = input || {};
   const labels0 = rest.labels || [];
-  if (humanScoreFresh === true && rest.humanRequired !== true && !humanPinned
+  if (humanScoreFresh === true && rest.humanRequired === false && !humanPinned
       && hasReviewLabel(labels0, REVIEW_LABELS.human) && !hasReviewLabel(labels0, REVIEW_LABELS.accepted)) {
     const stripped = labels0.filter((l) => (typeof l === 'string' ? l : l && l.name) !== REVIEW_LABELS.human);
     const g = decideReviewGateCore({ ...rest, humanRequired: false, labels: stripped });
