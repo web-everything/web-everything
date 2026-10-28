@@ -15,7 +15,7 @@ import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
 const TIMEOUT_SCALE = 3; // Allow extra time for CLI subprocesses on loaded shards.
 const NOW = Date.now();
-const iso = (minAgo) => new Date(NOW - minAgo * 60_000).toISOString();
+const iso = (minAgo, base = NOW) => new Date(base - minAgo * 60_000).toISOString();
 // Exercise real re-reads without production sleeps: several 20 s waits can exceed the child timeout.
 const retryTimingEnv = { WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC: '0' };
 
@@ -339,7 +339,8 @@ function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, e
     const pr = (number, headRefName, ages, extra = {}) => ({
       number, title: `couple ${number}`, body: 'A real summary.', headRefName, baseRefName: 'main', headRefOid: sha(number),
       mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
-      labels: [{ name: 'ready-to-merge' }], comments: [], passAtSeq: ages.map(iso),
+      // Ages count from this fixture, not module load: a slow file must not age a 25 min pass past the 30 min bar.
+      labels: [{ name: 'ready-to-merge' }], comments: [], passAtSeq: ages.map((age) => iso(age, Date.now())),
       commits: [{ oid: sha(number), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
       files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0, changeType: 'ADDED' }], ...extra,
     });
