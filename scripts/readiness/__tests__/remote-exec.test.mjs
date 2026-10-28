@@ -45,7 +45,7 @@ const nonceOf = (input) => JSON.parse(input).nonce;
 function fixture({ probeCode = 0, copyCode = 0, prepareCode = 0, runCode = 0, receipt, receiptCode = 0 } = {}) {
   let state;
   const exec = vi.fn(async (call) => {
-    if (call.file === 'git') return { code: 0, stdout: 'package-lock.json\na.test.mjs\n' };
+    if (call.file === 'git') return { code: 0, stdout: 'package-lock.json\0a.test.mjs\0' };
     if (call.file === 'rsync') return { code: copyCode, stdout: '' };
     if (isPrepare(call)) {
       state = JSON.parse(call.input);
@@ -109,6 +109,51 @@ function realRemoteFixture(files) {
 }
 
 describe('remote snapshot regressions', () => {
+  it.each(['ï¿½.test.mjs', '\ufffd\ufffd.test.mjs'])(
+    'keeps the failing é test selected through real split-byte capture alongside %s', async passingName => {
+      const files = ['package-lock.json', 'é.test.mjs', passingName];
+      const f = realRemoteFixture(files);
+      writeFileSync(join(cwd, 'é.test.mjs'), "import { test } from 'node:test'; test('e-acute fails', () => { throw new Error('EXPECTED_FAILURE'); });");
+      writeFileSync(join(cwd, passingName), "import { test } from 'node:test'; test('other passes', () => {});");
+      writeFileSync(join(f.bin, 'npm'), `#!${process.execPath}
+if (process.argv[2] === 'ci') process.exit(0);
+const fs = require('node:fs');
+const files = fs.readdirSync('.').filter(name => name.endsWith('.test.mjs'));
+const result = require('node:child_process').spawnSync(process.execPath, ['--test', ...files], {stdio:'inherit'});
+process.exit(result.status ?? 1);
+`, { mode: 0o755 });
+      const transport = f.exec;
+      const bytes = Buffer.from(files.join('\0') + '\0');
+      const split = bytes.indexOf(Buffer.from('é')) + 1;
+      delete f.listFiles;
+      f.exec = vi.fn(call => call.file === 'git' ? defaultExec({
+        file: process.execPath, cwd, signal: call.signal,
+        args: ['-e', `const bytes = Buffer.from(${JSON.stringify(bytes.toString('base64'))}, 'base64');
+process.stdout.write(bytes.subarray(0, ${split}), () => setTimeout(() => process.stdout.end(bytes.subarray(${split})), 100));`],
+      }) : transport(call));
+      f.argv = ['npm', 'run', 'test:unit'];
+      f.local = vi.fn(async () => {
+        const result = spawnSync(process.execPath, ['--test', 'é.test.mjs', passingName], { cwd, encoding: 'utf8', timeout: 10000 });
+        expect(result.stdout).toContain('e-acute fails');
+        expect(result.stdout).toContain('other passes');
+        return result.status;
+      });
+      expect(await runWithRemoteFallback({ ...f, log: vi.fn() })).toBe(1);
+      const copy = callsOf(f.exec).find(call => call.file === 'rsync');
+      if (passingName.includes('\ufffd')) {
+        // Literal replacement characters are ambiguous evidence: run the full
+        // local selection instead of certifying a reduced remote snapshot.
+        expect(copy).toBeUndefined();
+        expect(f.local).toHaveBeenCalledTimes(1);
+      } else {
+        expect(copy.input.split('\0').slice(0, -1)).toEqual(files.map(name => `./${name}`));
+        expect(f.local).not.toHaveBeenCalled();
+        expect(f.runs[0].status).toBe(1);
+        expect(f.runs[0].stdout).toContain('e-acute fails');
+        expect(f.runs[0].stdout).toContain('other passes');
+      }
+    }, 15000);
+
   it('falls back instead of certifying a snapshot missing a failing identity.test.mjs', async () => {
     const files = ['package-lock.json', 'package.json', 'vitest.config.mjs', 'smoke.test.mjs', 'identity.test.mjs'];
     const f = realRemoteFixture(files);
@@ -770,6 +815,26 @@ describe('runRemote', () => {
     }));
     expect(callsOf(f.exec).find((call) => call.file === 'rsync').input).toContain('a.test.mjs');
   });
+
+  it.each([
+    'package-lock.json\na.test.mjs\n', 'package-lock.json\0a.test.mjs',
+    'package-lock.json\0\0a.test.mjs\0',
+    'package-lock.json\0a.test.mjs\0a.test.mjs\0',
+  ])('refuses malformed or count-reducing Git inventory %j before prepare', async stdout => {
+    const { listFiles, ...f } = fixture();
+    const transport = f.exec;
+    f.exec = vi.fn(call => call.file === 'git' ? { code: 0, stdout } : transport(call));
+    expect(await runRemote(f)).toEqual({ mode: 'fallback', reason: 'copy-failed' });
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+
+  it.each(['\ufffd.test.mjs', '\ufffd\ufffd.test.mjs', '\ud800.test.mjs', 'src//a.test.mjs', 'a.test.mjs/'])(
+    'rejects ambiguous or noncanonical inventory path %j before transport', async path => {
+      const f = fixture();
+      f.listFiles.mockResolvedValue(['package-lock.json', path]);
+      expect(await runRemote(f)).toEqual({ mode: 'fallback', reason: 'copy-failed' });
+      expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+    });
 });
 
 describe('runWithRemoteFallback', () => {

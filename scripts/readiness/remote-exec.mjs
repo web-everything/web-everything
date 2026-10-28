@@ -53,14 +53,14 @@ export function defaultExec({ file, args, cwd, input, inherit = false, signal })
     const abort = () => kill();
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) abort();
-    let stdout = '';
+    const stdout = [];
     let bytes = 0;
     let exceeded = false;
     for (const stream of [child.stdout, child.stderr]) {
       stream?.on('data', (chunk) => {
         bytes += chunk.length;
         if (bytes > LIMIT) { exceeded = true; kill(); return; }
-        if (stream === child.stdout) stdout += chunk.toString();
+        if (stream === child.stdout) stdout.push(chunk);
       });
     }
     let error;
@@ -69,7 +69,9 @@ export function defaultExec({ file, args, cwd, input, inherit = false, signal })
       signal?.removeEventListener('abort', abort);
       if (signal?.aborted) resolve({ mode: 'cancelled', terminated: true });
       else if (error || exceeded) reject(error ?? new Error('Captured output limit exceeded'));
-      else resolve({ code: code ?? 1, stdout });
+      // A UTF-8 filename may span data events. Decode only complete output;
+      // the capture limit above still counts raw bytes from both streams.
+      else resolve({ code: code ?? 1, stdout: Buffer.concat(stdout).toString('utf8') });
     });
     if (input !== undefined) {
       child.stdin.on('error', () => {}); // A failed SSH may close stdin before reading.
@@ -101,9 +103,10 @@ function safeFiles(files) {
   if (!Array.isArray(files)) throw new Error('Invalid file inventory');
   const dropped = [];
   const safe = files.filter((path) => {
-    if (typeof path !== 'string' || !path || path.startsWith('/') || /[\0\r\n]/.test(path)) throw new Error('Invalid file path');
+    if (typeof path !== 'string' || !path || path.startsWith('/') || /[\0\r\n\ufffd]/.test(path)
+      || Buffer.from(path, 'utf8').toString('utf8') !== path) throw new Error('Invalid file path');
     const parts = path.split('/');
-    if (parts.some((part) => part === '..' || part === '.')) throw new Error('Unsafe file path');
+    if (parts.some((part) => !part || part === '..' || part === '.')) throw new Error('Unsafe file path');
     const reason = parts.some(part => omittedPatterns.some(pattern => pattern.test(part))) ? 'generated'
       : parts.some(part => !identityPatterns.some(pattern => pattern.test(part))
         && credentialPatterns.some(pattern => pattern.test(part))) ? 'credential' : null;
@@ -112,9 +115,12 @@ function safeFiles(files) {
   });
   // openrsync still treats leading #/; as comments with --from0. Anchor every
   // validated relative path so both rsync implementations read it literally.
-  const input = [...new Set(safe)].map((path) => `./${path}\0`).join('');
+  // Deduplicate exact strings only: never normalize Unicode, case or slashes.
+  // The caller also checks cardinality against Git's original inventory.
+  const selected = [...new Set(safe)];
+  const input = selected.map((path) => `./${path}\0`).join('');
   if (Buffer.byteLength(input) > LIMIT) throw new Error('File inventory limit exceeded');
-  return { input, dropped };
+  return { input, dropped, selected };
 }
 
 export async function runRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, signal } = {}) {
@@ -171,11 +177,17 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
       const files = listFiles ? await listFiles(cwd) : await (async () => {
         const result = await execute({file:'git',args:['ls-files','-co','--exclude-standard','-z'],cwd,signal});
         if(result.code !== 0 || typeof result.stdout !== 'string' || Buffer.byteLength(result.stdout)>LIMIT) throw new Error('Inventory unavailable');
-        return result.stdout.split(result.stdout.includes('\0')?'\0':'\n').filter(Boolean);
+        if (result.stdout === '') return [];
+        if (!result.stdout.endsWith('\0')) throw new Error('Invalid file inventory framing');
+        // Remove only the terminator; empty interior entries must fail validation.
+        return result.stdout.slice(0, -1).split('\0');
       })();
-      const { input: inventory, dropped } = safeFiles(files);
+      const { input: inventory, dropped, selected } = safeFiles(files);
       checkAbort();
       if(dropped.some(file => file.reason !== 'generated')) return fallback('filtered-inventory');
+      // Only explicitly classified generated files may be omitted. A duplicate
+      // or any other count loss must not certify a reduced selection.
+      if (inventory.split('\0').length - 1 !== files.length - dropped.length) throw new Error('File inventory count mismatch');
       if(files.includes('vitest.shared.ts')) return fallback('unsupported-sibling-dependency');
       const prepared = await ssh('prepare',{nonce,label:runId});
       if(prepared.code !== 0 || typeof prepared.stdout !== 'string' || prepared.stdout.length>1024) throw new Error('Prepare failed');
@@ -187,7 +199,7 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
         './',`${host}:${ROOT}/${run}/work/`],cwd,input:inventory,signal});
       checkAbort();
       if(copied.code !== 0) throw new Error('Copy failed');
-      const inputDigest = await digestInput(cwd, inventory.split('\0').filter(Boolean).map(name=>name.slice(2)));
+      const inputDigest = await digestInput(cwd, selected);
       expected = {v:1,nonce,run,inputDigest,argvDigest:digestArgv(argv),lock};
     } catch {return signal?.aborted ? cancelled() : fallback('copy-failed');}
     try {

@@ -18,6 +18,18 @@ function capturedChild() {
 }
 
 describe('remote-exec captured output boundary', () => {
+  it.each(['é.test.mjs\nï¿½.test.mjs', 'é.test.mjs\0ï¿½.test.mjs\0', '𐐀.test.mjs\0'])('preserves UTF-8 inventory bytes across every chunk boundary: %j', async inventory => {
+    const bytes = Buffer.from(inventory);
+    for (let split = 1; split < bytes.length; split++) {
+      const child = capturedChild();
+      const pending = defaultExec({ file: 'git', args: ['ls-files', '-z'] });
+      child.stdout.emit('data', bytes.subarray(0, split));
+      child.stdout.emit('data', bytes.subarray(split));
+      child.emit('close', 0);
+      await expect(pending, `split at byte ${split}`).resolves.toEqual({ code: 0, stdout: inventory });
+    }
+  });
+
   it('does not spawn for an already aborted request', async () => {
     const controller = new AbortController();
     controller.abort();
@@ -65,6 +77,17 @@ describe('remote-exec captured output boundary', () => {
 
     await expect(result.then(() => undefined)).rejects.toThrow('Captured output limit exceeded');
     expect(child.kill).toHaveBeenCalledTimes(1);
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+  });
+
+  it('counts multi-byte stdout against the raw byte limit, not decoded character length', async () => {
+    const child = capturedChild();
+    const pending = defaultExec({ file: 'git', args: ['ls-files', '-z'] });
+    child.stdout.emit('data', Buffer.from('é'.repeat(2 * 1024 * 1024)));
+    expect(child.kill).not.toHaveBeenCalled();
+    child.stderr.emit('data', Buffer.from('!'));
+    child.emit('close', 0);
+    await expect(pending).rejects.toThrow('Captured output limit exceeded');
     expect(child.kill).toHaveBeenCalledWith('SIGKILL');
   });
 });
