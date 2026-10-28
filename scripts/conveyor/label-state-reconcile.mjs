@@ -34,11 +34,11 @@ export function readLabelReconcileComments(number, options = {}) {
  * Pure: all inputs are observations; only exact SHA equality permits a stored result to decide.
  * `reviews` is the PR's native GitHub reviews; anything but an array is unreadable and never clears a review hold.
  */
-export function planLabelStateReconcile({ repo, pr, review = null, redTeam = null, reviews = null } = {}) {
+export function planLabelStateReconcile({ repo, pr, review = null, redTeam = null, reviews = null, env = process.env } = {}) {
   const from = names(pr.labels), after = new Set(from), evidence = {};
   const head = pr.headRefOid;
   if (!/^[a-f0-9]{40}$/.test(head ?? '') || !Array.isArray(pr.comments)) return null;
-  const disposition = readRedTeamDisposition({ repo, pr: pr.number, head, comments: pr.comments, env: {} });
+  const disposition = readRedTeamDisposition({ repo, pr: pr.number, head, comments: pr.comments, env });
   const result = disposition.result?.rev === head ? disposition.result : null;
   const status = redTeam?.repo === repo && Number(redTeam.pr) === pr.number && redTeam.head === head
     && redTeam.status === 'finished' && ['accept', 'changes'].includes(redTeam.result?.foldedVerdict) ? redTeam : null;
@@ -47,7 +47,7 @@ export function planLabelStateReconcile({ repo, pr, review = null, redTeam = nul
     // Live send-back/held dispositions include policy and operator rulings. A stored verdict
     // is only a fallback when no live result exists; it cannot undo a recorded release.
     const plan = planRedTeamStatusLabels({ repo, pr: pr.number, head, labels: from, comments: pr.comments,
-      env: {}, evidence: status ? { status } : {} });
+      env, evidence: status ? { status } : {} });
     if (plan.add) after.add(plan.add);
     for (const label of plan.remove) after.delete(label);
     redBlocked = after.has('red-team:blocked');
@@ -98,7 +98,7 @@ export function planLabelStateReconcile({ repo, pr, review = null, redTeam = nul
 }
 
 /** IO shell: re-read evidence and then the live head; read failures leave labels untouched for the next pass. */
-export function sweepLabelStateReconcile({ prs = [], repo, resolveRepo = () => repo, dryRun = false,
+export function sweepLabelStateReconcile({ prs = [], repo, resolveRepo = () => repo, dryRun = false, env = process.env,
   provider = createGhProvider(), readPr = defaultReadPr, readComments = readLabelReconcileComments,
   readReviews = readReviewRunEvidence, readReview = readRun, readRedTeam = readRedTeamStatus,
   emit = appendDaemonEvent } = {}) {
@@ -136,7 +136,7 @@ export function sweepLabelStateReconcile({ prs = [], repo, resolveRepo = () => r
         try { redTeam = readRedTeam({ repo: slug, pr: pr.number, head: pr.headRefOid }); } catch { /* retain unknown state */ }
         return { review, redTeam };
       };
-      const initialPlan = planLabelStateReconcile({ repo: slug, pr, ...readStored(), reviews: first.native });
+      const initialPlan = planLabelStateReconcile({ repo: slug, pr, ...readStored(), reviews: first.native, env });
       if (!initialPlan) continue;
       // Provision before refreshing evidence: provisioning can publish a same-head objection too.
       if (!dryRun) {
@@ -144,9 +144,11 @@ export function sweepLabelStateReconcile({ prs = [], repo, resolveRepo = () => r
       }
       // Evidence reads can span a push, a new verdict or a new run. Never apply the old head's clearance to the
       // new head, and re-plan from a final read of every plane so a hold that arrived meanwhile is honoured.
+      // Read stores before the live refresh so objections arriving during store IO are included in the plan.
+      const stored = readStored(true);
       const fresh = readLive();
       if (!fresh || fresh.pr.headRefOid !== pr.headRefOid) continue;
-      const plan = planLabelStateReconcile({ repo: slug, pr: fresh.pr, ...readStored(true), reviews: fresh.native });
+      const plan = planLabelStateReconcile({ repo: slug, pr: fresh.pr, ...stored, reviews: fresh.native, env });
       if (!plan) continue;
       if (!dryRun) {
         // A changed plan may need a different label. Retry next tick rather than provision after the refresh.

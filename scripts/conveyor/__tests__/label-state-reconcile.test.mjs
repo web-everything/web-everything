@@ -36,6 +36,24 @@ function referral(number, ruled) {
 }
 
 describe('planLabelStateReconcile', () => {
+  it.each(['injected', 'process', 'default'])
+  ('a confirmed degraded finding respects the %s red-team policy', kind => {
+    const result = red(42, head, true);
+    result.body = result.body.replace('edge-case, broken', 'edge-case, degraded');
+    const live = pr(42, ['review:changes', 'red-team:blocked', 'fix-waiting:host-busy', 'ready-to-merge'], [result]);
+    const policy = { WE_RED_TEAM_CONFIRMED_BREAKS: 'degraded=send-back' };
+    vi.stubEnv('WE_RED_TEAM_CONFIRMED_BREAKS', policy.WE_RED_TEAM_CONFIRMED_BREAKS);
+    if (kind !== 'process') delete process.env.WE_RED_TEAM_CONFIRMED_BREAKS;
+    try {
+      const plan = planOf({ repo, pr: live, review: review(42), ...(kind === 'injected' ? { env: policy } : {}) });
+      expect(plan.to).toEqual(kind === 'default' ? ['ready-to-merge', 'red-team:clear']
+        : ['review:changes', 'red-team:blocked', 'fix-waiting:host-busy']);
+      expect(plan.remove).toEqual(kind === 'default'
+        ? ['review:changes', 'red-team:blocked', 'fix-waiting:host-busy'] : ['ready-to-merge']);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
   it.each(['failed', 'pending', 'missing', 'advisory-only', 'stack-only'])
   ('%s publication cannot authorize clearing review holds', kind => {
     const stored = review(42);
@@ -224,7 +242,7 @@ describe('planLabelStateReconcile', () => {
     const live = pr(42, ['red-team:blocked', 'red-team:pending', 'review:changes',
       'fix-waiting:host-busy', 'ready-to-merge'], comments);
     const redTeam = { repo, pr: 42, head, status: 'finished', result: { foldedVerdict: 'changes' } };
-    expect(planOf({ repo, pr: live, redTeam, review: review(42) }).to)
+    expect(planOf({ repo, pr: live, redTeam, review: review(42), env: {} }).to)
       .toEqual(['ready-to-merge', 'red-team:clear']);
   });
   it.each(['send-back', 'held', 'forged-release', 'stale-release'])
@@ -275,6 +293,63 @@ describe('planLabelStateReconcile', () => {
 });
 
 describe('sweepLabelStateReconcile', () => {
+  it.each(['injected', 'process', 'default'])
+  ('the sweep carries the %s policy through both plans to the label writer', kind => {
+    const io = fixture(), live = io.prs[0];
+    live.comments = [red(5954, head, true)];
+    live.comments[0].body = live.comments[0].body.replace('edge-case, broken', 'edge-case, degraded');
+    live.labels.push('ready-to-merge');
+    const policy = { WE_RED_TEAM_CONFIRMED_BREAKS: 'degraded=send-back' };
+    if (kind === 'injected') io.env = policy;
+    vi.stubEnv('WE_RED_TEAM_CONFIRMED_BREAKS', policy.WE_RED_TEAM_CONFIRMED_BREAKS);
+    if (kind !== 'process') delete process.env.WE_RED_TEAM_CONFIRMED_BREAKS;
+    try {
+      const [row] = sweepLabelStateReconcile(io);
+      expect(row.labelsReconciled.to).toEqual(kind === 'default' ? ['ready-to-merge', 'red-team:clear']
+        : ['review:changes', 'red-team:blocked', 'fix-waiting:host-busy']);
+      expect(io.provider.setLabels).toHaveBeenCalledTimes(1);
+      expect(io.provider.setLabels).toHaveBeenCalledWith(repo, 5954, kind === 'default'
+        ? { add: 'red-team:clear', remove: ['review:changes', 'red-team:blocked', 'fix-waiting:host-busy'] }
+        : { add: null, remove: ['ready-to-merge'] });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+  it.each(['comment', 'edit', 'native', 'unreadable'])
+  ('a same-head %s arriving during the final stored read cannot be cleared', kind => {
+    const io = fixture(), live = io.prs[0], stored = review(5954);
+    live.labels.push('ready-to-merge');
+    const old = { ...comment('Operator note'), id: 'IC_old', createdAt: '2026-10-26T00:59:00Z',
+      updatedAt: '2026-10-26T00:59:00Z' };
+    live.comments.push(old);
+    let reads = 0;
+    io.readReviews = () => {
+      if (++reads === 2) {
+        if (kind === 'comment') live.comments.push({ ...comment('🔁 review — changes requested'), id: 'IC_new',
+          createdAt: '2026-10-26T01:02:00Z', updatedAt: '2026-10-26T01:02:00Z' });
+        if (kind === 'edit') Object.assign(old, { body: '🔁 review — changes requested', updatedAt: '2026-10-26T01:02:00Z' });
+        if (kind === 'native') io.provider.readPrReviews.mockReturnValue([
+          { state: 'CHANGES_REQUESTED', user: { login: 'chalbert' }, submitted_at: '2026-10-26T01:02:00Z' }]);
+      }
+      return [reviewRunEvidence(stored)];
+    };
+    io.readComments = () => {
+      if (kind === 'unreadable' && reads === 2) throw Error('final thread unreadable');
+      return structuredClone(live.comments);
+    };
+    const [row] = sweepLabelStateReconcile(io);
+    expect(reads).toBe(2);
+    if (kind === 'unreadable') {
+      expect(row.error).toBe('final thread unreadable');
+      expect(io.provider.setLabels).not.toHaveBeenCalled();
+      expect(io.emit).not.toHaveBeenCalled();
+    } else {
+      expect(row.labelsReconciled.to).toEqual(['review:changes', 'fix-waiting:host-busy', 'red-team:clear']);
+      expect(io.provider.setLabels).toHaveBeenCalledTimes(1);
+      expect(io.provider.setLabels).toHaveBeenCalledWith(repo, 5954,
+        { add: 'red-team:clear', remove: ['red-team:blocked', 'ready-to-merge'] });
+    }
+  });
   it.each(['later-edit', 'old-edit', 'never-edited', 'missing', 'duplicate', 'invalid', 'failed-page'])
   ('production edit metadata (%s) is joined before planning clearance', kind => {
     const io = fixture();
