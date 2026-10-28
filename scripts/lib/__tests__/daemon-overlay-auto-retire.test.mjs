@@ -334,7 +334,9 @@ describe('real Git retirement evidence', () => {
     appendOverlayEvent(root, { ...event, kind: 'removed' }, { env });
     appendOverlayEvent(root, { ...event, kind: 'removed' }, { env });
     expect(audit()).toHaveLength(6);
-  });
+  // Each concurrent native writer has a 10s hard limit; the test must allow that
+  // bounded work to finish before teardown removes the shared fixture.
+  }, 15_000);
 
   it('retries a shadow observation after audit append failure', () => {
     const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
@@ -934,12 +936,12 @@ describe('PR #5964 advisory round: evidence, containment recovery and audit orde
   });
 });
 
-describe('policy cascade and shadow graduation', () => {
+describe('policy cascade and explicit shadow promotion', () => {
   it.each(['off', 'on'])('explicit environment %s remains unchanged after the tool cutoff', (mode) => {
     env.WE_DAEMON_OVERLAY_AUTO_RETIRE = mode;
     expect(resolveAutoRetireMode(env, { now: '2026-10-29T12:00:00Z' })).toMatchObject({ mode, source: 'env' });
   });
-  it.each(['standard', 'platform', 'tool', 'env'])('%s shadow honors mode provenance before, at and after graduation', (source) => {
+  it.each(['standard', 'platform', 'tool', 'env'])('%s shadow stays observe-only regardless of a legacy graduation date', (source) => {
     delete env.WE_DAEMON_OVERLAY_AUTO_RETIRE;
     const settingsPath = join(base, 'settings.json');
     writeFileSync(settingsPath, JSON.stringify({ autoRetire: {
@@ -948,9 +950,8 @@ describe('policy cascade and shadow graduation', () => {
     if (source === 'platform') writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, JSON.stringify({ autoRetire: { mode: 'shadow' } }));
     if (source === 'env') env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'shadow';
     for (const now of ['2026-10-27T11:59:59Z', '2026-10-27T12:00:00Z', '2026-10-29T12:00:00Z']) {
-      const graduated = source === 'tool' && now !== '2026-10-27T11:59:59Z';
       expect(resolveAutoRetireMode(env, { settingsPath, now })).toMatchObject({
-        mode: graduated ? 'on' : 'shadow', source: `${source}${graduated ? ' (shadow elapsed)' : ''}`,
+        mode: 'shadow', source,
       });
     }
   });
@@ -964,11 +965,22 @@ describe('policy cascade and shadow graduation', () => {
     expect(readOverlayState(root, { env }).overlays).toEqual(overlays);
   });
 
-  it('defaults to shadow, and the shipped setting graduates at exactly one day', () => {
+  it('defaults and shipped settings remain shadow until explicitly promoted, even years after deployment', () => {
     delete env.WE_DAEMON_OVERLAY_AUTO_RETIRE;
     expect(resolveAutoRetireMode(env, { settingsPath: join(base, 'missing') }).mode).toBe('shadow');
-    expect(resolveAutoRetireMode(env, { now: '2026-10-27T11:59:59Z' }).mode).toBe('shadow');
-    expect(resolveAutoRetireMode(env, { now: '2026-10-27T12:00:00Z' })).toMatchObject({ mode: 'on', source: 'tool (shadow elapsed)' });
+    for (const now of ['2026-10-27T11:59:59Z', '2026-10-27T12:00:00Z', '2036-10-28T12:00:00Z']) {
+      expect(resolveAutoRetireMode(env, { now })).toMatchObject({ mode: 'shadow', source: 'tool' });
+    }
+  });
+
+  it('shipped shadow preserves registrations on the first tick long after the former cutoff', async () => {
+    delete env.WE_DAEMON_OVERLAY_AUTO_RETIRE;
+    const overlays = [{ ref: 'deleted', sha: initial }];
+    const result = await retire(overlays, { now: () => Date.parse('2036-10-28T12:00:00Z') });
+    expect(result.retired).toEqual([]);
+    expect(result.wouldRetire.map(row => row.ref)).toEqual(['deleted']);
+    expect(readOverlayState(root, { env }).overlays).toEqual(overlays);
+    expect(audit()).toContainEqual(expect.objectContaining({ kind: 'auto-retire-shadow', mode: 'shadow', source: 'tool' }));
   });
 
   it('resolves platform, tool and env, ignoring invalid overrides and invalid dates', () => {

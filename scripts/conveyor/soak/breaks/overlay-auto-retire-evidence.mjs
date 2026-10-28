@@ -20,7 +20,7 @@ export default {
   ] },
   fixPresent(root) {
     try {
-      return readFileSync(join(root, 'scripts/lib/daemon-overlay-auto-retire.mjs'), 'utf8').includes("r.sources.mode === 'tool'")
+      return readFileSync(join(root, 'scripts/lib/daemon-overlay-auto-retire.mjs'), 'utf8').includes('const mode = r.value.mode;')
         && readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8').includes('refEvidence: fetchResult.refEvidence')
         && readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8').includes('plan = unavailablePinned ??')
         && readFileSync(join(root, 'scripts/lib/daemon-overlays.mjs'), 'utf8').includes('expectedRequiredOverlay')
@@ -73,6 +73,13 @@ export default {
       const overlays = [{ ref: 'deleted', sha: initial }];
       writeOverlays(root, overlays, { env });
       const refEvidence = new Map([['deleted', 'missing']]);
+      const defaultEnv = { ...env };
+      delete defaultEnv.WE_DAEMON_OVERLAY_AUTO_RETIRE;
+      const shipped = await autoRetireOverlays({ root, env: defaultEnv, overlays, git, refEvidence,
+        now: () => Date.parse('2036-10-28T12:00:00Z') });
+      if (shipped.retired.length || shipped.wouldRetire.length !== 1 || readOverlayState(root, { env }).overlays.length !== 1) {
+        violation('shipped-shadow-promoted', 'first tick after deployment removed a registration without explicit promotion');
+      }
       const shadow = await autoRetireOverlays({ root, env, overlays, git, refEvidence, now: () => Date.parse('2026-10-29T12:00:00Z') });
       if (shadow.retired.length || readOverlayState(root, { env }).overlays.length !== 1) {
         violation('explicit-shadow-promoted', 'operator shadow removed a registration after the tool graduation date');

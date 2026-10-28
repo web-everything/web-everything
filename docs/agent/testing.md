@@ -5,7 +5,9 @@
 `daemon-clone-entries.test.mjs`, `closure-scope.test.mjs` and
 `daemon-rebuild-tree-reader.test.mjs` cover the pure R171 helpers. Clone entry discovery
 throws on unreadable LaunchAgents evidence, including a missing directory; inject a directory
-and plutil runner for portable tests. Discovery uses the supplied environment's `HOME` in both
+and plutil runner for portable tests. Discovery canonicalizes both the clone root and absolute
+arguments (including missing entries' existing ancestors), so symlink aliases discover the same daemon
+and mapped pass entries; aliases pointing outside the clone stay excluded. Discovery uses the supplied environment's `HOME` in both
 planning and boot smoke. Simulator homes provide an empty `Library/LaunchAgents` directory,
 so in-process rebuilds and forked daemon hosts read the same isolated evidence without an entry
 override or a missing-directory bypass. Scope computation accepts a snapshot reader plus a
@@ -31,13 +33,13 @@ the live root's entries instead could silently bypass discovery for a bad live-r
 discovery likewise retains the conflict on unreadable evidence. Final closure checks run before smoke and
 again when reconstructing persisted scoped candidates.
 
-Markdown is always retained by closure scoping, including under tests and backlog directories:
-an exported tick can read a prompt after boot with a computed filename, so absence from an import
+Markdown and JSON are always retained by closure scoping, including under tests and backlog directories:
+an exported tick can read runtime data after boot with a computed filename, so absence from an import
 closure is insufficient evidence to discard it. `closure-scope.test.mjs` pins this policy for URL
-literals and computed reads. Import collection parses syntax with the existing TypeScript dependency;
+literals and computed reads, including computed JSON basenames. Import collection parses syntax with the existing TypeScript dependency;
 comments, line terminators, escaped literals and template literals must not hide dynamic imports.
 Computed targets and parse failures mark the closure incomplete. The `overlay-runtime-closure`
-soak break reproduces both runtime-prompt and commented-worker conflicts through the planner in on
+soak break reproduces runtime-prompt, computed-JSON and commented-worker conflicts through the planner in on
 and shadow modes, then checks final-tree evidence with the same policy.
 
 ## Overlay auto-retirement
@@ -47,11 +49,12 @@ equivalence, deleted-branch recorded commits, and equal-tip carrier preservation
 uses `removeOverlay`'s `requireRef`, `expectedRequiredOverlay` and `expectedOverlay` guards: container
 withdrawal, container replacement or source re-registration preserves the source. Both identities are
 checked under the list mutex; mutable `stackBases` cache updates keep the same identity. Git uncertainty
-preserves registrations. `autoRetire` resolves through the policy cascade; only tool-sourced shadow
-graduates after a full day from `shadowSince`. Explicit platform/environment shadow stays observe-only.
-Test every mode source before, at and after the cutoff. Inject `now` at that boundary.
+preserves registrations. `autoRetire` resolves through the policy cascade; shadow at every layer
+stays observe-only until explicitly promoted to `on`. A legacy `shadowSince` is diagnostic data only;
+wall-clock time never authorizes removal. Test every mode source across the former cutoff and pin
+the shipped setting to shadow even on a first tick years after deployment.
 Historical rebuild and stack-cache fixtures explicitly disable retirement; retirement and auto-rebase
-integration fixtures explicitly enable it, so the shipped shadow cutoff cannot change their intent.
+integration fixtures explicitly enable it, so rollout settings cannot change their intent.
 The historical overlay-pin suite and `overlay-pin-carried-base-retry` soak also disable retirement:
 their adopted-input and retained-registration assertions require the original overlays to remain registered.
 Contained explicit, mechanism and unverifiable pins stay registered for the planner's safety checks.
@@ -81,7 +84,8 @@ plan. Preparation regressions cover missing tops, equal tips, a missing top abov
 and retirement into a refreshed top; the soak also checks a refreshed source beneath a missing recorded top.
 Shadow audit observations dedupe by exact `(ref, sha, reason)` using durable markers under the list mutex;
 repeat observations still appear in `wouldRetire`. Audit append precedes marking so failed writes retry.
-The command allowlist test restricts classification to local Git reads/merge-tree object creation; it forbids
+The concurrent native shadow-audit test allows 15 seconds around writers with individual 10-second
+hard limits, so its deadline includes process startup and fixture assertions. The command allowlist test restricts classification to local Git reads/merge-tree object creation; it forbids
 network and worktree mutations. `mainOnly` and corrupt state have separate preparation regressions.
 Malformed registry records (non-objects or missing/non-string/empty refs) hold preparation before fetch or
 retirement and require operator repair of the stored list. Structurally valid entries with unsafe branch names

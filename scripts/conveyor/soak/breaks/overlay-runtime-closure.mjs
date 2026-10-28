@@ -9,6 +9,9 @@ import { smokeSurfaceEntries } from '../../../lib/daemon-rebuild/skip-unrelated.
 
 const PATHS = ['scripts/lib/daemon-rebuild/closure-scope.mjs', 'scripts/lib/import-closure.mjs'];
 const CASES = [
+  { path: 'data/foo.json', base: '{"value":"base"}', main: '{"value":"main"}', overlay: '{"value":"overlay"}',
+    entry: `import { readFileSync } from 'node:fs';
+export function tick(dir, name){ return JSON.parse(readFileSync(\`\${dir}/\${name}.json\`, 'utf8')); }` },
   { path: 'prompt.md', base: 'old prompt', main: 'main prompt', overlay: 'overlay:v2',
     entry: `import { readFileSync } from 'node:fs';
 export function tick(){
@@ -23,11 +26,11 @@ export function tick(){
 
 export default {
   id: 'overlay-runtime-closure',
-  title: 'runtime Markdown and commented dynamic imports retain overlay conflicts',
+  title: 'runtime JSON, Markdown and commented dynamic imports retain overlay conflicts',
   card: 'PR #6023 / x1b8hlo',
   fixedBy: { sha: 'HEAD', where: 'lane/r171-closure-scope', paths: PATHS },
   fixPresent(root) {
-    return readFileSync(join(root, PATHS[0]), 'utf8').includes('/\\.md$/i.test(p)')
+    return readFileSync(join(root, PATHS[0]), 'utf8').includes('md|json')
       && readFileSync(join(root, PATHS[1]), 'utf8').includes('ts.isCallExpression(node)');
   },
   async run() {
@@ -71,7 +74,7 @@ export default {
         }
         // The final-tree verifier must reach the same conservative decision as the initial probe.
         const final = finalClosureScope({ git, sha: overlay, entries: ['entry.mjs'], env: {} });
-        if (scenario.path.endsWith('.md')
+        if (/\.(md|json)$/.test(scenario.path)
           ? !final.ok || isExcludable(scenario.path, final.scope)
           : final.ok || final.reason !== 'closure-incomplete') {
           violations.push(`${scenario.path}: final verification repeated the omitted dependency`);

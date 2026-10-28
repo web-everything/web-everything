@@ -14,10 +14,10 @@ const LIMIT = 4000;
 const metadata = new WeakMap();
 const validPath = p => typeof p === 'string' && p.length > 0 && !isAbsolute(p)
   && !p.split('/').some(part => part === '..' || part === '.') && !p.includes('\0');
-// Markdown can be read by exported ticks long after boot, with computed paths that
+// Markdown and JSON can be read by exported ticks long after boot, with computed paths that
 // an import closure cannot prove unused. Retain it even under tests/ or backlog/.
 const always = p => MANIFEST_RE.test(p) || CONFIG_RE.test(p) || EXECUTABLE_RE.test(p)
-  || RUNTIME_READ_RE.test(p) || /\.md$/i.test(p);
+  || RUNTIME_READ_RE.test(p) || /\.(md|json)$/i.test(p);
 const under = (p, prefix) => prefix.endsWith('/') ? p.startsWith(prefix) : p === prefix;
 
 /** Unknown paths are retained. Membership and mandatory rules take precedence over

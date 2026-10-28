@@ -49,6 +49,38 @@ it('throws on unreadable LaunchAgents directory instead of silently narrowing en
   expect(() => cloneRuntimeEntries({ ...f, launchAgentsDir: join(f.dir, 'missing') })).toThrow();
 });
 
+it('discovers aliased LaunchAgent and caller entries and mapped passes while excluding external paths', () => {
+  const f = fixture();
+  const alias = join(f.dir, 'alias');
+  symlinkSync(f.root, alias);
+  mkdirSync(join(f.root, 'scripts'));
+  writeFileSync(join(f.root, 'scripts', 'worker.mjs'), 'export {};');
+  const external = join(f.dir, 'external');
+  mkdirSync(external);
+  writeFileSync(join(external, 'foreign.mjs'), 'export {};');
+  symlinkSync(external, join(f.root, 'external-link'));
+  symlinkSync(join(f.root, 'scripts', 'worker.mjs'), join(f.dir, 'worker-alias.mjs'));
+  const programs = {
+    'com.we.worker.plist': ['node', join(alias, 'scripts/worker.mjs')],
+    'com.we.pass.plist': ['node', join(alias, 'skills-src/conveyor/pass-daemon.mjs'), '--pass=branch-drift'],
+    'com.we.file-alias.plist': ['node', join(f.dir, 'worker-alias.mjs')],
+    'com.we.external.plist': ['node', join(alias, 'external-link/foreign.mjs')],
+    'com.we.prefix.plist': ['node', `${realpathSync(f.root)}-other/foreign.mjs`],
+  };
+  for (const name of Object.keys(programs)) writeFileSync(join(f.launchAgentsDir, name), 'plist');
+  const run = (_bin, args) => ({ status: 0,
+    stdout: JSON.stringify({ ProgramArguments: programs[args.at(-1).split('/').at(-1)] }) });
+  for (const root of [f.root, alias]) {
+    expect(new Set(cloneRuntimeEntries({ ...f, root, run })))
+      .toEqual(new Set([...DAEMON_ENTRY_MODULES, 'scripts/worker.mjs',
+        'skills-src/conveyor/pass-daemon.mjs', 'scripts/conveyor/branch-drift.mjs']));
+    expect(cloneRuntimeEntries({ ...f, root, entries: [join(alias, 'scripts/caller.mjs')], run }))
+      .toContain('scripts/caller.mjs');
+  }
+  expect(() => cloneRuntimeEntries({ ...f, entries: [join(alias, 'external-link/foreign.mjs')], run }))
+    .toThrow('runtime entry outside clone');
+});
+
 it('discovers entries in the supplied environment HOME without changing the process HOME', () => {
   const f = fixture();
   const home = join(f.dir, 'home');
@@ -68,6 +100,15 @@ it('discovers entries in the supplied environment HOME without changing the proc
   expect(result).toContain('isolated.mjs');
   expect(calls).toEqual([join(agents, 'com.we.isolated.plist')]);
   expect(process.env.HOME).toBe(ambientHome);
+});
+
+it('fails closed on a cyclic LaunchAgent path instead of silently omitting it', () => {
+  const f = fixture();
+  symlinkSync('cycle', join(f.root, 'cycle'));
+  writeFileSync(join(f.launchAgentsDir, 'com.we.cycle.plist'), 'plist');
+  expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
+    stdout: JSON.stringify({ ProgramArguments: ['node', join(f.root, 'cycle/worker.mjs')] }),
+  }) })).toThrow();
 });
 
 it('fails closed when the supplied HOME has no readable LaunchAgents directory', () => {

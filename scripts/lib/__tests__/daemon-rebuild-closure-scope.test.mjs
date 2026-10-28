@@ -65,6 +65,7 @@ it.each([
   { label: 'package', path: 'package.json' },
   { label: 'lockfile', path: 'package-lock.json' },
   { label: 'named JSON', path: 'data/policy.json', entry: "const name = 'policy.json';" },
+  { label: 'computed JSON', path: 'data/foo.json', entry: 'export function tick(dir, name){ return readFileSync(`${dir}/${name}.json`, "utf8"); }' },
   { label: 'incomplete closure', entry: 'import(target);' },
   { label: 'runtime Markdown', path: 'prompt.md', entry: "import { readFileSync } from 'node:fs';\nexport function tick(){return readFileSync(new URL('./prompt.md', import.meta.url), 'utf8');}" },
   { label: 'commented dynamic import', path: 'worker.mjs', entry: 'export async function tick(){return (await import /* selected worker */ (process.env.TARGET)).runOverlay();}' },
@@ -174,6 +175,7 @@ it('readyBuildVerified rebuilds exclusions and refuses a reachable or tampered e
   expect(verify({ ...p, applied: [{ ...p.applied[0], excluded: ['entry.mjs'] }] })).toBe(false);
   expect(verify({ ...p, applied: [{ ...p.applied[0], excluded: [] }] })).toBe(false);
   expect(verify({ ...p, applied: [{ ...p.applied[0], excluded: ['unused.mjs', 'package.json'] }] })).toBe(false);
+  expect(verify({ ...p, applied: [{ ...p.applied[0], excluded: ['unused.mjs', 'data/foo.json'] }] })).toBe(false);
 });
 
 it('readyBuildVerified refuses reachable exclusions even when every recorded merge tree reconstructs', async () => {

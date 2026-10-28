@@ -31,7 +31,7 @@ it('only excludes allowed files outside the run closure and protects smoke and m
   expect(isExcludable('docs/note.md', result.scope)).toBe(false);
   expect(isExcludable('tests/thing.spec.mjs', result.scope)).toBe(true);
   expect(isExcludable('data.bin', result.scope)).toBe(false);
-  expect(isExcludable('unnamed.json', result.scope)).toBe(true);
+  expect(isExcludable('unnamed.json', result.scope)).toBe(false);
   expect(isExcludable('mechanism/new.mjs', result.scope)).toBe(false);
   for (const p of smokeSurfaceEntries({})) expect(result.scope.has(p)).toBe(true);
 });
@@ -87,6 +87,15 @@ it('retains Markdown even when runtime paths are computed or hidden in test/back
   const result = compute({ 'entry.mjs': "export function tick(){ return readFileSync(process.env.PROMPT, 'utf8'); }" });
   expect(result.ok).toBe(true);
   for (const path of ['prompt.md', 'docs/Prompt.MD', 'tests/prompt.md', 'backlog/prompt.md']) {
+    expect(isExcludable(path, result.scope), path).toBe(false);
+  }
+});
+
+it('retains JSON read through computed runtime paths, including test and backlog data', () => {
+  const result = compute({ 'entry.mjs': 'export function tick(dir, name){ return readFileSync(`${dir}/${name}.json`, "utf8"); }',
+    'data/foo.json': '{"value":"overlay"}' });
+  expect(result.ok).toBe(true);
+  for (const path of ['data/foo.json', 'data/FOO.JSON', 'tests/fixture.json', 'backlog/state.json']) {
     expect(isExcludable(path, result.scope), path).toBe(false);
   }
 });

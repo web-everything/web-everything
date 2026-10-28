@@ -12,10 +12,8 @@ import { pinnedStatus } from './daemon-rebuild/plan.mjs';
 
 const SETTINGS = join(dirname(fileURLToPath(import.meta.url)), 'daemon-rebuild-settings.json');
 const SHA = /^[0-9a-f]{40,64}$/;
-const time = (now) => new Date(typeof now === 'function' ? now() : now).getTime();
-
-/** Standard → platform → tool → environment; only tool shadow graduates after one full day. */
-export function resolveAutoRetireMode(env = process.env, { settingsPath = SETTINGS, now = Date.now } = {}) {
+/** Standard → platform → tool → environment; shadow requires explicit promotion to on. */
+export function resolveAutoRetireMode(env = process.env, { settingsPath = SETTINGS } = {}) {
   let tool;
   try { tool = JSON.parse(readFileSync(settingsPath, 'utf8')).autoRetire; } catch { /* unset */ }
   const r = cascadePolicy('autoRetire', tool, {
@@ -23,9 +21,8 @@ export function resolveAutoRetireMode(env = process.env, { settingsPath = SETTIN
     envValues: { mode: env?.WE_DAEMON_OVERLAY_AUTO_RETIRE?.trim() || undefined },
     valid: { mode: (v) => ['off', 'shadow', 'on'].includes(v), shadowSince: (v) => typeof v === 'string' && Number.isFinite(Date.parse(v)) },
   });
-  const graduated = r.sources.mode === 'tool' && r.value.mode === 'shadow' && time(now) - Date.parse(r.value.shadowSince) >= 86_400_000;
-  const mode = graduated ? 'on' : r.value.mode;
-  const source = `${r.sources.mode}${graduated ? ' (shadow elapsed)' : ''}`;
+  const mode = r.value.mode;
+  const source = r.sources.mode;
   logCascadeSources('autoRetire.effective', { value: { mode }, sources: { mode: source } }, { env });
   return { mode, source, shadowSince: r.value.shadowSince };
 }

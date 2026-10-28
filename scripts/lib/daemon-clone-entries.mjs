@@ -2,17 +2,32 @@
  * callers must retain the full conflict rather than proceed with narrowed entries. */
 import { readdirSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { DAEMON_ENTRY_MODULES } from './daemon-boot-smoke.mjs';
 import { DAEMON_MANIFEST } from '../../skills-src/conveyor/daemon-manifest.mjs';
+
+// Canonicalize both sides of containment, including aliases of a missing entry's
+// existing parent. Missing entries still reach closure/smoke's unreadable fallback;
+// other filesystem errors must refuse discovery rather than narrow its evidence.
+function canonicalArgument(path) {
+  const suffix = [];
+  for (;;) {
+    try { return join(realpathSync(path), ...suffix); }
+    catch (error) {
+      if (error.code !== 'ENOENT' || dirname(path) === path) throw error;
+      suffix.unshift(basename(path));
+      path = dirname(path);
+    }
+  }
+}
 
 export function cloneRuntimeEntries({ root, entries = [], env = process.env,
   launchAgentsDir = join(env.HOME || homedir(), 'Library', 'LaunchAgents'), run = spawnSync,
 }) {
   const realRoot = realpathSync(root);
   const inside = path => {
-    const rel = relative(realRoot, path);
+    const rel = relative(realRoot, canonicalArgument(path));
     return rel && rel !== '..' && !rel.startsWith('../') && !isAbsolute(rel) ? rel : null;
   };
   const out = new Set(DAEMON_ENTRY_MODULES);
