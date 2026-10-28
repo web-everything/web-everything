@@ -108,10 +108,11 @@ export function commentsMayBeTruncated(pr) {
  * Read ONE PR live: its state, labels and head from `gh pr view`, and its COMPLETE comment thread from the
  * paginated reader (`readCompletePrComments`) — never a one-page `--json comments` read. Throws on any failed
  * read, so a partial thread never decides a write.
- * @param {{repo: string, number: number, exec?: Function, readComments?: Function}} o
+ * @param {{repo: string, number: number, fields?: string, exec?: Function, readComments?: Function}} o
  */
-export function defaultReadPr({ repo, number, exec = execFileSyncThrottled, readComments = readCompletePrComments }) {
-  const argv = ['pr', 'view', String(number), '--repo', repo, '--json', 'number,state,labels,headRefOid'];
+export function defaultReadPr({ repo, number, fields = 'number,state,labels,headRefOid',
+  exec = execFileSyncThrottled, readComments = readCompletePrComments }) {
+  const argv = ['pr', 'view', String(number), '--repo', repo, '--json', fields];
   const out = exec('gh', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
   const pr = JSON.parse(String(out || '{}'));
   const comments = readComments(number, { repo });
