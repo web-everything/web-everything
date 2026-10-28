@@ -38,8 +38,8 @@ function gitEvidence({ collision = true, fail, mainKey = 'bornAs', mainValue = '
       case 'show': return text;
       case 'ls-remote': return `${'a'.repeat(40)}\trefs/heads/main\n`;
       case 'grep':
-        if (!collision || !new RegExp(args[2]).test(`${mainKey}: ${mainValue}`)) throw Object.assign(new Error('no match'), { status: 1 });
-        return `origin/main:${mainCard}:${mainKey}: ${mainValue}`;
+        if (!collision || !new RegExp(args[args.indexOf('-E') + 1]).test(`${mainKey}: ${mainValue}`)) throw Object.assign(new Error('no match'), { status: 1 });
+        return `origin/main:${mainCard}\0${mainKey}: ${mainValue}`;
       default: throw new Error(`unexpected git operation: ${args[0]}`);
     }
   });

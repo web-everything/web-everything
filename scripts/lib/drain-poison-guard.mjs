@@ -5,17 +5,18 @@ import { healLaneRefs, looksLikeCorruption } from './lane-repair.mjs';
 
 const HASH = /^x[0-9a-z]{6}$/;
 const IDENTITY = /^(?:bornAs|id):[ \t]*(["']?)(x[0-9a-z]{6})\1[ \t]*$/m;
+const TOP_LEVEL_CARD = /^backlog\/[^/]+\.md$/;
 
 /**
- * A card's identities, read from its frontmatter only: a body may quote another card's `bornAs:` as an example.
- * `null` when the text has no closed leading `---` block, so a caller can fail closed on it.
+ * A card's identities. `parsed` is true when the text opens with a closed `---` block: its identities then come
+ * from that frontmatter only, since a body may quote another card's `bornAs:` as an example. Otherwise `ids` holds
+ * every identity line in the whole text, and the caller decides how to fail closed.
  */
-function frontmatterIdentities(text) {
+function cardIdentities(text) {
   const lines = String(text ?? '').replace(/^﻿/, '').split(/\r?\n/);
-  if (lines[0].trimEnd() !== '---') return null;
-  const end = lines.findIndex((line, i) => i > 0 && line.trimEnd() === '---');
-  if (end < 0) return null;
-  return lines.slice(1, end).map(line => line.match(IDENTITY)?.[2]).filter(Boolean);
+  const end = lines[0].trimEnd() === '---' ? lines.findIndex((line, i) => i > 0 && line.trimEnd() === '---') : -1;
+  const parsed = end > 0;
+  return { parsed, ids: (parsed ? lines.slice(1, end) : lines).map(line => line.match(IDENTITY)?.[2]).filter(Boolean) };
 }
 
 /**
@@ -51,31 +52,36 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
   try {
     if (!/^[a-f0-9]{40}$/i.test(headSha ?? '')) throw new Error('invalid pinned head');
     run(['fetch', '--quiet', '--end-of-options', 'origin', headSha, `+refs/heads/${base}:refs/remotes/origin/${base}`]);
-    const names = run(['diff', '--name-only', '--diff-filter=A', `origin/${base}...${headSha}`, '--', 'backlog/'])
-      .split('\n').filter(path => /^backlog\/.+\.md$/.test(path));
+    // `-z` keeps paths verbatim: Git otherwise quotes a non-ASCII path, which the filters below would drop.
+    const names = run(['diff', '-z', '--name-only', '--diff-filter=A', `origin/${base}...${headSha}`, '--', 'backlog/'])
+      .split('\0').filter(path => /^backlog\/.+\.md$/.test(path));
     if (!names.length) return done({ ok: true });
-    const added = names.map(path => {
-      const hash = frontmatterIdentities(run(['show', `${headSha}:${path}`]))?.[0]
-        ?? path.split('/').pop().replace(/\.md$/, '').split('-')[0];
-      return { path, hash };
-    }).filter(card => HASH.test(card.hash));
+    // Every identity an added card carries is checked. Unparseable frontmatter falls back to every identity line in
+    // the file, so a malformed card can never slip a duplicate past the check.
+    const added = names.flatMap(path => {
+      const stem = path.split('/').pop().replace(/\.md$/, '').split('-')[0];
+      const hashes = new Set([...cardIdentities(run(['show', `${headSha}:${path}`])).ids, stem]);
+      return [...hashes].filter(hash => HASH.test(hash)).map(hash => ({ path, hash }));
+    });
     let matches;
-    try { matches = run(['grep', '-E', '^(bornAs|id):', `origin/${base}`, '--', 'backlog/']); }
+    try { matches = run(['grep', '-z', '-E', '^(bornAs|id):', `origin/${base}`, '--', 'backlog/']); }
     catch (e) { if (e.status === 1) matches = ''; else throw e; }
     const prefix = `origin/${base}:`;
     // `grep` also hits body lines, so each hit on an added hash is confirmed against that main card's frontmatter.
-    // A hit card without readable frontmatter still counts: unknown evidence never admits a duplicate.
+    // A top-level card whose frontmatter cannot be parsed is unknown evidence: unreadable (held, never labelled).
+    // A file below a backlog subdirectory without frontmatter is not a card and owns no identity.
     const owned = new Map();
     for (const line of matches.split('\n')) {
-      if (!line.startsWith(prefix)) continue;
-      const match = line.slice(prefix.length).match(/^(backlog\/.*):((?:bornAs|id):.*)$/);
-      if (!match) continue;
-      const hash = match[2].match(IDENTITY)?.[2];
+      const split = line.indexOf('\0');
+      if (!line.startsWith(prefix) || split < 0) continue;
+      const mainCard = line.slice(prefix.length, split);
+      const hash = line.slice(split + 1).match(IDENTITY)?.[2];
       const card = added.find(card => card.hash === hash);
-      if (!card) continue;
-      if (!owned.has(match[1])) owned.set(match[1], frontmatterIdentities(run(['show', `${prefix}${match[1]}`])));
-      const ids = owned.get(match[1]);
-      if (!ids || ids.includes(hash)) return done({ collision: { hash: card.hash, path: card.path, mainCard: match[1] } });
+      if (!card || !mainCard.startsWith('backlog/')) continue;
+      if (!owned.has(mainCard)) owned.set(mainCard, cardIdentities(run(['show', `${prefix}${mainCard}`])));
+      const { parsed, ids } = owned.get(mainCard);
+      if (!parsed && TOP_LEVEL_CARD.test(mainCard)) throw new Error(`main card ${mainCard} has no readable frontmatter`);
+      if (parsed && ids.includes(hash)) return done({ collision: { hash: card.hash, path: card.path, mainCard } });
     }
     return done({ ok: true });
   } catch (e) { return done({ error: String(e?.message ?? e) }); }
