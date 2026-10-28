@@ -47,7 +47,9 @@ export function decideStuckDequeues({ entries, tracker, max, nowMs = Date.now() 
     const trackable = typeof entry.groupOid === 'string' && typeof entry.enqueuedAt === 'string'
       && Number.isFinite(Date.parse(entry.enqueuedAt));
     const previous = tracker?.[entry.num];
-    const validPrevious = trackable && previous?.enqueuedAt === entry.enqueuedAt
+    // Compare enqueue identity by instant, so equivalent spellings (`…:00Z` / `…:00.000Z`) stay one entry.
+    const validPrevious = trackable && typeof previous?.enqueuedAt === 'string'
+      && Date.parse(previous.enqueuedAt) === Date.parse(entry.enqueuedAt)
       && typeof previous?.oid === 'string' && /^[a-f0-9]{40}$/i.test(previous.oid)
       && Number.isSafeInteger(previous.count) && previous.count >= 0 && previous.count < Number.MAX_SAFE_INTEGER;
     const count = validPrevious ? previous.count + (previous.oid !== entry.groupOid ? 1 : 0) : 0;

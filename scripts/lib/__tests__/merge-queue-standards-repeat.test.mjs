@@ -71,8 +71,9 @@ describe('repeated deterministic standards failure', () => {
     const first = decideStuckDequeues({ entries: [entry('a', { enqueuedAt: undefined })], tracker: {}, max: 1, nowMs });
     const second = decideStuckDequeues({ entries: [entry('b', { enqueuedAt: undefined })], tracker: first.tracker, max: 1, nowMs });
     expect(second.dequeue).toEqual([]);
-    expect(second.tracker[5969].count).toBe(0);
-    expect(second.tracker[5969].fails).toEqual([oid('b')]);
+    // Same contract as the base sweep: no valid enqueue time → nothing is persisted, so nothing can accumulate.
+    expect(first.tracker[5969]).toBeUndefined();
+    expect(second.tracker[5969]).toBeUndefined();
   });
   it('keeps the same enqueue identity across equivalent timestamp spellings', () => {
     const first = decideStuckDequeues({ entries: [entry('a')], tracker: {}, max: 99, nowMs });
