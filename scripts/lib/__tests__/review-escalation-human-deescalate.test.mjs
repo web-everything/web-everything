@@ -29,6 +29,12 @@ describe('sticky review:human de-escalation on a fresh net-diff score', () => {
     }
   });
 
+  it('keeps review:human when humanRequired is missing even if freshness is asserted', () => {
+    const g = decideReviewGate({ escalate: true, humanScoreFresh: true, labels: [H] });
+    expect(g.applyLabel).toBe(H);
+    expect(g.deescalatedHuman).toBeUndefined();
+  });
+
   it('keeps review:human when an operator ruling pinned it', () => {
     const g = decideReviewGate({ ...base, humanPinned: true });
     expect(g.applyLabel).toBe(H);

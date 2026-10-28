@@ -90,6 +90,20 @@ describe('runDelegatedClearHuman', () => {
     expect(calls).toEqual([{ pr: 7, head: HEAD, reason: R11_REASON, actor: 'chalbert' }]);
     expect(out.cleared).toEqual([7]);
   });
+  it('an unknown mode never reaches the write path', async () => {
+    const calls = []; const events = [];
+    for (const mode of ['bogus', undefined, 'ON']) {
+      await runDelegatedClearHuman({ prs: [pr()], mode, ...deps(), emit: async (e) => events.push(e), clearHuman: async (a) => calls.push(a) });
+    }
+    expect(calls).toEqual([]);
+  });
+  it('flags a head that moved right after the clear', async () => {
+    let reads = 0;
+    const out = await runDelegatedClearHuman({ prs: [pr()], mode: 'on', ...deps({ readLiveHead: () => (reads++ === 0 ? HEAD : 'b'.repeat(40)) }),
+      emit: async () => {}, clearHuman: async () => {} });
+    expect(out.cleared).toEqual([7]);
+    expect(out.headMovedAfterClear).toEqual([7]);
+  });
   it('on refuses when the live head moved since evaluation', async () => {
     const calls = [];
     const out = await runDelegatedClearHuman({ prs: [pr()], mode: 'on', ...deps({ readLiveHead: () => 'b'.repeat(40) }), emit: async () => {}, clearHuman: async (a) => calls.push(a) });
