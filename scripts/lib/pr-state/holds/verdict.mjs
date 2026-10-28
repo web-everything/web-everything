@@ -2,6 +2,7 @@ import { EVENT_TYPES, ledgerCoversHead } from '../../verdict-ledger.mjs';
 import { verdictHead, sameHead, isSha } from '../referrals.mjs';
 
 const time = v => (typeof v === 'number' ? v : Date.parse(v));
+const fullSha = v => typeof v === 'string' && /^[0-9a-f]{40}(?![\s\S])/i.test(v);
 
 /**
  * THE one approval-validity predicate (the verdict-based and the label-input human holds both use it). An
@@ -15,8 +16,16 @@ export function approvalValid(e, now) {
   return Number.isFinite(expires) && Number.isFinite(at) && expires > at;
 }
 
-/** Does a later, valid approval exist after position `from` in `events`? An unknown position (-1) answers no. */
-export const approvalLiftsAfter = (events, from, now) => from >= 0 && events.slice(from + 1).some(e => approvalValid(e, now));
+/** Delegated approvals bind to one full witnessed head and explicitly named hold events; prefixes never bind. */
+export function approvalBindsHold(e, holdId, head) {
+  if (e?.type !== EVENT_TYPES.APPROVAL) return false;
+  if (!e.delegation) return true;
+  return fullSha(head) && fullSha(e.headSha) && head.toLowerCase() === e.headSha.toLowerCase()
+    && Array.isArray(e.basis) && e.basis.length > 0 && e.basis.includes(holdId);
+}
+
+/** Does a later, valid approval bind this hold? An unknown position (-1) answers no. */
+export const approvalLiftsAfter = (events, from, now, head, holdId) => from >= 0 && events.slice(from + 1).some(e => approvalValid(e, now) && approvalBindsHold(e, holdId, head));
 
 /**
  * Does a clearing verdict row still cover `head`? THE one coverage predicate (the verdict rule and the label-input
