@@ -455,6 +455,8 @@ describe('capacity deferral marker helpers', () => {
     '2026-13-45', 'tomorrow', '1e12', '', '2026-10-28',
     '2026-10-28 05:00:00Z', '2026-10-28T05:00:00', '2026-10-28T05:00:00+00:00',
     '2026-10-28T05:00:00.1Z', '2026-10-28T05:00:00.0000Z', '2026-13-45T05:00:00Z',
+    '2026-02-30T00:00:00Z', '2026-13-01T00:00:00Z', '2026-10-27T24:00:00Z',
+    '2026-02-30T00:00:00.000Z', '2026-10-27T24:00:00.000Z',
   ])('malformed deferred-at %j counts as a deferral but supplies no starvation timestamp', at => {
     const comments = [capacityMarker(at)];
     expect(summarizeCapacityDeferral(comments, { headSha: CAPACITY_HEAD }))
@@ -466,6 +468,13 @@ describe('capacity deferral marker helpers', () => {
     'valid UTC deferred-at %s supplies starvation evidence', at => {
       expect(summarizeCapacityDeferral([capacityMarker(at)], { headSha: CAPACITY_HEAD }))
         .toEqual({ deferredForCapacity: 1, firstAt: isoHoursAgo(7), lastAt: isoHoursAgo(7) });
+    },
+  );
+
+  it.each(['2026-10-28T05:00:00.123Z', '2024-02-29T00:00:00.000Z'])(
+    'valid calendar instant %s retains millisecond precision', at => {
+      expect(summarizeCapacityDeferral([capacityMarker(at)], { headSha: CAPACITY_HEAD }))
+        .toEqual({ deferredForCapacity: 1, firstAt: at, lastAt: at });
     },
   );
 

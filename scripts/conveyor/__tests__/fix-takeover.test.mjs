@@ -94,6 +94,36 @@ describe('fix settings cascade (card xx0055i)', () => {
 });
 
 describe('capacity starvation hours settings cascade', () => {
+  it.each([1, 999, ' 8 '])('platform preference %j overrides the standard default and returns a number', value => {
+    expect(resolveFixSettings({ env: {}, platform: { capacityStarvationHours: value }, read: () => '{}' }))
+      .toMatchObject({ capacityStarvationHours: Number(value), sources: { capacityStarvationHours: 'platform' } });
+  });
+
+  it('tool settings override the platform preference with settings provenance', () => {
+    expect(resolveFixSettings({ env: {}, platform: { capacityStarvationHours: 8 },
+      read: () => JSON.stringify({ fix: { capacityStarvationHours: 9 } }) }))
+      .toMatchObject({ capacityStarvationHours: 9, sources: { capacityStarvationHours: 'settings' } });
+  });
+
+  it('environment overrides both tool settings and the platform preference', () => {
+    expect(resolveFixSettings({ env: { WE_FIX_CAPACITY_STARVATION_HOURS: ' 2 ' },
+      platform: { capacityStarvationHours: 8 }, read: () => JSON.stringify({ fix: { capacityStarvationHours: 9 } }) }))
+      .toMatchObject({ capacityStarvationHours: 2, sources: { capacityStarvationHours: 'env' } });
+  });
+
+  it.each([0, -1, 1.5, 1000, false, [2], { hours: 2 }, null, 'nope', '', '1e2', '0001'])(
+    'invalid capacity value %j at each layer falls through to the next valid layer', bad => {
+      expect(resolveFixSettings({ env: { WE_FIX_CAPACITY_STARVATION_HOURS: bad },
+        platform: { capacityStarvationHours: 8 }, read: () => JSON.stringify({ fix: { capacityStarvationHours: 9 } }) }))
+        .toMatchObject({ capacityStarvationHours: 9, sources: { capacityStarvationHours: 'settings' } });
+      expect(resolveFixSettings({ env: {}, platform: { capacityStarvationHours: 8 },
+        read: () => JSON.stringify({ fix: { capacityStarvationHours: bad } }) }))
+        .toMatchObject({ capacityStarvationHours: 8, sources: { capacityStarvationHours: 'platform' } });
+      expect(resolveFixSettings({ env: {}, platform: { capacityStarvationHours: bad }, read: () => '{}' }))
+        .toMatchObject({ capacityStarvationHours: 6, sources: { capacityStarvationHours: 'built-in' } });
+    },
+  );
+
   it('defaults to 6 hours with built-in provenance', () => {
     expect(FIX_SETTINGS_DEFAULTS.capacityStarvationHours).toBe(6);
     expect(resolveFixSettings({ env: {}, read: () => '{}' })).toMatchObject({
