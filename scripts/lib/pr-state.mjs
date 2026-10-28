@@ -11,7 +11,7 @@
  * No callers are switched by this slice.
  */
 import { derivePrState as derivePrPhase } from './pr-state-core.mjs';
-import { EVENT_TYPES, foldVerdictLedger, verdictLabel, validateLedgerEvent } from './verdict-ledger.mjs';
+import { EVENT_TYPES, foldVerdictLedger, verdictLabel, validateLedgerEvent, ledgerEventId } from './verdict-ledger.mjs';
 import { deriveReferrals, openReferralKeys } from './pr-state/referrals.mjs';
 import { evaluateHolds } from './pr-state/holds/index.mjs';
 import { approvalLiftsAfter } from './pr-state/holds/verdict.mjs';
@@ -54,7 +54,7 @@ export function ledgerView(events, facts) {
   const cur = folded?.current ?? null;
   let clears = !!folded?.clears;
   // A human hold is lifted by a LATER valid approval (unexpired delegation, provable clock); an unknown position never lifts.
-  if (cur && !clears && cur.verdict === 'human' && approvalLiftsAfter(mine, mine.indexOf(cur), facts?.now)) clears = true;
+  if (cur && !clears && cur.verdict === 'human' && approvalLiftsAfter(mine, mine.indexOf(cur), facts?.now, facts?.head?.sha, ledgerEventId(cur))) clears = true;
   const lastExempt = mine.filter(e => e.type === EVENT_TYPES.REVIEW_EXEMPT).at(-1);
   const fullSha = value => typeof value === 'string' && /^[0-9a-f]{40}$/i.test(value);
   const reviewExempt = !cur && fullSha(lastExempt?.headSha) && fullSha(facts?.head?.sha)

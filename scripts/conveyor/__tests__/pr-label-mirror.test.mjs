@@ -412,6 +412,21 @@ describe('#5649 planLabelInputRows', () => {
     expect(planLabelInputRows({ ...opts, events: [clear], headSha: HEAD, items: addition })).toEqual([]);
     expect(planLabelInputRows({ ...opts, events: [clear], headSha: 'b'.repeat(40), items: addition })).toHaveLength(1);
   });
+  it('delegated approval skips a historical hold only with a live delegation, matching head and non-empty basis', () => {
+    const approval = buildLedgerEvent({ type: 'approval', repo: REPO, pr: 7, at: '2026-10-12T12:00:00Z', source: 'test', approval: 'judge',
+      delegation: { by: 'op', scope: 'pr', expires: '2026-10-12T14:00:00Z' }, headSha: HEAD, basis: ['hold:12345678'] });
+    const opts = { ...base, liveLabels: ['review:human'], items: [tl('review:human', 'added', 'operator')],
+      headSha: HEAD, now: Date.parse('2026-10-12T13:00:00Z') };
+    expect(planLabelInputRows({ ...opts, events: [approval] })).toEqual([]);
+    for (const binding of [{ headSha: undefined }, { headSha: 'b'.repeat(40) }, { basis: undefined }]) {
+      expect(planLabelInputRows({ ...opts, events: [{ ...approval, ...binding }] })).toHaveLength(1);
+    }
+    for (const binding of [{ headSha: 'garbage' }, { basis: [] }]) {
+      expect(() => planLabelInputRows({ ...opts, events: [{ ...approval, ...binding }] })).toThrow(TypeError);
+    }
+    expect(planLabelInputRows({ ...opts, headSha: undefined, events: [approval] })).toHaveLength(1);
+    expect(planLabelInputRows({ ...opts, now: Date.parse(approval.delegation.expires), events: [approval] })).toHaveLength(1);
+  });
   it('a bot or missing actor is hand-made for added, not for removed', () => {
     expect(planLabelInputRows({ ...base, liveLabels: ['review:human'], items: [tl('review:human', 'added', 'ci[bot]', undefined, 'Bot')] })).toHaveLength(1);
     expect(planLabelInputRows({ ...base, liveLabels: ['review:human'], items: [tl('review:human', 'added', null, undefined, null)] })[0].sender).toBe('unknown');
