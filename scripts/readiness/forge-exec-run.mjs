@@ -37,6 +37,16 @@ async function readPinned(path) {
     return await fd.readFile();
   } finally {await fd.close();}
 }
+// This protocol supports package-lock only. npm gives shrinkwrap precedence,
+// so refuse its presence (including links) rather than certify the wrong lock.
+export async function digestLock(root) {
+  const shrinkwrap = await lstat(join(root,'npm-shrinkwrap.json')).then(()=>true,error=>{
+    if(error.code==='ENOENT') return false;
+    throw error;
+  });
+  if(shrinkwrap) throw new Error('npm-shrinkwrap.json is unsupported; use local fallback');
+  return sha(await readPinned(join(root,'package-lock.json')));
+}
 async function archiveDigest(path) {
   const fd=await open(path,constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
@@ -114,8 +124,10 @@ def children():
     for entry in os.listdir('/proc'):
         if not entry.isdigit(): continue
         try:
-            text = open('/proc/' + entry + '/stat').read()
-            parents[int(entry)] = int(text[text.rfind(')')+2:].split()[1])
+            # comm is arbitrary bytes and may itself contain spaces or ')'.
+            with open('/proc/' + entry + '/stat', 'rb') as stat:
+                data = stat.read()
+            parents[int(entry)] = int(data[data.rfind(b')')+2:].split()[1])
         except (FileNotFoundError, ProcessLookupError): pass
     found, frontier = set(), {os.getpid()}
     while frontier:
@@ -135,18 +147,20 @@ sys.exit(0)
 function execute(file,args,{cwd,env,input,inherit=false,detached=false,passFd}={}) {
   return new Promise((resolve,reject) => {
     const child = spawn(file,args,{cwd,env,detached,stdio:[input === undefined ? 'ignore':'pipe',inherit?'inherit':'pipe',inherit?'inherit':'pipe',...(passFd===undefined?[]:[passFd])]});
-    let stdout='',stderr='',bytes=0,overflow=false;
+    const stdout=[],stderr=[];
+    let bytes=0,overflow=false;
     for (const [name,stream] of [['stdout',child.stdout],['stderr',child.stderr]]) stream?.on('data',chunk => {
       bytes += chunk.length;
       if (bytes > LIMIT) {overflow=true; child.kill('SIGKILL'); return;}
-      if(name==='stdout') stdout+=chunk; else stderr+=chunk;
+      if(name==='stdout') stdout.push(chunk); else stderr.push(chunk);
     });
     child.on('error',reject);
     // exit rather than close: detached children must not hold the output pipes open.
     child.on('exit',code => {
       if (detached) {try {process.kill(-child.pid,'SIGKILL');} catch { /* group already gone */ }}
     });
-    child.on('close',code => overflow ? reject(new Error('Output limit exceeded')) : resolve({code:code??254,stdout,stderr}));
+    child.on('close',code => overflow ? reject(new Error('Output limit exceeded')) : resolve({code:code??254,
+      stdout:Buffer.concat(stdout).toString('utf8'),stderr:Buffer.concat(stderr).toString('utf8')}));
     if(input!==undefined) {child.stdin.on('error',()=>{}); child.stdin.end(input);}
   });
 }
@@ -183,16 +197,16 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
       return {...result,code};
     } finally {await rm(status,{force:true});}
   }
-  async function exclusiveWorker(action, busy) {
+  async function exclusiveWorker(action) {
     // All work still shares one uid. Serialize across ALL profiles and runners,
     // before hashing input, until the supervisor has reaped every descendant.
     // An atomic directory persists across wrapper/supervisor death. Never age
     // it out: an orphan could still modify another run under the shared uid.
     const active=join(receipts,'worker-active');
-    try {await mkdir(active,{mode:0o700});} catch(error) {
-      if(error.code==='EEXIST') return busy();
+    await mkdir(active,{mode:0o700}).catch(error=>{
+      if(error.code==='EEXIST') throw new Error('Worker execution busy or interrupted; use local fallback. Operator must stop all forge-exec processes before removing /srv/forge-receipts/worker-active');
       throw error;
-    }
+    });
     let settled=true;
     const command=async (...args)=>{
       settled=false;
@@ -242,16 +256,14 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
       return exclusiveWorker(async command => {
       const container=join(runs,request.run),work=join(container,'work');
       await directory(container,true); await directory(work);
-      if(await digestInput(work)!==request.inputDigest || sha(await readPinned(join(work,'package-lock.json')))!==request.lock) throw new Error('Input digest mismatch');
+      if(await digestInput(work)!==request.inputDigest || await digestLock(work)!==request.lock) throw new Error('Input digest mismatch');
       await rename(statePath(request.run,'prepared'),statePath(request.run,'running'));
-      let phase='install',result={code:97,stdout:'',stderr:''},commandPending=false;
-      const runCommand = async (...args) => {
-        commandPending=true;
-        const result=await command(...args);
-        commandPending=false;
-        return result;
-      };
-      const profile=join(cache,request.lock,'dev-v3');
+      let phase='install',result={code:97,stdout:'',stderr:''};
+      // npm accepts some manifest changes without lock changes. Key the entire
+      // validated snapshot, including workspace manifests and local dependency
+      // contents, so a warm archive represents the same install inputs. Earlier
+      // profiles lack this binding (v3 also allowed an unkeyed shrinkwrap).
+      const profile=join(cache,request.lock,'dev-v5-'+request.inputDigest);
       const installEnv={PATH:path,HOME:join(work,'.forge-home'),LANG:'C',CI:'true',NODE_ENV:'development'};
       try {
         // These parents are inaccessible to forge-exec; reject symlinked cache state.
@@ -274,12 +286,12 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
           if(warm) {
             const expected=(await readPinned(join(profile,'sha256'))).toString();
             if(!hex(expected) || await archiveDigest(archive)!==expected) throw new Error('Cache sha256 mismatch');
-            result=await runCommand([...ci,'--dry-run','--offline'],work,installEnv);
+            result=await command([...ci,'--dry-run','--offline'],work,installEnv);
             if(result.code) throw new Error('npm ci validation failed: '+result.stderr);
-            const extracted=await runCommand(['/usr/bin/tar','-xf','-'],work,installEnv,archive);
+            const extracted=await command(['/usr/bin/tar','-xf','-'],work,installEnv,archive);
             if(extracted.code) throw new Error('Cache extraction failed');
           } else {
-            result=await runCommand(ci,work,installEnv);
+            result=await command(ci,work,installEnv);
             if(result.code) throw new Error('npm ci failed: '+result.stderr);
             const temp=join(profile,'pending-'+randomBytes(8).toString('hex'));
             await cacheCommand(['-cf',temp,'--null','-T','-'],work,(await dependencies(work)).map(name=>name+'\0').join(''));
@@ -288,33 +300,19 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
           }
         } finally {await guard.close();}
         phase='test';
-        result=await runCommand(request.argv,work,{PATH:path,HOME:join(work,'.forge-home'),...request.env});
-      } catch(error) {const code=phase==='install'&&!commandPending?97:254; if(commandPending || phase==='test') phase='supervisor'; result={code,stdout:result.stdout,stderr:String(error.message)};}
+        result=await command(request.argv,work,{PATH:path,HOME:join(work,'.forge-home'),...request.env});
+      } catch(error) {const code=phase==='install'?97:254; if(phase==='test') phase='supervisor'; result={code,stdout:result.stdout,stderr:String(error.message)};}
       const receipt={...prepared,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code};
       await writeFile(statePath(request.run,'receipt'),JSON.stringify(receipt),{flag:'wx',mode:0o600});
       return result;
-      }, async () => {
-        // This attempt never acquired the worker and cannot execute any command.
-        // Retire prepared state before publishing evidence so it cannot be retried
-        // later against a stale not-started receipt. Leave the holder's lock alone.
-        await rename(statePath(request.run,'prepared'),statePath(request.run,'not-started'));
-        const receipt={...prepared,inputDigest:request.inputDigest,argvDigest:request.argvDigest,
-          lock:request.lock,phase:'not-started',code:75};
-        await writeFile(statePath(request.run,'receipt'),JSON.stringify(receipt),{flag:'wx',mode:0o600});
-        return {code:75,stdout:'',stderr:'Worker execution busy or interrupted; use local fallback.'};
       });
     },
     async finish(request) {
       // Only the protected state is evidence; receipt-like files in work are data.
       let phase='running';
-      try {await state(request,phase);} catch {
-        phase='not-started';
-        try {await state(request,phase);} catch {phase='prepared'; await state(request,phase);}
-      }
+      try {await state(request,phase);} catch {phase='prepared'; await state(request,phase);}
       let receipt;
       try {receipt=JSON.parse(await readPinned(statePath(request.run,'receipt')));} catch(e) {if(e.code!=='ENOENT') throw e;}
-      if (phase==='running' && (!receipt || !['install','test'].includes(receipt.phase))) throw new Error('Remote termination unconfirmed');
-      if (phase==='not-started' && (!receipt || receipt.phase!=='not-started' || receipt.code!==75)) throw new Error('Remote non-execution unconfirmed');
       const container=join(runs,request.run);
       await directory(container,true);
       // The worker owns work and may remove ops' write permission. Only the
@@ -338,6 +336,7 @@ if(process.argv[1] && await realpath(process.argv[1]).catch(()=> '') === await r
   try {
     if(process.argv.length!==3 || !['prepare','run','finish'].includes(process.argv[2])) throw new Error('Invalid subcommand');
     let input='';
+    process.stdin.setEncoding('utf8');
     for await(const chunk of process.stdin) {input+=chunk; if(Buffer.byteLength(input)>LIMIT) throw new Error('Request limit exceeded');}
     const result=await createRunner()[process.argv[2]](JSON.parse(input));
     if(process.argv[2]==='run') process.exitCode=result.code;

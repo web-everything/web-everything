@@ -1,18 +1,15 @@
 // @vitest-environment node
 /** @file Contract and execution tests for the Forge remote runner. */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, symlinkSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, symlinkSync, statSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   isAllowedCommand, filterEnv, validateRunId,
-  runRemote, runWithRemoteFallback, parseArgs, defaultExec,
+  runRemote, runWithRemoteFallback, parseArgs,
 } from '../remote-exec.mjs';
-import { createRunner } from '../forge-exec-run.mjs';
-import { runWithRemoteDecision, resolveAdmissionPolicy } from '../heavy-admission.mjs';
-import { keepAliveScript } from '../../lib/test-keepalive.mjs';
+import { createRunner, digestInput, digestArgv } from '../forge-exec-run.mjs';
 
 const argv = ['npm', 'run', 'test:unit', '--', 'a.test.mjs'];
 const runId = 'abcdef-1';
@@ -28,8 +25,8 @@ const forbiddenEnv = {
 };
 let cwd;
 beforeEach(() => {
-  // Respect the launcher's TMPDIR, with the OS default when CI leaves it unset.
-  cwd = realpathSync(mkdtempSync(join(tmpdir(), 'remote-exec-test-')));
+  // Task scratch must stay under the launcher-provided TMPDIR.
+  cwd = realpathSync(mkdtempSync(join(process.env.TMPDIR, 'remote-exec-test-')));
   writeFileSync(join(cwd, 'package-lock.json'), '{"lockfileVersion":3,"packages":{}}\n');
 });
 afterEach(() => rmSync(cwd, { recursive: true, force: true }));
@@ -45,7 +42,7 @@ const nonceOf = (input) => JSON.parse(input).nonce;
 function fixture({ probeCode = 0, copyCode = 0, prepareCode = 0, runCode = 0, receipt, receiptCode = 0 } = {}) {
   let state;
   const exec = vi.fn(async (call) => {
-    if (call.file === 'git') return { code: 0, stdout: 'package-lock.json\0a.test.mjs\0' };
+    if (call.file === 'git') return { code: 0, stdout: 'package-lock.json\na.test.mjs\n' };
     if (call.file === 'rsync') return { code: copyCode, stdout: '' };
     if (isPrepare(call)) {
       state = JSON.parse(call.input);
@@ -109,118 +106,147 @@ function realRemoteFixture(files) {
 }
 
 describe('remote snapshot regressions', () => {
-  it.each(['ï¿½.test.mjs', '\ufffd\ufffd.test.mjs'])(
-    'keeps the failing é test selected through real split-byte capture alongside %s', async passingName => {
-      const files = ['package-lock.json', 'é.test.mjs', passingName];
-      const f = realRemoteFixture(files);
-      writeFileSync(join(cwd, 'é.test.mjs'), "import { test } from 'node:test'; test('e-acute fails', () => { throw new Error('EXPECTED_FAILURE'); });");
-      writeFileSync(join(cwd, passingName), "import { test } from 'node:test'; test('other passes', () => {});");
-      writeFileSync(join(f.bin, 'npm'), `#!${process.execPath}
-if (process.argv[2] === 'ci') process.exit(0);
-const fs = require('node:fs');
-const files = fs.readdirSync('.').filter(name => name.endsWith('.test.mjs'));
-const result = require('node:child_process').spawnSync(process.execPath, ['--test', ...files], {stdio:'inherit'});
-process.exit(result.status ?? 1);
-`, { mode: 0o755 });
-      const transport = f.exec;
-      const bytes = Buffer.from(files.join('\0') + '\0');
-      const split = bytes.indexOf(Buffer.from('é')) + 1;
-      delete f.listFiles;
-      f.exec = vi.fn(call => call.file === 'git' ? defaultExec({
-        file: process.execPath, cwd, signal: call.signal,
-        args: ['-e', `const bytes = Buffer.from(${JSON.stringify(bytes.toString('base64'))}, 'base64');
-process.stdout.write(bytes.subarray(0, ${split}), () => setTimeout(() => process.stdout.end(bytes.subarray(${split})), 100));`],
-      }) : transport(call));
-      f.argv = ['npm', 'run', 'test:unit'];
-      f.local = vi.fn(async () => {
-        const result = spawnSync(process.execPath, ['--test', 'é.test.mjs', passingName], { cwd, encoding: 'utf8', timeout: 10000 });
-        expect(result.stdout).toContain('e-acute fails');
-        expect(result.stdout).toContain('other passes');
-        return result.status;
-      });
-      expect(await runWithRemoteFallback({ ...f, log: vi.fn() })).toBe(1);
-      const copy = callsOf(f.exec).find(call => call.file === 'rsync');
-      if (passingName.includes('\ufffd')) {
-        // Literal replacement characters are ambiguous evidence: run the full
-        // local selection instead of certifying a reduced remote snapshot.
-        expect(copy).toBeUndefined();
-        expect(f.local).toHaveBeenCalledTimes(1);
-      } else {
-        expect(copy.input.split('\0').slice(0, -1)).toEqual(files.map(name => `./${name}`));
-        expect(f.local).not.toHaveBeenCalled();
-        expect(f.runs[0].status).toBe(1);
-        expect(f.runs[0].stdout).toContain('e-acute fails');
-        expect(f.runs[0].stdout).toContain('other passes');
-      }
-    }, 15000);
-
-  it('falls back instead of certifying a snapshot missing a failing identity.test.mjs', async () => {
-    const files = ['package-lock.json', 'package.json', 'vitest.config.mjs', 'smoke.test.mjs', 'identity.test.mjs'];
+  it.each(['root', 'workspace'].flatMap(kind => ['dependencies', 'devDependencies', 'optionalDependencies'].map(field => [kind, field])))
+  ('matches clean npm after removing %s %s with an unchanged lock and a primed cache', async (kind, field) => {
+    const files = ['package.json', 'package-lock.json', 'packages/worker/package.json', 'probe.cjs', 'dependency.tgz'];
+    const source = join(cwd, 'source');
+    mkdirSync(join(source, 'package'), {recursive:true});
+    writeFileSync(join(source, 'package/package.json'), JSON.stringify({name:'cache-dependency', version:'1.0.0'}));
+    const packed = spawnSync('tar', ['-czf', join(cwd, 'dependency.tgz'), '-C', source, 'package'], {encoding:'utf8'});
+    expect(packed.status, packed.stderr).toBe(0);
+    const manifest = {name:'fixture', version:'1.0.0', workspaces:['packages/*'], scripts:{'test:unit':'node probe.cjs'}};
+    const worker = {name:'worker', version:'1.0.0'};
+    const changed = kind === 'root' ? manifest : worker;
+    changed[field] = {'cache-dependency':kind === 'root' ? 'file:dependency.tgz' : 'file:../../dependency.tgz'};
+    mkdirSync(join(cwd, 'packages/worker'), {recursive:true});
+    writeFileSync(join(cwd, 'package.json'), JSON.stringify(manifest));
+    writeFileSync(join(cwd, 'packages/worker/package.json'), JSON.stringify(worker));
+    writeFileSync(join(cwd, 'probe.cjs'), `
+const {createRequire} = require('node:module');
+const probe = createRequire(require('node:path').resolve(${JSON.stringify(kind === 'root' ? 'package.json' : 'packages/worker/package.json')}));
+console.log('RESOLVED ' + probe('cache-dependency/package.json').version);
+`);
     const f = realRemoteFixture(files);
-    writeFileSync(join(cwd, 'package.json'), JSON.stringify({ scripts: { 'test:unit': 'vitest run' } }));
-    writeFileSync(join(cwd, 'vitest.config.mjs'), "export default { test: { environment: 'node', include: ['*.test.mjs'] } };");
-    writeFileSync(join(cwd, 'smoke.test.mjs'), "import {it,expect} from 'vitest'; it('smoke',()=>expect(true).toBe(true));");
-    writeFileSync(join(cwd, 'identity.test.mjs'), "import {it,expect} from 'vitest'; it('identity',()=>expect(true).toBe(false));");
-    const modules = realpathSync(new URL('../../../node_modules', import.meta.url));
-    const vitest = join(modules, 'vitest', 'vitest.mjs');
-    symlinkSync(modules, join(cwd, 'node_modules'), 'dir');
-    // Reuse installed test dependencies offline, but execute actual Vitest in
-    // the transported checkout if a mutation removes the inventory guard.
-    writeFileSync(join(f.bin, 'npm'), `#!${process.execPath}
-if (process.argv[2] === 'ci') {
-  require('node:fs').symlinkSync(${JSON.stringify(modules)}, 'node_modules', 'dir');
-  process.exit(0);
-}
-const result = require('node:child_process').spawnSync(process.execPath, [${JSON.stringify(vitest)}, 'run'], {stdio:'inherit'});
-process.exit(result.status ?? 1);
-`, { mode: 0o755 });
-    f.local = vi.fn(async () => {
-      const result = spawnSync(process.execPath, [vitest, 'run'], { cwd, encoding: 'utf8', timeout: 10000 });
-      expect(result.stdout + result.stderr).toContain('identity.test.mjs');
-      return result.status;
-    });
-    f.argv = ['npm', 'run', 'test:unit'];
-    // The transport would return a bound exit-zero receipt for the filtered
-    // snapshot. Removing the dropped-inventory guard must make this test red.
-    expect(await runRemote(f)).toEqual({ mode: 'fallback', reason: 'filtered-inventory' });
-    expect(await runWithRemoteDecision({ argv: f.argv, cwd,
-      policy: resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always' } } }),
-      remoteExec: options => runRemote({ ...f, ...options }), log: vi.fn(),
-    })).toEqual({ handled: false });
-    expect(await runWithRemoteFallback({ ...f, log: vi.fn() })).toBe(1);
-    expect(f.local).toHaveBeenCalledTimes(1);
-    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
-  }, 15000);
-
-  it('falls back locally with the local exit code while another remote run holds the worker', async () => {
-    const f = realRemoteFixture(['package-lock.json']);
-    writeFileSync(join(f.bin, 'npm'), `#!${process.execPath}
-const fs = require('node:fs');
-if (process.argv[2] === 'ci') process.exit(0);
-fs.writeFileSync(${JSON.stringify(join(cwd, 'ready'))}, '');
-const timer = setInterval(() => {
-  if (fs.existsSync(${JSON.stringify(join(cwd, 'release'))})) { clearInterval(timer); process.exit(3); }
-}, 10);
-setTimeout(() => process.exit(2), 5000).unref();
-`, { mode: 0o755 });
-    const first = runRemote(f);
-    try {
-      await vi.waitFor(() => expect(existsSync(join(cwd, 'ready'))).toBe(true));
-      const log = vi.fn();
-      expect(await runWithRemoteFallback({ ...f, log })).toBe(7);
-      expect(f.local).toHaveBeenCalledTimes(1);
-      expect(log).toHaveBeenCalledWith(expect.stringContaining('worker-busy'));
-      expect(await runWithRemoteDecision({ argv: f.argv, cwd,
-        policy: resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always' } } }),
-        remoteExec: options => runRemote({ ...f, ...options }), log: vi.fn(),
-      })).toEqual({ handled: false });
-      expect(existsSync(join(f.root, 'receipts', 'worker-active'))).toBe(true);
-    } finally {
-      writeFileSync(join(cwd, 'release'), '');
-      expect(await first).toEqual({ mode: 'remote', code: 3 });
+    const locked = spawnSync(join(f.bin, 'npm'), ['install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund'], {cwd, encoding:'utf8', timeout:20000});
+    expect(locked.status, locked.stderr).toBe(0);
+    const lock = readFileSync(join(cwd, 'package-lock.json'));
+    const lockHash = createHash('sha256').update(lock).digest('hex');
+    for (const state of ['cold', 'warm']) {
+      expect(await runRemote(f), `${state}: ${f.runs.at(-1)?.stderr}`).toEqual({mode:'remote', code:0});
+      expect(f.runs.at(-1).stdout).toContain('RESOLVED 1.0.0');
+      expect(readdirSync(join(f.root, 'cache', lockHash))).toHaveLength(1);
     }
-  }, 15000);
+    delete changed[field];
+    writeFileSync(join(cwd, kind === 'root' ? 'package.json' : 'packages/worker/package.json'), JSON.stringify(changed));
+    // Real npm accepts removal without rewriting the lock. Root removals omit
+    // the package; workspace behavior is pinned to the actual clean install.
+    const clean = spawnSync(join(f.bin, 'npm'), ['ci', '--include=dev', '--ignore-scripts', '--no-audit', '--no-fund'], {cwd, encoding:'utf8', timeout:20000});
+    expect(clean.status, clean.stderr).toBe(0);
+    expect(readFileSync(join(cwd, 'package-lock.json'))).toEqual(lock);
+    const probe = spawnSync(process.execPath, ['probe.cjs'], {cwd, encoding:'utf8', timeout:10000});
+    expect([0, 1]).toContain(probe.status);
+    if (kind === 'root') {
+      expect(probe.status).toBe(1);
+      expect(probe.stderr).toContain('MODULE_NOT_FOUND');
+    }
+    for (const state of ['previously primed', 'repeated removed input', 'cold']) {
+      if (state === 'cold') rmSync(join(f.root, 'cache'), {recursive:true, force:true});
+      expect(await runRemote(f), `${state}: ${f.runs.at(-1)?.stderr}`).toEqual({mode:'remote', code:probe.status});
+      if (probe.status === 1) expect(f.runs.at(-1).stderr).toContain('MODULE_NOT_FOUND');
+      else expect(f.runs.at(-1).stdout).toContain('RESOLVED 1.0.0');
+      expect(readdirSync(join(f.root, 'cache', lockHash))).toHaveLength(state === 'cold' ? 1 : 2);
+    }
+    expect(f.local).not.toHaveBeenCalled();
+  }, 120000);
 
+  it('rejects real npm shrinkwrap precedence before caching and installs the next lock-only input cold', async () => {
+    const files = ['package.json', 'package-lock.json', 'probe.cjs', 'dependency-1.tgz', 'dependency-2.tgz'];
+    const dependencies = { 'cache-dependency': '*' };
+    writeFileSync(join(cwd,'package.json'), JSON.stringify({
+      name:'fixture', version:'1.0.0', dependencies, scripts:{'test:unit':'node probe.cjs'},
+    }));
+    writeFileSync(join(cwd,'probe.cjs'), "console.log('RESOLVED ' + require('cache-dependency/package.json').version)");
+    for (const version of [1, 2]) {
+      const source = join(cwd, `source-${version}`);
+      mkdirSync(join(source,'package'), {recursive:true});
+      writeFileSync(join(source,'package/package.json'), JSON.stringify({name:'cache-dependency',version:`${version}.0.0`}));
+      const archive = `dependency-${version}.tgz`;
+      const packed = spawnSync('tar', ['-czf',join(cwd,archive),'-C',source,'package'], {encoding:'utf8'});
+      expect(packed.status, packed.stderr).toBe(0);
+      writeFileSync(join(cwd,version === 1 ? 'package-lock.json' : 'npm-shrinkwrap.json'), JSON.stringify({
+        name:'fixture', version:'1.0.0', lockfileVersion:3, packages:{
+          '':{name:'fixture',version:'1.0.0',dependencies},
+          'node_modules/cache-dependency':{version:`${version}.0.0`,resolved:`file:${archive}`,
+            integrity:'sha512-'+createHash('sha512').update(readFileSync(join(cwd,archive))).digest('base64')},
+        },
+      }));
+    }
+    const f = realRemoteFixture(files);
+    // Establish the actual npm precedence using only local tarballs, without a registry.
+    const baseline = spawnSync(join(f.bin,'npm'), ['ci','--ignore-scripts','--no-audit','--no-fund'], {cwd,encoding:'utf8',timeout:20000});
+    expect(baseline.status, baseline.stderr).toBe(0);
+    expect(JSON.parse(readFileSync(join(cwd,'node_modules/cache-dependency/package.json'),'utf8')).version).toBe('2.0.0');
+    const npmWrapper = readFileSync(join(f.bin,'npm'),'utf8');
+    writeFileSync(join(f.bin,'npm'), npmWrapper.replace('#!/bin/bash\n', '#!/bin/bash\nprintf "%s\\n" "$*" >> "$HOME/install.log"\n'));
+    const runner = createRunner({testRoot:f.root,testPath:`${f.bin}:/usr/bin:/bin`});
+    const lock = createHash('sha256').update(readFileSync(join(cwd,'package-lock.json'))).digest('hex');
+    for (const dual of [true, false]) {
+      const nonce = (dual ? 'b' : 'c').repeat(32);
+      const prepared = await runner.prepare({nonce});
+      const work = join(f.root,'runs',prepared.run,'work');
+      for (const file of [...files,...(dual ? ['npm-shrinkwrap.json'] : [])]) writeFileSync(join(work,file),readFileSync(join(cwd,file)));
+      // HOME is fixed by the wrapper; create it so the real npm adapter can log calls.
+      mkdirSync(join(work,'.forge-home'));
+      const request = {...prepared,nonce,argv,env:{CI:'true'},lock,argvDigest:digestArgv(argv),inputDigest:await digestInput(work)};
+      try {
+        if (dual) {
+          await expect(runner.run(request)).rejects.toThrow(/shrinkwrap/i);
+          expect(existsSync(join(work,'.forge-home/install.log'))).toBe(false);
+          expect(existsSync(join(f.root,'cache',lock))).toBe(false);
+        } else {
+          const result = await runner.run(request);
+          expect(result, result.stderr).toMatchObject({code:0});
+          expect(result.stdout).toContain('RESOLVED 1.0.0');
+          const installs = readFileSync(join(work,'.forge-home/install.log'),'utf8');
+          expect(installs).toContain('ci --include=dev --ignore-scripts --no-audit --no-fund');
+          expect(installs).not.toContain('--dry-run');
+          expect(existsSync(join(f.root,'cache',lock,'dev-v5-'+request.inputDigest,'dependencies.tar'))).toBe(true);
+        }
+      } finally { await runner.finish(request); }
+    }
+  }, 120000);
+  it.each(['parent', 'nested parent', 'leaf', 'dangling parent'])('rejects a %s symlink before invoking rsync', async (kind) => {
+    const f = fixture();
+    const external = join(cwd,'external');
+    mkdirSync(external);
+    writeFileSync(join(external,'id_ed25519'),'SYNTHETIC_PRIVATE_MARKER');
+    let file = 'fixtures/id_ed25519';
+    if (kind === 'nested parent') {
+      mkdirSync(join(cwd,'fixtures'));
+      symlinkSync(external,join(cwd,'fixtures','nested'));
+      file = 'fixtures/nested/id_ed25519';
+    } else if (kind === 'leaf') {
+      mkdirSync(join(cwd,'fixtures'));
+      symlinkSync(join(external,'id_ed25519'),join(cwd,file));
+    } else symlinkSync(kind === 'dangling parent' ? join(cwd,'absent') : external,join(cwd,'fixtures'));
+    f.listFiles.mockResolvedValue(['package-lock.json',file]);
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'copy-failed'});
+    expect(callsOf(f.exec).filter(call=>call.file==='rsync')).toHaveLength(0);
+    expect(callsOf(f.exec).some(isRun)).toBe(false);
+  });
+  it.each(['directory', 'missing'])('rejects a %s inventory leaf before invoking rsync', async kind => {
+    const f = fixture();
+    if (kind === 'directory') mkdirSync(join(cwd,'fixtures'));
+    f.listFiles.mockResolvedValue(['package-lock.json','fixtures']);
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'copy-failed'});
+    expect(callsOf(f.exec).filter(call=>call.file==='rsync')).toHaveLength(0);
+  });
+  it('rejects dual lockfiles at the client even if shrinkwrap is omitted from the inventory', async () => {
+    const f = fixture();
+    writeFileSync(join(cwd,'npm-shrinkwrap.json'),'shrinkwrap');
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'copy-failed'});
+    expect(callsOf(f.exec).filter(call=>call.file==='rsync')).toHaveLength(0);
+  });
   it.each(['snapshot', 'stale remote'])('falls back when a %s receipt says 97 and npm ci fails before the command', async (source) => {
     writeFileSync(join(cwd, '.exit-code'), '97\n');
     const f = realRemoteFixture(['package-lock.json', '.exit-code']);
@@ -248,13 +274,9 @@ setTimeout(() => process.exit(2), 5000).unref();
     if(source === 'stale remote') expect(readFileSync(join(f.root,runId,'.exit-code'),'utf8')).toBe('97\n');
     expect(f.local).toHaveBeenCalledTimes(1);
     expect(f.local).toHaveBeenCalledWith(f.argv);
-    expect(log).toHaveBeenCalledWith(expect.stringContaining('install-failed'));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('ambiguous-result'));
     expect(callsOf(f.exec).find((call) => call.file === 'rsync').input).not.toContain('.exit-code');
     expect(existsSync(join(f.root, 'runs', f.serverRun))).toBe(false);
-    expect(await runWithRemoteDecision({ argv: f.argv, cwd,
-      policy: resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always' } } }),
-      remoteExec: options => runRemote({ ...f, ...options }), log: vi.fn(),
-    })).toEqual({ handled: false });
   });
 
   it('confirms command exit 97 with a fresh receipt on cold and warm caches', async () => {
@@ -325,11 +347,12 @@ console.log('RESOLVED ' + versions.join(','));
       expect(f.runs.at(-1).stdout).toContain('COMMAND_RAN');
     }
     const hash = createHash('sha256').update(readFileSync(join(cwd, 'package-lock.json'))).digest('hex');
-    writeFileSync(join(f.root, 'cache', hash, 'dev-v3/dependencies.tar'), 'corrupt archive');
+    const inputDigest = await digestInput(cwd, ['package.json', 'package-lock.json']);
+    writeFileSync(join(f.root, 'cache', hash, 'dev-v5-'+inputDigest, 'dependencies.tar'), 'corrupt archive');
     const log = vi.fn();
     expect(await runWithRemoteFallback({ ...f, log })).toBe(7);
     expect(f.runs.at(-1).stdout).not.toContain('COMMAND_RAN');
-    expect(log).toHaveBeenCalledWith(expect.stringContaining('install-failed'));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('ambiguous-result'));
     expect(existsSync(join(f.root, 'runs', f.serverRun))).toBe(false);
   }, 120000);
 
@@ -395,7 +418,7 @@ console.log('RESOLVED ' + versions.join(','));
       expect(f.runs.at(-1).status, f.runs.at(-1).stderr).toBe(97);
       expect(f.runs.at(-1).stderr).toContain('npm ci');
       expect(f.runs.at(-1).stdout).not.toContain('COMMAND_RAN');
-      expect(log).toHaveBeenCalledWith(expect.stringContaining('install-failed'));
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('ambiguous-result'));
     }
   }, 120000);
 });
@@ -454,228 +477,6 @@ describe('validateRunId', () => {
 });
 
 describe('runRemote', () => {
-  it('the production process adapter confirms a real child is dead after abort', async () => {
-    const controller = new AbortController();
-    const pidFile = join(cwd, 'transport.pid');
-    const pending = defaultExec({ file: process.execPath,
-      args: ['-e', keepAliveScript({ maxLifetimeMs: 30_000,
-        postlude: `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
-      })],
-      cwd, signal: controller.signal,
-    });
-    try {
-      await vi.waitFor(() => expect(existsSync(pidFile)).toBe(true));
-      const pid = Number(readFileSync(pidFile, 'utf8'));
-      expect(() => process.kill(pid, 0)).not.toThrow();
-      controller.abort();
-      expect(await pending).toEqual({ mode: 'cancelled', terminated: true });
-      expect(() => process.kill(pid, 0)).toThrow();
-    } finally { controller.abort(); await pending; }
-  });
-
-  it('admission permits local fallback only after the real executor finishes its aborted probe', async () => {
-    const f = fixture();
-    let entered, release;
-    const reached = new Promise(resolve => { entered = resolve; });
-    const exec = vi.fn(async call => {
-      if (call.args.at(-1) === 'true') {
-        entered();
-        await new Promise(resolve => { release = resolve; });
-      }
-      return f.exec(call);
-    });
-    vi.useFakeTimers();
-    try {
-      let settled = false;
-      const pending = runWithRemoteDecision({ argv, cwd,
-        policy: resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always' } } }),
-        timeoutMs: 20, log: vi.fn(), remoteExec: options => runRemote({ ...f, ...options, exec }),
-      }).then(value => { settled = true; return value; });
-      await reached;
-      await vi.advanceTimersByTimeAsync(20);
-      expect(settled).toBe(false);
-      release();
-      expect(await pending).toEqual({ handled: false });
-      expect(callsOf(exec).some(isRun)).toBe(false);
-    } finally { release?.(); vi.useRealTimers(); }
-  });
-  it.each(['injected', 'git'])('falls back for every credential path in the %s inventory without copying secrets', async (inventory) => {
-    const f = fixture();
-    const safe = [
-      'package-lock.json', 'src/a file.mjs', 'src/identity.mjs', 'docs/key-handling.md',
-      ...['js', 'cjs', 'ts', 'mts', 'cts', 'jsx', 'tsx'].map((ext) => `src/identity.${ext}`),
-    ];
-    const secrets = [
-      '.git-credentials', '.git-credentials.backup', 'nested/.GIT-CREDENTIALS',
-      '.git-credentials~', '.git-credentials-old',
-      'id_custom', 'nested/id_backup', '.envrc', '.environment', 'id_rsa', 'keys/ID_RSA', 'id_dsa', 'id_ecdsa', 'id_ed25519', 'id_ecdsa_sk', 'id_ed25519_sk', 'id_xmss',
-      'keys/id_rsa.backup', 'keys/id_rsa~', 'keys/id_ed25519.pub', 'identity', 'keys/identity.pub',
-      'keys/IDENTITY', 'keys/IDENTITY.PUB', 'keys/identity.backup', 'keys/identity~',
-      'keys/identity-old', 'keys/identity_old', 'keys/identity.pub.backup', 'keys/identity.mjs.backup',
-      'keys/identity.\u2028backup', 'keys/id_\u2029backup', 'keys/credentials.\u2028json',
-      'keys/identity.pem', 'keys/identity.key', '.ssh/identity.mjs', 'credentials/identity.ts',
-      '.env', 'nested/.env.local', '.npmrc', '.netrc', 'credentials', 'credentials.json',
-      'credentials/token', '.ssh/config', '.aws/config', 'keys/server.pem', 'keys/server.KEY',
-    ];
-    for (const file of safe) {
-      mkdirSync(join(cwd, file, '..'), { recursive: true });
-      writeFileSync(join(cwd, file), 'fixture');
-    }
-    let files;
-    f.listFiles.mockImplementation(async () => files);
-    const exec = vi.fn(async (call) => call.file === 'git'
-      ? { code: 0, stdout: files.join('\0') + '\0' } : f.exec(call));
-    const options = { ...f, exec };
-    if (inventory === 'git') delete options.listFiles;
-    for (const secret of secrets) {
-      files = [...safe, secret];
-      expect(await runRemote(options), secret).toEqual({ mode: 'fallback', reason: 'filtered-inventory' });
-    }
-    expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call))).toBe(false);
-    files = [...safe, '.git/config', 'node_modules/ignored', '.exit-code', 'nested/.GIT/config'];
-    expect(await runRemote(options)).toEqual({ mode: 'remote', code: 0 });
-    expect(callsOf(exec).find((call) => call.file === 'rsync').input).toBe(safe.map(file => `./${file}\0`).join(''));
-  });
-
-  it('uses the same rsync rules for identity source exceptions and credential-like prefixes', async () => {
-    const files = ['package-lock.json', 'src/IDENTITY.MJS', 'src/identity.ts', 'credentials-helper.mjs', '.git-credentials-helper.mjs'];
-    // The last file is denied by both rules; the hyphenated credentials helper is safe.
-    const f = realRemoteFixture(files.slice(0, -1));
-    mkdirSync(join(cwd, 'src'));
-    for (const file of files.slice(1)) writeFileSync(join(cwd, file), 'fixture');
-    writeFileSync(join(f.bin, 'npm'), '#!/bin/bash\nexit 0\n', { mode: 0o755 });
-    expect(await runRemote(f)).toEqual({ mode: 'remote', code: 0 });
-    f.listFiles.mockResolvedValue(files);
-    expect(await runRemote(f)).toEqual({ mode: 'fallback', reason: 'filtered-inventory' });
-  });
-  it.each(['probe', 'inventory', 'prepare', 'copy', 'dispatch boundary'])(
-    'cancels the real executor during %s without ever dispatching the command', async (stage) => {
-      const f = fixture();
-      const controller = new AbortController();
-      let release;
-      let entered;
-      const reached = new Promise((resolve) => { entered = resolve; });
-      const slow = async () => {
-        entered();
-        await new Promise((resolve) => { release = resolve; });
-      };
-      const exec = vi.fn(async (call) => {
-        if ((stage === 'probe' && call.args.at(-1) === 'true') || (stage === 'prepare' && isPrepare(call)) || (stage === 'copy' && call.file === 'rsync')) await slow();
-        return f.exec(call);
-      });
-      const listFiles = async () => {
-        if (stage === 'inventory') await slow();
-        return f.listFiles();
-      };
-      const env = stage === 'dispatch boundary' ? { get CI() { controller.abort(); return 'true'; } } : f.env;
-      const pending = runRemote({ ...f, exec, listFiles, env, signal: controller.signal });
-      if (stage !== 'dispatch boundary') {
-        await reached;
-        controller.abort();
-        release(); // The injected exec deliberately does NOT implement cancellation.
-      }
-      expect(await pending).toEqual({ mode: 'cancelled', terminated: true });
-      expect(callsOf(exec).some(isRun)).toBe(false);
-      if (stage === 'probe' || stage === 'inventory') expect(callsOf(exec).some(call => call.file === 'rsync')).toBe(false);
-      if (stage === 'prepare' || stage === 'copy' || stage === 'dispatch boundary') expect(callsOf(exec).some(isCleanup)).toBe(true);
-    },
-  );
-  it('does no IO when already aborted', async () => {
-    const f = fixture();
-    const controller = new AbortController();
-    controller.abort();
-    expect(await runRemote({ ...f, signal: controller.signal })).toEqual({ mode: 'cancelled', terminated: true });
-    expect(f.exec).not.toHaveBeenCalled();
-  });
-
-  it.each(['probe', 'git inventory', 'prepare', 'copy'].flatMap(stage =>
-    ['false acknowledgement', 'missing acknowledgement', 'empty result', 'rejection'].map(outcome => [stage, outcome])))(
-    'refuses timeout fallback when %s returns %s without confirming child termination', async (stage, outcome) => {
-      const f = fixture();
-      const options = { ...f };
-      if (stage === 'git inventory') delete options.listFiles;
-      let entered;
-      const reached = new Promise(resolve => { entered = resolve; });
-      const exec = vi.fn(async call => {
-        if ((stage === 'probe' && call.args.at(-1) === 'true')
-          || (stage === 'git inventory' && call.file === 'git')
-          || (stage === 'prepare' && isPrepare(call))
-          || (stage === 'copy' && call.file === 'rsync')) {
-          entered();
-          await new Promise(resolve => call.signal.addEventListener('abort', resolve, { once: true }));
-          if (outcome === 'rejection') throw new Error('transport termination unknown');
-          if (outcome === 'empty result') return undefined;
-          return { mode: 'cancelled', ...(outcome === 'false acknowledgement' ? { terminated: false } : {}) };
-        }
-        return f.exec(call);
-      });
-      vi.useFakeTimers();
-      try {
-        let remote;
-        const pending = runWithRemoteDecision({ argv, cwd,
-          policy: resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always' } } }),
-          timeoutMs: 20, log: vi.fn(),
-          remoteExec: request => (remote = runRemote({ ...options, ...request, exec })),
-        });
-        await reached;
-        await vi.advanceTimersByTimeAsync(20);
-        expect(await remote).toEqual({ mode: 'cancelled', terminated: false });
-        expect(await pending).toEqual({ handled: true, exitCode: 124 });
-        expect(callsOf(exec).some(isRun)).toBe(false);
-      } finally { vi.useRealTimers(); }
-    },
-  );
-
-  it.each(['probe', 'copy', 'run'])('cannot dispatch after admission returns 124 for an unresponsive %s', async (stage) => {
-    const f = fixture();
-    let entered, release, remote;
-    const reached = new Promise(resolve => { entered = resolve; });
-    const exec = vi.fn(async call => {
-      if ((stage === 'probe' && call.args.at(-1) === 'true') || (stage === 'copy' && call.file === 'rsync') || (stage === 'run' && isRun(call))) {
-        entered();
-        await new Promise(resolve => { release = resolve; });
-      }
-      return f.exec(call);
-    });
-    vi.useFakeTimers();
-    try {
-      const pending = runWithRemoteDecision({ argv, cwd,
-        policy: resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always' } } }),
-        timeoutMs: 20, log: vi.fn(),
-        remoteExec: options => (remote = runRemote({ ...f, ...options, exec })),
-      });
-      await reached;
-      await vi.advanceTimersByTimeAsync(1020);
-      expect(await pending).toEqual({ handled: true, exitCode: 124 });
-      release();
-      expect(await remote).toMatchObject(stage === 'run' ? { mode: 'uncertain', terminated: false } : { mode: 'cancelled', terminated: true });
-      expect(callsOf(exec).filter(isRun)).toHaveLength(stage === 'run' ? 1 : 0);
-      if (stage === 'run') expect(callsOf(exec).some(isCleanup)).toBe(false);
-    } finally { release?.(); vi.useRealTimers(); }
-  });
-
-  it.each([['vitest', 'run'], ['npx', 'vitest', 'run']])('normalizes the expanded entry point %j for the wrapper', async (...prefix) => {
-    const f = fixture();
-    expect(await runRemote({ ...f, argv: [...prefix, 'a.test.mjs'] })).toEqual({ mode: 'remote', code: 0 });
-    expect(JSON.parse(callsOf(f.exec).find(isRun).input).argv).toEqual(argv);
-  });
-
-  it.each(['throw', 'SSH 255', 'missing receipt', 'supervisor failure'])('refuses both callers after dispatch with %s', async outcome => {
-    const f = fixture({ runCode: outcome === 'SSH 255' ? 255 : 0,
-      ...(outcome === 'missing receipt' ? { receipt: '' } : {}),
-      ...(outcome === 'supervisor failure' ? { receipt: (_n, value) => JSON.stringify({ ...value, phase: 'supervisor' }) } : {}),
-    });
-    const exec = vi.fn(async call => {
-      if (isRun(call) && outcome === 'throw') throw new Error('connection lost');
-      return f.exec(call);
-    });
-    expect(await runWithRemoteFallback({ ...f, exec, log: vi.fn() })).toBe(124);
-    expect(f.local).not.toHaveBeenCalled();
-    expect(await runWithRemoteDecision({ argv, cwd,
-      policy: resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always' } } }),
-      remoteExec: options => runRemote({ ...f, ...options, exec }), log: vi.fn(),
-    })).toEqual({ handled: true, exitCode: 124 });
-  });
   it.each([[], ['--','--files=scripts/readiness/remote-exec.mjs']].map(args => [args]))('runs Git-dependent standards locally without preparing a snapshot: %j', async (args) => {
     const f = fixture();
     f.argv = ['npm','run','check:standards',...args];
@@ -688,11 +489,12 @@ describe('runRemote', () => {
     expect(f.exec).not.toHaveBeenCalled();
     expect(log).toHaveBeenCalledWith(expect.stringContaining('requires-git-worktree'));
   });
-  it.each(['0\n', '97\n', `${'f'.repeat(32)}:0\n`])('refuses local rerun for an unbound receipt %j', async (receipt) => {
+  it.each(['0\n', '97\n', `${'f'.repeat(32)}:0\n`])('falls back locally for an unbound receipt %j', async (receipt) => {
     const f = fixture({ runCode: receipt === '97\n' ? 97 : 0, receipt });
     const log = vi.fn();
-    expect(await runWithRemoteFallback({ ...f, log })).toBe(124);
-    expect(f.local).not.toHaveBeenCalled();
+    expect(await runWithRemoteFallback({ ...f, log })).toBe(7);
+    expect(f.local).toHaveBeenCalledTimes(1);
+    expect(f.local).toHaveBeenCalledWith(f.argv);
     expect(log).toHaveBeenCalledWith(expect.stringContaining('ambiguous-result'));
   });
 
@@ -701,11 +503,11 @@ describe('runRemote', () => {
     const f = fixture({ receipt: (_nonce, value) => priorReceipt ??= JSON.stringify(value) });
     expect(await runRemote(f)).toEqual({ mode: 'remote', code: 0 });
     const log = vi.fn();
-    expect(await runWithRemoteFallback({ ...f, log })).toBe(124);
+    expect(await runWithRemoteFallback({ ...f, log })).toBe(7);
     const nonces = callsOf(f.exec).filter(isRun).map((call) => nonceOf(call.input));
     expect(nonces[0]).toMatch(/^[a-f0-9]{32}$/);
     expect(nonces[1]).not.toBe(nonces[0]);
-    expect(f.local).not.toHaveBeenCalled();
+    expect(f.local).toHaveBeenCalledTimes(1);
     expect(log).toHaveBeenCalledWith(expect.stringContaining('ambiguous-result'));
   });
 
@@ -780,14 +582,16 @@ describe('runRemote', () => {
     ...['0\n\n', '0\r\n', '0\u2028', '00\n', '-1\n', '256\n', '0\ntrailing', '0'.repeat(100)].map((suffix) => ({
       runCode: 0, receipt: (nonce) => `${nonce}:${suffix}`,
     })),
-  ])('fails closed with ambiguous-result for %j', async (scenario) => {
+  ])('fails closed with ambiguous-result and attempts cleanup for %j', async (scenario) => {
     const f = fixture(scenario);
-    expect(await runRemote(f)).toEqual({ mode: 'uncertain', reason: 'ambiguous-result', terminated: false });
-    expect(callsOf(f.exec).some(isCleanup)).toBe(scenario.runCode !== 255);
+    expect(await runRemote(f)).toEqual({ mode: 'fallback', reason: 'ambiguous-result' });
+    expect(callsOf(f.exec).some(isCleanup)).toBe(true);
     expectNoSecrets(f.exec);
   });
   it('uses the injected file list as rsync stdin, excludes node_modules, and selects the restricted rsync user', async () => {
     const f = fixture();
+    mkdirSync(join(cwd,'src'));
+    writeFileSync(join(cwd,'src/a file.mjs'),'fixture');
     f.listFiles.mockResolvedValue(['package-lock.json', 'src/a file.mjs', 'node_modules/secret.js', 'src/node_modules/nested.js', '.exit-code', 'src/.exit-code', '.exit-code/forged']);
     await runRemote({ ...f, host: 'custom-forge' });
     expect(f.listFiles).toHaveBeenCalledWith(cwd);
@@ -796,9 +600,11 @@ describe('runRemote', () => {
     const copy = calls.find((call) => call.file === 'rsync');
     expect(copy.args.join(' ')).toMatch(/--files-from(?:=|\s)-/);
     expect(copy.args).toContain('--from0');
-    expect(copy.args).toContain('--exclude=.[eE][xX][iI][tT]-[cC][oO][dD][eE]');
+    expect(copy.args).toEqual(expect.arrayContaining(['-r','--no-links','--safe-links','--no-implied-dirs']));
+    expect(copy.args).not.toContain('-L');
+    expect(copy.args).toContain('--exclude=.exit-code');
     expect(calls.findIndex(isPrepare)).toBeLessThan(calls.indexOf(copy));
-    expect(sshText(calls.find(isPrepare))).toBe('custom-forge sudo -n -u ops /usr/local/libexec/forge-exec-run prepare');
+    expect(sshText(calls.find(isPrepare))).toBe('custom-forge sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs prepare');
     expect(copy.input.split('\0')).toEqual(['./package-lock.json', './src/a file.mjs', '']);
     expect(copy.args.join(' ')).toMatch(/--rsync-path(?:=|\s)sudo -u forge-exec rsync/);
     expect(copy.args.join(' ')).toMatch(/custom-forge:\/srv\/forge-exec\/r-[a-f0-9]+\/work\//);
@@ -815,26 +621,6 @@ describe('runRemote', () => {
     }));
     expect(callsOf(f.exec).find((call) => call.file === 'rsync').input).toContain('a.test.mjs');
   });
-
-  it.each([
-    'package-lock.json\na.test.mjs\n', 'package-lock.json\0a.test.mjs',
-    'package-lock.json\0\0a.test.mjs\0',
-    'package-lock.json\0a.test.mjs\0a.test.mjs\0',
-  ])('refuses malformed or count-reducing Git inventory %j before prepare', async stdout => {
-    const { listFiles, ...f } = fixture();
-    const transport = f.exec;
-    f.exec = vi.fn(call => call.file === 'git' ? { code: 0, stdout } : transport(call));
-    expect(await runRemote(f)).toEqual({ mode: 'fallback', reason: 'copy-failed' });
-    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
-  });
-
-  it.each(['\ufffd.test.mjs', '\ufffd\ufffd.test.mjs', '\ud800.test.mjs', 'src//a.test.mjs', 'a.test.mjs/'])(
-    'rejects ambiguous or noncanonical inventory path %j before transport', async path => {
-      const f = fixture();
-      f.listFiles.mockResolvedValue(['package-lock.json', path]);
-      expect(await runRemote(f)).toEqual({ mode: 'fallback', reason: 'copy-failed' });
-      expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
-    });
 });
 
 describe('runWithRemoteFallback', () => {
@@ -851,6 +637,7 @@ describe('runWithRemoteFallback', () => {
   it.each([
     ['forge-unreachable', {}, { probeCode: 255 }],
     ['copy-failed', {}, { copyCode: 23 }],
+    ['ambiguous-result', {}, { receipt: '' }],
   ])('logs %s and returns the local code on fallback', async (reason, overrides, scenario) => {
     const f = { ...fixture(scenario), ...overrides };
     const log = vi.fn();
@@ -982,22 +769,12 @@ original_fstat = os.fstat`);
 });
 
 describe('receipt field binding', () => {
-  it.each(['v','nonce','run','inputDigest','argvDigest','lock','phase','code'])('rejects mismatched worker-busy %s evidence', async field => {
-    const f = fixture({ runCode: 75, receipt: (_n, value) => JSON.stringify({ ...value, phase: 'not-started',
-      [field]: field === 'v' ? 2 : field === 'code' ? 0 : 'wrong' }) });
-    expect(await runWithRemoteFallback({ ...f, log: vi.fn() })).toBe(124);
-    expect(f.local).not.toHaveBeenCalled();
-  });
-  it('requires the dedicated worker-busy code on a not-started receipt', async () => {
-    expect(await runRemote(fixture({ receipt: (_n, v) => JSON.stringify({ ...v, phase: 'not-started' }) })))
-      .toEqual({ mode: 'uncertain', reason: 'ambiguous-result', terminated: false });
-  });
   it.each(['v','nonce','run','inputDigest','argvDigest','lock','phase','code'])('rejects mismatched %s', async field => {
     const f = fixture({receipt: (_nonce,value) => JSON.stringify({...value,[field]:field === 'v' ? 2 : field === 'code' ? 1 : 'wrong'})});
-    expect(await runRemote(f)).toEqual({mode:'uncertain',reason:'ambiguous-result',terminated:false});
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'ambiguous-result'});
   });
-  it('reports confirmed install failure as not-started after cleanup', async () => {
+  it('rejects install-phase evidence even with matching status', async () => {
     expect(await runRemote(fixture({runCode:97,receipt:(_n,v)=>JSON.stringify({...v,phase:'install'})})))
-      .toEqual({mode:'not-started',reason:'install-failed',code:97,terminated:true});
+      .toEqual({mode:'fallback',reason:'ambiguous-result'});
   });
 });

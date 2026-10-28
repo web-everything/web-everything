@@ -100,7 +100,8 @@ try:
                 os.fsync(fd)
             finally:
                 os.close(fd)
-            os.rename(name, "forge-exec-run", src_dir_fd=dest, dst_dir_fd=dest)
+            # Preserve explicit ESM resolution on Node 22.1 outside a package.
+            os.rename(name, "forge-exec-run.mjs", src_dir_fd=dest, dst_dir_fd=dest)
         finally:
             os.close(source)
     finally:
