@@ -13,6 +13,7 @@
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { reviewCiGate } from './review-ci-gate.mjs';
@@ -346,6 +347,22 @@ export function planQueueFollowUps({ merged = [], followedUp = [] } = {}) {
 
 /** The GitHub Actions app: a required check is only accepted when this app posted it (a status from anyone else cannot satisfy it). */
 export const GITHUB_ACTIONS_INTEGRATION_ID = 15368;
+
+/** Read the declared check/app bindings without guessing when policy is unavailable. */
+export function readRequiredCheckBindings({ read = readFileSync,
+  // Keep filesystem policy reads out of Vite's browser asset-URL rewriting in Vitest.
+  path = join(dirname(fileURLToPath(import.meta.url)), '../rulesets/main-required-checks.merge-queue.json') } = {}) {
+  const ruleset = JSON.parse(read(path, 'utf8'));
+  const rules = ruleset?.rules?.filter(rule => rule?.type === 'required_status_checks');
+  const checks = rules?.length === 1 ? rules[0].parameters?.required_status_checks : null;
+  if (!Array.isArray(checks) || !checks.length || checks.some(check =>
+    typeof check?.context !== 'string' || !check.context
+    || !Number.isSafeInteger(check.integration_id) || check.integration_id < 1)
+    || new Set(checks.map(check => check.context)).size !== checks.length) {
+    throw new Error('operator answer required: unreadable required-check integration policy');
+  }
+  return checks.map(({ context, integration_id }) => ({ context, integration_id }));
+}
 
 /**
  * Every workflow file that defines a required check. GitHub reads a workflow's YAML from the PR merge ref

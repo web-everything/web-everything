@@ -237,7 +237,7 @@ describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () =
 
   // Review of #4619 (test-coverage): the UNKNOWN-mergeability retry was only unit-tested as a helper. Through the real
   // CLI: the fresh pre-merge re-read answers UNKNOWN once (GitHub recomputing after the cascade's own previous merge),
-  // the retry re-reads, and the PR reaches `gh pr merge` instead of being refused on a transient.
+  // the retry re-reads, and the PR reaches `gh pr merge` instead of being refused on a transient (no fixture wait).
   it('a transient UNKNOWN mergeability on the fresh pre-merge re-read is re-read and the PR still merges', () => {
     const { attempts, stderr } = runCli({ hookOn: true, ages: [[3001, 5]], env: { MQ_UNKNOWN_FIRST: '1', WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES: '1' } });
     expect(attempts).toEqual([3001]);
@@ -403,10 +403,13 @@ describe('review of #4619 — the WE-carrier pre-check keeps a couple together',
     expect(attempts).toEqual([`${FUI}#501`, `${LOCAL}#4001`]);
   }, COUPLE_TEST_TIMEOUT_MS);
 
-  it('with retries off, the same transient UNKNOWN holds the couple before either half lands', () => {
-    const { attempts, stderr } = runCouple({ implPassAges: [5], carrierPassAges: [5], env: { MQ_UNKNOWN_FIRST: '1', WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES: '0' } });
+  it('with retries off, an UNKNOWN carrier pre-check holds both members', () => {
+    const { attempts, stdout } = runCouple({ implPassAges: [5], carrierPassAges: [5], env: { MQ_UNKNOWN_FIRST: '1', WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES: '0' } });
     expect(attempts).toEqual([]);
-    expect(stderr).toContain('mergeable=UNKNOWN');
+    expect(JSON.parse(stdout.trim().split('\n').at(-1)).coupleHeld).toEqual(expect.arrayContaining([
+      expect.objectContaining({ num: 501, reason: expect.stringContaining('mergeable=UNKNOWN') }),
+      expect.objectContaining({ num: 4001, reason: expect.stringContaining('mergeable=UNKNOWN') }),
+    ]));
   }, 90_000 * TIMEOUT_SCALE);
 
   // Residual (review of #4619): a third-party merge moves a sibling's repo between the preflight and its own turn, past the
