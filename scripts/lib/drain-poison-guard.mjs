@@ -1,18 +1,27 @@
 /** Fail-closed admission check for backlog identities already present on main. */
+import { realpathSync } from 'node:fs';
 import { healLaneRefs, looksLikeCorruption } from './lane-repair.mjs';
 
 const HASH = /^x[0-9a-z]{6}$/;
 const IDENTITY = /^(?:bornAs|id):[ \t]*(["']?)(x[0-9a-z]{6})\1[ \t]*$/m;
 
-export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, heal = healLaneRefs, log = () => {} }) {
+/** Heal only a clone proven distinct from a located primary checkout: never the primary, never an unknown one. */
+export function healableClone(cwd, primary) {
+  if (typeof cwd !== 'string' || typeof primary !== 'string') return false;
+  try { return realpathSync(cwd) !== realpathSync(primary); } catch { return false; }
+}
+
+export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primary = null, heal = healLaneRefs, log = () => {} }) {
   const git = args => exec('git', args, { cwd, encoding: 'utf8', timeout: 60_000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
   let healed = null;
   // A corrupt local cache (e.g. a commit-graph naming a missing object) heals the clone once per check, then the
   // failed command is retried once. Any other failure, or corruption that survives the heal, stays unreadable.
   const run = args => {
     try { return git(args); } catch (e) {
-      if (healed || typeof cwd !== 'string' || (args[0] === 'grep' && e?.status === 1)
-        || !looksLikeCorruption(`${e?.stderr ?? ''}\n${e?.message ?? e}`)) throw e;
+      // Judge git's own stderr when present: the command line in `message` carries PR-controlled card paths.
+      const stderr = typeof e?.stderr === 'string' && e.stderr.trim() ? e.stderr : String(e?.message ?? e);
+      if (healed || (args[0] === 'grep' && e?.status === 1) || !looksLikeCorruption(stderr)
+        || !healableClone(cwd, primary)) throw e;
       healed = heal(cwd, { log })?.actions ?? [];
       return git(args);
     }
@@ -46,8 +55,8 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, heal =
   } catch (e) { return done({ error: String(e?.message ?? e) }); }
 }
 
-export function guardEnqueue({ c, headSha, repo, exec, emit = () => {}, comment = () => {}, seen = new Set(), base, cwd, heal, log }) {
-  const result = checkBornAsCollision({ exec, headSha, base, cwd, heal, log });
+export function guardEnqueue({ c, headSha, repo, exec, emit = () => {}, comment = () => {}, seen = new Set(), base, cwd, primary, heal, log }) {
+  const result = checkBornAsCollision({ exec, headSha, base, cwd, primary, heal, log });
   if (result.ok) return null;
   const { hash, path, mainCard } = result.collision ?? {};
   const kind = result.collision ? 'bornas-collision' : 'bornas-unreadable';

@@ -224,6 +224,9 @@ export function createDrainMergeStrategy({
   cancelObsoleteRuns = cancelObsoleteQueueRuns, batching,
   env = process.env, queueSafety, labelProvider, readRedTeamEvidence = readDrainRedTeamEvidence, requestRedTeam = null,
   cwd = process.cwd(), // a clone of the local repo: enqueuePr reads the judged commit's change list from it
+  // The located primary checkout, if any. A corrupt `cwd` self-heals only when it is a different clone (never the
+  // primary itself); unknown (null) never heals.
+  primary = null,
   // xym8nt4 — a source PR of a post-approval card group never enqueues on its own (the combined PR carries it).
   // The SAME path resolver grouping writes through (`resolveCardGroupStatePath`), so an override never splits them.
   // `isMainFix(c)`: is `c` a published main-red repair PR per THIS pass's live red-main signal (never a cached flag)?
@@ -534,7 +537,7 @@ export function createDrainMergeStrategy({
       // Prepared file lists do not substitute for fresh Git evidence at identity admission.
       // A corrupt clone cache heals once and retries (logged); unreadable evidence holds the enqueue and never
       // reaches `comment`, so only a proven collision can label the PR.
-      const poison = guardEnqueue({ c, headSha, repo: slugOf(c.repo), exec, cwd,
+      const poison = guardEnqueue({ c, headSha, repo: slugOf(c.repo), exec, cwd, primary,
         log: line => log.write(`${line}\n`),
         emit: event => appendDaemonEvent(event, { env }),
         comment: (body, { kind, marker }) => {

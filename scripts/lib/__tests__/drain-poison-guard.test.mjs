@@ -1,7 +1,7 @@
 // @vitest-environment node
-import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { devNull, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -126,42 +126,64 @@ describe('checkBornAsCollision corruption self-heal', () => {
     return base(cmd, args, options);
   });
 
-  it.each(['fetch', 'diff', 'show'])('heals once and retries a corrupt %s', op => {
+  // Real directories: the heal requires the clone to be proven distinct from a located primary checkout.
+  let clone, primary;
+  beforeAll(() => {
+    clone = mkdtempSync(join(tmpdir(), 'poison-clone-'));
+    primary = mkdtempSync(join(tmpdir(), 'poison-primary-'));
+  });
+  afterAll(() => { for (const dir of [clone, primary]) rmSync(dir, { recursive: true, force: true }); });
+
+  it.each(['fetch', 'diff', 'show', 'grep'])('heals once and retries a corrupt %s', op => {
     const heal = vi.fn(() => ({ actions: ['removed stale objects/info/commit-graph cache'] }));
     const log = vi.fn();
     const exec = healingExec({ [op]: 1 });
-    expect(checkBornAsCollision({ exec, headSha: sha, cwd: '/clone', heal, log }))
+    expect(checkBornAsCollision({ exec, headSha: sha, cwd: clone, primary, heal, log }))
       .toEqual({ ok: true, healed: ['removed stale objects/info/commit-graph cache'] });
     expect(heal).toHaveBeenCalledOnce();
-    expect(heal).toHaveBeenCalledWith('/clone', { log });
+    expect(heal).toHaveBeenCalledWith(clone, { log });
     expect(exec.mock.calls.filter(([, args]) => args[0] === op)).toHaveLength(2);
   });
   it('heals at most once per check, even when corruption survives the heal', () => {
     const heal = vi.fn(() => ({ actions: [] }));
-    const out = checkBornAsCollision({ exec: healingExec({ fetch: 2 }), headSha: sha, cwd: '/clone', heal });
+    const out = checkBornAsCollision({ exec: healingExec({ fetch: 2 }), headSha: sha, cwd: clone, primary, heal });
     expect(out).toEqual({ error: expect.stringContaining('Command failed'), healed: [] });
     expect(heal).toHaveBeenCalledOnce();
   });
   it('does not heal a network-style failure', () => {
     const heal = vi.fn(() => ({ actions: [] }));
-    expect(checkBornAsCollision({ exec: fakeExec({ fetchFails: true }), headSha: sha, cwd: '/clone', heal }))
+    expect(checkBornAsCollision({ exec: fakeExec({ fetchFails: true }), headSha: sha, cwd: clone, primary, heal }))
       .toEqual({ error: expect.stringContaining('network down') });
+    expect(heal).not.toHaveBeenCalled();
+  });
+  it('judges git stderr, not a PR-controlled path in the command line', () => {
+    const heal = vi.fn(() => ({ actions: [] }));
+    const exec = vi.fn((cmd, args) => {
+      if (args[0] === 'show') throw Object.assign(new Error(`Command failed: git show ${args[1]}`), { status: 128, stderr: 'fatal: path not found' });
+      return fakeExec({ added: ['backlog/9-corrupt-index-file.md'] })(cmd, args);
+    });
+    expect(checkBornAsCollision({ exec, headSha: sha, cwd: clone, primary, heal }).error).toContain('corrupt');
     expect(heal).not.toHaveBeenCalled();
   });
   it('treats grep exit status 1 as no matches, never as corruption', () => {
     const heal = vi.fn(() => ({ actions: [] }));
-    expect(checkBornAsCollision({ exec: fakeExec({ main: '' }), headSha: sha, cwd: '/clone', heal })).toEqual({ ok: true });
+    expect(checkBornAsCollision({ exec: fakeExec({ main: '' }), headSha: sha, cwd: clone, primary, heal })).toEqual({ ok: true });
     expect(heal).not.toHaveBeenCalled();
   });
-  it('never heals without an explicit clone directory', () => {
+  it.each([
+    ['no clone directory', () => ({ primary })],
+    ['an unknown primary', () => ({ cwd: clone, primary: null })],
+    ['the primary checkout itself', () => ({ cwd: primary, primary })],
+    ['a primary that does not exist', () => ({ cwd: clone, primary: join(primary, 'missing') })],
+  ])('never heals %s', (_name, where) => {
     const heal = vi.fn(() => ({ actions: [] }));
-    expect(checkBornAsCollision({ exec: healingExec({ fetch: 1 }), headSha: sha, heal }).error).toContain('Command failed');
+    expect(checkBornAsCollision({ exec: healingExec({ fetch: 1 }), headSha: sha, heal, ...where() }).error).toContain('Command failed');
     expect(heal).not.toHaveBeenCalled();
   });
   it('reports heal actions on the unreadable refusal event without commenting', () => {
     const emit = vi.fn(); const comment = vi.fn();
     const heal = () => ({ actions: ['set core.commitGraph=false'] });
-    const out = guardEnqueue({ c: { num: 5998, repo: 'o/r' }, headSha: sha, repo: 'o/r', exec: healingExec({ fetch: 2 }), cwd: '/clone', heal, emit, comment });
+    const out = guardEnqueue({ c: { num: 5998, repo: 'o/r' }, headSha: sha, repo: 'o/r', exec: healingExec({ fetch: 2 }), cwd: clone, primary, heal, emit, comment });
     expect(out).toMatchObject({ kind: 'bornas-unreadable' });
     expect(emit.mock.calls[0][0].detail).toMatchObject({ reason: 'bornas-unreadable', healed: ['set core.commitGraph=false'] });
     expect(comment).not.toHaveBeenCalled();
@@ -175,10 +197,10 @@ describe('checkBornAsCollision on a clone with a corrupt commit-graph', () => {
     GIT_AUTHOR_NAME: 'fixture', GIT_AUTHOR_EMAIL: 'fixture@example.invalid', GIT_COMMITTER_NAME: 'fixture', GIT_COMMITTER_EMAIL: 'fixture@example.invalid' };
   const git = (cwd, ...args) => execFileSync('git', args, { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   const card = (dir, name, hash) => { mkdirSync(join(dir, 'backlog'), { recursive: true }); writeFileSync(join(dir, 'backlog', name), `---\nbornAs: ${hash}\n---\n`); };
-  let root, clone, head;
+  let root, clone, seed, head;
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), 'poison-graph-'));
-    const origin = join(root, 'origin.git'); const seed = join(root, 'seed'); clone = join(root, 'clone');
+    const origin = join(root, 'origin.git'); seed = join(root, 'seed'); clone = join(root, 'clone');
     git(root, 'init', '-q', '--bare', '-b', 'main', origin);
     git(root, 'init', '-q', '-b', 'main', seed);
     card(seed, '1-old.md', 'xaaaaaa');
@@ -199,14 +221,21 @@ describe('checkBornAsCollision on a clone with a corrupt commit-graph', () => {
   afterEach(() => rmSync(root, { recursive: true, force: true }));
 
   it('reproduces the incident: without a heal the planted graph makes the check unreadable', () => {
-    const out = checkBornAsCollision({ exec: execFileSync, headSha: head, cwd: clone, heal: () => ({ actions: [] }) });
+    const out = checkBornAsCollision({ exec: execFileSync, headSha: head, cwd: clone, primary: seed, heal: () => ({ actions: [] }) });
     expect(out.error).toMatch(/commit-graph|commit graph/);
   });
   it('heals the clone, retries the fetch once and reads the evidence', () => {
     const lines = [];
-    expect(checkBornAsCollision({ exec: execFileSync, headSha: head, cwd: clone, log: line => lines.push(line) }))
+    expect(checkBornAsCollision({ exec: execFileSync, headSha: head, cwd: clone, primary: seed, log: line => lines.push(line) }))
       .toEqual({ ok: true, healed: expect.arrayContaining([expect.stringContaining('commit-graph')]) });
     expect(lines.join('\n')).toContain('lane-repair');
+  });
+  it('leaves a corrupt primary checkout untouched and holds the check unreadable', () => {
+    const graph = join(clone, '.git', 'objects', 'info', 'commit-graph');
+    const out = checkBornAsCollision({ exec: execFileSync, headSha: head, cwd: clone, primary: clone });
+    expect(out.error).toMatch(/commit-graph|commit graph/);
+    expect(out.healed).toBeUndefined();
+    expect(existsSync(graph)).toBe(true);
   });
 });
 

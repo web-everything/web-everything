@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { guardEnqueue, recordEnqueueOutcome } from '../drain-poison-guard.mjs';
 import { labelSignature } from '../drain-prestage.mjs';
@@ -8,11 +8,19 @@ import { createDrainMergeStrategy } from '../drain-merge-strategy.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 import { enqueuePr } from '../merge-queue-enqueue.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
+import { healLaneRefs } from '../lane-repair.mjs';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 vi.mock('../merge-queue-enqueue.mjs', async original => ({
   ...(await original()), enqueuePr: vi.fn(() => ({ ok: true, already: false })),
 }));
 vi.mock('../daemon-events.mjs', () => ({ appendDaemonEvent: vi.fn() }));
+// The heal is a spy here: these fixtures must never repair a real checkout.
+vi.mock('../lane-repair.mjs', async original => ({
+  ...(await original()), healLaneRefs: vi.fn(() => ({ actions: ['removed stale objects/info/commit-graph cache'] })),
+}));
 
 const headSha = 'b'.repeat(40);
 const repo = 'fixture/poison-admission';
@@ -37,7 +45,7 @@ function gitEvidence({ collision = true, fail, mainKey = 'bornAs', mainValue = '
   });
 }
 
-function strategy(evidence, { pages = () => '[[]]', deliver = () => { throw new Error('GitHub delivery unavailable'); } } = {}) {
+function strategy(evidence, { pages = () => '[[]]', deliver = () => { throw new Error('GitHub delivery unavailable'); }, where = {} } = {}) {
   const exec = vi.fn((cmd, args, options) => {
     if (cmd === 'git') return evidence(cmd, args, options);
     if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view')
@@ -54,7 +62,7 @@ function strategy(evidence, { pages = () => '[[]]', deliver = () => { throw new 
     redTeamDeadline: { value: { deadlineAction: 'hold' } },
     cardGroupHold: () => null, batching: { gate: () => ({ admit: true }) },
     readFile: () => JSON.stringify({ pending: [], followedUp: [] }), writeState: vi.fn(),
-    log: { write: vi.fn() },
+    log: { write: vi.fn() }, ...where,
   });
   return { s, exec };
 }
@@ -91,6 +99,47 @@ describe('poison guard admission boundary', () => {
     expect(enqueuePr).not.toHaveBeenCalled();
     expect(deliver).not.toHaveBeenCalled();
     expect(exec.mock.calls.some(([cmd, args]) => cmd === 'gh' && args[0] === 'pr' && ['edit', 'comment'].includes(args[1]))).toBe(false);
+  });
+
+  describe('corrupt clone self-heal wiring', () => {
+    const corruptOnce = () => {
+      let failed = false;
+      const evidence = gitEvidence({ collision: false });
+      return vi.fn((cmd, args, options) => {
+        if (args[0] === 'fetch' && !failed) {
+          failed = true;
+          throw Object.assign(new Error('Command failed: git fetch'), { status: 128,
+            stderr: 'fatal: You are attempting to fetch 9c7274dc, which is in the commit-graph file but not in the object database.' });
+        }
+        return evidence(cmd, args, options);
+      });
+    };
+    let clone, primary;
+    beforeEach(() => {
+      clone = mkdtempSync(join(tmpdir(), 'admission-clone-'));
+      primary = mkdtempSync(join(tmpdir(), 'admission-primary-'));
+    });
+    afterEach(() => { for (const dir of [clone, primary]) rmSync(dir, { recursive: true, force: true }); });
+
+    it('heals a drain clone distinct from the located primary, retries and enqueues', () => {
+      const deliver = vi.fn(() => '');
+      const { s } = strategy(corruptOnce(), { deliver, where: { cwd: clone, primary } });
+      expect(s.enqueue(c, headSha)).toEqual({ enqueued: true, already: false });
+      expect(healLaneRefs).toHaveBeenCalledOnce();
+      expect(healLaneRefs).toHaveBeenCalledWith(clone, expect.any(Object));
+      expect(deliver).not.toHaveBeenCalled();
+    });
+    it.each([
+      ['no located primary (the default)', () => ({ cwd: clone })],
+      ['the primary checkout as the drain cwd', () => ({ cwd: primary, primary })],
+    ])('never heals with %s and holds the enqueue without touching the PR', (_name, where) => {
+      const deliver = vi.fn(() => '');
+      const { s } = strategy(corruptOnce(), { deliver, where: where() });
+      expect(s.enqueue(c, headSha)).toMatchObject({ enqueued: false, deferred: true, kind: 'bornas-unreadable' });
+      expect(healLaneRefs).not.toHaveBeenCalled();
+      expect(enqueuePr).not.toHaveBeenCalled();
+      expect(deliver).not.toHaveBeenCalled();
+    });
   });
 
   it('fetches a remote-only PR head before reading its diff or cards', () => {
