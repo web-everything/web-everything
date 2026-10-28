@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { resolveCoordinationRoot } from '../../operations/coordination-root.mjs';
 import { checkTranscriptText, resolveTranscriptCheckPolicy, runTranscriptCheck, checkRunTranscript } from '../codex-transcript-check.mjs';
 import { cliExitCode } from '../../codex-direct-task.mjs';
@@ -10,6 +11,23 @@ const tokens = total_tokens => JSON.stringify({ type: 'event_msg', payload: { ty
 const fixture = (...records) => records.join('\n');
 const check = command => checkTranscriptText(call(command), { tokenCap: 3000000 });
 const missing = () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); };
+
+describe('transcript text trust boundary', () => {
+  it('never executes custom tool input during inspection', () => {
+    const sentinel = vi.fn();
+    globalThis.__transcriptExecutionSentinel = sentinel;
+    try {
+      for (const input of [
+        'globalThis.__transcriptExecutionSentinel(); await tools.exec_command({cmd: "true"})',
+        'await tools.exec_command({cmd: `${globalThis.__transcriptExecutionSentinel()}`})',
+        'await tools.exec_command({cmd: "true"}); eval("globalThis.__transcriptExecutionSentinel()")',
+      ]) checkTranscriptText(JSON.stringify({ payload: { type: 'custom_tool_call', name: 'exec', input } }));
+      expect(sentinel).not.toHaveBeenCalled();
+      const source = readFileSync(new URL('../codex-transcript-check.mjs', import.meta.url), 'utf8');
+      expect(source).not.toMatch(/\beval\s*\(|\b(?:new\s+)?Function\s*\(|\b(?:runIn\w*Context|compileFunction)\s*\(/);
+    } finally { delete globalThis.__transcriptExecutionSentinel; }
+  });
+});
 
 describe('operator send-back regressions', () => {
   it.each(['&', '&&', '||', ';', '|', '\n'])('rejects network calls after command separator %j in fail mode', separator => {
@@ -371,6 +389,33 @@ describe('checkTranscriptText fixture rollouts', () => {
 });
 
 describe('transcript check policy cascade', () => {
+  it('ships warn/3000000 with tool provenance', () => {
+    expect(resolveTranscriptCheckPolicy({ env: {} })).toEqual({ mode: 'warn', tokenCap: 3000000,
+      sources: { mode: 'tool', tokenCap: 'tool' } });
+  });
+  it.each([
+    { source: 'tool', envMode: undefined, expected: 'fail' },
+    { source: 'tool', envMode: 'fail', expected: 'fail' },
+    { source: 'tool', envMode: 'warn', expected: 'warn' },
+    { source: 'platform', envMode: undefined, expected: 'fail' },
+    { source: 'platform', envMode: 'fail', expected: 'fail' },
+    { source: 'platform', envMode: 'warn', expected: 'warn' },
+    { source: 'platform', envMode: undefined, toolMode: 'warn', expected: 'warn' },
+  ])('preserves gating on unreadable $source policy with env $envMode and tool $toolMode', ({ source, envMode, toolMode = 'fail', expected }) => {
+    const env = { WE_PLATFORM_PREFERENCES_FILE: 'platform-fixture',
+      ...(envMode ? { WE_CODEX_TRANSCRIPT_CHECK_MODE: envMode } : {}) };
+    const readFile = path => {
+      const readingPlatform = String(path) === 'platform-fixture';
+      if (readingPlatform === (source === 'platform')) throw new SyntaxError('corrupt policy');
+      return JSON.stringify({ transcriptCheck: { mode: readingPlatform ? 'fail' : toolMode } });
+    };
+    const transcriptCheck = checkRunTranscript({ env, emit: vi.fn(),
+      resolvePolicy: options => resolveTranscriptCheckPolicy({ ...options, readFile }) });
+    expect(transcriptCheck).toEqual({ mode: expected, error: expect.any(String) });
+    for (const json of [false, true]) {
+      expect(cliExitCode({ exitCode: 0, gate: { pass: true }, transcriptCheck }, { json })).toBe(expected === 'fail' ? 1 : 0);
+    }
+  });
   it('defaults to warn and 3000000 with standard provenance when settings are absent', () => {
     expect(resolveTranscriptCheckPolicy({ env: {}, readFile: missing })).toEqual({ mode: 'warn', tokenCap: 3000000, sources: { mode: 'standard', tokenCap: 'standard' } });
   });
@@ -389,6 +434,10 @@ describe('transcript check policy cascade', () => {
 });
 
 describe('runTranscriptCheck', () => {
+  it('fails closed when policy resolution fails with an unknown mode', () => {
+    expect(checkRunTranscript({ env: {}, emit: vi.fn(),
+      resolvePolicy: () => { throw new Error('policy denied'); } })).toEqual({ mode: 'fail', error: 'policy denied' });
+  });
   it.each(['warn', 'fail'])('returns %s verdict and appends one structured log record', mode => {
     const appendLog = vi.fn(), readFile = vi.fn(() => fixture(call('gh issue list'), tokens(123)));
     const result = runTranscriptCheck({ rolloutFile: 'fixture.jsonl', threadId: 'own-thread', policy: { mode, tokenCap: 200 }, readFile, appendLog, now: () => new Date('2026-10-22T12:00:00Z') });

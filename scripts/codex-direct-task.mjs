@@ -103,6 +103,7 @@
 import { randomUUID } from 'node:crypto';
 import { writeLineSync } from './lib/write-all-sync.mjs';
 import { formatCascadeSourcesLine } from './lib/policy-cascade.mjs';
+import { resolveTranscriptCheckPolicy, transcriptCheckError } from './lib/codex-transcript-policy.mjs';
 import { resolveBuildPolicy, appendBuildRequirements, renderCodexTaskRules } from './lib/build-policy.mjs';
 import { runBuildSelfReview, renderSelfReviewNotes, boundedSelfReviewDiff, assertNoLaneFilterDrivers } from './lib/build-self-review.mjs';
 import { laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv } from './lib/lane-git-hardening.mjs';
@@ -1007,6 +1008,7 @@ export async function runCodexDirectExec({
  * @param {(path: string) => boolean} [opts.existsFn]
  * @param {Function} [opts.readQuotaFn] - injectable, default `readRolloutQuota`.
  * @param {Function} [opts.collectQuotaFn] - injectable, default `collectAndClearRolloutQuota`.
+ * @param {Function} [opts.loadTranscriptCheck] - injectable lazy checker import.
  * @returns {Promise<object>} the full report — see the CLI's `--json` output for its exact shape.
  */
 export async function codexDirectTask({
@@ -1041,6 +1043,7 @@ export async function codexDirectTask({
   selfReview: selfReviewEnabled,
   readQuotaFn = readRolloutQuota,
   collectQuotaFn = collectAndClearRolloutQuota,
+  loadTranscriptCheck = () => import('./lib/codex-transcript-check.mjs'),
 } = {}) {
   if (typeof task !== 'string' || !task.trim()) {
     throw new TypeError('codex-direct-task: `task` must be a non-empty string');
@@ -1136,10 +1139,17 @@ export async function codexDirectTask({
   let quota = null;
   let quotaRolloutFile = null;
   let quotaRolloutCleared = false;
-  // Lazy: codex-transcript-check pulls skills-src, which scripts-only copies (backlog CLI tests) lack.
-  const { checkRunTranscript } = await import('./lib/codex-transcript-check.mjs');
-  const transcriptCheck = checkRunTranscript({ codexHome: resolveCodexHome(env), threadId: summary.threadId,
-    ephemeral, findRolloutFile, env, emit });
+  let transcriptCheck, transcriptPolicy;
+  try {
+    // Resolve mode independently of the optional skills-src inspector so a failed
+    // import preserves both the completed report and settings-selected fail mode.
+    transcriptPolicy = resolveTranscriptCheckPolicy({ env });
+    const { checkRunTranscript } = await loadTranscriptCheck();
+    transcriptCheck = checkRunTranscript({ codexHome: resolveCodexHome(env), threadId: summary.threadId,
+      ephemeral, findRolloutFile, env, emit, resolvePolicy: () => transcriptPolicy });
+  } catch (error) {
+    transcriptCheck = transcriptCheckError({ error, policy: transcriptPolicy, env, emit });
+  }
   if (!ephemeral && summary.threadId) {
     const codexHome = resolveCodexHome(env);
     const lookup = clearRolloutAfterRun

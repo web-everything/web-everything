@@ -1314,6 +1314,23 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
   }
 
   describe('#x8wbivt Fork 4 — codexDirectTask wires the quota signal into its report', () => {
+    it.each([undefined, 'warn', 'fail'])('keeps the completed report on checker import failure in %s mode', async configuredMode => {
+      const mode = configuredMode ?? 'warn';
+      const dir = mkdtempSync(join(tmpdir(), 'we-transcript-import-'));
+      const { fn: spawnFn } = fakeSpawn('{"type":"turn.completed","usage":{}}\n');
+      const execFn = (bin, args) => args.includes('--absolute-git-dir') ? join(dir, 'git-metadata') : args.includes('rev-parse') ? 'sha0\n' : '';
+      const loadTranscriptCheck = vi.fn(async () => { throw new Error('checker dependency missing'); });
+      try {
+        const report = await codexDirectTask({ task: 'fixture', dir, gate: 'none', selfReview: false,
+          stream: false, execFn, spawnFn, log: vi.fn(), loadTranscriptCheck,
+          env: { ...process.env, WE_CODEX_TRANSCRIPT_CHECK_MODE: configuredMode } });
+        expect(loadTranscriptCheck).toHaveBeenCalledOnce();
+        expect(report.exitCode).toBe(0);
+        expect(report.transcriptCheck).toEqual({ mode, error: 'checker dependency missing' });
+        for (const json of [false, true]) expect(cliExitCode(report, { json })).toBe(mode === 'fail' ? 1 : 0);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
     it.each(['warn', 'fail', 'missing'])('reports own transcript before quota deletion and preserves warn exit status (%s)', async mode => {
       const dir = mkdtempSync(join(tmpdir(), 'we-codex-transcript-test-'));
       const sessions = join(dir, 'sessions');

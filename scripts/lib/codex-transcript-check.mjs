@@ -6,29 +6,13 @@
  */
 import { readFileSync, mkdirSync, appendFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { summarizeRecord } from '../../skills-src/inspect-codex-transcript/codex-transcript.mjs';
-import { cascadePolicy, platformPreference, formatCascadeSourcesLine } from './policy-cascade.mjs';
+import { formatCascadeSourcesLine } from './policy-cascade.mjs';
+import { resolveTranscriptCheckPolicy, transcriptCheckError } from './codex-transcript-policy.mjs';
+export { resolveTranscriptCheckPolicy } from './codex-transcript-policy.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 
-const SETTINGS = join(dirname(fileURLToPath(import.meta.url)), '../settings/codex-transcript-check.json');
 const INSPECTION_CAP = 200000;
-
-export function resolveTranscriptCheckPolicy({ env = process.env, tool, platform, readFile = readFileSync } = {}) {
-  if (tool === undefined) {
-    try { tool = JSON.parse(readFile(SETTINGS, 'utf8')); }
-    catch (error) { if (error.code !== 'ENOENT') throw error; }
-  }
-  const text = value => value == null || !String(value).trim() ? undefined : String(value).trim();
-  const cap = text(env.WE_CODEX_TRANSCRIPT_TOKEN_CAP);
-  platform ??= platformPreference('transcriptCheck', { env, readFile });
-  const resolved = cascadePolicy('transcriptCheck', tool?.transcriptCheck, {
-    standard: { mode: 'warn', tokenCap: 3000000 }, platform, env,
-    envValues: { mode: text(env.WE_CODEX_TRANSCRIPT_CHECK_MODE), tokenCap: cap !== undefined && /^\d+$/.test(cap) ? Number(cap) : cap },
-    valid: { mode: value => ['warn', 'fail'].includes(value), tokenCap: value => Number.isSafeInteger(value) && value >= 0 },
-  });
-  return { ...resolved.value, sources: resolved.sources };
-}
 
 // Decode structured tool arguments before inspecting commands. Custom exec tools embed those same
 // arguments in JS; extract cmd/command string literals without evaluating the snippet.
@@ -241,10 +225,6 @@ export function checkRunTranscript({ codexHome, threadId, ephemeral = false, fin
     if (result.flags.some(flag => flag.kind === 'truncated')) emit('codex-transcript-check · truncated input: inspect the full rollout manually; retry with smaller commands');
     return result;
   } catch (error) {
-    const mode = policy?.mode ?? (env.WE_CODEX_TRANSCRIPT_CHECK_MODE?.trim() === 'fail' ? 'fail' : 'warn');
-    const message = String(error?.message ?? error);
-    try { emit(`codex-transcript-check · warning: ${message.replace(/[\x00-\x1f\x7f]/g, ' ')}`); }
-    catch { /* A failed output sink must not replace the original failure or mode. */ }
-    return { mode, error: message };
+    return transcriptCheckError({ error, policy, env, emit });
   }
 }
