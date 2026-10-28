@@ -1,8 +1,10 @@
 /** Policy and error handling stay loadable when the optional transcript inspector is absent. */
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { cascadePolicy, readPlatformPreferences } from './policy-cascade.mjs';
 
-const SETTINGS = new URL('../settings/codex-transcript-check.json', import.meta.url);
+const SETTINGS = join(dirname(fileURLToPath(import.meta.url)), '../settings/codex-transcript-check.json');
 const modeValue = value => ['warn', 'fail'].includes(value) ? value : undefined;
 const text = value => value == null || !String(value).trim() ? undefined : String(value).trim();
 

@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { resolveCoordinationRoot } from '../../operations/coordination-root.mjs';
 import { checkTranscriptText, resolveTranscriptCheckPolicy, runTranscriptCheck, checkRunTranscript } from '../codex-transcript-check.mjs';
 import { cliExitCode } from '../../codex-direct-task.mjs';
@@ -23,7 +24,7 @@ describe('transcript text trust boundary', () => {
         'await tools.exec_command({cmd: "true"}); eval("globalThis.__transcriptExecutionSentinel()")',
       ]) checkTranscriptText(JSON.stringify({ payload: { type: 'custom_tool_call', name: 'exec', input } }));
       expect(sentinel).not.toHaveBeenCalled();
-      const source = readFileSync(new URL('../codex-transcript-check.mjs', import.meta.url), 'utf8');
+      const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../codex-transcript-check.mjs'), 'utf8');
       expect(source).not.toMatch(/\beval\s*\(|\b(?:new\s+)?Function\s*\(|\b(?:runIn\w*Context|compileFunction)\s*\(/);
     } finally { delete globalThis.__transcriptExecutionSentinel; }
   });
