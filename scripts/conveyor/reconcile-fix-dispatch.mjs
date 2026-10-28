@@ -1809,6 +1809,7 @@ export function runReconcileFixDispatch({
   dispatch = dispatchFix,
   reconcile = runReconcilePass,
   // R123 writes require caller permission, even when dispatch itself is stubbed (live smoke).
+  // The production daemon forwards fix.standDownAutoProceed from the policy cascade (standard: true).
   allowStandDownAutoProceed = false,
   // Card xd1tvd0 — rewrite the scope-overlap fences to each PR's git net diff vs current main (the `fixOverlap`
   // setting). Real git only with the real reconcile; an injected `reconcile` (every test) keeps its own fences.
