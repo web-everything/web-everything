@@ -126,6 +126,7 @@ function readRows(repo) {
 
 /** Injectable at every boundary; tests never need the host's credentials, process table, or ledgers. */
 export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.now(),
+  readFile = readFileSync,
   exec = execFileSync,
   readLedgerRows = readRows, readFixRows = readFixLoopRows,
   readJobs = () => parseLiveJobs(exec('ps', ['-axo', 'pid,etime,command'], {
@@ -144,7 +145,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
     throw failure('remote referral card requires operator verification');
   } }),
 } = {}) {
-  return ({ repo = JUDGE_SWEEP_REPO } = {}) => {
+  return ({ repo = JUDGE_SWEEP_REPO, checkCoverage } = {}) => {
     if (repo.length > 200 || !/^[\w.-]+\/[\w.-]+$/.test(repo)) throw failure('repo must be owner/name (at most 200 characters)');
     const start = now();
     const thresholds = readStallThresholds();
@@ -294,6 +295,9 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
       }
       return result;
     });
-    return { generatedAt: new Date(start).toISOString(), elapsedMs: Math.max(0, now() - start), prs, thresholds };
+    // An unreadable report leaves coverageReport unset; finish then fails closed as "unreadable".
+    let report = {};
+    if (checkCoverage !== undefined) { try { report = { coverageReport: readFile(checkCoverage, 'utf8') }; } catch { /* fail closed in finish */ } }
+    return { generatedAt: new Date(start).toISOString(), elapsedMs: Math.max(0, now() - start), prs, thresholds, ...report };
   };
 }

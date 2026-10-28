@@ -766,7 +766,7 @@ describe('pure sweep report coverage', () => {
 
 describe('coverage CLI with an injected report reader', () => {
   const reportFile = 'reports/judge sweep $(touch sentinel).txt';
-  const outcome = (input = { checkCoverage: reportFile }) => ({ code: 0, lines: [],
+  const outcome = (input = { 'check-coverage': reportFile }) => ({ code: 0, lines: [],
     run: { input, verdict: { prs: [{ number: 5996 }, { number: 5972 }, { number: 12 }] } } });
   it('declares --check-coverage as a CLI input and carries the report path to finish', async () => {
     const declaration = judgeSweepFactsOperation({ readFacts: fixture().read });
@@ -775,7 +775,7 @@ describe('coverage CLI with an injected report reader', () => {
     const result = await runOperationCli({ declaration, registry, sinks: {}, store: createMemoryRunStore(),
       argv: [`--check-coverage=${reportFile}`], newRunId: () => 'judge-sweep-coverage-fixture' });
     expect(result.code).toBe(0);
-    expect(result.run.input.checkCoverage).toBe(reportFile);
+    expect(result.run.input['check-coverage']).toBe(reportFile);
     const readFile = vi.fn(() => '#1');
     expect(finishJudgeSweep(result, { readFile }).code).toBe(0);
     expect(readFile.mock.calls[0][0]).toBe(reportFile);
