@@ -3,12 +3,95 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { resolveCoordinationRoot } from '../../operations/coordination-root.mjs';
 import { checkTranscriptText, resolveTranscriptCheckPolicy, runTranscriptCheck, checkRunTranscript } from '../codex-transcript-check.mjs';
+import { cliExitCode } from '../../codex-direct-task.mjs';
 
 const call = (cmd, name = 'exec_command') => JSON.stringify({ type: 'response_item', payload: { type: 'function_call', name, arguments: JSON.stringify({ cmd }) } });
 const tokens = total_tokens => JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { total_tokens } } } });
 const fixture = (...records) => records.join('\n');
 const check = command => checkTranscriptText(call(command), { tokenCap: 3000000 });
 const missing = () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); };
+
+describe('operator send-back regressions', () => {
+  it.each(['&', '&&', '||', ';', '|', '\n'])('rejects network calls after command separator %j in fail mode', separator => {
+    const command = `echo ok ${separator} curl https://example.test`;
+    const transcriptCheck = runTranscriptCheck({ rolloutFile: 'fixture', policy: { mode: 'fail' },
+      readFile: () => call(command), appendLog: vi.fn() });
+    expect(transcriptCheck.flags).toContainEqual({ kind: 'network', length: command.length });
+    expect(transcriptCheck.verdict).toBe('fail');
+    expect(cliExitCode({ exitCode: 0, gate: { pass: true }, transcriptCheck })).toBe(1);
+  });
+  it.each([
+    'echo "curl x; git push origin HEAD"',
+    "echo 'curl x; git push origin HEAD'",
+    String.raw`echo "escaped \"; git push origin HEAD"`,
+    String.raw`echo ok\; git push origin HEAD`,
+    String.raw`echo ok\& curl x`,
+    'echo "curl x\ngit push origin HEAD"',
+  ])('masks quoted and escaped separators before segment splitting: %s', command => {
+    expect(check(command).flags).toEqual([]);
+    expect(check(`${command}; git push origin HEAD`).flags.map(flag => flag.kind)).toContain('network');
+  });
+  it('masks an unterminated quoted argument through end of input', () => {
+    expect(check('echo "curl x; git push origin HEAD').flags).toEqual([]);
+  });
+  it.each(['echo "safe"\';& curl x\'', 'echo ok\\| git push origin HEAD',
+    'echo ok\\\ncontinued', 'echo "safe\r\n; curl x"'])(
+    'keeps concatenation, escaped pipes, continuations and quoted line endings inert: %s', command => {
+      expect(check(command).flags).toEqual([]);
+    });
+  it.each(['mktemp -p /tmp probe.XXXXXX', 'mktemp /tmp/probe.XXXXXX; echo TMPDIR',
+    'mktemp "$TMPDIR/x.XXXXXX"; mktemp /tmp/probe.XXXXXX',
+    'mktemp -p /tmp probe.XXXXXX; echo /private/tmp/claude-task',
+    'mktemp -d "/tmp/probe.XXXXXX"', "mktemp -p '/tmp' probe.XXXXXX",
+    'mktemp --tmpdir=/tmp probe.XXXXXX', 'mktemp -p/tmp probe.XXXXXX', 'env TMPDIR="$TMPDIR" mktemp /tmp/probe.XXXXXX',
+    'mktemp /tm"p"/probe.XXXXXX'])(
+    'flags explicit tmp paths in the mktemp segment: %s', command => {
+      expect(check(command).flags.map(flag => flag.kind)).toContain('tmp-write');
+    });
+  it.each(['mktemp', 'mktemp -d', 'mktemp probe.XXXXXX', 'mktemp "$TMPDIR/x.XXXXXX"',
+    'mktemp -p "$TMPDIR"', 'TMPDIR="$TMPDIR" mktemp'])(
+    'allows mktemp with no absolute tmp path: %s', command => {
+      expect(check(command).flags).toEqual([]);
+    });
+  it.each(['cp source "/tmp/a b"', 'mv source /tm"p"/target', 'mkdir -p /tmp',
+    'command cp -t /tmp source', 'cp -t/tmp source', 'mv --target-directory=/tmp source',
+    'echo ok & mkdir /tmp/target'])(
+    'checks tmp-write destinations once per command segment: %s', command => {
+      expect(check(command).flags.map(flag => flag.kind)).toContain('tmp-write');
+    });
+  it.each(['echo cp source /tmp/target', 'echo "mkdir /tmp/target"',
+    'cp /tmp/source local', 'mv /tmp/source local', 'mkdir local; echo /tmp/target',
+    'echo mktemp /tmp/target'])(
+    'does not confuse arguments or tmp read sources with writes: %s', command => {
+      expect(check(command).flags).toEqual([]);
+    });
+  it.each(['cp', 'mv', 'mkdir'])('bounds adversarial %s tmp-write scanning', executable => {
+    const probe = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import { checkTranscriptText } from './scripts/lib/codex-transcript-check.mjs';
+      const executable = ${JSON.stringify(executable)};
+      const inspect = cmd => checkTranscriptText(JSON.stringify({ payload: { type: 'function_call', name: 'exec_command', arguments: JSON.stringify({ cmd }) } })).flags;
+      const cmd = (executable + ' ').repeat(Math.floor(150000 / (executable.length + 1)));
+      console.log(JSON.stringify([inspect(cmd), inspect(cmd + '/tmp/probe')]));
+    `], { encoding: 'utf8', timeout: 3000, maxBuffer: 4096 });
+    expect(probe.error).toBeUndefined();
+    expect(probe.status, probe.stderr).toBe(0);
+    const length = Math.floor(150000 / (executable.length + 1)) * (executable.length + 1) + '/tmp/probe'.length;
+    expect(JSON.parse(probe.stdout)).toEqual([[], [{ kind: 'tmp-write', length }]]);
+  });
+  it.each(['warn', 'fail'])('visibly reports a missing rollout in %s mode', mode => {
+    const emit = vi.fn();
+    expect(checkRunTranscript({ threadId: 'own', env: {}, emit,
+      resolvePolicy: () => ({ mode }), findRolloutFile: () => null })).toEqual({ mode, error: 'Run rollout transcript not found' });
+    expect(emit).toHaveBeenCalledWith('codex-transcript-check · warning: Run rollout transcript not found');
+  });
+  it('preserves the lookup failure and fail mode if emitting its warning also fails', () => {
+    const emit = vi.fn().mockImplementationOnce(() => {}).mockImplementation(() => { throw new Error('sink denied'); });
+    expect(checkRunTranscript({ threadId: 'own', env: {}, emit,
+      resolvePolicy: () => ({ mode: 'fail' }), findRolloutFile: () => null }))
+      .toEqual({ mode: 'fail', error: 'Run rollout transcript not found' });
+    expect(emit).toHaveBeenCalledTimes(2);
+  });
+});
 
 describe('checkTranscriptText fixture rollouts', () => {
   it.each(['while true; do sleep 2; done', 'until ready; do sleep 1; done', 'for x in a b; do node scripts/readiness/heavy-admission.mjs run -- true; done', 'for x in a; do npx vitest run x; done'])('flags loop: %s', command => {
@@ -92,7 +175,7 @@ describe('checkTranscriptText fixture rollouts', () => {
   ])('does not invent risky loops from quoted syntax or clean nested loops: %s', command => {
     expect(check(command).flags).toEqual([]);
   });
-  it.each(['echo x > /tmp/x', 'echo x >> /tmp/x', 'echo x | tee /tmp/x', 'mktemp', 'curl x -o /tmp/x', 'cp source /tmp/x', 'mv source /tmp/x', 'mkdir -p /tmp/x'])('flags tmp-write: %s', command => {
+  it.each(['echo x > /tmp/x', 'echo x >> /tmp/x', 'echo x | tee /tmp/x', 'mktemp /tmp/x.XXXXXX', 'curl x -o /tmp/x', 'cp source /tmp/x', 'mv source /tmp/x', 'mkdir -p /tmp/x'])('flags tmp-write: %s', command => {
     expect(check(command).flags.map(flag => flag.kind)).toContain('tmp-write');
   });
   it('scans oversized adversarial loop syntax within a bounded runtime', () => {
@@ -182,11 +265,11 @@ describe('checkTranscriptText fixture rollouts', () => {
   ])('omits additional credential forms from returned and persisted flags: %s', command => {
     const appendLog = vi.fn();
     const result = runTranscriptCheck({ rolloutFile: 'fixture', policy: { mode: 'warn' }, readFile: () => call(command), appendLog });
-    expect(result.flags).toHaveLength(1);
     const persisted = JSON.stringify(result.flags) + appendLog.mock.calls[0][1];
     expect(persisted).not.toContain('credential-value');
     expect(persisted).not.toContain('trailing-sensitive-value');
-    expect(result.flags[0]).toEqual({ kind: result.flags[0].kind, length: command.length });
+    const kinds = command.startsWith('API_KEY="') ? ['tmp-write', 'network'] : ['network'];
+    expect(result.flags).toEqual(kinds.map(kind => ({ kind, length: command.length })));
   });
   it('flags apply_patch and edit targets', () => {
     const patch = JSON.stringify({ type: 'response_item', payload: { type: 'custom_tool_call', name: 'apply_patch', input: '*** Begin Patch\n*** Add File: /tmp/x\n+hi\n*** End Patch' } });

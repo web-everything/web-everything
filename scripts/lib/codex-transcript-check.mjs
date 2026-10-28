@@ -107,6 +107,63 @@ function hasRiskyLoop(command) {
   return false;
 }
 
+// Mask quoted/escaped syntax before recognizing separators. Keep decoded words
+// alongside the mask for path checks, including quoted and concatenated paths.
+// Each character is visited once; all input is already bounded by INSPECTION_CAP.
+function* shellSegments(command) {
+  let words = [], word = '', started = false, masked = '', quote = '';
+  const finishWord = () => {
+    if (started) words.push(word);
+    word = ''; started = false;
+  };
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i];
+    if (char === '\\' && quote !== "'" && i + 1 < command.length) {
+      const next = command[++i];
+      if (next === '\n') continue;
+      word += next; started = true; masked += 'xx';
+    } else if (quote) {
+      masked += 'x';
+      if (char === quote) quote = '';
+      else word += char;
+    } else if (char === '"' || char === "'") {
+      quote = char; started = true; masked += 'x';
+    } else if (';&|\n'.includes(char)) {
+      finishWord();
+      yield { words, masked };
+      words = []; masked = '';
+    } else if (/\s/.test(char)) {
+      finishWord(); masked += char;
+    } else {
+      word += char; started = true; masked += char;
+    }
+  }
+  finishWord();
+  yield { words, masked };
+}
+
+function hasTmpWrite(words) {
+  let start = 0;
+  while (start < words.length && (['env', 'sudo', 'command', 'exec', 'do'].includes(words[start])
+    || /^[A-Za-z_]\w*=/.test(words[start]))) start++;
+  const executable = words[start];
+  const tmpPath = word => /^\/tmp(?:\/|$)/.test(word);
+  if (executable === 'cp' || executable === 'mv') {
+    if (tmpPath(words[words.length - 1])) return true;
+    for (let i = start + 1; i < words.length; i++) {
+      if (['-t', '--target-directory'].includes(words[i]) && tmpPath(words[i + 1])) return true;
+      if (words[i].startsWith('-t') && tmpPath(words[i].slice(2))) return true;
+      if (words[i].startsWith('--target-directory=') && tmpPath(words[i].slice('--target-directory='.length))) return true;
+    }
+  } else if (executable === 'mkdir' || executable === 'mktemp') {
+    for (let i = start + 1; i < words.length; i++) {
+      if (tmpPath(words[i]) || words[i].startsWith('--tmpdir=') && tmpPath(words[i].slice('--tmpdir='.length))) return true;
+      if (executable === 'mktemp' && words[i].startsWith('-p') && tmpPath(words[i].slice(2))) return true;
+    }
+  }
+  return false;
+}
+
 export function checkTranscriptText(jsonlText, { tokenCap = 3000000 } = {}) {
   const flags = [], seen = new Set();
   let totalTokens = 0, recognized = false;
@@ -140,14 +197,12 @@ export function checkTranscriptText(jsonlText, { tokenCap = 3000000 } = {}) {
       if (hasRiskyLoop(command)) flag('loop', command);
       const tmp = `(?:["']?)/tmp/`;
       if (new RegExp(`(?:>{1,2}\\s*|\\btee\\s+(?:-[^\\s]+\\s+)*|(?:^|\\s)-o\\s*)${tmp}`).test(command)
-        || /\b(?:cp|mv)\b[^\n;&|]*\s["']?\/tmp\/[^\s"']*["']?\s*(?:$|[;&|\n])/.test(command)
-        || /\bmkdir\b[^\n;&|]*\s["']?\/tmp\//.test(command)
-        || /\bmktemp\b/.test(command) && !/TMPDIR|\/private\/tmp\/claude-|\bmktemp\b[^\n;&|]*\s-p(?:\s|$)/.test(command)
         || /(?:\*\*\* (?:Add|Update|Delete) File:|(?:path|file_path|target)["']?\s*[:=])\s*["']?\/tmp\//.test(command)) flag('tmp-write', command);
       // Quoted search patterns are data. Restrict network detection to command words, with wrappers
       // env/sudo/command/exec and VAR=val allowed. Suppress only search command words after wrappers.
-      for (const segment of command.split(/[;\n|]|&&/)) {
-        const words = segment.replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g, ' STRING ').trim();
+      for (const segment of shellSegments(command)) {
+        if (hasTmpWrite(segment.words)) flag('tmp-write', command);
+        const words = segment.masked.trim();
         if (/^\s*(?:(?:env|sudo|command|exec)\s+|[A-Za-z_][\w]*=\S+\s+)*(?:rg|grep)(?:\s|$)/.test(words)) continue;
         if (/(?:^|\||\bdo\b)\s*(?:(?:env|sudo|command|exec)\s+|[A-Za-z_][\w]*=\S+\s+)*(?:(?:gh|curl)(?:\s|$)|git\s+(?:-C\s+\S+\s+)?(?:fetch|push)(?:\s|$))/.test(words)) flag('network', command);
       }
@@ -187,6 +242,9 @@ export function checkRunTranscript({ codexHome, threadId, ephemeral = false, fin
     return result;
   } catch (error) {
     const mode = policy?.mode ?? (env.WE_CODEX_TRANSCRIPT_CHECK_MODE?.trim() === 'fail' ? 'fail' : 'warn');
-    return { mode, error: String(error?.message ?? error) };
+    const message = String(error?.message ?? error);
+    try { emit(`codex-transcript-check · warning: ${message.replace(/[\x00-\x1f\x7f]/g, ' ')}`); }
+    catch { /* A failed output sink must not replace the original failure or mode. */ }
+    return { mode, error: message };
   }
 }

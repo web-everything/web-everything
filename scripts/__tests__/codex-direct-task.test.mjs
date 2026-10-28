@@ -1338,8 +1338,10 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
         const report = await codexDirectTask({ task: 'fixture', dir, gate: 'none', stream: false, spawnFn, execFn, collectQuotaFn, clearRolloutAfterRun: true, log,
           env: { ...process.env, CODEX_HOME: dir, WE_COORDINATION_ROOT: join(dir, 'coordination'), WE_CODEX_TRANSCRIPT_CHECK_MODE: mode === 'fail' ? 'fail' : 'warn' } });
         expect(collectQuotaFn).toHaveBeenCalledOnce();
-        if (mode === 'missing') expect(report.transcriptCheck.error).toMatch(/not found/);
-        else {
+        if (mode === 'missing') {
+          expect(report.transcriptCheck.error).toMatch(/not found/);
+          expect(log).toHaveBeenCalledWith('codex-transcript-check · warning: Run rollout transcript not found');
+        } else {
           expect(report.transcriptCheck).toMatchObject({ mode, rolloutFile: rollout, verdict: mode, flags: [{ kind: 'network', length: 'gh issue list'.length }] });
           expect(JSON.stringify(report)).not.toContain('gh issue list');
           expect(readFileSync(join(dir, 'coordination', 'codex-transcript-check.jsonl'), 'utf8')).not.toContain('gh issue list');
