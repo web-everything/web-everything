@@ -341,6 +341,7 @@ export function reassertHumanClearance({ provider, repo, pr, headSha, assertElig
   try {
     if (!Array.isArray(fresh.labels)) return { reapplied: false };
     if (!isHumanSurfacePark({ provider, repo, pr, labels: fresh.labels, headSha, comments: fresh.comments })) return { reapplied: false };
+    assertEligible(fresh.labels);
     provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
     return { reapplied: true };
   } catch (e) {
@@ -1145,7 +1146,12 @@ export function runReviewLabelCli({
   // Shadows the module-level `fail` so EVERY refusal inside this function goes to the
   // injected emitter too. Without this the guards print past an in-process caller's collector (#3061); the
   // module-level one stays for the CLI bootstrap below, which owns fd 1 for real.
-  const fail = (message, code = 2) => { emit(`${JSON.stringify({ error: message })}\n`); process.exit(code); };
+  let retainRefusedClearance = () => '';
+  const fail = (message, code = 2) => {
+    const recovery = retainRefusedClearance();
+    emit(`${JSON.stringify({ error: message + recovery })}\n`);
+    process.exit(code);
+  };
   let repo = (argv.find((a) => a.startsWith('--repo=')) || '').slice('--repo='.length);
   const actorArg = (argv.find((a) => a.startsWith('--actor=')) || '').slice('--actor='.length);
   const actor = actorArg || defaultActor;
@@ -1985,18 +1991,40 @@ export function runReviewLabelCli({
   };
   recheckMissingRearm();
 
-  // Delegated clearance records are themselves clearance authority. Delay BOTH appends until the
-  // first write-time admission read succeeds, in either write order. Later checks still run normally.
+  // Delegated clearance records are themselves clearance authority. A later admission
+  // refusal must supersede even a partial append with a new human hold. Append ordering
+  // deliberately excludes all earlier clearances; a later independent approval can lift it.
+  // Arm BEFORE the append: a failed sink can have persisted a row in one ledger store.
+  let delegatedLedgerStarted = false;
+  retainRefusedClearance = () => {
+    if (!delegatedLedgerStarted) return '';
+    delegatedLedgerStarted = false; // a caught/stubbed exit must not append the recovery twice
+    try {
+      const held = appendVerdict(buildLedgerEvent({
+        type: EVENT_TYPES.LABEL_INPUT, repo, pr: Number(pr), at: new Date().toISOString(),
+        source: 'review-set-label', label: REVIEW_LABELS.human, change: 'added',
+        sender: 'refused delegated clearance',
+      }));
+      if (!held?.ok) throw new Error((held?.errors ?? ['unknown ledger failure']).join('; '));
+      return '; refused delegated clearance superseded by a durable human hold';
+    } catch (e) {
+      return `; HUMAN HOLD RECOVERY FAILED: ${String(e?.message ?? e).split('\n')[0]}; operator must repair the ledger before retrying`;
+    }
+  };
+  const assertDelegationCurrent = () => {
+    if (validatedApproval && !approvalValid(validatedApproval, Date.now())) {
+      fail('delegated clearance refused: delegation expired before clearance write', 1);
+    }
+  };
   let ledgerRecorded = false;
   const recordLedger = () => {
+    assertDelegationCurrent();
     if (ledgerRecorded) return;
-    if (validatedApproval && !approvalValid(validatedApproval, Date.now())) {
-      fail('--delegation-json expired before clearance; nothing was changed', 1);
-    }
     const ledgerVerdict = verdictForLabelTarget(to);
     let clearingLedgerMiss = false;
     let approvalRefusal = '';
     try {
+      if (guardedClearHuman) delegatedLedgerStarted = true;
       const appended = appendVerdict(buildVerdictRecord({
         repo,
         pr: Number(pr),
@@ -2059,7 +2087,8 @@ export function runReviewLabelCli({
         }
       }
     } catch (e) {
-      process.stderr.write(`review-set-label: verdict-ledger append failed (#3007 shadow, non-fatal) — ${String((e && e.message) || e).split('\n')[0]}\n`);
+      process.stderr.write(`review-set-label: verdict-ledger append failed (#3007 shadow, ${guardedClearHuman ? 'fatal' : 'non-fatal'}) — ${String((e && e.message) || e).split('\n')[0]}\n`);
+      if (guardedClearHuman) clearingLedgerMiss = true;
     }
     // Outside the try on purpose: a stubbed or real `process.exit` must never be swallowed by the non-fatal catch above.
     if (clearingLedgerMiss) {
@@ -2105,6 +2134,7 @@ export function runReviewLabelCli({
     }
     try {
       recordLedger();
+      assertDelegationCurrent();
       provider.setLabels(repo, pr, { add: decision.addLabel, remove: removals });
     } catch (e) {
       fail(ghErr(e, 'gh pr edit failed'), 1);
@@ -2140,6 +2170,7 @@ export function runReviewLabelCli({
           assertGuardedClearHumanEligible(fresh.labels);
         }
         recordLedger();
+        assertDelegationCurrent();
         provider.postComment(repo, pr, commentBody);
         return;
       } catch (e) { commentFailure = ghErr(e, 'gh pr comment failed'); }
@@ -2236,10 +2267,14 @@ export function runReviewLabelCli({
   // (Comment-first order needs no extra read: the swap's own fresh read already follows the comment.)
   // The re-park re-reads after its own write too, so at least one side sees the other.
   if (to === 'clear-human' && acceptanceAlreadyLive) {
-    // Clearance is already durable. Recovery warns on read/head failures and performs no further swap.
-    reassertHumanClearance({ provider, repo, pr, headSha,
-      assertEligible: assertGuardedClearHumanEligible });
+    const result = reassertHumanClearance({ provider, repo, pr, headSha,
+      assertEligible: labels => {
+        assertGuardedClearHumanEligible(labels);
+        assertDelegationCurrent();
+      } });
+    if (guardedClearHuman && result.error) fail('delegated clearance refused: post-clearance re-check failed; operator review required', 1);
   }
+  delegatedLedgerStarted = false;
 
   // #4258-shape — THE APPROVAL-TIME PREVENTION-FILING DEFAULT (operator, 2026-09-27). Runs ONLY for the two
   // targets that just recorded an acceptance above; `changes`/`rearm`/`restamp` never reach it (and
