@@ -4,10 +4,10 @@ import { readFile, realpath } from 'node:fs/promises';
 import { createHash, randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { digestInput, digestArgv } from './forge-exec-run.mjs';
 
 const ROOT = '/srv/forge-exec';
 const LIMIT = 4 * 1024 * 1024;
-const RECEIPT = '.exit-code';
 const SSH_OPTIONS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'];
 const ENV_KEYS = ['CI', 'NODE_ENV', 'TZ', 'LANG', 'LC_ALL', 'FORCE_COLOR', 'NO_COLOR'];
 const quote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
@@ -27,55 +27,6 @@ export function filterEnv(env = {}) {
 
 export function validateRunId(id) {
   return typeof id === 'string' && /^[a-z0-9][a-z0-9-]{5,63}$/.test(id);
-}
-
-export function buildRemoteScript({ runId, lockHash, receiptNonce = randomBytes(16).toString('hex'), env = {}, argv, retainRun = false }) {
-  if (!validateRunId(runId) || !/^[a-f0-9]{64}$/.test(lockHash) || !/^[a-f0-9]{32}$/.test(receiptNonce) || !isAllowedCommand(argv)) {
-    throw new Error('Invalid remote execution parameters');
-  }
-  const dir = `${ROOT}/${runId}`;
-  // Version the install profile so production-only and root-only caches are never reused.
-  const cacheRoot = `${ROOT}/.cache/${lockHash}`;
-  const cache = `${cacheRoot}/dev-v2`;
-  const cleanEnv = `env -i PATH=/usr/local/bin:/usr/bin:/bin ${Object.entries(filterEnv(env)).map(([k, v]) => `${k}=${quote(v)}`).join(' ')}`;
-  return `set -euo pipefail
-mkdir -p ${quote(dir)}
-trap 'code=$?; trap - EXIT; ${retainRun ? ':' : `rm -rf -- ${quote(dir)}`}; exit "$code"' EXIT
-rm -f -- ${quote(`${dir}/${RECEIPT}`)}
-receipt_nonce=${quote(receiptNonce)}
-cd ${quote(dir)}
-mkdir -p ${quote(cache)}
-# Serialize cache creation on the Linux execution host.
-if command -v flock >/dev/null 2>&1; then
-  exec 9>${quote(`${cache}/.lock`)}
-  flock -x 9
-fi
-if [ ! -f ${quote(`${cache}/dependencies.tar`)} ]; then
-  # Install output must not pollute the command's streamed output; show a tail only on failure.
-  if ! ${cleanEnv} npm ci --include=dev --ignore-scripts --no-audit --no-fund >.npm-ci.log 2>&1; then tail -n 20 .npm-ci.log >&2; exit 97; fi
-  rm -f .npm-ci.log
-  # Keep every installed tree at its relative location, including workspace-local
-  # dependencies. Prune at node_modules: tar already includes its nested packages.
-  find . -type d -name node_modules -prune -print0 > .npm-deps.list
-  tar -cf .npm-deps.tar --null -T .npm-deps.list
-  # Publish only a complete archive; an interrupted writer leaves a cold cache.
-  mv .npm-deps.tar ${quote(`${cache}/dependencies.tar`)}
-  rm -f .npm-deps.list
-else
-  # A lock hash does not cover root/workspace manifests. Validate the copied
-  # snapshot with npm before trusting a warm cache; never fetch or run scripts.
-  if ! ${cleanEnv} npm ci --dry-run --offline --include=dev --ignore-scripts --no-audit --no-fund >.npm-ci.log 2>&1; then tail -n 20 .npm-ci.log >&2; exit 97; fi
-  rm -f .npm-ci.log
-  tar -xf ${quote(`${cache}/dependencies.tar`)}
-fi
-touch ${quote(cacheRoot)} ${quote(cache)}
-if command -v flock >/dev/null 2>&1; then flock -u 9; exec 9>&-; fi
-# Only a completed command can publish a receipt; setup failures leave none.
-code=0
-${cleanEnv} ${argv.map(quote).join(' ')} || code=$?
-printf "%s:%s\\n" "$receipt_nonce" "$code" > ${quote(`${dir}/${RECEIPT}`)}
-exit "$code"
-`;
 }
 
 // Captures have a hard byte limit; streamed command output is inherited verbatim.
@@ -110,7 +61,7 @@ function safeFiles(files) {
     if (typeof path !== 'string' || !path || path.startsWith('/') || /[\0\r\n]/.test(path)) throw new Error('Invalid file path');
     const parts = path.split('/');
     if (parts.some((part) => part === '..' || part === '.')) throw new Error('Unsafe file path');
-    return !parts.some((part) => part === RECEIPT || /^(?:node_modules|\.git|\.env(?:\..*)?|\.secrets|\.ssh|\.aws|\.claude|\.codex|\.npmrc|\.netrc|credentials(?:\..*)?|.*\.(?:pem|key))$/i.test(part));
+    return !parts.some((part) => part === '.exit-code' || /^(?:node_modules|\.git|\.env(?:\..*)?|\.secrets|\.ssh|\.aws|\.claude|\.codex|\.npmrc|\.netrc|credentials(?:\..*)?|.*\.(?:pem|key))$/i.test(part));
   });
   // openrsync still treats leading #/; as comments with --from0. Anchor every
   // validated relative path so both rsync implementations read it literally.
@@ -126,46 +77,57 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
   try {
     if ((await exec({ file: 'ssh', args: [host, 'true'], cwd })).code !== 0) return fallback('forge-unreachable');
   } catch { return fallback('forge-unreachable'); }
-  const dir = `${ROOT}/${runId}`;
-  // A caller may reuse a run id; bind receipts to this invocation independently.
-  const receiptNonce = randomBytes(16).toString('hex');
-  const ssh = (script, inherit = false) => exec({ file: 'ssh',
-    args: [host, inherit ? 'sudo -u forge-exec bash -s' : `sudo -u forge-exec bash -c ${quote(script)}`],
-    ...(inherit ? { input: script } : {}), cwd, inherit });
-  const cleanup = async () => { try { await ssh(`rm -rf -- ${quote(dir)}`); } catch { /* Daily pruning is the final cleanup backstop. */ } };
-  let lockHash;
+  const nonce = randomBytes(16).toString('hex');
+  const ssh = (command, request, inherit = false) => exec({file:'ssh',
+    args:[host, `sudo -n -u ops /usr/local/libexec/forge-exec-run ${command}`],
+    input:JSON.stringify(request), cwd, inherit});
+  let run;
+  let finished = false;
+  const finish = async () => {
+    if (!run || finished) return null;
+    finished = true;
+    return ssh('finish', {nonce,run});
+  };
   try {
-    lockHash = createHash('sha256').update(await readFile(join(cwd, 'package-lock.json'))).digest('hex');
-    const files = listFiles ? await listFiles(cwd) : await (async () => {
-      const result = await exec({ file: 'git', args: ['ls-files', '-co', '--exclude-standard', '-z'], cwd });
-      if (result.code !== 0 || typeof result.stdout !== 'string' || Buffer.byteLength(result.stdout) > LIMIT) throw new Error('File inventory unavailable');
-      return result.stdout.split(result.stdout.includes('\0') ? '\0' : '\n').filter(Boolean);
-    })();
-    const inventory = safeFiles(files);
-    // This repository's shared config aliases both plugs and webtheme into
-    // ../frontierui. Our single-repository transport cannot reproduce that layout.
-    // Conservatively use local admission for either command until sibling snapshots
-    // are supported; do not turn a missing remote dependency into a test failure.
-    if (files.includes('vitest.shared.ts')) return fallback('unsupported-sibling-dependency');
-    // Clear stale receipts before transfer; rsync exclusions alone preserve them.
-    const prepared = await ssh(`mkdir -p ${quote(dir)} && rm -f -- ${quote(`${dir}/${RECEIPT}`)}`);
-    if (prepared.code !== 0) throw new Error('Run directory preparation failed');
-    // No --mkpath: macOS openrsync lacks it. Exclude receipts even for directory entries.
-    const copied = await exec({ file: 'rsync', args: ['-a', '--delete', `--exclude=${RECEIPT}`, '--from0', '--files-from=-', '--rsync-path=sudo -u forge-exec rsync', '-e', `ssh ${SSH_OPTIONS.join(' ')}`, './', `${host}:${dir}/`], cwd, input: inventory });
-    if (copied.code !== 0) throw new Error('Copy failed');
-  } catch { await cleanup(); return fallback('copy-failed'); }
+    let expected;
+    try {
+      const lock = createHash('sha256').update(await readFile(join(cwd,'package-lock.json'))).digest('hex');
+      const files = listFiles ? await listFiles(cwd) : await (async () => {
+        const result = await exec({file:'git',args:['ls-files','-co','--exclude-standard','-z'],cwd});
+        if(result.code !== 0 || typeof result.stdout !== 'string' || Buffer.byteLength(result.stdout)>LIMIT) throw new Error('Inventory unavailable');
+        return result.stdout.split(result.stdout.includes('\0')?'\0':'\n').filter(Boolean);
+      })();
+      const inventory = safeFiles(files);
+      if(files.includes('vitest.shared.ts')) return fallback('unsupported-sibling-dependency');
+      const prepared = await ssh('prepare',{nonce,label:runId});
+      if(prepared.code !== 0 || typeof prepared.stdout !== 'string' || prepared.stdout.length>1024) throw new Error('Prepare failed');
+      run = JSON.parse(prepared.stdout).run;
+      if(typeof run !== 'string' || !/^r-[a-f0-9]{32}$/.test(run)) {run=undefined; throw new Error('Invalid server run');}
+      const copied = await exec({file:'rsync',args:['-a','--delete','--exclude=.exit-code',
+        ...['node_modules','.git','.env*','.secrets','.ssh','.aws','.claude','.codex','.npmrc','.netrc','credentials*','*.pem','*.key'].map(name=>`--exclude=${name}`),
+        '--from0','--files-from=-','--rsync-path=sudo -u forge-exec rsync','-e',`ssh ${SSH_OPTIONS.join(' ')}`,
+        './',`${host}:${ROOT}/${run}/work/`],cwd,input:inventory});
+      if(copied.code !== 0) throw new Error('Copy failed');
+      const inputDigest = await digestInput(cwd, inventory.split('\0').filter(Boolean).map(name=>name.slice(2)));
+      expected = {v:1,nonce,run,inputDigest,argvDigest:digestArgv(argv),lock};
+    } catch {return fallback('copy-failed');}
+    try {
+      const result = await ssh('run',{...expected,argv,env:filterEnv(env)},true);
+      const receipt = await finish();
+      if(!receipt || receipt.code!==0 || typeof receipt.stdout!=='string' || Buffer.byteLength(receipt.stdout)>4096) return fallback('ambiguous-result');
+      if(!verifyReceipt(receipt.stdout,expected,result.code)) return fallback('ambiguous-result');
+      return {mode:'remote',code:result.code};
+    } catch {return fallback('ambiguous-result');}
+  } finally {try {await finish();} catch { /* Pruning is the cleanup backstop; never retry execution. */ }}
+}
+
+export function verifyReceipt(text, expected, code) {
   try {
-    const result = await ssh(buildRemoteScript({ runId, lockHash, receiptNonce, env, argv, retainRun: true }), true);
-    // Read beyond the longest valid receipt (37 bytes) so trailing data is rejected.
-    const receipt = await ssh(`head -c 64 -- ${quote(`${dir}/${RECEIPT}`)}`);
-    if (receipt.code !== 0 || typeof receipt.stdout !== 'string') return fallback('ambiguous-result');
-    const match = /^([a-f0-9]{32}):(0|[1-9][0-9]{0,2})\n?$/.exec(receipt.stdout);
-    if (!match || match[0] !== receipt.stdout || match[1] !== receiptNonce) return fallback('ambiguous-result');
-    const code = Number(match[2]);
-    if (code >= 255 || code !== result.code) return fallback('ambiguous-result');
-    return { mode: 'remote', code };
-  } catch { return fallback('ambiguous-result'); }
-  finally { await cleanup(); }
+    const receipt=JSON.parse(text);
+    return receipt && Object.keys(receipt).sort().join(',') === 'argvDigest,code,inputDigest,lock,nonce,phase,run,v'
+      && Object.entries(expected).every(([key,value])=>receipt[key]===value)
+      && receipt.phase==='test' && Number.isInteger(code) && code>=0 && code<255 && receipt.code===code;
+  } catch {return false;}
 }
 
 export async function runWithRemoteFallback(options = {}) {
