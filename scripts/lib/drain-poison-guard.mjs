@@ -13,7 +13,7 @@ const TOP_LEVEL_CARD = /^backlog\/[^/]+\.md$/;
  * every identity line in the whole text, and the caller decides how to fail closed.
  */
 function cardIdentities(text) {
-  const lines = String(text ?? '').replace(/^﻿/, '').split(/\r?\n/);
+  const lines = String(text ?? '').replace(/^\uFEFF/, '').split(/\r?\n/);
   const end = lines[0].trimEnd() === '---' ? lines.findIndex((line, i) => i > 0 && line.trimEnd() === '---') : -1;
   const parsed = end > 0;
   return { parsed, ids: (parsed ? lines.slice(1, end) : lines).map(line => line.match(IDENTITY)?.[2]).filter(Boolean) };

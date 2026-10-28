@@ -71,7 +71,7 @@ describe('checkBornAsCollision', () => {
     expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ collision: { hash: 'xgcpm6z', path: newCard, mainCard } });
   });
   it('reads a CRLF or BOM-prefixed main card frontmatter as frontmatter', () => {
-    const exec = fakeExec({ main: `origin/main:${mainCard}\0bornAs: xgcpm6z\r`, mainTexts: { [mainCard]: '﻿---\r\nbornAs: xgcpm6z\r\n---\r\nbody\r\n' } });
+    const exec = fakeExec({ main: `origin/main:${mainCard}\0bornAs: xgcpm6z\r`, mainTexts: { [mainCard]: '\uFEFF---\r\nbornAs: xgcpm6z\r\n---\r\nbody\r\n' } });
     expect(checkBornAsCollision({ exec, headSha: sha }).collision?.hash).toBe('xgcpm6z');
   });
   it.each([['no fence', 'bornAs: xgcpm6z\nno frontmatter fence\n'], ['an unclosed fence', '---\nbornAs: xgcpm6z\nbody\n']])(
