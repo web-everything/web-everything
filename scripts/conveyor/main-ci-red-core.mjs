@@ -55,6 +55,8 @@ export const MAIN_CI_RED_DEFAULTS = Object.freeze({
   mainCiRedAutoRecoverAfterMin: 60,
   /** Off = no automatic CI reruns. Each run is requested at most once. */
   mainCiRedFlakeRerun: true,
+  /** Off = only existing flake evidence qualifies; on = test-file failures also rerun once for repeat proof. */
+  mainCiRedRerunForProof: true,
   /** card 303: off = before this card, green merge groups supply no flake evidence. */
   mainCiRedMergeGroupFlakeEvidence: true,
   /** card 303: maximum merge-group runs to read; 0 = no merge-group read. */
@@ -239,6 +241,8 @@ export function classifyFlakeRun({ run, failures, prevRunGreen, changedFiles, gr
   if (Array.isArray(failures) && failures.length && failures.every((f) =>
     (signature && signature.test(String(f?.error ?? ''))) || settings.mainCiRedKnownFlakyTests.some((entry) =>
       entry && `${f?.file ?? ''} > ${f?.title ?? ''}`.includes(entry)))) return { eligible: true, reason: 'flaky-signature' };
+  if (settings.mainCiRedRerunForProof && Array.isArray(failures) && failures.length
+    && failures.every((f) => typeof f?.file === 'string' && f.file.trim().length > 0)) return { eligible: true, reason: 'repeat-proof' };
   if (settings.mainCiRedRerunUnrelatedChange && prevRunGreen === true && Array.isArray(changedFiles) && changedFiles.length
     && changedFiles.every((f) => isNonCodeFile(f, settings.mainCiRedNonCodePaths))) return { eligible: true, reason: 'unrelated-change' };
   if (groupEvidence) return { eligible: true, reason: 'merge-group-green-on-tip' };

@@ -56,7 +56,7 @@ describe('repeat-failure planner keys evidence by real run id and attempt', () =
   it('defaults absent run attempts and latestAttempt to 1 for distinct runs', () => {
     const repeatRuns = rows.map(({ attempt, ...row }, i) => ({ ...row, databaseId: runId + i }));
     expect(plan({ repeatRuns, latestRunId: runId + 1, latestAttempt: undefined }))
-      .toMatchObject({ action: 'add', entries: [{ proof: { ...proof, runIds: [runId, runId + 1], attempts: [1, 1] } }] });
+      .toMatchObject({ action: 'add', entries: [{ proof: { ...proof, runIds: [runId, runId + 1] } }] });
   });
 
   it.each([0, -1, 1.5, '2', null])('refuses a non-positive-integer attempt: %s', (attempt) => {
@@ -181,16 +181,42 @@ describe('red-main passively collects repeat evidence; the conveyor owns reruns'
     h.noRerun();
   });
 
-  it('notes a flake when main goes green after multiple observed failed attempts', () => {
+  it('does not classify two failed attempts as a flake when a different run makes main green', () => {
     const h = harness();
     h.tick();
     h.readLog.mockReturnValue(failure('scripts/lib/__tests__/different.test.mjs'));
     h.tick(rerun);
     const out = h.tick({ ...rerun, databaseId: runId + 1, headSha: 'b'.repeat(40), conclusion: 'success',
       createdAt: '2026-10-28T11:30:00Z' });
-    expect(out.rerun).toEqual({ outcome: 'flake' });
-    expect(h.ledger().reds[sha]).toMatchObject({ attempts: { outcome: 'passed-on-rerun (flake)' } });
+    expect(out.rerun).toBeUndefined();
+    expect(h.ledger().reds[sha].attempts).not.toHaveProperty('outcome');
+    expect(h.ledger().reds[sha].attempts).toMatchObject({
+      1: snapshot(originalRun),
+      2: snapshot(rerun, { [job]: failure('scripts/lib/__tests__/different.test.mjs') }),
+    });
     expect(h.write).not.toHaveBeenCalled();
+    h.noRerun();
+  });
+
+  it.each([3, 4, 10])('preserves sufficient distinct-run history for proof count %s when attempt 2 fails', (count) => {
+    const h = harness({ values: { repeatFailureCount: count } });
+    h.tick();
+    const history = Array.from({ length: count - 1 }, (_, i) => ({
+      ...originalRun, databaseId: runId - count + i + 1,
+      createdAt: new Date(Date.parse(originalRun.createdAt) - (count - i) * 60_000).toISOString(),
+    }));
+    const out = h.tick(rerun, {
+      mainCiRuns: { runs: [...history, rerun], failing: { runId, jobs: [job, 'daemon-soak'] } },
+    });
+    expect(out).toMatchObject({ applied: true, plan: { action: 'add' } });
+    expect(h.list().entries).toEqual([expect.objectContaining({
+      test: file, proof: {
+        kind: 'repeat-failed', count,
+        runIds: [...history.slice(1).map((r) => r.databaseId), runId, runId],
+        attempts: [...history.slice(1).map(() => 1), 1, 2], shas: [sha, sha],
+      },
+    })]);
+    expect(h.write).toHaveBeenCalledOnce();
     h.noRerun();
   });
 

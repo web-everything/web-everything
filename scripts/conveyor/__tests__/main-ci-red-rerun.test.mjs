@@ -39,9 +39,17 @@ describe('repeat-proof reruns use the existing conveyor path', () => {
     expect(classifyProof({ failures: [failure] })).toEqual({ eligible: true, reason: 'flaky-signature' });
   });
 
-  it('setting off preserves the old deterministic-failure behavior', () => {
-    expect(classifyProof({ settings: { ...proofSettings, mainCiRedRerunForProof: false } }))
-      .toEqual({ eligible: false, reason: 'not-flaky' });
+  it('default-enabled repeat proof accepts a deterministic file failure without other flake evidence', () => {
+    expect(core.classifyFlakeRun({
+      run: red, failures: [deterministic], prevRunGreen: false, changedFiles: [], groupEvidence: null,
+    })).toEqual({ eligible: true, reason: 'repeat-proof' });
+  });
+
+  it('explicit-false repeat proof rejects a deterministic file failure without other flake evidence', () => {
+    expect(core.classifyFlakeRun({
+      run: red, failures: [deterministic], prevRunGreen: false, changedFiles: [], groupEvidence: null,
+      settings: core.mainCiRedSettings({ mainCiRedRerunForProof: false }),
+    })).toEqual({ eligible: false, reason: 'not-flaky' });
   });
 
   it('attempt >1 still refuses a repeat-proof rerun', () => {
