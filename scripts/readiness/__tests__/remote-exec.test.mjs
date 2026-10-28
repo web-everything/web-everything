@@ -30,7 +30,7 @@ beforeEach(() => {
   // Task scratch must stay under the launcher-provided TMPDIR.
   cwd = realpathSync(mkdtempSync(join(process.env.TMPDIR, 'remote-exec-test-')));
   writeFileSync(join(cwd, 'package-lock.json'), '{"lockfileVersion":3,"packages":{}}\n');
-  for (const file of ['blocks/a.test.mjs', 'blocks/nested/b.test.tsx', 'blocks/__tests__/unit/route-map.test.ts']) {
+  for (const file of ['blocks/a.test.mjs', 'blocks/nested/b.test.ts', 'blocks/__tests__/unit/route-map.test.ts']) {
     mkdirSync(join(cwd, file, '..'), { recursive: true });
     writeFileSync(join(cwd, file), 'export {};\n');
   }
@@ -204,6 +204,48 @@ ${script.replaceAll('/srv/forge-exec', root)}`;
 });
 
 describe('runRemote', () => {
+  it.each(['always', 'above-threshold'])(
+    'keeps the real JSX-injected mapping selection local through both callers in %s mode', async (mode) => {
+      const root = realpathSync(new URL('../../../', import.meta.url));
+      const f = fixture();
+      const args = ['vitest', 'run', 'blocks/__tests__/unit/renderers/mapping-conformance.test.tsx'];
+      const log = vi.fn();
+      const policy = resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode } } });
+      expect(await runWithRemoteDecision({
+        argv: args, cwd: root, policy, loadPerCore: () => 10, log,
+        remoteExec: (options) => runRemote({ ...f, ...options }),
+      })).toEqual({ handled: false });
+      expect(await runWithRemoteFallback({ ...f, cwd: root, argv: args, log })).toBe(7);
+      expect(f.local).toHaveBeenCalledTimes(1);
+      expect(f.local).toHaveBeenCalledWith(args);
+      expect(f.exec).not.toHaveBeenCalled();
+      expect(f.listFiles).not.toHaveBeenCalled();
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('dependency-context-required'));
+    },
+  );
+
+  it.each(['tsx', 'jsx'].flatMap((extension) =>
+    ['direct', 'transitive', 'barrel', 'mixed'].map((shape) => [extension, shape])))(
+    'keeps %s transform dependencies local before transport: %s', async (extension, shape) => {
+      const f = fixture();
+      const jsxFile = `blocks/view.test.${extension}`;
+      writeFileSync(join(cwd, jsxFile), 'export const view = <div />;\n');
+      let files = [jsxFile];
+      if (shape === 'transitive' || shape === 'barrel') {
+        writeFileSync(join(cwd, 'blocks/a.test.mjs'), shape === 'barrel'
+          ? "import './barrel.mjs';\n" : `import './view.test.${extension}';\n`);
+        if (shape === 'barrel') writeFileSync(join(cwd, 'blocks/barrel.mjs'), "export * from './view.test';\n");
+        files = ['blocks/a.test.mjs'];
+      } else if (shape === 'mixed') files.unshift('blocks/a.test.mjs');
+      for (const prefix of [['npm', 'run', 'test:unit', '--'], ['npx', 'vitest', 'run']]) {
+        expect(await runRemote({ ...f, argv: [...prefix, ...files] }))
+          .toEqual({ mode: 'fallback', reason: 'dependency-context-required' });
+      }
+      expect(f.exec).not.toHaveBeenCalled();
+      expect(f.listFiles).not.toHaveBeenCalled();
+    },
+  );
+
   it.each(['always', 'above-threshold'])('offloads the actual package-script argv through admission in %s mode', async (mode) => {
     const pkg = JSON.parse(readFileSync(new URL('../../../package.json', import.meta.url), 'utf8'));
     const command = pkg.scripts['test:unit'].split(' -- ')[1].split(' ');
@@ -299,7 +341,7 @@ describe('runRemote', () => {
   it.each([
     ['blocks/__tests__/unit/route-map.test.ts'],
     ['--', 'blocks/__tests__/unit/route-map.test.ts'],
-    ['--', 'blocks/a.test.mjs', 'blocks/nested/b.test.tsx'],
+    ['--', 'blocks/a.test.mjs', 'blocks/nested/b.test.ts'],
   ].map((args) => [args]))('retains remote execution for explicit runtime tests: %j', async (args) => {
     expect(await runRemote({ ...fixture(), argv: ['npm', 'run', 'test:unit', ...args] }))
       .toEqual({ mode: 'remote', code: 0 });

@@ -53,6 +53,12 @@ async function needsDependencyContext(argv, cwd) {
       if (closure.error || closure.absent.length) return true;
       for (const dependency of closure.files) {
         const path = relative(root, await realpath(dependency));
+        // Vitest's jsxInject adds the renderer barrel to every JSX/TSX module,
+        // including transitive helpers. That edge is absent from this static
+        // closure and can require the omitted sibling checkout. Keep these
+        // selections local until transformed dependencies can be verified.
+        // Check both names so a symlink cannot hide the transform's extension.
+        if (/\.[cm]?[jt]sx$/i.test(dependency) || /\.[cm]?[jt]sx$/i.test(path)) return true;
         if (isAbsolute(path) || path === '..' || path.startsWith('../') || !safeFiles([path]).trim()) return true;
       }
     }
