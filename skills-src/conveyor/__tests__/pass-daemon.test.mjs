@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 import {
   runPassDaemonLoop, passDaemonLeaseKey, realSleep, DEFAULT_HEARTBEAT_INTERVAL_MS,
   PASS_DAEMON_SELF_SYNC_ENV, passDaemonSelfSyncEnabled, MAIN_ONLY_PASSES, spawnPassOnce,
-  waitForManifestEntry, passEnvFor,
+  waitForManifestEntry, passEnvFor, makePassRestartCheck,
 } from '../pass-daemon.mjs';
 import { DAEMON_MANIFEST } from '../daemon-manifest.mjs';
 import { withSelfSync, DAEMON_SELF_SYNC_BRANCH_ENV } from '../../../scripts/lib/daemon-self-sync.mjs';
@@ -443,5 +443,116 @@ describe('passEnvFor — the pass child env is read at spawn time (2026-10-09 pe
     const src = readFileSync(fileURLToPath(new URL('../pass-daemon.mjs', import.meta.url)), 'utf8');
     expect(src).not.toMatch(/const passEnv = \{ \.\.\.process\.env/);
     expect(src).toMatch(/env: passEnv\(\)/);
+  });
+});
+
+
+describe('adopted pass daemon restart', () => {
+  const setup = (overrides = {}) => {
+    const gate = vi.fn(() => ({ restart: true, relevant: ['scripts/lib/shared.mjs'] }));
+    const appendEvent = vi.fn(async () => true);
+    const check = makePassRestartCheck({ root: '.', passName: 'health-watch', bootSha: 'boot',
+      readHead: () => 'adopted', readState: () => ({ adopted: { head: 'adopted' } }),
+      gate, appendEvent, log: { error: vi.fn() }, ...overrides });
+    return { check, gate, appendEvent };
+  };
+  it.each([null, {}, { adopted: {} }, { adopted: { head: 'other' } }])(
+    'no restart on missing, incomplete or mismatched adoption: %j', async (state) => {
+      const { check, gate, appendEvent } = setup({ readState: () => state });
+      expect(await check()).toBe(false);
+      expect(gate).not.toHaveBeenCalled();
+      expect(appendEvent).not.toHaveBeenCalled();
+    });
+  it.each([null, 'boot'])('no restart on unreadable or unchanged HEAD: %j', async (head) => {
+    const { check, gate } = setup({ readHead: () => head });
+    expect(await check()).toBe(false);
+    expect(gate).not.toHaveBeenCalled();
+  });
+  it('no restart when adoption evidence is unreadable', async () => {
+    const { check, gate } = setup({ readState: () => { throw new Error('unreadable'); } });
+    expect(await check()).toBe(false);
+    expect(gate).not.toHaveBeenCalled();
+  });
+  it.each(['no-imported-change', 'min-interval'])('honors the shared gate: %s', async (reason) => {
+    const { check, appendEvent } = setup({ gate: () => ({ restart: false, reason }) });
+    expect(await check()).toBe(false);
+    expect(appendEvent).not.toHaveBeenCalled();
+  });
+  it('awaits writing pass-daemon-restarted with from/to/relevant before allowing restart', async () => {
+    let finish;
+    const written = new Promise((resolve) => { finish = resolve; });
+    const appendEvent = vi.fn(() => written);
+    const { check, gate } = setup({ appendEvent });
+    let settled = false;
+    const result = check().then((value) => { settled = true; return value; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(gate).toHaveBeenCalledWith('adopted');
+    expect(appendEvent).toHaveBeenCalledWith({ kind: 'pass-daemon-restarted',
+      daemon: 'pass-daemon:health-watch', detail: { from: 'boot', to: 'adopted', relevant: ['scripts/lib/shared.mjs'] } });
+    finish(true);
+    expect(await result).toBe(true);
+  });
+  it('does not restart when the event write returns false and retries on the next run', async () => {
+    const appendEvent = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    const { check, gate } = setup({ appendEvent });
+    expect(await check()).toBe(false);
+    expect(await check()).toBe(true);
+    expect(appendEvent).toHaveBeenCalledTimes(2);
+    expect(gate).toHaveBeenCalledTimes(2);
+  });
+  it.each(['other', 'boot', null, new Error('unreadable')])(
+    'does not restart if HEAD changes or becomes unreadable during the event write: %s', async (nextHead) => {
+      let head = 'adopted', finish;
+      const written = new Promise((resolve) => { finish = resolve; });
+      const readHead = vi.fn(() => {
+        if (head instanceof Error) throw head;
+        return head;
+      });
+      const appendEvent = vi.fn(() => written);
+      const { check } = setup({ readHead, appendEvent });
+      const result = check();
+      expect(appendEvent).toHaveBeenCalledTimes(1);
+      expect(readHead).toHaveBeenCalledTimes(1);
+      head = nextHead;
+      finish(true);
+      expect(await result).toBe(false);
+      expect(readHead).toHaveBeenCalledTimes(2);
+      expect(readHead).toHaveBeenLastCalledWith({ root: '.' });
+      head = 'adopted';
+      expect(await check()).toBe(true);
+    });
+  it('checks after onRun and noteRun, then stops with restart', async () => {
+    const order = [];
+    const result = await runPassDaemonLoop({ intervalMs: 1, maxRuns: 1, sleep: vi.fn(),
+      runPass: async () => ({ code: 1 }), onRun: () => order.push('onRun'),
+      failureAlertAfter: 1, onConsecutiveFailures: () => order.push('noteRun'),
+      shouldRestart: async () => { order.push('restart'); return true; } });
+    expect(order).toEqual(['onRun', 'noteRun', 'restart']);
+    expect(result.stoppedReason).toBe('restart');
+  });
+  it('tickWhileRunning never checks or stops until the in-flight run settles', async () => {
+    let finishRun, finishSleep, reachedTick;
+    const running = new Promise((resolve) => { finishRun = resolve; });
+    const sleeping = new Promise((resolve) => { finishSleep = resolve; });
+    const tick = new Promise((resolve) => { reachedTick = resolve; });
+    const shouldRestart = vi.fn(async () => true), onRun = vi.fn();
+    const runPass = vi.fn(() => running);
+    let settled = false;
+    const loop = runPassDaemonLoop({ runPass, shouldRestart, onRun, tickWhileRunning: true,
+      intervalMs: 1, maxRuns: 2, sleep: () => { reachedTick(); return sleeping; } })
+      .then((result) => { settled = true; return result; });
+    await tick;
+    expect(shouldRestart).not.toHaveBeenCalled();
+    expect(settled).toBe(false);
+    finishSleep();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(shouldRestart).not.toHaveBeenCalled();
+    finishRun({ code: 0 });
+    expect((await loop).stoppedReason).toBe('restart');
+    expect(onRun).toHaveBeenCalledTimes(1);
+    expect(shouldRestart).toHaveBeenCalledTimes(1);
+    expect(runPass).toHaveBeenCalledTimes(1);
   });
 });

@@ -13,7 +13,7 @@ import {
   decideSelfSync, selfSyncCheckout, withSelfSync, readHeadSha, readOriginRefSha,
   DAEMON_SELF_SYNC_BRANCH_ENV, resolvePocSyncBranch, decidePocSelfSync, selfSyncCheckoutPoc,
   isSafeBranchName, decideRestart, collectImportClosure, changedFilesBetween, resolveRestartMinIntervalMs,
-  DEFAULT_RESTART_MIN_INTERVAL_MS, resolveMaxAdoptWaitTicks,
+  DEFAULT_RESTART_MIN_INTERVAL_MS, resolveMaxAdoptWaitTicks, createRestartGate,
 } from '../daemon-self-sync.mjs';
 import { assertMainNotStale, isStaleMainRefusalMessage } from '../main-staleness.mjs';
 
@@ -1059,4 +1059,36 @@ describe('a skipped tick is an empty tick every real daemon onTick can log (#404
     // under a loaded host (reproduced on origin/main at load average ~230, 2026-09-26). The assertion is about
     // onTick's behaviour, not import speed, so it gets an explicit budget rather than failing the gate on load.
   }, 60_000);
+});
+
+
+describe('createRestartGate — shared with the pass daemon', () => {
+  it('ignores unrelated changes, defers imported changes for 120s, caches closure and logs once per key', () => {
+    let time = 0, changed = ['backlog/item.md'];
+    const log = { error: vi.fn() };
+    const importClosure = vi.fn(() => ({ complete: true, files: new Set(['scripts/shared.mjs']),
+      bareDeps: false, jsonNames: new Set() }));
+    const diffFiles = vi.fn(() => changed);
+    const gate = createRestartGate({ root: '.', entries: ['scripts/daemon.mjs'], bootSha: 'boot',
+      bootAt: 0, now: () => time, importClosure, diffFiles, log });
+    expect(gate('next')).toMatchObject({ restart: false, reason: 'no-imported-change' });
+    gate('next');
+    expect(log.error).toHaveBeenCalledTimes(1);
+    changed = ['scripts/shared.mjs'];
+    expect(gate('next')).toMatchObject({ restart: false, reason: 'min-interval' });
+    gate('next');
+    expect(log.error).toHaveBeenCalledTimes(2);
+    time = 120_000;
+    expect(gate('next')).toEqual({ restart: true, reason: 'imported-change', relevant: changed });
+    expect(importClosure).toHaveBeenCalledTimes(1);
+    expect(diffFiles).toHaveBeenLastCalledWith({ root: '.', from: 'boot', to: 'next' });
+  });
+  it('preserves urgent, diffRoot, timeout and interval overrides', () => {
+    const diffFiles = vi.fn(() => ['scripts/shared.mjs']);
+    const gate = createRestartGate({ root: '.', bootSha: 'boot', bootAt: 0, now: () => 1,
+      diffFiles, timeoutMs: 42, importClosure: () => null, log: { error: vi.fn() } });
+    expect(gate('next', { urgent: true, diffRoot: 'candidate' }).restart).toBe(true);
+    expect(diffFiles).toHaveBeenCalledWith({ root: 'candidate', from: 'boot', to: 'next', timeoutMs: 42 });
+    expect(gate('next', { minIntervalMs: 0 }).restart).toBe(true);
+  });
 });

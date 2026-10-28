@@ -481,6 +481,36 @@ export function decideRestart({ changedFiles, closure, uptimeMs, minIntervalMs }
   return { restart: true, reason: 'imported-change', relevant };
 }
 
+
+/** Shared restart decision: cache the import closure and log each deferred HEAD/reason once. */
+export function createRestartGate({
+  root, entries = [process.argv[1]], bootSha, now = Date.now, bootAt = now(),
+  minRestartIntervalMs = resolveRestartMinIntervalMs(), diffFiles = changedFilesBetween,
+  importClosure = collectImportClosure, timeoutMs, log = console,
+}) {
+  // #4044 restart gate (see decideRestart). The closure is walked lazily, once, from the BOOT tree's files — the
+  // code actually loaded in memory. (A file newly added to the closure only matters via an edit to an existing
+  // closure file that now imports it, which the gate already catches.)
+  let closure;
+  let closureBuilt = false;
+  const loggedHeads = new Set();
+  return (headNow, { urgent = false, diffRoot = root, minIntervalMs = minRestartIntervalMs } = {}) => {
+    if (!closureBuilt) {
+      closureBuilt = true;
+      try { closure = importClosure({ root, entries }); } catch { closure = null; }
+    }
+    const changedFiles = diffFiles({ root: diffRoot, from: bootSha, to: headNow, ...(timeoutMs != null ? { timeoutMs } : {}) });
+    const d = decideRestart({ changedFiles, closure, uptimeMs: now() - bootAt, minIntervalMs: urgent ? 0 : minIntervalMs });
+    if (!d.restart && !loggedHeads.has(`${headNow}:${d.reason}`)) {
+      loggedHeads.add(`${headNow}:${d.reason}`);
+      log.error?.(d.reason === 'min-interval'
+        ? `daemon-self-sync: clone moved to ${headNow} and ${d.relevant.length} imported file(s) changed — restart deferred until this process has run ${Math.round(minIntervalMs / 1000)}s (#4044 restart gate)`
+        : `daemon-self-sync: clone moved to ${headNow} (${changedFiles.length} file(s) changed since boot, none imported by this daemon) — no restart needed, ticking on (#4044 restart gate)`);
+    }
+    return d;
+  };
+}
+
 /**
  * #4044 (live 2026-09-25 ~13:20Z): a skipped tick used to return a bare `{skipped, reason}` into the daemon's
  * `onTick`, which reads `result.repos.map(...)` — `review-daemon: tick failed (non-fatal): Cannot read properties
@@ -727,12 +757,6 @@ export function withSelfSync(effects, {
   const bootSha = readHead(syncOpts());
   const bootAt = now();
   const cloneLockOpts = () => (env && env.WE_DAEMON_CLONE_LOCK_ROOT ? { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT } : {});
-  // #4044 restart gate (see decideRestart). The closure is walked lazily, once, from the BOOT tree's files — the
-  // code actually loaded in memory. (A file newly added to the closure only matters via an edit to an existing
-  // closure file that now imports it, which the gate already catches.)
-  let closure;
-  let closureBuilt = false;
-  const loggedHeads = new Set();
   let lastStuckLogAt = -Infinity;
   let lastNoMoveKey = null;
   const swapMinIntervalMs = swapSpaced ? bg.swapMinIntervalMs : minRestartIntervalMs;
@@ -749,21 +773,9 @@ export function withSelfSync(effects, {
       log.error?.(`daemon-self-sync: ${BACKGROUND_BUILD_ENV}=${env[BACKGROUND_BUILD_ENV]} — the background builder process is retired (x0m7a8x). '1' now selects the detached rebuild JOB (off the tick path) plus the swap spacing; '0' turns off only the swap spacing — the rebuild path is set by WE_DAEMON_REBUILD_AS_JOB / daemon-rebuild-settings.json`);
     }
   }
-  const restartGate = (headNow, { urgent = false, diffRoot = root, minIntervalMs = minRestartIntervalMs } = {}) => {
-    if (!closureBuilt) {
-      closureBuilt = true;
-      try { closure = importClosure({ root, entries }); } catch { closure = null; }
-    }
-    const changedFiles = diffFiles({ root: diffRoot, from: bootSha, to: headNow, ...(timeoutMs != null ? { timeoutMs } : {}) });
-    const d = decideRestart({ changedFiles, closure, uptimeMs: now() - bootAt, minIntervalMs: urgent ? 0 : minIntervalMs });
-    if (!d.restart && !loggedHeads.has(`${headNow}:${d.reason}`)) {
-      loggedHeads.add(`${headNow}:${d.reason}`);
-      log.error?.(d.reason === 'min-interval'
-        ? `daemon-self-sync: clone moved to ${headNow} and ${d.relevant.length} imported file(s) changed — restart deferred until this process has run ${Math.round(minIntervalMs / 1000)}s (#4044 restart gate)`
-        : `daemon-self-sync: clone moved to ${headNow} (${changedFiles.length} file(s) changed since boot, none imported by this daemon) — no restart needed, ticking on (#4044 restart gate)`);
-    }
-    return d;
-  };
+  const restartGate = createRestartGate({
+    root, entries, bootSha, now, bootAt, minRestartIntervalMs, diffFiles, importClosure, timeoutMs, log,
+  });
   // Card 89 S5 — the lock-free tick. A version is immutable and a switch is one atomic pointer rename, so a
   // tick never needs a read slot: it pins the version it runs from (so gc keeps it), runs its children from that
   // folder, and unpins. A switch mid-tick leaves this tick on its old folder; the next tick reads `current` again.

@@ -62,7 +62,9 @@ import {
   acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned,
 } from './runner-lock.mjs';
 import { ensureFreshGithubAppEnv, FLEET_APP_AUTH_OPTS, isGithubAppAuthGuardError } from '../../scripts/lib/github-app-auth-env.mjs';
-import { withSelfSync, resolvePocSyncBranch, DAEMON_SELF_SYNC_BRANCH_ENV } from '../../scripts/lib/daemon-self-sync.mjs';
+import { withSelfSync, createRestartGate, readHeadSha, resolvePocSyncBranch, DAEMON_SELF_SYNC_BRANCH_ENV } from '../../scripts/lib/daemon-self-sync.mjs';
+import { readRebuildStateFile } from '../../scripts/lib/daemon-last-good.mjs';
+import { appendDaemonEvent } from '../../scripts/lib/daemon-events.mjs';
 import { StringDecoder } from 'node:string_decoder';
 import { notifyDesktopChecked } from '../../scripts/conveyor/branch-sync.mjs';
 import { installDaemonLog, stripLogTimestamp } from './daemon-log.mjs';
@@ -105,6 +107,34 @@ export function passDaemonSelfSyncEnabled(env = process.env) {
   return pocBranch !== '';
 }
 
+/** Check only verified adoption; effects are injected so missing evidence and event ordering are testable. */
+export function makePassRestartCheck({
+  root, passName, bootSha, gate, readHead = readHeadSha, readState = readRebuildStateFile,
+  appendEvent = appendDaemonEvent, log = console,
+}) {
+  return async () => {
+    let head, state;
+    try {
+      if (!bootSha) return false;
+      head = readHead({ root });
+      if (!head || head === bootSha) return false;
+      state = readState(root);
+    } catch { return false; }
+    if (head !== state?.adopted?.head) return false;
+    const d = gate(head);
+    if (!d.restart) return false;
+    const written = await appendEvent({ kind: 'pass-daemon-restarted', daemon: `pass-daemon:${passName}`,
+      detail: { from: bootSha, to: head, relevant: d.relevant } });
+    if (written !== true) return false;
+    // The async event write may overlap a clone move; only restart onto the verified adoption.
+    try {
+      if (readHead({ root }) !== state.adopted.head) return false;
+    } catch { return false; }
+    log.error?.(`pass-daemon: "${passName}" restarting from ${bootSha} to verified adopted ${head}.`);
+    return true;
+  };
+}
+
 /** #4044 Module E — passes whose own job IS landing onto `main` (the periodic orphan merge sweep
  *  `merge-orphan-sweep` runs — see `daemon-manifest.mjs`'s own header for why that one is NOT the drain role)
  *  must never self-sync onto an OVERLAY: an overlay is unreviewed, unmerged code, and landing decisions have to
@@ -132,6 +162,7 @@ export const MAIN_ONLY_PASSES = new Set(['merge-orphan-sweep']);
  *   sleep: (ms:number) => Promise<void>,
  *   isAlive?: () => boolean,
  *   onRun?: (result:object, run:number) => void,
+ *   shouldRestart?: () => boolean|Promise<boolean>,
  *   onRunError?: (error:Error, run:number) => void,
  *   refreshAuth?: () => Promise<any>,
  *   onRefreshError?: (error:Error, run:number) => void,
@@ -144,10 +175,11 @@ export async function runPassDaemonLoop({
   runPass, sleep, isAlive = () => true, onRun = () => {}, onRunError = () => {},
   refreshAuth = async () => {}, onRefreshError = () => {},
   intervalMs, maxRuns = Infinity, tickWhileRunning = false,
-  failureAlertAfter = 0, onConsecutiveFailures = () => {},
+  failureAlertAfter = 0, onConsecutiveFailures = () => {}, shouldRestart,
 }) {
   if (typeof runPass !== 'function') throw new TypeError('runPassDaemonLoop requires a runPass effect');
   if (!Number.isFinite(intervalMs) || intervalMs <= 0) throw new TypeError('runPassDaemonLoop requires a positive intervalMs');
+  let restartRequested = false;
   let run = 0;
   let streak = 0;
   const failed = (result) => !result || result.spawnError != null || result.signal != null || (result.code ?? 1) !== 0;
@@ -170,9 +202,11 @@ export async function runPassDaemonLoop({
       onRunError(error, startedRun);
       noteRun(true, { error: String((error && error.message) || error) });
     }
+    if (shouldRestart) restartRequested = await shouldRestart();
   };
   let inFlight = null;
   for (;;) {
+    if (restartRequested) { await inFlight; return { runs: run + 1, stoppedReason: 'restart' }; }
     if (!inFlight) {
       try {
         await refreshAuth();
@@ -188,8 +222,9 @@ export async function runPassDaemonLoop({
         await Promise.resolve();
       } else await runOnce(run);
     }
-    if (!isAlive()) { await inFlight; return { runs: run + 1, stoppedReason: 'lease-lost' }; }
-    if (run + 1 >= maxRuns) { await inFlight; return { runs: run + 1, stoppedReason: 'max-runs' }; }
+    if (restartRequested) { await inFlight; return { runs: run + 1, stoppedReason: 'restart' }; }
+    if (!isAlive()) { await inFlight; return { runs: run + 1, stoppedReason: restartRequested ? 'restart' : 'lease-lost' }; }
+    if (run + 1 >= maxRuns) { await inFlight; return { runs: run + 1, stoppedReason: restartRequested ? 'restart' : 'max-runs' }; }
     await sleep(intervalMs);
     run += 1;
   }
@@ -464,6 +499,9 @@ export function spawnPassOnce(entry, ports = {}) {
 }
 
 async function main(argv) {
+  const selfSyncEnabled = passDaemonSelfSyncEnabled();
+  const bootSha = selfSyncEnabled ? null : readHeadSha({ root: REPO_ROOT });
+  const bootAt = Date.now();
   installDaemonLog(); // item 68a: ISO-stamp every log line (WE_DAEMON_LOG_TIMESTAMPS=0 turns it off)
   const flags = {};
   for (const a of argv) {
@@ -543,7 +581,11 @@ async function main(argv) {
   // Card 89 S5: on a versioned clone withSelfSync sets `tickContext.tickRoot` to the version folder this tick is
   // pinned to, and the pass child spawns from THERE (a switch mid-tick never moves a running child's tree).
   const tickContext = {};
-  const runPassSelfSynced = passDaemonSelfSyncEnabled()
+  const shouldRestart = selfSyncEnabled ? undefined : makePassRestartCheck({
+    root: REPO_ROOT, passName, bootSha,
+    gate: createRestartGate({ root: REPO_ROOT, entries: [fileURLToPath(import.meta.url)], bootSha, bootAt }),
+  });
+  const runPassSelfSynced = selfSyncEnabled
     ? withSelfSync({ tickOnce: () => spawnPassOnce(entry, { passName, env: passEnv(), root: tickContext.tickRoot ?? REPO_ROOT }) }, {
       root: REPO_ROOT, onRestart: restartOntoNewCode, mainOnly, env: selfSyncEnv, tickContext,
     }).tickOnce
@@ -552,7 +594,7 @@ async function main(argv) {
   const failureAlertAfter = resolveFailureAlertAfter(entry, process.env);
   console.error(`pass-daemon: started "${passName}" (${entry.script}) on interval ${intervalMs}ms, heartbeat every ${heartbeatIntervalMs}ms.`);
   const { stoppedReason } = await runPassDaemonLoop({
-    runPass: runPassSelfSynced,
+    runPass: runPassSelfSynced, shouldRestart,
     sleep: realSleep,
     isAlive: () => alive,
     intervalMs, tickWhileRunning: true,
@@ -562,6 +604,7 @@ async function main(argv) {
     onRunError: (e) => console.error(`pass-daemon: "${passName}" run failed (non-fatal): ${String((e && e.message) || e).split('\n')[0]}`),
     onRefreshError: (e) => console.error(`pass-daemon: "${passName}" GitHub App token refresh failed (non-fatal, falling back to personal auth): ${String((e && e.message) || e).split('\n')[0]}`),
   });
+  if (stoppedReason === 'restart') restartOntoNewCode();
   if (!stopping) {
     console.error(`pass-daemon: "${passName}" loop stopped (${stoppedReason}) — releasing the lease and exiting.`);
     clearInterval(heartbeatTimer);
