@@ -18,6 +18,25 @@ const plan = (pull, options = {}) => planReconcile({ prs: [{ ...pull, statusChec
   requiredChecks: ['test', 'smoke'], ...options });
 
 describe('review-gate-only red belongs to review', () => {
+  it('required test=STALE with smoke=SUCCESS and review-gate=FAILURE dispatches CI repair', () => {
+    const result = plan(pr({ statusCheckRollup: [check('test', 'STALE'), checks[1], checks[2]] }));
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal' })]);
+  });
+
+  it('required test=SUCCESS with smoke=SUCCESS and review-gate=FAILURE dispatches review', () => {
+    expect(plan(pr()).dispatch).toEqual([expect.objectContaining({ kind: 'review' })]);
+  });
+
+  it.each([
+    ['FAILURE', 'ci-heal'], ['ERROR', 'ci-heal'], ['TIMED_OUT', 'ci-heal'],
+    ['ACTION_REQUIRED', 'ci-heal'], ['STARTUP_FAILURE', 'ci-heal'], ['STALE', 'ci-heal'],
+    ['CANCELLED', 'ci-heal'], ['SKIPPED', 'review'], ['NEUTRAL', 'review'], ['SUCCESS', 'review'],
+    ['FUTURE_NON_PASSING', 'ci-heal'],
+  ])('required test=%s beside review-gate=FAILURE belongs to %s', (conclusion, owner) => {
+    const result = plan(pr({ statusCheckRollup: [check('test', conclusion), checks[1], checks[2]] }));
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: owner })]);
+  });
+
   it('a silent review decision cannot inherit a previous PR missing-check refusal', () => {
     const pulls = [5924, 5925].map(number => pr({ number, baseRefName: 'main',
       statusCheckRollup: [...fastChecks, checks[0], checks[2]] }));

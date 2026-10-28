@@ -30,6 +30,10 @@ export default {
     const standDown = { author: { login: 'web-everything' },
       body: buildCiHealEscalationComment({ headSha: head, outcome: 'not-a-ci-break' }) };
     const variants = [
+      ...[['STALE', 'ci-heal'], ['SUCCESS', 'review'], ['FUTURE_NON_PASSING', 'ci-heal']]
+        .map(([conclusion, expected]) => ({ name: `required test=${conclusion} with successful smoke`, expected,
+          over: { statusCheckRollup: rollup.map(row => row.name === 'test' ? check('test', conclusion)
+            : row.name === 'smoke' ? check('smoke') : row) } })),
       { name: 'cancelled smoke', expected: 'review' },
       { name: 'optional red before and after stand-down', expected: 'review', recordAfterTick: true,
         over: { statusCheckRollup: rollup.map(row => row.name === 'smoke' ? check('smoke') : row)

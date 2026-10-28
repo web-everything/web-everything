@@ -47,6 +47,12 @@ describe('required check verdict recheck', () => {
 });
 
 describe('cancelled smoke verdict retry ownership', () => {
+  it('unfinished cancelled smoke remains unsettled', () => {
+    const rollup = [{ name: 'smoke', status: 'IN_PROGRESS', conclusion: 'CANCELLED' }];
+    expect(unsettledRequiredChecks({ rollup, requiredChecks: ['smoke'] }))
+      .toEqual({ pending: ['smoke'], missing: [], red: [] });
+  });
+
   const head = 'a'.repeat(40);
   const check = (conclusion) => ({ name: 'smoke', status: 'COMPLETED', conclusion });
   const retry = { eligible: true, infraCancelled: true, head, pr: 5972,

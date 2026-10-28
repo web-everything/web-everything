@@ -2876,11 +2876,10 @@ export function planReconcile({
     // Optional failures are reported, but only required failures create CI repair ownership.
     const reviewRollup = collapseRollupToLatestPerName(pr?.statusCheckRollup);
     const reviewFailures = splitFailingChecks(reviewRollup, requiredChecks);
-    const visibleRealRed = reviewRollup
-      .filter(row => FAILED_CHECK_CONCLUSIONS.filter(c => c !== 'CANCELLED')
-        .includes(String(row?.conclusion || row?.state || '').toUpperCase()))
-      .filter(row => row?.name !== 'merge-gate' || !reviewHoldGatesOnlyRed([row], ['merge-gate']))
-      .map(row => row?.name || row?.context);
+    // Share splitFailingChecks' completed/non-passing rule, including unknown future conclusions.
+    const visibleRealRed = failingCheckNames(reviewRollup
+      .filter(row => String(row?.conclusion ?? '').toUpperCase() !== 'CANCELLED')
+      .filter(row => row?.name !== 'merge-gate' || !reviewHoldGatesOnlyRed([row], ['merge-gate'])));
     const reviewHoldHasRealRed = withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))
       // Required review gates keep the existing review-ci / review-hold-red refusals.
       && !requiredChecks?.includes('review-gate')
