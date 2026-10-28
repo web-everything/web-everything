@@ -79,6 +79,12 @@ describe('checkBornAsCollision', () => {
       const exec = fakeExec({ mainTexts: { [mainCard]: text } });
       expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ error: expect.stringContaining(`${mainCard} has no readable frontmatter`) });
     });
+  // The standards check reads `bornAs` with a YAML parser, which drops a trailing comment; the guard must agree.
+  it.each([['main', { main: `origin/main:${mainCard}\0bornAs: xgcpm6z # minted twice`, mainTexts: { [mainCard]: '---\nbornAs: xgcpm6z # minted twice\n---\n' } }],
+    ['the added card', { texts: { [newCard]: '---\nbornAs: "xgcpm6z"  # copied\n---\n' } }]])(
+    'reads a frontmatter identity with a trailing YAML comment on %s', (_, fixture) => {
+      expect(checkBornAsCollision({ exec: fakeExec(fixture), headSha: sha }).collision?.hash).toBe('xgcpm6z');
+    });
   it('treats a frontmatter-less file below a backlog subdirectory as no card', () => {
     const raised = 'backlog/raised-by/7233.md';
     const exec = fakeExec({ main: `origin/main:${raised}\0bornAs: xgcpm6z`, mainTexts: { [raised]: '- Also raised by:\nbornAs: xgcpm6z\n' } });

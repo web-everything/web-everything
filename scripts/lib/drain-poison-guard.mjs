@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { healLaneRefs, looksLikeCorruption } from './lane-repair.mjs';
 
 const HASH = /^x[0-9a-z]{6}$/;
-const IDENTITY = /^(?:bornAs|id):[ \t]*(["']?)(x[0-9a-z]{6})\1[ \t]*$/m;
+// A trailing ` # comment` is allowed: the standards check reads `bornAs` with a YAML parser, which drops it.
+const IDENTITY = /^(?:bornAs|id):[ \t]*(["']?)(x[0-9a-z]{6})\1(?:[ \t]+#.*)?[ \t]*$/m;
 const TOP_LEVEL_CARD = /^backlog\/[^/]+\.md$/;
 
 /**
