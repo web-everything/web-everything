@@ -58,8 +58,8 @@ describe('fixed wrapper security boundary', () => {
     expect(installs).toHaveLength(1);
     expect(installs[0]).not.toContain('--dry-run');
   });
-  it('does not reuse archives from the old package-lock-only cache profile', async () => {
-    const old = join(root,'cache',request.lock,'dev-v3');
+  it.each(['dev-v3','dev-v4'])('does not reuse archives from the old package-lock-only cache profile %s', async version => {
+    const old = join(root,'cache',request.lock,version);
     await mkdir(old,{recursive:true});
     await writeFile(join(old,'dependencies.tar'),'historically poisoned');
     await writeFile(join(old,'sha256'),hash('historically poisoned'));
@@ -217,7 +217,7 @@ process.stdout.write('x'.repeat(4*1024*1024+1));
     work = join(root,'runs',third.run,'work');
     await writeFile(join(work,'package-lock.json'),'lock');
     request = {...request,run:third.run,inputDigest:await digestInput(work)};
-    await writeFile(join(root,'cache',request.lock,'dev-v4/dependencies.tar'),'tampered');
+    await writeFile(join(root,'cache',request.lock,'dev-v5-'+request.inputDigest,'dependencies.tar'),'tampered');
     expect((await runner.run(request)).code).toBe(97);
     expect(await runner.finish(request)).toMatchObject({phase:'install',code:97});
   });
@@ -260,7 +260,7 @@ await runner.run(JSON.parse(process.argv[3]));`;
       await rm(join(root,'receipts','worker-active'),{recursive:true});
       await writeFile(npm,original,{mode:0o755});
       // Persisted sentinels from older wrappers must not block recovery either.
-      await mkdir(join(root,'cache',request.lock,'dev-v4','.busy'));
+      await mkdir(join(root,'cache',request.lock,'dev-v5-'+request.inputDigest,'.busy'));
       const recovered = await nextRequest();
       expect((await runner.run(recovered)).code).toBe(3);
       expect(await runner.finish(recovered)).toMatchObject({phase:'test',code:3});
@@ -272,7 +272,7 @@ await runner.run(JSON.parse(process.argv[3]));`;
     }
   }, 15000);
   it('rejects symlinked cache lock files without changing their targets', async () => {
-    const profile = join(root,'cache',request.lock,'dev-v4');
+    const profile = join(root,'cache',request.lock,'dev-v5-'+request.inputDigest);
     await mkdir(profile,{recursive:true});
     const target = join(root,'lock-target');
     await writeFile(target,'untouched');

@@ -1,7 +1,7 @@
 // @vitest-environment node
 /** @file Contract and execution tests for the Forge remote runner. */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, symlinkSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, symlinkSync, statSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -106,6 +106,59 @@ function realRemoteFixture(files) {
 }
 
 describe('remote snapshot regressions', () => {
+  it.each(['root', 'workspace'].flatMap(kind => ['dependencies', 'devDependencies', 'optionalDependencies'].map(field => [kind, field])))
+  ('matches clean npm after removing %s %s with an unchanged lock and a primed cache', async (kind, field) => {
+    const files = ['package.json', 'package-lock.json', 'packages/worker/package.json', 'probe.cjs', 'dependency.tgz'];
+    const source = join(cwd, 'source');
+    mkdirSync(join(source, 'package'), {recursive:true});
+    writeFileSync(join(source, 'package/package.json'), JSON.stringify({name:'cache-dependency', version:'1.0.0'}));
+    const packed = spawnSync('tar', ['-czf', join(cwd, 'dependency.tgz'), '-C', source, 'package'], {encoding:'utf8'});
+    expect(packed.status, packed.stderr).toBe(0);
+    const manifest = {name:'fixture', version:'1.0.0', workspaces:['packages/*'], scripts:{'test:unit':'node probe.cjs'}};
+    const worker = {name:'worker', version:'1.0.0'};
+    const changed = kind === 'root' ? manifest : worker;
+    changed[field] = {'cache-dependency':kind === 'root' ? 'file:dependency.tgz' : 'file:../../dependency.tgz'};
+    mkdirSync(join(cwd, 'packages/worker'), {recursive:true});
+    writeFileSync(join(cwd, 'package.json'), JSON.stringify(manifest));
+    writeFileSync(join(cwd, 'packages/worker/package.json'), JSON.stringify(worker));
+    writeFileSync(join(cwd, 'probe.cjs'), `
+const {createRequire} = require('node:module');
+const probe = createRequire(require('node:path').resolve(${JSON.stringify(kind === 'root' ? 'package.json' : 'packages/worker/package.json')}));
+console.log('RESOLVED ' + probe('cache-dependency/package.json').version);
+`);
+    const f = realRemoteFixture(files);
+    const locked = spawnSync(join(f.bin, 'npm'), ['install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund'], {cwd, encoding:'utf8', timeout:20000});
+    expect(locked.status, locked.stderr).toBe(0);
+    const lock = readFileSync(join(cwd, 'package-lock.json'));
+    const lockHash = createHash('sha256').update(lock).digest('hex');
+    for (const state of ['cold', 'warm']) {
+      expect(await runRemote(f), `${state}: ${f.runs.at(-1)?.stderr}`).toEqual({mode:'remote', code:0});
+      expect(f.runs.at(-1).stdout).toContain('RESOLVED 1.0.0');
+      expect(readdirSync(join(f.root, 'cache', lockHash))).toHaveLength(1);
+    }
+    delete changed[field];
+    writeFileSync(join(cwd, kind === 'root' ? 'package.json' : 'packages/worker/package.json'), JSON.stringify(changed));
+    // Real npm accepts removal without rewriting the lock. Root removals omit
+    // the package; workspace behavior is pinned to the actual clean install.
+    const clean = spawnSync(join(f.bin, 'npm'), ['ci', '--include=dev', '--ignore-scripts', '--no-audit', '--no-fund'], {cwd, encoding:'utf8', timeout:20000});
+    expect(clean.status, clean.stderr).toBe(0);
+    expect(readFileSync(join(cwd, 'package-lock.json'))).toEqual(lock);
+    const probe = spawnSync(process.execPath, ['probe.cjs'], {cwd, encoding:'utf8', timeout:10000});
+    expect([0, 1]).toContain(probe.status);
+    if (kind === 'root') {
+      expect(probe.status).toBe(1);
+      expect(probe.stderr).toContain('MODULE_NOT_FOUND');
+    }
+    for (const state of ['previously primed', 'repeated removed input', 'cold']) {
+      if (state === 'cold') rmSync(join(f.root, 'cache'), {recursive:true, force:true});
+      expect(await runRemote(f), `${state}: ${f.runs.at(-1)?.stderr}`).toEqual({mode:'remote', code:probe.status});
+      if (probe.status === 1) expect(f.runs.at(-1).stderr).toContain('MODULE_NOT_FOUND');
+      else expect(f.runs.at(-1).stdout).toContain('RESOLVED 1.0.0');
+      expect(readdirSync(join(f.root, 'cache', lockHash))).toHaveLength(state === 'cold' ? 1 : 2);
+    }
+    expect(f.local).not.toHaveBeenCalled();
+  }, 120000);
+
   it('rejects real npm shrinkwrap precedence before caching and installs the next lock-only input cold', async () => {
     const files = ['package.json', 'package-lock.json', 'probe.cjs', 'dependency-1.tgz', 'dependency-2.tgz'];
     const dependencies = { 'cache-dependency': '*' };
@@ -157,7 +210,7 @@ describe('remote snapshot regressions', () => {
           const installs = readFileSync(join(work,'.forge-home/install.log'),'utf8');
           expect(installs).toContain('ci --include=dev --ignore-scripts --no-audit --no-fund');
           expect(installs).not.toContain('--dry-run');
-          expect(existsSync(join(f.root,'cache',lock,'dev-v4/dependencies.tar'))).toBe(true);
+          expect(existsSync(join(f.root,'cache',lock,'dev-v5-'+request.inputDigest,'dependencies.tar'))).toBe(true);
         }
       } finally { await runner.finish(request); }
     }
@@ -294,7 +347,8 @@ console.log('RESOLVED ' + versions.join(','));
       expect(f.runs.at(-1).stdout).toContain('COMMAND_RAN');
     }
     const hash = createHash('sha256').update(readFileSync(join(cwd, 'package-lock.json'))).digest('hex');
-    writeFileSync(join(f.root, 'cache', hash, 'dev-v4/dependencies.tar'), 'corrupt archive');
+    const inputDigest = await digestInput(cwd, ['package.json', 'package-lock.json']);
+    writeFileSync(join(f.root, 'cache', hash, 'dev-v5-'+inputDigest, 'dependencies.tar'), 'corrupt archive');
     const log = vi.fn();
     expect(await runWithRemoteFallback({ ...f, log })).toBe(7);
     expect(f.runs.at(-1).stdout).not.toContain('COMMAND_RAN');

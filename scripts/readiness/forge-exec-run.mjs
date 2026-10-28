@@ -259,8 +259,11 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
       if(await digestInput(work)!==request.inputDigest || await digestLock(work)!==request.lock) throw new Error('Input digest mismatch');
       await rename(statePath(request.run,'prepared'),statePath(request.run,'running'));
       let phase='install',result={code:97,stdout:'',stderr:''};
-      // v3 may contain archives built from an unkeyed shrinkwrap. Never reuse them.
-      const profile=join(cache,request.lock,'dev-v4');
+      // npm accepts some manifest changes without lock changes. Key the entire
+      // validated snapshot, including workspace manifests and local dependency
+      // contents, so a warm archive represents the same install inputs. Earlier
+      // profiles lack this binding (v3 also allowed an unkeyed shrinkwrap).
+      const profile=join(cache,request.lock,'dev-v5-'+request.inputDigest);
       const installEnv={PATH:path,HOME:join(work,'.forge-home'),LANG:'C',CI:'true',NODE_ENV:'development'};
       try {
         // These parents are inaccessible to forge-exec; reject symlinked cache state.
