@@ -31,6 +31,15 @@ the live root's entries instead could silently bypass discovery for a bad live-r
 discovery likewise retains the conflict on unreadable evidence. Final closure checks run before smoke and
 again when reconstructing persisted scoped candidates.
 
+Markdown is always retained by closure scoping, including under tests and backlog directories:
+an exported tick can read a prompt after boot with a computed filename, so absence from an import
+closure is insufficient evidence to discard it. `closure-scope.test.mjs` pins this policy for URL
+literals and computed reads. Import collection parses syntax with the existing TypeScript dependency;
+comments, line terminators, escaped literals and template literals must not hide dynamic imports.
+Computed targets and parse failures mark the closure incomplete. The `overlay-runtime-closure`
+soak break reproduces both runtime-prompt and commented-worker conflicts through the planner in on
+and shadow modes, then checks final-tree evidence with the same policy.
+
 ## Overlay auto-retirement
 
 `daemon-overlay-auto-retire.test.mjs` uses local Git repositories for ancestry, squash/content

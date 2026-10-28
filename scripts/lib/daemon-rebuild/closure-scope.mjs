@@ -14,7 +14,10 @@ const LIMIT = 4000;
 const metadata = new WeakMap();
 const validPath = p => typeof p === 'string' && p.length > 0 && !isAbsolute(p)
   && !p.split('/').some(part => part === '..' || part === '.') && !p.includes('\0');
-const always = p => MANIFEST_RE.test(p) || CONFIG_RE.test(p) || EXECUTABLE_RE.test(p) || RUNTIME_READ_RE.test(p);
+// Markdown can be read by exported ticks long after boot, with computed paths that
+// an import closure cannot prove unused. Retain it even under tests/ or backlog/.
+const always = p => MANIFEST_RE.test(p) || CONFIG_RE.test(p) || EXECUTABLE_RE.test(p)
+  || RUNTIME_READ_RE.test(p) || /\.md$/i.test(p);
 const under = (p, prefix) => prefix.endsWith('/') ? p.startsWith(prefix) : p === prefix;
 
 /** Unknown paths are retained. Membership and mandatory rules take precedence over
@@ -24,7 +27,7 @@ export function isExcludable(path, scope) {
   const { mechanismPaths = REBUILD_MECHANISM_PATHS, jsonNames = new Set() } = metadata.get(scope) || {};
   if (mechanismPaths.some(p => under(path, p)) || (path.endsWith('.json') && jsonNames.has(basename(path)))) return false;
   return isCodePath(path) || /(^|\/)(__tests__|tests)\//.test(path)
-    || /\.(test|spec)\.[cm]?[jt]sx?$/.test(path) || path.startsWith('backlog/') || path.endsWith('.md');
+    || /\.(test|spec)\.[cm]?[jt]sx?$/.test(path) || path.startsWith('backlog/');
 }
 
 function layeredReader(base, layers) {

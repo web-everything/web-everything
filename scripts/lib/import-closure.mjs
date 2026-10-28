@@ -9,10 +9,29 @@
 
 import { readFileSync, statSync } from 'node:fs';
 import { dirname, resolve as resolvePath, relative, isAbsolute, basename } from 'node:path';
+import ts from 'typescript';
 
-const IMPORT_SPEC_RE = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+)(['"])([^'"\n]+)\1/g;
 const JSON_LITERAL_RE = /['"`]([^'"`\n]*\.json)['"`]/g;
-const NONLITERAL_DYNAMIC_IMPORT_RE = /\bimport\s*\(\s*(?!['"])/;
+
+// Parse the grammar: comments and line terminators are legal between `import`
+// and `(`. A literal prefix of a computed argument is not a known dependency.
+function importSpecs(file, source) {
+  const tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, false);
+  const specs = [];
+  let complete = tree.parseDiagnostics.length === 0;
+  const visit = node => {
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+      if (node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) specs.push(node.moduleSpecifier.text);
+    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      const target = node.arguments[0];
+      if (target && (ts.isStringLiteral(target) || ts.isNoSubstitutionTemplateLiteral(target))) specs.push(target.text);
+      else complete = false;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(tree);
+  return { specs, complete };
+}
 
 function resolveRelativeSpec(fromFile, spec, exists) {
   const base = resolvePath(dirname(fromFile), spec);
@@ -71,8 +90,11 @@ export function collectImportClosure({
       let src;
       try { src = readFile(file); } catch { info.complete = false; }
       if (src !== undefined) {
-        for (const m of src.matchAll(IMPORT_SPEC_RE)) {
-          const spec = m[2];
+        let imports;
+        try { imports = importSpecs(file, src); }
+        catch { imports = { specs: [], complete: false }; } // Parser limits retain the conservative fallback.
+        info.complete &&= imports.complete;
+        for (const spec of imports.specs) {
           if (spec.startsWith('./') || spec.startsWith('../')) {
             const hit = resolveRelativeSpec(file, spec, existsOnce);
             if (hit && !relative(absRoot, hit).startsWith('..')) info.imports.push(hit);
@@ -82,11 +104,6 @@ export function collectImportClosure({
           }
         }
         for (const m of src.matchAll(JSON_LITERAL_RE)) info.jsonNames.add(basename(m[1]));
-        for (const line of src.split('\n')) {
-          const t = line.trim();
-          if (t.startsWith('*') || t.startsWith('//') || t.startsWith('/*')) continue;
-          if (NONLITERAL_DYNAMIC_IMPORT_RE.test(t.replace(/\/\/.*$/, ''))) { info.complete = false; break; }
-        }
       }
       parsed.set(file, info);
     }

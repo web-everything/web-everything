@@ -27,8 +27,8 @@ it('only excludes allowed files outside the run closure and protects smoke and m
   expect(result.ok).toBe(true);
   expect(isExcludable('unused.mjs', result.scope)).toBe(true);
   expect(isExcludable('used.mjs', result.scope)).toBe(false);
-  expect(isExcludable('backlog/card.md', result.scope)).toBe(true);
-  expect(isExcludable('docs/note.md', result.scope)).toBe(true);
+  expect(isExcludable('backlog/card.md', result.scope)).toBe(false);
+  expect(isExcludable('docs/note.md', result.scope)).toBe(false);
   expect(isExcludable('tests/thing.spec.mjs', result.scope)).toBe(true);
   expect(isExcludable('data.bin', result.scope)).toBe(false);
   expect(isExcludable('unnamed.json', result.scope)).toBe(true);
@@ -56,6 +56,65 @@ it('protects manifests, lockfiles, configs, named JSON, runtime reads and execut
 
 it('fails closed on non-literal dynamic imports with a conflict-retaining fallback', () => {
   expect(compute({ 'entry.mjs': 'import(target);' })).toMatchObject({ ok: false, reason: 'closure-incomplete' });
+});
+
+it.each([
+  'import /* load selected worker */ (process.env.TARGET)',
+  'import // load selected worker\n (process.env.TARGET)',
+  'import /* first */ /* second */ (process.env.TARGET)',
+  'import // worker\u2028 (process.env.TARGET)',
+  'import // worker\u2029 (process.env.TARGET)',
+  'import\r\n(process.env.TARGET)',
+  'import( /* load selected worker */ process.env.TARGET)',
+  'import(\n process.env.TARGET\n)',
+  'import("./" + process.env.TARGET)',
+  'import(`./${process.env.TARGET}`)',
+])('fails closed on unresolved dynamic import syntax: %s', expression => {
+  expect(compute({ 'entry.mjs': `export async function tick(){ return ${expression}; }`,
+    'worker.mjs': 'export function runOverlay() {}' }))
+    .toMatchObject({ ok: false, reason: 'closure-incomplete' });
+});
+
+it.each(["'./prompt.md'", '"./prompt.md"', '`./prompt.md`'])('retains runtime Markdown read via URL literal %s', literal => {
+  const result = compute({ 'entry.mjs': `import { readFileSync } from 'node:fs';
+    export function tick(){return readFileSync(new URL(${literal}, import.meta.url), 'utf8');}`,
+    'prompt.md': 'overlay prompt', 'docs/unrelated.md': 'unrelated' });
+  expect(result.ok).toBe(true);
+  expect(isExcludable('prompt.md', result.scope)).toBe(false);
+});
+
+it('retains Markdown even when runtime paths are computed or hidden in test/backlog directories', () => {
+  const result = compute({ 'entry.mjs': "export function tick(){ return readFileSync(process.env.PROMPT, 'utf8'); }" });
+  expect(result.ok).toBe(true);
+  for (const path of ['prompt.md', 'docs/Prompt.MD', 'tests/prompt.md', 'backlog/prompt.md']) {
+    expect(isExcludable(path, result.scope), path).toBe(false);
+  }
+});
+
+it.each([
+  "import /* worker */ ('./worker.mjs')",
+  "import( /* worker */ './worker.mjs')",
+  'import(`./worker.mjs`)',
+  "import('./work\\u0065r.mjs')",
+])('walks literal dynamic imports without losing their dependencies: %s', expression => {
+  const result = compute({ 'entry.mjs': `export const tick = () => ${expression};`,
+    'worker.mjs': 'export function runOverlay() {}' });
+  expect(result.ok).toBe(true);
+  expect(isExcludable('worker.mjs', result.scope)).toBe(false);
+});
+
+it('ignores import-like prose in comments, strings and regular expressions', () => {
+  const result = compute({ 'entry.mjs': `// import(target)
+    /* import /* selected worker */
+    const text = 'import /* selected worker */ (target)';
+    const pattern = /import\\s*\\(target\\)/;
+    export {};` });
+  expect(result.ok).toBe(true);
+});
+
+it('fails closed when import syntax cannot be parsed', () => {
+  expect(compute({ 'entry.mjs': 'export const tick = () => import /* worker */ (' }))
+    .toMatchObject({ ok: false, reason: 'closure-incomplete' });
 });
 
 it('fails closed when any requested entry is unreadable, even if other entries exist', () => {

@@ -66,6 +66,9 @@ it.each([
   { label: 'lockfile', path: 'package-lock.json' },
   { label: 'named JSON', path: 'data/policy.json', entry: "const name = 'policy.json';" },
   { label: 'incomplete closure', entry: 'import(target);' },
+  { label: 'runtime Markdown', path: 'prompt.md', entry: "import { readFileSync } from 'node:fs';\nexport function tick(){return readFileSync(new URL('./prompt.md', import.meta.url), 'utf8');}" },
+  { label: 'commented dynamic import', path: 'worker.mjs', entry: 'export async function tick(){return (await import /* selected worker */ (process.env.TARGET)).runOverlay();}' },
+  { label: 'commented literal import', path: 'worker.mjs', entry: "export async function tick(){return (await import /* selected worker */ ('./worker.mjs')).runOverlay();}" },
   { label: 'missing relative import', entry: "import './missing.mjs';" },
 ])('$label conflict retains the unresolved/manual-rebase fallback', async options => {
   const f = fixture(options); const p = await planRebuild(f.args);
