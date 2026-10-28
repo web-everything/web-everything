@@ -24,8 +24,8 @@ const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..'
 /**
  * Card xx7ckd6 N1 — the red-main QUARANTINE safety net rides on this smell's tick: it adds main's known failing test
  * files to `ops/quarantine` and prunes them on green or at expiry (we:scripts/lib/red-main-quarantine-io.mjs
- * `runSafetyNet`). It acts LIVE only when `redMainMode` is `quarantine`; otherwise (the default `stop`) it logs what
- * it WOULD do to `<health dir>/red-main-quarantine-shadow.jsonl` — evidence for the red-team review. A replay / dry-run
+ * `runSafetyNet`). It acts LIVE only when `redMainMode` is `quarantine`; otherwise (`stop`) it logs what
+ * it WOULD do to `<health dir>/red-main-quarantine-shadow.jsonl` for operator inspection. R157 ships quarantine with repeat-failure proof. A replay / dry-run
  * tick (`--main-ci-runs-fixture`, `--dry-run`, `--lock-root`, `--state-root`) is always shadow, and nothing runs under
  * test unless a test passes its own `ctx.quarantineSafetyNet`. It never changes what the smell reports.
  */

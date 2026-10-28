@@ -8,6 +8,7 @@ import {
 } from '../red-main-quarantine.mjs';
 import { redMainSignal, resolveRedMainMode } from '../red-main-hold.mjs';
 import { assertPushRef } from '../git-transport-branch.mjs';
+import { quarantineSkip } from '../../ci/quarantine-skip.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIX = JSON.parse(readFileSync(join(HERE, 'fixtures', 'red-main-hold-windows-2026-10.json'), 'utf8'));
@@ -18,10 +19,11 @@ const TEST = 'skills-src/conveyor/__tests__/reconcile-fix-dispatch-daemon.test.m
 const listWith = (tests, sha = SHA, now = NOW) => addEntries(null, { tests, brokenSha: sha, owner: 'main-fix-7e5137663', reason: 'red on main', actor: 'red-main-safety-net', now }).list;
 
 describe('quarantine — settings', () => {
-  it('mode defaults to stop; the shipped platform preference is stop; env can switch it', () => {
+  it('mode defaults to stop; the shipped platform preference is quarantine; env can switch it', () => {
     expect(resolveRedMainMode({ env: {}, file: '/nonexistent' })).toEqual({ value: 'stop', source: 'default' });
-    expect(resolveRedMainMode({ env: {} }).value).toBe('stop');
-    expect(resolveRedMainMode({ env: { WE_DRAIN_RED_MAIN_MODE: 'quarantine' } })).toEqual({ value: 'quarantine', source: 'env' });
+    expect(resolveRedMainMode({ env: {} }).value).toBe('quarantine');
+    expect(resolveRedMainMode({ env: { WE_DRAIN_RED_MAIN_MODE: 'stop' } })).toEqual({ value: 'stop', source: 'env' });
+    expect(resolveRedMainMode({ env: { WE_DRAIN_RED_MAIN_MODE: 'quarantine' }, file: '/nonexistent' })).toEqual({ value: 'quarantine', source: 'env' });
   });
 });
 
@@ -59,6 +61,21 @@ describe('quarantine — lifetime', () => {
 
 describe('quarantine — what CI skips', () => {
   const l = listWith([TEST]);
+  const ci = (list, eventName, ref) => quarantineSkip({
+    env: {}, now: NOW, read: { ok: true, list: { ...list, mode: 'quarantine' } },
+    flags: { event: eventName, ref }, changed: [],
+  });
+  it('main never receives quarantine exclusions through the CI adapter', () => {
+    expect(ci(l, 'pull_request', 'refs/pull/1/merge').line).toBe(`--exclude=${TEST}`);
+    expect(ci(l, 'push', 'refs/heads/main')).toMatchObject({ line: '', skip: [] });
+    expect(ci(l, 'workflow_dispatch', 'refs/heads/main')).toMatchObject({ line: '', skip: [] });
+  });
+  it('name-qualified entries produce no CI exclusions through the CI adapter', () => {
+    expect(ci(listWith([`${TEST}::dispatches the fix`]), 'pull_request', 'refs/pull/1/merge'))
+      .toMatchObject({ line: '', skip: [], why: expect.stringContaining('name-qualified') });
+    expect(ci(listWith([TEST, `${TEST}::dispatches the fix`]), 'pull_request', 'refs/pull/1/merge').line)
+      .toBe(`--exclude=${TEST}`);
+  });
   it('an ordinary PR skips the quarantined test', () => {
     expect(testsToSkip({ list: l, now: NOW, prNumber: 4613, fixPrs: [4617] })).toEqual([TEST]);
   });

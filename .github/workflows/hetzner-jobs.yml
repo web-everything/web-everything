@@ -179,5 +179,5 @@ jobs:
 
       - name: Real-git integration suite (lane-pool, operations transport)
         working-directory: web-everything
-        run: npm run test:integration:vitest
+        run: npm run test:integration:vitest -- $(node scripts/ci/quarantine-skip.mjs --job="integration")
 

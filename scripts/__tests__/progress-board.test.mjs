@@ -12,12 +12,12 @@
  */
 import { describe, it, expect, beforeEach, afterAll } from 'vitest';
 import { PR_STATUS_STATES } from '../conveyor/pr-status-label.mjs';
-import { outputMixFixture } from './fixtures/output-mix-fixture.mjs';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { outputMixRepo } from '../lib/__tests__/helpers/output-mix-repo.mjs';
 import {
   classifyPr,
   ciFailed,
@@ -497,20 +497,55 @@ describe('the output-mix section', () => {
     expect(h).toContain('could not be computed');
   });
 
+  it('does not run the CLI when imported by another progress-board.mjs', () => {
+    // The copied CLI's shared dependencies import the original board too. A basename-only entry guard
+    // runs that original against the full checkout before the copied board ever reads its tiny fixture.
+    const entry = join(sandbox, 'progress-board.mjs');
+    writeFileSync(entry, `import ${JSON.stringify(pathToFileURL(CLI).href)};\nprocess.stdout.write('imported\\n');\n`);
+    const r = spawnSync(process.execPath, [entry, '--help'], {
+      encoding: 'utf8',
+      timeout: 20_000,
+    });
+    expect(r.status, r.error?.message ?? r.stderr).toBe(0);
+    expect(r.stdout).toBe('imported\n');
+  }, 30_000);
+
+  it.each(['directory', 'file'])('renders the CLI through a symlinked %s', (kind) => {
+    const link = join(sandbox, `entry-${kind}`);
+    symlinkSync(kind === 'directory' ? dirname(CLI) : CLI, link);
+    const out = join(sandbox, `symlink-${kind}.html`);
+    const r = spawnSync(process.execPath, [kind === 'directory' ? join(link, 'progress-board.mjs') : link,
+      `--state=${statePath}`, `--out=${out}`, '--no-gh'], {
+      encoding: 'utf8',
+      env: { ...process.env, WE_BOARD_NOW: NOW, WE_BOARD_NO_GH: '1', WE_BOARD_NO_GIT: '1' },
+      timeout: 20_000,
+    });
+    expect(r.status, r.error?.message ?? r.stderr).toBe(0);
+    expect(existsSync(out), `CLI exited without writing the board: ${r.stdout}`).toBe(true);
+    expect(readFileSync(out, 'utf8')).toContain('progress-board:generated');
+  }, 30_000);
+
   /**
    * The one case that runs the REAL derivation through the CLI. Every other `cli()` call in this file forces
    * `WE_BOARD_NO_GIT=1` for runtime, which means `main()`'s own call into `computeOutputMix` — the ROOT it
    * resolves, the `today` it passes, the wiring into `buildModel` — is otherwise never executed under test.
-   * Point Git at a dated fixture using its standard repository selectors: the actual CLI and Git still run,
-   * but a growing/blobless CI checkout cannot trigger expensive history reads or lazy network fetches.
+   * Copy both entry points into a small real repository so their import.meta.url roots still agree, without
+   * scanning the runner checkout's growing history. Other imports keep their original dependency trees.
    */
   it('runs the real git derivation end to end when it is NOT disabled', () => {
-    const { repoRoot, env } = outputMixFixture(join(sandbox, `git-${seq}`));
-    const r = spawnSync(process.execPath, [CLI, `--state=${statePath}`, `--out=${outPath}`, '--no-gh'], {
+    const root = outputMixRepo(join(sandbox, 'output-mix-repo'));
+    const scripts = join(root, 'scripts');
+    mkdirSync(join(scripts, 'lib'), { recursive: true });
+    for (const file of ['progress-board.mjs', 'lib/output-mix.mjs', 'lib/output-mix-paths.json']) {
+      copyFileSync(join(ROOT, 'scripts', file), join(scripts, file));
+    }
+    for (const file of ['operations', 'merge-ai-prs.mjs', 'lib/rollup-collapse.mjs']) {
+      symlinkSync(join(ROOT, 'scripts', file), join(scripts, file));
+    }
+    const r = spawnSync(process.execPath, [join(scripts, 'progress-board.mjs'), `--state=${statePath}`, `--out=${outPath}`, '--no-gh'], {
       encoding: 'utf8',
-      timeout: 30_000,
-      env: { ...env, GIT_DIR: join(repoRoot, '.git'), GIT_WORK_TREE: repoRoot,
-        WE_BOARD_NOW: NOW, WE_BOARD_NO_GH: '1', WE_BOARD_NO_GIT: '' },
+      env: { ...process.env, WE_BOARD_NOW: NOW, WE_BOARD_NO_GH: '1', WE_BOARD_NO_GIT: '' },
+      timeout: 20_000,
     });
     expect(r.status, r.stderr).toBe(0);
     const h = readFileSync(outPath, 'utf8');
@@ -519,8 +554,9 @@ describe('the output-mix section', () => {
     // A real read produces grouped, signed figures in the machinery column — not the honest-note fallback.
     expect(h).toMatch(/Machinery \+ bookkeeping/);
     expect(h).toMatch(/>\+[\d,]+<\/div>/);
-    expect(h).toContain('<div class="n">+5</div><div class="k">Product lines this week</div>');
-    expect(h).toContain('<div class="n">+10</div><div class="k">Machinery + bookkeeping</div>');
+    expect(h).toContain('Week of 2026-08-03 so far.');
+    expect(h).toContain('<div class="n">+2</div><div class="k">Product lines this week</div>');
+    expect(h).toContain('<div class="n">+2</div><div class="k">Machinery + bookkeeping</div>');
   }, 30_000);
 });
 

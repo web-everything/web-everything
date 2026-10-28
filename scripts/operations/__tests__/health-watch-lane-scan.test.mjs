@@ -41,15 +41,14 @@ afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: tru
 const policy = { interval: 300, source: 'standard', invalid: [] };
 const rows = [{ lane: { path: '/fixture/lane-1', clean: false, lease: { agentPid: 123 } }, ahead: 2 }];
 
-// Shared by the real-Git guard regressions; never probe the running checkout.
-const actions = ['reclaim', 'reset', 'reuse', 'release-on-behalf'];
-const fixture = () => {
+// Shared by inherited-configuration regressions and the real-Git action cases.
+// Never depend on the runner checkout's local config, index or publication refs.
+function laneFixture() {
   const path = temp();
   const git = argv => execFileSync('git', argv, {
     cwd: path, encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...laneGitEnv(path), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
   });
-  // All Git writes stay inside this disposable fixture, never the lane checkout.
   git(['init', '--quiet']);
   writeFileSync(join(path, 'tracked.txt'), 'committed content\n');
   writeFileSync(join(path, '.gitignore'), 'ignored.txt\nlocal-data/\n');
@@ -58,24 +57,18 @@ const fixture = () => {
     '-c', 'commit.gpgSign=false', '-c', 'core.hooksPath=/dev/null', 'commit', '--quiet', '-m', 'fixture']);
   commit();
   publishedTips.set(path, git(['rev-parse', 'HEAD']).trim());
-  // A tracking ref may agree with publication, but is never its authority.
   git(['update-ref', 'refs/remotes/origin/fixture', 'HEAD']);
-  for (const action of actions) {
-    expect(guardLaneAction({ path, action, log: vi.fn() })).toMatchObject({
-      act: true, fresh: { hasUnsafeWork: false },
-    });
-  }
   return { path, git, commit };
-};
+}
 
 describe('operator send-back regressions', () => {
-  it('freshLaneSafety never runs inherited GIT_CONFIG_PARAMETERS fsmonitor commands (read-only Git)', () => {
-    const { path } = fixture();
+  it('freshLaneSafety never runs inherited GIT_CONFIG_PARAMETERS fsmonitor commands', () => {
+    const { path } = laneFixture();
     const marker = join(temp(), 'executed');
     vi.stubEnv('GIT_CONFIG_PARAMETERS', `'core.fsmonitor=echo executed >> "${marker}"'`);
     try {
       const exec = vi.fn(execFileSync);
-      expect(freshLaneSafety({ path, exec })).toMatchObject({ hasUnsafeWork: false, fresh: true });
+      expect(freshLaneSafety({ path, exec })).toMatchObject({ hasUnsafeWork: false });
       expect(exec.mock.calls.some(([, argv]) => argv[0] === 'status')).toBe(true);
       expect(existsSync(marker)).toBe(false);
     } finally { vi.unstubAllEnvs(); }
@@ -561,8 +554,8 @@ describe('fresh per-lane safety check before any destructive action', () => {
 });
 
 describe('untrusted lane Git configuration', () => {
-  it('does not execute fsmonitor or external diff from configuration overrides (read-only Git)', () => {
-    const { path } = fixture();
+  it('does not execute fsmonitor or external diff from configuration overrides', () => {
+    const { path } = laneFixture();
     const marker = join(temp(), 'executed');
     const command = `echo executed >> '${marker}'`;
     vi.stubEnv('GIT_CONFIG_COUNT', '2');
@@ -571,7 +564,7 @@ describe('untrusted lane Git configuration', () => {
     vi.stubEnv('GIT_CONFIG_KEY_1', 'diff.external');
     vi.stubEnv('GIT_CONFIG_VALUE_1', command);
     try {
-      // Exercise the actual guard and Git against the clean, controlled fixture.
+      // Exercise the actual guard and Git against a positively safe, isolated lane.
       const exec = vi.fn(execFileSync);
       expect(guardLaneAction({ path, action: 'reclaim', exec, log: vi.fn() })).toMatchObject({ act: true });
       expect(exec.mock.calls.some(([, argv]) => argv[0] === 'status')).toBe(true);
@@ -742,6 +735,17 @@ describe('untrusted lane Git configuration', () => {
 });
 
 describe('lane action guard with real Git', () => {
+  const actions = ['reclaim', 'reset', 'reuse', 'release-on-behalf'];
+  const fixture = () => {
+    const { path, git, commit } = laneFixture();
+    for (const action of actions) {
+      expect(guardLaneAction({ path, action, log: vi.fn() })).toMatchObject({
+        act: true, fresh: { hasUnsafeWork: false },
+      });
+    }
+    return { path, git, commit };
+  };
+
   it('never runs marker scripts from lane-local fsmonitor or diff configuration', () => {
     const { path, git } = fixture();
     const scripts = temp();

@@ -15,7 +15,9 @@ describe('ci.yml: integration suite runs as its own parallel job', () => {
   it.each(['ci.yml', 'hetzner-jobs.yml'])('%s integration executes test:integration:vitest', (workflow) => {
     const text = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', '.github', 'workflows', workflow), 'utf8');
     const integration = yaml.load(text).jobs.integration;
-    const suiteSteps = integration.steps.filter((step) => step.run?.trim() === 'npm run test:integration:vitest');
+    // Both copies apply the same integration quarantine exclusions (PR #6014).
+    const suiteSteps = integration.steps.filter((step) => step.run?.trim()
+      === 'npm run test:integration:vitest -- $(node scripts/ci/quarantine-skip.mjs --job="integration")');
     expect(suiteSteps).toHaveLength(1);
     expect(suiteSteps[0]['working-directory']).toBe('web-everything');
     expect(suiteSteps[0].if).toBe(workflow === 'ci.yml' ? "${{ steps.gate.outputs.run == 'true' }}" : undefined);

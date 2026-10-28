@@ -11,15 +11,15 @@
  *   • the NUMSTAT PARSE + BUCKETING → renames and binaries are the two shapes that silently corrupt a line
  *     count, and this repo renames a file every time a backlog card is JIT-numbered.
  *
- * Repository coverage ratchets read the tracked tree only. The end-to-end history case uses a tiny local
- * repository with dated commits, so neither runtime nor expected output depends on the live history.
+ * History derivation uses a small real Git fixture. The classifier coverage ratchets also read the checkout's
+ * tracked paths, but never scan its growing commit history.
  */
-import { describe, it, expect, afterAll } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { outputMixFixture } from '../../__tests__/fixtures/output-mix-fixture.mjs';
+import { outputMixRepo } from './helpers/output-mix-repo.mjs';
 import {
   CLASSES,
   WEEK_COUNT,
@@ -454,22 +454,19 @@ describe('ratioLabel', () => {
   });
 });
 
-describe('computeOutputMix — real Git history', () => {
-  const sandbox = mkdtempSync(join(tmpdir(), 'output-mix-'));
-  afterAll(() => rmSync(sandbox, { recursive: true, force: true }));
-
+describe('computeOutputMix — against real Git history', () => {
   it('derives the current week plus four completed weeks, and never throws', () => {
-    const { repoRoot } = outputMixFixture(join(sandbox, 'repo'));
-    const mix = computeOutputMix({ repoRoot, today: '2026-08-09' });
-    expect(mix.fresh, mix.reason).toBe(true);
-    expect(mix.weeks).toHaveLength(WEEK_COUNT);
-    expect(mix.trend).toHaveLength(WEEK_COUNT - 1);
-    expect(mix.current.start).toBe('2026-08-03');
-    expect(mix.weeks.map(w => [w.product, w.machinery, w.other, w.total])).toEqual([
-      [1, 2, 3, 6], [2, 4, 6, 12], [3, 6, 9, 18], [4, 8, 12, 24], [5, 10, 15, 30],
-    ]);
-    // The three classes partition each week's additions exactly.
-    for (const w of mix.weeks) expect(w.product + w.machinery + w.other).toBe(w.total);
+    const root = mkdtempSync(join(tmpdir(), 'output-mix-'));
+    try {
+      const repoRoot = outputMixRepo(root);
+      const mix = computeOutputMix({ repoRoot, today: '2026-08-09' });
+      expect(mix.fresh, mix.reason).toBe(true);
+      expect(mix.weeks).toHaveLength(WEEK_COUNT);
+      expect(mix.trend).toHaveLength(WEEK_COUNT - 1);
+      expect(mix.current).toMatchObject({ start: '2026-08-03', product: 2, machinery: 2, other: 1, total: 5 });
+      expect(mix.trend.map(w => w.total)).toEqual([0, 0, 0, 1]);
+      for (const w of mix.weeks) expect(w.product + w.machinery + w.other).toBe(w.total);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   it('degrades to an honest empty result instead of throwing when the repository cannot be read', () => {
