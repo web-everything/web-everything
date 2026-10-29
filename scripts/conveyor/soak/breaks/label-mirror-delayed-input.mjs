@@ -48,10 +48,12 @@ export default {
         violations.push(sameSecond ? 'same-second readdition was discarded' : 'clearance inside append resurrected hold');
       }
     }
-    // Exercise both a finished label swap and labels still lagging behind the approval append.
+    // Exercise a finished label swap, labels lagging behind approval, and the partial ceremony
+    // before approval. The audit verdict alone must retain and record the hand-added hold.
     for (const [swap, approval] of [[true, true], [false, true], [false, false]]) {
       const rows = [verdict('human', '2026-10-12T10:00:00Z')];
-      let labels = ['review:human'], writes = 0;
+      let labels = ['review:human'], labelWrites = 0;
+      const appended = [];
       const out = await runMirrorApply({
         repo, listPrs: () => [{ number: pr, labels: [...labels] }], selfLogin: 'mirror',
         readEvents: async () => ({ status: 'ok', rows: [...rows] }),
@@ -63,10 +65,23 @@ export default {
           if (swap) labels = ['review:accepted'];
           return { status: 'ok', items: [{ label: 'review:human', change: 'added', actor: 'operator', actorType: 'User', createdAt: '2026-10-12T10:00:00Z' }] };
         },
-        appendRow: async (row) => { writes += 1; rows.push(row); return { ok: true }; },
-        addLabel: async () => { writes += 1; },
+        appendRow: async (row) => { appended.push(row); rows.push(row); return { ok: true }; },
+        addLabel: async () => { labelWrites += 1; },
       });
-      if (out.failures.length || writes || derivePrState(rows, facts, {}).clears !== approval) violations.push(`delayed addition failed approval-bound clearance (label swap=${swap}, approval=${approval})`);
+      const expectedAppends = approval ? 0 : 1;
+      const state = derivePrState(rows, facts, {});
+      const expectedHolds = approval ? [] : ['label-input:review:human', 'verdict:human'];
+      if (out.failures.length || labelWrites || appended.length !== expectedAppends
+        || out.rowsAppended.length !== expectedAppends || out.writes !== expectedAppends
+        || state.clears !== approval
+        || JSON.stringify(state.holds.map(h => h.code).sort()) !== JSON.stringify(expectedHolds)) {
+        violations.push(`delayed addition failed approval-bound clearance (label swap=${swap}, approval=${approval})`);
+      }
+      if (!approval && (appended[0]?.type !== 'label-input' || appended[0]?.label !== 'review:human'
+        || appended[0]?.change !== 'added' || appended[0]?.sender !== 'operator'
+        || appended[0]?.at !== '2026-10-12T10:00:00Z')) {
+        violations.push('partial clear-human ceremony did not record the historical hand-added hold');
+      }
     }
     const node = (change, label, at) => ({ __typename: change === 'added' ? 'LabeledEvent' : 'UnlabeledEvent', createdAt: at, label: { name: label }, actor: { __typename: 'User', login: 'operator' } });
     const chronological = [node('added', 'review:human', '2026-10-12T09:00:00Z'), node('removed', 'review:human', '2026-10-12T10:00:00Z'), node('added', 'review:human', '2026-10-12T10:00:00Z'), ...Array.from({ length: 99 }, () => node('added', 'bug', '2026-10-12T11:00:00Z'))];
