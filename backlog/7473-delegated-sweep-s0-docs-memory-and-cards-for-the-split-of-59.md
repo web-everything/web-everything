@@ -1,4 +1,5 @@
 ---
+bornAs: x703e22
 kind: story
 size: 2
 status: open

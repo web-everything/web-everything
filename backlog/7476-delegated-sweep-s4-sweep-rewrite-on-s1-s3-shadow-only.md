@@ -1,15 +1,17 @@
 ---
+bornAs: x1ylb5u
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/lib/pr-state/holds/verdict.mjs", "we:scripts/conveyor/delegated-clear-human.mjs", "we:scripts/lib/verdict-ledger.mjs"]
+blockedBy: ["7475"]
+scope: ["we:scripts/conveyor/delegated-clearance-sweep.mjs", "we:scripts/conveyor/soak/breaks/"]
 dateOpened: "2026-10-29"
 tags: []
 ---
 
-# Delegated sweep S2: head-bound approval rows on single admission
+# Delegated sweep S4: sweep rewrite on S1-S3, shadow only
 
-Pre-approval rows must carry approvedHead (no inferred baseline); built on #5982 single admission via admitClearHuman as the only gate. Owns invariants I1 exact head, I2 block wins, I8 fail closed. Depends on the clear-human rebuild PRs (#6036 head binding, #6043 shared snapshot) landing.
+Rewrite the delegated-clearance sweep on the shared checks (readRedTeamDisposition/resolveDisposition, approvalReleases, admitClearHuman as the only gate, isTrustedMarkerAuthor) and the S3 store; shadow mode only until a valid deadline. Owns I3 dismissal never outlives a later block, I5 refusal is final, I9 shadow until a valid deadline. Test matrix: one test per invariant, 18 named past-break regressions, plus soak breaks concurrent-state-overwrite and dismissal-after-block. Blocked by S3 (and S1 landed).
 
 ## Acceptance
 

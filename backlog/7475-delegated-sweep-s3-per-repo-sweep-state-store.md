@@ -1,16 +1,17 @@
 ---
+bornAs: xnueoyl
 kind: story
 size: 5
 status: open
-blockedBy: ["xnueoyl"]
-scope: ["we:scripts/conveyor/delegated-clearance-sweep.mjs", "we:scripts/conveyor/soak/breaks/"]
+blockedBy: ["7474"]
+scope: ["we:scripts/conveyor/delegated-clearance-sweep.mjs", "we:scripts/lib/atomic-json-file.mjs"]
 dateOpened: "2026-10-29"
 tags: []
 ---
 
-# Delegated sweep S4: sweep rewrite on S1-S3, shadow only
+# Delegated sweep S3: per-repo sweep state store
 
-Rewrite the delegated-clearance sweep on the shared checks (readRedTeamDisposition/resolveDisposition, approvalReleases, admitClearHuman as the only gate, isTrustedMarkerAuthor) and the S3 store; shadow mode only until a valid deadline. Owns I3 dismissal never outlives a later block, I5 refusal is final, I9 shadow until a valid deadline. Test matrix: one test per invariant, 18 named past-break regressions, plus soak breaks concurrent-state-overwrite and dismissal-after-block. Blocked by S3 (and S1 landed).
+Per-repo state file, updateState(fn) under withFileLock with a re-read (atomic-json-file), set-if-absent claimed before runLabel, void keyed by ruling, pruning. Authority stays in the verdict ledger. Owns invariants I6 per-PR isolation, I7 write-once baselines, I4 expiry admitted once at the commit point. Blocked by S2.
 
 ## Acceptance
 

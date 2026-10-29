@@ -1,16 +1,16 @@
 ---
+bornAs: x660rls
 kind: story
 size: 5
 status: open
-blockedBy: ["x660rls"]
-scope: ["we:scripts/conveyor/delegated-clearance-sweep.mjs", "we:scripts/lib/atomic-json-file.mjs"]
+scope: ["we:scripts/lib/pr-state/holds/verdict.mjs", "we:scripts/conveyor/delegated-clear-human.mjs", "we:scripts/lib/verdict-ledger.mjs"]
 dateOpened: "2026-10-29"
 tags: []
 ---
 
-# Delegated sweep S3: per-repo sweep state store
+# Delegated sweep S2: head-bound approval rows on single admission
 
-Per-repo state file, updateState(fn) under withFileLock with a re-read (atomic-json-file), set-if-absent claimed before runLabel, void keyed by ruling, pruning. Authority stays in the verdict ledger. Owns invariants I6 per-PR isolation, I7 write-once baselines, I4 expiry admitted once at the commit point. Blocked by S2.
+Pre-approval rows must carry approvedHead (no inferred baseline); built on #5982 single admission via admitClearHuman as the only gate. Owns invariants I1 exact head, I2 block wins, I8 fail closed. Depends on the clear-human rebuild PRs (#6036 head binding, #6043 shared snapshot) landing.
 
 ## Acceptance
 
