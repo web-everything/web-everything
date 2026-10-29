@@ -147,8 +147,9 @@ describe('health-watch destructive lane action call-site contract', () => {
       'scripts/conveyor/health-watch.mjs:tick:unlinkSync(overrunPath)',
     ];
     const violations = sites => sites.filter(({ site, guarded }) => !ALLOWLIST.includes(site) && !guarded);
-    const sites = scopedScanFiles(['scripts/lib/health-watch-lane-scan.mjs',
-      'scripts/operations/stale-state-io.mjs', 'scripts/conveyor/health-watch.mjs'])
+    // Full inventory on every run: the allowlist spans all three files, so a scoped scan cannot equal it.
+    const sites = ['scripts/lib/health-watch-lane-scan.mjs',
+      'scripts/operations/stale-state-io.mjs', 'scripts/conveyor/health-watch.mjs']
       .flatMap(file => scan(readFileSync(new URL(`../../../${file}`, import.meta.url), 'utf8'), file));
     expect(sites.map(({ site }) => site).sort()).toEqual([...ALLOWLIST].sort());
     expect(violations(sites)).toEqual([]);
