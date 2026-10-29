@@ -367,7 +367,7 @@ async function checkLanePoolList(ctx) {
   }
 }
 
-/** lane-pool acquire exits 75 (EX_TEMPFAIL) only when nothing was acquired solely because of lane-hold refusals. */
+/** lane-pool acquire exits 75 (EX_TEMPFAIL) only when a parked lane-hold refusal was seen and no other failure kind was (the rest of the pool was busy). */
 const LANE_POOL_ENV_ONLY_EXIT = 75;
 const isEnvOnlyAcquireExit = (e) => e?.status === LANE_POOL_ENV_ONLY_EXIT && !e?.signal;
 

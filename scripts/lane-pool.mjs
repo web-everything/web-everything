@@ -2566,7 +2566,7 @@ async function cmdAcquire(repo) {
       // that genuinely found nothing acquirable are three distinct facts, each with its own message — never
       // collapsed into one another.
       emitAcquirePollCount(); // #xj4tewd — before fail() exits the process, so a debug-mode caller still sees it
-      // Exit 75 (EX_TEMPFAIL) = the ONLY reason nothing was acquired is a parked lane-hold refusal (scan-lock contention stays exit 1 so a wedged lock still fails the smoke):
+      // Exit 75 (EX_TEMPFAIL) = at least one parked lane-hold refusal was seen and NO other failure kind (non-hold provision failure, scan timeout) was; the rest of the pool was simply busy. Scan-lock contention alone stays exit 1 so a wedged lock still fails the smoke:
       // environmental, never a code defect. Callers (the rebuild smoke) key on this exit code, never on message text.
       const environmentalOnly = !sawNonHoldProvisionFailure && !sawScanTimeout && holdRefused.size > 0;
       fail(
