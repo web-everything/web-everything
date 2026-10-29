@@ -245,7 +245,10 @@ export function sweepDelegatedClearance({ prs, repo = null, dryRun = false, sett
       try {
         const comments = readComments(p.number, { repo });
         if (!Array.isArray(comments)) throw new Error('comments read returned no array');
-        return [{ ...p, comments }];
+        const read = { ...p, comments };
+        // Plan here so one PR's malformed evidence refuses only that PR, never the whole tick.
+        planDelegatedClearance([read], { repo, preApprovals: approvals });
+        return [read];
       } catch (e) {
         results.push({ num: p.number, delegated: 'sweep-failed', detail: `complete comment read failed: ${String(e?.message ?? e).replace(/[\x00-\x1f]/g, ' ').slice(0, 400)}; operator review required` });
         return [];
@@ -271,13 +274,15 @@ export function sweepDelegatedClearance({ prs, repo = null, dryRun = false, sett
       const publish = kind => {
         const memoKey = kind === 'pre-approval-void' ? voidKey(c.approval) : `${key}:${kind}`;
         if (dryRun || state.memo[memoKey]) return;
-        remember(memoKey); emit(event(kind));
+        remember(memoKey);
+        // An event that failed to emit withdraws its memo, so a later tick publishes it instead of losing it.
+        try { emit(event(kind)); } catch (e) { delete state.memo[memoKey]; try { writeState(state); } catch { /* reported below */ } throw e; }
       };
-      if (c.approval && c.broken.length) { publish('pre-approval-void'); results.push({ num: c.num, delegated: 'pre-approval-void', detail: basis }); continue; }
-      // A void belongs to the ruling and survives every subsequent head.
-      if ((c.approval && state.memo[voidKey(c.approval)]) || state.memo[`${key}:attempt`]) continue;
       // One candidate's unreadable or oversized evidence refuses only that candidate; the rest of the batch still runs.
       try {
+        if (c.approval && c.broken.length) { publish('pre-approval-void'); results.push({ num: c.num, delegated: 'pre-approval-void', detail: basis }); continue; }
+        // A void belongs to the ruling and survives every subsequent head.
+        if ((c.approval && state.memo[voidKey(c.approval)]) || state.memo[`${key}:attempt`]) continue;
         const files = filesValid(readNetFiles({ repo, ...c }));
         const scored = shape(files);
         if (typeof scored?.humanRequired !== 'boolean') throw new Error('shape incomplete; human review required');

@@ -675,6 +675,7 @@ describe('R130 delegated clearance', () => {
   it.each([
     ['throws', () => { throw new Error('comment read failed\nforged line'); }, 'comment read failed forged line'],
     ['returns no array', () => null, 'comments read returned no array'],
+    ['holds a malformed comment', () => Array(100).fill(bot(42)), 'body.match is not a function'],
   ])('a complete comment read that %s refuses only that PR; unrelated candidates still clear', (_, failed, reason) => {
     const rows = [1, 2, 3].map(number => ({ ...pr(), number,
       comments: pr().comments.map(c => ({ ...c, body: c.body.replace('pr=5925', `pr=${number}`) })) }));
@@ -686,6 +687,24 @@ describe('R130 delegated clearance', () => {
     expect(results.filter(r => r.num === 0)).toEqual([]);
     expect(h.runLabel.mock.calls.map(([c]) => c.num).sort()).toEqual([1, 3]);
     expect(h.runLabel).not.toHaveBeenCalledWith(expect.objectContaining({ num: 2 }));
+  });
+  it('a pre-approval void whose event fails to emit refuses only that PR and is published on a later tick', () => {
+    const voided = pr();
+    voided.comments.splice(1, 0, bot(`<!-- we:red-team-advisory pr=5925 rev=${head} -->
+1. [**confirmed**] (security, broken) ` + '`src/a.js:1`' + ` — break`));
+    const other = { ...pr(), number: 2, comments: pr().comments.map(c => ({ ...c, body: c.body.replace('pr=5925', 'pr=2') })) };
+    let fail = true;
+    const emit = vi.fn(e => { if (fail && e.kind === 'pre-approval-void') throw new Error('event log unwritable'); });
+    const h = harness({ prs: [voided, other], readPreApprovals: () => approvals, emit });
+    const results = sweepDelegatedClearance(h);
+    expect(results).toContainEqual(expect.objectContaining({ num: 5925, delegated: 'sweep-failed', detail: expect.stringContaining('event log unwritable') }));
+    expect(results.filter(r => r.num === 0)).toEqual([]);
+    expect(h.runLabel.mock.calls.map(([c]) => c.num)).toEqual([2]);
+    expect(h.readState().memo['o/r#5925:R122:pre-approval-void']).toBeUndefined();
+    fail = false;
+    expect(sweepDelegatedClearance(h)).toContainEqual(expect.objectContaining({ num: 5925, delegated: 'pre-approval-void' }));
+    expect(emit).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'pre-approval-void', pr: 5925 }));
+    expect(h.runLabel).toHaveBeenCalledTimes(1);
   });
   it('the sanctioned CLI is attempted only once even if it throws', () => {
     const h = harness({ runLabel: vi.fn(() => { throw new Error('timeout'); }) });
