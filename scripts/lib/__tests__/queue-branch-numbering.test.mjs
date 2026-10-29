@@ -469,8 +469,24 @@ describe('sweepQueuedHashCards', () => {
     expect(x.emit).toHaveBeenCalledTimes(1);
     expect(x.emit).toHaveBeenCalledWith({ kind: 'queue-dequeue-skipped', pr: 1, daemon: 'drain', detail: { reason: 'human-enqueued' } });
   });
-  it.each(['numbering[bot]', '', null])('still dequeues a normal hash PR with enqueuer login %s and emits an event', (login) => {
-    const x = setup(); x.nodes.splice(1); x.nodes[0].enqueuer = login === null ? null : { login };
+  it.each([
+    ['missing enqueuer', undefined],
+    ['null enqueuer', null],
+    ['missing login', {}],
+    ['empty login', { login: '' }],
+    ['null login', { login: null }],
+    ['non-string login', { login: 42 }],
+  ])('fails closed when the enqueuer is unknown (%s), leaving the hash PR queued', (_case, enqueuer) => {
+    const x = setup(); x.nodes.splice(1); x.nodes[0].enqueuer = enqueuer;
+    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [], numbered: [], skipped: [{ num: 1, reason: 'enqueuer-unknown' }], errors: [] });
+    expect(x.exec.mock.calls.some(([, args]) => args.some((arg) => arg.includes('mutation')))).toBe(false);
+    expect(x.prepare).not.toHaveBeenCalled();
+    expect(x.emit).toHaveBeenCalledTimes(1);
+    expect(x.emit).toHaveBeenCalledWith({ kind: 'queue-dequeue-skipped', pr: 1, daemon: 'drain', detail: { reason: 'enqueuer-unknown' } });
+    expect(x.log.write).toHaveBeenCalledWith(expect.stringContaining('enqueuer-unknown — left queued'));
+  });
+  it('still dequeues a normal hash PR enqueued by a bot and emits an event', () => {
+    const x = setup(); x.nodes.splice(1); x.nodes[0].enqueuer = { login: 'numbering[bot]' };
     expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [1], numbered: [1], skipped: [], errors: [] });
     expect(x.exec).toHaveBeenCalledWith('gh', ['api', 'graphql', '-f', 'query=mutation($id:ID!){dequeuePullRequest(input:{id:$id}){mergeQueueEntry{id}}}', '-f', 'id=pr-1'], expect.any(Object));
     expect(x.prepare).toHaveBeenCalledTimes(1);

@@ -369,7 +369,11 @@ export function sweepQueuedHashCards({ repo, cwd = process.cwd(), exec = execFil
           continue;
         }
         const login = enqueuer?.login;
-        if (login && login !== 'plateau-merger' && !login.endsWith('[bot]')) {
+        if (typeof login !== 'string' || !login) {
+          skip(pr.number, 'enqueuer-unknown');
+          continue;
+        }
+        if (login !== 'plateau-merger' && !login.endsWith('[bot]')) {
           skip(pr.number, 'human-enqueued');
           continue;
         }
