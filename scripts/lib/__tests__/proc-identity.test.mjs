@@ -234,6 +234,34 @@ describe('readIdentity parsers', () => {
 });
 
 describe('sameIdentity', () => {
+  const bootCases = [BOOT, BOOT.toUpperCase(), '8B61301a-27f4-4828-9Ce1-9fc23BF14377'];
+
+  it.each(bootCases)('compares UUID casing symmetrically for %s without mutating inputs', (bootId) => {
+    const recorded = Object.freeze({ ...linuxIdentity, bootId });
+    for (const observedBoot of bootCases) {
+      const observed = Object.freeze({ ...linuxIdentity, bootId: observedBoot });
+      expect(sameIdentity(recorded, observed)).toBe(true);
+      expect(sameIdentity(observed, recorded)).toBe(true);
+      expect(sameIdentity(recorded, { ...observed, bootId: OTHER_BOOT.toUpperCase() })).toBe(false);
+    }
+  });
+
+  it.each(['linux', 'darwin'])('%s liveness accepts UUID casing differences through identity probes', (platform) => {
+    const expected = platform === 'linux' ? linuxIdentity : darwinIdentity;
+    for (const recordedBoot of bootCases) {
+      for (const observedBoot of bootCases) {
+        const deps = platform === 'linux'
+          ? linuxDeps({ bootId: observedBoot }) : darwinDeps({ bootId: observedBoot });
+        const recorded = { ...expected, bootId: recordedBoot };
+        expect(liveness(recorded, deps)).toBe('alive');
+        const group = listGroup(PID, deps);
+        expect(group.status).toBe('ok');
+        expect(group.identities).toHaveLength(1);
+        expect(sameIdentity(recorded, group.identities[0])).toBe(true);
+      }
+    }
+  });
+
   it('matches all four identity keys and ignores a state transition', () => {
     expect(sameIdentity(linuxIdentity, { ...linuxIdentity, state: 'R' })).toBe(true);
   });

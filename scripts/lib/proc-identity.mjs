@@ -199,7 +199,8 @@ function validIdentity(value) {
 
 export function sameIdentity(a, b) {
   return Boolean(validIdentity(a) && validIdentity(b) &&
-    ['pid', 'startTime', 'bootId', 'uid'].every((key) => a[key] === b[key]));
+    a.bootId.toLowerCase() === b.bootId.toLowerCase() &&
+    ['pid', 'startTime', 'uid'].every((key) => a[key] === b[key]));
 }
 
 export function liveness(expected, deps = {}) {
