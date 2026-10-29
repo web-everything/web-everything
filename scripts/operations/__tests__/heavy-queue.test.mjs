@@ -8,7 +8,7 @@ import { describe, it, expect } from 'vitest';
 import { BOUNDED_RUN_SHIM } from '../mutation-check-io.mjs';
 import {
   classifyHeavyJobKind, assessHeavyQueueRow, projectedWaitMinutesForNewJob, assessHeavyQueue,
-  heavyQueueOperation, HEAVY_QUEUE_OP, SELECTED_GATE_MERGE_SHA, STANDARD_MINUTES_BY_KIND,
+  heavyQueueOperation, HEAVY_QUEUE_OP, SELECTED_GATE_MERGE_SHA, STANDARD_MINUTES_BY_KIND, assessQueueAdmission,
 } from '../heavy-queue.mjs';
 
 describe('targeted heavy command regression', () => {
@@ -234,5 +234,46 @@ describe('heavyQueueOperation — the declared shape', () => {
     const declaration = heavyQueueOperation({ collect: () => ({ observedAt: '2026-01-01T00:00:00.000Z', cap: 1, heldCount: 0, freeCount: 1, held: [], waiting: [] }) });
     expect(declaration.name).toBe(HEAVY_QUEUE_OP);
     expect(declaration.verdictFrom).toBe('assess');
+  });
+});
+
+
+describe('assessQueueAdmission — fixes count only waiters ahead', () => {
+  const baseline = () => ({
+    slots: 4, heavySlots: 3, fastSlots: 1, maxWaitMinutes: 30, p1OrderingEnabled: true,
+    held: Array.from({ length: 3 }, () => ({ kind: 'FULL', priority: 'P3', remainingMinutes: 18 })),
+    waiting: Array.from({ length: 12 }, () => ({ kind: 'selected', priority: 'P3', expectedMinutes: 3 })),
+    heldHeavyCount: 3, waitingHeavyCount: 0,
+    heldRemainingMinutes: 54, waitingMinutes: 36, pendingMinutes: 0,
+    heavyBacklogMinutes: 54, shortBacklogMinutes: 36, backlogMinutes: 90,
+    projectedWaitMinutes: 36, heavyWaitMinutes: 18,
+  });
+
+  it('reports the FIFO queue cap until live P1 ordering is enabled', () => {
+    const b = baseline();
+    delete b.p1OrderingEnabled;
+    const result = assessQueueAdmission(b);
+    for (const kind of ['fix', 'ci-heal']) {
+      expect(result.byKind[kind]).toMatchObject({ admit: false, projectedMinutes: 39.25, excludedBehindCount: 0 });
+    }
+    expect(result.headline).toContain('(a fix → ~39.25m counting all waiters, HELD queue-cap)');
+  });
+
+  it('admits fix and ci-heal ahead of twelve build waiters while the build stays HELD', () => {
+    const result = assessQueueAdmission(baseline());
+    for (const kind of ['fix', 'ci-heal']) {
+      expect(result.byKind[kind]).toMatchObject({ admit: true, projectedMinutes: 3.25, excludedBehindCount: 12 });
+    }
+    expect(result.byKind['build (size 3)']).toEqual({ demandMinutes: 6.5, projectedMinutes: 42.5, admit: false, exempt: false });
+    expect(result.byKind.review).toMatchObject({ admit: true, exempt: true });
+    expect(result.headline).toContain('(a fix → ~3.25m counting only waiters ahead of it, admitted)');
+  });
+
+  it('explains HELD queue-cap when P0/P1 waiters ahead exhaust the fix budget', () => {
+    const b = baseline();
+    b.waiting = b.waiting.map((row, i) => ({ ...row, priority: i % 2 ? 'P0' : 'P1' }));
+    const result = assessQueueAdmission(b);
+    expect(result.byKind.fix).toMatchObject({ admit: false, projectedMinutes: 39.25, excludedBehindCount: 0 });
+    expect(result.headline).toContain('(a fix → ~39.25m counting only waiters ahead of it, HELD queue-cap)');
   });
 });
