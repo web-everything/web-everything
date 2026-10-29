@@ -139,6 +139,18 @@ describe('lane-pool acquire after lane-hold reset refusal', () => {
     expect(result.code).toBe(1);
   }, 60_000);
 
+  it('exits 1 rather than 75 when a hold-refused lane is mixed with a foreign live lease', () => {
+    provision(2);
+    park(1);
+    const held = run(['acquire', '--lane=2', '--session=foreign-live-owner', '--json']);
+    expect(held.code, held.err).toBe(0);
+    const foreignLease = readFileSync(lease(2), 'utf8');
+    const result = acquire(0);
+    expect(result.err.match(/lane-1: reset REFUSED — lane-hold:/g)).toHaveLength(1);
+    expect(readFileSync(lease(2), 'utf8')).toBe(foreignLease);
+    expect(result.code, result.err).toBe(1);
+  }, 60_000);
+
   it('does not retry a lane-hold-refused lane across acquire poll rounds', () => {
     provision(1);
     park(1);
