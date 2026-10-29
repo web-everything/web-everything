@@ -4,9 +4,15 @@ import * as quota from '../provider-quota-hold.mjs';
 const now = Date.parse('2026-10-29T08:00:00Z');
 const quotaErrors = [
   "You've hit your weekly limit · resets ...",
-  'HTTP 429', 'rate_limit', 'rate limit', 'too many requests',
+  "You've hit your weekly limit · resets Oct 30",
+  'HTTP 429', 'status 429 Too Many Requests', 'rate_limit', 'rate_limit_error',
+  'rate limit', 'too many requests', 'usage limit reached', 'insufficient_quota', 'RESOURCE_EXHAUSTED',
 ];
-const ordinaryErrors = ['schema invalid', 'the juror failed with no result text'];
+const ordinaryErrors = [
+  'schema invalid', 'the juror failed with no result text',
+  'disk quota exceeded on /tmp', 'schema invalid at line 429',
+  'port 4290 refused', 'quota-check script crashed',
+];
 
 describe('quota error evidence', () => {
   it.each(quotaErrors)('recognizes quota exhaustion: %s', text => {

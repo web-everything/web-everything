@@ -245,6 +245,37 @@ describe('quota failure telemetry reader', () => {
     ['readReviewFailureSpans', readReviewFailureSpans],
     ['readQuotaFailureSpans', readQuotaFailureSpans],
   ])('%s fails closed', (_, readSpans) => {
+    it.each([0, 1, 2])('returns [] for a non-ENOENT read error in scanned day offset %i', daysAgo => {
+      const dir = temp();
+      const span = quotaSpan();
+      const evidenceDay = iso(at - (daysAgo === 0 ? 1 : 0) * 86_400_000).slice(0, 10);
+      writeSpans(dir, [span], evidenceDay);
+      const unreadablePath = join(dir, `${iso(at - daysAgo * 86_400_000).slice(0, 10)}.jsonl`);
+      // A directory deterministically rejects file reads, even when tests run as root.
+      mkdirSync(unreadablePath);
+      expect(() => readFileSync(unreadablePath, 'utf8')).toThrow(expect.objectContaining({ code: 'EISDIR' }));
+
+      const spans = readSpans({ dir, now: options.now });
+      expect(spans).toEqual([]);
+      expect(markQuotaOnlyFromSpans([textlessRow()], spans)).toEqual([textlessRow()]);
+    });
+
+    it.each([
+      ['unparseable JSON', '{torn json'],
+      ['corrupt event', JSON.stringify({ ...quotaSpan({ statusMessage: genuineError }), event: 'unknown' })],
+      ['unknown version', JSON.stringify({ ...quotaSpan({ statusMessage: genuineError }), v: 999 })],
+    ].flatMap(([label, badLine]) => [1, 2].map(daysAgo => [label, daysAgo, badLine])))(
+      'returns [] for %s only in an older day file at offset %i than the quota spans', (_, daysAgo, badLine) => {
+        const dir = temp();
+        writeSpans(dir, [quotaSpan()]);
+        const day = iso(at - daysAgo * 86_400_000).slice(0, 10);
+        writeFileSync(join(dir, `${day}.jsonl`), `${badLine}\n`);
+
+        const spans = readSpans({ dir, now: options.now });
+        expect(spans).toEqual([]);
+        expect(markQuotaOnlyFromSpans([textlessRow()], spans)).toEqual([textlessRow()]);
+      });
+
     it.each([
       ['unparseable JSON', '{torn json'],
       ['corrupt event', JSON.stringify({ ...quotaSpan({ statusMessage: genuineError }), event: 'unknown' })],
