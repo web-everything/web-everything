@@ -47,12 +47,18 @@ describe('human-only enqueue license', () => {
     r.git(['checkout', '-qb', 'pr', r.approved]); r.git(['commit', '--allow-empty', '-qm', 'retain approved tree']);
     r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
     let diffArgs;
+    const treeReads = [];
     expect(r.prove({ exec: (cmd, args, opts) => {
       if (cmd === 'git' && args.includes('diff-tree')) diffArgs = args;
+      if (cmd === 'git' && args.includes('ls-tree')) treeReads.push(args);
       return r.exec(cmd, args, opts);
     } })).toMatchObject({ licensed: true, tier: 'mechanical' });
-    expect(diffArgs).toEqual(['-c', 'diff.ignoreSubmodules=none', 'diff-tree', '-r', '-z', '--raw', '--no-abbrev',
+    expect(diffArgs).toEqual(['-c', 'core.precomposeUnicode=false', '-c', 'core.quotePath=false',
+      '-c', 'diff.ignoreSubmodules=none', 'diff-tree', '-r', '-z', '--raw', '--no-abbrev',
       '--no-renames', '--ignore-submodules=none', '--no-ext-diff', '--no-textconv', r.approved, r.git(['rev-parse', 'HEAD'])]);
+    expect(treeReads).toEqual([r.git(['rev-parse', 'HEAD']), main].map(ref => [
+      '-c', 'core.precomposeUnicode=false', '-c', 'core.quotePath=false', 'ls-tree', '-r', '-z', '--full-tree', ref,
+    ]));
   });
   it.each([
     ['diff.ignoreSubmodules', '.github/actions/vendor'],
@@ -226,7 +232,7 @@ describe('human-only enqueue license', () => {
     r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
     expect(r.prove()).toMatchObject({ licensed: false, reason: expect.stringMatching(/symlink.*re-approve.*queue/) });
   });
-  it.each(['scripts/ordinary.mjs', 'scripts/ordinary[1].mjs'])('refuses a changed path differing from main using literal bounded tree reads at %s', path => {
+  it.each(['scripts/ordinary.mjs', 'scripts/ordinary[1].mjs', 'scripts/工作.mjs'])('refuses a changed path differing from main using complete bounded tree reads at %s', path => {
     const r = fixture();
     r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
     const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
@@ -238,30 +244,73 @@ describe('human-only enqueue license', () => {
     const reads = [];
     expect(r.prove({ exec: (cmd, args, opts) => {
       if (cmd === 'git' && args.includes('diff')) throw Error('content diff must not be read');
-      if (cmd === 'git' && args.includes('ls-tree') && args.at(-1) === path) reads.push({ args, opts });
+      if (cmd === 'git' && args.includes('ls-tree')) reads.push({ args, opts });
       return r.exec(cmd, args, opts);
     } })).toMatchObject({ licensed: false, reason: expect.stringMatching(/unapproved.*re-approve.*queue/) });
     expect(reads).toEqual([head, main].map(ref => ({
-      args: ['--literal-pathspecs', 'ls-tree', '-z', ref, '--', path],
+      args: ['-c', 'core.precomposeUnicode=false', '-c', 'core.quotePath=false', 'ls-tree', '-r', '-z', '--full-tree', ref],
       opts: expect.objectContaining({ cwd: r.cwd, timeout: 5000, maxBuffer: 8 * 1024 * 1024 }),
     })));
   });
-  it.each(['unreadable', 'oversized', 'non-UTF8', 'malformed'])('refuses %s per-path tree evidence and names the operator fallback', failure => {
+  it.each(['head', 'main'].flatMap(ref => ['unreadable', 'oversized', 'non-UTF8', 'malformed', 'truncated',
+    'duplicate', 'wrong type', 'missing tab', 'empty path', 'unknown mode', 'unicode path', 'control path'].map(failure => [ref, failure])))(
+    'refuses %s complete-tree evidence that is %s and names the operator fallback', (ref, failure) => {
     const r = fixture();
     r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
     const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
-    r.git(['checkout', '-qb', 'pr', r.approved]); r.write('ordinary.md', 'author docs'); r.commit('author docs');
-    r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
+    r.git(['checkout', '-qb', 'pr', r.approved]); r.git(['commit', '--allow-empty', '-qm', 'retain approved tree']);
+    r.git(['merge', '--no-ff', '-m', 'merge main', main]);
+    const head = r.git(['rev-parse', 'HEAD']); r.setHead(head);
+    let injected = false;
     expect(r.prove({ exec: (cmd, args, opts) => {
-      if (cmd === 'git' && args.includes('ls-tree') && args.at(-1) === 'ordinary.md') {
+      if (cmd === 'git' && args.includes('ls-tree') && args.at(-1) === (ref === 'head' ? head : main)) {
+        injected = true;
         if (failure === 'unreadable') throw Error('tree unavailable');
+        if (failure === 'oversized') return Buffer.alloc(8 * 1024 * 1024 + 1);
         if (failure === 'non-UTF8') return Buffer.from([0xff]);
         if (failure === 'malformed') return Buffer.from('unreadable\0');
-        return Buffer.alloc(8 * 1024 * 1024 + 1);
+        const entry = `100644 blob ${'a'.repeat(40)}\tREADME.md\0`;
+        if (failure === 'truncated') return Buffer.from(entry.slice(0, -1));
+        if (failure === 'duplicate') return Buffer.from(entry.repeat(2));
+        if (failure === 'wrong type') return Buffer.from(entry.replace('blob', 'commit'));
+        if (failure === 'missing tab') return Buffer.from(entry.replace('\t', ''));
+        if (failure === 'empty path') return Buffer.from(entry.replace('README.md', ''));
+        if (failure === 'unknown mode') return Buffer.from(entry.replace('100644', '170000'));
+        if (failure === 'unicode path') return Buffer.from(entry.replace('README.md', 'caf\u00e9.md'));
+        if (failure === 'control path') return Buffer.from(entry.replace('README.md', 'bad\u0085.md'));
       }
       return r.exec(cmd, args, opts);
     } })).toMatchObject({ licensed: false, reason: expect.stringMatching(/unreadable or oversized.*re-approve.*queue/) });
+    expect(injected).toBe(true);
   });
+  it.each(['A', 'M', 'D'])('requires a deletion record for a path absent from both complete trees: %s', status => {
+    const r = fixture();
+    r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
+    const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+    r.git(['checkout', '-qb', 'pr', r.approved]); r.git(['commit', '--allow-empty', '-qm', 'retain approved tree']);
+    r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
+    const oldMode = status === 'A' ? '000000' : '100644';
+    const newMode = status === 'D' ? '000000' : '100644';
+    const oldId = (status === 'A' ? '0' : 'a').repeat(40);
+    const newId = (status === 'D' ? '0' : 'b').repeat(40);
+    const result = r.prove({ exec: (cmd, args, opts) => cmd === 'git' && args.includes('diff-tree')
+      ? Buffer.from(`:${oldMode} ${newMode} ${oldId} ${newId} ${status}\0missing.md\0`) : r.exec(cmd, args, opts) });
+    expect(result).toMatchObject(status === 'D' ? { licensed: true, tier: 'mechanical' }
+      : { licensed: false, reason: expect.stringMatching(/re-approve.*queue/) });
+  });
+  it.each(['cafe\u0301.md', 'caf\u00e9.md', 'bad\n.md', 'bad\t.md', 'bad\u007f.md', 'bad\u0085.md'])(
+    'refuses ambiguous Unicode or control characters in raw diff paths: %j', path => {
+      const r = fixture();
+      r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
+      const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+      r.git(['checkout', '-qb', 'pr', r.approved]); r.git(['commit', '--allow-empty', '-qm', 'retain approved tree']);
+      r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
+      expect(r.prove({ exec: (cmd, args, opts) => {
+        if (cmd === 'git' && args.includes('diff-tree')) return Buffer.from(rawChange(path));
+        if (cmd === 'git' && args.includes('ls-tree')) return Buffer.from(`100644 blob ${'b'.repeat(40)}\t${path}\0`);
+        return r.exec(cmd, args, opts);
+      } })).toMatchObject({ licensed: false, reason: expect.stringMatching(/re-approve.*queue/) });
+    });
   it('refuses a main merge with more than 1024 paths and names the operator fallback', () => {
     const r = fixture();
     r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');

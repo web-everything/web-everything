@@ -26,6 +26,9 @@ export function resolveApprovalLicensesEnqueue({ env = process.env, readFile = r
 const SHA = /^[0-9a-f]{40}$/;
 const MAX_BYTES = 8 * 1024 * 1024;
 const MAX_PATHS = 1024;
+const RAW_PATH_CONFIG = ['-c', 'core.precomposeUnicode=false', '-c', 'core.quotePath=false'];
+const readablePath = path => path && path.normalize('NFC') === path.normalize('NFD')
+  && !/\p{Cc}/u.test(path) && !normalizeGatePath(path).split('/').includes('..');
 const refuse = reason => ({ licensed: false, reason: `${reason}; operator must re-approve the current head or queue it` });
 
 /** Recorded operator clearance licenses only an exact head or a proven mechanical successor. Never throws. */
@@ -78,7 +81,7 @@ export function proveHumanOnlyLicense({ repo, pr, headSha, exec, cwd, readCommen
     }
     git(['merge-base', '--is-ancestor', parents[2], main]);
     // Tree modes must remain visible regardless of local submodule-ignore or diff-driver settings.
-    const diff = git(['-c', 'diff.ignoreSubmodules=none', 'diff-tree', '-r', '-z', '--raw', '--no-abbrev',
+    const diff = git([...RAW_PATH_CONFIG, '-c', 'diff.ignoreSubmodules=none', 'diff-tree', '-r', '-z', '--raw', '--no-abbrev',
       '--no-renames', '--ignore-submodules=none', '--no-ext-diff', '--no-textconv', approved, headSha]);
     if (diff && !diff.endsWith('\0')) return refuse('successor diff incomplete');
     const records = diff ? diff.slice(0, -1).split('\0') : [];
@@ -90,20 +93,34 @@ export function proveHumanOnlyLicense({ repo, pr, headSha, exec, cwd, readCommen
       if (!entry) return refuse('successor tree evidence unreadable');
       if (entry[1] === '160000' || entry[2] === '160000') return refuse('successor changes a gitlink');
       if (entry[1] === '120000' || entry[2] === '120000') return refuse('successor changes a symlink');
-      paths.push(records[i + 1]);
+      const path = records[i + 1];
+      if (!readablePath(path)) return refuse('successor path unreadable');
+      paths.push({ path, deleted: entry[2] === '000000' });
     }
-    const blob = (ref, path) => {
-      const tree = git(['--literal-pathspecs', 'ls-tree', '-z', ref, '--', path]);
-      if (tree === '') return null; // proven absent, including a deletion inherited from main
-      const tab = tree.indexOf('\t');
-      if (!/^100(?:644|755) blob [0-9a-f]{40}$/.test(tree.slice(0, tab)) || tree.slice(tab + 1) !== `${path}\0`) throw Error('regular blob evidence unreadable');
-      const [mode, , id] = tree.slice(0, tab).split(' ');
-      return `${mode} ${id}`;
+    const readTree = ref => {
+      // Read the entire bounded tree: pathspec normalization must never turn a present path into absence.
+      const tree = git([...RAW_PATH_CONFIG, 'ls-tree', '-r', '-z', '--full-tree', ref]);
+      if (tree && !tree.endsWith('\0')) throw Error('complete tree evidence unreadable');
+      const entries = new Map();
+      for (const record of tree ? tree.slice(0, -1).split('\0') : []) {
+        const tab = record.indexOf('\t');
+        const entry = /^(100644|100755|120000|160000) (blob|commit) ([0-9a-f]{40})$/.exec(record.slice(0, tab));
+        const path = record.slice(tab + 1);
+        if (tab < 0 || !entry || (entry[1] === '160000') !== (entry[2] === 'commit')
+          || !readablePath(path) || entries.has(path)) throw Error('complete tree evidence unreadable');
+        entries.set(path, `${entry[1]} ${entry[3]}`);
+      }
+      return entries;
     };
-    for (const path of paths) {
-      if (!path || normalizeGatePath(path).split('/').includes('..')) return refuse('successor path unreadable');
+    const headTree = readTree(headSha);
+    const mainTree = readTree(main);
+    for (const { path, deleted } of paths) {
       // Every changed path must carry exactly main's mode and bytes, regardless of its name or content.
-      if (blob(headSha, path) !== blob(main, path)) return refuse('successor changes an unapproved path differing from main');
+      const headEntry = headTree.get(path);
+      const mainEntry = mainTree.get(path);
+      if (headEntry !== mainEntry || (headEntry === undefined && !deleted)) {
+        return refuse('successor changes an unapproved path differing from main');
+      }
     }
     return { licensed: true, tier: 'mechanical', reason: 'approved ancestor retained; every changed path matches main mode and blob' };
   } catch {
