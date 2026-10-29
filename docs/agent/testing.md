@@ -1907,6 +1907,17 @@ separate from transient infrastructure failures and their retry streak.
 
 ### Direct heavy-run hook probes
 
+Pool maintenance uses health-watch's existing tick and `scheduled-lane-maintenance.mjs`.
+Its per-pool `.maintenance-stamp.json` records attempts before running the trim and gc
+CLIs under a shared stamp lock; the interval is at least 24h, even with a shorter
+`lanes.gc.schedule`. Invalid/oversized/future stamps refuse work: inspect and repair the
+named stamp before retrying. Dry-run ticks do not consume the schedule. The named tests in
+`scripts/lib/__tests__/scheduled-lane-maintenance.test.mjs` cover restart suppression,
+lock contention, subprocess failures, du byte accounting, real trim lease protection,
+and GC refusing lease markers (including a marker appearing during host admission).
+GC conservatively skips even stale or malformed markers; lease reclamation stays with
+lane-pool's existing trim/recovery paths.
+
 Daemon clone GC is serialized by `clone-maintenance.mjs` with the shared WRITE lock;
 keep Git asynchronous so its lock heartbeat can run during packing. The named cases in
 `scripts/lib/__tests__/clone-maintenance.test.mjs` cover lock contention, persisted rate
