@@ -62,6 +62,14 @@ exit 3
 });
 afterEach(async () => {await rm(root,{recursive:true,force:true});});
 describe('fixed wrapper security boundary', () => {
+  it('does not certify a rejected reply after the protected run phase started', async () => {
+    await writeFile(join(root,'receipts',request.run+'.running'), JSON.stringify({v:1,nonce:request.nonce,run:request.run}));
+    await rm(join(root,'receipts',request.run+'.prepared'));
+    await writeFile(join(root,'receipts',request.run+'.rejected'), JSON.stringify({v:1,nonce:request.nonce,run:request.run,
+      phase:'rejected',reason:'snapshot-rejected',siblings:true}));
+    expect(await runner.finish(request)).toBeNull();
+  });
+
   it('real Vitest -t --help skips execution but cannot produce a certified success', async () => {
     const queue = fileURLToPath(new URL('../heavy-admission.mjs', import.meta.url));
     const vitest = fileURLToPath(new URL('../../../node_modules/vitest/vitest.mjs', import.meta.url));
@@ -897,5 +905,45 @@ if (globalThis.loaded !== ${tests.length}) process.exit(9);
     expect(selected.has('scripts/__tests__/credentials.js')).toBe(true);
     expect(selected.has('notes.test.txt')).toBe(false);
     expect(selected.has('support.js')).toBe(false);
+  });
+});
+
+
+describe('sibling manifest verification', () => {
+  async function withSiblings() {
+    const sibling = join(root,'runs',request.run,'frontierui');
+    const entries=[];
+    for (const subtree of ['plugs','webtheme']) {
+      await mkdir(join(sibling,subtree),{recursive:true});
+      await writeFile(join(sibling,subtree,'index.js'),subtree);
+      entries.push({path:Buffer.from(`${subtree}/index.js`),sha256:hash(subtree),executable:false});
+    }
+    request.manifest.siblings={frontierui:{sha:'a'.repeat(40),...manifestAPI.manifestWire({entries,excluded:[]})}};
+    request.manifestDigest=manifestAPI.digestManifest(request.manifest);
+    request.siblingShas={frontierui:'a'.repeat(40)};
+    return sibling;
+  }
+  it('advertises sibling support and puts the sibling SHA in protected receipts', async () => {
+    expect(await runner.prepare({nonce:request.nonce})).toMatchObject({capabilities:{siblings:1}});
+    await withSiblings();
+    expect((await runner.run(request)).code).toBe(3);
+    expect(await runner.finish(request)).toMatchObject({siblingShas:request.siblingShas});
+  });
+  it.each(['extra','missing','outside allowlist','wrong sha','missing sha','oversized'])
+  ('rejects %s sibling evidence and writes protected rejected state before executing', async fault => {
+    const sibling=await withSiblings();
+    if (fault==='extra') await writeFile(join(sibling,'plugs/extra.js'),'extra');
+    if (fault==='missing') await rm(join(sibling,'webtheme/index.js'));
+    if (fault==='outside allowlist') request.manifest.siblings.frontierui.paths=Buffer.from('other/index.js\0').toString('base64');
+    if (fault==='wrong sha') request.siblingShas.frontierui='0'.repeat(40);
+    if (fault==='missing sha') delete request.siblingShas;
+    if (fault==='oversized') request.manifest.siblings.frontierui.excluded='x'.repeat(4*1024*1024);
+    request.manifestDigest=manifestAPI.digestManifest(request.manifest);
+    await expect(runner.run(request)).rejects.toThrow();
+    await expect(readFile(join(root,'install.log'))).rejects.toMatchObject({code:'ENOENT'});
+    const rejected=join(root,'receipts',request.run+'.rejected');
+    expect(JSON.parse(await readFile(rejected,'utf8'))).toMatchObject({nonce:request.nonce,run:request.run,phase:'rejected'});
+    expect((await stat(rejected)).mode & 0o777).toBe(0o600);
+    expect(await runner.finish(request)).toMatchObject({phase:'rejected',started:false});
   });
 });

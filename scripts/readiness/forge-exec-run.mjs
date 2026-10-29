@@ -13,6 +13,14 @@ const runName = value => typeof value === 'string' && /^r-[a-f0-9]{32}$/.test(va
 const nonceOK = value => typeof value === 'string' && /^[a-f0-9]{32}$/.test(value);
 const sha = value => createHash('sha256').update(value).digest('hex');
 export const digestArgv = argv => sha(JSON.stringify(argv));
+import {SIBLING_PATHS} from './forge-exec-siblings.mjs';
+export {SIBLING_PATHS};
+const siblingPrefixes = Object.values(SIBLING_PATHS).map(path => Buffer.from(path.slice('../frontierui/'.length)+'/'));
+export const siblingShas = manifest => manifest.siblings ? {frontierui:manifest.siblings.frontierui.sha} : undefined;
+export const sameSiblingShas = (actual, expected) => expected !== undefined && actual !== undefined
+  && Object.keys(actual).join(',') === 'frontierui' && Object.keys(expected).join(',') === 'frontierui'
+  && typeof expected.frontierui === 'string' && /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(expected.frontierui) && actual.frontierui === expected.frontierui;
+
 // Shared by the client and fixed wrapper through allowedCommand. Match spellings exactly.
 export const VITEST_ALLOWED_OPTIONS = Object.freeze([
   '--run', '--silent', '--no-color',
@@ -122,11 +130,12 @@ export function splitPaths(bytes) {
   return paths;
 }
 export const nulPaths = paths => Buffer.concat(paths.flatMap(path => [path, Buffer.from([0])]));
-export const manifestWire = ({entries, excluded}) => ({
+export const manifestWire = ({entries, excluded, siblings}) => ({
   paths:nulPaths(entries.map(entry => entry.path)).toString('base64'),
   hashes:entries.map(entry => entry.sha256),
   executable:entries.map(entry => entry.executable),
   excluded:nulPaths(excluded).toString('base64'),
+  ...(siblings ? {siblings:{frontierui:{sha:siblings.frontierui.sha,...manifestWire(siblings.frontierui)}}} : {}),
 });
 export const digestManifest = manifest => sha(JSON.stringify(manifest));
 
@@ -143,8 +152,9 @@ export async function readManifestFile(path, st, fs = filesystem) {
   } finally {await fd.close();}
 }
 
-export async function verifyManifest(root, manifest, manifestDigest, {fs = filesystem} = {}) {
-  if (!manifest || Object.keys(manifest).sort().join(',') !== 'excluded,executable,hashes,paths'
+export async function verifyManifest(root, manifest, manifestDigest, {fs = filesystem, sibling = false} = {}) {
+  const keys = manifest && Object.keys(manifest).sort().join(',');
+  if (!manifest || !['excluded,executable,hashes,paths', ...(!sibling ? ['excluded,executable,hashes,paths,siblings'] : [])].includes(keys)
     || !hex(manifestDigest) || Buffer.byteLength(JSON.stringify(manifest)) > LIMIT
     || digestManifest(manifest) !== manifestDigest) throw new Error('Manifest digest mismatch or limit exceeded; use local fallback');
   const decode = value => {
@@ -160,6 +170,8 @@ export async function verifyManifest(root, manifest, manifestDigest, {fs = files
     || manifest.hashes.length !== paths.length || manifest.executable.length !== paths.length
     || !manifest.hashes.every(hex) || !manifest.executable.every(v => typeof v === 'boolean')) throw new Error('Invalid manifest hashes or executable bits');
   validateTestNames(paths);
+  if (sibling && [...paths,...excluded].some(path => !siblingPrefixes.some(prefix => path.subarray(0,prefix.length).equals(prefix))))
+    throw new Error('Unsupported sibling manifest path');
   const expected = new Map(paths.map((path, i) => [path.toString('hex'), {path, sha256:manifest.hashes[i], executable:manifest.executable[i]}]));
   for (const path of excluded) if (expected.has(path.toString('hex')) || isTestFile(path) || /\.(test|spec)\./.test(pathParts(path).at(-1).toString('latin1')))
     throw new Error('Manifest excluded test or overlapping path');
@@ -197,6 +209,14 @@ export async function verifyManifest(root, manifest, manifestDigest, {fs = files
   observed.sort(Buffer.compare); tests.sort(Buffer.compare);
   const same = (a,b) => a.length === b.length && a.every((p,i) => p.equals(b[i]));
   if (!same(paths, observed) || !same(paths.filter(isTestFile), tests)) throw new Error('Manifest inventory or test set mismatch');
+  if (Object.hasOwn(manifest,'siblings')) {
+    if (!manifest.siblings || typeof manifest.siblings !== 'object' || Object.keys(manifest.siblings).join(',') !== 'frontierui') throw new Error('Unsupported sibling manifest');
+    const section = manifest.siblings.frontierui;
+    if (!section || Object.keys(section).sort().join(',') !== 'excluded,executable,hashes,paths,sha'
+      || !sameSiblingShas({frontierui:section.sha},{frontierui:section.sha})) throw new Error('Invalid sibling SHA or manifest');
+    const {sha:revision,...snapshot} = section;
+    await verifyManifest(join(root,'../frontierui'),snapshot,digestManifest(snapshot),{fs,sibling:true});
+  }
   return {entries:paths.map(path => expected.get(path.toString('hex'))), testPaths:tests};
 }
 
@@ -386,7 +406,7 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
     await walk(dir);return found;
   }
   return {
-    async prepare({nonce,label}) {
+    async prepare({nonce,label,siblings}) {
       await init();
       if(!nonceOK(nonce) || (label!==undefined && (typeof label!=='string' || !/^[a-z0-9][a-z0-9-]{5,63}$/.test(label)))) throw new Error('Invalid prepare');
       const run='r-'+randomBytes(16).toString('hex');
@@ -397,20 +417,35 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
         const result=await execute('/usr/bin/sudo',['-n','/usr/bin/chown','forge-exec:forge-exec',work]);
         if(result.code) throw new Error('Worker ownership failed');
       }
+      if (siblings === true) {
+        const sibling = join(runs,run,'frontierui');
+        await mkdir(sibling,{mode:0o755});
+        if (!testRoot && (await execute('/usr/bin/sudo',['-n','/usr/bin/chown','forge-exec:forge-exec',sibling])).code)
+          throw new Error('Sibling ownership failed');
+      }
       await writeFile(statePath(run,'prepared'),JSON.stringify({v:1,nonce,run}),{flag:'wx',mode:0o600});
-      return {run};
+      return {run,capabilities:{siblings:1}};
     },
     async run(request) {
       const prepared=await state(request,'prepared');
+      try {
       if(!allowedCommand(request.argv) || !allowedEnv(request.env) || !hex(request.lock) || !hex(request.inputDigest)
         || request.argvDigest!==digestArgv(request.argv)) throw new Error('Invalid execution parameters');
-      return exclusiveWorker(async command => {
+      return await exclusiveWorker(async command => {
       const container=join(runs,request.run),work=join(container,'work');
       await directory(container,true); await directory(work);
       // Preserve the dual-lock refusal before inspecting snapshot differences.
       const lock = await digestLock(work);
       // Verify before npm or cache extraction can add generated files.
       await verifyManifest(work,request.manifest,request.manifestDigest);
+      if (request.manifest.siblings) {
+        if (!sameSiblingShas(request.siblingShas,siblingShas(request.manifest))) throw new Error('Sibling SHA mismatch');
+      } else {
+        if (request.siblingShas !== undefined) throw new Error('Unexpected sibling SHA');
+        const sibling = join(container,'frontierui');
+        const info = await lstat(sibling).catch(error => {if(error.code !== 'ENOENT') throw error;});
+        if (info && (info.isSymbolicLink() || !info.isDirectory() || (await readdir(sibling)).length)) throw new Error('Extra sibling snapshot');
+      }
       if(await digestInput(work)!==request.inputDigest || lock!==request.lock) throw new Error('Input digest mismatch');
       await rename(statePath(request.run,'prepared'),statePath(request.run,'running'));
       let phase='install',result={code:97,stdout:'',stderr:''};
@@ -418,7 +453,7 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
       // validated snapshot, including workspace manifests and local dependency
       // contents, so a warm archive represents the same install inputs. Earlier
       // profiles lack this binding (v3 also allowed an unkeyed shrinkwrap).
-      const profile=join(cache,request.lock,'dev-v5-'+request.inputDigest);
+      const profile=join(cache,request.lock,'dev-v5-'+(request.manifest.siblings ? request.manifestDigest : request.inputDigest));
       const installEnv={PATH:path,HOME:join(work,'.forge-home'),LANG:'C',CI:'true',NODE_ENV:'development'};
       try {
         // These parents are inaccessible to forge-exec; reject symlinked cache state.
@@ -457,10 +492,19 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
         phase='test';
         result=await command(request.argv,work,{PATH:path,HOME:join(work,'.forge-home'),...request.env});
       } catch(error) {const code=phase==='install'?97:254; if(phase==='test') phase='supervisor'; result={code,stdout:result.stdout,stderr:String(error.message)};}
-      const receipt={...prepared,manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code};
+      const receipt={...prepared,...(request.manifest.siblings ? {siblingShas:siblingShas(request.manifest)} : {}),manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code};
       await writeFile(statePath(request.run,'receipt'),JSON.stringify(receipt),{flag:'wx',mode:0o600});
       return result;
       });
+      } catch (error) {
+        // A separately installed runner must publish pre-execution rejection in
+        // protected ops state. Never infer not-started from worker-owned files.
+        const stillPrepared = await lstat(statePath(request.run,'prepared')).catch(e => {if(e.code !== 'ENOENT') throw e;});
+        if (stillPrepared) {
+          await writeFile(statePath(request.run,'rejected'),JSON.stringify({...prepared,phase:'rejected',reason:'snapshot-rejected',siblings:!!request.manifest?.siblings}),{flag:'wx',mode:0o600}).catch(async e => {if (e.code !== 'EEXIST') throw e; await state(request,'rejected');});
+        }
+        throw error;
+      }
     },
     async finish(request) {
       // Only the protected state is evidence; receipt-like files in work are data.
@@ -483,7 +527,11 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
       if(remaining) throw new Error('Run cleanup incomplete; use local fallback and inspect protected run state');
       await rename(statePath(request.run,phase),statePath(request.run,'consumed'));
       await rm(statePath(request.run,'receipt'),{force:true});
-      return receipt??null;
+      const rejected = await readPinned(statePath(request.run,'rejected')).then(bytes => JSON.parse(bytes),error => {if(error.code !== 'ENOENT') throw error;});
+      await rm(statePath(request.run,'rejected'),{force:true});
+      // Legacy callers retain their null finish response for non-sibling failures.
+      // Never certify rejection once the protected run phase has started.
+      return receipt ?? (phase === 'prepared' && rejected?.siblings ? {...rejected,started:false} : null) ?? null;
     },
   };
 }
