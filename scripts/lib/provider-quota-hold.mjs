@@ -4,7 +4,7 @@ export const CODEX_QUOTA_FULL_PERCENT = 98;
 
 export function isQuotaError(text) {
   return typeof text === 'string'
-    && /\b(rate[ _-]?limit|usage limit|quota|insufficient[_ ]quota|resource[_ ]exhausted|too many requests|429|you['’]ve hit your (?:weekly |daily |monthly )?limit)\b/i.test(text);
+    && /\b(rate[ _-]limit(?:_error)?|usage limit reached|insufficient_quota|resource_exhausted|too many requests|(?:HTTP|status)\s+429|you exceeded your current quota|you['’]ve hit your (?:weekly |daily |monthly )?limit)\b/i.test(text);
 }
 
 export function quotaHoldRow({ provider, error, now = Date.now() }) {
