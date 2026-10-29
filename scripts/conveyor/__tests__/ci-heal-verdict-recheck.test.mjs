@@ -106,6 +106,7 @@ describe('R10 escalation send-back regressions', () => {
       { name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE' },
     ];
     const result = verdictRecheck.gateOnlyRedStates({ requiredChecks, rollup });
+    expect.soft(verdictRecheck.gateOnlyRedStates({ drainGateSettings: { drainBlocksOnCodeQL: true }, requiredChecks, rollup }).gateOnlyRed).toBe(false);
     expect.soft(result.gateOnlyRed).toBe(false);
     expect.soft(result.red).toContain('CodeQL');
     expect(await checkNeedsHumanEscalable({
@@ -139,8 +140,8 @@ describe('R10 escalation send-back regressions', () => {
       const evidence = { requiredChecks: ['test'], rollup: [
         { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
         { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
-        { name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE', run_attempt: 1 },
-        { name: 'CODEQL', status: 'COMPLETED', conclusion, run_attempt: 2 },
+        { name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE', run_attempt: 1, completedAt: '2026-10-28T12:00:00-04:00' },
+        { name: 'CODEQL', status: 'COMPLETED', conclusion, run_attempt: 2, completedAt: '2026-10-28T13:00:00-04:00' },
       ] };
       for (const drainBlocksOnCodeQL of [false, true]) {
         expect(verdictRecheck.gateOnlyRedStates({ ...evidence, drainGateSettings: { drainBlocksOnCodeQL } }).gateOnlyRed)
@@ -212,7 +213,7 @@ describe('requiredCheckStates shared predicate regressions', () => {
     }
   });
 
-  it.each([false, true])('same-run or mixed-identity decisive ranks beat timestamps when secondary ranks are partial (reverse=%s)', reverse => {
+  it.each([false, true])('timestamps beat workflow metadata even when secondary ranks are partial (reverse=%s)', reverse => {
     for (const [olderMetadata, newerMetadata] of [
       [{ run_attempt: 1, id: 100 }, { run_attempt: 2 }],
       [{ run_id: 100, run_attempt: 1, id: 100 }, { run_id: 100, run_attempt: 2 }],
@@ -223,7 +224,7 @@ describe('requiredCheckStates shared predicate regressions', () => {
         { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T01:00:00Z', ...newerMetadata },
       ];
       expect(requiredCheckStates({ requiredChecks: ['test'], rollup: reverse ? rows.toReversed() : rows }))
-        .toEqual({ red: ['test'], pending: [], missing: [], green: [] });
+        .toEqual({ red: [], pending: [], missing: [], green: ['test'] });
     }
   });
 
@@ -236,10 +237,10 @@ describe('requiredCheckStates shared predicate regressions', () => {
       .toEqual({ red: [], pending: [], missing: [], green: ['test'] });
   });
 
-  it.each([false, true])('a newer workflow run supersedes an earlier rerun across verdict readers (reverse=%s)', reverse => {
+  it.each([false, true])('R1b: later completion in a different workflow run wins across verdict readers (reverse=%s)', reverse => {
     const runs = [
-      { name: 'test', run_id: 100, run_attempt: 2, id: 1001, status: 'COMPLETED', conclusion: 'SUCCESS' },
-      { name: 'test', run_id: 200, run_attempt: 1, id: 2001, status: 'COMPLETED', conclusion: 'FAILURE' },
+      { name: 'test', run_id: 100, run_attempt: 2, id: 1001, completedAt: '2026-10-28T12:00:00-04:00', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { name: 'test', run_id: 200, run_attempt: 1, id: 2001, completedAt: '2026-10-28T13:00:00-04:00', status: 'COMPLETED', conclusion: 'FAILURE' },
     ];
     const evidence = { ...input, requiredChecks: ['test'], rollup: [
       ...(reverse ? runs.toReversed() : runs),
@@ -251,7 +252,7 @@ describe('requiredCheckStates shared predicate regressions', () => {
     expect(ciGreenForEscalation(evidence)).toBe(false);
   });
 
-  it.each([false, true])('timestamp and attempt ranking coexist per normalized name (reverse=%s)', reverse => {
+  it.each([false, true])('timestamps and check-run ids rank per normalized name (reverse=%s)', reverse => {
     const rows = [
       { name: 'TEST', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-28T01:00:00Z' },
       { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T02:00:00Z' },
@@ -261,7 +262,7 @@ describe('requiredCheckStates shared predicate regressions', () => {
       { __typename: 'StatusContext', context: 'LEGACY', state: 'FAILURE', completedAt: '2026-10-28T02:00:00Z' },
     ];
     expect(requiredCheckStates({ requiredChecks: ['Test', 'build', 'Legacy'], rollup: reverse ? rows.toReversed() : rows }))
-      .toEqual({ red: ['Test', 'Legacy'], pending: [], missing: [], green: ['build'] });
+      .toEqual({ red: ['Test', 'build', 'Legacy'], pending: [], missing: [], green: [] });
   });
 
   it.each([false, true])('legacy metadata cannot displace a CheckRun from the preferred tier (reverse=%s)', reverse => {
@@ -273,13 +274,31 @@ describe('requiredCheckStates shared predicate regressions', () => {
       .toEqual({ red: ['test'], pending: [], missing: [], green: [] });
   });
 
+  it.each([false, true])('an untagged row outranks a legacy StatusContext (reverse=%s)', reverse => {
+    const rows = [
+      { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T01:00:00Z' },
+      { __typename: 'StatusContext', context: 'test', state: 'SUCCESS', id: 100 },
+    ];
+    expect(requiredCheckStates({ requiredChecks: ['test'], rollup: reverse ? rows.toReversed() : rows }))
+      .toEqual({ red: ['test'], pending: [], missing: [], green: [] });
+  });
+
+  it.each([false, true])('an undated PENDING StatusContext beats an older dated SUCCESS (reverse=%s)', reverse => {
+    const rows = [
+      { __typename: 'StatusContext', context: 'test', state: 'SUCCESS', completedAt: '2026-10-28T01:00:00Z' },
+      { __typename: 'StatusContext', context: 'test', state: 'PENDING' },
+    ];
+    expect(requiredCheckStates({ requiredChecks: ['test'], rollup: reverse ? rows.toReversed() : rows }))
+      .toEqual({ red: [], pending: ['test'], missing: [], green: [] });
+  });
+
   it.each(['CANCELLED', 'STALE'])('required %s is pending, never red or missing', conclusion => {
     expect(requiredCheckStates({ ...input, requiredChecks: ['Test'], rollup: [
       { name: 'Test', status: 'COMPLETED', conclusion },
     ] })).toEqual({ red: [], pending: ['Test'], missing: [], green: [] });
   });
 
-  it.each([false, true])('numeric run_attempt beats timestamps in either row order (reverse=%s)', reverse => {
+  it.each([false, true])('timestamps beat numeric run_attempt in either row order (reverse=%s)', reverse => {
     const rollup = [
       { name: 'Test', status: 'COMPLETED', conclusion: 'SUCCESS', run_attempt: 2, id: 10,
         startedAt: '2026-10-09T02:00:00Z', completedAt: '2026-10-09T02:01:00Z' },
@@ -287,15 +306,32 @@ describe('requiredCheckStates shared predicate regressions', () => {
         startedAt: '2026-10-09T04:00:00Z', completedAt: '2026-10-09T04:01:00Z' },
     ];
     expect(requiredCheckStates({ ...input, requiredChecks: ['Test'], rollup: reverse ? rollup.toReversed() : rollup }))
-      .toEqual({ red: [], pending: [], missing: [], green: ['Test'] });
+      .toEqual({ red: ['Test'], pending: [], missing: [], green: [] });
   });
 
   it('the latest failed attempt cannot be hidden by an older green attempt', () => {
-    expect(requiredCheckStates({ ...input, requiredChecks: ['Test'], rollup: [
-      { name: 'Test', status: 'COMPLETED', conclusion: 'FAILURE', run_attempt: 2 },
-      { name: 'Test', status: 'COMPLETED', conclusion: 'SUCCESS', run_attempt: 1 },
-    ] })).toEqual({ red: ['Test'], pending: [], missing: [], green: [] });
+    const older = { name: 'Test', status: 'COMPLETED', conclusion: 'SUCCESS', run_attempt: 1,
+      completedAt: '2026-10-28T01:00:00Z' };
+    const newer = { name: 'Test', status: 'COMPLETED', conclusion: 'FAILURE', run_attempt: 2,
+      completedAt: '2026-10-28T02:00:00Z' };
+    for (const rollup of [[older, newer], [newer, older]]) {
+      expect(requiredCheckStates({ ...input, requiredChecks: ['Test'], rollup }))
+        .toEqual({ red: ['Test'], pending: [], missing: [], green: [] });
+    }
   });
+
+  it.each(['created_at', 'createdAt', 'startedAt'])(
+    'legacy StatusContext attempts rank by %s in both input orders', field => {
+      const older = { __typename: 'StatusContext', context: 'Test', state: 'SUCCESS',
+        [field]: '2026-10-28T01:00:00Z' };
+      const newer = { __typename: 'StatusContext', context: 'Test', state: 'FAILURE',
+        [field]: '2026-10-28T02:00:00Z' };
+      for (const rollup of [[older, newer], [newer, older]]) {
+        expect(requiredCheckStates({ ...input, requiredChecks: ['Test'], rollup }))
+          .toEqual({ red: ['Test'], pending: [], missing: [], green: [] });
+      }
+    },
+  );
 
   it('an unknown completed conclusion fails closed red with its original-case name', () => {
     expect(requiredCheckStates({ ...input, requiredChecks: ['Test'], rollup: [
@@ -445,5 +481,31 @@ describe('void needs-human settings and green evidence', () => {
     expect(ciGreenForEscalation({ rollup: [{ ...rollup[0], status: 'IN_PROGRESS' }], requiredChecks: checks })).toBe(false);
     expect(ciGreenForEscalation({ rollup: [], requiredChecks: checks })).toBe(false);
     expect(ciGreenForEscalation({ rollup, requiredChecks: [] })).toBe(false);
+  });
+});
+
+
+describe('R4 shared ranking across verdict readers', () => {
+  it.each([false, true])('older-run rerun failure completed later stays red (reverse=%s)', reverse => {
+    const rows = [
+      { name: 'test', run_id: 200, run_attempt: 1, id: 2001, status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-28T12:00:00-04:00' },
+      { name: 'test', run_id: 100, run_attempt: 2, id: 1001, status: 'COMPLETED', conclusion: 'FAILURE', completed_at: '2026-10-28T13:00:00-04:00' },
+    ];
+    const evidence = { ...input, requiredChecks: ['test'], rollup: [
+      ...(reverse ? rows.toReversed() : rows),
+      { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+    ] };
+    expect(requiredCheckStates(evidence)).toEqual({ red: ['test'], pending: [], missing: [], green: [] });
+    expect(contradictingChecks(evidence)).toEqual(['test']);
+    expect(ciGreenForEscalation(evidence)).toBe(false);
+    expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(false);
+  });
+
+  it.each([false, true])('equal timestamps use BigInt-exact ids without workflow ranks (reverse=%s)', reverse => {
+    const rows = [
+      { name: 'test', id: '9007199254740992', run_attempt: 99, status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-28T12:00:00-04:00' },
+      { name: 'test', id: '9007199254740993', status: 'COMPLETED', conclusion: 'FAILURE', completed_at: '2026-10-28T12:00:00-04:00' },
+    ];
+    expect(requiredCheckStates({ requiredChecks: ['test'], rollup: reverse ? rows.toReversed() : rows }).red).toEqual(['test']);
   });
 });

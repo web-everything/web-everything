@@ -57,8 +57,11 @@ import { collectCiAuthDiagnosis, renderCiAuthDiagnosis } from './ci-auth-diagnos
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { isBudgetRefusal, postPrComment, recordOwedWrite, resolveOwedRepo } from './ci-heal-owed.mjs';
-import { resolveCiHealVerdictSettings, unsettledRequiredChecks, gateOnlyRedStates, ciGreenForEscalation } from './ci-heal-verdict-recheck.mjs';
-import { excusePrMergeGateHolds } from '../lib/merge-gate-hold-class.mjs';
+import { resolveCiHealVerdictSettings, unsettledRequiredChecks, gateOnlyRedStates, ciGreenForEscalation, sameSha } from './ci-heal-verdict-recheck.mjs';
+import { latestAttempts } from '../lib/check-state-predicate.mjs';
+import { excusePrMergeGateHolds, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
+import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
+import { runGhSync } from '../lib/gh-throttle.mjs';
 import { HUMAN_REVIEW_HOLD_GATES } from '../lib/merge-gate-verdict.mjs';
 
 /**
@@ -363,9 +366,7 @@ export function notCiBreakRecordRefusal({ headSha, pr, requiredChecks }) {
 
 /** Refuse a human CI escalation only when required CI is green and review/merge gates alone are red. Pure. */
 export function needsHumanGateOnlyRefusal({ headSha, pr, requiredChecks }) {
-  const head = String(headSha ?? '').trim().toLowerCase();
-  const prHead = String(pr?.headRefOid ?? '').trim().toLowerCase();
-  if (!head || !prHead || !(prHead.startsWith(head) || head.startsWith(prHead))) return null;
+  if (!sameSha(headSha, pr?.headRefOid)) return null;
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return null;
   // A cancelled, stale, running, or missing required check may need human help.
   // Gate-only red describes failures, not whether the rest of CI finished green.
@@ -429,47 +430,74 @@ export function postOrOweCiHealEscalation({ pr, body, headSha, repo, post = post
 /**
  * card x9zznl9 — the CLI's IO for {@link notCiBreakRecordRefusal}: read the PR's head + check rollup and the repo's
  * required-check set, then judge. Returns `{ refusal: string|null, warning?: string }`. A failed read never blocks the
- * escalation (`refusal: null` plus a warning) — the daemon-side void still catches a verdict that turns out wrong.
+ * escalation (`refusal: null` plus a warning) unless check facts remain available: a classifier read failure
+ * preserves the required-check refusal and adds a warning.
  * Off (`ci-heal-verdict-settings.json`) or any other outcome → `{ refusal: null }` with no read at all.
  */
 export async function checkNotCiBreakRecordable(options = {}) {
   return checkEscalationRecordable(options, 'not-a-ci-break', notCiBreakRecordRefusal);
 }
 
-/** Both preflights use the same settings switch, readers, and read-failure policy. */
+/** Both preflights share settings and classification; needs-human permits recording on classifier read failures. */
 async function checkEscalationRecordable({ pr, repo, headSha, outcome, settings = resolveCiHealVerdictSettings(),
-  readPr = defaultReadPrChecks, readRequired = defaultReadRequiredChecks }, expectedOutcome, refusalFor) {
+  prChecksOptions, readPr = args => defaultReadPrChecks(args, prChecksOptions),
+  readRequired = defaultReadRequiredChecks }, expectedOutcome, refusalFor) {
   if (outcome !== expectedOutcome || !settings?.recheckNotCiBreak) return { refusal: null };
+  const warningFor = error => `could not re-check required checks before recording ${expectedOutcome}: ${String(error?.message || error).split('\n')[0]}`;
   try {
     const facts = await readPr({ pr, repo });
     const { checks } = await readRequired({ repo: repo ?? facts?.slug ?? null });
-    return { refusal: refusalFor({ headSha, pr: facts, requiredChecks: checks }) };
+    const refusal = facts?.readError && expectedOutcome === 'needs-human'
+      ? null : refusalFor({ headSha, pr: facts, requiredChecks: checks });
+    return { refusal, ...(facts?.readError ? { warning: warningFor(facts.readError) } : {}) };
   } catch (e) {
-    return { refusal: null, warning: `could not re-check required checks before recording ${expectedOutcome}: ${String(e?.message || e).split('\n')[0]}` };
+    return { refusal: null, warning: warningFor(e) };
   }
 }
 
-/** Mirror the not-a-ci-break preflight, including its setting and warning on failed reads. */
+/** Share the not-a-ci-break setting and readers; failed reads permit needs-human with a warning. */
 export async function checkNeedsHumanEscalable(options = {}) {
   return checkEscalationRecordable(options, 'needs-human', needsHumanGateOnlyRefusal);
 }
 
-function defaultReadPrChecks({ pr, repo }) {
+function defaultReadPrChecks({ pr, repo }, {
+  runGh = runGhSync, readMergeGateVerdict = defaultReadMergeGateVerdict,
+  readFreeze = readSharedFreeze, mergeGateSetting,
+} = {}) {
   const args = ['pr', 'view', String(pr), '--json', 'number,labels,headRefOid,statusCheckRollup,url'];
   if (repo) args.push(`--repo=${repo}`);
-  const raw = execFileSync('gh', args, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024 });
+  const raw = runGh(args, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024 });
   const parsed = JSON.parse(String(raw || '{}'));
   const slug = /^https:\/\/github\.com\/([^/]+\/[^/]+)\//.exec(parsed.url ?? '')?.[1] ?? null;
-  const [classified] = excusePrMergeGateHolds([{ ...parsed, slug }], { repo: repo ?? slug });
-  // Non-candidates get an excused SUCCESS from the shared classifier. Preserve
-  // the review-only red signal for the escalation refusal, just as its candidate
-  // annotation does. Unreadable or real job failures never get this annotation.
-  return { ...classified, statusCheckRollup: classified.statusCheckRollup?.map(row => {
-    const hold = row.mergeGateHoldExcused;
-    if (!hold?.holds?.length || !hold.holds.every(r => r.status === 'hold' && HUMAN_REVIEW_HOLD_GATES.includes(r.id))) return row;
-    return { ...row, conclusion: 'FAILURE', mergeGateReviewHold: {
-      holds: hold.holds.map(r => r.id), jobId: hold.jobId,
-    } };
+  const rows = Array.isArray(parsed.statusCheckRollup) ? parsed.statusCheckRollup : [];
+  // Select once with R216 before the shared hold reader examines the job. It
+  // must never annotate an older failure beside a newer success/pending run.
+  const [mergeGate] = latestAttempts(rows.filter(row => String(row.name ?? '').trim().toLowerCase() === 'merge-gate'));
+  const statusCheckRollup = rows.filter(row => String(row.name ?? '').trim().toLowerCase() !== 'merge-gate' || row === mergeGate);
+  let readError;
+  const checkedRead = reader => input => {
+    try {
+      const value = reader(input);
+      if (value?.error) readError = new Error(String(value.error));
+      return value;
+    } catch (error) {
+      readError = error;
+      throw error;
+    }
+  };
+  const [classified] = excusePrMergeGateHolds([{ ...parsed, number: Number(pr), statusCheckRollup }], {
+    repo: repo ?? slug, readMergeGateVerdict: checkedRead(readMergeGateVerdict),
+    readFreeze: checkedRead(readFreeze), mergeGateSetting,
+  });
+  // Keep unknown evidence red and expose failures swallowed by the helper so
+  // each outcome can apply its recording policy without losing check facts.
+  return { ...classified, slug, readError, statusCheckRollup: classified.statusCheckRollup.map(row => {
+    const excused = row.mergeGateHoldExcused;
+    if (!excused?.holds?.length || !excused.holds.every(hold => hold.status === 'hold' && HUMAN_REVIEW_HOLD_GATES.includes(hold.id))) return row;
+    // Retain the observed red review gate for the escalation preflight even
+    // when the drain may excuse it for a non-candidate. Classification is shared.
+    return { ...row, conclusion: mergeGate.conclusion,
+      mergeGateReviewHold: { holds: excused.holds.map(hold => hold.id), jobId: excused.jobId } };
   }) };
 }
 

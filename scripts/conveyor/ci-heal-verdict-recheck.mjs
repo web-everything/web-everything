@@ -14,7 +14,7 @@
  *   - {@link unsettledRequiredChecks}: the escalation CLI refuses to record `not-a-ci-break` while a required check is
  *     still pending, missing, or red — the verdict can only be true once they have all finished green.
  *
- * Reuses the repo's own readers: `collapseRollupToLatestPerName` (latest run per check name), the shared
+ * Reuses the repo's own readers: `latestAttempts` (latest run per check name), the shared
  * check-state predicate, and `withoutImpliedRequiredChecks` (a required `integration` implied by `test`).
  * Declared setting `ci-heal-verdict-settings.json` (env `WE_CI_HEAL_RECHECK_NOT_CI_BREAK` beats the file);
  * missing, malformed or `off` = the behaviour before this card. PURE apart from the settings file read.
@@ -24,7 +24,7 @@ import { resolveHumanGateRemovalSetting } from '../lib/merge-gate-hold-class.mjs
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { collapseRollupToLatestPerName, rollupRowKind } from '../lib/rollup-collapse.mjs';
+import { rollupRowKind } from '../lib/rollup-collapse.mjs';
 import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.mjs';
 import { latestAttempts, summarize } from '../lib/check-state-predicate.mjs';
 import { CODEQL_CHECK_NAME, failedCodeQLCheck, loadDrainGateSettings } from '../lib/codeql-gate.mjs';
@@ -80,7 +80,7 @@ export function ciGreenForEscalation({ rollup, requiredChecks }) {
   return !red.length && !pending.length && !missing.length;
 }
 
-const sameSha = (a, b) => {
+export const sameSha = (a, b) => {
   const x = String(a ?? '').trim().toLowerCase();
   const y = String(b ?? '').trim().toLowerCase();
   return x.length >= 7 && y.length >= 7 && (x.startsWith(y) || y.startsWith(x));
@@ -88,36 +88,6 @@ const sameSha = (a, b) => {
 
 const gateNames = [REVIEW_GATE_CHECK, 'merge-gate'];
 const lowerName = name => String(name ?? '').toLowerCase();
-const hasNumericRank = value => (typeof value === 'number' || typeof value === 'string')
-  && Number.isFinite(Number(value)) && Number(value) > 0;
-
-/** Check only the fields needed to distinguish the latestAttempts winner. */
-function comparableAttemptRanks(pool) {
-  const allRunsKnown = pool.every(row => hasNumericRank(row.run_id));
-  const someRunsKnown = pool.some(row => hasNumericRank(row.run_id));
-  if (allRunsKnown && new Set(pool.map(row => String(row.run_id))).size > 1) {
-    const runs = new Map();
-    for (const row of pool) {
-      const run = String(row.run_id);
-      if (!runs.has(run)) runs.set(run, []);
-      runs.get(run).push(row);
-    }
-    // Within-run ranks must be comparable before comparing independent runs.
-    return [...runs.values()].every(rows => comparableAttemptRanks(rows));
-  }
-  const fields = allRunsKnown ? ['run_id', 'run_attempt', 'id']
-    : someRunsKnown ? ['id', 'run_attempt'] : ['run_attempt', 'id'];
-  let candidates = pool;
-  for (const field of fields) {
-    if (!candidates.some(row => hasNumericRank(row[field]))) continue;
-    if (!candidates.every(row => hasNumericRank(row[field]))) return false;
-    const highest = candidates.reduce((max, row) => Math.max(max, Number(row[field])), 0);
-    candidates = candidates.filter(row => Number(row[field]) === highest);
-    if (candidates.length === 1) return true;
-  }
-  return true;
-}
-
 /** Adapt GraphQL rollups and legacy statuses without replacing the shared state policy. */
 function checkEvidence(rollup, requiredChecks) {
   const rows = Array.isArray(rollup) ? rollup : [];
@@ -127,26 +97,20 @@ function checkEvidence(rollup, requiredChecks) {
     if (!groups.has(name)) groups.set(name, []);
     groups.get(name).push({ ...row, name, __typename: rollupRowKind(row) });
   }
-  // Ranking evidence belongs to one check name; an optional workflow must not
-  // disable the timestamp fallback for unrelated GraphQL rollup rows.
-  const selected = [...groups.values()].flatMap(group => {
-    // Keep the rollup reader's CheckRun > untagged > legacy-status precedence
-    // even when the preferred tier carries numeric attempt metadata.
+  const checks = [...groups.values()].flatMap(group => {
+    // Preserve CheckRun > untagged > legacy-status precedence, then use the
+    // same effective-time ranking for every name within its preferred tier.
     const pool = ['CheckRun', 'untagged', 'StatusContext']
       .map(kind => group.filter(row => row.__typename === kind)).find(tier => tier.length);
-    // Partially enriched rollups cannot rank an absent value as zero: an older
-    // enriched success would then hide a newer timestamp-only failure. Use the
-    // rollup reader unless the fields deciding the numeric winner are comparable.
-    const hasAttempts = pool.some(row => hasNumericRank(row.run_attempt) || hasNumericRank(row.run_id));
-    return hasAttempts && comparableAttemptRanks(pool) ? latestAttempts(pool) : collapseRollupToLatestPerName(pool);
-  });
-  const checks = selected.map(row => {
-    const check = { ...row };
-    if (row?.status == null && row?.state != null) {
-      if (['pending', 'expected'].includes(lowerName(row.state))) check.status = 'pending';
-      else check.conclusion = row.state;
-    }
-    return check;
+    return latestAttempts(pool.map(row => {
+      // Normalise legacy StatusContext state BEFORE ranking, so an undated PENDING status ranks as pending.
+      const check = { ...row };
+      if (row?.status == null && row?.state != null) {
+        if (['pending', 'expected'].includes(lowerName(row.state))) check.status = 'pending';
+        else check.conclusion = row.state;
+      }
+      return check;
+    }));
   });
   // Only the shared merge-gate hold classifier's annotation proves a review hold.
   // A job/setup failure (or unreadable verdict) must remain ordinary CI evidence.
