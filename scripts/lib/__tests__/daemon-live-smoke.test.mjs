@@ -90,10 +90,25 @@ describe('lane acquire smoke after lane-hold reset refusal', () => {
     expect(runChild.mock.calls.some(([, args]) => args.some((a) => /^--lane=/.test(a)))).toBe(false);
   });
 
-  it('a failed retry after an initial lane-hold remains an environmental skip even if the final error omits the signature', async () => {
-    const runChild = vi.fn().mockRejectedValueOnce(failure('stderr')).mockRejectedValueOnce(new Error('no lane within 30000ms (lock contention)'));
-    const row = await check.run(context(runChild));
-    expect(row).toMatchObject({ ok: true, skipped: true, skipReason: 'lane-hold-refused' });
+  it.each([
+    'no lane within 30000ms (lock contention)',
+    'timed out after 120000ms (process group killed)',
+    'acquire crashed with signal SIGSEGV',
+    'acquire failed to provision lane-4',
+  ])('fails when lane-hold retry encounters an unrelated error: %s', async (message) => {
+    const retryError = Object.assign(new Error(message), { stderr: 'retry failure diagnostics' });
+    const runChild = vi.fn().mockRejectedValueOnce(failure('stderr')).mockRejectedValueOnce(retryError);
+    const ctx = context(runChild);
+    // Even an exhausted wait on a busy host cannot carry the first error's lane-hold classification forward.
+    ctx.hostBusy = () => true;
+    ctx.clock = vi.fn().mockReturnValueOnce(1000).mockReturnValue(1000 + ctx.budgets.laneAcquireWaitMs);
+    const row = await check.run(ctx);
+    expect(row.ok).toBe(false);
+    expect(row.skipped).not.toBe(true);
+    expect(row.skipReason).toBeUndefined();
+    expect(row.detail).toContain(message);
+    expect(row.stderrTail).toContain('retry failure diagnostics');
+    expect(runChild).toHaveBeenCalledTimes(2);
     expect(runChild.mock.calls.filter(([, args]) => args[1] === 'acquire')).toHaveLength(2);
   });
 

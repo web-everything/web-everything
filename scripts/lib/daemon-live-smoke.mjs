@@ -382,12 +382,29 @@ async function checkLaneAcquireRelease(ctx) {
     // killed mid-flight expires by itself.
     // #4139 — see {@link checkLanePoolList}'s own comment just above: `env` must reach every lane-pool child
     // this gate spawns, never just some of them, or an isolated caller's pool override is only PARTLY honored.
-    const out = await runChild('node', [
+    const acquire = () => runChild('node', [
       'scripts/lane-pool.mjs', 'acquire', '--purpose=smoke', `--session=${sessionSlug}`,
       `--wait-ms=${budgets.laneAcquireWaitMs}`, '--ttl-minutes=10', '--json',
     ], {
       cwd: root, timeoutMs: acquireCapMs, env,
     });
+    let out;
+    const hasLaneHold = (e) => [e?.message, e?.stderr, JSON.stringify(e?.diagnostics)].join('\n').includes('lane-hold');
+    try {
+      out = await acquire();
+    } catch (e) {
+      if (!hasLaneHold(e)) throw e;
+      try {
+        out = await acquire();
+      } catch (retryError) {
+        if (!hasLaneHold(retryError)) {
+          return { ok: false, detail: `lane-pool acquire --purpose=smoke failed: ${firstLine(retryError)}`,
+            ...childFailureDiagnostics(retryError) };
+        }
+        return { ok: true, skipped: true, skipReason: 'lane-hold-refused',
+          detail: `skipped: lane-hold refused acquire after one retry: ${firstLine(retryError)}` };
+      }
+    }
     const parsed = JSON.parse(out);
     laneNum = Number.isInteger(parsed?.lane) ? parsed.lane : null;
     if (laneNum == null) return { ok: false, detail: 'lane-pool acquire returned no lane number' };

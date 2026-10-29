@@ -133,6 +133,7 @@ import { candidateLaunch } from './readiness/scope-lease-live.mjs';
 // spin-acquire (`we:scripts/readiness/drain-lock.mjs`), reused rather than re-implemented, for `acquire`'s
 // own optional `--wait-ms` full-pool retry/backoff below. No cycle: drain-lock.mjs never imports lane-pool.
 import { sleepSyncMs } from './readiness/drain-lock.mjs';
+import { jitteredDelayMs } from './lib/lane-acquire-backoff.mjs';
 // #2748 — REUSE the standalone reaper's PURE core so the "provably-dead lease" verdict is SINGLE-SOURCED with
 // `scripts/conveyor/lease-reaper.mjs` (the acquire-native backstop must agree with the periodic reaper, never
 // fork its logic). Importing lease-reaper is side-effect-free — its IO shell is gated on the main-module check —
@@ -2333,6 +2334,7 @@ async function cmdAcquire(repo) {
     const waitMs = flags['wait-ms'] !== undefined && Number.isFinite(Number(flags['wait-ms'])) ? Math.max(0, Number(flags['wait-ms'])) : 0;
     const deadline = nowMs + waitMs;
     const excluded = new Set();
+    const holdRefused = new Set(); // parked lanes stay excluded across poll rounds
     // The caller's OWN lane, if they are standing in one. Auto-pick skips it: acquiring resets the lane to
     // the integration branch, so returning the lane the caller is working in changes their checkout out from
     // under them (observed 2026-09-06 — a bare `acquire --purpose=review-juror` returned the driving lane).
@@ -2469,27 +2471,15 @@ async function cmdAcquire(repo) {
       }
       const pickable = candidateDirs
         .map((d) => Number(basename(d).slice(5)))
-        .filter((n) => !excluded.has(n) && n !== selfLane)
+        .filter((n) => !excluded.has(n) && !holdRefused.has(n) && n !== selfLane)
         .sort((a, b) => a - b);
-      let pick = null;
-      for (const n of pickable) {
-        const claimed = tryClaimLane(laneDir(repo, n), session, Date.now(), ttlMs);
-        if (claimed) { pick = n; holderSlug = claimed; break; }
-        excluded.add(n); // a concurrent acquire won this one — try the next candidate
-      }
-      // #4122 — a free-list round that claimed NOTHING (every listed candidate was already taken by someone
-      // else) gets exactly ONE pass: mark it exhausted now, before the sleep/retry branch below clears
-      // `excluded` — otherwise the next poll tick would recompute the SAME candidates from the SAME static
-      // list and retry the identical dead ends until `--wait-ms` ran out, never reaching the scan at all. Then
-      // go STRAIGHT to the scan in this same call (no sleep, no deadline gate, `excluded` kept) — with the
-      // default `--wait-ms=0` the deadline has already passed, so falling into the wait/grow/fail branch below
-      // would skip the scan entirely and either fail with a false "all held/dirty" or needlessly grow the pool
-      // while unlisted lanes sit free (PR #2679 review). Runs at most once: `freeListExhausted` is now sticky.
-      if (usingFreeList && pick === null) {
-        freeListExhausted = true;
-        continue;
-      }
-      if (pick !== null) {
+      for (const pick of pickable) {
+        const claimed = tryClaimLane(laneDir(repo, pick), session, Date.now(), ttlMs);
+        if (!claimed) {
+          excluded.add(pick); // a concurrent acquire won this one — try the next candidate
+          continue;
+        }
+        holderSlug = claimed;
         // #3407 fix item 2 — provision THIS candidate right here, inside the picking loop, so a failure falls
         // through to the NEXT candidate instead of failing the whole command: the claim above already won
         // lane `pick`, but that says nothing about whether it can actually be RESET/DEPS-READIED (a network
@@ -2500,7 +2490,13 @@ async function cmdAcquire(repo) {
           chosen = pick;
           break;
         } catch (e) {
-          log(`  ⚠ lane-${pick} claimed but failed to provision (${String(e && e.message ? e.message : e).split('\n')[0]}) — releasing it and trying another candidate`);
+          const failure = msgOf(e);
+          if (failure.includes('lane-hold')) holdRefused.add(pick);
+          if (failure.includes('index.lock')) {
+            log(`lane-${pick}: stale .git/index.lock - skipped; needs cleanup`);
+          } else {
+            log(`  ⚠ lane-${pick} claimed but failed to provision (${String(e && e.message ? e.message : e).split('\n')[0]}) — releasing it and trying another candidate`);
+          }
           // Auto-pick never re-acquires its OWN prior lane (`selfLane` is excluded from `pickable` above), so
           // there is never a live lease of ours to restore here — just drop the one this claim just wrote.
           restoreLeaseAfterRefusedClaim(laneDir(repo, pick), null);
@@ -2510,8 +2506,16 @@ async function cmdAcquire(repo) {
           continue;
         }
       }
-      if (Date.now() < deadline) {
-        sleepSyncMs(ACQUIRE_POLL_MS);
+      if (chosen !== null) break;
+      // Exhaust this snapshot before scanning again. A spent free list falls through to the
+      // shared scan once, even when --wait-ms=0, so unlisted healthy lanes still get a chance.
+      if (usingFreeList) {
+        freeListExhausted = true;
+        continue;
+      }
+      const remainingMs = deadline - Date.now();
+      if (remainingMs > 0) {
+        sleepSyncMs(Math.min(jitteredDelayMs(ACQUIRE_POLL_MS), remainingMs));
         acquirePollCount++;
         excluded.clear(); // a lane held/dirty a moment ago may have freed (or gone TTL-stale) since
         continue;
@@ -3650,15 +3654,19 @@ function acquirableListCached(repo, { limit, scanTimeoutMs, cacheTtlMs, callerDe
       if (listLockIsStale(repo, owner, Date.now(), scanTimeoutMs)) mine = takeOverStaleListLock(repo, owner);
     }
     if (mine) {
+      const lockHeldAt = Date.now();
+      let scanned = false;
       try {
         // Re-check under the lock: the previous holder may have just written a fresh result.
         const again = readListCache(repo, Date.now(), cacheTtlMs);
         if (again) return again;
+        scanned = true;
         const paths = scanAcquirable(repo, { ...scanOpts, limit: null });
         if (!lastScanPartial) writeListCache(repo, paths); // a partial answer is a lower bound — never cached
         return paths;
       } finally {
         releaseListLock(repo);
+        if (scanned && process.env.LANE_POOL_ACQUIRE_DEBUG === '1') log(`__SCAN_LOCK_HELD_MS__=${Date.now() - lockHeldAt}`);
       }
     }
     // #xj2k2pp — checked BEFORE the poll sleep, and every iteration: this caller does not own the lock, so
@@ -3672,7 +3680,7 @@ function acquirableListCached(repo, { limit, scanTimeoutMs, cacheTtlMs, callerDe
         { lockContention: true },
       );
     }
-    sleepSyncMs(LIST_LOCK_POLL_MS);
+    sleepSyncMs(Math.min(jitteredDelayMs(LIST_LOCK_POLL_MS), callerDeadlineMs === null ? Infinity : Math.max(0, callerDeadlineMs - Date.now())));
     const fresh = readListCache(repo, Date.now(), cacheTtlMs);
     if (fresh) return fresh;
     if (Date.now() > waitDeadline) {
