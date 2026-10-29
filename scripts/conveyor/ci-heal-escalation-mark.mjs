@@ -58,6 +58,8 @@ import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { isBudgetRefusal, postPrComment, recordOwedWrite, resolveOwedRepo } from './ci-heal-owed.mjs';
 import { resolveCiHealVerdictSettings, unsettledRequiredChecks, gateOnlyRedStates, ciGreenForEscalation } from './ci-heal-verdict-recheck.mjs';
+import { excusePrMergeGateHolds } from '../lib/merge-gate-hold-class.mjs';
+import { HUMAN_REVIEW_HOLD_GATES } from '../lib/merge-gate-verdict.mjs';
 
 /**
  * we:scripts/conveyor/ci-heal-escalation-mark.mjs#CI_HEAL_ESCALATION_MARKER — the stable FIRST LINE of the
@@ -453,12 +455,22 @@ export async function checkNeedsHumanEscalable(options = {}) {
 }
 
 function defaultReadPrChecks({ pr, repo }) {
-  const args = ['pr', 'view', String(pr), '--json', 'headRefOid,statusCheckRollup,url'];
+  const args = ['pr', 'view', String(pr), '--json', 'number,labels,headRefOid,statusCheckRollup,url'];
   if (repo) args.push(`--repo=${repo}`);
   const raw = execFileSync('gh', args, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024 });
   const parsed = JSON.parse(String(raw || '{}'));
   const slug = /^https:\/\/github\.com\/([^/]+\/[^/]+)\//.exec(parsed.url ?? '')?.[1] ?? null;
-  return { ...parsed, slug };
+  const [classified] = excusePrMergeGateHolds([{ ...parsed, slug }], { repo: repo ?? slug });
+  // Non-candidates get an excused SUCCESS from the shared classifier. Preserve
+  // the review-only red signal for the escalation refusal, just as its candidate
+  // annotation does. Unreadable or real job failures never get this annotation.
+  return { ...classified, statusCheckRollup: classified.statusCheckRollup?.map(row => {
+    const hold = row.mergeGateHoldExcused;
+    if (!hold?.holds?.length || !hold.holds.every(r => r.status === 'hold' && HUMAN_REVIEW_HOLD_GATES.includes(r.id))) return row;
+    return { ...row, conclusion: 'FAILURE', mergeGateReviewHold: {
+      holds: hold.holds.map(r => r.id), jobId: hold.jobId,
+    } };
+  }) };
 }
 
 async function defaultReadRequiredChecks({ repo }) {

@@ -45,7 +45,7 @@ export function classifyCheck(check = {}) {
 }
 
 // Only canonical non-negative integers rank; missing/garbage evidence is zero.
-// Keep string IDs exact above Number.MAX_SAFE_INTEGER; never consult dates.
+// Keep string IDs exact above Number.MAX_SAFE_INTEGER.
 const numeric = (value) => {
   if (typeof value !== 'number' && typeof value !== 'string') return 0n;
   const integer = String(value);
@@ -53,8 +53,10 @@ const numeric = (value) => {
 };
 
 /**
- * Select the greatest (run_id, run_attempt, id) exact integer tuple per name.
- * Attempts belong to one workflow run. Without run identities, retain the
+ * Select the latest attempt per name. Within a known workflow run, compare
+ * (run_attempt, id); across runs, compare completion/start times when complete,
+ * then global check ids (or run ids when check ids are incomplete). A rerun can
+ * finish later than a workflow with a larger run id. Without run identities, retain the
  * (run_attempt, id) ranking; with mixed identities, prefer global check ids
  * before attempts so counters from different runs cannot hide newer evidence.
  * Exact ties retain the first row. Inputs are never mutated.
@@ -72,7 +74,29 @@ export function latestAttempts(checks = []) {
   return [...groups.values()].map(group => {
     const allRunsKnown = group.every(check => numeric(check.run_id) > 0n);
     const someRunsKnown = group.some(check => numeric(check.run_id) > 0n);
-    const fields = allRunsKnown ? ['run_id', 'run_attempt', 'id']
+    if (allRunsKnown && new Set(group.map(check => numeric(check.run_id))).size > 1) {
+      // Reduce each run first, so stale timestamps cannot resurrect an earlier
+      // attempt of that same run. Then compare these independent run winners.
+      const runs = new Map();
+      for (const check of group) {
+        const run = numeric(check.run_id);
+        if (!runs.has(run)) runs.set(run, []);
+        runs.get(run).push(check);
+      }
+      const winners = [...runs.values()].map(rows => latestAttempts(rows)[0]);
+      const time = row => Date.parse(row.completedAt ?? row.completed_at ?? row.startedAt ?? row.started_at);
+      const dated = winners.every(row => Number.isFinite(time(row)));
+      const fields = winners.every(row => numeric(row.id) > 0n) ? ['id', 'run_id'] : ['run_id', 'id'];
+      return winners.reduce((previous, check) => {
+        if (dated && time(check) !== time(previous)) return time(check) > time(previous) ? check : previous;
+        for (const field of fields) {
+          const difference = numeric(check[field]) - numeric(previous[field]);
+          if (difference !== 0n) return difference > 0n ? check : previous;
+        }
+        return previous;
+      });
+    }
+    const fields = allRunsKnown ? ['run_attempt', 'id']
       : someRunsKnown ? ['id', 'run_attempt'] : ['run_attempt', 'id'];
     return group.reduce((previous, check) => {
       for (const field of fields) {

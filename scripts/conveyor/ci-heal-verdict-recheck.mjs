@@ -95,6 +95,16 @@ const hasNumericRank = value => (typeof value === 'number' || typeof value === '
 function comparableAttemptRanks(pool) {
   const allRunsKnown = pool.every(row => hasNumericRank(row.run_id));
   const someRunsKnown = pool.some(row => hasNumericRank(row.run_id));
+  if (allRunsKnown && new Set(pool.map(row => String(row.run_id))).size > 1) {
+    const runs = new Map();
+    for (const row of pool) {
+      const run = String(row.run_id);
+      if (!runs.has(run)) runs.set(run, []);
+      runs.get(run).push(row);
+    }
+    // Within-run ranks must be comparable before comparing independent runs.
+    return [...runs.values()].every(rows => comparableAttemptRanks(rows));
+  }
   const fields = allRunsKnown ? ['run_id', 'run_attempt', 'id']
     : someRunsKnown ? ['id', 'run_attempt'] : ['run_attempt', 'id'];
   let candidates = pool;

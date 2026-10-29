@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { requiredCheckStates, contradictingChecks, notCiBreakContradicted, unsettledRequiredChecks, ciGreenForEscalation, resolveVoidNeedsHumanWhenCiGreen, resolveCiHealVerdictSettings } from '../ci-heal-verdict-recheck.mjs';
 import * as verdictRecheck from '../ci-heal-verdict-recheck.mjs';
-import { checkNeedsHumanEscalable } from '../ci-heal-escalation-mark.mjs';
+import { checkNeedsHumanEscalable, notCiBreakRecordRefusal } from '../ci-heal-escalation-mark.mjs';
 import { excuseMergeGateRows } from '../../lib/merge-gate-hold-class.mjs';
 
 const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/ci-heal-verdict/pr4535-2026-10-09.json'), 'utf8'));
@@ -13,6 +13,19 @@ const input = { escalation: { outcome: 'not-a-ci-break', headSha: fixture.headRe
 const green = fixture.requiredChecks.map((name) => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' }));
 
 describe('R10 escalation send-back regressions', () => {
+  it.each([false, true])('a later failed rerun of an older workflow run wins (reverse=%s)', reverse => {
+    const rows = [
+      { name: 'test', run_id: 100, run_attempt: 2, id: 300, status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-29T03:00:00Z' },
+      { name: 'test', run_id: 200, run_attempt: 1, id: 200, status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-29T02:00:00Z' },
+    ];
+    const rollup = reverse ? rows.toReversed() : rows;
+    const evidence = { ...input, rollup, requiredChecks: ['test'] };
+    expect.soft(requiredCheckStates(evidence).red).toEqual(['test']);
+    expect.soft(notCiBreakRecordRefusal({ headSha: input.headSha,
+      pr: { headRefOid: input.headSha, statusCheckRollup: rollup }, requiredChecks: ['test'] })).not.toBeNull();
+    expect.soft(contradictingChecks(evidence)).toEqual(['test']);
+  });
+
   it('R10 item 1: a newer merge-gate job failure supersedes an older review-hold rerun', async () => {
     const requiredChecks = ['test', 'merge-gate'];
     const held = excuseMergeGateRows([
@@ -199,10 +212,10 @@ describe('requiredCheckStates shared predicate regressions', () => {
     }
   });
 
-  it.each([false, true])('complete decisive ranks still beat timestamps when secondary ranks are partial (reverse=%s)', reverse => {
+  it.each([false, true])('same-run or mixed-identity decisive ranks beat timestamps when secondary ranks are partial (reverse=%s)', reverse => {
     for (const [olderMetadata, newerMetadata] of [
       [{ run_attempt: 1, id: 100 }, { run_attempt: 2 }],
-      [{ run_id: 100, run_attempt: 2, id: 100 }, { run_id: 200 }],
+      [{ run_id: 100, run_attempt: 1, id: 100 }, { run_id: 100, run_attempt: 2 }],
       [{ run_id: 100, run_attempt: 2, id: 100 }, { id: 200 }],
     ]) {
       const rows = [
@@ -212,6 +225,15 @@ describe('requiredCheckStates shared predicate regressions', () => {
       expect(requiredCheckStates({ requiredChecks: ['test'], rollup: reverse ? rows.toReversed() : rows }))
         .toEqual({ red: ['test'], pending: [], missing: [], green: [] });
     }
+  });
+
+  it.each([false, true])('cross-run completion time wins even with partial check ids (reverse=%s)', reverse => {
+    const rows = [
+      { name: 'test', run_id: 100, run_attempt: 2, id: 100, status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-28T02:00:00Z' },
+      { name: 'test', run_id: 200, status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T01:00:00Z' },
+    ];
+    expect(requiredCheckStates({ requiredChecks: ['test'], rollup: reverse ? rows.toReversed() : rows }))
+      .toEqual({ red: [], pending: [], missing: [], green: ['test'] });
   });
 
   it.each([false, true])('a newer workflow run supersedes an earlier rerun across verdict readers (reverse=%s)', reverse => {

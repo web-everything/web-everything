@@ -687,29 +687,43 @@ describe('stacked base escalation facts (#4792)', () => {
 
 
 describe('needs-human CLI preflight wiring — #6004/#5979', () => {
-  it.each(['review-gate', 'merge-gate'])('refuses green required CI plus proven review hold %s before posting', gate => {
+  it.each([
+    ['review-gate', [], 'review'],
+    ['merge-gate', [{ name: 'ready-to-merge' }], 'review'], ['merge-gate', [], 'review'],
+    ['merge-gate', [], 'job-failure'], ['merge-gate', [], 'other-head'],
+    ['merge-gate', [], 'truncated'], ['merge-gate', [], 'unreadable'],
+  ])('classifies raw %s with labels %j and %s evidence before posting', (gate, labels, evidence) => {
     const dir = mkdtempSync(join(tmpdir(), 'ci-heal-gate-cli-'));
     try {
       const log = join(dir, 'calls.jsonl');
       const preload = join(dir, 'preload.mjs');
       // Exercise the real CLI and default readers without launching gh or touching shared caches.
       writeFileSync(join(dir, 'required-status-checks-cache.json'), JSON.stringify({ entries: {
-        'web-everything/web-everything@main': { checks: ['test'], fetchedAtMs: Date.now(), source: 'live' },
+        'web-everything/web-everything@main': { checks: ['test', ...(gate === 'merge-gate' ? ['merge-gate'] : [])], fetchedAtMs: Date.now(), source: 'live' },
       } }));
       writeFileSync(preload, `
 import cp from 'node:child_process';
 import { appendFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
-const facts = ${JSON.stringify({ headRefOid: HEAD, statusCheckRollup: [
+const facts = ${JSON.stringify({ number: 6042, labels, headRefOid: HEAD, statusCheckRollup: [
   { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
   { name: gate, status: 'COMPLETED', conclusion: 'FAILURE',
-    ...(gate === 'merge-gate' ? { mergeGateReviewHold: { holds: ['review-acceptance'], jobId: 123 } } : {}) },
+    ...(gate === 'merge-gate' ? { detailsUrl: 'https://github.com/web-everything/web-everything/actions/runs/100/job/123' } : {}) },
 ] })};
 for (const method of ['execFileSync', 'spawnSync', 'execSync', 'exec', 'execFile', 'spawn']) {
   cp[method] = (...args) => {
     appendFileSync(${JSON.stringify(log)}, JSON.stringify({ method, args: args.slice(0, 2) }) + '\\n');
-    if (method === 'execFileSync' && args[0] === 'gh'
-      && JSON.stringify(args[1]) === JSON.stringify(['pr', 'view', '6042', '--json', 'headRefOid,statusCheckRollup,url', '--repo=web-everything/web-everything'])) return JSON.stringify(facts);
+    if (method === 'execFileSync' && args[0] === 'gh') {
+      if (args[1][0] === 'pr' && args[1][1] === 'view') return JSON.stringify(facts);
+      if (args[1][0] === 'api' && args[1][1] === 'repos/web-everything/web-everything/actions/jobs/123') {
+        if (${JSON.stringify(evidence)} === 'unreadable') return 'invalid JSON';
+        return JSON.stringify({ head_sha: ${JSON.stringify(evidence === 'other-head' ? 'a'.repeat(40) : HEAD)}, completed_at: '2026-10-29T03:00:00Z' });
+      }
+      if (args[1][0] === 'api' && args[1][1] === 'repos/web-everything/web-everything/actions/jobs/123/logs')
+        return ${JSON.stringify('#6042: HOLD\n  hold review-acceptance review pending\n'
+          + (evidence === 'job-failure' ? '  fail-closed codeql security check failed\n' : '')
+          + (evidence === 'truncated' ? '' : 'merge-gate: HOLD — held\n'))};
+    }
     throw new Error('unexpected child process in CLI preflight test');
   };
 }
@@ -720,16 +734,34 @@ syncBuiltinESMExports();
         `--head=${HEAD}`, `--base-head=${HEAD}`, '--outcome=needs-human', '--repo=web-everything/web-everything'], {
         encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
         env: { ...process.env, NODE_OPTIONS: '', WE_COORDINATION_ROOT: dir,
-          WE_CI_HEAL_RECHECK_NOT_CI_BREAK: 'on', WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'throttle') },
+          WE_CI_HEAL_RECHECK_NOT_CI_BREAK: 'on', MERGE_GATE_CANDIDACY_HOLD_IS_NOT_CI_FAILURE: 'on',
+          WE_GH_THROTTLE_COST_HEADERS: '0',
+          WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'throttle') },
       });
       expect(result.error).toBeUndefined();
       expect(result.status, result.stderr).toBe(1);
-      expect(result.stderr).toContain('refusing to record needs-human on PR #6042');
-      expect(result.stderr).toContain(gate);
+      if (evidence === 'review') {
+        expect(result.stderr).toContain('refusing to record needs-human on PR #6042');
+        expect(result.stderr).toContain(gate);
+      } else {
+        expect(result.stderr).not.toContain('refusing to record needs-human');
+        // The posting seam is deliberately closed: real/unknown failures may
+        // escalate, but this fixture never writes a comment or changes labels.
+        expect(result.stderr).toContain('could not post CI-heal escalation comment');
+      }
       expect(result.stdout).toBe('');
       const calls = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-      expect(calls).toEqual([{ method: 'execFileSync', args: ['gh',
-        ['pr', 'view', '6042', '--json', 'headRefOid,statusCheckRollup,url', '--repo=web-everything/web-everything']] }]);
+      const reads = calls.filter(call => call.args[0] === 'gh' && ['pr', 'api'].includes(call.args[1]?.[0])
+        && call.args[1][1] !== 'comment');
+      expect(reads[0].args).toEqual(['gh', ['pr', 'view', '6042', '--json',
+        'number,labels,headRefOid,statusCheckRollup,url', '--repo=web-everything/web-everything']]);
+      expect(reads.map(call => call.args[1].slice(0, 2))).toEqual([
+        ['pr', 'view'], ...(gate === 'merge-gate' ? [
+          ['api', 'repos/web-everything/web-everything/actions/jobs/123'],
+          ...(evidence === 'unreadable' ? [] : [['api', 'repos/web-everything/web-everything/actions/jobs/123/logs']]),
+        ] : []),
+      ]);
+      if (evidence === 'review') expect(calls).toEqual(reads);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

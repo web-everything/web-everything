@@ -97,6 +97,36 @@ describe('classifyCheck exhaustive independent outcome grid', () => {
 });
 
 describe('latestAttempts', () => {
+  it.each([undefined, 'invalid', '2026-10-29T02:00:00Z'])(
+    'uses global check ids across runs when completion times are missing, invalid or equal (%s)', timestamp => {
+      const rerun = settled('ci', 'failure', { run_id: 100, run_attempt: 2, id: 300, completedAt: timestamp });
+      const newerRun = settled('ci', 'success', { run_id: 200, run_attempt: 1, id: 200, completedAt: timestamp });
+      for (const rows of [[rerun, newerRun], [newerRun, rerun]]) expect(latestAttempts(rows)).toEqual([rerun]);
+    },
+  );
+
+  it('reduces same-run attempts before comparing completion times across runs in every input order', () => {
+    const oldAttempt = settled('ci', 'success', { run_id: 100, run_attempt: 1, id: 100, completedAt: '2026-10-29T04:00:00Z' });
+    const rerun = settled('ci', 'failure', { run_id: 100, run_attempt: 2, id: 300, completedAt: '2026-10-29T03:00:00Z' });
+    const newerRun = settled('ci', 'success', { run_id: 200, run_attempt: 1, id: 200, completedAt: '2026-10-29T02:00:00Z' });
+    for (const rows of [
+      [oldAttempt, rerun, newerRun], [oldAttempt, newerRun, rerun],
+      [rerun, oldAttempt, newerRun], [rerun, newerRun, oldAttempt],
+      [newerRun, oldAttempt, rerun], [newerRun, rerun, oldAttempt],
+    ]) expect(latestAttempts(rows)).toEqual([rerun]);
+  });
+
+  it.each(['completedAt', 'completed_at'])('uses %s across runs so a later rerun of an older run wins', timeField => {
+    const rerun = settled('ci', 'failure', { run_id: 100, run_attempt: 2, id: 300,
+      [timeField]: '2026-10-29T03:00:00Z' });
+    const newerRun = settled('ci', 'success', { run_id: 200, run_attempt: 1, id: 200,
+      [timeField]: '2026-10-29T02:00:00Z' });
+    for (const rows of [[rerun, newerRun], [newerRun, rerun]]) {
+      expect(latestAttempts(rows)).toEqual([rerun]);
+      expect(summarize(rows).redSet).toEqual(new Set(['ci']));
+    }
+  });
+
   it('compares large run_attempt integers exactly before considering id in either order', () => {
     const older = settled('ci', 'success', { run_attempt: '9007199254740992', id: 999 });
     const newer = settled('ci', 'failure', { run_attempt: '9007199254740993', id: 1 });
