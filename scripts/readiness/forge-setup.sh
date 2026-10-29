@@ -67,6 +67,8 @@ if ! command -v rsync >/dev/null 2>&1; then
   apt-get install -y rsync
 fi
 
+# Sibling manifests require redeploying this wrapper with forge-setup.sh on Forge.
+# Clients require prepare.capabilities.siblings=1 before sending any sibling bytes.
 # Publish the fixed wrapper through a root-owned pinned directory. Never follow
 # a pre-existing destination symlink or mutate task-controlled paths.
 python3 - "$(dirname -- "$0")/forge-exec-run.mjs" <<'WRAPPER'
@@ -93,7 +95,16 @@ try:
             try:
                 with os.fdopen(source, "rb", closefd=False) as src:
                     with os.fdopen(fd, "wb", closefd=False) as out:
-                        out.write(src.read())
+                        # Keep the installed runner standalone (including Node 22.1).
+                        # The same data-only constant is imported by vitest.shared.ts.
+                        module = os.open(os.path.join(os.path.dirname(sys.argv[1]), "forge-exec-siblings.mjs"), os.O_RDONLY | os.O_NOFOLLOW)
+                        with os.fdopen(module, "rb") as data:
+                            constants = data.read()
+                        code = src.read()
+                        binding = b"import {SIBLING_PATHS} from './forge-exec-siblings.mjs';\nexport {SIBLING_PATHS};"
+                        if code.count(binding) != 1:
+                            raise RuntimeError("missing sibling allowlist binding")
+                        out.write(code.replace(binding, constants))
                         out.flush()
                 os.fchown(fd, 0, 0)
                 os.fchmod(fd, 0o755)

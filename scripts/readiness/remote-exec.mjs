@@ -3,11 +3,11 @@ import { spawn } from 'node:child_process';
 import { realpath } from 'node:fs/promises';
 import * as filesystem from 'node:fs/promises';
 import { constants } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { allowedCommand, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile } from './forge-exec-run.mjs';
+import { allowedCommand, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile, SIBLING_PATHS, siblingShas, sameSiblingShas } from './forge-exec-run.mjs';
 
 const ROOT = '/srv/forge-exec';
 const LIMIT = 4 * 1024 * 1024;
@@ -65,8 +65,8 @@ export { isTestFile };
 // filter. Test-shaped names under excluded components refuse remote admission.
 const safeDotDirectory = /^(?:\.github|\.husky|\.vscode|\.storybook|\.changeset)$/;
 const safeDotFile = /^(?:\.gitignore|\.gitattributes|\.editorconfig|\.nvmrc|\.node-version|\.prettierrc.*|\.eslintrc.*|\.gitkeep|\.nycrc.*)$/;
-const keyComponent = /(?:_rsa|^id_|\.(?:pem|key|p12|pfx|jks|keystore)$)/;
-const credentialComponent = /token|secret|creds|credential|passwd|password|oauth|apikey|api-key/;
+const keyComponent = /(?:_rsa|\.(?:pem|key|p12|pfx|jks|keystore)$)/;
+const credentialComponent = /token|secret|creds|credential|passwd|password|oauth|apikey|api-key|^id_/;
 const sourceExtension = /\.(?:mjs|js|ts|tsx|jsx|css|md|html)$/;
 function normalizedComponent(part) {
   const utf8 = part.toString('utf8');
@@ -85,7 +85,7 @@ function excludedComponent(name, leaf, allowCredential = false) {
     || (name.startsWith('.') && !safeDotDirectory.test(name) && !(leaf && safeDotFile.test(name)))
     || keyComponent.test(name) || (!allowCredential && credentialComponent.test(name));
 }
-export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles} = {}) {
+export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false} = {}) {
   // Only dependency and Git internals are exempt. In particular, secret/hidden
   // directories and ambiguous dist/build directories may still contain tests.
   const ignored = await exec({file:'git',args:['ls-files','-o','-i','--exclude-standard','-z'],cwd});
@@ -161,6 +161,8 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     const parts = pathParts(path);
     const names = parts.map(normalizedComponent);
     const excludedByPolicy = names.some((name,i) => excludedComponent(name, i === names.length-1));
+    // Only credential-name-only sources can use public evidence. Hidden paths,
+    // key components and other exclusions win even when a name also matches.
     const credentialSource = excludedByPolicy && sourceExtension.test(names.at(-1))
       && !names.some((name,i) => excludedComponent(name, i === names.length-1, true));
     let publicOid;
@@ -171,10 +173,11 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if (!indexedOid || indexedOid !== publicOid) throw excludedSource();
     }
     if ((excludedByPolicy && !publicOid) || names.includes('node_modules')) {
-      if (!names.includes('node_modules') && excludedByPolicy && sourceExtension.test(names.at(-1))) {
+      const excludedTest = isTestFile(path) || /\.(test|spec)\./.test(parts.at(-1).toString('latin1'));
+      if (!names.includes('node_modules') && excludedByPolicy && excludedTest && sourceExtension.test(names.at(-1))) {
         throw excludedSource();
       }
-      if (isTestFile(path) || /\.(test|spec)\./.test(parts.at(-1).toString('latin1'))) throw new Error('Excluded test: use local fallback');
+      if (excludedTest) throw new Error('Excluded test: use local fallback');
       excluded.push(path); continue;
     }
     let absolute = Buffer.from(cwd), st;
@@ -184,7 +187,9 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if (st.isSymbolicLink() || (i === parts.length-1 ? !st.isFile() : !st.isDirectory())) throw new Error('Unsafe inventory component');
     }
     const content = await readManifestFile(absolute,st,fs);
-    if (publicOid) {
+    if (publicOid || trackedOnly) {
+      publicOid ??= indexBlobs.get(path.toString('base64'));
+      if (!publicOid) throw new Error('Sibling index unavailable');
       // Index equality alone must not authorize private, unstaged working bytes.
       const oid = createHash(publicOid.length === 64 ? 'sha256' : 'sha1')
         .update(`blob ${content.length}\0`).update(content).digest('hex');
@@ -192,11 +197,56 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     }
     entries.push({path,sha256:createHash('sha256').update(content).digest('hex'), executable:!!(st.mode & 0o111)});
   }
-  const manifest = {entries,excluded};
+  let siblings;
+  if (!trackedOnly && entries.some(entry => entry.path.equals(Buffer.from('vitest.shared.ts')))) {
+    try {
+      const config = await fs.readFile(join(cwd,'vitest.shared.ts'),'utf8');
+      if (createHash('sha256').update(config).digest('hex') !== entries.find(entry => entry.path.equals(Buffer.from('vitest.shared.ts'))).sha256)
+        throw new Error('Config changed during inventory');
+      const dependencies = [...config.matchAll(/["'`]((?:\.\.\/)[^"'`]+)["'`]/g)].map(match => match[1]);
+      if (dependencies.some(path => !Object.values(SIBLING_PATHS).includes(path)))
+        throw Object.assign(new Error('Unsupported sibling dependency'),{code:'unsupported-sibling-dependency'});
+      const siblingRoot = resolve(cwd,'../frontierui');
+      const checked = await checkSibling(siblingRoot,exec,fs);
+      const result = await exec({file:'git',args:['ls-files','-z','--',...Object.values(SIBLING_PATHS).map(path => path.slice('../frontierui/'.length))],cwd:siblingRoot});
+      if (result.code !== 0) throw new Error('Sibling inventory unavailable');
+      const files = splitPaths(result.stdout);
+      const prefixes = Object.values(SIBLING_PATHS).map(path => Buffer.from(path.slice('../frontierui/'.length)+'/'));
+      if (files.some(path => !prefixes.some(prefix => path.subarray(0,prefix.length).equals(prefix)))) throw new Error('Unsupported sibling inventory');
+      const snapshot = await buildManifest({cwd:siblingRoot,exec,fs,listFiles:async()=>files,trackedOnly:true});
+      if (!sameSiblingEvidence(await checkSibling(siblingRoot,exec,fs),checked)) throw new Error('Sibling HEAD changed');
+      siblings = {frontierui:{sha:checked.sha,roots:checked.roots,entries:snapshot.entries,excluded:snapshot.excluded}};
+    } catch (error) {
+      error.code = ['unsupported-sibling-dependency','excluded-source-file','ignored-test-file'].includes(error.code) ? error.code : 'sibling-inventory-failed';
+      throw error;
+    }
+  }
+  const manifest = {entries,excluded,...(siblings ? {siblings} : {})};
   const wire = manifestWire(manifest);
   if (Buffer.byteLength(JSON.stringify(wire)) > LIMIT - 16384) throw new Error('Manifest wire limit exceeded; use local fallback');
   return {...manifest,manifestDigest:digestManifest(wire)};
 }
+
+// All sibling evidence is local Git evidence; never ask Forge to resolve a revision.
+async function checkSibling(root, exec, fs) {
+  const roots = [];
+  for (const path of [root,...Object.values(SIBLING_PATHS).map(path => resolve(root,'..',path.slice(3)))]) {
+    const info = await fs.lstat(path);
+    if (info.isSymbolicLink() || !info.isDirectory()) throw new Error('Unsafe or missing sibling directory');
+    roots.push({dev:info.dev,ino:info.ino});
+  }
+  const git = async args => {
+    const result = await exec({file:'git',args,cwd:root});
+    if (result.code !== 0) throw new Error('Sibling Git evidence unavailable');
+    return protocolText(result.stdout,LIMIT);
+  };
+  if (await fs.realpath(root) !== (await git(['rev-parse','--show-toplevel'])).trim()) throw new Error('Unresolvable sibling worktree');
+  const sha = (await git(['rev-parse','HEAD'])).trim();
+  if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(sha)) throw new Error('Invalid sibling HEAD');
+  if ((await git(['status','--porcelain=v1','-z','--untracked-files=normal'])).length) throw new Error('Dirty sibling worktree');
+  return {sha,roots};
+}
+const sameSiblingEvidence = (actual, expected) => actual.sha === expected.sha && JSON.stringify(actual.roots) === JSON.stringify(expected.roots);
 
 // Only protocol JSON is decoded, never inventory bytes.
 function protocolText(stdout, limit) {
@@ -236,31 +286,47 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
     try {
       const manifest = await buildManifest({cwd,exec,listFiles,fs});
       const selected = manifest.entries.map(entry => entry.path);
-      if (selected.some(path => path.equals(Buffer.from('vitest.shared.ts')))) return fallback('unsupported-sibling-dependency');
+      let workStage;
       try {
         staging = await fs.mkdtemp(join(tmpdir(), 'forge-exec-stage-'));
         await fs.chmod(staging, 0o700);
-        for (const entry of manifest.entries) {
-          const parts = pathParts(entry.path);
-          let source = Buffer.from(cwd), destination = Buffer.from(staging);
-          for (const [i, part] of parts.entries()) {
-            source = bytePath(source, part);
-            destination = bytePath(destination, part);
-            const st = await fs.lstat(source);
-            if (st.isSymbolicLink() || (i === parts.length - 1 ? !st.isFile() : !st.isDirectory())) throw new Error('Unsafe staging source');
-            if (i < parts.length - 1) await fs.mkdir(destination, {recursive:true, mode:0o700});
+        workStage = manifest.siblings ? join(staging,'work') : staging;
+        await fs.mkdir(workStage,{recursive:true,mode:0o700});
+        const snapshots = [{source:cwd,destination:workStage,entries:manifest.entries}];
+        if (manifest.siblings) snapshots.push({source:resolve(cwd,'../frontierui'),destination:join(staging,'frontierui'),entries:manifest.siblings.frontierui.entries});
+        for (const snapshot of snapshots) {
+          await fs.mkdir(snapshot.destination,{recursive:true,mode:0o700});
+          const rootInfo = await fs.lstat(snapshot.source);
+          if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) throw new Error('Unsafe staging root');
+          for (const entry of snapshot.entries) {
+            const parts = pathParts(entry.path);
+            let source = Buffer.from(snapshot.source), destination = Buffer.from(snapshot.destination);
+            for (const [i, part] of parts.entries()) {
+              source = bytePath(source, part);
+              destination = bytePath(destination, part);
+              const st = await fs.lstat(source);
+              if (st.isSymbolicLink() || (i === parts.length - 1 ? !st.isFile() : !st.isDirectory())) throw new Error('Unsafe staging source');
+              if (i < parts.length - 1) await fs.mkdir(destination, {recursive:true, mode:0o700});
+            }
+            // Pin the leaf and reject special files before reading; NONBLOCK also
+            // prevents a raced-in FIFO from hanging admission before fstat.
+            const fd = await fs.open(source, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+            try {
+              const st = await fd.stat();
+              if (!st.isFile() || !!(st.mode & 0o111) !== entry.executable) throw new Error('Invalid staging source');
+              await fs.writeFile(destination, await fd.readFile(), {flag:'wx', mode:0o600 | (st.mode & 0o111)});
+            } finally {await fd.close();}
+            // Node has no openat: an ancestor can race the leaf open. Re-hashing
+            // every staged byte against the verified public-content manifest
+            // confines swaps to identical bytes or not-started, before any rsync.
+            const hash = createHash('sha256').update(await fs.readFile(destination)).digest('hex');
+            if (hash !== entry.sha256) throw new Error('Staged bytes differ from manifest');
           }
-          // Pin the leaf and reject special files before reading; NONBLOCK also
-          // prevents a raced-in FIFO from hanging admission before fstat.
-          const fd = await fs.open(source, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
-          try {
-            const st = await fd.stat();
-            if (!st.isFile() || !!(st.mode & 0o111) !== entry.executable) throw new Error('Invalid staging source');
-            await fs.writeFile(destination, await fd.readFile(), {flag:'wx', mode:0o600 | (st.mode & 0o111)});
-          } finally {await fd.close();}
-          const hash = createHash('sha256').update(await fs.readFile(destination)).digest('hex');
-          if (hash !== entry.sha256) throw new Error('Staged bytes differ from manifest');
+          const after = await fs.lstat(snapshot.source);
+          if (after.isSymbolicLink() || after.ino !== rootInfo.ino || after.dev !== rootInfo.dev) throw new Error('Staging root swapped');
         }
+        if (manifest.siblings && !sameSiblingEvidence(await checkSibling(resolve(cwd,'../frontierui'),exec,fs),manifest.siblings.frontierui))
+          throw new Error('Sibling HEAD changed');
       } catch {
         return {mode:'not-started', terminated:true, reason:'snapshot-staging-failed'};
       }
@@ -270,23 +336,37 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
       // Preserve local lockfile-precedence admission even when an injected
       // inventory omits shrinkwrap; only the staged digest is transmitted.
       await digestLock(cwd);
-      const lock = await digestLock(staging);
+      const lock = await digestLock(workStage);
       // Reject incomplete or linked input before transmitting any file bytes.
-      const inputDigest = await digestInput(staging, selected);
-      const prepared = await ssh('prepare',{nonce,label:runId});
+      const inputDigest = await digestInput(workStage, selected);
+      const prepared = await ssh('prepare',{nonce,label:runId,...(manifest.siblings ? {siblings:true} : {})});
       if(prepared.code !== 0) throw new Error('Prepare failed');
-      run = JSON.parse(protocolText(prepared.stdout,1024)).run;
+      const preparation = JSON.parse(protocolText(prepared.stdout,1024));
+      run = preparation.run;
       if(typeof run !== 'string' || !/^r-[a-f0-9]{32}$/.test(run)) {run=undefined; throw new Error('Invalid server run');}
+      // forge-exec-run.mjs is separately installed by forge-setup.sh. Redeploy
+      // that fixed wrapper before siblings can run; old runners stay local.
+      if (manifest.siblings && preparation.capabilities?.siblings !== 1)
+        return {mode:'not-started',terminated:true,reason:'forge-runner-too-old'};
       // Transfer only staged leaves, retaining non-recursive rsync safeguards.
       // prepare creates a fresh work tree; deletion is unnecessary and requires
       // directory transfer on older rsync implementations.
       const copied = await exec({file:'rsync',args:['-a','--no-recursive','--no-dirs','--no-links','--safe-links','--no-implied-dirs','--exclude=.exit-code',
         '--from0','--files-from=-','--rsync-path=sudo -u forge-exec rsync','-e',`ssh ${SSH_OPTIONS.join(' ')}`,
-        './',`${host}:${ROOT}/${run}/work/`],cwd:staging,input:inventory});
+        './',`${host}:${ROOT}/${run}/work/`],cwd:workStage,input:inventory});
       if(copied.code !== 0) throw new Error('Copy failed');
-      expected = {v:1,nonce,run,inputDigest,argvDigest:digestArgv(argv),lock,manifestDigest:manifest.manifestDigest};
+      if (manifest.siblings) {
+        const inventory = Buffer.concat(manifest.siblings.frontierui.entries.flatMap(entry => [Buffer.from('./'),entry.path,Buffer.from([0])]));
+        const siblingsCopied = await exec({file:'rsync',args:['-a','--no-recursive','--no-dirs','--no-links','--safe-links','--no-implied-dirs','--exclude=.exit-code',
+          '--from0','--files-from=-','--rsync-path=sudo -u forge-exec rsync','-e',`ssh ${SSH_OPTIONS.join(' ')}`,
+          './',`${host}:${ROOT}/${run}/frontierui/`],cwd:join(staging,'frontierui'),input:inventory});
+        if (siblingsCopied.code !== 0) throw new Error('Sibling copy failed');
+      }
+      expected = {v:1,nonce,run,inputDigest,argvDigest:digestArgv(argv),lock,manifestDigest:manifest.manifestDigest,...(manifest.siblings ? {siblingShas:siblingShas(wire)} : {})};
       expectedManifest = wire;
     } catch (error) {
+      if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code};
+      if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
       if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code};
       return fallback(error.code === 'ignored-test-file' ? 'ignored-test-file' : 'copy-failed');
     }
@@ -294,7 +374,15 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
       const result = await ssh('run',{...expected,manifest:expectedManifest,argv,env:filterEnv(env)},true);
       const receipt = await finish();
       if(!receipt || receipt.code!==0) return {mode:'unconfirmed',reason:'ambiguous-result'};
-      if(!verifyReceipt(protocolText(receipt.stdout,4096),expected,result.code)) return {mode:'unconfirmed',reason:'ambiguous-result'};
+      const text = protocolText(receipt.stdout,4096);
+      const reply = JSON.parse(text);
+      // Only the fixed wrapper's protected prepared state can certify no execution.
+      if (reply && Object.keys(reply).sort().join(',') === 'nonce,phase,reason,run,siblings,started,v'
+        && reply.v === 1 && reply.nonce === nonce && reply.run === run
+        && reply.phase === 'rejected' && reply.reason === 'snapshot-rejected'
+        && reply.siblings === true && reply.started === false)
+        return {mode:'not-started',terminated:true,reason:'forge-rejected:'+reply.reason};
+      if(!verifyReceipt(text,expected,result.code)) return {mode:'unconfirmed',reason:'ambiguous-result'};
       return {mode:'remote',code:result.code};
     } catch {return {mode:'unconfirmed',reason:'ambiguous-result'};}
   } finally {
@@ -307,8 +395,8 @@ export function verifyReceipt(text, expected, code) {
   try {
     const receipt=JSON.parse(text);
     return receipt && typeof expected?.manifestDigest === 'string' && /^[a-f0-9]{64}$/.test(expected.manifestDigest)
-      && Object.keys(receipt).sort().join(',') === 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,v'
-      && Object.entries(expected).every(([key,value])=>receipt[key]===value)
+      && Object.keys(receipt).sort().join(',') === (expected.siblingShas ? 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,siblingShas,v' : 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,v')
+      && Object.entries(expected).every(([key,value])=>key === 'siblingShas' ? sameSiblingShas(receipt[key],value) : receipt[key]===value)
       && receipt.phase==='test' && Number.isInteger(code) && code>=0 && code<255 && receipt.code===code;
   } catch {return false;}
 }
