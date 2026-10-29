@@ -211,6 +211,43 @@ Atomics.wait = function(...args) {
     expect(result.code, result.err).toBe(1);
   }, 60_000);
 
+  it('exits 1 rather than 75 when a hold refusal is followed by a scan timeout', () => {
+    provision(1);
+    const parked = park(1);
+    // A warm snapshot lets the parked candidate reach reset before the tiny scan
+    // budget is exercised. The next poll drops it and delays real git in the scan.
+    const warmed = run(['list', '--acquirable', '--json']);
+    expect(warmed.code, warmed.err).toBe(0);
+    expect(JSON.parse(warmed.out)).toEqual([lane(1)]);
+    const realGit = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+    writeFileSync(preload, readFileSync(preload, 'utf8') + `
+const pollWait = Atomics.wait;
+let delayedScanInstalled = false;
+Atomics.wait = function(...args) {
+  if (!delayedScanInstalled && new Error().stack.includes('cmdAcquire')) {
+    delayedScanInstalled = true;
+    // Keep the scan's real elapsed time visible despite the poll clock hook.
+    const scanStart = process.hrtime.bigint();
+    Date.now = () => now + Number((process.hrtime.bigint() - scanStart) / 1000000n);
+    fs.rmSync(${JSON.stringify(join(pool, 'holdtest', '.list-acquirable-cache.json'))});
+    fs.writeFileSync(${JSON.stringify(join(bin, 'git'))},
+      '#!/bin/sh\\nif [ -n "$GIT_SHIM_SLEEP" ]; then sleep "$GIT_SHIM_SLEEP"; fi\\nexec "$LANE_POOL_TEST_REAL_GIT" "$@"\\n',
+      { mode: 0o755 });
+  }
+  return pollWait.apply(this, args);
+};
+`);
+    const result = acquire(2500, ['--scan-timeout-ms=100', '--no-verdict-memo', '--lane-clean-reuse-ms=0'], { LANE_POOL_TEST_REAL_GIT: realGit, GIT_SHIM_SLEEP: '1' });
+    expect(result.err.match(/lane-1: reset REFUSED — lane-hold:/g)).toHaveLength(1);
+    expect(result.err).toContain('acquirability scan itself did not finish');
+    expect(events().some((e) => e.kind === 'acquire-wait')).toBe(true);
+    expect(events().filter((e) => e.kind === 'scan').length).toBeGreaterThanOrEqual(1);
+    expect(existsSync(lease(1))).toBe(false);
+    expect(readFileSync(join(lane(1), '.git', '.fix-await-verify'), 'utf8')).toBe(parked);
+    expect(result.out.trim()).toBe('');
+    expect(result.code, result.err).toBe(1);
+  }, 60_000);
+
   it('never hands out or modifies a lane held by a live foreign lease', () => {
     provision(2);
     const held = run(['acquire', '--lane=1', '--session=foreign-live-owner', '--json']);

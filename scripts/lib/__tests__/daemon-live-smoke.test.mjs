@@ -1,7 +1,7 @@
 /**
  * @file scripts/lib/__tests__/daemon-live-smoke.test.mjs
  * @description #3383 — the live smoke gate a daemon clone runs after a self-sync merge, before restarting onto
- *   it. Every check runs through an INJECTED `runChild` here (never a real child process) so this suite is
+ *   it. Checks run through an INJECTED `runChild`; one bounded local Node exit probe verifies real error shapes. The suite is
  *   hermetic and fast; the real live behavior (a real lane-pool lease, a real `gh` call, a real reconcile-pass
  *   dry-run) is proven separately as a one-off script against a real/throwaway clone (see the PR body), not in
  *   vitest.
@@ -40,6 +40,7 @@ import {
   resolveIoBoundLoadScale, resolveSmokeGithubPerOwner, resolveSmokeReadMemo, resolveSmokeDryRun,
 } from '../daemon-live-smoke.mjs';
 
+import { runBounded } from '../bounded-child.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 vi.mock('../settings-files.mjs', async (original) => {
   const actual = await original();
@@ -76,6 +77,30 @@ describe('lane acquire smoke after lane-hold reset refusal', () => {
     expect(row).toMatchObject({ ok: true, skipped: true, skipReason: 'lane-hold-refused' });
     expect(acquires(runChild)).toHaveLength(2);
     expect(runChild.mock.calls.some(([, args]) => args.some((a) => /^--lane=/.test(a)))).toBe(false);
+  });
+
+  it('classifies real runBounded exits: two 75s skip, while exit 1 fails', async () => {
+    await expect(runBounded(process.execPath, ['-e', 'process.exit(75)'], {
+      timeoutMs: 5000, maxBytes: 1024,
+    })).rejects.toMatchObject({ status: 75, signal: null });
+    for (const status of [75, 1]) {
+      const runChild = vi.fn((_cmd, args, opts) => {
+        expect(args[1]).toBe('acquire');
+        return runBounded(process.execPath, ['-e', `process.exit(${status})`], {
+          ...opts, cwd: process.cwd(), timeoutMs: 5000, maxBytes: 1024,
+        });
+      });
+      const row = await check.run(context(runChild));
+      if (status === 75) {
+        expect(row).toMatchObject({ ok: true, skipped: true, skipReason: 'lane-hold-refused' });
+        expect(acquires(runChild)).toHaveLength(2);
+      } else {
+        expect(row.ok).toBe(false);
+        expect(row.skipped).not.toBe(true);
+        expect(acquires(runChild)).toHaveLength(1);
+      }
+      expect(runChild).toHaveBeenCalledTimes(status === 75 ? 2 : 1);
+    }
   });
 
   it.each([

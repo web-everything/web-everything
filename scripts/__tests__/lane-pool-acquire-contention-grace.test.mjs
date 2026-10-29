@@ -20,6 +20,7 @@ const git = (args, cwd) => execFileSync(REAL_GIT, args, { cwd, encoding: 'utf8',
 const cachePath = () => join(pool, '.list-acquirable-cache.json');
 const readCache = () => JSON.parse(readFileSync(cachePath(), 'utf8'));
 const writeCache = (cache) => writeFileSync(cachePath(), JSON.stringify(cache) + '\n');
+const refreshCache = () => writeCache({ ...readCache(), writtenAt: Date.now() });
 
 function runPool(args, extraEnv = {}) {
   const r = spawnSync(process.execPath, [SCRIPT, ...args,
@@ -63,16 +64,19 @@ function seedClaimedPool() {
   expect(list().map((p) => Number(p.match(/lane-(\d+)$/)[1]))).toEqual([1, 2, 3, 4]);
   expect(scanProbes().length, 'warm list must really probe the untouched lanes').toBeGreaterThan(0);
   const cached = readCache();
+  refreshCache();
+  const fresh = readCache();
   const first = acquire('first-holder');
   expect(first.lane).toBe(1);
   // The first claim leaves the pre-claim list in place but changes lease state.
-  expect(readCache()).toEqual(cached);
-  expect(Date.now() - cached.writtenAt, 'fixture must still be inside the default grace').toBeLessThan(DEFAULT_GRACE_MS);
+  expect(fresh).toEqual({ ...cached, writtenAt: fresh.writtenAt });
+  expect(readCache()).toEqual(fresh);
   return first;
 }
 
-function expectSecondLane(first, extraEnv = {}, { rescans = false, extraArgs = [] } = {}) {
+function expectSecondLane(first, extraEnv = {}, { rescans = false, extraArgs = [], cacheAgeMs = 0 } = {}) {
   const before = scanProbes().length;
+  writeCache({ ...readCache(), writtenAt: Date.now() - cacheAgeMs });
   const second = acquire('second-holder', extraEnv, extraArgs);
   expect(second.lane).toBe(2);
   expect(second.lane).not.toBe(first.lane);
@@ -121,7 +125,7 @@ describe('acquire shared-list contention grace', () => {
     // Release just the lease: retain the empty snapshot and its pre-release fingerprint.
     rmSync(join(pool, 'lane-3', '.git', '.lane-lease'));
     expect(readCache()).toEqual(cached);
-    expect(Date.now() - cached.writtenAt).toBeLessThan(DEFAULT_GRACE_MS);
+    refreshCache();
     const before = scanProbes().length;
     const released = acquire('released-lane-picker', { LANE_POOL_ACQUIRE_GROWTH_MAX_NEW: '0' }, ['--wait-ms=0']);
     expect(released.lane).toBe(3);
@@ -145,6 +149,7 @@ describe('acquire shared-list contention grace', () => {
         lanes: [1, 2].map((n) => ({ lane: n, path: join(pool, `lane-${n}`), head: 'deadbeef', branch: 'main' })),
       }));
     }
+    refreshCache();
     const second = runPool([
       'acquire', '--session=first-holder', '--wait-ms=0', '--json',
       ...(source === 'scan cache' ? ['--no-free-list'] : []),
@@ -160,6 +165,7 @@ describe('acquire shared-list contention grace', () => {
     const marker = join(pool, 'lane-1', '.git', '.lane-lease');
     const lease = JSON.parse(readFileSync(marker, 'utf8'));
     writeFileSync(marker, JSON.stringify({ ...lease, acquiredAt: '2000-01-01T00:00:00.000Z' }) + '\n');
+    refreshCache();
     const second = acquire('first-holder');
     expect(second.lane).toBe(first.lane);
     expect(second.holder).not.toBe(first.holder);
@@ -215,6 +221,7 @@ fs.readFileSync = function(path, ...args) {
 syncBuiltinESMExports();
 `);
     const before = scanProbes().length;
+    refreshCache();
     const second = acquire('second-holder', {
       NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --import=${pathToFileURL(preload).href}`,
       LANE_POOL_TEST_CACHE: cachePath(), LANE_POOL_TEST_LOCK: join(pool, '.list-acquirable.lock'),
@@ -243,6 +250,7 @@ syncBuiltinESMExports();
 
   it('list --acquirable still rescans on a fingerprint mismatch inside the grace', () => {
     seedClaimedPool();
+    refreshCache();
     const before = scanProbes().length;
     expect(list().map((p) => Number(p.match(/lane-(\d+)$/)[1]))).toEqual([2, 3, 4]);
     expect(scanProbes().length).toBeGreaterThan(before);
@@ -250,20 +258,17 @@ syncBuiltinESMExports();
 
   it('rescans a cache older than the default grace even though its normal TTL has not expired', () => {
     const first = seedClaimedPool();
-    writeCache({ ...readCache(), writtenAt: Date.now() - DEFAULT_GRACE_MS - 1000 });
-    expectSecondLane(first, {}, { rescans: true });
+    expectSecondLane(first, {}, { rescans: true, cacheAgeMs: DEFAULT_GRACE_MS + 1000 });
   }, 30_000);
 
   it('honours LANE_POOL_LIST_CONTENTION_GRACE_MS when it extends the grace', () => {
     const first = seedClaimedPool();
-    writeCache({ ...readCache(), writtenAt: Date.now() - 9000 });
-    expectSecondLane(first, { LANE_POOL_LIST_CONTENTION_GRACE_MS: '20000' });
+    expectSecondLane(first, { LANE_POOL_LIST_CONTENTION_GRACE_MS: '20000' }, { cacheAgeMs: 9000 });
   }, 30_000);
 
   it('honours LANE_POOL_LIST_CONTENTION_GRACE_MS when it shortens the grace', () => {
     const first = seedClaimedPool();
-    writeCache({ ...readCache(), writtenAt: Date.now() - 2000 });
-    expectSecondLane(first, { LANE_POOL_LIST_CONTENTION_GRACE_MS: '1000' }, { rescans: true });
+    expectSecondLane(first, { LANE_POOL_LIST_CONTENTION_GRACE_MS: '1000' }, { rescans: true, cacheAgeMs: 2000 });
   }, 30_000);
 
   it.each([
@@ -271,15 +276,13 @@ syncBuiltinESMExports();
     { grace: 1000, age: 2000, rescans: true, envGrace: '20000' },
   ])('honours --list-contention-grace-ms=$grace over the environment (rescans=$rescans)', ({ grace, age, rescans, envGrace }) => {
     const first = seedClaimedPool();
-    writeCache({ ...readCache(), writtenAt: Date.now() - age });
     expectSecondLane(first, { LANE_POOL_LIST_CONTENTION_GRACE_MS: envGrace }, {
-      rescans, extraArgs: [`--list-contention-grace-ms=${grace}`],
+      rescans, cacheAgeMs: age, extraArgs: [`--list-contention-grace-ms=${grace}`],
     });
   }, 30_000);
 
   it('resolves contention grace lazily when reading the cache', () => {
     const first = seedClaimedPool();
-    writeCache({ ...readCache(), writtenAt: Date.now() - 2000 });
     const preload = join(base, 'change-grace-at-cache-read.test.mjs');
     writeFileSync(preload, `import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
@@ -295,7 +298,7 @@ syncBuiltinESMExports();
     expectSecondLane(first, {
       LANE_POOL_LIST_CONTENTION_GRACE_MS: '20000', LANE_POOL_TEST_CACHE: cachePath(),
       NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --import=${pathToFileURL(preload).href}`,
-    }, { rescans: true });
+    }, { rescans: true, cacheAgeMs: 2000 });
   }, 30_000);
 
   it('fails closed on a cache key mismatch even inside the contention grace', () => {
