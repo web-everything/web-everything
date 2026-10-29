@@ -958,6 +958,11 @@ it('xxh4zw8 replay soak reaches one exact-head heal sink, holds subsequent ticks
 });
 
 describe('CI-heal salvage before agent dispatch', () => {
+  it('preserves earlier infra discounts when the same session ends with lease-lost', async () => {
+    const { default: scenario } = await import('../../conveyor/soak/breaks/fix-run-lease-lost-alignment.mjs');
+    expect(scenario.judge(await scenario.run())).toEqual([]);
+  });
+
   const entry = { kind: 'ci-heal', prNumber: 3895, headRefName: 'lane/session-watchdog', headRefOid: 'a'.repeat(40) };
   async function exercise(salvage, overrides = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'ci-heal-salvage-dispatch-'));
