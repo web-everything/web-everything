@@ -17,7 +17,7 @@
  *        tests prove the SAME head-sha-rotation scenario is now refused.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -679,6 +679,7 @@ it.each([false, true])('default claim refresh keeps a live wrapped fixing claim 
 // "live, non-terminal" and was heartbeated forever. An idle session whose PR head has not moved for the configured
 // time stops being heartbeated; its claim is released and logged as an event. A working session keeps its claim.
 describe('idle-claim auto-release (R201)', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
   const IDLE_MS = 30 * 60_000;
   const acquire = (pr = 5996) => acquireFixDispatchClaim({ repo: 'we', pr, kind: 'fix', headSha: 'sha1', owner: 'A', lockRoot: claimRoot, nowMs: T0, nowIso: iso(T0), leaseMinutes: 10 });
   const sweep = (at, { state = 'idle', head = 'sha1', events = [], extra = {} } = {}) => refreshLiveFixDispatchClaims({
@@ -700,15 +701,19 @@ describe('idle-claim auto-release (R201)', () => {
     expect(readPrHead({ repo: 'we', pr: 5996 })).toBeNull();
   });
 
-  it.each(['malformed JSON', '{"headRefOid":""}', '{"headRefOid":"   "}'])('readPrHead fails closed for %s', (output) => {
+  it.each(['', 'malformed JSON', 'null', '{}', '{"headRefOid":42}', '{"headRefOid":""}', '{"headRefOid":"   "}'])('readPrHead fails closed for %s', (output) => {
     execFileSyncThrottled.mockReturnValueOnce(output);
     expect(readPrHead({ repo: 'we', pr: 5996 })).toBeNull();
   });
 
-  it('readPrHead returns a valid head sha', () => {
+  it.each(['we', 'web-everything/web-everything'])('readPrHead maps %s to the gh repo slug and requests headRefOid with bounded I/O', (repo) => {
     const sha = 'a'.repeat(40);
-    execFileSyncThrottled.mockReturnValueOnce(JSON.stringify({ headRefOid: sha }));
-    expect(readPrHead({ repo: 'we', pr: 5996 })).toBe(sha);
+    execFileSyncThrottled.mockClear().mockReturnValueOnce(JSON.stringify({ headRefOid: sha }));
+    expect(readPrHead({ repo, pr: 5996 })).toBe(sha);
+    expect(execFileSyncThrottled).toHaveBeenCalledTimes(1);
+    expect(execFileSyncThrottled).toHaveBeenCalledWith('gh', [
+      'pr', 'view', '5996', '--repo', 'web-everything/web-everything', '--json', 'headRefOid',
+    ], { encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 });
   });
 
   it.each(['throws', 'rejects'])('recordIdleRelease does not throw or leave an unhandled rejection when appendDaemonEvent %s', async (failure) => {
@@ -732,6 +737,8 @@ describe('idle-claim auto-release (R201)', () => {
 
   it('resolves the idle window through the policy cascade: default 30 min from the standard layer, env overrides, both with sources', () => {
     const d = resolveIdleClaimRelease({ env: {}, platform: null });
+    expect(d.enabled).toBe(true);
+    expect(d.sources.enabled).toBe('standard');
     expect(d.idleMinutes).toBe(30);
     expect(d.sources.idleMinutes).toMatch(/standard/);
     const e = resolveIdleClaimRelease({ env: { WE_IDLE_CLAIM_RELEASE_MINUTES: '5' }, platform: null });
@@ -739,13 +746,16 @@ describe('idle-claim auto-release (R201)', () => {
     expect(e.sources.idleMinutes).toMatch(/env/);
   });
 
-  it('resolves platform preferences with provenance and lets environment override both leaves', () => {
-    const platform = { fixLoop: { idleClaimRelease: { enabled: false, idleMinutes: 12 } } };
-    expect(resolveIdleClaimRelease({ env: {}, platform })).toEqual({
-      enabled: false, idleMinutes: 12, sources: { enabled: 'platform', idleMinutes: 'platform' }, invalid: [],
-    });
-    expect(resolveIdleClaimRelease({ env: { WE_IDLE_CLAIM_RELEASE_ENABLED: '1', WE_IDLE_CLAIM_RELEASE_MINUTES: '5' }, platform })).toEqual({
-      enabled: true, idleMinutes: 5, sources: { enabled: 'env', idleMinutes: 'env' }, invalid: [],
+  it.each([
+    ['platform overrides standard', false, {}, false, 12, 'platform', 'platform'],
+    ['environment overrides enabled', false, { WE_IDLE_CLAIM_RELEASE_ENABLED: '1' }, true, 12, 'env', 'platform'],
+    ['environment overrides minutes', false, { WE_IDLE_CLAIM_RELEASE_MINUTES: '5' }, false, 5, 'platform', 'env'],
+    ['environment overrides both leaves', false, { WE_IDLE_CLAIM_RELEASE_ENABLED: '1', WE_IDLE_CLAIM_RELEASE_MINUTES: '5' }, true, 5, 'env', 'env'],
+    ['environment disables platform', true, { WE_IDLE_CLAIM_RELEASE_ENABLED: '0' }, false, 12, 'env', 'platform'],
+  ])('platform idle-release policy: %s with provenance', (_name, platformEnabled, env, enabled, idleMinutes, enabledSource, minutesSource) => {
+    const platform = { fixLoop: { idleClaimRelease: { enabled: platformEnabled, idleMinutes: 12 } } };
+    expect(resolveIdleClaimRelease({ env, platform })).toEqual({
+      enabled, idleMinutes, sources: { enabled: enabledSource, idleMinutes: minutesSource }, invalid: [],
     });
   });
 
@@ -915,18 +925,28 @@ describe('idle-claim auto-release (R201)', () => {
     expect(result.refreshed).toHaveLength(1);
   });
 
-  it('the default PR-head and event adapters append the idle release event', () => {
+  it('the default PR-head and event adapters append one daemon JSONL event with policy provenance', async () => {
     acquire();
+    vi.stubEnv('WE_DAEMON_EVENTS', join(claimRoot, 'events', 'daemon-events.jsonl'));
     const sha = 'a'.repeat(40);
     execFileSyncThrottled.mockReturnValueOnce(JSON.stringify({ headRefOid: sha }))
       .mockReturnValueOnce(JSON.stringify({ headRefOid: sha }));
-    appendDaemonEvent.mockClear().mockResolvedValueOnce(undefined);
+    appendDaemonEvent.mockClear();
     const idleRelease = resolveIdleClaimRelease({ env: { WE_IDLE_CLAIM_RELEASE_MINUTES: '5' }, platform: null });
     const extra = { prHeadFor: undefined, recordEvent: undefined, idleRelease };
     sweep(T0 + 60_000, { extra });
     expect(sweep(T0 + 6 * 60_000, { extra }).released).toHaveLength(1);
     expect(appendDaemonEvent).toHaveBeenCalledTimes(1);
     expect(appendDaemonEvent).toHaveBeenCalledWith({
+      kind: 'idle-claim-released', repo: 'we', pr: 5996, daemon: 'reconcile-fix-dispatch',
+      detail: { kind: 'fix', idleMinutes: 5, sources: idleRelease.sources,
+        headSha: sha, idleSince: iso(T0 + 60_000), owner: 'A' },
+    });
+    expect(await appendDaemonEvent.mock.results[0].value).toBe(true);
+    const lines = readFileSync(process.env.WE_DAEMON_EVENTS, 'utf8').trimEnd().split('\n');
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0])).toEqual({
+      at: expect.any(String),
       kind: 'idle-claim-released', repo: 'we', pr: 5996, daemon: 'reconcile-fix-dispatch',
       detail: { kind: 'fix', idleMinutes: 5, sources: idleRelease.sources,
         headSha: sha, idleSince: iso(T0 + 60_000), owner: 'A' },
@@ -987,17 +1007,31 @@ describe('idle-claim auto-release (R201)', () => {
     expect(readFixDispatchClaim(key).meta.idleHead).toEqual({ sha: 'sha1', since: iso(next), lastSeen: iso(next) });
   });
 
-  it('one working row alongside an idle row prevents release and clears the clock', () => {
+  it.each([
+    ['mixed idle and working rows retain the claim and clear the idle clock', ['idle', 'working'], false],
+    ['all idle rows release the claim', ['idle', 'idle'], true],
+    ['idle and done rows release the claim', ['idle', 'done'], true],
+    ['idle and stopped rows release the claim', ['idle', 'stopped'], true],
+    ['idle and failed rows release the claim', ['idle', 'failed'], true],
+  ])('%s beyond the idle window', (_name, states, shouldRelease) => {
     acquire();
     const first = T0 + 60_000;
-    const at = first + IDLE_MS;
+    const at = first + IDLE_MS + 1;
     sweep(first);
-    sweepThrough(first, at - 1);
+    sweepThrough(first, first + IDLE_MS - 1);
     const prHeadFor = vi.fn(() => 'sha1');
     const events = [];
     const result = sweep(at, { events, extra: { prHeadFor,
-      listAgentsAll: () => [{ name: 'fix-5996', state: 'idle' }, { name: 'fix-5996', state: 'working' }],
+      listAgentsAll: () => states.map((state) => ({ name: 'fix-5996', state })),
     } });
+    if (shouldRelease) {
+      expect(result.released).toHaveLength(1);
+      expect(result.refreshed).toHaveLength(0);
+      expect(readFixDispatchClaim({ repo: 'we', pr: 5996, lockRoot: claimRoot })).toBeNull();
+      expect(prHeadFor).toHaveBeenCalledOnce();
+      expect(events).toHaveLength(1);
+      return;
+    }
     expect(result.released ?? []).toHaveLength(0);
     expect(result.refreshed).toHaveLength(1);
     const retained = readFixDispatchClaim({ repo: 'we', pr: 5996, lockRoot: claimRoot });
