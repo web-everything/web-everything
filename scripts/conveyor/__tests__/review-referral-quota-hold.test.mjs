@@ -97,6 +97,21 @@ describe.each([false, true])('reviewRunEvidence quotaOnly (completed: %s)', comp
 
 describe('incomplete quota evidence after the seat phase', () => {
   it.each([
+    ['object records', {}],
+    ['string records', 'provider-quota'],
+    ['null records', null],
+    ['null record elements', [null]],
+    ['a null element mixed with a quota failure', [
+      { failure: "You've hit your weekly limit" }, null,
+    ]],
+  ])('fails closed without throwing for malformed referral evidence: %s', (_, records) => {
+    const run = reviewRun();
+    run.findings.mandatoryReferrals = { effects: [{ type: 'review.mandatory-referrals',
+      result: { records } }] };
+    expect(reviewRunEvidence(run)).toMatchObject({ incomplete: true, quotaOnly: false });
+  });
+
+  it.each([
     ['no verdict', { seat: 'judgeStyle', finishedAt: iso(at + 1) }],
     ['no finishedAt', { seat: 'judgeStyle', verdict: 'accept' }],
     ['neither verdict nor finishedAt', { seat: 'judgeStyle', startedAt: iso(at) }],
