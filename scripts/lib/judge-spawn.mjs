@@ -689,13 +689,12 @@ export function buildJudgeArgv({
   ];
 }
 
-function markQuotaFailure(error, ...texts) {
-  for (const text of texts) {
-    const holdRow = quotaHoldRow({ provider: 'claude', error: text });
-    if (!holdRow) continue;
+function markQuotaFailure(error, text) {
+  // Only a parsed CLI failure result is evidence; raw streams may contain incidental logs.
+  const holdRow = quotaHoldRow({ provider: 'claude', error: text });
+  if (holdRow) {
     Object.assign(error, { quota: true, holdRow,
       telemetry: { ...error.telemetry, failureKind: 'provider-quota', failureText: text.slice(0, 500) } });
-    break;
   }
   return error;
 }
@@ -996,9 +995,9 @@ export async function judgeSpawn({
         log(`judge-spawn: juror ${lens || '-'} attempt ${attempt}/${total} emitted no parseable JSON (exit ${code ?? 'none'}, signal ${signal ?? 'none'}, stdout ${stdout.length} bytes${snippet ? `, stderr: ${snippet}` : ''}); retrying with a fresh session id ${nextSid} — ${UNPARSEABLE_RETRY_SETTING.key}=${retries} (source: ${setting.source})`);
         continue;
       }
-      throw markQuotaFailure(new JudgeUnparseableError({
+      throw new JudgeUnparseableError({
         attempt, attempts: total, exitCode: code, signal, stdout, stderr, wallMs, sessionId: thisSid, failedAttempts,
-      }), stderr, stdout);
+      });
     }
     return { ...outcome, wallMs, attempts: attempt, failedAttempts, timedOut: false, loadedContextTokens: loadedContextTokens(outcome.usage), argv };
   }

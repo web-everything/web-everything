@@ -6,11 +6,11 @@ export function isQuotaError(text) {
   if (typeof text !== 'string') return false;
   // Strip only provider prefixes at the start; incidental log mentions are not evidence.
   const unwrapped = text.replace(/^(?:API Error|Error):\s*/i, '');
-  // A bare phrase like "too many requests" can describe a local configuration error.
-  if (/^(?:(?:HTTP|status)\s+429\b|429\s+Too Many Requests\b)/i.test(unwrapped)) return true;
+  // Require a quota reason after 429; bare statuses also occur in fixture diagnostics.
+  if (/^(?:(?:HTTP|status)\s+)?429(?:\s*:\s*|\s+)(?:Too Many Requests|Rate limit exceeded)\b/i.test(unwrapped)) return true;
   const message = unwrapped.replace(/^\d{3}\s+/, '');
   // Match complete provider error codes, not similarly named configuration fields.
-  if (/^(?:error type:\s*)?(?:rate_limit_error|insufficient_quota)\s*$/i.test(message)) return true;
+  if (/^(?:error type:\s*)?(?:rate_limit_error|insufficient_quota)(?:\s|$)/i.test(message)) return true;
   // Resource exhaustion needs an explicit quota reason; the token alone also covers memory failures.
   if (/^(?:resource_exhausted:\s*quota exceeded|you exceeded your current quota|you['’]ve hit your (?:weekly|daily|monthly|usage|session|hourly|5-hour) limit)\b/i.test(message)) return true;
   if (!message.startsWith('{')) return false;
