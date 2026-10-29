@@ -566,7 +566,13 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
       .rejects.toThrow('Not logged in · Please run /login');
   });
 
-  it.each(["You've hit your weekly limit · resets ...", 'HTTP 429', 'rate_limit', 'rate limit', 'too many requests'])
+  it.each([
+    "You've hit your weekly limit · resets ...", 'HTTP 429', 'rate_limit', 'rate limit', 'too many requests',
+    "You've hit your weekly limit · resets Oct 30 at 4pm (America/Toronto)",
+    "You've hit your usage limit",
+    '429 {"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}',
+    'API Error: 429 rate_limit_error', 'Usage limit reached', 'You exceeded your current quota',
+  ])
     ('tags quota failure %s without changing its message', async result => {
       const { fn } = fakeSpawn(JSON.stringify({ is_error: true, result }), { code: 1 });
       const before = Date.now();
@@ -585,7 +591,11 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
       expect(scoredAt).toBeLessThanOrEqual(Date.now());
     });
 
-  it.each(['schema invalid', ''])('leaves non-quota failure %j untagged and countable', async result => {
+  it.each([
+    'schema invalid', '',
+    'RESOURCE_EXHAUSTED: Out of memory', 'TypeError: rate limit is not a function',
+    'build log mentions HTTP 429 in a fixture', 'disk quota exceeded',
+  ])('leaves non-quota failure %j untagged and countable', async result => {
     const { fn } = fakeSpawn(JSON.stringify({ is_error: true, result }), { code: 1 });
     const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, spawnFn: fn })
       .catch(e => e);
