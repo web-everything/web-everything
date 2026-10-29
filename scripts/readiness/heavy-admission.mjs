@@ -425,6 +425,7 @@ const LEGACY_REMOTE_PRE_EXECUTION_REASONS = Object.freeze([
   'invalid-parameters',
   'forge-unreachable',
   'copy-failed',
+  'ignored-test-file',
   'unsupported-sibling-dependency',
 ]);
 

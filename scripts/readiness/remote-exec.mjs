@@ -168,7 +168,11 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
       if(prepared.code !== 0) throw new Error('Prepare failed');
       run = JSON.parse(protocolText(prepared.stdout,1024)).run;
       if(typeof run !== 'string' || !/^r-[a-f0-9]{32}$/.test(run)) {run=undefined; throw new Error('Invalid server run');}
-      const copied = await exec({file:'rsync',args:['-a','-r','--no-links','--safe-links','--no-implied-dirs','--delete','--exclude=.exit-code',
+      // Never expand a listed leaf that becomes a directory while prepare awaits:
+      // even server-side rejection would happen after disclosing its children.
+      // prepare creates a fresh work tree; deletion is unnecessary and requires
+      // directory transfer on older rsync implementations.
+      const copied = await exec({file:'rsync',args:['-a','--no-recursive','--no-dirs','--no-links','--safe-links','--no-implied-dirs','--exclude=.exit-code',
         '--from0','--files-from=-','--rsync-path=sudo -u forge-exec rsync','-e',`ssh ${SSH_OPTIONS.join(' ')}`,
         './',`${host}:${ROOT}/${run}/work/`],cwd,input:inventory});
       if(copied.code !== 0) throw new Error('Copy failed');

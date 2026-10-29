@@ -12,6 +12,7 @@ import {
 import { createRunner, digestInput, digestArgv } from '../forge-exec-run.mjs';
 import * as remoteManifestAPI from '../remote-exec.mjs';
 import * as forgeManifestAPI from '../forge-exec-run.mjs';
+import { adaptLegacyRemoteResult, resolveAdmissionPolicy, runWithRemoteDecision } from '../heavy-admission.mjs';
 
 const argv = ['npm', 'run', 'test:unit', '--', 'a.test.mjs'];
 const runId = 'abcdef-1';
@@ -549,6 +550,54 @@ describe('validateRunId', () => {
 });
 
 describe('runRemote', () => {
+  it('admits local execution for a Git-ignored test through the real legacy adapter', async () => {
+    const f = fixture();
+    const exec = f.exec;
+    f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i')
+      ? {code:0, stdout:Buffer.from('scripts/__tests__/ignored.test.mjs\0')}
+      : exec(call));
+    const result = await runWithRemoteDecision({
+      argv:f.argv, cwd, env:{}, log:vi.fn(), loadPerCore:() => 0,
+      policy:resolveAdmissionPolicy({platform:{remote:{enabled:true, mode:'always'}}}),
+      remoteExec:async options => adaptLegacyRemoteResult(await runRemote({...f, ...options})),
+    });
+    expect(result).toEqual({handled:false});
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+
+  it('never transmits unlisted children when a validated file becomes a directory during prepare', async () => {
+    const f = fixture();
+    mkdirSync(join(cwd, 'src'));
+    writeFileSync(join(cwd, 'src', 'kept.mjs'), 'selected nested file');
+    f.listFiles.mockResolvedValue(['package-lock.json', 'a.test.mjs', 'src/kept.mjs']);
+    const exec = f.exec;
+    const destination = join(cwd, 'transport-target');
+    mkdirSync(destination);
+    let copied;
+    f.exec = vi.fn(async call => {
+      if (isPrepare(call)) {
+        rmSync(join(cwd, 'a.test.mjs'));
+        mkdirSync(join(cwd, 'a.test.mjs', 'nested'), {recursive:true});
+        for (const name of ['.env', '.env.example', 'unlisted.txt', 'nested/.env.local', 'nested/unlisted.txt']) {
+          writeFileSync(join(cwd, 'a.test.mjs', name), 'must never leave the client');
+        }
+      }
+      if (call.file === 'rsync') {
+        const args = call.args.filter((arg, i, all) => !arg.startsWith('--rsync-path=') && arg !== '-e' && all[i-1] !== '-e');
+        args[args.length-1] = destination + '/';
+        copied = spawnSync('rsync', args, {cwd, input:call.input, encoding:'utf8', timeout:10000});
+        return {code:copied.status, stdout:copied.stdout};
+      }
+      return exec(call);
+    });
+    await runRemote(f);
+    expect(copied, 'the real rsync transfer must be exercised').toBeDefined();
+    expect(copied.error).toBeUndefined();
+    expect(readFileSync(join(destination, 'package-lock.json'), 'utf8')).toContain('lockfileVersion');
+    expect(readFileSync(join(destination, 'src', 'kept.mjs'), 'utf8')).toBe('selected nested file');
+    expect(readdirSync(destination, {recursive:true}).sort()).toEqual(['package-lock.json', 'src', 'src/kept.mjs']);
+  });
+
   it.each(['scripts/__tests__/.env.local/hidden.test.mjs','scripts/__tests__/.env.local/hidden.js','hidden.spec.ts','dist/hidden.test.mjs','build/hidden.test.mjs'])
   ('falls back for a Git-ignored test instead of certifying remote success: %s', async name => {
     spawnSync('git',['init','--quiet'],{cwd});
@@ -709,7 +758,9 @@ describe('runRemote', () => {
     const copy = calls.find((call) => call.file === 'rsync');
     expect(copy.args.join(' ')).toMatch(/--files-from(?:=|\s)-/);
     expect(copy.args).toContain('--from0');
-    expect(copy.args).toEqual(expect.arrayContaining(['-r','--no-links','--safe-links','--no-implied-dirs']));
+    expect(copy.args).toEqual(expect.arrayContaining(['--no-recursive','--no-dirs','--no-links','--safe-links','--no-implied-dirs']));
+    expect(copy.args).not.toContain('-r');
+    expect(copy.args).not.toContain('--delete');
     expect(copy.args).not.toContain('-L');
     expect(copy.args).toContain('--exclude=.exit-code');
     expect(calls.findIndex(isPrepare)).toBeLessThan(calls.indexOf(copy));

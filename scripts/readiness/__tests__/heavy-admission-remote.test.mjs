@@ -203,6 +203,7 @@ describe('adaptLegacyRemoteResult', () => {
     'invalid-parameters',
     'forge-unreachable',
     'copy-failed',
+    'ignored-test-file',
     'unsupported-sibling-dependency',
   ])('maps %s to a confirmed non-start only at the adapter boundary', async (reason) => {
     const legacy = { mode: 'fallback', reason };
