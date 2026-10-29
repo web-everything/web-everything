@@ -1452,7 +1452,7 @@ function redTeamRecoveryGuard({ pr, repo, head, redTeamMode, redTeamAdmission },
   } catch { return refuse('PR comments unreadable'); }
   if (redTeamForHead(comments, pr, head)) return refuse('red-team result already on head', true);
   if (redTeamMode === 'fresh') {
-    // Only production admission may clear an abandoned writer after proving it dead.
+    // Only production admission may clear abandonment after checking claims and re-probing owner staleness.
     if (status?.status === 'running') return refuse('prior red-team status; not re-run');
     const rows = seatRows(records).filter(row => row.seat === RED_TEAM_SEAT.seat && row.repo === repo
       && Number(row.pr) === Number(pr) && row.rev === head);
@@ -1901,7 +1901,7 @@ export function replayPayload({ view, diffText }) {
 // ── CLI ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 /** CLI boundary; injected red-team effects keep recovery tests free of paid calls. */
-export function runExtraSeatsCli(argv = process.argv.slice(2), { redTeamIo } = {}) {
+export function runExtraSeatsCli(argv = process.argv.slice(2), { redTeamIo, runRedTeam: redTeamEntry = runRedTeam } = {}) {
   const [sub, ...rest] = argv;
   const flag = (name) => {
     const hit = rest.find((a) => a.startsWith(`--${name}=`));
@@ -1918,7 +1918,7 @@ export function runExtraSeatsCli(argv = process.argv.slice(2), { redTeamIo } = {
     runExtraSeats({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload() })
       .then((result) => emit(result, renderSeatSummary));
   } else if (sub === 'red-team' && flag('pr') && flag('repo') && flag('lane') && flag('loop-json')) {
-    return runRedTeam({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload(), post: !rest.includes('--no-post'), resumeOnly: rest.includes('--resume-only'),
+    return redTeamEntry({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload(), post: !rest.includes('--no-post'), resumeOnly: rest.includes('--resume-only'),
       redTeamStaleRecovery: rest.includes('--red-team-stale-recovery'),
       redTeamMode: flag('red-team-mode'), redTeamAdmission: flag('red-team-admission') === undefined ? undefined : JSON.parse(flag('red-team-admission')) }, redTeamIo)
       .then((result) => emit(result, renderRedTeamSummary));

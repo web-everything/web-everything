@@ -397,7 +397,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           const retry = input.redTeamMode === 'fresh' && failedRedTeamRetry(admissionPrior, readEvidence(key));
           const withoutRun = redTeamStatusWithoutRun(admissionPrior, {
             originalStatus: prior, allowAbandonedRunning: input.redTeamStaleRecovery === true
-              && verifiedStaleRedTeamAbandonment(key, admissionPrior),
+              && verifiedStaleRedTeamAbandonment(key, admissionPrior)
+              && staleRedTeamRun({ status: admissionPrior, deadlineMs: staleRunDeadlineMs(env) }).stale,
           });
           if (input.redTeamMode === 'fresh' && admissionPrior?.status === 'running' && !withoutRun) {
             throw Error('prior red-team status; not re-run');

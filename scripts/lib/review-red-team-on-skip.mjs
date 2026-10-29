@@ -150,12 +150,14 @@ export function abandonStaleRedTeamRun({ repo, pr, head, status, env = process.e
   const key = { repo, pr, head, env }, path = staleStatusPath(key);
   let claim;
   try {
-    const current = JSON.parse(readFileSync(path, 'utf8'));
+    const snapshot = readFileSync(path, 'utf8');
+    const current = JSON.parse(snapshot);
     if (current.repo !== repo || Number(current.pr) !== Number(pr) || current.head !== head
       || current.status !== 'running' || current.result != null
       || current.pid !== status?.pid || current.pidStart !== status?.pidStart
       || current.host !== status?.host || current.pidNamespace !== status?.pidNamespace) return { ok: false };
     if (staleRedTeamRun({ status: current, now, probe, deadlineMs: staleRunDeadlineMs(env) }).stale !== true) return { ok: false };
+    const markers = readStaleRedispatchMarkers(key);
     const { nextOrdinal: attempt, firstMarkerMtimeMs } = staleRedTeamRedispatch(key);
     if (attempt == null || (attempt === 2 && (!isRedispatchedRun(current, firstMarkerMtimeMs)
       || !Number.isFinite(now) || now - firstMarkerMtimeMs < STALE_REDISPATCH_BACKOFF_MS))) return { ok: false };
@@ -163,6 +165,10 @@ export function abandonStaleRedTeamRun({ repo, pr, head, status, env = process.e
     if (!claim.ok) return claim;
     const at = new Date(clock()).toISOString();
     const reason = 'running red team owner is dead or exceeded stale deadline';
+    const latestMarkers = readStaleRedispatchMarkers(key);
+    if (latestMarkers.some((marker, index) => index === attempt - 1 ? !marker
+      : JSON.stringify(marker) !== JSON.stringify(markers[index]))
+      || readFileSync(path, 'utf8') !== snapshot) throw new Error('stale recovery evidence changed');
     writeJsonAtomic(path, { ...current, staleAbandoned: { at, pid: status.pid, reason } });
     const events = daemonEventsPath({ env });
     mkdirSync(dirname(events), { recursive: true });

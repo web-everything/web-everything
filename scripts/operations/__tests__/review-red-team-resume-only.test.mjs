@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createRedTeamIo, priorRedTeamRow, redTeamAlreadyRan, redTeamMarker, runRedTeam, speculateRedTeam } from '../review-extra-seats.mjs';
+import { createRedTeamIo, priorRedTeamRow, redTeamAlreadyRan, redTeamMarker, runExtraSeatsCli, runRedTeam, speculateRedTeam } from '../review-extra-seats.mjs';
 import { readStore } from '../../conveyor/run-scorecard-store.mjs';
 import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
 import { execFileSync } from 'node:child_process';
@@ -298,6 +298,24 @@ if (args[0] === 'pr' && args[1] === 'view' && args.includes('--json') && args.in
 });
 
 describe('red-team CLI recovery mode plumbing', () => {
+  it.each([true, false])('passes stale recovery %s from CLI argv to the red-team entry', async enabled => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-stale-flag-cli-'));
+    const output = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    try {
+      const payloadPath = join(dir, 'loop.json');
+      writeFileSync(payloadPath, JSON.stringify(loopPayload));
+      const entry = vi.fn(async () => ({ status: 'skipped', reason: 'test entry' }));
+      const redTeamIo = {};
+      await runExtraSeatsCli(['red-team', `--pr=${pr}`, `--repo=${repo}`, `--lane=${dir}`,
+        `--loop-json=${payloadPath}`, '--json', ...(enabled ? ['--red-team-stale-recovery'] : [])],
+      { redTeamIo, runRedTeam: entry });
+      expect(entry).toHaveBeenCalledOnce();
+      expect(entry).toHaveBeenCalledWith(expect.objectContaining({
+        pr, repo, lanePath: dir, loopPayload, redTeamStaleRecovery: enabled,
+      }), redTeamIo);
+    } finally { output.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it.each(['fresh', 'resume'])('enforces %s guards through the production child argv with zero model calls', mode => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-recovery-cli-'));
     try {

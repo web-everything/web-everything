@@ -706,7 +706,7 @@ describe('red-team-only review job', () => {
 
   it.each([
     'no markers', 'wrong head', 'pid mismatch', 'invalid abandonment time', 'invalid birth time',
-    'older abandonment than marker 2', 'restarted after cap consumed', 'unreadable marker', 'three dispatch markers',
+    'older abandonment than marker 2', 'restarted after cap consumed', 'unreadable marker', 'all three recovery marker files',
   ])('stale flag cannot authorize production admission with %s', kind => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-stale-trust-'));
     const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
@@ -733,7 +733,7 @@ describe('red-team-only review job', () => {
         row.pidStart = new Date(at + 5000).toISOString();
       }
       if (kind === 'unreadable marker') mkdirSync(`${path}.stale-redispatch-2`);
-      if (kind === 'three dispatch markers') { marker('stale-redispatch-2'); marker('stale-norestart'); }
+      if (kind === 'all three recovery marker files') { marker('stale-redispatch-2'); marker('stale-norestart'); }
       writeJsonAtomic(path, row);
       const prior = readFileSync(path, 'utf8');
       const io = createReviewJobIo({ env,
@@ -773,6 +773,29 @@ describe('red-team-only review job', () => {
         expect(readRedTeamStatus({ repo, pr, head, env })).toMatchObject({ status: 'queued', pid: process.pid });
       } finally { rmSync(dir, { recursive: true, force: true }); }
     });
+
+  it('fresh production admission re-probes a live PID despite verified abandonment and the stale flag', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-live-abandoned-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+    const path = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
+    try {
+      recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'running' }, { env });
+      const row = readRedTeamStatus({ repo, pr, head, env });
+      const at = Date.now();
+      row.staleAbandoned = { at: new Date(at).toISOString(), pid: row.pid };
+      writeJsonAtomic(path, row);
+      writeFileSync(`${path}.stale-redispatch-1`, '');
+      utimesSync(`${path}.stale-redispatch-1`, at / 1000, at / 1000);
+      expect(row.pid).toBe(process.pid);
+      expect(verifiedStaleRedTeamAbandonment({ repo, pr, head, env }, row)).toBe(true);
+      const before = readFileSync(path, 'utf8');
+      // Force earlier evidence reads clear: this assertion depends on admission's own liveness probe.
+      const io = createReviewJobIo({ env, readEvidence: () => ({ inFlight: false, queued: false }) });
+      expect(() => io.redTeamStatus({ repo, pr, loopPayload: payload(), status: 'queued',
+        redTeamMode: 'fresh', redTeamStaleRecovery: true })).toThrow('prior red-team status; not re-run');
+      expect(readFileSync(path, 'utf8')).toBe(before);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
 
   it('fresh production admission holds a live running writer without stale abandonment', () => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-live-running-'));

@@ -2232,6 +2232,8 @@ describe('runRedTeamOnSkip — stale recovery effects', () => {
 });
 
 describe('stale recovery — absolute combined dispatch cap', () => {
+  // Three marker files share two slots: redispatch-1 spends slot 1;
+  // redispatch-2 or norestart spends slot 2. All three files together exceed the cap.
   it.each(['abandon', 'no-restart'])(
     'only one interleaved final claim succeeds when %s reads count 1 first', outer => {
       const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-cap-race-'));
@@ -2355,6 +2357,57 @@ describe('stale recovery — absolute combined dispatch cap', () => {
 });
 
 describe('abandonStaleRedTeamRun — durable ordinal markers', () => {
+  // Status writers do not share a lock or compare-and-swap. The final re-read catches
+  // a replacement before the write, but a writer can still start between that re-read
+  // and writeJsonAtomic's rename. Full exclusion requires cooperation from all writers.
+  it.each(['new running job', 'new queued job', 'new claim marker', 'unreadable status'])(
+    'refuses abandonment when %s appears between the decision and the write', kind => {
+      const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-write-race-'));
+      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_DAEMON_EVENTS: join(dir, 'events.jsonl') };
+      try {
+        recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'running' }, { env });
+        const path = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
+        const status = deadRunningStatus();
+        writeFileSync(path, JSON.stringify(status));
+        const replacement = { ...status, pid: process.pid, pidStart: new Date().toISOString(),
+          status: kind === 'new queued job' ? 'queued' : 'running' };
+        const clock = vi.fn(() => {
+          expect(existsSync(`${path}.stale-redispatch-1`)).toBe(true);
+          if (kind === 'new claim marker') writeFileSync(`${path}.stale-norestart`, '');
+          else writeFileSync(path, kind === 'unreadable status' ? '{' : JSON.stringify(replacement));
+          return Date.now();
+        });
+        expect(staleRecovery.abandonStaleRedTeamRun({ repo, pr, head, env, status,
+          now: staleNow, probe: staleProbe(), clock })).toEqual({ ok: false });
+        expect(clock).toHaveBeenCalledOnce();
+        expect(readFileSync(path, 'utf8')).toBe(kind === 'unreadable status' ? '{'
+          : JSON.stringify(kind === 'new claim marker' ? status : replacement));
+        expect(existsSync(`${path}.stale-redispatch-1`)).toBe(false);
+        expect(existsSync(`${path}.stale-norestart`)).toBe(kind === 'new claim marker');
+        expect(existsSync(env.WE_DAEMON_EVENTS)).toBe(false);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+  it.each([
+    ['first', -1000, true], ['first', -1001, false], ['first', 0, true],
+    ['second', -1000, true], ['second', -1001, false], ['second', 0, true],
+  ])('verifies the %s claim at latestClaim offset %i ms: %s', (ordinal, offset, accepted) => {
+    const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-precision-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+    try {
+      recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'running' }, { env });
+      const path = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
+      for (const suffix of ordinal === 'first' ? ['stale-redispatch-1'] : ['stale-redispatch-1', 'stale-redispatch-2']) {
+        writeFileSync(`${path}.${suffix}`, '');
+        const at = ordinal === 'second' && suffix === 'stale-redispatch-1' ? staleNow - 5000 : staleNow;
+        utimesSync(`${path}.${suffix}`, at / 1000, at / 1000);
+      }
+      const status = deadRunningStatus({ pidStart: new Date(staleNow - 10_000).toISOString(),
+        staleAbandoned: { at: new Date(staleNow + offset).toISOString(), pid: deadRunningStatus().pid } });
+      expect(staleRecovery.verifiedStaleRedTeamAbandonment({ repo, pr, head, env }, status)).toBe(accepted);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it.each([null, {}])('unconfirmed abandonment dispatch %j refunds budget while retaining its marker', result => {
     const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-refund-'));
     const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_DAEMON_EVENTS: join(dir, 'events.jsonl') };
@@ -2579,7 +2632,7 @@ describe('stale red-team recovery — bounded second re-dispatch', () => {
       expect(existsSync(marker2)).toBe(true);
     }, { status, probe, age: staleDeadline * 2 });
   });
-  it('both markers cap a third dead run with an operator-visible inspection reason', () => {
+  it('redispatch markers 1 and 2 exhaust the two-slot cap with an operator-visible inspection reason', () => {
     withRedispatch(({ options, input, statusPath, marker2, events }) => {
       writeFileSync(marker2, '');
       expect(runRedTeamOnSkip(options).rows[0]).toMatchObject({ action: 'skip',
