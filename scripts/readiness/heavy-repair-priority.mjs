@@ -2,6 +2,10 @@
  * @file scripts/readiness/heavy-repair-priority.mjs
  * @description The red-main repair class of the heavy-admission queue (main-fix-queue-priority): which waiter is a
  *   red-main repair (P0) and so takes the next free slot ahead of every other waiter.
+ *   P1 covers fixes and unblocking builds, marked by a purpose prefix `unblock-` OR env WE_HEAVY_UNBLOCK=1.
+ *   The three tiers are P0 > P1 > P2; never preempt a running holder. The policy-cascade leaves
+ *   heavyAdmission.priority.fixPatterns / unblockPatterns are wired in the follow-up (Part B) into
+ *   heavy-admission.mjs. This module only supplies the P1 classifier; the P0 classifier remains independent.
  *
  *   Kept OUT of `./heavy-queue-projection.mjs` on purpose. That module is imported by the read-only `heavy-queue`
  *   operation's declaring module, and `http-adapter.test.mjs` pins that such a module's whole static import graph
@@ -21,6 +25,14 @@ export const DEFAULT_REPAIR_PATTERNS = Object.freeze([
   '^revert-red-(?:[0-9a-f]{7,40}|\\d+)(?:-lane-\\d+-[0-9a-f]+)?$',
 ]);
 export const ADMISSION_PRIORITY_MODES = Object.freeze(['enforce', 'off']);
+export const DEFAULT_FIX_PATTERNS = Object.freeze([
+  '^fix-\\d+(?:-lane-\\d+-[0-9a-f]+)?$',
+  '^ci-heal-\\d+(?:-lane-\\d+-[0-9a-f]+)?$',
+]);
+export const DEFAULT_UNBLOCK_PATTERNS = Object.freeze([
+  '^unblock-[a-z0-9][a-z0-9-]*(?:-lane-\\d+-[0-9a-f]+)?$',
+]);
+export const UNBLOCK_ENV = 'WE_HEAVY_UNBLOCK';
 const IDENTITY_FIELDS = ['purpose', 'session', 'holder', 'envSession'];
 
 /** Resource bounds on operator-set repair patterns. They run on the admission path BEFORE the queue and ceiling checks,
@@ -91,6 +103,42 @@ export function validRepairPatterns(v) {
     }
   }
   return true;
+}
+
+/** Validate an entire P1 policy selection; empty disables it, invalid falls back to defaults at the caller. */
+export function validP1Patterns(v) {
+  if (!Array.isArray(v) || v.length > MAX_REPAIR_PATTERNS) return false;
+  for (const p of v) {
+    if (typeof p !== 'string' || p === '' || p.length > MAX_REPAIR_PATTERN_LENGTH || hasUnsafeRepeat(p)) return false;
+    try { new RegExp(p); } catch { return false; }
+  }
+  return true;
+}
+
+/** Pure P1 classification over decoded identity and policy, sharing one bounded matching deadline. */
+export function classifyP1(identity, p1) {
+  const normal = (reason) => ({ class: null, reason, kind: null, matched: null });
+  if (p1?.mode !== 'enforce') return normal('priority off');
+  const fixPatterns = validP1Patterns(p1.fixPatterns) ? p1.fixPatterns : DEFAULT_FIX_PATTERNS;
+  const unblockPatterns = validP1Patterns(p1.unblockPatterns) ? p1.unblockPatterns : DEFAULT_UNBLOCK_PATTERNS;
+  const deadlineMs = Date.now() + REPAIR_CLASSIFY_BUDGET_MS;
+  for (const [kind, patterns] of [['fix', fixPatterns], ['unblock', unblockPatterns]]) {
+    for (const field of IDENTITY_FIELDS) {
+      const value = identity?.[field];
+      if (typeof value !== 'string' || value === '') continue;
+      const pattern = patterns.find((p) => repairPatternMatches(p, value, deadlineMs));
+      if (pattern !== undefined) return { class: 'P1', reason: `P1 ${kind}`, kind, matched: { field, value, pattern } };
+    }
+  }
+  if (identity?.unblockEnv === true) {
+    return { class: 'P1', reason: `${UNBLOCK_ENV}=1`, kind: 'unblock', matched: null };
+  }
+  return normal('normal');
+}
+
+/** P0 wins over P1; all historical, absent and unknown classes share the normal tier. */
+export function rankOfClass(cls) {
+  return cls === 'P0' ? 0 : cls === 'P1' ? 1 : 2;
 }
 
 let repairMatchSandbox = null;
