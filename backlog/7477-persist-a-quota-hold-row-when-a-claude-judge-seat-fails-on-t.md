@@ -3,7 +3,7 @@ bornAs: xska8ze
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/review-extra-seats.mjs", "we:scripts/lib/provider-quota-hold.mjs"]
+scope: ["we:scripts/operations/review-extra-seats.mjs", "we:scripts/lib/provider-quota-hold.mjs", "we:scripts/operations/__tests__/review-extra-seats.test.mjs"]
 dateOpened: "2026-10-29"
 tags: []
 ---
