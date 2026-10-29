@@ -77,10 +77,20 @@ export function proveHumanOnlyLicense({ repo, pr, headSha, exec, cwd, readCommen
       return refuse('successor is not a proven main merge');
     }
     git(['merge-base', '--is-ancestor', parents[2], main]);
-    const diff = git(['diff', '--name-only', '-z', '--no-renames', approved, headSha]);
+    // Tree modes must remain visible regardless of local submodule-ignore or diff-driver settings.
+    const diff = git(['-c', 'diff.ignoreSubmodules=none', 'diff-tree', '-r', '-z', '--raw', '--no-abbrev',
+      '--no-renames', '--ignore-submodules=none', '--no-ext-diff', '--no-textconv', approved, headSha]);
     if (diff && !diff.endsWith('\0')) return refuse('successor diff incomplete');
-    const paths = diff ? diff.slice(0, -1).split('\0') : [];
-    if (paths.length > MAX_PATHS) return refuse('successor diff exceeds 1024-path proof limit');
+    const records = diff ? diff.slice(0, -1).split('\0') : [];
+    if (records.length % 2 !== 0) return refuse('successor diff incomplete');
+    if (records.length / 2 > MAX_PATHS) return refuse('successor diff exceeds 1024-path proof limit');
+    const paths = [];
+    for (let i = 0; i < records.length; i += 2) {
+      const entry = /^:(000000|100644|100755|120000|160000) (000000|100644|100755|120000|160000) [0-9a-f]{40} [0-9a-f]{40} [ADMT]$/.exec(records[i]);
+      if (!entry) return refuse('successor tree evidence unreadable');
+      if (entry[1] === '160000' || entry[2] === '160000') return refuse('successor changes a gitlink');
+      paths.push(records[i + 1]);
+    }
     const blob = (ref, path) => {
       const tree = git(['--literal-pathspecs', 'ls-tree', '-z', ref, '--', path]);
       if (tree === '') return null; // proven absent, including a deletion inherited from main

@@ -7,10 +7,11 @@ import { dirname, join } from 'node:path';
 import { proveHumanOnlyLicense, resolveApprovalLicensesEnqueue } from '../human-only-enqueue-license.mjs';
 
 const roots = [];
+const rawChange = path => `:100644 100644 ${'a'.repeat(40)} ${'b'.repeat(40)} M\0${path}\0`;
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function fixture() {
   const cwd = mkdtempSync(join(tmpdir(), 'human-enqueue-')); roots.push(cwd);
-  const git = args => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const git = args => execFileSync('git', ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   const write = (path, body) => { mkdirSync(dirname(join(cwd, path)), { recursive: true }); writeFileSync(join(cwd, path), body); };
   const commit = message => { git(['add', '-A']); git(['commit', '-qm', message]); return git(['rev-parse', 'HEAD']); };
   git(['init', '-q']); git(['config', 'user.email', 'test@example.com']); git(['config', 'user.name', 'test']);
@@ -39,13 +40,61 @@ describe('human-only enqueue license', () => {
     const r = fixture(); r.write(path, 'unapproved'); r.setHead(r.commit('author change'));
     expect(r.prove()).toMatchObject({ licensed: false });
   });
-  it('licenses a main merge whose sensitive blobs came from main', () => {
+  it('licenses a main merge whose sensitive blobs came from main using config-independent raw evidence', () => {
     const r = fixture();
     r.git(['checkout', '-qb', 'main-change']); r.write('.github/workflows/ci.yml', 'from main');
     const main = r.commit('main workflow'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
     r.git(['checkout', '-qb', 'pr', r.approved]); r.write('README.md', 'ordinary'); r.commit('docs');
     r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
-    expect(r.prove()).toMatchObject({ licensed: true, tier: 'mechanical' });
+    let diffArgs;
+    expect(r.prove({ exec: (cmd, args, opts) => {
+      if (cmd === 'git' && args.includes('diff-tree')) diffArgs = args;
+      return r.exec(cmd, args, opts);
+    } })).toMatchObject({ licensed: true, tier: 'mechanical' });
+    expect(diffArgs).toEqual(['-c', 'diff.ignoreSubmodules=none', 'diff-tree', '-r', '-z', '--raw', '--no-abbrev',
+      '--no-renames', '--ignore-submodules=none', '--no-ext-diff', '--no-textconv', r.approved, r.git(['rev-parse', 'HEAD'])]);
+  });
+  it.each([
+    ['diff.ignoreSubmodules', '.github/actions/vendor'],
+    ['.gitmodules ignore', '.github/actions/vendor'],
+    ['diff.ignoreSubmodules', 'vendor'],
+  ])('refuses a gitlink update hidden by %s at %s but present in raw tree evidence', (ignore, path) => {
+    const r = fixture();
+    r.write('.gitmodules', `[submodule "vendor"]\n\tpath = ${path}\n\turl = ./vendor\n${ignore === '.gitmodules ignore' ? '\tignore = all\n' : ''}`);
+    r.git(['add', '.gitmodules']);
+    r.git(['update-index', '--add', '--cacheinfo', '160000', r.approved, path]);
+    r.git(['commit', '-qm', 'approved gitlink']);
+    const approved = r.git(['rev-parse', 'HEAD']);
+    r.comments[0].body = `<!-- reviewed-sha: ${approved} -->\n<!-- cleared-human: operator -->`;
+    r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
+    r.git(['add', 'README.md']); r.git(['commit', '-qm', 'main docs']);
+    const main = r.git(['rev-parse', 'HEAD']); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+    r.git(['checkout', '-qb', 'pr', approved]);
+    r.git(['update-index', '--cacheinfo', '160000', main, path]);
+    r.git(['commit', '-qm', 'author gitlink']);
+    r.git(['merge', '--no-ff', '-m', 'merge main', main]);
+    const head = r.git(['rev-parse', 'HEAD']); r.setHead(head);
+    if (ignore === 'diff.ignoreSubmodules') r.git(['config', 'diff.ignoreSubmodules', 'all']);
+    expect(r.git(['diff', '--name-only', '-z', '--no-renames', approved, head]).split('\0')).not.toContain(path);
+    expect(r.git(['-c', 'diff.ignoreSubmodules=none', 'diff-tree', '-r', '-z', '--raw', '--no-renames', '--ignore-submodules=none', approved, head]))
+      .toContain(`:160000 160000 ${r.approved} ${main} M\0${path}\0`);
+    expect(r.prove()).toMatchObject({ licensed: false, reason: expect.stringMatching(/re-approve.*queue/) });
+  });
+  it.each(['deletion', 'replacement'])('refuses a non-sensitive gitlink %s inherited from main (old-side mode)', change => {
+    const r = fixture(), path = 'vendor';
+    r.git(['update-index', '--add', '--cacheinfo', '160000', r.approved, path]);
+    r.git(['commit', '-qm', 'approved gitlink']);
+    const approved = r.git(['rev-parse', 'HEAD']);
+    r.comments[0].body = `<!-- reviewed-sha: ${approved} -->\n<!-- cleared-human: operator -->`;
+    r.git(['checkout', '-qb', 'main-change']);
+    r.git(['update-index', '--force-remove', path]);
+    if (change === 'replacement') { r.write(path, 'regular file'); r.git(['add', path]); }
+    r.git(['commit', '-qm', 'main gitlink removal']);
+    const main = r.git(['rev-parse', 'HEAD']); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+    r.git(['checkout', '-fqb', 'pr', approved]);
+    r.write('ordinary.md', 'author docs'); r.git(['add', 'ordinary.md']); r.git(['commit', '-qm', 'author docs']);
+    r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
+    expect(r.prove()).toMatchObject({ licensed: false, reason: expect.stringMatching(/gitlink.*re-approve.*queue/) });
   });
   it.each([
     ['regular-file-to-symlink change with the same blob id', '100644', '120000', false],
@@ -99,9 +148,25 @@ describe('human-only enqueue license', () => {
     const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
     r.git(['checkout', '-qb', 'pr', r.approved]); r.write('ordinary.md', 'author docs'); r.commit('author docs');
     r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
-    expect(r.prove({ exec: (cmd, args, opts) => cmd === 'git' && args[0] === 'diff'
-      ? Buffer.from(Array.from({ length: 1025 }, (_, i) => `docs/${i}.md\0`).join('')) : r.exec(cmd, args, opts) }))
+    expect(r.prove({ exec: (cmd, args, opts) => cmd === 'git' && args.includes('diff-tree')
+      ? Buffer.from(Array.from({ length: 1025 }, (_, i) => rawChange(`docs/${i}.md`)).join('')) : r.exec(cmd, args, opts) }))
       .toMatchObject({ licensed: false, reason: expect.stringMatching(/1024.*re-approve.*queue/) });
+  });
+  it.each([
+    ['missing terminator', rawChange('docs.md').slice(0, -1)],
+    ['missing path', rawChange('docs.md').split('\0')[0] + '\0'],
+    ['malformed header', 'unreadable\0docs.md\0'],
+    ['unknown mode', rawChange('docs.md').replace('100644', '170000')],
+    ['empty path', rawChange('')],
+  ])('refuses incomplete or unreadable raw tree evidence: %s', (_name, output) => {
+    const r = fixture();
+    r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
+    const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+    r.git(['checkout', '-qb', 'pr', r.approved]); r.write('ordinary.md', 'author docs'); r.commit('author docs');
+    r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
+    expect(r.prove({ exec: (cmd, args, opts) => cmd === 'git' && args.includes('diff-tree')
+      ? Buffer.from(output) : r.exec(cmd, args, opts) }))
+      .toMatchObject({ licensed: false, reason: expect.stringMatching(/re-approve.*queue/) });
   });
   it('refuses a head that is not a descendant of approval', () => {
     const r = fixture(); r.git(['checkout', '--orphan', 'unrelated']); r.write('README.md', 'new root');
@@ -129,7 +194,7 @@ describe('human-only enqueue license', () => {
     r.git(['checkout', '-qb', 'pr', r.approved]); r.write('ordinary.md', 'author docs'); r.commit('author docs');
     r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
     expect(r.prove({ exec: (cmd, args, opts) => {
-      if (cmd === 'git' && args[0] === 'diff') return 'x'.repeat(8 * 1024 * 1024 + 1);
+      if (cmd === 'git' && args.includes('diff-tree')) return 'x'.repeat(8 * 1024 * 1024 + 1);
       return r.exec(cmd, args, opts);
     } })).toMatchObject({ licensed: false, reason: expect.stringMatching(/oversized.*re-approve.*queue/) });
   });
