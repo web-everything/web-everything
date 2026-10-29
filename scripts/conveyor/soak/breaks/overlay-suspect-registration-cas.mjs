@@ -21,7 +21,7 @@ async function replay(tree) {
       try { removeOverlay(root, 'lane/suspect', { env, why: 'smoke-failed', expectRegistrationId: token }); }
       catch (error) { refused = /registration changed/.test(String(error?.message)); }
       if (!refused || readOverlays(root, { env }).length !== 1) {
-        violations.push(`shared CAS ${JSON.stringify(token ?? null)}: removed without a registration token`);
+        violations.push(`shared CAS ${token === undefined ? 'undefined' : JSON.stringify(token)}: removed without a registration token`);
       }
     } finally { rmSync(root, { recursive: true, force: true }); }
   }
@@ -75,7 +75,7 @@ export default {
   id: 'overlay-suspect-registration-cas',
   title: 'direct and recovered fallback adoption keep suspects without matching registration evidence',
   card: 'PR #6033',
-  fixedBy: { sha: 'pr-6033-suspect-cas', where: 'lane/overlay-generation-s1-r2', paths: ['scripts/lib/daemon-rebuild/adopt.mjs', 'scripts/lib/daemon-overlays.mjs'] },
+  fixedBy: { sha: '78683188d5,4af2025951', where: 'lane/overlay-generation-s1-r2', paths: ['scripts/lib/daemon-rebuild/adopt.mjs', 'scripts/lib/daemon-overlays.mjs'] },
   fixPresent(root) {
     const script = 'const { default: b } = await import(process.argv[1]); process.exitCode = b.judge(await b.run()).length ? 1 : 0;';
     const probe = spawnSync(process.execPath, ['--input-type=module', '-e', script,
