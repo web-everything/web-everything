@@ -56,11 +56,13 @@ const ADDED_2026_10_15 = ['operator-hold-aged'];
 const ADDED_2026_10_17 = ['nightly-coroner-failed'];
 // Operator ruling R157 2026-10-27: a live auto-quarantine needs repair before its 24h expiry, so it must alert.
 const ADDED_2026_10_27 = ['red-main-quarantined-test'];
-const APPROVED = [...new Set([...PREVIOUSLY_APPROVED, ...ADDED_2026_09_27, ...ADDED_2026_09_30, ...ADDED_2026_10_01, ...ADDED_2026_10_04, ...ADDED_2026_10_06, ...ADDED_2026_10_07, ...ADDED_2026_10_08, ...ADDED_2026_10_27, ...ADDED_2026_10_09, ...ADDED_2026_10_14, ...ADDED_2026_10_15, ...ADDED_2026_10_17, 'disk-space'])];
+// Operator ruling R179 2026-10-28: a daemon build stale vs main must alert.
+const ADDED_2026_10_28 = ['daemon-build-stale'];
+const APPROVED = [...new Set([...PREVIOUSLY_APPROVED, ...ADDED_2026_09_27, ...ADDED_2026_09_30, ...ADDED_2026_10_01, ...ADDED_2026_10_04, ...ADDED_2026_10_06, ...ADDED_2026_10_07, ...ADDED_2026_10_08, ...ADDED_2026_10_27, ...ADDED_2026_10_09, ...ADDED_2026_10_14, ...ADDED_2026_10_15, ...ADDED_2026_10_17, ...ADDED_2026_10_28, 'disk-space'])];
 
 describe('NOTIFY_EVEN_IN_SHADOW', () => {
-  it('is exactly the union of the approved operator decisions — 29 entries', () => {
-    expect(APPROVED).toHaveLength(29);
+  it('is exactly the union of the approved operator decisions — 30 entries', () => {
+    expect(APPROVED).toHaveLength(30);
     expect([...NOTIFY_EVEN_IN_SHADOW].sort()).toEqual([...APPROVED].sort());
   });
 

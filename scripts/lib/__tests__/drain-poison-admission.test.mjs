@@ -1,0 +1,361 @@
+// @vitest-environment node
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { guardEnqueue, recordEnqueueOutcome } from '../drain-poison-guard.mjs';
+import { labelSignature } from '../drain-prestage.mjs';
+import { AUTOMATION_LOGINS } from '../marker-authorship.mjs';
+import { createDrainMergeStrategy } from '../drain-merge-strategy.mjs';
+import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
+import { enqueuePr } from '../merge-queue-enqueue.mjs';
+import { appendDaemonEvent } from '../daemon-events.mjs';
+import { healLaneRefs } from '../lane-repair.mjs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+vi.mock('../merge-queue-enqueue.mjs', async original => ({
+  ...(await original()), enqueuePr: vi.fn(() => ({ ok: true, already: false })),
+}));
+vi.mock('../daemon-events.mjs', () => ({ appendDaemonEvent: vi.fn() }));
+// The heal is a spy here: these fixtures must never repair a real checkout.
+vi.mock('../lane-repair.mjs', async original => ({
+  ...(await original()), healLaneRefs: vi.fn(() => ({ actions: ['removed stale objects/info/commit-graph cache'] })),
+}));
+
+const headSha = 'b'.repeat(40);
+const repo = 'fixture/poison-admission';
+const c = { num: 5969, repo };
+const path = 'backlog/7274-new-card.md';
+const mainCard = 'backlog/7233-old-card.md';
+
+function gitEvidence({ collision = true, fail, mainKey = 'bornAs', mainValue = 'xgcpm6z', text = '---\nbornAs: xgcpm6z\n---\n' } = {}) {
+  return vi.fn((cmd, args) => {
+    if (cmd !== 'git') throw new Error(`unexpected command: ${cmd}`);
+    if (args[0] === fail) throw Object.assign(new Error(`unreadable ${fail}`), { status: 128 });
+    switch (args[0]) {
+      case 'diff': return path;
+      case 'fetch': return '';
+      case 'show': return text;
+      case 'ls-remote': return `${'a'.repeat(40)}\trefs/heads/main\n`;
+      case 'grep':
+        // `-F -e <hash>…`: a fixed-string match on any of the searched hashes.
+        if (!collision || !args.flatMap((arg, i) => (args[i - 1] === '-e' ? [arg] : [])).some(hash => `${mainKey}: ${mainValue}`.includes(hash)))
+          throw Object.assign(new Error('no match'), { status: 1 });
+        return `origin/main:${mainCard}\0${mainKey}: ${mainValue}`;
+      default: throw new Error(`unexpected git operation: ${args[0]}`);
+    }
+  });
+}
+
+function strategy(evidence, { pages = () => '[[]]', deliver = () => { throw new Error('GitHub delivery unavailable'); }, where = {} } = {}) {
+  const exec = vi.fn((cmd, args, options) => {
+    if (cmd === 'git') return evidence(cmd, args, options);
+    if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view')
+      return JSON.stringify({ headRefOid: headSha, labels: ['ready-to-merge'] });
+    if (cmd === 'gh' && args.includes('--slurp')) return pages();
+    if (cmd === 'gh' && args[0] === 'pr' && ['comment', 'edit'].includes(args[1]))
+      return deliver(args);
+    throw new Error(`unexpected command: ${cmd} ${args.join(' ')}`);
+  });
+  const s = createDrainMergeStrategy({
+    exec, localSlug: repo, isLocalRepo: () => true, env: { WE_UNDER_TEST: '1' },
+    resolved: { policy: resolveMergeDeliveryPolicy({ tool: { strategy: 'github-merge-queue' } }), note: null },
+    queueSafety: { value: { waitForRedTeamBeforeEnqueue: false } },
+    redTeamDeadline: { value: { deadlineAction: 'hold' } },
+    cardGroupHold: () => null, batching: { gate: () => ({ admit: true }) },
+    readFile: () => JSON.stringify({ pending: [], followedUp: [] }), writeState: vi.fn(),
+    log: { write: vi.fn() }, ...where,
+  });
+  return { s, exec };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  appendDaemonEvent.mockRejectedValue(new Error('event delivery unavailable'));
+});
+
+describe('poison guard admission boundary', () => {
+  it('refuses an identity collision before enqueue even when event, comment and label delivery fail', () => {
+    const { s, exec } = strategy(gitEvidence());
+    expect(s.enqueue(c, headSha)).toMatchObject({ enqueued: false, deferred: true, kind: 'bornas-collision' });
+    expect(enqueuePr).not.toHaveBeenCalled();
+    expect(appendDaemonEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: 'enqueue-refused' }), expect.any(Object));
+    expect(exec.mock.calls.some(([cmd, args]) => cmd === 'gh' && args[1] === 'comment')).toBe(true);
+    expect(exec.mock.calls.some(([cmd, args]) => cmd === 'gh' && args.includes('review:changes'))).toBe(true);
+  });
+
+  it.each(['diff', 'fetch', 'show', 'grep'])('refuses a Git %s read failure before enqueue', fail => {
+    const { s, exec } = strategy(gitEvidence({ fail }));
+    expect(s.enqueue(c, headSha)).toMatchObject({ enqueued: false, deferred: true, kind: 'bornas-unreadable', reason: expect.stringContaining('check unreadable') });
+    expect(enqueuePr).not.toHaveBeenCalled();
+    expect(exec.mock.calls.some(([cmd, args]) => cmd === 'gh' && args.includes('--add-label'))).toBe(false);
+    expect(appendDaemonEvent).toHaveBeenCalledWith(expect.objectContaining({ detail: expect.objectContaining({ error: `unreadable ${fail}` }) }), expect.any(Object));
+  });
+
+  // Live incident 2026-10-27 21:26Z: an unreadable check labelled approved #5998 and #5994 review:changes.
+  it.each(['fetch', 'diff', 'show', 'grep'])('skips enqueue on an unreadable %s with no PR comment and no label edit of any kind', fail => {
+    const deliver = vi.fn(() => '');
+    const { s, exec } = strategy(gitEvidence({ fail }), { deliver });
+    for (let pass = 0; pass < 2; pass++)
+      expect(s.enqueue(c, headSha)).toMatchObject({ enqueued: false, deferred: true, kind: 'bornas-unreadable' });
+    expect(enqueuePr).not.toHaveBeenCalled();
+    expect(deliver).not.toHaveBeenCalled();
+    expect(exec.mock.calls.some(([cmd, args]) => cmd === 'gh' && args[0] === 'pr' && ['edit', 'comment'].includes(args[1]))).toBe(false);
+  });
+
+  describe('corrupt clone self-heal wiring', () => {
+    const corruptOnce = () => {
+      let failed = false;
+      const evidence = gitEvidence({ collision: false });
+      return vi.fn((cmd, args, options) => {
+        if (args[0] === 'fetch' && !failed) {
+          failed = true;
+          throw Object.assign(new Error('Command failed: git fetch'), { status: 128,
+            stderr: 'fatal: You are attempting to fetch 9c7274dc, which is in the commit-graph file but not in the object database.' });
+        }
+        return evidence(cmd, args, options);
+      });
+    };
+    let clone, primary;
+    beforeEach(() => {
+      clone = mkdtempSync(join(tmpdir(), 'admission-clone-'));
+      primary = mkdtempSync(join(tmpdir(), 'admission-primary-'));
+      for (const dir of [clone, primary]) mkdirSync(join(dir, '.git'));
+    });
+    afterEach(() => { for (const dir of [clone, primary]) rmSync(dir, { recursive: true, force: true }); });
+
+    it('heals a drain clone distinct from the located primary, retries and enqueues', () => {
+      const deliver = vi.fn(() => '');
+      const { s } = strategy(corruptOnce(), { deliver, where: { cwd: clone, primary } });
+      expect(s.enqueue(c, headSha)).toEqual({ enqueued: true, already: false });
+      expect(healLaneRefs).toHaveBeenCalledOnce();
+      expect(healLaneRefs).toHaveBeenCalledWith(clone, expect.any(Object));
+      // A real enqueue posts the drain's own clearance comment; the guard itself never comments or labels.
+      expect(deliver.mock.calls.filter(([args]) => args[1] === 'edit')).toEqual([]);
+      expect(deliver.mock.calls.filter(([args]) => args.some(arg => String(arg).includes('we-drain-poison')))).toEqual([]);
+    });
+    it.each([
+      ['no located primary (the default)', () => ({ cwd: clone })],
+      ['the primary checkout as the drain cwd', () => ({ cwd: primary, primary })],
+    ])('never heals with %s and holds the enqueue without touching the PR', (_name, where) => {
+      const deliver = vi.fn(() => '');
+      const { s } = strategy(corruptOnce(), { deliver, where: where() });
+      expect(s.enqueue(c, headSha)).toMatchObject({ enqueued: false, deferred: true, kind: 'bornas-unreadable' });
+      expect(healLaneRefs).not.toHaveBeenCalled();
+      expect(enqueuePr).not.toHaveBeenCalled();
+      expect(deliver).not.toHaveBeenCalled();
+    });
+  });
+
+  it('fetches a remote-only PR head before reading its diff or cards', () => {
+    let headAvailable = false;
+    const evidence = gitEvidence({ collision: false });
+    const git = vi.fn((cmd, args, options) => {
+      if (args[0] === 'fetch' && args.includes(headSha)) headAvailable = true;
+      if (['diff', 'show'].includes(args[0]) && !headAvailable)
+        throw new Error('fatal: unknown revision: PR head exists only on remote');
+      return evidence(cmd, args, options);
+    });
+    const { s } = strategy(git);
+    expect(s.enqueue(c, headSha)).toEqual({ enqueued: true, already: false });
+    expect(headAvailable).toBe(true);
+    expect(enqueuePr).toHaveBeenCalledOnce();
+  });
+
+  it.each([['bornAs', '"xgcpm6z"'], ['bornAs', "'xgcpm6z'"]])('refuses a collision in quoted %s: %s on a numbered card', (key, value) => {
+    const { s } = strategy(gitEvidence({ text: `---\n${key}: ${value}\n---\n` }));
+    expect(s.enqueue(c, headSha)).toMatchObject({ enqueued: false, kind: 'bornas-collision' });
+    expect(enqueuePr).not.toHaveBeenCalled();
+  });
+
+  // The backlog loader replaces a frontmatter `id` with the file name, so duplicateBornAs never reads it as identity.
+  it.each(['"xgcpm6z"', "'xgcpm6z'"])('admits a numbered card whose only hash is a frontmatter id: %s', value => {
+    const { s } = strategy(gitEvidence({ text: `---\nid: ${value}\n---\n` }));
+    expect(s.enqueue(c, headSha)).toEqual({ enqueued: true, already: false });
+    expect(enqueuePr).toHaveBeenCalledOnce();
+  });
+
+  it.each(['bornAs', 'id'].flatMap(mainKey =>
+    ['xgcpm6z', '"xgcpm6z"', "'xgcpm6z'"].flatMap(mainValue =>
+      ['xgcpm6z', '"xgcpm6z"', "'xgcpm6z'"].map(incoming => [mainKey, mainValue, incoming]))))(
+    'refuses main %s: %s colliding with incoming bornAs: %s', (mainKey, mainValue, incoming) => {
+      const { s } = strategy(gitEvidence({ mainKey, mainValue, text: `---\nbornAs: ${incoming}\n---\n` }));
+      expect(s.enqueue(c, headSha)).toMatchObject({ enqueued: false, kind: 'bornas-collision',
+        reason: expect.stringContaining(mainCard) });
+      expect(enqueuePr).not.toHaveBeenCalled();
+    });
+
+  it('refreshes main before diff so inherited cards cannot collide with themselves', () => {
+    let refreshed = false;
+    const evidence = gitEvidence();
+    const exec = vi.fn((cmd, args) => {
+      if (args[0] === 'fetch') refreshed = true;
+      if (args[0] === 'diff' && refreshed) return '';
+      return evidence(cmd, args);
+    });
+    const { s } = strategy(exec);
+    expect(s.enqueue(c, headSha)).toEqual({ enqueued: true, already: false });
+    expect(exec.mock.calls.map(([, args]) => args[0])).toEqual(['fetch', 'diff']);
+    expect(enqueuePr).toHaveBeenCalledOnce();
+  });
+
+  it('admits a unique identity when grep reports no matches', () => {
+    const { s } = strategy(gitEvidence({ collision: false }));
+    expect(s.enqueue(c, headSha)).toEqual({ enqueued: true, already: false });
+    expect(enqueuePr).toHaveBeenCalledWith(expect.objectContaining({ num: c.num, headSha }));
+    expect(appendDaemonEvent).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['matching head and live main, but omitted backlog card', {}],
+    ['stale base tip', { baseSha: 'c'.repeat(40) }],
+    ['different head', { headSha: 'd'.repeat(40) }],
+    ['different base branch', { base: 'release' }],
+    ['explicit backlog file', { files: [path] }],
+    ['truncated file list', { files: ['scripts/example.mjs'] }],
+    ['missing file list', { files: undefined }],
+  ])('checks real identity evidence on prepared admission: %s', (_name, surface) => {
+    const evidence = gitEvidence();
+    const { s } = strategy(evidence);
+    const prepared = { allowed: true, safety: { waitForRedTeamBeforeEnqueue: false },
+      labels: labelSignature(['ready-to-merge']), comments: [],
+      preparedSurface: { headSha, base: 'main', baseSha: 'a'.repeat(40), files: [], ...surface } };
+    expect(s.enqueue(c, headSha, { prepared })).toMatchObject({ enqueued: false, kind: 'bornas-collision' });
+    expect(evidence.mock.calls.map(([, args]) => args[0])).toEqual(['fetch', 'diff', 'show', 'grep', 'show']);
+    expect(enqueuePr).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('prepared admission reads fresh main when unreadable is %s', unreadable => {
+    const evidence = gitEvidence({ collision: false, ...(unreadable ? { fail: 'fetch' } : {}) });
+    const { s, exec } = strategy(evidence);
+    const prepared = { allowed: true, safety: { waitForRedTeamBeforeEnqueue: false },
+      labels: labelSignature(['ready-to-merge']), comments: [],
+      preparedSurface: { headSha, base: 'main', baseSha: 'a'.repeat(40), files: [] } };
+    expect(s.enqueue(c, headSha, { prepared })).toMatchObject(unreadable
+      ? { enqueued: false, kind: 'bornas-unreadable' } : { enqueued: true });
+    expect(evidence.mock.calls[0][1]).toEqual(expect.arrayContaining(['fetch', headSha, '+refs/heads/main:refs/remotes/origin/main']));
+    expect(enqueuePr).toHaveBeenCalledTimes(unreadable ? 0 : 1);
+    expect(exec.mock.calls.some(([cmd, args]) => cmd === 'gh' && args.includes('--add-label'))).toBe(false);
+  });
+
+  it('deduplicates collision comments across drain instances while retrying failed labels', () => {
+    const comments = [];
+    const deliver = vi.fn(args => {
+      if (args[1] === 'edit') throw new Error('label outage');
+      comments.push({ body: args.at(-1), user: { login: AUTOMATION_LOGINS[0] } });
+      return '';
+    });
+    for (let i = 0; i < 2; i++) {
+      const { s } = strategy(gitEvidence(), { pages: () => JSON.stringify([[], comments]), deliver });
+      expect(s.enqueue(c, headSha)).toMatchObject({ kind: 'bornas-collision' });
+    }
+    expect(comments).toHaveLength(1);
+    expect(comments[0].body).toContain('<!-- we-drain-poison');
+    expect(deliver.mock.calls.filter(([args]) => args[1] === 'edit')).toHaveLength(2);
+    expect(enqueuePr).not.toHaveBeenCalled();
+  });
+
+  it('retries a failed comment on the next pass and suppresses it after successful delivery', () => {
+    const comments = [];
+    let fail = true;
+    const deliver = vi.fn(args => {
+      if (fail) throw new Error('delivery outage');
+      if (args[1] === 'comment') comments.push({ body: args.at(-1), user: { login: AUTOMATION_LOGINS[0] } });
+      return '';
+    });
+    const { s } = strategy(gitEvidence(), { pages: () => JSON.stringify([comments]), deliver });
+    expect(s.enqueue(c, headSha)).toMatchObject({ kind: 'bornas-collision' });
+    fail = false;
+    for (let i = 0; i < 2; i++) expect(s.enqueue(c, headSha)).toMatchObject({ kind: 'bornas-collision' });
+    expect(deliver.mock.calls.filter(([args]) => args[1] === 'comment')).toHaveLength(2);
+    expect(comments).toHaveLength(1);
+  });
+
+  it('does not trust a poison marker planted by another author', () => {
+    const marker = `<!-- we-drain-poison head=${headSha} kind=bornas-collision hash=xgcpm6z -->`;
+    const deliver = vi.fn(() => '');
+    const { s } = strategy(gitEvidence(), { pages: () => JSON.stringify([[{ body: marker, user: { login: 'untrusted' } }]]), deliver });
+    expect(s.enqueue(c, headSha)).toMatchObject({ kind: 'bornas-collision' });
+    expect(deliver.mock.calls.some(([args]) => args[1] === 'comment')).toBe(true);
+  });
+
+  it('defers a comment when its complete thread is unreadable, then retries', () => {
+    let readable = false;
+    const pages = () => { if (!readable) throw new Error('thread outage'); return '[[]]'; };
+    const deliver = vi.fn(() => '');
+    const { s } = strategy(gitEvidence(), { pages, deliver });
+    expect(s.enqueue(c, headSha)).toMatchObject({ kind: 'bornas-collision' });
+    expect(deliver.mock.calls.some(([args]) => args[1] === 'comment')).toBe(false);
+    readable = true;
+    expect(s.enqueue(c, headSha)).toMatchObject({ kind: 'bornas-collision' });
+    expect(deliver.mock.calls.filter(([args]) => args[1] === 'comment')).toHaveLength(1);
+  });
+
+  it.each(['throw', 'reject'])('keeps collision and unreadable refusals when delivery callbacks %s', async mode => {
+    const delivery = () => {
+      if (mode === 'throw') throw new Error('delivery unavailable');
+      return Promise.reject(new Error('delivery unavailable'));
+    };
+    for (const [evidence, kind] of [[gitEvidence(), 'bornas-collision'], [gitEvidence({ fail: 'fetch' }), 'bornas-unreadable']]) {
+      const emit = vi.fn(delivery);
+      const comment = vi.fn(delivery);
+      expect(guardEnqueue({ c, repo, headSha, exec: evidence, emit, comment, seen: new Set() }))
+        .toMatchObject({ enqueued: false, deferred: true, kind });
+      expect(emit).toHaveBeenCalledOnce();
+      expect(comment).toHaveBeenCalledTimes(kind === 'bornas-collision' ? 1 : 0);
+    }
+    await Promise.resolve();
+  });
+});
+
+describe('drain CLI enqueue outcome recorder', () => {
+  const source = readFileSync(new URL('../../merge-ai-prs.mjs', import.meta.url), 'utf8');
+
+  it('uses the combined recorder for the CLI instead of separate push and emit statements', () => {
+    expect(source).toMatch(/return\s+recordEnqueueOutcome\s*\(\s*\{\s*outcomes\s*,\s*repo\s*,\s*outcome\s*,\s*emit:\s*appendDaemonEvent\s*\}\s*\)/);
+    expect(source).not.toMatch(/enqueueOutcomes\s*\.\s*push\s*\(/);
+    expect(source).not.toContain('emitEnqueueOutcome');
+  });
+
+  it.each(['card-grouping', 'branch-preparation', 'merge-lock-held', 'card-group-hold', 'enqueue-error', 'batching-deferred', 'prestage'])(
+    'records and emits a %s refusal atomically', kind => {
+      const outcomes = [];
+      const outcome = { num: c.num, outcome: 'not-enqueued', kind, reason: 'fixture refusal' };
+      const atEmission = [];
+      const emit = vi.fn(() => { atEmission.push([...outcomes]); });
+      expect(recordEnqueueOutcome({ outcomes, outcome, repo, emit })).toBe(outcome);
+      expect(atEmission).toEqual([[outcome]]);
+      expect(emit).toHaveBeenCalledTimes(1);
+      expect(emit).toHaveBeenCalledWith({ kind: 'enqueue-skipped', repo, pr: c.num,
+        detail: { kind, reason: 'fixture refusal' } });
+    });
+
+  it.each([true, false])('records a successful enqueue with already=%s', already => {
+    const outcomes = [];
+    const emit = vi.fn();
+    const outcome = { num: c.num, outcome: 'enqueued', already };
+    recordEnqueueOutcome({ outcomes, outcome, repo, emit });
+    expect(outcomes).toEqual([outcome]);
+    expect(emit).toHaveBeenCalledWith({ kind: 're-enqueued', repo, pr: c.num,
+      detail: { reason: 'cleared by the pass', already } });
+  });
+
+  it('emits an event for every recorded outcome, including repeated decisions', () => {
+    const outcomes = [];
+    const emit = vi.fn();
+    const outcome = { num: c.num, outcome: 'not-enqueued', kind: 'prestage' };
+    for (let i = 0; i < 2; i++) recordEnqueueOutcome({ outcomes, outcome, repo, emit });
+    expect(outcomes).toHaveLength(2);
+    expect(emit).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['throw', 'reject'])('keeps the outcome when event delivery fails by %s', async mode => {
+    const outcomes = [];
+    const outcome = { num: c.num, repo: 'other/repo', outcome: 'not-enqueued', kind: 'prestage' };
+    const emit = vi.fn(() => { if (mode === 'throw') throw new Error('offline'); return Promise.reject(new Error('offline')); });
+    recordEnqueueOutcome({ outcomes, outcome, repo, emit });
+    expect(outcomes).toEqual([outcome]);
+    expect(emit).toHaveBeenCalledWith(expect.objectContaining({ repo: 'other/repo', detail: expect.objectContaining({ reason: 'no reason reported' }) }));
+    await Promise.resolve();
+  });
+});

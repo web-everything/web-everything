@@ -412,6 +412,20 @@ describe('#5649 planLabelInputRows', () => {
     expect(planLabelInputRows({ ...opts, events: [clear], headSha: HEAD, items: addition })).toEqual([]);
     expect(planLabelInputRows({ ...opts, events: [clear], headSha: 'b'.repeat(40), items: addition })).toHaveLength(1);
   });
+  it('a delegated approval never lets the mirror skip a hold: the evaluator binds it to the hold id', () => {
+    const approval = buildLedgerEvent({ type: 'approval', repo: REPO, pr: 7, at: '2026-10-12T12:00:00Z', source: 'test', approval: 'judge',
+      delegation: { by: 'op', scope: 'pr', expires: '2026-10-12T14:00:00Z' }, headSha: HEAD, basis: ['hold:12345678'] });
+    const opts = { ...base, liveLabels: ['review:human'], items: [tl('review:human', 'added', 'operator')],
+      headSha: HEAD, now: Date.parse('2026-10-12T13:00:00Z') };
+    // basis names some other event, not this hold: the hold must still be recorded
+    expect(planLabelInputRows({ ...opts, events: [approval] })).toHaveLength(1);
+    for (const binding of [{ headSha: undefined }, { headSha: 'b'.repeat(40) }, { basis: undefined }]) {
+      expect(planLabelInputRows({ ...opts, events: [{ ...approval, ...binding }] })).toHaveLength(1);
+    }
+    for (const binding of [{ headSha: 'garbage' }, { basis: [] }]) {
+      expect(() => planLabelInputRows({ ...opts, events: [{ ...approval, ...binding }] })).toThrow(TypeError);
+    }
+  });
   it('a bot or missing actor is hand-made for added, not for removed', () => {
     expect(planLabelInputRows({ ...base, liveLabels: ['review:human'], items: [tl('review:human', 'added', 'ci[bot]', undefined, 'Bot')] })).toHaveLength(1);
     expect(planLabelInputRows({ ...base, liveLabels: ['review:human'], items: [tl('review:human', 'added', null, undefined, null)] })[0].sender).toBe('unknown');

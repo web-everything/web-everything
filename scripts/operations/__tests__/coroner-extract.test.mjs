@@ -362,6 +362,8 @@ describe('coroner error rates (reported first)', () => {
     expect(ciCheckName('CodeQL / Analyze')).toBe('CodeQL');
     expect(ciCheckName('daemon-soak (1/2)')).toBe('daemon-soak');
     expect(ciCheckName('integration')).toBe('integration');
+    expect(ciCheckName('hetzner / integration')).toBe('integration');
+    expect(ciCheckName('hetzner / test-shard (1)')).toBe('test-shard');
   });
 
   it('fix/ci-heal sessions: outcomes with causes and rounds per PR', () => {

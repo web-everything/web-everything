@@ -312,6 +312,25 @@ Identity, path and published batch-ref validators use explicit absolute-end asse
 (`(?![\s\S])`). Keep the named trailing-newline regressions and the CR/CRLF/Unicode
 line-separator suffix cases in that required scoped gate.
 
+## Drain identity admission regressions
+
+Identity admission must fetch the pinned PR head as well as main before reading cards.
+Test a remote-only head by rejecting diff/show until that head has been fetched; use a real
+temporary remote when Git writes are available. Prepared file lists never replace the guard's
+fresh Git evidence, including empty, stale, or truncated lists. Any wrapper substituting synthetic
+output for a guard's command needs named positive and negative tests for every eligibility check.
+
+Infrastructure refusals must leave defect labels untouched. Test Git read failures through strategy
+admission, and keep raw command errors out of public comment bodies. An unreadable check holds the
+enqueue with a note and makes no PR comment or label edit of any kind. Corruption heals once per check
+and retries the failed command once; prove it on a real temporary clone with a planted commit-graph
+naming a missing object, and prove that a network failure or a surviving corruption is not healed again. Test notification retries after
+comment and label failures independently, and deduplication across fresh strategy instances using
+the paginated thread and trusted leading markers. Scope queue failure/rebuild history to the enqueue
+identity; old persisted records without it start fresh. Keep enqueue result recording and event
+emission in one helper, test each outcome and delivery failures, and exercise exported helpers
+instead of evaluating extracted source with `new Function`.
+
 ## Established-overlay auto-rebase
 
 Operator withdrawal wins over a detached repair: the worker rechecks its source registration
@@ -2123,6 +2142,11 @@ when the budget runs out. `heavyAdmission.runWaitMs` sets a default budget throu
 `WE_FULL_SUITE_OK` bypasses only full-suite selection, never admission. Guard tests should
 assert the suggested command verbatim and probe stdin-to-stdout hook wiring; unrelated
 allow-case fixtures must use admitted commands.
+
+For a CLI fixture that must preserve literal brace globs, spawn `process.execPath` with the repo's
+`node_modules/vitest/vitest.mjs` and an argv array inside the admitted parent test. npm/npx introduce
+an internal shell whose argument escaping leaves braces unquoted, so Bash can expand one brace
+argument into multiple flags even when the fixture's own spawn uses no shell.
 
 ### Orchestrator responsiveness hook probes
 
