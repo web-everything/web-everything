@@ -409,6 +409,29 @@ describe('currentBootId', () => {
 });
 
 describe('listGroup', () => {
+  it('Linux hidepid census omits live group -> listGroup unknown', () => {
+    const deps = linuxDeps({ processes: [{ pid: 222, pgid: 222 }] });
+    deps.kill = vi.fn(() => { throw Object.assign(new Error('denied'), { code: 'EPERM' }); });
+    expect(deps.readdir('/proc')).toEqual(['self', 'sys', '222']);
+    expect(readIdentity(PID, deps)).toEqual({ status: 'unknown', reason: expect.any(String) });
+    expect(deps.readFile).toHaveBeenCalledWith('/proc/12345/stat');
+    deps.kill.mockClear();
+    expect(listGroup(PID, deps)).toEqual({ status: 'unknown', reason: expect.any(String) });
+    expect(deps.kill).toHaveBeenCalledWith(PID, 0);
+  });
+
+  it.each(['live', 'EPERM', 'EACCES', 'ESRCH'])('Linux omitted leader requires confirmed absence before returning visible members (%s)', (result) => {
+    const deps = linuxDeps({ processes: [{ pid: PID + 1, pgid: PID }] });
+    deps.kill = vi.fn(() => {
+      if (result !== 'live') throw Object.assign(new Error(result), { code: result });
+      return true;
+    });
+    expect(listGroup(PID, deps)).toEqual(result === 'ESRCH'
+      ? { status: 'ok', identities: [{ ...linuxIdentity, pid: PID + 1 }] }
+      : { status: 'unknown', reason: expect.any(String) });
+    expect(deps.kill).toHaveBeenCalledWith(PID, 0);
+  });
+
   it.each([
     ['before the target', [{ pid: 2, pgid: 0, uid: 0 }, { pid: PID }], [linuxIdentity]],
     ['after the target', [{ pid: PID }, { pid: 2, pgid: 0, uid: 0 }], [linuxIdentity]],

@@ -227,6 +227,11 @@ export function listGroup(pgid, deps = {}) {
     } else if (io.platform === 'linux') {
       const names = io.readdir('/proc');
       if (!Array.isArray(names) || names.length > MAX_ENTRIES) throw new Error('procfs entry limit');
+      // hidepid can omit the leader entirely, bypassing the per-entry checks.
+      // Only confirmed absence permits a census without its PID directory.
+      if (!names.includes(String(pgid)) && !linuxAbsenceConfirmed(pgid, io)) {
+        throw new Error('Group leader missing from procfs census; absence unconfirmed');
+      }
       rows = [];
       const deadline = Date.now() + TIMEOUT;
       for (const name of names) {
