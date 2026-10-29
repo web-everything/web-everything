@@ -41,6 +41,8 @@
  *   node scripts/conveyor/health-watch.mjs silence --smell=ID [--subject=S] --card=NNN [--hours=72]
  *   node scripts/conveyor/health-watch.mjs unsilence --smell=ID [--subject=S]
  */
+import { runArchiveRetentionTick } from './archive-retention-tick.mjs';
+export { archiveRetentionTickAllowed } from './archive-retention-tick.mjs';
 import { sweepReviewTmp, probeDiskSpace } from './review-tmp-health.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { superviseNeedsYouFeed } from './needs-you-feed-job.mjs';
@@ -1135,6 +1137,13 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     : null;
 
   if (sweepAllowed && config.tmpSweepEnabled) attempt('reviewTmp', () => sweepReviewTmp({ tmpRoot: flags['tmp-sweep-root'] || tmpdir(), config, now, dryRun: !!flags['dry-run'] }));
+
+  // R217: each kind owns a 24h stamp; fixture ticks never touch host archives.
+  await attempt('archiveRetention', async () => {
+    const { results, error } = await runArchiveRetentionTick({ flags, now, archive: deps.archiveRetention ?? undefined });
+    if (error) probeErrors.archiveRetention = error;
+    return results;
+  });
 
   if (!flags['state-root'] && !flags['dry-run']) await attempt('cardBatchSeal', () => sealDueBatches({ now }));
 
