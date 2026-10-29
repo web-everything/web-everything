@@ -15,6 +15,9 @@
  * (card xrbu1bp, `we:scripts/conveyor/fix-resume.mjs`) `fix.resumeAcrossRounds` on|off (built-in on) and
  * `fix.strongerModelFromRound` (built-in 3, 0 = off). The file keeps them under a `fix` object, so the merged settings
  * view (`we:scripts/lib/settings-files.mjs`) carries the same `fix.*` paths the docs name.
+ * `fix.capacityStarvationHours` (built-in 6, integer 1..999) alerts on host capacity via
+ * standard → platform preference → tool settings → env;
+ * `WE_FIX_CAPACITY_STARVATION_HOURS` overrides it. Refusals never use repair attempts.
  *
  * How MANY takeovers a PR gets, and when a further one is owed (the budget, the progress guard, gate holds), lives in
  * `we:scripts/conveyor/takeover-budget.mjs` (`fix.takeoverBudget`, default 2) — this module holds the marker, the
@@ -31,6 +34,7 @@ export const FIX_SETTINGS_DEFAULTS = Object.freeze({
   roundCapAction: 'takeover', roundHistory: 'on',
   // Card xrbu1bp — see `we:scripts/conveyor/fix-resume.mjs`.
   resumeAcrossRounds: 'on', strongerModelFromRound: 3,
+  capacityStarvationHours: 6,
 });
 export const FIX_TAKEOVER_MARKER = '<!-- conveyor-fix-takeover';
 
@@ -105,6 +109,8 @@ export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE
   // Card xrbu1bp — resume the previous round's session (on|off) and the round the stronger-model rung starts at (0 = off).
   const resume = pick(env.WE_FIX_RESUME_ACROSS_ROUNDS, fromFile.resumeAcrossRounds, (v) => ONOFF.includes(v), FIX_SETTINGS_DEFAULTS.resumeAcrossRounds);
   const from = pick(env.WE_FIX_STRONGER_MODEL_FROM_ROUND, fromFile.strongerModelFromRound, (v) => /^\d{1,2}$/.test(v), String(FIX_SETTINGS_DEFAULTS.strongerModelFromRound));
+  // Keep malformed containers as invalid leaves, rather than letting the cascade traverse their children.
+  const capacityLeaf = value => value === undefined || typeof value === 'string' || Number.isInteger(value) ? value : null;
   // R123 is ruled on: automatic answers are enabled at the standard layer. A present malformed
   // switch fails closed; a missing layer inherits. Explicit dispatch arguments still take precedence.
   const autoProceed = value => value === undefined ? undefined : value === true;
@@ -113,26 +119,35 @@ export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE
   // Standard → platform → tool → env. Opus is reachable only through the critical-work verdict.
   const model = cascadePolicy('fix', {
     claudeEscalationModel: fromFile.claudeEscalationModel,
+    capacityStarvationHours: capacityLeaf(fromFile.capacityStarvationHours),
     standDownAutoProceed: autoProceed(layer === INVALID_LAYER ? false : fromFile.standDownAutoProceed),
   }, {
-    standard: { claudeEscalationModel: 'sonnet', standDownAutoProceed: true },
-    platform: { ...platformLayer, standDownAutoProceed: autoProceed(platformLayer?.standDownAutoProceed) }, env,
+    standard: { claudeEscalationModel: 'sonnet', standDownAutoProceed: true,
+      capacityStarvationHours: FIX_SETTINGS_DEFAULTS.capacityStarvationHours },
+    platform: { ...platformLayer, standDownAutoProceed: autoProceed(platformLayer?.standDownAutoProceed),
+      capacityStarvationHours: capacityLeaf(platformLayer?.capacityStarvationHours) }, env,
     envValues: {
       claudeEscalationModel: env.WE_FIX_CLAUDE_ESCALATION_MODEL,
+      capacityStarvationHours: capacityLeaf(env.WE_FIX_CAPACITY_STARVATION_HOURS),
       standDownAutoProceed: envAutoProceed === undefined ? undefined
         : ['true', '1', 'on'].includes(String(envAutoProceed).trim().toLowerCase()),
     },
     valid: { claudeEscalationModel: value => ['haiku', 'sonnet'].includes(value),
+      capacityStarvationHours: value => /^\d{1,3}$/.test(String(value).trim()) && Number(value) >= 1,
       standDownAutoProceed: value => typeof value === 'boolean' },
   });
   return {
     roundCapAction: action.value, roundHistory: history.value,
     resumeAcrossRounds: resume.value, strongerModelFromRound: Number(from.value),
+    capacityStarvationHours: Number(model.value.capacityStarvationHours),
     claudeEscalationModel: model.value.claudeEscalationModel,
     standDownAutoProceed: model.value.standDownAutoProceed,
     sources: {
       roundCapAction: action.source, roundHistory: history.source,
       resumeAcrossRounds: resume.source, strongerModelFromRound: from.source,
+      // Preserve the public provenance labels used before this leaf joined the shared cascade.
+      capacityStarvationHours: ({ standard: 'built-in', tool: 'settings' })[model.sources.capacityStarvationHours]
+        ?? model.sources.capacityStarvationHours,
       claudeEscalationModel: model.sources.claudeEscalationModel,
       standDownAutoProceed: model.sources.standDownAutoProceed,
     },
