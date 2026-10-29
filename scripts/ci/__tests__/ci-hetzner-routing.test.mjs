@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import yaml from 'js-yaml';
+import { QUARANTINE_SAFETY_NET_DEFAULTS } from '../../lib/red-main-quarantine.mjs';
 
 const raw = readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8');
 const { jobs } = yaml.load(raw);
@@ -97,6 +98,21 @@ describe('Hetzner reusable CI workflow contract', () => {
 });
 
 describe('ci.yml routes trusted events to Hetzner and preserves hosted PR checks', () => {
+  it('defines every default quarantine aggregator as a CI job', () => {
+    expect(QUARANTINE_SAFETY_NET_DEFAULTS.derivedJobs).toEqual(['test', 'daemon-soak', 'coverage-merge']);
+    for (const job of QUARANTINE_SAFETY_NET_DEFAULTS.derivedJobs) expect(jobs).toHaveProperty(job);
+  });
+
+  it.each(['hetzner / test-shard (3)', 'hetzner / integration'])('recognizes %s as a quarantine unit job', (job) => {
+    expect(new RegExp(QUARANTINE_SAFETY_NET_DEFAULTS.unitJobPattern).test(job)).toBe(true);
+  });
+
+  it('keeps test dependent on coverage-merge and fails closed on its result', () => {
+    expect(dependencies(jobs.test)).toContain('coverage-merge');
+    const gate = jobs.test.steps.map((step) => step.run ?? '').join('\n');
+    expect(gate).toMatch(/if \[ "\$\{\{ needs\.coverage-merge\.result \}\}" != "success" \]; then\s+echo "::error::Coverage merge did not succeed\."\s+exit 1\s+fi/);
+  });
+
   it('calls the local workflow at the tested commit, passes only needed secrets and waits for changes', () => {
     expect(jobs.hetzner).toBeDefined();
     expect(jobs.hetzner.uses).toBe('./.github/workflows/hetzner-jobs.yml');

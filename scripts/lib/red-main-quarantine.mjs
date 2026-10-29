@@ -186,7 +186,7 @@ export const QUARANTINE_SAFETY_NET_DEFAULTS = Object.freeze({
   /** A failed job matching this is a unit-test job: its log must name every failing test file. */
   unitJobPattern: '^(?:hetzner / )?(?:test-shard \\(\\d+\\)|integration|soak-shard \\(\\d+\\))$',
   /** Aggregator jobs that fail only because a unit job did (`test` gates on `needs.test-shard`). */
-  derivedJobs: Object.freeze(['test', 'daemon-soak']),
+  derivedJobs: Object.freeze(['test', 'daemon-soak', 'coverage-merge']),
   /** Accept repeated failures with unchanged test files as an alternative proof (R157). */
   repeatFailureProof: true,
   repeatFailureCount: 2,

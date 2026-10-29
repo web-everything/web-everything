@@ -19,10 +19,10 @@ afterEach(() => dirs.splice(0).forEach((d) => rmSync(d, { recursive: true, force
 const plan = (o = {}) => planSafetyNet({ status: 'red', firstRedSha: rows[0].headSha, failedJobs: ['integration'], jobFailures: { integration: failure }, repeatRuns: rows, latestRunId: 2, touchedFiles: () => [], now, ...o });
 const proof = { kind: 'repeat-failed', runIds: [1, 2], shas: rows.map((r) => r.headSha), count: 2 };
 describe('reusable-workflow quarantine job names', () => {
-  it.each(['integration', 'test-shard (1)'])('round-trips two failing hetzner / %s runs into the workflow skip decision', (job) => {
+  it.each(['integration', 'test-shard (3)'])('round-trips two failing hetzner / %s runs with failed aggregators into the workflow skip decision', (job) => {
     const reportedJob = `hetzner / ${job}`;
     const jobFailures = { [reportedJob]: failure };
-    const out = plan({ failedJobs: [reportedJob], jobFailures,
+    const out = plan({ failedJobs: [reportedJob, 'coverage-merge', 'test'], jobFailures,
       repeatRuns: rows.map((r) => ({ ...r, jobFailures })) });
     expect(out.action).toBe('add');
     expect(out.entries).toEqual([{ test: file, job, proof }]);
@@ -41,6 +41,10 @@ describe('reusable-workflow quarantine job names', () => {
     expect(skip(persisted, null).skip).toEqual(job === 'integration' ? [] : [file]);
     expect(plan({ failedJobs: [reportedJob], jobFailures,
       repeatRuns: rows.map((r) => ({ ...r, jobFailures })), list: persisted }).action).toBe('none');
+  });
+
+  it('does not quarantine when only coverage-merge and test failed, even with complete logs and repeat proof', () => {
+    expect(plan({ failedJobs: ['coverage-merge', 'test'] })).toMatchObject({ action: 'none' });
   });
 
   it('normalizes direct writes and recognizes old prefixed entries without renewing their expiry', () => {
