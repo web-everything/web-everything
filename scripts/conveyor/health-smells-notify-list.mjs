@@ -69,4 +69,6 @@ export const NOTIFY_EVEN_IN_SHADOW = new Set([
   'operator-hold-aged',
   // Operator 2026-10-22 (R1/R22): a green+audited fix not on the daemon prototype must alert.
   'fix-not-loaded',
+  // R179 (2026-10-28): all four daemons sat days behind main unflagged; a stale daemon build must reach the operator.
+  'daemon-build-stale',
 ]);

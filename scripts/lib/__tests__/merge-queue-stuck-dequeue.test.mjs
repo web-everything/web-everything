@@ -317,6 +317,19 @@ describe('sweepStuckEntries', () => {
       detail: { kind: 'rebuilds', state: 'AWAITING_CHECKS', reason: expect.stringContaining('3') } }));
   });
 
+  it('retains a fresh queue entry when persisted failures and rebuilds belong to its previous enqueue', () => {
+    const newEnqueuedAt = '2026-10-26T11:00:00Z';
+    const h = sweepIo({ nodes: [node({ enqueuedAt: newEnqueuedAt,
+      headCommit: { oid, statusCheckRollup: { state: 'FAILURE' } },
+      checks: { statusCheckRollup: { contexts: { pageInfo: { hasNextPage: false }, nodes: [
+        { __typename: 'CheckRun', name: 'standards', conclusion: 'FAILURE' },
+      ] } } } })], state: JSON.stringify({ 5977: { enqueuedAt, oid: 'b'.repeat(40), count: 2, fails: ['b'.repeat(40)] } }) });
+    expect(h.run()).toEqual({ dequeued: [] });
+    expect(JSON.parse(h.writeFile.mock.calls.at(-1)[1])[5977]).toEqual({ enqueuedAt: newEnqueuedAt, oid, count: 0, fails: [oid] });
+    expect(h.timeline).toEqual([]);
+    expect(h.emit).not.toHaveBeenCalled();
+  });
+
   it.each(['failure', 'unconfirmed', 'already absent'])('isolates a dequeue %s, continues with other entries and emits only for successful removals', mode => {
     const h = sweepIo({ nodes: [node({ state: 'UNMERGEABLE' }), node({ state: 'UNMERGEABLE', pullRequest: { number: 5962 } })],
       fail: mode === 'failure' ? [5977] : [], absent: mode === 'already absent' ? [5977] : [], unconfirmed: mode === 'unconfirmed' ? [5977] : [] });
