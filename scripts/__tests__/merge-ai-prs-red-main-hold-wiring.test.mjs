@@ -9,11 +9,15 @@
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
+import { spawnTimeoutMs } from './lib/spawn-timeout.mjs';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
+
+// Cover the 6x load cap (even if load rises later), an explicit override, and fixture cleanup.
+const CLI_TEST_TIMEOUT_MS = 2 * Math.max(180_000, spawnTimeoutMs()) + 10_000;
 
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
 const remediation = join(dirname(fileURLToPath(import.meta.url)), '..', 'readiness', 'red-main-remediation.mjs');
@@ -157,11 +161,11 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
     delete env.RMH_SHARED_FREEZE;
     if (shared !== null) env.RMH_SHARED_FREEZE = shared;
     if (unfreezeFirst) { // the operator lifts the freeze through the real remediation CLI BEFORE the drain pass
-      const u = spawnSync(process.execPath, ['--import', preload, remediation, 'unfreeze'], { cwd: dir, encoding: 'utf8', timeout: 30000, env });
+      const u = spawnSync(process.execPath, ['--import', preload, remediation, 'unfreeze'], { cwd: dir, encoding: 'utf8', timeout: spawnTimeoutMs(), env });
       expect(u.status, u.stderr).toBe(0);
     }
     const r = spawnSync(process.execPath, ['--import', preload, script, '--this-repo', '--label=ready-to-merge',
-      '--no-reconcile-labels', '--no-drain-lease', '--json', ...(dryRun ? ['--dry-run'] : [])], { cwd: dir, encoding: 'utf8', timeout: 30000, env });
+      '--no-reconcile-labels', '--no-drain-lease', '--json', ...(dryRun ? ['--dry-run'] : [])], { cwd: dir, encoding: 'utf8', timeout: spawnTimeoutMs(), env });
     expect(r.error, r.stderr).toBeUndefined();
     const lines = r.stdout.trim().split('\n').filter(Boolean);
     const result = lines.length ? JSON.parse(lines.at(-1)) : null;
@@ -183,7 +187,7 @@ describe('xym8nt4 — a card group never deadlocks the published main-red repair
     expect(attempts, stderr).toEqual([OTHER]);
     expect(result.enqueueOutcomes).toContainEqual(expect.objectContaining({ num: FIX, outcome: 'not-enqueued', kind: 'card-grouped',
       reason: expect.stringMatching(/reserved by open card group #4000/) }));
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('a PR a card group claims after the pre-pass check is re-checked inside the merge-write mutex: not merged', () => {
     const { attempts, stderr, result } = runCli({ lateGroup: FIX });
@@ -191,12 +195,12 @@ describe('xym8nt4 — a card group never deadlocks the published main-red repair
     expect(result.enqueueOutcomes).toContainEqual(expect.objectContaining({ num: FIX, outcome: 'not-enqueued', kind: 'card-group-hold',
       reason: expect.stringMatching(/grouped into #4100/) }));
     expect(result.enqueueOutcomes.filter(o => o.num === FIX && o.outcome === 'enqueued')).toEqual([]);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('main red: the published fix PR lands although the group reserves its card; the unrelated PR stays held', () => {
     const { attempts, stderr } = runCli({ publishedRed: true, priorityPrs: [FIX], cardGroup: true });
     expect(attempts, stderr).toEqual([FIX]);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 });
 
 describe('card xx7ckd6 — red-main hold wired at the drain merge site (no --no-red-main-freeze)', () => {
@@ -204,44 +208,44 @@ describe('card xx7ckd6 — red-main hold wired at the drain merge site (no --no-
     const { attempts, status, stderr } = runCli();
     expect(attempts.sort(), stderr).toEqual([FIX, OTHER]);
     expect(status).toBe(0);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('manual freeze + published fix PR (hold ON by default): every PR is held, including the fix PR', () => {
     const { attempts, stderr, status } = runCli({ freeze: 'env', priorityPrs: [FIX] });
     expect(attempts).toEqual([]);
     expect(status).not.toBe(5); // the old whole-line stop is NOT what contains it
     expect(stderr).toMatch(/red-main-hold/);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('a published red alone (no manual freeze) also holds the unrelated PR while the fix PR lands', () => {
     const { attempts, stderr } = runCli({ publishedRed: true, priorityPrs: [FIX] });
     expect(attempts).toEqual([FIX]);
     expect(stderr).toMatch(/\[published\] — only the main-fix PR #3001 lands/);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('red but NO fix PR published yet: nothing lands (no PR is exempt)', () => {
     const { attempts, stderr } = runCli({ freeze: 'env' });
     expect(attempts).toEqual([]);
     expect(stderr).toMatch(/skipped 2: #3001 red-main-hold, #3002 red-main-hold/);
     expect(stderr).toMatch(/nothing lands \(no main-fix PR published yet\)/);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('the hold only ADDS: a fix PR that fails another merge gate (not mergeable) is not merged, and the other stays held', () => {
     const { attempts } = runCli({ freeze: 'env', priorityPrs: [FIX], fixMergeable: 'CONFLICTING' });
     expect(attempts).toEqual([]);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('setting OFF restores the old full stop: a manual freeze exits 5 and nothing — not even the fix PR — reaches gh pr merge', () => {
     const { attempts, status, result } = runCli({ freeze: 'env', priorityPrs: [FIX], holdSetting: 'off' });
     expect(status).toBe(5);
     expect(attempts).toEqual([]);
     expect(result.stopped).toBe('red-main-freeze');
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('setting OFF: a published red alone holds nothing (behaviour before the card)', () => {
     const { attempts } = runCli({ publishedRed: true, priorityPrs: [FIX], holdSetting: 'off' });
     expect(attempts.sort()).toEqual([FIX, OTHER]);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('rollout: a freeze that exists ONLY at the legacy per-clone path is carried to the coordination root and still holds', () => {
     const { attempts, newMarkerExists, legacyGone, legacyAside, migratedFrom, stderr, status } = runCli({ freeze: 'legacy' });    expect(newMarkerExists).toBe(true);
@@ -251,7 +255,7 @@ describe('card xx7ckd6 — red-main hold wired at the drain merge site (no --no-
     expect(stderr).toMatch(/red-main freeze marker migrated/);
     expect(attempts).toEqual([]); // frozen, no fix PR published → nothing lands (a fully held pass is a clean exit, not a stop)
     expect(status).toBe(0);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('rollout (PR #4624 review): a freeze raised from a SIBLING clone (the daemon code clone) is carried across and still holds the line', () => {
     const { attempts, newMarkerExists, siblingGone, siblingAside, migratedFrom, stderr } = runCli({ freeze: 'sibling' });
@@ -260,14 +264,14 @@ describe('card xx7ckd6 — red-main hold wired at the drain merge site (no --no-
     expect(siblingAside).toBe('migrated');
     expect(migratedFrom).toMatch(/we-drain-daemon\/code\/\.conveyor\/red-main-freeze\.json$/);
     expect(attempts).toEqual([]);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('a sibling clone\'s freeze does not resurface after `unfreeze` through the real CLI', () => {
     const { attempts, siblingAside, newMarkerExists } = runCli({ freeze: 'sibling', unfreezeFirst: true });
     expect(siblingAside).toBe('retired');
     expect(newMarkerExists).toBe(false);
     expect(attempts.sort()).toEqual([FIX, OTHER]);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('an old marker can never resurface after `unfreeze`: legacy + new both present → unfreeze → both PRs land', () => {
     const { attempts, legacyGone, legacyAside, newMarkerExists } = runCli({ freeze: 'both', unfreezeFirst: true });
@@ -275,35 +279,35 @@ describe('card xx7ckd6 — red-main hold wired at the drain merge site (no --no-
     expect(legacyGone).toBe(true);
     expect(legacyAside).toBe('retired');
     expect(attempts.sort()).toEqual([FIX, OTHER]);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('legacy only → unfreeze (before any drain pass migrated it) → both PRs land, nothing is carried across', () => {
     const { attempts, newMarkerExists, legacyAside } = runCli({ freeze: 'legacy', unfreezeFirst: true });
     expect(legacyAside).toBe('retired');
     expect(newMarkerExists).toBe(false);
     expect(attempts.sort()).toEqual([FIX, OTHER]);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('legacy + a newer marker at the new path, no unfreeze: the new path wins, the legacy file is set aside, the line stays held', () => {
     const { attempts, legacyAside, migratedFrom } = runCli({ freeze: 'both' });
     expect(legacyAside).toBe('superseded');
     expect(migratedFrom).toBeNull();
     expect(attempts).toEqual([]);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('--dry-run is read-only: a legacy-only marker is NOT moved', () => {
     const { legacyGone, newMarkerExists, attempts } = runCli({ freeze: 'legacy', dryRun: true });
     expect(legacyGone).toBe(false);
     expect(newMarkerExists).toBe(false);
     expect(attempts).toEqual([]);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   // PR #4624 review (merge-ai-prs.mjs:6251): the old freeze stop exited before the pass, so NOTHING reached main. With
   // the hold ON the pass runs, so every OTHER write to main in it must be held too, not only `gh pr merge`.
   it('control: main not red → the stranded-card sweep resolves card 7001 and pushes it to main', () => {
     const { mainPushes, stderr } = runCli({ stranded: true });
     expect(mainPushes, stderr).toEqual(['push origin HEAD:main']);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('manual freeze (hold ON): the pass writes nothing to main, so the stranded-card sweep does not push; it waits for green', () => {
     const { mainPushes, attempts, status, stderr, result } = runCli({ freeze: 'env', stranded: true });
@@ -311,20 +315,20 @@ describe('card xx7ckd6 — red-main hold wired at the drain merge site (no --no-
     expect(status).not.toBe(5);
     expect(mainPushes, stderr).toEqual([]);
     expect(result.strandedSweep).toMatchObject({ skipped: 'red-main-hold', applied: [], autoResolvable: [{ id: '7001' }] });
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('manual freeze + published fix PR: nothing lands or pushes', () => {
     const { mainPushes, attempts, stderr, result } = runCli({ freeze: 'env', priorityPrs: [FIX], stranded: true });
     expect(attempts).toEqual([]);
     expect(mainPushes, stderr).toEqual([]);
     expect(result.strandedSweep).toMatchObject({ skipped: 'red-main-hold', applied: [] });
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('a published red alone (hold ON) also keeps the stranded-card sweep off main', () => {
     const { mainPushes, stderr, result } = runCli({ publishedRed: true, priorityPrs: [FIX], stranded: true });
     expect(mainPushes, stderr).toEqual([]);
     expect(result.strandedSweep).toMatchObject({ skipped: 'red-main-hold', applied: [] });
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   // Rollback/switch: with the setting OFF the only guard used to be the pre-pass stop, so a freeze raised after it
   // (mid-pass, or the setting switched OFF mid-watch) reached nothing and every PR landed on a frozen main.
@@ -333,25 +337,25 @@ describe('card xx7ckd6 — red-main hold wired at the drain merge site (no --no-
     expect(status, stderr).not.toBe(5); // the pre-pass stop did not see it — the in-pass hold is what catches it
     expect(attempts, stderr).toEqual([]);
     expect(mainPushes).toEqual([]);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('control: setting ON + a freeze raised mid-pass is held the same way (nothing lands)', () => {
     const { attempts, mainPushes } = runCli({ lateFreeze: true, priorityPrs: [FIX], stranded: true });
     expect(attempts).toEqual([]);
     expect(mainPushes).toEqual([]);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('setting OFF + manual freeze: the old stop (exit 5) still writes nothing to main', () => {
     const { mainPushes, status } = runCli({ freeze: 'env', holdSetting: 'off', stranded: true });
     expect(status).toBe(5);
     expect(mainPushes).toEqual([]);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('rollout + setting OFF: the migrated legacy freeze still stops the whole line (exit 5)', () => {
     const { attempts, status } = runCli({ freeze: 'legacy', holdSetting: 'off' });
     expect(status).toBe(5);
     expect(attempts).toEqual([]);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 });
 
 describe('runStrandedSweepStep — held while main is red (redMainHeld)', () => {
@@ -399,16 +403,16 @@ describe('x09e2bn shared reader wiring', () => {
     expect(r.stderr).toContain('redMainFreezeReader setting shared-first via env');
     if (holdSetting === 'off') expect(r.status).toBe(5);
     else expect(r.result.skipped[0].reason).toContain('shared operator stop');
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
   it('unreadable shared JSON holds with an error', () => {
     const r = runCli({ shared: '{bad json', priorityPrs: [FIX] });
     expect(r.attempts, r.stderr).toEqual([]);
     expect(r.result.skipped[0].reason).toContain('shared freeze unreadable');
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
   it('local automatic freeze exempts the published fix PR', () => {
     const r = runCli({ freeze: 'env', markerKind: 'auto', priorityPrs: [FIX] });
     expect(r.attempts, r.stderr).toEqual([FIX]);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 });
 
 describe('A5 manual fix setting wiring and OFF guidance', () => {
@@ -417,13 +421,13 @@ describe('A5 manual fix setting wiring and OFF guidance', () => {
     expect(r.attempts, r.stderr).toEqual([FIX]);
     expect(r.mainPushes).toEqual([]);
     expect(r.stderr).toContain('redMainManualFreezeFixPr setting exempt via env');
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
   it.each([['env', JSON.stringify({ frozen: true, mergeSha: 'sharedsha' }), 'abc1234567'], [null, JSON.stringify({ frozen: true, mergeSha: 'sharedsha' }), 'sharedsha']])('OFF guidance uses local then shared SHA (%s)', (freeze, shared, sha) => {
     const r = runCli({ freeze, shared, holdSetting: 'off' });
     expect(r.result.detail).toContain(`Revert-to-green (revert ${sha}), then \`node scripts/readiness/red-main-remediation.mjs unfreeze\` (#2681)`);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
   it('OFF unreadable guidance identifies checks', () => {
     const r = runCli({ shared: '{bad', holdSetting: 'off' });
     expect(r.result.detail).toMatch(/Check.*ops.*read access.*JSON/);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 });

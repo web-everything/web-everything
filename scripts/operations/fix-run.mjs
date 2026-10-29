@@ -34,11 +34,15 @@ import { REPO_ROOT } from './detached-dispatch.mjs';
 // below deadlocks if `dispatch-providers/fix.mjs` imports it back.
 import { FIX_RUN_EXECUTORS } from './dispatch-providers/fix.mjs';
 import { PR_BASE_MERGE_TARGET, recordBorrowOutcome, recordRoutedOutcome, consecutiveUnproductiveOnHead, ROUTED_CODEX_MAX_UNPRODUCTIVE } from '../lib/fix-slot-borrow.mjs';
-import { appendFixLoopRow, isInfraFixRunOutcome } from '../conveyor/fix-loop-ledger.mjs';
+import { appendFixLoopRow, isInfraFixRunOutcome, FIX_RUN_OUTCOME } from '../conveyor/fix-loop-ledger.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { riskyLaneConfig, LANE_CONFIG_LIST_ARGS, laneGitConfigArgs, laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
-import { LEASE_FILENAME } from '../lib/lane-lease.mjs';
+import { LEASE_FILENAME, renewedLease } from '../lib/lane-lease.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
+import { openOperatorSendBacks } from '../lib/operator-send-backs.mjs';
+import { buildFixEvidenceComment, sendBackItems, renderRequiredCitations } from '../lib/fix-evidence-post.mjs';
+import { fenceUntrusted, FENCED_DATA_RULE } from '../lib/mandate-fence.mjs';
+import { resolveCoordinationRoot } from './coordination-root.mjs';
 
 // LAZY on purpose: `deliver-item-wrapper.mjs` reaches `dispatch-providers/fix.mjs` (which imports this file) through
 // `dispatch-lane-io.mjs` -> `dispatch-provider-registry.mjs`, so a static import here is a cycle that makes the
@@ -64,9 +68,9 @@ const pendingRearmDir = () => join(homedir(), '.claude', 'conveyor', 'fix-run-pe
 const pendingKey = (repo, pr) => `${String(repo ?? 'we').replace(/[^\w.-]/g, '_')}-${String(pr).replace(/[^\w.-]/g, '_')}.json`;
 
 /**
- * A repair that is PUSHED but not yet re-armed (the re-arm call failed): the next launch of the same PR opens its lane
- * at that pushed tip, sees no new commit, and would otherwise skip the re-arm for good. This records "owed" durably
- * between the two steps so a no-change retry can finish the hand-back. Default = a file under `~/.claude/conveyor`.
+ * A pushed repair or published no-change evidence can still owe a re-arm. Record the debt before the external
+ * effect so retries can finish the hand-back. Evidence markers require a fresh closed-send-back check on recovery;
+ * legacy markers without a kind retain push recovery. Default = a file under `~/.claude/conveyor`.
  */
 export const defaultPendingRearm = (dir = pendingRearmDir()) => ({
   read(repo, pr, now = Date.now()) {
@@ -75,9 +79,9 @@ export const defaultPendingRearm = (dir = pendingRearmDir()) => ({
       return v && typeof v.sha === 'string' && now - Number(v.at) < PENDING_REARM_MAX_AGE_MS ? v : null;
     } catch { return null; }
   },
-  write(repo, pr, sha, now = Date.now()) {
+  write(repo, pr, sha, now = Date.now(), kind = 'push') {
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, pendingKey(repo, pr)), JSON.stringify({ sha, at: now }), { mode: 0o600 });
+    writeFileSync(join(dir, pendingKey(repo, pr)), JSON.stringify({ sha, at: now, kind }), { mode: 0o600 });
   },
   clear(repo, pr) { try { unlinkSync(join(dir, pendingKey(repo, pr))); } catch { /* already gone */ } },
 });
@@ -124,6 +128,7 @@ export const SANDBOX_PREAMBLE = [
   'already done for you: take the latest changes-requested (or advisory) comment in that section as the authoritative ask.',
   'The sandbox forbids ALL `.git` writes. Edit files only; do NOT run git add, commit, merge, checkout, reset, stash or rebase.',
   'You may write a commit message to .fix-commit-msg.txt. The launcher stages, commits, pushes and re-arms review after you exit.',
+  'Write your fix evidence to .fix-evidence.md at the lane root (gitignored), including for each open operator send-back item a line: - send-back <id> item <n>: <file:line>. Cite tests by file:line too (e.g. scripts/x/__tests__/y.test.mjs:24).',
   '',
   '---',
   '',
@@ -165,6 +170,8 @@ export function unmergedPaths(porcelain) {
 
 /** A refusal the launcher itself wrote: the only kind of error whose message may be posted to the public PR. */
 export class LauncherError extends Error {}
+
+export class LeaseLostError extends LauncherError {}
 
 const SCRATCH_RE = /^(?:\.fix-.*(?:commit-msg|commit-message).*\.txt|\.delivery-commit-msg-.*|\.converge-.*)$/;
 
@@ -454,6 +461,31 @@ export function readLaneLease(lanePath) {
   catch (e) { if (e.code === 'ENOENT') return null; throw e; }
 }
 
+/**
+ * Best-effort in-place renewal; a replaced lease stays on a different inode.
+ * One positioned write retains the old byte length with whitespace padding, avoiding
+ * an empty marker or a stale JSON suffix for allocator readers between IO calls.
+ */
+export function defaultRenewLease({ lanePath, holder } = {}) {
+  try {
+    const file = join(lanePath, '.git', LEASE_FILENAME);
+    const fd = nodeFs.openSync(file, 'r+');
+    try {
+      const previous = readFileSync(fd);
+      const lease = JSON.parse(previous.toString('utf8'));
+      if (!holder || lease?.holder !== holder) return false;
+      const next = renewedLease(lease, new Date().toISOString());
+      if (!next) return false;
+      const json = Buffer.from(`${JSON.stringify(next, null, 2)}\n`);
+      const contents = Buffer.alloc(Math.max(previous.length, json.length), 0x20);
+      json.copy(contents);
+      return nodeFs.writeSync(fd, contents, 0, contents.length, 0) === contents.length;
+    } finally {
+      nodeFs.closeSync(fd);
+    }
+  } catch { return false; }
+}
+
 /** Pure decision; clean must be positively observed before a reset can be proposed. */
 export function laneHeadCheck({ laneHead, prHead, lease, holder, clean = false }) {
   const mismatch = `${laneHead?.slice(0, 9) || 'unknown'}, not PR head ${prHead?.slice(0, 9) || 'unknown'}`;
@@ -481,11 +513,14 @@ export function inspectLaneHead({ lanePath, prHead, holder, run = sh, readLease 
 }
 
 export function assertLaneLease({ lanePath, holder, readLease = readLaneLease, phase = 'start the agent' }) {
+  let lease;
   try {
-    const lease = readLease(lanePath);
-    if (!holder || lease?.holder !== holder) throw new Error(`lease now held by ${lease?.holder || 'unknown'} (expected ${holder || 'unknown'})`);
+    lease = readLease(lanePath);
   } catch (e) {
     throw new LauncherError(`fix-run: ${basename(lanePath)} ${e.message}; refusing to ${phase}`);
+  }
+  if (!holder || lease?.holder !== holder) {
+    throw new LeaseLostError(`fix-run: ${basename(lanePath)} lease now held by ${lease?.holder || 'unknown'} (expected ${holder || 'unknown'}); refusing to ${phase}`);
   }
 }
 
@@ -589,7 +624,16 @@ export async function runFixCli(argv = [], {
   recordOutcome = recordBorrowOutcome,
   recordRouted = recordRoutedOutcome,
   readLease = readLaneLease,
+  renewLease = defaultRenewLease,
+  heartbeatMs = 60_000,
   readFile = readLaneFileSafe,
+  persistEvidence = ({ repoKey, pr, text }) => {
+    const dir = join(resolveCoordinationRoot(), 'fix-evidence');
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, `${repoKey}-${pr}.md`);
+    writeFileSync(file, text, { mode: 0o600 });
+    nodeFs.chmodSync(file, 0o600);
+  },
   stageEntry = laneStageEntry,
   fileExists = existsSync,
   weRoot = REPO_ROOT,
@@ -605,7 +649,7 @@ export async function runFixCli(argv = [], {
   let prHeadSha = null;
   let finalMessage = '';
   let abortMerge = null;
-  let outcome = 'failed';
+  let outcome = FIX_RUN_OUTCOME.FAILED;
   let reason = 'launch did not complete';
   const settle = async () => {
     if (!launch?.pr) return;
@@ -628,7 +672,9 @@ export async function runFixCli(argv = [], {
     if (head) {
       try {
         await appendLoopRow({ kind: 'outcome', repo, pr: Number(launch.pr), head, session: launch.sessionSlug,
-          outcome, infra: isInfraFixRunOutcome(outcome, reason), reason });
+          // The fix-loop ledger only accepts pushed|no-change|failed rows; a lease loss is a failed, non-infra row.
+          outcome: outcome === FIX_RUN_OUTCOME.LEASE_LOST ? FIX_RUN_OUTCOME.FAILED : outcome,
+          infra: isInfraFixRunOutcome(outcome, reason), reason });
       } catch (e) { writeErr(`fix-run: could not record fix-loop outcome: ${String(e?.message ?? e)}\n`); }
     }
     try {
@@ -666,6 +712,7 @@ export async function runFixCli(argv = [], {
     if (mergeOnto && !target) throw new LauncherError('cannot resolve PR base for conflict merge');
     if (mergeConflictingBase) write(`fix-run: PR #${pr} conflicts with ${target}; launcher merges origin/${target} first\n`);
     let prContext;
+    let openSendBacks = [];
     let repeatPlan = { action: 'patch' };
     if (launch.repairKind === 'ci-heal') {
       const inputs = await readCiHeal({ repo: launch.repo, pr, run: (cmd, args, opts) => run(cmd, args, { cwd: weRoot, ...opts }) });
@@ -673,6 +720,7 @@ export async function runFixCli(argv = [], {
       prContext = renderCiHealContext(inputs);
     } else {
       const comments = await readComments(pr, { repo: launch.repo });
+      openSendBacks = openOperatorSendBacks({ comments, headRefOid: prHeadSha });
       const safety = resolveFixSafety();
       for (const k of ['alertAtRoundCap', 'resetOnRepeatedFinding']) write(`policy · fix.${k}=${safety.value[k]} (${safety.sources[k]})\n`);
       repeatPlan = repeatedFindingPlan(comments, { enabled: safety.value.resetOnRepeatedFinding });
@@ -712,10 +760,7 @@ export async function runFixCli(argv = [], {
     const risky = riskyLaneConfig(configBefore);
     if (risky.length) throw new LauncherError(`lane git config defines command/credential/remote-rewrite keys (${risky.join(', ')}); refusing to run in it`);
     before = checkLane(prHeadSha).laneHead;
-    const rearm = head => {
-      // Best effort: the push already landed, and a label hiccup must never stop the re-arm (the CI-lifecycle label pass relabels it).
-      try { markFixPushAwaitingCi({ repo: launch.repo, pr, head }, { run: (cmd, args) => run(cmd, args, { cwd: weRoot }), recordPush }); }
-      catch (e) { writeErr(`fix-run: PR #${pr} CI hand-off failed, re-arming anyway: ${String(e?.message ?? e).split('\n')[0]}\n`); }
+    const rearmReview = () => {
       try {
         return run('node', [resolve(weRoot, 'scripts', 'conveyor', 'rearm-review.mjs'), pr, ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot });
       } catch (e) {
@@ -727,13 +772,26 @@ export async function runFixCli(argv = [], {
         throw e;
       }
     };
-    // A prior run pushed this exact tip and then failed to re-arm (this lane opened AT that tip): finish the hand-back
-    // now, before spending a whole agent run on it.
-    if (pendingRearm.read(launch.repo, pr)?.sha === before) {
-      rearm(before);
+    const rearm = head => {
+      // Best effort: the push already landed, and a label hiccup must never stop the re-arm (the CI-lifecycle label pass relabels it).
+      try { markFixPushAwaitingCi({ repo: launch.repo, pr, head }, { run: (cmd, args) => run(cmd, args, { cwd: weRoot }), recordPush }); }
+      catch (e) { writeErr(`fix-run: PR #${pr} CI hand-off failed, re-arming anyway: ${String(e?.message ?? e).split('\n')[0]}\n`); }
+      return rearmReview();
+    };
+    // Recover only at the recorded tip. An evidence marker precedes publication, so it alone cannot prove that
+    // publication succeeded: unresolved requests must go through the agent/evidence path again.
+    const pending = pendingRearm.read(launch.repo, pr);
+    const pendingEvidence = pending?.kind === 'evidence';
+    const recoverPending = pending?.sha === before && (!pendingEvidence || !openOperatorSendBacks({
+      comments: await readComments(pr, { repo: launch.repo }), headRefOid: prHeadSha,
+    }).length);
+    if (recoverPending) {
+      if (pendingEvidence) rearmReview();
+      else rearm(before);
       pendingRearm.clear(launch.repo, pr);
-      const result = `PR #${pr} (already pushed ${before.slice(0, 9)}; re-armed review:pending after a failed earlier re-arm)`;
-      outcome = 'pushed'; reason = 'finished an earlier push';
+      const result = `PR #${pr} (${pendingEvidence ? 'evidence already posted for' : 'already pushed'} ${before.slice(0, 9)}; re-armed review:pending after a failed earlier re-arm)`;
+      outcome = pendingEvidence ? FIX_RUN_OUTCOME.NO_CHANGE : FIX_RUN_OUTCOME.PUSHED;
+      reason = pendingEvidence ? 'finished an earlier evidence re-arm' : 'finished an earlier push';
       write(`fix-run: PR #${pr} finished - ${result}\n`);
       return { code: 0, result };
     }
@@ -894,21 +952,33 @@ export async function runFixCli(argv = [], {
       write(`fix-run: ${finalMessage}\n`);
     } else try {
       checkLane(unmerged.length ? before : preparedHead, !target);
-      spawned = await provider.spawn({
-        taskKind: launch.taskKind, usageTaskKind: launch.repairKind === 'ci-heal' ? 'ci-heal' : launch.taskKind, repo: launch.repo, pr, caller: 'fix-run.mjs',
-        sessionId: undefined, prompt: mergePrompt + (launch.repairKind === 'ci-heal'
-          ? SANDBOX_PREAMBLE.replace(/The reviewer's finding[\s\S]*?authoritative ask\.\n/, 'The failing checks and tests are in the CI FAILURE CONTEXT section below.\n')
-          : SANDBOX_PREAMBLE) + prContext + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
-        ...(launch.model ? { model: launch.model } : {}), ...(launch.effort ? { effort: launch.effort } : {}),
-      }, { resolveLane: () => lanePath, ...(launch.provider === 'codex' ? {
-        spawnAgent: async (...args) => {
-          try {
-            const result = await spawnCodex(...args);
-            finalMessage = agentFinalMessage(result);
-            return result;
-          } catch (e) { finalMessage = agentFinalMessage(e); throw e; }
-        },
-      } : {}) });
+      const heartbeat = setInterval(() => {
+        try {
+          if (readLease(lanePath)?.holder === holder) renewLease({ lanePath, holder });
+        } catch { /* Renewal is best-effort; the ownership guards still refuse mutations. */ }
+      }, heartbeatMs);
+      heartbeat.unref();
+      try {
+        spawned = await provider.spawn({
+          taskKind: launch.taskKind, usageTaskKind: launch.repairKind === 'ci-heal' ? 'ci-heal' : launch.taskKind, repo: launch.repo, pr, caller: 'fix-run.mjs',
+          sessionId: undefined, prompt: mergePrompt + (launch.repairKind === 'ci-heal'
+            ? SANDBOX_PREAMBLE.replace(/The reviewer's finding[\s\S]*?authoritative ask\.\n/, 'The failing checks and tests are in the CI FAILURE CONTEXT section below.\n')
+            : SANDBOX_PREAMBLE) + (openSendBacks.length
+            ? `## Required fix-evidence citations\nCopy these keys into .fix-evidence.md and replace each <file:line> with a changed, tracked file and its line at HEAD.\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', renderRequiredCitations(openSendBacks))}\n\n`
+            : '') + prContext + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
+          ...(launch.model ? { model: launch.model } : {}), ...(launch.effort ? { effort: launch.effort } : {}),
+        }, { resolveLane: () => lanePath, ...(launch.provider === 'codex' ? {
+          spawnAgent: async (...args) => {
+            try {
+              const result = await spawnCodex(...args);
+              finalMessage = agentFinalMessage(result);
+              return result;
+            } catch (e) { finalMessage = agentFinalMessage(e); throw e; }
+          },
+        } : {}) });
+      } finally {
+        clearInterval(heartbeat);
+      }
     } catch (e) {
       finalMessage = agentFinalMessage(e) || finalMessage;
       throw e;
@@ -956,10 +1026,67 @@ export async function runFixCli(argv = [], {
       withMessageFile(`${message.trim()}\n\n${trailer}\n`, file => git('commit', '-F', file));
     }
     const after = run('git', ['rev-parse', 'HEAD'], { cwd: lanePath }).trim();
+    let evidenceText = null, evidencePersisted = false;
+    try { evidenceText = readFile(join(lanePath, '.fix-evidence.md'), lanePath); }
+    catch (e) { writeErr(`fix-run: could not read fix evidence: ${singleLine(e?.message ?? e)}\n`); }
+    if (evidenceText != null) {
+      const repoKey = String(launch.claimRepo ?? launch.repo ?? 'we').replace(/[^\w.-]/g, '_');
+      try { await persistEvidence({ repoKey, pr, text: evidenceText }); evidencePersisted = true; }
+      catch (e) { writeErr(`fix-run: could not persist fix evidence: ${singleLine(e?.message ?? e)}\n`); }
+    }
+    const allItems = () => openSendBacks.flatMap(item => sendBackItems(item).map(({ n }) => `${item.id}#${n}`));
+    const baseRef = String(prHead.baseRefName ?? '').trim();
+    let changedAtHead = null;
+    const verifyCitation = ({ path, line }) => {
+      try {
+        if (!baseRef) return false;
+        if (changedAtHead === null) {
+          const mergeBase = git('merge-base', `origin/${baseRef}`, 'HEAD').trim();
+          if (!OID_RE.test(mergeBase)) return false;
+          changedAtHead = new Set(git('diff', '--name-only', '-z', `${mergeBase}..HEAD`).split('\0').filter(Boolean));
+        }
+        if (!changedAtHead.has(path)) return false;
+        const entry = /^(\d{6}) blob ([0-9a-f]+)\t([^\0]+)\0$/.exec(git('ls-tree', '-z', 'HEAD', '--', path));
+        if (!entry || !REGULAR_MODES.has(entry[1]) || !OID_RE.test(entry[2]) || entry[3] !== path) return false;
+        const text = blob(`HEAD:${path}`);
+        const lineCount = text ? text.split('\n').length - Number(text.endsWith('\n')) : 0;
+        return line >= 1 && line <= lineCount;
+      } catch { return false; }
+    };
+    const postEvidence = async head => {
+      if (launch.repairKind === 'ci-heal') return { posted: false, missing: [] };
+      try {
+        const comments = await readComments(pr, { repo: launch.repo });
+        openSendBacks = openOperatorSendBacks({ comments, headRefOid: prHeadSha });
+        if (evidenceText != null && !evidencePersisted) return { posted: false, missing: allItems(), reason: 'fix evidence persistence failed' };
+        if (!openSendBacks.length) return { posted: false, missing: [] };
+        if (!evidenceText) return { posted: false, missing: allItems() };
+        const evidence = buildFixEvidenceComment({ openSendBacks, evidenceText, head, verifyCitation });
+        if (!evidence.ok) return { posted: false, missing: evidence.missing };
+        // Fail closed if the debt cannot be saved. Posting can close the last request, removing the retry trigger.
+        if (after === before) pendingRearm.write(launch.repo, pr, head, Date.now(), 'evidence');
+        withMessageFile(evidence.body, file => run('gh', ['pr', 'comment', pr, ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot }));
+        return { posted: true, missing: [] };
+      } catch (e) {
+        writeErr(`fix-run: could not post fix evidence: ${singleLine(e?.message ?? e)}\n`);
+        return { posted: false, missing: allItems(), reason: 'fix evidence comment read or post failed' };
+      }
+    };
     let result;
     if (after === before) {
-      outcome = 'no-change'; reason = finalMessage || 'agent committed nothing';
-      result = `no-change (${singleLine(reason)}; claim released, PR is re-planned)`;
+      outcome = FIX_RUN_OUTCOME.NO_CHANGE; reason = finalMessage || 'agent committed nothing';
+      const evidence = await postEvidence(after);
+      if (openSendBacks.length || evidence.reason) {
+        if (evidence.posted) {
+          rearmReview();
+          pendingRearm.clear(launch.repo, pr);
+          reason = `evidence posted for send-back(s) ${openSendBacks.map(item => item.id).join(', ')}; review re-armed: ${finalMessage}`;
+        } else {
+          outcome = FIX_RUN_OUTCOME.NO_CHANGE_UNPROVEN;
+          reason = evidence.reason ?? `missing or unverified fix evidence: ${evidence.missing.join(', ')}`;
+        }
+      }
+      result = `${outcome} (${singleLine(reason)}; claim released, PR is re-planned)`;
     } else {
       // Defense in depth (config was already re-checked right after the agent): this push runs outside the sandbox with
       // our credentials, so refuse again if the repo-local config (remote URL, sshCommand, insteadOf, credential helper, includes...) changed or is now
@@ -972,20 +1099,25 @@ export async function runFixCli(argv = [], {
       try { pendingRearm.write(launch.repo, pr, after); } catch (e) { writeErr(`fix-run: could not record the pending re-arm: ${String(e?.message ?? e)}\n`); }
       assertLaneLease({ lanePath, holder, readLease, phase: 'push' });
       run('git', [...HARDENED_GIT_ARGS, 'push', '--no-verify', 'origin', `HEAD:refs/heads/${ref}`], { cwd: lanePath, env: gitEnv }); // never --force
+      await postEvidence(after);
       rearm(after);
       pendingRearm.clear(launch.repo, pr);
       result = `PR #${pr} (pushed ${after.slice(0, 9)}, re-armed review:pending)`;
-      outcome = 'pushed'; reason = finalMessage || `pushed ${after.slice(0, 9)}`;
+      outcome = FIX_RUN_OUTCOME.PUSHED; reason = finalMessage || `pushed ${after.slice(0, 9)}`;
     }
     write(`fix-run: PR #${pr} finished - ${result}\n`);
     return { code: 0, result };
   } catch (e) {
     writeErr(`fix-run: PR #${pr} FAILED: ${String(e?.message ?? e)}\n`);
-    outcome = 'failed'; reason = `${childFailureReason(e)}${finalMessage && !String(e?.message).includes(finalMessage) ? `: ${finalMessage}` : ''}`;
+    outcome = e instanceof LeaseLostError ? FIX_RUN_OUTCOME.LEASE_LOST : FIX_RUN_OUTCOME.FAILED;
+    reason = `${childFailureReason(e)}${finalMessage && !String(e?.message).includes(finalMessage) ? `: ${finalMessage}` : ''}`;
+    if (e instanceof LeaseLostError) reason = `lease-lost: ${reason.replace(/^fix-run:\s*/, '')}`;
     if (!finalMessage && e instanceof LauncherError) {
       finalMessage = e.message;
     }
-    try { abortMerge?.(); } catch (abortError) { writeErr(`fix-run: merge abort failed: ${abortError.message}\n`); }
+    if (!(e instanceof LeaseLostError)) {
+      try { abortMerge?.(); } catch (abortError) { writeErr(`fix-run: merge abort failed: ${abortError.message}\n`); }
+    }
     return { code: 1, result: null };
   } finally {
     removePrompt(launch.promptFile); // one-shot, untrusted text: gone on every exit, success or not
