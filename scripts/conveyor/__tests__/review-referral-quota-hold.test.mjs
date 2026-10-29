@@ -159,6 +159,16 @@ describe('telemetry quota overlay', () => {
     expect(markQuotaOnlyFromSpans([row], spans)).toEqual([row]);
   });
 
+  it('demotes an incomplete row with recorded quota-only failures when an overlapping non-quota review.loop error matches its PR and exact repo', () => {
+    const row = evidence([quotaError]);
+    const nonQuota = quotaSpan({ statusMessage: genuineError,
+      attributes: { pr: row.pr, repo: row.repo },
+      startedAt: iso(at - 500), endedAt: iso(at + 500) });
+
+    expect(row).toMatchObject({ incomplete: true, quotaOnly: true, startedAt: at, pr: 7, repo });
+    expect(markQuotaOnlyFromSpans([row], [nonQuota])).toEqual([{ ...row, quotaOnly: false }]);
+  });
+
   it.each(['other/repo', 'repo', 'example/other', 'another-owner/other'])('never matches quota telemetry without the exact full repo: %s', spanRepo => {
     const row = textlessRow();
     const span = quotaSpan({ attributes: { pr: row.pr, repo: spanRepo } });
