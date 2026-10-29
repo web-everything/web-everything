@@ -270,7 +270,10 @@ const DELEGATED_CLEARANCE_MARKER = '<!-- delegated-clearance: guarded -->';
 export function canRestoreHumanClearance(comments, headSha) {
   if (!Array.isArray(comments)
     || parseLatestHumanClearedSha(comments)?.toLowerCase() !== String(headSha).toLowerCase()) return false;
-  const latest = comments.findLast(c => isTrustedMarkerAuthor(c) && parseReviewedSha([c]));
+  const latest = comments.findLast(c => {
+    if (!isTrustedMarkerAuthor(c)) return false;
+    return parseReviewedSha([c]);
+  });
   return !!latest && !latest.body.includes(DELEGATED_CLEARANCE_MARKER);
 }
 
