@@ -162,13 +162,17 @@ describe('poison guard admission boundary', () => {
     expect(enqueuePr).toHaveBeenCalledOnce();
   });
 
-  it.each([
-    ['bornAs', '"xgcpm6z"'], ['bornAs', "'xgcpm6z'"],
-    ['id', '"xgcpm6z"'], ['id', "'xgcpm6z'"],
-  ])('refuses a collision in quoted %s: %s on a numbered card', (key, value) => {
+  it.each([['bornAs', '"xgcpm6z"'], ['bornAs', "'xgcpm6z'"]])('refuses a collision in quoted %s: %s on a numbered card', (key, value) => {
     const { s } = strategy(gitEvidence({ text: `---\n${key}: ${value}\n---\n` }));
     expect(s.enqueue(c, headSha)).toMatchObject({ enqueued: false, kind: 'bornas-collision' });
     expect(enqueuePr).not.toHaveBeenCalled();
+  });
+
+  // The backlog loader replaces a frontmatter `id` with the file name, so duplicateBornAs never reads it as identity.
+  it.each(['"xgcpm6z"', "'xgcpm6z'"])('admits a numbered card whose only hash is a frontmatter id: %s', value => {
+    const { s } = strategy(gitEvidence({ text: `---\nid: ${value}\n---\n` }));
+    expect(s.enqueue(c, headSha)).toEqual({ enqueued: true, already: false });
+    expect(enqueuePr).toHaveBeenCalledOnce();
   });
 
   it.each(['bornAs', 'id'].flatMap(mainKey =>
