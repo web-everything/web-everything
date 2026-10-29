@@ -97,8 +97,15 @@
  * (exit 75); a caller that cannot defer keeps waiting. `admission.onTimeout` (defer|run) is resolved through
  * heavyAdmission: standard → platform preferences → tool settings → env WE_HEAVY_ADMISSION_ON_TIMEOUT.
  * Explicit `run` retains the loud unslotted escape. Dead / lease-expired holders are still reclaimed first.
- * Cap, fastSlots, fastScale and priority use one host-wide resolver (standard → platform preferences); their env and
+ * Cap, fastSlots, fastScale, priority and remote (enabled/mode/loadPerCoreThreshold) use one host-wide resolver
+ * (standard → platform preferences); remote has no env mapping. Their env and
  * checkout-local tool-settings overrides apply only to a PRIVATE pool — a LANE_POOL_ROOT that is not the host pool. DEFAULT_TIMEOUT_MS remains a legacy CLI fallback; WE_HEAVY_ADMISSION=off bypasses admission.
+ *
+ * REMOTE ROUTING CONTRACT — remote stays disabled by default (heavyAdmission.remote.enabled=false).
+ * Only { mode: 'remote', code: <integer 0..254> } exits with that code. Local admission may follow only
+ * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }. After a timeout,
+ * only the cancelled+terminated acknowledgement permits local admission. Everything else, including
+ * legacy { mode: 'fallback' }, throws, malformed results and unacknowledged timeouts, exits 124.
  *
  * THE LOAD-ADMISSION GATE (#4076, revised #4343) — a SECOND, DIFFERENT admission axis this module now also
  * hosts, gating NEW DISPATCHED SESSIONS (not heavy commands) by the host's ACTUAL capacity — CPU idle% and
@@ -135,7 +142,7 @@
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
-import { hostname, homedir, userInfo } from 'node:os';
+import { hostname, homedir, userInfo, loadavg, cpus } from 'node:os';
 import { createHash } from 'node:crypto';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -224,6 +231,7 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
   fastScale: Object.freeze({ maxSlots: null, minShortWaiters: 3, minShortShare: 0.6, minCpuIdlePct: 30, maxMemPressureLevel: 1 }),
   // main-fix-queue-priority — a red-main repair waiter (P0) is admitted to the next free slot ahead of all others.
   priority: Object.freeze({ mode: 'enforce', repairPatterns: DEFAULT_REPAIR_PATTERNS }),
+  remote: Object.freeze({ enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3 }),
 });
 
 /** Upper bound on a `run --wait-ms` budget (24h): a typo must not turn into an unbounded wait. */
@@ -248,6 +256,9 @@ const ADMISSION_VALID = {
   'fastScale.maxMemPressureLevel': (v) => admissionInt(1)(v) && v <= 4,
   'priority.mode': (v) => ADMISSION_PRIORITY_MODES.includes(v),
   'priority.repairPatterns': validRepairPatterns,
+  'remote.enabled': (v) => typeof v === 'boolean',
+  'remote.mode': (v) => v === 'above-threshold' || v === 'always',
+  'remote.loadPerCoreThreshold': (v) => Number.isFinite(v) && v > 0,
 };
 const ADMISSION_ENV = {
   cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMISSION_FAST_SLOTS', onTimeout: 'WE_HEAVY_ADMISSION_ON_TIMEOUT',
@@ -310,6 +321,7 @@ export function privateAdmissionPool(env, checkoutRoot) {
 export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot } = {}) {
   const isPrivate = privateAdmissionPool(env, checkoutRoot);
   const settings = { ...ADMISSION_POLICY_STANDARD, fastScale: { ...ADMISSION_POLICY_STANDARD.fastScale },
+    remote: { ...ADMISSION_POLICY_STANDARD.remote },
     priority: { ...ADMISSION_POLICY_STANDARD.priority, repairPatterns: [...ADMISSION_POLICY_STANDARD.priority.repairPatterns] } };
   const sources = {}; const invalid = []; const ignored = [];
   for (const [leaf, valid] of Object.entries(ADMISSION_VALID)) {
@@ -390,9 +402,104 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
 }
 
 export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid = [] }) {
-  const values = ['cap', 'fastSlots', 'onTimeout', 'fastScale.maxSlots', 'priority.mode']
+  const values = ['cap', 'fastSlots', 'onTimeout', 'fastScale.maxSlots', 'priority.mode',
+    'remote.enabled', 'remote.mode', 'remote.loadPerCoreThreshold']
     .map((leaf) => `${leaf}=${admissionLeaf(settings, leaf)} (${sources[leaf] ?? 'standard'})`);
   return `heavy-admission policy · ${values.join(', ')}${ignored.length ? ` · ignored: ${ignored.join('; ')}` : ''}${invalid.length ? ` · invalid: ${invalid.join('; ')}` : ''}`;
+}
+
+/** Pure remote routing decision; unreadable load keeps threshold routing local. */
+export function decideRemote({ policy, loadPerCore, argv }) {
+  const remote = policy.settings.remote;
+  const enabled = `remote.enabled=${remote.enabled} (${policy.sources['remote.enabled'] ?? 'standard'})`;
+  if (!remote.enabled) return { remote: false, reason: enabled };
+  if (remote.mode === 'always') return { remote: true, reason: `${enabled}; mode=always` };
+  if (!Number.isFinite(loadPerCore)) return { remote: false, reason: `${enabled}; load-unreadable` };
+  const above = loadPerCore > remote.loadPerCoreThreshold;
+  return { remote: above, reason: `${enabled}; loadPerCore=${loadPerCore} ${above ? '>' : '<='} ${remote.loadPerCoreThreshold}` };
+}
+
+const LEGACY_REMOTE_PRE_EXECUTION_REASONS = Object.freeze([
+  'command-not-allowed',
+  'requires-git-worktree',
+  'invalid-parameters',
+  'forge-unreachable',
+  'copy-failed',
+  'ignored-test-file',
+  'unsupported-sibling-dependency',
+  'sibling-missing',
+  'sibling-not-git',
+  'sibling-dirty',
+  'sibling-unsafe',
+]);
+
+/** Translate only known pre-execution refusals from the legacy executor into confirmed non-starts. */
+export function adaptLegacyRemoteResult(result) {
+  if (result?.mode === 'fallback' && LEGACY_REMOTE_PRE_EXECUTION_REASONS.includes(result.reason)) {
+    return { mode: 'not-started', terminated: true, reason: result.reason };
+  }
+  return result;
+}
+
+/** Attempt remote execution before taking a local slot; remote is disabled by default.
+ * Only { mode: 'remote', code: <integer 0..254> } exits with that code. Local admission requires
+ * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }.
+ * After timeout-abort, allow up to one second for cancelled+terminated acknowledgement.
+ * Everything else (including legacy fallback, throws, malformed results and unacknowledged
+ * timeouts) refuses local reruns with exit 124. */
+export async function runWithRemoteDecision({
+  argv, policy, cwd, env,
+  timeoutMs = classifyCommandKind(argv.map(shellQuoteWord).join(' '), env) === 'files'
+    ? resolveFastRunTimeoutMs(env)
+    : env ? resolveCeilingMs(env) : DEFAULT_ADMISSION_CEILING_MS,
+  loadPerCore = () => loadavg()[0] / cpus().length,
+  remoteExec = async (options) => adaptLegacyRemoteResult(await (await import('./remote-exec.mjs')).runRemote(options)),
+  log = (line) => process.stderr.write(line),
+}) {
+  let load;
+  try { load = loadPerCore(); } catch { /* unreadable load stays local */ }
+  const decision = decideRemote({ policy, loadPerCore: load, argv });
+  log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
+  if (!decision.remote) return { handled: false };
+  const refuseLocal = (reason) => {
+    log(`heavy-admission: remote failed (${oneLine(reason)}) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying.\n`);
+    return { handled: true, exitCode: 124 };
+  };
+  let reason; let timer;
+  const controller = new AbortController();
+  const timedOut = Symbol('remote-timeout');
+  try {
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        resolve(timedOut);
+        controller.abort();
+      }, timeoutMs);
+    });
+    const remote = Promise.resolve(remoteExec({ argv, cwd, env, signal: controller.signal }));
+    const result = await Promise.race([remote, timeout]);
+    if (result === timedOut) {
+      const termination = await Promise.race([
+        remote.catch(() => null),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(null), 1000);
+        }),
+      ]);
+      if (termination?.mode !== 'cancelled' || termination.terminated !== true) {
+        return refuseLocal('remote-timeout');
+      }
+      reason = 'remote-timeout';
+    } else {
+      if (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254) return { handled: true, exitCode: result.code };
+      // Only explicit non-start or cancellation with confirmed termination is safe. Throws and malformed
+      // replies may come from an executor whose remote child is still alive.
+      if (!((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true)) return refuseLocal(result?.reason ?? 'unconfirmed remote result');
+      reason = result?.reason ?? 'unconfirmed remote result';
+    }
+  } catch (error) { return refuseLocal(error?.message ?? error); }
+  finally { clearTimeout(timer); }
+  const failure = reason === 'remote-timeout' ? reason : `fallback: ${oneLine(reason)}`;
+  log(`heavy-admission: remote failed (${failure}) - falling back to local admission\n`);
+  return { handled: false };
 }
 
 /** PURE: scale short-job capacity only with enough demand and a fresh, healthy resource snapshot. */
@@ -1749,7 +1856,8 @@ function parseFlags(argv) {
   return { flags, positionals };
 }
 
-async function main(argv) {
+// @test-only-export-ok: exercise CLI routing through the real decision before slot acquisition.
+export async function main(argv, { remoteExec } = {}) {
   // `run`'s command tail lives after a literal `--` and must never be parsed as this CLI's OWN flags (a
   // `--coverage` meant for the wrapped command would otherwise be read as a flag of THIS script).
   const dashDashIdx = argv.indexOf('--');
@@ -1906,6 +2014,19 @@ async function main(argv) {
     // below). See this file's own header and container-exec.mjs's "test:unit slice" section for why a plain
     // `--container` mount alone is not enough for test:unit (native darwin bindings in vitest's own closure).
     const useNodeModulesVolume = !!flags['container-node-modules'] || process.env.WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES === '1';
+    if (useNodeModulesVolume && !useContainer) {
+      process.stderr.write(`✗ --container-node-modules requires --container (it shadows a mount --container itself creates).\n`);
+      process.exit(1);
+    }
+    const bypass = admissionBypassReason({ env: process.env, poolExists: existsSync(poolRootOf(lockRoot)) });
+    if (!bypass && !useContainer && !process.env[ADMISSION_HELD_ENV]) {
+      const result = await runWithRemoteDecision({
+        argv: argv.slice(dashDashIdx + 1), policy, cwd: repo ?? process.cwd(),
+        env: process.env, remoteExec,
+        timeoutMs: classifyCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
+      });
+      if (result.handled) process.exit(result.exitCode);
+    }
     if (useContainer) {
       // Fail with a clear, actionable message rather than a raw ENOENT/"image not found" surfaced from deep
       // inside execFileSync — a caller that opted into real isolation should get a real reason it isn't
@@ -1926,11 +2047,7 @@ async function main(argv) {
           process.exit(1);
         }
       }
-    } else if (useNodeModulesVolume) {
-      process.stderr.write(`✗ --container-node-modules requires --container (it shadows a mount --container itself creates).\n`);
-      process.exit(1);
     }
-    const bypass = admissionBypassReason({ env: process.env, poolExists: existsSync(poolRootOf(lockRoot)) });
     const runOpts = { lockRoot, cap, owner, policy, lane: lane ?? (/lane-(\d+)/.exec(repo) || [])[1] ?? null, num, repo, ceilingMs, command, cwd: repo, bypass, kind: typeof flags.kind === 'string' ? flags.kind : null, waitMs, waitSource };
     if (useContainer) runOpts.exec = (cmd, o) => execContainerized(cmd, { ...o, nodeModulesVolume: useNodeModulesVolume });
     const { exitCode } = await runUnderAdmission(runOpts);

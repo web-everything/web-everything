@@ -133,6 +133,7 @@ export const REPO_SCAN_TESTS = Object.freeze([
  * @type {Readonly<Record<string, string>>}
  */
 export const DEFERRED_SCAN_TESTS = Object.freeze({
+  'scripts/readiness/__tests__/forge-exec-run.test.mjs': 'false positive: its `function walk(` is inside a string fixture and an in-memory snapshot checker; it enumerates only mkdtemp fixtures, never the live repo (also red on #6017)',
   'scripts/backlog/__tests__/number-at-birth-cli.test.mjs': 'false positive: readdirSync(join(root, ...)) enumerates only the mkdtempSync CLI fixture backlog, never the live repo; this is a hermetic CLI integration test, not a repo rule scanner',
   'scripts/__tests__/stdout-flush.test.mjs': 'its one-home drain-loop guard lives in a test the default vitest config excludes (runs under vitest.integration.config.ts with real child processes), so `vitest run <file>` cannot select it; CI runs it',
   'scripts/__tests__/check-standards.test.mjs': 'asserts over the real tracked tree via check-standards itself; the verify gate already runs `check:standards --local --files=<changed>`',
@@ -154,6 +155,7 @@ export const DEFERRED_SCAN_TESTS = Object.freeze({
   'scripts/operations/__tests__/run.test.mjs':'lists a throwaway run directory, not the repo',
   'scripts/operations/__tests__/review-loop-cli.test.mjs': 'lists a throwaway temp root, not the repo',
   'scripts/__tests__/review-set-label.approval-prevention-filing.test.mjs': 'lists a throwaway temp root, not the repo',
+  'scripts/readiness/__tests__/forge-exec-run.test.mjs': 'false positive: its fake npm walks the mkdtemp work directory it executes in (readdirSync of a throwaway fixture tree), never the live repo; a hermetic runner test, not a repo rule scanner',
 });
 
 /** The marker every manifest test must carry in its own header so a reader of the test sees it is a verify scanner. */
