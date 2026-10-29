@@ -1,12 +1,24 @@
 // @vitest-environment node
 /** Contract tests for the pending remote admission exports; all execution and load IO is injected. */
 import { describe, it, expect, vi } from 'vitest';
-import { spawnSync } from 'node:child_process';
+import { execSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { main, decideRemote, runWithRemoteDecision, adaptLegacyRemoteResult, resolveAdmissionPolicy, DEFAULT_ADMISSION_CEILING_MS, DEFAULT_FAST_RUN_TIMEOUT_MS } from '../heavy-admission.mjs';
+import { main, decideRemote, runWithRemoteDecision, adaptLegacyRemoteResult, resolveAdmissionPolicy, heldSlots, shellQuoteWord, DEFAULT_ADMISSION_CEILING_MS, DEFAULT_FAST_RUN_TIMEOUT_MS } from '../heavy-admission.mjs';
 import { runRemote } from '../remote-exec.mjs';
+import { execContainerized } from '../../lib/container-exec.mjs';
+
+vi.mock('node:child_process', async (importOriginal) => ({
+  ...await importOriginal(), execSync: vi.fn(),
+}));
+vi.mock('../../lib/host-load.mjs', async (importOriginal) => ({
+  ...await importOriginal(), hostLoadAdmission: vi.fn(() => ({ admitted: true })),
+}));
+vi.mock('../../lib/container-exec.mjs', async (importOriginal) => ({
+  ...await importOriginal(), execContainerized: vi.fn(),
+  containerCliAvailable: vi.fn(() => true), containerImageAvailable: vi.fn(() => true),
+}));
 
 const argv = ['npm', 'run', 'test:unit', '--', 'a file.test.mjs', '$(must-stay-literal)'];
 const remoteDefaults = { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3 };
@@ -84,6 +96,54 @@ describe('remote admission policy', () => {
       'remote.loadPerCoreThreshold': 'standard',
     });
     expect(policy.invalid).toEqual([]);
+  });
+
+  it.each([
+    ['WE_HEAVY_ADMISSION=off bypass', { WE_HEAVY_ADMISSION: 'off' }, [], true, false],
+    ['--container', {}, ['--container'], true, true],
+    ['WE_HEAVY_ADMISSION_HELD=1', { WE_HEAVY_ADMISSION_HELD: '1' }, [], true, false],
+    ['WE_HEAVY_ADMISSION_HELD set to another truthy value', { WE_HEAVY_ADMISSION_HELD: 'true' }, [], true, true],
+    ['remote disabled by default', {}, [], false, true],
+    ['remote.* env vars cannot enable remote', {
+      'remote.enabled': 'true', 'remote.mode': 'always',
+      WE_HEAVY_ADMISSION_REMOTE_ENABLED: 'true', WE_HEAVY_ADMISSION_REMOTE_MODE: 'always',
+    }, [], false, true],
+  ])('main run keeps %s local and proceeds with local admission', async (_name, env, flags, enableRemote, acquiresSlot) => {
+    const root = mkdtempSync(join(tmpdir(), 'remote-main-local-'));
+    const pool = join(root, 'pool');
+    const lockRoot = join(pool, '.admission', 'heavy');
+    mkdirSync(pool);
+    const prefs = join(root, 'preferences.json');
+    writeFileSync(prefs, JSON.stringify({ heavyAdmission: {
+      ...(enableRemote ? { remote: { enabled: true, mode: 'always' } } : {}),
+      fastScale: { maxSlots: 1 },
+    } }));
+    const exited = new Error('test exit');
+    const exit = vi.spyOn(process, 'exit').mockImplementation(() => { throw exited; });
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    for (const [key, value] of Object.entries({ LANE_POOL_ROOT: pool, WE_PLATFORM_PREFERENCES: prefs,
+      CI: '', WE_HEAVY_ADMISSION: 'on', WE_HEAVY_ADMISSION_HELD: '', WE_HEAVY_ADMISSION_CONTAINER: '',
+      WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES: '', WE_HEAVY_ADMISSION_RUN_WAIT_MS: '0', ...env })) vi.stubEnv(key, value);
+    const localExec = flags.includes('--container') ? execContainerized : execSync;
+    vi.mocked(localExec).mockImplementation(() => {
+      expect(heldSlots({ lockRoot, cap: 2, fastSlots: 1 })).toHaveLength(acquiresSlot ? 1 : 0);
+      throw Object.assign(new Error('local command exit'), { status: 17 });
+    });
+    try {
+      const remoteExec = vi.fn(async () => ({ mode: 'remote', code: 23 }));
+      await expect(main(['run', `--repo=${root}`, ...flags, '--', ...argv], { remoteExec })).rejects.toBe(exited);
+      expect(remoteExec).not.toHaveBeenCalled();
+      expect(localExec).toHaveBeenCalledTimes(1);
+      expect(localExec).toHaveBeenCalledWith(argv.map(shellQuoteWord).join(' '), expect.objectContaining({
+        cwd: root, env: expect.objectContaining({ WE_HEAVY_ADMISSION_HELD: '1' }),
+      }));
+      expect(exit).toHaveBeenCalledWith(17);
+      expect(heldSlots({ lockRoot, cap: 2, fastSlots: 1 })).toHaveLength(0);
+      if (!enableRemote) expect(stderr).toHaveBeenCalledWith(expect.stringContaining('remote.enabled=false (standard)'));
+    } finally {
+      vi.mocked(execSync).mockReset(); vi.mocked(execContainerized).mockReset();
+      exit.mockRestore(); stderr.mockRestore(); vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('resolves valid platform remote settings and their provenance', () => {

@@ -480,8 +480,7 @@ export async function runWithRemoteDecision({
         }),
       ]);
       if (termination?.mode !== 'cancelled' || termination.terminated !== true) {
-        log('heavy-admission: remote failed (remote-timeout) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying.\n');
-        return { handled: true, exitCode: 124 };
+        return refuseLocal('remote-timeout');
       }
       reason = 'remote-timeout';
     } else {
