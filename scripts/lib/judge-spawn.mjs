@@ -88,6 +88,7 @@ import { markWorkerEnv } from '../operations/session-role.mjs';
 // `GH_TOKEN` riding along until it expires mid-run. A tool-bearing juror (`allowedTools` set) can shell out
 // like any other worker, so it gets the same treatment as every other spawn site.
 import { sanitizeSpawnEnv } from './gh-app-shim.mjs';
+import { quotaHoldRow } from './provider-quota-hold.mjs';
 
 /**
  * Are these two paths the SAME DIRECTORY? By inode + device, never by comparing the strings.
@@ -765,7 +766,10 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
     }
     if (parsed.result) {
       // The CLI's OWN error text, verbatim — never reworded.
-      throw new Error(`judge-spawn: the juror failed: ${parsed.result}`);
+      const error = new Error(`judge-spawn: the juror failed: ${parsed.result}`);
+      const holdRow = quotaHoldRow({ provider: 'claude', error: parsed.result });
+      if (holdRow) Object.assign(error, { quota: true, holdRow });
+      throw error;
     }
     // `result` is empty — the CLI gave no error text at all (reproduced twice in one night, cause
     // unknown, resolved both times by a blind retry). A bare "<no result text>" placeholder left the

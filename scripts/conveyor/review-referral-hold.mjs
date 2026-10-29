@@ -22,6 +22,7 @@ import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { createActionStore } from '../operations/action-store.mjs';
 import { actionResource } from '../operations/action-record.mjs';
+import { isQuotaError } from '../lib/provider-quota-hold.mjs';
 
 export const REFERRAL_HOLD_MARKER = 'review paused:';
 export const GH_LIST_COMMENT_CAP = 100;
@@ -43,6 +44,9 @@ export function reviewRunEvidence(run) {
   const ownReferral = resuming && run.findings?.referralVerdict
     ? run.stepTimings?.find(t => t.step === 'referralVerdict')?.finishedAt : undefined;
   const savedReferral = resuming && !ownReferral;
+  const state = (savedReferral ? run.resumeOf.mandatoryReferrals : run.findings?.mandatoryReferrals)?.effects?.find(e => e.type === 'review.mandatory-referrals')?.result;
+  const failures = (state?.records ?? []).filter(r => r.failure != null).map(r => r.failure);
+  const quotaOnly = failures.length > 0 && failures.every(isQuotaError);
   const verdict = savedReferral ? run.resumeOf.verdict : run.findings?.referralVerdict ?? run.verdict;
   const finish = ownAdvise ?? ownReferral ?? run.resumeOf?.adviseFinishedAt;
   // A resumed run starts again at the resume: the rulings that woke it are answered. Only once the pass is finished,
@@ -58,10 +62,9 @@ export function reviewRunEvidence(run) {
     // Crashes before/during advise still consumed a retry. Keep them in the cached projection, without
     // inventing a completed panel or clean referral evidence for acceptance/carry readers.
     return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt: null,
-      incomplete: true, parked: false, attempted: false, persistenceFailed: false, count: 0,
+      incomplete: true, quotaOnly, parked: false, attempted: false, persistenceFailed: false, count: 0,
       pending: ['review-incomplete'], rulings: [] };
   }
-  const state = (savedReferral ? run.resumeOf.mandatoryReferrals : run.findings?.mandatoryReferrals)?.effects?.find(e => e.type === 'review.mandatory-referrals')?.result;
   const pending = verdict?.pendingReferrals ?? [];
   const resumeAdvise = Boolean(resuming && ownReferral && !pending.includes('referral-persistence-failed'));
   const findingKeys = pending.filter(key => !PENDING_REASON_TOKENS.has(key));
@@ -69,6 +72,7 @@ export function reviewRunEvidence(run) {
     .filter(r => r.repo === read.repo && r.pr === Number(read.pr) && r.head === head && r.attempted)
     .flatMap(r => r.referrals.map(f => f.key)));
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
+    quotaOnly,
     ...(resumeAdvise ? { resumeAdvise: true } : {}),
     parked: verdict?.verdict === 'needs-human' && pending.length > 0,
     // A list of only reason tokens names no referral, so it was never "attempted" (not vacuously true).
@@ -91,7 +95,7 @@ const evidenceCache = new Map();
 export const REVIEW_EVIDENCE_CACHE_FILE = '.review-run-evidence.cache';
 /** A warm process with at most this many changed records parses them directly instead of the whole on-disk file. */
 export const EVIDENCE_DISK_MIN_MISSES = 32;
-const EVIDENCE_CODE = createHash('sha256').update(String(reviewRunEvidence)).digest('hex').slice(0, 16);
+const EVIDENCE_CODE = createHash('sha256').update(String(reviewRunEvidence)).update(String(isQuotaError)).digest('hex').slice(0, 16);
 function readEvidenceDiskCache(file) {
   try {
     const c = JSON.parse(readFileSync(file, 'utf8'));
@@ -352,7 +356,7 @@ export function verdictNeverLanded(pr, last, now = Date.now()) {
 export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Date.now(), retry = resolveNoVerdictRetry(env) } = {}) {
   const max = resolveSameHeadMaxReviews(env);
   if (max === 0) return null;
-  const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid);
+  const history = runs.filter(r => !r.quotaOnly && r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid);
   // Newer incomplete attempts own retry accounting, including after an older parked review was released.
   // A fresh head can also crash on EVERY attempt and must still reach the exhausted needs-you hold.
   const last = latestReviewAttempt(history);
