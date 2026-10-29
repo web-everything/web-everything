@@ -123,7 +123,7 @@ export function logQueueNumbering(setting = resolveQueueNumbering(), log = proce
 }
 
 export function reservationPlan(mainFiles, reservations, isOpen) {
-  const mainIds = new Set(lines(mainFiles).map(cardId).filter(isNum).map(Number));
+  const mainIds = new Set(lines(mainFiles).filter((p) => /^backlog\/[^/]+\.md$/.test(p)).map(cardId).filter(isNum).map(Number));
   const kept = reservations.filter((r) => !r.nnns.every((n) => mainIds.has(Number(n))) && isOpen(r.repo, r.num) !== false);
   const max = [...mainIds, ...kept.flatMap((r) => r.nnns.map(Number))].reduce((m, n) => Math.max(m, n), 0);
   return { reservations: kept, minNext: max + 1 };
@@ -178,7 +178,8 @@ export function fallbackMinNext({ cwd = process.cwd(), exec = execFileSync, fs =
 
 /** Reject both a symlinked card and a symlinked parent before any PR-content IO. */
 export function assertWorktreeCard(worktree, path, fs = nodeFs) {
-  if (!/^backlog\/[^/]+\.md$/.test(path) || path.includes('\0')) throw new Error('unsafe backlog card path');
+  const allowed = /^backlog\/[^/]+\.md$/.test(path) || /^backlog\/raised-by\/\d+\/[A-Za-z0-9._-]+\.md$/.test(path);
+  if (!allowed || path.includes('..') || path.includes('\0')) throw new Error('unsafe backlog card path');
   if (fs.lstatSync(join(worktree, 'backlog')).isSymbolicLink() || fs.lstatSync(join(worktree, path)).isSymbolicLink()) throw new Error(`symlinked backlog card refused: ${path}`);
   assertWorktreeFile(worktree, path, fs);
 }
@@ -307,7 +308,7 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
 }
 
 /** Keep the cascade hook small; never enqueue after a write or refusal. */
-export function finishBranchPreparation(out, { c, revalidationAborted, needsAcceptanceRestamp, restampAcceptance, log = process.stderr }) {
+export function finishBranchPreparation(out, { c, revalidationAborted, needsAcceptanceRestamp, restampAcceptance, log = process.stderr, emit = appendDaemonEvent }) {
   if (out.action === 'final') return true;
   let reason = out.reason;
   if (out.action === 'numbered') {
@@ -316,6 +317,11 @@ export function finishBranchPreparation(out, { c, revalidationAborted, needsAcce
       const rs = restampAcceptance({ pr: c.num, repo: c.repo, newHead: out.newHead });
       if (!rs.ok) reason += `; acceptance re-stamp failed: ${String(rs.reason).slice(0, 200)}`;
     }
+  } else if (out.action === 'skip') {
+    try {
+      void Promise.resolve(emit({ kind: 'needs-you', pr: c.num, daemon: 'drain',
+        detail: `PR #${c.num}: branch numbering refused (${reason}) - the PR was not enqueued; fix the cause or number it by hand` })).catch(() => {});
+    } catch { /* Coordination events must never interrupt branch preparation. */ }
   }
   revalidationAborted.push({ num: c.num, repo: c.repo, reason });
   log.write(`  ↻ PR ${c.num} ${reason} — not enqueued this pass\n`);

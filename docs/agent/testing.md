@@ -770,6 +770,15 @@ and run real branch numbering with workflow edits while unqueued. Queued human-o
 human-enqueued hash cards retain their skip event and emit `needs-you` with the files and
 dequeue/re-queue instructions; hash-free branches emit no alert.
 
+Branch preparation accepts flat backlog cards and `backlog/raised-by/<digits>/<basename>.md`
+ledger files; ledger basenames allow ASCII letters, digits, dots, underscores and hyphens.
+Reject `..`, NUL and symlinks at every parent or file before numbering. Keep nested ledgers
+outside card discovery, renaming, number floors and reservation pruning.
+`queue-branch-numbering.test.mjs` exercises real Git
+numbering beside unchanged ledgers, including a hash-like ledger basename. Preparation skips
+emit a best-effort `needs-you` event with the refusal and manual-numbering fallback; numbered
+and final outcomes emit none. Regress both synchronous and asynchronous emitter failures.
+
 A `clear-human` record already counts as acceptance; a numbering carry must also run before
 workflow and anti-test-gaming holds can re-park it. Use the existing human carry writer with a
 fresh head, complete comment thread and formal reviews before posting. Its numbering tier uses
