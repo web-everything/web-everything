@@ -228,30 +228,30 @@ describe('the skip decision covers everything the shared candidate smoke exercis
     expect(smokeSurfaceEntries({ WE_SMOKE_DAEMON_ENTRIES: 'x/extra-daemon.mjs' })).toContain('x/extra-daemon.mjs');
   });
 
-  it.each([
+  const smokeMoves = [
     ['a sibling daemon entry', 'skills-src/conveyor/review-daemon.mjs'],
     ['lane-pool.mjs (lane-pool-list / lane-acquire-release)', 'scripts/lane-pool.mjs'],
     ['reconcile-pass.mjs (reconcile-dry-run)', 'scripts/conveyor/reconcile-pass.mjs'],
     ['a dispatch module (dispatch-dry-run)', 'scripts/operations/review-dispatch.mjs'],
-  ])('a move that changes only %s smokes, whether the file exists before the move or is added by it', async (_label, file) => {
-    for (const existsBefore of [true, false]) {
-      const f = makeFixture();
-      advanceMain(f.originDir, (dir) => {
-        writeFile(dir, entry, "import './lib/a.mjs';\n");
-        writeFile(dir, 'scripts/lib/a.mjs', 'export const a = 1;\n');
-        writeFile(dir, 'package.json', '{}\n');
-        if (existsBefore) writeFile(dir, file, 'export const v = 1;\n');
-      });
-      const baseline = await rebuildClone({ root: f.cloneDir, env: f.env, runSmoke: passSmoke(), prState: async () => null, lockOpts: LOCK_OPTS });
-      expect(baseline.adopted).toBe(true);
-      advanceMain(f.originDir, (dir) => writeFile(dir, file, 'export const v = 2;\n'));
-      const runSmoke = passSmoke();
-      const r = await rebuildClone({
-        root: f.cloneDir, env: { ...f.env, WE_DAEMON_REBUILD_SKIP_UNRELATED: '1' }, entries: [entry], runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
-      });
-      expect(runSmoke).toHaveBeenCalledTimes(1);
-      expect(r.reason).not.toBe('skipped-unrelated');
-    }
+  ].flatMap(([label, file]) => [true, false].map(existsBefore => ({ label, file, existsBefore })));
+  // Each real-git scenario gets its own test deadline and afterEach cleanup.
+  it.each(smokeMoves)('a move that changes only $label smokes (exists before move: $existsBefore)', async ({ file, existsBefore }) => {
+    const f = makeFixture();
+    advanceMain(f.originDir, (dir) => {
+      writeFile(dir, entry, "import './lib/a.mjs';\n");
+      writeFile(dir, 'scripts/lib/a.mjs', 'export const a = 1;\n');
+      writeFile(dir, 'package.json', '{}\n');
+      if (existsBefore) writeFile(dir, file, 'export const v = 1;\n');
+    });
+    const baseline = await rebuildClone({ root: f.cloneDir, env: f.env, runSmoke: passSmoke(), prState: async () => null, lockOpts: LOCK_OPTS });
+    expect(baseline.adopted).toBe(true);
+    advanceMain(f.originDir, (dir) => writeFile(dir, file, 'export const v = 2;\n'));
+    const runSmoke = passSmoke();
+    const r = await rebuildClone({
+      root: f.cloneDir, env: { ...f.env, WE_DAEMON_REBUILD_SKIP_UNRELATED: '1' }, entries: [entry], runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+    });
+    expect(runSmoke).toHaveBeenCalledTimes(1);
+    expect(r.reason).not.toBe('skipped-unrelated');
   });
 
   it('the same sibling-only change is still unrelated to a docs-only neighbour: docs still skip', async () => {
