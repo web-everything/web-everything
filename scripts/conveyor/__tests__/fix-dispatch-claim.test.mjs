@@ -1032,6 +1032,86 @@ describe('idle-claim auto-release (R201)', () => {
     expect(events[0].detail.idleSince).toBe(iso(next));
   });
 
+  it.each([
+    ['empty listing', []],
+    ['no matching name', [{ name: 'fix-5997', state: 'idle' }]],
+    ['hung idle session', [{ name: 'fix-5996', state: 'idle', hung: true }]],
+    ['self-reported done session', [{ name: 'fix-5996', state: 'idle', selfReportedDone: true }]],
+    ['auth-expired session', [{ name: 'fix-5996', state: 'idle', authExpired: true }]],
+    ['historical terminal session', [{ name: 'fix-5996', state: 'done', startedAt: T0 - 1 }]],
+  ])('a sweep with %s breaks the idle window without extending the lease', (_name, rows) => {
+    acquire();
+    const key = { repo: 'we', pr: 5996, lockRoot: claimRoot };
+    const events = [];
+    sweep(T0, { events });
+    sweep(T0 + 10 * 60_000, { events });
+    const before = readFixDispatchClaim(key);
+    const skipped = sweep(T0 + 20 * 60_000, { events, extra: { listAgentsAll: () => rows } });
+    const after = readFixDispatchClaim(key);
+    const resumedAt = T0 + IDLE_MS;
+    const resumed = sweep(resumedAt, { events });
+    expect(resumed.released ?? []).toHaveLength(0);
+    expect(resumed.refreshed).toHaveLength(1);
+    expect(readFixDispatchClaim(key).meta.idleHead)
+      .toEqual({ sha: 'sha1', since: iso(resumedAt), lastSeen: iso(resumedAt) });
+    expect(skipped.released ?? []).toHaveLength(0);
+    expect(skipped.refreshed).toHaveLength(0);
+    const { idleHead, ...meta } = before.meta;
+    expect(idleHead).toEqual({ sha: 'sha1', since: iso(T0), lastSeen: iso(T0 + 10 * 60_000) });
+    expect(after).toEqual({ ...before, meta });
+    expect(events).toHaveLength(0);
+    expect(sweepThrough(resumedAt, resumedAt + IDLE_MS, { events }).released).toHaveLength(1);
+    expect(events).toHaveLength(1);
+    expect(events[0].detail.idleSince).toBe(iso(resumedAt));
+  });
+
+  it.each([
+    ['refresh ceiling', 'fix', { claimedAt: iso(T0 - MAX_FIX_DISPATCH_CLAIM_REFRESH_MS) }],
+    ['unresolved session name', 'fixing', { who: null }],
+  ])('a claim skipped at the %s clears its idle clock without renewing its lease', (_name, kind, overrides) => {
+    const key = { repo: 'we', pr: 5996, kind, lockRoot: claimRoot };
+    expect(acquireFixDispatchClaim({ ...key, owner: 'A', nowMs: T0, nowIso: iso(T0) }).ok).toBe(true);
+    const current = readFixDispatchClaim(key);
+    expect(heartbeat(claimRoot, fixDispatchResource(key), current.owner, current.heartbeatAt, current.pid,
+      { ...current.meta, ...overrides, idleHead: { sha: 'sha1', since: iso(T0), lastSeen: iso(T0) } })).toBe(true);
+    const before = readFixDispatchClaim(key);
+    const prHeadFor = vi.fn(() => 'sha1');
+    const result = sweep(T0 + 20 * 60_000, { extra: { prHeadFor } });
+    const { idleHead, ...meta } = before.meta;
+    expect(idleHead).toBeDefined();
+    expect(readFixDispatchClaim(key)).toEqual({ ...before, meta });
+    expect(result.refreshed).toHaveLength(0);
+    expect(result.released ?? []).toHaveLength(0);
+    expect(prHeadFor).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['owner', { owner: 'B' }],
+    ['dispatch', { claimedAt: iso(T0 + 20 * 60_000) }],
+    ['runner', { runnerPid: 12345 }],
+  ])('clearing a skipped observation leaves a changed %s untouched', (_name, change) => {
+    acquire();
+    sweep(T0);
+    sweep(T0 + 10 * 60_000);
+    const key = { repo: 'we', pr: 5996, lockRoot: claimRoot };
+    let replacement;
+    const result = sweep(T0 + 20 * 60_000, { extra: {
+      listAgentsAll: () => [{ name: 'fix-5996', state: 'idle' }],
+      hungInfoFor: () => {
+        const current = readFixDispatchClaim(key);
+        const { owner = current.owner, ...metaChange } = change;
+        expect(heartbeat(claimRoot, fixDispatchResource(key), owner, current.heartbeatAt, current.pid,
+          { ...current.meta, ...metaChange })).toBe(true);
+        replacement = readFixDispatchClaim(key);
+        return { hung: true };
+      },
+    } });
+    expect(result.refreshed).toHaveLength(0);
+    expect(result.released ?? []).toHaveLength(0);
+    expect(replacement).toBeDefined();
+    expect(readFixDispatchClaim(key)).toEqual(replacement);
+  });
+
   it('updates lastSeen on every idle observation and accepts gaps of exactly the 20-minute limit', () => {
     acquire();
     const first = T0 + 60_000;

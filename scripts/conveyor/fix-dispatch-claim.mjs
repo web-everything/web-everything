@@ -189,6 +189,17 @@ function readUnchangedClaim(lockRoot, resource, expected) {
     && current.meta?.runnerPid === expected.meta?.runnerPid ? current : null;
 }
 
+// A skipped observation breaks the idle window without renewing the lease. The store's rewrite accepts
+// an explicit timestamp: retain the freshly read heartbeat rather than recording this sweep's time.
+function clearClaimIdleHead(lockRoot, resource, expected) {
+  if (!Object.hasOwn(expected.meta ?? {}, 'idleHead')) return;
+  const current = readUnchangedClaim(lockRoot, resource, expected);
+  if (!current || !Object.hasOwn(current.meta ?? {}, 'idleHead')) return;
+  const meta = { ...current.meta };
+  delete meta.idleHead;
+  heartbeat(lockRoot, resource, current.owner, current.heartbeatAt, current.pid ?? null, meta);
+}
+
 /**
  * Stamp the borrowed runner's pid onto the claim it was launched under, so the cap and the claim sweep can tell a live
  * borrowed fix from a dead one. Owner-checked (never rewrites a claim someone else now holds). Best effort.
@@ -316,7 +327,8 @@ export const MAX_IDLE_CLAIM_OBSERVATION_GAP_MS = 20 * 60_000;
  * metadata. An unchanged head for the configured window releases the owner-checked claim and records an
  * event. Head movement or an observation gap beyond 20 minutes restarts the clock; this bound covers the
  * observed 7–14 minute live sweep cadence while excluding longer downtime or sleep gaps.
- * Working rows and unreadable heads clear it, so recovery starts a full new window. Legacy clocks without
+ * Any sweep without an idle observation clears it without extending the lease on skipped claims, so recovery
+ * starts a full new window. Legacy clocks without
  * `lastSeen` also restart. Runner-pid and awaiting-verify claims are exempt from idle release.
  * @param {{lockRoot?:string, listAgentsAll?:Function, hungInfoFor?:Function, hungThresholdMs?:number,
  *   awaitingVerifyFor?:Function|null, idleRelease?:object, prHeadFor?:Function, recordEvent?:Function,
@@ -348,16 +360,22 @@ export function refreshLiveFixDispatchClaims({
   const awaiting = [];
   for (const entry of claims) {
     const { repo, pr, kind, headSha = null, claimedAt = null } = entry.meta;
+    const resource = fixDispatchResource({ repo, pr, kind });
     const claimedMs = Date.parse(claimedAt ?? '');
-    if (Number.isFinite(claimedMs) && nowMs - claimedMs > MAX_FIX_DISPATCH_CLAIM_REFRESH_MS) continue;
+    if (Number.isFinite(claimedMs) && nowMs - claimedMs > MAX_FIX_DISPATCH_CLAIM_REFRESH_MS) {
+      clearClaimIdleHead(lockRoot, resource, entry);
+      continue;
+    }
     // fix-procedure (`kind:'fixing'`, `we:scripts/conveyor/fix-procedure.mjs`): the holder's session name is
     // `meta.who`, not a minted slug — minting one would THROW on the unknown kind and crash this whole sweep.
     // A claim whose name cannot be resolved is skipped (left to its own TTL), never thrown over.
     let name = null;
     if (kind === 'fixing') name = entry.meta.who ? String(entry.meta.who) : null;
     else { try { name = fixDispatchSessionName({ repo, pr, kind }); } catch { name = null; } }
-    if (!name) continue;
-    const resource = fixDispatchResource({ repo, pr, kind });
+    if (!name) {
+      clearClaimIdleHead(lockRoot, resource, entry);
+      continue;
+    }
     // A BORROWED (non-Claude) fix, or (117 S3b) a Claude fix / ci-heal run through the detached worker wrapper, has no
     // `claude agents` row: its liveness is its runner pid. Dead -> release now, with a reason; alive -> heartbeat.
     // (No pid stamped yet -> falls through to the plain TTL like any new claim.)
@@ -409,6 +427,7 @@ export function refreshLiveFixDispatchClaims({
           if (result.released) released.push({ repo, pr, kind, owner: entry.owner });
         }
       }
+      clearClaimIdleHead(lockRoot, resource, entry);
       continue;
     }
     // A stale working row may point at a dead process, but reusable names alone cannot associate it with
@@ -428,6 +447,7 @@ export function refreshLiveFixDispatchClaims({
           if (result.released) released.push({ repo, pr, kind, owner: entry.owner,
             reason: `session-identity-dead (${identities[0].reason})` });
         }
+        clearClaimIdleHead(lockRoot, resource, entry);
         continue;
       }
     }
