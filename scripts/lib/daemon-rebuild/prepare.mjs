@@ -118,7 +118,7 @@ export async function prepareRebuild({
       // last verified head and let this tick rebuild + smoke it off-lock like any other candidate.
       const atUnverifiedTarget = headNow === ip.target && ip.target !== ip.prevHead && ip.verified !== true;
       if (atUnverifiedTarget) {
-        if (ip.quick) alert('quick-soak-unavailable', { sha: ip.target, lastGood: ip.prevHead, reason: 'adoption-interrupted' });
+        if (ip.quick) alert('quick-soak-unavailable', { sha: ip.target, lastGood: ip.prevHead, cause: 'adoption-interrupted' });
         const rolled = rollbackUnverified({ git, prevHead: ip.prevHead });
         if (!rolled) {
           if (ip.quick) {
