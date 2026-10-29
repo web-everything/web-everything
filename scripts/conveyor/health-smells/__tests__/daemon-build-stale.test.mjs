@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import * as detector from '../daemon-build-stale.mjs';
 import daemonBuildStale, { createStateLister, decide, evaluate } from '../daemon-build-stale.mjs';
 import { validateSmellShape } from '../../health-smells-shape.mjs';
 
@@ -61,6 +64,45 @@ function expectUnreadable(result) {
 }
 
 describe('daemon-build-stale', () => {
+  it('invokes bounded first-parent git history for adopted SHA through origin/main', () => {
+    expect(detector.createGitHistoryReader).toBeTypeOf('function');
+    const exec = vi.fn(() => `${MAIN_SHA}\t123\tMerge pull request #42 from x/y\twith tab\n`);
+    const readHistory = detector.createGitHistoryReader({ exec, repoRoot: 'fixture-repo' });
+    expect(readHistory(MAIN_SHA)).toEqual([
+      { sha: MAIN_SHA, ctMs: 123_000, subject: 'Merge pull request #42 from x/y\twith tab' },
+    ]);
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec).toHaveBeenCalledWith('git', [
+      '-C', 'fixture-repo', 'log', '--first-parent', '--format=%H%x09%ct%x09%s', `${MAIN_SHA}..origin/main`,
+    ], { encoding: 'utf8', timeout: 10_000, maxBuffer: 4 * 1024 * 1024 });
+  });
+
+  it.each(['', 'NaN', 'Infinity', 'bad'])('rejects unreadable git timestamps: %j', (ct) => {
+    expect(detector.createGitHistoryReader).toBeTypeOf('function');
+    const readHistory = detector.createGitHistoryReader({ exec: () => `${MAIN_SHA}\t${ct}\tsubject\n` });
+    expect(() => readHistory(MAIN_SHA)).toThrow(/timestamp/i);
+  });
+
+  it('reads real first-parent history and rejects an unknown SHA without Git writes', () => {
+    expect(detector.createGitHistoryReader).toBeTypeOf('function');
+    // Use the existing checkout read-only: sandbox repairs forbid even temporary .git writes.
+    const repoRoot = fileURLToPath(new URL('../../../../', import.meta.url));
+    const git = (args) => execFileSync('git', ['-C', repoRoot, ...args], {
+      encoding: 'utf8', timeout: 10_000, maxBuffer: 4 * 1024 * 1024,
+      env: { ...process.env, GIT_NO_LAZY_FETCH: '1', GIT_OPTIONAL_LOCKS: '0' },
+    }).trim();
+    const adopted = git(['rev-parse', 'origin/main~3']);
+    const readHistory = detector.createGitHistoryReader({ repoRoot });
+    const records = readHistory(adopted);
+    expect(records.map(({ sha }) => sha)).toEqual(git(['rev-list', '--first-parent', `${adopted}..origin/main`]).split('\n'));
+    expect(records).toHaveLength(3);
+    for (const record of records) {
+      expect(record.ctMs).toBe(Number(git(['show', '-s', '--format=%ct', record.sha])) * 1000);
+      expect(record.subject).toBe(git(['show', '-s', '--format=%s', record.sha]));
+    }
+    expect(() => readHistory('0'.repeat(40))).toThrow();
+  });
+
   it('breaches at five hours and names the clone, merge count, oldest age and the merged PRs', async () => {
     const { results: [result], io } = await run();
     expect(io.mergesSince).toHaveBeenCalledTimes(1);
@@ -84,6 +126,79 @@ describe('daemon-build-stale', () => {
     expect(result.summary).toContain('#6014');
     expect(result.summary).not.toContain('#2748');
     expect(result.measure.prs).not.toContain(2748);
+    expect(result.measure.behind).toBe(2);
+    expect(result.measure.oldestAgeMin).toBe(300);
+  });
+
+  it('does not breach for an old drain-only history', async () => {
+    const { results: [result] } = await run({ commits: [
+      { sha: 'e'.repeat(40), ctMs: NOW - 6 * HOUR, subject: 'drain: mark card resolved (#2748)' },
+    ] });
+    expect(result.breach).toBe(false);
+    expect(result.measure).toMatchObject({ behind: 0, oldestAgeMin: 0, prs: [] });
+  });
+
+  it('uses only recent PR merges when an older drain commit is present', async () => {
+    const { results: [result] } = await run({ commits: [
+      ...merges(30 * MINUTE),
+      { sha: 'e'.repeat(40), ctMs: NOW - 6 * HOUR, subject: 'drain: mark card resolved (#2748)' },
+    ] });
+    expect(result.breach).toBe(false);
+    expect(result.measure).toMatchObject({ behind: 2, oldestAgeMin: 30, prs: [6014, 6026] });
+  });
+
+  it.each([{ names: [] }, { names: ['unrelated.json'] }])('fails closed when the directory has no rebuild state files: $names', async ({ names }) => {
+    const io = {
+      listStates: createStateLister({ readdir: () => names, directory: 'state' }),
+      mergesSince: vi.fn(),
+    };
+    const results = await evaluate({}, { now: NOW, io });
+    expect(results).toHaveLength(1);
+    expect(results[0].breach).toBe(true);
+    expect(results[0].summary).toMatch(/state unreadable/i);
+    expect(io.mergesSince).not.toHaveBeenCalled();
+  });
+
+  it.each(['2h', '7200000', NaN, Infinity, -Infinity, 0, -1, false, {}, []].map(value => ({ value })))(
+    'falls back to two hours for an invalid threshold: $value', async ({ value }) => {
+      const { results: [result] } = await run({ config: { daemonBuildStaleMaxMs: value } });
+      const { results: [recent] } = await run({
+        commits: merges(30 * MINUTE), config: { daemonBuildStaleMaxMs: value },
+      });
+      expect(result.breach).toBe(true);
+      expect(recent.breach).toBe(false);
+      expect(decide({ states: [{ ...state(), merges: merges(5 * HOUR) }], now: NOW, maxMs: value })[0].breach).toBe(true);
+    },
+  );
+
+  it('breaches when an individual rebuild state file cannot be read', async () => {
+    const io = {
+      listStates: createStateLister({
+        readdir: () => [`${CLONE}.rebuild.json`], directory: 'state',
+        read: () => { throw new Error('file unreadable'); },
+      }),
+      mergesSince: vi.fn(),
+    };
+    const results = await evaluate({}, { now: NOW, io });
+    expect(results).toHaveLength(1);
+    expectUnreadable(results[0]);
+    expect(io.mergesSince).not.toHaveBeenCalled();
+  });
+
+  it.each(['short', 'g'.repeat(40), `${MAIN_SHA}\n`, `--${MAIN_SHA}`, `${MAIN_SHA}..origin/main`])(
+    'rejects malformed adopted.mainSha without invoking git: %j', async (mainSha) => {
+      const { results: [result], io } = await run({ states: [state({ mainSha })] });
+      expectUnreadable(result);
+      expect(io.mergesSince).not.toHaveBeenCalled();
+    },
+  );
+
+  it('fails closed for an empty injected state listing', async () => {
+    const io = { listStates: () => [], mergesSince: vi.fn() };
+    const results = await evaluate({}, { now: NOW, io });
+    expect(results).toHaveLength(1);
+    expect(results[0].breach).toBe(true);
+    expect(results[0].summary).toMatch(/state unreadable/i);
   });
 
   it('fails closed when the state directory itself cannot be read', async () => {

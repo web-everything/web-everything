@@ -25,11 +25,9 @@ export function createStateLister({ readdir = readdirSync, read = readFileSync, 
   };
 }
 
-const io = {
-  listStates: createStateLister(),
-  mergesSince(sha) {
-    const repoRoot = fileURLToPath(new URL('../../../', import.meta.url));
-    const output = execFileSync('git', [
+export function createGitHistoryReader({ exec = execFileSync, repoRoot = fileURLToPath(new URL('../../../', import.meta.url)) } = {}) {
+  return (sha) => {
+    const output = exec('git', [
       '-C', repoRoot, 'log', '--first-parent', '--format=%H%x09%ct%x09%s', `${sha}..origin/main`,
     ], { encoding: 'utf8', timeout: 10_000, maxBuffer: 4 * 1024 * 1024 });
     return output.split('\n').filter(Boolean).map((line) => {
@@ -38,7 +36,12 @@ const io = {
       if (!ct || !Number.isFinite(ctMs)) throw new Error('Unreadable merge timestamp');
       return { sha: commitSha, ctMs, subject: subject.join('\t') };
     });
-  },
+  };
+}
+
+const io = {
+  listStates: createStateLister(),
+  mergesSince: createGitHistoryReader(),
 };
 
 function adoptedMainSha(raw) {
@@ -52,7 +55,10 @@ function adoptedMainSha(raw) {
 
 /** Pure decision over state records enriched with `merges` (or `mergeReadFailed`). */
 export function decide({ states, now, maxMs = DEFAULT_MAX_MS }) {
-  return states.map(({ cloneKey, raw, merges, mergeReadFailed }) => {
+  const limitMs = Number.isFinite(maxMs) && maxMs > 0 ? maxMs : DEFAULT_MAX_MS;
+  // No rebuild evidence is unknown, even when directory enumeration succeeded.
+  const records = states.length ? states : [{ cloneKey: 'state-directory', raw: null }];
+  return records.map(({ cloneKey, raw, merges, mergeReadFailed }) => {
     const adoptedSha = adoptedMainSha(raw);
     const unreadable = !adoptedSha || mergeReadFailed || !Array.isArray(merges)
       || merges.some((merge) => !merge || !Number.isFinite(merge.ctMs) || typeof merge.subject !== 'string');
@@ -68,21 +74,22 @@ export function decide({ states, now, maxMs = DEFAULT_MAX_MS }) {
         summary: `daemon clone ${cloneKey}: state unreadable.`,
       };
     }
-    const behind = merges.length;
-    const oldestMs = merges.reduce((oldest, merge) => Math.min(oldest, merge.ctMs), Infinity);
+    const prMerges = merges.flatMap((merge) => {
+      const match = /^Merge pull request #(\d+) from /.exec(merge.subject);
+      return match ? [{ ...merge, pr: Number(match[1]) }] : [];
+    });
+    const behind = prMerges.length;
+    const oldestMs = prMerges.reduce((oldest, merge) => Math.min(oldest, merge.ctMs), Infinity);
     const age = behind ? Math.max(0, now - oldestMs) : 0;
     const ageLabel = age >= HOUR
       ? `${Math.floor(age / HOUR)} hours ${Math.floor((age % HOUR) / MINUTE)} minutes`
       : `${Math.floor(age / MINUTE)} minutes`;
-    const prs = [...new Set(merges.flatMap(({ subject }) => {
-      const match = /^Merge pull request #(\d+) from /.exec(subject);
-      return match ? [Number(match[1])] : [];
-    }))].sort((a, b) => a - b);
+    const prs = [...new Set(prMerges.map(({ pr }) => pr))].sort((a, b) => a - b);
     const displayedPrs = prs.slice(0, 15).map((pr) => `#${pr}`).join(', ');
     const prSummary = `${displayedPrs || 'none'}${prs.length > 15 ? ` +${prs.length - 15} more` : ''}`;
     return {
       ...base,
-      breach: behind > 0 && age > maxMs,
+      breach: behind > 0 && age > limitMs,
       measure: { behind, oldestAgeMin: Math.round(age / MINUTE), prs, adoptedMainSha: adoptedSha, at: now },
       summary: `daemon clone ${cloneKey} is ${behind} merge(s) behind origin/main; oldest missing merge ${ageLabel} old; PRs: ${prSummary}.`,
     };

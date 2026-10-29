@@ -90,7 +90,10 @@ describe('replay — 2026-09-27 ~04:04-04:33Z drain gh-error window, through the
   it('opens exactly one episode and plans exactly one un-suppressed notify, in shadow mode, via the real notify-list', () => {
     // Keep the real detector, with a healthy host fixture independent of local daemon state.
     const smells = SMELLS.map((s) => s.id === 'daemon-build-stale'
-      ? { ...s, evaluate: (probes, ctx) => s.evaluate(probes, { ...ctx, io: { listStates: () => [] } }) }
+      ? { ...s, evaluate: (probes, ctx) => s.evaluate(probes, { ...ctx, io: {
+        listStates: () => [{ cloneKey: 'fixture-daemon', raw: JSON.stringify({ adopted: { mainSha: 'a'.repeat(40) } }) }],
+        mergesSince: () => [],
+      } }) }
       : s);
     const tick1 = runHealthTick(emptyHealthState(), { ghCalls: incident() }, smells, NOW, { config: { mode: 'shadow' } });
     const notifies = tick1.plan.filter((p) => p.kind === 'notify');

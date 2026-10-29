@@ -35,7 +35,10 @@ vi.mock('../health-watch-core.mjs', async (original) => {
   return { ...real, runHealthTick: (state, probes, smells, ...args) =>
     real.runHealthTick(state, episodeReplay.probes ?? probes, smells.map((s) => s.id === 'daemon-build-stale'
       // Keep the real detector, with a healthy host fixture independent of local daemon state.
-      ? { ...s, evaluate: (probes, ctx) => s.evaluate(probes, { ...ctx, io: { listStates: () => [] } }) }
+      ? { ...s, evaluate: (probes, ctx) => s.evaluate(probes, { ...ctx, io: {
+        listStates: () => [{ cloneKey: 'fixture-daemon', raw: JSON.stringify({ adopted: { mainSha: 'a'.repeat(40) } }) }],
+        mergesSince: () => [],
+      } }) }
       : s), ...args) };
 });
 vi.mock('../branch-sync.mjs', async (original) => ({
