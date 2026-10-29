@@ -5,6 +5,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { proveHumanOnlyLicense, resolveApprovalLicensesEnqueue } from '../human-only-enqueue-license.mjs';
+import { scoreEscalation } from '../review-escalation.mjs';
 
 const roots = [];
 const rawChange = path => `:100644 100644 ${'a'.repeat(40)} ${'b'.repeat(40)} M\0${path}\0`;
@@ -141,6 +142,46 @@ describe('human-only enqueue license', () => {
     r.git(['checkout', '-qb', 'pr', r.approved]); r.write('scripts/lib/required-status-checks.mjs', 'author policy'); r.commit('author policy');
     r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
     expect(r.prove()).toMatchObject({ licensed: false });
+  });
+  it.each(['scripts/ordinary.mjs', 'scripts/ordinary[1].mjs'])('refuses a content-sensitive sandbox change differing from main at %s', path => {
+    const r = fixture();
+    r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
+    const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+    r.git(['checkout', '-qb', 'pr', r.approved]);
+    r.write(path, 'export const writableRoots = [".", "../shared"];\n'); r.commit('author sandbox grant');
+    r.git(['merge', '--no-ff', '-m', 'merge main', main]);
+    const head = r.git(['rev-parse', 'HEAD']); r.setHead(head);
+    const diffHunks = r.git(['--literal-pathspecs', '-c', 'diff.ignoreSubmodules=none', 'diff',
+      '--no-ext-diff', '--no-textconv', '--no-renames', r.approved, head, '--', path]);
+    expect(scoreEscalation({ changedFiles: [path] }).humanRequired).toBe(false);
+    expect(scoreEscalation({ changedFiles: [path], diffHunks })).toMatchObject({
+      humanRequired: true, signals: { permissionChange: [path] },
+    });
+    expect(r.git(['ls-tree', head, '--', path])).not.toBe(r.git(['ls-tree', main, '--', path]));
+    const reads = [];
+    expect(r.prove({ exec: (cmd, args, opts) => {
+      if (cmd === 'git' && args.includes('diff') && args.at(-1) === path) reads.push({ args, opts });
+      return r.exec(cmd, args, opts);
+    } })).toMatchObject({ licensed: false, reason: expect.stringMatching(/unapproved.*re-approve.*queue/) });
+    expect(reads).toEqual([{
+      args: ['--literal-pathspecs', '-c', 'diff.ignoreSubmodules=none', 'diff',
+        '--no-ext-diff', '--no-textconv', '--no-renames', r.approved, head, '--', path],
+      opts: expect.objectContaining({ cwd: r.cwd, timeout: 5000, maxBuffer: 8 * 1024 * 1024 }),
+    }]);
+  });
+  it.each(['unreadable', 'oversized'])('refuses %s per-path hunks and names the operator fallback', failure => {
+    const r = fixture();
+    r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
+    const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+    r.git(['checkout', '-qb', 'pr', r.approved]); r.write('ordinary.md', 'author docs'); r.commit('author docs');
+    r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
+    expect(r.prove({ exec: (cmd, args, opts) => {
+      if (cmd === 'git' && args.includes('diff') && args.at(-1) === 'ordinary.md') {
+        if (failure === 'unreadable') throw Error('hunks unavailable');
+        return Buffer.alloc(8 * 1024 * 1024 + 1);
+      }
+      return r.exec(cmd, args, opts);
+    } })).toMatchObject({ licensed: false, reason: expect.stringMatching(/unreadable or oversized.*re-approve.*queue/) });
   });
   it('refuses a main merge with more than 1024 paths and names the operator fallback', () => {
     const r = fixture();

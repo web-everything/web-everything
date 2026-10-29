@@ -101,8 +101,11 @@ export function proveHumanOnlyLicense({ repo, pr, headSha, exec, cwd, readCommen
     };
     for (const path of paths) {
       if (!path || normalizeGatePath(path).split('/').includes('..')) return refuse('successor path unreadable');
+      // Content can require human review even for ordinary paths; unreadable/oversized hunks refuse via git().
+      const diffHunks = git(['--literal-pathspecs', '-c', 'diff.ignoreSubmodules=none', 'diff',
+        '--no-ext-diff', '--no-textconv', '--no-renames', approved, headSha, '--', path]);
       const sensitive = GATE_PATH_PREFIXES.some(prefix => normalizeGatePath(path).startsWith(prefix))
-        || scoreEscalation({ changedFiles: [path] }).humanRequired === true;
+        || scoreEscalation({ changedFiles: [path], diffHunks }).humanRequired === true;
       if (sensitive && blob(headSha, path) !== blob(main, path)) return refuse('successor changes an unapproved human-only path');
     }
     return { licensed: true, tier: 'mechanical', reason: 'approved ancestor retained; sensitive successor blobs match main' };
