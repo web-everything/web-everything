@@ -6,7 +6,7 @@ import { sensitiveSurfaceHits, resolveHumanReviewSurfaces } from '../lib/human-r
 import { REVIEW_LABELS, hasReviewLabel, parseLatestHumanClearedSha, decideParkToHuman } from '../lib/review-escalation.mjs';
 import { createGhProvider, parseJsonLines } from '../lib/review-label-provider.mjs';
 import { execRead } from '../lib/proc-read.mjs';
-import { restoreClearanceOverRacedPark } from '../review-set-label.mjs';
+import { canRestoreHumanClearance, restoreClearanceOverRacedPark } from '../review-set-label.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { defaultListPrs } from './advisory-label-sweep.mjs';
@@ -48,7 +48,7 @@ const marksPark = (c, head) => typeof c?.body === 'string' && [...c.body.matchAl
  */
 export function raceLostParkProven(comments, head) {
   const trusted = (Array.isArray(comments) ? comments : []).filter(isTrustedMarkerAuthor);
-  if (!trusted.length || !sameSha(parseLatestHumanClearedSha(trusted), head)) return false;
+  if (!trusted.length || !canRestoreHumanClearance(trusted, head)) return false;
   const last = trusted.at(-1);
   const clearsHead = c => sameSha(parseLatestHumanClearedSha([c]), head);
   if (!marksPark(last, head) && !clearsHead(last)) return false;
@@ -225,7 +225,7 @@ function withdrawRaceLostPark({ provider, repo, num, head, readComments, readLab
   if (!Array.isArray(after)) throw new Error('comments read returned no array');
   const live = provider.readPrState(repo, num);
   if (!Array.isArray(live?.labels)) throw new Error('labels read returned no array');
-  if (!sameSha(live.headRefOid, head) || !sameSha(parseLatestHumanClearedSha(after), head)) return false;
+  if (!sameSha(live.headRefOid, head) || !canRestoreHumanClearance(after, head)) return false;
   if (hasReviewLabel(live.labels, REVIEW_LABELS.changes) || hasReviewLabel(live.labels, REVIEW_LABELS.heldMechanical)) return false;
   // Right after its own write the sweep knows the park is its own; a later heal must prove it from the thread.
   if (requireMarker && !raceLostParkProven(after, head)) return false;

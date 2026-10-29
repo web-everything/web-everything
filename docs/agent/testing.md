@@ -2745,6 +2745,17 @@ Interleave two admissions after both read the old status and assert exactly one 
 
 ### Delegated clearance races
 
+`scripts/conveyor/__tests__/clear-human-refused-park.test.mjs` and the auto-discovered
+`clear-human-refused-park` soak case drive the production CLI into expiry before its swap,
+a failed label write, a persisted comment with a lost reply, and expiry before reassertion.
+Both direct and fixed-target entry points must retain the human hold through immediate
+park recovery, repeated healer sweeps, and dry-run planning. A later independent operator
+clearance remains recoverable. Delegated comments are marked at the CLI boundary: they
+cannot alone authorize autonomous park withdrawal, even after a successful run. A remaining
+park requires a fresh guarded clearance; the CLI's own reassertion still validates current
+eligibility and expiry. This prevents a comment posted before a refusal from bypassing the
+recovery ledger hold, without requiring a second remote write to record the refusal.
+
 The delegated-clearance suite constructs CLI arguments for `runReviewLabelCli` with injected
 forge IO. A clear-human request carrying delegation, the daemon channel, or an expected head
 requires a full 40-hex `--expect-head`, valid delegation JSON, and no `--new-head` flag.

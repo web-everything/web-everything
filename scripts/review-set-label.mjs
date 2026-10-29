@@ -259,6 +259,21 @@ export const HUMAN_SURFACE_REPARK_RE = /<!-- (?:human-surface-repark|mechanical-
 export const buildMechanicalHandoffMarker = headSha => (/^[0-9a-f]{40}$/i.test(String(headSha))
   ? `<!-- mechanical-hold-handoff: ${String(headSha).toLowerCase()} -->` : '');
 
+const DELEGATED_CLEARANCE_MARKER = '<!-- delegated-clearance: guarded -->';
+
+/**
+ * A delegated comment can precede a refused swap or survive a lost reply. It is not proof that
+ * admission completed. Autonomous park recovery cannot revalidate that delegation: leave the hold
+ * for a fresh guarded clear-human run. The CLI's own reassertion still checks eligibility and expiry.
+ * Inspect the latest trusted acceptance only, so a later independent ceremony can release the park.
+ */
+export function canRestoreHumanClearance(comments, headSha) {
+  if (!Array.isArray(comments)
+    || parseLatestHumanClearedSha(comments)?.toLowerCase() !== String(headSha).toLowerCase()) return false;
+  const latest = comments.findLast(c => isTrustedMarkerAuthor(c) && parseReviewedSha([c]));
+  return !!latest && !latest.body.includes(DELEGATED_CLEARANCE_MARKER);
+}
+
 /**
  * PR #5273 — after a marked park's own label write, read the complete thread and the live labels. When a trusted
  * clearance names this unchanged head, the park lost a race with `clear-human`: remove its `review:human` and restore
@@ -283,12 +298,13 @@ export function withdrawParkOnLiveClearance({ provider, repo, pr, headSha, warn 
  * PR #5273 — THE single-home write that undoes a park which lost a race with `clear-human`: remove `review:human` and
  * restore the `review:accepted` the ceremony stamped. Callers outside this file (the human-surface sweep) read the
  * live state and pass it in; this re-checks it before writing. Writes only when the latest trusted clearance in
- * `comments` names `headSha`, `review:human` is present, and no bounce or mechanical hold stands. Returns whether it
- * wrote. Read errors are the caller's; a write error throws.
+ * `comments` names `headSha` without delegated admission, `review:human` is present, and no bounce or mechanical
+ * hold stands. Delegated parks require a fresh guarded ceremony. Returns whether it wrote. Read errors are the
+ * caller's; a write error throws.
  */
 export function restoreClearanceOverRacedPark({ provider, repo, pr, headSha, comments, labels }) {
   if (!Array.isArray(comments) || !Array.isArray(labels)) return false;
-  if (parseLatestHumanClearedSha(comments)?.toLowerCase() !== String(headSha).toLowerCase()) return false;
+  if (!canRestoreHumanClearance(comments, headSha)) return false;
   if (!hasReviewLabel(labels, REVIEW_LABELS.human) || hasReviewLabel(labels, REVIEW_LABELS.changes)
     || hasReviewLabel(labels, REVIEW_LABELS.heldMechanical)) return false;
   provider.setLabels(repo, pr, { add: REVIEW_LABELS.accepted, remove: [REVIEW_LABELS.human] });
@@ -320,7 +336,8 @@ export function isHumanSurfacePark({ provider, repo, pr, labels, headSha, commen
 /**
  * PR #5273 — after a swap-first `clear-human` (the PR was already accepted), re-read once its comment is posted and
  * undo a human-surface park that landed after the swap. Only that park: any other hold is left alone. A failed read
- * is reported, not fatal: the clearance is already durable, and the sweep heals its own park on a later tick.
+ * is reported, not fatal: the clearance is already durable. The sweep can heal an ordinary operator clearance
+ * on a later tick; a delegated park requires a fresh guarded ceremony.
  * Delegated callers supply their eligibility assertion. Recovery read failures and head moves stay best-effort
  * for every caller; a same-head eligibility refusal still propagates before any reassertion write.
  */
@@ -1873,7 +1890,9 @@ export function runReviewLabelCli({
   // that are size-checked, written and posted are the same bytes.
   const commentBody = buildComment({
     to, actor, decision, headSha, reason: clearReason, reviewedDiff, clearerId, independence, humanClearance,
-  }) + renderReferralCarryRecord(referralCarry) + rearmBinding;
+  }) + renderReferralCarryRecord(referralCarry) + rearmBinding
+    // Stamp at the CLI boundary, including custom builders and fixed-target callers, before size validation.
+    + (guardedClearHuman ? `\n\n${DELEGATED_CLEARANCE_MARKER}` : '');
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — THE SIZE GUARD, on the RENDERED bytes, before ANY write.
   // GitHub rejects a comment over `GH_COMMENT_MAX`. The cause this guard exists for: an oversize comment used to
