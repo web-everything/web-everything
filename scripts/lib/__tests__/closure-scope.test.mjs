@@ -83,6 +83,40 @@ it.each([
     'tests/unmentioned.mjs': '' })).toMatchObject({ ok: false, reason: 'closure-incomplete' });
 });
 
+it.each([
+  './%70ayload.mjs', './%70%61yload.mjs', './caf%C3%A9.mjs', './%2570ayload.mjs',
+  './%2e%2e/outside.mjs', './%2Foutside.mjs', './%5Coutside.mjs',
+  './payload%23part.mjs', './payload%3Fpart.mjs', './%ZZ.mjs', './%E0%A4.mjs',
+  './payload.mjs?decoy.mjs', './payload.mjs#decoy.mjs', './dir\\payload.mjs',
+  './pay\tload.mjs', './pay\rload.mjs', './pay\nload.mjs',
+])('retains the full conflict for URL-sensitive relative targets despite a raw-path decoy: %s', spec => {
+  const quoted = JSON.stringify(spec);
+  for (const source of [`import ${quoted};`, `export * from ${quoted};`,
+    `import(${quoted});`, `require(${quoted});`]) {
+    const files = { 'entry.mjs': "import './loader.mjs';", 'loader.mjs': source,
+      [spec.slice(2)]: '', 'payload.mjs': "import './runtime-dependency.mjs';",
+      'runtime-dependency.mjs': '', 'tests/unmentioned.mjs': '' };
+    const snapshot = reader(files);
+    const closure = collectImportClosure({ ...snapshot, entries: ['entry.mjs'], strict: true });
+    expect(closure.complete, source).toBe(false);
+    expect(compute(files), source).toMatchObject({ ok: false, reason: 'closure-incomplete' });
+  }
+});
+
+it('retains the full conflict for JavaScript-escaped percent signs in relative imports', () => {
+  expect(compute({ 'entry.mjs': "import './\\u002570ayload.mjs';",
+    '%70ayload.mjs': '', 'payload.mjs': '' }))
+    .toMatchObject({ ok: false, reason: 'closure-incomplete' });
+});
+
+it.each(['local/%70ayload.mjs', 'local/payload.mjs?decoy.mjs', 'local/payload.mjs#decoy.mjs'])(
+  'retains the full conflict for URL-sensitive bare package subpaths: %s', spec => {
+    expect(compute({ 'entry.mjs': `import '${spec}';`,
+      'node_modules/local/index.js': '', [`node_modules/${spec}`]: '',
+      'node_modules/local/payload.mjs': '' }))
+      .toMatchObject({ ok: false, reason: 'closure-incomplete' });
+  });
+
 it.each(['main', 'exports'])('R210 final round protects raw and URL-decoded package %s targets', field => {
   const files = { 'entry.mjs': "require('./pkg');", 'pkg/index.js': '',
     'pkg/package.json': JSON.stringify({ [field]: './%70ayload.mjs' }),
@@ -103,6 +137,16 @@ it.each(['main', 'exports'])('R210 final round refuses unproven URL-decoded pack
     expect(compute({ 'entry.mjs': "require('./pkg');", 'pkg/index.js': '',
       'pkg/package.json': JSON.stringify({ [field]: target }),
       [`pkg/${target.slice(2)}`]: '' }), target).toMatchObject({ ok: false, reason: 'closure-incomplete' });
+  }
+});
+
+it.each(['main', 'exports'])('refuses URL-normalized package %s targets despite raw and decoded decoys', field => {
+  for (const target of ['./pay\tload.mjs', './pay\nload.mjs', './pay\rload.mjs', './dir\\payload.mjs',
+    './pay%09load.mjs', './pay%0Aload.mjs', './pay%0Dload.mjs', './dir%5Cpayload.mjs']) {
+    expect(compute({ 'entry.mjs': "require('./pkg');", 'pkg/index.js': '',
+      'pkg/package.json': JSON.stringify({ [field]: target }),
+      [`pkg/${target.slice(2)}`]: '', [`pkg/${decodeURIComponent(target.slice(2))}`]: '',
+    }), target).toMatchObject({ ok: false, reason: 'closure-incomplete' });
   }
 });
 

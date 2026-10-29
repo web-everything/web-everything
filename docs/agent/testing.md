@@ -76,6 +76,11 @@ and retain the full conflict.
 Strict relative resolution unions extension and index candidates and recursively walks package
 `main` and every `exports` condition/array target. Unknown, cyclic, wildcard, missing, malformed or
 unreadable package resolution falls back to full merge/manual rebase. Keep legacy resolution independent.
+Direct import/require specifiers containing percent escapes, query/fragment delimiters, backslashes,
+or URL-stripped tabs/line breaks retain the full conflict, even if the raw spelling names a snapshot file.
+The URL-sensitive relative-target and bare-package-subpath regressions in `closure-scope.test.mjs`
+pin this fallback through scope admission. Manifest targets still union raw and decoded spellings,
+but refuse URL separators and control characters in either spelling.
 Package-target resolution tracks local success separately from the union's growth, and active recursion
 separately from previously resolved targets. The named index/main overlap and shared main/exports
 regressions in `closure-scope.test.mjs` require scope admission and protection of transitive dependencies;
