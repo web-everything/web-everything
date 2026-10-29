@@ -23,6 +23,15 @@ function compute(files = {}, options = {}) {
     entries: ['entry.mjs'], env: {}, ...options });
 }
 
+it.each(['off', 'shadow', 'on'])('scope computation uses supplied entries without host LaunchAgents in %s mode', mode => {
+  const result = compute({ 'entry.mjs': "import './runtime.mjs';", 'runtime.mjs': '' }, {
+    env: { HOME: '/nonexistent-closure-scope-home', WE_SMOKE_LIVE_CLONE: '/nonexistent-live-clone',
+      WE_DAEMON_CLOSURE_SCOPE: mode },
+  });
+  expect(result.ok).toBe(true);
+  expect(result.scope.has('runtime.mjs')).toBe(true);
+});
+
 const workerLaunches = [
   ...['spawn', 'spawnSync', 'execFile', 'execFileSync'].map(name =>
     options => `${name}('node', ['worker.mjs']${options});`),
