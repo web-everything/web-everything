@@ -120,6 +120,7 @@ describe('readSnapshot', () => {
       const f = fixture();
       f.pullRequest.comments.nodes[0].author = author;
       await expect(readSnapshot(f.input)).rejects.toThrow(/comment.author/);
+      for (const key of IO_MEMBERS.slice(1)) expect(f.calls[key]).toEqual([]);
     });
 
   it.each([

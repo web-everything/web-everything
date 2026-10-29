@@ -111,6 +111,8 @@ export async function readSnapshot({ repo, pr, expectedHead, now, io } = {}) {
   }).sort();
   const comments = connection(p, 'comments').map(c => {
     requireEvidence(object(c), 'comment');
+    // Validate before normalization so a null login cannot become a deleted author.
+    requireEvidence(c.author === null || (object(c.author) && text(c.author.login)), 'comment.author.login');
     return { id: c.id, author: c.author === null ? null : c.author?.login, body: c.body, createdAt: c.createdAt,
       lastEditedAt: c.lastEditedAt }; // GraphQL always returns it (null = never edited); absent = partial read
   }).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
