@@ -170,7 +170,7 @@ export function planLabelInputRows({ repo, pr, items = [], liveLabels = [], self
     // GitHub timestamps describe a whole second. Only a strictly later second proves a clearance
     // followed this addition. Same-second ambiguity tightens; connection order keeps a re-add latest.
     if (it.change === 'added' && clearances.some((e) => Math.floor(Date.parse(e.at) / 1000) > Math.floor(Date.parse(it.createdAt) / 1000)
-      && (approvalValid(e, now) || ((e.type === EVENT_TYPES.VERDICT || e.type === undefined)
+      && ((approvalValid(e, now) && !e.delegation) || ((e.type === EVENT_TYPES.VERDICT || e.type === undefined)
         && verdictClears(e.verdict) && acceptanceCovers(e, headSha))))) continue;
     const dup = events.some((e) => e?.type === EVENT_TYPES.LABEL_INPUT && e.pr === pr && String(e.repo).toLowerCase() === String(repo).toLowerCase()
       && e.label === it.label && e.change === it.change && (it.id && e.timelineId ? it.id === e.timelineId

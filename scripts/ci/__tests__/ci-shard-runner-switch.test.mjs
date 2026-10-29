@@ -1,6 +1,6 @@
 // @vitest-environment node
 // #5027 — pins the Arm-runner experiment switch in ci.yml: ONLY `test-shard` reads `vars.WE_SHARD_RUNNER`
-// (falling back to x86), every other job stays on `ubuntu-latest`, and the matrix stays single-axis so
+// (falling back to x86), other inline jobs stay on `ubuntu-latest`, and the matrix stays single-axis so
 // the coverage divisor remains matrix length minus the no-coverage group.
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -20,9 +20,18 @@ describe('ci.yml test-shard runner switch (#5027)', () => {
     expect(raw.split('\n').filter((l) => /^ {4}runs-on: .*vars\.WE_SHARD_RUNNER/.test(l))).toHaveLength(1);
   });
 
-  it('every other job stays on ubuntu-latest (the switch must not widen)', () => {
+  it('other inline jobs stay on ubuntu-latest and the Hetzner caller cannot follow the Arm switch', () => {
     for (const [name, j] of Object.entries(jobs)) {
       if (name === 'test-shard') continue;
+      if (name === 'hetzner') {
+        expect(j.uses).toBe('./.github/workflows/hetzner-jobs.yml');
+        expect(j['runs-on']).toBeUndefined();
+        const called = yaml.load(readFileSync(new URL('../../../.github/workflows/hetzner-jobs.yml', import.meta.url), 'utf8'));
+        for (const calledJob of Object.values(called.jobs)) {
+          expect(calledJob['runs-on']).toEqual(['self-hosted', 'hetzner', 'we']);
+        }
+        continue;
+      }
       expect(j['runs-on'], `${name} must not follow the Arm switch`).toBe('ubuntu-latest');
     }
     for (const name of ['test', 'changes', 'daemon-soak-scope', 'soak-shard']) expect(jobs[name]).toBeDefined();
