@@ -443,7 +443,7 @@ export function refreshLiveFixDispatchClaims({
     if (!current) continue;
     // Write back the FRESHLY re-read entry (not the listing snapshot); a pre-`claimedAt` claim is stamped now so
     // the ceiling applies to it from here on.
-    const meta = { ...(current.meta ?? entry.meta), claimedAt: current.meta?.claimedAt ?? heartbeatAt };
+    const meta = { ...(current.meta ?? entry.meta), claimedAt: current.meta?.claimedAt || heartbeatAt };
     if (idleHeadSha === null) delete meta.idleHead;
     if (idleHeadSha !== null) {
       const idleSince = meta.idleHead?.since;

@@ -280,6 +280,26 @@ describe('listFixDispatchClaims / refreshLiveFixDispatchClaims — the tick-time
     expect(readFixDispatchClaim({ repo: 'we', pr: 2784, kind: 'ci-heal', lockRoot: claimRoot }).meta.claimedAt).toBe(iso(T0 + 60_000));
   });
 
+  it('a claim with empty claimedAt is stamped on refresh and stops refreshing past the four-hour ceiling', () => {
+    const key = { repo: 'we', pr: 2784, kind: 'ci-heal', lockRoot: claimRoot };
+    acquireFixDispatchClaim({ ...key, owner: 'A', nowMs: T0, nowIso: iso(T0) });
+    const entry = readFixDispatchClaim(key);
+    expect(heartbeat(claimRoot, fixDispatchResource(key), entry.owner, iso(T0), entry.pid,
+      { ...entry.meta, claimedAt: '' })).toBe(true);
+    expect(readFixDispatchClaim(key).meta.claimedAt).toBe('');
+    const refresh = (at) => refreshLiveFixDispatchClaims({ lockRoot: claimRoot,
+      listAgentsAll: () => [{ name: 'ci-heal-2784', state: 'working' }], hungInfoFor: () => ({ hung: false }),
+      nowMs: at, nowIso: () => iso(at) });
+    const stampedAt = T0 + 60_000;
+    expect(refresh(stampedAt).refreshed).toHaveLength(1);
+    expect(readFixDispatchClaim(key).meta.claimedAt).toBe(iso(stampedAt));
+    expect(refresh(stampedAt + MAX_FIX_DISPATCH_CLAIM_REFRESH_MS).refreshed).toHaveLength(1);
+    const lastRefreshed = readFixDispatchClaim(key);
+    expect(lastRefreshed.meta.claimedAt).toBe(iso(stampedAt));
+    expect(refresh(stampedAt + MAX_FIX_DISPATCH_CLAIM_REFRESH_MS + 1).refreshed).toHaveLength(0);
+    expect(readFixDispatchClaim(key)).toEqual(lastRefreshed);
+  });
+
   // PR #2789 review (security/toctou) — the refresh used an owner snapshot from the listing and heartbeat-wrote
   // it blindly, clobbering a DIFFERENT owner that released+re-acquired in between.
   it('never clobbers a claim re-acquired by a DIFFERENT owner between the listing and the heartbeat write', () => {
@@ -666,10 +686,12 @@ describe('idle-claim auto-release (R201)', () => {
     awaitingVerifyFor: null, prHeadFor: () => head, recordEvent: (e) => events.push(e), nowIso: () => iso(at),
     idleRelease: resolveIdleClaimRelease({ env: {}, platform: null }), ...extra,
   });
-  // Explicit intervening observations keep release fixtures on the daemon's two-minute cadence.
+  // Explicit intervening observations keep fixtures on the daemon's two-minute cadence.
   // Tests of observation gaps call sweep directly instead.
   const sweepThrough = (from, at, options) => {
-    for (let tick = from + 120_000; tick < at; tick += 120_000) sweep(tick, options);
+    for (let tick = from + 120_000; tick < at; tick += 120_000) {
+      expect(sweep(tick, options).released ?? []).toHaveLength(0);
+    }
     return sweep(at, options);
   };
 
@@ -756,7 +778,7 @@ describe('idle-claim auto-release (R201)', () => {
     const prHeadFor = vi.fn(() => 'sha1');
     const awaitingVerifyFor = vi.fn(() => ({ awaiting: true }));
     const extra = { awaitingVerifyFor, prHeadFor };
-    const result = sweep(T0 + 60_000 + 2 * IDLE_MS, { extra });
+    const result = sweepThrough(T0 + 60_000, T0 + 60_000 + 2 * IDLE_MS, { extra });
     expect(result.released ?? []).toHaveLength(0);
     expect(result.refreshed).toHaveLength(1);
     expect(result.awaiting).toEqual([{ repo: 'we', pr: 5996, kind: 'fix', owner: 'A' }]);
@@ -777,7 +799,7 @@ describe('idle-claim auto-release (R201)', () => {
     const alive = vi.fn(() => true);
     const identity = vi.fn(() => ({ alive: true }));
     const prHeadFor = vi.fn(() => 'sha1');
-    const result = sweep(T0 + 60_000 + 2 * IDLE_MS, { extra: { alive, identity, prHeadFor } });
+    const result = sweepThrough(T0 + 60_000, T0 + 60_000 + 2 * IDLE_MS, { extra: { alive, identity, prHeadFor } });
     expect(result.released ?? []).toHaveLength(0);
     expect(result.refreshed).toHaveLength(1);
     const refreshed = readFixDispatchClaim(key);
@@ -1013,7 +1035,7 @@ describe('idle-claim auto-release (R201)', () => {
   it('a session that is working keeps its claim however long the head is unmoved', () => {
     acquire();
     const events = [];
-    for (const at of [60_000, IDLE_MS, 2 * IDLE_MS, 3 * IDLE_MS]) {
+    for (let at = 0; at <= 3 * IDLE_MS; at += 120_000) {
       const r = sweep(T0 + at, { state: 'working', events });
       expect(r.released ?? []).toHaveLength(0);
       expect(r.refreshed).toHaveLength(1);
@@ -1024,9 +1046,12 @@ describe('idle-claim auto-release (R201)', () => {
   it('a session that goes back to work restarts the idle clock', () => {
     acquire();
     sweep(T0 + 60_000);
+    sweepThrough(T0 + 60_000, T0 + 10 * 60_000 - 1);
     sweep(T0 + 10 * 60_000, { state: 'working' });
-    const r = sweep(T0 + 60_000 + IDLE_MS, {});
+    sweep(T0 + 11 * 60_000);
+    const r = sweepThrough(T0 + 11 * 60_000, T0 + 60_000 + IDLE_MS);
     expect(r.released ?? []).toHaveLength(0);
+    expect(readFixDispatchClaim({ repo: 'we', pr: 5996, lockRoot: claimRoot }).meta.idleHead.since).toBe(iso(T0 + 11 * 60_000));
   });
 
   it('a PR head that moves restarts the idle clock', () => {
@@ -1042,7 +1067,7 @@ describe('idle-claim auto-release (R201)', () => {
   it('fails closed: an unreadable PR head never releases', () => {
     acquire();
     sweep(T0 + 60_000, { head: null });
-    const r = sweep(T0 + 60_000 + 2 * IDLE_MS, { head: null });
+    const r = sweepThrough(T0 + 60_000, T0 + 60_000 + 2 * IDLE_MS, { head: null });
     expect(r.released ?? []).toHaveLength(0);
     expect(readFixDispatchClaim({ repo: 'we', pr: 5996, kind: 'fix', lockRoot: claimRoot })?.owner).toBe('A');
   });
@@ -1051,7 +1076,7 @@ describe('idle-claim auto-release (R201)', () => {
     acquire();
     const boom = () => { throw new Error('gh down'); };
     sweep(T0 + 60_000, { extra: { prHeadFor: boom } });
-    const r = sweep(T0 + 60_000 + 2 * IDLE_MS, { extra: { prHeadFor: boom } });
+    const r = sweepThrough(T0 + 60_000, T0 + 60_000 + 2 * IDLE_MS, { extra: { prHeadFor: boom } });
     expect(r.released ?? []).toHaveLength(0);
   });
 
@@ -1059,7 +1084,7 @@ describe('idle-claim auto-release (R201)', () => {
     acquire();
     const idleRelease = resolveIdleClaimRelease({ env: { WE_IDLE_CLAIM_RELEASE_ENABLED: '0' }, platform: null });
     sweep(T0 + 60_000, { extra: { idleRelease } });
-    const r = sweep(T0 + 60_000 + 2 * IDLE_MS, { extra: { idleRelease } });
+    const r = sweepThrough(T0 + 60_000, T0 + 60_000 + 2 * IDLE_MS, { extra: { idleRelease } });
     expect(r.released ?? []).toHaveLength(0);
   });
 
