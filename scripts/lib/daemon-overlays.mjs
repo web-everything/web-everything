@@ -410,14 +410,19 @@ function collectRetiredSources(list, sources, { strict = false } = {}) {
  * an entry carrying `retiredSources` puts those sources back in its place (a source registered again meanwhile is
  * skipped, its own nested sources still come back), so a container dropped later (pr-closed, ref-gone, smoke,
  * operator) never takes their content with it.
+ * `expectRegistrationId`, when the key is passed at all, must be a non-empty string equal to the present entry's
+ * `registrationId`; an absent or malformed token throws like a changed registration.
  * @param {{env?:NodeJS.ProcessEnv, why?:string, requireRef?:string, expectedOverlay?:object, expectedRequiredOverlay?:object, expectRegistrationId?:string,
  *   retireInto?:boolean, retiredSha?:string|null}} [o]
  * @returns {{removed:boolean, list:Array<object>, reinstated?:string[]}}
  */
-export function removeOverlay(root, ref, {
-  env = process.env, why, requireRef, expectedOverlay, expectedRequiredOverlay, expectRegistrationId, retireInto = false, retiredSha = null,
-} = {}) {
+export function removeOverlay(root, ref, options = {}) {
+  const {
+    env = process.env, why, requireRef, expectedOverlay, expectedRequiredOverlay, expectRegistrationId, retireInto = false, retiredSha = null,
+  } = options;
   void why; // caller bookkeeping only — see JSDoc above.
+  // Passing the key at all requests the CAS: a missing or malformed token refuses instead of removing unconditionally.
+  const casRequested = Object.hasOwn(options, 'expectRegistrationId');
   return withListLock(root, env, (pause) => {
     const list = readOverlaysForWrite(root, env);
     pause();
@@ -433,7 +438,8 @@ export function removeOverlay(root, ref, {
     if (expectedOverlay !== undefined && idx !== -1 && !isDeepStrictEqual(registrationIdentity(list[idx]), registrationIdentity(expectedOverlay))) {
       throw new Error('registration changed; refusing removal');
     }
-    if (expectRegistrationId !== undefined && idx !== -1 && list[idx].registrationId !== expectRegistrationId) {
+    if (casRequested && idx !== -1 && (typeof expectRegistrationId !== 'string' || !expectRegistrationId
+      || list[idx].registrationId !== expectRegistrationId)) {
       throw new Error('registration changed; refusing removal');
     }
     if (idx === -1) return { removed: false, list };

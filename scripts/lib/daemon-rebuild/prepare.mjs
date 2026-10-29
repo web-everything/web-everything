@@ -591,7 +591,10 @@ export async function prepareRebuild({
     if (d.pr != null && (d.action === 'apply' || d.action === 'remove') && !d.pinned) clearOverlayConflictWake(env, d.pr);
     if (d.action === 'remove') {
       try {
-        const removed = removeOverlay(root, d.ref, { env, why: d.reason, expectRegistrationId: snap.get(d.ref) });
+        // A source this tick reinstated is bound to the id we restored; with neither, removeOverlay refuses.
+        const removed = removeOverlay(root, d.ref, {
+          env, why: d.reason, expectRegistrationId: snap.get(d.ref) ?? ourRestored.get(d.ref),
+        });
         if (removed.removed) {
           ourRemoved.add(d.ref); snap.delete(d.ref);
           for (const ref of removed.reinstated ?? []) ourRestored.set(ref, removed.list.find((o) => o.ref === ref)?.registrationId);
