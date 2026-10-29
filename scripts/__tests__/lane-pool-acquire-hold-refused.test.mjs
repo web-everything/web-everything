@@ -167,6 +167,38 @@ describe('lane-pool acquire after lane-hold reset refusal', () => {
     expect(result.out.trim()).toBe('');
   }, 60_000);
 
+  it('exits 1 rather than 75 when a hold refusal is followed by shared scan-lock contention', () => {
+    provision(1);
+    const parked = park(1);
+    const lock = join(pool, 'holdtest', '.list-acquirable.lock');
+    // Let the first scan reach the parked lane; install the foreign lock only when
+    // acquire polls after that refusal. An initially held lock would hide the lane.
+    writeFileSync(preload, readFileSync(preload, 'utf8') + `
+const pollWait = Atomics.wait;
+let foreignLockInstalled = false;
+Atomics.wait = function(...args) {
+  if (!foreignLockInstalled && new Error().stack.includes('cmdAcquire')) {
+    foreignLockInstalled = true;
+    mkdir(${JSON.stringify(lock)}); // original mkdir: not an observed CLI scan
+    fs.writeFileSync(${JSON.stringify(join(lock, 'owner.json'))}, JSON.stringify({
+      pid: ${process.pid}, host: ${JSON.stringify(hostname())}, startedAt: Date.now(),
+    }));
+  }
+  return pollWait.apply(this, args);
+};
+`);
+    const result = acquire(2500, ['--cache-ttl-ms=0']);
+    expect(result.err.match(/lane-1: reset REFUSED — lane-hold:/g)).toHaveLength(1);
+    expect(result.err).toContain('(lock contention)');
+    expect(events().filter((e) => e.kind === 'scan')).toHaveLength(1);
+    expect(events().some((e) => e.kind === 'lock-wait')).toBe(true);
+    expect(existsSync(lease(1))).toBe(false);
+    expect(readFileSync(join(lane(1), '.git', '.fix-await-verify'), 'utf8')).toBe(parked);
+    expect(JSON.parse(readFileSync(join(lock, 'owner.json'), 'utf8'))).toMatchObject({ pid: process.pid, host: hostname() });
+    expect(result.out.trim()).toBe('');
+    expect(result.code, result.err).toBe(1);
+  }, 60_000);
+
   it('never hands out or modifies a lane held by a live foreign lease', () => {
     provision(2);
     const held = run(['acquire', '--lane=1', '--session=foreign-live-owner', '--json']);
