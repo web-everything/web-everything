@@ -1489,3 +1489,281 @@ describe('unprovable accepted head move — fresh full review', () => {
     expect(o.dispatch).toHaveBeenCalledTimes(1); expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: 'fresh' });
   });
 });
+
+
+// Namespace access keeps missing feature exports as individual RED failures, not a collection error.
+import * as staleRecovery from '../review-red-team-on-skip.mjs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { hostname } from 'node:os';
+import { pidNamespace, pidStartTime } from '../pid-alive.mjs';
+
+const staleNow = Date.parse('2026-10-28T12:00:00Z');
+const staleDeadline = 2 * 60 * 60 * 1000;
+const deadRunningStatus = (over = {}) => ({ repo, pr, head, status: 'running', result: null,
+  pid: 6039, host: 'fixture-host', pidNamespace: 'fixture-namespace',
+  pidStart: new Date(staleNow - 60_000).toISOString(), ...over });
+const staleProbe = (alive = false, start = deadRunningStatus().pidStart) => ({
+  host: 'fixture-host', namespace: 'fixture-namespace',
+  isAlive: vi.fn(() => alive), readPidStart: vi.fn(() => start),
+});
+function staleFixture(over = {}) {
+  const status = deadRunningStatus();
+  return fixture({ now: staleNow, probe: staleProbe(), staleSpent: () => false,
+    rawPrs: [{ number: pr, headRefOid: head, labels: ['review:accepted', 'red-team:pending'], reviews: [],
+      comments: [{ body: `✅ review — accepted\n<!-- reviewed-sha: ${head} -->`, author: { login: 'web-everything' } }] }],
+    readEvidence: () => ({ loopPayload: { findings: { read: { netBasis: { rev: head } } } },
+      inFlight: false, recorded: false, seatRecorded: false, completedRecorded: false, status }),
+    readStatus: () => status, ...over });
+}
+function staleRunFixture(over = {}) {
+  const f = staleFixture();
+  return runFixture({ ...f, plan: { refusals: f.refusals }, now: () => staleNow,
+    env: {}, readCarry: () => null,
+    abandonStale: vi.fn(() => ({ ok: true, release: vi.fn() })),
+    recoverPayload: vi.fn(() => payload()), ...over });
+}
+
+describe('staleRedTeamRun — dead running owner recovery', () => {
+  it('exports the two-hour stale run deadline', () => {
+    expect(staleRecovery.STALE_RUN_DEADLINE_MS).toBe(staleDeadline);
+  });
+  const old = new Date(staleNow - staleDeadline - 1).toISOString();
+  it.each([
+    ['dead local owner', {}, false, undefined, true],
+    ['absent result with dead owner', { result: undefined }, false, undefined, true],
+    ['live local owner', {}, true, undefined, false],
+    ['live local owner past deadline', { pidStart: old }, true, old, false],
+    ['live legacy owner without start time', { pidStart: undefined }, true, undefined, false],
+    ['reused local pid', {}, true, 'a different start time', true],
+    ['fresh remote host', { host: 'remote' }, false, undefined, false],
+    ['expired remote host', { host: 'remote', pidStart: old }, true, undefined, true],
+    ['fresh foreign namespace', { pidNamespace: 'other' }, false, undefined, false],
+    ['expired foreign namespace', { pidNamespace: 'other', pidStart: old }, true, undefined, true],
+    ['remote host at deadline', { host: 'remote', pidStart: new Date(staleNow - staleDeadline).toISOString() }, false, undefined, false],
+    ['remote host with unknown age', { host: 'remote', pidStart: 'unparseable' }, false, undefined, false],
+    ['foreign namespace with unknown age', { pidNamespace: 'other', pidStart: undefined }, false, undefined, false],
+    ['missing local pid fresh', { pid: undefined }, false, undefined, false],
+    ['missing local pid expired', { pid: undefined, pidStart: old }, false, undefined, true],
+    ['invalid local pid fresh', { pid: -1 }, false, undefined, false],
+    ['invalid local pid expired', { pid: 'invalid', pidStart: old }, false, undefined, true],
+    ['invalid local pid unknown age', { pid: 0, pidStart: 'unparseable' }, false, undefined, false],
+    ['queued', { status: 'queued' }, false, undefined, false],
+    ['finished', { status: 'finished' }, false, undefined, false],
+    ['abandoned', { status: 'abandoned' }, false, undefined, false],
+    ['missing state', { status: undefined }, false, undefined, false],
+    ['usable result', { result: { status: 'ran' } }, false, undefined, false],
+    ['non-null false result', { result: false }, false, undefined, false],
+    ['marked abandonment with live owner', { staleAbandoned: { at: staleNow } }, true, undefined, false],
+  ])('%s', (_name, status, alive, start, stale) => {
+    const result = staleRecovery.staleRedTeamRun({ status: deadRunningStatus(status), now: staleNow,
+      deadlineMs: staleDeadline, probe: staleProbe(alive, start) });
+    expect(result).toEqual({ stale, reason: expect.any(String) });
+    expect(result.reason.length).toBeGreaterThan(0);
+  });
+  it('missing status fails closed', () => {
+    expect(staleRecovery.staleRedTeamRun({ now: staleNow, probe: staleProbe() }))
+      .toEqual({ stale: false, reason: expect.any(String) });
+  });
+  it('default probes recognize the real live owner even past the deadline', () => {
+    expect(staleRecovery.staleRedTeamRun({ status: deadRunningStatus({ pid: process.pid,
+      host: hostname(), pidNamespace: pidNamespace(), pidStart: pidStartTime(process.pid) }),
+      now: staleNow + staleDeadline * 100, deadlineMs: staleDeadline }).stale).toBe(false);
+  });
+});
+
+describe('planRedTeamOnSkip — PR 6039 truncated running payload', () => {
+  it.each([1, 2])('dead owner with pending labels skips a spent retry count of %i', retryCount => {
+    const f = staleFixture();
+    f.readStatus().retryCount = retryCount;
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'skip',
+      why: 'red-team retry already spent; inspect stored evidence' });
+  });
+  it.each([0, undefined])('dead owner with pending labels still dispatches with retryCount=%s', retryCount => {
+    const f = staleFixture();
+    if (retryCount !== undefined) f.readStatus().retryCount = retryCount;
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'dispatch', mode: 'fresh', abandonStale: true });
+  });
+  it.each([true, false])('dead owner dispatches fresh with pending label %s', pending => {
+    const f = staleFixture();
+    if (!pending) f.rawPrs[0].labels = ['review:accepted'];
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'dispatch', mode: 'fresh', abandonStale: true });
+  });
+  it('live owner never dispatches', () => {
+    expect(planRedTeamOnSkip(staleFixture({ probe: staleProbe(true) }))[0].action).toBe('skip');
+  });
+  it('spent stale recovery skips as already re-dispatched', () => {
+    expect(planRedTeamOnSkip(staleFixture({ staleSpent: () => true }))[0])
+      .toMatchObject({ action: 'skip', why: expect.stringContaining('already re-dispatched') });
+  });
+  it('dead owner respects retry cooldown', () => {
+    expect(planRedTeamOnSkip(staleFixture({ lastDispatch: new Map([[`${repo}#${pr}@${head}`, staleNow - 1]]) }))[0])
+      .toMatchObject({ action: 'skip', why: 'retry cooldown active' });
+  });
+  it('published head result still prevents stale recovery', () => {
+    const f = staleFixture();
+    f.rawPrs[0].comments.push({ body: redTeamMarker(pr, head), author: { login: 'web-everything' } });
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'skip', why: 'red-team result already on head' });
+  });
+});
+
+describe('runRedTeamOnSkip — stale recovery effects', () => {
+  it('abandons exactly once before fresh red-team-only dispatch', () => {
+    const o = staleRunFixture();
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'dispatch', mode: 'fresh', abandonStale: true });
+    expect(o.recoverPayload).toHaveBeenCalledOnce();
+    expect(o.abandonStale).toHaveBeenCalledOnce();
+    expect(o.abandonStale).toHaveBeenCalledWith({ repo, pr, head,
+      status: o.readStatus(), env: o.env, now: staleNow, probe: o.probe });
+    expect(o.dispatch).toHaveBeenCalledOnce();
+    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' });
+    expect(o.abandonStale.mock.invocationCallOrder[0]).toBeLessThan(o.dispatch.mock.invocationCallOrder[0]);
+  });
+  it('two ticks share the real cooldown map and abandon/dispatch only once', () => {
+    const o = staleRunFixture({ lastDispatch: new Map() });
+    expect(runRedTeamOnSkip(o).dispatched).toHaveLength(1);
+    o.capacity = { lanes: 1, budget: { left: 1 } };
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'retry cooldown active' });
+    expect(o.abandonStale).toHaveBeenCalledOnce();
+    expect(o.dispatch).toHaveBeenCalledOnce();
+    expect(o.lastDispatch.get(`${repo}#${pr}@${head}`)).toBe(staleNow);
+  });
+  it('missing accepting review run fails closed before abandonment or dispatch', () => {
+    const o = staleRunFixture({ recoverPayload: vi.fn(() => null) });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: expect.stringContaining('review run') });
+    expect(o.recoverPayload).toHaveBeenCalledOnce();
+    expect(o.abandonStale).not.toHaveBeenCalled();
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it('a dispatch that does not start releases its stale spend marker', () => {
+    const release = vi.fn(), o = staleRunFixture({
+      abandonStale: vi.fn(() => ({ ok: true, release })), dispatch: vi.fn(() => ({ skipped: 'x' })) });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'x' });
+    expect(o.abandonStale).toHaveBeenCalledOnce();
+    expect(o.dispatch).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledOnce();
+    expect(o.dispatch.mock.invocationCallOrder[0]).toBeLessThan(release.mock.invocationCallOrder[0]);
+    expect(o.lastDispatch.size).toBe(0);
+  });
+});
+
+describe('abandonStaleRedTeamRun — durable one-shot marker', () => {
+  it('preserves status, records one event, refuses a second spend, and releases the marker', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-marker-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_DAEMON_EVENTS: join(dir, 'daemon-events.jsonl') };
+    try {
+      recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'running' }, { env });
+      const statusPath = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
+      const status = { ...JSON.parse(readFileSync(statusPath, 'utf8')), ...deadRunningStatus(), extra: { preserve: true } };
+      writeFileSync(statusPath, JSON.stringify(status));
+      const input = { repo, pr, head, env, status, now: staleNow, probe: staleProbe() };
+      const marker = `${statusPath}.stale-redispatch-1`;
+      expect(staleRecovery.staleRedTeamSpent(input)).toBe(false);
+      const result = staleRecovery.abandonStaleRedTeamRun(input);
+      expect(result).toEqual({ ok: true, release: expect.any(Function) });
+      expect(existsSync(marker)).toBe(true);
+      expect(staleRecovery.staleRedTeamSpent(input)).toBe(true);
+      expect(staleRecovery.staleRedTeamSpent({ ...input, head: 'b'.repeat(40) })).toBe(false);
+      const rewritten = JSON.parse(readFileSync(statusPath, 'utf8'));
+      expect(rewritten).toEqual({ ...status, staleAbandoned: { at: expect.anything(), pid: status.pid, reason: expect.any(String) } });
+      expect(new Date(rewritten.staleAbandoned.at).getTime()).toBe(staleNow);
+      const events = () => readFileSync(env.WE_DAEMON_EVENTS, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(events()).toHaveLength(1);
+      expect(events()[0]).toMatchObject({ kind: 'red-team-stale-run-abandoned', repo, pr });
+      expect(JSON.stringify(events()[0].detail)).toContain(head);
+      expect(JSON.stringify(events()[0].detail)).toContain(String(status.pid));
+      expect(staleRecovery.abandonStaleRedTeamRun(input)).toMatchObject({ ok: false });
+      expect(events()).toHaveLength(1);
+      result.release();
+      expect(existsSync(marker)).toBe(false);
+      expect(staleRecovery.staleRedTeamSpent(input)).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each(['owner identity unreadable', 'unprobeable owner within deadline'])(
+    'refuses abandonment when the re-read has %s without a marker or event', kind => {
+      const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-refused-'));
+      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_DAEMON_EVENTS: join(dir, 'daemon-events.jsonl') };
+      try {
+        recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'running' }, { env });
+        const statusPath = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
+        const status = deadRunningStatus(kind === 'unprobeable owner within deadline' ? { host: 'remote' } : {});
+        const original = JSON.stringify(status);
+        writeFileSync(statusPath, original);
+        const priorEvent = `${JSON.stringify({ kind: 'prior-event' })}\n`;
+        writeFileSync(env.WE_DAEMON_EVENTS, priorEvent);
+        const probe = staleProbe(true, null);
+        expect(staleRecovery.staleRedTeamRun({ status, now: staleNow, probe }).stale).toBe(false);
+        expect(staleRecovery.abandonStaleRedTeamRun({ repo, pr, head, env, status, now: staleNow, probe }))
+          .toEqual({ ok: false });
+        expect(existsSync(`${statusPath}.stale-redispatch-1`)).toBe(false);
+        expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).toBe(priorEvent);
+        expect(readFileSync(statusPath, 'utf8')).toBe(original);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+});
+
+describe('recoverStaleRunPayload — head-bound accepting review run', () => {
+  it.each([false, true])('returns the newest matching run when it owes red team despite list order reversed=%s', reverse => {
+    const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-payload-'));
+    try {
+      const run = (id, at, over = {}) => {
+        const value = { ...newRunRecord({ id, op: 'review-pr', input: { repo, pr } }), ...payload(), ...over };
+        writeRun(value, dir);
+        utimesSync(join(dir, `${id}.json`), new Date(at), new Date(at));
+        return value;
+      };
+      const rows = [run('review-pr-old', 1000), run('review-pr-newest-matching', 4500),
+        run('review-pr-rejected', 3000, { verdict: { verdict: 'changes' } }),
+        run('review-pr-truncated', 4000, { verdict: null }),
+        run('review-pr-carried', 4200, { carriedFrom: 'older-run' }),
+        run('review-pr-other-head', 5000, { findings: { read: { netBasis: { rev: 'b'.repeat(40) } } } }),
+        run('review-pr-other-repo', 6000, { input: { repo: 'other/repo', pr } }),
+        run('review-pr-other-pr', 7000, { input: { repo, pr: pr + 1 } }),
+        run('review-pr-other-op', 8000, { op: 'other' }), run('other-run', 9000)];
+      const ids = rows.map(row => row.id);
+      const list = vi.fn(() => reverse ? [...ids].reverse() : ids);
+      const read = vi.fn(id => rows.find(row => row.id === id));
+      expect(staleRecovery.recoverStaleRunPayload({ repo, pr, head, env: { WE_SHARED_RUNS_DIR: dir }, runsDir: dir, list, read }))
+        .toEqual(rows[1]);
+      expect(list).toHaveBeenCalledWith(dir);
+      expect(read).not.toHaveBeenCalledWith('other-run', expect.anything());
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each([
+    ['rejecting', { verdict: { verdict: 'changes' } }],
+    ['incomplete', { verdict: null }],
+    ['carried', { carriedFrom: 'older-run' }],
+  ])('returns null when a newer %s review supersedes an older accept in either list order', (_kind, over) => {
+    const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-superseded-'));
+    try {
+      const rows = [
+        { ...newRunRecord({ id: 'review-pr-old-accept', op: 'review-pr', input: { repo, pr } }), ...payload() },
+        { ...newRunRecord({ id: 'review-pr-newest', op: 'review-pr', input: { repo, pr } }), ...payload(), ...over },
+      ];
+      rows.forEach((row, i) => {
+        writeRun(row, dir);
+        utimesSync(join(dir, `${row.id}.json`), new Date(1000 * (i + 1)), new Date(1000 * (i + 1)));
+      });
+      const read = id => rows.find(row => row.id === id);
+      expect(staleRecovery.recoverStaleRunPayload({ repo, pr, head, runsDir: dir,
+        list: () => rows.map(row => row.id), read })).toBeNull();
+      expect(staleRecovery.recoverStaleRunPayload({ repo, pr, head, runsDir: dir,
+        list: () => rows.map(row => row.id).reverse(), read })).toBeNull();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each(['empty', 'truncated', 'non-accepting', 'wrong-head', 'wrong-repo', 'wrong-pr'])(
+    'returns null with only %s evidence', kind => {
+      const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-no-payload-'));
+      try {
+        const id = 'review-pr-ineligible';
+        const value = { ...newRunRecord({ id, op: 'review-pr', input: { repo, pr } }), ...payload() };
+        if (kind === 'truncated') delete value.verdict;
+        if (kind === 'non-accepting') value.verdict.verdict = 'changes';
+        if (kind === 'wrong-head') value.findings.read.netBasis.rev = 'b'.repeat(40);
+        if (kind === 'wrong-repo') value.input.repo = 'other/repo';
+        if (kind === 'wrong-pr') value.input.pr++;
+        writeRun(value, dir);
+        expect(staleRecovery.recoverStaleRunPayload({ repo, pr, head, env: { WE_SHARED_RUNS_DIR: dir }, runsDir: dir,
+          list: () => kind === 'empty' ? [] : [id], read: () => value })).toBeNull();
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+});

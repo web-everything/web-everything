@@ -91,7 +91,7 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
 import { liveResultGateState, readRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
-import { normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
+import { recoverStaleRunPayload, staleRedTeamRun, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../lib/red-team-carry-io.mjs';
@@ -457,6 +457,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       if (fetched !== head) throw Error('review head changed during fetch; retry shared setup on the live head');
       return { head };
     },
+    readStaleRunPayload: key => recoverStaleRunPayload({ ...key, env }),
     readRedTeamOnlyPayload: ({ pr, repo, head }) => ({ ...readEvidence({ repo, pr, head, env }), head }),
     redTeamSkipCardOnlySetting: () => readRedTeamProbes({ env, log: line => process.stderr.write(`${line}\n`) }).value.skipCardOnly,
     // Prove in the review lane: prepareLane fetched and pinned the PR head there; the daemon's own clone may lack it.
@@ -466,6 +467,13 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       : { ok: false }),
     // The carry's own resolver is its only source (logged with that source); no timing setting governs it.
     carryAcrossRebaseSetting: () => resolveCarryAcrossRebase({ env, readFile }),
+    carryHumanClearance: ({ pr, repo }) => {
+      const cwd = planReviewDispatch({ pr: 1, repo }).laneRepo;
+      // Parse/exec failures propagate to the arc's normal-review fallback.
+      return JSON.parse(exec(process.execPath, [join(root, 'scripts', 'conveyor', 'human-clearance-carry-cli.mjs'),
+        '--pr', String(pr), '--repo', repo],
+      { cwd, env: laneGitHardeningEnv(env), encoding: 'utf8', timeout: 300_000, maxBuffer: READ_MAX_BUFFER }));
+    },
     readCarryEvidence: ({ pr, repo }) => {
       const view = JSON.parse(execRead('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], { cwd: root, env }));
       const comments = readCompletePrComments(pr, { repo, exec: (f, a, o) => execRead(f, a, { ...o, cwd: root, env }) });
@@ -1005,6 +1013,24 @@ function runReviewArc({
   try {
     const prev = io.readPrevCompletion(slug);
     if (!redTeamOnly) io.report({ session: slug, kind: 'review', pr: String(planned.pr), repo: planned.repo, status: 'started', timeoutMs: loopTimeoutMs });
+    if (!redTeamOnly && typeof io.carryHumanClearance === 'function') {
+      try {
+        const carry = io.carryHumanClearance({ pr: planned.pr, repo: planned.repo });
+        if (carry?.carried) {
+          const { fromSha, toSha: headSha, fingerprint } = carry.carried;
+          io.log(`review-job: human clearance carried ${fromSha}->${headSha} fingerprint ${fingerprint.slice(0, 12)}`);
+          classified = { outcome: 'carried', fromSha, headSha, fingerprint };
+          return result(classified);
+        }
+        if (carry?.reason) {
+          const reason = tail(safeErrorText(carry.reason).replace(/[\x00-\x1f\x7f-\x9f]/g, ' '), 300);
+          io.log(`review-job ${slug}: human clearance not carried (${reason}) — normal review`);
+        }
+      } catch (e) {
+        const reason = tail(safeErrorText(e).replace(/[\x00-\x1f\x7f-\x9f]/g, ' '), 300);
+        io.log(`review-job ${slug}: human clearance carry unavailable (${reason}) — normal review`);
+      }
+    }
     if (!redTeamOnly && typeof io.carryAcrossRebaseSetting === 'function') {
       try {
         const setting = io.carryAcrossRebaseSetting();
@@ -1091,6 +1117,16 @@ function runReviewArc({
       if (stored?.carryConflict) {
         classified = { outcome: 'red-team-not-owed', reason: 'later review supersedes the carry' };
         return result({ ...classified, lanePath });
+      }
+      if (redTeamMode === 'fresh' && !redTeamOwedFor(loopPayload)
+        && (staleRedTeamRun({ status: stored?.status, probe: io.staleProbe }).stale
+          || (stored?.status?.staleAbandoned && staleRedTeamRun({
+            status: { ...stored.status, status: 'running', result: null }, probe: io.staleProbe }).stale))) {
+        let recovered;
+        try { recovered = (io.readStaleRunPayload ?? recoverStaleRunPayload)({ repo: planned.repo, pr: planned.pr, head }); }
+        catch { /* Missing or unreadable full review evidence stays not owed. */ }
+        if (redTeamOwedFor(recovered) && recovered.findings?.read?.netBasis?.rev === head
+          && recovered.carriedFrom == null && loopPayload?.carriedFrom == null) loopPayload = recovered;
       }
       let cardOnlyRecovery = false;
       const movedCardOnly = redTeamMode === 'fresh' && stored?.head === head && cardOnlyHeadMoveCandidate(stored, head);
