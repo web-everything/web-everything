@@ -18,6 +18,68 @@ const temp = () => { const d = mkdtempSync(join(tmpdir(), 'repeat-quarantine-'))
 afterEach(() => dirs.splice(0).forEach((d) => rmSync(d, { recursive: true, force: true })));
 const plan = (o = {}) => planSafetyNet({ status: 'red', firstRedSha: rows[0].headSha, failedJobs: ['integration'], jobFailures: { integration: failure }, repeatRuns: rows, latestRunId: 2, touchedFiles: () => [], now, ...o });
 const proof = { kind: 'repeat-failed', runIds: [1, 2], shas: rows.map((r) => r.headSha), count: 2 };
+describe('reusable-workflow quarantine job names', () => {
+  it.each(['integration', 'test-shard (3)'])('round-trips two failing hetzner / %s runs with failed aggregators into the workflow skip decision', (job) => {
+    const reportedJob = `hetzner / ${job}`;
+    const jobFailures = { [reportedJob]: failure };
+    const out = plan({ failedJobs: [reportedJob, 'coverage-merge', 'test'], jobFailures,
+      repeatRuns: rows.map((r) => ({ ...r, jobFailures })) });
+    expect(out.action).toBe('add');
+    expect(out.entries).toEqual([{ test: file, job, proof }]);
+    const added = addEntries(null, { tests: out.tests, job: out.entries[0].job, proof: out.entries[0].proof,
+      brokenSha: rows[0].headSha, actor: 'operator', owner: 'operator', reason: out.why, now });
+    expect(added.ok).toBe(true);
+    const skip = (list, selectedJob) => decideCiSkip({ mode: 'quarantine', read: { ok: true, list },
+      ctx: { known: true, onMain: false, prNumber: 6003 }, changedFiles: [], now, job: selectedJob });
+    expect(skip(added.list, job).skip).toEqual([file]);
+    expect(skip(added.list, reportedJob).skip).toEqual([file]);
+    expect(skip(added.list, null).skip).toEqual(job === 'integration' ? [] : [file]);
+    expect(skip(added.list, job === 'integration' ? 'test-shard (1)' : 'integration').skip).toEqual([]);
+    // Lists published before normalization remain readable, including the unit-suite default.
+    const persisted = { ...added.list, entries: added.list.entries.map((e) => ({ ...e, job: reportedJob })) };
+    expect(skip(persisted, job).skip).toEqual([file]);
+    expect(skip(persisted, null).skip).toEqual(job === 'integration' ? [] : [file]);
+    expect(plan({ failedJobs: [reportedJob], jobFailures,
+      repeatRuns: rows.map((r) => ({ ...r, jobFailures })), list: persisted }).action).toBe('none');
+  });
+
+  it('does not quarantine when only coverage-merge and test failed, even with complete logs and repeat proof', () => {
+    expect(plan({ failedJobs: ['coverage-merge', 'test'] })).toMatchObject({ action: 'none' });
+  });
+
+  it('normalizes direct writes and recognizes old prefixed entries without renewing their expiry', () => {
+    const options = { tests: [file], job: 'caller / nested / integration', proof,
+      brokenSha: rows[0].headSha, actor: 'operator', owner: 'operator', reason: 'repeat', now };
+    const added = addEntries(null, options);
+    expect(added.ok).toBe(true);
+    expect(added.list.entries[0].job).toBe('integration');
+    const old = { ...added.list, entries: added.list.entries.map((e) => ({ ...e, job: options.job })) };
+    const again = addEntries(old, { ...options, job: 'integration', now: now + 60000 });
+    expect(again.list).toEqual(old);
+    expect(again.events).toEqual([]);
+  });
+
+  it.each(['other / integration', 'hetzner / build', 'hetzner / test-shard-helper (1)'])('rejects unrelated failing job %s', (job) => {
+    expect(plan({ failedJobs: [job], jobFailures: { [job]: failure } })).toMatchObject({
+      action: 'none', why: expect.stringContaining('outside the unit suite'),
+    });
+  });
+
+  it.each(['integration', 'test-shard (1)'])('collects prefixed %s logs through the IO default', (job) => {
+    const reportedJob = `hetzner / ${job}`;
+    const dir = temp();
+    const write = vi.fn(({ change }) => change({ version: 1, entries: [] }));
+    const out = runSafetyNet({ now, dir,
+      settings: resolveQuarantineSettings({ file: join(dir, 'absent.json'), env: {}, platform: null }),
+      mainCiRuns: { runs: [...rows].reverse(), failing: { runId: 2, jobs: [reportedJob] } },
+      mode: { value: 'quarantine', source: 'test' }, touchedFiles: () => [],
+      readJobs: () => ({ failed: [{ id: 10, name: reportedJob }], jobs: [] }), readLog: () => failure,
+      readList: () => ({ ok: true, list: { version: 1, entries: [] } }), write, log: () => {} });
+    expect(out.plan.action).toBe('add');
+    expect(out.plan.entries).toEqual([{ test: file, job, proof }]);
+    expect(write).toHaveBeenCalledOnce();
+  });
+});
 describe('quarantine CLI entry guard', () => {
   it.each(['directory', 'file'])('runs through a symlinked %s and prints usage without remote IO', (kind) => {
     const cli = fileURLToPath(new URL('../red-main-quarantine-io.mjs', import.meta.url));
