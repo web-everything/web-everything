@@ -147,8 +147,9 @@ describe('health-watch destructive lane action call-site contract', () => {
       'scripts/conveyor/health-watch.mjs:tick:unlinkSync(overrunPath)',
     ];
     const violations = sites => sites.filter(({ site, guarded }) => !ALLOWLIST.includes(site) && !guarded);
-    const sites = scopedScanFiles(['scripts/lib/health-watch-lane-scan.mjs',
-      'scripts/operations/stale-state-io.mjs', 'scripts/conveyor/health-watch.mjs'])
+    // Full inventory on every run: the allowlist spans all three files, so a scoped scan cannot equal it.
+    const sites = ['scripts/lib/health-watch-lane-scan.mjs',
+      'scripts/operations/stale-state-io.mjs', 'scripts/conveyor/health-watch.mjs']
       .flatMap(file => scan(readFileSync(new URL(`../../../${file}`, import.meta.url), 'utf8'), file));
     expect(sites.map(({ site }) => site).sort()).toEqual([...ALLOWLIST].sort());
     expect(violations(sites)).toEqual([]);
@@ -357,6 +358,7 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:../lib/claude-agents-cache.mjs#cachedClaudeAgents:cachedClaudeAgents",
       "helper:../lib/daemon-clone-branch-probe.mjs#probeDaemonCloneBranches:probeDaemonCloneBranches",
       "helper:../lib/daemon-clone-registry.mjs#daemonCloneRoots:daemonCloneRoots",
+      "helper:../lib/daemon-rebuild/overlay-main-sync.mjs#kickOverlayMainSync:kickOverlayMainSync",
       "helper:../lib/gh-throttle.mjs#budgetProbeArgs:budgetProbeArgs",
       "helper:../lib/gh-throttle.mjs#ghThrottleLockRoot:ghThrottleLockRoot",
       "helper:../lib/gh-throttle.mjs#ghThrottleLogPath:ghThrottleLogPath",
@@ -467,10 +469,11 @@ describe('health-watch destructive lane action call-site contract', () => {
   const allowedHelperCounts = {
     "scripts/conveyor/health-watch.mjs": {
       "helper:../backlog-stranded-sweep.mjs#readBacklogCards:readBacklogCards": 1,
-      "helper:../lib/automation-home.mjs#workspaceOf:workspaceOf": 8,
+      "helper:../lib/automation-home.mjs#workspaceOf:workspaceOf": 9,
       "helper:../lib/claude-agents-cache.mjs#cachedClaudeAgents:cachedClaudeAgents": 1,
       "helper:../lib/daemon-clone-branch-probe.mjs#probeDaemonCloneBranches:probeDaemonCloneBranches": 1,
-      "helper:../lib/daemon-clone-registry.mjs#daemonCloneRoots:daemonCloneRoots": 5,
+      "helper:../lib/daemon-clone-registry.mjs#daemonCloneRoots:daemonCloneRoots": 6,
+      "helper:../lib/daemon-rebuild/overlay-main-sync.mjs#kickOverlayMainSync:kickOverlayMainSync": 1,
       "helper:../lib/gh-throttle.mjs#budgetProbeArgs:budgetProbeArgs": 2,
       "helper:../lib/gh-throttle.mjs#ghThrottleLockRoot:ghThrottleLockRoot": 3,
       "helper:../lib/gh-throttle.mjs#ghThrottleLogPath:ghThrottleLogPath": 2,

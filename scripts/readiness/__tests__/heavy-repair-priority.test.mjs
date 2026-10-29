@@ -11,6 +11,7 @@ import {
   DEFAULT_REPAIR_PATTERNS, validRepairPatterns, classifyWaiterPriority, repairPatternMatches,
   MAX_REPAIR_PATTERN_LENGTH, MAX_REPAIR_MATCH_VALUE_LENGTH, MAX_REPAIR_PATTERNS,
   REPAIR_CLASSIFY_BUDGET_MS, REPAIR_MATCH_TIMEOUT_MS,
+  DEFAULT_FIX_PATTERNS, DEFAULT_UNBLOCK_PATTERNS, UNBLOCK_ENV, validP1Patterns, classifyP1, rankOfClass,
 } from '../heavy-repair-priority.mjs';
 
 afterEach(() => vi.restoreAllMocks());
@@ -119,5 +120,92 @@ describe('bounded matching after validation', () => {
     expect(child.error).toBeUndefined();
     expect(child.status, child.stderr).toBe(0);
     expect(JSON.parse(child.stdout)).toEqual([false, true]);
+  });
+});
+
+
+describe('P1 fixes and unblocking builds (R203)', () => {
+  const policy = (overrides = {}) => ({ mode: 'enforce', fixPatterns: DEFAULT_FIX_PATTERNS, unblockPatterns: DEFAULT_UNBLOCK_PATTERNS, ...overrides });
+
+  it('exports the bounded default families and explicit environment marker', () => {
+    expect(DEFAULT_FIX_PATTERNS).toEqual(['^fix-\\d+(?:-lane-\\d+-[0-9a-f]+)?$', '^ci-heal-\\d+(?:-lane-\\d+-[0-9a-f]+)?$']);
+    expect(DEFAULT_UNBLOCK_PATTERNS).toEqual(['^unblock-[a-z0-9][a-z0-9-]*(?:-lane-\\d+-[0-9a-f]+)?$']);
+    expect(UNBLOCK_ENV).toBe('WE_HEAVY_UNBLOCK');
+  });
+
+  it.each(['purpose', 'session', 'holder', 'envSession'])('recognizes fix and ci-heal identities in %s, including lane suffixes', (field) => {
+    for (const value of ['fix-203', 'ci-heal-42', 'fix-203-lane-47-abc123', 'ci-heal-42-lane-47-abc123']) {
+      expect(classifyP1({ [field]: value }, policy())).toMatchObject({ class: 'P1', kind: 'fix', matched: { field, value }, reason: expect.any(String) });
+    }
+  });
+
+  it.each(['unblock-host', 'unblock-build-203', 'unblock-host-lane-47-abc123'])('recognizes unblocking purpose %s', (purpose) => {
+    expect(classifyP1({ purpose }, policy())).toMatchObject({ class: 'P1', kind: 'unblock', matched: { field: 'purpose', value: purpose } });
+  });
+
+  it('WE_HEAVY_UNBLOCK=1, decoded as a boolean, marks an ordinary build as unblocking', () => {
+    expect(classifyP1({ purpose: 'build-203', unblockEnv: true }, policy())).toMatchObject({ class: 'P1', kind: 'unblock' });
+    for (const unblockEnv of [false, undefined, '1', 1]) {
+      expect(classifyP1({ purpose: 'build-203', unblockEnv }, policy())).toMatchObject({ class: null, kind: null, matched: null });
+    }
+  });
+
+  it.each(['build-203', 'review-203', 'prefix-fix-203', 'fix-feature', 'ci-heal-host', 'unblock-', 'unblock-UPPER'])('does not promote ordinary or near-match purpose %s', (purpose) => {
+    expect(classifyP1({ purpose }, policy())).toMatchObject({ class: null, kind: null, matched: null });
+  });
+
+  it('mode off disables both pattern and environment promotion', () => {
+    for (const identity of [{ purpose: 'fix-203' }, { purpose: 'unblock-host' }, { purpose: 'build-203', unblockEnv: true }]) {
+      expect(classifyP1(identity, policy({ mode: 'off' }))).toMatchObject({ class: null, kind: null, matched: null });
+    }
+  });
+
+  it('accepts empty selections, safe custom patterns, and the exact count and length bounds', () => {
+    expect(validP1Patterns([])).toBe(true);
+    expect(validP1Patterns(['^custom-fix-[0-9]+$'])).toBe(true);
+    expect(validP1Patterns(Array(16).fill('^fix-1$'))).toBe(true);
+    expect(validP1Patterns(['a'.repeat(MAX_REPAIR_PATTERN_LENGTH)])).toBe(true);
+    expect(classifyP1({ purpose: 'custom-fix-8' }, policy({ fixPatterns: ['^custom-fix-[0-9]+$'] }))).toMatchObject({ class: 'P1', kind: 'fix' });
+    for (const purpose of ['fix-203', 'unblock-host']) {
+      expect(classifyP1({ purpose }, policy({ fixPatterns: [], unblockPatterns: [] })).class).toBeNull();
+    }
+  });
+
+  const invalidLayers = [
+    ['unsafe nested repeat', ['^custom$', '^(a+)+$']],
+    ['oversized pattern list', Array(17).fill('^custom$')],
+    ['overlong pattern', ['a'.repeat(MAX_REPAIR_PATTERN_LENGTH + 1)]],
+    ['non-string entry', ['^custom$', 42]],
+    ['malformed regex', ['(']],
+    ['missing array', null],
+    ['non-array', '^custom$'],
+  ];
+  it.each(invalidLayers)('rejects the whole %s layer and falls back to the default families', (_label, patterns) => {
+    expect(validP1Patterns(patterns)).toBe(false);
+    expect(classifyP1({ purpose: 'fix-203' }, policy({ fixPatterns: patterns }))).toMatchObject({ class: 'P1', kind: 'fix' });
+    expect(classifyP1({ purpose: 'unblock-host' }, policy({ unblockPatterns: patterns }))).toMatchObject({ class: 'P1', kind: 'unblock' });
+    expect(classifyP1({ purpose: 'custom' }, policy({ fixPatterns: patterns, unblockPatterns: patterns })).class).toBeNull();
+  });
+
+  it('bounds all P1 matching by the shared classification deadline', () => {
+    let clock = 1000;
+    vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    const calls = [];
+    vi.spyOn(vm.Script.prototype, 'runInContext').mockImplementation((_context, options) => {
+      calls.push({ at: clock, timeout: options.timeout });
+      clock += calls.length === 1 ? 130 : 20;
+      return false;
+    });
+    expect(classifyP1({ purpose: 'ordinary', session: 'ordinary', holder: 'ordinary', envSession: 'ordinary' }, policy()).class).toBeNull();
+    expect(calls).toEqual([{ at: 1000, timeout: 50 }, { at: 1130, timeout: 20 }]);
+  });
+
+  it('keeps P0 above P1 and leaves red-main repair classification unchanged', () => {
+    expect(rankOfClass('P0')).toBe(0);
+    expect(rankOfClass('P1')).toBe(1);
+    for (const cls of ['P2', 'P3', null, undefined, 'unknown']) expect(rankOfClass(cls)).toBe(2);
+    const identity = { purpose: 'main-fix-abcdef0' };
+    expect(classify(identity).class).toBe('P0');
+    expect(classifyP1(identity, policy())).toMatchObject({ class: null, kind: null, matched: null });
   });
 });
