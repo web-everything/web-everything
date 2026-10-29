@@ -20,6 +20,8 @@ permissions:
 jobs:
   test-shard:
     runs-on: [self-hosted, hetzner, we]
+    env:
+      TMPDIR: ${{ runner.temp }}
     timeout-minutes: 25
     strategy:
       fail-fast: false
@@ -130,6 +132,8 @@ jobs:
 
   integration:
     runs-on: [self-hosted, hetzner, we]
+    env:
+      TMPDIR: ${{ runner.temp }}
     timeout-minutes: 20
     steps:
       # Same sibling layout as the shards.
