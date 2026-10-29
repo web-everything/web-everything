@@ -23,6 +23,57 @@ function compute(files = {}, options = {}) {
     entries: ['entry.mjs'], env: {}, ...options });
 }
 
+const workerLaunches = [
+  ...['spawn', 'spawnSync', 'execFile', 'execFileSync'].map(name =>
+    options => `${name}('node', ['worker.mjs']${options});`),
+  options => `fork('worker.mjs', []${options});`,
+  options => `import { spawn as launch } from 'node:child_process';
+    launch('node', ['worker.mjs']${options});`,
+  options => `import * as child from 'node:child_process';
+    child.spawn('node', ['worker.mjs']${options});`,
+  options => `import child from 'node:child_process';
+    child['spawn'](process.execPath, ['worker.mjs']${options});`,
+];
+
+it.each([
+  '{ cwd: process.env.RUN_DIR }',
+  "{ cwd: '../external' }",
+  "{ cwd: '.' }",
+  "{ 'cwd': process.env.RUN_DIR }",
+  '{ "c\\u0077d": process.env.RUN_DIR }',
+  '{ c\\u0077d: process.env.RUN_DIR }',
+  "{ ['cwd']: process.env.RUN_DIR }",
+  "{ ['c' + 'wd']: process.env.RUN_DIR }",
+  '{ cwd }',
+  '{ ...options }',
+  '{ get cwd() { return process.env.RUN_DIR; } }',
+  '{ __proto__: options }',
+  'options',
+])('refuses launches with unproven working directories: %s', options => {
+  for (const launch of workerLaunches) {
+    const source = launch(`, ${options}`);
+    // The snapshot worker is a decoy: cwd can select an external worker whose
+    // dependencies include repository files absent from this static closure.
+    const files = { 'entry.mjs': "import './launcher.mjs';", 'launcher.mjs': source,
+      'worker.mjs': '', 'tests/runtime-dependency.mjs': '' };
+    expect(collectImportClosure({ ...reader(files), entries: ['entry.mjs'], strict: true }).complete, source)
+      .toBe(false);
+    expect(compute(files), source).toMatchObject({ ok: false, reason: 'closure-incomplete' });
+  }
+});
+
+it.each(['', ', {}', ', { shell: false, stdio: "pipe" }'])(
+  'still admits modeled worker launches without a cwd override: %s', options => {
+    for (const launch of workerLaunches) {
+      const source = launch(options);
+      const result = compute({ 'entry.mjs': source, 'worker.mjs': "import './dependency.mjs';",
+        'dependency.mjs': '', 'tests/unrelated.mjs': '' });
+      expect(result.ok, source).toBe(true);
+      expect(isExcludable('dependency.mjs', result.scope), source).toBe(false);
+      expect(isExcludable('tests/unrelated.mjs', result.scope), source).toBe(true);
+    }
+  });
+
 it.each([
   ['string-keyed module destructuring', "const {'require':load}=module; load.call(module,process.argv[2]);"],
   ['package dot main', "require('.');", { 'package.json': '{"main":"./tests/payload"}',

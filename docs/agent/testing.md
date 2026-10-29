@@ -71,8 +71,11 @@ Sensitive capability evidence comes from module-binding provenance (`fs`, `fs/pr
 inventory. Any filesystem binding retains all existing snapshot files, including future exports,
 aliases, string-keyed destructuring and callbacks. Other capability escapes and unknown operations
 refuse scoped adoption; only the positively modeled direct child-process launches can pass.
-Supplied `execArgv`, launch environments or executable overrides are unmodeled execution edges
-and retain the full conflict.
+Supplied `execArgv`, launch environments, executable overrides or `cwd` overrides are unmodeled
+execution edges and retain the full conflict. Even a literal `cwd` is not resolved against the
+snapshot. The named "refuses launches with unproven working directories" regression in
+`closure-scope.test.mjs` uses a snapshot worker decoy and checks both the strict collector and
+scope admission across spawn, execFile, fork, aliases and namespace calls.
 Strict relative resolution unions extension and index candidates and recursively walks package
 `main` and every `exports` condition/array target. Unknown, cyclic, wildcard, missing, malformed or
 unreadable package resolution falls back to full merge/manual rebase. Keep legacy resolution independent.
