@@ -5,7 +5,6 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { proveHumanOnlyLicense, resolveApprovalLicensesEnqueue } from '../human-only-enqueue-license.mjs';
-import { scoreEscalation } from '../review-escalation.mjs';
 
 const roots = [];
 const rawChange = path => `:100644 100644 ${'a'.repeat(40)} ${'b'.repeat(40)} M\0${path}\0`;
@@ -41,11 +40,11 @@ describe('human-only enqueue license', () => {
     const r = fixture(); r.write(path, 'unapproved'); r.setHead(r.commit('author change'));
     expect(r.prove()).toMatchObject({ licensed: false });
   });
-  it('licenses a main merge whose sensitive blobs came from main using config-independent raw evidence', () => {
+  it('licenses a main merge whose changed paths match main using config-independent raw evidence', () => {
     const r = fixture();
     r.git(['checkout', '-qb', 'main-change']); r.write('.github/workflows/ci.yml', 'from main');
     const main = r.commit('main workflow'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
-    r.git(['checkout', '-qb', 'pr', r.approved]); r.write('README.md', 'ordinary'); r.commit('docs');
+    r.git(['checkout', '-qb', 'pr', r.approved]); r.git(['commit', '--allow-empty', '-qm', 'retain approved tree']);
     r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
     let diffArgs;
     expect(r.prove({ exec: (cmd, args, opts) => {
@@ -104,7 +103,7 @@ describe('human-only enqueue license', () => {
     ['submodule inherited from main', '160000', '160000', false],
     ['executable regular file inherited from main', '100755', '100755', true],
     ['deletion inherited from main', null, null, true],
-  ])('checks sensitive path modes in a main merge: %s', (_name, mainMode, headMode, licensed) => {
+  ])('checks path modes in a main merge: %s', (_name, mainMode, headMode, licensed) => {
     const r = fixture(), path = '.github/workflows/ci.yml';
     const id = mainMode === '160000' ? r.approved : r.git(['rev-parse', `${r.approved}:${path}`]);
     const stageMode = mode => r.git(mode === null ? ['update-index', '--force-remove', path]
@@ -112,8 +111,8 @@ describe('human-only enqueue license', () => {
     r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
     r.git(['add', 'README.md']); stageMode(mainMode); r.git(['commit', '-qm', 'main mode']);
     const main = r.git(['rev-parse', 'HEAD']); r.git(['update-ref', 'refs/remotes/origin/main', main]);
-    r.git(['checkout', '-fqb', 'pr', r.approved]); r.write('ordinary.md', 'author docs');
-    r.git(['add', 'ordinary.md']); stageMode(headMode); r.git(['commit', '-qm', 'author mode']);
+    r.git(['checkout', '-fqb', 'pr', r.approved]);
+    stageMode(headMode); r.git(['commit', '-qm', 'author mode']);
     r.git(['reset', '--hard', 'HEAD']);
     r.git(['merge', '--no-ff', '-m', 'merge main', main]);
     const head = r.git(['rev-parse', 'HEAD']); r.setHead(head);
@@ -135,7 +134,7 @@ describe('human-only enqueue license', () => {
     r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
     expect(r.prove()).toMatchObject({ licensed: false });
   });
-  it('refuses a humanRequired policy successor even in a main merge', () => {
+  it('refuses a policy successor differing from main even in a main merge', () => {
     const r = fixture();
     r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
     const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
@@ -143,7 +142,69 @@ describe('human-only enqueue license', () => {
     r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
     expect(r.prove()).toMatchObject({ licensed: false });
   });
-  it.each(['scripts/ordinary.mjs', 'scripts/ordinary[1].mjs'])('refuses a content-sensitive sandbox change differing from main at %s', path => {
+  it.each([
+    ['ordinary text', 'ordinary.md', 'author docs'],
+    ['binary', 'asset.bin', Buffer.from([0, 1, 2, 255])],
+    ['non-UTF8', 'legacy.txt', Buffer.from([0xff, 0xfe, 0x61])],
+  ])('refuses a %s changed file differing from main', (_name, path, body) => {
+    const r = fixture();
+    r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
+    const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+    r.git(['checkout', '-qb', 'pr', r.approved]); r.write(path, body); r.commit('author content');
+    r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
+    expect(r.prove()).toMatchObject({ licensed: false, reason: expect.stringMatching(/differing from main.*re-approve.*queue/) });
+  });
+  it.each([
+    ['ordinary.md', 'identical content'],
+    ['asset.bin', Buffer.from([0, 1, 2, 255])],
+    ['legacy[1].txt', Buffer.from([0xff, 0xfe, 0x61])],
+  ])('licenses a changed path identical to main without reading content: %s', (path, body) => {
+    const r = fixture();
+    r.git(['checkout', '-qb', 'main-change']); r.write(path, body);
+    const main = r.commit('main content'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+    r.git(['checkout', '-qb', 'pr', r.approved]); r.write(path, body); r.commit('identical author content');
+    r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
+    const reads = [];
+    expect(r.prove({ exec: (cmd, args, opts) => {
+      if (cmd === 'git') reads.push(args);
+      return r.exec(cmd, args, opts);
+    } })).toMatchObject({ licensed: true, tier: 'mechanical' });
+    expect(reads.some(args => args.includes('diff') || args.includes('show')
+      || (args.includes('cat-file') && !args.includes('-e')))).toBe(false);
+  });
+  it('refuses a PR-touched file merged with main changes even when the merge is clean', () => {
+    const r = fixture(), path = 'ordinary.md';
+    const baseText = 'base author line\n' + 'unchanged\n'.repeat(10) + 'base main line\n';
+    r.write(path, baseText); const base = r.commit('shared file');
+    r.git(['checkout', '-qb', 'main-change']); r.write(path, baseText.replace('base main line', 'main change'));
+    const main = r.commit('main edits shared file'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+    r.git(['checkout', '-qb', 'pr', base]); r.write(path, baseText.replace('base author line', 'approved PR change'));
+    const approved = r.commit('approved PR edit');
+    r.comments[0].body = `<!-- reviewed-sha: ${approved} -->\n<!-- cleared-human: operator -->`;
+    r.git(['merge', '--no-ff', '-m', 'merge main', main]);
+    const head = r.git(['rev-parse', 'HEAD']); r.setHead(head);
+    expect(r.git(['show', `${head}:${path}`])).toContain('approved PR change');
+    expect(r.git(['show', `${head}:${path}`])).toContain('main change');
+    expect(r.git(['diff-tree', '-r', '--name-only', approved, head])).toBe(path);
+    expect(r.prove()).toMatchObject({ licensed: false, reason: expect.stringMatching(/differing from main.*re-approve.*queue/) });
+  });
+  it.each(['deletion', 'replacement'])('refuses a symlink %s inherited from main (old-side mode)', change => {
+    const r = fixture(), path = 'ordinary-link';
+    const id = r.git(['rev-parse', `${r.approved}:.github/workflows/ci.yml`]);
+    r.git(['update-index', '--add', '--cacheinfo', '120000', id, path]);
+    r.git(['commit', '-qm', 'approved symlink']);
+    const approved = r.git(['rev-parse', 'HEAD']);
+    r.comments[0].body = `<!-- reviewed-sha: ${approved} -->\n<!-- cleared-human: operator -->`;
+    r.git(['checkout', '-qb', 'main-change']);
+    r.git(['update-index', '--force-remove', path]);
+    if (change === 'replacement') r.git(['update-index', '--add', '--cacheinfo', '100644', id, path]);
+    r.git(['commit', '-qm', 'main symlink removal']);
+    const main = r.git(['rev-parse', 'HEAD']); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+    r.git(['checkout', '-fqb', 'pr', approved]); r.git(['commit', '--allow-empty', '-qm', 'retain approved tree']);
+    r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
+    expect(r.prove()).toMatchObject({ licensed: false, reason: expect.stringMatching(/symlink.*re-approve.*queue/) });
+  });
+  it.each(['scripts/ordinary.mjs', 'scripts/ordinary[1].mjs'])('refuses a changed path differing from main using literal bounded tree reads at %s', path => {
     const r = fixture();
     r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
     const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
@@ -151,33 +212,29 @@ describe('human-only enqueue license', () => {
     r.write(path, 'export const writableRoots = [".", "../shared"];\n'); r.commit('author sandbox grant');
     r.git(['merge', '--no-ff', '-m', 'merge main', main]);
     const head = r.git(['rev-parse', 'HEAD']); r.setHead(head);
-    const diffHunks = r.git(['--literal-pathspecs', '-c', 'diff.ignoreSubmodules=none', 'diff',
-      '--no-ext-diff', '--no-textconv', '--no-renames', r.approved, head, '--', path]);
-    expect(scoreEscalation({ changedFiles: [path] }).humanRequired).toBe(false);
-    expect(scoreEscalation({ changedFiles: [path], diffHunks })).toMatchObject({
-      humanRequired: true, signals: { permissionChange: [path] },
-    });
     expect(r.git(['ls-tree', head, '--', path])).not.toBe(r.git(['ls-tree', main, '--', path]));
     const reads = [];
     expect(r.prove({ exec: (cmd, args, opts) => {
-      if (cmd === 'git' && args.includes('diff') && args.at(-1) === path) reads.push({ args, opts });
+      if (cmd === 'git' && args.includes('diff')) throw Error('content diff must not be read');
+      if (cmd === 'git' && args.includes('ls-tree') && args.at(-1) === path) reads.push({ args, opts });
       return r.exec(cmd, args, opts);
     } })).toMatchObject({ licensed: false, reason: expect.stringMatching(/unapproved.*re-approve.*queue/) });
-    expect(reads).toEqual([{
-      args: ['--literal-pathspecs', '-c', 'diff.ignoreSubmodules=none', 'diff',
-        '--no-ext-diff', '--no-textconv', '--no-renames', r.approved, head, '--', path],
+    expect(reads).toEqual([head, main].map(ref => ({
+      args: ['--literal-pathspecs', 'ls-tree', '-z', ref, '--', path],
       opts: expect.objectContaining({ cwd: r.cwd, timeout: 5000, maxBuffer: 8 * 1024 * 1024 }),
-    }]);
+    })));
   });
-  it.each(['unreadable', 'oversized'])('refuses %s per-path hunks and names the operator fallback', failure => {
+  it.each(['unreadable', 'oversized', 'non-UTF8', 'malformed'])('refuses %s per-path tree evidence and names the operator fallback', failure => {
     const r = fixture();
     r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
     const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
     r.git(['checkout', '-qb', 'pr', r.approved]); r.write('ordinary.md', 'author docs'); r.commit('author docs');
     r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
     expect(r.prove({ exec: (cmd, args, opts) => {
-      if (cmd === 'git' && args.includes('diff') && args.at(-1) === 'ordinary.md') {
-        if (failure === 'unreadable') throw Error('hunks unavailable');
+      if (cmd === 'git' && args.includes('ls-tree') && args.at(-1) === 'ordinary.md') {
+        if (failure === 'unreadable') throw Error('tree unavailable');
+        if (failure === 'non-UTF8') return Buffer.from([0xff]);
+        if (failure === 'malformed') return Buffer.from('unreadable\0');
         return Buffer.alloc(8 * 1024 * 1024 + 1);
       }
       return r.exec(cmd, args, opts);

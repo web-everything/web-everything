@@ -2,10 +2,10 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cascadePolicy } from './policy-cascade.mjs';
-import { parseLatestHumanClearedSha, scoreEscalation } from './review-escalation.mjs';
+import { parseLatestHumanClearedSha } from './review-escalation.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { proveNumberingOnlyMove } from './numbering-carry.mjs';
-import { GATE_PATH_PREFIXES, normalizeGatePath } from './merge-queue-enqueue.mjs';
+import { normalizeGatePath } from './merge-queue-enqueue.mjs';
 
 /** R212: environment → feature settings → default true; invalid layers fall through. */
 export function resolveApprovalLicensesEnqueue({ env = process.env, readFile = readFileSync } = {}) {
@@ -89,6 +89,7 @@ export function proveHumanOnlyLicense({ repo, pr, headSha, exec, cwd, readCommen
       const entry = /^:(000000|100644|100755|120000|160000) (000000|100644|100755|120000|160000) [0-9a-f]{40} [0-9a-f]{40} [ADMT]$/.exec(records[i]);
       if (!entry) return refuse('successor tree evidence unreadable');
       if (entry[1] === '160000' || entry[2] === '160000') return refuse('successor changes a gitlink');
+      if (entry[1] === '120000' || entry[2] === '120000') return refuse('successor changes a symlink');
       paths.push(records[i + 1]);
     }
     const blob = (ref, path) => {
@@ -101,14 +102,10 @@ export function proveHumanOnlyLicense({ repo, pr, headSha, exec, cwd, readCommen
     };
     for (const path of paths) {
       if (!path || normalizeGatePath(path).split('/').includes('..')) return refuse('successor path unreadable');
-      // Content can require human review even for ordinary paths; unreadable/oversized hunks refuse via git().
-      const diffHunks = git(['--literal-pathspecs', '-c', 'diff.ignoreSubmodules=none', 'diff',
-        '--no-ext-diff', '--no-textconv', '--no-renames', approved, headSha, '--', path]);
-      const sensitive = GATE_PATH_PREFIXES.some(prefix => normalizeGatePath(path).startsWith(prefix))
-        || scoreEscalation({ changedFiles: [path], diffHunks }).humanRequired === true;
-      if (sensitive && blob(headSha, path) !== blob(main, path)) return refuse('successor changes an unapproved human-only path');
+      // Every changed path must carry exactly main's mode and bytes, regardless of its name or content.
+      if (blob(headSha, path) !== blob(main, path)) return refuse('successor changes an unapproved path differing from main');
     }
-    return { licensed: true, tier: 'mechanical', reason: 'approved ancestor retained; sensitive successor blobs match main' };
+    return { licensed: true, tier: 'mechanical', reason: 'approved ancestor retained; every changed path matches main mode and blob' };
   } catch {
     return refuse('approval or git evidence unreadable or oversized');
   }
