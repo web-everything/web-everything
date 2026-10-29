@@ -23,6 +23,7 @@ import { isUnderTest } from '../lib/under-test.mjs';
 import { createActionStore } from '../operations/action-store.mjs';
 import { actionResource } from '../operations/action-record.mjs';
 import { isQuotaError } from '../lib/provider-quota-hold.mjs';
+import { telemetryDir, dayKey, parseTelemetryLines } from '../operations/telemetry-store.mjs';
 
 export const REFERRAL_HOLD_MARKER = 'review paused:';
 export const GH_LIST_COMMENT_CAP = 100;
@@ -86,6 +87,45 @@ export function reviewRunEvidence(run) {
   };
 }
 
+const isQuotaFailureSpan = span => span?.event === 'span.end' && span.name === 'review.loop'
+  && span.status === 'error' && isQuotaError(span.statusMessage);
+
+/** Read only the current and previous two UTC day files; telemetry is optional evidence. */
+export function readQuotaFailureSpans({ dir = telemetryDir(), now = Date.now() } = {}) {
+  const spans = [];
+  try {
+    for (let daysAgo = 0; daysAgo < 3; daysAgo++) {
+      let text;
+      try {
+        text = readFileSync(join(dir, `${dayKey(new Date(now - daysAgo * 86_400_000))}.jsonl`), 'utf8');
+      } catch (error) {
+        if (error.code === 'ENOENT') continue;
+        return [];
+      }
+      spans.push(...parseTelemetryLines(text).events.filter(isQuotaFailureSpan));
+    }
+    return spans;
+  } catch { return []; }
+}
+
+/** Overlay textless interrupted attempts without changing the cached run projection or the spans. */
+export function markQuotaOnlyFromSpans(rows, spans) {
+  const repoBase = repo => typeof repo === 'string' ? repo.split('/').at(-1) : '';
+  const windows = spans.filter(isQuotaFailureSpan).flatMap(span => {
+    const start = Date.parse(span.startedAt);
+    const end = Date.parse(span.endedAt);
+    const pr = Number(span.attributes?.pr);
+    const repo = repoBase(span.attributes?.repo);
+    return Number.isFinite(start) && Number.isFinite(end) && end >= start
+      && Number.isInteger(pr) && pr > 0 && repo
+      ? [{ start, end, pr, repo }] : [];
+  });
+  return rows.map(row => row.incomplete && windows.some(window =>
+    row.pr === window.pr && repoBase(row.repo) === window.repo
+    && row.startedAt >= window.start - 30_000 && row.startedAt <= window.end + 30_000)
+    ? { ...row, quotaOnly: true } : row);
+}
+
 // Cache only small projections, never full diffs/seat transcripts. A changed file is parsed again.
 const evidenceCache = new Map();
 /** The on-disk projection beside the records (not `.json`, so no run-store listing reads it as a record). Live
@@ -109,7 +149,8 @@ function writeEvidenceDiskCache(file, entries) {
     renameSync(tmp, file);
   } catch { try { unlinkSync(tmp); } catch { /* best effort: the cache is only a speed-up */ } }
 }
-export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryReadRun, memo = evidenceCache, persist = true } = {}) {
+export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryReadRun, memo = evidenceCache, persist = true,
+  spansDir = telemetryDir(), now = Date.now() } = {}) {
   let names;
   try { names = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
   const file = join(dir, REVIEW_EVIDENCE_CACHE_FILE);
@@ -151,7 +192,8 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
     disk ??= readEvidenceDiskCache(file);
     if (dirty || Object.keys(disk).some(n => !kept[n])) writeEvidenceDiskCache(file, kept);
   }
-  return out;
+  // Keep live telemetry outside both caches, so arriving or disappearing spans take effect immediately.
+  return markQuotaOnlyFromSpans(out, readQuotaFailureSpans({ dir: spansDir, now }));
 }
 
 /** The events on the PR thread that wake a parked review, each tagged with what woke it. `ruling` (a reviewer's or
