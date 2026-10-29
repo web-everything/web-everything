@@ -7,7 +7,7 @@ import { prepareRebuild } from '../../../lib/daemon-rebuild/prepare.mjs';
 import { rebuildClone } from '../../../lib/daemon-rebuild.mjs';
 import { ACTIVE_BUILD_TOKENS, releaseBuildLease } from '../../../lib/daemon-rebuild/lease.mjs';
 import { readRebuildState, writeRebuildState } from '../../../lib/daemon-rebuild/state.mjs';
-import { addOverlay, overlayFilePath, persistTipShas, readOverlayState, registrationIdentity, removeOverlay, writeOverlays } from '../../../lib/daemon-overlays.mjs';
+import { addOverlay, overlayFilePath, persistTipShas, readOverlayState, registrationIdentity, reinstateOverlaySources, removeOverlay, writeOverlays } from '../../../lib/daemon-overlays.mjs';
 import { autoRetireOverlays } from '../../../lib/daemon-overlay-auto-retire.mjs';
 
 export default {
@@ -218,12 +218,13 @@ export async function registrationEvidenceReplay() {
   };
   try {
     writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, '{}');
-    const old = { ref: 'feature', sha: landed, tipSha: landed, registeredAt: 'old' };
+    const old = { ref: 'feature', sha: landed, tipSha: landed, registeredAt: 'old', registrationId: 'original-registration' };
     writeOverlays(root, [old], { env });
     let refreshed;
     await autoRetireOverlays({ root, env, overlays: [old], git, refEvidence: new Map([['feature', 'refreshed']]),
       persistTipShas: (_root, tips) => { refreshed = tips; } });
     check('refresh-carries-registration-identity', refreshed.get('feature')?.reg?.registeredAt === 'old', refreshed.get('feature'));
+    check('refresh-carries-registration-token', refreshed.get('feature')?.registrationId === old.registrationId, refreshed.get('feature'));
     writeOverlays(root, [{ ...old, sha: needed }], { env });
     addOverlay(root, { ref: 'feature' }, { env });
     check('reregistration-clears-inherited-tip', entries()[0].tipSha === undefined, entries()[0]);
@@ -235,12 +236,29 @@ export async function registrationEvidenceReplay() {
 
     const input = { ref: 'same', now: '2026-10-27T12:00:00Z' };
     const first = addOverlay(root, input, { env }).find((o) => o.ref === 'same');
-    const tips = new Map([['same', { sha: landed, reg: registrationIdentity(first) }]]);
+    const tips = new Map([['same', { sha: landed, reg: registrationIdentity(first), registrationId: first.registrationId }]]);
     const matching = persistTipShas(root, tips, { env });
     const second = addOverlay(root, input, { env }).find((o) => o.ref === 'same');
     check('same-metadata-reregistration-is-distinct', JSON.stringify(registrationIdentity(first)) !== JSON.stringify(registrationIdentity(second)), { first, second });
     const stale = persistTipShas(root, tips, { env });
     check('matching-only-tip-persistence', matching.written === 1 && stale.written === 0, { matching, stale });
+
+    for (const token of ['absent', undefined, null, '', 42]) {
+      const evidence = { sha: landed, reg: registrationIdentity(second) };
+      if (token !== 'absent') evidence.registrationId = token;
+      const before = readFileSync(overlayFilePath(root, env), 'utf8');
+      const unbound = persistTipShas(root, new Map([['same', evidence]]), { env });
+      check(`unusable-tip-token-${String(token)}`, unbound.written === 0
+        && readFileSync(overlayFilePath(root, env), 'utf8') === before, unbound);
+    }
+
+    const source = { ref: 'archived', registrationId: 'archived-registration' };
+    const carrier = { ref: 'carrier', registrationId: 'carrier-registration', retiredSources: [{ entry: source, sha: needed }] };
+    writeOverlays(root, [...entries(), carrier], { env });
+    const generationBeforeRestore = readOverlayState(root, { env }).generation;
+    reinstateOverlaySources(root, carrier.ref, { env, expectedOverlay: carrier });
+    check('source-restoration-advances-generation', readOverlayState(root, { env }).generation === generationBeforeRestore + 1
+      && entries().find(o => o.ref === source.ref)?.registrationId === source.registrationId, readOverlayState(root, { env }));
 
     const noEvidence = addOverlay(root, { ref: 'missing' }, { env }).find((o) => o.ref === 'missing');
     const adoptedFallback = await autoRetireOverlays({ root, env, overlays: [noEvidence], git,

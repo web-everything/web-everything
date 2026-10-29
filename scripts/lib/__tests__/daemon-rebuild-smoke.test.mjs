@@ -378,6 +378,25 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
 });
 
 describe('dispatch smoke registration CAS', () => {
+  it('every rebuild removal carries registration CAS or the explicit auto-rebase snapshot allowlist', () => {
+    const directory = join(process.cwd(), 'scripts/lib/daemon-rebuild');
+    const calls = readdirSync(directory).filter(name => name.endsWith('.mjs')).flatMap(name => {
+      const source = readFileSync(join(directory, name), 'utf8');
+      return [...source.matchAll(/\bremoveOverlay\([^;]+\);/g)].map(match => ({ name, call: match[0] }));
+    });
+    expect(calls.length).toBeGreaterThanOrEqual(4);
+    for (const { name, call } of calls) {
+      // Verified auto-rebase swaps use a complete saved oldOverlay identity (including registrationId)
+      // plus requireRef. Keep this sole existing exception explicit; new call sites must carry id CAS.
+      if (name === 'auto-rebase.mjs' && call.includes('removeOverlay(root, swap.old,')) {
+        expect(call).toContain('expectedOverlay: swap.oldOverlay');
+        expect(call).toContain('requireRef: swap.new');
+      } else {
+        expect(call, name).toContain('expectRegistrationId:');
+      }
+    }
+  });
+
   // Exercise the real smokeAndAdopt removal branch and list/event storage. Only Git and the two
   // smoke runners are injected: this fixture neither creates a repository nor launches a worker.
   it.each([

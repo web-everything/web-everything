@@ -235,6 +235,7 @@ export async function prepareRebuild({
     if (!mainOnly) return terminal({ moved: false, reason: 'overlay-state-corrupt' });
   }
   let overlaysBefore = overlayState.overlays;
+  let snapshotGeneration = overlayState.generation;
   if (!mainOnly && !overlayState.corrupt) {
     const migrated = migrateRegistrationIds(root, { env, adopted: state.adopted });
     if (migrated.adopted !== state.adopted) { state.adopted = migrated.adopted; writeState(); }
@@ -246,6 +247,7 @@ export async function prepareRebuild({
       return terminal({ moved: false, reason: 'overlay-registration-changed' });
     }
     overlaysBefore = migrated.list;
+    snapshotGeneration = migrated.generation;
   }
   const snap = new Map(overlaysBefore.map((o) => [o?.ref, o?.registrationId]));
   const ourRemoved = new Set();
@@ -261,7 +263,7 @@ export async function prepareRebuild({
       generation = 0;
     }
     const expected = new Map([...snap, ...ourRestored]);
-    return generation === fresh.generation && !fresh.corrupt && fresh.overlays.every((o) => o && expected.has(o.ref) && expected.get(o.ref) === o.registrationId)
+    return generation === snapshotGeneration && generation === fresh.generation && !fresh.corrupt && fresh.overlays.every((o) => o && expected.has(o.ref) && expected.get(o.ref) === o.registrationId)
       && [...expected.keys()].every((ref) => ourRemoved.has(ref) || fresh.overlays.some((o) => o?.ref === ref));
   };
   const registrationChanged = () => {
@@ -322,6 +324,7 @@ export async function prepareRebuild({
           if (!snapshotHolds()) throw new Error('registration changed; refusing removal');
           const removed = removeOverlay(r, ref, { ...options, expectRegistrationId: snap.get(ref) });
           if (removed.removed) {
+            snapshotGeneration += 1;
             ourRemoved.add(ref); snap.delete(ref);
             for (const restored of removed.reinstated ?? []) {
               ourRestored.set(restored, removed.list.find((o) => o.ref === restored)?.registrationId);
@@ -443,6 +446,7 @@ export async function prepareRebuild({
       const restored = [];
       for (const carrier of uncovered) {
         const recovery = reinstateOverlaySources(root, carrier.ref, { env, expectedOverlay: carrier });
+        if (recovery.reinstated.length) snapshotGeneration += 1;
         for (const ref of recovery.reinstated) {
           ourRestored.set(ref, recovery.list.find((o) => o.ref === ref)?.registrationId);
           if (!recoveredRefs.has(ref)) restored.push(ref);
@@ -582,12 +586,16 @@ export async function prepareRebuild({
     return terminal({ moved: false, reason: 'established-overlay-conflict', detail });
   }
   if (!snapshotHolds()) return registrationChanged();
-  refreshedTips = new Map([...refreshedTips].map(([ref, tip]) => [ref, { ...tip, registrationId: snap.get(ref) }]));
+  refreshedTips = new Map([...refreshedTips].map(([ref, tip]) => [ref, {
+    ...tip, registrationId: tip.registrationId ?? snap.get(ref) ?? ourRestored.get(ref),
+  }]));
   try { persistTipShas(root, refreshedTips, { env }); }
   catch (error) {
     alert('overlay-auto-retire-audit-failed', { failures: [{ ref: null, kind: 'tip-sha', error: String(error?.message || error) }] });
   }
+  if (!snapshotHolds()) return registrationChanged();
   for (const d of plan.decisions) {
+    if (!snapshotHolds()) return registrationChanged();
     if (d.pr != null && (d.action === 'apply' || d.action === 'remove') && !d.pinned) clearOverlayConflictWake(env, d.pr);
     if (d.action === 'remove') {
       try {
@@ -596,6 +604,7 @@ export async function prepareRebuild({
           env, why: d.reason, expectRegistrationId: snap.get(d.ref) ?? ourRestored.get(d.ref),
         });
         if (removed.removed) {
+          snapshotGeneration += 1;
           ourRemoved.add(d.ref); snap.delete(d.ref);
           for (const ref of removed.reinstated ?? []) ourRestored.set(ref, removed.list.find((o) => o.ref === ref)?.registrationId);
         }

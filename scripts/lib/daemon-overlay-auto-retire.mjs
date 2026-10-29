@@ -167,7 +167,9 @@ export async function autoRetireOverlays({
   }
   // Only a tip this run refreshed is evidence; a cached tracking ref (no refEvidence) never is.
   const tips = new Map(rows.filter((r) => refEvidence?.get(r.ref) === 'refreshed' && SHA.test(r.sha ?? '')
-    && !result.retired.includes(r)).map((r) => [r.ref, { sha: r.sha, reg: registrations.get(r.ref) }]));
+    && !result.retired.includes(r)).map((r) => [r.ref, {
+    sha: r.sha, reg: registrations.get(r.ref), registrationId: registrations.get(r.ref)?.registrationId,
+  }]));
   if (tips.size) {
     try { persistTipShas(root, tips, { env }); }
     catch (error) { result.auditFailures.push({ ref: null, kind: 'tip-sha', error: String(error?.message || error) }); }

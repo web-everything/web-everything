@@ -155,6 +155,11 @@ audit, post-removal audit, `appendDaemonEvent` (`overlay-retired`), and `persist
 tests use throwing spies and assert zero Git, audit, removal and persistence calls; shadow still classifies.
 Retirement and replacement swaps append archive snapshots even when a ref repeats. Withdrawal restores the
 latest archived registration of each ref and recovers older nested sources; test both swap branches.
+Registration tip persistence requires an explicit nonempty string `registrationId` as well as matching metadata.
+The retired-source preparation suite covers generation-only add/remove interleavings during fetch, planning and
+persistence; own removals/restorations advance the captured generation. Its injected runners write no Git state.
+Dispatch smoke's CAS table exercises matching, replaced and unusable tokens through `smokeAndAdopt` and checks
+registry/event bytes. Its removal-call inventory permits only the existing auto-rebase full-snapshot exception.
 The exported `registrationEvidenceReplay` in the existing `overlay-auto-retire-evidence` soak runs these
 send-back cases through real list storage with injected Git results. It can run without network or `.git`
 writes; it is a deterministic replay, not a claim about production daemon state. When collecting fix evidence,

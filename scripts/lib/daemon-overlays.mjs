@@ -169,13 +169,17 @@ function withListLock(root, env, fn) {
   }
 }
 
-/** The list to MUTATE — like {@link readOverlays}, but throws on a corrupt file so a write never replaces it. */
-function readOverlaysForWrite(root, env) {
+/** State to mutate: keep the generation and list from one read, refusing a corrupt file. */
+function readOverlayStateForWrite(root, env) {
   const state = readOverlayState(root, { env });
   if (state.corrupt) {
     throw new Error(`daemon-overlays: overlay state file ${overlayFilePath(root, env)} is corrupt — refusing to overwrite it; fix or remove it by hand`);
   }
-  return state.overlays;
+  return state;
+}
+
+function readOverlaysForWrite(root, env) {
+  return readOverlayStateForWrite(root, env).overlays;
 }
 
 /**
@@ -208,9 +212,9 @@ export function appliedRowFor(adopted, ref, registrationId) {
 export function migrateRegistrationIds(root, { env = process.env, adopted } = {}) {
   return withListLock(root, env, () => {
     const stamped = [];
-    const current = readOverlaysForWrite(root, env);
+    const { overlays: current, generation: capturedGeneration } = readOverlayStateForWrite(root, env);
     if (current.some((o) => !o || typeof o !== 'object' || Array.isArray(o) || typeof o.ref !== 'string' || !o.ref)) {
-      return { list: current, stamped: [], unprovable: [], adopted };
+      return { list: current, generation: capturedGeneration, stamped: [], unprovable: [], adopted };
     }
     const list = current.map((entry) => {
       if (!entry || typeof entry.ref !== 'string' || entry.registrationId) return entry;
@@ -233,8 +237,9 @@ export function migrateRegistrationIds(root, { env = process.env, adopted } = {}
       unprovable.push({ ref: row.ref });
       return row;
     });
-    if (stamped.length) writeOverlays(root, list, { env, generation: readOverlayState(root, { env }).generation + 1 });
-    return { list, stamped, unprovable, adopted: changed ? { ...adopted, applied } : adopted };
+    const generation = capturedGeneration + (stamped.length ? 1 : 0);
+    if (stamped.length) writeOverlays(root, list, { env, generation });
+    return { list, generation, stamped, unprovable, adopted: changed ? { ...adopted, applied } : adopted };
   });
 }
 
@@ -486,14 +491,15 @@ export function reinstateOverlaySources(root, ref, { env = process.env, expected
     if (back.length && skipped.length) appendOverlayEvent(root, { kind: 'reinstate-skipped', refs: skipped, from: ref }, { env });
     const restored = back.map((s) => (SHA_RE.test(s.sha ?? '') ? { ...s.entry, tipSha: s.sha } : s.entry));
     const next = list.slice(0, idx).concat(restored, list.slice(idx));
-    if (back.length) writeOverlays(root, next, { env });
+    if (back.length) writeOverlays(root, next, { env, generation: readOverlayState(root, { env }).generation + 1 });
     return { list: next, reinstated: back.map((s) => s.entry.ref) };
   });
 }
 
 /**
  * Record each refreshed overlay's remote tip as `tipSha` — retirement evidence once its branch is deleted.
- * Fresh read under the list lock; the identity captured at refresh must still match. Unbound, replaced and
+ * Fresh read under the list lock; an explicit nonempty registrationId and the identity captured at refresh
+ * must both match. Unbound, replaced and
  * vanished registrations are skipped. Rebuild caches are excluded from that identity, so cache writes commute.
  * @param {string} root
  * @param {Map<string,{sha:string,reg:object,registrationId?:string}>} tips ref → full sha and registration identity captured at refresh
@@ -508,7 +514,7 @@ export function persistTipShas(root, tips, { env = process.env } = {}) {
     for (let i = 0; i < list.length; i += 1) {
       const evidence = list[i] && tips.get(list[i].ref);
       const { sha, reg, registrationId } = evidence ?? {};
-      if (registrationId !== undefined && (!list[i].registrationId || list[i].registrationId !== registrationId)) continue;
+      if (typeof registrationId !== 'string' || !registrationId || list[i]?.registrationId !== registrationId) continue;
       if (!reg || !isDeepStrictEqual(registrationIdentity(list[i]), reg)
         || !SHA_RE.test(sha ?? '') || list[i].tipSha === sha) continue;
       list[i] = { ...list[i], tipSha: sha };

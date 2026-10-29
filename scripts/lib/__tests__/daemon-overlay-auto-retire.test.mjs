@@ -69,14 +69,14 @@ afterEach(() => rmSync(base, { recursive: true, force: true }));
 
 describe('real Git retirement evidence', () => {
   it('re-registration between refresh and persistence rejects stale retirement evidence', async () => {
-    const old = { ref: 'feature', sha: initial, tipSha: initial, registeredAt: 'old' };
+    const old = { ref: 'feature', sha: initial, tipSha: initial, registeredAt: 'old', registrationId: 'old-registration' };
     register([old]);
     track('feature', initial);
     let refreshedTips;
     await autoRetireOverlays({ root, env: { ...env, WE_DAEMON_OVERLAY_AUTO_RETIRE: 'shadow' },
       overlays: [old], git, refEvidence: new Map([['feature', 'refreshed']]),
       persistTipShas: (_root, tips) => { refreshedTips = tips; } });
-    expect(refreshedTips.get('feature')).toEqual({ sha: initial, reg: registrationIdentity(old) });
+    expect(refreshedTips.get('feature')).toEqual({ sha: initial, reg: registrationIdentity(old), registrationId: old.registrationId });
     branch('feature');
     const needed = commit('needed', 'unmerged replacement');
     register([{ ...old, sha: needed }]);
@@ -105,8 +105,8 @@ describe('real Git retirement evidence', () => {
   });
 
   it('persists matching registration tips and refuses unbound, replaced and vanished evidence', () => {
-    const entry = { ref: 'feature', sha: initial, registeredAt: 'old' };
-    const tips = new Map([['feature', { sha: initial, reg: registrationIdentity(entry) }]]);
+    const entry = { ref: 'feature', sha: initial, registeredAt: 'old', registrationId: 'feature-registration' };
+    const tips = new Map([['feature', { sha: initial, reg: registrationIdentity(entry), registrationId: entry.registrationId }]]);
     register([entry]);
     expect(persistTipShas(root, tips, { env })).toEqual({ written: 1 });
     expect(persistTipShas(root, tips, { env })).toEqual({ written: 0 });
@@ -539,10 +539,10 @@ describe('real Git retirement evidence', () => {
     const cherry = ok('cherry', 'origin/main', 'origin/feature').split('\n');
     expect(cherry.length).toBeGreaterThan(0);
     expect(cherry.every((line) => line.startsWith('- '))).toBe(true);
-    const result = await retire([{ ref: 'feature' }]);
+    const result = await retire([{ ref: 'feature', registrationId: 'feature-registration' }]);
     expect(result.retired).toEqual([]);
     expect(result.kept[0]).toMatchObject({ ref: 'feature', class: 'needed', reason: 'unmerged-content' });
-    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'feature', tipSha: ok('rev-parse', 'origin/feature') }]);
+    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'feature', registrationId: 'feature-registration', tipSha: ok('rev-parse', 'origin/feature') }]);
   });
 
   it('retires a contained overlay while its consolidated top remains, with both audit trails', async () => {
@@ -552,9 +552,9 @@ describe('real Git retirement evidence', () => {
     branch('top', lower);
     commit('top', 'top');
     track('top');
-    const result = await retire([{ ref: 'lower' }, { ref: 'top' }]);
+    const result = await retire([{ ref: 'lower' }, { ref: 'top', registrationId: 'top-registration' }]);
     expect(result.retired).toEqual([expect.objectContaining({ ref: 'lower', class: 'contained', sha: lower })]);
-    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'top', tipSha: ok('rev-parse', 'origin/top'),
+    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'top', registrationId: 'top-registration', tipSha: ok('rev-parse', 'origin/top'),
       retiredSources: [{ entry: { ref: 'lower' }, sha: lower }] }]);
     expect(audit()).toEqual([
       expect.objectContaining({ kind: 'retiring', by: 'auto-retire', ref: 'lower', sha: lower, container: 'top' }),
@@ -597,12 +597,12 @@ describe('real Git retirement evidence', () => {
     ok('revert', '--no-edit', 'HEAD');
     track('main');
     expect(ok('cherry', 'origin/main', 'origin/feature')).toBe(`- ${tip}`);
-    const overlays = [{ ref: 'feature' }];
+    const overlays = [{ ref: 'feature', registrationId: 'feature-registration' }];
     const result = await retire(overlays);
     expect(result.retired).toEqual([]);
     expect(result.wouldRetire).toEqual([]);
     expect(result.kept[0]).toMatchObject({ ref: 'feature', class: 'needed', reason: 'unmerged-content' });
-    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'feature', tipSha: tip }]);
+    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'feature', registrationId: 'feature-registration', tipSha: tip }]);
   });
 
   it('keeps still-needed and conflicting overlays', async () => {
@@ -667,7 +667,7 @@ describe('real Git retirement evidence', () => {
     for (const ref of refs) ok('merge', '--no-ff', '-m', `merge ${ref}`, ref);
     const top = ok('rev-parse', 'HEAD');
     track(topRef);
-    const overlays = [...sources.map(({ entry }) => entry), { ref: topRef }];
+    const overlays = [...sources.map(({ entry }) => entry), { ref: topRef, registrationId: 'top-registration' }];
     for (const overlay of overlays) {
       expect(classify([overlay])[0]).toMatchObject({ ref: overlay.ref, class: 'needed', reason: 'unmerged-content' });
     }
@@ -678,12 +678,12 @@ describe('real Git retirement evidence', () => {
         // The registered carrier exists before each source is removed; the same write preserves the source.
         const before = readOverlayState(r, { env }).overlays;
         expect(before).toContainEqual({ ref });
-        expect(before).toContainEqual({ ref: topRef, ...(moved.length ? { retiredSources: [...moved] } : {}) });
+        expect(before).toContainEqual({ ref: topRef, registrationId: 'top-registration', ...(moved.length ? { retiredSources: [...moved] } : {}) });
         const removed = removeOverlay(r, ref, opts);
         moved.push(sources.find(({ entry }) => entry.ref === ref));
         const after = readOverlayState(r, { env }).overlays;
         expect(after.some((entry) => entry.ref === ref)).toBe(false);
-        expect(after).toContainEqual({ ref: topRef, retiredSources: [...moved] });
+        expect(after).toContainEqual({ ref: topRef, registrationId: 'top-registration', retiredSources: [...moved] });
         return removed;
       },
     });
@@ -691,7 +691,7 @@ describe('real Git retirement evidence', () => {
       ref: entry.ref, sha, class: 'contained', container: topRef,
     })));
     expect(result.kept).toEqual([expect.objectContaining({ ref: topRef, sha: top, class: 'needed', reason: 'unmerged-content' })]);
-    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: topRef, tipSha: top, retiredSources: sources }]);
+    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: topRef, registrationId: 'top-registration', tipSha: top, retiredSources: sources }]);
 
     expect(removeOverlay(root, topRef, { env, why: 'pr-closed' }).reinstated).toEqual(refs);
     expect(readOverlayState(root, { env }).overlays).toEqual(sources.map(({ entry, sha }) => ({ ...entry, tipSha: sha })));
@@ -710,20 +710,20 @@ describe('real Git retirement evidence', () => {
   it('container withdrawal under the list mutex prevents contained removal', async () => {
     branch('lower'); commit('lower', 'lower'); track('lower');
     commit('top', 'top'); track('top');
-    const result = await retire([{ ref: 'lower' }, { ref: 'top' }], {
+    const result = await retire([{ ref: 'lower', registrationId: 'lower-registration' }, { ref: 'top' }], {
       removeOverlay: (r, ref, opts) => {
         removeOverlay(r, 'top', { env });
         return removeOverlay(r, ref, opts);
       },
     });
     expect(result.retired).toEqual([]);
-    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'lower', tipSha: ok('rev-parse', 'origin/lower') }]);
+    expect(readOverlayState(root, { env }).overlays).toEqual([{ ref: 'lower', registrationId: 'lower-registration', tipSha: ok('rev-parse', 'origin/lower') }]);
   });
 
   it('container re-registration with unrelated content preserves the contained source', async () => {
     branch('lower'); commit('lower', 'lower'); track('lower');
     const top = commit('top', 'top'); track('top');
-    const original = [{ ref: 'lower' }, { ref: 'top', sha: top, addedAt: 'original' }];
+    const original = [{ ref: 'lower', registrationId: 'lower-registration' }, { ref: 'top', sha: top, addedAt: 'original' }];
     const replacement = { ref: 'top', sha: initial, addedAt: 'replacement' };
     const result = await retire(original, {
       removeOverlay: (r, ref, opts) => {
