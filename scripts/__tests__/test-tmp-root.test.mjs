@@ -42,6 +42,13 @@ describe('run root lifecycle', () => {
     expect(existsSync(root)).toBe(true);
   });
 
+  it('uses a different parent dir per uid', () => {
+    const a = createRunTmpRoot({ baseTmp: base, uid: 1001 });
+    const b = createRunTmpRoot({ baseTmp: base, uid: 1002 });
+    expect(a.startsWith(join(base, 'we-vitest-1001'))).toBe(true);
+    expect(b.startsWith(join(base, 'we-vitest-1002'))).toBe(true);
+  });
+
   it('counts leftovers by prefix, then removes the root', () => {
     const root = createRunTmpRoot({ baseTmp: base });
     for (let i = 0; i < 3; i++) mkdtempSync(join(root, 'leaky-thing-'));
