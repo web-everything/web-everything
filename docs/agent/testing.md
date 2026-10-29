@@ -2787,13 +2787,20 @@ episode origins confer no launch priority.
 Confirmed send-back launches retain session evidence for at most 24 hours for heavy-command
 classification, without continuing to block launches. Both freshness settings resolve through
 `fixWaiting` in the policy cascade and name their sources in priority reasons.
-`heavyAdmission.priority.mode` controls queue ordering: P0 red-main repair, P1 send-back fixer,
-then normal P3 within each queue lane. A FULL P1 waiter does not block an ordinary short
+`heavyAdmission.priority.mode` controls queue ordering: P0 red-main repair, then P1 send-back
+fixers, canonical `fix-<n>`/`ci-heal-<n>` sessions and unblocking work (`unblock-` identity or
+`WE_HEAVY_UNBLOCK=1`), then normal P3. P1 competes across queue lanes for heavy slots;
+only short P1 waiters compete for short-only slots. A FULL P1 waiter does not block an ordinary short
 command from a free short-only slot. P1 keeps its existing slot eligibility, and running
 holders are never preempted. The broader send-back waiting/priority classification does
 not change reserved fix-cap eligibility: only `review:changes` receives that reservation.
 The focused suites are `fix-waiting-priority.test.mjs` and `heavy-send-back-priority.test.mjs`;
 run them through heavy admission when host capacity permits.
+Queue snapshots retain marker priority and the effective priority mode. Fix projections discount
+lower-priority waiters only with explicit `priorityMode: enforce` evidence; off, unknown and historical
+snapshots retain all backlog and report that conservative fallback. The named
+`heavy-p1-admission.test.mjs` regression uses real temporary slot locks and the production admission
+path to prove a fix takes the next released slot ahead of the build waiters its projection excludes.
 
 ## Fixer lane HEAD and lease probe
 

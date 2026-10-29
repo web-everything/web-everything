@@ -420,9 +420,11 @@ function hasLaneSplit(b) {
 
 /** Pure P1 view: only P0/P1 waiters are ahead. Held and pending work are never discounted.
  *  Compare the two classes locally to keep the VM-backed priority classifier out of this pure import graph.
- *  Unreadable rows or costs stay counted; historical markers without a class belong to the normal tier. */
+ *  Discounting requires explicit scheduler mode evidence. Unreadable rows or costs stay counted;
+ *  historical markers without a class belong to the normal tier. */
 export function waitersAheadOf(baseline, dispatchKind) {
-  if (!P1_DISPATCH_KINDS.includes(dispatchKind) || baseline?.bypassed || !Array.isArray(baseline?.waiting)) return baseline;
+  if (!P1_DISPATCH_KINDS.includes(dispatchKind) || baseline?.priorityMode !== 'enforce'
+    || baseline?.bypassed || !Array.isArray(baseline?.waiting)) return baseline;
   let excludedBehindCount = 0;
   let excludedBehindMinutes = 0;
   let heavyMinutes = 0;

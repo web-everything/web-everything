@@ -3,9 +3,9 @@
  * @description The red-main repair class of the heavy-admission queue (main-fix-queue-priority): which waiter is a
  *   red-main repair (P0) and so takes the next free slot ahead of every other waiter.
  *   P1 covers fixes and unblocking builds, marked by a purpose prefix `unblock-` OR env WE_HEAVY_UNBLOCK=1.
- *   The three tiers are P0 > P1 > P2; never preempt a running holder. The policy-cascade leaves
- *   heavyAdmission.priority.fixPatterns / unblockPatterns are wired in the follow-up (Part B) into
- *   heavy-admission.mjs. This module only supplies the P1 classifier; the P0 classifier remains independent.
+ *   The tiers are P0 > P1 > normal P3; never preempt a running holder. Heavy admission composes
+ *   this bounded P1 classifier after red-main/send-back classification under the shared priority mode.
+ *   The scheduler uses the default P1 families; custom P1 patterns remain a pure classifier option.
  *
  *   Kept OUT of `./heavy-queue-projection.mjs` on purpose. That module is imported by the read-only `heavy-queue`
  *   operation's declaring module, and `http-adapter.test.mjs` pins that such a module's whole static import graph

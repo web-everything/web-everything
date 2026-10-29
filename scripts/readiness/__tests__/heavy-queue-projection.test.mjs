@@ -345,6 +345,7 @@ describe('item 100 — `other` is split into real kinds; only a truly unknown co
 
 describe('waitersAheadOf — P0 > P1 > builds without preempting holders', () => {
   const baseline = () => ({
+    priorityMode: 'enforce',
     ...queueBacklog({
       held: [{ kind: 'FULL', priority: 'P3' }, { kind: 'selected', priority: 'P3' }],
       waiting: [
@@ -392,7 +393,7 @@ describe('waitersAheadOf — P0 > P1 > builds without preempting holders', () =>
   });
 
   it('closed path: non-object rows remain counted while valid lower-priority rows are removed', () => {
-    const b = { waiting: [null, 'unreadable', 42, { kind: 'selected', priority: 'P3', expectedMinutes: 3 }], waitingMinutes: 12, backlogMinutes: 12, shortBacklogMinutes: 12, heavyBacklogMinutes: 0, waitingHeavyCount: 0 };
+    const b = { priorityMode: 'enforce', waiting: [null, 'unreadable', 42, { kind: 'selected', priority: 'P3', expectedMinutes: 3 }], waitingMinutes: 12, backlogMinutes: 12, shortBacklogMinutes: 12, heavyBacklogMinutes: 0, waitingHeavyCount: 0 };
     expect(waitersAheadOf(b, 'fix')).toMatchObject({ waiting: [null, 'unreadable', 42], waitingMinutes: 9, backlogMinutes: 9, shortBacklogMinutes: 9, excludedBehindCount: 1, excludedBehindMinutes: 3 });
   });
 });
@@ -401,6 +402,7 @@ describe('P1 queue budget — cap 3 plus one fast slot', () => {
   it.each(['fix', 'ci-heal'])('%s retains held and pending backlog after excluding valid lower-priority waiters', (kind) => {
     const pending = [{ demandMinutes: 7 }];
     const b = {
+      priorityMode: 'enforce',
       ...queueBacklog({
         held: [{ kind: 'FULL', priority: 'P3' }, { kind: 'selected', priority: 'P3' }],
         waiting: [{ kind: 'FULL', priority: 'P3' }, { kind: 'selected', priority: 'P3' }],
@@ -438,6 +440,7 @@ describe('P1 queue budget — cap 3 plus one fast slot', () => {
     // The aggregate snapshot includes 40 minutes attributed to the unreadable row.
     // Its unknown cost must not erase that recorded demand or disable the cap.
     const b = {
+      priorityMode: 'enforce',
       waiting: [row, { kind: 'selected', priority: 'P3', expectedMinutes: 3 }],
       waitingMinutes: 43, backlogMinutes: 43, shortBacklogMinutes: 43,
       heavyBacklogMinutes: 0, heldHeavyCount: 0, waitingHeavyCount: 0,
@@ -458,6 +461,7 @@ describe('P1 queue budget — cap 3 plus one fast slot', () => {
   });
 
   const baseline = () => ({
+    priorityMode: 'enforce',
     ...queueBacklog({
       held: Array.from({ length: 3 }, () => ({ kind: 'FULL', priority: 'P3' })),
       waiting: Array.from({ length: 12 }, () => ({ kind: 'selected', priority: 'P3' })),
@@ -482,6 +486,7 @@ describe('P1 queue budget — cap 3 plus one fast slot', () => {
 
   it('never discounts a running lower-priority holder: its remaining work can still hold a fix', () => {
     const b = {
+      priorityMode: 'enforce',
       ...queueBacklog({ held: [{ kind: 'selected' }], waiting: [{ kind: 'selected', priority: 'P3' }], standardMinutes: { selected: 40 } }),
       slots: 1, maxWaitMinutes: 30, dispatchMinutes: { fix: 3.25 },
     };

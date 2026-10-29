@@ -158,7 +158,7 @@ import {
   queueBacklog, laneProjection, slotOrderFor, DEFAULT_QUEUE_MAX_WAIT_MINUTES, QUEUE_MAX_WAIT_ENV,
   QUEUE_ADMISSION_SWITCH_ENV, DEFAULT_ARRIVAL_WINDOW_MINUTES,
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
-import { classifyWaiterPriority, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES } from './heavy-repair-priority.mjs'; // red-main repair class — kept out of the projection (which the read-only `heavy-queue` op imports) because it needs `node:vm`
+import { classifyWaiterPriority, classifyP1, UNBLOCK_ENV, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES } from './heavy-repair-priority.mjs'; // priority classification stays outside the read-only projection because it needs `node:vm`
 export * from './heavy-queue-projection.mjs';
 export * from './heavy-repair-priority.mjs';
 
@@ -1111,12 +1111,12 @@ export function isDeadOwnerWaiter(marker, {
  * @param {{lockRoot:string, owner:string, nowMs:number, ttlMs?:number, pidLiveness?:(pid:number)=>('dead'|'alive'|'unknown'), host?:string}} o
  * @returns {boolean}
  */
-export function isOldestLiveWaiter({ lockRoot, owner, nowMs, ttlMs = WAITING_TTL_MINUTES * 60_000, kind = undefined, priorityMode = 'enforce', ...seams }) {
+export function isOldestLiveWaiter({ lockRoot, owner, nowMs, ttlMs = WAITING_TTL_MINUTES * 60_000, kind = undefined, priorityMode = 'enforce', slot, cap, rankableWaiters, ...seams }) {
   // Card xkyw1x4 — THE FAST LANE. With a `kind`, rank only against waiters in the SAME queue lane: a short job is
   // never behind a full-suite waiter, and first-come-first-served (#2692) still holds inside each lane. A marker
   // with no `kind` (written by older code) ranks in the slow lane. Without a `kind`: one global queue, as before.
   const lane = kind === undefined ? null : queueLaneOf(normalizeKind(kind));
-  const rankable = listWaiting(lockRoot).filter((m) => isRankableWaiter(m, { nowMs, ttlMs, ...seams }));
+  const rankable = rankableWaiters ?? listWaiting(lockRoot).filter((m) => isRankableWaiter(m, { nowMs, ttlMs, ...seams }));
   // main-fix-queue-priority — a red-main repair (P0) may take any slot, so it ranks in ONE queue across both lanes,
   // ahead of every other waiter; FCFS still orders the P0 waiters among themselves. While a live P0 waits, nobody
   // else attempts. `priorityMode: 'off'` ignores the markers' class (today's FCFS).
@@ -1125,11 +1125,13 @@ export function isOldestLiveWaiter({ lockRoot, owner, nowMs, ttlMs = WAITING_TTL
     const self = rankable.find((m) => m.owner === owner);
     if (self && waiterPriorityClass(self) === 'P0') return oldestOwner(p0) === owner;
     if (p0.some((m) => m.owner !== owner)) return false;
-    // P1 yields to P0 and precedes P3 within its own queue lane. A FULL P1 cannot take
-    // a short-only slot, so it must not prevent short waiters from using that capacity.
-    const sendBacks = rankable.filter(m => waiterPriorityClass(m) === 'P1'
-      && (lane === null || queueLaneOf(normalizeKind(m.kind)) === lane));
-    if (sendBacks.length) return oldestOwner(sendBacks) === owner;
+    // Rank P1 against everyone eligible for this slot, across queue lanes. FULL P1
+    // cannot consume a short-only slot. Callers without a slot retain lane ranking.
+    const slotKnown = Number.isInteger(slot) && Number.isInteger(cap);
+    const p1 = rankable.filter(m => waiterPriorityClass(m) === 'P1'
+      && (slotKnown ? slot < cap || queueLaneOf(normalizeKind(m.kind)) === 'fast'
+        : lane === null || queueLaneOf(normalizeKind(m.kind)) === lane));
+    if (p1.length) return oldestOwner(p1) === owner;
   }
   const live = rankable.filter((m) => lane === null || queueLaneOf(normalizeKind(m.kind)) === lane);
   if (live.length === 0) return true;
@@ -1222,11 +1224,17 @@ export async function acquireSlotBlocking({
   const prioritySrc = `priority.mode=${priority.mode} (${policy.sources?.['priority.mode'] ?? 'standard'})`;
   let waiterLease = null;
   try { const leaseRepo = repo ?? repoOfOwner(owner); if (leaseRepo) waiterLease = (seams.readLease || readLaneLease)(leaseRepo); } catch { /* best-effort */ }
-  const cls = classifyWaiterPriority({
+  const waiterIdentity = {
     purpose: waiterLease?.purpose ?? null, session: waiterLease?.session ?? null, holder: waiterLease?.holder ?? null,
     envSession: clipIdentity(env?.[HOLD_SESSION_ENV]),
-  }, priority, { sendBackFixes: priority.mode === 'enforce'
+    unblockEnv: env?.[UNBLOCK_ENV] === '1',
+  };
+  const repairClass = classifyWaiterPriority(waiterIdentity, priority, { sendBackFixes: priority.mode === 'enforce'
     ? (seams.readSendBackFixes ?? readSendBackFixPriority)({ env, nowMs: startedAt, waitingOnly: false }) : [] });
+  // Preserve P0 and send-back evidence, then compose the bounded generic P1 classifier.
+  const p1 = repairClass.class === 'P3'
+    ? classifyP1({ ...waiterIdentity, envSession: env?.[HOLD_SESSION_ENV] }, priority) : null;
+  const cls = p1?.class === 'P1' ? p1 : repairClass;
   if (cls.class === 'P1') log(`heavy-command admission: ${cls.reason} — class P1, ahead of normal waiters, below red-main repair [${prioritySrc}]\n`);
   if (cls.class === 'P0') {
     log(`heavy-command admission: red-main repair — class P0 (${cls.reason}; matched ${cls.matched.field}=${cls.matched.value} by /${cls.matched.pattern}/) ranks ahead of every other waiter and may take any free slot, heavy or fast [${prioritySrc}]\n`);
@@ -1311,17 +1319,21 @@ export async function acquireSlotBlocking({
       }
       const fastSlots = resolveEffectiveFastSlots({ policy: policy.settings, waiting: listWaiting(lockRoot), snapshot, nowMs: attempt });
       const slotOrder = slotOrderFor(jobKind, cap, fastSlots, cls.class);
+      // Read and probe each marker once per attempt, even when the configured slot span is large.
+      const rankableWaiters = listWaiting(lockRoot).filter(m => isRankableWaiter(m, { nowMs: attempt, ...seams }));
+      const eligibleSlots = slotOrder.filter(slot => isOldestLiveWaiter({ lockRoot, owner, nowMs: attempt,
+        kind: jobKind, priorityMode: priority.mode, slot, cap, rankableWaiters, ...seams }));
       const atCeiling = !ceilingChecked && attempt - startedAt >= ceilingMs;
       // Fairness holds at the ceiling too: only the oldest live waiter of its lane tries (a dead or lease-expired
       // holder is reclaimed by that attempt, so the ceiling never needs an unranked grab that cuts the queue).
-      if (isOldestLiveWaiter({ lockRoot, owner, nowMs: attempt, kind: jobKind, priorityMode: priority.mode, ...seams })) {
+      if (eligibleSlots.length) {
         const nowIso = new Date(attempt).toISOString();
         // `meta` carries the kind + acquire time so the release can record the hold duration by kind.
         // Card xmh9mtr — WHO holds it is fixed here, at acquire (env first, then the lane lease as it is NOW);
         // reading it at release mis-attributes a lane whose lease was reaped or re-leased meanwhile.
         const identity = resolveHoldIdentity({ env, repo: repo ?? repoOfOwner(owner), readLease: seams.readLease });
         const meta = { kind: jobKind, acquiredAt: nowIso, lane: lane ?? null, ...(command ? { command: String(command).slice(0, 200) } : {}), ...(holder ? { holder } : {}), ...identity, ...(cls.class !== 'P3' ? { priority: cls.class } : {}) };
-        const r = tryAcquireSlot({ lockRoot, cap, owner, nowMs: attempt, nowIso, pid, leaseMinutes, meta, slots: slotOrder });
+        const r = tryAcquireSlot({ lockRoot, cap, owner, nowMs: attempt, nowIso, pid, leaseMinutes, meta, slots: eligibleSlots });
         if (r.ok) {
           if (cls.class === 'P0') log(`heavy-command admission: red-main repair admitted — class P0, slot ${r.slot}, after ${Math.round((attempt - startedAt) / 1000)}s [${prioritySrc}]\n`);
           return { ok: true, slot: r.slot, timedOut: false, waitedMs: attempt - startedAt };
@@ -1530,7 +1542,8 @@ export function resolveQueueBaseline({
   const maxWaitMinutes = resolveQueueMaxWaitMinutes(env);
   const settings = loadAdmissionPolicy({ env, checkoutRoot }).settings;
   const fastSlots = settings.fastSlots;
-  const base = { slots: cap + fastSlots, heavySlots: cap, fastSlots, maxWaitMinutes, arrivalWindowMinutes, observedAt: new Date(nowMs).toISOString() };
+  const base = { slots: cap + fastSlots, heavySlots: cap, fastSlots, priorityMode: settings.priority.mode,
+    maxWaitMinutes, arrivalWindowMinutes, observedAt: new Date(nowMs).toISOString() };
   if (isQueueAdmissionOff(env)) return { ...base, bypassed: 'off' };
   if (/^(?:true|1)$/i.test(String(env?.CI || ''))) return { ...base, bypassed: 'ci' };
 
@@ -1548,7 +1561,8 @@ export function resolveQueueBaseline({
   });
   const waiting = listWaiting(lockRoot)
     .filter((m) => isLiveWaiter(m, { nowMs }))
-    .map((m) => ({ kind: normalizeKind(m.kind), repo: waiterRepo(m), lane: m.lane ?? null, requestedAt: m.requestedAt }));
+    .map((m) => ({ kind: normalizeKind(m.kind), repo: waiterRepo(m), lane: m.lane ?? null,
+      requestedAt: m.requestedAt, priority: waiterPriorityClass(m) }));
 
   const busyRepos = new Set([...held.map((h) => h.repo), ...waiting.map((w) => w.repo)].filter(Boolean));
   const windowMs = arrivalWindowMinutes * 60_000;

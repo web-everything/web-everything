@@ -240,6 +240,7 @@ describe('heavyQueueOperation — the declared shape', () => {
 
 describe('assessQueueAdmission — fixes count only waiters ahead', () => {
   const baseline = () => ({
+    priorityMode: 'enforce',
     slots: 4, heavySlots: 3, fastSlots: 1, maxWaitMinutes: 30,
     held: Array.from({ length: 3 }, () => ({ kind: 'FULL', priority: 'P3', remainingMinutes: 18 })),
     waiting: Array.from({ length: 12 }, () => ({ kind: 'selected', priority: 'P3', expectedMinutes: 3 })),
