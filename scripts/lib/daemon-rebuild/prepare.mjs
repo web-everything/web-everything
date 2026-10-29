@@ -2,11 +2,11 @@
  * Split out of daemon-rebuild.mjs (move-only).
  */
 
-import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
+import { makeGit, verifyRev, FULL_SHA_RE, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
 import {
   alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, readReadyCandidate,
 } from './state.mjs';
-import { mkdirSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
+import { mkdirSync, appendFileSync, statSync, unlinkSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
   READY_MAX_AGE_ENV, DEFAULT_READY_MAX_AGE_MS, claimBuildLease, buildLeaseIsLive,
@@ -20,10 +20,14 @@ import {
   pruneLandedBacklogSidecars,
 } from './local-state.mjs';
 import {
-  readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode, persistStackBases,
+  readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode,
+  persistStackBases, persistTipShas, reinstateOverlaySources, migrateRegistrationIds, appliedRowFor,
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
-import { planRebuild } from './plan.mjs';
+import { planRebuild, pinnedStatus, PINNED_OVERLAY_GONE_MESSAGE } from './plan.mjs';
+import { cloneRuntimeEntries } from '../daemon-clone-entries.mjs';
+import { resolveClosureScopeMode } from './skip-unrelated.mjs';
+import { autoRetireOverlays } from '../daemon-overlay-auto-retire.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
 import { repairCloneRefs, holdsCloneWriteLock } from '../lane-repair.mjs';
@@ -39,7 +43,7 @@ import {
  * smoke a candidate — see {@link rebuildClone}).
  */
 export async function prepareRebuild({
-  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase,
+  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, entries = [], prBaseChain, prForcePushes, autoRebase = realAutoRebase,
 }) {
   // Tests reaching the hold must opt in before launching a detached repair or cleaning up swaps.
   if (process.env.VITEST === 'true' && env?.WE_DAEMON_AUTO_REBASE === undefined) {
@@ -230,7 +234,42 @@ export async function prepareRebuild({
     alert('overlay-state-corrupt', { file: overlayFilePath(root, env) });
     if (!mainOnly) return terminal({ moved: false, reason: 'overlay-state-corrupt' });
   }
-  const overlaysBefore = overlayState.overlays;
+  let overlaysBefore = overlayState.overlays;
+  let snapshotGeneration = overlayState.generation;
+  if (!mainOnly && !overlayState.corrupt) {
+    const migrated = migrateRegistrationIds(root, { env, adopted: state.adopted });
+    if (migrated.adopted !== state.adopted) { state.adopted = migrated.adopted; writeState(); }
+    for (const detail of migrated.unprovable) alert('overlay-registration-unprovable', detail);
+    // A registration already identified by the first read cannot be replaced during migration.
+    if (overlayState.overlays.length !== migrated.list.length || overlayState.overlays.some((o) => o?.registrationId
+      && !migrated.list.some((m) => m?.ref === o.ref && m.registrationId === o.registrationId))) {
+      alert('overlay-registration-changed', {});
+      return terminal({ moved: false, reason: 'overlay-registration-changed' });
+    }
+    overlaysBefore = migrated.list;
+    snapshotGeneration = migrated.generation;
+  }
+  const snap = new Map(overlaysBefore.map((o) => [o?.ref, o?.registrationId]));
+  const ourRemoved = new Set();
+  const ourRestored = new Map();
+  const snapshotHolds = () => {
+    if (mainOnly) return true;
+    const fresh = readOverlayState(root, { env });
+    // Check the generation again after reading: a registration writer may have run during the read.
+    let generation;
+    try { generation = JSON.parse(readFileSync(overlayFilePath(root, env), 'utf8')).generation ?? 0; }
+    catch (error) {
+      if (error.code !== 'ENOENT' || fresh.clone !== null || fresh.overlays.length) return false;
+      generation = 0;
+    }
+    const expected = new Map([...snap, ...ourRestored]);
+    return generation === snapshotGeneration && generation === fresh.generation && !fresh.corrupt && fresh.overlays.every((o) => o && expected.has(o.ref) && expected.get(o.ref) === o.registrationId)
+      && [...expected.keys()].every((ref) => ourRemoved.has(ref) || fresh.overlays.some((o) => o?.ref === ref));
+  };
+  const registrationChanged = () => {
+    alert('overlay-registration-changed', {});
+    return terminal({ moved: false, reason: 'overlay-registration-changed' });
+  };
   const edgeResolve = env[OVERLAY_EDGE_RESOLVE_ENV] !== '0';
   // Heal dangling remote-tracking refs (and a clone that is itself broken) BEFORE the fetch: one such ref makes
   // `fetch --prune` reject the whole batch. Daemon clones are never acquired through lane-pool, so this is their only heal.
@@ -264,6 +303,81 @@ export async function prepareRebuild({
   for (const ref of fetchResult.goneRefs) alert('overlay-ref-gone-on-fetch', { ref });
 
   const fetchedMainSha = verifyRev(git, 'origin/main^{commit}');
+  // Per-ref confirmation allows recorded-SHA retirement for deleted branches without trusting failed fetches
+  // or names the fetch layer skipped. One unavailable ref cannot block retirement of independently verified ones.
+  // Sources a retirement put back this tick were never fetched by it: they wait for the next tick's fetch
+  // instead of raising unavailable alerts or a pinned hold (their container's content is already in main).
+  const reinstatedNow = new Set();
+  let refreshedTips = new Map();
+  if (!snapshotHolds()) return registrationChanged();
+  if (!mainOnly && !overlayState.corrupt && fetchedMainSha) {
+    try {
+      // The adopted build's applied tips are evidence for a deleted branch registered before `tipSha` was
+      // recorded. Edge-resolved entries applied a resolution commit, not the overlay's own tip, so they are skipped.
+      const recordedShas = new Map((state.adopted?.head === prevHead ? state.adopted.applied ?? [] : [])
+        .filter((a) => appliedRowFor(state.adopted, a?.ref, snap.get(a?.ref)) === a && a.sha && !a.resolvedVia).map((a) => [a.ref, a.sha]));
+      const retirementInputs = overlaysBefore.map((o) => recordedShas.has(o.ref) && !o.tipSha && !o.sha && !o.headSha
+        ? { ...o, tipSha: recordedShas.get(o.ref) } : o);
+      const retired = await autoRetireOverlays({ root, env, overlays: retirementInputs, git, mainSha: fetchedMainSha,
+        refEvidence: fetchResult.refEvidence, recordedShas, now, appendOverlayEvent,
+        removeOverlay: (r, ref, options) => {
+          if (!snapshotHolds()) throw new Error('registration changed; refusing removal');
+          const removed = removeOverlay(r, ref, { ...options, expectRegistrationId: snap.get(ref) });
+          if (removed.removed) {
+            snapshotGeneration += 1;
+            ourRemoved.add(ref); snap.delete(ref);
+            for (const restored of removed.reinstated ?? []) {
+              ourRestored.set(restored, removed.list.find((o) => o.ref === restored)?.registrationId);
+            }
+          }
+          return removed;
+        },
+        // Existing archives must survive until the proposed build proves it carries their sources.
+        protectedRefs: new Set([...realAutoRebase.pendingSwapRefs({ root, env }),
+          ...overlaysBefore.filter((o) => o.retiredSources?.length).map((o) => o.ref)]),
+        // A refused plan must preserve the registered tips as well as the running tree. Keep this tick's
+        // fresh {sha, reg} evidence in memory until both pinned and established-content checks accept the plan.
+        // Preserve the identity captured before classification; never rebind it to a later same-ref registration.
+        persistTipShas: (_root, tips) => { refreshedTips = tips; } });
+      if (retired.auditFailures.length) alert('overlay-auto-retire-audit-failed', { failures: retired.auditFailures });
+      for (const ref of retired.reinstated) reinstatedNow.add(ref);
+      if (retired.retired.length) {
+        // Health monitoring consumes the existing removal alert to clear earlier conflict-drop warnings.
+        for (const row of retired.retired) {
+          alert('overlay-auto-dropped', { ref: row.ref, reason: row.class === 'landed' ? 'in-main' : row.reason });
+        }
+        const fresh = readOverlayState(root, { env });
+        if (!fresh.corrupt) overlaysBefore = fresh.overlays;
+      }
+    } catch (error) { alert('overlay-auto-retire-failed', { error: String(error?.message || error) }); }
+  }
+  if (!snapshotHolds()) return registrationChanged();
+  // Preserve unavailable registrations without building from cached tips. Unpinned overlays may be skipped,
+  // but an unavailable pin must use the normal refusal/last-good hold path before any new build is adopted.
+  let overlaysForPlan = overlaysBefore.filter((o) => fetchResult.refEvidence.get(o?.ref) === 'refreshed');
+  const unverified = overlaysBefore.filter((o) => fetchResult.refEvidence.get(o?.ref) !== 'refreshed' && !reinstatedNow.has(o?.ref));
+  let unavailablePinned = null;
+  if (!mainOnly) {
+    for (const raw of unverified) {
+      if (!snapshotHolds()) return registrationChanged();
+      // Fetch cleanup may have deleted the tracking ref. The last adopted inputs still identify the
+      // mechanism this clone runs; use them only to refuse a loss, never as fresh build/retirement inputs.
+      const adopted = state.adopted?.head === prevHead
+        ? appliedRowFor(state.adopted, raw.ref, snap.get(raw.ref)) : null;
+      const pin = pinnedStatus(git, raw, state.adopted?.mainSha ?? fetchedMainSha, adopted?.sha);
+      if (!pin.pinned) continue;
+      unavailablePinned = {
+        ok: false, reason: 'pinned-overlay-unavailable',
+        detail: { ref: raw.ref, pr: raw.pr ?? null, sha: adopted?.sha ?? null,
+          dropReason: 'ref-unavailable', pinnedBy: pin.why, message: PINNED_OVERLAY_GONE_MESSAGE },
+      };
+      break;
+    }
+  }
+  if (!mainOnly && unverified.length && !unavailablePinned) {
+    const detail = { refs: unverified.map((o) => o?.ref), message: 'Overlay tips unavailable; preserving registrations and skipping these overlays for this rebuild. Retrying next tick; restore or re-register deleted branches from their recorded SHA.' };
+    alert('overlay-fetch-unverifiable', detail);
+  }
   pruneLandedBacklogSidecars({ git, root, paths: unsafe.untracked, mainSha: fetchedMainSha, alert });
   const remaining = collectUntrackedPaths(git);
   if (remaining === null) {
@@ -277,12 +391,96 @@ export async function prepareRebuild({
   // Held item 212 — stacked overlay PRs apply as stacks (only their tops) unless `overlay.stackMode` says independent.
   // The PR base chains come from gh, else from each entry's recorded `stackBases`, else ancestry alone.
   const stack = resolveOverlayStackMode(env);
-  const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysBefore, env });
-  const plan = await planRebuild({
-    git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, edgeResolve,
-    stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
-    prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
-  });
+  const closureScopeMode = resolveClosureScopeMode(env).mode;
+  const runtimeEntries = () => cloneRuntimeEntries({ root, entries, env });
+  let chainOf;
+  let plan;
+  const recoveredRefs = new Set();
+  // A carrier can be rewritten, closed, missing or conflict-skipped. Validate against the actual candidate,
+  // not merely a registered ref. Each retry adds a previously absent source; no-progress refuses the build.
+  for (;;) {
+    chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysForPlan, env });
+    plan = unavailablePinned ?? await planRebuild({
+      git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysForPlan, prState, mainOnly, edgeResolve,
+      entries: runtimeEntries, env, closureScopeMode,
+      stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
+      prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
+    });
+    if (!plan.ok || mainOnly) break;
+    const uncovered = [];
+    try {
+      const covered = new Map();
+      const carries = (sha) => {
+        if (!FULL_SHA_RE.test(sha ?? '') || !FULL_SHA_RE.test(plan.finalSha ?? '')) throw new Error('invalid archived commit');
+        if (covered.has(sha)) return covered.get(sha);
+        // A restored source may have advanced beyond its archived SHA. Prove the archive is in the
+        // proposed build by ancestry; requiring equality with the live tip would hold recovery forever.
+        const ancestor = git(['merge-base', '--is-ancestor', sha, plan.finalSha]);
+        if (ancestor.error || ![0, 1].includes(ancestor.status)) throw new Error('archive ancestry unavailable');
+        let present = ancestor.status === 0;
+        if (!present) {
+          // Squash-landed/rebased content is safe only with whole-tree equivalence, as in retirement.
+          const merged = git(['merge-tree', '--write-tree', '--no-messages', plan.finalSha, sha]);
+          if (merged.error || ![0, 1].includes(merged.status)) throw new Error('archive content unavailable');
+          if (merged.status === 0) {
+            const tree = verifyRev(git, `${plan.finalSha}^{tree}`);
+            const mergedTree = String(merged.stdout ?? '').split('\n')[0].trim();
+            if (!FULL_SHA_RE.test(tree ?? '') || !FULL_SHA_RE.test(mergedTree)) throw new Error('archive tree unavailable');
+            present = tree === mergedTree;
+          }
+        }
+        covered.set(sha, present);
+        return present;
+      };
+      for (const carrier of overlaysBefore) {
+        const pending = [...(carrier.retiredSources ?? [])];
+        let missing = false;
+        while (pending.length) {
+          const source = pending.pop();
+          if (!carries(source?.sha)) missing = true;
+          pending.push(...(source.entry?.retiredSources ?? []));
+        }
+        if (missing) uncovered.push(carrier);
+      }
+      if (!uncovered.length) break;
+      const restored = [];
+      for (const carrier of uncovered) {
+        const recovery = reinstateOverlaySources(root, carrier.ref, { env, expectedOverlay: carrier });
+        if (recovery.reinstated.length) snapshotGeneration += 1;
+        for (const ref of recovery.reinstated) {
+          ourRestored.set(ref, recovery.list.find((o) => o.ref === ref)?.registrationId);
+          if (!recoveredRefs.has(ref)) restored.push(ref);
+          recoveredRefs.add(ref);
+        }
+        overlaysBefore = recovery.list;
+      }
+      if (!restored.length) {
+        alert('overlay-source-unavailable', { refs: uncovered.map((o) => o.ref),
+          message: 'Archived content is absent from the proposed build; restore its source branch or land it on main.' });
+        return terminal({ moved: false, reason: 'overlay-source-unavailable' });
+      }
+      const required = new Set([...restored, ...overlaysForPlan.map((o) => o.ref)]);
+      const refreshed = fetchMainAndOverlays({ git, overlays: overlaysBefore, edgeResolve });
+      if (!refreshed.ok || [...required].some((ref) => refreshed.refEvidence.get(ref) !== 'refreshed')) {
+        alert('overlay-source-unavailable', { refs: uncovered.map((o) => o.ref), message: 'Restored sources could not be refreshed; retrying next tick.' });
+        return terminal({ moved: false, reason: 'overlay-source-unavailable' });
+      }
+      // Re-fetch can advance any tip. Never reuse deferred retirement evidence across the recovery
+      // plan; its registration snapshot predates reinstatement. Previously available pins must also
+      // stay available; unrelated already-unavailable registrations remain excluded as before.
+      refreshedTips = new Map();
+      for (const [ref, evidence] of refreshed.refEvidence) fetchResult.refEvidence.set(ref, evidence);
+      overlaysForPlan = overlaysBefore.filter((o) => fetchResult.refEvidence.get(o.ref) === 'refreshed');
+    } catch (error) {
+      alert('overlay-source-unverifiable', { error: String(error?.message ?? error) });
+      return terminal({ moved: false, reason: 'overlay-source-unverifiable' });
+    }
+  }
+  if (!snapshotHolds()) return registrationChanged();
+  // Carry the captured ids through normal adoption too; adopt.mjs consumes these applied rows unchanged.
+  if (plan.applied) plan.applied = plan.applied.map((row) => ({
+    ...row, registrationId: row.registrationId ?? snap.get(row.ref) ?? ourRestored.get(row.ref),
+  }));
   // The chains gh answered completely are written back onto the entries (only when they changed), so a rebuild that
   // cannot reach gh later still knows the stacks. Best effort: a busy or unwritable list never fails the rebuild.
   // A chain only names a stack's members; setting a base aside still needs hard evidence it moved (planOverlayStacks).
@@ -370,6 +568,7 @@ export async function prepareRebuild({
       try { detail.autoRebase = { ...await autoRebase.kickAutoRebase({ root, env, lost }), source: setting.source }; }
       catch { detail.autoRebase = { started: [], skipped: lost.map(l => l.ref), source: setting.source }; }
     }
+    if (!snapshotHolds()) return registrationChanged();
     alert('established-overlay-hold', detail);
     if (state.adopted?.head && state.adopted.head === prevHead) {
       state.held = {
@@ -386,10 +585,34 @@ export async function prepareRebuild({
     }
     return terminal({ moved: false, reason: 'established-overlay-conflict', detail });
   }
+  if (!snapshotHolds()) return registrationChanged();
+  refreshedTips = new Map([...refreshedTips].map(([ref, tip]) => [ref, {
+    ...tip, registrationId: tip.registrationId ?? snap.get(ref) ?? ourRestored.get(ref),
+  }]));
+  try { persistTipShas(root, refreshedTips, { env }); }
+  catch (error) {
+    alert('overlay-auto-retire-audit-failed', { failures: [{ ref: null, kind: 'tip-sha', error: String(error?.message || error) }] });
+  }
+  if (!snapshotHolds()) return registrationChanged();
   for (const d of plan.decisions) {
+    if (!snapshotHolds()) return registrationChanged();
     if (d.pr != null && (d.action === 'apply' || d.action === 'remove') && !d.pinned) clearOverlayConflictWake(env, d.pr);
     if (d.action === 'remove') {
-      removeOverlay(root, d.ref, { env, why: d.reason });
+      try {
+        // A source this tick reinstated is bound to the id we restored; with neither, removeOverlay refuses.
+        const removed = removeOverlay(root, d.ref, {
+          env, why: d.reason, expectRegistrationId: snap.get(d.ref) ?? ourRestored.get(d.ref),
+        });
+        if (removed.removed) {
+          snapshotGeneration += 1;
+          ourRemoved.add(d.ref); snap.delete(d.ref);
+          for (const ref of removed.reinstated ?? []) ourRestored.set(ref, removed.list.find((o) => o.ref === ref)?.registrationId);
+        }
+      } catch (error) {
+        if (!/registration changed/.test(String(error?.message))) throw error;
+        alert('overlay-registration-changed', {});
+        continue;
+      }
       appendOverlayEvent(root, { kind: 'auto-dropped', ref: d.ref, pr: d.pr, reason: d.reason }, { env });
       alert('overlay-auto-dropped', { ref: d.ref, reason: d.reason });
     } else if (d.action === 'drop') {
@@ -421,7 +644,8 @@ export async function prepareRebuild({
   if (plan.upToDate) {
     if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
       state.adopted = {
-        head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
+        head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha,
+        applied: plan.applied.map((row) => ({ ...row, registrationId: row.registrationId ?? snap.get(row.ref) })), at: nowIso(),
       };
       state.held = null; // x5wbsbc — current again: no longer held on a last-good build
       writeState();
@@ -439,7 +663,8 @@ export async function prepareRebuild({
     if (ready) {
       // Still wanted = registered AFTER this tick's own list edits (a same-tick `pr-closed`/`ref-gone` removal is
       // NOT wanted), plus overlays that left because main now has them. A mainOnly rebuild wants no overlay.
-      const registeredRefs = new Set((overlaysBefore || []).map((o) => o?.ref));
+      // A saved candidate cannot restore a cached tip that this tick could not refresh.
+      const registeredRefs = new Set(overlaysForPlan.map((o) => o?.ref));
       for (const d of plan.decisions) if (d.action === 'remove') registeredRefs.delete(d.ref);
       const wantedRefs = new Set(mainOnly ? [] : registeredRefs);
       for (const d of plan.decisions) {
@@ -453,7 +678,7 @@ export async function prepareRebuild({
         treeOf: (sha) => verifyRev(git, `${sha}^{tree}`),
         stillWanted: (ref) => wantedRefs.has(ref),
         verifyBuilt: (adopt) => readyBuildVerified({
-          git, adopt, mainTip: plan.mainSha, prevHead,
+          git, adopt, mainTip: plan.mainSha, prevHead, entries: runtimeEntries, env,
           approvedEdgeShaFor: (ref) => recordedEdgeSha((overlaysBefore || []).find((o) => o?.ref === ref)),
         }),
         overlayTip: (ref) => verifyRev(git, `refs/remotes/origin/${ref}^{commit}`),
@@ -575,6 +800,7 @@ export async function prepareRebuild({
   // PR #2731 review — single flight: phase 2 runs unlocked, so without this a sibling daemon sharing the clone
   // could build + smoke the same candidate at the same time. Claimed HERE, under the write lock, so exactly one
   // caller wins; the loser returns at once and its next tick finds the winner's result.
+  if (!snapshotHolds()) return registrationChanged();
   const lease = claimBuildLease({
     state, plan, root, run, env: stEnv, nowMs: nowMs(),
   });
