@@ -3339,6 +3339,9 @@ export function planReconcile({
       }
       if (pr.timeoutRetry && !pr.timeoutRetry.eligible && !partialFailureInventory) refusals.push({ kind: 'timeout-retry-ineligible', prNumber,
         why: `PR #${prNumber}: ${pr.timeoutRetry.reason}` });
+      // Known ineligibility falls through to the shared heal budget; unknown evidence and incomplete-inventory
+      // recovery keep their own guards above. Tag the heal and surface its reason only when it is dispatched.
+      const timeoutRetryFallback = pr.timeoutRetry?.eligible === false && !pr.timeoutRetry.unknown && !partialFailureInventory;
       // Live PR #4631 — only REQUIRED failures are healed or named as the failure; a non-required red (`merge-gate`,
       // red by design until #4715) is reported beside it, never healed. The budget is the heals since the PR's last
       // non-mechanical head ({@link ciHealBudgetResetAt}), not every heal it ever had.
@@ -3382,12 +3385,17 @@ export function planReconcile({
       } else {
         dispatch.push({
           ...base, ...withPhase, ...refund, ...healFacts, ...owedMainRuleFact, kind: 'ci-heal', attempts: ciHealAttempts,
+          ...(timeoutRetryFallback ? { timeoutRetryFallback: pr.timeoutRetry.reason } : {}),
           ...(partialFailureInventory ? { partialFailureInventory: true } : {}),
           ...(fixTiming.joinCiAndReview && readiness.reviewFindings ? { reviewFixAttempts: roundAttempts() } : {}),
           why: `a required check is failing (${failing.required.join(', ') || 'unnamed'}), nothing live is working it, and ${ciHealAttempts} of ${ciHealCap} CI-heal attempts are spent`
             + (healBudget.log.resetAt ? ` since ${healBudget.log.resetBy}'s push at ${healBudget.log.resetAt}` : '')
             + ` (cap from ${ciHealCapSource})`
             + (owedMainRuleFact.owedMainRule ? `; test's hand-picked-NNN errors are drain-assigned (${owedMainRuleFact.owedMainRule.nums.map(n => `#${n}`).join(', ')}) and must be left alone` : ''),
+        });
+        if (timeoutRetryFallback) notes.push({
+          kind: 'timeout-retry-fallback-heal', prNumber, reason: pr.timeoutRetry.reason,
+          text: `PR #${prNumber}: timeout retry ineligible (${pr.timeoutRetry.reason}); falling back to ordinary ci-heal (${ciHealAttempts} of ${ciHealCap} attempts spent)`,
         });
       }
       continue;

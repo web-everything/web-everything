@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { planReconcile } from '../reconcile-core.mjs';
 import { resolveStaleCiRerunSetting } from '../reconcile-pass.mjs';
+import { buildCiHealComment } from '../ci-heal-mark.mjs';
 
 const repo = 'web-everything/web-everything';
 const head = 'ab9985630d90019a07b94e946bc75f8de7a6161f';
@@ -16,6 +17,70 @@ const fixture = (over = {}) => ({ number: 5273, state: 'OPEN', isDraft: true, he
   timeoutRetryBudget: { confirmed: 0, rejected: 0 }, ...over });
 const plan = (over = {}, staleCiRerun = 'once-per-head') => planReconcile({
   prs: [fixture(over)], agents: [], requiredChecks: ['test'], now: Date.parse('2026-10-14T17:00:00Z'), mainRedWindows: [], staleCiRerun });
+
+describe('ineligible timeout-retry reasons fall back to ci-heal', () => {
+  const mixedReason = 'mixed-infra-cancelled-and-real-failure';
+  const fallbackPlan = (over = {}, options = {}) => planReconcile({
+    prs: [fixture({ owedCiRerunRetry: undefined, ...over })], agents: [], requiredChecks: ['test'],
+    now: Date.parse('2026-10-14T17:00:00Z'), mainRedWindows: [], staleCiRerun: 'once-per-head', ...options,
+  });
+
+  it('heals mixed infra-cancelled and real failures with a visible fallback note and no rerun', () => {
+    const out = fallbackPlan({
+      timeoutRetry: { eligible: false, reason: mixedReason },
+      statusCheckRollup: [check(), check({ name: 'smoke', conclusion: 'CANCELLED' })],
+    }, { requiredChecks: ['test', 'smoke'] });
+    expect(out.dispatch).toEqual([expect.objectContaining({
+      kind: 'ci-heal', prNumber: 5273, attempts: 0, timeoutRetryFallback: mixedReason,
+    })]);
+    expect(out.dispatch.some(row => row.kind === 'ci-timeout-rerun')).toBe(false);
+    expect(out.refusals).toContainEqual(expect.objectContaining({
+      kind: 'timeout-retry-ineligible', prNumber: 5273, why: `PR #5273: ${mixedReason}`,
+    }));
+    expect(out.notes).toContainEqual(expect.objectContaining({
+      kind: 'timeout-retry-fallback-heal', prNumber: 5273, reason: mixedReason,
+      text: expect.stringContaining(mixedReason),
+    }));
+  });
+
+  it.each(['timeout-evidence:incomplete-diff', 'timeout-evidence:evidence-read-deadline', 'missing-check-origin', 'not-a-timeout'])(
+    'heals known ineligibility with a fallback tag, note and refusal: %s', reason => {
+      const out = fallbackPlan({ timeoutRetry: { eligible: false, reason } });
+      expect(out.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', timeoutRetryFallback: reason })]);
+      expect(out.dispatch.some(row => row.kind === 'ci-timeout-rerun')).toBe(false);
+      expect(out.notes).toContainEqual(expect.objectContaining({
+        kind: 'timeout-retry-fallback-heal', prNumber: 5273, reason, text: expect.stringContaining(reason),
+      }));
+      expect(out.refusals).toContainEqual(expect.objectContaining({
+        kind: 'timeout-retry-ineligible', prNumber: 5273, why: `PR #5273: ${reason}`,
+      }));
+    },
+  );
+
+  it('never heals when the existing heal budget is spent (3 of 3)', () => {
+    const comments = Array.from({ length: 3 }, () => ({
+      body: buildCiHealComment({ reason: 'red-ci' }), author: { login: 'web-everything' },
+    }));
+    const out = fallbackPlan({ timeoutRetry: { eligible: false, reason: mixedReason }, comments }, { ciHealCap: 3 });
+    expect(out.dispatch).toEqual([]);
+    expect(out.refusals).toContainEqual(expect.objectContaining({
+      kind: 'cap-exhausted', prNumber: 5273, attempts: 3, cap: 3,
+    }));
+    expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-ineligible', prNumber: 5273 }));
+    expect(out.notes).toContainEqual(expect.objectContaining({ kind: 'ci-heal-exhausted', attempts: 3, cap: 3 }));
+    expect(out.notes.some(row => row.kind === 'timeout-retry-fallback-heal')).toBe(false);
+  });
+
+  it('deliberately leaves unknown evidence held without dispatch or a fallback note', () => {
+    const out = fallbackPlan({ timeoutRetry: {
+      eligible: false, unknown: true, reason: 'timeout-evidence-unknown:spawnSync gh ETIMEDOUT',
+    } });
+    expect(out.dispatch).toEqual([]);
+    expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'timeout-evidence-unknown', prNumber: 5273 }));
+    expect(out.refusals.some(row => row.kind === 'timeout-retry-ineligible')).toBe(false);
+    expect(out.notes.some(row => row.kind === 'timeout-retry-fallback-heal')).toBe(false);
+  });
+});
 
 describe('fix.staleCiRerun', () => {
   it('re-runs the failed jobs once for a stale red check on a green main, draft included, without a heal', () => {
