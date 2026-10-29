@@ -1,5 +1,22 @@
 {
   "version": 1,
-  "entries": [],
+  "entries": [
+    {
+      "test": "scripts/__tests__/proc-read-migration-74d.test.mjs",
+      "brokenSha": "fbcf1cc849c59a17c0afac958570f91a0cf2ec89",
+      "owner": "forge-env-test-failures (card)",
+      "reason": "R157: main red on Forge runners after #6003/#6064/#6067; 2 env-dependent tests fail only on hetzner-we runners (run 40944695769 shard 4)",
+      "addedAt": 1793304332008,
+      "expiresAt": 1793390732008
+    },
+    {
+      "test": "scripts/operations/__tests__/record-red-team-ruling-io.test.mjs",
+      "brokenSha": "fbcf1cc849c59a17c0afac958570f91a0cf2ec89",
+      "owner": "forge-env-test-failures (card)",
+      "reason": "R157: main red on Forge runners after #6003/#6064/#6067; 2 env-dependent tests fail only on hetzner-we runners (run 40944695769 shard 4)",
+      "addedAt": 1793304332008,
+      "expiresAt": 1793390732008
+    }
+  ],
   "mode": "quarantine"
 }
