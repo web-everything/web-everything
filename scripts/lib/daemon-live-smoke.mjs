@@ -367,6 +367,21 @@ async function checkLanePoolList(ctx) {
   }
 }
 
+/**
+ * Allowlist for the lane-acquire-release smoke's lane-hold skip: a retry error line is benign only when it is
+ * not failure-shaped at all, or is exactly a lane-hold refusal / the final "no lane" refusal / the bare child
+ * exit line. Any other failure-shaped line (provision, git, fs, signal, timeout, crash...) is a real failure.
+ */
+function isBenignLaneHoldLine(line) {
+  const l = String(line);
+  if (!/provision|fatal|error|failed|refused|✗|exited|SIG[A-Z]+|timed out|crash|killed|limit|ENOENT|EACCES/i.test(l)) return true;
+  if (/fatal:|SIG[A-Z]+|crash|timed out|killed|ENOENT|EACCES|error:|limit/i.test(l)) return false;
+  if (/lane-hold/.test(l) && /reset REFUSED|is held|claimed but failed to provision/i.test(l)) return true;
+  if (/^\s*✗ no (?:free )?lane\b/.test(l) || /^\s*no (?:free )?lane within\b/.test(l)) return true;
+  if (/^\s*acquire exited \d+\s*$/.test(l) || /^\s*Command failed: node scripts\/lane-pool\.mjs acquire\b[^\n]*$/.test(l)) return true;
+  return false;
+}
+
 async function checkLaneAcquireRelease(ctx) {
   const { root, budgets, sessionSlug, runChild, env } = ctx;
   let laneNum = null;
@@ -402,8 +417,7 @@ async function checkLaneAcquireRelease(ctx) {
         // Scan EVERY line of the retry's message, stderr and diagnostics: any failure-shaped line that is not itself a
         // lane-hold refusal (provision error, git/fs error, timeout, signal, crash, output limit) makes it a real failure.
         const retryText = [retryError?.message, retryError?.stderr, JSON.stringify(retryError?.diagnostics ?? '')].join('\n').split(/\\n|\n/);
-        const cleanNoLane = !retryText.some((l) => /timed out|SIG[A-Z]+|crash|output.?limit|killed/i.test(l)
-          || (!l.includes('lane-hold') && /failed to provision|git read failed|fatal:|ENOENT|EACCES/i.test(l)));
+        const cleanNoLane = retryText.every(isBenignLaneHoldLine);
         if (!hasLaneHold(retryError) || !cleanNoLane) {
           return { ok: false, detail: `lane-pool acquire --purpose=smoke failed: ${firstLine(retryError)}`,
             ...childFailureDiagnostics(retryError) };

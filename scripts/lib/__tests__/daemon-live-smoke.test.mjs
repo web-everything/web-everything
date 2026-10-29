@@ -90,6 +90,21 @@ describe('lane acquire smoke after lane-hold reset refusal', () => {
     expect(row.skipped).not.toBe(true);
   });
 
+  it('a retry mixing lane-hold with a fatal git error on one line is a real failure', async () => {
+    const mixed = Object.assign(new Error('acquire exited 1'), { stderr: `${refusal} fatal: bad object HEAD` });
+    const runChild = vi.fn().mockRejectedValueOnce(failure('message')).mockRejectedValueOnce(mixed);
+    const row = await check.run(context(runChild));
+    expect(row.ok).toBe(false);
+    expect(row.skipped).not.toBe(true);
+  });
+
+  it('a retry with an unrecognised failure-shaped line is a real failure', async () => {
+    const odd = Object.assign(new Error('acquire exited 1'), { stderr: `${refusal}\nsomething unexpected failed` });
+    const runChild = vi.fn().mockRejectedValueOnce(failure('message')).mockRejectedValueOnce(odd);
+    const row = await check.run(context(runChild));
+    expect(row.ok).toBe(false);
+  });
+
   it('a retry that exited on a signal is a real failure even if the same line mentions lane-hold', async () => {
     const sig = new Error(`acquire exited SIGSEGV: ${refusal}`);
     const runChild = vi.fn().mockRejectedValueOnce(failure('message')).mockRejectedValueOnce(sig);
