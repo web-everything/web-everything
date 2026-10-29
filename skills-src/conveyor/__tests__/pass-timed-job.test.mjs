@@ -83,7 +83,7 @@ function fixture(policyOptions = {}) {
     reapGroup: vi.fn(handle => probe(handle) === 'dead'),
     env: {}, eventsPath: join(dir, 'daemon-events.jsonl'),
     now: () => Date.now(),
-    readStart: () => 'fixture-start', host: 'fixture-host',
+    readStart: () => new Date(Date.now()).toISOString(), host: 'fixture-host',
     log, alert: detail => alerts.push(detail),
     // No host preferences, git snapshots, network, or real subprocesses.
     root: dir, codeSha: 'fixture-sha',
@@ -116,10 +116,139 @@ async function quarantinedFixture() {
   const [record] = f.store.list().records;
   f.children[0].finish();
   await expect(pending).resolves.toEqual({ outcome: 'quarantined' });
+  // Historical quarantines predate unreapable state/alerts. Recovery must create
+  // both afresh, rather than accidentally satisfying assertions from this launch.
+  f.store.update(record.id, r => { delete r.job.passUnreapable; return r; });
+  f.alerts.length = 0;
   return { ...f, pass, record };
 }
 
 describe('timed pass quarantine recovery and reporting', () => {
+  it.each(['orphaned descendants', 'live reused leader'])(
+    'never SIGKILLs unrelated PID/PGID 7000 reused while the daemon was down (%s)', async mode => {
+      const f = await quarantinedFixture();
+      const ownerStart = Date.now();
+      f.store.update(f.record.id, r => {
+        r.job.procStart = new Date(ownerStart).toISOString();
+        r.job.handle = `fixture-host:7000:${r.job.procStart}`;
+        return r;
+      });
+      vi.setSystemTime(ownerStart + 2 * 60 * 60 * 1000);
+      const kill = vi.fn(); // the unrelated group still exists
+      const reapGroup = (handle, notAfterMs, options) => reapDeadGroup(handle, {
+        ...options, notAfterMs, host: 'fixture-host', kill, bootTime: () => 0,
+        readStart: () => mode === 'live reused leader' ? new Date(ownerStart + 60_000).toISOString() : null,
+        groupStarts: () => [ownerStart + 60_000],
+      });
+
+      await expect(runPassAsTimedJob(f.pass, { ...f.ports, reapGroup }))
+        .resolves.toEqual({ outcome: 'quarantined' });
+
+      expect(kill).not.toHaveBeenCalledWith(-7000, 'SIGKILL');
+      expect(f.store.read(f.record.id).job).toMatchObject({ passQuarantine: true, passUnreapable: true });
+      expect(f.alerts).toContainEqual(expect.objectContaining({ kind: 'needs-you', id: f.record.id }));
+      expect(f.spawnFn).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('still reaps a genuine orphaned group of the same recorded owner after daemon downtime', async () => {
+    const f = await quarantinedFixture();
+    const ownerStart = Date.now();
+    f.store.update(f.record.id, r => {
+      r.job.procStart = new Date(ownerStart).toISOString();
+      r.job.handle = `fixture-host:7000:${r.job.procStart}`;
+      return r;
+    });
+    vi.setSystemTime(ownerStart + 2 * 60 * 60 * 1000);
+    let groupAlive = true;
+    const kill = vi.fn((pid, signal) => {
+      if (pid !== -7000 || !groupAlive) throw Object.assign(new Error('no group'), { code: 'ESRCH' });
+      if (signal === 'SIGKILL') groupAlive = false;
+    });
+    const reapGroup = vi.fn((handle, notAfterMs, options) => reapDeadGroup(handle, {
+      ...options, notAfterMs, host: 'fixture-host', kill,
+      readStart: () => null, bootTime: () => 0, groupStarts: () => [ownerStart + 500],
+    }));
+
+    const pending = runPassAsTimedJob(f.pass, { ...f.ports, reapGroup });
+    await vi.waitFor(() => expect(f.children).toHaveLength(2));
+    f.children[1].finish();
+    await expect(pending).resolves.toEqual({ code: 0, signal: null });
+
+    expect(kill).toHaveBeenCalledWith(-7000, 'SIGKILL');
+    expect(reapGroup).toHaveBeenCalledWith(`fixture-host:7000:${new Date(ownerStart).toISOString()}`,
+      ownerStart + 1000, { requireConfirmedDeath: true });
+    expect(f.store.read(f.record.id).job.passQuarantine).toBeUndefined();
+    expect(f.store.read(f.record.id).job.passUnreapable).toBeUndefined();
+  });
+
+  it.each(['invalid owner start', 'missing last-alive time', 'member past owner tolerance', 'host rebooted', 'unreadable leader'])(
+    'does not signal an unprovable group: %s', async mode => {
+      const f = await quarantinedFixture();
+      const ownerStart = Date.now();
+      f.store.update(f.record.id, r => {
+        if (mode === 'invalid owner start') {
+          r.job.procStart = 'unparseable-start';
+          r.job.handle = `fixture-host:7000:${r.job.procStart}`;
+        }
+        if (mode === 'missing last-alive time') {
+          r.job.heartbeatAt = null;
+          r.job.startedAt = null;
+        }
+        // A late heartbeat must never widen the owner-start bound.
+        if (mode === 'member past owner tolerance') r.job.heartbeatAt = new Date(ownerStart + 60_000).toISOString();
+        return r;
+      });
+      vi.setSystemTime(ownerStart + 2 * 60 * 60 * 1000);
+      const kill = vi.fn();
+      const reapGroup = (handle, notAfterMs, options) => reapDeadGroup(handle, {
+        ...options, notAfterMs, host: 'fixture-host', kill,
+        readStart: () => {
+          if (mode === 'unreadable leader') throw new Error('ps unavailable');
+          return null;
+        },
+        bootTime: () => mode === 'host rebooted' ? ownerStart + 60_000 : 0,
+        groupStarts: () => [ownerStart + (mode === 'member past owner tolerance' ? 1001 : 500)],
+      });
+
+      await expect(runPassAsTimedJob(f.pass, { ...f.ports, reapGroup }))
+        .resolves.toEqual({ outcome: 'quarantined' });
+
+      expect(kill).not.toHaveBeenCalledWith(-7000, 'SIGKILL');
+      expect(f.store.read(f.record.id).job).toMatchObject({ passQuarantine: true, passUnreapable: true });
+      expect(f.alerts).toContainEqual(expect.objectContaining({ kind: 'needs-you' }));
+    },
+  );
+
+  it.each(['reattachment', 'expired deadline'])(
+    'does not SIGKILL a reused orphan group during %s before quarantine was recorded', async mode => {
+      const f = await quarantinedFixture();
+      const ownerStart = Date.now();
+      f.store.update(f.record.id, r => {
+        delete r.job.passQuarantine;
+        delete r.job.passResult;
+        if (mode === 'reattachment') {
+          r.job.task.timeoutMs = 3 * 60 * 60 * 1000;
+          r.job.task.policy.timeoutMs = r.job.task.timeoutMs;
+        }
+        return r;
+      });
+      vi.setSystemTime(ownerStart + 2 * 60 * 60 * 1000);
+      const kill = vi.fn();
+      const reapGroup = (handle, notAfterMs, options) => reapDeadGroup(handle, {
+        ...options, notAfterMs, host: 'fixture-host', kill, bootTime: () => 0,
+        readStart: () => null, groupStarts: () => [ownerStart + 60_000],
+      });
+
+      await expect(runPassAsTimedJob(f.pass, { ...f.ports, reapGroup }))
+        .resolves.toEqual({ outcome: 'quarantined' });
+
+      expect(kill).not.toHaveBeenCalledWith(-7000, 'SIGKILL');
+      expect(f.store.read(f.record.id).job).toMatchObject({ passQuarantine: true, passUnreapable: true });
+      expect(f.alerts).toContainEqual(expect.objectContaining({ kind: 'needs-you' }));
+    },
+  );
+
   it('clears a dead owner with a confirmed empty pgid and runs a fresh job in the same call', async () => {
     const f = await quarantinedFixture();
     const ageMs = 2 * 60 * 60 * 1000;
@@ -250,9 +379,9 @@ describe('timed pass quarantine recovery and reporting', () => {
     ['record start missing', { procStart: undefined }],
     ['record start null', { procStart: null }],
     ['record start empty', { procStart: '' }],
-    ['handle host mismatch', { handle: 'other-host:7000:fixture-start' }],
-    ['consistent foreign host', { host: 'other-host', handle: 'other-host:7000:fixture-start' }],
-    ['handle pid mismatch', { handle: 'fixture-host:8000:fixture-start' }],
+    ['handle host mismatch', { handle: 'other-host:7000:2026-10-10T00:00:00.000Z' }],
+    ['consistent foreign host', { host: 'other-host', handle: 'other-host:7000:2026-10-10T00:00:00.000Z' }],
+    ['handle pid mismatch', { handle: 'fixture-host:8000:2026-10-10T00:00:00.000Z' }],
     ['handle start mismatch', { handle: 'fixture-host:7000:different-start' }],
     ['group identity mismatch', { pgid: 8000 }],
   ])('fails closed and reports unknown liveness for %s despite dead/gone probes', async (_name, patch) => {
@@ -340,7 +469,7 @@ describe('#5755 independent timed pass jobs', () => {
         // activePasses is populated, as an independent adapter process would.
         reattached = runPassAsTimedJob(pass, { ...f.ports, store: createJobStore(f.store.dir) });
         duringLaunch = f.store.list().records[0].job;
-        return 'fixture-start';
+        return new Date(Date.now()).toISOString();
       },
     });
     expect(duringLaunch).toMatchObject({ status: 'launching', handle: null });
@@ -365,7 +494,8 @@ describe('#5755 independent timed pass jobs', () => {
     const [record] = f.store.list().records;
     f.children[0].finish(code);
     await expect(pending).resolves.toEqual({ code, signal: null });
-    expect(reapGroup).toHaveBeenCalledWith(record.job.handle, Date.now(), { requireConfirmedDeath: true });
+    expect(reapGroup).toHaveBeenCalledWith(record.job.handle, Date.parse(record.job.procStart) + 1000,
+      { requireConfirmedDeath: true });
     expect(f.store.read(record.id).job.handle).toBeNull();
   });
 

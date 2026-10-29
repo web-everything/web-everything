@@ -361,10 +361,27 @@ async function executeTimedPass({ passName, repo, entry }, ports) {
   const observeOwner = handle => {
     try { return probe(handle); } catch { return 'unknown'; }
   };
-  const confirmGroupGone = handle => {
+  const validOwnerIdentity = job => {
+    const handle = parseJobHandle(job.handle);
+    return handle && Number.isSafeInteger(handle.pid)
+      && handle.host === host && job.host === handle.host
+      && job.pid === handle.pid && job.procStart === handle.procStart
+      && (job.pgid == null || job.pgid === handle.pid);
+  };
+  const reapRecordedGroup = job => {
+    if (!validOwnerIdentity(job)) return false;
+    // ps lstart has second precision. Never extend an old owner's window to
+    // the recovery tick: its PGID may have belonged to another workload since.
+    // The shared reaper also refuses any currently occupied leader PID.
+    const ownerStartMs = Date.parse(job.procStart);
+    const lastAliveMs = Date.parse(job.heartbeatAt ?? job.startedAt ?? '');
+    const cutoff = Math.min(ownerStartMs, lastAliveMs) + 1000;
+    return reapGroup(job.handle, cutoff, { requireConfirmedDeath: true }) === true;
+  };
+  const confirmGroupGone = job => {
     try {
-      return observeOwner(handle) === 'dead'
-        && reapGroup(handle, now(), { requireConfirmedDeath: true }) === true;
+      return validOwnerIdentity(job) && observeOwner(job.handle) === 'dead'
+        && reapRecordedGroup(job);
     } catch { return false; }
   };
   const kindDef = defineJobKind({ kind: `pass-${createHash('sha256').update(passName).digest('hex').slice(0, 24)}`, entry: entry.script,
@@ -383,12 +400,9 @@ async function executeTimedPass({ passName, repo, entry }, ports) {
       const observedAt = now();
       const ts = new Date(observedAt).toISOString();
       const handle = parseJobHandle(r.job.handle);
-      const validIdentity = handle && Number.isSafeInteger(handle.pid)
-        && handle.host === host && r.job.host === handle.host
-        && r.job.pid === handle.pid && r.job.procStart === handle.procStart
-        && (r.job.pgid == null || r.job.pgid === handle.pid);
+      const validIdentity = validOwnerIdentity(r.job);
       const ownerLiveness = validIdentity ? observeOwner(r.job.handle) : 'unknown';
-      const groupGone = ownerLiveness === 'dead' && confirmGroupGone(r.job.handle);
+      const groupGone = ownerLiveness === 'dead' && confirmGroupGone(r.job);
       const startedAt = Date.parse(r.job.launchedAt ?? r.job.startedAt ?? '');
       const ageMs = Number.isFinite(startedAt) ? Math.max(0, observedAt - startedAt) : null;
       const age = ageMs === null ? 'unknown' : `${Math.floor(ageMs / 3600000)}h ${Math.floor(ageMs / 60000) % 60}m ${Math.floor(ageMs / 1000) % 60}s`;
@@ -396,21 +410,25 @@ async function executeTimedPass({ passName, repo, entry }, ports) {
         pgid: r.job.pgid ?? handle?.pid ?? r.job.pid ?? null, ageMs, age };
       if (groupGone) {
         delete r.job.passQuarantine;
+        delete r.job.passUnreapable;
         cleared = true;
         emission = { kind: 'pass-quarantine-cleared', detail };
         return markFailed(r, { at: ts, reason: 'Pass quarantine cleared: owner dead and process group confirmed gone' });
       }
+      if (ownerLiveness !== 'alive') r.job.passUnreapable = true;
       const lastEventAt = Date.parse(r.job.passQuarantineEventAt ?? '');
       if (Number.isFinite(lastEventAt) && lastEventAt <= observedAt
-        && observedAt - lastEventAt < QUARANTINE_EVENT_INTERVAL_MS) return null;
+        && observedAt - lastEventAt < QUARANTINE_EVENT_INTERVAL_MS) return r;
       const liveness = ownerLiveness === 'alive' ? 'alive' : 'unknown';
       emission = { kind: 'pass-quarantined', detail: { ...detail, ownerLiveness, groupGone,
-        liveness, livenessUnknown: liveness === 'unknown',
+        liveness, livenessUnknown: liveness === 'unknown', unreapable: !!r.job.passUnreapable,
         reason: 'Pass remains quarantined; operator must inspect owner/process group if recovery stays unconfirmed' } };
-      return null;
+      return r;
     });
     if (emission) {
       log(`pass-daemon: ${emission.kind} ${JSON.stringify(emission.detail)}`);
+      if (emission.detail.unreapable) alert({ kind: 'needs-you', passName, repo, id: record.id,
+        reason: 'Pass unreapable: cannot prove process-group ownership and absence; operator must inspect before recovery' });
       // Use the shared JSONL envelope (at/kind/repo/daemon/detail). Keep the test
       // port and PATH alias local; WE_DAEMON_EVENTS is the writer's standard override.
       const eventsPath = ports.eventsPath ?? env.WE_DAEMON_EVENTS_PATH ?? env.WE_DAEMON_EVENTS;
@@ -452,14 +470,18 @@ async function executeTimedPass({ passName, repo, entry }, ports) {
         outcome, elapsedMs: Math.max(0, now() - Date.parse(r.job.launchedAt)) };
       r.job.passResult = result;
       r.job.passTiming = timing;
-      if (quarantine) r.job.passQuarantine = true;
+      if (quarantine) {
+        r.job.passQuarantine = true;
+        r.job.passUnreapable = true;
+      }
       else if (!TERMINAL_JOB_STATUSES.includes(r.job.status)) r = outcome === 'failed'
         ? markFailed(r, { at: at(), reason: result.spawnError ?? `exit code ${result.code}` })
         : markSucceeded(r, { at: at() });
       return r;
     });
     if (timing) log(JSON.stringify(timing));
-    if (quarantine && timing) alert({ passName, repo, id, reason: 'Cannot confirm pass gone; operator must inspect and recover the retained job before retrying' });
+    if (quarantine && timing) alert({ kind: 'needs-you', passName, repo, id,
+      reason: 'Pass unreapable: cannot confirm pass gone; operator must inspect and recover the retained job before retrying' });
     return store.read(id).job.passResult;
   };
   let childResult;
@@ -505,7 +527,10 @@ async function executeTimedPass({ passName, repo, entry }, ports) {
       const scopedStore = { ...store, list: () => ({ records: [store.read(id)], corrupt: [] }) };
       const recovery = await reattachTick({ store: scopedStore, kinds: new Map([[kindDef.kind, kindDef]]),
         maxConcurrent: 1, observation: { now: now(), slept: false, gapMs: 0 },
-        probe, stop, reapGroup, staleMs: Number.MAX_SAFE_INTEGER, log });
+        probe, stop, reapGroup: handle => {
+          const job = store.read(id).job;
+          return job.handle === handle && reapRecordedGroup(job);
+        }, staleMs: Number.MAX_SAFE_INTEGER, log });
       const quarantine = recovery.actions.some(a => a.action === 'stop-failed')
         || !TERMINAL_JOB_STATUSES.includes(store.read(id).job.status);
       return finish({ outcome: quarantine ? 'quarantined' : 'timeout' }, quarantine ? 'quarantined' : 'timeout', quarantine);
@@ -513,7 +538,7 @@ async function executeTimedPass({ passName, repo, entry }, ports) {
     if (result) {
       // A child result does not prove its subprocess group is gone.
       // Keep the durable claim and alert if reaping cannot confirm absence.
-      if (record.job.handle && !confirmGroupGone(record.job.handle)) {
+      if (record.job.handle && !confirmGroupGone(record.job)) {
         return finish({ outcome: 'quarantined' }, 'quarantined', true);
       }
       return finish(result, result.code === 0 && !result.spawnError ? 'acted' : 'failed');
@@ -522,7 +547,7 @@ async function executeTimedPass({ passName, repo, entry }, ports) {
       spawnError: record.job.error ?? 'pass exited without a recorded result' }, 'failed');
     // Reattached owners have no local ChildProcess; judge them through shared recovery.
     if (!childResult && !awaitingClaim && observeOwner(record.job.handle) !== 'alive') {
-      const quarantine = !confirmGroupGone(record.job.handle);
+      const quarantine = !confirmGroupGone(record.job);
       return finish(quarantine ? { outcome: 'quarantined' } : { code: null, signal: null,
         spawnError: 'pass owner exited without a recorded result' }, quarantine ? 'quarantined' : 'failed', quarantine);
     }
