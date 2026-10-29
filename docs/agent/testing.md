@@ -104,6 +104,16 @@ refusals because even single-target require edges can shorten the original graph
 extensionless require chain with a candidate shortcut in `closure-scope.test.mjs` pins this fallback
 to full merge/manual rebase when candidate unions would otherwise complete the strict walk.
 The six R210 red-team regressions in `closure-scope.test.mjs` pin these guarantees.
+R230 makes exclusion an explicit snapshot allowlist: absence from the closure is not proof.
+`closure-scope-failclosed.test.mjs` requires source evidence for every closure file and entry,
+and protects path, extensionless-path and extensionless-basename substrings in raw source or
+decoded literals. Unknown paths and sets without that proof retain the conflict, including
+copies of a computed scope. Missing textual evidence, opaque reads and comments inside loader
+arguments admit an all-files scope with reason `closure-opaque` and an empty exclusion allowlist;
+other incomplete loader evidence keeps the existing `closure-incomplete` refusal. Both outcomes
+retain the full conflict for full merge/manual rebase. Clone discovery also throws on relative
+script/path arguments in LaunchAgents instead of silently narrowing the roots; bare interpreters,
+option flags and numeric string tokens keep their existing treatment.
 Opaque loaders follow one strict rule: a closure reference to `module`/`node:module`,
 `createRequire`, `eval`, `new Function`, `node:vm`, `node:test` runner capabilities,
 `process.loadEnvFile`, `process.execArgv`, `process.env.NODE_OPTIONS` or preload/loader flags,

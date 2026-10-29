@@ -46,6 +46,10 @@ export function cloneRuntimeEntries({ root, entries = [], env = process.env,
     if (!Array.isArray(args) || !args.length || args.some(arg => typeof arg !== 'string')) {
       throw new Error(`LaunchAgents ProgramArguments invalid: ${name}`);
     }
+    if (args.some(arg => !isAbsolute(arg) && !arg.startsWith('-')
+      && (arg.includes('/') || /\.(?:mjs|js|cjs|ts)$/i.test(arg)))) {
+      throw new Error(`LaunchAgents relative entrypoint refused: ${name}`);
+    }
     const paths = args.filter(isAbsolute).map(inside).filter(Boolean);
     for (const path of paths) out.add(path);
     if (paths.some(path => basename(path) === 'pass-daemon.mjs')) {

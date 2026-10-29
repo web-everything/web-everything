@@ -136,3 +136,20 @@ it('refuses an unknown pass for this clone', () => {
     stdout: JSON.stringify({ ProgramArguments: ['node', join(realpathSync(f.root), 'skills-src/conveyor/pass-daemon.mjs'), '--pass=unknown'] }),
   }) })).toThrow();
 });
+
+it.each(['scripts/daemon.mjs', './daemon.js', 'daemon.cjs', 'daemon.ts', 'relative/runner'])(
+  'R230 refuses a relative LaunchAgent entrypoint: %s', entry => {
+    const f = fixture();
+    writeFileSync(join(f.launchAgentsDir, 'com.we.relative.plist'), 'plist');
+    expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
+      stdout: JSON.stringify({ ProgramArguments: ['/usr/bin/env', 'node', entry] }),
+    }) })).toThrow('LaunchAgents relative entrypoint refused: com.we.relative.plist');
+  });
+
+it('R230 permits bare interpreters, option flags and numeric argument tokens', () => {
+  const f = fixture();
+  writeFileSync(join(f.launchAgentsDir, 'com.we.tokens.plist'), 'plist');
+  expect(new Set(cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
+    stdout: JSON.stringify({ ProgramArguments: ['/usr/bin/env', 'node', '--pass=x', '--path=relative/file.js', '42'] }),
+  }) }))).toEqual(new Set(DAEMON_ENTRY_MODULES));
+});
