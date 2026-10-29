@@ -160,7 +160,11 @@ describe('real Git retirement evidence', () => {
     track('top');
     branch('main');
     for (const kind of ['explicit', 'mechanism', 'merge-base-failed', 'diff-failed', 'diff-error']) {
-      const overlays = [{ ref: 'lower', ...(kind === 'explicit' ? { pinned: true } : {}) }, { ref: 'top' }];
+      // Refreshed tips can only be persisted for registrations with explicit identities.
+      const overlays = [
+        { ref: 'lower', registrationId: 'lower-registration', ...(kind === 'explicit' ? { pinned: true } : {}) },
+        { ref: 'top', registrationId: 'top-registration' },
+      ];
       const result = await retire(overlays, { git: (args) => {
         if (kind === 'merge-base-failed' && args[0] === 'merge-base' && args[1] !== '--is-ancestor') return { status: 128 };
         if (kind === 'diff-failed' && args[0] === 'diff') return { status: 128 };
