@@ -14,7 +14,7 @@ import { derivePrState as derivePrPhase } from './pr-state-core.mjs';
 import { EVENT_TYPES, VERDICTS, verdictClears, foldVerdictLedger, verdictLabel, validateLedgerEvent, ledgerEventId } from './verdict-ledger.mjs';
 import { deriveReferrals, openReferralKeys } from './pr-state/referrals.mjs';
 import { evaluateHolds } from './pr-state/holds/index.mjs';
-import { approvalLiftsAfter } from './pr-state/holds/verdict.mjs';
+import { approvalLiftsAfter, acceptanceCovers } from './pr-state/holds/verdict.mjs';
 import { HUMAN_HOLD_CI_RED, lifecycleRow, renderLabels } from '../conveyor/pr-lifecycle.mjs';
 
 const isVerdictRow = e => e.type === EVENT_TYPES.VERDICT || e.type === undefined;
@@ -54,9 +54,10 @@ export function ledgerView(events, facts) {
   // A clear-human audit verdict cannot replace a human hold: its companion approval must pass the
   // same validity and binding checks as an approval without that verdict. Keep the original hold id,
   // including across bounces, rearms, partial writes and retries. Only an independent clearing verdict
-  // supersedes the human hold; changes/pending/observed cannot erase its approval requirement.
+  // covering the current head supersedes the human hold; stale verdicts and changes/pending/observed
+  // cannot erase its approval requirement.
   const lastHumanBoundary = verdicts.findLast(e => e.verdict === VERDICTS.HUMAN
-    || (e.verdict !== VERDICTS.CLEAR_HUMAN && verdictClears(e.verdict)));
+    || (verdictClears(e.verdict) && acceptanceCovers(e, facts?.head?.sha)));
   let humanHold = lastHumanBoundary?.verdict === VERDICTS.HUMAN ? lastHumanBoundary : null;
   const folded = scope ? foldVerdictLedger(verdicts).get(scope.pr) ?? null : null;
   const cur = folded?.current ?? null;

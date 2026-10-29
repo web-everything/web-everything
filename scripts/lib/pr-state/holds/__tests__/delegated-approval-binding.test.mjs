@@ -28,6 +28,42 @@ describe('companion clear-human verdict binding', () => {
   const bounce = (verdict, m) => buildVerdictRecord({ repo, pr: PR, verdict,
     at: at(m), source: 'test', headSha: HEAD, reason: 'review bounce/rearm' });
 
+  describe.each([VERDICTS.ACCEPTED, VERDICTS.RESTAMPED])('%s between hold and audit verdict', verdict => {
+    const acceptance = headSha => buildVerdictRecord({ repo, pr: PR, verdict,
+      at: at(2), source: 'test', headSha });
+
+    describe.each([
+      ['stale head', OLD_HEAD],
+      ['missing head', null],
+    ])('with %s', (_name, headSha) => {
+      it.each([
+        ['no approval', null],
+        ['wrong head and hold', { headSha: OLD_HEAD, basis: ['hold:unrelated'] }],
+        ['wrong head only', { headSha: OLD_HEAD }],
+        ['wrong hold only', { basis: ['hold:unrelated'] }],
+        ['expired approval', { delegation: { ...delegation, expires: at(299) } }],
+      ])('retains the original human hold with %s', (_approvalName, overrides) => {
+        const hold = human();
+        const rows = [hold, acceptance(headSha), clear()];
+        if (overrides) rows.push(approve([ledgerEventId(hold)], overrides));
+        const state = derivePrState(rows, facts());
+        expect(state).toMatchObject({ lifecycleState: 'NEEDS-OPERATOR', clears: false });
+        expect(state.holds.map(h => h.code)).toContain('verdict:human');
+      });
+
+      it('allows a valid approval bound to the original hold', () => {
+        const hold = human();
+        expect(derivePrState([hold, acceptance(headSha), clear(), approve([ledgerEventId(hold)])], facts()))
+          .toMatchObject({ lifecycleState: 'READY-TO-MERGE', clears: true, holds: [] });
+      });
+    });
+
+    it('allows an independent verdict covering the current head', () => {
+      expect(derivePrState([human(), acceptance(HEAD), clear()], facts()))
+        .toMatchObject({ lifecycleState: 'READY-TO-MERGE', clears: true, holds: [] });
+    });
+  });
+
   describe.each([
     ['changes', [VERDICTS.CHANGES]],
     ['pending', [VERDICTS.PENDING]],
