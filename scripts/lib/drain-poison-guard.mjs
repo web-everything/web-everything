@@ -70,6 +70,11 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
   const done = result => (healed ? { ...result, healed } : result);
   try {
     if (!/^[a-f0-9]{40}$/i.test(headSha ?? '')) throw new Error('invalid pinned head');
+    // Older Git can fetch around stale graph entries without reading them. Verify an existing cache explicitly so
+    // admission and the one-shot clone repair do not depend on which negotiation walk this Git version chooses.
+    if (typeof cwd === 'string' && ['objects/info/commit-graph', 'objects/info/commit-graphs'].some(path => {
+      try { lstatSync(join(cwd, '.git', path)); return true; } catch (e) { if (['ENOENT', 'ENOTDIR'].includes(e.code)) return false; throw e; }
+    })) run(['commit-graph', 'verify']);
     run(['fetch', '--quiet', '--end-of-options', 'origin', headSha, `+refs/heads/${base}:refs/remotes/origin/${base}`]);
     // `-z` keeps paths verbatim: Git otherwise quotes a non-ASCII path, which the filters below would drop.
     const names = run(['diff', '-z', '--name-only', '--diff-filter=A', `origin/${base}...${headSha}`, '--', 'backlog/'])
