@@ -681,14 +681,15 @@ it.each([false, true])('default claim refresh keeps a live wrapped fixing claim 
 describe('idle-claim auto-release (R201)', () => {
   afterEach(() => { vi.unstubAllEnvs(); });
   const IDLE_MS = 30 * 60_000;
+  const liveSweepOffsets = [0, 6.85, 15.8, 23.35, 32.8, 40.1, 49.1, 57.2, 71.15];
   const acquire = (pr = 5996) => acquireFixDispatchClaim({ repo: 'we', pr, kind: 'fix', headSha: 'sha1', owner: 'A', lockRoot: claimRoot, nowMs: T0, nowIso: iso(T0), leaseMinutes: 10 });
   const sweep = (at, { state = 'idle', head = 'sha1', events = [], extra = {} } = {}) => refreshLiveFixDispatchClaims({
     lockRoot: claimRoot, listAgentsAll: () => [{ name: 'fix-5996', state }], hungInfoFor: () => null,
     awaitingVerifyFor: null, prHeadFor: () => head, recordEvent: (e) => events.push(e), nowIso: () => iso(at),
     idleRelease: resolveIdleClaimRelease({ env: {}, platform: null }), ...extra,
   });
-  // Explicit intervening observations keep fixtures on the daemon's two-minute cadence.
-  // Tests of observation gaps call sweep directly instead.
+  // Explicit intervening observations use two-minute steps for continuous-observation fixtures.
+  // Tests of live cadence and observation gaps call sweep directly instead.
   const sweepThrough = (from, at, options) => {
     for (let tick = from + 120_000; tick < at; tick += 120_000) {
       expect(sweep(tick, options).released ?? []).toHaveLength(0);
@@ -917,6 +918,62 @@ describe('idle-claim auto-release (R201)', () => {
     expect(events[0].detail.sources).toBeTruthy();
   });
 
+  it('releases fix-5996 at the 32.8-minute sweep of the observed live cadence', () => {
+    acquire();
+    const events = [];
+    const releaseOffset = liveSweepOffsets.find((minutes) => minutes * 60_000 >= IDLE_MS);
+    for (const minutes of liveSweepOffsets) {
+      const result = sweep(T0 + minutes * 60_000, { events });
+      if (minutes < releaseOffset) {
+        expect(result.released ?? []).toHaveLength(0);
+        expect(result.refreshed).toHaveLength(1);
+        expect(readFixDispatchClaim({ repo: 'we', pr: 5996, lockRoot: claimRoot })?.owner).toBe('A');
+        expect(events).toHaveLength(0);
+      } else {
+        expect(result.released ?? []).toHaveLength(minutes === releaseOffset ? 1 : 0);
+        expect(result.refreshed).toHaveLength(0);
+        expect(readFixDispatchClaim({ repo: 'we', pr: 5996, lockRoot: claimRoot })).toBeNull();
+        expect(events).toHaveLength(1);
+        expect(events[0]).toMatchObject({ kind: 'idle-claim-released', repo: 'we', pr: 5996,
+          detail: { idleMinutes: 30, headSha: 'sha1', idleSince: iso(T0), owner: 'A' } });
+      }
+    }
+  });
+
+  it.each(['working session', 'head change'])('a %s at the live 32.8-minute sweep requires a fresh idle window', (change) => {
+    acquire();
+    const events = [];
+    const changedOffset = 32.8;
+    const resetOffset = change === 'working session' ? 40.1 : changedOffset;
+    const releaseOffset = liveSweepOffsets.find((minutes) => (minutes - resetOffset) * 60_000 >= IDLE_MS);
+    for (const minutes of liveSweepOffsets) {
+      const working = change === 'working session' && minutes === changedOffset;
+      const head = change === 'head change' && minutes >= changedOffset ? 'sha2' : 'sha1';
+      const result = sweep(T0 + minutes * 60_000, { state: working ? 'working' : 'idle', head, events });
+      if (minutes < releaseOffset) {
+        expect(result.released ?? []).toHaveLength(0);
+        expect(result.refreshed).toHaveLength(1);
+        const retained = readFixDispatchClaim({ repo: 'we', pr: 5996, lockRoot: claimRoot });
+        expect(retained.owner).toBe('A');
+        if (working) {
+          expect(retained.meta).not.toHaveProperty('idleHead');
+        } else {
+          expect(retained.meta.idleHead).toEqual({ sha: head,
+            since: iso(T0 + (minutes < changedOffset ? 0 : resetOffset) * 60_000),
+            lastSeen: iso(T0 + minutes * 60_000) });
+        }
+        expect(events).toHaveLength(0);
+      } else {
+        expect(result.released).toHaveLength(1);
+        expect(result.refreshed).toHaveLength(0);
+        expect(readFixDispatchClaim({ repo: 'we', pr: 5996, lockRoot: claimRoot })).toBeNull();
+        expect(events).toHaveLength(1);
+        expect(events[0]).toMatchObject({ kind: 'idle-claim-released', repo: 'we', pr: 5996,
+          detail: { headSha: head, idleSince: iso(T0 + resetOffset * 60_000), owner: 'A' } });
+      }
+    }
+  });
+
   it('an idle session inside the window keeps its claim', () => {
     acquire();
     sweep(T0 + 60_000);
@@ -955,6 +1012,7 @@ describe('idle-claim auto-release (R201)', () => {
   });
 
   it.each([MAX_IDLE_CLAIM_OBSERVATION_GAP_MS + 1, 2 * IDLE_MS])('an unobserved gap of %d ms restarts the clock without releasing', (gap) => {
+    expect(gap).toBeGreaterThan(MAX_IDLE_CLAIM_OBSERVATION_GAP_MS);
     acquire();
     const first = T0 + 60_000;
     const next = first + gap;
@@ -974,7 +1032,7 @@ describe('idle-claim auto-release (R201)', () => {
     expect(events[0].detail.idleSince).toBe(iso(next));
   });
 
-  it('updates lastSeen on every idle observation and accepts gaps of exactly three sweep intervals', () => {
+  it('updates lastSeen on every idle observation and accepts gaps of exactly the 20-minute limit', () => {
     acquire();
     const first = T0 + 60_000;
     const gap = MAX_IDLE_CLAIM_OBSERVATION_GAP_MS;

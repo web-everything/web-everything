@@ -280,9 +280,9 @@ export function isClaimSessionLive({ repo, pr, kind = 'fix', agentsAll, name: na
  *  Well above any real fix/ci-heal run, and above `hung-session.mjs`'s own 30-min hung threshold. */
 export const MAX_FIX_DISPATCH_CLAIM_REFRESH_MS = 4 * 60 * 60 * 1000;
 
-/** Three sweeps at reconcile-fix-dispatch-daemon.mjs's DEFAULT_INTERVAL_MS (120_000).
- * A longer gap is unobserved time and must not count toward the idle release window. */
-export const MAX_IDLE_CLAIM_OBSERVATION_GAP_MS = 3 * 120_000;
+/** Twenty minutes covers the observed 7–14 minute gaps between live daemon sweeps.
+ * A longer gap (daemon down or machine asleep) is unobserved time and must not count toward the idle release window. */
+export const MAX_IDLE_CLAIM_OBSERVATION_GAP_MS = 20 * 60_000;
 
 /**
  * we:scripts/conveyor/fix-dispatch-claim.mjs#refreshLiveFixDispatchClaims — THE FIX for a claim outliving a
@@ -314,8 +314,9 @@ export const MAX_IDLE_CLAIM_OBSERVATION_GAP_MS = 3 * 120_000;
  *
  * When every non-terminal session row is idle, a readable PR head starts an `idleHead` clock in claim
  * metadata. An unchanged head for the configured window releases the owner-checked claim and records an
- * event. Head movement or an observation gap beyond three default sweep intervals restarts the clock;
- * working rows and unreadable heads clear it, so recovery starts a full new window. Legacy clocks without
+ * event. Head movement or an observation gap beyond 20 minutes restarts the clock; this bound covers the
+ * observed 7–14 minute live sweep cadence while excluding longer downtime or sleep gaps.
+ * Working rows and unreadable heads clear it, so recovery starts a full new window. Legacy clocks without
  * `lastSeen` also restart. Runner-pid and awaiting-verify claims are exempt from idle release.
  * @param {{lockRoot?:string, listAgentsAll?:Function, hungInfoFor?:Function, hungThresholdMs?:number,
  *   awaitingVerifyFor?:Function|null, idleRelease?:object, prHeadFor?:Function, recordEvent?:Function,
