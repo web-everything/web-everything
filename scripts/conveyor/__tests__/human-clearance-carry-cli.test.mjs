@@ -26,7 +26,7 @@ const fromSha = 'a'.repeat(40), toSha = 'b'.repeat(40), fingerprint = 'c'.repeat
 const job = { pr: 1, repo: 'web-everything/web-everything' };
 const trusted = body => ({ author: { login: 'chalbert' }, body });
 
-function cliFixture({ headSha = toSha, reviews = [], objection = false, incomplete = false } = {}) {
+function cliFixture({ headSha = toSha, reviews = [], labels = [], objection = false, incomplete = false } = {}) {
   const comments = [{ ...trusted(`<!-- reviewed-sha: ${fromSha} -->\n<!-- reviewed-diff: ${fingerprint} -->\n<!-- cleared-human: chalbert -->`),
     id: 'clearance', createdAt: '2026-10-01T00:00:00Z' }];
   if (objection) comments.push({ ...trusted('Please stop: this still needs changes.'),
@@ -46,8 +46,7 @@ function cliFixture({ headSha = toSha, reviews = [], objection = false, incomple
     }
     if (file === 'gh' && args[0] === 'pr' && args[1] === 'view') {
       expect(proofFinished).toBe(true);
-      expect(args).toContain('headRefOid,reviews');
-      return JSON.stringify({ headRefOid: headSha, reviews });
+      return JSON.stringify({ headRefOid: headSha, reviews, labels });
     }
     if (file === 'gh' && args[0] === 'api') {
       expect(proofFinished).toBe(true);
@@ -93,13 +92,15 @@ describe('human clearance carry CLI', () => {
   });
 
   it('re-reads fresh head, complete comments and formal reviews after proof and posts the carry once', () => {
-    const f = cliFixture();
+    const f = cliFixture({ labels: [{ name: 'review:accepted' }, { name: 'review:held-mechanical' }] });
     expect(f.run()).toEqual({ status: 0, result: { carried: { fromSha, toSha, fingerprint } } });
     expect(f.write).toHaveBeenCalledTimes(1);
     expect(applyHumanClearanceCarry).toHaveBeenCalledTimes(1);
     expect(applyHumanClearanceCarry).toHaveBeenCalledWith(expect.objectContaining({ evidence: f.evidence,
       readLiveEvidence: expect.any(Function), numberingOnly: false }));
     expect(f.readEvidence).toHaveBeenCalledWith(expect.objectContaining(job));
+    expect(f.exec.mock.calls.find(([file, args]) => file === 'gh' && args[1] === 'view')[1])
+      .toContain('headRefOid,reviews,labels');
     expect(f.exec.mock.calls.some(([, args]) => args[1] === 'graphql')).toBe(true);
     expect(f.posts()).toHaveLength(1);
     const body = f.posts()[0][1].at(-1);
@@ -120,6 +121,37 @@ describe('human clearance carry CLI', () => {
     expect(f.options.log.mock.calls.some(([line]) => line.includes('net diff changed'))).toBe(true);
     expect(f.posts()).toHaveLength(0);
     expect(f.exec).not.toHaveBeenCalled();
+  });
+
+  it.each(['review:human', 'review:changes'])('refuses a live %s hold even beside review:accepted without a new comment', label => {
+    const f = cliFixture({ labels: [{ name: 'review:accepted' }, { name: label }] });
+    expect(f.run()).toEqual({ status: 0, result: { carried: null,
+      reason: expect.stringContaining(label) } });
+    expect(f.posts()).toHaveLength(0);
+    expect(f.exec.mock.calls.find(([file, args]) => file === 'gh' && args[1] === 'view')[1])
+      .toContain('headRefOid,reviews,labels');
+  });
+
+  it.each([null, {}, [null], [{}], [{ name: 42 }], [{ name: '' }], ['review:human']].map(labels => [labels]))('fails closed on unreadable live labels: %j', labels => {
+    const f = cliFixture({ labels });
+    expect(f.run()).toEqual({ status: 1, result: { carried: null,
+      reason: expect.stringContaining('live labels unreadable') } });
+    expect(f.posts()).toHaveLength(0);
+  });
+
+  it('fails closed when the live response omits labels', () => {
+    const f = cliFixture();
+    const original = f.exec.getMockImplementation();
+    f.exec.mockImplementation((file, args, options) => {
+      const result = original(file, args, options);
+      if (file !== 'gh' || args[1] !== 'view') return result;
+      const view = JSON.parse(result);
+      delete view.labels;
+      return JSON.stringify(view);
+    });
+    expect(f.run()).toEqual({ status: 1, result: { carried: null,
+      reason: expect.stringContaining('live labels unreadable') } });
+    expect(f.posts()).toHaveLength(0);
   });
 
   it('fails closed with nonzero status when evidence.headReadFailed is true despite a valid head', () => {
