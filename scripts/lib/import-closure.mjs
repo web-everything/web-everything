@@ -239,7 +239,7 @@ function resolveRelativeCandidates(fromFile, spec, { root, exists, readFile }) {
             // URL resolution decodes manifest targets. Union both spellings so raw
             // CommonJS paths and their dependencies remain protected as well.
             for (const spelling of new Set([target, decodeURIComponent(target)])) {
-              if (!spelling || /[*?#]/.test(spelling) || isAbsolute(spelling)) { complete = false; continue; }
+              if (!spelling || /[*?#\\\r\n\t]/.test(spelling) || isAbsolute(spelling)) { complete = false; continue; }
               const path = resolvePath(base, spelling);
               if (!inside(path)) { complete = false; continue; }
               if (walk(path)) found = true;
@@ -389,9 +389,10 @@ export function collectImportClosure({
         info.opaqueReads = imports.opaqueReads;
         for (const [specs, targets] of [[imports.specs, info.imports], [imports.requires || [], info.nonImports]]) {
           for (const spec of specs) {
-            if (extended && opaqueLoaderSpecifier(spec)) {
-              // URL bodies, percent-escaped file paths and loader modules are outside
-              // static evidence. Retain every file through closure-incomplete.
+            if (extended && (opaqueLoaderSpecifier(spec) || /[%?#\\\r\n\t]/.test(spec))) {
+              // URL syntax can select a different file than the raw filesystem spelling.
+              // Refuse before relative/package routing, even when a raw-path decoy exists.
+              // Retain every file through closure-incomplete; legacy walks stay independent.
               info.complete = false;
             } else if (spec.startsWith('./') || spec.startsWith('../')
               || (extended && (spec === '.' || spec === '..'))) {
