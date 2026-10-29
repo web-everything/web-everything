@@ -230,6 +230,27 @@ describe('overlay registration generations', () => {
     expect(f.list()).toEqual([{ ref: REF, pr: 17 }]);
   });
 
+  // A caller that asks for the CAS but has no token (a snapshot miss, a ref it already dropped and deleted from
+  // its snapshot, a legacy record) must never fall through to an unconditional removal.
+  it.each([undefined, null, '', 7])('T4b an explicit but unusable expectRegistrationId (%s) refuses removal, entry stays', (token) => {
+    const f = fixture();
+    const current = f.add();
+    const before = f.bytes();
+    expect(() => overlays.removeOverlay(f.root, REF, { env: f.env, expectRegistrationId: token })).toThrow(/registration changed/);
+    expect(f.bytes()).toBe(before);
+    expect(f.list()).toEqual([current]);
+    f.seed([{ ref: REF, pr: 17 }]);
+    expect(() => overlays.removeOverlay(f.root, REF, { env: f.env, expectRegistrationId: token })).toThrow(/registration changed/);
+    expect(f.list()).toEqual([{ ref: REF, pr: 17 }]);
+  });
+
+  it('T4c removal without the CAS option keeps its unconditional operator semantics', () => {
+    const f = fixture();
+    f.add();
+    expect(overlays.removeOverlay(f.root, REF, { env: f.env }).removed).toBe(true);
+    expect(f.list()).toEqual([]);
+  });
+
   it('T5 migration idempotent + shared id: legacy entry and legacy applied row get the SAME id', () => {
     const f = fixture();
     f.seed([{ ref: REF, pr: 17 }]);
