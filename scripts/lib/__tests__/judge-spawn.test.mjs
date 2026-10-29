@@ -567,11 +567,11 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
   });
 
   it.each([
-    "You've hit your weekly limit · resets ...", 'HTTP 429', 'rate_limit', 'rate limit', 'too many requests',
+    "You've hit your weekly limit · resets ...", 'HTTP 429',
     "You've hit your weekly limit · resets Oct 30 at 4pm (America/Toronto)",
     "You've hit your usage limit",
     '429 {"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}',
-    'API Error: 429 rate_limit_error', 'Usage limit reached', 'You exceeded your current quota',
+    'API Error: 429 rate_limit_error', 'You exceeded your current quota',
   ])
     ('tags quota failure %s without changing its message', async result => {
       const { fn } = fakeSpawn(JSON.stringify({ is_error: true, result }), { code: 1 });
@@ -593,6 +593,11 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
 
   it.each([
     'schema invalid', '',
+    'rate_limit', 'rate limit', 'too many requests', 'Usage limit reached',
+    'rate limit must be a positive integer',
+    'too many requests configured: expected at most 10',
+    'Rate limit is configured wrong',
+    'usage limit reached for your plan setting (config error)',
     'RESOURCE_EXHAUSTED: Out of memory', 'TypeError: rate limit is not a function',
     'build log mentions HTTP 429 in a fixture', 'disk quota exceeded',
   ])('leaves non-quota failure %j untagged and countable', async result => {
