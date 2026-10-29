@@ -100,7 +100,17 @@ export function addEntries(list, { tests = [], brokenSha, owner, reason, actor, 
   const entries = [...base.entries];
   const events = [];
   for (const test of tests) {
-    if (entries.some((e) => e.test === test && now < e.expiresAt && (job === undefined ? e.job === undefined : entryCoversJob(e, job)))) continue;
+    const same = (e) => e.test === test && now < e.expiresAt && (job === undefined ? e.job === undefined : entryCoversJob(e, job));
+    const idx = entries.findIndex(same);
+    if (idx >= 0) {
+      // Already listed: a different brokenSha re-keys it (brokenSha/reason/expiresAt); the same sha stays a no-op.
+      if (entries[idx].brokenSha === brokenSha) continue;
+      const exp = now + Math.min(Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : QUARANTINE_DEFAULT_TTL_MS, QUARANTINE_MAX_TTL_MS);
+      const e = { ...entries[idx], brokenSha, reason, expiresAt: exp };
+      entries[idx] = e;
+      events.push({ type: 'quarantine-rekeyed', at: now, actor, from: base.entries[idx]?.brokenSha ?? null, ...e });
+      continue;
+    }
     const e = { test, brokenSha, owner, reason, addedAt: now, expiresAt: fileExpiry(entries, { test, brokenSha, now, ttlMs }), ...(area ? { area } : {}), ...(job !== undefined ? { job } : {}), ...(proof ? { proof } : {}) };
     entries.push(e);
     events.push({ type: 'quarantine-added', at: now, actor, ...e });
@@ -455,7 +465,10 @@ export function classifyQuarantinedFailure({ failedTests, list, now }) {
  */
 export function decideQuarantineHold({ num, files, signal, list, fixFiles, now }) {
   if (signal.fixPrs.includes(Number(num))) return { hold: false, fix: true };
-  const live = activeEntries(list, { now }).filter((e) => !signal.firstRedSha || String(signal.firstRedSha).startsWith(e.brokenSha) || e.brokenSha.startsWith(String(signal.firstRedSha)));
+  // An entry keyed to the streak's first OR latest red sha covers it (the latest run is where failures are read). Only the
+  // sha match widens; unknown files, fix-PR overlap and area overlap below are unchanged.
+  const shas = [signal.firstRedSha, signal.latestRedSha].filter(Boolean).map(String);
+  const live = activeEntries(list, { now }).filter((e) => !shas.length || shas.some((s) => s.startsWith(e.brokenSha) || e.brokenSha.startsWith(s)));
   if (!live.length) return { hold: true, fallback: 'stop', reason: 'red-main-hold: main is red and no quarantine entry covers it — stop mode until one is published' };
   if (!Array.isArray(files)) return { hold: true, reason: 'red-main-hold: main is red (quarantine) and this PR\'s files are unknown — held (fail closed)' };
   const fixSet = new Set(fixFiles ?? []);
