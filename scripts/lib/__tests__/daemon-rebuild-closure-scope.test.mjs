@@ -193,16 +193,37 @@ it.each([
   }) });
 });
 
-it.each([
-  { label: 'omitted', options: {} },
-  { label: 'empty', options: { entries: [] } },
-])('readyBuildVerified in on mode without entries fails closed ($label)', async ({ options }) => {
+it.each(['on', 'off', 'shadow'].flatMap(mode => [
+  { mode, label: 'omitted', options: {} },
+  { mode, label: 'empty', options: { entries: [] } },
+  { mode, label: 'invalid', options: { entries: null } },
+  { mode, label: 'empty provider', options: { entries: () => [] } },
+  { mode, label: 'throwing provider', options: { entries() { throw new Error('unreadable'); } } },
+]))('readyBuildVerified refuses saved scoped candidates without runtime entries in $mode mode ($label)', async ({ mode, options }) => {
   const f = fixture(); const adopt = await planRebuild(f.args);
   expect(adopt.applied[0]).toMatchObject({ resolvedVia: 'closure-scope', excluded: ['unused.mjs'] });
   const args = { git: f.git, adopt, mainTip: f.main, prevHead: f.main,
-    env: { WE_DAEMON_CLOSURE_SCOPE: 'on' } };
+    env: { WE_DAEMON_CLOSURE_SCOPE: mode } };
   expect(readyBuildVerified({ ...args, entries: ['entry.mjs'] })).toBe(true);
   expect(readyBuildVerified({ ...args, ...options })).toBe(false);
+});
+
+it.each(['on', 'off', 'shadow'])('readyBuildVerified resolves runtime entries once in %s mode', async mode => {
+  const f = fixture(); const adopt = await planRebuild(f.args);
+  const entries = vi.fn().mockReturnValueOnce(['entry.mjs', 'unused.mjs']).mockReturnValue([]);
+  expect(readyBuildVerified({ git: f.git, adopt, mainTip: f.main, prevHead: f.main,
+    entries, env: { WE_DAEMON_CLOSURE_SCOPE: mode } })).toBe(false);
+  expect(entries).toHaveBeenCalledTimes(1);
+});
+
+it('planning retains the conflict if runtime entries disappear before final verification', async () => {
+  const f = fixture();
+  const entries = vi.fn().mockReturnValueOnce(['entry.mjs']).mockReturnValue([]);
+  const plan = await planRebuild({ ...f.args, entries });
+  expect(plan.applied).toEqual([]);
+  expect(plan.alerts).toContainEqual({ kind: 'overlay-closure-scope-refused', detail: expect.objectContaining({
+    reason: 'entries-unreadable', message: expect.stringContaining('rebase'),
+  }) });
 });
 
 it('readyBuildVerified rebuilds exclusions and refuses a reachable or tampered excluded path', async () => {

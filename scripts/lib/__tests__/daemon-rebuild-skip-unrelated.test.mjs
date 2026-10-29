@@ -228,14 +228,15 @@ describe('the skip decision covers everything the shared candidate smoke exercis
     expect(smokeSurfaceEntries({ WE_SMOKE_DAEMON_ENTRIES: 'x/extra-daemon.mjs' })).toContain('x/extra-daemon.mjs');
   });
 
-  const smokeMoves = [
+  // Each real-Git scenario gets its own deadline; two complete rebuild sequences
+  // in one test can exhaust the default timeout on a loaded CI shard.
+  const moves = [
     ['a sibling daemon entry', 'skills-src/conveyor/review-daemon.mjs'],
     ['lane-pool.mjs (lane-pool-list / lane-acquire-release)', 'scripts/lane-pool.mjs'],
     ['reconcile-pass.mjs (reconcile-dry-run)', 'scripts/conveyor/reconcile-pass.mjs'],
     ['a dispatch module (dispatch-dry-run)', 'scripts/operations/review-dispatch.mjs'],
   ].flatMap(([label, file]) => [true, false].map(existsBefore => ({ label, file, existsBefore })));
-  // Each real-git scenario gets its own test deadline and afterEach cleanup.
-  it.each(smokeMoves)('a move that changes only $label smokes (exists before move: $existsBefore)', async ({ file, existsBefore }) => {
+  it.each(moves)('a move that changes only $label smokes (exists before move: $existsBefore)', async ({ file, existsBefore }) => {
     const f = makeFixture();
     advanceMain(f.originDir, (dir) => {
       writeFile(dir, entry, "import './lib/a.mjs';\n");

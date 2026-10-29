@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 import { autoRetireOverlays } from '../daemon-overlay-auto-retire.mjs';
-import { overlayFilePath, readOverlayState, reinstateOverlaySources, writeOverlays } from '../daemon-overlays.mjs';
+import { addOverlay, migrateRegistrationIds, overlayFilePath, persistTipShas, readOverlayState, registrationIdentity,
+  reinstateOverlaySources, removeOverlay, writeOverlays } from '../daemon-overlays.mjs';
 import { writeRebuildState } from '../daemon-rebuild/state.mjs';
 
 // Exercise preparation and real registry storage without network or .git writes.
@@ -19,6 +20,7 @@ vi.mock('../daemon-overlays.mjs', async (original) => {
   return { ...actual,
     persistTipShas: (...args) => {
       model.persisted.push(args[1]);
+      model.onPersist?.();
       if (model.failTips) throw new Error('tip disk full');
       return actual.persistTipShas(...args);
     },
@@ -31,6 +33,7 @@ vi.mock('../daemon-overlays.mjs', async (original) => {
 vi.mock('../daemon-rebuild/plan.mjs', async (original) => ({
   ...await original(),
   planRebuild: async ({ overlays }) => {
+    model.onPlan?.();
     model.plans.push(overlays.map((o) => o.ref));
     const applied = overlays.filter((o) => !(model.closed && o.ref === 'top'));
     const carries = applied.some((o) => o.ref === 'lower' || (o.ref === 'top' && !model.rewritten));
@@ -47,7 +50,7 @@ afterEach(() => { if (root) rmSync(root, { recursive: true, force: true }); });
 function fixture() {
   root = mkdtempSync(join(tmpdir(), 'retired-sources-'));
   Object.assign(model, { plans: [], rewritten: false, closed: false, missing: false, gitError: false,
-    lowerTip: '2', persisted: [], failTips: false, failAudit: false });
+    lowerTip: '2', persisted: [], failTips: false, failAudit: false, onPersist: null, onPlan: null });
   const env = { WE_DAEMON_OVERLAY_DIR: join(root, 'overlays'), WE_DAEMON_STATE_DIR: join(root, 'state'),
     WE_DAEMON_EVENTS: join(root, 'events'), WE_PLATFORM_PREFERENCES_FILE: join(root, 'preferences'),
     WE_DAEMON_AUTO_REBASE: '0', WE_DAEMON_OVERLAY_AUTO_RETIRE: 'on', WE_DAEMON_OVERLAY_EDGE_RESOLVE: '0' };
@@ -79,7 +82,7 @@ function fixture() {
   };
   const entries = [{ ref: 'lower', pr: 1 }, { ref: 'top', pr: 2 }];
   writeOverlays(root, entries, { env });
-  const retire = () => autoRetireOverlays({ root, env, overlays: entries, git, mainSha: '1'.repeat(40),
+  const retire = () => autoRetireOverlays({ root, env, overlays: readOverlayState(root, { env }).overlays, git, mainSha: '1'.repeat(40),
     refEvidence: new Map(entries.map((o) => [o.ref, 'refreshed'])) });
   const prepare = (options = {}) => prepareRebuild({ root, env, run: git, now: Date.now, mainOnly: false,
     prState: async () => 'OPEN', prBaseChain: async () => [], ...options });
@@ -87,6 +90,105 @@ function fixture() {
 }
 
 describe('archived sources remain represented in preparation', () => {
+  it.each(['fetch', 'planning', 'persistence'])('generation-only change during %s aborts preparation', async (stage) => {
+    const f = fixture();
+    // Start with stamped registrations so the transient writer is the only generation change.
+    f.env.WE_DAEMON_OVERLAY_AUTO_RETIRE = 'shadow';
+    migrateRegistrationIds(root, { env: f.env });
+    const before = readOverlayState(root, { env: f.env });
+    let injected = false;
+    const mutate = () => {
+      if (injected) return;
+      injected = true;
+      const transient = addOverlay(root, { ref: 'transient' }, { env: f.env }).find(o => o.ref === 'transient');
+      removeOverlay(root, transient.ref, { env: f.env, expectRegistrationId: transient.registrationId });
+    };
+    if (stage === 'planning') model.onPlan = mutate;
+    if (stage === 'persistence') model.onPersist = mutate;
+    const next = await f.prepare({ run: (args) => {
+      if (stage === 'fetch' && args[0] === 'fetch') mutate();
+      return f.git(args);
+    } });
+    expect(injected).toBe(true);
+    expect(next).toMatchObject({ terminal: true, result: { moved: false, reason: 'overlay-registration-changed' } });
+    const after = readOverlayState(root, { env: f.env });
+    expect(after.generation).toBe(before.generation + 2);
+    expect(after.overlays.map(registrationIdentity)).toEqual(before.overlays.map(registrationIdentity));
+    expect(next.alerts.map(a => a.kind)).toContain('overlay-registration-changed');
+    expect(model.persisted).toHaveLength(stage === 'persistence' ? 1 : 0);
+  });
+
+  it.each(['absent', undefined, null, '', 42])('tip persistence refuses an unusable token (%s) after re-registration', (token) => {
+    const f = fixture();
+    const old = addOverlay(root, { ref: 'tip', pr: 17 }, { env: f.env }).find(o => o.ref === 'tip');
+    removeOverlay(root, old.ref, { env: f.env, expectRegistrationId: old.registrationId });
+    const replacement = addOverlay(root, { ref: 'tip', pr: 17 }, { env: f.env }).find(o => o.ref === 'tip');
+    // Metadata from a later read is insufficient: the refresh itself must carry an explicit token.
+    const evidence = { sha: 'a'.repeat(40), reg: registrationIdentity(replacement) };
+    if (token !== 'absent') evidence.registrationId = token;
+    const file = overlayFilePath(root, f.env);
+    const before = readFileSync(file, 'utf8');
+    expect(persistTipShas(root, new Map([['tip', evidence]]), { env: f.env })).toEqual({ written: 0 });
+    expect(readFileSync(file, 'utf8')).toBe(before);
+  });
+
+  it('refreshed tips carry registration tokens and matching tokens still persist', async () => {
+    const f = fixture();
+    migrateRegistrationIds(root, { env: f.env });
+    const before = readOverlayState(root, { env: f.env });
+    await f.prepare();
+    const tips = model.persisted.at(-1);
+    expect(tips.size).toBeGreaterThan(0);
+    for (const [ref, evidence] of tips) {
+      expect(evidence.registrationId).toBe(before.overlays.find(o => o.ref === ref).registrationId);
+      expect(readOverlayState(root, { env: f.env }).overlays.find(o => o.ref === ref).tipSha).toBe(evidence.sha);
+    }
+  });
+
+  it('restored sources discard pre-restoration tips and refresh only on the next tick', async () => {
+    const f = fixture();
+    migrateRegistrationIds(root, { env: f.env });
+    const original = readOverlayState(root, { env: f.env }).overlays.find(o => o.ref === 'lower');
+    await f.retire();
+    model.rewritten = true;
+    const restored = await f.prepare();
+    expect(restored.result.plan.applied).toContainEqual(expect.objectContaining({ ref: 'lower', registrationId: original.registrationId }));
+    expect(model.persisted.at(-1).size).toBe(0);
+    await f.prepare();
+    expect(model.persisted.at(-1).get('lower').registrationId).toBe(original.registrationId);
+  });
+
+  it('re-registering a previously restored source before tip persistence cannot receive its old tip', async () => {
+    const f = fixture();
+    migrateRegistrationIds(root, { env: f.env });
+    await f.retire();
+    model.rewritten = true;
+    await f.prepare();
+    let replacement;
+    model.onPersist = () => {
+      const restored = readOverlayState(root, { env: f.env }).overlays.find(o => o.ref === 'lower');
+      removeOverlay(root, restored.ref, { env: f.env, expectRegistrationId: restored.registrationId });
+      replacement = addOverlay(root, restored, { env: f.env }).find(o => o.ref === restored.ref);
+    };
+    const next = await f.prepare();
+    expect(replacement).toBeDefined();
+    expect(readOverlayState(root, { env: f.env }).overlays.find(o => o.ref === 'lower')).toEqual(replacement);
+    expect(replacement.tipSha).toBeUndefined();
+    expect(next.result.reason).toBe('overlay-registration-changed');
+  });
+
+  it('source restoration advances generation once and preserves existing registration ids', () => {
+    const f = fixture();
+    const source = { ref: 'archived', registrationId: 'archived-registration' };
+    const carrier = { ref: 'carrier', registrationId: 'carrier-registration', retiredSources: [{ entry: source, sha: '2'.repeat(40) }] };
+    writeOverlays(root, [carrier], { env: f.env, generation: 7 });
+    reinstateOverlaySources(root, carrier.ref, { env: f.env, expectedOverlay: carrier });
+    expect(readOverlayState(root, { env: f.env })).toMatchObject({ generation: 8,
+      overlays: [{ ...source, tipSha: '2'.repeat(40) }, carrier] });
+    reinstateOverlaySources(root, carrier.ref, { env: f.env, expectedOverlay: carrier });
+    expect(readOverlayState(root, { env: f.env }).generation).toBe(8);
+  });
+
   it.each([undefined, null, new Map(), new Map([['lower', 'unverifiable']])])('on mode fails closed without complete per-ref freshness evidence (%j)', async (refEvidence) => {
     const f = fixture();
     const overlays = readOverlayState(root, { env: f.env }).overlays;

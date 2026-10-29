@@ -252,6 +252,32 @@ const mutationCases = [
 ];
 
 describe('ready-only preparation defers clone mutations to the normal tick', () => {
+  it('readyOnly prepare queues the job with untracked backlog/xabc123-unlanded.md without bornAs on origin/main or a collision', async () => {
+    const f = prepareFixture();
+    const plan = plannedFixture(f);
+    const path = 'backlog/xabc123-unlanded.md';
+    fs.mkdirSync(join(f.root, 'backlog'));
+    fs.writeFileSync(join(f.root, path), 'unlanded sidecar');
+    const before = cloneBytes(f.root);
+    const r = await prepareRebuild({ ...f.args, readyOnly: true });
+    expect(r.result?.reason).not.toBe('readonly-job-mutation-due');
+    expect(r).toMatchObject({ terminal: false, plan, lease: { token: expect.any(String) } });
+    expect(readRebuildState(f.root, f.env).building.token).toBe(r.lease.token);
+    expect(r.alerts).toContainEqual({ kind: 'untracked-kept', detail: { paths: [path] } });
+    expect(cloneBytes(f.root)).toEqual(before);
+  });
+
+  it('readyOnly prepare defers pruning a landed backlog sidecar without changing clone bytes', async () => {
+    const f = prepareFixture();
+    mutationCases.find(([mutation]) => mutation === 'backlog-sidecar-prune')[1](f);
+    const before = cloneBytes(f.root);
+    expect(await prepareRebuild({ ...f.args, readyOnly: true })).toMatchObject({
+      terminal: true, result: { reason: 'readonly-job-mutation-due', mutation: 'backlog-sidecar-prune' },
+    });
+    expect(planner.planRebuild).not.toHaveBeenCalled();
+    expect(cloneBytes(f.root)).toEqual(before);
+  });
+
   it.each(mutationCases)('readyOnly preserves every clone byte for %s', async (mutation, setup) => {
     const f = prepareFixture(); setup(f);
     const before = cloneBytes(f.root);

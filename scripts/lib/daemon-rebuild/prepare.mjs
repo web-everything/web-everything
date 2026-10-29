@@ -31,7 +31,6 @@ import { resolveClosureScopeMode } from './skip-unrelated.mjs';
 import { autoRetireOverlays } from '../daemon-overlay-auto-retire.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
-import { isHash, idFromName } from '../../backlog/id.mjs';
 import { repairCloneRefs, holdsCloneWriteLock, probeBrokenRefs, diagnoseLane } from '../lane-repair.mjs';
 import {
   markOverlayConflictWake, readOverlayConflictWakes, clearOverlayConflictWake,
@@ -264,6 +263,7 @@ export async function prepareRebuild({
     if (!mainOnly) return terminal({ moved: false, reason: 'overlay-state-corrupt' });
   }
   let overlaysBefore = overlayState.overlays;
+  let snapshotGeneration = overlayState.generation;
   if (!mainOnly && !overlayState.corrupt) {
     const migrated = migrateRegistrationIds(root, { env, adopted: state.adopted });
     if (migrated.adopted !== state.adopted) { state.adopted = migrated.adopted; writeState(); }
@@ -275,6 +275,7 @@ export async function prepareRebuild({
       return terminal({ moved: false, reason: 'overlay-registration-changed' });
     }
     overlaysBefore = migrated.list;
+    snapshotGeneration = migrated.generation;
   }
   const snap = new Map(overlaysBefore.map((o) => [o?.ref, o?.registrationId]));
   const ourRemoved = new Set();
@@ -290,7 +291,7 @@ export async function prepareRebuild({
       generation = 0;
     }
     const expected = new Map([...snap, ...ourRestored]);
-    return generation === fresh.generation && !fresh.corrupt && fresh.overlays.every((o) => o && expected.has(o.ref) && expected.get(o.ref) === o.registrationId)
+    return generation === snapshotGeneration && generation === fresh.generation && !fresh.corrupt && fresh.overlays.every((o) => o && expected.has(o.ref) && expected.get(o.ref) === o.registrationId)
       && [...expected.keys()].every((ref) => ourRemoved.has(ref) || fresh.overlays.some((o) => o?.ref === ref));
   };
   const registrationChanged = () => {
@@ -352,6 +353,7 @@ export async function prepareRebuild({
           if (!snapshotHolds()) throw new Error('registration changed; refusing removal');
           const removed = removeOverlay(r, ref, { ...options, expectRegistrationId: snap.get(ref) });
           if (removed.removed) {
+            snapshotGeneration += 1;
             ourRemoved.add(ref); snap.delete(ref);
             for (const restored of removed.reinstated ?? []) {
               ourRestored.set(restored, removed.list.find((o) => o.ref === restored)?.registrationId);
@@ -405,9 +407,10 @@ export async function prepareRebuild({
     const detail = { refs: unverified.map((o) => o?.ref), message: 'Overlay tips unavailable; preserving registrations and skipping these overlays for this rebuild. Retrying next tick; restore or re-register deleted branches from their recorded SHA.' };
     alert('overlay-fetch-unverifiable', detail);
   }
-  if (readyOnly && unsafe.untracked.some((path) => /^backlog\/[^/]+\.md$/.test(path)
-    && isHash(idFromName(path.slice(8, -3))))) return mutationDue('backlog-sidecar-prune');
-  pruneLandedBacklogSidecars({ git, root, paths: unsafe.untracked, mainSha: fetchedMainSha, alert });
+  const prunedSidecars = pruneLandedBacklogSidecars({
+    git, root, paths: unsafe.untracked, mainSha: fetchedMainSha, alert, dryRun: readyOnly,
+  });
+  if (readyOnly && prunedSidecars.length) return mutationDue('backlog-sidecar-prune');
   const remaining = collectUntrackedPaths(git);
   if (remaining === null) {
     alert('status-failed', 'Post-cleanup ls-files --others failed');
@@ -475,6 +478,7 @@ export async function prepareRebuild({
       const restored = [];
       for (const carrier of uncovered) {
         const recovery = reinstateOverlaySources(root, carrier.ref, { env, expectedOverlay: carrier });
+        if (recovery.reinstated.length) snapshotGeneration += 1;
         for (const ref of recovery.reinstated) {
           ourRestored.set(ref, recovery.list.find((o) => o.ref === ref)?.registrationId);
           if (!recoveredRefs.has(ref)) restored.push(ref);
@@ -614,17 +618,25 @@ export async function prepareRebuild({
     return terminal({ moved: false, reason: 'established-overlay-conflict', detail });
   }
   if (!snapshotHolds()) return registrationChanged();
-  refreshedTips = new Map([...refreshedTips].map(([ref, tip]) => [ref, { ...tip, registrationId: snap.get(ref) }]));
+  refreshedTips = new Map([...refreshedTips].map(([ref, tip]) => [ref, {
+    ...tip, registrationId: tip.registrationId ?? snap.get(ref) ?? ourRestored.get(ref),
+  }]));
   try { persistTipShas(root, refreshedTips, { env }); }
   catch (error) {
     alert('overlay-auto-retire-audit-failed', { failures: [{ ref: null, kind: 'tip-sha', error: String(error?.message || error) }] });
   }
+  if (!snapshotHolds()) return registrationChanged();
   for (const d of plan.decisions) {
+    if (!snapshotHolds()) return registrationChanged();
     if (d.pr != null && (d.action === 'apply' || d.action === 'remove') && !d.pinned) clearOverlayConflictWake(env, d.pr);
     if (d.action === 'remove') {
       try {
-        const removed = removeOverlay(root, d.ref, { env, why: d.reason, expectRegistrationId: snap.get(d.ref) });
+        // A source this tick reinstated is bound to the id we restored; with neither, removeOverlay refuses.
+        const removed = removeOverlay(root, d.ref, {
+          env, why: d.reason, expectRegistrationId: snap.get(d.ref) ?? ourRestored.get(d.ref),
+        });
         if (removed.removed) {
+          snapshotGeneration += 1;
           ourRemoved.add(d.ref); snap.delete(d.ref);
           for (const ref of removed.reinstated ?? []) ourRestored.set(ref, removed.list.find((o) => o.ref === ref)?.registrationId);
         }

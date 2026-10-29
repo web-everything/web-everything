@@ -139,10 +139,13 @@ export function reportDiscardedCandidate({ ready, match, alert, needsYou }) {
 export function readyBuildVerified({
   git, adopt, mainTip, prevHead, approvedEdgeShaFor = () => null, entries = [], env = {}, closureScopeMode,
 }) {
-  if ((closureScopeMode ?? resolveClosureScopeMode(env).mode) === 'on') {
+  const applied = Array.isArray(adopt?.applied) ? adopt.applied : [];
+  const scoped = applied.some(a => a?.resolvedVia === 'closure-scope' || a?.excluded !== undefined);
+  // Persisted scoped builds still need runtime evidence after the strategy is disabled.
+  if (scoped || (closureScopeMode ?? resolveClosureScopeMode(env).mode) === 'on') {
     try {
-      const runtimeEntries = typeof entries === 'function' ? entries() : entries;
-      if (!Array.isArray(runtimeEntries) || !runtimeEntries.length) return false;
+      entries = typeof entries === 'function' ? entries() : entries;
+      if (!Array.isArray(entries) || !entries.length) return false;
     } catch { return false; }
   }
   const isAncestor = (a, b) => git(['merge-base', '--is-ancestor', a, b]).status === 0;
@@ -150,9 +153,8 @@ export function readyBuildVerified({
   // Never a rollback: the record's main must be at or past the main the current head was built on.
   const headBase = prevHead ? String(git(['merge-base', prevHead, mainTip]).stdout ?? '').trim() : '';
   if (!headBase || !isAncestor(headBase, adopt.mainSha)) return false;
-  const applied = Array.isArray(adopt.applied) ? adopt.applied : [];
   let finalScope;
-  if (applied.some(a => a?.resolvedVia === 'closure-scope' || a?.excluded !== undefined)) {
+  if (scoped) {
     const final = finalClosureScope({ git, sha: adopt.finalSha, entries, env });
     if (!final.ok) return false;
     finalScope = final.scope;
