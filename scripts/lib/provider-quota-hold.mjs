@@ -5,13 +5,19 @@ export const CODEX_QUOTA_FULL_PERCENT = 98;
 export function isQuotaError(text) {
   if (typeof text !== 'string') return false;
   // Strip only provider prefixes at the start; incidental log mentions are not evidence.
-  const message = text.replace(/^(?:(?:API Error|Error):\s*)?(?:\d{3}\s+)?/i, '');
+  const unwrapped = text.replace(/^(?:API Error|Error):\s*/i, '');
+  // A bare phrase like "too many requests" can describe a local configuration error.
+  if (/^(?:(?:HTTP|status)\s+429\b|429\s+Too Many Requests\b)/i.test(unwrapped)) return true;
+  const message = unwrapped.replace(/^\d{3}\s+/, '');
+  // Match complete provider error codes, not similarly named configuration fields.
+  if (/^(?:error type:\s*)?(?:rate_limit_error|insufficient_quota)\s*$/i.test(message)) return true;
   // Resource exhaustion needs an explicit quota reason; the token alone also covers memory failures.
-  if (/^(?:rate[ _-]limit(?:_error)?|usage limit reached|insufficient_quota|resource_exhausted:\s*quota exceeded|too many requests|(?:HTTP|status)\s+429|you exceeded your current quota|you['’]ve hit your (?:weekly |daily |monthly |usage )?limit)\b/i.test(message)) return true;
+  if (/^(?:resource_exhausted:\s*quota exceeded|you exceeded your current quota|you['’]ve hit your (?:weekly |daily |monthly |usage )?limit)\b/i.test(message)) return true;
   if (!message.startsWith('{')) return false;
   try {
     const payload = JSON.parse(message);
-    return payload?.type === 'error' && payload.error?.type === 'rate_limit_error';
+    return payload?.type === 'error'
+      && ['rate_limit_error', 'insufficient_quota'].includes(payload.error?.type);
   } catch {
     return false;
   }
