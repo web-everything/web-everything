@@ -17,10 +17,13 @@ import { publishAttention } from '../../operations/needs-you-feed.mjs';
 import { isUnderTest } from '../under-test.mjs';
 import { syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 import { sweepAdvisoryLabels } from '../../conveyor/advisory-label-sweep.mjs';
+import * as completeComments from '../../conveyor/pr-comments-complete.mjs';
+import { appendDaemonEvent } from '../daemon-events.mjs';
 
 // The real operator feed is never written from this file: every test either injects a publisher or relies on the
 // test-run guard, and the guard's own tests assert against this stand-in.
 vi.mock('../../operations/needs-you-feed.mjs', async importOriginal => ({ ...(await importOriginal()), publishAttention: vi.fn() }));
+vi.mock('../daemon-events.mjs', () => ({ appendDaemonEvent: vi.fn().mockResolvedValue(true) }));
 
 const HEAD = 'b'.repeat(40);
 const BASE_TIP = 'e'.repeat(40);
@@ -29,7 +32,7 @@ const policyOf = (strategy) => ({ policy: resolveMergeDeliveryPolicy({ tool: str
 
 const DRAIN = 'drain-bot';
 
-function harness({ strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = process.env, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, baseTip = () => BASE_TIP, publishNeedsYou, redTeamDeadline, labelProvider, strategyExtra = {} } = {}) {
+function harness({ changedFiles = ['scripts/x.mjs'], strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = process.env, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, baseTip = () => BASE_TIP, publishNeedsYou, redTeamDeadline, labelProvider, strategyExtra = {} } = {}) {
   const calls = [];
   const readLive = onView.readLive;
   const logs = [];
@@ -59,7 +62,7 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
     if (args[0] === 'api' && args[1] === 'user') { if (selfLogin == null) throw new Error('gh: not logged in'); return `${selfLogin}\n`; }
     if (cmd === 'git' && args[0] === 'rev-parse') return `${baseTip()}\n`; // the base tip the pinned diff used
     if (cmd === 'git' && args[0] === 'ls-remote') return `${baseTip()}\t${args.at(-1)}\n`; // the live base tip
-    if (cmd === 'git') return args[0] === 'diff' ? 'scripts/x.mjs\0' : ''; // the pinned change list of the judged head
+    if (cmd === 'git') return args[0] === 'diff' ? `${changedFiles.join('\0')}\0` : ''; // the pinned change list of the judged head
     if (args[0] === 'pr' && args[1] === 'view' && args.includes('id,headRefOid,baseRefName')) return JSON.stringify({ id: 'PR_NODE', headRefOid: HEAD, baseRefName: 'main', labels: ['ready-to-merge'] });
     if (args[0] === 'pr' && args[1] === 'view' && viewThrows.includes(Number(args[2]))) throw new Error('gh: HTTP 502');
     if (args[0] === 'pr' && args[1] === 'view' && args.includes('headRefOid,labels,reviews') && readLive) return JSON.stringify(readLive());
@@ -112,6 +115,47 @@ describe('drain merge strategy — drain-direct (default) is unchanged', () => {
 });
 
 describe('drain merge strategy — github-merge-queue', () => {
+  it.each([true, false])('R212: setting %s controls enqueue with exact operator approval', enabled => {
+    const read = vi.spyOn(completeComments, 'readCompletePrComments').mockReturnValue([
+      { author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${HEAD} -->\n<!-- cleared-human: operator -->` },
+    ]);
+    appendDaemonEvent.mockClear();
+    try {
+      const env = { WE_UNDER_TEST: '1', WE_MERGE_QUEUE_HUMAN_ONLY_APPROVAL_LICENSES_ENQUEUE: String(enabled) };
+      const h = harness({ strategy: 'github-merge-queue', changedFiles: ['.github/workflows/ci.yml'],
+        labels: ['review:accepted', 'ready-to-merge'], env,
+        evidence: { scheduled: false, inFlight: false, recorded: false, loopPayload: { verdict: { verdict: 'accept' } } } });
+      if (enabled) {
+        expect(h.s.enqueue({ num: 42 }, HEAD, { comments: [] })).toMatchObject({ enqueued: true });
+        expect(read).toHaveBeenCalled();
+        expect(appendDaemonEvent).not.toHaveBeenCalled();
+      } else {
+        expect(() => h.s.enqueue({ num: 42 }, HEAD, { comments: [] })).toThrow(/enqueue FAILED/);
+        expect(read).not.toHaveBeenCalled();
+        expect(appendDaemonEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', pr: 42,
+          detail: expect.stringMatching(/re-approve.*queue.*disabled/) }), { env });
+      }
+      expect(h.calls.some(c => c.some(arg => typeof arg === 'string' && arg.includes('mutation(') && arg.includes('enqueuePullRequest')))).toBe(enabled);
+      expect(h.logs.join('')).toContain(`approvalLicensesEnqueue=${enabled} (env)`);
+    } finally { read.mockRestore(); }
+  });
+
+  it('R212: unreadable approval emits needs-you even when event storage fails', async () => {
+    const read = vi.spyOn(completeComments, 'readCompletePrComments').mockImplementation(() => { throw Error('unreadable'); });
+    appendDaemonEvent.mockClear();
+    appendDaemonEvent.mockRejectedValueOnce(Error('storage unavailable'));
+    try {
+      const h = harness({ strategy: 'github-merge-queue', changedFiles: ['.github/workflows/ci.yml'],
+        labels: ['review:accepted', 'ready-to-merge'], env: { WE_UNDER_TEST: '1' },
+        evidence: { scheduled: false, inFlight: false, recorded: false, loopPayload: { verdict: { verdict: 'accept' } } } });
+      expect(() => h.s.enqueue({ num: 42 }, HEAD, { comments: [] })).toThrow(/enqueue FAILED/);
+      expect(appendDaemonEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you',
+        detail: expect.stringMatching(/re-approve.*queue.*unreadable/) }), expect.anything());
+      expect(h.calls.some(c => c.some(arg => typeof arg === 'string' && arg.includes('mutation(') && arg.includes('enqueuePullRequest')))).toBe(false);
+      await Promise.resolve();
+    } finally { read.mockRestore(); }
+  });
+
   it('xym8nt4: a card-group source is deferred as card-grouped and never reaches the enqueue mutation', () => {
     const { s, calls } = harness({ strategy: 'github-merge-queue', strategyExtra: {
       cardGroupHold: c => (c.num === 42 ? { kind: 'card-grouped', reason: 'grouped into #9 (lands with it; drain.group)' } : null) } });

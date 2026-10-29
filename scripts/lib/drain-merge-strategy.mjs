@@ -34,6 +34,7 @@ import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
  */
 import { sweepStuckEntries } from './merge-queue-stuck-dequeue.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
+import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './human-only-enqueue-license.mjs';
 import { labelSignature } from './drain-prestage.mjs';
 import { readDrainRedTeamEvidence } from './drain-red-team-evidence.mjs';
 import { readDrainQueueSafety, redTeamEnqueueHold, redTeamLabelHoldReason, dequeueSentBack, sendBackReason, queueLabels } from './drain-queue-safety.mjs';
@@ -529,8 +530,20 @@ export function createDrainMergeStrategy({
         if (freshHeld !== freshLabelHold) return { enqueued: false, deferred: true, kind: 'sent-back', reason: freshHeld };
       }
       if (freshLabelHold) return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: freshLabelHold };
-      const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, cwd, exec, ...(preparedAdmission ? { preparedSurface: prepared.preparedSurface } : {}) });
+      const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, cwd, exec,
+        humanOnlyLicense: () => {
+          const setting = resolveApprovalLicensesEnqueue({ env, readFile });
+          say(`  human-only approvalLicensesEnqueue=${setting.value} (${setting.source})`);
+          return setting.value
+            ? proveHumanOnlyLicense({ repo: slugOf(c.repo), pr: c.num, headSha, cwd, exec })
+            : { licensed: false, reason: `approvalLicensesEnqueue disabled (${setting.source}); operator must re-approve or queue it` };
+        },
+        ...(preparedAdmission ? { preparedSurface: prepared.preparedSurface } : {}) });
       if (!r.ok) {
+        if (r.humanOnly) {
+          void appendDaemonEvent({ kind: 'needs-you', repo: slugOf(c.repo), pr: c.num, daemon: 'drain',
+            detail: `Operator must re-approve the current head or queue it: ${r.licenseReason || r.error}` }, { env }).catch(() => {});
+        }
         // A shortcut refusal delegates to the full cascade in this pass. Do not install
         // retry backoff here: it would hide the refusal from that cascade's recovery catch.
         if (preparedAdmission) throw Object.assign(new Error(`github-merge-queue prepared enqueue FAILED (${r.error})`), {

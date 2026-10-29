@@ -1,5 +1,15 @@
 # Testing — Three-Tier Strategy
 
+## Human-only enqueue approval license (R212)
+
+`human-only-enqueue-license.test.mjs` uses local Git repositories to exercise exact clearance,
+the shared numbering proof, and main merges whose sensitive blobs match `origin/main`.
+Admission reads complete comments and live head/labels; missing or unreadable evidence retains
+the human hold. Successor proof is read-only, with 8 MiB per Git output and 1024 changed paths;
+exceeding either limit asks the operator to re-approve the current head or queue it.
+`drain-merge-strategy.test.mjs` covers the setting-off refusal and best-effort `needs-you` event.
+Run these and `merge-queue-enqueue.test.mjs` through the host heavy-admission queue.
+
 ## Direction-aware operation evidence (R131)
 
 In-process review callers import the pure shape derivation from `scripts/lib/review-shape.mjs`.
