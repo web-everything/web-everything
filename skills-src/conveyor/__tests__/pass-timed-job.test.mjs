@@ -19,7 +19,7 @@ import {
 import {
   makeCliMechanicalPasses, MECHANICAL_PASS_NAMES, runTimedPasses,
 } from '../runner.mjs';
-import { createJobStore, reapDeadGroup, stopHandle } from '../../../scripts/lib/daemon-jobs-runtime.mjs';
+import { createJobStore, localHostAliases, probeHandle, reapDeadGroup, stopHandle } from '../../../scripts/lib/daemon-jobs-runtime.mjs';
 import { DEFAULT_TASK_TIMEOUT_MS } from '../../../scripts/lib/daemon-jobs.mjs';
 import { taskIdentity } from '../../../scripts/lib/daemon-item-tasks.mjs';
 import { validateTaskMetadata } from '../../../scripts/operations/job-record.mjs';
@@ -84,6 +84,7 @@ function fixture(policyOptions = {}) {
     env: {}, eventsPath: join(dir, 'daemon-events.jsonl'),
     now: () => Date.now(),
     readStart: () => new Date(Date.now()).toISOString(), host: 'fixture-host',
+    aliases: new Set(['fixture-host', 'fixture-host.local']),
     log, alert: detail => alerts.push(detail),
     // No host preferences, git snapshots, network, or real subprocesses.
     root: dir, codeSha: 'fixture-sha',
@@ -124,6 +125,49 @@ async function quarantinedFixture() {
 }
 
 describe('timed pass quarantine recovery and reporting', () => {
+  it.each(['quarantine', 'reattachment', 'expired deadline'].flatMap(mode =>
+    ['server', 'server.local', 'Old-Computer'].map(recordedHost => [mode, recordedHost])))(
+    'recovers %s for a dead owner recorded under local alias %s', async (mode, recordedHost) => {
+      const f = await quarantinedFixture();
+      f.store.update(f.record.id, r => {
+        r.job.host = recordedHost;
+        r.job.handle = `${recordedHost}:${r.job.pid}:${r.job.procStart}`;
+        if (mode !== 'quarantine') {
+          delete r.job.passQuarantine;
+          delete r.job.passResult;
+        }
+        return r;
+      });
+      if (mode === 'expired deadline') vi.setSystemTime(Date.now() + 200);
+      const handle = f.store.read(f.record.id).job.handle;
+      const host = 'server.example';
+      const aliases = localHostAliases({ host, platform: 'linux' });
+      aliases.add('Old-Computer'); // e.g. a trusted macOS ComputerName alias
+      const probe = vi.fn(h => h === handle
+        ? probeHandle(h, { host, aliases, readStart: () => null }) : f.probe(h));
+      const reapGroup = vi.fn((h, notAfterMs, options) => reapDeadGroup(h, {
+        ...options, notAfterMs, host, aliases,
+        kill: () => { throw Object.assign(new Error('no group'), { code: 'ESRCH' }); },
+      }));
+
+      const pending = runPassAsTimedJob(f.pass, { ...f.ports, host, aliases, probe, reapGroup });
+      if (mode === 'quarantine') {
+        await vi.waitFor(() => expect(f.children).toHaveLength(2));
+        f.children[1].finish();
+        await expect(pending).resolves.toEqual({ code: 0, signal: null });
+        expect(quarantineEvents(f)[0].kind).toBe('pass-quarantine-cleared');
+      } else {
+        await expect(pending).resolves.toMatchObject(mode === 'expired deadline'
+          ? { outcome: 'timeout' } : { spawnError: 'pass owner exited without a recorded result' });
+        expect(f.spawnFn).toHaveBeenCalledTimes(1);
+      }
+
+      expect(f.store.read(f.record.id).job).toMatchObject({ status: 'failed', handle: null });
+      expect(f.store.read(f.record.id).job.passQuarantine).toBeUndefined();
+      expect(reapGroup).toHaveBeenCalledWith(handle, expect.any(Number), { requireConfirmedDeath: true });
+    },
+  );
+
   it.each(['orphaned descendants', 'live reused leader'])(
     'never SIGKILLs unrelated PID/PGID 7000 reused while the daemon was down (%s)', async mode => {
       const f = await quarantinedFixture();
@@ -370,6 +414,7 @@ describe('timed pass quarantine recovery and reporting', () => {
 
   it.each([
     ['record host mismatch', { host: 'other-host' }],
+    ['record and handle use different local aliases', { host: 'fixture-host.local' }],
     ['record host missing', { host: undefined }],
     ['record host null', { host: null }],
     ['record pid mismatch', { pid: 8000 }],
@@ -381,6 +426,7 @@ describe('timed pass quarantine recovery and reporting', () => {
     ['record start empty', { procStart: '' }],
     ['handle host mismatch', { handle: 'other-host:7000:2026-10-10T00:00:00.000Z' }],
     ['consistent foreign host', { host: 'other-host', handle: 'other-host:7000:2026-10-10T00:00:00.000Z' }],
+    ['unrecognized FQDN with local short name', { host: 'fixture-host.foreign', handle: 'fixture-host.foreign:7000:2026-10-10T00:00:00.000Z' }],
     ['handle pid mismatch', { handle: 'fixture-host:8000:2026-10-10T00:00:00.000Z' }],
     ['handle start mismatch', { handle: 'fixture-host:7000:different-start' }],
     ['group identity mismatch', { pgid: 8000 }],

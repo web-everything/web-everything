@@ -50,7 +50,7 @@ import { createHash } from 'node:crypto';
 import { CONSTELLATION_REPOS } from '../../scripts/lib/constellation-repos.mjs';
 import { enqueueItemTask } from '../../scripts/lib/daemon-item-tasks.mjs';
 import { defineJobKind, markClaimed, markSucceeded, markFailed, taskDeadlineDecision } from '../../scripts/lib/daemon-jobs.mjs';
-import { createJobStore, launchJob, reattachTick, probeHandle, stopHandle, hostName, readProcStart, reapDeadGroup } from '../../scripts/lib/daemon-jobs-runtime.mjs';
+import { createJobStore, launchJob, reattachTick, probeHandle, stopHandle, hostName, localHostAliases, readProcStart, reapDeadGroup } from '../../scripts/lib/daemon-jobs-runtime.mjs';
 import { daemonJobsDir } from '../../scripts/operations/run-store.mjs';
 import { formatJobHandle, parseJobHandle, TERMINAL_JOB_STATUSES } from '../../scripts/operations/job-record.mjs';
 import { appendDaemonEvent } from '../../scripts/lib/daemon-events.mjs';
@@ -350,6 +350,7 @@ export function runPassAsTimedJob({ passName, repo, entry }, ports = {}) {
 
 async function executeTimedPass({ passName, repo, entry }, ports) {
   const { store, env, root = REPO_ROOT, now = Date.now, host = hostName(), readStart = readProcStart } = ports;
+  const aliases = ports.aliases ?? localHostAliases();
   // A legacy {log,error} sink carries only relayed child output; diagnostics go to the process log.
   const log = typeof ports.log === 'function' ? ports.log : line => console.error(line);
   const alert = ports.alert ?? (detail => log(`pass-daemon: ALERT ${JSON.stringify(detail)}`));
@@ -364,7 +365,8 @@ async function executeTimedPass({ passName, repo, entry }, ports) {
   const validOwnerIdentity = job => {
     const handle = parseJobHandle(job.handle);
     return handle && Number.isSafeInteger(handle.pid)
-      && handle.host === host && job.host === handle.host
+      // Locality follows the shared probes; persisted identity must still agree exactly.
+      && (handle.host === host || aliases.has(handle.host)) && job.host === handle.host
       && job.pid === handle.pid && job.procStart === handle.procStart
       && (job.pgid == null || job.pgid === handle.pid);
   };
