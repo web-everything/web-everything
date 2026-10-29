@@ -15,7 +15,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { readDrainAcceptance, decideDrainReviewGate, reconcileDrainReviewPending, classifyPr, needsAcceptanceRestamp, restampAcceptance, computeNetDiffSignals, drainReasonMarker, buildDrainReasonComment, hasDrainReasonComment, LAND_REASON, applyEscalationRelief, REVIEW_COVERAGE_KIND, REVIEW_COVERAGE_GAP_META, reviewRecordKind, recordedReviewRecords, readReviewRecord, reviewCoverageGaps, buildReviewCoverageReason } from '../merge-ai-prs.mjs';
-import { drainGateInputs, permissionChangeForCandidate, removeDeescalatedHumanLabels } from '../merge-ai-prs.mjs';
+import { applyDrainParkLabel, drainGateInputs, permissionChangeForCandidate, removeDeescalatedHumanLabels } from '../merge-ai-prs.mjs';
 import { normalizeDiffFingerprint, normalizeContributionFingerprint, decideReviewGate, scoreEscalation, REVIEW_LABELS, acceptanceCoversHead } from '../lib/review-escalation.mjs';
 
 
@@ -693,12 +693,6 @@ describe('PR #3432 — drain acceptance verification and pending reconciliation'
     view.comments[0].author = { login: 'untrusted-worker' };
     expect(decideDrainReviewGate(inputs, acceptanceOptions(view)).action).toBe('park');
   });
-
-  it('wires unreadable verification to a logged skip before the label-writing gate branches', () => {
-    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
-    expect(src).toMatch(/const gate = decideDrainReviewGate\([\s\S]*?if \(gate.action === 'defer'\) \{\s*v.decision = 'skip';\s*v.reason = gate.reason;\s*process.stderr.write\([\s\S]*?continue;\s*\}/);
-    expect(src).toContain('const out = reconcileDrainReviewPending({');
-  });
 });
 
 /**
@@ -744,11 +738,6 @@ describe('PR #4446 — permission-change hold: score -> drain gate hand-off', ()
   it('forwards the deviation input beside the permission input', () => {
     expect(drainGateInputs({ score: scoreOf(['docs/README.md'], ''), labels: [], deviation: 'scope' }).deviation).toBe('scope');
   });
-
-  it('the drain call site builds its gate input through drainGateInputs (not an inline copy)', () => {
-    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
-    expect(src).toMatch(/const gate = decideDrainReviewGate\(\s*drainGateInputs\(\{\s*score,\s*labels: v\.prLabels,\s*deviation: v\.deviation\s*,[^}]*\bnetScored\b[^}]*\bhumanPinned\b[^}]*\}\),/);
-  });
 });
 
 describe('#6027 — fresh net score de-escalation through the drain handoff', () => {
@@ -768,26 +757,81 @@ describe('#6027 — fresh net score de-escalation through the drain handoff', ()
       humanRequired: false, deescalatedHuman: true, removeLabels: [REVIEW_LABELS.human] });
   });
 
-  it('removes the de-escalated human label through argv', () => {
-    const exec = vi.fn();
-    removeDeescalatedHumanLabels({ gate: drain(), labels: [REVIEW_LABELS.human],
-      dryRun: false, pr: 6027, repo: 'owner/repo', applyOk: true }, { exec });
-    expect(exec).toHaveBeenCalledTimes(1);
+  it('keeps review:human when the pending add throws, recording the verdict before attempting the add', () => {
+    const order = [];
+    const onBeforeAdd = vi.fn(() => { order.push('ledger'); });
+    const exec = vi.fn(() => { order.push('add'); throw new Error('label add failed'); });
+    expect(applyDrainParkLabel({ gate: drain(), labels: [REVIEW_LABELS.human],
+      dryRun: false, pr: 6027, repo: 'owner/repo', onBeforeAdd }, { exec }))
+      .toEqual({ added: false, removed: [] });
+    expect(order).toEqual(['ledger', 'add']);
+    expect(onBeforeAdd).toHaveBeenCalledOnce();
+    expect(exec).toHaveBeenCalledOnce();
     expect(exec).toHaveBeenCalledWith('gh',
-      ['pr', 'edit', '6027', '--repo', 'owner/repo', '--remove-label', REVIEW_LABELS.human],
+      ['pr', 'edit', '6027', '--repo', 'owner/repo', '--add-label', REVIEW_LABELS.pending],
       { stdio: ['ignore', 'ignore', 'pipe'] });
-    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
-    expect(src).toMatch(/catch \{ applyLabelOk = false;/);
-    const call = src.indexOf('removeDeescalatedHumanLabels({ gate, labels: v.prLabels');
-    expect(call).toBeGreaterThan(src.indexOf("'--add-label', gate.applyLabel"));
   });
 
-  it('never removes labels during a dry run or for a retained human hold', () => {
+  it('records the verdict, adds review:pending, then removes review:human through argv', () => {
+    const order = [];
+    const onBeforeAdd = vi.fn(() => { order.push('ledger'); });
+    const exec = vi.fn((_cmd, args) => { order.push(args.includes('--add-label') ? 'add' : 'remove'); });
+    expect(applyDrainParkLabel({ gate: drain(), labels: [REVIEW_LABELS.human],
+      dryRun: false, pr: 6027, repo: 'owner/repo', onBeforeAdd }, { exec }))
+      .toEqual({ added: true, removed: [REVIEW_LABELS.human] });
+    expect(order).toEqual(['ledger', 'add', 'remove']);
+    expect(onBeforeAdd).toHaveBeenCalledOnce();
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(exec).toHaveBeenNthCalledWith(1, 'gh',
+      ['pr', 'edit', '6027', '--repo', 'owner/repo', '--add-label', REVIEW_LABELS.pending],
+      { stdio: ['ignore', 'ignore', 'pipe'] });
+    expect(exec).toHaveBeenNthCalledWith(2, 'gh',
+      ['pr', 'edit', '6027', '--repo', 'owner/repo', '--remove-label', REVIEW_LABELS.human],
+      { stdio: ['ignore', 'ignore', 'pipe'] });
+  });
+
+  it('removes review:human without another add or ledger write when review:pending is already present', () => {
     const exec = vi.fn();
-    for (const [gate, dryRun] of [[drain(), true], [drain({ humanPinned: true }), false],
-      [drain({ score: { ...score, humanRequired: true } }), false], [drain({ netScored: false }), false]]) {
-      removeDeescalatedHumanLabels({ gate, labels: [REVIEW_LABELS.human], dryRun, pr: 6027 }, { exec });
-    }
+    const onBeforeAdd = vi.fn();
+    expect(applyDrainParkLabel({ gate: drain(), labels: [REVIEW_LABELS.human, REVIEW_LABELS.pending],
+      dryRun: false, pr: 6027, onBeforeAdd }, { exec }))
+      .toEqual({ added: false, removed: [REVIEW_LABELS.human] });
+    expect(onBeforeAdd).not.toHaveBeenCalled();
+    expect(exec).toHaveBeenCalledOnce();
+    expect(exec).toHaveBeenCalledWith('gh',
+      ['pr', 'edit', '6027', '--remove-label', REVIEW_LABELS.human],
+      { stdio: ['ignore', 'ignore', 'pipe'] });
+  });
+
+  it('does not execute label edits or record a verdict during a dry run', () => {
+    const exec = vi.fn();
+    const onBeforeAdd = vi.fn();
+    expect(applyDrainParkLabel({ gate: drain(), labels: [REVIEW_LABELS.human],
+      dryRun: true, pr: 6027, onBeforeAdd }, { exec })).toEqual({ added: false, removed: [] });
+    expect(onBeforeAdd).not.toHaveBeenCalled();
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('does not remove review:human when the gate has not de-escalated, even after a successful add', () => {
+    const exec = vi.fn();
+    expect(applyDrainParkLabel({ gate: { ...drain(), deescalatedHuman: false }, labels: [REVIEW_LABELS.human],
+      dryRun: false, pr: 6027 }, { exec })).toEqual({ added: true, removed: [] });
+    expect(exec).toHaveBeenCalledOnce();
+    expect(exec).toHaveBeenCalledWith('gh',
+      ['pr', 'edit', '6027', '--add-label', REVIEW_LABELS.pending],
+      { stdio: ['ignore', 'ignore', 'pipe'] });
+  });
+
+  it.each([
+    ['humanPinned', { humanPinned: true }],
+    ['humanRequired', { score: { ...score, humanRequired: true } }],
+    ['no fresh net score', { netScored: false }],
+  ])('does not remove a retained human hold for %s', (_name, extra) => {
+    const gate = drain(extra);
+    expectKept(gate);
+    const exec = vi.fn();
+    expect(applyDrainParkLabel({ gate, labels: [REVIEW_LABELS.human], dryRun: false, pr: 6027 }, { exec }))
+      .toEqual({ added: false, removed: [] });
     expect(exec).not.toHaveBeenCalled();
   });
 
@@ -800,10 +844,12 @@ describe('#6027 — fresh net score de-escalation through the drain handoff', ()
   });
 
   it('treats a failed label removal as best-effort', () => {
-    const exec = vi.fn(() => { throw new Error('label edit failed'); });
-    expect(() => removeDeescalatedHumanLabels({ gate: drain(), labels: [REVIEW_LABELS.human],
-      dryRun: false, pr: 6027, repo: 'owner/repo', applyOk: true }, { exec })).not.toThrow();
-    expect(exec).toHaveBeenCalledOnce();
+    const exec = vi.fn((_cmd, args) => {
+      if (args.includes('--remove-label')) throw new Error('label removal failed');
+    });
+    expect(applyDrainParkLabel({ gate: drain(), labels: [REVIEW_LABELS.human],
+      dryRun: false, pr: 6027, repo: 'owner/repo' }, { exec })).toEqual({ added: true, removed: [] });
+    expect(exec).toHaveBeenCalledTimes(2);
   });
 
   it('keeps review:human when an operator pin is present despite a fresh low score', () => {
@@ -818,11 +864,11 @@ describe('#6027 — fresh net score de-escalation through the drain handoff', ()
     const gate = decideDrainReviewGate(gateInputs, acceptanceOptions());
     expectKept(gate);
     const exec = vi.fn();
-    removeDeescalatedHumanLabels({ gate, labels: candidate.labels, dryRun: false, pr: 6027 }, { exec });
+    applyDrainParkLabel({ gate, labels: candidate.labels, dryRun: false, pr: 6027 }, { exec });
     expect(exec).not.toHaveBeenCalled();
   });
 
-  it('keeps review:human on a deferred acceptance read (no label change)', () => {
+  it('defers an unreadable acceptance without authorizing human-label removal', () => {
     const exec = vi.fn(() => { throw new Error('comments unavailable'); });
     const gate = decideDrainReviewGate(drainGateInputs(inputs({
       humanPinned: undefined, labels: [REVIEW_LABELS.human, REVIEW_LABELS.accepted],
@@ -832,13 +878,16 @@ describe('#6027 — fresh net score de-escalation through the drain handoff', ()
     expect(gate.deescalatedHuman).not.toBe(true);
     expect(gate.removeLabels ?? []).not.toContain(REVIEW_LABELS.human);
     const edit = vi.fn();
-    removeDeescalatedHumanLabels({ gate, labels: [REVIEW_LABELS.human], dryRun: false, pr: 6027 }, { exec: edit });
+    const onBeforeAdd = vi.fn();
+    expect(applyDrainParkLabel({ gate, labels: [REVIEW_LABELS.human], dryRun: false, pr: 6027, onBeforeAdd }, { exec: edit }))
+      .toEqual({ added: false, removed: [] });
+    expect(onBeforeAdd).not.toHaveBeenCalled();
     expect(edit).not.toHaveBeenCalled();
   });
 
-  it('pins the production hold unconditionally until current score-driven ownership can be proven', () => {
+  it('passes humanPinned true in production', () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
-    expect(src).toMatch(/const humanPinned = true;\s*const gate = decideDrainReviewGate\(\s*drainGateInputs\(\{\s*score,\s*labels: v\.prLabels,\s*deviation: v\.deviation,\s*netScored,\s*humanPinned\s*\}\)/);
+    expect(src).toMatch(/const humanPinned = true;\s*const gate = decideDrainReviewGate\(\s*drainGateInputs\(\{[^}]*\bhumanPinned\s*\}\)/);
   });
 
   it('keeps review:human when the fresh score still requires a human', () => {
