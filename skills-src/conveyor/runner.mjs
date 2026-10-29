@@ -305,6 +305,7 @@ export const MECHANICAL_PASS_NAMES = Object.freeze([
   'ci-queue-watch',
   'parked-pr-conflict-watch',
   'advisory-label-sweep',
+  'delegated-clear-human',
   'review-hold-reconcile',
   'reconcile-pass',
   'duplicate-pr-watch',
@@ -442,6 +443,8 @@ export function makeCliMechanicalPasses({
         // Dispatcher must skip this to avoid double-running it.
         if (!skip('parked-pr-conflict-watch')) runRepo('conveyor/parked-pr-conflict-watch.mjs', ['sweep', ...prsArgs], key, slug);
         if (!skip('advisory-label-sweep')) runRepo('conveyor/advisory-label-sweep.mjs', ['sweep', ...prsArgs], key, slug);
+        // R130 delegated clear-human: mode off|shadow|on (default shadow, appends would-approve events only).
+        if (!skip('delegated-clear-human')) runRepo('conveyor/delegated-clear-human.mjs', ['sweep', ...prsArgs], key, slug);
         // #x01u7az — the one-time-and-ongoing cleanup for the two review-hold/advisory strays
         // `we:scripts/review-set-label.mjs#decideSetLabel`'s `rearm`/`clear-human` fix stops PRODUCING going
         // forward (a stray review:pending beside a live review:human; a stray advisory:* once review:human is

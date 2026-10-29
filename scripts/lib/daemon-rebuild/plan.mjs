@@ -335,6 +335,21 @@ export async function planOverlayStacks({
 export async function planRebuild(options) {
   const { git, entries = [], env = process.env } = options;
   const mode = options.closureScopeMode ?? resolveClosureScopeMode(env).mode;
+  let initialEntries = entries;
+  if (mode === 'on') {
+    try {
+      initialEntries = typeof entries === 'function' ? entries() : entries;
+      if (!Array.isArray(initialEntries) || !initialEntries.length) throw new Error('entries unreadable');
+    } catch {
+      const fallback = await planRebuildPass({ ...options, scopeContext: { mode: 'off' } });
+      fallback.alerts ??= [];
+      fallback.alerts.push({ kind: 'overlay-closure-scope-refused', detail: {
+        reason: 'entries-unreadable',
+        message: 'final closure unproven — retain full-merge conflict; rebase the overlay manually',
+      } });
+      return fallback;
+    }
+  }
   let evidence;
   const scopeContext = {
     mode: ['on', 'shadow'].includes(mode) ? mode : 'off',
@@ -352,7 +367,7 @@ export async function planRebuild(options) {
           return { sha, changedFiles: names.split('\0').filter(Boolean) };
         });
         evidence = computeClosureScope({ git, mainSha, overlays,
-          entries: typeof entries === 'function' ? entries() : entries, env });
+          entries: typeof initialEntries === 'function' ? initialEntries() : initialEntries, env });
         if (!evidence.ok) evidence = null;
       } catch { evidence = null; }
       return evidence?.scope;

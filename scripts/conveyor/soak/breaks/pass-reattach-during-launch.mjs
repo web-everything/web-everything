@@ -71,7 +71,7 @@ async function launchRace(expired) {
 export default {
   id: 'pass-reattach-during-launch',
   title: 'reattachment while a pass launches must preserve its live child deadline',
-  card: '#5755 / PR #6020, red-team send-back x1b8hlo item 1',
+  card: '#5755 / PR #6020, red-team send-back 5726 item 1',
   fixedBy: { sha: 'HEAD', where: 'lane/5755-pass-timed-job', paths: ['skills-src/conveyor/pass-daemon.mjs'] },
   fixPresent(root) {
     return readFileSync(join(root, 'skills-src/conveyor/pass-daemon.mjs'), 'utf8')

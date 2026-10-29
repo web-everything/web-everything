@@ -83,6 +83,18 @@ it('mechanism-path conflict refuses', async () => {
   expect(p).toMatchObject({ ok: false, reason: 'pinned-overlay-conflict' });
 });
 
+it.each(['#worker', 'closure-test/worker'])('retains conflicts in package-import alias targets (%s)', async specifier => {
+  const f = fixture({ path: 'worker.mjs', entry: `import '${specifier}';`, files: {
+    'package.json': JSON.stringify({ name: 'closure-test', type: 'module',
+      imports: { '#worker': './worker.mjs' }, exports: { './worker': './worker.mjs' } }),
+  } });
+  const p = await planRebuild(f.args);
+  expect(p.applied).toEqual([]);
+  expect(p.decisions).toContainEqual(expect.objectContaining({ action: 'drop', reason: 'conflict' }));
+  expect(closureScope.finalClosureScope({ git: f.git, sha: f.main, entries: ['entry.mjs'], env: {} }))
+    .toMatchObject({ ok: false, reason: 'closure-incomplete' });
+});
+
 it('scoped-noop skips and never removes the overlay as in-main', async () => {
   const f = fixture({ noop: true }); const p = await planRebuild(f.args);
   expect(p.decisions).toContainEqual(expect.objectContaining({ action: 'skip', reason: 'scoped-noop', excluded: ['unused.mjs'] }));
@@ -165,6 +177,32 @@ it('unreadable clone entries retain the conflict instead of narrowing the scope'
   const p = await planRebuild({ ...f.args, entries() { throw new Error('plist unreadable'); } });
   expect(p.applied).toEqual([]);
   expect(p.decisions[0]).toMatchObject({ action: 'drop', reason: 'conflict' });
+});
+
+it.each([
+  { label: 'omitted', options: {} },
+  { label: 'empty', options: { entries: [] } },
+])('planRebuild in on mode without entries refuses with entries-unreadable and retains the conflict ($label)', async ({ options }) => {
+  const f = fixture();
+  const { entries, ...args } = f.args;
+  const p = await planRebuild({ ...args, ...options });
+  expect(p.applied).toEqual([]);
+  expect(p.decisions).toContainEqual(expect.objectContaining({ action: 'drop', reason: 'conflict' }));
+  expect(p.alerts).toContainEqual({ kind: 'overlay-closure-scope-refused', detail: expect.objectContaining({
+    reason: 'entries-unreadable', message: expect.stringContaining('rebase'),
+  }) });
+});
+
+it.each([
+  { label: 'omitted', options: {} },
+  { label: 'empty', options: { entries: [] } },
+])('readyBuildVerified in on mode without entries fails closed ($label)', async ({ options }) => {
+  const f = fixture(); const adopt = await planRebuild(f.args);
+  expect(adopt.applied[0]).toMatchObject({ resolvedVia: 'closure-scope', excluded: ['unused.mjs'] });
+  const args = { git: f.git, adopt, mainTip: f.main, prevHead: f.main,
+    env: { WE_DAEMON_CLOSURE_SCOPE: 'on' } };
+  expect(readyBuildVerified({ ...args, entries: ['entry.mjs'] })).toBe(true);
+  expect(readyBuildVerified({ ...args, ...options })).toBe(false);
 });
 
 it('readyBuildVerified rebuilds exclusions and refuses a reachable or tampered excluded path', async () => {
@@ -253,4 +291,10 @@ it('closureScope mode cascades standard shadow, file, and environment with prove
   rmSync(env.WE_PLATFORM_PREFERENCES_FILE);
   writeFileSync(settingsPath, '{bad');
   expect(resolveClosureScopeMode({ ...env, WE_DAEMON_CLOSURE_SCOPE: 'bogus' }, { settingsPath })).toMatchObject({ mode: 'shadow', source: 'standard' });
+});
+
+it('shipped closureScope remains shadow without overrides', () => {
+  const f = fixture();
+  const env = { WE_PLATFORM_PREFERENCES_FILE: join(f.root, 'absent.json') };
+  expect(resolveClosureScopeMode(env)).toMatchObject({ mode: 'shadow', source: 'tool' });
 });

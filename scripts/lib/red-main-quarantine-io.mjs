@@ -131,7 +131,9 @@ export function resolveQuarantineSettings({ env = process.env, file = RED_MAIN_H
     valid: QUARANTINE_SETTINGS_VALID,
   });
   // `derivedJobs` is an array leaf; every other knob a scalar leaf — `sources` keys them by name.
-  return { value: { ...QUARANTINE_SAFETY_NET_DEFAULTS, ...c.value }, sources: c.sources, invalid: c.invalid };
+  // Persisted tool/platform configuration may still contain retired knobs; expose only registered settings.
+  const registered = (values) => Object.fromEntries(Object.entries(values ?? {}).filter(([key]) => Object.hasOwn(QUARANTINE_SETTINGS_VALID, key)));
+  return { value: { ...QUARANTINE_SAFETY_NET_DEFAULTS, ...registered(c.value) }, sources: registered(c.sources), invalid: c.invalid };
 }
 
 /** Ledger + shadow log live in the health watch's own state dir (the caller passes it). */
@@ -334,6 +336,19 @@ export function runSafetyNet({
   let activeKey = null;
   let shadowChanged = false;
   try {
+    // Successful reruns have no failed-job snapshot: count the observed successful attempt too.
+    for (const red of Object.values(ledger.reds)) {
+      if (!red?.attempts || red.attempts.outcome) continue;
+      const snapshots = Object.values(red.attempts).filter((a) => a && typeof a === 'object');
+      const run = mainCiRuns?.runs?.find((r) => snapshots.some((a) => a.runId === r?.databaseId));
+      const passed = run?.status === 'completed' && run.conclusion === 'success';
+      const attempts = new Set(Object.keys(red.attempts));
+      if (passed && Number.isInteger(run.attempt) && run.attempt > 1) attempts.add(String(run.attempt));
+      if (attempts.size > 1 && passed && Number.isInteger(run.attempt) && run.attempt > 1) {
+        red.attempts.outcome = 'passed-on-rerun (flake)';
+        out.rerun = { outcome: 'flake' };
+      }
+    }
     // In `stop`, unless the ledger KNOWS (from a recent read) the list carries no `quarantine` stamp: read the list and
     // withdraw a live stamp, so CI (which reads the mode from the list) stops skipping at once, not at entry expiry.
     // That covers a flip back to `stop` after this daemon published, and a fresh, lost, reset or stale ledger: an
@@ -366,9 +381,9 @@ export function runSafetyNet({
       // Each failed unit job's log is read until it succeeds, then kept for the red window (re-read only if the
       // failing run changed). A failed read is NEVER cached as an answer: it is retried with a growing backoff.
       const runId = mainCiRuns?.failing?.runId ?? null;
-      // A re-run of the same workflow run keeps its id but gets a new `updatedAt`: key the cache on both, so a shard
-      // that fails differently on attempt 2 is read again.
-      const runKey = `${runId}@${(mainCiRuns?.runs ?? []).find((r) => r?.databaseId === runId)?.updatedAt ?? ''}`;
+      // Attempts share a run id; reread their logs independently, including after an update.
+      const run = mainCiRuns?.runs?.find((r) => r?.databaseId === runId);
+      const runKey = `${runId}:${run?.attempt ?? 1}@${run?.updatedAt ?? ''}`;
       if (!rec.jobFailures || rec.runKey !== runKey) { rec.runId = runId; rec.runKey = runKey; rec.jobFailures = {}; rec.readAttempts = 0; rec.readRetryAt = 0; }
       const unitRe = new RegExp(settings.value.unitJobPattern);
       const wanted = failedJobs.filter((n) => unitRe.test(n));
@@ -403,12 +418,47 @@ export function runSafetyNet({
     }
     if (isLive && read.list?.mode === 'quarantine') out.liveEntries = activeEntries(read.list, { now });
     const flakeProof = settings.value.requireProvenFlake && state.status === 'red' ? readFlakeProof(mainCiRuns, { readJobs, now }) : {};
-    const repeatRuns = settings.value.repeatFailureProof && settings.value.requireProvenFlake && state.status === 'red'
+    let repeatRuns = settings.value.repeatFailureProof && settings.value.requireProvenFlake && state.status === 'red'
       ? readRepeatRuns(mainCiRuns, { state, jobFailures, readJobs, readLog, settings: settings.value }) : [];
+    const failingRun = mainCiRuns?.runs?.find((r) => r?.databaseId === mainCiRuns?.failing?.runId);
+    const attempt = failingRun?.attempt === undefined ? 1 : failingRun.attempt;
+    const completedFailure = failingRun?.status === 'completed' && ['failure', 'timed_out'].includes(failingRun.conclusion);
+    const unitJobs = Array.isArray(failedJobs) ? failedJobs.filter((name) => new RegExp(settings.value.unitJobPattern).test(name)) : [];
+    const completeFailures = unitJobs.length > 0 && unitJobs.every((name) => rec?.jobFailures?.[name]?.complete === true);
+    // Keep passive, complete failure snapshots for this run only. No rerun IO belongs here.
+    if (rec && failingRun && rec.attempts
+      && Object.values(rec.attempts).some((a) => a && typeof a === 'object' && a.runId !== failingRun.databaseId)) rec.attempts = {};
+    if (rec && completedFailure && completeFailures && Number.isInteger(attempt) && attempt > 0) {
+      rec.attempts ??= {};
+      rec.attempts[String(attempt)] = { runId: failingRun.databaseId, createdAt: failingRun.createdAt,
+        updatedAt: failingRun.updatedAt, observedAt: now,
+        headSha: failingRun.headSha, jobFailures: structuredClone(jobFailures) };
+    }
+    const previous = rec?.attempts?.[String(attempt - 1)];
+    if (settings.value.repeatFailureProof && settings.value.requireProvenFlake && previous
+      && previous.runId === failingRun?.databaseId && Number.isInteger(attempt) && attempt > 1
+      && completedFailure && completeFailures
+      && Object.values(previous.jobFailures ?? {}).length > 0
+      && Object.values(previous.jobFailures).every((f) => f?.complete === true)
+      // Attempt numbers alone do not establish freshness; old snapshots without updatedAt cannot supply proof.
+      && typeof previous.updatedAt === 'string' && Number.isFinite(Date.parse(previous.updatedAt))
+      && typeof failingRun.updatedAt === 'string' && Number.isFinite(Date.parse(failingRun.updatedAt))
+      && Date.parse(failingRun.updatedAt) > Date.parse(previous.updatedAt)) {
+      const attemptRuns = [
+        { databaseId: previous.runId, attempt: attempt - 1, headSha: previous.headSha,
+          status: 'completed', conclusion: 'failure', createdAt: previous.createdAt, jobFailures: previous.jobFailures },
+        { ...failingRun, createdAt: failingRun.updatedAt, jobFailures },
+      ];
+      // Augment distinct-run history rather than discarding proof for configured counts above two.
+      const key = (r) => `${r.databaseId}:${r.attempt === undefined ? 1 : r.attempt}`;
+      repeatRuns = [...new Map([...repeatRuns, ...attemptRuns].map((r) => [key(r), r])).values()]
+        .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt))
+        .slice(-REPEAT_RUN_LIMIT);
+    }
     const pri = mainCiRuns?.priority;
     const fixPrs = pri ? (Array.isArray(pri.prs) ? pri.prs : [pri.pr]) : null;
     const plan = planSafetyNet({
-      status: state.status, firstRedSha: sha, failedJobs, jobFailures, flakeProof, repeatRuns, latestRunId: mainCiRuns?.failing?.runId, touchedFiles, list: read.list, fixPrs,
+      status: state.status, firstRedSha: sha, failedJobs, jobFailures, flakeProof, repeatRuns, latestRunId: mainCiRuns?.failing?.runId, latestAttempt: attempt, touchedFiles, list: read.list, fixPrs,
       addedForRed: (isLive ? rec?.added : rec?.shadowAdded) ?? [], now, settings: settings.value,
     });
     out.plan = plan;

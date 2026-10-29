@@ -375,4 +375,28 @@ describe('overlay registration generations', () => {
     expect(alert.mock.calls).toEqual([['overlay-registration-changed', { ref: REF }]]);
     expect(() => readFileSync(f.file.replace(/\.json$/, '.events.jsonl'), 'utf8')).toThrow(/ENOENT/);
   });
+
+  it.each([undefined, null, ''])('T11 suspect without a usable registrationId (%s) is kept without a drop event', (registrationId) => {
+    const f = fixture();
+    const suspect = { ...f.add(), registrationId };
+    const replacement = f.add();
+    const alert = vi.fn();
+    const before = f.bytes();
+    dropSuspectOverlays({ root: f.root, env: f.env, suspects: [suspect], failed: 'smoke', alert });
+    expect(f.bytes()).toBe(before);
+    expect(f.list()).toEqual([replacement]);
+    expect(alert.mock.calls).toEqual([['overlay-registration-changed', { ref: REF }]]);
+    expect(() => readFileSync(f.file.replace(/\.json$/, '.events.jsonl'), 'utf8')).toThrow(/ENOENT/);
+  });
+
+  it('T11 suspect with a matching registrationId is dropped', () => {
+    const f = fixture();
+    const suspect = f.add();
+    const alert = vi.fn();
+    dropSuspectOverlays({ root: f.root, env: f.env, suspects: [suspect], failed: 'smoke', alert });
+    expect(f.list()).toEqual([]);
+    expect(alert.mock.calls.map(([kind]) => kind)).toEqual(['overlay-dropped-smoke-failed']);
+    const events = readFileSync(f.file.replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(events).toContainEqual(expect.objectContaining({ kind: 'dropped-smoke-failed', ref: REF }));
+  });
 });

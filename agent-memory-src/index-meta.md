@@ -102,3 +102,4 @@ Agent Meta · Memory · Model Routing cluster — open a leaf with `node scripts
 - [Load fixes after review accepts](feedback-edge-load-after-review-accept.md) — load a guard/fixer/drain fix on its daemon once its review ACCEPTS, not before and not after the merge; prove it on the live case
 - [Investigate before asking for an override](investigate-before-asking-override.md) — before asking the operator to raise a cap or override, find why it tripped (2026-10-24 a stale fixture lane inflated the lane-pool check); "You could have investigated"
 - [Never touch secrets, even file names](never-touch-secrets-even-filenames.md) — never read, list or print anything under ~/.secrets; listing github-apps filenames on 2026-10-25 was a violation
+- [Only ask review when ready](only-ask-review-when-ready.md) — never list a PR as "your review" until not draft, checks green, advisory review + red team done on the current head

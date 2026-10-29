@@ -17,7 +17,7 @@ const alive = pid => {
 export default {
   id: 'runner-shutdown-abandons-passes',
   title: 'runner exits with live pass children and abandons discovery-dependent launches',
-  card: '#5755 / PR #6020, send-back x1b8hlo item 1',
+  card: '#5755 / PR #6020, send-back 5726 item 1',
   fixedBy: { sha: 'HEAD', where: 'lane/5755-pass-timed-job', paths: ['skills-src/conveyor/runner.mjs', 'skills-src/conveyor/pass-daemon.mjs'] },
   fixPresent(checkout) {
     return readFileSync(join(checkout, 'skills-src/conveyor/runner.mjs'), 'utf8')

@@ -36,6 +36,9 @@ beforeAll(() => {
     cpSync(WE_SCRIPTS_DIR, join(root, 'scripts'), { recursive: true });
     cpSync(join(dirname(WE_SCRIPTS_DIR), 'skills-src/conveyor/daemon-manifest.mjs'),
       join(root, 'skills-src/conveyor/daemon-manifest.mjs'));
+    // The transcript check imports this skill module during CLI startup.
+    cpSync(join(dirname(WE_SCRIPTS_DIR), 'skills-src', 'inspect-codex-transcript'),
+      join(root, 'skills-src', 'inspect-codex-transcript'), { recursive: true });
     symlinkSync(join(dirname(WE_SCRIPTS_DIR), 'node_modules'), join(root, 'node_modules'), 'dir');
     mkdirSync(join(root, 'backlog'), { recursive: true });
   }
