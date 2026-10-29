@@ -11,7 +11,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   runPassAsTimedJob, runPassDaemonLoop,
@@ -19,7 +19,7 @@ import {
 import {
   makeCliMechanicalPasses, MECHANICAL_PASS_NAMES, runTimedPasses,
 } from '../runner.mjs';
-import { createJobStore, stopHandle } from '../../../scripts/lib/daemon-jobs-runtime.mjs';
+import { createJobStore, reapDeadGroup, stopHandle } from '../../../scripts/lib/daemon-jobs-runtime.mjs';
 import { DEFAULT_TASK_TIMEOUT_MS } from '../../../scripts/lib/daemon-jobs.mjs';
 import { taskIdentity } from '../../../scripts/lib/daemon-item-tasks.mjs';
 import { validateTaskMetadata } from '../../../scripts/operations/job-record.mjs';
@@ -80,6 +80,8 @@ function fixture(policyOptions = {}) {
   const log = line => lines.push(String(line));
   const ports = {
     store, spawnFn, probe, stop,
+    reapGroup: vi.fn(handle => probe(handle) === 'dead'),
+    env: {}, eventsPath: join(dir, 'daemon-events.jsonl'),
     now: () => Date.now(),
     readStart: () => 'fixture-start', host: 'fixture-host',
     log, alert: detail => alerts.push(detail),
@@ -98,6 +100,231 @@ function timingLines(f) {
   return f.lines.filter(line => line.includes('task-timing')).map(line =>
     JSON.parse(line.slice(line.indexOf('{'))));
 }
+
+function quarantineEvents(f, path = f.ports.eventsPath) {
+  return readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+}
+
+// Persist the historical shape: a non-terminal job with a retained handle and
+// passResult, but no quarantine timestamp or notification timestamp.
+async function quarantinedFixture() {
+  const f = fixture();
+  const pass = descriptor('branch-drift');
+  f.ports.reapGroup.mockReturnValue(false);
+  const pending = runPassAsTimedJob(pass, f.ports);
+  await vi.advanceTimersByTimeAsync(0);
+  const [record] = f.store.list().records;
+  f.children[0].finish();
+  await expect(pending).resolves.toEqual({ outcome: 'quarantined' });
+  return { ...f, pass, record };
+}
+
+describe('timed pass quarantine recovery and reporting', () => {
+  it('clears a dead owner with a confirmed empty pgid and runs a fresh job in the same call', async () => {
+    const f = await quarantinedFixture();
+    const ageMs = 2 * 60 * 60 * 1000;
+    vi.setSystemTime(Date.now() + ageMs);
+    const reaper = vi.fn((handle, notAfterMs, options) => reapDeadGroup(handle, {
+      ...options, notAfterMs, host: 'fixture-host',
+      kill: () => { throw Object.assign(new Error('no group'), { code: 'ESRCH' }); },
+    }));
+    const pending = runPassAsTimedJob(f.pass, { ...f.ports, reapGroup: reaper });
+    await vi.waitFor(() => expect(f.children).toHaveLength(2));
+    f.children[1].finish();
+    await expect(pending).resolves.toEqual({ code: 0, signal: null });
+    const old = f.store.read(f.record.id).job;
+    expect(old.passQuarantine).toBeUndefined();
+    expect(old).toMatchObject({ status: 'failed', handle: null, error: expect.stringMatching(/quarantine.*cleared/i) });
+    const fresh = f.store.list().records.find(r => r.id !== f.record.id);
+    expect(fresh.job).toMatchObject({ status: 'succeeded', task: { seq: f.record.job.task.seq + 1 } });
+    expect(reaper).toHaveBeenCalledWith(f.record.job.handle, expect.any(Number), { requireConfirmedDeath: true });
+    expect(quarantineEvents(f)).toEqual([expect.objectContaining({
+      kind: 'pass-quarantine-cleared', detail: expect.objectContaining({
+        ts: expect.any(String), passName: f.pass.passName, jobId: f.record.id,
+        pid: f.children[0].pid, pgid: f.children[0].pid, ageMs,
+      }),
+    })]);
+    expect(f.lines.some(line => line.includes('pass-quarantine-cleared') && line.includes(f.record.id))).toBe(true);
+  });
+
+  it('retains quarantine for a dead owner with a LIVE pgid even after an acknowledged reap', async () => {
+    const f = await quarantinedFixture();
+    const kill = vi.fn(); // signal 0 succeeds; SIGKILL is acknowledged but the group survives
+    const reaper = vi.fn((handle, notAfterMs, options) => reapDeadGroup(handle, {
+      ...options, notAfterMs, host: 'fixture-host', readStart: () => null,
+      bootTime: () => 0, groupStarts: () => [Date.now()], kill,
+    }));
+    // A real start time lets the shared reaper attempt SIGKILL and check again.
+    f.store.update(f.record.id, r => {
+      r.job.procStart = new Date(Date.now()).toISOString();
+      r.job.handle = `fixture-host:${f.children[0].pid}:${r.job.procStart}`;
+      return r;
+    });
+    await expect(runPassAsTimedJob(f.pass, { ...f.ports, reapGroup: reaper }))
+      .resolves.toEqual({ outcome: 'quarantined' });
+    expect(kill).toHaveBeenCalledWith(-f.children[0].pid, 'SIGKILL');
+    expect(f.store.read(f.record.id).job.passQuarantine).toBe(true);
+    expect(f.spawnFn).toHaveBeenCalledTimes(1);
+    expect(quarantineEvents(f)[0]).toMatchObject({ kind: 'pass-quarantined', detail: { groupGone: false } });
+  });
+
+  it('reports a live owner once per hour across restarts, including its id, pid and age', async () => {
+    const f = await quarantinedFixture();
+    f.children[0].state = 'alive';
+    const ports = { ...f.ports, store: createJobStore(f.store.dir) };
+    const run = () => runPassAsTimedJob(f.pass, ports);
+    await expect(run()).resolves.toEqual({ outcome: 'quarantined' });
+    const emittedAt = f.store.read(f.record.id).job.passQuarantineEventAt;
+    expect(emittedAt).toBeDefined();
+    vi.setSystemTime(Date.now() + 60 * 60 * 1000 - 1);
+    await expect(run()).resolves.toEqual({ outcome: 'quarantined' });
+    expect(quarantineEvents(f)).toHaveLength(1);
+    vi.setSystemTime(Date.now() + 1);
+    await expect(run()).resolves.toEqual({ outcome: 'quarantined' });
+    const events = quarantineEvents(f);
+    expect(events).toHaveLength(2);
+    expect(events[1]).toMatchObject({ kind: 'pass-quarantined', detail: {
+      jobId: f.record.id, pid: f.children[0].pid, ageMs: 3600000,
+      age: expect.any(String), ownerLiveness: 'alive', livenessUnknown: false,
+    } });
+    expect(f.store.read(f.record.id).job.passQuarantineEventAt).not.toEqual(emittedAt);
+    expect(f.lines.filter(line => line.includes('pass-quarantined'))).toHaveLength(2);
+    expect(f.spawnFn).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['1ms in the future', 1],
+    ['2h in the future', 2 * 60 * 60 * 1000],
+    ['unparsable', null],
+  ])('emits immediately for a persisted %s timestamp and restores hourly throttling', async (_name, offsetMs) => {
+    const f = await quarantinedFixture();
+    const emittedAt = new Date(Date.now()).toISOString();
+    f.store.update(f.record.id, r => {
+      r.job.passQuarantineEventAt = offsetMs === null ? 'not-a-timestamp' : new Date(Date.now() + offsetMs).toISOString();
+      return r;
+    });
+    const run = () => runPassAsTimedJob(f.pass, { ...f.ports, store: createJobStore(f.store.dir) });
+
+    await expect(run()).resolves.toEqual({ outcome: 'quarantined' });
+    expect(quarantineEvents(f)).toEqual([expect.objectContaining({
+      kind: 'pass-quarantined', detail: expect.objectContaining({ ts: emittedAt }),
+    })]);
+    expect(f.store.read(f.record.id).job.passQuarantineEventAt).toBe(emittedAt);
+
+    await expect(run()).resolves.toEqual({ outcome: 'quarantined' });
+    expect(quarantineEvents(f)).toHaveLength(1);
+    vi.setSystemTime(Date.now() + 60 * 60 * 1000);
+    await expect(run()).resolves.toEqual({ outcome: 'quarantined' });
+    expect(quarantineEvents(f)).toHaveLength(2);
+    expect(f.spawnFn).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['unknown', 'throws', 'unreadable-handle', 'group-throws', 'group-unknown'])(
+    'fails closed and reports unknown liveness when evidence is %s', async mode => {
+      const f = await quarantinedFixture();
+      if (mode === 'unknown') f.probe.mockReturnValue('unknown');
+      if (mode === 'throws') f.probe.mockImplementation(() => { throw new Error('probe unavailable'); });
+      if (mode === 'unreadable-handle') {
+        f.store.update(f.record.id, r => { r.job.status = 'launching'; r.job.handle = null; return r; });
+        f.probe.mockReturnValue('dead'); // probeHandle treats a missing handle as dead
+        f.ports.reapGroup.mockReturnValue(true);
+      }
+      if (mode === 'group-throws') f.ports.reapGroup.mockImplementation(() => { throw new Error('ps unavailable'); });
+      if (mode === 'group-unknown') f.ports.reapGroup.mockReturnValue('unknown');
+      await expect(runPassAsTimedJob(f.pass, f.ports)).resolves.toEqual({ outcome: 'quarantined' });
+      expect(f.store.read(f.record.id).job.passQuarantine).toBe(true);
+      expect(f.spawnFn).toHaveBeenCalledTimes(1);
+      expect(quarantineEvents(f)[0]).toMatchObject({ kind: 'pass-quarantined', detail: { livenessUnknown: true } });
+      expect(f.lines.some(line => line.includes('pass-quarantined') && line.includes('unknown'))).toBe(true);
+    },
+  );
+
+  it.each([
+    ['record host mismatch', { host: 'other-host' }],
+    ['record host missing', { host: undefined }],
+    ['record host null', { host: null }],
+    ['record pid mismatch', { pid: 8000 }],
+    ['record pid missing', { pid: undefined }],
+    ['record pid null', { pid: null }],
+    ['record start mismatch', { procStart: 'different-start' }],
+    ['record start missing', { procStart: undefined }],
+    ['record start null', { procStart: null }],
+    ['record start empty', { procStart: '' }],
+    ['handle host mismatch', { handle: 'other-host:7000:fixture-start' }],
+    ['consistent foreign host', { host: 'other-host', handle: 'other-host:7000:fixture-start' }],
+    ['handle pid mismatch', { handle: 'fixture-host:8000:fixture-start' }],
+    ['handle start mismatch', { handle: 'fixture-host:7000:different-start' }],
+    ['group identity mismatch', { pgid: 8000 }],
+  ])('fails closed and reports unknown liveness for %s despite dead/gone probes', async (_name, patch) => {
+    const f = await quarantinedFixture();
+    f.store.update(f.record.id, r => { Object.assign(r.job, patch); return r; });
+    const retained = f.store.read(f.record.id).job;
+    f.probe.mockReset().mockReturnValue('dead');
+    f.ports.reapGroup.mockReset().mockReturnValue(true);
+    f.spawnFn.mockImplementation(() => { throw new Error('unexpected replacement launch'); });
+
+    await expect(runPassAsTimedJob(f.pass, f.ports)).resolves.toEqual({ outcome: 'quarantined' });
+
+    expect(f.store.read(f.record.id).job).toMatchObject({
+      ...retained, passQuarantine: true,
+    });
+    expect(f.probe).not.toHaveBeenCalled();
+    expect(f.ports.reapGroup).not.toHaveBeenCalled();
+    expect(f.spawnFn).toHaveBeenCalledTimes(1);
+    expect(quarantineEvents(f)[0]).toMatchObject({ kind: 'pass-quarantined', detail: {
+      ownerLiveness: 'unknown', livenessUnknown: true, groupGone: false,
+      reason: expect.stringContaining('operator must inspect'),
+    } });
+  });
+
+  it.each([false, true])('retries a failed append immediately without advancing the throttle (previous event=%s)', async previous => {
+    const f = await quarantinedFixture();
+    const previousAt = previous ? new Date(Date.now() - 3600000).toISOString() : undefined;
+    if (previous) f.store.update(f.record.id, r => { r.job.passQuarantineEventAt = previousAt; return r; });
+    writeFileSync(f.ports.eventsPath, 'parent is a file');
+    const ports = { ...f.ports, eventsPath: join(f.ports.eventsPath, 'unwritable.jsonl') };
+
+    await expect(runPassAsTimedJob(f.pass, ports)).resolves.toEqual({ outcome: 'quarantined' });
+    expect(f.store.read(f.record.id).job.passQuarantineEventAt).toBe(previousAt);
+    expect(f.lines.some(line => line.includes('pass-quarantined') && line.includes('failed to append'))).toBe(true);
+
+    // Restart with repaired event storage at the same clock time: no hour-long silence.
+    await expect(runPassAsTimedJob(f.pass, {
+      ...f.ports, store: createJobStore(f.store.dir), eventsPath: join(dir, 'repaired-events.jsonl'),
+    })).resolves.toEqual({ outcome: 'quarantined' });
+    expect(quarantineEvents(f, join(dir, 'repaired-events.jsonl'))).toHaveLength(1);
+    expect(f.store.read(f.record.id).job.passQuarantineEventAt).toBe(new Date(Date.now()).toISOString());
+    expect(f.spawnFn).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['persist', 'clear'])('event-write failure cannot change the quarantine %s outcome', async mode => {
+    const f = await quarantinedFixture();
+    writeFileSync(f.ports.eventsPath, 'parent is a file');
+    const ports = { ...f.ports, eventsPath: join(f.ports.eventsPath, 'unwritable.jsonl') };
+    if (mode === 'persist') {
+      await expect(runPassAsTimedJob(f.pass, ports)).resolves.toEqual({ outcome: 'quarantined' });
+    } else {
+      ports.reapGroup = () => true;
+      const pending = runPassAsTimedJob(f.pass, ports);
+      await vi.waitFor(() => expect(f.children).toHaveLength(2));
+      f.children[1].finish();
+      await expect(pending).resolves.toEqual({ code: 0, signal: null });
+    }
+    expect(f.lines.some(line => line.includes(mode === 'persist' ? 'pass-quarantined' : 'pass-quarantine-cleared'))).toBe(true);
+    expect(f.lines.some(line => line.includes(mode === 'persist' ? 'pass-quarantined' : 'pass-quarantine-cleared')
+      && line.includes('failed to append'))).toBe(true);
+    expect(f.store.read(f.record.id).job.passQuarantine).toBe(mode === 'persist' ? true : undefined);
+  });
+
+  it.each(['WE_DAEMON_EVENTS', 'WE_DAEMON_EVENTS_PATH'])('honours the %s event-path override', async variable => {
+    const f = await quarantinedFixture();
+    const eventsPath = join(dir, 'env-events.jsonl');
+    await expect(runPassAsTimedJob(f.pass, {
+      ...f.ports, eventsPath: undefined, env: { [variable]: eventsPath },
+    })).resolves.toEqual({ outcome: 'quarantined' });
+    expect(quarantineEvents(f, eventsPath)[0].kind).toBe('pass-quarantined');
+  });
+});
 
 describe('#5755 independent timed pass jobs', () => {
   it.each([false, true])('keeps deadline ownership across reattachment before claim (expired=%s)', async expired => {
