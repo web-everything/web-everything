@@ -94,15 +94,28 @@ describe('checkBornAsCollision', () => {
     const exec = fakeExec({ mainTexts: { [mainCard]: '---\nbornAs:xgcpm6z\n---\n' } });
     expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ ok: true });
   });
-  it('falls back to identity lines when a frontmatter block is not valid YAML', () => {
-    const exec = fakeExec({ mainTexts: { [mainCard]: '---\nbornAs: xaaaaaa\nbornAs: xgcpm6z\n---\n' } });
+  // Self-review break on e551e17b5: a main card whose frontmatter YAML fails fell back to raw identity lines and was
+  // labelled, though duplicateBornAs skips such a card. With a mistyped closing fence those lines reach a body example.
+  it.each([['a duplicate key', '---\nbornAs: xaaaaaa\nbornAs: xgcpm6z\n---\n'],
+    ['a mistyped closing fence that runs into a body example', '---\nbornAs: xaaaaaa\n--\nExample:\nbornAs: xgcpm6z\n---\n']])(
+    'holds a main card whose frontmatter is not valid YAML (%s) as unreadable, never as a labelling collision', (_, text) => {
+      const exec = fakeExec({ mainTexts: { [mainCard]: text } });
+      expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ error: expect.stringContaining(`${mainCard} has no readable frontmatter`) });
+    });
+  it('treats an invalid-YAML file below a backlog subdirectory on main as no card', () => {
+    const raised = 'backlog/raised-by/7233.md';
+    const exec = fakeExec({ main: `origin/main:${raised}\0bornAs: xgcpm6z`, mainTexts: { [raised]: '---\nbornAs: xgcpm6z\nbornAs: xgcpm6z\n---\n' } });
+    expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ ok: true });
+  });
+  it('still catches a duplicate in an added card whose frontmatter is not valid YAML', () => {
+    const exec = fakeExec({ texts: { [newCard]: '---\nbornAs: xaaaaaa\nbornAs: xgcpm6z\n---\n' } });
     expect(checkBornAsCollision({ exec, headSha: sha }).collision?.hash).toBe('xgcpm6z');
   });
   it('searches main for the added hashes as plain text, not for an identity key spelling', () => {
     const exec = fakeExec();
     checkBornAsCollision({ exec, headSha: sha });
     const grep = exec.mock.calls.find(([, args]) => args[0] === 'grep')[1];
-    expect(grep.slice(0, 5)).toEqual(['grep', '-z', '-F', '-e', 'xgcpm6z']);
+    expect(grep.slice(0, 6)).toEqual(['grep', '-z', '--text', '-F', '-e', 'xgcpm6z']);
   });
   it('treats a frontmatter-less file below a backlog subdirectory as no card', () => {
     const raised = 'backlog/raised-by/7233.md';
@@ -363,6 +376,13 @@ describe('checkBornAsCollision against real Git with a body identity example on 
     git(clone, 'fetch', '-q', 'origin');
     expect(checkBornAsCollision({ exec: execFileSync, headSha: prAdding('xccccc1'), cwd: clone }))
       .toEqual({ collision: { hash: 'xccccc1', path: 'backlog/2-new.md', mainCard: 'backlog/3-crlf.md' } });
+  });
+  it('refuses a duplicate of a main card that holds a NUL byte, which Git greps as binary by default', () => {
+    write(clone, '4-binary.md', '---\nbornAs: xddddd1\n---\nbody \0 byte\n');
+    git(clone, 'add', '.'); git(clone, 'commit', '-qm', 'binary'); git(clone, 'push', '-q', 'origin', 'HEAD:refs/heads/main');
+    git(clone, 'fetch', '-q', 'origin');
+    expect(checkBornAsCollision({ exec: execFileSync, headSha: prAdding('xddddd1'), cwd: clone }))
+      .toEqual({ collision: { hash: 'xddddd1', path: 'backlog/2-new.md', mainCard: 'backlog/4-binary.md' } });
   });
   it('refuses a duplicate added under a non-ASCII path that Git quotes by default', () => {
     expect(checkBornAsCollision({ exec: execFileSync, headSha: prAdding('xaaaaaa', '2-é.md'), cwd: clone }))
