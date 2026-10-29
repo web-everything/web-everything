@@ -33,6 +33,8 @@ import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
  *   (non-dry-run) pass ignores the variable and says so.
  */
 import { sweepStuckEntries } from './merge-queue-stuck-dequeue.mjs';
+import { guardEnqueue } from './drain-poison-guard.mjs';
+import { countTrustedLeadingMarker } from './marker-authorship.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
 import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './human-only-enqueue-license.mjs';
 import { labelSignature } from './drain-prestage.mjs';
@@ -223,6 +225,9 @@ export function createDrainMergeStrategy({
   cancelObsoleteRuns = cancelObsoleteQueueRuns, batching,
   env = process.env, queueSafety, labelProvider, readRedTeamEvidence = readDrainRedTeamEvidence, requestRedTeam = null,
   cwd = process.cwd(), // a clone of the local repo: enqueuePr reads the judged commit's change list from it
+  // The located primary checkout, if any. A corrupt `cwd` self-heals only when it is a different clone (never the
+  // primary itself); unknown (null) never heals.
+  primary = null,
   // xym8nt4 — a source PR of a post-approval card group never enqueues on its own (the combined PR carries it).
   // The SAME path resolver grouping writes through (`resolveCardGroupStatePath`), so an override never splits them.
   // `isMainFix(c)`: is `c` a published main-red repair PR per THIS pass's live red-main signal (never a cached flag)?
@@ -530,6 +535,34 @@ export function createDrainMergeStrategy({
         if (freshHeld !== freshLabelHold) return { enqueued: false, deferred: true, kind: 'sent-back', reason: freshHeld };
       }
       if (freshLabelHold) return { enqueued: false, deferred: true, kind: 'red-team-pending', reason: freshLabelHold };
+      // Prepared file lists do not substitute for fresh Git evidence at identity admission.
+      // A corrupt clone cache heals once and retries (logged); unreadable evidence holds the enqueue and never
+      // reaches `comment`, so only a proven collision can label the PR.
+      const poison = guardEnqueue({ c, headSha, repo: slugOf(c.repo), exec, cwd, primary,
+        log: line => log.write(`${line}\n`),
+        emit: event => appendDaemonEvent(event, { env }),
+        comment: (body, { kind, marker }) => {
+          let commented = false;
+          try {
+            const pages = readThreadPages(c.repo, c.num);
+            if (!Array.isArray(pages) || pages.some(page => !Array.isArray(page))) throw new Error('malformed comments response');
+            if (!countTrustedLeadingMarker(pages.flat(), marker)) {
+              exec('gh', ['pr', 'comment', String(c.num), '--repo', slugOf(c.repo), '--body', `${marker}\n${body}`],
+                { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] });
+            }
+            commented = true;
+          } catch { /* Unknown thread/delivery retries next pass without posting duplicates. */ }
+          let labelled = kind !== 'bornas-collision';
+          if (!labelled) {
+            try {
+              exec('gh', ['pr', 'edit', String(c.num), '--repo', slugOf(c.repo), '--add-label', 'review:changes'],
+                { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] });
+              labelled = true;
+            } catch { /* Retry the label independently of the durable comment marker. */ }
+          }
+          return commented && labelled;
+        } });
+      if (poison) return poison;
       const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, cwd, exec,
         humanOnlyLicense: () => {
           const setting = resolveApprovalLicensesEnqueue({ env, readFile });
