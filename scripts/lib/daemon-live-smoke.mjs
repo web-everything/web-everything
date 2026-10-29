@@ -397,7 +397,10 @@ async function checkLaneAcquireRelease(ctx) {
       try {
         out = await acquire();
       } catch (retryError) {
-        if (!hasLaneHold(retryError)) {
+        // Only a clean "no lane" refusal that names lane-hold is environmental; a crash/timeout/provision error
+        // that merely mentions lane-hold in its diagnostics stays a real failure.
+        const cleanNoLane = !/timed out|SIG[A-Z]+|crash|failed to provision/i.test(String(retryError?.message ?? ''));
+        if (!hasLaneHold(retryError) || !cleanNoLane) {
           return { ok: false, detail: `lane-pool acquire --purpose=smoke failed: ${firstLine(retryError)}`,
             ...childFailureDiagnostics(retryError) };
         }

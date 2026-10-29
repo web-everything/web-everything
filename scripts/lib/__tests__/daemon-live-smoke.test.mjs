@@ -82,6 +82,14 @@ describe('lane acquire smoke after lane-hold reset refusal', () => {
     expect(release[2].env).toBe(ctx.env);
   });
 
+  it('a retry that crashes while diagnostics mention lane-hold is a real failure, not a skip', async () => {
+    const crash = Object.assign(new Error('acquire crashed with signal SIGSEGV'), { stderr: refusal });
+    const runChild = vi.fn().mockRejectedValueOnce(failure('message')).mockRejectedValueOnce(crash);
+    const row = await check.run(context(runChild));
+    expect(row.ok).toBe(false);
+    expect(row.skipped).not.toBe(true);
+  });
+
   it.each(['message', 'stderr', 'diagnostics'])('persistent lane-hold in %s retries exactly once and returns an environmental skip', async (source) => {
     const runChild = vi.fn().mockRejectedValue(failure(source));
     const row = await check.run(context(runChild));
