@@ -4,18 +4,12 @@ export const CODEX_QUOTA_FULL_PERCENT = 98;
 
 export function isQuotaError(text) {
   if (typeof text !== 'string') return false;
-  // Only direct provider messages qualify; arbitrary wrappers and logs are not evidence.
-  if (/^(?:you exceeded your current quota|you['’]ve hit your (?:weekly|daily|monthly|usage|session|hourly|5-hour) limit)\b/i.test(text)) return true;
-  // The CLI may wrap a structured provider response with its API status prefix.
-  const message = text.replace(/^API Error: \d{3} /, '');
-  if (!message.startsWith('{')) return false;
-  try {
-    const payload = JSON.parse(message);
-    return ['rate_limit_error', 'insufficient_quota'].includes(payload?.type)
-      || ['rate_limit_error', 'insufficient_quota'].includes(payload?.error?.type);
-  } catch {
-    return false;
-  }
+  // Only this exact provider prefix proves exhaustion. Keep its case, spacing and
+  // reset separator intact; wrappers, generic rate limits and JSON are not evidence.
+  // Boundary coverage in __tests__/provider-quota-hold.test.mjs:
+  // "recognizes quota exhaustion: %s" and
+  // "rejects anything outside the exact anchored quota pattern: %s".
+  return /^You've hit your (?:weekly|daily|5-hour|session) limit · resets /.test(text);
 }
 
 export function quotaHoldRow({ provider, error, now = Date.now() }) {
