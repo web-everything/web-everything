@@ -601,6 +601,8 @@ const EVENT_PAYLOAD = Object.freeze({
   [EVENT_TYPES.APPROVAL]: [
     ['approval', oneOf(APPROVAL_KINDS), (v) => v],
     ['delegation', (v) => delegationOrNull(v) !== undefined, delegationOrNull],
+    ['headSha', (v) => v === undefined || shaOrNull(v) !== null, (v) => v === undefined ? undefined : shaOrNull(v)],
+    ['basis', (v) => v === undefined || (Array.isArray(v) && v.length > 0 && v.every(id => typeof id === 'string' && /^[A-Za-z0-9:._-]{8,128}$/.test(id))), (v) => v === undefined ? undefined : [...v]],
   ],
   [EVENT_TYPES.SEND_BACK]: [
     ['cause', oneOf(SEND_BACK_CAUSES), (v) => v],
@@ -703,6 +705,11 @@ export function validateLedgerEvent(raw) {
   if (!isStr(raw.source)) errors.push('bad `source`: a row must name its writer');
   for (const [name, check] of spec) {
     if (!check(raw[name])) errors.push(`bad \`${name}\`: ${JSON.stringify(raw[name])}`);
+  }
+  // A delegated approval's optional head witness must identify the full commit, never a prefix.
+  if (raw.type === EVENT_TYPES.APPROVAL && raw.delegation && raw.headSha !== undefined
+    && (typeof raw.headSha !== 'string' || shaOrNull(raw.headSha)?.length !== 40)) {
+    errors.push('bad `headSha`: a delegated approval requires a full 40-character SHA');
   }
   if (errors.length) return { valid: false, errors, record: null };
   const actor = raw.actor && typeof raw.actor === 'object' ? raw.actor : {};
