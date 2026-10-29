@@ -516,6 +516,59 @@ The back-port from `8173660fcf` also pins the guard in `review-red-team-resume-o
 Its production admission regression in `review-job-red-team-only.test.mjs` is
 **fresh recovery preserves unknown finished-null history through production admission and launches no call**;
 it verifies that refusal restores the original finished/null status and publishes no comment.
+Stale abandonment retains `status: running`; fresh recovery recognizes its null/absent result only
+with a finite abandonment time and an integer abandonment PID matching the status PID. Production
+planner recovery may re-dispatch an unchanged abandoned row even when its stale redispatch marker
+is spent, provided no retry is spent; it must not abandon the row again. A queued or replaced row
+still blocks this recovery. `review-red-team-on-skip.test.mjs` exercises the real durable marker,
+planner and executor through re-dispatch and the subsequent queued-state refusal.
+Production recovery has two slots per head across three exclusive marker files:
+`.stale-redispatch-1`, `.stale-redispatch-2`, and `.stale-norestart`. Marker 1 consumes slot 1;
+either marker 2 or no-restart consumes slot 2. All three together exceed the cap and fail closed.
+An existing marker 1 spends only the first attempt; `staleRedTeamSpent` means both slots are spent.
+The second abandonment requires a stale running owner with no result, absent/zero `retryCount`,
+and a parseable `pidStart` strictly later than marker 1's mtime. It waits at least
+`STALE_REDISPATCH_BACKOFF_MS` (15 minutes) from that mtime, independently of the retry cooldown.
+The abandonment function rechecks these conditions against disk and emits `detail.attempt`.
+Immediately before writing it also refuses changed status bytes or changed claim markers, releasing
+its own claim. The write is not a compare-and-swap: a writer starting between the final re-read and
+the atomic rename can still race it. The durable-marker tests document this residual window and
+simulate new queued/running jobs and changed/unreadable evidence before the final re-read.
+Confirmed non-starts release only the marker they claimed; unknown dispatch outcomes retain it.
+`live-job` keeps both abandonment and no-restart claims even when its PID was already budgeted;
+that budget refund proves no new start, not that the existing job cannot run. Null/undefined
+dispatch outcomes keep their claims; the budget start is refunded as for any non-live-job skip. The stale planner bypasses
+only the in-flight refusal: non-owed verdicts and all accepted-head publication guards still apply,
+including when the status re-read observes a completed decision after selecting a stale owner.
+Malformed marker metadata stays closed, and exhausted recovery asks the operator to inspect the
+review run. The **stale red-team recovery — bounded second re-dispatch** cases exercise real
+markers, backoff boundaries, owner provenance, retry bounds, and release/retention semantics.
+Production admission re-runs `staleRedTeamRun` on the prior before clearing it. Admission-level tests
+pin only a dead PID (accepted) and a live PID (refused); the other outcomes (reused PID, unprobeable
+owner past or within the deadline, probe error, unknown age) are pinned at the `staleRedTeamRun` unit
+level, not through admission. The execution guard
+refuses every still-running prior, including one marked abandoned: direct callers cannot
+use abandonment as proof of death. The regression
+**refuses direct fresh recovery without admission for an abandoned running live writer with zero calls**
+in `review-red-team-resume-only.test.mjs` pins that closed path. The regressions
+**fresh recovery launches an abandoned stale running pass through production admission and the shared guard**,
+**fresh production admission holds a live running writer without stale abandonment**, and
+**fresh production admission and shared guard never rerun a finished ran result with a posted comment**
+pin that boundary; `red-team-run-result.test.mjs` covers malformed abandonment and spent retry evidence.
+The stale-recovery flag is only a hint: production job admission independently reads the head's
+redispatch/spent/no-restart markers and binds the running row's head, PID and abandonment time
+to the latest abandonment claim (allowing 1 second for timestamp precision). A no-restart claim
+uses marker 1's original abandonment; a later process start or more than two claims refuses
+admission. Missing, unreadable or inconsistent claims preserve the row and require operator
+inspection. `stale flag cannot authorize production admission with %s` covers those refusals;
+`verified %s permits production admission at the dispatch boundary` covers both dispatch ordinals
+and the no-restart handoff. The durable-marker tests pin the timestamp boundary at latestClaim minus
+1000 ms (accepted), minus 1001 ms (rejected), and plus 0 ms for both abandonment ordinals.
+**fresh production admission re-probes a live PID despite verified abandonment and the stale flag**
+pins the independent admission probe. The extra-seats CLI forwards the flag to `runRedTeam`, which
+currently has no consumer for it; authorization happens in job admission before that call.
+The CLI recovery-mode plumbing test pins forwarding with and without the flag.
+Direct seat calls still refuse every running prior, regardless of flags.
 These exercise the shared execution guard and production admission, alongside the planner's
 **f: a null completion without queued provenance skips (stored status %s)** in
 `review-red-team-on-skip.test.mjs`. Live or unknown liveness
