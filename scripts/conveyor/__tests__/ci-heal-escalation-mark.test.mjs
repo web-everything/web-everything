@@ -359,13 +359,16 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
       'both preflights: required=$required, $gate=$state', async ({ gate, required, state }) => {
         const row = (name, value) => value === 'MISSING' ? []
           : [check(name, value === 'IN_PROGRESS' ? null : value,
-            { status: value === 'IN_PROGRESS' ? 'IN_PROGRESS' : 'COMPLETED' })];
+            { status: value === 'IN_PROGRESS' ? 'IN_PROGRESS' : 'COMPLETED',
+              ...(name === 'merge-gate' && value === 'FAILURE'
+                ? { mergeGateReviewHold: { holds: ['review-acceptance'], jobId: 123 } } : {}) })];
         const readers = { readPr: () => gatePr([...row('test', required), ...row(gate, state)]),
           readRequired: async () => ({ checks: ['test', gate] }) };
         const human = await checkNeedsHumanEscalable({ ...humanOptions(), ...readers });
         const notCi = await checkNotCiBreakRecordable({ ...recordOptions(), ...readers });
         expect(human.refusal !== null).toBe(required === 'SUCCESS' && state === 'FAILURE');
-        expect(notCi.refusal !== null).toBe(required !== 'SUCCESS');
+        expect(notCi.refusal !== null).toBe(required !== 'SUCCESS'
+          || (gate === 'merge-gate' && ['IN_PROGRESS', 'MISSING'].includes(state)));
       },
     );
 
@@ -406,8 +409,9 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
       expect(message).toMatch(/(?:do not|cannot|refus\w*|must not)[\s\S]*needs-human/i);
     });
 
-    it('a red merge-gate also refuses needs-human and names the gate', () => {
-      expect(humanRefusal({ pr: gatePr([check('test', 'SUCCESS'), check('merge-gate', 'FAILURE')]) }))
+    it('a proven merge-gate review hold refuses needs-human and names the gate', () => {
+      expect(humanRefusal({ pr: gatePr([check('test', 'SUCCESS'), check('merge-gate', 'FAILURE',
+        { mergeGateReviewHold: { holds: ['review-acceptance'], jobId: 123 } })]) }))
         .toEqual(expect.stringContaining('merge-gate'));
     });
 
@@ -683,7 +687,7 @@ describe('stacked base escalation facts (#4792)', () => {
 
 
 describe('needs-human CLI preflight wiring — #6004/#5979', () => {
-  it.each(['review-gate', 'merge-gate'])('refuses green required CI plus red %s before posting', gate => {
+  it.each(['review-gate', 'merge-gate'])('refuses green required CI plus proven review hold %s before posting', gate => {
     const dir = mkdtempSync(join(tmpdir(), 'ci-heal-gate-cli-'));
     try {
       const log = join(dir, 'calls.jsonl');
@@ -698,7 +702,8 @@ import { appendFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 const facts = ${JSON.stringify({ headRefOid: HEAD, statusCheckRollup: [
   { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
-  { name: gate, status: 'COMPLETED', conclusion: 'FAILURE' },
+  { name: gate, status: 'COMPLETED', conclusion: 'FAILURE',
+    ...(gate === 'merge-gate' ? { mergeGateReviewHold: { holds: ['review-acceptance'], jobId: 123 } } : {}) },
 ] })};
 for (const method of ['execFileSync', 'spawnSync', 'execSync', 'exec', 'execFile', 'spawn']) {
   cp[method] = (...args) => {

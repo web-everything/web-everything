@@ -4,11 +4,84 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { requiredCheckStates, contradictingChecks, notCiBreakContradicted, unsettledRequiredChecks, ciGreenForEscalation, resolveVoidNeedsHumanWhenCiGreen, resolveCiHealVerdictSettings } from '../ci-heal-verdict-recheck.mjs';
 import * as verdictRecheck from '../ci-heal-verdict-recheck.mjs';
+import { checkNeedsHumanEscalable } from '../ci-heal-escalation-mark.mjs';
+import { excuseMergeGateRows } from '../../lib/merge-gate-hold-class.mjs';
 
 const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/ci-heal-verdict/pr4535-2026-10-09.json'), 'utf8'));
 const input = { escalation: { outcome: 'not-a-ci-break', headSha: fixture.headRefOid }, headSha: fixture.headRefOid,
   rollup: fixture.statusCheckRollup, requiredChecks: fixture.requiredChecks };
 const green = fixture.requiredChecks.map((name) => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' }));
+
+describe('R10 escalation send-back regressions', () => {
+  it('keeps a required merge-gate npm ci failure red and allows needs-human escalation', async () => {
+    const requiredChecks = ['test', 'merge-gate'];
+    const rollup = [
+      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE', output: { summary: 'npm ci failed' } },
+    ];
+    const evidence = { ...input, requiredChecks, rollup };
+    expect.soft(requiredCheckStates(evidence).red).toEqual(['merge-gate']);
+    expect.soft(contradictingChecks(evidence)).toEqual(['merge-gate']);
+    expect.soft(ciGreenForEscalation(evidence)).toBe(false);
+    expect.soft(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(false);
+    expect(await checkNeedsHumanEscalable({
+      pr: 6042, headSha: fixture.headRefOid, outcome: 'needs-human', settings: { recheckNotCiBreak: true },
+      readPr: () => ({ headRefOid: fixture.headRefOid, statusCheckRollup: rollup }),
+      readRequired: () => ({ checks: requiredChecks }),
+    })).toEqual({ refusal: null });
+  });
+
+  it('counts a drain-blocking CodeQL failure alongside review-gate and allows needs-human escalation', async () => {
+    const requiredChecks = ['test'];
+    const rollup = [
+      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+      { name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE' },
+    ];
+    const result = verdictRecheck.gateOnlyRedStates({ requiredChecks, rollup });
+    expect.soft(result.gateOnlyRed).toBe(false);
+    expect.soft(result.red).toContain('CodeQL');
+    expect(await checkNeedsHumanEscalable({
+      pr: 6042, headSha: fixture.headRefOid, outcome: 'needs-human', settings: { recheckNotCiBreak: true },
+      readPr: () => ({ headRefOid: fixture.headRefOid, statusCheckRollup: rollup }),
+      readRequired: () => ({ checks: requiredChecks }),
+    })).toEqual({ refusal: null });
+  });
+
+  it('exempts only a review hold positively classified for the current merge-gate job', () => {
+    const row = { name: 'merge-gate', id: 123, status: 'COMPLETED', conclusion: 'FAILURE' };
+    for (const readable of [false, true]) {
+      const classified = excuseMergeGateRows([row], {
+        prNumber: 6042, headSha: fixture.headRefOid, labels: ['ready-to-merge'], setting: 'on',
+        readVerdict: () => readable ? { num: 6042, head_sha: fixture.headRefOid, ok: false,
+          results: [{ id: 'review-acceptance', status: 'hold', reason: 'review pending' }] }
+          : { error: 'job log unreadable' },
+      });
+      expect(Boolean(classified.reviewHold)).toBe(readable);
+      const evidence = { ...input, requiredChecks: ['test', 'merge-gate'], rollup: [
+        { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, ...classified.rows,
+      ] };
+      expect(requiredCheckStates(evidence).red).toEqual(readable ? [] : ['merge-gate']);
+      expect(ciGreenForEscalation(evidence)).toBe(readable);
+      expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(readable);
+    }
+  });
+
+  it('uses the latest normalized CodeQL attempt and honors the drain switch', () => {
+    for (const conclusion of ['SUCCESS', 'FAILURE', 'CANCELLED']) {
+      const evidence = { requiredChecks: ['test'], rollup: [
+        { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+        { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+        { name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE', run_attempt: 1 },
+        { name: 'CODEQL', status: 'COMPLETED', conclusion, run_attempt: 2 },
+      ] };
+      for (const drainBlocksOnCodeQL of [false, true]) {
+        expect(verdictRecheck.gateOnlyRedStates({ ...evidence, drainGateSettings: { drainBlocksOnCodeQL } }).gateOnlyRed)
+          .toBe(!drainBlocksOnCodeQL || conclusion !== 'FAILURE');
+      }
+    }
+  });
+});
 
 describe('requiredCheckStates shared predicate regressions', () => {
   it.each([false, true])('partial attempt metadata cannot hide newer rollup evidence (reverse=%s)', reverse => {
@@ -174,15 +247,17 @@ describe('requiredCheckStates shared predicate regressions', () => {
 });
 
 describe('gateOnlyRedStates', () => {
-  it.each(['review-gate', 'merge-gate'])('includes red %s even when absent from the required roster', name => {
+  it.each(['review-gate', 'merge-gate'])('includes proven review hold %s even when absent from the required roster', name => {
     expect(verdictRecheck.gateOnlyRedStates({ ...input, rollup: [
-      ...green, { name, status: 'COMPLETED', conclusion: 'FAILURE' },
+      ...green, { name, status: 'COMPLETED', conclusion: 'FAILURE',
+        ...(name === 'merge-gate' ? { mergeGateReviewHold: { holds: ['review-acceptance'], jobId: 123 } } : {}) },
     ] })).toEqual({ gateOnlyRed: true, red: [name] });
   });
 
   it('recognizes both gates red together', () => {
     const result = verdictRecheck.gateOnlyRedStates({ ...input, rollup: [
-      ...green, ...['review-gate', 'merge-gate'].map(name => ({ name, status: 'COMPLETED', conclusion: 'FAILURE' })),
+      ...green, ...['review-gate', 'merge-gate'].map(name => ({ name, status: 'COMPLETED', conclusion: 'FAILURE',
+        ...(name === 'merge-gate' ? { mergeGateReviewHold: { holds: ['review-acceptance'], jobId: 123 } } : {}) })),
     ] });
     expect(result.gateOnlyRed).toBe(true);
     expect(result.red.toSorted()).toEqual(['merge-gate', 'review-gate']);

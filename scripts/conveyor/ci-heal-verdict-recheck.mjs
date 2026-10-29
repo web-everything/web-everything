@@ -27,6 +27,7 @@ import { fileURLToPath } from 'node:url';
 import { collapseRollupToLatestPerName, rollupRowKind } from '../lib/rollup-collapse.mjs';
 import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.mjs';
 import { latestAttempts, summarize } from '../lib/check-state-predicate.mjs';
+import { CODEQL_CHECK_NAME, failedCodeQLCheck, loadDrainGateSettings } from '../lib/codeql-gate.mjs';
 
 export const CI_HEAL_VERDICT_ENV = 'WE_CI_HEAL_RECHECK_NOT_CI_BREAK';
 export const ciHealVerdictSettingsPath = () => join(dirname(fileURLToPath(import.meta.url)), 'ci-heal-verdict-settings.json');
@@ -137,13 +138,17 @@ function checkEvidence(rollup, requiredChecks) {
     }
     return check;
   });
+  // Only the shared merge-gate hold classifier's annotation proves a review hold.
+  // A job/setup failure (or unreadable verdict) must remain ordinary CI evidence.
+  const holdGateNames = [REVIEW_GATE_CHECK];
+  if (checks.some(row => row.name === 'merge-gate' && row.mergeGateReviewHold)) holdGateNames.push('merge-gate');
   const roster = withoutImpliedRequiredChecks(Array.isArray(requiredChecks) ? requiredChecks : [], checks)
-    .filter(name => !gateNames.includes(lowerName(name)));
-  return { checks, roster };
+    .filter(name => !holdGateNames.includes(lowerName(name)));
+  return { checks, roster, holdGateNames };
 }
 
 /**
- * The required checks (minus review/merge gates) on this head, split by their LATEST run. PURE.
+ * The required checks (minus review-gate and proven merge-gate review holds), split by their LATEST run. PURE.
  * An empty/unknown required set returns nothing at all: with no list to judge against, nothing is claimed.
  * @returns {{red: string[], pending: string[], missing: string[], green: string[]}}
  */
@@ -162,11 +167,17 @@ export function requiredCheckStates({ rollup, requiredChecks }) {
   return out;
 }
 
-/** Include hold gates even when they are absent from the required roster. Pure. */
-export function gateOnlyRedStates({ rollup, requiredChecks }) {
-  const { checks, roster } = checkEvidence(rollup, requiredChecks);
-  const { gateOnlyRed, redSet } = summarize(checks, { requiredNames: [...roster, ...gateNames] });
+/** Include gates and enabled drain-blocking CodeQL failures, even outside the required roster. */
+export function gateOnlyRedStates({ rollup, requiredChecks, drainGateSettings = loadDrainGateSettings() }) {
+  const { checks, roster, holdGateNames } = checkEvidence(rollup, requiredChecks);
+  // Reuse the drain's failure rule on the already-selected latest attempts. Its
+  // canonical spelling bridges this reader's case-insensitive check names.
+  const codeql = drainGateSettings.drainBlocksOnCodeQL && failedCodeQLCheck({ statusCheckRollup:
+    checks.filter(row => row.name === lowerName(CODEQL_CHECK_NAME)).map(row => ({ ...row, name: CODEQL_CHECK_NAME })) });
+  const requiredNames = [...roster, ...gateNames, ...(codeql ? [CODEQL_CHECK_NAME] : [])];
+  const { gateOnlyRed, redSet } = summarize(checks, { requiredNames, holdGateNames });
   const originalNames = new Map((Array.isArray(requiredChecks) ? requiredChecks : []).map(name => [lowerName(name), name]));
+  if (codeql && !originalNames.has(lowerName(CODEQL_CHECK_NAME))) originalNames.set(lowerName(CODEQL_CHECK_NAME), CODEQL_CHECK_NAME);
   return { gateOnlyRed, red: [...redSet].map(name => originalNames.get(name) ?? name) };
 }
 
