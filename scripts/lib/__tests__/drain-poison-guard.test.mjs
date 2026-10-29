@@ -102,6 +102,12 @@ describe('checkBornAsCollision', () => {
       const exec = fakeExec({ mainTexts: { [mainCard]: text } });
       expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ error: expect.stringContaining(`${mainCard} has no readable frontmatter`) });
     });
+  it('reports a readable main duplicate even when an unreadable main card sorts before it', () => {
+    const broken = 'backlog/7000-broken.md';
+    const exec = fakeExec({ main: `origin/main:${broken}\0bornAs: xgcpm6z\norigin/main:${mainCard}\0bornAs: xgcpm6z`,
+      mainTexts: { [broken]: '---\nbornAs: xaaaaaa\n--\nExample:\nbornAs: xgcpm6z\n---\n', [mainCard]: cardText('xgcpm6z') } });
+    expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ collision: { hash: 'xgcpm6z', path: newCard, mainCard } });
+  });
   it('treats an invalid-YAML file below a backlog subdirectory on main as no card', () => {
     const raised = 'backlog/raised-by/7233.md';
     const exec = fakeExec({ main: `origin/main:${raised}\0bornAs: xgcpm6z`, mainTexts: { [raised]: '---\nbornAs: xgcpm6z\nbornAs: xgcpm6z\n---\n' } });

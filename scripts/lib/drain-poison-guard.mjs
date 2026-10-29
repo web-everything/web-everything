@@ -92,6 +92,7 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
     // (held, never labelled), since those lines may be a body example. A file below a backlog subdirectory without
     // readable frontmatter is not a card and owns no identity.
     const seenCards = new Set();
+    let unreadable = null;
     for (const line of matches.split('\n')) {
       const split = line.indexOf('\0');
       if (!line.startsWith(prefix) || split < 0) continue;
@@ -102,9 +103,11 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
       const card = added.find(card => ids.includes(card.hash));
       if (!card) continue;
       const readable = parsed && !malformed;
-      if (!readable && TOP_LEVEL_CARD.test(mainCard)) throw new Error(`main card ${mainCard} has no readable frontmatter`);
       if (readable) return done({ collision: { hash: card.hash, path: card.path, mainCard } });
+      // Held only after every hit is read, so an unreadable card never hides a readable duplicate sorted after it.
+      if (TOP_LEVEL_CARD.test(mainCard)) unreadable ??= mainCard;
     }
+    if (unreadable) throw new Error(`main card ${unreadable} has no readable frontmatter`);
     return done({ ok: true });
   } catch (e) { return done({ error: String(e?.message ?? e) }); }
 }
