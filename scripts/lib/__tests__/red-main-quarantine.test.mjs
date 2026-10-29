@@ -223,6 +223,11 @@ describe('quarantine — latestRedSha keying and re-keying', () => {
     expect(same.list.entries[0]).toEqual(first.entries[0]);
     expect(same.events).toHaveLength(0);
   });
+  it('a re-key never extends total lifetime past QUARANTINE_MAX_TTL_MS from the original addedAt', () => {
+    const first = base(SHA);
+    const r = addEntries(first, { tests: [TEST], brokenSha: LATEST, owner: 'o', reason: 'r', actor: 'operator', now: NOW + QUARANTINE_MAX_TTL_MS - 3_600_000 });
+    expect(r.list.entries[0].expiresAt).toBeLessThanOrEqual(NOW + QUARANTINE_MAX_TTL_MS);
+  });
   it('re-key of a test does not touch other tests or other jobs', () => {
     const l = addEntries(base(SHA), { tests: ['a/__tests__/b.test.mjs'], brokenSha: SHA, owner: 'o', reason: 'r', actor: 'operator', now: NOW }).list;
     const r = addEntries(l, { tests: [TEST], brokenSha: LATEST, owner: 'o', reason: 'r2', actor: 'operator', now: NOW + 1 });

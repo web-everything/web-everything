@@ -105,7 +105,8 @@ export function addEntries(list, { tests = [], brokenSha, owner, reason, actor, 
     if (idx >= 0) {
       // Already listed: a different brokenSha re-keys it (brokenSha/reason/expiresAt); the same sha stays a no-op.
       if (entries[idx].brokenSha === brokenSha) continue;
-      const exp = now + Math.min(Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : QUARANTINE_DEFAULT_TTL_MS, QUARANTINE_MAX_TTL_MS);
+      // Total lifetime stays bounded from the ORIGINAL addedAt: a re-key can never keep an entry alive past the max TTL.
+      const exp = Math.min(now + Math.min(Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : QUARANTINE_DEFAULT_TTL_MS, QUARANTINE_MAX_TTL_MS), (Number.isFinite(entries[idx].addedAt) ? entries[idx].addedAt : now) + QUARANTINE_MAX_TTL_MS);
       const e = { ...entries[idx], brokenSha, reason, expiresAt: exp };
       entries[idx] = e;
       events.push({ type: 'quarantine-rekeyed', at: now, actor, from: base.entries[idx]?.brokenSha ?? null, ...e });
