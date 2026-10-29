@@ -1,5 +1,12 @@
-import { describe, expect, it } from 'vitest';
-import { reviewRunEvidence, decideSameHeadHold } from '../review-referral-hold.mjs';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import * as hold from '../review-referral-hold.mjs';
+import { newSpanEnd } from '../../operations/telemetry.mjs';
+import { newRunRecord } from '../../operations/run-store.mjs';
+
+const { reviewRunEvidence, decideSameHeadHold, markQuotaOnlyFromSpans,
+  readQuotaFailureSpans, readReviewRunEvidence, REVIEW_EVIDENCE_CACHE_FILE } = hold;
 
 const repo = 'example/repo';
 const head = 'a'.repeat(40);
@@ -80,5 +87,155 @@ describe('same-head quota attempt accounting', () => {
     const expected = decideSameHeadHold(acceptedPr, [genuine], options);
     expect(expected).toMatchObject({ kind: 'same-head', count: 1, attemptsSinceWake: 1 });
     expect(decideSameHeadHold(acceptedPr, [genuine, evidence([quotaError], 1)], options)).toEqual(expected);
+  });
+});
+
+const dirs = [];
+function temp() {
+  const dir = mkdtempSync(join(process.env.TMPDIR, 'quota-spans-'));
+  dirs.push(dir);
+  return dir;
+}
+afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+function quotaSpan(overrides = {}) {
+  return newSpanEnd({ traceId: 'a'.repeat(32), spanId: 'b'.repeat(16),
+    name: 'review.loop', status: 'error',
+    statusMessage: "review-loop exit 1: error: judge-spawn: the juror failed: You've hit your weekly limit · resets Oct 30 at 4pm (America/Toronto)",
+    startedAt: iso(at), endedAt: iso(at + 1_000),
+    attributes: { pr: 7, repo: 'example/repo' }, ...overrides });
+}
+
+// Real interrupted runs contain a verdict flag, but no error text in their persisted findings.
+function textlessRun(index = 0) {
+  const id = `review-pr-${index}`;
+  const run = { ...newRunRecord({ id, op: 'review-pr' }), ...failedRun([], index), id };
+  delete run.findings.mandatoryReferrals;
+  run.stepTimings = run.stepTimings.map((timing, stepIndex) => ({ ...timing, stepIndex, durationMs: 1 }));
+  run.seatTimings = [{ seat: 'judge', verdict: 'error' }];
+  return run;
+}
+const textlessRow = () => reviewRunEvidence(textlessRun());
+function writeSpans(dir, spans, day = iso(at).slice(0, 10)) {
+  const path = join(dir, `${day}.jsonl`);
+  writeFileSync(path, spans.map(s => JSON.stringify(s)).join('\n') + '\n');
+  return path;
+}
+
+describe('telemetry quota overlay', () => {
+  it('marks a textless incomplete row by PR and repo basename without mutating either input', () => {
+    const rows = [textlessRow()];
+    const spans = [quotaSpan({ attributes: { pr: 7, repo: 'repo' } })];
+    const before = structuredClone({ rows, spans });
+    expect(rows[0]).toMatchObject({ incomplete: true, quotaOnly: false, startedAt: at });
+    expect(markQuotaOnlyFromSpans(rows, spans)).toEqual([{ ...rows[0], quotaOnly: true }]);
+    expect({ rows, spans }).toEqual(before);
+  });
+
+  it.each([-30_000, 31_000])('includes the 30-second window boundary at offset %i', offset => {
+    const row = { ...textlessRow(), startedAt: at + offset };
+    expect(markQuotaOnlyFromSpans([row], [quotaSpan()])[0].quotaOnly).toBe(true);
+  });
+
+  it.each([
+    ['completed row', { incomplete: false, completedAt: at + 500 }, {}],
+    ['another PR', { pr: 8 }, {}],
+    ['another repo basename', { repo: 'example/other' }, {}],
+    ['non-quota error', {}, { statusMessage: genuineError }],
+    ['another span name', {}, { name: 'review.seat' }],
+    ['successful span', {}, { status: 'ok' }],
+    ['before the window', { startedAt: at - 30_001 }, {}],
+    ['after the window', { startedAt: at + 31_001 }, {}],
+    ['missing PR identity', {}, { attributes: { repo } }],
+    ['missing repo identity', {}, { attributes: { pr: 7 } }],
+    ['invalid span start', {}, { startedAt: 'invalid' }],
+    ['invalid span end', {}, { endedAt: 'invalid' }],
+  ])('fails closed for %s', (_, rowOverrides, spanOverrides) => {
+    const row = { ...textlessRow(), ...rowOverrides };
+    expect(markQuotaOnlyFromSpans([row], [quotaSpan(spanOverrides)])).toEqual([row]);
+  });
+
+  it('leaves rows unchanged when telemetry is absent', () => {
+    const rows = [textlessRow()];
+    expect(markQuotaOnlyFromSpans(rows, [])).toEqual(rows);
+  });
+});
+
+describe('quota failure telemetry reader', () => {
+  it('reads quota review.loop errors from each of the last three daily jsonl files only', () => {
+    const dir = temp();
+    const spans = [0, 1, 2].map(daysAgo => quotaSpan({
+      startedAt: iso(at - daysAgo * 86_400_000), endedAt: iso(at - daysAgo * 86_400_000 + 1_000),
+    }));
+    for (const span of spans) writeSpans(dir, [span], span.startedAt.slice(0, 10));
+    writeSpans(dir, [quotaSpan({ spanId: 'c'.repeat(16) })], '2026-10-26');
+    writeFileSync(join(dir, 'ignored.txt'), JSON.stringify(quotaSpan()));
+    expect(readQuotaFailureSpans({ dir, now: options.now })).toEqual(expect.arrayContaining(spans));
+    expect(readQuotaFailureSpans({ dir, now: options.now })).toHaveLength(3);
+  });
+
+  it('uses telemetry parsing to skip corrupt and unknown-version lines and filters unrelated events', () => {
+    const dir = temp();
+    const span = quotaSpan();
+    const path = writeSpans(dir, [span,
+      quotaSpan({ statusMessage: genuineError }), quotaSpan({ name: 'review.seat' }),
+      quotaSpan({ status: 'ok' }), { ...span, event: 'span.start' }, { ...span, v: 999 }]);
+    writeFileSync(path, readFileSync(path, 'utf8') + '{torn json\n\n');
+    expect(readQuotaFailureSpans({ dir, now: options.now })).toEqual([span]);
+  });
+
+  it('returns no quota evidence for a missing telemetry directory', () => {
+    expect(readQuotaFailureSpans({ dir: join(temp(), 'missing'), now: options.now })).toEqual([]);
+  });
+});
+
+function runFixture(count = 1) {
+  const root = temp();
+  const dir = join(root, 'runs');
+  const spansDir = join(root, 'spans');
+  mkdirSync(dir);
+  mkdirSync(spansDir);
+  for (let i = 0; i < count; i++) {
+    writeFileSync(join(dir, `review-pr-${i}.json`), JSON.stringify(textlessRun(i)));
+  }
+  return { dir, spansDir, now: options.now };
+}
+
+describe('run evidence telemetry integration', () => {
+  it('overlays newly arrived spans after memory and disk cache reads without caching the overlay', () => {
+    const fixture = runFixture();
+    const memo = new Map();
+    const baseline = readReviewRunEvidence({ ...fixture, memo });
+    expect(baseline[0].quotaOnly).toBe(false);
+    const diskBefore = readFileSync(join(fixture.dir, REVIEW_EVIDENCE_CACHE_FILE), 'utf8');
+    const path = writeSpans(fixture.spansDir, [quotaSpan()]);
+    expect(readQuotaFailureSpans({ dir: fixture.spansDir, now: fixture.now })).toHaveLength(1);
+    const readRun = vi.fn(() => { throw new Error('unchanged run must come from cache'); });
+    expect(readReviewRunEvidence({ ...fixture, memo, readRun })[0].quotaOnly).toBe(true);
+    expect(readReviewRunEvidence({ ...fixture, memo: new Map(), readRun })[0].quotaOnly).toBe(true);
+    expect(readRun).not.toHaveBeenCalled();
+    expect(baseline[0].quotaOnly).toBe(false);
+    expect([...memo.values()].every(entry => entry.evidence.quotaOnly === false)).toBe(true);
+    expect(readFileSync(join(fixture.dir, REVIEW_EVIDENCE_CACHE_FILE), 'utf8')).toBe(diskBefore);
+    rmSync(path);
+    expect(readReviewRunEvidence({ ...fixture, memo, readRun })).toEqual(baseline);
+    expect(readReviewRunEvidence({ ...fixture, memo: new Map(), readRun })).toEqual(baseline);
+  });
+
+  it.each([true, false])('13 textless incomplete runs with quota spans: %s', quota => {
+    const fixture = runFixture(13);
+    const spans = Array.from({ length: 13 }, (_, i) => quotaSpan({
+      spanId: i.toString(16).padStart(16, '0'), startedAt: iso(at + i * 1_000),
+      endedAt: iso(at + i * 1_000 + 500), ...(quota ? {} : { statusMessage: genuineError }),
+    }));
+    writeSpans(fixture.spansDir, spans);
+    expect(readQuotaFailureSpans({ dir: fixture.spansDir, now: fixture.now })).toHaveLength(quota ? 13 : 0);
+    const rows = readReviewRunEvidence({ ...fixture, memo: new Map() });
+    expect(rows).toHaveLength(13);
+    expect(rows.every(row => row.incomplete && row.quotaOnly === quota)).toBe(true);
+    const result = decideSameHeadHold(pr, rows, options);
+    if (quota) expect(result).toBeNull();
+    else expect(result).toMatchObject({ kind: 'same-head', count: 13, attemptsSinceWake: 13,
+      retryAt: null, noVerdict: { exhausted: true } });
   });
 });
