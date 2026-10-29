@@ -134,6 +134,28 @@ describe('human-only enqueue license', () => {
     r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
     expect(r.prove()).toMatchObject({ licensed: false });
   });
+  it('refuses an NFD-named workflow whose precomposed pathspec lookups are both empty', () => {
+    const r = fixture(), path = '.github/workflows/cafe\u0301.yml';
+    r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
+    const main = r.commit('main docs'); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+    r.git(['checkout', '-qb', 'pr', r.approved]);
+    const id = r.git(['rev-parse', `${r.approved}:.github/workflows/ci.yml`]);
+    // Stage the raw name directly so filesystem normalization cannot change the fixture.
+    r.git(['-c', 'core.precomposeUnicode=false', 'update-index', '--add', '--cacheinfo', '100644', id, path]);
+    r.git(['commit', '-qm', 'author NFD workflow']);
+    r.git(['merge', '--no-ff', '-m', 'merge main', main]);
+    const head = r.git(['rev-parse', 'HEAD']); r.setHead(head);
+    r.git(['config', 'core.precomposeUnicode', 'true']);
+    expect(r.git(['-c', 'core.precomposeUnicode=false', '-c', 'core.quotePath=false', 'ls-tree', '-r', '-z', '--full-tree', head]))
+      .toContain(`\t${path}\0`);
+    // Model Git's macOS pathspec precomposition on every host, including Linux.
+    const emptyLookups = [head, main].map(ref => r.git(['ls-tree', '-z', ref, '--', path.normalize('NFC')]));
+    expect(emptyLookups).toEqual(['', '']);
+    expect(r.prove({ exec: (cmd, args, opts) => {
+      if (cmd === 'git' && args.includes('ls-tree') && args.includes('--')) return Buffer.alloc(0);
+      return r.exec(cmd, args, opts);
+    } })).toMatchObject({ licensed: false, reason: expect.stringMatching(/re-approve.*queue/) });
+  });
   it('refuses a policy successor differing from main even in a main merge', () => {
     const r = fixture();
     r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
