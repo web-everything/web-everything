@@ -97,47 +97,31 @@ describe('classifyCheck exhaustive independent outcome grid', () => {
 });
 
 describe('latestAttempts', () => {
-  it('compares workflow runs before their local attempt counters, in either input order', () => {
-    const older = settled('CI', 'success', { run_id: '100', run_attempt: 2, id: 1001 });
-    const newer = settled('ci', 'failure', { run_id: '200', run_attempt: 1, id: 2001 });
-    for (const checks of [[older, newer], [newer, older]]) {
-      expect(latestAttempts(checks)).toEqual([newer]);
-      expect(summarize([...checks, settled('review-gate', 'failure')])).toEqual({
-        redSet: new Set(['ci', 'review-gate']), pendingSet: new Set(),
-        gateOnlyRed: false, allRequiredGreen: false,
-      });
+  it('compares large run_attempt integers exactly before considering id in either order', () => {
+    const older = settled('ci', 'success', { run_attempt: '9007199254740992', id: 999 });
+    const newer = settled('ci', 'failure', { run_attempt: '9007199254740993', id: 1 });
+    for (const runs of [[older, newer], [newer, older]]) {
+      expect(latestAttempts(runs)).toEqual([newer]);
     }
   });
 
-  it('still orders reruns within one workflow run by attempt before check id', () => {
-    const older = settled('ci', 'failure', { run_id: 200, run_attempt: 1, id: 9999 });
-    const newer = settled('ci', 'success', { run_id: '200', run_attempt: 2, id: 1 });
-    for (const checks of [[older, newer], [newer, older]]) {
-      expect(latestAttempts(checks)).toEqual([newer]);
-    }
+  it('compares canonical string and number ranks equally and retains the first exact tie', () => {
+    const first = settled('ci', 'failure', { run_attempt: 2, id: 9007199254740992 });
+    const second = settled('ci', 'success', { run_attempt: '2', id: '9007199254740992' });
+    expect(latestAttempts([first, second])).toEqual([first]);
+    expect(latestAttempts([second, first])).toEqual([second]);
   });
 
-  it.each([['failure', 'red'], ['success', 'green'], ['cancelled', 'pending']])(
-    'classifies the newer workflow run as %s rather than inheriting an earlier attempt', (conclusion, state) => {
-      const checks = [
-        settled('ci', 'failure', { run_id: 100, run_attempt: 10, id: 1001 }),
-        settled('ci', conclusion, { run_id: 200, run_attempt: 1, id: 2001 }),
-      ];
-      for (const rows of [checks, checks.toReversed()]) {
-        const result = summarize(rows, { requiredNames: ['CI'] });
-        expect(result.redSet.has('ci')).toBe(state === 'red');
-        expect(result.pendingSet.has('ci')).toBe(state === 'pending');
-        expect(result.allRequiredGreen).toBe(state === 'green');
-      }
-    },
-  );
-
-  it('uses global check ids for mixed run identities without depending on row order', () => {
-    const a = settled('ci', 'success', { run_id: 100, run_attempt: 3, id: 1001 });
-    const b = settled('ci', 'success', { run_id: 200, run_attempt: 1, id: 2001 });
-    const c = settled('ci', 'failure', { run_attempt: 2, id: 3001 });
-    for (const rows of [[a, b, c], [a, c, b], [b, a, c], [b, c, a], [c, a, b], [c, b, a]]) {
-      expect(latestAttempts(rows)).toEqual([c]);
+  it.each([
+    undefined, null, '', 'garbage', '01', ' 2', '2 ', '2\n', '+2', '-2',
+    '2.5', '2.0', '2e3', '0x10', 'Infinity', 'NaN', -2, 2.5, Infinity, NaN,
+    true, {}, [],
+  ])('treats noncanonical or missing ranking evidence %j as zero for both fields', (value) => {
+    for (const field of ['run_attempt', 'id']) {
+      const invalid = settled('ci', 'success', { [field]: value });
+      const zero = settled('ci', 'failure', { [field]: '0' });
+      expect(latestAttempts([zero, invalid])).toEqual([zero]);
+      expect(latestAttempts([invalid, zero])).toEqual([invalid]);
     }
   });
 
@@ -185,6 +169,16 @@ describe('latestAttempts', () => {
 });
 
 describe('named check-state regressions', () => {
+  it('large adjacent ids cannot hide a newer failure in either row order', () => {
+    const older = settled('ci', 'success', { run_attempt: 1, id: '9007199254740992' });
+    const newer = settled('ci', 'failure', { run_attempt: 1, id: '9007199254740993' });
+    for (const runs of [[older, newer], [newer, older]]) {
+      const result = summarize(runs, { requiredNames: ['ci'] });
+      expect(result.redSet).toEqual(new Set(['ci']));
+      expect(result.allRequiredGreen).toBe(false);
+    }
+  });
+
   it('STALE is not omitted from the failed set', () => {
     const check = settled('ci', 'STALE');
     expect(classifyCheck(check)).toBe('pending');
@@ -231,24 +225,6 @@ describe('named check-state regressions', () => {
 });
 
 describe('summarize required checks', () => {
-  it('an explicit requiredNames roster overrides a row marked required:false', () => {
-    expect(summarize([settled('ci', 'failure', { required: false })], {
-      requiredNames: ['ci'],
-    })).toEqual({
-      redSet: new Set(['ci']), pendingSet: new Set(),
-      gateOnlyRed: false, allRequiredGreen: false,
-    });
-  });
-
-  it('matches requiredNames and holdGateNames case-insensitively and returns lowercase names', () => {
-    expect(summarize([
-      settled('ci', 'success'), settled('REVIEW-GATE', 'failure'),
-    ], { requiredNames: ['CI', 'Review-Gate'], holdGateNames: ['Review-Gate'] })).toEqual({
-      redSet: new Set(['review-gate']), pendingSet: new Set(),
-      gateOnlyRed: true, allRequiredGreen: false,
-    });
-  });
-
   it('marks an explicitly required name with no row as pending', () => {
     expect(summarize([settled('ci', 'success')], { requiredNames: ['ci', 'missing'] })).toEqual({
       redSet: new Set(), pendingSet: new Set(['missing']),

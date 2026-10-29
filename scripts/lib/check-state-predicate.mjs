@@ -44,43 +44,34 @@ export function classifyCheck(check = {}) {
   return check.required === false && state !== 'green' ? 'ignore' : state;
 }
 
-// Missing or nonnumeric ranking evidence has no priority; never consult dates.
+// Only canonical non-negative integers rank; missing/garbage evidence is zero.
+// Keep string IDs exact above Number.MAX_SAFE_INTEGER; never consult dates.
 const numeric = (value) => {
-  if (typeof value !== 'number' && typeof value !== 'string') return 0;
-  const number = Number(value);
-  return Number.isFinite(number) ? number : 0;
+  if (typeof value !== 'number' && typeof value !== 'string') return 0n;
+  const integer = String(value);
+  return /^(0|[1-9][0-9]*)$/.test(integer) ? BigInt(integer) : 0n;
 };
 
 /**
- * Select the greatest (run_id, run_attempt, id) per case-insensitive name.
- * Attempts are local to a workflow run. With no run identities, retain the
- * legacy (run_attempt, id) ranking. With mixed identities, use global check ids
- * before attempts rather than compare counters from potentially different runs.
+ * Select the greatest (run_attempt, id) exact integer pair per case-insensitive name.
  * Exact ties retain the first row. Inputs are never mutated.
  * @param {object[]} checks Check attempts.
  * @returns {object[]} Original winning rows, in first-seen name order.
  * @example latestAttempts([{ name: 'ci', id: 1 }, { name: 'ci', id: 2 }]);
  */
 export function latestAttempts(checks = []) {
-  const groups = new Map();
+  const latest = new Map();
   for (const check of checks) {
     const name = normalize(check.name);
-    if (!groups.has(name)) groups.set(name, []);
-    groups.get(name).push(check);
+    const previous = latest.get(name);
+    const attempt = numeric(check.run_attempt);
+    const previousAttempt = numeric(previous?.run_attempt);
+    if (!previous || attempt > previousAttempt
+      || (attempt === previousAttempt && numeric(check.id) > numeric(previous.id))) {
+      latest.set(name, check);
+    }
   }
-  return [...groups.values()].map(group => {
-    const allRunsKnown = group.every(check => numeric(check.run_id) > 0);
-    const someRunsKnown = group.some(check => numeric(check.run_id) > 0);
-    const fields = allRunsKnown ? ['run_id', 'run_attempt', 'id']
-      : someRunsKnown ? ['id', 'run_attempt'] : ['run_attempt', 'id'];
-    return group.reduce((previous, check) => {
-      for (const field of fields) {
-        const difference = numeric(check[field]) - numeric(previous[field]);
-        if (difference !== 0) return difference > 0 ? check : previous;
-      }
-      return previous;
-    });
-  });
+  return [...latest.values()];
 }
 
 /**
