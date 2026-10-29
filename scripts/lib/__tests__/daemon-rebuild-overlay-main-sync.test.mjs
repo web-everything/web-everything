@@ -12,6 +12,8 @@ import { readOverlayConflictWakes } from '../overlay-conflict-wake.mjs';
 import { replay, sidecarsOf } from '../../operations/needs-you-feed.mjs';
 import { probeOverlayMainSync } from '../../conveyor/health-watch.mjs';
 
+vi.mock('node:fs', async importOriginal => ({ ...await importOriginal() }));
+
 const temps = [], ref = 'lane/fix';
 const temp = () => { const p = fs.mkdtempSync(join(tmpdir(), 'we-main-sync-test-')); temps.push(p); return p; };
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); temps.splice(0).forEach(p => fs.rmSync(p, { recursive: true, force: true })); });
@@ -137,6 +139,40 @@ describe('overlay main sync', () => {
     expect(f.pushes).toEqual([]); unchanged(f);
   });
 
+  it.each([
+    [null, 'success'], [123, 'success'],
+    [null, 'failed'], [123, 'failed'],
+    [null, 'threw'], [123, 'threw'],
+  ])('conflict notifications precede abort for PR %s even when abort %s', async (pr, outcome) => {
+    const f = fixture({ conflict: true }), git = f.deps.git;
+    const state = json(overlayFilePath(f.root, f.env)); state.overlays[0].pr = pr;
+    fs.writeFileSync(overlayFilePath(f.root, f.env), JSON.stringify(state));
+    let beforeAbort;
+    f.deps.git = vi.fn((args, opts) => {
+      if (args[0] !== 'merge' || args[1] !== '--abort') return git(args, opts);
+      beforeAbort = {
+        events: [...f.events],
+        attention: replay({ path: f.env.WE_NEEDS_YOU_FEED }),
+        wake: readOverlayConflictWakes(f.env).get(pr),
+      };
+      if (outcome === 'threw') throw new Error('abort unavailable');
+      if (outcome === 'failed') return { status: 1, stdout: '', stderr: 'abort unavailable' };
+      return git(args, opts);
+    });
+    await expect(job(f)).rejects.toThrow(outcome === 'success' ? /merge conflicts/ : /abort unavailable/);
+    expect(beforeAbort?.events).toContainEqual(expect.objectContaining({
+      kind: 'overlay-main-merge-conflict', ref, files: ['worker.mjs'],
+    }));
+    if (pr) expect(beforeAbort.wake).toMatchObject({ pr, ref, files: ['worker.mjs'], clone: f.root });
+    else expect(beforeAbort.attention).toContainEqual(expect.objectContaining({
+      kind: 'overlay-main-merge-conflict', repo: 'web-everything', pr: 0, ref, files: ['worker.mjs'],
+    }));
+    attempted(f);
+    expect(json(sidecar(f)).retryMain[ref]).toBeUndefined();
+    expect(f.pushes).toEqual([]); expect(f.deps.testRunner).not.toHaveBeenCalled();
+    expect(fs.existsSync(marker(f))).toBe(false); unchanged(f);
+  });
+
   it('non-conflict failures schedule exactly three retries at 10, 20 and 30 minutes then remember main', async () => {
     const f = fixture(), clock = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
     f.deps.testRunner = vi.fn(async () => ({ status: 1, stdout: '', stderr: 'temporary failure' }));
@@ -218,6 +254,45 @@ describe('overlay main sync', () => {
       expect(fs.readFileSync(`${file}.1`, 'utf8')).toBe(before);
       expect(fs.readFileSync(file, 'utf8')).toBe('child log\n');
     } else if (outcome !== 'open-failure') expect(fs.readFileSync(file, 'utf8')).toBe(before + 'child log\n');
+  });
+
+  it.each(['mkdirSync', 'appendFileSync'])('spawn error releases its lock when needs-you %s fails in both alert paths', method => {
+    const f = fixture(), child = { once: vi.fn(), unref: vi.fn() };
+    expect(tick(f, { spawnFn: () => child }).started).toEqual([ref]);
+    const file = alertsFilePath(f.root, f.env), original = fs[method];
+    const target = method === 'mkdirSync' ? dirname(file) : file;
+    const failedWrite = vi.fn(() => { throw new Error('local alert unavailable'); });
+    vi.spyOn(fs, method).mockImplementation((path, ...args) => path === target
+      ? failedWrite() : original(path, ...args));
+    const onError = child.once.mock.calls.find(([name]) => name === 'error')[1];
+    expect(() => onError(new Error('spawn unavailable'))).not.toThrow();
+    expect(failedWrite).toHaveBeenCalledTimes(2);
+    expect(fs.existsSync(marker(f))).toBe(false);
+    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toContainEqual(expect.objectContaining({
+      kind: 'overlay-main-sync-needs-you', ref, reason: 'spawn unavailable',
+    }));
+  });
+
+  it('log close failure still attaches the child error handler and transfers the lock token', () => {
+    const f = fixture(), child = { once: vi.fn(), unref: vi.fn() }, close = fs.closeSync;
+    let fd, owner;
+    const spawnFn = vi.fn((bin, args, options) => {
+      fd = options.stdio[1]; owner = args.find(arg => arg.startsWith('--token=')).slice('--token='.length);
+      return child;
+    });
+    const failedClose = vi.fn();
+    vi.spyOn(fs, 'closeSync').mockImplementation(value => {
+      close(value);
+      if (value === fd) { failedClose(); throw new Error('log close unavailable'); }
+    });
+    expect(tick(f, { spawnFn })).toMatchObject({ started: [ref], skipped: [] });
+    expect(failedClose).toHaveBeenCalledOnce();
+    expect(child.once).toHaveBeenCalledWith('error', expect.any(Function));
+    expect(child.unref).toHaveBeenCalledOnce();
+    expect(fs.readFileSync(marker(f), 'utf8')).toBe(owner);
+    const onError = child.once.mock.calls.find(([name]) => name === 'error')[1];
+    expect(() => onError(new Error('spawn unavailable'))).not.toThrow();
+    expect(fs.existsSync(marker(f))).toBe(false);
   });
 
   it('unavailable needs-you feed never masks a sync failure or its local alert', async () => {

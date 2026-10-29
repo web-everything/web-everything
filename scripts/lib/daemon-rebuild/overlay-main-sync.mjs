@@ -145,7 +145,10 @@ function rateLimitedAlert(root, env, ref, error, io = fs) {
     if (markerError.code === 'MAIN_SYNC_STATE_BUSY') return; // Another process owns this diagnostic; retry next tick.
     // If the diagnostic marker itself is unavailable, a long-lived health-watch
     // still emits at most once an hour. Keep the original actionable error.
-    if (!emitted) needsYou(root, env, ref, error, io);
+    if (!emitted) {
+      try { needsYou(root, env, ref, error, io); }
+      catch { /* Diagnostics must not interrupt lock cleanup. */ }
+    }
     emitted = true;
   }
   alertFallback.set(file, lastAlertAt);
@@ -219,7 +222,10 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
       try {
         child = spawnFn(process.execPath, [SELF, `--clone=${root}`, `--ref=${ref}`, `--token=${owner}`],
           { cwd: root, env, detached: true, stdio: fd === undefined ? 'ignore' : ['ignore', fd, fd] });
-      } finally { if (fd !== undefined) fs.closeSync(fd); }
+      } finally {
+        try { if (fd !== undefined) fs.closeSync(fd); }
+        catch { /* Closing the log must not interrupt child ownership transfer. */ }
+      }
       child.once?.('error', error => { alert(error); release(lock, owner); });
       child.unref(); result.started.push(ref); token = null;
     } catch (error) { alert(error); result.skipped.push(ref); }
@@ -279,11 +285,11 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     const conflicts = paths(git(['diff', '--name-only', '-z', '--diff-filter=U'], scratch));
     if (conflicts.length) {
       mergeConflict = true;
-      output(git(['merge', '--abort'], scratch));
       event(root, { kind: 'overlay-main-merge-conflict', ref, files: conflicts }, { env });
       if (old.pr) markOverlayConflictWake(env, { pr: old.pr, ref, files: conflicts, at: now(), clone: root });
       else publishNeedsYou(root, env, ref, 'overlay-main-merge-conflict',
         `Merge conflicts on ${ref}: ${conflicts.join(', ')}`, { files: conflicts });
+      output(git(['merge', '--abort'], scratch));
       throw Object.assign(new Error(`merge conflicts require operator resolution: ${conflicts.join(', ')}`),
         { step: 'merge', stderrTail: stderrTail(merge) });
     }
