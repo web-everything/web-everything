@@ -74,11 +74,13 @@ export function testArea(entry) {
   return dir || null;
 }
 
-const isUnitShard = (name) => /^test-shard \(\d+\)$/.test(name);
+/** Actions reports reusable jobs as `<caller> / <job>`; CI passes the local job name. */
+const localJobName = (name) => typeof name === 'string' ? name.split(' / ').at(-1) : name;
+const isUnitShard = (name) => /^test-shard \(\d+\)$/.test(localJobName(name));
 /** Legacy untagged entries apply only to unit shards, just as they do in CI. */
 const entryCoversJob = (entry, job) => job === null
   ? entry.job === undefined || isUnitShard(entry.job)
-  : entry.job === undefined ? isUnitShard(job) : entry.job === job;
+  : entry.job === undefined ? isUnitShard(job) : localJobName(entry.job) === localJobName(job);
 
 /** Adding coverage for another job must not renew this file's quarantine for the same red. */
 function fileExpiry(entries, { test, brokenSha, now, ttlMs }) {
@@ -93,6 +95,7 @@ function fileExpiry(entries, { test, brokenSha, now, ttlMs }) {
  */
 export function addEntries(list, { tests = [], brokenSha, owner, reason, actor, now, ttlMs = QUARANTINE_DEFAULT_TTL_MS, area = null, job, proof }) {
   if (!canWriteQuarantine(actor)) return { ok: false, error: `writer "${actor}" may not change the quarantine list (allowed: ${QUARANTINE_WRITERS.join(', ')})` };
+  job = localJobName(job);
   const base = list && list.version === 1 ? list : { version: 1, entries: [] };
   const entries = [...base.entries];
   const events = [];
@@ -181,7 +184,7 @@ export function parseVitestFailures(logText) {
 /** Built-in (standard) knobs of the safety net; the IO resolves each through the policy cascade. */
 export const QUARANTINE_SAFETY_NET_DEFAULTS = Object.freeze({
   /** A failed job matching this is a unit-test job: its log must name every failing test file. */
-  unitJobPattern: '^(?:test-shard \\(\\d+\\)|integration|soak-shard \\(\\d+\\))$',
+  unitJobPattern: '^(?:hetzner / )?(?:test-shard \\(\\d+\\)|integration|soak-shard \\(\\d+\\))$',
   /** Aggregator jobs that fail only because a unit job did (`test` gates on `needs.test-shard`). */
   derivedJobs: Object.freeze(['test', 'daemon-soak']),
   /** Accept repeated failures with unchanged test files as an alternative proof (R157). */
@@ -293,7 +296,8 @@ export function planSafetyNet({ status, firstRedSha = null, failedJobs = null, j
           }
           proof = repeat.proof;
         }
-        origins.set(JSON.stringify([file, job]), { test: file, job, proof });
+        const localJob = localJobName(job);
+        origins.set(JSON.stringify([file, localJob]), { test: file, job: localJob, proof });
       }
       files.push(...f.files);
       names.push(...f.tests.map((t) => (t.name ? `${t.file} > ${t.name}` : t.file)));
