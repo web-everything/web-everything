@@ -8,8 +8,8 @@ const HASH = /^x[0-9a-z]{6}$/;
 // A trailing ` # comment` is allowed: the standards check reads `bornAs` with a YAML parser, which drops it. Only
 // `bornAs` is an identity: the backlog loader replaces a frontmatter `id` with the file name.
 const IDENTITY = /^bornAs:[ \t]*(["']?)(x[0-9a-z]{6})\1(?:[ \t]+#.*)?[ \t]*$/m;
-// The backlog loader reads top-level cards only, so a file below a backlog subdirectory owns no identity.
-const TOP_LEVEL_CARD = /^backlog\/[^/]+\.md$/;
+// The backlog loader reads top-level cards only, and skips a name holding a backslash, so neither owns an identity.
+const TOP_LEVEL_CARD = /^backlog\/[^/\\]+\.md$/;
 // Each main card hit costs one `git show`. More hits than this hold the check instead of stalling the drain pass.
 export const MAX_MAIN_READS = 64;
 
@@ -91,20 +91,27 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
     }
     if (!added.size && unreadable) throw new Error(unreadable);
     if (!added.size) return done({ ok: true });
-    // Search main for the added hashes as plain whole words, so no key spelling YAML accepts (a quoted key, a space
-    // before the colon) can hide a card from the search, while a word that merely contains a hash-shaped stem (`xisting`
-    // in `existing`) is no hit. Each hit, body citations included, is then confirmed against that main card's own
-    // frontmatter.
+    // Search main for the added hashes as plain text, so no key spelling YAML accepts (a quoted key, a space before
+    // the colon) can hide a card from the search. Each hit, body citations included, is then confirmed against that
+    // main card's own frontmatter.
     let matches;
     const patterns = [...added.keys()].flatMap(hash => ['-e', hash]);
     // `--text` searches a card holding a NUL byte too: Git otherwise prints only "Binary file … matches" for it.
-    try { matches = run(['grep', '-z', '--text', '-F', '-w', ...patterns, `origin/${base}`, '--', 'backlog/']); }
+    try { matches = run(['grep', '-z', '--text', '-F', ...patterns, `origin/${base}`, '--', 'backlog/']); }
     catch (e) { if (e.status === 1) matches = ''; else throw e; }
     const prefix = `origin/${base}:`;
+    // A hit counts only where the hash stands as a word, so a word that merely contains a hash-shaped stem (`xisting`
+    // in `existing`) costs no read. A YAML escape right before it (`"\txabc123"`, `"\x09xabc123"`) still counts: the
+    // escape decodes to whitespace that `duplicateBornAs` trims. Git's own `-w` would miss that case.
+    const mentions = new RegExp(`(?:^|[^A-Za-z0-9_]|\\\\(?:[A-Za-z_]|x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}))(?:${[...added.keys()].join('|')})(?![A-Za-z0-9_])`);
     const mainCards = new Set();
     for (const line of matches.split('\n')) {
       const split = line.indexOf('\0');
-      if (line.startsWith(prefix) && split >= 0 && TOP_LEVEL_CARD.test(line.slice(prefix.length, split))) mainCards.add(line.slice(prefix.length, split));
+      // Every output line starts with the ref; one that does not is part of a path holding a newline, which this
+      // line format cannot name, so the evidence is unreadable.
+      if (line && (!line.startsWith(prefix) || split < 0)) throw new Error('main grep output names a path it cannot delimit');
+      if (!line || !mentions.test(line.slice(split + 1))) continue;
+      if (TOP_LEVEL_CARD.test(line.slice(prefix.length, split))) mainCards.add(line.slice(prefix.length, split));
     }
     if (mainCards.size > MAX_MAIN_READS) throw new Error(`${mainCards.size} main cards mention an added hash, over the ${MAX_MAIN_READS}-card read bound`);
     // Only readable frontmatter on both sides confirms a collision. A top-level main card whose frontmatter is

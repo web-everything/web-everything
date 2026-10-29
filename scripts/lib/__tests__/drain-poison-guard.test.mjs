@@ -168,12 +168,32 @@ describe('checkBornAsCollision', () => {
       .toEqual({ error: `${MAX_MAIN_READS + 1} main cards mention an added hash, over the ${MAX_MAIN_READS}-card read bound` });
     expect(exec.mock.calls.filter(([, a]) => a[0] === 'show' && a[1].startsWith('origin/'))).toEqual([]);
   });
-  it('searches main for the added hashes as plain whole words, not for an identity key spelling', () => {
+  it('searches main for the added hashes as plain text, not for an identity key spelling', () => {
     const exec = fakeExec();
     checkBornAsCollision({ exec, headSha: sha });
     const grep = exec.mock.calls.find(([, args]) => args[0] === 'grep')[1];
-    expect(grep.slice(0, 7)).toEqual(['grep', '-z', '--text', '-F', '-w', '-e', 'xgcpm6z']);
+    expect(grep.slice(0, 6)).toEqual(['grep', '-z', '--text', '-F', '-e', 'xgcpm6z']);
   });
+  it('treats a backslash in a card name as no card, since the backlog loader skips such a name', () => {
+    const odd = 'backlog/7233-a\\b.md';
+    const exec = fakeExec({ main: `origin/main:${odd}\0bornAs: xgcpm6z`, mainTexts: { [odd]: cardText('xgcpm6z') } });
+    expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ ok: true });
+  });
+  it('holds when a main path holding a newline splits a grep output line', () => {
+    const exec = fakeExec({ main: `origin/main:backlog/7233-a\nb.md\0bornAs: xgcpm6z` });
+    expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ error: 'main grep output names a path it cannot delimit' });
+  });
+  it('reads no main card whose hit only holds the hash inside a longer word', () => {
+    const exec = fakeExec({ main: `origin/main:${mainCard}\0see axgcpm6z and xgcpm6z_b` });
+    expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ ok: true });
+    expect(exec.mock.calls.filter(([, a]) => a[0] === 'show' && a[1].startsWith('origin/'))).toEqual([]);
+  });
+  // Self-review break on c86b3ae42: Git's `-w` missed a hash right after a YAML escape, which YAML decodes and trims.
+  it.each([['\\t', '"\\txgcpm6z"'], ['\\x09', '"\\x09xgcpm6z"'], ['\\u0009', '"\\u0009xgcpm6z"']])(
+    'reports a main identity written after a %s escape, which duplicateBornAs reads as the bare hash', (_, value) => {
+      const exec = fakeExec({ main: `origin/main:${mainCard}\0bornAs: ${value}`, mainTexts: { [mainCard]: `---\nbornAs: ${value}\n---\n` } });
+      expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ collision: { hash: 'xgcpm6z', path: newCard, mainCard } });
+    });
   it('treats a frontmatter-less file below a backlog subdirectory as no card', () => {
     const raised = 'backlog/raised-by/7233.md';
     const exec = fakeExec({ main: `origin/main:${raised}\0bornAs: xgcpm6z`, mainTexts: { [raised]: '- Also raised by:\nbornAs: xgcpm6z\n' } });
