@@ -4,11 +4,9 @@ import { realpath } from 'node:fs/promises';
 import * as filesystem from 'node:fs/promises';
 import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { resolve, relative, dirname } from 'node:path';
 import { allowedCommand, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile } from './forge-exec-run.mjs';
 
 const ROOT = '/srv/forge-exec';
-const SIBLING = {dir:'../frontierui', aliases:['plugs','webtheme']};
 const LIMIT = 4 * 1024 * 1024;
 const SSH_OPTIONS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'];
 const ENV_KEYS = ['CI', 'NODE_ENV', 'TZ', 'LANG', 'LC_ALL', 'FORCE_COLOR', 'NO_COLOR'];
@@ -62,32 +60,32 @@ export function defaultExec({ file, args, cwd, input, inherit = false }) {
 export { isTestFile };
 // This exclusion policy is part of the manifest, never an independent rsync
 // filter. Test-shaped names under excluded components refuse remote admission.
-const excludedComponent = /^(?:node_modules|\.git|\.env.*|\.secrets|\.ssh|\.aws|\.claude|\.codex|\.npmrc|\.netrc|credentials.*|.*\.(?:pem|key)|\.exit-code)$/i;
-
-function requiresGitWorktree(paths, argv, cwd) {
-  const tests = paths.filter(isTestFile).map(path => path.toString('utf8'));
-  // Tooling tests may inspect the real index/history during collection, directly
-  // or through helpers. A source scan for Git commands cannot prove independence.
-  const tooling = tests.filter(path => /(?:^|\/)(?:scripts|skills-src|tools)\//i.test(path));
-  if (!tooling.length) return false;
-  const filters = [];
-  for (let i = 4; i < argv.length; i++) {
-    if (argv[i] === '-t') {i++; continue;}
-    if (!argv[i].startsWith('-')) filters.push(argv[i]);
-  }
-  // Only explicit files can narrow this conservative policy. Vitest's filters
-  // are substrings, so an exact non-tooling filename may ALSO select tooling.
-  return !filters.length || filters.some(filter => {
-    const name = relative(cwd,resolve(cwd,filter)).replaceAll('\\','/');
-    return !tests.includes(name) || tooling.some(path => path.toLowerCase().includes(name.toLowerCase()));
-  });
+const safeDotDirectory = /^(?:\.github|\.husky|\.vscode|\.storybook|\.changeset)$/;
+const safeDotFile = /^(?:\.gitignore|\.gitattributes|\.editorconfig|\.nvmrc|\.node-version|\.prettierrc.*|\.eslintrc.*|\.gitkeep|\.nycrc.*)$/;
+const keyComponent = /(?:_rsa|^id_|\.(?:pem|key|p12|pfx|jks|keystore)$)/;
+const credentialComponent = /token|secret|creds|credential|passwd|password|oauth|apikey|api-key/;
+const sourceExtension = /\.(?:mjs|js|ts|tsx|jsx|css|md|html)$/;
+function normalizedComponent(part) {
+  const utf8 = part.toString('utf8');
+  // Non-test opaque byte names retain their existing byte-path contract. Only
+  // the policy view is decoded; transport and hashing always use original bytes.
+  const text = Buffer.from(utf8).equals(part) ? utf8 : part.toString('latin1');
+  return text.normalize('NFKC').normalize('NFD').replace(/\p{M}/gu, '')
+    .replace(/\p{Cf}/gu, '').replace(/[. ]+$/u, '').toLowerCase();
 }
-
-export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, pathspecs} = {}) {
-  const scope = pathspecs === undefined ? [] : ['--', ...pathspecs];
+function excludedComponent(name, leaf) {
+  // Admit ordinary accented Latin names (e.g. é) but fail closed on remaining
+  // non-ASCII forms: no incomplete hand-maintained confusable substitution map.
+  const unsafe = /\p{Cc}/u.test(name) || [...name].some(char => char.charCodeAt(0) > 127
+    && !/^(?:[a-z]\p{M}+|\p{Z})$/u.test(char.normalize('NFD')));
+  return unsafe || !name || /^\.(?:netrc|npmrc|env.*)$/.test(name)
+    || (name.startsWith('.') && !safeDotDirectory.test(name) && !(leaf && safeDotFile.test(name)))
+    || keyComponent.test(name) || credentialComponent.test(name);
+}
+export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles} = {}) {
   // Only dependency and Git internals are exempt. In particular, secret/hidden
   // directories and ambiguous dist/build directories may still contain tests.
-  const ignored = await exec({file:'git',args:['ls-files','-o','-i','--exclude-standard','-z',...scope],cwd});
+  const ignored = await exec({file:'git',args:['ls-files','-o','-i','--exclude-standard','-z'],cwd});
   if (ignored.code !== 0 || !Buffer.isBuffer(ignored.stdout)) throw new Error('Ignored byte inventory unavailable');
   for (const path of splitPaths(ignored.stdout)) {
     if (pathParts(path).slice(0,-1).some(part => part.equals(Buffer.from('node_modules')) || part.equals(Buffer.from('.git')))) continue;
@@ -99,22 +97,23 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     if (!Array.isArray(names) || names.some(name => !Buffer.isBuffer(name) && typeof name !== 'string')) throw new Error('Invalid inventory');
     files = names.map(name => Buffer.from(name));
   } else {
-    const result = await exec({file:'git',args:['ls-files','-co','--exclude-standard','-z',...scope],cwd});
+    const result = await exec({file:'git',args:['ls-files','-co','--exclude-standard','-z'],cwd});
     if (result.code !== 0 || !Buffer.isBuffer(result.stdout)) throw new Error('Byte inventory unavailable');
     files = splitPaths(result.stdout);
-    const stage = await exec({file:'git',args:['ls-files','--stage','-z',...scope],cwd});
-    if (stage.code !== 0 || !Buffer.isBuffer(stage.stdout) || stage.stdout.length > LIMIT
-      || (stage.stdout.length && stage.stdout.at(-1) !== 0)) throw new Error('Git index unavailable');
-    let start = 0;
-    for (let i = 0; i < stage.stdout.length; i++) if (stage.stdout[i] === 0) {
-      const record = stage.stdout.subarray(start,i), tab = record.indexOf(9);
-      if (tab < 0 || !/^[0-7]{6} [a-f0-9]{40,64} [0-3]$/.test(record.subarray(0,tab).toString('latin1'))) throw new Error('Invalid git index record');
-      pathParts(record.subarray(tab+1));
-      // Gitlinks cannot be transported as directory leaves. Until recursive
-      // submodule inventories are supported, use real local heavy admission.
-      if (record.subarray(0,6).equals(Buffer.from('160000'))) throw new Error('gitlink-unsupported: use local fallback');
-      start = i + 1;
-    }
+  }
+  // Index evidence still rejects unsupported gitlinks, including injected inventories.
+  const stage = await exec({file:'git',args:['ls-files','--stage','-z'],cwd});
+  if (stage.code !== 0 || !Buffer.isBuffer(stage.stdout) || stage.stdout.length > LIMIT
+    || (stage.stdout.length && stage.stdout.at(-1) !== 0)) throw new Error('Git index unavailable');
+  let start = 0;
+  for (let i = 0; i < stage.stdout.length; i++) if (stage.stdout[i] === 0) {
+    const record = stage.stdout.subarray(start,i), tab = record.indexOf(9);
+    if (tab < 0 || !/^[0-7]{6} [a-f0-9]{40,64} [0-3]$/.test(record.subarray(0,tab).toString('latin1'))) throw new Error('Invalid git index record');
+    pathParts(record.subarray(tab+1));
+    // Gitlinks cannot be transported as directory leaves. Until recursive
+    // submodule inventories are supported, use real local heavy admission.
+    if (record.subarray(0,6).equals(Buffer.from('160000'))) throw new Error('gitlink-unsupported: use local fallback');
+    start = i + 1;
   }
   files.sort(Buffer.compare);
   files = files.filter((path,i) => !i || !path.equals(files[i-1]));
@@ -125,7 +124,12 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   const entries = [], excluded = [];
   for (const path of files) {
     const parts = pathParts(path);
-    if (parts.some(part => excludedComponent.test(part.toString('latin1')))) {
+    const names = parts.map(normalizedComponent);
+    const excludedByPolicy = names.some((name,i) => excludedComponent(name, i === names.length-1));
+    if (excludedByPolicy || names.includes('node_modules')) {
+      if (!names.includes('node_modules') && excludedByPolicy && sourceExtension.test(names.at(-1))) {
+        throw Object.assign(new Error('Excluded source: use local fallback'), {code:'excluded-source-file'});
+      }
       if (isTestFile(path) || /\.(test|spec)\./.test(parts.at(-1).toString('latin1'))) throw new Error('Excluded test: use local fallback');
       excluded.push(path); continue;
     }
@@ -141,86 +145,6 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   const wire = manifestWire(manifest);
   if (Buffer.byteLength(JSON.stringify(wire)) > LIMIT - 16384) throw new Error('Manifest wire limit exceeded; use local fallback');
   return {...manifest,manifestDigest:digestManifest(wire)};
-}
-
-export async function buildSiblingManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem} = {}) {
-  const root = resolve(cwd,SIBLING.dir);
-  const failure = (code, cause) => Object.assign(new Error(code,{cause}),{code});
-  let info;
-  try {info = await fs.lstat(Buffer.from(root));}
-  catch (error) {throw failure(error.code === 'ENOENT' ? 'sibling-missing' : 'sibling-unsafe',error);}
-  if (info.isSymbolicLink() || !info.isDirectory()) throw failure('sibling-unsafe');
-  const git = args => exec({file:'git',args,cwd:root});
-  let head;
-  try {
-    const top = await git(['rev-parse','--show-toplevel']);
-    if (top.code !== 0 || protocolText(top.stdout,LIMIT).trimEnd() !== root) throw new Error('Sibling is not a Git root');
-    const revision = await git(['rev-parse','HEAD']);
-    head = protocolText(revision.stdout,1024).trimEnd();
-    if (revision.code !== 0 || !/^[a-f0-9]{40,64}$/.test(head)) throw new Error('Sibling HEAD unavailable');
-  } catch (error) {throw failure('sibling-not-git',error);}
-  try {
-    // Alias entry points import other sibling directories (including transitive
-    // dependencies and package metadata). Validate and copy the whole checkout;
-    // a directory allowlist cannot describe that runtime dependency closure.
-    const status = await git(['status','--porcelain','-z','--untracked-files=all']);
-    if (status.code !== 0 || protocolText(status.stdout,LIMIT).length) throw new Error('Sibling is dirty or status unavailable');
-    // Index flags can hide modified bytes from status; only ordinary cached entries are safe.
-    const flags = await git(['ls-files','-v','-z']);
-    if (flags.code !== 0 || splitPaths(flags.stdout).some(record => record[0] !== 72 || record[1] !== 32 || record.length < 3))
-      throw new Error('Sibling index flags are unsafe or unavailable');
-  } catch (error) {throw failure('sibling-dirty',error);}
-  try {
-    const manifest = await buildManifest({cwd:root,exec,fs});
-    // The runner installs only work/. Never certify a sibling whose Node
-    // resolution depends on omitted modules (including nested or linked trees).
-    // Check every source ancestor once, even when Git omits ignored modules.
-    const checked = new Set();
-    const checkModules = async directory => {
-      const key = Buffer.from(directory).toString('hex');
-      if (checked.has(key)) return;
-      checked.add(key);
-      const modules = await fs.lstat(bytePath(directory,Buffer.from('node_modules')))
-        .then(() => true,error => {if (error.code === 'ENOENT') return false; throw error;});
-      if (modules) throw failure('unsupported-sibling-dependency');
-    };
-    // Node also walks above the sibling root. Those installations are absent
-    // from the remote container just as sibling-local installations are.
-    for (let parent = root;; parent = dirname(parent)) {
-      await checkModules(parent);
-      if (dirname(parent) === parent) break;
-    }
-    for (const {path} of manifest.entries) {
-      let directory = Buffer.from(root);
-      for (const part of [null,...pathParts(path).slice(0,-1)]) {
-        if (part) directory = bytePath(directory,part);
-        await checkModules(directory);
-      }
-      if (pathParts(path).at(-1).equals(Buffer.from('package.json'))) {
-        const absolute = bytePath(root,path);
-        const st = await fs.lstat(absolute);
-        if (st.size > LIMIT) throw failure('unsupported-sibling-dependency');
-        const pkg = JSON.parse(await readManifestFile(absolute,st,fs));
-        // Even an uninstalled checkout can declare runtime, peer, workspace or
-        // build dependencies. Empty declarations alone need no installation.
-        if (!pkg || typeof pkg !== 'object' || Array.isArray(pkg)
-          || ['dependencies','devDependencies','optionalDependencies','peerDependencies',
-            'bundledDependencies','bundleDependencies','workspaces']
-            .some(field => pkg[field] !== undefined && (!pkg[field] || typeof pkg[field] !== 'object' || Object.keys(pkg[field]).length)))
-          throw failure('unsupported-sibling-dependency');
-      }
-    }
-    for (const path of SIBLING.aliases) {
-      const st = await fs.lstat(Buffer.from(resolve(root,path)));
-      if (st.isSymbolicLink() || !st.isDirectory()
-        || !manifest.entries.some(entry => entry.path.subarray(0,path.length+1).equals(Buffer.from(path+'/'))))
-        throw new Error('Missing or empty aliased directory');
-    }
-    return {...manifest,cwd:root,head};
-  } catch (error) {
-    if (error.code === 'unsupported-sibling-dependency') throw error;
-    throw failure('sibling-unsafe',error);
-  }
 }
 
 // Only protocol JSON is decoded, never inventory bytes.
@@ -256,12 +180,11 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
     return ssh('finish', {nonce,run});
   };
   try {
-    let expected, expectedManifest, siblingManifest;
+    let expected, expectedManifest;
     try {
       const manifest = await buildManifest({cwd,exec,listFiles});
       const selected = manifest.entries.map(entry => entry.path);
-      if (requiresGitWorktree(selected,argv,cwd)) return fallback('requires-git-worktree');
-      if (selected.some(path => path.equals(Buffer.from('vitest.shared.ts')))) siblingManifest = await buildSiblingManifest({cwd,exec});
+      if (selected.some(path => path.equals(Buffer.from('vitest.shared.ts')))) return fallback('unsupported-sibling-dependency');
       // Anchor comment-like and option-like names for both rsync implementations.
       const inventory = Buffer.concat(selected.flatMap(path => [Buffer.from('./'),path,Buffer.from([0])]));
       const wire = manifestWire(manifest);
@@ -272,26 +195,22 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
       if(prepared.code !== 0) throw new Error('Prepare failed');
       run = JSON.parse(protocolText(prepared.stdout,1024)).run;
       if(typeof run !== 'string' || !/^r-[a-f0-9]{32}$/.test(run)) {run=undefined; throw new Error('Invalid server run');}
-      // Transfer listed leaves only: a file replaced by a directory must not expand.
-      // Both destinations are fresh trees, so no recursive deletion is needed.
+      // Never expand a listed leaf that becomes a directory while prepare awaits:
+      // even server-side rejection would happen after disclosing its children.
+      // prepare creates a fresh work tree; deletion is unnecessary and requires
+      // directory transfer on older rsync implementations.
       const copied = await exec({file:'rsync',args:['-a','--no-recursive','--no-dirs','--no-links','--safe-links','--no-implied-dirs','--exclude=.exit-code',
         '--from0','--files-from=-','--rsync-path=sudo -u forge-exec rsync','-e',`ssh ${SSH_OPTIONS.join(' ')}`,
         './',`${host}:${ROOT}/${run}/work/`],cwd,input:inventory});
       if(copied.code !== 0) throw new Error('Copy failed');
-      if (siblingManifest) {
-        const inventory = Buffer.concat(siblingManifest.entries.flatMap(({path}) => [Buffer.from('./'),path,Buffer.from([0])]));
-        const copiedSibling = await exec({file:'rsync',args:['-a','--no-recursive','--no-dirs','--no-links','--safe-links','--no-implied-dirs','--exclude=.exit-code',
-          '--from0','--files-from=-','--rsync-path=sudo -u forge-exec rsync','-e',`ssh ${SSH_OPTIONS.join(' ')}`,
-          './',`${host}:${ROOT}/${run}/frontierui/`],cwd:siblingManifest.cwd,input:inventory});
-        if (copiedSibling.code !== 0) throw new Error('Sibling copy failed');
-      }
       expected = {v:1,nonce,run,inputDigest,argvDigest:digestArgv(argv),lock,manifestDigest:manifest.manifestDigest};
-      if (siblingManifest) expected.siblingManifestDigest = siblingManifest.manifestDigest;
       expectedManifest = wire;
-    } catch (error) {return fallback(['sibling-missing','sibling-not-git','sibling-dirty','sibling-unsafe','unsupported-sibling-dependency','ignored-test-file'].includes(error.code) ? error.code : 'copy-failed');}
+    } catch (error) {
+      if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code};
+      return fallback(error.code === 'ignored-test-file' ? 'ignored-test-file' : 'copy-failed');
+    }
     try {
-      const result = await ssh('run',{...expected,manifest:expectedManifest,
-        ...(siblingManifest ? {siblingManifest:manifestWire(siblingManifest)} : {}),argv,env:filterEnv(env)},true);
+      const result = await ssh('run',{...expected,manifest:expectedManifest,argv,env:filterEnv(env)},true);
       const receipt = await finish();
       if(!receipt || receipt.code!==0) return {mode:'unconfirmed',reason:'ambiguous-result'};
       if(!verifyReceipt(protocolText(receipt.stdout,4096),expected,result.code)) return {mode:'unconfirmed',reason:'ambiguous-result'};
@@ -303,25 +222,27 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
 export function verifyReceipt(text, expected, code) {
   try {
     const receipt=JSON.parse(text);
-    const keys = ['argvDigest','code','inputDigest','lock','manifestDigest','nonce','phase','run','v'];
-    if (Object.hasOwn(expected,'siblingManifestDigest')) {
-      if (typeof expected.siblingManifestDigest !== 'string' || !/^[a-f0-9]{64}$/.test(expected.siblingManifestDigest)) return false;
-      keys.push('siblingManifestDigest');
-    }
     return receipt && typeof expected?.manifestDigest === 'string' && /^[a-f0-9]{64}$/.test(expected.manifestDigest)
-      && Object.keys(receipt).sort().join(',') === keys.sort().join(',')
+      && Object.keys(receipt).sort().join(',') === 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,v'
       && Object.entries(expected).every(([key,value])=>receipt[key]===value)
       && receipt.phase==='test' && Number.isInteger(code) && code>=0 && code<255 && receipt.code===code;
   } catch {return false;}
 }
 
-export async function runWithRemoteFallback(options = {}) {
-  // A rejected command must not regain execution through local fallback.
+/** Explicit remote CLI request; the shared decision contract owns safe local admission. */
+export async function main(options = {}) {
   if (!isAllowedCommand(options.argv)) throw new Error('command-not-allowed: use npm run <allowed-task> -- <task-args>');
-  const result = await runRemote(options);
-  if (result.mode === 'remote') return result.code;
-  const log = options.log ?? ((message) => process.stderr.write(`${message}\n`));
-  log(`remote-exec: falling back to local (${result.reason})`);
+  // Import at invocation time: heavy-admission's default executor imports us.
+  const { runWithRemoteDecision, resolveAdmissionPolicy, adaptLegacyRemoteResult } = await import('./heavy-admission.mjs');
+  const policy = resolveAdmissionPolicy({platform:{remote:{enabled:true, mode:'always'}}});
+  policy.sources['remote.enabled'] = 'explicit remote CLI request';
+  policy.sources['remote.mode'] = 'explicit remote CLI request';
+  const result = await runWithRemoteDecision({
+    argv:options.argv, cwd:options.cwd, env:options.env, policy,
+    timeoutMs:options.timeoutMs, log:options.log,
+    remoteExec:options.remoteExec ?? (async decisionOptions => adaptLegacyRemoteResult(await runRemote({...options, ...decisionOptions}))),
+  });
+  if (result.handled) return result.exitCode;
   const local = options.local ?? (async (argv) => (await defaultExec({ file: process.execPath,
     args: ['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=600000', '--', ...argv], cwd: options.cwd, inherit: true })).code);
   return local(options.argv);
@@ -341,6 +262,6 @@ export function parseArgs(args) {
 }
 
 if (process.argv[1] && await realpath(process.argv[1]).catch(() => '') === await realpath(fileURLToPath(import.meta.url))) {
-  try { process.exitCode = await runWithRemoteFallback(parseArgs(process.argv.slice(2))); }
+  try { process.exitCode = await main(parseArgs(process.argv.slice(2))); }
   catch (error) { process.stderr.write(`remote-exec: ${error.message}\n`); process.exitCode = 1; }
 }
