@@ -6,7 +6,7 @@ import { newSpanEnd } from '../../operations/telemetry.mjs';
 import { newRunRecord } from '../../operations/run-store.mjs';
 
 const { reviewRunEvidence, decideSameHeadHold, markQuotaOnlyFromSpans,
-  readQuotaFailureSpans, readReviewRunEvidence, REVIEW_EVIDENCE_CACHE_FILE } = hold;
+  readReviewFailureSpans, readQuotaFailureSpans, readReviewRunEvidence, REVIEW_EVIDENCE_CACHE_FILE } = hold;
 
 const repo = 'example/repo';
 const head = 'a'.repeat(40);
@@ -38,6 +38,12 @@ const evidence = (failures, index, opts) => reviewRunEvidence(failedRun(failures
 const history = (failures, count = 13) => Array.from({ length: count }, (_, i) => evidence(failures, i));
 
 describe('quota-only review run evidence', () => {
+  it.each([false, true])('records hasFailure for any recorded failure (completed: %s)', complete => {
+    for (const failures of [[quotaError], [genuineError], [quotaError, genuineError]]) {
+      expect(evidence(failures, 0, { complete })).toMatchObject({ hasFailure: true });
+    }
+  });
+
   it.each([false, true])('marks every recorded failure as quota-only (completed: %s)', complete => {
     const row = evidence([quotaError, 'HTTP 429', null], 0, { complete });
     expect(row).toMatchObject({ quotaOnly: true });
@@ -123,9 +129,9 @@ function writeSpans(dir, spans, day = iso(at).slice(0, 10)) {
 }
 
 describe('telemetry quota overlay', () => {
-  it('marks a textless incomplete row by PR and repo basename without mutating either input', () => {
+  it('marks a textless incomplete row by PR and exact full repo without mutating either input', () => {
     const rows = [textlessRow()];
-    const spans = [quotaSpan({ attributes: { pr: 7, repo: 'repo' } })];
+    const spans = [quotaSpan()];
     const before = structuredClone({ rows, spans });
     expect(rows[0]).toMatchObject({ incomplete: true, quotaOnly: false, startedAt: at });
     expect(markQuotaOnlyFromSpans(rows, spans)).toEqual([{ ...rows[0], quotaOnly: true }]);
@@ -138,11 +144,9 @@ describe('telemetry quota overlay', () => {
   });
 
   it.each([
-    ['repo', false],
-    ['repo', true],
-    ['another-owner/repo', false],
-    ['another-owner/repo', true],
-  ])('does not mark mixed failures for matching basename %s (non-quota first: %s)', (spanRepo, nonQuotaFirst) => {
+    [repo, false],
+    [repo, true],
+  ])('does not mark mixed failures for exact repo %s (non-quota first: %s)', (spanRepo, nonQuotaFirst) => {
     const row = textlessRow();
     const quota = quotaSpan();
     const nonQuota = quotaSpan({ spanId: 'c'.repeat(16), statusMessage: 'schema invalid',
@@ -155,17 +159,28 @@ describe('telemetry quota overlay', () => {
     expect(markQuotaOnlyFromSpans([row], spans)).toEqual([row]);
   });
 
-  it.each(['example/other', 'another-owner/other'])('never matches quota telemetry with a different basename: %s', spanRepo => {
+  it.each(['other/repo', 'repo', 'example/other', 'another-owner/other'])('never matches quota telemetry without the exact full repo: %s', spanRepo => {
     const row = textlessRow();
     const span = quotaSpan({ attributes: { pr: row.pr, repo: spanRepo } });
     expect(markQuotaOnlyFromSpans([row], [span])).toEqual([row]);
   });
 
-  it.each(['example/other', 'another-owner/other'])('does not mix in non-quota telemetry with a different basename: %s', spanRepo => {
+  it.each(['other/repo', 'repo', 'example/other', 'another-owner/other'])('does not mix in non-quota telemetry from another repo: %s', spanRepo => {
     const row = textlessRow();
     const unrelated = quotaSpan({ spanId: 'c'.repeat(16), statusMessage: 'schema invalid',
       attributes: { pr: row.pr, repo: spanRepo } });
     expect(markQuotaOnlyFromSpans([row], [quotaSpan(), unrelated])).toEqual([{ ...row, quotaOnly: true }]);
+  });
+
+  it.each([
+    ['genuine failure', [genuineError]],
+    ['mixed failures', [quotaError, genuineError]],
+  ])('never overlays a row with its own recorded %s', (_, failures) => {
+    const row = evidence(failures);
+    const before = structuredClone(row);
+    expect(row).toMatchObject({ incomplete: true, quotaOnly: false });
+    expect(markQuotaOnlyFromSpans([row], [quotaSpan()])).toEqual([before]);
+    expect(row).toEqual(before);
   });
 
   it.each([
@@ -205,14 +220,38 @@ describe('quota failure telemetry reader', () => {
     expect(readQuotaFailureSpans({ dir, now: options.now })).toHaveLength(3);
   });
 
-  it('uses telemetry parsing to skip corrupt and unknown-version lines and filters unrelated events', () => {
+  it('filters unrelated valid events while retaining quota evidence', () => {
     const dir = temp();
     const span = quotaSpan();
-    const path = writeSpans(dir, [span,
+    writeSpans(dir, [span,
       quotaSpan({ statusMessage: genuineError }), quotaSpan({ name: 'review.seat' }),
-      quotaSpan({ status: 'ok' }), { ...span, event: 'span.start' }, { ...span, v: 999 }]);
-    writeFileSync(path, readFileSync(path, 'utf8') + '{torn json\n\n');
+      quotaSpan({ status: 'ok' }), { ...span, event: 'span.start' }]);
     expect(readQuotaFailureSpans({ dir, now: options.now })).toEqual([span]);
+  });
+
+  // Deliberate contract change: any rejected line invalidates the entire scan,
+  // rather than silently dropping a potentially genuine failure from the overlay.
+  describe.each([
+    ['readReviewFailureSpans', readReviewFailureSpans],
+    ['readQuotaFailureSpans', readQuotaFailureSpans],
+  ])('%s fails closed', (_, readSpans) => {
+    it.each([
+      ['unparseable JSON', '{torn json'],
+      ['corrupt event', JSON.stringify({ ...quotaSpan({ statusMessage: genuineError }), event: 'unknown' })],
+      ['unknown version', JSON.stringify({ ...quotaSpan({ statusMessage: genuineError }), v: 999 })],
+    ].flatMap(([label, badLine]) => [0, 1, 2].map(daysAgo => [label, daysAgo, badLine])))(
+      'returns [] for %s in scanned day offset %i', (_, daysAgo, badLine) => {
+        const dir = temp();
+        const span = quotaSpan();
+        const day = iso(at - daysAgo * 86_400_000).slice(0, 10);
+        writeSpans(dir, [span]);
+        const path = join(dir, `${day}.jsonl`);
+        // Keep valid evidence on both sides to catch partial results as well.
+        writeFileSync(path, `${JSON.stringify(span)}\n${badLine}\n${JSON.stringify(span)}\n`);
+        const spans = readSpans({ dir, now: options.now });
+        expect(spans, `corrupt day offset ${daysAgo}`).toEqual([]);
+        expect(markQuotaOnlyFromSpans([textlessRow()], spans)).toEqual([textlessRow()]);
+      });
   });
 
   it('returns no quota evidence for a missing telemetry directory', () => {
