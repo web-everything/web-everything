@@ -8,6 +8,7 @@ import { proveHumanOnlyLicense, resolveApprovalLicensesEnqueue } from '../human-
 
 const roots = [];
 const rawChange = path => `:100644 100644 ${'a'.repeat(40)} ${'b'.repeat(40)} M\0${path}\0`;
+const removeTreeEntryTabs = entry => entry.replaceAll('\t', '');
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function fixture() {
   const cwd = mkdtempSync(join(tmpdir(), 'human-enqueue-')); roots.push(cwd);
@@ -24,6 +25,18 @@ function fixture() {
   const prove = (options = {}) => proveHumanOnlyLicense({ repo: 'o/r', pr: 7, headSha: head, exec, cwd, readComments: () => comments, ...options });
   return { cwd, git, write, commit, approved, comments, exec, prove, setHead: sha => { head = sha; }, setLabels: v => { labels = v; } };
 }
+
+describe('missing-tab tree fixture', () => {
+  it.each([
+    ['', ''],
+    ['README.md', 'README.md'],
+    ['header\tREADME.md\0', 'headerREADME.md\0'],
+    ['header\tREAD\tME.md\0', 'headerREADME.md\0'],
+    ['header\tREADME.md\0header\tother.md\0', 'headerREADME.md\0headerother.md\0'],
+  ])('removes every tab while preserving other bytes: %j', (entry, expected) => {
+    expect(removeTreeEntryTabs(entry)).toBe(expected);
+  });
+});
 
 describe('human-only enqueue license', () => {
   it('licenses the exact trusted approved current head', () => {
@@ -273,7 +286,7 @@ describe('human-only enqueue license', () => {
         if (failure === 'truncated') return Buffer.from(entry.slice(0, -1));
         if (failure === 'duplicate') return Buffer.from(entry.repeat(2));
         if (failure === 'wrong type') return Buffer.from(entry.replace('blob', 'commit'));
-        if (failure === 'missing tab') return Buffer.from(entry.replace('\t', ''));
+        if (failure === 'missing tab') return Buffer.from(removeTreeEntryTabs(entry));
         if (failure === 'empty path') return Buffer.from(entry.replace('README.md', ''));
         if (failure === 'unknown mode') return Buffer.from(entry.replace('100644', '170000'));
         if (failure === 'unicode path') return Buffer.from(entry.replace('README.md', 'caf\u00e9.md'));
