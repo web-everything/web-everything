@@ -113,7 +113,7 @@ export function resolveIdleClaimRelease({ env = process.env, platform } = {}) {
   return { ...c.value, sources: c.sources, invalid: c.invalid };
 }
 
-function readPrHead({ repo, pr }) {
+export function readPrHead({ repo, pr }) {
   try {
     const data = JSON.parse(execFileSyncThrottled('gh', [
       'pr', 'view', String(pr), '--repo', ghRepoSlug(repo), '--json', 'headRefOid',
@@ -122,8 +122,8 @@ function readPrHead({ repo, pr }) {
   } catch { return null; }
 }
 
-function recordIdleRelease(event) {
-  try { void appendDaemonEvent(event).catch(() => {}); } catch { /* best effort */ }
+export function recordIdleRelease(event, recordEvent = appendDaemonEvent) {
+  try { void Promise.resolve(recordEvent(event)).catch(() => {}); } catch { /* event storage never interrupts the sweep */ }
 }
 
 // The light store helpers live in `fix-claim-store.mjs` (no dispatch graph — see its header); re-exported here so
@@ -280,6 +280,10 @@ export function isClaimSessionLive({ repo, pr, kind = 'fix', agentsAll, name: na
  *  Well above any real fix/ci-heal run, and above `hung-session.mjs`'s own 30-min hung threshold. */
 export const MAX_FIX_DISPATCH_CLAIM_REFRESH_MS = 4 * 60 * 60 * 1000;
 
+/** Three sweeps at reconcile-fix-dispatch-daemon.mjs's DEFAULT_INTERVAL_MS (120_000).
+ * A longer gap is unobserved time and must not count toward the idle release window. */
+export const MAX_IDLE_CLAIM_OBSERVATION_GAP_MS = 3 * 120_000;
+
 /**
  * we:scripts/conveyor/fix-dispatch-claim.mjs#refreshLiveFixDispatchClaims — THE FIX for a claim outliving a
  * genuinely still-working session past its own TTL (see this file's own header). Called once per daemon tick
@@ -310,8 +314,9 @@ export const MAX_FIX_DISPATCH_CLAIM_REFRESH_MS = 4 * 60 * 60 * 1000;
  *
  * When every non-terminal session row is idle, a readable PR head starts an `idleHead` clock in claim
  * metadata. An unchanged head for the configured window releases the owner-checked claim and records an
- * event. Head movement restarts the clock; working rows and unreadable heads clear it, so recovery starts
- * a full new window. Runner-pid and awaiting-verify claims are exempt from idle release.
+ * event. Head movement or an observation gap beyond three default sweep intervals restarts the clock;
+ * working rows and unreadable heads clear it, so recovery starts a full new window. Legacy clocks without
+ * `lastSeen` also restart. Runner-pid and awaiting-verify claims are exempt from idle release.
  * @param {{lockRoot?:string, listAgentsAll?:Function, hungInfoFor?:Function, hungThresholdMs?:number,
  *   awaitingVerifyFor?:Function|null, idleRelease?:object, prHeadFor?:Function, recordEvent?:Function,
  *   nowMs?:number, nowIso?:()=>string}} [o]
@@ -327,7 +332,7 @@ export function refreshLiveFixDispatchClaims({
   identity = pidIdentity,
   idleRelease = resolveIdleClaimRelease(),
   prHeadFor = readPrHead,
-  recordEvent = recordIdleRelease,
+  recordEvent = appendDaemonEvent,
   nowIso = () => new Date().toISOString(),
   nowMs = Date.parse(nowIso()),
 } = {}) {
@@ -443,18 +448,21 @@ export function refreshLiveFixDispatchClaims({
     if (idleHeadSha !== null) {
       const idleSince = meta.idleHead?.since;
       const idleSinceMs = typeof idleSince === 'string' ? Date.parse(idleSince) : NaN;
-      if (meta.idleHead?.sha !== idleHeadSha || !Number.isFinite(idleSinceMs)) {
-        meta.idleHead = { sha: idleHeadSha, since: new Date(nowMs).toISOString() };
-      } else if (nowMs - idleSinceMs >= idleRelease.idleMinutes * 60_000) {
+      const lastSeen = meta.idleHead?.lastSeen;
+      const lastSeenMs = typeof lastSeen === 'string' ? Date.parse(lastSeen) : NaN;
+      const restart = meta.idleHead?.sha !== idleHeadSha || !Number.isFinite(idleSinceMs)
+        || !Number.isFinite(lastSeenMs) || lastSeenMs < idleSinceMs || nowMs < lastSeenMs
+        || nowMs - lastSeenMs > MAX_IDLE_CLAIM_OBSERVATION_GAP_MS;
+      const observedAt = new Date(nowMs).toISOString();
+      meta.idleHead = { sha: idleHeadSha, since: restart ? observedAt : idleSince, lastSeen: observedAt };
+      if (!restart && nowMs - idleSinceMs >= idleRelease.idleMinutes * 60_000) {
         const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
         if (result.released) {
           released.push({ repo, pr, kind, owner: entry.owner,
             reason: `idle-head-unmoved (${Math.floor((nowMs - idleSinceMs) / 60_000)}m, ${idleRelease.idleMinutes} from ${idleRelease.sources.idleMinutes})` });
-          try {
-            void Promise.resolve(recordEvent({ kind: 'idle-claim-released', repo, pr, daemon: 'reconcile-fix-dispatch',
-              detail: { kind, idleMinutes: idleRelease.idleMinutes, sources: idleRelease.sources,
-                headSha: idleHeadSha, idleSince, owner: entry.owner } })).catch(() => {});
-          } catch { /* event storage never interrupts the sweep */ }
+          recordIdleRelease({ kind: 'idle-claim-released', repo, pr, daemon: 'reconcile-fix-dispatch',
+            detail: { kind, idleMinutes: idleRelease.idleMinutes, sources: idleRelease.sources,
+              headSha: idleHeadSha, idleSince, owner: entry.owner } }, recordEvent);
         }
         continue;
       }
