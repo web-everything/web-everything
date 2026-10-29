@@ -230,6 +230,8 @@ function collectSpawnedScripts({ root, files, readFile, exists, byName, strict, 
  * decideSkipRebuild ignores members and spawned names for an incomplete closure.
  * `strictExtensions:false` restores the legacy import parser, string-path launch scan and
  * spawn-generation counting while preserving `strict` import checks and the caller's bounds.
+ * `legacyRequires:true` supplements that walk with single-target require edges only. Callers
+ * must also retain the original legacy refusal: even these edges can shorten its chains.
  */
 export function collectRunClosure({
   root, entries, reader, importClosure = collectImportClosure,
@@ -237,7 +239,7 @@ export function collectRunClosure({
   exists = reader?.exists ?? ((p) => { try { return statSync(p).isFile(); } catch { return false; } }),
   byName = reader?.byName ?? trackedScriptIndex(resolvePath(root)),
   maxFiles = Infinity, strict = false, strictExtensions = true,
-  stopWhenIncomplete = false,
+  stopWhenIncomplete = false, legacyRequires = false,
 }) {
   const extended = strict && strictExtensions;
   const absRoot = resolvePath(root);
@@ -266,7 +268,7 @@ export function collectRunClosure({
   // Only imports may expand inside this walk. ALL other edges are returned as targets and pass
   // through the fresh-target check below before becoming roots for the next generation.
   const imports = () => importClosure({ root, entries: [...walked], readFile: readOnce, exists: existsOnce,
-    parsed, maxFiles, strict, strictExtensions, followNonImports: false });
+    parsed, maxFiles, strict, strictExtensions, legacyRequires, followNonImports: false });
   const walked = new Set(entries);
   let closure = imports();
   if (!closure) return null;
@@ -284,7 +286,7 @@ export function collectRunClosure({
     unreadable ||= bad;
     for (const n of names) spawnedNames.add(n);
     if (stopWhenIncomplete && unreadable) break;
-    if (extended) for (const target of closure.nonImportTargets || []) targets.add(target);
+    if (extended || legacyRequires) for (const target of closure.nonImportTargets || []) targets.add(target);
     const fresh = [...targets].filter((t) => !closure.files.has(t) && !walked.has(t));
     if (!fresh.length) break;
     if (hop >= MAX_SPAWN_HOPS) { closure = { ...closure, complete: false }; break; }

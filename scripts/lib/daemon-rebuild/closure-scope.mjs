@@ -75,20 +75,24 @@ export function computeClosureScope({ reader, git, mainSha, overlays = [], overl
       if (!validPath(p) || !combined.exists(p)) return { ok: false, reason: 'entries-unreadable' };
       try { combined.readFile(p); } catch { return { ok: false, reason: 'entries-unreadable' }; }
     }
-    let closure = collectRunClosure({ root: combined.root, reader: combined, entries: starts,
-      maxFiles: LIMIT, strict: true, stopWhenIncomplete: true });
-    if (!closure?.complete) return { ok: false, reason: 'closure-incomplete' };
-    if (closure.files.size > LIMIT) return { ok: false, reason: 'closure-too-large' };
-    // More edges can shorten the strict walk's generations and hide a legacy hop refusal.
-    // Require the independent pre-extension walk too; neither walk may authorize the other.
+    // Decide compatibility before strict expansion can add shortcuts. Keep BOTH historical
+    // graphs independent: adding even single-target require edges can shorten the older walk.
     const legacy = collectRunClosure({ root: combined.root, reader: combined, entries: starts,
       maxFiles: LIMIT, strict: true, strictExtensions: false, stopWhenIncomplete: true });
     if (!legacy?.complete) return { ok: false, reason: 'closure-incomplete' };
     if (legacy.files.size > LIMIT) return { ok: false, reason: 'closure-too-large' };
-    closure = { ...closure, files: new Set([...closure.files, ...legacy.files]),
-      bareDeps: closure.bareDeps || legacy.bareDeps,
-      jsonNames: new Set([...closure.jsonNames, ...legacy.jsonNames]),
-      spawnedNames: new Set([...closure.spawnedNames, ...legacy.spawnedNames]) };
+    const legacyRequire = collectRunClosure({ root: combined.root, reader: combined, entries: starts,
+      maxFiles: LIMIT, strict: true, strictExtensions: false, legacyRequires: true, stopWhenIncomplete: true });
+    if (!legacyRequire?.complete) return { ok: false, reason: 'closure-incomplete' };
+    if (legacyRequire.files.size > LIMIT) return { ok: false, reason: 'closure-too-large' };
+    let closure = collectRunClosure({ root: combined.root, reader: combined, entries: starts,
+      maxFiles: LIMIT, strict: true, stopWhenIncomplete: true });
+    if (!closure?.complete) return { ok: false, reason: 'closure-incomplete' };
+    if (closure.files.size > LIMIT) return { ok: false, reason: 'closure-too-large' };
+    closure = { ...closure, files: new Set([...closure.files, ...legacy.files, ...legacyRequire.files]),
+      bareDeps: closure.bareDeps || legacy.bareDeps || legacyRequire.bareDeps,
+      jsonNames: new Set([...closure.jsonNames, ...legacy.jsonNames, ...legacyRequire.jsonNames]),
+      spawnedNames: new Set([...closure.spawnedNames, ...legacy.spawnedNames, ...legacyRequire.spawnedNames]) };
     if (closure.files.size > LIMIT) return { ok: false, reason: 'closure-too-large' };
     const scope = new Set([...closure.files, ...mechanismPaths]);
     for (const p of combined.listFiles()) {

@@ -23,6 +23,89 @@ function compute(files = {}, options = {}) {
     entries: ['entry.mjs'], env: {}, ...options });
 }
 
+it.each([
+  ['string-keyed module destructuring', "const {'require':load}=module; load.call(module,process.argv[2]);"],
+  ['package dot main', "require('.');", { 'package.json': '{"main":"./tests/payload"}',
+    'tests/payload.js': '', 'tests/payload.cjs': '' }, ['tests/payload.mjs', 'tests/payload.js', 'tests/payload.cjs']],
+  ['package parent exports', "import './child/start.mjs';", {
+    'child/start.mjs': "require('..');", 'package.json': '{"exports":"./tests/payload"}',
+  }, ['tests/payload.mjs']],
+  ['nested package exports', "import 'outer';", {
+    'node_modules/outer/package.json': '{"exports":"./lib/start.mjs"}',
+    'node_modules/outer/lib/start.mjs': "import 'inner';",
+    'node_modules/outer/node_modules/inner/package.json': '{"exports":{".":{"import":"./tests/payload"}}}',
+    'node_modules/outer/node_modules/inner/tests/payload.js': '',
+    'node_modules/outer/node_modules/inner/tests/payload.cjs': '',
+  }, ['node_modules/outer/node_modules/inner/tests/payload.js', 'node_modules/outer/node_modules/inner/tests/payload.cjs']],
+  ['tracked bare package entry', "require('local-fixture');", {
+    'node_modules/local-fixture/index.js': "import './tests/dependency.mjs';",
+    'node_modules/local-fixture/tests/dependency.mjs': '',
+  }, ['node_modules/local-fixture/index.js', 'node_modules/local-fixture/tests/dependency.mjs']],
+  ['inherited fork execArgv', "process.execArgv.push(process.argv[2]); fork('./worker.mjs');", { 'worker.mjs': '' }],
+  ['inherited spawn NODE_OPTIONS', "process.env.NODE_OPTIONS=process.argv[2]; spawnSync('node', ['./worker.mjs']);", { 'worker.mjs': '' }],
+  ['escaped file URL', "import 'file:///x/tests/%70ayload.mjs';"],
+  ['base64 data import', `import 'data:text/javascript;base64,${Buffer.from("import 'node:fs';").toString('base64')}';`],
+  ['node:test runner', "import {run} from 'node:test'; run({files:[process.argv[2]]});"],
+  ['environment file loader', 'process.loadEnvFile(process.argv[2]);'],
+  ['eval loader', 'eval(process.argv[2]);'],
+  ['Function loader', 'new Function(process.argv[2]);'],
+  ['module bracket member', "consume(module['require']);"],
+  ['resolver factory reference', 'consume(createRequire);'],
+  ['vm namespace', "import * as vm from 'node:vm'; consume(vm);"],
+  ['module namespace', "import * as mod from 'node:module'; consume(mod);"],
+  ['preload strings', "const flags=['--require','--import','--loader','--experimental-loader'];"],
+  ['remote import', "import 'https://example.invalid/loader.mjs';"],
+])('opaque loaders and tracked resolution protect runtime files: %s', (_label, source, files = {}, targets) => {
+  const result = compute({ 'entry.mjs': "import './loader.mjs';", 'loader.mjs': source,
+    'tests/payload.mjs': '', 'tests/unmentioned.mjs': '', ...files });
+  for (const target of targets || ['tests/payload.mjs', 'tests/unmentioned.mjs']) {
+    expect(result.ok ? isExcludable(target, result.scope) : false, target).toBe(false);
+  }
+});
+
+it.each([
+  "await Function('return import(process.argv[2])')();",
+  "await Function.prototype.constructor('return import(process.argv[2])')();",
+  "await (0, Function)('return import(process.argv[2])')();",
+  "await globalThis.Function('return import(process.argv[2])')();",
+  "const {'Function': compile} = globalThis; compile(process.argv[2])();",
+  'consume(process.mainModule);',
+  "consume(process['mainModule']);",
+  "const {'mainModule': entry} = process; consume(entry);",
+  'consume(require.main);', 'consume(module.parent);', 'consume(module.children);',
+  'consume(require.cache);', 'consume(Module._load);', 'consume(Module._resolveFilename);',
+  "const {'_load': load} = Module; consume(load);",
+  "const {'_resolveFilename': locate} = Module; consume(locate);",
+  "consume(process.getBuiltinModule);", 'consume(process.binding);',
+  'consume(process._linkedBinding);', 'consume(process.dlopen);',
+])('R210 final round retains the full conflict for opaque loader references: %s', source => {
+  expect(compute({ 'entry.mjs': "import './loader.mjs';", 'loader.mjs': source,
+    'tests/unmentioned.mjs': '' })).toMatchObject({ ok: false, reason: 'closure-incomplete' });
+});
+
+it.each(['main', 'exports'])('R210 final round protects raw and URL-decoded package %s targets', field => {
+  const files = { 'entry.mjs': "require('./pkg');", 'pkg/index.js': '',
+    'pkg/package.json': JSON.stringify({ [field]: './%70ayload.mjs' }),
+    'pkg/%70ayload.mjs': "import './raw-dependency.mjs';",
+    'pkg/payload.mjs': "import './decoded-dependency.mjs';",
+    'pkg/raw-dependency.mjs': '', 'pkg/decoded-dependency.mjs': '' };
+  const result = compute(files);
+  expect(result.ok).toBe(true);
+  for (const path of ['pkg/%70ayload.mjs', 'pkg/payload.mjs',
+    'pkg/raw-dependency.mjs', 'pkg/decoded-dependency.mjs']) {
+    expect(result.closure.files.has(path), path).toBe(true);
+    expect(isExcludable(path, result.scope), path).toBe(false);
+  }
+});
+
+it.each(['main', 'exports'])('R210 final round refuses unproven URL-decoded package %s targets', field => {
+  for (const target of ['./%ZZ.mjs', './%2e%2e/%2e%2e/outside.mjs', './%2Foutside.mjs', './%2a.mjs']) {
+    expect(compute({ 'entry.mjs': "require('./pkg');", 'pkg/index.js': '',
+      'pkg/package.json': JSON.stringify({ [field]: target }),
+      [`pkg/${target.slice(2)}`]: '' }), target).toMatchObject({ ok: false, reason: 'closure-incomplete' });
+  }
+});
+
 it('only excludes allowed files outside the run closure and protects smoke and mechanism paths', () => {
   const result = compute({ 'entry.mjs': "import './used.mjs';", 'used.mjs': '',
     'unused.mjs': '', 'data.bin': '' }, { mechanismPaths: ['mechanism/'] });
@@ -77,6 +160,46 @@ it('retains the full conflict when a comment shortcut completes a strict 66-file
   expect(compute(files)).toEqual({ ok: false, reason: 'closure-incomplete' });
 });
 
+it('retains the legacy refusal for a 66-link extensionless require chain with a candidate shortcut', () => {
+  const files = { 'entry.mjs': "require('./chain-00');",
+    'chain-00.js': "require('./chain-32');" };
+  for (let i = 0; i < 66; i++) {
+    files[`chain-${String(i).padStart(2, '0')}.mjs`] = i === 65 ? ''
+      : `require('./chain-${String(i + 1).padStart(2, '0')}');`;
+  }
+  const snapshot = reader(files);
+  const options = { root: snapshot.root, reader: snapshot, entries: ['entry.mjs'],
+    strict: true, stopWhenIncomplete: true, byName: () => [] };
+  const expanded = collectRunClosure(options);
+  expect(expanded.complete).toBe(true);
+  expect(expanded.files.size).toBe(68);
+  const legacy = collectRunClosure({ ...options, strictExtensions: false, legacyRequires: true });
+  expect(legacy.complete).toBe(false);
+  expect(legacy.files.has('chain-00.js')).toBe(false);
+  expect(compute(files)).toEqual({ ok: false, reason: 'closure-incomplete' });
+});
+
+it('single-target require compatibility bypasses strict launch, basename, comment and read-capability traversal', () => {
+  const snapshot = reader({ 'entry.mjs': `import fs from 'node:fs';
+    require('./required');
+    fork('./launch\\u002emjs');
+    const note = 'basename.mjs';
+    // comment.mjs
+    fs.readFileSync(process.argv[2]);`,
+  'required.mjs': '', 'required.js': 'import(target);', 'launch.mjs': 'import(target);',
+  'hidden/basename.mjs': 'import(target);', 'comment.mjs': 'import(target);', 'opaque.mjs': 'import(target);' });
+  const byName = vi.fn(() => []);
+  const options = { root: snapshot.root, reader: snapshot, entries: ['entry.mjs'], strict: true,
+    strictExtensions: false, legacyRequires: true, stopWhenIncomplete: true, byName };
+  const legacy = collectRunClosure(options);
+  expect(legacy.complete).toBe(true);
+  expect(legacy.files).toEqual(new Set(['entry.mjs', 'required.mjs']));
+  expect(legacy.opaqueReads).toBeUndefined();
+  // The old string-path scanner's fallback is preserved; the new basename index is unused.
+  expect(byName).toHaveBeenCalledTimes(1);
+  expect(byName).toHaveBeenCalledWith('basename.mjs');
+});
+
 it('legacy compatibility preserves strict import checks without new launch or reference parsing', () => {
   const snapshot = reader({ 'entry.mjs': `// comment-worker.mjs
     require('./required');
@@ -100,33 +223,46 @@ it.each([
   ['oversized', () => ({ complete: true, files: new Set(Array.from({ length: 4001 }, (_, i) => `f${i}.mjs`)) }), 'closure-too-large'],
   ['unreadable', () => { throw new Error('legacy read failed'); }, 'scope-unreadable'],
   ['file-bound exception', () => { throw Object.assign(new Error('bound'), { code: 'CLOSURE_TOO_LARGE' }); }, 'closure-too-large'],
-])('retains the full conflict after strict completion when legacy evidence is %s', (_label, legacy, reason) => {
-  const strict = { complete: true, files: new Set(['entry.mjs']) };
-  const spy = vi.spyOn(runClosure, 'collectRunClosure')
-    .mockReturnValueOnce(strict).mockImplementationOnce(legacy);
+])('retains the full conflict before strict traversal when legacy evidence is %s', (_label, legacy, reason) => {
+  const spy = vi.spyOn(runClosure, 'collectRunClosure').mockImplementationOnce(legacy);
   try {
     expect(compute()).toEqual({ ok: false, reason });
-    expect(spy).toHaveBeenCalledTimes(2);
-    expect(spy.mock.calls[1][0]).toMatchObject({ strict: true, strictExtensions: false,
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls[0][0]).toMatchObject({ strict: true, strictExtensions: false,
       maxFiles: 4000, stopWhenIncomplete: true });
-    expect(spy.mock.calls[1][0].reader).toBe(spy.mock.calls[0][0].reader);
-    expect(spy.mock.calls[1][0].entries).toEqual(spy.mock.calls[0][0].entries);
   } finally { spy.mockRestore(); }
 });
 
-it('includes both independently proven closures and their metadata in the admitted scope', () => {
+it('returns single-target require incompleteness before strict traversal', () => {
+  const spy = vi.spyOn(runClosure, 'collectRunClosure')
+    .mockReturnValueOnce({ complete: true, files: new Set(['entry.mjs']) })
+    .mockReturnValueOnce({ complete: false });
+  try {
+    expect(compute()).toEqual({ ok: false, reason: 'closure-incomplete' });
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(spy.mock.calls[1][0]).toMatchObject({ strict: true, strictExtensions: false,
+      legacyRequires: true, maxFiles: 4000, stopWhenIncomplete: true });
+  } finally { spy.mockRestore(); }
+});
+
+it('includes all independently proven closures and their metadata in the admitted scope', () => {
   const evidence = name => ({ complete: true, files: new Set(['entry.mjs', `${name}.mjs`]),
     bareDeps: name === 'legacy', jsonNames: new Set([`${name}.json`]), spawnedNames: new Set([`${name}.mjs`]) });
   const spy = vi.spyOn(runClosure, 'collectRunClosure')
-    .mockReturnValueOnce(evidence('strict')).mockReturnValueOnce(evidence('legacy'));
+    .mockReturnValueOnce(evidence('legacy')).mockReturnValueOnce(evidence('required'))
+    .mockReturnValueOnce(evidence('strict'));
   try {
     const result = compute({ 'strict.mjs': '', 'legacy.mjs': '', 'unrelated.mjs': '' });
     expect(result.ok).toBe(true);
-    expect(result.closure.files).toEqual(new Set(['entry.mjs', 'strict.mjs', 'legacy.mjs']));
+    expect(result.closure.files).toEqual(new Set(['entry.mjs', 'strict.mjs', 'legacy.mjs', 'required.mjs']));
     expect(result.closure.bareDeps).toBe(true);
-    expect(result.closure.jsonNames).toEqual(new Set(['strict.json', 'legacy.json']));
-    expect(result.closure.spawnedNames).toEqual(new Set(['strict.mjs', 'legacy.mjs']));
-    for (const file of ['strict.mjs', 'legacy.mjs']) expect(isExcludable(file, result.scope)).toBe(false);
+    expect(result.closure.jsonNames).toEqual(new Set(['strict.json', 'legacy.json', 'required.json']));
+    expect(result.closure.spawnedNames).toEqual(new Set(['strict.mjs', 'legacy.mjs', 'required.mjs']));
+    for (const call of spy.mock.calls) {
+      expect(call[0].reader).toBe(spy.mock.calls[0][0].reader);
+      expect(call[0].entries).toEqual(spy.mock.calls[0][0].entries);
+    }
+    for (const file of ['strict.mjs', 'legacy.mjs', 'required.mjs']) expect(isExcludable(file, result.scope)).toBe(false);
     expect(isExcludable('unrelated.mjs', result.scope)).toBe(true);
   } finally { spy.mockRestore(); }
 });
@@ -494,4 +630,149 @@ it.each(['export const tick = name => readFileSync(name);',
 it('R210 refuses an imported file type whose dependencies it cannot parse', () => {
   expect(compute({ 'entry.mjs': "import './worker.custom';", 'worker.custom': '' }))
     .toMatchObject({ ok: false, reason: 'closure-incomplete' });
+});
+
+it('R210 red-team 1 protects computed reads through every filesystem module binding', () => {
+  for (const module of ['node:fs', 'node:fs/promises', 'fs', 'fs/promises']) {
+    for (const name of ['createReadStream', 'readlink', 'opendir', 'cp', 'glob', 'futureExport']) {
+      const result = compute({ 'entry.mjs': `import { ${name} as capability } from '${module}';
+        capability(new URL(process.argv[2], import.meta.url));`, 'tests/selected.test.mjs': '' });
+      expect(result.ok ? isExcludable('tests/selected.test.mjs', result.scope) : false, `${module}:${name}`).toBe(false);
+    }
+  }
+});
+
+it('R210 red-team 2 protects string-keyed filesystem destructuring and escaped namespace capabilities', () => {
+  for (const use of ["const {'readFileSync': read} = fs; read(path);",
+    'const { [key]: read } = fs; read(path);', 'const copy = { ...fs }; copy[key](path);',
+    'const alias = fs; callbacks.map(alias[key]);', 'consume(fs.futureExport);']) {
+    const result = compute({ 'entry.mjs': `import fs from 'node:fs'; ${use}`, 'tests/selected.test.mjs': '' });
+    expect(result.ok ? isExcludable('tests/selected.test.mjs', result.scope) : false, use).toBe(false);
+  }
+  for (const source of ["const {'readFileSync': read} = require('node:fs'); read(path);",
+    "const fs = await import('node:fs/promises'); consume(fs[key]);",
+    "export * from 'node:fs';", "import fs = require('node:fs'); consume(fs);"]) {
+    const result = compute({ 'entry.mjs': source, 'tests/selected.test.mjs': '' });
+    expect(result.ok ? isExcludable('tests/selected.test.mjs', result.scope) : false, source).toBe(false);
+  }
+});
+
+it('R210 red-team 3 refuses string-keyed child-process destructuring with a computed test target', () => {
+  expect(compute({ 'entry.mjs': `import * as cp from 'node:child_process';
+    const {'execFileSync': run} = cp; run(process.execPath, [process.argv[2]]);`,
+  'tests/selected.test.mjs': '' })).toMatchObject({ ok: false, reason: 'closure-incomplete' });
+});
+
+it('R210 red-team 4 refuses computed worker targets through module binding provenance', () => {
+  for (const source of ["import { Worker } from 'node:worker_threads'; new Worker(new URL(process.argv[2], import.meta.url));",
+    "import * as workers from 'node:worker_threads'; const Alias = workers.Worker; new Alias(target);",
+    "const { 'Worker': Run } = require('node:worker_threads'); new Run(target);",
+    "import { Script as Run } from 'node:vm'; callbacks.map(Run);",
+    "import * as mod from 'node:module'; const { [key]: run } = mod; run(target);",
+    "import { futureExport as run } from 'node:child_process'; run(target);",
+    "export * from 'node:vm';",
+    "const cp = await import('node:child_process'); cp[key](target);",
+    "import cp from 'node:child_process'; const copy = { ...cp }; copy[key](target);"]) {
+    expect(compute({ 'entry.mjs': source, 'tests/selected.test.mjs': '' }), source)
+      .toMatchObject({ ok: false, reason: 'closure-incomplete' });
+  }
+});
+
+it('R210 red-team 5 refuses unproven launch preloads in execArgv and environment options', () => {
+  for (const options of ["{execArgv:['--require', process.env.PRELOAD]}",
+    "{execArgv:['--import', target]}", "{execArgv:['--loader', target]}",
+    '{env: {NODE_OPTIONS: process.env.PRELOAD}}', '{env: process.env}', '{execPath: process.env.RUNNER}',
+    "{execArgv:['--require', './preload.mjs']}"]) {
+    expect(compute({ 'entry.mjs': `fork('./worker.mjs', [], ${options});`, 'worker.mjs': '',
+      'tests/preload.test.mjs': '' }), options).toMatchObject({ ok: false, reason: 'closure-incomplete' });
+  }
+});
+
+it('R210 package resolution retains the conflict on missing, cyclic, wildcard and unreadable evidence', () => {
+  for (const manifest of ['not json', 'null', '{"main": 42}', '{"main":"."}',
+    '{"main":"./missing"}', '{"exports":"./*.mjs"}', '{"exports":"../../outside.mjs"}']) {
+    expect(compute({ 'entry.mjs': "require('./pkg');", 'pkg/package.json': manifest, 'pkg/index.js': '' }), manifest)
+      .toMatchObject({ ok: false, reason: 'closure-incomplete' });
+  }
+  const snapshot = reader({ ...Object.fromEntries(smokeSurfaceEntries({}).map(p => [p, ''])),
+    'entry.mjs': "require('./pkg');", 'pkg/package.json': '{}', 'pkg/index.js': '' });
+  const read = snapshot.readFile;
+  snapshot.readFile = path => {
+    if (path.endsWith('/pkg/package.json')) throw new Error('EACCES');
+    return read(path);
+  };
+  expect(compute({}, { reader: snapshot })).toMatchObject({ ok: false, reason: 'closure-incomplete' });
+});
+
+it('R210 admits main pointing to an existing index candidate and protects its dependencies', () => {
+  const result = compute({ 'entry.mjs': "require('./pkg');",
+    'pkg/package.json': JSON.stringify({ main: './index.js' }),
+    'pkg/index.js': "require('./dependency');", 'pkg/dependency.js': '', 'unrelated.js': '' });
+  expect(result.ok).toBe(true);
+  for (const path of ['pkg/index.js', 'pkg/dependency.js']) {
+    expect(result.closure.files.has(path), path).toBe(true);
+    expect(isExcludable(path, result.scope), path).toBe(false);
+  }
+  expect(isExcludable('unrelated.js', result.scope)).toBe(true);
+});
+
+it('R210 admits main and exports sharing a resolved target and protects its dependencies', () => {
+  const result = compute({ 'entry.mjs': "require('./pkg');",
+    'pkg/package.json': JSON.stringify({ main: './entry.js',
+      exports: { '.': { import: './entry.js', require: './entry.js' } } }),
+    'pkg/index.js': '', 'pkg/entry.js': "require('./dependency');",
+    'pkg/dependency.js': '', 'unrelated.js': '' });
+  expect(result.ok).toBe(true);
+  for (const path of ['pkg/index.js', 'pkg/entry.js', 'pkg/dependency.js']) {
+    expect(result.closure.files.has(path), path).toBe(true);
+    expect(isExcludable(path, result.scope), path).toBe(false);
+  }
+  expect(isExcludable('unrelated.js', result.scope)).toBe(true);
+});
+
+it('R210 package resolution retains the conflict above the existing 4000-file closure bound', () => {
+  const files = { 'entry.mjs': "require('./pkg');", 'pkg/index.js': '' };
+  const exports = {};
+  for (let i = 0; i < 4000; i++) {
+    exports[`condition${i}`] = `./target-${i}.mjs`;
+    files[`pkg/target-${i}.mjs`] = '';
+  }
+  files['pkg/package.json'] = JSON.stringify({ exports });
+  expect(compute(files)).toMatchObject({ ok: false, reason: 'closure-too-large' });
+});
+
+it('R210 red-team 6 walks every extension, index and package manifest resolution candidate', () => {
+  const files = { 'entry.mjs': "require('./chosen'); require('./pkg');",
+    'chosen.mjs': "import './mjs-dependency.mjs';", 'chosen.js': "import './js-dependency.mjs';",
+    'chosen.cjs': '', 'chosen/index.js': '', 'chosen/index.cjs': '', 'chosen/index.mjs': '',
+    'mjs-dependency.mjs': '', 'js-dependency.mjs': '',
+    'pkg/package.json': JSON.stringify({ main: './main', exports: { '.': { import: './esm.mjs', require: './cjs.cjs' } } }),
+    'pkg/main.js': "import './main-dependency.mjs';", 'pkg/esm.mjs': '', 'pkg/cjs.cjs': '',
+    'pkg/main-dependency.mjs': '', 'pkg/index.js': '', 'pkg/index.cjs': '' };
+  const result = compute(files);
+  expect(result.ok).toBe(true);
+  for (const path of Object.keys(files)) {
+    expect(isExcludable(path, result.scope), path).toBe(false);
+    if (!path.endsWith('.json')) expect(result.closure.files.has(path), path).toBe(true);
+  }
+});
+
+it('R210 walks every exports array target and its transitive dependencies', () => {
+  const targets = ['first.mjs', 'second.cjs', 'third.mjs', 'fourth.cjs'];
+  const files = { 'entry.mjs': "require('./pkg');", 'pkg/index.js': '',
+    'pkg/package.json': JSON.stringify({ exports: { '.': [
+      './first.mjs', './second.cjs', { default: ['./third.mjs', './fourth.cjs'] },
+    ] } }) };
+  for (const target of targets) {
+    files[`pkg/${target}`] = `import './${target}-dependency.mjs';`;
+    files[`pkg/${target}-dependency.mjs`] = '';
+  }
+  const result = compute(files);
+  expect(result.ok).toBe(true);
+  for (const target of targets) {
+    for (const path of [`pkg/${target}`, `pkg/${target}-dependency.mjs`]) {
+      expect(result.closure.files.has(path), path).toBe(true);
+      expect(isExcludable(path, result.scope), path).toBe(false);
+    }
+  }
 });
