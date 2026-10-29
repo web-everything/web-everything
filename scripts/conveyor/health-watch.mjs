@@ -85,6 +85,7 @@ import { readVerifyMarker } from '../lib/lane-verify.mjs';
 // this probe's notion of "a daemon clone" can never drift from the guards'.
 import { daemonCloneRoots } from '../lib/daemon-clone-registry.mjs';
 import { probeFixReady } from './fix-ready-probe.mjs';
+import { kickOverlayMainSync } from '../lib/daemon-rebuild/overlay-main-sync.mjs';
 import { probeDaemonCloneBranches } from '../lib/daemon-clone-branch-probe.mjs';
 import { workspaceOf } from '../lib/automation-home.mjs';
 import { probeBuildSessions, probeExternalRuns } from './build-supervision.mjs';
@@ -1102,6 +1103,16 @@ export function resolveLaneScanTarget(flags, dir, fixtureTick) {
   return { laneScanDir, laneScanWrite: !!laneScanDir };
 }
 
+export function probeOverlayMainSync(flags, roots = () => daemonCloneRoots(workspaceOf(REPO_ROOT)),
+  kick = options => kickOverlayMainSync(options)) {
+  if (flags['logs-dir'] || flags['lock-root'] || flags['state-root'] || flags['dry-run']
+    || Object.keys(flags).some(key => key.endsWith('-fixture'))) return undefined;
+  return roots().map(root => {
+    try { return kick({ root }); }
+    catch (error) { return { root, error: String(error?.message ?? error).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 1000) }; }
+  });
+}
+
 /** One tick: probe, evaluate, diagnose, and persist. Returns the CLI summary. */
 export async function tick(flags = {}, { collectInventory = collectCredentialInventory, tmpSweepRun, ...deps } = {}) {
   const started = Date.now();
@@ -1199,6 +1210,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // #4370 — fs-only, every tick. A fixture tick (any of the fixture-dir flags) reads only an explicit
   // `--lane-pool-root`, never the host's real pool.
   const fixtureTick = flags['logs-dir'] || flags['lock-root'] || flags['state-root'];
+  probes.overlayMainSync = attempt('overlayMainSync', () => probeOverlayMainSync(flags));
   probes.operationRuns = attempt('operationRuns', () => probeOperationRuns(fixtureTick ? { roots: [flags['state-root'] || logsDir], jobsRoot: null } : {}));
   probes.fixLoopLedger = attempt('fixLoopLedger', () => flags['fix-loop-ledger']
     ? readFixLoopRows({ env: { WE_FIX_LOOP_LEDGER: flags['fix-loop-ledger'] } })
