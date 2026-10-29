@@ -207,24 +207,31 @@ const validSha = (sha) => typeof sha === 'string' && /^[0-9a-f]{7,40}$/.test(sha
 const validRepeatProof = (p) => p?.kind === 'repeat-failed'
   && Number.isInteger(p.count) && p.count >= 2 && p.count <= 10
   && Array.isArray(p.runIds) && p.runIds.length === p.count && p.runIds.every(validRunId)
-  && new Set(p.runIds.map(String)).size === p.count
+  && (p.attempts === undefined
+    ? new Set(p.runIds.map(String)).size === p.count
+    : Array.isArray(p.attempts) && p.attempts.length === p.count
+      && p.attempts.every((a) => Number.isInteger(a) && a > 0)
+      && new Set(p.runIds.map((id, i) => `${id}:${p.attempts[i]}`)).size === p.count)
   && Array.isArray(p.shas) && p.shas.length === 2 && p.shas.every(validSha);
 
 /** Bounded evidence from the current main-red window, ordered oldest to newest. */
 export const REPEAT_RUN_LIMIT = 10;
-function repeatProofFor(file, { repeatRuns, latestRunId, touchedFiles, count }) {
+function repeatProofFor(file, { repeatRuns, latestRunId, latestAttempt = 1, touchedFiles, count }) {
   const no = (why) => ({ why });
   if (!Number.isInteger(count) || count < 2 || count > REPEAT_RUN_LIMIT) return no('repeat count exceeds evidence bound — STOP; operator repair required');
   if (!Array.isArray(repeatRuns) || repeatRuns.length > REPEAT_RUN_LIMIT) return no('repeat history exceeds evidence bound — STOP; operator repair required');
   const seen = new Set();
   const runs = repeatRuns.filter((r) => {
-    if (!validRunId(r?.databaseId) || seen.has(String(r.databaseId))) return false;
-    seen.add(String(r.databaseId));
+    const attempt = r?.attempt === undefined ? 1 : r.attempt;
+    if (!validRunId(r?.databaseId) || !Number.isInteger(attempt) || attempt < 1) return false;
+    const key = `${r.databaseId}:${attempt}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
     return r.status === 'completed' && ['failure', 'timed_out'].includes(r.conclusion)
       && Object.values(r.jobFailures ?? {}).some((f) => f?.complete === true && f.files?.includes(file));
   });
   const latest = runs.at(-1);
-  if (!latest || String(latest.databaseId) !== String(latestRunId) || runs.length < count) return no('insufficient distinct failing main runs');
+  if (!latest || String(latest.databaseId) !== String(latestRunId) || (latest.attempt === undefined ? 1 : latest.attempt) !== latestAttempt || runs.length < count) return no('insufficient distinct failing main runs');
   const evidence = runs.slice(-count);
   let previousCreatedAt = -Infinity;
   for (const run of evidence) {
@@ -240,7 +247,9 @@ function repeatProofFor(file, { repeatRuns, latestRunId, touchedFiles, count }) 
   try { touched = touchedFiles?.(...shas); } catch { touched = null; }
   if (!Array.isArray(touched) || !touched.every((f) => typeof f === 'string')) return no('touched files unknown');
   if (touched.includes(file)) return no('failing test file touched between runs');
-  return { proof: { kind: 'repeat-failed', runIds: evidence.map((r) => r.databaseId), shas, count: evidence.length } };
+  const attempts = evidence.map((r) => r.attempt === undefined ? 1 : r.attempt);
+  // Back-compat: distinct-run proofs keep their historical shape; `attempts` appears only when a re-run attempt is evidence.
+  return { proof: { kind: 'repeat-failed', runIds: evidence.map((r) => r.databaseId), ...(attempts.some((a) => a !== 1) ? { attempts } : {}), shas, count: evidence.length } };
 }
 
 /**
@@ -258,7 +267,7 @@ function repeatProofFor(file, { repeatRuns, latestRunId, touchedFiles, count }) 
  * @returns {{action:'add'|'prune'|'none', tests?:string[], names?:string[], why:string, mainGreen?:boolean|null,
  *   fixPrs?:number[]|null}}
  */
-export function planSafetyNet({ status, firstRedSha = null, failedJobs = null, jobFailures = {}, list = null, fixPrs = [], addedForRed = [], now, settings = {}, flakeProof = {}, repeatRuns = [], latestRunId = null, touchedFiles = null }) {
+export function planSafetyNet({ status, firstRedSha = null, failedJobs = null, jobFailures = {}, list = null, fixPrs = [], addedForRed = [], now, settings = {}, flakeProof = {}, repeatRuns = [], latestRunId = null, latestAttempt = 1, touchedFiles = null }) {
   const s = { ...QUARANTINE_SAFETY_NET_DEFAULTS, ...settings };
   const entries = list?.entries ?? [];
   if (status === 'green') return entries.length ? { action: 'prune', mainGreen: true, why: 'main is green' } : { action: 'none', why: 'main is green; list empty' };
@@ -287,7 +296,7 @@ export function planSafetyNet({ status, firstRedSha = null, failedJobs = null, j
       for (const file of f.files) {
         let proof = validFlakeProof(flakeProof?.[job]) ? flakeProof[job] : undefined;
         if (!proof && s.requireProvenFlake) {
-          const repeat = s.repeatFailureProof ? repeatProofFor(file, { repeatRuns, latestRunId, touchedFiles, count: s.repeatFailureCount }) : { why: 'repeat proof disabled' };
+          const repeat = s.repeatFailureProof ? repeatProofFor(file, { repeatRuns, latestRunId, latestAttempt, touchedFiles, count: s.repeatFailureCount }) : { why: 'repeat proof disabled' };
           if (!repeat.proof) {
             return none(`not a proven flake: ${job} (no green re-run of the failing commit; ${repeat.why})`);
           }

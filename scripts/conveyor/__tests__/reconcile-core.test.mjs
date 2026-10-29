@@ -42,6 +42,7 @@ import {
 } from '../stand-down.mjs';
 import { buildRoundExtensionComment } from '../round-extension-mark.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
+import { buildQueueCapRefusalComment } from '../queue-cap-refusal-count.mjs';
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
 import { CI_HEAL_COMMENT_MARKER, buildCiHealComment } from '../ci-heal-mark.mjs';
 import { buildCiHealEscalationComment } from '../ci-heal-escalation-mark.mjs';
@@ -418,6 +419,36 @@ describe('case 3 — refusal 2: a PR with nothing to fix never gets a fixer (#32
 
 // ── CASE 4 — REFUSAL 3: THE CAP SURVIVES A RESTART, OR IT IS NOT A CAP ────────────────────────────────────────
 describe('case 4 — refusal 3: the round cap is derived from the PR and ONLY from the PR (#3296)', () => {
+  it('queue-cap comments spend zero real fix rounds; another failed repair still reaches capKind fix exhaustion', () => {
+    const capacity = Array.from({ length: 6 }, () => ({ author: AUTOMATION,
+      body: buildQueueCapRefusalComment('host busy', pr1563().headRefOid, NOW) }));
+    const round = () => ({ author: AUTOMATION, body: REARM_COMMENT_MARKER });
+    const run = rounds => planReconcile({
+      prs: [pr1563({ comments: [finding(), ...rounds, ...capacity] })], agents: [],
+      durableCounts: {}, roundCap: 3, roundCapAction: 'person', now: NOW,
+    });
+    // A saturated queue cannot exhaust the repair cap even with more capacity markers than the cap.
+    expect(run([]).dispatch).toContainEqual(expect.objectContaining({ kind: 'fix', attempts: 0 }));
+    const prior = [round(), round()];
+    const below = run(prior);
+    expect(below.dispatch).toContainEqual(expect.objectContaining({ kind: 'fix', attempts: 2 }));
+    expect(below.refusals.map(r => r.kind)).not.toContain('cap-exhausted');
+    // A real fix ran, released its claim and re-armed, but the original finding remains uncorrected.
+    const failed = [
+      { author: AUTOMATION, body: buildFixBeginComment({ who: 'fix-3', headSha: pr1563().headRefOid }) },
+      { author: AUTOMATION, body: buildFixEndComment({ who: 'fix-3', headSha: pr1563().headRefOid }) },
+      round(),
+    ];
+    const exhausted = run([...prior, ...failed]);
+    expect(exhausted.dispatch).toEqual([]);
+    expect(exhausted.refusals).toContainEqual(expect.objectContaining({
+      kind: 'cap-exhausted', prNumber: 1563, attempts: 3, cap: 3, capKind: 'fix',
+    }));
+    expect(exhausted.notes).toContainEqual(expect.objectContaining({
+      kind: 'round-cap-exhausted', capKind: 'fix', attempts: 3, cap: 3,
+    }));
+  });
+
   it('a fresh pass carrying NOTHING in refuses on the PR\'s own count', () => {
     // `durableCounts` is what the shell read back off the PR's comment thread. No in-process state exists here:
     // this pass is one-shot. #1563 ran to TWELVE rounds against a cap of 5 with a durable count of 0 — the cap

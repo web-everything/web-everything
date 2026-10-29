@@ -312,6 +312,8 @@ export const REFUSAL_KINDS = Object.freeze([
   'ci-heal-escalated', 'waiting-on-system-fix', 'review-hold-red',
   // A CI re-run this system requested whose result is not observed yet: held, not escalated, until the window.
   'ci-timeout-rerun-in-flight', 'timeout-evidence-unknown',
+  // Incomplete inventory recovery exhausted its rerun; no active stale path can fall through to a bounded heal.
+  'starved-capacity-alert',
   // `draft` (draft-first PRs, operator-approved 2026-09-27) — the PR is still a GitHub draft: no review is
   // dispatched, whatever `review:*` label it carries, until the `promote-draft` DISPATCH_KIND (above) has
   // un-drafted it. See {@link dispatchReviewRow}'s own gate.
@@ -3301,10 +3303,13 @@ export function planReconcile({
       // ever started. The failed jobs of an unchanged head are re-run once (budget shared with the timeout re-run),
       // only when main is green and nothing on the head is still running (a re-run of a live run is rejected).
       const staleRetry = pr.owedCiRerunRetry;
-      if (!pr.timeoutRetry?.cancelledShard && staleCiRerun === 'once-per-head' && pr.mainGreenNow?.red === false && staleRetry?.eligible
-          && staleRetry.head === pr.headRefOid && staleRetry.pr === prNumber) {
+      const incompleteFailureInventory = pr.timeoutRetry && !pr.timeoutRetry.eligible
+        && String(pr.timeoutRetry.reason).includes('incomplete-failure-inventory');
+      const staleRerunActive = !pr.timeoutRetry?.cancelledShard && staleCiRerun === 'once-per-head' && pr.mainGreenNow?.red === false && staleRetry?.eligible
+        && staleRetry.head === pr.headRefOid && staleRetry.pr === prNumber;
+      if (staleRerunActive) {
         const staleSpent = retryBudget?.confirmed === undefined ? undefined : retryBudget.confirmed + (retryBudget.rejected ?? 0);
-        const staleCap = staleRetry.jobs.length;
+        const staleCap = incompleteFailureInventory ? 1 : staleRetry.jobs.length;
         if (staleSpent < staleCap && hasLiveCheck(pr)) {
           // The owed re-run is deferred, not skipped: hold (never fall through to a heal that spends heal budget on a
           // head whose fresh result is still on its way) and re-plan next tick.
@@ -3329,9 +3334,40 @@ export function planReconcile({
           why: `PR #${prNumber}: evidence read timed out; unknown, not ineligible — will re-read next tick (${unknownEvidence.reason})` });
         continue;
       }
-      const retryRefusal = pr.timeoutRetry && !pr.timeoutRetry.eligible
+      const inventorySpent = retryBudget?.confirmed === undefined ? undefined
+        : retryBudget.confirmed + (retryBudget.rejected ?? 0);
+      // Turning off stale reruns on green main retains the legacy ineligible-row/ci-heal path.
+      // Red main likewise never authorizes a mechanical recovery rerun; absent main evidence can use recovery.
+      const staleRerunDisabled = staleCiRerun === 'off' && pr.mainGreenNow?.red === false;
+      const partialFailureInventory = incompleteFailureInventory && !staleRerunActive && !staleRerunDisabled && inventorySpent === 0;
+      if (incompleteFailureInventory && inventorySpent >= 1) {
+        const why = `PR #${prNumber}: incomplete failure inventory on head ${String(pr.headRefOid).slice(0, 8)}; the one-time recovery rerun is spent — `
+          + (staleRerunActive ? 'ordinary ci-heal remains bounded by its heal budget' : 'operator investigation required');
+        notes.push({ kind: 'starved-capacity-alert', prNumber, text: why });
+        if (!staleRerunActive) {
+          refusals.push({ kind: 'starved-capacity-alert', prNumber, why });
+          continue;
+        }
+      }
+      if (partialFailureInventory && pr.mainGreenNow?.red !== true && staleRetry?.eligible
+          && staleRetry.head === pr.headRefOid && staleRetry.pr === prNumber) {
+        if (hasLiveCheck(pr)) {
+          refuse('ci-timeout-rerun-in-flight', { ...withPhase,
+            why: 'another check on this head is still running — the incomplete inventory recovery rerun waits until it completes' });
+          continue;
+        }
+        const variant = 'incomplete-inventory-rerun';
+        dispatch.push({ ...base, ...withPhase, kind: 'ci-timeout-rerun', variant,
+          timeoutRetry: { ...staleRetry, variant, cap: 1 },
+          why: 'incomplete failure inventory; one recovery rerun on this head before operator investigation, no heal budget' });
+        continue;
+      }
+      const retryRefusal = pr.timeoutRetry && !pr.timeoutRetry.eligible && !partialFailureInventory
         ? { kind: 'timeout-retry-ineligible', prNumber, why: `PR #${prNumber}: ${pr.timeoutRetry.reason}` } : null;
       if (retryRefusal) refusals.push(retryRefusal);
+      // Known ineligibility falls through to the shared heal budget; unknown evidence and incomplete-inventory
+      // recovery keep their own guards above. Tag the heal and surface its reason only when it is dispatched.
+      const timeoutRetryFallback = pr.timeoutRetry?.eligible === false && !pr.timeoutRetry.unknown && !partialFailureInventory;
       // Live PR #4631 — only REQUIRED failures are healed or named as the failure; a non-required red (`merge-gate`,
       // red by design until #4715) is reported beside it, never healed. The budget is the heals since the PR's last
       // non-mechanical head ({@link ciHealBudgetResetAt}), not every heal it ever had.
@@ -3378,11 +3414,17 @@ export function planReconcile({
         if (retryRefusal) retryRefusal.owner = 'ci-heal';
         dispatch.push({
           ...base, ...withPhase, ...refund, ...healFacts, ...owedMainRuleFact, kind: 'ci-heal', attempts: ciHealAttempts,
+          ...(timeoutRetryFallback ? { timeoutRetryFallback: pr.timeoutRetry.reason } : {}),
+          ...(partialFailureInventory ? { partialFailureInventory: true } : {}),
           ...(fixTiming.joinCiAndReview && readiness.reviewFindings ? { reviewFixAttempts: roundAttempts() } : {}),
           why: `a required check is failing (${failing.required.join(', ') || 'unnamed'}), nothing live is working it, and ${ciHealAttempts} of ${ciHealCap} CI-heal attempts are spent`
             + (healBudget.log.resetAt ? ` since ${healBudget.log.resetBy}'s push at ${healBudget.log.resetAt}` : '')
             + ` (cap from ${ciHealCapSource})`
             + (owedMainRuleFact.owedMainRule ? `; test's hand-picked-NNN errors are drain-assigned (${owedMainRuleFact.owedMainRule.nums.map(n => `#${n}`).join(', ')}) and must be left alone` : ''),
+        });
+        if (timeoutRetryFallback) notes.push({
+          kind: 'timeout-retry-fallback-heal', prNumber, reason: pr.timeoutRetry.reason,
+          text: `PR #${prNumber}: timeout retry ineligible (${pr.timeoutRetry.reason}); falling back to ordinary ci-heal (${ciHealAttempts} of ${ciHealCap} attempts spent)`,
         });
       }
       continue;
