@@ -3,8 +3,18 @@ export const QUOTA_COOLOFF_MS = 60 * 60 * 1000;
 export const CODEX_QUOTA_FULL_PERCENT = 98;
 
 export function isQuotaError(text) {
-  return typeof text === 'string'
-    && /\b(rate[ _-]limit(?:_error)?|usage limit reached|insufficient_quota|resource_exhausted|too many requests|(?:HTTP|status)\s+429|you exceeded your current quota|you['’]ve hit your (?:weekly |daily |monthly )?limit)\b/i.test(text);
+  if (typeof text !== 'string') return false;
+  // Strip only provider prefixes at the start; incidental log mentions are not evidence.
+  const message = text.replace(/^(?:(?:API Error|Error):\s*)?(?:\d{3}\s+)?/i, '');
+  // Resource exhaustion needs an explicit quota reason; the token alone also covers memory failures.
+  if (/^(?:rate[ _-]limit(?:_error)?|usage limit reached|insufficient_quota|resource_exhausted:\s*quota exceeded|too many requests|(?:HTTP|status)\s+429|you exceeded your current quota|you['’]ve hit your (?:weekly |daily |monthly |usage )?limit)\b/i.test(message)) return true;
+  if (!message.startsWith('{')) return false;
+  try {
+    const payload = JSON.parse(message);
+    return payload?.type === 'error' && payload.error?.type === 'rate_limit_error';
+  } catch {
+    return false;
+  }
 }
 
 export function quotaHoldRow({ provider, error, now = Date.now() }) {
