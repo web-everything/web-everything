@@ -1955,8 +1955,19 @@ function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, r
   }
 }
 
+function defaultReadCheckOrigin({ repo, head, name, exec = execFileSyncThrottled }) {
+  if (!repo || !head || !name) return null;
+  try {
+    const checks = readCommitCheckRuns(head, { exec, repo, checkName: name });
+    return authoritativeCheckRuns(checks).find((check) => check.name === name)?.details_url ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export function enrichPrsWithTimeoutEvidence(prs, {
   repo, read = readTimeoutEvidence, readBudget = readTimeoutBudget, enabled = process.env.WE_CI_TIMEOUT_RERUN_ENABLED !== '0',
+  readCheckOrigin = defaultReadCheckOrigin,
   infraMode = resolveInfraCancelledMode(repoKeyForSlug(repo)), infraMaxReruns = DEFAULT_INFRA_CANCELLED_MAX_RERUNS,
 } = {}) {
   // GRADUATED 2026-10-04 (PR #3826): the opt-in flag was never set on the edge, so the re-run that does not spend
@@ -1967,7 +1978,16 @@ export function enrichPrsWithTimeoutEvidence(prs, {
       && ['failure', 'timed_out', 'cancelled', 'startup_failure'].includes(String(c.conclusion).toLowerCase()))) return pr;
     const timeoutRetryBudget = readBudget({ repo, pr: pr.number, head: pr.headRefOid });
     if (!(pr.statusCheckRollup ?? []).some((c) => c.detailsUrl?.startsWith(`https://github.com/${repo}/actions/runs/`))) {
-      return { ...pr, timeoutRetryBudget, timeoutRetry: { eligible: false, reason: 'missing-check-origin' } };
+      let detailsUrl;
+      try {
+        detailsUrl = readCheckOrigin({ repo, pr: pr.number, head: pr.headRefOid, name: pr.requiredCheckName });
+      } catch { /* Unreadable origins remain missing evidence. */ }
+      if (typeof detailsUrl !== 'string' || !detailsUrl.startsWith(`https://github.com/${repo}/actions/runs/`)
+          || !pr.requiredCheckName || !pr.statusCheckRollup.some((c) => c.name === pr.requiredCheckName)) {
+        return { ...pr, timeoutRetryBudget, timeoutRetry: { eligible: false, reason: 'missing-check-origin' } };
+      }
+      pr = { ...pr, statusCheckRollup: pr.statusCheckRollup.map((c) => c.name === pr.requiredCheckName
+        ? { ...c, detailsUrl } : c) };
     }
     let timeoutRetry = read(pr, { repo });
     if (timeoutRetry?.infraCancelled) {
