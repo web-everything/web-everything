@@ -173,6 +173,12 @@ export function dropSuspectOverlays({
   root, env, suspects, failed, alert,
 }) {
   for (const s of suspects) {
+    // Legacy fallback records can name a ref without binding their smoke evidence to a registration.
+    // An absent CAS token would make removeOverlay unconditional, so keep the entry for operator review.
+    if (typeof s.registrationId !== 'string' || !s.registrationId) {
+      alert('overlay-registration-changed', { ref: s.ref });
+      continue;
+    }
     try {
       removeOverlay(root, s.ref, { env, why: 'smoke-failed', expectRegistrationId: s.registrationId });
     } catch (error) {
