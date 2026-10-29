@@ -16,6 +16,10 @@ function fixture() {
   dirs.push(dir);
   const bin = join(dir, 'bin');
   mkdirSync(bin);
+  // Fail closed if the scenario ever stops putting its response-barrier fake gh first on PATH.
+  writeFileSync(join(bin, 'gh'), `#!${process.execPath}
+throw new Error('scenario must install its GitHub response barrier');
+`, { mode: 0o755 });
   // The scenario needs an origin slug and UNKNOWN local history, not writable Git state.
   writeFileSync(join(bin, 'git'), `#!${process.execPath}
 const args = process.argv.slice(2);
@@ -27,6 +31,19 @@ process.exit(1);
 `, { mode: 0o755 });
   vi.stubEnv('PATH', `${bin}:${process.env.PATH}`);
   return dir;
+}
+
+function blockingPlanner(dir, workerLock) {
+  const readiness = join(dir, 'scripts', 'readiness');
+  mkdirSync(readiness, { recursive: true });
+  writeFileSync(join(readiness, 'dispatch-plan.mjs'), `
+import { execFileSync } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
+const workerLock = ${JSON.stringify(workerLock)};
+if (workerLock !== undefined) writeFileSync(process.env.WE_DISPATCH_PLAN_ALREADY_DONE_CACHE_FILE + '.refresh-lock', workerLock);
+try { execFileSync('gh', ['api', 'graphql', 'search=' + process.pid], { stdio: 'ignore' }); } catch {}
+console.log(JSON.stringify({ groundTruth: { pending: 444, refresh: { started: false, ids: ['8000', '8001'] } } }));
+`);
 }
 
 describe('large-queue soak oracle', () => {
@@ -48,17 +65,21 @@ if (process.argv[1]?.endsWith('/scripts/readiness/dispatch-plan.mjs')) {
 
   it('rejects a planner that waits for GitHub even when it returns within the runaway ceiling', async () => {
     const dir = fixture();
-    const readiness = join(dir, 'scripts', 'readiness');
-    mkdirSync(readiness, { recursive: true });
-    writeFileSync(join(readiness, 'dispatch-plan.mjs'), `
-import { execFileSync } from 'node:child_process';
-try { execFileSync('gh', ['api', 'graphql', 'search=' + process.pid], { stdio: 'ignore' }); } catch {}
-console.log(JSON.stringify({ groundTruth: { pending: 444, refresh: { started: false, ids: ['8000', '8001'] } } }));
-`);
+    blockingPlanner(dir);
     const report = await b.run({ root: dir });
     expect(report.violations).toContainEqual({
       invariant: 'not-awaited', detail: 'slow worker did not outlive planner',
     });
     expect(report.violations.some(v => v.invariant === 'crash')).toBe(false);
+  }, 30000);
+
+  it.each([
+    ['malformed JSON', '{', /SyntaxError/],
+    ['invalid worker pid', '{"pid":0}', /invalid refresh worker pid/],
+  ])('keeps %s in worker evidence as a crash', async (_name, workerLock, error) => {
+    const dir = fixture();
+    blockingPlanner(dir, workerLock);
+    const report = await b.run({ root: dir });
+    expect(report.violations).toEqual([{ invariant: 'crash', detail: expect.stringMatching(error) }]);
   }, 30000);
 });

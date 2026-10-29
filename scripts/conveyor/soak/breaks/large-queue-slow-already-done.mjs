@@ -18,6 +18,7 @@ export default {
     const violations = [];
     let child;
     let pausedWorker;
+    const isWorkerPid = pid => Number.isInteger(pid) && pid > 1 && pid !== child?.pid && pid !== process.pid;
     try {
       const backlog = join(dir, 'backlog'); const bin = join(dir, 'bin');
       mkdirSync(backlog); mkdirSync(bin);
@@ -52,8 +53,9 @@ const timer = setInterval(()=>{
           '--no-drift-check', '--no-pause-check', '--no-pr-limit-check'], { cwd: dir, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
         planner.stdout.on('data', d => { output += d; }); planner.stderr.on('data', d => { stderr += d; });
         return new Promise((resolve, reject) => {
-          // This bounds a hung process; the response barrier below proves non-blocking behavior.
-          const timer = setTimeout(() => { try { process.kill(-planner.pid, 'SIGKILL'); } catch {} reject(new Error(`planner blocked on slow GitHub: ${stderr}`)); }, 5000);
+          // Allow slow CLI startup on loaded hosts. The response barrier proves non-blocking behavior;
+          // this ceiling only bounds a hung process, matching the request-observation deadline below.
+          const timer = setTimeout(() => { try { process.kill(-planner.pid, 'SIGKILL'); } catch {} reject(new Error(`planner blocked on slow GitHub: ${stderr}`)); }, 10000);
           planner.on('error', e => { clearTimeout(timer); reject(e); });
           planner.on('close', code => {
             clearTimeout(timer);
@@ -73,21 +75,30 @@ const timer = setInterval(()=>{
         if (Date.now() >= requestDeadline) throw new Error('refresh did not reach fake GitHub');
         await delay(25);
       }
-      const { pid } = JSON.parse(readFileSync(`${cache}.refresh-lock`, 'utf8'));
-      // A real request proves the reservation has been handed from planner to detached worker.
-      if (!Number.isInteger(pid) || pid <= 1 || pid === child.pid || pid === process.pid) throw new Error('invalid refresh worker pid');
-      pausedWorker = pid;
-      process.kill(-pausedWorker, 'SIGSTOP');
+      let worker;
+      try { worker = JSON.parse(readFileSync(`${cache}.refresh-lock`, 'utf8')); }
+      catch (e) { if (e.code !== 'ENOENT') throw e; }
+      if (worker === undefined) {
+        // A synchronous planner has no detached-worker lock. Release its request so it can return
+        // within the runaway ceiling, then report the missing worker through not-awaited below.
+        writeFileSync(release, '');
+      } else {
+        // A real request proves the reservation has been handed from planner to detached worker.
+        const { pid } = worker;
+        if (!isWorkerPid(pid)) throw new Error('invalid refresh worker pid');
+        pausedWorker = pid;
+        process.kill(-pausedWorker, 'SIGSTOP');
+      }
       const plan = await first;
       const elapsedMs = Date.now() - started;
       if (plan.groundTruth.pending !== 444) violations.push({ invariant: 'queue-exercised', detail: JSON.stringify(plan.groundTruth) });
       if (plan.groundTruth.refresh.ids.length !== 2) violations.push({ invariant: 'bounded-selection', detail: JSON.stringify(plan.groundTruth) });
-      if (!existsSync(`${cache}.refresh-lock`)) violations.push({ invariant: 'not-awaited', detail: 'slow worker did not outlive planner' });
+      if (worker === undefined || !existsSync(`${cache}.refresh-lock`)) violations.push({ invariant: 'not-awaited', detail: 'slow worker did not outlive planner' });
       // A second tick WHILE the first worker is alive must not add any requests.
       const second = await runPlanner();
       if (second.groundTruth.refresh.started) violations.push({ invariant: 'single-flight', detail: 'overlapping tick started another worker' });
       writeFileSync(release, '');
-      process.kill(-pausedWorker, 'SIGCONT');
+      if (pausedWorker) process.kill(-pausedWorker, 'SIGCONT');
       pausedWorker = null;
       const deadline = Date.now() + 18000;
       while (existsSync(`${cache}.refresh-lock`) && Date.now() < deadline) await delay(50);
@@ -103,7 +114,7 @@ const timer = setInterval(()=>{
       // Reap any background enrichment before deleting its inputs, including on the pre-fix RED path.
       try { process.kill(-child.pid, 'SIGKILL'); } catch {}
       try { if (pausedWorker) process.kill(-pausedWorker, 'SIGKILL'); } catch {}
-      try { const { pid } = JSON.parse(readFileSync(join(dir, 'cache.refresh-lock'), 'utf8')); process.kill(-pid, 'SIGKILL'); } catch {}
+      try { const { pid } = JSON.parse(readFileSync(join(dir, 'cache.refresh-lock'), 'utf8')); if (isWorkerPid(pid)) process.kill(-pid, 'SIGKILL'); } catch {}
       rmSync(dir, { recursive: true, force: true });
     }
   },
