@@ -918,11 +918,118 @@ original_fstat = os.fstat`);
   });
 });
 
+describe('sibling dependency snapshot', () => {
+  // Inject Git's read-only protocol so these cases require no .git writes.
+  function dependencyFixture({dirty, untracked = false, flag, unsafe = false} = {}) {
+    const f = fixture({receipt:(_nonce,value,state) => JSON.stringify({
+      ...value,manifestDigest:state.manifestDigest,siblingManifestDigest:state.siblingManifestDigest,
+    })});
+    f.cwd = join(cwd,'web-everything');
+    const sibling = join(cwd,'frontierui');
+    mkdirSync(f.cwd);
+    for (const name of ['package-lock.json','a.test.mjs']) writeFileSync(join(f.cwd,name),readFileSync(join(cwd,name)));
+    writeFileSync(join(f.cwd,'vitest.shared.ts'),'// sibling aliases\n');
+    f.listFiles.mockResolvedValue(['package-lock.json','a.test.mjs','vitest.shared.ts']);
+    const files = {
+      'package.json':'{"type":"module"}',
+      'plugs/webvalidation/CustomValidityMergeRegistry.js':
+        "export {provider} from '../../validity-merge/provider.js'; export {registry} from '../../validity-merge/registry.js';",
+      'validity-merge/provider.js':"export {provider} from '../shared/provider.js';",
+      'validity-merge/registry.js':'export const registry = "registry";',
+      'shared/provider.js':'export const provider = "provider";',
+      'webtheme/theme.js':"export {theme} from '../theme-shared/theme.js';",
+      'theme-shared/theme.js':'export const theme = "theme";',
+      '.env.local':'secret-marker',
+    };
+    for (const [name,contents] of Object.entries(files)) {
+      mkdirSync(join(sibling,name,'..'),{recursive:true});
+      writeFileSync(join(sibling,name),contents);
+    }
+    if (unsafe) {
+      rmSync(join(sibling,'shared/provider.js'));
+      symlinkSync(join(sibling,'validity-merge/registry.js'),join(sibling,'shared/provider.js'));
+    }
+    const fake = f.exec;
+    f.exec = vi.fn(async call => {
+      if (call.file !== 'git') return fake(call);
+      const [command,...args] = call.args;
+      if (command === 'rev-parse') return {code:0,stdout:Buffer.from(args[0] === 'HEAD' ? 'a'.repeat(40)+'\n' : sibling+'\n')};
+      const separator = args.indexOf('--');
+      const roots = separator < 0 ? [] : args.slice(separator+1);
+      const selected = name => !roots.length || roots.some(root => name === root || name.startsWith(root+'/'));
+      if (command === 'status') return {code:0,stdout:Buffer.from(dirty && selected(dirty) ? `${untracked ? '??' : ' M'} ${dirty}\0` : '')};
+      if (command === 'ls-files') {
+        const names = args.includes('-i') ? [] : Object.keys(files).filter(selected);
+        const records = names.map(name => args.includes('-v') ? `${name === 'shared/provider.js' && flag ? flag : 'H'} ${name}`
+          : args.includes('--stage') ? `100644 ${'a'.repeat(40)} 0\t${name}` : name);
+        return {code:0,stdout:Buffer.from(records.length ? records.join('\0')+'\0' : '')};
+      }
+      throw new Error(`Unexpected Git read: ${command}`);
+    });
+    return {...f,sibling};
+  }
+
+  it('bundles both aliases with direct and transitive dependencies from the transported snapshot', async () => {
+    const f = dependencyFixture();
+    const {build} = await import('esbuild');
+    const bundle = root => build({
+      stdin:{contents:"export * from '@frontierui/plugs/webvalidation/CustomValidityMergeRegistry.js'; export * from '@frontierui/webtheme/theme.js';",resolveDir:f.cwd},
+      alias:{'@frontierui/plugs':join(root,'plugs'),'@frontierui/webtheme':join(root,'webtheme')},
+      bundle:true,write:false,platform:'node',format:'esm',logLevel:'silent',
+    });
+    await bundle(f.sibling);
+    expect(await runRemote(f)).toEqual({mode:'remote',code:0});
+    const calls = callsOf(f.exec);
+    const request = JSON.parse(calls.find(isRun).input);
+    const copy = calls.find(call => call.file === 'rsync' && call.cwd === f.sibling);
+    const snapshot = join(cwd,'snapshot');
+    mkdirSync(snapshot);
+    for (const path of copy.input.toString().split('\0').filter(Boolean)) {
+      const name = path.replace(/^\.\//,'');
+      mkdirSync(join(snapshot,name,'..'),{recursive:true});
+      writeFileSync(join(snapshot,name),readFileSync(join(f.sibling,name)));
+    }
+    await forgeManifestAPI.verifyManifest(snapshot,request.siblingManifest,request.siblingManifestDigest);
+    const result = await bundle(snapshot);
+    expect(result.outputFiles[0].text).toContain('provider');
+    expect(existsSync(join(snapshot,'package.json'))).toBe(true);
+    expect(existsSync(join(snapshot,'.env.local'))).toBe(false);
+    expect(Buffer.from(request.siblingManifest.excluded,'base64').toString()).toBe('.env.local\0');
+  });
+
+  it.each(['validity-merge/provider.js','shared/provider.js','theme-shared/theme.js','package.json']
+    .flatMap(dirty => [{dirty,untracked:false},{dirty,untracked:true}]))
+    ('falls back before transfer for a dirty dependency: %j', async options => {
+      const f = dependencyFixture(options);
+      expect(await runRemote(f)).toEqual({mode:'fallback',reason:'sibling-dirty'});
+      expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+    });
+
+  it.each(['h','S'])('rejects hidden index flags outside alias roots: %s', async flag => {
+    const f = dependencyFixture({flag});
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'sibling-dirty'});
+  });
+
+  it('rejects symlink dependencies outside alias roots before transfer', async () => {
+    const f = dependencyFixture({unsafe:true});
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'sibling-unsafe'});
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+
+  it('falls back before transfer when the whole sibling inventory exceeds its byte bound', async () => {
+    const f = dependencyFixture();
+    const exec = f.exec;
+    f.exec = vi.fn(call => call.file === 'git' && call.args.includes('-co')
+      ? {code:0,stdout:Buffer.from('x'.repeat(4*1024*1024)+'\0')}
+      : exec(call));
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'sibling-unsafe'});
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+});
+
 describe('sibling root snapshot acceptance', () => {
-  it('sends only aliased tracked directories as a second root and certifies its digest', async () => {
+  it('sends the clean sibling repository as a second root and certifies its digest', async () => {
     const f = siblingFixture();
-    // Unrelated sibling changes do not affect the aliased snapshot.
-    writeFileSync(join(f.sibling,'README.md'),'unrelated dirty file');
     expect(await runRemote(f)).toEqual({mode:'remote',code:0});
     const calls = callsOf(f.exec);
     const copies = calls.filter(call => call.file === 'rsync');
@@ -936,12 +1043,12 @@ describe('sibling root snapshot acceptance', () => {
       '-a','-r','--no-links','--safe-links','--no-implied-dirs','--delete',
       '--from0','--files-from=-','--rsync-path=sudo -u forge-exec rsync',
     ]));
-    expect(copies[1].input).toEqual(Buffer.from('./plugs/runtime.js\0./webtheme/theme.js\0'));
+    expect(copies[1].input).toEqual(Buffer.from('./README.md\0./plugs/runtime.js\0./webtheme/theme.js\0'));
     const siblingWire = {
-      paths:Buffer.from('plugs/runtime.js\0webtheme/theme.js\0').toString('base64'),
-      hashes:['plugs/runtime.js','webtheme/theme.js'].map(name =>
+      paths:Buffer.from('README.md\0plugs/runtime.js\0webtheme/theme.js\0').toString('base64'),
+      hashes:['README.md','plugs/runtime.js','webtheme/theme.js'].map(name =>
         createHash('sha256').update(readFileSync(join(f.sibling,name))).digest('hex')),
-      executable:[true,false], excluded:'',
+      executable:[false,true,false], excluded:'',
     };
     expect(request.siblingManifest).toEqual(siblingWire);
     expect(request.siblingManifestDigest).toBe(createHash('sha256').update(JSON.stringify(siblingWire)).digest('hex'));
@@ -950,7 +1057,9 @@ describe('sibling root snapshot acceptance', () => {
     expect(calls.indexOf(copies[1])).toBeLessThan(calls.findIndex(isRun));
     const inventories = calls.filter(call => call.file === 'git' && call.cwd === f.sibling && call.args[0] === 'ls-files');
     expect(inventories).toHaveLength(4);
-    for (const call of inventories) expect(call.args.slice(-3)).toEqual(['--','plugs','webtheme']);
+    for (const call of inventories) expect(call.args).not.toContain('--');
+    expect(calls.find(call => call.file === 'git' && call.args[0] === 'status').args)
+      .toEqual(['status','--porcelain','-z','--untracked-files=all']);
   });
 
   it('records sibling HEAD without including it in the manifest digest', async () => {
@@ -959,10 +1068,9 @@ describe('sibling root snapshot acceptance', () => {
     const firstHead = f.gitAt(f.sibling,['rev-parse','HEAD']);
     const first = await remoteManifestAPI.buildSiblingManifest({cwd:f.cwd,exec:f.exec});
     expect(Object.values(first)).toContain(firstHead);
-    writeFileSync(join(f.sibling,'README.md'),'a new unrelated commit');
-    f.gitAt(f.sibling,['add','README.md']);
+    // A metadata-only commit changes HEAD without changing any snapshot bytes.
     f.gitAt(f.sibling,['-c','user.name=Fixture','-c','user.email=fixture@example.invalid',
-      '-c','commit.gpgsign=false','commit','--quiet','-m','unrelated change']);
+      '-c','commit.gpgsign=false','commit','--quiet','--allow-empty','-m','metadata-only change']);
     const secondHead = f.gitAt(f.sibling,['rev-parse','HEAD']);
     const second = await remoteManifestAPI.buildSiblingManifest({cwd:f.cwd,exec:f.exec});
     expect(secondHead).not.toBe(firstHead);

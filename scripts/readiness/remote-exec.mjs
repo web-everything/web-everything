@@ -8,7 +8,7 @@ import { resolve } from 'node:path';
 import { allowedCommand, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile } from './forge-exec-run.mjs';
 
 const ROOT = '/srv/forge-exec';
-const SIBLING = {dir:'../frontierui', paths:['plugs','webtheme']};
+const SIBLING = {dir:'../frontierui', aliases:['plugs','webtheme']};
 const LIMIT = 4 * 1024 * 1024;
 const SSH_OPTIONS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'];
 const ENV_KEYS = ['CI', 'NODE_ENV', 'TZ', 'LANG', 'LC_ALL', 'FORCE_COLOR', 'NO_COLOR'];
@@ -140,16 +140,19 @@ export async function buildSiblingManifest({cwd = process.cwd(), exec = defaultE
     if (revision.code !== 0 || !/^[a-f0-9]{40,64}$/.test(head)) throw new Error('Sibling HEAD unavailable');
   } catch (error) {throw failure('sibling-not-git',error);}
   try {
-    const status = await git(['status','--porcelain','-z','--untracked-files=all','--',...SIBLING.paths]);
+    // Alias entry points import other sibling directories (including transitive
+    // dependencies and package metadata). Validate and copy the whole checkout;
+    // a directory allowlist cannot describe that runtime dependency closure.
+    const status = await git(['status','--porcelain','-z','--untracked-files=all']);
     if (status.code !== 0 || protocolText(status.stdout,LIMIT).length) throw new Error('Sibling is dirty or status unavailable');
     // Index flags can hide modified bytes from status; only ordinary cached entries are safe.
-    const flags = await git(['ls-files','-v','-z','--',...SIBLING.paths]);
+    const flags = await git(['ls-files','-v','-z']);
     if (flags.code !== 0 || splitPaths(flags.stdout).some(record => record[0] !== 72 || record[1] !== 32 || record.length < 3))
       throw new Error('Sibling index flags are unsafe or unavailable');
   } catch (error) {throw failure('sibling-dirty',error);}
   try {
-    const manifest = await buildManifest({cwd:root,exec,fs,pathspecs:SIBLING.paths});
-    for (const path of SIBLING.paths) {
+    const manifest = await buildManifest({cwd:root,exec,fs});
+    for (const path of SIBLING.aliases) {
       const st = await fs.lstat(Buffer.from(resolve(root,path)));
       if (st.isSymbolicLink() || !st.isDirectory()
         || !manifest.entries.some(entry => entry.path.subarray(0,path.length+1).equals(Buffer.from(path+'/'))))
