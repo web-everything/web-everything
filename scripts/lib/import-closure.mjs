@@ -74,6 +74,10 @@ export function collectImportClosure({
   const jsonNames = new Set();
   let complete = true;
   let bareDeps = false;
+  let packageName;
+  if (strict) {
+    try { packageName = JSON.parse(readFile(resolvePath(absRoot, 'package.json'))).name; } catch { /* no readable package name */ }
+  }
   const stack = [...starts];
   while (stack.length) {
     const file = stack.pop();
@@ -99,6 +103,10 @@ export function collectImportClosure({
             const hit = resolveRelativeSpec(file, spec, existsOnce);
             if (hit && !relative(absRoot, hit).startsWith('..')) info.imports.push(hit);
             else if (strict) info.complete = false;
+          } else if (strict && (spec.startsWith('#')
+            || (typeof packageName === 'string' && packageName.length > 0
+              && (spec === packageName || spec.startsWith(`${packageName}/`))))) {
+            info.complete = false;
           } else if (!spec.startsWith('node:') && /^[@a-z]/i.test(spec) && !/\s/.test(spec)) {
             info.bareDeps = true;
           }

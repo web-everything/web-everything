@@ -12,6 +12,7 @@ import { finalClosureScope, isExcludable } from './closure-scope.mjs';
 import { resolveClosureScopedConflict, resolveOverlayConflict } from './overlay-strategies.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
+import { resolveClosureScopeMode } from './skip-unrelated.mjs';
 
 /**
  * PURE: may the ready candidate `ready` be adopted now, instead of smoking `plan`? Returns
@@ -136,8 +137,14 @@ export function reportDiscardedCandidate({ ready, match, alert, needsYou }) {
  * @param {{git:(args:string[])=>{status:number|null, stdout?:string}, adopt:object, mainTip:string}} o
  */
 export function readyBuildVerified({
-  git, adopt, mainTip, prevHead, approvedEdgeShaFor = () => null, entries = [], env = {},
+  git, adopt, mainTip, prevHead, approvedEdgeShaFor = () => null, entries = [], env = {}, closureScopeMode,
 }) {
+  if ((closureScopeMode ?? resolveClosureScopeMode(env).mode) === 'on') {
+    try {
+      const runtimeEntries = typeof entries === 'function' ? entries() : entries;
+      if (!Array.isArray(runtimeEntries) || !runtimeEntries.length) return false;
+    } catch { return false; }
+  }
   const isAncestor = (a, b) => git(['merge-base', '--is-ancestor', a, b]).status === 0;
   if (!adopt?.finalSha || !adopt.mainSha || !mainTip || !isAncestor(adopt.mainSha, mainTip)) return false;
   // Never a rollback: the record's main must be at or past the main the current head was built on.
@@ -201,6 +208,12 @@ export function dropSuspectOverlays({
   root, env, suspects, failed, alert,
 }) {
   for (const s of suspects) {
+    // Legacy fallback records can name a ref without binding their smoke evidence to a registration.
+    // An absent CAS token would make removeOverlay unconditional, so keep the entry for operator review.
+    if (typeof s.registrationId !== 'string' || !s.registrationId) {
+      alert('overlay-registration-changed', { ref: s.ref });
+      continue;
+    }
     try {
       removeOverlay(root, s.ref, { env, why: 'smoke-failed', expectRegistrationId: s.registrationId });
     } catch (error) {

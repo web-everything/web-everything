@@ -24,6 +24,8 @@ import { runBounded } from '../bounded-child.mjs';
 import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
+import { cloneRuntimeEntries } from '../daemon-clone-entries.mjs';
+import { resolveClosureScopeMode } from './skip-unrelated.mjs';
 
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 
@@ -117,7 +119,7 @@ export function attributeSmokeFailure({ git, files, overlays }) {
       }
       const changed = String(diff.stdout ?? '').split('\n').map((file) => file.trim());
       const matched = [...new Set(changed.filter((file) => wanted.has(file)))].sort();
-      if (matched.length) culprits.push({ ref: ap.ref, pr: ap.pr ?? null, sha: ap.sha, matched });
+      if (matched.length) culprits.push({ ref: ap.ref, pr: ap.pr ?? null, sha: ap.sha, registrationId: ap.registrationId, matched });
     } catch {
       unknown.push(ap.ref);
     }
@@ -333,8 +335,10 @@ async function resolveDispatchSmoke(opt, env) {
  */
 export async function smokeAndAdopt({
   root, env, stEnv, log, run, runSmoke, stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
-  finalLockOpts, finalizeLockOpts = finalLockOpts, dispatchSmoke, readyOnly = false,
+  finalLockOpts, finalizeLockOpts = finalLockOpts, dispatchSmoke, readyOnly = false, entries = [],
 }) {
+  const closureScopeMode = resolveClosureScopeMode(env).mode;
+  const runtimeEntries = () => cloneRuntimeEntries({ root, entries, env });
   /** Every state write here happens UNDER the write lock (PR #2731 review: an unlocked write could clobber a
    *  sibling's locked one). `release` also drops our build lease — done by the outcome that ENDS this build,
    *  never mid-fallback (a sibling must not start a build while B/C are still being smoked). Returns the
@@ -732,6 +736,7 @@ export async function smokeAndAdopt({
       const culpritRefs = new Set(culprits.map((ap) => ap.ref));
       const kept = plan.applied.filter((ap) => !culpritRefs.has(ap.ref));
       const planA2 = await planRebuild({
+        entries: runtimeEntries, env, closureScopeMode,
         git, headSha: prevHead, mainRef: 'origin/main',
         overlays: kept.map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr })),
         edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
@@ -761,7 +766,7 @@ export async function smokeAndAdopt({
           });
           const fin = await finalize(planA2, dropCulprits, {
             kind: 'fallback', forInputsKey: plan.inputsKey,
-            dropRefs: culprits.map(({ ref, pr, sha }) => ({ ref, pr, sha })), failed: failedNames,
+            dropRefs: culprits.map(({ ref, pr, sha, registrationId }) => ({ ref, pr, sha, registrationId })), failed: failedNames,
           }, a2.smokeResult);
           return { ...fin, reason: 'overlay-set-aside', setAside: { from: plan.finalSha, to: planA2.finalSha, dropped: culprits } };
         }
@@ -775,6 +780,7 @@ export async function smokeAndAdopt({
   if (!mainOnly && suspects.length > 0) {
     const pinnedOverlays = withPin.filter((ap) => ap.pinned).map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr }));
     const planB = await planRebuild({
+      entries: runtimeEntries, env, closureScopeMode,
       git, headSha: prevHead, mainRef: 'origin/main', overlays: pinnedOverlays,
       edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
     });
@@ -789,12 +795,14 @@ export async function smokeAndAdopt({
       });
       const failedNames = failedA.map((r) => r.name).join(',');
       const dropSuspects = ({ alert: finAlert }) => dropSuspectOverlays({
-        root, env, suspects: suspectInfo, failed: failedNames, alert: finAlert,
+        root, env, suspects, failed: failedNames, alert: finAlert,
       });
       const fallbackReady = {
         // Each suspect's failing sha rides along, so a later adoption after main moved can tell that the suspect
-        // itself did not (matchReadyCandidate's `fallback-main-moved`).
-        kind: 'fallback', forInputsKey: plan.inputsKey, dropRefs: suspects.map((ap) => ({ ref: ap.ref, pr: ap.pr, sha: ap.sha })), failed: failedNames,
+        // itself did not (matchReadyCandidate's `fallback-main-moved`). Keep the captured registration too:
+        // re-registering the same ref must invalidate its old smoke evidence, even at the same sha.
+        kind: 'fallback', forInputsKey: plan.inputsKey,
+        dropRefs: suspects.map(({ ref, pr, sha, registrationId }) => ({ ref, pr, sha, registrationId })), failed: failedNames,
       };
       // Even the currently adopted head needs a fresh comparison before blaming an overlay.
       // Fail fast on every check A failed: if plain main fails one of them too, the rest of B cannot change the outcome.

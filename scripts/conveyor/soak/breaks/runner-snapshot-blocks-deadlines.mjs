@@ -12,7 +12,7 @@ import { keepAliveScript } from '../../../lib/test-keepalive.mjs';
 export default {
   id: 'runner-snapshot-blocks-deadlines',
   title: 'blocking PR discovery delays unrelated launches and existing timed-pass deadlines',
-  card: '#5755 / PR #6020, send-back x1b8hlo item 1',
+  card: '#5755 / PR #6020, send-back 5726 item 1',
   fixedBy: { sha: 'HEAD', where: 'lane/5755-pass-timed-job', paths: ['skills-src/conveyor/runner.mjs'] },
   fixPresent(root) {
     return readFileSync(join(root, 'skills-src/conveyor/runner.mjs'), 'utf8')
