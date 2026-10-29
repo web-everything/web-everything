@@ -30,7 +30,7 @@
  *
  * Usage:
  *   node scripts/conveyor/health-watch.mjs tick    [--json] [--force-gh] [--no-gh] [--dry-run] [--state-root=DIR]
- *                                                  [--logs-dir=DIR] [--lock-root=DIR] [--self-sync-dir=DIR]
+ *                                                  [--logs-dir=DIR] [--lock-root=DIR] [--self-sync-dir=DIR] [--fix-ready-store=FILE]
  *                                                  [--heavy-run-samples-file=FILE]  # ungated heavy-run history fixture
  *                                                  [--ps-fixture=FILE] [--machine-load-fixture=FILE]  # machine-overload's inputs, real by default
  *                                                  [--no-investigate]  # skip the #4078 investigation pass entirely
@@ -46,6 +46,7 @@ import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { superviseNeedsYouFeed } from './needs-you-feed-job.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { sealDueBatches } from '../operations/card-batch-seal-io.mjs';
+import { reconcileCardBatches, resolveReconcileIntervalMin } from '../operations/card-batch-reconcile.mjs';
 import { readFixLoopRows } from './fix-loop-ledger.mjs';
 import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 import { archiveClaudeJobs, formatClaudeJobsArchiveLine } from './claude-jobs-archive.mjs';
@@ -69,6 +70,7 @@ import { readRecentSamples, appendSample, summarizeSample, findUngatedHeavyRuns 
 import { healthDir, healthSectionLines } from './health-watch-section.mjs';
 import { runDailyReadinessCheck, ledgerReadinessHistoryPath } from '../lib/ledger-readiness-daily.mjs';
 import { runInvestigations } from './health-investigate-dispatch.mjs';
+import { runBundleRepairs } from './bundle-repair-dispatch.mjs';
 import {
   planFileRequests, recordRequested, readLedgerStrict, writeLedger, spliceFilingSection, withLedgerLock,
 } from './health-file-request.mjs';
@@ -82,6 +84,8 @@ import { readVerifyMarker } from '../lib/lane-verify.mjs';
 // #4317 — the same "which paths are DAEMON clones" registry `guard-lane.mjs`/`guard-bash.mjs` already use, so
 // this probe's notion of "a daemon clone" can never drift from the guards'.
 import { daemonCloneRoots } from '../lib/daemon-clone-registry.mjs';
+import { probeFixReady } from './fix-ready-probe.mjs';
+import { kickOverlayMainSync } from '../lib/daemon-rebuild/overlay-main-sync.mjs';
 import { probeDaemonCloneBranches } from '../lib/daemon-clone-branch-probe.mjs';
 import { workspaceOf } from '../lib/automation-home.mjs';
 import { probeBuildSessions, probeExternalRuns } from './build-supervision.mjs';
@@ -1099,6 +1103,16 @@ export function resolveLaneScanTarget(flags, dir, fixtureTick) {
   return { laneScanDir, laneScanWrite: !!laneScanDir };
 }
 
+export function probeOverlayMainSync(flags, roots = () => daemonCloneRoots(workspaceOf(REPO_ROOT)),
+  kick = options => kickOverlayMainSync(options)) {
+  if (flags['logs-dir'] || flags['lock-root'] || flags['state-root'] || flags['dry-run']
+    || Object.keys(flags).some(key => key.endsWith('-fixture'))) return undefined;
+  return roots().map(root => {
+    try { return kick({ root }); }
+    catch (error) { return { root, error: String(error?.message ?? error).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 1000) }; }
+  });
+}
+
 /** One tick: probe, evaluate, diagnose, and persist. Returns the CLI summary. */
 export async function tick(flags = {}, { collectInventory = collectCredentialInventory, tmpSweepRun, ...deps } = {}) {
   const started = Date.now();
@@ -1124,6 +1138,15 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     : null;
 
   if (sweepAllowed && config.tmpSweepEnabled) attempt('reviewTmp', () => sweepReviewTmp({ tmpRoot: flags['tmp-sweep-root'] || tmpdir(), config, now, dryRun: !!flags['dry-run'] }));
+
+  const cardBatchReconcile = !flags['state-root'] && !flags['dry-run']
+    && cadenceDue(prev.cardBatchReconcile?.completedAt, now, resolveReconcileIntervalMin() * 60_000)
+    ? await attempt('cardBatchReconcile', async () => {
+      const results = await reconcileCardBatches({ now });
+      const failures = results.filter(result => result.action === 'error');
+      if (failures.length) throw new Error(failures.map(result => result.reason).join('; '));
+      return { completedAt: now };
+    }) : null;
 
   if (!flags['state-root'] && !flags['dry-run']) await attempt('cardBatchSeal', () => sealDueBatches({ now }));
 
@@ -1180,12 +1203,14 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   probes.leases = flags['lock-root'] ? attempt('leases', leaseScan)
     : (attempt('daemonStatus', () => probeDaemonStatus()) ?? attempt('leases', leaseScan));
   probes.selfSync = attempt('selfSync', () => probeSelfSync(flags['self-sync-dir'] || defaultSelfSyncDir()));
+  probes.fixReady = attempt('fixReady', () => probeFixReady({ storePath: flags['fix-ready-store'] || undefined }));
   probes.cloneLag = (flags['logs-dir'] || flags['lock-root'] || flags['state-root']) ? undefined : attempt('cloneLag', () => probeCloneLag());
   probes.daemonCloneBranches = (flags['logs-dir'] || flags['lock-root'] || flags['state-root']) ? undefined : attempt('daemonCloneBranches', () => probeDaemonCloneBranches({ workspace: workspaceOf(REPO_ROOT) }));
   probes.lanePools = attempt('lanePools', () => probeLanePools(logsDir));
   // #4370 — fs-only, every tick. A fixture tick (any of the fixture-dir flags) reads only an explicit
   // `--lane-pool-root`, never the host's real pool.
   const fixtureTick = flags['logs-dir'] || flags['lock-root'] || flags['state-root'];
+  probes.overlayMainSync = attempt('overlayMainSync', () => probeOverlayMainSync(flags));
   probes.operationRuns = attempt('operationRuns', () => probeOperationRuns(fixtureTick ? { roots: [flags['state-root'] || logsDir], jobsRoot: null } : {}));
   probes.fixLoopLedger = attempt('fixLoopLedger', () => flags['fix-loop-ledger']
     ? readFixLoopRows({ env: { WE_FIX_LOOP_LEDGER: flags['fix-loop-ledger'] } })
@@ -1397,6 +1422,8 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
       }, { now }));
     }
   }
+  if (cardBatchReconcile) state.cardBatchReconcile = cardBatchReconcile;
+  else if (prev.cardBatchReconcile) state.cardBatchReconcile = prev.cardBatchReconcile;
   if (tmpSweep) state.tmpSweep = { at: now, ...(tmpSweep.complete ? { completedAt: now } : {}), ...tmpSweep };
   else if (prev.tmpSweep) state.tmpSweep = prev.tmpSweep;
   state.notifiedSilences = (result.state.silences || []).filter((x) => x.expiredNotified).map(silenceSig);
@@ -1464,6 +1491,16 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
         closedEpisodes: result.transitions.filter((t) => t.type === 'closed').map((t) => t.episode),
       });
     } catch (e) { probeErrors.investigate = scrubText(String(e?.message || e).split('\n')[0]); }
+  }
+
+  // Bundle repair (prototype, 2026-10-21) — a daemon clone held on its last-good build by an overlay conflict gets ONE
+  // supervised repair session (or, in shadow, the brief it would launch). Off unless `bundleRepair.enabled`; its own
+  // failure is a probe error, never a failed tick. A fixture tick never touches it unless a test supplies the seam.
+  let bundleRepair = null;
+  if (!flags['no-bundle-repair'] && (!flags['state-root'] || deps.runBundleRepairs) && Array.isArray(probes.selfSync)) {
+    try {
+      bundleRepair = await (deps.runBundleRepairs ?? runBundleRepairs)({ dir, selfSync: probes.selfSync, now, dryRun: !!flags['dry-run'] });
+    } catch (e) { probeErrors.bundleRepair = scrubText(String(e?.message || e).split('\n')[0]); }
   }
 
   // #4079 — filing requests (slice 5): plan which open episodes get a NEW filing request this tick and append
@@ -1593,7 +1630,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   return scrubDeep({
     now: new Date(now).toISOString(), durationMs, mode: config.mode, stateDir: dir, ghSampled: !!probes.prs, ghJob,
     claudeJobsArchive: claudeJobsArchive ?? null, tmpSweep: tmpSweep ?? null, ghSpend: ghSpend ?? null, probeErrors, transitions: result.transitions.map((t) => ({ type: t.type, key: t.key })),
-    plan: result.plan.map(({ diagnose, ...rest }) => rest), diagnoses, notifications, investigations, reports: written,
+    plan: result.plan.map(({ diagnose, ...rest }) => rest), diagnoses, notifications, investigations, bundleRepair, reports: written,
     section: renderHealthSection(state, { now, reportDir }),
     skipped: result.evaluations.filter((e) => !e.results).map((e) => ({ smell: e.smell.id, missing: e.skipped, error: e.error })),
   });

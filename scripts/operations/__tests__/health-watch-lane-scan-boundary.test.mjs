@@ -147,8 +147,9 @@ describe('health-watch destructive lane action call-site contract', () => {
       'scripts/conveyor/health-watch.mjs:tick:unlinkSync(overrunPath)',
     ];
     const violations = sites => sites.filter(({ site, guarded }) => !ALLOWLIST.includes(site) && !guarded);
-    const sites = scopedScanFiles(['scripts/lib/health-watch-lane-scan.mjs',
-      'scripts/operations/stale-state-io.mjs', 'scripts/conveyor/health-watch.mjs'])
+    // Full inventory on every run: the allowlist spans all three files, so a scoped scan cannot equal it.
+    const sites = ['scripts/lib/health-watch-lane-scan.mjs',
+      'scripts/operations/stale-state-io.mjs', 'scripts/conveyor/health-watch.mjs']
       .flatMap(file => scan(readFileSync(new URL(`../../../${file}`, import.meta.url), 'utf8'), file));
     expect(sites.map(({ site }) => site).sort()).toEqual([...ALLOWLIST].sort());
     expect(violations(sites)).toEqual([]);
@@ -357,6 +358,7 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:../lib/claude-agents-cache.mjs#cachedClaudeAgents:cachedClaudeAgents",
       "helper:../lib/daemon-clone-branch-probe.mjs#probeDaemonCloneBranches:probeDaemonCloneBranches",
       "helper:../lib/daemon-clone-registry.mjs#daemonCloneRoots:daemonCloneRoots",
+      "helper:../lib/daemon-rebuild/overlay-main-sync.mjs#kickOverlayMainSync:kickOverlayMainSync",
       "helper:../lib/gh-throttle.mjs#budgetProbeArgs:budgetProbeArgs",
       "helper:../lib/gh-throttle.mjs#ghThrottleLockRoot:ghThrottleLockRoot",
       "helper:../lib/gh-throttle.mjs#ghThrottleLogPath:ghThrottleLogPath",
@@ -379,6 +381,8 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:../lib/quiet-hours-io.mjs#flushDigest:flushDigest",
       "helper:../lib/quiet-hours-io.mjs#loadQuietSettings:loadQuietSettings",
       "helper:../lib/quiet-hours.mjs#breaksThrough:breaksThrough",
+      "helper:../operations/card-batch-reconcile.mjs#reconcileCardBatches:reconcileCardBatches",
+      "helper:../operations/card-batch-reconcile.mjs#resolveReconcileIntervalMin:resolveReconcileIntervalMin",
       "helper:../operations/card-batch-seal-io.mjs#sealDueBatches:sealDueBatches",
       "helper:../operations/coordination-root.mjs#resolveCoordinationRoot:resolveCoordinationRoot",
       "helper:../operations/live-state-io.mjs#defaultDrainHistoryPath:defaultDrainHistoryPath",
@@ -388,10 +392,12 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:./branch-sync.mjs#notifyDesktopChecked:notifyDesktopChecked",
       "helper:./build-supervision.mjs#probeBuildSessions:probeBuildSessions",
       "helper:./build-supervision.mjs#probeExternalRuns:probeExternalRuns",
+      "helper:./bundle-repair-dispatch.mjs#runBundleRepairs:(deps.runBundleRepairs ?? runBundleRepairs)",
       "helper:./claude-jobs-archive.mjs#archiveClaudeJobs:archiveClaudeJobs",
       "helper:./claude-jobs-archive.mjs#formatClaudeJobsArchiveLine:formatClaudeJobsArchiveLine",
       "helper:./credential-inventory.mjs#normalizeInventory:normalizeInventory",
       "helper:./fix-loop-ledger.mjs#readFixLoopRows:readFixLoopRows",
+      "helper:./fix-ready-probe.mjs#probeFixReady:probeFixReady",
       "helper:./health-file-request.mjs#planFileRequests:planFileRequests",
       "helper:./health-file-request.mjs#readLedgerStrict:readLedgerStrict",
       "helper:./health-file-request.mjs#recordRequested:recordRequested",
@@ -467,10 +473,11 @@ describe('health-watch destructive lane action call-site contract', () => {
   const allowedHelperCounts = {
     "scripts/conveyor/health-watch.mjs": {
       "helper:../backlog-stranded-sweep.mjs#readBacklogCards:readBacklogCards": 1,
-      "helper:../lib/automation-home.mjs#workspaceOf:workspaceOf": 8,
+      "helper:../lib/automation-home.mjs#workspaceOf:workspaceOf": 9,
       "helper:../lib/claude-agents-cache.mjs#cachedClaudeAgents:cachedClaudeAgents": 1,
       "helper:../lib/daemon-clone-branch-probe.mjs#probeDaemonCloneBranches:probeDaemonCloneBranches": 1,
-      "helper:../lib/daemon-clone-registry.mjs#daemonCloneRoots:daemonCloneRoots": 5,
+      "helper:../lib/daemon-clone-registry.mjs#daemonCloneRoots:daemonCloneRoots": 6,
+      "helper:../lib/daemon-rebuild/overlay-main-sync.mjs#kickOverlayMainSync:kickOverlayMainSync": 1,
       "helper:../lib/gh-throttle.mjs#budgetProbeArgs:budgetProbeArgs": 2,
       "helper:../lib/gh-throttle.mjs#ghThrottleLockRoot:ghThrottleLockRoot": 3,
       "helper:../lib/gh-throttle.mjs#ghThrottleLogPath:ghThrottleLogPath": 2,
@@ -493,6 +500,8 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:../lib/quiet-hours-io.mjs#flushDigest:flushDigest": 1,
       "helper:../lib/quiet-hours-io.mjs#loadQuietSettings:loadQuietSettings": 1,
       "helper:../lib/quiet-hours.mjs#breaksThrough:breaksThrough": 1,
+      "helper:../operations/card-batch-reconcile.mjs#reconcileCardBatches:reconcileCardBatches": 1,
+      "helper:../operations/card-batch-reconcile.mjs#resolveReconcileIntervalMin:resolveReconcileIntervalMin": 1,
       "helper:../operations/card-batch-seal-io.mjs#sealDueBatches:sealDueBatches": 1,
       "helper:../operations/coordination-root.mjs#resolveCoordinationRoot:resolveCoordinationRoot": 1,
       "helper:../operations/live-state-io.mjs#defaultDrainHistoryPath:defaultDrainHistoryPath": 1,
@@ -502,9 +511,11 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:./branch-sync.mjs#notifyDesktopChecked:notifyDesktopChecked": 4,
       "helper:./build-supervision.mjs#probeBuildSessions:probeBuildSessions": 1,
       "helper:./build-supervision.mjs#probeExternalRuns:probeExternalRuns": 1,
+      "helper:./bundle-repair-dispatch.mjs#runBundleRepairs:(deps.runBundleRepairs ?? runBundleRepairs)": 1,
       "helper:./claude-jobs-archive.mjs#archiveClaudeJobs:archiveClaudeJobs": 2,
       "helper:./credential-inventory.mjs#normalizeInventory:normalizeInventory": 1,
       "helper:./fix-loop-ledger.mjs#readFixLoopRows:readFixLoopRows": 2,
+      "helper:./fix-ready-probe.mjs#probeFixReady:probeFixReady": 1,
       "helper:./health-file-request.mjs#planFileRequests:planFileRequests": 1,
       "helper:./health-file-request.mjs#readLedgerStrict:readLedgerStrict": 1,
       "helper:./health-file-request.mjs#recordRequested:recordRequested": 1,
@@ -518,7 +529,7 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:./health-watch-core.mjs#emptyHealthState:emptyHealthState": 1,
       "helper:./health-watch-core.mjs#parsePsOutput:parsePsOutput": 2,
       "helper:./health-watch-core.mjs#scrubDeep:scrubDeep": 3,
-      "helper:./health-watch-core.mjs#scrubText:scrubText": 14,
+      "helper:./health-watch-core.mjs#scrubText:scrubText": 15,
       "helper:./health-watch-core.mjs#runHealthTick:runHealthTick": 1,
       "helper:./health-watch-core.mjs#summarizeDiagnosisOutput:summarizeDiagnosisOutput": 1,
       "helper:./health-watch-job.mjs#resolveHealthJobSwitches:resolveHealthJobSwitches": 1,
