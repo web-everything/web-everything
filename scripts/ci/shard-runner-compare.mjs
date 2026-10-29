@@ -26,7 +26,7 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 
-export const SHARD_JOB_RE = /^test-shard \(\d+\)$/;
+export const SHARD_JOB_RE = /^(?:hetzner \/ )?test-shard \(\d+\)$/;
 const FAIL_CONCLUSIONS = new Set(['failure', 'timed_out']);
 const SETTLED_CONCLUSIONS = new Set(['success', ...FAIL_CONCLUSIONS]);
 
