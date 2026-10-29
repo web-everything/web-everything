@@ -1,0 +1,194 @@
+/**
+ * CLI regression for lease churn invalidating the shared acquire scan cache.
+ * Mirrors lane-pool-acquire-shares-scan-cache.test.mjs: local origin, four real
+ * lanes, and a PATH git shim. No implementation exports or remote services.
+ */
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { tmpdir } from 'node:os';
+
+const SCRIPT = resolve('scripts/lane-pool.mjs');
+const REAL_GIT = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+const DEFAULT_GRACE_MS = 8000;
+let base, origin, reference, poolRoot, pool, shim, traceLog;
+
+const git = (args, cwd) => execFileSync(REAL_GIT, args, { cwd, encoding: 'utf8', timeout: 20_000, maxBuffer: 1024 * 1024 });
+const cachePath = () => join(pool, '.list-acquirable-cache.json');
+const readCache = () => JSON.parse(readFileSync(cachePath(), 'utf8'));
+const writeCache = (cache) => writeFileSync(cachePath(), JSON.stringify(cache) + '\n');
+
+function runPool(args, extraEnv = {}) {
+  const r = spawnSync(process.execPath, [SCRIPT, ...args,
+    `--origin=${origin}`, `--reference=${reference}`, '--name=contention-grace',
+    '--branch=main', '--no-install', '--no-reap', '--no-verdict-memo',
+  ], {
+    encoding: 'utf8', timeout: 30_000, maxBuffer: 2 * 1024 * 1024,
+    env: {
+      ...process.env, TMPDIR: base, LANE_POOL_ROOT: poolRoot, LANE_POOL_NO_RECOVER: '1',
+      // Disable the independent per-lane memo so a full scan is observable in git.
+      LANE_POOL_LIST_LANE_CLEAN_REUSE_MS: '0', LANE_POOL_LIST_CACHE_TTL_MS: '30000',
+      LANE_POOL_LIST_CONTENTION_GRACE_MS: '',
+      PATH: `${shim}:${process.env.PATH}`, GIT_TRACE_LOG: traceLog,
+      LANE_POOL_TEST_REAL_GIT: REAL_GIT,
+      ...extraEnv,
+    },
+  });
+  expect(r.error, `CLI failed to execute: ${r.stderr}`).toBeUndefined();
+  expect(r.status, r.stderr).toBe(0);
+  return args[0] === 'provision' ? null : JSON.parse(r.stdout);
+}
+
+const list = () => runPool(['list', '--acquirable', '--json']);
+const acquire = (session, extraEnv = {}) => runPool([
+  'acquire', `--session=${session}`, '--no-free-list', '--wait-ms=20000', '--json',
+], { CLAUDE_CODE_SESSION_ID: session, ...extraEnv });
+
+function scanProbes() {
+  if (!existsSync(traceLog)) return [];
+  // Acquires choose lanes 1 and 2. Git in untouched lanes 3 and 4 can only be
+  // shared-scan work, never the mandatory verification/reset of a winning lane.
+  const untouched = [3, 4].map((n) => realpathSync(join(pool, `lane-${n}`)));
+  return readFileSync(traceLog, 'utf8').split('\n').filter(Boolean).filter((line) => {
+    const [cwd, , args] = line.split('\t');
+    return untouched.includes(cwd) && /^(status|rev-list|cherry|diff-tree|patch-id)( |$)/.test(args);
+  });
+}
+
+function seedClaimedPool() {
+  runPool(['provision', '--count=4', '--json']);
+  expect(list().map((p) => Number(p.match(/lane-(\d+)$/)[1]))).toEqual([1, 2, 3, 4]);
+  expect(scanProbes().length, 'warm list must really probe the untouched lanes').toBeGreaterThan(0);
+  const cached = readCache();
+  const first = acquire('first-holder');
+  expect(first.lane).toBe(1);
+  // The first claim leaves the pre-claim list in place but changes lease state.
+  expect(readCache()).toEqual(cached);
+  expect(Date.now() - cached.writtenAt, 'fixture must still be inside the default grace').toBeLessThan(DEFAULT_GRACE_MS);
+  return first;
+}
+
+function expectSecondLane(first, extraEnv = {}, { rescans = false } = {}) {
+  const before = scanProbes().length;
+  const second = acquire('second-holder', extraEnv);
+  expect(second.lane).toBe(2);
+  expect(second.lane).not.toBe(first.lane);
+  const after = scanProbes().length;
+  if (rescans) expect(after, 'ineligible cache must trigger full-scan probes').toBeGreaterThan(before);
+  else expect(after - before, 'second acquire must issue ZERO new full-scan probe git calls').toBe(0);
+}
+
+beforeEach(() => {
+  base = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'lane-pool-contention-grace-'));
+  origin = join(base, 'origin.git');
+  reference = join(base, 'reference');
+  poolRoot = join(base, 'pool');
+  pool = join(poolRoot, 'contention-grace');
+  shim = join(base, 'shim');
+  traceLog = join(base, 'git-trace.log');
+  mkdirSync(shim);
+  git(['init', '--quiet', '--initial-branch=main', reference]);
+  writeFileSync(join(reference, 'file.txt'), 'v1\n');
+  git(['add', 'file.txt'], reference);
+  git(['-c', 'user.email=t@t.com', '-c', 'user.name=t', 'commit', '--quiet', '-m', 'v1'], reference);
+  git(['clone', '--quiet', '--bare', reference, origin]);
+  git(['remote', 'add', 'origin', origin], reference);
+  writeFileSync(join(shim, 'git'), `#!/bin/sh
+printf '%s\\t%s\\t%s\\n' "$(pwd -P)" "\${GIT_OPTIONAL_LOCKS:-}" "$*" >> "$GIT_TRACE_LOG"
+exec "$LANE_POOL_TEST_REAL_GIT" "$@"
+`);
+  chmodSync(join(shim, 'git'), 0o755);
+  // The CLI may best-effort query PR state; keep that path entirely local.
+  writeFileSync(join(shim, 'gh'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+}, 30_000);
+
+afterEach(() => {
+  rmSync(base, { recursive: true, force: true });
+});
+
+describe('acquire shared-list contention grace', () => {
+  it('reuses a matching cache younger than the default 8000ms grace despite a lease fingerprint change', () => {
+    expectSecondLane(seedClaimedPool());
+  }, 30_000);
+
+  it('re-checks contention grace under the scan lock after the initial cache read misses', () => {
+    const first = seedClaimedPool();
+    // Deterministically model a cache becoming visible between the first read
+    // and lock acquisition. All later reads, including the one under the lock,
+    // see the real pre-claim cache. The preload changes no production files.
+    const preload = join(base, 'initial-cache-miss.test.mjs');
+    const evidence = join(base, 'cache-read-evidence.jsonl');
+    writeFileSync(preload, `import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+const read = fs.readFileSync;
+let reads = 0;
+fs.readFileSync = function(path, ...args) {
+  if (String(path) === process.env.LANE_POOL_TEST_CACHE) {
+    reads++;
+    fs.appendFileSync(process.env.LANE_POOL_TEST_READ_EVIDENCE, JSON.stringify({ reads, locked: fs.existsSync(process.env.LANE_POOL_TEST_LOCK) }) + '\\n');
+    if (reads === 1) throw Object.assign(new Error('simulated initial cache miss'), { code: 'ENOENT' });
+  }
+  return read.call(this, path, ...args);
+};
+syncBuiltinESMExports();
+`);
+    const before = scanProbes().length;
+    const second = acquire('second-holder', {
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --import=${pathToFileURL(preload).href}`,
+      LANE_POOL_TEST_CACHE: cachePath(), LANE_POOL_TEST_LOCK: join(pool, '.list-acquirable.lock'),
+      LANE_POOL_TEST_READ_EVIDENCE: evidence,
+    });
+    expect(second.lane).toBe(2);
+    expect(second.lane).not.toBe(first.lane);
+    const reads = readFileSync(evidence, 'utf8').trim().split('\n').map(JSON.parse);
+    expect(reads.slice(0, 2)).toEqual([{ reads: 1, locked: false }, { reads: 2, locked: true }]);
+    expect(scanProbes().length - before, 'under-lock re-check must issue ZERO new full-scan probe git calls').toBe(0);
+  }, 30_000);
+
+  it('refuses a stale-listed lane with a live foreign lease and acquires another without overwriting the lease', () => {
+    const first = seedClaimedPool();
+    // Force the candidate snapshot to include the now-leased lane even on the
+    // old implementation, isolating tryClaimLane safety from grace acceptance.
+    const cached = readCache();
+    list();
+    const current = readCache();
+    writeCache({ ...cached, fingerprint: current.fingerprint, writtenAt: Date.now() });
+    const marker = join(pool, 'lane-1', '.git', '.lane-lease');
+    const leaseBefore = readFileSync(marker, 'utf8');
+    expectSecondLane(first);
+    expect(readFileSync(marker, 'utf8')).toBe(leaseBefore);
+  }, 30_000);
+
+  it('list --acquirable still rescans on a fingerprint mismatch inside the grace', () => {
+    seedClaimedPool();
+    const before = scanProbes().length;
+    expect(list().map((p) => Number(p.match(/lane-(\d+)$/)[1]))).toEqual([2, 3, 4]);
+    expect(scanProbes().length).toBeGreaterThan(before);
+  }, 30_000);
+
+  it('rescans a cache older than the default grace even though its normal TTL has not expired', () => {
+    const first = seedClaimedPool();
+    writeCache({ ...readCache(), writtenAt: Date.now() - DEFAULT_GRACE_MS - 1000 });
+    expectSecondLane(first, {}, { rescans: true });
+  }, 30_000);
+
+  it('honours LANE_POOL_LIST_CONTENTION_GRACE_MS when it extends the grace', () => {
+    const first = seedClaimedPool();
+    writeCache({ ...readCache(), writtenAt: Date.now() - 9000 });
+    expectSecondLane(first, { LANE_POOL_LIST_CONTENTION_GRACE_MS: '20000' });
+  }, 30_000);
+
+  it('honours LANE_POOL_LIST_CONTENTION_GRACE_MS when it shortens the grace', () => {
+    const first = seedClaimedPool();
+    writeCache({ ...readCache(), writtenAt: Date.now() - 2000 });
+    expectSecondLane(first, { LANE_POOL_LIST_CONTENTION_GRACE_MS: '1000' }, { rescans: true });
+  }, 30_000);
+
+  it('fails closed on a cache key mismatch even inside the contention grace', () => {
+    const first = seedClaimedPool();
+    writeCache({ ...readCache(), key: 'different-branch|ttl=1|reap=1' });
+    expectSecondLane(first, {}, { rescans: true });
+  }, 30_000);
+});
