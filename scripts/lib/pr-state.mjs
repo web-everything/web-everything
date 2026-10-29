@@ -11,7 +11,7 @@
  * No callers are switched by this slice.
  */
 import { derivePrState as derivePrPhase } from './pr-state-core.mjs';
-import { EVENT_TYPES, foldVerdictLedger, verdictLabel, validateLedgerEvent, ledgerEventId } from './verdict-ledger.mjs';
+import { EVENT_TYPES, VERDICTS, verdictClears, foldVerdictLedger, verdictLabel, validateLedgerEvent, ledgerEventId } from './verdict-ledger.mjs';
 import { deriveReferrals, openReferralKeys } from './pr-state/referrals.mjs';
 import { evaluateHolds } from './pr-state/holds/index.mjs';
 import { approvalLiftsAfter } from './pr-state/holds/verdict.mjs';
@@ -50,17 +50,30 @@ function scopedEvents(events, scope) {
 export function ledgerView(events, facts) {
   const scope = scopeOf(facts);
   const mine = scope ? scopedEvents(events, scope) : [];
-  const folded = scope ? foldVerdictLedger(mine.filter(isVerdictRow)).get(scope.pr) ?? null : null;
+  const verdicts = mine.filter(isVerdictRow);
+  // A clear-human audit verdict cannot replace a human hold: its companion approval must pass the
+  // same validity and binding checks as an approval without that verdict. Keep the original hold id,
+  // including across bounces, rearms, partial writes and retries. Only an independent clearing verdict
+  // supersedes the human hold; changes/pending/observed cannot erase its approval requirement.
+  const lastHumanBoundary = verdicts.findLast(e => e.verdict === VERDICTS.HUMAN
+    || (e.verdict !== VERDICTS.CLEAR_HUMAN && verdictClears(e.verdict)));
+  let humanHold = lastHumanBoundary?.verdict === VERDICTS.HUMAN ? lastHumanBoundary : null;
+  const folded = scope ? foldVerdictLedger(verdicts).get(scope.pr) ?? null : null;
   const cur = folded?.current ?? null;
   let clears = !!folded?.clears;
   // A human hold is lifted by a LATER valid approval (unexpired delegation, provable clock); an unknown position never lifts.
-  if (cur && !clears && cur.verdict === 'human' && approvalLiftsAfter(mine, mine.indexOf(cur), facts?.now, facts?.head?.sha, ledgerEventId(cur))) clears = true;
+  if (humanHold) {
+    const lifted = approvalLiftsAfter(mine, mine.indexOf(humanHold), facts?.now, facts?.head?.sha, ledgerEventId(humanHold));
+    // Approval can lift the human hold, but cannot itself clear a later changes/pending verdict.
+    clears = lifted && (clears || cur?.verdict === VERDICTS.HUMAN);
+    if (lifted) humanHold = null;
+  }
   const lastExempt = mine.filter(e => e.type === EVENT_TYPES.REVIEW_EXEMPT).at(-1);
   const fullSha = value => typeof value === 'string' && /^[0-9a-f]{40}$/i.test(value);
   const reviewExempt = !cur && fullSha(lastExempt?.headSha) && fullSha(facts?.head?.sha)
     && lastExempt.headSha.toLowerCase() === facts.head.sha.toLowerCase();
   clears = clears || reviewExempt;
-  return { events: mine, folded, clears, reviewExempt, referrals: deriveReferrals(mine) };
+  return { events: mine, folded, clears, humanHold, reviewExempt, referrals: deriveReferrals(mine) };
 }
 
 /** Map a core phase plus the hold picture to a lifecycle state. The core's phase is kept except for two restrictions. */
@@ -103,14 +116,15 @@ function derive(events, facts, settings) {
   const holds = evaluateHolds({ view, facts, settings }, settings.holdRules);
   const cur = view.folded?.current ?? null;
   const covered = view.clears && !!cur && !holds.some(h => h.code === 'stale-acceptance');
-  const labels = covered ? ['review:accepted'] : cur && !view.clears ? [verdictLabel(cur.verdict)].filter(Boolean) : [];
+  const heldVerdict = view.humanHold ?? cur;
+  const labels = covered ? ['review:accepted'] : heldVerdict && !view.clears ? [verdictLabel(heldVerdict.verdict)].filter(Boolean) : [];
   const open = openReferralKeys(view.referrals);
   const capHold = holds.find(h => h.code === 'same-head-cap' && h.needsYou);
   const coreFacts = { ...facts, labels,
     referrals: { pending: open, ruled: [...view.referrals.values()].filter(k => k.state !== 'open').length },
     roundCapNote: !!capHold || !!facts.roundCapNote };
   const phase = derivePrPhase(coreFacts, settings);
-  const humanGate = (cur?.verdict === 'human' && !view.clears) || holds.some(h => h.code === 'label-input:review:human');
+  const humanGate = (heldVerdict?.verdict === 'human' && !view.clears) || holds.some(h => h.code === 'label-input:review:human');
   const lifecycleState = lifecycleOf(phase, { holds, humanGate, facts });
   const clears = view.clears && holds.length === 0;
   return finish({ lifecycleState, verdict: cur?.verdict ?? null, clears, reviewExempt: view.reviewExempt && clears, holds, phase });
