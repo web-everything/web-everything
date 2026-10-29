@@ -138,6 +138,37 @@ describe('telemetry quota overlay', () => {
   });
 
   it.each([
+    ['repo', false],
+    ['repo', true],
+    ['another-owner/repo', false],
+    ['another-owner/repo', true],
+  ])('does not mark mixed failures for matching basename %s (non-quota first: %s)', (spanRepo, nonQuotaFirst) => {
+    const row = textlessRow();
+    const quota = quotaSpan();
+    const nonQuota = quotaSpan({ spanId: 'c'.repeat(16), statusMessage: 'schema invalid',
+      attributes: { pr: row.pr, repo: spanRepo },
+      startedAt: iso(at - 500), endedAt: iso(at + 500) });
+    const spans = nonQuotaFirst ? [nonQuota, quota] : [quota, nonQuota];
+
+    expect(row).toMatchObject({ incomplete: true, quotaOnly: false });
+    expect(markQuotaOnlyFromSpans([row], [quota])[0].quotaOnly).toBe(true);
+    expect(markQuotaOnlyFromSpans([row], spans)).toEqual([row]);
+  });
+
+  it.each(['example/other', 'another-owner/other'])('never matches quota telemetry with a different basename: %s', spanRepo => {
+    const row = textlessRow();
+    const span = quotaSpan({ attributes: { pr: row.pr, repo: spanRepo } });
+    expect(markQuotaOnlyFromSpans([row], [span])).toEqual([row]);
+  });
+
+  it.each(['example/other', 'another-owner/other'])('does not mix in non-quota telemetry with a different basename: %s', spanRepo => {
+    const row = textlessRow();
+    const unrelated = quotaSpan({ spanId: 'c'.repeat(16), statusMessage: 'schema invalid',
+      attributes: { pr: row.pr, repo: spanRepo } });
+    expect(markQuotaOnlyFromSpans([row], [quotaSpan(), unrelated])).toEqual([{ ...row, quotaOnly: true }]);
+  });
+
+  it.each([
     ['completed row', { incomplete: false, completedAt: at + 500 }, {}],
     ['another PR', { pr: 8 }, {}],
     ['another repo basename', { repo: 'example/other' }, {}],
