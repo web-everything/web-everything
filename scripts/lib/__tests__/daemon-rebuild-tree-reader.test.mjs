@@ -1,6 +1,6 @@
-import { afterEach, expect, it } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { afterEach, expect, it, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join, relative } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { treeReader, collectRunClosure } from '../daemon-rebuild/skip-unrelated.mjs';
@@ -38,6 +38,33 @@ it('reads a commit with NUL filenames and byte-framed UTF-8 blobs, without readi
     .toEqual(new Set(['entry.mjs', 'space name.mjs']));
   expect(collectRunClosure({ root: r.root, entries: ['entry.mjs'], reader: r }).files)
     .toEqual(new Set(['entry.mjs', 'space name.mjs', 'child.mjs']));
+});
+
+it('resolves bare spawned basenames from the snapshot, excluding checkout-only decoys', () => {
+  const f = fixture();
+  mkdirSync(join(dir, 'snapshot'));
+  writeFileSync(join(dir, 'entry.mjs'), "spawn('node', ['worker.mjs']);\nspawn('node', ['decoy.mjs']);");
+  writeFileSync(join(dir, 'snapshot/worker.mjs'), 'export {};');
+  const sha = f.commit();
+  rmSync(join(dir, 'snapshot'), { recursive: true });
+  mkdirSync(join(dir, 'checkout'));
+  writeFileSync(join(dir, 'checkout/worker.mjs'), 'export {};');
+  writeFileSync(join(dir, 'checkout/decoy.mjs'), 'export {};');
+  f.commit();
+  const snapshot = treeReader(f.git, sha);
+  // Anchor the reader at the checkout so an accidental tracked-index fallback sees
+  // the decoys; all source reads still come from the original snapshot.
+  const reader = { ...snapshot, root: dir, byName: vi.fn(snapshot.byName),
+    readFile: path => snapshot.readFile(relative(dir, path)),
+    exists: path => snapshot.exists(relative(dir, path)),
+  };
+  const closure = collectRunClosure({ root: dir, entries: ['entry.mjs'], reader });
+  expect(reader.byName).toHaveBeenCalledWith('worker.mjs');
+  expect(reader.byName).toHaveBeenCalledWith('decoy.mjs');
+  expect(closure.files).toEqual(new Set(['entry.mjs', 'snapshot/worker.mjs']));
+  expect(closure.files.has('checkout/worker.mjs')).toBe(false);
+  expect(closure.files.has('checkout/decoy.mjs')).toBe(false);
+  expect(closure.complete).toBe(true);
 });
 
 it('fails closed on git read errors and truncated batch output', () => {

@@ -100,6 +100,8 @@ export function fixpointExtend({ scope, excluded, finalClosure }) {
 /** Pre-smoke and persisted-candidate evidence, read from the final Git tree rather than the checkout. */
 export function finalClosureScope({ git, sha, entries = [], env = {} }) {
   try {
-    return computeClosureScope({ git, mainSha: sha, entries: typeof entries === 'function' ? entries() : entries, env });
+    entries = typeof entries === 'function' ? entries() : entries;
+    if (!Array.isArray(entries) || !entries.length) return { ok: false, reason: 'entries-unreadable' };
+    return computeClosureScope({ git, mainSha: sha, entries, env });
   } catch { return { ok: false, reason: 'entries-unreadable' }; }
 }

@@ -8,6 +8,8 @@ to `forks` with `singleFork: true`; `vitest-worker-cap.test.mjs` checks that rou
 Run them with `npm run test:integration:vitest -- scripts/lib/__tests__/daemon-rebuild-fallback.test.mjs`
 (or the established-overlay path). CI's required `test` check depends on integration success;
 the assertions and deadlines remain unchanged.
+The integration-only fallback suite has no `unit` entry in `scripts/ci/test-timings.json`;
+`shard-assign.test.mjs` checks all committed unit timing keys against discovered unit tests.
 
 ## Closure-scope foundations
 
@@ -40,7 +42,11 @@ selects discovery against the supplied root in hermetic boot fixtures. With daem
 in the boot tree, an unreadable live clone or plist fails smoke before spawning children; checking
 the live root's entries instead could silently bypass discovery for a bad live-root path. Scope
 discovery likewise retains the conflict on unreadable evidence. Final closure checks run before smoke and
-again when reconstructing persisted scoped candidates.
+again when reconstructing persisted scoped candidates. Saved scoped candidates require nonempty runtime
+entries even after switching to `off` or `shadow`; adoption evaluates a lazy entry provider once and uses
+that same evidence throughout verification. Final-scope checks also reject empty provider results during
+planning. The tree-reader basename regression uses snapshot workers and checkout-only decoys to pin the
+reader's own basename index.
 
 Markdown and JSON are always retained by closure scoping, including under tests and backlog directories:
 an exported tick can read runtime data after boot with a computed filename, so absence from an import
