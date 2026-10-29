@@ -1,4 +1,4 @@
-/** Daily pool maintenance, called by the existing health-watch tick.
+/** Daily lease-guarded pool trim, called by the existing health-watch tick.
  * Stamp attempts before subprocesses so failures/restarts cannot cause a tight retry loop.
  * Unknown state refuses maintenance; repair the named stamp before retrying.
  */
@@ -55,8 +55,8 @@ export function scheduledLaneMaintenance({
         trim = JSON.parse(String(exec(process.execPath, args, options)));
         if (!Array.isArray(trim?.removed) || !trim.removed.every(Number.isSafeInteger)) throw Error('invalid trim report');
       } catch (error) { trim = null; errors.push(`trim: ${safeMessage(error)}`); }
-      try { exec(process.execPath, [...cli, 'gc', ...selector], options); }
-      catch (error) { errors.push(`gc: ${safeMessage(error)}`); }
+      // Schedule only trim, which holds lane claims. GC's host lock does not exclude
+      // concurrent lane acquisition, and no shared filesystem claim primitive is exposed.
       const bytesAfter = measure();
       const detail = { poolDir, lanesTrimmed: trim?.removed ?? null, bytesBefore, bytesAfter,
         bytesFreed: bytesBefore === null || bytesAfter === null ? null : Math.max(0, bytesBefore - bytesAfter), errors };

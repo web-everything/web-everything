@@ -24,11 +24,11 @@ beforeEach(() => {
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 describe('scheduled lane maintenance', () => {
-  it('runs trim then gc as bounded CLI children, never force, and emits measured bytes and lanes trimmed', () => {
+  it('runs only lease-guarded trim as a bounded CLI child, never force, and emits measured bytes and lanes trimmed', () => {
     exec.mockImplementation((cmd, args) => cmd === 'du' ? `${exec.mock.calls.length === 1 ? 20 : 10}\tpool\n` : args[1] === 'trim' ? '{"removed":[3]}' : '');
     const result = scheduledLaneMaintenance(opts);
     expect(result.trim.removed).toEqual([3]);
-    expect(exec.mock.calls.map(([cmd, args]) => cmd === 'du' ? cmd : args[1])).toEqual(['du', 'trim', 'gc', 'du']);
+    expect(exec.mock.calls.map(([cmd, args]) => cmd === 'du' ? cmd : args[1])).toEqual(['du', 'trim', 'du']);
     for (const [, args, options] of exec.mock.calls) {
       expect(args).not.toContain('--force');
       expect(options.timeout).toBeGreaterThan(0);
@@ -70,14 +70,33 @@ describe('scheduled lane maintenance', () => {
     expect(exec).toHaveBeenCalled();
   });
 
-  it('contains child and measurement failures, tries gc after failed trim, stamps failed attempts', () => {
+  it('contains child and measurement failures, skips gc after failed trim, stamps failed attempts', () => {
     exec.mockImplementation(() => { throw Error('failed'); });
     expect(() => scheduledLaneMaintenance(opts)).not.toThrow();
-    expect(exec.mock.calls.some(([, args]) => args[1] === 'gc')).toBe(true);
+    expect(exec.mock.calls.map(([cmd, args]) => cmd === 'du' ? cmd : args[1])).toEqual(['du', 'trim', 'du']);
     expect(emitEvent).toHaveBeenCalledWith(expect.objectContaining({ detail: expect.objectContaining({ bytesFreed: null, lanesTrimmed: null }) }));
     exec.mockClear();
     scheduledLaneMaintenance(opts);
     expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('skips scheduled gc when a concurrent process leases a lane after trim', () => {
+    const lane = join(poolDir, 'lane-1');
+    mkdirSync(join(lane, '.git'), { recursive: true });
+    const marker = join(lane, '.git', '.lane-lease');
+    const lease = JSON.stringify({ session: 'concurrent-holder', acquiredAt: new Date().toISOString() });
+    exec.mockImplementation((cmd, args) => {
+      if (cmd === 'du') return '10\tpool\n';
+      if (args[1] === 'trim') {
+        writeFileSync(marker, lease, { flag: 'wx' });
+        return '{"removed":[]}';
+      }
+      return '';
+    });
+    const result = scheduledLaneMaintenance(opts);
+    expect(result.trim.removed).toEqual([]);
+    expect(exec.mock.calls.filter(([cmd]) => cmd === process.execPath).map(([, args]) => args[1])).toEqual(['trim']);
+    expect(readFileSync(marker, 'utf8')).toBe(lease);
   });
 
   it('refuses unreadable policy or a busy maintenance lock without launching children', () => {
