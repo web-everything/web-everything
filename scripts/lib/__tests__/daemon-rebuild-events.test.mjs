@@ -70,6 +70,20 @@ describe('rebuildClone coordination events', () => {
     expectEvent('rebuild-adopted', { sha });
   });
 
+  it('reports closure-scope provenance in rebuild-adopted', async () => {
+    const result = { moved: true, adopted: true, head: sha,
+      plan: { applied: [{ ref: 'lane/a', resolvedVia: 'closure-scope', excluded: ['unused.mjs'] }] } };
+    smokeAndAdopt.mockResolvedValue(result);
+    await rebuildClone(options);
+    expectEvent('rebuild-adopted', { sha, resolvedVia: 'closure-scope' });
+  });
+
+  it('passes the caller entries through to preparation', async () => {
+    terminal({ moved: false, reason: 'up-to-date' });
+    await rebuildClone({ ...options, entries: ['scripts/caller.mjs'] });
+    expect(prepareRebuild).toHaveBeenCalledWith(expect.objectContaining({ entries: ['scripts/caller.mjs'] }));
+  });
+
   it('also emits once for a ready candidate adopted during prepare', async () => {
     const result = { moved: true, adopted: true, reason: 'ready-adopted', head: sha };
     terminal(result);
@@ -79,6 +93,7 @@ describe('rebuildClone coordination events', () => {
   });
 
   it.each(['quarantined', 'established-overlay-conflict', 'still-rejected',
+    'overlay-source-unavailable', 'overlay-source-unverifiable',
     'error: build unavailable', 'established-overlay-conflict: lane/example'])(
     'emits rebuild-failed once for a prepare refusal: %s', async (reason) => {
       terminal({ moved: false, reason });
@@ -250,7 +265,8 @@ describe('rebuildClone coordination events', () => {
       'smoke-env-load', 'smoke-harness-broken-backoff', 'smoke-load-confirm-passed', 'stack-base-moved',
       'stack-contained', 'state-file-busy', 'superseded-live-set-unknown', 'superseded-omits-live-overlay',
       'swapped', 'switch-busy', 'touches-dispatch-path', 'unknown', 'unsafe-ref', 'untracked-collision',
-      'unverified-build', 'up-to-date',
+      'unverified-build', 'up-to-date', 'scoped-noop', 'fixpoint-exhausted',
+      'entries-unreadable', 'closure-incomplete', 'closure-too-large', 'scope-unreadable',
     ]);
     const reasons = new Set();
     function collect(expression) {

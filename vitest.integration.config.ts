@@ -69,6 +69,7 @@ export default defineConfig({
       'scripts/__tests__/rust-scan-citation-check-parity.test.mjs',
       'scripts/__tests__/gate-entrypoint-integration.test.mjs',
       'scripts/lib/__tests__/daemon-rebuild-keep-established.test.mjs',
+      'scripts/lib/__tests__/daemon-rebuild-fallback.test.mjs',
       'scripts/operations/__tests__/wake-cli.test.mjs',
       'scripts/__tests__/lane-pool-acquire-base.test.mjs',
       'scripts/__tests__/publish-secret-gate.test.mjs',
@@ -161,6 +162,8 @@ export default defineConfig({
       // Multiple real-git rebuilds per test exceeded 5s in the unit shard. Queue with the daemon scenarios;
       // retain the fixture's full behavior checks and its existing deadline.
       ['scripts/lib/__tests__/daemon-rebuild-keep-established.test.mjs', 'forks'],
+      // Candidate, backoff and retry rebuilds share the same real-git contention risk.
+      ['scripts/lib/__tests__/daemon-rebuild-fallback.test.mjs', 'forks'],
       ['scripts/operations/__tests__/wake-cli.test.mjs', 'forks'],
       ['scripts/operations/__tests__/dispatch-spawn-live.test.mjs', 'forks'],
       // Rust parity tests compile the scanner and scan the real repository. A separate threads pool
