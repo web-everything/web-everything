@@ -2,6 +2,7 @@
 // Installed root:root 0755. No executable source or configuration comes from the task.
 import {spawn} from 'node:child_process';
 import {constants} from 'node:fs';
+import * as filesystem from 'node:fs/promises';
 import {open, mkdir, readdir, writeFile, rename, rm, rmdir, lstat, realpath} from 'node:fs/promises';
 import {createHash, randomBytes} from 'node:crypto';
 import {join, relative} from 'node:path';
@@ -12,10 +13,25 @@ const runName = value => typeof value === 'string' && /^r-[a-f0-9]{32}$/.test(va
 const nonceOK = value => typeof value === 'string' && /^[a-f0-9]{32}$/.test(value);
 const sha = value => createHash('sha256').update(value).digest('hex');
 export const digestArgv = argv => sha(JSON.stringify(argv));
+// Shared by the client and fixed wrapper through allowedCommand. Match spellings exactly.
+export const VITEST_ALLOWED_OPTIONS = Object.freeze([
+  '--run', '--silent', '--no-color',
+  '--reporter=default', '--reporter=dot', '--reporter=verbose', '--reporter=basic', '--reporter=tap',
+  '-t', '--testNamePattern=',
+]);
 export function allowedCommand(argv) {
-  return Array.isArray(argv) && argv.length >= 3 && argv.every(a => typeof a === 'string' && !a.includes('\0'))
+  if (!(Array.isArray(argv) && argv.length >= 3 && argv.every(a => typeof a === 'string' && !a.includes('\0'))
     && argv[0] === 'npm' && argv[1] === 'run' && argv[2] === 'test:unit'
-    && (argv.length === 3 || argv[3] === '--');
+    && (argv.length === 3 || argv[3] === '--'))) return false;
+  for (let i = 4; i < argv.length; i++) {
+    const arg = argv[i];
+    if (!arg.startsWith('-')) continue;
+    const option = arg.startsWith('--testNamePattern=') ? '--testNamePattern=' : arg;
+    if (!VITEST_ALLOWED_OPTIONS.includes(option)) return false;
+    // Vitest reparses dash-prefixed -t values as options (including --help).
+    if (arg === '-t' && (++i >= argv.length || argv[i].startsWith('-'))) return false;
+  }
+  return true;
 }
 const ENV_KEYS = ['CI','NODE_ENV','TZ','LANG','LC_ALL','FORCE_COLOR','NO_COLOR'];
 export function allowedEnv(env) {
@@ -57,37 +73,172 @@ async function archiveDigest(path) {
     return hash.digest('hex');
   } finally {await fd.close();}
 }
-// Length-prefixed records avoid ambiguity from odd names or binary content.
-// Reject input symlinks (including parents) rather than digesting external bytes.
+// Paths remain bytes throughout inventory, transport, hashing and verification.
+export function pathParts(path) {
+  if (!Buffer.isBuffer(path) || !path.length || path[0] === 47 || path.some(b => b === 0 || b === 10 || b === 13))
+    throw new Error('Unsafe manifest path');
+  const parts = [];
+  let start = 0;
+  for (let i = 0; i <= path.length; i++) if (i === path.length || path[i] === 47) {
+    const part = path.subarray(start, i);
+    if (!part.length || part.equals(Buffer.from('.')) || part.equals(Buffer.from('..'))) throw new Error('Unsafe manifest path component');
+    parts.push(part); start = i + 1;
+  }
+  return parts;
+}
+export const bytePath = (root, path) => Buffer.concat([Buffer.from(root), Buffer.from('/'), path]);
+// latin1 preserves bytes while matching ASCII suffixes and directory names.
+export function isTestFile(path) {
+  const parts = path.toString('latin1').split('/');
+  const basename = parts.pop();
+  return /\.(test|spec)\.[cm]?[jt]sx?$/.test(basename)
+    || (/\.(?:js|mjs|cjs|ts|mts|cts|jsx|tsx)$/.test(basename)
+      && parts.some(part => /^(?:__tests__|__test__|test|tests|spec|specs|e2e)$/.test(part)));
+}
+
+// Test discovery consumes Unicode strings. Refuse names it could merge or lose;
+// non-test assets retain the byte-path transport contract.
+export function validateTestNames(paths) {
+  const normalized = new Set(), folded = new Set();
+  for (const path of paths.filter(isTestFile)) {
+    let name;
+    try { name = new TextDecoder('utf-8', {fatal:true, ignoreBOM:true}).decode(path); }
+    catch { throw new Error('Input digest mismatch: undecodable test name; use local fallback'); }
+    if (!Buffer.from(name).equals(path)) throw new Error('Input digest mismatch: undecodable test name; use local fallback');
+    const nfc = name.normalize('NFC');
+    // Upper then lower also detects expanding case pairs such as ß / SS.
+    const fold = nfc.toUpperCase().toLowerCase().normalize('NFC');
+    if (normalized.has(nfc) || folded.has(fold)) throw new Error('Input digest mismatch: test name collision; use local fallback');
+    normalized.add(nfc); folded.add(fold);
+  }
+}
+export function splitPaths(bytes) {
+  if (!Buffer.isBuffer(bytes) || bytes.length > LIMIT || (bytes.length && bytes.at(-1) !== 0)) throw new Error('Invalid manifest inventory framing');
+  const paths = [];
+  let start = 0;
+  for (let i = 0; i < bytes.length; i++) if (bytes[i] === 0) {
+    const path = bytes.subarray(start, i); pathParts(path); paths.push(path); start = i + 1;
+  }
+  return paths;
+}
+export const nulPaths = paths => Buffer.concat(paths.flatMap(path => [path, Buffer.from([0])]));
+export const manifestWire = ({entries, excluded}) => ({
+  paths:nulPaths(entries.map(entry => entry.path)).toString('base64'),
+  hashes:entries.map(entry => entry.sha256),
+  executable:entries.map(entry => entry.executable),
+  excluded:nulPaths(excluded).toString('base64'),
+});
+export const digestManifest = manifest => sha(JSON.stringify(manifest));
+
+// No-follow opens pin file identity while reading. Injected IO supports byte-path
+// fixtures on filesystems which cannot create arbitrary Unix filenames.
+export async function readManifestFile(path, st, fs = filesystem) {
+  if (fs !== filesystem) return fs.readFile(path);
+  const fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const pinned = await fd.stat();
+    if (!pinned.isFile() || pinned.ino !== st.ino || pinned.dev !== st.dev || pinned.mode !== st.mode)
+      throw new Error('Manifest file swapped');
+    return await fd.readFile();
+  } finally {await fd.close();}
+}
+
+export async function verifyManifest(root, manifest, manifestDigest, {fs = filesystem} = {}) {
+  if (!manifest || Object.keys(manifest).sort().join(',') !== 'excluded,executable,hashes,paths'
+    || !hex(manifestDigest) || Buffer.byteLength(JSON.stringify(manifest)) > LIMIT
+    || digestManifest(manifest) !== manifestDigest) throw new Error('Manifest digest mismatch or limit exceeded; use local fallback');
+  const decode = value => {
+    if (typeof value !== 'string') throw new Error('Invalid manifest base64');
+    const bytes = Buffer.from(value, 'base64');
+    if (bytes.toString('base64') !== value) throw new Error('Non-canonical manifest base64');
+    const paths = splitPaths(bytes);
+    for (let i = 1; i < paths.length; i++) if (Buffer.compare(paths[i-1], paths[i]) >= 0) throw new Error('Manifest paths must be strictly increasing');
+    return paths;
+  };
+  const paths = decode(manifest.paths), excluded = decode(manifest.excluded);
+  if (!Array.isArray(manifest.hashes) || !Array.isArray(manifest.executable)
+    || manifest.hashes.length !== paths.length || manifest.executable.length !== paths.length
+    || !manifest.hashes.every(hex) || !manifest.executable.every(v => typeof v === 'boolean')) throw new Error('Invalid manifest hashes or executable bits');
+  validateTestNames(paths);
+  const expected = new Map(paths.map((path, i) => [path.toString('hex'), {path, sha256:manifest.hashes[i], executable:manifest.executable[i]}]));
+  for (const path of excluded) if (expected.has(path.toString('hex')) || isTestFile(path) || /\.(test|spec)\./.test(pathParts(path).at(-1).toString('latin1')))
+    throw new Error('Manifest excluded test or overlapping path');
+  const parents = new Set();
+  for (const path of paths) for (let i = 0; i < path.length; i++) if (path[i] === 47) parents.add(path.subarray(0, i).toString('hex'));
+  const rootInfo = await fs.lstat(Buffer.from(root));
+  if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) throw new Error('Invalid manifest root directory');
+  const observed = [], tests = [];
+  let budget = 0;
+  async function walk(prefix, depth = 0) {
+    if (depth > 128) throw new Error('Manifest depth limit exceeded; use local fallback');
+    const dir = prefix.length ? bytePath(root, prefix) : Buffer.from(root);
+    for (const name of await fs.readdir(dir, {encoding:'buffer'})) {
+      if (!Buffer.isBuffer(name) || name.includes(47)) throw new Error('Invalid manifest directory name');
+      const path = prefix.length ? Buffer.concat([prefix, Buffer.from('/'), name]) : name;
+      pathParts(path);
+      budget += path.length + 1;
+      if (budget > LIMIT) throw new Error('Manifest inventory limit exceeded; use local fallback');
+      const st = await fs.lstat(bytePath(root, path));
+      if (st.isSymbolicLink()) throw new Error('Manifest symlink');
+      if (st.isDirectory()) {
+        if (!parents.has(path.toString('hex'))) throw new Error('Extra manifest directory');
+        await walk(path, depth + 1);
+      } else {
+        if (!st.isFile()) throw new Error('Manifest non-regular file');
+        const entry = expected.get(path.toString('hex'));
+        if (!entry || entry.executable !== !!(st.mode & 0o111)
+          || entry.sha256 !== sha(await readManifestFile(bytePath(root, path), st, fs))) throw new Error('Input digest mismatch: manifest snapshot digest or mode mismatch');
+        observed.push(path);
+        if (isTestFile(path)) tests.push(path);
+      }
+    }
+  }
+  await walk(Buffer.alloc(0));
+  observed.sort(Buffer.compare); tests.sort(Buffer.compare);
+  const same = (a,b) => a.length === b.length && a.every((p,i) => p.equals(b[i]));
+  if (!same(paths, observed) || !same(paths.filter(isTestFile), tests)) throw new Error('Manifest inventory or test set mismatch');
+  return {entries:paths.map(path => expected.get(path.toString('hex'))), testPaths:tests};
+}
+
+// Length-prefixed records retain the existing digest protocol, with raw names.
 export async function digestInput(root, files) {
-  const selected = files && new Set(files.flatMap(file => {const parts=file.split("/"); return parts.map((_,i)=>parts.slice(0,i+1).join("/"));}));
+  const selected = files && new Set(files.flatMap(file => {
+    const path = Buffer.isBuffer(file) ? file : Buffer.from(file);
+    pathParts(path);
+    return [path.toString('hex'), ...Array.from(path.keys()).filter(i => path[i] === 47).map(i => path.subarray(0,i).toString('hex'))];
+  }));
   await directory(root);
-  const seen = new Set();
-  const hash = createHash('sha256');
+  const seen = new Set(), hash = createHash('sha256');
   const field = data => {const b = Buffer.from(data); hash.update(String(b.length)+':'); hash.update(b);};
-  async function walk(dir) {
-    for (const name of (await readdir(dir)).sort()) {
-      const path = join(dir,name);
-      if(selected && !selected.has(relative(root,path))) continue;
-      const st = await lstat(path);
-      seen.add(relative(root,path));
-      field(relative(root,path));
+  let budget = 0;
+  async function walk(prefix, depth = 0) {
+    if (depth > 128) throw new Error('Input depth limit exceeded; use local fallback');
+    const dir = prefix.length ? bytePath(root,prefix) : Buffer.from(root);
+    for (const name of (await readdir(dir,{encoding:'buffer'})).sort(Buffer.compare)) {
+      const path = prefix.length ? Buffer.concat([prefix,Buffer.from('/'),name]) : name;
+      const key = path.toString('hex');
+      if (selected && !selected.has(key)) continue;
+      pathParts(path);
+      budget += path.length + 1;
+      if (budget > LIMIT) throw new Error('Input inventory limit exceeded; use local fallback');
+      const absolute = bytePath(root,path), st = await lstat(absolute);
+      seen.add(key); field(path);
       if (st.isSymbolicLink()) throw new Error('Input symlink');
-      if (st.isDirectory()) {field('dir'); await walk(path);}
+      if (st.isDirectory()) {field('dir'); await walk(path, depth + 1);}
       else if (st.isFile()) {
         field('file'); field(String(st.mode & 0o111));
-        const fd = await open(path,constants.O_RDONLY | constants.O_NOFOLLOW);
+        const fd = await open(absolute,constants.O_RDONLY | constants.O_NOFOLLOW);
         try {
           const pinned = await fd.stat();
-          if (pinned.ino !== st.ino || pinned.dev !== st.dev) throw new Error('Input swapped');
+          if (!pinned.isFile() || pinned.ino !== st.ino || pinned.dev !== st.dev || pinned.mode !== st.mode) throw new Error('Input swapped');
           field(String(pinned.size));
           for await (const chunk of fd.createReadStream({autoClose:false})) hash.update(chunk);
         } finally {await fd.close();}
       } else throw new Error('Unsupported input');
     }
   }
-  await walk(root);
-  if(selected && [...selected].some(name=>!seen.has(name))) throw new Error('Input inventory incomplete');
+  await walk(Buffer.alloc(0));
+  if (selected && [...selected].some(name => !seen.has(name))) throw new Error('Input inventory incomplete');
   return hash.digest('hex');
 }
 // A root supervisor is a subreaper: children which call setsid/double-fork are
@@ -256,7 +407,11 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
       return exclusiveWorker(async command => {
       const container=join(runs,request.run),work=join(container,'work');
       await directory(container,true); await directory(work);
-      if(await digestInput(work)!==request.inputDigest || await digestLock(work)!==request.lock) throw new Error('Input digest mismatch');
+      // Preserve the dual-lock refusal before inspecting snapshot differences.
+      const lock = await digestLock(work);
+      // Verify before npm or cache extraction can add generated files.
+      await verifyManifest(work,request.manifest,request.manifestDigest);
+      if(await digestInput(work)!==request.inputDigest || lock!==request.lock) throw new Error('Input digest mismatch');
       await rename(statePath(request.run,'prepared'),statePath(request.run,'running'));
       let phase='install',result={code:97,stdout:'',stderr:''};
       // npm accepts some manifest changes without lock changes. Key the entire
@@ -302,7 +457,7 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
         phase='test';
         result=await command(request.argv,work,{PATH:path,HOME:join(work,'.forge-home'),...request.env});
       } catch(error) {const code=phase==='install'?97:254; if(phase==='test') phase='supervisor'; result={code,stdout:result.stdout,stderr:String(error.message)};}
-      const receipt={...prepared,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code};
+      const receipt={...prepared,manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code};
       await writeFile(statePath(request.run,'receipt'),JSON.stringify(receipt),{flag:'wx',mode:0o600});
       return result;
       });

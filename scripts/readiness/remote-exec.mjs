@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { lstat, realpath } from 'node:fs/promises';
-import { randomBytes } from 'node:crypto';
-import { join } from 'node:path';
+import { realpath } from 'node:fs/promises';
+import * as filesystem from 'node:fs/promises';
+import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { digestInput, digestArgv, digestLock } from './forge-exec-run.mjs';
+import { allowedCommand, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile } from './forge-exec-run.mjs';
 
 const ROOT = '/srv/forge-exec';
 const LIMIT = 4 * 1024 * 1024;
@@ -17,7 +17,8 @@ export function isAllowedCommand(argv) {
   // Only task arguments may follow the script name; npm options can skip or replace execution.
   return Array.isArray(argv) && argv.length >= 3 && argv.every((arg) => typeof arg === 'string' && !arg.includes('\0'))
     && argv[0] === 'npm' && argv[1] === 'run' && ['test:unit', 'check:standards'].includes(argv[2])
-    && (argv.length === 3 || argv[3] === '--');
+    && (argv.length === 3 || argv[3] === '--')
+    && (argv[2] !== 'test:unit' || allowedCommand(argv));
 }
 
 export function filterEnv(env = {}) {
@@ -48,7 +49,7 @@ export function defaultExec({ file, args, cwd, input, inherit = false }) {
     }
     child.on('error', reject);
     child.on('close', (code) => exceeded ? reject(new Error('Captured output limit exceeded'))
-      : resolve({ code: code ?? 1, stdout: Buffer.concat(stdout).toString('utf8') }));
+      : resolve({ code: code ?? 1, stdout: Buffer.concat(stdout) }));
     if (input !== undefined) {
       child.stdin.on('error', () => {}); // A failed SSH may close stdin before reading.
       child.stdin.end(input);
@@ -56,34 +57,78 @@ export function defaultExec({ file, args, cwd, input, inherit = false }) {
   });
 }
 
-function safeFiles(files) {
-  if (!Array.isArray(files)) throw new Error('Invalid file inventory');
-  const safe = files.filter((path) => {
-    if (typeof path !== 'string' || !path || path.startsWith('/') || /[\0\r\n]/.test(path)) throw new Error('Invalid file path');
-    const parts = path.split('/');
-    if (parts.some((part) => !part || part === '..' || part === '.')) throw new Error('Unsafe file path');
-    return !parts.some((part) => part === '.exit-code' || /^(?:node_modules|\.git|\.env(?:\..*)?|\.secrets|\.ssh|\.aws|\.claude|\.codex|\.npmrc|\.netrc|credentials(?:\..*)?|.*\.(?:pem|key))$/i.test(part));
-  });
-  // openrsync still treats leading #/; as comments with --from0. Anchor every
-  // validated relative path so both rsync implementations read it literally.
-  const input = [...new Set(safe)].map((path) => `./${path}\0`).join('');
-  if (Buffer.byteLength(input) > LIMIT) throw new Error('File inventory limit exceeded');
-  return input;
-}
-
-async function validateInventory(root, files) {
-  if (!(await lstat(root)).isDirectory()) throw new Error('Invalid input root');
-  for (const file of files) {
-    const parts = file.split('/');
-    let path = root;
-    for (const [index, part] of parts.entries()) {
-      path = join(path, part);
-      const info = await lstat(path);
-      if (info.isSymbolicLink()) throw new Error('Input symlink');
-      // A directory leaf would let recursive rsync send unlisted contents.
-      if (index === parts.length - 1 ? !info.isFile() : !info.isDirectory()) throw new Error('Invalid inventory component');
+export { isTestFile };
+// This exclusion policy is part of the manifest, never an independent rsync
+// filter. Test-shaped names under excluded components refuse remote admission.
+const excludedComponent = /^(?:node_modules|\.git|\.env.*|\.secrets|\.ssh|\.aws|\.claude|\.codex|\.npmrc|\.netrc|credentials.*|.*\.(?:pem|key)|\.exit-code)$/i;
+export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles} = {}) {
+  // Only dependency and Git internals are exempt. In particular, secret/hidden
+  // directories and ambiguous dist/build directories may still contain tests.
+  const ignored = await exec({file:'git',args:['ls-files','-o','-i','--exclude-standard','-z'],cwd});
+  if (ignored.code !== 0 || !Buffer.isBuffer(ignored.stdout)) throw new Error('Ignored byte inventory unavailable');
+  for (const path of splitPaths(ignored.stdout)) {
+    if (pathParts(path).slice(0,-1).some(part => part.equals(Buffer.from('node_modules')) || part.equals(Buffer.from('.git')))) continue;
+    if (isTestFile(path)) throw Object.assign(new Error('Ignored test: use local fallback'), {code:'ignored-test-file'});
+  }
+  let files;
+  if (listFiles) {
+    const names = await listFiles(cwd);
+    if (!Array.isArray(names) || names.some(name => !Buffer.isBuffer(name) && typeof name !== 'string')) throw new Error('Invalid inventory');
+    files = names.map(name => Buffer.from(name));
+  } else {
+    const result = await exec({file:'git',args:['ls-files','-co','--exclude-standard','-z'],cwd});
+    if (result.code !== 0 || !Buffer.isBuffer(result.stdout)) throw new Error('Byte inventory unavailable');
+    files = splitPaths(result.stdout);
+    const stage = await exec({file:'git',args:['ls-files','--stage','-z'],cwd});
+    if (stage.code !== 0 || !Buffer.isBuffer(stage.stdout) || stage.stdout.length > LIMIT
+      || (stage.stdout.length && stage.stdout.at(-1) !== 0)) throw new Error('Git index unavailable');
+    let start = 0;
+    for (let i = 0; i < stage.stdout.length; i++) if (stage.stdout[i] === 0) {
+      const record = stage.stdout.subarray(start,i), tab = record.indexOf(9);
+      if (tab < 0 || !/^[0-7]{6} [a-f0-9]{40,64} [0-3]$/.test(record.subarray(0,tab).toString('latin1'))) throw new Error('Invalid git index record');
+      pathParts(record.subarray(tab+1));
+      // Gitlinks cannot be transported as directory leaves. Until recursive
+      // submodule inventories are supported, use real local heavy admission.
+      if (record.subarray(0,6).equals(Buffer.from('160000'))) throw new Error('gitlink-unsupported: use local fallback');
+      start = i + 1;
     }
   }
+  files.sort(Buffer.compare);
+  files = files.filter((path,i) => !i || !path.equals(files[i-1]));
+  if (files.reduce((size,path) => size + path.length + 3,0) > LIMIT) throw new Error('Inventory limit exceeded; use local fallback');
+  validateTestNames(files);
+  const rootInfo = await fs.lstat(Buffer.from(cwd));
+  if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) throw new Error('Invalid inventory root');
+  const entries = [], excluded = [];
+  for (const path of files) {
+    const parts = pathParts(path);
+    if (parts.some(part => excludedComponent.test(part.toString('latin1')))) {
+      if (isTestFile(path) || /\.(test|spec)\./.test(parts.at(-1).toString('latin1'))) throw new Error('Excluded test: use local fallback');
+      excluded.push(path); continue;
+    }
+    let absolute = Buffer.from(cwd), st;
+    for (const [i,part] of parts.entries()) {
+      absolute = bytePath(absolute,part);
+      st = await fs.lstat(absolute);
+      if (st.isSymbolicLink() || (i === parts.length-1 ? !st.isFile() : !st.isDirectory())) throw new Error('Unsafe inventory component');
+    }
+    entries.push({path,sha256:createHash('sha256').update(await readManifestFile(absolute,st,fs)).digest('hex'), executable:!!(st.mode & 0o111)});
+  }
+  const manifest = {entries,excluded};
+  const wire = manifestWire(manifest);
+  if (Buffer.byteLength(JSON.stringify(wire)) > LIMIT - 16384) throw new Error('Manifest wire limit exceeded; use local fallback');
+  return {...manifest,manifestDigest:digestManifest(wire)};
+}
+
+// Only protocol JSON is decoded, never inventory bytes.
+function protocolText(stdout, limit) {
+  if ((!Buffer.isBuffer(stdout) && typeof stdout !== 'string') || Buffer.byteLength(stdout) > limit) throw new Error('Invalid protocol output');
+  if (Buffer.isBuffer(stdout)) {
+    const text = stdout.toString('utf8');
+    if (!Buffer.from(text).equals(stdout)) throw new Error('Invalid protocol UTF-8');
+    return text;
+  }
+  return stdout;
 }
 
 export async function runRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles } = {}) {
@@ -108,45 +153,43 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
     return ssh('finish', {nonce,run});
   };
   try {
-    let expected;
+    let expected, expectedManifest;
     try {
-      const files = listFiles ? await listFiles(cwd) : await (async () => {
-        const result = await exec({file:'git',args:['ls-files','-co','--exclude-standard','-z'],cwd});
-        if(result.code !== 0 || typeof result.stdout !== 'string' || Buffer.byteLength(result.stdout)>LIMIT) throw new Error('Inventory unavailable');
-        return result.stdout.split(result.stdout.includes('\0')?'\0':'\n').filter(Boolean);
-      })();
-      const inventory = safeFiles(files);
-      if(files.includes('vitest.shared.ts')) return fallback('unsupported-sibling-dependency');
-      const selected = inventory.split('\0').filter(Boolean).map(name=>name.slice(2));
-      await validateInventory(cwd, selected);
+      const manifest = await buildManifest({cwd,exec,listFiles});
+      const selected = manifest.entries.map(entry => entry.path);
+      if (selected.some(path => path.equals(Buffer.from('vitest.shared.ts')))) return fallback('unsupported-sibling-dependency');
+      // Anchor comment-like and option-like names for both rsync implementations.
+      const inventory = Buffer.concat(selected.flatMap(path => [Buffer.from('./'),path,Buffer.from([0])]));
+      const wire = manifestWire(manifest);
       const lock = await digestLock(cwd);
       // Reject incomplete or linked input before transmitting any file bytes.
       const inputDigest = await digestInput(cwd, selected);
       const prepared = await ssh('prepare',{nonce,label:runId});
-      if(prepared.code !== 0 || typeof prepared.stdout !== 'string' || prepared.stdout.length>1024) throw new Error('Prepare failed');
-      run = JSON.parse(prepared.stdout).run;
+      if(prepared.code !== 0) throw new Error('Prepare failed');
+      run = JSON.parse(protocolText(prepared.stdout,1024)).run;
       if(typeof run !== 'string' || !/^r-[a-f0-9]{32}$/.test(run)) {run=undefined; throw new Error('Invalid server run');}
       const copied = await exec({file:'rsync',args:['-a','-r','--no-links','--safe-links','--no-implied-dirs','--delete','--exclude=.exit-code',
-        ...['node_modules','.git','.env*','.secrets','.ssh','.aws','.claude','.codex','.npmrc','.netrc','credentials*','*.pem','*.key'].map(name=>`--exclude=${name}`),
         '--from0','--files-from=-','--rsync-path=sudo -u forge-exec rsync','-e',`ssh ${SSH_OPTIONS.join(' ')}`,
         './',`${host}:${ROOT}/${run}/work/`],cwd,input:inventory});
       if(copied.code !== 0) throw new Error('Copy failed');
-      expected = {v:1,nonce,run,inputDigest,argvDigest:digestArgv(argv),lock};
-    } catch {return fallback('copy-failed');}
+      expected = {v:1,nonce,run,inputDigest,argvDigest:digestArgv(argv),lock,manifestDigest:manifest.manifestDigest};
+      expectedManifest = wire;
+    } catch (error) {return fallback(error.code === 'ignored-test-file' ? 'ignored-test-file' : 'copy-failed');}
     try {
-      const result = await ssh('run',{...expected,argv,env:filterEnv(env)},true);
+      const result = await ssh('run',{...expected,manifest:expectedManifest,argv,env:filterEnv(env)},true);
       const receipt = await finish();
-      if(!receipt || receipt.code!==0 || typeof receipt.stdout!=='string' || Buffer.byteLength(receipt.stdout)>4096) return fallback('ambiguous-result');
-      if(!verifyReceipt(receipt.stdout,expected,result.code)) return fallback('ambiguous-result');
+      if(!receipt || receipt.code!==0) return {mode:'unconfirmed',reason:'ambiguous-result'};
+      if(!verifyReceipt(protocolText(receipt.stdout,4096),expected,result.code)) return {mode:'unconfirmed',reason:'ambiguous-result'};
       return {mode:'remote',code:result.code};
-    } catch {return fallback('ambiguous-result');}
+    } catch {return {mode:'unconfirmed',reason:'ambiguous-result'};}
   } finally {try {await finish();} catch { /* Pruning is the cleanup backstop; never retry execution. */ }}
 }
 
 export function verifyReceipt(text, expected, code) {
   try {
     const receipt=JSON.parse(text);
-    return receipt && Object.keys(receipt).sort().join(',') === 'argvDigest,code,inputDigest,lock,nonce,phase,run,v'
+    return receipt && typeof expected?.manifestDigest === 'string' && /^[a-f0-9]{64}$/.test(expected.manifestDigest)
+      && Object.keys(receipt).sort().join(',') === 'argvDigest,code,inputDigest,lock,manifestDigest,nonce,phase,run,v'
       && Object.entries(expected).every(([key,value])=>receipt[key]===value)
       && receipt.phase==='test' && Number.isInteger(code) && code>=0 && code<255 && receipt.code===code;
   } catch {return false;}
