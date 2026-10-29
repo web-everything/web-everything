@@ -41,6 +41,12 @@ export function buildFixEvidenceComment({ openSendBacks, evidenceText, head, ver
   const citations = parseEvidenceCitations(evidence);
   const missing = [], lines = [];
   for (const sendBack of openSendBacks) {
+    // Match the reader's short/full SHA semantics: same-head evidence cannot resolve a named-head request.
+    const requestHead = String(sendBack.head ?? '').toLowerCase(), evidenceHead = String(head ?? '').toLowerCase();
+    if (requestHead && (requestHead.startsWith(evidenceHead) || evidenceHead.startsWith(requestHead))) {
+      missing.push(...sendBackItems(sendBack).map(({ n }) => `${sendBack.id}#${n}`));
+      continue;
+    }
     if (/<(?:li|ol|ul)/i.test(String(sendBack.body ?? ''))) {
       missing.push(`${sendBack.id}#unparsed`);
       continue;

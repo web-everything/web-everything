@@ -7,6 +7,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createFixBorrowGate, recordRoutedOutcome, consecutiveUnproductiveOnHead, chooseFixExecutor } from '../../lib/fix-slot-borrow.mjs';
 import { LANE_GIT_CONFIG_PINS, laneGitHardeningEnv } from '../../lib/lane-git-hardening.mjs';
+import { openOperatorSendBacks } from '../../lib/operator-send-backs.mjs';
 import { dispatchFix, writePrivateBorrowedPrompt } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import { buildFixEndComment } from '../../conveyor/fix-procedure.mjs';
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
@@ -169,6 +170,90 @@ describe('runFixCli', () => {
     expect(m.io.readFile).toHaveBeenCalledWith('/lanes/lane-5/.fix-evidence.md', '/lanes/lane-5');
     expect(m.io.persistEvidence).toHaveBeenCalledWith({ repoKey: 'o_r', pr: '7', text: citedEvidence });
     expect(m.io.readComments.mock.calls).toEqual([['7', { repo: 'o/r' }], ['7', { repo: 'o/r' }]]);
+  });
+  it('persists the no-change re-arm before posting and recovers after re-arm throws once', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fix-evidence-rearm-'));
+    try {
+      const pendingRearm = defaultPendingRearm(dir);
+      const m = withSendBack();
+      const comments = await m.io.readComments();
+      let attempts = 0;
+      let markerAtPost;
+      const run = (cmd, args, opts) => {
+        if (cmd === 'gh' && args.includes('comment')) {
+          markerAtPost = pendingRearm.read('o/r', '7');
+        }
+        if (args.some(a => a.endsWith('rearm-review.mjs')) && attempts++ === 0) throw new Error('re-arm unavailable');
+        return m.io.run(cmd, args, opts);
+      };
+      const io = { ...m.io, run, pendingRearm, readComments: async () => [
+        ...comments, ...m.posted.map(body => ({ author: { login: 'web-everything' }, body })),
+      ] };
+      expect((await runFixCli(argv, io)).code).toBe(1);
+      expect(m.posted).toHaveLength(1);
+      expect(markerAtPost).toMatchObject({ sha: 'b'.repeat(40), kind: 'evidence' });
+      expect(openOperatorSendBacks({ comments: await io.readComments() })).toEqual([]);
+      expect(pendingRearm.read('o/r', '7')).toMatchObject({ kind: 'evidence' });
+      const retry = await runFixCli(argv, io);
+      expect(retry.code).toBe(0);
+      expect(retry.result).toContain('re-armed');
+      expect(attempts).toBe(2);
+      expect(m.spawn).toHaveBeenCalledOnce();
+      expect(m.posted).toHaveLength(1);
+      expect(m.io.recordPush).not.toHaveBeenCalled();
+      expect(m.io.recordOutcome).toHaveBeenLastCalledWith(expect.objectContaining({ outcome: 'no-change' }));
+      expect(pendingRearm.read('o/r', '7')).toBeNull();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('withholds no-change evidence when the pending re-arm cannot be persisted', async () => {
+    const m = withSendBack();
+    m.pendingRearm.write.mockImplementation(() => { throw new Error('disk full'); });
+    expect((await runFixCli(argv, m.io)).result).toContain('no-change-unproven');
+    expect(m.posted).toEqual([]);
+    expect(m.events).toEqual([]);
+  });
+  it.each(['post failed', 'read failed', 're-arm failed'])('keeps an evidence re-arm pending when retry %s', async failure => {
+    const m = withSendBack({ failPost: failure === 'post failed' });
+    m.pendingRearm.read.mockReturnValue({ sha: 'b'.repeat(40), kind: 'evidence' });
+    const comments = await m.io.readComments();
+    if (failure === 'read failed') m.io.readComments
+      .mockResolvedValueOnce(comments).mockRejectedValue(new Error('thread unavailable'));
+    const rearmAttempt = vi.fn();
+    if (failure === 're-arm failed') {
+      m.io.readComments.mockResolvedValue([...comments, { author: { login: 'web-everything' },
+        body: `## Fix evidence\n\nHead: \`${'b'.repeat(40)}\`\n<!-- addresses-operator-send-back: 1001 -->` }]);
+      const run = m.io.run;
+      m.io.run = (cmd, args, opts) => {
+        if (args.some(a => a.endsWith('rearm-review.mjs'))) {
+          rearmAttempt();
+          throw new Error('re-arm unavailable');
+        }
+        return run(cmd, args, opts);
+      };
+    }
+    const out = await runFixCli(argv, m.io);
+    expect(m.pendingRearm.clear).not.toHaveBeenCalled();
+    expect(m.io.recordPush).not.toHaveBeenCalled();
+    if (failure === 'post failed') {
+      expect(out.result).toContain('no-change-unproven');
+      expect(m.spawn).toHaveBeenCalledOnce();
+      expect(m.events).toEqual(['comment']);
+    } else {
+      expect(out.code).toBe(1);
+      expect(m.spawn).not.toHaveBeenCalled();
+    }
+    if (failure === 're-arm failed') expect(rearmAttempt).toHaveBeenCalledOnce();
+  });
+  it.each(['bbbbbbb', 'b'.repeat(40), 'BBBBBBB'])('withholds same-head evidence for request head %s', async head => {
+    const m = withSendBack();
+    const comments = await m.io.readComments();
+    comments[0].body = comments[0].body.replace('aaaaaaa', head);
+    m.io.readComments.mockResolvedValue(comments);
+    expect((await runFixCli(argv, m.io)).result).toContain('no-change-unproven');
+    expect(m.posted).toEqual([]);
+    expect(m.events).toEqual([]);
+    expect(m.pendingRearm.write).not.toHaveBeenCalled();
+    expect(openOperatorSendBacks({ comments })).toHaveLength(1);
   });
   it.each([
     ['an uncited item', { evidence: '- send-back 1001 item 1: src/fix.mjs:1' }, '1001#2'],

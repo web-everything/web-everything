@@ -68,9 +68,9 @@ const pendingRearmDir = () => join(homedir(), '.claude', 'conveyor', 'fix-run-pe
 const pendingKey = (repo, pr) => `${String(repo ?? 'we').replace(/[^\w.-]/g, '_')}-${String(pr).replace(/[^\w.-]/g, '_')}.json`;
 
 /**
- * A repair that is PUSHED but not yet re-armed (the re-arm call failed): the next launch of the same PR opens its lane
- * at that pushed tip, sees no new commit, and would otherwise skip the re-arm for good. This records "owed" durably
- * between the two steps so a no-change retry can finish the hand-back. Default = a file under `~/.claude/conveyor`.
+ * A pushed repair or published no-change evidence can still owe a re-arm. Record the debt before the external
+ * effect so retries can finish the hand-back. Evidence markers require a fresh closed-send-back check on recovery;
+ * legacy markers without a kind retain push recovery. Default = a file under `~/.claude/conveyor`.
  */
 export const defaultPendingRearm = (dir = pendingRearmDir()) => ({
   read(repo, pr, now = Date.now()) {
@@ -79,9 +79,9 @@ export const defaultPendingRearm = (dir = pendingRearmDir()) => ({
       return v && typeof v.sha === 'string' && now - Number(v.at) < PENDING_REARM_MAX_AGE_MS ? v : null;
     } catch { return null; }
   },
-  write(repo, pr, sha, now = Date.now()) {
+  write(repo, pr, sha, now = Date.now(), kind = 'push') {
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, pendingKey(repo, pr)), JSON.stringify({ sha, at: now }), { mode: 0o600 });
+    writeFileSync(join(dir, pendingKey(repo, pr)), JSON.stringify({ sha, at: now, kind }), { mode: 0o600 });
   },
   clear(repo, pr) { try { unlinkSync(join(dir, pendingKey(repo, pr))); } catch { /* already gone */ } },
 });
@@ -778,13 +778,20 @@ export async function runFixCli(argv = [], {
       catch (e) { writeErr(`fix-run: PR #${pr} CI hand-off failed, re-arming anyway: ${String(e?.message ?? e).split('\n')[0]}\n`); }
       return rearmReview();
     };
-    // A prior run pushed this exact tip and then failed to re-arm (this lane opened AT that tip): finish the hand-back
-    // now, before spending a whole agent run on it.
-    if (pendingRearm.read(launch.repo, pr)?.sha === before) {
-      rearm(before);
+    // Recover only at the recorded tip. An evidence marker precedes publication, so it alone cannot prove that
+    // publication succeeded: unresolved requests must go through the agent/evidence path again.
+    const pending = pendingRearm.read(launch.repo, pr);
+    const pendingEvidence = pending?.kind === 'evidence';
+    const recoverPending = pending?.sha === before && (!pendingEvidence || !openOperatorSendBacks({
+      comments: await readComments(pr, { repo: launch.repo }), headRefOid: prHeadSha,
+    }).length);
+    if (recoverPending) {
+      if (pendingEvidence) rearmReview();
+      else rearm(before);
       pendingRearm.clear(launch.repo, pr);
-      const result = `PR #${pr} (already pushed ${before.slice(0, 9)}; re-armed review:pending after a failed earlier re-arm)`;
-      outcome = FIX_RUN_OUTCOME.PUSHED; reason = 'finished an earlier push';
+      const result = `PR #${pr} (${pendingEvidence ? 'evidence already posted for' : 'already pushed'} ${before.slice(0, 9)}; re-armed review:pending after a failed earlier re-arm)`;
+      outcome = pendingEvidence ? FIX_RUN_OUTCOME.NO_CHANGE : FIX_RUN_OUTCOME.PUSHED;
+      reason = pendingEvidence ? 'finished an earlier evidence re-arm' : 'finished an earlier push';
       write(`fix-run: PR #${pr} finished - ${result}\n`);
       return { code: 0, result };
     }
@@ -1056,6 +1063,8 @@ export async function runFixCli(argv = [], {
         if (!evidenceText) return { posted: false, missing: allItems() };
         const evidence = buildFixEvidenceComment({ openSendBacks, evidenceText, head, verifyCitation });
         if (!evidence.ok) return { posted: false, missing: evidence.missing };
+        // Fail closed if the debt cannot be saved. Posting can close the last request, removing the retry trigger.
+        if (after === before) pendingRearm.write(launch.repo, pr, head, Date.now(), 'evidence');
         withMessageFile(evidence.body, file => run('gh', ['pr', 'comment', pr, ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot }));
         return { posted: true, missing: [] };
       } catch (e) {
@@ -1070,6 +1079,7 @@ export async function runFixCli(argv = [], {
       if (openSendBacks.length || evidence.reason) {
         if (evidence.posted) {
           rearmReview();
+          pendingRearm.clear(launch.repo, pr);
           reason = `evidence posted for send-back(s) ${openSendBacks.map(item => item.id).join(', ')}; review re-armed: ${finalMessage}`;
         } else {
           outcome = FIX_RUN_OUTCOME.NO_CHANGE_UNPROVEN;
