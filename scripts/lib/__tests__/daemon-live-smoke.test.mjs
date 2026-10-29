@@ -105,6 +105,13 @@ describe('lane acquire smoke after lane-hold reset refusal', () => {
     expect(row.ok).toBe(false);
   });
 
+  it('a provision failure whose text merely contains a lane-hold path is a real failure', async () => {
+    const odd = Object.assign(new Error('acquire exited 1'), { stderr: `${refusal}\n  ⚠ lane-4 claimed but failed to provision (git checkout exited 128 in /workspace/lane-hold) — releasing it` });
+    const runChild = vi.fn().mockRejectedValueOnce(failure('message')).mockRejectedValueOnce(odd);
+    const row = await check.run(context(runChild));
+    expect(row.ok).toBe(false);
+  });
+
   it('a retry that exited on a signal is a real failure even if the same line mentions lane-hold', async () => {
     const sig = new Error(`acquire exited SIGSEGV: ${refusal}`);
     const runChild = vi.fn().mockRejectedValueOnce(failure('message')).mockRejectedValueOnce(sig);

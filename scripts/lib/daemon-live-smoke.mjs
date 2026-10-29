@@ -376,7 +376,8 @@ function isBenignLaneHoldLine(line) {
   const l = String(line);
   if (!/provision|fatal|error|failed|refused|✗|exited|SIG[A-Z]+|timed out|crash|killed|limit|ENOENT|EACCES/i.test(l)) return true;
   if (/fatal:|SIG[A-Z]+|crash|timed out|killed|ENOENT|EACCES|error:|limit/i.test(l)) return false;
-  if (/lane-hold/.test(l) && /reset REFUSED|is held|claimed but failed to provision/i.test(l)) return true;
+  if (/lane-\d+: reset REFUSED — lane-hold: /.test(l)) return true;
+  if (/claimed but failed to provision \(lane-\d+ is held — lane-hold: [^)]*; not reset \(pick another lane\)\)/.test(l)) return true;
   if (/^\s*✗ no (?:free )?lane\b/.test(l) || /^\s*no (?:free )?lane within\b/.test(l)) return true;
   if (/^\s*acquire exited \d+\s*$/.test(l) || /^\s*Command failed: node scripts\/lane-pool\.mjs acquire\b[^\n]*$/.test(l)) return true;
   return false;
