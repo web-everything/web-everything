@@ -87,11 +87,17 @@ export function reviewRunEvidence(run) {
   };
 }
 
-const isQuotaFailureSpan = span => span?.event === 'span.end' && span.name === 'review.loop'
-  && span.status === 'error' && isQuotaError(span.statusMessage);
+const isReviewFailureSpan = span => span?.event === 'span.end' && span.name === 'review.loop'
+  && span.status === 'error';
 
-/** Read only the current and previous two UTC day files; telemetry is optional evidence. */
-export function readQuotaFailureSpans({ dir = telemetryDir(), now = Date.now() } = {}) {
+/** Read only quota review.loop errors from the current and previous two UTC day files. */
+export function readQuotaFailureSpans(options = {}) {
+  return readReviewFailureSpans(options).filter(span => isQuotaError(span.statusMessage));
+}
+
+/** Read review.loop errors from the current and previous two UTC day files, including non-quota
+ * failures so the quota overlay can reject mixed evidence. Telemetry is optional evidence. */
+export function readReviewFailureSpans({ dir = telemetryDir(), now = Date.now() } = {}) {
   const spans = [];
   try {
     for (let daysAgo = 0; daysAgo < 3; daysAgo++) {
@@ -102,28 +108,32 @@ export function readQuotaFailureSpans({ dir = telemetryDir(), now = Date.now() }
         if (error.code === 'ENOENT') continue;
         return [];
       }
-      spans.push(...parseTelemetryLines(text).events.filter(isQuotaFailureSpan));
+      spans.push(...parseTelemetryLines(text).events.filter(isReviewFailureSpan));
     }
     return spans;
   } catch { return []; }
 }
 
-/** Overlay textless interrupted attempts without changing the cached run projection or the spans. */
+/** Overlay textless interrupted attempts only when every matching error is quota-related,
+ * without changing the cached run projection or the spans. */
 export function markQuotaOnlyFromSpans(rows, spans) {
   const repoBase = repo => typeof repo === 'string' ? repo.split('/').at(-1) : '';
-  const windows = spans.filter(isQuotaFailureSpan).flatMap(span => {
+  const windows = spans.filter(isReviewFailureSpan).flatMap(span => {
     const start = Date.parse(span.startedAt);
     const end = Date.parse(span.endedAt);
     const pr = Number(span.attributes?.pr);
     const repo = repoBase(span.attributes?.repo);
     return Number.isFinite(start) && Number.isFinite(end) && end >= start
       && Number.isInteger(pr) && pr > 0 && repo
-      ? [{ start, end, pr, repo }] : [];
+      ? [{ start, end, pr, repo, quotaOnly: isQuotaError(span.statusMessage) }] : [];
   });
-  return rows.map(row => row.incomplete && windows.some(window =>
-    row.pr === window.pr && repoBase(row.repo) === window.repo
-    && row.startedAt >= window.start - 30_000 && row.startedAt <= window.end + 30_000)
-    ? { ...row, quotaOnly: true } : row);
+  return rows.map(row => {
+    if (!row.incomplete) return row;
+    const matching = windows.filter(window => row.pr === window.pr && repoBase(row.repo) === window.repo
+      && row.startedAt >= window.start - 30_000 && row.startedAt <= window.end + 30_000);
+    return matching.length > 0 && matching.every(window => window.quotaOnly)
+      ? { ...row, quotaOnly: true } : row;
+  });
 }
 
 // Cache only small projections, never full diffs/seat transcripts. A changed file is parsed again.
@@ -193,7 +203,7 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
     if (dirty || Object.keys(disk).some(n => !kept[n])) writeEvidenceDiskCache(file, kept);
   }
   // Keep live telemetry outside both caches, so arriving or disappearing spans take effect immediately.
-  return markQuotaOnlyFromSpans(out, readQuotaFailureSpans({ dir: spansDir, now }));
+  return markQuotaOnlyFromSpans(out, readReviewFailureSpans({ dir: spansDir, now }));
 }
 
 /** The events on the PR thread that wake a parked review, each tagged with what woke it. `ruling` (a reviewer's or
