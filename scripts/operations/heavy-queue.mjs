@@ -173,8 +173,10 @@ export function assessQueueAdmission(queue) {
   if (!queue) return null;
   if (queue.bypassed) return { bypassed: queue.bypassed, headline: `queue admission bypassed (${queue.bypassed})` };
   const byKind = {};
+  let fixAheadOnly = false;
   for (const [label, kind, size] of [['review', 'review', null], ['fix', 'fix', null], ['ci-heal', 'ci-heal', null], [`build (size ${DEFAULT_BUILD_SIZE})`, 'build', DEFAULT_BUILD_SIZE], ['build (size 8)', 'build', 8]]) {
     const d = createQueueBudget(queue).tryAdmit(kind, { size });
+    if (kind === 'fix') fixAheadOnly = d.aheadOnly === true;
     byKind[label] = { demandMinutes: d.demandMinutes, projectedMinutes: d.projectedMinutes, admit: d.admit, exempt: d.exempt };
     if (kind === 'fix' || kind === 'ci-heal') byKind[label].excludedBehindCount = d.excludedBehindCount ?? 0;
   }
@@ -192,7 +194,7 @@ export function assessQueueAdmission(queue) {
     standardMinutes: queue.standardMinutes, standardSource: queue.standardSource,
     byKind,
     headline: `projected wait if you start now: ~${queue.projectedWaitMinutes}m of ${queue.maxWaitMinutes}m max`
-      + ` (a fix → ~${fix.projectedMinutes}m counting only waiters ahead of it, ${fix.admit ? 'admitted' : 'HELD queue-cap'})`
+      + ` (a fix → ~${fix.projectedMinutes}m counting ${fixAheadOnly ? 'only waiters ahead of it' : 'all waiters'}, ${fix.admit ? 'admitted' : 'HELD queue-cap'})`
       + (queue.heavyWaitMinutes != null ? `; a full suite → ~${queue.heavyWaitMinutes}m` : ''),
   };
 }

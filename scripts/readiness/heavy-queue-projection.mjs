@@ -418,11 +418,13 @@ function hasLaneSplit(b) {
   return !!b && Number.isFinite(b.heavySlots) && Number.isFinite(b.heavyBacklogMinutes) && Number.isFinite(b.shortBacklogMinutes);
 }
 
-/** Pure P1 view: only P0/P1 waiters are ahead. Held and pending work are never discounted.
- *  Compare the two classes locally to keep the VM-backed priority classifier out of this pure import graph.
- *  Unreadable rows or costs stay counted; historical markers without a class belong to the normal tier. */
+/** Pure P1 view, gated by the baseline producer's explicit `p1OrderingEnabled: true` capability.
+ *  Part B must wire live P1 ordering and marker classes before the producer may set it; until then FIFO
+ *  waiters all stay counted. This is internal baseline metadata, never a caller name or environment override.
+ *  Only explicit P2/P3 waiters can be behind P1. Unknown classes, unreadable rows/costs, held work and pending
+ *  work stay counted. Compare classes locally to keep the VM-backed classifier out of this pure import graph. */
 export function waitersAheadOf(baseline, dispatchKind) {
-  if (!P1_DISPATCH_KINDS.includes(dispatchKind) || baseline?.bypassed || !Array.isArray(baseline?.waiting)) return baseline;
+  if (baseline?.p1OrderingEnabled !== true || !P1_DISPATCH_KINDS.includes(dispatchKind) || baseline?.bypassed || !Array.isArray(baseline?.waiting)) return baseline;
   let excludedBehindCount = 0;
   let excludedBehindMinutes = 0;
   let heavyMinutes = 0;
@@ -430,7 +432,7 @@ export function waitersAheadOf(baseline, dispatchKind) {
   const waiting = baseline.waiting.filter((row) => {
     if (!row || typeof row !== 'object' || Array.isArray(row)) return true;
     const cls = row.priorityClass ?? row.priority;
-    if (cls === 'P0' || cls === 'P1') return true;
+    if (cls !== 'P2' && cls !== 'P3') return true;
     if (!Number.isFinite(row.expectedMinutes) || row.expectedMinutes < 0) return true;
     excludedBehindCount++;
     excludedBehindMinutes += row.expectedMinutes;
