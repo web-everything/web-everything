@@ -35,18 +35,26 @@ export function run({ pr, repo, cwd = process.cwd(), exec = execFileSyncThrottle
       const outcome = applyHumanClearanceCarry({ ...carryOptions, evidence, pr, repo, cwd, exec: carryExec, log,
         numberingOnly: !evidence.humanClearance.diff && !evidence.humanClearance.contribution,
         readLiveEvidence: () => {
+          let live;
           try {
-            const view = JSON.parse(carryExec('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid,reviews'],
+            const view = JSON.parse(carryExec('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid,reviews,labels'],
               { encoding: 'utf8' }));
             if (!/^[0-9a-f]{40}$/i.test(view?.headRefOid ?? '')) throw Error('live head unreadable');
+            if (!Array.isArray(view.labels) || view.labels.some(label => !label || typeof label.name !== 'string' || !label.name)) {
+              throw Error('live labels unreadable');
+            }
             const comments = readCompletePrComments(pr, { repo, exec: carryExec });
             const reviews = Array.isArray(view.reviews) ? view.reviews : null;
             if (reviews === null) liveUnreadable = true;
-            return { headSha: view.headRefOid, comments, reviews };
+            live = { headSha: view.headRefOid, comments, reviews, labels: view.labels };
           } catch (error) {
             liveUnreadable = true;
             throw error;
           }
+          // An explicit hold can be reapplied without a comment, including while the proof runs.
+          const hold = live.labels.find(label => ['review:human', 'review:changes'].includes(label.name));
+          if (hold) throw Error(`${hold.name} hold stands; normal review required`);
+          return live;
         },
       });
       if (liveUnreadable) status = 1;
