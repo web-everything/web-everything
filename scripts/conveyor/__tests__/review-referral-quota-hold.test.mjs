@@ -300,19 +300,66 @@ describe('quota failure telemetry reader', () => {
   });
 });
 
-function runFixture(count = 1) {
+function runFixture(count = 1, failures) {
   const root = temp();
   const dir = join(root, 'runs');
   const spansDir = join(root, 'spans');
   mkdirSync(dir);
   mkdirSync(spansDir);
   for (let i = 0; i < count; i++) {
-    writeFileSync(join(dir, `review-pr-${i}.json`), JSON.stringify(textlessRun(i)));
+    const run = textlessRun(i);
+    if (failures) run.findings = failedRun(failures, i).findings;
+    writeFileSync(join(dir, `review-pr-${i}.json`), JSON.stringify(run));
   }
   return { dir, spansDir, now: options.now };
 }
 
 describe('run evidence telemetry integration', () => {
+  it.each(['corrupt line', 'unreadable file'].flatMap(kind =>
+    [0, 1, 2].map(daysAgo => [kind, daysAgo])))(
+    'fails closed on a %s in scanned day offset %i even when incomplete evidence is quota-only', (kind, daysAgo) => {
+      const fixture = runFixture(13, [quotaError]);
+      const memo = new Map();
+      const baseline = readReviewRunEvidence({ ...fixture, memo });
+      expect(baseline).toHaveLength(13);
+      expect(baseline.every(row => row.incomplete && row.quotaOnly === true)).toBe(true);
+      expect(decideSameHeadHold(pr, baseline, options)).toBeNull();
+
+      const day = iso(at - daysAgo * 86_400_000).slice(0, 10);
+      const path = join(fixture.spansDir, `${day}.jsonl`);
+      if (kind === 'corrupt line') {
+        // Valid quota spans must not mask a possibly hidden genuine failure.
+        writeFileSync(path, `${JSON.stringify(quotaSpan())}\n{torn json\n${JSON.stringify(quotaSpan())}\n`);
+      } else {
+        // EISDIR remains deterministic even under a privileged test runner.
+        mkdirSync(path);
+        expect(() => readFileSync(path, 'utf8')).toThrow(expect.objectContaining({ code: 'EISDIR' }));
+      }
+
+      // Exercise fresh, memory-cached, and persisted evidence classifications.
+      for (const cache of [{ memo: new Map(), persist: false }, { memo }, { memo: new Map() }]) {
+        const rows = readReviewRunEvidence({ ...fixture, ...cache });
+        expect(rows).toHaveLength(13);
+        expect(rows.every(row => row.incomplete && row.quotaOnly === false)).toBe(true);
+        expect(decideSameHeadHold(pr, rows, options)).toMatchObject({
+          kind: 'same-head', count: 13, attemptsSinceWake: 13,
+          retryAt: null, noVerdict: { exhausted: true },
+        });
+      }
+    });
+
+  it('keeps evidence-based quota-only incomplete rows when the telemetry directory is absent (ENOENT)', () => {
+    const fixture = runFixture(13, [quotaError]);
+    rmSync(fixture.spansDir, { recursive: true });
+    expect(() => readFileSync(join(fixture.spansDir, `${iso(at).slice(0, 10)}.jsonl`), 'utf8'))
+      .toThrow(expect.objectContaining({ code: 'ENOENT' }));
+
+    const rows = readReviewRunEvidence({ ...fixture, memo: new Map() });
+    expect(rows).toHaveLength(13);
+    expect(rows.every(row => row.incomplete && row.quotaOnly === true)).toBe(true);
+    expect(decideSameHeadHold(pr, rows, options)).toBeNull();
+  });
+
   it('overlays newly arrived spans after memory and disk cache reads without caching the overlay', () => {
     const fixture = runFixture();
     const memo = new Map();
