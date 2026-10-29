@@ -53,25 +53,35 @@ const numeric = (value) => {
 };
 
 /**
- * Select the greatest (run_attempt, id) exact integer pair per case-insensitive name.
+ * Select the greatest (run_id, run_attempt, id) exact integer tuple per name.
+ * Attempts belong to one workflow run. Without run identities, retain the
+ * (run_attempt, id) ranking; with mixed identities, prefer global check ids
+ * before attempts so counters from different runs cannot hide newer evidence.
  * Exact ties retain the first row. Inputs are never mutated.
  * @param {object[]} checks Check attempts.
  * @returns {object[]} Original winning rows, in first-seen name order.
  * @example latestAttempts([{ name: 'ci', id: 1 }, { name: 'ci', id: 2 }]);
  */
 export function latestAttempts(checks = []) {
-  const latest = new Map();
+  const groups = new Map();
   for (const check of checks) {
     const name = normalize(check.name);
-    const previous = latest.get(name);
-    const attempt = numeric(check.run_attempt);
-    const previousAttempt = numeric(previous?.run_attempt);
-    if (!previous || attempt > previousAttempt
-      || (attempt === previousAttempt && numeric(check.id) > numeric(previous.id))) {
-      latest.set(name, check);
-    }
+    if (!groups.has(name)) groups.set(name, []);
+    groups.get(name).push(check);
   }
-  return [...latest.values()];
+  return [...groups.values()].map(group => {
+    const allRunsKnown = group.every(check => numeric(check.run_id) > 0n);
+    const someRunsKnown = group.some(check => numeric(check.run_id) > 0n);
+    const fields = allRunsKnown ? ['run_id', 'run_attempt', 'id']
+      : someRunsKnown ? ['id', 'run_attempt'] : ['run_attempt', 'id'];
+    return group.reduce((previous, check) => {
+      for (const field of fields) {
+        const difference = numeric(check[field]) - numeric(previous[field]);
+        if (difference !== 0n) return difference > 0n ? check : previous;
+      }
+      return previous;
+    });
+  });
 }
 
 /**

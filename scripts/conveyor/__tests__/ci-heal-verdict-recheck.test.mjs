@@ -13,6 +13,60 @@ const input = { escalation: { outcome: 'not-a-ci-break', headSha: fixture.headRe
 const green = fixture.requiredChecks.map((name) => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' }));
 
 describe('R10 escalation send-back regressions', () => {
+  it('R10 item 1: a newer merge-gate job failure supersedes an older review-hold rerun', async () => {
+    const requiredChecks = ['test', 'merge-gate'];
+    const held = excuseMergeGateRows([
+      { name: 'merge-gate', id: 123, run_id: 100, run_attempt: 3, status: 'COMPLETED', conclusion: 'FAILURE' },
+    ], {
+      prNumber: 6042, headSha: fixture.headRefOid, labels: ['ready-to-merge'], setting: 'on',
+      readVerdict: () => ({ num: 6042, head_sha: fixture.headRefOid, ok: false,
+        results: [{ id: 'review-acceptance', status: 'hold', reason: 'review pending' }] }),
+    });
+    expect(held.reviewHold).toBe(true);
+    for (const reverse of [false, true]) {
+      const gates = [...held.rows,
+        { name: 'merge-gate', id: 234, run_id: 200, run_attempt: 1, status: 'COMPLETED',
+          conclusion: 'FAILURE', output: { summary: 'npm ci failed' } },
+      ];
+      const rollup = [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+        ...(reverse ? gates.toReversed() : gates)];
+      const evidence = { ...input, requiredChecks, rollup };
+      expect.soft(requiredCheckStates(evidence).red).toEqual(['merge-gate']);
+      expect.soft(contradictingChecks(evidence)).toEqual(['merge-gate']);
+      expect.soft(ciGreenForEscalation(evidence)).toBe(false);
+      expect.soft(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(false);
+      expect.soft(await checkNeedsHumanEscalable({
+        pr: 6042, headSha: fixture.headRefOid, outcome: 'needs-human', settings: { recheckNotCiBreak: true },
+        readPr: () => ({ headRefOid: fixture.headRefOid, statusCheckRollup: rollup }),
+        readRequired: () => ({ checks: requiredChecks }),
+      })).toEqual({ refusal: null });
+    }
+  });
+
+  it('R10 item 2: a newer drain-blocking CodeQL failure supersedes an older successful rerun', async () => {
+    const requiredChecks = ['test'];
+    for (const reverse of [false, true]) {
+      const scans = [
+        { name: 'CodeQL', id: 123, run_id: 100, run_attempt: 3, status: 'COMPLETED', conclusion: 'SUCCESS' },
+        { name: 'CodeQL', id: 234, run_id: 200, run_attempt: 1, status: 'COMPLETED', conclusion: 'FAILURE' },
+      ];
+      const rollup = [
+        { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+        { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+        ...(reverse ? scans.toReversed() : scans),
+      ];
+      const result = verdictRecheck.gateOnlyRedStates({ requiredChecks, rollup,
+        drainGateSettings: { drainBlocksOnCodeQL: true } });
+      expect.soft(result.gateOnlyRed).toBe(false);
+      expect.soft(result.red).toContain('CodeQL');
+      expect.soft(await checkNeedsHumanEscalable({
+        pr: 6042, headSha: fixture.headRefOid, outcome: 'needs-human', settings: { recheckNotCiBreak: true },
+        readPr: () => ({ headRefOid: fixture.headRefOid, statusCheckRollup: rollup }),
+        readRequired: () => ({ checks: requiredChecks }),
+      })).toEqual({ refusal: null });
+    }
+  });
+
   it('keeps a required merge-gate npm ci failure red and allows needs-human escalation', async () => {
     const requiredChecks = ['test', 'merge-gate'];
     const rollup = [
