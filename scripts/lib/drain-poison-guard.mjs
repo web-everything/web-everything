@@ -15,9 +15,9 @@ const identityLines = lines => lines.map(line => line.match(IDENTITY)?.[2]).filt
  * A card's identities. `parsed` is true when the text opens with a closed `---` block: its identities then come
  * from that frontmatter only, since a body may quote another card's `bornAs:` as an example. The block is read with
  * gray-matter, the parser the standards check's `duplicateBornAs` reads `bornAs` through, so a quoted key or a
- * trailing comment means the same here as there. A block YAML cannot parse falls back to its identity lines, so a
- * malformed card still fails closed. Otherwise `ids` holds every identity line in the whole text, and the caller
- * decides how to fail closed.
+ * trailing comment means the same here as there. A block YAML cannot parse is `malformed`: its `ids` are its identity
+ * lines, which may run on into the body when the closing fence is missing. Otherwise `ids` holds every identity line
+ * in the whole text. In both cases the caller decides how to fail closed.
  */
 function cardIdentities(text) {
   const lines = String(text ?? '').replace(/^\uFEFF/, '').split(/\r?\n/);
@@ -25,7 +25,7 @@ function cardIdentities(text) {
   if (end <= 0) return { parsed: false, ids: identityLines(lines) };
   const block = lines.slice(1, end);
   let data;
-  try { data = matter(['---', ...block, '---', ''].join('\n'), {}).data; } catch { return { parsed: true, ids: identityLines(block) }; }
+  try { data = matter(['---', ...block, '---', ''].join('\n'), {}).data; } catch { return { parsed: true, malformed: true, ids: identityLines(block) }; }
   const fields = data && typeof data === 'object' && !Array.isArray(data) ? [data.bornAs, data.id] : [];
   return { parsed: true, ids: fields.filter(value => typeof value === 'string').map(value => value.trim()) };
 }
@@ -83,25 +83,31 @@ export function checkBornAsCollision({ exec, headSha, base = 'main', cwd, primar
     // main card's own frontmatter.
     let matches;
     const patterns = [...new Set(added.map(card => card.hash))].flatMap(hash => ['-e', hash]);
-    try { matches = run(['grep', '-z', '-F', ...patterns, `origin/${base}`, '--', 'backlog/']); }
+    // `--text` searches a card holding a NUL byte too: Git otherwise prints only "Binary file … matches" for it.
+    try { matches = run(['grep', '-z', '--text', '-F', ...patterns, `origin/${base}`, '--', 'backlog/']); }
     catch (e) { if (e.status === 1) matches = ''; else throw e; }
     const prefix = `origin/${base}:`;
-    // A top-level card without frontmatter that carries an added hash on an identity line is unknown evidence:
-    // unreadable (held, never labelled). A file below a backlog subdirectory without frontmatter is not a card and
-    // owns no identity.
+    // Only frontmatter YAML reads confirms that a main card owns an identity. A top-level card whose frontmatter is
+    // missing or not valid YAML, and that carries an added hash on an identity line, is unknown evidence: unreadable
+    // (held, never labelled), since those lines may be a body example. A file below a backlog subdirectory without
+    // readable frontmatter is not a card and owns no identity.
     const seenCards = new Set();
+    let unreadable = null;
     for (const line of matches.split('\n')) {
       const split = line.indexOf('\0');
       if (!line.startsWith(prefix) || split < 0) continue;
       const mainCard = line.slice(prefix.length, split);
       if (!mainCard.startsWith('backlog/') || seenCards.has(mainCard)) continue;
       seenCards.add(mainCard);
-      const { parsed, ids } = cardIdentities(run(['show', `${prefix}${mainCard}`]));
+      const { parsed, malformed, ids } = cardIdentities(run(['show', `${prefix}${mainCard}`]));
       const card = added.find(card => ids.includes(card.hash));
       if (!card) continue;
-      if (!parsed && TOP_LEVEL_CARD.test(mainCard)) throw new Error(`main card ${mainCard} has no readable frontmatter`);
-      if (parsed) return done({ collision: { hash: card.hash, path: card.path, mainCard } });
+      const readable = parsed && !malformed;
+      if (readable) return done({ collision: { hash: card.hash, path: card.path, mainCard } });
+      // Held only after every hit is read, so an unreadable card never hides a readable duplicate sorted after it.
+      if (TOP_LEVEL_CARD.test(mainCard)) unreadable ??= mainCard;
     }
+    if (unreadable) throw new Error(`main card ${unreadable} has no readable frontmatter`);
     return done({ ok: true });
   } catch (e) { return done({ error: String(e?.message ?? e) }); }
 }
