@@ -567,7 +567,8 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
   });
 
   it.each([
-    "You've hit your weekly limit · resets ...", 'HTTP 429',
+    "You've hit your weekly limit · resets ...", 'HTTP 429 Too Many Requests',
+    '429 Too Many Requests', '429 rate_limit_error Rate limit exceeded',
     "You've hit your weekly limit · resets Oct 30 at 4pm (America/Toronto)",
     "You've hit your usage limit",
     '429 {"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}',
@@ -593,6 +594,8 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
 
   it.each([
     'schema invalid', '',
+    'HTTP 429 fixture failed: expected 429, received 500',
+    'HTTP 429', 'HTTP 429 request failed', 'status 429 fixture',
     'rate_limit', 'rate limit', 'too many requests', 'Usage limit reached',
     'rate limit must be a positive integer',
     'too many requests configured: expected at most 10',
@@ -612,20 +615,29 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
     expect(error).not.toHaveProperty('holdRow');
   });
 
-  it('merges quota classification into existing unparseable-spawn telemetry without changing the error message', async () => {
-    const result = 'HTTP 429: too many requests';
-    const { fn } = fakeSpawn('not JSON', { code: 1, stderr: result });
+  it.each([
+    "You've hit your weekly limit",
+    'HTTP 429: too many requests',
+    '429 rate_limit_error Rate limit exceeded',
+  ].flatMap(text => [
+    { source: 'stdout', stdout: text, stderr: '' },
+    { source: 'stderr', stdout: 'not JSON', stderr: text },
+  ]))('never tags UNPARSEABLE raw $source as provider-quota: $stdout $stderr', async ({ stdout, stderr }) => {
+    const { fn } = fakeSpawn(stdout, { code: 1, stderr });
     const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE,
       sessionId: SID, spawnFn: fn, retries: 0 }).catch(e => e);
     const original = new JudgeUnparseableError({ attempt: 1, attempts: 1, exitCode: 1,
-      signal: null, stdout: 'not JSON', stderr: result, wallMs: 0, sessionId: SID, failedAttempts: [] });
-    expect(error).toBeInstanceOf(Error);
+      signal: null, stdout, stderr, wallMs: 0, sessionId: SID, failedAttempts: [] });
+    expect(error).toBeInstanceOf(JudgeUnparseableError);
     expect(error.message).toBe(original.message);
     expect(error.telemetry).toMatchObject({
-      sessionId: SID, exitCode: 1, attempts: 1, stderrTail: result,
-      failure: 'unparseable-stdout', failureKind: 'provider-quota',
+      sessionId: SID, exitCode: 1, attempts: 1, stderrTail: stderr,
+      failure: 'unparseable-stdout',
     });
-    expect(error.telemetry.failureText).toContain(result);
+    expect(error.telemetry).not.toHaveProperty('failureKind');
+    expect(error.telemetry).not.toHaveProperty('failureText');
+    expect(error).not.toHaveProperty('quota');
+    expect(error).not.toHaveProperty('holdRow');
   });
 
   it('refuses an empty input rather than spawning a juror with nothing to judge', async () => {

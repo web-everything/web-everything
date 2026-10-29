@@ -16,7 +16,8 @@ const structuredRateLimit = '429 {"type":"error","error":{"type":"rate_limit_err
 const quotaErrors = [
   "You've hit your weekly limit · resets ...",
   "You've hit your weekly limit · resets Oct 30",
-  '429 Too Many Requests', 'HTTP 429', 'HTTP 429 request failed',
+  '429 Too Many Requests', 'HTTP 429 Too Many Requests',
+  '429 rate_limit_error', '429 rate_limit_error Rate limit exceeded',
   'status 429 Too Many Requests', 'rate_limit_error', 'insufficient_quota',
   'RESOURCE_EXHAUSTED: Quota exceeded',
   ...['rate_limit_error', 'insufficient_quota'].flatMap(type => [
@@ -32,6 +33,9 @@ const ordinaryErrors = [
   "You've hit your limit of 2 repair rounds",
   "You've hit your limit",
   'schema invalid', 'the juror failed with no result text',
+  'HTTP 429 fixture failed: expected 429, received 500',
+  'HTTP 429', 'HTTP 429 request failed', 'status 429 fixture',
+  '429', '429 fixture failed',
   'disk quota exceeded on /tmp', 'schema invalid at line 429',
   'port 4290 refused', 'quota-check script crashed',
   'rate_limit', 'rate limit', 'too many requests', 'usage limit reached',
