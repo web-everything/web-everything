@@ -65,8 +65,8 @@ export { isTestFile };
 // filter. Test-shaped names under excluded components refuse remote admission.
 const safeDotDirectory = /^(?:\.github|\.husky|\.vscode|\.storybook|\.changeset)$/;
 const safeDotFile = /^(?:\.gitignore|\.gitattributes|\.editorconfig|\.nvmrc|\.node-version|\.prettierrc.*|\.eslintrc.*|\.gitkeep|\.nycrc.*)$/;
-const keyComponent = /(?:_rsa|^id_|\.(?:pem|key|p12|pfx|jks|keystore)$)/;
-const credentialComponent = /token|secret|creds|credential|passwd|password|oauth|apikey|api-key/;
+const keyComponent = /(?:_rsa|\.(?:pem|key|p12|pfx|jks|keystore)$)/;
+const credentialComponent = /token|secret|creds|credential|passwd|password|oauth|apikey|api-key|^id_/;
 const sourceExtension = /\.(?:mjs|js|ts|tsx|jsx|css|md|html)$/;
 function normalizedComponent(part) {
   const utf8 = part.toString('utf8');
@@ -161,6 +161,8 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     const parts = pathParts(path);
     const names = parts.map(normalizedComponent);
     const excludedByPolicy = names.some((name,i) => excludedComponent(name, i === names.length-1));
+    // Only credential-name-only sources can use public evidence. Hidden paths,
+    // key components and other exclusions win even when a name also matches.
     const credentialSource = excludedByPolicy && sourceExtension.test(names.at(-1))
       && !names.some((name,i) => excludedComponent(name, i === names.length-1, true));
     let publicOid;
@@ -171,10 +173,11 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if (!indexedOid || indexedOid !== publicOid) throw excludedSource();
     }
     if ((excludedByPolicy && !publicOid) || names.includes('node_modules')) {
-      if (!names.includes('node_modules') && excludedByPolicy && sourceExtension.test(names.at(-1))) {
+      const excludedTest = isTestFile(path) || /\.(test|spec)\./.test(parts.at(-1).toString('latin1'));
+      if (!names.includes('node_modules') && excludedByPolicy && excludedTest && sourceExtension.test(names.at(-1))) {
         throw excludedSource();
       }
-      if (isTestFile(path) || /\.(test|spec)\./.test(parts.at(-1).toString('latin1'))) throw new Error('Excluded test: use local fallback');
+      if (excludedTest) throw new Error('Excluded test: use local fallback');
       excluded.push(path); continue;
     }
     let absolute = Buffer.from(cwd), st;

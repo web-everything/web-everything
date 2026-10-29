@@ -1249,6 +1249,51 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
   const indexRecord = (name, data) => Buffer.from(`100644 ${blob(data)} 0\t${name}\0`);
   const treeRecord = (name, data) => Buffer.from(`100644 blob ${blob(data)}\t${name}\0`);
 
+  it.each([
+    '.claude/skills/x/SKILL.md', '.githooks/pre-commit.js', '.eleventy.js',
+    '.claude/secrets.md', '.secret.js', 'secret-directory/.hidden.md',
+    'private.key/safe.md', 'secret.key/safe.js', '.env.local.js',
+    '.netrc/safe.md', '.npmrc/safe.js',
+  ])('silently excludes tracked forbidden source %s and proceeds remotely without public evidence', async name => {
+    mkdirSync(join(cwd, name, '..'), {recursive:true});
+    writeFileSync(join(cwd, name), 'DO_NOT_TRANSMIT');
+    const paths = ['package-lock.json', name].map(value => Buffer.from(value));
+    const stage = indexRecord(name, 'DO_NOT_TRANSMIT');
+    const inventory = gitInventory(paths, stage, new Error('must not read public evidence'));
+    const manifest = await build({cwd, exec:inventory});
+    expect(manifest.entries.map(entry => entry.path)).toEqual([Buffer.from('package-lock.json')]);
+    expect(manifest.excluded).toEqual([Buffer.from(name)]);
+    expect(callsOf(inventory).some(call => call.args[0] === 'ls-tree')).toBe(false);
+    const exec = acceptingTransport(paths, stage);
+    expect(await runRemote({argv, cwd, runId, exec})).toEqual({mode:'remote', code:0});
+    expect(callsOf(exec).find(call => call.file === 'rsync').input).toEqual(Buffer.from('./package-lock.json\0'));
+    expect(JSON.parse(callsOf(exec).find(isRun).input).manifest).toEqual(wire(manifest));
+  });
+
+  it.each(['.claude/skills/x/SKILL.test.md', '.eleventy.test.js', '.claude/secrets.test.js', 'private.key/safe.test.js'])
+  ('still refuses excluded test %s before transmitting a snapshot', async name => {
+    const paths = ['package-lock.json', name].map(value => Buffer.from(value));
+    const exec = acceptingTransport(paths, indexRecord(name, 'must run locally'));
+    await expect(build({cwd, exec})).rejects.toMatchObject({code:'excluded-source-file'});
+    expect(await runRemote({argv, cwd, runId, exec}))
+      .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
+    expect(callsOf(exec).some(call => call.file === 'rsync' || isPrepare(call) || isRun(call))).toBe(false);
+  });
+
+  it.each(['id_custom.md', 'id_backup/safe.js'])
+  ('requires public evidence for credential-name-only source %s', async name => {
+    mkdirSync(join(cwd, name, '..'), {recursive:true});
+    writeFileSync(join(cwd, name), 'public');
+    const paths = [Buffer.from(name)];
+    const stage = indexRecord(name, 'public');
+    await expect(build({cwd, exec:gitInventory(paths, stage)}))
+      .rejects.toMatchObject({code:'excluded-source-file'});
+    const manifest = await build({cwd, exec:gitInventory(paths, stage,
+      {code:0, stdout:treeRecord(name, 'public')})});
+    expect(manifest.entries.map(entry => entry.path)).toEqual(paths);
+    expect(manifest.excluded).toEqual([]);
+  });
+
   it('keeps tracked credential JSON excluded from entries', async () => {
     const paths = [Buffer.from('secret-example.json')];
     const stage = Buffer.from(`100644 ${'a'.repeat(40)} 0\tsecret-example.json\0`);
@@ -1295,13 +1340,10 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
   ('keeps public tracked non-source or forbidden-component path %s excluded', async name => {
     const paths = [Buffer.from(name)];
     const exec = gitInventory(paths, indexRecord(name, 'public'), {code:0, stdout:treeRecord(name, 'public')});
-    if (name.endsWith('.md')) {
-      await expect(build({cwd, exec})).rejects.toMatchObject({code:'excluded-source-file'});
-    } else {
-      const manifest = await build({cwd, exec});
-      expect(manifest.entries).toEqual([]);
-      expect(manifest.excluded).toEqual(paths);
-    }
+    const manifest = await build({cwd, exec});
+    expect(manifest.entries).toEqual([]);
+    expect(manifest.excluded).toEqual(paths);
+    expect(callsOf(exec).some(call => call.args[0] === 'ls-tree')).toBe(false);
   });
 
   it.each(['.github/workflows/ci.yml','.husky/pre-commit','.vscode/settings.json','.storybook/main.ts','.changeset/change.md',
