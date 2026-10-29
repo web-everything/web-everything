@@ -27,6 +27,10 @@ const closedCases = [
   ['empty seat timings', run => { run.seatTimings = []; }],
   ['missing seat timings', run => { delete run.seatTimings; }],
   ['one failed seat has no matching row', run => { run.telemetry.pop(); }],
+  ['two errors for judge have only one quota row (second failure has no telemetry)', run => {
+    run.seatTimings = [failedSeat('judge'), failedSeat('judge')];
+    run.telemetry = [quotaRow('judge')];
+  }],
   ['rows name unrelated steps', run => { run.telemetry = [quotaRow('unrelated')]; }],
   ['one failed seat has another failureKind', run => { run.telemetry[1].failureKind = 'provider-error'; }],
   ['one failed seat has no failureKind', run => { delete run.telemetry[1].failureKind; }],
@@ -58,6 +62,13 @@ describe.each([false, true])('reviewRunEvidence quotaOnly (completed: %s)', comp
     const run = reviewRun(0, complete);
     mutate(run);
     expect(reviewRunEvidence(run)).toMatchObject({ quotaOnly: false });
+  });
+
+  it('exempts two errors for judge when each has its own provider-quota telemetry row', () => {
+    const run = reviewRun(0, complete);
+    run.seatTimings = [failedSeat('judge'), failedSeat('judge')];
+    run.telemetry = [quotaRow('judge'), quotaRow('judge')];
+    expect(reviewRunEvidence(run)).toMatchObject({ quotaOnly: true });
   });
 
   it('does not infer quotaOnly from recorded referral failure text without seat telemetry', () => {
@@ -92,6 +103,17 @@ describe('same-head quota attempt accounting from persisted seat telemetry', () 
 
   it('fails closed and holds for 13 incomplete runs with missing telemetry', () => {
     const rows = history(run => { delete run.telemetry; });
+    expect(decideSameHeadHold(pr, rows, options)).toMatchObject({
+      kind: 'same-head', count: 13, attemptsSinceWake: 13, retryAt: null,
+      noVerdict: { exhausted: true },
+    });
+  });
+
+  it('holds for 13 incomplete runs with two judge errors but only one quota telemetry row each', () => {
+    const rows = history(run => {
+      run.seatTimings = [failedSeat('judge'), failedSeat('judge')];
+      run.telemetry = [quotaRow('judge')];
+    });
     expect(decideSameHeadHold(pr, rows, options)).toMatchObject({
       kind: 'same-head', count: 13, attemptsSinceWake: 13, retryAt: null,
       noVerdict: { exhausted: true },

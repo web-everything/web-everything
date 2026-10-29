@@ -7,6 +7,9 @@ const providerMessages = [
   "You've hit your daily limit · resets tomorrow",
   "You've hit your monthly limit · resets Nov 1",
   "You've hit your usage limit",
+  "You've hit your session limit",
+  "You've hit your hourly limit",
+  "You've hit your 5-hour limit",
   'You exceeded your current quota',
 ];
 const structuredRateLimit = '429 {"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}';
@@ -26,6 +29,8 @@ const quotaErrors = [
   'API Error: 429 rate_limit_error',
 ];
 const ordinaryErrors = [
+  "You've hit your limit of 2 repair rounds",
+  "You've hit your limit",
   'schema invalid', 'the juror failed with no result text',
   'disk quota exceeded on /tmp', 'schema invalid at line 429',
   'port 4290 refused', 'quota-check script crashed',
