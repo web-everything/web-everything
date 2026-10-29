@@ -32,10 +32,19 @@ const sha = result => {
 function readSyncState(file, io = fs) {
   try {
     const data = JSON.parse(io.readFileSync(file, 'utf8'));
-    if (!data?.lastSyncedMain || typeof data.lastSyncedMain !== 'object' || Array.isArray(data.lastSyncedMain)
-      || Object.values(data.lastSyncedMain).some(v => !/^[a-f0-9]{40}$/.test(v))) throw new Error('invalid main-sync state; operator repair required');
+    if (!data || !Object.hasOwn(data, 'lastSyncedMain')) throw new Error('invalid main-sync state; operator repair required');
+    for (const map of [data.lastSyncedMain, Object.hasOwn(data, 'attemptedMain') ? data.attemptedMain : {}]) {
+      if (!map || typeof map !== 'object' || Array.isArray(map)
+        || Object.values(map).some(v => typeof v !== 'string' || !/^[a-f0-9]{40}$/.test(v))) throw new Error('invalid main-sync state; operator repair required');
+    }
+    data.attemptedMain ??= {};
     return data;
-  } catch (error) { if (error.code === 'ENOENT') return { lastSyncedMain: {} }; throw error; }
+  } catch (error) { if (error.code === 'ENOENT') return { lastSyncedMain: {}, attemptedMain: {} }; throw error; }
+}
+function writeSyncState(file, data, io) {
+  const temp = `${file}.${randomUUID()}.tmp`;
+  try { io.writeFileSync(temp, JSON.stringify(data)); io.renameSync(temp, file); }
+  finally { io.rmSync(temp, { force: true }); }
 }
 function acquire(file, io = fs) {
   io.mkdirSync(dirname(file), { recursive: true });
@@ -80,12 +89,13 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
     const lock = marker(root, env, ref);
     try {
       if (!isSafeBranchName(ref)) throw new Error('unsafe overlay ref');
+      const synced = readSyncState(sidecar(root, env));
       token = acquire(lock);
       if (!token) { result.skipped.push(ref); continue; }
       output(run(['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main', `+refs/heads/${ref}:refs/remotes/origin/${ref}`]));
       const main = sha(run(['rev-parse', 'origin/main']));
-      const last = readSyncState(sidecar(root, env)).lastSyncedMain[ref];
-      if (last === main) { result.skipped.push(ref); continue; }
+      const last = synced.lastSyncedMain[ref];
+      if (last === main || synced.attemptedMain[ref] === main) { result.skipped.push(ref); continue; }
       const base = last ?? sha(run(['merge-base', 'origin/main', `origin/${ref}`]));
       const changed = new Set(paths(run(['diff', '--name-only', '-z', base, main])));
       if (!paths(run(['diff', '--name-only', '-z', `origin/main...origin/${ref}`])).some(f => changed.has(f))) {
@@ -115,9 +125,11 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
   const now = deps.now ?? (() => new Date().toISOString());
   const git = (args, cwd = root) => (deps.git ?? executeGit)(args, { cwd, env: { ...env, ...REBUILD_IDENTITY_ENV } });
   const lock = marker(root, env, ref);
-  let scratchParent, heartbeat;
+  let scratchParent, heartbeat, main;
   try {
     if (!isSafeBranchName(ref)) throw new Error('unsafe overlay ref');
+    readSyncState(sidecar(root, env), io);
+    main = sha(git(['rev-parse', 'origin/main']));
     if (token) { if (io.readFileSync(lock, 'utf8') !== token) throw new Error('marker ownership lost'); }
     else { token = acquire(lock, io); if (!token) return; }
     heartbeat = setInterval(() => {
@@ -127,7 +139,6 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     heartbeat.unref();
     const state = readOverlayState(root, { env }), old = state.overlays.find(o => o.ref === ref);
     if (state.corrupt || !old || !selectSyncTargets(state).includes(ref)) throw new Error('overlay registration unavailable');
-    readSyncState(sidecar(root, env), io);
     scratchParent = io.mkdtempSync(join(env.TMPDIR || tmpdir(), 'we-overlay-main-sync-'));
     const scratch = join(scratchParent, 'repo');
     const url = output(git(['remote', 'get-url', 'origin'])).trim();
@@ -136,7 +147,8 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     output(git(['remote', 'set-url', 'origin', origin], scratch));
     output(git(['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main', `+refs/heads/${ref}:refs/remotes/origin/${ref}`], scratch));
     output(git(['checkout', '-b', ref, `origin/${ref}`], scratch));
-    const from = sha(git(['rev-parse', 'HEAD'], scratch)), main = sha(git(['rev-parse', 'origin/main'], scratch));
+    const from = sha(git(['rev-parse', 'HEAD'], scratch));
+    main = sha(git(['rev-parse', 'origin/main'], scratch));
     const base = sha(git(['merge-base', main, from], scratch));
     const own = paths(git(['diff', '--name-only', '-z', base, from], scratch));
     const mainFiles = new Set(paths(git(['diff', '--name-only', '-z', base, main], scratch)));
@@ -181,11 +193,19 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     if (push.status !== 0 || push.error) return { pushed: false };
     const file = sidecar(root, env), synced = readSyncState(file, io);
     synced.lastSyncedMain[ref] = main;
-    const temp = join(scratchParent, 'main-sync.json');
-    io.writeFileSync(temp, JSON.stringify(synced)); io.renameSync(temp, file);
+    writeSyncState(file, synced, io);
     event(root, { kind: 'overlay-main-synced', ref, from, to, tests }, { env });
     return { pushed: true, ref, from, to, tests };
-  } catch (error) { needsYou(root, env, ref, error, io); throw error; }
+  } catch (error) {
+    try {
+      if (main) {
+        const file = sidecar(root, env), state = readSyncState(file, io);
+        state.attemptedMain[ref] = main;
+        writeSyncState(file, state, io);
+      }
+    } catch (stateError) { needsYou(root, env, ref, stateError, io); }
+    needsYou(root, env, ref, error, io); throw error;
+  }
   finally {
     clearInterval(heartbeat);
     try { if (scratchParent) io.rmSync(scratchParent, { recursive: true, force: true }); }

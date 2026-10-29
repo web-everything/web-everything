@@ -7,6 +7,7 @@ import { kickOverlayMainSync, runOverlayMainSync, selectSyncTargets, resolveOver
 import { addOverlay, readOverlayState, overlayFilePath, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { alertsFilePath } from '../daemon-rebuild/state.mjs';
 import { readOverlayConflictWakes } from '../overlay-conflict-wake.mjs';
+import { probeOverlayMainSync } from '../../conveyor/health-watch.mjs';
 
 const temps = [], ref = 'lane/fix';
 const temp = () => { const p = fs.mkdtempSync(join(tmpdir(), 'we-main-sync-test-')); temps.push(p); return p; };
@@ -22,7 +23,7 @@ const synced = f => f.events.filter(e => e.kind === 'overlay-main-synced');
 const alerts = f => fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse)
   .filter(e => e.kind.includes('needs-you'));
 
-function fixture({ conflict = false, unrelated = false, count = 1 } = {}) {
+function fixture({ conflict = false, unrelated = false, count = 1, overlayTest = true } = {}) {
   const base = temp(), root = join(base, 'clone'), origin = join(base, 'origin.git');
   fs.mkdirSync(root); fs.mkdirSync(join(root, 'node_modules'));
   ok(root, ['init', '-q', '-b', 'main']);
@@ -36,7 +37,7 @@ function fixture({ conflict = false, unrelated = false, count = 1 } = {}) {
   ok(root, ['checkout', '-qb', ref]);
   const branch = [...lines]; branch[0] = 'export const value0 = 100;';
   write(root, 'worker.mjs', `${branch.join('\n')}\n`);
-  write(root, 'overlay.test.mjs', "import './worker.mjs';\n");
+  if (overlayTest) write(root, 'overlay.test.mjs', "import './worker.mjs';\n");
   ok(root, ['add', '.']); ok(root, ['commit', '-qm', 'overlay']);
   const oldSha = ok(root, ['rev-parse', 'HEAD']);
   ok(root, ['checkout', '-q', 'main']);
@@ -72,6 +73,8 @@ function fixture({ conflict = false, unrelated = false, count = 1 } = {}) {
 }
 const job = f => runOverlayMainSync({ root: f.root, ref, env: f.env, deps: f.deps });
 const tick = (f, extra = {}) => kickOverlayMainSync({ root: f.root, env: f.env, mode: 'on', git: f.deps.git, ...extra });
+const spawner = () => vi.fn(() => ({ once: vi.fn(), unref: vi.fn() }));
+const attempted = f => expect(json(sidecar(f)).attemptedMain[ref]).toBe(f.mainSha);
 const unchanged = f => {
   expect(ok(f.root, ['rev-parse', 'HEAD'])).toBe(f.mainSha);
   expect(ok(f.root, ['status', '--porcelain'])).toBe('');
@@ -126,6 +129,10 @@ describe('overlay main sync', () => {
     expect(f.pushes).toHaveLength(1);
     expect(synced(f)).toEqual([]);
     expect(json(sidecar(f)).lastSyncedMain[ref]).toBe(f.baseSha);
+    expect(json(sidecar(f)).attemptedMain?.[ref]).toBeUndefined();
+    const spawnFn = spawner();
+    expect(tick(f, { spawnFn }).started).toEqual([ref]);
+    expect(spawnFn).toHaveBeenCalledOnce();
     unchanged(f);
   });
 
@@ -147,6 +154,7 @@ describe('overlay main sync', () => {
     await job(f).catch(() => {});
     expect(alerts(f).some(e => e.detail.ref === ref && /100/.test(e.detail.reason))).toBe(true);
     expect(f.pushes).toEqual([]); expect(f.deps.testRunner).not.toHaveBeenCalled();
+    attempted(f);
     expect(synced(f)).toEqual([]); unchanged(f);
   });
 
@@ -162,6 +170,7 @@ describe('overlay main sync', () => {
     expect(log.mock.calls.flat().join('\n')).toContain(`overlay-main-sync would merge main into ${ref}`);
     expect(spawnFn).not.toHaveBeenCalled();
     const eventFile = overlayFilePath(f.root, f.env).replace(/\.json$/, '.events.jsonl');
+    expect(fs.existsSync(sidecar(f))).toBe(false);
     expect(fs.readFileSync(eventFile, 'utf8').trim().split('\n').map(JSON.parse))
       .toContainEqual(expect.objectContaining({ kind: 'overlay-main-sync-shadow', ref }));
   });
@@ -187,5 +196,123 @@ describe('overlay main sync', () => {
     await tick(f, { mode: 'off', spawnFn });
     expect(spawnFn).not.toHaveBeenCalled();
     expect(readOverlayState(f.root, { env: f.env }).overlays.map(o => o.ref)).toEqual([ref]);
+  });
+
+  it('failing selected tests do not push and remember the attempted main', async () => {
+    const f = fixture(), passing = f.deps.testRunner;
+    f.deps.testRunner = vi.fn(async options => {
+      await passing(options);
+      return { status: 1, stdout: '', stderr: 'selected test failed' };
+    });
+    await expect(job(f)).rejects.toThrow(/command failed/);
+    expect(f.pushes).toEqual([]); expect(synced(f)).toEqual([]);
+    attempted(f); unchanged(f);
+  });
+
+  it.each(['failed', 'nothing executed'])('testRunner reports %s: no push, flagged and remembered', async outcome => {
+    const f = fixture(), passing = f.deps.testRunner;
+    f.deps.testRunner = vi.fn(async options => {
+      const result = await passing(options);
+      const reportFile = options.args.find(a => a.startsWith('--outputFile.json=')).split('=')[1];
+      const report = json(reportFile);
+      for (const test of report.testResults) test.assertionResults = outcome === 'failed' ? [{ status: 'failed' }] : [];
+      fs.writeFileSync(reportFile, JSON.stringify(report));
+      return result;
+    });
+    await expect(job(f)).rejects.toThrow(/did not pass or execute/);
+    expect(f.pushes).toEqual([]); expect(synced(f)).toEqual([]);
+    expect(alerts(f).some(e => /did not pass or execute/.test(e.detail.reason))).toBe(true);
+    attempted(f); unchanged(f);
+  });
+
+  it('empty test selection does not push, flags operator review and remembers main', async () => {
+    const f = fixture({ count: 0, overlayTest: false });
+    await expect(job(f)).rejects.toThrow(/test selection empty/);
+    expect(f.pushes).toEqual([]); expect(f.deps.testRunner).not.toHaveBeenCalled();
+    expect(alerts(f).some(e => /test selection empty; operator review required/.test(e.detail.reason))).toBe(true);
+    attempted(f); unchanged(f);
+  });
+
+  it('marker token lost before push refuses publication and preserves the new owner', async () => {
+    const f = fixture(), passing = f.deps.testRunner;
+    f.deps.testRunner = vi.fn(async options => {
+      const result = await passing(options);
+      fs.writeFileSync(marker(f), 'new-owner');
+      return result;
+    });
+    await expect(job(f)).rejects.toThrow(/marker changed/);
+    expect(f.pushes).toEqual([]); expect(synced(f)).toEqual([]);
+    expect(fs.readFileSync(marker(f), 'utf8')).toBe('new-owner');
+    attempted(f); unchanged(f);
+  });
+
+  it('unsafe ref --upload-pack=x is refused by kick and run before any spawn', async () => {
+    const f = fixture(), unsafe = '--upload-pack=x', spawnFn = spawner();
+    const state = json(overlayFilePath(f.root, f.env));
+    state.overlays[0].ref = unsafe;
+    fs.writeFileSync(overlayFilePath(f.root, f.env), JSON.stringify(state));
+    expect(tick(f, { spawnFn })).toMatchObject({ started: [], skipped: [unsafe] });
+    await expect(runOverlayMainSync({ root: f.root, ref: unsafe, env: f.env, deps: f.deps })).rejects.toThrow(/unsafe overlay ref/);
+    expect(spawnFn).not.toHaveBeenCalled(); expect(f.deps.git).not.toHaveBeenCalled();
+    expect(fs.existsSync(sidecar(f))).toBe(false);
+  });
+
+  it.each([
+    '{broken', '{}', JSON.stringify({ lastSyncedMain: { [ref]: 'origin/main' } }),
+    JSON.stringify({ lastSyncedMain: {}, attemptedMain: { [ref]: 'not-a-sha' } }),
+    JSON.stringify({ lastSyncedMain: {}, attemptedMain: null }),
+  ])('corrupt/non-SHA sidecar fails closed with no spawn (%#)', async raw => {
+    const f = fixture(), spawnFn = spawner();
+    fs.writeFileSync(sidecar(f), raw);
+    expect(tick(f, { spawnFn })).toMatchObject({ started: [], skipped: [ref] });
+    await expect(job(f)).rejects.toThrow();
+    expect(spawnFn).not.toHaveBeenCalled(); expect(f.deps.git).not.toHaveBeenCalled();
+    expect(fs.readFileSync(sidecar(f), 'utf8')).toBe(raw);
+    expect(alerts(f)).toHaveLength(2);
+  });
+
+  it('stale marker older than 30 minutes is taken over', () => {
+    const f = fixture(), spawnFn = spawner();
+    fs.mkdirSync(dirname(marker(f)), { recursive: true }); fs.writeFileSync(marker(f), 'stale-owner');
+    const stale = new Date(Date.now() - 31 * 60_000);
+    fs.utimesSync(marker(f), stale, stale);
+    expect(tick(f, { spawnFn }).started).toEqual([ref]);
+    expect(spawnFn).toHaveBeenCalledOnce();
+    expect(fs.readFileSync(marker(f), 'utf8')).not.toBe('stale-owner');
+  });
+
+  it('failure memory skips the same main after conflict and spawns again after main moves', async () => {
+    const f = fixture({ conflict: true }), spawnFn = spawner();
+    await expect(job(f)).rejects.toThrow(/merge conflicts/);
+    attempted(f);
+    const eventFile = overlayFilePath(f.root, f.env).replace(/\.json$/, '.events.jsonl');
+    const eventsBefore = fs.readFileSync(eventFile, 'utf8'), alertsBefore = alerts(f);
+    expect(tick(f, { spawnFn })).toMatchObject({ started: [], skipped: [ref] });
+    expect(tick(f, { spawnFn })).toMatchObject({ started: [], skipped: [ref] });
+    expect(spawnFn).not.toHaveBeenCalled();
+    expect(fs.readFileSync(eventFile, 'utf8')).toBe(eventsBefore);
+    expect(alerts(f)).toEqual(alertsBefore);
+    const tree = ok(f.origin, ['rev-parse', `${f.mainSha}^{tree}`]);
+    const moved = ok(f.origin, ['commit-tree', tree, '-p', f.mainSha, '-m', 'main moves again']);
+    ok(f.origin, ['update-ref', 'refs/heads/main', moved, f.mainSha]);
+    expect(tick(f, { spawnFn }).started).toEqual([ref]);
+    expect(spawnFn).toHaveBeenCalledOnce();
+  });
+});
+
+describe('health-watch overlay main sync wiring', () => {
+  it.each(['logs-dir', 'lock-root', 'state-root', 'dry-run', 'ps-fixture', 'arbitrary-fixture'])(
+    '%s suppresses clone discovery and overlay kicks', flag => {
+      const roots = vi.fn(), kick = vi.fn();
+      expect(probeOverlayMainSync({ [flag]: true }, roots, kick)).toBeUndefined();
+      expect(roots).not.toHaveBeenCalled(); expect(kick).not.toHaveBeenCalled();
+    });
+
+  it('one clone throwing returns its root and error and still kicks the next clone', () => {
+    const kick = vi.fn(({ root }) => { if (root === 'broken') throw new Error('corrupt overlay'); return { started: [ref] }; });
+    expect(probeOverlayMainSync({}, () => ['broken', 'healthy'], kick)).toEqual([
+      { root: 'broken', error: 'corrupt overlay' }, { started: [ref] },
+    ]);
+    expect(kick.mock.calls).toEqual([[{ root: 'broken' }], [{ root: 'healthy' }]]);
   });
 });
