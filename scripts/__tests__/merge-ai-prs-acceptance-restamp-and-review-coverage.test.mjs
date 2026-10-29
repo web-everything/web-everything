@@ -693,6 +693,12 @@ describe('PR #3432 — drain acceptance verification and pending reconciliation'
     view.comments[0].author = { login: 'untrusted-worker' };
     expect(decideDrainReviewGate(inputs, acceptanceOptions(view)).action).toBe('park');
   });
+
+  it('wires unreadable verification to a logged skip before the label-writing gate branches', () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
+    expect(src).toMatch(/const gate = decideDrainReviewGate\([\s\S]*?if \(gate.action === 'defer'\) \{\s*v.decision = 'skip';\s*v.reason = gate.reason;\s*process.stderr.write\([\s\S]*?continue;\s*\}/);
+    expect(src).toContain('const out = reconcileDrainReviewPending({');
+  });
 });
 
 /**
@@ -733,6 +739,11 @@ describe('PR #4446 — permission-change hold: score -> drain gate hand-off', ()
 
   it('a PR with no permission change still merges on its accept', () => {
     expect(drain(scoreOf(['docs/README.md'], ''), reviewedView()).action).toBe('merge');
+  });
+
+  it('the drain call site builds its gate input through drainGateInputs (not an inline copy)', () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
+    expect(src).toMatch(/const gate = decideDrainReviewGate\(\s*drainGateInputs\(\{\s*score,\s*labels: v\.prLabels,\s*deviation: v\.deviation,\s*netScored,\s*humanPinned\s*\}\),/);
   });
 
   it('forwards the deviation input beside the permission input', () => {
