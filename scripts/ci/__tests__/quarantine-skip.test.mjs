@@ -5,10 +5,14 @@
  * only that file, the main-fix PR runs it, main runs it, and `redMainMode: stop` (the shipped setting) skips nothing.
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import yaml from 'js-yaml';
 
-import { quarantineSkip } from '../quarantine-skip.mjs';
+import { quarantineSkip, renderExclude } from '../quarantine-skip.mjs';
 import { decideCiSkip, ciJobContext, addEntries, setFixPrs, pruneOnGreen, validateQuarantineList, testsToSkip, planSafetyNet } from '../../lib/red-main-quarantine.mjs';
 import { skipForList } from '../../lib/red-main-quarantine-io.mjs';
 
@@ -23,6 +27,60 @@ const Q = { value: 'quarantine', source: 'env' };
 const prEvent = (n) => ({ pull_request: { number: n, base: { ref: 'main' } } });
 
 const run = (o) => quarantineSkip({ env: {}, now: NOW, mode: Q, read: READ, changed: [], readEvent: () => o.event, flags: { event: 'pull_request', ref: `refs/pull/${o.pr}/merge`, 'event-path': '/e.json' }, ...o });
+
+describe('renderExclude — one exact Vitest exclude argument', () => {
+  it('renders no files as an empty line', () => {
+    expect(renderExclude([])).toEqual({ line: '', refused: [] });
+  });
+  it('preserves the single-file argument', () => {
+    expect(renderExclude([TEST_FILE])).toEqual({ line: `--exclude=${TEST_FILE}`, refused: [] });
+  });
+  it.each([2, 3])('renders %i files as one brace glob', (count) => {
+    const files = ['a.test.mjs', 'b.test.mjs', 'c.test.mjs'].slice(0, count);
+    expect(renderExclude(files)).toEqual({ line: `--exclude={${files.join(',')}}`, refused: [] });
+  });
+  it.each([...",{}[]()*?!\\ \t\n\r\v\f'\"$`", '\u00a0', '\0', '\u001b'])('refuses unsafe character %j and leaves that file running', (char) => {
+    const file = `scripts/a${char}b.test.mjs`;
+    expect(renderExclude([file])).toEqual({ line: '', refused: [file] });
+    expect(renderExclude(['a.test.mjs', file])).toEqual({ line: '--exclude=a.test.mjs', refused: [file] });
+    expect(renderExclude(['a.test.mjs', file, 'b.test.mjs'])).toEqual({
+      line: '--exclude={a.test.mjs,b.test.mjs}', refused: [file],
+    });
+  });
+  it('reports refused paths in why and preserves nonblocking names', () => {
+    const files = ['a.test.mjs', 'scripts/a,b.test.mjs', 'b.test.mjs'];
+    const read = { ok: true, list: { ...LIST, entries: files.map((test) => ({ ...LIST.entries[0], test })) } };
+    const options = { pr: 4990, event: prEvent(4990), read };
+    const result = run(options);
+    expect(result.line).toBe('--exclude={a.test.mjs,b.test.mjs}');
+    expect(result.skip).toEqual(['a.test.mjs', 'b.test.mjs']);
+    expect(result.why).toContain('scripts/a,b.test.mjs');
+    expect(result.why).toMatch(/not skipped.*unsafe.*running/i);
+    expect(run({ ...options, flags: { event: 'pull_request', ref: 'refs/pull/4990/merge', nonblocking: true } }).line).toBe(files.join(' '));
+  });
+  it('real Vitest accepts the rendered exclude and runs only the remaining file', () => {
+    let root;
+    try {
+      root = realpathSync(mkdtempSync(join(tmpdir(), 'quarantine-exclude-')));
+      writeFileSync(join(root, 'vitest.config.mjs'), 'export default { test: { globals: true, poolOptions: { threads: { singleThread: true } } } };\n');
+      const files = ['a.test.mjs', 'b.test.mjs', 'c.test.mjs'];
+      for (const file of files) writeFileSync(join(root, file), `it(${JSON.stringify(file)}, () => { expect(true).toBe(true); });\n`);
+      const { line } = renderExclude(files.slice(0, 2));
+      // npm/npx use an internal shell that can brace-expand arguments even with spawnSync's shell disabled.
+      const vitest = fileURLToPath(new URL('../../../node_modules/vitest/vitest.mjs', import.meta.url));
+      const child = spawnSync(process.execPath, [vitest, 'run', line, '--passWithNoTests', '--reporter=json'], {
+        cwd: root, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
+      });
+      expect(child.error).toBeUndefined();
+      expect(child.status, child.stderr || child.stdout).toBe(0);
+      const report = JSON.parse(child.stdout);
+      expect(report.numTotalTests).toBe(1);
+      expect(report.testResults.map((result) => result.name)).toEqual([join(root, 'c.test.mjs')]);
+    } finally {
+      if (root) rmSync(root, { recursive: true, force: true });
+    }
+  }, 40_000);
+});
 
 describe('quarantine-skip — 2026-10-10 replay', () => {
   it('an ordinary PR skips ONLY the quarantined test file', () => {
