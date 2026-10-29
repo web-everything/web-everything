@@ -566,6 +566,34 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
       .rejects.toThrow('Not logged in · Please run /login');
   });
 
+  it.each(["You've hit your weekly limit · resets ...", 'HTTP 429', 'rate_limit', 'rate limit', 'too many requests'])
+    ('tags quota failure %s without changing its message', async result => {
+      const { fn } = fakeSpawn(JSON.stringify({ is_error: true, result }), { code: 1 });
+      const before = Date.now();
+      const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, spawnFn: fn })
+        .catch(e => e);
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toBe(`judge-spawn: the juror failed: ${result}`);
+      expect(error.quota).toBe(true);
+      expect(error.holdRow).toEqual({ provider: 'claude', status: 'quota-exhausted',
+        scoredAt: expect.any(String), quotaResetsAt: null });
+      const scoredAt = Date.parse(error.holdRow.scoredAt);
+      expect(new Date(scoredAt).toISOString()).toBe(error.holdRow.scoredAt);
+      expect(scoredAt).toBeGreaterThanOrEqual(before);
+      expect(scoredAt).toBeLessThanOrEqual(Date.now());
+    });
+
+  it.each(['schema invalid', ''])('leaves non-quota failure %j untagged and countable', async result => {
+    const { fn } = fakeSpawn(JSON.stringify({ is_error: true, result }), { code: 1 });
+    const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, spawnFn: fn })
+      .catch(e => e);
+    expect(error).toBeInstanceOf(Error);
+    if (result) expect(error.message).toBe(`judge-spawn: the juror failed: ${result}`);
+    else expect(error.message).toContain('judge-spawn: the juror failed with no result text.');
+    expect(error).not.toHaveProperty('quota');
+    expect(error).not.toHaveProperty('holdRow');
+  });
+
   it('refuses an empty input rather than spawning a juror with nothing to judge', async () => {
     let started = false;
     const spawnFn = () => { started = true; };
