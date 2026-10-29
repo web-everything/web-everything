@@ -1970,6 +1970,11 @@ when the budget runs out. `heavyAdmission.runWaitMs` sets a default budget throu
 assert the suggested command verbatim and probe stdin-to-stdout hook wiring; unrelated
 allow-case fixtures must use admitted commands.
 
+For a CLI fixture that must preserve literal brace globs, spawn `process.execPath` with the repo's
+`node_modules/vitest/vitest.mjs` and an argv array inside the admitted parent test. npm/npx introduce
+an internal shell whose argument escaping leaves braces unquoted, so Bash can expand one brace
+argument into multiple flags even when the fixture's own spawn uses no shell.
+
 ### Orchestrator responsiveness hook probes
 
 `session.orchestratorMode` defaults to false and resolves through the shared policy cascade;
