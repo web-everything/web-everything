@@ -14,7 +14,7 @@ judge-spawn now tags a quota juror failure with .quota and .holdRow (we:scripts/
 
 ## Acceptance
 
-- [A1] **Executable** — a new test file `we:scripts/operations/__tests__/review-extra-seats.test.mjs` (or the existing one for that module) has a case where a Claude seat quota failure writes a quota-exhausted row; the row is written with quotaResetsAt null (no reset parsing exists yet), so the one-hour default cool-off applies; parsing the reset time from the message is part of this card.
+- [A1] **Executable** — a new test file `we:scripts/operations/__tests__/review-extra-seats.test.mjs` (or the existing one for that module) has a case where a Claude seat quota failure writes a quota-exhausted row; reset-time parsing is out of scope here (N1), so the row keeps quotaResetsAt null and the one-hour default cool-off applies.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -22,7 +22,7 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] Does not change the same-head cap accounting: the parent change (PR for branch lane/unblock-quota-infra-hold) already did, and this card only adds the hold-row write.
+- [N1] Does not change the same-head cap accounting (done in the parent change) and does not parse the reset time out of the message: rows keep quotaResetsAt null and the one-hour default cool-off applies.
 
 ## Edge cases this change must handle
 
@@ -33,5 +33,5 @@ One line per class: either the handling, or `n/a: <why>`.
 3. **Shared state files** — the scorecard rows are append-only through the existing seat writer.
 4. **Fail closed** — an unreadable or unrecognised error writes no hold and the run counts as a normal failure.
 5. **Identity scoping** — the hold is keyed by provider claude.
-6. **State over time** — the hold ends after the one-hour default cool-off until reset parsing is added.
+6. **State over time** — the hold ends after the one-hour default cool-off.
 7. **Who wrote it** — n/a: rows come from the seat spawner, not from user text.

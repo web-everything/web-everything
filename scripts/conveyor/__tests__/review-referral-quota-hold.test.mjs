@@ -72,6 +72,13 @@ describe.each([false, true])('reviewRunEvidence quotaOnly (completed: %s)', comp
     expect(reviewRunEvidence(run)).toMatchObject({ quotaOnly: false });
   });
 
+  it.each(['', undefined, null, 0, false, {}, []])('seat-name guard', seat => {
+    const run = reviewRun(0, complete);
+    run.seatTimings[1] = failedSeat(seat);
+    run.telemetry[1] = quotaRow(seat);
+    expect(reviewRunEvidence(run)).toMatchObject({ quotaOnly: false });
+  });
+
   it.each([
     ['non-array effects', {}],
     ['effects containing null', [null, { type: 'review.mandatory-referrals',
