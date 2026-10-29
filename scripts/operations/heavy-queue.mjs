@@ -176,6 +176,7 @@ export function assessQueueAdmission(queue) {
   for (const [label, kind, size] of [['review', 'review', null], ['fix', 'fix', null], ['ci-heal', 'ci-heal', null], [`build (size ${DEFAULT_BUILD_SIZE})`, 'build', DEFAULT_BUILD_SIZE], ['build (size 8)', 'build', 8]]) {
     const d = createQueueBudget(queue).tryAdmit(kind, { size });
     byKind[label] = { demandMinutes: d.demandMinutes, projectedMinutes: d.projectedMinutes, admit: d.admit, exempt: d.exempt };
+    if (kind === 'fix' || kind === 'ci-heal') byKind[label].excludedBehindCount = d.excludedBehindCount ?? 0;
   }
   const fix = byKind.fix;
   return {
@@ -191,7 +192,7 @@ export function assessQueueAdmission(queue) {
     standardMinutes: queue.standardMinutes, standardSource: queue.standardSource,
     byKind,
     headline: `projected wait if you start now: ~${queue.projectedWaitMinutes}m of ${queue.maxWaitMinutes}m max`
-      + ` (a fix → ~${fix.projectedMinutes}m, ${fix.admit ? 'admitted' : 'HELD queue-cap'})`
+      + ` (a fix → ~${fix.projectedMinutes}m counting only waiters ahead of it, ${fix.admit ? 'admitted' : 'HELD queue-cap'})`
       + (queue.heavyWaitMinutes != null ? `; a full suite → ~${queue.heavyWaitMinutes}m` : ''),
   };
 }

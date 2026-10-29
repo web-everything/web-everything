@@ -11,6 +11,7 @@ import {
   classifyCommandKind, queueLaneOf, typicalMinutes, DEFAULT_STANDARD_MINUTES, TYPICAL_MIN_SAMPLES,
   classifyDispatchKind, dispatchDemandMinutes, queueBacklog, projectedWaitMinutes, createQueueBudget,
   refineKind, holderLabel, holdBreakdown, HEAVY_KINDS, FAST_LANE_KINDS,
+  P1_DISPATCH_KINDS, waitersAheadOf,
   resolvePrepareAdmission, typicalDispatchMinutes, PREPARE_DISPATCH_KINDS, resolveFastSlots, slotOrderFor, DEFAULT_QUEUE_MAX_WAIT_MINUTES, laneProjection,
 } from '../heavy-queue-projection.mjs';
 
@@ -338,5 +339,152 @@ describe('item 100 — `other` is split into real kinds; only a truly unknown co
     expect(b.kinds.other).toEqual({ holds: 2, minutes: 3 });
     expect(b.kinds.verify.minutes).toBe(3);
     expect(b.other).toEqual({ 'node a.mjs': { holds: 1, minutes: 1 }, fix: { holds: 1, minutes: 2 } });
+  });
+});
+
+
+describe('waitersAheadOf — P0 > P1 > builds without preempting holders', () => {
+  const baseline = () => ({
+    ...queueBacklog({
+      held: [{ kind: 'FULL', priority: 'P3' }, { kind: 'selected', priority: 'P3' }],
+      waiting: [
+        { kind: 'FULL', priority: 'P0' },
+        { kind: 'selected', priorityClass: 'P1', priority: 'P3' },
+        { kind: 'FULL', priority: 'P2' },
+        { kind: 'selected', priority: 'P3' },
+        { kind: 'standards' }, // historical marker: absent priority defaults to P3
+        { kind: 'FULL', priority: 'unknown' },
+      ],
+      pending: [{ demandMinutes: 7 }],
+    }),
+    pending: [{ demandMinutes: 7 }], slots: 4, heavySlots: 3, fastSlots: 1,
+  });
+
+  it('exports exactly the two P1 dispatch kinds', () => {
+    expect(P1_DISPATCH_KINDS).toEqual(['fix', 'ci-heal']);
+  });
+
+  it.each(['fix', 'ci-heal'])('%s removes only lower-priority waiters and adjusts both lane totals without mutating input', (kind) => {
+    const b = baseline();
+    const before = structuredClone(b);
+    const ahead = waitersAheadOf(b, kind);
+    expect(ahead).not.toBe(b);
+    expect(ahead.waiting).toEqual(b.waiting.slice(0, 2));
+    expect(ahead).toMatchObject({
+      waitingMinutes: 21, backlogMinutes: 49, heavyBacklogMinutes: 36,
+      shortBacklogMinutes: 13, waitingHeavyCount: 1,
+      excludedBehindCount: 4, excludedBehindMinutes: 39.25,
+    });
+    expect(ahead.held).toBe(b.held);
+    expect(ahead.pending).toBe(b.pending);
+    expect(ahead.heldRemainingMinutes).toBe(b.heldRemainingMinutes);
+    expect(ahead.pendingMinutes).toBe(b.pendingMinutes);
+    expect(b).toEqual(before);
+  });
+
+  it.each(['build', 'review', 'prepare', 'unknown'])('%s retains the original baseline unchanged', (kind) => {
+    const b = baseline();
+    expect(waitersAheadOf(b, kind)).toBe(b);
+  });
+
+  it.each([null, undefined, {}, { waiting: null }, { waiting: 'unreadable' }, { bypassed: 'off', waiting: [{ priority: 'P3' }] }])('closed path: bypassed or missing/malformed waiting input %j stays unchanged', (b) => {
+    expect(waitersAheadOf(b, 'fix')).toBe(b);
+  });
+
+  it('closed path: non-object rows remain counted while valid lower-priority rows are removed', () => {
+    const b = { waiting: [null, 'unreadable', 42, { kind: 'selected', priority: 'P3', expectedMinutes: 3 }], waitingMinutes: 12, backlogMinutes: 12, shortBacklogMinutes: 12, heavyBacklogMinutes: 0, waitingHeavyCount: 0 };
+    expect(waitersAheadOf(b, 'fix')).toMatchObject({ waiting: [null, 'unreadable', 42], waitingMinutes: 9, backlogMinutes: 9, shortBacklogMinutes: 9, excludedBehindCount: 1, excludedBehindMinutes: 3 });
+  });
+});
+
+describe('P1 queue budget — cap 3 plus one fast slot', () => {
+  it.each(['fix', 'ci-heal'])('%s retains held and pending backlog after excluding valid lower-priority waiters', (kind) => {
+    const pending = [{ demandMinutes: 7 }];
+    const b = {
+      ...queueBacklog({
+        held: [{ kind: 'FULL', priority: 'P3' }, { kind: 'selected', priority: 'P3' }],
+        waiting: [{ kind: 'FULL', priority: 'P3' }, { kind: 'selected', priority: 'P3' }],
+        pending,
+      }),
+      pending, slots: 2, heavySlots: 1, fastSlots: 1, maxWaitMinutes: 12,
+    };
+    const ahead = waitersAheadOf(b, kind);
+    expect(ahead).toMatchObject({
+      waiting: [], waitingMinutes: 0, waitingHeavyCount: 0,
+      heldRemainingMinutes: 21, heldHeavyCount: 1, pendingMinutes: 7,
+      backlogMinutes: 28, heavyBacklogMinutes: 18, shortBacklogMinutes: 10,
+      excludedBehindCount: 2, excludedBehindMinutes: 21,
+    });
+    expect(ahead.held).toBe(b.held);
+    expect(ahead.pending).toBe(pending);
+    expect(createQueueBudget(b).tryAdmit(kind)).toMatchObject({
+      admit: false, projectedMinutes: 13.25, aheadOnly: true, excludedBehindCount: 2,
+    });
+  });
+
+  it.each([
+    ['null row', null],
+    ['string row', 'unreadable'],
+    ['numeric row', 42],
+    ['undefined row', undefined],
+    ['array row with an otherwise readable cost', Object.assign([], { kind: 'selected', expectedMinutes: 3 })],
+    ['missing cost', { kind: 'selected', priority: 'P3' }],
+    ['null cost', { kind: 'selected', priority: 'P3', expectedMinutes: null }],
+    ['string cost', { kind: 'selected', priority: 'P3', expectedMinutes: '40' }],
+    ['NaN cost', { kind: 'selected', priority: 'P3', expectedMinutes: NaN }],
+    ['infinite cost', { kind: 'selected', priority: 'P3', expectedMinutes: Infinity }],
+    ['negative cost', { kind: 'selected', priority: 'P3', expectedMinutes: -1 }],
+  ])('closed path: retains the backlog contribution of a %s while excluding a valid lower-priority waiter', (_label, row) => {
+    // The aggregate snapshot includes 40 minutes attributed to the unreadable row.
+    // Its unknown cost must not erase that recorded demand or disable the cap.
+    const b = {
+      waiting: [row, { kind: 'selected', priority: 'P3', expectedMinutes: 3 }],
+      waitingMinutes: 43, backlogMinutes: 43, shortBacklogMinutes: 43,
+      heavyBacklogMinutes: 0, heldHeavyCount: 0, waitingHeavyCount: 0,
+      slots: 1, heavySlots: 1, fastSlots: 0, maxWaitMinutes: 30,
+    };
+    const ahead = waitersAheadOf(b, 'fix');
+    expect(ahead.waiting).toEqual([row]);
+    expect(ahead).toMatchObject({
+      waitingMinutes: 40, backlogMinutes: 40, shortBacklogMinutes: 40,
+      heavyBacklogMinutes: 0, waitingHeavyCount: 0,
+      excludedBehindCount: 1, excludedBehindMinutes: 3,
+    });
+    expect(createQueueBudget(b).tryAdmit('fix')).toMatchObject({
+      admit: false, projectedMinutes: 43.25, aheadOnly: true, excludedBehindCount: 1,
+    });
+    expect(b.waiting).toEqual([row, { kind: 'selected', priority: 'P3', expectedMinutes: 3 }]);
+    expect(b.backlogMinutes).toBe(43);
+  });
+
+  const baseline = () => ({
+    ...queueBacklog({
+      held: Array.from({ length: 3 }, () => ({ kind: 'FULL', priority: 'P3' })),
+      waiting: Array.from({ length: 12 }, () => ({ kind: 'selected', priority: 'P3' })),
+    }),
+    slots: 4, heavySlots: 3, fastSlots: 1, maxWaitMinutes: 30,
+  });
+
+  it.each(['fix', 'ci-heal'])('%s is admitted ahead of builds although the historical all-waiter projection is held', (kind) => {
+    const b = baseline();
+    const budget = createQueueBudget(b);
+    expect(budget.projectFor(3.25)).toBe(39.25);
+    expect(budget.projectFor(3.25, kind)).toBe(3.25);
+    expect(budget.tryAdmit(kind)).toMatchObject({ admit: true, projectedMinutes: 3.25, aheadOnly: true, excludedBehindCount: 12 });
+    expect(budget.addedMinutes()).toBe(3.25);
+    expect(budget.projectFor(3.25, kind)).toBe(6.5);
+    expect(budget.tryAdmit('build')).toMatchObject({ admit: false, projectedMinutes: 45.75 });
+  });
+
+  it('a build still sees every waiter and preserves the existing decision shape', () => {
+    expect(createQueueBudget(baseline()).tryAdmit('build')).toEqual({ id: null, kind: 'build', admit: false, exempt: false, demandMinutes: 6.5, projectedMinutes: 42.5, maxWaitMinutes: 30 });
+  });
+
+  it('never discounts a running lower-priority holder: its remaining work can still hold a fix', () => {
+    const b = {
+      ...queueBacklog({ held: [{ kind: 'selected' }], waiting: [{ kind: 'selected', priority: 'P3' }], standardMinutes: { selected: 40 } }),
+      slots: 1, maxWaitMinutes: 30, dispatchMinutes: { fix: 3.25 },
+    };
+    expect(createQueueBudget(b).tryAdmit('fix')).toMatchObject({ admit: false, projectedMinutes: 43.25, aheadOnly: true, excludedBehindCount: 1 });
   });
 });

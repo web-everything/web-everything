@@ -93,12 +93,17 @@
  * Exit status: with --json, a completed run exits 0 and its report carries `exitCode`, `timedOut` and `gate.pass`,
  * the contract machine callers already read (codex-worker, the probation launchers). Without --json, a failed run
  * or a red gate exits 1. A thrown error (including an unavailable self-review) exits 1 in both modes.
- * Detached job records preserve the task's nonzero code; timeout or a red gate falls back to 1.
+ * Transcript detection uses best-effort heuristics: wrapped shells like `bash -c`, absolute
+ * command paths and other tools are not covered. In fail mode, flagged runs, check errors and
+ * checks skipped for ephemeral runs or a missing threadId exit nonzero in both output modes.
+ * Warn mode preserves exit status, including when the transcript check is skipped.
+ * Detached job records preserve the task's nonzero code; timeout, a red gate or a failed transcript check falls back to 1.
  */
 
 import { randomUUID } from 'node:crypto';
 import { writeLineSync } from './lib/write-all-sync.mjs';
 import { formatCascadeSourcesLine } from './lib/policy-cascade.mjs';
+import { resolveTranscriptCheckPolicy, transcriptCheckError } from './lib/codex-transcript-policy.mjs';
 import { resolveBuildPolicy, appendBuildRequirements, renderCodexTaskRules } from './lib/build-policy.mjs';
 import { runBuildSelfReview, renderSelfReviewNotes, boundedSelfReviewDiff, assertNoLaneFilterDrivers } from './lib/build-self-review.mjs';
 import { laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv } from './lib/lane-git-hardening.mjs';
@@ -120,7 +125,6 @@ import {
   CODEX_EFFORT_MAP, CODEX_MODEL, CODEX_TIER_EFFORT, assertCodexModel, resolveCodexEffort, parseRolloutUsageBucket,
 } from './lib/codex-model-routing.mjs';
 import { resolveCodexTaskRoute } from './lib/codex-task-route.mjs';
-import { checkRunTranscript } from './lib/codex-transcript-check.mjs';
 
 // ── constants ─────────────────────────────────────────────────────────────────────────────────────
 export const CODEX_CLI = 'codex';
@@ -1004,6 +1008,7 @@ export async function runCodexDirectExec({
  * @param {(path: string) => boolean} [opts.existsFn]
  * @param {Function} [opts.readQuotaFn] - injectable, default `readRolloutQuota`.
  * @param {Function} [opts.collectQuotaFn] - injectable, default `collectAndClearRolloutQuota`.
+ * @param {Function} [opts.loadTranscriptCheck] - injectable lazy checker import.
  * @returns {Promise<object>} the full report — see the CLI's `--json` output for its exact shape.
  */
 export async function codexDirectTask({
@@ -1038,6 +1043,7 @@ export async function codexDirectTask({
   selfReview: selfReviewEnabled,
   readQuotaFn = readRolloutQuota,
   collectQuotaFn = collectAndClearRolloutQuota,
+  loadTranscriptCheck = () => import('./lib/codex-transcript-check.mjs'),
 } = {}) {
   if (typeof task !== 'string' || !task.trim()) {
     throw new TypeError('codex-direct-task: `task` must be a non-empty string');
@@ -1133,10 +1139,19 @@ export async function codexDirectTask({
   let quota = null;
   let quotaRolloutFile = null;
   let quotaRolloutCleared = false;
-  let transcriptCheck = null;
+  let transcriptCheck, transcriptPolicy;
+  try {
+    // Resolve mode independently of the optional skills-src inspector so a failed
+    // import preserves both the completed report and settings-selected fail mode.
+    transcriptPolicy = resolveTranscriptCheckPolicy({ env });
+    const { checkRunTranscript } = await loadTranscriptCheck();
+    transcriptCheck = checkRunTranscript({ codexHome: resolveCodexHome(env), threadId: summary.threadId,
+      ephemeral, findRolloutFile, env, emit, resolvePolicy: () => transcriptPolicy });
+  } catch (error) {
+    transcriptCheck = transcriptCheckError({ error, policy: transcriptPolicy, env, emit });
+  }
   if (!ephemeral && summary.threadId) {
     const codexHome = resolveCodexHome(env);
-    transcriptCheck = checkRunTranscript({ codexHome, threadId: summary.threadId, findRolloutFile, env, emit });
     const lookup = clearRolloutAfterRun
       ? collectQuotaFn({ codexHome, threadId: summary.threadId })
       : readQuotaFn({ codexHome, threadId: summary.threadId });
@@ -1424,9 +1439,14 @@ export async function waitForJob({
 }
 
 // ── CLI ───────────────────────────────────────────────────────────────────────────────────────────
-/** Process exit status for a completed run; see the file header's "Exit status". PURE. */
+function transcriptCheckFailed(check) {
+  const mode = check?.mode ?? process.env.WE_CODEX_TRANSCRIPT_CHECK_MODE?.trim();
+  return check?.verdict === 'fail' || Boolean(check && Object.hasOwn(check, 'error') && mode === 'fail');
+}
+
+/** Process exit status for a completed run; see the file header's "Exit status". */
 export function cliExitCode(report, { json = false } = {}) {
-  if (report.transcriptCheck?.verdict === 'fail') return 1;
+  if (transcriptCheckFailed(report.transcriptCheck)) return 1;
   if (json) return 0;
   return report.exitCode !== 0 || report.timedOut || !report.gate.pass ? 1 : 0;
 }
@@ -1434,6 +1454,7 @@ export function cliExitCode(report, { json = false } = {}) {
 /** Internal job records preserve a nonzero task code independently of the foreground contract. */
 function jobExitCode(report) {
   if (report.exitCode !== 0) return report.exitCode || 1;
+  if (transcriptCheckFailed(report.transcriptCheck)) return 1;
   return report.timedOut || !report.gate.pass ? 1 : 0;
 }
 
