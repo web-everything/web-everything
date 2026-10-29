@@ -69,6 +69,21 @@ export function isStatusOnlyNote(note) {
 }
 
 /**
+ * Reconcile note kinds that are INFORMATION, never a question: the pass already decided and nobody has to act.
+ * Log line only — never a PR comment in ANY `prComments.mode` (including `all`), never a needs-you event, and an
+ * old comment of one of these kinds never reads as an open question in the operator queue.
+ *   - `released-claim-session-ignored` — a live pid whose fix claim was released (fix-end at this head) is
+ *     treated as finished work. That decision is already made; it posted "🔔 needs your decision" on #5758,
+ *     #5729 and #5485 (2026-10-21 13:24Z) and raised a NEEDS-YOU ruling-needed event for nothing.
+ */
+export const INFO_NOTE_KINDS = Object.freeze(['released-claim-session-ignored']);
+
+/** @param {{kind?:string}|string} note - a note, or a bare kind. @returns {boolean} */
+export function isInfoNote(note) {
+  return INFO_NOTE_KINDS.includes(typeof note === 'string' ? note : note?.kind);
+}
+
+/**
  * Reconcile note kinds that MAY be dropped when a new episode reads exactly like the PR's latest note. An explicit
  * allowlist, deliberately empty: every note kind that exists today asks a person to act ("needs your decision"),
  * and an identical recurrence of one is a new problem that must still reach them (a permission wall that clears

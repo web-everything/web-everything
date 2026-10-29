@@ -3,9 +3,9 @@
  * @description The red-main repair class of the heavy-admission queue (main-fix-queue-priority): which waiter is a
  *   red-main repair (P0) and so takes the next free slot ahead of every other waiter.
  *   P1 covers fixes and unblocking builds, marked by a purpose prefix `unblock-` OR env WE_HEAVY_UNBLOCK=1.
- *   The three tiers are P0 > P1 > P2; never preempt a running holder. The policy-cascade leaves
- *   heavyAdmission.priority.fixPatterns / unblockPatterns are wired in the follow-up (Part B) into
- *   heavy-admission.mjs. This module only supplies the P1 classifier; the P0 classifier remains independent.
+ *   The tiers are P0 > P1 > normal P3; never preempt a running holder. Heavy admission composes
+ *   this bounded P1 classifier after red-main/send-back classification under the shared priority mode.
+ *   The scheduler uses the default P1 families; custom P1 patterns remain a pure classifier option.
  *
  *   Kept OUT of `./heavy-queue-projection.mjs` on purpose. That module is imported by the read-only `heavy-queue`
  *   operation's declaring module, and `http-adapter.test.mjs` pins that such a module's whole static import graph
@@ -171,13 +171,14 @@ export function repairPatternMatches(pattern, value, deadlineMs = Infinity) {
 
 /**
  * The admission class of one waiter. PURE. A red-main repair — any identity field matching a repair pattern — is
- * classed by the delivery-priority rule as the owner of the open main-red episode's fix (P0); everything else is
- * P3 (normal). Mode `off` makes every waiter P3 (today's FCFS).
+ * classed by the delivery-priority rule as the owner of the open main-red episode's fix (P0); a matching
+ * send-back fixer is P1, and everything else is P3 (normal). Mode `off` makes every waiter P3 (today's FCFS).
  * @param {{purpose?:string|null, session?:string|null, holder?:string|null, envSession?:string|null}} identity
  * @param {{mode:'enforce'|'off', repairPatterns:string[]}} priority
+ * @param {{sendBackFixes?:Array<{session:string, pr:number, repo:string, freshness:string}>}} evidence
  * @returns {{class:string, reason:string, matched:{field:string, value:string, pattern:string}|null}}
  */
-export function classifyWaiterPriority(identity, priority) {
+export function classifyWaiterPriority(identity, priority, { sendBackFixes = [] } = {}) {
   const normal = (reason) => ({ class: 'P3', reason, matched: null });
   if (priority?.mode !== 'enforce') return normal('priority off');
   const patterns = validRepairPatterns(priority.repairPatterns) ? priority.repairPatterns : DEFAULT_REPAIR_PATTERNS;
@@ -189,6 +190,14 @@ export function classifyWaiterPriority(identity, priority) {
     if (pattern === undefined) continue;
     const d = deliveryPriority({ incident: { open: true, owner: true } }, { mode: 'enforce' }, 0);
     return { class: d.class, reason: `red-main repair: ${d.reasons.join('; ')}`, matched: { field, value, pattern } };
+  }
+  for (const field of IDENTITY_FIELDS) {
+    const value = identity?.[field];
+    if (typeof value !== 'string' || value.length > MAX_REPAIR_MATCH_VALUE_LENGTH) continue;
+    const row = sendBackFixes.find(row => value === row.session
+      || (value.startsWith(`${row.session}-lane-`) && /^\d+-[a-z0-9]+$/.test(value.slice(row.session.length + 6))));
+    if (row) return { class: 'P1', reason: `send-back fix #${row.pr} (${row.repo}; ${row.freshness})`,
+      matched: { field, value, pattern: row.session } };
   }
   return normal('normal');
 }

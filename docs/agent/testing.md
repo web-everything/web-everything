@@ -1,5 +1,17 @@
 # Testing — Three-Tier Strategy
 
+Released fix claims are PR evidence until their holder exactly matches a session's ID. A shared head and an earlier start time alone never establish completion.
+The `unrelated live worker remains live and is never stopped` regression in
+`reconcile-core.test.mjs` feeds planner notes through the reaper with injected IO;
+its matching-holder control proves the stop path remains exercised. Missing holder
+evidence retains ordinary liveness checks, including for legacy release records.
+The listing-based open-PR cleanup also requires explicit holder correlation.
+Its `unbound open-PR session with %s is never stopped` cases in
+`finished-session-reap.test.mjs` cover different and missing holders, alongside
+matching-holder stop controls for fix and CI-heal sessions. Correlate only the explicit
+release holder with the listing's `sessionId`; matching names, slugs or listing handles
+cannot substitute for that identity. Missing identities hold with a visible reason.
+
 ## Direction-aware operation evidence (R131)
 
 In-process review callers import the pure shape derivation from `scripts/lib/review-shape.mjs`.
@@ -2751,6 +2763,85 @@ clone discovery mark the snapshot incomplete. Reads are bounded (1 MiB log tail,
 omissions are reported as truncation. Clone paths must be absolute. The drain target is the code clone from the
 prototype-load settings, not the plist's data clone; tests inject those settings. Matrix and PR table cells strip
 Cc/Cf controls and are width-capped; table mode keeps the truncated-listing warning.
+
+### Previewing host-busy fix waits
+
+`node scripts/conveyor/reconcile-fix-dispatch.mjs --dry-run --repo=we` works from a lane.
+It reads the live planner and the existing resource throttle and prints proposed
+`fix-waiting:host-busy` label changes and overdue alerts. Dry-run makes no label,
+alert, waiting-state, lane-pool or planner-ledger writes and never launches a fixer.
+Lane availability is unknown: admitted entries report “would launch if a lane is free”,
+and proposed clears are conditional on a free lane and a successful launch. Only a
+caller-supplied lane picker can provide preview lane availability; preview never calls
+lane-pool list (which writes scan locks/caches and can reap). The live dispatcher clears
+only after a successful fresh launch or resume. Checkout auto-sync is skipped.
+Reads still pass through the gh throttle (accounting kept on purpose) and may refresh
+local git remote-tracking refs or the agent-list cache. Other dispatch gates still apply
+after resource admission.
+
+The alert limit is `fixWaiting.hostBusyAlertMinutes` (default 30), resolved through the
+policy cascade and logged with its source on every pass. Tool overrides belong in
+`we:scripts/settings/fix-waiting.json`; the env override is
+`WE_FIX_WAITING_HOST_BUSY_ALERT_MINUTES`. Episode files live beside the PR-limit state
+in `~/.claude/conveyor/`, using its directory resolver. Tests inject a temporary path
+and label/notification providers; never use the operator's live episode store in tests.
+
+Dispatcher fixtures must inject `fetchItemlessDiffPaths` even for a named backlog item:
+the planner checks that item's presence in the PR diff before reaching admission.
+Also fake `resolveFallbackScope`, `resolveCardScopeAtRef`, claims, comments, resume
+attempts and lane selection when exercising their paths. Preview tests must inject
+`readClaim` separately; the dispatcher's claim-list fakes do not cover that reader.
+
+## Send-back admission priority
+
+`fix-waiting-priority.mjs` reads the fix dispatcher's existing host-wait episodes without
+GitHub IO. Build/graduation launch gates only add deferrals after resource admission;
+fix/ci-heal gates and resource floors retain their existing behavior. A waiting record
+expires after three dispatcher intervals (six minutes by default), including if the daemon dies.
+Refreshes do not extend the absolute yield bound: builds/graduations yield only while
+the episode's first deferral (`firstDeferredAt`, or legacy `waitingSince`) is younger than
+`fixWaiting.yieldMaxMinutes` (default 30, valid 1..240). This setting follows the same
+standard → platform → tool → env cascade (`WE_FIX_WAITING_YIELD_MAX_MINUTES`), with its
+source included in the yield reason. Once the bound expires, the existing gate's admission
+stands; the waiting label and overdue alert continue independently. Missing or invalid
+episode origins confer no launch priority.
+Confirmed send-back launches retain session evidence for at most 24 hours for heavy-command
+classification, without continuing to block launches. Both freshness settings resolve through
+`fixWaiting` in the policy cascade and name their sources in priority reasons.
+`heavyAdmission.priority.mode` controls queue ordering: P0 red-main repair, then P1 send-back
+fixers, canonical `fix-<n>`/`ci-heal-<n>` sessions and unblocking work (`unblock-` identity or
+`WE_HEAVY_UNBLOCK=1`), then normal P3. P1 competes across queue lanes for heavy slots;
+only short P1 waiters compete for short-only slots. A FULL P1 waiter does not block an ordinary short
+command from a free short-only slot. P1 keeps its existing slot eligibility, and running
+holders are never preempted. The broader send-back waiting/priority classification does
+not change reserved fix-cap eligibility: only `review:changes` receives that reservation.
+The focused suites are `fix-waiting-priority.test.mjs` and `heavy-send-back-priority.test.mjs`;
+run them through heavy admission when host capacity permits.
+New enforced waiters record P3 explicitly; historical markers without a class remain unknown to projection.
+Queue snapshots retain raw marker priority and the effective priority mode. The live producer sets
+`p1OrderingEnabled: true` only with `priorityMode: enforce`; projections require that explicit capability
+and discount only explicit P2/P3 waiters. Unreadable or absent classes stay counted. Off, unknown and
+historical snapshots retain all backlog and report that conservative fallback. The named
+`heavy-p1-admission.test.mjs` regression uses real temporary slot locks and the production admission
+path to prove a fix takes the next released slot ahead of the build waiters its projection excludes.
+
+## Fixer lane HEAD and lease probe
+
+`fix-run.mjs` retains the `holder` returned by `lane-pool acquire --json`; the ambient
+session is not proof that a later lease belongs to the fixer. It checks the on-disk
+`.git/.lane-lease` and exact PR head before starting the agent, preserves launcher
+merge preparation, and checks ownership again before staging and pushing. Only an
+owned, clean lane can be fetched/reset to the pinned PR SHA; recovery rechecks the
+lease and HEAD. These checks detect takeover but do not make the allocator atomic.
+
+For a read-only observation, run
+`node scripts/operations/fix-run.mjs --probe-lane-head --lane-path=<absolute lane path> --pr=<PR> --holder=<original acquired holder> [--repo=owner/repo]`.
+The probe prints the observed lease, HEAD, current GitHub PR head and pure
+`laneHeadCheck` decision. Omitting `--holder` refuses ownership rather than treating
+the current occupant as ours. Git optional locks are disabled, so status does not
+refresh the index. The live PR head may have advanced since an incident; compare
+against the SHA the probe actually reports. Regression files: `fix-run-lane-head.test.mjs`,
+`fix-run.test.mjs`, and `fix-run-borrow-dies.test.mjs` under `scripts/operations/__tests__/`.
 
 
 Recovery retries must spend their allowance in the head-bound red-team status before the model call.
