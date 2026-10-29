@@ -331,6 +331,27 @@ describe('currentBootId', () => {
 });
 
 describe('listGroup', () => {
+  it.each([
+    ['before the target', [{ pid: 2, pgid: 0, uid: 0 }, { pid: PID }], [linuxIdentity]],
+    ['after the target', [{ pid: PID }, { pid: 2, pgid: 0, uid: 0 }], [linuxIdentity]],
+    ['without a target member', [{ pid: 2, pgid: 0, uid: 0 }], []],
+  ])('Linux excludes a valid zero-group kernel thread %s', (_label, processes, identities) => {
+    expect(listGroup(PID, linuxDeps({ processes }))).toEqual({ status: 'ok', identities });
+  });
+
+  it('Linux accepts a zero process group for identity reads while group queries require a positive id', () => {
+    const deps = linuxDeps({ processes: [{ pid: 2, pgid: 0, uid: 0 }] });
+    const identity = { ...linuxIdentity, pid: 2, uid: 0 };
+    expect(readIdentity(2, deps)).toEqual({ status: 'ok', identity });
+    expect(liveness(identity, deps)).toBe('alive');
+    expect(listGroup(0, deps)).toEqual({ status: 'unknown', reason: 'Invalid process group' });
+  });
+
+  it.each([-1, '1e4', '9007199254740992'])('Linux malformed unrelated process group %s invalidates the census', (pgid) => {
+    const deps = linuxDeps({ processes: [{ pid: PID }, { pid: 2, pgid, uid: 0 }] });
+    expect(listGroup(PID, deps)).toEqual({ status: 'unknown', reason: expect.any(String) });
+  });
+
   it.each(['', HEADER])('an empty macOS all-process census is unknown, not an empty group', (output) => {
     expect(listGroup(PID, darwinDeps({ output }))).toEqual({ status: 'unknown', reason: expect.any(String) });
   });

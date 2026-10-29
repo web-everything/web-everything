@@ -104,7 +104,8 @@ function linuxStat(pid, io) {
     throw new Error('Incomplete procfs stat');
   }
   const pgid = Number(fields[2]);
-  if (!positive(pgid)) throw new Error('Missing process group');
+  // Kernel threads may have pgrp=0; listGroup filters them out of positive groups.
+  if (!unsigned(pgid)) throw new Error('Invalid process group');
   return { pid, pgid, startTime: fields[19], state: fields[0] };
 }
 
