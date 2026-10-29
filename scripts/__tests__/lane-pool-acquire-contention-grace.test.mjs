@@ -9,6 +9,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
+import { buildFreeLaneList, writeFreeLaneListAtomic, resolveFreeLaneListPath } from '../lib/free-lane-list.mjs';
 
 const SCRIPT = resolve('scripts/lane-pool.mjs');
 const REAL_GIT = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
@@ -131,6 +132,38 @@ describe('acquire shared-list contention grace', () => {
 
   it('reuses a matching cache younger than the default 8000ms grace despite a lease fingerprint change', () => {
     expectSecondLane(seedClaimedPool());
+  }, 30_000);
+
+  it.each(['scan cache', 'free list'])('same-session auto-acquire skips its live lease from a stale %s without rewriting it', (source) => {
+    const first = seedClaimedPool();
+    const marker = join(pool, 'lane-1', '.git', '.lane-lease');
+    const originalLease = readFileSync(marker, 'utf8');
+    const before = scanProbes().length;
+    if (source === 'free list') {
+      writeFreeLaneListAtomic(resolveFreeLaneListPath({ repoName: 'contention-grace', poolDir: pool }), buildFreeLaneList({
+        repoName: 'contention-grace', poolDir: pool, writtenAt: Date.now(),
+        lanes: [1, 2].map((n) => ({ lane: n, path: join(pool, `lane-${n}`), head: 'deadbeef', branch: 'main' })),
+      }));
+    }
+    const second = runPool([
+      'acquire', '--session=first-holder', '--wait-ms=0', '--json',
+      ...(source === 'scan cache' ? ['--no-free-list'] : []),
+    ], { CLAUDE_CODE_SESSION_ID: 'first-holder' });
+    expect(second.lane).toBe(2);
+    expect(second.holder).not.toBe(first.holder);
+    expect(readFileSync(marker, 'utf8')).toBe(originalLease);
+    expect(scanProbes().length - before, 'skip a claimed candidate without rescanning the pool').toBe(0);
+  }, 30_000);
+
+  it('reclaims a TTL-stale same-session candidate with a fresh holder slug', () => {
+    const first = seedClaimedPool();
+    const marker = join(pool, 'lane-1', '.git', '.lane-lease');
+    const lease = JSON.parse(readFileSync(marker, 'utf8'));
+    writeFileSync(marker, JSON.stringify({ ...lease, acquiredAt: '2000-01-01T00:00:00.000Z' }) + '\n');
+    const second = acquire('first-holder');
+    expect(second.lane).toBe(first.lane);
+    expect(second.holder).not.toBe(first.holder);
+    expect(JSON.parse(readFileSync(marker, 'utf8')).holder).toBe(second.holder);
   }, 30_000);
 
   it('rescans a non-empty grace cache when every listed lane is now claimed and an unlisted lane is released', () => {

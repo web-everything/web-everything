@@ -1696,9 +1696,10 @@ function cmdRefresh(repo) {
 // string, #2997) iff THIS call created the marker, else null. A live lease owned by someone else ⇒ null (taken
 // — #2337(b), NOT overridable by `--force`; the deliberate override is `release --force` then re-acquire, per
 // the ruling's "no new flag" contract). A stale marker ⇒ reclaimed (rm + retry, the small documented race).
-// Own live lease ⇒ claimed (idempotent re-acquire) — and that path PRESERVES the existing `holder` slug, so an
-// idempotent re-acquire never invalidates the slug the current holder is already asserting.
-function tryClaimLane(dir, session, nowMs, ttlMs) {
+// An explicit lane request may opt into idempotent re-acquire of its own lease, preserving the holder slug.
+// Auto-pick must reject EVERY live lease: stale candidate lists can include a lane just leased by the same
+// dispatcher/session, and another auto-acquire means another allocation, not a refresh of that prior hold.
+function tryClaimLane(dir, session, nowMs, ttlMs, { allowReacquire = false } = {}) {
   // #2367 — stamp a DURABLE session identity (`CLAUDE_CODE_SESSION_ID`, exposed to this subprocess) so a later
   // guard can tell "my own lease" from another live session's AUTHORITATIVELY — it is stable across a session's
   // separate Bash-tool calls yet distinct between concurrent sessions, and does NOT false-match two independent
@@ -1762,7 +1763,7 @@ function tryClaimLane(dir, session, nowMs, ttlMs) {
     if (e.code !== 'EEXIST') throw e;
   }
   const existing = readLease(dir);
-  if (leaseOwnedBy(existing, session)) {
+  if (allowReacquire && leaseOwnedBy(existing, session)) {
     // #2997 — an IDEMPOTENT re-acquire of our own hold KEEPS the existing `holder` slug. Re-minting here would
     // silently invalidate the slug the current holder is already asserting in its commands, turning its next
     // legitimate destructive op into a mismatch deny — a self-inflicted false refusal.
@@ -1799,7 +1800,7 @@ function tryClaimLane(dir, session, nowMs, ttlMs) {
     // OCCUPANCY is dropped for the same reason (only `--adopt` re-declares it for the new holder).
     try { writeLeaseAtomic(file, bodyFor(mintedHolder, adopted), { exclusive: true }); return mintedHolder; } catch { return null; }
   }
-  return null; // a LIVE lease held by another session — this lane is taken, even with --force
+  return null; // a LIVE lease — auto-pick skips even a matching session, including with --force
 }
 
 // #2748 — the acquire-native reaper pass. Reclaims a PROVABLY-DEAD lease in `repo`'s pool before a fresh
@@ -2230,7 +2231,7 @@ async function cmdAcquire(repo) {
   let holderSlug = null;
   // #3407 — what a LATER refusal (past the claim) should restore: the explicit-lane path fills this with the
   // lease that was there before (a live re-acquire of our own hold must survive a later refusal); auto-pick
-  // never re-acquires its own lane (it excludes `selfLane`), so a refusal there has nothing to restore — just
+  // never re-acquires a live lease, so a refusal there has nothing to restore — just
   // drop the lease this claim just wrote. One shared variable so the single rollback below (after the reset/
   // deps block) doesn't need to know which path chose the lane.
   let preClaimLease = null;
@@ -2256,7 +2257,7 @@ async function cmdAcquire(repo) {
       }
       targetWasReserved = true; // an idempotent re-reserve — skip the reset so accrued content survives
     }
-    holderSlug = tryClaimLane(dir, session, nowMs, ttlMs);
+    holderSlug = tryClaimLane(dir, session, nowMs, ttlMs, { allowReacquire: true });
     if (!holderSlug) {
       const lease = readLease(dir);
       // #2350 — a RESERVED (permanent) lane is off-limits to an ordinary acquire; point at the deliberate
@@ -2355,9 +2356,9 @@ async function cmdAcquire(repo) {
     // not a laxer check, only a shared one. A cached answer can be briefly stale (up to
     // `--cache-ttl-ms`), but that costs at most a lost race on `tryClaimLane` below (excluded and retried) —
     // never a clobbered lane: the destructive reset later in this function re-verifies dirty/ahead fresh,
-    // right before it touches the tree (#2924), regardless of how the candidate was found. A lease claim
-    // (ours or a competitor's) changes the pool's lease fingerprint, which invalidates the cache on the very
-    // next read, so a lane just taken is never handed out twice from a stale hit.
+    // right before it touches the tree (#2924), regardless of how the candidate was found. Candidate snapshots
+    // can stay cached across lease churn during contention grace, so the auto-pick claim rejects every live
+    // lease, even one with the same session string.
     let grownOnce = false;
     let recoveredOnce = false;
     // #3383 (coordinator follow-up, live-caught 2026-09-24 16:25 ET) — did the MOST RECENT round's scan fail
@@ -2499,7 +2500,7 @@ async function cmdAcquire(repo) {
             log(`lane-${pick}: stale .git/index.lock - skipped; needs cleanup`);
           }
           log(`  ⚠ lane-${pick} claimed but failed to provision (${String(e && e.message ? e.message : e).split('\n')[0]}) — releasing it and trying another candidate`);
-          // Auto-pick never re-acquires its OWN prior lane (`selfLane` is excluded from `pickable` above), so
+          // Auto-pick never re-acquires a live lease, even one with the same session string, so
           // there is never a live lease of ours to restore here — just drop the one this claim just wrote.
           restoreLeaseAfterRefusedClaim(laneDir(repo, pick), null);
           excluded.add(pick);
