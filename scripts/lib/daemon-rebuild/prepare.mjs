@@ -30,7 +30,6 @@ import { resolveClosureScopeMode } from './skip-unrelated.mjs';
 import { autoRetireOverlays } from '../daemon-overlay-auto-retire.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
-import { isHash, idFromName } from '../../backlog/id.mjs';
 import { repairCloneRefs, holdsCloneWriteLock, probeBrokenRefs, diagnoseLane } from '../lane-repair.mjs';
 import {
   markOverlayConflictWake, readOverlayConflictWakes, clearOverlayConflictWake,
@@ -407,9 +406,10 @@ export async function prepareRebuild({
     const detail = { refs: unverified.map((o) => o?.ref), message: 'Overlay tips unavailable; preserving registrations and skipping these overlays for this rebuild. Retrying next tick; restore or re-register deleted branches from their recorded SHA.' };
     alert('overlay-fetch-unverifiable', detail);
   }
-  if (readyOnly && unsafe.untracked.some((path) => /^backlog\/[^/]+\.md$/.test(path)
-    && isHash(idFromName(path.slice(8, -3))))) return mutationDue('backlog-sidecar-prune');
-  pruneLandedBacklogSidecars({ git, root, paths: unsafe.untracked, mainSha: fetchedMainSha, alert });
+  const prunedSidecars = pruneLandedBacklogSidecars({
+    git, root, paths: unsafe.untracked, mainSha: fetchedMainSha, alert, dryRun: readyOnly,
+  });
+  if (readyOnly && prunedSidecars.length) return mutationDue('backlog-sidecar-prune');
   const remaining = collectUntrackedPaths(git);
   if (remaining === null) {
     alert('status-failed', 'Post-cleanup ls-files --others failed');
