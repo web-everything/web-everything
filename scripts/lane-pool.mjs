@@ -3108,7 +3108,8 @@ function warnPlaceholderIdentity(lanes) {
 // `acquire`'s own auto-pick layers the atomic claim + re-verify above on top of the exact same answer.
 //
 // The cache is also invalidated early by (a) a FINGERPRINT of every lane's lease marker (existence + mtime,
-// stat-only — no git, no FS events) so any acquire/release/adopt/hand-written lease misses immediately, and
+// stat-only — no git, no FS events) so any acquire/release/adopt/hand-written lease misses immediately
+// (acquire callers tolerate churn within LIST_CACHE_CONTENTION_GRACE_MS), and
 // (b) `invalidateListCache` from the commands that reset trees WITHOUT touching a lease (provision/refresh) —
 // acquire/release/adopt/remove all change the fingerprint on their own.
 const LIST_CACHE_FILE = (repo) => join(repo.poolDir, '.list-acquirable-cache.json');
@@ -3126,6 +3127,7 @@ const numFlagOrEnv = (flag, env, dflt) => {
 };
 const listCacheTtlMs = () => numFlagOrEnv('cache-ttl-ms', 'LANE_POOL_LIST_CACHE_TTL_MS', DEFAULT_LIST_CACHE_TTL_MS);
 const listScanTimeoutMs = () => numFlagOrEnv('scan-timeout-ms', 'LANE_POOL_LIST_SCAN_TIMEOUT_MS', DEFAULT_LIST_SCAN_TIMEOUT_MS);
+const LIST_CACHE_CONTENTION_GRACE_MS = numFlagOrEnv('list-contention-grace-ms', 'LANE_POOL_LIST_CONTENTION_GRACE_MS', 8_000);
 // #4122 — how old the free-lane list may be and still be consulted (`--free-list-max-age-ms` / env); `--no-free-list`
 // disables the fast path outright (tests, or an operator who wants today's scan-only behavior back).
 const freeListMaxAgeMs = () => numFlagOrEnv('free-list-max-age-ms', FREE_LANE_LIST_MAX_AGE_ENV, DEFAULT_FREE_LANE_LIST_MAX_AGE_MS);
@@ -3465,12 +3467,16 @@ function leaseFingerprint(repo) {
 // or reap setting is a miss, never reused.
 const listCacheKey = (repo) => `${repo.branch}|ttl=${ttlMsFromFlags()}|reap=${flags['no-reap'] ? 0 : 1}`;
 
-function readListCache(repo, nowMs, cacheTtlMs) {
+function readListCache(repo, nowMs, cacheTtlMs, callerDeadlineMs = null) {
   let c;
   try { c = JSON.parse(readFileSync(LIST_CACHE_FILE(repo), 'utf8')); } catch { return null; }
   if (!c || c.v !== 1 || !Array.isArray(c.paths) || typeof c.writtenAt !== 'number') return null;
   if (c.key !== listCacheKey(repo)) return null;
   if (nowMs - c.writtenAt >= cacheTtlMs || c.writtenAt > nowMs + 1000) return null; // expired (or clock-skewed)
+  // Acquire only needs candidates: atomic claim + re-verification still decide whether a lane is safe.
+  // lane-pool-acquire-contention-grace.test.mjs covers default-grace lease churn and, separately,
+  // refusing a stale-listed foreign lease without overwriting it; claim/re-verify regressions cover reset safety.
+  if (callerDeadlineMs !== null && nowMs - c.writtenAt < LIST_CACHE_CONTENTION_GRACE_MS) return c.paths;
   if (c.fingerprint !== leaseFingerprint(repo)) return null; // a lease changed since the scan
   return c.paths;
 }
@@ -3639,7 +3645,7 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs, reuseClean = false,
 // prior behavior exactly: no caller-side bound, only the scan/lock's own.
 function acquirableListCached(repo, { limit, scanTimeoutMs, cacheTtlMs, callerDeadlineMs = null, partialOnOverrun = false }) {
   const slice = (paths) => (limit !== null ? paths.slice(0, limit) : paths);
-  const hit = readListCache(repo, Date.now(), cacheTtlMs);
+  const hit = readListCache(repo, Date.now(), cacheTtlMs, callerDeadlineMs);
   if (hit) return slice(hit);
   // xkv3p37 — cached-mode scans reuse per-lane clean verdicts (off when caching itself is off: TTL 0).
   const scanOpts = { scanTimeoutMs, reuseClean: cacheTtlMs > 0, partialOnOverrun };
@@ -3658,7 +3664,7 @@ function acquirableListCached(repo, { limit, scanTimeoutMs, cacheTtlMs, callerDe
       let scanned = false;
       try {
         // Re-check under the lock: the previous holder may have just written a fresh result.
-        const again = readListCache(repo, Date.now(), cacheTtlMs);
+        const again = readListCache(repo, Date.now(), cacheTtlMs, callerDeadlineMs);
         if (again) return again;
         scanned = true;
         const paths = scanAcquirable(repo, { ...scanOpts, limit: null });
@@ -3681,7 +3687,7 @@ function acquirableListCached(repo, { limit, scanTimeoutMs, cacheTtlMs, callerDe
       );
     }
     sleepSyncMs(Math.min(jitteredDelayMs(LIST_LOCK_POLL_MS), callerDeadlineMs === null ? Infinity : Math.max(0, callerDeadlineMs - Date.now())));
-    const fresh = readListCache(repo, Date.now(), cacheTtlMs);
+    const fresh = readListCache(repo, Date.now(), cacheTtlMs, callerDeadlineMs);
     if (fresh) return fresh;
     if (Date.now() > waitDeadline) {
       // Should be unreachable (the lock goes stale first), but never hang: scan ourselves, uncached.
