@@ -4,6 +4,7 @@ import { mkdtempSync, cpSync, mkdirSync, readFileSync, readdirSync, rmSync, writ
 import { tmpdir } from 'node:os';
 import { join, basename, delimiter, resolve } from 'node:path';
 import { tryAcquireNumberingLock, releaseNumberingLockIfOwned } from '../../readiness/drain-lock.mjs';
+import { handNumberedNewItems } from '../../check-standards-rules.mjs';
 
 const collisionRoots = [];
 afterEach(() => collisionRoots.splice(0).forEach((root) => rmSync(root, { recursive: true, force: true })));
@@ -162,7 +163,7 @@ it('renumber CLI dry-run plans the fresh target without claiming or rewriting', 
   expect(cli.state()).toMatchObject({ refs: cli.refs, pushes: [], blobs: {} });
 });
 
-it('real scaffold and file-item CLIs birth numeric cards; off/outage use hashes; required refuses outages and lock contention', () => {
+it('legacy scaffold retains numeric allocation and refusals; file-item births hashes without remote allocation', () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'birth-cli-')));
   try {
     cpSync('scripts', join(root, 'scripts'), { recursive: true, filter: (p) => basename(p) !== '__tests__' });
@@ -211,13 +212,22 @@ fs.writeFileSync(file, JSON.stringify(state));
     expect(readdirSync(join(root, 'backlog'))).toEqual([`${numeric.num}-born-numbered.md`]);
     expect(() => run({}, 'yield', [`${numeric.num}-born-numbered`, '--force'])).toThrow(/immutable birth number/);
     expect(readFileSync(join(root, numeric.file), 'utf8')).toBe(content);
-    run({}, 'file-item');
-    const names = readdirSync(join(root, 'backlog'));
-    expect(names).toContain('002-born-numbered.md');
-    const second = readFileSync(join(root, 'backlog/002-born-numbered.md'), 'utf8');
-    const secondId = second.match(/^bornAs: (x[0-9a-z]{6})$/m)[1];
-    const nextRefs = JSON.parse(readFileSync(join(root, 'remote.json'), 'utf8')).refs;
-    expect(nextRefs['refs/card-ids/' + secondId]).toBe(nextRefs['refs/number-reservations/002']);
+    const expectHashFileItem = (env = {}) => {
+      const before = readdirSync(join(root, 'backlog'));
+      const remoteBefore = readFileSync(join(root, 'remote.json'), 'utf8');
+      const { verdict: card } = run(env, 'file-item');
+      expect(card.num).toMatch(/^x[0-9a-z]{6}$/);
+      expect(card.id).toBe(`${card.num}-born-numbered`);
+      expect(card.rel).toBe(`backlog/${card.id}.md`);
+      expect(card.abs).toBe(join(root, card.rel));
+      expect(readFileSync(card.abs, 'utf8')).toBe(card.content);
+      expect(card.content).not.toContain('bornAs:');
+      expect(handNumberedNewItems([card], [])).toEqual([]);
+      expect(readdirSync(join(root, 'backlog')).sort()).toEqual([...before, `${card.id}.md`].sort());
+      expect(readFileSync(join(root, 'remote.json'), 'utf8')).toBe(remoteBefore);
+      expect(readFileSync(join(root, numeric.file), 'utf8')).toBe(content);
+    };
+    expectHashFileItem();
     const off = run({ WE_NUMBER_AT_BIRTH: 'off' });
     expect(off.num).toMatch(/^x[0-9a-z]{6}$/);
     expect(readFileSync(join(root, off.file), 'utf8')).not.toContain('bornAs:');
@@ -226,22 +236,28 @@ fs.writeFileSync(file, JSON.stringify(state));
     const missingMain = run({ BIRTH_MAIN_DOWN: '1' });
     expect(missingMain.num).toMatch(/^x[0-9a-z]{6}$/);
     const before = readdirSync(join(root, 'backlog'));
-    for (const operation of ['scaffold', 'file-item']) {
-      expect(() => run({ BIRTH_REMOTE_DOWN: '1', WE_CARD_NUMBERING_REMOTE: 'required' }, operation)).toThrow();
-      expect(() => run({ BIRTH_MAIN_DOWN: '1', WE_CARD_NUMBERING_REMOTE: 'required' }, operation)).toThrow();
+    for (const env of [{ BIRTH_REMOTE_DOWN: '1' }, { BIRTH_MAIN_DOWN: '1' }]) {
+      expect(() => run({ ...env, WE_CARD_NUMBERING_REMOTE: 'required' })).toThrow();
       expect(readdirSync(join(root, 'backlog'))).toEqual(before);
     }
+    // Numbering settings and remote availability apply to the legacy CLI, not hash-first file-item.
+    for (const env of [
+      { WE_NUMBER_AT_BIRTH: 'off' },
+      { BIRTH_REMOTE_DOWN: '1' }, { BIRTH_MAIN_DOWN: '1' },
+      { BIRTH_REMOTE_DOWN: '1', WE_CARD_NUMBERING_REMOTE: 'required' },
+      { BIRTH_MAIN_DOWN: '1', WE_CARD_NUMBERING_REMOTE: 'required' },
+    ]) expectHashFileItem(env);
     const lockRoot = join(home, '.claude', 'drain-locks');
     const owner = 'birth-cli-test-holder';
     expect(tryAcquireNumberingLock(lockRoot, owner).ok).toBe(true);
     const remoteBefore = readFileSync(join(root, 'remote.json'), 'utf8');
+    const beforeLock = readdirSync(join(root, 'backlog'));
     try {
-      for (const operation of ['scaffold', 'file-item']) {
-        // The transport is healthy: only contention may cause this refusal.
-        expect(() => run({ WE_CARD_NUMBERING_REMOTE: 'required' }, operation)).toThrow();
-        expect(readdirSync(join(root, 'backlog'))).toEqual(before);
-        expect(readFileSync(join(root, 'remote.json'), 'utf8')).toBe(remoteBefore);
-      }
+      // The transport is healthy: only contention may cause the numeric CLI's refusal.
+      expect(() => run({ WE_CARD_NUMBERING_REMOTE: 'required' })).toThrow();
+      expect(readdirSync(join(root, 'backlog'))).toEqual(beforeLock);
+      expect(readFileSync(join(root, 'remote.json'), 'utf8')).toBe(remoteBefore);
+      expectHashFileItem({ WE_CARD_NUMBERING_REMOTE: 'required' });
     } finally { expect(releaseNumberingLockIfOwned(lockRoot, owner)).toBe(true); }
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 20_000);

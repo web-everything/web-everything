@@ -32,8 +32,7 @@ import { readTimeoutBudget, timeoutKey } from '../../conveyor/timeout-retry-stat
 import { planReconcile } from '../../conveyor/reconcile-core.mjs';
 import { allocateCardNumber } from '../../lib/card-number-allocator.mjs';
 
-// Dispatch fixtures use a deterministic birth number; allocator transport has its own suite.
-// Replacing the filing sink alone still leaves planning able to reserve a live remote number.
+// Keep a regression to numeric allocation hermetic; follow-up filing must never call this mock.
 vi.mock('../../lib/card-number-allocator.mjs', () => ({
   allocateCardNumber: vi.fn(() => ({ ok: true, num: '90001' })),
 }));
@@ -834,19 +833,24 @@ describe('xng7q1p retry reservation and restart soak', () => {
   }));
   it('owed filing retries independently after CI passes and never reallocates its card identity', async () => harness(async (dir) => {
     const e = evidence(); const ids = []; let reject = true;
-    const allocationsBefore = vi.mocked(allocateCardNumber).mock.calls.length;
     const fileFollowup = vi.fn(async (p) => { ids.push(p.num); if (reject) throw new Error('disk unavailable'); });
     const opts = { dir, root: dir, repo: e.repo, fileFollowup, effects: { observe, request: () => ({ status: 'confirmed' }) } };
     await dispatchTimeoutRetry(e, opts);
     await dispatchTimeoutRetry({ ...e, jobs: [{ ...e.jobs[0], job: 21, attempt: 2 }] }, opts);
+    const payload = readState(dir, e).card.payload;
+    expect(payload.num).toMatch(/^x[0-9a-z]{6}$/);
+    expect(payload.content).not.toContain('bornAs:');
+    expect(readState(dir, e).card).toMatchObject({ filed: false, error: 'disk unavailable' });
     reject = false;
     await flushTimeoutFollowups(opts);
     await flushTimeoutFollowups(opts);
     expect(ids).toHaveLength(2); expect(new Set(ids).size).toBe(1);
-    expect(ids).toEqual(['90001', '90001']);
+    expect(ids).toEqual([payload.num, payload.num]);
     expect(fileFollowup.mock.calls[1][0]).toEqual(fileFollowup.mock.calls[0][0]);
-    expect(fileFollowup.mock.calls[0][0].abs).toBe(join(dir, 'backlog', '90001-investigate-timeout-retries-for-pr-3415-at-aaaaaaaa.md'));
-    expect(vi.mocked(allocateCardNumber).mock.calls.length - allocationsBefore).toBe(1);
+    expect(fileFollowup.mock.calls[0][0]).toEqual(payload);
+    expect(payload.abs).toBe(join(dir, 'backlog', `${payload.num}-investigate-timeout-retries-for-pr-3415-at-aaaaaaaa.md`));
+    expect(readState(dir, e).card).toMatchObject({ filed: true, payload });
+    expect(allocateCardNumber).not.toHaveBeenCalled();
   }));
   it('refuses stale heads and nonterminal jobs; a newly evidenced head gets a fresh budget', async () => harness(async (dir) => {
     const e = evidence(); let requests = 0;
