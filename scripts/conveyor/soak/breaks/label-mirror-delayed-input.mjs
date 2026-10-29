@@ -66,7 +66,7 @@ export default {
         appendRow: async (row) => { writes += 1; rows.push(row); return { ok: true }; },
         addLabel: async () => { writes += 1; },
       });
-      if (out.failures.length || writes || !derivePrState(rows, facts, {}).clears) violations.push(`delayed addition resurrected the cleared hold (label swap=${swap}, approval=${approval})`);
+      if (out.failures.length || writes || derivePrState(rows, facts, {}).clears !== approval) violations.push(`delayed addition failed approval-bound clearance (label swap=${swap}, approval=${approval})`);
     }
     const node = (change, label, at) => ({ __typename: change === 'added' ? 'LabeledEvent' : 'UnlabeledEvent', createdAt: at, label: { name: label }, actor: { __typename: 'User', login: 'operator' } });
     const chronological = [node('added', 'review:human', '2026-10-12T09:00:00Z'), node('removed', 'review:human', '2026-10-12T10:00:00Z'), node('added', 'review:human', '2026-10-12T10:00:00Z'), ...Array.from({ length: 99 }, () => node('added', 'bug', '2026-10-12T11:00:00Z'))];
