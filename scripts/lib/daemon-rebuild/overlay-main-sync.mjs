@@ -30,16 +30,19 @@ const sha = result => {
   return value;
 };
 function readSyncState(file, io = fs) {
+  let data;
   try {
-    const data = JSON.parse(io.readFileSync(file, 'utf8'));
-    if (!data || !Object.hasOwn(data, 'lastSyncedMain')) throw new Error('invalid main-sync state; operator repair required');
-    for (const map of [data.lastSyncedMain, Object.hasOwn(data, 'attemptedMain') ? data.attemptedMain : {}]) {
-      if (!map || typeof map !== 'object' || Array.isArray(map)
-        || Object.values(map).some(v => typeof v !== 'string' || !/^[a-f0-9]{40}$/.test(v))) throw new Error('invalid main-sync state; operator repair required');
-    }
-    data.attemptedMain ??= {};
-    return data;
-  } catch (error) { if (error.code === 'ENOENT') return { lastSyncedMain: {}, attemptedMain: {} }; throw error; }
+    data = JSON.parse(io.readFileSync(file, 'utf8'));
+  } catch (error) { if (error.code === 'ENOENT') data = { lastSyncedMain: {} }; else throw error; }
+  if (!data || !Object.hasOwn(data, 'lastSyncedMain')) throw new Error('invalid main-sync state; operator repair required');
+  for (const key of ['lastSyncedMain', 'attemptedMain', 'shadowMain', 'pushRetryMain', 'pushRetryAfter', 'errorAt']) {
+    if (!Object.hasOwn(data, key)) data[key] = {};
+    const map = data[key], timestamp = key === 'pushRetryAfter' || key === 'errorAt';
+    if (!map || typeof map !== 'object' || Array.isArray(map) || Object.values(map).some(v => timestamp
+      ? !Number.isSafeInteger(v) || v < 0 : typeof v !== 'string' || !/^[a-f0-9]{40}$/.test(v))) throw new Error('invalid main-sync state; operator repair required');
+  }
+  if (Object.keys(data.pushRetryAfter).some(ref => !data.pushRetryMain[ref])) throw new Error('incomplete push retry state; operator repair required');
+  return data;
 }
 function writeSyncState(file, data, io) {
   const temp = `${file}.${randomUUID()}.tmp`;
@@ -87,21 +90,35 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
   for (const ref of selectSyncTargets(readOverlayState(root, { env }))) {
     let token;
     const lock = marker(root, env, ref);
+    const alert = error => {
+      try {
+        const file = sidecar(root, env), state = readSyncState(file), at = Date.now();
+        if (state.errorAt[ref] !== undefined && at - state.errorAt[ref] < 60 * 60_000) return;
+        state.errorAt[ref] = at;
+        writeSyncState(file, state, fs);
+      } catch { /* Unreadable state cannot authorize a run or suppress its diagnostic. */ }
+      needsYou(root, env, ref, error);
+    };
     try {
       if (!isSafeBranchName(ref)) throw new Error('unsafe overlay ref');
-      const synced = readSyncState(sidecar(root, env));
       token = acquire(lock);
       if (!token) { result.skipped.push(ref); continue; }
+      const synced = readSyncState(sidecar(root, env));
+      if (Date.now() < (synced.pushRetryAfter[ref] ?? 0)) { result.skipped.push(ref); continue; }
       output(run(['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main', `+refs/heads/${ref}:refs/remotes/origin/${ref}`]));
       const main = sha(run(['rev-parse', 'origin/main']));
       const last = synced.lastSyncedMain[ref];
-      if (last === main || synced.attemptedMain[ref] === main) { result.skipped.push(ref); continue; }
+      if (last === main || synced.attemptedMain[ref] === main || (mode === 'shadow' && synced.shadowMain[ref] === main)) {
+        result.skipped.push(ref); continue;
+      }
       const base = last ?? sha(run(['merge-base', 'origin/main', `origin/${ref}`]));
       const changed = new Set(paths(run(['diff', '--name-only', '-z', base, main])));
       if (!paths(run(['diff', '--name-only', '-z', `origin/main...origin/${ref}`])).some(f => changed.has(f))) {
         result.skipped.push(ref); continue;
       }
       if (mode === 'shadow') {
+        synced.shadowMain[ref] = main;
+        writeSyncState(sidecar(root, env), synced, fs);
         console.error(`overlay-main-sync would merge main into ${ref}`);
         appendOverlayEvent(root, { kind: 'overlay-main-sync-shadow', ref }, { env });
         result.would.push(ref); continue;
@@ -109,9 +126,9 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
       const owner = token;
       const child = spawnFn(process.execPath, [SELF, `--clone=${root}`, `--ref=${ref}`, `--token=${owner}`],
         { cwd: root, env, detached: true, stdio: 'ignore' });
-      child.once?.('error', error => { release(lock, owner); needsYou(root, env, ref, error); });
+      child.once?.('error', error => { alert(error); release(lock, owner); });
       child.unref(); result.started.push(ref); token = null;
-    } catch (error) { needsYou(root, env, ref, error); result.skipped.push(ref); }
+    } catch (error) { alert(error); result.skipped.push(ref); }
     finally { release(lock, token); }
   }
   return result;
@@ -135,7 +152,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     heartbeat = setInterval(() => {
       try { if (io.readFileSync(lock, 'utf8') === token) { const date = new Date(); io.utimesSync(lock, date, date); } }
       catch { /* ownership is checked again before push */ }
-    }, 60_000);
+    }, deps.heartbeatMs ?? 60_000);
     heartbeat.unref();
     const state = readOverlayState(root, { env }), old = state.overlays.find(o => o.ref === ref);
     if (state.corrupt || !old || !selectSyncTargets(state).includes(ref)) throw new Error('overlay registration unavailable');
@@ -189,10 +206,18 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     if (current.corrupt || !isDeepStrictEqual(current.overlays.find(o => o.ref === ref), old)
       || io.readFileSync(lock, 'utf8') !== token) throw new Error('overlay registration or marker changed');
     if (sha(git(['rev-parse', 'HEAD'], scratch)) !== to || output(git(['status', '--porcelain'], scratch)).trim()) throw new Error('candidate changed during tests');
-    const push = git(['push', 'origin', `HEAD:refs/heads/${ref}`], scratch);
-    if (push.status !== 0 || push.error) return { pushed: false };
+    let push;
+    try { push = git(['push', 'origin', `HEAD:refs/heads/${ref}`], scratch); }
+    catch (error) { push = { error }; }
     const file = sidecar(root, env), synced = readSyncState(file, io);
+    if (push?.status !== 0 || push.error) {
+      synced.pushRetryAfter[ref] = Date.now() + 10 * 60_000;
+      synced.pushRetryMain[ref] = main;
+      writeSyncState(file, synced, io);
+      return { pushed: false };
+    }
     synced.lastSyncedMain[ref] = main;
+    delete synced.pushRetryAfter[ref]; delete synced.pushRetryMain[ref];
     writeSyncState(file, synced, io);
     event(root, { kind: 'overlay-main-synced', ref, from, to, tests }, { env });
     return { pushed: true, ref, from, to, tests };

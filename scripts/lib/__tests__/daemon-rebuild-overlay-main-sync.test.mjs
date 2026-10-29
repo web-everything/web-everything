@@ -11,7 +11,7 @@ import { probeOverlayMainSync } from '../../conveyor/health-watch.mjs';
 
 const temps = [], ref = 'lane/fix';
 const temp = () => { const p = fs.mkdtempSync(join(tmpdir(), 'we-main-sync-test-')); temps.push(p); return p; };
-afterEach(() => { vi.restoreAllMocks(); temps.splice(0).forEach(p => fs.rmSync(p, { recursive: true, force: true })); });
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); temps.splice(0).forEach(p => fs.rmSync(p, { recursive: true, force: true })); });
 const run = (args, opts = {}) => spawnSync('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', ...args],
   { encoding: 'utf8', timeout: 20_000, maxBuffer: 8 * 1024 * 1024, ...opts, env: { ...process.env, ...opts.env } });
 const ok = (cwd, args) => { const r = run(args, { cwd }); if (r.status !== 0) throw new Error(`${args}: ${r.stderr}`); return r.stdout.trim(); };
@@ -112,27 +112,47 @@ describe('overlay main sync', () => {
     unchanged(f);
   });
 
-  it('moved remote (push rejected) -> no synced event, lastSyncedMain unchanged', async () => {
+  it.each(['rejected', 'failed', 'threw'])('%s push persists a ten-minute cooldown, skips ticks and automatically retries non-force', async outcome => {
     const f = fixture();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000), started = Date.now();
     fs.writeFileSync(sidecar(f), JSON.stringify({ lastSyncedMain: { [ref]: f.baseSha } }));
     const git = f.deps.git;
+    let reject = true;
     f.deps.git = vi.fn((args, opts) => {
-      if (args[0] !== 'push') return git(args, opts);
+      if (args[0] !== 'push' || !reject) return git(args, opts);
+      reject = false;
       f.pushes.push([...args]);
+      if (outcome === 'threw') throw new Error('push transport threw');
+      if (outcome === 'failed') return { status: null, error: new Error('push transport failed'), stdout: '' };
       // Advance the real remote independently, then let Git reject the non-fast-forward push.
       const tree = ok(f.origin, ['rev-parse', `${f.oldSha}^{tree}`]);
       const moved = ok(f.origin, ['commit-tree', tree, '-p', f.oldSha, '-m', 'concurrent writer']);
       ok(f.origin, ['update-ref', `refs/heads/${ref}`, moved, f.oldSha]);
       const result = run(args, opts); expect(result.status).not.toBe(0); return result;
     });
-    await job(f).catch(() => {});
+    expect(await job(f)).toEqual({ pushed: false });
     expect(f.pushes).toHaveLength(1);
     expect(synced(f)).toEqual([]);
     expect(json(sidecar(f)).lastSyncedMain[ref]).toBe(f.baseSha);
     expect(json(sidecar(f)).attemptedMain?.[ref]).toBeUndefined();
+    expect(json(sidecar(f)).pushRetryAfter[ref]).toBe(started + 10 * 60_000);
+    expect(json(sidecar(f)).pushRetryMain[ref]).toBe(f.mainSha);
     const spawnFn = spawner();
+    f.deps.git.mockClear();
+    expect(tick(f, { spawnFn })).toMatchObject({ started: [], skipped: [ref] });
+    clock.mockReturnValue(started + 10 * 60_000 - 1);
+    expect(tick(f, { spawnFn })).toMatchObject({ started: [], skipped: [ref] });
+    expect(spawnFn).not.toHaveBeenCalled(); expect(f.deps.git).not.toHaveBeenCalled();
+    expect(f.deps.testRunner).toHaveBeenCalledOnce(); expect(f.scratched).toHaveLength(1);
+    clock.mockReturnValue(started + 10 * 60_000);
     expect(tick(f, { spawnFn }).started).toEqual([ref]);
     expect(spawnFn).toHaveBeenCalledOnce();
+    fs.unlinkSync(marker(f)); // The fake child hands off to the real worker below.
+    expect(await job(f)).toMatchObject({ pushed: true });
+    expect(f.deps.testRunner).toHaveBeenCalledTimes(2);
+    expect(f.pushes).toEqual(Array(2).fill(['push', 'origin', `HEAD:refs/heads/${ref}`]));
+    expect(json(sidecar(f)).pushRetryAfter[ref]).toBeUndefined();
+    expect(json(sidecar(f)).pushRetryMain[ref]).toBeUndefined();
     unchanged(f);
   });
 
@@ -164,15 +184,54 @@ describe('overlay main sync', () => {
     expect(spawnFn).not.toHaveBeenCalled();
   });
 
-  it('shadow mode logs "would merge" and spawns nothing', async () => {
+  it('shadow mode persists main SHA and logs, emits and returns would only once per ref and main', async () => {
     const f = fixture(), spawnFn = vi.fn(), log = vi.spyOn(console, 'error').mockImplementation(() => {});
     expect(await tick(f, { mode: 'shadow', spawnFn })).toMatchObject({ started: [], would: [ref] });
     expect(log.mock.calls.flat().join('\n')).toContain(`overlay-main-sync would merge main into ${ref}`);
     expect(spawnFn).not.toHaveBeenCalled();
     const eventFile = overlayFilePath(f.root, f.env).replace(/\.json$/, '.events.jsonl');
-    expect(fs.existsSync(sidecar(f))).toBe(false);
-    expect(fs.readFileSync(eventFile, 'utf8').trim().split('\n').map(JSON.parse))
-      .toContainEqual(expect.objectContaining({ kind: 'overlay-main-sync-shadow', ref }));
+    expect(json(sidecar(f)).shadowMain[ref]).toBe(f.mainSha);
+    const eventsBefore = fs.readFileSync(eventFile, 'utf8');
+    log.mockClear();
+    expect(tick(f, { mode: 'shadow', spawnFn })).toMatchObject({ started: [], skipped: [ref], would: [] });
+    expect(tick(f, { mode: 'shadow', spawnFn })).toMatchObject({ started: [], skipped: [ref], would: [] });
+    expect(log).not.toHaveBeenCalled();
+    expect(fs.readFileSync(eventFile, 'utf8')).toBe(eventsBefore);
+    const tree = ok(f.origin, ['rev-parse', `${f.mainSha}^{tree}`]);
+    const moved = ok(f.origin, ['commit-tree', tree, '-p', f.mainSha, '-m', 'next main']);
+    ok(f.origin, ['update-ref', 'refs/heads/main', moved, f.mainSha]);
+    expect(tick(f, { mode: 'shadow', spawnFn }).would).toEqual([ref]);
+    expect(json(sidecar(f)).shadowMain[ref]).toBe(moved);
+    expect(log).toHaveBeenCalledOnce();
+    expect(fs.readFileSync(eventFile, 'utf8').trim().split('\n').map(JSON.parse)
+      .filter(e => e.kind === 'overlay-main-sync-shadow')).toHaveLength(2);
+    expect(spawnFn).not.toHaveBeenCalled();
+    // Shadow memory never blocks switching to live mode for the same main.
+    const live = spawner();
+    expect(tick(f, { spawnFn: live }).started).toEqual([ref]);
+    expect(live).toHaveBeenCalledOnce();
+  });
+
+  it.each(['fetch failure', 'ref missing on origin'])('%s alerts once per ref per hour across ticks', failure => {
+    const f = fixture(), spawnFn = spawner(), started = 1_800_000_000_000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(started);
+    if (failure === 'ref missing on origin') ok(f.origin, ['update-ref', '-d', `refs/heads/${ref}`]);
+    else {
+      const git = f.deps.git;
+      f.deps.git = vi.fn((args, opts) => args[0] === 'fetch' ? { status: 1, stdout: '' } : git(args, opts));
+    }
+    expect(tick(f, { spawnFn })).toMatchObject({ started: [], skipped: [ref] });
+    expect(alerts(f)).toHaveLength(1);
+    expect(json(sidecar(f)).errorAt[ref]).toBe(started);
+    tick(f, { spawnFn });
+    clock.mockReturnValue(started + 60 * 60_000 - 1);
+    tick(f, { spawnFn });
+    expect(alerts(f)).toHaveLength(1);
+    clock.mockReturnValue(started + 60 * 60_000);
+    tick(f, { spawnFn });
+    expect(alerts(f)).toHaveLength(2);
+    expect(json(sidecar(f)).errorAt[ref]).toBe(Date.now());
+    expect(spawnFn).not.toHaveBeenCalled();
   });
 
   it('mode cascade (default shadow, settings, env)', () => {
@@ -233,6 +292,39 @@ describe('overlay main sync', () => {
     attempted(f); unchanged(f);
   });
 
+  it('report over 8 MiB refuses a push and alerts that operator review is required', async () => {
+    const f = fixture(), passing = f.deps.testRunner;
+    f.deps.testRunner = vi.fn(async options => {
+      const result = await passing(options);
+      const reportFile = options.args.find(a => a.startsWith('--outputFile.json=')).slice('--outputFile.json='.length);
+      // Valid passing JSON remains valid after padding, so removing the cap would publish.
+      fs.appendFileSync(reportFile, ' '.repeat(8 * 1024 * 1024));
+      return result;
+    });
+    await expect(job(f)).rejects.toThrow('test report over 8 MiB; operator review required');
+    expect(f.pushes).toEqual([]); expect(synced(f)).toEqual([]);
+    expect(alerts(f).some(e => e.detail.reason === 'test report over 8 MiB; operator review required')).toBe(true);
+    attempted(f); unchanged(f);
+  });
+
+  it('marker heartbeat refreshes lock mtime while tests run past the 30-minute expiry', async () => {
+    const f = fixture(), passing = f.deps.testRunner, spawnFn = spawner();
+    vi.useFakeTimers();
+    f.deps.heartbeatMs = 1000;
+    f.deps.testRunner = vi.fn(async options => {
+      const before = fs.statSync(marker(f)).mtimeMs;
+      await vi.advanceTimersByTimeAsync(31 * 60_000);
+      expect(fs.statSync(marker(f)).mtimeMs).toBeGreaterThan(before + 30 * 60_000);
+      expect(tick(f, { spawnFn })).toMatchObject({ started: [], skipped: [ref] });
+      expect(spawnFn).not.toHaveBeenCalled();
+      return passing(options);
+    });
+    expect(await job(f)).toMatchObject({ pushed: true });
+    expect(vi.getTimerCount()).toBe(0);
+    expect(fs.existsSync(marker(f))).toBe(false);
+    unchanged(f);
+  });
+
   it('marker token lost before push refuses publication and preserves the new owner', async () => {
     const f = fixture(), passing = f.deps.testRunner;
     f.deps.testRunner = vi.fn(async options => {
@@ -254,13 +346,18 @@ describe('overlay main sync', () => {
     expect(tick(f, { spawnFn })).toMatchObject({ started: [], skipped: [unsafe] });
     await expect(runOverlayMainSync({ root: f.root, ref: unsafe, env: f.env, deps: f.deps })).rejects.toThrow(/unsafe overlay ref/);
     expect(spawnFn).not.toHaveBeenCalled(); expect(f.deps.git).not.toHaveBeenCalled();
-    expect(fs.existsSync(sidecar(f))).toBe(false);
+    expect(json(sidecar(f)).errorAt[unsafe]).toEqual(expect.any(Number));
   });
 
   it.each([
     '{broken', '{}', JSON.stringify({ lastSyncedMain: { [ref]: 'origin/main' } }),
     JSON.stringify({ lastSyncedMain: {}, attemptedMain: { [ref]: 'not-a-sha' } }),
     JSON.stringify({ lastSyncedMain: {}, attemptedMain: null }),
+    JSON.stringify({ lastSyncedMain: {}, pushRetryAfter: { [ref]: 1_800_000_000_000 } }),
+    ...['shadowMain', 'pushRetryMain'].flatMap(key => [null, { [ref]: 'not-a-sha' }]
+      .map(value => JSON.stringify({ lastSyncedMain: {}, [key]: value }))),
+    ...['pushRetryAfter', 'errorAt'].flatMap(key => [null, { [ref]: 'tomorrow' }, { [ref]: -1 }]
+      .map(value => JSON.stringify({ lastSyncedMain: {}, [key]: value }))),
   ])('corrupt/non-SHA sidecar fails closed with no spawn (%#)', async raw => {
     const f = fixture(), spawnFn = spawner();
     fs.writeFileSync(sidecar(f), raw);
