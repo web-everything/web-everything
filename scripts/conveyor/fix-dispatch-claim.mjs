@@ -370,7 +370,9 @@ export function refreshLiveFixDispatchClaims({
         const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
         if (result.released) released.push({ repo, pr, kind, owner: entry.owner, reason: identityReason ? `runner-identity-dead (${identityReason})` : `${entry.meta.borrowed ? 'borrowed' : 'wrapped'}-runner-dead (pid ${entry.meta.runnerPid} is gone)` });
       } else {
-        if (heartbeat(lockRoot, resource, cur.owner, heartbeatAt, cur.pid ?? null, cur.meta)) {
+        const meta = { ...cur.meta };
+        delete meta.idleHead;
+        if (heartbeat(lockRoot, resource, cur.owner, heartbeatAt, cur.pid ?? null, meta)) {
           refreshed.push({ repo, pr, kind, headSha, owner: entry.owner });
         }
       }
@@ -437,25 +439,22 @@ export function refreshLiveFixDispatchClaims({
     // Write back the FRESHLY re-read entry (not the listing snapshot); a pre-`claimedAt` claim is stamped now so
     // the ceiling applies to it from here on.
     const meta = { ...(current.meta ?? entry.meta), claimedAt: current.meta?.claimedAt ?? heartbeatAt };
-    if (!isIdle || (!isAwaiting && idleRelease.enabled && idleHeadSha === null)) delete meta.idleHead;
+    if (idleHeadSha === null) delete meta.idleHead;
     if (idleHeadSha !== null) {
       const idleSince = meta.idleHead?.since;
       const idleSinceMs = typeof idleSince === 'string' ? Date.parse(idleSince) : NaN;
       if (meta.idleHead?.sha !== idleHeadSha || !Number.isFinite(idleSinceMs)) {
         meta.idleHead = { sha: idleHeadSha, since: new Date(nowMs).toISOString() };
       } else if (nowMs - idleSinceMs >= idleRelease.idleMinutes * 60_000) {
-        if (readUnchangedClaim(lockRoot, resource, entry)) {
-          const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
-          if (result.released) {
-            released.push({ repo, pr, kind, owner: entry.owner,
-              reason: `idle-head-unmoved (${Math.floor((nowMs - idleSinceMs) / 60_000)}m, ${idleRelease.idleMinutes} from ${idleRelease.sources.idleMinutes})` });
-            try {
-              const recorded = recordEvent({ kind: 'idle-claim-released', repo, pr, daemon: 'reconcile-fix-dispatch',
-                detail: { kind, idleMinutes: idleRelease.idleMinutes, sources: idleRelease.sources,
-                  headSha: idleHeadSha, idleSince, owner: entry.owner } });
-              if (recorded && typeof recorded.catch === 'function') void recorded.catch(() => {});
-            } catch { /* event storage never interrupts the sweep */ }
-          }
+        const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
+        if (result.released) {
+          released.push({ repo, pr, kind, owner: entry.owner,
+            reason: `idle-head-unmoved (${Math.floor((nowMs - idleSinceMs) / 60_000)}m, ${idleRelease.idleMinutes} from ${idleRelease.sources.idleMinutes})` });
+          try {
+            void Promise.resolve(recordEvent({ kind: 'idle-claim-released', repo, pr, daemon: 'reconcile-fix-dispatch',
+              detail: { kind, idleMinutes: idleRelease.idleMinutes, sources: idleRelease.sources,
+                headSha: idleHeadSha, idleSince, owner: entry.owner } })).catch(() => {});
+          } catch { /* event storage never interrupts the sweep */ }
         }
         continue;
       }

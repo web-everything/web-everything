@@ -665,6 +665,139 @@ describe('idle-claim auto-release (R201)', () => {
     expect(e.sources.idleMinutes).toMatch(/env/);
   });
 
+  it.each(['abc', '0'])('malformed WE_IDLE_CLAIM_RELEASE_MINUTES=%s falls back to the 30 min standard', (value) => {
+    const idleRelease = resolveIdleClaimRelease({ env: { WE_IDLE_CLAIM_RELEASE_MINUTES: value }, platform: null });
+    expect(idleRelease.idleMinutes).toBe(30);
+    expect(idleRelease.sources.idleMinutes).toMatch(/standard/);
+    acquire();
+    sweep(T0 + 60_000, { extra: { idleRelease } });
+    const inside = sweep(T0 + 60_000 + IDLE_MS - 1, { extra: { idleRelease } });
+    expect(inside.released ?? []).toHaveLength(0);
+    expect(inside.refreshed).toHaveLength(1);
+    const expired = sweep(T0 + 60_000 + IDLE_MS, { extra: { idleRelease } });
+    expect(expired.released).toHaveLength(1);
+    expect(readFixDispatchClaim({ repo: 'we', pr: 5996, lockRoot: claimRoot })).toBeNull();
+  });
+
+  it('an idle session awaiting verification is never idle-released, clears its idle clock, and never probes the PR head', () => {
+    acquire();
+    sweep(T0 + 60_000);
+    const prHeadFor = vi.fn(() => 'sha1');
+    const awaitingVerifyFor = vi.fn(() => ({ awaiting: true }));
+    const extra = { awaitingVerifyFor, prHeadFor };
+    const result = sweep(T0 + 60_000 + 2 * IDLE_MS, { extra });
+    expect(result.released ?? []).toHaveLength(0);
+    expect(result.refreshed).toHaveLength(1);
+    expect(result.awaiting).toEqual([{ repo: 'we', pr: 5996, kind: 'fix', owner: 'A' }]);
+    const current = readFixDispatchClaim({ repo: 'we', pr: 5996, lockRoot: claimRoot });
+    expect(current?.owner).toBe('A');
+    expect(current.meta).not.toHaveProperty('idleHead');
+    expect(awaitingVerifyFor).toHaveBeenCalled();
+    expect(prHeadFor).not.toHaveBeenCalled();
+  });
+
+  it('a claim with a live meta.runnerPid is never idle-released and clears its idle clock', () => {
+    acquire();
+    sweep(T0 + 60_000);
+    const key = { repo: 'we', pr: 5996, lockRoot: claimRoot };
+    const current = readFixDispatchClaim(key);
+    expect(heartbeat(claimRoot, fixDispatchResource(key), current.owner, iso(T0 + 60_000), current.pid,
+      { ...current.meta, runnerPid: 12345, runnerStart: 'runner-start', runnerArgv: 'runner-argv' })).toBe(true);
+    const alive = vi.fn(() => true);
+    const identity = vi.fn(() => ({ alive: true }));
+    const prHeadFor = vi.fn(() => 'sha1');
+    const result = sweep(T0 + 60_000 + 2 * IDLE_MS, { extra: { alive, identity, prHeadFor } });
+    expect(result.released ?? []).toHaveLength(0);
+    expect(result.refreshed).toHaveLength(1);
+    const refreshed = readFixDispatchClaim(key);
+    expect(refreshed?.owner).toBe('A');
+    expect(refreshed.meta.runnerPid).toBe(12345);
+    expect(refreshed.meta).not.toHaveProperty('idleHead');
+    expect(alive).toHaveBeenCalledWith(12345);
+    expect(identity).toHaveBeenCalledWith(12345, { expectStart: 'runner-start', expectArgv: 'runner-argv' });
+    expect(prHeadFor).not.toHaveBeenCalled();
+  });
+
+  it.each(['working', 'disabled'])('%s clears a stale idle clock and resuming idle release requires a fresh window', (mode) => {
+    acquire();
+    sweep(T0 + 60_000);
+    const prHeadFor = vi.fn(() => 'sha1');
+    const idleRelease = resolveIdleClaimRelease({ env: { WE_IDLE_CLAIM_RELEASE_ENABLED: '0' }, platform: null });
+    const result = sweep(T0 + 10 * 60_000, mode === 'working'
+      ? { state: 'working', extra: { prHeadFor } } : { extra: { idleRelease, prHeadFor } });
+    expect(result.released ?? []).toHaveLength(0);
+    expect(result.refreshed).toHaveLength(1);
+    expect(readFixDispatchClaim({ repo: 'we', pr: 5996, lockRoot: claimRoot }).meta).not.toHaveProperty('idleHead');
+    expect(prHeadFor).not.toHaveBeenCalled();
+    const resumedAt = T0 + 20 * 60_000;
+    sweep(resumedAt);
+    const originalWindow = sweep(T0 + 60_000 + IDLE_MS);
+    expect(originalWindow.released ?? []).toHaveLength(0);
+    expect(originalWindow.refreshed).toHaveLength(1);
+    expect(sweep(resumedAt + IDLE_MS).released).toHaveLength(1);
+  });
+
+  it('an unreadable head clears the idle clock so readable X again requires a full new window', () => {
+    acquire();
+    sweep(T0 + 60_000, { head: 'sha1' });
+    const unreadable = sweep(T0 + 10 * 60_000, { head: null });
+    expect(unreadable.released ?? []).toHaveLength(0);
+    expect(unreadable.refreshed).toHaveLength(1);
+    expect(readFixDispatchClaim({ repo: 'we', pr: 5996, lockRoot: claimRoot }).meta).not.toHaveProperty('idleHead');
+    const readableAt = T0 + 20 * 60_000;
+    sweep(readableAt, { head: 'sha1' });
+    const originalWindow = sweep(T0 + 60_000 + IDLE_MS);
+    expect(originalWindow.released ?? []).toHaveLength(0);
+    expect(originalWindow.refreshed).toHaveLength(1);
+    const insideFreshWindow = sweep(readableAt + IDLE_MS - 1);
+    expect(insideFreshWindow.released ?? []).toHaveLength(0);
+    expect(insideFreshWindow.refreshed).toHaveLength(1);
+    const expired = sweep(readableAt + IDLE_MS);
+    expect(expired.released).toHaveLength(1);
+    expect(readFixDispatchClaim({ repo: 'we', pr: 5996, lockRoot: claimRoot })).toBeNull();
+  });
+
+  it('recordEvent throwing does not stop a release or the sweep of subsequent claims', () => {
+    acquire(5996);
+    acquire(5997);
+    const recordEvent = vi.fn(() => { throw new Error('event storage unavailable'); });
+    const extra = { recordEvent, listAgentsAll: () => [5996, 5997].map((pr) => ({ name: `fix-${pr}`, state: 'idle' })) };
+    expect(sweep(T0 + 60_000, { extra }).refreshed).toHaveLength(2);
+    const result = sweep(T0 + 60_000 + IDLE_MS, { extra });
+    expect(result.checked).toBe(2);
+    expect(result.released).toHaveLength(2);
+    expect(result.released.map(({ pr }) => pr).sort()).toEqual([5996, 5997]);
+    expect(result.refreshed).toHaveLength(0);
+    expect(recordEvent).toHaveBeenCalledTimes(2);
+    expect(readFixDispatchClaim({ repo: 'we', pr: 5996, lockRoot: claimRoot })).toBeNull();
+    expect(readFixDispatchClaim({ repo: 'we', pr: 5997, lockRoot: claimRoot })).toBeNull();
+  });
+
+  it('recordEvent returning a rejected promise processes subsequent claims without an unhandled rejection', async () => {
+    acquire(5996);
+    acquire(5997);
+    const recordEvent = vi.fn(() => Promise.reject(new Error('event storage unavailable')));
+    const extra = { recordEvent, listAgentsAll: () => [5996, 5997].map((pr) => ({ name: `fix-${pr}`, state: 'idle' })) };
+    const unhandledRejection = vi.fn();
+    process.on('unhandledRejection', unhandledRejection);
+    try {
+      expect(sweep(T0 + 60_000, { extra }).refreshed).toHaveLength(2);
+      const result = sweep(T0 + 60_000 + IDLE_MS, { extra });
+      expect(result.checked).toBe(2);
+      expect(result.released).toHaveLength(2);
+      expect(result.released.map(({ pr }) => pr).sort()).toEqual([5996, 5997]);
+      expect(result.refreshed).toHaveLength(0);
+      expect(recordEvent).toHaveBeenCalledTimes(2);
+      expect(readFixDispatchClaim({ repo: 'we', pr: 5996, lockRoot: claimRoot })).toBeNull();
+      expect(readFixDispatchClaim({ repo: 'we', pr: 5997, lockRoot: claimRoot })).toBeNull();
+      // Cross an event-loop turn so an unhandled rejection would have been emitted.
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(unhandledRejection).not.toHaveBeenCalled();
+    } finally {
+      process.removeListener('unhandledRejection', unhandledRejection);
+    }
+  });
+
   it('an idle session with an unmoved PR head past the window loses its claim, which is released and logged as an event', () => {
     acquire();
     const events = [];
