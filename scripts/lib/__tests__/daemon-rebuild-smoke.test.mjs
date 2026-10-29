@@ -392,4 +392,10 @@ describe('dispatchSmokeSuspects', () => {
       git: okGit(['q']), applied, adoptedApplied: null, patterns: ['p'], match,
     })).toEqual([]);
   });
+
+  it('carries each applied row\'s registrationId, so the definite drop is bound to the smoked registration', () => {
+    const applied = [{ ref: 'a', sha: '1', registrationId: 'reg-a' }, { ref: 'b', sha: '2' }];
+    const out = dispatchSmokeSuspects({ git: okGit(['p']), applied, adoptedApplied: null, patterns: ['p'], match });
+    expect(out.map((s) => [s.ref, s.registrationId])).toEqual([['a', 'reg-a'], ['b', undefined]]);
+  });
 });
