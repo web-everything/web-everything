@@ -85,8 +85,9 @@ export function proveHumanOnlyLicense({ repo, pr, headSha, exec, cwd, readCommen
       const tree = git(['--literal-pathspecs', 'ls-tree', '-z', ref, '--', path]);
       if (tree === '') return null; // proven absent, including a deletion inherited from main
       const tab = tree.indexOf('\t');
-      if (!/^\d{6} blob [0-9a-f]{40}$/.test(tree.slice(0, tab)) || tree.slice(tab + 1) !== `${path}\0`) throw Error('blob evidence unreadable');
-      return tree.slice(0, tab).split(' ')[2];
+      if (!/^100(?:644|755) blob [0-9a-f]{40}$/.test(tree.slice(0, tab)) || tree.slice(tab + 1) !== `${path}\0`) throw Error('regular blob evidence unreadable');
+      const [mode, , id] = tree.slice(0, tab).split(' ');
+      return `${mode} ${id}`;
     };
     for (const path of paths) {
       if (!path || normalizeGatePath(path).split('/').includes('..')) return refuse('successor path unreadable');

@@ -47,6 +47,32 @@ describe('human-only enqueue license', () => {
     r.git(['merge', '--no-ff', '-m', 'merge main', main]); r.setHead(r.git(['rev-parse', 'HEAD']));
     expect(r.prove()).toMatchObject({ licensed: true, tier: 'mechanical' });
   });
+  it.each([
+    ['regular-file-to-symlink change with the same blob id', '100644', '120000', false],
+    ['exec-bit change with the same blob id', '100644', '100755', false],
+    ['symlink inherited from main', '120000', '120000', false],
+    ['submodule inherited from main', '160000', '160000', false],
+    ['executable regular file inherited from main', '100755', '100755', true],
+    ['deletion inherited from main', null, null, true],
+  ])('checks sensitive path modes in a main merge: %s', (_name, mainMode, headMode, licensed) => {
+    const r = fixture(), path = '.github/workflows/ci.yml';
+    const id = mainMode === '160000' ? r.approved : r.git(['rev-parse', `${r.approved}:${path}`]);
+    const stageMode = mode => r.git(mode === null ? ['update-index', '--force-remove', path]
+      : ['update-index', '--cacheinfo', mode, id, path]);
+    r.git(['checkout', '-qb', 'main-change']); r.write('README.md', 'from main');
+    r.git(['add', 'README.md']); stageMode(mainMode); r.git(['commit', '-qm', 'main mode']);
+    const main = r.git(['rev-parse', 'HEAD']); r.git(['update-ref', 'refs/remotes/origin/main', main]);
+    r.git(['checkout', '-fqb', 'pr', r.approved]); r.write('ordinary.md', 'author docs');
+    r.git(['add', 'ordinary.md']); stageMode(headMode); r.git(['commit', '-qm', 'author mode']);
+    r.git(['reset', '--hard', 'HEAD']);
+    r.git(['merge', '--no-ff', '-m', 'merge main', main]);
+    const head = r.git(['rev-parse', 'HEAD']); r.setHead(head);
+    const type = mainMode === '160000' ? 'commit' : 'blob';
+    expect(r.git(['ls-tree', main, '--', path])).toBe(mainMode === null ? '' : `${mainMode} ${type} ${id}\t${path}`);
+    expect(r.git(['ls-tree', head, '--', path])).toBe(headMode === null ? '' : `${headMode} ${type} ${id}\t${path}`);
+    expect(r.prove()).toMatchObject(licensed ? { licensed: true, tier: 'mechanical' }
+      : { licensed: false, reason: expect.stringMatching(/re-approve.*queue/) });
+  });
   it('refuses an ordinary author successor without a main merge', () => {
     const r = fixture(); r.write('README.md', 'ordinary'); r.setHead(r.commit('author docs'));
     expect(r.prove()).toMatchObject({ licensed: false, reason: expect.stringMatching(/re-approve.*queue/) });
