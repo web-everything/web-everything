@@ -306,6 +306,8 @@ export const REFUSAL_KINDS = Object.freeze([
   'ci-heal-escalated', 'waiting-on-system-fix', 'review-hold-red',
   // A CI re-run this system requested whose result is not observed yet: held, not escalated, until the window.
   'ci-timeout-rerun-in-flight', 'timeout-evidence-unknown',
+  // Incomplete inventory recovery exhausted its rerun; no active stale path can fall through to a bounded heal.
+  'starved-capacity-alert',
   // `draft` (draft-first PRs, operator-approved 2026-09-27) — the PR is still a GitHub draft: no review is
   // dispatched, whatever `review:*` label it carries, until the `promote-draft` DISPATCH_KIND (above) has
   // un-drafted it. See {@link dispatchReviewRow}'s own gate.
@@ -3278,8 +3280,9 @@ export function planReconcile({
       const staleRetry = pr.owedCiRerunRetry;
       const incompleteFailureInventory = pr.timeoutRetry && !pr.timeoutRetry.eligible
         && String(pr.timeoutRetry.reason).includes('incomplete-failure-inventory');
-      if (!incompleteFailureInventory && !pr.timeoutRetry?.cancelledShard && staleCiRerun === 'once-per-head' && pr.mainGreenNow?.red === false && staleRetry?.eligible
-          && staleRetry.head === pr.headRefOid && staleRetry.pr === prNumber) {
+      const staleRerunActive = !pr.timeoutRetry?.cancelledShard && staleCiRerun === 'once-per-head' && pr.mainGreenNow?.red === false && staleRetry?.eligible
+        && staleRetry.head === pr.headRefOid && staleRetry.pr === prNumber;
+      if (staleRerunActive) {
         const staleSpent = retryBudget?.confirmed === undefined ? undefined : retryBudget.confirmed + (retryBudget.rejected ?? 0);
         const staleCap = staleRetry.jobs.length;
         if (staleSpent < staleCap && hasLiveCheck(pr)) {
@@ -3308,14 +3311,20 @@ export function planReconcile({
       }
       const inventorySpent = retryBudget?.confirmed === undefined ? undefined
         : retryBudget.confirmed + (retryBudget.rejected ?? 0);
-      const partialFailureInventory = incompleteFailureInventory && inventorySpent === 0;
+      // Turning off stale reruns on green main retains the legacy ineligible-row/ci-heal path.
+      // Red main likewise never authorizes a mechanical recovery rerun; absent main evidence can use recovery.
+      const staleRerunDisabled = staleCiRerun === 'off' && pr.mainGreenNow?.red === false;
+      const partialFailureInventory = incompleteFailureInventory && !staleRerunActive && !staleRerunDisabled && inventorySpent === 0;
       if (incompleteFailureInventory && inventorySpent >= 1) {
-        const why = `PR #${prNumber}: incomplete failure inventory on head ${String(pr.headRefOid).slice(0, 8)}; the one-time recovery rerun is spent — operator investigation required`;
-        refusals.push({ kind: 'starved-capacity-alert', prNumber, why });
+        const why = `PR #${prNumber}: incomplete failure inventory on head ${String(pr.headRefOid).slice(0, 8)}; the one-time recovery rerun is spent — `
+          + (staleRerunActive ? 'ordinary ci-heal remains bounded by its heal budget' : 'operator investigation required');
         notes.push({ kind: 'starved-capacity-alert', prNumber, text: why });
-        continue;
+        if (!staleRerunActive) {
+          refusals.push({ kind: 'starved-capacity-alert', prNumber, why });
+          continue;
+        }
       }
-      if (partialFailureInventory && staleRetry?.eligible
+      if (partialFailureInventory && pr.mainGreenNow?.red !== true && staleRetry?.eligible
           && staleRetry.head === pr.headRefOid && staleRetry.pr === prNumber) {
         if (hasLiveCheck(pr)) {
           refuse('ci-timeout-rerun-in-flight', { ...withPhase,

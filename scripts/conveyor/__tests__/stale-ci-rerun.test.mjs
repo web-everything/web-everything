@@ -84,7 +84,7 @@ describe('resolveStaleCiRerunSetting cascade', () => {
 
 describe('incomplete failure inventory recovery', () => {
   it.each(['once-per-head', 'off'])('dispatches exactly one capped recovery rerun without a heal when staleCiRerun is %s', setting => {
-    const out = plan({}, setting);
+    const out = plan({ mainGreenNow: undefined, owedCiRerunRetry: { ...evidence, jobs: [...evidence.jobs, ...evidence.jobs] } }, setting);
     expect(out.dispatch).toEqual([expect.objectContaining({
       kind: 'ci-timeout-rerun', variant: 'incomplete-inventory-rerun',
       timeoutRetry: expect.objectContaining({ cap: 1 }),
@@ -93,7 +93,7 @@ describe('incomplete failure inventory recovery', () => {
   });
 
   it.each(['once-per-head', 'off'])('dispatches a partial-inventory heal without a blocking refusal when no rerun evidence is owed (%s)', setting => {
-    const out = plan({ owedCiRerunRetry: undefined }, setting);
+    const out = plan({ mainGreenNow: undefined, owedCiRerunRetry: undefined }, setting);
     expect.soft(out.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', partialFailureInventory: true })]);
     expect.soft(out.refusals.some(row => row.kind === 'ci-heal-blocking')).toBe(false);
     expect.soft(out.dispatch.some(row => row.kind === 'ci-timeout-rerun')).toBe(false);
@@ -105,7 +105,7 @@ describe('incomplete failure inventory recovery', () => {
     ['off', { confirmed: 1, rejected: 0 }],
     ['off', { confirmed: 0, rejected: 1 }],
   ])('never reruns or heals after the head budget is spent and surfaces starvation in both sinks (%s, %j)', (setting, budget) => {
-    const out = plan({ timeoutRetryBudget: budget }, setting);
+    const out = plan({ mainGreenNow: undefined, timeoutRetryBudget: budget }, setting);
     expect.soft(out.dispatch.some(row => row.kind === 'ci-timeout-rerun')).toBe(false);
     expect.soft(out.dispatch.some(row => row.kind === 'ci-heal')).toBe(false);
     expect.soft(out.refusals).toContainEqual(expect.objectContaining({
@@ -119,7 +119,70 @@ describe('incomplete failure inventory recovery', () => {
   });
 
   it.each(['once-per-head', 'off'])('fails closed on an unknown head budget even with eligible owed rerun evidence (%s)', setting => {
-    const out = plan({ timeoutRetryBudget: undefined }, setting);
+    const out = plan({ mainGreenNow: undefined, timeoutRetryBudget: undefined }, setting);
     expect(out.dispatch.some(row => row.kind === 'ci-timeout-rerun')).toBe(false);
+  });
+
+  it('preserves the stale rerun variant on green main', () => {
+    expect(plan().dispatch).toEqual([expect.objectContaining({
+      kind: 'ci-timeout-rerun', variant: 'stale-ci-rerun',
+      timeoutRetry: expect.objectContaining({ variant: 'stale-ci-rerun', cap: 1 }),
+    })]);
+  });
+
+  it('preserves the ineligible refusal and heal when stale reruns are off on green main', () => {
+    const out = plan({}, 'off');
+    expect(out.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal' })]);
+    expect(out.dispatch[0]).not.toHaveProperty('partialFailureInventory');
+    expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-ineligible' }));
+  });
+
+  it.each(['once-per-head', 'off'])('never reruns on red main but allows a partial-inventory heal (%s)', setting => {
+    expect(plan({ mainGreenNow: { red: true } }, setting).dispatch)
+      .toEqual([expect.objectContaining({ kind: 'ci-heal', partialFailureInventory: true })]);
+  });
+
+  it.each(['once-per-head', 'off'])('holds incomplete recovery while another check is live (%s)', setting => {
+    const out = plan({ mainGreenNow: undefined, rollupIncomplete: true }, setting);
+    expect(out.dispatch).toEqual([]);
+    expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'ci-timeout-rerun-in-flight' }));
+  });
+
+  it.each([{ confirmed: 1, rejected: 0 }, { confirmed: 0, rejected: 1 }, { confirmed: 20, rejected: 20 }])(
+    'keeps stale budget exhaustion on the heal path and emits only a starvation note: %j', budget => {
+      const out = plan({ timeoutRetryBudget: budget });
+      expect(out.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal' })]);
+      expect(out.dispatch[0]).not.toHaveProperty('partialFailureInventory');
+      expect(out.refusals.some(row => row.kind === 'starved-capacity-alert')).toBe(false);
+      expect(out.notes).toContainEqual(expect.objectContaining({
+        kind: 'starved-capacity-alert', prNumber: 5273,
+        text: expect.stringMatching(/PR #5273.*incomplete failure inventory.*heal budget/i),
+      }));
+    },
+  );
+
+  it('keeps the stale fall-through bounded by the heal budget while surfacing starvation', () => {
+    const out = planReconcile({
+      prs: [fixture({ timeoutRetryBudget: { confirmed: 1, rejected: 0 } })],
+      agents: [], requiredChecks: ['test'], now: Date.parse('2026-10-14T17:00:00Z'),
+      mainRedWindows: [], staleCiRerun: 'once-per-head', ciHealCap: 0,
+    });
+    expect(out.dispatch).toEqual([]);
+    expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', cap: 0 }));
+    expect(out.refusals.some(row => row.kind === 'starved-capacity-alert')).toBe(false);
+    expect(out.notes).toContainEqual(expect.objectContaining({ kind: 'starved-capacity-alert', prNumber: 5273 }));
+  });
+
+  it.each([
+    ['setting off', 'off', {}],
+    ['main red', 'once-per-head', { mainGreenNow: { red: true } }],
+    ['no eligible stale evidence', 'once-per-head', { owedCiRerunRetry: { eligible: false } }],
+    ['stale evidence for another head', 'once-per-head', { owedCiRerunRetry: { ...evidence, head: 'old-head' } }],
+    ['stale evidence for another PR', 'once-per-head', { owedCiRerunRetry: { ...evidence, pr: 999 } }],
+  ])('surfaces spent-budget starvation in both sinks when stale rerun is inactive: %s', (_label, setting, over) => {
+    const out = plan({ ...over, timeoutRetryBudget: { confirmed: 1, rejected: 0 } }, setting);
+    expect(out.dispatch).toEqual([]);
+    expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'starved-capacity-alert', prNumber: 5273 }));
+    expect(out.notes).toContainEqual(expect.objectContaining({ kind: 'starved-capacity-alert', prNumber: 5273 }));
   });
 });
