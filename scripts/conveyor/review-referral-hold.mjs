@@ -46,9 +46,8 @@ export function reviewRunEvidence(run) {
   const savedReferral = resuming && !ownReferral;
   const state = (savedReferral ? run.resumeOf.mandatoryReferrals : run.findings?.mandatoryReferrals)?.effects?.find(e => e.type === 'review.mandatory-referrals')?.result;
   const failures = (state?.records ?? []).filter(r => r.failure != null).map(r => r.failure);
-  const hasFailure = failures.length > 0;
   // Only unambiguous persisted quota evidence for every failed seat exempts an attempt.
-  // Missing evidence and conflicting seat/referral failures still count toward the attempt budget.
+  // Missing evidence, conflicting failures, and attempts that reached post-seat steps still count.
   let quotaOnly = false;
   try {
     const failedSeats = Array.isArray(run.seatTimings) ? run.seatTimings.filter(t => t?.verdict === 'error') : [];
@@ -75,10 +74,13 @@ export function reviewRunEvidence(run) {
     resuming && verdict?.pendingReferrals?.includes('referral-persistence-failed') ? Date.parse(run.resumedAt ?? '') || 0 : 0);
   if (!sha(head) || !Number.isFinite(startedAt)) return null;
   if (!Number.isFinite(completedAt)) {
+    // Quota errors at the seats cannot explain a later crash after the panel advanced.
+    if (run.stepTimings?.some(t =>
+      ['reduce', 'mandatoryReferrals', 'referralVerdict', 'advise'].includes(t.step) && t.startedAt != null)) quotaOnly = false;
     // Crashes before/during advise still consumed a retry. Keep them in the cached projection, without
     // inventing a completed panel or clean referral evidence for acceptance/carry readers.
     return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt: null,
-      incomplete: true, hasFailure, quotaOnly, parked: false, attempted: false, persistenceFailed: false, count: 0,
+      incomplete: true, quotaOnly, parked: false, attempted: false, persistenceFailed: false, count: 0,
       pending: ['review-incomplete'], rulings: [] };
   }
   const pending = verdict?.pendingReferrals ?? [];
@@ -88,7 +90,7 @@ export function reviewRunEvidence(run) {
     .filter(r => r.repo === read.repo && r.pr === Number(read.pr) && r.head === head && r.attempted)
     .flatMap(r => r.referrals.map(f => f.key)));
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
-    hasFailure, quotaOnly,
+    quotaOnly,
     ...(resumeAdvise ? { resumeAdvise: true } : {}),
     parked: verdict?.verdict === 'needs-human' && pending.length > 0,
     // A list of only reason tokens names no referral, so it was never "attempted" (not vacuously true).
@@ -372,7 +374,7 @@ export function verdictNeverLanded(pr, last, now = Date.now()) {
 export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Date.now(), retry = resolveNoVerdictRetry(env) } = {}) {
   const max = resolveSameHeadMaxReviews(env);
   if (max === 0) return null;
-  const history = runs.filter(r => !r.quotaOnly && r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid);
+  const history = runs.filter(r => !(r.incomplete && r.quotaOnly) && r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid);
   // Newer incomplete attempts own retry accounting, including after an older parked review was released.
   // A fresh head can also crash on EVERY attempt and must still reach the exhausted needs-you hold.
   const last = latestReviewAttempt(history);
