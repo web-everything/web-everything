@@ -22,7 +22,7 @@ Must ship policy resolution, class persistence, live ordering and the producer c
 
 ## Acceptance
 
-- [A1] **Executable / Must** — `npm run test:unit -- scripts/readiness/__tests__/heavy-admission.test.mjs scripts/readiness/__tests__/heavy-queue-projection.test.mjs scripts/readiness/__tests__/heavy-repair-priority.test.mjs` passes. Add planned case `P1 producer and live ordering agree` in `we:scripts/readiness/__tests__/heavy-admission.test.mjs`: use real temp-pool P0/P1/P3 markers, assert P0 wins, P1 then wins ahead of older builds, same-class FIFO is preserved, and the producer enables discounts only in enforce mode. Its real `tryAdmit('fix')` / `tryAdmit('ci-heal')` ahead set must match `isOldestLiveWaiter`.
+- [A1] **Executable / Must** — The scoped command in Test plan passes. Add planned case `P1 producer and live ordering agree` in `we:scripts/readiness/__tests__/heavy-admission.test.mjs`: use real temp-pool P0/P1/P3 markers, assert P0 wins, P1 then wins ahead of older builds, same-class FIFO is preserved, and the producer enables discounts only in enforce mode. Its real `tryAdmit('fix')` / `tryAdmit('ci-heal')` ahead set must match `isOldestLiveWaiter`.
 - [A2] **Executable / Must fail closed** — Add planned case `P1 policy cascade rejects malformed settings` in `we:scripts/readiness/__tests__/heavy-admission.test.mjs`: invalid/unreadable policy, missing/unknown marker classes, mode off and legacy markers never grant priority or erase queue demand; source diagnostics name the effective fallback. Keep existing case `retains unclassified P0 and earlier fix demand from the real baseline producer; projection agrees with live FIFO` in `we:scripts/readiness/__tests__/heavy-queue-projection.test.mjs` as the pre-wiring guard, migrating its producer-class assertions explicitly when wiring lands.
 - [A3] **Executable / Must handle non-code inputs** — Add planned cases `P1 non-code inputs fail closed` and `P1 names and env cannot impersonate P0` in `we:scripts/readiness/__tests__/heavy-admission.test.mjs`: docs/config/data job contents, PR text and malformed identities cannot become trusted priority/capability inputs; valid self-asserted fix/unblock identities and the local unblock env may grant P1 only, never P0, bypass the cap, or discount another P1. Test missing, null, invalid, oversized and adversarial text.
 - [A4] **Executable / Must preserve occupied slots** — Add planned case `P1 admission never preempts live holders` in `we:scripts/readiness/__tests__/heavy-admission.test.mjs`: occupy every eligible slot with live holders, queue P1, assert acquisition refuses and holder owner/meta stay intact; release one slot, assert the next eligible waiter takes only that slot. Keep existing case `never discounts a running lower-priority holder: its remaining work can still hold a fix` in `we:scripts/readiness/__tests__/heavy-queue-projection.test.mjs` and the legacy non-split cases for both fix and ci-heal.
@@ -35,6 +35,12 @@ Must ship policy resolution, class persistence, live ordering and the producer c
 - P1 can starve builds under persistent repair demand; this item changes queue order only, with no preemption, slot expansion or cap bypass (A4).
 
 ## Test plan
+
+Run the A1 command from the WE checkout:
+
+```bash
+npm run test:unit -- scripts/readiness/__tests__/heavy-admission.test.mjs scripts/readiness/__tests__/heavy-queue-projection.test.mjs scripts/readiness/__tests__/heavy-repair-priority.test.mjs
+```
 
 The named A1–A4 cases above are planned Part B tests, not claims of existing coverage. Exercise real marker files, real slot locks and `resolveQueueBaseline`, with an isolated temp root and injected local policy inputs; never depend on the host queue. Run the A1 command through admission and the diff-selected verify gate. Keep the existing split and non-split projection cases for fix/ci-heal; mutate each branch independently (restoring total backlog must turn its case red). For the live proof, record held/waiting classes, baseline capability, queue-cap verdict and eventual slot order at the same congested moment; if no congestion occurs, retain the proof as owed.
 
