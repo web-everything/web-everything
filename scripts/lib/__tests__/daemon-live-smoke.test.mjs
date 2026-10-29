@@ -65,6 +65,9 @@ describe('lane acquire smoke after lane-hold reset refusal', () => {
     const row = await check.run(context(runChild));
     expect(row).toMatchObject({ ok: true, lane: 4 });
     expect(acquires(runChild)).toHaveLength(2);
+    const releases = runChild.mock.calls.filter(([, args]) => args.includes('release'));
+    expect(releases).toHaveLength(1);
+    expect(releases[0][1]).toEqual(expect.arrayContaining(['release', '--lane=4']));
   });
 
   it('two environmental-only exits are a lane-hold-refused skip, with no release attempted', async () => {

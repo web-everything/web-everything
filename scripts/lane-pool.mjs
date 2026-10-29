@@ -2495,6 +2495,7 @@ async function cmdAcquire(repo) {
           if (e && e.laneHoldRefusal === true) holdRefused.add(pick); // structural flag, never message text
           else sawNonHoldProvisionFailure = true;
           if (failure.includes('index.lock')) {
+            // Log only: index.lock text must not change the structural failure classification above.
             log(`lane-${pick}: stale .git/index.lock - skipped; needs cleanup`);
           }
           log(`  ⚠ lane-${pick} claimed but failed to provision (${String(e && e.message ? e.message : e).split('\n')[0]}) — releasing it and trying another candidate`);
@@ -3481,9 +3482,10 @@ function readListCache(repo, nowMs, cacheTtlMs, callerDeadlineMs = null) {
   // Acquire only needs candidates: atomic claim + re-verification still decide whether a lane is safe.
   // lane-pool-acquire-contention-grace.test.mjs covers default-grace lease churn and, separately,
   // refusing a stale-listed foreign lease without overwriting it; claim/re-verify regressions cover reset safety.
-  // An empty snapshot offers no candidates to re-verify: check its fingerprint so a newly released lane
+  // A snapshot with no currently unleased candidates must check its fingerprint so a newly released lane
   // is visible immediately, including to a --wait-ms=0 caller inside the grace window.
-  if (callerDeadlineMs !== null && c.paths.length > 0 && nowMs - c.writtenAt < listContentionGraceMs()) return c.paths;
+  if (callerDeadlineMs !== null && nowMs - c.writtenAt < listContentionGraceMs()
+    && c.paths.some((dir) => !liveLease(dir, nowMs, ttlMsFromFlags()))) return c.paths;
   if (c.fingerprint !== leaseFingerprint(repo)) return null; // a lease changed since the scan
   return c.paths;
 }

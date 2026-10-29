@@ -133,6 +133,33 @@ describe('acquire shared-list contention grace', () => {
     expectSecondLane(seedClaimedPool());
   }, 30_000);
 
+  it('rescans a non-empty grace cache when every listed lane is now claimed and an unlisted lane is released', () => {
+    seedClaimedPool();
+    expect(acquire('holder-3', {}, ['--lane=3']).lane).toBe(3);
+    expect(list()).toEqual([2, 4].map((n) => join(pool, `lane-${n}`)));
+    const cached = readCache();
+    for (const n of [2, 4]) {
+      expect(acquire(`holder-${n}`, {}, [`--lane=${n}`]).lane).toBe(n);
+    }
+    rmSync(join(pool, 'lane-3', '.git', '.lane-lease'));
+    expect(readCache()).toEqual(cached);
+    // Keep this specifically inside grace even on a slow host; retain the scan's fingerprint.
+    writeCache({ ...cached, writtenAt: Date.now() });
+    const before = scanProbes().length;
+    const released = acquire('released-lane-picker', { LANE_POOL_ACQUIRE_GROWTH_MAX_NEW: '0' }, ['--wait-ms=0']);
+    expect(released.lane).toBe(3);
+    expect(scanProbes().length, 'all cached candidates leased must trigger a fresh scan').toBeGreaterThan(before);
+    expect(readCache().fingerprint).not.toBe(cached.fingerprint);
+    expect(readCache().paths).toEqual([join(pool, 'lane-3')]);
+  }, 30_000);
+
+  it.each(['flag', 'environment'])('zero contention grace from %s disables reuse on a fingerprint change', (source) => {
+    expectSecondLane(seedClaimedPool(), source === 'environment' ? { LANE_POOL_LIST_CONTENTION_GRACE_MS: '0' } : {}, {
+      rescans: true,
+      extraArgs: source === 'flag' ? ['--list-contention-grace-ms=0'] : [],
+    });
+  }, 30_000);
+
   it('re-checks contention grace under the scan lock after the initial cache read misses', () => {
     const first = seedClaimedPool();
     // Deterministically model a cache becoming visible between the first read

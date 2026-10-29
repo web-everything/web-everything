@@ -150,6 +150,23 @@ describe('lane-pool acquire after lane-hold reset refusal', () => {
     expect(result.out.trim()).toBe('');
   }, 60_000);
 
+  it('exits 1 rather than 75 when a hold refusal is mixed with a non-hold index.lock provision failure', () => {
+    provision(2);
+    const parked = park(1);
+    const lock = join(lane(2), '.git', 'index.lock');
+    writeFileSync(lock, 'leftover index lock\n');
+    const result = acquire(0, ['--cache-ttl-ms=0']);
+    expect(result.code, result.err).toBe(1);
+    expect(result.err.match(/lane-1: reset REFUSED — lane-hold:/g)).toHaveLength(1);
+    expect(result.err).toContain('lane-2: stale .git/index.lock - skipped; needs cleanup');
+    expect(result.err).toMatch(/lane-2 claimed but failed to provision \([^\n]*\) — releasing it and trying another candidate/);
+    expect(existsSync(lease(1))).toBe(false);
+    expect(existsSync(lease(2))).toBe(false);
+    expect(readFileSync(join(lane(1), '.git', '.fix-await-verify'), 'utf8')).toBe(parked);
+    expect(readFileSync(lock, 'utf8')).toBe('leftover index lock\n');
+    expect(result.out.trim()).toBe('');
+  }, 60_000);
+
   it('never hands out or modifies a lane held by a live foreign lease', () => {
     provision(2);
     const held = run(['acquire', '--lane=1', '--session=foreign-live-owner', '--json']);
@@ -172,7 +189,7 @@ describe('lane-pool acquire after lane-hold reset refusal', () => {
       expect(held.code, held.err).toBe(0);
     }
     const result = acquire(2500);
-    expect(result.code).not.toBe(0);
+    expect(result.code, result.err).toBe(kind === 'lock-wait' ? 75 : 1);
     const waits = events().filter((e) => e.kind === kind);
     expect(waits.length).toBeGreaterThanOrEqual(2);
     expect(new Set(waits.map((e) => e.ms)).size, 'poll intervals must vary with injected random draws').toBeGreaterThan(1);
