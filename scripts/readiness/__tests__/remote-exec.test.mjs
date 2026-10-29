@@ -1016,8 +1016,121 @@ describe('sibling dependency snapshot', () => {
       }
       throw new Error(`Unexpected Git read: ${command}`);
     });
-    return {...f,sibling};
+    return {...f,sibling,files};
   }
+
+  it.each([
+    ['scripts/lib/__tests__/constellation-ownership.test.mjs'],
+    ['scripts/lib'], ['constellation-ownership'], [], ['-t', 'one case'],
+    ['a.test.mjs', 'scripts/lib/__tests__/constellation-ownership.test.mjs'],
+    ['./scripts/lib/__tests__/constellation-ownership.test.mjs'],
+  ].map(selectors => [selectors]))('keeps Git-dependent test collection local for selectors %j', async selectors => {
+    const f = dependencyFixture();
+    const name = 'scripts/lib/__tests__/constellation-ownership.test.mjs';
+    mkdirSync(join(f.cwd,'scripts/lib/__tests__'),{recursive:true});
+    writeFileSync(join(f.cwd,name), "import {execFileSync} from 'node:child_process'; execFileSync('git',['ls-files','-z']);\n");
+    f.listFiles.mockResolvedValue(['package-lock.json','a.test.mjs','vitest.shared.ts',name]);
+    f.argv = ['npm','run','test:unit','--',...selectors];
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'requires-git-worktree'});
+    expect(await runWithRemoteDecision({
+      argv:f.argv,cwd:f.cwd,env:{},log:vi.fn(),loadPerCore:() => 0,
+      policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
+      remoteExec:async options => adaptLegacyRemoteResult(await runRemote({...f,...options})),
+    })).toEqual({handled:false});
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+
+  it.each(['scripts','skills-src','tools','packages/worker/scripts'])
+  ('keeps tooling collection local under %s, including substring collisions', async tree => {
+    const f = dependencyFixture();
+    const name = `${tree}/a.test.mjs`;
+    mkdirSync(join(f.cwd,tree),{recursive:true});
+    writeFileSync(join(f.cwd,name),'// Git-dependent helpers may be imported here');
+    f.listFiles.mockResolvedValue(['package-lock.json','a.test.mjs','vitest.shared.ts',name]);
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'requires-git-worktree'});
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+
+  it('still admits an explicit non-tooling file when unrelated tooling tests exist', async () => {
+    const f = dependencyFixture();
+    const name = 'scripts/ownership.test.mjs';
+    mkdirSync(join(f.cwd,'scripts'));
+    writeFileSync(join(f.cwd,name),'// requires the real Git checkout');
+    f.listFiles.mockResolvedValue(['package-lock.json','a.test.mjs','vitest.shared.ts',name]);
+    expect(await runRemote(f)).toEqual({mode:'remote',code:0});
+  });
+
+  it.each(['node_modules','plugs/node_modules','shared/node_modules'])
+  ('keeps sibling runtime dependencies local at %s', async location => {
+    const f = dependencyFixture();
+    mkdirSync(join(f.sibling,location,'sibling-dep'),{recursive:true});
+    writeFileSync(join(f.sibling,location,'sibling-dep/index.js'),'module.exports = 42;');
+    const module = join(f.sibling,location,'../runtime.cjs');
+    writeFileSync(module,"module.exports = require('sibling-dep');");
+    f.files[location.replace('node_modules','runtime.cjs')] = "module.exports = require('sibling-dep');";
+    const probe = spawnSync(process.execPath,['-e','console.log(require(process.argv[1]))',module],{encoding:'utf8'});
+    expect(probe.status,probe.stderr).toBe(0);
+    expect(probe.stdout.trim()).toBe('42');
+    await expect(remoteManifestAPI.buildSiblingManifest({cwd:f.cwd,exec:f.exec}))
+      .rejects.toMatchObject({code:'unsupported-sibling-dependency'});
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'unsupported-sibling-dependency'});
+    expect(await runWithRemoteDecision({
+      argv:f.argv,cwd:f.cwd,env:{},log:vi.fn(),loadPerCore:() => 0,
+      policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
+      remoteExec:async options => adaptLegacyRemoteResult(await runRemote({...f,...options})),
+    })).toEqual({handled:false});
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+
+  it.each(['dependencies','devDependencies','optionalDependencies','peerDependencies',
+    'bundledDependencies','bundleDependencies','workspaces'])
+  ('refuses declared sibling %s even before dependencies are installed', async field => {
+    const f = dependencyFixture();
+    writeFileSync(join(f.sibling,'package.json'),JSON.stringify({[field]:{'sibling-dep':'1.0.0'}}));
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'unsupported-sibling-dependency'});
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+
+  it('refuses dependency declarations in nested packages', async () => {
+    const f = dependencyFixture();
+    f.files['shared/package.json'] = '{"dependencies":{"sibling-dep":"1.0.0"}}';
+    writeFileSync(join(f.sibling,'shared/package.json'),f.files['shared/package.json']);
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'unsupported-sibling-dependency'});
+  });
+
+  it('refuses linked node_modules even when Git omits the link', async () => {
+    const f = dependencyFixture();
+    // A dangling link also refuses: its eventual target must not affect admission.
+    symlinkSync(join(cwd,'absent-dependencies'),join(f.sibling,'shared/node_modules'));
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'unsupported-sibling-dependency'});
+  });
+
+  it('refuses modules resolved from the sibling parent directory', async () => {
+    const f = dependencyFixture();
+    mkdirSync(join(cwd,'node_modules/sibling-dep'),{recursive:true});
+    writeFileSync(join(cwd,'node_modules/sibling-dep/index.js'),'module.exports = 42;');
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'unsupported-sibling-dependency'});
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+
+  it('refuses oversized sibling package metadata before parsing it', async () => {
+    const f = dependencyFixture();
+    writeFileSync(join(f.sibling,'package.json'),JSON.stringify({padding:'x'.repeat(4 * 1024 * 1024)}));
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'unsupported-sibling-dependency'});
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+
+  it('fails closed when sibling dependency state is unreadable', async () => {
+    const f = dependencyFixture();
+    const fs = await import('node:fs/promises');
+    const injected = {...fs,lstat:async path => {
+      if (Buffer.from(path).equals(Buffer.from(join(f.sibling,'node_modules'))))
+        throw Object.assign(new Error('permission denied'),{code:'EACCES'});
+      return fs.lstat(path);
+    }};
+    await expect(remoteManifestAPI.buildSiblingManifest({cwd:f.cwd,exec:f.exec,fs:injected}))
+      .rejects.toMatchObject({code:'sibling-unsafe'});
+  });
 
   it('bundles both aliases with direct and transitive dependencies from the transported snapshot', async () => {
     const f = dependencyFixture();

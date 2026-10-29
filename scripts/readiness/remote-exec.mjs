@@ -4,7 +4,7 @@ import { realpath } from 'node:fs/promises';
 import * as filesystem from 'node:fs/promises';
 import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { resolve } from 'node:path';
+import { resolve, relative, dirname } from 'node:path';
 import { allowedCommand, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile } from './forge-exec-run.mjs';
 
 const ROOT = '/srv/forge-exec';
@@ -63,6 +63,26 @@ export { isTestFile };
 // This exclusion policy is part of the manifest, never an independent rsync
 // filter. Test-shaped names under excluded components refuse remote admission.
 const excludedComponent = /^(?:node_modules|\.git|\.env.*|\.secrets|\.ssh|\.aws|\.claude|\.codex|\.npmrc|\.netrc|credentials.*|.*\.(?:pem|key)|\.exit-code)$/i;
+
+function requiresGitWorktree(paths, argv, cwd) {
+  const tests = paths.filter(isTestFile).map(path => path.toString('utf8'));
+  // Tooling tests may inspect the real index/history during collection, directly
+  // or through helpers. A source scan for Git commands cannot prove independence.
+  const tooling = tests.filter(path => /(?:^|\/)(?:scripts|skills-src|tools)\//i.test(path));
+  if (!tooling.length) return false;
+  const filters = [];
+  for (let i = 4; i < argv.length; i++) {
+    if (argv[i] === '-t') {i++; continue;}
+    if (!argv[i].startsWith('-')) filters.push(argv[i]);
+  }
+  // Only explicit files can narrow this conservative policy. Vitest's filters
+  // are substrings, so an exact non-tooling filename may ALSO select tooling.
+  return !filters.length || filters.some(filter => {
+    const name = relative(cwd,resolve(cwd,filter)).replaceAll('\\','/');
+    return !tests.includes(name) || tooling.some(path => path.toLowerCase().includes(name.toLowerCase()));
+  });
+}
+
 export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, pathspecs} = {}) {
   const scope = pathspecs === undefined ? [] : ['--', ...pathspecs];
   // Only dependency and Git internals are exempt. In particular, secret/hidden
@@ -152,6 +172,44 @@ export async function buildSiblingManifest({cwd = process.cwd(), exec = defaultE
   } catch (error) {throw failure('sibling-dirty',error);}
   try {
     const manifest = await buildManifest({cwd:root,exec,fs});
+    // The runner installs only work/. Never certify a sibling whose Node
+    // resolution depends on omitted modules (including nested or linked trees).
+    // Check every source ancestor once, even when Git omits ignored modules.
+    const checked = new Set();
+    const checkModules = async directory => {
+      const key = Buffer.from(directory).toString('hex');
+      if (checked.has(key)) return;
+      checked.add(key);
+      const modules = await fs.lstat(bytePath(directory,Buffer.from('node_modules')))
+        .then(() => true,error => {if (error.code === 'ENOENT') return false; throw error;});
+      if (modules) throw failure('unsupported-sibling-dependency');
+    };
+    // Node also walks above the sibling root. Those installations are absent
+    // from the remote container just as sibling-local installations are.
+    for (let parent = root;; parent = dirname(parent)) {
+      await checkModules(parent);
+      if (dirname(parent) === parent) break;
+    }
+    for (const {path} of manifest.entries) {
+      let directory = Buffer.from(root);
+      for (const part of [null,...pathParts(path).slice(0,-1)]) {
+        if (part) directory = bytePath(directory,part);
+        await checkModules(directory);
+      }
+      if (pathParts(path).at(-1).equals(Buffer.from('package.json'))) {
+        const absolute = bytePath(root,path);
+        const st = await fs.lstat(absolute);
+        if (st.size > LIMIT) throw failure('unsupported-sibling-dependency');
+        const pkg = JSON.parse(await readManifestFile(absolute,st,fs));
+        // Even an uninstalled checkout can declare runtime, peer, workspace or
+        // build dependencies. Empty declarations alone need no installation.
+        if (!pkg || typeof pkg !== 'object' || Array.isArray(pkg)
+          || ['dependencies','devDependencies','optionalDependencies','peerDependencies',
+            'bundledDependencies','bundleDependencies','workspaces']
+            .some(field => pkg[field] !== undefined && (!pkg[field] || typeof pkg[field] !== 'object' || Object.keys(pkg[field]).length)))
+          throw failure('unsupported-sibling-dependency');
+      }
+    }
     for (const path of SIBLING.aliases) {
       const st = await fs.lstat(Buffer.from(resolve(root,path)));
       if (st.isSymbolicLink() || !st.isDirectory()
@@ -159,7 +217,10 @@ export async function buildSiblingManifest({cwd = process.cwd(), exec = defaultE
         throw new Error('Missing or empty aliased directory');
     }
     return {...manifest,cwd:root,head};
-  } catch (error) {throw failure('sibling-unsafe',error);}
+  } catch (error) {
+    if (error.code === 'unsupported-sibling-dependency') throw error;
+    throw failure('sibling-unsafe',error);
+  }
 }
 
 // Only protocol JSON is decoded, never inventory bytes.
@@ -199,6 +260,7 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
     try {
       const manifest = await buildManifest({cwd,exec,listFiles});
       const selected = manifest.entries.map(entry => entry.path);
+      if (requiresGitWorktree(selected,argv,cwd)) return fallback('requires-git-worktree');
       if (selected.some(path => path.equals(Buffer.from('vitest.shared.ts')))) siblingManifest = await buildSiblingManifest({cwd,exec});
       // Anchor comment-like and option-like names for both rsync implementations.
       const inventory = Buffer.concat(selected.flatMap(path => [Buffer.from('./'),path,Buffer.from([0])]));
@@ -226,7 +288,7 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
       expected = {v:1,nonce,run,inputDigest,argvDigest:digestArgv(argv),lock,manifestDigest:manifest.manifestDigest};
       if (siblingManifest) expected.siblingManifestDigest = siblingManifest.manifestDigest;
       expectedManifest = wire;
-    } catch (error) {return fallback(['sibling-missing','sibling-not-git','sibling-dirty','sibling-unsafe','ignored-test-file'].includes(error.code) ? error.code : 'copy-failed');}
+    } catch (error) {return fallback(['sibling-missing','sibling-not-git','sibling-dirty','sibling-unsafe','unsupported-sibling-dependency','ignored-test-file'].includes(error.code) ? error.code : 'copy-failed');}
     try {
       const result = await ssh('run',{...expected,manifest:expectedManifest,
         ...(siblingManifest ? {siblingManifest:manifestWire(siblingManifest)} : {}),argv,env:filterEnv(env)},true);
