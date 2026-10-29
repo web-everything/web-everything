@@ -210,13 +210,15 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
       if(prepared.code !== 0) throw new Error('Prepare failed');
       run = JSON.parse(protocolText(prepared.stdout,1024)).run;
       if(typeof run !== 'string' || !/^r-[a-f0-9]{32}$/.test(run)) {run=undefined; throw new Error('Invalid server run');}
-      const copied = await exec({file:'rsync',args:['-a','-r','--no-links','--safe-links','--no-implied-dirs','--delete','--exclude=.exit-code',
+      // Transfer listed leaves only: a file replaced by a directory must not expand.
+      // Both destinations are fresh trees, so no recursive deletion is needed.
+      const copied = await exec({file:'rsync',args:['-a','--no-recursive','--no-dirs','--no-links','--safe-links','--no-implied-dirs','--exclude=.exit-code',
         '--from0','--files-from=-','--rsync-path=sudo -u forge-exec rsync','-e',`ssh ${SSH_OPTIONS.join(' ')}`,
         './',`${host}:${ROOT}/${run}/work/`],cwd,input:inventory});
       if(copied.code !== 0) throw new Error('Copy failed');
       if (siblingManifest) {
         const inventory = Buffer.concat(siblingManifest.entries.flatMap(({path}) => [Buffer.from('./'),path,Buffer.from([0])]));
-        const copiedSibling = await exec({file:'rsync',args:['-a','-r','--no-links','--safe-links','--no-implied-dirs','--delete','--exclude=.exit-code',
+        const copiedSibling = await exec({file:'rsync',args:['-a','--no-recursive','--no-dirs','--no-links','--safe-links','--no-implied-dirs','--exclude=.exit-code',
           '--from0','--files-from=-','--rsync-path=sudo -u forge-exec rsync','-e',`ssh ${SSH_OPTIONS.join(' ')}`,
           './',`${host}:${ROOT}/${run}/frontierui/`],cwd:siblingManifest.cwd,input:inventory});
         if (copiedSibling.code !== 0) throw new Error('Sibling copy failed');
@@ -229,10 +231,10 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
       const result = await ssh('run',{...expected,manifest:expectedManifest,
         ...(siblingManifest ? {siblingManifest:manifestWire(siblingManifest)} : {}),argv,env:filterEnv(env)},true);
       const receipt = await finish();
-      if(!receipt || receipt.code!==0) return fallback('ambiguous-result');
-      if(!verifyReceipt(protocolText(receipt.stdout,4096),expected,result.code)) return fallback('ambiguous-result');
+      if(!receipt || receipt.code!==0) return {mode:'unconfirmed',reason:'ambiguous-result'};
+      if(!verifyReceipt(protocolText(receipt.stdout,4096),expected,result.code)) return {mode:'unconfirmed',reason:'ambiguous-result'};
       return {mode:'remote',code:result.code};
-    } catch {return fallback('ambiguous-result');}
+    } catch {return {mode:'unconfirmed',reason:'ambiguous-result'};}
   } finally {try {await finish();} catch { /* Pruning is the cleanup backstop; never retry execution. */ }}
 }
 

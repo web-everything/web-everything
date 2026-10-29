@@ -101,6 +101,12 @@
  * (standard → platform preferences); remote has no env mapping. Their env and
  * checkout-local tool-settings overrides apply only to a PRIVATE pool — a LANE_POOL_ROOT that is not the host pool. DEFAULT_TIMEOUT_MS remains a legacy CLI fallback; WE_HEAVY_ADMISSION=off bypasses admission.
  *
+ * REMOTE ROUTING CONTRACT — remote stays disabled by default (heavyAdmission.remote.enabled=false).
+ * Only { mode: 'remote', code: <integer> } exits with that code. Local admission may follow only
+ * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }. After a timeout,
+ * only the cancelled+terminated acknowledgement permits local admission. Everything else, including
+ * legacy { mode: 'fallback' }, throws, malformed results and unacknowledged timeouts, exits 124.
+ *
  * THE LOAD-ADMISSION GATE (#4076, revised #4343) — a SECOND, DIFFERENT admission axis this module now also
  * hosts, gating NEW DISPATCHED SESSIONS (not heavy commands) by the host's ACTUAL capacity — CPU idle% and
  * memory pressure, with a much-higher-ratio `load1/cores` kept only as a runaway backstop (a bare load1 ratio
@@ -413,17 +419,41 @@ export function decideRemote({ policy, loadPerCore, argv }) {
   return { remote: above, reason: `${enabled}; loadPerCore=${loadPerCore} ${above ? '>' : '<='} ${remote.loadPerCoreThreshold}` };
 }
 
-/** Attempt remote execution before taking a local slot. Ambiguous executions refuse local reruns.
- * A timed-out attempt may fall back only after
- * the executor acknowledges abort with { mode: 'cancelled', terminated: true }; an abort request alone
- * cannot prove remote termination. Allow up to one second for acknowledgement, then refuse a local rerun. */
+const LEGACY_REMOTE_PRE_EXECUTION_REASONS = Object.freeze([
+  'command-not-allowed',
+  'requires-git-worktree',
+  'invalid-parameters',
+  'forge-unreachable',
+  'copy-failed',
+  'ignored-test-file',
+  'unsupported-sibling-dependency',
+  'sibling-missing',
+  'sibling-not-git',
+  'sibling-dirty',
+  'sibling-unsafe',
+]);
+
+/** Translate only known pre-execution refusals from the legacy executor into confirmed non-starts. */
+export function adaptLegacyRemoteResult(result) {
+  if (result?.mode === 'fallback' && LEGACY_REMOTE_PRE_EXECUTION_REASONS.includes(result.reason)) {
+    return { mode: 'not-started', terminated: true, reason: result.reason };
+  }
+  return result;
+}
+
+/** Attempt remote execution before taking a local slot; remote is disabled by default.
+ * Only { mode: 'remote', code: <integer> } exits with that code. Local admission requires
+ * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }.
+ * After timeout-abort, allow up to one second for cancelled+terminated acknowledgement.
+ * Everything else (including legacy fallback, throws, malformed results and unacknowledged
+ * timeouts) refuses local reruns with exit 124. */
 export async function runWithRemoteDecision({
   argv, policy, cwd, env,
   timeoutMs = classifyCommandKind(argv.map(shellQuoteWord).join(' '), env) === 'files'
     ? resolveFastRunTimeoutMs(env)
     : env ? resolveCeilingMs(env) : DEFAULT_ADMISSION_CEILING_MS,
   loadPerCore = () => loadavg()[0] / cpus().length,
-  remoteExec = async (options) => (await import('./remote-exec.mjs')).runRemote(options),
+  remoteExec = async (options) => adaptLegacyRemoteResult(await (await import('./remote-exec.mjs')).runRemote(options)),
   log = (line) => process.stderr.write(line),
 }) {
   let load;
@@ -455,15 +485,14 @@ export async function runWithRemoteDecision({
         }),
       ]);
       if (termination?.mode !== 'cancelled' || termination.terminated !== true) {
-        log('heavy-admission: remote failed (remote-timeout) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying.\n');
-        return { handled: true, exitCode: 124 };
+        return refuseLocal('remote-timeout');
       }
       reason = 'remote-timeout';
     } else {
       if (result?.mode === 'remote' && Number.isInteger(result.code)) return { handled: true, exitCode: result.code };
-      // Only an explicit pre-execution fallback is safe. Throws and malformed
+      // Only explicit non-start or cancellation with confirmed termination is safe. Throws and malformed
       // replies may come from an executor whose remote child is still alive.
-      if (result?.mode !== 'fallback' && !(result?.mode === 'not-started' && result.terminated === true)) return refuseLocal(result?.reason ?? 'unconfirmed remote result');
+      if (!((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true)) return refuseLocal(result?.reason ?? 'unconfirmed remote result');
       reason = result?.reason ?? 'unconfirmed remote result';
     }
   } catch (error) { return refuseLocal(error?.message ?? error); }

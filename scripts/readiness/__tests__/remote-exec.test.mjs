@@ -12,6 +12,7 @@ import {
 import { createRunner, digestInput, digestArgv } from '../forge-exec-run.mjs';
 import * as remoteManifestAPI from '../remote-exec.mjs';
 import * as forgeManifestAPI from '../forge-exec-run.mjs';
+import { adaptLegacyRemoteResult, resolveAdmissionPolicy, runWithRemoteDecision } from '../heavy-admission.mjs';
 
 const argv = ['npm', 'run', 'test:unit', '--', 'a.test.mjs'];
 const runId = 'abcdef-1';
@@ -586,6 +587,53 @@ describe('validateRunId', () => {
 });
 
 describe('runRemote', () => {
+  it('admits local execution for a Git-ignored test through the real legacy adapter', async () => {
+    const f = fixture();
+    const exec = f.exec;
+    f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i')
+      ? {code:0, stdout:Buffer.from('scripts/__tests__/ignored.test.mjs\0')}
+      : exec(call));
+    const result = await runWithRemoteDecision({
+      argv:f.argv, cwd, env:{}, log:vi.fn(), loadPerCore:() => 0,
+      policy:resolveAdmissionPolicy({platform:{remote:{enabled:true, mode:'always'}}}),
+      remoteExec:async options => adaptLegacyRemoteResult(await runRemote({...f, ...options})),
+    });
+    expect(result).toEqual({handled:false});
+    expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+
+  it('never transmits unlisted children when a validated file becomes a directory during prepare', async () => {
+    const f = fixture();
+    mkdirSync(join(cwd, 'src'));
+    writeFileSync(join(cwd, 'src', 'kept.mjs'), 'selected nested file');
+    f.listFiles.mockResolvedValue(['package-lock.json', 'a.test.mjs', 'src/kept.mjs']);
+    const exec = f.exec;
+    const destination = join(cwd, 'transport-target');
+    mkdirSync(destination);
+    let copied;
+    f.exec = vi.fn(async call => {
+      if (isPrepare(call)) {
+        rmSync(join(cwd, 'a.test.mjs'));
+        mkdirSync(join(cwd, 'a.test.mjs', 'nested'), {recursive:true});
+        for (const name of ['.env', '.env.example', 'unlisted.txt', 'nested/.env.local', 'nested/unlisted.txt']) {
+          writeFileSync(join(cwd, 'a.test.mjs', name), 'must never leave the client');
+        }
+      }
+      if (call.file === 'rsync') {
+        const args = call.args.filter((arg, i, all) => !arg.startsWith('--rsync-path=') && arg !== '-e' && all[i-1] !== '-e');
+        args[args.length-1] = destination + '/';
+        copied = spawnSync('rsync', args, {cwd, input:call.input, encoding:'utf8', timeout:10000});
+        return {code:copied.status, stdout:copied.stdout};
+      }
+      return exec(call);
+    });
+    await runRemote(f);
+    expect(copied, 'the real rsync transfer must be exercised').toBeDefined();
+    expect(copied.error).toBeUndefined();
+    expect(readFileSync(join(destination, 'package-lock.json'), 'utf8')).toContain('lockfileVersion');
+    expect(readFileSync(join(destination, 'src', 'kept.mjs'), 'utf8')).toBe('selected nested file');
+    expect(readdirSync(destination, {recursive:true}).sort()).toEqual(['package-lock.json', 'src', 'src/kept.mjs']);
+  });
   it.each(['scripts/__tests__/.env.local/hidden.test.mjs','scripts/__tests__/.env.local/hidden.js','hidden.spec.ts','dist/hidden.test.mjs','build/hidden.test.mjs'])
   ('falls back for a Git-ignored test instead of certifying remote success: %s', async name => {
     spawnSync('git',['init','--quiet'],{cwd});
@@ -733,7 +781,7 @@ describe('runRemote', () => {
     })),
   ])('fails closed with ambiguous-result and attempts cleanup for %j', async (scenario) => {
     const f = fixture(scenario);
-    expect(await runRemote(f)).toEqual({ mode: 'fallback', reason: 'ambiguous-result' });
+    expect(await runRemote(f)).toEqual({ mode: 'unconfirmed', reason: 'ambiguous-result' });
     expect(callsOf(f.exec).some(isCleanup)).toBe(true);
     expectNoSecrets(f.exec);
   });
@@ -749,7 +797,9 @@ describe('runRemote', () => {
     const copy = calls.find((call) => call.file === 'rsync');
     expect(copy.args.join(' ')).toMatch(/--files-from(?:=|\s)-/);
     expect(copy.args).toContain('--from0');
-    expect(copy.args).toEqual(expect.arrayContaining(['-r','--no-links','--safe-links','--no-implied-dirs']));
+    expect(copy.args).toEqual(expect.arrayContaining(['--no-recursive','--no-dirs','--no-links','--safe-links','--no-implied-dirs']));
+    expect(copy.args).not.toContain('-r');
+    expect(copy.args).not.toContain('--delete');
     expect(copy.args).not.toContain('-L');
     expect(copy.args).toContain('--exclude=.exit-code');
     expect(calls.findIndex(isPrepare)).toBeLessThan(calls.indexOf(copy));
@@ -1002,8 +1052,42 @@ describe('sibling dependency snapshot', () => {
     ('falls back before transfer for a dirty dependency: %j', async options => {
       const f = dependencyFixture(options);
       expect(await runRemote(f)).toEqual({mode:'fallback',reason:'sibling-dirty'});
+      expect(await runWithRemoteDecision({
+        argv:f.argv, cwd:f.cwd, env:{}, log:vi.fn(), loadPerCore:() => 0,
+        policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
+        remoteExec:async options => adaptLegacyRemoteResult(await runRemote({...f,...options})),
+      })).toEqual({handled:false});
       expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
     });
+
+  it('never expands a sibling file replaced by a directory after validation', async () => {
+    const f = dependencyFixture();
+    const destination = join(cwd,'sibling-transport');
+    mkdirSync(destination);
+    const exec = f.exec;
+    let copied;
+    f.exec = vi.fn(async call => {
+      if (isPrepare(call)) {
+        rmSync(join(f.sibling,'shared/provider.js'));
+        mkdirSync(join(f.sibling,'shared/provider.js'));
+        writeFileSync(join(f.sibling,'shared/provider.js/.env'),'must never leave the client');
+        writeFileSync(join(f.sibling,'shared/provider.js/unlisted.txt'),'unlisted');
+      }
+      if (call.file === 'rsync' && call.cwd === f.sibling) {
+        const args = call.args.filter((arg,i,all) => !arg.startsWith('--rsync-path=') && arg !== '-e' && all[i-1] !== '-e');
+        args[args.length-1] = destination+'/';
+        copied = spawnSync('rsync',args,{cwd:f.sibling,input:call.input,encoding:'utf8',timeout:10000});
+        return {code:copied.status,stdout:copied.stdout};
+      }
+      return exec(call);
+    });
+    await runRemote(f);
+    expect(copied).toBeDefined();
+    expect(copied.error).toBeUndefined();
+    expect(readFileSync(join(destination,'package.json'),'utf8')).toBe('{"type":"module"}');
+    expect(readFileSync(join(destination,'validity-merge/registry.js'),'utf8')).toContain('registry');
+    expect(existsSync(join(destination,'shared/provider.js'))).toBe(false);
+  });
 
   it.each(['h','S'])('rejects hidden index flags outside alias roots: %s', async flag => {
     const f = dependencyFixture({flag});
@@ -1040,9 +1124,11 @@ describe('sibling root snapshot acceptance', () => {
     expect(copies[1].cwd).toBe(f.sibling);
     expect(copies[1].args.at(-1)).toBe(`${destination}/frontierui/`);
     expect(copies[1].args).toEqual(expect.arrayContaining([
-      '-a','-r','--no-links','--safe-links','--no-implied-dirs','--delete',
+      '-a','--no-recursive','--no-dirs','--no-links','--safe-links','--no-implied-dirs',
       '--from0','--files-from=-','--rsync-path=sudo -u forge-exec rsync',
     ]));
+    expect(copies[1].args).not.toContain('-r');
+    expect(copies[1].args).not.toContain('--delete');
     expect(copies[1].input).toEqual(Buffer.from('./README.md\0./plugs/runtime.js\0./webtheme/theme.js\0'));
     const siblingWire = {
       paths:Buffer.from('README.md\0plugs/runtime.js\0webtheme/theme.js\0').toString('base64'),
@@ -1136,7 +1222,12 @@ describe('sibling root snapshot acceptance', () => {
       ...value,manifestDigest:state.manifestDigest,
       ...(kind === 'missing' ? {} : {siblingManifestDigest:'0'.repeat(64)}),
     })});
-    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'ambiguous-result'});
+    expect(await runRemote(f)).toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
+    expect(await runWithRemoteDecision({
+      argv:f.argv, cwd:f.cwd, env:{}, log:vi.fn(), loadPerCore:() => 0,
+      policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
+      remoteExec:async options => adaptLegacyRemoteResult(await runRemote({...f,...options})),
+    })).toEqual({handled:true,exitCode:124});
     expect(callsOf(f.exec).some(isRun)).toBe(true);
   });
 
@@ -1157,13 +1248,15 @@ describe('sibling root snapshot acceptance', () => {
 describe('receipt field binding', () => {
   it.each(['v','nonce','run','inputDigest','argvDigest','lock','phase','code'])('rejects mismatched %s', async field => {
     const f = fixture({receipt: (_nonce,value) => JSON.stringify({...value,[field]:field === 'v' ? 2 : field === 'code' ? 1 : 'wrong'})});
-    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'ambiguous-result'});
+    expect(await runRemote(f)).toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
   });
   it('rejects install-phase evidence even with matching status', async () => {
     expect(await runRemote(fixture({runCode:97,receipt:(_n,v)=>JSON.stringify({...v,phase:'install'})})))
-      .toEqual({mode:'fallback',reason:'ambiguous-result'});
+      .toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
   });
 });
+
+
 
 
 // Manifest acceptance contract (Round 1):
@@ -1402,6 +1495,6 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
 
   it.each(['missing', 'wrong'])('rejects a %s manifestDigest in an otherwise matching green receipt', async kind => {
     const f = fixture({receipt:(_nonce,value) => JSON.stringify(kind === 'missing' ? value : {...value,manifestDigest:'0'.repeat(64)})});
-    expect(await runRemote(f)).toEqual({mode:'fallback', reason:'ambiguous-result'});
+    expect(await runRemote(f)).toEqual({mode:'unconfirmed', reason:'ambiguous-result'});
   });
 });

@@ -281,7 +281,8 @@ else {
 `);
     const first = runner.run(request);
     try {
-      await vi.waitFor(async () => expect((await stat(join(root,'ready'))).isFile()).toBe(true));
+      // The first run must reach its worker before the overlap probe; the 1s default is too tight on a loaded host.
+      await vi.waitFor(async () => expect((await stat(join(root,'ready'))).isFile()).toBe(true), {timeout:4000,interval:20});
       await expect(other.run(second)).rejects.toThrow('Worker execution busy');
     } finally {
       await writeFile(join(root,'release'),'');
