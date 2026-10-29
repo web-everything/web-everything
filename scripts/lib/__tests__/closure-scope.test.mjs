@@ -1,7 +1,9 @@
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import { resolve, relative } from 'node:path';
 import { computeClosureScope, fixpointExtend, isExcludable } from '../daemon-rebuild/closure-scope.mjs';
-import { smokeSurfaceEntries } from '../daemon-rebuild/skip-unrelated.mjs';
+import { collectRunClosure, smokeSurfaceEntries } from '../daemon-rebuild/skip-unrelated.mjs';
+import { collectImportClosure } from '../import-closure.mjs';
+import * as runClosure from '../daemon-rebuild/skip-unrelated.mjs';
 
 function reader(files = {}) {
   const root = resolve('virtual-scope');
@@ -42,6 +44,166 @@ it('walks overlay changes on top of main including newly imported and spawned fi
   ]) });
   expect(result.ok).toBe(true);
   for (const p of ['entry.mjs', 'new.mjs', 'child.mjs']) expect(result.scope.has(p)).toBe(true);
+});
+
+it.each([
+  ['spawn', next => `spawn('node', ['./${next}']);`],
+  ['basename-reference', next => `// Worker name: ${next}`],
+  ['string path', next => `const target = './${next}';`],
+  ['require', next => `require('./${next.slice(0, -4)}');`],
+])('retains the full conflict beyond 64 non-import hops: 66-link %s chain', (_mechanism, source) => {
+  const files = { 'entry.mjs': source('bounded-00.mjs') };
+  for (let i = 0; i < 66; i++) {
+    files[`bounded-${String(i).padStart(2, '0')}.mjs`] = i === 65 ? ''
+      : source(`bounded-${String(i + 1).padStart(2, '0')}.mjs`);
+  }
+  expect(compute(files)).toMatchObject({ ok: false, reason: 'closure-incomplete' });
+});
+
+it('retains the full conflict when a comment shortcut completes a strict 66-file spawn chain within 64 generations', () => {
+  const files = { 'entry.mjs': "import './chain-00.mjs';" };
+  for (let i = 0; i < 66; i++) {
+    files[`chain-${String(i).padStart(2, '0')}.mjs`] = i === 65 ? ''
+      : `spawn('node', ['./chain-${String(i + 1).padStart(2, '0')}.mjs']);`;
+  }
+  files['chain-00.mjs'] += '\n// Later worker: chain-65.mjs';
+  const snapshot = reader(files);
+  const options = { root: snapshot.root, reader: snapshot, entries: ['entry.mjs'],
+    strict: true, stopWhenIncomplete: true, byName: () => [] };
+  const strict = collectRunClosure(options);
+  expect(strict.complete).toBe(true);
+  expect(strict.files.size).toBe(67);
+  expect(collectRunClosure({ ...options, strictExtensions: false }).complete).toBe(false);
+  expect(compute(files)).toEqual({ ok: false, reason: 'closure-incomplete' });
+});
+
+it('legacy compatibility preserves strict import checks without new launch or reference parsing', () => {
+  const snapshot = reader({ 'entry.mjs': `// comment-worker.mjs
+    require('./required');
+    exec(command);
+    const child = './child.mjs';`,
+  'comment-worker.mjs': '', 'required.mjs': '', 'child.mjs': "import './dependency.mjs';",
+  'dependency.mjs': '' });
+  const options = { root: snapshot.root, reader: snapshot, entries: ['entry.mjs'],
+    strict: true, strictExtensions: false, stopWhenIncomplete: true, byName: () => [] };
+  const legacy = collectRunClosure(options);
+  expect(legacy.complete).toBe(true);
+  expect(legacy.files).toEqual(new Set(['entry.mjs', 'child.mjs', 'dependency.mjs']));
+  expect(collectRunClosure({ ...options, strictExtensions: true }).complete).toBe(false);
+  for (const source of ["import './missing.mjs';", "import '#private';", "import(target);"]) {
+    expect(collectImportClosure({ ...options, readFile: () => source, exists: snapshot.exists }).complete).toBe(false);
+  }
+});
+
+it.each([
+  ['incomplete', () => ({ complete: false }), 'closure-incomplete'],
+  ['oversized', () => ({ complete: true, files: new Set(Array.from({ length: 4001 }, (_, i) => `f${i}.mjs`)) }), 'closure-too-large'],
+  ['unreadable', () => { throw new Error('legacy read failed'); }, 'scope-unreadable'],
+  ['file-bound exception', () => { throw Object.assign(new Error('bound'), { code: 'CLOSURE_TOO_LARGE' }); }, 'closure-too-large'],
+])('retains the full conflict after strict completion when legacy evidence is %s', (_label, legacy, reason) => {
+  const strict = { complete: true, files: new Set(['entry.mjs']) };
+  const spy = vi.spyOn(runClosure, 'collectRunClosure')
+    .mockReturnValueOnce(strict).mockImplementationOnce(legacy);
+  try {
+    expect(compute()).toEqual({ ok: false, reason });
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(spy.mock.calls[1][0]).toMatchObject({ strict: true, strictExtensions: false,
+      maxFiles: 4000, stopWhenIncomplete: true });
+    expect(spy.mock.calls[1][0].reader).toBe(spy.mock.calls[0][0].reader);
+    expect(spy.mock.calls[1][0].entries).toEqual(spy.mock.calls[0][0].entries);
+  } finally { spy.mockRestore(); }
+});
+
+it('includes both independently proven closures and their metadata in the admitted scope', () => {
+  const evidence = name => ({ complete: true, files: new Set(['entry.mjs', `${name}.mjs`]),
+    bareDeps: name === 'legacy', jsonNames: new Set([`${name}.json`]), spawnedNames: new Set([`${name}.mjs`]) });
+  const spy = vi.spyOn(runClosure, 'collectRunClosure')
+    .mockReturnValueOnce(evidence('strict')).mockReturnValueOnce(evidence('legacy'));
+  try {
+    const result = compute({ 'strict.mjs': '', 'legacy.mjs': '', 'unrelated.mjs': '' });
+    expect(result.ok).toBe(true);
+    expect(result.closure.files).toEqual(new Set(['entry.mjs', 'strict.mjs', 'legacy.mjs']));
+    expect(result.closure.bareDeps).toBe(true);
+    expect(result.closure.jsonNames).toEqual(new Set(['strict.json', 'legacy.json']));
+    expect(result.closure.spawnedNames).toEqual(new Set(['strict.mjs', 'legacy.mjs']));
+    for (const file of ['strict.mjs', 'legacy.mjs']) expect(isExcludable(file, result.scope)).toBe(false);
+    expect(isExcludable('unrelated.mjs', result.scope)).toBe(true);
+  } finally { spy.mockRestore(); }
+});
+
+it.each([64, 65, 66])('preserves the 64-hop spawn bound for a %i-link chain with a conflict-retaining fallback', links => {
+  const files = { 'entry.mjs': "spawn('node', ['./worker-0.mjs']);" };
+  for (let i = 0; i < links; i++) {
+    files[`worker-${i}.mjs`] = i + 1 < links ? `spawn('node', ['./worker-${i + 1}.mjs']);` : '';
+  }
+  const result = compute(files);
+  if (links > 64) {
+    expect(result).toMatchObject({ ok: false, reason: 'closure-incomplete' });
+  } else {
+    expect(result.ok).toBe(true);
+    expect(result.closure.files.has(`worker-${links - 1}.mjs`)).toBe(true);
+  }
+});
+
+it.each([64, 65, 66])('shares the aggregate 64-hop bound across a %i-link mixed launch/reference chain', links => {
+  const files = {};
+  for (let i = 0; i <= links; i++) {
+    const file = i === 0 ? 'entry.mjs' : `mixed-worker-${i}.mjs`;
+    const next = `mixed-worker-${i + 1}.mjs`;
+    files[file] = i === links ? '' : i % 2 === 0
+      ? `spawn('node', ['./${next}']);` : `const next = '${next}';`;
+  }
+  const result = compute(files);
+  if (links > 64) expect(result).toMatchObject({ ok: false, reason: 'closure-incomplete' });
+  else {
+    expect(result.ok).toBe(true);
+    expect(result.closure.files.has(`mixed-worker-${links}.mjs`)).toBe(true);
+  }
+});
+
+it.each([64, 66])('counts only launches in a %i-link spawn chain separated by imports', links => {
+  const files = { 'entry.mjs': "import './launcher-0.mjs';" };
+  for (let i = 0; i < links; i++) {
+    files[`launcher-${i}.mjs`] = `spawn('node', ['./worker-${i}.mjs']);`;
+    files[`worker-${i}.mjs`] = i + 1 < links ? `import './launcher-${i + 1}.mjs';` : '';
+  }
+  const result = compute(files);
+  if (links > 64) expect(result).toMatchObject({ ok: false, reason: 'closure-incomplete' });
+  else {
+    expect(result.ok).toBe(true);
+    expect(result.closure.files.has(`worker-${links - 1}.mjs`)).toBe(true);
+  }
+});
+
+it('does not apply the spawn-hop bound to a 66-link import chain', () => {
+  const files = { 'entry.mjs': "import './module-0.mjs';" };
+  for (let i = 0; i < 66; i++) {
+    files[`module-${i}.mjs`] = i + 1 < 66 ? `import './module-${i + 1}.mjs';` : '';
+  }
+  const result = compute(files);
+  expect(result.ok).toBe(true);
+  expect(result.closure.files.has('module-65.mjs')).toBe(true);
+});
+
+it('uses the shortest launch depth for shared targets and terminates spawn cycles', () => {
+  const files = { 'entry.mjs': "import './worker-32.mjs'; spawn('node', ['./worker-0.mjs']);" };
+  for (let i = 0; i < 66; i++) {
+    files[`worker-${i}.mjs`] = `spawn('node', ['./worker-${(i + 1) % 66}.mjs']);`;
+  }
+  const result = compute(files);
+  expect(result.ok).toBe(true);
+  expect(result.closure.files.has('worker-65.mjs')).toBe(true);
+});
+
+it('keeps the launch-depth refusal when continuing to scan heuristic spawn targets', () => {
+  const files = { 'entry.mjs': "spawn('node', ['./worker-0.mjs']);" };
+  for (let i = 0; i < 66; i++) {
+    files[`worker-${i}.mjs`] = i + 1 < 66 ? `spawn('node', ['./worker-${i + 1}.mjs']);` : '';
+  }
+  const snapshot = reader(files);
+  const closure = collectRunClosure({ root: snapshot.root, reader: snapshot,
+    entries: ['entry.mjs'], strict: true, byName: () => [] });
+  expect(closure.complete).toBe(false);
 });
 
 it('protects manifests, lockfiles, configs, named JSON, runtime reads and executables unconditionally', () => {
@@ -160,4 +322,176 @@ it('extends the fixpoint only by reachable excluded paths and never mutates its 
   expect(add).toEqual(['a.mjs']);
   expect([...scope]).toEqual(['entry.mjs']);
   expect(() => fixpointExtend({ scope, excluded: [], finalClosure: { complete: false, files: new Set() } })).toThrow();
+});
+
+it('R210 protects existing Markdown read through an unresolvable runtime path', () => {
+  const result = compute({ 'entry.mjs': 'export const tick = name => readFileSync(name);',
+    'tests/runtime-prompt.md': 'runtime data' });
+  expect(result.ok).toBe(true);
+  expect(isExcludable('tests/runtime-prompt.md', result.scope)).toBe(false);
+});
+
+it('R210 protects files named only in comments and walks their dependencies', () => {
+  const result = compute({ 'entry.mjs': '// import ./comment-worker.mjs\nexport {};',
+    'comment-worker.mjs': "import './comment-dependency.mjs';", 'comment-dependency.mjs': '' });
+  expect(result.ok).toBe(true);
+  for (const path of ['comment-worker.mjs', 'comment-dependency.mjs']) {
+    expect(isExcludable(path, result.scope), path).toBe(false);
+  }
+});
+
+it('R210 refuses a tree containing a symlinked LaunchAgent and protects its target', () => {
+  const files = { ...Object.fromEntries(smokeSurfaceEntries({}).map(p => [p, ''])),
+    'entry.mjs': "const agent = '~/Library/LaunchAgents/agent.mjs';",
+    'Library/LaunchAgents/agent.mjs': '../../target.mjs', 'target.mjs': '' };
+  const blobs = new Map(Object.entries(files).map(([path, source], i) =>
+    [String(i + 1).padStart(40, '0'), { path, source }]));
+  const git = (args, options = {}) => ({ status: 0, stdout: args[0] === 'ls-tree'
+    ? [...blobs].map(([oid, { path }]) =>
+      `${path === 'Library/LaunchAgents/agent.mjs' ? '120000' : '100644'} blob ${oid}\t${path}\0`).join('')
+    : Buffer.concat(options.input.trim().split('\n').map(oid => {
+      const source = blobs.get(oid).source;
+      return Buffer.from(`${oid} blob ${Buffer.byteLength(source)}\n${source}\n`);
+    })) });
+  const result = computeClosureScope({ git, mainSha: 'fixture', entries: ['entry.mjs'], env: {} });
+  for (const path of ['Library/LaunchAgents/agent.mjs', 'target.mjs']) {
+    expect(result.ok ? isExcludable(path, result.scope) : false, path).toBe(false);
+  }
+});
+
+it('R210 walks literal CommonJS require and its transitive imports', () => {
+  const result = compute({ 'entry.mjs': "require('./required');",
+    'required.cjs': "require('./dependency');", 'dependency.cjs': '' });
+  expect(result.ok).toBe(true);
+  expect(result.closure.files.has('required.cjs')).toBe(true);
+  expect(isExcludable('dependency.cjs', result.scope)).toBe(false);
+});
+
+it.each([
+  'require(process.env.MODULE)',
+  "import { createRequire as makeRequire } from 'node:module'; const load = makeRequire(import.meta.url); load(target);",
+  "const load = module.createRequire(import.meta.url); load(target);",
+  'const { createRequire: make } = module; const load = make(import.meta.url); load(target);',
+])('R210 refuses unresolved CommonJS loading: %s', source => {
+  expect(compute({ 'entry.mjs': source })).toMatchObject({ ok: false, reason: 'closure-incomplete' });
+});
+
+it('R210 protects explicitly spawned tests and their dependencies', () => {
+  const result = compute({ 'entry.mjs': "spawn('node', ['scripts/__tests__/worker.test.mjs']);",
+    'scripts/__tests__/worker.test.mjs': "import './test-helper.mjs';", 'scripts/__tests__/test-helper.mjs': '' });
+  expect(result.ok).toBe(true);
+  for (const path of ['scripts/__tests__/worker.test.mjs', 'scripts/__tests__/test-helper.mjs']) {
+    expect(isExcludable(path, result.scope), path).toBe(false);
+  }
+});
+
+it.each(["'worker.test.mjs'", '`prefix/${name}/worker.test.mjs`', "'worker\\u002etest.mjs'"])(
+  'R210 protects every existing file named by a string or template basename: %s', literal => {
+    const result = compute({ 'entry.mjs': `const name = ${literal};`,
+      'tests/worker.test.mjs': '', 'other/worker.test.mjs': '' });
+    expect(result.ok).toBe(true);
+    for (const path of ['tests/worker.test.mjs', 'other/worker.test.mjs']) {
+      expect(isExcludable(path, result.scope), path).toBe(false);
+    }
+  });
+
+it('R210 protects unknown extensions even in test and backlog directories', () => {
+  const result = compute();
+  expect(result.ok).toBe(true);
+  for (const path of ['tests/runtime.wasm', '__tests__/fixture.bin', 'backlog/worker.custom', 'tests/worker.mjsx']) {
+    expect(isExcludable(path, result.scope), path).toBe(false);
+  }
+});
+
+it.each(["spawn('node', [target])", 'child_process.exec(command)', 'fork(target)',
+  "spawn('unknown-runner', ['worker'])", "spawn('node', ['${worker}.mjs'])",
+  "import { spawn as launch } from 'node:child_process'; launch('node', [target]);",
+  "const launch = spawn; launch('node', [target]);",
+  "import * as cp from 'node:child_process'; cp[method]('node', [target]);",
+  "spawn('node', ['missing-worker.mjs'])", "fork('./missing-worker.mjs')",
+  "spawnSync(process.execPath, ['missing-worker.mjs'])", "exec('node missing-worker.mjs --flag')",
+  "execFile('node', ['missing-worker.mjs'])",
+  "spawn('node', ['~/Library/LaunchAgents/alias.mjs'])"])(
+  'R210 refuses unresolved process launch patterns: %s', source => {
+    expect(compute({ 'entry.mjs': source })).toMatchObject({ ok: false, reason: 'closure-incomplete' });
+  });
+
+it.each([
+  'const launch = cp.spawn;',
+  "const launch = cp['spawn'];",
+  'const launch = cp[`spawn`];',
+  "const launch = cp['sp\\u0061wn'];",
+  'const { spawn: launch } = cp;',
+])('R210 refuses escaped launch capabilities through aliases: %s', alias => {
+  expect(compute({
+    'entry.mjs': `import * as cp from 'node:child_process'; ${alias}
+      const target = process.env.WORKER; launch('node', [target]);`,
+    'unreferenced-worker.mjs': 'export {};',
+  })).toMatchObject({ ok: false, reason: 'closure-incomplete' });
+});
+
+it('R210 refuses unresolved launch paths even when their basenames exist in the snapshot', () => {
+  for (const target of ['missing/worker.mjs', '~/Library/LaunchAgents/worker.mjs']) {
+    expect(compute({ 'entry.mjs': `spawn('node', ['${target}']);`, 'worker.mjs': '' }))
+      .toMatchObject({ ok: false, reason: 'closure-incomplete' });
+  }
+});
+
+it.each(['spawn', 'spawnSync', 'execFile', 'execFileSync'])(
+  'R210 refuses shell-enabled launches with wildcard targets: %s', launch => {
+    expect(compute({
+      'entry.mjs': `${launch}('node', ['worker.mjs', ';', 'node', 'hidden-*.mjs'], { shell: true });`,
+      'worker.mjs': '', 'hidden-a.mjs': "import './hidden-dependency.mjs';", 'hidden-dependency.mjs': '',
+    })).toMatchObject({ ok: false, reason: 'closure-incomplete' });
+  });
+
+it.each([
+  "{ shell: '/bin/sh' }", '{ shell: enabled }', '{ shell }', 'options',
+  '{ ...options }', '{ shell: false, ...options }', "{ ['she' + 'll']: true }",
+  '{ get shell() { return true; } }', '{ __proto__: options }',
+])('R210 refuses launch options whose shell behavior is unproven: %s', options => {
+  expect(compute({
+    'entry.mjs': `spawn('node', ['worker.mjs', ';', 'node', 'hidden-*.mjs'], ${options});`,
+    'worker.mjs': '', 'hidden-a.mjs': '',
+  })).toMatchObject({ ok: false, reason: 'closure-incomplete' });
+});
+
+it.each(['exec', 'execSync'])('R210 refuses implicit shell execution: %s', launch => {
+  expect(compute({ 'entry.mjs': `${launch}('node worker.mjs --flag');`, 'worker.mjs': '' }))
+    .toMatchObject({ ok: false, reason: 'closure-incomplete' });
+});
+
+it.each(['{}', '{ shell: false }', "{ 'shell': false, stdio: 'inherit' }"])(
+  'R210 walks literal argv when launch options prove the shell disabled: %s', options => {
+    const result = compute({
+      'entry.mjs': `spawn('node', ['worker.mjs', ';', 'node', 'hidden-*.mjs'], ${options});`,
+      'worker.mjs': "import './dependency.mjs';", 'dependency.mjs': '', 'hidden-a.mjs': '',
+    });
+    expect(result.ok).toBe(true);
+    for (const path of ['worker.mjs', 'dependency.mjs']) expect(result.closure.files.has(path), path).toBe(true);
+  });
+
+it.each(["fork('./worker.mjs')", "spawnSync(process.execPath, ['./worker.mjs'])",
+  "import * as cp from 'node:child_process'; cp['spawn']('node', ['./worker.mjs'])",
+  "execFile('node', ['./worker.mjs'])"])(
+  'R210 walks resolved launch targets and their transitive imports: %s', source => {
+    const result = compute({ 'entry.mjs': source, 'worker.mjs': "import './dependency.mjs';", 'dependency.mjs': '' });
+    expect(result.ok).toBe(true);
+    for (const path of ['worker.mjs', 'dependency.mjs']) expect(result.closure.files.has(path), path).toBe(true);
+  });
+
+it.each(['export const tick = name => readFileSync(name);',
+  'const read = fs.readFileSync; export const tick = name => read(name);',
+  "const read = fs['readFileSync']; export const tick = name => read(name);",
+  'const { readFileSync: read } = fs; export const tick = name => read(name);',
+  "import { readFileSync as read } from 'node:fs'; export const tick = name => read(name);"])(
+  'R210 protects code when a runtime read can select any existing file: %s', source => {
+  const result = compute({ 'entry.mjs': source, 'runtime.js': '' });
+  expect(result.ok).toBe(true);
+  expect(isExcludable('runtime.js', result.scope)).toBe(false);
+});
+
+it('R210 refuses an imported file type whose dependencies it cannot parse', () => {
+  expect(compute({ 'entry.mjs': "import './worker.custom';", 'worker.custom': '' }))
+    .toMatchObject({ ok: false, reason: 'closure-incomplete' });
 });

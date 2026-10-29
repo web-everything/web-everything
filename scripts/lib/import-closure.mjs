@@ -12,25 +12,108 @@ import { dirname, resolve as resolvePath, relative, isAbsolute, basename } from 
 import ts from 'typescript';
 
 const JSON_LITERAL_RE = /['"`]([^'"`\n]*\.json)['"`]/g;
+export const PARSEABLE_CODE_RE = /\.(?:[cm]?[jt]s|[jt]sx)$/i;
+export const MAX_SPAWN_HOPS = 64;
+const literal = node => node && (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node));
+const callName = node => ts.isIdentifier(node) ? node.text
+  : ts.isPropertyAccessExpression(node) ? node.name.text
+    : ts.isElementAccessExpression(node) && literal(node.argumentExpression) ? node.argumentExpression.text : null;
+const LAUNCH_NAMES = ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork'];
+const READ_NAMES = ['readFile', 'readFileSync', 'open', 'openSync', 'readdir', 'readdirSync'];
+
+function nonShellOptions(options) {
+  if (!options) return true;
+  if (!ts.isObjectLiteralExpression(options)) return false;
+  // Unknown keys, spreads, accessors and inherited options cannot prove shell interpretation absent.
+  return options.properties.every(property => ts.isPropertyAssignment(property)
+    && (ts.isIdentifier(property.name) || literal(property.name))
+    && property.name.text !== '__proto__'
+    && (property.name.text !== 'shell' || property.initializer.kind === ts.SyntaxKind.FalseKeyword));
+}
+
+// Only literal argv without shell interpretation have statically known launch targets.
+// Other patterns retain the full conflict; callers can use the full-merge/manual-rebase path.
+function knownLaunch(node, name, resolveLaunch) {
+  // exec always uses a shell; its command string is outside this scanner's grammar.
+  if (name === 'exec' || name === 'execSync') return false;
+  if (!nonShellOptions(node.arguments[2])) return false;
+  const [command, args] = node.arguments;
+  const nodeExecutable = command && ts.isPropertyAccessExpression(command)
+    && command.expression.getText() === 'process' && command.name.text === 'execPath';
+  if (!literal(command) && !nodeExecutable) return false;
+  if (name === 'fork') {
+    if (!literal(command) || !PARSEABLE_CODE_RE.test(command.text)) return false;
+  } else if (!nodeExecutable && command.text !== 'node') return false;
+  if (args && (!ts.isArrayLiteralExpression(args) || !args.elements.every(literal)
+    || args.elements.some(arg => /[$`]/.test(arg.text)))) return false;
+  return name === 'fork' ? resolveLaunch(command.text)
+    : args?.elements.length > 0 && PARSEABLE_CODE_RE.test(args.elements[0].text)
+      && resolveLaunch(args.elements[0].text);
+}
 
 // Parse the grammar: comments and line terminators are legal between `import`
 // and `(`. A literal prefix of a computed argument is not a known dependency.
-function importSpecs(file, source) {
-  const tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, false);
+function importSpecs(file, source, strict, resolveLaunch) {
+  const tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, strict);
   const specs = [];
+  const requires = [];
+  // Raw text keeps comment references; decoded literals keep escaped filenames and template parts.
+  const references = [source];
+  const launches = new Map(LAUNCH_NAMES.map(name => [name, name]));
+  const reads = new Set(READ_NAMES);
+  const factories = new Set(['createRequire']);
+  for (const statement of tree.statements) {
+    if (!ts.isImportDeclaration(statement) || !statement.importClause?.namedBindings
+      || !ts.isNamedImports(statement.importClause.namedBindings)) continue;
+    for (const binding of statement.importClause.namedBindings.elements) {
+      const name = (binding.propertyName || binding.name).text;
+      if (LAUNCH_NAMES.includes(name)) launches.set(binding.name.text, name);
+      if (READ_NAMES.includes(name)) reads.add(binding.name.text);
+      if (name === 'createRequire') factories.add(binding.name.text);
+    }
+  }
+  let opaqueReads = false;
   let complete = tree.parseDiagnostics.length === 0;
   const visit = node => {
+    if (strict && (ts.isStringLiteralLike(node) || ts.isTemplateHead(node)
+      || ts.isTemplateMiddle(node) || ts.isTemplateTail(node))) references.push(node.text);
     if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
       if (node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) specs.push(node.moduleSpecifier.text);
-    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
-      const target = node.arguments[0];
-      if (target && (ts.isStringLiteral(target) || ts.isNoSubstitutionTemplateLiteral(target))) specs.push(target.text);
-      else complete = false;
+    } else if (ts.isCallExpression(node)) {
+      const name = callName(node.expression);
+      if (node.expression.kind === ts.SyntaxKind.ImportKeyword || (strict && name === 'require')) {
+        const target = node.arguments[0];
+        if (literal(target)) (name === 'require' ? requires : specs).push(target.text);
+        else complete = false;
+      }
+      if (strict) {
+        if (factories.has(name) || (launches.has(name) && !knownLaunch(node, launches.get(name), resolveLaunch))) complete = false;
+        if (ts.isElementAccessExpression(node.expression) && !literal(node.expression.argumentExpression)) complete = false;
+        // A computed runtime read can select code as well as Markdown/JSON. Keep every candidate.
+        if (reads.has(name)) opaqueReads = true;
+      }
+    }
+    // References can escape through aliases, destructuring or callbacks before they are called.
+    // Retain every runtime candidate as soon as a read capability is referenced.
+    if (strict && reads.has(callName(node))) opaqueReads = true;
+    if (strict && ts.isElementAccessExpression(node) && launches.has(callName(node))) {
+      if (!(ts.isCallExpression(node.parent) && node.parent.expression === node)) complete = false;
+    }
+    if (strict && ts.isIdentifier(node) && node.text === 'require'
+      && !(ts.isCallExpression(node.parent) && node.parent.expression === node)) {
+      complete = false; // require aliases/resolvers are not statically walked.
+    }
+    if (strict && ts.isIdentifier(node)) {
+      if (node.text === 'createRequire') complete = false; // Includes destructured/aliased factories.
+      if (launches.has(node.text) && !ts.isImportSpecifier(node.parent)) {
+        const target = ts.isPropertyAccessExpression(node.parent) && node.parent.name === node ? node.parent : node;
+        if (!(ts.isCallExpression(target.parent) && target.parent.expression === target)) complete = false;
+      }
     }
     ts.forEachChild(node, visit);
   };
   visit(tree);
-  return { specs, complete };
+  return { specs, requires, complete, referenceText: references.join('\n'), opaqueReads };
 }
 
 function resolveRelativeSpec(fromFile, spec, exists) {
@@ -48,17 +131,26 @@ function resolveRelativeSpec(fromFile, spec, exists) {
  * to "any code file changed". `bareDeps` = some file imports a package (a `package*.json` change is relevant).
  * `jsonNames` = basenames of `.json` string literals in closure files (a config read at runtime by name).
  * By default never throws: an unreadable entry returns `null` (the caller's conservative fallback).
- * Opt-in `maxFiles` throws CLOSURE_TOO_LARGE; `strict` marks unresolved relative imports incomplete.
+ * Opt-in `maxFiles` throws CLOSURE_TOO_LARGE; `strict` also walks literal CommonJS require,
+ * rejects unresolved loads/launches, shell execution, unproven shell options and unsupported source types,
+ * bounds non-import depth to MAX_SPAWN_HOPS,
+ * and records reference text for scope scans. An incomplete closure retains the full conflict for manual rebase.
+ * `followNonImports:false` returns require/launch targets without walking them; the run-closure scanner
+ * combines them with all other non-import references before applying its single shared hop bound.
+ * `strictExtensions:false` preserves the legacy parser and import walk: `strict` still rejects
+ * unresolved relative, package-self and # imports, without the newer load/launch/reference checks.
  * `parsed` may be shared across walks of the SAME tree snapshot (e.g. successive spawned-script hops).
- * It must be discarded before walking a changed tree; by default every invocation gets a fresh cache.
+ * It must be discarded before walking a changed tree or changing strict/strictExtensions;
+ * by default every invocation gets a fresh cache.
  * @param {{root:string, entries:string[], readFile?:(p:string)=>string, exists?:(p:string)=>boolean, parsed?:Map}} o
  * @returns {{files:Set<string>, complete:boolean, bareDeps:boolean, jsonNames:Set<string>}|null}
  */
 export function collectImportClosure({
   root, entries, readFile = (p) => readFileSync(p, 'utf8'),
   exists = (p) => { try { return statSync(p).isFile(); } catch { return false; } },
-  parsed = new Map(), maxFiles = Infinity, strict = false,
+  parsed = new Map(), maxFiles = Infinity, strict = false, strictExtensions = true, followNonImports = true,
 }) {
+  const extended = strict && strictExtensions;
   const absRoot = resolvePath(root);
   // Shared dependencies occur on many edges. Cache probes for this tree snapshot only;
   // a later invocation must observe added/deleted files, including prior misses.
@@ -72,16 +164,32 @@ export function collectImportClosure({
   if (!starts.length) return null;
   const seen = new Set();
   const jsonNames = new Set();
+  const referenceTexts = new Map();
+  const nonImportTargets = new Set();
+  let opaqueReads = false;
   let complete = true;
   let bareDeps = false;
   let packageName;
   if (strict) {
     try { packageName = JSON.parse(readFile(resolvePath(absRoot, 'package.json'))).name; } catch { /* no readable package name */ }
   }
-  const stack = [...starts];
-  while (stack.length) {
+  let stack = [...starts];
+  let nonImports = [];
+  let nonImportDepth = 0;
+  while (stack.length || nonImports.length) {
+    // Exhaust imports at this depth before following require/launch edges: imports cost zero hops.
+    // First visits therefore use the fewest non-import edges, including shared targets/cycles.
+    if (!stack.length) {
+      stack = nonImports;
+      nonImports = [];
+      nonImportDepth++;
+    }
     const file = stack.pop();
     if (seen.has(file)) continue;
+    if (extended && nonImportDepth > MAX_SPAWN_HOPS) {
+      complete = false;
+      continue;
+    }
     seen.add(file);
     if (seen.size > maxFiles) {
       const error = new Error('closure-too-large');
@@ -90,25 +198,38 @@ export function collectImportClosure({
     }
     let info = parsed.get(file);
     if (!info) {
-      info = { imports: [], jsonNames: new Set(), complete: true, bareDeps: false };
+      info = { imports: [], nonImports: [], jsonNames: new Set(), complete: true, bareDeps: false };
+      if (extended && !PARSEABLE_CODE_RE.test(file)) info.complete = false;
       let src;
       try { src = readFile(file); } catch { info.complete = false; }
       if (src !== undefined) {
         let imports;
-        try { imports = importSpecs(file, src); }
+        const resolveLaunch = spec => {
+          // Home aliases and absolute paths are outside the snapshot's resolution evidence.
+          if (isAbsolute(spec) || spec.startsWith('~')) return false;
+          const targets = [resolvePath(dirname(file), spec), resolvePath(absRoot, spec)]
+            .filter(path => !relative(absRoot, path).startsWith('..') && existsOnce(path));
+          info.nonImports.push(...targets);
+          return targets.length > 0;
+        };
+        try { imports = importSpecs(file, src, extended, resolveLaunch); }
         catch { imports = { specs: [], complete: false }; } // Parser limits retain the conservative fallback.
         info.complete &&= imports.complete;
-        for (const spec of imports.specs) {
-          if (spec.startsWith('./') || spec.startsWith('../')) {
-            const hit = resolveRelativeSpec(file, spec, existsOnce);
-            if (hit && !relative(absRoot, hit).startsWith('..')) info.imports.push(hit);
-            else if (strict) info.complete = false;
-          } else if (strict && (spec.startsWith('#')
-            || (typeof packageName === 'string' && packageName.length > 0
-              && (spec === packageName || spec.startsWith(`${packageName}/`))))) {
-            info.complete = false;
-          } else if (!spec.startsWith('node:') && /^[@a-z]/i.test(spec) && !/\s/.test(spec)) {
-            info.bareDeps = true;
+        info.referenceText = imports.referenceText;
+        info.opaqueReads = imports.opaqueReads;
+        for (const [specs, targets] of [[imports.specs, info.imports], [imports.requires || [], info.nonImports]]) {
+          for (const spec of specs) {
+            if (spec.startsWith('./') || spec.startsWith('../')) {
+              const hit = resolveRelativeSpec(file, spec, existsOnce);
+              if (hit && !relative(absRoot, hit).startsWith('..')) targets.push(hit);
+              else if (strict) info.complete = false;
+            } else if (strict && ((extended && isAbsolute(spec)) || spec.startsWith('#')
+              || (typeof packageName === 'string' && packageName.length > 0
+                && (spec === packageName || spec.startsWith(`${packageName}/`))))) {
+              info.complete = false;
+            } else if (!spec.startsWith('node:') && /^[@a-z]/i.test(spec) && !/\s/.test(spec)) {
+              info.bareDeps = true;
+            }
           }
         }
         for (const m of src.matchAll(JSON_LITERAL_RE)) info.jsonNames.add(basename(m[1]));
@@ -116,11 +237,16 @@ export function collectImportClosure({
       parsed.set(file, info);
     }
     stack.push(...info.imports);
+    if (followNonImports) nonImports.push(...info.nonImports);
+    else for (const target of info.nonImports) nonImportTargets.add(relative(absRoot, target));
+    if (extended && info.referenceText !== undefined) referenceTexts.set(relative(absRoot, file), info.referenceText);
+    opaqueReads ||= info.opaqueReads;
     for (const name of info.jsonNames) jsonNames.add(name);
     complete &&= info.complete;
     bareDeps ||= info.bareDeps;
   }
-  return { files: new Set([...seen].map((f) => relative(absRoot, f))), complete, bareDeps, jsonNames };
+  return { files: new Set([...seen].map((f) => relative(absRoot, f))), complete, bareDeps, jsonNames,
+    ...(extended ? { referenceTexts, opaqueReads, ...(!followNonImports ? { nonImportTargets } : {}) } : {}) };
 }
 
 

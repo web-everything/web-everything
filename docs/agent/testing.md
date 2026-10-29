@@ -29,6 +29,13 @@ character counts cannot delimit blobs). `makeGit` forwards explicit batch stdin 
 Incomplete/missing dependencies and closures above 4,000 files return a failure reason:
 the planner retains the conflict for a full merge or manual rebase. Existing
 closure callers retain their defaults; strict resolution and the file bound are opt-in.
+Scope admission requires both the expanded strict walk and an independent legacy walk with
+`strict:true, strictExtensions:false`, the same entries and file bound, and `stopWhenIncomplete:true`.
+The legacy mode preserves the old import parser, string-path spawn scan and hop counting: extra strict
+edges can shorten a chain, so strict completion alone cannot supersede a legacy hop refusal.
+Union both closures into the admitted scope; either walk's incomplete, oversized or unreadable evidence
+retains the conflict for full merge/manual rebase. The 66-file spawn-chain comment-shortcut regression
+in `closure-scope.test.mjs` pins this independent legacy refusal.
 The fixpoint helper returns additions without mutating scope; the planner owns the three-replan
 limit. `daemon-rebuild-closure-scope.test.mjs` uses local refs (no network) to exercise
 scoped merges, real-overlay ancestry, final-tree verification and the three-replan fallback.
@@ -53,7 +60,13 @@ an exported tick can read runtime data after boot with a computed filename, so a
 closure is insufficient evidence to discard it. `closure-scope.test.mjs` pins this policy for URL
 literals and computed reads, including computed JSON basenames. Import collection parses syntax with the existing TypeScript dependency;
 comments, line terminators, escaped literals and template literals must not hide dynamic imports.
-Computed targets and parse failures mark the closure incomplete. The `overlay-runtime-closure`
+Computed targets and parse failures mark the closure incomplete. Strict launch evidence must prove
+the shell disabled: `exec`/`execSync` are incomplete; other launches require absent options or a literal
+object with no shell setting or literal `shell: false`. Opaque options, spreads, computed keys and
+accessors retain the conflict for full merge/manual rebase. `closure-scope.test.mjs` covers wildcard
+targets under shell-enabled launches and unproven options, plus safe non-shell argv. Mutation verification
+must remove the shell-options guard and observe the wildcard-target regression fail.
+The `overlay-runtime-closure`
 soak break reproduces runtime-prompt, computed-JSON and commented-worker conflicts through the planner in on
 and shadow modes, then checks final-tree evidence with the same policy.
 
