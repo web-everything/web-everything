@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { reviewRunEvidence, decideSameHeadHold } from '../review-referral-hold.mjs';
+import { parseJudgeOutcome } from '../../lib/judge-spawn.mjs';
+import { normalizeJudgeTelemetry } from '../../operations/run-record.mjs';
 
 const repo = 'example/repo';
 const head = 'a'.repeat(40);
@@ -78,6 +80,39 @@ describe.each([false, true])('reviewRunEvidence quotaOnly (completed: %s)', comp
       result: { records: [{ failure: "You've hit your weekly limit", referrals: [], rulings: [] }] } }] };
     expect(reviewRunEvidence(run)).toMatchObject({ quotaOnly: false });
   });
+
+  it('rejects a non-quota referral failure even when every failed seat has quota telemetry', () => {
+    const run = reviewRun(0, complete);
+    run.findings.mandatoryReferrals = { effects: [{ type: 'review.mandatory-referrals',
+      result: { records: [{ failure: 'GitHub refused to persist the referral', referrals: [], rulings: [] }] } }] };
+    expect(reviewRunEvidence(run)).toMatchObject({ quotaOnly: false });
+  });
+});
+
+describe('incomplete quota evidence after the seat phase', () => {
+  it.each(['reduce', 'mandatoryReferrals', 'referralVerdict', 'advise'])(
+    'counts an incomplete run once %s has started despite all seat quota tags', step => {
+      const run = reviewRun();
+      run.stepTimings.push({ step, startedAt: iso(at + 2) });
+      expect(reviewRunEvidence(run)).toMatchObject({ incomplete: true, quotaOnly: false });
+    },
+  );
+
+  it('preserves quota evidence from the judge parser through normalized run telemetry', () => {
+    let error;
+    try {
+      parseJudgeOutcome(JSON.stringify({ is_error: true,
+        result: "You've hit your weekly limit · resets tomorrow" }));
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect(error.telemetry).toMatchObject({ failureKind: 'provider-quota' });
+    const run = reviewRun();
+    run.seatTimings = [failedSeat('judge')];
+    run.telemetry = [normalizeJudgeTelemetry({ step: 'judge', telemetry: error.telemetry })];
+    expect(reviewRunEvidence(run)).toMatchObject({ incomplete: true, quotaOnly: true });
+  });
 });
 
 function history(mutate = () => {}) {
@@ -91,6 +126,18 @@ function history(mutate = () => {}) {
 describe('same-head quota attempt accounting from persisted seat telemetry', () => {
   it('ignores 13 quota-only incomplete runs', () => {
     expect(decideSameHeadHold(pr, history(), options)).toBeNull();
+  });
+
+  it('holds for 13 completed runs even when their evidence is quotaOnly', () => {
+    const rows = Array.from({ length: 13 }, (_, index) => reviewRunEvidence(reviewRun(index, true)));
+    for (const row of rows) {
+      expect(row).toMatchObject({ quotaOnly: true, completedAt: expect.any(Number) });
+      expect(row.incomplete).not.toBe(true);
+    }
+    expect(decideSameHeadHold(pr, rows, options)).toMatchObject({
+      kind: 'same-head', count: 13, attemptsSinceWake: 13, retryAt: null,
+      noVerdict: { exhausted: true },
+    });
   });
 
   it('still holds for 13 incomplete runs each with one genuine failed seat among quota failures', () => {
