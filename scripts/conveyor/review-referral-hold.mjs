@@ -117,8 +117,8 @@ export function readReviewFailureSpans({ dir = telemetryDir(), now = Date.now() 
   } catch { return []; }
 }
 
-/** Overlay textless interrupted attempts only when every matching error is quota-related,
- * without changing the cached run projection or the spans. */
+/** Matching non-quota errors veto quota-only evidence for interrupted attempts. Promote textless
+ * attempts only when every matching error is quota-related, without mutating rows or spans. */
 export function markQuotaOnlyFromSpans(rows, spans) {
   const windows = spans.filter(isReviewFailureSpan).flatMap(span => {
     const start = Date.parse(span.startedAt);
@@ -130,9 +130,11 @@ export function markQuotaOnlyFromSpans(rows, spans) {
       ? [{ start, end, pr, repo, quotaOnly: isQuotaError(span.statusMessage) }] : [];
   });
   return rows.map(row => {
-    if (!row.incomplete || row.hasFailure) return row;
+    if (!row.incomplete) return row;
     const matching = windows.filter(window => row.pr === window.pr && row.repo === window.repo
       && row.startedAt >= window.start - 30_000 && row.startedAt <= window.end + 30_000);
+    if (matching.some(window => !window.quotaOnly)) return { ...row, quotaOnly: false };
+    if (row.hasFailure) return row;
     return matching.length > 0 && matching.every(window => window.quotaOnly)
       ? { ...row, quotaOnly: true } : row;
   });
