@@ -478,7 +478,7 @@ export async function smokeAndAdopt({
       } catch { /* full */ }
       const decision = decideQuick({ enabled: true, changedFiles: files, dispatchClosure });
       quick = decision.quick;
-      log.error?.(`daemon-rebuild: quick mode ${quick ? 'on' : 'ignored — full path'}: ${decision.reason}`);
+      log.error?.(`daemon-rebuild: quick mode ${quick ? 'on' : 'ignored — full path'}: ${decision.why}`);
       if (quick) { changedFiles = null; proven = false; }
     } else if (quickSetting.quick) {
       log.error?.('daemon-rebuild: quick mode ignored — full path: last-good control for a full-mode candidate');

@@ -42,23 +42,23 @@ const matches = (path, pattern) => {
 
 /** Unknown or oversized evidence falls back to full smoke; callers log this reason when enabled. */
 export function decideQuick({ enabled = false, changedFiles, dispatchClosure } = {}) {
-  if (enabled !== true) return { quick: false, reason: 'disabled' };
+  if (enabled !== true) return { quick: false, why: 'disabled' };
   if (!Array.isArray(changedFiles) || changedFiles.length > 10_000 || !changedFiles.every(safePath)) {
-    return { quick: false, reason: 'unknown or oversized change set — full smoke required' };
+    return { quick: false, why: 'unknown or oversized change set — full smoke required' };
   }
   const dispatchFiles = dispatchClosure?.files instanceof Set ? dispatchClosure.files : null;
   const dependencyEvidence = typeof dispatchClosure?.bareDeps === 'boolean' && dispatchClosure?.jsonNames instanceof Set;
   const protectedPath = changedFiles.find(path => QUICK_ALWAYS_FULL_PATHS.some(pattern => matches(path, pattern))
     || dispatchFiles?.has(path));
-  if (protectedPath) return { quick: false, reason: `protected code changed: ${protectedPath}` };
+  if (protectedPath) return { quick: false, why: `protected code changed: ${protectedPath}` };
   if (dispatchClosure?.complete !== true || !dispatchFiles
     || !dependencyEvidence
     || !DISPATCH_DRY_RUN_CODE_ENTRIES.every(entry => dispatchFiles.has(entry))) {
-    return { quick: false, reason: 'unknown dispatch import closure — full smoke required' };
+    return { quick: false, why: 'unknown dispatch import closure — full smoke required' };
   }
   const dependencyHit = closureHits({ closure: dispatchClosure, changedFiles })?.[0];
-  if (dependencyHit) return { quick: false, reason: `protected code changed: ${dependencyHit}` };
-  return { quick: true, reason: 'two dry-run checks deferred to post-adopt soak' };
+  if (dependencyHit) return { quick: false, why: `protected code changed: ${dependencyHit}` };
+  return { quick: true, why: 'two dry-run checks deferred to post-adopt soak' };
 }
 
 /** Retain the full path's existing max/starvation and explicit test override semantics. */

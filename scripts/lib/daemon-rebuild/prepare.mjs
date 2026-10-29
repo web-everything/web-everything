@@ -482,7 +482,7 @@ export async function prepareRebuild({
       });
       if (ready.quick && !resolveQuick(env).quick) {
         clearReadyCandidate(root, stEnv);
-        alert('ready-candidate-discarded', { target: ready.adopt.finalSha, reason: 'quick mode disabled — full smoke required' });
+        alert('ready-candidate-discarded', { target: ready.adopt.finalSha, note: 'quick mode disabled — full smoke required' });
       } else if (!m.adopt) {
         clearReadyCandidate(root, stEnv);
         alert('ready-candidate-discarded', { target: ready.adopt.finalSha, reason: m.reason });

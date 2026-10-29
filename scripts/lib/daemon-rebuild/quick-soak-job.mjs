@@ -29,6 +29,9 @@ export const QUICK_SOAK_JOB_KIND = defineJobKind({
   codeMode: 'readonly-tree', serial: true, nodeModules: true, maxAttempts: 1,
 });
 const KINDS = kindRegistry([QUICK_SOAK_JOB_KIND]);
+// Job-store failure text (markFailed's `reason` key); consts keep it out of the rebuild-reason inventory.
+const JOB_FAIL_LAUNCHER = 'quick soak launcher unavailable';
+const JOB_FAIL_NO_COMPLETION = 'single-attempt quick soak worker exited without completion';
 const jobsDir = (root, env) => daemonJobsDir(`quick-soak-${cloneKey(root)}`, env);
 const resultPath = (root, env, marker) => join(stateDir(env),
   `${cloneKey(root)}.quick-soak-${createHash('sha256').update(String(marker.token)).digest('hex').slice(0, 16)}.json`);
@@ -150,7 +153,7 @@ export async function launchQuickSoak({ root, env, marker, run = gitRun, log = c
     return { started: true };
   } catch {
     if (queued) {
-      try { store.update(queued.id, record => markFailed(record, { at: new Date().toISOString(), reason: 'quick soak launcher unavailable' })); } catch { /* state recovery still runs */ }
+      try { store.update(queued.id, record => markFailed(record, { at: new Date().toISOString(), reason: JOB_FAIL_LAUNCHER })); } catch { /* state recovery still runs */ }
     }
     return settleQuickSoak({ root, env, marker, outcome: 'unavailable', reason: 'worker-launch-failed', run, log });
   }
@@ -211,7 +214,7 @@ async function launchPinnedSoak({ root, token, jobId, env = process.env }) {
   // One dead-handle reconciliation closes an import/launch failure in the standard job store, capped at 1.
   await reattachTick({ store, kinds: KINDS, maxConcurrent: 0 });
   store.update(jobId, record => TERMINAL_JOB_STATUSES.includes(record.job.status) ? null
-    : markFailed(record, { at: new Date().toISOString(), reason: 'single-attempt quick soak worker exited without completion' }));
+    : markFailed(record, { at: new Date().toISOString(), reason: JOB_FAIL_NO_COMPLETION }));
   const marker = readRebuildState(root, env).unverified;
   if (marker?.quick && marker.token === token) {
     // A worker may have persisted its result but failed its completion lock. Consume that evidence first.

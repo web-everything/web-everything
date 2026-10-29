@@ -30,7 +30,7 @@ const decision = (changedFiles, extra = {}) => decideQuick({ enabled: true, chan
 
 describe('quick mode policy (default OFF)', () => {
   it('off preserves full checks and the existing finalize/starvation wait', () => {
-    expect(decision(null, { enabled: false })).toEqual({ quick: false, reason: 'disabled' });
+    expect(decision(null, { enabled: false })).toEqual({ quick: false, why: 'disabled' });
     expect(quickFinalizeWaitMs({ quick: false, env: {}, waitMs: 900_000 })).toBe(900_000);
     expect(quickFinalizeWaitMs({ quick: false, env: {}, waitMs: 60_000 })).toBe(180_000);
     expect(quickFinalizeWaitMs({ quick: false, env: {}, overrideWaitMs: 123 })).toBe(123);
@@ -64,24 +64,24 @@ describe('quick mode policy (default OFF)', () => {
     'scripts/lib/daemon-rebuild.mjs', 'scripts/lib/daemon-rebuild-extra.mjs',
     'scripts/lib/daemon-rebuild/smoke.mjs', 'scripts/lib/daemon-rebuild/nested/new.mjs',
   ])('always uses full smoke for dispatch/smoke/rebuild code: %s', path => {
-    expect(decision([path])).toMatchObject({ quick: false, reason: expect.stringContaining('protected') });
+    expect(decision([path])).toMatchObject({ quick: false, why: expect.stringContaining('protected') });
   });
   it.each(['package.json', 'package-lock.json', 'nested/package-lock.json', 'scripts/dispatch-settings.json'])(
     'always uses full smoke for dispatch package/config dependency: %s', path => {
-      expect(decision([path])).toMatchObject({ quick: false, reason: expect.stringContaining('protected') });
+      expect(decision([path])).toMatchObject({ quick: false, why: expect.stringContaining('protected') });
     });
   it.each([
     { bareDeps: undefined }, { bareDeps: null }, { jsonNames: undefined }, { jsonNames: [] },
   ])('fails closed when dispatch dependency evidence is missing or malformed: %j', evidence => {
     expect(decision(['README.md'], { dispatchClosure: { ...closure, ...evidence } }))
-      .toMatchObject({ quick: false, reason: expect.stringContaining('unknown dispatch import closure') });
+      .toMatchObject({ quick: false, why: expect.stringContaining('unknown dispatch import closure') });
   });
   it('exports a single protected path list including the dispatch entries', () => {
     expect(QUICK_ALWAYS_FULL_PATHS).toEqual(expect.arrayContaining(DISPATCH_DRY_RUN_CODE_ENTRIES));
   });
   it('fails closed on unknown/incomplete diff or dispatch evidence, with a full-path explanation', () => {
     for (const changedFiles of [null, ['../escape'], [null], new Array(10_001).fill('a')]) {
-      expect(decision(changedFiles)).toMatchObject({ quick: false, reason: expect.stringContaining('unknown') });
+      expect(decision(changedFiles)).toMatchObject({ quick: false, why: expect.stringContaining('unknown') });
     }
     expect(decision(['README.md'], { dispatchClosure: { ...closure, complete: false } }).quick).toBe(false);
     expect(decision(['README.md'], { dispatchClosure: null }).quick).toBe(false);
