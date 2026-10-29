@@ -241,7 +241,15 @@ export function sweepDelegatedClearance({ prs, repo = null, dryRun = false, sett
         results.push({ num: p.number, delegated: 'deferred', detail: 'complete comment read budget exhausted; retry next tick or request operator review' });
         return [];
       }
-      return [{ ...p, comments: readComments(p.number, { repo }) }];
+      // One PR's failed thread read refuses only that PR; it never aborts clearance for unrelated candidates.
+      try {
+        const comments = readComments(p.number, { repo });
+        if (!Array.isArray(comments)) throw new Error('comments read returned no array');
+        return [{ ...p, comments }];
+      } catch (e) {
+        results.push({ num: p.number, delegated: 'sweep-failed', detail: `complete comment read failed: ${String(e?.message ?? e).replace(/[\x00-\x1f]/g, ' ').slice(0, 400)}; operator review required` });
+        return [];
+      }
     });
     const candidates = planDelegatedClearance(complete, { repo, preApprovals: approvals });
     const candidateStart = (state.candidateCursors[cursorKey] ?? 0) % Math.max(1, candidates.length);

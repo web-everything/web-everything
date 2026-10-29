@@ -672,6 +672,21 @@ describe('R130 delegated clearance', () => {
     const h = harness({ prs: [p], readComments: () => { throw new Error('comment read failed'); } });
     expect(sweepDelegatedClearance(h)[0].delegated).toBe('sweep-failed'); expect(h.runLabel).not.toHaveBeenCalled();
   });
+  it.each([
+    ['throws', () => { throw new Error('comment read failed\nforged line'); }, 'comment read failed forged line'],
+    ['returns no array', () => null, 'comments read returned no array'],
+  ])('a complete comment read that %s refuses only that PR; unrelated candidates still clear', (_, failed, reason) => {
+    const rows = [1, 2, 3].map(number => ({ ...pr(), number,
+      comments: pr().comments.map(c => ({ ...c, body: c.body.replace('pr=5925', `pr=${number}`) })) }));
+    const readComments = vi.fn(number => (number === 2 ? failed() : rows.find(p => p.number === number).comments));
+    const h = harness({ prs: rows.map(p => (p.number === 2 ? { ...p, comments: Array(100).fill(p.comments[0]) } : p)), readComments });
+    const results = sweepDelegatedClearance(h);
+    expect(results).toContainEqual({ num: 2, delegated: 'sweep-failed',
+      detail: `complete comment read failed: ${reason}; operator review required` });
+    expect(results.filter(r => r.num === 0)).toEqual([]);
+    expect(h.runLabel.mock.calls.map(([c]) => c.num).sort()).toEqual([1, 3]);
+    expect(h.runLabel).not.toHaveBeenCalledWith(expect.objectContaining({ num: 2 }));
+  });
   it('the sanctioned CLI is attempted only once even if it throws', () => {
     const h = harness({ runLabel: vi.fn(() => { throw new Error('timeout'); }) });
     sweepDelegatedClearance(h); sweepDelegatedClearance(h);
