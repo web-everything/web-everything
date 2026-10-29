@@ -9,6 +9,7 @@ import { collectRunClosure, treeReader, smokeSurfaceEntries,
   MANIFEST_RE, CONFIG_RE, EXECUTABLE_RE, RUNTIME_READ_RE } from './skip-unrelated.mjs';
 import { REBUILD_MECHANISM_PATHS } from './plan.mjs';
 import { isCodePath } from '../main-staleness.mjs';
+import { PARSEABLE_CODE_RE } from '../import-closure.mjs';
 
 const LIMIT = 4000;
 const metadata = new WeakMap();
@@ -17,7 +18,7 @@ const validPath = p => typeof p === 'string' && p.length > 0 && !isAbsolute(p)
 // Markdown and JSON can be read by exported ticks long after boot, with computed paths that
 // an import closure cannot prove unused. Retain it even under tests/ or backlog/.
 const always = p => MANIFEST_RE.test(p) || CONFIG_RE.test(p) || EXECUTABLE_RE.test(p)
-  || RUNTIME_READ_RE.test(p) || /\.(md|json)$/i.test(p);
+  || RUNTIME_READ_RE.test(p) || /\.(md|json)$/i.test(p) || !PARSEABLE_CODE_RE.test(p);
 const under = (p, prefix) => prefix.endsWith('/') ? p.startsWith(prefix) : p === prefix;
 
 /** Unknown paths are retained. Membership and mandatory rules take precedence over
@@ -31,6 +32,8 @@ export function isExcludable(path, scope) {
 }
 
 function layeredReader(base, layers) {
+  base.assertRegularFiles?.();
+  for (const { reader } of layers) reader.assertRegularFiles?.();
   const root = resolve(base.root);
   const sources = new Map(base.listFiles().map(path => [path, base]));
   for (const { reader, files } of layers) for (const path of files) {
@@ -72,13 +75,28 @@ export function computeClosureScope({ reader, git, mainSha, overlays = [], overl
       if (!validPath(p) || !combined.exists(p)) return { ok: false, reason: 'entries-unreadable' };
       try { combined.readFile(p); } catch { return { ok: false, reason: 'entries-unreadable' }; }
     }
-    const closure = collectRunClosure({ root: combined.root, reader: combined, entries: starts,
+    // Decide compatibility before strict expansion can add shortcuts. Keep BOTH historical
+    // graphs independent: adding even single-target require edges can shorten the older walk.
+    const legacy = collectRunClosure({ root: combined.root, reader: combined, entries: starts,
+      maxFiles: LIMIT, strict: true, strictExtensions: false, stopWhenIncomplete: true });
+    if (!legacy?.complete) return { ok: false, reason: 'closure-incomplete' };
+    if (legacy.files.size > LIMIT) return { ok: false, reason: 'closure-too-large' };
+    const legacyRequire = collectRunClosure({ root: combined.root, reader: combined, entries: starts,
+      maxFiles: LIMIT, strict: true, strictExtensions: false, legacyRequires: true, stopWhenIncomplete: true });
+    if (!legacyRequire?.complete) return { ok: false, reason: 'closure-incomplete' };
+    if (legacyRequire.files.size > LIMIT) return { ok: false, reason: 'closure-too-large' };
+    let closure = collectRunClosure({ root: combined.root, reader: combined, entries: starts,
       maxFiles: LIMIT, strict: true, stopWhenIncomplete: true });
     if (!closure?.complete) return { ok: false, reason: 'closure-incomplete' };
     if (closure.files.size > LIMIT) return { ok: false, reason: 'closure-too-large' };
+    closure = { ...closure, files: new Set([...closure.files, ...legacy.files, ...legacyRequire.files]),
+      bareDeps: closure.bareDeps || legacy.bareDeps || legacyRequire.bareDeps,
+      jsonNames: new Set([...closure.jsonNames, ...legacy.jsonNames, ...legacyRequire.jsonNames]),
+      spawnedNames: new Set([...closure.spawnedNames, ...legacy.spawnedNames, ...legacyRequire.spawnedNames]) };
+    if (closure.files.size > LIMIT) return { ok: false, reason: 'closure-too-large' };
     const scope = new Set([...closure.files, ...mechanismPaths]);
     for (const p of combined.listFiles()) {
-      if (always(p) || mechanismPaths.some(prefix => under(p, prefix))
+      if (closure.opaqueReads || always(p) || mechanismPaths.some(prefix => under(p, prefix))
         || (p.endsWith('.json') && closure.jsonNames.has(basename(p)))) scope.add(p);
     }
     metadata.set(scope, { mechanismPaths: [...mechanismPaths], jsonNames: new Set(closure.jsonNames) });
