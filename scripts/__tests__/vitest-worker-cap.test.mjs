@@ -70,8 +70,10 @@ describe('every vitest config applies the shared ceiling', () => {
     expect(read('vitest.integration.config.ts')).toMatch(/forks:\s*\{\s*singleFork: true/);
   });
 
-  it('keeps established-overlay rebuild coverage in the blocking serial integration tier', () => {
-    const file = 'scripts/lib/__tests__/daemon-rebuild-keep-established.test.mjs';
+  it.each([
+    'scripts/lib/__tests__/daemon-rebuild-keep-established.test.mjs',
+    'scripts/lib/__tests__/daemon-rebuild-skip-unrelated.test.mjs',
+  ])('keeps %s in the blocking serial integration tier', (file) => {
     expect(micromatch.isMatch(file, unitConfig.test.exclude)).toBe(true);
     expect(micromatch.isMatch(file, integrationConfig.test.include)).toBe(true);
     expect(micromatch.isMatch(file, integrationConfig.test.exclude ?? [])).toBe(false);
