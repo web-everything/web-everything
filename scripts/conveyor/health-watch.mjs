@@ -41,6 +41,7 @@
  *   node scripts/conveyor/health-watch.mjs silence --smell=ID [--subject=S] --card=NNN [--hours=72]
  *   node scripts/conveyor/health-watch.mjs unsilence --smell=ID [--subject=S]
  */
+import { archiveRetention } from '../lib/archive-retention.mjs';
 import { sweepReviewTmp, probeDiskSpace } from './review-tmp-health.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { superviseNeedsYouFeed } from './needs-you-feed-job.mjs';
@@ -1110,6 +1111,12 @@ export function probeOverlayMainSync(flags, roots = () => daemonCloneRoots(works
   });
 }
 
+/** Host retention is excluded from fixture and redirected maintenance ticks. */
+export function archiveRetentionTickAllowed(flags = {}) {
+  return !Object.keys(flags).some(key => key.endsWith('-fixture'))
+    && !['state-root', 'dry-run', 'logs-dir', 'lock-root', 'tmp-sweep-root', 'claude-jobs-root', 'no-gh'].some(key => flags[key]);
+}
+
 /** One tick: probe, evaluate, diagnose, and persist. Returns the CLI summary. */
 export async function tick(flags = {}, { collectInventory = collectCredentialInventory, tmpSweepRun, ...deps } = {}) {
   const started = Date.now();
@@ -1135,6 +1142,17 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     : null;
 
   if (sweepAllowed && config.tmpSweepEnabled) attempt('reviewTmp', () => sweepReviewTmp({ tmpRoot: flags['tmp-sweep-root'] || tmpdir(), config, now, dryRun: !!flags['dry-run'] }));
+
+  // R217: each kind owns a 24h stamp; fixture ticks never touch host archives.
+  if (archiveRetentionTickAllowed(flags)) {
+    await attempt('archiveRetention', async () => {
+      const results = [];
+      for (const kind of ['runs', 'sessions']) results.push(await (deps.archiveRetention ?? archiveRetention)({ kind, now, log: console.error }));
+      const errors = results.flatMap(r => r.errors);
+      if (errors.length) probeErrors.archiveRetention = scrubText(errors.join('; '));
+      return results;
+    });
+  }
 
   if (!flags['state-root'] && !flags['dry-run']) await attempt('cardBatchSeal', () => sealDueBatches({ now }));
 

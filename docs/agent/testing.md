@@ -2835,3 +2835,30 @@ the current occupant as ours. Git optional locks are disabled, so status does no
 refresh the index. The live PR head may have advanced since an incident; compare
 against the SHA the probe actually reports. Regression files: `fix-run-lane-head.test.mjs`,
 `fix-run.test.mjs`, and `fix-run-borrow-dies.test.mjs` under `scripts/operations/__tests__/`.
+
+## Archive-only host retention (R217)
+
+`scripts/lib/archive-retention.mjs` uses the run store's shared directory resolver without triggering
+legacy migration; `OPERATION_RUNS_DIR` wins. Tests use temporary source, Drive and stamp roots.
+Run the archive-retention and archive-retention-tick fixtures through heavy admission. Real `tar`
+creation/listing proves the happy path; injected post-bundle changes prove truncation, size/count
+mismatch and concurrent-source protection. The Drive root must already exist. Never create a local
+fallback archive or remove originals when Drive verification fails. An oversized scan retains all
+sources and asks the operator to split the source or inspect and raise the scan bound. Stale lock
+recovery requires operator inspection, never automatic lock stealing. Archives have no expiry.
+The CLI defaults to both kinds; `--dry-run` creates no archive or stamp. Settings live in
+`scripts/settings/archive-retention.json` and resolve through the shared policy cascade with sources
+included in results and logged by the CLI/health-watch. Host health ticks invoke both kinds; fixture,
+dry-run and redirected ticks skip retention. Each kind serializes with a lock and uses a 24-hour stamp.
+
+The archiver's invocation lock serializes archivers only; it does **not** exclude run-store or
+Claude writers. A stat/unlink pair cannot safely reclaim a mutable source. Source removal therefore
+requires the injected `withSourceWriterExclusion(path, criticalSection)` provider to exclude **all**
+writers, including already-open file descriptors and atomic replacements, throughout final identity
+verification and unlink. The provider must await the critical section and leave it uncalled when
+exclusion is unavailable. No production provider exists for Claude's external transcript writers;
+the CLI and daily health-watch archive but retain originals, report `filesRetained` and an operator
+fallback, and claim zero reclaimed bytes. Do not enable reclamation with a policy flag or quiet-time
+heuristic. The operator must arrange actual writer exclusion before reclamation can be wired in.
+Regression tests append in the final-stat/removal interval, hold an open transcript descriptor, test
+unavailable exclusion, and queue a cooperating writer through the same exclusion used by removal.
