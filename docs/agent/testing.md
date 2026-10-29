@@ -516,6 +516,44 @@ The back-port from `8173660fcf` also pins the guard in `review-red-team-resume-o
 Its production admission regression in `review-job-red-team-only.test.mjs` is
 **fresh recovery preserves unknown finished-null history through production admission and launches no call**;
 it verifies that refusal restores the original finished/null status and publishes no comment.
+Stale abandonment retains `status: running`; fresh recovery recognizes its null/absent result only
+with a finite abandonment time and an integer abandonment PID matching the status PID. Production
+planner recovery may re-dispatch an unchanged abandoned row even when its stale redispatch marker
+is spent, provided no retry is spent; it must not abandon the row again. A queued or replaced row
+still blocks this recovery. `review-red-team-on-skip.test.mjs` exercises the real durable marker,
+planner and executor through re-dispatch and the subsequent queued-state refusal.
+Production recovery spends at most two exclusive `.stale-redispatch-1` / `.stale-redispatch-2` markers per head.
+An existing marker 1 spends only the first attempt; `staleRedTeamSpent` means both are spent.
+The second abandonment requires a stale running owner with no result, absent/zero `retryCount`,
+and a parseable `pidStart` strictly later than marker 1's mtime. It waits at least
+`STALE_REDISPATCH_BACKOFF_MS` (15 minutes) from that mtime, independently of the retry cooldown.
+The abandonment function rechecks these conditions against disk and emits `detail.attempt`.
+Confirmed non-starts release only the marker they claimed; unknown dispatch outcomes retain it.
+`live-job` keeps both abandonment and no-restart claims even when its PID was already budgeted;
+that budget refund proves no new start, not that the existing job cannot run. Null/undefined
+dispatch outcomes keep their claims; the budget start is refunded as for any non-live-job skip. The stale planner bypasses
+only the in-flight refusal: non-owed verdicts and all accepted-head publication guards still apply,
+including when the status re-read observes a completed decision after selecting a stale owner.
+Malformed marker metadata stays closed, and exhausted recovery asks the operator to inspect the
+review run. The **stale red-team recovery — bounded second re-dispatch** cases exercise real
+markers, backoff boundaries, owner provenance, retry bounds, and release/retention semantics.
+Production admission must still prove the writer dead before clearing that prior. The execution guard
+refuses every still-running prior, including one marked abandoned: direct callers cannot
+use abandonment as proof of death. The regression
+**refuses direct fresh recovery without admission for an abandoned running live writer with zero calls**
+in `review-red-team-resume-only.test.mjs` pins that closed path. The regressions
+**fresh recovery launches an abandoned stale running pass through production admission and the shared guard**,
+**fresh production admission holds a live running writer without stale abandonment**, and
+**fresh production admission and shared guard never rerun a finished ran result with a posted comment**
+pin that boundary; `red-team-run-result.test.mjs` covers malformed abandonment and spent retry evidence.
+The stale-recovery flag is only a hint: production admission independently reads the head's
+redispatch/spent/no-restart markers and binds the running row's head, PID and abandonment time
+to the latest abandonment claim (allowing 1 second for timestamp precision). A no-restart claim
+uses marker 1's original abandonment; a later process start or more than two claims refuses
+admission. Missing, unreadable or inconsistent claims preserve the row and require operator
+inspection. `stale flag cannot authorize production admission with %s` covers those refusals;
+`verified %s permits production admission at the dispatch boundary` covers both dispatch ordinals
+and the no-restart handoff. Direct seat calls still refuse every running prior, regardless of flags.
 These exercise the shared execution guard and production admission, alongside the planner's
 **f: a null completion without queued provenance skips (stored status %s)** in
 `review-red-team-on-skip.test.mjs`. Live or unknown liveness

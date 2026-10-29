@@ -2,12 +2,12 @@ import { settleRedTeamSkip } from '../../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../../lib/red-team-carry-io.mjs';
 import { readRedTeamCarry } from '../../lib/red-team-carry-machine.mjs';
 import { describe, it, expect, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
-import { planRedTeamOnSkip, redTeamSkipNeedsSettlement, runRedTeamOnSkip } from '../../lib/review-red-team-on-skip.mjs';
+import { abandonStaleRedTeamRun, planRedTeamOnSkip, recoverStaleRunPayload, redTeamSkipNeedsSettlement, runRedTeamOnSkip, verifiedStaleRedTeamAbandonment } from '../../lib/review-red-team-on-skip.mjs';
 import { redTeamForHead, redTeamMarker } from '../../lib/red-team-gate.mjs';
 import { redTeamOwedFor } from '../../lib/review-red-team-policy.mjs';
 import { writeJsonAtomic } from '../../lib/atomic-json-file.mjs';
@@ -96,7 +96,8 @@ describe('review-job CLI --red-team-only', () => {
     [['--red-team-only=resume'], true, 'resume'],
     [['--red-team-only=unknown'], true, 'unknown'],
     [['--red-team-only='], true, ''],
-  ])('passes %j to the job without losing its recovery mode', (flags, redTeamOnly, redTeamMode) => {
+    [['--red-team-only=fresh', '--red-team-stale-recovery'], true, 'fresh', true],
+  ])('passes %j to the job without losing its recovery mode', (flags, redTeamOnly, redTeamMode, redTeamStaleRecovery) => {
     const source = `
       import { runReviewJobCli } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../review-job.mjs')).href)};
       runReviewJobCli(process.argv.slice(1), { runJob: options => options });
@@ -105,7 +106,8 @@ describe('review-job CLI --red-team-only', () => {
       'run', '--pr=5762', '--repo=web-everything/web-everything', '--prefer-lane=7', ...flags], {
       encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, env: { PATH: '' },
     });
-    expect(JSON.parse(output)).toEqual({ pr: '5762', repo, preferLane: 7, redTeamOnly, redTeamMode });
+    expect(JSON.parse(output)).toEqual({ pr: '5762', repo, preferLane: 7, redTeamOnly, redTeamMode,
+      ...(redTeamStaleRecovery === true ? { redTeamStaleRecovery: true } : {}) });
   });
 });
 
@@ -649,6 +651,175 @@ describe('red-team-only review job', () => {
       expect(io.runRedTeamGate).toHaveBeenCalledOnce();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+  it.each([
+    ['fresh recovery launches an abandoned stale running pass through production admission and the shared guard', true],
+    ['fresh recovery without the stale flag refuses an abandoned running prior and keeps it intact', undefined],
+    ['fresh recovery with a false stale flag refuses an abandoned running prior and keeps it intact', false],
+    ['fresh recovery with a non-boolean stale flag refuses an abandoned running prior and keeps it intact', 'true'],
+  ])('%s', (_name, redTeamStaleRecovery) => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-abandoned-running-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_DAEMON_EVENTS: join(dir, 'events.jsonl') };
+    const loopPayload = { ...payload(), findings: { read: { netBasis: { rev: head },
+      diffText: 'diff --git a/scripts/example.mjs b/scripts/example.mjs\n+export const value = 1;',
+      netChangedFiles: ['scripts/example.mjs'] } } };
+    const read = () => readRedTeamStatus({ repo, pr, head, env });
+    const production = createReviewJobIo({ env, readEvidence: input => readDrainRedTeamEvidence({ ...input,
+      list: () => [], readScorecards: () => [], isAlive: () => false }) });
+    let observed, admittedPrior;
+    const io = fakeIo({ readRedTeamOnlyPayload: () => ({ head, loopPayload }),
+      redTeamStatus: production.redTeamStatus,
+      clearRedTeamQueued: production.clearRedTeamQueued,
+      runRedTeam: vi.fn(input => {
+        admittedPrior = input.redTeamAdmission.prior;
+        observed = runSharedRecovery(input, { status: read(), probeFresh: true });
+        return observed.result;
+      }),
+    });
+    try {
+      recordRedTeamStatus({ repo, pr, loopPayload, status: 'running', result: null }, { env });
+      const status = { ...read(), pid: 2147483647 };
+      writeJsonAtomic(join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`), status);
+      expect(abandonStaleRedTeamRun({ repo, pr, head, env, status,
+        probe: { host: status.host, namespace: status.pidNamespace, isAlive: () => false } }).ok).toBe(true);
+      expect(read()).toMatchObject({ status: 'running', result: null,
+        staleAbandoned: { at: expect.any(String), pid: status.pid } });
+
+      const prior = read();
+      expect(verifiedStaleRedTeamAbandonment({ repo, pr, head, env }, prior)).toBe(true);
+      const result = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh',
+        ...(redTeamStaleRecovery === undefined ? {} : { redTeamStaleRecovery }) }, io);
+      if (redTeamStaleRecovery !== true) {
+        expect(result).toMatchObject({ outcome: 'blocked-on-infra',
+          label: expect.stringContaining('prior red-team status; not re-run') });
+        expect(io.runRedTeam).not.toHaveBeenCalled();
+        expect(read()).toEqual(prior);
+        return;
+      }
+      expect(io.runRedTeam).toHaveBeenCalledOnce();
+      expect(io.runRedTeam.mock.calls[0][0].redTeamStaleRecovery).toBe(true);
+      expect(result.redTeam?.reason ?? '').not.toContain('prior red-team status; not re-run');
+      expect(observed.calls.model).toBe(1);
+      expect(observed.result.deferredByGuard).not.toBe(true);
+      expect(admittedPrior).toBeNull();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    'no markers', 'wrong head', 'pid mismatch', 'invalid abandonment time', 'invalid birth time',
+    'older abandonment than marker 2', 'restarted after cap consumed', 'unreadable marker', 'three dispatch markers',
+  ])('stale flag cannot authorize production admission with %s', kind => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-stale-trust-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+    const at = Date.now() - 10_000;
+    const path = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
+    const marker = suffix => {
+      writeFileSync(`${path}.${suffix}`, '');
+      utimesSync(`${path}.${suffix}`, at / 1000, at / 1000);
+    };
+    try {
+      recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'running' }, { env });
+      const row = { ...readRedTeamStatus({ repo, pr, head, env }), pid: 2147483647,
+        pidStart: new Date(at - 1000).toISOString(), staleAbandoned: { at: new Date(at).toISOString(), pid: 2147483647 } };
+      if (kind !== 'no markers') marker('stale-redispatch-1');
+      if (kind === 'pid mismatch') row.staleAbandoned.pid--;
+      if (kind === 'invalid abandonment time') row.staleAbandoned.at = 'invalid';
+      if (kind === 'invalid birth time') row.pidStart = 'invalid';
+      if (kind === 'older abandonment than marker 2') {
+        marker('stale-redispatch-2');
+        utimesSync(`${path}.stale-redispatch-2`, (at + 5000) / 1000, (at + 5000) / 1000);
+      }
+      if (kind === 'restarted after cap consumed') {
+        marker('stale-norestart');
+        row.pidStart = new Date(at + 5000).toISOString();
+      }
+      if (kind === 'unreadable marker') mkdirSync(`${path}.stale-redispatch-2`);
+      if (kind === 'three dispatch markers') { marker('stale-redispatch-2'); marker('stale-norestart'); }
+      writeJsonAtomic(path, row);
+      const prior = readFileSync(path, 'utf8');
+      const io = createReviewJobIo({ env,
+        readStatus: key => {
+          const stored = readRedTeamStatus(key);
+          return kind === 'wrong head' && stored?.status === 'running' ? { ...stored, head: 'b'.repeat(40) } : stored;
+        }, readEvidence: () => ({ inFlight: false, queued: false }) });
+      expect(() => io.redTeamStatus({ repo, pr, loopPayload: payload(), status: 'queued',
+        redTeamMode: 'fresh', redTeamStaleRecovery: true })).toThrow('prior red-team status; not re-run');
+      expect(readFileSync(path, 'utf8')).toBe(prior);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each(['first abandonment', 'second abandonment', 'no-restart claim', 'missing birth time', 'legacy UTC birth time'])(
+    'verified %s permits production admission at the dispatch boundary', kind => {
+      const dir = mkdtempSync(join(tmpdir(), 'red-team-stale-verified-'));
+      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') }, at = Date.now() - 1000;
+      const path = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
+      try {
+        recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'running' }, { env });
+        const row = { ...readRedTeamStatus({ repo, pr, head, env }), pid: 2147483647,
+          pidStart: new Date(at - 1000).toISOString(), staleAbandoned: { at: new Date(at).toISOString(), pid: 2147483647 } };
+        if (kind === 'missing birth time') row.pidStart = null;
+        if (kind === 'legacy UTC birth time') row.pidStart = new Date(at - 1000).toUTCString()
+          .replace(/^(\w+), (\d+) (\w+) (\d+) (.*) GMT$/, '$1 $3 $2 $5 $4');
+        writeJsonAtomic(path, row);
+        const suffixes = ['stale-redispatch-1', ...(kind === 'second abandonment' ? ['stale-redispatch-2']
+          : kind === 'no-restart claim' ? ['stale-norestart'] : [])];
+        for (const suffix of suffixes) {
+          writeFileSync(`${path}.${suffix}`, '');
+          utimesSync(`${path}.${suffix}`, at / 1000, at / 1000);
+        }
+        const io = createReviewJobIo({ env, readEvidence: () => ({ inFlight: false, queued: false }) });
+        expect(io.redTeamStatus({ repo, pr, loopPayload: payload(), status: 'queued',
+          redTeamMode: 'fresh', redTeamStaleRecovery: true })).toEqual({ priorResult: null,
+            redTeamAdmission: { pid: process.pid, prior: null } });
+        expect(readRedTeamStatus({ repo, pr, head, env })).toMatchObject({ status: 'queued', pid: process.pid });
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+  it('fresh production admission holds a live running writer without stale abandonment', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-live-running-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+    const read = () => readRedTeamStatus({ repo, pr, head, env });
+    const production = createReviewJobIo({ env, readEvidence: input => readDrainRedTeamEvidence({ ...input,
+      list: () => [], readScorecards: () => [], isAlive: () => true, readPidStart: () => null }) });
+    const io = fakeIo({ redTeamStatus: production.redTeamStatus,
+      runRedTeam: vi.fn(input => runSharedRecovery(input, { status: read(), probeFresh: true }).result) });
+    try {
+      recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'running', result: null }, { env });
+      const prior = read();
+      expect(prior.pid).toBe(process.pid);
+      expect(prior.staleAbandoned).toBeUndefined();
+      expect(runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, io))
+        .toMatchObject({ outcome: 'blocked-on-infra', label: expect.stringContaining('red-team writer is live or unknown') });
+      expect(io.runRedTeam).not.toHaveBeenCalled();
+      expect(read()).toEqual(prior);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('fresh production admission and shared guard never rerun a finished ran result with a posted comment', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-finished-posted-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+    const read = () => readRedTeamStatus({ repo, pr, head, env });
+    const production = createReviewJobIo({ env });
+    let observed;
+    const io = fakeIo({ redTeamStatus: production.redTeamStatus,
+      clearRedTeamQueued: production.clearRedTeamQueued,
+      runRedTeam: vi.fn(input => {
+        observed = runSharedRecovery(input, { status: read(), probeFresh: true });
+        return observed.result;
+      }),
+    });
+    try {
+      recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'finished',
+        result: { status: 'ran', comment: { status: 'posted' } } }, { env });
+      const prior = read();
+      expect(runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' }, io).redTeam)
+        .toMatchObject({ status: 'not-owed', deferredByGuard: true,
+          reason: expect.stringContaining('prior red-team status; not re-run') });
+      expect(observed.calls).toEqual({ provider: 0, reserve: 0, model: 0, recheck: 0 });
+      expect(observed.comments).toEqual([]);
+      expect(read()).toEqual(prior);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('fresh recovery preserves unknown finished-null history through production admission and launches no call', () => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-null-history-'));
     const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
@@ -1289,10 +1460,12 @@ describe('red-team-only dispatch', () => {
       resolveSettingsEnv: () => ({}), ciGate: vi.fn(() => ({ allowed: false })), spawnJob: vi.fn(() => 4242) };
     try { run(options); } finally { rmSync(dir, { recursive: true, force: true }); }
   }
-  it.each(['fresh', 'resume'])('passes --red-team-only=%s and preferred lane, skipping CI admission', redTeamMode => withDispatch(options => {
-    const out = dispatchReviewJob({ ...options, redTeamMode, preferLane: 7 });
+  it.each(['fresh', 'resume'].flatMap(redTeamMode => [false, true].map(redTeamStaleRecovery => ({ redTeamMode, redTeamStaleRecovery }))))(
+    'passes --red-team-only=$redTeamMode and preferred lane, skipping CI admission (stale=$redTeamStaleRecovery)', ({ redTeamMode, redTeamStaleRecovery }) => withDispatch(options => {
+    const out = dispatchReviewJob({ ...options, redTeamMode, redTeamStaleRecovery, preferLane: 7 });
     expect(out.jobPid).toBe(4242); expect(options.ciGate).not.toHaveBeenCalled();
     expect(options.spawnJob.mock.calls[0][0].argv).toEqual(expect.arrayContaining(['run', `--pr=${pr}`, `--repo=${repo}`, `--red-team-only=${redTeamMode}`, '--prefer-lane=7']));
+    expect(options.spawnJob.mock.calls[0][0].argv.includes('--red-team-stale-recovery')).toBe(redTeamStaleRecovery);
   }));
   it('still skips live-job with the same slug and record', () => withDispatch(options => {
     writeJobRecord({ slug: `review-${pr}`, pr, repo, pid: 99, cwd: '/daemon', startedAt: new Date().toISOString() }, options.dir);
@@ -1312,11 +1485,13 @@ describe('red-team child resume enforcement', () => {
     [undefined, []],
     ['fresh', ['--red-team-mode=fresh']],
     ['resume', ['--resume-only', '--red-team-mode=resume']],
-  ])('builds exact child argv for %s mode', (redTeamMode, modeArgs) => {
+  ].flatMap(([redTeamMode, modeArgs]) => [undefined, true].map(redTeamStaleRecovery => [redTeamMode, modeArgs, redTeamStaleRecovery])))(
+    'builds exact child argv for %s mode (%j, stale=%s)', (redTeamMode, modeArgs, redTeamStaleRecovery) => {
     const loopFile = `review-${pr}.red-team.loop.json`;
-    expect(redTeamRunnerArgs({ pr, repo, lanePath: '/lanes/lane-7', loopFile, redTeamMode })).toEqual([
+    expect(redTeamRunnerArgs({ pr, repo, lanePath: '/lanes/lane-7', loopFile, redTeamMode, redTeamStaleRecovery })).toEqual([
       'scripts/operations/review-extra-seats.mjs', 'red-team', `--pr=${pr}`, `--repo=${repo}`,
       '--lane=/lanes/lane-7', `--loop-json=${loopFile}`, ...modeArgs,
+      ...(redTeamStaleRecovery === true ? ['--red-team-stale-recovery'] : []),
     ]);
   });
   it.each(['fresh', 'resume'])('carries the exact pre-queue %s evidence to the shared child argv', redTeamMode => {
@@ -1988,4 +2163,119 @@ describe('R100 failed-seat recovery admission', () => {
         expect(f.recover().rows[0].action).toBe('skip');
       } finally { rmSync(f.dir, { recursive: true, force: true }); }
     });
+});
+
+
+describe('PR 6039 red-team-only stale running payload recovery', () => {
+  function staleJob({ alive = false, recovered = payload(), abandoned = false } = {}) {
+    const pidStart = new Date(0).toISOString();
+    const status = { repo, pr, head, status: 'running', result: null, pid: 6039,
+      host: 'fixture-host', pidNamespace: 'fixture-namespace', pidStart,
+      ...(abandoned ? { staleAbandoned: { at: 500, pid: 6039, reason: 'dead owner' } } : {}) };
+    return fakeIo({
+      readRedTeamOnlyPayload: vi.fn(() => ({ head, status,
+        loopPayload: { findings: { read: { netBasis: { rev: head } } } } })),
+      readStaleRunPayload: vi.fn(() => recovered),
+      staleProbe: { host: status.host, namespace: status.pidNamespace,
+        isAlive: vi.fn(() => alive), readPidStart: vi.fn(() => pidStart) },
+    });
+  }
+  const options = { repo, pr, redTeamOnly: true, redTeamMode: 'fresh' };
+  describe.each([false, true])('environment deadline recheck (staleAbandoned=%s)', abandoned => {
+    it.each([
+      ['shorter injected deadline', '60000', '14400000', 60 * 60 * 1000, true],
+      ['longer injected deadline', '14400000', '60000', 3 * 60 * 60 * 1000, false],
+      ['injected default', undefined, '60000', 60 * 60 * 1000, false],
+    ])('%s takes precedence over process.env', (_name, injected, host, age, recovered) => {
+      const now = Date.parse('2026-10-29T15:00:00Z');
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+      vi.stubEnv('WE_RED_TEAM_STALE_RUN_MS', host);
+      try {
+        const env = injected === undefined ? {} : { WE_RED_TEAM_STALE_RUN_MS: injected };
+        const io = staleJob({ abandoned });
+        io.env = createReviewJobIo({ env }).env;
+        const { status } = io.readRedTeamOnlyPayload();
+        Object.assign(status, { host: 'remote', pidStart: new Date(now - age).toISOString(),
+          ...(abandoned ? { status: 'finished', result: { status: 'not-owed' } } : {}) });
+        expect(runReviewJob(options, io).outcome).toBe(recovered ? 'red-team-only' : 'red-team-not-owed');
+        expect(io.readStaleRunPayload).toHaveBeenCalledTimes(recovered ? 1 : 0);
+        expect(io.runRedTeam).toHaveBeenCalledTimes(recovered ? 1 : 0);
+        expect(io.redTeamStatus.mock.calls.map(([input]) => input.status)).toEqual(recovered ? ['queued', 'finished'] : []);
+      } finally {
+        clock.mockRestore();
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it.each([
+      ['shorter override', '60000', 60 * 60 * 1000, true],
+      ['longer override', '14400000', 3 * 60 * 60 * 1000, false],
+      ['invalid override within default', 'invalid', 60 * 60 * 1000, false],
+      ['unsafe override past default', '9007199254740992', 3 * 60 * 60 * 1000, true],
+      ['unset within default', undefined, 60 * 60 * 1000, false],
+      ['unset past default', undefined, 3 * 60 * 60 * 1000, true],
+    ])('%s for an unprobeable stored owner', (_name, value, age, recovered) => {
+      const now = 20_000_000;
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+      vi.stubEnv('WE_RED_TEAM_STALE_RUN_MS', value);
+      try {
+        const io = staleJob({ abandoned });
+        const { status } = io.readRedTeamOnlyPayload();
+        Object.assign(status, { host: 'remote', pidStart: new Date(now - age).toISOString(),
+          ...(abandoned ? { status: 'finished', result: { status: 'not-owed' } } : {}) });
+        expect(runReviewJob(options, io).outcome).toBe(recovered ? 'red-team-only' : 'red-team-not-owed');
+        expect(io.readStaleRunPayload).toHaveBeenCalledTimes(recovered ? 1 : 0);
+        expect(io.runRedTeam).toHaveBeenCalledTimes(recovered ? 1 : 0);
+        expect(io.redTeamStatus.mock.calls.map(([input]) => input.status)).toEqual(recovered ? ['queued', 'finished'] : []);
+      } finally {
+        clock.mockRestore();
+        vi.unstubAllEnvs();
+      }
+    });
+  });
+  it.each([false, true])('dead owner recovers accepting payload and runs red team (staleAbandoned=%s)', abandoned => {
+    const recovered = { ...payload(), recoveryEvidence: 'full accepting review run' };
+    const io = staleJob({ recovered, abandoned });
+    const result = runReviewJob(options, io);
+    expect(result.outcome).not.toBe('red-team-not-owed');
+    expect(result.outcome).toBe('red-team-only');
+    expect(io.readStaleRunPayload).toHaveBeenCalledOnce();
+    expect(io.runRedTeam).toHaveBeenCalledOnce();
+    expect(io.runRedTeam).toHaveBeenCalledWith(expect.objectContaining({ loopPayload: recovered, redTeamMode: 'fresh' }));
+  });
+  it.each([false, true])('live owner never recovers or starts even with staleAbandoned=%s', abandoned => {
+    const io = staleJob({ alive: true, abandoned });
+    expect(runReviewJob(options, io).outcome).toBe('red-team-not-owed');
+    expect(io.readStaleRunPayload).not.toHaveBeenCalled();
+    expect(io.runRedTeam).not.toHaveBeenCalled();
+    expect(io.redTeamStatus).not.toHaveBeenCalled();
+  });
+  it('missing full review run fails closed as red-team-not-owed', () => {
+    const io = staleJob({ recovered: null });
+    expect(runReviewJob(options, io).outcome).toBe('red-team-not-owed');
+    expect(io.readStaleRunPayload).toHaveBeenCalledOnce();
+    expect(io.runRedTeam).not.toHaveBeenCalled();
+    expect(io.redTeamStatus).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['rejecting', { verdict: { verdict: 'changes' } }],
+    ['incomplete', { verdict: null }],
+    ['carried', { carriedFrom: 'older-run' }],
+  ])('a newer %s stored review prevents stale recovery from running an older accept', (_kind, over) => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-superseded-review-'));
+    try {
+      const older = { ...newRunRecord({ id: 'review-pr-old', op: 'review-pr', input: { repo, pr } }), ...payload() };
+      const newest = { ...newRunRecord({ id: 'review-pr-new', op: 'review-pr', input: { repo, pr } }), ...payload(), ...over };
+      writeRun(older, dir);
+      writeRun(newest, dir);
+      utimesSync(join(dir, `${older.id}.json`), new Date(1000), new Date(1000));
+      utimesSync(join(dir, `${newest.id}.json`), new Date(2000), new Date(2000));
+      const io = staleJob();
+      io.readStaleRunPayload = vi.fn(key => recoverStaleRunPayload({ ...key, runsDir: dir }));
+      expect(runReviewJob(options, io).outcome).toBe('red-team-not-owed');
+      expect(io.readStaleRunPayload).toHaveBeenCalledOnce();
+      expect(io.runRedTeam).not.toHaveBeenCalled();
+      expect(io.redTeamStatus).not.toHaveBeenCalled();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
 });

@@ -91,7 +91,7 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
 import { liveResultGateState, readRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
-import { normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
+import { recoverStaleRunPayload, staleRedTeamRun, staleRunDeadlineMs, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate, verifiedStaleRedTeamAbandonment } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../lib/red-team-carry-io.mjs';
@@ -281,11 +281,12 @@ export function laneCooloffActive(record, nowMs, cooloffMs = INFRA_RETRY_COOLOFF
 }
 
 /** PURE — carry recovery mode and pre-admission evidence to the shared red-team entry. */
-export function redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode, redTeamAdmission }) {
+export function redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode, redTeamAdmission, redTeamStaleRecovery }) {
   return [
     'scripts/operations/review-extra-seats.mjs', 'red-team', `--pr=${pr}`, `--repo=${repo}`, `--lane=${lanePath}`, `--loop-json=${loopFile}`,
     ...(redTeamMode === 'resume' ? ['--resume-only'] : []),
     ...(redTeamMode === undefined ? [] : [`--red-team-mode=${redTeamMode}`]),
+    ...(redTeamStaleRecovery === true ? ['--red-team-stale-recovery'] : []),
     ...(redTeamAdmission === undefined ? [] : [`--red-team-admission=${JSON.stringify(redTeamAdmission)}`]),
   ];
 }
@@ -338,6 +339,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     'pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-',
   ], { input: body, cwd: root, env, timeout: 60_000, maxBuffer: 1024 * 1024 });
   return {
+    env,
     redTeamResultVisible: ({ repo, pr, head }) => Boolean(redTeamForHead(readComments({ repo, pr }), pr, head)),
     settleRedTeamSkip: input => settleRedTeamSkip({ ...input, io: {
       env,
@@ -393,11 +395,18 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           // A null result is eligible only when normalized from the original queued
           // writer above. An ordinary finished/null prior must reach the guard intact.
           const retry = input.redTeamMode === 'fresh' && failedRedTeamRetry(admissionPrior, readEvidence(key));
+          const withoutRun = redTeamStatusWithoutRun(admissionPrior, {
+            originalStatus: prior, allowAbandonedRunning: input.redTeamStaleRecovery === true
+              && verifiedStaleRedTeamAbandonment(key, admissionPrior),
+          });
+          if (input.redTeamMode === 'fresh' && admissionPrior?.status === 'running' && !withoutRun) {
+            throw Error('prior red-team status; not re-run');
+          }
           if (input.redTeamMode === 'fresh'
             && (admissionPrior?.retryCount === undefined || admissionPrior.retryCount === 0)
             && !retry
             && (redTeamSkipNeedsSettlement(admissionPrior)
-            || redTeamStatusWithoutRun(admissionPrior, { originalStatus: prior }))) admissionPrior = null;
+            || withoutRun)) admissionPrior = null;
           if (['ran', 'resumed'].includes(normalizeRedTeamResult(admissionPrior?.result).priorResult)) priorResult = admissionPrior.result;
           input = { ...input, result: priorResult, ...(retry ? { retryCount: 1 } : {}) };
         }
@@ -457,6 +466,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       if (fetched !== head) throw Error('review head changed during fetch; retry shared setup on the live head');
       return { head };
     },
+    readStaleRunPayload: key => recoverStaleRunPayload({ ...key, env }),
     readRedTeamOnlyPayload: ({ pr, repo, head }) => ({ ...readEvidence({ repo, pr, head, env }), head }),
     redTeamSkipCardOnlySetting: () => readRedTeamProbes({ env, log: line => process.stderr.write(`${line}\n`) }).value.skipCardOnly,
     // Prove in the review lane: prepareLane fetched and pinned the PR head there; the daemon's own clone may lack it.
@@ -466,6 +476,13 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       : { ok: false }),
     // The carry's own resolver is its only source (logged with that source); no timing setting governs it.
     carryAcrossRebaseSetting: () => resolveCarryAcrossRebase({ env, readFile }),
+    carryHumanClearance: ({ pr, repo }) => {
+      const cwd = planReviewDispatch({ pr: 1, repo }).laneRepo;
+      // Parse/exec failures propagate to the arc's normal-review fallback.
+      return JSON.parse(exec(process.execPath, [join(root, 'scripts', 'conveyor', 'human-clearance-carry-cli.mjs'),
+        '--pr', String(pr), '--repo', repo],
+      { cwd, env: laneGitHardeningEnv(env), encoding: 'utf8', timeout: 300_000, maxBuffer: READ_MAX_BUFFER }));
+    },
     readCarryEvidence: ({ pr, repo }) => {
       const view = JSON.parse(execRead('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], { cwd: root, env }));
       const comments = readCompletePrComments(pr, { repo, exec: (f, a, o) => execRead(f, a, { ...o, cwd: root, env }) });
@@ -545,13 +562,13 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     },
     // x00g3tt — the POST-ACCEPT RED TEAM, its own process and wall, run only after the added seats. Advisory: it
     // posts one deduped comment and writes evidence; nothing it returns reaches a label, merge or verdict.
-    runRedTeam: ({ pr, repo, lanePath, loopPayload, slug, redTeamMode, redTeamAdmission }) => {
+    runRedTeam: ({ pr, repo, lanePath, loopPayload, slug, redTeamMode, redTeamAdmission, redTeamStaleRecovery }) => {
       if (!redTeamEnabled(env)) return { status: 'disabled', reason: 'kill switch thrown' };
       const loopFile = join(dir, `${slug}.red-team.loop.json`);
       try {
         mkdirSync(dir, { recursive: true });
         writeFileSync(loopFile, JSON.stringify(loopPayload));
-        const r = node(redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode, redTeamAdmission }),
+        const r = node(redTeamRunnerArgs({ pr, repo, lanePath, loopFile, redTeamMode, redTeamAdmission, redTeamStaleRecovery }),
           { timeoutMs: resolveSeatTimeoutMs(env) + 20 * 60 * 1000 });
         for (const line of String(r.stderr ?? '').split('\n').filter((l) => l && !/DeprecationWarning|trace-deprecation/.test(l))) {
           writeLineSync(2, `  ${line}`);
@@ -973,7 +990,7 @@ export function prepareReviewArc(input, io) {
 }
 
 function runReviewArc({
-  pr, repo, redTeamOnly = false, redTeamMode = 'fresh', preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid,
+  pr, repo, redTeamOnly = false, redTeamMode = 'fresh', redTeamStaleRecovery = false, preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid,
 } = {}, io, seatsBox = {}) {
   const planned = planReviewDispatch({ pr, repo });
   const slug = planned.sessionSlug;
@@ -1005,6 +1022,24 @@ function runReviewArc({
   try {
     const prev = io.readPrevCompletion(slug);
     if (!redTeamOnly) io.report({ session: slug, kind: 'review', pr: String(planned.pr), repo: planned.repo, status: 'started', timeoutMs: loopTimeoutMs });
+    if (!redTeamOnly && typeof io.carryHumanClearance === 'function') {
+      try {
+        const carry = io.carryHumanClearance({ pr: planned.pr, repo: planned.repo });
+        if (carry?.carried) {
+          const { fromSha, toSha: headSha, fingerprint } = carry.carried;
+          io.log(`review-job: human clearance carried ${fromSha}->${headSha} fingerprint ${fingerprint.slice(0, 12)}`);
+          classified = { outcome: 'carried', fromSha, headSha, fingerprint };
+          return result(classified);
+        }
+        if (carry?.reason) {
+          const reason = tail(safeErrorText(carry.reason).replace(/[\x00-\x1f\x7f-\x9f]/g, ' '), 300);
+          io.log(`review-job ${slug}: human clearance not carried (${reason}) — normal review`);
+        }
+      } catch (e) {
+        const reason = tail(safeErrorText(e).replace(/[\x00-\x1f\x7f-\x9f]/g, ' '), 300);
+        io.log(`review-job ${slug}: human clearance carry unavailable (${reason}) — normal review`);
+      }
+    }
     if (!redTeamOnly && typeof io.carryAcrossRebaseSetting === 'function') {
       try {
         const setting = io.carryAcrossRebaseSetting();
@@ -1092,6 +1127,19 @@ function runReviewArc({
         classified = { outcome: 'red-team-not-owed', reason: 'later review supersedes the carry' };
         return result({ ...classified, lanePath });
       }
+      const deadlineMs = staleRunDeadlineMs(io.env ?? process.env);
+      // Recheck the stored owner before recovering a missing accepting payload, including marked abandonment.
+      const staleStored = redTeamMode === 'fresh' && !redTeamOwedFor(loopPayload)
+        && (staleRedTeamRun({ status: stored?.status, probe: io.staleProbe, deadlineMs }).stale
+          || (stored?.status?.staleAbandoned && staleRedTeamRun({
+            status: { ...stored.status, status: 'running', result: null }, probe: io.staleProbe, deadlineMs }).stale));
+      if (staleStored) {
+        let recovered;
+        try { recovered = (io.readStaleRunPayload ?? recoverStaleRunPayload)({ repo: planned.repo, pr: planned.pr, head }); }
+        catch { /* Missing or unreadable full review evidence stays not owed. */ }
+        if (redTeamOwedFor(recovered) && recovered.findings?.read?.netBasis?.rev === head
+          && recovered.carriedFrom == null && loopPayload?.carriedFrom == null) loopPayload = recovered;
+      }
       let cardOnlyRecovery = false;
       const movedCardOnly = redTeamMode === 'fresh' && stored?.head === head && cardOnlyHeadMoveCandidate(stored, head);
       const pendingCardOnly = redTeamMode === 'fresh' && stored?.head === head
@@ -1149,7 +1197,8 @@ function runReviewArc({
         return result({ ...classified, lanePath, redTeam: { ...redTeam, ...settled } });
       }
       classified = { outcome: 'red-team-only' };
-      return finishArc({ pr: planned.pr, repo: planned.repo, lanePath, loopPayload, slug, redTeamMode });
+      return finishArc({ pr: planned.pr, repo: planned.repo, lanePath, loopPayload, slug, redTeamMode,
+        ...(redTeamStaleRecovery === true ? { redTeamStaleRecovery: true } : {}) });
     }
 
     // Card xbizuci — `review.speculativeRedTeam`: start the red team NOW, beside the loop. It waits for the loop's
@@ -1228,7 +1277,7 @@ function runReviewArc({
  *   logPath:string, skipped?:string}}
  */
 export function dispatchReviewJob({
-  ciGate = readReviewCiGate, advisoryCiWaiver = null, redTeamOnly = false, redTeamMode = 'fresh',
+  ciGate = readReviewCiGate, advisoryCiWaiver = null, redTeamOnly = false, redTeamMode = 'fresh', redTeamStaleRecovery = false,
   pr, repo, preferLane = null, root = REPO_ROOT, env = process.env, now = Date.now(), checkStaleness,
   dir = reviewJobsDir(env, root),
   spawnJob = defaultSpawnJob,
@@ -1272,6 +1321,7 @@ export function dispatchReviewJob({
   const jobPid = spawnJob({
     argv: [THIS_FILE, 'run', `--pr=${planned.pr}`, `--repo=${planned.repo}`,
       ...(redTeamOnly ? [`--red-team-only=${redTeamMode}`] : []),
+      ...(redTeamStaleRecovery === true ? ['--red-team-stale-recovery'] : []),
       ...(Number.isInteger(preferLane) && preferLane > 0 ? [`--prefer-lane=${preferLane}`] : [])], cwd: root, env: childEnv, logPath,
   });
   // Claim the slot for the child NOW, so the very next reader (a tick 120s later, or a status tag this same
@@ -1420,6 +1470,7 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
       const redTeamMode = flag('red-team-only') ?? 'fresh';
       const redTeamOnly = rest.includes('--red-team-only') || flag('red-team-only') !== undefined;
       const out = runJob({ pr: flag('pr'), repo: flag('repo'), redTeamOnly, redTeamMode,
+        ...(rest.includes('--red-team-stale-recovery') ? { redTeamStaleRecovery: true } : {}),
         preferLane: Number.isInteger(lane) && lane > 0 ? lane : null });
       writeAllSync(1, `${JSON.stringify(out)}\n`);
       // #4075/run-rating slice 1 — mechanical grading for this now-finished job-mode review, read back from
