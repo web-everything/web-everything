@@ -1202,6 +1202,14 @@ temporary git repo to verify gate arguments and green/red handling without recur
 suite. Exercise real subprocesses and git transport. Emit gate chatter in the fixture too: a CLI's
 machine-readable JSON stdout must remain parseable when its child gate prints output.
 
+Keep real-Git fixtures compatible with Forge's Git 2.43. An unsupported repository extension can
+prevent even read-only repository commands: inspect configuration with `git config --file`, and
+prove refusal by comparing filesystem bytes. Git's fetch negotiation may avoid a stale commit-graph,
+so verify an existing graph explicitly when testing corruption admission and repair. An `ls-files`
+exit 1 alone does not prove an untracked path: sparse-tree read failures can share that exit status.
+Send repository-sized path lists through NUL-delimited stdin, not argv; real-Git regressions should
+exceed the host's `getconf ARG_MAX` and prove the argv form fails with `E2BIG` while stdin succeeds.
+
 ### Passive-wait hook regression probes
 
 Test Stop/SubagentStop with distinct parent and subagent JSONL files: SubagentStop prefers

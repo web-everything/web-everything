@@ -867,6 +867,39 @@ export async function runFixCli(argv = [], {
       .filter(m => m && OID_RE.test(m[2]) && m[4] === path)
       .map(m => ({ mode: m[1], oid: m[2], stage: m[3] }));
     let preparedHead = before;
+    // Keep Git's marker allocation bounded (2.43 overflows its int parser on e.g. 99999999999).
+    // Oversized attributes use the normal width 7; preserve the tracked attributes and restore local overrides.
+    const MAX_MARKER_SIZE = 1024;
+    const boundedMarkerPaths = new Set();
+    const mergeWithBoundedMarkers = (target) => {
+      const inspect = (args, input) => run('git', [...HARDENED_GIT_ARGS, ...args], { cwd: lanePath, env: gitEnv, input, maxBuffer: BLOB_MAX_BYTES });
+      const paths = [...new Set((inspect(['ls-tree', '-r', '--name-only', '-z', 'HEAD']) + inspect(['ls-tree', '-r', '--name-only', '-z', `origin/${target}`])).split('\0').filter(Boolean))];
+      // Repository-sized path lists exceed ARG_MAX; keep argv fixed and preserve every path byte through NUL stdin.
+      const input = paths.join('\0') + '\0';
+      if (paths.length) for (const source of [[], [`--source=origin/${target}`]]) {
+        const attrs = inspect(['check-attr', ...source, '-z', '--stdin', 'conflict-marker-size'], input).split('\0');
+        for (let i = 0; i + 2 < attrs.length; i += 3) if (Math.abs(Number.parseInt(attrs[i + 2], 10)) > MAX_MARKER_SIZE) boundedMarkerPaths.add(attrs[i]);
+      }
+      if (!boundedMarkerPaths.size) return git('merge', '--no-commit', '--no-ff', `origin/${target}`);
+      const path = resolve(lanePath, git('rev-parse', '--git-path', 'info/attributes').trim());
+      let original = null;
+      try {
+        if (!nodeFs.lstatSync(path).isFile()) throw new LauncherError('cannot bound conflict markers: info/attributes is not a regular file; restore it before retrying');
+        original = readFileSync(path);
+      } catch (e) { if (e.code !== 'ENOENT') throw e; }
+      // C-quote bytes and escape glob metacharacters: even whitespace/newline/glob-bearing paths match literally.
+      const rules = [...boundedMarkerPaths].map(p => {
+        const literal = '/' + p.replace(/[\\*?\[\]]/g, '\\$&');
+        return '"' + [...Buffer.from(literal)].map(b => '\\' + b.toString(8).padStart(3, '0')).join('') + '" conflict-marker-size=7\n';
+      }).join('');
+      write(`fix-run: conflict-marker-size exceeds ${MAX_MARKER_SIZE} in ${boundedMarkerPaths.size} path(s); using width 7 for this merge\n`);
+      try {
+        writeFileSync(path, Buffer.concat([original ?? Buffer.alloc(0), Buffer.from('\n' + rules)]));
+        return git('merge', '--no-commit', '--no-ff', `origin/${target}`);
+      } finally {
+        if (original === null) rmSync(path); else writeFileSync(path, original);
+      }
+    };
     let unmerged = [];
     let mergePrompt = '';
     if (target) {
@@ -885,7 +918,7 @@ export async function runFixCli(argv = [], {
         git('merge', '--abort');
       };
       checkLane(before, false);
-      try { git('merge', '--no-commit', '--no-ff', `origin/${target}`); }
+      try { mergeWithBoundedMarkers(target); }
       catch (e) {
         const conflicts = unmergedPaths(git('status', '--porcelain=v1', '-z'));
         if (!inMerge() || !conflicts.length) throw e;
@@ -915,12 +948,13 @@ export async function runFixCli(argv = [], {
       for (let i = 0; i + 2 < attrs.length; i += 3) {
         const sizes = attrSizes.get(attrs[i]);
         if (!sizes) continue;
-        if (/^[1-9]\d{0,8}$/.test(attrs[i + 2])) { sizes.add(Number(attrs[i + 2])); continue; }
+        if (boundedMarkerPaths.has(attrs[i])) sizes.add(7);
+        if (/^[1-9]\d{0,8}$/.test(attrs[i + 2]) && Number(attrs[i + 2]) <= MAX_MARKER_SIZE) { sizes.add(Number(attrs[i + 2])); continue; }
         // Anything else (unspecified, `+10`, `10x`, an out-of-range number): git's own parse may give 7 or the leading
         // number, so scan for both rather than guess.
         sizes.add(7);
         const lead = Number.parseInt(attrs[i + 2], 10);
-        if (lead > 0 && lead < 2 ** 31) sizes.add(lead);
+        if (lead > 0 && lead <= MAX_MARKER_SIZE) sizes.add(lead);
       }
     }
     const markerSizes = new Map(unmerged.map(path => {
