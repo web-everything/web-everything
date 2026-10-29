@@ -7,6 +7,8 @@ import { isHash, isNum, idFromName } from '../backlog/id.mjs';
 import { numberPendingHashes } from '../lane-drain.mjs';
 import { withNumberingLock } from '../readiness/drain-lock.mjs';
 import { queueStatePath } from './drain-merge-strategy.mjs';
+import { workflowEditHold } from './merge-queue-enqueue.mjs';
+import { appendDaemonEvent } from './daemon-events.mjs';
 
 const SETTING = 'scripts/settings/merge-queue-numbering.json';
 const ENV = 'WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE';
@@ -320,10 +322,19 @@ export function finishBranchPreparation(out, { c, revalidationAborted, needsAcce
   return false;
 }
 
-/** Evict pre-rollout hash-bearing queue entries; normal drain admission waits for their new CI. */
+/** Number only drain-eligible queue entries; human-held hash cards are repaired on main after landing. */
 export function sweepQueuedHashCards({ repo, cwd = process.cwd(), exec = execFileSync, log = process.stderr,
-  prepare = prepareBranchBeforeEnqueue, isOpen } = {}) {
-  const result = { dequeued: [], numbered: [], errors: [] };
+  prepare = prepareBranchBeforeEnqueue, isOpen, emit = appendDaemonEvent } = {}) {
+  const result = { dequeued: [], numbered: [], skipped: [], errors: [] };
+  const event = (kind, pr, detail) => {
+    try { void Promise.resolve(emit({ kind, pr, daemon: 'drain', detail })).catch(() => {}); }
+    catch { /* Coordination events must never interrupt the sweep. */ }
+  };
+  const skip = (num, reason) => {
+    result.skipped.push({ num, reason });
+    event('queue-dequeue-skipped', num, { reason });
+    log.write(`  ⇠ PR ${num} dequeue skipped: ${reason} — left queued${reason === 'changed-files-unreadable' ? '; retry on next pass' : ''}\n`);
+  };
   const fail = (num, e) => {
     const reason = String(e.message || e);
     result.errors.push({ num, reason });
@@ -337,15 +348,38 @@ export function sweepQueuedHashCards({ repo, cwd = process.cwd(), exec = execFil
   };
   try {
     const [owner, name] = repo.split('/');
-    const queue = graphql('query($owner:String!,$name:String!){repository(owner:$owner,name:$name){mergeQueue(branch:"main"){entries(first:100){nodes{id state pullRequest{id number headRefName headRefOid isCrossRepository}}}}}}', [`owner=${owner}`, `name=${name}`]);
-    for (const { pullRequest: pr } of queue.data.repository.mergeQueue?.entries.nodes || []) {
+    const queue = graphql('query($owner:String!,$name:String!){repository(owner:$owner,name:$name){mergeQueue(branch:"main"){entries(first:100){nodes{id state enqueuer{login} pullRequest{id number headRefName headRefOid isCrossRepository}}}}}}', [`owner=${owner}`, `name=${name}`]);
+    for (const { pullRequest: pr, enqueuer } of queue.data.repository.mergeQueue?.entries.nodes || []) {
       if (pr.isCrossRepository) continue;
       try {
         run('git', ['fetch', 'origin', `refs/heads/${pr.headRefName}`]);
         const files = hashBacklogFiles(run('git', ['ls-tree', '-r', '--name-only', pr.headRefOid, '--', 'backlog/']));
         if (!files.length) continue;
+        let changedFiles;
+        try {
+          // NUL delimiters preserve unusual paths; disabling renames exposes both old and new workflow paths.
+          changedFiles = run('git', ['diff', '--name-only', '--no-renames', '-z', `origin/main...${pr.headRefOid}`]).split('\0').filter(Boolean);
+        } catch {
+          skip(pr.number, 'changed-files-unreadable');
+          continue;
+        }
+        const hold = workflowEditHold({ files: changedFiles, expectedCount: changedFiles.length });
+        if (hold.hold) {
+          skip(pr.number, hold.humanOnly ? 'human-only' : 'changed-files-unreadable');
+          continue;
+        }
+        const login = enqueuer?.login;
+        if (typeof login !== 'string' || !login) {
+          skip(pr.number, 'enqueuer-unknown');
+          continue;
+        }
+        if (login !== 'plateau-merger' && !login.endsWith('[bot]')) {
+          skip(pr.number, 'human-enqueued');
+          continue;
+        }
         graphql('mutation($id:ID!){dequeuePullRequest(input:{id:$id}){mergeQueueEntry{id}}}', [`id=${pr.id}`]);
         result.dequeued.push(pr.number);
+        event('queue-dequeued', pr.number, { reason: 'hash-cards-numbering', files });
         log.write(`  ⇠ PR ${pr.number} DEQUEUED: carries hash card(s) ${files.join(', ')} — numbering on its branch, re-enqueued after CI\n`);
         const out = prepare({ c: { num: pr.number, repo: null, headRef: pr.headRefName, item: null, hasManifest: false }, traceHeadSha: pr.headRefOid, cwd, isLocal: true, isOpen });
         log.write(`  ↻ PR ${pr.number} queue branch preparation: ${out.action}${out.reason ? ` — ${out.reason}` : ''}${out.newHead ? ` → ${out.newHead}` : ''}\n`);
