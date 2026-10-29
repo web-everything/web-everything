@@ -30,6 +30,16 @@ function reviewRun(index = 0, complete = false) {
   };
 }
 
+function resumedReviewRun(complete = false) {
+  return { ...reviewRun(), resumedAt: iso(at + 60_000),
+    resumeOf: {
+      verdict: { verdict: 'accept', pendingReferrals: [] },
+      mandatoryReferrals: { effects: [{ type: 'review.mandatory-referrals', result: { records: [] } }] },
+      ...(complete ? { adviseFinishedAt: iso(at + 3) } : {}),
+    },
+  };
+}
+
 const closedCases = [
   ['no failed seats', run => { run.seatTimings = [{ seat: 'judgeSecurity', verdict: 'accept' }]; }],
   ['empty seat timings', run => { run.seatTimings = []; }],
@@ -110,6 +120,54 @@ describe.each([false, true])('reviewRunEvidence quotaOnly (completed: %s)', comp
       result: { records: [{ failure: 'GitHub refused to persist the referral', referrals: [], rulings: [] }] } }] };
     expect(reviewRunEvidence(run)).toMatchObject({ quotaOnly: false });
   });
+});
+
+describe.each([false, true])('saved referral quota evidence (completed: %s)', complete => {
+  it('uses clean saved referral state with quota-tagged seats', () => {
+    const row = reviewRunEvidence(resumedReviewRun(complete));
+    expect(row).toMatchObject({ quotaOnly: true });
+    expect(Boolean(row.incomplete)).toBe(!complete);
+  });
+
+  it.each(closedCases)('fails closed with %s on a resumed run', (_, mutate) => {
+    const run = resumedReviewRun(complete);
+    mutate(run);
+    expect(reviewRunEvidence(run)).toMatchObject({ quotaOnly: false });
+  });
+
+  it('counts a conflicting non-quota failure in resumeOf.mandatoryReferrals', () => {
+    const run = resumedReviewRun(complete);
+    // A clean current finding must not mask the saved referral evidence selected during a rewind.
+    run.findings.mandatoryReferrals = { effects: [{ type: 'review.mandatory-referrals', result: { records: [] } }] };
+    run.resumeOf.mandatoryReferrals.effects[0].result.records.push({
+      failure: 'GitHub refused to persist the referral', referrals: [], rulings: [],
+    });
+    expect(reviewRunEvidence(run)).toMatchObject({ quotaOnly: false });
+  });
+});
+
+describe.each([false, true])('incomplete step evidence (resumed: %s)', resumed => {
+  const makeRun = () => resumed ? resumedReviewRun() : reviewRun();
+
+  it('fails closed without throwing for a null step timing despite perfect quota evidence', () => {
+    const run = makeRun();
+    run.stepTimings.push(null);
+    expect(reviewRunEvidence(run)).toMatchObject({ id: run.id, incomplete: true, quotaOnly: false });
+  });
+
+  it('fails closed without throwing when a post-seat start time is unreadable', () => {
+    const run = makeRun();
+    run.stepTimings.push({ step: 'reduce', get startedAt() { throw new Error('step timing unreadable'); } });
+    expect(reviewRunEvidence(run)).toMatchObject({ id: run.id, incomplete: true, quotaOnly: false });
+  });
+
+  it.each(['reduce', 'mandatoryReferrals', 'referralVerdict', 'advise'])(
+    'counts an incomplete run once %s has started despite clean referral and quota seat evidence', step => {
+      const run = makeRun();
+      run.stepTimings.push({ step, startedAt: iso(at + 2) });
+      expect(reviewRunEvidence(run)).toMatchObject({ incomplete: true, quotaOnly: false });
+    },
+  );
 });
 
 describe('incomplete quota evidence after the seat phase', () => {

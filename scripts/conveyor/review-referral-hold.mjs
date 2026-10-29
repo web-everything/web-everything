@@ -39,18 +39,31 @@ export function reviewRunEvidence(run) {
   const head = read?.netBasis?.rev;
   // A rewind drops the referral result. Use the saved pass until this pass finishes referralVerdict; an unrelated
   // advisory failure must not hide a successful persist behind the saved persistence failure (PR #5771).
-  const ownAdvise = run.stepTimings?.find(t => t.step === 'advise')?.finishedAt;
+  const ownAdvise = run.stepTimings?.find(t => t?.step === 'advise')?.finishedAt;
   const resuming = Boolean(run.resumeOf) && !ownAdvise;
   const ownReferral = resuming && run.findings?.referralVerdict
-    ? run.stepTimings?.find(t => t.step === 'referralVerdict')?.finishedAt : undefined;
+    ? run.stepTimings?.find(t => t?.step === 'referralVerdict')?.finishedAt : undefined;
   const savedReferral = resuming && !ownReferral;
   const effects = (savedReferral ? run.resumeOf.mandatoryReferrals : run.findings?.mandatoryReferrals)?.effects;
   const state = Array.isArray(effects) ? effects.find(e => e?.type === 'review.mandatory-referrals')?.result : undefined;
   const records = Array.isArray(state?.records) ? state.records : [];
+  const verdict = savedReferral ? run.resumeOf.verdict : run.findings?.referralVerdict ?? run.verdict;
+  const finish = ownAdvise ?? ownReferral ?? run.resumeOf?.adviseFinishedAt;
+  // A resumed run starts again at the resume: the rulings that woke it are answered. Only once the pass is finished,
+  // though: an unfinished resume has answered nothing yet, and must stay wakeable by the ruling that started it.
+  const startedAt = Math.max(Date.parse(run.stepTimings?.find(t => t?.step === 'read')?.startedAt),
+    resuming ? 0 : Date.parse(run.resumedAt ?? '') || 0);
+  // An interrupted persist retry still spends a slot. Start its next backoff at the latest resume, rather than
+  // the original parked pass: after an outage that old deadline could spend every remaining slot on adjacent ticks.
+  const completedAt = Math.max(Date.parse(finish),
+    resuming && verdict?.pendingReferrals?.includes('referral-persistence-failed') ? Date.parse(run.resumedAt ?? '') || 0 : 0);
   // Only unambiguous persisted quota evidence for every failed seat exempts an attempt.
   // Unfinished seats, missing evidence, conflicting failures, and attempts that reached post-seat steps still count.
   let quotaOnly = false;
   try {
+    // Quota errors at the seats cannot explain a later crash or unreadable step evidence.
+    const validStepTimings = Number.isFinite(completedAt) || !run.stepTimings?.some(t => t == null
+      || (['reduce', 'mandatoryReferrals', 'referralVerdict', 'advise'].includes(t?.step) && t?.startedAt != null));
     const validEffects = effects === undefined || (Array.isArray(effects) && effects.every(e => e != null));
     const validRecords = state == null || (Array.isArray(state.records)
       && records.every(r => r != null && typeof r === 'object' && !Array.isArray(r)));
@@ -60,29 +73,16 @@ export function reviewRunEvidence(run) {
     // Repeated calls to the same seat each need their own persisted quota row.
     const failuresBySeat = new Map();
     for (const t of failedSeats) failuresBySeat.set(t.seat, (failuresBySeat.get(t.seat) ?? 0) + 1);
-    quotaOnly = validEffects && validRecords && failedSeats.length > 0 && Array.isArray(telemetry) && failures.every(isQuotaError)
+    quotaOnly = validStepTimings && validEffects && validRecords && failedSeats.length > 0 && Array.isArray(telemetry) && failures.every(isQuotaError)
       && run.seatTimings.every(t => t?.verdict && t?.finishedAt)
       && failedSeats.every(t => {
         if (typeof t.seat !== 'string' || t.seat.length === 0) return false;
         const rows = telemetry.filter(row => row?.step === t.seat);
         return rows.length >= failuresBySeat.get(t.seat) && rows.every(row => row.failureKind === 'provider-quota');
       });
-  } catch { /* unreadable seat evidence cannot establish a quota-only attempt */ }
-  const verdict = savedReferral ? run.resumeOf.verdict : run.findings?.referralVerdict ?? run.verdict;
-  const finish = ownAdvise ?? ownReferral ?? run.resumeOf?.adviseFinishedAt;
-  // A resumed run starts again at the resume: the rulings that woke it are answered. Only once the pass is finished,
-  // though: an unfinished resume has answered nothing yet, and must stay wakeable by the ruling that started it.
-  const startedAt = Math.max(Date.parse(run.stepTimings?.find(t => t.step === 'read')?.startedAt),
-    resuming ? 0 : Date.parse(run.resumedAt ?? '') || 0);
-  // An interrupted persist retry still spends a slot. Start its next backoff at the latest resume, rather than
-  // the original parked pass: after an outage that old deadline could spend every remaining slot on adjacent ticks.
-  const completedAt = Math.max(Date.parse(finish),
-    resuming && verdict?.pendingReferrals?.includes('referral-persistence-failed') ? Date.parse(run.resumedAt ?? '') || 0 : 0);
+  } catch { /* unreadable step or seat evidence cannot establish a quota-only attempt */ }
   if (!sha(head) || !Number.isFinite(startedAt)) return null;
   if (!Number.isFinite(completedAt)) {
-    // Quota errors at the seats cannot explain a later crash after the panel advanced.
-    if (run.stepTimings?.some(t =>
-      ['reduce', 'mandatoryReferrals', 'referralVerdict', 'advise'].includes(t.step) && t.startedAt != null)) quotaOnly = false;
     // Crashes before/during advise still consumed a retry. Keep them in the cached projection, without
     // inventing a completed panel or clean referral evidence for acceptance/carry readers.
     return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt: null,
