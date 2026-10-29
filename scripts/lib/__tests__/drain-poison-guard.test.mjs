@@ -138,8 +138,9 @@ describe('checkBornAsCollision', () => {
     expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ error: `main card ${mainCard} has no readable frontmatter` });
   });
   it('closes frontmatter where gray-matter does: at the first later line starting `---`', () => {
-    const exec = fakeExec({ mainTexts: { [mainCard]: '---\nkind: story\n----\nbornAs: xgcpm6z\n---\n' } });
-    expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ ok: true });
+    // A `--- note` line ends the block, so the second `bornAs` below it is body text, not a duplicate YAML key.
+    const exec = fakeExec({ mainTexts: { [mainCard]: '---\nbornAs: xgcpm6z\n--- note\nbornAs: xaaaaaa\n---\n' } });
+    expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ collision: { hash: 'xgcpm6z', path: newCard, mainCard } });
   });
   it('reads an unclosed frontmatter block to the end of the file, as gray-matter does', () => {
     const exec = fakeExec({ mainTexts: { [mainCard]: '---\nkind: story\nbornAs: xgcpm6z\n' } });
