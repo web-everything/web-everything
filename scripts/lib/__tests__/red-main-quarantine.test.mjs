@@ -224,9 +224,12 @@ describe('quarantine — latestRedSha keying and re-keying', () => {
     expect(same.events).toHaveLength(0);
   });
   it('a re-key never extends total lifetime past QUARANTINE_MAX_TTL_MS from the original addedAt', () => {
-    const first = base(SHA);
-    const r = addEntries(first, { tests: [TEST], brokenSha: LATEST, owner: 'o', reason: 'r', actor: 'operator', now: NOW + QUARANTINE_MAX_TTL_MS - 3_600_000 });
-    expect(r.list.entries[0].expiresAt).toBeLessThanOrEqual(NOW + QUARANTINE_MAX_TTL_MS);
+    let l = addEntries(null, { tests: [TEST], brokenSha: SHA, owner: 'o', reason: 'r', actor: 'operator', now: NOW, ttlMs: QUARANTINE_MAX_TTL_MS }).list;
+    const at = NOW + QUARANTINE_MAX_TTL_MS - 3_600_000;
+    expect(l.entries[0].expiresAt).toBeGreaterThan(at);
+    const r = addEntries(l, { tests: [TEST], brokenSha: LATEST, owner: 'o', reason: 'r', actor: 'operator', now: at, ttlMs: QUARANTINE_MAX_TTL_MS });
+    expect(r.list.entries[0].brokenSha).toBe(LATEST);
+    expect(r.list.entries[0].expiresAt).toBe(NOW + QUARANTINE_MAX_TTL_MS);
   });
   it('re-key of a test does not touch other tests or other jobs', () => {
     const l = addEntries(base(SHA), { tests: ['a/__tests__/b.test.mjs'], brokenSha: SHA, owner: 'o', reason: 'r', actor: 'operator', now: NOW }).list;
