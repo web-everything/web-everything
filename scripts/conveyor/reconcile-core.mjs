@@ -3284,7 +3284,7 @@ export function planReconcile({
         && staleRetry.head === pr.headRefOid && staleRetry.pr === prNumber;
       if (staleRerunActive) {
         const staleSpent = retryBudget?.confirmed === undefined ? undefined : retryBudget.confirmed + (retryBudget.rejected ?? 0);
-        const staleCap = staleRetry.jobs.length;
+        const staleCap = incompleteFailureInventory ? 1 : staleRetry.jobs.length;
         if (staleSpent < staleCap && hasLiveCheck(pr)) {
           // The owed re-run is deferred, not skipped: hold (never fall through to a heal that spends heal budget on a
           // head whose fresh result is still on its way) and re-plan next tick.

@@ -83,6 +83,40 @@ describe('resolveStaleCiRerunSetting cascade', () => {
 });
 
 describe('incomplete failure inventory recovery', () => {
+  it.each([{ confirmed: 1, rejected: 0 }, { confirmed: 0, rejected: 1 }])(
+    'never reruns two stale jobs on green main after the incomplete-inventory head budget is spent: %j', budget => {
+      const out = plan({
+        owedCiRerunRetry: { ...evidence, jobs: [...evidence.jobs, { ...evidence.jobs[0], job: 457 }] },
+        timeoutRetryBudget: budget,
+      }, 'once-per-head');
+      expect.soft(out.dispatch.some(row => row.kind === 'ci-timeout-rerun')).toBe(false);
+      expect.soft(out.notes).toContainEqual(expect.objectContaining({
+        kind: 'starved-capacity-alert', prNumber: 5273,
+        text: expect.stringMatching(/PR #5273.*incomplete failure inventory.*heal budget/i),
+      }));
+    },
+  );
+
+  it('caps two stale jobs at one recovery on green main with incomplete inventory', () => {
+    const out = plan({ owedCiRerunRetry: { ...evidence, jobs: [...evidence.jobs, { ...evidence.jobs[0], job: 457 }] } });
+    expect(out.dispatch).toEqual([expect.objectContaining({
+      kind: 'ci-timeout-rerun', variant: 'stale-ci-rerun',
+      timeoutRetry: expect.objectContaining({ cap: 1 }),
+    })]);
+  });
+
+  it('retains the two-job stale cap when the inventory is not incomplete', () => {
+    const out = plan({
+      timeoutRetry: { eligible: false, reason: 'not-a-timeout' },
+      owedCiRerunRetry: { ...evidence, jobs: [...evidence.jobs, { ...evidence.jobs[0], job: 457 }] },
+      timeoutRetryBudget: { confirmed: 1, rejected: 0 },
+    });
+    expect(out.dispatch).toEqual([expect.objectContaining({
+      kind: 'ci-timeout-rerun', variant: 'stale-ci-rerun',
+      timeoutRetry: expect.objectContaining({ cap: 2 }),
+    })]);
+  });
+
   it.each(['once-per-head', 'off'])('dispatches exactly one capped recovery rerun without a heal when staleCiRerun is %s', setting => {
     const out = plan({ mainGreenNow: undefined, owedCiRerunRetry: { ...evidence, jobs: [...evidence.jobs, ...evidence.jobs] } }, setting);
     expect(out.dispatch).toEqual([expect.objectContaining({
