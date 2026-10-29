@@ -112,6 +112,12 @@ describe('lane acquire smoke after lane-hold reset refusal', () => {
     expect(row.ok).toBe(false);
   });
 
+  it('a lane-hold refusal with appended failure text is a real failure', async () => {
+    const odd = Object.assign(new Error('acquire exited 1'), { stderr: `${refusal}; npm ci failed` });
+    const runChild = vi.fn().mockRejectedValueOnce(failure('message')).mockRejectedValueOnce(odd);
+    expect((await check.run(context(runChild))).ok).toBe(false);
+  });
+
   it('a retry that exited on a signal is a real failure even if the same line mentions lane-hold', async () => {
     const sig = new Error(`acquire exited SIGSEGV: ${refusal}`);
     const runChild = vi.fn().mockRejectedValueOnce(failure('message')).mockRejectedValueOnce(sig);

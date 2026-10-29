@@ -376,8 +376,12 @@ function isBenignLaneHoldLine(line) {
   const l = String(line);
   if (!/provision|fatal|error|failed|refused|✗|exited|SIG[A-Z]+|timed out|crash|killed|limit|ENOENT|EACCES/i.test(l)) return true;
   if (/fatal:|SIG[A-Z]+|crash|timed out|killed|ENOENT|EACCES|error:|limit/i.test(l)) return false;
-  if (/lane-\d+: reset REFUSED — lane-hold: /.test(l)) return true;
-  if (/claimed but failed to provision \(lane-\d+ is held — lane-hold: [^)]*; not reset \(pick another lane\)\)/.test(l)) return true;
+  // The reason is the lane-hold verdict's own prose: plain words only, ending the line (or its JSON string), and never
+  // failure vocabulary. Anything appended to it (`; npm ci failed`) is not a lane-hold refusal.
+  const reason = "[A-Za-z0-9 ,'-]{1,160}";
+  const notFailure = !/fail|error|exit|crash|npm|git |fatal/i.test(l.replace('claimed but failed to provision', ''));
+  if (notFailure && new RegExp(`lane-\\d+: reset REFUSED — lane-hold: ${reason}(?:["}\\\\]|$)`).test(l)) return true;
+  if (notFailure && new RegExp(`claimed but failed to provision \\(lane-\\d+ is held — lane-hold: ${reason}; not reset \\(pick another lane\\)\\)(?: — releasing it and trying another candidate)?\\s*$`).test(l)) return true;
   if (/^\s*✗ no (?:free )?lane\b/.test(l) || /^\s*no (?:free )?lane within\b/.test(l)) return true;
   if (/^\s*acquire exited \d+\s*$/.test(l) || /^\s*Command failed: node scripts\/lane-pool\.mjs acquire\b[^\n]*$/.test(l)) return true;
   return false;
