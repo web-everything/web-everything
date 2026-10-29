@@ -97,6 +97,34 @@ describe('classifyCheck exhaustive independent outcome grid', () => {
 });
 
 describe('latestAttempts', () => {
+  it('compares large run_attempt integers exactly before considering id in either order', () => {
+    const older = settled('ci', 'success', { run_attempt: '9007199254740992', id: 999 });
+    const newer = settled('ci', 'failure', { run_attempt: '9007199254740993', id: 1 });
+    for (const runs of [[older, newer], [newer, older]]) {
+      expect(latestAttempts(runs)).toEqual([newer]);
+    }
+  });
+
+  it('compares canonical string and number ranks equally and retains the first exact tie', () => {
+    const first = settled('ci', 'failure', { run_attempt: 2, id: 9007199254740992 });
+    const second = settled('ci', 'success', { run_attempt: '2', id: '9007199254740992' });
+    expect(latestAttempts([first, second])).toEqual([first]);
+    expect(latestAttempts([second, first])).toEqual([second]);
+  });
+
+  it.each([
+    undefined, null, '', 'garbage', '01', ' 2', '2 ', '2\n', '+2', '-2',
+    '2.5', '2.0', '2e3', '0x10', 'Infinity', 'NaN', -2, 2.5, Infinity, NaN,
+    true, {}, [],
+  ])('treats noncanonical or missing ranking evidence %j as zero for both fields', (value) => {
+    for (const field of ['run_attempt', 'id']) {
+      const invalid = settled('ci', 'success', { [field]: value });
+      const zero = settled('ci', 'failure', { [field]: '0' });
+      expect(latestAttempts([zero, invalid])).toEqual([zero]);
+      expect(latestAttempts([invalid, zero])).toEqual([invalid]);
+    }
+  });
+
   it('selects the greatest numeric run_attempt, then numeric id, per name in either input order', () => {
     const winner = settled('ci', 'failure', { run_attempt: '10', id: '10' });
     const smoke = settled('smoke', 'success', { run_attempt: 1, id: 1 });
@@ -141,6 +169,16 @@ describe('latestAttempts', () => {
 });
 
 describe('named check-state regressions', () => {
+  it('large adjacent ids cannot hide a newer failure in either row order', () => {
+    const older = settled('ci', 'success', { run_attempt: 1, id: '9007199254740992' });
+    const newer = settled('ci', 'failure', { run_attempt: 1, id: '9007199254740993' });
+    for (const runs of [[older, newer], [newer, older]]) {
+      const result = summarize(runs, { requiredNames: ['ci'] });
+      expect(result.redSet).toEqual(new Set(['ci']));
+      expect(result.allRequiredGreen).toBe(false);
+    }
+  });
+
   it('STALE is not omitted from the failed set', () => {
     const check = settled('ci', 'STALE');
     expect(classifyCheck(check)).toBe('pending');

@@ -44,15 +44,16 @@ export function classifyCheck(check = {}) {
   return check.required === false && state !== 'green' ? 'ignore' : state;
 }
 
-// Missing or nonnumeric ranking evidence has no priority; never consult dates.
+// Only canonical non-negative integers rank; missing/garbage evidence is zero.
+// Keep string IDs exact above Number.MAX_SAFE_INTEGER; never consult dates.
 const numeric = (value) => {
-  if (typeof value !== 'number' && typeof value !== 'string') return 0;
-  const number = Number(value);
-  return Number.isFinite(number) ? number : 0;
+  if (typeof value !== 'number' && typeof value !== 'string') return 0n;
+  const integer = String(value);
+  return /^(0|[1-9][0-9]*)$/.test(integer) ? BigInt(integer) : 0n;
 };
 
 /**
- * Select the greatest (run_attempt, id) numeric pair per case-insensitive name.
+ * Select the greatest (run_attempt, id) exact integer pair per case-insensitive name.
  * Exact ties retain the first row. Inputs are never mutated.
  * @param {object[]} checks Check attempts.
  * @returns {object[]} Original winning rows, in first-seen name order.
