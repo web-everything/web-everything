@@ -15,9 +15,7 @@ import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
 const TIMEOUT_SCALE = 3; // Allow extra time for CLI subprocesses on loaded shards.
 const NOW = Date.now();
-const iso = (minAgo, base = NOW) => new Date(base - minAgo * 60_000).toISOString();
-// Exercise real re-reads without production sleeps: several 20 s waits can exceed the child timeout.
-const retryTimingEnv = { WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC: '0' };
+const iso = (minAgo) => new Date(NOW - minAgo * 60_000).toISOString();
 
 const fakeGh = `#!/usr/bin/env node
 const fs = require('node:fs');
@@ -131,10 +129,12 @@ function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]],
     const r = spawnSync(process.execPath, ['--import', preload, script, approvedHeadPlan?.repo ? `--repos=${approvedHeadPlan.repo}` : '--this-repo', '--label=ready-to-merge',
       '--no-reconcile-labels', '--no-drain-lease', '--no-red-main-freeze', ...(approvedHeadPlan ? ['--dry-run'] : ['--json'])], {
       cwd, encoding: 'utf8', timeout: 30_000 * TIMEOUT_SCALE,
-      env: { ...process.env, ...daemonAppEnv(dir), ...retryTimingEnv, WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir,
+      env: { ...process.env, ...daemonAppEnv(dir), WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir,
         // hook OFF = no settings file at all: the built-in default (a test run never reads the live file)
         ...(hookOn ? { WE_MERGE_QUEUE_SETTINGS_FILE: settings } : {}), ...(mainFixPr ? { WE_MERGE_QUEUE_MAIN_FIX_FILE: mainFixFile } : {}),
         WE_COORDINATION_ROOT: coord,
+        // Exercise real retries without spending the production 20-second wait per UNKNOWN read.
+        WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC: '0',
         ...(approvedHeadPlan ? { MQ_APPROVED_HEAD: '1', WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'on', WE_DRAIN_MERGE_STRATEGY: approvedHeadPlan.strategy } : {}), ...extraEnv },
     });
     expect(r.error, r.stderr).toBeUndefined();
@@ -339,8 +339,7 @@ function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, e
     const pr = (number, headRefName, ages, extra = {}) => ({
       number, title: `couple ${number}`, body: 'A real summary.', headRefName, baseRefName: 'main', headRefOid: sha(number),
       mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
-      // Ages count from this fixture, not module load: a slow file must not age a 25 min pass past the 30 min bar.
-      labels: [{ name: 'ready-to-merge' }], comments: [], passAtSeq: ages.map((age) => iso(age, Date.now())),
+      labels: [{ name: 'ready-to-merge' }], comments: [], passAtSeq: ages.map(iso),
       commits: [{ oid: sha(number), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
       files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0, changeType: 'ADDED' }], ...extra,
     });
@@ -357,8 +356,9 @@ function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, e
     const r = spawnSync(process.execPath, ['--import', preload, script, `--repos=${LOCAL},${FUI}${secondImplPassAges ? `,${PA}` : ''}`, '--label=ready-to-merge',
       '--no-drain-lease', '--no-red-main-freeze', '--json'], { // reconcile ON: a couple's gate needs the complete open-PR context
       cwd: dir, encoding: 'utf8', timeout: COUPLE_RUN_TIMEOUT_MS,
-      // Both halves can need a retry; use the shared fixture timing instead of the production 20 s default.
-      env: { ...process.env, ...daemonAppEnv(dir), ...retryTimingEnv, WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir, WE_MERGE_QUEUE_SETTINGS_FILE: settings, WE_COORDINATION_ROOT: coord, ...extraEnv },
+      env: { ...process.env, ...daemonAppEnv(dir), WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir, WE_MERGE_QUEUE_SETTINGS_FILE: settings, WE_COORDINATION_ROOT: coord,
+        // Carrier pre-check and impl revalidation each retry; keep their real reads, omit production waits.
+        WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC: '0', ...extraEnv },
     });
     expect(r.error, r.stderr).toBeUndefined();
     expect(r.status, r.stderr).toBe(0);
