@@ -19,7 +19,7 @@ const alive = pid => {
 export default {
   id: 'pass-exit-leaves-process-group',
   title: 'pass child exit released exclusion while a subprocess survived in its process group',
-  card: '#5755 / PR #6020, red-team send-back x1b8hlo',
+  card: '#5755 / PR #6020, red-team send-back 5726',
   fixedBy: { sha: 'lane/5755-pass-timed-job', where: 'lane/5755-pass-timed-job', paths: ['skills-src/conveyor/pass-daemon.mjs'] },
   fixPresent(root) {
     // Independently probe the refusal path instead of trusting a source marker or

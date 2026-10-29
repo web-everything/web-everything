@@ -113,9 +113,60 @@ describe('checkBornAsCollision', () => {
     const exec = fakeExec({ main: `origin/main:${raised}\0bornAs: xgcpm6z`, mainTexts: { [raised]: '---\nbornAs: xgcpm6z\nbornAs: xgcpm6z\n---\n' } });
     expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ ok: true });
   });
-  it('still catches a duplicate in an added card whose frontmatter is not valid YAML', () => {
-    const exec = fakeExec({ texts: { [newCard]: '---\nbornAs: xaaaaaa\nbornAs: xgcpm6z\n---\n' } });
+  // Self-review break on 653b7a4c7: an added card's fallback lines (no or invalid frontmatter) reached a labelling
+  // collision, though duplicateBornAs reads no bornAs from such a card. They are still searched, but a hit holds.
+  it.each([['frontmatter that is not valid YAML', '---\nbornAs: xaaaaaa\nbornAs: xgcpm6z\n---\n'],
+    ['no frontmatter and a body example', '# Title\n\n```yaml\nbornAs: xgcpm6z\n```\n'], ['a blank first line', '\n---\nbornAs: xgcpm6z\n---\n']])(
+    'holds an added card whose identity comes only from %s, never as a labelling collision', (_, text) => {
+      const exec = fakeExec({ texts: { [newCard]: text } });
+      expect(checkBornAsCollision({ exec, headSha: sha }))
+        .toEqual({ error: `added card ${newCard} carries xgcpm6z outside readable frontmatter, which main card ${mainCard} holds` });
+    });
+  it('still reports a collision by file name for a hash-named added card without frontmatter', () => {
+    const named = 'backlog/xgcpm6z-new.md';
+    const exec = fakeExec({ added: [named], texts: { [named]: '# Title\nbornAs: xgcpm6z\n' } });
+    expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ collision: { hash: 'xgcpm6z', path: named, mainCard } });
+  });
+  // gray-matter reads a named opener with that language's engine; the guard never runs one, so such a card holds.
+  it.each([['---json', '---json\n{"bornAs":"xgcpm6z"}\n---\n'], ['---yaml', '---yaml\nbornAs:\n  xgcpm6z\n---\n'], ['---js', '---js\n({ bornAs: "xgcpm6z" })\n---\n']])(
+    'holds an added card opened with %s as unreadable, never admitting it', (_, text) => {
+      const exec = fakeExec({ texts: { [newCard]: text } });
+      expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ error: `added card ${newCard} has no readable frontmatter` });
+    });
+  it('holds a main card opened with a named language on any hit, never admitting the PR', () => {
+    const exec = fakeExec({ main: `origin/main:${mainCard}\0{"bornAs":"xgcpm6z"}`, mainTexts: { [mainCard]: '---json\n{"bornAs":"xgcpm6z"}\n---\n' } });
+    expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ error: `main card ${mainCard} has no readable frontmatter` });
+  });
+  it('closes frontmatter where gray-matter does: at the first later line starting `---`', () => {
+    // A `--- note` line ends the block, so the second `bornAs` below it is body text, not a duplicate YAML key.
+    const exec = fakeExec({ mainTexts: { [mainCard]: '---\nbornAs: xgcpm6z\n--- note\nbornAs: xaaaaaa\n---\n' } });
+    expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ collision: { hash: 'xgcpm6z', path: newCard, mainCard } });
+  });
+  it('reads an unclosed frontmatter block to the end of the file, as gray-matter does', () => {
+    const exec = fakeExec({ mainTexts: { [mainCard]: '---\nkind: story\nbornAs: xgcpm6z\n' } });
     expect(checkBornAsCollision({ exec, headSha: sha }).collision?.hash).toBe('xgcpm6z');
+  });
+  it('never reads a frontmatter `id` as an identity, since the backlog loader replaces it with the file name', () => {
+    const exec = fakeExec({ mainTexts: { [mainCard]: '---\nid: xgcpm6z\nbornAs: xzzzzzz\n---\n' } });
+    expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ ok: true });
+    const added = fakeExec({ texts: { [newCard]: '---\nid: xgcpm6z\n---\n' } });
+    expect(checkBornAsCollision({ exec: added, headSha: sha })).toEqual({ ok: true });
+    expect(added.mock.calls.some(([, a]) => a[0] === 'grep')).toBe(false);
+  });
+  it('treats a file below a backlog subdirectory as no card, even with readable frontmatter', () => {
+    const raised = 'backlog/raised-by/7233.md';
+    const exec = fakeExec({ main: `origin/main:${raised}\0bornAs: xgcpm6z`, mainTexts: { [raised]: cardText('xgcpm6z') } });
+    expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ ok: true });
+    const added = fakeExec({ added: ['backlog/raised-by/7274.md'], texts: { 'backlog/raised-by/7274.md': cardText('xgcpm6z') } });
+    expect(checkBornAsCollision({ exec: added, headSha: sha })).toEqual({ ok: true });
+  });
+  it('holds, without reading any main card, when more main cards mention an added hash than the read bound', async () => {
+    const { MAX_MAIN_READS } = await import('../drain-poison-guard.mjs');
+    const main = Array.from({ length: MAX_MAIN_READS + 1 }, (_, i) => `origin/main:backlog/${i}-c.md\0see xgcpm6z`).join('\n');
+    const exec = fakeExec({ main });
+    expect(checkBornAsCollision({ exec, headSha: sha }))
+      .toEqual({ error: `${MAX_MAIN_READS + 1} main cards mention an added hash, over the ${MAX_MAIN_READS}-card read bound` });
+    expect(exec.mock.calls.filter(([, a]) => a[0] === 'show' && a[1].startsWith('origin/'))).toEqual([]);
   });
   it('searches main for the added hashes as plain text, not for an identity key spelling', () => {
     const exec = fakeExec();
@@ -123,6 +174,26 @@ describe('checkBornAsCollision', () => {
     const grep = exec.mock.calls.find(([, args]) => args[0] === 'grep')[1];
     expect(grep.slice(0, 6)).toEqual(['grep', '-z', '--text', '-F', '-e', 'xgcpm6z']);
   });
+  it('treats a backslash in a card name as no card, since the backlog loader skips such a name', () => {
+    const odd = 'backlog/7233-a\\b.md';
+    const exec = fakeExec({ main: `origin/main:${odd}\0bornAs: xgcpm6z`, mainTexts: { [odd]: cardText('xgcpm6z') } });
+    expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ ok: true });
+  });
+  it('holds when a main path holding a newline splits a grep output line', () => {
+    const exec = fakeExec({ main: `origin/main:backlog/7233-a\nb.md\0bornAs: xgcpm6z` });
+    expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ error: 'main grep output names a path it cannot delimit' });
+  });
+  it('reads no main card whose hit only holds the hash inside a longer word', () => {
+    const exec = fakeExec({ main: `origin/main:${mainCard}\0see axgcpm6z and xgcpm6z_b` });
+    expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ ok: true });
+    expect(exec.mock.calls.filter(([, a]) => a[0] === 'show' && a[1].startsWith('origin/'))).toEqual([]);
+  });
+  // Self-review break on c86b3ae42: Git's `-w` missed a hash right after a YAML escape, which YAML decodes and trims.
+  it.each([['\\t', '"\\txgcpm6z"'], ['\\x09', '"\\x09xgcpm6z"'], ['\\u0009', '"\\u0009xgcpm6z"']])(
+    'reports a main identity written after a %s escape, which duplicateBornAs reads as the bare hash', (_, value) => {
+      const exec = fakeExec({ main: `origin/main:${mainCard}\0bornAs: ${value}`, mainTexts: { [mainCard]: `---\nbornAs: ${value}\n---\n` } });
+      expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ collision: { hash: 'xgcpm6z', path: newCard, mainCard } });
+    });
   it('treats a frontmatter-less file below a backlog subdirectory as no card', () => {
     const raised = 'backlog/raised-by/7233.md';
     const exec = fakeExec({ main: `origin/main:${raised}\0bornAs: xgcpm6z`, mainTexts: { [raised]: '- Also raised by:\nbornAs: xgcpm6z\n' } });
@@ -132,7 +203,7 @@ describe('checkBornAsCollision', () => {
     const exec = fakeExec({ texts: { [newCard]: '---\nkind: story\n---\nExample:\nbornAs: xgcpm6z\n' } });
     expect(checkBornAsCollision({ exec, headSha: sha })).toEqual({ ok: true });
   });
-  it.each([['a blank first line', '\n---\nbornAs: xgcpm6z\n---\n'], ['an unclosed fence', '---\nbornAs: xgcpm6z\n'], ['a `...` close', '---\nbornAs: xgcpm6z\n...\n']])(
+  it.each([['an unclosed fence', '---\nbornAs: xgcpm6z\n'], ['a `...` close', '---\nbornAs: xgcpm6z\n...\n']])(
     'still catches a duplicate in an added card with %s', (_, text) => {
       const exec = fakeExec({ texts: { [newCard]: text } });
       expect(checkBornAsCollision({ exec, headSha: sha }).collision?.hash).toBe('xgcpm6z');

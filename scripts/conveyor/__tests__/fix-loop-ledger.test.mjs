@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { ledgerInfraRows, fixLoopConfig, fixLoopState, fixLoopBreaches, readFixLoopRows, appendFixLoopRow,
-  fixLoopLedgerPath, fixDispatchKillFile, fixDispatchKilled, hasFixHoldLabel, FIX_HOLD_LABEL, FIX_RUN_INFRA_PATTERNS, classifyFixRunOutcome, infraFailureCount, fixLoopDisposition, fixLoopRedMainLapse, fixLoopSessionRows } from '../fix-loop-ledger.mjs';
+  fixLoopLedgerPath, fixDispatchKillFile, fixDispatchKilled, hasFixHoldLabel, FIX_HOLD_LABEL, FIX_RUN_INFRA_PATTERNS, FIX_RUN_OUTCOME, classifyFixRunOutcome, infraFailureCount, fixLoopDisposition, fixLoopRedMainLapse, fixLoopSessionRows } from '../fix-loop-ledger.mjs';
 const now = Date.parse('2026-10-05T12:00:00Z'), head = 'a'.repeat(40);
 const row = (extra = {}) => ({ v: 1, at: new Date(now).toISOString(), repo: 'we', pr: 3990, head, kind: 'ci-heal', ...extra });
 const hermeticConfig = env => fixLoopConfig(env, { readPlatform: () => ({}), readRepo: () => ({}), readMainRuns: () => [] });
@@ -92,11 +92,30 @@ it('stub sessions from the daemon smoke never count as repair attempts (#4194 mi
 });
 
 // PRs #4992/#4993/#4965, 2026-10-12: launcher refusals are not repair sessions.
+it.each(Object.values(FIX_RUN_OUTCOME))('parses the fix-run %s terminal contract', outcome => {
+  for (const claim of ['released', 'not held / already released', 'release failed']) {
+    expect(classifyFixRunOutcome(`fix-run: PR #6030 ${outcome} (lease-lost: .git lease missing); claim ${claim}`))
+      .toEqual({ pr: 6030, outcome, reason: 'lease-lost: .git lease missing', infra: outcome === 'failed' });
+  }
+});
+
+it('keeps earlier infra failures aligned when the same session ends with lease loss', () => {
+  const lines = [
+    'fix-run: PR #6030 failed (EPERM); claim released',
+    'fix-run: PR #6030 lease-lost (lease-lost: .git lease missing); claim released',
+  ];
+  expect(lines.map(classifyFixRunOutcome).filter(Boolean)).toMatchObject([
+    { outcome: 'failed', infra: true }, { outcome: 'lease-lost', infra: false },
+  ]);
+  expect(infraFailureCount({ logText: lines.join('\n'), pr: 6030, sessions: 1 })).toBe(0);
+});
+
 it('classifies terminal outcomes without treating genuine runs as infrastructure', () => {
   for (const [line, pr, outcome, infra] of [
     ['fix-run: PR #4992 failed (no-finding: the PR has no changes-requested or advisory comment to apply); claim released', 4992, 'failed', true],
     ['fix-run: PR #4965 failed (no-finding: ...); claim not held / already released', 4965, 'failed', true],
     ['fix-run: PR #4965 no-change (agent committed nothing; ...); claim released', 4965, 'no-change', false],
+    ['fix-run: PR #4965 no-change-unproven (missing 1001#2); claim released', 4965, 'no-change-unproven', false],
     ['fix-run: PR #4965 pushed (pushed abc123def); claim released', 4965, 'pushed', false],
   ]) expect(classifyFixRunOutcome(line)).toMatchObject({ pr, outcome, infra });
   expect(classifyFixRunOutcome('unrelated')).toBeNull();
@@ -157,10 +176,23 @@ it('classifies every infrastructure pattern and never discounts pushed or no-cha
   for (const reason of ['no-finding: missing', 'no-ci-failure: missing', 'fix-run: refusal', 'error: broken', 'missing required flag',
     'has no fix launcher', 'launch did not complete', 'lane-pool', 'Operation not permitted', 'EPERM',
     'EACCES', 'read-only file system', 'index.lock', '.git permission', 'sandbox', 'could not commit', 'could not push', 'could not stage']) {
-    for (const outcome of ['failed', 'no-change', 'pushed']) {
+    for (const outcome of ['failed', 'no-change', 'no-change-unproven', 'pushed']) {
       expect(classifyFixRunOutcome(`fix-run: PR #1 ${outcome} (${reason}); claim released`).infra).toBe(outcome === 'failed');
     }
   }
+});
+it('roundtrips no-change-unproven outcome rows and counts them like no-change toward escalation', () => {
+  const env = { WE_FIX_LOOP_LEDGER: join(temp(), 'ledger.jsonl') };
+  const rows = Array.from({ length: 3 }, (_, i) => [row({ kind: 'fix', session: `s${i}` }),
+    row({ kind: 'outcome', session: `s${i}`, outcome: 'no-change-unproven', infra: false, reason: 'missing 1001#2' })]).flat();
+  for (const entry of rows) appendFixLoopRow(entry, { env, now });
+  expect(readFixLoopRows({ env })).toEqual(rows);
+  const ordinary = rows.map(entry => entry.kind === 'outcome' ? { ...entry, outcome: 'no-change' } : entry);
+  expect(state(rows)).toEqual(state(ordinary));
+  expect(state(rows)).toMatchObject({ count: 3, infraFailures: 0, held: true });
+  const decide = entries => fixLoopDisposition({ rows: entries, repo: 'we', pr: 3990, head, now, config, build: 'b'.repeat(40) });
+  expect(decide(rows)).toEqual(decide(ordinary));
+  expect(decide(rows).action).toBe('rearm');
 });
 it('uses exact infra positions for build triggers and parking, and retries an unlaunched re-arm after its clock', () => {
   const build = 'b'.repeat(40), oldAt = new Date(now - 121 * 60000).toISOString();
