@@ -4,7 +4,8 @@ import { approvalValid, approvalBindsHold, acceptanceCovers } from './verdict.mj
 export const HOLD_LABELS = Object.freeze(['review:human', 'review:changes', 'review:pending', 'advisory:ruling-needed']);
 /**
  * A hand-added hold label holds until a later VALID approval (the same predicate the verdict-based human hold
- * uses, so an expired delegation lifts nothing) or a later clearing verdict that covers the current head.
+ * uses, so an expired delegation lifts nothing) or a later independent clearing verdict that covers the current
+ * head. A clear-human ceremony's audit verdict never substitutes for its approval's binding checks.
  */
 export default {
   id: 'label-input',

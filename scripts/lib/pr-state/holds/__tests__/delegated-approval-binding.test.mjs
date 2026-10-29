@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { derivePrState } from '../../../pr-state.mjs';
 import { buildVerdictRecord, buildLedgerEvent, ledgerEventId, VERDICTS } from '../../../verdict-ledger.mjs';
 import { approvalBindsHold } from '../verdict.mjs';
+import { planLabelInputRows } from '../../../../conveyor/pr-label-mirror.mjs';
+import { HOLD_LABELS } from '../label-input.mjs';
 
 const repo = 'web-everything/web-everything', PR = 4017;
 const HEAD = 'b'.repeat(40), OLD_HEAD = 'a'.repeat(40);
@@ -16,6 +18,121 @@ const codes = events => derivePrState(events, facts()).holds.map(h => h.code);
 const label = m => ev('label-input', m, { label: 'review:human', sender: 'someone', change: 'added' });
 const human = () => buildVerdictRecord({ repo, pr: PR, verdict: VERDICTS.HUMAN,
   at: at(1), source: 'test', headSha: HEAD, reason: 'human review required' });
+
+describe('companion clear-human verdict binding', () => {
+  const clear = () => buildVerdictRecord({ repo, pr: PR, verdict: VERDICTS.CLEAR_HUMAN,
+    at: at(4), source: 'review-set-label', headSha: HEAD });
+  const approve = (basis, overrides = {}) => ev('approval', 5, {
+    approval: 'clear-human', delegation, headSha: HEAD, basis, ...overrides,
+  });
+
+  it('keeps an unnamed hand-added hold when the companion verdict is present', () => {
+    const verdict = human(), hold = label(2);
+    const approval = approve([ledgerEventId(verdict)]);
+    for (const events of [[verdict, hold, approval], [verdict, hold, clear(), approval]]) {
+      const state = derivePrState(events, facts());
+      expect(state).toMatchObject({ lifecycleState: 'NEEDS-OPERATOR', clears: false });
+      expect(state.holds.map(h => h.code)).toContain('label-input:review:human');
+    }
+  });
+
+  it.each([
+    ['different head', { headSha: OLD_HEAD }],
+    ['expired delegation', { delegation: { ...delegation, expires: at(299) } }],
+    ['missing head', { headSha: undefined }],
+    ['missing basis', { basis: undefined }],
+  ])('the companion verdict cannot rescue an approval with %s', (_name, overrides) => {
+    const verdict = human(), hold = label(2);
+    const state = derivePrState([verdict, hold, clear(),
+      approve([ledgerEventId(verdict), ledgerEventId(hold)], overrides)], facts());
+    expect(state).toMatchObject({ lifecycleState: 'NEEDS-OPERATOR', clears: false });
+    expect(state.holds.map(h => h.code)).toContain('verdict:human');
+    expect(state.holds.map(h => h.code)).toContain('label-input:review:human');
+  });
+
+  it('fails closed between the verdict append and the approval append', () => {
+    const verdict = human(), hold = label(2);
+    const state = derivePrState([verdict, hold, clear()], facts());
+    expect(state).toMatchObject({ lifecycleState: 'NEEDS-OPERATOR', clears: false });
+    expect(state.holds.map(h => h.code)).toContain('verdict:human');
+    expect(state.holds.map(h => h.code)).toContain('label-input:review:human');
+  });
+
+  it('clears when a valid approval explicitly names both holds', () => {
+    const verdict = human(), hold = label(2);
+    expect(derivePrState([verdict, hold, clear(), approve([ledgerEventId(verdict), ledgerEventId(hold)])], facts()))
+      .toMatchObject({ lifecycleState: 'READY-TO-MERGE', clears: true, holds: [] });
+  });
+
+  it('preserves an operator approval without binding fields', () => {
+    expect(derivePrState([human(), label(2), clear(),
+      ev('approval', 5, { approval: 'clear-human', delegation: null })], facts()))
+      .toMatchObject({ lifecycleState: 'READY-TO-MERGE', clears: true, holds: [] });
+  });
+
+  it.each([null, delegation])('uses the companion head witness after a valid approval (delegation: %j)', delegated => {
+    const verdict = buildVerdictRecord({ repo, pr: PR, verdict: VERDICTS.HUMAN,
+      at: at(1), source: 'test', headSha: OLD_HEAD });
+    expect(derivePrState([verdict, clear(), approve([ledgerEventId(verdict)], { delegation: delegated })], facts()))
+      .toMatchObject({ lifecycleState: 'READY-TO-MERGE', clears: true, holds: [] });
+  });
+
+  it('does not let the companion verdict clear a re-added mirrored hold outside basis', () => {
+    const verdict = human(), first = label(2), second = { ...label(3), clearanceBaseline: [] };
+    expect(codes([verdict, first, clear(), approve([ledgerEventId(verdict), ledgerEventId(first)]), second]))
+      .toContain('label-input:review:human');
+  });
+
+  it.each(HOLD_LABELS)('requires approval binding for %s even without a human verdict', name => {
+    const hold = ev('label-input', 2, { label: name, sender: 'operator', change: 'added' });
+    expect(codes([hold, clear(), approve([ledgerEventId(label(1))])])).toContain(`label-input:${name}`);
+    expect(codes([hold, clear(), approve([ledgerEventId(hold)])])).not.toContain(`label-input:${name}`);
+  });
+
+  it('retains the original human hold id across explicit verdict rows, observations and retries', () => {
+    const verdict = { type: 'verdict', ...human() };
+    const observation = buildVerdictRecord({ repo, pr: PR, verdict: VERDICTS.OBSERVED,
+      at: at(6), source: 'test', headSha: HEAD });
+    const retry = { ...clear(), at: at(7) };
+    expect(codes([verdict, clear(), observation, retry, approve([ledgerEventId(label(1))])]))
+      .toContain('verdict:human');
+    expect(derivePrState([verdict, clear(), observation, retry, approve([ledgerEventId(verdict)])], facts()))
+      .toMatchObject({ lifecycleState: 'READY-TO-MERGE', clears: true, holds: [] });
+  });
+
+  it('keeps a newly added human verdict outside an earlier approval basis', () => {
+    const first = human(), second = { ...human(), at: at(6) };
+    expect(codes([first, clear(), approve([ledgerEventId(first)]), second, { ...clear(), at: at(7) }]))
+      .toContain('verdict:human');
+  });
+
+  it('an ordinary later acceptance still supersedes the human verdict', () => {
+    const accepted = buildVerdictRecord({ repo, pr: PR, verdict: VERDICTS.ACCEPTED,
+      at: at(8), source: 'test', headSha: HEAD });
+    expect(derivePrState([human(), clear(), accepted], facts()))
+      .toMatchObject({ lifecycleState: 'READY-TO-MERGE', clears: true, holds: [] });
+  });
+
+  it('fails closed for an unknown clock even with both holds named', () => {
+    const verdict = human(), hold = label(2);
+    expect(derivePrState([verdict, hold, clear(), approve([ledgerEventId(verdict), ledgerEventId(hold)])],
+      { ...facts(), now: undefined })).toMatchObject({ lifecycleState: 'NEEDS-OPERATOR', clears: false });
+  });
+
+  it('the mirror records a hold despite the delegated clearance companion verdict', () => {
+    const verdict = human(), approval = approve([ledgerEventId(verdict)]);
+    const options = { repo, pr: PR, selfLogin: 'mirror', headSha: HEAD, now: at(300),
+      liveLabels: ['review:human'], items: [{ label: 'review:human', change: 'added',
+        actor: 'operator', createdAt: at(2), id: 'hand-addition' }] };
+    for (const events of [[verdict, clear()], [verdict, clear(), approval]]) {
+      const rows = planLabelInputRows({ ...options, events });
+      expect(rows).toHaveLength(1);
+      expect(codes([...events, ...rows])).toContain('label-input:review:human');
+    }
+    expect(planLabelInputRows({ ...options, events: [clear(),
+      ev('approval', 5, { approval: 'clear-human', delegation: null })] })).toEqual([]);
+  });
+});
 
 describe.each(['clear-human', 'judge'])('%s approval binding', approval => {
   const approve = (o = {}) => ev('approval', 5, { approval, delegation, ...o });
