@@ -26,6 +26,37 @@ function fixture() {
 }
 
 describe('clearing authority evidence fence', () => {
+  it('carries ghost authors and a null review commit through snapshot admission', async () => {
+    const { snapshot: evidence, options } = fixture();
+    const connection = nodes => ({ nodes, pageInfo: { hasNextPage: false } });
+    const snapshot = await readSnapshot({
+      repo: 'example/project', pr: 42, expectedHead: HEAD, now: NOW,
+      io: {
+        graphql: () => ({ repository: { pullRequest: {
+          headRefOid: HEAD, updatedAt: evidence.labelsVersion,
+          labels: connection(evidence.labels.map(name => ({ name }))),
+          comments: connection(evidence.comments.map(c => ({ ...c, author: null }))),
+          reviews: connection([{ id: 'R1', author: null, state: 'APPROVED', commit: null }]),
+        } } }),
+        netDiffAtHead: () => evidence.netDiff,
+        openReferrals: ({ comments }) => {
+          expect(comments[0].author).toBeNull();
+          return evidence.openReferrals;
+        },
+        redTeam: () => evidence.redTeam,
+        standingRulings: () => evidence.standingRulings,
+        holdEventIds: () => evidence.holdEventIds,
+        humanOnlyHold: () => evidence.humanOnlyHold,
+      },
+    });
+    expect(snapshot.reviews[0]).toEqual({ id: 'R1', author: null, state: 'APPROVED', commit: null });
+    expect(admitClearHuman(snapshot, options)).toEqual({
+      admit: true, reasons: [], basis: ['hold:1'],
+      fence: { headSha: HEAD, labelsDigest: labelsDigest(snapshot.labels),
+        commentVersion: commentVersion(snapshot.comments) },
+    });
+  });
+
   it('readSnapshot deeply freezes authorization evidence', async () => {
     const { snapshot: evidence, options } = fixture();
     const connection = nodes => ({ nodes, pageInfo: { hasNextPage: false } });

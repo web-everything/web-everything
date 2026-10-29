@@ -105,6 +105,15 @@ describe('admitClearHuman', () => {
       expect(admitClearHuman(f.snapshot, f.options).reasons).toEqual(['delegation-expired']);
     });
 
+  it.each([undefined, null, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, String(NOW), true])(
+    'rejects delegation.expiresAt unless it is a non-negative safe integer: %j', expiresAt => {
+      const f = fixture();
+      f.options.delegation.expiresAt = expiresAt;
+      expect(() => admitClearHuman(f.snapshot, f.options)).toThrow(/delegation\.expiresAt/);
+      expect(f.calls.decide).toEqual([]);
+      expect(f.calls.score).toEqual([]);
+    });
+
   it('admits one millisecond beyond the commit budget and reads expiry once', () => {
     const f = fixture();
     let reads = 0;

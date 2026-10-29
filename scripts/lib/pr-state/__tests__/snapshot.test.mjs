@@ -75,6 +75,64 @@ describe('readSnapshot', () => {
     expect(snapshot.netDiff.headSha).toBe(snapshot.head);
   });
 
+  it('rejects a head mismatch before reading derived evidence or the net diff', async () => {
+    const f = fixture();
+    f.pullRequest.headRefOid = 'b'.repeat(40);
+    await expect(readSnapshot(f.input)).rejects.toThrow(/headRefOid differs from expectedHead/);
+    for (const key of IO_MEMBERS.slice(1)) expect(f.calls[key]).toEqual([]);
+  });
+
+  it('rejects GraphQL data accompanied by errors before reading derived evidence', async () => {
+    const f = fixture();
+    f.io.graphql = () => ({ repository: { pullRequest: f.pullRequest },
+      errors: [{ message: 'Partial evidence' }] });
+    await expect(readSnapshot(f.input)).rejects.toThrow(/GraphQL response errors/);
+    for (const key of IO_MEMBERS.slice(1)) expect(f.calls[key]).toEqual([]);
+  });
+
+  it('rejects a netDiff headSha mismatch instead of overwriting it with the pinned head', async () => {
+    const f = fixture();
+    f.io.netDiffAtHead = () => ({ headSha: 'b'.repeat(40), files: [], diffLines: 0 });
+    await expect(readSnapshot(f.input)).rejects.toThrow(/netDiff head mismatch/);
+  });
+
+  it('tolerates a ghost comment author and preserves null in the snapshot and evidence fence', async () => {
+    const f = fixture();
+    f.pullRequest.comments.nodes[0].author = null;
+    const snapshot = await readSnapshot(f.input);
+    const ghost = snapshot.comments.find(comment => comment.id === 'C2');
+    expect(ghost.author).toBeNull();
+    expect(f.calls.openReferrals).toEqual([[{ comments: snapshot.comments, head: HEAD }]]);
+    expect(commentVersion(snapshot.comments)).not.toBe(commentVersion(
+      snapshot.comments.map(comment => ({ ...comment, author: comment.author ?? 'reviewer' }))));
+  });
+
+  it.each(['author', 'commit'])('tolerates an explicit null review %s', async key => {
+    const f = fixture();
+    f.pullRequest.reviews.nodes[0][key] = null;
+    const snapshot = await readSnapshot(f.input);
+    expect(snapshot.reviews[0][key]).toBeNull();
+    expect(Object.isFrozen(snapshot.reviews[0])).toBe(true);
+  });
+
+  it.each([{}, { login: null }, { login: '' }, { login: 42 }])(
+    'rejects a malformed comment author rather than treating it as a ghost: %j', async author => {
+      const f = fixture();
+      f.pullRequest.comments.nodes[0].author = author;
+      await expect(readSnapshot(f.input)).rejects.toThrow(/comment.author/);
+    });
+
+  it.each([
+    ['author', undefined], ['author', {}], ['author', { login: null }],
+    ['author', { login: '' }], ['author', { login: 42 }],
+    ['commit', undefined], ['commit', {}], ['commit', { oid: null }],
+    ['commit', { oid: 'not-a-sha' }],
+  ])('rejects missing or malformed review %s: %j', async (key, value) => {
+    const f = fixture();
+    f.pullRequest.reviews.nodes[0][key] = value;
+    await expect(readSnapshot(f.input)).rejects.toThrow(new RegExp(`review\\.${key}`));
+  });
+
   it('comment and label input order changes neither snapshot nor digests', async () => {
     const first = fixture();
     const shuffled = fixture();

@@ -21,7 +21,8 @@ function commentsValid(comments) {
   for (const c of comments) {
     requireEvidence(object(c) && text(c.id) && !ids.has(c.id), 'comment.id (unique)');
     ids.add(c.id);
-    requireEvidence(text(c.author), 'comment.author');
+    // Explicit null is a deleted GitHub user; undefined still signals a partial read.
+    requireEvidence(c.author === null || text(c.author), 'comment.author');
     requireEvidence(typeof c.body === 'string', 'comment.body');
     requireEvidence(timestamp(c.createdAt), 'comment.createdAt');
     requireEvidence(c.lastEditedAt === null || timestamp(c.lastEditedAt), 'comment.lastEditedAt');
@@ -33,9 +34,9 @@ function reviewsValid(reviews) {
   for (const r of reviews) {
     requireEvidence(object(r) && text(r.id) && !ids.has(r.id), 'review.id (unique)');
     ids.add(r.id);
-    requireEvidence(text(r.author?.login), 'review.author.login');
+    requireEvidence(r.author === null || text(r.author?.login), 'review.author.login');
     requireEvidence(['PENDING', 'COMMENTED', 'APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(r.state), 'review.state');
-    requireEvidence(sha(r.commit?.oid), 'review.commit.oid');
+    requireEvidence(r.commit === null || sha(r.commit?.oid), 'review.commit.oid');
   }
 }
 export function validateSnapshot(s) {
@@ -110,7 +111,7 @@ export async function readSnapshot({ repo, pr, expectedHead, now, io } = {}) {
   }).sort();
   const comments = connection(p, 'comments').map(c => {
     requireEvidence(object(c), 'comment');
-    return { id: c.id, author: c.author?.login, body: c.body, createdAt: c.createdAt,
+    return { id: c.id, author: c.author === null ? null : c.author?.login, body: c.body, createdAt: c.createdAt,
       lastEditedAt: c.lastEditedAt }; // GraphQL always returns it (null = never edited); absent = partial read
   }).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
   commentsValid(comments);
