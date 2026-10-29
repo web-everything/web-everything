@@ -367,6 +367,10 @@ async function checkLanePoolList(ctx) {
   }
 }
 
+/** lane-pool acquire exits 75 (EX_TEMPFAIL) only when a parked lane-hold refusal was seen and no other failure kind was (the rest of the pool was busy). */
+const LANE_POOL_ENV_ONLY_EXIT = 75;
+const isEnvOnlyAcquireExit = (e) => e?.status === LANE_POOL_ENV_ONLY_EXIT && !e?.signal;
+
 async function checkLaneAcquireRelease(ctx) {
   const { root, budgets, sessionSlug, runChild, env } = ctx;
   let laneNum = null;
@@ -382,12 +386,29 @@ async function checkLaneAcquireRelease(ctx) {
     // killed mid-flight expires by itself.
     // #4139 — see {@link checkLanePoolList}'s own comment just above: `env` must reach every lane-pool child
     // this gate spawns, never just some of them, or an isolated caller's pool override is only PARTLY honored.
-    const out = await runChild('node', [
+    const acquire = () => runChild('node', [
       'scripts/lane-pool.mjs', 'acquire', '--purpose=smoke', `--session=${sessionSlug}`,
       `--wait-ms=${budgets.laneAcquireWaitMs}`, '--ttl-minutes=10', '--json',
     ], {
       cwd: root, timeoutMs: acquireCapMs, env,
     });
+    let out;
+    try {
+      out = await acquire();
+    } catch (e) {
+      if (!isEnvOnlyAcquireExit(e)) throw e;
+      try {
+        out = await acquire();
+      } catch (retryError) {
+        // Structural, not textual: only lane-pool's own environmental-only exit (75) twice in a row is a skip.
+        if (!isEnvOnlyAcquireExit(retryError)) {
+          return { ok: false, detail: `lane-pool acquire --purpose=smoke failed: ${firstLine(retryError)}`,
+            ...childFailureDiagnostics(retryError) };
+        }
+        return { ok: true, skipped: true, skipReason: 'lane-hold-refused',
+          detail: `skipped: acquire found only lane-hold refusals after one retry: ${firstLine(retryError)}` };
+      }
+    }
     const parsed = JSON.parse(out);
     laneNum = Number.isInteger(parsed?.lane) ? parsed.lane : null;
     if (laneNum == null) return { ok: false, detail: 'lane-pool acquire returned no lane number' };

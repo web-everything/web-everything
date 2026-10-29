@@ -466,6 +466,13 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       : { ok: false }),
     // The carry's own resolver is its only source (logged with that source); no timing setting governs it.
     carryAcrossRebaseSetting: () => resolveCarryAcrossRebase({ env, readFile }),
+    carryHumanClearance: ({ pr, repo }) => {
+      const cwd = planReviewDispatch({ pr: 1, repo }).laneRepo;
+      // Parse/exec failures propagate to the arc's normal-review fallback.
+      return JSON.parse(exec(process.execPath, [join(root, 'scripts', 'conveyor', 'human-clearance-carry-cli.mjs'),
+        '--pr', String(pr), '--repo', repo],
+      { cwd, env: laneGitHardeningEnv(env), encoding: 'utf8', timeout: 300_000, maxBuffer: READ_MAX_BUFFER }));
+    },
     readCarryEvidence: ({ pr, repo }) => {
       const view = JSON.parse(execRead('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], { cwd: root, env }));
       const comments = readCompletePrComments(pr, { repo, exec: (f, a, o) => execRead(f, a, { ...o, cwd: root, env }) });
@@ -1005,6 +1012,24 @@ function runReviewArc({
   try {
     const prev = io.readPrevCompletion(slug);
     if (!redTeamOnly) io.report({ session: slug, kind: 'review', pr: String(planned.pr), repo: planned.repo, status: 'started', timeoutMs: loopTimeoutMs });
+    if (!redTeamOnly && typeof io.carryHumanClearance === 'function') {
+      try {
+        const carry = io.carryHumanClearance({ pr: planned.pr, repo: planned.repo });
+        if (carry?.carried) {
+          const { fromSha, toSha: headSha, fingerprint } = carry.carried;
+          io.log(`review-job: human clearance carried ${fromSha}->${headSha} fingerprint ${fingerprint.slice(0, 12)}`);
+          classified = { outcome: 'carried', fromSha, headSha, fingerprint };
+          return result(classified);
+        }
+        if (carry?.reason) {
+          const reason = tail(safeErrorText(carry.reason).replace(/[\x00-\x1f\x7f-\x9f]/g, ' '), 300);
+          io.log(`review-job ${slug}: human clearance not carried (${reason}) — normal review`);
+        }
+      } catch (e) {
+        const reason = tail(safeErrorText(e).replace(/[\x00-\x1f\x7f-\x9f]/g, ' '), 300);
+        io.log(`review-job ${slug}: human clearance carry unavailable (${reason}) — normal review`);
+      }
+    }
     if (!redTeamOnly && typeof io.carryAcrossRebaseSetting === 'function') {
       try {
         const setting = io.carryAcrossRebaseSetting();
