@@ -98,7 +98,12 @@ export function readQuotaFailureSpans(options = {}) {
 
 /** Read review.loop errors from the current and previous two UTC day files, including non-quota
  * failures so the quota overlay can reject mixed evidence. Any corrupt line invalidates the scan. */
-export function readReviewFailureSpans({ dir = telemetryDir(), now = Date.now() } = {}) {
+export function readReviewFailureSpans(options = {}) {
+  return scanReviewFailureSpans(options).spans;
+}
+
+// Preserve the public readers' [] contract while distinguishing missing telemetry from a failed scan.
+function scanReviewFailureSpans({ dir = telemetryDir(), now = Date.now() } = {}) {
   const spans = [];
   try {
     for (let daysAgo = 0; daysAgo < 3; daysAgo++) {
@@ -107,14 +112,14 @@ export function readReviewFailureSpans({ dir = telemetryDir(), now = Date.now() 
         text = readFileSync(join(dir, `${dayKey(new Date(now - daysAgo * 86_400_000))}.jsonl`), 'utf8');
       } catch (error) {
         if (error.code === 'ENOENT') continue;
-        return [];
+        return { spans: [], failed: true };
       }
       const { events, corrupt } = parseTelemetryLines(text);
-      if (corrupt > 0) return [];
+      if (corrupt > 0) return { spans: [], failed: true };
       spans.push(...events.filter(isReviewFailureSpan));
     }
-    return spans;
-  } catch { return []; }
+    return { spans, failed: false };
+  } catch { return { spans: [], failed: true }; }
 }
 
 /** Matching non-quota errors veto quota-only evidence for interrupted attempts. Promote textless
@@ -207,7 +212,10 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
     if (dirty || Object.keys(disk).some(n => !kept[n])) writeEvidenceDiskCache(file, kept);
   }
   // Keep live telemetry outside both caches, so arriving or disappearing spans take effect immediately.
-  return markQuotaOnlyFromSpans(out, readReviewFailureSpans({ dir: spansDir, now }));
+  const { spans, failed } = scanReviewFailureSpans({ dir: spansDir, now });
+  // Unknown telemetry may hide a genuine failure, even when the run's recorded failures are quota-only.
+  if (failed) return out.map(row => row.incomplete ? { ...row, quotaOnly: false } : row);
+  return markQuotaOnlyFromSpans(out, spans);
 }
 
 /** The events on the PR thread that wake a parked review, each tagged with what woke it. `ruling` (a reviewer's or
