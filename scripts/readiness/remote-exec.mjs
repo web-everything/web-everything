@@ -60,7 +60,28 @@ export function defaultExec({ file, args, cwd, input, inherit = false }) {
 export { isTestFile };
 // This exclusion policy is part of the manifest, never an independent rsync
 // filter. Test-shaped names under excluded components refuse remote admission.
-const excludedComponent = /^(?:node_modules|\.git|\.env.*|\.secrets|\.ssh|\.aws|\.claude|\.codex|\.npmrc|\.netrc|credentials.*|.*\.(?:pem|key)|\.exit-code)$/i;
+const safeDotDirectory = /^(?:\.github|\.husky|\.vscode|\.storybook|\.changeset)$/;
+const safeDotFile = /^(?:\.gitignore|\.gitattributes|\.editorconfig|\.nvmrc|\.node-version|\.prettierrc.*|\.eslintrc.*|\.gitkeep|\.nycrc.*)$/;
+const keyComponent = /(?:_rsa|^id_|\.(?:pem|key|p12|pfx|jks|keystore)$)/;
+const credentialComponent = /token|secret|creds|credential|passwd|password|oauth|apikey|api-key/;
+const sourceExtension = /\.(?:mjs|js|ts|tsx|jsx|css|md|html)$/;
+function normalizedComponent(part) {
+  const utf8 = part.toString('utf8');
+  // Non-test opaque byte names retain their existing byte-path contract. Only
+  // the policy view is decoded; transport and hashing always use original bytes.
+  const text = Buffer.from(utf8).equals(part) ? utf8 : part.toString('latin1');
+  return text.normalize('NFKC').normalize('NFD').replace(/\p{M}/gu, '')
+    .replace(/\p{Cf}/gu, '').replace(/[. ]+$/u, '').toLowerCase();
+}
+function excludedComponent(name, leaf) {
+  // Admit ordinary accented Latin names (e.g. é) but fail closed on remaining
+  // non-ASCII forms: no incomplete hand-maintained confusable substitution map.
+  const unsafe = /\p{Cc}/u.test(name) || [...name].some(char => char.charCodeAt(0) > 127
+    && !/^(?:[a-z]\p{M}+|\p{Z})$/u.test(char.normalize('NFD')));
+  return unsafe || !name || /^\.(?:netrc|npmrc|env.*)$/.test(name)
+    || (name.startsWith('.') && !safeDotDirectory.test(name) && !(leaf && safeDotFile.test(name)))
+    || keyComponent.test(name) || credentialComponent.test(name);
+}
 export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles} = {}) {
   // Only dependency and Git internals are exempt. In particular, secret/hidden
   // directories and ambiguous dist/build directories may still contain tests.
@@ -79,19 +100,20 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     const result = await exec({file:'git',args:['ls-files','-co','--exclude-standard','-z'],cwd});
     if (result.code !== 0 || !Buffer.isBuffer(result.stdout)) throw new Error('Byte inventory unavailable');
     files = splitPaths(result.stdout);
-    const stage = await exec({file:'git',args:['ls-files','--stage','-z'],cwd});
-    if (stage.code !== 0 || !Buffer.isBuffer(stage.stdout) || stage.stdout.length > LIMIT
-      || (stage.stdout.length && stage.stdout.at(-1) !== 0)) throw new Error('Git index unavailable');
-    let start = 0;
-    for (let i = 0; i < stage.stdout.length; i++) if (stage.stdout[i] === 0) {
-      const record = stage.stdout.subarray(start,i), tab = record.indexOf(9);
-      if (tab < 0 || !/^[0-7]{6} [a-f0-9]{40,64} [0-3]$/.test(record.subarray(0,tab).toString('latin1'))) throw new Error('Invalid git index record');
-      pathParts(record.subarray(tab+1));
-      // Gitlinks cannot be transported as directory leaves. Until recursive
-      // submodule inventories are supported, use real local heavy admission.
-      if (record.subarray(0,6).equals(Buffer.from('160000'))) throw new Error('gitlink-unsupported: use local fallback');
-      start = i + 1;
-    }
+  }
+  // Index evidence still rejects unsupported gitlinks, including injected inventories.
+  const stage = await exec({file:'git',args:['ls-files','--stage','-z'],cwd});
+  if (stage.code !== 0 || !Buffer.isBuffer(stage.stdout) || stage.stdout.length > LIMIT
+    || (stage.stdout.length && stage.stdout.at(-1) !== 0)) throw new Error('Git index unavailable');
+  let start = 0;
+  for (let i = 0; i < stage.stdout.length; i++) if (stage.stdout[i] === 0) {
+    const record = stage.stdout.subarray(start,i), tab = record.indexOf(9);
+    if (tab < 0 || !/^[0-7]{6} [a-f0-9]{40,64} [0-3]$/.test(record.subarray(0,tab).toString('latin1'))) throw new Error('Invalid git index record');
+    pathParts(record.subarray(tab+1));
+    // Gitlinks cannot be transported as directory leaves. Until recursive
+    // submodule inventories are supported, use real local heavy admission.
+    if (record.subarray(0,6).equals(Buffer.from('160000'))) throw new Error('gitlink-unsupported: use local fallback');
+    start = i + 1;
   }
   files.sort(Buffer.compare);
   files = files.filter((path,i) => !i || !path.equals(files[i-1]));
@@ -102,7 +124,12 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   const entries = [], excluded = [];
   for (const path of files) {
     const parts = pathParts(path);
-    if (parts.some(part => excludedComponent.test(part.toString('latin1')))) {
+    const names = parts.map(normalizedComponent);
+    const excludedByPolicy = names.some((name,i) => excludedComponent(name, i === names.length-1));
+    if (excludedByPolicy || names.includes('node_modules')) {
+      if (!names.includes('node_modules') && excludedByPolicy && sourceExtension.test(names.at(-1))) {
+        throw Object.assign(new Error('Excluded source: use local fallback'), {code:'excluded-source-file'});
+      }
       if (isTestFile(path) || /\.(test|spec)\./.test(parts.at(-1).toString('latin1'))) throw new Error('Excluded test: use local fallback');
       excluded.push(path); continue;
     }
@@ -178,7 +205,10 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
       if(copied.code !== 0) throw new Error('Copy failed');
       expected = {v:1,nonce,run,inputDigest,argvDigest:digestArgv(argv),lock,manifestDigest:manifest.manifestDigest};
       expectedManifest = wire;
-    } catch (error) {return fallback(error.code === 'ignored-test-file' ? 'ignored-test-file' : 'copy-failed');}
+    } catch (error) {
+      if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code};
+      return fallback(error.code === 'ignored-test-file' ? 'ignored-test-file' : 'copy-failed');
+    }
     try {
       const result = await ssh('run',{...expected,manifest:expectedManifest,argv,env:filterEnv(env)},true);
       const receipt = await finish();
@@ -199,13 +229,20 @@ export function verifyReceipt(text, expected, code) {
   } catch {return false;}
 }
 
-export async function runWithRemoteFallback(options = {}) {
-  // A rejected command must not regain execution through local fallback.
+/** Explicit remote CLI request; the shared decision contract owns safe local admission. */
+export async function main(options = {}) {
   if (!isAllowedCommand(options.argv)) throw new Error('command-not-allowed: use npm run <allowed-task> -- <task-args>');
-  const result = await runRemote(options);
-  if (result.mode === 'remote') return result.code;
-  const log = options.log ?? ((message) => process.stderr.write(`${message}\n`));
-  log(`remote-exec: falling back to local (${result.reason})`);
+  // Import at invocation time: heavy-admission's default executor imports us.
+  const { runWithRemoteDecision, resolveAdmissionPolicy, adaptLegacyRemoteResult } = await import('./heavy-admission.mjs');
+  const policy = resolveAdmissionPolicy({platform:{remote:{enabled:true, mode:'always'}}});
+  policy.sources['remote.enabled'] = 'explicit remote CLI request';
+  policy.sources['remote.mode'] = 'explicit remote CLI request';
+  const result = await runWithRemoteDecision({
+    argv:options.argv, cwd:options.cwd, env:options.env, policy,
+    timeoutMs:options.timeoutMs, log:options.log,
+    remoteExec:options.remoteExec ?? (async decisionOptions => adaptLegacyRemoteResult(await runRemote({...options, ...decisionOptions}))),
+  });
+  if (result.handled) return result.exitCode;
   const local = options.local ?? (async (argv) => (await defaultExec({ file: process.execPath,
     args: ['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=600000', '--', ...argv], cwd: options.cwd, inherit: true })).code);
   return local(options.argv);
@@ -225,6 +262,6 @@ export function parseArgs(args) {
 }
 
 if (process.argv[1] && await realpath(process.argv[1]).catch(() => '') === await realpath(fileURLToPath(import.meta.url))) {
-  try { process.exitCode = await runWithRemoteFallback(parseArgs(process.argv.slice(2))); }
+  try { process.exitCode = await main(parseArgs(process.argv.slice(2))); }
   catch (error) { process.stderr.write(`remote-exec: ${error.message}\n`); process.exitCode = 1; }
 }
