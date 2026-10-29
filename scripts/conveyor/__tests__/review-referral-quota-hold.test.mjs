@@ -72,6 +72,16 @@ describe.each([false, true])('reviewRunEvidence quotaOnly (completed: %s)', comp
     expect(reviewRunEvidence(run)).toMatchObject({ quotaOnly: false });
   });
 
+  it.each([
+    ['non-array effects', {}],
+    ['effects containing null', [null, { type: 'review.mandatory-referrals',
+      result: { records: [{ failure: "You've hit your weekly limit" }] } }]],
+  ])('fails closed without throwing for %s and keeps the run as evidence', (_, effects) => {
+    const run = reviewRun(0, complete);
+    run.findings.mandatoryReferrals = { effects };
+    expect(reviewRunEvidence(run)).toMatchObject({ id: run.id, quotaOnly: false });
+  });
+
   it('exempts two errors for judge when each has its own provider-quota telemetry row', () => {
     const run = reviewRun(0, complete);
     run.seatTimings = [failedSeat('judge'), failedSeat('judge')];

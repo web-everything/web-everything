@@ -44,12 +44,14 @@ export function reviewRunEvidence(run) {
   const ownReferral = resuming && run.findings?.referralVerdict
     ? run.stepTimings?.find(t => t.step === 'referralVerdict')?.finishedAt : undefined;
   const savedReferral = resuming && !ownReferral;
-  const state = (savedReferral ? run.resumeOf.mandatoryReferrals : run.findings?.mandatoryReferrals)?.effects?.find(e => e.type === 'review.mandatory-referrals')?.result;
+  const effects = (savedReferral ? run.resumeOf.mandatoryReferrals : run.findings?.mandatoryReferrals)?.effects;
+  const state = Array.isArray(effects) ? effects.find(e => e?.type === 'review.mandatory-referrals')?.result : undefined;
   const records = Array.isArray(state?.records) ? state.records : [];
   // Only unambiguous persisted quota evidence for every failed seat exempts an attempt.
   // Unfinished seats, missing evidence, conflicting failures, and attempts that reached post-seat steps still count.
   let quotaOnly = false;
   try {
+    const validEffects = effects === undefined || (Array.isArray(effects) && effects.every(e => e != null));
     const validRecords = state == null || (Array.isArray(state.records)
       && records.every(r => r != null && typeof r === 'object' && !Array.isArray(r)));
     const failures = records.filter(r => r?.failure != null).map(r => r.failure);
@@ -58,7 +60,7 @@ export function reviewRunEvidence(run) {
     // Repeated calls to the same seat each need their own persisted quota row.
     const failuresBySeat = new Map();
     for (const t of failedSeats) failuresBySeat.set(t.seat, (failuresBySeat.get(t.seat) ?? 0) + 1);
-    quotaOnly = validRecords && failedSeats.length > 0 && Array.isArray(telemetry) && failures.every(isQuotaError)
+    quotaOnly = validEffects && validRecords && failedSeats.length > 0 && Array.isArray(telemetry) && failures.every(isQuotaError)
       && run.seatTimings.every(t => t?.verdict && t?.finishedAt)
       && failedSeats.every(t => {
         if (typeof t.seat !== 'string' || t.seat.length === 0) return false;
