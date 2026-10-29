@@ -90,6 +90,14 @@ describe('lane acquire smoke after lane-hold reset refusal', () => {
     expect(row.skipped).not.toBe(true);
   });
 
+  it('a retry that exited on a signal is a real failure even if the same line mentions lane-hold', async () => {
+    const sig = new Error(`acquire exited SIGSEGV: ${refusal}`);
+    const runChild = vi.fn().mockRejectedValueOnce(failure('message')).mockRejectedValueOnce(sig);
+    const row = await check.run(context(runChild));
+    expect(row.ok).toBe(false);
+    expect(row.skipped).not.toBe(true);
+  });
+
   it('a retry whose later stderr line is an unrelated provision failure is a real failure even though lane-hold appears earlier', async () => {
     const mixed = Object.assign(new Error('acquire exited 1'), { stderr: `${refusal}\nlane-4 claimed but failed to provision (fatal: bad object)\nno lane within 30000ms` });
     const runChild = vi.fn().mockRejectedValueOnce(failure('message')).mockRejectedValueOnce(mixed);
