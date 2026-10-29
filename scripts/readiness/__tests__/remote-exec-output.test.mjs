@@ -18,13 +18,37 @@ function capturedChild() {
 }
 
 describe('remote-exec captured output boundary', () => {
+  // Revised capture contract: defaultExec resolves {code, stdout: Buffer}.
+  // Existing content and limit assertions now expect bytes: this is the
+  // intentional stdout contract change, with the same capture bounds retained.
+  it('returns raw bytes when an é.test.mjs inventory name is split in two chunks', async () => {
+    const child = capturedChild();
+    const result = defaultExec({file:'git', args:['ls-files','-co','--exclude-standard','-z']});
+    const bytes = Buffer.from('é.test.mjs\0');
+    child.stdout.emit('data', bytes.subarray(0, 1));
+    child.stdout.emit('data', bytes.subarray(1));
+    child.emit('close', 0);
+    const captured = await result;
+    expect(Buffer.isBuffer(captured.stdout)).toBe(true);
+    expect(captured.stdout).toEqual(bytes);
+  });
+
+  it('never replaces a non-UTF-8 inventory byte with U+FFFD', async () => {
+    const child = capturedChild();
+    const result = defaultExec({file:'git', args:['ls-files','-z']});
+    const bytes = Buffer.concat([Buffer.from('raw-'), Buffer.from([0xff]), Buffer.from('.test.mjs\0')]);
+    child.stdout.emit('data', bytes);
+    child.emit('close', 0);
+    expect((await result).stdout).toEqual(bytes);
+  });
+
   it('preserves multibyte inventory names split across stdout chunks', async () => {
     const child = capturedChild();
     const result = defaultExec({file:'git',args:['ls-files','-z']});
     const inventory = 'fixtures/é😀\u2028.txt\0';
     for (const byte of Buffer.from(inventory)) child.stdout.emit('data',Buffer.from([byte]));
     child.emit('close',0);
-    await expect(result).resolves.toEqual({code:0,stdout:inventory});
+    await expect(result).resolves.toEqual({code:0,stdout:Buffer.from(inventory)});
   });
   it('accepts exactly 4 MiB combined across stdout and stderr without terminating', async () => {
     const child = capturedChild();
@@ -33,7 +57,7 @@ describe('remote-exec captured output boundary', () => {
     child.stderr.emit('data', Buffer.alloc(2 * 1024 * 1024, 'b'));
     child.emit('close', 0);
 
-    await expect(result).resolves.toEqual({ code: 0, stdout: 'a'.repeat(2 * 1024 * 1024) });
+    await expect(result).resolves.toEqual({ code: 0, stdout: Buffer.alloc(2 * 1024 * 1024, 'a') });
     expect(child.kill).not.toHaveBeenCalled();
   });
 
