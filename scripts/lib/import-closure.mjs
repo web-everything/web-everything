@@ -108,8 +108,9 @@ function nonShellOptions(options) {
     && (ts.isIdentifier(property.name) || literal(property.name))
     && property.name.text !== '__proto__'
     // Preloads are executable edges, even when the primary script is literal.
-    // Until modeled explicitly, retain the full conflict for all supplied launch environments/execArgv.
-    && !['execArgv', 'env', 'execPath'].includes(property.name.text)
+    // A cwd override can select a different worker than the snapshot decoy, even
+    // when literal. Retain the full conflict until launch directories are modeled.
+    && !['execArgv', 'env', 'execPath', 'cwd'].includes(property.name.text)
     && (property.name.text !== 'shell' || property.initializer.kind === ts.SyntaxKind.FalseKeyword));
 }
 
