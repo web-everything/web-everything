@@ -1,12 +1,26 @@
 import { beforeEach, describe, it, expect, vi } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { resolve } from 'node:path';
 import { run } from '../human-clearance-carry-cli.mjs';
 import { applyHumanClearanceCarry } from '../../lib/human-clearance-carry.mjs';
+import { liveCarryFingerprints } from '../../lib/carry-equivalence.mjs';
 
 vi.mock('../../lib/human-clearance-carry.mjs', async importOriginal => {
   const actual = await importOriginal();
   return { ...actual, applyHumanClearanceCarry: vi.fn(actual.applyHumanClearanceCarry) };
 });
 beforeEach(() => vi.mocked(applyHumanClearanceCarry).mockClear());
+
+it('CLI exits 1 with one failure JSON line on stdout when arguments are missing', () => {
+  const child = spawnSync(process.execPath, [resolve('scripts/conveyor/human-clearance-carry-cli.mjs')], {
+    env: { ...process.env, PATH: '' }, encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024,
+  });
+  expect(child.error).toBeUndefined();
+  expect(child.status).toBe(1);
+  expect(child.stdout).toMatch(/^[^\r\n]+\n$/);
+  expect(JSON.parse(child.stdout)).toEqual({ carried: null,
+    reason: expect.stringContaining('pr must be a positive integer') });
+});
 
 const fromSha = 'a'.repeat(40), toSha = 'b'.repeat(40), fingerprint = 'c'.repeat(64);
 const job = { pr: 1, repo: 'web-everything/web-everything' };
@@ -56,6 +70,12 @@ function cliFixture({ headSha = toSha, reviews = [], objection = false, incomple
     posts: () => exec.mock.calls.filter(([file, args]) => file === 'gh' && args[0] === 'pr' && args[1] === 'comment') };
 }
 
+function changeContent(f) {
+  const clearedDiff = 'diff --git a/example.txt b/example.txt\n--- a/example.txt\n+++ b/example.txt\n@@ -1 +1 @@\n-old\n+reviewed\n';
+  Object.assign(f.evidence.humanClearance, liveCarryFingerprints(clearedDiff));
+  f.evidence.headDiff = clearedDiff.replace('+reviewed', '+unreviewed');
+}
+
 describe('human clearance carry CLI', () => {
   it('uses the exported drain acceptance reader and emits one no-clearance JSON line', () => {
     const exec = vi.fn((file, args) => {
@@ -85,6 +105,93 @@ describe('human clearance carry CLI', () => {
     const body = f.posts()[0][1].at(-1);
     expect(body).toContain(`<!-- reviewed-sha: ${toSha} -->`);
     expect(body).toContain(`<!-- human-clearance-carried: from=${fromSha} to=${toSha} diff=${fingerprint} -->`);
+  });
+
+  it('refuses a non-mechanical content change with different live and clearance fingerprints without posting', () => {
+    const f = cliFixture();
+    changeContent(f);
+    f.options.carryOptions.numberingSetting = { value: false, source: 'test' };
+    const live = liveCarryFingerprints(f.evidence.headDiff);
+    expect(live.diff).not.toBe(f.evidence.humanClearance.diff);
+    expect(live.contribution).not.toBe(f.evidence.humanClearance.contribution);
+
+    expect(f.run()).toEqual({ status: 0, result: { carried: null,
+      reason: 'carry not proven; normal review required' } });
+    expect(f.options.log.mock.calls.some(([line]) => line.includes('net diff changed'))).toBe(true);
+    expect(f.posts()).toHaveLength(0);
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+
+  it('fails closed with nonzero status when evidence.headReadFailed is true despite a valid head', () => {
+    const f = cliFixture();
+    f.evidence.headReadFailed = true;
+    expect(f.run()).toEqual({ status: 1, result: { carried: null,
+      reason: expect.stringContaining('initial head or live net diff unreadable') } });
+    expect(applyHumanClearanceCarry).not.toHaveBeenCalled();
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+
+  it.each([0, -1, 'x'])('rejects invalid pr %s with failure JSON and nonzero status before reading evidence', pr => {
+    const f = cliFixture();
+    f.options.pr = pr;
+    expect(f.run()).toEqual({ status: 1, result: { carried: null,
+      reason: expect.stringContaining('pr must be a positive integer') } });
+    expect(f.write).toHaveBeenCalledTimes(1);
+    expect(f.readEvidence).not.toHaveBeenCalled();
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+
+  it('rejects an invalid repo slug with failure JSON and nonzero status before reading evidence', () => {
+    const f = cliFixture();
+    f.options.repo = 'owner/repo/extra';
+    expect(f.run()).toEqual({ status: 1, result: { carried: null,
+      reason: expect.stringContaining('repo must be an owner/name slug') } });
+    expect(f.write).toHaveBeenCalledTimes(1);
+    expect(f.readEvidence).not.toHaveBeenCalled();
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+
+  it.each(['omitted', 'empty'].flatMap(mode => [
+    [mode, 'content change', 0, 'carry not proven; normal review required'],
+    [mode, 'head read failed', 1, 'initial head or live net diff unreadable'],
+    [mode, 'moved head', 0, 'head moved'],
+    [mode, 'missing formal reviews', 1, 'formal reviews unreadable'],
+  ]))('production defaults with carryOptions %s refuse %s without posting', (mode, scenario, status, reason) => {
+    const f = cliFixture({ headSha: scenario === 'moved head' ? 'e'.repeat(40) : toSha,
+      reviews: scenario === 'missing formal reviews' ? null : [] });
+    if (scenario === 'content change') changeContent(f);
+    if (scenario === 'head read failed') f.evidence.headReadFailed = true;
+    if (mode === 'omitted') delete f.options.carryOptions;
+    else f.options.carryOptions = {};
+
+    expect(f.run()).toEqual({ status, result: { carried: null, reason: expect.stringContaining(reason) } });
+    expect(f.posts()).toHaveLength(0);
+    if (scenario !== 'head read failed') {
+      expect(applyHumanClearanceCarry).toHaveBeenCalledTimes(1);
+      expect(applyHumanClearanceCarry).toHaveBeenCalledWith(expect.not.objectContaining({ setting: expect.anything() }));
+    }
+  });
+
+  it('returns carried null for a dry run whose carried.recorded is false', () => {
+    const f = cliFixture();
+    f.options.carryOptions.dryRun = true;
+    expect(f.run()).toEqual({ status: 0, result: { carried: null,
+      reason: 'carry not proven; normal review required' } });
+    expect(applyHumanClearanceCarry.mock.results.at(-1).value.carried.recorded).toBe(false);
+    expect(f.posts()).toHaveLength(0);
+  });
+
+  it('returns carried null and the defer reason when the durable record write fails', () => {
+    const f = cliFixture();
+    const original = f.exec.getMockImplementation();
+    f.exec.mockImplementation((file, args, options) => {
+      if (file === 'gh' && args[0] === 'pr' && args[1] === 'comment') throw Error('record unavailable');
+      return original(file, args, options);
+    });
+    expect(f.run()).toEqual({ status: 0, result: { carried: null,
+      reason: expect.stringContaining('durable record could not be written') } });
+    expect(applyHumanClearanceCarry.mock.results.at(-1).value).toMatchObject({ action: 'defer' });
+    expect(f.posts()).toHaveLength(1);
   });
 
   it.each([

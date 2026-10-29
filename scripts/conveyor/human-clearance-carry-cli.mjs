@@ -33,7 +33,7 @@ export function run({ pr, repo, cwd = process.cwd(), exec = execFileSyncThrottle
     } else {
       let liveUnreadable = false;
       const outcome = applyHumanClearanceCarry({ ...carryOptions, evidence, pr, repo, cwd, exec: carryExec, log,
-        numberingOnly: !!evidence.humanClearance && !evidence.humanClearance.diff && !evidence.humanClearance.contribution,
+        numberingOnly: !evidence.humanClearance.diff && !evidence.humanClearance.contribution,
         readLiveEvidence: () => {
           try {
             const view = JSON.parse(carryExec('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid,reviews'],

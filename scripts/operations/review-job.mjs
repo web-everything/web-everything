@@ -1017,10 +1017,13 @@ function runReviewArc({
         const carry = io.carryHumanClearance({ pr: planned.pr, repo: planned.repo });
         if (carry?.carried) {
           const { fromSha, toSha: headSha, fingerprint } = carry.carried;
-          io.log(`review-job: human clearance carried ${fromSha.slice(0, 12)}->${headSha.slice(0, 12)} fingerprint ${fingerprint.slice(0, 12)}`);
-          io.log(`review-job: human clearance evidence ${fromSha}->${headSha} fingerprint ${fingerprint}`);
+          io.log(`review-job: human clearance carried ${fromSha}->${headSha} fingerprint ${fingerprint.slice(0, 12)}`);
           classified = { outcome: 'carried', fromSha, headSha, fingerprint };
           return result(classified);
+        }
+        if (carry?.reason) {
+          const reason = tail(safeErrorText(carry.reason).replace(/[\x00-\x1f\x7f-\x9f]/g, ' '), 300);
+          io.log(`review-job ${slug}: human clearance not carried (${reason}) — normal review`);
         }
       } catch (e) {
         const reason = tail(safeErrorText(e).replace(/[\x00-\x1f\x7f-\x9f]/g, ' '), 300);

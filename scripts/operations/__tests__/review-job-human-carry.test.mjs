@@ -71,25 +71,26 @@ describe('review job human-clearance carry across mechanical head moves', () => 
     for (const key of ['runLoop', 'runExtraSeats', 'runRedTeam', 'startSpeculativeRedTeam']) {
       expect(io[key]).not.toHaveBeenCalled();
     }
-    expect(io.log.mock.calls.some(([line]) =>
-      line.includes(fromSha) && line.includes(toSha) && line.includes(fingerprint))).toBe(true);
+    expect(io.log.mock.calls.filter(([line]) => line.includes('human clearance'))).toEqual([
+      [`review-job: human clearance carried ${fromSha}->${toSha} fingerprint ${fingerprint.slice(0, 12)}`],
+    ]);
     expect(io.carryAcrossRebaseSetting).not.toHaveBeenCalled();
     expect(io.restampVerdict).not.toHaveBeenCalled();
   });
 
-  it.each(['non-mechanical move', 'content change', 'conflict-resolution diff'])(
-    'runs the normal arc when the human carry proof returns null: %s', () => {
-      const io = fixture();
-      io.carryHumanClearance = vi.fn(() => null);
+  it('runs the normal arc and logs the reason when the CLI refuses human carry', () => {
+    const io = fixture();
+    const reason = 'carry not proven; normal review required';
+    io.carryHumanClearance = vi.fn(() => ({ carried: null, reason }));
 
-      const out = runReviewJob(job, io);
+    const out = runReviewJob(job, io);
 
-      expect(io.carryHumanClearance).toHaveBeenCalledTimes(1);
-      expect(io.carryHumanClearance).toHaveBeenCalledWith(job);
-      expect(out.outcome).not.toBe('carried');
-      expect(io.runLoop).toHaveBeenCalledTimes(1);
-    },
-  );
+    expect(io.carryHumanClearance).toHaveBeenCalledTimes(1);
+    expect(io.carryHumanClearance).toHaveBeenCalledWith(job);
+    expect(out.outcome).not.toBe('carried');
+    expect(io.runLoop).toHaveBeenCalledTimes(1);
+    expect(io.log.mock.calls.some(([line]) => line.includes(reason))).toBe(true);
+  });
 
   it.each(['unreadable marker', 'unreadable evidence'])(
     'fails closed to the normal arc and logs unavailable when the hook throws: %s', reason => {
@@ -102,7 +103,7 @@ describe('review job human-clearance carry across mechanical head moves', () => 
       expect(io.runLoop).toHaveBeenCalledTimes(1);
       expect(io.log.mock.calls.some(([line]) => /unavailable/i.test(line) && line.includes(reason))).toBe(true);
       expect(io.carryHumanClearance).toHaveBeenCalledTimes(1);
-    expect(io.carryHumanClearance).toHaveBeenCalledWith(job);
+      expect(io.carryHumanClearance).toHaveBeenCalledWith(job);
     },
   );
 
