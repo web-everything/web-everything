@@ -574,6 +574,8 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
         .catch(e => e);
       expect(error).toBeInstanceOf(Error);
       expect(error.message).toBe(`judge-spawn: the juror failed: ${result}`);
+      expect(error.telemetry).toMatchObject({ failureKind: 'provider-quota' });
+      expect(error.telemetry.failureText).toContain(result);
       expect(error.quota).toBe(true);
       expect(error.holdRow).toEqual({ provider: 'claude', status: 'quota-exhausted',
         scoredAt: expect.any(String), quotaResetsAt: null });
@@ -590,8 +592,25 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
     expect(error).toBeInstanceOf(Error);
     if (result) expect(error.message).toBe(`judge-spawn: the juror failed: ${result}`);
     else expect(error.message).toContain('judge-spawn: the juror failed with no result text.');
+    expect(error.telemetry ?? {}).not.toHaveProperty('failureKind');
     expect(error).not.toHaveProperty('quota');
     expect(error).not.toHaveProperty('holdRow');
+  });
+
+  it('merges quota classification into existing unparseable-spawn telemetry without changing the error message', async () => {
+    const result = 'HTTP 429: too many requests';
+    const { fn } = fakeSpawn('not JSON', { code: 1, stderr: result });
+    const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE,
+      sessionId: SID, spawnFn: fn, retries: 0 }).catch(e => e);
+    const original = new JudgeUnparseableError({ attempt: 1, attempts: 1, exitCode: 1,
+      signal: null, stdout: 'not JSON', stderr: result, wallMs: 0, sessionId: SID, failedAttempts: [] });
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toBe(original.message);
+    expect(error.telemetry).toMatchObject({
+      sessionId: SID, exitCode: 1, attempts: 1, stderrTail: result,
+      failure: 'unparseable-stdout', failureKind: 'provider-quota',
+    });
+    expect(error.telemetry.failureText).toContain(result);
   });
 
   it('refuses an empty input rather than spawning a juror with nothing to judge', async () => {
