@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { MINUTE, HOUR } from '../health-watch-core.mjs';
@@ -25,7 +25,7 @@ export function createStateLister({ readdir = readdirSync, read = readFileSync, 
   };
 }
 
-export function createGitHistoryReader({ exec = execFileSync, repoRoot = fileURLToPath(new URL('../../../', import.meta.url)) } = {}) {
+export function createGitHistoryReader({ exec = execFileSync, repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..') } = {}) {
   return (sha) => {
     const output = exec('git', [
       '-C', repoRoot, 'log', '--first-parent', '--format=%H%x09%ct%x09%s', `${sha}..origin/main`,

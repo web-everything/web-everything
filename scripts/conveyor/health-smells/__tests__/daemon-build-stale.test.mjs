@@ -1,18 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as detector from '../daemon-build-stale.mjs';
 import daemonBuildStale, { createStateLister, decide, evaluate } from '../daemon-build-stale.mjs';
 import { validateSmellShape } from '../../health-smells-shape.mjs';
-
-// Exercise the real registry loader against an in-memory directory listing. Do not
-// mock the registry or supply its entries: inclusion must come from discovery.
-vi.mock('node:fs', async (importOriginal) => ({
-  ...await importOriginal(),
-  readdirSync: vi.fn(() => [
-    { name: 'daemon-build-stale.mjs', isFile: () => true },
-  ]),
-}));
+import { SMELLS } from '../index.mjs';
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -85,16 +78,20 @@ describe('daemon-build-stale', () => {
 
   it('reads real first-parent history and rejects an unknown SHA without Git writes', () => {
     expect(detector.createGitHistoryReader).toBeTypeOf('function');
-    // Use the existing checkout read-only: sandbox repairs forbid even temporary .git writes.
-    const repoRoot = fileURLToPath(new URL('../../../../', import.meta.url));
+    // Use committed HEAD history read-only: remote-tracking refs are live state.
+    const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..');
     const git = (args) => execFileSync('git', ['-C', repoRoot, ...args], {
       encoding: 'utf8', timeout: 10_000, maxBuffer: 4 * 1024 * 1024,
       env: { ...process.env, GIT_NO_LAZY_FETCH: '1', GIT_OPTIONAL_LOCKS: '0' },
     }).trim();
-    const adopted = git(['rev-parse', 'origin/main~3']);
-    const readHistory = detector.createGitHistoryReader({ repoRoot });
+    const head = git(['rev-parse', 'HEAD']);
+    const adopted = git(['rev-parse', `${head}~3`]);
+    // Pin the history endpoint to this commit without writing a fixture ref. The
+    // bounded-argv test above separately pins the production origin/main endpoint.
+    const readHistory = detector.createGitHistoryReader({ repoRoot, exec: (command, args, options) =>
+      execFileSync(command, args.map(arg => arg.replace(/\.\.origin\/main$/, `..${head}`)), options) });
     const records = readHistory(adopted);
-    expect(records.map(({ sha }) => sha)).toEqual(git(['rev-list', '--first-parent', `${adopted}..origin/main`]).split('\n'));
+    expect(records.map(({ sha }) => sha)).toEqual(git(['rev-list', '--first-parent', `${adopted}..${head}`]).split('\n'));
     expect(records).toHaveLength(3);
     for (const record of records) {
       expect(record.ctMs).toBe(Number(git(['show', '-s', '--format=%ct', record.sha])) * 1000);
@@ -282,7 +279,6 @@ describe('daemon-build-stale', () => {
       probes: [], severity: 'high', action: 'alert', evaluate,
     });
     expect(validateSmellShape(daemonBuildStale, 'daemon-build-stale.mjs')).toBe(daemonBuildStale);
-    const { SMELLS } = await import('../index.mjs');
     expect(SMELLS.filter((smell) => smell.id === 'daemon-build-stale')).toEqual([daemonBuildStale]);
   });
 });
