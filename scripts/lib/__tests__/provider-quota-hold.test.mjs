@@ -12,24 +12,49 @@ const providerMessages = [
   "You've hit your 5-hour limit",
   'You exceeded your current quota',
 ];
-const structuredRateLimit = '429 {"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}';
+const structuredRateLimit = '{"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}';
 const quotaErrors = [
-  "You've hit your weekly limit · resets ...",
-  "You've hit your weekly limit · resets Oct 30",
+  ...providerMessages,
+  ...['rate_limit_error', 'insufficient_quota'].flatMap(type => [
+    { type },
+    { error: { type } },
+    { type: 'error', error: { type, message: 'Request failed' } },
+  ].flatMap(payload => ['', 'API Error: 429 ', 'API Error: 400 ']
+    .map(prefix => `${prefix}${JSON.stringify(payload)}`))),
+];
+// Former positives deliberately moved here: free text and arbitrary wrappers fail closed.
+const droppedQuotaErrors = [
   '429 Too Many Requests', 'HTTP 429 Too Many Requests',
   '429 rate_limit_error', '429 rate_limit_error Rate limit exceeded',
   'status 429 Too Many Requests', 'rate_limit_error', 'insufficient_quota',
   'RESOURCE_EXHAUSTED: Quota exceeded',
-  ...['rate_limit_error', 'insufficient_quota'].flatMap(type => [
-    `error type: ${type}`,
-    JSON.stringify({ type: 'error', error: { type, message: 'Request failed' } }),
-  ]),
-  ...['', 'API Error: ', 'Error: ', '429 ', 'API Error: 429 ', 'Error: 429 ']
+  ...['rate_limit_error', 'insufficient_quota'].map(type => `error type: ${type}`),
+  ...['API Error: ', 'Error: ', '429 ', 'API Error: 429 ', 'Error: 429 ']
     .flatMap(prefix => providerMessages.map(message => `${prefix}${message}`)),
-  structuredRateLimit, `API Error: ${structuredRateLimit}`, `Error: ${structuredRateLimit}`,
+  ...['429 ', 'Error: 429 '].map(prefix => `${prefix}${structuredRateLimit}`),
   'API Error: 429 rate_limit_error',
 ];
 const ordinaryErrors = [
+  ...droppedQuotaErrors,
+  '',
+  '429 Rate limit exceeded', 'HTTP 429: Too Many Requests',
+  'rate limit exceeded', 'Too Many Requests',
+  ...['rate_limit_error', 'insufficient_quota'].flatMap(type => [
+    JSON.stringify({ message: type }),
+    JSON.stringify({ error: { message: type } }),
+    JSON.stringify([{ type }]),
+    JSON.stringify({ type: `${type}_config` }),
+    JSON.stringify({ type: type.toUpperCase() }),
+    JSON.stringify({ error: { type: `${type} ` } }),
+    JSON.stringify({ error: { type: [type] } }),
+    JSON.stringify(type),
+    `{"type":"${type}"`,
+    `{"type":"${type}"} trailing diagnostic`,
+    `diagnostic {"type":"${type}"}`,
+  ]),
+  '{}', 'null', '[]',
+  ...['Error: ', 'API Error: ', 'HTTP 429 ', 'API Error: nope ']
+    .map(prefix => `${prefix}${structuredRateLimit}`),
   "You've hit your limit of 2 repair rounds",
   "You've hit your limit",
   'schema invalid', 'the juror failed with no result text',
@@ -64,7 +89,7 @@ describe('quota error evidence', () => {
     expect(quota.isQuotaError(text)).toBe(true);
   });
 
-  it.each(ordinaryErrors)('keeps ordinary juror failures countable: %s', text => {
+  it.each(ordinaryErrors)('fails closed without structural provider evidence: %s', text => {
     expect(quota.isQuotaError, 'isQuotaError export').toBeTypeOf('function');
     expect(quota.isQuotaError(text)).toBe(false);
   });

@@ -567,12 +567,15 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
   });
 
   it.each([
-    "You've hit your weekly limit · resets ...", 'HTTP 429 Too Many Requests',
-    '429 Too Many Requests', '429 rate_limit_error Rate limit exceeded',
+    "You've hit your weekly limit · resets ...",
     "You've hit your weekly limit · resets Oct 30 at 4pm (America/Toronto)",
-    "You've hit your usage limit",
-    '429 {"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}',
-    'API Error: 429 rate_limit_error', 'You exceeded your current quota',
+    ...['daily', 'monthly', 'usage', 'session', 'hourly', '5-hour']
+      .map(period => `You've hit your ${period} limit`),
+    'You exceeded your current quota',
+    ...['rate_limit_error', 'insufficient_quota'].flatMap(type => [
+      { type }, { error: { type } }, { type: 'error', error: { type } },
+    ].flatMap(payload => ['', 'API Error: 429 ', 'API Error: 400 ']
+      .map(prefix => `${prefix}${JSON.stringify(payload)}`))),
   ])
     ('tags quota failure %s without changing its message', async result => {
       const { fn } = fakeSpawn(JSON.stringify({ is_error: true, result }), { code: 1 });
@@ -594,6 +597,27 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
 
   it.each([
     'schema invalid', '',
+    // Former quota positives now remain countable failures.
+    'HTTP 429 Too Many Requests', '429 Too Many Requests',
+    '429 rate_limit_error Rate limit exceeded', 'API Error: 429 rate_limit_error',
+    '429 {"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}',
+    '429 rate_limit_error', 'status 429 Too Many Requests',
+    'rate_limit_error', 'insufficient_quota', 'RESOURCE_EXHAUSTED: Quota exceeded',
+    'rate limit exceeded', 'Too Many Requests', 'usage limit reached',
+    ...['API Error: ', 'Error: ', '429 ', 'API Error: 429 ', 'Error: 429 ']
+      .flatMap(prefix => ["You've hit your weekly limit", 'You exceeded your current quota']
+        .map(message => `${prefix}${message}`)),
+    ...['rate_limit_error', 'insufficient_quota'].flatMap(type => [
+      `error type: ${type}`,
+      JSON.stringify({ type: `${type}_config` }),
+      JSON.stringify({ error: { type: type.toUpperCase() } }),
+      JSON.stringify([{ type }]),
+      `{"type":"${type}"`,
+      `{"type":"${type}"} trailing diagnostic`,
+      `diagnostic {"type":"${type}"}`,
+      ...['Error: ', 'API Error: ', '429 ', 'HTTP 429 ', 'API Error: nope ']
+        .map(prefix => `${prefix}${JSON.stringify({ type: 'error', error: { type } })}`),
+    ]),
     'HTTP 429 fixture failed: expected 429, received 500',
     'HTTP 429', 'HTTP 429 request failed', 'status 429 fixture',
     'rate_limit', 'rate limit', 'too many requests', 'Usage limit reached',
