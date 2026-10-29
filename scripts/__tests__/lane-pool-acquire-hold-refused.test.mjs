@@ -131,11 +131,19 @@ describe('lane-pool acquire after lane-hold reset refusal', () => {
     expect(events().filter((e) => e.kind === 'scan'), 'one actual full-scan lock acquisition').toHaveLength(1);
   }, 60_000);
 
+  it('exits 1 (not the environmental 75) when the only lane is held by a foreign live lease', () => {
+    provision(1);
+    const held = run(['acquire', '--lane=1', '--session=foreign-live-owner', '--json']);
+    expect(held.code, held.err).toBe(0);
+    const result = acquire(0);
+    expect(result.code).toBe(1);
+  }, 60_000);
+
   it('does not retry a lane-hold-refused lane across acquire poll rounds', () => {
     provision(1);
     park(1);
     const result = acquire(2500);
-    expect(result.code).not.toBe(0);
+    expect(result.code, 'only lane-hold refusals => environmental-only exit 75').toBe(75);
     expect(events().filter((e) => e.kind === 'acquire-wait').length).toBeGreaterThanOrEqual(2);
     expect(result.err.match(/lane-1: reset REFUSED — lane-hold:/g), 'sticky refusal exclusion').toHaveLength(1);
     expect(existsSync(lease(1))).toBe(false);

@@ -1514,9 +1514,9 @@ function laneAcquirableInfo(repo, n, remoteShasBox = null, nowMs = Date.now(), t
 
 // ── output ──────────────────────────────────────────────────────────────────────────────────────────
 const log = (m) => process.stderr.write(m + '\n');
-function fail(m) {
+function fail(m, code = 1) {
   process.stderr.write(`✗ ${m}\n`);
-  process.exit(1);
+  process.exit(code);
 }
 
 // ── commands ──────────────────────────────────────────────────────────────────────────────────────
@@ -2335,6 +2335,7 @@ async function cmdAcquire(repo) {
     const deadline = nowMs + waitMs;
     const excluded = new Set();
     const holdRefused = new Set(); // parked lanes stay excluded across poll rounds
+    let sawNonHoldProvisionFailure = false; // any provision failure that is NOT a lane-hold refusal
     // The caller's OWN lane, if they are standing in one. Auto-pick skips it: acquiring resets the lane to
     // the integration branch, so returning the lane the caller is working in changes their checkout out from
     // under them (observed 2026-09-06 — a bare `acquire --purpose=review-juror` returned the driving lane).
@@ -2492,6 +2493,7 @@ async function cmdAcquire(repo) {
         } catch (e) {
           const failure = msgOf(e);
           if (failure.includes('lane-hold')) holdRefused.add(pick);
+          else sawNonHoldProvisionFailure = true;
           if (failure.includes('index.lock')) {
             log(`lane-${pick}: stale .git/index.lock - skipped; needs cleanup`);
           }
@@ -2563,6 +2565,9 @@ async function cmdAcquire(repo) {
       // that genuinely found nothing acquirable are three distinct facts, each with its own message — never
       // collapsed into one another.
       emitAcquirePollCount(); // #xj4tewd — before fail() exits the process, so a debug-mode caller still sees it
+      // Exit 75 (EX_TEMPFAIL) = the ONLY reason nothing was acquired is a parked lane-hold refusal / lock contention:
+      // environmental, never a code defect. Callers (the rebuild smoke) key on this exit code, never on message text.
+      const environmentalOnly = !sawNonHoldProvisionFailure && !sawScanTimeout && (holdRefused.size > 0 || sawLockContention);
       fail(
         sawScanTimeout
           ? `no free lane in pool "${repo.name}" — the acquirability scan itself did not finish within the ` +
@@ -2581,6 +2586,7 @@ async function cmdAcquire(repo) {
               // it gets its own message; each such lane already had its lease released (see the loop above).
               ? `no free lane in pool "${repo.name}" — every candidate this call tried was claimed but failed to provision (see the warnings above); each was released — investigate the underlying failure, or retry`
               : `no free lane in pool "${repo.name}" (${lanes.length} all held/dirty) — release one or \`provision\` more`,
+        environmentalOnly ? 75 : 1,
       );
     }
     emitAcquirePollCount(); // #xj4tewd — success path (the loop exited via `break`, not `fail`)

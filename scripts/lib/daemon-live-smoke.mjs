@@ -367,25 +367,9 @@ async function checkLanePoolList(ctx) {
   }
 }
 
-/**
- * Allowlist for the lane-acquire-release smoke's lane-hold skip: a retry error line is benign only when it is
- * not failure-shaped at all, or is exactly a lane-hold refusal / the final "no lane" refusal / the bare child
- * exit line. Any other failure-shaped line (provision, git, fs, signal, timeout, crash...) is a real failure.
- */
-function isBenignLaneHoldLine(line) {
-  const l = String(line);
-  if (!/provision|fatal|error|failed|refused|✗|exited|SIG[A-Z]+|timed out|crash|killed|limit|ENOENT|EACCES/i.test(l)) return true;
-  if (/fatal:|SIG[A-Z]+|crash|timed out|killed|ENOENT|EACCES|error:|limit/i.test(l)) return false;
-  // The reason is the lane-hold verdict's own prose: plain words only, ending the line (or its JSON string), and never
-  // failure vocabulary. Anything appended to it (`; npm ci failed`) is not a lane-hold refusal.
-  const reason = "[A-Za-z0-9 ,'-]{1,160}";
-  const notFailure = !/fail|error|exit|crash|npm|git |fatal/i.test(l.replace('claimed but failed to provision', ''));
-  if (notFailure && new RegExp(`lane-\\d+: reset REFUSED — lane-hold: ${reason}(?:["}\\\\]|$)`).test(l)) return true;
-  if (notFailure && new RegExp(`claimed but failed to provision \\(lane-\\d+ is held — lane-hold: ${reason}; not reset \\(pick another lane\\)\\)(?: — releasing it and trying another candidate)?\\s*$`).test(l)) return true;
-  if (/^\s*✗ no (?:free )?lane\b/.test(l) || /^\s*no (?:free )?lane within\b/.test(l)) return true;
-  if (/^\s*acquire exited \d+\s*$/.test(l) || /^\s*Command failed: node scripts\/lane-pool\.mjs acquire\b[^\n]*$/.test(l)) return true;
-  return false;
-}
+/** lane-pool acquire exits 75 (EX_TEMPFAIL) only when nothing was acquired solely because of lane-hold refusals / lock contention. */
+const LANE_POOL_ENV_ONLY_EXIT = 75;
+const isEnvOnlyAcquireExit = (e) => e?.status === LANE_POOL_ENV_ONLY_EXIT && !e?.signal;
 
 async function checkLaneAcquireRelease(ctx) {
   const { root, budgets, sessionSlug, runChild, env } = ctx;
@@ -409,26 +393,20 @@ async function checkLaneAcquireRelease(ctx) {
       cwd: root, timeoutMs: acquireCapMs, env,
     });
     let out;
-    const hasLaneHold = (e) => [e?.message, e?.stderr, JSON.stringify(e?.diagnostics)].join('\n').includes('lane-hold');
     try {
       out = await acquire();
     } catch (e) {
-      if (!hasLaneHold(e)) throw e;
+      if (!isEnvOnlyAcquireExit(e)) throw e;
       try {
         out = await acquire();
       } catch (retryError) {
-        // Only a clean "no lane" refusal that names lane-hold is environmental; a crash/timeout/provision error
-        // that merely mentions lane-hold in its diagnostics stays a real failure.
-        // Scan EVERY line of the retry's message, stderr and diagnostics: any failure-shaped line that is not itself a
-        // lane-hold refusal (provision error, git/fs error, timeout, signal, crash, output limit) makes it a real failure.
-        const retryText = [retryError?.message, retryError?.stderr, JSON.stringify(retryError?.diagnostics ?? '')].join('\n').split(/\\n|\n/);
-        const cleanNoLane = retryText.every(isBenignLaneHoldLine);
-        if (!hasLaneHold(retryError) || !cleanNoLane) {
+        // Structural, not textual: only lane-pool's own environmental-only exit (75) twice in a row is a skip.
+        if (!isEnvOnlyAcquireExit(retryError)) {
           return { ok: false, detail: `lane-pool acquire --purpose=smoke failed: ${firstLine(retryError)}`,
             ...childFailureDiagnostics(retryError) };
         }
         return { ok: true, skipped: true, skipReason: 'lane-hold-refused',
-          detail: `skipped: lane-hold refused acquire after one retry: ${firstLine(retryError)}` };
+          detail: `skipped: acquire found only lane-hold / lock-contention refusals after one retry: ${firstLine(retryError)}` };
       }
     }
     const parsed = JSON.parse(out);

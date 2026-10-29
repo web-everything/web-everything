@@ -53,125 +53,51 @@ afterEach(() => vi.unstubAllEnvs());
 
 describe('lane acquire smoke after lane-hold reset refusal', () => {
   const check = SMOKE_CHECKS.find((c) => c.name === 'lane-acquire-release');
-  const refusal = 'lane-9: reset REFUSED — lane-hold: a fixer is parked awaiting verify';
   function context(runChild) {
     return { root: '/x', env: {}, budgets: resolveSmokeBudgets({}), sessionSlug: 'smoke-hold-test',
       runChild, clock: () => 1000, hostBusy: () => false };
   }
-  function failure(source) {
-    const error = new Error(source === 'message' ? refusal : 'acquire exited 1');
-    if (source === 'stderr') error.stderr = `pool diagnostics\n${refusal}\nno lane within 30000ms (lock contention)`;
-    if (source === 'diagnostics') error.diagnostics = { stderrTail: refusal };
-    return error;
-  }
+  const exit = (status, extra = {}) => Object.assign(new Error(`exited ${status}: lane-hold text is irrelevant`), { status, signal: null, ...extra });
+  const acquires = (runChild) => runChild.mock.calls.filter(([, args]) => args[1] === 'acquire');
 
-  it.each(['message', 'stderr', 'diagnostics'])('retries once when %s contains lane-hold, then releases the successful lease', async (source) => {
-    const runChild = vi.fn().mockRejectedValueOnce(failure(source))
-      .mockResolvedValueOnce(JSON.stringify({ lane: 4 })).mockResolvedValueOnce('');
-    const ctx = context(runChild);
-    const row = await check.run(ctx);
-    expect(row.ok).toBe(true);
-    expect(row.skipped).not.toBe(true);
-    expect(runChild).toHaveBeenCalledTimes(3);
-    const [first, retry, release] = runChild.mock.calls;
-    expect(first[1][1]).toBe('acquire');
-    expect(retry).toEqual(first);
-    expect(release[1]).toContain('release');
-    expect(release[1]).toContain('--lane=4');
-    expect(release[1]).toContain('--session=smoke-hold-test');
-    expect(release[2].env).toBe(ctx.env);
-  });
-
-  it('a retry that crashes while diagnostics mention lane-hold is a real failure, not a skip', async () => {
-    const crash = Object.assign(new Error('acquire crashed with signal SIGSEGV'), { stderr: refusal });
-    const runChild = vi.fn().mockRejectedValueOnce(failure('message')).mockRejectedValueOnce(crash);
+  it('retries once on the environmental-only exit (75) and releases the successful lease', async () => {
+    const runChild = vi.fn().mockRejectedValueOnce(exit(75)).mockResolvedValueOnce(JSON.stringify({ lane: 4 })).mockResolvedValueOnce('');
     const row = await check.run(context(runChild));
-    expect(row.ok).toBe(false);
-    expect(row.skipped).not.toBe(true);
+    expect(row).toMatchObject({ ok: true, lane: 4 });
+    expect(acquires(runChild)).toHaveLength(2);
   });
 
-  it('a retry mixing lane-hold with a fatal git error on one line is a real failure', async () => {
-    const mixed = Object.assign(new Error('acquire exited 1'), { stderr: `${refusal} fatal: bad object HEAD` });
-    const runChild = vi.fn().mockRejectedValueOnce(failure('message')).mockRejectedValueOnce(mixed);
-    const row = await check.run(context(runChild));
-    expect(row.ok).toBe(false);
-    expect(row.skipped).not.toBe(true);
-  });
-
-  it('a retry with an unrecognised failure-shaped line is a real failure', async () => {
-    const odd = Object.assign(new Error('acquire exited 1'), { stderr: `${refusal}\nsomething unexpected failed` });
-    const runChild = vi.fn().mockRejectedValueOnce(failure('message')).mockRejectedValueOnce(odd);
-    const row = await check.run(context(runChild));
-    expect(row.ok).toBe(false);
-  });
-
-  it('a provision failure whose text merely contains a lane-hold path is a real failure', async () => {
-    const odd = Object.assign(new Error('acquire exited 1'), { stderr: `${refusal}\n  ⚠ lane-4 claimed but failed to provision (git checkout exited 128 in /workspace/lane-hold) — releasing it` });
-    const runChild = vi.fn().mockRejectedValueOnce(failure('message')).mockRejectedValueOnce(odd);
-    const row = await check.run(context(runChild));
-    expect(row.ok).toBe(false);
-  });
-
-  it('a lane-hold refusal with appended failure text is a real failure', async () => {
-    const odd = Object.assign(new Error('acquire exited 1'), { stderr: `${refusal}; npm ci failed` });
-    const runChild = vi.fn().mockRejectedValueOnce(failure('message')).mockRejectedValueOnce(odd);
-    expect((await check.run(context(runChild))).ok).toBe(false);
-  });
-
-  it('a retry that exited on a signal is a real failure even if the same line mentions lane-hold', async () => {
-    const sig = new Error(`acquire exited SIGSEGV: ${refusal}`);
-    const runChild = vi.fn().mockRejectedValueOnce(failure('message')).mockRejectedValueOnce(sig);
-    const row = await check.run(context(runChild));
-    expect(row.ok).toBe(false);
-    expect(row.skipped).not.toBe(true);
-  });
-
-  it('a retry whose later stderr line is an unrelated provision failure is a real failure even though lane-hold appears earlier', async () => {
-    const mixed = Object.assign(new Error('acquire exited 1'), { stderr: `${refusal}\nlane-4 claimed but failed to provision (fatal: bad object)\nno lane within 30000ms` });
-    const runChild = vi.fn().mockRejectedValueOnce(failure('message')).mockRejectedValueOnce(mixed);
-    const row = await check.run(context(runChild));
-    expect(row.ok).toBe(false);
-    expect(row.skipped).not.toBe(true);
-  });
-
-  it.each(['message', 'stderr', 'diagnostics'])('persistent lane-hold in %s retries exactly once and returns an environmental skip', async (source) => {
-    const runChild = vi.fn().mockRejectedValue(failure(source));
+  it('two environmental-only exits are a lane-hold-refused skip, with no release attempted', async () => {
+    const runChild = vi.fn().mockRejectedValue(exit(75));
     const row = await check.run(context(runChild));
     expect(row).toMatchObject({ ok: true, skipped: true, skipReason: 'lane-hold-refused' });
-    expect(runChild.mock.calls.filter(([, args]) => args[1] === 'acquire')).toHaveLength(2);
+    expect(acquires(runChild)).toHaveLength(2);
     expect(runChild.mock.calls.some(([, args]) => args.some((a) => /^--lane=/.test(a)))).toBe(false);
   });
 
   it.each([
-    'no lane within 30000ms (lock contention)',
-    'timed out after 120000ms (process group killed)',
-    'acquire crashed with signal SIGSEGV',
-    'acquire failed to provision lane-4',
-  ])('fails when lane-hold retry encounters an unrelated error: %s', async (message) => {
-    const retryError = Object.assign(new Error(message), { stderr: 'retry failure diagnostics' });
-    const runChild = vi.fn().mockRejectedValueOnce(failure('stderr')).mockRejectedValueOnce(retryError);
-    const ctx = context(runChild);
-    // Even an exhausted wait on a busy host cannot carry the first error's lane-hold classification forward.
-    ctx.hostBusy = () => true;
-    ctx.clock = vi.fn().mockReturnValueOnce(1000).mockReturnValue(1000 + ctx.budgets.laneAcquireWaitMs);
-    const row = await check.run(ctx);
-    expect(row.ok).toBe(false);
-    expect(row.skipped).not.toBe(true);
-    expect(row.skipReason).toBeUndefined();
-    expect(row.detail).toContain(message);
-    expect(row.stderrTail).toContain('retry failure diagnostics');
-    expect(runChild).toHaveBeenCalledTimes(2);
-    expect(runChild.mock.calls.filter(([, args]) => args[1] === 'acquire')).toHaveLength(2);
-  });
-
-  it('a failure without lane-hold stays ok:false and is never retried or skipped', async () => {
-    const runChild = vi.fn().mockRejectedValue(Object.assign(new Error('acquire exited 1'), { stderr: 'fatal: bad object HEAD' }));
+    ['ordinary exit 1 mentioning lane-hold', exit(1)],
+    ['a signal', Object.assign(new Error('exited SIGSEGV: lane-hold'), { status: null, signal: 'SIGSEGV' })],
+    ['a timeout', Object.assign(new Error('timed out after 120000ms lane-hold'), { status: null, signal: 'SIGKILL' })],
+    ['75 with a signal', exit(75, { signal: 'SIGTERM' })],
+  ])('the first failure being %s is never retried or skipped', async (_n, err) => {
+    const runChild = vi.fn().mockRejectedValue(err);
     const row = await check.run(context(runChild));
     expect(row.ok).toBe(false);
     expect(row.skipped).not.toBe(true);
-    expect(row.skipReason).toBeUndefined();
-    expect(row.detail).toContain('acquire exited 1');
-    expect(runChild).toHaveBeenCalledTimes(1);
+    expect(acquires(runChild)).toHaveLength(1);
+  });
+
+  it.each([
+    ['exit 1 with lane-hold in stderr', exit(1, { stderr: 'lane-9: reset REFUSED — lane-hold: x\nnpm ERR! code EIO' })],
+    ['a signal', Object.assign(new Error('exited SIGSEGV'), { status: null, signal: 'SIGSEGV' })],
+    ['a fatal git error', exit(128, { stderr: 'fatal: bad object HEAD lane-hold' })],
+  ])('a retry that fails with %s after an environmental first failure is a real failure', async (_n, err) => {
+    const runChild = vi.fn().mockRejectedValueOnce(exit(75)).mockRejectedValueOnce(err);
+    const row = await check.run(context(runChild));
+    expect(row.ok).toBe(false);
+    expect(row.skipped).not.toBe(true);
+    expect(acquires(runChild)).toHaveLength(2);
   });
 });
 
