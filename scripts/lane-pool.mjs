@@ -2139,7 +2139,7 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
     // xbdixjc — the hold rule, on the fresh pre-reset snapshot. THROWS like the containment re-check above, so
     // auto-pick restores the claim and moves to the next lane; `--force` does not override it.
     const held = laneHoldRefuses(dir, 'reset', { unpushed: before.unpushed ?? undefined });
-    if (held) throw new Error(`lane-${chosen} is held — ${held.reason}; not reset (pick another lane)`);
+    if (held) throw Object.assign(new Error(`lane-${chosen} is held — ${held.reason}; not reset (pick another lane)`), { laneHoldRefusal: true });
     acquireResetSnapshots.set(chosen, before);
     git(['checkout', '-B', repo.branch, baseRef, '--quiet', '--force'], dir);
     git(['clean', '-fd', '--quiet'], dir);
@@ -2492,7 +2492,7 @@ async function cmdAcquire(repo) {
           break;
         } catch (e) {
           const failure = msgOf(e);
-          if (failure.includes('lane-hold')) holdRefused.add(pick);
+          if (e && e.laneHoldRefusal === true) holdRefused.add(pick); // structural flag, never message text
           else sawNonHoldProvisionFailure = true;
           if (failure.includes('index.lock')) {
             log(`lane-${pick}: stale .git/index.lock - skipped; needs cleanup`);
