@@ -25,6 +25,58 @@ describe('companion clear-human verdict binding', () => {
   const approve = (basis, overrides = {}) => ev('approval', 5, {
     approval: 'clear-human', delegation, headSha: HEAD, basis, ...overrides,
   });
+  const bounce = (verdict, m) => buildVerdictRecord({ repo, pr: PR, verdict,
+    at: at(m), source: 'test', headSha: HEAD, reason: 'review bounce/rearm' });
+
+  describe.each([
+    ['changes', [VERDICTS.CHANGES]],
+    ['pending', [VERDICTS.PENDING]],
+    ['changes then pending', [VERDICTS.CHANGES, VERDICTS.PENDING]],
+    ['repeated bounce with observation', [VERDICTS.CHANGES, VERDICTS.PENDING,
+      VERDICTS.OBSERVED, VERDICTS.CHANGES, VERDICTS.PENDING]],
+  ])('human hold across %s', (_name, sequence) => {
+    const history = () => [human(), ...sequence.map((v, i) => bounce(v, i + 2))];
+    const ceremony = () => ({ ...clear(), at: at(20) });
+    const approval = (overrides = {}) => ({ ...approve([ledgerEventId(human())], overrides), at: at(21) });
+
+    it.each([
+      ['no approval', null],
+      ['different head', { headSha: OLD_HEAD }],
+      ['missing head', { headSha: undefined }],
+      ['missing basis', { basis: undefined }],
+      ['missing both bindings', { headSha: undefined, basis: undefined }],
+      ['wrong hold', { basis: [ledgerEventId(label(0))] }],
+      ['expired delegation', { delegation: { ...delegation, expires: at(299) } }],
+    ])('refuses clear-human with %s', (_case, overrides) => {
+      const events = [...history(), ceremony(), ...(overrides === null ? [] : [approval(overrides)])];
+      const state = derivePrState(events, facts());
+      expect(state).toMatchObject({ lifecycleState: 'NEEDS-OPERATOR', clears: false });
+      expect(state.holds.map(h => h.code)).toContain('verdict:human');
+    });
+
+    it.each([delegation, null])('allows a valid companion approval (delegation: %j)', delegated => {
+      expect(derivePrState([...history(), ceremony(), approval({ delegation: delegated })], facts()))
+        .toMatchObject({ lifecycleState: 'READY-TO-MERGE', clears: true, holds: [] });
+    });
+
+    it('does not let an approval alone clear a later bounce or rearm verdict', () => {
+      const state = derivePrState([...history(), approval()], facts());
+      expect(state.clears).toBe(false);
+      expect(state.holds.length).toBeGreaterThan(0);
+      expect(state.lifecycleState).not.toBe('READY-TO-MERGE');
+    });
+
+    it('cannot reuse approval for an earlier human hold after a new human verdict', () => {
+      const second = { ...human(), at: at(10) };
+      expect(derivePrState([...history(), approval(), second, bounce(VERDICTS.PENDING, 22), ceremony()], facts()))
+        .toMatchObject({ lifecycleState: 'NEEDS-OPERATOR', clears: false });
+    });
+
+    it.each([VERDICTS.ACCEPTED, VERDICTS.RESTAMPED])('%s still supersedes the human hold', verdict => {
+      expect(derivePrState([...history(), bounce(verdict, 22)], facts()))
+        .toMatchObject({ lifecycleState: 'READY-TO-MERGE', clears: true, holds: [] });
+    });
+  });
 
   it('keeps an unnamed hand-added hold when the companion verdict is present', () => {
     const verdict = human(), hold = label(2);
