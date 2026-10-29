@@ -45,17 +45,20 @@ export function reviewRunEvidence(run) {
     ? run.stepTimings?.find(t => t.step === 'referralVerdict')?.finishedAt : undefined;
   const savedReferral = resuming && !ownReferral;
   const state = (savedReferral ? run.resumeOf.mandatoryReferrals : run.findings?.mandatoryReferrals)?.effects?.find(e => e.type === 'review.mandatory-referrals')?.result;
-  const failures = (state?.records ?? []).filter(r => r.failure != null).map(r => r.failure);
+  const records = Array.isArray(state?.records) ? state.records : [];
   // Only unambiguous persisted quota evidence for every failed seat exempts an attempt.
   // Unfinished seats, missing evidence, conflicting failures, and attempts that reached post-seat steps still count.
   let quotaOnly = false;
   try {
+    const validRecords = state == null || (Array.isArray(state.records)
+      && records.every(r => r != null && typeof r === 'object' && !Array.isArray(r)));
+    const failures = records.filter(r => r?.failure != null).map(r => r.failure);
     const failedSeats = Array.isArray(run.seatTimings) ? run.seatTimings.filter(t => t?.verdict === 'error') : [];
     const telemetry = run.telemetry;
     // Repeated calls to the same seat each need their own persisted quota row.
     const failuresBySeat = new Map();
     for (const t of failedSeats) failuresBySeat.set(t.seat, (failuresBySeat.get(t.seat) ?? 0) + 1);
-    quotaOnly = failedSeats.length > 0 && Array.isArray(telemetry) && failures.every(isQuotaError)
+    quotaOnly = validRecords && failedSeats.length > 0 && Array.isArray(telemetry) && failures.every(isQuotaError)
       && run.seatTimings.every(t => t?.verdict && t?.finishedAt)
       && failedSeats.every(t => {
         if (typeof t.seat !== 'string' || t.seat.length === 0) return false;
@@ -87,8 +90,8 @@ export function reviewRunEvidence(run) {
   const pending = verdict?.pendingReferrals ?? [];
   const resumeAdvise = Boolean(resuming && ownReferral && !pending.includes('referral-persistence-failed'));
   const findingKeys = pending.filter(key => !PENDING_REASON_TOKENS.has(key));
-  const attempted = new Set((state?.records ?? [])
-    .filter(r => r.repo === read.repo && r.pr === Number(read.pr) && r.head === head && r.attempted)
+  const attempted = new Set(records
+    .filter(r => r?.repo === read.repo && r.pr === Number(read.pr) && r.head === head && r.attempted)
     .flatMap(r => r.referrals.map(f => f.key)));
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
     quotaOnly,
@@ -98,7 +101,7 @@ export function reviewRunEvidence(run) {
     pending, attempted: findingKeys.length > 0 && findingKeys.every(key => attempted.has(key)),
     persistenceFailed: pending.includes('referral-persistence-failed'),
     count: pending.includes('referral-persistence-failed') ? Math.max(1, verdict?.referrals?.length ?? 0) : findingKeys.length,
-    rulings: (state?.records ?? []).flatMap(r => r.rulings ?? []).map(r => JSON.stringify(r)),
+    rulings: records.flatMap(r => r?.rulings ?? []).map(r => JSON.stringify(r)),
     // How many times this run was already resumed to retry a failed referral persist (card 5752 below). Each such
     // resume is one spent slot of the 15/30/60 retry budget, though it stays the same run.
     persistRetries: Math.max(0, Number(run.resumeOf?.persistRetries) || 0),
