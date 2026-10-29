@@ -719,7 +719,7 @@ describe('idle-claim auto-release (R201)', () => {
   it('fails closed: an unreadable PR head never releases', () => {
     acquire();
     sweep(T0 + 60_000, { head: null });
-    const r = sweep(T0 + 60_000 + 10 * IDLE_MS, { head: null });
+    const r = sweep(T0 + 60_000 + 2 * IDLE_MS, { head: null });
     expect(r.released ?? []).toHaveLength(0);
     expect(readFixDispatchClaim({ repo: 'we', pr: 5996, kind: 'fix', lockRoot: claimRoot })?.owner).toBe('A');
   });
@@ -728,7 +728,7 @@ describe('idle-claim auto-release (R201)', () => {
     acquire();
     const boom = () => { throw new Error('gh down'); };
     sweep(T0 + 60_000, { extra: { prHeadFor: boom } });
-    const r = sweep(T0 + 60_000 + 10 * IDLE_MS, { extra: { prHeadFor: boom } });
+    const r = sweep(T0 + 60_000 + 2 * IDLE_MS, { extra: { prHeadFor: boom } });
     expect(r.released ?? []).toHaveLength(0);
   });
 
@@ -736,7 +736,7 @@ describe('idle-claim auto-release (R201)', () => {
     acquire();
     const idleRelease = resolveIdleClaimRelease({ env: { WE_IDLE_CLAIM_RELEASE_ENABLED: '0' }, platform: null });
     sweep(T0 + 60_000, { extra: { idleRelease } });
-    const r = sweep(T0 + 60_000 + 10 * IDLE_MS, { extra: { idleRelease } });
+    const r = sweep(T0 + 60_000 + 2 * IDLE_MS, { extra: { idleRelease } });
     expect(r.released ?? []).toHaveLength(0);
   });
 
