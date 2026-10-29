@@ -13,13 +13,13 @@ const lane = (n) => join(pool, 'holdtest', `lane-${n}`);
 const lease = (n) => join(lane(n), '.git', '.lane-lease');
 const argsForRepo = () => [`--origin=${origin}`, `--reference=${reference}`, '--name=holdtest', '--branch=main', '--no-install', '--no-reap'];
 
-function run(args, observe = false) {
+function run(args, observe = false, extraEnv = {}) {
   const result = spawnSync(process.execPath, [ ...(observe ? ['--require', preload] : []), SCRIPT, ...args, ...argsForRepo() ], {
     encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
     env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, LANE_POOL_ROOT: pool,
       LANE_POOL_NO_RECOVER: '1', LANE_POOL_ACQUIRE_GROWTH_MAX_NEW: '0',
       WE_LANE_HOLD: 'enforce', WE_AWAIT_VERIFY_STORE: join(base, 'await-store'),
-      LANE_POOL_ACQUIRE_DEBUG: '1', TEST_ACQUIRE_AUDIT: audit },
+      LANE_POOL_ACQUIRE_DEBUG: '1', TEST_ACQUIRE_AUDIT: audit, ...extraEnv },
   });
   expect(result.error, 'CLI must exit normally, never hit the fixture timeout').toBeUndefined();
   return { code: result.status, out: result.stdout, err: result.stderr };
@@ -34,7 +34,7 @@ function park(n) {
   return record;
 }
 const events = () => existsSync(audit) ? readFileSync(audit, 'utf8').trim().split('\n').map((s) => JSON.parse(s)) : [];
-const acquire = (waitMs, extra = []) => run(['acquire', '--no-free-list', '--json', '--session=acceptance-picker', `--wait-ms=${waitMs}`, ...extra], true);
+const acquire = (waitMs, extra = [], extraEnv = {}) => run(['acquire', '--no-free-list', '--json', '--session=acceptance-picker', `--wait-ms=${waitMs}`, ...extra], true, extraEnv);
 
 beforeAll(() => {
   fixtureRoot = mkdtempSync(join(tmpdir(), 'lane-hold-fixture-'));
@@ -90,6 +90,31 @@ Atomics.wait = function(array, index, value, ms) {
 afterEach(() => { rmSync(base, { recursive: true, force: true }); sharedFixture.restore(); });
 
 describe('lane-pool acquire after lane-hold reset refusal', () => {
+  it('skips an index.lock provision failure, releases the claim, takes the next lane and logs both diagnostics', () => {
+    provision(2);
+    const lock = join(lane(1), '.git', 'index.lock');
+    writeFileSync(lock, 'leftover index lock\n');
+    const result = acquire(0, ['--cache-ttl-ms=0']);
+    expect(result.code, result.err).toBe(0);
+    expect(JSON.parse(result.out).lane).toBe(2);
+    expect(existsSync(lease(1))).toBe(false);
+    expect(existsSync(lease(2))).toBe(true);
+    expect(readFileSync(lock, 'utf8')).toBe('leftover index lock\n');
+    expect(result.err).toContain('lane-1: stale .git/index.lock - skipped; needs cleanup');
+    expect(result.err).toMatch(/lane-1 claimed but failed to provision \([^\n]*\) — releasing it and trying another candidate/);
+    expect(events().filter((e) => e.kind === 'scan')).toHaveLength(1);
+  }, 60_000);
+
+  it.each(['1', ''])('prints __SCAN_LOCK_HELD_MS__ only with LANE_POOL_ACQUIRE_DEBUG=1 (value=%j)', (debug) => {
+    provision(1);
+    const result = acquire(0, ['--cache-ttl-ms=0'], { LANE_POOL_ACQUIRE_DEBUG: debug });
+    expect(result.code, result.err).toBe(0);
+    expect(JSON.parse(result.out).lane).toBe(1);
+    expect(events().filter((e) => e.kind === 'scan')).toHaveLength(1);
+    if (debug === '1') expect(result.err).toMatch(/^__SCAN_LOCK_HELD_MS__=\d+$/m);
+    else expect(result.err).not.toContain('__SCAN_LOCK_HELD_MS__');
+  }, 60_000);
+
   it('tries two refused lanes then the healthy lane from ONE scan snapshot and releases failed claims', () => {
     provision(3);
     const records = [park(1), park(2)];

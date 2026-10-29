@@ -2494,9 +2494,8 @@ async function cmdAcquire(repo) {
           if (failure.includes('lane-hold')) holdRefused.add(pick);
           if (failure.includes('index.lock')) {
             log(`lane-${pick}: stale .git/index.lock - skipped; needs cleanup`);
-          } else {
-            log(`  ⚠ lane-${pick} claimed but failed to provision (${String(e && e.message ? e.message : e).split('\n')[0]}) — releasing it and trying another candidate`);
           }
+          log(`  ⚠ lane-${pick} claimed but failed to provision (${String(e && e.message ? e.message : e).split('\n')[0]}) — releasing it and trying another candidate`);
           // Auto-pick never re-acquires its OWN prior lane (`selfLane` is excluded from `pickable` above), so
           // there is never a live lease of ours to restore here — just drop the one this claim just wrote.
           restoreLeaseAfterRefusedClaim(laneDir(repo, pick), null);
@@ -3109,7 +3108,7 @@ function warnPlaceholderIdentity(lanes) {
 //
 // The cache is also invalidated early by (a) a FINGERPRINT of every lane's lease marker (existence + mtime,
 // stat-only — no git, no FS events) so any acquire/release/adopt/hand-written lease misses immediately
-// (acquire callers tolerate churn within LIST_CACHE_CONTENTION_GRACE_MS), and
+// (acquire callers tolerate churn for nonempty candidate lists within listContentionGraceMs()), and
 // (b) `invalidateListCache` from the commands that reset trees WITHOUT touching a lease (provision/refresh) —
 // acquire/release/adopt/remove all change the fingerprint on their own.
 const LIST_CACHE_FILE = (repo) => join(repo.poolDir, '.list-acquirable-cache.json');
@@ -3127,7 +3126,7 @@ const numFlagOrEnv = (flag, env, dflt) => {
 };
 const listCacheTtlMs = () => numFlagOrEnv('cache-ttl-ms', 'LANE_POOL_LIST_CACHE_TTL_MS', DEFAULT_LIST_CACHE_TTL_MS);
 const listScanTimeoutMs = () => numFlagOrEnv('scan-timeout-ms', 'LANE_POOL_LIST_SCAN_TIMEOUT_MS', DEFAULT_LIST_SCAN_TIMEOUT_MS);
-const LIST_CACHE_CONTENTION_GRACE_MS = numFlagOrEnv('list-contention-grace-ms', 'LANE_POOL_LIST_CONTENTION_GRACE_MS', 8_000);
+const listContentionGraceMs = () => numFlagOrEnv('list-contention-grace-ms', 'LANE_POOL_LIST_CONTENTION_GRACE_MS', 8_000);
 // #4122 — how old the free-lane list may be and still be consulted (`--free-list-max-age-ms` / env); `--no-free-list`
 // disables the fast path outright (tests, or an operator who wants today's scan-only behavior back).
 const freeListMaxAgeMs = () => numFlagOrEnv('free-list-max-age-ms', FREE_LANE_LIST_MAX_AGE_ENV, DEFAULT_FREE_LANE_LIST_MAX_AGE_MS);
@@ -3476,7 +3475,9 @@ function readListCache(repo, nowMs, cacheTtlMs, callerDeadlineMs = null) {
   // Acquire only needs candidates: atomic claim + re-verification still decide whether a lane is safe.
   // lane-pool-acquire-contention-grace.test.mjs covers default-grace lease churn and, separately,
   // refusing a stale-listed foreign lease without overwriting it; claim/re-verify regressions cover reset safety.
-  if (callerDeadlineMs !== null && nowMs - c.writtenAt < LIST_CACHE_CONTENTION_GRACE_MS) return c.paths;
+  // An empty snapshot offers no candidates to re-verify: check its fingerprint so a newly released lane
+  // is visible immediately, including to a --wait-ms=0 caller inside the grace window.
+  if (callerDeadlineMs !== null && c.paths.length > 0 && nowMs - c.writtenAt < listContentionGraceMs()) return c.paths;
   if (c.fingerprint !== leaseFingerprint(repo)) return null; // a lease changed since the scan
   return c.paths;
 }
@@ -4730,7 +4731,7 @@ const KNOWN_FLAGS = new Set([
   'name', 'no-install', 'no-reap', 'no-reset', 'origin', 'pool', 'purpose', 'reference', 'release-reserved',
   'repo', 'reserve', 'scope', 'session', 'expect-holder', 'ttl-minutes', 'wait-ms',
   // #xn432dz — list --acquirable's single-flight cache / early-stop / bounded-scan knobs.
-  'limit', 'no-cache', 'cache-ttl-ms', 'scan-timeout-ms',
+  'limit', 'no-cache', 'cache-ttl-ms', 'scan-timeout-ms', 'list-contention-grace-ms',
   // list --acquirable's per-lane "holds un-pushed work" memo (see VERDICT_MEMO_FILE).
   'no-verdict-memo', 'verdict-memo-max-age-ms', 'clean-verdict-memo-max-age-ms',
   // xkv3p37 — list --acquirable's per-lane clean-verdict reuse window (see LANE_CLEAN_MEMO_FILE).
@@ -4812,7 +4813,7 @@ if (!cmd || cmd === 'help' || cmd === '--help' || !COMMANDS[cmd]) {
   if (cmd && cmd !== 'help' && cmd !== '--help') process.stderr.write(`unknown command: ${cmd}\n`);
   process.stderr.write(
     'usage: lane-pool.mjs <gc|provision|refresh|status|list|path|acquire|adopt|release|remove|trim|reclaim|keep|map|unmap> [--count=N] [--lane=N] [--all] [--all-pools] [--acquirable] [--max-new=N] ' +
-      '[--item=NNN[,NNN…]] [--purpose=<slug>] [--session=<slug>] [--expect-holder=<slug>] [--adopt] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--release-reserved] [--ttl-minutes=N] [--no-reset] [--no-reap] [--limit=N] [--no-cache] [--cache-ttl-ms=N] [--scan-timeout-ms=N] [--repo=<path>] [--pool=<name>] [--origin=<url>] ' +
+      '[--item=NNN[,NNN…]] [--purpose=<slug>] [--session=<slug>] [--expect-holder=<slug>] [--adopt] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--release-reserved] [--ttl-minutes=N] [--no-reset] [--no-reap] [--limit=N] [--no-cache] [--cache-ttl-ms=N] [--scan-timeout-ms=N] [--list-contention-grace-ms=N] [--repo=<path>] [--pool=<name>] [--origin=<url>] ' +
       '[--reference=<path>] [--name=<slug>] [--branch=<ref>] [--no-install] [--force] [--json] [--max=N] [--dry-run] [--override] [--reason=<text>] ' +
       '[--no-free-list] [--free-list-max-age-ms=N] [--leased-only]  # trim: shrink a pool to --max lanes (default per-repo cap; env LANE_POOL_TRIM_MAX)\n' +
       '  # gc [--watch]: serialized maintenance; --watch repeats at lanes.gc.schedule (default 24h), host load may defer a pass\n' +
@@ -4821,6 +4822,8 @@ if (!cmd || cmd === 'help' || cmd === '--help' || !COMMANDS[cmd]) {
       '  # acquire (auto-pick, no --lane): on a full pool, grows it by up to --growth-max-new=N new lanes (default 4, env ' +
       'LANE_POOL_ACQUIRE_GROWTH_MAX_NEW) up to a --hard-max=N ceiling (default 90 for web-everything/30 for siblings, env LANE_POOL_HARD_MAX) ' +
       'before failing — refuses to grow on a live remote-probe failure (#3383)\n' +
+      '  # acquire --list-contention-grace-ms=N: reuse nonempty cached candidates across lease churn for N ms ' +
+      '(env LANE_POOL_LIST_CONTENTION_GRACE_MS, default 8000; 0 disables); empty lists still require a matching fingerprint\n' +
       '  # provision --count=N [--dry-run]: --dry-run reports what WOULD be provisioned and creates/resets nothing (#4139)\n' +
       '  # reclaim --lane=N [--dry-run] [--override] [--json]: reset ONE unleased lane to origin/<branch>, only once this call\'s ' +
       'OWN re-check proves every uncommitted/ahead change is still provably preserved (#3383 gap 2 — the mutation ' +

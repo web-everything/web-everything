@@ -42,8 +42,8 @@ function runPool(args, extraEnv = {}) {
 }
 
 const list = () => runPool(['list', '--acquirable', '--json']);
-const acquire = (session, extraEnv = {}) => runPool([
-  'acquire', `--session=${session}`, '--no-free-list', '--wait-ms=20000', '--json',
+const acquire = (session, extraEnv = {}, extraArgs = []) => runPool([
+  'acquire', `--session=${session}`, '--no-free-list', '--wait-ms=20000', '--json', ...extraArgs,
 ], { CLAUDE_CODE_SESSION_ID: session, ...extraEnv });
 
 function scanProbes() {
@@ -70,9 +70,9 @@ function seedClaimedPool() {
   return first;
 }
 
-function expectSecondLane(first, extraEnv = {}, { rescans = false } = {}) {
+function expectSecondLane(first, extraEnv = {}, { rescans = false, extraArgs = [] } = {}) {
   const before = scanProbes().length;
-  const second = acquire('second-holder', extraEnv);
+  const second = acquire('second-holder', extraEnv, extraArgs);
   expect(second.lane).toBe(2);
   expect(second.lane).not.toBe(first.lane);
   const after = scanProbes().length;
@@ -109,6 +109,26 @@ afterEach(() => {
 });
 
 describe('acquire shared-list contention grace', () => {
+  it('rescans an empty cache after a lease release changes its fingerprint inside grace with --wait-ms=0', () => {
+    seedClaimedPool();
+    for (const n of [2, 3, 4]) {
+      expect(acquire(`holder-${n}`, {}, [`--lane=${n}`]).lane).toBe(n);
+    }
+    expect(list()).toEqual([]);
+    const cached = readCache();
+    expect(cached.paths).toEqual([]);
+    // Release just the lease: retain the empty snapshot and its pre-release fingerprint.
+    rmSync(join(pool, 'lane-3', '.git', '.lane-lease'));
+    expect(readCache()).toEqual(cached);
+    expect(Date.now() - cached.writtenAt).toBeLessThan(DEFAULT_GRACE_MS);
+    const before = scanProbes().length;
+    const released = acquire('released-lane-picker', { LANE_POOL_ACQUIRE_GROWTH_MAX_NEW: '0' }, ['--wait-ms=0']);
+    expect(released.lane).toBe(3);
+    expect(scanProbes().length, 'released lane must be found by a fresh scan').toBeGreaterThan(before);
+    expect(readCache().fingerprint).not.toBe(cached.fingerprint);
+    expect(readCache().paths).toEqual([join(pool, 'lane-3')]);
+  }, 30_000);
+
   it('reuses a matching cache younger than the default 8000ms grace despite a lease fingerprint change', () => {
     expectSecondLane(seedClaimedPool());
   }, 30_000);
@@ -184,6 +204,38 @@ syncBuiltinESMExports();
     const first = seedClaimedPool();
     writeCache({ ...readCache(), writtenAt: Date.now() - 2000 });
     expectSecondLane(first, { LANE_POOL_LIST_CONTENTION_GRACE_MS: '1000' }, { rescans: true });
+  }, 30_000);
+
+  it.each([
+    { grace: 20000, age: 9000, rescans: false, envGrace: '1000' },
+    { grace: 1000, age: 2000, rescans: true, envGrace: '20000' },
+  ])('honours --list-contention-grace-ms=$grace over the environment (rescans=$rescans)', ({ grace, age, rescans, envGrace }) => {
+    const first = seedClaimedPool();
+    writeCache({ ...readCache(), writtenAt: Date.now() - age });
+    expectSecondLane(first, { LANE_POOL_LIST_CONTENTION_GRACE_MS: envGrace }, {
+      rescans, extraArgs: [`--list-contention-grace-ms=${grace}`],
+    });
+  }, 30_000);
+
+  it('resolves contention grace lazily when reading the cache', () => {
+    const first = seedClaimedPool();
+    writeCache({ ...readCache(), writtenAt: Date.now() - 2000 });
+    const preload = join(base, 'change-grace-at-cache-read.test.mjs');
+    writeFileSync(preload, `import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+const read = fs.readFileSync;
+fs.readFileSync = function(path, ...args) {
+  if (String(path) === process.env.LANE_POOL_TEST_CACHE) {
+    process.env.LANE_POOL_LIST_CONTENTION_GRACE_MS = '1000';
+  }
+  return read.call(this, path, ...args);
+};
+syncBuiltinESMExports();
+`);
+    expectSecondLane(first, {
+      LANE_POOL_LIST_CONTENTION_GRACE_MS: '20000', LANE_POOL_TEST_CACHE: cachePath(),
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --import=${pathToFileURL(preload).href}`,
+    }, { rescans: true });
   }, 30_000);
 
   it('fails closed on a cache key mismatch even inside the contention grace', () => {
