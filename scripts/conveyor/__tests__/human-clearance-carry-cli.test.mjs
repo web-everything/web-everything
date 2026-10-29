@@ -26,7 +26,8 @@ const fromSha = 'a'.repeat(40), toSha = 'b'.repeat(40), fingerprint = 'c'.repeat
 const job = { pr: 1, repo: 'web-everything/web-everything' };
 const trusted = body => ({ author: { login: 'chalbert' }, body });
 
-function cliFixture({ headSha = toSha, reviews = [], labels = [], objection = false, incomplete = false } = {}) {
+function cliFixture({ headSha = toSha, reviews = [], labels = [], objection = false, incomplete = false,
+  files = ['example.txt'], filesError = false, identicalTrees = false } = {}) {
   const comments = [{ ...trusted(`<!-- reviewed-sha: ${fromSha} -->\n<!-- reviewed-diff: ${fingerprint} -->\n<!-- cleared-human: chalbert -->`),
     id: 'clearance', createdAt: '2026-10-01T00:00:00Z' }];
   if (objection) comments.push({ ...trusted('Please stop: this still needs changes.'),
@@ -37,7 +38,21 @@ function cliFixture({ headSha = toSha, reviews = [], labels = [], objection = fa
   let proofFinished = false;
   const exec = vi.fn((file, args) => {
     if (file === 'git') {
-      if (args[0] === 'rev-parse') return args.at(-1).startsWith(fromSha) ? fromSha : toSha;
+      if (args[0] === 'fetch') return '';
+      if (args[0] === 'diff' && args.includes('--name-only')) {
+        expect(args).toContain('--no-renames');
+        expect(args).toContain('-z');
+        expect(args.at(-1)).toMatch(new RegExp(`\\.\\.\\.${toSha}$`));
+        if (filesError) throw Error('pinned files unavailable');
+        return files.map(path => `${path}\0`).join('');
+      }
+      if (args[0] === 'rev-parse') {
+        if (identicalTrees && args.at(-1).endsWith('^{tree}')) {
+          proofFinished = true;
+          return 'd'.repeat(40);
+        }
+        return args.at(-1).startsWith(fromSha) ? fromSha : toSha;
+      }
       if (args[0] === 'cat-file' || (args[0] === 'merge-base' && args[1] === '--is-ancestor')) return '';
       if (args[0] === 'rev-list') {
         proofFinished = true;
@@ -65,6 +80,7 @@ function cliFixture({ headSha = toSha, reviews = [], labels = [], objection = fa
     carryOptions: { setting: { value: true, source: 'test' }, netPatchSetting: { value: false, source: 'test' },
       equivalence: 'contribution' } };
   return { exec, readEvidence, evidence, comments, options, write,
+    finishProof: () => { proofFinished = true; },
     run: () => { const status = run(options); return { status, result: JSON.parse(write.mock.calls.at(-1)[0]) }; },
     posts: () => exec.mock.calls.filter(([file, args]) => file === 'gh' && args[0] === 'pr' && args[1] === 'comment') };
 }
@@ -76,6 +92,46 @@ function changeContent(f) {
 }
 
 describe('human clearance carry CLI', () => {
+  it.each(['.github/workflows/merge-gate.yml', '.github/actions/check/action.yml',
+    '.github/workflows/deleted.yml', '.github/workflows/renamed-away.yml',
+    './.GitHub/Workflows/merge-gate.yml', '.github\\actions\\check\\action.yml'])
+  ('refuses general merge-of-main carry for protected path %s without an explicit human label', path => {
+    const f = cliFixture({ files: [path, 'example.txt'], labels: [{ name: 'review:accepted' }] });
+    f.options.carryOptions.proveNumbering = () => ({ ok: false, reason: 'not numbering-only' });
+    expect(f.run().result.carried).toBeNull();
+    expect(f.posts()).toHaveLength(0);
+    expect(applyHumanClearanceCarry).toHaveBeenCalledWith(expect.objectContaining({ numberingOnly: true }));
+  });
+
+  it('keeps workflow carry restricted when the identical-net-patch alternative is enabled', () => {
+    const f = cliFixture({ files: ['.github/workflows/merge-gate.yml'] });
+    f.options.carryOptions.netPatchSetting = { value: true, source: 'test' };
+    f.options.carryOptions.proveNumbering = () => ({ ok: false, reason: 'not numbering-only' });
+    expect(f.run().result.carried).toBeNull();
+    expect(f.posts()).toHaveLength(0);
+    expect(f.exec.mock.calls.some(([file, args]) => file === 'git' && args[0] === 'rev-list')).toBe(false);
+  });
+
+  it('fails closed when the pinned change list is unreadable', () => {
+    const f = cliFixture({ filesError: true });
+    expect(f.run()).toEqual({ status: 1, result: { carried: null,
+      reason: expect.stringContaining('pinned files unavailable') } });
+    expect(applyHumanClearanceCarry).not.toHaveBeenCalled();
+    expect(f.posts()).toHaveLength(0);
+  });
+
+  it.each(['tree', 'numbering'])('preserves the permitted %s carry for workflow edits', tier => {
+    const f = cliFixture({ files: ['.github/workflows/merge-gate.yml'], identicalTrees: tier === 'tree' });
+    f.options.carryOptions.numberingSetting = { value: true, source: 'test' };
+    f.options.carryOptions.proveNumbering = vi.fn(() => {
+      f.finishProof();
+      return { ok: true, reason: 'only numbering changed' };
+    });
+    expect(f.run().result.carried).toEqual({ fromSha, toSha, fingerprint });
+    expect(applyHumanClearanceCarry.mock.results.at(-1).value.carried.tier).toBe(tier);
+    expect(f.posts()).toHaveLength(1);
+  });
+
   it('uses the exported drain acceptance reader and emits one no-clearance JSON line', () => {
     const exec = vi.fn((file, args) => {
       expect(file).toBe('gh');
@@ -120,7 +176,9 @@ describe('human clearance carry CLI', () => {
       reason: 'carry not proven; normal review required' } });
     expect(f.options.log.mock.calls.some(([line]) => line.includes('net diff changed'))).toBe(true);
     expect(f.posts()).toHaveLength(0);
-    expect(f.exec).not.toHaveBeenCalled();
+    // Only the pinned file classification runs; no content-equivalence proof or writer runs.
+    expect(f.exec.mock.calls.every(([file, args]) => file === 'git'
+      && ['fetch', 'cat-file', 'rev-parse', 'diff'].includes(args[0]))).toBe(true);
   });
 
   it.each(['review:human', 'review:changes'])('refuses a live %s hold even beside review:accepted without a new comment', label => {

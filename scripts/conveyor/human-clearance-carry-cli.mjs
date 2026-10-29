@@ -4,6 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { readDrainAcceptance } from '../merge-ai-prs.mjs';
 import { applyHumanClearanceCarry } from '../lib/human-clearance-carry.mjs';
+import { readPinnedChangedFiles } from '../lib/merge-queue-enqueue.mjs';
+import { decideDrainWorkflowEditHold } from '../lib/drain-workflow-edit-hold.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { READ_MAX_BUFFER } from '../lib/proc-read.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
@@ -31,9 +33,15 @@ export function run({ pr, repo, cwd = process.cwd(), exec = execFileSyncThrottle
     if (!evidence.humanClearance || evidence.humanClearance.sha === evidence.headSha) {
       result = { carried: null, reason: evidence.humanClearance ? 'clearance already bound to the head' : 'no human clearance' };
     } else {
+      const changed = readPinnedChangedFiles({ headSha: evidence.headSha, cwd, exec: carryExec });
+      if (changed.error) throw Error(`workflow-edit change list unreadable: ${changed.error}`);
+      const workflow = decideDrainWorkflowEditHold({ files: changed.files, filesComplete: true,
+        headSha: evidence.headSha, humanClearedSha: evidence.humanClearance.sha });
+      if (workflow.defer) throw Error(workflow.reason);
       let liveUnreadable = false;
       const outcome = applyHumanClearanceCarry({ ...carryOptions, evidence, pr, repo, cwd, exec: carryExec, log,
-        numberingOnly: !evidence.humanClearance.diff && !evidence.humanClearance.contribution,
+        // Match the drain: workflow clearance can move only over numbering or identical root trees.
+        numberingOnly: workflow.hold === true || (!evidence.humanClearance.diff && !evidence.humanClearance.contribution),
         readLiveEvidence: () => {
           let live;
           try {

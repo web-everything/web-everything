@@ -60,12 +60,52 @@ function fixture() {
 }
 
 describe('review job human-clearance carry across mechanical head moves', () => {
+  it('runs the normal review arc when a workflow head only has general merge-of-main equivalence', () => {
+    const io = fixture();
+    const comments = [{ ...trusted(`<!-- reviewed-sha: ${fromSha} -->\n<!-- reviewed-diff: ${fingerprint} -->\n<!-- cleared-human: chalbert -->`),
+      id: 'clearance', createdAt: '2026-10-01T00:00:00Z' }];
+    const exec = vi.fn((file, args) => {
+      if (file === 'git') {
+        if (['fetch', 'cat-file', 'merge-base'].includes(args[0])) return '';
+        if (args[0] === 'diff' && args.includes('--name-only')) return '.github/workflows/merge-gate.yml\0';
+        if (args[0] === 'rev-parse') return args.at(-1).startsWith(fromSha) ? fromSha : toSha;
+        if (args[0] === 'rev-list') return `${toSha} ${fromSha} ${'d'.repeat(40)}`;
+      }
+      if (file === 'gh' && args[1] === 'view') return JSON.stringify({ headRefOid: toSha, reviews: [], labels: [{ name: 'review:accepted' }] });
+      if (file === 'gh' && args[0] === 'api') {
+        if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: {
+          comments: { totalCount: comments.length },
+        } } } });
+        return comments.map(c => [c.body.replaceAll('\n', '\\n'), c.createdAt, c.author.login, c.id, ''].join('\t')).join('\n');
+      }
+      if (file === 'gh' && args[1] === 'comment') return '';
+      throw Error(`unexpected command: ${file} ${args.join(' ')}`);
+    });
+    io.carryHumanClearance = () => {
+      let result;
+      expect(runCarryCli({ ...job, exec, readEvidence: () => ({
+        humanClearance: { sha: fromSha, diff: fingerprint, actor: 'chalbert' },
+        headSha: toSha, headDiffSha: toSha, headDiff: fingerprint,
+      }), carryOptions: { setting: { value: true, source: 'test' }, netPatchSetting: { value: false, source: 'test' },
+        proveNumbering: () => ({ ok: false, reason: 'not numbering-only' }) },
+      log: io.log, write: line => { result = JSON.parse(line); } })).toBe(0);
+      return result;
+    };
+
+    expect(runReviewJob(job, io).outcome).not.toBe('carried');
+    expect(io.runLoop).toHaveBeenCalledTimes(1);
+    expect(exec.mock.calls.filter(([file, args]) => file === 'gh' && args[1] === 'comment')).toHaveLength(0);
+  });
+
   it.each(['existing', 'during proof'])('runs the advisory arc for a human hold applied %s despite identical head trees', timing => {
     const io = fixture();
     const labels = timing === 'existing' ? [{ name: 'review:human' }] : [];
     const comments = [{ ...trusted(`<!-- reviewed-sha: ${fromSha} -->\n<!-- reviewed-diff: ${fingerprint} -->\n<!-- cleared-human: chalbert -->`),
       id: 'clearance', createdAt: '2026-10-01T00:00:00Z' }];
     const exec = vi.fn((file, args) => {
+      if (file === 'git' && ['fetch', 'cat-file'].includes(args[0])) return '';
+      if (file === 'git' && args[0] === 'diff' && args.includes('--name-only')) return 'example.txt\0';
+      if (file === 'git' && args[0] === 'rev-parse' && !args.at(-1).endsWith('^{tree}')) return toSha;
       if (file === 'git' && args[0] === 'rev-parse' && args.at(-1).endsWith('^{tree}')) {
         if (timing === 'during proof' && labels.length === 0) labels.push({ name: 'review:human' });
         return 'd'.repeat(40);
