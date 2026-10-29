@@ -689,6 +689,17 @@ export function buildJudgeArgv({
   ];
 }
 
+function markQuotaFailure(error, ...texts) {
+  for (const text of texts) {
+    const holdRow = quotaHoldRow({ provider: 'claude', error: text });
+    if (!holdRow) continue;
+    Object.assign(error, { quota: true, holdRow,
+      telemetry: { ...error.telemetry, failureKind: 'provider-quota', failureText: text.slice(0, 500) } });
+    break;
+  }
+  return error;
+}
+
 /**
  * THE OTHER PURE HALF: the CLI's stdout, turned into a validated result or a throw.
  *
@@ -767,9 +778,7 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
     if (parsed.result) {
       // The CLI's OWN error text, verbatim — never reworded.
       const error = new Error(`judge-spawn: the juror failed: ${parsed.result}`);
-      const holdRow = quotaHoldRow({ provider: 'claude', error: parsed.result });
-      if (holdRow) Object.assign(error, { quota: true, holdRow });
-      throw error;
+      throw markQuotaFailure(error, parsed.result);
     }
     // `result` is empty — the CLI gave no error text at all (reproduced twice in one night, cause
     // unknown, resolved both times by a blind retry). A bare "<no result text>" placeholder left the
@@ -987,9 +996,9 @@ export async function judgeSpawn({
         log(`judge-spawn: juror ${lens || '-'} attempt ${attempt}/${total} emitted no parseable JSON (exit ${code ?? 'none'}, signal ${signal ?? 'none'}, stdout ${stdout.length} bytes${snippet ? `, stderr: ${snippet}` : ''}); retrying with a fresh session id ${nextSid} — ${UNPARSEABLE_RETRY_SETTING.key}=${retries} (source: ${setting.source})`);
         continue;
       }
-      throw new JudgeUnparseableError({
+      throw markQuotaFailure(new JudgeUnparseableError({
         attempt, attempts: total, exitCode: code, signal, stdout, stderr, wallMs, sessionId: thisSid, failedAttempts,
-      });
+      }), stderr, stdout);
     }
     return { ...outcome, wallMs, attempts: attempt, failedAttempts, timedOut: false, loadedContextTokens: loadedContextTokens(outcome.usage), argv };
   }
