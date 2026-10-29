@@ -367,7 +367,7 @@ async function checkLanePoolList(ctx) {
   }
 }
 
-/** lane-pool acquire exits 75 (EX_TEMPFAIL) only when nothing was acquired solely because of lane-hold refusals / lock contention. */
+/** lane-pool acquire exits 75 (EX_TEMPFAIL) only when nothing was acquired solely because of lane-hold refusals. */
 const LANE_POOL_ENV_ONLY_EXIT = 75;
 const isEnvOnlyAcquireExit = (e) => e?.status === LANE_POOL_ENV_ONLY_EXIT && !e?.signal;
 
@@ -406,7 +406,7 @@ async function checkLaneAcquireRelease(ctx) {
             ...childFailureDiagnostics(retryError) };
         }
         return { ok: true, skipped: true, skipReason: 'lane-hold-refused',
-          detail: `skipped: acquire found only lane-hold / lock-contention refusals after one retry: ${firstLine(retryError)}` };
+          detail: `skipped: acquire found only lane-hold refusals after one retry: ${firstLine(retryError)}` };
       }
     }
     const parsed = JSON.parse(out);

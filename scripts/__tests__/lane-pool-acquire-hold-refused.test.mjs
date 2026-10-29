@@ -189,7 +189,7 @@ describe('lane-pool acquire after lane-hold reset refusal', () => {
       expect(held.code, held.err).toBe(0);
     }
     const result = acquire(2500);
-    expect(result.code, result.err).toBe(kind === 'lock-wait' ? 75 : 1);
+    expect(result.code, result.err).toBe(1);
     const waits = events().filter((e) => e.kind === kind);
     expect(waits.length).toBeGreaterThanOrEqual(2);
     expect(new Set(waits.map((e) => e.ms)).size, 'poll intervals must vary with injected random draws').toBeGreaterThan(1);
