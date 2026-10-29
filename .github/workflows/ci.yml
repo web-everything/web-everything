@@ -6,6 +6,8 @@ name: CI
 # main, this re-checks it on GitHub). The pull_request trigger makes the same gate a PR status check so
 # main can require it before merge (the #2138 merge-queue / self-approved-PR direction); it does not
 # block today's direct-push landing.
+# (2026-10-29: comment-only touch to make GitHub re-register this workflow; PR runs were attributed to a
+# missing workflow id 382175354 and ended startup_failure.)
 #
 # Scope: the fast deterministic lanes + the visual-regression guard (#2177), split across parallel jobs
 # so the correctness lane doesn't wait on the slower build/browser steps:
