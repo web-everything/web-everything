@@ -9,6 +9,8 @@ import { isDeepStrictEqual } from 'node:util';
 import { cascadePolicy } from '../policy-cascade.mjs';
 import { readOverlayState, overlayFilePath, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { isSafeBranchName } from '../daemon-self-sync.mjs';
+import { appendDaemonEvent } from '../daemon-events.mjs';
+import { feedPath, publishAttention } from '../../operations/needs-you-feed.mjs';
 import { markOverlayConflictWake } from '../overlay-conflict-wake.mjs';
 import { buildReverseImportGraph, testDepths, isVitestTestFile, isGraphSourceFile } from '../related-test-selection.mjs';
 import { alertsFilePath } from './state.mjs';
@@ -20,29 +22,48 @@ const validMode = mode => ['off', 'shadow', 'on'].includes(mode);
 const sidecar = (root, env) => `${overlayFilePath(root, env)}.main-sync.json`;
 const marker = (root, env, ref) => join(`${overlayFilePath(root, env)}.auto-rebase`, `${encodeURIComponent(ref)}.lock`);
 const executeGit = (args, opts) => spawnSync('git', args, { encoding: 'utf8', timeout: 60_000, maxBuffer: 8 * 1024 * 1024, ...opts });
+const cleanText = text => String(text ?? '').replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, '');
+const stderrTail = result => cleanText(result?.stderr || result?.error?.message).slice(-500);
 const output = result => {
-  if (result?.status !== 0 || result.error || typeof result.stdout !== 'string') throw new Error('command failed or incomplete; operator review required');
+  if (result?.status !== 0 || result.error || typeof result.stdout !== 'string') {
+    const step = result?.step ?? 'unknown', tail = stderrTail(result);
+    throw Object.assign(new Error(`${step}: command failed or incomplete; operator review required${tail ? `: ${tail}` : ''}`),
+      { step, stderrTail: tail });
+  }
   return result.stdout;
 };
 const paths = result => output(result).split('\0').filter(Boolean);
 const sha = result => {
   const value = output(result).trim();
-  if (!/^[a-f0-9]{40}$/.test(value)) throw new Error('invalid Git SHA; operator review required');
+  if (!/^[a-f0-9]{40}$/.test(value)) throw Object.assign(new Error('invalid Git SHA; operator review required'), { step: result.step });
   return value;
 };
+const RETRY_DELAYS = [10, 20, 30].map(minutes => minutes * 60_000);
+const retryKeys = ['retryMain', 'retryTries', 'retryAfter'];
+function clearRetry(state, ref) { for (const key of retryKeys) delete state[key][ref]; }
 function readSyncState(file, io = fs) {
   let data;
   try {
     data = JSON.parse(io.readFileSync(file, 'utf8'));
   } catch (error) { if (error.code === 'ENOENT') data = { lastSyncedMain: {} }; else throw error; }
   if (!data || !Object.hasOwn(data, 'lastSyncedMain')) throw new Error('invalid main-sync state; operator repair required');
-  for (const key of ['lastSyncedMain', 'attemptedMain', 'shadowMain', 'pushRetryMain', 'pushRetryAfter', 'errorAt']) {
+  for (const key of ['lastSyncedMain', 'attemptedMain', 'shadowMain', 'pushRetryMain', 'pushRetryAfter', 'errorAt', ...retryKeys]) {
     if (!Object.hasOwn(data, key)) data[key] = {};
-    const map = data[key], timestamp = key === 'pushRetryAfter' || key === 'errorAt';
-    if (!map || typeof map !== 'object' || Array.isArray(map) || Object.values(map).some(v => timestamp
-      ? !Number.isSafeInteger(v) || v < 0 : typeof v !== 'string' || !/^[a-f0-9]{40}$/.test(v))) throw new Error('invalid main-sync state; operator repair required');
+    const map = data[key], timestamp = ['pushRetryAfter', 'errorAt', 'retryAfter', 'retryTries'].includes(key);
+    const invalid = value => {
+      if (!timestamp) return typeof value !== 'string' || !/^[a-f0-9]{40}$/.test(value);
+      return !Number.isSafeInteger(value) || value < 0
+        || (key === 'retryTries' && (value < 1 || value > RETRY_DELAYS.length));
+    };
+    if (!map || typeof map !== 'object' || Array.isArray(map) || Object.values(map).some(invalid)) {
+      throw new Error('invalid main-sync state; operator repair required');
+    }
   }
   if (Object.keys(data.pushRetryAfter).some(ref => !data.pushRetryMain[ref])) throw new Error('incomplete push retry state; operator repair required');
+  const retryRefs = new Set(retryKeys.flatMap(key => Object.keys(data[key])));
+  if ([...retryRefs].some(ref => retryKeys.some(key => !Object.hasOwn(data[key], ref)))) {
+    throw new Error('incomplete main-sync retry state; operator repair required');
+  }
   return data;
 }
 function writeSyncState(file, data, io) {
@@ -86,8 +107,17 @@ function release(file, token, io = fs) {
   try { if (io.readFileSync(file, 'utf8') === token) io.unlinkSync(file); }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
 }
+function publishNeedsYou(root, env, ref, kind, reason, extra = {}) {
+  try {
+    const old = readOverlayState(root, { env }).overlays.find(o => o.ref === ref);
+    // Feed keys use a numeric PR; zero is the established host/non-PR convention.
+    publishAttention({ repo: 'web-everything', pr: old?.pr ?? 0, head: ref, ref, kind,
+      title: `Overlay top ${ref}`, reason, ...extra }, { path: feedPath({ env }) });
+  } catch { /* Attention publication must never interrupt the sync or local diagnostic. */ }
+}
 function needsYou(root, env, ref, error, io = fs) {
   const detail = { ref, reason: String(error?.message ?? error).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 1000) };
+  publishNeedsYou(root, env, ref, 'overlay-main-sync-needs-you', detail.reason);
   const file = alertsFilePath(root, env);
   io.mkdirSync(dirname(file), { recursive: true });
   io.appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), kind: 'overlay-main-sync-needs-you', detail })}\n`);
@@ -139,12 +169,22 @@ export function selectSyncTargets(state) {
   if (state?.corrupt || !Array.isArray(state?.overlays)) throw new Error('overlay state unavailable; operator repair required');
   return state.overlays.filter(o => !state.overlays.some(other => other !== o && other.stackBases?.includes(o.ref))).map(o => o.ref);
 }
+function openJobLog(root, env) {
+  const file = `${overlayFilePath(root, env)}.main-sync.log`;
+  try {
+    fs.mkdirSync(dirname(file), { recursive: true });
+    if (fs.existsSync(file) && fs.statSync(file).size > 1024 * 1024) {
+      fs.renameSync(file, `${file}.1`);
+    }
+    return fs.openSync(file, 'a');
+  } catch { return undefined; }
+}
 export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = spawn, git = executeGit }) {
   mode ??= resolveOverlayMainSyncMode(env).mode;
   if (!validMode(mode)) throw new Error('invalid overlay main sync mode');
   const result = { started: [], skipped: [], would: [] };
   if (mode === 'off') return result;
-  const run = args => git(args, { cwd: root, env });
+  const run = args => ({ ...git(args, { cwd: root, env }), step: args[0] });
   for (const ref of selectSyncTargets(readOverlayState(root, { env }))) {
     let token;
     const lock = marker(root, env, ref);
@@ -157,6 +197,7 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
       if (Date.now() < (synced.pushRetryAfter[ref] ?? 0)) { result.skipped.push(ref); continue; }
       output(run(['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main', `+refs/heads/${ref}:refs/remotes/origin/${ref}`]));
       const main = sha(run(['rev-parse', 'origin/main']));
+      if (synced.retryMain[ref] === main && Date.now() < synced.retryAfter[ref]) { result.skipped.push(ref); continue; }
       const last = synced.lastSyncedMain[ref];
       if (last === main || synced.attemptedMain[ref] === main || (mode === 'shadow' && synced.shadowMain[ref] === main)) {
         result.skipped.push(ref); continue;
@@ -173,8 +214,12 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
         result.would.push(ref); continue;
       }
       const owner = token;
-      const child = spawnFn(process.execPath, [SELF, `--clone=${root}`, `--ref=${ref}`, `--token=${owner}`],
-        { cwd: root, env, detached: true, stdio: 'ignore' });
+      const fd = openJobLog(root, env);
+      let child;
+      try {
+        child = spawnFn(process.execPath, [SELF, `--clone=${root}`, `--ref=${ref}`, `--token=${owner}`],
+          { cwd: root, env, detached: true, stdio: fd === undefined ? 'ignore' : ['ignore', fd, fd] });
+      } finally { if (fd !== undefined) fs.closeSync(fd); }
       child.once?.('error', error => { alert(error); release(lock, owner); });
       child.unref(); result.started.push(ref); token = null;
     } catch (error) { alert(error); result.skipped.push(ref); }
@@ -189,9 +234,19 @@ const runTests = ({ root, args, env }) => new Promise(resolveResult => {
 export async function runOverlayMainSync({ root, ref, token, env = process.env, deps = {} }) {
   const io = deps.io ?? fs, event = deps.appendOverlayEvent ?? appendOverlayEvent;
   const now = deps.now ?? (() => new Date().toISOString());
-  const git = (args, cwd = root) => (deps.git ?? executeGit)(args, { cwd, env: { ...env, ...REBUILD_IDENTITY_ENV } });
+  let step = 'state';
+  const setStep = name => { step = name; console.error(`overlay-main-sync ref=${cleanText(ref)} step=${step}`); };
+  const git = (args, cwd = root) => {
+    setStep(args[0]);
+    return { ...(deps.git ?? executeGit)(args, { cwd, env: { ...env, ...REBUILD_IDENTITY_ENV } }), step };
+  };
+  const failureEvent = async error => {
+    const detail = { ref, step: error.step ?? step, stderrTail: error.stderrTail ?? '', main: main ?? null };
+    console.error(`overlay-main-sync failed ref=${cleanText(ref)} step=${detail.step}: ${cleanText(error.message)}`);
+    await appendDaemonEvent({ kind: 'overlay-main-sync-failed', detail }, { env });
+  };
   const lock = marker(root, env, ref);
-  let scratchParent, heartbeat, main, publicationStarted = false;
+  let scratchParent, heartbeat, main, mergeConflict = false, publicationStarted = false;
   try {
     if (!isSafeBranchName(ref)) throw new Error('unsafe overlay ref');
     readSyncState(sidecar(root, env), io);
@@ -203,8 +258,10 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
       catch { /* ownership is checked again before push */ }
     }, deps.heartbeatMs ?? 60_000);
     heartbeat.unref();
+    setStep('registration');
     const state = readOverlayState(root, { env }), old = state.overlays.find(o => o.ref === ref);
     if (state.corrupt || !old || !selectSyncTargets(state).includes(ref)) throw new Error('overlay registration unavailable');
+    setStep('scratch');
     scratchParent = io.mkdtempSync(join(env.TMPDIR || tmpdir(), 'we-overlay-main-sync-'));
     const scratch = join(scratchParent, 'repo');
     const url = output(git(['remote', 'get-url', 'origin'])).trim();
@@ -221,14 +278,19 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     const merge = git(['merge', '--no-edit', 'origin/main'], scratch);
     const conflicts = paths(git(['diff', '--name-only', '-z', '--diff-filter=U'], scratch));
     if (conflicts.length) {
+      mergeConflict = true;
       output(git(['merge', '--abort'], scratch));
       event(root, { kind: 'overlay-main-merge-conflict', ref, files: conflicts }, { env });
       if (old.pr) markOverlayConflictWake(env, { pr: old.pr, ref, files: conflicts, at: now(), clone: root });
-      throw new Error(`merge conflicts require operator resolution: ${conflicts.join(', ')}`);
+      else publishNeedsYou(root, env, ref, 'overlay-main-merge-conflict',
+        `Merge conflicts on ${ref}: ${conflicts.join(', ')}`, { files: conflicts });
+      throw Object.assign(new Error(`merge conflicts require operator resolution: ${conflicts.join(', ')}`),
+        { step: 'merge', stderrTail: stderrTail(merge) });
     }
     output(merge);
     const to = sha(git(['rev-parse', 'HEAD'], scratch));
     const files = paths(git(['ls-files', '-z'], scratch)), candidates = new Set(files);
+    setStep('test-select');
     // Read all graph inputs first: the shared helper skips unreadable files; this caller refuses them.
     const contents = new Map(files.filter(isGraphSourceFile).map(f => [f, io.readFileSync(join(scratch, f), 'utf8')]));
     const reverse = buildReverseImportGraph({ files, readFile: f => contents.get(f) });
@@ -245,12 +307,14 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     const reportFile = join(scratchParent, 'tests.json');
     const args = ['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=540000', '--', 'npx', 'vitest', 'run', ...tests,
       '--reporter=default', '--reporter=json', `--outputFile.json=${reportFile}`];
-    output(await (deps.testRunner ?? runTests)({ root: scratch, args, env }));
+    setStep('tests');
+    output({ ...await (deps.testRunner ?? runTests)({ root: scratch, args, env }), step });
     if (io.statSync(reportFile).size > 8 * 1024 * 1024) throw new Error('test report over 8 MiB; operator review required');
     const report = JSON.parse(io.readFileSync(reportFile, 'utf8'));
     const executed = new Set((report.testResults ?? []).filter(r => Array.isArray(r.assertionResults)
       && r.assertionResults.length && r.assertionResults.every(a => a.status === 'passed')).map(r => r.name));
     if (tests.some(f => !executed.has(join(io.realpathSync(scratch), f)))) throw new Error('selected tests did not pass or execute; operator review required');
+    setStep('verify');
     const current = readOverlayState(root, { env });
     if (current.corrupt || !isDeepStrictEqual(current.overlays.find(o => o.ref === ref), old)
       || io.readFileSync(lock, 'utf8') !== token) throw new Error('overlay registration or marker changed');
@@ -265,24 +329,43 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
         state.pushRetryAfter[ref] = Date.now() + 10 * 60_000;
         state.pushRetryMain[ref] = main;
       }, io);
-      const reason = String(push?.stderr || push?.error?.message || 'push rejected or failed');
-      rateLimitedAlert(root, env, ref, new Error(`push failed; retry in ten minutes: ${reason}`), io);
+      const tail = stderrTail(push);
+      const error = Object.assign(new Error(`push failed; retry in ten minutes: ${tail || 'push rejected or failed'}`),
+        { step: 'push', stderrTail: tail });
+      await failureEvent(error);
+      rateLimitedAlert(root, env, ref, error, io);
       return { pushed: false };
     }
+    setStep('state-publish');
     updateSyncState(file, state => {
+      clearRetry(state, ref);
       state.lastSyncedMain[ref] = main;
       delete state.pushRetryAfter[ref]; delete state.pushRetryMain[ref];
     }, io);
     event(root, { kind: 'overlay-main-synced', ref, from, to, tests }, { env });
     return { pushed: true, ref, from, to, tests };
-  } catch (error) {
+  } catch (cause) {
+    const failedStep = cause.step ?? step;
+    const message = cleanText(cause.message ?? cause);
+    const error = Object.assign(new Error(message.startsWith(`${failedStep}: `) ? message : `${failedStep}: ${message}`),
+      { step: failedStep, stderrTail: cause.stderrTail ?? '' });
     try {
-      // A state-lock/write failure after attempting publication must remain retryable;
-      // attemptedMain is reserved for merge/test failures requiring a new main.
+      // Publication has its own retry path; conflicts require a human immediately.
       if (main && !publicationStarted) {
-        updateSyncState(sidecar(root, env), state => { state.attemptedMain[ref] = main; }, io);
+        updateSyncState(sidecar(root, env), state => {
+          const tries = state.retryMain[ref] === main ? state.retryTries[ref] : 0;
+          if (mergeConflict || tries >= RETRY_DELAYS.length) {
+            state.attemptedMain[ref] = main;
+            clearRetry(state, ref);
+          } else {
+            state.retryMain[ref] = main;
+            state.retryTries[ref] = tries + 1;
+            state.retryAfter[ref] = Date.now() + RETRY_DELAYS[tries];
+          }
+        }, io);
       }
     } catch { /* The diagnostic below uses its own rate-limit marker. */ }
+    await failureEvent(error);
     rateLimitedAlert(root, env, ref, error, io); throw error;
   }
   finally {
