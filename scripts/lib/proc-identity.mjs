@@ -74,12 +74,15 @@ function readdir(path) {
 }
 
 function dependencies(deps) {
-  return { platform: process.platform, readFile, readdir, exec: execFileSync, ...deps };
+  return { platform: process.platform, readFile, readdir, kill: process.kill, exec: execFileSync, ...deps };
 }
 
 function exec(deps, file, args) {
-  return boundedText(deps.exec(file, args, { ...EXEC_OPTIONS }));
+  return boundedText(deps.exec(file, args, { ...EXEC_OPTIONS, env: { ...process.env, TZ: 'UTC', LC_ALL: 'C' } }));
 }
+
+// Export the production adapters so their byte/read/closure bounds can be tested.
+export { readFile as boundedReadFile, readdir as boundedReaddir };
 
 /** A missing or unreadable boot identifier is never a wildcard identity. */
 export function currentBootId(deps = {}) {
@@ -87,7 +90,7 @@ export function currentBootId(deps = {}) {
   try {
     const value = (io.platform === 'linux'
       ? boundedText(io.readFile('/proc/sys/kernel/random/boot_id'))
-      : io.platform === 'darwin' ? exec(io, 'sysctl', ['-n', 'kern.bootsessionuuid']) : '').trim();
+      : io.platform === 'darwin' ? exec(io, '/usr/sbin/sysctl', ['-n', 'kern.bootsessionuuid']) : '').trim();
     return validBootId(value) ? value : null;
   } catch {
     return null;
@@ -143,6 +146,16 @@ function identity({ pgid, ...entry }, bootId) {
   return { ...entry, bootId };
 }
 
+function linuxAbsenceConfirmed(pid, io) {
+  if (!currentBootId(io)) return false;
+  // hidepid can conceal a live process even while boot_id is readable.
+  // Signal 0 checks existence without delivering a signal; EPERM is unknown.
+  try { io.kill(pid, 0); } catch (error) {
+    return error.code === 'ESRCH';
+  }
+  return false;
+}
+
 export function readIdentity(pid, deps = {}) {
   if (!positive(pid)) return unknown('Invalid pid');
   const io = dependencies(deps);
@@ -150,11 +163,24 @@ export function readIdentity(pid, deps = {}) {
   try {
     if (io.platform === 'linux') {
       try { entry = linuxProcess(pid, io); } catch (error) {
-        if (error.code === 'ENOENT' || error.code === 'ESRCH') return { status: 'gone' };
+        if (error.code === 'ENOENT' || error.code === 'ESRCH') {
+          return linuxAbsenceConfirmed(pid, io) ? { status: 'gone' } : unknown('Process absence unconfirmed');
+        }
         throw error;
       }
     } else if (io.platform === 'darwin') {
-      const rows = psProcesses(exec(io, 'ps', ['-o', 'ruid,pid,ppid,pgid,stat,lstart', '-p', String(pid)]));
+      let output;
+      try {
+        output = exec(io, '/bin/ps', ['-o', 'ruid,pid,ppid,pgid,stat,lstart', '-p', String(pid)]);
+      } catch (error) {
+        // Darwin ps exits 1 on no match. Only its empty/header-only, bounded
+        // output without execution errors is absence evidence, never a census.
+        if (error.status !== 1 || error.code || error.signal ||
+            (error.stderr != null && boundedText(error.stderr).trim())) throw error;
+        output = boundedText(error.stdout);
+        if (psProcesses(output).length) throw error;
+      }
+      const rows = psProcesses(output);
       if (!rows.length) return { status: 'gone' };
       if (rows.length !== 1 || rows[0].pid !== pid) return unknown('Unexpected ps identity');
       entry = rows[0];
@@ -193,7 +219,7 @@ export function listGroup(pgid, deps = {}) {
     if (!bootId) return unknown('Boot identity unavailable');
     let rows;
     if (io.platform === 'darwin') {
-      rows = psProcesses(exec(io, 'ps', ['-A', '-o', 'ruid,pid,ppid,pgid,stat,lstart']));
+      rows = psProcesses(exec(io, '/bin/ps', ['-A', '-o', 'ruid,pid,ppid,pgid,stat,lstart']));
       // An all-process census must include at least ps itself. Empty output is
       // incomplete evidence, unlike an empty per-PID query in readIdentity.
       if (!rows.length) throw new Error('Empty all-process census');
@@ -209,7 +235,7 @@ export function listGroup(pgid, deps = {}) {
         const pid = Number(name);
         if (!positive(pid)) throw new Error('Invalid procfs pid');
         try { rows.push(linuxProcess(pid, io)); } catch (error) {
-          if (error.code !== 'ENOENT' && error.code !== 'ESRCH') throw error;
+          if ((error.code !== 'ENOENT' && error.code !== 'ESRCH') || !linuxAbsenceConfirmed(pid, io)) throw error;
         }
       }
     } else return unknown('Unsupported platform');

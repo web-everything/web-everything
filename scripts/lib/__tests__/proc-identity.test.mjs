@@ -1,6 +1,15 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { spawn } from 'node:child_process';
-import { readIdentity, sameIdentity, liveness, currentBootId, listGroup } from '../proc-identity.mjs';
+import { mkdtempSync, writeFileSync, rmSync, openSync, readSync, closeSync, opendirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { readIdentity, sameIdentity, liveness, currentBootId, listGroup, boundedReadFile, boundedReaddir } from '../proc-identity.mjs';
+
+vi.mock('node:fs', async (importOriginal) => {
+  const fs = await importOriginal();
+  return { ...fs, openSync: vi.fn(fs.openSync), readSync: vi.fn(fs.readSync),
+    closeSync: vi.fn(fs.closeSync), opendirSync: vi.fn(fs.opendirSync) };
+});
 
 const PID = 12345;
 const UID = 501;
@@ -27,6 +36,7 @@ function linuxDeps({ processes = [{ pid: PID }], bootId = BOOT } = {}) {
   });
   return {
     platform: 'linux',
+    kill: vi.fn(() => { throw Object.assign(new Error('no such process'), { code: 'ESRCH' }); }),
     uid: 9999, // Must never stand in for another process's real uid.
     readFile: vi.fn((path) => {
       if (!files.has(path)) throw enoent();
@@ -46,10 +56,10 @@ function darwinDeps({ output = HEADER + psRow(), bootId = BOOT } = {}) {
     uid: 9999,
     readFile: vi.fn(() => { throw new Error('Darwin probes must use exec'); }),
     exec: vi.fn((file, args) => {
-      if (file === 'sysctl' && JSON.stringify(args) === JSON.stringify(['-n', 'kern.bootsessionuuid'])) {
+      if (file === '/usr/sbin/sysctl' && JSON.stringify(args) === JSON.stringify(['-n', 'kern.bootsessionuuid'])) {
         return ` ${bootId}\n`;
       }
-      if (file === 'ps') return output;
+      if (file === '/bin/ps') return output;
       throw new Error(`Unexpected executable: ${file}`);
     }),
   };
@@ -78,7 +88,7 @@ describe('readIdentity parsers', () => {
     const deps = darwinDeps();
     const exec = deps.exec;
     deps.exec = vi.fn((file, args, options) => {
-      if (file === 'ps') {
+      if (file === '/bin/ps') {
         const uid = args.includes('ruid,pid,ppid,pgid,stat,lstart') ? UID : UID + 1;
         return HEADER + psRow({ uid });
       }
@@ -132,6 +142,51 @@ describe('readIdentity parsers', () => {
     const deps = darwinDeps({ output: '' });
     expect(readIdentity(PID, deps)).toEqual({ status: 'gone' });
     expect(liveness(darwinIdentity, deps)).toBe('dead');
+  });
+
+  it.each(['', HEADER, Buffer.from(HEADER)])('macOS ps no-match exit returns gone and dead (%j)', (stdout) => {
+    const deps = darwinDeps();
+    const exec = deps.exec;
+    deps.exec = vi.fn((file, ...args) => {
+      if (file === '/bin/ps') throw Object.assign(new Error('ps exited 1'), { status: 1, stdout, stderr: '', signal: null });
+      return exec(file, ...args);
+    });
+    expect(readIdentity(PID, deps)).toEqual({ status: 'gone' });
+    expect(liveness(darwinIdentity, deps)).toBe('dead');
+    expect(listGroup(PID, deps).status).toBe('unknown');
+    expect(deps.exec).toHaveBeenCalledWith('/bin/ps', ['-A', '-o', 'ruid,pid,ppid,pgid,stat,lstart'], expect.any(Object));
+  });
+
+  it.each([
+    { status: 2, stdout: HEADER }, { status: 1 },
+    { status: 1, stdout: HEADER + psRow() }, { status: 1, stdout: 'garbled' },
+    { status: 1, stdout: ' '.repeat(1024 * 1024 + 1) },
+    { status: 1, stdout: HEADER, code: 'ETIMEDOUT' },
+    { status: 1, stdout: HEADER, signal: 'SIGKILL' },
+    { status: 1, stdout: HEADER, stderr: 'ps: denied' },
+  ])('macOS execution failure remains unknown: %j', (details) => {
+    const deps = darwinDeps();
+    deps.exec = vi.fn(() => { throw Object.assign(new Error('ps failure'), details); });
+    expect(readIdentity(PID, deps).status).toBe('unknown');
+    expect(liveness(darwinIdentity, deps)).toBe('unknown');
+  });
+
+  it.each(['ENOENT', 'ESRCH'])('Linux %s plus unreadable boot id stays unknown', (code) => {
+    const deps = linuxDeps({ processes: [] });
+    deps.readFile = () => { throw Object.assign(new Error('unreadable'), { code }); };
+    expect(readIdentity(PID, deps).status).toBe('unknown');
+    expect(liveness(linuxIdentity, deps)).toBe('unknown');
+  });
+
+  it.each(['live', 'EPERM', 'EACCES'])('Linux hidden stat with %s existence probe stays unknown', (result) => {
+    const deps = linuxDeps({ processes: [] });
+    deps.kill = vi.fn(() => {
+      if (result !== 'live') throw Object.assign(new Error('denied'), { code: result });
+      return true;
+    });
+    expect(readIdentity(PID, deps).status).toBe('unknown');
+    expect(liveness(linuxIdentity, deps)).toBe('unknown');
+    expect(deps.kill).toHaveBeenCalledWith(PID, 0);
   });
 
   it('unreadable Linux evidence fails closed as unknown, with a reason', () => {
@@ -282,11 +337,12 @@ describe('bounded probes fail closed', () => {
     expect(readIdentity(PID, deps).status).toBe('ok');
     expect(currentBootId(deps)).toBe(BOOT);
     expect(listGroup(PID, deps).status).toBe('ok');
-    expect(deps.exec).toHaveBeenCalledWith('ps', ['-o', 'ruid,pid,ppid,pgid,stat,lstart', '-p', String(PID)], expect.any(Object));
-    expect(deps.exec).toHaveBeenCalledWith('ps', ['-A', '-o', 'ruid,pid,ppid,pgid,stat,lstart'], expect.any(Object));
-    expect(deps.exec).toHaveBeenCalledWith('sysctl', ['-n', 'kern.bootsessionuuid'], expect.any(Object));
+    expect(deps.exec).toHaveBeenCalledWith('/bin/ps', ['-o', 'ruid,pid,ppid,pgid,stat,lstart', '-p', String(PID)], expect.any(Object));
+    expect(deps.exec).toHaveBeenCalledWith('/bin/ps', ['-A', '-o', 'ruid,pid,ppid,pgid,stat,lstart'], expect.any(Object));
+    expect(deps.exec).toHaveBeenCalledWith('/usr/sbin/sysctl', ['-n', 'kern.bootsessionuuid'], expect.any(Object));
     deps.exec.mock.calls.forEach(([file, args, options]) => {
-      expect(['ps', 'sysctl']).toContain(file);
+      expect(['/bin/ps', '/usr/sbin/sysctl']).toContain(file);
+      expect(options.env).toMatchObject({ TZ: 'UTC', LC_ALL: 'C' });
       expect(Array.isArray(args)).toBe(true);
       expect(Number.isFinite(options.timeout)).toBe(true);
       expect(options.timeout).toBeGreaterThan(0);
@@ -366,6 +422,23 @@ describe('listGroup', () => {
     expect(listGroup(PID, deps)).toEqual({ status: 'unknown', reason: expect.any(String) });
   });
 
+  it.each(['live', 'EPERM', 'ESRCH'])('Linux missing group member needs confirmed absence (%s)', (result) => {
+    const deps = linuxDeps();
+    const readFile = deps.readFile;
+    deps.readFile = (path) => {
+      if (path.endsWith('/stat')) throw enoent();
+      return readFile(path);
+    };
+    deps.kill = vi.fn(() => {
+      if (result !== 'live') throw Object.assign(new Error(result), { code: result });
+      return true;
+    });
+    expect(listGroup(PID, deps)).toEqual(result === 'ESRCH'
+      ? { status: 'ok', identities: [] }
+      : { status: 'unknown', reason: expect.any(String) });
+    expect(deps.kill).toHaveBeenCalledWith(PID, 0);
+  });
+
   it.each(['garbled', 'x'.repeat(1024 * 1024 + 1)])('incomplete macOS group output fails closed', (output) => {
     expect(listGroup(PID, darwinDeps({ output })).status).toBe('unknown');
   });
@@ -404,15 +477,131 @@ describe('listGroup', () => {
     const deps = darwinDeps();
     const exec = deps.exec;
     deps.exec = vi.fn((file, ...args) => {
-      if (file === 'ps') throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' });
+      if (file === '/bin/ps') throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' });
       return exec(file, ...args);
     });
     expect(listGroup(PID, deps)).toEqual({ status: 'unknown', reason: expect.any(String) });
-    expect(deps.exec).toHaveBeenCalledWith('ps', ['-A', '-o', 'ruid,pid,ppid,pgid,stat,lstart'], expect.any(Object));
+    expect(deps.exec).toHaveBeenCalledWith('/bin/ps', ['-A', '-o', 'ruid,pid,ppid,pgid,stat,lstart'], expect.any(Object));
+  });
+});
+
+describe('default bounded filesystem adapters', () => {
+  const maxBytes = 1024 * 1024;
+  afterEach(async () => {
+    const fs = await vi.importActual('node:fs');
+    for (const [name, mock] of Object.entries({ openSync, readSync, closeSync, opendirSync })) {
+      mock.mockReset().mockImplementation(fs[name]);
+    }
+  });
+
+  it('default procfs reader reads at most MAX_BYTES plus one byte and closes on rejection', () => {
+    const root = mkdtempSync(join(tmpdir(), 'proc-identity-'));
+    const path = join(root, 'large');
+    writeFileSync(path, Buffer.alloc(maxBytes * 2, 120));
+    const nativeRead = readSync.getMockImplementation();
+    let total = 0;
+    const ranges = [];
+    readSync.mockImplementation((fd, buffer, offset, length, position) => {
+      ranges.push({ offset, length, capacity: buffer.length });
+      const count = nativeRead(fd, buffer, offset, Math.min(length, 65536), position);
+      total += count;
+      return count;
+    });
+    closeSync.mockClear();
+    try {
+      expect(() => boundedReadFile(path)).toThrow(/1 MiB/);
+      expect(total).toBe(maxBytes + 1);
+      expect(ranges.length).toBeGreaterThan(1);
+      for (const range of ranges) {
+        expect(range.capacity).toBe(maxBytes + 1);
+        expect(range.offset + range.length).toBe(maxBytes + 1);
+      }
+      expect(closeSync).toHaveBeenCalledTimes(1);
+      expect(() => nativeRead(closeSync.mock.calls[0][0], Buffer.alloc(1), 0, 1, null)).toThrow();
+    } finally {
+      readSync.mockImplementation(nativeRead);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('default reader accepts exactly MAX_BYTES and closes on successful EOF', () => {
+    const root = mkdtempSync(join(tmpdir(), 'proc-identity-'));
+    const path = join(root, 'exact');
+    writeFileSync(path, 'x'.repeat(maxBytes));
+    closeSync.mockClear();
+    try {
+      expect(boundedReadFile(path)).toBe('x'.repeat(maxBytes));
+      expect(closeSync).toHaveBeenCalledTimes(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('default procfs reader honours deadline between reads and closes on timeout', () => {
+    const nativeRead = readSync.getMockImplementation();
+    const clock = vi.spyOn(Date, 'now').mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValue(2000);
+    openSync.mockReturnValueOnce(987);
+    readSync.mockImplementationOnce(() => 1).mockImplementation(() => { throw new Error('Unexpected second read'); });
+    closeSync.mockImplementationOnce(() => {});
+    readSync.mockClear();
+    closeSync.mockClear();
+    try {
+      expect(() => boundedReadFile('/synthetic')).toThrow(/timed out/);
+      expect(readSync).toHaveBeenCalledTimes(1);
+      expect(closeSync).toHaveBeenCalledWith(987);
+    } finally { clock.mockRestore(); readSync.mockImplementation(nativeRead); }
+  });
+
+  it('default procfs reader closes when the filesystem read throws', () => {
+    openSync.mockReturnValueOnce(987);
+    readSync.mockImplementationOnce(() => { throw new Error('read failed'); });
+    closeSync.mockImplementationOnce(() => {});
+    closeSync.mockClear();
+    expect(() => boundedReadFile('/synthetic')).toThrow('read failed');
+    expect(closeSync).toHaveBeenCalledWith(987);
+  });
+
+  it.each([65536, 65537])('default directory reader enforces the 65536 entry cap (%s)', (count) => {
+    let seen = 0;
+    const dir = { readSync: vi.fn(() => seen++ < count ? { name: String(seen) } : null), closeSync: vi.fn() };
+    opendirSync.mockReturnValueOnce(dir);
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(0);
+    try {
+      if (count === 65536) expect(boundedReaddir('/synthetic')).toHaveLength(count);
+      else expect(() => boundedReaddir('/synthetic')).toThrow(/scan limit/);
+      expect(dir.readSync.mock.calls.length).toBeLessThanOrEqual(65537);
+      expect(dir.closeSync).toHaveBeenCalledTimes(1);
+    } finally { clock.mockRestore(); }
+  });
+
+  it('default directory reader honours deadline and closes on timeout', () => {
+    const dir = { readSync: vi.fn(() => ({ name: '1' })), closeSync: vi.fn() };
+    opendirSync.mockReturnValueOnce(dir);
+    const clock = vi.spyOn(Date, 'now').mockReturnValueOnce(0).mockReturnValue(2000);
+    try {
+      expect(() => boundedReaddir('/synthetic')).toThrow(/scan limit/);
+      expect(dir.readSync).toHaveBeenCalledTimes(1);
+      expect(dir.closeSync).toHaveBeenCalledTimes(1);
+    } finally { clock.mockRestore(); }
   });
 });
 
 describe('real host process identity', () => {
+  it.skipIf(!['linux', 'darwin'].includes(process.platform))('a REAL exited pid reads gone and dead on darwin and linux', async () => {
+    const child = spawn(process.execPath, ['-e', 'process.stdin.resume()'], { stdio: ['pipe', 'ignore', 'ignore'] });
+    try {
+      await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+      const before = readIdentity(child.pid);
+      expect(before.status).toBe('ok');
+      const exited = new Promise((resolve, reject) => { child.once('exit', resolve); child.once('error', reject); });
+      child.stdin.end();
+      await exited;
+      expect(readIdentity(child.pid)).toEqual({ status: 'gone' });
+      expect(liveness(before.identity)).toBe('dead');
+    } finally {
+      child.stdin.destroy();
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    }
+  });
+
   it.skipIf(process.platform === 'win32')('a real live process is alive and has the same identity across reads', () => {
     const first = readIdentity(process.pid);
     const second = readIdentity(process.pid);
