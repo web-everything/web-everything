@@ -3,7 +3,7 @@ bornAs: xprg7e1
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/lane-pool.mjs", "we:scripts/lib/lane-lease.mjs", "we:scripts/__tests__/lane-pool-reap-dead-owner.test.mjs"]
+scope: ["we:scripts/lane-pool.mjs", "we:scripts/lib/lane-lease.mjs", "we:scripts/lib/__tests__/lane-lease.test.mjs", "we:scripts/__tests__/lane-pool-reap-dead-owner.test.mjs"]
 dateOpened: "2026-10-28"
 tags: []
 ---

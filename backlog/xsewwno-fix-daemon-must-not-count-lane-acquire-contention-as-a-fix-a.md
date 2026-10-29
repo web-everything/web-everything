@@ -3,7 +3,7 @@ bornAs: xsewwno
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/fix-run.mjs", "we:scripts/operations/__tests__/fix-run-acquire-contention.test.mjs"]
+scope: ["we:scripts/operations/fix-run.mjs", "we:scripts/operations/__tests__/fix-run.test.mjs", "we:scripts/operations/__tests__/fix-run-acquire-contention.test.mjs"]
 dateOpened: "2026-10-28"
 tags: []
 ---
