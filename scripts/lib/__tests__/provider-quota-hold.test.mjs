@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import * as quota from '../provider-quota-hold.mjs';
 
 const now = Date.parse('2026-10-29T08:00:00Z');
-const providerMessages = [
+const legacyProviderMessages = [
   "You've hit your weekly limit · resets Oct 30 at 4pm (America/Toronto)",
   "You've hit your daily limit · resets tomorrow",
   "You've hit your monthly limit · resets Nov 1",
@@ -14,7 +14,14 @@ const providerMessages = [
 ];
 const structuredRateLimit = '{"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}';
 const quotaErrors = [
-  ...providerMessages,
+  ...['weekly', 'daily', '5-hour', 'session']
+    .flatMap(period => ['', 'tomorrow', 'Oct 30 at 4pm (America/Toronto)']
+      .map(reset => `You've hit your ${period} limit · resets ${reset}`)),
+  "You've hit your weekly limit · resets tomorrow\nmore diagnostics",
+];
+// No structural field proves quota: old provider phrasings and JSON are negative cases.
+const rejectedLegacyQuotaErrors = [
+  ...legacyProviderMessages.slice(2),
   ...['rate_limit_error', 'insufficient_quota'].flatMap(type => [
     { type },
     { error: { type } },
@@ -30,12 +37,38 @@ const droppedQuotaErrors = [
   'RESOURCE_EXHAUSTED: Quota exceeded',
   ...['rate_limit_error', 'insufficient_quota'].map(type => `error type: ${type}`),
   ...['API Error: ', 'Error: ', '429 ', 'API Error: 429 ', 'Error: 429 ']
-    .flatMap(prefix => providerMessages.map(message => `${prefix}${message}`)),
+    .flatMap(prefix => quotaErrors.map(message => `${prefix}${message}`)),
   ...['429 ', 'Error: 429 '].map(prefix => `${prefix}${structuredRateLimit}`),
   'API Error: 429 rate_limit_error',
 ];
 const ordinaryErrors = [
   ...droppedQuotaErrors,
+  ...rejectedLegacyQuotaErrors,
+  ...['weekly', 'daily', '5-hour', 'session'].flatMap(period => [
+    `You've hit your ${period} limit`,
+    `You've hit your ${period} limit of 2 repair rounds`,
+    `You've hit your ${period} limit · resets`,
+    `You've hit your ${period} limit · reset tomorrow`,
+    `You've hit your ${period} limit - resets tomorrow`,
+    `You've hit your ${period} limit • resets tomorrow`,
+    `You've hit your ${period} limit· resets tomorrow`,
+    `You've hit your ${period} limit ·resets tomorrow`,
+    `You've hit your ${period} limit  · resets tomorrow`,
+    `You've hit your ${period} limit ·  resets tomorrow`,
+  ]),
+  ...['monthly', 'usage', 'hourly', 'yearly'].map(period =>
+    `You've hit your ${period} limit · resets tomorrow`),
+  ...[' ', '\t', '\n', '\r\n', '\uFEFF', '\u001b[31m', 'diagnostic\n']
+    .map(prefix => `${prefix}${quotaErrors[0]}`),
+  "You’ve hit your weekly limit · resets tomorrow",
+  "you've hit your weekly limit · resets tomorrow",
+  "YOU'VE HIT YOUR WEEKLY LIMIT · RESETS tomorrow",
+  "You've hit your Weekly limit · resets tomorrow",
+  "You've hit your weekly limit · Resets tomorrow",
+  JSON.stringify(quotaErrors[0]),
+  JSON.stringify({ result: quotaErrors[0] }),
+  JSON.stringify({ is_error: true, result: quotaErrors[0] }),
+  null, undefined, 429, { type: 'rate_limit_error' },
   '',
   '429 Rate limit exceeded', 'HTTP 429: Too Many Requests',
   'rate limit exceeded', 'Too Many Requests',
@@ -78,7 +111,7 @@ const ordinaryErrors = [
   'RESOURCE_EXHAUSTED', 'RESOURCE_EXHAUSTED: Out of memory',
   'TypeError: rate limit is not a function',
   'build log mentions HTTP 429 in a fixture', 'disk quota exceeded',
-  ...providerMessages.map(message => `build log mentions ${message} in a fixture`),
+  ...quotaErrors.map(message => `build log mentions ${message} in a fixture`),
   `build log mentions ${structuredRateLimit} in a fixture`,
   'build log mentions API Error: 429 rate_limit_error in a fixture',
 ];
@@ -89,7 +122,7 @@ describe('quota error evidence', () => {
     expect(quota.isQuotaError(text)).toBe(true);
   });
 
-  it.each(ordinaryErrors)('fails closed without structural provider evidence: %s', text => {
+  it.each(ordinaryErrors)('rejects anything outside the exact anchored quota pattern: %s', text => {
     expect(quota.isQuotaError, 'isQuotaError export').toBeTypeOf('function');
     expect(quota.isQuotaError(text)).toBe(false);
   });
