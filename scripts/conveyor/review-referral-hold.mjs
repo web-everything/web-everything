@@ -53,11 +53,14 @@ export function reviewRunEvidence(run) {
   try {
     const failedSeats = Array.isArray(run.seatTimings) ? run.seatTimings.filter(t => t?.verdict === 'error') : [];
     const telemetry = run.telemetry;
+    // Repeated calls to the same seat each need their own persisted quota row.
+    const failuresBySeat = new Map();
+    for (const t of failedSeats) failuresBySeat.set(t.seat, (failuresBySeat.get(t.seat) ?? 0) + 1);
     quotaOnly = failedSeats.length > 0 && Array.isArray(telemetry) && failures.every(isQuotaError)
       && failedSeats.every(t => {
         if (typeof t.seat !== 'string' || t.seat.length === 0) return false;
         const rows = telemetry.filter(row => row?.step === t.seat);
-        return rows.length > 0 && rows.every(row => row.failureKind === 'provider-quota');
+        return rows.length >= failuresBySeat.get(t.seat) && rows.every(row => row.failureKind === 'provider-quota');
       });
   } catch { /* unreadable seat evidence cannot establish a quota-only attempt */ }
   const verdict = savedReferral ? run.resumeOf.verdict : run.findings?.referralVerdict ?? run.verdict;

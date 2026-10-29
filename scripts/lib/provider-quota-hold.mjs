@@ -12,7 +12,7 @@ export function isQuotaError(text) {
   // Match complete provider error codes, not similarly named configuration fields.
   if (/^(?:error type:\s*)?(?:rate_limit_error|insufficient_quota)\s*$/i.test(message)) return true;
   // Resource exhaustion needs an explicit quota reason; the token alone also covers memory failures.
-  if (/^(?:resource_exhausted:\s*quota exceeded|you exceeded your current quota|you['’]ve hit your (?:weekly |daily |monthly |usage )?limit)\b/i.test(message)) return true;
+  if (/^(?:resource_exhausted:\s*quota exceeded|you exceeded your current quota|you['’]ve hit your (?:weekly|daily|monthly|usage|session|hourly|5-hour) limit)\b/i.test(message)) return true;
   if (!message.startsWith('{')) return false;
   try {
     const payload = JSON.parse(message);
