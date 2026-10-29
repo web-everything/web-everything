@@ -276,7 +276,7 @@ export function ensureLaneHooksPath(dir, {
         // A clean non-match has no stdout and ONLY the two standard pathspec lines; anything else is unreadable.
         const diagnostic = String(e?.stderr ?? '');
         const notTracked = `error: pathspec '${LANE_HOOKS_PATH}/pre-commit' did not match any file(s) known to git\nDid you forget to 'git add'?\n`;
-        if (e?.status === 1 && !String(e?.stdout ?? '') && diagnostic === notTracked) return { status: 'skipped' };
+        if (e?.status === 1 && !String(e?.stdout ?? '') && (diagnostic === '' || diagnostic === notTracked)) return { status: 'skipped' };
         throw e;
       }
       throw new Error(`${LANE_HOOKS_PATH}/pre-commit is tracked but missing (or a dangling symlink), so git runs no pre-commit guard (restore it from git)`);
