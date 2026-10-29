@@ -6,7 +6,7 @@
 // test FILE and never removed — plus a long tail of per-test `mkdtemp` dirs with no cleanup.
 //
 // Fix at the root, not per leaker: `vitest.globalSetup.mjs` gives each vitest run ONE private temp root
-// (`<os tmp>/we-vitest/<pid>-XXXXXX`) and points `TMPDIR`/`TMP`/`TEMP` at it before any worker spawns, so every
+// (`<os tmp>/we-vitest-<uid>/<pid>-XXXXXX`) and points `TMPDIR`/`TMP`/`TEMP` at it before any worker spawns, so every
 // `os.tmpdir()` call — in a worker or in a spawned child that inherits the env — lands inside it. Teardown
 // counts what tests left behind (the leak signal), warns or fails per policy, then removes the whole root.
 // A run that dies before teardown leaves its root behind; the next run sweeps roots whose pid is dead.
@@ -20,7 +20,12 @@ import { randomBytes } from 'node:crypto';
 import { delimiter, join } from 'node:path';
 import { fakeGhScript, gitShimScript } from './hermetic-tests.mjs';
 
-export const RUN_ROOT_PARENT = 'we-vitest';
+// Per-user parent: runners share /tmp but run as different users, so a shared `we-vitest` dir made by one
+// user is unwritable for the rest (EACCES mkdtemp, CI run 40932177960).
+export function runRootParentName(uid = process.getuid?.() ?? 'nouid') {
+  return `we-vitest-${uid}`;
+}
+export const RUN_ROOT_PARENT = runRootParentName();
 export const DEFAULT_LEAK_MAX = 50;
 export const STALE_ROOT_MIN_AGE_MS = 10 * 60 * 1000;
 
@@ -43,8 +48,8 @@ export function isPidAlive(pid) {
 
 // Remove run roots left by vitest processes that are gone. Only touches `<baseTmp>/we-vitest/<pid>-*`
 // entries whose pid is dead AND that are older than `minAgeMs` (guards against pid reuse races).
-export function sweepStaleRunRoots({ baseTmp, isAlive = isPidAlive, now = Date.now(), minAgeMs = STALE_ROOT_MIN_AGE_MS } = {}) {
-  const parent = join(baseTmp, RUN_ROOT_PARENT);
+export function sweepStaleRunRoots({ baseTmp, uid, isAlive = isPidAlive, now = Date.now(), minAgeMs = STALE_ROOT_MIN_AGE_MS } = {}) {
+  const parent = join(baseTmp, runRootParentName(uid));
   let names;
   try {
     names = readdirSync(parent);
@@ -69,8 +74,8 @@ export function sweepStaleRunRoots({ baseTmp, isAlive = isPidAlive, now = Date.n
   return removed;
 }
 
-export function createRunTmpRoot({ baseTmp, pid = process.pid }) {
-  const parent = join(baseTmp, RUN_ROOT_PARENT);
+export function createRunTmpRoot({ baseTmp, pid = process.pid, uid }) {
+  const parent = join(baseTmp, runRootParentName(uid));
   mkdirSync(parent, { recursive: true });
   return mkdtempSync(join(parent, `${pid}-`));
 }
