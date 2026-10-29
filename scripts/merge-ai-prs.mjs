@@ -206,7 +206,7 @@ import { createCardGrouping, runCardGroupPass } from './lib/card-group.mjs';
 import { readQueueFacts } from './lib/merge-queue-adaptive-batching.mjs';
 import { readQueueEntryFiles } from './lib/queue-file-overlap.mjs';
 import { createStepTimer, formatTimingsSummary, PASS_STEP_ORDER } from './lib/pass-timings.mjs';
-import { mapWithConcurrency, runEnqueueCandidates, canParallelEnqueue, createBranchPreparationRequired, formatConcurrencySources } from './lib/drain-concurrency.mjs';
+import { mapWithConcurrency, runEnqueueCandidates, canParallelEnqueue, createBranchPreparationRequired, shouldPrepareBranchBeforeEnqueue, formatConcurrencySources } from './lib/drain-concurrency.mjs';
 import { execDrainAsync } from './lib/drain-gh-async.mjs';
 export { mapWithConcurrency } from './lib/drain-concurrency.mjs';
 import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
@@ -6904,7 +6904,7 @@ async function runCli() {
           // shares with a concurrent resident-daemon sweep (the fast drain bypasses the whole-process lease), so
           // it is what serializes the actual merge write, not just NNN allocation. Inside the lock, the re-check
           // makes a PR another lander already merged a safe no-op — never a double `gh pr merge`.
-          if (branchPreparationRequired(c) && mergeStrategy.enqueues(c.repo) && !approvedHeadHold(c, traceHeadSha)) {
+          if (shouldPrepareBranchBeforeEnqueue({ required: branchPreparationRequired(c), enqueues: mergeStrategy.enqueues(c.repo) })) {
             const prepared = prepareBranchBeforeEnqueue({ c, traceHeadSha, isLocal: isLocalRepo(c.repo), isOpen: (repo, num) => openReservationPr(openPrContext, repo, num) });
             if (!finishBranchPreparation(prepared, { c, revalidationAborted, needsAcceptanceRestamp, restampAcceptance })) { enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'branch-preparation', reason: revalidationAborted.at(-1)?.reason || prepared.reason || prepared.detail || 'branch preparation refused' }); const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; }
           }

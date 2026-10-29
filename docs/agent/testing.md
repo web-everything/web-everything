@@ -754,6 +754,12 @@ commits and changed trees through the writer, alongside refusal cases with zero 
 
 ## Human clearance across drain numbering
 
+An approved human-surface head hold suppresses rebasing, never pending-card numbering before
+enqueue. Regress that preparation predicate with an approved human-only head carrying a hash card,
+and run real branch numbering with workflow edits while unqueued. Queued human-only or
+human-enqueued hash cards retain their skip event and emit `needs-you` with the files and
+dequeue/re-queue instructions; hash-free branches emit no alert.
+
 A `clear-human` record already counts as acceptance; a numbering carry must also run before
 workflow and anti-test-gaming holds can re-park it. Use the existing human carry writer with a
 fresh head, complete comment thread and formal reviews before posting. Its numbering tier uses

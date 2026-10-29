@@ -322,7 +322,7 @@ export function finishBranchPreparation(out, { c, revalidationAborted, needsAcce
   return false;
 }
 
-/** Number only drain-eligible queue entries; human-held hash cards are repaired on main after landing. */
+/** Number only drain-eligible queue entries; alert humans to dequeue held hash cards for branch numbering. */
 export function sweepQueuedHashCards({ repo, cwd = process.cwd(), exec = execFileSync, log = process.stderr,
   prepare = prepareBranchBeforeEnqueue, isOpen, emit = appendDaemonEvent } = {}) {
   const result = { dequeued: [], numbered: [], skipped: [], errors: [] };
@@ -330,9 +330,12 @@ export function sweepQueuedHashCards({ repo, cwd = process.cwd(), exec = execFil
     try { void Promise.resolve(emit({ kind, pr, daemon: 'drain', detail })).catch(() => {}); }
     catch { /* Coordination events must never interrupt the sweep. */ }
   };
-  const skip = (num, reason) => {
+  const skip = (num, reason, files = []) => {
     result.skipped.push({ num, reason });
     event('queue-dequeue-skipped', num, { reason });
+    if ((reason === 'human-only' || reason === 'human-enqueued') && files.length) {
+      event('needs-you', num, `PR #${num} was queued by a human while its backlog card(s) ${files.join(', ')} are still unnumbered; it will fail the merge group. Dequeue and re-queue it after the drain numbers its branch.`);
+    }
     log.write(`  ⇠ PR ${num} dequeue skipped: ${reason} — left queued${reason === 'changed-files-unreadable' ? '; retry on next pass' : ''}\n`);
   };
   const fail = (num, e) => {
@@ -365,7 +368,7 @@ export function sweepQueuedHashCards({ repo, cwd = process.cwd(), exec = execFil
         }
         const hold = workflowEditHold({ files: changedFiles, expectedCount: changedFiles.length });
         if (hold.hold) {
-          skip(pr.number, hold.humanOnly ? 'human-only' : 'changed-files-unreadable');
+          skip(pr.number, hold.humanOnly ? 'human-only' : 'changed-files-unreadable', files);
           continue;
         }
         const login = enqueuer?.login;
@@ -374,7 +377,7 @@ export function sweepQueuedHashCards({ repo, cwd = process.cwd(), exec = execFil
           continue;
         }
         if (login !== 'plateau-merger' && !login.endsWith('[bot]')) {
-          skip(pr.number, 'human-enqueued');
+          skip(pr.number, 'human-enqueued', files);
           continue;
         }
         graphql('mutation($id:ID!){dequeuePullRequest(input:{id:$id}){mergeQueueEntry{id}}}', [`id=${pr.id}`]);

@@ -320,6 +320,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withNumberingLock } from '../../readiness/drain-lock.mjs';
 import { buildFollowupInput } from '../drain-followup-job.mjs';
+import { workflowEditHold } from '../merge-queue-enqueue.mjs';
 import { withHooksDisabled, fallbackMinNext, repairHashOnMain, openReservationPr, probeQueuedLand, sweepQueuedHashCards } from '../queue-branch-numbering.mjs';
 
 it('rejects a real external card symlink and leaves the target unchanged', () => {
@@ -369,7 +370,7 @@ it('reports stranded queue hashes with a read-only probe', () => {
   expect(write).toHaveBeenCalledWith(expect.stringContaining('WARNING'));
 });
 
-it('publishes a real fast-forward numbering commit to the PR branch, never main', () => {
+it.each([false, true])('publishes a real fast-forward numbering commit to the unqueued PR branch, never main (human-only workflow edits=%s)', humanOnly => {
   const root = mkdtempSync(join(tmpdir(), 'queue-numbering-git-'));
   const cwd = join(root, 'clone'); const origin = join(root, 'origin.git');
   const git = (...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' }).trim();
@@ -384,6 +385,10 @@ it('publishes a real fast-forward numbering commit to the PR branch, never main'
     git('add', '.'); git('commit', '-qm', 'seed'); git('push', '-q', 'origin', 'main');
     const main = git('rev-parse', 'HEAD');
     git('checkout', '-qb', 'topic');
+    if (humanOnly) {
+      mkdirSync(join(cwd, '.github/workflows'), { recursive: true });
+      writeFileSync(join(cwd, '.github/workflows/ci.yml'), 'name: CI\non: push\n');
+    }
     writeFileSync(join(cwd, 'backlog/xabc123-foo.md'), '---\nstatus: open\n---\n');
     git('add', '.'); git('commit', '-qm', 'branch card'); git('push', '-q', 'origin', 'topic');
     let old = git('rev-parse', 'HEAD');
@@ -394,8 +399,12 @@ it('publishes a real fast-forward numbering commit to the PR branch, never main'
     writeFileSync(join(cwd, 'scripts/backlog.mjs'), `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(sentinel)}, 'executed');`);
     git('add', '.'); git('commit', '-qm', 'untrusted branch code'); git('push', '-q', 'origin', 'topic');
     git('config', 'core.hooksPath', '.githooks');
-    const c = { repo: 'test/repo', num: 1, headRef: 'topic', hasManifest: true, item: 'xabc123' };
+    const c = { repo: 'test/repo', num: humanOnly ? 6003 : 1, headRef: 'topic', hasManifest: true, item: 'xabc123', mergeQueueEntry: null };
     old = git('rev-parse', 'HEAD');
+    if (humanOnly) {
+      const files = git('diff', '--name-only', `${main}...${old}`).split('\n');
+      expect(workflowEditHold({ files, expectedCount: files.length })).toMatchObject({ hold: true, humanOnly: true });
+    }
     const statePath = join(root, 'state.json');
     const lock = (fn, options) => withNumberingLock(fn, { ...options, lockRoot: join(root, 'locks') });
     const envBefore = { ...process.env };
@@ -411,6 +420,7 @@ it('publishes a real fast-forward numbering commit to the PR branch, never main'
     git('merge-base', '--is-ancestor', old, result.newHead);
     expect(git('ls-tree', '-r', '--name-only', result.newHead)).toContain('backlog/011-foo.md');
     expect(git('ls-tree', '-r', '--name-only', result.newHead)).not.toContain('backlog/xabc123-foo.md');
+    if (humanOnly) expect(git('show', `${result.newHead}:.github/workflows/ci.yml`)).toBe(git('show', `${old}:.github/workflows/ci.yml`));
     expect(JSON.parse(readFileSync(statePath, 'utf8')).reservations[0].nnns).toEqual([11]);
     expect(prepareBranchBeforeEnqueue({ cwd, c, traceHeadSha: result.newHead, statePath, lock })).toEqual({ action: 'final' });
     expect(git('worktree', 'list', '--porcelain').match(/^worktree /gm)).toHaveLength(1);
@@ -458,16 +468,26 @@ describe('sweepQueuedHashCards', () => {
     expect(x.exec).toHaveBeenCalledWith('git', ['diff', '--name-only', '--no-renames', '-z', 'origin/main...bb609fd418'], expect.any(Object));
     expect(x.exec.mock.calls.some(([, args]) => args.some((arg) => arg.includes('mutation')))).toBe(false);
     expect(x.prepare).not.toHaveBeenCalled();
-    expect(x.emit).toHaveBeenCalledTimes(1);
+    expect(x.emit).toHaveBeenCalledTimes(2);
     expect(x.emit).toHaveBeenCalledWith({ kind: 'queue-dequeue-skipped', pr: 6003, daemon: 'drain', detail: { reason: 'human-only' } });
+    expect(x.emit).toHaveBeenCalledWith({ kind: 'needs-you', pr: 6003, daemon: 'drain',
+      detail: 'PR #6003 was queued by a human while its backlog card(s) backlog/xabc123-card.md are still unnumbered; it will fail the merge group. Dequeue and re-queue it after the drain numbers its branch.' });
   });
   it('leaves a human-enqueued non-workflow hash PR queued', () => {
     const x = setup(); x.nodes.splice(1); x.nodes[0].enqueuer.login = 'human-reviewer';
     expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [], numbered: [], skipped: [{ num: 1, reason: 'human-enqueued' }], errors: [] });
     expect(x.exec.mock.calls.some(([, args]) => args.some((arg) => arg.includes('mutation')))).toBe(false);
     expect(x.prepare).not.toHaveBeenCalled();
-    expect(x.emit).toHaveBeenCalledTimes(1);
+    expect(x.emit).toHaveBeenCalledTimes(2);
     expect(x.emit).toHaveBeenCalledWith({ kind: 'queue-dequeue-skipped', pr: 1, daemon: 'drain', detail: { reason: 'human-enqueued' } });
+    expect(x.emit).toHaveBeenCalledWith({ kind: 'needs-you', pr: 1, daemon: 'drain',
+      detail: 'PR #1 was queued by a human while its backlog card(s) backlog/xabc123-card.md are still unnumbered; it will fail the merge group. Dequeue and re-queue it after the drain numbers its branch.' });
+  });
+  it('does not alert for a human-enqueued branch without hash cards', () => {
+    const x = setup(); x.nodes.splice(0, x.nodes.length, x.nodes[1]); x.nodes[0].enqueuer.login = 'human-reviewer';
+    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [], numbered: [], skipped: [], errors: [] });
+    expect(x.prepare).not.toHaveBeenCalled();
+    expect(x.emit).not.toHaveBeenCalled();
   });
   it.each([
     ['missing enqueuer', undefined],
