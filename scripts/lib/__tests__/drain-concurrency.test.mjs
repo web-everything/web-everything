@@ -1,13 +1,34 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { mapWithConcurrency, runEnqueueCandidates, canParallelEnqueue, createBranchPreparationRequired, formatConcurrencySources } from '../drain-concurrency.mjs';
+import { mapWithConcurrency, runEnqueueCandidates, canParallelEnqueue, createBranchPreparationRequired, shouldPrepareBranchBeforeEnqueue, formatConcurrencySources } from '../drain-concurrency.mjs';
+import { decideHoldApprovedHumanSurfaceHead } from '../approved-human-surface-hold.mjs';
+import { hashBacklogFiles } from '../queue-branch-numbering.mjs';
 import { fetchPrReadsCached, classifyPr } from '../../merge-ai-prs.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 
 const pause = () => new Promise(resolve => setTimeout(resolve, 5));
 
 describe('bounded drain concurrency', () => {
+  it.each([
+    [true, true, true], [true, false, false], [false, true, false], [false, false, false],
+    [undefined, true, false], [true, undefined, false], ['required', 'queue', true],
+  ])('prepares only when required=%s and enqueues=%s (returns %s)', (required, enqueues, expected) => {
+    expect(shouldPrepareBranchBeforeEnqueue({ required, enqueues })).toBe(expected);
+  });
+
+  it('prepares #6003 with a pending hash card even when its approved human-only head is held', () => {
+    const c = { num: 6003, repo: 'owner/repo', headSha: 'a'.repeat(40) };
+    const files = ['.github/workflows/ci.yml', 'backlog/xh6zcov-card.md'];
+    const required = createBranchPreparationRequired({ enabled: true, readFiles: () => files,
+      hasPendingCards: files => hashBacklogFiles(files).length > 0 });
+    const approvedHeadHold = decideHoldApprovedHumanSurfaceHead({ setting: 'on', approved: true,
+      humanSurface: true, conflicting: false, manifestOnHead: false });
+    expect(approvedHeadHold.hold).toBe(true);
+    expect(required(c)).toBe(true);
+    expect(shouldPrepareBranchBeforeEnqueue({ required: required(c), enqueues: true })).toBe(true);
+  });
+
   it('preserves map order despite out-of-order completion', async () => {
     expect(await mapWithConcurrency([3, 2, 1], 3, async n => {
       await new Promise(resolve => setTimeout(resolve, n)); return n;
@@ -128,5 +149,6 @@ describe('bounded drain concurrency', () => {
     expect(source).toContain('concurrency: resolvedMergePolicy.policy.concurrency.gateReads');
     expect(source).toContain('const { stdout: raw } = await execFileP');
     expect(source).toContain('formatConcurrencySources(resolvedMergePolicy.policy)');
+    expect(source.includes('if (shouldPrepareBranchBeforeEnqueue({ required: branchPreparationRequired(c), enqueues: mergeStrategy.enqueues(c.repo) })) {')).toBe(true);
   });
 });
