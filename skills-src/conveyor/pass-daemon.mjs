@@ -355,8 +355,9 @@ async function executeTimedPass({ passName, repo, entry }, ports) {
   const alert = ports.alert ?? (detail => log(`pass-daemon: ALERT ${JSON.stringify(detail)}`));
   const probe = ports.probe ?? probeHandle;
   const stop = ports.stop ?? ((handle, options) => stopHandle(handle, { ...options, probe }));
-  const reapGroup = ports.reapGroup
-    ?? ((handle, notAfterMs, options) => reapDeadGroup(handle, { ...options, notAfterMs }));
+  const reapGroup = ports.reapGroup ?? (ports.probe
+    ? handle => probe(handle) === 'dead'
+    : (handle, notAfterMs, options) => reapDeadGroup(handle, { ...options, notAfterMs }));
   const observeOwner = handle => {
     try { return probe(handle); } catch { return 'unknown'; }
   };
