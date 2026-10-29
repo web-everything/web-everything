@@ -97,6 +97,50 @@ describe('classifyCheck exhaustive independent outcome grid', () => {
 });
 
 describe('latestAttempts', () => {
+  it('compares workflow runs before their local attempt counters, in either input order', () => {
+    const older = settled('CI', 'success', { run_id: '100', run_attempt: 2, id: 1001 });
+    const newer = settled('ci', 'failure', { run_id: '200', run_attempt: 1, id: 2001 });
+    for (const checks of [[older, newer], [newer, older]]) {
+      expect(latestAttempts(checks)).toEqual([newer]);
+      expect(summarize([...checks, settled('review-gate', 'failure')])).toEqual({
+        redSet: new Set(['ci', 'review-gate']), pendingSet: new Set(),
+        gateOnlyRed: false, allRequiredGreen: false,
+      });
+    }
+  });
+
+  it('still orders reruns within one workflow run by attempt before check id', () => {
+    const older = settled('ci', 'failure', { run_id: 200, run_attempt: 1, id: 9999 });
+    const newer = settled('ci', 'success', { run_id: '200', run_attempt: 2, id: 1 });
+    for (const checks of [[older, newer], [newer, older]]) {
+      expect(latestAttempts(checks)).toEqual([newer]);
+    }
+  });
+
+  it.each([['failure', 'red'], ['success', 'green'], ['cancelled', 'pending']])(
+    'classifies the newer workflow run as %s rather than inheriting an earlier attempt', (conclusion, state) => {
+      const checks = [
+        settled('ci', 'failure', { run_id: 100, run_attempt: 10, id: 1001 }),
+        settled('ci', conclusion, { run_id: 200, run_attempt: 1, id: 2001 }),
+      ];
+      for (const rows of [checks, checks.toReversed()]) {
+        const result = summarize(rows, { requiredNames: ['CI'] });
+        expect(result.redSet.has('ci')).toBe(state === 'red');
+        expect(result.pendingSet.has('ci')).toBe(state === 'pending');
+        expect(result.allRequiredGreen).toBe(state === 'green');
+      }
+    },
+  );
+
+  it('uses global check ids for mixed run identities without depending on row order', () => {
+    const a = settled('ci', 'success', { run_id: 100, run_attempt: 3, id: 1001 });
+    const b = settled('ci', 'success', { run_id: 200, run_attempt: 1, id: 2001 });
+    const c = settled('ci', 'failure', { run_attempt: 2, id: 3001 });
+    for (const rows of [[a, b, c], [a, c, b], [b, a, c], [b, c, a], [c, a, b], [c, b, a]]) {
+      expect(latestAttempts(rows)).toEqual([c]);
+    }
+  });
+
   it('selects the greatest numeric run_attempt, then numeric id, per name in either input order', () => {
     const winner = settled('ci', 'failure', { run_attempt: '10', id: '10' });
     const smoke = settled('smoke', 'success', { run_attempt: 1, id: 1 });

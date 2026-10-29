@@ -11,6 +11,59 @@ const input = { escalation: { outcome: 'not-a-ci-break', headSha: fixture.headRe
 const green = fixture.requiredChecks.map((name) => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' }));
 
 describe('requiredCheckStates shared predicate regressions', () => {
+  it.each([false, true])('unrelated attempt metadata cannot hide a timestamped required failure (reverse=%s)', reverse => {
+    const rows = [
+      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-28T01:00:00Z' },
+      { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T02:00:00Z' },
+      { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+    ];
+    for (const optional of [[], [{ name: 'unrelated-optional', status: 'COMPLETED', conclusion: 'SUCCESS', id: 100, run_attempt: 1 }]]) {
+      const rollup = [...(reverse ? rows.toReversed() : rows), ...optional];
+      const evidence = { ...input, requiredChecks: ['test'], rollup };
+      expect(requiredCheckStates(evidence)).toEqual({ red: ['test'], pending: [], missing: [], green: [] });
+      expect(contradictingChecks(evidence)).toEqual(['test']);
+      expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(false);
+      expect(ciGreenForEscalation(evidence)).toBe(false);
+    }
+  });
+
+  it.each([false, true])('a newer workflow run supersedes an earlier rerun across verdict readers (reverse=%s)', reverse => {
+    const runs = [
+      { name: 'test', run_id: 100, run_attempt: 2, id: 1001, status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { name: 'test', run_id: 200, run_attempt: 1, id: 2001, status: 'COMPLETED', conclusion: 'FAILURE' },
+    ];
+    const evidence = { ...input, requiredChecks: ['test'], rollup: [
+      ...(reverse ? runs.toReversed() : runs),
+      { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+    ] };
+    expect(requiredCheckStates(evidence)).toEqual({ red: ['test'], pending: [], missing: [], green: [] });
+    expect(contradictingChecks(evidence)).toEqual(['test']);
+    expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(false);
+    expect(ciGreenForEscalation(evidence)).toBe(false);
+  });
+
+  it.each([false, true])('timestamp and attempt ranking coexist per normalized name (reverse=%s)', reverse => {
+    const rows = [
+      { name: 'TEST', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-28T01:00:00Z' },
+      { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T02:00:00Z' },
+      { name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS', run_attempt: 2, id: 1 },
+      { name: 'build', status: 'COMPLETED', conclusion: 'FAILURE', run_attempt: 1, id: 99 },
+      { __typename: 'StatusContext', context: 'legacy', state: 'SUCCESS', completedAt: '2026-10-28T01:00:00Z' },
+      { __typename: 'StatusContext', context: 'LEGACY', state: 'FAILURE', completedAt: '2026-10-28T02:00:00Z' },
+    ];
+    expect(requiredCheckStates({ requiredChecks: ['Test', 'build', 'Legacy'], rollup: reverse ? rows.toReversed() : rows }))
+      .toEqual({ red: ['Test', 'Legacy'], pending: [], missing: [], green: ['build'] });
+  });
+
+  it.each([false, true])('legacy metadata cannot displace a CheckRun from the preferred tier (reverse=%s)', reverse => {
+    const rows = [
+      { __typename: 'CheckRun', name: 'Test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T01:00:00Z' },
+      { context: 'test', state: 'SUCCESS', id: 100, run_attempt: 2 },
+    ];
+    expect(requiredCheckStates({ requiredChecks: ['test'], rollup: reverse ? rows.toReversed() : rows }))
+      .toEqual({ red: ['test'], pending: [], missing: [], green: [] });
+  });
+
   it.each(['CANCELLED', 'STALE'])('required %s is pending, never red or missing', conclusion => {
     expect(requiredCheckStates({ ...input, requiredChecks: ['Test'], rollup: [
       { name: 'Test', status: 'COMPLETED', conclusion },

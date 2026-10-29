@@ -24,7 +24,7 @@ import { resolveHumanGateRemovalSetting } from '../lib/merge-gate-hold-class.mjs
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
+import { collapseRollupToLatestPerName, rollupRowKind } from '../lib/rollup-collapse.mjs';
 import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.mjs';
 import { latestAttempts, summarize } from '../lib/check-state-predicate.mjs';
 
@@ -91,17 +91,31 @@ const lowerName = name => String(name ?? '').toLowerCase();
 /** Adapt GraphQL rollups and legacy statuses without replacing the shared state policy. */
 function checkEvidence(rollup, requiredChecks) {
   const rows = Array.isArray(rollup) ? rollup : [];
-  const hasAttempts = rows.some(row => row?.run_attempt != null);
-  const checks = (hasAttempts ? rows : collapseRollupToLatestPerName(rows)).map(row => {
-    const check = { ...row, name: row?.name ?? row?.context };
+  const groups = new Map();
+  for (const row of rows) {
+    const name = lowerName(row?.name ?? row?.context);
+    if (!groups.has(name)) groups.set(name, []);
+    groups.get(name).push({ ...row, name, __typename: rollupRowKind(row) });
+  }
+  // Ranking evidence belongs to one check name; an optional workflow must not
+  // disable the timestamp fallback for unrelated GraphQL rollup rows.
+  const selected = [...groups.values()].flatMap(group => {
+    // Keep the rollup reader's CheckRun > untagged > legacy-status precedence
+    // even when the preferred tier carries numeric attempt metadata.
+    const pool = ['CheckRun', 'untagged', 'StatusContext']
+      .map(kind => group.filter(row => row.__typename === kind)).find(tier => tier.length);
+    return pool.some(row => row.run_attempt != null || row.run_id != null)
+      ? latestAttempts(pool) : collapseRollupToLatestPerName(pool);
+  });
+  const checks = selected.map(row => {
+    const check = { ...row };
     if (row?.status == null && row?.state != null) {
       if (['pending', 'expected'].includes(lowerName(row.state))) check.status = 'pending';
       else check.conclusion = row.state;
     }
     return check;
   });
-  const latest = hasAttempts ? latestAttempts(checks) : checks;
-  const roster = withoutImpliedRequiredChecks(Array.isArray(requiredChecks) ? requiredChecks : [], latest)
+  const roster = withoutImpliedRequiredChecks(Array.isArray(requiredChecks) ? requiredChecks : [], checks)
     .filter(name => !gateNames.includes(lowerName(name)));
   return { checks, roster };
 }
