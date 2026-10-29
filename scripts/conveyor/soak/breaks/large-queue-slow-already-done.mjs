@@ -1,11 +1,15 @@
 /** Real CLI break: 444 cleared items and a slow, rate-limited GitHub cannot occupy the tick. */
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runBounded } from '../../../lib/bounded-child.mjs';
 const ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+// Startup and parsing the large backlog share CI CPUs with the other soak worlds. This is a runaway
+// ceiling, not the async proof: the live refresh lock and overlapping tick below prove GitHub was not awaited.
+const PLANNER_TIMEOUT_MS = 10000;
 
 export default {
   id: 'large-queue-slow-already-done',
@@ -16,7 +20,6 @@ export default {
   async run({ log, root = ROOT } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'soak-large-queue-'));
     const violations = [];
-    let child;
     try {
       const backlog = join(dir, 'backlog'); const bin = join(dir, 'bin');
       mkdirSync(backlog); mkdirSync(bin);
@@ -27,7 +30,8 @@ export default {
         queue.push({ num, addedAt: '2020-01-01T00:00:00Z' });
       }
       writeFileSync(join(dir, 'queue.json'), JSON.stringify(queue));
-      // Every request stays alive until AFTER the planner must have returned, then returns a rate limit.
+      // Slow requests return a rate limit. The live-worker assertion below establishes ordering independently
+      // of how long the planner took to start; its runaway ceiling need not be shorter than this delay.
       writeFileSync(join(bin, 'gh'), `#!/usr/bin/env node
 const fs = require('node:fs');
 fs.appendFileSync(process.env.SOAK_CALLS, JSON.stringify(process.argv.slice(2))+'\\n');
@@ -39,24 +43,18 @@ setTimeout(()=>{process.stderr.write('API rate limit exceeded\\n');process.exit(
       const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, CONVEYOR_QUEUE_FILE: join(dir, 'queue.json'),
         WE_DISPATCH_PLAN_ALREADY_DONE_CACHE_FILE: cache, WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'throttle'),
         WE_PR_SNAPSHOT_DIR: join(dir, 'snapshot'), SOAK_CALLS: callsPath };
-      const started = Date.now(); let output = ''; let stderr = '';
-      child = spawn(process.execPath, [join(root, 'scripts/readiness/dispatch-plan.mjs'), '--json', `--backlog-dir=${backlog}`, '--free-lanes=1',
-        '--no-drift-check', '--no-pause-check', '--no-pr-limit-check'], { cwd: dir, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-      child.stdout.on('data', d => { output += d; }); child.stderr.on('data', d => { stderr += d; });
-      const code = await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} reject(new Error('planner blocked on slow GitHub')); }, 2000);
-        child.on('error', reject);
-        child.on('close', code => { clearTimeout(timer); resolve(code); });
-      });
+      const planTick = async () => JSON.parse(await runBounded(process.execPath,
+        [join(root, 'scripts/readiness/dispatch-plan.mjs'), '--json', `--backlog-dir=${backlog}`, '--free-lanes=1',
+          '--no-drift-check', '--no-pause-check', '--no-pr-limit-check'],
+        { cwd: dir, env, timeoutMs: PLANNER_TIMEOUT_MS, maxBytes: 8 * 1024 * 1024 }));
+      const started = Date.now();
+      const plan = await planTick();
       const elapsedMs = Date.now() - started;
-      if (code !== 0) throw new Error(`planner exit ${code}: ${stderr}`);
-      const plan = JSON.parse(output);
       if (plan.groundTruth.pending !== 444) violations.push({ invariant: 'queue-exercised', detail: JSON.stringify(plan.groundTruth) });
       if (plan.groundTruth.refresh.ids.length !== 2) violations.push({ invariant: 'bounded-selection', detail: JSON.stringify(plan.groundTruth) });
       if (!existsSync(`${cache}.refresh-lock`)) violations.push({ invariant: 'not-awaited', detail: 'slow worker did not outlive planner' });
       // A second tick WHILE the first worker is alive must not add any requests.
-      const second = JSON.parse(execFileSync(process.execPath, [join(root, 'scripts/readiness/dispatch-plan.mjs'), '--json', `--backlog-dir=${backlog}`, '--free-lanes=1',
-        '--no-drift-check', '--no-pause-check', '--no-pr-limit-check'], { cwd: dir, env, encoding: 'utf8', timeout: 2000 }));
+      const second = await planTick();
       if (second.groundTruth.refresh.started) violations.push({ invariant: 'single-flight', detail: 'overlapping tick started another worker' });
       const deadline = Date.now() + 18000;
       while (existsSync(`${cache}.refresh-lock`) && Date.now() < deadline) await delay(50);
