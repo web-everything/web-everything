@@ -693,7 +693,7 @@ describe('runRemote', () => {
     })),
   ])('fails closed with ambiguous-result and attempts cleanup for %j', async (scenario) => {
     const f = fixture(scenario);
-    expect(await runRemote(f)).toEqual({ mode: 'fallback', reason: 'ambiguous-result' });
+    expect(await runRemote(f)).toEqual({ mode: 'unconfirmed', reason: 'ambiguous-result' });
     expect(callsOf(f.exec).some(isCleanup)).toBe(true);
     expectNoSecrets(f.exec);
   });
@@ -881,11 +881,11 @@ original_fstat = os.fstat`);
 describe('receipt field binding', () => {
   it.each(['v','nonce','run','inputDigest','argvDigest','lock','phase','code'])('rejects mismatched %s', async field => {
     const f = fixture({receipt: (_nonce,value) => JSON.stringify({...value,[field]:field === 'v' ? 2 : field === 'code' ? 1 : 'wrong'})});
-    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'ambiguous-result'});
+    expect(await runRemote(f)).toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
   });
   it('rejects install-phase evidence even with matching status', async () => {
     expect(await runRemote(fixture({runCode:97,receipt:(_n,v)=>JSON.stringify({...v,phase:'install'})})))
-      .toEqual({mode:'fallback',reason:'ambiguous-result'});
+      .toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
   });
 });
 
@@ -1126,6 +1126,6 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
 
   it.each(['missing', 'wrong'])('rejects a %s manifestDigest in an otherwise matching green receipt', async kind => {
     const f = fixture({receipt:(_nonce,value) => JSON.stringify(kind === 'missing' ? value : {...value,manifestDigest:'0'.repeat(64)})});
-    expect(await runRemote(f)).toEqual({mode:'fallback', reason:'ambiguous-result'});
+    expect(await runRemote(f)).toEqual({mode:'unconfirmed', reason:'ambiguous-result'});
   });
 });

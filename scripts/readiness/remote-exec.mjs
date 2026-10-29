@@ -178,10 +178,10 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
     try {
       const result = await ssh('run',{...expected,manifest:expectedManifest,argv,env:filterEnv(env)},true);
       const receipt = await finish();
-      if(!receipt || receipt.code!==0) return fallback('ambiguous-result');
-      if(!verifyReceipt(protocolText(receipt.stdout,4096),expected,result.code)) return fallback('ambiguous-result');
+      if(!receipt || receipt.code!==0) return {mode:'unconfirmed',reason:'ambiguous-result'};
+      if(!verifyReceipt(protocolText(receipt.stdout,4096),expected,result.code)) return {mode:'unconfirmed',reason:'ambiguous-result'};
       return {mode:'remote',code:result.code};
-    } catch {return fallback('ambiguous-result');}
+    } catch {return {mode:'unconfirmed',reason:'ambiguous-result'};}
   } finally {try {await finish();} catch { /* Pruning is the cleanup backstop; never retry execution. */ }}
 }
 

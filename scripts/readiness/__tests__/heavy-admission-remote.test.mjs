@@ -6,6 +6,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { main, decideRemote, runWithRemoteDecision, resolveAdmissionPolicy, DEFAULT_ADMISSION_CEILING_MS, DEFAULT_FAST_RUN_TIMEOUT_MS } from '../heavy-admission.mjs';
+import { runRemote } from '../remote-exec.mjs';
 
 const argv = ['npm', 'run', 'test:unit', '--', 'a file.test.mjs', '$(must-stay-literal)'];
 const remoteDefaults = { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3 };
@@ -171,6 +172,55 @@ describe('runWithRemoteDecision', () => {
     expect(await runWithRemoteDecision(f)).toEqual({ handled: false });
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
     expectFallback(f.log, reason);
+  });
+
+  describe.each(['ssh disconnect', 'invalid receipt', 'run throws', 'finish throws'])('%s', (scenario) => {
+    it('ambiguous runRemote receipt refuses local rerun', async () => {
+      const cwd = mkdtempSync(join(tmpdir(), 'remote-ambiguous-'));
+      const files = ['package-lock.json', 'a.test.mjs'];
+      writeFileSync(join(cwd, files[0]), '{"lockfileVersion":3,"packages":{}}\n');
+      writeFileSync(join(cwd, files[1]), 'fixture');
+      let request;
+      const actions = [];
+      const exec = vi.fn(async (call) => {
+        if (call.file === 'git' && call.args.includes('-i')) return { code: 0, stdout: Buffer.alloc(0) };
+        if (call.file === 'rsync') return { code: 0, stdout: '' };
+        if (call.file === 'ssh') {
+          const action = call.args.at(-1).split(' ').at(-1);
+          actions.push(action);
+          if (action === 'true') return { code: 0, stdout: '' };
+          if (action === 'prepare') return { code: 0, stdout: JSON.stringify({ run: 'r-' + JSON.parse(call.input).nonce }) };
+          if (action === 'run') {
+            request = JSON.parse(call.input);
+            if (scenario === 'run throws') throw new Error('run transport lost');
+            return { code: scenario === 'ssh disconnect' ? 255 : 0, stdout: '' };
+          }
+          if (action === 'finish') {
+            if (scenario === 'finish throws') throw new Error('finish transport lost');
+            if (scenario !== 'invalid receipt') return { code: 255, stdout: '' };
+            const { v, nonce, run, inputDigest, argvDigest, lock, manifestDigest } = request;
+            // Otherwise valid receipt, but its exit status disagrees with the run.
+            return { code: 0, stdout: JSON.stringify({ v, nonce, run, inputDigest, argvDigest, lock, manifestDigest, phase: 'test', code: 7 }) };
+          }
+        }
+        throw new Error(`Unexpected exec call: ${call.file}`);
+      });
+      const local = vi.fn();
+      const log = vi.fn();
+      try {
+        const result = await runWithRemoteDecision({
+          argv: ['npm', 'run', 'test:unit', '--', 'a.test.mjs'], cwd, env: {},
+          policy: policyFor({ mode: 'always' }), loadPerCore: () => 0, log,
+          remoteExec: (options) => runRemote({ ...options, exec, listFiles: async () => files }),
+        });
+        if (!result.handled) local();
+        expect(actions).toEqual(['true', 'prepare', 'run', 'finish']);
+        expect(result).toEqual({ handled: true, exitCode: 124 });
+        expect(local).not.toHaveBeenCalled();
+        expect(log.mock.calls[1][0]).toContain('ambiguous-result');
+        expect(log.mock.calls[1][0]).toContain('refusing local rerun');
+      } finally { rmSync(cwd, { recursive: true, force: true }); }
+    });
   });
 
   it('remoteExec throws -> refuses local rerun with the error reason', async () => {
