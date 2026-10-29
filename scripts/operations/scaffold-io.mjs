@@ -3,7 +3,7 @@
  * @description THE IO SHELL of the `scaffold` declaration (#xrrpfo7) — the reader its `read` step is
  *   injected with, and the sink its `write` effect is applied through.
  *
- * Reads the existing id set and today's date, and reserves the final id through the shared allocator.
+ * Reads the existing id set and today's date. New cards use hash ids by default; the drain numbers at land.
  * Everything the item becomes is decided in the pure plan, so the sink writes bytes it did not choose — which
  * is what makes the #2288 collision retry testable with no filesystem.
  *
@@ -25,7 +25,6 @@ import { writeBacklogMd } from '../backlog/guarded-write.mjs';
 // first cut of `resolve-io.mjs` doing exactly it.
 import { localToday } from '../lib/local-date.mjs';
 import { nextHash } from '../backlog/id.mjs';
-import { allocateCardNumber } from '../lib/card-number-allocator.mjs';
 import { SCAFFOLD_EFFECT } from './scaffold.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -34,6 +33,7 @@ export const REPO_ROOT = resolvePath(HERE, '..', '..');
 
 const backlogDir = (root) => join(root, 'backlog');
 const idFromName = (file) => file.replace(/\.md$/, '').split('-')[0];
+const defaultAllocate = () => ({ ok: false, reason: 'new cards are hash-keyed (#2288); the drain numbers at land' });
 
 /**
  * Build the injected reader.
@@ -46,7 +46,7 @@ export function createScaffoldReader({
   root = REPO_ROOT,
   listFiles = (dir) => readdirSync(dir),
   today = localToday,
-  allocate = allocateCardNumber,
+  allocate = defaultAllocate,
   log = console.warn,
 } = {}) {
   return () => {
@@ -58,7 +58,7 @@ export function createScaffoldReader({
     const birthHash = nextHash(existingIds);
     const allocation = allocate({ id: birthHash, cwd: root, log });
     if (!allocation.ok && allocation.required) throw new Error(`scaffold: ${allocation.reason}`);
-    if (!allocation.ok) log(`scaffold: using hash naming: ${allocation.reason}`);
+    if (!allocation.ok && allocate !== defaultAllocate) log(`scaffold: using hash naming: ${allocation.reason}`);
     return { existingIds, today: today(), dir,
       ...(allocation.ok ? { allocatedId: String(allocation.num), birthHash } : {}) };
   };
