@@ -378,6 +378,19 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
       expect(humanRefusal({ pr: gatePr([check('test', 'FAILURE'), check('review-gate', 'FAILURE')]) })).toBeNull();
     });
 
+    it.each([false, true])('mixed attempt metadata keeps a real CI break escalatable through injected readers (reverse=%s)', async reverse => {
+      const rows = [
+        check('test', 'SUCCESS', { __typename: 'CheckRun', run_attempt: 1, id: 100, completedAt: '2026-10-28T01:00:00Z' }),
+        check('test', 'FAILURE', { __typename: 'CheckRun', completedAt: '2026-10-28T02:00:00Z' }),
+      ];
+      const pr = gatePr([...(reverse ? rows.toReversed() : rows), check('review-gate', 'FAILURE')]);
+      const readers = { readPr: vi.fn(() => pr), readRequired: vi.fn(async () => ({ checks: ['test'] })) };
+      await expect(checkNeedsHumanEscalable({ ...humanOptions(), ...readers })).resolves.toEqual({ refusal: null });
+      await expect(checkNotCiBreakRecordable({ ...recordOptions(), ...readers })).resolves.toEqual({ refusal: expect.stringContaining('red: test') });
+      expect(readers.readPr).toHaveBeenCalledTimes(2);
+      expect(readers.readRequired).toHaveBeenCalledTimes(2);
+    });
+
     it('does not refuse needs-human when there are no red checks', () => {
       expect(humanRefusal({ pr: gatePr([check('test', 'SUCCESS'), check('review-gate', 'SUCCESS')]) })).toBeNull();
     });

@@ -87,6 +87,25 @@ const sameSha = (a, b) => {
 
 const gateNames = [REVIEW_GATE_CHECK, 'merge-gate'];
 const lowerName = name => String(name ?? '').toLowerCase();
+const hasNumericRank = value => (typeof value === 'number' || typeof value === 'string')
+  && Number.isFinite(Number(value)) && Number(value) > 0;
+
+/** Check only the fields needed to distinguish the latestAttempts winner. */
+function comparableAttemptRanks(pool) {
+  const allRunsKnown = pool.every(row => hasNumericRank(row.run_id));
+  const someRunsKnown = pool.some(row => hasNumericRank(row.run_id));
+  const fields = allRunsKnown ? ['run_id', 'run_attempt', 'id']
+    : someRunsKnown ? ['id', 'run_attempt'] : ['run_attempt', 'id'];
+  let candidates = pool;
+  for (const field of fields) {
+    if (!candidates.some(row => hasNumericRank(row[field]))) continue;
+    if (!candidates.every(row => hasNumericRank(row[field]))) return false;
+    const highest = candidates.reduce((max, row) => Math.max(max, Number(row[field])), 0);
+    candidates = candidates.filter(row => Number(row[field]) === highest);
+    if (candidates.length === 1) return true;
+  }
+  return true;
+}
 
 /** Adapt GraphQL rollups and legacy statuses without replacing the shared state policy. */
 function checkEvidence(rollup, requiredChecks) {
@@ -104,8 +123,11 @@ function checkEvidence(rollup, requiredChecks) {
     // even when the preferred tier carries numeric attempt metadata.
     const pool = ['CheckRun', 'untagged', 'StatusContext']
       .map(kind => group.filter(row => row.__typename === kind)).find(tier => tier.length);
-    return pool.some(row => row.run_attempt != null || row.run_id != null)
-      ? latestAttempts(pool) : collapseRollupToLatestPerName(pool);
+    // Partially enriched rollups cannot rank an absent value as zero: an older
+    // enriched success would then hide a newer timestamp-only failure. Use the
+    // rollup reader unless the fields deciding the numeric winner are comparable.
+    const hasAttempts = pool.some(row => hasNumericRank(row.run_attempt) || hasNumericRank(row.run_id));
+    return hasAttempts && comparableAttemptRanks(pool) ? latestAttempts(pool) : collapseRollupToLatestPerName(pool);
   });
   const checks = selected.map(row => {
     const check = { ...row };

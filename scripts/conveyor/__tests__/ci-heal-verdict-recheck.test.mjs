@@ -11,6 +11,51 @@ const input = { escalation: { outcome: 'not-a-ci-break', headSha: fixture.headRe
 const green = fixture.requiredChecks.map((name) => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' }));
 
 describe('requiredCheckStates shared predicate regressions', () => {
+  it.each([false, true])('partial attempt metadata cannot hide newer rollup evidence (reverse=%s)', reverse => {
+    for (const [olderMetadata, newerMetadata] of [
+      [{ run_attempt: 1, id: 100 }, {}],
+      [{ run_id: 100, id: 100 }, {}],
+      [{ run_attempt: '1', id: '100' }, {}],
+      [{ run_attempt: 'invalid', id: 100 }, {}],
+      [{}, { run_attempt: 1, id: 100 }],
+      [{ run_attempt: 1, id: 100 }, { run_attempt: null }],
+      [{ run_attempt: 1, id: 100 }, { run_attempt: 'invalid' }],
+      [{ run_attempt: 1, id: 100 }, { run_id: 200 }],
+      [{ run_attempt: 1, id: 100 }, { run_attempt: 1 }],
+      [{ run_id: 100, run_attempt: 1, id: 100 }, { run_id: 100 }],
+    ]) {
+      for (const conclusion of ['FAILURE', 'CANCELLED', 'SUCCESS']) {
+        const rows = [
+          { __typename: 'CheckRun', name: 'TEST', status: 'COMPLETED', conclusion: conclusion === 'SUCCESS' ? 'FAILURE' : 'SUCCESS',
+            completedAt: '2026-10-28T01:00:00Z', ...olderMetadata },
+          { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion,
+            completedAt: '2026-10-28T02:00:00Z', ...newerMetadata },
+        ];
+        const evidence = { ...input, requiredChecks: ['test'], rollup: [
+          ...(reverse ? rows.toReversed() : rows),
+          { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+        ] };
+        const expected = { red: [], pending: [], missing: [], green: [] };
+        expected[conclusion === 'FAILURE' ? 'red' : conclusion === 'CANCELLED' ? 'pending' : 'green'] = ['test'];
+        expect(requiredCheckStates(evidence)).toEqual(expected);
+        expect(contradictingChecks(evidence)).toEqual(expected.red);
+        expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(conclusion !== 'FAILURE');
+        expect(ciGreenForEscalation(evidence)).toBe(conclusion === 'SUCCESS');
+      }
+    }
+  });
+
+  it.each([false, true])('partial attempt metadata cannot hide an in-flight required check (reverse=%s)', reverse => {
+    const rows = [
+      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', run_attempt: 1, id: 100, completedAt: '2026-10-28T01:00:00Z' },
+      { name: 'test', status: 'IN_PROGRESS', conclusion: null },
+    ];
+    const evidence = { ...input, requiredChecks: ['test'], rollup: reverse ? rows.toReversed() : rows };
+    expect(requiredCheckStates(evidence)).toEqual({ red: [], pending: ['test'], missing: [], green: [] });
+    expect(ciGreenForEscalation(evidence)).toBe(false);
+    expect(contradictingChecks(evidence)).toEqual([]);
+  });
+
   it.each([false, true])('unrelated attempt metadata cannot hide a timestamped required failure (reverse=%s)', reverse => {
     const rows = [
       { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-28T01:00:00Z' },
@@ -24,6 +69,21 @@ describe('requiredCheckStates shared predicate regressions', () => {
       expect(contradictingChecks(evidence)).toEqual(['test']);
       expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(false);
       expect(ciGreenForEscalation(evidence)).toBe(false);
+    }
+  });
+
+  it.each([false, true])('complete decisive ranks still beat timestamps when secondary ranks are partial (reverse=%s)', reverse => {
+    for (const [olderMetadata, newerMetadata] of [
+      [{ run_attempt: 1, id: 100 }, { run_attempt: 2 }],
+      [{ run_id: 100, run_attempt: 2, id: 100 }, { run_id: 200 }],
+      [{ run_id: 100, run_attempt: 2, id: 100 }, { id: 200 }],
+    ]) {
+      const rows = [
+        { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-28T02:00:00Z', ...olderMetadata },
+        { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T01:00:00Z', ...newerMetadata },
+      ];
+      expect(requiredCheckStates({ requiredChecks: ['test'], rollup: reverse ? rows.toReversed() : rows }))
+        .toEqual({ red: ['test'], pending: [], missing: [], green: [] });
     }
   });
 
