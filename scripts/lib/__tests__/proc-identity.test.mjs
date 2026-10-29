@@ -1,15 +1,9 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync, openSync, readSync, closeSync, opendirSync } from 'node:fs';
+import fs, { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readIdentity, sameIdentity, liveness, currentBootId, listGroup, boundedReadFile, boundedReaddir } from '../proc-identity.mjs';
-
-vi.mock('node:fs', async (importOriginal) => {
-  const fs = await importOriginal();
-  return { ...fs, openSync: vi.fn(fs.openSync), readSync: vi.fn(fs.readSync),
-    closeSync: vi.fn(fs.closeSync), opendirSync: vi.fn(fs.opendirSync) };
-});
 
 const PID = 12345;
 const UID = 501;
@@ -485,16 +479,31 @@ describe('listGroup', () => {
   });
 });
 
-describe('default bounded filesystem adapters', () => {
+describe('bounded filesystem adapters', () => {
   const maxBytes = 1024 * 1024;
-  afterEach(async () => {
-    const fs = await vi.importActual('node:fs');
-    for (const [name, mock] of Object.entries({ openSync, readSync, closeSync, opendirSync })) {
+  // Native ESM consumers can bypass Vitest's node:fs module mock. Inject only
+  // these adapters' IO so instrumentation also reaches the production reader.
+  const io = Object.fromEntries(['openSync', 'readSync', 'closeSync', 'opendirSync']
+    .map((name) => [name, vi.fn(fs[name])]));
+  const { openSync, readSync, closeSync, opendirSync } = io;
+  afterEach(() => {
+    for (const [name, mock] of Object.entries(io)) {
       mock.mockReset().mockImplementation(fs[name]);
     }
   });
 
-  it('default procfs reader reads at most MAX_BYTES plus one byte and closes on rejection', () => {
+  it('default adapters read real files and directory entries without injected IO', () => {
+    const root = mkdtempSync(join(tmpdir(), 'proc-identity-'));
+    const path = join(root, 'evidence');
+    try {
+      writeFileSync(path, 'process evidence');
+      expect(boundedReadFile(path)).toBe('process evidence');
+      expect(boundedReaddir(root)).toEqual(['evidence']);
+      for (const mock of Object.values(io)) expect(mock).not.toHaveBeenCalled();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('procfs reader reads at most MAX_BYTES plus one byte and closes on rejection', () => {
     const root = mkdtempSync(join(tmpdir(), 'proc-identity-'));
     const path = join(root, 'large');
     writeFileSync(path, Buffer.alloc(maxBytes * 2, 120));
@@ -509,7 +518,7 @@ describe('default bounded filesystem adapters', () => {
     });
     closeSync.mockClear();
     try {
-      expect(() => boundedReadFile(path)).toThrow(/1 MiB/);
+      expect(() => boundedReadFile(path, io)).toThrow(/1 MiB/);
       expect(total).toBe(maxBytes + 1);
       expect(ranges.length).toBeGreaterThan(1);
       for (const range of ranges) {
@@ -524,18 +533,18 @@ describe('default bounded filesystem adapters', () => {
     }
   });
 
-  it('default reader accepts exactly MAX_BYTES and closes on successful EOF', () => {
+  it('reader accepts exactly MAX_BYTES and closes on successful EOF', () => {
     const root = mkdtempSync(join(tmpdir(), 'proc-identity-'));
     const path = join(root, 'exact');
     writeFileSync(path, 'x'.repeat(maxBytes));
     closeSync.mockClear();
     try {
-      expect(boundedReadFile(path)).toBe('x'.repeat(maxBytes));
+      expect(boundedReadFile(path, io)).toBe('x'.repeat(maxBytes));
       expect(closeSync).toHaveBeenCalledTimes(1);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it('default procfs reader honours deadline between reads and closes on timeout', () => {
+  it('procfs reader honours deadline between reads and closes on timeout', () => {
     const nativeRead = readSync.getMockImplementation();
     const clock = vi.spyOn(Date, 'now').mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValue(2000);
     openSync.mockReturnValueOnce(987);
@@ -544,40 +553,40 @@ describe('default bounded filesystem adapters', () => {
     readSync.mockClear();
     closeSync.mockClear();
     try {
-      expect(() => boundedReadFile('/synthetic')).toThrow(/timed out/);
+      expect(() => boundedReadFile('/synthetic', io)).toThrow(/timed out/);
       expect(readSync).toHaveBeenCalledTimes(1);
       expect(closeSync).toHaveBeenCalledWith(987);
     } finally { clock.mockRestore(); readSync.mockImplementation(nativeRead); }
   });
 
-  it('default procfs reader closes when the filesystem read throws', () => {
+  it('procfs reader closes when the filesystem read throws', () => {
     openSync.mockReturnValueOnce(987);
     readSync.mockImplementationOnce(() => { throw new Error('read failed'); });
     closeSync.mockImplementationOnce(() => {});
     closeSync.mockClear();
-    expect(() => boundedReadFile('/synthetic')).toThrow('read failed');
+    expect(() => boundedReadFile('/synthetic', io)).toThrow('read failed');
     expect(closeSync).toHaveBeenCalledWith(987);
   });
 
-  it.each([65536, 65537])('default directory reader enforces the 65536 entry cap (%s)', (count) => {
+  it.each([65536, 65537])('directory reader enforces the 65536 entry cap (%s)', (count) => {
     let seen = 0;
     const dir = { readSync: vi.fn(() => seen++ < count ? { name: String(seen) } : null), closeSync: vi.fn() };
     opendirSync.mockReturnValueOnce(dir);
     const clock = vi.spyOn(Date, 'now').mockReturnValue(0);
     try {
-      if (count === 65536) expect(boundedReaddir('/synthetic')).toHaveLength(count);
-      else expect(() => boundedReaddir('/synthetic')).toThrow(/scan limit/);
+      if (count === 65536) expect(boundedReaddir('/synthetic', io)).toHaveLength(count);
+      else expect(() => boundedReaddir('/synthetic', io)).toThrow(/scan limit/);
       expect(dir.readSync.mock.calls.length).toBeLessThanOrEqual(65537);
       expect(dir.closeSync).toHaveBeenCalledTimes(1);
     } finally { clock.mockRestore(); }
   });
 
-  it('default directory reader honours deadline and closes on timeout', () => {
+  it('directory reader honours deadline and closes on timeout', () => {
     const dir = { readSync: vi.fn(() => ({ name: '1' })), closeSync: vi.fn() };
     opendirSync.mockReturnValueOnce(dir);
     const clock = vi.spyOn(Date, 'now').mockReturnValueOnce(0).mockReturnValue(2000);
     try {
-      expect(() => boundedReaddir('/synthetic')).toThrow(/scan limit/);
+      expect(() => boundedReaddir('/synthetic', io)).toThrow(/scan limit/);
       expect(dir.readSync).toHaveBeenCalledTimes(1);
       expect(dir.closeSync).toHaveBeenCalledTimes(1);
     } finally { clock.mockRestore(); }

@@ -38,26 +38,26 @@ function boundedText(value) {
 }
 
 // procfs reports zero file sizes, so enforce the limit while reading, not with stat.
-function readFile(path) {
-  const fd = openSync(path, 'r');
+function readFile(path, fs = { openSync, readSync, closeSync }) {
+  const fd = fs.openSync(path, 'r');
   try {
     const buffer = Buffer.alloc(MAX_BYTES + 1);
     let length = 0;
     const deadline = Date.now() + TIMEOUT;
     while (length < buffer.length) {
       if (Date.now() >= deadline) throw new Error('procfs read timed out; retry or inspect manually');
-      const count = readSync(fd, buffer, length, buffer.length - length, null);
+      const count = fs.readSync(fd, buffer, length, buffer.length - length, null);
       if (!count) break;
       length += count;
     }
     return boundedText(buffer.subarray(0, length));
   } finally {
-    closeSync(fd);
+    fs.closeSync(fd);
   }
 }
 
-function readdir(path) {
-  const dir = opendirSync(path);
+function readdir(path, fs = { opendirSync }) {
+  const dir = fs.opendirSync(path);
   try {
     const entries = [];
     const deadline = Date.now() + TIMEOUT;
