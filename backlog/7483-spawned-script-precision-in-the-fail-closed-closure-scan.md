@@ -14,7 +14,7 @@ we:scripts/lib/daemon-rebuild/skip-unrelated.mjs now protects any file named by 
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — `npx vitest run we:scripts/lib/__tests__/closure-scope.test.mjs` gains a precision test that fails before and passes after, while every R210 protection test stays green.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -22,16 +22,16 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] Does not relax R210: unknown still means protected; only proven-resolvable targets may become droppable.
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — n/a: precision work on the same scan; unknown references stay protected (fail closed).
+2. **Truncated reads** — n/a: precision work on the same scan; unknown references stay protected (fail closed).
+3. **Shared state files** — n/a: precision work on the same scan; unknown references stay protected (fail closed).
+4. **Fail closed** — n/a: precision work on the same scan; unknown references stay protected (fail closed).
+5. **Identity scoping** — n/a: precision work on the same scan; unknown references stay protected (fail closed).
+6. **State over time** — n/a: precision work on the same scan; unknown references stay protected (fail closed).
+7. **Who wrote it** — n/a: precision work on the same scan; unknown references stay protected (fail closed).
