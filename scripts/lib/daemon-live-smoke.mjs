@@ -861,6 +861,7 @@ export async function runLiveSmoke({
   clock = Date.now, hostBusy = undefined, reuseCode = false,
   load = () => loadavg()[0], cores = () => cpus().length, shadow = shadowAdmission, admit = admitResource,
   makeReadMemoDir = () => mkdtempSync(join(tmpdir(), 'smoke-read-memo-')),
+  deferredChecks = [], onlyChecks = null,
 } = {}) {
   if (isSmokeGateDisabled(env)) return { pass: true, disabled: true, results: [], sessionSlug: null };
   // One shared `rebuild-smoke` decision per run sets the budgets (x9xkupj); the legacy load factor is its logged comparison.
@@ -914,6 +915,12 @@ export async function runLiveSmoke({
     const ctx = { root, budgets, repos, sessionSlug, env, ghChildEnv, runChild, beforePorcelain, clock, hostBusy, dryRun };
     const results = [];
     for (const check of SMOKE_CHECKS) {
+      if (onlyChecks && !onlyChecks.includes(check.name)) continue;
+      if (deferredChecks.includes(check.name)) {
+        results.push({ name: check.name, ms: 0, ok: true, skipped: true, mayBeTransient: check.mayBeTransient !== false,
+          detail: 'deferred to post-adopt soak (quick mode)' });
+        continue;
+      }
       const startedAt = clock();
       let result;
       if (check.kind === 'code' && (reuseCode || checkCodeUnchanged({ check, changedFiles, root, closureOf }))) {
@@ -1089,6 +1096,7 @@ export async function runLiveSmokeWithRetry({
   clock = Date.now,
   loadAvg = () => loadavg(),
   log = console,
+  singleAttempt = false, deferredChecks = [],
 } = {}) {
   if (isSmokeGateDisabled(env)) return { verdict: 'pass', disabled: true };
   let smoke;
@@ -1108,8 +1116,9 @@ export async function runLiveSmokeWithRetry({
     // Fresh token for EVERY attempt, the same way the daemon's own tick gets one (see refreshSmokeGithubEnv).
     const { env: runEnv, refresh } = await refreshAuth({ env: attemptEnv, force: forceRefresh });
     forceRefresh = false;
-    smoke = await runLiveSmoke({ root, env: runEnv, runChild, changedFiles, reuseCode, clock });
+    smoke = await runLiveSmoke({ root, env: runEnv, runChild, changedFiles, reuseCode, clock, deferredChecks });
     verdict = classifySmokeFailure(smoke.results);
+    if (singleAttempt) break;
     // A gate-confirmed outage may spend the retry's remaining budget before later checks can run.
     // Those gate-observed refusals are incomplete evidence, not a newly discovered code regression.
     // Still reject any independent code row, and never promote skips without prior probe confirmation.
