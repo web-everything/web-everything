@@ -162,13 +162,21 @@ describe('merge-ai-prs — #3215 wiring: the park site writes the ledger BEFORE 
     expect(add).toBeGreaterThan(row);
   });
 
-  it('the call sits inside the shouldApplyReviewLabel guard, AHEAD of the `gh pr edit --add-label` transport call', () => {
-    const guardStart = src.indexOf('if (shouldApplyReviewLabel(gate.applyLabel, v.prLabels)) {');
-    expect(guardStart).toBeGreaterThan(-1);
-    const ledgerCallAt = src.indexOf('recordDrainVerdict({ repo:', guardStart);
-    const ghCallAt = src.indexOf("execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', gate.applyLabel]", guardStart);
-    expect(ledgerCallAt).toBeGreaterThan(guardStart);
-    expect(ghCallAt).toBeGreaterThan(ledgerCallAt);
+  it('the call sits inside the applyDrainParkLabel onBeforeAdd hook, AHEAD of the `gh pr edit --add-label` transport call', () => {
+    // runCli hands the ledger write to applyDrainParkLabel as onBeforeAdd; the helper runs it only inside the
+    // shouldApplyReviewLabel guard and strictly before its own gh add-label call.
+    const callStart = src.indexOf('applyDrainParkLabel({ gate, labels: v.prLabels');
+    expect(callStart).toBeGreaterThan(-1);
+    expect(src.indexOf('onBeforeAdd: () => {', callStart)).toBeGreaterThan(callStart);
+    expect(src.indexOf('recordDrainVerdict({ repo:', callStart)).toBeGreaterThan(callStart);
+    const fnStart = src.indexOf('export function applyDrainParkLabel(');
+    expect(fnStart).toBeGreaterThan(-1);
+    const guardAt = src.indexOf('if (shouldApplyReviewLabel(gate.applyLabel, labels)) {', fnStart);
+    const hookAt = src.indexOf('onBeforeAdd?.();', fnStart);
+    const ghAt = src.indexOf("'--add-label', gate.applyLabel]", fnStart);
+    expect(guardAt).toBeGreaterThan(fnStart);
+    expect(hookAt).toBeGreaterThan(guardAt);
+    expect(ghAt).toBeGreaterThan(hookAt);
   });
 
   it('the wired call passes the SAME label the gate decided and the drain\'s own headSha — never a re-derived value', () => {
