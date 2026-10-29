@@ -66,7 +66,7 @@ const live = (r, now) => !!r && Number.isFinite(r.expiresAt) && now < r.expiresA
 /**
  * Is main red right now, and which PRs own the fix? PURE.
  * @param {{mainRedState?:object|null, priority?:object|null, manualFreeze?:object|null, now:number, repo?:string}} o
- * @returns {{red:boolean, sources:string[], fixPrs:number[], firstRedSha:string|null, since:number|null}}
+ * @returns {{red:boolean, sources:string[], fixPrs:number[], firstRedSha:string|null, latestRedSha:string|null, since:number|null}}
  */
 export function redMainSignal({ mainRedState = null, priority = null, manualFreeze = null, now, repo = 'we' } = {}) {
   const sources = [];
@@ -80,6 +80,7 @@ export function redMainSignal({ mainRedState = null, priority = null, manualFree
     sources,
     fixPrs,
     firstRedSha: mainRedState?.firstRedSha ?? pri?.firstRedSha ?? manualFreeze?.mergeSha ?? null,
+    latestRedSha: mainRedState?.latestRedSha ?? pri?.latestRedSha ?? null,
     since: Number.isFinite(mainRedState?.since) ? mainRedState.since : null,
   };
 }
