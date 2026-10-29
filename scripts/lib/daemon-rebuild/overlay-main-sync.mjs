@@ -2,9 +2,9 @@
 import * as fs from 'node:fs';
 import { execFile, spawn, spawnSync } from 'node:child_process';
 import { dirname, join, resolve, isAbsolute } from 'node:path';
-import { tmpdir } from 'node:os';
+import { tmpdir, hostname } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { cascadePolicy } from '../policy-cascade.mjs';
 import { readOverlayState, overlayFilePath, appendOverlayEvent } from '../daemon-overlays.mjs';
@@ -13,6 +13,7 @@ import { markOverlayConflictWake } from '../overlay-conflict-wake.mjs';
 import { buildReverseImportGraph, testDepths, isVitestTestFile, isGraphSourceFile } from '../related-test-selection.mjs';
 import { alertsFilePath } from './state.mjs';
 import { REBUILD_IDENTITY_ENV } from './shared.mjs';
+import { tryLease } from '../../operations/coordination-lock.mjs';
 
 const SELF = fileURLToPath(import.meta.url), SETTINGS = join(dirname(SELF), '../daemon-rebuild-settings.json');
 const validMode = mode => ['off', 'shadow', 'on'].includes(mode);
@@ -49,6 +50,29 @@ function writeSyncState(file, data, io) {
   try { io.writeFileSync(temp, JSON.stringify(data)); io.renameSync(temp, file); }
   finally { io.rmSync(temp, { force: true }); }
 }
+const transactionWait = new Int32Array(new SharedArrayBuffer(4));
+function transaction(file, fn, io = fs) {
+  // The shared fence covers the entire callback, including read and rename. Even an
+  // expired holder cannot resume a write after a successor has acquired the fence.
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const lease = tryLease({ path: `${file}.lock`, owner: { pid: process.pid, host: hostname() },
+      staleMs: 30_000, fs: io });
+    if (!lease.ok) { Atomics.wait(transactionWait, 0, 0, 10); continue; }
+    try {
+      const result = lease.handle.runIfOwned(() => ({ value: fn() }));
+      if (!result || !Object.hasOwn(result, 'value')) throw new Error('main-sync state ownership lost');
+      return result.value;
+    } finally { lease.handle.release(); }
+  }
+  throw Object.assign(new Error('main-sync state busy; retry on the next tick'), { code: 'MAIN_SYNC_STATE_BUSY' });
+}
+function updateSyncState(file, update, io = fs) {
+  return transaction(file, () => {
+    const state = readSyncState(file, io);
+    update(state);
+    writeSyncState(file, state, io);
+  }, io);
+}
 function acquire(file, io = fs) {
   io.mkdirSync(dirname(file), { recursive: true });
   try { if (Date.now() - io.statSync(file).mtimeMs > 30 * 60_000) io.unlinkSync(file); }
@@ -68,13 +92,47 @@ function needsYou(root, env, ref, error, io = fs) {
   io.mkdirSync(dirname(file), { recursive: true });
   io.appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), kind: 'overlay-main-sync-needs-you', detail })}\n`);
 }
+const alertFallback = new Map(), ALERT_INTERVAL = 60 * 60_000;
+function rateLimitedAlert(root, env, ref, error, io = fs) {
+  // Keep diagnostics independent of the state they diagnose, including malformed JSON.
+  const file = join(`${alertsFilePath(root, env)}.main-sync`, `${createHash('sha256').update(ref).digest('hex')}.json`);
+  const at = Date.now();
+  const recent = time => Number.isFinite(time) && at >= time && at - time < ALERT_INTERVAL;
+  for (const [key, time] of alertFallback) if (!recent(time)) alertFallback.delete(key);
+  if (recent(alertFallback.get(file))) return;
+  let emitted = false, lastAlertAt = at;
+  try {
+    transaction(file, () => {
+      let previous;
+      try { previous = JSON.parse(io.readFileSync(file, 'utf8')).at; }
+      catch (e) { if (e.code !== 'ENOENT') throw e; }
+      if (recent(previous)) { lastAlertAt = previous; return; }
+      needsYou(root, env, ref, error, io);
+      emitted = true;
+      writeSyncState(file, { at }, io);
+    }, io);
+  } catch (markerError) {
+    if (markerError.code === 'MAIN_SYNC_STATE_BUSY') return; // Another process owns this diagnostic; retry next tick.
+    // If the diagnostic marker itself is unavailable, a long-lived health-watch
+    // still emits at most once an hour. Keep the original actionable error.
+    if (!emitted) needsYou(root, env, ref, error, io);
+    emitted = true;
+  }
+  alertFallback.set(file, lastAlertAt);
+  if (emitted) {
+    try { updateSyncState(sidecar(root, env), state => { state.errorAt[ref] = at; }, io); }
+    catch { /* The independent marker remains authoritative when state is unreadable/busy. */ }
+  }
+}
+let lastModeLog;
 export function resolveOverlayMainSyncMode(env = process.env, { settingsPath = SETTINGS } = {}) {
   let tool;
   try { tool = JSON.parse(fs.readFileSync(settingsPath, 'utf8')).overlayMainSync; } catch { /* standard */ }
   const r = cascadePolicy('overlayMainSync', tool, { env, standard: { mode: 'shadow' },
     envValues: { mode: env.WE_DAEMON_OVERLAY_MAIN_SYNC }, valid: { mode: validMode } });
   const value = { mode: r.value.mode, source: r.sources.mode };
-  console.error(`overlayMainSync=${value.mode} source=${value.source}`);
+  const line = `overlayMainSync=${value.mode} source=${value.source}`, key = `${settingsPath}:${line}`;
+  if (lastModeLog !== key) { console.error(line); lastModeLog = key; }
   return value;
 }
 export function selectSyncTargets(state) {
@@ -90,15 +148,7 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
   for (const ref of selectSyncTargets(readOverlayState(root, { env }))) {
     let token;
     const lock = marker(root, env, ref);
-    const alert = error => {
-      try {
-        const file = sidecar(root, env), state = readSyncState(file), at = Date.now();
-        if (state.errorAt[ref] !== undefined && at - state.errorAt[ref] < 60 * 60_000) return;
-        state.errorAt[ref] = at;
-        writeSyncState(file, state, fs);
-      } catch { /* Unreadable state cannot authorize a run or suppress its diagnostic. */ }
-      needsYou(root, env, ref, error);
-    };
+    const alert = error => rateLimitedAlert(root, env, ref, error);
     try {
       if (!isSafeBranchName(ref)) throw new Error('unsafe overlay ref');
       token = acquire(lock);
@@ -117,8 +167,7 @@ export function kickOverlayMainSync({ root, env = process.env, mode, spawnFn = s
         result.skipped.push(ref); continue;
       }
       if (mode === 'shadow') {
-        synced.shadowMain[ref] = main;
-        writeSyncState(sidecar(root, env), synced, fs);
+        updateSyncState(sidecar(root, env), state => { state.shadowMain[ref] = main; });
         console.error(`overlay-main-sync would merge main into ${ref}`);
         appendOverlayEvent(root, { kind: 'overlay-main-sync-shadow', ref }, { env });
         result.would.push(ref); continue;
@@ -142,7 +191,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
   const now = deps.now ?? (() => new Date().toISOString());
   const git = (args, cwd = root) => (deps.git ?? executeGit)(args, { cwd, env: { ...env, ...REBUILD_IDENTITY_ENV } });
   const lock = marker(root, env, ref);
-  let scratchParent, heartbeat, main;
+  let scratchParent, heartbeat, main, publicationStarted = false;
   try {
     if (!isSafeBranchName(ref)) throw new Error('unsafe overlay ref');
     readSyncState(sidecar(root, env), io);
@@ -207,29 +256,34 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
       || io.readFileSync(lock, 'utf8') !== token) throw new Error('overlay registration or marker changed');
     if (sha(git(['rev-parse', 'HEAD'], scratch)) !== to || output(git(['status', '--porcelain'], scratch)).trim()) throw new Error('candidate changed during tests');
     let push;
+    publicationStarted = true;
     try { push = git(['push', 'origin', `HEAD:refs/heads/${ref}`], scratch); }
     catch (error) { push = { error }; }
-    const file = sidecar(root, env), synced = readSyncState(file, io);
+    const file = sidecar(root, env);
     if (push?.status !== 0 || push.error) {
-      synced.pushRetryAfter[ref] = Date.now() + 10 * 60_000;
-      synced.pushRetryMain[ref] = main;
-      writeSyncState(file, synced, io);
+      updateSyncState(file, state => {
+        state.pushRetryAfter[ref] = Date.now() + 10 * 60_000;
+        state.pushRetryMain[ref] = main;
+      }, io);
+      const reason = String(push?.stderr || push?.error?.message || 'push rejected or failed');
+      rateLimitedAlert(root, env, ref, new Error(`push failed; retry in ten minutes: ${reason}`), io);
       return { pushed: false };
     }
-    synced.lastSyncedMain[ref] = main;
-    delete synced.pushRetryAfter[ref]; delete synced.pushRetryMain[ref];
-    writeSyncState(file, synced, io);
+    updateSyncState(file, state => {
+      state.lastSyncedMain[ref] = main;
+      delete state.pushRetryAfter[ref]; delete state.pushRetryMain[ref];
+    }, io);
     event(root, { kind: 'overlay-main-synced', ref, from, to, tests }, { env });
     return { pushed: true, ref, from, to, tests };
   } catch (error) {
     try {
-      if (main) {
-        const file = sidecar(root, env), state = readSyncState(file, io);
-        state.attemptedMain[ref] = main;
-        writeSyncState(file, state, io);
+      // A state-lock/write failure after attempting publication must remain retryable;
+      // attemptedMain is reserved for merge/test failures requiring a new main.
+      if (main && !publicationStarted) {
+        updateSyncState(sidecar(root, env), state => { state.attemptedMain[ref] = main; }, io);
       }
-    } catch (stateError) { needsYou(root, env, ref, stateError, io); }
-    needsYou(root, env, ref, error, io); throw error;
+    } catch { /* The diagnostic below uses its own rate-limit marker. */ }
+    rateLimitedAlert(root, env, ref, error, io); throw error;
   }
   finally {
     clearInterval(heartbeat);

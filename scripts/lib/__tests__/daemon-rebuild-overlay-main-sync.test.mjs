@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import { join, dirname } from 'node:path';
+import ts from 'typescript';
 import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { kickOverlayMainSync, runOverlayMainSync, selectSyncTargets, resolveOverlayMainSyncMode } from '../daemon-rebuild/overlay-main-sync.mjs';
 import { addOverlay, readOverlayState, overlayFilePath, appendOverlayEvent } from '../daemon-overlays.mjs';
@@ -137,6 +139,8 @@ describe('overlay main sync', () => {
     expect(json(sidecar(f)).attemptedMain?.[ref]).toBeUndefined();
     expect(json(sidecar(f)).pushRetryAfter[ref]).toBe(started + 10 * 60_000);
     expect(json(sidecar(f)).pushRetryMain[ref]).toBe(f.mainSha);
+    expect(alerts(f)).toHaveLength(1);
+    expect(alerts(f)[0].detail.reason).toMatch(/push.*(failed|rejected|transport)/i);
     const spawnFn = spawner();
     f.deps.git.mockClear();
     expect(tick(f, { spawnFn })).toMatchObject({ started: [], skipped: [ref] });
@@ -159,6 +163,42 @@ describe('overlay main sync', () => {
   it('contained bases skipped', () => {
     const state = { corrupt: false, overlays: [{ ref: 'lane/base' }, { ref, stackBases: ['lane/base'] }, { ref: 'lane/solo' }] };
     expect(selectSyncTargets(state)).toEqual([ref, 'lane/solo']);
+  });
+
+  it('consecutive permission-denied pushes alert on the first failure and again after an hour', async () => {
+    const f = fixture(), started = 1_800_000_000_000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(started), git = f.deps.git;
+    f.deps.git = (args, opts) => args[0] === 'push'
+      ? { status: 1, stdout: '', stderr: 'permission denied by branch protection' } : git(args, opts);
+    for (const [elapsed, expectedAlerts] of [[0, 1], [10 * 60_000, 1], [60 * 60_000, 2]]) {
+      clock.mockReturnValue(started + elapsed);
+      expect(await job(f)).toEqual({ pushed: false });
+      expect(alerts(f)).toHaveLength(expectedAlerts);
+      expect(alerts(f).at(-1).detail.reason).toContain('permission denied by branch protection');
+      expect(json(sidecar(f)).attemptedMain[ref]).toBeUndefined();
+      expect(json(sidecar(f)).pushRetryAfter[ref]).toBe(Date.now() + 10 * 60_000);
+    }
+  });
+
+  it('state publication failure after push stays retryable instead of remembering a failed main', async () => {
+    const f = fixture(), git = f.deps.git;
+    let pushed = false, failed = false;
+    f.deps.git = (args, opts) => {
+      const result = git(args, opts);
+      if (args[0] === 'push') pushed = true;
+      return result;
+    };
+    f.deps.io.readFileSync = (file, ...args) => {
+      if (file === sidecar(f) && pushed && !failed) {
+        failed = true;
+        throw new Error('state publication unavailable');
+      }
+      return fs.readFileSync(file, ...args);
+    };
+    await expect(job(f)).rejects.toThrow('state publication unavailable');
+    expect(failed).toBe(true);
+    expect(json(sidecar(f)).attemptedMain[ref]).toBeUndefined();
+    expect(alerts(f)[0].detail.reason).toContain('state publication unavailable');
   });
 
   it('no run while the auto-rebase marker is held', async () => {
@@ -246,6 +286,102 @@ describe('overlay main sync', () => {
     expect(resolve(env)).toEqual({ mode: 'shadow', source: 'tool' });
     for (const mode of ['on', 'off', 'shadow']) expect(resolve({ ...env, WE_DAEMON_OVERLAY_MAIN_SYNC: mode })).toEqual({ mode, source: 'env' });
     expect(log.mock.calls.flat().join('\n')).toMatch(/source=env/);
+  });
+
+  // Reusable contract for off|shadow|on settings: malformed inputs never choose live mode.
+  function assertInvalidModesStayShadow(resolveMode, settingsPath) {
+    fs.writeFileSync(settingsPath, JSON.stringify({ overlayMainSync: { mode: 'shadow' } }));
+    for (const value of ['bogus', 'ON', ' on ', '', 'true']) {
+      expect(resolveMode({ WE_DAEMON_OVERLAY_MAIN_SYNC: value }).mode).toBe('shadow');
+    }
+    for (const raw of ['{broken', 'null', JSON.stringify({ overlayMainSync: { mode: 'bogus' } })]) {
+      fs.writeFileSync(settingsPath, raw);
+      expect(resolveMode({}).mode).toBe('shadow');
+    }
+  }
+
+  it('invalid environment and corrupt settings resolve to shadow', () => {
+    const base = temp(), settingsPath = join(base, 'settings.json');
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    assertInvalidModesStayShadow(env => resolveOverlayMainSyncMode({
+      WE_PLATFORM_PREFERENCES_FILE: join(base, 'missing'), ...env,
+    }, { settingsPath }), settingsPath);
+  });
+
+  it('unchanged mode provenance logs once across consecutive resolutions', () => {
+    const base = temp(), log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const env = { WE_PLATFORM_PREFERENCES_FILE: join(base, 'missing') };
+    const options = { settingsPath: join(base, 'settings.json') };
+    resolveOverlayMainSyncMode(env, options);
+    resolveOverlayMainSyncMode(env, options);
+    expect(log).toHaveBeenCalledTimes(1);
+    resolveOverlayMainSyncMode({ ...env, WE_DAEMON_OVERLAY_MAIN_SYNC: 'off' }, options);
+    expect(log).toHaveBeenCalledTimes(2);
+  });
+
+  it('off mode skips an eligible unsynced overlay without Git or spawn calls', () => {
+    const f = fixture(), spawnFn = spawner();
+    expect(tick(f, { mode: 'off', spawnFn })).toEqual({ started: [], skipped: [], would: [] });
+    expect(f.deps.git).not.toHaveBeenCalled();
+    expect(spawnFn).not.toHaveBeenCalled();
+    expect(tick(f, { spawnFn }).started).toEqual([ref]);
+  });
+
+  it('eligible overlay launches a detached unreferenced worker', () => {
+    const f = fixture(), unref = vi.fn(), spawnFn = vi.fn(() => ({ once: vi.fn(), unref }));
+    expect(tick(f, { spawnFn }).started).toEqual([ref]);
+    expect(spawnFn).toHaveBeenCalledWith(process.execPath, expect.arrayContaining([
+      `--clone=${f.root}`, `--ref=${ref}`,
+    ]), { cwd: f.root, env: f.env, detached: true, stdio: 'ignore' });
+    expect(unref).toHaveBeenCalledOnce();
+  });
+
+  it('unreadable graph input refuses publication', async () => {
+    const f = fixture();
+    f.deps.io.readFileSync = (file, ...args) => {
+      if (String(file).endsWith('/repo/worker.mjs')) throw new Error('graph-source unreadable');
+      return fs.readFileSync(file, ...args);
+    };
+    await expect(job(f)).rejects.toThrow('graph-source unreadable');
+    expect(f.deps.testRunner).not.toHaveBeenCalled();
+    expect(f.pushes).toEqual([]);
+    expect(alerts(f)[0].detail.reason).toContain('graph-source unreadable');
+  });
+
+  it.each(['synced', 'retry'])('concurrent refs preserve each other’s sync and retry state (%s)', async outcome => {
+    const f = fixture(), other = 'lane/other';
+    addOverlay(f.root, { ref: other }, { env: f.env });
+    let overlap, interleaved = false, pushReached = false;
+    const git = f.deps.git;
+    f.deps.git = (args, opts) => {
+      if (args[0] === 'push') {
+        pushReached = true;
+        if (outcome === 'retry') return { status: 1, stdout: '', stderr: 'permission denied' };
+      }
+      return git(args, opts);
+    };
+    const otherGit = args => ({ status: 0, stdout: args[0] === 'fetch' ? ''
+      : args[0] === 'diff' ? 'worker.mjs\0' : `${f.mainSha}\n` });
+    const otherTick = () => tick(f, { mode: 'shadow', git: otherGit });
+    // Pause writer A after reading its snapshot, then run writer B before A publishes.
+    f.deps.io.readFileSync = (file, ...args) => {
+      const value = fs.readFileSync(file, ...args);
+      if (file === sidecar(f) && pushReached && !interleaved) {
+        interleaved = true;
+        overlap = otherTick();
+      }
+      return value;
+    };
+    fs.writeFileSync(sidecar(f), JSON.stringify({ lastSyncedMain: {} }));
+    await job(f);
+    expect(interleaved).toBe(true);
+    // A contending transaction may defer, but an acknowledged write must never disappear.
+    if (overlap.would.includes(other)) expect(json(sidecar(f)).shadowMain[other]).toBe(f.mainSha);
+    otherTick();
+    const state = json(sidecar(f));
+    expect(state.shadowMain[other]).toBe(f.mainSha);
+    expect(state[outcome === 'synced' ? 'lastSyncedMain' : 'pushRetryMain'][ref]).toBe(f.mainSha);
+    if (outcome === 'retry') expect(state.pushRetryAfter[ref]).toBeGreaterThan(Date.now());
   });
 
   it('already synced main is skipped and off mode spawns nothing', async () => {
@@ -362,10 +498,69 @@ describe('overlay main sync', () => {
     const f = fixture(), spawnFn = spawner();
     fs.writeFileSync(sidecar(f), raw);
     expect(tick(f, { spawnFn })).toMatchObject({ started: [], skipped: [ref] });
+    expect(tick(f, { spawnFn })).toMatchObject({ started: [], skipped: [ref] });
     await expect(job(f)).rejects.toThrow();
     expect(spawnFn).not.toHaveBeenCalled(); expect(f.deps.git).not.toHaveBeenCalled();
     expect(fs.readFileSync(sidecar(f), 'utf8')).toBe(raw);
+    expect(alerts(f)).toHaveLength(1);
+  });
+
+  it('corrupt sidecar diagnostic becomes due again after one hour', () => {
+    const f = fixture(), spawnFn = spawner(), started = 1_800_000_000_000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(started);
+    fs.writeFileSync(sidecar(f), '{broken');
+    tick(f, { spawnFn });
+    clock.mockReturnValue(started + 60 * 60_000 - 1);
+    tick(f, { spawnFn });
+    expect(alerts(f)).toHaveLength(1);
+    clock.mockReturnValue(started + 60 * 60_000);
+    tick(f, { spawnFn });
     expect(alerts(f)).toHaveLength(2);
+    expect(spawnFn).not.toHaveBeenCalled();
+    expect(f.deps.git).not.toHaveBeenCalled();
+  });
+
+  it('unreadable sidecar fails closed and shares the independent diagnostic rate limit', async () => {
+    const f = fixture();
+    f.deps.io.readFileSync = (file, ...args) => {
+      if (file === sidecar(f)) throw Object.assign(new Error('sidecar unreadable'), { code: 'EACCES' });
+      return fs.readFileSync(file, ...args);
+    };
+    await expect(job(f)).rejects.toThrow('sidecar unreadable');
+    await expect(job(f)).rejects.toThrow('sidecar unreadable');
+    expect(alerts(f)).toHaveLength(1);
+    expect(alerts(f)[0].detail.reason).toBe('sidecar unreadable');
+    expect(f.deps.git).not.toHaveBeenCalled();
+    expect(f.deps.testRunner).not.toHaveBeenCalled();
+  });
+
+  it('diagnostic rate limit survives a fresh worker and expires at the original timestamp', () => {
+    const f = fixture(), started = 1_800_000_000_000;
+    vi.spyOn(Date, 'now').mockReturnValue(started);
+    fs.writeFileSync(sidecar(f), '{broken');
+    tick(f, { spawnFn: spawner() });
+    const moduleUrl = pathToFileURL(join(process.cwd(), 'scripts/lib/daemon-rebuild/overlay-main-sync.mjs')).href;
+    const code = `
+      import { readFileSync } from 'node:fs';
+      import { kickOverlayMainSync } from ${JSON.stringify(moduleUrl)};
+      const { root, env, started, alertsFile } = JSON.parse(readFileSync(0, 'utf8'));
+      const counts = [];
+      for (const elapsed of [59 * 60_000, 60 * 60_000]) {
+        Date.now = () => started + elapsed;
+        kickOverlayMainSync({ root, env, mode: 'on',
+          git: () => { throw new Error('unexpected Git'); },
+          spawnFn: () => { throw new Error('unexpected spawn'); },
+        });
+        counts.push(readFileSync(alertsFile, 'utf8').trim().split('\\n').length);
+      }
+      console.log(JSON.stringify(counts));
+    `;
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', code], {
+      encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+      input: JSON.stringify({ root: f.root, env: f.env, started, alertsFile: alertsFilePath(f.root, f.env) }),
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual([1, 2]);
   });
 
   it('stale marker older than 30 minutes is taken over', () => {
@@ -398,6 +593,26 @@ describe('overlay main sync', () => {
 });
 
 describe('health-watch overlay main sync wiring', () => {
+  it('tick registers overlayMainSync and forwards the actual flags through its error boundary', () => {
+    const source = fs.readFileSync(join(process.cwd(), 'scripts/conveyor/health-watch.mjs'), 'utf8');
+    const ast = ts.createSourceFile('health-watch.mjs', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+    const tickNode = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === 'tick');
+    const assignments = [];
+    const visit = node => {
+      if (ts.isBinaryExpression(node) && node.left.getText(ast) === 'probes.overlayMainSync') assignments.push(node);
+      ts.forEachChild(node, visit);
+    };
+    visit(tickNode.body);
+    expect(assignments).toHaveLength(1);
+    const probe = vi.fn(() => 'probe-result'), attempt = vi.fn((name, fn) => fn());
+    const flags = { 'state-root': '/fixture', 'dry-run': true }, probes = {};
+    // Execute the real assignment extracted from tick, without invoking unrelated host probes.
+    Function('probes', 'attempt', 'probeOverlayMainSync', 'flags', assignments[0].getText(ast))(probes, attempt, probe, flags);
+    expect(probe).toHaveBeenCalledOnce();
+    expect(probe).toHaveBeenCalledWith(flags);
+    expect(attempt).toHaveBeenCalledWith('overlayMainSync', expect.any(Function));
+    expect(probes.overlayMainSync).toBe('probe-result');
+  });
   it.each(['logs-dir', 'lock-root', 'state-root', 'dry-run', 'ps-fixture', 'arbitrary-fixture'])(
     '%s suppresses clone discovery and overlay kicks', flag => {
       const roots = vi.fn(), kick = vi.fn();
