@@ -1,7 +1,7 @@
 /**
  * @file scripts/lib/__tests__/daemon-live-smoke.test.mjs
  * @description #3383 — the live smoke gate a daemon clone runs after a self-sync merge, before restarting onto
- *   it. Every check runs through an INJECTED `runChild` here (never a real child process) so this suite is
+ *   it. Checks run through an INJECTED `runChild`; one bounded local Node exit probe verifies real error shapes. The suite is
  *   hermetic and fast; the real live behavior (a real lane-pool lease, a real `gh` call, a real reconcile-pass
  *   dry-run) is proven separately as a one-off script against a real/throwaway clone (see the PR body), not in
  *   vitest.
@@ -40,6 +40,7 @@ import {
   resolveIoBoundLoadScale, resolveSmokeGithubPerOwner, resolveSmokeReadMemo, resolveSmokeDryRun,
 } from '../daemon-live-smoke.mjs';
 
+import { runBounded } from '../bounded-child.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 vi.mock('../settings-files.mjs', async (original) => {
   const actual = await original();
@@ -50,6 +51,83 @@ vi.mock('../settings-files.mjs', async (original) => {
 vi.mock('../resource-admission.mjs', () => ({ shadowAdmission: vi.fn(), admit: vi.fn() }));
 beforeEach(() => vi.stubEnv('WE_RESOURCE_SHADOW', 'off'));
 afterEach(() => vi.unstubAllEnvs());
+
+describe('lane acquire smoke after lane-hold reset refusal', () => {
+  const check = SMOKE_CHECKS.find((c) => c.name === 'lane-acquire-release');
+  function context(runChild) {
+    return { root: '/x', env: {}, budgets: resolveSmokeBudgets({}), sessionSlug: 'smoke-hold-test',
+      runChild, clock: () => 1000, hostBusy: () => false };
+  }
+  const exit = (status, extra = {}) => Object.assign(new Error(`exited ${status}: lane-hold text is irrelevant`), { status, signal: null, ...extra });
+  const acquires = (runChild) => runChild.mock.calls.filter(([, args]) => args[1] === 'acquire');
+
+  it('retries once on the environmental-only exit (75) and releases the successful lease', async () => {
+    const runChild = vi.fn().mockRejectedValueOnce(exit(75)).mockResolvedValueOnce(JSON.stringify({ lane: 4 })).mockResolvedValueOnce('');
+    const row = await check.run(context(runChild));
+    expect(row).toMatchObject({ ok: true, lane: 4 });
+    expect(acquires(runChild)).toHaveLength(2);
+    const releases = runChild.mock.calls.filter(([, args]) => args.includes('release'));
+    expect(releases).toHaveLength(1);
+    expect(releases[0][1]).toEqual(expect.arrayContaining(['release', '--lane=4']));
+  });
+
+  it('two environmental-only exits are a lane-hold-refused skip, with no release attempted', async () => {
+    const runChild = vi.fn().mockRejectedValue(exit(75));
+    const row = await check.run(context(runChild));
+    expect(row).toMatchObject({ ok: true, skipped: true, skipReason: 'lane-hold-refused' });
+    expect(acquires(runChild)).toHaveLength(2);
+    expect(runChild.mock.calls.some(([, args]) => args.some((a) => /^--lane=/.test(a)))).toBe(false);
+  });
+
+  it('classifies real runBounded exits: two 75s skip, while exit 1 fails', async () => {
+    await expect(runBounded(process.execPath, ['-e', 'process.exit(75)'], {
+      timeoutMs: 5000, maxBytes: 1024,
+    })).rejects.toMatchObject({ status: 75, signal: null });
+    for (const status of [75, 1]) {
+      const runChild = vi.fn((_cmd, args, opts) => {
+        expect(args[1]).toBe('acquire');
+        return runBounded(process.execPath, ['-e', `process.exit(${status})`], {
+          ...opts, cwd: process.cwd(), timeoutMs: 5000, maxBytes: 1024,
+        });
+      });
+      const row = await check.run(context(runChild));
+      if (status === 75) {
+        expect(row).toMatchObject({ ok: true, skipped: true, skipReason: 'lane-hold-refused' });
+        expect(acquires(runChild)).toHaveLength(2);
+      } else {
+        expect(row.ok).toBe(false);
+        expect(row.skipped).not.toBe(true);
+        expect(acquires(runChild)).toHaveLength(1);
+      }
+      expect(runChild).toHaveBeenCalledTimes(status === 75 ? 2 : 1);
+    }
+  });
+
+  it.each([
+    ['ordinary exit 1 mentioning lane-hold', exit(1)],
+    ['a signal', Object.assign(new Error('exited SIGSEGV: lane-hold'), { status: null, signal: 'SIGSEGV' })],
+    ['a timeout', Object.assign(new Error('timed out after 120000ms lane-hold'), { status: null, signal: 'SIGKILL' })],
+    ['75 with a signal', exit(75, { signal: 'SIGTERM' })],
+  ])('the first failure being %s is never retried or skipped', async (_n, err) => {
+    const runChild = vi.fn().mockRejectedValue(err);
+    const row = await check.run(context(runChild));
+    expect(row.ok).toBe(false);
+    expect(row.skipped).not.toBe(true);
+    expect(acquires(runChild)).toHaveLength(1);
+  });
+
+  it.each([
+    ['exit 1 with lane-hold in stderr', exit(1, { stderr: 'lane-9: reset REFUSED — lane-hold: x\nnpm ERR! code EIO' })],
+    ['a signal', Object.assign(new Error('exited SIGSEGV'), { status: null, signal: 'SIGSEGV' })],
+    ['a fatal git error', exit(128, { stderr: 'fatal: bad object HEAD lane-hold' })],
+  ])('a retry that fails with %s after an environmental first failure is a real failure', async (_n, err) => {
+    const runChild = vi.fn().mockRejectedValueOnce(exit(75)).mockRejectedValueOnce(err);
+    const row = await check.run(context(runChild));
+    expect(row.ok).toBe(false);
+    expect(row.skipped).not.toBe(true);
+    expect(acquires(runChild)).toHaveLength(2);
+  });
+});
 
 describe('resource shadow observations', () => {
   it.each([[63, 'admit', false], [3, 'wait', true]])('uses shadow admission at load %s', (load1, verdict, busy) => {

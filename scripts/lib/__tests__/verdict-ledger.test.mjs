@@ -904,6 +904,38 @@ describe('plan slice B: v2 event types round-trip, and the v1 fold is byte-ident
     expect(buildLedgerEvent({ ...base, type: 'finding', headSha: SHA, findingId: 'fi-0123456789ab', path: '', symbol: '', defectClass: 'x', status: 'tolerated', round: 1 }).lines).toEqual([]);
   });
 
+  it('normalizes and round-trips approval head and hold bindings, copying basis', () => {
+    const basis = ['hold:12345678'];
+    const row = buildLedgerEvent({ ...base, type: 'approval', ...payloads.approval, headSha: ` ${SHA.toUpperCase()} `, basis });
+    expect(row.headSha).toBe(SHA);
+    expect(row.basis).toEqual(basis);
+    expect(row.basis).not.toBe(basis);
+    basis.push('hold:87654321');
+    expect(row.basis).toEqual(['hold:12345678']);
+    expect(parseLedgerEvents(serializeLedgerEvent(row).line)).toEqual([row]);
+  });
+
+  it('keeps legacy approval bindings absent through a round trip', () => {
+    const row = buildLedgerEvent({ ...base, type: 'approval', ...payloads.approval });
+    expect(row.headSha).toBeUndefined();
+    expect(row.basis).toBeUndefined();
+    expect(parseLedgerEvents(serializeLedgerEvent(row).line)).toEqual([row]);
+  });
+
+  it.each([
+    ['malformed head', { headSha: 'not-a-sha' }],
+    ['null head', { headSha: null }],
+    ['empty basis', { basis: [] }],
+    ['non-array basis', { basis: 'hold:12345678' }],
+    ['null basis', { basis: null }],
+    ['non-string basis entry', { basis: [12345678] }],
+    ['short basis entry', { basis: ['short'] }],
+    ['oversized basis entry', { basis: ['a'.repeat(129)] }],
+    ['invalid basis characters', { basis: ['hold id:123'] }],
+  ])('rejects approval bindings with %s', (_name, binding) => {
+    expect(() => buildLedgerEvent({ ...base, type: 'approval', ...payloads.approval, ...binding })).toThrow(TypeError);
+  });
+
   it.each([
     ['unknown type', { type: 'nope' }],
     ['verdict via the event builder', { type: 'verdict' }],
