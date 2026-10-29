@@ -189,3 +189,43 @@ describe('quarantine — replay of the 2026-10-09 red windows', () => {
     });
   }
 });
+
+describe('quarantine — latestRedSha keying and re-keying', () => {
+  const FIRST = 'dbd6e67c3d0000000000000000000000000000aa';
+  const LATEST = 'fbcf1cc8490000000000000000000000000000bb';
+  const sig = (extra = {}) => ({ red: true, sources: ['published'], fixPrs: [], firstRedSha: FIRST, latestRedSha: LATEST, ...extra });
+  const base = (sha) => listWith([TEST], sha);
+  it('an entry keyed to latestRedSha covers the streak; one keyed to neither does not (stop fallback)', () => {
+    expect(decideQuarantineHold({ num: 5, files: ['backlog/a.md'], signal: sig(), list: base(LATEST), fixFiles: [], now: NOW }).hold).toBe(false);
+    expect(decideQuarantineHold({ num: 5, files: ['backlog/a.md'], signal: sig(), list: base(SHA), fixFiles: [], now: NOW })).toMatchObject({ hold: true, fallback: 'stop' });
+  });
+  it('matching latestRedSha only lifts the sha mismatch: unknown files, fix overlap and area overlap still hold', () => {
+    const l = base(LATEST);
+    expect(decideQuarantineHold({ num: 5, files: null, signal: sig(), list: l, fixFiles: [], now: NOW })).toMatchObject({ hold: true, reason: expect.stringMatching(/files are unknown/) });
+    expect(decideQuarantineHold({ num: 5, files: ['x.mjs'], signal: sig({ fixPrs: [9] }), list: l, fixFiles: null, now: NOW })).toMatchObject({ hold: true, reason: expect.stringMatching(/fix PR's files are unknown/) });
+    expect(decideQuarantineHold({ num: 5, files: ['x.mjs'], signal: sig({ fixPrs: [9] }), list: l, fixFiles: ['x.mjs'], now: NOW })).toMatchObject({ hold: true, reason: expect.stringMatching(/overlaps the main-fix PR/) });
+    expect(decideQuarantineHold({ num: 5, files: [TEST], signal: sig(), list: l, fixFiles: [], now: NOW })).toMatchObject({ hold: true, reason: expect.stringMatching(/quarantined test's area/) });
+  });
+  it('a missing latestRedSha behaves exactly as before (firstRedSha only)', () => {
+    const s = sig({ latestRedSha: null });
+    expect(decideQuarantineHold({ num: 5, files: ['a.md'], signal: s, list: base(LATEST), fixFiles: [], now: NOW })).toMatchObject({ hold: true, fallback: 'stop' });
+    expect(decideQuarantineHold({ num: 5, files: ['a.md'], signal: s, list: base(FIRST), fixFiles: [], now: NOW }).hold).toBe(false);
+  });
+  it('add for an already-listed test with a different brokenSha re-keys it (brokenSha, reason, expiresAt); same sha stays a no-op', () => {
+    const first = base(SHA);
+    const later = NOW + 3_600_000;
+    const r = addEntries(first, { tests: [TEST], brokenSha: LATEST, owner: 'o2', reason: 'rekeyed', actor: 'operator', now: later });
+    expect(r.ok).toBe(true);
+    expect(r.list.entries).toHaveLength(1);
+    expect(r.list.entries[0]).toMatchObject({ test: TEST, brokenSha: LATEST, reason: 'rekeyed', expiresAt: later + QUARANTINE_DEFAULT_TTL_MS });
+    expect(r.events).toHaveLength(1);
+    const same = addEntries(first, { tests: [TEST], brokenSha: SHA, owner: 'o', reason: 'again', actor: 'operator', now: later });
+    expect(same.list.entries[0]).toEqual(first.entries[0]);
+    expect(same.events).toHaveLength(0);
+  });
+  it('re-key of a test does not touch other tests or other jobs', () => {
+    const l = addEntries(base(SHA), { tests: ['a/__tests__/b.test.mjs'], brokenSha: SHA, owner: 'o', reason: 'r', actor: 'operator', now: NOW }).list;
+    const r = addEntries(l, { tests: [TEST], brokenSha: LATEST, owner: 'o', reason: 'r2', actor: 'operator', now: NOW + 1 });
+    expect(r.list.entries.find((e) => e.test === 'a/__tests__/b.test.mjs').brokenSha).toBe(SHA);
+  });
+});
