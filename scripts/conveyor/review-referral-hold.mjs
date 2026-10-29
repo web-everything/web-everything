@@ -47,7 +47,7 @@ export function reviewRunEvidence(run) {
   const state = (savedReferral ? run.resumeOf.mandatoryReferrals : run.findings?.mandatoryReferrals)?.effects?.find(e => e.type === 'review.mandatory-referrals')?.result;
   const failures = (state?.records ?? []).filter(r => r.failure != null).map(r => r.failure);
   // Only unambiguous persisted quota evidence for every failed seat exempts an attempt.
-  // Missing evidence, conflicting failures, and attempts that reached post-seat steps still count.
+  // Unfinished seats, missing evidence, conflicting failures, and attempts that reached post-seat steps still count.
   let quotaOnly = false;
   try {
     const failedSeats = Array.isArray(run.seatTimings) ? run.seatTimings.filter(t => t?.verdict === 'error') : [];
@@ -56,6 +56,7 @@ export function reviewRunEvidence(run) {
     const failuresBySeat = new Map();
     for (const t of failedSeats) failuresBySeat.set(t.seat, (failuresBySeat.get(t.seat) ?? 0) + 1);
     quotaOnly = failedSeats.length > 0 && Array.isArray(telemetry) && failures.every(isQuotaError)
+      && run.seatTimings.every(t => t?.verdict && t?.finishedAt)
       && failedSeats.every(t => {
         if (typeof t.seat !== 'string' || t.seat.length === 0) return false;
         const rows = telemetry.filter(row => row?.step === t.seat);
