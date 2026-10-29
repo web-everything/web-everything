@@ -1,5 +1,11 @@
-import { describe, expect, it } from 'vitest';
-import { reviewRunEvidence, decideSameHeadHold } from '../review-referral-hold.mjs';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, expect, it, vi } from 'vitest';
+import { reviewRunEvidence, decideSameHeadHold, readReviewRunEvidence,
+  REVIEW_EVIDENCE_CACHE_FILE } from '../review-referral-hold.mjs';
+import { isQuotaError } from '../../lib/provider-quota-hold.mjs';
 import { parseJudgeOutcome } from '../../lib/judge-spawn.mjs';
 import { normalizeJudgeTelemetry } from '../../operations/run-record.mjs';
 
@@ -11,7 +17,7 @@ const pr = { number: 7, headRefOid: head, labels: [{ name: 'review:pending' }], 
   createdAt: iso(at - 24 * 3_600_000) };
 const options = { repo, env: {}, now: at + 30 * 60_000 };
 const quotaRow = step => ({ step, failureKind: 'provider-quota' });
-const failedSeat = seat => ({ seat, verdict: 'error' });
+const failedSeat = seat => ({ seat, verdict: 'error', finishedAt: iso(at + 1) });
 
 function reviewRun(index = 0, complete = false) {
   const time = at + index * 1_000;
@@ -52,7 +58,7 @@ describe.each([false, true])('reviewRunEvidence quotaOnly (completed: %s)', comp
   it('exempts only when every failed seat has a matching provider-quota telemetry row', () => {
     const run = reviewRun(0, complete);
     // Successful seats and unrelated telemetry need no quota classification; row order is immaterial.
-    run.seatTimings.push({ seat: 'judgeStyle', verdict: 'accept' });
+    run.seatTimings.push({ seat: 'judgeStyle', verdict: 'accept', finishedAt: iso(at + 1) });
     run.telemetry.reverse();
     run.telemetry.push({ step: 'judgeStyle' });
     const row = reviewRunEvidence(run);
@@ -90,6 +96,16 @@ describe.each([false, true])('reviewRunEvidence quotaOnly (completed: %s)', comp
 });
 
 describe('incomplete quota evidence after the seat phase', () => {
+  it.each([
+    ['no verdict', { seat: 'judgeStyle', finishedAt: iso(at + 1) }],
+    ['no finishedAt', { seat: 'judgeStyle', verdict: 'accept' }],
+    ['neither verdict nor finishedAt', { seat: 'judgeStyle', startedAt: iso(at) }],
+  ])('fails closed when a seat has %s despite quota tags on every error', (_, seat) => {
+    const run = reviewRun();
+    run.seatTimings.push(seat);
+    expect(reviewRunEvidence(run)).toMatchObject({ incomplete: true, quotaOnly: false });
+  });
+
   it.each(['reduce', 'mandatoryReferrals', 'referralVerdict', 'advise'])(
     'counts an incomplete run once %s has started despite all seat quota tags', step => {
       const run = reviewRun();
@@ -112,6 +128,36 @@ describe('incomplete quota evidence after the seat phase', () => {
     run.seatTimings = [failedSeat('judge')];
     run.telemetry = [normalizeJudgeTelemetry({ step: 'judge', telemetry: error.telemetry })];
     expect(reviewRunEvidence(run)).toMatchObject({ incomplete: true, quotaOnly: true });
+  });
+});
+
+describe('review evidence disk cache classifier invalidation', () => {
+  it.each([
+    ['omits isQuotaError source', ''],
+    ['uses different isQuotaError source', `${String(isQuotaError)}\n// previous classifier source`],
+  ])('ignores a stale disk projection whose code %s', (_, classifierSource) => {
+    const dir = mkdtempSync(join(tmpdir(), 'review-quota-evidence-'));
+    try {
+      const run = reviewRun();
+      const name = 'review-pr-quota-cache.json';
+      writeFileSync(join(dir, name), JSON.stringify(run));
+      const readRun = vi.fn(() => run);
+      const expected = [reviewRunEvidence(run)];
+      expect(readReviewRunEvidence({ dir, readRun, memo: new Map() })).toEqual(expected);
+      const file = join(dir, REVIEW_EVIDENCE_CACHE_FILE);
+      const cache = JSON.parse(readFileSync(file, 'utf8'));
+      // Retain the real file key so only code invalidation can reject this stale projection.
+      cache.code = createHash('sha256').update(String(reviewRunEvidence))
+        .update(classifierSource).digest('hex').slice(0, 16);
+      cache.entries[name].evidence = { ...expected[0], quotaOnly: false };
+      writeFileSync(file, JSON.stringify(cache));
+      readRun.mockClear();
+
+      expect(readReviewRunEvidence({ dir, readRun, memo: new Map() })).toEqual(expected);
+      expect(readRun).toHaveBeenCalledTimes(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
