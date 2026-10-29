@@ -352,6 +352,51 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
     const humanOptions = () => ({ ...recordOptions(), outcome: 'needs-human',
       readPr: vi.fn(() => gatePr()), readRequired: vi.fn(async () => ({ checks: ['test'] })) });
 
+    const requiredStates = ['SUCCESS', 'FAILURE', 'CANCELLED', 'STALE', 'IN_PROGRESS', 'MISSING'];
+    const gateStates = ['SUCCESS', 'FAILURE', 'IN_PROGRESS', 'MISSING'];
+    it.each(['review-gate', 'merge-gate'].flatMap(gate => requiredStates.flatMap(required =>
+      gateStates.map(state => ({ gate, required, state })))))(
+      'both preflights: required=$required, $gate=$state', async ({ gate, required, state }) => {
+        const row = (name, value) => value === 'MISSING' ? []
+          : [check(name, value === 'IN_PROGRESS' ? null : value,
+            { status: value === 'IN_PROGRESS' ? 'IN_PROGRESS' : 'COMPLETED' })];
+        const readers = { readPr: () => gatePr([...row('test', required), ...row(gate, state)]),
+          readRequired: async () => ({ checks: ['test', gate] }) };
+        const human = await checkNeedsHumanEscalable({ ...humanOptions(), ...readers });
+        const notCi = await checkNotCiBreakRecordable({ ...recordOptions(), ...readers });
+        expect(human.refusal !== null).toBe(required === 'SUCCESS' && state === 'FAILURE');
+        expect(notCi.refusal !== null).toBe(required !== 'SUCCESS');
+      },
+    );
+
+    it.each([
+      ['needs-human', checkNeedsHumanEscalable], ['not-a-ci-break', checkNotCiBreakRecordable],
+    ])('%s honors explicit off and default settings resolution', async (outcome, preflight) => {
+      const opts = { ...humanOptions(), outcome,
+        readPr: vi.fn(() => gatePr(outcome === 'needs-human'
+          ? [check('test', 'SUCCESS'), check('review-gate', 'FAILURE')]
+          : [check('test', 'CANCELLED'), check('review-gate', 'FAILURE')])) };
+      expect(await preflight({ ...opts, settings: { recheckNotCiBreak: false } })).toEqual({ refusal: null });
+      expect(opts.readPr).not.toHaveBeenCalled();
+      expect(opts.readRequired).not.toHaveBeenCalled();
+      const previous = process.env.WE_CI_HEAL_RECHECK_NOT_CI_BREAK;
+      try {
+        for (const value of ['off', 'on', undefined]) {
+          if (value === undefined) delete process.env.WE_CI_HEAL_RECHECK_NOT_CI_BREAK;
+          else process.env.WE_CI_HEAL_RECHECK_NOT_CI_BREAK = value;
+          opts.readPr.mockClear();
+          opts.readRequired.mockClear();
+          const result = await preflight({ ...opts, settings: undefined });
+          expect(result.refusal !== null).toBe(value !== 'off');
+          expect(opts.readPr).toHaveBeenCalledTimes(value === 'off' ? 0 : 1);
+          expect(opts.readRequired).toHaveBeenCalledTimes(value === 'off' ? 0 : 1);
+        }
+      } finally {
+        if (previous === undefined) delete process.env.WE_CI_HEAL_RECHECK_NOT_CI_BREAK;
+        else process.env.WE_CI_HEAL_RECHECK_NOT_CI_BREAK = previous;
+      }
+    });
+
     it('#6004/#5979: green required test plus red review-gate permits not-a-ci-break and refuses needs-human', () => {
       expect(refusal({ pr: gatePr(), requiredChecks: ['test'] })).toBeNull();
       const message = humanRefusal();
@@ -636,6 +681,53 @@ describe('stacked base escalation facts (#4792)', () => {
   });
 });
 
+
+describe('needs-human CLI preflight wiring — #6004/#5979', () => {
+  it.each(['review-gate', 'merge-gate'])('refuses green required CI plus red %s before posting', gate => {
+    const dir = mkdtempSync(join(tmpdir(), 'ci-heal-gate-cli-'));
+    try {
+      const log = join(dir, 'calls.jsonl');
+      const preload = join(dir, 'preload.mjs');
+      // Exercise the real CLI and default readers without launching gh or touching shared caches.
+      writeFileSync(join(dir, 'required-status-checks-cache.json'), JSON.stringify({ entries: {
+        'web-everything/web-everything@main': { checks: ['test'], fetchedAtMs: Date.now(), source: 'live' },
+      } }));
+      writeFileSync(preload, `
+import cp from 'node:child_process';
+import { appendFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+const facts = ${JSON.stringify({ headRefOid: HEAD, statusCheckRollup: [
+  { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+  { name: gate, status: 'COMPLETED', conclusion: 'FAILURE' },
+] })};
+for (const method of ['execFileSync', 'spawnSync', 'execSync', 'exec', 'execFile', 'spawn']) {
+  cp[method] = (...args) => {
+    appendFileSync(${JSON.stringify(log)}, JSON.stringify({ method, args: args.slice(0, 2) }) + '\\n');
+    if (method === 'execFileSync' && args[0] === 'gh'
+      && JSON.stringify(args[1]) === JSON.stringify(['pr', 'view', '6042', '--json', 'headRefOid,statusCheckRollup,url', '--repo=web-everything/web-everything'])) return JSON.stringify(facts);
+    throw new Error('unexpected child process in CLI preflight test');
+  };
+}
+syncBuiltinESMExports();
+`);
+      const result = spawnSync(process.execPath, ['--import', preload,
+        join(dirname(fileURLToPath(import.meta.url)), '..', 'ci-heal-escalation-mark.mjs'), '6042',
+        `--head=${HEAD}`, `--base-head=${HEAD}`, '--outcome=needs-human', '--repo=web-everything/web-everything'], {
+        encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
+        env: { ...process.env, NODE_OPTIONS: '', WE_COORDINATION_ROOT: dir,
+          WE_CI_HEAL_RECHECK_NOT_CI_BREAK: 'on', WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'throttle') },
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(1);
+      expect(result.stderr).toContain('refusing to record needs-human on PR #6042');
+      expect(result.stderr).toContain(gate);
+      expect(result.stdout).toBe('');
+      const calls = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(calls).toEqual([{ method: 'execFileSync', args: ['gh',
+        ['pr', 'view', '6042', '--json', 'headRefOid,statusCheckRollup,url', '--repo=web-everything/web-everything']] }]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
 
 describe('inherited-red CLI routing', () => {
   it.each([false, true])('resolves the base on GitHub and tolerates a failed base note (%s)', failNote => {

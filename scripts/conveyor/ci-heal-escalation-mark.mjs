@@ -57,7 +57,7 @@ import { collectCiAuthDiagnosis, renderCiAuthDiagnosis } from './ci-auth-diagnos
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { isBudgetRefusal, postPrComment, recordOwedWrite, resolveOwedRepo } from './ci-heal-owed.mjs';
-import { resolveCiHealVerdictSettings, unsettledRequiredChecks, gateOnlyRedStates } from './ci-heal-verdict-recheck.mjs';
+import { resolveCiHealVerdictSettings, unsettledRequiredChecks, gateOnlyRedStates, ciGreenForEscalation } from './ci-heal-verdict-recheck.mjs';
 
 /**
  * we:scripts/conveyor/ci-heal-escalation-mark.mjs#CI_HEAL_ESCALATION_MARKER — the stable FIRST LINE of the
@@ -359,12 +359,15 @@ export function notCiBreakRecordRefusal({ headSha, pr, requiredChecks }) {
       : 'Wait for the checks to finish, then decide.');
 }
 
-/** Refuse a human CI escalation when only review/merge hold gates are red on this head. Pure. */
+/** Refuse a human CI escalation only when required CI is green and review/merge gates alone are red. Pure. */
 export function needsHumanGateOnlyRefusal({ headSha, pr, requiredChecks }) {
   const head = String(headSha ?? '').trim().toLowerCase();
   const prHead = String(pr?.headRefOid ?? '').trim().toLowerCase();
   if (!head || !prHead || !(prHead.startsWith(head) || head.startsWith(prHead))) return null;
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return null;
+  // A cancelled, stale, running, or missing required check may need human help.
+  // Gate-only red describes failures, not whether the rest of CI finished green.
+  if (!ciGreenForEscalation({ rollup: pr?.statusCheckRollup, requiredChecks })) return null;
   const { gateOnlyRed, red } = gateOnlyRedStates({ rollup: pr?.statusCheckRollup, requiredChecks });
   if (!gateOnlyRed) return null;
   return `Refusing needs-human: only ${red.join(', ')} is red on this head. This is not a CI break; ordinary review is owed.`;
