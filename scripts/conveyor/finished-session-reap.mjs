@@ -41,7 +41,7 @@ import { lockDirFor, readLockEntry } from '../readiness/file-locks.mjs';
 import { stopSessionWithRetry } from './session-reaper.mjs';
 import { execFileSync } from 'node:child_process';
 import { defaultListAgents } from '../operations/dispatch-lane-io.mjs';
-import { isAwaitingPermission, startedAtMs } from './reconcile-core.mjs';
+import { isAwaitingPermission, releasedFixClaimHolder, startedAtMs } from './reconcile-core.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
@@ -196,7 +196,8 @@ export function formatFinishedSessionReapLines(result) {
 // longer binds). This pass walks the session LISTING instead and reads the PR named by the session's own slug.
 // Same safety rules: dispatch dir only, stop by listing id, any claim lock dir holds, plus ONE of
 //   - the PR is CLOSED/MERGED for at least `afterMinutes`; or
-//   - the PR's latest trusted fix marker is a fix-END posted after the session started, at least `afterMinutes` ago
+//   - the PR's latest trusted fix marker is a fix-END whose explicit holder equals the listing's sessionId,
+//     posted after the session started, at least `afterMinutes` ago
 //     (a later fix-begin = a claim is held again → hold; equal or unreadable timestamps → hold).
 
 /** Session kinds that hold a fix claim (the only ones this reaps). Reviewers hold none and are never touched. */
@@ -252,6 +253,10 @@ export function planUnboundFinishedSession({ agent, pr, nowMs, afterMs, dispatch
   const last = markers.at(-1);
   if (markers.length > 1 && markers.at(-2).at === last.at) return hold('ambiguous marker order');
   if (!last.body.startsWith(FIX_END_MARKER)) return hold('latest fix marker is a fix-begin (claim held)');
+  const holder = releasedFixClaimHolder(last.body);
+  if (!holder) return hold('latest fix-end has no explicit holder');
+  if (typeof agent.sessionId !== 'string' || !agent.sessionId.trim()) return hold('session ID unreadable');
+  if (holder !== agent.sessionId) return hold('latest fix-end holder belongs to another session');
   if (!(started < last.at)) return hold('session started after the latest fix-end (new work)');
   if (!(nowMs - last.at >= afterMs)) return hold(`alive ${minutes(nowMs - last.at)}m after fix-end (< ${minutes(afterMs)}m)`);
   return { decision: 'reap', reason: `alive ${minutes(nowMs - last.at)}m after the PR's latest fix-end, no claim held` };

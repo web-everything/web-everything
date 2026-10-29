@@ -926,8 +926,9 @@ export function markWaiting({ lockRoot, owner, lane = null, num = null, nowIso, 
     // `pid` + `host` + `repo` (xaipsbs) are what the stale-waiter reap reads to prove the owner is gone.
     // Markers written before they existed carry none of them; the reap falls back to the lane lease for those.
     // `kind` (card xkyw1x4) — which queue lane this waiter ranks in, and what `queue-status` costs it at.
-    // `priority` (main-fix-queue-priority) — only a non-normal class is written; a marker without one ranks as P3.
-    const cls = priority && priority !== 'P3' ? { priority, ...(priorityReason ? { priorityReason } : {}) } : {};
+    // Record explicit P3 for new normal waiters so projection can distinguish them from historical/unknown
+    // markers. An absent class still ranks as P3 in the scheduler, but stays counted in projections.
+    const cls = priority ? { priority, ...(priorityReason ? { priorityReason } : {}) } : {};
     const body = { owner: String(owner), lane, num, requestedAt: nowIso, pid: Number.isInteger(pid) ? pid : null, host: hostname(), repo, ...(kind ? { kind } : {}), ...cls };
     writeFileSync(waitingFile(lockRoot, owner), JSON.stringify(body, null, 2) + '\n', 'utf8');
   } catch { /* best-effort — the wait itself must never fail on a marker write */ }
@@ -1248,7 +1249,7 @@ export async function acquireSlotBlocking({
   // succeeds with zero wait below — `isOldestLiveWaiter` reports it "oldest" (nothing else live to rank
   // against) on its very first check.
   markWaiting({ lockRoot, owner, lane, num, pid, repo, kind: jobKind, nowIso: new Date(startedAt).toISOString(),
-    priority: cls.class, priorityReason: cls.class !== 'P3' ? cls.reason : null });
+    priority: priority.mode === 'enforce' ? cls.class : null, priorityReason: cls.class !== 'P3' ? cls.reason : null });
   let lastLoggedAt = startedAt;
   let ceilingChecked = false;
   let yieldLogged = false;
@@ -1543,6 +1544,7 @@ export function resolveQueueBaseline({
   const settings = loadAdmissionPolicy({ env, checkoutRoot }).settings;
   const fastSlots = settings.fastSlots;
   const base = { slots: cap + fastSlots, heavySlots: cap, fastSlots, priorityMode: settings.priority.mode,
+    p1OrderingEnabled: settings.priority.mode === 'enforce',
     maxWaitMinutes, arrivalWindowMinutes, observedAt: new Date(nowMs).toISOString() };
   if (isQueueAdmissionOff(env)) return { ...base, bypassed: 'off' };
   if (/^(?:true|1)$/i.test(String(env?.CI || ''))) return { ...base, bypassed: 'ci' };
@@ -1562,7 +1564,8 @@ export function resolveQueueBaseline({
   const waiting = listWaiting(lockRoot)
     .filter((m) => isLiveWaiter(m, { nowMs }))
     .map((m) => ({ kind: normalizeKind(m.kind), repo: waiterRepo(m), lane: m.lane ?? null,
-      requestedAt: m.requestedAt, priority: waiterPriorityClass(m) }));
+      // Preserve unreadable/historical classes: projection may discount only explicit P2/P3 evidence.
+      requestedAt: m.requestedAt, ...(m.priority == null ? {} : { priority: m.priority }) }));
 
   const busyRepos = new Set([...held.map((h) => h.repo), ...waiting.map((w) => w.repo)].filter(Boolean));
   const windowMs = arrivalWindowMinutes * 60_000;

@@ -8,7 +8,9 @@ evidence retains ordinary liveness checks, including for legacy release records.
 The listing-based open-PR cleanup also requires explicit holder correlation.
 Its `unbound open-PR session with %s is never stopped` cases in
 `finished-session-reap.test.mjs` cover different and missing holders, alongside
-matching-holder stop controls for name, slug and session ID.
+matching-holder stop controls for fix and CI-heal sessions. Correlate only the explicit
+release holder with the listing's `sessionId`; matching names, slugs or listing handles
+cannot substitute for that identity. Missing identities hold with a visible reason.
 
 ## Direction-aware operation evidence (R131)
 
@@ -101,6 +103,25 @@ in the shared suite and run it and the scoped producer/prepare suites through he
 Identity, path and published batch-ref validators use explicit absolute-end assertions
 (`(?![\s\S])`). Keep the named trailing-newline regressions and the CR/CRLF/Unicode
 line-separator suffix cases in that required scoped gate.
+
+## Drain identity admission regressions
+
+Identity admission must fetch the pinned PR head as well as main before reading cards.
+Test a remote-only head by rejecting diff/show until that head has been fetched; use a real
+temporary remote when Git writes are available. Prepared file lists never replace the guard's
+fresh Git evidence, including empty, stale, or truncated lists. Any wrapper substituting synthetic
+output for a guard's command needs named positive and negative tests for every eligibility check.
+
+Infrastructure refusals must leave defect labels untouched. Test Git read failures through strategy
+admission, and keep raw command errors out of public comment bodies. An unreadable check holds the
+enqueue with a note and makes no PR comment or label edit of any kind. Corruption heals once per check
+and retries the failed command once; prove it on a real temporary clone with a planted commit-graph
+naming a missing object, and prove that a network failure or a surviving corruption is not healed again. Test notification retries after
+comment and label failures independently, and deduplication across fresh strategy instances using
+the paginated thread and trusted leading markers. Scope queue failure/rebuild history to the enqueue
+identity; old persisted records without it start fresh. Keep enqueue result recording and event
+emission in one helper, test each outcome and delivery failures, and exercise exported helpers
+instead of evaluating extracted source with `new Function`.
 
 ## Established-overlay auto-rebase
 
@@ -2796,9 +2817,11 @@ holders are never preempted. The broader send-back waiting/priority classificati
 not change reserved fix-cap eligibility: only `review:changes` receives that reservation.
 The focused suites are `fix-waiting-priority.test.mjs` and `heavy-send-back-priority.test.mjs`;
 run them through heavy admission when host capacity permits.
-Queue snapshots retain marker priority and the effective priority mode. Fix projections discount
-lower-priority waiters only with explicit `priorityMode: enforce` evidence; off, unknown and historical
-snapshots retain all backlog and report that conservative fallback. The named
+New enforced waiters record P3 explicitly; historical markers without a class remain unknown to projection.
+Queue snapshots retain raw marker priority and the effective priority mode. The live producer sets
+`p1OrderingEnabled: true` only with `priorityMode: enforce`; projections require that explicit capability
+and discount only explicit P2/P3 waiters. Unreadable or absent classes stay counted. Off, unknown and
+historical snapshots retain all backlog and report that conservative fallback. The named
 `heavy-p1-admission.test.mjs` regression uses real temporary slot locks and the production admission
 path to prove a fix takes the next released slot ahead of the build waiters its projection excludes.
 

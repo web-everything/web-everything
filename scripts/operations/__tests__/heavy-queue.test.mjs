@@ -240,14 +240,23 @@ describe('heavyQueueOperation — the declared shape', () => {
 
 describe('assessQueueAdmission — fixes count only waiters ahead', () => {
   const baseline = () => ({
-    priorityMode: 'enforce',
-    slots: 4, heavySlots: 3, fastSlots: 1, maxWaitMinutes: 30,
+    slots: 4, heavySlots: 3, fastSlots: 1, maxWaitMinutes: 30, priorityMode: 'enforce', p1OrderingEnabled: true,
     held: Array.from({ length: 3 }, () => ({ kind: 'FULL', priority: 'P3', remainingMinutes: 18 })),
     waiting: Array.from({ length: 12 }, () => ({ kind: 'selected', priority: 'P3', expectedMinutes: 3 })),
     heldHeavyCount: 3, waitingHeavyCount: 0,
     heldRemainingMinutes: 54, waitingMinutes: 36, pendingMinutes: 0,
     heavyBacklogMinutes: 54, shortBacklogMinutes: 36, backlogMinutes: 90,
     projectedWaitMinutes: 36, heavyWaitMinutes: 18,
+  });
+
+  it('reports the FIFO queue cap until live P1 ordering is enabled', () => {
+    const b = baseline();
+    delete b.p1OrderingEnabled;
+    const result = assessQueueAdmission(b);
+    for (const kind of ['fix', 'ci-heal']) {
+      expect(result.byKind[kind]).toMatchObject({ admit: false, projectedMinutes: 39.25, excludedBehindCount: 0 });
+    }
+    expect(result.headline).toContain('(a fix → ~39.25m counting all waiters, HELD queue-cap)');
   });
 
   it('admits fix and ci-heal ahead of twelve build waiters while the build stays HELD', () => {

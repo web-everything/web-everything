@@ -149,13 +149,14 @@ describe('readLiveFixClaimStrict — fails closed, unlike readLiveFixClaim (Code
 describe('unbound finished sessions — PR closed/merged, or head moved past the lane (live 2026-10-21 14:25Z: pids 95540, 98331)', async () => {
   const { planUnboundFinishedSession, runUnboundFinishedSessionReap, unboundCandidate } = await import('../finished-session-reap.mjs');
   const { parseSessionSlug } = await import('../session-slug.mjs');
-  const { buildFixBeginComment, buildFixEndComment } = await import('../fix-procedure.mjs');
+  const { buildFixBeginComment, buildFixEndComment, FIX_END_MARKER } = await import('../fix-procedure.mjs');
   const { AUTOMATION_LOGINS } = await import('../../lib/marker-authorship.mjs');
   const AUTO = { login: AUTOMATION_LOGINS[0] };
   const STARTED = RELEASED - 60 * 60_000;
-  const agent = (over = {}) => ({ id: '6142e61f', pid: 98331, name: 'fix-5729', state: 'done', status: 'idle', cwd: `${ROOT}/5e53`, startedAt: STARTED, ...over });
-  const begin = (at) => ({ author: AUTO, createdAt: new Date(at).toISOString(), body: buildFixBeginComment({ who: 'fix-5729', why: 'x', branch: 'lane/x', headSha: 'a'.repeat(40), ttlMinutes: 60 }) });
-  const end = (at) => ({ author: AUTO, createdAt: new Date(at).toISOString(), body: buildFixEndComment({ who: 'fix-5729', headSha: 'a'.repeat(40) }) });
+  const SESSION_ID = 'session-5729';
+  const agent = (over = {}) => ({ id: '6142e61f', sessionId: SESSION_ID, pid: 98331, name: 'fix-5729', state: 'done', status: 'idle', cwd: `${ROOT}/5e53`, startedAt: STARTED, ...over });
+  const begin = (at) => ({ author: AUTO, createdAt: new Date(at).toISOString(), body: buildFixBeginComment({ who: SESSION_ID, why: 'x', branch: 'lane/x', headSha: 'a'.repeat(40), ttlMinutes: 60 }) });
+  const end = (at, who = SESSION_ID) => ({ author: AUTO, createdAt: new Date(at).toISOString(), body: buildFixEndComment({ who, headSha: 'a'.repeat(40) }) });
   const open = (comments) => ({ state: 'OPEN', comments });
   const p = (o) => planUnboundFinishedSession({ agent: agent(), nowMs: NOW, afterMs: 10 * 60_000, dispatchRoot: ROOT, pidAlive: true, ...o });
 
@@ -172,6 +173,36 @@ describe('unbound finished sessions — PR closed/merged, or head moved past the
   });
   it('reaps: open PR whose latest fix marker is a fix-end after the session started', () => {
     expect(p({ pr: open([begin(STARTED + 1000), end(RELEASED)]) }).decision).toBe('reap');
+  });
+  const runOpen = (worker, comments, stop) => runUnboundFinishedSessionReap({
+    nowMs: NOW, settings, dispatchRoot: ROOT, listAgents: () => [worker],
+    readPr: () => open(comments), readClaim: () => null, probePid: () => true, stop,
+  });
+  it.each([
+    ['different holder', {}, [end(RELEASED, 'another-session')], /another session/],
+    ['missing holder', {}, [{ ...end(RELEASED), body: `${FIX_END_MARKER}\n\nReleased the fix claim.` }], /no explicit holder/],
+    ['blank holder', {}, [end(RELEASED, '')], /no explicit holder/],
+    ['missing session ID', { sessionId: undefined }, [end(RELEASED)], /session ID unreadable/],
+    ['invalid session ID', { sessionId: 42 }, [end(RELEASED)], /session ID unreadable/],
+    ['blank session ID', { sessionId: ' ' }, [end(RELEASED)], /session ID unreadable/],
+    ['matching name but different session ID', {}, [end(RELEASED, 'fix-5729')], /another session/],
+    ['matching slug but different session ID', { sessionSlug: SESSION_ID, sessionId: 'another-session' }, [end(RELEASED)], /another session/],
+    ['matching listing handle but different session ID', {}, [end(RELEASED, '6142e61f')], /another session/],
+    ['another holder after its own release', {}, [end(RELEASED - 1000), end(RELEASED, 'another-session')], /another session/],
+  ])('unbound open-PR session with %s is never stopped', (_label, identity, comments, reason) => {
+    const stop = vi.fn();
+    const out = runOpen(agent(identity), comments, stop);
+    expect(out.rows).toHaveLength(1);
+    expect(out.rows[0]).toMatchObject({ decision: 'hold', reason: expect.stringMatching(reason) });
+    expect(stop).not.toHaveBeenCalled();
+  });
+  it.each(['fix-5729', 'ci-heal-5729'])('matching-holder control: stops an open-PR %s session by listing handle', name => {
+    const stop = vi.fn(() => ({ stopped: true }));
+    const out = runOpen(agent({ name }), [begin(STARTED + 1000), end(RELEASED)], stop);
+    expect(out.rows).toHaveLength(1);
+    expect(out.rows[0]).toMatchObject({ decision: 'reap', result: 'stopped' });
+    expect(stop).toHaveBeenCalledTimes(1);
+    expect(stop).toHaveBeenCalledWith({ handle: '6142e61f' });
   });
   it.each([
     ['closed too recently', { pr: { state: 'CLOSED', closedAt: new Date(NOW - 5 * 60_000).toISOString() } }, /< 10m/],

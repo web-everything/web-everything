@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -51,6 +51,7 @@ describe('P1 projection agrees with real slot admission', () => {
       expect(listWaiting(lockRoot)).toContainEqual(expect.objectContaining({ owner: 'FIX', priority: 'P1' }));
       const baseline = snapshot();
       expect(baseline.priorityMode).toBe('enforce');
+      expect(baseline.p1OrderingEnabled).toBe(true);
       expect(baseline.waiting.map(w => w.priority).sort()).toEqual(['P1', 'P3']);
       expect(waitersAheadOf(baseline, session.startsWith('fix-') ? 'fix' : 'ci-heal'))
         .toMatchObject({ excludedBehindCount: 1, waiting: [expect.objectContaining({ priority: 'P1' })] });
@@ -116,6 +117,20 @@ describe('P1 projection agrees with real slot admission', () => {
     expect(ahead.waiting.map(w => w.priority).sort()).toEqual(['P0', 'P1']);
   });
 
+  it.each([undefined, null, 'unknown', 'p3', 'P4', 3, {}, []])('closed path: the live producer retains unreadable or historical marker class %j', priority => {
+    marker('UNKNOWN', 'selected');
+    const row = listWaiting(lockRoot)[0];
+    writeFileSync(join(lockRoot, 'waiting', 'UNKNOWN.json'), JSON.stringify({ ...row, priority }));
+    const baseline = snapshot();
+    expect(baseline.p1OrderingEnabled).toBe(true);
+    expect(baseline.waiting).toHaveLength(1);
+    const ahead = waitersAheadOf(baseline, 'fix');
+    expect(ahead.waiting).toEqual(baseline.waiting);
+    expect(ahead.excludedBehindCount).toBe(0);
+    expect(createQueueBudget({ ...baseline, maxWaitMinutes: 5 }).tryAdmit('fix'))
+      .toMatchObject({ admit: false, projectedMinutes: 6.25, excludedBehindCount: 0 });
+  });
+
   it('priority off retains FCFS in the scheduler and all waiters in the projection', async () => {
     marker('BUILD', 'selected');
     let clock = T0;
@@ -126,6 +141,7 @@ describe('P1 projection agrees with real slot admission', () => {
     expect(fix).toMatchObject({ ok: false, deferred: true });
     const baseline = snapshot('off');
     expect(baseline.priorityMode).toBe('off');
+    expect(baseline.p1OrderingEnabled).toBe(false);
     expect(waitersAheadOf(baseline, 'fix')).toBe(baseline);
     expect(assessQueueAdmission(baseline).headline).toContain('counting all waiters (priority ordering off or unverified)');
   });

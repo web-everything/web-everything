@@ -194,6 +194,8 @@ import { parseArgvFlags, reconcileWouldRunFor } from './lib/reconcile-predicate.
 import { createPrestageCache, resolvePrestageSettings, prestageCi, prestageRequiredChecks, labelSignature, enqueuePrestage } from './lib/drain-prestage.mjs';
 import { reviewCiGate } from './lib/review-ci-gate.mjs';
 import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, handleStaleMergeGate } from './lib/merge-queue-enqueue.mjs';
+import { recordEnqueueOutcome } from './lib/drain-poison-guard.mjs';
+import { appendDaemonEvent } from './lib/daemon-events.mjs';
 import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
 // #3215 — the drain applies holds of its own (a fresh park, a #2409 stale-acceptance re-park); this is the
 // same ledger `review-set-label.mjs` already writes through for the review seam, never a second format.
@@ -240,6 +242,10 @@ export { remoteManifestApiArgs };
 // re-capture the current (possibly-tampered) body as the new trusted baseline — a durable bypass if the loss
 // races a tamper (see review-baseline-state.mjs's cache-loss residual). Co-located with the park-state cache;
 // resolved against cwd.
+function recordEnqueue(outcomes, repo, outcome) {
+  return recordEnqueueOutcome({ outcomes, repo, outcome, emit: appendDaemonEvent });
+}
+
 const REVIEW_BASELINE_STATE_PATH = resolve(process.cwd(), '.claude/skills/drain/review-baseline-state.json');
 
 const argv = process.argv.slice(2);
@@ -4378,14 +4384,52 @@ export function permissionChangeForCandidate(score) {
  * The full input object `runCli` hands `decideDrainReviewGate` for one candidate. Pure. One named place for every
  * score-derived gate input (`escalate`, `humanRequired`, `engineTier`, `permissionChange`) so a new signal cannot be
  * scored yet silently never reach the gate, and a test can drive a real `scoreEscalation` result straight through.
- * @param {{score: object, labels: any, deviation?: string|null}} candidate
+ * @param {{score: object, labels: any, deviation?: string|null, netScored?: boolean, humanPinned?: boolean}} candidate
  */
-export function drainGateInputs({ score, labels, deviation = null }) {
+export function drainGateInputs({ score, labels, deviation = null, netScored = false, humanPinned = true }) {
   return {
     escalate: score.escalate, humanRequired: score.humanRequired, labels,
+    // 6027: unknown pin evidence retains review:human, even beside a fresh scored net diff.
+    humanScoreFresh: netScored === true, humanPinned: humanPinned !== false,
     engineTier: engineTierForCandidate(score), deviation,
     permissionChange: permissionChangeForCandidate(score),
   };
+}
+
+/** Best-effort removal after the pending label is applied or already present. Dry runs never write. */
+export function removeDeescalatedHumanLabels({ gate, labels, dryRun, pr, repo, applyOk = false }, { exec = execFileSync } = {}) {
+  const removed = [];
+  // Fail closed: only an explicit applyOk===true (review:pending applied or already present) lets the hold go.
+  if (!gate.deescalatedHuman || dryRun || applyOk !== true) return removed;
+  for (const label of (gate.removeLabels || []).filter((l) => hasReviewLabel(labels, l))) {
+    try {
+      exec('gh', ['pr', 'edit', String(pr), ...(repo ? ['--repo', repo] : []), '--remove-label', label],
+        { stdio: ['ignore', 'ignore', 'pipe'] });
+      removed.push(label);
+    } catch { /* label best-effort */ }
+  }
+  return removed;
+}
+
+/**
+ * Apply the park label before releasing a de-escalated human hold, recording the verdict before any add.
+ * @returns {{added: boolean, removed: string[]}} Successful label writes only; dry runs never write.
+ */
+export function applyDrainParkLabel({ gate, labels, dryRun, pr, repo, onBeforeAdd }, { exec = execFileSync } = {}) {
+  let added = false;
+  if (dryRun || !gate.applyLabel) return { added, removed: [] };
+  let applyOk = true; // already present => nothing to add
+  if (shouldApplyReviewLabel(gate.applyLabel, labels)) {
+    onBeforeAdd?.();
+    try {
+      exec('gh', ['pr', 'edit', String(pr), ...(repo ? ['--repo', repo] : []), '--add-label', gate.applyLabel],
+        { stdio: ['ignore', 'ignore', 'pipe'] });
+      added = true;
+    } catch { applyOk = false; /* label best-effort */ }
+  }
+  // Never leave a PR with neither label if the pending add fails.
+  const removed = removeDeescalatedHumanLabels({ gate, labels, dryRun, pr, repo, applyOk }, { exec });
+  return { added, removed };
 }
 
 /**
@@ -4631,7 +4675,8 @@ async function runCli() {
   let passMainFix = new Set();
   const isMainFix = (c) => isLocalRepo(c?.repo) && passMainFix.has(Number(c?.num));
   const mainFixFrom = (sig) => new Set(sig?.red ? (sig.fixPrs || []).map(Number).filter(Number.isInteger) : []);
-  const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, isMainFix, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
+  const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, isMainFix,
+    withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
   // xym8nt4 — post-approval card grouping: sources of a combined card PR are held; groups form/reconcile after each pass.
   const cardGrouping = createCardGrouping({ localSlug, dryRun: DRY_RUN, isMainFix, requiredCheck: REQUIRED, prestage: (c, sha) => mergeStrategy.prestage(c, sha),
@@ -5092,7 +5137,9 @@ async function runCli() {
     });
     if (!fast.fallback) {
       const result = { ok: true, prestaged: true, considered: 1, merged: [], failed: [], pendingRebased: [], deferred: [],
-        enqueueOutcomes: [{ num: Number(onlyPr), repo: localSlug, outcome: fast.enqueued ? 'enqueued' : 'not-enqueued', kind: fast.kind || 'prestage', ...fast }] };
+        enqueueOutcomes: [] };
+      recordEnqueue(result.enqueueOutcomes, localSlug,
+        { num: Number(onlyPr), repo: localSlug, outcome: fast.enqueued ? 'enqueued' : 'not-enqueued', kind: fast.kind || 'prestage', ...fast });
       return { result, merged: [], failedMerges: [], pendingRebased: [], deferred: [], duplicateIdsOnMain: [] };
     }
     process.stderr.write('drain-prestage: cache miss/stale — full fast drain\n');
@@ -6033,8 +6080,14 @@ async function runCli() {
       // `blockedBy` resolves. Flip `engineTierForCandidate` to delegate to `basisTouchesEngineTier(score)` once
       // `#2410` ships that writer — do not re-inline the computation here when that day comes, keep it in one
       // named, tested place.
+      // Fail closed: no source here proves the CURRENT review:human is exclusively score-driven.
+      // Even a trusted-author drain marker or ledger row cannot rule out an operator's later/concurrent
+      // hold on the same label (see decideTestGamingPark). Missing, incomplete or unreadable evidence
+      // cannot release it. De-escalation stays wired but inert until sound ownership proof exists;
+      // the operator's sanctioned clear-human ceremony remains the release path.
+      const humanPinned = true;
       const gate = decideDrainReviewGate(
-        drainGateInputs({ score, labels: v.prLabels, deviation: v.deviation }),
+        drainGateInputs({ score, labels: v.prLabels, deviation: v.deviation, netScored, humanPinned }),
         { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo), dryRun: candidateDryRun, ...workflowReadOptions(v) });
       if (gate.action === 'defer') {
         v.decision = 'skip';
@@ -6087,7 +6140,7 @@ async function runCli() {
         // double-apply). `shouldApplyReviewLabel` is the SAME shared gate `pr-land.mjs` uses at open, so
         // producer- and drain-applied verdicts can never drift on what "already labelled" means.
         if (gate.applyLabel && !candidateDryRun) {
-          if (shouldApplyReviewLabel(gate.applyLabel, v.prLabels)) {
+          applyDrainParkLabel({ gate, labels: v.prLabels, dryRun: candidateDryRun, pr: v.num, repo: v.repo, onBeforeAdd: () => {
             // #3215 — the ledger is written FIRST, before the `gh` transport call, same ordering rationale as
             // `review-set-label.mjs`'s Phase-1 write: this hold is already DECIDED (the gate verdict above is
             // final), so a `gh` failure below must not un-form it — only the durable record of it. Fail-soft:
@@ -6095,8 +6148,7 @@ async function runCli() {
             // never this park.
             const ledgered = recordDrainVerdict({ repo: v.repo || localSlug, pr: v.num, applyLabel: gate.applyLabel, reason: v.reason, headSha: v.headSha ?? null });
             if (!ledgered.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger append (#3215, drain hold, non-fatal) — ${ledgered.errors.join('; ')}\n`);
-            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', gate.applyLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
-          }
+          } });
           // mechanical-dispatcher — the companion "not yet advised" label, only for a review:human park (never
           // for a plain review:pending one). Same shared guard, same best-effort posture as the add above.
           if (gate.applyLabel === REVIEW_LABELS.human && shouldApplyReviewLabel(REVIEW_LABELS.awaitingAdvisory, v.prLabels)) {
@@ -6619,7 +6671,7 @@ async function runCli() {
       const grouped = cardGrouping.holdFor(c);
       if (!grouped) continue;
       c.decision = 'skip'; c.reason = grouped.reason;
-      enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', ...grouped });
+      recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', ...grouped });
     }
     // #2257 — an item is unique per (repo, PR#): match/remove candidates on both so a WE #10 and a FUI #10 never
     // collide in the cascade bookkeeping.
@@ -6906,7 +6958,7 @@ async function runCli() {
           // makes a PR another lander already merged a safe no-op — never a double `gh pr merge`.
           if (branchPreparationRequired(c) && mergeStrategy.enqueues(c.repo) && !approvedHeadHold(c, traceHeadSha)) {
             const prepared = prepareBranchBeforeEnqueue({ c, traceHeadSha, isLocal: isLocalRepo(c.repo), isOpen: (repo, num) => openReservationPr(openPrContext, repo, num) });
-            if (!finishBranchPreparation(prepared, { c, revalidationAborted, needsAcceptanceRestamp, restampAcceptance })) { enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'branch-preparation', reason: revalidationAborted.at(-1)?.reason || prepared.reason || prepared.detail || 'branch preparation refused' }); const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; }
+            if (!finishBranchPreparation(prepared, { c, revalidationAborted, needsAcceptanceRestamp, restampAcceptance })) { recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'branch-preparation', reason: revalidationAborted.at(-1)?.reason || prepared.reason || prepared.detail || 'branch preparation refused' }); const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; }
           }
           const landLock = withLandWriteLock(() => {
             if (isPrAlreadyMerged(c.repo, c.num)) return { skipped: 'already-merged' };
@@ -6919,9 +6971,9 @@ async function runCli() {
             __t.time('mergeCall', () => mergePr({ pr: c.num, repo: c.repo, method: 'merge', matchHeadCommit: traceHeadSha, caller: 'drain' }));
             return { merged: true };
           }, (mergeStrategy.enqueues(c.repo) || cardGrouping.mayHold()) ? { runUnlockedOnContention: false } : {}); // xtpxusq — the enqueue's state write must never run unserialized; xym8nt4 — nor may a direct merge's group re-check (a group claim holds this lock); a refused lock retries next pass
-          if (landLock.ran === false) { enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'merge-lock-held', reason: `merge-write mutex held by ${landLock.heldBy || '?'}` }); if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} enqueue skipped: merge-write mutex held by ${landLock.heldBy || '?'} — retried next pass\n`); const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; }
+          if (landLock.ran === false) { recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'merge-lock-held', reason: `merge-write mutex held by ${landLock.heldBy || '?'}` }); if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} enqueue skipped: merge-write mutex held by ${landLock.heldBy || '?'} — retried next pass\n`); const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; }
           if (landLock.result?.skipped === 'card-group-hold') {
-            enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'card-group-hold', reason: landLock.result.reason });
+            recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'card-group-hold', reason: landLock.result.reason });
             if (!AS_JSON) process.stderr.write(`  ⏸ ${repoTag(c.repo)}${c.num} not landed: ${landLock.result.reason} — claimed by a card group after the pass-start check (xym8nt4)\n`);
             c.decision = 'skip'; c.reason = landLock.result.reason;
             const cc = remaining.find((x) => sameCand(x, c)); if (cc) { cc.decision = 'skip'; cc.reason = landLock.result.reason; }
@@ -6950,11 +7002,11 @@ async function runCli() {
             continue;
           }
           if (landLock.result?.enqueued === true) {
-            enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'enqueued', already: !!landLock.result.already });
+            recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'enqueued', already: !!landLock.result.already });
             await recordLandedLedgerFacts(c, traceHeadSha); // PR #5195 — only a confirmed enqueue writes the clearing facts
           }
           if (landLock.result?.enqueued === false) {
-            enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: landLock.result.kind || 'batching-deferred', reason: landLock.result.reason, healthSmell: !!landLock.result.healthSmell });
+            recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: landLock.result.kind || 'batching-deferred', reason: landLock.result.reason, healthSmell: !!landLock.result.healthSmell });
             if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} not enqueued: ${landLock.result.kind || 'batching-deferred'}: ${landLock.result.reason || 'admission deferred'} — retried next pass\n`);
           }
           if (mergeStrategy.enqueues(c.repo)) { const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; } // xtpxusq — queued, not merged: keeps blocking dependents until GitHub merges it
@@ -6971,7 +7023,7 @@ async function runCli() {
           if (!AS_JSON) process.stderr.write(`  ✓ merged ${repoTag(c.repo)}${c.num}${c.item ? ` (#${c.item})` : ''}\n`);
         } catch (e) {
           const detail = ghListErrText(e);
-          if (e.enqueueFailure) enqueueOutcomes.push({ num: c.num, repo: c.repo, outcome: 'not-enqueued', ...e.enqueueFailure });
+          if (e.enqueueFailure) { recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', ...e.enqueueFailure }); }
           // #2683 — CONTENDED-FALLBACK idempotency recovery. If the merge write raced past the mutex (the
           // never-hang fallback ran `fn` un-locked) and LOST to a concurrent lander, `gh pr merge` throws here on
           // an already-merged PR. Re-probe: if it is now MERGED, this is the SAME safe idempotent no-op as the
