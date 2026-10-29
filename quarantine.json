@@ -1,14 +1,5 @@
 {
   "version": 1,
-  "entries": [
-    {
-      "test": "scripts/conveyor/__tests__/health-watch-core.test.mjs",
-      "brokenSha": "9426fda44",
-      "owner": "card:shard6-timeouts",
-      "reason": "delegated R157/delegations.md (operator chalbert standing): main CI red on 9426fda44 (#6027 merge) — test-shard (6) timeout 5000ms in health-watch-core.test.mjs; shard 6 runs ~15m40s and times out tests (also hit #6036). Flake under shard load; card owed.",
-      "addedAt": 1793210332145,
-      "expiresAt": 1793296732145
-    }
-  ],
+  "entries": [],
   "mode": "quarantine"
 }
