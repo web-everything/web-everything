@@ -419,6 +419,23 @@ export function decideRemote({ policy, loadPerCore, argv }) {
   return { remote: above, reason: `${enabled}; loadPerCore=${loadPerCore} ${above ? '>' : '<='} ${remote.loadPerCoreThreshold}` };
 }
 
+const LEGACY_REMOTE_PRE_EXECUTION_REASONS = Object.freeze([
+  'command-not-allowed',
+  'requires-git-worktree',
+  'invalid-parameters',
+  'forge-unreachable',
+  'copy-failed',
+  'unsupported-sibling-dependency',
+]);
+
+/** Translate only known pre-execution refusals from the legacy executor into confirmed non-starts. */
+export function adaptLegacyRemoteResult(result) {
+  if (result?.mode === 'fallback' && LEGACY_REMOTE_PRE_EXECUTION_REASONS.includes(result.reason)) {
+    return { mode: 'not-started', terminated: true, reason: result.reason };
+  }
+  return result;
+}
+
 /** Attempt remote execution before taking a local slot; remote is disabled by default.
  * Only { mode: 'remote', code: <integer> } exits with that code. Local admission requires
  * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }.
@@ -431,7 +448,7 @@ export async function runWithRemoteDecision({
     ? resolveFastRunTimeoutMs(env)
     : env ? resolveCeilingMs(env) : DEFAULT_ADMISSION_CEILING_MS,
   loadPerCore = () => loadavg()[0] / cpus().length,
-  remoteExec = async (options) => (await import('./remote-exec.mjs')).runRemote(options),
+  remoteExec = async (options) => adaptLegacyRemoteResult(await (await import('./remote-exec.mjs')).runRemote(options)),
   log = (line) => process.stderr.write(line),
 }) {
   let load;

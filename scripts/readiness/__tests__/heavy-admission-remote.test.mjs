@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { main, decideRemote, runWithRemoteDecision, resolveAdmissionPolicy, DEFAULT_ADMISSION_CEILING_MS, DEFAULT_FAST_RUN_TIMEOUT_MS } from '../heavy-admission.mjs';
+import { main, decideRemote, runWithRemoteDecision, adaptLegacyRemoteResult, resolveAdmissionPolicy, DEFAULT_ADMISSION_CEILING_MS, DEFAULT_FAST_RUN_TIMEOUT_MS } from '../heavy-admission.mjs';
 import { runRemote } from '../remote-exec.mjs';
 
 const argv = ['npm', 'run', 'test:unit', '--', 'a file.test.mjs', '$(must-stay-literal)'];
@@ -134,6 +134,47 @@ describe('decideRemote', () => {
       expect(result.reason).toContain('load-unreadable');
     },
   );
+});
+
+describe('adaptLegacyRemoteResult', () => {
+  it.each([
+    'command-not-allowed',
+    'requires-git-worktree',
+    'invalid-parameters',
+    'forge-unreachable',
+    'copy-failed',
+    'unsupported-sibling-dependency',
+  ])('maps %s to a confirmed non-start only at the adapter boundary', async (reason) => {
+    const legacy = { mode: 'fallback', reason };
+    const adapted = adaptLegacyRemoteResult(legacy);
+    expect(adapted).toEqual({ mode: 'not-started', terminated: true, reason });
+    expect(legacy).toEqual({ mode: 'fallback', reason });
+    expect(await runWithRemoteDecision(fixture({ result: adapted }))).toEqual({ handled: false });
+    expect(await runWithRemoteDecision(fixture({ result: legacy }))).toEqual({ handled: true, exitCode: 124 });
+  });
+
+  it.each(['ambiguous-result', 'unknown-reason', undefined])('preserves unsafe fallback reason %s and refuses local rerun', async (reason) => {
+    const legacy = { mode: 'fallback', reason };
+    expect(adaptLegacyRemoteResult(legacy)).toBe(legacy);
+    expect(await runWithRemoteDecision(fixture({ result: adaptLegacyRemoteResult(legacy) })))
+      .toEqual({ handled: true, exitCode: 124 });
+  });
+
+  it('passes remote completion through unchanged', () => {
+    const result = { mode: 'remote', code: 23 };
+    expect(adaptLegacyRemoteResult(result)).toBe(result);
+  });
+
+  it.each([null, undefined, { mode: 'unknown', reason: 'command-not-allowed' }])('passes malformed results through unchanged: %j', (result) => {
+    expect(adaptLegacyRemoteResult(result)).toBe(result);
+  });
+
+  it('uses the adapter in the default remote executor for an ineligible command', async () => {
+    const f = fixture({});
+    expect(await runWithRemoteDecision({ ...f, argv: ['node', 'ineligible.mjs'], remoteExec: undefined }))
+      .toEqual({ handled: false });
+    expectFallback(f.log, 'command-not-allowed');
+  });
 });
 
 describe('runWithRemoteDecision', () => {
