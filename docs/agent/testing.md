@@ -1907,6 +1907,15 @@ separate from transient infrastructure failures and their retry streak.
 
 ### Direct heavy-run hook probes
 
+Daemon clone GC is serialized by `clone-maintenance.mjs` with the shared WRITE lock;
+keep Git asynchronous so its lock heartbeat can run during packing. The named cases in
+`scripts/lib/__tests__/clone-maintenance.test.mjs` cover lock contention, persisted rate
+limits, idle-hook order and real local packing that preserves recent unreachable objects.
+`cloneMaintenance.intervalMs` resolves through the policy cascade with
+`WE_DAEMON_CLONE_MAINTENANCE_INTERVAL_MS` as the environment override. A corrupt or
+oversized stamp skips GC (`stamp-unreadable` in the `clone-maintenance` event); inspect
+and repair `clone-maintenance-<cloneLockKey>.json` under the daemon state directory.
+
 The `heavy-enforce` guard requires admission even for one-file Vitest runs, `related`,
 and direct `check-standards.mjs` execution. Use `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>`
 or the admitted `npm run test:unit -- <file>` / `npm run check:standards` scripts.
