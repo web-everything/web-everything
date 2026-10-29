@@ -150,7 +150,10 @@ describe('health-watch destructive lane action call-site contract', () => {
     const sites = scopedScanFiles(['scripts/lib/health-watch-lane-scan.mjs',
       'scripts/operations/stale-state-io.mjs', 'scripts/conveyor/health-watch.mjs'])
       .flatMap(file => scan(readFileSync(new URL(`../../../${file}`, import.meta.url), 'utf8'), file));
-    expect(sites.map(({ site }) => site).sort()).toEqual([...ALLOWLIST].sort());
+    // A scoped verify scans only changed files, so only those files' allowlist entries can be observed.
+    const scopedFiles = scopedScanFiles(['scripts/lib/health-watch-lane-scan.mjs', 'scripts/operations/stale-state-io.mjs', 'scripts/conveyor/health-watch.mjs']);
+    const expected = ALLOWLIST.filter(entry => scopedFiles.includes(entry.split(':')[0]));
+    expect(sites.map(({ site }) => site).sort()).toEqual([...expected].sort());
     expect(violations(sites)).toEqual([]);
     expect(sites.filter(({ site }) => !ALLOWLIST.includes(site))).toHaveLength(0);
 
