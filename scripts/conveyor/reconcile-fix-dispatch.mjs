@@ -1808,6 +1808,7 @@ export function runReconcileFixDispatch({
   tryResumeRound = isUnderTestEnv() ? null : tryResumeRoundFix,
   dispatch = dispatchFix,
   reconcile = runReconcilePass,
+  readPrs,
   // R123 writes require caller permission, even when dispatch itself is stubbed (live smoke).
   // The production daemon forwards fix.standDownAutoProceed from the policy cascade (standard: true).
   allowStandDownAutoProceed = false,
@@ -1886,6 +1887,7 @@ export function runReconcileFixDispatch({
   // stale. Run it for every repo.
   assertMainNotStale(root, checkStaleness, FIX_STALE_GUARD_OPTS);
   const reconciledRaw = reconcile({ repo, allowStandDownAutoProceed,
+    ...(readPrs ? { readPrs } : {}),
     ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   const reconciled = netScope ? netScope(reconciledRaw, { root, repoKey }) : reconciledRaw;
   const dispatchEntries = Array.isArray(reconciled.dispatch) ? reconciled.dispatch : [];
