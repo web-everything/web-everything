@@ -1,0 +1,274 @@
+---
+kind: story
+size: 5
+parent: "3383"
+status: open
+scope: ["we:scripts/lib/daemon-plugins.mjs", "we:scripts/settings/daemon-plugins.json", "we:skills-src/conveyor/verify-daemon.mjs", "we:scripts/verify-lane.mjs", "we:scripts/lib/daemon-clone-registry.mjs", "we:scripts/lib/__tests__/daemon-plugins.test.mjs", "we:skills-src/conveyor/__tests__/verify-daemon.test.mjs", "we:scripts/lib/__tests__/daemon-clone-registry-fix-clone.test.mjs", "we:scripts/__tests__/verify-lane.test.mjs"]
+dateOpened: "2026-10-29"
+preparedDate: "2026-10-29"
+preparedAgainstSha: "ff1fa58cc7999d172f321bd3b11f9c486bd732e7"
+tags: []
+---
+
+# Daemon plugins: each daemon independently switchable via its own policy-cascade setting, one daemon at a time (verify first)
+
+Operator ruling R238 (2026-10-29 21:06 ET): split the web-everything daemons (review, fix, drain, health-watch,
+control, build) into independently switchable plugins, one daemon at a time, starting with the daemon that
+carries zero live prototype overlays, each behind its own policy-cascade on/off setting
+(we:scripts/lib/policy-cascade.mjs), prototype-loadable before merge (R228). Reuses the ratified conveyor runner
+split (#3860/#3874: supervisor + one process per piece;
+we:docs/agent/platform-decisions.md#conveyor-orchestration-mechanics-not-per-lane-agent, #2701/#2702) rather than
+re-deriving it. This slice: the plugin descriptor + setting resolver, and the verify daemon
+(we:skills-src/conveyor/verify-daemon.mjs, clone `wev-control`, 0 overlays) as plugin one.
+
+## Progress
+
+Prepared 2026-10-29 (ET) against `origin/main` ff1fa58cc7. Premise check:
+
+- **The process split already exists; the switch does not.** #3860's umbrella and its slices #3870–#3878 are all
+  resolved: fix, review, verify and the 8 watcher passes each run as their own process
+  (we:skills-src/conveyor/pass-daemon.mjs over the closed allowlist in we:skills-src/conveyor/daemon-manifest.mjs;
+  #3874's we:skills-src/conveyor/supervisor-launcher.mjs). So "plugin" here does NOT mean a new process topology.
+  It means: one declared descriptor per daemon (name, entry, launchd label, clone, setting key), and one
+  policy-cascade on/off switch the daemon reads itself. Today the only off levers are per-daemon ad-hoc kill
+  switches (e.g. `WE_BUILD_DAEMON_KILL` / `build-dispatch-daemon.kill`, #3984) or `launchctl bootout`, and
+  `--max-concurrent=0` on the build plist.
+- **The coupling that hurts is the shared clone, not shared code.** `wev-review-daemon` hosts 12 launchd jobs
+  (review-daemon, 9 pass-daemons, lease-reaper, resource-sampler) and 9 overlays. Every overlay loaded for the
+  review daemon is live in every other job on that clone, and every shared-file move rebases all of them (the
+  2026-10-29 review-daemon freeze on an overlay conflict).
+
+### Overlay inventory (2026-10-29 ~21:30 ET, `node we:scripts/daemon-overlay.mjs list --clone=<clone>`)
+
+| Daemon (launchd label) | Clone | Live overlays | Overlays touching shared daemon files | Clone vs `origin/main` |
+|---|---|---|---|---|
+| verify (`com.we.verify-daemon`) | `wev-control` | **0** | — | at main (0 ahead) |
+| build (`com.we.build-dispatch-daemon`, `--max-concurrent=0`) | `wev-control` | **0** | — | at main (0 ahead) |
+| control (`com.we.control`, in `we:scripts/settings/prototype-load.json`) | `wev-control` | 0 | — | no such plist installed — label drift, see Follow-ups |
+| drain (`com.plateau.drain-daemon`) | `.lanes/we-drain-daemon/code` (+ `plateau-drain-daemon`: 0) | 2 | none | — |
+| health-watch (`com.we.health-watch`) | `wev-health-watch` | 3 (one = PR 6033) | `lane/unblock-pass-quarantine-m1` edits `we:skills-src/conveyor/pass-daemon.mjs` (open PR 6062 too) | 246 ahead |
+| merge passes (`merge-orphan-sweep`) | `wev-merge-daemon` | 1 (`lane/proto-daemon-resources`, 10-18, 171 files) | edits `we:skills-src/conveyor/daemon-manifest.mjs` | — |
+| fix (`com.we.fix-dispatch-daemon`) | `wev-fix-daemon` | 6 | `lane/unfreeze-fix-top-10263-m5-m1` edits prototype-load files | 102 ahead |
+| review + 9 passes + lease-reaper + sampler | `wev-review-daemon` | 9 (one = PR 6061) | none of the daemon-shell files | 151 ahead |
+
+No overlay on any clone touches we:skills-src/conveyor/verify-daemon.mjs, we:scripts/conveyor/verify-dispatch.mjs,
+we:skills-src/conveyor/supervisor*.mjs or we:scripts/lib/policy-cascade.mjs. No open PR touches
+we:skills-src/conveyor/verify-daemon.mjs, and no active card scopes it. The build daemon shares the zero-overlay clone, but
+#3984 is `status: active` on we:skills-src/conveyor/build-dispatch-daemon.mjs (3,121 lines), so it is second.
+
+### Existing async/split-daemon cards (inventory, per the operator's 21:08 ET addition)
+
+| Card | Status | preparedDate | Still accurate vs today (overlays, self-sync, prototype-load, R228, quick-mode #6084)? | This card |
+|---|---|---|---|---|
+| #3860 daemonize the runner (umbrella; its own slice = gh-throttle default swap) | resolved | — | Delivered. Its "many small independent daemons" shape is what this card builds on. | reuses |
+| #3870 fix-dispatch daemon | resolved | — | Delivered (`we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs`). | plugin later |
+| #3871 pass-daemon + manifest | resolved | — | Delivered; the manifest is the allowlist this card's descriptor sits beside, never replaces. | reuses |
+| #3872 credential scoping | resolved | — | Ruled. | n/a |
+| #3873 8 watchers onto pass-daemon | resolved | — | Delivered. | plugin later |
+| #3874 supervisor manifest launcher | resolved | — | Delivered; launchd plists, not the launcher, run the fleet today. | reuses |
+| #3875 assertMainNotStale extraction | resolved | — | Delivered. | n/a |
+| #3876 review daemon | resolved | — | Delivered. | plugin last |
+| #3877 keyed runner-lock lease | resolved | — | Delivered; the verify lease key is what "off" releases. | reuses |
+| #3878 verify daemon | resolved | — | Delivered; the subject of slice 1. | slice 1 |
+| #3866 fleet GitHub credential | open | 2026-09-21 | Ratified 2026-09-22 (App, app-to-server); its "carve a build story" Done-when is met by #3881. Not a stale prepare; it is resolvable. | n/a |
+| #3984 build-dispatch resident daemon | active | — | Slice 1 landed; plist runs `--max-concurrent=0`. No R228 prototype step in its later slices. | plugin two, after it settles |
+| #4086 multi-host / multi-instance daemons | open (decision) | 2026-09-24 | **Partly stale**: Fork 3 ("which changes serve probation before the incumbent adopts them") predates the overlay registry, `prototype-load` and R228, which now answer it (prototype first, merge as soon as it passes). Re-prepare at ratification. | composes |
+| #4088 route overlay-overlapping reviews to a main-only checkout | open | 2026-10-03 | Code refs still hold (we:scripts/operations/review-job.mjs, `DAEMON_CLONE_SEED` in we:scripts/lib/daemon-clone-registry.mjs, `readOverlayState`); its Proof plan lacks an R228 prototype-load step. Minor. | independent |
+| #5452 event-driven daemons epic (E1–E7) | open | — | Accurate; E2 ("separate executor processes per role") is the same direction as plugins. Slices #5501/#4283/#5454 all open. | composes |
+| #5785 one event stream + state manager | open (decision) | 2026-10-10 | Accurate; orthogonal (state, not switching). | composes |
+| #5036 blue-green daemons | open | — | Unprepared; overlaps quick-mode #6084 (R228) — re-scope when prepared. | n/a |
+
+## Design
+
+**One descriptor + one switch per daemon; no file moves while a daemon has overlays.**
+
+1. **Descriptor + resolver, new we:scripts/lib/daemon-plugins.mjs.** A frozen `DAEMON_PLUGINS` map, one entry
+   per daemon: `{ name, entry, label, clone, settingKey }`. Slice 1 registers `verify` only (`entry:
+   'we:skills-src/conveyor/verify-daemon.mjs'`, `label: 'com.we.verify-daemon'`, `clone: 'wev-control'`). It sits
+   beside we:skills-src/conveyor/daemon-manifest.mjs (which stays the closed allowlist for pass-daemon) and does
+   not touch it — that file carries an overlay on `wev-merge-daemon`. Export
+   `resolvePluginEnabled(name, { env, readFile, overridePath, last })` → `{ enabled, source, invalid, errors }`.
+   It calls `cascadePolicy('daemonPlugins.<name>', toolBlock, { standard: { enabled: true }, envValues, valid })`
+   (we:scripts/lib/policy-cascade.mjs:176) **once per plugin**, so each plugin's leaf is its own policy and an env
+   value for one plugin can never replace the whole `daemonPlugins` block (`resolveCascade` replaces a top-level
+   key wholesale, :112-117). `valid` is `{ enabled: (v) => typeof v === 'boolean' }`. Layers: standard `true` →
+   platform preference → tool file we:scripts/settings/daemon-plugins.json → env. The **env layer** has two
+   sources, highest first: the process env `WE_DAEMON_PLUGIN_<NAME>` (`0|1|off|on`, parsed to a boolean), then a
+   runtime **operator override file** `<RUNNER_LOCK_ROOT>/daemon-plugins.override`
+   (`~/.claude/conveyor-runner-locks/`, we:skills-src/conveyor/runner-lock.mjs:63), written only by
+   `node we:scripts/lib/daemon-plugins.mjs set <name> on|off --reason=<text>` (atomic write, records actor + ET time +
+   reason, optional `--ttl=<hours>` after which the entry is ignored and the daemon logs that it expired). `set`
+   holds `withFileLock(<override path>.lock, …, { staleMs: 30000 })` (we:scripts/lib/atomic-json-file.mjs:154),
+   whose stale-lock takeover checks the holder pid, so a crashed `set` cannot wedge the lever; readers (daemon,
+   requester) never lock — `writeJsonAtomic` (:64) makes a lock-free read safe. The override file follows the precedent of the existing drain marker (`VERIFY_DAEMON_DRAIN_FILE`,
+   we:skills-src/conveyor/verify-daemon.mjs:85) and the build daemon's `.kill` file: it lives outside every clone, so self-sync, overlay
+   re-applies and rebuilds never reset it, and it is the fast emergency lever (no PR, no plist edit, no restart).
+   The tool file is the durable, reviewed default. Under test (`isUnderTest()`) the resolver reads no disk unless
+   paths are injected, like `defaultIsDraining` (:88).
+2. **Settings file, new we:scripts/settings/daemon-plugins.json:**
+   `{ "daemonPlugins": { "recheckMs": 60000, "verify": { "enabled": true } } }`. Setting names:
+   `daemonPlugins.<name>.enabled` (boolean) and `daemonPlugins.recheckMs` (number, ≥ 10000; tool layer only).
+3. **The verify daemon reads its own switch; "off" reuses the drain path.** In
+   we:skills-src/conveyor/verify-daemon.mjs, `main()` (line 589) acquires its lease at line 592 unconditionally.
+   Add an exported pure `pluginStep({ enabled, holdsLease, inFlight })` → `'idle' | 'acquire' | 'run' | 'drain' |
+   'release'`, and wire `main()` through it:
+   - **Boot while off:** log `plugin verify disabled (<source>)`, hold NO lease, dispatch nothing, re-resolve every
+     `recheckMs`. The process stays up, so launchd `KeepAlive` does not crash-loop it.
+   - **Off → on:** acquire the lease on the next recheck and enter the normal loop, no process restart.
+   - **On → off:** the loop's existing `isDraining` probe (:88, consumed at ~:384) is OR-ed with "plugin off", so
+     dispatch of new gates stops exactly as the drain marker stops it today, while the daemon keeps ticking and
+     heartbeating. When the in-flight registry is empty (`in flight 0 (draining)`), release through
+     `releaseRunnerLeaseIfOwned` and drop to the idle loop. Detached job-mode gates are never killed; a gate still
+     running when the lease is released is re-adopted by the next lease holder through the existing job-store
+     registry rebuild (~:380), the same path a restart uses today. "Off" never kills a running gate; the existing
+     kill/stop paths keep precedence.
+   - **Long-off reminder:** while disabled, the daemon logs `plugin verify disabled for <N>h (<source>)` once per
+     hour, so a forgotten `set verify off` stays visible.
+   - **State record:** on every transition the daemon writes `<RUNNER_LOCK_ROOT>/verify-daemon.plugin`
+     (`{ enabled, source, phase, at, pid }`, atomic write via we:scripts/lib/atomic-json-file.mjs). This is what
+     requesters read, so they never re-resolve settings from their own lane clone.
+4. **Requesters get a named refusal.** we:scripts/verify-lane.mjs `request` already refuses with exit 3 when no
+   verify daemon lease is alive (:569-580). Add, **before** that lease check: when the daemon's state record says
+   `enabled: false` (any phase, including `drain` while the lease is still held), refuse at once with exit 3 and
+   name it (`verify daemon disabled: daemonPlugins.verify.enabled=false (override, <reason>, <ET time>)`). The
+   requester reads the daemon's record, not its own checkout's settings file, because the lane clone and
+   `wev-control` hold different copies and environments.
+5. **Prototype-loadable (R228).** `wev-control` has never been prototype-loaded (no record in
+   `~/workspace/.operations/coordination/prototype-loads.jsonl`) and is missing from `DAEMON_CLONE_SEED`
+   (we:scripts/lib/daemon-clone-registry.mjs:63). Add `'wev-control'` to the seed so the overlay CLI treats it as a
+   daemon clone (its prune deleted overlays on an unseeded clone once, #4717). `prototype-load` already resolves
+   the `verify` clone from the plist `WorkingDirectory` (we:scripts/operations/prototype-load-io.mjs:247).
+6. **One daemon at a time.** Each later daemon is its own card: register its descriptor, wire its gate. A daemon's
+   code moves into a plugin directory only once its clone has zero live overlays (graduate them first, or in the
+   same change). Order (fewest overlays and fewest shared-file overlays first): verify → build (after #3984
+   settles) → drain (2) → merge passes (graduate or drop the stale 171-file `proto-daemon-resources` overlay
+   first) → health-watch (3; after PR 6062 lands, since it edits `we:skills-src/conveyor/pass-daemon.mjs`) → fix (6) → review clone (9,
+   and first split its 12 jobs onto their own clones).
+
+**Rollback.** Runtime: `node we:scripts/lib/daemon-plugins.mjs set verify on` (or delete the override file); takes
+effect at the next recheck, no restart. Durable: set `daemonPlugins.verify.enabled` back to `true` by PR. Code
+before merge: `node we:scripts/daemon-overlay.mjs remove --clone=$HOME/workspace/wev-control --ref=<ref>` restores
+main. Code after merge: revert the PR; the default is ON, so a revert changes nothing at runtime.
+
+## MVP
+
+Musts:
+- `we:scripts/lib/daemon-plugins.mjs`: the `verify` descriptor, `resolvePluginEnabled` (per-plugin
+  `cascadePolicy`), the override file reader, and the `set` CLI.
+- `we:scripts/settings/daemon-plugins.json` with `daemonPlugins.verify.enabled` and `daemonPlugins.recheckMs`.
+- `pluginStep` + its wiring in `we:skills-src/conveyor/verify-daemon.mjs` `main()`: idle-when-off boot, off→on acquire, on→off via the
+  drain path then release, and the state record.
+- The named refusal in `we:scripts/verify-lane.mjs request`, read from the state record.
+- `'wev-control'` in `DAEMON_CLONE_SEED`.
+- Prototype-load onto `wev-control` and the live proof below before merge.
+
+Out (Follow-ups): other daemons, file moves into plugin dirs, a per-plugin clone for the review jobs,
+health-watch display of "off by setting", the `com.we.control` label drift.
+
+## Test plan
+
+we:scripts/lib/__tests__/daemon-plugins.test.mjs (RED for all: module does not exist):
+- **`plugin resolve: default on`** — no files, no env → `enabled: true, source: 'standard'`. Capability — Red today.
+- **`plugin resolve: tool off`** — fixture tool `verify.enabled=false` → `false, source: 'tool'`. Capability — Red today.
+- **`plugin resolve: env beats tool`** — `WE_DAEMON_PLUGIN_VERIFY=1` over tool `false` → `true, 'env'`; tool
+  `recheckMs` still resolves from the tool layer. Capability — Red today.
+- **`plugin resolve: override beats tool, process env beats override`.** Capability — Red today.
+- **`plugin resolve: invalid never wins`** — tool `"enabled": "nope"` → stays `true`, `invalid` names the leaf. Capability — Red today.
+- **`plugin resolve: read error keeps last known`** — `readFile` throws with `last: false` → stays `false`, error
+  named; with no `last` (boot) → `true`. Capability — Red today.
+- **`plugin resolve: unknown name throws`.** Capability — Red today.
+- **`plugin set: atomic write records actor, time, reason`** and refuses a `--reason` value starting with `--`. Capability — Red today.
+- **`plugin set: stale lock from a dead pid is taken over`** — a fixture lock older than `staleMs` with a dead pid
+  does not block `set`. Capability — Red today.
+- **`plugin resolve: expired override is ignored`** — `--ttl` in the past → falls back to the tool layer. Capability — Red today.
+
+we:skills-src/conveyor/__tests__/verify-daemon.test.mjs (RED: `pluginStep` is not exported; today `main()` has no
+off path at all):
+- **`plugin step: off at boot is idle, no lease`.** Capability — Red today.
+- **`plugin step: off to on acquires`.** Capability — Red today.
+- **`plugin step: on to off drains while in flight, releases at zero`.** Capability — Red today.
+- **`plugin drain: plugin-off stops new dispatch like the drain marker`** — the dispatch fake is never called while
+  `inFlight > 0` and the plugin is off. Capability — Red today.
+
+we:scripts/__tests__/verify-lane.test.mjs:
+- **`request refusal names a disabled plugin`** — a fixture state record with `enabled: false` → exit 3 and the
+  text names `daemonPlugins.verify.enabled`. RED: today the text says only that no daemon is alive. Capability — Red today.
+- **`request refusal names a disabled plugin while draining`** — record `{ enabled: false, phase: 'drain' }` with a
+  live lease → still refused at once. RED: today a live lease always accepts (:572-575). Capability — Red today.
+- **`request refusal names a disabled plugin while idle`** — record `{ phase: 'idle', pid: <live pid> }` and no
+  lease → named refusal, not the generic text. Capability — Red today.
+
+we:scripts/lib/__tests__/daemon-clone-registry-fix-clone.test.mjs:
+- **seed includes `wev-control`.** Capability — Red today: absent at :63.
+- **`plugin override: survives a clone reset`** — like `VERIFY_DAEMON_DRAIN_FILE` (we:skills-src/conveyor/verify-daemon.mjs:85) and the build daemon's `.kill` file, the override path resolves under `RUNNER_LOCK_ROOT`, outside the injected clone root; a fixture `git reset --hard` of the clone leaves the override read unchanged. Capability — Red today (no override exists).
+
+## Proof plan
+
+On the prototype, before merge (R228). Preconditions for steps 3–4: `verify-daemon.drain` absent, the daemon log
+shows `in flight 0`, and the orchestrator is told the window (≤ 2 × `recheckMs`, about 2 min) before it starts.
+1. `prototype-load` the build branch onto `verify` (clone `wev-control`); capture the adoption record.
+2. Before: `verify-lane request` on a throwaway lane goes green through the daemon (daemon log line).
+3. `node we:scripts/lib/daemon-plugins.mjs set verify off --reason="R238 proof"`. Within `recheckMs` the daemon log
+   shows `plugin verify disabled (override)`, the `<conveyor:verify-daemon-lease>` lease file under
+   `~/.claude/conveyor-runner-locks/` is gone, and `verify-lane request` exits 3 naming the setting.
+4. `node we:scripts/lib/daemon-plugins.mjs set verify on` (this is also the rollback). The lease reappears and the
+   same request goes green, with the same PID in `launchctl list com.we.verify-daemon` before and after.
+5. Record the before/after lines on the PR; merge as soon as it passes, then drop the overlay.
+
+## Edge cases this change must handle
+
+1. **Untrusted text** — the env value and the settings leaf are parsed against a closed set (`true/false`,
+   `0|1|on|off`). The `--reason` text is folded (`foldUntrusted`, we:scripts/lib/jury-core.mjs), capped at 200
+   chars, and a value starting with `--` is refused; it is only ever written as JSON, never into argv, a path or a
+   regex.
+2. **Truncated reads** — n/a: no `gh`/`git` reads are added; settings, override and state files are small JSON
+   read whole with `readFileSync`.
+3. **Shared state files** — the override file and the state record are written with `writeJsonAtomic`
+   (we:scripts/lib/atomic-json-file.mjs); the override `set` takes `withFileLock` with a 30 s pid-checked stale takeover; readers never lock. The lease is released only through
+   `releaseRunnerLeaseIfOwned` (owner check), never a raw delete.
+4. **Fail closed** — for a gate daemon the safe side is "do not change state on a bad read": an unreadable or
+   invalid setting keeps the last known value while running, and the standard default ON only at boot. It is
+   named in the log. The requester still fails closed: no live lease → `request` refuses (exit 3), never a fake
+   green; an unreadable state record falls back to today's "no daemon alive" text.
+5. **Identity scoping** — the plugin name is a fixed key in the frozen descriptor map; an unknown name throws. The
+   lease key stays `<conveyor:verify-daemon-lease>`; the state record is per plugin name.
+6. **State over time** — re-resolved every `recheckMs`; flips take effect within one interval. A restart while off
+   boots straight into idle. A restart mid-drain re-adopts in-flight gates through the existing job-store rebuild
+   (~:380) before deciding. The state record carries `at` + `pid`. In `phase: 'idle'` (no lease), a requester checks
+   that pid is alive directly; in other phases it must match the live lease owner. A record failing its check is
+   stale, and the requester falls back to the lease check.
+7. **Who wrote it** — the tool file is a tracked repo file, changed only by a PR; the process env is the plist the
+   operator installs; the override file is written only by the `set` CLI, which stamps actor and time, and lives
+   under the operator's home, outside every clone. No label, comment or remote text can toggle a plugin.
+
+## Acceptance
+
+- [A1] **Executable** — `npx vitest run we:scripts/lib/__tests__/daemon-plugins.test.mjs` fails before (module
+  missing) and passes after.
+- [A2] **Executable** — `npx vitest run we:skills-src/conveyor/__tests__/verify-daemon.test.mjs -t "plugin step"`
+  runs the three named `plugin step:` tests (fails before: `pluginStep` not exported) and passes after; the
+  `plugin drain:` test likewise.
+- [A3] **Executable** — `npx vitest run we:scripts/__tests__/verify-lane.test.mjs -t "disabled plugin"` runs the three
+  `request refusal names a disabled plugin` tests; fails before and passes after.
+- [A4] **Executable** — the extended seed test in we:scripts/lib/__tests__/daemon-clone-registry-fix-clone.test.mjs
+  fails before (`wev-control` absent) and passes after.
+- [A5] **Observable** — the Proof plan's steps 3–4 recorded on the PR: disabled log line, lease gone, named
+  refusal, then lease back with the same PID.
+
+## Non-goals
+
+- [N1] No change to process topology, launchd plists or the supervisor launcher (#3874 stands).
+- [N2] No change to `we:skills-src/conveyor/daemon-manifest.mjs` or `we:skills-src/conveyor/pass-daemon.mjs` (both carry live overlays elsewhere).
+- [N3] No other daemon in this slice.
+
+## Follow-ups
+
+- Plugin two: build-dispatch daemon descriptor + switch (replaces `--max-concurrent=0` as the off lever), once
+  #3984 is no longer active.
+- Plugins for drain, merge passes, health-watch, fix, then review — one card each, in the Design §6 order, each
+  graduating (or dropping) its clone's overlays in the same change.
+- Give each job now sharing `wev-review-daemon` its own clone, so one plugin's overlay stops loading into 11 others.
+- Move each daemon's code into a plugin directory once its clone has zero overlays.
+- health-watch shows "off by setting" for a disabled plugin instead of a liveness question.
+- Fix the `com.we.control` label in we:scripts/settings/prototype-load.json (no such plist is installed).
+- Re-prepare #4086 Fork 3 against R228; resolve #3866 (its follow-on is #3881).
