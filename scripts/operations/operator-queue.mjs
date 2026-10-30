@@ -84,6 +84,10 @@ try { ({ needsPersonRow } = await import('./operator-queue-needs-person.mjs')); 
 let isCollectingBatchPr = () => false;
 try { ({ isCollectingBatchPr } = await import('./card-batch-hold-state.mjs')); } catch { /* optional in staged copies */ }
 
+// Partial CLI fixtures may omit the pause-evidence reader.
+let pausedReferrals = null;
+try { pausedReferrals = await import('../conveyor/review-referral-hold.mjs'); } catch { /* staged copies */ }
+
 // The optional ledger also pulls in a graph that staged CLI copies may omit.
 let rulingLedger = null;
 let rulingLedgerError = null;
@@ -119,13 +123,14 @@ function queueChecks(pr) {
  * alert anywhere). Derived from the PR thread alone, for ANY open PR (the park is the signal, whatever the labels
  * say), so it shows until a ruling or a new head clears it. `findings` is one line each plus the file.
  */
-export function rulingNeededRow(repo, pr) {
-  const need = rulingLedger?.rulingNeeded(pr, rulingHumanAt === undefined ? {} : { humanAt: rulingHumanAt });
+export function rulingNeededRow(repo, pr, options = {}) {
+  const paused = pausedReferrals?.pausedReviewRulingNeeded(pr, { repo, ...options });
+  const need = paused ?? rulingLedger?.rulingNeeded(pr, rulingHumanAt === undefined ? {} : { humanAt: rulingHumanAt });
   if (!need) return null;
   return {
     repo, number: pr.number, title: pr.title, head: need.head,
     since: need.since === null ? null : new Date(need.since).toISOString(),
-    findings: need.findings.map((f) => ({ file: f.file, line: f.line, summary: f.summary, reason: f.reason })),
+    findings: need.findings.map((f) => ({ ...(paused ? { key: f.key } : {}), file: f.file, line: f.line, summary: f.summary, reason: f.reason })),
   };
 }
 
@@ -866,7 +871,8 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
       + (pr.ceremonyOwed ? ` — ${pr.reason}\n    clear-human: node scripts/review-set-label.mjs ${pr.number} --repo=${pr.repo} --to=clear-human --actor=<your login> --reason='<your words>'`
         : (pr.humanHolds ? ` — merge-gate holds only for human review: ${pr.humanHolds.join(', ')}` : ''))).concat((report.needsYouStandDowns ?? []).map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  [stood down ${pr.standDownAt || 'time unknown'} — the fixer asks] ${pr.question}`
       + pr.remaining.map((f) => `\n    - still needs your ruling: ${f.file || '(no file)'}${f.line != null ? `:${f.line}` : ''}  ${f.summary}`).join(''))).concat(report.needsPerson.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  [conveyor asks since ${pr.noteAt}] ${pr.headline}${pr.detail ? ` — ${pr.detail}` : ''}`
-      + `\n    extend rounds: ${pr.commands.extendRounds}\n    send back past the cap: ${pr.commands.sendBack}\n    answer the stand-down: ${pr.commands.standDownAnswer}\n    close: ${pr.commands.close}`)).join('\n'));
+      + (pr.commands.releaseDraft ? `\n    release draft: ${pr.commands.releaseDraft}`
+        : `\n    extend rounds: ${pr.commands.extendRounds}\n    send back past the cap: ${pr.commands.sendBack}\n    answer the stand-down: ${pr.commands.standDownAnswer}\n    close: ${pr.commands.close}`))).join('\n'));
     console.log('RULING NEEDED — review parked with confirmed findings; each needs your block/card/not-real ruling:');
     printRows(report.rulingNeeded.map((r) => `${r.repo}#${r.number}  ${r.title}  [waiting since ${r.since || 'time unknown'}, head ${r.head.slice(0, 9)}]\n`
       + r.findings.map((f) => `    - ${f.file ?? '(no file)'}${f.line ? `:${f.line}` : ''}  ${f.summary}${f.reason === 'dispute' ? '  [came back after your block ruling; the fixer and reviewer disagree]' : f.reason === 'red-team-round-cap' ? '  [red team confirmed break; round cap reached, not sent back]' : ''}`).join('\n')
