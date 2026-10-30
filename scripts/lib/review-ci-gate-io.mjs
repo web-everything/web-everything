@@ -1,3 +1,5 @@
+import { greenLedgerDir, hasGreenLedger } from './lane-verify.mjs';
+import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { ciRedOnHead, fastChecksFor, reviewStartGate, reviewUsesRequiredChecks } from './review-timing.mjs';
 import { resolveTimingPolicy } from './review-timing-settings.mjs';
 /** Fresh repo-explicit review eligibility, with injectable read-only GitHub IO. */
@@ -36,6 +38,7 @@ export const readReviewChecks = ({ repo, headSha, run = gh }) => [
 export function readReviewCiGate({ repo, pr, readHead, readLabels,
   readHeadAndLabels = readReviewHeadAndLabels,
   readMergeGateVerdict = defaultReadMergeGateVerdict, readFreeze = readSharedFreeze, mergeGateSetting,
+  readVerifyGreen = hasGreenLedger, coordinationRoot,
   readChecks = readReviewChecks, readRequired = getRequiredStatusChecks, policy = resolveTimingPolicy().review } = {}) {
   let headSha = null;
   let labels;
@@ -88,7 +91,12 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
     } catch { /* Unreadable excusal evidence preserves the original failed checks. */ }
     const requiredChecks = trustedRequired && required.source !== 'timing-policy' ? required.checks : [];
     // `requiredChecks` rides along so a publish-time void judges only healable reds, as review start does.
-    return withSource({ ...reviewStartGate({ headSha, repo, requiredChecks, checks, policy }), checks, requiredChecks });
+    let verifyGreen = false;
+    if (policy.startBeforeCi) {
+      try { verifyGreen = readVerifyGreen({ dir: greenLedgerDir({ coordinationRoot: coordinationRoot ?? resolveCoordinationRoot() }), sha: headSha }) === true; }
+      catch { /* Unreadable verification waits on CI. */ }
+    }
+    return withSource({ ...reviewStartGate({ headSha, repo, requiredChecks, checks, policy, verifyGreen }), checks, requiredChecks });
   } catch (error) {
     return { allowed: false, headSha, startAfter: policy.startAfter, reason: 'unreadable-ci', error: String(error?.message ?? error) };
   }
