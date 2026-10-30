@@ -1,5 +1,7 @@
 # Testing — Three-Tier Strategy
 
+> Authors: APPEND new sections at the END of this file, never right after the title (`.gitattributes` union-merges it, but appending avoids overlapping insertions).
+
 ## Human-only enqueue approval license (R212)
 
 `human-only-enqueue-license.test.mjs` uses local Git repositories to exercise exact clearance,
