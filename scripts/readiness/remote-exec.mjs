@@ -112,29 +112,13 @@ export function createGitBlobReader({cwd, timeoutMs=10000}={}) {
 import {classifyManifestPath, manifestEntry, decodeManifest, parseGitTree, parseGitStatus, nulPaths} from './forge-exec-manifest.mjs';
 export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse} = {}) {
   if(head!==undefined&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head))throw new Error('Invalid Git HEAD');
-  // Build names are exempt only with evidence that Git ignores the whole directory.
+  // Git ignore rules do not establish test-runner exclusions. Even a whole
+  // ignored build directory can contain runnable tests (scripts/build/__tests__).
   const ignored = await exec({file:'git',args:['ls-files','-o','-i','--exclude-standard','-z'],cwd});
   if (ignored.code !== 0 || !Buffer.isBuffer(ignored.stdout)) throw new Error('Ignored byte inventory unavailable');
   const ignoredTests=splitPaths(ignored.stdout).filter(path=>isTestFile(path)
     && !pathParts(path).slice(0,-1).some(part=>['node_modules','.git'].includes(part.toString('latin1'))));
-  const buildNames=new Set(['_site','dist','build','out','coverage','.next','.vite','.cache','storybook-static']);
-  const candidates=new Map();
-  for(const path of ignoredTests) {
-    const parts=pathParts(path);
-    for(let i=0;i<parts.length-1;i++)if(buildNames.has(parts[i].toString('latin1'))) {
-      const dir=path.subarray(0,parts.slice(0,i+1).reduce((length,part)=>length+part.length+1,0)-1);
-      candidates.set(dir.toString('hex'),dir);
-    }
-  }
-  let ignoredDirs=[];
-  if(candidates.size) {
-    const result=await exec({file:'git',args:['check-ignore','--no-index','-z','--stdin'],cwd,input:nulPaths([...candidates.values()])});
-    if(![0,1].includes(result.code))throw new Error('Ignored directory evidence unavailable');
-    ignoredDirs=splitPaths(result.stdout);
-    if(ignoredDirs.some(dir=>!candidates.has(dir.toString('hex'))))throw new Error('Invalid ignored directory evidence');
-  }
-  for(const path of ignoredTests) {
-    if(ignoredDirs.some(dir=>path[dir.length]===47 && path.subarray(0,dir.length).equals(dir)))continue;
+  if(ignoredTests.length) {
     throw Object.assign(new Error('Ignored test: use local fallback'), {code:'ignored-test-file'});
   }
   let files;
