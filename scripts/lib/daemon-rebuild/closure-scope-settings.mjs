@@ -1,10 +1,12 @@
 /** Shared closure-scope policy for planning and boot smoke, without a smoke import cycle. */
 import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cascadePolicy, logCascadeSources } from '../policy-cascade.mjs';
 
 export function daemonRebuildSettingsPath() {
-  return fileURLToPath(new URL('../daemon-rebuild-settings.json', import.meta.url));
+  // Resolve a filesystem path: Vite rewrites new URL(..., import.meta.url) as an asset URL.
+  return join(dirname(fileURLToPath(import.meta.url)), '..', 'daemon-rebuild-settings.json');
 }
 
 /** Standard shadow never auto-graduates: enabling scoped adoption requires an explicit layer. */
