@@ -65,25 +65,31 @@ describe('sibling root snapshot acceptance', () => {
   const siblingRoot = () => join(root,'runs',request.run,'frontierui');
   async function siblingSnapshot() {
     const sibling = siblingRoot();
-    // Allow mismatch tests to reach run() even before prepare gains this root.
     await mkdir(join(sibling,'plugs'),{recursive:true});
     await mkdir(join(sibling,'webtheme'),{recursive:true});
     await writeFile(join(sibling,'plugs','runtime.js'),'export const plug = true;\n');
     await writeFile(join(sibling,'webtheme','theme.js'),'export const theme = true;\n');
-    const {manifest,manifestDigest} = await snapshotBinding(sibling);
-    Object.assign(request,{siblingManifest:manifest,siblingManifestDigest:manifestDigest});
+    const {manifest} = await snapshotBinding(sibling);
+    request.manifest.siblings = {frontierui:{sha:'a'.repeat(40),...manifest}};
+    request.manifestDigest = manifestAPI.digestManifest(request.manifest);
+    request.siblingShas = {frontierui:'a'.repeat(40)};
     return sibling;
   }
-  async function expectNoExecutionOrReceipt() {
+  async function expectNoExecutionOrReceipt({siblings = true} = {}) {
     await expect(readFile(join(root,'install.log'))).rejects.toMatchObject({code:'ENOENT'});
     await expect(readFile(join(work,'task-seen'))).rejects.toMatchObject({code:'ENOENT'});
-    expect(await runner.finish(request)).toBeNull();
+    expect(await runner.finish(request)).toEqual(siblings
+      ? {v:1,nonce:request.nonce,run:request.run,phase:'rejected',reason:'snapshot-rejected',siblings:true,started:false}
+      : null);
   }
 
-  it('prepare creates an empty sibling root beside work with mode 0755', async () => {
-    expect((await stat(siblingRoot())).mode & 0o777).toBe(0o755);
-    expect(await readdir(siblingRoot())).toEqual([]);
-    expect(await realpath(join(work,'..','frontierui'))).toBe(siblingRoot());
+  it('prepare creates an empty sibling root beside work with mode 0755 when requested', async () => {
+    const prepared = await runner.prepare({nonce:request.nonce,siblings:true});
+    const preparedWork = join(root,'runs',prepared.run,'work');
+    const sibling = join(root,'runs',prepared.run,'frontierui');
+    expect((await stat(sibling)).mode & 0o777).toBe(0o755);
+    expect(await readdir(sibling)).toEqual([]);
+    expect(await realpath(join(preparedWork,'..','frontierui'))).toBe(sibling);
   });
 
   it('accepts the matching sibling snapshot and binds its digest in the test receipt', async () => {
@@ -92,11 +98,17 @@ describe('sibling root snapshot acceptance', () => {
     expect(await readFile(join(sibling,'plugs','runtime.js'),'utf8')).toBe('export const plug = true;\n');
     expect(await runner.finish(request)).toEqual({v:1,nonce:request.nonce,run:request.run,
       inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,
-      manifestDigest:request.manifestDigest,siblingManifestDigest:request.siblingManifestDigest,phase:'test',code:3});
+      manifestDigest:request.manifestDigest,siblingShas:request.siblingShas,phase:'test',code:3});
   });
 
-  it.each(['changed byte','extra file','missing file','file symlink','directory symlink','wrong digest'])
-  ('refuses sibling %s before installation and never certifies a receipt', async fault => {
+  it.each([
+    ['changed byte', /snapshot digest/],
+    ['extra file', /snapshot digest/],
+    ['missing file', /Manifest inventory/],
+    ['file symlink', /Manifest symlink/],
+    ['directory symlink', /Manifest symlink/],
+    ['wrong digest', /Manifest digest mismatch/],
+  ])('refuses sibling %s before installation and never certifies a receipt', async (fault, error) => {
     const sibling = await siblingSnapshot();
     const plug = join(sibling,'plugs','runtime.js');
     const outside = join(root,'outside.js');
@@ -112,8 +124,8 @@ describe('sibling root snapshot acceptance', () => {
       await rm(join(sibling,'plugs'),{recursive:true});
       await symlink(root,join(sibling,'plugs'));
     }
-    if (fault === 'wrong digest') request.siblingManifestDigest = '0'.repeat(64);
-    await expect(runner.run(request)).rejects.toThrow(/manifest|inventory|snapshot|digest|symlink|regular|directory/i);
+    if (fault === 'wrong digest') request.manifestDigest = '0'.repeat(64);
+    await expect(runner.run(request)).rejects.toThrow(error);
     await expectNoExecutionOrReceipt();
   });
 
@@ -122,15 +134,16 @@ describe('sibling root snapshot acceptance', () => {
     expect((await runner.run(request)).code).toBe(3);
     const receipt = await runner.finish(request);
     expect(receipt).toMatchObject({phase:'test',code:3,manifestDigest:request.manifestDigest});
-    expect(receipt).not.toHaveProperty('siblingManifestDigest');
+    expect(receipt).not.toHaveProperty('siblingShas');
   });
 
   it('requires an empty sibling root when no sibling manifest was supplied', async () => {
     await siblingSnapshot();
-    delete request.siblingManifest;
-    delete request.siblingManifestDigest;
-    await expect(runner.run(request)).rejects.toThrow(/manifest|inventory|snapshot|extra/i);
-    await expectNoExecutionOrReceipt();
+    delete request.manifest.siblings;
+    request.manifestDigest = manifestAPI.digestManifest(request.manifest);
+    delete request.siblingShas;
+    await expect(runner.run(request)).rejects.toThrow('Extra sibling snapshot');
+    await expectNoExecutionOrReceipt({siblings:false});
   });
 });
 
