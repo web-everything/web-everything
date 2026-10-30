@@ -71,7 +71,7 @@ export const NON_READ_OPERATIONS = Object.freeze([
   'graduation-progress-report', 'graduate-chain', 'judge-sweep-facts', 'route-pr-outcome', 'dispatch-lane', 'claim', 'open-pr', 'explore', 'stage-pr-view',
   'docket-refresh', 'restart-runner', 'priority-sync', 'live-state', 'live-work', 'sessions', 'record-referral-ruling', 'extend-rounds',
   'free-scope', 'operator-session-bootstrap', 'maintenance', 'perf-snapshot', 'pre-pr-check', 'resource-status', 'prototype-load',
-  'unpark', 'retry-prepare', 'rearm', 'refresh', 'grant-rounds', 'clear-claim',
+  'unpark', 'retry-prepare', 'rearm', 'refresh', 'grant-rounds', 'clear-claim', 'routing-override',
 ]);
 
 /** Pre-approved commands, as `node <root>/…` prefixes (the agent's cwd is a scratch dir outside any checkout). */
