@@ -36,6 +36,99 @@ const settled = (name, conclusion, extra = {}) => ({
   name, status: 'completed', conclusion, ...extra,
 });
 
+describe('review regressions: fail-closed summary inputs', () => {
+  it.each([
+    ['null', null], ['string', 'ci'], ['Set', new Set(['ci'])],
+    ['number', 1], ['object', {}], ['non-string entry', [null]],
+    ['mixed entries', ['ci', 1]], ['sparse array', new Array(1)],
+  ])('rejects malformed requiredNames: %s', (_label, requiredNames) => {
+    expect(() => summarize([settled('ci', 'failure')], { requiredNames }))
+      .toThrow(TypeError);
+  });
+
+  it('rejects nameless rows instead of dropping a failure behind a success', () => {
+    const failed = { status: 'completed', conclusion: 'failure', id: 1 };
+    const passed = { status: 'completed', conclusion: 'success', id: 2 };
+    for (const rows of [[failed, passed], [passed, failed]]) {
+      expect(() => latestAttempts(rows)).toThrow(TypeError);
+      expect(() => summarize(rows)).toThrow(TypeError);
+      expect(() => summarize(rows, { requiredNames: ['ci'] })).toThrow(TypeError);
+    }
+  });
+
+  it.each([undefined, null, '', 1, {}, []].map((value) => [value]))('rejects invalid check identity %j', (name) => {
+    expect(() => latestAttempts([settled(name, 'success')])).toThrow(TypeError);
+  });
+
+  it.each([null, 'ci', new Set(['ci']), [null], new Array(1)].map((value) => [value]))(
+    'rejects malformed holdGateNames: %j', (holdGateNames) => {
+      expect(() => summarize([settled('ci', 'failure')], { holdGateNames }))
+        .toThrow(TypeError);
+    },
+  );
+
+  it('rejects conflicting required flags at a tied rank in either order', () => {
+    const optional = settled('ci', 'failure', { required: false });
+    const required = { name: 'ci', status: 'queued' };
+    for (const rows of [[optional, required], [required, optional]]) {
+      expect(() => summarize(rows)).toThrow(TypeError);
+      expect(() => summarize(rows, { requiredNames: ['ci'] })).toThrow(TypeError);
+    }
+  });
+
+  it.each([
+    ['missing', {}], ['noncanonical', { run_attempt: 'bad', id: 'node-id' }],
+    ['canonical', { run_attempt: 1, id: 2 }],
+  ])('retains the worse state on %s rank ties in either order', (_label, rank) => {
+    const green = settled('ci', 'success', rank);
+    const pending = { name: 'ci', status: 'queued', ...rank };
+    const red = settled('ci', 'failure', rank);
+    for (const [better, worse] of [[green, pending], [green, red], [pending, red]]) {
+      for (const rows of [[better, worse], [worse, better]]) {
+        expect(latestAttempts(rows)).toEqual([worse]);
+        const summary = summarize(rows);
+        expect(summary.allRequiredGreen).toBe(false);
+        expect(summary[worse === red ? 'redSet' : 'pendingSet']).toEqual(new Set(['ci']));
+      }
+    }
+  });
+
+  it('retains the first original row when rank and severity both tie', () => {
+    const first = Object.freeze(settled('ci', 'failure', { id: 1 }));
+    const second = Object.freeze(settled('ci', 'timed_out', { id: '1' }));
+    expect(latestAttempts(Object.freeze([first, second]))[0]).toBe(first);
+    expect(latestAttempts(Object.freeze([second, first]))[0]).toBe(second);
+  });
+
+  it('keeps the worse optional tied outcome for an explicit roster override', () => {
+    const green = settled('ci', 'success', { required: false });
+    const red = settled('ci', 'failure', { required: false });
+    for (const rows of [[green, red], [red, green]]) {
+      expect(summarize(rows).allRequiredGreen).toBe(true);
+      expect(summarize(rows, { requiredNames: ['ci'] }).redSet).toEqual(new Set(['ci']));
+    }
+  });
+
+  it('does not case-fold default hold gates or the required roster', () => {
+    expect(summarize([settled('REVIEW-GATE', 'failure')]).gateOnlyRed).toBe(false);
+    const result = summarize([settled('test', 'success')], { requiredNames: ['Test'] });
+    expect(result.pendingSet).toEqual(new Set(['Test']));
+    expect(result.allRequiredGreen).toBe(false);
+  });
+
+  it('honors optional row flags when requiredNames is omitted', () => {
+    const result = summarize([
+      settled('ci', 'success'),
+      settled('optional-failed', 'failure', { required: false }),
+      { name: 'optional-pending', status: 'queued', required: false },
+    ]);
+    expect(result.redSet).toEqual(new Set());
+    expect(result.pendingSet).toEqual(new Set());
+    expect(result.allRequiredGreen).toBe(true);
+    expect(result.gateOnlyRed).toBe(false);
+  });
+});
+
 describe('CHECK_STATE_TABLE', () => {
   it('exports a frozen table', () => {
     expect(CHECK_STATE_TABLE).toBeTypeOf('object');
@@ -238,23 +331,23 @@ describe('latestAttempts', () => {
     }
   });
 
-  it('compares canonical string and number ranks equally and retains the first exact tie', () => {
+  it('compares canonical string and number ranks equally and retains the worse exact tie', () => {
     const first = settled('ci', 'failure', { run_attempt: 2, id: 9007199254740992 });
     const second = settled('ci', 'success', { run_attempt: '2', id: '9007199254740992' });
     expect(latestAttempts([first, second])).toEqual([first]);
-    expect(latestAttempts([second, first])).toEqual([second]);
+    expect(latestAttempts([second, first])).toEqual([first]);
   });
 
   it.each([
-    undefined, null, '', 'garbage', '01', ' 2', '2 ', '2\n', '+2', '-2',
+    undefined, null, '', 'garbage', '01', ' 2', '2 ', '2\n', '2\r', '2\u2028', '2\u2029', '+2', '-2',
     '2.5', '2.0', '2e3', '0x10', 'Infinity', 'NaN', -2, 2.5, Infinity, NaN,
     true, {}, [],
-  ])('treats noncanonical or missing ranking evidence %j as zero for both fields', (value) => {
+  ].map((value) => [value]))('treats noncanonical or missing ranking evidence %j as zero for both fields', (value) => {
     for (const field of ['run_attempt', 'id']) {
       const invalid = settled('ci', 'success', { [field]: value });
       const zero = settled('ci', 'failure', { [field]: '0' });
       expect(latestAttempts([zero, invalid])).toEqual([zero]);
-      expect(latestAttempts([invalid, zero])).toEqual([invalid]);
+      expect(latestAttempts([invalid, zero])).toEqual([zero]);
     }
   });
 
