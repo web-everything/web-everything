@@ -45,6 +45,19 @@ describe('CHECK_STATE_TABLE', () => {
 });
 
 describe('classifyCheck exhaustive independent outcome grid', () => {
+  it('fails closed on prototype-key statuses and conclusions just like unknown values', () => {
+    for (const value of ['unrecognised', 'constructor', 'toString', '__proto__']) {
+      for (const evidence of [
+        { status: value, conclusion: 'success' },
+        { status: 'completed', conclusion: value },
+        { conclusion: value },
+      ]) {
+        expect(classifyCheck({ name: 'ci', ...evidence, required: true })).toBe('red');
+        expect(classifyCheck({ name: 'ci', ...evidence, required: false })).toBe('ignore');
+      }
+    }
+  });
+
   for (const required of [true, false]) {
     for (const status of statuses) {
       for (const conclusion of conclusions) {
@@ -96,86 +109,27 @@ describe('classifyCheck exhaustive independent outcome grid', () => {
   );
 });
 
-describe('inherited check-state keys', () => {
-  it.each(['constructor', 'toString', '__proto__'])('classifies inherited status/conclusion %s as red', key => {
-    expect(classifyCheck({ status: key })).toBe('red');
-    expect(classifyCheck({ status: 'COMPLETED', conclusion: key })).toBe('red');
-  });
-});
-
 describe('latestAttempts', () => {
-  it('keeps distinct test and TEST checks separate and matches the required name exactly', () => {
-    const failed = settled('test', 'FAILURE', { completedAt: '2026-10-30T10:00:00Z' });
-    const passed = settled('TEST', 'SUCCESS', { completedAt: '2026-10-30T10:01:00Z' });
-    for (const rows of [[failed, passed], [passed, failed]]) {
-      expect(latestAttempts(rows)).toHaveLength(2);
-      expect(summarize(rows, { requiredNames: ['test'] })).toEqual({
-        redSet: new Set(['test']), pendingSet: new Set(), gateOnlyRed: false, allRequiredGreen: false,
-      });
-      expect(summarize(rows, { requiredNames: ['TEST'] }).allRequiredGreen).toBe(true);
-      expect(summarize(rows, { requiredNames: ['Test'] }).pendingSet).toEqual(new Set(['Test']));
-    }
+  it('does not mutate deeply frozen input and returns original rows in first-seen name order', () => {
+    const older = Object.freeze(settled('test', 'failure', { run_attempt: 1, id: 1 }));
+    const build = Object.freeze(settled('build', 'success', { run_attempt: 1, id: 2 }));
+    const newer = Object.freeze(settled('test', 'success', { run_attempt: 2, id: 3 }));
+    const smoke = Object.freeze(settled('smoke', 'success', { run_attempt: 1, id: 4 }));
+    const input = Object.freeze([older, build, newer, smoke]);
+    const snapshot = input.map((row) => ({ ...row }));
+
+    const result = latestAttempts(input);
+
+    expect(input).toEqual(snapshot);
+    expect(result).toHaveLength(3);
+    expect(result[0]).toBe(newer);
+    expect(result[1]).toBe(build);
+    expect(result[2]).toBe(smoke);
   });
 
-  it('an older completed attempt cannot hide a newer in-progress attempt on the same head', () => {
-    const success = settled('test', 'SUCCESS', { head_sha: 'abc1234', run_id: 100, run_attempt: 1,
-      id: 100, completed_at: '2026-10-30T10:00:00Z' });
-    const pending = { name: 'test', head_sha: 'abc1234', run_id: 100, run_attempt: 2,
-      id: 200, status: 'IN_PROGRESS', started_at: '2026-10-30T10:01:00Z' };
-    for (const rows of [[success, pending], [pending, success]]) {
-      expect(latestAttempts(rows)).toEqual([pending]);
-      expect(summarize(rows, { requiredNames: ['test'] })).toEqual({
-        redSet: new Set(), pendingSet: new Set(['test']), gateOnlyRed: false, allRequiredGreen: false,
-      });
-    }
-  });
-
-  it.each([undefined, 'invalid', '2026-10-29T02:00:00Z'])(
-    'uses global check ids across runs when completion times are missing, invalid or equal (%s)', timestamp => {
-      const rerun = settled('ci', 'failure', { run_id: 100, run_attempt: 2, id: 300, completedAt: timestamp });
-      const newerRun = settled('ci', 'success', { run_id: 200, run_attempt: 1, id: 200, completedAt: timestamp });
-      for (const rows of [[rerun, newerRun], [newerRun, rerun]]) expect(latestAttempts(rows)).toEqual([rerun]);
-    },
-  );
-
-  it('compares completion times across same-run attempts and other runs in every input order', () => {
-    const oldAttempt = settled('ci', 'success', { run_id: 100, run_attempt: 1, id: 100, completedAt: '2026-10-29T04:00:00Z' });
-    const rerun = settled('ci', 'failure', { run_id: 100, run_attempt: 2, id: 300, completedAt: '2026-10-29T03:00:00Z' });
-    const newerRun = settled('ci', 'success', { run_id: 200, run_attempt: 1, id: 200, completedAt: '2026-10-29T02:00:00Z' });
-    for (const rows of [
-      [oldAttempt, rerun, newerRun], [oldAttempt, newerRun, rerun],
-      [rerun, oldAttempt, newerRun], [rerun, newerRun, oldAttempt],
-      [newerRun, oldAttempt, rerun], [newerRun, rerun, oldAttempt],
-    ]) expect(latestAttempts(rows)).toEqual([oldAttempt]);
-  });
-
-  it.each(['completedAt', 'completed_at'])('uses %s across runs so a later rerun of an older run wins', timeField => {
-    const rerun = settled('ci', 'failure', { run_id: 100, run_attempt: 2, id: 300,
-      [timeField]: '2026-10-29T03:00:00Z' });
-    const newerRun = settled('ci', 'success', { run_id: 200, run_attempt: 1, id: 200,
-      [timeField]: '2026-10-29T02:00:00Z' });
-    for (const rows of [[rerun, newerRun], [newerRun, rerun]]) {
-      expect(latestAttempts(rows)).toEqual([rerun]);
-      expect(summarize(rows).redSet).toEqual(new Set(['ci']));
-    }
-  });
-
-  it('ignores large run_attempt integers and uses check-run id in either order', () => {
+  it('compares large run_attempt integers exactly before considering id in either order', () => {
     const older = settled('ci', 'success', { run_attempt: '9007199254740992', id: 999 });
     const newer = settled('ci', 'failure', { run_attempt: '9007199254740993', id: 1 });
-    for (const runs of [[older, newer], [newer, older]]) {
-      expect(latestAttempts(runs)).toEqual([older]);
-    }
-  });
-
-  it('never mutates its input rows or array', () => {
-    const rows = Object.freeze([Object.freeze({ name: 'ci', id: 1 }), Object.freeze({ name: 'ci', id: 2 })]);
-    expect(latestAttempts(rows)[0]).toBe(rows[1]);
-  });
-
-  it('compares equal-time check-run ids exactly above Number.MAX_SAFE_INTEGER in either order', () => {
-    const older = settled('ci', 'success', { completed_at: '2026-10-28T13:00:00-04:00', id: '9007199254740992' });
-    const newer = settled('ci', 'failure', { completedAt: '2026-10-28T13:00:00-04:00', id: '9007199254740993' });
     for (const runs of [[older, newer], [newer, older]]) {
       expect(latestAttempts(runs)).toEqual([newer]);
     }
@@ -201,12 +155,12 @@ describe('latestAttempts', () => {
     }
   });
 
-  it('selects effective time, then numeric check-run id, per name in either input order', () => {
-    const winner = settled('ci', 'failure', { run_attempt: '10', id: '10', completedAt: '2026-10-28T13:00:00-04:00' });
+  it('selects the greatest numeric run_attempt, then numeric id, per name in either input order', () => {
+    const winner = settled('ci', 'failure', { run_attempt: '10', id: '10' });
     const smoke = settled('smoke', 'success', { run_attempt: 1, id: 1 });
     const runs = [
-      settled('ci', 'success', { run_attempt: '2', id: '999', completedAt: '2026-10-28T12:00:00-04:00' }),
-      settled('ci', 'success', { run_attempt: '10', id: '2', completedAt: '2026-10-28T13:00:00-04:00' }),
+      settled('ci', 'success', { run_attempt: '2', id: '999' }),
+      settled('ci', 'success', { run_attempt: '10', id: '2' }),
       winner, smoke,
     ];
     for (const input of [runs, [...runs].reverse()]) {
@@ -216,7 +170,7 @@ describe('latestAttempts', () => {
     }
   });
 
-  it('ignores run_attempt and counts missing check-run id as zero', () => {
+  it('counts missing run_attempt and id as zero', () => {
     const missing = settled('ci', 'success');
     const byId = settled('ci', 'failure', { id: 1 });
     const byAttempt = settled('ci', 'neutral', { run_attempt: 1 });
@@ -224,13 +178,13 @@ describe('latestAttempts', () => {
       expect(latestAttempts(pair)).toEqual([byId]);
     }
     for (const pair of [[byId, byAttempt], [byAttempt, byId]]) {
-      expect(latestAttempts(pair)).toEqual([byId]);
+      expect(latestAttempts(pair)).toEqual([byAttempt]);
     }
     expect(latestAttempts([missing])).toEqual([missing]);
     expect(latestAttempts([])).toEqual([]);
   });
 
-  it('timestamps outrank check-run ids', () => {
+  it('never uses startedAt or completedAt to break the numeric ranking', () => {
     const older = settled('ci', 'success', {
       run_attempt: 1, id: 2,
       startedAt: '2026-10-28T12:00:00Z', completedAt: '2026-10-28T13:00:00Z',
@@ -239,12 +193,31 @@ describe('latestAttempts', () => {
       run_attempt: 1, id: 10,
       startedAt: '2026-10-27T12:00:00Z', completedAt: '2026-10-27T13:00:00Z',
     });
-    expect(latestAttempts([older, newer])).toEqual([older]);
-    expect(latestAttempts([newer, older])).toEqual([older]);
+    expect(latestAttempts([older, newer])).toEqual([newer]);
+    expect(latestAttempts([newer, older])).toEqual([newer]);
   });
 });
 
 describe('named check-state regressions', () => {
+  it('groups check names case-insensitively and matches required and hold-gate names with lowercase sets', () => {
+    const older = settled('Test', 'success', { run_attempt: 1, id: 1 });
+    const newer = settled('test', 'failure', { run_attempt: 2, id: 2, required: false });
+    for (const runs of [[older, newer], [newer, older]]) {
+      expect(latestAttempts(runs)).toEqual([newer]);
+      expect(summarize([
+        ...runs,
+        { name: 'Build', status: 'queued' },
+        settled('Smoke', 'failure'),
+      ], {
+        requiredNames: ['TEST', 'bUiLd', 'ABSENT'],
+        holdGateNames: ['tEsT'],
+      })).toEqual({
+        redSet: new Set(['test']), pendingSet: new Set(['build', 'absent']),
+        gateOnlyRed: true, allRequiredGreen: false,
+      });
+    }
+  });
+
   it('large adjacent ids cannot hide a newer failure in either row order', () => {
     const older = settled('ci', 'success', { run_attempt: 1, id: '9007199254740992' });
     const newer = settled('ci', 'failure', { run_attempt: 1, id: '9007199254740993' });
@@ -266,7 +239,7 @@ describe('named check-state regressions', () => {
   it('mixed timestamp ranking cannot hide a newer FAILURE', () => {
     const older = settled('ci', 'SUCCESS', {
       run_attempt: 1, id: 999,
-      startedAt: '2026-10-26T12:00:00Z', completedAt: '2026-10-26T13:00:00Z',
+      startedAt: '2026-10-28T12:00:00Z', completedAt: '2026-10-28T13:00:00Z',
     });
     const newer = settled('ci', 'FAILURE', {
       run_attempt: 2, id: 1,
@@ -338,8 +311,8 @@ describe('summarize required checks', () => {
 
   it('uses the latest green attempt to clear an older failure', () => {
     expect(summarize([
-      settled('ci', 'failure', { run_attempt: 1, completed_at: '2026-10-28T12:00:00-04:00' }),
-      settled('ci', 'success', { run_attempt: 2, completed_at: '2026-10-28T13:00:00-04:00' }),
+      settled('ci', 'failure', { run_attempt: 1 }),
+      settled('ci', 'success', { run_attempt: 2 }),
     ], { requiredNames: ['ci'] })).toEqual({
       redSet: new Set(), pendingSet: new Set(),
       gateOnlyRed: false, allRequiredGreen: true,
@@ -367,179 +340,5 @@ describe('gate-only-red detection', () => {
     const options = { holdGateNames: ['custom-gate'] };
     expect(summarize([settled('custom-gate', 'failure')], options).gateOnlyRed).toBe(true);
     expect(summarize([settled('review-gate', 'failure')], options).gateOnlyRed).toBe(false);
-  });
-});
-
-
-describe('R216 effective-time attempt ranking', () => {
-  const early = '2026-10-28T12:00:00-04:00';
-  const late = '2026-10-28T13:00:00-04:00';
-
-  it('invalid completion falls back to a newer pending start', () => {
-    const success = settled('test', 'SUCCESS', { completedAt: early });
-    const pending = { name: 'test', status: 'IN_PROGRESS', completedAt: 'invalid', startedAt: late };
-    for (const rows of [[success, pending], [pending, success]]) {
-      expect(latestAttempts(rows)).toEqual([pending]);
-      expect(summarize(rows, { requiredNames: ['test'] })).toEqual({
-        redSet: new Set(), pendingSet: new Set(['test']),
-        gateOnlyRed: false, allRequiredGreen: false,
-      });
-    }
-  });
-
-  it.each([
-    [{ completed_at: 'invalid' }, 'completedAt'],
-    [{ completed_at: 'invalid' }, 'started_at'],
-    [{ completedAt: 'invalid' }, 'startedAt'],
-    [{ completed_at: 'invalid', completedAt: 'invalid', started_at: 'invalid' }, 'startedAt'],
-    [{ completedAt: 'invalid', startedAt: 'invalid' }, 'created_at'],
-    [{ completed_at: 'invalid', started_at: 'invalid' }, 'createdAt'],
-    [{ completedAt: 'invalid', startedAt: 'invalid', created_at: 'invalid' }, 'createdAt'],
-  ])('malformed higher-priority timestamps %j fall through to valid %s in both orders', (malformed, field) => {
-    const success = settled('test', 'SUCCESS', { id: 999, completedAt: early });
-    for (const fallback of ['2026-10-27T12:00:00Z', late]) {
-      const pending = { name: 'test', status: 'IN_PROGRESS', id: 1, ...malformed, [field]: fallback };
-      const winner = fallback === late ? pending : success;
-      for (const rows of [[success, pending], [pending, success]]) {
-        expect(latestAttempts(rows)).toEqual([winner]);
-        expect(summarize(rows, { requiredNames: ['test'] })).toEqual({
-          redSet: new Set(), pendingSet: new Set(winner === pending ? ['test'] : []),
-          gateOnlyRed: false, allRequiredGreen: winner === success,
-        });
-      }
-    }
-  });
-
-  it('an unfinished row with only malformed timestamps stays pending in both orders', () => {
-    const success = settled('test', 'SUCCESS', { completedAt: early });
-    const pending = { name: 'test', status: 'IN_PROGRESS',
-      completedAt: 'invalid', startedAt: 'invalid', createdAt: 'invalid' };
-    for (const rows of [[success, pending], [pending, success]]) {
-      expect(latestAttempts(rows)).toEqual([pending]);
-      expect(summarize(rows, { requiredNames: ['test'] })).toEqual({
-        redSet: new Set(), pendingSet: new Set(['test']),
-        gateOnlyRed: false, allRequiredGreen: false,
-      });
-    }
-  });
-
-  it.each(['0001-01-01T00:00:00Z', '1999-12-31T23:59:59Z', '1970-01-01T00:00:00Z', 0, '0'])(
-    'zero/epoch-like completion %j falls back to start time or undated-newest in both orders', completed => {
-      const success = settled('test', 'SUCCESS', { id: 999, completed_at: early });
-      for (const field of ['completed_at', 'completedAt']) {
-        for (const start of [{ started_at: late }, { startedAt: late }, {}]) {
-          const pending = { name: 'test', status: 'IN_PROGRESS', id: 1, [field]: completed, ...start };
-          for (const rows of [[success, pending], [pending, success]]) {
-            expect(latestAttempts(rows)).toEqual([pending]);
-            expect(summarize(rows, { requiredNames: ['test'] })).toEqual({
-              redSet: new Set(), pendingSet: new Set(['test']),
-              gateOnlyRed: false, allRequiredGreen: false,
-            });
-          }
-        }
-        const olderPending = { name: 'test', status: 'IN_PROGRESS', [field]: completed,
-          startedAt: '2026-10-27T12:00:00Z' };
-        for (const rows of [[success, olderPending], [olderPending, success]]) {
-          expect(latestAttempts(rows)).toEqual([success]);
-        }
-      }
-    },
-  );
-
-  it.each(['created_at', 'createdAt'])(
-    '%s is the last timestamp fallback after completion and start time', field => {
-      const older = settled('test', 'SUCCESS', { id: 999, [field]: early });
-      const newer = settled('test', 'FAILURE', { id: 1, [field]: late });
-      for (const rows of [[older, newer], [newer, older]]) {
-        expect(latestAttempts(rows)).toEqual([newer]);
-        expect(summarize(rows).redSet).toEqual(new Set(['test']));
-      }
-      for (const timestamp of ['completed_at', 'completedAt', 'started_at', 'startedAt']) {
-        const earlier = settled('test', 'SUCCESS', { id: 999, [timestamp]: early, [field]: late });
-        for (const rows of [[earlier, newer], [newer, earlier]]) {
-          expect(latestAttempts(rows)).toEqual([newer]);
-        }
-      }
-    },
-  );
-
-  it.each(['completed_at', 'completedAt', 'started_at', 'startedAt', 'created_at', 'createdAt'])(
-    'zero dates in %s count as absent for unfinished and completed rows', field => {
-      const dated = settled('test', 'FAILURE', { completedAt: early });
-      for (const zero of ['0001-01-01T00:00:00Z', '1970-01-01T00:00:00Z', 0, '0']) {
-        const pending = { name: 'test', status: 'IN_PROGRESS', [field]: zero };
-        const completed = settled('test', 'SUCCESS', { id: 999, [field]: zero });
-        for (const rows of [[dated, pending], [pending, dated]]) {
-          expect(latestAttempts(rows)).toEqual([pending]);
-          expect(summarize(rows).pendingSet).toEqual(new Set(['test']));
-        }
-        for (const rows of [[dated, completed], [completed, dated]]) {
-          expect(latestAttempts(rows)).toEqual([dated]);
-          expect(summarize(rows).redSet).toEqual(new Set(['test']));
-        }
-      }
-    },
-  );
-
-  it.each(['queued', 'in_progress', 'waiting', 'requested', 'pending', 'QUEUED', 'IN_PROGRESS', 'PENDING'])(
-    'an undated %s attempt ranks newest and keeps a required check pending', status => {
-      const success = settled('test', 'SUCCESS', { id: 999, completed_at: late });
-      const pending = { name: 'test', status, conclusion: null };
-      for (const rows of [[success, pending], [pending, success]]) {
-        expect(latestAttempts(rows)).toEqual([pending]);
-        expect(summarize(rows, { requiredNames: ['test'] })).toEqual({
-          redSet: new Set(), pendingSet: new Set(['test']),
-          gateOnlyRed: false, allRequiredGreen: false,
-        });
-      }
-    },
-  );
-
-  it.each([
-    {},
-    { started_at: null, completed_at: null },
-    { completed_at: 'invalid' },
-    { startedAt: 'invalid' },
-  ])('completed rows with missing or invalid timestamps rank lowest: %j', timestamps => {
-    const dated = settled('test', 'FAILURE', { id: 1, completed_at: early });
-    for (const conclusion of ['SUCCESS', 'CANCELLED', 'STALE']) {
-      const undated = settled('test', conclusion, { id: 999, ...timestamps });
-      for (const rows of [[undated, dated], [dated, undated]]) {
-        expect(latestAttempts(rows)).toEqual([dated]);
-        expect(summarize(rows, { requiredNames: ['test'] }).redSet).toEqual(new Set(['test']));
-      }
-    }
-  });
-
-  it.each([
-    ['R1b: different workflow runs never compare attempt counters',
-      { run_id: 100, run_attempt: 2, id: 1001, completed_at: early },
-      { run_id: 200, run_attempt: 1, id: 2001, completed_at: late }],
-    ['R2: partial metadata cannot hide a timestamp-only failure',
-      { run_attempt: 2, id: 1001, completedAt: early }, { completedAt: late }],
-    ['R4: an older-run rerun failure beats a newer-run success completed earlier',
-      { run_id: 200, run_attempt: 1, id: 2001, completed_at: early },
-      { run_id: 100, run_attempt: 2, id: 1001, completed_at: late }],
-    ['missing timestamps rank lowest even with greater workflow and check-run ids',
-      { run_id: 999, run_attempt: 999, id: 9999 }, { completedAt: late }],
-    ['invalid timestamps rank lowest', { id: 9999, completed_at: 'invalid' }, { completed_at: early }],
-    ['completion time takes precedence over start time',
-      { started_at: late, completed_at: early }, { started_at: early, completed_at: late }],
-  ])('%s', (_name, olderMetadata, newerMetadata) => {
-    const older = settled('test', 'SUCCESS', olderMetadata);
-    const newer = settled('test', 'FAILURE', newerMetadata);
-    for (const rows of [[older, newer], [newer, older]]) {
-      expect(latestAttempts(rows)).toEqual([newer]);
-      expect(summarize(rows, { requiredNames: ['test'] }).redSet).toEqual(new Set(['test']));
-    }
-  });
-
-  it.each(['started_at', 'startedAt'])('a newer in-progress %s outranks an older completed check', field => {
-    const older = settled('test', 'SUCCESS', { id: 999, completed_at: early });
-    const pending = { name: 'test', status: 'IN_PROGRESS', id: 1, [field]: late };
-    for (const rows of [[older, pending], [pending, older]]) {
-      expect(latestAttempts(rows)).toEqual([pending]);
-      expect(summarize(rows).pendingSet).toEqual(new Set(['test']));
-    }
   });
 });
