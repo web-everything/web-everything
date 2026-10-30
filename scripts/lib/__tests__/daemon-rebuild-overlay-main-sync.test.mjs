@@ -237,7 +237,16 @@ describe('overlay main sync', () => {
     const before = outcome === 'rotate' ? 'x'.repeat(1024 * 1024 + 1) : 'previous log\n';
     fs.writeFileSync(file, before); fs.writeFileSync(`${file}.1`, 'older');
     if (outcome === 'open-failure') { fs.unlinkSync(file); fs.mkdirSync(file); }
-    let fd;
+    let fd, logClosed = false;
+    const close = fs.closeSync;
+    vi.spyOn(fs, 'closeSync').mockImplementation(value => {
+      close(value);
+      if (value === fd && !logClosed) {
+        // Record the successful real close: another open can reuse this number
+        // before a later fstatSync, especially during spawn-error reporting.
+        logClosed = true;
+      }
+    });
     const spawnFn = vi.fn((bin, args, options) => {
       if (outcome === 'open-failure') expect(options.stdio).toBe('ignore');
       else {
@@ -249,7 +258,7 @@ describe('overlay main sync', () => {
       return { once: vi.fn(), unref: vi.fn() };
     });
     expect(tick(f, { spawnFn }).started).toEqual(outcome === 'spawn-error' ? [] : [ref]);
-    if (fd !== undefined) expect(() => fs.fstatSync(fd)).toThrow();
+    expect(logClosed).toBe(outcome !== 'open-failure');
     if (outcome === 'rotate') {
       expect(fs.readFileSync(`${file}.1`, 'utf8')).toBe(before);
       expect(fs.readFileSync(file, 'utf8')).toBe('child log\n');
