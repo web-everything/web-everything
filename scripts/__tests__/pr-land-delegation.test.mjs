@@ -5,6 +5,8 @@ import { mkdtempSync, writeFileSync, chmodSync, existsSync, rmSync } from 'node:
 import { tmpdir } from 'node:os';
 import { buildDelegationMarker, parseDelegationMarker } from '../lib/delegation-marker.mjs';
 import { parseAuthorActorId } from '../lib/review-independence.mjs';
+// Load the shared CLI dependency graph during collection, outside each test's deadline.
+import '../pr-land.mjs';
 
 const originalArgv = process.argv;
 afterEach(() => {
@@ -14,11 +16,12 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 const triple = { provider: 'codex', model: 'gpt-6-astra', taskType: 'bugfix' };
+let loadN = 0;
 async function load(args = []) {
-  vi.resetModules();
   vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'author-session');
   process.argv = ['node', 'test-import', ...args];
-  return import('../pr-land.mjs');
+  // Re-evaluate argv-derived defaults without reloading the entire CLI dependency graph.
+  return import(`../pr-land.mjs?fresh=${++loadN}`);
 }
 
 describe('pr-land --delegation', () => {
