@@ -93,7 +93,7 @@ import { collectImportClosure, closureHits } from './import-closure.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { gitRun } from './main-staleness.mjs';
 import { DAEMON_BOOT_SMOKE_CHECK, DEFAULT_DAEMON_BOOT_MS } from './daemon-boot-smoke.mjs';
-import { redactDetail } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
+import { redactDetail, redactDiagnosticLine } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
 
 /** Set to `1`/`true`/`yes` to disable the whole gate — every merge is adopted unconditionally, exactly like
  *  before this file existed. The one intentionally fail-OPEN switch in this module. */
@@ -1480,18 +1480,26 @@ export function clearRejectedSha(root, env = process.env) {
 }
 
 // Bound both Git output and parsing work. Missing/truncated/oversized evidence refuses rollback.
-const ROLLBACK_PATH_LIST_MAX_BYTES = 1024 * 1024;
-function rollbackPathList(run, args, root) {
-  try {
-    const result = run(args, { cwd: root, timeout: 60_000, killSignal: 'SIGKILL', maxBuffer: ROLLBACK_PATH_LIST_MAX_BYTES });
-    if (result.status !== 0 || typeof result.stdout !== 'string'
-      || Buffer.byteLength(result.stdout) > ROLLBACK_PATH_LIST_MAX_BYTES
-      || (result.stdout && !result.stdout.endsWith('\0'))) return null;
+const ROLLBACK_PATH_LIST_MAX_BYTES = 64 * 1024 * 1024;
+function rollbackRead(run, args, root, pathList = false) {
+  let result;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      result = run(args, { cwd: root, timeout: 60_000, killSignal: 'SIGKILL',
+        env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' }, maxBuffer: ROLLBACK_PATH_LIST_MAX_BYTES });
+    } catch (error) { result = { error, stderr: error?.message }; }
+    const stdout = result?.stdout;
+    if (result?.status !== 0 || result.error || result.signal || typeof stdout !== 'string'
+      || Buffer.byteLength(stdout) > ROLLBACK_PATH_LIST_MAX_BYTES) continue;
+    if (!pathList) return { value: stdout };
+    if (stdout && !stdout.endsWith('\0')) continue;
     // --directory emits a trailing slash for collapsed untracked directories.
-    const paths = result.stdout ? result.stdout.slice(0, -1).split('\0').map(path => path.replace(/\/$/, '')) : [];
-    return paths.every(path => path && !path.startsWith('/')
-      && !path.split('/').some(part => !part || part === '.' || part === '..')) ? paths : null;
-  } catch { return null; }
+    const paths = stdout ? stdout.slice(0, -1).split('\0').map(path => path.replace(/\/$/, '')) : [];
+    if (paths.every(path => path && !path.startsWith('/')
+      && !path.split('/').some(part => !part || part === '.' || part === '..'))) return { value: paths };
+  }
+  const bytes = typeof result?.stdout === 'string' || Buffer.isBuffer(result?.stdout) ? Buffer.byteLength(result.stdout) : 0;
+  return { detail: `status=${result?.status === undefined ? 'unknown' : result.status} signal=${redactDiagnosticLine(result?.signal ?? 'none')} code=${redactDiagnosticLine(result?.error?.code ?? 'none')} bytes=${bytes} stderr=${redactDiagnosticLine(result?.stderr ?? result?.error?.message)}` };
 }
 function rollbackHasUntrackedCollision(untracked, target) {
   // Conservatively protect case-insensitive and Unicode-normalizing filesystems too.
@@ -1521,19 +1529,26 @@ function rollbackHasUntrackedCollision(untracked, target) {
  * Untracked paths (including ignored files) must not obstruct a file or directory in the target tree.
  * Mirrors `daemon-self-sync.mjs#decideSelfSync`'s own fail-closed posture on an unreadable tree state.
  * @param {{root:string, sha:string|null, run?:typeof gitRun, ignoreUntracked?:boolean}} o
- * @returns {{ok:boolean, reason?:string}}
+ * @returns {{ok:boolean, reason?:string, detail?:string}}
  */
 export function rollbackToSha({ root, sha, run = gitRun, ignoreUntracked = false }) {
   if (!sha) return { ok: false, reason: 'no-sha' };
-  const status = run(['status', '--porcelain', ...(ignoreUntracked ? ['--untracked-files=no'] : [])], { cwd: root, timeout: 60_000, killSignal: 'SIGKILL' });
-  const dirty = status.status === 0 ? !!String(status.stdout ?? '').trim() : null;
-  if (dirty !== false) return { ok: false, reason: dirty === null ? 'status-failed' : 'dirty' };
+  const args = ['status', '--porcelain', ...(ignoreUntracked ? ['--untracked-files=no'] : [])];
   if (ignoreUntracked) {
+    const status = rollbackRead(run, args, root);
+    if (status.value === undefined) return { ok: false, reason: 'status-failed', detail: status.detail };
+    if (status.value.trim()) return { ok: false, reason: 'dirty' };
     // Include ignored sidecars too: reset --hard can delete either kind of untracked obstruction.
-    const untracked = rollbackPathList(run, ['ls-files', '--others', '--directory', '--no-empty-directory', '-z'], root);
-    const target = rollbackPathList(run, ['ls-tree', '-r', '--full-tree', '--name-only', '-z', sha], root);
-    if (untracked === null || target === null) return { ok: false, reason: 'status-failed' };
-    if (rollbackHasUntrackedCollision(untracked, target)) return { ok: false, reason: 'untracked-collision' };
+    const untracked = rollbackRead(run, ['ls-files', '--others', '--directory', '--no-empty-directory', '-z'], root, true);
+    if (!untracked.value) return { ok: false, reason: 'untracked-list-failed', detail: untracked.detail };
+    const target = rollbackRead(run, ['ls-tree', '-r', '--full-tree', '--name-only', '-z', sha], root, true);
+    if (!target.value) return { ok: false, reason: 'target-list-failed', detail: target.detail };
+    if (rollbackHasUntrackedCollision(untracked.value, target.value)) return { ok: false, reason: 'untracked-collision' };
+  } else {
+    // Preserve the default caller's status flags, result shape and single-read behavior.
+    const status = run(args, { cwd: root, timeout: 60_000, killSignal: 'SIGKILL' });
+    const dirty = status.status === 0 ? !!String(status.stdout ?? '').trim() : null;
+    if (dirty !== false) return { ok: false, reason: dirty === null ? 'status-failed' : 'dirty' };
   }
   const reset = run(['reset', '--hard', sha], { cwd: root, timeout: 60_000, killSignal: 'SIGKILL' });
   if (reset.status !== 0) return { ok: false, reason: 'reset-failed' };

@@ -1,6 +1,6 @@
 /** Quick rebuild policy, real check selection, and durable post-adopt recovery. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { EventEmitter } from 'node:events';
@@ -11,7 +11,7 @@ import {
   resolveQuick, QUICK_SOAK_CHECKS, QUICK_SOAK_MAX_MS,
 } from '../daemon-rebuild/quick.mjs';
 import {
-  launchQuickSoak, recoverQuickSoak, recordQuickSoakResult, settleQuickSoak, runQuickSoak, QUICK_SOAK_JOB_KIND,
+  launchQuickSoak, recoverQuickSoak, recordQuickSoakResult, settleQuickSoak, runQuickSoak, handleQuickSoakFatal, QUICK_SOAK_JOB_KIND,
 } from '../daemon-rebuild/quick-soak-job.mjs';
 import { alertsFilePath, readReadyCandidate, readRebuildState, writeRebuildState } from '../daemon-rebuild/state.mjs';
 import { completeSmokePass, smokeAndAdopt } from '../daemon-rebuild/smoke.mjs';
@@ -283,21 +283,64 @@ describe('post-adopt soak', () => {
     expect(f.git(['rev-parse', 'HEAD'])).toBe(f.plan.finalSha);
     expect(readFileSync(join(f.root, 'README.md'), 'utf8')).toBe('operator edit');
   });
+  it('default rollback preserves its single status read, flags and failure shape', () => {
+    const run = vi.fn(() => ({ status: 1, stdout: '' }));
+    const root = temp();
+    expect(rollbackToSha({ root, sha: prevHead, run })).toEqual({ ok: false, reason: 'status-failed' });
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run).toHaveBeenCalledWith(['status', '--porcelain'],
+      { cwd: root, timeout: 60_000, killSignal: 'SIGKILL' });
+  });
   it('unreadable tracked status refuses opt-in rollback', () => {
     const run = vi.fn(() => ({ status: 1, stdout: '' }));
     expect(rollbackToSha({ root: temp(), sha: prevHead, run, ignoreUntracked: true }))
-      .toEqual({ ok: false, reason: 'status-failed' });
-    expect(run).toHaveBeenCalledOnce();
+      .toEqual({ ok: false, reason: 'status-failed', detail: 'status=1 signal=none code=none bytes=0 stderr=' });
+    expect(run).toHaveBeenCalledTimes(2);
     expect(run.mock.calls[0][0]).toEqual(['status', '--porcelain', '--untracked-files=no']);
   });
-  it('bounds rollback inventory subprocess output to 1 MiB', () => {
+  it('bounds rollback inventory subprocess output to 64 MiB', () => {
     const run = vi.fn(() => ({ status: 0, stdout: '' }));
     expect(rollbackToSha({ root: temp(), sha: prevHead, run, ignoreUntracked: true })).toEqual({ ok: true });
     for (const command of ['ls-files', 'ls-tree']) {
       const inventories = run.mock.calls.filter(([args]) => args[0] === command);
       expect(inventories).toHaveLength(1);
-      expect(inventories[0][1]).toMatchObject({ maxBuffer: 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' });
+      expect(inventories[0][1]).toMatchObject({ maxBuffer: 64 * 1024 * 1024, env: expect.objectContaining({ GIT_OPTIONAL_LOCKS: '0' }), timeout: 60_000, killSignal: 'SIGKILL' });
     }
+  });
+  it.each(['status', 'ls-files', 'ls-tree'])('retries a transient %s read once with optional locks disabled', command => {
+    let reads = 0;
+    const run = vi.fn(args => args[0] === command && reads++ === 0
+      ? { status: null, signal: 'SIGKILL', error: { code: 'ETIMEDOUT' }, stdout: '', stderr: 'locked' }
+      : { status: 0, stdout: '' });
+    expect(rollbackToSha({ root: temp(), sha: prevHead, run, ignoreUntracked: true })).toEqual({ ok: true });
+    const calls = run.mock.calls.filter(([args]) => args[0] === command);
+    expect(calls).toHaveLength(2);
+    for (const [, opts] of calls) expect(opts.env.GIT_OPTIONAL_LOCKS).toBe('0');
+  });
+  it.each(['status', 'ls-files', 'ls-tree'])('diagnoses failed %s reads without exposing paths', command => {
+    const run = vi.fn(args => args[0] === command
+      ? { status: null, signal: 'SIGKILL', error: { code: 'ETIMEDOUT' }, stdout: 'abc', stderr: 'locked /private/clone/index\nsecret line' }
+      : { status: 0, stdout: '' });
+    const result = rollbackToSha({ root: temp(), sha: prevHead, run, ignoreUntracked: true });
+    expect(result).toEqual({ ok: false,
+      reason: command === 'status' ? 'status-failed' : command === 'ls-files' ? 'untracked-list-failed' : 'target-list-failed',
+      detail: 'status=null signal=SIGKILL code=ETIMEDOUT bytes=3 stderr=locked <path>' });
+    expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+  });
+  it('retries thrown inventory reads and fails closed with error code evidence', () => {
+    const run = vi.fn(args => {
+      if (args[0] === 'ls-files') throw Object.assign(new Error('read /private/clone failed'), { code: 'EIO' });
+      return { status: 0, stdout: '' };
+    });
+    expect(rollbackToSha({ root: temp(), sha: prevHead, run, ignoreUntracked: true }))
+      .toEqual({ ok: false, reason: 'untracked-list-failed',
+        detail: 'status=unknown signal=none code=EIO bytes=0 stderr=read <path> failed' });
+    expect(run.mock.calls.filter(([args]) => args[0] === 'ls-files')).toHaveLength(2);
+    expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+  });
+  it('accepts a complete target list larger than the historical 1 MiB cap', () => {
+    const run = vi.fn(args => ({ status: 0, stdout: args[0] === 'ls-tree' ? 'file\0'.repeat(220_000) : '' }));
+    expect(rollbackToSha({ root: temp(), sha: prevHead, run, ignoreUntracked: true })).toEqual({ ok: true });
   });
   it('rolls back with a node_modules-sized ignored tree without enumerating its files', () => {
     const f = candidateFixture('README.md', '1', { seed: ({ write }) => write('.gitignore', 'node_modules/\n') });
@@ -356,11 +399,13 @@ describe('post-adopt soak', () => {
     { name: 'target listing missing', command: 'ls-tree', result: { status: 0 } },
     { name: 'target listing truncated', command: 'ls-tree', result: { status: 0, stdout: 'partial' } },
     { name: 'untracked listing truncated', command: 'ls-files', result: { status: 0, stdout: 'partial' } },
-    { name: 'listing oversized', command: 'ls-tree', result: { status: 0, stdout: 'x'.repeat(1024 * 1024) + '\0' } },
+    { name: 'listing oversized', command: 'ls-tree', result: { status: 0, stdout: 'x'.repeat(64 * 1024 * 1024) + '\0' } },
   ])('unreadable collision evidence refuses rollback: $name', ({ command, result }) => {
     const run = vi.fn(args => args[0] === command ? result : { status: 0, stdout: '' });
     expect(rollbackToSha({ root: temp(), sha: prevHead, run, ignoreUntracked: true }))
-      .toEqual({ ok: false, reason: 'status-failed' });
+      .toEqual({ ok: false, reason: command === 'ls-files' ? 'untracked-list-failed' : 'target-list-failed',
+        detail: expect.stringContaining(`bytes=${Buffer.byteLength(result.stdout ?? '')}`) });
+    expect(run.mock.calls.filter(([args]) => args[0] === command)).toHaveLength(2);
     expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
   });
   it.each([
@@ -422,7 +467,7 @@ describe('post-adopt soak', () => {
       target: sha, prevHead, host: 'foreign-fixture', startedAt: new Date(0).toISOString() } }, f.env);
     const result = await prepareRebuild({ ...f, log: { error: vi.fn() }, stateOpts: {}, now: Date.now });
     expect(result.result.reason).toBe('rebuild-interrupted-unrecoverable');
-    expect(readRebuildState(f.root, f.env)).toMatchObject({ inProgress: null, quarantine: { prevHead } });
+    expect(readRebuildState(f.root, f.env)).toMatchObject({ inProgress: null, quarantine: { prevHead, failedHead: sha } });
     expect(f.alerts().some(row => row.kind === 'quick-soak-unavailable')).toBe(true);
     expect(f.alerts()).toContainEqual(expect.objectContaining({ kind: 'quick-soak-needs-you',
       detail: expect.objectContaining({ sha, lastGood: prevHead, attempts: 0, cause: 'adoption-interrupted', rollback: { ok: false } }) }));
@@ -451,7 +496,7 @@ describe('post-adopt soak', () => {
     settleQuickSoak({ ...f, outcome: 'failed' });
     const st = readRebuildState(f.root, f.env);
     expect(st.unverified).toBeNull();
-    expect(st.quarantine).toMatchObject({ prevHead });
+    expect(st.quarantine).toMatchObject({ prevHead, failedHead: sha });
     expect(f.run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
   });
   it('does not roll back a different head or settle another adoption token', () => {
@@ -489,6 +534,80 @@ describe('post-adopt soak', () => {
     expect(f.git(['rev-parse', 'HEAD'])).toBe(f.plan.finalSha);
     expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
   });
+  it('clears legacy quick quarantine already at last-good with quick off and proceeds to adopt later code', async () => {
+    const f = candidateFixture('README.md', '0');
+    delete f.env.WE_DAEMON_REBUILD_QUICK;
+    expect(resolveQuick(f.env).quick).toBe(false);
+    writeRebuildState(f.root, { adopted: { head: f.prevHead }, quarantine: {
+      prevHead: f.prevHead, reason: 'quick-soak-rollback-failed',
+    } }, f.env);
+    writeFileSync(join(f.root, 'untracked-sidecar'), 'keep');
+    f.git(['update-ref', 'refs/remotes/origin/main', f.plan.finalSha]);
+    const run = vi.fn((args, opts) => args[0] === 'fetch' ? { status: 0, stdout: '' } : f.run(args, opts));
+    const result = await rebuildClone({ ...f, run, asJob: false, mainOnly: true,
+      runSmoke: async () => completePassed(), log: { error: vi.fn() } });
+    expect(result.adopted).toBe(true);
+    expect(f.git(['rev-parse', 'HEAD'])).toBe(f.plan.finalSha);
+    expect(readRebuildState(f.root, f.env).quarantine).toBeNull();
+    expect(result.alerts).toContainEqual({ kind: 'quick-soak-quarantine-cleared',
+      detail: { prevHead: f.prevHead, via: 'already-at-last-good' } });
+    expect(readFileSync(join(f.root, 'untracked-sidecar'), 'utf8')).toBe('keep');
+    expect(run.mock.calls.filter(([args]) => args[0] === 'reset').map(([args]) => args))
+      .not.toContainEqual(['reset', '--hard', f.prevHead]);
+  });
+  it.each(['dirty', 'unreadable'])('keeps last-good quick quarantine when tracked status is %s', async status => {
+    const f = candidateFixture('README.md', '0');
+    writeRebuildState(f.root, { quarantine: { prevHead: f.prevHead, reason: 'quick-soak-rollback-failed' } }, f.env);
+    if (status === 'dirty') writeFileSync(join(f.root, 'README.md'), 'operator edits');
+    const run = vi.fn((args, opts) => status === 'unreadable' && args[0] === 'status'
+      ? { status: 1, stdout: '' } : f.run(args, opts));
+    const result = await prepareRebuild({ ...f, run, log: { error: vi.fn() }, stateOpts: {}, now: Date.now });
+    expect(result.result.reason).toBe('quarantined');
+    expect(readRebuildState(f.root, f.env).quarantine).toMatchObject({ prevHead: f.prevHead });
+    expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+    expect(f.git(['rev-parse', 'HEAD'])).toBe(f.prevHead);
+    if (status === 'dirty') expect(readFileSync(join(f.root, 'README.md'), 'utf8')).toBe('operator edits');
+  });
+  it('pages immediately for a distinct rollback reason or last-good head within the rate-limit window', async () => {
+    const f = candidateFixture('README.md', '0');
+    writeFileSync(join(f.root, 'README.md'), 'operator edits');
+    writeRebuildState(f.root, { quarantine: { prevHead: f.prevHead, reason: 'quick-soak-rollback-failed' } }, f.env);
+    let unreadable = false;
+    const run = vi.fn((args, opts) => unreadable && args[0] === 'status'
+      ? { status: 1, stdout: '' } : f.run(args, opts));
+    const time = Date.now();
+    const prepare = () => prepareRebuild({ ...f, run, log: { error: vi.fn() }, stateOpts: {}, now: () => time });
+    await prepare();
+    unreadable = true;
+    await prepare();
+    const state = readRebuildState(f.root, f.env);
+    state.quarantine.prevHead = f.plan.finalSha;
+    writeRebuildState(f.root, state, f.env);
+    await prepare();
+    const alerts = readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(alerts.filter(row => row.kind === 'quick-soak-needs-you').map(row => [row.detail.lastGood, row.detail.rollback.reason]))
+      .toEqual([[f.prevHead, 'dirty'], [f.prevHead, 'status-failed'], [f.plan.finalSha, 'adopted-head-changed-or-unreadable']]);
+    expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+  });
+  it.each([false, true])('rate-limits dirty tracked recovery away from last-good (legacy=%s)', async legacy => {
+    const f = candidateFixture('README.md', '0');
+    f.git(['reset', '--hard', f.plan.finalSha]);
+    writeFileSync(join(f.root, 'README.md'), 'operator edits');
+    writeRebuildState(f.root, { quarantine: { prevHead: f.prevHead, reason: 'quick-soak-rollback-failed',
+      ...(legacy ? {} : { failedHead: f.plan.finalSha }) } }, f.env);
+    const run = vi.fn(f.run);
+    const time = Date.now();
+    for (const elapsed of [0, 20_000]) {
+      const result = await prepareRebuild({ ...f, run, log: { error: vi.fn() }, stateOpts: {}, now: () => time + elapsed });
+      expect(result.result.reason).toBe('quarantined');
+    }
+    const alerts = readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(alerts.filter(row => row.kind === 'quick-soak-needs-you')).toHaveLength(1);
+    expect(readRebuildState(f.root, f.env).quarantine.lastPagedAt).toBe(new Date(time).toISOString());
+    expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+    expect(f.git(['rev-parse', 'HEAD'])).toBe(f.plan.finalSha);
+    expect(readFileSync(join(f.root, 'README.md'), 'utf8')).toBe('operator edits');
+  });
   it('quarantine recovery retries rollback only at its persisted failed HEAD', async () => {
     const f = candidateFixture();
     f.git(['reset', '--hard', f.plan.finalSha]);
@@ -501,6 +620,225 @@ describe('post-adopt soak', () => {
     expect(readRebuildState(f.root, f.env).quarantine).toBeNull();
     expect(run.mock.calls.filter(([args]) => args[0] === 'reset').map(([args]) => args))
       .toEqual([['reset', '--hard', f.prevHead]]);
+  });
+  it('quick disabled rate-limits quarantine pages until the same guarded rollback succeeds', async () => {
+    const f = candidateFixture('README.md', '0');
+    f.git(['reset', '--hard', f.plan.finalSha]);
+    writeRebuildState(f.root, { adopted: { head: f.prevHead }, quarantine: {
+      prevHead: f.prevHead, failedHead: f.plan.finalSha, reason: 'quick-soak-rollback-failed',
+    } }, f.env);
+    let failing = true;
+    const run = vi.fn((args, opts) => args[0] === 'ls-tree' && failing ? { status: 1, stdout: '', stderr: 'busy' }
+      : args[0] === 'fetch' ? { status: 0, stdout: '' } : f.run(args, opts));
+    let time = Date.now();
+    const prepare = () => prepareRebuild({ ...f, run, log: { error: vi.fn() }, stateOpts: {}, now: () => time });
+    expect((await prepare()).result.reason).toBe('quarantined');
+    expect((await prepare()).result.reason).toBe('quarantined');
+    expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+    const alerts = readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(alerts.filter(row => row.kind === 'quick-soak-needs-you')).toHaveLength(1);
+    expect(readRebuildState(f.root, f.env).quarantine.lastPagedAt).toBe(new Date(time).toISOString());
+    time += 30 * 60_000;
+    expect((await prepare()).result.reason).toBe('quarantined');
+    const laterAlerts = readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(laterAlerts.filter(row => row.kind === 'quick-soak-needs-you')).toHaveLength(2);
+    expect(readRebuildState(f.root, f.env).quarantine.failedHead).toBe(f.plan.finalSha);
+    failing = false;
+    await prepare();
+    expect(readRebuildState(f.root, f.env).quarantine).toBeNull();
+    expect(f.git(['rev-parse', 'HEAD'])).toBe(f.prevHead);
+    expect(run.mock.calls.filter(([args]) => args[0] === 'reset').map(([args]) => args))
+      .toEqual([['reset', '--hard', f.prevHead]]);
+  });
+  it.each(['passed', 'failed'])('fatal settlement consumes durable %s evidence without replacing it', async outcome => {
+    const f = soakFixture();
+    recordQuickSoakResult({ ...f, outcome });
+    vi.mocked(withWriteLock).mockResolvedValueOnce({ ok: false, reason: 'tick-in-progress' });
+    await handleQuickSoakFatal({ ...f, token: f.marker.token, error: new Error('settle failed') });
+    expect(readRebuildState(f.root, f.env).unverified).toEqual(f.marker);
+    recoverQuickSoak({ ...f });
+    expect(f.alerts().at(-1).kind).toBe(`quick-soak-${outcome}`);
+    expect(f.alerts().some(row => row.kind === 'quick-soak-unavailable')).toBe(false);
+  });
+  it.each([1, 3])('fatal attempt %s alerts carry bounded first-line path-redacted errors through durable recovery', async attempts => {
+    const f = soakFixture();
+    f.marker.soakAttempts = attempts;
+    writeRebuildState(f.root, f.state, f.env);
+    const error = new Error('failed /private/clone/index C:\\checkout\\file ' + 'x'.repeat(400) + '\nsecond line');
+    vi.mocked(withWriteLock).mockResolvedValueOnce({ ok: false, reason: 'tick-in-progress' });
+    await handleQuickSoakFatal({ ...f, token: f.marker.token, error });
+    recoverQuickSoak({ ...f });
+    const rows = f.alerts().filter(row => ['quick-soak-retry', 'quick-soak-needs-you', 'quick-soak-unavailable'].includes(row.kind));
+    expect(rows.map(row => row.kind)).toEqual(attempts === 1 ? ['quick-soak-retry'] : ['quick-soak-needs-you', 'quick-soak-unavailable']);
+    for (const row of rows) {
+      expect(row.detail.error).toHaveLength(300);
+      expect(row.detail.error).toMatch(/^failed <path> <path> x/);
+      expect(row.detail.error).not.toContain('second line');
+      expect(row.detail.reason).toBe('worker-fatal');
+    }
+  });
+  it.each(['passed', 'failed'])('late unavailable writes cannot replace a durable %s result', outcome => {
+    const f = soakFixture();
+    recordQuickSoakResult({ ...f, outcome });
+    recordQuickSoakResult({ ...f, outcome: 'unavailable', reason: 'soak-deadline' });
+    recoverQuickSoak({ ...f });
+    expect(f.alerts().at(-1).kind).toBe(`quick-soak-${outcome}`);
+  });
+  it.each(['passed', 'failed'])('a concurrent %s result survives publication between an unavailable writer\'s read and write', outcome => {
+    const f = soakFixture();
+    let interleaved = false;
+    let resultFile;
+    const io = { write: writeFileSync, rename: renameSync, link: (source, target) => {
+      expect(existsSync(`${target}.lock`)).toBe(true);
+      expect(existsSync(target)).toBe(false);
+      expect(JSON.parse(readFileSync(source, 'utf8'))).toMatchObject({
+        token: f.marker.token, sha: f.marker.sha, outcome: 'unavailable', reason: 'soak-deadline' });
+      // Inject an already-staged competing publication after the initial read. Calling
+      // recordQuickSoakResult recursively here would wait on this publisher's own lock.
+      const competing = `${source}.competing`;
+      writeFileSync(competing, JSON.stringify({ token: f.marker.token, sha: f.marker.sha, outcome }));
+      renameSync(competing, target);
+      resultFile = target;
+      interleaved = true;
+      return linkSync(source, target); // EEXIST must preserve the completed evidence.
+    } };
+    recordQuickSoakResult({ ...f, outcome: 'unavailable', reason: 'soak-deadline', io });
+    expect(interleaved).toBe(true);
+    expect(JSON.parse(readFileSync(resultFile, 'utf8'))).toEqual({ token: f.marker.token, sha: f.marker.sha, outcome });
+    expect(readdirSync(f.env.WE_DAEMON_STATE_DIR).some(name => name.endsWith('.tmp') || name.endsWith('.lock'))).toBe(false);
+    recoverQuickSoak({ ...f });
+    expect(f.alerts().at(-1).kind).toBe(`quick-soak-${outcome}`);
+    expect(f.alerts().some(row => row.kind === 'quick-soak-unavailable')).toBe(false);
+  });
+  it('fatal diagnostics upgrade an existing unavailable record and survive a later bare timeout', () => {
+    const f = soakFixture();
+    recordQuickSoakResult({ ...f, outcome: 'unavailable', reason: 'soak-deadline' });
+    let upgraded = false;
+    let resultFile;
+    const io = { write: writeFileSync, link: linkSync, rename: (source, target) => {
+      expect(existsSync(`${target}.lock`)).toBe(true);
+      expect(JSON.parse(readFileSync(target, 'utf8'))).toMatchObject({
+        token: f.marker.token, sha: f.marker.sha, outcome: 'unavailable', reason: 'soak-deadline' });
+      expect(JSON.parse(readFileSync(source, 'utf8'))).toMatchObject({
+        token: f.marker.token, sha: f.marker.sha, outcome: 'unavailable',
+        reason: 'worker-fatal', error: 'completion lock failed' });
+      resultFile = target;
+      upgraded = true;
+      return renameSync(source, target);
+    } };
+    recordQuickSoakResult({ ...f, outcome: 'unavailable', reason: 'worker-fatal', error: 'completion lock failed', io });
+    expect(upgraded).toBe(true);
+    const richer = { token: f.marker.token, sha: f.marker.sha, outcome: 'unavailable',
+      reason: 'worker-fatal', error: 'completion lock failed' };
+    expect(JSON.parse(readFileSync(resultFile, 'utf8'))).toEqual(richer);
+    expect(readRebuildState(f.root, f.env).unverified).toEqual(f.marker);
+    recordQuickSoakResult({ ...f, outcome: 'unavailable', reason: 'soak-deadline' });
+    expect(JSON.parse(readFileSync(resultFile, 'utf8'))).toEqual(richer);
+    expect(readdirSync(f.env.WE_DAEMON_STATE_DIR).some(name => name.endsWith('.tmp') || name.endsWith('.lock'))).toBe(false);
+    recoverQuickSoak({ ...f });
+    expect(f.alerts().at(-1)).toMatchObject({ kind: 'quick-soak-unavailable',
+      detail: { reason: 'worker-fatal', error: 'completion lock failed' } });
+  });
+  it.each(['foreign sha', 'invalid JSON'])('unavailable diagnostic upgrades preserve %s evidence', async mode => {
+    const f = soakFixture();
+    recordQuickSoakResult({ ...f, outcome: 'unavailable', reason: 'soak-deadline' });
+    const dir = f.env.WE_DAEMON_STATE_DIR;
+    const file = join(dir, readdirSync(dir).find(name => name.includes('.quick-soak-') && name.endsWith('.json')));
+    const original = mode === 'invalid JSON' ? '{' : JSON.stringify({
+      token: f.marker.token, sha: 'other', outcome: 'unavailable', reason: 'soak-deadline' });
+    writeFileSync(file, original);
+    vi.mocked(withWriteLock).mockResolvedValueOnce({ ok: false, reason: 'tick-in-progress' });
+    await handleQuickSoakFatal({ ...f, token: f.marker.token, error: new Error('completion lock failed') });
+    expect(readFileSync(file, 'utf8')).toBe(original);
+    expect(readdirSync(dir).some(name => name.endsWith('.tmp') || name.endsWith('.lock'))).toBe(false);
+    recoverQuickSoak({ ...f });
+    expect(f.alerts().at(-1)).toMatchObject({ kind: 'quick-soak-unavailable',
+      detail: { reason: 'worker-dead-missing-or-expired' } });
+    expect(f.alerts().at(-1).detail).not.toHaveProperty('error');
+  });
+  it.each(['passed', 'failed'])('a concurrent %s result survives an unavailable diagnostic upgrade', outcome => {
+    const f = soakFixture();
+    recordQuickSoakResult({ ...f, outcome: 'unavailable', reason: 'soak-deadline' });
+    let interleaved = false;
+    let resultFile;
+    const io = { write: writeFileSync, rename: renameSync, link: (source, target) => {
+      expect(existsSync(`${target}.lock`)).toBe(true);
+      expect(JSON.parse(readFileSync(target, 'utf8'))).toMatchObject({
+        token: f.marker.token, sha: f.marker.sha, outcome: 'unavailable', reason: 'soak-deadline' });
+      expect(JSON.parse(readFileSync(source, 'utf8'))).toMatchObject({
+        token: f.marker.token, sha: f.marker.sha, outcome: 'unavailable',
+        reason: 'worker-fatal', error: 'completion lock failed' });
+      // Publish completed evidence before the EEXIST handler re-reads the old timeout.
+      const competing = `${source}.competing`;
+      writeFileSync(competing, JSON.stringify({ token: f.marker.token, sha: f.marker.sha, outcome }));
+      renameSync(competing, target);
+      resultFile = target;
+      interleaved = true;
+      return linkSync(source, target);
+    } };
+    recordQuickSoakResult({ ...f, outcome: 'unavailable', reason: 'worker-fatal', error: 'completion lock failed', io });
+    expect(interleaved).toBe(true);
+    expect(JSON.parse(readFileSync(resultFile, 'utf8'))).toEqual({ token: f.marker.token, sha: f.marker.sha, outcome });
+    expect(readdirSync(f.env.WE_DAEMON_STATE_DIR).some(name => name.endsWith('.tmp') || name.endsWith('.lock'))).toBe(false);
+    recoverQuickSoak({ ...f });
+    expect(f.alerts().at(-1).kind).toBe(`quick-soak-${outcome}`);
+    expect(f.alerts().some(row => row.kind === 'quick-soak-unavailable')).toBe(false);
+  });
+  it.each(['passed', 'failed'])('completed %s checks supersede a prior unavailable result', outcome => {
+    const f = soakFixture();
+    recordQuickSoakResult({ ...f, outcome: 'unavailable', reason: 'soak-deadline' });
+    recordQuickSoakResult({ ...f, outcome });
+    recoverQuickSoak({ ...f });
+    expect(f.alerts().at(-1).kind).toBe(`quick-soak-${outcome}`);
+    expect(f.alerts().some(row => row.kind === 'quick-soak-unavailable')).toBe(false);
+  });
+  it.each(['token', 'sha'])('fatal recovery rejects a durable result for a mismatched %s', field => {
+    const f = soakFixture();
+    recordQuickSoakResult({ ...f, marker: { ...f.marker, [field]: 'other' }, outcome: 'passed' });
+    return handleQuickSoakFatal({ ...f, token: f.marker.token, error: new Error('settle failed') }).then(() => {
+      // A mismatched sha occupies the same token's path: no-clobber preserves it, and
+      // recovery must reject that evidence and take the dead-worker fallback.
+      expect(f.alerts().at(-1)).toMatchObject({ kind: 'quick-soak-unavailable',
+        detail: field === 'sha' ? { reason: 'worker-dead-missing-or-expired' }
+          : { reason: 'worker-fatal', error: 'settle failed' } });
+      if (field === 'sha') expect(f.alerts().at(-1).detail).not.toHaveProperty('error');
+      expect(f.alerts().some(row => row.kind === 'quick-soak-passed')).toBe(false);
+      expect(readRebuildState(f.root, f.env).adopted).toEqual(f.marker.lastGood);
+    });
+  });
+  it('worker completion-lock failure retains passed checks for fatal recovery', async () => {
+    const f = soakFixture();
+    const smoke = vi.fn(async () => ({ pass: true, results: QUICK_SOAK_CHECKS.map(name => ({ name, ok: true })) }));
+    vi.mocked(withWriteLock).mockRejectedValueOnce(new Error('completion lock failed'));
+    await expect(runQuickSoak({ ...f, smoke })).rejects.toThrow('completion lock failed');
+    await handleQuickSoakFatal({ ...f, token: f.marker.token, error: new Error('completion lock failed') });
+    expect(smoke).toHaveBeenCalledOnce();
+    expect(f.alerts().at(-1).kind).toBe('quick-soak-passed');
+    expect(f.run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+  });
+  it('fatal handler preserves a newer adoption installed during write-lock acquisition', async () => {
+    const f = soakFixture();
+    const replacement = { ...f.marker, token: 'new-adoption', sha: 'c'.repeat(40), head: 'c'.repeat(40), pid: 123 };
+    let expected;
+    vi.mocked(withWriteLock).mockImplementationOnce(async (_root, recover) => {
+      // The old worker passed its pre-lock check before another writer installed this adoption.
+      writeRebuildState(f.root, { ...f.state, unverified: replacement,
+        adopted: { ...f.state.adopted, head: replacement.sha } }, f.env);
+      expected = readRebuildState(f.root, f.env);
+      return { ok: true, value: await recover() };
+    });
+    await handleQuickSoakFatal({ ...f, token: f.marker.token, error: new Error('late fatal') });
+    expect(withWriteLock).toHaveBeenCalledOnce();
+    expect(expected.unverified).toEqual(replacement);
+    expect(readRebuildState(f.root, f.env)).toEqual(expected);
+    expect(f.run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+    expect(f.run).not.toHaveBeenCalled();
+  });
+  it('fatal handler cannot settle a different adoption token', async () => {
+    const f = soakFixture();
+    await handleQuickSoakFatal({ ...f, token: 'old-token', error: new Error('late') });
+    expect(readRebuildState(f.root, f.env).unverified).toEqual(f.marker);
+    expect(f.run).not.toHaveBeenCalled();
   });
   it('recovers a durable completed result even if the worker could not acquire the final lock', () => {
     const f = soakFixture();
@@ -750,6 +1088,16 @@ async function expectDependencyFullSmoke(f) {
   expect(options.log.error).toHaveBeenCalledWith(expect.stringContaining('daemon-rebuild: quick=off reason=protected'));
   expect(readReadyCandidate(f.root, f.env)).toMatchObject({ adopt: { finalSha: f.plan.finalSha } });
   expect(readReadyCandidate(f.root, f.env)).not.toHaveProperty('quick');
+}
+
+async function expectDependencyQuickSmoke(f) {
+  const options = smokeOptions(f);
+  const runSmoke = vi.fn(async () => passed());
+  await smokeAndAdopt({ ...options, runSmoke });
+  expect(runSmoke).toHaveBeenCalledOnce();
+  expect(runSmoke.mock.calls[0][0]).toMatchObject({ singleAttempt: true, deferredChecks: QUICK_DEFERRED_CHECKS });
+  expect(options.log.error).toHaveBeenCalledWith(expect.stringContaining('daemon-rebuild: quick=on reason='));
+  expect(readReadyCandidate(f.root, f.env)).toMatchObject({ quick: true, adopt: { finalSha: f.plan.finalSha } });
 }
 
 describe('quick mode through the existing candidate/adoption pipeline', () => {

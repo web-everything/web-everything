@@ -198,17 +198,42 @@ export async function prepareRebuild({
   }
 
   if (state.quarantine?.reason?.startsWith('quick-soak-')) {
+    const quarantine = state.quarantine;
+    const head = verifyRev(git, 'HEAD');
+    const alreadyAtLastGood = !!head && head === quarantine.prevHead;
     // Settlement may already have refused this rollback. Never retry through the weaker legacy reset:
     // ignored files and ancestor-path obstructions need the same guard on every recovery tick.
-    const rollback = rollbackQuick(state.quarantine.prevHead, state.quarantine.failedHead);
+    // A verified last-good HEAD needs no reset or adoption identity (including legacy records).
+    let rollback;
+    if (alreadyAtLastGood) {
+      try {
+        const status = git(['status', '--porcelain', '--untracked-files=no']);
+        rollback = status.status !== 0 ? { ok: false, reason: 'status-failed' }
+          : String(status.stdout ?? '').trim() ? { ok: false, reason: 'dirty' } : { ok: true };
+      } catch { rollback = { ok: false, reason: 'status-failed' }; }
+    } else {
+      rollback = rollbackQuick(quarantine.prevHead, quarantine.failedHead);
+    }
     if (!rollback.ok) {
-      reportQuickSoakNeedsYou({ root, env: stEnv, log, detail: {
-        lastGood: state.quarantine.prevHead, reason: state.quarantine.reason, rollback,
-      } });
+      const pageKey = JSON.stringify([quarantine.prevHead, rollback.reason]);
+      const lastPagedMs = Date.parse(quarantine.lastPagedAt ?? '');
+      const time = nowMs();
+      if (quarantine.lastPagedKey !== pageKey || !Number.isFinite(lastPagedMs)
+        || time - lastPagedMs >= 30 * 60_000) {
+        quarantine.lastPagedAt = new Date(time).toISOString();
+        quarantine.lastPagedKey = pageKey;
+        writeState();
+        reportQuickSoakNeedsYou({ root, env: stEnv, log, detail: {
+          lastGood: quarantine.prevHead, reason: quarantine.reason, rollback,
+        } });
+      }
       return terminal({ moved: false, reason: 'quarantined' });
     }
     state.quarantine = null;
     writeState();
+    if (alreadyAtLastGood) alert('quick-soak-quarantine-cleared', {
+      prevHead: quarantine.prevHead, via: 'already-at-last-good',
+    });
   }
   if (state.quarantine) {
     // Same definition of "clean" as findUnsafeLocalState: tracked changes only (an untracked sidecar must never

@@ -40,7 +40,7 @@ export const FAILURE_REASONS = new Set([
   'rev-parse-failed', 'rollback-failed', 'save-failed', 'scratch-init-failed',
   'smoke-failed', 'smoke-harness-broken', 'smoke-rejected', 'smoke-retry',
   'smoke-reused-env-failed', 'smoke-threw', 'state-file-unparsable', 'state-file-unreadable',
-  'status-failed', 'status-unreadable', 'still-rejected', 'swap-failed', 'switch-failed',
+  'status-failed', 'untracked-list-failed', 'target-list-failed', 'status-unreadable', 'still-rejected', 'swap-failed', 'switch-failed',
   'worktree-add-failed', 'error',
 ]);
 

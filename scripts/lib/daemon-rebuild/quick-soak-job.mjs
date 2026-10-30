@@ -6,13 +6,14 @@
 import { spawn } from 'node:child_process';
 import { setTimeout as pauseFor } from 'node:timers/promises';
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { hostname } from 'node:os';
 import { cloneKey, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { withReadLock, withWriteLock } from '../daemon-clone-lock.mjs';
 import { runLiveSmoke, rollbackToSha } from '../daemon-live-smoke.mjs';
+import { redactDiagnosticLine } from './smoke-classify/redact-detail.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { runBounded, installChildReaper } from '../bounded-child.mjs';
 import { alertsFilePath, stateDir, readRebuildState, writeRebuildState } from './state.mjs';
@@ -23,6 +24,7 @@ import { createJobStore, enqueueJob, launchJob, probeHandle, readProcStart, reat
 import { daemonJobsDir } from '../../operations/run-store.mjs';
 import { formatJobHandle, TERMINAL_JOB_STATUSES } from '../../operations/job-record.mjs';
 import { cloneNodeModulesInstaller } from './rebuild-job.mjs';
+import { withFileLock } from '../atomic-json-file.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 export const QUICK_SOAK_JOB_KIND = defineJobKind({
@@ -74,7 +76,7 @@ function finishAttempt({ root, env, marker, outcome, now }) {
 }
 
 /** Caller holds the write lock. A mismatched token can never settle or roll back a newer adoption. */
-export function settleQuickSoak({ root, env = process.env, marker, outcome, reason, run = gitRun, log = console, now = Date.now }) {
+export function settleQuickSoak({ root, env = process.env, marker, outcome, reason, error, run = gitRun, log = console, now = Date.now }) {
   const state = readRebuildState(root, env);
   if (!same(state.unverified, marker)) return { settled: false };
   marker = state.unverified;
@@ -98,7 +100,7 @@ export function settleQuickSoak({ root, env = process.env, marker, outcome, reas
     state.unverified = retry;
     writeRebuildState(root, state, env);
     finishAttempt({ root, env, marker, outcome, now });
-    alert(root, env, 'quick-soak-retry', { sha: marker.sha, attempts: attemptsOf(marker), reason: retry.lastSoakReason }, log);
+    alert(root, env, 'quick-soak-retry', { sha: marker.sha, attempts: attemptsOf(marker), reason: retry.lastSoakReason, ...(error ? { error } : {}) }, log);
     return { settled: false, pending: true, retry: true };
   } else if (outcome !== 'passed') {
     try { rollback = rollbackToSha({ root, sha: marker.prevHead, run, ignoreUntracked: true }); }
@@ -121,20 +123,75 @@ export function settleQuickSoak({ root, env = process.env, marker, outcome, reas
   finishAttempt({ root, env, marker, outcome, now });
   if (outcome === 'unavailable' || rollback?.ok === false) {
     reportQuickSoakNeedsYou({ root, env, log, detail: { sha: marker.sha, lastGood: marker.prevHead,
-      attempts: attemptsOf(marker), reason: reason ?? `quick-soak-${outcome}`, rollback } });
+      attempts: attemptsOf(marker), reason: reason ?? `quick-soak-${outcome}`, rollback, ...(error ? { error } : {}) } });
   }
   alert(root, env, `quick-soak-${outcome}`, { sha: marker.sha, lastGood: marker.prevHead,
-    ...(reason ? { reason } : {}), ...(rollback ? { rollback } : {}) }, log);
+    ...(reason ? { reason } : {}), ...(error ? { error } : {}), ...(rollback ? { rollback } : {}) }, log);
   return { settled: true, outcome, rollback };
 }
 
 /** Atomic result handoff, outside the live tree. Consumers require the adoption's token AND sha. */
-export function recordQuickSoakResult({ root, env, marker, outcome, reason }) {
+export function recordQuickSoakResult({ root, env, marker, outcome, reason, error,
+  io = { link: linkSync, rename: renameSync, write: writeFileSync } }) {
+  // A launcher/watchdog failure is weaker evidence than checks that already completed.
+  if (outcome === 'unavailable') {
+    const recorded = readQuickSoakResult(root, env, marker);
+    if (recorded?.outcome === 'passed' || recorded?.outcome === 'failed') return;
+  }
   const file = resultPath(root, env, marker);
   mkdirSync(dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify({ token: marker.token, sha: marker.sha, outcome, reason }));
-  renameSync(tmp, file);
+  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    io.write(tmp, JSON.stringify({ token: marker.token, sha: marker.sha, outcome, reason, ...(error ? { error } : {}) }), { flag: 'wx' });
+    // Serialize every publisher, including completed checks, so an unavailable upgrade cannot
+    // rename over a completed result between its identity/outcome check and publication.
+    // The shared lock times out loudly; fatal handling / next-tick recovery remains the fallback.
+    withFileLock(`${file}.lock`, () => {
+      if (outcome === 'unavailable') {
+        try { io.link(tmp, file); }
+        catch (publishError) {
+          if (publishError.code !== 'EEXIST') throw publishError;
+          const recorded = readQuickSoakResult(root, env, marker);
+          // Unknown, corrupt or foreign evidence is never replaceable. Only richer diagnostic
+          // evidence may upgrade an unavailable record; a later bare timeout must not erase it.
+          if (recorded?.outcome === 'unavailable' && error) io.rename(tmp, file);
+        }
+      } else {
+        // Completed checks may atomically supersede an earlier unavailable result.
+        io.rename(tmp, file);
+      }
+    });
+  } finally {
+    try { unlinkSync(tmp); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+}
+
+function readQuickSoakResult(root, env, marker) {
+  try {
+    const result = JSON.parse(readFileSync(resultPath(root, env, marker), 'utf8'));
+    if (result?.token === marker.token && result.sha === marker.sha
+      && ['passed', 'failed', 'unavailable'].includes(result.outcome)) return result;
+  } catch { /* missing or invalid evidence cannot certify a soak */ }
+  return null;
+}
+
+/** Both launcher and worker fatal paths preserve completed evidence before recording unavailability. */
+export async function handleQuickSoakFatal({ root, token, error, env = process.env, run = gitRun, log = console }) {
+  const pending = readRebuildState(root, env).unverified;
+  if (!pending?.quick || pending.token !== token) return;
+  const result = readQuickSoakResult(root, env, pending);
+  if (!result || result.outcome === 'unavailable') {
+    recordQuickSoakResult({ root, env, marker: pending, outcome: 'unavailable', reason: 'worker-fatal',
+      error: redactDiagnosticLine(error?.message ?? error) });
+  }
+  // Recovery re-reads the token and durable evidence under the lock. If locking fails, the next tick
+  // consumes the same result, including the diagnostic, rather than losing it in this process.
+  return withWriteLock(root, () => {
+    const state = readRebuildState(root, env);
+    if (!same(state.unverified, pending)) return;
+    return recoverQuickSoak({ root, env, state, run, log, pidAlive: () => false });
+  }, lockOptions(env));
 }
 
 const alive = marker => {
@@ -150,14 +207,14 @@ export function recoverQuickSoak({ root, env, state = readRebuildState(root, env
   if (marker.retryPending && withinDeadline(marker, now()) && attemptsOf(marker) < QUICK_SOAK_MAX_ATTEMPTS) {
     return { pending: true, retry: true };
   }
-  let result;
-  try { result = JSON.parse(readFileSync(resultPath(root, env, marker), 'utf8')); } catch { /* no completed evidence */ }
+  const result = readQuickSoakResult(root, env, marker);
   const nowMs = now();
   let workerAlive = false;
   try { workerAlive = Number.isSafeInteger(marker.pid) && marker.pid > 0 && pidAlive(marker) === true; } catch { /* unknown = unavailable */ }
   if (result?.token === marker.token && result.sha === marker.sha && ['passed', 'failed', 'unavailable'].includes(result.outcome)) {
     settleQuickSoak({ root, env, marker, outcome: result.outcome,
-      reason: result.outcome === 'unavailable' ? result.reason ?? 'soak-could-not-run' : undefined, run, log, now });
+      reason: result.outcome === 'unavailable' ? result.reason ?? 'soak-could-not-run' : undefined,
+      ...(result.error ? { error: redactDiagnosticLine(result.error) } : {}), run, log, now });
   } else if (workerAlive && withinDeadline(marker, nowMs)) {
     return { pending: true };
   } else {
@@ -274,7 +331,7 @@ async function launchPinnedSoak({ root, token, jobId, env = process.env }) {
   const marker = readRebuildState(root, env).unverified;
   if (marker?.quick && marker.token === token) {
     // A worker may have persisted its result but failed its completion lock. Consume that evidence first.
-    if (!launched || !child) recordQuickSoakResult({ root, env, marker, outcome: 'unavailable', reason: 'worker-launch-failed' });
+    if ((!launched || !child) && !readQuickSoakResult(root, env, marker)) recordQuickSoakResult({ root, env, marker, outcome: 'unavailable', reason: 'worker-launch-failed' });
     await withWriteLock(root, () => recoverQuickSoak({ root, env, pidAlive: () => false }), lockOptions(env));
   }
 }
@@ -302,14 +359,9 @@ if (process.argv[1] && resolve(process.argv[1]) === SELF) {
       for (const key of ['DAEMON_JOB_ID', 'DAEMON_JOB_ATTEMPT', 'DAEMON_JOB_HEARTBEAT_MS', 'OPERATION_RUNS_DIR']) delete smokeEnv[key];
       return runQuickSoak({ root, token, env: smokeEnv });
     } }] });
-  work.catch(async () => {
-    try {
-      const pending = readRebuildState(root).unverified;
-      if (pending?.quick && pending.token === token) {
-        recordQuickSoakResult({ root, env: process.env, marker: pending, outcome: 'unavailable', reason: 'worker-fatal' });
-        await withWriteLock(root, () => settleQuickSoak({ root, marker: pending, outcome: 'unavailable', reason: 'worker-fatal' }), lockOptions(process.env));
-      }
-    } catch { /* the next tick sees the dead PID and recovers under its write lock */ }
+  work.catch(async error => {
+    try { await handleQuickSoakFatal({ root, token, error }); }
+    catch { /* the next tick consumes durable evidence under its write lock */ }
     process.exitCode = 1;
   }).finally(() => clearTimeout(watchdog));
 }

@@ -13,3 +13,10 @@ export function redactDetail(detail, checkName) {
   return String(detail ?? '').replace(/\b(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/g, '$1<redacted>')
     .slice(0, SUMMARY_DETAILS.has(checkName) ? SUMMARY_DETAIL_MAX : 500);
 }
+
+/** First-line diagnostic for operator alerts: no host paths, tokens or terminal controls. */
+export function redactDiagnosticLine(value) {
+  return redactDetail(String(value ?? '').split(/[\r\n\u2028\u2029]/, 1)[0]
+    .replace(/(?:[A-Za-z]:[\\/]|\/)[^\s'"<>]*/g, '<path>')
+    .replace(/[\x00-\x1f\x7f-\x9f]/g, '')).slice(0, 300);
+}
