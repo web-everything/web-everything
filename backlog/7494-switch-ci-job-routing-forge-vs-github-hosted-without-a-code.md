@@ -1,15 +1,16 @@
 ---
+bornAs: xjp6t9m
 kind: story
 size: 5
 status: open
-scope: ["we:.github/workflows/", "we:scripts/readiness/"]
+scope: ["we:.github/workflows/", "we:scripts/operations/"]
 dateOpened: "2026-10-29"
 tags: []
 ---
 
-# CI placement gate: a PR that moves jobs to new runners needs one green run of the real jobs there before merge
+# Switch CI job routing (Forge vs GitHub-hosted) without a code deploy
 
-#6003 moved unit shards onto hetzner-we and merged although every hetzner job died at startup (EACCES), so no test ever ran on Forge; 11 env-dependent failures surfaced only after #6064/#6067. A job-placement change (runs-on / runner-group edits in we:.github/workflows/) must carry a green run of the moved jobs on its own head on the target runners; a job that fails before running tests must block, not pass silently.
+Operator 2026-10-29 16:29 ET: expose a switch so merge-queue and push CI routing can change without a PR. Proposal: runs-on reads a repo variable per job group (unit shards, integration, merge queue) with GitHub-hosted fallback, flipped by a policy-cascade-backed CLI with an audit log; doubles as the rollback for the placement gate.
 
 ## Acceptance
 

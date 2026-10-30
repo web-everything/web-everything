@@ -1,15 +1,16 @@
 ---
+bornAs: xsh72w5
 kind: story
-size: 3
+size: 5
 status: open
-scope: ["we:scripts/", "we:.github/workflows/"]
+scope: ["we:.github/workflows/", "we:scripts/readiness/"]
 dateOpened: "2026-10-29"
 tags: []
 ---
 
-# Break-glass on workflow files must pass actionlint first
+# CI placement gate: a PR that moves jobs to new runners needs one green run of the real jobs there before merge
 
-#6064 was break-glass merged with an invalid runner context in job-level env, which broke every CI run (workflow file issue) until hotfix #6067. Break-glass skips CI, so nothing validated the workflow. Any merge path, including break-glass, that touches we:.github/workflows/ must run actionlint on the head and refuse on errors.
+#6003 moved unit shards onto hetzner-we and merged although every hetzner job died at startup (EACCES), so no test ever ran on Forge; 11 env-dependent failures surfaced only after #6064/#6067. A job-placement change (runs-on / runner-group edits in we:.github/workflows/) must carry a green run of the moved jobs on its own head on the target runners; a job that fails before running tests must block, not pass silently.
 
 ## Acceptance
 

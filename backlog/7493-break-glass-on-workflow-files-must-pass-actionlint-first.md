@@ -1,15 +1,16 @@
 ---
+bornAs: x2kxqkz
 kind: story
-size: 5
+size: 3
 status: open
-scope: ["we:.github/workflows/", "we:scripts/operations/"]
+scope: ["we:scripts/", "we:.github/workflows/"]
 dateOpened: "2026-10-29"
 tags: []
 ---
 
-# Switch CI job routing (Forge vs GitHub-hosted) without a code deploy
+# Break-glass on workflow files must pass actionlint first
 
-Operator 2026-10-29 16:29 ET: expose a switch so merge-queue and push CI routing can change without a PR. Proposal: runs-on reads a repo variable per job group (unit shards, integration, merge queue) with GitHub-hosted fallback, flipped by a policy-cascade-backed CLI with an audit log; doubles as the rollback for the placement gate.
+#6064 was break-glass merged with an invalid runner context in job-level env, which broke every CI run (workflow file issue) until hotfix #6067. Break-glass skips CI, so nothing validated the workflow. Any merge path, including break-glass, that touches we:.github/workflows/ must run actionlint on the head and refuse on errors.
 
 ## Acceptance
 
