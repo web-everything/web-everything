@@ -527,7 +527,10 @@ Production recovery has two slots per head across three exclusive marker files:
 either marker 2 or no-restart consumes slot 2. All three together exceed the cap and fail closed.
 An existing marker 1 spends only the first attempt; `staleRedTeamSpent` means both slots are spent.
 The second abandonment requires a stale running owner with no result, absent/zero `retryCount`,
-and a parseable `pidStart` strictly later than marker 1's mtime. It waits at least
+and a parseable `pidStart` at or after marker 1's mtime rounded down to the second,
+matching `ps lstart` precision. **recognises a dead same-second replacement and plans attempt 2 with marker %s**
+pins both fractional and whole-second marker mtimes; **refuses a dead previous-second replacement with a millisecond marker without spending attempt 2**
+pins the earlier-second refusal through the planner and abandonment check. It waits at least
 `STALE_REDISPATCH_BACKOFF_MS` (15 minutes) from that mtime, independently of the retry cooldown.
 The abandonment function rechecks these conditions against disk and emits `detail.attempt`.
 Immediately before writing it also refuses changed status bytes or changed claim markers, releasing

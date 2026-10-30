@@ -137,9 +137,11 @@ function claimStaleNoRestart({ count, ...key }) {
 
 function isRedispatchedRun(status, firstMarkerMtimeMs) {
   const started = parsePidStart(status?.pidStart);
+  // ps lstart has second precision; a replacement may start in the marker's second.
   return status?.status === 'running' && status.result == null
     && (status.retryCount === undefined || status.retryCount === 0)
-    && Number.isFinite(started) && Number.isFinite(firstMarkerMtimeMs) && started > firstMarkerMtimeMs;
+    && Number.isFinite(started) && Number.isFinite(firstMarkerMtimeMs)
+    && started >= Math.floor(firstMarkerMtimeMs / 1000) * 1000;
 }
 
 /** The exclusive-create marker spends recovery; the re-read is a best-effort recheck, not an atomic lock.

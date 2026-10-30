@@ -2638,6 +2638,34 @@ describe('stale red-team recovery — bounded second re-dispatch', () => {
   it('exports the fifteen-minute backoff', () => {
     expect(staleRecovery.STALE_REDISPATCH_BACKOFF_MS).toBe(backoff);
   });
+  it.each(['2026-10-28T12:00:00.100Z', '2026-10-28T12:00:00.000Z'])(
+    'recognises a dead same-second replacement and plans attempt 2 with marker %s', markerTime => {
+      withRedispatch(({ options, marker1, marker2, events }) => {
+        const markerAt = new Date(markerTime);
+        utimesSync(marker1, markerAt, markerAt);
+        options.now = () => Date.parse('2026-10-28T12:31:00Z');
+        expect(runRedTeamOnSkip(options)).toMatchObject({ rows: [{ action: 'dispatch', abandonStale: true }],
+          dispatched: [{ prNumber: pr, jobPid: 42 }] });
+        expect(options.abandonStale).toHaveBeenCalledOnce();
+        expect(options.dispatch).toHaveBeenCalledOnce();
+        expect(existsSync(marker2)).toBe(true);
+        expect(events()[1]).toMatchObject({ kind: 'red-team-stale-run-abandoned', detail: { attempt: 2 } });
+      }, { status: { pidStart: 'Wed Oct 28 12:00:00 2026 GMT', result: null } });
+    });
+  it('refuses a dead previous-second replacement with a millisecond marker without spending attempt 2', () => {
+    withRedispatch(({ options, input, marker1, marker2, events }) => {
+      const markerAt = new Date('2026-10-28T12:00:00.100Z');
+      const now = Date.parse('2026-10-28T12:31:00Z');
+      utimesSync(marker1, markerAt, markerAt);
+      options.now = () => now;
+      expect(runRedTeamOnSkip(options).rows[0].action).toBe('skip');
+      expect(options.dispatch).not.toHaveBeenCalled();
+      expect(options.abandonStale).not.toHaveBeenCalled();
+      expect(staleRecovery.abandonStaleRedTeamRun({ ...input, now })).toEqual({ ok: false });
+      expect(existsSync(marker2)).toBe(false);
+      expect(events()).toHaveLength(1);
+    }, { status: { pidStart: 'Wed Oct 28 11:59:59 2026 GMT', result: null } });
+  });
   it.each([null, undefined].flatMap(result => [0, undefined].map(retryCount => ({ result, retryCount }))))(
     'dead replacement after marker 1 abandons and dispatches attempt 2 after backoff: %j', status => {
       withRedispatch(({ key, options, statusPath, marker1, marker2, markerAt, events }) => {
@@ -2672,7 +2700,6 @@ describe('stale red-team recovery — bounded second re-dispatch', () => {
   it.each([
     ['backoff', {}, backoff - 1, 'stale red team re-dispatch backoff'],
     ['row before marker 1', { pidStart: new Date(staleNow - backoff - 1).toISOString() }, backoff],
-    ['row at marker 1', { pidStart: new Date(staleNow - backoff).toISOString() }, backoff],
     ['unknown start', { pidStart: undefined }, backoff],
     ['invalid start', { pidStart: 'unparseable' }, backoff],
     ['spent retry', { retryCount: 1 }, backoff],
