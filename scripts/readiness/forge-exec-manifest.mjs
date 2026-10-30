@@ -63,7 +63,7 @@ export const digestManifest = manifest => sha(JSON.stringify(manifest));
 
 // This exclusion policy is part of the manifest, never an independent rsync
 // filter. Test-shaped names under excluded components refuse remote admission.
-const safeDotDirectory = /^(?:\.github|\.husky|\.vscode|\.storybook|\.changeset)$/;
+const safeDotDirectory = /^(?:\.github|\.githooks|\.husky|\.vscode|\.storybook|\.changeset)$/;
 const safeDotFile = /^(?:\.gitignore|\.gitattributes|\.editorconfig|\.nvmrc|\.node-version|\.prettierrc.*|\.eslintrc.*|\.gitkeep|\.nycrc.*)$/;
 const keyComponent = /(?:_rsa|\.(?:pem|key|p12|pfx|jks|keystore)$)/;
 const credentialComponent = /token|secret|creds|credential|passwd|password|oauth|apikey|api-key|^id_/;

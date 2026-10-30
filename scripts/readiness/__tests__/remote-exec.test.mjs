@@ -1595,7 +1595,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
   const treeRecord = (name, data) => Buffer.from(`100644 blob ${blob(data)}\t${name}\0`);
 
   it.each([
-    '.claude/skills/x/SKILL.md', '.githooks/pre-commit.js', '.eleventy.js',
+    '.claude/skills/x/SKILL.md', '.eleventy.js',
     '.claude/secrets.md', '.secret.js', 'secret-directory/.hidden.md',
     'private.key/safe.md', 'secret.key/safe.js', '.env.local.js',
     '.netrc/safe.md', '.npmrc/safe.js',
@@ -1613,6 +1613,15 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     expect(await runRemote({argv, cwd, runId, exec})).toEqual({mode:'remote', code:0});
     expect(callsOf(exec).find(call => call.file === 'rsync').input).toEqual(Buffer.from('./package-lock.json\0'));
     expect(JSON.parse(callsOf(exec).find(isRun).input).manifest).toEqual(wire(manifest));
+  });
+
+  it('keeps .githooks in the remote snapshot so remote check:standards sees hook files', async () => {
+    const name = '.githooks/pre-commit';
+    mkdirSync(join(cwd, '.githooks'), {recursive:true});
+    writeFileSync(join(cwd, name), '#!/bin/sh\n');
+    const manifest = await build({cwd, exec:gitInventory(['package-lock.json', name].map(value => Buffer.from(value)))});
+    expect(manifest.entries.map(entry => entry.path.toString())).toContain(name);
+    expect(manifest.excluded.map(entry => entry.toString())).not.toContain(name);
   });
 
   it.each(['.claude/skills/x/SKILL.test.md', '.eleventy.test.js', '.claude/secrets.test.js', 'private.key/safe.test.js'])
