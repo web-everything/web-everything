@@ -2839,8 +2839,13 @@ and `probe` (positive-evidence tri-state checks). UID remains a captured filter,
 a key for `probe`; legacy `liveness` and `sameIdentity` retain their UID comparison.
 Live-process fixtures must supply Linux cmdline and namespace links as well as stat/status.
 For an exited Linux leader, `probe` uses stat plus a bounded task census without reading
-the namespace link (which can disappear at exit): all exited tasks prove dead; any live
-task yields `unknown` with `zombie-leader-live-tasks`. `record` still requires the namespace
+the namespace link (which can disappear at exit): all exited tasks plus an unchanged
+task-ID set in a final census prove dead; any live task yields `unknown` with
+`zombie-leader-live-tasks`. Changed, duplicate, unreadable, incomplete or over-budget
+censuses yield `unknown` with `evidence-unavailable`; retry or inspect manually.
+Race fixtures must include a worker spawning a live successor before its own stat is
+read as Z/X/x, and a same-count task replacement. Reordering an unchanged set must
+still permit dead. `record` still requires the namespace
 link to capture a complete identity. Model removed evidence with a read error, not
 an empty successful output or ENOENT: those can be positive absence evidence. Exhaustive
 subset tests cover both absence and exited-task death as well as live and reused keys.

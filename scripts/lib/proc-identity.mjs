@@ -359,6 +359,8 @@ function exitedTasks(pid, io) {
   if (!Array.isArray(names) || !names.length || names.length > MAX_ENTRIES) {
     throw new Error('Incomplete task census; retry or inspect manually');
   }
+  const taskIds = new Set(names);
+  if (taskIds.size !== names.length) throw new Error('Duplicate task id');
   const deadline = Date.now() + TIMEOUT;
   for (const name of names) {
     if (Date.now() >= deadline) throw new Error('Task scan timed out; retry or inspect manually');
@@ -371,6 +373,15 @@ function exitedTasks(pid, io) {
     if (!exited(linuxStat(Number(name), taskIo).state)) {
       return triState('unknown', 'zombie-leader-live-tasks');
     }
+  }
+  // A worker can create a successor and then exit after the initial census.
+  // All sampled tasks being Z/X is only exit evidence if membership is stable
+  // after those reads. Fail closed on changes or an unavailable final census.
+  const finalNames = io.readdir(`/proc/${pid}/task`);
+  if (!Array.isArray(finalNames) || finalNames.length !== taskIds.size ||
+      new Set(finalNames).size !== taskIds.size || finalNames.some((name) => !taskIds.has(name)) ||
+      Date.now() >= deadline) {
+    throw new Error('Task census changed or incomplete; retry or inspect manually');
   }
   return triState('dead', 'exited');
 }

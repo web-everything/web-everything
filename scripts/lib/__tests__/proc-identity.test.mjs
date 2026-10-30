@@ -956,6 +956,76 @@ describe('single-pid tri-state probe', () => {
     expect(probe(linuxIdentity, singleDeps('linux', { processes: [{ pid: PID, state }] })))
       .toEqual(outcome('dead', 'exited'));
   });
+  it.each(['Z', 'X', 'x'])('a worker spawning a successor before exiting to %s cannot prove process exit', (state) => {
+    const deps = singleDeps();
+    const captured = record(PID, deps);
+    expect(captured.ok).toBe(true);
+    replaceRead(deps, `/proc/${PID}/stat`, () => stat({ state: 'Z' }));
+    replaceRead(deps, `/task/${PID}/stat`, () => stat({ state: 'Z' }));
+    let spawned = false;
+    deps.readdir = vi.fn(() => spawned
+      ? [String(PID), String(PID + 1), String(PID + 2)]
+      : [String(PID), String(PID + 1)]);
+    replaceRead(deps, `/task/${PID + 1}/stat`, () => {
+      spawned = true; // The old worker is retained as a zombie after creating its successor.
+      return stat({ pid: PID + 1, state });
+    });
+    replaceRead(deps, `/task/${PID + 2}/stat`, () => stat({ pid: PID + 2, state: 'S' }));
+    expect(probe(captured.identity, deps)).toEqual(outcome('unknown', 'evidence-unavailable'));
+    expect(deps.readdir).toHaveBeenCalledTimes(2);
+    expect(deps.readdir()).toEqual([String(PID), String(PID + 1), String(PID + 2)]);
+    expect(deps.readFile(`/proc/${PID}/task/${PID + 2}/stat`)).toBe(stat({ pid: PID + 2, state: 'S' }));
+  });
+  it.each([
+    ['same-count replacement', [String(PID), String(PID + 2)]],
+    ['removed task', [String(PID)]],
+    ['empty', []],
+    ['malformed', [String(PID), 'bad']],
+    ['duplicate', [String(PID), String(PID)]],
+    ['non-array', null],
+    ['oversized', Array(65537).fill(String(PID))],
+  ])('a %s final task census stays unknown', (_kind, finalNames) => {
+    const deps = singleDeps('linux', { processes: [{ pid: PID, state: 'Z' }] });
+    replaceRead(deps, `/task/${PID + 1}/stat`, () => stat({ pid: PID + 1, state: 'Z' }));
+    deps.readdir = vi.fn()
+      .mockReturnValueOnce([String(PID), String(PID + 1)])
+      .mockReturnValue(finalNames);
+    expect(probe(linuxIdentity, deps)).toEqual(outcome('unknown', 'evidence-unavailable'));
+  });
+  it.each(['ENOENT', 'ESRCH', 'EACCES', 'EPERM'])('a final task census failing with %s stays unknown', (code) => {
+    const deps = singleDeps('linux', { processes: [{ pid: PID, state: 'Z' }] });
+    deps.readdir = vi.fn().mockReturnValueOnce([String(PID)]).mockImplementation(() => {
+      throw Object.assign(new Error('final census unavailable'), { code });
+    });
+    expect(probe(linuxIdentity, deps)).toEqual(outcome('unknown', 'evidence-unavailable'));
+  });
+  it('an unchanged task set in a different order still proves exit', () => {
+    const deps = singleDeps('linux', { processes: [{ pid: PID, state: 'Z' }] });
+    replaceRead(deps, `/task/${PID + 1}/stat`, () => stat({ pid: PID + 1, state: 'Z' }));
+    deps.readdir = vi.fn()
+      .mockReturnValueOnce([String(PID), String(PID + 1)])
+      .mockReturnValue([String(PID + 1), String(PID)]);
+    expect(probe(linuxIdentity, deps)).toEqual(outcome('dead', 'exited'));
+    expect(deps.readdir).toHaveBeenCalledTimes(2);
+  });
+  it('duplicate initial task IDs cannot establish a complete census', () => {
+    const deps = singleDeps('linux', { processes: [{ pid: PID, state: 'Z' }] });
+    deps.readdir = () => [String(PID), String(PID)];
+    expect(probe(linuxIdentity, deps)).toEqual(outcome('unknown', 'evidence-unavailable'));
+  });
+  it('a stable final task census exceeding the scan deadline stays unknown', () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(0);
+    try {
+      const deps = singleDeps('linux', { processes: [{ pid: PID, state: 'Z' }] });
+      deps.readdir = vi.fn().mockReturnValueOnce([String(PID)]).mockImplementation(() => {
+        clock.mockReturnValue(2000);
+        return [String(PID)];
+      });
+      expect(probe(linuxIdentity, deps)).toEqual(outcome('unknown', 'evidence-unavailable'));
+    } finally {
+      clock.mockRestore();
+    }
+  });
   it.each(['ENOENT', 'EACCES', 'EPERM'])('zombie namespace link %s with all-Z tasks is dead', (code) => {
     const deps = singleDeps('linux', { processes: [{ pid: PID, state: 'Z' }] });
     deps.readlink = vi.fn(() => { throw Object.assign(new Error('namespace unavailable'), { code }); });
