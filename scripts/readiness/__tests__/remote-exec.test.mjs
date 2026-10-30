@@ -1,19 +1,37 @@
 // @vitest-environment node
 /** @file Contract and execution tests for the Forge remote runner. */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { constants, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, symlinkSync, statSync, readdirSync } from 'node:fs';
+import { constants, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, symlinkSync, statSync, readdirSync, renameSync, cpSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import * as filesystem from 'node:fs/promises';
 import {
   isAllowedCommand, filterEnv, validateRunId,
-  runRemote, main as runRemoteCli, parseArgs,
+  runRemote as timedRunRemote, main as runRemoteCli, parseArgs,
 } from '../remote-exec.mjs';
 import { createRunner, digestInput, digestArgv } from '../forge-exec-run.mjs';
 import * as remoteManifestAPI from '../remote-exec.mjs';
 import * as forgeManifestAPI from '../forge-exec-run.mjs';
 import { adaptLegacyRemoteResult, resolveAdmissionPolicy, runWithRemoteDecision } from '../heavy-admission.mjs';
+import {materializeWorktree} from '../forge-exec-bases.mjs';
+import {scanMaterializedGuards} from './fixtures/forge-git-guards.mjs';
+import {cachedPublicGitExec} from './fixtures/forge-public-git.mjs';
+
+vi.mock('../forge-telemetry.mjs', async importOriginal => {
+  const actual=await importOriginal();
+  const {easternTimestamp}=await import('../forge-exec-run.mjs');
+  return {...actual,readForgeTelemetry:async()=>({sampledAtET:easternTimestamp(Date.now()),
+    cores:8,loadPerCore:0.1,memFreePct:90,activeRuns:0,recent:[]})};
+});
+
+// Retain every exact legacy/security assertion while checking the added result field.
+async function runRemote(options) {
+  const {timings, ...legacy} = await timedRunRemote(options);
+  expect(Array.isArray(timings)).toBe(true);
+  expect(timings.at(-1)).toMatchObject({stage:'total',ms:expect.any(Number),startedAtET:expect.any(String)});
+  return legacy;
+}
 
 const argv = ['npm', 'run', 'test:unit', '--', 'a.test.mjs'];
 const runId = 'abcdef-1';
@@ -47,6 +65,7 @@ function fixture({ probeCode = 0, copyCode = 0, prepareCode = 0, runCode = 0, re
   let state;
   const exec = vi.fn(async (call) => {
     if (call.file === 'git') {
+      if (call.args.join(' ') === 'rev-parse HEAD') return {code:0,stdout:Buffer.from('a'.repeat(40)+'\n')};
       if (call.args.includes('-i')) return {code:0, stdout:Buffer.alloc(0)};
       const files = ['package-lock.json', 'a.test.mjs'];
       const records = call.args.includes('--stage') ? files.map(name => {
@@ -57,16 +76,17 @@ function fixture({ probeCode = 0, copyCode = 0, prepareCode = 0, runCode = 0, re
       return { code: 0, stdout: Buffer.from(records.join('\0') + '\0') };
     }
     if (call.file === 'rsync') return { code: copyCode, stdout: '' };
+    if (call.file === 'ssh' && sshText(call).endsWith(' bases')) return {code:254,stdout:''};
     if (isPrepare(call)) {
       state = JSON.parse(call.input);
       state.run = 'r-' + state.nonce;
-      return { code: prepareCode, stdout: JSON.stringify({run: state.run}) };
+      return { code: prepareCode, stdout: JSON.stringify({run: state.run, capabilities:{siblings:1,commandClasses:1,gitWorktree:2}}) };
     }
     if (isRun(call)) { state = {...state, ...JSON.parse(call.input)}; return {code: runCode, stdout: ''}; }
     if (isReceipt(call)) {
       const value = {v:1, nonce:state.nonce, run:state.run, inputDigest:state.inputDigest,
         argvDigest:state.argvDigest, lock:state.lock, phase:'test', code:runCode};
-      return {code:receiptCode, stdout: typeof receipt === 'function' ? receipt(state.nonce, value, state) : receipt ?? JSON.stringify({...value, manifestDigest:state.manifestDigest})};
+      return {code:receiptCode, stdout: typeof receipt === 'function' ? receipt(state.nonce, value, state) : receipt ?? JSON.stringify({...value, manifestDigest:state.manifestDigest, ...(state.siblingShas ? {siblingShas:state.siblingShas} : {})})};
     }
     if (call.file === 'ssh' && call.args.at(-1) === 'true') return {code:probeCode, stdout:''};
     throw new Error(`Unexpected exec call: ${JSON.stringify(call)}`);
@@ -74,7 +94,29 @@ function fixture({ probeCode = 0, copyCode = 0, prepareCode = 0, runCode = 0, re
   const local = vi.fn(async () => 7);
   const listFiles = vi.fn(async () => ['package-lock.json', 'a.test.mjs']);
   writeFileSync(join(cwd, 'a.test.mjs'), 'fixture');
-  return {exec, local, listFiles, argv:[...argv], cwd, env:{...allowedEnv,...forbiddenEnv}, runId};
+  return {exec, local, listFiles, argv:[...argv], cwd, lockRoot:join(cwd,'heavy'), env:{...allowedEnv,...forbiddenEnv}, runId};
+}
+// Simulate umask 077 without changing the test worker's process-wide umask.
+function restrictiveStageFs() {
+  return {...filesystem,
+    mkdir:(path, options) => filesystem.mkdir(path, {...options, mode:0o700}),
+    writeFile:(path, data, options) => filesystem.writeFile(path, data, {...options, mode:0o600}),
+  };
+}
+function expectStageModes(root, executable) {
+  const visit = directory => {
+    for (const name of readdirSync(directory)) {
+      const path = join(directory,name), st = statSync(path);
+      if (st.isDirectory()) {
+        expect(st.mode & 0o7777).toBe(0o755);
+        visit(path);
+      } else {
+        expect(st.mode & 0o7777, `staged file must never remain 0600: ${name}`).not.toBe(0o600);
+        expect(st.mode & 0o7777).toBe(path === join(root,executable) ? 0o755 : 0o644);
+      }
+    }
+  };
+  visit(root);
 }
 function expectNoSecrets(exec) {
   const transport = JSON.stringify(callsOf(exec).map(({args,input}) => ({args,input})));
@@ -445,6 +487,21 @@ console.log('RESOLVED ' + versions.join(','));
 });
 
 describe('isAllowedCommand', () => {
+  it.each([
+    ['npx','vitest','run','a.test.mjs'], ['npx','vitest','related','a.test.mjs','--run'],
+    ['npm','run','test:integration:vitest'], ['npm','run','test:coverage'],
+  ].map(argv=>[argv]))('keeps new class %j local with an old runner before copying bytes', async command => {
+    const f=fixture(),exec=f.exec;
+    f.exec=vi.fn(async call=>{
+      const reply=await exec(call);
+      if(isPrepare(call))return {...reply,stdout:JSON.stringify({run:JSON.parse(reply.stdout).run,capabilities:{siblings:1}})};
+      return reply;
+    });
+    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started',terminated:true,reason:'forge-runner-too-old'});
+    expect(callsOf(f.exec).some(call=>call.file==='rsync'||isRun(call))).toBe(false);
+    expect(callsOf(f.exec).filter(isCleanup)).toHaveLength(1);
+  });
+
   it.each(['--help','-h','--version','-v','--passWithNoTests','--pass-with-no-tests','--changed','--shard','--bail']
     .flatMap(flag => [flag, flag+'=true', flag+'=false', flag+'=']))
   ('rejects arguments outside the allowlist: %s on both sides before transport', async arg => {
@@ -558,6 +615,158 @@ describe('validateRunId', () => {
 });
 
 describe('runRemote', () => {
+  it.each(['bound','wrong nonce','wrong run','started','missing started','extra field','non-Git command'])('accepts only protected not-started Git HEAD refusal and never retries: %s',async kind=>{
+    const f=fixture({runCode:254,receipt:(_nonce,value)=>{
+      const reply={v:1,nonce:value.nonce,run:value.run,phase:'rejected',reason:'git-head-unavailable',siblings:false,started:false};
+      if(kind==='wrong nonce')reply.nonce='0'.repeat(32);
+      if(kind==='wrong run')reply.run='r-'+'0'.repeat(32);
+      if(kind==='started')reply.started=true;
+      if(kind==='missing started')delete reply.started;
+      if(kind==='extra field')reply.code=0;
+      return JSON.stringify(reply);
+    }});
+    if(kind!=='non-Git command')f.argv=['npm','run','check:standards'];
+    expect(await runRemote(f)).toEqual(kind==='bound'?{mode:'not-started',terminated:true,reason:'git-head-unavailable'}:{mode:'unconfirmed',reason:'ambiguous-result'});
+    expect(callsOf(f.exec).filter(isPrepare)).toHaveLength(1);
+    expect(callsOf(f.exec).filter(isRun)).toHaveLength(1);
+    expect(callsOf(f.exec).filter(isCleanup)).toHaveLength(1);
+  });
+  it('falls back through Mac admission after a protected unavailable-HEAD receipt',async()=>{
+    const f=fixture({runCode:254,receipt:(_nonce,value)=>JSON.stringify({v:1,nonce:value.nonce,run:value.run,
+      phase:'rejected',reason:'git-head-unavailable',siblings:false,started:false})});
+    f.argv=['npm','run','check:standards'];
+    const log=vi.fn();
+    expect(await runWithRemoteDecision({argv:f.argv,cwd,env:{},lockRoot:join(cwd,'heavy'),log,loadPerCore:()=>0,
+      policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
+      remoteExec:async options=>runRemote({...f,...options}),
+    })).toEqual({handled:false});
+    expect(log.mock.calls.some(([message])=>message.includes('git-head-unavailable'))).toBe(true);
+  });
+  it('refuses a Mac HEAD change during snapshot construction before prepare or transport',async()=>{
+    const f=fixture(),execute=f.exec;let reads=0;
+    f.argv=['npm','run','check:standards'];
+    f.exec=vi.fn(async call=>call.file==='git'&&call.args.join(' ')==='rev-parse HEAD'
+      ?{code:0,stdout:Buffer.from((++reads===1?'a':'b').repeat(40)+'\n')}:execute(call));
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'copy-failed'});
+    expect(callsOf(f.exec).some(call=>isPrepare(call)||isRun(call)||call.file==='rsync')).toBe(false);
+  });
+  it('preserves forge-busy from prepare without transferring bytes or asking an unknown run to finish',async()=>{
+    const f=fixture(),execute=f.exec;
+    f.exec=vi.fn(async call=>isPrepare(call)?{code:254,stdout:JSON.stringify({reason:'forge-busy'})}:execute(call));
+    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'forge-busy'});
+    expect(callsOf(f.exec).some(c=>c.file==='rsync'||isRun(c)||isCleanup(c))).toBe(false);
+  });
+  it.each(['forge-exec-2','root','forge-exec-3','forge-exec-01'])('rsync targets only a valid server-reserved pool member: %s',async slot=>{
+    const f=fixture(),execute=f.exec;
+    f.exec=vi.fn(async call=>{
+      const result=await execute(call);
+      if(isPrepare(call)){const p=JSON.parse(result.stdout);p.slot=slot;p.capabilities.workers=['forge-exec-1','forge-exec-2'];return {...result,stdout:JSON.stringify(p)};}
+      return result;
+    });
+    const result=await runRemote(f),copies=callsOf(f.exec).filter(c=>c.file==='rsync');
+    if(slot==='forge-exec-2'){
+      expect(result).toEqual({mode:'remote',code:0});
+      expect(copies).toHaveLength(1);
+      expect(copies[0].args).toContain('--rsync-path=sudo -u forge-exec-2 rsync');
+      expect(copies[0].args.at(-1)).toMatch(/^forge:\/srv\/forge-exec\/slot-2\/r-[a-f0-9]{32}\/work\/$/);
+    }else{expect(result).toEqual({mode:'fallback',reason:'copy-failed'});expect(copies).toHaveLength(0);}
+  });
+  it.each(['bound', 'wrong nonce', 'wrong run', 'malformed', 'missing started', 'started', 'unknown reason', 'extra field', 'invalid JSON'])
+  ('accepts only bound pre-run protected rejection: %s', async kind => {
+    const f = fixture({runCode:1, receipt:(_nonce, value) => {
+      const reply = {v:1,nonce:value.nonce,run:value.run,phase:'rejected',reason:'snapshot-rejected',siblings:true,started:false};
+      if (kind === 'wrong nonce') reply.nonce = '0'.repeat(32);
+      if (kind === 'wrong run') reply.run = 'r-'+'0'.repeat(32);
+      if (kind === 'malformed') reply.siblings = 'true';
+      if (kind === 'missing started') delete reply.started;
+      if (kind === 'started') reply.started = true;
+      if (kind === 'unknown reason') reply.reason = 'unknown';
+      if (kind === 'extra field') reply.code = 0;
+      return kind === 'invalid JSON' ? '{' : JSON.stringify(reply);
+    }});
+    expect(await runRemote(f)).toEqual(kind === 'bound'
+      ? {mode:'not-started',terminated:true,reason:'forge-rejected:snapshot-rejected'}
+      : {mode:'unconfirmed',reason:'ambiguous-result'});
+  });
+
+  it('aborts not-started before rsync when an ancestor is redirected to different bytes at staging open', async () => {
+    const f = fixture();
+    const source = join(cwd,'fixtures');
+    const alternate = join(cwd,'alternate');
+    mkdirSync(source); mkdirSync(alternate);
+    writeFileSync(join(source,'a.test.mjs'),'fixture');
+    writeFileSync(join(alternate,'a.test.mjs'),'different private bytes');
+    f.listFiles.mockResolvedValue(['fixtures/a.test.mjs','package-lock.json']);
+    let redirected = false, openedDifferentBytes = false;
+    f.fs = {...filesystem, open:async (path, flags) => {
+      if (Buffer.from(path).equals(Buffer.from(join(source,'a.test.mjs')))) {
+        renameSync(source,join(cwd,'original-fixtures'));
+        symlinkSync(alternate,source);
+        redirected = true;
+        const fd = await filesystem.open(path,flags);
+        openedDifferentBytes = (await fd.readFile('utf8')) === 'different private bytes';
+        await fd.close();
+      }
+      return filesystem.open(path,flags);
+    }};
+    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'snapshot-staging-failed'});
+    expect(redirected).toBe(true);
+    expect(openedDifferentBytes).toBe(true);
+    expect(callsOf(f.exec).some(call => call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+
+  it('stages primary files as 0644/0755 and subdirectories as 0755 under a 0700 root despite restrictive creation modes', async () => {
+    const f = fixture();
+    mkdirSync(join(cwd,'sub/dir'), {recursive:true});
+    writeFileSync(join(cwd,'sub/dir/run.js'), 'executable');
+    chmodSync(join(cwd,'sub/dir/run.js'), 0o711);
+    f.listFiles.mockResolvedValue(['package-lock.json','a.test.mjs','sub/dir/run.js']);
+    f.fs = restrictiveStageFs();
+    const fake = f.exec;
+    let copied = false;
+    f.exec = vi.fn(async call => {
+      if (call.file === 'rsync') {
+        copied = true;
+        expect(statSync(call.cwd).mode & 0o7777).toBe(0o700);
+        expectStageModes(call.cwd, 'sub/dir/run.js');
+        expect(statSync(join(call.cwd,'sub')).mode & 0o7777).toBe(0o755);
+        expect(statSync(join(call.cwd,'sub/dir')).mode & 0o7777).toBe(0o755);
+        const destination = join(cwd,'copied');
+        mkdirSync(destination);
+        chmodSync(destination,0o755);
+        const args = call.args.filter((arg,i,all) => !arg.startsWith('--rsync-path=') && arg !== '-e' && all[i-1] !== '-e');
+        args[args.length-1] = destination+'/';
+        const result = spawnSync('rsync',args,{cwd:call.cwd,input:call.input,timeout:10000});
+        expect(result.status,result.stderr?.toString()).toBe(0);
+        expect(statSync(destination).mode & 0o7777).toBe(0o755);
+        expect(statSync(call.cwd).mode & 0o7777).toBe(0o700);
+        expectStageModes(destination,'sub/dir/run.js');
+      }
+      return fake(call);
+    });
+    const result = await runRemote(f);
+    const transport = await Promise.allSettled(f.exec.mock.results.map(call => call.type === 'throw' ? Promise.reject(call.value) : call.value));
+    expect(transport.filter(call => call.status === 'rejected').map(call => call.reason?.stack ?? String(call.reason)), JSON.stringify(result)).toEqual([]);
+    expect(result, JSON.stringify(result)).toEqual({mode:'remote',code:0});
+    expect(copied).toBe(true);
+  });
+
+  it.each(['mode','bytes'])('refuses staged %s corruption before prepare or rsync', async fault => {
+    const f = fixture();
+    let corrupted = false;
+    f.fs = {...filesystem, chmod:async (path, mode) => {
+      await filesystem.chmod(path, mode);
+      if (statSync(path).isFile()) {
+        corrupted = true;
+        if (fault === 'mode') await filesystem.chmod(path, 0o600);
+        else await filesystem.writeFile(path, 'corrupt staged bytes');
+      }
+    }};
+    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'snapshot-staging-failed'});
+    expect(corrupted).toBe(true);
+    expect(callsOf(f.exec).some(call => call.file === 'rsync' || isPrepare(call))).toBe(false);
+  });
+
   it('sends only verified staged bytes when a live file becomes private after manifest build', async () => {
     const f = fixture();
     const transport = f.exec;
@@ -621,7 +830,7 @@ describe('runRemote', () => {
       ? {code:0, stdout:Buffer.from('scripts/__tests__/ignored.test.mjs\0')}
       : exec(call));
     const result = await runWithRemoteDecision({
-      argv:f.argv, cwd, env:{}, log:vi.fn(), loadPerCore:() => 0,
+      argv:f.argv, cwd, env:{}, lockRoot:join(cwd,'heavy'), log:vi.fn(), loadPerCore:() => 0,
       policy:resolveAdmissionPolicy({platform:{remote:{enabled:true, mode:'always'}}}),
       remoteExec:async options => adaptLegacyRemoteResult(await runRemote({...f, ...options})),
     });
@@ -700,17 +909,81 @@ describe('runRemote', () => {
     expect(callsOf(f.exec).some(isPrepare)).toBe(false);
   });
 
-  it.each([[], ['--','--files=scripts/readiness/remote-exec.mjs']].map(args => [args]))('runs Git-dependent standards locally without preparing a snapshot: %j', async (args) => {
-    const f = fixture();
+  it.each([[], ['--','--files=scripts/readiness/remote-exec.mjs']].map(args => [args]))('preserves both real standards guards at exact published Mac HEAD ahead of cache base: %j', async (args) => {
+    const f = fixture({runCode:1}),original=f.exec;
+    const git=(...args)=>{
+      const result=spawnSync('git',args,{cwd,encoding:'utf8',timeout:10000});
+      expect(result.status,result.stderr).toBe(0);return result.stdout.trim();
+    };
+    git('init','-b','main');git('config','user.name','Fixture');git('config','user.email','fixture@example.invalid');
+    const tier='scripts/lib/disposition-judge.mjs';
+    mkdirSync(join(cwd,'scripts/lib'),{recursive:true});
+    writeFileSync(join(cwd,tier),'export const changed = false;\n');
+    git('add','.');git('commit','-m','public base');
+    const base=git('rev-parse','HEAD'),baseRoot=join(cwd,'forge-base'),snapshot=join(cwd,'forge-work');
+    mkdirSync(baseRoot);mkdirSync(snapshot);
+    git('clone','--bare','.',join(baseRoot,'repo.git'));
+    git('--git-dir',join(baseRoot,'repo.git'),'update-ref','refs/remotes/origin/main',base);
+    writeFileSync(join(cwd,tier),'export const changed = true;\n');
+    git('add',tier);git('commit','-m','published Mac change');
+    const head=git('rev-parse','HEAD');
+    // Public main is ahead of the warm content base; seed its transport fixture.
+    rmSync(join(baseRoot,'repo.git'),{recursive:true});
+    git('clone','--bare','.',join(baseRoot,'repo.git'));
+    git('--git-dir',join(baseRoot,'repo.git'),'update-ref','refs/remotes/origin/main',head);
+    writeFileSync(join(cwd,tier),'export const changed = 2;\n');
+    const localCoverage=scanMaterializedGuards(cwd).coverage;
+    expect(localCoverage.status).toBe('fail');
+    const artifacts=['reports/new.md','src/_data/researchTopics/new.json','src/_includes/research-descriptions/new.njk'];
+    for(const name of artifacts){mkdirSync(join(cwd,name,'..'),{recursive:true});writeFileSync(join(cwd,name),'new artifact');}
+    f.listFiles.mockResolvedValue(['a.test.mjs','package-lock.json',tier,...artifacts]);
+    let observed;
+    f.exec=vi.fn(async call=>{
+      if(call.file==='git')return remoteManifestAPI.defaultExec(call);
+      if(call.file==='rsync')cpSync(call.cwd,snapshot,{recursive:true});
+      if(isRun(call)){
+        const request=JSON.parse(call.input);
+        await materializeWorktree({work:snapshot,root:baseRoot,head:request.manifest.git.head,
+          manifest:request.manifest,manifestDigest:request.manifestDigest,exec:cachedPublicGitExec});
+        mkdirSync(join(snapshot,'coverage'));
+        const loc={start:{line:1,column:0},end:{line:1,column:40}};
+        writeFileSync(join(snapshot,'coverage/coverage-final.json'),JSON.stringify({[tier]:{branchMap:{0:{loc,locations:[loc,loc]}},b:{0:[0,0]}}}));
+        observed=scanMaterializedGuards(snapshot);
+      }
+      return original(call);
+    });
     f.argv = ['npm','run','check:standards',...args];
-    // No vitest.shared.ts: the Git requirement alone must trigger fallback.
-    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'requires-git-worktree'});
-    const log = vi.fn();
-    expect(await runRemoteCli({...f,log})).toBe(7);
-    expect(f.local).toHaveBeenCalledTimes(1);
-    expect(f.local).toHaveBeenCalledWith(f.argv);
-    expect(f.exec).not.toHaveBeenCalled();
-    expect(log).toHaveBeenCalledWith(expect.stringContaining('requires-git-worktree'));
+    expect(await runRemote(f)).toEqual({mode:'remote',code:1});
+    expect(observed.coverage).toMatchObject({status:'fail',total:2,exercised:0,ok:false});
+    expect(observed.artifacts.errors.map(e=>e.descriptor.file)).toEqual(['reports','src/_data/researchTopics','src/_includes/research-descriptions']);
+    expect(spawnSync('git',['rev-parse','HEAD'],{cwd:snapshot,encoding:'utf8'}).stdout.trim()).toBe(head);
+    expect(spawnSync('git',['merge-base','--is-ancestor','HEAD','origin/main'],{cwd:snapshot}).status).toBe(0);
+    expect(callsOf(f.exec).some(isPrepare)).toBe(true);
+    expect(JSON.parse(callsOf(f.exec).find(isRun).input).manifest.git.head).toBe(head);
+    expect(JSON.stringify(callsOf(f.exec))).not.toContain('verify-marker');
+    expect(f.local).not.toHaveBeenCalled();
+  });
+  it.each([undefined,1])('requires exact-HEAD worktree capability before transferring a standards snapshot to an old runner (version=%s)',async version=>{
+    const f=fixture(),original=f.exec;
+    f.argv=['npm','run','check:standards'];
+    f.exec=vi.fn(async call=>{
+      const result=await original(call);
+      if(isPrepare(call)){
+        const prepared=JSON.parse(result.stdout);
+        if(version===undefined)delete prepared.capabilities.gitWorktree;else prepared.capabilities.gitWorktree=version;
+        return {...result,stdout:JSON.stringify(prepared)};
+      }
+      return result;
+    });
+    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'forge-runner-too-old'});
+    expect(callsOf(f.exec).some(c=>c.file==='rsync'||isRun(c))).toBe(false);
+    expect(callsOf(f.exec).filter(isCleanup)).toHaveLength(1);
+  });
+  it.each([{code:1,stdout:''},{code:0,stdout:''},{code:0,stdout:'invalid-head'}])('refuses standards before prepare when logical HEAD evidence is unavailable: %j',async evidence=>{
+    const f=fixture(),original=f.exec;f.argv=['npm','run','check:standards'];
+    f.exec=vi.fn(call=>call.file==='git'&&call.args.join(' ')==='rev-parse HEAD'?evidence:original(call));
+    expect(await runRemote(f)).toEqual({mode:'fallback',reason:'copy-failed'});
+    expect(callsOf(f.exec).some(c=>isPrepare(c)||c.file==='rsync'||isRun(c))).toBe(false);
   });
   it.each(['0\n', '97\n', `${'f'.repeat(32)}:0\n`])('refuses local rerun for an unbound receipt %j', async (receipt) => {
     const f = fixture({ runCode: receipt === '97\n' ? 97 : 0, receipt });
@@ -750,15 +1023,15 @@ describe('runRemote', () => {
     expect(callsOf(f.exec).some((call) => call.file === 'rsync' || isRun(call))).toBe(false);
   });
 
-  it.each(['test:unit', 'check:standards'])('falls back before transport for %s when the snapshot requires the unsynchronized sibling', async (command) => {
+  it.each(['test:unit', 'check:standards'])('falls back before transport for %s when the snapshot requires an outside-allowlist sibling', async (command) => {
     const f = fixture();
     f.argv = ['npm', 'run', command, '--', 'blocks/__tests__/unit/resource-loader/ResourceLoader.test.ts'];
     f.listFiles.mockResolvedValue(['package-lock.json', 'vitest.shared.ts']);
-    writeFileSync(join(cwd, 'vitest.shared.ts'), "export const fuiPlugsRoot = resolve(repoRoot, '../frontierui/plugs');\n");
+    writeFileSync(join(cwd, 'vitest.shared.ts'), "export const fuiPlugsRoot = resolve(repoRoot, '../frontierui/outside');\n");
     const log = vi.fn();
     expect(await runRemoteCli({ ...f, log })).toBe(7);
     expect(f.local).toHaveBeenCalledWith(f.argv);
-    expect(log).toHaveBeenCalledWith(expect.stringContaining(command === 'check:standards' ? 'requires-git-worktree' : 'unsupported-sibling-dependency'));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('unsupported-sibling-dependency'));
     expect(callsOf(f.exec).some((call) => call.file === 'rsync' || isRun(call))).toBe(false);
   });
   it('falls back without exec for a command outside the allowlist', async () => {
@@ -822,7 +1095,8 @@ describe('runRemote', () => {
     const copy = calls.find((call) => call.file === 'rsync');
     expect(copy.args.join(' ')).toMatch(/--files-from(?:=|\s)-/);
     expect(copy.args).toContain('--from0');
-    expect(copy.args).toEqual(expect.arrayContaining(['--no-recursive','--no-dirs','--no-links','--safe-links','--no-implied-dirs']));
+    expect(copy.args).toEqual(expect.arrayContaining(['--no-recursive','--no-dirs','--no-links','--safe-links']));
+    expect(copy.args).not.toContain('--no-implied-dirs');
     expect(copy.args).not.toContain('-r');
     expect(copy.args).not.toContain('--delete');
     expect(copy.args).not.toContain('-L');
@@ -891,20 +1165,20 @@ describe('explicit remote CLI decision', () => {
     ['remote failure', {mode:'remote', code:23}, 23],
   ])('%s exits without a local rerun even when remote defaults are disabled', async (_name, result, code) => {
     const remoteExec = vi.fn(async () => result), local = vi.fn();
-    expect(await remoteManifestAPI.main({argv, remoteExec, local, log:vi.fn()})).toBe(code);
+    expect(await remoteManifestAPI.main({argv,cwd,lockRoot:join(cwd,'heavy'), remoteExec, local, log:vi.fn()})).toBe(code);
     expect(remoteExec).toHaveBeenCalledTimes(1);
     expect(local).not.toHaveBeenCalled();
   });
   it('thrown remote execution exits 124 without a local rerun', async () => {
     const local = vi.fn();
-    await expect(remoteManifestAPI.main({argv, remoteExec:async () => {throw new Error('disconnected');}, local, log:vi.fn()})).resolves.toBe(124);
+    await expect(remoteManifestAPI.main({argv,cwd,lockRoot:join(cwd,'heavy'), remoteExec:async () => {throw new Error('disconnected');}, local, log:vi.fn()})).resolves.toBe(124);
     expect(local).not.toHaveBeenCalled();
   });
   it('timeout exits 124 without a local rerun', async () => {
     vi.useFakeTimers();
     const local = vi.fn();
     try {
-      const pending = remoteManifestAPI.main({argv, timeoutMs:10, remoteExec:() => new Promise(() => {}), local, log:vi.fn()});
+      const pending = remoteManifestAPI.main({argv,cwd,lockRoot:join(cwd,'heavy'), timeoutMs:10, remoteExec:() => new Promise(() => {}), local, log:vi.fn()});
       await vi.dynamicImportSettled();
       await vi.advanceTimersByTimeAsync(1010);
       expect(await pending).toBe(124);
@@ -913,7 +1187,7 @@ describe('explicit remote CLI decision', () => {
   });
   it.each(['not-started', 'cancelled'])('confirmed %s may enter local admission', async mode => {
     const local = vi.fn(async () => 7);
-    expect(await remoteManifestAPI.main({argv, remoteExec:async () => ({mode, terminated:true}), local, log:vi.fn()})).toBe(7);
+    expect(await remoteManifestAPI.main({argv,cwd,lockRoot:join(cwd,'heavy'), remoteExec:async () => ({mode, terminated:true}), local, log:vi.fn()})).toBe(7);
     expect(local).toHaveBeenCalledTimes(1);
     expect(local).toHaveBeenCalledWith(argv);
   });
@@ -961,11 +1235,17 @@ original_fstat = os.fstat
 owners = {}
 os.fstat = lambda fd: types.SimpleNamespace(st_uid=0, st_mode=original_fstat(fd).st_mode)
 os.fchown = lambda fd, uid, gid: owners.__setitem__(original_fstat(fd).st_ino, (uid, gid))
-grp.getgrnam = lambda name: types.SimpleNamespace(gr_gid=os.getgid())
-pwd.getpwnam = lambda name: types.SimpleNamespace(pw_uid=0, pw_gid=os.getgid())
+os.environ['FORGE_EXEC_SLOTS'] = '2'
+os.getgrouplist = lambda name, gid: [gid]
+grp.getgrnam = lambda name: types.SimpleNamespace(gr_gid=6000+int(name.rsplit('-', 1)[1]) if name.startswith('forge-exec-') else os.getgid(), gr_mem=[])
+pwd.getpwnam = lambda name: types.SimpleNamespace(pw_uid=5000+int(name.rsplit('-', 1)[1]) if name.startswith('forge-exec-') else 0, pw_gid=6000+int(name.rsplit('-', 1)[1]) if name.startswith('forge-exec-') else os.getgid())
 ${body.replaceAll('"/srv"', JSON.stringify(srv))}
 assert owners[os.stat(${JSON.stringify(join(srv, 'forge-exec'))}).st_ino] == (0, os.getgid())
-assert owners[os.stat(${JSON.stringify(join(srv, 'forge-exec/.cache'))}).st_ino] == (0, os.getgid())`;
+assert owners[os.stat(${JSON.stringify(join(srv, 'forge-exec/.cache'))}).st_ino] == (0, os.getgid())
+for k in (1, 2):
+    path = ${JSON.stringify(join(srv, 'forge-exec'))} + '/slot-' + str(k)
+    assert owners[os.stat(path).st_ino] == (0, 6000+k)
+    assert os.stat(path).st_mode & 0o7777 == 0o710`;
   }
 
   it('keeps parent entries protected on rerun and freezes the parent before opening the cache', () => {
@@ -1046,12 +1326,12 @@ describe('receipt field binding', () => {
 
 
 // Manifest acceptance contract (Round 1):
-// buildManifest({cwd, exec, fs?}) -> {entries:[{path:Buffer, sha256, executable:boolean}],
+// buildManifest({cwd, exec, fs?}) -> {entries:[{path:Buffer, sha256, executable:boolean, tracked:boolean}],
 //   excluded:Buffer[], manifestDigest}. fs defaults to node:fs/promises; injected
 //   lstat/readFile/readdir use Buffer paths and readdir({encoding:'buffer'}).
 // isTestFile(path:Buffer) -> boolean is the shared test-file predicate.
-// Wire manifest = {paths:base64(NUL-terminated entries), hashes:string[],
-//   executable:boolean[], excluded:base64(NUL-terminated excluded paths)}.
+// Wire manifest v2 = {v:2, paths:base64(NUL-terminated entries), hashes:string[],
+//   executable:boolean[], tracked:boolean[], excluded:base64(NUL-terminated excluded paths)}.
 // manifestDigest = sha256(JSON.stringify(wire manifest)) in that property order.
 // entries and excluded are separately strictly byte-sorted. Excluded tests must
 // throw; identity/keyword names outside a forbidden component remain selected.
@@ -1061,9 +1341,11 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
   const sha = value => createHash('sha256').update(value).digest('hex');
   const nul = paths => Buffer.concat(paths.flatMap(path => [path, Buffer.from([0])]));
   const wire = manifest => ({
+    v:2,
     paths:nul(manifest.entries.map(entry => entry.path)).toString('base64'),
     hashes:manifest.entries.map(entry => entry.sha256),
     executable:manifest.entries.map(entry => entry.executable),
+    tracked:manifest.entries.map(entry => entry.tracked),
     excluded:nul(manifest.excluded).toString('base64'),
   });
   async function build(options) {
@@ -1217,7 +1499,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
       expect(await runRemote({argv, cwd, runId, exec}))
         .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
       const local = vi.fn(async () => 7);
-      expect(await runRemoteCli({argv, cwd, runId, exec, local, log:vi.fn()})).toBe(7);
+      expect(await runRemoteCli({argv, cwd, runId, exec, local, lockRoot:join(cwd,'heavy'), log:vi.fn()})).toBe(7);
       expect(local).toHaveBeenCalledWith(argv);
       expect(callsOf(exec).some(isPrepare)).toBe(false);
       expect(callsOf(exec).some(call => call.file === 'rsync')).toBe(false);
@@ -1394,7 +1676,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
       }),
     };
     const manifest = await build({cwd, exec:gitInventory([path]), fs});
-    expect(manifest.entries).toEqual([{path, sha256:sha(data), executable:true}]);
+    expect(manifest.entries).toEqual([{path, sha256:sha(data), executable:true,tracked:false}]);
     expect(manifest.manifestDigest).toBe(sha(JSON.stringify(wire(manifest))));
     expect(fs.readFile).toHaveBeenCalled();
   });
@@ -1484,4 +1766,274 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     const f = fixture({receipt:(_nonce,value) => JSON.stringify(kind === 'missing' ? value : {...value,manifestDigest:'0'.repeat(64)})});
     expect(await runRemote(f)).toEqual({mode:'unconfirmed', reason:'ambiguous-result'});
   });
+});
+
+
+describe('allowlisted sibling snapshots', () => {
+  let parent, sibling;
+  function git(...args) {
+    const result = spawnSync('git', ['-C', sibling, ...args], {encoding:'utf8'});
+    expect(result.status, result.stderr).toBe(0);
+    return result.stdout.trim();
+  }
+  function siblingsFixture() {
+    const f = fixture();
+    parent = realpathSync(mkdtempSync(join(process.env.TMPDIR, 'remote-siblings-')));
+    const repo = join(parent, 'work');
+    sibling = join(parent, 'frontierui');
+    mkdirSync(repo); mkdirSync(sibling);
+    for (const subtree of ['plugs', 'webtheme']) {
+      mkdirSync(join(sibling, subtree));
+      writeFileSync(join(sibling, subtree, 'index.js'), `export const value = '${subtree}';`);
+    }
+    mkdirSync(join(sibling, 'webtheme/sub/dir'), {recursive:true});
+    writeFileSync(join(sibling, 'webtheme/sub/dir/x.md'), 'nested sibling');
+    writeFileSync(join(sibling, 'plugs', 'credentials.txt'), 'PRIVATE');
+    git('init', '-q'); git('add', '.');
+    git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture');
+    for (const name of ['package-lock.json', 'a.test.mjs']) writeFileSync(join(repo,name), readFileSync(join(cwd,name)));
+    writeFileSync(join(repo, 'vitest.shared.ts'), "resolve(repoRoot, '../frontierui/plugs'); resolve(repoRoot, '../frontierui/webtheme');");
+    const fake = f.exec;
+    f.cwd = repo;
+    f.listFiles.mockResolvedValue(['a.test.mjs', 'package-lock.json', 'vitest.shared.ts']);
+    f.exec = vi.fn(async call => {
+      if (call.file === 'git' && call.cwd === sibling) {
+        const result = spawnSync('git', call.args, {cwd:sibling, maxBuffer:4*1024*1024});
+        return {code:result.status, stdout:result.stdout};
+      }
+      return fake(call);
+    });
+    return f;
+  }
+  afterEach(() => {if (parent) rmSync(parent, {recursive:true,force:true}); parent=undefined;});
+
+  it('allows implied directories for both rsync calls and anchors nested inventory paths', async () => {
+    const f = siblingsFixture();
+    mkdirSync(join(f.cwd, 'sub/dir'), {recursive:true});
+    writeFileSync(join(f.cwd, 'sub/dir/x.md'), 'nested primary');
+    f.listFiles.mockResolvedValue(['a.test.mjs', 'package-lock.json', 'vitest.shared.ts', 'sub/dir/x.md']);
+    expect(await runRemote(f)).toEqual({mode:'remote',code:0});
+    const copies = callsOf(f.exec).filter(call => call.file === 'rsync');
+    expect(copies).toHaveLength(2);
+    for (const copy of copies) {
+      expect(copy.args).not.toContain('--no-implied-dirs');
+      expect(copy.args).toEqual(expect.arrayContaining(['--no-recursive','--no-dirs','--no-links','--safe-links']));
+      expect(copy.args.at(-2)).toBe('./');
+    }
+    expect(copies[0].input.toString().split('\0')).toContain('./sub/dir/x.md');
+    expect(copies[1].input.toString().split('\0')).toContain('./webtheme/sub/dir/x.md');
+  });
+
+  it('stages both trees with public leaf modes inside a private root and preserves Forge directory access through real rsync', async () => {
+    const f = siblingsFixture();
+    chmodSync(join(sibling,'plugs/index.js'), 0o755);
+    git('add','.');
+    git('-c','user.name=Test','-c','user.email=test@example.invalid','commit','-qm','executable');
+    chmodSync(join(f.cwd,'a.test.mjs'), 0o711);
+    f.fs = restrictiveStageFs();
+    const fake = f.exec;
+    let copies = 0;
+    f.exec = vi.fn(async call => {
+      if (call.file === 'rsync') {
+        copies++;
+        expect(statSync(join(call.cwd,'..')).mode & 0o7777).toBe(0o700);
+        expect(statSync(call.cwd).mode & 0o7777).toBe(0o755);
+        const executable = call.args.at(-1).endsWith('/frontierui/') ? 'plugs/index.js' : 'a.test.mjs';
+        expectStageModes(call.cwd, executable);
+        const destination = join(parent,`copy-${copies}`);
+        mkdirSync(destination);
+        chmodSync(destination,0o755);
+        const args = call.args.filter((arg,i,all) => !arg.startsWith('--rsync-path=') && arg !== '-e' && all[i-1] !== '-e');
+        args[args.length-1] = destination+'/';
+        const result = spawnSync('rsync',args,{cwd:call.cwd,input:call.input,timeout:10000});
+        expect(result.status,result.stderr?.toString()).toBe(0);
+        expect(statSync(destination).mode & 0o7777).toBe(0o755);
+        expectStageModes(destination,executable);
+      }
+      return fake(call);
+    });
+    const result = await runRemote(f);
+    const transport = await Promise.allSettled(f.exec.mock.results.map(call => call.type === 'throw' ? Promise.reject(call.value) : call.value));
+    expect(transport.filter(call => call.status === 'rejected').map(call => call.reason?.stack ?? String(call.reason)), JSON.stringify(result)).toEqual([]);
+    expect(result, JSON.stringify(result)).toEqual({mode:'remote',code:0});
+    expect(copies).toBe(2);
+  });
+
+  it('ships both tracked sibling subtrees from private staging and binds their SHA in the receipt', async () => {
+    const f = siblingsFixture();
+    const sha = git('rev-parse', 'HEAD');
+    const fake = f.exec;
+    let copies = 0;
+    f.exec = vi.fn(async call => {
+      if (call.file === 'rsync' && call.args.at(-1).endsWith('/frontierui/')) {
+        copies++;
+        expect(statSync(call.cwd).mode & 0o777).toBe(0o755);
+        expect(statSync(join(call.cwd,'..')).mode & 0o777).toBe(0o700);
+        expect(readFileSync(join(call.cwd, 'plugs/index.js'), 'utf8')).toContain('plugs');
+        expect(call.input.toString()).toContain('./webtheme/index.js\0');
+        expect(call.input.toString()).not.toContain('credentials');
+        expect(existsSync(join(call.cwd,'plugs/credentials.txt'))).toBe(false);
+      }
+      return fake(call);
+    });
+    expect(await runRemote(f)).toEqual({mode:'remote',code:0});
+    expect(copies).toBe(1);
+    const sent = JSON.parse(callsOf(f.exec).find(isRun).input);
+    expect(sent.siblingShas).toEqual({frontierui:sha});
+    expect(sent.manifest.siblings.frontierui.sha).toBe(sha);
+    expect(sent.manifestDigest).toBe(forgeManifestAPI.digestManifest(sent.manifest));
+    expect(remoteManifestAPI.verifyReceipt(JSON.stringify({...sent, manifest:undefined, argv:undefined, env:undefined,
+      phase:'test',code:0,siblingShas:{frontierui:'0'.repeat(40)}}),
+      {v:1,nonce:sent.nonce,run:sent.run,inputDigest:sent.inputDigest,argvDigest:sent.argvDigest,lock:sent.lock,
+        manifestDigest:sent.manifestDigest,siblingShas:sent.siblingShas},0)).toBe(false);
+  });
+
+  it('resolves ../frontierui from work after real rsync and Forge verification', async () => {
+    const f=siblingsFixture();
+    const bin=join(parent,'bin'), server=join(parent,'server');
+    mkdirSync(bin);
+    symlinkSync(process.execPath,join(bin,'node'));
+    writeFileSync(join(bin,'npm'), `#!/bin/bash
+if [ "$1" = ci ]; then mkdir -p node_modules; exit 0; fi
+node -e "const fs=require('fs'); for(const name of ['plugs','webtheme']) {if(!fs.readFileSync('../frontierui/'+name+'/index.js','utf8').includes(name)) process.exit(1);}"
+`,{mode:0o755});
+    const runner=createRunner({testRoot:server,testPath:bin+':/usr/bin:/bin'});
+    const fake=f.exec;
+    let run;
+    f.exec=vi.fn(async call => {
+      if (isPrepare(call)) {
+        const reply=await runner.prepare(JSON.parse(call.input)); run=reply.run;
+        return {code:0,stdout:JSON.stringify(reply)};
+      }
+      if (call.file==='rsync') {
+        const args=call.args.filter((arg,i,all)=>!arg.startsWith('--rsync-path=') && arg!=='-e' && all[i-1]!=='-e');
+        args[args.length-1]=join(server,'runs',run,call.args.at(-1).endsWith('/frontierui/')?'frontierui':'work')+'/';
+        const result=spawnSync('rsync',args,{cwd:call.cwd,input:call.input,timeout:10000});
+        return {code:result.status,stdout:result.stdout};
+      }
+      if (isRun(call)) {const result=await runner.run(JSON.parse(call.input)); return {...result};}
+      if (isReceipt(call)) return {code:0,stdout:JSON.stringify(await runner.finish(JSON.parse(call.input)))};
+      return fake(call);
+    });
+    expect(await runRemote(f)).toEqual({mode:'remote',code:0});
+    expect(existsSync(join(server,'runs',run))).toBe(false);
+  });
+  it.each(['dirty','staged','untracked','missing','symlink','root symlink','gitlink','unresolvable'])
+  ('refuses %s sibling evidence before rsync', async fault => {
+    const f = siblingsFixture();
+    if (fault === 'dirty' || fault === 'staged') writeFileSync(join(sibling,'plugs/index.js'), 'changed');
+    if (fault === 'staged') git('add','.');
+    if (fault === 'untracked') writeFileSync(join(sibling,'untracked'), 'new');
+    if (fault === 'missing' || fault === 'symlink') rmSync(join(sibling,'plugs'), {recursive:true});
+    if (fault === 'symlink') symlinkSync(join(sibling,'webtheme'), join(sibling,'plugs'));
+    if (fault === 'root symlink') {
+      const target = join(parent,'target');
+      renameSync(sibling,target); symlinkSync(target,sibling);
+    }
+    if (fault === 'gitlink') {
+      git('rm','-r','plugs'); git('update-index','--add','--cacheinfo',`160000,${git('rev-parse','HEAD')},plugs`);
+      git('-c','user.name=Test','-c','user.email=test@example.invalid','commit','-qm','gitlink');
+      mkdirSync(join(sibling,'plugs'));
+    }
+    if (fault === 'unresolvable') rmSync(join(sibling,'.git'), {recursive:true});
+    expect(await runRemote(f)).toMatchObject({mode:'not-started',terminated:true,reason:'sibling-inventory-failed'});
+    expect(callsOf(f.exec).some(call => call.file === 'rsync' || isRun(call))).toBe(false);
+  });
+  it.each(['bytes','symlink','directory'])('refuses a sibling swapped to %s after inventory before any rsync', async kind => {
+    const f = siblingsFixture();
+    f.fs = {...filesystem, mkdtemp:async prefix => {
+      if (kind === 'bytes') writeFileSync(join(sibling,'plugs/index.js'), 'SWAPPED');
+      else {
+        const original=join(parent,'original-plugs');
+        renameSync(join(sibling,'plugs'),original);
+        if (kind === 'symlink') symlinkSync(original,join(sibling,'plugs'));
+        else cpSync(original,join(sibling,'plugs'),{recursive:true});
+      }
+      return filesystem.mkdtemp(prefix);
+    }};
+    expect(await runRemote(f)).toMatchObject({mode:'not-started',reason:'snapshot-staging-failed'});
+    expect(callsOf(f.exec).some(call => call.file === 'rsync')).toBe(false);
+  });
+
+  it.each(['credentials.txt','CREDENTIALS.txt','cre\u200bdentials.txt','crédentials.txt','.env','private.key'])
+  ('applies the shared exclusion policy to sibling path %s', async name => {
+    const f=siblingsFixture();
+    writeFileSync(join(sibling,'webtheme',name),'PRIVATE');
+    git('add','.'); git('-c','user.name=Test','-c','user.email=test@example.invalid','commit','-qm','excluded');
+    expect(await runRemote(f)).toEqual({mode:'remote',code:0});
+    const request=JSON.parse(callsOf(f.exec).find(isRun).input);
+    expect(Buffer.from(request.manifest.siblings.frontierui.excluded,'base64').includes(Buffer.from(`webtheme/${name}\0`))).toBe(true);
+    expect(callsOf(f.exec).filter(call=>call.file==='rsync').every(call=>!call.input.includes(Buffer.from(name)))).toBe(true);
+  });
+  it('refuses an oversized sibling inventory before staging or transmission with local fallback', async () => {
+    const f=siblingsFixture(), fake=f.exec;
+    f.exec=vi.fn(async call => call.file==='git' && call.cwd===sibling && call.args[0]==='ls-files' && call.args.includes('--')
+      ? {code:0,stdout:Buffer.alloc(4*1024*1024+1,97)} : fake(call));
+    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'sibling-inventory-failed'});
+    expect(callsOf(f.exec).some(call=>call.file==='rsync' || isPrepare(call) || isRun(call))).toBe(false);
+  });
+  it('falls back locally as not-started when the installed Forge runner lacks sibling capability', async () => {
+    const f = siblingsFixture(), fake=f.exec;
+    f.exec = vi.fn(async call => {
+      const result = await fake(call);
+      if (isPrepare(call)) result.stdout=JSON.stringify({run:JSON.parse(result.stdout).run});
+      return result;
+    });
+    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'forge-runner-too-old'});
+    expect(callsOf(f.exec).some(call => call.file === 'rsync' || isRun(call))).toBe(false);
+    expect(await runRemoteCli({...f,log:vi.fn()})).toBe(7);
+    expect(f.local).toHaveBeenCalledOnce();
+  });
+});
+
+
+describe('offload stage evidence', () => {
+  it('records ordered stages with an injected clock and Eastern offset, including transfer counts', async () => {
+    const f=fixture({receipt:(_nonce,value,state)=>JSON.stringify({...value,manifestDigest:state.manifestDigest,timings:{installMs:12,runMs:34}})});
+    let now=Date.parse('2026-07-01T12:00:00Z');
+    const result=await timedRunRemote({...f,clock:()=>{const value=now;now+=10;return value;}});
+    expect(result.mode).toBe('remote');
+    expect(result.timings.map(value=>value.stage)).toEqual(['manifest-build','mac-stage-and-rehash','forge-prepare','rsync','forge-install','forge-run','finish-receipt','total']);
+    for(const stage of result.timings) {
+      expect(stage.startedAtET).toMatch(/^2026-07-01T08:00:\d{2}\.\d{3}-04:00$/);
+      expect(Number.isInteger(stage.ms) && stage.ms>=0).toBe(true);
+    }
+    expect(result.timings.find(s=>s.stage==='forge-install').ms).toBe(12);
+    expect(result.timings.find(s=>s.stage==='forge-run').ms).toBe(34);
+    expect(result.timings.find(s=>s.stage==='rsync')).toMatchObject({shipMode:'full',fileCount:2,bytesSent:expect.any(Number)});
+  });
+  it('formats winter timestamps with the Eastern standard offset even for early fallback', async () => {
+    const result=await timedRunRemote({argv:[],clock:()=>Date.parse('2026-01-01T12:00:00Z')});
+    expect(result.timings).toEqual([{stage:'total',startedAtET:'2026-01-01T07:00:00.000-05:00',ms:0}]);
+  });
+  it.each([undefined,{installMs:0,runMs:42}])('accepts optional exact runner timings %j', timings => {
+    const expected={v:1,nonce:'a'.repeat(32),run:'r-'+'b'.repeat(32),inputDigest:'c'.repeat(64),argvDigest:'d'.repeat(64),lock:'e'.repeat(64),manifestDigest:'f'.repeat(64)};
+    expect(remoteManifestAPI.verifyReceipt(JSON.stringify({...expected,phase:'test',code:0,...(timings?{timings}:{})}),expected,0)).toBe(true);
+  });
+  it.each([null,[],{installMs:'1',runMs:2},{installMs:1.5,runMs:2},{installMs:-1,runMs:2},{installMs:1},{installMs:1,runMs:2,extra:3}])('rejects malformed optional receipt timings %j', timings=>{
+    const expected={v:1,nonce:'a'.repeat(32),run:'r-'+'b'.repeat(32),inputDigest:'c'.repeat(64),argvDigest:'d'.repeat(64),lock:'e'.repeat(64),manifestDigest:'f'.repeat(64)};
+    expect(remoteManifestAPI.verifyReceipt(JSON.stringify({...expected,phase:'test',code:0,timings}),expected,0)).toBe(false);
+  });
+});
+
+
+it('CLI prints one compact timing table to stderr after remote completion',async()=>{
+  const stderr=vi.spyOn(process.stderr,'write').mockImplementation(()=>true);
+  const timings=[{stage:'total',startedAtET:'2026-01-01T07:00:00.000-05:00',ms:12}];
+  try {
+    expect(await runRemoteCli({argv,cwd,lockRoot:join(cwd,'heavy'),remoteExec:async()=>({mode:'remote',code:0,timings}),log:vi.fn()})).toBe(0);
+    expect(stderr).toHaveBeenCalledOnce();
+    expect(stderr.mock.calls[0][0]).toContain('total');
+    expect(stderr.mock.calls[0][0]).toContain('12');
+    expect(stderr.mock.calls[0][0]).toContain('2026-01-01T07:00:00.000-05:00');
+  }finally{stderr.mockRestore();}
+});
+
+
+it('includes an attempted manifest stage on failure and measures old-runner wall run time',async()=>{
+  const failed=fixture();failed.listFiles.mockResolvedValue(['missing-leaf']);
+  expect((await timedRunRemote(failed)).timings.map(t=>t.stage)).toEqual(['manifest-build','total']);
+  const completed=await timedRunRemote(fixture());
+  expect(completed.timings.find(t=>t.stage==='forge-run')).toMatchObject({ms:expect.any(Number)});
+  expect(completed.timings.find(t=>t.stage==='forge-install')).toBeUndefined();
 });

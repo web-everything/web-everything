@@ -10,7 +10,7 @@ import {fileURLToPath} from 'node:url';
 import {createRunner, digestInput, digestArgv, supervisorSource} from '../forge-exec-run.mjs';
 import * as manifestAPI from '../forge-exec-run.mjs';
 let root, runner, request, work;
-const argv = ['npm','run','test:unit','--','two words',"a'b",'$(touch marker)','line\nbreak'];
+const argv = ['npm','run','test:unit','--','two words',"a'b",'$(touch marker)','-t','line\nbreak'];
 const hash = data => createHash('sha256').update(data).digest('hex');
 // Legacy success fixtures bind the exact snapshot supplied in their run request.
 async function snapshotBinding(base) {
@@ -62,6 +62,20 @@ exit 3
 });
 afterEach(async () => {await rm(root,{recursive:true,force:true});});
 describe('fixed wrapper security boundary', () => {
+  it.each(['--run','--silent','--no-color'])('rejects separated false for %s before install or execution',async flag=>{
+    const command=['npx','vitest','related','a.test.mjs','--run',flag,'false'];
+    await expect(runner.run({...request,argv:command,argvDigest:digestArgv(command)})).rejects.toThrow('Invalid execution parameters');
+    await expect(readFile(join(root,'install.log'))).rejects.toMatchObject({code:'ENOENT'});
+    await expect(readFile(join(work,'task-seen'))).rejects.toMatchObject({code:'ENOENT'});
+  });
+  it('does not certify a rejected reply after the protected run phase started', async () => {
+    await writeFile(join(root,'receipts',request.run+'.running'), JSON.stringify({v:1,nonce:request.nonce,run:request.run}));
+    await rm(join(root,'receipts',request.run+'.prepared'));
+    await writeFile(join(root,'receipts',request.run+'.rejected'), JSON.stringify({v:1,nonce:request.nonce,run:request.run,
+      phase:'rejected',reason:'snapshot-rejected',siblings:true}));
+    expect(await runner.finish(request)).toBeNull();
+  });
+
   it('real Vitest -t --help skips execution but cannot produce a certified success', async () => {
     const queue = fileURLToPath(new URL('../heavy-admission.mjs', import.meta.url));
     const vitest = fileURLToPath(new URL('../../../node_modules/vitest/vitest.mjs', import.meta.url));
@@ -239,9 +253,9 @@ process.stdout.write('x'.repeat(4*1024*1024+1));
     const next = await runner.prepare({nonce:request.nonce});
     await expect(runner.run({...request,...next})).rejects.toThrow('Worker execution busy');
   });
-  it('rejects Git-dependent standards requests at the server boundary', async () => {
+  it('rejects standards requests without hash-bound Git evidence at the server boundary', async () => {
     const command = ['npm','run','check:standards'];
-    await expect(runner.run({...request,argv:command,argvDigest:digestArgv(command)})).rejects.toThrow('Invalid execution parameters');
+    await expect(runner.run({...request,argv:command,argvDigest:digestArgv(command)})).rejects.toThrow('Missing Git evidence');
     await expect(stat(join(root,'install.log'))).rejects.toThrow();
   });
   it.each([
@@ -259,17 +273,17 @@ process.stdout.write('x'.repeat(4*1024*1024+1));
     expect(result.code).toBe(3);
     expect(await readFile(join(work,'stdin-seen'),'utf8')).toBe('');
     expect(JSON.parse(await readFile(join(work,'argv-seen'),'utf8'))).toEqual(argv.slice(1));
-    expect(await readFile(join(work,'task-seen'),'utf8')).toContain("two words a'b $(touch marker) line\nbreak|production");
+    expect(await readFile(join(work,'task-seen'),'utf8')).toContain("two words a'b $(touch marker) -t line\nbreak|production");
     await expect(stat(join(work,'marker'))).rejects.toThrow();
     const log = await readFile(join(root,'install.log'),'utf8');
     expect(log).toContain('--include=dev --ignore-scripts --no-audit --no-fund');
     expect(log).not.toContain('production');
     expect(log).not.toContain(process.env.HOME);
     expect(await runner.finish(request)).toEqual({v:1,nonce:request.nonce,run:request.run,inputDigest:request.inputDigest,
-      argvDigest:request.argvDigest,lock:request.lock,manifestDigest:request.manifestDigest,phase:'test',code:3});
+      argvDigest:request.argvDigest,lock:request.lock,manifestDigest:request.manifestDigest,phase:'test',code:3,timings:{installMs:expect.any(Number),runMs:expect.any(Number)}});
     await expect(stat(join(root,'runs',request.run))).rejects.toThrow();
     await expect(runner.finish(request)).rejects.toThrow();
-    expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.consumed']);
+    expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.consumed',request.run+'.telemetry','telemetry.json']);
   });
   it('rejects input and lock changes before install and accepts odd filenames literally', async () => {
     for (const name of ['#file',';file',"quote'`$()",'--option','é\u2028fixture','tab\tfile','trailing ']) await writeFile(join(work,name),name);
@@ -468,7 +482,7 @@ with patch.object(os, 'open', side_effect=local_open), \
      patch.object(os, 'fstat', side_effect=root_stat), patch.object(os, 'fchown') as chown:
     sys.argv = ['installer', source]
     exec(installer)
-    assert chown.call_count == 1
+    assert chown.call_count == 2
     assert chown.call_args.args[1:] == (0, 0)
 `;
     const installed=spawnSync('python3',['-I','-c',harness,installer,
@@ -477,8 +491,8 @@ with patch.object(os, 'open', side_effect=local_open), \
     });
     expect(installed.status,installed.stderr).toBe(0);
     const names=await readdir(join(local,'libexec'));
-    expect(names).toHaveLength(1);
-    const entry=join(local,'libexec',names[0]);
+    expect(names.sort()).toEqual(['forge-exec-run.mjs','forge-warm-base.mjs']);
+    const entry=join(local,'libexec','forge-exec-run.mjs');
     expect((await stat(entry)).mode & 0o777).toBe(0o755);
     // Disable newer Node's syntax detection to retain the Node 22.1 default.
     // Execute the actual shebang path, with no surrounding type:module package.
@@ -488,8 +502,27 @@ with patch.object(os, 'open', side_effect=local_open), \
     });
     expect(result.status,result.stderr).toBe(254);
     expect(result.stderr).toBe('forge-exec-run: Invalid subcommand\n');
+    const warmer=join(local,'libexec','forge-warm-base.mjs');
+    expect((await stat(warmer)).mode & 0o777).toBe(0o755);
+    const warmResult=spawnSync(warmer,['unexpected'],{cwd:local,encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+      env:{PATH:join(root,'bin')+':/usr/bin:/bin',NODE_OPTIONS:'--no-experimental-detect-module --experimental-default-type=commonjs'}});
+    expect(warmResult.status,warmResult.stderr).toBe(1);
+    expect(warmResult.stderr).toBe('forge-warm-base: No arguments accepted\n');
+    expect(setup).toContain('User=ops');
+    // The worker and ops share dependency archives through ordinary 0644/0755
+    // files. A service-wide 0077 mask makes a cold worker install unreadable to ops.
+    const serviceMask=setup.match(/^UMask=([0-7]+)$/m)[1];
+    const modes=spawnSync(process.execPath,['-e',
+      "const fs=require('node:fs');process.umask(parseInt(process.argv[1],8));const dir=process.argv[2];fs.mkdirSync(dir);fs.writeFileSync(dir+'/file','public dependency');console.log(JSON.stringify({dir:fs.statSync(dir).mode&511,file:fs.statSync(dir+'/file').mode&511}));",
+      serviceMask,join(root,'service-created')],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+    expect(modes.status,modes.stderr).toBe(0);
+    expect(JSON.parse(modes.stdout)).toEqual({dir:0o755,file:0o644});
+    expect(serviceMask).toBe('0022');
+    expect(setup).toContain('/usr/bin/flock -n /srv/forge-base/.tick.lock');
+    expect(setup).toContain('OnCalendar=*-*-* *:*:00,30');
+    expect(setup).toContain('Persistent=true');
     const client=await readFile(new URL('../remote-exec.mjs',import.meta.url),'utf8');
-    expect(client).toContain('/usr/local/libexec/'+names[0]+' ${command}');
+    expect(client).toContain('/usr/local/libexec/forge-exec-run.mjs ${command}');
   });
   it('installs a root-owned fixed wrapper, makes the old cache inert, and prunes only expired state', async () => {
     const setup=await readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');
@@ -499,8 +532,8 @@ with patch.object(os, 'open', side_effect=local_open), \
     expect(setup).toContain('("forge-receipts", ops.pw_uid, ops.pw_gid, 0o700)');
     expect(setup).toContain('("forge-cache", 0, ops.pw_gid, 0o770)');
     const prune=setup.match(/<<'PRUNE'\n([\s\S]*?)\nPRUNE/)[1];
-    expect(prune).toContain('-mmin +1440');
-    expect(prune).toContain('-mmin +20160');
+    expect(prune).toContain('86400');
+    expect(prune).toContain('1209600');
     const expired=new Date(Date.now()-16*24*60*60*1000);
     const oldRun=join(root,'runs','r-expired'), oldReceipt=join(root,'receipts','expired.receipt');
     const oldCache=join(root,'cache','expired'), newCache=join(root,'cache','fresh');
@@ -508,16 +541,19 @@ with patch.object(os, 'open', side_effect=local_open), \
     await mkdir(active,{mode:0o700});
     await mkdir(oldRun); await writeFile(oldReceipt,'old'); await mkdir(oldCache); await mkdir(newCache);
     for(const path of [oldRun,oldReceipt,oldCache,active]) await utimes(path,expired,expired);
-    const quote=value=>"'"+value.replaceAll("'", "'\\''")+"'";
-    const local=prune.replaceAll('/srv/forge-exec',quote(join(root,'runs')))
-      .replaceAll('/srv/forge-receipts',quote(join(root,'receipts')))
-      .replaceAll('/srv/forge-cache',quote(join(root,'cache')));
+    const local=prune.replaceAll('/srv/forge-exec',join(root,'runs'))
+      .replaceAll('/srv/forge-receipts',join(root,'receipts'))
+      .replaceAll('/srv/forge-cache',join(root,'cache'));
     const result=spawnSync('bash',['-c',local],{encoding:'utf8'});
     expect(result.status,result.stderr).toBe(0);
+    for(const path of [oldRun,oldReceipt,oldCache])expect((await stat(path)).isDirectory()||(await stat(path)).isFile()).toBe(true);
+    await rm(active,{recursive:true});
+    const inactive=spawnSync('bash',['-c',local],{encoding:'utf8'});
+    expect(inactive.status,inactive.stderr).toBe(0);
     for(const path of [oldRun,oldReceipt,oldCache]) await expect(stat(path)).rejects.toThrow();
     expect((await stat(newCache)).isDirectory()).toBe(true);
     expect((await stat(work)).isDirectory()).toBe(true);
-    expect((await stat(active)).isDirectory()).toBe(true);
+    await expect(stat(active)).rejects.toThrow();
   });
   it('the production CLI rejects extra argv and oversized requests', () => {
     const source=new URL('../forge-exec-run.mjs',import.meta.url);
@@ -595,7 +631,7 @@ describe('privileged finish cleanup', () => {
     expect(await isolated.finish(request)).toMatchObject({phase:'test',code:3});
     expect(cleanup).toHaveBeenCalledTimes(1);
     await expect(stat(join(root,'runs',request.run))).rejects.toThrow();
-    expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.consumed']);
+    expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.consumed',request.run+'.telemetry','telemetry.json']);
   });
   it('refuses cleanup failure without consuming state or publishing success', async () => {
     const cleanup=vi.fn(async ()=>({code:1}));
@@ -604,13 +640,13 @@ describe('privileged finish cleanup', () => {
     await expect(isolated.finish(request)).rejects.toThrow('Run cleanup failed');
     expect(cleanup).toHaveBeenCalledTimes(1);
     expect((await stat(work)).isDirectory()).toBe(true);
-    expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.receipt',request.run+'.running']);
+    expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.receipt',request.run+'.running',request.run+'.telemetry','telemetry.json']);
   });
   it('refuses claimed cleanup success when the run directory remains', async () => {
     const cleanup=vi.fn(async ()=>({code:0}));
     const isolated=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testCleanupExec:cleanup});
     await expect(isolated.finish(request)).rejects.toThrow('Run cleanup incomplete');
-    expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.prepared']);
+    expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.prepared',request.run+'.telemetry','telemetry.json']);
     expect((await stat(work)).isDirectory()).toBe(true);
   });
   it('does not delegate invalid or symlink-swapped run containers', async () => {
@@ -660,16 +696,16 @@ exec /usr/bin/sudo -n /usr/bin/python3 -I -c ${quote(task)}
   expect(await isolated.finish(request)).toMatchObject({phase:'test',code:0});
   expect(cleanup).toHaveBeenCalledTimes(1);
   await expect(stat(join(root,'runs',request.run))).rejects.toThrow();
-  expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.consumed']);
+  expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.consumed',request.run+'.telemetry','telemetry.json']);
 });
 
 
 // Manifest acceptance contract (Round 1): isTestFile(path:Buffer) -> boolean;
 // verifyManifest(root, manifest, manifestDigest, {fs?} = {}) -> {entries, testPaths}.
-// entries = [{path:Buffer, sha256:string, executable:boolean}], testPaths = Buffer[].
+// entries = [{path:Buffer, sha256:string, executable:boolean, tracked:boolean}], testPaths = Buffer[].
 // fs defaults to node:fs/promises (lstat/readFile/readdir, Buffer paths/names).
-// Wire manifest = {paths:base64(NUL-terminated byte paths), hashes:hexSHA256[],
-//   executable:boolean[], excluded:base64(NUL-terminated excluded byte paths)};
+// Wire manifest v2 = {v:2, paths:base64(NUL-terminated byte paths), hashes:hexSHA256[],
+//   executable:boolean[], tracked:boolean[], excluded:base64(NUL-terminated excluded byte paths)};
 // manifestDigest = sha256(JSON.stringify(manifest)), in that property order.
 // Both path lists are strictly byte-sorted; excluded files must be absent.
 // Invalid UTF-8 is allowed only for non-test byte paths; base64 is canonical.
@@ -678,9 +714,11 @@ describe('certified snapshot equals selected inventory: Forge acceptance', () =>
   function makeManifest(entries, excluded = []) {
     const ordered = [...entries].sort((a,b) => Buffer.compare(a.path,b.path));
     const manifest = {
+      v:2,
       paths:nul(ordered.map(entry => entry.path)).toString('base64'),
       hashes:ordered.map(entry => entry.sha256),
       executable:ordered.map(entry => entry.executable),
+      tracked:ordered.map(entry => entry.tracked ?? false),
       excluded:nul([...excluded].sort(Buffer.compare)).toString('base64'),
     };
     return {manifest, manifestDigest:hash(JSON.stringify(manifest))};
@@ -697,6 +735,21 @@ describe('certified snapshot equals selected inventory: Forge acceptance', () =>
     expect(manifestAPI.verifyManifest, 'export the pre-execution exact snapshot verifier').toBeTypeOf('function');
     return manifestAPI.verifyManifest(work, manifest, digest, options);
   }
+
+  it.each(['legacy','unknown version','missing tracked','tracked count','tracked type','tampered tracked'])
+  ('refuses %s tracking evidence rather than accepting an old digest as proof',async fault=>{
+    Object.assign(request,await snapshot());
+    const manifest=request.manifest;
+    if(fault==='legacy'){delete manifest.v;delete manifest.tracked;}
+    if(fault==='unknown version')manifest.v=3;
+    if(fault==='missing tracked')delete manifest.tracked;
+    if(fault==='tracked count')manifest.tracked=[];
+    if(fault==='tracked type')manifest.tracked=['true'];
+    if(fault==='tampered tracked')manifest.tracked[0]=!manifest.tracked[0];
+    else request.manifestDigest=hash(JSON.stringify(manifest));
+    await expect(runner.run(request)).rejects.toThrow(/manifest|digest|tracking/i);
+    await expectNoExecutionOrReceipt();
+  });
   async function expectNoExecutionOrReceipt() {
     expect(await readFile(join(root,'install.log'),'utf8').catch(error => {
       if (error.code !== 'ENOENT') throw error;
@@ -718,10 +771,11 @@ describe('certified snapshot equals selected inventory: Forge acceptance', () =>
     expect(manifestAPI.isTestFile(Buffer.from(path))).toBe(expected);
   });
 
-  it.each(['extra file','missing file','hash mismatch','extra test file','exec bit mismatch'])
+  it.each(['extra directory','extra file','missing file','hash mismatch','extra test file','exec bit mismatch'])
   ('rejects %s before installation even when inputDigest matches the current disk', async fault => {
     await writeFile(join(work,'identity.test.mjs'),'original assertion');
     Object.assign(request, await snapshot(['package-lock.json','identity.test.mjs']));
+    if (fault === 'extra directory') await mkdir(join(work,'unexpected'));
     if (fault === 'extra file') await writeFile(join(work,'extra.json'),'extra');
     if (fault === 'extra test file') await writeFile(join(work,'credentials.test.mjs'),'hidden assertion');
     if (fault === 'missing file') await rm(join(work,'identity.test.mjs'));
@@ -815,7 +869,7 @@ describe('certified snapshot equals selected inventory: Forge acceptance', () =>
       }),
     };
     const verified = await verify(manifest,manifestDigest,{fs});
-    expect(verified.entries).toEqual([{path,sha256:hash('assertion'),executable:false}]);
+    expect(verified.entries).toEqual([{path,sha256:hash('assertion'),executable:false,tracked:false}]);
     expect(verified.testPaths).toEqual([]);
     expect(fs.readFile).toHaveBeenCalled();
   });
@@ -897,5 +951,46 @@ if (globalThis.loaded !== ${tests.length}) process.exit(9);
     expect(selected.has('scripts/__tests__/credentials.js')).toBe(true);
     expect(selected.has('notes.test.txt')).toBe(false);
     expect(selected.has('support.js')).toBe(false);
+  });
+});
+
+
+describe('sibling manifest verification', () => {
+  async function withSiblings() {
+    const sibling = join(root,'runs',request.run,'frontierui');
+    const entries=[];
+    for (const subtree of ['plugs','webtheme']) {
+      await mkdir(join(sibling,subtree),{recursive:true});
+      await writeFile(join(sibling,subtree,'index.js'),subtree);
+      entries.push({path:Buffer.from(`${subtree}/index.js`),sha256:hash(subtree),executable:false});
+    }
+    request.manifest.siblings={frontierui:{sha:'a'.repeat(40),...manifestAPI.manifestWire({entries,excluded:[]})}};
+    request.manifestDigest=manifestAPI.digestManifest(request.manifest);
+    request.siblingShas={frontierui:'a'.repeat(40)};
+    return sibling;
+  }
+  it('advertises sibling support and puts the sibling SHA in protected receipts', async () => {
+    expect(await runner.prepare({nonce:request.nonce})).toMatchObject({capabilities:{siblings:1}});
+    await withSiblings();
+    expect((await runner.run(request)).code).toBe(3);
+    expect(await runner.finish(request)).toMatchObject({siblingShas:request.siblingShas});
+  });
+  it.each(['extra','extra directory','missing','outside allowlist','wrong sha','missing sha','oversized'])
+  ('rejects %s sibling evidence and writes protected rejected state before executing', async fault => {
+    const sibling=await withSiblings();
+    if (fault==='extra directory') await mkdir(join(sibling,'plugs/unexpected'));
+    if (fault==='extra') await writeFile(join(sibling,'plugs/extra.js'),'extra');
+    if (fault==='missing') await rm(join(sibling,'webtheme/index.js'));
+    if (fault==='outside allowlist') request.manifest.siblings.frontierui.paths=Buffer.from('other/index.js\0').toString('base64');
+    if (fault==='wrong sha') request.siblingShas.frontierui='0'.repeat(40);
+    if (fault==='missing sha') delete request.siblingShas;
+    if (fault==='oversized') request.manifest.siblings.frontierui.excluded='x'.repeat(4*1024*1024);
+    request.manifestDigest=manifestAPI.digestManifest(request.manifest);
+    await expect(runner.run(request)).rejects.toThrow();
+    await expect(readFile(join(root,'install.log'))).rejects.toMatchObject({code:'ENOENT'});
+    const rejected=join(root,'receipts',request.run+'.rejected');
+    expect(JSON.parse(await readFile(rejected,'utf8'))).toMatchObject({nonce:request.nonce,run:request.run,phase:'rejected'});
+    expect((await stat(rejected)).mode & 0o777).toBe(0o600);
+    expect(await runner.finish(request)).toMatchObject({phase:'rejected',started:false});
   });
 });
