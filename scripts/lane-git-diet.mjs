@@ -179,14 +179,15 @@ const auditGitDir = (dir) => {
 };
 // Every ref a symbolic ref points at, seen from the lane's own git dir and from each linked worktree's (its HEAD,
 // root refs and per-worktree refs). `%(symref)` resolves a whole chain to its last ref, so each symbolic ref's own
-// next hop is read unresolved too: every ref along a chain (HEAD → ops/a → ops/b → ops/c) is kept. Ref names hold no
-// whitespace, so one per line and a space separator are exact. Any read failure throws: lane error row.
+// next hop is read unresolved too: every ref along a chain (HEAD → ops/a → ops/b → ops/c) is kept. Ref names exclude
+// ASCII spaces/control characters, but may contain Unicode whitespace: strip only Git's output newline.
+// One per line and an ASCII space separator are exact. Any read failure throws: lane error row.
 const symrefTargets = (dir) => {
   let ids = [];
   try { ids = readdirSync(join(dir, '.git', 'worktrees')); } catch (err) { if (!['ENOENT', 'ENOTDIR'].includes(err.code)) throw err; }
   const targets = new Set();
   for (const gitDir of [join(dir, '.git'), ...ids.map((id) => join(dir, '.git', 'worktrees', id))]) {
-    const nextHop = (ref) => { try { targets.add(git(dir, [`--git-dir=${gitDir}`, 'symbolic-ref', '-q', '--no-recurse', ref]).trim()); } catch (e) { if (e.status !== 1) throw e; } }; // 1: not symbolic (detached HEAD)
+    const nextHop = (ref) => { try { targets.add(git(dir, [`--git-dir=${gitDir}`, 'symbolic-ref', '-q', '--no-recurse', ref]).replace(/\r?\n$/, '')); } catch (e) { if (e.status !== 1) throw e; } }; // 1: not symbolic (detached HEAD)
     // Files-format root refs are loose uppercase files. Enumerate them explicitly: --include-root-refs needs 2.46.
     // Packed refs cannot be symbolic; for-each-ref below still covers both loose and packed refs/ entries.
     nextHop('HEAD');

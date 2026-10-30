@@ -16,6 +16,21 @@ import {
 
 describe('hook repair failures cannot silently disable commit guards', () => {
   const get = ['config', '--show-scope', '--get', 'core.hooksPath'];
+  it('skips an absent untracked hook under a non-English locale', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'identity-hooks-locale-'));
+    try {
+      execFileSync('git', ['init', '-q', dir]);
+      vi.stubEnv('LC_ALL', 'fr_FR.UTF-8');
+      vi.stubEnv('LANG', 'fr_FR.UTF-8');
+      vi.stubEnv('LANGUAGE', 'fr');
+      for (const write of [false, true]) {
+        expect(ensureLaneHooksPath(dir, { write, log: () => {} })).toEqual({ status: 'skipped' });
+      }
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   it('repairs the directory Git actually uses, so a previously skipped real hook executes', () => {
     const dir = mkdtempSync(join(tmpdir(), 'identity-hooks-'));
     const env = { PATH: process.env.PATH, HOME: dir, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(dir, 'global-config') };

@@ -210,7 +210,8 @@ function hooksVerifyEnv(env) {
   delete out.GIT_EXTERNAL_DIFF;
   // No lazy fetch: a sparse index whose `.githooks` tree is missing from a lane-declared promisor remote made `ls-files`
   // fetch through the lane's `remote.origin.uploadpack` (PR #5775 self-review). Without it, git fails (→ `error`).
-  return { ...out, GIT_PAGER: 'cat', PAGER: 'cat', GIT_NO_LAZY_FETCH: '1' };
+  // The clean ls-files non-match below is recognized by its exact English diagnostic, on every host locale.
+  return { ...out, LC_ALL: 'C', LANGUAGE: 'C', GIT_PAGER: 'cat', PAGER: 'cat', GIT_NO_LAZY_FETCH: '1' };
 }
 
 /**
