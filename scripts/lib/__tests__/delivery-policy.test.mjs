@@ -5,6 +5,7 @@ import { Worker } from 'node:worker_threads';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { performance } from 'node:perf_hooks';
 import ts from 'typescript';
 import { PLATFORM_DELIVERY_POLICY_DEFAULTS as defaults } from '../../../config/deliveryPolicyDefaults';
 import * as gate from '../gate-config.mjs';
@@ -1167,6 +1168,38 @@ describe('policy journal', () => {
       recordPolicyEvent({ event: 'after-slow-holder' }, env);
     } finally { sleep.mockRestore(); }
     expect(readPolicyEvents({ env })).toMatchObject([{ event: 'after-slow-holder' }]);
+  });
+
+  it.each([-3600000, 3600000])('bounds a live lock wait by monotonic time when wall time steps %ims', step => {
+    const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
+    const owner = JSON.stringify({ pid: process.pid, token: 'live-owner' });
+    writeFileSync(lock, owner);
+    const wallStart = Date.now();
+    let elapsed = 0, wallStep = 0;
+    const monotonic = vi.spyOn(performance, 'now').mockImplementation(() => elapsed);
+    const wall = vi.spyOn(Date, 'now').mockImplementation(() => wallStart + elapsed + wallStep);
+    const sleep = vi.spyOn(Atomics, 'wait').mockImplementation((_cell, _index, _value, ms) => {
+      // The first sleep happens after the deadline is computed. Advance monotonic
+      // time by the requested sleep, but step the wall clock independently.
+      wallStep = step;
+      elapsed += ms;
+      if (elapsed >= 2000) throw Error('Lock wait exceeded its monotonic budget');
+      return 'timed-out';
+    });
+    try {
+      expect(() => deliveryPolicy.appendPolicyJournal(env.WE_POLICY_EVENTS_FILE, '{}\n', {
+        allowedRoots: [dir],
+      })).toThrow(/lock timeout; event not recorded/);
+      expect(Date.now() - wallStart).toBe(elapsed + step);
+      expect(elapsed).toBeGreaterThanOrEqual(1000);
+      expect(elapsed).toBeLessThan(1080);
+      expect(readFileSync(lock, 'utf8')).toBe(owner);
+      expect(readPolicyEvents({ env })).toEqual([]);
+    } finally {
+      sleep.mockRestore();
+      wall.mockRestore();
+      monotonic.mockRestore();
+    }
   });
 
   it('refuses a live lock within a bounded wait without stopping the daemon', () => {

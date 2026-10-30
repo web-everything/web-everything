@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readSync, realpathSync, rmSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
+import { performance } from 'node:perf_hooks';
 import { pathToFileURL } from 'node:url';
 import { defaultLogsDir } from '../conveyor/health-watch.mjs';
 import { daemonStateDir } from './daemon-last-good.mjs';
@@ -320,7 +321,8 @@ export function appendPolicyJournal(path, record, options = {}) {
   // A time budget, not an attempt count: a live holder on a loaded host (CI shards run
   // at load 40+) can keep the lock well past ten short sleeps, and a refused append is
   // a silently lost event. The budget stays far below the 30s stale age.
-  const deadline = Date.now() + JOURNAL_LOCK_WAIT_MS;
+  // Monotonic time keeps wall-clock corrections from changing the wait budget.
+  const deadline = performance.now() + JOURNAL_LOCK_WAIT_MS;
   for (let attempt = 0; ; attempt++) {
     try {
       held = lock.open(constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL);
@@ -331,7 +333,7 @@ export function appendPolicyJournal(path, record, options = {}) {
       if (existing && reclaimable(existing)) {
         // Recheck age and liveness under the generation's removal guard too.
         lock.remove(existing, reclaimable);
-      } else if (Date.now() < deadline) {
+      } else if (performance.now() < deadline) {
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(10 * (attempt + 1), 80));
       } else break;
     }
