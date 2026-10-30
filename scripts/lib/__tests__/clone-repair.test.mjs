@@ -645,11 +645,15 @@ describe('fetch paths call the repair first', () => {
 // fetch) reddens this. (The drain data clone is the incident's actual clone.)
 describe('every daemon fetch site repairs first', () => {
   const root = join(import.meta.dirname, '..', '..', '..');
-  const body = (file, startRe) => {
+  const body = (file, startRe, endRe) => {
     const src = readFileSync(join(root, file), 'utf8');
     const at = src.search(startRe);
     expect(at, `${file} ${startRe}`).toBeGreaterThanOrEqual(0);
-    return src.slice(at, at + 4000);
+    // Bound by the step/function, not its character count: snapshot checks can grow the fetch prelude.
+    const rest = src.slice(at);
+    const end = rest.search(endRe);
+    expect(end, `${file} ${endRe}`).toBeGreaterThanOrEqual(0);
+    return rest.slice(0, end);
   };
   const repairsBeforeFetch = (text) => {
     const repair = text.indexOf('repairCloneRefs(');
@@ -657,12 +661,16 @@ describe('every daemon fetch site repairs first', () => {
     return repair >= 0 && fetch >= 0 && repair < fetch;
   };
   it.each([
-    ['scripts/lib/daemon-rebuild/prepare.mjs', /Step 2: fetch/],
-    ['scripts/lane-drain.mjs', /function syncMain\(/],
-    ['scripts/lane-drain.mjs', /function readResolveReachable\(/],
-    ['scripts/lib/daemon-self-sync.mjs', /export function selfSyncCheckoutPoc\(/],
-  ])('%s %s', (file, re) => {
-    expect(repairsBeforeFetch(body(file, re))).toBe(true);
+    ['scripts/lib/daemon-rebuild/prepare.mjs', /Step 2: fetch/, /Step 3: plan/],
+    ['scripts/lane-drain.mjs', /function syncMain\(/, /\n\n/],
+    ['scripts/lane-drain.mjs', /function readResolveReachable\(/, /^}/m],
+    ['scripts/lib/daemon-self-sync.mjs', /export function selfSyncCheckoutPoc\(/, /^}/m],
+  ])('%s %s', (file, re, endRe) => {
+    const scope = body(file, re, endRe);
+    expect(repairsBeforeFetch(scope)).toBe(true);
+    const withoutRepair = scope.replace('repairCloneRefs(', 'removedRepair(');
+    expect(repairsBeforeFetch(withoutRepair)).toBe(false);
+    expect(repairsBeforeFetch(`${withoutRepair}\nrepairCloneRefs()`)).toBe(false);
   });
 });
 

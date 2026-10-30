@@ -111,7 +111,7 @@ describe('cloneKey / overlayFilePath', () => {
 describe('readOverlays / readOverlayState', () => {
   it('missing file ⇒ [] and corrupt:false, never throws', () => {
     expect(readOverlays(cloneRoot, { env: env() })).toEqual([]);
-    expect(readOverlayState(cloneRoot, { env: env() })).toEqual({ clone: null, overlays: [], corrupt: false });
+    expect(readOverlayState(cloneRoot, { env: env() })).toEqual({ clone: null, overlays: [], generation: 0, corrupt: false });
   });
 
   it('corrupt (unparsable) file ⇒ [] and corrupt:true, never throws', () => {
@@ -155,7 +155,7 @@ describe('writeOverlays', () => {
 describe('addOverlay', () => {
   it('adds a new entry', () => {
     const list = addOverlay(cloneRoot, { ref: 'lane/foo', pr: 12, addedBy: 'nic', reason: 'fix' }, { env: env() });
-    expect(list).toEqual([{ ref: 'lane/foo', pr: 12, addedAt: expect.any(String), addedBy: 'nic', reason: 'fix' }]);
+    expect(list).toEqual([{ ref: 'lane/foo', registrationId: expect.any(String), pr: 12, addedAt: expect.any(String), addedBy: 'nic', reason: 'fix' }]);
   });
 
   it('duplicate ref updates pr/reason in place and keeps position + original addedAt/addedBy', () => {
@@ -248,7 +248,7 @@ describe('CLI (spawnSync, --no-lock — never imports daemon-clone-lock.mjs)', (
     const r = run(['add', `--clone=${cloneDir}`, '--ref=lane/cli-test', '--pr=7', '--by=tester', '--no-lock', '--json']);
     expect(r.status, r.stderr).toBe(0);
     const out = JSON.parse(r.stdout);
-    expect(out.list).toEqual([{ ref: 'lane/cli-test', pr: 7, addedAt: expect.any(String), addedBy: 'tester', reason: null }]);
+    expect(out.list).toEqual([{ ref: 'lane/cli-test', registrationId: expect.any(String), pr: 7, addedAt: expect.any(String), addedBy: 'tester', reason: null }]);
     const events = readFileSync(join(overlayDir, `${cloneKey(cloneDir)}.events.jsonl`), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ kind: 'added', ref: 'lane/cli-test', pr: 7 });
