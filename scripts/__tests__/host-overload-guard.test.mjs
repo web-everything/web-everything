@@ -347,6 +347,26 @@ it('scheduled gc falls back only for an unsupported --no-detach, retaining foreg
   expect(exec).toHaveBeenCalledTimes(2);
 });
 
+it.each([
+  { status: 129, stderr: 'fatal: bad object' },
+  { status: 1, stderr: "error: unknown option `no-detach'\n" },
+  { status: 1 },
+  { code: 'ETIMEDOUT', stderr: "error: unknown option `no-detach'\n" },
+])('scheduled gc does not retry an unrelated failure: %j', async (failure) => {
+  const { scheduledLaneGc } = await import('../lib/host-load.mjs');
+  const exec = vi.fn(() => { throw Object.assign(new Error('gc failed'), failure); });
+  const log = vi.fn();
+  const opts = { stateRoot: temp(), exec, admission: () => ({ admitted: true }), log, schedule: 60000, nowMs: 100000 };
+  expect(scheduledLaneGc(['/pool/lane-1'], opts)).toEqual({ ran: false, reason: '1 lane gc run(s) failed' });
+  expect(exec).toHaveBeenCalledTimes(1);
+  expect(exec.mock.calls[0][1]).toContain('--no-detach');
+  expect(log.mock.calls.flat().join(' ')).toContain('/pool/lane-1');
+  // Failed work remains due; a later scheduled pass may try once again.
+  exec.mockClear();
+  scheduledLaneGc(['/pool/lane-1'], opts);
+  expect(exec).toHaveBeenCalledTimes(1);
+});
+
 it('a failing gc lane does not starve later lanes or advance its successful-run cursor', async () => {
   const { scheduledLaneGc } = await import('../lib/host-load.mjs');
   const stateRoot = temp();

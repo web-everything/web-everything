@@ -894,7 +894,8 @@ export async function runFixCli(argv = [], {
       const path = resolve(lanePath, git('rev-parse', '--git-path', 'info/attributes').trim());
       let original = null;
       try {
-        if (!nodeFs.lstatSync(path).isFile()) throw new LauncherError('cannot bound conflict markers: info/attributes is not a regular file; restore it before retrying');
+        const stat = nodeFs.lstatSync(path);
+        if (!stat.isFile() || stat.nlink !== 1) throw new LauncherError('cannot bound conflict markers: info/attributes must be a single-link regular file; restore it before retrying');
         original = readFileSync(path);
       } catch (e) { if (e.code !== 'ENOENT') throw e; }
       // C-quote bytes and escape glob metacharacters: even whitespace/newline/glob-bearing paths match literally.

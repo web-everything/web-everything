@@ -986,6 +986,41 @@ describe('runFixCli', () => {
       await check({ out, m, git, dir, recordOutcome });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   };
+  it.each(['hardlink', 'symlink', 'directory'])('refuses a %s marker override before writes or merge', async (kind) => {
+    const root = mkdtempSync(join(tmpdir(), 'fix-marker-link-'));
+    const outside = join(root, 'outside');
+    const lane = join(root, 'lane');
+    const attributes = join(lane, 'attributes');
+    const original = '# preserve outside bytes\n';
+    mkdirSync(lane);
+    writeFileSync(outside, original);
+    if (kind === 'hardlink') linkSync(outside, attributes);
+    else if (kind === 'symlink') symlinkSync(outside, attributes);
+    else mkdirSync(attributes);
+    const m = mk(['aaa', 'aaa']);
+    const observed = [];
+    const run = (cmd, args, opts) => {
+      if (args.includes('acquire')) return JSON.stringify({ path: lane, holder: 'test-holder' });
+      if (cmd === 'git' && args.includes('ls-tree')) return 'file.txt\0';
+      if (cmd === 'git' && args.includes('check-attr')) return ['file.txt', 'conflict-marker-size', '99999999999', ''].join('\0');
+      if (cmd === 'git' && args.includes('--git-path')) return args.at(-1) === 'info/attributes' ? attributes : join(lane, 'MERGE_HEAD');
+      if (cmd === 'git' && args.includes('merge') && args.includes('--no-commit')) {
+        observed.push(readFileSync(outside, 'utf8'));
+        throw new Error('probe stopped merge');
+      }
+      return m.run(cmd, args, opts);
+    };
+    const recordOutcome = vi.fn();
+    try {
+      const out = await runFixCli([...argv, '--merge-onto=main'], { ...m.io, run, recordOutcome, fileExists: () => false });
+      expect(observed).toEqual([]);
+      expect(out.code).toBe(1);
+      expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ reason: expect.stringContaining('info/attributes') }));
+      expect(readFileSync(outside, 'utf8')).toBe(original);
+      expect(m.spawn).not.toHaveBeenCalled();
+      expect(m.calls.some(c => c.includes('commit') || c.includes('push'))).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   it('refuses an overlong literal marker override before merge, preserving local attributes', async () => {
     const path = Array(5).fill('a'.repeat(100)).join('/') + '.txt';
     const effective = [];

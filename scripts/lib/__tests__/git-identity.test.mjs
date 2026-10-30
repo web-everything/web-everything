@@ -16,6 +16,32 @@ import {
 
 describe('hook repair failures cannot silently disable commit guards', () => {
   const get = ['config', '--show-scope', '--get', 'core.hooksPath'];
+  const notTracked = "error: pathspec '.githooks/pre-commit' did not match any file(s) known to git\nDid you forget to 'git add'?\n";
+  it.each([
+    { status: 1, stderr: 'error: unable to read tree deadbeef\n' },
+    { status: 1, stderr: 'error: unable to read tree deadbeef\n' + notTracked },
+    { status: 1, stderr: notTracked + 'fatal: index read failed\n' },
+    { status: 1, stderr: notTracked.split('\n')[0] + '\n' },
+    { status: 1, stdout: 'x', stderr: '' },
+    { status: 1, stdout: Buffer.from('x'), stderr: Buffer.from(notTracked) },
+    { status: 128, stderr: notTracked },
+  ])('hook repair refuses an unproven non-match: %j', (failure) => {
+    for (const write of [false, true]) {
+      const run = vi.fn(() => { throw Object.assign(new Error('ls-files failed'), failure); });
+      const log = vi.fn();
+      expect(ensureLaneHooksPath('/lane', { write, exists: () => false, run, log })).toMatchObject({ status: 'error' });
+      expect(run).toHaveBeenCalledTimes(1);
+      expect(run).toHaveBeenCalledWith(['ls-files', '--error-unmatch', '--', '.githooks/pre-commit']);
+      expect(log.mock.calls.flat().join(' ')).toContain('pre-commit guards');
+    }
+  });
+  it.each(['', notTracked])('hook repair accepts a clean non-match diagnostic %j', (stderr) => {
+    for (const write of [false, true]) {
+      const run = vi.fn(() => { throw Object.assign(new Error('not tracked'), { status: 1, stdout: '', stderr }); });
+      expect(ensureLaneHooksPath('/lane', { write, exists: () => false, run, log: () => {} })).toEqual({ status: 'skipped' });
+      expect(run).toHaveBeenCalledTimes(1);
+    }
+  });
   it('skips an absent untracked hook under a non-English locale', () => {
     const dir = mkdtempSync(join(tmpdir(), 'identity-hooks-locale-'));
     try {

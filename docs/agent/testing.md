@@ -1207,6 +1207,11 @@ prevent even read-only repository commands: inspect configuration with `git conf
 prove refusal by comparing filesystem bytes. Git's fetch negotiation may avoid a stale commit-graph,
 so verify an existing graph explicitly when testing corruption admission and repair. An `ls-files`
 exit 1 alone does not prove an untracked path: sparse-tree read failures can share that exit status.
+For a narrowed catch, keep one negative test per independent condition: the expected status with
+an unrelated diagnostic, and the expected diagnostic with another status. Fail-closed hook checks
+also need nonempty stdout and extra or partial stderr cases, in both reporting and repair modes.
+A test promising "only" or "never" must exercise the excluded case as well as the permitted one;
+assert the absence of retries or writes, not just the returned error.
 Send repository-sized path lists through NUL-delimited stdin, not argv; real-Git regressions should
 exceed the host's `getconf ARG_MAX` and prove the argv form fails with `E2BIG` while stdin succeeds.
 
