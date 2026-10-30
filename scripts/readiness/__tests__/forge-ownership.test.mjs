@@ -41,7 +41,12 @@ it.each(['work','container'])('prepare refuses a replaced %s endpoint without to
   const victim=join(root,'unrelated');await fs.mkdir(victim,{mode:0o700});
   await fs.writeFile(join(victim,'keep'),'unchanged');
   const before=await fs.stat(victim);let calls=0;
+  const worker={uid:process.getuid()+1,gid:process.getgid()+1};
   const runner=runnerAPI.createRunner({testRoot:root,
+    testWorkerIdentity:()=>({...worker,groups:[worker.gid]}),
+    // Model the private slot group on unprivileged hosts; retain real modes,
+    // inodes and the descriptor-based handoff that must reject the symlink.
+    testSlotStat:async path=>Object.assign(await fs.lstat(path),{gid:worker.gid}),
     testOwnershipExec:async call=>{
       calls++;
       const cfg=JSON.parse(call.args.at(-1)),path=join(cfg.root,...cfg.parts.slice(0,target==='container'?-1:undefined));
@@ -117,7 +122,10 @@ await fs.chown(join(root,'runs','slot-1'),0,gid);
 await fs.mkdir(join(root,'runs','slot-2'),{mode:0o710});
 await fs.chown(join(root,'runs','slot-2'),0,65534);
 const victim=join(root,'runs','slot-2'),before=await fs.stat(victim);let attempted=0;
-const runner=createRunner({testRoot:root,testWorkerIdentity:user=>({uid:user.endsWith('-1')?uid:65534,gid:user.endsWith('-1')?gid:65534}),
+const runner=createRunner({testRoot:root,testWorkerIdentity:user=>{
+  const worker=user.endsWith('-1')?{uid,gid}:{uid:65534,gid:65534};
+  return {...worker,groups:[worker.gid]};
+},
   testOwnershipExec:async call=>{
     const cfg=JSON.parse(call.args.at(-1)),run=cfg.parts[1];
     const actor=spawnSync('python3',['-I','-c',
