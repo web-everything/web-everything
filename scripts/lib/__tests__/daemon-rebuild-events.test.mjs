@@ -169,7 +169,7 @@ describe('rebuildClone coordination events', () => {
   it.each([
     'tick-in-progress', 'reader-priority', 'concurrent-mover', 'smoke-backoff', 'held-after-rollback',
     'disabled', 'dirty', 'dirty-tree', 'local-commits', 'index-locked', 'switch-busy',
-    'smoke-env-load', 'future-benign-reason',
+    'smoke-env-load', 'closure-opaque', 'future-benign-reason',
   ])('does not announce a failure for a hold or unknown reason: %s', async (reason) => {
     terminal({ moved: false, reason });
     await rebuildClone(options);
@@ -267,7 +267,8 @@ describe('rebuildClone coordination events', () => {
       'stack-contained', 'state-file-busy', 'superseded-live-set-unknown', 'superseded-omits-live-overlay',
       'swapped', 'switch-busy', 'touches-dispatch-path', 'unknown', 'unsafe-ref', 'untracked-collision',
       'unverified-build', 'up-to-date', 'scoped-noop', 'fixpoint-exhausted',
-      'entries-unreadable', 'closure-incomplete', 'closure-too-large', 'scope-unreadable',
+      // Opaque scope evidence retains all files; this is a planning fallback.
+      'entries-unreadable', 'closure-incomplete', 'closure-opaque', 'closure-too-large', 'scope-unreadable',
     ]);
     const reasons = new Set();
     function collect(expression) {
