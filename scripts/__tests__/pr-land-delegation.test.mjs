@@ -5,8 +5,6 @@ import { mkdtempSync, writeFileSync, chmodSync, existsSync, rmSync } from 'node:
 import { tmpdir } from 'node:os';
 import { buildDelegationMarker, parseDelegationMarker } from '../lib/delegation-marker.mjs';
 import { parseAuthorActorId } from '../lib/review-independence.mjs';
-// Load the shared CLI dependency graph during collection, outside each test's deadline.
-import '../pr-land.mjs';
 
 const originalArgv = process.argv;
 afterEach(() => {
@@ -17,13 +15,14 @@ afterEach(() => {
 });
 const triple = { provider: 'codex', model: 'gpt-6-astra', taskType: 'bugfix' };
 let loadN = 0;
-const prLandPath = resolve(import.meta.dirname, '../pr-land.mjs');
 async function load(args = []) {
   vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'author-session');
   process.argv = ['node', 'test-import', ...args];
-  // Re-evaluate argv-derived defaults without reloading the entire CLI dependency graph.
-  // Vite cannot statically resolve a relative template with a query, so build an absolute specifier.
-  return import(/* @vite-ignore */ `${prLandPath}?fresh=${++loadN}`);
+  // Re-evaluate the module-scope flags without rebuilding the entire transitive graph.
+  // Clearing every dependency on each case exhausted the unchanged 5s test deadline.
+  // @vite-ignore: under --coverage the variable query is otherwise rewritten into a glob map that
+  // has no `?fresh=N` key ("Unknown variable dynamic import"); the plain specifier resolves normally.
+  return import(/* @vite-ignore */ `../pr-land.mjs?fresh=${++loadN}`);
 }
 
 describe('pr-land --delegation', () => {
