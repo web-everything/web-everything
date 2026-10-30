@@ -884,7 +884,10 @@ Its token/SHA-bound result is durable before the completion lock is attempted. L
 consume that result or recover a missing/dead/expired worker as `quick-soak-unavailable`; the
 one-hour deadline is derived from the exact recorded `adoptedAt`. Failure/unavailability rolls
 back to the previous last-good record; an unsafe rollback quarantines rather than discarding dirt.
-Quick partial passes never enter the full-smoke proof cache. Regression home:
+Quick partial passes never enter the full-smoke proof cache.
+Quick quarantine retries and interrupted-adoption recovery use the same untracked-aware guarded rollback
+as soak settlement; ignored files and ancestor-path collisions must survive recovery with quarantine and a needs-you page.
+Regression home:
 `scripts/lib/__tests__/daemon-rebuild-quick.test.mjs` (private state/lock roots and injected children).
 
 Pipeline fixtures keep dispatch entry bytes identical while renaming, removing or adding a
@@ -2869,3 +2872,21 @@ the current occupant as ours. Git optional locks are disabled, so status does no
 refresh the index. The live PR head may have advanced since an incident; compare
 against the SHA the probe actually reports. Regression files: `fix-run-lane-head.test.mjs`,
 `fix-run.test.mjs`, and `fix-run-borrow-dies.test.mjs` under `scripts/operations/__tests__/`.
+
+### Quick soak contention and recovery
+
+`daemon-rebuild-quick.test.mjs` covers the post-adopt read barrier (ten one-minute retries),
+three durable soak attempts relaunched only at tick boundaries, and the original one-hour adoption
+budget across retries. Historical markers with no `soakAttempts` count as attempt one; malformed
+or exhausted counters fail closed. Rotate the token before scheduling a retry so late worker evidence
+cannot settle its successor. Terminal unavailable outcomes and refused rollbacks emit
+`quick-soak-needs-you` with the rollback result as well as the normal outcome alert.
+Quick settlement opts into `rollbackToSha`'s untracked-file exception; its default still refuses
+untracked dirt, and tracked changes always refuse. Keep the real-Git sidecar-preservation cases.
+
+The untracked exception must reject collisions with the rollback target, including a sidecar at
+an exact target path, a file obstructing a target directory, or a directory obstructing a target
+file. Include ignored files in the collision inventory. The named real-Git collision regressions
+assert refusal, unchanged HEAD, preservation of binary sidecar bytes, quarantine and paging.
+Failed, missing, truncated or oversized path inventories refuse rollback as `status-failed`;
+keep the named evidence-refusal cases alongside the preservation cases.

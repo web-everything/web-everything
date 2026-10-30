@@ -4,12 +4,13 @@
  * cannot move underneath them. A failed completion lock leaves a durable result for the next tick.
  */
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { setTimeout as pauseFor } from 'node:timers/promises';
+import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { hostname } from 'node:os';
-import { cloneKey } from '../daemon-overlays.mjs';
+import { cloneKey, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { withReadLock, withWriteLock } from '../daemon-clone-lock.mjs';
 import { runLiveSmoke, rollbackToSha } from '../daemon-live-smoke.mjs';
 import { gitRun } from '../main-staleness.mjs';
@@ -28,6 +29,9 @@ export const QUICK_SOAK_JOB_KIND = defineJobKind({
   kind: 'daemon-quick-soak', entry: 'scripts/lib/daemon-rebuild/quick-soak-job.mjs',
   codeMode: 'readonly-tree', serial: true, nodeModules: true, maxAttempts: 1,
 });
+export const QUICK_SOAK_MAX_ATTEMPTS = 3;
+const BARRIER_RETRIES = 10;
+const BARRIER_RETRY_MS = 60_000;
 const KINDS = kindRegistry([QUICK_SOAK_JOB_KIND]);
 // Job-store failure text (markFailed's `reason` key); consts keep it out of the rebuild-reason inventory.
 const JOB_FAIL_LAUNCHER = 'quick soak launcher unavailable';
@@ -46,6 +50,29 @@ function alert(root, env, kind, detail, log = console) {
   } catch { /* same best-effort audit trail as the rebuild's other alerts; console remains visible */ }
 }
 
+// Missing counters are historical first attempts. Malformed counters exhaust the budget fail-closed.
+const attemptsOf = marker => marker.soakAttempts === undefined ? 1
+  : Number.isSafeInteger(marker.soakAttempts) && marker.soakAttempts >= 1
+    ? Math.min(marker.soakAttempts, QUICK_SOAK_MAX_ATTEMPTS) : QUICK_SOAK_MAX_ATTEMPTS;
+const withinDeadline = (marker, nowMs) => {
+  const adoptedMs = Date.parse(marker.adoptedAt);
+  return Number.isFinite(adoptedMs) && adoptedMs <= nowMs && Number.isFinite(marker.deadline)
+    && marker.deadline > nowMs && marker.deadline <= adoptedMs + QUICK_SOAK_MAX_MS;
+};
+export function reportQuickSoakNeedsYou({ root, env, detail, log = console }) {
+  try { appendOverlayEvent(root, { kind: 'quick-soak-needs-you', ...detail }, { env }); } catch { /* alert still attempted */ }
+  alert(root, env, 'quick-soak-needs-you', detail, log);
+}
+function finishAttempt({ root, env, marker, outcome, now }) {
+  if (outcome !== 'passed' && marker.jobId) {
+    try {
+      createJobStore(jobsDir(root, env)).update(marker.jobId, record => TERMINAL_JOB_STATUSES.includes(record.job.status) ? null
+        : markFailed(record, { at: new Date(now()).toISOString(), reason: `quick-soak-${outcome}` }));
+    } catch { /* clone state and alert are authoritative even if the job journal is unavailable */ }
+  }
+  try { unlinkSync(resultPath(root, env, marker)); } catch { /* no result after launch failure */ }
+}
+
 /** Caller holds the write lock. A mismatched token can never settle or roll back a newer adoption. */
 export function settleQuickSoak({ root, env = process.env, marker, outcome, reason, run = gitRun, log = console, now = Date.now }) {
   const state = readRebuildState(root, env);
@@ -62,8 +89,19 @@ export function settleQuickSoak({ root, env = process.env, marker, outcome, reas
       state.quarantine = { prevHead: marker.prevHead, reason: 'quick-soak-unavailable' };
       state.adopted = marker.lastGood ?? null;
     }
+  } else if (outcome === 'unavailable' && attemptsOf(marker) < QUICK_SOAK_MAX_ATTEMPTS && withinDeadline(marker, now())) {
+    // Retire the attempt under the write lock; only a later tick may launch the successor. A new token
+    // fences late results, watchdogs and launcher completion from the previous worker.
+    const retry = { ...marker, token: randomUUID(), soakAttempts: attemptsOf(marker), retryPending: true,
+      lastSoakReason: reason ?? 'soak-could-not-run' };
+    for (const key of ['pid', 'host', 'procStart', 'jobId']) delete retry[key];
+    state.unverified = retry;
+    writeRebuildState(root, state, env);
+    finishAttempt({ root, env, marker, outcome, now });
+    alert(root, env, 'quick-soak-retry', { sha: marker.sha, attempts: attemptsOf(marker), reason: retry.lastSoakReason }, log);
+    return { settled: false, pending: true, retry: true };
   } else if (outcome !== 'passed') {
-    try { rollback = rollbackToSha({ root, sha: marker.prevHead, run }); }
+    try { rollback = rollbackToSha({ root, sha: marker.prevHead, run, ignoreUntracked: true }); }
     catch { rollback = { ok: false, reason: 'rollback-threw' }; }
     const rejected = { inputsKey: state.adopted?.inputsKey, reason: `quick-soak-${outcome}`, at: new Date(now()).toISOString() };
     if (rollback.ok) {
@@ -80,13 +118,11 @@ export function settleQuickSoak({ root, env = process.env, marker, outcome, reas
   state.unverified = null;
   if (state.adopted?.head === marker.sha) delete state.adopted.unverified;
   writeRebuildState(root, state, env);
-  if (outcome !== 'passed' && marker.jobId) {
-    try {
-      createJobStore(jobsDir(root, env)).update(marker.jobId, record => TERMINAL_JOB_STATUSES.includes(record.job.status) ? null
-        : markFailed(record, { at: new Date(now()).toISOString(), reason: `quick-soak-${outcome}` }));
-    } catch { /* clone state and alert are authoritative even if the job journal is unavailable */ }
+  finishAttempt({ root, env, marker, outcome, now });
+  if (outcome === 'unavailable' || rollback?.ok === false) {
+    reportQuickSoakNeedsYou({ root, env, log, detail: { sha: marker.sha, lastGood: marker.prevHead,
+      attempts: attemptsOf(marker), reason: reason ?? `quick-soak-${outcome}`, rollback } });
   }
-  try { unlinkSync(resultPath(root, env, marker)); } catch { /* no result after launch failure */ }
   alert(root, env, `quick-soak-${outcome}`, { sha: marker.sha, lastGood: marker.prevHead,
     ...(reason ? { reason } : {}), ...(rollback ? { rollback } : {}) }, log);
   return { settled: true, outcome, rollback };
@@ -111,28 +147,41 @@ const alive = marker => {
 export function recoverQuickSoak({ root, env, state = readRebuildState(root, env), now = Date.now, pidAlive = alive, run = gitRun, log = console }) {
   const marker = state.unverified;
   if (marker?.quick !== true) return { pending: false };
+  if (marker.retryPending && withinDeadline(marker, now()) && attemptsOf(marker) < QUICK_SOAK_MAX_ATTEMPTS) {
+    return { pending: true, retry: true };
+  }
   let result;
   try { result = JSON.parse(readFileSync(resultPath(root, env, marker), 'utf8')); } catch { /* no completed evidence */ }
   const nowMs = now();
-  const adoptedMs = Date.parse(marker.adoptedAt);
   let workerAlive = false;
   try { workerAlive = Number.isSafeInteger(marker.pid) && marker.pid > 0 && pidAlive(marker) === true; } catch { /* unknown = unavailable */ }
   if (result?.token === marker.token && result.sha === marker.sha && ['passed', 'failed', 'unavailable'].includes(result.outcome)) {
     settleQuickSoak({ root, env, marker, outcome: result.outcome,
-      reason: result.outcome === 'unavailable' ? 'soak-could-not-run' : undefined, run, log, now });
-  } else if (workerAlive && Number.isFinite(adoptedMs) && adoptedMs <= nowMs && Number.isFinite(marker.deadline)
-    && marker.deadline > nowMs && marker.deadline <= adoptedMs + QUICK_SOAK_MAX_MS) {
+      reason: result.outcome === 'unavailable' ? result.reason ?? 'soak-could-not-run' : undefined, run, log, now });
+  } else if (workerAlive && withinDeadline(marker, nowMs)) {
     return { pending: true };
   } else {
     settleQuickSoak({ root, env, marker, outcome: 'unavailable', reason: 'worker-dead-missing-or-expired', run, log, now });
   }
   Object.assign(state, readRebuildState(root, env));
-  return { pending: false };
+  return { pending: !!state.unverified, ...(state.unverified?.retryPending ? { retry: true } : {}) };
 }
 
 /** Caller holds the write lock. Await only the OS spawn handshake; never the smoke. */
 export async function launchQuickSoak({ root, env, marker, run = gitRun, log = console, spawnFn = spawn, readStart = readProcStart }) {
   let store; let queued;
+  const state = readRebuildState(root, env);
+  if (!same(state.unverified, marker)) return { started: false };
+  marker = state.unverified;
+  if (marker.retryPending) {
+    if (attemptsOf(marker) >= QUICK_SOAK_MAX_ATTEMPTS || !withinDeadline(marker, Date.now())) {
+      return settleQuickSoak({ root, env, marker, outcome: 'unavailable', reason: 'worker-dead-missing-or-expired', run, log });
+    }
+    marker = { ...marker, soakAttempts: attemptsOf(marker) + 1 };
+    delete marker.retryPending;
+  } else marker = { ...marker, soakAttempts: attemptsOf(marker) };
+  state.unverified = marker;
+  writeRebuildState(root, state, env);
   try {
     store = createJobStore(jobsDir(root, env));
     mkdirSync(store.dir, { recursive: true });
@@ -160,15 +209,17 @@ export async function launchQuickSoak({ root, env, marker, run = gitRun, log = c
 }
 
 /** Job entry. One attempt: both deferred checks, then tree-stays-clean; incomplete evidence never passes. */
-export async function runQuickSoak({ root, env = process.env, marker, token, run = gitRun, smoke = runLiveSmoke, log = console }) {
+export async function runQuickSoak({ root, env = process.env, marker, token, run = gitRun, smoke = runLiveSmoke, log = console, readLock = withReadLock, pause = pauseFor }) {
   marker ??= readRebuildState(root, env).unverified;
   if (!marker?.quick || (token && marker.token !== token)) return;
   let outcome = 'unavailable'; let reason = 'soak-could-not-run';
   try {
-    // Wait for the adopting writer's spawn handshake/state write to finish before taking a read slot.
-    const barrier = await withWriteLock(root, () => same(readRebuildState(root, env).unverified, marker), lockOptions(env));
-    if (barrier.ok && barrier.value) {
-      const checked = await withReadLock(root, async () => {
+    // The durable adoption marker precedes launch. A read slot is sufficient to start checks; do not
+    // compete with daemon ticks for a write lock. Read acquisition is immediate, so retry for <=10 min.
+    for (let attempt = 0; attempt <= BARRIER_RETRIES; attempt++) {
+      if (!same(readRebuildState(root, env).unverified, marker)) return;
+      const checked = await readLock(root, async () => {
+        if (!same(readRebuildState(root, env).unverified, marker)) return null;
         if (verifyRev(makeGit({ run, cwd: root, env }), 'HEAD') !== marker.sha) return null;
         const deadline = Math.min(marker.deadline, Date.now() + QUICK_SOAK_MAX_MS);
         if (!(deadline > Date.now())) return null;
@@ -179,9 +230,14 @@ export async function runQuickSoak({ root, env = process.env, marker, token, run
         };
         return smoke({ root, env, onlyChecks: QUICK_SOAK_CHECKS, changedFiles: null, reuseCode: false, runChild });
       }, lockOptions(env));
-      const result = checked.ok ? checked.value : null;
-      outcome = decideQuickSoakResult(result);
-      if (outcome !== 'unavailable') reason = undefined;
+      if (checked.ok) {
+        outcome = decideQuickSoakResult(checked.value);
+        if (outcome !== 'unavailable') reason = undefined;
+        break;
+      }
+      const remaining = marker.deadline - Date.now();
+      if (attempt === BARRIER_RETRIES || !(remaining > 0)) break;
+      await pause(Math.min(BARRIER_RETRY_MS, remaining));
     }
   } catch { /* unavailable is durable evidence too */ }
   recordQuickSoakResult({ root, env, marker, outcome, reason });
@@ -189,8 +245,8 @@ export async function runQuickSoak({ root, env = process.env, marker, token, run
 }
 
 /** Detached launcher: the shared runtime pins/installs code off-tick, then owns the real job record/handle.
- * Remain alive until its child exits so pending-state recovery also covers snapshot preparation. No relaunch:
- * every unavailable launch/run records the owed soak as unavailable and lets the tick roll back.
+ * Remain alive until its child exits so pending-state recovery also covers snapshot preparation.
+ * Unavailable attempts schedule bounded retries; only the next tick launches them.
  */
 async function launchPinnedSoak({ root, token, jobId, env = process.env }) {
   const store = createJobStore(jobsDir(root, env));

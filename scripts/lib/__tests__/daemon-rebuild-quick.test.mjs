@@ -18,7 +18,7 @@ import { completeSmokePass, smokeAndAdopt } from '../daemon-rebuild/smoke.mjs';
 import { finalizeRebuild } from '../daemon-rebuild/adopt.mjs';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 import { DISPATCH_PATH_DEFAULTS } from '../daemon-rebuild/dispatch-paths.mjs';
-import { DISPATCH_DRY_RUN_CODE_ENTRIES, SMOKE_CHECKS, runLiveSmoke, runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
+import { DISPATCH_DRY_RUN_CODE_ENTRIES, SMOKE_CHECKS, rollbackToSha, runLiveSmoke, runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
 
 vi.mock('../resource-admission.mjs', () => ({ shadowAdmission: vi.fn(), admit: vi.fn() }));
 const dirs = [];
@@ -135,10 +135,11 @@ describe('quick pre-adopt smoke', () => {
 
 function soakFixture() {
   const root = temp();
-  const env = { WE_DAEMON_STATE_DIR: temp(), WE_DAEMON_CLONE_LOCK_ROOT: temp(), WE_DAEMON_JOBS_ROOT: temp() };
+  const env = { WE_DAEMON_STATE_DIR: temp(), WE_DAEMON_CLONE_LOCK_ROOT: temp(), WE_DAEMON_JOBS_ROOT: temp(), WE_DAEMON_OVERLAY_DIR: temp() };
   const lastGood = { head: prevHead, mainSha: prevHead, applied: [], at: new Date(0).toISOString() };
   const adoptedMs = Date.now();
-  const marker = { quick: true, unverified: true, sha, head: sha, prevHead, lastGood, token: 'test',
+  // Existing terminal recovery cases model the final allowed attempt; retry cases reset this counter.
+  const marker = { quick: true, unverified: true, sha, head: sha, prevHead, lastGood, token: 'test', soakAttempts: 3,
     adoptedAt: new Date(adoptedMs).toISOString(), deadline: adoptedMs + QUICK_SOAK_MAX_MS };
   const state = { adopted: { head: sha, unverified: true, inputsKey: 'new' }, unverified: marker };
   writeRebuildState(root, state, env);
@@ -147,6 +148,233 @@ function soakFixture() {
   return { root, env, marker, state, run, alerts };
 }
 describe('post-adopt soak', () => {
+  it('read barrier retries contention and runs the checks on its second attempt', async () => {
+    const f = soakFixture();
+    const smoke = vi.fn(async () => ({ pass: true, results: QUICK_SOAK_CHECKS.map(name => ({ name, ok: true })) }));
+    const readLock = vi.fn().mockResolvedValueOnce({ ok: false, reason: 'tick-in-progress' })
+      .mockImplementationOnce(async (_root, check) => ({ ok: true, value: await check() }));
+    const pause = vi.fn(async () => {});
+    await runQuickSoak({ ...f, smoke, readLock, pause });
+    expect(readLock).toHaveBeenCalledTimes(2);
+    expect(pause).toHaveBeenCalledTimes(1);
+    expect(pause).toHaveBeenCalledWith(60_000);
+    expect(smoke).toHaveBeenCalledTimes(1);
+    expect(smoke).toHaveBeenCalledWith(expect.objectContaining({ onlyChecks: QUICK_SOAK_CHECKS }));
+    expect(readRebuildState(f.root, f.env).unverified).toBeNull();
+  });
+  it('exhausted read barrier is bounded and pages after the last soak attempt', async () => {
+    const f = soakFixture();
+    const readLock = vi.fn(async () => ({ ok: false, reason: 'tick-in-progress' }));
+    const pause = vi.fn(async () => {});
+    const smoke = vi.fn();
+    await runQuickSoak({ ...f, smoke, readLock, pause });
+    expect(readLock).toHaveBeenCalledTimes(11);
+    expect(pause).toHaveBeenCalledTimes(10);
+    expect(smoke).not.toHaveBeenCalled();
+    expect(f.alerts()).toContainEqual(expect.objectContaining({ kind: 'quick-soak-needs-you', detail: {
+      sha, lastGood: prevHead, attempts: 3, reason: 'soak-could-not-run', rollback: { ok: true },
+    } }));
+    expect(f.alerts().at(-1).kind).toBe('quick-soak-unavailable');
+    expect(readRebuildState(f.root, f.env).unverified).toBeNull();
+  });
+  it('legacy markers retry unavailable evidence on later ticks, cap at three, then page', async () => {
+    const f = soakFixture();
+    delete f.marker.soakAttempts;
+    writeRebuildState(f.root, f.state, f.env);
+    const spawnFn = vi.fn(() => {
+      const child = new EventEmitter(); child.pid = 123; child.unref = vi.fn();
+      queueMicrotask(() => child.emit('spawn')); return child;
+    });
+    const tokens = [f.marker.token];
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const marker = readRebuildState(f.root, f.env).unverified;
+      recordQuickSoakResult({ ...f, marker, outcome: 'unavailable' });
+      const recovered = recoverQuickSoak({ ...f, state: readRebuildState(f.root, f.env) });
+      if (attempt < 3) {
+        expect(recovered.pending).toBe(true);
+        expect(recovered.retry).toBe(true);
+        expect(f.run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+        // The tick owns relaunch; detached completion/recovery only schedules it.
+        await prepareRebuild({ ...f, log: { error: vi.fn() }, stateOpts: {}, now: Date.now,
+          launchSoak: opts => launchQuickSoak({ ...opts, spawnFn, readStart: () => 'fixture' }) });
+        const next = readRebuildState(f.root, f.env).unverified;
+        expect(next.soakAttempts).toBe(attempt + 1);
+        expect(next.deadline).toBe(f.marker.deadline);
+        expect(tokens).not.toContain(next.token);
+        tokens.push(next.token);
+      } else {
+        expect(recovered.pending).toBe(false);
+        expect(readRebuildState(f.root, f.env).unverified).toBeNull();
+      }
+    }
+    expect(spawnFn).toHaveBeenCalledTimes(2);
+    expect(f.alerts().filter(row => row.kind === 'quick-soak-needs-you')).toHaveLength(1);
+    expect(f.alerts().find(row => row.kind === 'quick-soak-needs-you').detail.attempts).toBe(3);
+  });
+  it.each([0, -1, 4, 1_000_000, '2', null])('invalid or exhausted attempt count %j cannot buy another retry', soakAttempts => {
+    const f = soakFixture();
+    f.marker.soakAttempts = soakAttempts;
+    writeRebuildState(f.root, f.state, f.env);
+    settleQuickSoak({ ...f, outcome: 'unavailable' });
+    expect(readRebuildState(f.root, f.env).unverified).toBeNull();
+    expect(f.alerts().some(row => row.kind === 'quick-soak-needs-you')).toBe(true);
+  });
+  it('retry deadline exhaustion settles and pages instead of relaunching', () => {
+    const f = soakFixture();
+    f.marker.soakAttempts = 1;
+    writeRebuildState(f.root, f.state, f.env);
+    settleQuickSoak({ ...f, outcome: 'unavailable' });
+    expect(recoverQuickSoak({ ...f, state: readRebuildState(f.root, f.env),
+      now: () => f.marker.deadline + 1 })).toEqual({ pending: false });
+    expect(readRebuildState(f.root, f.env).unverified).toBeNull();
+    expect(f.alerts().some(row => row.kind === 'quick-soak-needs-you')).toBe(true);
+  });
+  it('first launch failure persists a retry without rolling back', async () => {
+    const f = soakFixture();
+    delete f.marker.soakAttempts;
+    writeRebuildState(f.root, f.state, f.env);
+    await launchQuickSoak({ ...f, spawnFn: () => { throw new Error('unavailable'); } });
+    expect(readRebuildState(f.root, f.env).unverified).toMatchObject({ retryPending: true, soakAttempts: 1 });
+    expect(f.run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+  });
+  it('tracked-dirty rollback still refuses, quarantines and pages', () => {
+    const f = soakFixture();
+    f.run.mockImplementation(args => ({ status: 0, stdout: args[0] === 'rev-parse' ? sha : ' M tracked' }));
+    settleQuickSoak({ ...f, outcome: 'failed' });
+    expect(readRebuildState(f.root, f.env)).toMatchObject({ unverified: null, quarantine: { prevHead } });
+    expect(f.alerts()).toContainEqual(expect.objectContaining({ kind: 'quick-soak-needs-you',
+      detail: expect.objectContaining({ sha, lastGood: prevHead, attempts: 3, rollback: { ok: false, reason: 'dirty' } }) }));
+    expect(f.run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+  });
+  it.each([false, true])('rollback untracked opt-in=%s preserves runtime files and default refusal', ignoreUntracked => {
+    const f = candidateFixture();
+    f.git(['reset', '--hard', f.plan.finalSha]);
+    const runtime = join(f.root, 'runtime-sidecar.md');
+    writeFileSync(runtime, 'keep me');
+    const options = { root: f.root, sha: f.prevHead, run: f.run };
+    const result = rollbackToSha(ignoreUntracked ? { ...options, ignoreUntracked } : options);
+    expect(result).toEqual(ignoreUntracked ? { ok: true } : { ok: false, reason: 'dirty' });
+    expect(readFileSync(runtime, 'utf8')).toBe('keep me');
+    expect(f.git(['rev-parse', 'HEAD'])).toBe(ignoreUntracked ? f.prevHead : f.plan.finalSha);
+  });
+  it.each([false, true])('real tracked dirt refuses rollback with untracked opt-in=%s', ignoreUntracked => {
+    const f = candidateFixture();
+    f.git(['reset', '--hard', f.plan.finalSha]);
+    writeFileSync(join(f.root, 'README.md'), 'operator edit');
+    expect(rollbackToSha({ root: f.root, sha: f.prevHead, run: f.run, ignoreUntracked }))
+      .toEqual({ ok: false, reason: 'dirty' });
+    expect(f.git(['rev-parse', 'HEAD'])).toBe(f.plan.finalSha);
+    expect(readFileSync(join(f.root, 'README.md'), 'utf8')).toBe('operator edit');
+  });
+  it('unreadable tracked status refuses opt-in rollback', () => {
+    const run = vi.fn(() => ({ status: 1, stdout: '' }));
+    expect(rollbackToSha({ root: temp(), sha: prevHead, run, ignoreUntracked: true }))
+      .toEqual({ ok: false, reason: 'status-failed' });
+    expect(run).toHaveBeenCalledOnce();
+    expect(run.mock.calls[0][0]).toEqual(['status', '--porcelain', '--untracked-files=no']);
+  });
+  it.each([
+    { name: 'same path', tracked: 'runtime-sidecar.md', runtime: 'runtime-sidecar.md' },
+    { name: 'untracked file obstructs target directory', tracked: 'runtime/target.md', runtime: 'runtime' },
+    { name: 'untracked directory obstructs target file', tracked: 'runtime', runtime: 'runtime/sidecar.md' },
+    { name: 'ignored sidecar obstructs target file', tracked: 'ignored.md', runtime: 'ignored.md', ignored: true },
+  ])('refuses rollback target collision and preserves obstructing bytes: $name', ({ tracked, runtime, ignored }) => {
+    const f = candidateFixture('README.md', '1', {
+      seed: ({ write, git }) => {
+        write(tracked, 'last good tracked content');
+        if (ignored) {
+          write('.gitignore', 'ignored.md\n');
+          git(['add', '-f', '--', tracked]);
+        }
+      },
+      change: ({ git }) => { git(['rm', '--', tracked]); },
+    });
+    f.git(['reset', '--hard', f.plan.finalSha]);
+    const sidecar = join(f.root, runtime);
+    mkdirSync(dirname(sidecar), { recursive: true });
+    const bytes = Buffer.from([0, 255, 10, 13, 42]);
+    writeFileSync(sidecar, bytes);
+    expect(rollbackToSha({ root: f.root, sha: f.prevHead, run: f.run, ignoreUntracked: true }))
+      .toEqual({ ok: false, reason: 'untracked-collision' });
+    expect(f.git(['rev-parse', 'HEAD'])).toBe(f.plan.finalSha);
+    expect(readFileSync(sidecar)).toEqual(bytes);
+    const marker = { quick: true, sha: f.plan.finalSha, prevHead: f.prevHead, token: 'collision',
+      soakAttempts: 3, lastGood: { head: f.prevHead } };
+    writeRebuildState(f.root, { unverified: marker, adopted: { head: marker.sha, unverified: true } }, f.env);
+    expect(settleQuickSoak({ ...f, marker, outcome: 'unavailable' }).rollback)
+      .toEqual({ ok: false, reason: 'untracked-collision' });
+    expect(readRebuildState(f.root, f.env)).toMatchObject({ unverified: null, quarantine: { prevHead: f.prevHead } });
+    const alerts = readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(alerts).toContainEqual(expect.objectContaining({ kind: 'quick-soak-needs-you',
+      detail: expect.objectContaining({ rollback: { ok: false, reason: 'untracked-collision' } }) }));
+    expect(f.git(['rev-parse', 'HEAD'])).toBe(f.plan.finalSha);
+    expect(readFileSync(sidecar)).toEqual(bytes);
+  });
+  it.each([
+    { name: 'untracked listing failed', command: 'ls-files', result: { status: 1, stdout: '' } },
+    { name: 'target listing failed', command: 'ls-tree', result: { status: 1, stdout: '' } },
+    { name: 'target listing missing', command: 'ls-tree', result: { status: 0 } },
+    { name: 'target listing truncated', command: 'ls-tree', result: { status: 0, stdout: 'partial' } },
+    { name: 'untracked listing truncated', command: 'ls-files', result: { status: 0, stdout: 'partial' } },
+    { name: 'listing oversized', command: 'ls-tree', result: { status: 0, stdout: 'x'.repeat(1024 * 1024) + '\0' } },
+  ])('unreadable collision evidence refuses rollback: $name', ({ command, result }) => {
+    const run = vi.fn(args => args[0] === command ? result : { status: 0, stdout: '' });
+    expect(rollbackToSha({ root: temp(), sha: prevHead, run, ignoreUntracked: true }))
+      .toEqual({ ok: false, reason: 'status-failed' });
+    expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+  });
+  it.each([
+    { name: 'ignored sidecar', tracked: 'ignored.md', runtime: 'ignored.md', ignored: true },
+    { name: 'ancestor collision', tracked: 'runtime', runtime: 'runtime/sidecar.md' },
+  ].flatMap(collision => ['pending-soak', 'persisted-quarantine', 'interrupted-adoption']
+    .map(recovery => ({ ...collision, recovery }))))(
+    'quick $recovery preserves $name and quarantines + pages without a reset', async ({ tracked, runtime, ignored, recovery }) => {
+      const f = candidateFixture('README.md', '1', {
+        seed: ({ write, git }) => {
+          write(tracked, 'last good tracked content');
+          if (ignored) {
+            write('.gitignore', 'ignored.md\n');
+            git(['add', '-f', '--', tracked]);
+          }
+        },
+        change: ({ git }) => { git(['rm', '--', tracked]); },
+      });
+      f.git(['reset', '--hard', f.plan.finalSha]);
+      const sidecar = join(f.root, runtime);
+      mkdirSync(dirname(sidecar), { recursive: true });
+      const bytes = Buffer.from([0, 255, 10, 13, 42]);
+      writeFileSync(sidecar, bytes);
+      const marker = { quick: true, sha: f.plan.finalSha, prevHead: f.prevHead, token: 'recovery-collision',
+        soakAttempts: 3, lastGood: { head: f.prevHead } };
+      const state = recovery === 'pending-soak'
+        ? { unverified: marker, adopted: { head: marker.sha, unverified: true } }
+        : recovery === 'persisted-quarantine'
+          ? { quarantine: { prevHead: f.prevHead, reason: 'quick-soak-rollback-failed' } }
+          : { adopted: marker.lastGood, inProgress: { quick: true, verified: false,
+            target: marker.sha, prevHead: f.prevHead, host: 'foreign-fixture', startedAt: new Date(0).toISOString() } };
+      writeRebuildState(f.root, state, f.env);
+      const run = vi.fn(f.run);
+      const result = await prepareRebuild({ ...f, run, log: { error: vi.fn() }, stateOpts: {}, now: Date.now });
+      expect(result.result.reason).toBe(recovery === 'interrupted-adoption' ? 'rebuild-interrupted-unrecoverable' : 'quarantined');
+      expect(readRebuildState(f.root, f.env)).toMatchObject({ unverified: null, quarantine: { prevHead: f.prevHead } });
+      const alerts = readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse);
+      expect(alerts).toContainEqual(expect.objectContaining({ kind: 'quick-soak-needs-you',
+        detail: expect.objectContaining({ lastGood: f.prevHead, rollback: expect.objectContaining({ ok: false }) }) }));
+      expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+      expect(f.git(['rev-parse', 'HEAD'])).toBe(f.plan.finalSha);
+      expect(readFileSync(sidecar)).toEqual(bytes);
+    });
+  it('quick settlement rolls back untracked-only dirt and preserves the sidecar', () => {
+    const f = candidateFixture();
+    f.git(['reset', '--hard', f.plan.finalSha]);
+    const marker = { quick: true, sha: f.plan.finalSha, prevHead: f.prevHead, token: 'runtime',
+      soakAttempts: 3, lastGood: { head: f.prevHead } };
+    writeRebuildState(f.root, { unverified: marker, adopted: { head: marker.sha, unverified: true } }, f.env);
+    writeFileSync(join(f.root, 'runtime-sidecar.md'), 'keep me');
+    expect(settleQuickSoak({ ...f, marker, outcome: 'unavailable' }).rollback).toEqual({ ok: true });
+    expect(f.git(['rev-parse', 'HEAD'])).toBe(f.prevHead);
+    expect(readFileSync(join(f.root, 'runtime-sidecar.md'), 'utf8')).toBe('keep me');
+  });
   it('an interrupted quick reset that cannot recover is quarantined and reports the unavailable soak', async () => {
     const f = soakFixture();
     f.run.mockImplementation(args => ({ status: 0, stdout: args[0] === 'rev-parse' ? sha : args[0] === 'status' ? ' M tracked' : '' }));
@@ -156,6 +384,8 @@ describe('post-adopt soak', () => {
     expect(result.result.reason).toBe('rebuild-interrupted-unrecoverable');
     expect(readRebuildState(f.root, f.env)).toMatchObject({ inProgress: null, quarantine: { prevHead } });
     expect(f.alerts().some(row => row.kind === 'quick-soak-unavailable')).toBe(true);
+    expect(f.alerts()).toContainEqual(expect.objectContaining({ kind: 'quick-soak-needs-you',
+      detail: expect.objectContaining({ sha, lastGood: prevHead, attempts: 0, cause: 'adoption-interrupted', rollback: { ok: false } }) }));
   });
   it('failed soak rolls back to last-good under the write lock and alerts', () => {
     const f = soakFixture();
