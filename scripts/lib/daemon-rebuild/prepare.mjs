@@ -27,6 +27,9 @@ import { planRebuild } from './plan.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
 import { repairCloneRefs, holdsCloneWriteLock } from '../lane-repair.mjs';
+import { recoverQuickSoak, launchQuickSoak, reportQuickSoakNeedsYou } from './quick-soak-job.mjs';
+import { rollbackToSha } from '../daemon-live-smoke.mjs';
+import { resolveQuick } from './quick.mjs';
 import {
   markOverlayConflictWake, readOverlayConflictWakes, clearOverlayConflictWake,
 } from '../overlay-conflict-wake.mjs';
@@ -39,7 +42,7 @@ import {
  * smoke a candidate — see {@link rebuildClone}).
  */
 export async function prepareRebuild({
-  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase,
+  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase, launchSoak = launchQuickSoak,
 }) {
   // Tests reaching the hold must opt in before launching a detached repair or cleaning up swaps.
   if (process.env.VITEST === 'true' && env?.WE_DAEMON_AUTO_REBASE === undefined) {
@@ -71,6 +74,12 @@ export async function prepareRebuild({
 
   const state = readRebuildState(root, stEnv);
   const writeState = () => writeRebuildState(root, state, stEnv);
+  const rollbackQuick = (sha, failedHead) => {
+    // A legacy record without adoption identity cannot authorize resetting today's HEAD.
+    if (!failedHead || verifyRev(git, 'HEAD') !== failedHead) return { ok: false, reason: 'adopted-head-changed-or-unreadable' };
+    try { return rollbackToSha({ root, sha, run, ignoreUntracked: true }); }
+    catch { return { ok: false, reason: 'rollback-threw' }; }
+  };
 
   const finishVerifiedSwaps = async () => {
     try {
@@ -116,8 +125,18 @@ export async function prepareRebuild({
       // last verified head and let this tick rebuild + smoke it off-lock like any other candidate.
       const atUnverifiedTarget = headNow === ip.target && ip.target !== ip.prevHead && ip.verified !== true;
       if (atUnverifiedTarget) {
-        const rolled = rollbackUnverified({ git, prevHead: ip.prevHead });
+        const rolled = ip.quick ? rollbackQuick(ip.prevHead, ip.target).ok : rollbackUnverified({ git, prevHead: ip.prevHead });
+        if (ip.quick) {
+          const detail = { sha: ip.target, lastGood: ip.prevHead, attempts: 0, cause: 'adoption-interrupted', rollback: { ok: rolled } };
+          reportQuickSoakNeedsYou({ root, env: stEnv, detail, log });
+          alert('quick-soak-unavailable', detail);
+        }
         if (!rolled) {
+          if (ip.quick) {
+            state.quarantine = { prevHead: ip.prevHead, failedHead: ip.target, reason: 'quick-soak-unavailable' };
+            state.inProgress = null;
+            writeState();
+          }
           alert('rebuild-interrupted-unrecoverable', { inProgress: ip, headNow, unverified: true });
           return terminal({ moved: false, reason: 'rebuild-interrupted-unrecoverable' });
         }
@@ -156,8 +175,15 @@ export async function prepareRebuild({
   }
 
   // PR #2731 review: the pre-fix recovery could leave `state.unverified` — a build reset onto but never smoked.
-  // This design never writes it, so treat it exactly like an unmarked inProgress record at its target: roll back
-  // to its verified prevHead so this tick re-smokes it off-lock, instead of reading HEAD as up-to-date.
+  // Quick records have bounded detached-soak recovery. Legacy marks still roll back to their verified
+  // prevHead so this tick re-smokes off-lock, instead of reading an unsmoked HEAD as up-to-date.
+  if (state.unverified?.quick === true) {
+    const soak = recoverQuickSoak({ root, env: stEnv, state, now, run, log });
+    if (soak.pending) {
+      if (soak.retry) await launchSoak({ root, env: stEnv, marker: state.unverified, run, log });
+      return terminal({ moved: false, reason: 'rebuild-in-progress', heldBy: 'quick-soak' });
+    }
+  }
   if (state.unverified) {
     const uv = state.unverified;
     if (verifyRev(git, 'HEAD') === uv.head && uv.head !== uv.prevHead) {
@@ -171,6 +197,45 @@ export async function prepareRebuild({
     writeState();
   }
 
+  if (state.quarantine?.reason?.startsWith('quick-soak-')) {
+    const quarantine = state.quarantine;
+    const head = verifyRev(git, 'HEAD');
+    const alreadyAtLastGood = !!head && head === quarantine.prevHead;
+    // Settlement may already have refused this rollback. Never retry through the weaker legacy reset:
+    // ignored files and ancestor-path obstructions need the same guard on every recovery tick.
+    // A verified last-good HEAD needs no reset or adoption identity (including legacy records).
+    let rollback;
+    if (alreadyAtLastGood) {
+      try {
+        const status = git(['status', '--porcelain', '--untracked-files=no']);
+        rollback = status.status !== 0 || status.error || status.signal || typeof status.stdout !== 'string'
+          ? { ok: false, reason: 'status-failed' }
+          : status.stdout.trim() ? { ok: false, reason: 'dirty' } : { ok: true };
+      } catch { rollback = { ok: false, reason: 'status-failed' }; }
+    } else {
+      rollback = rollbackQuick(quarantine.prevHead, quarantine.failedHead);
+    }
+    if (!rollback.ok) {
+      const pageKey = JSON.stringify([quarantine.prevHead, rollback.reason]);
+      const lastPagedMs = Date.parse(quarantine.lastPagedAt ?? '');
+      const time = nowMs();
+      if (quarantine.lastPagedKey !== pageKey || !Number.isFinite(lastPagedMs)
+        || time - lastPagedMs >= 30 * 60_000) {
+        quarantine.lastPagedAt = new Date(time).toISOString();
+        quarantine.lastPagedKey = pageKey;
+        writeState();
+        reportQuickSoakNeedsYou({ root, env: stEnv, log, detail: {
+          lastGood: quarantine.prevHead, reason: quarantine.reason, rollback,
+        } });
+      }
+      return terminal({ moved: false, reason: 'quarantined' });
+    }
+    state.quarantine = null;
+    writeState();
+    if (alreadyAtLastGood) alert('quick-soak-quarantine-cleared', {
+      prevHead: quarantine.prevHead, via: 'already-at-last-good',
+    });
+  }
   if (state.quarantine) {
     // Same definition of "clean" as findUnsafeLocalState: tracked changes only (an untracked sidecar must never
     // freeze recovery), plus the same untracked-collision guard Step 4.5 runs — refuse if prevHead has content
@@ -417,19 +482,6 @@ export async function prepareRebuild({
     return live;
   }
 
-  // ── Step 4: up-to-date / still-rejected short-circuits ──────────────────────────────────────────────
-  if (plan.upToDate) {
-    if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
-      state.adopted = {
-        head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
-      };
-      state.held = null; // x5wbsbc — current again: no longer held on a last-good build
-      writeState();
-    }
-    clearReadyCandidate(root, stEnv); // current already — nothing a passed-but-unadopted build could add
-    return terminal({ moved: false, reason: 'up-to-date', plan });
-  }
-
   // fix-rebuild-finalize — a candidate that already PASSED its smoke but could not be adopted (a reader was
   // mid-tick when its finalize tried the lock) is adopted HERE, under the write lock this phase already holds,
   // instead of being thrown away and re-smoked. Checked before the rejection/backoff short-circuits: a passed
@@ -468,7 +520,10 @@ export async function prepareRebuild({
         carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
         leftForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
       });
-      if (!m.adopt) {
+      if (ready.quick && !resolveQuick(env).quick) {
+        clearReadyCandidate(root, stEnv);
+        alert('ready-candidate-discarded', { target: ready.adopt.finalSha, note: 'quick mode disabled — full smoke required' });
+      } else if (!m.adopt) {
         clearReadyCandidate(root, stEnv);
         alert('ready-candidate-discarded', { target: ready.adopt.finalSha, reason: m.reason });
       } else {
@@ -493,6 +548,9 @@ export async function prepareRebuild({
           plan: m.adopt,
           prevHead,
           lease: { token: ready.token ?? null },
+          quick: ready.quick === true,
+          rejectionBackoff: ready.rejectionBackoff,
+          launchSoak,
           onAdopted: m.dropRefs.length
             ? ({ alert: finAlert }) => dropSuspectOverlays({
               root, env, suspects: m.dropRefs, failed: m.failed, alert: finAlert,
@@ -508,6 +566,19 @@ export async function prepareRebuild({
       }
     }
   }
+  // Process ready metadata first: an already-HEAD fallback can still owe a soak and backoff restoration.
+  if (plan.upToDate) {
+    if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
+      state.adopted = {
+        head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
+      };
+      state.held = null;
+      writeState();
+    }
+    clearReadyCandidate(root, stEnv);
+    return terminal({ moved: false, reason: 'up-to-date', plan });
+  }
+
   // x5wbsbc — a BROKEN SMOKE HARNESS (every candidate, the last-good build included, fails the same checks) is
   // not re-smoked on every main move: it would cost up to three full smokes per move and every one would fail
   // the same way. Until its backoff expires the clone stays on its last-good build (and keeps dispatching —
