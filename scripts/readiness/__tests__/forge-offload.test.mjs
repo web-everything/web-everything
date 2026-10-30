@@ -219,7 +219,7 @@ describe('runner base materialization refuses before install',()=>{
     const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:transport,log});
     expect(log).toHaveBeenCalledWith(expect.stringMatching(mode==='delta'||mode==='late delta failure'?/^manifest: git-delta \(\d+ changed of \d+\)\n$/:/^manifest: full-scan \(.+\)\n$/));
     expect(result.mode).toBe('remote');
-    const stage=result.timings.find(s=>s.stage==='rsync');
+    const stage=result.timings.filter(s=>s.stage==='rsync').at(-1);
     expect(stage.shipMode).toBe(mode==='delta'?'delta':'full');
     expect(requests[0].manifestDigest).toBe(f.request.manifestDigest);
     if(mode==='late delta failure'){
