@@ -114,6 +114,27 @@ describe('classifyCheck exhaustive independent outcome grid', () => {
     }
   });
 
+  it.each([null, 0, '', 'false', '0', 1, NaN, {}, [], new Boolean(false)])(
+    'only literal false makes a check optional; required=%j stays required', (required) => {
+      for (const [evidence, expected] of [
+        [{ status: 'completed', conclusion: 'failure' }, 'red'],
+        [{ status: 'queued' }, 'pending'],
+        [{ status: 'completed', conclusion: 'unknown' }, 'red'],
+        [{}, 'red'],
+        [{ status: 'completed', conclusion: 'success' }, 'green'],
+      ]) {
+        expect(classifyCheck({ ...evidence, required })).toBe(expected);
+        expect(classifyCheck({ ...evidence, required: false }))
+          .toBe(expected === 'green' ? 'green' : 'ignore');
+        expect(summarize([{ name: 'ci', ...evidence, required }])).toEqual({
+          redSet: new Set(expected === 'red' ? ['ci'] : []),
+          pendingSet: new Set(expected === 'pending' ? ['ci'] : []),
+          gateOnlyRed: false, allRequiredGreen: expected === 'green',
+        });
+      }
+    },
+  );
+
   it.each(conclusions.filter((conclusion) => conclusion !== null))(
     'treats missing status with conclusion=%s as completed',
     (conclusion) => {
@@ -147,7 +168,7 @@ describe('latestAttempts', () => {
   });
 
   it('returns the original winning row objects without cloning or normalizing them', () => {
-    const older = settled('Test', 'failure', { run_attempt: 1, id: 1 });
+    const older = settled('TEST', 'failure', { run_attempt: 1, id: 1 });
     const winner = settled('TEST', 'success', { run_attempt: 2, id: 2 });
     const build = settled('Build', 'success', { id: 3 });
 
@@ -172,20 +193,41 @@ describe('latestAttempts', () => {
     ])).toEqual([zed, alpha, middle]);
   });
 
-  it('groups Test and test as one check in either order, including exact ranking ties', () => {
+  it('keeps Test and test as distinct checks in either order, including exact ranking ties (#7501 B8)', () => {
     const older = settled('Test', 'success', { run_attempt: 1, id: 1 });
     const newer = settled('test', 'failure', { run_attempt: 2, id: 2 });
     for (const rows of [[older, newer], [newer, older]]) {
       const result = latestAttempts(rows);
-      expect(result).toHaveLength(1);
-      expect(result[0]).toBe(newer);
+      expect(result).toHaveLength(2);
+      expect(result[0]).toBe(rows[0]);
+      expect(result[1]).toBe(rows[1]);
     }
     const tied = { ...newer, name: 'Test' };
     for (const rows of [[newer, tied], [tied, newer]]) {
       const result = latestAttempts(rows);
-      expect(result).toHaveLength(1);
+      expect(result).toHaveLength(2);
       expect(result[0]).toBe(rows[0]);
+      expect(result[1]).toBe(rows[1]);
     }
+  });
+
+  it('uses name || context without trimming or Unicode folding (#7501 I1)', () => {
+    const names = ['test', 'TEST', 'test\u200b', ' test', 'test ', 'ｔｅｓｔ', 'é', 'e\u0301'];
+    const rows = names.map((name, id) => settled(name, id === 0 ? 'success' : 'failure', { id }));
+    for (const input of [rows, [...rows].reverse()]) {
+      expect(latestAttempts(input)).toEqual(input);
+      expect(summarize(input, { requiredNames: ['test'] })).toEqual({
+        redSet: new Set(), pendingSet: new Set(),
+        gateOnlyRed: false, allRequiredGreen: true,
+      });
+    }
+    const fallback = { name: '', context: 'test', status: 'completed', conclusion: 'failure', id: 20 };
+    expect(latestAttempts([rows[0], fallback])).toEqual([fallback]);
+    expect(summarize([rows[0], fallback], { requiredNames: ['test'] }).redSet).toEqual(new Set(['test']));
+    const contextOnly = { context: 'test', status: 'queued', id: 21 };
+    expect(latestAttempts([fallback, contextOnly])).toEqual([contextOnly]);
+    expect(summarize([contextOnly], { requiredNames: ['test'] }).pendingSet).toEqual(new Set(['test']));
+    expect(latestAttempts([rows[0], { ...fallback, name: 'other' }])).toHaveLength(2);
   });
 
   it('compares large run_attempt integers exactly before considering id in either order', () => {
@@ -260,20 +302,20 @@ describe('latestAttempts', () => {
 });
 
 describe('named check-state regressions', () => {
-  it('groups check names case-insensitively and matches required and hold-gate names with lowercase sets', () => {
+  it('keeps exact check identities through required and hold-gate matching (#7501 B8)', () => {
     const older = settled('Test', 'success', { run_attempt: 1, id: 1 });
     const newer = settled('test', 'failure', { run_attempt: 2, id: 2, required: false });
     for (const runs of [[older, newer], [newer, older]]) {
-      expect(latestAttempts(runs)).toEqual([newer]);
+      expect(latestAttempts(runs)).toEqual(runs);
       expect(summarize([
         ...runs,
         { name: 'Build', status: 'queued' },
         settled('Smoke', 'failure'),
       ], {
-        requiredNames: ['TEST', 'bUiLd', 'ABSENT'],
-        holdGateNames: ['tEsT'],
+        requiredNames: ['test', 'Build', 'ABSENT'],
+        holdGateNames: ['test'],
       })).toEqual({
-        redSet: new Set(['test']), pendingSet: new Set(['build', 'absent']),
+        redSet: new Set(['test']), pendingSet: new Set(['Build', 'ABSENT']),
         gateOnlyRed: true, allRequiredGreen: false,
       });
     }
@@ -335,29 +377,34 @@ describe('named check-state regressions', () => {
 });
 
 describe('summarize required checks', () => {
-  it('matches requiredNames case-insensitively without inventing missing required checks', () => {
+  it('matches requiredNames exactly without inventing missing required checks', () => {
     expect(summarize([
       settled('TeSt', 'success', { required: false }),
       settled('SMOKE', 'failure'),
-    ], { requiredNames: ['TEST', 'test'] })).toEqual({
+    ], { requiredNames: ['TeSt', 'TeSt'] })).toEqual({
       redSet: new Set(), pendingSet: new Set(),
       gateOnlyRed: false, allRequiredGreen: true,
     });
+    expect(summarize([settled('TEST', 'success')], { requiredNames: ['test'] })).toEqual({
+      redSet: new Set(), pendingSet: new Set(['test']),
+      gateOnlyRed: false, allRequiredGreen: false,
+    });
   });
 
-  it('matches holdGateNames case-insensitively and returns lowercase blocker sets', () => {
+  it('matches holdGateNames exactly and preserves blocker names', () => {
     expect(summarize([
       settled('ReViEw-GaTe', 'failure'),
       settled('MERGE-GATE', 'failure'),
       { name: 'BuIlD', status: 'queued' },
     ], {
-      requiredNames: ['REVIEW-GATE', 'merge-gate', 'BUILD', 'Absent', 'ABSENT'],
-      holdGateNames: ['REVIEW-GATE', 'mErGe-GaTe'],
+      requiredNames: ['ReViEw-GaTe', 'MERGE-GATE', 'BuIlD', 'Absent', 'Absent'],
+      holdGateNames: ['ReViEw-GaTe', 'MERGE-GATE'],
     })).toEqual({
-      redSet: new Set(['review-gate', 'merge-gate']),
-      pendingSet: new Set(['build', 'absent']),
+      redSet: new Set(['ReViEw-GaTe', 'MERGE-GATE']),
+      pendingSet: new Set(['BuIlD', 'Absent']),
       gateOnlyRed: true, allRequiredGreen: false,
     });
+    expect(summarize([settled('MERGE-GATE', 'failure')]).gateOnlyRed).toBe(false);
   });
 
   it('marks an explicitly required name with no row as pending', () => {
