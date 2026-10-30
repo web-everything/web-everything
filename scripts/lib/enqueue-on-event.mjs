@@ -59,7 +59,8 @@
  *
  *   catchUp.missBackoff {enabled:true, ttlMinutes:30} skips repeated hold-eligible not-enqueued summaries at the same
  *   head and sorted-label SHA-256 digest until either changes or TTL (integer 1–1440 minutes) expires.
- *   Queue contention, independent retry timers and unreadable evidence retry on the next catch-up.
+ *   Only classified enqueue outcomes authorize holds. Queue contention, independent retry timers,
+ *   unreadable evidence and unclassified revalidation aborts retry on the next catch-up.
  *   Events bypass the hold; enabled:false restores retries on every catch-up.
  *
  * SCOPE. Only PRs of the local repo (the clone's origin): that is the repo whose ready PRs the drain enqueues on
@@ -829,10 +830,9 @@ export function createEnqueueOnEvent({
         const previous = missHold(p.num, pr, s);
         missBackoff.delete(p.num);
         const enqueueOutcome = Array.isArray(json?.enqueueOutcomes) ? json.enqueueOutcomes.find(x => Number(x?.num) === p.num) : null;
-        // Revalidation misses may lack enqueueOutcomes. Preserve those legacy holds;
-        // never infer eligibility from reason text or a missing enqueue outcome.
-        const holdEligible = enqueueOutcome ? enqueueOutcome.outcome === 'not-enqueued' && isMissBackoffHoldEligible(enqueueOutcome.kind)
-          : Array.isArray(json?.revalidationAborted) && json.revalidationAborted.some(x => Number(x?.num) === p.num);
+        // Only an explicitly classified enqueue outcome authorizes a hold.
+        // Unclassified revalidation aborts can be transient and must retry next catch-up.
+        const holdEligible = enqueueOutcome?.outcome === 'not-enqueued' && isMissBackoffHoldEligible(enqueueOutcome.kind);
         if (missSettings(s).enabled && holdEligible && summary.startsWith('not enqueued:') && typeof pr?.headRefOid === 'string' && pr.headRefOid && digest) {
           const reason = summary.slice('not enqueued:'.length).trim();
           missBackoff.set(p.num, { pr: p.num, headSha: pr.headRefOid, labelsDigest: digest, reason, at: now(),
