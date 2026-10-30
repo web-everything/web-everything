@@ -62,6 +62,34 @@ function expectFallback(log, reason) {
 }
 
 describe('remote admission policy', () => {
+  it('runs unsupported check:standards arguments locally with a reason and no remote staging',async()=>{
+    const root=mkdtempSync(join(process.env.TMPDIR,'standards-fallback-')),pool=join(root,'pool');mkdirSync(pool);
+    const preferences=join(root,'preferences.json');
+    writeFileSync(preferences,JSON.stringify({heavyAdmission:{remote:{enabled:true,mode:'always'}}}));
+    const command=['npm','run','check:standards','--','--unknown'];
+    const exited=new Error('test exit'),transport=vi.fn(),stage=vi.fn();
+    const exit=vi.spyOn(process,'exit').mockImplementation(()=>{throw exited;});
+    const stderr=vi.spyOn(process.stderr,'write').mockImplementation(()=>true);
+    for(const [key,value] of Object.entries({LANE_POOL_ROOT:pool,WE_PLATFORM_PREFERENCES:preferences,
+      CI:'',WE_HEAVY_ADMISSION:'on',WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1',
+      WE_HEAVY_ADMISSION_CONTAINER:'',WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES:''}))vi.stubEnv(key,value);
+    vi.mocked(execSync).mockImplementation(()=>{throw Object.assign(new Error('local command exit'),{status:17});});
+    try {
+      await expect(main(['run',`--repo=${root}`,'--',...command],{
+        readTelemetry:healthyRead,
+        remoteExec:async options=>adaptLegacyRemoteResult(await runRemote({...options,exec:transport,fs:{mkdtemp:stage}})),
+      })).rejects.toBe(exited);
+      expect(execSync).toHaveBeenCalledTimes(1);
+      expect(execSync).toHaveBeenCalledWith(command.map(shellQuoteWord).join(' '),expect.objectContaining({cwd:root}));
+      expect(exit).toHaveBeenCalledWith(17);
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining('command-not-allowed'));
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining('falling back to local admission'));
+      expect(transport).not.toHaveBeenCalled();expect(stage).not.toHaveBeenCalled();
+    }finally{
+      vi.mocked(execSync).mockReset();exit.mockRestore();stderr.mockRestore();vi.unstubAllEnvs();
+      rmSync(root,{recursive:true,force:true});
+    }
+  });
   it('ignores conflicting tool remote settings on the shared pool', () => {
     const remote = { enabled: true, mode: 'always', loadPerCoreThreshold: 5 };
     const policy = resolveAdmissionPolicy({

@@ -8,7 +8,7 @@ import {createHash, randomBytes} from 'node:crypto';
 import {join, relative} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {cpus, loadavg, freemem, totalmem} from 'node:os';
-import {baseGuard, readyBases, readBase, copyLeaves, baseFile, materializeWorktree} from './forge-exec-bases.mjs';
+import {baseGuard, readyBases, readBase, copyLeaves, baseFile, createBasePin, materializeWorktree} from './forge-exec-bases.mjs';
 import {decodeManifest} from './forge-exec-manifest.mjs';
 const LIMIT = 4 * 1024 * 1024;
 const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
@@ -526,29 +526,9 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
     if(result.code!==0)throw new Error('Worker ownership handoff refused; use local fallback and inspect slot setup');
   }
   async function pinBase(run,baseSha) {
-    const active=join(bases,'active'),pin=join(active,run);
-    await mkdir(active,{recursive:true,mode:0o700});
     // Pool metadata runs as root, but the anonymous warmer runs as ops and
     // must read every active pin before deciding which public bases to prune.
-    if(!testRoot&&process.getuid()===0){
-      const fd=await open(active,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
-      try{
-        const st=await fd.stat();
-        if(![0,operator.uid].includes(st.uid)||(st.mode&0o022))throw new Error('Unsafe base pin directory');
-        await fd.chown(operator.uid,operator.gid);
-      }finally{await fd.close();}
-    }
-    try{await writeFile(pin,baseSha,{flag:'wx',mode:0o600});}
-    catch(error){if(error.code!=='EEXIST'||(await baseFile(pin)).toString()!==baseSha)throw error;}
-    if(!testRoot&&process.getuid()===0){
-      const fd=await open(pin,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
-      try{
-        const st=await fd.stat();
-        if(!st.isFile()||st.nlink!==1||![0,operator.uid].includes(st.uid)||st.size!==baseSha.length
-          ||(await fd.readFile()).toString()!==baseSha)throw new Error('Unsafe base pin');
-        await fd.chown(operator.uid,operator.gid);
-      }finally{await fd.close();}
-    }
+    await createBasePin(bases,run,baseSha,!testRoot&&process.getuid()===0?operator:undefined);
   }
   async function workCommand(worker,argv,work,env,archive) {
     if(testRoot) return testWorkerExec?testWorkerExec({worker,argv,cwd:work,env,archive}):execute(argv[0],archive ? ['-xf',archive] : argv.slice(1),{cwd:work,env,detached:true});

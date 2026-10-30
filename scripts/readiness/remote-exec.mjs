@@ -17,9 +17,7 @@ const newRunId = () => `${new Date().toISOString().replace(/[^0-9tz]/gi, '').toL
 
 export function isAllowedCommand(argv) {
   // Only task arguments may follow the script name; npm options can skip or replace execution.
-  return Array.isArray(argv) && argv.length >= 3 && argv.every((arg) => typeof arg === 'string' && !arg.includes('\0'))
-    && (allowedCommand(argv) || (argv[0] === 'npm' && argv[1] === 'run' && argv[2] === 'check:standards'
-      && (argv.length === 3 || argv[3] === '--')));
+  return allowedCommand(argv);
 }
 
 export function filterEnv(env = {}) {
