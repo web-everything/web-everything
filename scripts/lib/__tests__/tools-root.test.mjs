@@ -72,6 +72,45 @@ describe('tools.root resolution and guard', () => {
     expect(resolveToolsRoot({ ...options, env: { WE_TOOLS_ROOT: 'relative' } }).reason).toMatch(/absolute/);
   });
 
+  it.each(['node_modules/vitest/vitest.mjs', 'other-script.mjs', 'scripts-other/run.mjs',
+    'scripts/__tests__/runner.mjs', 'scripts/nested/__tests__/runner.mjs', 'scripts/node_modules/runner.mjs',
+  ])('silently leaves library entrypoint %s local even when tools.root contains it', entry => {
+    write(join(ownRoot, entry), '// local runner');
+    write(join(root, entry), '// tools runner');
+    const o = { ...guardOptions(), entryUrl: pathToFileURL(join(ownRoot, entry)),
+      argv: [process.execPath, join(ownRoot, entry)], git: vi.fn(git) };
+    maybeReexecFromToolsRoot(o);
+    expect(o.spawnSync).not.toHaveBeenCalled();
+    expect(o.exit).not.toHaveBeenCalled();
+    expect(o.log).not.toHaveBeenCalled();
+    expect(o.appendEvent).not.toHaveBeenCalled();
+    expect(o.git).not.toHaveBeenCalled();
+  });
+
+  it.each(['node_modules/vitest/vitest.mjs', 'scripts/__tests__/runner.mjs', '../outside.mjs'])
+    ('silently rejects a scripts entrypoint whose realpath is %s', target => {
+      write(join(ownRoot, target), '// runner');
+      const alias = join(ownRoot, 'scripts/alias.mjs');
+      fs.symlinkSync(join(ownRoot, target), alias);
+      write(join(root, 'scripts/alias.mjs'), '// tools runner');
+      const o = { ...guardOptions(), entryUrl: pathToFileURL(alias), argv: [process.execPath, alias] };
+      maybeReexecFromToolsRoot(o);
+      expect(o.spawnSync).not.toHaveBeenCalled();
+      expect(o.exit).not.toHaveBeenCalled();
+      expect(o.log).not.toHaveBeenCalled();
+      expect(o.appendEvent).not.toHaveBeenCalled();
+    });
+
+  it('silently continues locally when the entrypoint realpath is unavailable', () => {
+    fs.rmSync(join(ownRoot, script));
+    const o = guardOptions();
+    maybeReexecFromToolsRoot(o);
+    expect(o.spawnSync).not.toHaveBeenCalled();
+    expect(o.exit).not.toHaveBeenCalled();
+    expect(o.log).not.toHaveBeenCalled();
+    expect(o.appendEvent).not.toHaveBeenCalled();
+  });
+
   it('uses WE_PLATFORM_PREFERENCES and reports unreadable or malformed preferences', () => {
     const path = join(base, 'custom.json');
     write(path, JSON.stringify({ tools: { root } }));
@@ -194,6 +233,29 @@ describe('tools.root resolution and guard', () => {
     await maybeReexecFromToolsRoot(o);
     expect(o.log).toHaveBeenCalledTimes(1);
     expect(o.log).toHaveBeenCalledWith('[tools-root] ignored: bad  [31mevidence');
+  });
+
+  it('importing the guard from a node_modules runner neither re-execs nor logs', () => {
+    const repo = resolve('.');
+    const gitDir = realSpawnSync('git', ['rev-parse', '--absolute-git-dir'], { encoding: 'utf8', cwd: repo }).stdout.trim();
+    fs.rmSync(join(root, '.git'), { recursive: true }); fs.symlinkSync(gitDir, join(root, '.git'));
+    for (const name of ['tools-root-guard.mjs', 'tools-root.mjs', 'daemon-clone-layout.mjs']) {
+      write(join(ownRoot, 'scripts/lib', name), fs.readFileSync(join(repo, 'scripts/lib', name), 'utf8'));
+    }
+    const eventsUrl = pathToFileURL(join(repo, 'scripts/lib/daemon-events.mjs')).href;
+    write(join(ownRoot, 'scripts/lib/daemon-events.mjs'), `export { appendDaemonEvent, daemonEventsPath } from ${JSON.stringify(eventsUrl)};\n`);
+    const runner = 'node_modules/vitest/vitest.mjs';
+    write(join(ownRoot, runner), "import '../../scripts/lib/tools-root-guard.mjs';\nconsole.log('local runner');\n");
+    write(join(root, runner), "console.log('tools runner'); process.exitCode=9;\n");
+    const result = realSpawnSync(process.execPath, [join(ownRoot, runner)], {
+      cwd: ownRoot, env: { ...process.env, ...env, WE_TOOLS_ROOT_REEXEC: undefined,
+        WE_PLATFORM_PREFERENCES: join(base, 'absent.json') }, encoding: 'utf8', timeout: 15000,
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe('local runner\n');
+    expect(result.stderr).toBe('');
+    expect(fs.existsSync(env.WE_DAEMON_EVENTS)).toBe(false);
+    expect(fs.existsSync(join(dirname(env.WE_DAEMON_EVENTS), 'tools-root-last.json'))).toBe(false);
   });
 
   it('runs the actual first-import guard before entry dependencies, preserving the real lane cwd and child exit status', () => {

@@ -41,8 +41,11 @@ export function maybeReexecFromToolsRoot({ entryUrl, argv = process.argv, env = 
 } = {}) {
   try {
     if (env.WE_TOOLS_ROOT_REEXEC !== undefined) return;
-    const rel = relative(ownRoot, fileURLToPath(entryUrl));
-    if (isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`)) return;
+    // Library imports must not redirect their runner, even if tools.root contains it.
+    const rel = relative(fs.realpathSync(ownRoot), fs.realpathSync(fileURLToPath(entryUrl)));
+    const parts = rel.split(sep);
+    if (isAbsolute(rel) || parts[0] !== 'scripts' || parts.length < 2
+      || parts.slice(1, -1).some(part => part === 'node_modules' || part === '__tests__')) return;
     const result = resolveToolsRoot({ scriptRelPath: rel, env, home, ownRoot, fs, git });
     if (!result.active) {
       if (result.reason) log(`[tools-root] ignored: ${clean(result.reason)}`);
