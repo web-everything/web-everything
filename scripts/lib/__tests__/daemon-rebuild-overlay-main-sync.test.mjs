@@ -19,6 +19,7 @@ const temp = () => { const p = fs.mkdtempSync(join(tmpdir(), 'we-main-sync-test-
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); temps.splice(0).forEach(p => fs.rmSync(p, { recursive: true, force: true })); });
 const run = (args, opts = {}) => spawnSync('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.invalid', ...args],
   { encoding: 'utf8', timeout: 20_000, maxBuffer: 8 * 1024 * 1024, ...opts, env: { ...process.env, ...opts.env } });
+const gitCommand = args => args[0] === '--attr-source=origin/main' ? args[1] : args[0];
 const ok = (cwd, args) => { const r = run(args, { cwd }); if (r.status !== 0) throw new Error(`${args}: ${r.stderr}`); return r.stdout.trim(); };
 const write = (root, file, text) => { fs.mkdirSync(dirname(join(root, file)), { recursive: true }); fs.writeFileSync(join(root, file), text); };
 const json = file => JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -28,7 +29,7 @@ const synced = f => f.events.filter(e => e.kind === 'overlay-main-synced');
 const alerts = f => !fs.existsSync(alertsFilePath(f.root, f.env)) ? [] : fs.readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse)
   .filter(e => e.kind.includes('needs-you'));
 
-function fixture({ conflict = false, unrelated = false, count = 1, overlayTest = true, exhausted = false, deleteFinalTest = false } = {}) {
+function fixture({ conflict = false, unrelated = false, count = 1, overlayTest = true, exhausted = false, deleteFinalTest = false, mainUnion = false } = {}) {
   const base = temp(), root = join(base, 'clone'), origin = join(base, 'origin.git');
   fs.mkdirSync(root); fs.mkdirSync(join(root, 'node_modules'));
   ok(root, ['init', '-q', '-b', 'main']);
@@ -36,6 +37,7 @@ function fixture({ conflict = false, unrelated = false, count = 1, overlayTest =
   const lines = Array.from({ length: 30 }, (_, i) => `export const value${i} = ${i};`);
   write(root, 'worker.mjs', `${lines.join('\n')}\n`);
   write(root, 'unrelated.mjs', 'export default 0;\n');
+  if (mainUnion) write(root, 'docs/agent/testing.md', '# Testing\n');
   for (let i = 0; i < count; i++) write(root, `worker${i}.test.mjs`, "import './worker.mjs';\n");
   if (deleteFinalTest) write(root, 'scripts/lib/__tests__/daemon-rebuild-overlay-main-sync.test.mjs',
     "import { it } from 'vitest';\nit('smoke', () => {});\n");
@@ -46,11 +48,17 @@ function fixture({ conflict = false, unrelated = false, count = 1, overlayTest =
   write(root, 'worker.mjs', `${branch.join('\n')}\n`);
   if (overlayTest) write(root, 'overlay.test.mjs', "import './worker.mjs';\n");
   if (deleteFinalTest) fs.unlinkSync(join(root, 'worker0.test.mjs'));
+  if (mainUnion) fs.appendFileSync(join(root, 'docs/agent/testing.md'), 'Overlay testing notes\n');
   ok(root, ['add', '.']); ok(root, ['commit', '-qm', 'overlay']);
   const oldSha = ok(root, ['rev-parse', 'HEAD']);
   ok(root, ['checkout', '-q', 'main']);
   const main = [...lines]; main[conflict ? 0 : 29] = `export const value${conflict ? 0 : 29} = 200;`;
   write(root, unrelated ? 'unrelated.mjs' : 'worker.mjs', unrelated ? 'export default 1;\n' : `${main.join('\n')}\n`);
+  if (mainUnion) {
+    fs.appendFileSync(join(root, 'docs/agent/testing.md'), 'Main testing notes\n');
+    write(root, '.gitattributes', 'docs/agent/testing.md merge=union\n');
+    ok(root, ['add', '.gitattributes']);
+  }
   ok(root, ['commit', '-qam', 'main advanced']);
   const mainSha = ok(root, ['rev-parse', 'HEAD']);
   // Seed a local remote without network IO; both heads and their objects are real.
@@ -194,7 +202,7 @@ describe('overlay main sync', () => {
     f.deps.appendDaemonEvent = e => { outcomes.push(e); };
     f.deps.gitBackoff = vi.fn();
     let tries = 0;
-    f.deps.git = (args, opts) => args[0] === step
+    f.deps.git = (args, opts) => gitCommand(args) === step
       ? (++tries, { status: null, stdout: '', error: Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }) }) : git(args, opts);
     expect(await job(f)).toMatchObject({ skipped: true, reason: 'transient-git' });
     expect(tries).toBe(3); expect(f.deps.gitBackoff).toHaveBeenCalledTimes(2);
@@ -255,7 +263,7 @@ describe('overlay main sync', () => {
     }
     expect(f.deps.git.mock.calls.filter(([args]) => args[0] !== 'checkout')
       .every(([, opts]) => opts.timeout === undefined)).toBe(true);
-    expect(f.deps.git.mock.calls.some(([args]) => args[0] === 'merge')).toBe(true);
+    expect(f.deps.git.mock.calls.some(([args]) => gitCommand(args) === 'merge')).toBe(true);
     expect(synced(f)).toHaveLength(1);
     expect(alerts(f)).toEqual([]);
     expect(fs.readFileSync(join(outside, 'keep.md'), 'utf8')).toBe('preserve outside scratch\n');
@@ -318,7 +326,7 @@ describe('overlay main sync', () => {
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     const stderr = 'discard-me'.repeat(100) + '\x00\x1b\r\nfinal diagnostic';
     if (step === 'tests') f.deps.testRunner = async () => ({ status: 1, stdout: '', stderr });
-    else f.deps.git = (args, opts) => args[0] === step ? { status: 1, stdout: '', stderr } : git(args, opts);
+    else f.deps.git = (args, opts) => gitCommand(args) === step ? { status: 1, stdout: '', stderr } : git(args, opts);
     if (step === 'push') expect(await job(f)).toEqual({ pushed: false });
     else await expect(job(f)).rejects.toMatchObject({ step, stderrTail: expect.stringContaining('final diagnostic') });
     const failure = fs.readFileSync(f.env.WE_DAEMON_EVENTS, 'utf8').trim().split('\n').map(JSON.parse).at(-1);
@@ -619,6 +627,76 @@ describe('overlay main sync', () => {
       tests: expect.arrayContaining(['worker0.test.mjs', 'overlay.test.mjs']) })]);
     expect(f.deps.testRunner).toHaveBeenCalledOnce();
     expect(json(sidecar(f)).lastSyncedMain[ref]).toBe(f.mainSha);
+    unchanged(f);
+  });
+
+  it('uses main union attributes absent from the overlay to merge both testing.md appends without conflict', async () => {
+    const f = fixture({ mainUnion: true });
+    expect(run(['cat-file', '-e', `${f.oldSha}:.gitattributes`], { cwd: f.root }).status).not.toBe(0);
+    expect(ok(f.root, ['show', `${f.mainSha}:.gitattributes`])).toBe('docs/agent/testing.md merge=union');
+    expect(await job(f)).toMatchObject({ pushed: true });
+    const merged = ok(f.origin, ['show', `${ref}:docs/agent/testing.md`]);
+    expect(merged.split('\n')).toEqual(expect.arrayContaining(['# Testing', 'Overlay testing notes', 'Main testing notes']));
+    expect(merged).not.toMatch(/<<<<<<<|=======|>>>>>>>/);
+    expect(f.events.filter(e => e.kind === 'overlay-main-merge-conflict')).toEqual([]);
+    expect(readOverlayConflictWakes(f.env).size).toBe(0);
+    expect(alerts(f)).toEqual([]);
+    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toEqual([]);
+    unchanged(f);
+  });
+
+  it.each([
+    ['clean merge', false, false],
+    ['non-union conflict', true, false],
+    ['union append conflict', false, true],
+  ])('unsupported attribute-source option falls back to the plain merge: %s', async (_, conflict, mainUnion) => {
+    const f = fixture({ conflict, mainUnion }), git = f.deps.git;
+    f.deps.git = vi.fn((args, opts) => args[0] === '--attr-source=origin/main'
+      ? { status: 129, stdout: '', stderr: `unknown option: --attr-source${mainUnion ? '' : '=origin/main'}\nusage: git [<options>] <command> [<args>]\n` }
+      : git(args, opts));
+    if (conflict || mainUnion) {
+      const files = [mainUnion ? 'docs/agent/testing.md' : 'worker.mjs'];
+      await expect(job(f)).rejects.toMatchObject({ step: 'merge', message: expect.stringContaining(files[0]) });
+      expect(f.events).toContainEqual(expect.objectContaining({ kind: 'overlay-main-merge-conflict', ref, files }));
+      expect(f.deps.git).toHaveBeenCalledWith(['merge', '--abort'], expect.any(Object));
+      expect(f.pushes).toEqual([]);
+    } else expect(await job(f)).toMatchObject({ pushed: true });
+    expect(f.deps.git.mock.calls.filter(([args]) => gitCommand(args) === 'merge' && !args.includes('--abort'))
+      .map(([args]) => args)).toEqual([
+      ['--attr-source=origin/main', 'merge', '--no-edit', 'origin/main'],
+      ['merge', '--no-edit', 'origin/main'],
+    ]);
+    unchanged(f);
+  });
+
+  it.each([
+    [129, 'unknown option: --another-option\n'],
+    [128, 'fatal: bad tree object origin/main\n'],
+  ])('attribute-source merge failure without an unsupported-option diagnostic refuses without fallback (%s)', async (status, stderr) => {
+    const f = fixture(), git = f.deps.git;
+    f.deps.git = vi.fn((args, opts) => args[0] === '--attr-source=origin/main'
+      ? { status, stdout: '', stderr } : git(args, opts));
+    await expect(job(f)).rejects.toMatchObject({ step: 'merge', stderrTail: stderr.trim() });
+    expect(f.deps.git).not.toHaveBeenCalledWith(['merge', '--no-edit', 'origin/main'], expect.any(Object));
+    expect(f.events.filter(e => e.kind === 'overlay-main-merge-conflict')).toEqual([]);
+    expect(f.deps.testRunner).not.toHaveBeenCalled(); expect(f.pushes).toEqual([]);
+    unchanged(f);
+  });
+
+  it('main union attributes still refuse a conflicting non-union file with abort, notifications and wake', async () => {
+    const f = fixture({ mainUnion: true, conflict: true });
+    await expect(job(f)).rejects.toMatchObject({ step: 'merge', message: expect.stringContaining('worker.mjs') });
+    expect(f.events.filter(e => e.kind === 'overlay-main-merge-conflict')).toEqual([
+      expect.objectContaining({ ref, files: ['worker.mjs'] }),
+    ]);
+    expect(f.deps.git.mock.calls.some(([args]) => args[0] === 'merge' && args[1] === '--abort')).toBe(true);
+    expect(readOverlayConflictWakes(f.env).get(123)).toMatchObject({ pr: 123, ref, files: ['worker.mjs'], clone: f.root });
+    expect(replay({ path: f.env.WE_NEEDS_YOU_FEED })).toContainEqual(expect.objectContaining({
+      kind: 'overlay-main-sync-needs-you', pr: 123, ref,
+    }));
+    expect(f.deps.testRunner).not.toHaveBeenCalled();
+    expect(f.pushes).toEqual([]); expect(synced(f)).toEqual([]);
+    expect(ok(f.origin, ['rev-parse', ref])).toBe(f.oldSha);
     unchanged(f);
   });
 

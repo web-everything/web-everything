@@ -180,7 +180,13 @@ export function scheduledLaneGc(lanes, { stateRoot = hostStateRoot(), exec = chi
         if (!host.admitted) { log(`gc skipped: ${host.reason}`); return { ran, reason: host.reason }; }
         if (gcLeaseProtected(lane)) { log(`gc skipped leased/unreadable lane: ${lane}`); continue; }
         try {
-          exec('git', ['-c', 'gc.auto=0', '-c', 'gc.autoDetach=false', '-c', 'gc.pruneExpire=never', 'gc', '--no-detach'], { cwd: lane, timeout: 120000, stdio: 'pipe' });
+          const args = ['-c', 'gc.auto=0', '-c', 'gc.autoDetach=false', '-c', 'gc.pruneExpire=never', 'gc', '--no-detach'];
+          const options = { cwd: lane, timeout: 120000, stdio: 'pipe' };
+          try { exec('git', args, options); } catch (e) {
+            if (e.status !== 129 || !/unknown option [`']no-detach'/.test(String(e.stderr))) throw e;
+            // Git 2.43 has no detach option: explicit (non-auto) gc already runs in the foreground.
+            exec('git', args.slice(0, -1), options);
+          }
         } catch (e) {
           // A damaged or slow clone must not starve the rest of the pool. Leave it due for retry.
           failures++;
