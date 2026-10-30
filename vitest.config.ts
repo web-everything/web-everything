@@ -192,6 +192,8 @@ export default defineConfig({
       // Real origin/author/clone fixtures with multiple rebuilds per test. CI shard 4 hit the 5s deadline;
       // keep the assertions and deadline in the blocking integration tier's serial fork instead.
       'scripts/lib/__tests__/daemon-rebuild-keep-established.test.mjs',
+      // Fallback/backoff also runs multiple real-git rebuilds per test and timed out on unit shard 9.
+      'scripts/lib/__tests__/daemon-rebuild-fallback.test.mjs',
       // Same real-git rebuild pattern: skip-unrelated's paired existing/added-file cases timed out in shard 5.
       'scripts/lib/__tests__/daemon-rebuild-skip-unrelated.test.mjs',
       'scripts/operations/__tests__/wake-cli.test.mjs',

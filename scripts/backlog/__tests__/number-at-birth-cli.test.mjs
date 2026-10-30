@@ -13,6 +13,7 @@ function collisionCli(kind, { reservedSource = false, rejectPush = false, offlin
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'collision-cli-')));
   collisionRoots.push(root);
   cpSync('scripts', join(root, 'scripts'), { recursive: true, filter: (p) => basename(p) !== '__tests__' });
+  cpSync('skills-src/conveyor/daemon-manifest.mjs', join(root, 'skills-src/conveyor/daemon-manifest.mjs'));
   symlinkSync(resolve('node_modules'), join(root, 'node_modules'), 'dir');
   mkdirSync(join(root, 'backlog'));
   mkdirSync(join(root, 'home'));
