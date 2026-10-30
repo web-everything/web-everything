@@ -174,6 +174,12 @@ we:scripts/lib/__tests__/daemon-plugins.test.mjs (RED for all: module does not e
   `recheckMs` still resolves from the tool layer. Capability — Red today.
 - **`plugin resolve: override beats tool, process env beats override`.** Capability — Red today.
 - **`plugin resolve: invalid never wins`** — tool `"enabled": "nope"` → stays `true`, `invalid` names the leaf. Capability — Red today.
+- **`plugin resolve: invalid keeps a previously disabled state`** — the fail-closed half of the case above: with
+  `last: false` (the daemon is running disabled), each invalid input leaves `enabled: false`, never flips it on, and
+  `invalid` names the leaf. One row per layer, so no layer can reset a disabled plugin: tool `"enabled": "nope"`,
+  tool `"enabled": null`, env `WE_DAEMON_PLUGIN_VERIFY=maybe`, and an override entry `{ enabled: "yes" }`. A row
+  with `last: true` and an invalid `false`-looking value (`"false"` string) stays `true`. At boot (no `last`) the
+  same invalid inputs resolve to the standard `true`, named in `errors`. Capability — Red today.
 - **`plugin resolve: read error keeps last known`** — `readFile` throws with `last: false` → stays `false`, error
   named; with no `last` (boot) → `true`. Capability — Red today.
 - **`plugin resolve: unknown name throws`.** Capability — Red today.
@@ -189,6 +195,20 @@ off path at all):
 - **`plugin step: on to off drains while in flight, releases at zero`.** Capability — Red today.
 - **`plugin drain: plugin-off stops new dispatch like the drain marker`** — the dispatch fake is never called while
   `inFlight > 0` and the plugin is off. Capability — Red today.
+- **`plugin lifecycle: main() wiring`** — the pure `pluginStep` tests above do not prove `main()` calls it, so this
+  drives the real `main()` loop (tick interval and clock injected, resolver, lease acquire/release, dispatch,
+  state-record writer and logger all fakes) through one scripted sequence and asserts the calls in order:
+  1. resolver returns off at boot → logs `plugin verify disabled (override)`, lease acquire fake **never called**,
+     dispatch fake never called, state record `{ enabled: false, phase: 'idle' }`, `main()` still running (does not
+     exit, so launchd `KeepAlive` has nothing to restart);
+  2. resolver flips on → lease acquired exactly once, dispatch is called, state record `{ enabled: true, phase: 'run' }`;
+  3. resolver flips off with `inFlight = 2` → dispatch not called again, lease **not** released, state record
+     `phase: 'drain'` (`enabled: false`), heartbeat still written;
+  4. `inFlight` reaches 0 → `releaseRunnerLeaseIfOwned` called once with this daemon's owner, state record
+     `phase: 'idle'`, loop keeps ticking;
+  5. resolver throws (read error) while running on → state and lease unchanged, error logged;
+  6. a clock advance past one hour while off → the `plugin verify disabled for <N>h` reminder is logged once, not per tick.
+  Capability — Red today: `main()` has no off path and never calls `pluginStep`.
 
 we:scripts/__tests__/verify-lane.test.mjs:
 - **`request refusal names a disabled plugin`** — a fixture state record with `enabled: false` → exit 3 and the
@@ -247,7 +267,10 @@ shows `in flight 0`, and the orchestrator is told the window (≤ 2 × `recheckM
   missing) and passes after.
 - [A2] **Executable** — `npx vitest run we:skills-src/conveyor/__tests__/verify-daemon.test.mjs -t "plugin step"`
   runs the three named `plugin step:` tests (fails before: `pluginStep` not exported) and passes after; the
-  `plugin drain:` test likewise.
+  `plugin drain:` and `plugin lifecycle: main() wiring` tests likewise (the latter fails before because `main()`
+  never consults `pluginStep`).
+- [A1b] **Executable** — `npx vitest run we:scripts/lib/__tests__/daemon-plugins.test.mjs -t "invalid keeps a previously disabled state"`
+  fails before (module missing) and passes after.
 - [A3] **Executable** — `npx vitest run we:scripts/__tests__/verify-lane.test.mjs -t "disabled plugin"` runs the three
   `request refusal names a disabled plugin` tests; fails before and passes after.
 - [A4] **Executable** — the extended seed test in we:scripts/lib/__tests__/daemon-clone-registry-fix-clone.test.mjs
