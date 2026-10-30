@@ -5,7 +5,7 @@
  * This shared writer deliberately accepts open event kinds. */
 import { appendFile as appendFileDefault, mkdir } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
-import { handoffHome } from '../operations/handoff-home.mjs';
+import { handoffHome } from './handoff-path.mjs';
 
 export function daemonEventsPath({ env = process.env, home } = {}) {
   const override = env?.WE_DAEMON_EVENTS;

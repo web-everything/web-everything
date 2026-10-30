@@ -150,8 +150,8 @@ import { hostname, homedir, userInfo, loadavg, cpus } from 'node:os';
 import { createHash } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { createRequire } from 'node:module';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
-import { importRemoteClient } from './remote-client-import.mjs';
 import { shadowAdmission, readSnapshot } from '../lib/resource-admission.mjs';
 import { hostLoadAdmission } from '../lib/host-load.mjs';
 import { DEFAULT_HOST_MAX_WAIT_MS, loadHostOverloadSettings } from '../lib/host-overload-settings.mjs';
@@ -459,6 +459,12 @@ export function adaptLegacyRemoteResult(result) {
 }
 
 const realClientFs = () => ({ realpathSync, statSync });
+
+// Command-only adapter: daemon import closures must stay statically complete even though a host
+// can select arbitrary client code. Load it only when executing remotely, through native CJS so
+// Vitest does not transform the adapter's computed import. Relative clients still resolve beside it.
+const requireRemoteClient = createRequire(import.meta.url);
+const importRemoteClient = (specifier) => requireRemoteClient('./remote-client-import.cjs').importRemoteClient(specifier);
 
 /** Validate both the named path and its target; symlinks cannot smuggle a lane client outside the pool. */
 export function resolveRemoteClient({ clientPath, laneRoots = [], fs = realClientFs() }) {

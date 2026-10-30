@@ -12,7 +12,7 @@ tags: []
 
 # Remove the host-set remote client path once the prototype Forge client merges (R254)
 
-Remove the host-set `heavyAdmission.remote.clientPath` override once the Forge remote-exec client merges into the bundled client. Delete `we:scripts/readiness/remote-client-import.mjs` and its tests, and retire the override's resolution and provenance plumbing so admission uses the bundled client without importing host-selected code.
+Remove the host-set `heavyAdmission.remote.clientPath` override once the Forge remote-exec client merges into the bundled client. Delete `we:scripts/readiness/remote-client-import.cjs` and its tests, and retire the override's resolution and provenance plumbing so admission uses the bundled client without importing host-selected code.
 
 ## Acceptance
 
