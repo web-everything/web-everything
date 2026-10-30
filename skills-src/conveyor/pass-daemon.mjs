@@ -356,8 +356,10 @@ async function executeTimedPass({ passName, repo, entry }, ports) {
   const alert = ports.alert ?? (detail => log(`pass-daemon: ALERT ${JSON.stringify(detail)}`));
   const probe = ports.probe ?? probeHandle;
   const stop = ports.stop ?? ((handle, options) => stopHandle(handle, { ...options, probe }));
+  // An injected owner probe cannot confirm detached descendants are gone.
+  // Require an independent group reaper or retain quarantine for operator recovery.
   const reapGroup = ports.reapGroup ?? (ports.probe
-    ? handle => probe(handle) === 'dead'
+    ? () => false
     : (handle, notAfterMs, options) => reapDeadGroup(handle, { ...options, notAfterMs }));
   const observeOwner = handle => {
     try { return probe(handle); } catch { return 'unknown'; }
