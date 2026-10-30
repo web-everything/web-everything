@@ -12,6 +12,16 @@ Ignored test-shaped build output is exempt only when `check-ignore`
 confirms that a known build directory itself is ignored; file-only ignore rules still refuse.
 Run this fixture and the affected Forge tests through heavy admission.
 
+Remote discovery may overlap reachability, HEAD and base discovery, but drain every
+speculative process before returning fallback. `buildManifest` always lists ignored files
+fresh after base-manifest retrieval; ignored tests created during retrieval must still
+refuse admission (`forge-offload.test.mjs`). Capture all base lstat metadata before diff/status, attributes
+and index flags. Metadata capture uses at most 16 workers and drains failures before
+full scanning. Manifest timing substages appear inside the existing stage report;
+`inventory-walk` includes `hashing` (do not add those two counters). SSH and rsync
+share multiplexing options only after checking a short, owner-only 0700 directory;
+unavailable, unsafe or overlong control paths retain ordinary SSH.
+
 ## Human-only enqueue approval license (R212)
 
 `human-only-enqueue-license.test.mjs` uses local Git repositories to exercise exact clearance,

@@ -2,9 +2,9 @@
 import { spawn } from 'node:child_process';
 import { realpath } from 'node:fs/promises';
 import * as filesystem from 'node:fs/promises';
-import { constants } from 'node:fs';
+import { constants, mkdirSync, lstatSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { tmpdir } from 'node:os';
+import { tmpdir, homedir } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { allowedCommand, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile, SIBLING_PATHS, siblingShas, sameSiblingShas } from './forge-exec-run.mjs';
@@ -12,6 +12,32 @@ import { allowedCommand, digestInput, digestArgv, digestLock, isTestFile, valida
 const ROOT = '/srv/forge-exec';
 const LIMIT = 4 * 1024 * 1024;
 const SSH_OPTIONS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'];
+// @test-only-export-ok: exercise private-directory refusal without touching user state.
+export function connectionOptions({directory=join(homedir(),'.forge-cm'),fs={mkdirSync,lstatSync}}={}) {
+  try {
+    // %C expands to 40 hex bytes. Keep below even the smaller Unix socket limit.
+    if(Buffer.byteLength(join(directory,'x'.repeat(40)))>100)return [...SSH_OPTIONS];
+    fs.mkdirSync(directory,{mode:0o700});
+  } catch(error) {if(error.code!=='EEXIST')return [...SSH_OPTIONS];}
+  try {
+    const st=fs.lstatSync(directory);
+    if(!st.isDirectory()||st.isSymbolicLink()||(st.mode&0o777)!==0o700||st.uid!==process.getuid())return [...SSH_OPTIONS];
+    return [...SSH_OPTIONS,'-o','ControlMaster=auto','-o','ControlPersist=60s','-o',`ControlPath=${join(directory,'%C')}`];
+  } catch {return [...SSH_OPTIONS];}
+}
+const noTiming=()=>()=>{};
+// Substages accumulate repeated hashing calls without one timing record per file.
+function substageTimer(clock) {
+  const values=new Map();
+  return {values,begin(stage) {
+    const at=clock();
+    return ()=>values.set(stage,(values.get(stage)??0)+Math.max(0,clock()-at));
+  }};
+}
+async function timed(begin,stage,work) {
+  const done=begin(stage);try{return await work();}finally{done();}
+}
+const ignoredInventory=(cwd,exec)=>exec({file:'git',args:['ls-files','-o','-i','--exclude-standard','-z'],cwd});
 const ENV_KEYS = ['CI', 'NODE_ENV', 'TZ', 'LANG', 'LC_ALL', 'FORCE_COLOR', 'NO_COLOR'];
 const quote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
 const newRunId = () => `${new Date().toISOString().replace(/[^0-9tz]/gi, '').toLowerCase()}-${randomBytes(4).toString('hex')}`;
@@ -34,9 +60,9 @@ export function validateRunId(id) {
 
 // Captures have a hard byte limit; streamed command output is inherited verbatim.
 // @test-only-export-ok: the capture boundary suite exercises this process adapter directly.
-export function defaultExec({ file, args, cwd, input, inherit = false }) {
+export function defaultExec({ file, args, cwd, input, inherit = false, sshOptions }) {
   return new Promise((resolve, reject) => {
-    const child = spawn(file, file === 'ssh' ? [...SSH_OPTIONS, ...args] : args, {
+    const child = spawn(file, file === 'ssh' ? [...(sshOptions??connectionOptions()), ...args] : args, {
       cwd, stdio: [input === undefined ? 'inherit' : 'pipe', inherit ? 'inherit' : 'pipe', inherit ? 'inherit' : 'pipe'],
     });
     const stdout = [];
@@ -112,10 +138,10 @@ export function createGitBlobReader({cwd, timeoutMs=10000}={}) {
   };
 }
 import {classifyManifestPath, manifestEntry, decodeManifest, parseGitTree, parseGitStatus, nulPaths} from './forge-exec-manifest.mjs';
-export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse} = {}) {
+export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, beginSub=noTiming} = {}) {
   if(head!==undefined&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head))throw new Error('Invalid Git HEAD');
   // Build names are exempt only with evidence that Git ignores the whole directory.
-  const ignored = await exec({file:'git',args:['ls-files','-o','-i','--exclude-standard','-z'],cwd});
+  const ignored = await timed(beginSub,'ignored-file-listing',()=>ignoredInventory(cwd,exec));
   if (ignored.code !== 0 || !Buffer.isBuffer(ignored.stdout)) throw new Error('Ignored byte inventory unavailable');
   const ignoredTests=splitPaths(ignored.stdout).filter(path=>isTestFile(path)
     && !pathParts(path).slice(0,-1).some(part=>['node_modules','.git'].includes(part.toString('latin1'))));
@@ -139,6 +165,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     if(ignoredDirs.some(dir=>path[dir.length]===47 && path.subarray(0,dir.length).equals(dir)))continue;
     throw Object.assign(new Error('Ignored test: use local fallback'), {code:'ignored-test-file'});
   }
+  const walkDone=beginSub('inventory-walk');
   let files;
   if (listFiles) {
     const names = await listFiles(cwd);
@@ -249,6 +276,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       entries.push({path,sha256:previous.sha256,executable,tracked});
       continue;
     }
+    const hashDone=beginSub('hashing');
     const content = await readManifestFile(absolute,st,fs);
     if (publicOid || trackedOnly) {
       publicOid ??= indexBlobs.get(path.toString('base64'));
@@ -259,7 +287,9 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if (oid !== publicOid) throw excludedSource();
     }
     entries.push(manifestEntry(path,content,!!(st.mode & 0o111),indexBlobs.has(path.toString('base64'))));
+    hashDone();
   }
+  walkDone(); // Includes hashing; the separate hashing counter identifies its share.
   let siblings;
   if (!trackedOnly && entries.some(entry => entry.path.equals(Buffer.from('vitest.shared.ts')))) {
     try {
@@ -304,10 +334,10 @@ export async function selectBase({cwd,exec=defaultExec,bases}={}) {
   }
   return newestLocal;
 }
-export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,base,head}={}) {
+export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,base,head,beginSub=noTiming}={}) {
   if(!base || digestManifest(base.manifest)!==base.manifestDigest)throw new Error('Base manifest digest mismatch');
   const snapshot=decodeManifest(base.manifest);
-  const git=async (args,input)=>{const result=await exec({file:'git',args,cwd,...(input===undefined?{}:{input})});if(result.code!==0||!Buffer.isBuffer(result.stdout)||result.stdout.length>LIMIT)throw new Error('Delta git evidence unavailable; use full ship');return result.stdout;};
+  const git=async (args,input)=>{const result=await timed(beginSub,args[0]==='cat-file'?'base-blob-verification':'git-evidence',()=>exec({file:'git',args,cwd,...(input===undefined?{}:{input})}));if(result.code!==0||!Buffer.isBuffer(result.stdout)||result.stdout.length>LIMIT)throw new Error('Delta git evidence unavailable; use full ship');return result.stdout;};
   const baseEntries=new Map(snapshot.entries.map(entry=>[entry.path.toString('hex'),entry]));
   let blobs=new Map(),reuse,changed,manifestMode='full-scan',manifestReason;
   try {
@@ -315,7 +345,7 @@ export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,bas
     // no fsmonitor. Missing/invalid config evidence must also disable reuse.
     manifestReason='unsafe stat config or unavailable config evidence';
     const config=async args=>{
-      const result=await exec({file:'git',args:['config',...args],cwd});
+      const result=await timed(beginSub,'git-evidence',()=>exec({file:'git',args:['config',...args],cwd}));
       if(![0,1].includes(result.code)||!Buffer.isBuffer(result.stdout)||result.stdout.length>LIMIT
         ||(result.code===1?result.stdout.length:!result.stdout.length))throw new Error('Invalid Git stat config evidence');
       return result.code===1?undefined:result.stdout;
@@ -342,10 +372,22 @@ export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,bas
     blobs=new Map(tree.map(entry=>[entry.path.toString('hex'),entry]));
     // Capture metadata before Git evidence; a subsequent write invalidates reuse.
     const stats=new Map();
-    for(const entry of snapshot.entries) {
-      try {stats.set(entry.path.toString('hex'),await fs.lstat(bytePath(cwd,entry.path)));}
-      catch(error){if(error.code!=='ENOENT')throw error;}
-    }
+    await timed(beginSub,'lstat-pass',async()=>{
+      let next=0;
+      const workers=Array.from({length:Math.min(16,snapshot.entries.length)},async()=>{
+        while(next<snapshot.entries.length) {
+          const entry=snapshot.entries[next++];
+          try {stats.set(entry.path.toString('hex'),await fs.lstat(bytePath(cwd,entry.path)));}
+          catch(error){if(error.code!=='ENOENT')throw error;}
+        }
+      });
+      // Drain all workers even on error; never start Git evidence with stats in flight.
+      const results=await Promise.allSettled(workers);
+      const failed=results.find(result=>result.status==='rejected');
+      if(failed)throw failed.reason;
+    });
+    // Status, flags and attributes remain after the entire capture barrier.
+    // Speculating these reads before lstat could authorize stale clean evidence.
     changed=new Set([
       ...splitPaths(await git(['diff','--no-ext-diff','--no-textconv','--name-only','-z','--no-renames',base.sha,head??'HEAD','--'])),
       ...parseGitStatus(await git(['status','--porcelain=v1','-z','--untracked-files=all'])),
@@ -376,7 +418,7 @@ export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,bas
         // warm snapshot bytes. Prove that the snapshot hash names those bytes.
         if(!blobHashes.has(blob.oid)) {
           if(exec===defaultExec)reader ??= createGitBlobReader({cwd});
-          const content=reader ? await reader.read(blob.oid) : await git(['cat-file','blob',blob.oid]);
+          const content=reader ? await timed(beginSub,'base-blob-verification',()=>reader.read(blob.oid)) : await git(['cat-file','blob',blob.oid]);
           const oid=createHash(blob.oid.length===64?'sha256':'sha1')
             .update(`blob ${content.length}\0`).update(content).digest('hex');
           if(content.length!==blob.size || oid!==blob.oid)throw new Error('Invalid base blob evidence');
@@ -388,7 +430,7 @@ export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,bas
     } finally {await reader?.close();}
     manifestMode='git-delta';
   } catch {manifestReason ??='base or git evidence unavailable';reuse=undefined;}
-  const manifest=await buildManifest({cwd,exec,fs,head,reuse});
+  const manifest=await buildManifest({cwd,exec,fs,head,reuse,beginSub});
   // Transfer decisions still compare the complete manifest, including fresh modes.
   const final=new Set(manifest.entries.map(e=>e.path.toString('hex')));
   const deltaPaths=manifest.entries.filter(entry=>{
@@ -475,18 +517,25 @@ export async function runRemote(options={}) {
   return {...result,timings};
 }
 
-async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, log = text=>process.stderr.write(text) } = {}) {
+async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, log = text=>process.stderr.write(text) } = {}) {
   const fallback = (reason) => ({ mode: 'fallback', reason });
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
   const needsGit=argv[2]==='check:standards';
   if (!validateRunId(runId) || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host)) return fallback('invalid-parameters');
-  try {
-    if ((await exec({ file: 'ssh', args: [host, 'true'], cwd })).code !== 0) return fallback('forge-unreachable');
-  } catch { return fallback('forge-unreachable'); }
+  sshOptions ??= connectionOptions();
+  const start=work=>Promise.resolve().then(work);
+  const initial=await Promise.allSettled([
+    start(()=>exec({file:'ssh',args:[host,'true'],cwd,sshOptions})),
+    start(()=>needsGit?exec({file:'git',args:['rev-parse','HEAD'],cwd}):undefined),
+    start(()=>disableDelta?undefined:exec({file:'ssh',args:[host,'sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs bases'],input:'{}',cwd,sshOptions})),
+  ]);
+  // All speculative children are drained and all rejections observed before fallback.
+  if(initial[0].status==='rejected'||initial[0].value.code!==0)return fallback('forge-unreachable');
+  const unwrap=result=>{if(result.status==='rejected')throw result.reason;return result.value;};
   const nonce = randomBytes(16).toString('hex');
   const ssh = (command, request, inherit = false) => exec({file:'ssh',
     args:[host, `sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs ${command}`],
-    input:JSON.stringify(request), cwd, inherit});
+    input:JSON.stringify(request), cwd, inherit, sshOptions});
   let run;
   let staging;
   let finished = false;
@@ -500,10 +549,11 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
     let expected, expectedManifest, delta, transferBytes=0, transferCount=0;
     try {
       const manifestDone=begin('manifest-build');
+      const substages=substageTimer(clock),beginSub=stage=>substages.begin(stage);
       let manifest, manifestReason='no usable warm base';
       let logicalHead;
       if(needsGit){
-        const evidence=await exec({file:'git',args:['rev-parse','HEAD'],cwd});
+        const evidence=unwrap(initial[1]);
         logicalHead=protocolText(evidence.stdout,128).trim();
         if(evidence.code!==0||!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(logicalHead))throw new Error('Missing Git evidence');
       }
@@ -511,7 +561,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       // subcommand; their full-ship path retains its existing admission order.
       try {
         if(disableDelta)throw new Error('Full ship selected');
-        const discovery=await ssh('bases',{});
+        const discovery=unwrap(initial[2]);
         if(discovery.code!==0)throw new Error('No base capabilities');
         const caps=JSON.parse(protocolText(discovery.stdout,4096));
         if(caps.delta!==1)throw new Error('Delta unavailable');
@@ -520,14 +570,14 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
         const response=await ssh('base-manifest',{sha:base.sha});
         if(response.code!==0)throw new Error('Base manifest unavailable');
         const wire=JSON.parse(protocolText(response.stdout,LIMIT));
-        delta=await buildDeltaManifest({cwd,exec,fs,base:{...base,manifest:wire},head:logicalHead});
+        delta=await buildDeltaManifest({cwd,exec,fs,base:{...base,manifest:wire},head:logicalHead,beginSub});
         manifest=delta;
         if(delta.manifestMode==='full-scan'){manifestReason=delta.manifestReason;delta=undefined;}
       } catch {delta=undefined;}
 
-      manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead});
+      manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,beginSub});
       log(`manifest: ${delta ? `git-delta (${delta.changedCount} changed of ${delta.baseCount})` : `full-scan (${manifestReason})`}\n`);
-      manifestDone();
+      manifestDone({substages:[...substages.values].map(([stage,ms])=>({stage,ms:Math.round(ms)}))});
       const selected = (delta ? delta.deltaPaths : manifest.entries.map(entry => entry.path));
       const selectedKeys=new Set(selected.map(path=>path.toString('hex')));
       const stageDone=begin('mac-stage-and-rehash');
@@ -636,13 +686,13 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       // already normalizes every mode; additive directory access avoids Apple
       // openrsync's '=' parser corrupting file permission masks.
       const copied = await exec({file:'rsync',args:['-a','--chmod=Da+rx','--no-recursive','--no-dirs','--no-links','--safe-links','--exclude=.exit-code',
-        '--from0','--files-from=-',`--rsync-path=sudo -u ${slot} rsync`,'-e',`ssh ${SSH_OPTIONS.join(' ')}`,
+        '--from0','--files-from=-',`--rsync-path=sudo -u ${slot} rsync`,'-e',`ssh ${sshOptions.map(quote).join(' ')}`,
         './',`${host}:${runRoot}/${run}/work/`],cwd:workStage,input:inventory});
       if(copied.code !== 0) throw new Error('Copy failed');
       if (manifest.siblings) {
         const inventory = Buffer.concat(manifest.siblings.frontierui.entries.flatMap(entry => [Buffer.from('./'),entry.path,Buffer.from([0])]));
         const siblingsCopied = await exec({file:'rsync',args:['-a','--chmod=Da+rx','--no-recursive','--no-dirs','--no-links','--safe-links','--exclude=.exit-code',
-          '--from0','--files-from=-',`--rsync-path=sudo -u ${slot} rsync`,'-e',`ssh ${SSH_OPTIONS.join(' ')}`,
+          '--from0','--files-from=-',`--rsync-path=sudo -u ${slot} rsync`,'-e',`ssh ${sshOptions.map(quote).join(' ')}`,
           './',`${host}:${runRoot}/${run}/frontierui/`],cwd:join(staging,'frontierui'),input:inventory});
         if (siblingsCopied.code !== 0) throw new Error('Sibling copy failed');
       }
@@ -653,7 +703,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       if(delta) {
         await finish();
         if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true});
+        return executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions});
       }
       if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code};
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
@@ -684,7 +734,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.
           if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true});
+          const retried=await executeRemote({argv,cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions});
           for(const timing of timings)if(timing.stage==='rsync')timing.shipMode='delta-then-full';
           return retried;
         }
@@ -732,7 +782,7 @@ export async function main(options = {}) {
     host:options.host, readTelemetry:options.readTelemetry, lockRoot:options.lockRoot, clock:options.clock,
     remoteExec:async decisionOptions=>{const value=await remoteExecutor(decisionOptions);capturedTimings=value?.timings;return value;},
   });
-  if(capturedTimings?.length)(options.stderr??(text=>process.stderr.write(text)))(['forge stages (Eastern) | ms | transfer',...capturedTimings.map(t=>`${t.stage} ${t.startedAtET} | ${t.ms}${t.shipMode ? ` | ${t.shipMode} ${t.fileCount} files ${t.bytesSent} bytes`:''}`)].join('\n')+'\n');
+  if(capturedTimings?.length)(options.stderr??(text=>process.stderr.write(text)))(['forge stages (Eastern) | ms | transfer',...capturedTimings.map(t=>`${t.stage} ${t.startedAtET} | ${t.ms}${t.shipMode ? ` | ${t.shipMode} ${t.fileCount} files ${t.bytesSent} bytes`:''}${t.substages?.length ? `\n${t.substages.map(s=>`  ${s.stage} | ${s.ms}`).join('\n')}`:''}`)].join('\n')+'\n');
   if (result.handled) return result.exitCode;
   const local = options.local ?? (async (argv) => (await defaultExec({ file: process.execPath,
     args: ['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=600000', '--', ...argv], cwd: options.cwd, inherit: true })).code);

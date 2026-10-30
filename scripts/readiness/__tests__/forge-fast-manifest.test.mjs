@@ -40,6 +40,45 @@ async function compare(options={}) {
   return fast;
 }
 describe('fast Git manifest',()=>{
+  it('bounds concurrent metadata capture and drains it before diff/status/flags',async()=>{
+    for(let i=0;i<40;i++)await write(`leaf-${i}.txt`,'leaf');
+    await git(['add','.']);await commit();
+    const full=await buildManifest({cwd,exec});
+    const warm={sha:(await git(['rev-parse','HEAD'])).toString().trim(),manifest:manifestWire(full),manifestDigest:full.manifestDigest};
+    let active=0,maximum=0,captures=0,evidence=false;
+    const observedFs={...fs,lstat:async path=>{
+      if(evidence)return fs.lstat(path);
+      active++;maximum=Math.max(maximum,active);
+      try {await new Promise(resolve=>setImmediate(resolve));return await fs.lstat(path);}
+      finally {active--;captures++;}
+    }};
+    const observedExec=async call=>{
+      if(['diff','status','check-attr'].includes(call.args[0])||call.args.includes('-v')) {
+        expect(active).toBe(0);expect(captures).toBe(full.entries.length);evidence=true;
+      }
+      return exec(call);
+    };
+    const fast=await buildDeltaManifest({cwd,exec:observedExec,fs:observedFs,base:warm});
+    expect(maximum).toBeGreaterThan(1);expect(maximum).toBeLessThanOrEqual(16);
+    expect(fast.manifestMode).toBe('git-delta');expect(manifestWire(fast)).toEqual(manifestWire(full));
+  });
+  it('drains a failed lstat pass and hashes everything without partial reuse',async()=>{
+    let active=0,failed=false;
+    const observedFs={...fs,lstat:async path=>{
+      active++;
+      try {
+        await new Promise(resolve=>setImmediate(resolve));
+        if(!failed){failed=true;throw Object.assign(new Error('unreadable'),{code:'EACCES'});}
+        return await fs.lstat(path);
+      } finally {active--;}
+    }};
+    const observedExec=async call=>{
+      if(call.args.includes('-i'))expect(active).toBe(0);
+      return exec(call);
+    };
+    const fast=await compare({fs:observedFs,exec:observedExec});
+    expect(fast.manifestMode).toBe('full-scan');expect(active).toBe(0);
+  });
   it('reads only committed, staged, unstaged and untracked changes, matching full entries, wire and digest',async()=>{
     await write('edit.txt','committed');await git(['add','.']);await commit();
     await write('staged.txt','staged');await git(['add','staged.txt']);
