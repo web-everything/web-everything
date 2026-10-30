@@ -44,6 +44,8 @@ beforeAll(() => {
   // import.meta.url) resolves inside the throwaway clone, not the real repo — the mutation genuinely
   // lands only in `clone/backlog/*`, never touches this lane's real `backlog/`.
   cpSync(WE_SCRIPTS_DIR, join(clone, 'scripts'), { recursive: true, filter: skipTestDirs });
+  cpSync(join(dirname(WE_SCRIPTS_DIR), 'skills-src/conveyor/daemon-manifest.mjs'),
+    join(clone, 'skills-src/conveyor/daemon-manifest.mjs'));
   // The transcript check imports this skill module during CLI startup.
   cpSync(join(dirname(WE_SCRIPTS_DIR), 'skills-src', 'inspect-codex-transcript'),
     join(clone, 'skills-src', 'inspect-codex-transcript'), { recursive: true });
