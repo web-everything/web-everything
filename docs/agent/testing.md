@@ -1021,6 +1021,12 @@ holds apply globally. Reads leave legacy files untouched. A skipped run retains
 `servedModel: 'unknown'` and `modelEvidence: 'not-launched'`; `heldBackend` and
 `heldModel` identify the observation responsible for the refusal.
 
+Judge scorecards and run-record telemetry keep the effective agy effort: a model-id
+suffix takes precedence, otherwise apply the CLI map and legacy model override.
+Use `antigravity-model-effort.mjs`'s shared predicate in both launchers. Regression
+coverage lives in `antigravity-judge-spawn.test.mjs`; `parallel-judges.test.mjs` checks
+that both drive modes preserve provider effort while retaining the request fallback.
+
 ## Shadow reviewer agreement evidence
 
 The agy mandatory-seat shadows are off by default (operator 2026-10-16).
