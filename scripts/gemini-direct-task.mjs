@@ -129,13 +129,18 @@ function validateTimeout(value) {
 }
 
 /** Pure argv AFTER agy. No required cwd flag exists; scope is supplied via spawn and the prompt. */
-export function buildAgyDirectTaskArgv({ addDirs = [], model, effort, sandbox = false, printTimeoutMs, resumeConversationId = null, review = false } = {}) {
+export function buildAgyDirectTaskArgv({ addDirs = [], model, effort, jsonSchema, sandbox = false, printTimeoutMs, resumeConversationId = null, review = false } = {}) {
   // Resume supplies a non-empty continuation instruction via text-mode --print and an explicit conversation.
   // stream-json input is for the initial task only: it runs one turn per stdin message.
   const argv = ['--input-format', resumeConversationId === null ? 'stream-json' : 'text', '--output-format', 'stream-json',
     '--disable-slash-commands'];
   // #4194 — without this flag agy denies shell, writes and out-of-cwd reads (see REVIEW_MODE_SUFFIX).
   if (!review) argv.push('--dangerously-skip-permissions');
+  if (jsonSchema !== undefined) {
+    requireText(jsonSchema, 'jsonSchema');
+    // The schema belongs to the initial turn; text-mode resume continues that conversation.
+    if (resumeConversationId === null) argv.push('--json-schema', jsonSchema);
+  }
   if (!Array.isArray(addDirs)) throw new TypeError('gemini-direct-task: addDirs must be an array');
   // An extra dir would re-grant reads outside --dir that a review run exists to deny.
   if (review && addDirs.length) throw new TypeError('gemini-direct-task: --add-dir is not allowed with --review');
@@ -408,7 +413,7 @@ export function runGate({ dir, mode, execFn = defaultExecFn }) {
  * No child process is created by unit tests: spawnFn is injectable.
  */
 export async function runAgyDirectExec({
-  dir, task, model, effort, addDirs, sandbox = false, timeoutMs = DEFAULT_TIMEOUT_MS,
+  dir, task, model, effort, jsonSchema, addDirs, sandbox = false, timeoutMs = DEFAULT_TIMEOUT_MS,
   logFile, stream = true, spawnFn = nodeSpawn, cli = AGY_CLI, resumeConversationId = null, review = false,
   // Injected processes must not consume or publish the host's real quota observations.
   // Callers exercising quota behavior can inject both store operations explicitly.
@@ -419,7 +424,7 @@ export async function runAgyDirectExec({
   let stdinLine;
   try {
     validateTimeout(timeoutMs);
-    argv = buildAgyDirectTaskArgv({ model, effort, addDirs, sandbox, printTimeoutMs: timeoutMs, resumeConversationId, review });
+    argv = buildAgyDirectTaskArgv({ model, effort, jsonSchema, addDirs, sandbox, printTimeoutMs: timeoutMs, resumeConversationId, review });
     if (resumeConversationId === null) stdinLine = buildAgyStdinLine(buildAgyPrompt(task, dir, { review }));
     requireText(logFile, 'logFile');
     // A killed process can leave a partial final line. Separate attempts before appending new JSONL.
@@ -511,13 +516,13 @@ export async function runAgyDirectExec({
 
 /** Resolve target, record HEAD, run with at most one resume, capture diff, gate. NEVER commit/push/open a PR. */
 export async function geminiDirectTask({
-  task, dir, repoRoot, model, effort, addDirs, sandbox = false, timeoutMs = DEFAULT_TIMEOUT_MS,
+  task, dir, repoRoot, model, effort, jsonSchema, addDirs, sandbox = false, timeoutMs = DEFAULT_TIMEOUT_MS,
   gate = 'none', logFile, stream = true, installDeps = true, wireOriginToRemote = false, review = false,
   execFn = defaultExecFn, spawnFn = nodeSpawn, mkTempDir = mkdtempSync, existsFn = existsSync,
 } = {}) {
   requireText(task, 'task');
   validateTimeout(timeoutMs);
-  buildAgyDirectTaskArgv({ model, effort, addDirs, sandbox }); // fail before cloning on invalid input.
+  buildAgyDirectTaskArgv({ model, effort, jsonSchema, addDirs, sandbox }); // fail before cloning on invalid input.
   if (!['none', 'standards', 'full'].includes(gate)) throw new TypeError('gemini-direct-task: gate must be none|standards|full');
   let scratch = null;
   let targetDir;
@@ -539,7 +544,7 @@ export async function geminiDirectTask({
   const resolvedLogFile = logFile ? resolve(logFile) : join(gitDir, 'gemini-direct-task.jsonl');
   mkdirSync(dirname(resolvedLogFile), { recursive: true });
   const runOptions = {
-    dir: targetDir, task, model, effort, addDirs, sandbox, timeoutMs,
+    dir: targetDir, task, model, effort, jsonSchema, addDirs, sandbox, timeoutMs,
     logFile: resolvedLogFile, stream, spawnFn, review,
   };
   let run = await runAgyDirectExec(runOptions);
@@ -585,7 +590,7 @@ export async function geminiDirectTask({
 /** --flag=value parsing, with repeatable --add-dir. Pure and independently testable. */
 export function parseFlags(argv) {
   const flags = {};
-  const values = ['task', 'task-file', 'dir', 'repo-root', 'model', 'effort', 'add-dir', 'timeout-ms', 'gate', 'log'];
+  const values = ['task', 'task-file', 'dir', 'repo-root', 'model', 'effort', 'json-schema', 'add-dir', 'timeout-ms', 'gate', 'log'];
   const booleans = ['sandbox', 'no-stream', 'no-install', 'wire-origin-to-remote', 'json', 'help', 'review'];
   for (const arg of argv) {
     const eq = arg.indexOf('=');
@@ -607,6 +612,7 @@ export function parseFlags(argv) {
 }
 
 export const HELP = `usage: node scripts/gemini-direct-task.mjs --task=<text>|--task-file=<path>
+  --json-schema=<string|path> Constrain the final print-mode answer (passed directly to agy).
   --dir=<existing checkout>  Default: fresh scratch clone; --repo-root=<path> REQUIRED without --dir.
   --model=<slug> --effort=low|medium|high  Optional passthroughs; no validated recommendation for this role.
   --add-dir=<dir>            Repeatable bookkeeping only, NOT a sandbox or permission boundary.
@@ -681,6 +687,7 @@ export async function main(argv = process.argv.slice(2), { taskFn = geminiDirect
     task, dir: flags.dir ? resolve(flags.dir) : undefined,
     repoRoot: flags['repo-root'] ? resolve(flags['repo-root']) : undefined,
     model: flags.model, effort: flags.effort, addDirs: flags['add-dir']?.map((dir) => resolve(dir)),
+    jsonSchema: flags['json-schema'] && existsSync(flags['json-schema']) ? resolve(flags['json-schema']) : flags['json-schema'],
     sandbox: Boolean(flags.sandbox), timeoutMs: flags['timeout-ms'] ? Number(flags['timeout-ms']) : DEFAULT_TIMEOUT_MS,
     gate: flags.gate ?? 'none', logFile: flags.log ? resolve(flags.log) : undefined,
     stream: !flags['no-stream'] && !flags.json, installDeps: !flags['no-install'],
