@@ -14,7 +14,7 @@ export default {
   ] },
   fixPresent(root) {
     return readFileSync(join(root, 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8')
-      .includes('rollbackQuick(state.quarantine.prevHead, state.quarantine.failedHead)');
+      .includes('rollbackQuick(quarantine.prevHead, quarantine.failedHead)');
   },
   run({ log } = {}) {
     return runSoak({

@@ -1274,6 +1274,23 @@ describe('quick mode through the existing candidate/adoption pipeline', () => {
     expect(runSmoke.mock.calls[0][0]).toMatchObject({ singleAttempt: true, deferredChecks: QUICK_DEFERRED_CHECKS });
     expect(readReadyCandidate(f.root, f.env)).toMatchObject({ quick: true });
   });
+  it.each([
+    { name: 'missing stdout', res: { status: 0 } },
+    { name: 'numeric stdout', res: { status: 0, stdout: 0 } },
+    { name: 'error with zero status', res: { status: 0, stdout: 'README.md\0', error: new Error('boom') } },
+    { name: 'signal with zero status', res: { status: 0, stdout: 'README.md\0', signal: 'SIGTERM' } },
+    { name: 'truncated NUL stream', res: { status: 0, stdout: 'README.md' } },
+  ])('requires full smoke when the quick diff is incomplete: $name', async ({ res }) => {
+    const f = candidateFixture('README.md', '1');
+    const run = vi.fn((args, opts) => args[0] === 'diff' && args.includes('-z') ? res : f.run(args, opts));
+    const options = smokeOptions({ ...f, run });
+    const runSmoke = vi.fn(async () => passed());
+    await smokeAndAdopt({ ...options, runSmoke });
+    expect(run.mock.calls.some(([args]) => args[0] === 'diff' && args.includes('-z'))).toBe(true);
+    expect(runSmoke).toHaveBeenCalledOnce();
+    expect(runSmoke.mock.calls[0][0]).not.toHaveProperty('singleAttempt');
+    expect(readReadyCandidate(f.root, f.env)).not.toHaveProperty('quick');
+  });
   it('requires full smoke when a transitive verifier dependency is renamed', async () => {
     const f = dependencyFixture('rename');
     // Prove Git recognizes the rename; the quick diff still includes both endpoints.

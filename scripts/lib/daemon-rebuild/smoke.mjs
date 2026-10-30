@@ -443,7 +443,9 @@ export async function smokeAndAdopt({
   const quickDecisionFor = sha => {
     const diff = quickSetting.quick ? git(['diff', '--name-only', '-z', '--no-renames', prevHead, sha]) : null;
     return decideQuick({ enabled: quickSetting.quick,
-      changedFiles: diff?.status === 0 ? String(diff.stdout ?? '').split('\0').filter(Boolean) : null });
+      changedFiles: diff?.status === 0 && !diff.error && !diff.signal && typeof diff.stdout === 'string'
+        && (diff.stdout === '' || diff.stdout.endsWith('\0'))
+        ? diff.stdout.split('\0').filter(Boolean) : null });
   };
   const primaryDecision = quickDecisionFor(plan.finalSha);
   const decisionWhy = primaryDecision.why === 'disabled' ? `disabled (source ${quickSetting.source})` : primaryDecision.why;
