@@ -49,7 +49,9 @@ export function cloneRuntimeEntries({ root, entries = [], env = process.env,
     for (const arg of args) {
       if (isAbsolute(arg) || arg.startsWith('--pass=')) continue;
       if (/^--(?:import|require|(?:experimental-)?loader)(?:=|$)/.test(arg)
-        || arg.includes('/') || /^\.{1,2}$/.test(arg) || /\.[a-z][a-z0-9]*$/i.test(arg)) {
+        || /^-r/.test(arg)
+        || (!arg.startsWith('-')
+          && (arg.includes('/') || /^\.{1,2}$/.test(arg) || /\.[a-z][a-z0-9]*$/i.test(arg)))) {
         throw new Error(`LaunchAgents unsupported entrypoint/module argument refused: ${name}: ${arg}`);
       }
     }

@@ -137,9 +137,10 @@ it('refuses an unknown pass for this clone', () => {
   }) })).toThrow();
 });
 
-it.each(['scripts/daemon.mjs', './daemon.js', 'daemon.cjs', 'daemon.ts', 'relative/runner',
+it.each(['scripts/daemon.mjs', './daemon.js', 'daemon.cjs', 'daemon.ts', 'relative/runner', '.', '..',
   'daemon.mts', 'daemon.py', 'daemon.cts', 'daemon.tsx', '--import=./x', '--import=package',
-  '--require=./x', '--loader=./x', '--experimental-loader=./x', '--import', '--path=relative/file.js'])(
+  '--require=./x', '--loader=./x', '--experimental-loader=./x',
+  '--import', '--require', '--loader', '--experimental-loader', '-r./relative-module.cjs', '-rpackage', '-r'])(
   'refuses an unsupported LaunchAgent entrypoint/module argument: %s', entry => {
     const f = fixture();
     writeFileSync(join(f.launchAgentsDir, 'com.we.relative.plist'), 'plist');
@@ -147,6 +148,23 @@ it.each(['scripts/daemon.mjs', './daemon.js', 'daemon.cjs', 'daemon.ts', 'relati
       stdout: JSON.stringify({ ProgramArguments: ['/usr/bin/env', 'node', entry] }),
     }) })).toThrow(`LaunchAgents unsupported entrypoint/module argument refused: com.we.relative.plist: ${entry}`);
   });
+
+it('R230 permits bare interpreters, option flags and numeric argument tokens', () => {
+  const f = fixture();
+  writeFileSync(join(f.launchAgentsDir, 'com.we.tokens.plist'), 'plist');
+  expect(new Set(cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
+    stdout: JSON.stringify({ ProgramArguments: ['/usr/bin/env', 'node', '--pass=x', '--path=relative/file.js', '42'] }),
+  }) }))).toEqual(new Set(DAEMON_ENTRY_MODULES));
+});
+
+it('permits --repo=owner/repo on a LaunchAgent with an absolute entrypoint', () => {
+  const f = fixture();
+  writeFileSync(join(f.launchAgentsDir, 'com.we.postmortem.plist'), 'plist');
+  const entry = 'scripts/conveyor/pass-daemons/pr-postmortem-pass.mjs';
+  expect(new Set(cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
+    stdout: JSON.stringify({ ProgramArguments: ['node', join(f.root, entry), '--repo=owner/repo', '--watch'] }),
+  }) }))).toEqual(new Set([...DAEMON_ENTRY_MODULES, entry]));
+});
 
 it('permits node paths, absolute scripts, plain flags, pass names and numeric argument tokens', () => {
   const f = fixture();
