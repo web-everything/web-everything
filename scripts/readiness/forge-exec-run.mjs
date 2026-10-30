@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // Installed root:root 0755. No executable source or configuration comes from the task.
 import {spawn} from 'node:child_process';
-import {constants} from 'node:fs';
+import {constants, realpathSync} from 'node:fs';
 import * as filesystem from 'node:fs/promises';
-import {open, mkdir, readdir, writeFile, rename, rm, rmdir, lstat, realpath} from 'node:fs/promises';
+import {open, mkdir, readdir, writeFile, rename, rm, rmdir, lstat} from 'node:fs/promises';
 import {createHash, randomBytes} from 'node:crypto';
 import {join, relative} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -925,7 +925,9 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
     },
   };
 }
-if(process.argv[1] && await realpath(process.argv[1]).catch(()=> '') === await realpath(fileURLToPath(import.meta.url))) {
+const cliPath = (()=>{try{return realpathSync(process.argv[1]);}catch{return '';}})();
+if(process.argv[1] && cliPath === realpathSync(fileURLToPath(import.meta.url))) {
+  (async()=>{
   try {
     if(process.argv.length!==3 || !['prepare','run','finish','bases','base-manifest','telemetry','warm-install'].includes(process.argv[2])) throw new Error('Invalid subcommand');
     // Pool roots are deliberately 0700 worker-owned. Only this installed,
@@ -949,4 +951,5 @@ if(process.argv[1] && await realpath(process.argv[1]).catch(()=> '') === await r
     if(process.argv[2]==='prepare'&&error.code==='forge-busy')process.stdout.write(JSON.stringify({reason:'forge-busy'})+'\n');
     process.stderr.write('forge-exec-run: '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n'); process.exitCode=254;
   }
+  })();
 }

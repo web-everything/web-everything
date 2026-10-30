@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { realpath } from 'node:fs/promises';
 import * as filesystem from 'node:fs/promises';
-import { constants } from 'node:fs';
+import { constants, realpathSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
@@ -661,7 +660,10 @@ export function parseArgs(args) {
   return options;
 }
 
-if (process.argv[1] && await realpath(process.argv[1]).catch(() => '') === await realpath(fileURLToPath(import.meta.url))) {
+const cliPath = (() => { try { return realpathSync(process.argv[1]); } catch { return ''; } })();
+if (process.argv[1] && cliPath === realpathSync(fileURLToPath(import.meta.url))) {
+  (async () => {
   try { process.exitCode = await main(parseArgs(process.argv.slice(2))); }
   catch (error) { process.stderr.write(`remote-exec: ${error.message}\n`); process.exitCode = 1; }
+  })();
 }
