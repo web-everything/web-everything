@@ -103,6 +103,10 @@ describe('quick mode policy (default OFF)', () => {
   it('requires full smoke for a transitive verifier dependency', () => {
     expect(decision(['scripts/lib/red-main-hold.mjs']).quick).toBe(false);
   });
+  it.each(['\u2028', '\u2029'])('requires full smoke for a protected filename containing separator %j', separator => {
+    const path = `scripts/lib/entry${separator}.mjs`;
+    expect(decision([path])).toEqual({ quick: false, file: path, why: `protected code changed: ${path}` });
+  });
   it.each(QUICK_ALWAYS_FULL_PATHS)('protected pattern has an independently covered path: %s', pattern => {
     const path = pattern.replaceAll('**/', 'nested/').replaceAll('*', 'fixture');
     expect(decision([path])).toMatchObject({ quick: false, file: path });
@@ -1408,6 +1412,26 @@ describe('quick mode through the existing candidate/adoption pipeline', () => {
     expect(runSmoke.mock.calls[0][0]).toMatchObject({ singleAttempt: true, deferredChecks: QUICK_DEFERRED_CHECKS });
     expect(options.log.error).toHaveBeenCalledWith(expect.stringContaining('daemon-rebuild: quick=on'));
     expect(readReadyCandidate(f.root, f.env)).toMatchObject({ quick: true, adopt: { finalSha: f.plan.finalSha } });
+  });
+  it('quick with smoke disabled adopts without marking quick or scheduling soak debt', async () => {
+    const f = candidateFixture();
+    f.env.WE_DAEMON_SMOKE_DISABLE = '1';
+    const runSmoke = vi.fn(runLiveSmokeWithRetry);
+    await smokeAndAdopt({ ...smokeOptions(f), runSmoke });
+    expect(runSmoke).toHaveBeenCalledOnce();
+    expect(await runSmoke.mock.results[0].value).toEqual({ verdict: 'pass', disabled: true });
+    const ready = readReadyCandidate(f.root, f.env);
+    expect(ready).not.toHaveProperty('quick');
+    const launchSoak = vi.fn();
+    const adopted = await finalizeRebuild({ ...smokeOptions(f), quick: ready.quick, plan: ready.adopt, launchSoak });
+    expect(adopted.moved).toBe(true);
+    expect(launchSoak).not.toHaveBeenCalled();
+    expect(f.git(['rev-parse', 'HEAD'])).toBe(f.plan.finalSha);
+    const st = readRebuildState(f.root, f.env);
+    expect(st.adopted.head).toBe(f.plan.finalSha);
+    expect(st.adopted).not.toHaveProperty('unverified');
+    expect(st.unverified).toBeNull();
+    expect(st.smokePassed).toBeNull();
   });
   it('quick runs one pre-adopt smoke, carries its mark through ready adoption and launches soak', async () => {
     const f = candidateFixture();

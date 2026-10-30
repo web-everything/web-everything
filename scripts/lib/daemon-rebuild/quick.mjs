@@ -45,7 +45,7 @@ export const matchesQuickProtectedPath = (path, pattern) => {
   path = canonical(path);
   pattern = canonical(pattern);
   const escaped = pattern.split('*').map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-  return new RegExp(`^${escaped.join('.*')}$`).test(path);
+  return new RegExp(`^${escaped.join('.*')}$`, 's').test(path);
 };
 
 /** Unknown or oversized evidence falls back to full smoke; callers log the decision once per rebuild. */
