@@ -1365,6 +1365,11 @@ A large seed commit can launch detached maintenance/repack that outlives `execFi
 recursive snapshots and cleanup. Apply the same flags to bounded production freshness fetches;
 do not hide the race with sleeps, cleanup retries, or exclusions from the snapshot.
 
+Git path safety tests must preserve raw command-output bytes until UTF-8 round-trip validation;
+include invalid filename bytes as well as a valid U+FFFD name. For generated safety attributes,
+probe the effective value with `git check-attr`, and test encoded line lengths near Git 2.43's
+2048-byte limit. An ignored override must refuse the merge before Git can allocate conflict markers.
+
 1. Test behavior, not implementation.
 2. One concept per test; descriptive names (`should notify listeners on setItem`).
 3. Arrange-Act-Assert. Reset state in `beforeEach`/`afterEach`.

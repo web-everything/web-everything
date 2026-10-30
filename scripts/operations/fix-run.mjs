@@ -134,7 +134,10 @@ export const SANDBOX_PREAMBLE = [
   '',
 ].join('\n');
 
-const sh = (cmd, args, opts) => String(execFileSync(cmd, args, { encoding: 'utf8', ...opts }) ?? '');
+const sh = (cmd, args, opts) => {
+  const output = execFileSync(cmd, args, { encoding: 'utf8', ...opts });
+  return opts?.encoding === null ? output : String(output ?? '');
+};
 
 
 const singleLine = (text) => String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, 300);
@@ -872,7 +875,14 @@ export async function runFixCli(argv = [], {
     const MAX_MARKER_SIZE = 1024;
     const boundedMarkerPaths = new Set();
     const mergeWithBoundedMarkers = (target) => {
-      const inspect = (args, input) => run('git', [...HARDENED_GIT_ARGS, ...args], { cwd: lanePath, env: gitEnv, input, maxBuffer: BLOB_MAX_BYTES });
+      const inspect = (args, input) => {
+        // Decode only after checking round-trip fidelity. Replacement decoding could target a different path,
+        // and downstream conflict handling also needs UTF-8 paths. Refuse unsupported names before merging.
+        const bytes = Buffer.from(run('git', [...HARDENED_GIT_ARGS, ...args], { cwd: lanePath, env: gitEnv, input, encoding: null, maxBuffer: BLOB_MAX_BYTES }));
+        const text = bytes.toString('utf8');
+        if (!Buffer.from(text).equals(bytes)) throw new LauncherError('cannot bound conflict markers: non-UTF-8 path bytes; rename these paths to UTF-8 before retrying');
+        return text;
+      };
       const paths = [...new Set((inspect(['ls-tree', '-r', '--name-only', '-z', 'HEAD']) + inspect(['ls-tree', '-r', '--name-only', '-z', `origin/${target}`])).split('\0').filter(Boolean))];
       // Repository-sized path lists exceed ARG_MAX; keep argv fixed and preserve every path byte through NUL stdin.
       const input = paths.join('\0') + '\0';
@@ -890,7 +900,10 @@ export async function runFixCli(argv = [], {
       // C-quote bytes and escape glob metacharacters: even whitespace/newline/glob-bearing paths match literally.
       const rules = [...boundedMarkerPaths].map(p => {
         const literal = '/' + p.replace(/[\\*?\[\]]/g, '\\$&');
-        return '"' + [...Buffer.from(literal)].map(b => '\\' + b.toString(8).padStart(3, '0')).join('') + '" conflict-marker-size=7\n';
+        const rule = '"' + [...Buffer.from(literal)].map(b => '\\' + b.toString(8).padStart(3, '0')).join('') + '" conflict-marker-size=7\n';
+        // Git 2.43 ignores attribute lines at its 2048-byte buffer limit. Never let a safety rule be ignored.
+        if (Buffer.byteLength(rule) >= 2048) throw new LauncherError('cannot bound conflict markers: literal override exceeds Git attribute line limit; shorten paths or reduce conflict-marker-size before retrying');
+        return rule;
       }).join('');
       write(`fix-run: conflict-marker-size exceeds ${MAX_MARKER_SIZE} in ${boundedMarkerPaths.size} path(s); using width 7 for this merge\n`);
       try {

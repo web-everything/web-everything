@@ -975,7 +975,7 @@ describe('runFixCli', () => {
           m.calls.push([cmd, ...args]);
           onGit?.(args, dir, opts);
           if (args.includes('fetch') || args.includes('push')) return '';
-          return execFileSync(cmd, args, { cwd: dir, env: { ...env, ...opts?.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' }, encoding: 'utf8', stdio: 'pipe', input: opts?.input, maxBuffer: opts?.maxBuffer });
+          return execFileSync(cmd, args, { cwd: dir, env: { ...env, ...opts?.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' }, encoding: opts?.encoding === null ? null : 'utf8', stdio: 'pipe', input: opts?.input, maxBuffer: opts?.maxBuffer });
         }
         if (args.includes('acquire')) return JSON.stringify({ path: dir, holder: 'test-holder' });
         if (cmd === 'gh' && args.includes('view')) return JSON.stringify({ title: 'T', headRefOid: git('rev-parse', 'HEAD').trim() });
@@ -986,6 +986,108 @@ describe('runFixCli', () => {
       await check({ out, m, git, dir, recordOutcome });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   };
+  it('refuses an overlong literal marker override before merge, preserving local attributes', async () => {
+    const path = Array(5).fill('a'.repeat(100)).join('/') + '.txt';
+    const effective = [];
+    await withRealMerge({
+      base: ({ dir }) => {
+        mkdirSync(dirname(join(dir, path)), { recursive: true });
+        writeFileSync(join(dir, path), 'base\n');
+        writeFileSync(join(dir, '.gitattributes'), '* conflict-marker-size=99999999999\n');
+      },
+      theirs: ({ dir }) => writeFileSync(join(dir, path), 'theirs\n'),
+      ours: ({ dir }) => {
+        writeFileSync(join(dir, path), 'ours\n');
+        writeFileSync(join(dir, '.git/info/attributes'), '# preserve me\n');
+      },
+    }, {
+      agent: () => {},
+      onGit: (args, dir) => {
+        if (!args.includes('merge') || !args.includes('--no-commit')) return;
+        effective.push(execFileSync('git', ['check-attr', '-z', '--stdin', 'conflict-marker-size'], {
+          cwd: dir, input: path + '\0', encoding: 'utf8', stdio: 'pipe',
+        }).split('\0')[2]);
+        throw new Error('probe stopped merge before unsafe allocation');
+      },
+    }, async ({ out, m, dir, recordOutcome }) => {
+      expect(effective).toEqual([]);
+      expect(out.code).toBe(1);
+      expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ reason: expect.stringContaining('attribute line limit') }));
+      expect(m.spawn).not.toHaveBeenCalled();
+      expect(m.calls.some(c => c.includes('commit') || c.includes('push'))).toBe(false);
+      expect(readFileSync(join(dir, '.git/info/attributes'), 'utf8')).toBe('# preserve me\n');
+      expect(existsSync(join(dir, '.git/MERGE_HEAD'))).toBe(false);
+    });
+  });
+  it.each(['HEAD', 'origin/main'])('rejects undecodable tree path bytes from %s before attribute inspection or merge', async source => {
+    const m = mk(['aaa', 'aaa']);
+    const raw = Buffer.from([0x66, 0x80, 0x2e, 0x74, 0x78, 0x74, 0]);
+    const run = (cmd, args, opts) => {
+      if (cmd === 'git' && args.includes('ls-tree')) {
+        m.calls.push([cmd, ...args]);
+        // Mirror execFileSync's decoding: bytes are already lost with its default UTF-8 mode.
+        return args.at(-1) === source ? (opts?.encoding === null ? raw : raw.toString('utf8')) : '';
+      }
+      return m.run(cmd, args, opts);
+    };
+    const recordOutcome = vi.fn();
+    const out = await runFixCli([...argv, '--merge-onto=main'], { ...m.io, run, recordOutcome, fileExists: () => false });
+    expect(out.code).toBe(1);
+    expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ reason: expect.stringContaining('non-UTF-8 path bytes') }));
+    expect(m.calls.some(c => c.includes('check-attr') || c.includes('merge') || c.includes('commit') || c.includes('push'))).toBe(false);
+    expect(m.spawn).not.toHaveBeenCalled();
+  });
+  it.skipIf(process.platform !== 'linux')('rejects a real invalid UTF-8 filename before merge without changing its bytes', async () => {
+    const raw = Buffer.from([0x66, 0x80, 0x2e, 0x74, 0x78, 0x74]);
+    const full = dir => Buffer.concat([Buffer.from(dir + '/'), raw]);
+    await withRealMerge({
+      base: ({ dir }) => {
+        writeFileSync(full(dir), 'base\n');
+        writeFileSync(join(dir, '.gitattributes'), '* conflict-marker-size=99999999999\n');
+      },
+      theirs: ({ dir }) => writeFileSync(full(dir), 'theirs\n'),
+      ours: ({ dir }) => writeFileSync(full(dir), 'ours\n'),
+    }, { agent: () => {} }, async ({ out, m, dir, recordOutcome }) => {
+      expect(out.code).toBe(1);
+      expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ reason: expect.stringContaining('non-UTF-8 path bytes') }));
+      expect(m.calls.some(c => c.includes('check-attr') || c.includes('merge') || c.includes('commit') || c.includes('push'))).toBe(false);
+      expect(m.spawn).not.toHaveBeenCalled();
+      expect(readFileSync(full(dir), 'utf8')).toBe('ours\n');
+      expect(existsSync(join(dir, '.git/info/attributes'))).toBe(false);
+    });
+  });
+  it.each([
+    Array(5).fill('a'.repeat(100)).join('/'), // 504 bytes: encoded rule is 2046 bytes, just below the limit.
+    '\ufeffliteral-\ufffd-\u2028-invisible\u200b.txt',
+    '--quoted "`*?[x]\\\n\r.txt',
+  ])('bounds marker width for a representable literal path %j', async path => {
+    const effective = [];
+    await withRealMerge({
+      base: ({ dir }) => {
+        mkdirSync(dirname(join(dir, path)), { recursive: true });
+        writeFileSync(join(dir, path), 'base\n');
+        writeFileSync(join(dir, '.gitattributes'), '* conflict-marker-size=99999999999\n');
+      },
+      theirs: ({ dir }) => writeFileSync(join(dir, path), 'theirs\n'),
+      ours: ({ dir }) => writeFileSync(join(dir, path), 'ours\n'),
+    }, {
+      agent: ({ dir }) => writeFileSync(join(dir, path), 'resolved\n'),
+      onGit: (args, dir) => {
+        if (!args.includes('merge') || !args.includes('--no-commit')) return;
+        effective.push(execFileSync('git', ['check-attr', '-z', '--stdin', 'conflict-marker-size'], {
+          cwd: dir, input: path + '\0', encoding: 'utf8', stdio: 'pipe',
+        }).split('\0')[2]);
+        // Do not reach an unsafe allocation if the assertion fails on an older tree.
+        expect(effective.at(-1)).toBe('7');
+      },
+    }, async ({ out, m, dir }) => {
+      expect(effective).toEqual(['7']);
+      expect(out.code).toBe(0);
+      expect(m.spawn).toHaveBeenCalledTimes(1);
+      expect(readFileSync(join(dir, path), 'utf8')).toBe('resolved\n');
+      expect(existsSync(join(dir, '.git/info/attributes'))).toBe(false);
+    });
+  });
   it('inspects marker attributes through stdin when tracked path bytes exceed ARG_MAX, then merges normally', async () => {
     const argMax = Number(execFileSync('getconf', ['ARG_MAX'], { encoding: 'utf8', timeout: 5000 }));
     expect(Number.isSafeInteger(argMax) && argMax > 0).toBe(true);
