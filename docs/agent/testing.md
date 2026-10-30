@@ -3040,6 +3040,14 @@ Verification marker authorship stays in the Mac gate driver and requires a
 confirmed protected receipt. Run the scoped Forge tests through heavy-admission;
 never execute setup in a development lane.
 
+Warm manifest reuse requires conservative Git stat evidence: disabled `core.trustctime`,
+`core.checkStat=minimal`, or enabled `core.fsmonitor` (including a hook path) requires
+`full-scan`. Unreadable or incomplete config evidence also requires that fallback.
+Use `git ls-files -f -v -z` for index flags: fsmonitor-valid entries become lowercase
+only with `-f` and must be hashed. The fast-manifest tests pin restored-mtime edits
+and fsmonitor-valid entries; the offload tests require every final leaf to be read
+and hashed when reuse is unavailable.
+
 Git metadata setup runs entirely under an operator-owned 0700 temporary parent;
 publish `.git` only after the final privileged Git command. A root-owned `.git`
 under worker-owned `work` can still be renamed and replaced by that worker.

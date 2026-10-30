@@ -135,6 +135,74 @@ describe('fast Git manifest',()=>{
     const spy=readSpy();await compare({fs:spy.fs});
     expect(readNames(spy.readFile)).toContain('keep.txt');
   });
+  it('full-scans a same-size edit hidden by unsafe stat config and restored mtime',async()=>{
+    await git(['config','core.trustctime','false']);
+    await git(['config','core.checkStat','minimal']);
+    const path=join(cwd,'keep.txt');
+    // Whole seconds survive utimes exactly and predate the index's racy window.
+    await fs.utimes(path,1000000000,1000000000);
+    await git(['update-index','--refresh']);
+    const stat=await fs.stat(path);
+    await write('keep.txt','diff');await fs.utimes(path,stat.atime,stat.mtime);
+    expect(await git(['status','--porcelain=v1','-z'])).toHaveLength(0);
+    const spy=readSpy(),fast=await compare({fs:spy.fs});
+    expect(fast.manifestMode).toBe('full-scan');
+    expect(fast.manifestReason).toContain('unsafe stat config');
+    expect(fast.manifestDigest).not.toBe(base.manifestDigest);
+    expect(readNames(spy.readFile)).toEqual(['edit.txt','keep.txt','remove.txt']);
+  });
+  it.each([
+    ['core.trustctime','false'],['core.trustctime','0'],['core.checkStat','minimal'],
+    ['core.fsmonitor','true'],['core.fsmonitor','hooks/fsmonitor'],
+  ])('full-scans unsafe stat config %s=%s',async(key,value)=>{
+    await git(['config',key,value]);
+    const fast=await compare();
+    expect(fast.manifestMode).toBe('full-scan');
+    expect(fast.manifestReason).toContain('unsafe stat config');
+  });
+  it.each([
+    ['core.trustctime','yes'],['core.trustctime','1'],['core.checkStat','default'],
+    ['core.fsmonitor','false'],['core.fsmonitor','off'],['core.untrackedCache','true'],['core.splitIndex','true'],
+  ])('retains reuse with safe stat config %s=%s',async(key,value)=>{
+    await git(['config',key,value]);
+    expect((await compare()).manifestMode).toBe('git-delta');
+  });
+  it('hashes fsmonitor-valid leaves hidden from ls-files -v',async()=>{
+    const hook=join(cwd,'.git','fsmonitor-hook');
+    await fs.writeFile(hook,"#!/bin/sh\nprintf 'fixture-token\\0'\n",{mode:0o755});
+    const monitor=['-c',`core.fsmonitor=${hook}`];
+    await git([...monitor,'update-index','--fsmonitor']);
+    await write('keep.txt','diff');
+    await git([...monitor,'update-index','--fsmonitor-valid','keep.txt']);
+    expect((await git([...monitor,'ls-files','-v','--','keep.txt'])).toString()).toBe('H keep.txt\n');
+    expect((await git([...monitor,'ls-files','-f','-v','--','keep.txt'])).toString()).toBe('h keep.txt\n');
+    // Isolate the flag guard from the separately tested config fallback: keep
+    // real fsmonitor flags on index reads and inject its stale clean status.
+    const monitored=call=>{
+      if(call.args[0]==='status')return Promise.resolve({code:0,stdout:Buffer.alloc(0)});
+      if(call.args[0]==='ls-files'&&call.args.includes('-v'))return exec({...call,args:[...monitor,...call.args]});
+      return exec(call);
+    };
+    const spy=readSpy(),fast=await compare({fs:spy.fs,exec:monitored});
+    expect(fast.manifestMode).toBe('git-delta');
+    expect(fast.manifestDigest).not.toBe(base.manifestDigest);
+    expect(readNames(spy.readFile)).toContain('keep.txt');
+  });
+  it.each(['failed','oversized','truncated','invalid key','invalid boolean','missing boolean'])('full-scans when stat config evidence is %s',async fault=>{
+    const broken=async call=>{
+      if(call.args[0]==='config') {
+        if(fault==='failed')return {code:2,stdout:Buffer.alloc(0)};
+        if(fault==='oversized')return {code:0,stdout:Buffer.alloc(4*1024*1024+1)};
+        if(call.args.includes('--get-regexp'))return {code:0,stdout:Buffer.from(fault==='truncated'?'core.trustctime\ntrue':fault==='invalid key'?'core.unknown\ntrue\0':'core.trustctime\ntrue\0')};
+        return {code:fault==='missing boolean'?1:0,stdout:Buffer.from(fault==='missing boolean'?'':'unknown\n')};
+      }
+      return exec(call);
+    };
+    const spy=readSpy(),fast=await compare({exec:broken,fs:spy.fs});
+    expect(fast.manifestMode).toBe('full-scan');
+    expect(fast.manifestReason).toContain('config evidence');
+    expect(readNames(spy.readFile)).toEqual(['edit.txt','keep.txt','remove.txt']);
+  });
   it('hashes a same-size write racing after status evidence',async()=>{
     let raced=false;
     const racing=async call=>{

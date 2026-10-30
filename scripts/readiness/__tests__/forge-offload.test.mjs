@@ -126,6 +126,24 @@ describe('warm base selection and delta proof',()=>{
     expect(delta.manifestMode).toBe('git-delta');
     expect(read.mock.calls.map(([path])=>Buffer.from(path).subarray(Buffer.byteLength(repo)+1).toString()).sort()).toEqual(['a.test.mjs','oauth-source.mjs']);
   });
+  it('reads and hashes every final leaf when the fast path is unavailable',async()=>{
+    const base=await baseFixture();
+    await fs.writeFile(join(repo,'a.test.mjs'),'changed');await fs.rm(join(repo,'deleted.txt'));
+    await fs.writeFile(join(repo,'untracked.txt'),'new');
+    const read=vi.fn(path=>fs.readFile(path));
+    const unavailable=call=>call.args[0]==='diff'&&call.args.includes('--name-only')?Promise.resolve({code:1,stdout:Buffer.alloc(0)}):exec(call);
+    const delta=await remote.buildDeltaManifest({cwd:repo,exec:unavailable,base,fs:{...fs,readFile:read}});
+    const full=await remote.buildManifest({cwd:repo,exec});
+    expect(delta.manifestMode).toBe('full-scan');
+    expect(delta.manifestReason).toBeTruthy();
+    expect(delta.entries).toEqual(full.entries);
+    expect(delta.manifestDigest).toBe(full.manifestDigest);
+    const reads=new Map(read.mock.calls.map(([path],i)=>[Buffer.from(path).subarray(Buffer.byteLength(repo)+1).toString(),read.mock.results[i].value]));
+    for(const entry of delta.entries) {
+      expect(reads.has(entry.path.toString())).toBe(true);
+      expect(entry.sha256).toBe(hash(await reads.get(entry.path.toString())));
+    }
+  });
   it('includes autocrlf worktree bytes that git considers clean and matches full shipping',async()=>{
     await fs.writeFile(join(repo,'mode.txt'),'line\n');git(['add','.']);commit();
     const base=await baseFixture();git(['config','core.autocrlf','true']);

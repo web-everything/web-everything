@@ -311,6 +311,32 @@ export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,bas
   const baseEntries=new Map(snapshot.entries.map(entry=>[entry.path.toString('hex'),entry]));
   let blobs=new Map(),reuse,changed,manifestMode='full-scan',manifestReason;
   try {
+    // Git cleanliness is byte evidence only with conservative stat checks and
+    // no fsmonitor. Missing/invalid config evidence must also disable reuse.
+    manifestReason='unsafe stat config or unavailable config evidence';
+    const config=async args=>{
+      const result=await exec({file:'git',args:['config',...args],cwd});
+      if(![0,1].includes(result.code)||!Buffer.isBuffer(result.stdout)||result.stdout.length>LIMIT
+        ||(result.code===1?result.stdout.length:!result.stdout.length))throw new Error('Invalid Git stat config evidence');
+      return result.code===1?undefined:result.stdout;
+    };
+    const settings=new Map();
+    const records=(await config(['-z','--get-regexp','^core\\.(trustctime|checkstat|fsmonitor|untrackedcache|splitindex)$']))??Buffer.alloc(0);
+    if(records.length&&records.at(-1)!==0)throw new Error('Incomplete Git stat config');
+    for(const record of records.toString('utf8').split('\0').slice(0,-1)) {
+      const newline=record.indexOf('\n'),key=newline<0?record:record.slice(0,newline);
+      if(!/^core\.(trustctime|checkstat|fsmonitor|untrackedcache|splitindex)$/.test(key))throw new Error('Invalid Git stat config key');
+      settings.set(key,newline<0?'':record.slice(newline+1));
+    }
+    // Let Git normalize boolean spellings (including bare keys and numbers);
+    // core.trustctime defaults to true only when the key is absent.
+    const trustctime=await config(['--type=bool','--get','core.trustctime']);
+    if(trustctime!==undefined&&!['true\n','false\n'].includes(trustctime.toString()))throw new Error('Invalid Git trustctime');
+    if(settings.has('core.trustctime')!==(trustctime!==undefined))throw new Error('Incomplete Git trustctime');
+    if(trustctime?.toString()==='false\n'
+      ||(settings.has('core.checkstat')&&settings.get('core.checkstat').toLowerCase()!=='default')
+      ||(settings.has('core.fsmonitor')&&!/^(false|no|off|0)$/i.test(settings.get('core.fsmonitor'))))throw new Error('Unsafe Git stat config');
+    manifestReason=undefined;
     if(typeof base.sha!=='string'||!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(base.sha))throw new Error('invalid base sha');
     const tree=parseGitTree(await git(['ls-tree','-r','-l','-z',base.sha]),{sizes:true});
     blobs=new Map(tree.map(entry=>[entry.path.toString('hex'),entry]));
@@ -333,7 +359,7 @@ export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,bas
     for(let i=0;i<attributes.length;i+=3) {
       if(sensitive.has(attributes[i+1].toString('latin1'))&&!['unspecified','unset'].includes(attributes[i+2].toString('latin1')))changed.add(attributes[i].toString('hex'));
     }
-    for(const record of splitPaths(await git(['ls-files','-v','-z']))) {
+    for(const record of splitPaths(await git(['ls-files','-f','-v','-z']))) {
       if(record.length<3||record[1]!==32)throw new Error('Invalid Git index flags');
       if(record[0]===83 || (record[0]>=97 && record[0]<=122))changed.add(record.subarray(2).toString('hex'));
     }
@@ -360,7 +386,7 @@ export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,bas
       }
     } finally {await reader?.close();}
     manifestMode='git-delta';
-  } catch {manifestReason='base or git evidence unavailable';reuse=undefined;}
+  } catch {manifestReason ??='base or git evidence unavailable';reuse=undefined;}
   const manifest=await buildManifest({cwd,exec,fs,head,reuse});
   // Transfer decisions still compare the complete manifest, including fresh modes.
   const final=new Set(manifest.entries.map(e=>e.path.toString('hex')));
