@@ -197,7 +197,8 @@ export function isAlreadyQueuedError(text) {
  * YAML from the PR merge ref (`pull_request`) or the group commit (`merge_group`), so a PR can edit one to
  * `exit 0` (or add a new workflow with a job named like a required check) and turn the check green from inside its
  * own diff. No check a PR can edit can defend against that, so the defence sits where the PR cannot reach: the
- * drain, running from the daemon's own `main` checkout, refuses to enqueue such a PR at all. A human merges it.
+ * drain requires operator clearance before enqueueing such a PR (R212). Callers without a license proof retain
+ * the human-only hold.
  */
 export const GATE_PATH_PREFIXES = ['.github/workflows/', '.github/actions/'];
 
@@ -282,9 +283,11 @@ function readBaseTip({ base, cwd, exec }) {
  * retryable), the workflow-edit refusal reads the change list OF `headSha` (`readPinnedChangedFiles`), and the
  * mutation carries `expectedHeadOid: headSha`, so GitHub refuses the entry if the head moves after the read. The
  * refusal and the queue entry therefore always describe the same commit.
- * @param {{repo:string, num:number, headSha:string, cwd:string, exec?:Function}} o  `cwd`: a clone of `repo`.
+ * @param {{repo:string, num:number, headSha:string, cwd:string, exec?:Function, humanOnlyLicense?:Function}} o
+ *   `cwd`: a clone of `repo`. `humanOnlyLicense(hold)` may authorize a human-only hold with a proven tier;
+ *   absent, unreadable or unlicensed evidence retains the hold. Successful results carry `licensedBy`.
  */
-export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync, preparedSurface = null }) {
+export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync, preparedSurface = null, humanOnlyLicense }) {
   if (!/^[\w.-]+\/[\w.-]+$/.test(String(repo)) || !Number.isInteger(Number(num))) {
     return { ok: false, held: true, humanOnly: false, retryable: true, reason: 'unreadable', paths: [], error: 'changed files unreadable (repo or PR number is malformed)' };
   }
@@ -309,10 +312,17 @@ export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync, prepar
     && readBaseTip({ base: liveBase, cwd, exec }) === preparedSurface.baseSha;
   const read = reusable ? { files: preparedSurface.files } : readPinnedChangedFiles({ headSha, base: liveBase, cwd, exec });
   const hold = workflowEditHold({ files: read.files, expectedCount: read.files?.length });
-  if (hold.hold) return { ok: false, held: true, humanOnly: hold.humanOnly, retryable: hold.retryable === true, reason: hold.reason, paths: hold.paths, error: read.error ? `${hold.error}: ${read.error}` : hold.error };
+  let license;
+  if (hold.humanOnly && typeof humanOnlyLicense === 'function') {
+    try { license = humanOnlyLicense(hold); }
+    catch { license = { licensed: false, reason: 'human-only enqueue license unreadable' }; }
+  }
+  const licensed = license?.licensed === true && ['exact', 'numbering', 'mechanical'].includes(license.tier);
+  const licenseResult = licensed ? { licensedBy: license.tier } : {};
+  if (hold.hold && !licensed) return { ok: false, held: true, humanOnly: hold.humanOnly, retryable: hold.retryable === true, reason: hold.reason, paths: hold.paths, error: read.error ? `${hold.error}: ${read.error}` : hold.error, ...(license?.reason ? { licenseReason: license.reason } : {}) };
   const queueState = () => readMergeQueueState({ repo, pr: num, readJson: args => JSON.parse(exec('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}') });
   const existing = queueState();
-  if (existing.inQueue === true && existing.head === headSha) return { ok: true, already: true };
+  if (existing.inQueue === true && existing.head === headSha) return { ok: true, already: true, ...licenseResult };
   try {
     const out = JSON.parse(exec('gh', buildEnqueueArgs({ nodeId, headSha }), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}');
     const errs = out?.errors;
@@ -326,7 +336,7 @@ export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync, prepar
     if (!entry?.id) return { ok: false, error: 'no merge queue entry returned' };
     const queue = queueState();
     if (queue.inQueue !== true || queue.head !== headSha) return { ok: false, unconfirmed: true, error: `enqueue unconfirmed: ${queue.error || (queue.inQueue === false ? 'isInMergeQueue is false' : 'queue head does not match judged head')}` };
-    return { ok: true, entry };
+    return { ok: true, entry, ...licenseResult };
   } catch (e) {
     const t = String(e?.stderr || e?.message || e).trim();
     if (isRequiredWorkflowsUnsatisfiedError(String(e?.stderr || e?.message || e))) return { ok: false, reason: REQUIRED_WORKFLOWS_UNSATISFIED, error: t };
