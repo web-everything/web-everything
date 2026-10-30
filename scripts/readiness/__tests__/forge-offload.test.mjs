@@ -2,7 +2,7 @@
 import {describe,it,expect,beforeEach,afterEach,vi} from 'vitest';
 import * as fs from 'node:fs/promises';
 import {spawnSync} from 'node:child_process';
-import {join} from 'node:path';
+import {dirname,join} from 'node:path';
 import {createHash} from 'node:crypto';
 import * as remote from '../remote-exec.mjs';
 import {BASE_RETENTION,baseGuard,claimPrewarm,copyLeaves} from '../forge-exec-bases.mjs';
@@ -28,7 +28,7 @@ async function baseFixture() {
 }
 async function pruningFixture() {
   const target=join(root,'pruning');await fs.mkdir(target,{mode:0o700});
-  const shas=Array.from({length:6},(_,i)=>String(i).repeat(40));
+  const shas=Array.from({length:BASE_RETENTION+2},(_,i)=>i.toString(16).repeat(40));
   for(const [i,sha] of shas.entries()) {
     await fs.mkdir(join(target,sha));
     await fs.writeFile(join(target,sha,'READY'),JSON.stringify({sha,manifestDigest:hash('manifest'),lockDigest:hash('lock'),readyAtMs:i,fetchedAtMs:i}));
@@ -258,9 +258,14 @@ describe('warm base selection and delta proof',()=>{
 });
 
 describe('runner base materialization refuses before install',()=>{
-  async function setup(pool=false) {
+  async function setup(pool=false,shape) {
+    if(shape==='file to directory')await fs.writeFile(join(repo,'node'),'old leaf');
+    if(['directory to file','nested deletion'].includes(shape)) {
+      await fs.mkdir(join(repo,'node','nested'),{recursive:true});await fs.writeFile(join(repo,'node','nested','leaf'),'old leaf');
+    }
     const base=await baseFixture();const server=join(root,'server');const dir=join(server,'bases',base.sha);await fs.mkdir(join(dir,'tree'),{recursive:true});
-    for(const path of Buffer.from(base.manifest.paths,'base64').toString().split('\0').filter(Boolean)) await fs.copyFile(join(repo,path),join(dir,'tree',path));
+    const copy=async(source,dest)=>{await fs.mkdir(dirname(dest),{recursive:true});await fs.copyFile(source,dest);};
+    for(const path of Buffer.from(base.manifest.paths,'base64').toString().split('\0').filter(Boolean)) await copy(join(repo,path),join(dir,'tree',path));
     await fs.writeFile(join(dir,'manifest.json'),JSON.stringify(base.manifest));await fs.writeFile(join(dir,'READY'),JSON.stringify({sha:base.sha,manifestDigest:base.manifestDigest,lockDigest:hash('lock'),readyAtMs:1,fetchedAtMs:0}));
     const bin=join(server,'bin');await fs.mkdir(bin);await fs.symlink(process.execPath,join(bin,'node'));
     await fs.writeFile(join(bin,'npm'),`#!/bin/sh\necho ran >> '${server}/npm.log'\necho \"$*\" >> '${server}/npm-args.log'\nexit 0\n`,{mode:0o755});
@@ -269,13 +274,19 @@ describe('runner base materialization refuses before install',()=>{
     const nonce='e'.repeat(32),prepared=await runner.prepare({nonce});
     expect(prepared.capabilities).toMatchObject({delta:1,bases:[{sha:base.sha,manifestDigest:base.manifestDigest}]});
     await fs.writeFile(join(repo,'a.test.mjs'),'changed');await fs.rm(join(repo,'deleted.txt'));
+    if(shape)await fs.rm(join(repo,'node'),{recursive:true});
+    if(shape==='file to directory'){await fs.mkdir(join(repo,'node'));await fs.writeFile(join(repo,'node','leaf'),'new leaf');}
+    if(shape==='directory to file')await fs.writeFile(join(repo,'node'),'new leaf');
     const manifest=await remote.buildManifest({cwd:repo,exec});
     const work=join(server,'runs',...(pool?['slot-1']:[]),prepared.run,'work');await fs.copyFile(join(repo,'a.test.mjs'),join(work,'a.test.mjs'));
+    if(shape==='file to directory')await copy(join(repo,'node','leaf'),join(work,'node','leaf'));
+    if(shape==='directory to file')await copy(join(repo,'node'),join(work,'node'));
     // Real fully materialized local tree supplies the unchanged legacy input binding.
     const full=join(root,'full');await fs.mkdir(full);
-    for(const entry of manifest.entries)await fs.copyFile(join(repo,entry.path.toString()),join(full,entry.path.toString()));
+    for(const entry of manifest.entries)await copy(join(repo,entry.path.toString()),join(full,entry.path.toString()));
     const argv=['npm','run','test:unit','--','a.test.mjs'];
     const request={v:1,nonce,run:prepared.run,argv,env:{},argvDigest:digestArgv(argv),lock:hash('lock'),inputDigest:await digestInput(full),manifest:manifestWire(manifest),manifestDigest:manifest.manifestDigest,baseSha:base.sha,baseManifestDigest:base.manifestDigest,deletions:Buffer.from('deleted.txt\0').toString('base64')};
+    if(shape)request.deletions=Buffer.concat([Buffer.from('deleted.txt\0'),Buffer.from(shape==='file to directory'?'node\0':'node/nested/leaf\0')]).toString('base64');
     return {base,dir,server,runner,request,work};
   }
   it('uses independent copies, applies deletion and delta, and verifies before install',async()=>{
@@ -309,6 +320,20 @@ describe('runner base materialization refuses before install',()=>{
       expect(await claimPrewarm(join(f.server,'bases'),f.base.sha,'1',join(parent,'second'),f.base.manifest,f.base.manifestDigest,()=>{})).toBe(false);
     }
     expect((await f.runner.telemetry()).recent.find(r=>r.runId===f.request.run).prewarmed).toBe(kind==='valid');
+    await f.runner.finish(f.request);
+  });
+  it.each(['file to directory','directory to file','nested deletion'])('prewarm applies %s without stale parent directories',async shape=>{
+    const f=await setup(true,shape),tree=join(f.server,'bases','prewarm',f.base.sha,'1');
+    await fs.mkdir(tree,{recursive:true,mode:0o700});
+    const {decodeManifest}=await import('../forge-exec-manifest.mjs');
+    await copyLeaves(join(f.dir,'tree'),tree,decodeManifest(f.base.manifest).entries);
+    await fs.writeFile(tree+'.json',JSON.stringify({sha:f.base.sha,manifestDigest:f.base.manifestDigest}),{mode:0o600});
+    const inode=(await fs.stat(join(tree,'mode.txt'))).ino;
+    expect((await f.runner.run(f.request)).code).toBe(0);
+    expect((await fs.stat(join(f.work,'mode.txt'))).ino).toBe(inode);
+    if(shape==='nested deletion')await expect(fs.lstat(join(f.work,'node'))).rejects.toMatchObject({code:'ENOENT'});
+    else expect(await fs.readFile(join(f.work,'node',...(shape==='file to directory'?['leaf']:[])),'utf8')).toBe('new leaf');
+    expect((await f.runner.telemetry()).recent.find(r=>r.runId===f.request.run).prewarmed).toBe(true);
     await f.runner.finish(f.request);
   });
   it.each(['base mutated','delta tamper','symlink delta','deletion traversal','unknown base','digest mismatch','unready base','malformed READY'])('rejects %s with protected non-start evidence and no npm',async fault=>{
