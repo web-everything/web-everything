@@ -706,6 +706,22 @@ export async function smokeAndAdopt({
 
   // ── (a) plain main: drop every NON-pinned overlay and try again ──────────────────────────────────────
   const rawByRef = new Map((overlaysBefore || []).map((o) => [o?.ref, o]));
+  const replanWithRegistrationIds = async (retained) => {
+    const ids = new Map(retained.map((ap) => [ap.ref, ap.registrationId]));
+    const replanned = await planRebuild({
+      entries: runtimeEntries, env, closureScopeMode,
+      git, headSha: prevHead, mainRef: 'origin/main',
+      overlays: retained.map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr })),
+      edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
+    });
+    // The planner produces content rows. Bind fallback evidence to the original candidate's
+    // captured registrations before smoke, ready persistence, or adoption; never read new ids here.
+    // Missing ids stay unbound, and finalizeRebuild still strips ids replaced during smoke.
+    if (replanned.applied) replanned.applied = replanned.applied.map((ap) => ({
+      ...ap, registrationId: ids.get(ap.ref),
+    }));
+    return replanned;
+  };
   const withPin = plan.applied.map((ap) => ({
     ...ap, pinned: pinnedStatus(git, rawByRef.get(ap.ref) ?? {}, plan.mainSha, ap.sha).pinned,
   }));
@@ -743,12 +759,7 @@ export async function smokeAndAdopt({
     if (culprits.length > 0 && unknown.length === 0 && culprits.length < suspects.length) {
       const culpritRefs = new Set(culprits.map((ap) => ap.ref));
       const kept = plan.applied.filter((ap) => !culpritRefs.has(ap.ref));
-      const planA2 = await planRebuild({
-        entries: runtimeEntries, env, closureScopeMode,
-        git, headSha: prevHead, mainRef: 'origin/main',
-        overlays: kept.map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr })),
-        edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
-      });
+      const planA2 = await replanWithRegistrationIds(kept);
       const failedNames = failedA.map((r) => r.name).join(',');
       let failed = planA2.reason ?? 'not planned';
       // x9diisp — setting the culprits aside must never also lose an overlay the running build carries (e.g. one a
@@ -786,12 +797,7 @@ export async function smokeAndAdopt({
   }
 
   if (!mainOnly && suspects.length > 0) {
-    const pinnedOverlays = withPin.filter((ap) => ap.pinned).map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr }));
-    const planB = await planRebuild({
-      entries: runtimeEntries, env, closureScopeMode,
-      git, headSha: prevHead, mainRef: 'origin/main', overlays: pinnedOverlays,
-      edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
-    });
+    const planB = await replanWithRegistrationIds(withPin.filter((ap) => ap.pinned));
     // x9diisp/overlay-pin — like planA2, plain main must never lose an overlay the running build carries (e.g. a
     // pinned head that only merged thanks to a suspect it now leaves out): refused as unplannable instead.
     const bLost = planB.ok && planB.establishedLost?.length > 0;
