@@ -27,10 +27,12 @@ export const CHECK_STATE_TABLE = Object.freeze({
 });
 
 const normalize = (value) => typeof value === 'string' ? value.toLowerCase() : '';
+// #7501 I1: check identity is exact; only status/conclusion are case-folded.
+const checkName = (check) => check.name || check.context;
 const ownValue = (table, key) => Object.hasOwn(table, key) ? table[key] : 'red';
 
 /**
- * Classify REST or GraphQL status and conclusion values case-insensitively.
+ * Classify REST or GraphQL check evidence, case-insensitively.
  * @param {object} check Check row; required defaults to true.
  * @returns {'green'|'red'|'pending'|'ignore'} Admission state.
  * @example classifyCheck({ status: 'COMPLETED', conclusion: 'SUCCESS' }); // green
@@ -45,7 +47,7 @@ export function classifyCheck(check = {}) {
 }
 
 // Only canonical non-negative integers rank; missing/garbage evidence is zero.
-// Keep string IDs exact above Number.MAX_SAFE_INTEGER.
+// Keep string IDs exact above Number.MAX_SAFE_INTEGER; never consult dates.
 const numeric = (value) => {
   if (typeof value !== 'number' && typeof value !== 'string') return 0n;
   const integer = String(value);
@@ -53,54 +55,31 @@ const numeric = (value) => {
 };
 
 /**
- * Select the greatest (effective time, check-run id) tuple per exact name.
- * Effective time is completed_at/completedAt, else started_at/startedAt, else
- * created_at/createdAt. Invalid timestamps and pre-2000/epoch
- * timestamps count as absent, falling through to the next valid timestamp.
- * Unfinished rows with no valid timestamps rank newest (+Infinity), conservatively
- * keeping undated attempts pending. Undated red evidence also ranks newest,
- * so incomplete failure evidence cannot establish green admission. Other missing
- * or invalid timestamps rank lowest. Workflow run identities and attempt counters never rank checks;
- * numeric check-run ids break time ties.
+ * Select the greatest (run_attempt, id) exact integer pair per exact name || context.
  * Exact ties retain the first row. Inputs are never mutated.
  * @param {object[]} checks Check attempts.
  * @returns {object[]} Original winning rows, in first-seen name order.
  * @example latestAttempts([{ name: 'ci', id: 1 }, { name: 'ci', id: 2 }]);
  */
 export function latestAttempts(checks = []) {
-  const groups = new Map();
+  const latest = new Map();
   for (const check of checks) {
-    const name = check.name;
-    if (!groups.has(name)) groups.set(name, []);
-    groups.get(name).push(check);
+    const name = checkName(check);
+    const previous = latest.get(name);
+    const attempt = numeric(check.run_attempt);
+    const previousAttempt = numeric(previous?.run_attempt);
+    if (!previous || attempt > previousAttempt
+      || (attempt === previousAttempt && numeric(check.id) > numeric(previous.id))) {
+      latest.set(name, check);
+    }
   }
-  return [...groups.values()].map(group => {
-    const effectiveTime = check => {
-      for (const field of ['completed_at', 'completedAt', 'started_at', 'startedAt', 'created_at', 'createdAt']) {
-        const timestamp = check[field];
-        if (timestamp == null) continue;
-        const time = Date.parse(timestamp);
-        if (!Number.isFinite(time)) continue;
-        if (timestamp === 0 || timestamp === '0' || time < Date.UTC(2000, 0, 1)) continue;
-        return time;
-      }
-      // Requiredness is applied by summarize AFTER selection; a row flag must
-      // never hide undated red evidence for a name in an explicit required roster.
-      const undatedRed = classifyCheck({ ...check, required: true }) === 'red';
-      return undatedRed || ownValue(CHECK_STATE_TABLE, normalize(check.status)) === 'pending' ? Infinity : -Infinity;
-    };
-    return group.reduce((previous, check) => {
-      const time = effectiveTime(check), previousTime = effectiveTime(previous);
-      if (time !== previousTime) return time > previousTime ? check : previous;
-      return numeric(check.id) > numeric(previous.id) ? check : previous;
-    });
-  });
+  return [...latest.values()];
 }
 
 /**
  * Summarize latest required attempts; absent roster entries remain pending.
  * An explicit roster determines requiredness; otherwise row flags apply.
- * Names match the required roster and hold gates exactly, as in the drain.
+ * Names match exactly and retain their original case, whitespace, and Unicode.
  * @param {object[]} checks Check attempts.
  * @param {object} options Optional requiredNames and holdGateNames arrays.
  * @returns {{redSet: Set<string>, pendingSet: Set<string>, gateOnlyRed: boolean,
@@ -118,7 +97,7 @@ export function summarize(checks = [], {
   const redSet = new Set();
   const pendingSet = new Set();
   for (const check of latest) {
-    const name = check.name;
+    const name = checkName(check);
     observed.add(name);
     const state = classifyCheck(required === null
       ? check : { ...check, required: required.has(name) });

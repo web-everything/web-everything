@@ -114,6 +114,27 @@ describe('classifyCheck exhaustive independent outcome grid', () => {
     }
   });
 
+  it.each([null, 0, '', 'false', '0', 1, NaN, {}, [], new Boolean(false)])(
+    'only literal false makes a check optional; required=%j stays required', (required) => {
+      for (const [evidence, expected] of [
+        [{ status: 'completed', conclusion: 'failure' }, 'red'],
+        [{ status: 'queued' }, 'pending'],
+        [{ status: 'completed', conclusion: 'unknown' }, 'red'],
+        [{}, 'red'],
+        [{ status: 'completed', conclusion: 'success' }, 'green'],
+      ]) {
+        expect(classifyCheck({ ...evidence, required })).toBe(expected);
+        expect(classifyCheck({ ...evidence, required: false }))
+          .toBe(expected === 'green' ? 'green' : 'ignore');
+        expect(summarize([{ name: 'ci', ...evidence, required }])).toEqual({
+          redSet: new Set(expected === 'red' ? ['ci'] : []),
+          pendingSet: new Set(expected === 'pending' ? ['ci'] : []),
+          gateOnlyRed: false, allRequiredGreen: expected === 'green',
+        });
+      }
+    },
+  );
+
   it.each(conclusions.filter((conclusion) => conclusion !== null))(
     'treats missing status with conclusion=%s as completed',
     (conclusion) => {
@@ -126,77 +147,13 @@ describe('classifyCheck exhaustive independent outcome grid', () => {
 });
 
 describe('latestAttempts', () => {
-  it.each([undefined, null, '', 'invalid', 0, '0', '1970-01-01T00:00:00Z', '0001-01-01T00:00:00Z', '1999-12-31T23:59:59Z'])(
-    'fails closed across dated/undated outcome pairs (timestamp=%j)', timestamp => {
-      for (const datedConclusion of ['SUCCESS', 'FAILURE', 'STARTUP_FAILURE']) {
-        for (const undatedConclusion of ['SUCCESS', 'FAILURE', 'STARTUP_FAILURE']) {
-          const dated = settled('test', datedConclusion, { id: 999, completedAt: '2026-10-28T01:00:00Z' });
-          const undated = settled('test', undatedConclusion, { id: 1, completedAt: timestamp });
-          const expected = undatedConclusion === 'SUCCESS' ? dated : undated;
-          for (const rows of [[dated, undated], [undated, dated]]) {
-            expect(latestAttempts(rows)).toEqual([expected]);
-            const result = summarize(rows, { requiredNames: ['test'] });
-            expect(result.redSet).toEqual(new Set(expected.conclusion === 'SUCCESS' ? [] : ['test']));
-            expect(result.allRequiredGreen).toBe(expected.conclusion === 'SUCCESS');
-          }
-        }
-      }
-    },
-  );
-
-  it.each(['completed_at', 'completedAt', 'started_at', 'startedAt', 'created_at', 'createdAt'])(
-    'uses a valid %s to let a dated newer success clear an older failure', field => {
-      const failure = settled('test', 'FAILURE', {
-        completed_at: 'invalid', completedAt: '0001-01-01T00:00:00Z',
-        started_at: 0, startedAt: '', created_at: null, createdAt: undefined,
-        [field]: '2026-10-28T01:00:00Z',
-      });
-      const success = settled('test', 'SUCCESS', { completedAt: '2026-10-28T02:00:00Z' });
-      for (const rows of [[failure, success], [success, failure]]) {
-        expect(latestAttempts(rows)).toEqual([success]);
-        expect(summarize(rows, { requiredNames: ['test'] }).allRequiredGreen).toBe(true);
-      }
-    },
-  );
-
-  it.each(['FAILURE', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE', 'unknown', null])(
-    'undated %s stays red even with required=false when the roster requires it', conclusion => {
-      const undated = settled('test', conclusion, { required: false });
-      const success = settled('test', 'SUCCESS', { completedAt: '2026-10-28T01:00:00Z' });
-      for (const rows of [[undated, success], [success, undated]]) {
-        expect(summarize(rows, { requiredNames: ['test'] }).redSet).toEqual(new Set(['test']));
-        expect(summarize(rows).allRequiredGreen).toBe(true);
-      }
-    },
-  );
-
-  it.each(['queued', 'in_progress', 'waiting', 'requested', 'pending'])(
-    'undated %s remains pending ahead of dated success', status => {
-      const pending = { name: 'test', status };
-      const success = settled('test', 'SUCCESS', { completedAt: '2026-10-28T01:00:00Z' });
-      for (const rows of [[pending, success], [success, pending]]) {
-        expect(summarize(rows, { requiredNames: ['test'] }).pendingSet).toEqual(new Set(['test']));
-      }
-    },
-  );
-
-  it.each(['CANCELLED', 'STALE', 'SUCCESS'])(
-    'undated completed %s cannot displace dated failure', conclusion => {
-      const undated = settled('test', conclusion);
-      const failure = settled('test', 'FAILURE', { completedAt: '2026-10-28T01:00:00Z' });
-      for (const rows of [[undated, failure], [failure, undated]]) {
-        expect(latestAttempts(rows)).toEqual([failure]);
-      }
-    },
-  );
-
   it('does not mutate deeply frozen input and returns original rows in first-seen name order', () => {
     const older = Object.freeze(settled('test', 'failure', {
-      run_attempt: 1, id: 1, completedAt: '2026-10-28T01:00:00Z',
+      run_attempt: 1, id: 1,
       output: Object.freeze({ annotations: Object.freeze([Object.freeze({ message: 'failed' })]) }),
     }));
     const build = Object.freeze(settled('build', 'success', { run_attempt: 1, id: 2 }));
-    const newer = Object.freeze(settled('test', 'success', { run_attempt: 2, id: 3, completedAt: '2026-10-28T02:00:00Z' }));
+    const newer = Object.freeze(settled('test', 'success', { run_attempt: 2, id: 3 }));
     const smoke = Object.freeze(settled('smoke', 'success', { run_attempt: 1, id: 4 }));
     const input = Object.freeze([older, build, newer, smoke]);
     const snapshot = structuredClone(input);
@@ -211,59 +168,79 @@ describe('latestAttempts', () => {
   });
 
   it('returns the original winning row objects without cloning or normalizing them', () => {
-    const older = settled('Test', 'failure', { run_attempt: 1, id: 1 });
+    const older = settled('TEST', 'failure', { run_attempt: 1, id: 1 });
     const winner = settled('TEST', 'success', { run_attempt: 2, id: 2 });
     const build = settled('Build', 'success', { id: 3 });
 
     const result = latestAttempts([older, winner, build]);
 
-    expect(result).toHaveLength(3);
-    expect(result[0]).toBe(older);
-    expect(result[1]).toBe(winner);
-    expect(result[2]).toBe(build);
+    expect(result).toHaveLength(2);
+    expect(result[0]).toBe(winner);
+    expect(result[1]).toBe(build);
     expect(winner.name).toBe('TEST');
     expect(build.name).toBe('Build');
   });
 
   it('preserves first-seen name order when later attempts replace multiple winners', () => {
-    const zed = settled('zed', 'success', { completedAt: '2026-10-28T02:00:00Z' });
-    const alpha = settled('alpha', 'success', { completedAt: '2026-10-28T02:00:00Z' });
+    const zed = settled('zed', 'success', { run_attempt: 2 });
+    const alpha = settled('alpha', 'success', { run_attempt: 2 });
     const middle = settled('middle', 'success', { run_attempt: 1 });
 
     expect(latestAttempts([
-      settled('zed', 'failure', { completedAt: '2026-10-28T01:00:00Z' }),
-      settled('alpha', 'failure', { completedAt: '2026-10-28T01:00:00Z' }),
+      settled('zed', 'failure', { run_attempt: 1 }),
+      settled('alpha', 'failure', { run_attempt: 1 }),
       middle, alpha, zed,
     ])).toEqual([zed, alpha, middle]);
   });
 
-  it('keeps Test and test distinct in either order, including exact ranking ties', () => {
+  it('keeps Test and test as distinct checks in either order, including exact ranking ties (#7501 B8)', () => {
     const older = settled('Test', 'success', { run_attempt: 1, id: 1 });
     const newer = settled('test', 'failure', { run_attempt: 2, id: 2 });
     for (const rows of [[older, newer], [newer, older]]) {
       const result = latestAttempts(rows);
       expect(result).toHaveLength(2);
-      expect(result).toEqual(rows);
+      expect(result[0]).toBe(rows[0]);
+      expect(result[1]).toBe(rows[1]);
     }
     const tied = { ...newer, name: 'Test' };
     for (const rows of [[newer, tied], [tied, newer]]) {
       const result = latestAttempts(rows);
       expect(result).toHaveLength(2);
-      expect(result).toEqual(rows);
+      expect(result[0]).toBe(rows[0]);
+      expect(result[1]).toBe(rows[1]);
     }
   });
 
-  it('ignores large run_attempt counters when completion times identify the latest check', () => {
-    const older = settled('ci', 'success', { run_attempt: '9007199254740993', id: 999, completedAt: '2026-10-28T01:00:00Z' });
-    const newer = settled('ci', 'failure', { run_attempt: '9007199254740992', id: 1, completedAt: '2026-10-28T02:00:00Z' });
+  it('uses name || context without trimming or Unicode folding (#7501 I1)', () => {
+    const names = ['test', 'TEST', 'test\u200b', ' test', 'test ', 'ｔｅｓｔ', 'é', 'e\u0301'];
+    const rows = names.map((name, id) => settled(name, id === 0 ? 'success' : 'failure', { id }));
+    for (const input of [rows, [...rows].reverse()]) {
+      expect(latestAttempts(input)).toEqual(input);
+      expect(summarize(input, { requiredNames: ['test'] })).toEqual({
+        redSet: new Set(), pendingSet: new Set(),
+        gateOnlyRed: false, allRequiredGreen: true,
+      });
+    }
+    const fallback = { name: '', context: 'test', status: 'completed', conclusion: 'failure', id: 20 };
+    expect(latestAttempts([rows[0], fallback])).toEqual([fallback]);
+    expect(summarize([rows[0], fallback], { requiredNames: ['test'] }).redSet).toEqual(new Set(['test']));
+    const contextOnly = { context: 'test', status: 'queued', id: 21 };
+    expect(latestAttempts([fallback, contextOnly])).toEqual([contextOnly]);
+    expect(summarize([contextOnly], { requiredNames: ['test'] }).pendingSet).toEqual(new Set(['test']));
+    expect(latestAttempts([rows[0], { ...fallback, name: 'other' }])).toHaveLength(2);
+  });
+
+  it('compares large run_attempt integers exactly before considering id in either order', () => {
+    const older = settled('ci', 'success', { run_attempt: '9007199254740992', id: 999 });
+    const newer = settled('ci', 'failure', { run_attempt: '9007199254740993', id: 1 });
     for (const runs of [[older, newer], [newer, older]]) {
       expect(latestAttempts(runs)).toEqual([newer]);
     }
   });
 
   it('compares canonical string and number ranks equally and retains the first exact tie', () => {
-    const first = settled('ci', 'failure', { completedAt: '2026-10-28T01:00:00Z', id: 9007199254740992 });
-    const second = settled('ci', 'success', { completedAt: '2026-10-28T01:00:00Z', id: '9007199254740992' });
+    const first = settled('ci', 'failure', { run_attempt: 2, id: 9007199254740992 });
+    const second = settled('ci', 'success', { run_attempt: '2', id: '9007199254740992' });
     expect(latestAttempts([first, second])).toEqual([first]);
     expect(latestAttempts([second, first])).toEqual([second]);
   });
@@ -272,22 +249,21 @@ describe('latestAttempts', () => {
     undefined, null, '', 'garbage', '01', ' 2', '2 ', '2\n', '+2', '-2',
     '2.5', '2.0', '2e3', '0x10', 'Infinity', 'NaN', -2, 2.5, Infinity, NaN,
     true, {}, [],
-  ])('treats noncanonical or missing id %j as zero and ignores run_attempt', (value) => {
+  ])('treats noncanonical or missing ranking evidence %j as zero for both fields', (value) => {
     for (const field of ['run_attempt', 'id']) {
-      const invalid = settled('ci', 'success', { completedAt: '2026-10-28T01:00:00Z', [field]: value });
-      const zero = settled('ci', 'failure', { completedAt: '2026-10-28T01:00:00Z', [field]: '0' });
+      const invalid = settled('ci', 'success', { [field]: value });
+      const zero = settled('ci', 'failure', { [field]: '0' });
       expect(latestAttempts([zero, invalid])).toEqual([zero]);
       expect(latestAttempts([invalid, zero])).toEqual([invalid]);
     }
   });
 
-  it('selects the greatest numeric id on equal timestamps, ignoring run_attempt, in either order', () => {
-    const time = { completedAt: '2026-10-28T01:00:00Z' };
-    const winner = settled('ci', 'failure', { ...time, run_attempt: '2', id: '1000' });
+  it('selects the greatest numeric run_attempt, then numeric id, per name in either input order', () => {
+    const winner = settled('ci', 'failure', { run_attempt: '10', id: '10' });
     const smoke = settled('smoke', 'success', { run_attempt: 1, id: 1 });
     const runs = [
-      settled('ci', 'success', { ...time, run_attempt: '10', id: '999' }),
-      settled('ci', 'success', { ...time, run_attempt: '10', id: '2' }),
+      settled('ci', 'success', { run_attempt: '2', id: '999' }),
+      settled('ci', 'success', { run_attempt: '10', id: '2' }),
       winner, smoke,
     ];
     for (const input of [runs, [...runs].reverse()]) {
@@ -297,21 +273,21 @@ describe('latestAttempts', () => {
     }
   });
 
-  it('counts missing id as zero and never ranks run_attempt', () => {
+  it('counts missing run_attempt and id as zero', () => {
     const missing = settled('ci', 'success');
-    const byId = settled('ci', 'neutral', { id: 1 });
+    const byId = settled('ci', 'failure', { id: 1 });
     const byAttempt = settled('ci', 'neutral', { run_attempt: 1 });
     for (const pair of [[missing, byId], [byId, missing]]) {
       expect(latestAttempts(pair)).toEqual([byId]);
     }
     for (const pair of [[byId, byAttempt], [byAttempt, byId]]) {
-      expect(latestAttempts(pair)).toEqual([byId]);
+      expect(latestAttempts(pair)).toEqual([byAttempt]);
     }
     expect(latestAttempts([missing])).toEqual([missing]);
     expect(latestAttempts([])).toEqual([]);
   });
 
-  it('ranks completedAt before check id and ignores attempt counters', () => {
+  it('never uses startedAt or completedAt to break the numeric ranking', () => {
     const older = settled('ci', 'success', {
       run_attempt: 1, id: 2,
       startedAt: '2026-10-28T12:00:00Z', completedAt: '2026-10-28T13:00:00Z',
@@ -320,13 +296,13 @@ describe('latestAttempts', () => {
       run_attempt: 1, id: 10,
       startedAt: '2026-10-27T12:00:00Z', completedAt: '2026-10-27T13:00:00Z',
     });
-    expect(latestAttempts([older, newer])).toEqual([older]);
-    expect(latestAttempts([newer, older])).toEqual([older]);
+    expect(latestAttempts([older, newer])).toEqual([newer]);
+    expect(latestAttempts([newer, older])).toEqual([newer]);
   });
 });
 
 describe('named check-state regressions', () => {
-  it('keeps check names, required rosters and hold gates case-sensitive', () => {
+  it('keeps exact check identities through required and hold-gate matching (#7501 B8)', () => {
     const older = settled('Test', 'success', { run_attempt: 1, id: 1 });
     const newer = settled('test', 'failure', { run_attempt: 2, id: 2, required: false });
     for (const runs of [[older, newer], [newer, older]]) {
@@ -346,8 +322,8 @@ describe('named check-state regressions', () => {
   });
 
   it('large adjacent ids cannot hide a newer failure in either row order', () => {
-    const older = settled('ci', 'success', { completedAt: '2026-10-28T01:00:00Z', id: '9007199254740992' });
-    const newer = settled('ci', 'failure', { completedAt: '2026-10-28T01:00:00Z', id: '9007199254740993' });
+    const older = settled('ci', 'success', { run_attempt: 1, id: '9007199254740992' });
+    const newer = settled('ci', 'failure', { run_attempt: 1, id: '9007199254740993' });
     for (const runs of [[older, newer], [newer, older]]) {
       const result = summarize(runs, { requiredNames: ['ci'] });
       expect(result.redSet).toEqual(new Set(['ci']));
@@ -366,11 +342,11 @@ describe('named check-state regressions', () => {
   it('mixed timestamp ranking cannot hide a newer FAILURE', () => {
     const older = settled('ci', 'SUCCESS', {
       run_attempt: 1, id: 999,
-      startedAt: '2026-10-27T12:00:00Z', completedAt: '2026-10-27T13:00:00Z',
+      startedAt: '2026-10-28T12:00:00Z', completedAt: '2026-10-28T13:00:00Z',
     });
     const newer = settled('ci', 'FAILURE', {
       run_attempt: 2, id: 1,
-      startedAt: '2026-10-28T12:00:00Z', completedAt: '2026-10-28T13:00:00Z',
+      startedAt: '2026-10-27T12:00:00Z', completedAt: '2026-10-27T13:00:00Z',
     });
     for (const runs of [[older, newer], [newer, older]]) {
       expect(latestAttempts(runs)).toEqual([newer]);
@@ -401,53 +377,34 @@ describe('named check-state regressions', () => {
 });
 
 describe('summarize required checks', () => {
-  it('explicit roster overrides row.required in both directions', () => {
-    expect(summarize([
-      settled('test', 'FAILURE', { required: false }),
-      settled('optional', 'FAILURE', { required: true }),
-    ], { requiredNames: ['test'] })).toEqual({
-      redSet: new Set(['test']), pendingSet: new Set(),
-      gateOnlyRed: false, allRequiredGreen: false,
-    });
-    expect(summarize([settled('optional', 'FAILURE', { required: true })], { requiredNames: [] })
-      .allRequiredGreen).toBe(true);
-  });
-
-  it('omitted roster honors row.required=false', () => {
-    for (const conclusion of ['FAILURE', 'CANCELLED', 'STALE']) {
-      expect(summarize([settled('optional', conclusion, { required: false })])).toEqual({
-        redSet: new Set(), pendingSet: new Set(), gateOnlyRed: false, allRequiredGreen: true,
-      });
-    }
-    expect(summarize([settled('test', 'FAILURE', { required: true })]).redSet).toEqual(new Set(['test']));
-  });
-
-  it('matches requiredNames exactly and keeps differently cased names missing', () => {
+  it('matches requiredNames exactly without inventing missing required checks', () => {
     expect(summarize([
       settled('TeSt', 'success', { required: false }),
       settled('SMOKE', 'failure'),
-    ], { requiredNames: ['TEST', 'test'] })).toEqual({
-      redSet: new Set(), pendingSet: new Set(['TEST', 'test']),
+    ], { requiredNames: ['TeSt', 'TeSt'] })).toEqual({
+      redSet: new Set(), pendingSet: new Set(),
+      gateOnlyRed: false, allRequiredGreen: true,
+    });
+    expect(summarize([settled('TEST', 'success')], { requiredNames: ['test'] })).toEqual({
+      redSet: new Set(), pendingSet: new Set(['test']),
       gateOnlyRed: false, allRequiredGreen: false,
     });
   });
 
-  it('matches holdGateNames exactly and preserves blocker case', () => {
+  it('matches holdGateNames exactly and preserves blocker names', () => {
     expect(summarize([
       settled('ReViEw-GaTe', 'failure'),
       settled('MERGE-GATE', 'failure'),
       { name: 'BuIlD', status: 'queued' },
     ], {
-      requiredNames: ['ReViEw-GaTe', 'MERGE-GATE', 'BuIlD', 'Absent', 'ABSENT'],
+      requiredNames: ['ReViEw-GaTe', 'MERGE-GATE', 'BuIlD', 'Absent', 'Absent'],
       holdGateNames: ['ReViEw-GaTe', 'MERGE-GATE'],
     })).toEqual({
       redSet: new Set(['ReViEw-GaTe', 'MERGE-GATE']),
-      pendingSet: new Set(['BuIlD', 'Absent', 'ABSENT']),
+      pendingSet: new Set(['BuIlD', 'Absent']),
       gateOnlyRed: true, allRequiredGreen: false,
     });
-    expect(summarize([settled('ReViEw-GaTe', 'failure')], {
-      holdGateNames: ['review-gate'],
-    }).gateOnlyRed).toBe(false);
+    expect(summarize([settled('MERGE-GATE', 'failure')]).gateOnlyRed).toBe(false);
   });
 
   it('marks an explicitly required name with no row as pending', () => {
@@ -487,8 +444,8 @@ describe('summarize required checks', () => {
 
   it('uses the latest green attempt to clear an older failure', () => {
     expect(summarize([
-      settled('ci', 'failure', { completedAt: '2026-10-28T01:00:00Z' }),
-      settled('ci', 'success', { completedAt: '2026-10-28T02:00:00Z' }),
+      settled('ci', 'failure', { run_attempt: 1 }),
+      settled('ci', 'success', { run_attempt: 2 }),
     ], { requiredNames: ['ci'] })).toEqual({
       redSet: new Set(), pendingSet: new Set(),
       gateOnlyRed: false, allRequiredGreen: true,
