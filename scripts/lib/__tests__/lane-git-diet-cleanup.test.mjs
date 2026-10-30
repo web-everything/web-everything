@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync, renameSync, symlinkSync, utimesSync, cpSync, realpathSync, chmodSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync, renameSync, symlinkSync, utimesSync, cpSync, realpathSync, chmodSync, readdirSync, readlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join, relative } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -273,11 +273,11 @@ describe('real git: cleanup CLI', () => {
   }, 60_000);
   afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-  it.each(['shallow', 'index', 'gc.log', 'FETCH_HEAD', 'ORIG_HEAD', 'custom/nested/file', 'custom/dangling'])('reports and refuses a symlink at .git/%s', (path) => {
+  it.each(['shallow', 'index', 'gc.log', 'FETCH_HEAD', 'ORIG_HEAD', 'FOO_HEAD', 'custom/nested/file', 'custom/dangling'])('reports and refuses a symlink at .git/%s', (path) => {
     const dir = lane(13);
     git(root, 'clone', '-q', up, dir);
     const victim = join(root, 'outside-git-file');
-    const contents = `${git(dir, 'rev-parse', 'HEAD')}\n`;
+    const contents = path === 'FOO_HEAD' ? 'ref: refs/remotes/origin/ops/review-requests\n' : `${git(dir, 'rev-parse', 'HEAD')}\n`;
     writeFileSync(victim, contents);
     const link = join(dir, '.git', path);
     rmSync(link, { force: true });
@@ -421,7 +421,20 @@ describe('real git: cleanup CLI', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 60_000);
 
-  const snapshot = (dir) => ({ config: readFileSync(join(dir, '.git', 'config'), 'utf8'), refs: refs(dir), objects: git(dir, 'count-objects', '-v') });
+  // Snapshot bytes without invoking Git: an unsupported repository extension must still prove zero mutations.
+  const snapshot = (dir) => {
+    const files = {};
+    const visit = (path) => {
+      for (const entry of readdirSync(join(dir, '.git', path), { withFileTypes: true })) {
+        const rel = join(path, entry.name), file = join(dir, '.git', rel);
+        if (entry.isSymbolicLink()) files[rel] = { link: readlinkSync(file) };
+        else if (entry.isDirectory()) { files[rel] = { directory: true }; visit(rel); }
+        else files[rel] = readFileSync(file);
+      }
+    };
+    visit('');
+    return files;
+  };
   const hasOpsRef = (dir) => existsSync(join(dir, '.git', 'refs', 'remotes', 'origin', 'ops', 'review-requests'))
     || readFileSync(join(dir, '.git', 'packed-refs'), 'utf8').includes('refs/remotes/origin/ops/review-requests');
   const hook = (dir, ran) => git(dir, 'config', 'gc.recentObjectsHook', `touch '${ran}'`);
@@ -721,6 +734,24 @@ describe('real git: cleanup CLI', () => {
   const OPS = 'refs/remotes/origin/ops/review-requests';
   const HOP = 'refs/remotes/origin/ops/a';
   const HOP2 = 'refs/remotes/origin/ops/b';
+  it.each([
+    ['U+00A0', '\u00a0'],
+    ['U+2028', '\u2028'],
+    ['U+FEFF', '\ufeff'],
+  ])('FOO_HEAD pins an ops target ending in %s through cleanup --apply', (_name, suffix) => {
+    const dir = lane(25);
+    git(root, 'clone', '-q', up, dir);
+    const target = `refs/remotes/origin/ops/keep${suffix}`;
+    const tip = git(dir, 'rev-parse', OPS);
+    try {
+      git(dir, 'update-ref', target, tip);
+      git(dir, 'symbolic-ref', 'FOO_HEAD', target);
+      const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--prune-expire=now', '--apply', '--lanes=25', '--json'], { env, encoding: 'utf8' }));
+      expect(out.rows[0]).toMatchObject({ mode: 'apply', opsRefsDeleted: 1, opsRefsKept: [target] });
+      expect(git(dir, 'rev-parse', '--verify', target)).toBe(tip);
+      expect(git(dir, 'rev-parse', '--verify', 'FOO_HEAD')).toBe(tip);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
   // %(symref) resolves a whole chain to its last ref, so a middle hop (ops/b here) is only seen hop by hop.
   const chain3 = (dir, from) => {
     git(dir, 'symbolic-ref', HOP2, OPS);
@@ -737,7 +768,27 @@ describe('real git: cleanup CLI', () => {
       return [wt, 'HEAD', [OPS]];
     }],
     ['another symbolic ref', (dir) => { git(dir, 'symbolic-ref', 'refs/heads/alias', OPS); return [dir, 'refs/heads/alias', [OPS]]; }],
+    ['another symbolic ref through a Unicode-whitespace-suffixed intermediate hop', (dir) => {
+      const hop = `${HOP}\u00a0`;
+      git(dir, 'symbolic-ref', hop, OPS);
+      git(dir, 'symbolic-ref', 'refs/heads/alias', hop);
+      return [dir, 'refs/heads/alias', [hop, OPS]];
+    }],
     ['a root ref', (dir) => { git(dir, 'symbolic-ref', 'FOO_HEAD', OPS); return [dir, 'FOO_HEAD', [OPS]]; }],
+    ...[
+      ['a tab-separated root ref', '\t'],
+      ['a root ref with mixed separator whitespace', ' \t '],
+      ['a root ref without separator whitespace', ''],
+    ].map(([name, separator]) => [name, (dir) => {
+      writeFileSync(join(dir, '.git', 'FOO_HEAD'), `ref:${separator}${OPS}\n`);
+      return [dir, 'FOO_HEAD', [OPS]];
+    }]),
+    ['a tab-separated linked worktree root ref', (dir) => {
+      const wt = join(root, 'symref-worktree');
+      git(dir, 'worktree', 'add', '-q', '--detach', wt);
+      writeFileSync(join(git(wt, 'rev-parse', '--absolute-git-dir'), 'FOO_HEAD'), `ref:\t${OPS}\n`);
+      return [wt, 'FOO_HEAD', [OPS]];
+    }],
     ['HEAD through a chain of ops refs', (dir) => {
       git(dir, 'symbolic-ref', HOP, OPS);
       git(dir, 'symbolic-ref', 'HEAD', HOP);
@@ -751,6 +802,7 @@ describe('real git: cleanup CLI', () => {
     const tip = git(dir, 'rev-parse', OPS);
     try {
       const [cwd, symref, kept] = plant(dir);
+      expect(git(cwd, 'rev-parse', '--verify', symref)).toBe(tip);
       const out = JSON.parse(execFileSync('node', [CLI, `--pool-root=${poolRoot}`, `--scan-root=${root}`, '--prune-expire=now', '--apply', '--lanes=25', '--json'], { env, encoding: 'utf8' }));
       expect(out.rows[0]).toMatchObject({ mode: 'apply', opsRefsDeleted: 0, opsRefsKept: kept });
       expect(git(cwd, 'rev-parse', '--verify', symref)).toBe(tip);

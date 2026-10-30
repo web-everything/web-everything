@@ -333,6 +333,40 @@ it('scheduled gc is host single-flight and skips before the next due pass', asyn
   expect(scheduledLaneGc(['/pool/lane-1'], opts).ran).toBe(false);
 });
 
+it('scheduled gc falls back only for an unsupported --no-detach, retaining foreground and no-prune guarantees', async () => {
+  const { scheduledLaneGc } = await import('../lib/host-load.mjs');
+  const exec = vi.fn().mockImplementationOnce(() => { throw Object.assign(new Error('unsupported'), { status: 129, stderr: "error: unknown option `no-detach'\n" }); });
+  const opts = { stateRoot: temp(), exec, admission: () => ({ admitted: true }), log: () => {}, schedule: 60000, nowMs: 100000 };
+  expect(scheduledLaneGc(['/pool/lane-1'], opts)).toEqual({ ran: true });
+  expect(exec.mock.calls.map(([, args]) => args)).toEqual([
+    ['-c', 'gc.auto=0', '-c', 'gc.autoDetach=false', '-c', 'gc.pruneExpire=never', 'gc', '--no-detach'],
+    ['-c', 'gc.auto=0', '-c', 'gc.autoDetach=false', '-c', 'gc.pruneExpire=never', 'gc'],
+  ]);
+  expect(exec.mock.calls.every(([, , options]) => options.cwd === '/pool/lane-1' && options.timeout === 120000)).toBe(true);
+  expect(scheduledLaneGc(['/pool/lane-1'], opts).ran).toBe(false);
+  expect(exec).toHaveBeenCalledTimes(2);
+});
+
+it.each([
+  { status: 129, stderr: 'fatal: bad object' },
+  { status: 1, stderr: "error: unknown option `no-detach'\n" },
+  { status: 1 },
+  { code: 'ETIMEDOUT', stderr: "error: unknown option `no-detach'\n" },
+])('scheduled gc does not retry an unrelated failure: %j', async (failure) => {
+  const { scheduledLaneGc } = await import('../lib/host-load.mjs');
+  const exec = vi.fn(() => { throw Object.assign(new Error('gc failed'), failure); });
+  const log = vi.fn();
+  const opts = { stateRoot: temp(), exec, admission: () => ({ admitted: true }), log, schedule: 60000, nowMs: 100000 };
+  expect(scheduledLaneGc(['/pool/lane-1'], opts)).toEqual({ ran: false, reason: '1 lane gc run(s) failed' });
+  expect(exec).toHaveBeenCalledTimes(1);
+  expect(exec.mock.calls[0][1]).toContain('--no-detach');
+  expect(log.mock.calls.flat().join(' ')).toContain('/pool/lane-1');
+  // Failed work remains due; a later scheduled pass may try once again.
+  exec.mockClear();
+  scheduledLaneGc(['/pool/lane-1'], opts);
+  expect(exec).toHaveBeenCalledTimes(1);
+});
+
 it('a failing gc lane does not starve later lanes or advance its successful-run cursor', async () => {
   const { scheduledLaneGc } = await import('../lib/host-load.mjs');
   const stateRoot = temp();
