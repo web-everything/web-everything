@@ -112,6 +112,9 @@ we:skills-src/conveyor/verify-daemon.mjs, and no active card scopes it. The buil
    we:skills-src/conveyor/verify-daemon.mjs, `main()` (line 589) acquires its lease at line 592 unconditionally.
    Add an exported pure `pluginStep({ enabled, holdsLease, inFlight })` → `'idle' | 'acquire' | 'run' | 'drain' |
    'release'`, and wire `main()` through it:
+   - **Seams:** `main()` becomes a thin wrapper over an exported `runLoop(deps)`; `deps` injects the tick, clock,
+     resolver, lease acquire/release, dispatch, state-record writer, heartbeat and logger. Each tick the loop calls
+     the resolver with `last` set to the previous resolved `enabled` (none on the first call), then `pluginStep`.
    - **Boot while off:** log `plugin verify disabled (<source>)`, hold NO lease, dispatch nothing, re-resolve every
      `recheckMs`. The process stays up, so launchd `KeepAlive` does not crash-loop it.
    - **Off → on:** acquire the lease on the next recheck and enter the normal loop, no process restart.
@@ -156,6 +159,9 @@ Musts:
 - `we:scripts/lib/daemon-plugins.mjs`: the `verify` descriptor, `resolvePluginEnabled` (per-plugin
   `cascadePolicy`), the override file reader, and the `set` CLI.
 - `we:scripts/settings/daemon-plugins.json` with `daemonPlugins.verify.enabled` and `daemonPlugins.recheckMs`.
+- An exported `runLoop(deps)` in `we:skills-src/conveyor/verify-daemon.mjs` that `main()` delegates to, with the tick, clock, resolver,
+  lease, dispatch, state-record writer, heartbeat and logger injected (so the lifecycle wiring is testable), passing
+  `last` (the prior resolved `enabled`) on every resolver call after boot.
 - `pluginStep` + its wiring in `we:skills-src/conveyor/verify-daemon.mjs` `main()`: idle-when-off boot, off→on acquire, on→off via the
   drain path then release, and the state record.
 - The named refusal in `we:scripts/verify-lane.mjs request`, read from the state record.
@@ -174,7 +180,8 @@ we:scripts/lib/__tests__/daemon-plugins.test.mjs (RED for all: module does not e
   `recheckMs` still resolves from the tool layer. Capability — Red today.
 - **`plugin resolve: override beats tool, process env beats override`.** Capability — Red today.
 - **`plugin resolve: invalid never wins`** — tool `"enabled": "nope"` → stays `true`, `invalid` names the leaf. Capability — Red today.
-- **`plugin resolve: invalid keeps a previously disabled state`** — the fail-closed half of the case above: with
+- **`plugin resolve: invalid keeps a previously disabled state`** (the `"false"` string row below is the tool layer;
+  env values `0|1|on|off` are parsed to a boolean before the `valid` check, a settings leaf must already be a boolean) — the fail-closed half of the case above: with
   `last: false` (the daemon is running disabled), each invalid input leaves `enabled: false`, never flips it on, and
   `invalid` names the leaf. One row per layer, so no layer can reset a disabled plugin: tool `"enabled": "nope"`,
   tool `"enabled": null`, env `WE_DAEMON_PLUGIN_VERIFY=maybe`, and an override entry `{ enabled: "yes" }`. A row
@@ -196,19 +203,26 @@ off path at all):
 - **`plugin drain: plugin-off stops new dispatch like the drain marker`** — the dispatch fake is never called while
   `inFlight > 0` and the plugin is off. Capability — Red today.
 - **`plugin lifecycle: main() wiring`** — the pure `pluginStep` tests above do not prove `main()` calls it, so this
-  drives the real `main()` loop (tick interval and clock injected, resolver, lease acquire/release, dispatch,
-  state-record writer and logger all fakes) through one scripted sequence and asserts the calls in order:
-  1. resolver returns off at boot → logs `plugin verify disabled (override)`, lease acquire fake **never called**,
-     dispatch fake never called, state record `{ enabled: false, phase: 'idle' }`, `main()` still running (does not
-     exit, so launchd `KeepAlive` has nothing to restart);
+  drives the real loop through the injected seams (`main()` delegates to an exported `runLoop(deps)`; `deps` carries
+  the tick, clock, `resolvePluginEnabled`, lease acquire/release, dispatch, state-record writer, heartbeat and logger,
+  all fakes in the test) through one scripted sequence and asserts the calls in order:
+  1. resolver returns off at boot → the first resolver call carries **no `last`**; logs `plugin verify disabled (override)`,
+     lease acquire fake **never called**, dispatch fake never called, state record `{ enabled: false, phase: 'idle' }`,
+     loop still running (does not exit, so launchd `KeepAlive` has nothing to restart);
   2. resolver flips on → lease acquired exactly once, dispatch is called, state record `{ enabled: true, phase: 'run' }`;
   3. resolver flips off with `inFlight = 2` → dispatch not called again, lease **not** released, state record
      `phase: 'drain'` (`enabled: false`), heartbeat still written;
   4. `inFlight` reaches 0 → `releaseRunnerLeaseIfOwned` called once with this daemon's owner, state record
      `phase: 'idle'`, loop keeps ticking;
-  5. resolver throws (read error) while running on → state and lease unchanged, error logged;
-  6. a clock advance past one hour while off → the `plugin verify disabled for <N>h` reminder is logged once, not per tick.
-  Capability — Red today: `main()` has no off path and never calls `pluginStep`.
+  5. a clock advance past one hour while off → the `plugin verify disabled for <N>h` reminder is logged once, not per tick;
+  6. resolver flips on again → lease acquired a second time (after the release in step 4), dispatch resumes, state
+     record `phase: 'run'`;
+  7. resolver returns a read error (`{ enabled: <last>, errors: ['read failed …'] }`, which is what
+     `resolvePluginEnabled` does on a read error — it does not throw) while running on → state record and lease
+     unchanged, no dispatch pause, error logged; the same read error while off → stays idle and keeps the lease released;
+  8. across steps 2–7 every resolver call carries `last` equal to the previous resolved `enabled`, so the fail-closed
+     rule (invalid or unreadable keeps the last known value) holds end to end in the loop, not only in the resolver.
+  Capability — Red today: no off path, no `runLoop`, and nothing consults `pluginStep`.
 
 we:scripts/__tests__/verify-lane.test.mjs:
 - **`request refusal names a disabled plugin`** — a fixture state record with `enabled: false` → exit 3 and the
@@ -217,6 +231,12 @@ we:scripts/__tests__/verify-lane.test.mjs:
   live lease → still refused at once. RED: today a live lease always accepts (:572-575). Capability — Red today.
 - **`request refusal names a disabled plugin while idle`** — record `{ phase: 'idle', pid: <live pid> }` and no
   lease → named refusal, not the generic text. Capability — Red today.
+- **`request ignores a stale or unreadable plugin record`** — the fallbacks Edge 4 and 6 promise, so a stale
+  `enabled: false` record can never block a live, re-enabled daemon. Rows: (a) record `{ enabled: false, phase: 'idle',
+  pid: <dead pid> }` and a live lease → treated as stale, request accepted via the lease check; (b) record
+  `{ enabled: false, phase: 'drain', pid: <pid not matching the live lease owner> }` → stale, accepted via the lease
+  check; (c) unparseable record file and no lease → exit 3 with the generic "no daemon alive" text, not a named
+  refusal and not a fake green; (d) unreadable record with a live lease → accepted. Capability — Red today.
 
 we:scripts/lib/__tests__/daemon-clone-registry-fix-clone.test.mjs:
 - **seed includes `wev-control`.** Capability — Red today: absent at :63.
@@ -265,14 +285,14 @@ shows `in flight 0`, and the orchestrator is told the window (≤ 2 × `recheckM
 
 - [A1] **Executable** — `npx vitest run we:scripts/lib/__tests__/daemon-plugins.test.mjs` fails before (module
   missing) and passes after.
-- [A2] **Executable** — `npx vitest run we:skills-src/conveyor/__tests__/verify-daemon.test.mjs -t "plugin step"`
-  runs the three named `plugin step:` tests (fails before: `pluginStep` not exported) and passes after; the
-  `plugin drain:` and `plugin lifecycle: main() wiring` tests likewise (the latter fails before because `main()`
+- [A2] **Executable** — `npx vitest run we:skills-src/conveyor/__tests__/verify-daemon.test.mjs -t "plugin (step|drain|lifecycle)"`
+  runs the three named `plugin step:` tests (fails before: `pluginStep` not exported), the `plugin drain:` test and
+  the `plugin lifecycle: main() wiring` test, and all pass after (the lifecycle test fails before because the loop
   never consults `pluginStep`).
 - [A1b] **Executable** — `npx vitest run we:scripts/lib/__tests__/daemon-plugins.test.mjs -t "invalid keeps a previously disabled state"`
   fails before (module missing) and passes after.
-- [A3] **Executable** — `npx vitest run we:scripts/__tests__/verify-lane.test.mjs -t "disabled plugin"` runs the three
-  `request refusal names a disabled plugin` tests; fails before and passes after.
+- [A3] **Executable** — `npx vitest run we:scripts/__tests__/verify-lane.test.mjs -t "plugin"` runs the three
+  `request refusal names a disabled plugin` tests and `request ignores a stale or unreadable plugin record`; fails before and passes after.
 - [A4] **Executable** — the extended seed test in we:scripts/lib/__tests__/daemon-clone-registry-fix-clone.test.mjs
   fails before (`wev-control` absent) and passes after.
 - [A5] **Observable** — the Proof plan's steps 3–4 recorded on the PR: disabled log line, lease gone, named
