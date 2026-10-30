@@ -77,6 +77,18 @@ it.each([
   expect(p.decisions).toContainEqual(expect.objectContaining({ action: 'drop', reason: 'conflict' }));
 });
 
+it('indirect function constructor retains the unmentioned runtime-module conflict and manual-rebase fallback', async () => {
+  const f = fixture({ entry: "(()=>{}).constructor('return import(process.argv[2])')();" });
+  expect(closureScope.finalClosureScope({ git: f.git, sha: f.main, entries: ['entry.mjs'], env: {} }))
+    .toMatchObject({ ok: false, reason: 'closure-incomplete' });
+  const plan = await planRebuild(f.args);
+  expect(plan.applied).toEqual([]);
+  expect(plan.decisions).toContainEqual(expect.objectContaining({ action: 'drop', reason: 'conflict' }));
+  expect(plan.alerts.some(alert => alert.kind === 'overlay-conflict-resolved')).toBe(false);
+  expect(plan.finalSha).toBe(f.main);
+  expect(f.ok(['show', `${plan.finalSha}:unused.mjs`])).toBe('// main');
+});
+
 it('mechanism-path conflict refuses', async () => {
   const f = fixture({ path: 'scripts/lib/daemon-rebuild/change.mjs' });
   const p = await planRebuild(f.args);

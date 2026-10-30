@@ -27,7 +27,9 @@ const capabilityModule = spec => CAPABILITY_MODULES.has(spec.replace(/^node:/, '
 // A loader capability's reach is opaque as soon as it is referenced, before aliases,
 // destructuring or inherited process settings can hide the eventual execution edge.
 // Strict scoping refuses the whole closure; the legacy walks remain independent.
-const OPAQUE_LOADER_NAMES = new Set(['module', 'createRequire', 'eval', 'Function', 'mainModule',
+// `.constructor` can recover Function (including async/generator variants) without
+// mentioning Function itself. Treat references as opaque before aliases can escape.
+const OPAQUE_LOADER_NAMES = new Set(['module', 'createRequire', 'eval', 'Function', 'constructor', 'mainModule',
   '_load', '_resolveFilename', 'getBuiltinModule', 'binding', '_linkedBinding', 'dlopen',
   'loadEnvFile', 'execArgv', 'NODE_OPTIONS']);
 const opaqueLoaderReference = node => (ts.isIdentifier(node) && OPAQUE_LOADER_NAMES.has(node.text))

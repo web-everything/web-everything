@@ -144,6 +144,20 @@ it.each([
 });
 
 it.each([
+  "(()=>{}).constructor('return import(process.argv[2])')();",
+  "(()=>{})['constructor']('return import(process.argv[2])')();",
+  "const {constructor: compile} = ()=>{}; compile('return import(process.argv[2])')();",
+  "(async()=>{}).constructor('return import(process.argv[2])')();",
+  "(function*(){}).constructor('return import(process.argv[2])')().next();",
+])('indirect function constructors make strict closure incomplete and refuse scope admission: %s', source => {
+  const files = { 'entry.mjs': source, 'tests/unmentioned.mjs': '' };
+  expect(collectImportClosure({ ...reader(files), entries: ['entry.mjs'], strict: true }).complete).toBe(false);
+  const result = compute(files);
+  expect(result).toMatchObject({ ok: false, reason: 'closure-incomplete' });
+  expect(isExcludable('tests/unmentioned.mjs', result.scope)).toBe(false);
+});
+
+it.each([
   './%70ayload.mjs', './%70%61yload.mjs', './caf%C3%A9.mjs', './%2570ayload.mjs',
   './%2e%2e/outside.mjs', './%2Foutside.mjs', './%5Coutside.mjs',
   './payload%23part.mjs', './payload%3Fpart.mjs', './%ZZ.mjs', './%E0%A4.mjs',
