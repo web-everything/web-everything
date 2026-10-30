@@ -202,6 +202,23 @@ off path at all):
 - **`plugin step: on to off drains while in flight, releases at zero`.** Capability — Red today.
 - **`plugin drain: plugin-off stops new dispatch like the drain marker`** — the dispatch fake is never called while
   `inFlight > 0` and the plugin is off. Capability — Red today.
+- **`plugin drain: running gates are never terminated`** — required integration test: start a controlled detached
+  job-mode gate against a temporary job store, then disable verify through the production loop. Use the real
+  in-flight registry and job lifecycle (do not supply `inFlight` counts). Assert the gate remains alive with the
+  same job ID and PID, no gate kill/stop/signal path is called, new dispatch stops, and heartbeats continue while
+  draining. Hold the gate open across multiple ticks: the lease must stay owned until the gate completes normally
+  and the registry reaches zero; only then may the loop release it and become idle. Re-enable verify and assert
+  the completed job is not dispatched again. Capability — Red today: no plugin-off drain integration exists.
+- **`plugin restart: adopts persisted gates before drain decisions`** — required integration test: persist a
+  controlled detached gate as running, disable verify mid-flight, then restart only the daemon loop while the
+  gate remains alive and the setting remains off. The successor boots idle with no lease and no dispatch;
+  assert no gate kill/stop/signal path is called and the same gate survives both the disable and restart.
+  Re-enable while it is still running: the next lease holder must use the production job-store registry rebuild,
+  not a fake `inFlight` count, and retain the original job ID and PID before any dispatch or drain-empty decision.
+  Disable again with the gate held open and assert the rebuilt registry keeps the daemon draining and its lease
+  owned until normal gate completion. Assert no duplicate dispatch across the restart or lease handoff, and
+  exactly one completion before release to idle. The test must fail if registry adoption is skipped or moved
+  after dispatch/drain decisions. Capability — Red today: no plugin-aware restart/adoption integration exists.
 - **`plugin lifecycle: main() wiring`** — the pure `pluginStep` tests above do not prove `main()` calls it, so this
   drives the real loop through the injected seams (`main()` delegates to an exported `runLoop(deps)`; `deps` carries
   the tick, clock, `resolvePluginEnabled`, lease acquire/release, dispatch, state-record writer, heartbeat and logger,
