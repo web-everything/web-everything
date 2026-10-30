@@ -146,6 +146,8 @@ WRAPPER
 # Ops owns the public bare repository. No remote configuration or credentials
 # are copied from the Mac; each tick supplies the public HTTPS URL explicitly.
 sudo -n -u ops env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/nonexistent GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 git -c credential.helper= init --bare /srv/forge-base/repo.git
+# git init under ops' umask 002 makes group-writable dirs; bases refuse those.
+chmod -R go-w /srv/forge-base
 cat > /etc/systemd/system/forge-warm-base.service <<'SERVICE'
 [Unit]
 Description=Prepare anonymous public Web Everything bases

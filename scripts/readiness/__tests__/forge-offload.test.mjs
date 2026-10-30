@@ -47,12 +47,33 @@ describe('warm base selection and delta proof',()=>{
     expect(delta.manifestDigest).toBe(full.manifestDigest);
     expect(manifestWire(delta)).toEqual(manifestWire(full));
   });
-  it('selects newest available ancestor, skips missing local and nonancestor bases, otherwise uses full',async()=>{
+  it('prefers the newest local ancestor over a newer nonancestor base',async()=>{
     const base=await baseFixture();
-    const bases=[{...base,sha:'a'.repeat(40)},base];
-    expect(await remote.selectBase({cwd:repo,exec,bases})).toEqual(base);
+    await fs.writeFile(join(repo,'mode.txt'),'next');git(['add','.']);commit();
+    const newerAncestor=await baseFixture();
     git(['checkout','--orphan','other']);await fs.writeFile(join(repo,'other.txt'),'other');git(['add','.']);commit();
-    expect(await remote.selectBase({cwd:repo,exec,bases})).toBeNull();
+    const nonancestor=await baseFixture();
+    git(['checkout','--detach',newerAncestor.sha]);
+    expect(await remote.selectBase({cwd:repo,exec,bases:[{...base,sha:'a'.repeat(40)},nonancestor,newerAncestor,base]})).toEqual(newerAncestor);
+  });
+  it('uses the newest locally available nonancestor: integrity comes from the byte manifest, not ancestry',async()=>{
+    const older=await baseFixture();
+    await fs.writeFile(join(repo,'mode.txt'),'new base');git(['add','.']);commit();
+    const base=await baseFixture();
+    git(['checkout','--orphan','other']);await fs.writeFile(join(repo,'other.txt'),'other');git(['add','.']);commit();
+    await fs.writeFile(join(repo,'mode.txt'),'different bytes');await fs.rm(join(repo,'deleted.txt'));await fs.chmod(join(repo,'a.test.mjs'),0o755);
+    const selected=await remote.selectBase({cwd:repo,exec,bases:[{...base,sha:'a'.repeat(40)},base,older]});
+    expect(selected).toEqual(base);
+    const delta=await remote.buildDeltaManifest({cwd:repo,exec,base:selected});
+    const full=await remote.buildManifest({cwd:repo,exec});
+    expect(manifestWire(delta)).toEqual(manifestWire(full));
+    expect(delta.manifestDigest).toBe(full.manifestDigest);
+    expect(delta.deltaPaths.map(p=>p.toString())).toEqual(['a.test.mjs','mode.txt','other.txt']);
+    expect(delta.deletions.map(p=>p.toString())).toEqual(['deleted.txt']);
+  });
+  it('uses full shipping when no ready base exists locally',async()=>{
+    const base=await baseFixture();
+    expect(await remote.selectBase({cwd:repo,exec,bases:[{...base,sha:'a'.repeat(40)}]})).toBeNull();
     expect(await remote.selectBase({cwd:repo,exec,bases:[]})).toBeNull();
   });
   it.each([1,2,3])('delta overlay equals a full manifest with additions, deletions, modes and public credentials (case %s)',async seed=>{
@@ -282,6 +303,25 @@ describe('runner base materialization refuses before install',()=>{
 
 // The warm tick's process boundary is injected: no network or registry access.
 describe('warm-base tick',()=>{
+  it('imports safely without changing the worker umask',async()=>{
+    const mask=vi.spyOn(process,'umask').mockImplementation(()=>{throw Object.assign(new Error('unsupported in worker'),{code:'ERR_WORKER_UNSUPPORTED_OPERATION'});});
+    try {
+      await expect(import('../forge-warm-base.mjs')).resolves.toHaveProperty('warmTick');
+      expect(mask).not.toHaveBeenCalled();
+    } finally {mask.mockRestore();}
+  });
+  it.each(['supported','unsupported','missing'])('sets the Forge CLI umask when %s without breaking unsupported runtimes',async kind=>{
+    const path=new URL('../forge-warm-base.mjs',import.meta.url).pathname;
+    const script=`
+      process.argv=[process.execPath,${JSON.stringify(path)},'unexpected'];
+      process.umask=${kind==='missing'?'undefined':`mask=>{process.stdout.write('mask='+mask);${kind==='unsupported'?"throw new Error('unsupported');":''}}`};
+      await import(${JSON.stringify(path)});
+    `;
+    const child=spawnSync(process.execPath,['--input-type=module','-e',script],{encoding:'utf8',timeout:10000,maxBuffer:4*1024*1024});
+    expect(child.status).toBe(1);
+    expect(child.stdout).toBe(kind==='missing'?'':'mask=18');
+    expect(child.stderr).toBe('forge-warm-base: No arguments accepted\n');
+  });
   async function tickFixture() {
     const warm=await import('../forge-warm-base.mjs');const base=await baseFixture();let now=1000;
     const target=join(root,'bases');await fs.mkdir(target);

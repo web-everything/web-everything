@@ -146,6 +146,9 @@ export async function warmTick({root='/srv/forge-base',exec=run,clock=Date.now,f
   return publish(sha);
 }
 if(process.argv[1]&&await filesystem.realpath(process.argv[1]).catch(()=> '')===await filesystem.realpath(fileURLToPath(import.meta.url))) {
+  // Bases refuse group/other-writable directories. Imports must not change the
+  // host process mask, and worker runtimes may expose an unsupported umask.
+  try {if(typeof process.umask==='function')process.umask(0o022);} catch { /* unsupported runtime */ }
   try{if(process.argv.length!==2)throw new Error('No arguments accepted');await warmTick();}
   catch(error){process.stderr.write('forge-warm-base: '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n');process.exitCode=1;}
 }

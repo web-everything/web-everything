@@ -266,16 +266,19 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   return {...manifest,manifestDigest:digestManifest(wire)};
 }
 
-// An advertised base is only a candidate: local object and ancestry evidence
-// are both mandatory. Any incomplete Git protocol returns to full shipping.
+// Forge advertises ready bases newest-first. Prefer an ancestor, then the
+// newest local commit: integrity comes from the byte-level base manifest and
+// verified worktree bytes, not Git ancestry. No local base means full shipping.
 export async function selectBase({cwd,exec=defaultExec,bases}={}) {
   if(!Array.isArray(bases)||bases.length>4)return null;
+  let newestLocal=null;
   for(const base of bases) {
     if(!base || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(base.sha)||!/^[a-f0-9]{64}$/.test(base.manifestDigest))return null;
     if((await exec({file:'git',args:['cat-file','-e',base.sha+'^{commit}'],cwd})).code!==0)continue;
+    newestLocal ??= base;
     if((await exec({file:'git',args:['merge-base','--is-ancestor',base.sha,'HEAD'],cwd})).code===0)return base;
   }
-  return null;
+  return newestLocal;
 }
 function changedPaths(bytes) {
   const fields=splitPaths(bytes),paths=[];
@@ -423,7 +426,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
         const caps=JSON.parse(protocolText(discovery.stdout,4096));
         if(caps.delta!==1)throw new Error('Delta unavailable');
         const base=await selectBase({cwd,exec,bases:caps.bases});
-        if(!base)throw new Error('No ancestor');
+        if(!base)throw new Error('No local ready base');
         const response=await ssh('base-manifest',{sha:base.sha});
         if(response.code!==0)throw new Error('Base manifest unavailable');
         const wire=JSON.parse(protocolText(response.stdout,LIMIT));
