@@ -432,19 +432,69 @@ it('rejects a real external card symlink and leaves the target unchanged', () =>
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-it.each([false, true])('permits confined convenience links and refuses escaping links (external=%s)', external => {
+it.each([false, true])('permits confined convenience links and refuses escaping links before numbering (external=%s)', external => {
   const root = mkdtempSync(join(tmpdir(), 'queue-directory-link-'));
+  try {
+    const temporary = join(root, 'temporary');
+    const tree = join(temporary, 'tree');
+    mkdirSync(join(tree, 'backlog'), { recursive: true }); mkdirSync(join(tree, '.claude'));
+    mkdirSync(join(tree, 'skills-src')); mkdirSync(join(root, 'outside'));
+    const text = '---\nstatus: open\n---\n';
+    writeFileSync(join(tree, 'backlog/xabc123-card.md'), text);
+    writeFileSync(join(root, 'outside/sentinel.md'), text);
+    symlinkSync(external ? join(root, 'outside') : '../skills-src', join(tree, '.claude/skills'));
+    const number = vi.fn(() => {
+      realFs.renameSync(join(tree, 'backlog/xabc123-card.md'), join(tree, 'backlog/041-card.md'));
+      return { assigned: [{ hash: 'xabc123', nnn: '041' }], committed: true };
+    });
+    const lock = vi.fn(fn => ({ ran: true, result: fn() }));
+    const exec = vi.fn((_cmd, args) => {
+      if (args[0] === 'ls-remote') return 'head\trefs/heads/lane/example';
+      if (args[0] === 'ls-files') {
+        const card = existsSync(join(tree, 'backlog/xabc123-card.md')) ? 'backlog/xabc123-card.md' : 'backlog/041-card.md';
+        return args.length === 1 ? `${card}\n.claude/skills` : card;
+      }
+      if (args[0] === 'ls-tree') return 'backlog/040-main.md';
+      if (args[0] === 'rev-parse') return 'numbered-head';
+      return '';
+    });
+    const statePath = join(root, 'reservations.json');
+    const out = prepareBranchBeforeEnqueue({ c: { headRef: 'lane/example', num: 1 }, traceHeadSha: 'head', exec,
+      fs: { ...realFs, mkdtempSync: () => temporary }, statePath, lock, number });
+    expect(out).toMatchObject(external
+      ? { action: 'skip', reason: expect.stringContaining('escapes worktree') }
+      : { action: 'numbered', newHead: 'numbered-head' });
+    expect(readFileSync(join(root, 'outside/sentinel.md'), 'utf8')).toBe(text);
+    if (external) {
+      expect(number).not.toHaveBeenCalled();
+      expect(lock).not.toHaveBeenCalled();
+      expect(existsSync(statePath)).toBe(false);
+      expect(exec.mock.calls.some(([, args]) => args[0] === 'push')).toBe(false);
+    } else {
+      expect(number).toHaveBeenCalledWith(tree, { minNext: 41 });
+      expect(exec).toHaveBeenCalledWith('git', ['push', '--no-verify', 'origin', 'HEAD:refs/heads/lane/example'], expect.any(Object));
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it('returns final for a hash-free tree with external and dangling tracked links without numbering IO', () => {
+  const root = mkdtempSync(join(tmpdir(), 'queue-hash-free-links-'));
   try {
     const tree = join(root, 'tree');
     mkdirSync(join(tree, 'backlog'), { recursive: true }); mkdirSync(join(tree, '.claude'));
-    mkdirSync(join(tree, 'skills-src')); mkdirSync(join(root, 'outside'));
+    mkdirSync(join(root, 'outside'));
     writeFileSync(join(tree, 'backlog/041-card.md'), '---\nstatus: resolved\n---\n');
-    symlinkSync(external ? join(root, 'outside') : '../skills-src', join(tree, '.claude/skills'));
+    symlinkSync(join(root, 'outside'), join(tree, '.claude/skills'));
+    symlinkSync('missing.md', join(tree, 'dangling.md'));
     const exec = vi.fn((_cmd, args) => args[0] === 'ls-remote' ? 'head\trefs/heads/lane/example' : args[0] === 'ls-files'
-      ? (args.length === 1 ? 'backlog/041-card.md\n.claude/skills' : 'backlog/041-card.md') : '');
+      ? (args.length === 1 ? 'backlog/041-card.md\n.claude/skills\ndangling.md' : 'backlog/041-card.md') : '');
+    const unexpected = vi.fn(() => { throw new Error('unexpected numbering IO'); });
     const out = prepareBranchBeforeEnqueue({ c: { headRef: 'lane/example' }, traceHeadSha: 'head', exec,
-      fs: { ...realFs, mkdtempSync: () => root }, number: () => { throw new Error('unexpected numbering'); } });
-    expect(out).toMatchObject(external ? { action: 'skip', reason: expect.stringContaining('escapes worktree') } : { action: 'final' });
+      fs: { ...realFs, mkdtempSync: () => root, lstatSync: unexpected, writeFileSync: unexpected },
+      lock: unexpected, number: unexpected });
+    expect(out).toEqual({ action: 'final' });
+    expect(unexpected).not.toHaveBeenCalled();
+    expect(exec.mock.calls.some(([, args]) => ['push', 'commit'].includes(args[0]) || (args[0] === 'ls-files' && args.length === 1))).toBe(false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
