@@ -2036,6 +2036,55 @@ describe('catch-up miss backoff', () => {
     expect(attempts(f)).toEqual(['--only=42']);
   });
 
+  it.each(['skipped', 'timeout', 'error', 'refused'])('an event-origin %s clears an earlier miss so only existing backoff rules govern catch-up', async outcome => {
+    vi.useFakeTimers();
+    try {
+      let result = { revalidationAborted: [{ num: 42, reason: 'red-team-pending' }] };
+      const f = fixture({ manualFinish: true, timeoutMs: 1000, drainResult: () => result,
+        resolveSetting: () => ({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp,
+          blockedBackoffRounds: 1, timeoutBackoffRounds: 1 } }),
+      });
+      const finish = async (run, end) => {
+        await vi.advanceTimersByTimeAsync(0);
+        const child = f.children.at(-1);
+        if (end === 'timeout') {
+          child.kill = () => child.emit('close', null);
+          await vi.advanceTimersByTimeAsync(1000);
+        } else if (end === 'error') child.emit('error', new Error('spawn failed'));
+        else child.finish();
+        return run;
+      };
+      await finish(f.handle.catchUp(), 'not-enqueued');
+      expect(f.handle.missBackoff().has(42)).toBe(true);
+
+      result = outcome === 'refused' ? { ok: false, reason: 'unavailable' }
+        : { considered: 1, skipReasons: [{ num: 42, reason: 'merge state BLOCKED' }] };
+      f.handle.notePoll({ ok: true, marked: [mark(42)] }); f.advance(15_000);
+      const eventRan = await finish(f.handle.tick(), outcome);
+      expect(eventRan).toMatchObject([{ num: 42, outcome }]);
+      expect(eventRan[0].catchUp).toBeUndefined();
+      expect(f.handle.missBackoff().size).toBe(0);
+      expect(f.handle.blocked().size).toBe(0); // Events do not arm blocked/timeout backoff.
+
+      f.advance(600_000);
+      expect(await finish(f.handle.catchUp(), outcome)).toMatchObject([{ num: 42, catchUp: true, outcome }]);
+      expect(attempts(f)).toHaveLength(3);
+      expect(f.handle.missBackoff().size).toBe(0);
+      if (outcome === 'skipped' || outcome === 'timeout') {
+        expect(f.handle.blocked().get(42)).toMatchObject({ rounds: 1,
+          reason: outcome === 'timeout' ? 'timeout' : 'blocked' });
+        f.advance(600_000);
+        expect(await f.handle.catchUp()).toMatchObject([{ num: 42, outcome: 'skipped',
+          what: expect.stringMatching(/^backed off:/) }]);
+        expect(attempts(f)).toHaveLength(3);
+      }
+      result = { toMerge: [{ num: 42 }] };
+      f.advance(600_000);
+      expect(await finish(f.handle.catchUp(), 'enqueued')).toMatchObject([{ num: 42, outcome: 'enqueued' }]);
+      expect(attempts(f)).toHaveLength(4); // Retry before the original 30-minute miss TTL.
+    } finally { vi.useRealTimers(); }
+  });
+
   it.each(['head', 'labels', 'TTL'])('re-picks after %s changes', async change => {
     let pr = head;
     const f = fixture({ readPr: async () => pr });

@@ -797,10 +797,10 @@ export function createEnqueueOnEvent({
         const json = lastJsonLine(r.stdout);
         let what = r.timedOut ? `timed out after ${childTimeoutMs / 1000}s with no JSON result` : r.error ? `could not run (${r.error})` : summarizeFastDrain(json, p.num);
         const summary = what;
-        if (summary.startsWith('passed every drain gate — enqueued') || summary.startsWith('not listed')) missBackoff.delete(p.num);
+        const previous = missBackoff.get(p.num);
+        missBackoff.delete(p.num);
         if (missSettings(s).enabled && summary.startsWith('not enqueued:') && typeof pr?.headRefOid === 'string' && pr.headRefOid && digest) {
           const reason = summary.slice('not enqueued:'.length).trim();
-          const previous = missBackoff.get(p.num);
           missBackoff.set(p.num, { pr: p.num, headSha: pr.headRefOid, labelsDigest: digest, reason, at: now(),
             logged: previous?.headSha === pr.headRefOid && previous?.labelsDigest === digest && previous?.reason === reason && previous.logged === true });
         }
@@ -855,6 +855,7 @@ export function createEnqueueOnEvent({
         ran.push({ ...metadata, num: p.num, code: r.code, what, verified, outcome });
       };
       const task = finish().catch(e => {
+        missBackoff.delete(p.num);
         const what = `could not finish (${String(e?.message || e).split('\n')[0]})`;
         log(`${prefix} — ${what}`);
         ran.push({ ...metadata, num: p.num, code: null, what, outcome: 'error' });
