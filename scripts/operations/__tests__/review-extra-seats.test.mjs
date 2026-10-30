@@ -116,6 +116,17 @@ describe('#4194 reviewSeatRoutes — which seats, on which provider', () => {
     expect(JUDGE_SEATS.map((s) => s.step)).toEqual(['judge', 'judgeSecurity']);
   });
 
+  it('launches REVIEW_SEAT_MODELS agy-gemini with its suffixed pin and no --effort argv', () => {
+    const pin = REVIEW_SEAT_MODELS['agy-gemini'];
+    const routes = reviewSeatRoutes({ available: ['agy-gemini'] }).routes;
+    expect(routes.length).toBeGreaterThan(0);
+    for (const route of [pin, ...routes]) {
+      const argv = buildAgyDirectTaskArgv({ ...route, review: true });
+      expect(argv).toEqual(expect.arrayContaining(['--model', 'gemini-4-argon-high']));
+      expect(argv).not.toContain('--effort');
+    }
+  });
+
   it('daily cap: 0 calls left skips every seat; 1 call left puts every seat on one provider', () => {
     const none = reviewSeatRoutes({ callsRemaining: 0 });
     expect(none.routes).toEqual([]);
@@ -346,7 +357,8 @@ describe('#4194 the direct-task scripts in --review mode', () => {
     expect(p).not.toMatch(/\brg\b|grep|via your shell/);
   });
 
-  it('gemini --review drops the permission bypass through the real run (initial attempt and resume alike)', async () => {
+  it('gemini --review launches the seat pin without --effort or permission bypass, initially and on resume', async () => {
+    const pin = REVIEW_SEAT_MODELS['agy-gemini'];
     const argvs = [];
     const spawnFn = (_cli, argv) => {
       argvs.push(argv);
@@ -362,11 +374,15 @@ describe('#4194 the direct-task scripts in --review mode', () => {
     // Hermetic: never read or write the host's real agy quota-hold evidence (a live hold returns before spawnFn).
     const hold = { readHold: () => null, saveHold: () => {} };
     try {
-      await runAgyDirectExec({ dir, task: 'Review it', review: true, timeoutMs: 60_000, logFile: join(dir, 'log.jsonl'), stream: false, spawnFn, ...hold });
-      await runAgyDirectExec({ dir, task: 'Review it', review: true, timeoutMs: 60_000, logFile: join(dir, 'log.jsonl'), stream: false, spawnFn, resumeConversationId: 'c-1', ...hold });
+      await runAgyDirectExec({ ...pin, dir, task: 'Review it', review: true, timeoutMs: 60_000, logFile: join(dir, 'log.jsonl'), stream: false, spawnFn, ...hold });
+      await runAgyDirectExec({ ...pin, dir, task: 'Review it', review: true, timeoutMs: 60_000, logFile: join(dir, 'log.jsonl'), stream: false, spawnFn, resumeConversationId: 'c-1', ...hold });
     } finally { rmSync(dir, { recursive: true, force: true }); }
     expect(argvs).toHaveLength(2);
-    for (const a of argvs) expect(a).not.toContain('--dangerously-skip-permissions');
+    for (const a of argvs) {
+      expect(a).not.toContain('--dangerously-skip-permissions');
+      expect(a).toEqual(expect.arrayContaining(['--model', 'gemini-4-argon-high']));
+      expect(a).not.toContain('--effort');
+    }
   });
 
   it('seatCallArgv shells the existing scripts in review mode (gemini halves its per-attempt budget)', () => {

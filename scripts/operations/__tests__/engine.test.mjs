@@ -204,9 +204,9 @@ describe('a judge resume carries what the spawn cost', () => {
 
   it('takes a REPORTED model over the declared one, and refuses the caller `lens`/`effort` (#3151)', () => {
     // THE ASYMMETRY IS THE TEST. `--model` is the one thing that can legitimately make the spawn differ from
-    // the declaration, so a reported model must win or the row lies about which juror judged. Nothing can make
-    // `lens` or `effort` diverge, so a caller reporting them is either confused or hostile — and the row must
-    // stay attributable to the declared call. A fixture that reported the SAME values the declaration asks for
+    // the declaration, so a reported model must win or the row lies about which juror judged. A bare `effort`
+    // report cannot claim an effective provider tier; `lens` always stays attributable to the declared call.
+    // A fixture that reported the SAME values the declaration asks for
     // could not tell the two paths apart, so every field here is deliberately different.
     const run = advance(atJudge(), {
       registry,
@@ -218,6 +218,25 @@ describe('a judge resume carries what the spawn cost', () => {
     expect(run.telemetry[0].model).toBe('opus');
     expect(run.telemetry[0].effort).toBe('medium');
     expect(run.telemetry[0].lens).toBe('panel');
+  });
+
+  it('records explicit provider effectiveEffort under effort without changing the declared lens or request', () => {
+    const suspended = atJudge();
+    const request = structuredClone(suspended.pending.request);
+    const run = advance(suspended, {
+      registry,
+      resume: { value: FIXTURE_JUDGE_ANSWER, telemetry: { ...SPEND, effectiveEffort: 'high', effort: 'low', lens: 'other' } },
+    });
+    expect(run.telemetry[0]).toMatchObject({ effort: 'high', lens: 'panel' });
+    expect(run.telemetry[0]).not.toHaveProperty('effectiveEffort');
+    expect(suspended.pending.request).toEqual(request);
+  });
+
+  it.each([undefined, null, '', ' ', 42, {}, []])('keeps the declared effort when effectiveEffort is unusable: %s', (effectiveEffort) => {
+    const run = advance(atJudge(), {
+      registry, resume: { value: FIXTURE_JUDGE_ANSWER, telemetry: { ...SPEND, effectiveEffort, effort: 'max' } },
+    });
+    expect(run.telemetry[0].effort).toBe('medium');
   });
 
   it('falls back to the declared model when the caller reports an EMPTY one, rather than recording none', () => {

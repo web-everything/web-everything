@@ -134,6 +134,7 @@
  */
 
 import { agyRunEvidence, readAgyHold, saveAgyHold, agyEvidenceError } from './antigravity-run-evidence.mjs';
+import { hasAntigravityEffortSuffix } from './antigravity-model-effort.mjs';
 import { spawn as nodeSpawn } from 'node:child_process';
 import {
   mkdtempSync, mkdirSync, rmSync, writeFileSync,
@@ -299,7 +300,7 @@ export function buildAntigravityJudgeArgv({ schemaFile, model, effort } = {}) {
       throw new TypeError(`antigravity-judge-spawn: \`effort\` must be one of ${Object.keys(ANTIGRAVITY_EFFORT_MAP).join('|')}, got ${JSON.stringify(effort)}`);
     }
     // Effort-suffixed ids already select effort; agy rejects combining them with --effort.
-    if (!/-(low|medium|high)$/.test(model?.trim() ?? '')) {
+    if (!hasAntigravityEffortSuffix(model)) {
       argv.push('--effort', resolveAntigravityModelEffort(model, mapped));
     }
   }
@@ -660,10 +661,15 @@ export async function antigravityJudgeSpawn({
   }
   assertNoAntigravityToolAllowlist(allowedTools);
 
+  // Record the tier agy will use, including suffixes that supersede the requested effort.
+  const effectiveEffort = hasAntigravityEffortSuffix(model)
+    ? model.trim().split('-').at(-1)
+    : resolveAntigravityModelEffort(model, ANTIGRAVITY_EFFORT_MAP[effort]);
   const hold = readHold(model);
   if (hold) {
-    recordScorecard({ provider: 'antigravity', model: 'unknown', ...hold, dispatchKind: role, kind: 'review', role });
-    throw agyEvidenceError(hold);
+    const evidence = { ...hold, effort: effectiveEffort };
+    recordScorecard({ provider: 'antigravity', model: 'unknown', ...evidence, dispatchKind: role, kind: 'review', role });
+    throw agyEvidenceError(evidence);
   }
   const workDir = mkTempDir(join(tmpdir(), 'antigravity-judge-'));
   const spawnCwd = cwd || workDir;
@@ -725,7 +731,7 @@ export async function antigravityJudgeSpawn({
       child.stdin?.end(streamInput);
     });
   } catch (error) {
-    const evidence = agyRunEvidence({ requestedModel: model });
+    const evidence = { ...agyRunEvidence({ requestedModel: model }), effort: effectiveEffort };
     error.telemetry = evidence;
     recordScorecard({ ...evidence, model: 'unknown', provider: 'antigravity', dispatchKind: role, kind: 'review', role });
     throw error;
@@ -749,13 +755,13 @@ export async function antigravityJudgeSpawn({
   // unparseable run is recorded too — exactly the run most worth capturing. Best-effort, never throws
   // (`recordAntigravityRunScorecard`'s own header) — a recording failure can never turn an otherwise-completed
   // judge call into a failed one.
-  const evidence = agyRunEvidence({ ...result, requestedModel: model });
+  const evidence = { ...agyRunEvidence({ ...result, requestedModel: model }), effort: effectiveEffort };
   let holdError;
   try { saveHold(evidence); } catch (error) { holdError = error; }
   recordScorecard({
     ...evidence,
     transcriptFile, dispatchKind: role, kind: 'review', role,
-    provider: 'antigravity', model: evidence.servedModel, effort,
+    provider: 'antigravity', model: evidence.servedModel,
   });
 
   try {

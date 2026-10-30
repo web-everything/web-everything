@@ -352,6 +352,32 @@ describe('planJudgeBatch — only independent judge steps are batched', () => {
   });
 });
 
+describe('driveRun — effective provider effort reaches the run record', () => {
+  it.each([false, true])('keeps high effort over a low request with parallelJudges=%s, retaining request fallback', async (parallelJudges) => {
+    const request = (effort) => ({ mandate: 'm', input: 'i', shape: { type: 'object' }, effort });
+    const declaration = op('effective-effort-fixture', {
+      input: { x: 'number' },
+      a: judgeStep({ reads: ['input.x'], request: () => request('low') }),
+      b: judgeStep({ reads: ['input.x'], request: () => request('medium') }),
+    });
+    const registry = createRegistry();
+    registry.register(declaration);
+    const provider = async ({ effort }) => ({
+      value: { verdict: 'accept' },
+      ...(effort === 'low' ? { effort: 'high', servedModel: 'gemini-4-argon-high' } : {}),
+    });
+    const judge = createDefaultJudge({ provider, providerName: 'antigravity' });
+    const store = createMemoryRunStore();
+    const run = startRun({ op: declaration.name, id: `r-effort-${parallelJudges}`, input: { x: 1 }, registry });
+    const out = await driveRun({ run, registry, store, sinks: {}, judge, parallelJudges, log: () => {} });
+    expect(out.stopped).toBe('complete');
+    expect(out.run.telemetry).toHaveLength(2);
+    expect(out.run.telemetry[0]).toMatchObject({ step: 'a', model: 'gemini-4-argon-high', effort: 'high' });
+    expect(out.run.telemetry[1]).toMatchObject({ step: 'b', effort: 'medium' });
+    expect(store.read(run.id).telemetry).toEqual(out.run.telemetry);
+  });
+});
+
 describe('driveRun — a changed request never commits its early answer', () => {
   it('discards the answer planned for the old request, records its spend, and respawns the seat', async () => {
     const shape = { type: 'object' };

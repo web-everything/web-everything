@@ -83,6 +83,7 @@
  */
 
 import { pickAgyEvidence, agyRunEvidence, readAgyHold, saveAgyHold } from './lib/antigravity-run-evidence.mjs';
+import { hasAntigravityEffortSuffix } from './lib/antigravity-model-effort.mjs';
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import { mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -151,7 +152,8 @@ export function buildAgyDirectTaskArgv({ addDirs = [], model, effort, sandbox = 
   }
   if (effort !== undefined) {
     if (!['low', 'medium', 'high'].includes(effort)) throw new TypeError('gemini-direct-task: effort must be low|medium|high');
-    const modelSupportsEffort = !(typeof model === 'string' && (AGY_EFFORT_UNSUPPORTED_MODELS.includes(model.trim()) || /-(low|medium|high)$/.test(model.trim())));
+    const modelSupportsEffort = !hasAntigravityEffortSuffix(model)
+      && !(typeof model === 'string' && AGY_EFFORT_UNSUPPORTED_MODELS.includes(model.trim()));
     if (modelSupportsEffort) argv.push('--effort', effort); // vocabulary only; agy validates model/effort combinations for every other model.
   }
   if (typeof sandbox !== 'boolean') throw new TypeError('gemini-direct-task: sandbox must be boolean');
