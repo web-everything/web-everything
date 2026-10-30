@@ -87,13 +87,13 @@ export const sameSha = (a, b) => {
 };
 
 const gateNames = [REVIEW_GATE_CHECK, 'merge-gate'];
-const lowerName = name => String(name ?? '').toLowerCase();
+const lowerState = state => String(state ?? '').toLowerCase();
 /** Adapt GraphQL rollups and legacy statuses without replacing the shared state policy. */
 function checkEvidence(rollup, requiredChecks) {
   const rows = Array.isArray(rollup) ? rollup : [];
   const groups = new Map();
   for (const row of rows) {
-    const name = lowerName(row?.name ?? row?.context);
+    const name = row?.name ?? row?.context;
     if (!groups.has(name)) groups.set(name, []);
     groups.get(name).push({ ...row, name, __typename: rollupRowKind(row) });
   }
@@ -106,7 +106,7 @@ function checkEvidence(rollup, requiredChecks) {
       // Normalise legacy StatusContext state BEFORE ranking, so an undated PENDING status ranks as pending.
       const check = { ...row };
       if (row?.status == null && row?.state != null) {
-        if (['pending', 'expected'].includes(lowerName(row.state))) check.status = 'pending';
+        if (['pending', 'expected'].includes(lowerState(row.state))) check.status = 'pending';
         else check.conclusion = row.state;
       }
       return check;
@@ -117,7 +117,7 @@ function checkEvidence(rollup, requiredChecks) {
   const holdGateNames = [REVIEW_GATE_CHECK];
   if (checks.some(row => row.name === 'merge-gate' && row.mergeGateReviewHold)) holdGateNames.push('merge-gate');
   const roster = withoutImpliedRequiredChecks(Array.isArray(requiredChecks) ? requiredChecks : [], checks)
-    .filter(name => !holdGateNames.includes(lowerName(name)));
+    .filter(name => !holdGateNames.includes(name));
   return { checks, roster, holdGateNames };
 }
 
@@ -130,12 +130,11 @@ export function requiredCheckStates({ rollup, requiredChecks }) {
   const out = { red: [], pending: [], missing: [], green: [] };
   const { checks, roster } = checkEvidence(rollup, requiredChecks);
   const { redSet, pendingSet } = summarize(checks, { requiredNames: roster });
-  const observed = new Set(checks.map(row => lowerName(row.name)));
+  const observed = new Set(checks.map(row => row.name));
   for (const name of roster) {
-    const key = lowerName(name);
-    if (!observed.has(key)) out.missing.push(name);
-    else if (redSet.has(key)) out.red.push(name);
-    else if (pendingSet.has(key)) out.pending.push(name);
+    if (!observed.has(name)) out.missing.push(name);
+    else if (redSet.has(name)) out.red.push(name);
+    else if (pendingSet.has(name)) out.pending.push(name);
     else out.green.push(name);
   }
   return out;
@@ -144,15 +143,11 @@ export function requiredCheckStates({ rollup, requiredChecks }) {
 /** Include gates and enabled drain-blocking CodeQL failures, even outside the required roster. */
 export function gateOnlyRedStates({ rollup, requiredChecks, drainGateSettings = loadDrainGateSettings() }) {
   const { checks, roster, holdGateNames } = checkEvidence(rollup, requiredChecks);
-  // Reuse the drain's failure rule on the already-selected latest attempts. Its
-  // canonical spelling bridges this reader's case-insensitive check names.
-  const codeql = drainGateSettings.drainBlocksOnCodeQL && failedCodeQLCheck({ statusCheckRollup:
-    checks.filter(row => row.name === lowerName(CODEQL_CHECK_NAME)).map(row => ({ ...row, name: CODEQL_CHECK_NAME })) });
+  // Reuse the drain's exact-name failure rule on the already-selected latest attempts.
+  const codeql = drainGateSettings.drainBlocksOnCodeQL && failedCodeQLCheck({ statusCheckRollup: checks });
   const requiredNames = [...roster, ...gateNames, ...(codeql ? [CODEQL_CHECK_NAME] : [])];
   const { gateOnlyRed, redSet } = summarize(checks, { requiredNames, holdGateNames });
-  const originalNames = new Map((Array.isArray(requiredChecks) ? requiredChecks : []).map(name => [lowerName(name), name]));
-  if (codeql && !originalNames.has(lowerName(CODEQL_CHECK_NAME))) originalNames.set(lowerName(CODEQL_CHECK_NAME), CODEQL_CHECK_NAME);
-  return { gateOnlyRed, red: [...redSet].map(name => originalNames.get(name) ?? name) };
+  return { gateOnlyRed, red: [...redSet] };
 }
 
 /**

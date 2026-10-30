@@ -6,11 +6,70 @@ import { requiredCheckStates, contradictingChecks, notCiBreakContradicted, unset
 import * as verdictRecheck from '../ci-heal-verdict-recheck.mjs';
 import { checkNeedsHumanEscalable, notCiBreakRecordRefusal } from '../ci-heal-escalation-mark.mjs';
 import { excuseMergeGateRows } from '../../lib/merge-gate-hold-class.mjs';
+import { latestCheckNamed } from '../../lib/rollup-collapse.mjs';
 
 const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/ci-heal-verdict/pr4535-2026-10-09.json'), 'utf8'));
 const input = { escalation: { outcome: 'not-a-ci-break', headSha: fixture.headRefOid }, headSha: fixture.headRefOid,
   rollup: fixture.statusCheckRollup, requiredChecks: fixture.requiredChecks };
 const green = fixture.requiredChecks.map((name) => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' }));
+
+describe('operator send-back exact check identity', () => {
+  it('required test FAILURE plus a distinct TEST SUCCESS must stay red', async () => {
+    for (const legacy of [false, true]) {
+      const failed = legacy
+        ? { __typename: 'StatusContext', context: 'test', state: 'FAILURE' }
+        : { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' };
+      const rows = [
+        { ...failed, completedAt: '2026-10-30T10:00:00Z' },
+        { name: 'TEST', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-30T10:01:00Z' },
+        { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+      ];
+      for (const rollup of [rows, rows.toReversed()]) {
+        const evidence = { ...input, rollup, requiredChecks: ['test'] };
+        const drainRow = latestCheckNamed(rollup, 'test');
+        expect(drainRow.conclusion ?? drainRow.state).toBe('FAILURE');
+        expect(requiredCheckStates(evidence)).toEqual({ red: ['test'], pending: [], missing: [], green: [] });
+        expect(ciGreenForEscalation(evidence)).toBe(false);
+        expect(contradictingChecks(evidence)).toEqual(['test']);
+        expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(false);
+        expect(notCiBreakRecordRefusal({ headSha: input.headSha,
+          pr: { headRefOid: input.headSha, statusCheckRollup: rollup }, requiredChecks: ['test'] })).not.toBeNull();
+        expect(await checkNeedsHumanEscalable({
+          pr: 6042, headSha: input.headSha, outcome: 'needs-human', settings: { recheckNotCiBreak: true },
+          readPr: () => ({ headRefOid: input.headSha, statusCheckRollup: rollup }),
+          readRequired: () => ({ checks: ['test'] }),
+        })).toEqual({ refusal: null });
+      }
+    }
+  });
+
+  it('a differently cased success cannot satisfy a missing required check', () => {
+    expect(requiredCheckStates({ requiredChecks: ['test'], rollup: [
+      { name: 'TEST', status: 'COMPLETED', conclusion: 'SUCCESS' },
+    ] })).toEqual({ red: [], pending: [], missing: ['test'], green: [] });
+  });
+
+  it('a distinct CODEQL success cannot hide a drain-blocking CodeQL failure', () => {
+    const rollup = [
+      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+      { name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-30T10:00:00Z' },
+      { name: 'CODEQL', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-30T10:01:00Z' },
+    ];
+    expect(verdictRecheck.gateOnlyRedStates({ rollup, requiredChecks: ['test'],
+      drainGateSettings: { drainBlocksOnCodeQL: true } })).toEqual({ gateOnlyRed: false, red: ['review-gate', 'CodeQL'] });
+  });
+
+  it('a differently cased required gate is ordinary CI evidence', () => {
+    const evidence = { requiredChecks: ['MERGE-GATE', 'REVIEW-GATE'], rollup: [
+      { name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE', mergeGateReviewHold: true },
+      { name: 'MERGE-GATE', status: 'COMPLETED', conclusion: 'FAILURE' },
+      { name: 'REVIEW-GATE', status: 'COMPLETED', conclusion: 'FAILURE' },
+    ] };
+    expect(requiredCheckStates(evidence).red).toEqual(['MERGE-GATE', 'REVIEW-GATE']);
+    expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(false);
+  });
+});
 
 describe('R10 escalation send-back regressions', () => {
   it.each([false, true])('a later failed rerun of an older workflow run wins (reverse=%s)', reverse => {
@@ -135,13 +194,13 @@ describe('R10 escalation send-back regressions', () => {
     }
   });
 
-  it('uses the latest normalized CodeQL attempt and honors the drain switch', () => {
+  it('uses the latest exact-name CodeQL attempt and honors the drain switch', () => {
     for (const conclusion of ['SUCCESS', 'FAILURE', 'CANCELLED']) {
       const evidence = { requiredChecks: ['test'], rollup: [
         { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
         { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
         { name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE', run_attempt: 1, completedAt: '2026-10-28T12:00:00-04:00' },
-        { name: 'CODEQL', status: 'COMPLETED', conclusion, run_attempt: 2, completedAt: '2026-10-28T13:00:00-04:00' },
+        { name: 'CodeQL', status: 'COMPLETED', conclusion, run_attempt: 2, completedAt: '2026-10-28T13:00:00-04:00' },
       ] };
       for (const drainBlocksOnCodeQL of [false, true]) {
         expect(verdictRecheck.gateOnlyRedStates({ ...evidence, drainGateSettings: { drainBlocksOnCodeQL } }).gateOnlyRed)
@@ -167,7 +226,7 @@ describe('requiredCheckStates shared predicate regressions', () => {
     ]) {
       for (const conclusion of ['FAILURE', 'CANCELLED', 'SUCCESS']) {
         const rows = [
-          { __typename: 'CheckRun', name: 'TEST', status: 'COMPLETED', conclusion: conclusion === 'SUCCESS' ? 'FAILURE' : 'SUCCESS',
+          { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: conclusion === 'SUCCESS' ? 'FAILURE' : 'SUCCESS',
             completedAt: '2026-10-28T01:00:00Z', ...olderMetadata },
           { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion,
             completedAt: '2026-10-28T02:00:00Z', ...newerMetadata },
@@ -252,22 +311,22 @@ describe('requiredCheckStates shared predicate regressions', () => {
     expect(ciGreenForEscalation(evidence)).toBe(false);
   });
 
-  it.each([false, true])('timestamps and check-run ids rank per normalized name (reverse=%s)', reverse => {
+  it.each([false, true])('timestamps and check-run ids rank per exact name (reverse=%s)', reverse => {
     const rows = [
-      { name: 'TEST', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-28T01:00:00Z' },
+      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-28T01:00:00Z' },
       { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T02:00:00Z' },
       { name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS', run_attempt: 2, id: 1 },
       { name: 'build', status: 'COMPLETED', conclusion: 'FAILURE', run_attempt: 1, id: 99 },
       { __typename: 'StatusContext', context: 'legacy', state: 'SUCCESS', completedAt: '2026-10-28T01:00:00Z' },
-      { __typename: 'StatusContext', context: 'LEGACY', state: 'FAILURE', completedAt: '2026-10-28T02:00:00Z' },
+      { __typename: 'StatusContext', context: 'legacy', state: 'FAILURE', completedAt: '2026-10-28T02:00:00Z' },
     ];
-    expect(requiredCheckStates({ requiredChecks: ['Test', 'build', 'Legacy'], rollup: reverse ? rows.toReversed() : rows }))
-      .toEqual({ red: ['Test', 'build', 'Legacy'], pending: [], missing: [], green: [] });
+    expect(requiredCheckStates({ requiredChecks: ['test', 'build', 'legacy'], rollup: reverse ? rows.toReversed() : rows }))
+      .toEqual({ red: ['test', 'build', 'legacy'], pending: [], missing: [], green: [] });
   });
 
   it.each([false, true])('legacy metadata cannot displace a CheckRun from the preferred tier (reverse=%s)', reverse => {
     const rows = [
-      { __typename: 'CheckRun', name: 'Test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T01:00:00Z' },
+      { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T01:00:00Z' },
       { context: 'test', state: 'SUCCESS', id: 100, run_attempt: 2 },
     ];
     expect(requiredCheckStates({ requiredChecks: ['test'], rollup: reverse ? rows.toReversed() : rows }))

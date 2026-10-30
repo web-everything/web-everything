@@ -104,6 +104,32 @@ describe('inherited check-state keys', () => {
 });
 
 describe('latestAttempts', () => {
+  it('keeps distinct test and TEST checks separate and matches the required name exactly', () => {
+    const failed = settled('test', 'FAILURE', { completedAt: '2026-10-30T10:00:00Z' });
+    const passed = settled('TEST', 'SUCCESS', { completedAt: '2026-10-30T10:01:00Z' });
+    for (const rows of [[failed, passed], [passed, failed]]) {
+      expect(latestAttempts(rows)).toHaveLength(2);
+      expect(summarize(rows, { requiredNames: ['test'] })).toEqual({
+        redSet: new Set(['test']), pendingSet: new Set(), gateOnlyRed: false, allRequiredGreen: false,
+      });
+      expect(summarize(rows, { requiredNames: ['TEST'] }).allRequiredGreen).toBe(true);
+      expect(summarize(rows, { requiredNames: ['Test'] }).pendingSet).toEqual(new Set(['Test']));
+    }
+  });
+
+  it('an older completed attempt cannot hide a newer in-progress attempt on the same head', () => {
+    const success = settled('test', 'SUCCESS', { head_sha: 'abc1234', run_id: 100, run_attempt: 1,
+      id: 100, completed_at: '2026-10-30T10:00:00Z' });
+    const pending = { name: 'test', head_sha: 'abc1234', run_id: 100, run_attempt: 2,
+      id: 200, status: 'IN_PROGRESS', started_at: '2026-10-30T10:01:00Z' };
+    for (const rows of [[success, pending], [pending, success]]) {
+      expect(latestAttempts(rows)).toEqual([pending]);
+      expect(summarize(rows, { requiredNames: ['test'] })).toEqual({
+        redSet: new Set(), pendingSet: new Set(['test']), gateOnlyRed: false, allRequiredGreen: false,
+      });
+    }
+  });
+
   it.each([undefined, 'invalid', '2026-10-29T02:00:00Z'])(
     'uses global check ids across runs when completion times are missing, invalid or equal (%s)', timestamp => {
       const rerun = settled('ci', 'failure', { run_id: 100, run_attempt: 2, id: 300, completedAt: timestamp });
@@ -500,7 +526,7 @@ describe('R216 effective-time attempt ranking', () => {
     ['completion time takes precedence over start time',
       { started_at: late, completed_at: early }, { started_at: early, completed_at: late }],
   ])('%s', (_name, olderMetadata, newerMetadata) => {
-    const older = settled('TEST', 'SUCCESS', olderMetadata);
+    const older = settled('test', 'SUCCESS', olderMetadata);
     const newer = settled('test', 'FAILURE', newerMetadata);
     for (const rows of [[older, newer], [newer, older]]) {
       expect(latestAttempts(rows)).toEqual([newer]);

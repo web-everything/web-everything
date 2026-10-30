@@ -30,7 +30,7 @@ const normalize = (value) => typeof value === 'string' ? value.toLowerCase() : '
 const ownValue = (table, key) => Object.hasOwn(table, key) ? table[key] : 'red';
 
 /**
- * Classify REST or GraphQL check evidence, case-insensitively.
+ * Classify REST or GraphQL status and conclusion values case-insensitively.
  * @param {object} check Check row; required defaults to true.
  * @returns {'green'|'red'|'pending'|'ignore'} Admission state.
  * @example classifyCheck({ status: 'COMPLETED', conclusion: 'SUCCESS' }); // green
@@ -53,7 +53,7 @@ const numeric = (value) => {
 };
 
 /**
- * Select the greatest (effective time, check-run id) tuple per name.
+ * Select the greatest (effective time, check-run id) tuple per exact name.
  * Effective time is completed_at/completedAt, else started_at/startedAt, else
  * created_at/createdAt. Invalid timestamps and pre-2000/epoch
  * timestamps count as absent, falling through to the next valid timestamp.
@@ -69,7 +69,7 @@ const numeric = (value) => {
 export function latestAttempts(checks = []) {
   const groups = new Map();
   for (const check of checks) {
-    const name = normalize(check.name);
+    const name = check.name;
     if (!groups.has(name)) groups.set(name, []);
     groups.get(name).push(check);
   }
@@ -96,7 +96,7 @@ export function latestAttempts(checks = []) {
 /**
  * Summarize latest required attempts; absent roster entries remain pending.
  * An explicit roster determines requiredness; otherwise row flags apply.
- * Names are case-insensitive and returned in lowercase.
+ * Names match the required roster and hold gates exactly, as in the drain.
  * @param {object[]} checks Check attempts.
  * @param {object} options Optional requiredNames and holdGateNames arrays.
  * @returns {{redSet: Set<string>, pendingSet: Set<string>, gateOnlyRed: boolean,
@@ -108,13 +108,13 @@ export function summarize(checks = [], {
   holdGateNames = ['review-gate', 'merge-gate'],
 } = {}) {
   const latest = latestAttempts(checks);
-  const required = requiredNames === undefined ? null : new Set(requiredNames.map(normalize));
-  const gates = new Set(holdGateNames.map(normalize));
+  const required = requiredNames === undefined ? null : new Set(requiredNames);
+  const gates = new Set(holdGateNames);
   const observed = new Set();
   const redSet = new Set();
   const pendingSet = new Set();
   for (const check of latest) {
-    const name = normalize(check.name);
+    const name = check.name;
     observed.add(name);
     const state = classifyCheck(required === null
       ? check : { ...check, required: required.has(name) });

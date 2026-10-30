@@ -472,8 +472,8 @@ function defaultReadPrChecks({ pr, repo }, {
   const rows = Array.isArray(parsed.statusCheckRollup) ? parsed.statusCheckRollup : [];
   // Select once with R216 before the shared hold reader examines the job. It
   // must never annotate an older failure beside a newer success/pending run.
-  const [mergeGate] = latestAttempts(rows.filter(row => String(row.name ?? '').trim().toLowerCase() === 'merge-gate'));
-  const statusCheckRollup = rows.filter(row => String(row.name ?? '').trim().toLowerCase() !== 'merge-gate' || row === mergeGate);
+  const [mergeGate] = latestAttempts(rows.filter(row => row.name === 'merge-gate'));
+  const statusCheckRollup = rows.filter(row => row.name !== 'merge-gate' || row === mergeGate);
   let readError;
   const checkedRead = reader => input => {
     try {

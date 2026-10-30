@@ -982,6 +982,19 @@ describe('R4: default CLI check reader classifies merge-gate review holds', () =
     expect(opts.prChecksOptions.readMergeGateVerdict).toHaveBeenCalledWith({ repo: 'example/repo', prNumber: 6042, jobId: 99 });
   });
 
+  it('keeps a distinct required MERGE-GATE failure through the default reader', async () => {
+    const opts = options();
+    const facts = JSON.parse(opts.prChecksOptions.runGh());
+    facts.statusCheckRollup.push({ name: 'MERGE-GATE', id: 999,
+      status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T14:00:00-04:00' });
+    opts.prChecksOptions.runGh.mockReturnValue(JSON.stringify(facts));
+    opts.readRequired = () => ({ checks: ['test', 'merge-gate', 'MERGE-GATE'] });
+    expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: null });
+    expect(await checkNotCiBreakRecordable({ ...opts, outcome: 'not-a-ci-break' }))
+      .toEqual({ refusal: expect.stringContaining('red: MERGE-GATE') });
+    expect(opts.prChecksOptions.readMergeGateVerdict).toHaveBeenCalledWith({ repo: 'example/repo', prNumber: 6042, jobId });
+  });
+
   it.each(['SUCCESS', null])('newer success/pending evidence (%s) supersedes an older failed merge-gate without reading its verdict', async conclusion => {
     const opts = options();
     const facts = JSON.parse(opts.prChecksOptions.runGh());

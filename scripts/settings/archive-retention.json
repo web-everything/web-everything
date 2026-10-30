@@ -1,0 +1,4 @@
+{
+  "$comment": "R217 archive-only retention. archive.runs.keepDays defaults to 14, archive.sessions.keepDays to 30. Overrides resolve standard → platform → tool → environment (WE_ARCHIVE_RUNS_KEEP_DAYS, WE_ARCHIVE_SESSIONS_KEEP_DAYS, WE_ARCHIVE_DRIVE_ROOT). The Drive root defaults under os.homedir(); it must already exist. Missing Drive, invalid policy, verification failure or scan bounds retain originals. Archives have no expiry. Reclamation additionally requires a source-writer exclusion provider; CLI and daily ticks retain originals and report skipped removal until all writers can be excluded.",
+  "archive": {}
+}
