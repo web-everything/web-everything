@@ -19,9 +19,8 @@ const newRunId = () => `${new Date().toISOString().replace(/[^0-9tz]/gi, '').toL
 export function isAllowedCommand(argv) {
   // Only task arguments may follow the script name; npm options can skip or replace execution.
   return Array.isArray(argv) && argv.length >= 3 && argv.every((arg) => typeof arg === 'string' && !arg.includes('\0'))
-    && argv[0] === 'npm' && argv[1] === 'run' && ['test:unit', 'check:standards'].includes(argv[2])
-    && (argv.length === 3 || argv[3] === '--')
-    && (argv[2] !== 'test:unit' || allowedCommand(argv));
+    && (allowedCommand(argv) || (argv[0] === 'npm' && argv[1] === 'run' && argv[2] === 'check:standards'
+      && (argv.length === 3 || argv[3] === '--')));
 }
 
 export function filterEnv(env = {}) {
@@ -518,6 +517,8 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       // that fixed wrapper before siblings can run; old runners stay local.
       if (manifest.siblings && preparation.capabilities?.siblings !== 1)
         return {mode:'not-started',terminated:true,reason:'forge-runner-too-old'};
+      if (!(argv[0] === 'npm' && argv[2] === 'test:unit') && preparation.capabilities?.commandClasses !== 1)
+        return {mode:'not-started',terminated:true,reason:'forge-runner-too-old'};
       if(delta && (preparation.capabilities?.delta!==1 || !preparation.capabilities.bases?.some(base=>base.sha===delta.baseSha && base.manifestDigest===delta.baseManifestDigest)))throw new Error('Base changed during prepare');
       const rsyncDone=begin('rsync');
       // Transfer only staged leaves, retaining non-recursive rsync safeguards.
@@ -566,9 +567,10 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       // Only the fixed wrapper's protected prepared state can certify no execution.
       if (reply && (Object.keys(reply).sort().join(',') === 'nonce,phase,reason,run,siblings,started,v' || (delta && reply.delta===true && Object.keys(reply).sort().join(',') === 'delta,nonce,phase,reason,run,siblings,started,v'))
         && reply.v === 1 && reply.nonce === nonce && reply.run === run
-        && reply.phase === 'rejected' && reply.reason === 'snapshot-rejected'
-        && (reply.siblings === true || (delta && reply.delta===true && reply.siblings===!!expectedManifest.siblings)) && reply.started === false)
+        && reply.phase === 'rejected' && ['snapshot-rejected','forge-busy'].includes(reply.reason)
+        && (reply.reason === 'forge-busy' || reply.siblings === true || (delta && reply.delta===true && reply.siblings===!!expectedManifest.siblings)) && reply.started === false)
       {
+        if(reply.reason === 'forge-busy')return {mode:'not-started',terminated:true,reason:'forge-busy'};
         if(delta && reply.delta===true) {
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.
@@ -608,8 +610,9 @@ export function verifyReceipt(text, expected, code) {
 export async function main(options = {}) {
   if (!isAllowedCommand(options.argv)) throw new Error('command-not-allowed: use npm run <allowed-task> -- <task-args>');
   // Import at invocation time: heavy-admission's default executor imports us.
-  const { runWithRemoteDecision, resolveAdmissionPolicy, adaptLegacyRemoteResult } = await import('./heavy-admission.mjs');
-  const policy = resolveAdmissionPolicy({platform:{remote:{enabled:true, mode:'always'}}});
+  const { runWithRemoteDecision, loadAdmissionPolicy, adaptLegacyRemoteResult } = await import('./heavy-admission.mjs');
+  const loaded = loadAdmissionPolicy({env:options.env,checkoutRoot:options.cwd});
+  const policy = {...loaded,settings:{...loaded.settings,remote:{...loaded.settings.remote,enabled:true,mode:'always'}},sources:{...loaded.sources}};
   policy.sources['remote.enabled'] = 'explicit remote CLI request';
   policy.sources['remote.mode'] = 'explicit remote CLI request';
   let capturedTimings;
@@ -617,6 +620,7 @@ export async function main(options = {}) {
   const result = await runWithRemoteDecision({
     argv:options.argv, cwd:options.cwd, env:options.env, policy,
     timeoutMs:options.timeoutMs, log:options.log,
+    host:options.host, readTelemetry:options.readTelemetry, lockRoot:options.lockRoot, clock:options.clock,
     remoteExec:async decisionOptions=>{const value=await remoteExecutor(decisionOptions);capturedTimings=value?.timings;return value;},
   });
   if(capturedTimings?.length)(options.stderr??(text=>process.stderr.write(text)))(['forge stages (Eastern) | ms | transfer',...capturedTimings.map(t=>`${t.stage} ${t.startedAtET} | ${t.ms}${t.shipMode ? ` | ${t.shipMode} ${t.fileCount} files ${t.bytesSent} bytes`:''}`)].join('\n')+'\n');

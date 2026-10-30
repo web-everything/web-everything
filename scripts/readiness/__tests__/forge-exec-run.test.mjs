@@ -10,7 +10,7 @@ import {fileURLToPath} from 'node:url';
 import {createRunner, digestInput, digestArgv, supervisorSource} from '../forge-exec-run.mjs';
 import * as manifestAPI from '../forge-exec-run.mjs';
 let root, runner, request, work;
-const argv = ['npm','run','test:unit','--','two words',"a'b",'$(touch marker)','line\nbreak'];
+const argv = ['npm','run','test:unit','--','two words',"a'b",'$(touch marker)','-t','line\nbreak'];
 const hash = data => createHash('sha256').update(data).digest('hex');
 // Legacy success fixtures bind the exact snapshot supplied in their run request.
 async function snapshotBinding(base) {
@@ -267,7 +267,7 @@ process.stdout.write('x'.repeat(4*1024*1024+1));
     expect(result.code).toBe(3);
     expect(await readFile(join(work,'stdin-seen'),'utf8')).toBe('');
     expect(JSON.parse(await readFile(join(work,'argv-seen'),'utf8'))).toEqual(argv.slice(1));
-    expect(await readFile(join(work,'task-seen'),'utf8')).toContain("two words a'b $(touch marker) line\nbreak|production");
+    expect(await readFile(join(work,'task-seen'),'utf8')).toContain("two words a'b $(touch marker) -t line\nbreak|production");
     await expect(stat(join(work,'marker'))).rejects.toThrow();
     const log = await readFile(join(root,'install.log'),'utf8');
     expect(log).toContain('--include=dev --ignore-scripts --no-audit --no-fund');
@@ -277,7 +277,7 @@ process.stdout.write('x'.repeat(4*1024*1024+1));
       argvDigest:request.argvDigest,lock:request.lock,manifestDigest:request.manifestDigest,phase:'test',code:3,timings:{installMs:expect.any(Number),runMs:expect.any(Number)}});
     await expect(stat(join(root,'runs',request.run))).rejects.toThrow();
     await expect(runner.finish(request)).rejects.toThrow();
-    expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.consumed']);
+    expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.consumed',request.run+'.telemetry','telemetry.json']);
   });
   it('rejects input and lock changes before install and accepts odd filenames literally', async () => {
     for (const name of ['#file',';file',"quote'`$()",'--option','é\u2028fixture','tab\tfile','trailing ']) await writeFile(join(work,name),name);
@@ -622,7 +622,7 @@ describe('privileged finish cleanup', () => {
     expect(await isolated.finish(request)).toMatchObject({phase:'test',code:3});
     expect(cleanup).toHaveBeenCalledTimes(1);
     await expect(stat(join(root,'runs',request.run))).rejects.toThrow();
-    expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.consumed']);
+    expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.consumed',request.run+'.telemetry','telemetry.json']);
   });
   it('refuses cleanup failure without consuming state or publishing success', async () => {
     const cleanup=vi.fn(async ()=>({code:1}));
@@ -631,13 +631,13 @@ describe('privileged finish cleanup', () => {
     await expect(isolated.finish(request)).rejects.toThrow('Run cleanup failed');
     expect(cleanup).toHaveBeenCalledTimes(1);
     expect((await stat(work)).isDirectory()).toBe(true);
-    expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.receipt',request.run+'.running']);
+    expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.receipt',request.run+'.running',request.run+'.telemetry','telemetry.json']);
   });
   it('refuses claimed cleanup success when the run directory remains', async () => {
     const cleanup=vi.fn(async ()=>({code:0}));
     const isolated=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testCleanupExec:cleanup});
     await expect(isolated.finish(request)).rejects.toThrow('Run cleanup incomplete');
-    expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.prepared']);
+    expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.prepared',request.run+'.telemetry','telemetry.json']);
     expect((await stat(work)).isDirectory()).toBe(true);
   });
   it('does not delegate invalid or symlink-swapped run containers', async () => {
@@ -687,7 +687,7 @@ exec /usr/bin/sudo -n /usr/bin/python3 -I -c ${quote(task)}
   expect(await isolated.finish(request)).toMatchObject({phase:'test',code:0});
   expect(cleanup).toHaveBeenCalledTimes(1);
   await expect(stat(join(root,'runs',request.run))).rejects.toThrow();
-  expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.consumed']);
+  expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.consumed',request.run+'.telemetry','telemetry.json']);
 });
 
 

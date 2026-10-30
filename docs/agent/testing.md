@@ -1905,6 +1905,36 @@ Redirect `WE_RESOLVE_CONFLICT_LOG` to temporary storage. Permission-denial compl
 `denied`, hold for 60 minutes, and surface a `permission-blocked` note immediately; they are
 separate from transient infrastructure failures and their retry streak.
 
+### Forge client telemetry and remote admission
+
+The runner's `telemetry` subcommand samples the host on demand, including on fresh installs
+without `telemetry.json`; it never returns a saved timestamp as evidence of current health.
+Keep the stale-idle-file → SSH adapter → health-check regression alongside the ten-second
+cache boundary and SSH-failure/backoff recovery assertions. Boolean flags `--run`, `--silent`
+and `--no-color` must reject immediately following tokens beginning with `true` or `false`:
+Vitest can consume those positional-looking filters as flag values and change execution mode.
+
+`forge-client-controls.test.mjs` pins strict bounded telemetry, the read-only single-SSH CLI,
+runner sampling at prepare/run/finish and five-second in-process updates, fixed command
+classes, receipt argv binding, separate remote capacity, and persisted health/cache state.
+Use temporary lock roots and injected telemetry in legacy remote-contract fixtures; never
+contact Forge or consume the real host's remote slots from a unit test. Retain the original
+termination acknowledgements and refusal assertions when updating those fixtures.
+
+Remote telemetry older than 30 seconds (or dated in the future) routes through local admission.
+An idle runner does not fabricate a fresh sample on a telemetry read: a prepare/run/finish
+refresh must occur before remote routing can recover from stale evidence. Cache reads,
+including failed reads, are shared across clients for ten seconds; back-off and failure counts
+are host-shared too. Persist `slot-N.unconfirmed` exclusively before invoking the remote executor;
+remove it only after confirmed completion or termination. Abrupt client death skips `finally`,
+so quarantine cannot depend on cleanup running. A dead client PID or expired slot lease never
+authorizes reusing an outstanding execution's capacity. An operator must confirm Forge termination
+before manually clearing a retained marker. If marker creation fails, refuse remote dispatch and
+fall back through local admission. The SIGKILL subprocess regression leaves its simulated remote
+job alive and asserts that a second caller cannot reclaim that capacity. Keep this crash test
+alongside the returned-result and confirmed-cleanup cases when changing remote-slot lifecycle.
+The local host's heavy semaphore is acquired only on a safe local fallback.
+
 ### Forge warm bases and delta snapshots
 
 The Mac client and public-base warmer share `forge-exec-manifest.mjs`: path bytes,

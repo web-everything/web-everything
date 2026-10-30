@@ -15,6 +15,13 @@ import * as remoteManifestAPI from '../remote-exec.mjs';
 import * as forgeManifestAPI from '../forge-exec-run.mjs';
 import { adaptLegacyRemoteResult, resolveAdmissionPolicy, runWithRemoteDecision } from '../heavy-admission.mjs';
 
+vi.mock('../forge-telemetry.mjs', async importOriginal => {
+  const actual=await importOriginal();
+  const {easternTimestamp}=await import('../forge-exec-run.mjs');
+  return {...actual,readForgeTelemetry:async()=>({sampledAtET:easternTimestamp(Date.now()),
+    cores:8,loadPerCore:0.1,memFreePct:90,activeRuns:0,recent:[]})};
+});
+
 // Retain every exact legacy/security assertion while checking the added result field.
 async function runRemote(options) {
   const {timings, ...legacy} = await timedRunRemote(options);
@@ -69,7 +76,7 @@ function fixture({ probeCode = 0, copyCode = 0, prepareCode = 0, runCode = 0, re
     if (isPrepare(call)) {
       state = JSON.parse(call.input);
       state.run = 'r-' + state.nonce;
-      return { code: prepareCode, stdout: JSON.stringify({run: state.run, capabilities:{siblings:1}}) };
+      return { code: prepareCode, stdout: JSON.stringify({run: state.run, capabilities:{siblings:1,commandClasses:1}}) };
     }
     if (isRun(call)) { state = {...state, ...JSON.parse(call.input)}; return {code: runCode, stdout: ''}; }
     if (isReceipt(call)) {
@@ -83,7 +90,7 @@ function fixture({ probeCode = 0, copyCode = 0, prepareCode = 0, runCode = 0, re
   const local = vi.fn(async () => 7);
   const listFiles = vi.fn(async () => ['package-lock.json', 'a.test.mjs']);
   writeFileSync(join(cwd, 'a.test.mjs'), 'fixture');
-  return {exec, local, listFiles, argv:[...argv], cwd, env:{...allowedEnv,...forbiddenEnv}, runId};
+  return {exec, local, listFiles, argv:[...argv], cwd, lockRoot:join(cwd,'heavy'), env:{...allowedEnv,...forbiddenEnv}, runId};
 }
 // Simulate umask 077 without changing the test worker's process-wide umask.
 function restrictiveStageFs() {
@@ -476,6 +483,21 @@ console.log('RESOLVED ' + versions.join(','));
 });
 
 describe('isAllowedCommand', () => {
+  it.each([
+    ['npx','vitest','run','a.test.mjs'], ['npx','vitest','related','a.test.mjs','--run'],
+    ['npm','run','test:integration:vitest'], ['npm','run','test:coverage'],
+  ].map(argv=>[argv]))('keeps new class %j local with an old runner before copying bytes', async command => {
+    const f=fixture(),exec=f.exec;
+    f.exec=vi.fn(async call=>{
+      const reply=await exec(call);
+      if(isPrepare(call))return {...reply,stdout:JSON.stringify({run:JSON.parse(reply.stdout).run,capabilities:{siblings:1}})};
+      return reply;
+    });
+    expect(await runRemote({...f,argv:command})).toEqual({mode:'not-started',terminated:true,reason:'forge-runner-too-old'});
+    expect(callsOf(f.exec).some(call=>call.file==='rsync'||isRun(call))).toBe(false);
+    expect(callsOf(f.exec).filter(isCleanup)).toHaveLength(1);
+  });
+
   it.each(['--help','-h','--version','-v','--passWithNoTests','--pass-with-no-tests','--changed','--shard','--bail']
     .flatMap(flag => [flag, flag+'=true', flag+'=false', flag+'=']))
   ('rejects arguments outside the allowlist: %s on both sides before transport', async arg => {
@@ -748,7 +770,7 @@ describe('runRemote', () => {
       ? {code:0, stdout:Buffer.from('scripts/__tests__/ignored.test.mjs\0')}
       : exec(call));
     const result = await runWithRemoteDecision({
-      argv:f.argv, cwd, env:{}, log:vi.fn(), loadPerCore:() => 0,
+      argv:f.argv, cwd, env:{}, lockRoot:join(cwd,'heavy'), log:vi.fn(), loadPerCore:() => 0,
       policy:resolveAdmissionPolicy({platform:{remote:{enabled:true, mode:'always'}}}),
       remoteExec:async options => adaptLegacyRemoteResult(await runRemote({...f, ...options})),
     });
@@ -1019,20 +1041,20 @@ describe('explicit remote CLI decision', () => {
     ['remote failure', {mode:'remote', code:23}, 23],
   ])('%s exits without a local rerun even when remote defaults are disabled', async (_name, result, code) => {
     const remoteExec = vi.fn(async () => result), local = vi.fn();
-    expect(await remoteManifestAPI.main({argv, remoteExec, local, log:vi.fn()})).toBe(code);
+    expect(await remoteManifestAPI.main({argv,cwd,lockRoot:join(cwd,'heavy'), remoteExec, local, log:vi.fn()})).toBe(code);
     expect(remoteExec).toHaveBeenCalledTimes(1);
     expect(local).not.toHaveBeenCalled();
   });
   it('thrown remote execution exits 124 without a local rerun', async () => {
     const local = vi.fn();
-    await expect(remoteManifestAPI.main({argv, remoteExec:async () => {throw new Error('disconnected');}, local, log:vi.fn()})).resolves.toBe(124);
+    await expect(remoteManifestAPI.main({argv,cwd,lockRoot:join(cwd,'heavy'), remoteExec:async () => {throw new Error('disconnected');}, local, log:vi.fn()})).resolves.toBe(124);
     expect(local).not.toHaveBeenCalled();
   });
   it('timeout exits 124 without a local rerun', async () => {
     vi.useFakeTimers();
     const local = vi.fn();
     try {
-      const pending = remoteManifestAPI.main({argv, timeoutMs:10, remoteExec:() => new Promise(() => {}), local, log:vi.fn()});
+      const pending = remoteManifestAPI.main({argv,cwd,lockRoot:join(cwd,'heavy'), timeoutMs:10, remoteExec:() => new Promise(() => {}), local, log:vi.fn()});
       await vi.dynamicImportSettled();
       await vi.advanceTimersByTimeAsync(1010);
       expect(await pending).toBe(124);
@@ -1041,7 +1063,7 @@ describe('explicit remote CLI decision', () => {
   });
   it.each(['not-started', 'cancelled'])('confirmed %s may enter local admission', async mode => {
     const local = vi.fn(async () => 7);
-    expect(await remoteManifestAPI.main({argv, remoteExec:async () => ({mode, terminated:true}), local, log:vi.fn()})).toBe(7);
+    expect(await remoteManifestAPI.main({argv,cwd,lockRoot:join(cwd,'heavy'), remoteExec:async () => ({mode, terminated:true}), local, log:vi.fn()})).toBe(7);
     expect(local).toHaveBeenCalledTimes(1);
     expect(local).toHaveBeenCalledWith(argv);
   });
@@ -1345,7 +1367,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
       expect(await runRemote({argv, cwd, runId, exec}))
         .toEqual({mode:'not-started', terminated:true, reason:'excluded-source-file'});
       const local = vi.fn(async () => 7);
-      expect(await runRemoteCli({argv, cwd, runId, exec, local, log:vi.fn()})).toBe(7);
+      expect(await runRemoteCli({argv, cwd, runId, exec, local, lockRoot:join(cwd,'heavy'), log:vi.fn()})).toBe(7);
       expect(local).toHaveBeenCalledWith(argv);
       expect(callsOf(exec).some(isPrepare)).toBe(false);
       expect(callsOf(exec).some(call => call.file === 'rsync')).toBe(false);
@@ -1867,7 +1889,7 @@ it('CLI prints one compact timing table to stderr after remote completion',async
   const stderr=vi.spyOn(process.stderr,'write').mockImplementation(()=>true);
   const timings=[{stage:'total',startedAtET:'2026-01-01T07:00:00.000-05:00',ms:12}];
   try {
-    expect(await runRemoteCli({argv,remoteExec:async()=>({mode:'remote',code:0,timings}),log:vi.fn()})).toBe(0);
+    expect(await runRemoteCli({argv,cwd,lockRoot:join(cwd,'heavy'),remoteExec:async()=>({mode:'remote',code:0,timings}),log:vi.fn()})).toBe(0);
     expect(stderr).toHaveBeenCalledOnce();
     expect(stderr.mock.calls[0][0]).toContain('total');
     expect(stderr.mock.calls[0][0]).toContain('12');

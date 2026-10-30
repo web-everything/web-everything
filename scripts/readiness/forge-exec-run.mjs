@@ -7,6 +7,7 @@ import {open, mkdir, readdir, writeFile, rename, rm, rmdir, lstat, realpath} fro
 import {createHash, randomBytes} from 'node:crypto';
 import {join, relative} from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {cpus, loadavg, freemem, totalmem} from 'node:os';
 import {baseGuard, readyBases, readBase, copyLeaves, baseFile} from './forge-exec-bases.mjs';
 import {decodeManifest} from './forge-exec-manifest.mjs';
 const LIMIT = 4 * 1024 * 1024;
@@ -30,18 +31,73 @@ export const VITEST_ALLOWED_OPTIONS = Object.freeze([
   '-t', '--testNamePattern=',
 ]);
 export function allowedCommand(argv) {
-  if (!(Array.isArray(argv) && argv.length >= 3 && argv.every(a => typeof a === 'string' && !a.includes('\0'))
-    && argv[0] === 'npm' && argv[1] === 'run' && argv[2] === 'test:unit'
-    && (argv.length === 3 || argv[3] === '--'))) return false;
-  for (let i = 4; i < argv.length; i++) {
+  if (!(Array.isArray(argv) && argv.length >= 3 && argv.every(a => typeof a === 'string' && !a.includes('\0')))) return false;
+  const npm = argv[0] === 'npm' && argv[1] === 'run'
+    && ['test:unit','test:integration:vitest','test:coverage'].includes(argv[2])
+    && (argv.length === 3 || argv[3] === '--');
+  const npx = argv[0] === 'npx' && argv[1] === 'vitest' && ['run','related'].includes(argv[2]);
+  if (!npm && !npx) return false;
+  const files=[];
+  for (let i = npm ? 4 : 3; i < argv.length; i++) {
     const arg = argv[i];
-    if (!arg.startsWith('-')) continue;
+    if (!arg.startsWith('-')) {
+      try {
+        // Backslashes can be separators on the client even though Forge is Unix.
+        if (/\\|^[A-Za-z]:/.test(arg)) return false;
+        pathParts(Buffer.from(arg));
+        files.push(Buffer.from(arg));
+      } catch { return false; }
+      continue;
+    }
     const option = arg.startsWith('--testNamePattern=') ? '--testNamePattern=' : arg;
     if (!VITEST_ALLOWED_OPTIONS.includes(option)) return false;
+    // Vitest consumes a following boolean-looking token as the flag's value,
+    // even when that token could also be a valid positional file filter.
+    if (['--run','--silent','--no-color'].includes(arg) && /^(?:true|false)/i.test(argv[i+1] ?? '')) return false;
     // Vitest reparses dash-prefixed -t values as options (including --help).
     if (arg === '-t' && (++i >= argv.length || argv[i].startsWith('-'))) return false;
   }
+  try { validateTestNames(files); } catch { return false; }
+  if (npx && (!files.length || (argv[2] === 'related' && !argv.includes('--run')))) return false;
   return true;
+}
+// Each class fixes the executable and mode; never execute npx or interpolate a shell command.
+// The original test:unit class retains its installed npm-script contract.
+export function executionArgv(argv) {
+  if (!allowedCommand(argv)) throw new Error('Invalid execution parameters');
+  if (argv[0] === 'npm' && argv[2] === 'test:unit') return ['npm','run','test:unit',...argv.slice(3)];
+  const options=argv.slice(argv[0] === 'npm' ? 4 : 3);
+  return ['node','node_modules/vitest/vitest.mjs',argv[0] === 'npx' ? argv[2] : 'run',
+    ...(argv[2] === 'test:integration:vitest' ? ['--config','vitest.integration.config.ts'] : []),
+    ...(argv[2] === 'test:coverage' ? ['--coverage'] : []),...options];
+}
+
+export function easternTimestamp(ms) {
+  const parts=Object.fromEntries(new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23',timeZoneName:'longOffset'}).formatToParts(new Date(ms)).map(p=>[p.type,p.value]));
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}.${String(new Date(ms).getUTCMilliseconds()).padStart(3,'0')}${parts.timeZoneName.replace('GMT','')}`;
+}
+const exactKeys = (v,keys) => v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).sort().join(',') === keys;
+const validET = value => typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}-0[45]:00$/.test(value)
+  && Number.isFinite(Date.parse(value)) && easternTimestamp(Date.parse(value)) === value;
+const duration = n => Number.isSafeInteger(n) && n >= 0;
+export function parseTelemetry(text) {
+  if ((!Buffer.isBuffer(text) && typeof text !== 'string') || Buffer.byteLength(text)>65536
+    || (Buffer.isBuffer(text) && !Buffer.from(text.toString('utf8')).equals(text))) throw new Error('Invalid telemetry size or encoding');
+  const v=JSON.parse(text.toString());
+  if (!exactKeys(v,'activeRuns,cores,loadPerCore,memFreePct,recent,sampledAtET') || !validET(v.sampledAtET)
+    || !Number.isSafeInteger(v.cores) || v.cores<1 || !Number.isFinite(v.loadPerCore) || v.loadPerCore<0
+    || !Number.isFinite(v.memFreePct) || v.memFreePct<0 || v.memFreePct>100 || !duration(v.activeRuns)
+    || !Array.isArray(v.recent) || v.recent.length>50 || v.recent.some(r=>!exactKeys(r,'code,runId,stageMs,startedAtET')
+      || !runName(r.runId) || !validET(r.startedAtET) || !exactKeys(r.stageMs,'install,run')
+      || !duration(r.stageMs.install) || !duration(r.stageMs.run) || !(r.code===null || (duration(r.code)&&r.code<=255))))
+    throw new Error('Invalid telemetry schema');
+  return v;
+}
+export function formatTelemetry(value,host='forge') {
+  const v=parseTelemetry(JSON.stringify(value));
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host)) throw new Error('Invalid host');
+  const last=v.recent.find(r=>r.code!==null);
+  return `${host} ${v.sampledAtET.slice(11,16)} ET load/core ${v.loadPerCore.toFixed(2)} ram free ${Math.round(v.memFreePct)}% runs ${v.activeRuns} last-run ${last ? Math.round((last.stageMs.install+last.stageMs.run)/1000)+'s' : 'none'}`;
 }
 const ENV_KEYS = ['CI','NODE_ENV','TZ','LANG','LC_ALL','FORCE_COLOR','NO_COLOR'];
 export function allowedEnv(env) {
@@ -291,6 +347,26 @@ export function createRunner({testRoot, testPath, testCleanupExec, clock=Date.no
   const cache = testRoot ? join(testRoot,'cache') : '/srv/forge-cache';
   const path = testRoot ? testPath : '/usr/local/bin:/usr/bin:/bin';
   const statePath = (run,phase) => join(receipts,run+'.'+phase);
+  async function atomicJSON(file,value) {
+    const pending=file+'-'+randomBytes(8).toString('hex');
+    try {await writeFile(pending,JSON.stringify(value),{flag:'wx',mode:0o600});await rename(pending,file);}
+    finally {await rm(pending,{force:true});}
+  }
+  async function publishTelemetry(record) {
+    if(record)await atomicJSON(statePath(record.runId,'telemetry'),record);
+    const names=await readdir(receipts);
+    const recent=[];
+    for(const name of names.filter(n=>/^r-[a-f0-9]{32}\.telemetry$/.test(n)))
+      recent.push(JSON.parse(await readPinned(join(receipts,name))));
+    recent.sort((a,b)=>Date.parse(b.startedAtET)-Date.parse(a.startedAtET)||a.runId.localeCompare(b.runId));
+    const cores=cpus().length;
+    const value={sampledAtET:easternTimestamp(clock()),cores,loadPerCore:loadavg()[0]/cores,
+      memFreePct:freemem()/totalmem()*100,
+      activeRuns:names.filter(n=>/^r-[a-f0-9]{32}\.(prepared|running)$/.test(n)).length,recent:recent.slice(0,50)};
+    parseTelemetry(JSON.stringify(value));
+    await atomicJSON(join(receipts,'telemetry.json'),value);
+    return value;
+  }
   async function init() {
     if(testRoot) for(const dir of [runs,receipts,cache]) await mkdir(dir,{recursive:true,mode:0o700});
     for(const dir of [runs,receipts,cache]) await directory(dir,true);
@@ -323,7 +399,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, clock=Date.no
     // it out: an orphan could still modify another run under the shared uid.
     const active=join(receipts,'worker-active');
     await mkdir(active,{mode:0o700}).catch(error=>{
-      if(error.code==='EEXIST') throw new Error('Worker execution busy or interrupted; use local fallback. Operator must stop all forge-exec processes before removing /srv/forge-receipts/worker-active');
+      if(error.code==='EEXIST') throw Object.assign(new Error('Worker execution busy or interrupted; use local fallback. Operator must stop all forge-exec processes before removing /srv/forge-receipts/worker-active'),{code:'forge-busy'});
       throw error;
     });
     let settled=true;
@@ -438,6 +514,12 @@ export function createRunner({testRoot, testPath, testCleanupExec, clock=Date.no
     return result;
   }
   return {
+    async telemetry() {
+      // Idle hosts and fresh installs have no background sampler. Sample the
+      // actual host on every SSH request; the Mac health cache bounds reads.
+      await init();
+      return publishTelemetry();
+    },
     async bases() {
       try{return {delta:1,bases:(await readyBases(bases)).slice(0,4).map(({sha,manifestDigest})=>({sha,manifestDigest}))};}
       catch{return {delta:1,bases:[]};}
@@ -496,13 +578,14 @@ export function createRunner({testRoot, testPath, testCleanupExec, clock=Date.no
           throw new Error('Sibling ownership failed');
       }
       await writeFile(statePath(run,'prepared'),JSON.stringify({v:1,nonce,run}),{flag:'wx',mode:0o600});
+      await publishTelemetry({runId:run,startedAtET:easternTimestamp(clock()),stageMs:{install:0,run:0},code:null});
       if(baseSha!==undefined)await baseGuard(bases,async()=>{
         await readBase(bases,baseSha,baseManifestDigest);
         await mkdir(join(bases,'active'),{recursive:true,mode:0o700});
         await writeFile(join(bases,'active',run),baseSha,{flag:'wx',mode:0o600});
         await writeFile(statePath(run,'base'),JSON.stringify({baseSha,baseManifestDigest}),{flag:'wx',mode:0o600});
       });
-      return {run,capabilities:{siblings:1,...await this.bases()}};
+      return {run,capabilities:{siblings:1,commandClasses:1,...await this.bases()}};
     },
     async run(request) {
       const prepared=await state(request,'prepared');
@@ -558,16 +641,34 @@ export function createRunner({testRoot, testPath, testCleanupExec, clock=Date.no
       await rename(statePath(request.run,'prepared'),statePath(request.run,'running'));
       let phase='install',result={code:97,stdout:'',stderr:''};
       const installAt=clock();let installMs=0,runMs=0,runAt;
+      const startedAtET=easternTimestamp(installAt);
+      let telemetryError;
+      let updates=Promise.resolve();
+      const update=()=>{
+        const record={runId:request.run,startedAtET,stageMs:{install:runAt===undefined?Math.max(0,Math.round(clock()-installAt)):installMs,
+          run:runAt===undefined?0:Math.max(0,Math.round(clock()-runAt))},code:null};
+        updates=updates.then(()=>publishTelemetry(record)).catch(error=>{telemetryError=error;});
+        return updates;
+      };
+      await update();
+      if(telemetryError)throw telemetryError;
+      const telemetryTimer=setInterval(update,5000);
+      telemetryTimer.unref();
       try {
         result=await installDependencies(request,work,command);
         installMs=Math.max(0,Math.round(clock()-installAt));
         phase='test';
         runAt=clock();
-        result=await command(request.argv,work,{PATH:path,HOME:join(work,'.forge-home'),...request.env});
+        await update();
+        if(telemetryError)throw telemetryError;
+        result=await command(executionArgv(request.argv),work,{PATH:path,HOME:join(work,'.forge-home'),...request.env});
       } catch(error) {const code=phase==='install'?97:254; if(phase==='test') phase='supervisor'; result={code,stdout:result.stdout,stderr:String(error.message)};}
+      finally {clearInterval(telemetryTimer);await updates;}
       if(runAt!==undefined)runMs=Math.max(0,Math.round(clock()-runAt));else installMs=Math.max(0,Math.round(clock()-installAt));
       const receipt={...prepared,timings:{installMs,runMs},...(request.manifest.siblings ? {siblingShas:siblingShas(request.manifest)} : {}),manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code};
       await writeFile(statePath(request.run,'receipt'),JSON.stringify(receipt),{flag:'wx',mode:0o600});
+      await publishTelemetry({runId:request.run,startedAtET,stageMs:{install:installMs,run:runMs},code:result.code});
+      if(telemetryError)throw telemetryError;
       return result;
       });
       } catch (error) {
@@ -575,7 +676,8 @@ export function createRunner({testRoot, testPath, testCleanupExec, clock=Date.no
         // protected ops state. Never infer not-started from worker-owned files.
         const stillPrepared = await lstat(statePath(request.run,'prepared')).catch(e => {if(e.code !== 'ENOENT') throw e;});
         if (stillPrepared) {
-          await writeFile(statePath(request.run,'rejected'),JSON.stringify({...prepared,phase:'rejected',reason:'snapshot-rejected',siblings:!!request.manifest?.siblings,...(request.baseSha!==undefined?{delta:true}:{})}),{flag:'wx',mode:0o600}).catch(async e => {if (e.code !== 'EEXIST') throw e; await state(request,'rejected');});
+          const reason=error.code==='forge-busy' && !(request.argv?.[0]==='npm' && request.argv?.[2]==='test:unit') ? 'forge-busy' : 'snapshot-rejected';
+          await writeFile(statePath(request.run,'rejected'),JSON.stringify({...prepared,phase:'rejected',reason,siblings:!!request.manifest?.siblings,...(request.baseSha!==undefined?{delta:true}:{})}),{flag:'wx',mode:0o600}).catch(async e => {if (e.code !== 'EEXIST') throw e; await state(request,'rejected');});
         }
         throw error;
       }
@@ -605,19 +707,20 @@ export function createRunner({testRoot, testPath, testCleanupExec, clock=Date.no
       await rm(statePath(request.run,'rejected'),{force:true});
       await rm(join(bases,'active',request.run),{force:true});
       await rm(statePath(request.run,'base'),{force:true});
+      await publishTelemetry();
       // Legacy callers retain their null finish response for non-sibling failures.
       // Never certify rejection once the protected run phase has started.
-      return receipt ?? (phase === 'prepared' && (rejected?.siblings||rejected?.delta) ? {...rejected,started:false} : null) ?? null;
+      return receipt ?? (phase === 'prepared' && (rejected?.siblings||rejected?.delta||rejected?.reason==='forge-busy') ? {...rejected,started:false} : null) ?? null;
     },
   };
 }
 if(process.argv[1] && await realpath(process.argv[1]).catch(()=> '') === await realpath(fileURLToPath(import.meta.url))) {
   try {
-    if(process.argv.length!==3 || !['prepare','run','finish','bases','base-manifest'].includes(process.argv[2])) throw new Error('Invalid subcommand');
+    if(process.argv.length!==3 || !['prepare','run','finish','bases','base-manifest','telemetry'].includes(process.argv[2])) throw new Error('Invalid subcommand');
     let input='';
     process.stdin.setEncoding('utf8');
-    for await(const chunk of process.stdin) {input+=chunk; if(Buffer.byteLength(input)>LIMIT) throw new Error('Request limit exceeded');}
-    const result=await createRunner()[process.argv[2]](JSON.parse(input));
+    if(process.argv[2]!=='telemetry')for await(const chunk of process.stdin) {input+=chunk; if(Buffer.byteLength(input)>LIMIT) throw new Error('Request limit exceeded');}
+    const result=await createRunner()[process.argv[2]](process.argv[2]==='telemetry'?undefined:JSON.parse(input));
     if(process.argv[2]==='run') process.exitCode=result.code;
     else process.stdout.write(JSON.stringify(result)+'\n');
   } catch(error) {process.stderr.write('forge-exec-run: '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n'); process.exitCode=254;}
