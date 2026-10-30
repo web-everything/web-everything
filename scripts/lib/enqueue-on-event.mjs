@@ -57,8 +57,9 @@
  *   `enqueue-on-event: catch-up`. `tick()` runs it when due; `catchUp()` runs ONLY it, for a daemon whose passes
  *   run back to back (no post-pass sleep window) to call right before each pass.
  *
- *   catchUp.missBackoff {enabled:true, ttlMinutes:30} skips repeated not-enqueued summaries at the same
+ *   catchUp.missBackoff {enabled:true, ttlMinutes:30} skips repeated hold-eligible not-enqueued summaries at the same
  *   head and sorted-label SHA-256 digest until either changes or TTL (integer 1–1440 minutes) expires.
+ *   Queue contention, independent retry timers and unreadable evidence retry on the next catch-up.
  *   Events bypass the hold; enabled:false restores retries on every catch-up.
  *
  * SCOPE. Only PRs of the local repo (the clone's origin): that is the repo whose ready PRs the drain enqueues on
@@ -244,6 +245,33 @@ export function duePending(pending, { now, debounceSeconds, debounceMaxWaitMs = 
 /** The fast-drain argv (node script + args). The drain's own single-PR path; `--this-repo` keeps the listing local. PURE. */
 export function fastDrainArgs({ scriptRoot, num, listingSnapshot }) {
   return [join(scriptRoot, 'scripts', 'merge-ai-prs.mjs'), `--only=${num}`, `--label=${READY_LABEL}`, '--this-repo', '--json', ...(listingSnapshot ? [`--listing-snapshot=${listingSnapshot}`] : [])];
+}
+
+/** Explicit classification of recordEnqueue kinds, including delegated producers. PURE.
+ * The source-contract lint in enqueue-on-event.test.mjs requires each new kind to be classified.
+ * Infrastructure, queue/base state and existing retry timers must not acquire a second, longer hold.
+ */
+export const MISS_BACKOFF_HOLD_ELIGIBILITY = Object.freeze({
+  'batching-deferred': false,
+  'merge-lock-held': false,
+  prestage: false,
+  'branch-preparation': false,
+  'card-group-hold': false,
+  'card-grouped': false,
+  'enqueue-backoff': false,
+  'live-state-unreadable': false,
+  'bornas-unreadable': false,
+  conflict: false,
+  unconfirmed: false,
+  'enqueue-error': false,
+  'red-team-pending': true,
+  'sent-back': true,
+  'bornas-collision': true,
+});
+
+/** Unknown kinds retry: a new outcome must never silently impose a 30-minute hold. PURE. */
+export function isMissBackoffHoldEligible(kind) {
+  return typeof kind === 'string' && Object.hasOwn(MISS_BACKOFF_HOLD_ELIGIBILITY, kind) && MISS_BACKOFF_HOLD_ELIGIBILITY[kind] === true;
 }
 
 /** What the fast drain's JSON said about the target PR, in a few words. PURE. */
@@ -797,12 +825,18 @@ export function createEnqueueOnEvent({
         const json = lastJsonLine(r.stdout);
         let what = r.timedOut ? `timed out after ${childTimeoutMs / 1000}s with no JSON result` : r.error ? `could not run (${r.error})` : summarizeFastDrain(json, p.num);
         const summary = what;
-        const previous = missBackoff.get(p.num);
+        // Recheck at completion: an event-bypassed hold may expire while the child runs.
+        const previous = missHold(p.num, pr, s);
         missBackoff.delete(p.num);
-        if (missSettings(s).enabled && summary.startsWith('not enqueued:') && typeof pr?.headRefOid === 'string' && pr.headRefOid && digest) {
+        const enqueueOutcome = Array.isArray(json?.enqueueOutcomes) ? json.enqueueOutcomes.find(x => Number(x?.num) === p.num) : null;
+        // Revalidation misses may lack enqueueOutcomes. Preserve those legacy holds;
+        // never infer eligibility from reason text or a missing enqueue outcome.
+        const holdEligible = enqueueOutcome ? enqueueOutcome.outcome === 'not-enqueued' && isMissBackoffHoldEligible(enqueueOutcome.kind)
+          : Array.isArray(json?.revalidationAborted) && json.revalidationAborted.some(x => Number(x?.num) === p.num);
+        if (missSettings(s).enabled && holdEligible && summary.startsWith('not enqueued:') && typeof pr?.headRefOid === 'string' && pr.headRefOid && digest) {
           const reason = summary.slice('not enqueued:'.length).trim();
           missBackoff.set(p.num, { pr: p.num, headSha: pr.headRefOid, labelsDigest: digest, reason, at: now(),
-            logged: previous?.headSha === pr.headRefOid && previous?.labelsDigest === digest && previous?.reason === reason && previous.logged === true });
+            logged: previous?.reason === reason && previous.logged === true });
         }
         if (!r.error && (summary.startsWith('passed every drain gate — enqueued') || summary.startsWith('not listed'))) backoff.delete(p.num);
         if (p.catchUp && !r.error && blockedRounds > 0 && signature && summary.startsWith('skipped:') && /merge state BLOCKED|merge-gate hold/.test(summary)) {

@@ -2,7 +2,8 @@
  * @file Event-driven enqueue eligibility, policy resolution, debounce, and injected fast-drain runs.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import ts from 'typescript';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -1980,6 +1981,115 @@ describe('catch-up miss backoff', () => {
     ...extra,
   });
   const attempts = f => f.calls.map(c => c.args[1]);
+  // Every recordEnqueue not-enqueued kind, including its delegated producers.
+  // Timers, queue/base state and unreadable evidence can recover without a head/label change.
+  const holdEligibility = [
+    ['batching-deferred', false], ['merge-lock-held', false], ['prestage', false],
+    ['branch-preparation', false], ['card-group-hold', false], ['card-grouped', false],
+    ['enqueue-backoff', false], ['live-state-unreadable', false], ['bornas-unreadable', false],
+    ['conflict', false], ['unconfirmed', false], ['enqueue-error', false],
+    ['red-team-pending', true], ['sent-back', true], ['bornas-collision', true],
+  ];
+
+  it.each(holdEligibility)('classifies %s hold eligibility as %s and retries transient misses next catch-up', async (kind, eligible) => {
+    const f = fixture({ drainResult: num => ({ enqueueOutcomes: [
+      { num: 99, outcome: 'not-enqueued', kind: eligible ? 'batching-deferred' : 'red-team-pending' },
+      { num, outcome: 'not-enqueued', kind, reason: 'drain-reported gate' },
+    ] }) });
+    await f.handle.catchUp();
+    f.advance(600_000); await f.handle.catchUp();
+    expect(attempts(f)).toHaveLength(eligible ? 1 : 2);
+    expect(f.handle.missBackoff().size).toBe(eligible ? 1 : 0);
+    expect(enqueueModule.isMissBackoffHoldEligible(kind)).toBe(eligible);
+  });
+
+  it('lints recordEnqueue kinds and delegated producers against the classification table', () => {
+    const kinds = new Set();
+    const literals = node => {
+      if (ts.isStringLiteral(node)) kinds.add(node.text);
+      else if (ts.isConditionalExpression(node)) { literals(node.whenTrue); literals(node.whenFalse); }
+      else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.BarBarToken) literals(node.right);
+      else throw new Error(`Unclassified dynamic enqueue kind: ${node.getText()}`);
+    };
+    for (const file of ['../../merge-ai-prs.mjs', '../drain-merge-strategy.mjs', '../drain-poison-guard.mjs', '../card-group.mjs']) {
+      const source = ts.createSourceFile(file, readFileSync(new URL(file, import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+      const visit = node => {
+        if (ts.isObjectLiteralExpression(node)) {
+          const props = node.properties.filter(ts.isPropertyAssignment);
+          const prop = name => props.find(p => p.name.text === name);
+          const kind = prop('kind');
+          const notEnqueued = prop('outcome')?.initializer.getText(source).includes('not-enqueued');
+          const enqueueReturn = prop('enqueued')?.initializer.kind === ts.SyntaxKind.FalseKeyword;
+          const failure = ts.isVariableDeclaration(node.parent) && node.parent.name.getText(source) === 'failure';
+          const grouped = file.endsWith('/card-group.mjs') && !prop('outcome');
+          if (kind && (notEnqueued || enqueueReturn || failure || grouped)) literals(kind.initializer);
+        }
+        // guardEnqueue returns its conditional kind through a shorthand property.
+        if (file.endsWith('/drain-poison-guard.mjs') && ts.isVariableDeclaration(node) && node.name.getText(source) === 'kind') literals(node.initializer);
+        ts.forEachChild(node, visit);
+      };
+      visit(source);
+    }
+    expect([...kinds].sort()).toEqual(holdEligibility.map(([kind]) => kind).sort());
+    expect(Object.keys(enqueueModule.MISS_BACKOFF_HOLD_ELIGIBILITY).sort()).toEqual([...kinds].sort());
+  });
+
+  it.each([undefined, 'new-unknown-kind', 'toString', '__proto__'])('never holds an unclassified kind: %s', async kind => {
+    const f = fixture({ drainResult: num => ({ enqueueOutcomes: [{ num, outcome: 'not-enqueued', kind,
+      reason: 'red-team-pending: misleading text' }] }) });
+    await f.handle.catchUp(); f.advance(600_000); await f.handle.catchUp();
+    expect(attempts(f)).toHaveLength(2);
+    expect(f.handle.missBackoff().size).toBe(0);
+    expect(enqueueModule.isMissBackoffHoldEligible(kind)).toBe(false);
+  });
+
+  it('retries a planned enqueue with no recorded outcome instead of inventing a hold', async () => {
+    const f = fixture({ drainResult: num => ({ toMerge: [{ num }], enqueueOutcomes: [] }) });
+    await f.handle.catchUp(); f.advance(600_000); await f.handle.catchUp();
+    expect(attempts(f)).toHaveLength(2);
+    expect(f.handle.missBackoff().size).toBe(0);
+  });
+
+  it('logs once for each renewed hold after TTL expiry', async () => {
+    const f = fixture();
+    const logs = () => f.lines.filter(l => l.includes('miss-backoff: skipped'));
+    await f.handle.catchUp();
+    f.advance(600_000); await f.handle.catchUp();
+    expect(logs()).toHaveLength(1);
+    f.advance(1_200_000); await f.handle.catchUp();
+    expect(attempts(f)).toHaveLength(2);
+    f.advance(600_000); await f.handle.catchUp();
+    f.advance(600_000); await f.handle.catchUp();
+    expect(logs()).toHaveLength(2);
+  });
+
+  it('renews the log when an event-bypassed hold expires while the drain runs', async () => {
+    let expireDuringDrain = false;
+    const f = fixture({ drainResult: num => {
+      if (expireDuringDrain) f.advance(5_000);
+      return { revalidationAborted: [{ num, reason: 'red-team-pending' }] };
+    } });
+    await f.handle.catchUp();
+    f.advance(600_000); await f.handle.catchUp();
+    f.advance(1_180_000); f.handle.notePoll({ ok: true, marked: [mark(42)] });
+    f.advance(15_000); expireDuringDrain = true;
+    await f.handle.tick();
+    expect(attempts(f)).toHaveLength(2);
+    expect(f.handle.missBackoff().get(42).logged).toBe(false);
+    f.advance(600_000); await f.handle.catchUp();
+    expect(f.lines.filter(l => l.includes('miss-backoff: skipped'))).toHaveLength(2);
+  });
+
+  it('sanitises hostile control characters in the logged miss reason', async () => {
+    const reason = 'x\nSMELL enqueue-not-entering\r\x1b[31m\x00\x7f\x85';
+    const f = fixture({ drainResult: num => ({ revalidationAborted: [{ num, reason }] }) });
+    await f.handle.catchUp();
+    f.advance(600_000); await f.handle.catchUp();
+    const lines = f.lines.filter(l => l.includes('miss-backoff: skipped'));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('reason x SMELL enqueue-not-entering  [31m');
+    expect(lines[0]).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+  });
 
   it('resolves nested defaults, independent cascade leaves, sources and invalid bounds', () => {
     expect(resolveSetting().catchUp.missBackoff).toEqual({ enabled: true, ttlMinutes: 30 });
