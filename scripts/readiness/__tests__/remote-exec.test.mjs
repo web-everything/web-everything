@@ -1,7 +1,7 @@
 // @vitest-environment node
 /** @file Contract and execution tests for the Forge remote runner. */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { constants, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, symlinkSync, statSync, readdirSync, renameSync, cpSync } from 'node:fs';
+import { constants, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, symlinkSync, statSync, readdirSync, renameSync, cpSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -75,6 +75,28 @@ function fixture({ probeCode = 0, copyCode = 0, prepareCode = 0, runCode = 0, re
   const listFiles = vi.fn(async () => ['package-lock.json', 'a.test.mjs']);
   writeFileSync(join(cwd, 'a.test.mjs'), 'fixture');
   return {exec, local, listFiles, argv:[...argv], cwd, env:{...allowedEnv,...forbiddenEnv}, runId};
+}
+// Simulate umask 077 without changing the test worker's process-wide umask.
+function restrictiveStageFs() {
+  return {...filesystem,
+    mkdir:(path, options) => filesystem.mkdir(path, {...options, mode:0o700}),
+    writeFile:(path, data, options) => filesystem.writeFile(path, data, {...options, mode:0o600}),
+  };
+}
+function expectStageModes(root, executable) {
+  const visit = directory => {
+    for (const name of readdirSync(directory)) {
+      const path = join(directory,name), st = statSync(path);
+      if (st.isDirectory()) {
+        expect(st.mode & 0o7777).toBe(0o755);
+        visit(path);
+      } else {
+        expect(st.mode & 0o7777, `staged file must never remain 0600: ${name}`).not.toBe(0o600);
+        expect(st.mode & 0o7777).toBe(path === join(root,executable) ? 0o755 : 0o644);
+      }
+    }
+  };
+  visit(root);
 }
 function expectNoSecrets(exec) {
   const transport = JSON.stringify(callsOf(exec).map(({args,input}) => ({args,input})));
@@ -602,6 +624,58 @@ describe('runRemote', () => {
     expect(callsOf(f.exec).some(call => call.file === 'rsync' || isRun(call))).toBe(false);
   });
 
+  it('stages primary files as 0644/0755 and subdirectories as 0755 under a 0700 root despite restrictive creation modes', async () => {
+    const f = fixture();
+    mkdirSync(join(cwd,'sub/dir'), {recursive:true});
+    writeFileSync(join(cwd,'sub/dir/run.js'), 'executable');
+    chmodSync(join(cwd,'sub/dir/run.js'), 0o711);
+    f.listFiles.mockResolvedValue(['package-lock.json','a.test.mjs','sub/dir/run.js']);
+    f.fs = restrictiveStageFs();
+    const fake = f.exec;
+    let copied = false;
+    f.exec = vi.fn(async call => {
+      if (call.file === 'rsync') {
+        copied = true;
+        expect(statSync(call.cwd).mode & 0o7777).toBe(0o700);
+        expectStageModes(call.cwd, 'sub/dir/run.js');
+        expect(statSync(join(call.cwd,'sub')).mode & 0o7777).toBe(0o755);
+        expect(statSync(join(call.cwd,'sub/dir')).mode & 0o7777).toBe(0o755);
+        const destination = join(cwd,'copied');
+        mkdirSync(destination);
+        chmodSync(destination,0o755);
+        const args = call.args.filter((arg,i,all) => !arg.startsWith('--rsync-path=') && arg !== '-e' && all[i-1] !== '-e');
+        args[args.length-1] = destination+'/';
+        const result = spawnSync('rsync',args,{cwd:call.cwd,input:call.input,timeout:10000});
+        expect(result.status,result.stderr?.toString()).toBe(0);
+        expect(statSync(destination).mode & 0o7777).toBe(0o755);
+        expect(statSync(call.cwd).mode & 0o7777).toBe(0o700);
+        expectStageModes(destination,'sub/dir/run.js');
+      }
+      return fake(call);
+    });
+    const result = await runRemote(f);
+    const transport = await Promise.allSettled(f.exec.mock.results.map(call => call.type === 'throw' ? Promise.reject(call.value) : call.value));
+    expect(transport.filter(call => call.status === 'rejected').map(call => call.reason?.stack ?? String(call.reason)), JSON.stringify(result)).toEqual([]);
+    expect(result, JSON.stringify(result)).toEqual({mode:'remote',code:0});
+    expect(copied).toBe(true);
+  });
+
+  it.each(['mode','bytes'])('refuses staged %s corruption before prepare or rsync', async fault => {
+    const f = fixture();
+    let corrupted = false;
+    f.fs = {...filesystem, chmod:async (path, mode) => {
+      await filesystem.chmod(path, mode);
+      if (statSync(path).isFile()) {
+        corrupted = true;
+        if (fault === 'mode') await filesystem.chmod(path, 0o600);
+        else await filesystem.writeFile(path, 'corrupt staged bytes');
+      }
+    }};
+    expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'snapshot-staging-failed'});
+    expect(corrupted).toBe(true);
+    expect(callsOf(f.exec).some(call => call.file === 'rsync' || isPrepare(call))).toBe(false);
+  });
+
   it('sends only verified staged bytes when a live file becomes private after manifest build', async () => {
     const f = fixture();
     const transport = f.exec;
@@ -866,7 +940,8 @@ describe('runRemote', () => {
     const copy = calls.find((call) => call.file === 'rsync');
     expect(copy.args.join(' ')).toMatch(/--files-from(?:=|\s)-/);
     expect(copy.args).toContain('--from0');
-    expect(copy.args).toEqual(expect.arrayContaining(['--no-recursive','--no-dirs','--no-links','--safe-links','--no-implied-dirs']));
+    expect(copy.args).toEqual(expect.arrayContaining(['--no-recursive','--no-dirs','--no-links','--safe-links']));
+    expect(copy.args).not.toContain('--no-implied-dirs');
     expect(copy.args).not.toContain('-r');
     expect(copy.args).not.toContain('--delete');
     expect(copy.args).not.toContain('-L');
@@ -1548,6 +1623,8 @@ describe('allowlisted sibling snapshots', () => {
       mkdirSync(join(sibling, subtree));
       writeFileSync(join(sibling, subtree, 'index.js'), `export const value = '${subtree}';`);
     }
+    mkdirSync(join(sibling, 'webtheme/sub/dir'), {recursive:true});
+    writeFileSync(join(sibling, 'webtheme/sub/dir/x.md'), 'nested sibling');
     writeFileSync(join(sibling, 'plugs', 'credentials.txt'), 'PRIVATE');
     git('init', '-q'); git('add', '.');
     git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture');
@@ -1567,6 +1644,58 @@ describe('allowlisted sibling snapshots', () => {
   }
   afterEach(() => {if (parent) rmSync(parent, {recursive:true,force:true}); parent=undefined;});
 
+  it('allows implied directories for both rsync calls and anchors nested inventory paths', async () => {
+    const f = siblingsFixture();
+    mkdirSync(join(f.cwd, 'sub/dir'), {recursive:true});
+    writeFileSync(join(f.cwd, 'sub/dir/x.md'), 'nested primary');
+    f.listFiles.mockResolvedValue(['a.test.mjs', 'package-lock.json', 'vitest.shared.ts', 'sub/dir/x.md']);
+    expect(await runRemote(f)).toEqual({mode:'remote',code:0});
+    const copies = callsOf(f.exec).filter(call => call.file === 'rsync');
+    expect(copies).toHaveLength(2);
+    for (const copy of copies) {
+      expect(copy.args).not.toContain('--no-implied-dirs');
+      expect(copy.args).toEqual(expect.arrayContaining(['--no-recursive','--no-dirs','--no-links','--safe-links']));
+      expect(copy.args.at(-2)).toBe('./');
+    }
+    expect(copies[0].input.toString().split('\0')).toContain('./sub/dir/x.md');
+    expect(copies[1].input.toString().split('\0')).toContain('./webtheme/sub/dir/x.md');
+  });
+
+  it('stages both trees with public leaf modes inside a private root and preserves Forge directory access through real rsync', async () => {
+    const f = siblingsFixture();
+    chmodSync(join(sibling,'plugs/index.js'), 0o755);
+    git('add','.');
+    git('-c','user.name=Test','-c','user.email=test@example.invalid','commit','-qm','executable');
+    chmodSync(join(f.cwd,'a.test.mjs'), 0o711);
+    f.fs = restrictiveStageFs();
+    const fake = f.exec;
+    let copies = 0;
+    f.exec = vi.fn(async call => {
+      if (call.file === 'rsync') {
+        copies++;
+        expect(statSync(join(call.cwd,'..')).mode & 0o7777).toBe(0o700);
+        expect(statSync(call.cwd).mode & 0o7777).toBe(0o755);
+        const executable = call.args.at(-1).endsWith('/frontierui/') ? 'plugs/index.js' : 'a.test.mjs';
+        expectStageModes(call.cwd, executable);
+        const destination = join(parent,`copy-${copies}`);
+        mkdirSync(destination);
+        chmodSync(destination,0o755);
+        const args = call.args.filter((arg,i,all) => !arg.startsWith('--rsync-path=') && arg !== '-e' && all[i-1] !== '-e');
+        args[args.length-1] = destination+'/';
+        const result = spawnSync('rsync',args,{cwd:call.cwd,input:call.input,timeout:10000});
+        expect(result.status,result.stderr?.toString()).toBe(0);
+        expect(statSync(destination).mode & 0o7777).toBe(0o755);
+        expectStageModes(destination,executable);
+      }
+      return fake(call);
+    });
+    const result = await runRemote(f);
+    const transport = await Promise.allSettled(f.exec.mock.results.map(call => call.type === 'throw' ? Promise.reject(call.value) : call.value));
+    expect(transport.filter(call => call.status === 'rejected').map(call => call.reason?.stack ?? String(call.reason)), JSON.stringify(result)).toEqual([]);
+    expect(result, JSON.stringify(result)).toEqual({mode:'remote',code:0});
+    expect(copies).toBe(2);
+  });
+
   it('ships both tracked sibling subtrees from private staging and binds their SHA in the receipt', async () => {
     const f = siblingsFixture();
     const sha = git('rev-parse', 'HEAD');
@@ -1575,7 +1704,8 @@ describe('allowlisted sibling snapshots', () => {
     f.exec = vi.fn(async call => {
       if (call.file === 'rsync' && call.args.at(-1).endsWith('/frontierui/')) {
         copies++;
-        expect(statSync(call.cwd).mode & 0o777).toBe(0o700);
+        expect(statSync(call.cwd).mode & 0o777).toBe(0o755);
+        expect(statSync(join(call.cwd,'..')).mode & 0o777).toBe(0o700);
         expect(readFileSync(join(call.cwd, 'plugs/index.js'), 'utf8')).toContain('plugs');
         expect(call.input.toString()).toContain('./webtheme/index.js\0');
         expect(call.input.toString()).not.toContain('credentials');

@@ -289,13 +289,20 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
       let workStage;
       try {
         staging = await fs.mkdtemp(join(tmpdir(), 'forge-exec-stage-'));
-        await fs.chmod(staging, 0o700);
         workStage = manifest.siblings ? join(staging,'work') : staging;
-        await fs.mkdir(workStage,{recursive:true,mode:0o700});
+        const stageDirectory = async path => {
+          const mode = path === staging ? 0o700 : 0o755;
+          await fs.mkdir(path,{recursive:true,mode});
+          await fs.chmod(path,mode);
+          const st = await fs.lstat(path);
+          if (!st.isDirectory() || st.isSymbolicLink() || (st.mode & 0o7777) !== mode)
+            throw new Error('Invalid staging directory mode');
+        };
+        await stageDirectory(staging);
         const snapshots = [{source:cwd,destination:workStage,entries:manifest.entries}];
         if (manifest.siblings) snapshots.push({source:resolve(cwd,'../frontierui'),destination:join(staging,'frontierui'),entries:manifest.siblings.frontierui.entries});
         for (const snapshot of snapshots) {
-          await fs.mkdir(snapshot.destination,{recursive:true,mode:0o700});
+          await stageDirectory(snapshot.destination);
           const rootInfo = await fs.lstat(snapshot.source);
           if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) throw new Error('Unsafe staging root');
           for (const entry of snapshot.entries) {
@@ -306,7 +313,7 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
               destination = bytePath(destination, part);
               const st = await fs.lstat(source);
               if (st.isSymbolicLink() || (i === parts.length - 1 ? !st.isFile() : !st.isDirectory())) throw new Error('Unsafe staging source');
-              if (i < parts.length - 1) await fs.mkdir(destination, {recursive:true, mode:0o700});
+              if (i < parts.length - 1) await stageDirectory(destination);
             }
             // Pin the leaf and reject special files before reading; NONBLOCK also
             // prevents a raced-in FIFO from hanging admission before fstat.
@@ -314,7 +321,12 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
             try {
               const st = await fd.stat();
               if (!st.isFile() || !!(st.mode & 0o111) !== entry.executable) throw new Error('Invalid staging source');
-              await fs.writeFile(destination, await fd.readFile(), {flag:'wx', mode:0o600 | (st.mode & 0o111)});
+              const mode = entry.executable ? 0o755 : 0o644;
+              await fs.writeFile(destination, await fd.readFile(), {flag:'wx', mode});
+              await fs.chmod(destination, mode);
+              const staged = await fs.lstat(destination);
+              if (!staged.isFile() || staged.isSymbolicLink() || (staged.mode & 0o7777) !== mode)
+                throw new Error('Invalid staging file mode');
             } finally {await fd.close();}
             // Node has no openat: an ancestor can race the leaf open. Re-hashing
             // every staged byte against the verified public-content manifest
@@ -350,14 +362,18 @@ export async function runRemote({ argv, cwd = process.cwd(), env = process.env, 
         return {mode:'not-started',terminated:true,reason:'forge-runner-too-old'};
       // Transfer only staged leaves, retaining non-recursive rsync safeguards.
       // prepare creates a fresh work tree; deletion is unnecessary and requires
-      // directory transfer on older rsync implementations.
-      const copied = await exec({file:'rsync',args:['-a','--no-recursive','--no-dirs','--no-links','--safe-links','--no-implied-dirs','--exclude=.exit-code',
+      // directory transfer on older rsync implementations. Normalize directory
+      // attributes (including './') so the private 0700 staging root cannot
+      // close the pre-created Forge work directory to the ops runner. Staging
+      // already normalizes every mode; additive directory access avoids Apple
+      // openrsync's '=' parser corrupting file permission masks.
+      const copied = await exec({file:'rsync',args:['-a','--chmod=Da+rx','--no-recursive','--no-dirs','--no-links','--safe-links','--exclude=.exit-code',
         '--from0','--files-from=-','--rsync-path=sudo -u forge-exec rsync','-e',`ssh ${SSH_OPTIONS.join(' ')}`,
         './',`${host}:${ROOT}/${run}/work/`],cwd:workStage,input:inventory});
       if(copied.code !== 0) throw new Error('Copy failed');
       if (manifest.siblings) {
         const inventory = Buffer.concat(manifest.siblings.frontierui.entries.flatMap(entry => [Buffer.from('./'),entry.path,Buffer.from([0])]));
-        const siblingsCopied = await exec({file:'rsync',args:['-a','--no-recursive','--no-dirs','--no-links','--safe-links','--no-implied-dirs','--exclude=.exit-code',
+        const siblingsCopied = await exec({file:'rsync',args:['-a','--chmod=Da+rx','--no-recursive','--no-dirs','--no-links','--safe-links','--exclude=.exit-code',
           '--from0','--files-from=-','--rsync-path=sudo -u forge-exec rsync','-e',`ssh ${SSH_OPTIONS.join(' ')}`,
           './',`${host}:${ROOT}/${run}/frontierui/`],cwd:join(staging,'frontierui'),input:inventory});
         if (siblingsCopied.code !== 0) throw new Error('Sibling copy failed');

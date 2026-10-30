@@ -726,10 +726,11 @@ describe('certified snapshot equals selected inventory: Forge acceptance', () =>
     expect(manifestAPI.isTestFile(Buffer.from(path))).toBe(expected);
   });
 
-  it.each(['extra file','missing file','hash mismatch','extra test file','exec bit mismatch'])
+  it.each(['extra directory','extra file','missing file','hash mismatch','extra test file','exec bit mismatch'])
   ('rejects %s before installation even when inputDigest matches the current disk', async fault => {
     await writeFile(join(work,'identity.test.mjs'),'original assertion');
     Object.assign(request, await snapshot(['package-lock.json','identity.test.mjs']));
+    if (fault === 'extra directory') await mkdir(join(work,'unexpected'));
     if (fault === 'extra file') await writeFile(join(work,'extra.json'),'extra');
     if (fault === 'extra test file') await writeFile(join(work,'credentials.test.mjs'),'hidden assertion');
     if (fault === 'missing file') await rm(join(work,'identity.test.mjs'));
@@ -929,9 +930,10 @@ describe('sibling manifest verification', () => {
     expect((await runner.run(request)).code).toBe(3);
     expect(await runner.finish(request)).toMatchObject({siblingShas:request.siblingShas});
   });
-  it.each(['extra','missing','outside allowlist','wrong sha','missing sha','oversized'])
+  it.each(['extra','extra directory','missing','outside allowlist','wrong sha','missing sha','oversized'])
   ('rejects %s sibling evidence and writes protected rejected state before executing', async fault => {
     const sibling=await withSiblings();
+    if (fault==='extra directory') await mkdir(join(sibling,'plugs/unexpected'));
     if (fault==='extra') await writeFile(join(sibling,'plugs/extra.js'),'extra');
     if (fault==='missing') await rm(join(sibling,'webtheme/index.js'));
     if (fault==='outside allowlist') request.manifest.siblings.frontierui.paths=Buffer.from('other/index.js\0').toString('base64');
