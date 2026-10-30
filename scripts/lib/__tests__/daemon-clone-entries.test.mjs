@@ -137,19 +137,22 @@ it('refuses an unknown pass for this clone', () => {
   }) })).toThrow();
 });
 
-it.each(['scripts/daemon.mjs', './daemon.js', 'daemon.cjs', 'daemon.ts', 'relative/runner'])(
-  'R230 refuses a relative LaunchAgent entrypoint: %s', entry => {
+it.each(['scripts/daemon.mjs', './daemon.js', 'daemon.cjs', 'daemon.ts', 'relative/runner',
+  'daemon.mts', 'daemon.py', 'daemon.cts', 'daemon.tsx', '--import=./x', '--import=package',
+  '--require=./x', '--loader=./x', '--experimental-loader=./x', '--import', '--path=relative/file.js'])(
+  'refuses an unsupported LaunchAgent entrypoint/module argument: %s', entry => {
     const f = fixture();
     writeFileSync(join(f.launchAgentsDir, 'com.we.relative.plist'), 'plist');
     expect(() => cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
       stdout: JSON.stringify({ ProgramArguments: ['/usr/bin/env', 'node', entry] }),
-    }) })).toThrow('LaunchAgents relative entrypoint refused: com.we.relative.plist');
+    }) })).toThrow(`LaunchAgents unsupported entrypoint/module argument refused: com.we.relative.plist: ${entry}`);
   });
 
-it('R230 permits bare interpreters, option flags and numeric argument tokens', () => {
+it('permits node paths, absolute scripts, plain flags, pass names and numeric argument tokens', () => {
   const f = fixture();
   writeFileSync(join(f.launchAgentsDir, 'com.we.tokens.plist'), 'plist');
   expect(new Set(cloneRuntimeEntries({ ...f, run: () => ({ status: 0,
-    stdout: JSON.stringify({ ProgramArguments: ['/usr/bin/env', 'node', '--pass=x', '--path=relative/file.js', '42'] }),
-  }) }))).toEqual(new Set(DAEMON_ENTRY_MODULES));
+    stdout: JSON.stringify({ ProgramArguments: ['/usr/bin/env', 'node', '/usr/bin/node',
+      join(f.root, 'worker.mjs'), join(f.root, 'worker.js'), '-e', '--no-warnings', '--pass=NAME', '42'] }),
+  }) }))).toEqual(new Set([...DAEMON_ENTRY_MODULES, 'worker.mjs', 'worker.js']));
 });

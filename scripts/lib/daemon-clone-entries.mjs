@@ -46,9 +46,12 @@ export function cloneRuntimeEntries({ root, entries = [], env = process.env,
     if (!Array.isArray(args) || !args.length || args.some(arg => typeof arg !== 'string')) {
       throw new Error(`LaunchAgents ProgramArguments invalid: ${name}`);
     }
-    if (args.some(arg => !isAbsolute(arg) && !arg.startsWith('-')
-      && (arg.includes('/') || /\.(?:mjs|js|cjs|ts)$/i.test(arg)))) {
-      throw new Error(`LaunchAgents relative entrypoint refused: ${name}`);
+    for (const arg of args) {
+      if (isAbsolute(arg) || arg.startsWith('--pass=')) continue;
+      if (/^--(?:import|require|(?:experimental-)?loader)(?:=|$)/.test(arg)
+        || arg.includes('/') || /^\.{1,2}$/.test(arg) || /\.[a-z][a-z0-9]*$/i.test(arg)) {
+        throw new Error(`LaunchAgents unsupported entrypoint/module argument refused: ${name}: ${arg}`);
+      }
     }
     const paths = args.filter(isAbsolute).map(inside).filter(Boolean);
     for (const path of paths) out.add(path);

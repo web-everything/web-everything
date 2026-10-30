@@ -1,5 +1,5 @@
 import { it, expect, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -297,6 +297,38 @@ it('on adopts the scoped candidate and emits rebuild-adopted with closure-scope 
   expect(readRebuildState(f.root, env).adopted.applied[0]).toMatchObject({ resolvedVia: 'closure-scope', excluded: ['unused.mjs'] });
   expect(emitEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: 'rebuild-adopted',
     detail: expect.objectContaining({ resolvedVia: 'closure-scope' }) }), expect.anything());
+});
+
+it('smoke failure replans closure scope with all caller entry roots', async () => {
+  const f = fixture({ files: { 'other-entry.mjs': 'export {};\n' } });
+  f.ok(['checkout', '-q', '--detach', f.main]);
+  f.commit({ 'bad.mjs': 'throw new Error("bad overlay");\n' }, 'lane/b');
+  f.ok(['checkout', '-q', '-B', 'main', f.main]);
+  const state = mkdtempSync(join(tmpdir(), 'closure-replan-')); temps.push(state);
+  const env = { WE_DAEMON_STATE_DIR: join(state, 'state'), WE_DAEMON_OVERLAY_DIR: join(state, 'overlays'),
+    WE_DAEMON_CLONE_LOCK_ROOT: join(state, 'locks'), WE_DAEMON_AUTO_REBASE: '0',
+    WE_DAEMON_OVERLAY_AUTO_RETIRE: 'off', WE_DAEMON_CLOSURE_SCOPE: 'on', WE_DAEMON_OVERLAY_EDGE_RESOLVE: '0' };
+  for (const ref of ['lane/a', 'lane/b']) addOverlay(f.root, { ref, addedBy: 'test' }, { env });
+  vi.spyOn(edgeFetch, 'fetchMainAndOverlays').mockReturnValue({ ok: true, goneRefs: [],
+    refEvidence: new Map([['lane/a', 'refreshed'], ['lane/b', 'refreshed']]) });
+  const discovery = vi.spyOn(cloneEntries, 'cloneRuntimeEntries').mockImplementation(({ entries }) => entries);
+  const entries = ['entry.mjs', 'other-entry.mjs'];
+  const runSmoke = vi.fn(async ({ root }) => existsSync(join(root, 'bad.mjs'))
+    ? { verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'entry-boot',
+      detail: `exited 1: file://${root}/bad.mjs:1` }] } }
+    : { verdict: 'pass', attempts: 1, smoke: { results: [] } });
+  const result = await rebuildClone({ root: f.root, env, log: { error() {} },
+    run: (args, options) => f.git(args, options), prState: async () => null,
+    entries, skipCheck: null, asJob: false, versions: null, runSmoke,
+    dispatchSmoke: { settings: { dispatchSmoke: 'off' } }, emitEvent: vi.fn(),
+  });
+  expect(result).toMatchObject({ adopted: true, reason: 'overlay-set-aside' });
+  expect(runSmoke).toHaveBeenCalledTimes(2);
+  expect(discovery.mock.calls.length).toBeGreaterThan(1);
+  for (const [options] of discovery.mock.calls) expect(options.entries).toEqual(entries);
+  expect(readRebuildState(f.root, env).adopted.applied).toEqual([
+    expect.objectContaining({ ref: 'lane/a', resolvedVia: 'closure-scope', excluded: ['unused.mjs'] }),
+  ]);
 });
 
 it('closureScope mode cascades standard shadow, file, and environment with provenance', () => {

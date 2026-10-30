@@ -74,6 +74,21 @@ describe('resolveDaemonEntries', () => {
     expect(r.entries.map(entry => entry.entry)).toEqual(DAEMON_ENTRY_MODULES);
   });
 
+  it('falls back to booting the fixed entries in on mode when the candidate has no daemon entries', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'boot-smoke-on-fallback-'));
+    const booted = [];
+    try {
+      const r = await checkDaemonEntriesBoot({ root, env: {
+        HOME: root, WE_DAEMON_CLOSURE_SCOPE: 'on', WE_SMOKE_LIVE_CLONE: join(root, 'missing-live-clone'),
+      }, runChild: async (_cmd, args) => { booted.push(args[2]); return '{"ok":true}'; } });
+      expect(r.ok).toBe(true);
+      expect(r.entries.map(entry => entry.entry)).toEqual(DAEMON_ENTRY_MODULES);
+      expect(booted).toHaveLength(DAEMON_ENTRY_MODULES.length);
+      for (const entry of DAEMON_ENTRY_MODULES) expect(booted).toContain(buildEntryBootScript(entry));
+      expect(r.detail).toContain('daemon entries booted clean');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('fails closed on missing fixed entries in a real boot of a minimal clone', async () => {
     const root = mkdtempSync(join(tmpdir(), 'boot-smoke-missing-'));
     try {
