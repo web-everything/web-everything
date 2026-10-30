@@ -1,15 +1,16 @@
 ---
+bornAs: xjjk9v6
 kind: story
-size: 8
+size: 5
 status: open
-scope: ["we:scripts/lane-pool.mjs"]
+scope: ["we:scripts/lib/gh-throttle.mjs"]
 dateOpened: "2026-10-29"
 tags: []
 ---
 
-# Setting: lane clones share object store and node_modules
+# Setting: shared TTL'd GitHub PR snapshot across daemons
 
-Disk is 93 percent full; each of ~90 lane clones is ~1.2 GB. Add a policy-cascade setting (default off) so lane clones use a shared git object store and shared node_modules. Needs design (bigger item); prototype-loaded before merge (R228).
+Review, fix, drain, health-watch and reconcile each list the same PRs and checks every pass. Add a policy-cascade setting (default off) for one shared TTL'd snapshot built on we:scripts/lib/gh-throttle.mjs. Fail closed on stale or truncated data; prototype-loaded before merge (R228).
 
 ## Acceptance
 

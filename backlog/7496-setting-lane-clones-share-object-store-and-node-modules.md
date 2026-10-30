@@ -1,15 +1,16 @@
 ---
+bornAs: xf9pqgh
 kind: story
-size: 5
+size: 8
 status: open
-scope: ["we:scripts/lib/daemon-rebuild/candidate.mjs", "we:scripts/lib/daemon-rebuild/index.mjs"]
+scope: ["we:scripts/lane-pool.mjs"]
 dateOpened: "2026-10-29"
 tags: []
 ---
 
-# Setting: reuse one tested daemon candidate per main sha
+# Setting: lane clones share object store and node_modules
 
-When main moves, ~6 daemons each build and smoke-test their own candidate (we:scripts/lib/daemon-rebuild/, self-sync state under ~/.claude/daemon-self-sync-state/). Add a policy-cascade setting (default off = today's behaviour) that reuses one tested candidate per main sha. No guard weakening; one settings change turns it on/off; prototype-loaded on daemons before merge (R228).
+Disk is 93 percent full; each of ~90 lane clones is ~1.2 GB. Add a policy-cascade setting (default off) so lane clones use a shared git object store and shared node_modules. Needs design (bigger item); prototype-loaded before merge (R228).
 
 ## Acceptance
 

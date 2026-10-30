@@ -1,15 +1,16 @@
 ---
+bornAs: xmkxvv4
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/lib/gh-throttle.mjs"]
+scope: ["we:scripts/lib/daemon-rebuild/overlay-strategies.mjs", "we:scripts/lib/daemon-rebuild/auto-rebase.mjs"]
 dateOpened: "2026-10-29"
 tags: []
 ---
 
-# Setting: shared TTL'd GitHub PR snapshot across daemons
+# Setting: dedupe overlay-main-sync per clone and select tests from overlay changes
 
-Review, fix, drain, health-watch and reconcile each list the same PRs and checks every pass. Add a policy-cascade setting (default off) for one shared TTL'd snapshot built on we:scripts/lib/gh-throttle.mjs. Fail closed on stale or truncated data; prototype-loaded before merge (R228).
+Concurrent overlay-main-sync runs on one clone duplicate work, and main-sync test selection can exceed 100 tests and page the operator. Add a policy-cascade setting (default off) to run one sync per clone at a time and to select tests from the overlay's own changed files plus conflict-resolved files. No guard weakening; prototype-loaded before merge (R228).
 
 ## Acceptance
 

@@ -1,15 +1,16 @@
 ---
+bornAs: xn3xlpp
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/lib/daemon-rebuild/overlay-strategies.mjs", "we:scripts/lib/daemon-rebuild/auto-rebase.mjs"]
+scope: ["we:scripts/lib/daemon-rebuild/candidate.mjs", "we:scripts/lib/daemon-rebuild/index.mjs"]
 dateOpened: "2026-10-29"
 tags: []
 ---
 
-# Setting: dedupe overlay-main-sync per clone and select tests from overlay changes
+# Setting: reuse one tested daemon candidate per main sha
 
-Concurrent overlay-main-sync runs on one clone duplicate work, and main-sync test selection can exceed 100 tests and page the operator. Add a policy-cascade setting (default off) to run one sync per clone at a time and to select tests from the overlay's own changed files plus conflict-resolved files. No guard weakening; prototype-loaded before merge (R228).
+When main moves, ~6 daemons each build and smoke-test their own candidate (we:scripts/lib/daemon-rebuild/, self-sync state under ~/.claude/daemon-self-sync-state/). Add a policy-cascade setting (default off = today's behaviour) that reuses one tested candidate per main sha. No guard weakening; one settings change turns it on/off; prototype-loaded on daemons before merge (R228).
 
 ## Acceptance
 
