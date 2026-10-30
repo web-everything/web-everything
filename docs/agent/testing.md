@@ -865,11 +865,12 @@ Run these suites through the host heavy-admission queue.
 through the policy cascade; `WE_DAEMON_REBUILD_QUICK=1|0` overrides it. Quick candidates defer only
 `dispatch-dry-run` and `reconcile-dry-run`, take one smoke attempt without confirmation, and use a
 60-second finalize wait unless `WE_DAEMON_FINALIZE_LOCK_WAIT_MS` overrides it. The pure policy and
-protected path list live in `scripts/lib/daemon-rebuild/quick.mjs`. Diff or dispatch-closure evidence
-that is unknown, incomplete or oversized selects full smoke and logs why; both sides of a rename
-and both the old and candidate dispatch closures matter. Preserve their `bareDeps` and `jsonNames`
-evidence too: package manifests/locks and named JSON configs force full smoke through the shared
-closure-hit policy. Missing dependency evidence also requires full smoke.
+protected path list live in `scripts/lib/daemon-rebuild/quick.mjs`. Unknown, malformed or oversized
+change sets select full smoke. Gate code, dispatch entries, the shared dispatch core paths,
+dispatch settings and package manifests/locks always select full smoke. Transitive-only imports
+and unknown import closures do not block quick mode: the deferred checks still run after adoption
+with rollback. Each rebuild logs one `daemon-rebuild: quick=on|off reason=...` line and records a
+`quick-decision` alert, including the triggering protected file or disabled setting provenance.
 
 Keep quick provenance on ready records: adopting a partial pass as a full pass loses its owed soak.
 An already-HEAD quick fallback still persists its unverified marker and schedules the deferred checks;
@@ -886,10 +887,10 @@ back to the previous last-good record; an unsafe rollback quarantines rather tha
 Quick partial passes never enter the full-smoke proof cache. Regression home:
 `scripts/lib/__tests__/daemon-rebuild-quick.test.mjs` (private state/lock roots and injected children).
 
-Closure pipeline fixtures keep dispatch entry bytes identical while renaming, removing or adding a
-referenced dependency. Editing an entry would independently force full smoke and mask a missing
-old/candidate closure. Rename fixtures first prove Git recognizes the rename, then assert full smoke
-and an unmarked ready record so dropping either the old closure or the source endpoint is observable.
+Pipeline fixtures keep dispatch entry bytes identical while renaming, removing or adding a
+referenced dependency, and assert quick smoke and a marked ready record. Entry and gate-code
+changes retain full-smoke assertions. Decision visibility fixtures check enabled, disabled and
+protected-path outcomes in both the log and alerts file, with one decision across fallback stages.
 
 Cache-exclusion fixtures need complete, unskipped evidence and a full-mode positive control that actually
 inserts a proof; incomplete rows would independently prevent caching and mask a missing quick guard.

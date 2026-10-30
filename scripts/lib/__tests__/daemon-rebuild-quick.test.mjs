@@ -17,6 +17,7 @@ import { alertsFilePath, readReadyCandidate, readRebuildState, writeRebuildState
 import { completeSmokePass, smokeAndAdopt } from '../daemon-rebuild/smoke.mjs';
 import { finalizeRebuild } from '../daemon-rebuild/adopt.mjs';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
+import { DISPATCH_PATH_DEFAULTS } from '../daemon-rebuild/dispatch-paths.mjs';
 import { DISPATCH_DRY_RUN_CODE_ENTRIES, SMOKE_CHECKS, runLiveSmoke, runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
 
 vi.mock('../resource-admission.mjs', () => ({ shadowAdmission: vi.fn(), admit: vi.fn() }));
@@ -25,7 +26,7 @@ const temp = () => { const dir = mkdtempSync(join(tmpdir(), 'we-quick-')); dirs.
 afterEach(() => { vi.restoreAllMocks(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const sha = 'a'.repeat(40);
 const prevHead = 'b'.repeat(40);
-const closure = { complete: true, bareDeps: true, jsonNames: new Set(['dispatch-settings.json']), files: new Set([...DISPATCH_DRY_RUN_CODE_ENTRIES, 'scripts/operations/dispatch-lane.mjs']) };
+const closure = { complete: true, bareDeps: true, jsonNames: new Set(['dispatch-settings.json']), files: new Set([...DISPATCH_DRY_RUN_CODE_ENTRIES, 'scripts/lib/red-main-hold.mjs']) };
 const decision = (changedFiles, extra = {}) => decideQuick({ enabled: true, changedFiles, dispatchClosure: closure, ...extra });
 
 describe('quick mode policy (default OFF)', () => {
@@ -59,7 +60,10 @@ describe('quick mode policy (default OFF)', () => {
   it('permits an unrelated readable change', () => { expect(decision(['README.md']).quick).toBe(true); });
   it.each([
     ...DISPATCH_DRY_RUN_CODE_ENTRIES,
-    'scripts/operations/dispatch-lane.mjs',
+    ...DISPATCH_PATH_DEFAULTS.map(path => path.replaceAll('*', 'fixture')),
+    'scripts/lib/daemon-last-good.mjs', 'scripts/lib/quick-extra.mjs',
+    'scripts/lib/daemon-rebuild/quick.mjs', 'scripts/lib/daemon-rebuild/quick-soak-job.mjs',
+    'scripts/lib/daemon-rebuild/dispatch-paths.mjs',
     'scripts/lib/daemon-live-smoke.mjs', 'scripts/lib/daemon-boot-smoke.mjs',
     'scripts/lib/daemon-rebuild.mjs', 'scripts/lib/daemon-rebuild-extra.mjs',
     'scripts/lib/daemon-rebuild/smoke.mjs', 'scripts/lib/daemon-rebuild/nested/new.mjs',
@@ -70,22 +74,22 @@ describe('quick mode policy (default OFF)', () => {
     'always uses full smoke for dispatch package/config dependency: %s', path => {
       expect(decision([path])).toMatchObject({ quick: false, why: expect.stringContaining('protected') });
     });
-  it.each([
-    { bareDeps: undefined }, { bareDeps: null }, { jsonNames: undefined }, { jsonNames: [] },
-  ])('fails closed when dispatch dependency evidence is missing or malformed: %j', evidence => {
-    expect(decision(['README.md'], { dispatchClosure: { ...closure, ...evidence } }))
-      .toMatchObject({ quick: false, why: expect.stringContaining('unknown dispatch import closure') });
+  it.each([null, { complete: false }, { complete: true, files: [] },
+    { ...closure, bareDeps: undefined, jsonNames: undefined }])(
+    'does not consult unknown or incomplete dispatch closure evidence: %j', dispatchClosure => {
+      expect(decision(['scripts/lib/red-main-hold.mjs'], { dispatchClosure }).quick).toBe(true);
+      expect(decision([DISPATCH_DRY_RUN_CODE_ENTRIES[0]], { dispatchClosure }).quick).toBe(false);
+    });
+  it('allows a transitive-only dispatch dependency even with complete closure evidence', () => {
+    expect(decision(['scripts/lib/red-main-hold.mjs']).quick).toBe(true);
   });
-  it('exports a single protected path list including the dispatch entries', () => {
-    expect(QUICK_ALWAYS_FULL_PATHS).toEqual(expect.arrayContaining(DISPATCH_DRY_RUN_CODE_ENTRIES));
+  it('exports a single protected path list including the dispatch entries and shared dispatch core paths', () => {
+    expect(QUICK_ALWAYS_FULL_PATHS).toEqual(expect.arrayContaining([...DISPATCH_DRY_RUN_CODE_ENTRIES, ...DISPATCH_PATH_DEFAULTS]));
   });
-  it('fails closed on unknown/incomplete diff or dispatch evidence, with a full-path explanation', () => {
+  it('fails closed on unknown/incomplete diff evidence, with a full-path explanation', () => {
     for (const changedFiles of [null, ['../escape'], [null], new Array(10_001).fill('a')]) {
       expect(decision(changedFiles)).toMatchObject({ quick: false, why: expect.stringContaining('unknown') });
     }
-    expect(decision(['README.md'], { dispatchClosure: { ...closure, complete: false } }).quick).toBe(false);
-    expect(decision(['README.md'], { dispatchClosure: null }).quick).toBe(false);
-    expect(decision(['README.md'], { dispatchClosure: { complete: true, files: [] } }).quick).toBe(false);
   });
   it('quick finalize is bounded at 60s even after starvation, and an explicit finalize env wins', () => {
     expect(quickFinalizeWaitMs({ quick: true, env: {}, waitMs: 900_000 })).toBe(60_000);
@@ -406,15 +410,15 @@ const passed = () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } });
 const completePassed = () => ({ verdict: 'pass', attempts: 1,
   smoke: { results: SMOKE_CHECKS.map(({ name }) => ({ name, ok: true, ms: 0 })) } });
 
-const dependency = 'scripts/lib/quick-mode-test-dependency.mjs';
-const renamedDependency = 'scripts/lib/renamed-quick-mode-test-dependency.mjs';
+const dependency = 'scripts/lib/red-main-hold.mjs';
+const renamedDependency = 'scripts/lib/renamed-red-main-hold.mjs';
 function dependencyFixture(action) {
   return candidateFixture('README.md', '1', {
     seed: ({ write, git }) => {
       // Keep the dispatch entry identical across the move: editing it would independently force full
-      // smoke and hide a broken closure union. A literal lazy import may name a not-yet-present module.
+      // smoke and hide whether a transitive-only change allows quick mode.
       write(DISPATCH_DRY_RUN_CODE_ENTRIES[0],
-        "export async function checkDependency() { return import('../lib/quick-mode-test-dependency.mjs'); }\n");
+        "export async function checkDependency() { return import('../lib/red-main-hold.mjs'); }\n");
       if (action !== 'add') write(dependency, 'export const fixture = true;\n');
       git(['config', 'diff.renames', 'true']);
     },
@@ -426,18 +430,14 @@ function dependencyFixture(action) {
   });
 }
 
-async function expectDependencyFullSmoke(f) {
+async function expectDependencyQuickSmoke(f) {
   const options = smokeOptions(f);
   const runSmoke = vi.fn(async () => passed());
   await smokeAndAdopt({ ...options, runSmoke });
   expect(runSmoke).toHaveBeenCalledOnce();
-  expect(runSmoke.mock.calls[0][0]).not.toHaveProperty('singleAttempt');
-  expect(runSmoke.mock.calls[0][0]).not.toHaveProperty('deferredChecks');
-  // A protected-path explanation proves this is closure evidence, rather than an unknown-evidence fallback.
-  expect(options.log.error).toHaveBeenCalledWith(expect.stringContaining(`ignored — full path: protected code changed: ${dependency}`));
-  const ready = readReadyCandidate(f.root, f.env);
-  expect(ready).toMatchObject({ adopt: { finalSha: f.plan.finalSha } });
-  expect(ready).not.toHaveProperty('quick');
+  expect(runSmoke.mock.calls[0][0]).toMatchObject({ singleAttempt: true, deferredChecks: QUICK_DEFERRED_CHECKS });
+  expect(options.log.error).toHaveBeenCalledWith(expect.stringContaining('daemon-rebuild: quick=on reason='));
+  expect(readReadyCandidate(f.root, f.env)).toMatchObject({ quick: true, adopt: { finalSha: f.plan.finalSha } });
 }
 
 describe('quick mode through the existing candidate/adoption pipeline', () => {
@@ -450,6 +450,29 @@ describe('quick mode through the existing candidate/adoption pipeline', () => {
     expect(runSmoke.mock.calls[0][0]).not.toHaveProperty('deferredChecks');
     expect(readReadyCandidate(f.root, f.env)).not.toHaveProperty('quick');
     expect(readRebuildState(f.root, f.env).unverified).toBeNull();
+  });
+  it.each([
+    { path: 'README.md', setting: '0', quick: false, reason: 'disabled (source env)' },
+    { path: 'README.md', setting: '1', quick: true, reason: 'two dry-run checks deferred to post-adopt soak' },
+    { path: 'scripts/lib/daemon-last-good.mjs', setting: '1', quick: false,
+      reason: 'protected code changed: scripts/lib/daemon-last-good.mjs' },
+  ])('logs and persists exactly one quick decision: $path / $setting', async ({ path, setting, quick, reason }) => {
+    const f = candidateFixture(path, setting);
+    const options = smokeOptions(f);
+    const result = await smokeAndAdopt({ ...options, runSmoke: vi.fn(async () => passed()) });
+    const lines = options.log.error.mock.calls.map(([line]) => line).filter(line => line.startsWith('daemon-rebuild: quick'));
+    expect(lines).toEqual([`daemon-rebuild: quick=${quick ? 'on' : 'off'} reason=${reason}`]);
+    const detail = { quick, reason, ...(path !== 'README.md' ? { file: path } : {}) };
+    expect(result.alerts.filter(row => row.kind === 'quick-decision')).toEqual([{ kind: 'quick-decision', detail }]);
+    const rows = readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(rows.filter(row => row.kind === 'quick-decision')).toEqual([
+      { at: expect.any(String), kind: 'quick-decision', detail },
+    ]);
+  });
+  it('allows a transitive-only JSON config change', async () => {
+    await expectDependencyQuickSmoke(candidateFixture('config/other-settings.json', '1', { seed: ({ write }) => {
+      write(DISPATCH_DRY_RUN_CODE_ENTRIES[0], "export const config = 'other-settings.json';\n");
+    } }));
   });
   it('quick runs one pre-adopt smoke, carries its mark through ready adoption and launches soak', async () => {
     const f = candidateFixture();
@@ -492,18 +515,20 @@ describe('quick mode through the existing candidate/adoption pipeline', () => {
     expect(readReadyCandidate(quick.root, quick.env).quick).toBe(true);
     expect(readRebuildState(quick.root, quick.env).smokePassed).toBeNull();
   });
-  it.each(['scripts/lib/daemon-live-smoke.mjs', 'scripts/lib/daemon-rebuild/new.mjs', DISPATCH_DRY_RUN_CODE_ENTRIES[0]])(
+  it.each(['scripts/lib/daemon-live-smoke.mjs', 'scripts/lib/daemon-rebuild/new.mjs',
+    'scripts/lib/daemon-rebuild/quick.mjs', 'scripts/lib/daemon-last-good.mjs',
+    'scripts/operations/dispatch-lane.mjs', ...DISPATCH_DRY_RUN_CODE_ENTRIES])(
     'logs why quick is ignored and runs full for %s', async path => {
       const f = candidateFixture(path);
       const options = smokeOptions(f);
       const runSmoke = vi.fn(async () => passed());
       await smokeAndAdopt({ ...options, runSmoke });
       expect(runSmoke.mock.calls[0][0]).not.toHaveProperty('singleAttempt');
-      expect(options.log.error).toHaveBeenCalledWith(expect.stringContaining('ignored — full path: protected'));
+      expect(options.log.error).toHaveBeenCalledWith(expect.stringContaining('daemon-rebuild: quick=off reason=protected'));
       expect(readReadyCandidate(f.root, f.env)).not.toHaveProperty('quick');
     });
-  it.each(['package.json', 'package-lock.json', 'scripts/dispatch-settings.json', 'config/other-settings.json'])(
-    'retains package/config closure evidence through the pipeline for %s', async path => {
+  it.each(['package.json', 'package-lock.json', 'scripts/dispatch-settings.json'])(
+    'protects package/config paths through the pipeline for %s', async path => {
       const f = candidateFixture(path, '1', { seed: ({ write }) => {
         write(DISPATCH_DRY_RUN_CODE_ENTRIES[0],
           "import 'fixture-package';\nexport const configs = ['dispatch-settings.json', 'other-settings.json'];\n");
@@ -517,7 +542,7 @@ describe('quick mode through the existing candidate/adoption pipeline', () => {
       expect(options.log.error).toHaveBeenCalledWith(expect.stringContaining(`protected code changed: ${path}`));
       expect(readReadyCandidate(f.root, f.env)).not.toHaveProperty('quick');
     });
-  it('uses full smoke when the dispatch closure cannot be computed', async () => {
+  it('allows quick when the dispatch closure cannot be computed', async () => {
     const f = candidateFixture('README.md', '1', { seed: ({ write }) => {
       write(DISPATCH_DRY_RUN_CODE_ENTRIES[0], 'export const load = name => import(name);\n');
     } });
@@ -525,27 +550,26 @@ describe('quick mode through the existing candidate/adoption pipeline', () => {
     const runSmoke = vi.fn(async () => passed());
     await smokeAndAdopt({ ...options, runSmoke });
     expect(runSmoke).toHaveBeenCalledOnce();
-    expect(runSmoke.mock.calls[0][0]).not.toHaveProperty('deferredChecks');
-    expect(options.log.error).toHaveBeenCalledWith(expect.stringContaining('unknown dispatch import closure'));
-    expect(readReadyCandidate(f.root, f.env)).not.toHaveProperty('quick');
+    expect(runSmoke.mock.calls[0][0]).toMatchObject({ singleAttempt: true, deferredChecks: QUICK_DEFERRED_CHECKS });
+    expect(readReadyCandidate(f.root, f.env)).toMatchObject({ quick: true });
   });
-  it('protects both rename endpoints when a dispatch dependency is renamed outside the candidate closure', async () => {
+  it('allows quick when a transitive-only dispatch dependency is renamed', async () => {
     const f = dependencyFixture('rename');
-    // Prove Git recognizes the rename and would hide its protected source endpoint without --no-renames.
+    // Prove Git recognizes the rename; the quick diff still includes both endpoints.
     expect(f.git(['diff', '--name-only', '--find-renames=100%', f.prevHead, f.plan.finalSha])).toBe(renamedDependency);
     expect(f.git(['diff', '--name-only', '--no-renames', f.prevHead, f.plan.finalSha]).split('\n').sort())
       .toEqual([dependency, renamedDependency].sort());
-    await expectDependencyFullSmoke(f);
+    await expectDependencyQuickSmoke(f);
   });
-  it('protects the old dispatch closure when a dependency disappears from the candidate closure', async () => {
+  it('allows quick when a transitive-only dispatch dependency is removed', async () => {
     const f = dependencyFixture('remove');
     expect(f.git(['diff', '--name-only', f.prevHead, f.plan.finalSha])).toBe(dependency);
-    await expectDependencyFullSmoke(f);
+    await expectDependencyQuickSmoke(f);
   });
-  it('protects the candidate dispatch closure when a dependency was absent from the old closure', async () => {
+  it('allows quick when a transitive-only dispatch dependency is added', async () => {
     const f = dependencyFixture('add');
     expect(f.git(['diff', '--name-only', f.prevHead, f.plan.finalSha])).toBe(dependency);
-    await expectDependencyFullSmoke(f);
+    await expectDependencyQuickSmoke(f);
   });
   it('keeps plain-main fallback after a code-shaped quick failure and schedules its already-HEAD soak', async () => {
     const f = candidateFixture();
@@ -554,7 +578,10 @@ describe('quick mode through the existing candidate/adoption pipeline', () => {
     const runSmoke = vi.fn().mockResolvedValueOnce({ verdict: 'code', smoke: { results: [
       { name: 'daemon-entries-boot', ok: false, mayBeTransient: false, ms: 100, detail: 'TypeError: broken boot' },
     ] } }).mockResolvedValue(passed());
-    const result = await smokeAndAdopt({ ...smokeOptions(f), overlaysBefore: [{ ref: 'lane/work' }], runSmoke });
+    const options = smokeOptions(f);
+    const result = await smokeAndAdopt({ ...options, overlaysBefore: [{ ref: 'lane/work' }], runSmoke });
+    expect(options.log.error.mock.calls.filter(([line]) => line.startsWith('daemon-rebuild: quick'))).toHaveLength(1);
+    expect(result.alerts.filter(row => row.kind === 'quick-decision')).toHaveLength(1);
     expect(result.reason).toBe('fallback-plain-main');
     expect(runSmoke).toHaveBeenCalledTimes(2);
     expect(readReadyCandidate(f.root, f.env)).toMatchObject({ quick: true, kind: 'fallback', adopt: { finalSha: f.prevHead } });

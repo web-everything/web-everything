@@ -2,20 +2,26 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { closureHits } from '../import-closure.mjs';
+import { DISPATCH_PATH_DEFAULTS } from './dispatch-paths.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 import { DISPATCH_DRY_RUN_CODE_ENTRIES } from '../daemon-live-smoke.mjs';
 
 export const QUICK_ENV = 'WE_DAEMON_REBUILD_QUICK';
 export const QUICK_DEFERRED_CHECKS = Object.freeze(['dispatch-dry-run', 'reconcile-dry-run']);
 export const QUICK_SOAK_CHECKS = Object.freeze([...QUICK_DEFERRED_CHECKS, 'tree-stays-clean']);
-/** One authoritative protected path list; dispatch entries also expand to their import closure. */
+/** One authoritative protected path list; transitive dispatch imports are covered by the post-adopt soak. */
 export const QUICK_ALWAYS_FULL_PATHS = Object.freeze([
   'scripts/lib/daemon-rebuild/**',
   'scripts/lib/daemon-rebuild*.mjs',
   'scripts/lib/daemon-live-smoke.mjs',
   'scripts/lib/daemon-boot-smoke.mjs',
+  'scripts/lib/daemon-last-good.mjs',
+  'scripts/lib/quick*.mjs',
   ...DISPATCH_DRY_RUN_CODE_ENTRIES,
+  ...DISPATCH_PATH_DEFAULTS,
+  'dispatch-settings.json', '**/dispatch-settings.json',
+  'package.json', '**/package.json',
+  'package-lock.json', '**/package-lock.json',
 ]);
 export const QUICK_SOAK_MAX_MS = 60 * 60_000;
 const SETTINGS_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'daemon-rebuild-settings.json');
@@ -40,24 +46,14 @@ const matches = (path, pattern) => {
   return new RegExp(`^${escaped.join('.*')}$`).test(path);
 };
 
-/** Unknown or oversized evidence falls back to full smoke; callers log this reason when enabled. */
-export function decideQuick({ enabled = false, changedFiles, dispatchClosure } = {}) {
+/** Unknown or oversized evidence falls back to full smoke; callers log the decision once per rebuild. */
+export function decideQuick({ enabled = false, changedFiles } = {}) {
   if (enabled !== true) return { quick: false, why: 'disabled' };
   if (!Array.isArray(changedFiles) || changedFiles.length > 10_000 || !changedFiles.every(safePath)) {
     return { quick: false, why: 'unknown or oversized change set — full smoke required' };
   }
-  const dispatchFiles = dispatchClosure?.files instanceof Set ? dispatchClosure.files : null;
-  const dependencyEvidence = typeof dispatchClosure?.bareDeps === 'boolean' && dispatchClosure?.jsonNames instanceof Set;
-  const protectedPath = changedFiles.find(path => QUICK_ALWAYS_FULL_PATHS.some(pattern => matches(path, pattern))
-    || dispatchFiles?.has(path));
-  if (protectedPath) return { quick: false, why: `protected code changed: ${protectedPath}` };
-  if (dispatchClosure?.complete !== true || !dispatchFiles
-    || !dependencyEvidence
-    || !DISPATCH_DRY_RUN_CODE_ENTRIES.every(entry => dispatchFiles.has(entry))) {
-    return { quick: false, why: 'unknown dispatch import closure — full smoke required' };
-  }
-  const dependencyHit = closureHits({ closure: dispatchClosure, changedFiles })?.[0];
-  if (dependencyHit) return { quick: false, why: `protected code changed: ${dependencyHit}` };
+  const protectedPath = changedFiles.find(path => QUICK_ALWAYS_FULL_PATHS.some(pattern => matches(path, pattern)));
+  if (protectedPath) return { quick: false, why: `protected code changed: ${protectedPath}`, file: protectedPath };
   return { quick: true, why: 'two dry-run checks deferred to post-adopt soak' };
 }
 

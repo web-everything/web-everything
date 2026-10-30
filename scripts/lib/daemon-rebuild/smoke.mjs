@@ -21,8 +21,7 @@ import { candidateSmokeEnv, materializeCandidate, removeCandidate } from './cand
 import { hostname } from 'node:os';
 import { pinnedStatus, planRebuild } from './plan.mjs';
 import { runBounded } from '../bounded-child.mjs';
-import { SMOKE_CHECKS, DISPATCH_DRY_RUN_CODE_ENTRIES } from '../daemon-live-smoke.mjs';
-import { collectImportClosure } from '../import-closure.mjs';
+import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
 import { decideQuick, resolveQuick, QUICK_DEFERRED_CHECKS, quickFinalizeWaitMs } from './quick.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
@@ -354,9 +353,9 @@ export async function smokeAndAdopt({
   };
   const alertsList = [];
   const nowIso = () => new Date(now()).toISOString();
-  const alert = (kind, detail) => {
+  const alert = (kind, detail, message) => {
     alertsList.push({ kind, detail });
-    log.error?.(`daemon-rebuild: ${kind}${detail !== undefined ? ` ${JSON.stringify(detail)}` : ''}`);
+    log.error?.(message ?? `daemon-rebuild: ${kind}${detail !== undefined ? ` ${JSON.stringify(detail)}` : ''}`);
     try {
       const file = alertsFilePath(root, stEnv);
       mkdirSync(dirname(file), { recursive: true });
@@ -439,6 +438,18 @@ export async function smokeAndAdopt({
     return d.status === 0 ? String(d.stdout ?? '').split('\n').map((x) => x.trim()).filter(Boolean) : null;
   };
 
+  // Independent of skip-unchanged evidence. Preserve both rename endpoints and unusual path names.
+  const quickDecisionFor = sha => {
+    const diff = quickSetting.quick ? git(['diff', '--name-only', '-z', '--no-renames', prevHead, sha]) : null;
+    return decideQuick({ enabled: quickSetting.quick,
+      changedFiles: diff?.status === 0 ? String(diff.stdout ?? '').split('\0').filter(Boolean) : null });
+  };
+  const primaryDecision = quickDecisionFor(plan.finalSha);
+  const decisionWhy = primaryDecision.why === 'disabled' ? `disabled (source ${quickSetting.source})` : primaryDecision.why;
+  alert('quick-decision', { quick: primaryDecision.quick, reason: decisionWhy,
+    ...(primaryDecision.file ? { file: primaryDecision.file } : {}) },
+    `daemon-rebuild: quick=${primaryDecision.quick ? 'on' : 'off'} reason=${decisionWhy}`);
+
   /** Materialize `sha` as the candidate worktree, smoke it, tear it down. */
   let primaryQuick = false;
   const smokeSha = async (sha, changedFiles, label, suspects = [], { failFast = [] } = {}) => {
@@ -460,28 +471,9 @@ export async function smokeAndAdopt({
     if (!candidate.ok) return { worktreeFailed: candidate.reason };
     let quick = false;
     if (quickSetting.quick && !(label === 'last-good' && !primaryQuick)) {
-      // Independent of skip-unchanged evidence: even an unknown adopted state must inspect the actual move.
-      // --no-renames includes both endpoints; NUL output preserves unusual Git path names.
-      const diff = git(['diff', '--name-only', '-z', '--no-renames', prevHead, sha]);
-      const files = diff.status === 0 ? String(diff.stdout ?? '').split('\0').filter(Boolean) : null;
-      let dispatchClosure = null;
-      try {
-        const before = collectImportClosure({ root, entries: DISPATCH_DRY_RUN_CODE_ENTRIES });
-        const after = collectImportClosure({ root: candidate.path, entries: DISPATCH_DRY_RUN_CODE_ENTRIES });
-        dispatchClosure = { files: new Set([...(before?.files ?? []), ...(after?.files ?? [])]),
-          bareDeps: before?.bareDeps || after?.bareDeps,
-          jsonNames: new Set([...(before?.jsonNames ?? []), ...(after?.jsonNames ?? [])]),
-          complete: before?.complete === true && after?.complete === true
-            && typeof before.bareDeps === 'boolean' && typeof after.bareDeps === 'boolean'
-            && before.jsonNames instanceof Set && after.jsonNames instanceof Set
-            && DISPATCH_DRY_RUN_CODE_ENTRIES.every(entry => before.files.has(entry) && after.files.has(entry)) };
-      } catch { /* full */ }
-      const decision = decideQuick({ enabled: true, changedFiles: files, dispatchClosure });
+      const decision = label == null ? primaryDecision : quickDecisionFor(sha);
       quick = decision.quick;
-      log.error?.(`daemon-rebuild: quick mode ${quick ? 'on' : 'ignored — full path'}: ${decision.why}`);
       if (quick) { changedFiles = null; proven = false; }
-    } else if (quickSetting.quick) {
-      log.error?.('daemon-rebuild: quick mode ignored — full path: last-good control for a full-mode candidate');
     }
     if (label == null) primaryQuick = quick;
     if (proven && quickSetting.quick) log.error?.(`daemon-rebuild: smoke reused from ${proven.passedAt} on tree ${identity.tree} (env checks re-run)`);
