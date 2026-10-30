@@ -2279,3 +2279,149 @@ describe('smoke dry-run settings', () => {
     expect(listing.args).toEqual(['scripts/lane-pool.mjs', 'list', '--acquirable', ...(mode === 'off' ? ['--no-cache'] : []), '--limit=1', '--json']);
   });
 });
+
+
+describe('boot smoke shared budget and full-cap timeout classification', () => {
+  let diagnosticsDir;
+  beforeEach(() => { diagnosticsDir = mkdtempSync(join(tmpdir(), 'boot-timeout-diag-')); });
+  afterEach(() => rmSync(diagnosticsDir, { recursive: true, force: true }));
+  async function replay({ left = 1275, failure = 'timeout' } = {}) {
+    let t = 0;
+    let bootCalls = 0;
+    const defaults = withNewCheckDefaults(async (_cmd, args) => args[1] === 'list' ? '[]' : args[1] === 'acquire' ? '{"lane":1}' : '');
+    const runChild = budgetedRunChild({ deadline: 100000, now: () => t, runChild: async (cmd, args, opts) => {
+      if (String(args[2] ?? '').includes('daemon-boot-smoke:entry-boot')) {
+        bootCalls++;
+        if (failure === 'import' && bootCalls === 1) return '{"ok":false,"error":"SyntaxError: broken import"}';
+        if (failure === 'crash' && bootCalls === 1) throw Object.assign(new Error('exited 1'), { status: 1 });
+        t += opts.timeoutMs;
+        throw new Error(`timed out after ${opts.timeoutMs}ms (process group killed)`);
+      }
+      const out = await defaults(cmd, args, opts);
+      if (String(args[2] ?? '') === DISPATCH_DRY_RUN_SCRIPT) t = 100000 - left;
+      return out;
+    } });
+    const smoke = await runLiveSmoke({ root: '/x', env: { WE_SMOKE_LOAD_SCALE: '0', WE_SMOKE_BOOT_CONCURRENCY: '1',
+      WE_SMOKE_DAEMON_ENTRIES: Array.from({ length: 7 }, (_, i) => `fixture-${i}.mjs`).join(',') },
+      runChild, clock: () => t });
+    return { row: smoke.results.find(r => r.name === 'daemon-entries-boot'), bootCalls };
+  }
+
+  it('marks the seven 1275ms refusals as budget interrupted without spawning boot children', async () => {
+    const { row, bootCalls } = await replay();
+    expect(bootCalls).toBe(0);
+    expect(row.budgetInterrupted).toBe(true);
+    expect(row.detail).toContain('skipped: rebuild smoke budget exhausted (1275ms left)');
+    expect(row.detail).not.toContain('timed out');
+  });
+
+  it.each(['import', 'crash'])('preserves a genuine %s failure mixed with timeouts and budget refusals', async (failure) => {
+    const { row } = await replay({ left: 55000, failure });
+    expect(row.ok).toBe(false);
+    expect(row.budgetInterrupted).toBeUndefined();
+    expect(isEnvTimeoutRow(row)).toBe(false);
+    expect(classifySmokeFailure([row])).toBe('code');
+  });
+
+  it('refuses an immediate boot kill even after another entry consumed a full cap', async () => {
+    const { checkDaemonEntriesBoot } = await import('../daemon-boot-smoke.mjs');
+    let t = 0;
+    let calls = 0;
+    const result = await checkDaemonEntriesBoot({ root: '/x', diagnosticsDir, now: () => t,
+      env: { WE_SMOKE_DAEMON_ENTRIES: 'slow.mjs,fast.mjs', WE_SMOKE_BOOT_CONCURRENCY: '1' },
+      budgets: { daemonBootMs: 45000 }, runChild: async () => {
+        t += calls++ === 0 ? 45000 : 1;
+        throw new Error('timed out after 45000ms (process group killed)');
+      } });
+    const row = { name: 'daemon-entries-boot', ...result, ms: t };
+    expect(isEnvTimeoutRow(row)).toBe(false);
+    expect(isEnvTimeoutFailureSet([row])).toBe(false);
+    expect(classifySmokeFailure([row])).toBe('code');
+  });
+
+  it('refuses a 120s boot cap with only 30s elapsed and accepts full-cap elapsed', () => {
+    const entry = { ok: false, kind: 'child failed: timed out after 120000ms (process group killed)',
+      timeoutMs: 120000, elapsedMs: 30000 };
+    const row = { name: 'daemon-entries-boot', ok: false, ms: 120000, entries: [entry] };
+    expect(isEnvTimeoutRow(row)).toBe(false);
+    expect(isEnvTimeoutRow({ ...row, entries: [{ ...entry, elapsedMs: 107999 }] })).toBe(false);
+    expect(isEnvTimeoutRow({ ...row, entries: [{ ...entry, elapsedMs: 108000 }] })).toBe(true);
+    expect(isEnvTimeoutRow({ ...row, entries: [{ ...entry, elapsedMs: 120000 }] })).toBe(true);
+  });
+
+  it('refuses a SIGSEGV attempt followed by a full-cap boot timeout', async () => {
+    const { checkDaemonEntriesBoot } = await import('../daemon-boot-smoke.mjs');
+    let t = 0;
+    let calls = 0;
+    const result = await checkDaemonEntriesBoot({ root: '/x', diagnosticsDir, now: () => t,
+      env: { WE_SMOKE_DAEMON_ENTRIES: 'crash.mjs', WE_SMOKE_BOOT_SIGNAL_RETRIES: '1' },
+      budgets: { daemonBootMs: 45000 }, runChild: async () => {
+        if (calls++ === 0) throw Object.assign(new Error('native crash'), { signal: 'SIGSEGV' });
+        t += 45000;
+        throw new Error('timed out after 45000ms (process group killed)');
+      } });
+    expect(calls).toBe(2);
+    expect(result.entries[0].attempts).toHaveLength(2);
+    expect(result.entries[0].attempts[0].signal).toBe('SIGSEGV');
+    expect(result.entries[0].kind).toBe('child failed: timed out after 45000ms (process group killed)');
+    const row = { name: 'daemon-entries-boot', ...result, ms: t };
+    expect(isEnvTimeoutRow(row)).toBe(false);
+    expect(isEnvTimeoutFailureSet([row])).toBe(false);
+    expect(classifySmokeFailure([row])).toBe('code');
+  });
+
+  it('requires full-cap timeout evidence for every recorded boot attempt', () => {
+    const timeout = { ok: false, kind: 'child failed: timed out after 45000ms (process group killed)',
+      timeoutMs: 45000, elapsedMs: 45000 };
+    const row = { name: 'daemon-entries-boot', ok: false, entries: [timeout] };
+    expect(isEnvTimeoutRow(row)).toBe(true); // Historical entries without attempts still use their own evidence.
+    expect(isEnvTimeoutRow({ ...row, entries: [{ ...timeout, attempts: [timeout, timeout] }] })).toBe(true);
+    for (const attempt of [null, {}, { ...timeout, kind: 'import failed' },
+      { ...timeout, kind: 'child failed', signal: 'SIGSEGV' },
+      { ...timeout, elapsedMs: 1 }, { ...timeout, elapsedMs: undefined },
+      { ...timeout, timeoutMs: undefined },
+      { ...timeout, kind: 'child failed: timed out after 1ms (process group killed)', timeoutMs: 1 }]) {
+      expect(isEnvTimeoutRow({ ...row, entries: [{ ...timeout, attempts: [attempt, timeout] }] })).toBe(false);
+    }
+    for (const attempts of [[], null, {}]) {
+      expect(isEnvTimeoutRow({ ...row, entries: [{ ...timeout, attempts }] })).toBe(false);
+    }
+  });
+
+  it('requires complete per-entry elapsed evidence at the boot timeout threshold', () => {
+    const entry = { ok: false, kind: 'child failed: timed out after 10000ms (process group killed)',
+      timeoutMs: 10000, elapsedMs: 9000 };
+    const row = { name: 'daemon-entries-boot', ok: false, ms: 90000, entries: [entry] };
+    expect(isEnvTimeoutRow(row)).toBe(true);
+    expect(isEnvTimeoutRow({ ...row, entries: [{ ...entry, elapsedMs: 5000 }] }, { minElapsedMs: 5000 })).toBe(false);
+    for (const elapsedMs of [undefined, null, NaN, Infinity, '9000', -1, 1, 8999]) {
+      expect(isEnvTimeoutRow({ ...row, entries: [{ ...entry, elapsedMs }] })).toBe(false);
+    }
+  });
+
+  it('classifies full-cap boot timeouts as env-timeout and refuses incomplete or mixed evidence', async () => {
+    const { checkDaemonEntriesBoot } = await import('../daemon-boot-smoke.mjs');
+    let t = 0;
+    const result = await checkDaemonEntriesBoot({ root: '/x', env: {}, budgets: { daemonBootMs: 45000 },
+      diagnosticsDir, now: () => t, runChild: async () => {
+        t += 45000;
+        throw new Error('timed out after 45000ms (process group killed)');
+      } });
+    const row = { name: 'daemon-entries-boot', ...result, ms: t };
+    expect(isEnvTimeoutRow(row)).toBe(true);
+    expect(isEnvTimeoutFailureSet([row])).toBe(true);
+    // Aggregate elapsed time is redundant: each failed entry supplies its own full-cap evidence.
+    expect(isEnvTimeoutRow({ ...row, ms: 300 })).toBe(true);
+    expect(isEnvTimeoutRow({ ...row, entries: [] })).toBe(false);
+    expect(isEnvTimeoutRow({ ...row, entries: undefined })).toBe(false);
+    expect(isEnvTimeoutRow({ ...row, entries: [null] })).toBe(false);
+    expect(isEnvTimeoutRow({ ...row, entries: [{ ...row.entries[0], timeoutMs: undefined }] })).toBe(false);
+    expect(isEnvTimeoutRow({ ...row, entries: row.entries.map((entry, i) => i === 0
+      ? { ...entry, kind: 'import failed' } : entry) })).toBe(false);
+    for (const kind of ['import failed', 'child failed', 'unparsable child output',
+      'child failed: timed out after 1275ms (process group killed)',
+      'child failed: timed out after 1ms (process group killed)']) {
+      expect(isEnvTimeoutRow({ ...row, entries: [{ ...row.entries[0], kind }] })).toBe(false);
+    }
+  });
+});
