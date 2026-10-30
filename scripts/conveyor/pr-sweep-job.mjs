@@ -71,11 +71,16 @@ export function runSweepWorker(input, { timeoutMs = 15 * 60000, WorkerClass = Wo
     let settled = false;
     const finish = (fn, value) => { if (settled) return; settled = true; clearTimeout(timer); fn(value); };
     const timer = setTimeout(() => {
-      // Ignore termination's late events, and keep the caller alive until the worker has shut down.
+      // Ignore late events. Give normal shutdown a grace period, bounded even during native calls.
       if (settled) return;
       settled = true;
       const error = new Error(`PR sweep worker timed out after ${timeoutMs}ms`);
-      worker.terminate().then(() => fail(error), () => fail(error));
+      const terminationGraceTimer = setTimeout(() => {
+        worker.unref();
+        fail(error);
+      }, 1000);
+      const terminated = () => { clearTimeout(terminationGraceTimer); fail(error); };
+      Promise.resolve().then(() => worker.terminate()).then(terminated, terminated);
     }, timeoutMs);
     worker.once('message', (r) => finish(done, r));
     worker.once('error', (e) => finish(fail, e));
