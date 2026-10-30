@@ -22,6 +22,7 @@ import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { createActionStore } from '../operations/action-store.mjs';
 import { actionResource } from '../operations/action-record.mjs';
+import { isQuotaError } from '../lib/provider-quota-hold.mjs';
 
 // Match we:scripts/conveyor/rearm-review.mjs#REARM_COMMENT_MARKER locally: importing it closes a daemon boot cycle.
 // The equality test keeps this first-line matcher tied to the canonical marker.
@@ -41,39 +42,66 @@ export function reviewRunEvidence(run) {
   const head = read?.netBasis?.rev;
   // A rewind drops the referral result. Use the saved pass until this pass finishes referralVerdict; an unrelated
   // advisory failure must not hide a successful persist behind the saved persistence failure (PR #5771).
-  const ownAdvise = run.stepTimings?.find(t => t.step === 'advise')?.finishedAt;
+  const ownAdvise = run.stepTimings?.find(t => t?.step === 'advise')?.finishedAt;
   const resuming = Boolean(run.resumeOf) && !ownAdvise;
   const ownReferral = resuming && run.findings?.referralVerdict
-    ? run.stepTimings?.find(t => t.step === 'referralVerdict')?.finishedAt : undefined;
+    ? run.stepTimings?.find(t => t?.step === 'referralVerdict')?.finishedAt : undefined;
   const savedReferral = resuming && !ownReferral;
+  const effects = (savedReferral ? run.resumeOf.mandatoryReferrals : run.findings?.mandatoryReferrals)?.effects;
+  const state = Array.isArray(effects) ? effects.find(e => e?.type === 'review.mandatory-referrals')?.result : undefined;
+  const records = Array.isArray(state?.records) ? state.records : [];
   const verdict = savedReferral ? run.resumeOf.verdict : run.findings?.referralVerdict ?? run.verdict;
   const finish = ownAdvise ?? ownReferral ?? run.resumeOf?.adviseFinishedAt;
   // A resumed run starts again at the resume: the rulings that woke it are answered. Only once the pass is finished,
   // though: an unfinished resume has answered nothing yet, and must stay wakeable by the ruling that started it.
-  const startedAt = Math.max(Date.parse(run.stepTimings?.find(t => t.step === 'read')?.startedAt),
+  const startedAt = Math.max(Date.parse(run.stepTimings?.find(t => t?.step === 'read')?.startedAt),
     resuming ? 0 : Date.parse(run.resumedAt ?? '') || 0);
   // An interrupted persist retry still spends a slot. Start its next backoff at the latest resume, rather than
   // the original parked pass: after an outage that old deadline could spend every remaining slot on adjacent ticks.
   const completedAt = Math.max(Date.parse(finish),
     resuming && verdict?.pendingReferrals?.includes('referral-persistence-failed') ? Date.parse(run.resumedAt ?? '') || 0 : 0);
+  // Only unambiguous persisted quota evidence for every failed seat exempts an attempt.
+  // Unfinished seats, missing evidence, conflicting failures, and attempts that reached post-seat steps still count.
+  let quotaOnly = false;
+  try {
+    // Quota errors at the seats cannot explain a later crash or unreadable step evidence.
+    const validStepTimings = Number.isFinite(completedAt) || !run.stepTimings?.some(t => t == null
+      || (['reduce', 'mandatoryReferrals', 'referralVerdict', 'advise'].includes(t?.step) && t?.startedAt != null));
+    const validEffects = effects === undefined || (Array.isArray(effects) && effects.every(e => e != null));
+    const validRecords = state == null || (Array.isArray(state.records)
+      && records.every(r => r != null && typeof r === 'object' && !Array.isArray(r)));
+    const failures = records.filter(r => r?.failure != null).map(r => r.failure);
+    const failedSeats = Array.isArray(run.seatTimings) ? run.seatTimings.filter(t => t?.verdict === 'error') : [];
+    const telemetry = run.telemetry;
+    // Repeated calls to the same seat each need their own persisted quota row.
+    const failuresBySeat = new Map();
+    for (const t of failedSeats) failuresBySeat.set(t.seat, (failuresBySeat.get(t.seat) ?? 0) + 1);
+    quotaOnly = validStepTimings && validEffects && validRecords && failedSeats.length > 0 && Array.isArray(telemetry) && failures.every(isQuotaError)
+      && run.seatTimings.every(t => t?.verdict && t?.finishedAt)
+      && failedSeats.every(t => {
+        if (typeof t.seat !== 'string' || t.seat.length === 0) return false;
+        const rows = telemetry.filter(row => row?.step === t.seat);
+        return rows.length >= failuresBySeat.get(t.seat) && rows.every(row => row.failureKind === 'provider-quota');
+      });
+  } catch { /* unreadable step or seat evidence cannot establish a quota-only attempt */ }
   if (!sha(head) || !Number.isFinite(startedAt)) return null;
   if (!Number.isFinite(completedAt)) {
     // Crashes before/during advise still consumed a retry. Keep them in the cached projection, without
     // inventing a completed panel or clean referral evidence for acceptance/carry readers.
     return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt: null,
-      incomplete: true, parked: false, attempted: false, persistenceFailed: false, count: 0,
+      incomplete: true, quotaOnly, parked: false, attempted: false, persistenceFailed: false, count: 0,
       pending: ['review-incomplete'], rulings: [] };
   }
-  const state = (savedReferral ? run.resumeOf.mandatoryReferrals : run.findings?.mandatoryReferrals)?.effects?.find(e => e.type === 'review.mandatory-referrals')?.result;
   const pending = verdict?.pendingReferrals ?? [];
   const resumeAdvise = Boolean(resuming && ownReferral && !pending.includes('referral-persistence-failed'));
   const findingKeys = pending.filter(key => !PENDING_REASON_TOKENS.has(key));
-  const attempted = new Set((state?.records ?? [])
-    .filter(r => r.repo === read.repo && r.pr === Number(read.pr) && r.head === head && r.attempted)
+  const attempted = new Set(records
+    .filter(r => r?.repo === read.repo && r.pr === Number(read.pr) && r.head === head && r.attempted)
     .flatMap(r => r.referrals.map(f => f.key)));
   // PR #5520 — a run started under a chosen `--run-id` says so in its record (`run-record.mjs#chosenRunIdRecord`).
   // Inline, not a helper: the disk cache is keyed by this function's source.
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
+    quotaOnly,
     ...(resumeAdvise ? { resumeAdvise: true } : {}),
     ...(run.idChosen === true ? { custom: true } : {}),
     parked: verdict?.verdict === 'needs-human' && pending.length > 0,
@@ -81,7 +109,7 @@ export function reviewRunEvidence(run) {
     pending, attempted: findingKeys.length > 0 && findingKeys.every(key => attempted.has(key)),
     persistenceFailed: pending.includes('referral-persistence-failed'),
     count: pending.includes('referral-persistence-failed') ? Math.max(1, verdict?.referrals?.length ?? 0) : findingKeys.length,
-    rulings: (state?.records ?? []).flatMap(r => r.rulings ?? []).map(r => JSON.stringify(r)),
+    rulings: records.flatMap(r => r?.rulings ?? []).map(r => JSON.stringify(r)),
     // How many times this run was already resumed to retry a failed referral persist (card 5752 below). Each such
     // resume is one spent slot of the 15/30/60 retry budget, though it stays the same run.
     persistRetries: Math.max(0, Number(run.resumeOf?.persistRetries) || 0),
@@ -110,7 +138,8 @@ export const REVIEW_EVIDENCE_CACHE_FILE = '.review-run-evidence.cache';
 export const REVIEW_HEAD_CACHE_FILE = '.review-run-heads.cache';
 /** A warm process with at most this many changed records parses them directly instead of the whole on-disk file. */
 export const EVIDENCE_DISK_MIN_MISSES = 32;
-const projectionCode = project => createHash('sha256').update(String(project)).digest('hex').slice(0, 16);
+const projectionCode = project => createHash('sha256').update(String(project))
+  .update(project === reviewRunEvidence ? String(isQuotaError) : '').digest('hex').slice(0, 16);
 function readEvidenceDiskCache(file, code) {
   try {
     const c = JSON.parse(readFileSync(file, 'utf8'));
@@ -403,7 +432,7 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   needsPerson = p => pausedReferralNeedsPerson(p, { repo }) } = {}) {
   const max = resolveSameHeadMaxReviews(env);
   if (max === 0) return null;
-  const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid);
+  const history = runs.filter(r => !(r.incomplete && r.quotaOnly) && r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid);
   // Newer incomplete attempts own retry accounting, including after an older parked review was released.
   // A fresh head can also crash on EVERY attempt and must still reach the exhausted needs-you hold.
   const last = latestReviewAttempt(history);
