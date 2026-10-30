@@ -1449,6 +1449,7 @@ process.exit(${standardsExit});
     const env = { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}`, LANE_POOL_ROOT: join(dir, 'pool'), WE_HEAVY_ADMISSION_CAP: '1', WE_VERIFY_PHASE_ADMISSION: phaseAdmission, WE_VERIFY_STANDARDS: 'always', TMPDIR: join(dir, 'tmp'), ...(guard ? { WE_VERIFY_ALWAYS_RUN_TESTS: guardExcluded ? 'guard.test.mjs,excluded.test.mjs' : 'guard.test.mjs' } : {}) };
     function invoke(args = [], extraEnv = {}) {
       const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, env: { ...env, ...extraEnv }, encoding: 'utf8' });
+      expect(result.signal, result.stderr).toBeNull();
       return { code: result.status, json: JSON.parse(result.stdout.trim().split('\n').at(-1)), stdout: result.stdout, stderr: result.stderr };
     }
     return { files, invoke, calls: () => readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) };

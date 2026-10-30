@@ -42,6 +42,46 @@ describe('escaped-descendant listings (PR #5768)', () => {
 });
 
 describe('startTreeWatchdog (PR #5768)', () => {
+  it.each([false, true])('stop() drains an in-flight heartbeat import without terminating its isolate (fired: %s)', async (fire) => {
+    // A real subprocess keeps a native worker-loader crash from taking down Vitest itself.
+    const dir = mkdtempSync(join(tmpdir(), 'tree-watchdog-stop-import-'));
+    try {
+      const heartbeat = join(dir, 'heartbeat.mjs');
+      writeFileSync(heartbeat, `import { workerData } from 'node:worker_threads';
+const state = workerData.heartbeat.args.state;
+Atomics.store(state, 0, 1);
+await new Promise((r) => setTimeout(r, 450));
+Atomics.store(state, 0, 2);
+export const beat = () => Atomics.add(state, 1, 1);
+`);
+      const probe = join(dir, 'probe.mjs');
+      writeFileSync(probe, `import { spawn } from 'node:child_process';
+import { startTreeWatchdog } from ${JSON.stringify(pathToFileURL(resolve(process.cwd(), 'scripts/lib/tree-watchdog.mjs')).href)};
+const victim = spawn(process.execPath, ['-e', ${JSON.stringify(keepAliveScript())}], { stdio: 'ignore' });
+const exited = new Promise((r) => victim.once('exit', r));
+const state = new Int32Array(new SharedArrayBuffer(8));
+const warned = [];
+const watchdog = startTreeWatchdog({ pid: victim.pid, timeoutMs: ${fire ? 100 : 5_000}, warn: (m) => warned.push(m),
+  heartbeat: { module: ${JSON.stringify(pathToFileURL(heartbeat).href)}, exportName: 'beat', args: { state }, everyMs: 10 } });
+try {
+  const until = Date.now() + 5_000;
+  while (Atomics.load(state, 0) === 0 && Date.now() < until) await new Promise((r) => setTimeout(r, 5));
+  const entered = Atomics.load(state, 0);
+  while (${fire} && !watchdog.fired() && Date.now() < until) await new Promise((r) => setTimeout(r, 5));
+  const firstStop = watchdog.stop();
+  const secondStop = watchdog.stop();
+  await Promise.all([firstStop, secondStop]);
+  console.log(JSON.stringify({ entered, completed: Atomics.load(state, 0), beats: Atomics.load(state, 1), fired: watchdog.fired(), alive: victim.exitCode === null && victim.signalCode === null, warned }));
+} finally { victim.kill('SIGKILL'); await exited; }
+`);
+      const result = spawnSync(process.execPath, [probe], { encoding: 'utf8', timeout: 15_000 });
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout.trim())).toEqual({ entered: 1, completed: 2, beats: 0, fired: fire, alive: !fire, warned: [] });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it('kills the tree from its own thread while the main thread is blocked, and heartbeats only until then', async () => {
     const child = spawn(process.execPath, ['-e', keepAliveScript()], { stdio: 'ignore' });
     const exited = new Promise((r) => child.once('exit', (code, signal) => r(signal)));

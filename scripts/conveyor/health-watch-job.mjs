@@ -31,7 +31,8 @@ import { execFileSync, spawn } from 'node:child_process';
 import { closeSync, constants as fsConstants, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { isMainThread, parentPort, Worker, workerData } from 'node:worker_threads';
+import { isMainThread, parentPort, workerData } from 'node:worker_threads';
+import { runDeadlineWorker, workerDeadlineReady } from '../lib/worker-deadline.mjs';
 
 import { readGit } from '../lib/proc-read.mjs';
 import { createJobStore, enqueueJob, launchJob, reattachTick, runJob } from '../lib/daemon-jobs-runtime.mjs';
@@ -47,7 +48,7 @@ import {
 const SELF = fileURLToPath(import.meta.url);
 const SOURCE_ROOT_DEFAULT = resolve(SELF, '..', '..', '..');
 
-/** A gh-probe worker that has not answered after this long is terminated and the step fails (the runtime retries). */
+/** Probe deadline: cancel startup or terminate ready work, then fail the step after worker exit (the runtime retries). */
 export const GH_PROBE_TIMEOUT_MS = 10 * 60_000;
 /** Finished, consumed records older than this are pruned (record, log, result). */
 export const FINISHED_JOB_KEEP_MS = 24 * 60 * 60_000;
@@ -496,21 +497,14 @@ export async function runGhProbeJobs({
 
 /**
  * Run the probe group in a worker thread, so this process's event loop stays free to heartbeat. Rejects on a
- * worker error, a non-zero exit, or `timeoutMs` (the worker is terminated first).
+ * worker error, an exit without a result, or a deadline. A timed-out startup drains its imports and skips
+ * probing; ready synchronous work is terminated. Both paths wait for worker exit before rejecting.
  */
 export function runProbeWorker({ input, timeoutMs = GH_PROBE_TIMEOUT_MS, workerUrl = new URL(import.meta.url) }) {
-  return new Promise((resolveRun, reject) => {
-    const worker = new Worker(workerUrl, { workerData: { [WORKER_MARK]: true, input } });
-    let settled = false;
-    const done = (fn, v) => { if (settled) return; settled = true; clearTimeout(timer); fn(v); };
-    const timer = setTimeout(() => {
-      // Settle first: terminating fires the worker's own 'exit', which must not be reported as a crash.
-      done(reject, new Error(`gh probe worker timed out after ${timeoutMs}ms`));
-      worker.terminate().catch(() => {});
-    }, timeoutMs);
-    worker.once('message', (msg) => done(resolveRun, msg));
-    worker.once('error', (e) => done(reject, e));
-    worker.once('exit', (code) => done(reject, new Error(`gh probe worker exited (${code}) without a result`)));
+  return runDeadlineWorker(workerUrl, {
+    workerData: { [WORKER_MARK]: true, input }, timeoutMs,
+    timeoutMessage: `gh probe worker timed out after ${timeoutMs}ms`,
+    exitMessage: (code) => `gh probe worker exited (${code}) without a result`,
   });
 }
 
@@ -528,6 +522,7 @@ export async function ghProbeStep({ jobId, input, dir = process.env.OPERATION_RU
 async function workerMain() {
   const { input } = workerData;
   if (input?.proofBlockMs) {
+    if (!await workerDeadlineReady(workerData, parentPort)) return;
     // Live proof only (`enqueue-proof`): block THIS thread on a real synchronous subprocess, exactly the way a
     // probe's `execFileSync('gh', …)` does — so the proof exercises heartbeat continuity and process-group teardown.
     execFileSync('sleep', [String(Math.max(1, Math.round(Number(input.proofBlockMs) / 1000)))], { stdio: 'ignore' });
@@ -536,6 +531,7 @@ async function workerMain() {
   }
   const { collectGhProbes } = await import('./health-watch.mjs');
   const { scrubDeep } = await import('./health-watch-core.mjs');
+  if (!await workerDeadlineReady(workerData, parentPort)) return;
   parentPort.postMessage(scrubDeep(collectGhProbes(input)));
 }
 
