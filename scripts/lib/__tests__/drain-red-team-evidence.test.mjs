@@ -42,6 +42,16 @@ describe('historical fallback predicate clauses', () => {
 });
 
 describe('drain reads actual head-bound review scheduler inputs', () => {
+  it.each(['failed', { status: 'failed' }])('holds a failed red-team result with no scorecard row after append failure: %j', result => {
+    const f = fixture();
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished', result }, f);
+    const evidence = readDrainRedTeamEvidence(f);
+    expect(evidence).toMatchObject({ recorded: false, seatRecorded: false, completedRecorded: false,
+      failedSeatCount: 0, inFlight: false, status: { status: 'finished', result } });
+    expect(redTeamEnqueueHold({ ...f, ...evidence, comments: [] })).toMatch(/no recorded result/);
+    expect(evidence.scheduled).toBe(true);
+  });
+
   it.each(['missing status', 'real panel status', 'same-head panel', 'different-head panel'])(
     'unfinished journal discovery handles %s without manufacturing a verdict', kind => {
       const f = fixture(), from = 'a'.repeat(40);

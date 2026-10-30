@@ -74,6 +74,8 @@ import { createRunnerActivityReader, createRunnerActivityCliStores } from './run
 import { daemonStatusOperation, DAEMON_STATUS_OP } from './daemon-status.mjs';
 import { collectDaemonStatus } from './daemon-status-io.mjs';
 import { heavyQueueOperation, HEAVY_QUEUE_OP } from './heavy-queue.mjs';
+import { hostCapacityOperation, HOST_CAPACITY_OP, finishHostCapacity } from './host-capacity.mjs';
+import { collectHostCapacity } from '../readiness/host-capacity.mjs';
 import { collectHeavyQueue } from './heavy-queue-io.mjs';
 import { resourceStatusOperation, RESOURCE_STATUS_OP, finishResourceStatus } from './resource-status.mjs';
 import { readSnapshot, loadResourcePolicy } from '../lib/resource-admission.mjs';
@@ -402,6 +404,12 @@ export const OPERATIONS = Object.freeze({
   [DAEMON_STATUS_OP]: () => ({
     declaration: daemonStatusOperation({ collect: collectDaemonStatus }),
     sinks: {},
+  }),
+  // R258 — measured CPU/memory capacity; read-only, no effect sinks.
+  [HOST_CAPACITY_OP]: () => ({
+    declaration: hostCapacityOperation({ collect: collectHostCapacity }),
+    sinks: {},
+    finish: finishHostCapacity,
   }),
   // Card xb0iuxq (epic #4075, under #3383) — the mechanical "who's holding/waiting on the heavy-admission pool"
   // report (the operator's own hand-built report, made mechanical). Read-only, same no-sinks reasoning as

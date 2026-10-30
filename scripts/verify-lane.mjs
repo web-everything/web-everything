@@ -56,6 +56,7 @@
  * accepted; 2 = red (suites failed — marker recorded red) / `check` verdict not-ok; 3 = usage / git error (no
  * marker written) / `request` refused because no verify daemon is alive / `reset` refused because a FOREIGN lease is live (own live lease no longer refuses, #3378).
  */
+import './lib/tools-root-guard.mjs';
 import { resolveBuildPolicy } from './lib/build-policy.mjs';
 import { redFirstWarning } from './lib/tests-first-policy.mjs';
 import { RUNNER_LOCK_ROOT, runnerLeaseStatus, probeRunnerLeaseLiveness } from '../skills-src/conveyor/runner-lock.mjs';

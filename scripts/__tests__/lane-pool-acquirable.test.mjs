@@ -105,6 +105,34 @@ describe('lane-pool list --acquirable (#2426)', () => {
     expect(listLanes(['--acquirable'])).toEqual([1]);
   });
 
+  it('offers salvage-preserved ahead commits, but refuses unpushed commits and real dirt', () => {
+    provision(1);
+    const lane = join(poolRoot, 'acqtest', 'lane-1');
+    const commit = text => {
+      writeFileSync(join(lane, 'file.txt'), text);
+      git(['add', 'file.txt'], lane);
+      git(['-c', 'user.email=t@t.com', '-c', 'user.name=t', '-c', 'commit.gpgSign=false',
+        'commit', '--quiet', '-m', text], lane);
+      return git(['rev-parse', 'HEAD'], lane);
+    };
+    // Probe live containment each time: publishing refs does not change the lane's memo fingerprint.
+    const first = commit('first salvage commit\n');
+    const second = commit('second salvage commit\n');
+    expect(git(['rev-list', '--count', 'origin/main..HEAD'], lane)).toBe('2');
+    expect(listLanes(['--acquirable', '--no-cache', '--no-verdict-memo'])).toEqual([]);
+    // Copy objects locally without a push/fetch; advertise both SHAs as remote salvage heads.
+    const pack = execFileSync('git', ['pack-objects', '--stdout', '--revs'], { cwd: lane, input: `${second}\n` });
+    execFileSync('git', ['--git-dir=' + originDir, 'index-pack', '--stdin'], { input: pack });
+    git(['update-ref', 'refs/heads/salvage/lane-1-20261030-1200', first], originDir);
+    git(['update-ref', 'refs/heads/salvage/lane-1-20261030-1201', second], originDir);
+    expect(listLanes(['--acquirable', '--no-cache', '--no-verdict-memo'])).toEqual([1]);
+    writeFileSync(join(lane, 'file.txt'), 'real uncommitted work\n');
+    expect(listLanes(['--acquirable', '--no-cache', '--no-verdict-memo'])).toEqual([]);
+    git(['checkout', '--', 'file.txt'], lane);
+    commit('third unpushed commit\n');
+    expect(listLanes(['--acquirable', '--no-cache', '--no-verdict-memo'])).toEqual([]);
+  });
+
   it('a STALE lease does NOT drop the lane (reclaimable ⇒ acquirable)', () => {
     provision(1);
     leaseLane(1, { ttlMinutes: 0 }); // an already-stale lease (0-minute TTL) is reclaimable, so not "held"
