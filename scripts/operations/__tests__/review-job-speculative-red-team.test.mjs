@@ -79,6 +79,94 @@ function jobIo({ verdict = 'accept', setting = { value: 'on', enabled: true, sou
 const kinds = (calls) => calls.filter((c) => c[0] !== 'log').map((c) => c[0]);
 
 describe('runReviewJob under review.speculativeRedTeam', () => {
+  const counters = calls => calls.filter(c => c[0] === 'log' && c[1].includes('speculative-red-team counters:')).map(c => c[1]);
+
+  it.each(['usage limit', 'weekly limit', 'outage', 'queue cap', 'seat quota hold'])('skips speculation for a current infra block: %s', error => {
+    const { io, calls } = jobIo({ over: {
+      now: () => NOW,
+      readPrevCompletion: () => ({ status: 'done', outcome: 'blocked-on-infra', label: error, sessionId: 'historical-job', updatedAt: new Date(NOW - 1000).toISOString() }),
+      runLoop: () => ({ status: 1, stdout: JSON.stringify({ stopped: 'step-refused', error }), stderr: '' }),
+    } });
+    const out = runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
+    expect(out.outcome).toBe('blocked-on-infra');
+    expect(kinds(calls)).not.toContain('start');
+    expect(kinds(calls)).not.toContain('sequential');
+    expect(out.redTeam).toBeUndefined();
+    expect(counters(calls)).toEqual([expect.stringContaining('started=0 used=0 discarded-infra=0 discarded-parked=0 discarded-bounced=0 stale=0 skipped-infra=1')]);
+  });
+
+  it('starts beside the loop with a read sink and finishes with the jurors findings', () => {
+    const p = payload('accept');
+    p.findings.judge.findings = [{ summary: 'juror finding', file: 'x.mjs' }];
+    let started = false;
+    const { io, calls } = jobIo({ over: {
+      runLoop: o => { expect(started).toBe(true); expect(o.readSink).toBe('/jobs/sink.json'); return { status: 0, stdout: JSON.stringify(p), stderr: '' }; },
+      startSpeculativeRedTeam: o => { started = true; expect(o.loopPayload).toBeUndefined(); return { pid: 4242, readSink: '/jobs/sink.json', startedAt: Date.now() }; },
+      finishSpeculativeRedTeam: o => { expect(o.loopPayload).toEqual(p); return { status: 'ran', foldedVerdict: 'accept' }; },
+    } });
+    const out = runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
+    expect(out.redTeamSpeculative.decision).toBe('finish');
+    expect(counters(calls)).toEqual([expect.stringContaining('started=1 used=1 discarded-infra=0 discarded-parked=0 discarded-bounced=0 stale=0 skipped-infra=0')]);
+  });
+
+  it('fails closed on unreadable infra evidence, leaving the review itself running', () => {
+    const { io, calls } = jobIo({ over: { reviewInfraBlock: () => { throw Error('unreadable'); } } });
+    runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
+    expect(kinds(calls)).not.toContain('start');
+    expect(kinds(calls)).toContain('loop');
+    expect(counters(calls)).toEqual([expect.stringContaining('skipped-infra=1')]);
+  });
+
+  it.each(['usage limit', 'weekly limit', 'outage', 'queue cap', 'seat quota hold'])('discards and counts infra first discovered by the loop: %s', error => {
+    const { io, calls } = jobIo({ over: {
+      reviewInfraBlock: () => null,
+      runLoop: () => ({ status: 1, stdout: JSON.stringify({ stopped: 'step-refused', error }), stderr: '' }),
+    } });
+    expect(runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io).outcome).toBe('blocked-on-infra');
+    expect(kinds(calls)).toEqual(['start', 'cancel', 'discard-row', 'cleanup']);
+    expect(counters(calls)).toEqual([expect.stringContaining('started=1 used=0 discarded-infra=1 discarded-parked=0 discarded-bounced=0 stale=0 skipped-infra=0')]);
+  });
+
+  it.each([['parked', 'needs-human'], ['bounced', 'changes']])('counts discarded-%s', (outcome, verdict) => {
+    const { io, calls } = jobIo({ verdict, over: {
+      runLoop: () => ({ status: 0, stdout: JSON.stringify({ ...payload(verdict), stopped: outcome === 'parked' ? 'confirm' : 'complete' }), stderr: '' }),
+    } });
+    expect(runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io).outcome).toBe(outcome);
+    expect(counters(calls)).toEqual([expect.stringContaining(`discarded-${outcome}=1`)]);
+  });
+
+  it('counts a stale read and falls back to sequential completion', () => {
+    const { io, calls } = jobIo({ finish: { status: 'stale', reason: 'different read' } });
+    runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
+    expect(kinds(calls)).toContain('sequential');
+    expect(counters(calls)).toEqual([expect.stringContaining('stale=1 skipped-infra=0')]);
+  });
+
+  it('uses the shared infra cooloff and resumes after expiry', () => {
+    for (const expired of [false, true]) {
+      const { io, calls } = jobIo({ over: {
+        now: () => NOW,
+        readPrevCompletion: () => ({ status: 'done', outcome: 'blocked-on-infra', label: 'lane-deferrals:3', updatedAt: new Date(NOW - (expired ? 24 * 60 * 60_000 : 1_000)).toISOString() }),
+      } });
+      runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
+      expect(kinds(calls).includes('start')).toBe(expired);
+    }
+  });
+
+  it('the real infra reader reuses quota holds and queue admission and refuses unreadable state', () => {
+    const make = overrides => createReviewJobIo({ env: {}, readSeatRecords: () => [],
+      seatAvailable: p => p === 'codex', queueBaseline: () => ({ slots: 1, backlogMinutes: 0, maxWaitMinutes: 1000 }), ...overrides });
+    expect(make({}).reviewInfraBlock()).toBeNull();
+    const quota = provider => [{ provider, dispatchKind: 'review-seat', status: 'quota-exhausted', scoredAt: new Date().toISOString(), quotaResetsAt: new Date(Date.now() + 3600_000).toISOString() }];
+    expect(make({ readSeatRecords: () => quota('claude') }).reviewInfraBlock()).toContain('quota exhausted');
+    expect(make({ readSeatRecords: () => quota('codex') }).reviewInfraBlock()).toContain('quota-held');
+    // The shared queue policy exempts review work; do not invent a second cap.
+    expect(make({ queueBaseline: () => ({ slots: 1, backlogMinutes: 1000, maxWaitMinutes: 1 }) }).reviewInfraBlock()).toBeNull();
+    expect(() => make({ queueBaseline: () => ({ bypassed: 'error' }) }).reviewInfraBlock()).toThrow('unreadable');
+    expect(() => make({ readSeatRecords: () => null }).reviewInfraBlock()).toThrow('unreadable');
+    expect(() => make({ queueBaseline: () => ({}) }).reviewInfraBlock()).toThrow('incomplete');
+  });
+
   it('the actual carry comment releases queue admission without starting another review or red team', () => {
     const head = 'b'.repeat(40);
     const comments = [
@@ -377,15 +465,31 @@ describe('speculateRedTeam + finishSpeculativeRedTeam', () => {
     expect(posts).toEqual([]);
   });
 
-  it('an accept whose jurors raised findings is stale: the sequential brief lists them, the speculative one could not', async () => {
-    const { io, rows, posts } = seatsIo();
+  it.each([false, true])('marks juror overlap before folding without clearing a blocking red-team finding (duplicate=%s)', async duplicate => {
+    const { io, posts } = seatsIo();
     const pass = await speculateRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', read: read(), env: {}, resume: false }, io);
     const p = payload('accept');
-    p.findings.judge.findings = [{ summary: 'f(0) divides by zero', file: 'x.mjs' }];
+    p.findings.judge.findings = [duplicate ? { ...BREAK } : { summary: 'a separate issue', file: 'other.mjs' }];
     const r = await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload: p, pass, env: {} }, io);
-    expect(r.status).toBe('stale');
-    expect(rows).toEqual([]);
-    expect(posts).toEqual([]);
+    expect(r.status).toBe('ran');
+    expect(r.findings[0].confirmedByClaude).toBe(duplicate);
+    expect(r.seat.findings[0].confirmedByClaude).toBe(duplicate);
+    expect(r.foldedVerdict).toBe('changes');
+    expect(r.confirmedMissCount).toBe(1);
+    expect(posts).toHaveLength(1);
+  });
+
+  it('uses a pass briefed with the final juror findings instead of declaring it stale', async () => {
+    const { io, posts } = seatsIo();
+    const p = payload('accept');
+    p.findings.judge.findings = [{ summary: 'f(0) divides by zero', file: 'x.mjs' }];
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', read: p.findings.read,
+      claudeFindings: p.findings.judge.findings, env: {}, resume: false }, io);
+    expect((await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload: p, pass, env: {} }, io)).status).toBe('ran');
+    expect(posts).toHaveLength(1);
+    const different = payload('accept', read('c'.repeat(40)));
+    different.findings.judge.findings = p.findings.judge.findings;
+    expect((await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload: different, pass, env: {} }, io)).status).toBe('stale');
   });
 
   it('finishing a non-accept is refused (not owed) — the speculative pass never posts on changes', async () => {

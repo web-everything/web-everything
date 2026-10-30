@@ -296,6 +296,7 @@ describe('existing-card IO', () => {
     expect(labelSyncs).toEqual([{ repo, pr: PR, head: HEAD }]);
     expect(warnings).toEqual([`red-team-status-label-miss: ${repo}#${PR}: label service unavailable`]);
   });
+  // Cold TypeScript import + IO parsing exceed 5s under Forge self-hosted parallel load (run 40944695769, shard 4).
   it('operation IO rulableBreaks and liveResultGateState call sites pass standing-ruling scope explicitly', async () => {
     const { default: ts } = await import('typescript');
     const dir = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -324,7 +325,7 @@ describe('existing-card IO', () => {
     }
     expect(calls.length).toBeGreaterThan(0);
     expect(missingScope).toEqual([]);
-  });
+  }, 60_000);
   it('pre-write refuses every selected break when only part of the selection is still held', () => {
     const findings = [1, 2].map(n => ({ summary: `confirmed break ${n}`, category: 'edge-case', impactIfUnfixed: 'broken', confirmedByRecheck: true }));
     const initial = [redTeam(HEAD, findings), capped()];

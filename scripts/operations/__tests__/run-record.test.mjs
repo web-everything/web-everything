@@ -11,6 +11,35 @@ import { describe, it, expect } from 'vitest';
 import { newRunRecord, normalizeJudgeTelemetry, validateRunRecord } from '../run-record.mjs';
 
 describe('normalizeJudgeTelemetry — a failed seat keeps its spawn evidence', () => {
+  it('keeps string failureKind and failureText alongside existing telemetry', () => {
+    expect(normalizeJudgeTelemetry({ step: 'judgeSecurity', stepIndex: 2, telemetry: {
+      failureKind: 'provider-quota', failureText: "You've hit your weekly limit",
+      sessionId: 's', exitCode: 1, attempts: 1,
+    } })).toMatchObject({
+      step: 'judgeSecurity', stepIndex: 2, failureKind: 'provider-quota',
+      failureText: "You've hit your weekly limit", sessionId: 's', exitCode: 1, attempts: 1,
+    });
+  });
+
+  it('caps oversized failureText at 500 characters', () => {
+    const row = normalizeJudgeTelemetry({ telemetry: {
+      failureKind: 'provider-quota', failureText: 'x'.repeat(501),
+    } });
+    expect(row.failureKind).toBe('provider-quota');
+    expect(row.failureText).toBe('x'.repeat(500));
+  });
+
+  it('preserves failureText at the 500-character boundary', () => {
+    expect(normalizeJudgeTelemetry({ telemetry: { failureText: 'x'.repeat(500) } }).failureText)
+      .toBe('x'.repeat(500));
+  });
+
+  it.each([null, 7, true, {}, []])('drops non-string failure classification fields: %j', value => {
+    const row = normalizeJudgeTelemetry({ telemetry: { failureKind: value, failureText: value } });
+    expect(row).not.toHaveProperty('failureKind');
+    expect(row).not.toHaveProperty('failureText');
+  });
+
   it('keeps exitCode, attempts, signal, stderrTail and failure', () => {
     const row = normalizeJudgeTelemetry({
       step: 'judgeSecurity', stepIndex: 2,
