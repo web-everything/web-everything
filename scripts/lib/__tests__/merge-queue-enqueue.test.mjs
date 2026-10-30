@@ -45,6 +45,19 @@ describe('merge queue enqueue', () => {
     expect(() => buildEnqueueArgs({ nodeId: 'PR_1' })).toThrow(/head SHA required/);
   });
 
+  it.each(['exact', 'numbering', 'mechanical'])('enqueues a licensed human-only hold (%s)', tier => {
+    const result = enqueuePr({ repo: 'o/r', num: 7, headSha: HEAD, cwd: CWD,
+      exec: execFor({ files: ['.github/workflows/ci.yml'], mutation: JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E' } } } }) }),
+      humanOnlyLicense: hold => { expect(hold.humanOnly).toBe(true); return { licensed: true, tier, reason: 'proven' }; } });
+    expect(result).toMatchObject({ ok: true, licensedBy: tier });
+  });
+
+  it.each([undefined, () => ({ licensed: false, reason: 'no approval' }), () => { throw Error('unreadable'); }])('keeps a human-only hold without a proven license', humanOnlyLicense => {
+    const result = enqueuePr({ repo: 'o/r', num: 7, headSha: HEAD, cwd: CWD,
+      exec: execFor({ files: ['.github/workflows/ci.yml'] }), humanOnlyLicense });
+    expect(result).toMatchObject({ ok: false, held: true, humanOnly: true });
+  });
+
   it('reads the node id and file list, then enqueues exactly the judged head', () => {
     const calls = [];
     const entry = { id: 'E', position: 1, state: 'QUEUED' };

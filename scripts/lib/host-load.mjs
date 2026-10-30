@@ -9,11 +9,18 @@
  */
 import { createHash } from 'node:crypto';
 import * as os from 'node:os';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, lstatSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import * as childProcess from 'node:child_process';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { loadHostOverloadSettings, hostStateRoot, boundedText, DEFAULT_MIN_MEMORY_HEADROOM_MB } from './host-overload-settings.mjs';
+import { LEASE_FILENAME } from './lane-lease.mjs';
+
+// GC has no reason to reclaim even a stale lease. Unknown markers/IO refuse work too.
+function gcLeaseProtected(lane) {
+  try { lstatSync(join(lane, '.git', LEASE_FILENAME)); return true; }
+  catch (error) { return error.code !== 'ENOENT'; }
+}
 /** Subprocess fixtures may supply a reading only under Vitest. Production always samples the host.
  * Keep the source injectable so tests can also prove the real-source fallback without sampling the host.
  */
@@ -164,12 +171,14 @@ export function scheduledLaneGc(lanes, { stateRoot = hostStateRoot(), exec = chi
       let ran = false;
       let failures = 0;
       for (const lane of lanes) {
+        if (gcLeaseProtected(lane)) { log(`gc skipped leased/unreadable lane: ${lane}`); continue; }
         const key = digest(resolve(lane));
         const last = cursor[key];
         if (last !== undefined && (!Number.isFinite(last) || last > nowMs)) throw Error('unknown gc cursor');
         if (last !== undefined && nowMs - last < schedule) continue;
         const host = admission({ env, log, interactive });
         if (!host.admitted) { log(`gc skipped: ${host.reason}`); return { ran, reason: host.reason }; }
+        if (gcLeaseProtected(lane)) { log(`gc skipped leased/unreadable lane: ${lane}`); continue; }
         try {
           exec('git', ['-c', 'gc.auto=0', '-c', 'gc.autoDetach=false', '-c', 'gc.pruneExpire=never', 'gc', '--no-detach'], { cwd: lane, timeout: 120000, stdio: 'pipe' });
         } catch (e) {
