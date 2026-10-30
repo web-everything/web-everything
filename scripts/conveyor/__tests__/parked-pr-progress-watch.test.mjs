@@ -317,6 +317,11 @@ describe('watchNeglectedPrs — the IO shell over injected fakes', () => {
 });
 
 
+// Every sweep here injects agent discovery or has no candidates. Keep the dispatcher's
+// unrelated dependency graph out of the CLI contract's repeated module reloads.
+vi.mock('../../operations/dispatch-lane-io.mjs', () => ({
+  defaultListAgents: vi.fn(() => { throw new Error('Agent discovery must be injected in progress-watch tests'); }),
+}));
 vi.mock('node:child_process', async (importOriginal) => ({
   ...await importOriginal(), execFileSync: vi.fn(),
 }));

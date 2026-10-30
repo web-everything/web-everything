@@ -1,5 +1,15 @@
 # Testing — Three-Tier Strategy
 
+## Human-only enqueue approval license (R212)
+
+`human-only-enqueue-license.test.mjs` uses local Git repositories to exercise exact clearance,
+the shared numbering proof, and main merges whose sensitive blobs match `origin/main`.
+Admission reads complete comments and live head/labels; missing or unreadable evidence retains
+the human hold. Successor proof is read-only, with 8 MiB per Git output and 1024 changed paths;
+exceeding either limit asks the operator to re-approve the current head or queue it.
+`drain-merge-strategy.test.mjs` covers the setting-off refusal and best-effort `needs-you` event.
+Run these and `merge-queue-enqueue.test.mjs` through the host heavy-admission queue.
+
 ## Direction-aware operation evidence (R131)
 
 In-process review callers import the pure shape derivation from `scripts/lib/review-shape.mjs`.
@@ -772,6 +782,21 @@ clearances remain confined to the explicitly requested numbering-only proof. Tes
 commits and changed trees through the writer, alongside refusal cases with zero writer calls.
 
 ## Human clearance across drain numbering
+
+An approved human-surface head hold suppresses rebasing, never pending-card numbering before
+enqueue. Regress that preparation predicate with an approved human-only head carrying a hash card,
+and run real branch numbering with workflow edits while unqueued. Queued human-only or
+human-enqueued hash cards retain their skip event and emit `needs-you` with the files and
+dequeue/re-queue instructions; hash-free branches emit no alert.
+
+Branch preparation accepts flat backlog cards and `backlog/raised-by/<digits>/<basename>.md`
+ledger files; ledger basenames allow ASCII letters, digits, dots, underscores and hyphens.
+Reject `..`, NUL and symlinks at every parent or file before numbering. Keep nested ledgers
+outside card discovery, renaming, number floors and reservation pruning.
+`queue-branch-numbering.test.mjs` exercises real Git
+numbering beside unchanged ledgers, including a hash-like ledger basename. Preparation skips
+emit a best-effort `needs-you` event with the refusal and manual-numbering fallback; numbered
+and final outcomes emit none. Regress both synchronous and asynchronous emitter failures.
 
 A `clear-human` record already counts as acceptance; a numbering carry must also run before
 workflow and anti-test-gaming holds can re-park it. Use the existing human carry writer with a
@@ -1907,6 +1932,26 @@ separate from transient infrastructure failures and their retry streak.
 
 ### Direct heavy-run hook probes
 
+Pool maintenance uses health-watch's existing tick and `scheduled-lane-maintenance.mjs`.
+Its per-pool `.maintenance-stamp.json` records attempts before running the trim and gc
+CLIs under a shared stamp lock; the interval is at least 24h, even with a shorter
+`lanes.gc.schedule`. Invalid/oversized/future stamps refuse work: inspect and repair the
+named stamp before retrying. Dry-run ticks do not consume the schedule. The named tests in
+`scripts/lib/__tests__/scheduled-lane-maintenance.test.mjs` cover restart suppression,
+lock contention, subprocess failures, du byte accounting, real trim lease protection,
+and GC refusing lease markers (including a marker appearing during host admission).
+GC conservatively skips even stale or malformed markers; lease reclamation stays with
+lane-pool's existing trim/recovery paths.
+
+Daemon clone GC is serialized by `clone-maintenance.mjs` with the shared WRITE lock;
+keep Git asynchronous so its lock heartbeat can run during packing. The named cases in
+`scripts/lib/__tests__/clone-maintenance.test.mjs` cover lock contention, persisted rate
+limits, idle-hook order and real local packing that preserves recent unreachable objects.
+`cloneMaintenance.intervalMs` resolves through the policy cascade with
+`WE_DAEMON_CLONE_MAINTENANCE_INTERVAL_MS` as the environment override. A corrupt or
+oversized stamp skips GC (`stamp-unreadable` in the `clone-maintenance` event); inspect
+and repair `clone-maintenance-<cloneLockKey>.json` under the daemon state directory.
+
 The `heavy-enforce` guard requires admission even for one-file Vitest runs, `related`,
 and direct `check-standards.mjs` execution. Use `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>`
 or the admitted `npm run test:unit -- <file>` / `npm run check:standards` scripts.
@@ -2863,3 +2908,40 @@ evidence yields unknown; retry or inspect the mount configuration manually. Keep
 visible-leader/hidden-member regression alongside the omitted-leader case.
 The real-host cases require permission to execute `ps` and read the boot UUID on macOS;
 a sandbox denying either operation produces unknown and cannot certify those cases.
+
+## Archive-only host retention (R217)
+
+`scripts/lib/archive-retention.mjs` uses the run store's shared directory resolver without triggering
+legacy migration; `OPERATION_RUNS_DIR` wins. Tests use temporary source, Drive and stamp roots.
+Run the archive-retention and archive-retention-tick fixtures through heavy admission. Real `tar`
+creation/listing proves the happy path; injected post-bundle changes prove truncation, size/count
+mismatch and concurrent-source protection. The Drive root must already exist. Never create a local
+fallback archive or remove originals when Drive verification fails. An oversized scan retains all
+sources and asks the operator to split the source or inspect and raise the scan bound. Stale lock
+recovery requires operator inspection, never automatic lock stealing. Archives have no expiry.
+The CLI defaults to both kinds; `--dry-run` creates no archive or stamp. Settings live in
+`scripts/settings/archive-retention.json` and resolve through the shared policy cascade with sources
+included in results and logged by the CLI/health-watch. Host health ticks invoke both kinds; fixture,
+dry-run and redirected ticks skip retention. Each kind serializes with a lock and uses a 24-hour stamp.
+
+A durable per-kind manifest beside the stamp records source-relative paths, size, mtime and
+identity/ctime for verified bundles, scoped to the source and Drive paths. Retained unchanged
+sources are skipped even after stamp expiry; changed sources and session companions remain eligible.
+The manifest is read under the invocation lock and atomically replaced after bundle verification,
+before source removal or stamp publication. Dry-run reads it without writing state. Invalid or
+oversized manifests fail closed and ask the operator to inspect or restore the manifest; the read
+and write limits are 128 MiB and `maxFiles` entries. Regression fixtures cross stamp expiry for both
+kinds, change size/mtime or restore mtime after a same-size edit, and retry failed verification or
+manifest publication. Existing bundles from before manifest tracking cannot be deduplicated by it.
+
+The archiver's invocation lock serializes archivers only; it does **not** exclude run-store or
+Claude writers. A stat/unlink pair cannot safely reclaim a mutable source. Source removal therefore
+requires the injected `withSourceWriterExclusion(path, criticalSection)` provider to exclude **all**
+writers, including already-open file descriptors and atomic replacements, throughout final identity
+verification and unlink. The provider must await the critical section and leave it uncalled when
+exclusion is unavailable. No production provider exists for Claude's external transcript writers;
+the CLI and daily health-watch archive but retain originals, report `filesRetained` and an operator
+fallback, and claim zero reclaimed bytes. Do not enable reclamation with a policy flag or quiet-time
+heuristic. The operator must arrange actual writer exclusion before reclamation can be wired in.
+Regression tests append in the final-stat/removal interval, hold an open transcript descriptor, test
+unavailable exclusion, and queue a cooperating writer through the same exclusion used by removal.
