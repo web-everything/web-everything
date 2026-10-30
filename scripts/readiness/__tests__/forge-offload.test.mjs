@@ -1,0 +1,496 @@
+// @vitest-environment node
+import {describe,it,expect,beforeEach,afterEach,vi} from 'vitest';
+import * as fs from 'node:fs/promises';
+import {spawnSync} from 'node:child_process';
+import {join} from 'node:path';
+import {createHash} from 'node:crypto';
+import * as remote from '../remote-exec.mjs';
+import {parseGitTree} from '../forge-exec-manifest.mjs';
+import {createRunner,manifestWire,digestManifest,digestInput,digestArgv} from '../forge-exec-run.mjs';
+import {createBasePin,pruneBases} from '../forge-exec-bases.mjs';
+let root,repo;
+const hash=data=>createHash('sha256').update(data).digest('hex');
+const git=(args,cwd=repo)=>{const r=spawnSync('git',args,{cwd,maxBuffer:4*1024*1024});if(r.status)throw new Error(r.stderr.toString());return r.stdout;};
+const exec=async ({file,args,cwd,env})=>{const r=spawnSync(file,args,{cwd,env,maxBuffer:4*1024*1024});return {code:r.status,stdout:r.stdout};};
+const commit=()=>git(['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','fixture']);
+beforeEach(async()=>{
+  root=await fs.realpath(await fs.mkdtemp(join(process.env.TMPDIR,'forge-offload-')));repo=join(root,'repo');await fs.mkdir(repo);
+  git(['init','-q']);
+  for(const [name,data] of Object.entries({'package-lock.json':'lock','a.test.mjs':'test','deleted.txt':'delete','mode.txt':'mode','oauth-source.mjs':'public','credentials.txt':'private'})) await fs.writeFile(join(repo,name),data);
+  git(['add','.']);commit();git(['update-ref','refs/remotes/origin/main','HEAD']);
+});
+afterEach(async()=>fs.rm(root,{recursive:true,force:true}));
+async function baseFixture() {
+  const sha=git(['rev-parse','HEAD']).toString().trim();
+  const manifest=await remote.buildManifest({cwd:repo,exec});
+  return {sha,manifest:manifestWire(manifest),manifestDigest:manifest.manifestDigest};
+}
+async function pruningFixture() {
+  const target=join(root,'pruning');await fs.mkdir(target,{mode:0o700});
+  const shas=Array.from({length:6},(_,i)=>String(i).repeat(40));
+  for(const [i,sha] of shas.entries()) {
+    await fs.mkdir(join(target,sha));
+    await fs.writeFile(join(target,sha,'READY'),JSON.stringify({sha,manifestDigest:hash('manifest'),lockDigest:hash('lock'),readyAtMs:i,fetchedAtMs:i}));
+    await fs.writeFile(join(target,sha,'keep'),'base '+i);
+  }
+  await fs.mkdir(join(target,'failed.tmp'));
+  return {target,shas};
+}
+describe('active base pin safety',()=>{
+  it.each(['garbage','unreadable'])('refuses pruning with a %s active pin and keeps every base',async fault=>{
+    const {target,shas}=await pruningFixture(),active=join(target,'active');
+    await fs.mkdir(active,{mode:0o700});
+    const pin=join(active,'run-one');await fs.writeFile(pin,fault==='garbage'?'not-a-sha':shas[0],{mode:0o600});
+    const before=(await fs.readdir(target)).sort();
+    const remove=vi.fn(fs.rm);
+    const io={...fs,rm:remove,open:async(path,...args)=>{
+      if(fault==='unreadable'&&String(path)===pin)throw Object.assign(new Error('pin denied'),{code:'EACCES'});
+      return fs.open(path,...args);
+    }};
+    if(fault==='garbage')await expect(pruneBases(target,io)).rejects.toThrow('Unreadable active base pin: pruning refused');
+    else await expect(pruneBases(target,io)).rejects.toMatchObject({code:'EACCES'});
+    expect(remove).not.toHaveBeenCalled();
+    expect((await fs.readdir(target)).sort()).toEqual(before);
+    for(const [i,sha] of shas.entries())expect(await fs.readFile(join(target,sha,'keep'),'utf8')).toBe('base '+i);
+    expect(await fs.readFile(pin,'utf8')).toBe(fault==='garbage'?'not-a-sha':shas[0]);
+  });
+  it('ops can read root-created active base pins and retain the pinned base',async()=>{
+    const {target,shas}=await pruningFixture(),active=join(target,'active'),pin=join(active,'run-one');
+    const operator={uid:1001,gid:1002},owners=new Map(),transfers=[];
+    let asOps=false;
+    const checkOps=path=>{
+      if(!asOps)return;
+      for(const name of [active,...(String(path)===pin?[pin]:[])]) {
+        if(owners.get(name)?.uid!==operator.uid)throw Object.assign(new Error('ops cannot read root-owned pin metadata'),{code:'EACCES'});
+      }
+    };
+    const io={...fs,
+      mkdir:async(path,options)=>{await fs.mkdir(path,options);if(!owners.has(String(path)))owners.set(String(path),{uid:0,gid:0});},
+      writeFile:async(path,...args)=>{await fs.writeFile(path,...args);owners.set(String(path),{uid:0,gid:0});},
+      lstat:async path=>{checkOps(path);return fs.lstat(path);},
+      readdir:async path=>{checkOps(path);return fs.readdir(path);},
+      open:async(path,flags)=>{
+        checkOps(path);
+        const fd=await fs.open(path,flags);
+        return {stat:async()=>Object.assign(await fd.stat(),owners.get(String(path))),
+          readFile:()=>fd.readFile(),close:()=>fd.close(),
+          chown:async(uid,gid)=>{transfers.push({path:String(path),uid,gid});owners.set(String(path),{uid,gid});}};
+      },
+    };
+    // Run the same pin creator used by privileged prepare/run; only identity
+    // and fchown are simulated, while metadata creation and pruning use disk.
+    await createBasePin(target,'run-one',shas[0],operator,io);
+    expect(transfers).toEqual([{path:active,...operator},{path:pin,...operator}]);
+    expect((await fs.stat(active)).mode&0o777).toBe(0o700);
+    expect((await fs.stat(pin)).mode&0o777).toBe(0o600);
+    asOps=true;
+    const reader=await io.open(pin,0);
+    try{expect((await reader.readFile()).toString()).toBe(shas[0]);}finally{await reader.close();}
+    await pruneBases(target,io);
+    expect(await fs.readdir(target)).toEqual(expect.arrayContaining([shas[0],...shas.slice(2)]));
+    await expect(fs.stat(join(target,shas[1]))).rejects.toMatchObject({code:'ENOENT'});
+    await expect(fs.stat(join(target,'failed.tmp'))).rejects.toMatchObject({code:'ENOENT'});
+  });
+});
+describe('warm base selection and delta proof',()=>{
+  it('hashes Mac index membership even when tracked and untracked file bytes are identical',async()=>{
+    await fs.writeFile(join(repo,'new.md'),'same bytes');
+    const untracked=await remote.buildManifest({cwd:repo,exec});
+    expect(untracked.entries.find(e=>e.path.toString()==='new.md').tracked).toBe(false);
+    git(['add','new.md']);
+    const tracked=await remote.buildManifest({cwd:repo,exec});
+    expect(tracked.entries.find(e=>e.path.toString()==='new.md').tracked).toBe(true);
+    expect(tracked.manifestDigest).not.toBe(untracked.manifestDigest);
+    const base=await baseFixture();
+    git(['rm','--cached','new.md']);
+    const delta=await remote.buildDeltaManifest({cwd:repo,exec,base});
+    expect(delta.entries.find(e=>e.path.toString()==='new.md').tracked).toBe(false);
+    expect(delta.deltaPaths).toEqual([]);
+    expect(delta.manifestDigest).toBe((await remote.buildManifest({cwd:repo,exec})).manifestDigest);
+    expect(delta.manifestDigest).not.toBe(base.manifestDigest);
+  });
+  it('refuses a legacy warm-base manifest with its valid historical digest and requires full shipping',async()=>{
+    const base=await baseFixture();
+    delete base.manifest.v;delete base.manifest.tracked;
+    base.manifestDigest=digestManifest(base.manifest);
+    await expect(remote.buildDeltaManifest({cwd:repo,exec,base})).rejects.toThrow(/manifest|full ship/i);
+  });
+  it.each([['120000','blob'],['160000','commit']])('retains excluded %s tree entries for manifest policy', (mode,type)=>{
+    const oid='a'.repeat(40);
+    const tree=Buffer.from([`${mode} ${type} ${oid}\t.claude/skills`,`${mode} ${type} ${oid}\t.claude/agent-memory`,`100644 blob ${oid}\tnormal.txt`,''].join('\0'));
+    expect(parseGitTree(tree).map(entry=>entry.path.toString())).toEqual(['.claude/skills','.claude/agent-memory','normal.txt']);
+  });
+  it.each([['120000','blob','skills'],['160000','commit','module'],['120000','blob','oauth-source.mjs']])('rejects non-excluded %s tree entry %s %s', (mode,type,path)=>{
+    expect(()=>parseGitTree(Buffer.from(`${mode} ${type} ${'a'.repeat(40)}\t${path}\0`))).toThrow('Unsupported git tree mode');
+  });
+  it('matches the full-ship digest with excluded symlinks in the base tree',async()=>{
+    await fs.mkdir(join(repo,'.claude'));
+    await fs.symlink('../mode.txt',join(repo,'.claude/skills'));
+    await fs.symlink('../deleted.txt',join(repo,'.claude/agent-memory'));
+    git(['add','.']);commit();git(['update-ref','refs/remotes/origin/main','HEAD']);
+    const base=await baseFixture();
+    await fs.writeFile(join(repo,'mode.txt'),'changed');
+    const delta=await remote.buildDeltaManifest({cwd:repo,exec,base});
+    const full=await remote.buildManifest({cwd:repo,exec});
+    expect(delta.excluded.map(path=>path.toString())).toEqual(expect.arrayContaining(['.claude/skills','.claude/agent-memory']));
+    expect(delta.entries.some(entry=>entry.path.toString().startsWith('.claude/'))).toBe(false);
+    expect(delta.manifestDigest).toBe(full.manifestDigest);
+    expect(manifestWire(delta)).toEqual(manifestWire(full));
+  });
+  it('prefers the newest local ancestor over a newer nonancestor base',async()=>{
+    const base=await baseFixture();
+    await fs.writeFile(join(repo,'mode.txt'),'next');git(['add','.']);commit();
+    const newerAncestor=await baseFixture();
+    git(['checkout','--orphan','other']);await fs.writeFile(join(repo,'other.txt'),'other');git(['add','.']);commit();
+    const nonancestor=await baseFixture();
+    git(['checkout','--detach',newerAncestor.sha]);
+    expect(await remote.selectBase({cwd:repo,exec,bases:[{...base,sha:'a'.repeat(40)},nonancestor,newerAncestor,base]})).toEqual(newerAncestor);
+  });
+  it('uses the newest locally available nonancestor: integrity comes from the byte manifest, not ancestry',async()=>{
+    const older=await baseFixture();
+    await fs.writeFile(join(repo,'mode.txt'),'new base');git(['add','.']);commit();
+    const base=await baseFixture();
+    git(['checkout','--orphan','other']);await fs.writeFile(join(repo,'other.txt'),'other');git(['add','.']);commit();
+    await fs.writeFile(join(repo,'mode.txt'),'different bytes');await fs.rm(join(repo,'deleted.txt'));await fs.chmod(join(repo,'a.test.mjs'),0o755);
+    const selected=await remote.selectBase({cwd:repo,exec,bases:[{...base,sha:'a'.repeat(40)},base,older]});
+    expect(selected).toEqual(base);
+    const delta=await remote.buildDeltaManifest({cwd:repo,exec,base:selected});
+    const full=await remote.buildManifest({cwd:repo,exec});
+    expect(manifestWire(delta)).toEqual(manifestWire(full));
+    expect(delta.manifestDigest).toBe(full.manifestDigest);
+    expect(delta.deltaPaths.map(p=>p.toString())).toEqual(['a.test.mjs','mode.txt','other.txt']);
+    expect(delta.deletions.map(p=>p.toString())).toEqual(['deleted.txt']);
+  });
+  it('uses full shipping when no ready base exists locally',async()=>{
+    const base=await baseFixture();
+    expect(await remote.selectBase({cwd:repo,exec,bases:[{...base,sha:'a'.repeat(40)}]})).toBeNull();
+    expect(await remote.selectBase({cwd:repo,exec,bases:[]})).toBeNull();
+  });
+  it.each([1,2,3])('delta overlay equals a full manifest with additions, deletions, modes and public credentials (case %s)',async seed=>{
+    const base=await baseFixture();
+    await fs.writeFile(join(repo,'a.test.mjs'),'changed '+seed);await fs.rm(join(repo,'deleted.txt'));await fs.chmod(join(repo,'mode.txt'),0o755);
+    await fs.writeFile(join(repo,'added.txt'),'added '+seed);git(['add','.']);commit();
+    await fs.writeFile(join(repo,'untracked.txt'),'untracked '+seed);await fs.writeFile(join(repo,'credentials.txt'),'still private');
+    const delta=await remote.buildDeltaManifest({cwd:repo,exec,base});
+    const full=await remote.buildManifest({cwd:repo,exec});
+    expect(delta.manifestDigest).toBe(full.manifestDigest);
+    expect(manifestWire(delta)).toEqual(manifestWire(full));
+    expect(delta.deltaPaths.map(p=>p.toString())).toEqual(['a.test.mjs','added.txt','mode.txt','untracked.txt']);
+    expect(delta.deletions.map(p=>p.toString())).toEqual(['deleted.txt']);
+    expect(delta.entries.some(e=>e.path.toString()==='oauth-source.mjs')).toBe(true);
+    expect(delta.excluded.map(p=>p.toString())).toContain('credentials.txt');
+  });
+  it('refuses a credential source changed from public evidence and ignored tests in delta mode',async()=>{
+    const base=await baseFixture();await fs.writeFile(join(repo,'oauth-source.mjs'),'private bytes');
+    await expect(remote.buildDeltaManifest({cwd:repo,exec,base})).rejects.toThrow('Excluded source');
+    git(['checkout','--','oauth-source.mjs']);await fs.writeFile(join(repo,'.gitignore'),'ignored.test.mjs\n');await fs.writeFile(join(repo,'ignored.test.mjs'),'hidden');
+    await expect(remote.buildDeltaManifest({cwd:repo,exec,base})).rejects.toThrow('Ignored test');
+  });
+  it('reads and hashes every final worktree leaf, including git-clean paths',async()=>{
+    const base=await baseFixture();await fs.writeFile(join(repo,'a.test.mjs'),'changed');
+    const read=vi.fn(path=>fs.readFile(path));
+    const delta=await remote.buildDeltaManifest({cwd:repo,exec,base,fs:{...fs,readFile:read}});
+    expect(delta.deltaPaths.map(p=>p.toString())).toEqual(['a.test.mjs']);
+    for(const entry of delta.entries)expect(read.mock.calls.some(([path])=>Buffer.from(path).equals(Buffer.from(join(repo,entry.path.toString()))))).toBe(true);
+  });
+  it('includes autocrlf worktree bytes that git considers clean and matches full shipping',async()=>{
+    await fs.writeFile(join(repo,'mode.txt'),'line\n');git(['add','.']);commit();
+    const base=await baseFixture();git(['config','core.autocrlf','true']);
+    await fs.writeFile(join(repo,'mode.txt'),'line\r\n');
+    expect(git(['diff','--name-only'])).toHaveLength(0);
+    const delta=await remote.buildDeltaManifest({cwd:repo,exec,base});
+    expect(delta.deltaPaths.map(p=>p.toString())).toEqual(['mode.txt']);
+    expect(delta.manifestDigest).toBe((await remote.buildManifest({cwd:repo,exec})).manifestDigest);
+  });
+  it.each(['bytes','executable'])('detects a git-clean %s change racing after diff evidence',async fault=>{
+    const base=await baseFixture();let raced=false;
+    const racingExec=async call=>{
+      const result=await exec(call);
+      if(!raced&&call.args[0]==='diff'&&call.args.at(-2)==='HEAD') {
+        raced=true;
+        if(fault==='bytes')await fs.writeFile(join(repo,'mode.txt'),'race');
+        else await fs.chmod(join(repo,'mode.txt'),0o755);
+      }
+      return result;
+    };
+    const delta=await remote.buildDeltaManifest({cwd:repo,exec:racingExec,base});
+    expect(delta.deltaPaths.map(p=>p.toString())).toEqual(['mode.txt']);
+    expect(delta.manifestDigest).toBe((await remote.buildManifest({cwd:repo,exec})).manifestDigest);
+  });
+
+});
+
+describe('runner base materialization refuses before install',()=>{
+  async function setup() {
+    const base=await baseFixture();const server=join(root,'server');const dir=join(server,'bases',base.sha);await fs.mkdir(join(dir,'tree'),{recursive:true});
+    for(const path of Buffer.from(base.manifest.paths,'base64').toString().split('\0').filter(Boolean)) await fs.copyFile(join(repo,path),join(dir,'tree',path));
+    await fs.writeFile(join(dir,'manifest.json'),JSON.stringify(base.manifest));await fs.writeFile(join(dir,'READY'),JSON.stringify({sha:base.sha,manifestDigest:base.manifestDigest,lockDigest:hash('lock'),readyAtMs:1,fetchedAtMs:0}));
+    const bin=join(server,'bin');await fs.mkdir(bin);await fs.symlink(process.execPath,join(bin,'node'));
+    await fs.writeFile(join(bin,'npm'),`#!/bin/sh\necho ran >> '${server}/npm.log'\necho \"$*\" >> '${server}/npm-args.log'\nexit 0\n`,{mode:0o755});
+    const runner=createRunner({testRoot:server,testPath:bin+':/usr/bin:/bin'});
+    const nonce='e'.repeat(32),prepared=await runner.prepare({nonce});
+    expect(prepared.capabilities).toMatchObject({delta:1,bases:[{sha:base.sha,manifestDigest:base.manifestDigest}]});
+    await fs.writeFile(join(repo,'a.test.mjs'),'changed');await fs.rm(join(repo,'deleted.txt'));
+    const manifest=await remote.buildManifest({cwd:repo,exec});
+    const work=join(server,'runs',prepared.run,'work');await fs.copyFile(join(repo,'a.test.mjs'),join(work,'a.test.mjs'));
+    // Real fully materialized local tree supplies the unchanged legacy input binding.
+    const full=join(root,'full');await fs.mkdir(full);
+    for(const entry of manifest.entries)await fs.copyFile(join(repo,entry.path.toString()),join(full,entry.path.toString()));
+    const argv=['npm','run','test:unit','--','a.test.mjs'];
+    const request={v:1,nonce,run:prepared.run,argv,env:{},argvDigest:digestArgv(argv),lock:hash('lock'),inputDigest:await digestInput(full),manifest:manifestWire(manifest),manifestDigest:manifest.manifestDigest,baseSha:base.sha,baseManifestDigest:base.manifestDigest,deletions:Buffer.from('deleted.txt\0').toString('base64')};
+    return {base,dir,server,runner,request,work};
+  }
+  it('uses independent copies, applies deletion and delta, and verifies before install',async()=>{
+    const f=await setup();expect((await f.runner.run(f.request)).code).toBe(0);
+    expect(await fs.readFile(join(f.work,'a.test.mjs'),'utf8')).toBe('changed');
+    await expect(fs.stat(join(f.work,'deleted.txt'))).rejects.toMatchObject({code:'ENOENT'});
+    await fs.writeFile(join(f.work,'mode.txt'),'worker modification');expect(await fs.readFile(join(f.dir,'tree/mode.txt'),'utf8')).toBe('mode');
+    const receipt=await f.runner.finish(f.request);expect(receipt.timings).toMatchObject({installMs:expect.any(Number),runMs:expect.any(Number)});
+  });
+  it.each(['base mutated','delta tamper','symlink delta','deletion traversal','unknown base','digest mismatch','unready base','malformed READY'])('rejects %s with protected non-start evidence and no npm',async fault=>{
+    const f=await setup();
+    if(fault==='base mutated')await fs.writeFile(join(f.dir,'tree/mode.txt'),'tamper');
+    if(fault==='delta tamper')await fs.writeFile(join(f.work,'a.test.mjs'),'tamper');
+    if(fault==='symlink delta'){await fs.rm(join(f.work,'a.test.mjs'));await fs.symlink(join(repo,'a.test.mjs'),join(f.work,'a.test.mjs'));}
+    if(fault==='deletion traversal')f.request.deletions=Buffer.from('../escape\0').toString('base64');
+    if(fault==='unknown base')f.request.baseSha='0'.repeat(40);
+    if(fault==='digest mismatch')f.request.baseManifestDigest='0'.repeat(64);
+    if(fault==='unready base')await fs.rm(join(f.dir,'READY'));
+    if(fault==='malformed READY')await fs.writeFile(join(f.dir,'READY'),JSON.stringify({sha:f.base.sha,manifestDigest:f.base.manifestDigest}));
+    await expect(f.runner.run(f.request)).rejects.toThrow();
+    await expect(fs.stat(join(f.server,'npm.log'))).rejects.toMatchObject({code:'ENOENT'});
+    expect(await f.runner.finish(f.request)).toMatchObject({phase:'rejected',started:false,delta:true});
+  });
+  // These cases run real Git, file copies and the install supervisor; allow for CI contention.
+  it.each(['delta','old runner','manifest unavailable','oversized manifest','late delta failure'])('remote transport uses %s and preserves the exact full manifest',async mode=>{
+    const f=await setup(),requests=[],copies=[];
+    const transport=async call=>{
+      if(call.file==='git'){if(mode==='late delta failure'&&call.args[0]==='cat-file'&&call.args[1]==='blob')return {code:1,stdout:Buffer.alloc(0)};return exec(call);}
+      if(call.file==='rsync'){
+        copies.push(call.input);
+        const destination=call.args.at(-1).split(':').slice(1).join(':').replace('/srv/forge-exec',join(f.server,'runs'));
+        for(const name of call.input.toString().split('\0').filter(Boolean)){const rel=name.slice(2);await fs.mkdir(join(destination,rel,'..'),{recursive:true});await fs.copyFile(join(call.cwd,rel),join(destination,rel));}
+        return {code:0,stdout:Buffer.alloc(0)};
+      }
+      const action=call.args.at(-1).split(' ').at(-1);
+      if(action==='true')return {code:0,stdout:''};
+      if(action==='bases'&&mode==='old runner')return {code:254,stdout:''};
+      if(action==='base-manifest'&&mode==='manifest unavailable')return {code:254,stdout:''};
+      if(action==='base-manifest'&&mode==='oversized manifest')return {code:0,stdout:'x'.repeat(4*1024*1024+1)};
+      const value=await f.runner[action](JSON.parse(call.input));
+      if(action==='run'){requests.push(JSON.parse(call.input));return {code:value.code,stdout:''};}
+      return {code:0,stdout:JSON.stringify(value)};
+    };
+    const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:transport});
+    expect(result.mode).toBe('remote');
+    const stage=result.timings.find(s=>s.stage==='rsync');
+    expect(stage.shipMode).toBe(mode==='delta'?'delta':'full');
+    expect(requests[0].manifestDigest).toBe(f.request.manifestDigest);
+    if(mode==='delta'){
+      expect(copies[0]).toEqual(Buffer.from('./a.test.mjs\0'));
+      expect(requests[0]).toMatchObject({baseSha:f.base.sha,deletions:Buffer.from('deleted.txt\0').toString('base64')});
+    }else expect(requests[0].baseSha).toBeUndefined();
+  },30_000);
+  it.each(['corrupt base','missing base','unbound rejection','started rejection','missing finish','second rejection','lost run response','started run response'])('retries only a proven pre-start delta rejection once: %s',async fault=>{
+    const f=await setup(),requests=[],prepares=[],finishes=[],copies=[];
+    const transport=async call=>{
+      if(call.file==='git')return exec(call);
+      if(call.file==='rsync') {
+        copies.push(call.input);
+        const destination=call.args.at(-1).split(':').slice(1).join(':').replace('/srv/forge-exec',join(f.server,'runs'));
+        for(const name of call.input.toString().split('\0').filter(Boolean)){const rel=name.slice(2);await fs.mkdir(join(destination,rel,'..'),{recursive:true});await fs.copyFile(join(call.cwd,rel),join(destination,rel));}
+        return {code:0,stdout:''};
+      }
+      const action=call.args.at(-1).split(' ').at(-1);
+      if(action==='true')return {code:0,stdout:''};
+      const request=JSON.parse(call.input);
+      if(action==='prepare')prepares.push(request);
+      if(action==='run') {
+        requests.push(request);
+        if(requests.length===1 && fault!=='started run response') {
+          if(fault==='missing base')await fs.rm(join(f.dir,'READY'));
+          else await fs.writeFile(join(f.dir,'tree/mode.txt'),'corrupt');
+        } else if(fault==='second rejection')await fs.writeFile(join(f.server,'runs',request.run,'work/a.test.mjs'),'corrupt');
+        let value;
+        try {value=await f.runner.run(request);}
+        catch{if(fault==='lost run response')throw new Error('SSH response lost');return {code:1,stdout:''};}
+        if(fault==='started run response')throw new Error('SSH response lost after execution');
+        return {code:value.code,stdout:''};
+      }
+      let value=await f.runner[action](request);
+      if(action==='finish') {
+        finishes.push(request);
+        if(fault==='missing finish')return {code:1,stdout:''};
+        if(fault==='unbound rejection')value.nonce='0'.repeat(32);
+        if(fault==='started rejection')value.started=true;
+        if(fault==='second rejection'&&requests.length===2)value={v:1,...request,phase:'rejected',reason:'snapshot-rejected',siblings:true,started:false};
+      }
+      return {code:0,stdout:JSON.stringify(value)};
+    };
+    const result=await remote.runRemote({argv:f.request.argv,cwd:repo,exec:transport});
+    const retry=['corrupt base','missing base','second rejection','lost run response'].includes(fault);
+    expect(requests).toHaveLength(retry?2:1);
+    expect(prepares).toHaveLength(retry?2:1);
+    expect(finishes).toHaveLength(retry?2:1);
+    if(retry) {
+      expect(requests[0].baseSha).toBe(f.base.sha);
+      expect(requests[1].baseSha).toBeUndefined();
+      expect(requests[1].run).not.toBe(requests[0].run);
+      expect(requests[1].nonce).not.toBe(requests[0].nonce);
+      expect(copies[1].toString()).toContain('./mode.txt\0');
+      expect(requests[1].manifestDigest).toBe(f.request.manifestDigest);
+      expect(result.timings.filter(t=>t.stage==='rsync').every(t=>t.shipMode==='delta-then-full')).toBe(true);
+      expect(result.timings.filter(t=>t.stage==='forge-run')).toHaveLength(2);
+      const stages=result.timings.map(t=>t.stage);
+      if(fault!=='second rejection')expect(stages.lastIndexOf('forge-install')).toBeGreaterThan(stages.lastIndexOf('rsync'));
+    }
+    expect(result.mode).toBe(fault==='second rejection'?'not-started':retry?'remote':'unconfirmed');
+  },30_000); // A proven pre-start rejection performs a second complete transport/run/finish cycle.
+
+  it('warmer reuses registry-only install inputs across nondependency main changes, while retaining full profile keys',async()=>{
+    const f=await setup();
+    const packageData=JSON.stringify({name:'fixture',version:'1.0.0'});
+    const lockData=JSON.stringify({lockfileVersion:3,packages:{'':{name:'fixture'}}});
+    await fs.writeFile(join(repo,'package-lock.json'),lockData);
+    await fs.writeFile(join(repo,'package.json'),packageData);git(['add','.']);commit();
+    const first=manifestWire(await remote.buildManifest({cwd:repo,exec}));
+    await f.runner.warmInstall(repo,first);
+    await fs.writeFile(join(repo,'a.test.mjs'),'new main test');
+    const second=manifestWire(await remote.buildManifest({cwd:repo,exec}));
+    await f.runner.warmInstall(repo,second);
+    expect((await fs.readFile(join(f.server,'npm.log'),'utf8')).trim().split('\n')).toHaveLength(1);
+    const profiles=await fs.readdir(join(f.server,'cache',hash(lockData)));
+    expect(profiles.filter(p=>p.startsWith('dev-v5-'))).toHaveLength(2);
+    await fs.writeFile(join(repo,'package.json'),JSON.stringify({name:'fixture',version:'2.0.0'}));
+    await f.runner.warmInstall(repo,manifestWire(await remote.buildManifest({cwd:repo,exec})));
+    expect((await fs.readFile(join(f.server,'npm.log'),'utf8')).trim().split('\n')).toHaveLength(2);
+  });
+
+  it('seeds a full sibling-bound profile from proven registry-only warm inputs, never a lock-only key',async()=>{
+    const f=await setup();
+    await fs.writeFile(join(repo,'package.json'),JSON.stringify({name:'fixture',version:'1.0.0'}));
+    const lockData=JSON.stringify({lockfileVersion:3,packages:{'':{name:'fixture'}}});await fs.writeFile(join(repo,'package-lock.json'),lockData);
+    git(['add','.']);commit();
+    const manifest=manifestWire(await remote.buildManifest({cwd:repo,exec}));
+    await f.runner.warmInstall(repo,manifest);
+    const prepared=await f.runner.prepare({nonce:f.request.nonce,siblings:true});
+    const work=join(f.server,'runs',prepared.run,'work');
+    const primary=await remote.buildManifest({cwd:repo,exec});
+    for(const e of primary.entries)await fs.copyFile(join(repo,e.path.toString()),join(work,e.path.toString()));
+    const sibling=join(f.server,'runs',prepared.run,'frontierui');await fs.mkdir(join(sibling,'plugs'));await fs.writeFile(join(sibling,'plugs/index.js'),'private sibling');
+    manifest.siblings={frontierui:{sha:'a'.repeat(40),...manifestWire({entries:[{path:Buffer.from('plugs/index.js'),sha256:hash('private sibling'),executable:false}],excluded:[]})}};
+    const manifestDigest=digestManifest(manifest);
+    const request={...f.request,run:prepared.run,manifest,manifestDigest,siblingShas:{frontierui:'a'.repeat(40)},lock:hash(lockData),inputDigest:await digestInput(work)};
+    delete request.baseSha;delete request.baseManifestDigest;delete request.deletions;
+    expect((await f.runner.run(request)).code).toBe(0);
+    const commands=(await fs.readFile(join(f.server,'npm-args.log'),'utf8')).trim().split('\n');
+    expect(commands.filter(line=>line.startsWith('ci')&&!line.includes('--dry-run'))).toHaveLength(1);
+    expect(commands.some(line=>line.includes('--dry-run --offline'))).toBe(true);
+    expect(await fs.stat(join(f.server,'cache',hash(lockData),'dev-v5-'+manifestDigest,'dependencies.tar'))).toBeDefined();
+    await f.runner.finish(request);
+  });
+
+});
+
+// The warm tick's process boundary is injected: no network or registry access.
+describe('warm-base tick',()=>{
+  it('imports safely without changing the worker umask',async()=>{
+    const mask=vi.spyOn(process,'umask').mockImplementation(()=>{throw Object.assign(new Error('unsupported in worker'),{code:'ERR_WORKER_UNSUPPORTED_OPERATION'});});
+    try {
+      await expect(import('../forge-warm-base.mjs')).resolves.toHaveProperty('warmTick');
+      expect(mask).not.toHaveBeenCalled();
+    } finally {mask.mockRestore();}
+  });
+  it.each(['supported','unsupported','missing'])('sets the Forge CLI umask when %s without breaking unsupported runtimes',async kind=>{
+    const path=new URL('../forge-warm-base.mjs',import.meta.url).pathname;
+    const script=`
+      process.argv=[process.execPath,${JSON.stringify(path)},'unexpected'];
+      process.umask=${kind==='missing'?'undefined':`mask=>{process.stdout.write('mask='+mask);${kind==='unsupported'?"throw new Error('unsupported');":''}}`};
+      await import(${JSON.stringify(path)});
+    `;
+    const child=spawnSync(process.execPath,['--input-type=module','-e',script],{encoding:'utf8',timeout:10000,maxBuffer:4*1024*1024});
+    expect(child.status).toBe(1);
+    expect(child.stdout).toBe(kind==='missing'?'':'mask=18');
+    expect(child.stderr).toBe('forge-warm-base: No arguments accepted\n');
+  });
+  async function tickFixture() {
+    const warm=await import('../forge-warm-base.mjs');const base=await baseFixture();let now=1000;
+    const target=join(root,'bases');await fs.mkdir(target);
+    const gitExec=vi.fn(async call=>{
+      expect(Object.keys(call.env).some(k=>/token|secret|credential|auth/i.test(k))).toBe(false);
+      expect(call.env.GIT_TERMINAL_PROMPT).toBe('0');
+      if(call.args.includes('fetch')){expect(call.args).toContain('https://github.com/chalbert/web-everything.git');expect(call.args).toContain('credential.helper=');return {code:0,stdout:Buffer.alloc(0)};}
+      if(call.args.includes('init')){await fs.mkdir(join(target,'repo.git'));return {code:0,stdout:Buffer.alloc(0)};}
+      const args=call.args.slice(call.args.indexOf('--git-dir')+2);
+      return exec({...call,args:['-C',repo,...args]});
+    });
+    const install=vi.fn(async()=>({code:0}));
+    return {warm,base,target,gitExec,install,options:{root:target,exec:gitExec,install,clock:()=>now++,fs}};
+  }
+  it('publishes only ready verified trees, logs latency and does not pass tokens to anonymous git',async()=>{
+    const f=await tickFixture();await f.warm.warmTick(f.options);
+    const ready=JSON.parse(await fs.readFile(join(f.target,f.base.sha,'READY'),'utf8'));
+    expect(ready).toMatchObject({sha:f.base.sha,manifestDigest:f.base.manifestDigest,lockDigest:hash('lock'),readyAtMs:expect.any(Number),fetchedAtMs:expect.any(Number)});
+    const log=JSON.parse((await fs.readFile(join(f.target,'latency.log'),'utf8')).trim());
+    expect(log).toMatchObject({sha:f.base.sha,mergeCommitDate:expect.any(String),fetchedAt:expect.any(String),readyAt:expect.any(String),latencyMs:expect.any(Number)});
+    expect(f.install).toHaveBeenCalledOnce();await f.warm.warmTick(f.options);expect(f.install).toHaveBeenCalledOnce();
+  });
+  it.each(['missing tree','missing leaf','extra leaf','same-size corruption','bad marker','oversized marker','overdeep tree','symlink leaf','malformed READY'])('removes and rebuilds a previously advertised %s base',async fault=>{
+    const f=await tickFixture();await f.warm.warmTick(f.options);
+    const dir=join(f.target,f.base.sha);
+    if(fault==='missing tree')await fs.rm(join(dir,'tree'),{recursive:true});
+    if(fault==='missing leaf')await fs.rm(join(dir,'tree/mode.txt'));
+    if(fault==='extra leaf')await fs.writeFile(join(dir,'tree/extra.txt'),'extra');
+    if(fault==='same-size corruption')await fs.writeFile(join(dir,'tree/mode.txt'),'evil');
+    if(fault==='bad marker')await fs.writeFile(join(dir,'tree-digest.json'),'{}');
+    if(fault==='oversized marker')await fs.writeFile(join(dir,'tree-digest.json'),'x'.repeat(4*1024*1024+1));
+    if(fault==='overdeep tree')await fs.mkdir(join(dir,'tree',...Array(130).fill('deep')),{recursive:true});
+    if(fault==='symlink leaf'){await fs.rm(join(dir,'tree/mode.txt'));await fs.symlink(join(repo,'mode.txt'),join(dir,'tree/mode.txt'));}
+    if(fault==='malformed READY')await fs.writeFile(join(dir,'READY'),'{}');
+    await f.warm.warmTick(f.options);
+    expect(f.install).toHaveBeenCalledTimes(2);
+    const {verifyManifest}=await import('../forge-exec-run.mjs');
+    await verifyManifest(join(dir,'tree'),f.base.manifest,f.base.manifestDigest);
+  });
+  it('rehashes legacy bases once when the marker is missing, then checks metadata only',async()=>{
+    const f=await tickFixture();await f.warm.warmTick(f.options);
+    const dir=join(f.target,f.base.sha),marker=join(dir,'tree-digest.json');
+    await fs.rm(marker,{force:true});
+    const read=vi.fn(path=>fs.readFile(path));
+    await f.warm.warmTick({...f.options,fs:{...fs,readFile:read}});
+    expect(read.mock.calls.some(([path])=>Buffer.from(path).includes(Buffer.from('/tree/')))).toBe(true);
+    expect(JSON.parse(await fs.readFile(marker,'utf8'))).toMatchObject({manifestDigest:f.base.manifestDigest,fileCount:f.base.manifest.hashes.length,treeDigest:expect.stringMatching(/^[a-f0-9]{64}$/)});
+    read.mockClear();await f.warm.warmTick({...f.options,fs:{...fs,readFile:read}});
+    expect(read.mock.calls.some(([path])=>Buffer.from(path).includes(Buffer.from('/tree/')))).toBe(false);
+    expect(f.install).toHaveBeenCalledOnce();
+  });
+  it('rejects corrupt legacy bytes when the tree marker is missing',async()=>{
+    const f=await tickFixture();await f.warm.warmTick(f.options);
+    const dir=join(f.target,f.base.sha);await fs.rm(join(dir,'tree-digest.json'),{force:true});await fs.writeFile(join(dir,'tree/mode.txt'),'evil');
+    await f.warm.warmTick(f.options);expect(f.install).toHaveBeenCalledTimes(2);
+    expect(await fs.readFile(join(dir,'tree/mode.txt'),'utf8')).toBe('mode');
+  });
+  it('repairs a retained older base even when current main is healthy',async()=>{
+    const f=await tickFixture();await f.warm.warmTick(f.options);
+    await fs.writeFile(join(repo,'new.txt'),'new main');git(['add','.']);commit();git(['update-ref','refs/remotes/origin/main','HEAD']);
+    await f.warm.warmTick(f.options);expect(f.install).toHaveBeenCalledTimes(2);
+    await fs.writeFile(join(f.target,f.base.sha,'tree/mode.txt'),'evil');
+    expect(await f.warm.warmTick(f.options)).toMatchObject({reused:true});
+    expect(f.install).toHaveBeenCalledTimes(3);
+    expect(await fs.readFile(join(f.target,f.base.sha,'tree/mode.txt'),'utf8')).toBe('mode');
+  });
+  it('failed install leaves no READY or stale temporary tree',async()=>{
+    const f=await tickFixture();f.install.mockRejectedValue(new Error('npm failed'));
+    await expect(f.warm.warmTick(f.options)).rejects.toThrow('npm failed');
+    expect(await fs.readdir(f.target)).not.toContain(f.base.sha);
+    expect((await fs.readdir(f.target)).filter(n=>n.endsWith('.tmp'))).toEqual([]);
+  });
+  it('retains newest four plus active bases, prunes stale tmp dirs and never follows symlinks',async()=>{
+    const f=await tickFixture();
+    await f.warm.warmTick(f.options);
+    for(let i=0;i<6;i++){const sha=String(i).repeat(40);await fs.cp(join(f.target,f.base.sha),join(f.target,sha),{recursive:true});await fs.rm(join(f.target,sha,'tree-digest.json'));await fs.writeFile(join(f.target,sha,'READY'),JSON.stringify({sha,manifestDigest:f.base.manifestDigest,lockDigest:hash('lock'),readyAtMs:i,fetchedAtMs:i}));}
+    await fs.mkdir(join(f.target,'failed.tmp'));await fs.mkdir(join(f.target,'active'),{recursive:true});await fs.writeFile(join(f.target,'active','run-one'),'0'.repeat(40));
+    await f.warm.warmTick(f.options);
+    const dirs=await fs.readdir(f.target);expect(dirs).toContain('0'.repeat(40));expect(dirs).not.toContain('1'.repeat(40));expect(dirs).not.toContain('2'.repeat(40));expect(dirs).not.toContain('failed.tmp');
+  });
+});
