@@ -1890,6 +1890,22 @@ describe('allowlisted sibling snapshots', () => {
   }
   afterEach(() => {if (parent) rmSync(parent, {recursive:true,force:true}); parent=undefined;});
 
+  it('counts exact staged primary and sibling payload bytes, excluding private leaves',async()=>{
+    const f=siblingsFixture();
+    const primary=['a.test.mjs','package-lock.json','vitest.shared.ts'];
+    const siblingFiles=['plugs/index.js','webtheme/index.js','webtheme/sub/dir/x.md'];
+    // Read independently named fixture inputs, never the manifest or timing total.
+    const bytes=[...primary.map(name=>readFileSync(join(f.cwd,name))),
+      ...siblingFiles.map(name=>readFileSync(join(sibling,name)))].reduce((sum,data)=>sum+data.length,0);
+    const result=await timedRunRemote(f);
+    expect(result).toMatchObject({mode:'remote',code:0});
+    expect(result.timings.find(stage=>stage.stage==='rsync')).toMatchObject({
+      shipMode:'full',fileCount:6,bytesSent:bytes,deltaFileCount:0,deltaBytes:0});
+    const copies=callsOf(f.exec).filter(call=>call.file==='rsync');
+    expect(copies).toHaveLength(2);
+    expect(copies[1].input.toString()).not.toContain('credentials.txt');
+  });
+
   it('allows implied directories for both rsync calls and anchors nested inventory paths', async () => {
     const f = siblingsFixture();
     mkdirSync(join(f.cwd, 'sub/dir'), {recursive:true});
@@ -2083,7 +2099,8 @@ describe('offload stage evidence', () => {
     }
     expect(result.timings.find(s=>s.stage==='forge-install').ms).toBe(12);
     expect(result.timings.find(s=>s.stage==='forge-run').ms).toBe(34);
-    expect(result.timings.find(s=>s.stage==='rsync')).toMatchObject({shipMode:'full',fileCount:2,bytesSent:expect.any(Number)});
+    const bytes=Buffer.byteLength('fixture')+Buffer.byteLength('{"lockfileVersion":3,"packages":{}}\n');
+    expect(result.timings.find(s=>s.stage==='rsync')).toMatchObject({shipMode:'full',fileCount:2,bytesSent:bytes});
   });
   it('formats winter timestamps with the Eastern standard offset even for early fallback', async () => {
     const result=await timedRunRemote({argv:[],clock:()=>Date.parse('2026-01-01T12:00:00Z')});
