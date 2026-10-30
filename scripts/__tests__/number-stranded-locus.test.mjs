@@ -34,6 +34,8 @@ beforeAll(() => {
   for (const d of [laneRoot, plainRoot, elsewhere]) mkdirSync(d, { recursive: true });
   for (const root of [laneRoot, plainRoot]) {
     cpSync(WE_SCRIPTS_DIR, join(root, 'scripts'), { recursive: true });
+    cpSync(join(dirname(WE_SCRIPTS_DIR), 'skills-src/conveyor/daemon-manifest.mjs'),
+      join(root, 'skills-src/conveyor/daemon-manifest.mjs'));
     // The transcript check imports this skill module during CLI startup.
     cpSync(join(dirname(WE_SCRIPTS_DIR), 'skills-src', 'inspect-codex-transcript'),
       join(root, 'skills-src', 'inspect-codex-transcript'), { recursive: true });

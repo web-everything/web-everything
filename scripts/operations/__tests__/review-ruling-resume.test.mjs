@@ -189,7 +189,7 @@ describe('ordinary review-pr CLI resume preserves the saved roster', () => {
       const parked = await runReviewLoopOnce({ declaration, registry, argv, store,
         sinks: sinksWith({ seen: [], ruled: { value: true } }),
         makeJudge: () => async () => judgeOutcome({ summary: 'looked', findings: [] }, {}),
-        mintRunId: () => 'historical-cli' });
+        mintRunId: () => 'review-pr-historical-cli' });
       expect(parked.stopped).toBe('confirm');
       for (const minimum of ['1', '2']) {
         vi.stubEnv('WE_REVIEW_MIN_NON_CLAUDE_SEATS', minimum);
@@ -250,7 +250,7 @@ describe('ordinary review-pr CLI resume preserves the saved roster', () => {
       const registry = createRegistry();
       registry.register(declaration);
       const store = createFileRunStore();
-      let run = advanceWhileRunning(startRun({ op: declaration.name, id: 'unfinished', input: { pr: 4361, repo: 'o/n' }, registry }), { registry });
+      let run = advanceWhileRunning(startRun({ op: declaration.name, id: 'review-pr-unfinished', input: { pr: 4361, repo: 'o/n' }, registry }), { registry });
       const visited = [];
       while (run.pending?.kind === 'judge') {
         visited.push(run.pending.step);
@@ -271,7 +271,7 @@ describe('ordinary review-pr CLI resume preserves the saved roster', () => {
 
   // Drive one unfinished panel to confirm, resolving the registration from the saved record at every judge step.
   const driveUnfinished = async ({ declaration, registry, store, beforeResume = () => {}, strip = false }) => {
-    let run = advanceWhileRunning(startRun({ op: declaration.name, id: 'mid-panel', input: { pr: 4361, repo: 'o/n' }, registry }), { registry });
+    let run = advanceWhileRunning(startRun({ op: declaration.name, id: 'review-pr-mid-panel', input: { pr: 4361, repo: 'o/n' }, registry }), { registry });
     if (strip) {
       // A run saved before the roster was persisted: its `read` finding names only the security seat.
       const { seatSteps, minNonClaudeSeats, ...read } = run.findings.read;
@@ -316,7 +316,7 @@ describe('ordinary review-pr CLI resume preserves the saved roster', () => {
       const declaration = reviewPrOperation({ readPr: stubReader(), minNonClaudeSeats: 0, correctnessAdvisory: true });
       const registry = createRegistry();
       registry.register(declaration);
-      let run = advanceWhileRunning(startRun({ op: declaration.name, id: 'prefilled', input: { pr: 4361, repo: 'o/n' }, registry }), { registry });
+      let run = advanceWhileRunning(startRun({ op: declaration.name, id: 'review-pr-prefilled', input: { pr: 4361, repo: 'o/n' }, registry }), { registry });
       const { seatSteps, minNonClaudeSeats, ...read } = run.findings.read;
       run = { ...run, findings: { ...run.findings, read },
         prefilledSeats: [{ step: 'judgeCorrectnessAdvisory', stepIndex: 3, value: { summary: 'looked', findings: [] } }] };

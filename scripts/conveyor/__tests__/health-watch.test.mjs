@@ -52,12 +52,58 @@ vi.mock('../health-watch-section.mjs', async original => {
   return { ...real, healthDir: root => real.healthDir(root ?? sealTestRoot.path ?? undefined) };
 });
 vi.mock('../needs-you-feed-job.mjs', () => ({ superviseNeedsYouFeed: vi.fn(() => ({ enqueued: false })) }));
+const cardBatchReconcile = vi.hoisted(() => vi.fn(() => []));
+vi.mock('../../operations/card-batch-reconcile.mjs', () => ({
+  reconcileCardBatches: cardBatchReconcile, resolveReconcileIntervalMin: () => 5,
+}));
 const cardBatchSeal = vi.hoisted(() => vi.fn(() => []));
 vi.mock('../../operations/card-batch-seal-io.mjs', () => ({ sealDueBatches: cardBatchSeal }));
 
 let dir;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'health-watch-test-')); });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+describe('bundle repair and fix-ready tick wiring', () => {
+  const flagsFor = () => ({
+    'state-root': dir, 'logs-dir': join(dir, 'logs'), 'lock-root': join(dir, 'locks'),
+    'self-sync-dir': join(dir, 'sync'), 'fix-ready-store': join(dir, 'ready.jsonl'),
+    'no-gh': true, 'no-diagnose': true, 'no-investigate': true,
+  });
+
+  it('forwards the self-sync snapshot, time and dry-run flag to the repair supervisor', async () => {
+    const runBundleRepairs = vi.fn(() => ({ off: 'disabled' }));
+    const now = '2026-10-22T12:00:00Z';
+    const result = await tick({ ...flagsFor(), now, 'dry-run': true }, {
+      collectInventory: () => ({}), smells: [], runBundleRepairs,
+    });
+    expect(runBundleRepairs).toHaveBeenCalledTimes(1);
+    expect(runBundleRepairs).toHaveBeenCalledWith({
+      dir: healthDir(dir), selfSync: [], now: Date.parse(now), dryRun: true,
+    });
+    expect(result.bundleRepair).toEqual({ off: 'disabled' });
+  });
+
+  it('keeps a supervisor failure visible without failing the tick and honors the opt-out', async () => {
+    const runBundleRepairs = vi.fn(() => { throw Error('repair ledger unreadable'); });
+    const deps = { collectInventory: () => ({}), smells: [], runBundleRepairs };
+    const failed = await tick(flagsFor(), deps);
+    expect(failed.probeErrors.bundleRepair).toBe('repair ledger unreadable');
+    expect(failed.bundleRepair).toBeNull();
+    await tick({ ...flagsFor(), 'no-bundle-repair': true }, deps);
+    expect(runBundleRepairs).toHaveBeenCalledTimes(1);
+  });
+
+  it('probes the selected fix-ready store and reports unreadable evidence', async () => {
+    const flags = flagsFor();
+    mkdirSync(flags['fix-ready-store']);
+    const failed = await tick(flags, { collectInventory: () => ({}), smells: [] });
+    expect(failed.probeErrors.fixReady).toBeTruthy();
+    expect(failed.bundleRepair).toBeNull();
+    rmSync(flags['fix-ready-store'], { recursive: true });
+    const clean = await tick(flags, { collectInventory: () => ({}), smells: [] });
+    expect(clean.probeErrors.fixReady).toBeUndefined();
+  });
+});
 
 describe('lane scan cache target isolation', () => {
   it.each([
@@ -1740,3 +1786,31 @@ it('wires each review sweep and disk probe into tick and publishes distinct open
     sweepReviewTmp.mockImplementation(real.sweepReviewTmp); probeDiskSpace.mockImplementation(real.probeDiskSpace);
   }
 }, 30000);
+
+it('runs card batch reconcile only when due, stamps success, and reports failures', async () => {
+  sealTestRoot.path = dir;
+  const hd = healthDir(dir); mkdirSync(hd, { recursive: true });
+  writeFileSync(join(hd, 'config.json'), JSON.stringify({ tmpSweepEnabled: false, claudeJobsArchiveEnabled: false }));
+  const ps = join(dir, 'ps.txt'); writeFileSync(ps, '');
+  const flags = { 'logs-dir': join(dir, 'logs'), 'lock-root': join(dir, 'locks'),
+    'self-sync-dir': join(dir, 'sync'), 'ps-fixture': ps, 'no-gh': true, 'no-diagnose': true };
+  const start = Date.parse('2026-10-18T12:00:00Z');
+  cardBatchReconcile.mockClear();
+  try {
+    await tick({ ...flags, now: new Date(start).toISOString() });
+    expect(cardBatchReconcile).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(readFileSync(join(hd, 'state.json'))).cardBatchReconcile.completedAt).toBe(start);
+    await tick({ ...flags, now: new Date(start + 299_999).toISOString() });
+    expect(cardBatchReconcile).toHaveBeenCalledTimes(1);
+    await tick({ ...flags, now: new Date(start + 300_000).toISOString() });
+    expect(cardBatchReconcile).toHaveBeenCalledTimes(2);
+    cardBatchReconcile.mockImplementationOnce(() => { throw Error('reconcile failed'); });
+    const failed = await tick({ ...flags, now: new Date(start + 600_000).toISOString() });
+    expect(failed.probeErrors.cardBatchReconcile).toBe('reconcile failed');
+    expect(JSON.parse(readFileSync(join(hd, 'state.json'))).cardBatchReconcile.completedAt).toBe(start + 300_000);
+    cardBatchReconcile.mockClear();
+    await tick({ ...flags, 'dry-run': true });
+    await tick({ ...flags, 'state-root': dir });
+    expect(cardBatchReconcile).not.toHaveBeenCalled();
+  } finally { sealTestRoot.path = null; }
+});

@@ -256,6 +256,57 @@ describe('attributeSmokeFailure', () => {
 });
 
 describe('smokeAndAdopt fallback-plain-main (x5wbsbc)', () => {
+  it.each([true, false])('fallback adoption preserves registration IDs and last-good after failed mechanism-overlay refresh (attributed=%s)', async (attributed) => {
+    const { originDir, cloneDir, env } = makeFixture();
+    Object.assign(env, { WE_DAEMON_CLOSURE_SCOPE: 'off', WE_DAEMON_OVERLAY_AUTO_RETIRE: 'shadow',
+      WE_DAEMON_AUTO_REBASE: '0' });
+    advanceMain(originDir, dir => writeFile(dir, 'main-moved.txt', 'main'));
+    const mechanismFile = 'scripts/lib/daemon-rebuild/fixture.mjs';
+    const mechanismSha = pushBranch(originDir, 'lane/mechanism', dir => writeFile(dir, mechanismFile, 'export const version = 1;'));
+    pushBranch(originDir, 'lane/good', dir => writeFile(dir, 'good.txt', 'good'));
+    pushBranch(originDir, 'lane/bad', dir => writeFile(dir, 'scripts/conveyor/bad.mjs', 'bad'));
+    for (const ref of ['lane/mechanism', 'lane/good', 'lane/bad']) addOverlay(cloneDir, { ref }, { env });
+    const captured = readOverlays(cloneDir, { env });
+    const runSmoke = vi.fn(async ({ root }) => failsWhenFile('scripts/conveyor/bad.mjs', {
+      verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'x',
+        detail: attributed ? `file://${root}/scripts/conveyor/bad.mjs:20` : 'boom' }] },
+    })({ root }));
+    const adopted = await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS });
+    expect(adopted.reason).toBe(attributed ? 'overlay-set-aside' : 'fallback-plain-main');
+    expect(adopted.adopted).toBe(true);
+    const lastGood = readRebuildState(cloneDir, env).adopted;
+    expect(lastGood.applied.map(row => row.ref).sort()).toEqual(attributed ? ['lane/good', 'lane/mechanism'] : ['lane/mechanism']);
+    for (const row of lastGood.applied) {
+      const original = captured.find(entry => entry.ref === row.ref);
+      expect(original.registrationId).toEqual(expect.any(String));
+      expect(row.registrationId).toBe(original.registrationId);
+    }
+    expect(lastGood.applied.find(row => row.ref === 'lane/mechanism').sha).toBe(mechanismSha);
+    expect(readFileSync(join(cloneDir, mechanismFile), 'utf8')).toBe('export const version = 1;');
+
+    advanceMain(originDir, dir => writeFile(dir, 'next-main.txt', 'next'));
+    const nextSmoke = passSmoke();
+    let failedFetches = 0;
+    const refresh = await rebuildClone({ root: cloneDir, env, runSmoke: nextSmoke,
+      run: (args, options) => {
+        if ((args[0] === 'fetch' && args.some(arg => arg.includes('heads/lane/mechanism:')))
+          || (args[0] === 'ls-remote' && args.includes('refs/heads/lane/mechanism'))) {
+          if (args[0] === 'fetch') failedFetches++;
+          return { status: 1, stdout: '', stderr: 'injected refresh failure' };
+        }
+        return git(options.cwd, args);
+      }, prState: async () => null, lockOpts: LOCK_OPTS });
+    expect(failedFetches).toBe(2); // batch and individual refresh both failed
+    expect(refresh.reason).toBe('pinned-overlay-unavailable');
+    expect(refresh.moved).toBe(false);
+    expect(nextSmoke).not.toHaveBeenCalled();
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(lastGood.head);
+    expect(readRebuildState(cloneDir, env).adopted).toEqual(lastGood);
+    expect(readFileSync(join(cloneDir, mechanismFile), 'utf8')).toBe('export const version = 1;');
+    expect(readOverlays(cloneDir, { env }).find(row => row.ref === 'lane/mechanism').registrationId)
+      .toBe(lastGood.applied.find(row => row.ref === 'lane/mechanism').registrationId);
+  }, 30_000);
+
   it.each([true, false])('two overlays: attributable=%s preserves only proven-good overlays', async (attributable) => {
     const { originDir, cloneDir, env } = makeFixture();
     const mainSha = advanceMain(originDir, (dir) => writeFile(dir, 'main-moved.txt', 'main'));

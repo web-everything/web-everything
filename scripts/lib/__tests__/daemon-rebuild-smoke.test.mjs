@@ -6,11 +6,12 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { rebuildClone, readRebuildState } from '../daemon-rebuild.mjs';
-import { addOverlay, readOverlayState } from '../daemon-overlays.mjs';
-import { dispatchSmokeSuspects, smokeFailureFiles } from '../daemon-rebuild/smoke.mjs';
+import { addOverlay, overlayFilePath, readOverlayState, removeOverlay } from '../daemon-overlays.mjs';
+import { dispatchSmokeSuspects, smokeAndAdopt, smokeFailureFiles } from '../daemon-rebuild/smoke.mjs';
 import { checkDaemonEntriesBoot, DAEMON_ENTRIES_ENV } from '../daemon-boot-smoke.mjs';
 import { runRealDispatchSmoke } from '../daemon-load-overlay.mjs';
 import { alertsFilePath } from '../daemon-rebuild/state.mjs';
+import { replayFallbackRegistration } from '../../conveyor/soak/breaks/overlay-fallback-registration.mjs';
 
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
@@ -86,6 +87,19 @@ function addDispatchOverlay(f, ref = 'lane/s3b', file = 'scripts/operations/disp
   return sha;
 }
 const refs = (f) => readOverlayState(f.cloneDir, { env: f.env }).overlays.map((o) => o.ref);
+
+describe('fallback registration evidence', () => {
+  for (const selective of [false, true]) for (const recovery of [false, true]) {
+    it(`fallback adoption preserves retained mechanism registration evidence across refresh failure (${selective ? 'selective' : 'plain'}, ${recovery ? 'recovered' : 'direct'})`, async () => {
+      expect((await replayFallbackRegistration({ selective, recovery })).violations).toEqual([]);
+    }, 30_000);
+  }
+  for (const selective of [false, true]) {
+    it(`fallback adoption does not bind old mechanism evidence to a replacement registration (${selective ? 'selective' : 'plain'})`, async () => {
+      expect((await replayFallbackRegistration({ selective, replace: true })).violations).toEqual([]);
+    }, 30_000);
+  }
+});
 
 beforeEach(() => { tempDirs.length = 0; });
 afterEach(() => {
@@ -377,6 +391,107 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
   });
 });
 
+describe('dispatch smoke registration CAS', () => {
+  it('every rebuild removal carries registration CAS or the explicit auto-rebase snapshot allowlist', () => {
+    const directory = join(process.cwd(), 'scripts/lib/daemon-rebuild');
+    const calls = readdirSync(directory).filter(name => name.endsWith('.mjs')).flatMap(name => {
+      const source = readFileSync(join(directory, name), 'utf8');
+      return [...source.matchAll(/\bremoveOverlay\([^;]+\);/g)].map(match => ({ name, call: match[0] }));
+    });
+    expect(calls.length).toBeGreaterThanOrEqual(4);
+    for (const { name, call } of calls) {
+      // Verified auto-rebase swaps use a complete saved oldOverlay identity (including registrationId)
+      // plus requireRef. Keep this sole existing exception explicit; new call sites must carry id CAS.
+      if (name === 'auto-rebase.mjs' && call.includes('removeOverlay(root, swap.old,')) {
+        expect(call).toContain('expectedOverlay: swap.oldOverlay');
+        expect(call).toContain('requireRef: swap.new');
+      } else {
+        expect(call, name).toContain('expectRegistrationId:');
+      }
+    }
+  });
+
+  // Exercise the real smokeAndAdopt removal branch and list/event storage. Only Git and the two
+  // smoke runners are injected: this fixture neither creates a repository nor launches a worker.
+  it.each([
+    { name: 'drops a matching registration', token: 'matching', dropped: true },
+    { name: 'preserves a replacement registration added during smoke', token: 'replaced', dropped: false },
+    { name: 'preserves a suspect with a missing registration token', token: 'missing', dropped: false },
+    { name: 'preserves a suspect with an undefined registration token', token: undefined, dropped: false },
+    { name: 'preserves a suspect with a null registration token', token: null, dropped: false },
+    { name: 'preserves a suspect with an empty registration token', token: '', dropped: false },
+    { name: 'preserves a suspect with a non-string registration token', token: 42, dropped: false },
+  ])('$name', async ({ token, dropped }) => {
+    const root = mktemp('we-dispatch-cas-');
+    const env = {
+      WE_DAEMON_STATE_DIR: join(root, 'state'),
+      WE_DAEMON_OVERLAY_DIR: join(root, 'overlays'),
+      WE_REBUILD_SMOKE_REUSE_ENABLED: '0',
+    };
+    const registration = { ref: 'lane/dispatch-cas', pr: 77, addedBy: 't' };
+    addOverlay(root, registration, { env });
+    const original = readOverlayState(root, { env }).overlays[0];
+    const applied = { ...original, sha: 'a'.repeat(40) };
+    if (token === 'missing') delete applied.registrationId;
+    else if (token !== 'matching' && token !== 'replaced') applied.registrationId = token;
+    const file = overlayFilePath(root, env);
+    const eventBytes = () => readdirSync(env.WE_DAEMON_OVERLAY_DIR).filter(n => n.endsWith('.events.jsonl'))
+      .sort().map(n => readFileSync(join(env.WE_DAEMON_OVERLAY_DIR, n), 'utf8')).join('');
+    let listBeforeDrop;
+    let eventsBeforeDrop;
+    const dispatch = vi.fn(async () => {
+      if (token === 'replaced') {
+        removeOverlay(root, original.ref, { env, expectRegistrationId: original.registrationId });
+        addOverlay(root, registration, { env });
+        expect(readOverlayState(root, { env }).overlays[0].registrationId).not.toBe(original.registrationId);
+      }
+      // Capture after the operator's re-registration, before the dispatch result reaches the drop loop.
+      listBeforeDrop = readFileSync(file, 'utf8');
+      eventsBeforeDrop = eventBytes();
+      return { ok: false, reason: 'commands-denied' };
+    });
+    const run = vi.fn((args) => {
+      if (args[0] === 'merge-base') return { status: 0, stdout: 'b'.repeat(40) };
+      if (args[0] === 'diff') return { status: 0, stdout: `${SETTINGS.dispatchPaths[0]}\n` };
+      if (args[0] === 'worktree') return { status: 0, stdout: '' };
+      // No cached smoke identity: the candidate must run both smoke stages.
+      if (args[0] === 'rev-parse') return { status: 1, stdout: '' };
+      throw new Error(`unexpected Git call: ${args.join(' ')}`);
+    });
+    const runSmoke = vi.fn(async () => PASS);
+    const result = await smokeAndAdopt({
+      root, env, stEnv: env, log: { error() {} }, run, runSmoke, now: Date.now,
+      plan: { finalSha: applied.sha, mainSha: 'b'.repeat(40), inputsKey: 'dispatch-cas', applied: [applied] },
+      prevHead: 'c'.repeat(40), lease: { token: 'lease', path: join(root, 'candidate') },
+      overlaysBefore: [original], prepAlerts: [], mainOnly: false,
+      finalLockOpts: { ...LOCK_OPTS, lockRoot: join(root, 'locks') },
+      dispatchSmoke: { settings: SETTINGS, run: dispatch, match: (files, patterns) => files.filter(f => patterns.includes(f)) },
+    });
+    expect(runSmoke).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch.mock.calls[0][0].tree).toBe(join(root, 'candidate'));
+    expect(result).toMatchObject({ moved: false, reason: 'dispatch-smoke-failed' });
+    expect(readRebuildState(root, env).held.reason).toBe('dispatch-smoke-failed');
+    const kinds = result.alerts.map(a => a.kind);
+    expect(kinds).toContain('dispatch-smoke-failed');
+    expect(kinds).not.toContain('overlay-drop-failed');
+    if (dropped) {
+      expect(readOverlayState(root, { env }).overlays).toEqual([]);
+      const newEvents = eventBytes().slice(eventsBeforeDrop.length).trim().split('\n').map(line => JSON.parse(line));
+      expect(newEvents.filter(e => e.kind === 'dropped-dispatch-smoke-failed')).toEqual([
+        expect.objectContaining({ ref: original.ref, pr: original.pr }),
+      ]);
+      expect(kinds).toContain('overlay-dropped-dispatch-smoke-failed');
+      expect(kinds).not.toContain('overlay-registration-changed');
+    } else {
+      expect(readFileSync(file, 'utf8')).toBe(listBeforeDrop);
+      expect(eventBytes()).toBe(eventsBeforeDrop);
+      expect(result.alerts).toContainEqual({ kind: 'overlay-registration-changed', detail: { ref: original.ref } });
+      expect(kinds).not.toContain('overlay-dropped-dispatch-smoke-failed');
+    }
+  });
+});
+
 describe('dispatchSmokeSuspects', () => {
   const match = (files, pats) => files.filter((x) => pats.includes(x));
   const okGit = (files) => (args) => (args[0] === 'merge-base' ? { status: 0, stdout: 'base\n' } : { status: 0, stdout: files.join('\n') });
@@ -391,5 +506,11 @@ describe('dispatchSmokeSuspects', () => {
     expect(dispatchSmokeSuspects({
       git: okGit(['q']), applied, adoptedApplied: null, patterns: ['p'], match,
     })).toEqual([]);
+  });
+
+  it('carries each applied row\'s registrationId, so the definite drop is bound to the smoked registration', () => {
+    const applied = [{ ref: 'a', sha: '1', registrationId: 'reg-a' }, { ref: 'b', sha: '2' }];
+    const out = dispatchSmokeSuspects({ git: okGit(['p']), applied, adoptedApplied: null, patterns: ['p'], match });
+    expect(out.map((s) => [s.ref, s.registrationId])).toEqual([['a', 'reg-a'], ['b', undefined]]);
   });
 });
