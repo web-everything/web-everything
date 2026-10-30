@@ -26,7 +26,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { rollupRowKind } from '../lib/rollup-collapse.mjs';
 import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.mjs';
-import { latestAttempts, summarize } from '../lib/check-state-predicate.mjs';
+import { classifyCheck, latestAttempts, summarize } from '../lib/check-state-predicate.mjs';
 import { CODEQL_CHECK_NAME, failedCodeQLCheck, loadDrainGateSettings } from '../lib/codeql-gate.mjs';
 
 export const CI_HEAL_VERDICT_ENV = 'WE_CI_HEAL_RECHECK_NOT_CI_BREAK';
@@ -88,30 +88,52 @@ export const sameSha = (a, b) => {
 
 const gateNames = [REVIEW_GATE_CHECK, 'merge-gate'];
 const lowerState = state => String(state ?? '').toLowerCase();
-/** Adapt GraphQL rollups and legacy statuses without replacing the shared state policy. */
-function checkEvidence(rollup, requiredChecks) {
+const normalizeRollupCheck = row => {
+  const check = { ...row, name: row?.name || row?.context };
+  if (row?.status == null && row?.state != null) {
+    if (['pending', 'expected'].includes(lowerState(row.state))) check.status = 'pending';
+    else check.conclusion = row.state;
+  }
+  return check;
+};
+
+const rollupTime = row => {
+  for (const key of ['completedAt', 'completed_at', 'startedAt', 'started_at', 'createdAt', 'created_at']) {
+    const time = Date.parse(row?.[key]);
+    if (Number.isFinite(time) && time > Date.parse('2000-01-01T00:00:00Z')) return time;
+  }
+  const state = classifyCheck({ ...normalizeRollupCheck(row), required: true });
+  return state === 'pending' || state === 'red' ? Infinity : -Infinity;
+};
+
+/**
+ * Select original rollup rows by source tier, effective time, then exact check id.
+ * Workflow attempt counters are scoped to different runs, so cannot rank this feed.
+ * Keep S1's integer-pair contract intact: filter by time, then let latestAttempts
+ * compare ids and resolve ambiguous ties using the shared fail-closed policy.
+ */
+export function latestRollupAttempts(rollup) {
   const rows = Array.isArray(rollup) ? rollup : [];
   const groups = new Map();
   for (const row of rows) {
-    const name = row?.name ?? row?.context;
+    const name = row?.name || row?.context;
     if (!groups.has(name)) groups.set(name, []);
-    groups.get(name).push({ ...row, name, __typename: rollupRowKind(row) });
+    groups.get(name).push(row);
   }
-  const checks = [...groups.values()].flatMap(group => {
-    // Preserve CheckRun > untagged > legacy-status precedence, then use the
-    // same effective-time ranking for every name within its preferred tier.
+  return [...groups.values()].flatMap(group => {
     const pool = ['CheckRun', 'untagged', 'StatusContext']
-      .map(kind => group.filter(row => row.__typename === kind)).find(tier => tier.length);
-    return latestAttempts(pool.map(row => {
-      // Normalise legacy StatusContext state BEFORE ranking, so an undated PENDING status ranks as pending.
-      const check = { ...row };
-      if (row?.status == null && row?.state != null) {
-        if (['pending', 'expected'].includes(lowerState(row.state))) check.status = 'pending';
-        else check.conclusion = row.state;
-      }
-      return check;
-    }));
+      .map(kind => group.filter(row => rollupRowKind(row) === kind)).find(tier => tier.length);
+    const timed = pool.map(row => ({ row, time: rollupTime(row) }));
+    const newest = timed.reduce((best, item) => Math.max(best, item.time), -Infinity);
+    const originals = new Map(timed.filter(item => item.time === newest)
+      .map(({ row }) => [{ ...normalizeRollupCheck(row), run_attempt: 0 }, row]));
+    return latestAttempts([...originals.keys()]).map(check => originals.get(check));
   });
+}
+
+/** Adapt GraphQL rollups and legacy statuses without replacing the shared state policy. */
+function checkEvidence(rollup, requiredChecks) {
+  const checks = latestRollupAttempts(rollup).map(normalizeRollupCheck);
   // Only the shared merge-gate hold classifier's annotation proves a review hold.
   // A job/setup failure (or unreadable verdict) must remain ordinary CI evidence.
   const holdGateNames = [REVIEW_GATE_CHECK];

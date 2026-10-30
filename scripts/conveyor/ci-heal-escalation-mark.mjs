@@ -57,8 +57,7 @@ import { collectCiAuthDiagnosis, renderCiAuthDiagnosis } from './ci-auth-diagnos
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { isBudgetRefusal, postPrComment, recordOwedWrite, resolveOwedRepo } from './ci-heal-owed.mjs';
-import { resolveCiHealVerdictSettings, unsettledRequiredChecks, gateOnlyRedStates, ciGreenForEscalation, sameSha } from './ci-heal-verdict-recheck.mjs';
-import { latestAttempts } from '../lib/check-state-predicate.mjs';
+import { resolveCiHealVerdictSettings, unsettledRequiredChecks, gateOnlyRedStates, ciGreenForEscalation, sameSha, latestRollupAttempts } from './ci-heal-verdict-recheck.mjs';
 import { excusePrMergeGateHolds, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
@@ -472,7 +471,7 @@ function defaultReadPrChecks({ pr, repo }, {
   const rows = Array.isArray(parsed.statusCheckRollup) ? parsed.statusCheckRollup : [];
   // Select once with R216 before the shared hold reader examines the job. It
   // must never annotate an older failure beside a newer success/pending run.
-  const [mergeGate] = latestAttempts(rows.filter(row => row.name === 'merge-gate'));
+  const [mergeGate] = latestRollupAttempts(rows.filter(row => row.name === 'merge-gate'));
   const statusCheckRollup = rows.filter(row => row.name !== 'merge-gate' || row === mergeGate);
   let readError;
   const checkedRead = reader => input => {

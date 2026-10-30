@@ -7,11 +7,39 @@ import * as verdictRecheck from '../ci-heal-verdict-recheck.mjs';
 import { checkNeedsHumanEscalable, checkNotCiBreakRecordable, notCiBreakRecordRefusal } from '../ci-heal-escalation-mark.mjs';
 import { excuseMergeGateRows } from '../../lib/merge-gate-hold-class.mjs';
 import { latestCheckNamed } from '../../lib/rollup-collapse.mjs';
+import { latestAttempts } from '../../lib/check-state-predicate.mjs';
 
 const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/ci-heal-verdict/pr4535-2026-10-09.json'), 'utf8'));
 const input = { escalation: { outcome: 'not-a-ci-break', headSha: fixture.headRefOid }, headSha: fixture.headRefOid,
   rollup: fixture.statusCheckRollup, requiredChecks: fixture.requiredChecks };
 const green = fixture.requiredChecks.map((name) => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' }));
+
+describe('S1 restack preserves both evidence contracts', () => {
+  it('keeps S1 attempt ranking while CI-heal selects the later original rollup row without mutation', () => {
+    const older = Object.freeze({ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS',
+      run_attempt: 2, id: 100, completedAt: '2026-10-28T01:00:00Z' });
+    const newer = Object.freeze({ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE',
+      run_attempt: 1, id: 200, completedAt: '2026-10-28T02:00:00Z' });
+    for (const rows of [Object.freeze([older, newer]), Object.freeze([newer, older])]) {
+      expect(latestAttempts(rows)[0]).toBe(older);
+      expect(verdictRecheck.latestRollupAttempts(rows)[0]).toBe(newer);
+      expect(requiredCheckStates({ rollup: rows, requiredChecks: ['test'] }).red).toEqual(['test']);
+    }
+  });
+
+  it.each(['startedAt', 'started_at', 'createdAt', 'created_at'])(
+    'retains %s timestamp fallback after invalid completion evidence', key => {
+      const older = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS',
+        id: 200, completedAt: '2026-10-28T01:00:00Z' };
+      const newer = { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE',
+        id: 100, completedAt: 'invalid', completed_at: '1970-01-01T00:00:00Z',
+        [key]: '2026-10-28T02:00:00Z' };
+      for (const rollup of [[older, newer], [newer, older]]) {
+        expect(requiredCheckStates({ rollup, requiredChecks: ['test'] }).red).toEqual(['test']);
+      }
+    },
+  );
+});
 
 describe('operator send-back exact check identity', () => {
   it('required test FAILURE plus a distinct TEST SUCCESS must stay red', async () => {

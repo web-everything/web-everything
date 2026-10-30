@@ -5,7 +5,7 @@
 Check names and required rosters match exactly, including case, as in the drain's
 `latestCheckNamed`: a passing `TEST` never clears a failing or missing required `test`.
 Only status and conclusion values are case-insensitive; CodeQL and hold-gate names retain their exact identity.
-Rank attempts with `scripts/lib/check-state-predicate.mjs#latestAttempts`: completion time
+Rank rollup evidence with `scripts/conveyor/ci-heal-verdict-recheck.mjs#latestRollupAttempts`: completion time
 (invalid or pre-2000/epoch values count as absent), else valid start time, else valid creation time
 (`created_at`/`createdAt`), then BigInt-exact check-run id; an unfinished row
 (queued/in_progress/pending, including waiting/requested) with no valid timestamp after these
@@ -15,6 +15,10 @@ startup failure, or unknown outcome. Other completed rows with missing/invalid t
 rank lowest. Test dated/undated SUCCESS, FAILURE and STARTUP_FAILURE pairs in both input
 orders, plus timestamp fallbacks and row flags. Workflow run ids and attempt counters never rank evidence. Verdict readers retain
 CheckRun → untagged → StatusContext precedence before ranking within the chosen tier.
+The rollup adapter filters by time, then delegates exact id and fail-closed tie handling to
+`scripts/lib/check-state-predicate.mjs#latestAttempts`, whose S1 contract remains the greatest
+`(run_attempt, id)` integer pair. The adapter clears workflow attempt ranks on temporary copies
+and returns the original rows, so the CLI annotates the same selected merge-gate evidence.
 The escalation CLI reuses `excusePrMergeGateHolds` for head-bound hold evidence, with
 `prChecksOptions` supplying hermetic readers. A failed PR or roster read permits recording with a warning; an unreadable merge-gate verdict or freeze read still permits `needs-human` with a warning, but keeps the red-check refusal for `not-a-ci-break`.
 
