@@ -3,7 +3,7 @@ import '../lib/tools-root-guard.mjs';
 import { spawn } from 'node:child_process';
 import * as filesystem from 'node:fs/promises';
 import { constants, realpathSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join, resolve, relative, isAbsolute, win32 } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -24,6 +24,24 @@ export function filterEnv(env = {}) {
   if (Object.hasOwn(env, 'DIFF_COVERAGE_BASE') && !allowedEnv({DIFF_COVERAGE_BASE:env.DIFF_COVERAGE_BASE}))
     throw Object.assign(new Error('Invalid DIFF_COVERAGE_BASE: use local fallback'), {code:'invalid-diff-coverage-base'});
   return Object.fromEntries(Object.entries(env).filter(([key,value]) => allowedEnv({[key]:value})));
+}
+
+// Project only verified report bytes; the staged manifest is rehashed below.
+function portableCoverage(bytes, cwd) {
+  try {
+    const report = JSON.parse(bytes.toString('utf8'));
+    if (!report || typeof report !== 'object' || Array.isArray(report)) throw new Error('Invalid report');
+    const portable = Object.create(null);
+    for (const [key, value] of Object.entries(report)) {
+      const path = isAbsolute(key) ? relative(cwd, key) : key;
+      if (win32.isAbsolute(key) && !isAbsolute(key) || !path || path === '..' || path.startsWith('../')
+        || isAbsolute(path) || Object.hasOwn(portable, path)) throw new Error('Unsafe coverage path');
+      portable[path] = value;
+    }
+    return Buffer.from(JSON.stringify(portable));
+  } catch {
+    throw Object.assign(new Error('Coverage report is not portable; use local fallback'), {code:'coverage-report-not-portable'});
+  }
 }
 
 export function validateRunId(id) {
@@ -395,7 +413,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
   let executionEnv;
   try { executionEnv = filterEnv(env); } catch (error) { return fallback(error.code); }
-  const needsGit=argv[2]==='check:standards';
+  const needsGit=argv[2]==='check:standards'||Object.hasOwn(executionEnv,'DIFF_COVERAGE_BASE');
   if (!validateRunId(runId) || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host)) return fallback('invalid-parameters');
   try {
     if ((await exec({ file: 'ssh', args: [host, 'true'], cwd })).code !== 0) return fallback('forge-unreachable');
@@ -423,6 +441,14 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
         const evidence=await exec({file:'git',args:['rev-parse','HEAD'],cwd});
         logicalHead=protocolText(evidence.stdout,128).trim();
         if(evidence.code!==0||!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(logicalHead))throw new Error('Missing Git evidence');
+      }
+      if (Object.hasOwn(executionEnv,'DIFF_COVERAGE_BASE')) {
+        try {
+          const evidence=await exec({file:'git',args:['rev-parse','--verify','--end-of-options',executionEnv.DIFF_COVERAGE_BASE+'^{commit}'],cwd});
+          const sha=protocolText(evidence.stdout,128).trim();
+          if(evidence.code!==0||!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(sha))throw new Error('Invalid coverage base SHA');
+          executionEnv.DIFF_COVERAGE_BASE=sha;
+        } catch {throw Object.assign(new Error('Coverage base unavailable; use local fallback'),{code:'diff-coverage-base-unavailable'});}
       }
       // Discovery is read-only. Older separately installed wrappers reject this
       // subcommand; their full-ship path retains its existing admission order.
@@ -497,6 +523,14 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
             transferBytes+=stagedContent.length;transferCount++;
             const hash = createHash('sha256').update(stagedContent).digest('hex');
             if (hash !== entry.sha256) throw new Error('Staged bytes differ from manifest');
+            if (snapshot.source === cwd && entry.path.equals(Buffer.from('coverage/coverage-final.json'))) {
+              const portable=portableCoverage(stagedContent,cwd);
+              const stamp=await fs.lstat(destination);
+              await fs.writeFile(destination,portable);
+              await fs.utimes(destination,stamp.atime,stamp.mtime);
+              transferBytes+=portable.length-stagedContent.length;
+              entry.sha256=createHash('sha256').update(portable).digest('hex');
+            }
           }
           const after = await fs.lstat(snapshot.source);
           if (after.isSymbolicLink() || after.ino !== rootInfo.ino || after.dev !== rootInfo.dev) throw new Error('Staging root swapped');
@@ -504,6 +538,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
         if (manifest.siblings && !sameSiblingEvidence(await checkSibling(resolve(cwd,'../frontierui'),exec,fs),manifest.siblings.frontierui))
           throw new Error('Sibling HEAD changed');
       } catch(error) {
+        if(error.code==='coverage-report-not-portable')throw error;
         if(delta)throw error;
         return {mode:'not-started', terminated:true, reason:'snapshot-staging-failed'};
       }
@@ -513,7 +548,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
         const current=await exec({file:'git',args:['rev-parse','HEAD'],cwd});
         if(current.code!==0||protocolText(current.stdout,128).trim()!==logicalHead)throw new Error('Git HEAD changed during snapshot; use local fallback');
       }
-      const wire = {...manifestWire(manifest),...(needsGit?{git:{head:logicalHead}}:{})};
+      const wire = {...manifestWire(manifest),...(needsGit?{git:{head:logicalHead,...(executionEnv.DIFF_COVERAGE_BASE?{diffCoverageBase:executionEnv.DIFF_COVERAGE_BASE}:{})}}:{})};
       const wireDigest=digestManifest(wire);
       // Preserve local lockfile-precedence admission even when an injected
       // inventory omits shrinkwrap; only the staged digest is transmitted.
@@ -574,6 +609,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       }
       if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code};
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
+      if (['coverage-report-not-portable','diff-coverage-base-unavailable'].includes(error.code)) return fallback(error.code);
       if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code};
       return fallback(error.code === 'ignored-test-file' ? 'ignored-test-file' : 'copy-failed');
     }
@@ -591,12 +627,13 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       // Only the fixed wrapper's protected prepared state can certify no execution.
       if (reply && (Object.keys(reply).sort().join(',') === 'nonce,phase,reason,run,siblings,started,v' || (delta && reply.delta===true && Object.keys(reply).sort().join(',') === 'delta,nonce,phase,reason,run,siblings,started,v'))
         && reply.v === 1 && reply.nonce === nonce && reply.run === run
-        && reply.phase === 'rejected' && ['snapshot-rejected','forge-busy','git-head-unavailable'].includes(reply.reason)
-        && (reply.reason!=='git-head-unavailable'||needsGit)
-        && (reply.reason === 'forge-busy' || (needsGit && reply.reason==='git-head-unavailable' && reply.siblings===!!expectedManifest.siblings) || reply.siblings === true || (delta && reply.delta===true && reply.siblings===!!expectedManifest.siblings)) && reply.started === false)
+        && reply.phase === 'rejected' && ['snapshot-rejected','forge-busy','git-head-unavailable','diff-coverage-base-unavailable'].includes(reply.reason)
+        && (!['git-head-unavailable','diff-coverage-base-unavailable'].includes(reply.reason)||needsGit)
+        && (reply.reason === 'forge-busy' || (needsGit && ['git-head-unavailable','diff-coverage-base-unavailable'].includes(reply.reason) && reply.siblings===!!expectedManifest.siblings) || reply.siblings === true || (delta && reply.delta===true && reply.siblings===!!expectedManifest.siblings)) && reply.started === false)
       {
         if(reply.reason === 'forge-busy')return {mode:'not-started',terminated:true,reason:'forge-busy'};
         if(needsGit&&reply.reason==='git-head-unavailable')return {mode:'not-started',terminated:true,reason:'git-head-unavailable'};
+        if(needsGit&&reply.reason==='diff-coverage-base-unavailable')return {mode:'not-started',terminated:true,reason:reply.reason};
         if(delta && reply.delta===true) {
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.

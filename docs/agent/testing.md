@@ -2006,6 +2006,11 @@ Use temporary lock roots and injected telemetry in legacy remote-contract fixtur
 contact Forge or consume the real host's remote slots from a unit test. Retain the original
 termination acknowledgements and refusal assertions when updating those fixtures.
 
+Coverage transport fixtures must use absolute Istanbul source keys and preserve report/source
+mtimes. Compare local and remote attribution after transport makes keys relative. Pin coverage
+base refs to local commit SHAs in the manifest; reject bases outside reconstructed public ancestry,
+including unrelated commits already present in the worker's object cache.
+
 Remote telemetry older than 30 seconds or more than 60 seconds ahead routes through local
 admission. Compare ET timestamps by instant with `Date.parse`, independent of the process timezone.
 `forge-health-fresh.test.mjs` pins both freshness boundaries, winter/summer offsets, strict optional
