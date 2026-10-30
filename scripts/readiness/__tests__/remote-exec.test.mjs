@@ -1229,6 +1229,31 @@ describe('forge-setup.sh', () => {
     return body[1];
   }
 
+  it.each(['0','129','not-a-number'])('rejects FORGE_EXEC_SLOTS=%s before setup',slots=>{
+    const setup=readFileSync(new URL('../forge-setup.sh',import.meta.url),'utf8');
+    const guard=setup.slice(setup.indexOf('set -euo pipefail'),setup.indexOf('export FORGE_EXEC_SLOTS'));
+    const result=spawnSync('bash',['-c',guard],{encoding:'utf8',timeout:10000,env:{...process.env,FORGE_EXEC_SLOTS:slots}});
+    expect(result.status).not.toBe(0);expect(result.stderr).toContain('FORGE_EXEC_SLOTS must be 1..128');
+  });
+  it.each([
+    ['invalid or shared worker identity',"pwd.getpwnam = lambda name: types.SimpleNamespace(pw_uid=0, pw_gid=os.getgid())"],
+    ['invalid or shared worker identity',"original_pwd = pwd.getpwnam\npwd.getpwnam = lambda name: types.SimpleNamespace(pw_uid=5001, pw_gid=original_pwd(name).pw_gid) if name.startswith('forge-exec-') else original_pwd(name)"],
+    ['invalid or shared worker identity',`# Duplicate primary GID with distinct worker UIDs and matching named groups.
+original_pwd, original_grp = pwd.getpwnam, grp.getgrnam
+pwd.getpwnam = lambda name: types.SimpleNamespace(pw_uid=original_pwd(name).pw_uid, pw_gid=6001) if name.startswith('forge-exec-') else original_pwd(name)
+grp.getgrnam = lambda name: types.SimpleNamespace(gr_gid=6001, gr_mem=[]) if name.startswith('forge-exec-') else original_grp(name)`],
+    ['invalid or shared worker identity',"original_grp = grp.getgrnam\ngrp.getgrnam = lambda name: types.SimpleNamespace(gr_gid=9999, gr_mem=[]) if name.startswith('forge-exec-') else original_grp(name)"],
+    ['slot groups must be private',"original_grp = grp.getgrnam\ngrp.getgrnam = lambda name: types.SimpleNamespace(gr_gid=original_grp(name).gr_gid, gr_mem=['intruder'])"],
+    ['slot groups must be private',"os.getgrouplist = lambda name, gid: [gid, 6001] if name == 'ops' else [gid]"],
+    ['slot users must not have supplementary groups',"os.getgrouplist = lambda name, gid: [gid, 9999] if name.startswith('forge-exec-') else [gid]"],
+  ])('rejects setup identity evidence: %s (%s)',(message,override)=>{
+    const srv=join(cwd,'srv');mkdirSync(srv);
+    const body=directorySetup();
+    const harness=directoryHarness(body,srv).replace(body.replaceAll('"/srv"',JSON.stringify(srv)),override+'\n'+body.replaceAll('"/srv"',JSON.stringify(srv)));
+    const result=spawnSync('python3',['-c',harness],{encoding:'utf8',timeout:10000});
+    expect(result.status).not.toBe(0);expect(result.stderr).toContain('RuntimeError: '+message);
+  });
+
   it.each(['forge-exec', 'forge-exec/.cache'])('rejects a symlink at %s without changing its target', (path) => {
     const srv = join(cwd, 'srv');
     const target = join(cwd, 'target');

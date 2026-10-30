@@ -125,6 +125,48 @@ async function quarantinedFixture() {
 }
 
 describe('timed pass quarantine recovery and reporting', () => {
+  it('retains quarantine when an injected probe reports dead without an independent reapGroup', async () => {
+    const f = await quarantinedFixture();
+    f.probe.mockReturnValue('dead');
+    const { reapGroup, ...ports } = f.ports;
+    const pending = runPassAsTimedJob(f.pass, ports);
+    expect(f.store.read(f.record.id).job).toMatchObject({
+      passQuarantine: true, handle: f.record.job.handle,
+    });
+    await expect(pending).resolves.toEqual({ outcome: 'quarantined' });
+    expect(f.spawnFn).toHaveBeenCalledTimes(1);
+    expect(quarantineEvents(f)).toEqual([expect.objectContaining({
+      kind: 'pass-quarantined', detail: expect.objectContaining({
+        ownerLiveness: 'dead', groupGone: false,
+        reason: expect.stringContaining('operator must inspect owner/process group'),
+      }),
+    })]);
+  });
+
+  it.each(['alive', 'unknown'])(
+    'retains quarantine for an %s owner without invoking a group reaper that would confirm gone', async ownerLiveness => {
+      const f = await quarantinedFixture();
+      const retained = f.store.read(f.record.id).job;
+      f.probe.mockReset().mockReturnValue(ownerLiveness);
+      f.ports.reapGroup.mockReset().mockReturnValue(true);
+
+      await expect(runPassAsTimedJob(f.pass, {
+        ...f.ports, store: createJobStore(f.store.dir),
+      })).resolves.toEqual({ outcome: 'quarantined' });
+
+      expect(f.probe).toHaveBeenCalledWith(retained.handle);
+      expect(f.ports.reapGroup).not.toHaveBeenCalled();
+      expect(f.store.read(f.record.id).job).toMatchObject({
+        status: retained.status, handle: retained.handle, passQuarantine: true,
+      });
+      expect(f.store.list().records.map(r => r.id)).toEqual([f.record.id]);
+      expect(f.spawnFn).toHaveBeenCalledTimes(1);
+      expect(quarantineEvents(f)[0]).toMatchObject({
+        kind: 'pass-quarantined', detail: { ownerLiveness, groupGone: false },
+      });
+    },
+  );
+
   it.each(['quarantine', 'reattachment', 'expired deadline'].flatMap(mode =>
     ['server', 'server.local', 'Old-Computer'].map(recordedHost => [mode, recordedHost])))(
     'recovers %s for a dead owner recorded under local alias %s', async (mode, recordedHost) => {
