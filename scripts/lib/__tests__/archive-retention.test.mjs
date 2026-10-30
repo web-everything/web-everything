@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile, utimes, access, readdir, rm, rename, symlink
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { archiveRetention, archiveSettings } from '../archive-retention.mjs';
+import { runArchiveRetentionTick } from '../../conveyor/archive-retention-tick.mjs';
 let root, drive, runs, sessions, stateDir;
 const now = Date.now(), old = new Date(now - 45 * 86400000);
 beforeEach(async () => {
@@ -54,6 +55,125 @@ it('rerun uses numbered parts and never overwrites a daily bundle', async () => 
   await file(join(runs, 'a.json')); await run();
   await file(join(runs, 'b.json')); await run({ now: now + 86400001 });
   expect((await readdir(join(drive, 'runs'))).filter(n => n.endsWith('.tar.gz')).length).toBe(2);
+});
+it.each(['runs', 'sessions'])('unchanged retained sources are archived only once (%s)', async kind => {
+  const p = await file(kind === 'runs' ? join(runs, 'a.json') : join(sessions, 'project', 'old.jsonl'));
+  const options = { kind, withSourceWriterExclusion: undefined };
+  expect((await run(options)).filesArchived).toBe(1);
+  const second = await run({ ...options, now: now + 86400001 });
+  expect(second.filesArchived).toBe(0); expect(second.bundles).toEqual([]);
+  expect(await readFile(p, 'utf8')).toBe('record');
+  const dest = join(drive, kind === 'runs' ? 'runs' : 'claude-sessions');
+  expect((await readdir(dest)).filter(n => n.endsWith('.tar.gz'))).toHaveLength(1);
+});
+it('daily health ticks retain sources and skip their verified versions on the next day', async () => {
+  await file(join(runs, 'a.json')); await file(join(sessions, 'project', 'old.jsonl'));
+  const archive = request => archiveRetention({ driveRoot: drive, runsDir: runs, sessionsDir: sessions, stateDir,
+    emit: () => {}, env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'policy.json') }, ...request });
+  const first = await runArchiveRetentionTick({ now, archive, log: () => {} });
+  expect(first.results.map(r => [r.filesArchived, r.filesRetained])).toEqual([[1, 1], [1, 1]]);
+  const second = await runArchiveRetentionTick({ now: now + 86400001, archive, log: () => {} });
+  expect(second.results.map(r => r.bundles)).toEqual([[], []]);
+  expect(second.error).toBeNull();
+});
+it.each(['size', 'mtime', 'same-size restored-mtime'])('changed retained sources are archived again (%s)', async change => {
+  const p = await file(join(runs, 'a.json'));
+  const options = { withSourceWriterExclusion: undefined };
+  await run(options);
+  if (change !== 'mtime') await writeFile(p, change === 'size' ? 'longer record' : 'update');
+  const date = change === 'mtime' ? new Date(old.getTime() + 10000) : old;
+  await utimes(p, date, date);
+  const second = await run({ ...options, now: now + 86400001 });
+  expect(second.filesArchived).toBe(1); expect(second.bundles).toHaveLength(1);
+  const third = await run({ ...options, now: now + 2 * 86400001 });
+  expect(third.filesArchived).toBe(0); expect(third.bundles).toEqual([]);
+  expect((await readdir(join(drive, 'runs'))).filter(n => n.endsWith('.tar.gz'))).toHaveLength(2);
+});
+it('failed verification does not mark retained sources as archived', async () => {
+  await file(join(runs, 'a.json'));
+  const options = { withSourceWriterExclusion: undefined };
+  const failed = await run({ ...options, listBundle: async () => [] });
+  expect(failed.filesArchived).toBe(0); expect(failed.errors.join()).toMatch(/verification/);
+  const retry = await run({ ...options, now: now + 86400001 });
+  expect(retry.filesArchived).toBe(1);
+  expect((await run({ ...options, now: now + 2 * 86400001 })).filesArchived).toBe(0);
+});
+it('a changed session companion is archived without duplicating its retained transcript', async () => {
+  const project = join(sessions, 'project');
+  await file(join(project, 'old.jsonl'));
+  const companion = await file(join(project, 'old', 'agent.jsonl'));
+  await utimes(join(project, 'old'), old, old);
+  const options = { kind: 'sessions', withSourceWriterExclusion: undefined };
+  expect((await run(options)).filesArchived).toBe(2);
+  await writeFile(companion, 'updated companion'); await utimes(companion, old, old);
+  expect((await run({ ...options, now: now + 86400001 })).filesArchived).toBe(1);
+  expect((await run({ ...options, now: now + 2 * 86400001 })).filesArchived).toBe(0);
+});
+it('a source changed during bundling is eligible again after it ages', async () => {
+  const p = await file(join(runs, 'a.json'));
+  const options = { withSourceWriterExclusion: undefined };
+  await run({ ...options, afterBundle: async () => { await writeFile(p, 'update'); await utimes(p, old, old); } });
+  expect((await run({ ...options, now: now + 86400001 })).filesArchived).toBe(1);
+});
+it('dry-run reads archived versions without changing the manifest or stamp', async () => {
+  await file(join(runs, 'a.json'));
+  await run({ withSourceWriterExclusion: undefined });
+  const manifest = join(stateDir, 'runs.manifest.json'), stamp = join(stateDir, 'runs.stamp');
+  const before = await Promise.all([readFile(manifest, 'utf8'), readFile(stamp, 'utf8')]);
+  expect((await run({ dryRun: true, now: now + 86400001 })).filesEligible).toBe(0);
+  expect(await Promise.all([readFile(manifest, 'utf8'), readFile(stamp, 'utf8')])).toEqual(before);
+});
+it('a different Drive destination does not reuse archived-source evidence', async () => {
+  await file(join(runs, 'a.json'));
+  await run({ withSourceWriterExclusion: undefined });
+  const otherDrive = join(root, 'other-drive'); await mkdir(otherDrive);
+  expect((await run({ driveRoot: otherDrive, now: now + 86400001 })).filesArchived).toBe(1);
+});
+it('an unreadable or oversized manifest fails closed with an operator fallback', async () => {
+  const p = await file(join(runs, 'a.json'));
+  await run({ withSourceWriterExclusion: undefined });
+  const manifest = join(stateDir, 'runs.manifest.json');
+  await writeFile(manifest, '{bad json');
+  const invalid = await run({ now: now + 86400001 });
+  expect(invalid.errors.join()).toMatch(/manifest.*operator/); expect(invalid.bundles).toEqual([]);
+  await writeFile(manifest, '{}');
+  const fd = await open(manifest, 'r+');
+  try { await fd.truncate(128 * 1024 * 1024 + 1); } finally { await fd.close(); }
+  const oversized = await run({ now: now + 86400001 });
+  expect(oversized.errors.join()).toMatch(/manifest.*operator/); expect(oversized.bundles).toEqual([]);
+  expect(await exists(p)).toBe(true);
+});
+it('manifest publication failure retains sources and retries without trusting partial state', async () => {
+  const p = await file(join(runs, 'a.json'));
+  const manifest = join(stateDir, 'runs.manifest.json');
+  const failed = await run({ afterBundle: async () => mkdir(manifest) });
+  expect(failed.errors.length).toBeGreaterThan(0); expect(await exists(p)).toBe(true);
+  expect((await readdir(stateDir)).filter(n => n.endsWith('.partial'))).toEqual([]);
+  await rm(manifest, { recursive: true });
+  const options = { withSourceWriterExclusion: undefined };
+  expect((await run({ ...options, now: now + 86400001 })).filesArchived).toBe(1);
+  expect((await run({ ...options, now: now + 2 * 86400001 })).filesArchived).toBe(0);
+});
+it.each(['read', 'write'])('manifest entry bound fails closed on %s', async mode => {
+  await file(join(runs, 'a.json')); await run();
+  let p = await file(join(runs, 'b.json'));
+  if (mode === 'read') {
+    expect((await run({ now: now + 86400001 })).filesArchived).toBe(1);
+    p = await file(join(runs, 'c.json'));
+  }
+  const manifest = join(stateDir, 'runs.manifest.json'), before = await readFile(manifest, 'utf8');
+  const out = await run({ maxFiles: 1, now: now + 2 * 86400001 });
+  expect(out.errors.join()).toMatch(/manifest.*operator/); expect(out.filesArchived).toBe(0);
+  expect(await readFile(manifest, 'utf8')).toBe(before); expect(await exists(p)).toBe(true);
+});
+it('verified manifest progress survives a failed stamp write', async () => {
+  await file(join(runs, 'a.json'));
+  const stamp = join(stateDir, 'runs.stamp');
+  const options = { withSourceWriterExclusion: undefined };
+  const first = await run({ ...options, afterBundle: async () => mkdir(stamp) });
+  expect(first.filesArchived).toBe(1); expect(first.errors.length).toBeGreaterThan(0);
+  await rm(stamp, { recursive: true });
+  expect((await run(options)).filesArchived).toBe(0);
 });
 it('sessions archive old transcript and subagents but keep memory, current and active families', async () => {
   const project = join(sessions, 'project');

@@ -41,6 +41,36 @@ export function archiveSettings({ env = process.env, tool, log = console.error }
 }
 const dayOf = ms => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' }).format(ms);
 const same = (a, b) => a.isFile() && b.isFile() && a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
+// Include identity/ctime so a replacement or a same-size write with restored mtime is new.
+const version = s => [s.size, s.mtimeMs, s.ctimeMs, s.dev, s.ino];
+const MAX_MANIFEST_BYTES = 128 * 1024 * 1024;
+async function readArchiveManifest(path, source, drive, maxFiles) {
+  try {
+    const stat = await lstat(path);
+    if (!stat.isFile() || stat.size > MAX_MANIFEST_BYTES) throw Error('invalid or oversized manifest');
+    const data = JSON.parse(boundedText(path, stat.size));
+    if (data.v !== 1 || typeof data.source !== 'string' || typeof data.drive !== 'string' || !Array.isArray(data.files) || data.files.length > maxFiles) throw Error('invalid or oversized manifest');
+    const files = new Map();
+    for (const entry of data.files) {
+      if (!Array.isArray(entry) || entry.length !== 6 || typeof entry[0] !== 'string' || !entry[0] || relative(source, resolve(source, entry[0])) !== entry[0] || entry[0].startsWith('../') || !entry.slice(1).every(Number.isFinite) || files.has(entry[0])) throw Error('invalid manifest entry');
+      files.set(entry[0], entry.slice(1));
+    }
+    return data.source === source && data.drive === drive ? files : new Map();
+  } catch (e) {
+    if (e.code === 'ENOENT') return new Map();
+    throw Error(`archive manifest unreadable; operator must inspect or restore manifest: ${e.message}`);
+  }
+}
+async function writeArchiveManifest(path, source, drive, files, maxFiles) {
+  if (files.size > maxFiles) throw Error('archive manifest entry bound exceeded; operator must split the source/state or inspect and raise maxFiles');
+  const data = JSON.stringify({ v: 1, source, drive, files: [...files].map(([name, v]) => [name, ...v]) });
+  if (Buffer.byteLength(data) > MAX_MANIFEST_BYTES) throw Error('archive manifest byte bound exceeded; operator must split the source/state');
+  const temp = `${path}.${randomUUID()}.partial`;
+  try {
+    await writeFile(temp, data, { flag: 'wx', mode: 0o600 });
+    await rename(temp, path);
+  } finally { await unlink(temp).catch(e => { if (e.code !== 'ENOENT') throw e; }); }
+}
 async function directory(path) { const s = await lstat(path); if (!s.isDirectory() || s.isSymbolicLink()) throw Error('not a real directory'); return s; }
 async function tar(args) { return exec('tar', args, { timeout: 30 * 60 * 1000, maxBuffer: 64 * 1024 * 1024 }); }
 /**
@@ -68,6 +98,7 @@ export async function archiveRetention(o = {}) {
     await directory(source);
     const state = o.stateDir ?? join(homedir(), '.cache', 'we-archive-retention');
     const stamp = join(state, `${kind}.stamp`);
+    const archiveManifest = join(state, `${kind}.manifest.json`);
     if (!o.dryRun) {
       await mkdir(state, { recursive: true });
       lock = join(state, `${kind}.lock`);
@@ -82,6 +113,7 @@ export async function archiveRetention(o = {}) {
     const cutoff = Math.min(now - (o.keepDays ?? settings.value[kind].keepDays) * DAY, now - 600000);
     const groups = new Map(); let scanned = 0;
     const maxFiles = o.maxFiles ?? 500000;
+    let archived = await readArchiveManifest(archiveManifest, source, drive, maxFiles);
     async function scan(dir, recursive) {
       const files = [], dirs = []; let fresh = false;
       for await (const entry of await opendir(dir)) {
@@ -99,6 +131,10 @@ export async function archiveRetention(o = {}) {
       return { files, dirs, fresh };
     }
     function add(key, files, dirs = []) {
+      files = files.filter(f => {
+        const prior = archived.get(relative(source, f.path));
+        return !prior || !version(f.stat).every((v, i) => v === prior[i]);
+      });
       if (!files.length) return;
       if (!groups.has(key)) groups.set(key, { files: [], dirs: [] });
       groups.get(key).files.push(...files); groups.get(key).dirs.push(...dirs);
@@ -155,6 +191,13 @@ export async function archiveRetention(o = {}) {
         if (!verified.isFile() || verified.size <= 0 || verified.size !== written.size || listing.length !== names.length || listing.some((n, i) => n !== names[i])) throw Error('archive verification failed; originals retained');
         const driveNow = await directory(drive);
         if (driveNow.dev !== driveIdentity.dev || driveNow.ino !== driveIdentity.ino) throw Error('Drive changed; originals retained, operator must inspect mount');
+        // Commit verified versions before removal or the daily stamp. A crash/retry must
+        // not archive retained originals again. Use the pre-bundle stat: concurrent edits
+        // differ on the next scan and must get their own verified archive.
+        const next = new Map(archived);
+        for (const f of group.files) next.set(relative(source, f.path), version(f.stat));
+        await writeArchiveManifest(archiveManifest, source, drive, next, maxFiles);
+        archived = next;
         out.bundles.push(final); out.filesArchived += names.length;
         let uncoordinated = 0;
         for (const f of group.files) {

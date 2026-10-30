@@ -2867,6 +2867,16 @@ The CLI defaults to both kinds; `--dry-run` creates no archive or stamp. Setting
 included in results and logged by the CLI/health-watch. Host health ticks invoke both kinds; fixture,
 dry-run and redirected ticks skip retention. Each kind serializes with a lock and uses a 24-hour stamp.
 
+A durable per-kind manifest beside the stamp records source-relative paths, size, mtime and
+identity/ctime for verified bundles, scoped to the source and Drive paths. Retained unchanged
+sources are skipped even after stamp expiry; changed sources and session companions remain eligible.
+The manifest is read under the invocation lock and atomically replaced after bundle verification,
+before source removal or stamp publication. Dry-run reads it without writing state. Invalid or
+oversized manifests fail closed and ask the operator to inspect or restore the manifest; the read
+and write limits are 128 MiB and `maxFiles` entries. Regression fixtures cross stamp expiry for both
+kinds, change size/mtime or restore mtime after a same-size edit, and retry failed verification or
+manifest publication. Existing bundles from before manifest tracking cannot be deduplicated by it.
+
 The archiver's invocation lock serializes archivers only; it does **not** exclude run-store or
 Claude writers. A stat/unlink pair cannot safely reclaim a mutable source. Source removal therefore
 requires the injected `withSourceWriterExclusion(path, criticalSection)` provider to exclude **all**
