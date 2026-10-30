@@ -8,13 +8,14 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, readFileSync, existsSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { EventEmitter } from 'node:events';
 
 import {
   probeDaemonLogs, probeLeases, probeSelfSync, probeLanePools, tick, healthSectionLines, healthDir,
   probeDaemonStatus, daemonNameForLabel, runTickWithWatchdog, probeAuthExpiredSessions, probeAgents,
   probePrs, probeStaleState, probeMergedPrs, probeProcesses, probeMachineLoad, probeGhShimLanes,
   probeBgIsolationStalls, probeUntrackedBacklogCards, persistGhSpend, breakthroughEmergency, isRepeatAlert,
-  resolveLaneScanTarget,
+  resolveLaneScanTarget, resolveTickWatchdogLimit,
 } from '../health-watch.mjs';
 import { decideDelivery, DEFAULT_QUIET_SETTINGS } from '../../lib/quiet-hours.mjs';
 import { replay, unacknowledged } from '../../operations/needs-you-feed.mjs';
@@ -818,6 +819,95 @@ describe('tick() — #4079 filing-request dispatch plumbing', () => {
 });
 
 describe('runTickWithWatchdog', () => {
+  const settings = (options = {}) => resolveTickWatchdogLimit({
+    env: {}, platform: {}, log: () => {}, readLoad: () => ({ load1: 40, cores: 12 }), ...options,
+  });
+
+  async function simulatedTick(killAfterMs, durationMs) {
+    vi.useFakeTimers();
+    try {
+      const child = new EventEmitter();
+      child.kill = vi.fn(() => child.emit('exit', null));
+      const result = runTickWithWatchdog([], { dir, killAfterMs, spawnChild: () => child });
+      if (durationMs !== null) setTimeout(() => child.emit('exit', 0), durationMs);
+      await vi.advanceTimersByTimeAsync(durationMs ?? killAfterMs - 1);
+      if (durationMs === null) {
+        expect(child.kill).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+      }
+      return { code: await result, kill: child.kill };
+    } finally { vi.useRealTimers(); }
+  }
+
+  it('at load 40 on 12 cores gives a healthy 174s tick more than 180s', async () => {
+    const { killAfterMs } = settings();
+    expect(killAfterMs).toBe(540_000);
+    const result = await simulatedTick(killAfterMs, 174_000);
+    expect(result.code).toBe(0);
+    expect(result.kill).not.toHaveBeenCalled();
+    expect(existsSync(join(dir, 'overrun.json'))).toBe(false);
+  });
+
+  it('keeps the idle-load deadline at 180s', () => {
+    expect(settings({ readLoad: () => ({ load1: 2, cores: 12 }) }).killAfterMs).toBe(180_000);
+  });
+
+  it('kills a hung tick exactly at its scaled limit and records that actual limit', async () => {
+    const { killAfterMs } = settings({ readLoad: () => ({ load1: 24, cores: 12 }) });
+    expect(killAfterMs).toBe(360_000);
+    const result = await simulatedTick(killAfterMs, null);
+    expect(result.code).toBe(3);
+    expect(result.kill).toHaveBeenCalledWith('SIGKILL');
+    expect(JSON.parse(readFileSync(join(dir, 'overrun.json'), 'utf8')).killedAfterMs).toBe(killAfterMs);
+  });
+
+  it.each(['oops', '', 'Infinity', '-1', '0'])('logs invalid max scale %j and falls back to standard', raw => {
+    const log = vi.fn();
+    const result = settings({ config: { tickKillLoadScaleMax: 2 }, env: { WE_HEALTH_TICK_KILL_LOAD_SCALE_MAX: raw }, log });
+    expect(result.killAfterMs).toBe(540_000);
+    expect(result.sources.tickKillLoadScaleMax).toBe('standard');
+    expect(log.mock.calls.flat().join('\n')).toMatch(/ignored invalid/);
+    expect(log.mock.calls.flat().join('\n')).toMatch(/tickKillLoadScaleMax=3 \(standard\)/);
+  });
+
+  it('resolves standard, platform, tool and environment and logs effective sources', () => {
+    const log = vi.fn();
+    const result = settings({ platform: { tickKillLoadScaleMax: 2, tickKillCeilingMs: 500_000 },
+      config: { tickKillLoadScaleMax: 2.5 }, env: { WE_HEALTH_TICK_KILL_CEILING_MS: '400000' }, log });
+    expect(result.killAfterMs).toBe(400_000);
+    expect(result.sources).toMatchObject({ tickKillLoadScaleMax: 'tool', tickKillCeilingMs: 'env', tickBudgetMs: 'standard' });
+    expect(settings({ platform: { tickKillLoadScaleMax: 2 } }).sources.tickKillLoadScaleMax).toBe('platform');
+    expect(log.mock.calls.flat().join('\n')).toMatch(/tickKillCeilingMs=400000 \(env\)/);
+  });
+
+  it.each([0, -1, Infinity, 2_147_483_648, { nested: 1 }])('rejects invalid absolute ceiling %j', tickKillCeilingMs => {
+    const result = settings({ config: { tickKillCeilingMs, tickKillLoadScaleMax: 100 } });
+    expect(result.killAfterMs).toBe(540_000);
+    expect(result.sources.tickKillCeilingMs).toBe('standard');
+  });
+
+  it.each([0, -1, Infinity, 'bad'])('rejects invalid persisted tick budget %j', tickBudgetMs => {
+    expect(settings({ config: { tickBudgetMs } }).killAfterMs).toBe(540_000);
+  });
+
+  it('caps even an oversized budget and scale at the absolute ceiling', () => {
+    expect(settings({ config: { tickBudgetMs: 2_147_483_647, tickKillLoadScaleMax: 1e300 },
+      readLoad: () => ({ load1: 1e300, cores: 1 }) }).killAfterMs).toBe(540_000);
+  });
+
+  it.each([{ load1: NaN, cores: 12 }, { load1: 40, cores: 0 }, { load1: -1, cores: 12 }])(
+    'logs invalid load evidence %j and uses the bounded idle deadline', load => {
+      const log = vi.fn();
+      expect(settings({ readLoad: () => load, log }).killAfterMs).toBe(180_000);
+      expect(log.mock.calls.flat().join('\n')).toMatch(/load.*invalid/i);
+    });
+
+  it('logs an unreadable load and uses the bounded idle deadline', () => {
+    const log = vi.fn();
+    expect(settings({ readLoad: () => { throw new Error('unavailable'); }, log }).killAfterMs).toBe(180_000);
+    expect(log.mock.calls.flat().join('\n')).toMatch(/load.*invalid/i);
+  });
+
   it('kills a tick that outlives its budget from OUTSIDE the tick process and records overrun.json', async () => {
     const stateRoot = join(dir, 'state');
     const hd = healthDir(stateRoot);

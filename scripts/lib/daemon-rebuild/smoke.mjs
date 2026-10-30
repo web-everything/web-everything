@@ -222,7 +222,7 @@ export function smokeCheckOfChild(cmd, args = []) {
 
 /**
  * The `runChild` every smoke of one build gets: each child's timeout capped at the time left before `deadline`, no
- * child started once less than `minChildMs` is left, and — when `failFast` names checks — every child after one of
+ * child started once less than the per-call `opts.minChildMs` (default `minChildMs`) is left, and — when `failFast` names checks — every child after one of
  * them fails is refused at once. Exposes `deadline` / `failFast` for the caller's log and tests.
  */
 export function budgetedRunChild({ runChild = runBounded, deadline, now = Date.now, failFast = [], minChildMs = 1_000 }) {
@@ -230,11 +230,12 @@ export function budgetedRunChild({ runChild = runBounded, deadline, now = Date.n
   let stopped = null;
   const run = async (cmd, args = [], opts = {}) => {
     if (stopped) throw new Error(`skipped: fail-fast — ${stopped} failed on the overlay build and again on this one`);
+    const { minChildMs: childFloor = minChildMs, ...childOpts } = opts;
     const left = deadline - now();
-    if (!(left >= minChildMs)) throw new Error(`skipped: rebuild smoke budget exhausted (${Math.max(0, Math.round(left))}ms left)`);
+    if (!(left >= childFloor)) throw new Error(`skipped: rebuild smoke budget exhausted (${Math.max(0, Math.round(left))}ms left)`);
     const timeoutMs = Number.isFinite(opts?.timeoutMs) ? Math.min(opts.timeoutMs, left) : left;
     try {
-      return await runChild(cmd, args, { ...opts, timeoutMs });
+      return await runChild(cmd, args, { ...childOpts, timeoutMs });
     } catch (e) {
       const check = smokeCheckOfChild(cmd, args);
       if (check && ff.has(check)) stopped = check;

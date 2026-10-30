@@ -1,10 +1,12 @@
-import { beforeAll, afterEach, describe, it, expect, vi } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import { resolve, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, chmodSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { buildDelegationMarker, parseDelegationMarker } from '../lib/delegation-marker.mjs';
 import { parseAuthorActorId } from '../lib/review-independence.mjs';
+// Load the shared CLI dependency graph during collection, outside each test's deadline.
+import '../pr-land.mjs';
 
 const originalArgv = process.argv;
 afterEach(() => {
@@ -15,40 +17,30 @@ afterEach(() => {
 });
 const triple = { provider: 'codex', model: 'gpt-6-astra', taskType: 'bugfix' };
 let loadN = 0;
+const prLandPath = resolve(import.meta.dirname, '../pr-land.mjs');
 async function load(args = []) {
   vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'author-session');
   process.argv = ['node', 'test-import', ...args];
-  try {
-    // Re-evaluate the CLI's flag defaults while retaining its shared dependency graph.
-    return await import(`../pr-land.mjs?delegationCase=${++loadN}`);
-  } finally {
-    process.argv = originalArgv;
-    vi.unstubAllEnvs();
-  }
+  // Re-evaluate argv-derived defaults without reloading the entire CLI dependency graph.
+  // Vite cannot statically resolve a relative template with a query, so build an absolute specifier.
+  return import(/* @vite-ignore */ `${prLandPath}?fresh=${++loadN}`);
 }
 
 describe('pr-land --delegation', () => {
-  let delegated, ordinary;
-  beforeAll(async () => {
-    // Cold CLI imports belong to fixture setup, outside the stamp assertions' 5s budget.
-    delegated = await load(['--delegation=codex:gpt-6-astra:bugfix']);
-    ordinary = await load();
-  }, 30000);
-
-  it('valid flag composes both author and delegation stamps into the PR body', () => {
-    const { composePrBody } = delegated;
+  it('valid flag composes both author and delegation stamps into the PR body', async () => {
+    const { composePrBody } = await load(['--delegation=codex:gpt-6-astra:bugfix']);
     const body = composePrBody('Fix the launch wrapper.');
     expect(parseAuthorActorId(body)).toBe('author-session');
     expect(parseDelegationMarker(body)).toEqual(triple);
   });
-  it('absent flag preserves the author stamp without any delegation marker', () => {
-    const { composePrBody } = ordinary;
+  it('absent flag preserves the author stamp without any delegation marker', async () => {
+    const { composePrBody } = await load();
     const body = composePrBody('Ordinary work.');
     expect(parseAuthorActorId(body)).toBe('author-session');
     expect(body).not.toContain('delegation:');
   });
-  it('stamps idempotently, including malformed/conflicting existing stamps and empty bodies', () => {
-    const { withDelegationStamp } = delegated;
+  it('stamps idempotently, including malformed/conflicting existing stamps and empty bodies', async () => {
+    const { withDelegationStamp } = await load(['--delegation=codex:gpt-6-astra:bugfix']);
     const once = withDelegationStamp('body');
     expect(withDelegationStamp(once)).toBe(once);
     for (const body of ['', '  ', null, undefined, '<!-- delegation: broken -->', `${once}\n${buildDelegationMarker({ ...triple, model: 'other' })}`]) {
