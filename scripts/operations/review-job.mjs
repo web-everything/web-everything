@@ -117,10 +117,15 @@ import { tryReadCompletion } from './completion-store.mjs';
 import { rateAndRecordReviewJob } from '../conveyor/run-rating.mjs';
 import { recorderFor, setActiveRecorder } from './telemetry-store.mjs';
 import { ACTOR_ENV } from '../lib/review-independence.mjs';
-import { INFRA_RETRY_COOLOFF_MS } from '../conveyor/reconcile-core.mjs';
+import { providerQuotaHold } from '../lib/provider-quota-hold.mjs';
+import { REVIEW_SEAT_PROVIDERS } from '../lib/provider-routing.mjs';
+import { resolveLiveQueueBaseline } from '../readiness/heavy-admission.mjs';
+import { createQueueBudget } from '../readiness/heavy-queue-projection.mjs';
+import { resolveProviderCap } from './review-seat-policy.mjs';
+import { INFRA_RETRY_COOLOFF_MS, markSelfReportedDone } from '../conveyor/reconcile-core.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import {
-  createRedTeamIo, extraSeatsEnabled, recordDiscardedRedTeam, redTeamEnabled, redTeamOwedFor, resolveSeatTimeoutMs,
+  createRedTeamIo, extraSeatsEnabled, recordDiscardedRedTeam, redTeamEnabled, redTeamOwedFor, resolveSeatTimeoutMs, quotaHoldOrProbe, callsUsedTodayForProvider,
 } from './review-extra-seats.mjs';
 import {
   decideSpeculativeOutcome, formatSpeculativeRedTeamSourceLine, loadSpeculativeRedTeam, READ_SINK_ENV,
@@ -319,7 +324,11 @@ export function execReadRaw(file, args, options = {}) {
 }
 
 /** The real effects, each one command. `root` is the checkout the arc runs from (the daemon's clone). */
-export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence } = {}) {
+export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
+  readSeatRecords = () => createRedTeamIo({ root, env }).readRecords({ strict: true }),
+  queueBaseline = () => resolveLiveQueueBaseline({ checkoutRoot: root, env }),
+  seatAvailable = provider => createRedTeamIo({ root, env }).cliAvailable(provider),
+} = {}) {
   // The record each queued write replaced, so a deferral rollback can restore it beside a retry marker.
   const replacedStatus = new Map();
   const node = (args, { actorId, timeoutMs, extraEnv = null } = {}) => spawnSync(process.execPath, args, {
@@ -587,6 +596,24 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     },
     // Card xbizuci — `review.speculativeRedTeam` resolved through the policy cascade (see `../lib/review-speculative-red-team.mjs`).
     speculativeRedTeamSetting: () => loadSpeculativeRedTeam({ env }),
+    // Read the existing quota and queue signals; never invent a second outage detector.
+    reviewInfraBlock: () => {
+      const now = Date.now();
+      const records = readSeatRecords();
+      if (!Array.isArray(records)) throw new Error('seat quota evidence unreadable');
+      const reviewHold = providerQuotaHold(records, 'claude', now);
+      if (reviewHold) return reviewHold;
+      const available = REVIEW_SEAT_PROVIDERS.filter(p => seatAvailable(p) && resolveProviderCap(p, env) > 0);
+      if (available.length && available.every(p => quotaHoldOrProbe(records, p, now, env) || callsUsedTodayForProvider(records, now, p) >= resolveProviderCap(p, env))) return 'all available red-team seats are quota-held';
+      const baseline = queueBaseline();
+      if (!baseline || baseline.bypassed === 'error') throw new Error('queue admission evidence unreadable');
+      const budget = createQueueBudget(baseline);
+      if (!budget.active && !['off', 'ci'].includes(baseline.bypassed)) throw new Error('queue admission evidence incomplete');
+      // Reviews retain the shared queue policy's exemption; persisted queue-cap
+      // completions are still held by the review's existing infra cooloff.
+      const queue = budget.tryAdmit('review');
+      return queue.admit ? null : 'queue-cap: review held by heavy-test queue';
+    },
     // Card xbizuci — THE SPECULATIVE RED TEAM, its own detached process group so it runs WHILE the loop runs (the loop
     // is a blocking spawnSync). It waits for the loop's read sink, makes the call, and writes its pass to `passFile`.
     startSpeculativeRedTeam: ({ pr, repo, lanePath, slug, waitMs }) => {
@@ -965,6 +992,11 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     out.redTeamGate = { status: gate?.status ?? null, outcome: gate?.outcome ?? null, ...(gate?.reason ?? gate?.error ? { reason: gate.reason ?? gate.error } : {}),
       ...(gate?.plan ? { sendBack: gate.plan.sendBack.length, card: gate.plan.card.length, advisory: gate.plan.advisory.length } : {}) };
   }
+  if (!opts.redTeamOnly) {
+    const decision = out.redTeamSpeculative?.decision;
+    const discarded = decision === 'discard';
+    io.log(`review-job ${out.sessionSlug}: speculative-red-team counters: started=${Number(Boolean(spec))} used=${Number(decision === 'finish')} discarded-infra=${Number(discarded && out.outcome === BLOCKED_ON_INFRA)} discarded-parked=${Number(discarded && out.outcome === 'parked')} discarded-bounced=${Number(discarded && out.outcome === 'bounced')} stale=${Number(decision === 'stale')} skipped-infra=${Number(Boolean(seatsBox.skippedInfra))}`);
+  }
   return out;
 }
 
@@ -1011,6 +1043,7 @@ function runReviewArc({
   let lanePath = null;
   try {
     const prev = io.readPrevCompletion(slug);
+    seatsBox.prevCompletion = prev;
     if (!redTeamOnly) io.report({ session: slug, kind: 'review', pr: String(planned.pr), repo: planned.repo, status: 'started', timeoutMs: loopTimeoutMs });
     if (!redTeamOnly && typeof io.carryHumanClearance === 'function') {
       try {
@@ -1183,9 +1216,21 @@ function runReviewArc({
     seatsBox.speculative = null;
     if (seatsBox.speculativeEnabled && typeof io.startSpeculativeRedTeam === 'function') {
       try {
-        seatsBox.speculative = io.startSpeculativeRedTeam({ pr: planned.pr, repo: planned.repo, lanePath, slug, waitMs: loopTimeoutMs });
+        seatsBox.checkingInfra = true;
+        const [prior] = markSelfReportedDone([{ name: slug, state: 'working', startedAt: 0, sessionId: seatsBox.prevCompletion?.sessionId }],
+          () => seatsBox.prevCompletion, io.now());
+        const block = prior.awaitingInfraCooloff ? 'review infra cooloff'
+          : io.reviewInfraBlock?.({ pr: planned.pr, repo: planned.repo, slug });
+        if (block) {
+          seatsBox.skippedInfra = true;
+          io.log(`review-job ${slug}: speculative red team skipped — infra block (retry after fresh eligible state)`);
+        } else {
+          seatsBox.checkingInfra = false;
+          seatsBox.speculative = io.startSpeculativeRedTeam({ pr: planned.pr, repo: planned.repo, lanePath, slug, waitMs: loopTimeoutMs });
+        }
         if (seatsBox.speculative) io.log(`review-job ${slug}: red team started speculatively (pid ${seatsBox.speculative.pid}) beside the review loop`);
       } catch (e) {
+        if (seatsBox.checkingInfra) seatsBox.skippedInfra = true;
         io.log(`review-job ${slug}: speculative red team did not start (${tail(e?.message ?? e, 200)}) — sequential order`);
         seatsBox.speculative = null;
       }

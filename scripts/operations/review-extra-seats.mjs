@@ -1672,7 +1672,10 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
     const claudeFindings = claudeFindingsFromLoop(loopPayload);
     const { rev, provider, model, effort, callId, call, parsed, evidence, quota, durationMs } = pass;
     const recheckStatus = publishableRecheckStatus(pass.recheckStatus);
-    const findings = pass.findings.map(withFileReadEvidence);
+    // Mark juror overlap before folding, just as buildSeatRows does. Keep every
+    // confirmed break in the fold: an accepting jury may have waived its own finding.
+    const findings = pass.findings.map(f => ({ ...withFileReadEvidence(f),
+      confirmedByClaude: claudeFindings ? Boolean(findingCorroboratedBy(f, claudeFindings)) : null }));
     let records = [];
     try { records = io.readRecords(); } catch (e) { io.log(`red team: could not read the scorecard store (${e.message}) — treating it as empty`); }
     const [seatRow] = buildSeatRows({
@@ -1740,12 +1743,6 @@ export async function finishSpeculativeRedTeam({ pr, repo, loopPayload, pass, en
     const fp = redTeamReadFingerprint(read);
     if (!fp || fp !== pass.readFingerprint) {
       return { status: 'stale', reason: `the speculative pass judged a different read (head ${String(pass.rev).slice(0, 12)} vs ${String(read?.netBasis?.rev ?? '-').slice(0, 12)})` };
-    }
-    // The sequential brief lists the jurors' own findings so the red team does not repeat them; a speculative brief
-    // was written before they existed. Identical only when there were none — otherwise the sequential pass runs.
-    const jurorFindings = claudeFindingsFromLoop(loopPayload);
-    if (Array.isArray(jurorFindings) && jurorFindings.length) {
-      return { status: 'stale', reason: `the jurors raised ${jurorFindings.length} finding(s) the speculative brief could not carry (the sequential brief lists them so the red team does not repeat them)` };
     }
     let records = [];
     try { records = io.readRecords(); } catch { records = []; }
