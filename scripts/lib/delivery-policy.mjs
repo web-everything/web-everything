@@ -323,7 +323,8 @@ export function appendPolicyJournal(path, record, options = {}) {
   // a silently lost event. The budget stays far below the 30s stale age.
   // Monotonic time keeps wall-clock corrections from changing the wait budget.
   const deadline = performance.now() + JOURNAL_LOCK_WAIT_MS;
-  for (let attempt = 0; ; attempt++) {
+  // Every retry spends the budget, including stale reclamation without a sleep.
+  for (let attempt = 0; attempt === 0 || performance.now() < deadline; attempt++) {
     try {
       held = lock.open(constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL);
       break;

@@ -891,6 +891,51 @@ describe('trust, confinement and reach set', () => {
 });
 
 describe('policy journal', () => {
+  it.each(['stale replacement', 'disappearing lock'])('bounds retries by monotonic time under %s churn', kind => {
+    // Patch native ESM bindings only in the child; exercise the real lock checks and
+    // generation-guard removal while recreating contention before every open.
+    const script = `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { performance } from 'node:perf_hooks';
+      import { dirname } from 'node:path';
+      import { appendPolicyJournal } from './scripts/lib/delivery-policy.mjs';
+      const [path, kind] = process.argv.slice(1);
+      const lock = path + '.lock';
+      const originalOpen = fs.openSync;
+      let attempts = 0, elapsed = 0;
+      Object.defineProperty(performance, 'now', { value: () => elapsed });
+      fs.openSync = (file, flags, ...args) => {
+        if (file === lock && (flags & fs.constants.O_EXCL)) {
+          // A safety cutoff makes the pre-fix infinite retry fail deterministically.
+          if (++attempts > 30) throw Error('Lock churn exceeded its monotonic budget');
+          elapsed += 100;
+          if (kind === 'stale replacement') {
+            fs.writeFileSync(lock, '{}');
+            fs.utimesSync(lock, 1, 1);
+          } else {
+            fs.rmSync(lock, { force: true });
+            throw Object.assign(Error('lock disappeared'), { code: 'EEXIST' });
+          }
+        }
+        return originalOpen(file, flags, ...args);
+      };
+      Atomics.wait = () => 'timed-out';
+      syncBuiltinESMExports();
+      let error;
+      try { appendPolicyJournal(path, '{}\\n', { allowedRoots: [dirname(path)] }); }
+      catch (caught) { error = caught.message; }
+      process.stdout.write(JSON.stringify({ error, attempts, elapsed, journalExists: fs.existsSync(path) }));
+    `;
+    const result = JSON.parse(execFileSync(process.execPath,
+      ['--input-type=module', '-e', script, env.WE_POLICY_EVENTS_FILE, kind],
+      { cwd: resolve('.'), encoding: 'utf8', timeout: 10000, killSignal: 'SIGKILL', maxBuffer: 65536 }));
+    expect(result.error).toMatch(/lock timeout; event not recorded/);
+    expect(result.attempts).toBe(10);
+    expect(result.elapsed).toBe(1000);
+    expect(result.journalExists).toBe(false);
+  });
+
   it('does not reclaim an aged lock with a live pid and refuses within a bounded wait', () => {
     const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
     const owner = JSON.stringify({ pid: process.pid, token: 'live-owner' });
