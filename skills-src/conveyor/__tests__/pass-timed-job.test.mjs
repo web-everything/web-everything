@@ -120,6 +120,24 @@ async function quarantinedFixture() {
 }
 
 describe('timed pass quarantine recovery and reporting', () => {
+  it('retains quarantine when an injected probe reports dead without an independent reapGroup', async () => {
+    const f = await quarantinedFixture();
+    f.probe.mockReturnValue('dead');
+    const { reapGroup, ...ports } = f.ports;
+    const pending = runPassAsTimedJob(f.pass, ports);
+    expect(f.store.read(f.record.id).job).toMatchObject({
+      passQuarantine: true, handle: f.record.job.handle,
+    });
+    await expect(pending).resolves.toEqual({ outcome: 'quarantined' });
+    expect(f.spawnFn).toHaveBeenCalledTimes(1);
+    expect(quarantineEvents(f)).toEqual([expect.objectContaining({
+      kind: 'pass-quarantined', detail: expect.objectContaining({
+        ownerLiveness: 'dead', groupGone: false,
+        reason: expect.stringContaining('operator must inspect owner/process group'),
+      }),
+    })]);
+  });
+
   it('clears a dead owner with a confirmed empty pgid and runs a fresh job in the same call', async () => {
     const f = await quarantinedFixture();
     const ageMs = 2 * 60 * 60 * 1000;
