@@ -1,3 +1,5 @@
+import { greenLedgerDir, hasGreenLedger } from '../lib/lane-verify.mjs';
+import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { pidIdentity } from '../lib/pid-alive.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 /**
@@ -52,7 +54,7 @@ import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
  * is killed.
  */
 import { enrichPrsWithStandingRulingGrants } from './standing-ruling-io.mjs';
-import { enrichPrsWithOwedMainRule, resolveRefreshSettings } from '../lib/renamed-pr-refresh.mjs';
+import { enrichPrsWithOwedMainRule, readOwedMainRule, resolveRefreshSettings } from '../lib/renamed-pr-refresh.mjs';
 import { excusePrMergeGateHolds, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { readMainRedPriority } from '../lib/main-red-priority.mjs'; // card xu1nixv
@@ -73,7 +75,7 @@ import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.
 // check failed rather than "any check outside a hand-maintained exclusion list" — see that module's own header
 // for the full incident this closes. Anchored at the TOP of the import block (rather than beside the other
 // `reconcile-core.mjs`-adjacent imports below) so it never collides with an overlay editing that region.
-import { getRequiredStatusChecks, withoutImpliedRequiredChecks } from '../lib/required-status-checks.mjs';
+import { getRequiredStatusChecks, readRequiredStatusChecksDetailed, withoutImpliedRequiredChecks } from '../lib/required-status-checks.mjs';
 import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -1445,6 +1447,7 @@ export function enrichPrsWithLedgerHolds(prs, { repo, now = Date.now(), env = pr
  * @returns {{dispatch:Array<object>, refusals:Array<object>, notes:Array<object>, prs:number, agents:number}}
  */
 export function runReconcilePass({
+  readOnly = false,
   readPrs = defaultReadPrs, readAgents = defaultReadAgents, enrich = enrichAgents,
   excuseMergeGateHolds = excusePrMergeGateHolds, readMergeGateVerdict = defaultReadMergeGateVerdict,
   readFreeze = readSharedFreeze, mergeGateSetting,
@@ -1509,6 +1512,28 @@ export function runReconcilePass({
   // Card xu1nixv — the published red-main priority (injectable; a test passes its own record or `() => null`).
   readPriority = () => readMainRedPriority({ now, env }),
 } = {}) {
+  // fix-waiting: diagnostics reuse the live planner with cache/journal sinks disabled.
+  // A distinct exec binding takes the existing uncached read branches (including timeout evidence).
+  // Keep gh-throttle rate-limit accounting enabled: it is a guard, even for preview reads.
+  if (readOnly) {
+    const readExec = (...args) => execFileSyncThrottled(...args);
+    if (readPrs === defaultReadPrs) readPrs = options => defaultReadPrs({ ...options, exec: readExec });
+    if (readRequiredChecks === getRequiredStatusChecks) readRequiredChecks = options => getRequiredStatusChecks({
+      ...options, readOnly: true,
+      readChecks: query => readRequiredStatusChecksDetailed({ ...query,
+        gh: args => readExec('gh', args, { encoding: 'utf8', timeout: 30000 }),
+      }),
+    });
+    if (enrichTimeouts === enrichPrsWithTimeoutEvidence) enrichTimeouts = (prs, options) => enrichPrsWithTimeoutEvidence(prs, {
+      ...options, read: (pr, query) => readTimeoutEvidence(pr, { ...query, exec: readExec }),
+    });
+    if (enrichLedgerHolds === enrichPrsWithLedgerHolds) enrichLedgerHolds = (prs, options) => enrichPrsWithLedgerHolds(prs, {
+      ...options, step: (rows, query) => ledgerHoldStep(rows, { ...query, journal: () => {} }),
+    });
+    if (enrichOwedMainRule === enrichPrsWithOwedMainRule) enrichOwedMainRule = (prs, options) => enrichPrsWithOwedMainRule(prs, {
+      ...options, read: (pr, query) => readOwedMainRule(pr, { ...query, readOnly: true }),
+    });
+  }
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`reconcile-pass: --repo ${repo} is not a constellation repo`);
   // #x81m8xx — `repo` may be either vocabulary (the gh SLUG or the internal KEY, e.g. `--repo=we`); `gh` only
@@ -1565,7 +1590,7 @@ export function runReconcilePass({
   // facts and the normal cap applies. Skipped entirely when mechanical rounds count toward the cap.
   const prsBeforeRulings = repoKey === 'we' && mechanicalSetting.mechanicalRoundsCountTowardCap === false
     ? enrichMechanicalRound(prsBeforeMechanical, { defaultBranch }) : prsBeforeMechanical;
-  const prs = enrichStandingRulingGrants(prsBeforeRulings, { repo: CONSTELLATION_REPOS[repoKey].slug });
+  const rulingPrs = enrichStandingRulingGrants(prsBeforeRulings, { repo: CONSTELLATION_REPOS[repoKey].slug });
   const agents = enrich(readAgents({}));
   const mainSha = resolveMainSha(defaultBranch);
   const owedCiRerunSetting = loadOwedCiRerunSettings({ env });
@@ -1575,6 +1600,7 @@ export function runReconcilePass({
   const standDownHoldsAcrossHeads = loadStandDownHoldsAcrossHeads({ env });
   console.error(`fix.standDownHoldsAcrossHeads=${standDownHoldsAcrossHeads.value} (source: ${standDownHoldsAcrossHeads.source})`);
   const timing = resolveTimingPolicy({ env });
+  const prs = enrichVerifyGreen(rulingPrs, { policy: timing.review, env });
   const plan = planReconcile({
     reviewTiming: timing.review, fixTiming: timing.fix,
     standDownHoldsAcrossHeads,
@@ -1972,5 +1998,16 @@ export function enrichPrsWithTimeoutEvidence(prs, {
         : { eligible: false, reason: 'infra-cancelled-heal-mode' };
     }
     return { ...pr, timeoutRetry, timeoutRetryBudget };
+  });
+}
+
+/** IO shell enrichment: never consult the ledger when the policy is off. */
+export function enrichVerifyGreen(prs, { policy, coordinationRoot, env = process.env, read = hasGreenLedger } = {}) {
+  if (!policy?.startBeforeCi) return prs;
+  const dir = greenLedgerDir({ coordinationRoot: coordinationRoot ?? resolveCoordinationRoot({ env }), env });
+  return prs.map(pr => {
+    let verifyGreen = false;
+    try { verifyGreen = read({ dir, sha: pr.headRefOid }) === true; } catch { /* Missing evidence waits for CI. */ }
+    return { ...pr, verifyGreen };
   });
 }

@@ -69,6 +69,7 @@ describe('fix executor chain', () => {
       reason:expect.stringContaining('argon launcher unavailable, fallback')});
     expect(pick({...input,criticalClaudeFromRung:1})).toMatchObject({executor:'claude',rung:'claude',
       reason:'critical work reaches Claude from rung 1 (criticalClaudeFromRung=1, source=default)'});
+    expect(pick({critical:true,trigger:'stronger-model',launcherAvailable:()=>false})).toMatchObject({executor:'claude'});
   });
   it('honors thresholds beyond the chain while retaining its Claude fallback', () => {
     expect(pick({critical:true,criticalClaudeFromRung:99,codexUnproductive:9})).toMatchObject({executor:'claude',

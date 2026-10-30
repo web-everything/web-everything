@@ -4,8 +4,10 @@
  *   real dispatch, no real timers): injected effects, so the tick/backoff/stop-condition decision is tested
  *   with fakes exactly like runner.mjs's own `runLoop` is.
  */
-import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { runReconcileCiHealDispatch } from '../../../scripts/operations/ci-heal-pr-dispatch.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
@@ -16,11 +18,35 @@ import {
   runMainRedRebaseAllRepos, formatMainRedRebaseActionLine,
   runMissingRunRecoveryAllRepos, formatMissingRunActionLine,
   runPromoteDraftDispatchAllRepos, formatPromoteActionLine,
-  defaultTagDispatchStatus, withFixDispatchClaimRefresh,
+  defaultTagDispatchStatus, withFixDispatchClaimRefresh, defaultReadNotesForRepo, runReconcileNotesAllRepos,
   buildAwaitVerifyStep, buildFixThrottle, buildDaemonExits, fixQueueLengthOf,
 } from '../reconcile-fix-dispatch-daemon.mjs';
 import { CONSTELLATION_REPOS } from '../../../scripts/lib/constellation-repos.mjs';
 import { assertMainNotStale } from '../../../scripts/lib/main-staleness.mjs';
+import * as fixDispatch from '../../../scripts/conveyor/reconcile-fix-dispatch.mjs';
+import * as recovery from '../../../scripts/conveyor/ci-red-recovery-watch.mjs';
+import * as netScope from '../../../scripts/conveyor/net-scope.mjs';
+import * as prStack from '../../../scripts/conveyor/pr-stack.mjs';
+import * as reconcilePass from '../../../scripts/conveyor/reconcile-pass.mjs';
+import { resolveFixDispatchSettings } from '../../../scripts/conveyor/fix-takeover.mjs';
+
+describe('R242 fixDispatch.skipEmptySteps policy cascade', () => {
+  it.each([
+    ['standard default', {}, {}, {}, true, 'standard'],
+    ['platform off', { skipEmptySteps: false }, {}, {}, false, 'platform'],
+    ['tool on', { skipEmptySteps: false }, { skipEmptySteps: true }, {}, true, 'tool'],
+    ['tool off', {}, { skipEmptySteps: false }, {}, false, 'tool'],
+    ['env off', {}, { skipEmptySteps: true }, { WE_FIX_SKIP_EMPTY_STEPS: 'off' }, false, 'env'],
+    ['env on', {}, { skipEmptySteps: false }, { WE_FIX_SKIP_EMPTY_STEPS: 'true' }, true, 'env'],
+    ['invalid platform', { skipEmptySteps: 'true' }, {}, {}, false, 'platform'],
+    ['invalid tool', {}, { skipEmptySteps: [] }, {}, false, 'tool'],
+    ['invalid env', {}, {}, { WE_FIX_SKIP_EMPTY_STEPS: 'typo' }, false, 'env'],
+  ])('%s: resolves value and provenance', (_name, platform, fixDispatch, env, value, source) => {
+    expect(resolveFixDispatchSettings({ env, platform, file: { fixDispatch } })).toEqual({
+      skipEmptySteps: value, sources: { skipEmptySteps: source },
+    });
+  });
+});
 
 // These historical fixtures exercise other daemon halves with R123 explicitly disabled.
 // stand-down-auto-proceed-daemon.test.mjs exercises the production policy defaults and writer.
@@ -383,6 +409,422 @@ const noopNotesTick = () => ({ notes: [], prsByNumber: new Map() });
 // against these fixtures' fake repo names and throws `not a constellation repo` — a tick-failed refusal these
 // tests never expected.
 const noopPromoteDraftTick = () => ({ dispatched: [], refusals: [] });
+
+describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const steps = {
+    fix: 'fixTick', 'ci-heal': 'ciHealTick', 'hung-ci': 'hungCiTick',
+    'main-red-rebase': 'mainRedRebaseTick', 'missing-run': 'missingRunTick',
+    'promote-draft': 'promoteDraftTick', notes: 'notesTick',
+  };
+  const pr = (number, extra = {}) => ({
+    number, title: `PR ${number}`, body: '', isDraft: false, state: 'OPEN',
+    headRefName: `lane/test-${number}`, headRefOid: 'a'.repeat(40), baseRefName: 'main',
+    labels: [], statusCheckRollup: [], comments: [], reviews: [], files: [], commits: [],
+    mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', ...extra,
+  });
+  const plan = (extra = {}) => ({ dispatch: [], notes: [], refusals: [], prs: 1, agents: 0, ...extra });
+  // Model the real planner's PR read so snapshot completeness is observed too.
+  const observedPlan = value => options => { options.readPrs(); return value; };
+  const fixture = (extra = {}) => ({
+    repos: ['repo-a'], allowStandDownAutoProceed: false,
+    authGateOverride: () => ({ paused: false, reason: null }),
+    fixTick: vi.fn(() => ({ dispatched: [], refusals: [] })),
+    ciHealTick: vi.fn(async () => ({ dispatched: [], refusals: [] })),
+    hungCiTick: vi.fn(noopHungCiTick), mainRedRebaseTick: vi.fn(noopMainRedRebaseTick),
+    missingRunTick: vi.fn(noopMissingRunTick), promoteDraftTick: vi.fn(noopPromoteDraftTick),
+    notesTick: vi.fn(noopNotesTick), ...extra,
+  });
+  const captureLog = () => vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  const skipLines = log => log.mock.calls.flatMap(([text]) => String(text).split('\n'))
+    .filter(line => line.startsWith('reconcile-fix-dispatch-daemon: skipped '));
+
+  it('fails open with historical arguments and no skips for a default-enabled empty PR list', async () => {
+    const log = captureLog();
+    const readPrs = vi.fn(() => []);
+    vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(observedPlan(plan({ prs: 0 })));
+    // Omit skipEmptySteps deliberately: the production default must fail open too.
+    const opts = fixture({ readPrs });
+    let time = 0;
+    const result = await runTickAllRepos({ ...opts, now: () => ++time });
+
+    for (const [step, tickName] of Object.entries(steps)) {
+      expect(opts[tickName]).toHaveBeenCalledTimes(1);
+      expect(opts[tickName]).toHaveBeenCalledWith(step === 'fix'
+        ? { repo: 'repo-a', allowStandDownAutoProceed: false }
+        : ['hung-ci', 'main-red-rebase', 'missing-run'].includes(step)
+          ? { repo: 'repo-a', apply: true } : { repo: 'repo-a' });
+      expect(result.phaseMs[step]).toBeGreaterThan(0);
+    }
+    expect(readPrs).toHaveBeenCalledTimes(1);
+    expect(result.skippedSteps).toEqual([]);
+    expect(skipLines(log)).toEqual([]);
+  });
+
+  it.each([{ rows: [] }, { rows: [pr(1)] }])('always runs CI-heal and notes with historical arguments for snapshot $rows', async ({ rows }) => {
+    captureLog();
+    const opts = fixture({ readPrs: () => rows });
+    let time = 0;
+    const result = await runTickAllRepos({ ...opts, now: () => ++time });
+    // R242 audit round 3: preserve durable flush ordering and fresh-evidence writes.
+    for (const step of ['ci-heal', 'notes']) {
+      expect(opts[steps[step]]).toHaveBeenCalledTimes(1);
+      expect(opts[steps[step]]).toHaveBeenCalledWith({ repo: 'repo-a' });
+      expect(result.skippedSteps).not.toContain(step);
+      expect(result.phaseMs[step]).toBeGreaterThan(0);
+    }
+  });
+
+  it.each([
+    ['fix', 'fixTick', { dispatch: [{ kind: 'fix', prNumber: 1 }] }, {}],
+    ['ci-heal', 'ciHealTick', { dispatch: [{ kind: 'ci-heal', prNumber: 1 }] }, {
+      statusCheckRollup: [{ __typename: 'CheckRun', name: 'unit', status: 'COMPLETED', conclusion: 'FAILURE' }],
+    }],
+    ['promote-draft', 'promoteDraftTick', { dispatch: [{ kind: 'promote-draft', prNumber: 1 }] }, { isDraft: true }],
+    ['promote-draft', 'promoteDraftTick', { dispatch: [{ kind: 'restore-review-label', prNumber: 1 }] }, {}],
+    ['notes', 'notesTick', { notes: [{ kind: 'ci-heal-exhausted', prNumber: 1 }] }, {}],
+  ])('runs %s for non-empty work via %s: %j', async (step, tickName, planned, fields) => {
+    const log = captureLog();
+    const readPrs = vi.fn(() => [pr(1, fields)]);
+    vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(observedPlan(plan(planned)));
+    const opts = fixture({ readPrs, fixSettings: { skipEmptySteps: true } });
+    const result = await runTickAllRepos(opts);
+
+    expect(opts[tickName]).toHaveBeenCalledTimes(1);
+    expect(readPrs).toHaveBeenCalledTimes(1);
+    expect(result.skippedSteps ?? []).not.toContain(step);
+    expect(skipLines(log).some(line => line.startsWith(`reconcile-fix-dispatch-daemon: skipped ${step} — `))).toBe(false);
+  });
+
+  it.each(['fix', 'ci-heal', 'promote-draft', 'notes'])('runs %s for captured PRs even when a reconcile plan would have no work', async step => {
+    const log = captureLog();
+    const readPrs = vi.fn(() => [pr(1, {
+      statusCheckRollup: [{ __typename: 'CheckRun', name: 'unit', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+    })]);
+    vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(observedPlan(plan()));
+    const opts = fixture({ readPrs, fixSettings: { skipEmptySteps: true } });
+    const result = await runTickAllRepos(opts);
+
+    expect(opts[steps[step]]).toHaveBeenCalledTimes(1);
+    expect(result.skippedSteps).not.toContain(step);
+    expect(reconcilePass.runReconcilePass).not.toHaveBeenCalled();
+    expect(skipLines(log).filter(line => line.startsWith(`reconcile-fix-dispatch-daemon: skipped ${step} — `)))
+      .toHaveLength(0);
+  });
+
+  it('flushes pending durable owed and timeout work through real CI-heal with an empty plan and no open PRs', async () => {
+    captureLog();
+    const dir = mkdtempSync(join(tmpdir(), 'r242-flush-'));
+    const owed = [{ pr: 7 }], timeouts = [{ pr: 8 }];
+    const order = [];
+    const flushOwed = vi.fn(() => { order.push('owed'); return owed.splice(0); });
+    const flushTimeouts = vi.fn(async () => {
+      order.push('timeouts');
+      await Promise.resolve();
+      order.push('timeouts-done');
+      return timeouts.splice(0);
+    });
+    const reconcile = vi.fn(() => { order.push('reconcile'); return plan({ prs: 0 }); });
+    try {
+      const opts = fixture({ repos: ['we'], readPrs: () => [], ciHealTick: options => runReconcileCiHealDispatch({
+        ...options, root: dir, unsupportedPath: join(dir, 'unsupported.json'),
+        checkStaleness: () => ({ fresh: true, behind: 0 }), pollAttempts: () => [],
+        flushOwed, flushTimeouts, reconcile, resolveProfile: () => ({ capabilities: { ciHeal: false } }),
+      }) });
+      const result = await runTickAllRepos(opts);
+      expect(result.refusals).toEqual([]);
+      expect(result.skippedSteps).not.toContain('ci-heal');
+      expect(flushOwed).toHaveBeenCalledWith('we');
+      expect(flushTimeouts).toHaveBeenCalledWith({ root: dir, repo: CONSTELLATION_REPOS.we.slug });
+      expect(reconcile).toHaveBeenCalledTimes(1);
+      expect(owed).toEqual([]);
+      expect(timeouts).toEqual([]);
+      expect(order).toEqual(['owed', 'timeouts', 'timeouts-done', 'reconcile']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('keeps empty-plan notes candidates and publishes stuckAfterGrant from captured PRs', async () => {
+    captureLog();
+    const row = pr(1);
+    const opts = fixture({ readPrs: () => [row], notesTick: vi.fn(() => ({ notes: [], prsByNumber: new Map() })) });
+    expect((await runTickAllRepos(opts)).skippedSteps).not.toContain('notes');
+    expect(opts.notesTick).toHaveBeenCalledTimes(1);
+    const stuckAfterGrant = vi.fn(() => 'still at round cap after grant');
+    const publish = vi.fn();
+    const result = runReconcileNotesAllRepos({ repos: ['repo-a'],
+      tick: () => ({ notes: [], prsByNumber: new Map([[1, row]]) }),
+      dryRun: false, safety: { value: { alertAtRoundCap: true }, sources: { alertAtRoundCap: 'test' } },
+      stuckAfterGrant, publish,
+    });
+    expect(stuckAfterGrant).toHaveBeenCalledWith({ repo: 'repo-a', pr: row });
+    expect(publish).toHaveBeenCalledWith(expect.objectContaining({ pr: 1, kind: 'at-round-limit' }));
+    expect(result.autoGrants).toEqual([expect.objectContaining({ prNumber: 1, action: 'stuck' })]);
+  });
+
+  it('reads fresh notes evidence after fix, CI-heal and promote instead of reusing pre-dispatch comments', async () => {
+    captureLog();
+    const order = [];
+    const before = pr(1);
+    const after = pr(1, { comments: [{ body: 'new parking/dedup evidence' }] });
+    const read = vi.spyOn(reconcilePass, 'defaultReadPrs').mockImplementation(() => {
+      order.push('notes-read'); return [after];
+    });
+    const reconcile = vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(options => {
+      options.readPrs(); return plan({ notes: [{ kind: 'awaiting-permission', prNumber: 1 }] });
+    });
+    const realNotes = defaultReadNotesForRepo;
+    const opts = fixture({ readPrs: () => [before], notesDryRun: true,
+      fixTick: () => { order.push('fix'); return { dispatched: [], refusals: [] }; },
+      ciHealTick: async () => { order.push('ci-heal'); return { dispatched: [], refusals: [] }; },
+      promoteDraftTick: () => { order.push('promote'); return { dispatched: [], refusals: [] }; },
+      notesTick: options => {
+        expect(options).toEqual({ repo: 'repo-a' });
+        const result = realNotes(options);
+        expect(result.prsByNumber.get(1).comments).toEqual(after.comments);
+        return result;
+      },
+    });
+    const result = await runTickAllRepos(opts);
+    expect(result.refusals).toEqual([]);
+    expect(order).toEqual(['fix', 'ci-heal', 'promote', 'notes-read']);
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(result.notes).toEqual([expect.objectContaining({ kind: 'awaiting-permission' })]);
+  });
+
+  it.each([false, true])('uses the real default discovery reader once per repo/pass without speculative hydration (active owner: %s)', async activeOwner => {
+    captureLog();
+    // A review disposition avoids the default reader's legitimate commit-attribution IO.
+    const rows = activeOwner ? [pr(1, { labels: [{ name: 'review-status:fixing' }, { name: 'review:changes' }] })] : [];
+    const exec = vi.fn(() => JSON.stringify(rows));
+    const defaultReader = reconcilePass.defaultReadPrs;
+    vi.spyOn(reconcilePass, 'defaultReadPrs').mockImplementation(options => defaultReader({ ...options, exec }));
+    const reconcile = vi.spyOn(reconcilePass, 'runReconcilePass');
+    const opts = fixture({ repos: ['we', 'frontierui'], readPrs: options => reconcilePass.defaultReadPrs(options) });
+    for (let pass = 0; pass < 2; pass++) {
+      expect((await runTickAllRepos(opts)).refusals).toEqual([]);
+      expect(exec).toHaveBeenCalledTimes((pass + 1) * 2);
+      for (const repo of opts.repos) {
+        expect(exec.mock.calls.filter(([, argv]) => argv.includes(CONSTELLATION_REPOS[repo].slug))).toHaveLength(pass + 1);
+      }
+    }
+    expect(exec.mock.calls.every(([command, argv]) => command === 'gh' && argv[0] === 'pr' && argv[1] === 'list')).toBe(true);
+    expect(reconcile).not.toHaveBeenCalled();
+  });
+
+  it('skipEmptySteps=false runs every step with the historical injected-tick arguments', async () => {
+    const log = captureLog();
+    const opts = fixture({ readPrs: vi.fn(() => []), fixSettings: { skipEmptySteps: false } });
+    const result = await runTickAllRepos(opts);
+
+    for (const [step, tickName] of Object.entries(steps)) {
+      expect(opts[tickName]).toHaveBeenCalledTimes(1);
+      expect(opts[tickName]).toHaveBeenCalledWith(step === 'fix'
+        ? { repo: 'repo-a', allowStandDownAutoProceed: false }
+        : ['hung-ci', 'main-red-rebase', 'missing-run'].includes(step)
+          ? { repo: 'repo-a', apply: true } : { repo: 'repo-a' });
+    }
+    expect(result.skippedSteps ?? []).toEqual([]);
+    expect(skipLines(log)).toEqual([]);
+  });
+
+  it.each([
+    ['unreadable', () => { throw new Error('snapshot unavailable'); }],
+    ['missing', () => null],
+    ['empty', () => []],
+    ['empty stdout coerced by defaultReadPrs', options => reconcilePass.defaultReadPrs({ ...options, exec: () => '' })],
+    ['non-array JSON coerced by defaultReadPrs', options => reconcilePass.defaultReadPrs({ ...options, exec: () => '{}' })],
+    ['partial', () => [{ number: 1 }]],
+    ['possibly truncated at the discovery limit', () => Array.from({ length: reconcilePass.PR_LIST_LIMIT }, (_, i) => pr(i + 1))],
+  ])('fails open and runs every step when the snapshot is %s', async (_kind, readSnapshot) => {
+    const log = captureLog();
+    const readPrs = vi.fn(readSnapshot);
+    vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(observedPlan(plan({ prs: 0 })));
+    const opts = fixture({ readPrs, fixSettings: { skipEmptySteps: true } });
+    const result = await runTickAllRepos(opts);
+
+    expect(readPrs).toHaveBeenCalledTimes(1);
+    for (const tickName of Object.values(steps)) expect(opts[tickName]).toHaveBeenCalledTimes(1);
+    expect(result.skippedSteps ?? []).toEqual([]);
+    expect(skipLines(log)).toEqual([]);
+  });
+
+  it.each([
+    ['timeout rerun', { dispatch: [{ kind: 'ci-timeout-rerun', prNumber: 1 }] }],
+    ['owed rerun dispatch', { dispatch: [{ kind: 'owed-ci-rerun', prNumber: 1 }] }],
+    ['owed rerun refusal', { refusals: [{ kind: 'owed-ci-rerun', prNumber: 1 }] }],
+    ['owed trigger', { owedTriggers: [{ kind: 'ci-trigger-owed', prNumber: 1 }] }],
+  ])('runs CI work for %s even without a failed rollup or ci-heal dispatch', async (_name, owed) => {
+    captureLog();
+    vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(observedPlan(plan(owed)));
+    const opts = fixture({ readPrs: () => [pr(1)] });
+    const result = await runTickAllRepos(opts);
+    expect(opts.ciHealTick).toHaveBeenCalledTimes(1);
+    expect(result.skippedSteps).not.toContain('ci-heal');
+  });
+
+  it('runs fix for a settled PR that can still owe an idle restack', async () => {
+    captureLog();
+    vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(observedPlan(plan({
+      refusals: [{ kind: 'nothing-owed', prNumber: 1 }],
+    })));
+    const opts = fixture({ readPrs: () => [pr(1)] });
+    const result = await runTickAllRepos(opts);
+    expect(opts.fixTick).toHaveBeenCalledTimes(1);
+    expect(result.skippedSteps).not.toContain('fix');
+  });
+
+  it.each([
+    ['incomplete hydrated checks', { rollupIncomplete: true }, {}],
+    ['failed check read', {}, { refusals: [{ kind: 'check-read-failed', prNumber: 1 }] }],
+    ['truncated check list', { statusCheckRollup: Array(100).fill({ conclusion: 'SUCCESS' }) }, {}],
+    ['truncated comment list', { comments: Array(100).fill({ body: 'comment' }) }, {}],
+    ['explicitly incomplete comments', { commentsComplete: false }, {}],
+    ['truncated file list', { files: Array(100).fill({ path: 'x' }) }, {}],
+  ])('runs every step with %s on one PR in an otherwise readable snapshot', async (_name, fields, planned) => {
+    captureLog();
+    vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(observedPlan(plan({ prs: 2, ...planned })));
+    const opts = fixture({ readPrs: () => [pr(1), pr(2, fields)] });
+    const result = await runTickAllRepos(opts);
+    expect(result.skippedSteps).toEqual([]);
+    for (const tickName of Object.values(steps)) expect(opts[tickName]).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs every step when comment hydration omitted an unreadable PR from discovery', async () => {
+    captureLog();
+    const opts = fixture({ readPrs: ({ readComments }) => {
+      // Same omission as defaultReadPrs after its complete-comments reader fails.
+      try { readComments(1, { repo: 'repo-a', exec: () => { throw Error('unreadable'); } }); } catch {}
+      return [];
+    } });
+    const result = await runTickAllRepos(opts);
+    expect(result.skippedSteps).toEqual([]);
+    for (const tickName of Object.values(steps)) expect(opts[tickName]).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['all', 'one'])('rejects discovery when comment coverage silently drops %s rows after a successful reader', async dropped => {
+    const log = captureLog();
+    const listed = Array.from({ length: 100 }, (_, i) => ({ body: `listed ${i}`, id: i }));
+    const returned = listed.map(c => ({ ...c, body: `different ${c.id}` }));
+    const raw = [pr(1, { labels: ['review:changes'], comments: listed }),
+      ...(dropped === 'one' ? [pr(2, { labels: ['review:changes'] })] : [])];
+    const exec = vi.fn(() => JSON.stringify(raw));
+    const readComments = vi.fn(() => returned);
+    const readPrs = vi.fn(options => reconcilePass.defaultReadPrs({ ...options, exec, readComments }));
+    const opts = fixture({ readPrs });
+    const result = await runTickAllRepos(opts);
+    expect(readComments).toHaveReturnedWith(returned);
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(readPrs.mock.results[0].value).toHaveLength(dropped === 'all' ? 0 : 1);
+    expect(readPrs.mock.results[0].value.discoveryIncomplete).toBe(true);
+    expect(result.skippedSteps).toEqual([]);
+    expect(skipLines(log)).toEqual([]);
+    for (const [step, tickName] of Object.entries(steps)) {
+      const options = opts[tickName].mock.calls[0][0];
+      expect(opts[tickName]).toHaveBeenCalledTimes(1);
+      expect(options).toEqual(step === 'fix'
+        ? { repo: 'repo-a', allowStandDownAutoProceed: false }
+        : ['hung-ci', 'main-red-rebase', 'missing-run'].includes(step)
+          ? { repo: 'repo-a', apply: true } : { repo: 'repo-a' });
+    }
+  });
+
+  it('runs every step when hydration drops a PR from the captured evidence', async () => {
+    captureLog();
+    vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(options => {
+      const rows = options.readPrs();
+      options.excuseMergeGateHolds(rows.slice(0, 1), {});
+      return plan({ prs: 2 });
+    });
+    const opts = fixture({ readPrs: () => [pr(1), pr(2)] });
+    expect((await runTickAllRepos(opts)).skippedSteps).toEqual([]);
+    for (const tickName of Object.values(steps)) expect(opts[tickName]).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['hungCiTick', 'mainRedRebaseTick', 'missingRunTick'])('preserves requested recovery conflict reads for %s when discovery lacks mergeable', async tickName => {
+    captureLog();
+    const row = pr(1);
+    delete row.mergeable;
+    vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(observedPlan(plan()));
+    const conflictRead = vi.spyOn(recovery, 'defaultReadOpenPrs').mockReturnValue([{ ...row, mergeable: 'CONFLICTING' }]);
+    const opts = fixture({ readPrs: () => [row], [tickName]: options => {
+      expect(options.readOpenPrs({ repo: options.repo, extraFields: ['mergeable'] })[0].mergeable).toBe('CONFLICTING');
+      return { dispatched: [], refusals: [] };
+    } });
+    expect((await runTickAllRepos(opts)).refusals).toEqual([]);
+    expect(conflictRead).toHaveBeenCalledWith({ repo: 'repo-a', extraFields: ['mergeable'] });
+  });
+
+  it('keeps real fix scope and stack reads enabled with shared discovery', async () => {
+    captureLog();
+    const rows = [pr(1)];
+    const reconcile = vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(observedPlan(plan({
+      refusals: [{ kind: 'nothing-owed', prNumber: 1 }],
+    })));
+    const scopeRead = vi.spyOn(netScope, 'applyNetScopeToReconcile').mockImplementation(value => value);
+    const stackRead = vi.spyOn(prStack, 'readStacksForPass').mockReturnValue({ pairs: [] });
+    const realFix = fixDispatch.runReconcileFixDispatch;
+    vi.spyOn(fixDispatch, 'runReconcileFixDispatch').mockImplementation(options => realFix({
+      ...options, root: '/fixture', checkStaleness: () => ({ fresh: true, behind: 0 }),
+      resolveProfile: () => ({ capabilities: { fix: true, ciHeal: true }, canonicalPrefix: 'we' }),
+      listFixClaims: () => [], listBuildClaims: () => [], loadItems: () => [],
+      priorityShadow: null, pickFreeLanes: () => [], writeStacks: null,
+    }));
+    const opts = fixture({ repos: ['we'], readPrs: () => rows });
+    delete opts.fixTick;
+    const result = await runTickAllRepos(opts);
+    expect(result.refusals).toEqual([]);
+    expect(scopeRead).toHaveBeenCalledTimes(1);
+    expect(stackRead).toHaveBeenCalledTimes(1);
+    // The owner re-runs reconciliation using the same list, preserving other IO.
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(reconcile.mock.calls[0][0].readPrs()).toEqual(rows);
+  });
+
+  it('shares one discovery per repo/pass only with fix/promote/recovery and gives CI-heal/notes historical arguments', async () => {
+    captureLog();
+    const snapshots = {
+      'repo-a': [pr(1, { isDraft: true })],
+      'repo-b': [pr(2, { isDraft: true })],
+    };
+    const readPrs = vi.fn(({ repo }) => snapshots[repo]);
+    vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(({ repo, readPrs }) => { readPrs(); return plan({
+      dispatch: ['fix', 'ci-heal', 'promote-draft'].map(kind => ({ kind, prNumber: snapshots[repo][0].number })),
+      notes: [{ kind: 'ci-heal-exhausted', prNumber: snapshots[repo][0].number }],
+    }); });
+    const seen = [];
+    const consume = (step, fallback) => vi.fn(options => {
+      // R242 audit round 3 reverses earlier sharing expectations: these owners
+      // must always run their historical paths for flush ordering and fresh writes.
+      if (['ci-heal', 'notes'].includes(step)) {
+        expect(options).toEqual({ repo: options.repo });
+        seen.push([step, options.repo]);
+        return fallback();
+      }
+      // Exercise the existing reader/file seams twice: neither may fetch another list.
+      const read = options.readPrs ?? (options.prsFile ? () => JSON.parse(readFileSync(options.prsFile, 'utf8')) : null);
+      expect(read, `${step} must receive the shared snapshot`).toBeTypeOf('function');
+      for (let i = 0; i < 2; i++) expect(read({ repo: options.repo })).toEqual(snapshots[options.repo]);
+      seen.push([step, options.repo]);
+      return fallback();
+    });
+    const opts = fixture({ repos: Object.keys(snapshots), readPrs, fixSettings: { skipEmptySteps: true } });
+    for (const [step, tickName] of Object.entries(steps)) opts[tickName] = consume(step, opts[tickName]);
+
+    for (let pass = 0; pass < 2; pass++) {
+      const result = await runTickAllRepos(opts);
+      // Tick errors are normally isolated; assert them here so missing seams cannot be swallowed.
+      expect(result.refusals).toEqual([]);
+      expect(readPrs).toHaveBeenCalledTimes((pass + 1) * 2);
+      for (const repo of opts.repos) expect(readPrs.mock.calls.filter(([o]) => o.repo === repo)).toHaveLength(pass + 1);
+      // Recovery steps may cheaply skip; the four expensive steps have explicit work above.
+      for (const step of ['fix', 'ci-heal', 'promote-draft', 'notes']) {
+        for (const repo of opts.repos) expect(seen.filter(row => row[0] === step && row[1] === repo)).toHaveLength(pass + 1);
+      }
+    }
+  });
+});
 
 describe('runTickAllRepos — the daemon tick now runs BOTH fix and ci-heal dispatch, merged (#xngv3vn)', () => {
   it('awaits the async ci-heal half and merges both halves\' dispatched/refusals into one result', async () => {

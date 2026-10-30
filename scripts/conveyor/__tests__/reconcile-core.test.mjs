@@ -30,6 +30,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER, buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
+import { runFinishedSessionReap } from '../finished-session-reap.mjs';
 import {
   staleRequiredBaseRepair, planReconcile as planReconcileCore, fixWaitingSince, countFindings, bindAgents, assessLiveness, isAwaitingPermission, startedAtMs, releasedFixClaim, isReleasedClaimSession,
   REFUSAL_KINDS, DISPATCH_KINDS, selectStatusCandidates, markSelfReportedDone, markHungSessions,
@@ -4462,6 +4463,57 @@ describe('released fix claim + live pid is not live work (PR #5492 replay)', () 
     expect(plan.notes.find((n) => n.kind === 'released-claim-session-ignored').text).toContain('fix claim was released');
   });
 
+  it('the note carries the reaper evidence: listing handle, release time, start time', () => {
+    const plan = run([begin, end], [spare({ id: 'abc123' })]);
+    expect(plan.notes.find((n) => n.kind === 'released-claim-session-ignored')).toMatchObject({
+      handle: 'abc123', releasedAtMs: Date.parse(RELEASED_AT), startedAt: STARTED_BEFORE, cwd: '/dispatch/ad7088e2',
+    });
+  });
+
+  it.each([
+    ['unrelated builder', { name: 'build-1563', sessionSlug: 'build-1563' }],
+    ['another fixer', { name: 'fix-9999', sessionSlug: 'fix-9999' }],
+    ['unnamed worker with no holder evidence', { sessionSlug: undefined }],
+    ['matching name with a different session ID', { name: 's-spare' }],
+    ['matching slug with a different session ID', { sessionSlug: 's-spare' }],
+  ])('unrelated live worker remains live and is never stopped: %s', (_label, identity) => {
+    const worker = spare({ ...identity, sessionId: 's-unrelated', id: 'unrelated-worker' });
+    const plan = run([begin, end], [worker]);
+    expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'live-process', pid: worker.pid }));
+    expect(plan.notes.filter(note => note.kind === 'released-claim-session-ignored')).toEqual([]);
+    const stopped = [];
+    const result = runFinishedSessionReap({ notes: plan.notes,
+      nowMs: Date.parse('2026-10-20T23:30:00Z'), dispatchRoot: '/dispatch',
+      settings: { enabled: true, afterMinutes: 10, afterMs: 10 * 60_000 },
+      readClaim: () => null, probePid: () => true,
+      stop: ({ handle }) => { stopped.push(handle); return {}; },
+    });
+    expect(result.rows).toEqual([]);
+    expect(stopped).toEqual([]);
+  });
+
+  it.each(['name', 'sessionSlug', 'sessionId'])('correlates the released fixer by exact sessionId with %s evidence before reaping', field => {
+    const worker = spare({ sessionSlug: undefined, [field]: 's-spare', sessionId: 's-spare', id: 'released-fixer' });
+    const plan = run([begin, end], [worker]);
+    expect(plan.refusals.some(row => row.kind === 'live-process')).toBe(false);
+    const stopped = [];
+    const result = runFinishedSessionReap({ notes: plan.notes,
+      nowMs: Date.parse('2026-10-20T23:30:00Z'), dispatchRoot: '/dispatch',
+      settings: { enabled: true, afterMinutes: 10, afterMs: 10 * 60_000 },
+      readClaim: () => null, probePid: () => true,
+      stop: ({ handle }) => { stopped.push(handle); return {}; },
+    });
+    expect(result.rows).toContainEqual(expect.objectContaining({ decision: 'reap', result: 'stopped' }));
+    expect(stopped).toEqual(['released-fixer']);
+  });
+
+  it('fails closed on legacy release evidence without a holder identity', () => {
+    const legacy = { ...end, body: `${FIX_END_MARKER}\n\nReleased at \`${SHA}\`.` };
+    expect(releasedFixClaim(pr1563({ comments: [begin, legacy] }))).toBeNull();
+    expect(isReleasedClaimSession(spare(), { releasedAtMs: Date.parse(RELEASED_AT), head: SHA })).toBe(false);
+    expect(run([begin, legacy], [spare()]).refusals[0].kind).toBe('live-process');
+  });
+
   it('a second release at the same head keeps both finished sessions exempt and logs both pids', () => {
     const first = spare({ sessionId: 's-first', pid: 101, startedAt: Date.parse('2026-10-20T20:00:00Z') });
     const second = spare({ sessionId: 's-second', pid: 102, startedAt: Date.parse('2026-10-20T22:00:00Z') });
@@ -4476,6 +4528,8 @@ describe('released fix claim + live pid is not live work (PR #5492 replay)', () 
       const plan = run(comments, [first, second]);
       expect(plan.refusals.some((r) => r.kind === 'live-process')).toBe(false);
       expect(plan.notes.filter((n) => n.kind === 'released-claim-session-ignored').map((n) => n.pid)).toEqual([101, 102]);
+      expect(plan.notes.filter((n) => n.kind === 'released-claim-session-ignored').map((n) => n.releasedAtMs))
+        .toEqual([Date.parse('2026-10-20T21:00:00Z'), Date.parse('2026-10-20T23:00:00Z')]);
       expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'fix', prNumber: 1563 })]);
     }
   });

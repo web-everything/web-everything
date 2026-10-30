@@ -543,7 +543,7 @@ export function staleRequiredBaseRepair({ pr, requiredChecks, defaultBranch }) {
   if (!rows.length || rows.some(row =>
     ['queued', 'in_progress', 'pending', 'waiting', 'requested'].includes(String(row?.status ?? row?.state).toLowerCase())
     || String(row?.state).toLowerCase() === 'expected')) return null;
-  const gate = reviewStartGate({ headSha: pr.headRefOid, requiredChecks, checks: pr.statusCheckRollup, policy: pr.reviewTiming });
+  const gate = reviewStartGate({ headSha: pr.headRefOid, requiredChecks, checks: pr.statusCheckRollup, verifyGreen: pr.verifyGreen, policy: pr.reviewTiming });
   if (gate.allowed || gate.reason !== 'required-checks-not-successful' || !gate.affected.length
       || gate.affected.some(row => row.reason !== 'missing')) return null;
   return { missing: gate.affected.map(row => row.name) };
@@ -1195,14 +1195,14 @@ export function releasedFixClaim(pr) {
   if (!last.body.startsWith(FIX_END_MARKER)) return null; // a later fix-begin = claim held again
   const named = /at `([0-9a-f]{7,40})`/.exec(last.body)?.[1];
   if (!named || !sameHeadSha(named, head)) return null;
-  const who = /^`([^`\r\n]*)` released the fix claim\b/m.exec(last.body)?.[1];
+  const who = releasedFixClaimHolder(last.body);
   if (!who?.trim()) return null;
   const releasesBySession = new Map();
   for (const marker of markers) {
     const isEnd = marker.body.startsWith(FIX_END_MARKER);
     const identity = (isEnd
-      ? /^`([^`\r\n]*)` released the fix claim\b/m
-      : /^\*\*Who:\*\* `([^`\r\n]*)`/m).exec(marker.body)?.[1];
+      ? releasedFixClaimHolder(marker.body)
+      : /^\*\*Who:\*\* `([^`\r\n]*)`/m.exec(marker.body)?.[1]);
     if (!identity?.trim()) return null; // cannot safely attribute a later claim to a session
     releasesBySession.delete(identity); // a renewed claim or invalid release supersedes its earlier evidence
     const releaseHead = isEnd && /at `([0-9a-f]{7,40})`/.exec(marker.body)?.[1];
@@ -1211,6 +1211,12 @@ export function releasedFixClaim(pr) {
     }
   }
   return { releasedAtMs: last.at, head, who, releases: [...releasesBySession.values()] };
+}
+
+/** Read the holder from the shared fix-end comment format; absent or blank identities stay unknown. */
+export function releasedFixClaimHolder(body) {
+  const who = /^`([^`\r\n]*)` released the fix claim\b/m.exec(String(body ?? ''))?.[1];
+  return who?.trim() ? who : null;
 }
 
 /**
@@ -1533,7 +1539,7 @@ function timingFacts(pr, { agents = [], repo, requiredChecks = null, reviewDispa
 
 /** A shared prerequisite for every review emission, including advisory review branches. */
 function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }) {
-  const ci = reviewStartGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup, policy: pr.reviewTiming });
+  const ci = reviewStartGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup, verifyGreen: pr?.verifyGreen, policy: pr.reviewTiming });
   // Excuse only failed conclusions, preserving missing-head, wrong-head and incomplete-evidence refusals.
   const onlyFailures = ci.reason === 'ci-red' || (ci.affected.length > 0
     && ci.affected.every(row => FAILED_CHECK_CONCLUSIONS.includes(row.reason.toUpperCase())));
@@ -2649,6 +2655,11 @@ export function planReconcile({
         notes.push({
           kind: 'released-claim-session-ignored', prNumber, pid: Number.isInteger(b.agent.pid) ? b.agent.pid : null,
           sessionId: b.agent.sessionId ?? null, cwd: b.cwd, head: claimRelease.head,
+          // Evidence for the finished-session reaper (we:scripts/conveyor/finished-session-reap.mjs): the listing's
+          // stop handle, and when the claim was released (how long the session has outlived its work).
+          handle: b.agent.id ?? null,
+          releasedAtMs: (claimRelease.releases ?? [claimRelease]).find(release => release.who === b.agent.sessionId).releasedAtMs,
+          startedAt: b.agent.startedAt ?? null,
           text: `PR #${prNumber}: ignoring live pid ${b.agent.pid ?? '?'} (${b.cwd}) — its fix claim was released (fix-end at ${String(claimRelease.head).slice(0, 9)}) and no new claim is held, so it is finished work, not live work`,
         });
       }

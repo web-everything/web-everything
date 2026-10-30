@@ -195,6 +195,7 @@ export function assessQueueAdmission(queue) {
     byKind,
     headline: `projected wait if you start now: ~${queue.projectedWaitMinutes}m of ${queue.maxWaitMinutes}m max`
       + ` (a fix → ~${fix.projectedMinutes}m counting ${fixAheadOnly ? 'only waiters ahead of it' : 'all waiters'}, ${fix.admit ? 'admitted' : 'HELD queue-cap'})`
+      + (!fixAheadOnly ? '; counting all waiters (priority ordering off or unverified)' : '')
       + (queue.heavyWaitMinutes != null ? `; a full suite → ~${queue.heavyWaitMinutes}m` : ''),
   };
 }

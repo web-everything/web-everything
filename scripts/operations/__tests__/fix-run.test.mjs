@@ -112,8 +112,38 @@ describe('runFixCli', () => {
       write: vi.fn((_r, _p, sha) => { owed.sha = sha; }),
       clear: vi.fn(() => { owed.sha = null; }),
     };
-    return { calls, envs, run, spawn, owed, pendingRearm, io: { persistEvidence: () => {}, readLease: () => ({ holder: 'test-holder' }), recordPush: () => {}, run, pendingRearm, readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }], releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), appendLoopRow: () => {}, removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
+    return { calls, envs, run, spawn, owed, pendingRearm, io: { readLease: () => ({ holder: 'test-holder' }), persistEvidence: () => {}, recordPush: () => {}, run, pendingRearm, readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }], releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), appendLoopRow: () => {}, removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
   };
+  it.each([false, true])('pushAfterCi=%s waits with injected time and folds failures before the agent', async enabled => {
+    const m = mk(['a'.repeat(40), 'b'.repeat(40)]);
+    let now = 1000;
+    const sleeps = [];
+    const readChecks = vi.fn(() => now < 31000 ? [{ name: 'test', status: 'in_progress' }] : [{ name: 'test', status: 'completed', conclusion: 'failure' }]);
+    const result = await runFixCli(argv, { ...m.io, timingPolicy: { pushAfterCi: enabled, pushAfterCiMaxMin: 1 },
+      readRequired: () => ({ checks: ['test'] }), readChecks, clock: () => now,
+      sleep: async ms => { sleeps.push(ms); now += ms; } });
+    expect(result.code).toBe(0);
+    expect(sleeps).toEqual(enabled ? [30000] : []);
+    expect(readChecks).toHaveBeenCalledTimes(enabled ? 2 : 0);
+    if (enabled) {
+      expect(readChecks).toHaveBeenCalledWith({ repo: 'o/r', headSha: 'a'.repeat(40) });
+      expect(m.spawn.mock.calls[0][0].prompt).toContain('Previous-head CI failures (same repair)');
+      expect(m.spawn.mock.calls[0][0].prompt).toContain('\"name\":\"test\"');
+    }
+    expect(m.calls.filter(c => c.includes('push'))).toHaveLength(1);
+    expect(m.calls.flat()).not.toContain('--force');
+  });
+  it('pushes at the fixed bound even if CI reads fail', async () => {
+    const m = mk(['a'.repeat(40), 'b'.repeat(40)]);
+    let now = 0;
+    const sleeps = [];
+    const result = await runFixCli(argv, { ...m.io, timingPolicy: { pushAfterCi: true, pushAfterCiMaxMin: 1 },
+      readRequired: () => ({ checks: ['test'] }), readChecks: () => { throw Error('offline'); }, clock: () => now,
+      sleep: async ms => { sleeps.push(ms); now += ms; } });
+    expect(result.code).toBe(0);
+    expect(sleeps).toEqual([30000, 30000]);
+    expect(m.calls.filter(c => c.includes('push'))).toHaveLength(1);
+  });
   const citedEvidence = '- send-back 1001 item 1: src/fix.mjs:1\n- send-back 1001 item 2: src/fix.mjs:2';
   const withSendBack = ({ evidence = citedEvidence, after = 'b'.repeat(40), failPost = false, fileText = 'one\ntwo\n',
     baseRefName = 'develop', mergeBase = 'd'.repeat(40), diffError = false,
@@ -176,6 +206,7 @@ describe('runFixCli', () => {
     try {
       const pendingRearm = defaultPendingRearm(dir);
       const m = withSendBack();
+      const carryVerdict = vi.fn(async () => ({ carried: true }));
       const comments = await m.io.readComments();
       let attempts = 0;
       let markerAtPost;
@@ -186,7 +217,7 @@ describe('runFixCli', () => {
         if (args.some(a => a.endsWith('rearm-review.mjs')) && attempts++ === 0) throw new Error('re-arm unavailable');
         return m.io.run(cmd, args, opts);
       };
-      const io = { ...m.io, run, pendingRearm, readComments: async () => [
+      const io = { ...m.io, run, pendingRearm, carryVerdict, readComments: async () => [
         ...comments, ...m.posted.map(body => ({ author: { login: 'web-everything' }, body })),
       ] };
       expect((await runFixCli(argv, io)).code).toBe(1);
@@ -201,6 +232,7 @@ describe('runFixCli', () => {
       expect(m.spawn).toHaveBeenCalledOnce();
       expect(m.posted).toHaveLength(1);
       expect(m.io.recordPush).not.toHaveBeenCalled();
+      expect(carryVerdict).not.toHaveBeenCalled();
       expect(m.io.recordOutcome).toHaveBeenLastCalledWith(expect.objectContaining({ outcome: 'no-change' }));
       expect(pendingRearm.read('o/r', '7')).toBeNull();
     } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -1717,6 +1749,41 @@ describe('runFixCli', () => {
     expect(m2.calls.some((c) => c.join(' ').includes('rearm-review.mjs 7 --repo=o/r'))).toBe(true);
     expect(m2.calls.some((c) => c.includes('push'))).toBe(false);
     expect(m2.owed.sha).toBe(null);
+  });
+  it.each([false, true])('carries an accepted ordinary push without re-arming (pending retry=%s)', async retry => {
+    const m = mk(retry ? ['bbb'] : ['aaa', 'bbb']);
+    if (retry) m.owed.sha = 'bbb'; // Historical records without a kind still represent pushes.
+    const carryVerdict = vi.fn(async () => ({ carried: true, fromSha: 'aaa', patchId: 'same-patch' }));
+    const recordOutcome = vi.fn();
+    const out = await runFixCli(argv, { ...m.io, carryVerdict, recordOutcome });
+    expect(out.code).toBe(0);
+    expect(out.result).toContain('accept carried');
+    expect(carryVerdict).toHaveBeenCalledOnce();
+    expect(carryVerdict).toHaveBeenCalledWith(expect.objectContaining({ head: 'bbb', lanePath: '/lanes/lane-5' }));
+    expect(m.calls.some(c => c.some(a => String(a).includes('rearm-review')))).toBe(false);
+    expect(m.spawn).toHaveBeenCalledTimes(retry ? 0 : 1);
+    expect(m.pendingRearm.clear).toHaveBeenCalledOnce();
+    expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'pushed' }));
+  });
+  it('recovers a persisted conflict push in its original round without carrying acceptance', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fix-conflict-rearm-'));
+    try {
+      const pendingRearm = defaultPendingRearm(dir);
+      pendingRearm.write('o/r', '7', 'bbb', undefined, { conflictRound: true, mainRef: 'develop' });
+      expect(pendingRearm.read('o/r', '7')).toMatchObject({ kind: 'push', conflictRound: true, mainRef: 'develop' });
+      const m = mk(['bbb']);
+      const carryVerdict = vi.fn(async () => ({ carried: true }));
+      const out = await runFixCli(argv, { ...m.io, pendingRearm, carryVerdict });
+      expect(out.code).toBe(0);
+      expect(out.result).toContain('re-armed');
+      expect(carryVerdict).not.toHaveBeenCalled();
+      expect(m.spawn).not.toHaveBeenCalled();
+      expect(m.calls.some(c => c.includes('push'))).toBe(false);
+      const rearm = m.run.mock.calls.find(([, args]) => args.some(a => a.endsWith('rearm-review.mjs')));
+      expect(rearm[1]).toEqual(expect.arrayContaining(['--round=conflict', '--main-ref=develop']));
+      expect(rearm[2]).toMatchObject({ cwd: '/lanes/lane-5' });
+      expect(pendingRearm.read('o/r', '7')).toBeNull();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('clears a pending re-arm refusal as pushed without running another agent', async () => {
     vi.stubEnv('WE_FIX_REARM_NOTHING_TO_REARM', 'noop');
