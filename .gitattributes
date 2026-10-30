@@ -1,0 +1,2 @@
+# Union merge: PRs add independent sections to this prose doc; keep both sides instead of conflicting.
+docs/agent/testing.md merge=union
