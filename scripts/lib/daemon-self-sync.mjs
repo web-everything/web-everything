@@ -134,6 +134,7 @@ import { resolveRebuildAsJob, rebuildJobsDir, REBUILD_JOB_KIND } from './daemon-
 import { createJobStore } from './daemon-jobs-runtime.mjs';
 import { cloneKey } from './daemon-overlays.mjs';
 import { daemonStateDir } from './daemon-last-good.mjs';
+import { maybeMaintainClone, cloneHasRebuildJob } from './clone-maintenance.mjs';
 
 /** PURE: env → rebuild.maxAdoptWaitTicks → default, with the effective policy source. */
 export function resolveMaxAdoptWaitTicks(env = {}, settings = {}) {
@@ -688,6 +689,7 @@ export function withSelfSync(effects, {
   background, tickProgress, recloneMarker, cloneIdentity = readCloneIdentity, rebuildJobIds,
   // x0m7a8x — the declared rebuild path (see resolveSelfSyncRebuildAsJob); undefined resolves it once, here.
   rebuildAsJob: rebuildAsJobOpt,
+  maintain, hasMaintenanceRebuildJob = () => cloneHasRebuildJob(root, env),
 }) {
   const tick = effects.tickOnce;
   const realIo = rebuildOpt === undefined;
@@ -996,6 +998,17 @@ export function withSelfSync(effects, {
       }
       // Cheap pre-lock re-clone check; the one that counts is re-run UNDER the read lock below.
       if (recloneBlocks()) return recloneSkip();
+
+      // Idle boundary: adoption has finished and this tick does not yet hold a READ slot.
+      // Tests with an injected rebuild opt in to maintenance explicitly, avoiding real clone/state IO.
+      if (maintain || realIo) {
+        try {
+          if (!/^rebuild-job-(started|running)$/.test(String(rebuildResult?.reason))
+            && await hasMaintenanceRebuildJob() === false) {
+            await (maintain ?? maybeMaintainClone)({ root, env, now, hasRebuildJob: hasMaintenanceRebuildJob });
+          }
+        } catch { /* Maintenance must never fail or suppress a daemon tick. */ }
+      }
 
       // A stale refusal gets one immediate re-discovery after a successful gated rebuild.
       // Never reuse the old plan (some reviews may already have started), and never loop
