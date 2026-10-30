@@ -2943,6 +2943,42 @@ refresh the index. The live PR head may have advanced since an incident; compare
 against the SHA the probe actually reports. Regression files: `fix-run-lane-head.test.mjs`,
 `fix-run.test.mjs`, and `fix-run-borrow-dies.test.mjs` under `scripts/operations/__tests__/`.
 
+### Single-pid process identity evidence
+
+`scripts/lib/proc-identity.mjs` exposes `record` (canonical, null-free identity capture)
+and `probe` (positive-evidence tri-state checks). UID remains a captured filter, not
+a key for `probe`; legacy `liveness` and `sameIdentity` retain their UID comparison.
+Live-process fixtures must supply Linux cmdline and namespace links as well as stat/status.
+For an exited Linux leader, `probe` uses stat plus a bounded task census without reading
+the namespace link (which can disappear at exit): all exited tasks plus an unchanged
+task-ID set in a final census prove dead; any live task yields `unknown` with
+`zombie-leader-live-tasks`. Changed, duplicate, unreadable, incomplete or over-budget
+censuses yield `unknown` with `evidence-unavailable`; retry or inspect manually.
+An initial task-directory `ENOENT`/`ESRCH` can also mean hidepid concealed live workers:
+require independent absence confirmation (readable boot ID and signal-zero `ESRCH`)
+before returning dead. Test both directory errors with signal-zero success, `EPERM`,
+`EACCES`, and other failures (unknown), alongside confirmed absence (dead).
+Race fixtures must include a worker spawning a live successor before its own stat is
+read as Z/X/x, and a same-count task replacement. Reordering an unchanged set must
+still permit dead. `record` still requires the namespace
+link to capture a complete identity. Model removed evidence with a read error, not
+an empty successful output or ENOENT: those can be positive absence evidence. Exhaustive
+subset tests cover both absence and exited-task death as well as live and reused keys.
+Race fixtures must change the second per-PID stat read: a changed start time or parent
+PID makes `record` fail and `probe` return `unknown`, both with
+`identity-changed-during-read`. Exercise each field separately and together so removing
+either comparison is detectable. A second-read transition to Z/X/x keeps the captured
+identity recordable when evidence is complete; `probe` must consult the task census,
+returning dead for all exited tasks or unknown for a live task, never alive.
+Linux `listGroup` fixtures must also provide `/proc/self/mountinfo`: a visible leader
+does not prove that procfs exposes other users' group members. Require one full procfs
+mount at `/proc`, with hidepid absent or explicitly zero, and unchanged mount evidence
+before and after the census. Hidden, missing, malformed, unreadable or oversized mount
+evidence yields unknown; retry or inspect the mount configuration manually. Keep a
+visible-leader/hidden-member regression alongside the omitted-leader case.
+The real-host cases require permission to execute `ps` and read the boot UUID on macOS;
+a sandbox denying either operation produces unknown and cannot certify those cases.
+
 ## Archive-only host retention (R217)
 
 `scripts/lib/archive-retention.mjs` uses the run store's shared directory resolver without triggering
