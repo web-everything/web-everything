@@ -1674,7 +1674,8 @@ export async function speculateRedTeam({
 /**
  * THE SECOND HALF — given a `speculated` pass and the FINISHED review, write the seat row (corroborated against
  * Claude's own findings now that they exist), fold the verdict and run the effects. Identical to the tail of the
- * pre-split `runRedTeam`. Never throws.
+ * pre-split `runRedTeam`. A non-ok seat returns/stores `failed` with its reason, retaining the evidence row
+ * for quota/cap accounting; only a clean execution claims `ran` or publishes effects. Never throws.
  */
 export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true, record = true } = {}, io = createRedTeamIo()) {
   try {
@@ -1694,6 +1695,8 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
       changedFiles: pass.changedFiles ?? null,
     });
     const ran = seatRow.status === 'ok';
+    const status = ran ? 'ran' : 'failed';
+    const reason = ran ? null : (seatRow.reason || seatRow.error || `red-team seat ${seatRow.status}`);
     const confirmed = findings.filter((f) => f.confirmedByRecheck);
     const foldedVerdict = foldRedTeamVerdict({ ran, findings: confirmed.map((f) => ({ summary: f.summary, file: f.file })) });
     const builder = resolveBuilder({ body: pass.body, headMessage: pass.headMessage ?? '' });
@@ -1725,11 +1728,11 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
     }
 
     if (record && post) {
-      try { io.redTeamStatus?.({ repo, pr, loopPayload, status: 'finished', result: 'ran' }); }
+      try { io.redTeamStatus?.({ repo, pr, loopPayload, status: 'finished', result: status }); }
       catch (e) { io.log(`red-team status: ${e.message}`); }
     }
     return {
-      status: 'ran', provider, model, effort, callId, rev, seat: row, findings, recheckStatus, confirmedMissCount: confirmed.length,
+      status, ...(!ran ? { reason } : {}), provider, model, effort, callId, rev, seat: row, findings, recheckStatus, confirmedMissCount: confirmed.length,
       foldedVerdict, builder, delegationTrial, comment, rowsWritten, callsUsedToday: pass.callsUsedToday, dailyCap: pass.dailyCap,
     };
   } catch (e) {

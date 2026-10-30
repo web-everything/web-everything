@@ -40,6 +40,11 @@ export default {
         const child = children.get(Number(handle.split(':')[1]));
         return child && child.exitCode === null && child.signalCode === null ? 'alive' : 'dead';
       },
+      // Fixture-owned children: stop() SIGKILLs and awaits close, so a dead owner means no group survives.
+      reapGroup: handle => {
+        const child = children.get(Number(handle.split(':')[1]));
+        return !child || (child.exitCode !== null || child.signalCode !== null);
+      },
       stop: async handle => {
         stopAt ??= Date.now() - started;
         const child = children.get(Number(handle.split(':')[1]));

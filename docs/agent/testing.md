@@ -1,24 +1,6 @@
 # Testing — Three-Tier Strategy
 
-## Live operator routing fixtures
-
-`routing-overrides.test.mjs` covers the routing reader's last-good snapshot across repo edits and
-operator `routingOverrides` changes, including clearing and one event per applied change.
-`routing-override.test.mjs` exercises the declared CLI and atomic preference writer with a temporary
-`WE_PLATFORM_PREFERENCES_FILE`; never point write tests at the operator's real preferences.
-The red-team live-reload case injects `io.readRoutingPolicy` and keeps CLI, quota and reservation
-checks in the selection path. Explicit provider selection enables a default-zero provider with a
-finite daily cap only when its env cap is unset; explicit env caps (including zero) remain binding.
-Clearing restores the repo/env defaults on the next pass. The preference writer holds the shared
-file lock across the full read-modify-write; overlapping writer fixtures must preserve both updates.
-Non-judged operation declarations may use `provider` and `model` as real inputs. On judged
-operations those names remain reserved juror controls; undeclared juror flags still fail closed.
-Repo platform files must ignore `routingOverrides` and warn, even when the operator file has no
-override; only the operator file (or its explicit replacement) can supply them. In added-seat
-fixtures, enable Gemini for one seat and leave other seats inherited or with Gemini fallbacks:
-only the enabled seat may use the default-zero provider. Check both synchronous and rejected
-event writes: neither may prevent applying or clearing a validated policy. Agy Sonnet aliases
-must resolve to an effort-suffixed catalog ID; historical persisted IDs remain readable.
+> Authors: APPEND new sections at the END of this file, never right after the title (`.gitattributes` union-merges it, but appending avoids overlapping insertions).
 
 ## Human-only enqueue approval license (R212)
 
@@ -2955,3 +2937,23 @@ fallback, and claim zero reclaimed bytes. Do not enable reclamation with a polic
 heuristic. The operator must arrange actual writer exclusion before reclamation can be wired in.
 Regression tests append in the final-stat/removal interval, hold an open transcript descriptor, test
 unavailable exclusion, and queue a cooperating writer through the same exclusion used by removal.
+
+## Live operator routing fixtures
+
+`routing-overrides.test.mjs` covers the routing reader's last-good snapshot across repo edits and
+operator `routingOverrides` changes, including clearing and one event per applied change.
+`routing-override.test.mjs` exercises the declared CLI and atomic preference writer with a temporary
+`WE_PLATFORM_PREFERENCES_FILE`; never point write tests at the operator's real preferences.
+The red-team live-reload case injects `io.readRoutingPolicy` and keeps CLI, quota and reservation
+checks in the selection path. Explicit provider selection enables a default-zero provider with a
+finite daily cap only when its env cap is unset; explicit env caps (including zero) remain binding.
+Clearing restores the repo/env defaults on the next pass. The preference writer holds the shared
+file lock across the full read-modify-write; overlapping writer fixtures must preserve both updates.
+Non-judged operation declarations may use `provider` and `model` as real inputs. On judged
+operations those names remain reserved juror controls; undeclared juror flags still fail closed.
+Repo platform files must ignore `routingOverrides` and warn, even when the operator file has no
+override; only the operator file (or its explicit replacement) can supply them. In added-seat
+fixtures, enable Gemini for one seat and leave other seats inherited or with Gemini fallbacks:
+only the enabled seat may use the default-zero provider. Check both synchronous and rejected
+event writes: neither may prevent applying or clearing a validated policy. Agy Sonnet aliases
+must resolve to an effort-suffixed catalog ID; historical persisted IDs remain readable.

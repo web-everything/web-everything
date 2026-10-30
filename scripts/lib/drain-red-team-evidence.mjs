@@ -186,7 +186,7 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
     // writer retained one. Keep the status intact for recovery's provenance checks.
     const loopPayload = status.loopPayload?.carriedFrom != null ? { ...status.loopPayload, verdict: null } : status.loopPayload;
     return { status, loopPayload, ...seatEvidence, inFlight: live && status.status === 'running', ...(live && status.status === 'queued' ? { queued: true } : {}),
-      ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error'].includes(resultStatus), recorded: recorded || resultStatus === 'ran' };
+      ...(typeof status.skipCardOnly === 'boolean' ? { skipCardOnly: status.skipCardOnly } : {}), scheduled: ['queued', 'running'].includes(status.status) || ['ran', 'error', 'failed'].includes(resultStatus), recorded: recorded || resultStatus === 'ran' };
   }
   const loopPayload = latestRun().run;
   if (!loopPayload && !recorded) {
