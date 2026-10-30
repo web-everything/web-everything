@@ -57,6 +57,16 @@ describe('normalizeJob', () => {
 });
 
 describe('compareRunners', () => {
+  it('includes hosted and reusable-workflow shards while rejecting similarly named jobs', () => {
+    const r = compareRunners([
+      job({ run: 1 }),
+      { ...job({ run: 2 }), name: 'hetzner / test-shard (1)' },
+      { ...job({ run: 3 }), name: 'hetzner / integration' },
+      { ...job({ run: 4 }), name: 'hetzner / test-shard-helper (1)' },
+    ]);
+    expect(r.x86).toMatchObject({ runs: 2, shardJobs: 2, medianMin: 2 });
+  });
+
   it('groups shard durations by runner and reports median, p90, failures', () => {
     const jobs = [];
     [60, 120, 180, 240, 300].forEach((s, i) => jobs.push(job({ run: i + 1, runSec: s })));
@@ -149,6 +159,13 @@ describe('fetchShardJobs + main wiring (fake gh)', () => {
     const jobs = fetchShardJobs({ exec: fakeGh });
     expect(jobs).toHaveLength(2);
     expect(jobs.map((j) => [j.runId, j.headSha])).toEqual([[11, 'sha11'], [12, 'sha12']]);
+  });
+
+  it('retains reusable-workflow shards through fetch and comparison', () => {
+    const exec = (cmd, args) => fakeGh(cmd, args).replaceAll('test-shard (1)', 'hetzner / test-shard (1)');
+    const jobs = fetchShardJobs({ exec });
+    expect(jobs).toHaveLength(2);
+    expect(compareRunners(jobs)).toMatchObject({ x86: { shardJobs: 1 }, arm: { shardJobs: 1 } });
   });
 
   it('main() prints the table end to end from gh output', () => {

@@ -10,9 +10,50 @@
  * So these tests drive the REAL reader and the REAL sink with injected fs, never a fixture standing in for
  * them.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { createScaffoldReader, createScaffoldSinks } from '../scaffold-io.mjs';
-import { SCAFFOLD_EFFECT } from '../scaffold.mjs';
+import { planScaffold, shapeScaffoldRead, SCAFFOLD_EFFECT } from '../scaffold.mjs';
+import { handNumberedNewItems } from '../../check-standards-rules.mjs';
+import { allocateCardNumber } from '../../lib/card-number-allocator.mjs';
+
+// Keep the default-reader regression hermetic if it reaches the numeric allocator again.
+vi.mock('../../lib/card-number-allocator.mjs', () => ({
+  allocateCardNumber: vi.fn(() => ({ ok: true, num: '90001' })),
+}));
+
+describe('new cards use hash ids by default (#2288/#2548)', () => {
+  it('skips numeric allocation and produces a hash filename accepted by the standards gate without warnings', () => {
+    vi.mocked(allocateCardNumber).mockClear();
+    const log = vi.fn();
+    const raw = createScaffoldReader({ root: '/repo',
+      listFiles: () => ['001-a.md', '042-b.md', '3201-resolved.md'],
+      today: () => '2026-08-21', log,
+    })();
+    expect(raw).not.toHaveProperty('allocatedId');
+    expect(allocateCardNumber).not.toHaveBeenCalled();
+    expect(log).not.toHaveBeenCalled();
+
+    const plan = planScaffold(shapeScaffoldRead(raw), { title: 'New card', kind: 'task' });
+    expect(plan.num).toMatch(/^x[0-9a-z]{6}$/);
+    expect(plan.id).toBe(`${plan.num}-new-card`);
+    expect(plan.rel).toBe(`backlog/${plan.id}.md`);
+    expect(plan.content).not.toContain('bornAs:');
+    const { id, num } = plan;
+    expect(handNumberedNewItems([{ id, num }], [])).toEqual([]);
+  });
+
+  it('preserves existing numeric ids verbatim and never reuses them for the new card', () => {
+    const files = ['001-a.md', '042-b.md', '3201-resolved.md'];
+    const raw = createScaffoldReader({ root: '/repo', listFiles: () => files,
+      today: () => '2026-08-21', log: () => {},
+    })();
+    const plan = planScaffold(raw, { title: 'Another card', kind: 'task' });
+    expect(raw.existingIds).toEqual(['001', '042', '3201']);
+    expect(files).toEqual(['001-a.md', '042-b.md', '3201-resolved.md']);
+    expect(plan.num).toMatch(/^x[0-9a-z]{6}$/);
+    expect(raw.existingIds).not.toContain(plan.num);
+  });
+});
 
 describe('the reader supplies exactly what the allocator needs', () => {
   it('collects EVERY card id, including resolved ones', () => {
