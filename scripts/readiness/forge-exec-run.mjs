@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 // Installed root:root 0755. No executable source or configuration comes from the task.
 import {spawn} from 'node:child_process';
-import {constants} from 'node:fs';
+import {constants, realpathSync} from 'node:fs';
 import * as filesystem from 'node:fs/promises';
-import {open, mkdir, readdir, writeFile, rename, rm, rmdir, lstat, realpath} from 'node:fs/promises';
+import {open, mkdir, readdir, writeFile, rename, rm, rmdir, lstat} from 'node:fs/promises';
 import {createHash, randomBytes} from 'node:crypto';
 import {join, relative} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {cpus, loadavg, freemem, totalmem} from 'node:os';
-import {baseGuard, readyBases, readBase, copyLeaves, baseFile, materializeWorktree} from './forge-exec-bases.mjs';
+import {baseGuard, readyBases, readBase, copyLeaves, baseFile, createBasePin, materializeWorktree} from './forge-exec-bases.mjs';
 import {decodeManifest} from './forge-exec-manifest.mjs';
 const LIMIT = 4 * 1024 * 1024;
 const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
@@ -90,7 +90,8 @@ export function parseTelemetry(text) {
   if (!exactKeys(v,'activeRuns,cores,loadPerCore,memFreePct,recent,sampledAtET') || !validET(v.sampledAtET)
     || !Number.isSafeInteger(v.cores) || v.cores<1 || !Number.isFinite(v.loadPerCore) || v.loadPerCore<0
     || !Number.isFinite(v.memFreePct) || v.memFreePct<0 || v.memFreePct>100 || !duration(v.activeRuns)
-    || !Array.isArray(v.recent) || v.recent.length>50 || v.recent.some(r=>!exactKeys(r,'code,runId,stageMs,startedAtET')
+    || !Array.isArray(v.recent) || v.recent.length>50 || v.recent.some(r=>!(exactKeys(r,'code,runId,stageMs,startedAtET')
+      || (exactKeys(r,'code,prewarmed,runId,stageMs,startedAtET') && typeof r.prewarmed==='boolean'))
       || !runName(r.runId) || !validET(r.startedAtET) || !exactKeys(r.stageMs,'install,run')
       || !duration(r.stageMs.install) || !duration(r.stageMs.run) || !(r.code===null || (duration(r.code)&&r.code<=255))))
     throw new Error('Invalid telemetry schema');
@@ -525,29 +526,9 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
     if(result.code!==0)throw new Error('Worker ownership handoff refused; use local fallback and inspect slot setup');
   }
   async function pinBase(run,baseSha) {
-    const active=join(bases,'active'),pin=join(active,run);
-    await mkdir(active,{recursive:true,mode:0o700});
     // Pool metadata runs as root, but the anonymous warmer runs as ops and
     // must read every active pin before deciding which public bases to prune.
-    if(!testRoot&&process.getuid()===0){
-      const fd=await open(active,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
-      try{
-        const st=await fd.stat();
-        if(![0,operator.uid].includes(st.uid)||(st.mode&0o022))throw new Error('Unsafe base pin directory');
-        await fd.chown(operator.uid,operator.gid);
-      }finally{await fd.close();}
-    }
-    try{await writeFile(pin,baseSha,{flag:'wx',mode:0o600});}
-    catch(error){if(error.code!=='EEXIST'||(await baseFile(pin)).toString()!==baseSha)throw error;}
-    if(!testRoot&&process.getuid()===0){
-      const fd=await open(pin,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
-      try{
-        const st=await fd.stat();
-        if(!st.isFile()||st.nlink!==1||![0,operator.uid].includes(st.uid)||st.size!==baseSha.length
-          ||(await fd.readFile()).toString()!==baseSha)throw new Error('Unsafe base pin');
-        await fd.chown(operator.uid,operator.gid);
-      }finally{await fd.close();}
-    }
+    await createBasePin(bases,run,baseSha,!testRoot&&process.getuid()===0?operator:undefined);
   }
   async function workCommand(worker,argv,work,env,archive) {
     if(testRoot) return testWorkerExec?testWorkerExec({worker,argv,cwd:work,env,archive}):execute(argv[0],archive ? ['-xf',archive] : argv.slice(1),{cwd:work,env,detached:true});
@@ -925,7 +906,9 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
     },
   };
 }
-if(process.argv[1] && await realpath(process.argv[1]).catch(()=> '') === await realpath(fileURLToPath(import.meta.url))) {
+const cliPath = (()=>{try{return realpathSync(process.argv[1]);}catch{return '';}})();
+if(process.argv[1] && cliPath === realpathSync(fileURLToPath(import.meta.url))) {
+  (async()=>{
   try {
     if(process.argv.length!==3 || !['prepare','run','finish','bases','base-manifest','telemetry','warm-install'].includes(process.argv[2])) throw new Error('Invalid subcommand');
     // Pool roots are deliberately 0700 worker-owned. Only this installed,
@@ -949,4 +932,5 @@ if(process.argv[1] && await realpath(process.argv[1]).catch(()=> '') === await r
     if(process.argv[2]==='prepare'&&error.code==='forge-busy')process.stdout.write(JSON.stringify({reason:'forge-busy'})+'\n');
     process.stderr.write('forge-exec-run: '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n'); process.exitCode=254;
   }
+  })();
 }

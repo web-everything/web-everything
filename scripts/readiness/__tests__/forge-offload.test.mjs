@@ -7,6 +7,7 @@ import {createHash} from 'node:crypto';
 import * as remote from '../remote-exec.mjs';
 import {parseGitTree} from '../forge-exec-manifest.mjs';
 import {createRunner,manifestWire,digestManifest,digestInput,digestArgv} from '../forge-exec-run.mjs';
+import {createBasePin,pruneBases} from '../forge-exec-bases.mjs';
 let root,repo;
 const hash=data=>createHash('sha256').update(data).digest('hex');
 const git=(args,cwd=repo)=>{const r=spawnSync('git',args,{cwd,maxBuffer:4*1024*1024});if(r.status)throw new Error(r.stderr.toString());return r.stdout;};
@@ -24,6 +25,73 @@ async function baseFixture() {
   const manifest=await remote.buildManifest({cwd:repo,exec});
   return {sha,manifest:manifestWire(manifest),manifestDigest:manifest.manifestDigest};
 }
+async function pruningFixture() {
+  const target=join(root,'pruning');await fs.mkdir(target,{mode:0o700});
+  const shas=Array.from({length:6},(_,i)=>String(i).repeat(40));
+  for(const [i,sha] of shas.entries()) {
+    await fs.mkdir(join(target,sha));
+    await fs.writeFile(join(target,sha,'READY'),JSON.stringify({sha,manifestDigest:hash('manifest'),lockDigest:hash('lock'),readyAtMs:i,fetchedAtMs:i}));
+    await fs.writeFile(join(target,sha,'keep'),'base '+i);
+  }
+  await fs.mkdir(join(target,'failed.tmp'));
+  return {target,shas};
+}
+describe('active base pin safety',()=>{
+  it.each(['garbage','unreadable'])('refuses pruning with a %s active pin and keeps every base',async fault=>{
+    const {target,shas}=await pruningFixture(),active=join(target,'active');
+    await fs.mkdir(active,{mode:0o700});
+    const pin=join(active,'run-one');await fs.writeFile(pin,fault==='garbage'?'not-a-sha':shas[0],{mode:0o600});
+    const before=(await fs.readdir(target)).sort();
+    const remove=vi.fn(fs.rm);
+    const io={...fs,rm:remove,open:async(path,...args)=>{
+      if(fault==='unreadable'&&String(path)===pin)throw Object.assign(new Error('pin denied'),{code:'EACCES'});
+      return fs.open(path,...args);
+    }};
+    if(fault==='garbage')await expect(pruneBases(target,io)).rejects.toThrow('Unreadable active base pin: pruning refused');
+    else await expect(pruneBases(target,io)).rejects.toMatchObject({code:'EACCES'});
+    expect(remove).not.toHaveBeenCalled();
+    expect((await fs.readdir(target)).sort()).toEqual(before);
+    for(const [i,sha] of shas.entries())expect(await fs.readFile(join(target,sha,'keep'),'utf8')).toBe('base '+i);
+    expect(await fs.readFile(pin,'utf8')).toBe(fault==='garbage'?'not-a-sha':shas[0]);
+  });
+  it('ops can read root-created active base pins and retain the pinned base',async()=>{
+    const {target,shas}=await pruningFixture(),active=join(target,'active'),pin=join(active,'run-one');
+    const operator={uid:1001,gid:1002},owners=new Map(),transfers=[];
+    let asOps=false;
+    const checkOps=path=>{
+      if(!asOps)return;
+      for(const name of [active,...(String(path)===pin?[pin]:[])]) {
+        if(owners.get(name)?.uid!==operator.uid)throw Object.assign(new Error('ops cannot read root-owned pin metadata'),{code:'EACCES'});
+      }
+    };
+    const io={...fs,
+      mkdir:async(path,options)=>{await fs.mkdir(path,options);if(!owners.has(String(path)))owners.set(String(path),{uid:0,gid:0});},
+      writeFile:async(path,...args)=>{await fs.writeFile(path,...args);owners.set(String(path),{uid:0,gid:0});},
+      lstat:async path=>{checkOps(path);return fs.lstat(path);},
+      readdir:async path=>{checkOps(path);return fs.readdir(path);},
+      open:async(path,flags)=>{
+        checkOps(path);
+        const fd=await fs.open(path,flags);
+        return {stat:async()=>Object.assign(await fd.stat(),owners.get(String(path))),
+          readFile:()=>fd.readFile(),close:()=>fd.close(),
+          chown:async(uid,gid)=>{transfers.push({path:String(path),uid,gid});owners.set(String(path),{uid,gid});}};
+      },
+    };
+    // Run the same pin creator used by privileged prepare/run; only identity
+    // and fchown are simulated, while metadata creation and pruning use disk.
+    await createBasePin(target,'run-one',shas[0],operator,io);
+    expect(transfers).toEqual([{path:active,...operator},{path:pin,...operator}]);
+    expect((await fs.stat(active)).mode&0o777).toBe(0o700);
+    expect((await fs.stat(pin)).mode&0o777).toBe(0o600);
+    asOps=true;
+    const reader=await io.open(pin,0);
+    try{expect((await reader.readFile()).toString()).toBe(shas[0]);}finally{await reader.close();}
+    await pruneBases(target,io);
+    expect(await fs.readdir(target)).toEqual(expect.arrayContaining([shas[0],...shas.slice(2)]));
+    await expect(fs.stat(join(target,shas[1]))).rejects.toMatchObject({code:'ENOENT'});
+    await expect(fs.stat(join(target,'failed.tmp'))).rejects.toMatchObject({code:'ENOENT'});
+  });
+});
 describe('warm base selection and delta proof',()=>{
   it('hashes Mac index membership even when tracked and untracked file bytes are identical',async()=>{
     await fs.writeFile(join(repo,'new.md'),'same bytes');

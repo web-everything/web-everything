@@ -566,6 +566,35 @@ with patch.object(os, 'open', side_effect=local_open), \
       expect(result.stderr).toContain(args.length===1?'Request limit exceeded':'Invalid subcommand');
     }
   });
+  it.each(['/root', '../', '/srv/forge-base/../root', `/srv/forge-base/${'a'.repeat(40)}.tmp/other`])
+  ('warm-install rejects out-of-allowlist source %s before any copy', async source => {
+    const probe=join(root,'warm-source-probe.mjs'),attempts=join(root,'warm-source-io.jsonl');
+    await writeFile(probe, `
+import fs from 'node:fs/promises';
+import {appendFileSync} from 'node:fs';
+import {syncBuiltinESMExports} from 'node:module';
+// Skip host pool discovery and stop every subsequent IO operation before it
+// can read or mutate a host tree, even if the source guard regresses.
+fs.readdir = async () => [];
+for (const method of ['open','mkdir','lstat','writeFile','copyFile','cp']) {
+  fs[method] = async () => {
+    appendFileSync(${JSON.stringify(attempts)},JSON.stringify(method)+'\\n');
+    throw new Error('unexpected warm IO: '+method);
+  };
+}
+syncBuiltinESMExports();
+`);
+    const result=spawnSync(process.execPath,['--import',probe,
+      new URL('../forge-exec-run.mjs',import.meta.url).pathname,'warm-install'],{
+      input:JSON.stringify({source,manifest:request.manifest}),encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+      env:{PATH:process.env.PATH},
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status,result.stderr).toBe(254);
+    expect(result.stderr).toBe('forge-exec-run: Invalid warm source\n');
+    expect(result.stdout).toBe('');
+    await expect(stat(attempts)).rejects.toMatchObject({code:'ENOENT'});
+  });
   it('the production CLI reaches createRunner with a valid request and ignores test-root environment overrides', async () => {
     const probe=join(root,'boundary-probe.mjs');
     // Observe the real CLI's first filesystem operation after createRunner().
@@ -798,11 +827,13 @@ describe('certified snapshot equals selected inventory: Forge acceptance', () =>
     if (fault === 'duplicate') {
       manifest.paths = nul([Buffer.from('package-lock.json'),Buffer.from('package-lock.json')]).toString('base64');
       manifest.hashes.push(manifest.hashes[0]); manifest.executable.push(false);
+      manifest.tracked.push(manifest.tracked[0]);
     }
     if (fault === 'unsorted') {
       await writeFile(join(work,'z.txt'),'z');
       manifest.paths = nul([Buffer.from('z.txt'),Buffer.from('package-lock.json')]).toString('base64');
       manifest.hashes = [hash('z'),hash('lock')]; manifest.executable = [false,false];
+      manifest.tracked = [false,false];
     }
     const unsafe = {'newline':'bad\nname.test.mjs', CR:'bad\rname', absolute:'/outside', parent:'../outside', dot:'./file', 'empty component':'a//file'};
     if (fault in unsafe) manifest.paths = nul([Buffer.from(unsafe[fault])]).toString('base64');
@@ -813,7 +844,13 @@ describe('certified snapshot equals selected inventory: Forge acceptance', () =>
     if (fault === 'excluded directory test') manifest.excluded = nul([Buffer.from('__tests__/credentials.js')]).toString('base64');
     request.manifestDigest = hash(JSON.stringify(manifest));
     request.inputDigest = await digestInput(work);
-    await expect(runner.run(request)).rejects.toThrow(/manifest|inventory|snapshot|path|base64|hash|test/i);
+    const ordering = fault === 'duplicate' || fault === 'unsorted';
+    if (ordering) {
+      expect(manifest.hashes).toHaveLength(2);
+      expect(manifest.executable).toEqual([false,false]);
+      expect(manifest.tracked).toEqual([false,false]);
+    }
+    await expect(runner.run(request)).rejects.toThrow(ordering ? 'Manifest paths must be strictly increasing' : /manifest|inventory|snapshot|path|base64|hash|test/i);
     await expectNoExecutionOrReceipt();
   });
 

@@ -152,6 +152,31 @@ export async function copyLeaves(source,destination,entries,io=fs) {
     }
   }
 }
+// Root-created pins must be readable by the ops warmer. The privileged caller
+// supplies the operator identity; unprivileged creation needs no transfer.
+export async function createBasePin(root,run,baseSha,operator,io=fs) {
+  const active=join(root,'active'),pin=join(active,run);
+  await io.mkdir(active,{recursive:true,mode:0o700});
+  if(operator){
+    const fd=await io.open(active,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
+    try{
+      const st=await fd.stat();
+      if(![0,operator.uid].includes(st.uid)||(st.mode&0o022))throw new Error('Unsafe base pin directory');
+      await fd.chown(operator.uid,operator.gid);
+    }finally{await fd.close();}
+  }
+  try{await io.writeFile(pin,baseSha,{flag:'wx',mode:0o600});}
+  catch(error){if(error.code!=='EEXIST'||(await baseFile(pin,io)).toString()!==baseSha)throw error;}
+  if(operator){
+    const fd=await io.open(pin,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
+    try{
+      const st=await fd.stat();
+      if(!st.isFile()||st.nlink!==1||![0,operator.uid].includes(st.uid)||st.size!==baseSha.length
+        ||(await fd.readFile()).toString()!==baseSha)throw new Error('Unsafe base pin');
+      await fd.chown(operator.uid,operator.gid);
+    }finally{await fd.close();}
+  }
+}
 export async function pruneBases(root,io=fs) {
   const ready=await readyBases(root,io),active=new Set();
   await io.mkdir(join(root,'active'),{recursive:true,mode:0o700});await baseDirectory(join(root,'active'),io);
