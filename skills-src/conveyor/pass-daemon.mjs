@@ -370,20 +370,22 @@ async function executeTimedPass({ passName, repo, entry }, ports) {
       && job.pid === handle.pid && job.procStart === handle.procStart
       && (job.pgid == null || job.pgid === handle.pid);
   };
-  const reapRecordedGroup = job => {
+  const reapRecordedGroup = (job, observedExitAt) => {
     if (!validOwnerIdentity(job)) return false;
     // ps lstart has second precision. Never extend an old owner's window to
     // the recovery tick: its PGID may have belonged to another workload since.
     // The shared reaper also refuses any currently occupied leader PID.
     const ownerStartMs = Date.parse(job.procStart);
     const lastAliveMs = Date.parse(job.heartbeatAt ?? job.startedAt ?? '');
-    const cutoff = Math.min(ownerStartMs, lastAliveMs) + 1000;
+    // A locally observed child exit proves a fresh lifetime boundary. Its
+    // descendants may have started long after the owner; recovery has no such proof.
+    const cutoff = observedExitAt ?? Math.min(ownerStartMs, lastAliveMs) + 1000;
     return reapGroup(job.handle, cutoff, { requireConfirmedDeath: true }) === true;
   };
-  const confirmGroupGone = job => {
+  const confirmGroupGone = (job, observedExitAt) => {
     try {
       return validOwnerIdentity(job) && observeOwner(job.handle) === 'dead'
-        && reapRecordedGroup(job);
+        && reapRecordedGroup(job, observedExitAt);
     } catch { return false; }
   };
   const kindDef = defineJobKind({ kind: `pass-${createHash('sha256').update(passName).digest('hex').slice(0, 24)}`, entry: entry.script,
@@ -510,8 +512,9 @@ async function executeTimedPass({ passName, repo, entry }, ports) {
     return finish({ outcome: 'quarantined' }, 'quarantined', true);
   }
   let result;
+  let observedExitAt;
   childResult = childResult?.catch(error => ({ code: null, signal: null, spawnError: String(error?.message || error) }));
-  childResult?.then(value => { result = value; });
+  childResult?.then(value => { result = value; observedExitAt = now(); });
   for (;;) {
     record = store.read(id);
     if (record.job.passResult) return record.job.passResult;
@@ -531,7 +534,7 @@ async function executeTimedPass({ passName, repo, entry }, ports) {
         maxConcurrent: 1, observation: { now: now(), slept: false, gapMs: 0 },
         probe, stop, reapGroup: handle => {
           const job = store.read(id).job;
-          return job.handle === handle && reapRecordedGroup(job);
+          return job.handle === handle && reapRecordedGroup(job, observedExitAt);
         }, staleMs: Number.MAX_SAFE_INTEGER, log });
       const quarantine = recovery.actions.some(a => a.action === 'stop-failed')
         || !TERMINAL_JOB_STATUSES.includes(store.read(id).job.status);
@@ -540,7 +543,7 @@ async function executeTimedPass({ passName, repo, entry }, ports) {
     if (result) {
       // A child result does not prove its subprocess group is gone.
       // Keep the durable claim and alert if reaping cannot confirm absence.
-      if (record.job.handle && !confirmGroupGone(record.job)) {
+      if (record.job.handle && !confirmGroupGone(record.job, observedExitAt)) {
         return finish({ outcome: 'quarantined' }, 'quarantined', true);
       }
       return finish(result, result.code === 0 && !result.spawnError ? 'acted' : 'failed');

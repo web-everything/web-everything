@@ -540,9 +540,40 @@ describe('#5755 independent timed pass jobs', () => {
     const [record] = f.store.list().records;
     f.children[0].finish(code);
     await expect(pending).resolves.toEqual({ code, signal: null });
-    expect(reapGroup).toHaveBeenCalledWith(record.job.handle, Date.parse(record.job.procStart) + 1000,
+    expect(reapGroup).toHaveBeenCalledWith(record.job.handle, Date.now(),
       { requireConfirmedDeath: true });
     expect(f.store.read(record.id).job.handle).toBeNull();
+  });
+
+  it.each([
+    { code: 0, expired: false }, { code: 7, expired: false }, { code: 0, expired: true },
+  ])('reaps a late-spawned straggler after locally observed child exit $code (expired=$expired)', async ({ code, expired }) => {
+    const f = fixture({ tool: { timeoutMs: 60_000 } });
+    const ownerStart = Date.now();
+    let groupAlive = true;
+    const kill = vi.fn((pid, signal) => {
+      if (pid !== -7000 || !groupAlive) throw Object.assign(new Error('no group'), { code: 'ESRCH' });
+      if (signal === 'SIGKILL') groupAlive = false;
+    });
+    const reapGroup = vi.fn((handle, notAfterMs, options) => reapDeadGroup(handle, {
+      ...options, notAfterMs, host: 'fixture-host', kill,
+      readStart: () => null, bootTime: () => 0, groupStarts: () => [ownerStart + 5000],
+    }));
+    const pending = runPassAsTimedJob(descriptor('branch-drift'), { ...f.ports, reapGroup });
+    await vi.advanceTimersByTimeAsync(10_000);
+    const [record] = f.store.list().records;
+    // The local exit can arrive at the deadline before the polling timer fires.
+    if (expired) vi.setSystemTime(ownerStart + 60_000);
+    f.children[0].finish(code);
+
+    await expect(pending).resolves.toEqual(expired ? { outcome: 'timeout' } : { code, signal: null });
+    expect(kill).toHaveBeenCalledWith(-7000, 'SIGKILL');
+    expect(groupAlive).toBe(false);
+    expect(reapGroup).toHaveBeenCalledWith(record.job.handle, ownerStart + (expired ? 60_000 : 10_000),
+      { requireConfirmedDeath: true });
+    expect(f.store.read(record.id).job).toMatchObject({ status: code === 0 && !expired ? 'succeeded' : 'failed', handle: null });
+    expect(f.store.read(record.id).job.passQuarantine).toBeUndefined();
+    expect(f.alerts).toHaveLength(0);
   });
 
   it.each(['pending', 'throws', 'unknown-owner'])('retains exclusion when child-exit cleanup is %s', async mode => {
