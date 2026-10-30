@@ -23,6 +23,15 @@ function compute(files = {}, options = {}) {
     entries: ['entry.mjs'], env: {}, ...options });
 }
 
+it.each(['off', 'shadow', 'on'])('scope computation uses supplied entries without host LaunchAgents in %s mode', mode => {
+  const result = compute({ 'entry.mjs': "import './runtime.mjs';", 'runtime.mjs': '' }, {
+    env: { HOME: '/nonexistent-closure-scope-home', WE_SMOKE_LIVE_CLONE: '/nonexistent-live-clone',
+      WE_DAEMON_CLOSURE_SCOPE: mode },
+  });
+  expect(result.ok).toBe(true);
+  expect(result.scope.has('runtime.mjs')).toBe(true);
+});
+
 const workerLaunches = [
   ...['spawn', 'spawnSync', 'execFile', 'execFileSync'].map(name =>
     options => `${name}('node', ['worker.mjs']${options});`),
@@ -209,7 +218,7 @@ it('only excludes allowed files outside the run closure and protects smoke and m
   expect(isExcludable('used.mjs', result.scope)).toBe(false);
   expect(isExcludable('backlog/card.md', result.scope)).toBe(false);
   expect(isExcludable('docs/note.md', result.scope)).toBe(false);
-  expect(isExcludable('tests/thing.spec.mjs', result.scope)).toBe(true);
+  expect(isExcludable('tests/thing.spec.mjs', result.scope)).toBe(false); // Absent from the scanned snapshot.
   expect(isExcludable('data.bin', result.scope)).toBe(false);
   expect(isExcludable('unnamed.json', result.scope)).toBe(false);
   expect(isExcludable('mechanism/new.mjs', result.scope)).toBe(false);
@@ -340,7 +349,7 @@ it('returns single-target require incompleteness before strict traversal', () =>
   } finally { spy.mockRestore(); }
 });
 
-it('includes all independently proven closures and their metadata in the admitted scope', () => {
+it('protects all independent closures and retains every file when reference evidence is absent', () => {
   const evidence = name => ({ complete: true, files: new Set(['entry.mjs', `${name}.mjs`]),
     bareDeps: name === 'legacy', jsonNames: new Set([`${name}.json`]), spawnedNames: new Set([`${name}.mjs`]) });
   const spy = vi.spyOn(runClosure, 'collectRunClosure')
@@ -358,7 +367,8 @@ it('includes all independently proven closures and their metadata in the admitte
       expect(call[0].entries).toEqual(spy.mock.calls[0][0].entries);
     }
     for (const file of ['strict.mjs', 'legacy.mjs', 'required.mjs']) expect(isExcludable(file, result.scope)).toBe(false);
-    expect(isExcludable('unrelated.mjs', result.scope)).toBe(true);
+    expect(result.reason).toBe('closure-opaque');
+    expect(isExcludable('unrelated.mjs', result.scope)).toBe(false);
   } finally { spy.mockRestore(); }
 });
 

@@ -53,6 +53,7 @@
  */
 
 import { cloneRuntimeEntries } from './daemon-clone-entries.mjs';
+import { resolveClosureScopeMode } from './daemon-rebuild/closure-scope-settings.mjs';
 import { randomBytes } from 'node:crypto';
 import { closeSync, constants, existsSync, fchmodSync, mkdirSync, openSync, readdirSync, rmSync, statSync, writeSync } from 'node:fs';
 import { join, posix } from 'node:path';
@@ -305,17 +306,18 @@ export const DAEMON_ENTRY_MODULES = Object.freeze([
   'skills-src/conveyor/pass-daemon.mjs',
 ]);
 
-/** Resolve the entry list: override (test/soak only), explicit live clone discovery, else the fixed list.
+/** Resolve the entry list: override (test/soak only), live clone discovery in `on` mode, else the fixed list.
  *  `overridden:true` whenever the override actually supplied the list — the check surfaces this loudly in its
  *  own `detail` (never silently), so an override that leaked into a real daemon's environment shows up in the
  *  smoke's own result instead of quietly narrowing what gets boot-checked. */
-export function resolveDaemonEntries(env = process.env, { root, runtimeEntries = cloneRuntimeEntries } = {}) {
+export function resolveDaemonEntries(env = process.env, { root, runtimeEntries = cloneRuntimeEntries, fixedEntriesOnly = false } = {}) {
   const raw = env?.[DAEMON_ENTRIES_ENV];
   if (typeof raw === 'string' && raw.trim()) {
     return { entries: raw.split(',').map((s) => s.trim()).filter(Boolean), overridden: true };
   }
   const cloneRoot = env?.WE_SMOKE_LIVE_CLONE || root;
-  return { entries: cloneRoot ? runtimeEntries({ root: cloneRoot, entries: [], env }) : DAEMON_ENTRY_MODULES, overridden: false };
+  const discover = cloneRoot && !fixedEntriesOnly && resolveClosureScopeMode(env).mode === 'on';
+  return { entries: discover ? runtimeEntries({ root: cloneRoot, entries: [], env }) : DAEMON_ENTRY_MODULES, overridden: false };
 }
 
 /** A fixed, never-real marker base — resolving `rel` against THIS exact base is how {@link isSafeRelativeEntry}
@@ -435,7 +437,7 @@ export async function checkDaemonEntriesBoot({
   } catch { /* diagnostics only */ }
   let entries, overridden;
   // `root` is the tree to boot, often a disposable candidate, not evidence of a live clone. Production
-  // discovery uses WE_SMOKE_LIVE_CLONE; an injected resolver explicitly opts into discovery against root.
+  // discovery in `on` mode uses WE_SMOKE_LIVE_CLONE; an injected resolver selects discovery against root.
   // When the boot tree has none of the fixed entries, boot that list directly: real imports must fail,
   // while injected-child fixtures need no host LaunchAgents. Inspect the boot tree, not the live root,
   // so an unreadable live root cannot bypass discovery when a real candidate's entries are present.

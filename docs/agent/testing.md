@@ -41,12 +41,14 @@ limit. `daemon-rebuild-closure-scope.test.mjs` uses local refs (no network) to e
 scoped merges, real-overlay ancestry, final-tree verification and the three-replan fallback.
 `closureScope.mode` follows the policy cascade with standard `shadow`; shadow reports
 "would resolve, excluded N" while preserving the ordinary plan. Explicit `on` applies scopes;
-`off` disables the strategy. Candidate boot discovery uses `WE_SMOKE_LIVE_CLONE` for clone
-LaunchAgents; a generic smoke root alone keeps the fixed daemon entry list. Minimal boot trees
+`off` disables the strategy. Candidate boot discovery runs only in explicit `on` mode and uses
+`WE_SMOKE_LIVE_CLONE` for clone LaunchAgents; `shadow`, `off` and a generic smoke root alone
+keep the fixed daemon entry list. Planning and boot smoke share `closure-scope-settings.mjs`
+for the policy cascade and provenance. Minimal boot trees
 with none of those entries also keep the fixed list: real child imports fail on missing modules,
-while injected-child fixtures need no host LaunchAgents. An injected `runtimeEntries` explicitly
+while injected-child fixtures need no host LaunchAgents. In `on` mode an injected `runtimeEntries`
 selects discovery against the supplied root in hermetic boot fixtures. With daemon entries present
-in the boot tree, an unreadable live clone or plist fails smoke before spawning children; checking
+in the boot tree and mode `on`, an unreadable live clone or plist fails smoke before spawning children; checking
 the live root's entries instead could silently bypass discovery for a bad live-root path. Scope
 discovery likewise retains the conflict on unreadable evidence. Final closure checks run before smoke and
 again when reconstructing persisted scoped candidates. Saved scoped candidates require nonempty runtime
@@ -54,6 +56,13 @@ entries even after switching to `off` or `shadow`; adoption evaluates a lazy ent
 that same evidence throughout verification. Final-scope checks also reject empty provider results during
 planning. The tree-reader basename regression uses snapshot workers and checkout-only decoys to pin the
 reader's own basename index.
+
+The named boot-smoke tests "keeps boot discovery inert with unreadable LaunchAgents" compare
+the complete default/shadow/off result against the fixed-list result. "keeps the skip surface fixed"
+checks every mode and the explicit entry override. Scope computation uses supplied runtime entries;
+its smoke surface never discovers host LaunchAgents. The `overlay-shadow-boot-discovery` soak
+exercises both callers with a real missing LaunchAgents directory and confirms explicit `on`
+still refuses boot before spawning children. This preserves the shadow rollout's adoption behavior.
 
 Markdown and JSON are always retained by closure scoping, including under tests and backlog directories:
 an exported tick can read runtime data after boot with a computed filename, so absence from an import
@@ -95,6 +104,16 @@ refusals because even single-target require edges can shorten the original graph
 extensionless require chain with a candidate shortcut in `closure-scope.test.mjs` pins this fallback
 to full merge/manual rebase when candidate unions would otherwise complete the strict walk.
 The six R210 red-team regressions in `closure-scope.test.mjs` pin these guarantees.
+R230 makes exclusion an explicit snapshot allowlist: absence from the closure is not proof.
+`closure-scope-failclosed.test.mjs` requires source evidence for every closure file and entry,
+and protects path, extensionless-path and extensionless-basename substrings in raw source or
+decoded literals. Unknown paths and sets without that proof retain the conflict, including
+copies of a computed scope. Missing textual evidence, opaque reads and comments inside loader
+arguments admit an all-files scope with reason `closure-opaque` and an empty exclusion allowlist;
+other incomplete loader evidence keeps the existing `closure-incomplete` refusal. Both outcomes
+retain the full conflict for full merge/manual rebase. Clone discovery also throws on relative
+script/path arguments in LaunchAgents instead of silently narrowing the roots; bare interpreters,
+option flags and numeric string tokens keep their existing treatment.
 Opaque loaders follow one strict rule: a closure reference to `module`/`node:module`,
 `createRequire`, `eval`, `new Function`, `node:vm`, `node:test` runner capabilities,
 `process.loadEnvFile`, `process.execArgv`, `process.env.NODE_OPTIONS` or preload/loader flags,
