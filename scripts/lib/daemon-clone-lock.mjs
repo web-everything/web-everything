@@ -455,9 +455,11 @@ const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
  *       a dead/expired one is reclaimed by {@link reserve} itself, same as any other stale key.
  *   (2) poll `readers/` until no LIVE entry other than `owner` remains, or `waitMs` elapses. Any dead/expired
  *       reader entry seen along the way is removed on sight (reclaim) rather than left to rot.
+ *       explicitly supplied `ignoreOwners` (default: []) never block;
+ *       their entries are retained unless the liveness probe proves them dead.
  *       Timeout ⇒ release the writer key we took and report `tick-in-progress` (a live tick is still running).
  * @param {string} root
- * @param {{owner?:string, lockRoot?:string, waitMs?:number, pollMs?:number, sleep?:(ms:number)=>Promise<void>,
+ * @param {{owner?:string, ignoreOwners?:string[], lockRoot?:string, waitMs?:number, pollMs?:number, sleep?:(ms:number)=>Promise<void>,
  *   now?:()=>number, pid?:number, leaseMinutes?:number, probe?:(entry:object|null)=>('dead'|'alive'|'unknown')}} [opts]
  * Reader fairness: before reserving, and on every drain poll, a live starved reader (refused
  * `readerPriorityAfter` times in a row) makes this writer back off — `reader-priority`, writer key released. Only
@@ -467,6 +469,8 @@ const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 export async function acquireWrite(root, opts = {}) {
   const {
     owner = defaultOwner(opts.pid),
+    // Callers must explicitly opt in to excluding readers; inherited env never grants a bypass.
+    ignoreOwners = [],
     lockRoot = defaultLockRoot(),
     waitMs = Number(process.env.WE_DAEMON_CLONE_LOCK_WAIT_MS) || 600_000,
     pollMs = 1000,
@@ -524,6 +528,11 @@ export async function acquireWrite(root, opts = {}) {
     const blockers = [];
     for (const entry of listReaderEntries(readersRoot)) {
       if (entry.owner === owner) continue;
+      if (ignoreOwners.includes(entry.owner)) {
+        // An ignored reader still owns its entry, even after lease expiry; only proven death reclaims it.
+        if (probe(entry) === 'dead') releaseLockDir(readersRoot, entry.owner);
+        continue;
+      }
       if (entryIsLive(entry, nowMsN, leaseMinutes, probe)) {
         blockers.push(entry.owner);
       } else {

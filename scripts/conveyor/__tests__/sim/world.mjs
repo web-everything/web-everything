@@ -241,7 +241,8 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
 
   // (c) fake HOME
   const home = join(root, 'home');
-  mkdirSync(home, { recursive: true });
+  // Discovery must read complete, world-local evidence even on hosts without launchd.
+  mkdirSync(join(home, 'Library', 'LaunchAgents'), { recursive: true });
 
   // (d) lane pool root (provisioned below, once the merged env exists)
   const lanePoolRoot = join(root, 'lanes');
