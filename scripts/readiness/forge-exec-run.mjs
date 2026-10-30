@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 // Installed root:root 0755. No executable source or configuration comes from the task.
 import {spawn} from 'node:child_process';
-import {constants} from 'node:fs';
+import {constants, realpathSync} from 'node:fs';
 import * as filesystem from 'node:fs/promises';
-import {open, mkdir, readdir, writeFile, rename, rm, rmdir, lstat, realpath} from 'node:fs/promises';
+import {open, mkdir, readdir, writeFile, rename, rm, rmdir, lstat} from 'node:fs/promises';
 import {createHash, randomBytes} from 'node:crypto';
 import {join, relative} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {cpus, loadavg, freemem, totalmem} from 'node:os';
-import {baseGuard, readyBases, readBase, copyLeaves, baseFile, materializeWorktree} from './forge-exec-bases.mjs';
+import {baseGuard, readyBases, readBase, copyLeaves, baseFile, createBasePin, materializeWorktree} from './forge-exec-bases.mjs';
 import {decodeManifest} from './forge-exec-manifest.mjs';
 const LIMIT = 4 * 1024 * 1024;
 const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
@@ -90,7 +90,8 @@ export function parseTelemetry(text) {
   if (!exactKeys(v,'activeRuns,cores,loadPerCore,memFreePct,recent,sampledAtET') || !validET(v.sampledAtET)
     || !Number.isSafeInteger(v.cores) || v.cores<1 || !Number.isFinite(v.loadPerCore) || v.loadPerCore<0
     || !Number.isFinite(v.memFreePct) || v.memFreePct<0 || v.memFreePct>100 || !duration(v.activeRuns)
-    || !Array.isArray(v.recent) || v.recent.length>50 || v.recent.some(r=>!exactKeys(r,'code,runId,stageMs,startedAtET')
+    || !Array.isArray(v.recent) || v.recent.length>50 || v.recent.some(r=>!(exactKeys(r,'code,runId,stageMs,startedAtET')
+      || (exactKeys(r,'code,prewarmed,runId,stageMs,startedAtET') && typeof r.prewarmed==='boolean'))
       || !runName(r.runId) || !validET(r.startedAtET) || !exactKeys(r.stageMs,'install,run')
       || !duration(r.stageMs.install) || !duration(r.stageMs.run) || !(r.code===null || (duration(r.code)&&r.code<=255))))
     throw new Error('Invalid telemetry schema');
@@ -331,12 +332,29 @@ finally:
 // A root supervisor is a subreaper: children which call setsid/double-fork are
 // adopted here, and killed before the ops process publishes any evidence.
 export const supervisorSource = String.raw`
-import os, sys, json, signal, subprocess, ctypes, time
+import os, sys, json, signal, subprocess, ctypes, time, fcntl, stat
 PR_SET_CHILD_SUBREAPER = 36
 if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
     raise RuntimeError('subreaper unavailable')
 cfg = json.loads(sys.argv[1])
 uid, gid = cfg['uid'], cfg['gid']
+writer = cfg['writer']
+writer_fd = os.open(writer['guard'], os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+st = os.fstat(writer_fd)
+if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_mode & 0o077:
+    raise RuntimeError('unsafe worker writer guard; use local fallback')
+fcntl.flock(writer_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+fd = os.open(writer['reservation'], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+with os.fdopen(fd) as stream:
+    st = os.fstat(stream.fileno())
+    if not stat.S_ISREG(st.st_mode) or st.st_size > 4*1024*1024:
+        raise RuntimeError('unsafe worker reservation; use local fallback')
+    reservation = json.load(stream)
+if any(reservation.get(key) != writer.get(key) for key in ('run', 'nonce', 'slot')):
+    raise RuntimeError('Reservation mismatch; use local fallback')
+# Keep the lease in a root child even if the supervisor is killed mid-fork.
+# Close its copy only AFTER UID drop, before exposing any task-controlled code.
+writer_fds = (writer_fd,)
 def drop():
     os.setsid()
     if os.geteuid() == 0:
@@ -345,15 +363,16 @@ def drop():
         os.setuid(uid)
     elif os.getuid() != uid or os.getgid() != gid:
         raise RuntimeError('cannot drop identity')
+    os.close(writer_fd)
 if 'archive' in cfg:
     # Only the fixed cache-extraction command receives an archive descriptor.
     # It runs as the worker; neither tar nor the task can write the cache.
     archive = os.open(cfg['archive'], os.O_RDONLY | os.O_NOFOLLOW)
     try:
-        child = subprocess.Popen(cfg['argv'], cwd=cfg['cwd'], env=cfg['env'], stdin=archive, preexec_fn=drop)
+        child = subprocess.Popen(cfg['argv'], cwd=cfg['cwd'], env=cfg['env'], stdin=archive, preexec_fn=drop, pass_fds=writer_fds)
     finally: os.close(archive)
 else:
-    child = subprocess.Popen(cfg['argv'], cwd=cfg['cwd'], env=cfg['env'], stdin=subprocess.DEVNULL, preexec_fn=drop)
+    child = subprocess.Popen(cfg['argv'], cwd=cfg['cwd'], env=cfg['env'], stdin=subprocess.DEVNULL, preexec_fn=drop, pass_fds=writer_fds)
 code = child.wait()
 # All descendants run as the dedicated uid. Include live descendants before
 # killing their parents, then reap orphans adopted by this subreaper.
@@ -419,37 +438,50 @@ function execute(file,args,{cwd,env,input,inherit=false,detached=false,passFd}={
     if(input!==undefined) {child.stdin.on('error',()=>{}); child.stdin.end(input);}
   });
 }
-// testRoot/testPath/testCleanupExec are explicit dependency injection only. CLI never reads them
+// testRoot/testPath/testCleanupExec/testIdExec are explicit dependency injection only. CLI never reads them
 // from its environment, nor transports them in requests.
-export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIdentity, testWorkerExec, testOwnershipExec, testGitExec, clock=Date.now} = {}) {
+export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, clock=Date.now} = {}) {
   const bases=testRoot ? join(testRoot,'bases') : '/srv/forge-base';
   const runs = testRoot ? join(testRoot,'runs') : '/srv/forge-exec';
   const receipts = testRoot ? join(testRoot,'receipts') : '/srv/forge-receipts';
   const cache = testRoot ? join(testRoot,'cache') : '/srv/forge-cache';
   const path = testRoot ? testPath : '/usr/local/bin:/usr/bin:/bin';
+  const idExec=testRoot&&testIdExec?testIdExec:execute;
+  // Only the legacy, same-UID test harness omits isolation evidence. Production
+  // and either explicit isolation injection always use the production checks.
+  const isolatedWorkers=!testRoot||testWorkerIdentity!==undefined||testSlotStat!==undefined;
   let operator={uid:process.getuid(),gid:process.getgid()};
   const statePath = (run,phase) => join(receipts,run+'.'+phase);
   const busy=()=>Object.assign(new Error('Worker execution busy or interrupted; use local fallback. Operator must stop the reserved UID before removing its worker-active lock'),{code:'forge-busy'});
   async function identity(user) {
-    if(testRoot)return testWorkerIdentity?.(user)??{uid:process.getuid(),gid:process.getgid()};
-    const uid=await execute('/usr/bin/id',['-u',user]),gid=await execute('/usr/bin/id',['-g',user]);
-    if(uid.code||gid.code||!/^\d+\n$/.test(uid.stdout)||!/^\d+\n$/.test(gid.stdout)||Number(uid.stdout)===0)throw new Error('Unknown worker identity');
-    if(/^forge-exec-[1-9]\d*$/.test(user)){
-      const groups=await execute('/usr/bin/id',['-G',user]);
-      if(groups.code||groups.stdout.trim()!==gid.stdout.trim())throw new Error('Worker groups must be private');
+    if(!isolatedWorkers)return {uid:process.getuid(),gid:process.getgid()};
+    let ids;
+    if(testWorkerIdentity)ids=await testWorkerIdentity(user);
+    else {
+      const uid=await idExec('/usr/bin/id',['-u',user]),gid=await idExec('/usr/bin/id',['-g',user]);
+      if(uid.code||gid.code||!/^\d+\n$/.test(uid.stdout)||!/^\d+\n$/.test(gid.stdout))throw new Error('Unknown worker identity');
+      ids={uid:Number(uid.stdout),gid:Number(gid.stdout)};
+      if(/^forge-exec-[1-9]\d*$/.test(user)){
+        const groups=await idExec('/usr/bin/id',['-G',user]);
+        if(groups.code||!/^\d+(?: \d+)*\n$/.test(groups.stdout))throw new Error('Worker groups must be private');
+        ids.groups=groups.stdout.trim().split(' ').map(Number);
+      }
     }
-    return {uid:Number(uid.stdout),gid:Number(gid.stdout)};
+    if(!ids||!Number.isSafeInteger(ids.uid)||ids.uid<0||!Number.isSafeInteger(ids.gid)||ids.gid<0)throw new Error('Unknown worker identity');
+    if(/^forge-exec-[1-9]\d*$/.test(user)&&(ids.uid===operator.uid||ids.gid===operator.gid))throw new Error('Worker must not share the operator identity');
+    if(ids.uid===0)throw new Error('Unknown worker identity');
+    if(/^forge-exec-[1-9]\d*$/.test(user)&&(!Array.isArray(ids.groups)||ids.groups.length!==1||ids.groups[0]!==ids.gid))throw new Error('Worker groups must be private');
+    return {uid:ids.uid,gid:ids.gid};
   }
   async function workers() {
     const names=(await readdir(runs)).filter(name=>/^slot-[1-9]\d*$/.test(name)).sort((a,b)=>Number(a.slice(5))-Number(b.slice(5)));
     if(names.length>128)throw new Error('Worker pool exceeds 128 slots; use local fallback and inspect setup');
     const found=[];
     for(const name of names) {
-      const user='forge-exec-'+name.slice(5),ids=await identity(user),root=join(runs,name),st=await lstat(root);
-      if(!testRoot&&(ids.uid===operator.uid||ids.gid===operator.gid))throw new Error('Worker must not share the operator identity');
+      const user='forge-exec-'+name.slice(5),ids=await identity(user),root=join(runs,name),st=await (testSlotStat??lstat)(root);
       if(st.isSymbolicLink()||!st.isDirectory()||(st.mode&0o7777)!==0o710
-        ||(!testRoot&&(st.uid!==operator.uid||st.gid!==ids.gid)))throw new Error('Untrusted slot directory; redeploy forge-setup and use local fallback');
-      if(found.some(w=>w.uid===ids.uid||w.gid===ids.gid)&&!testRoot)throw new Error('Duplicate worker identity');
+        ||(isolatedWorkers&&(st.uid!==operator.uid||st.gid!==ids.gid)))throw new Error('Untrusted slot directory; redeploy forge-setup and use local fallback');
+      if(isolatedWorkers&&found.some(w=>w.uid===ids.uid||w.gid===ids.gid))throw new Error('Duplicate worker identity');
       found.push({user,root,active:join(receipts,'worker-active-'+name.slice(5)),...ids});
     }
     return found;
@@ -461,26 +493,43 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
     if(!worker)throw new Error('Invalid slot');
     const reservation=JSON.parse(await readPinned(join(worker.active,'reservation.json')));
     if(reservation.run!==record.run||reservation.nonce!==record.nonce||reservation.slot!==record.slot)throw new Error('Reservation mismatch');
-    return worker;
+    return {...worker,reservation:record};
+  }
+  const writerName=record=>record?.slot?'worker-active-'+record.slot.slice('forge-exec-'.length):'worker-active';
+  async function withWorkerWriter(name,action) {
+    // Stable inode shared with cron's exclusive prune lock. Never unlink it:
+    // the shared lease excludes reclamation through the last possible launch.
+    const guard=await open(join(receipts,'.'+name+'.writer'),constants.O_RDWR|constants.O_CREAT|constants.O_NOFOLLOW|constants.O_NONBLOCK,0o600);
+    try {
+      const st=await guard.stat();
+      if(!st.isFile()||st.nlink!==1||(st.mode&0o077)||![0,operator.uid].includes(st.uid))throw new Error('Untrusted worker writer guard; use local fallback and inspect slot setup');
+      const locked=await execute('/usr/bin/python3',['-I','-c','import fcntl; fcntl.flock(3, fcntl.LOCK_SH | fcntl.LOCK_NB)'],{passFd:guard.fd});
+      if(locked.code)throw busy();
+      return await action();
+    }finally{await guard.close();}
   }
   async function reserveWorker(run,nonce,slot) {
     const pool=await workers();
     if(slot!==undefined&&!pool.some(w=>w.user===slot))throw new Error('Invalid slot');
     if(!pool.length)return {user:'forge-exec',root:runs};
     for(const worker of pool) {
-      try{await mkdir(worker.active,{mode:0o700});}catch(error){if(error.code==='EEXIST')continue;throw error;}
-      // If persistence fails, retain the empty lock: incomplete evidence is busy.
-      await writeFile(join(worker.active,'reservation.json'),JSON.stringify({run,nonce,slot:worker.user}),{flag:'wx',mode:0o600});
-      return worker;
+      try {return await withWorkerWriter(writerName({slot:worker.user}),async()=>{
+        await mkdir(worker.active,{mode:0o700});
+        // If persistence fails, retain the empty lock: incomplete evidence is busy.
+        await writeFile(join(worker.active,'reservation.json'),JSON.stringify({run,nonce,slot:worker.user,writerGuard:1}),{flag:'wx',mode:0o600});
+        return worker;
+      });}catch(error){if(error.code==='EEXIST'||error.code==='forge-busy')continue;throw error;}
     }
     throw busy();
   }
   async function releaseWorker(record) {
+    return withWorkerWriter(writerName(record),async()=>{
     const worker=await workerFor(record);
     if(worker.active){
       if(await lstat(join(worker.active,'executing')).catch(e=>{if(e.code!=='ENOENT')throw e;}))throw new Error('Worker execution unconfirmed; operator must stop the reserved UID');
       await rm(join(worker.active,'reservation.json'));await rmdir(worker.active);
     }
+    });
   }
   async function atomicJSON(file,value) {
     const pending=file+'-'+randomBytes(8).toString('hex');
@@ -525,36 +574,17 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
     if(result.code!==0)throw new Error('Worker ownership handoff refused; use local fallback and inspect slot setup');
   }
   async function pinBase(run,baseSha) {
-    const active=join(bases,'active'),pin=join(active,run);
-    await mkdir(active,{recursive:true,mode:0o700});
     // Pool metadata runs as root, but the anonymous warmer runs as ops and
     // must read every active pin before deciding which public bases to prune.
-    if(!testRoot&&process.getuid()===0){
-      const fd=await open(active,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
-      try{
-        const st=await fd.stat();
-        if(![0,operator.uid].includes(st.uid)||(st.mode&0o022))throw new Error('Unsafe base pin directory');
-        await fd.chown(operator.uid,operator.gid);
-      }finally{await fd.close();}
-    }
-    try{await writeFile(pin,baseSha,{flag:'wx',mode:0o600});}
-    catch(error){if(error.code!=='EEXIST'||(await baseFile(pin)).toString()!==baseSha)throw error;}
-    if(!testRoot&&process.getuid()===0){
-      const fd=await open(pin,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
-      try{
-        const st=await fd.stat();
-        if(!st.isFile()||st.nlink!==1||![0,operator.uid].includes(st.uid)||st.size!==baseSha.length
-          ||(await fd.readFile()).toString()!==baseSha)throw new Error('Unsafe base pin');
-        await fd.chown(operator.uid,operator.gid);
-      }finally{await fd.close();}
-    }
+    await createBasePin(bases,run,baseSha,!testRoot&&process.getuid()===0?operator:undefined);
   }
   async function workCommand(worker,argv,work,env,archive) {
     if(testRoot) return testWorkerExec?testWorkerExec({worker,argv,cwd:work,env,archive}):execute(argv[0],archive ? ['-xf',archive] : argv.slice(1),{cwd:work,env,detached:true});
     const ids=await identity(worker.user);
     const status=join(receipts,'supervisor-'+randomBytes(16).toString('hex'));
+    const name=writerName(worker.reservation),writer={...worker.reservation,guard:join(receipts,'.'+name+'.writer'),reservation:join(receipts,name,'reservation.json')};
     try {
-      const result=await execute('/usr/bin/sudo',['-n','/usr/bin/python3','-I','-c',supervisorSource,JSON.stringify({argv,cwd:work,env,status,reapUid:true,...(archive?{archive}:{}),...ids})],{inherit:true});
+      const result=await execute('/usr/bin/sudo',['-n','/usr/bin/python3','-I','-c',supervisorSource,JSON.stringify({argv,cwd:work,env,status,writer,reapUid:true,...(archive?{archive}:{}),...ids})],{inherit:true});
       if(result.code!==0) throw new Error('Supervisor failed');
       const code=Number((await readPinned(status)).toString());
       if(!Number.isInteger(code) || code<0 || code>255) throw new Error('Invalid supervisor status');
@@ -562,6 +592,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
     } finally {await rm(status,{force:true});}
   }
   async function exclusiveWorker(action,record) {
+    return withWorkerWriter(writerName(record),async()=>{
     if(record?.slot) {
       const worker=await workerFor(record),executing=join(worker.active,'executing');
       await mkdir(executing,{mode:0o700}).catch(error=>{if(error.code==='EEXIST')throw busy();throw error;});
@@ -579,15 +610,17 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
       if(error.code==='EEXIST') throw Object.assign(new Error('Worker execution busy or interrupted; use local fallback. Operator must stop all forge-exec processes before removing /srv/forge-receipts/worker-active'),{code:'forge-busy'});
       throw error;
     });
+    await writeFile(join(active,'reservation.json'),JSON.stringify({...record,writerGuard:1}),{flag:'wx',mode:0o600});
     let settled=true;
     const command=async (...args)=>{
       settled=false;
-      const result=await workCommand({user:'forge-exec'},...args);
+      const result=await workCommand({user:'forge-exec',reservation:record},...args);
       settled=true;
       return result;
     };
     try {return await action(command);}
-    finally {if(settled) await rmdir(active);}
+    finally {if(settled){await rm(join(active,'reservation.json'));await rmdir(active);}}
+    });
   }
   async function cacheCommand(args,work,input) {
     const result=await execute('/usr/bin/tar',args,{cwd:work,env:{PATH:path,LANG:'C'},input});
@@ -745,6 +778,8 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
       if(!nonceOK(nonce) || (label!==undefined && (typeof label!=='string' || !/^[a-z0-9][a-z0-9-]{5,63}$/.test(label)))) throw new Error('Invalid prepare');
       const run='r-'+randomBytes(16).toString('hex');
       const worker=await reserveWorker(run,nonce,slot),record={v:1,nonce,run,...(worker.active?{slot:worker.user}:{})};
+      const prepare=async()=>{
+      if(worker.active)await workerFor(record);
       const container=join(worker.root,run);
       try {
       await mkdir(container,{mode:0o755}); // exclusive server-generated name
@@ -772,6 +807,8 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
         if(worker.active)await releaseWorker(record);
         throw error;
       }
+      };
+      return worker.active?withWorkerWriter(writerName(record),prepare):prepare();
     },
     async run(request) {
       const prepared=await state(request,'prepared');
@@ -878,6 +915,9 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
       }
     },
     async finish(request) {
+      let phase='running',record;
+      try{record=await state(request,phase);}catch{record=await state(request,'prepared');}
+      return withWorkerWriter(writerName(record),async()=>{
       let finishingWorker,settled=true;
       try {
       // Only the protected state is evidence; receipt-like files in work are data.
@@ -922,10 +962,13 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
       // Never certify rejection once the protected run phase has started.
       return receipt ?? (phase === 'prepared' && (rejected?.siblings||rejected?.delta||['forge-busy','git-head-unavailable'].includes(rejected?.reason)) ? {...rejected,started:false} : null) ?? null;
       }finally{if(finishingWorker&&settled)await rmdir(join(finishingWorker.active,'executing'));}
+      });
     },
   };
 }
-if(process.argv[1] && await realpath(process.argv[1]).catch(()=> '') === await realpath(fileURLToPath(import.meta.url))) {
+const cliPath = (()=>{try{return realpathSync(process.argv[1]);}catch{return '';}})();
+if(process.argv[1] && cliPath === realpathSync(fileURLToPath(import.meta.url))) {
+  (async()=>{
   try {
     if(process.argv.length!==3 || !['prepare','run','finish','bases','base-manifest','telemetry','warm-install'].includes(process.argv[2])) throw new Error('Invalid subcommand');
     // Pool roots are deliberately 0700 worker-owned. Only this installed,
@@ -949,4 +992,5 @@ if(process.argv[1] && await realpath(process.argv[1]).catch(()=> '') === await r
     if(process.argv[2]==='prepare'&&error.code==='forge-busy')process.stdout.write(JSON.stringify({reason:'forge-busy'})+'\n');
     process.stderr.write('forge-exec-run: '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n'); process.exitCode=254;
   }
+  })();
 }

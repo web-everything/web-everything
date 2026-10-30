@@ -253,21 +253,105 @@ systemctl enable --now forge-warm-base.timer
 cat > /etc/cron.daily/forge-exec-prune <<'PRUNE'
 #!/bin/bash
 set -euo pipefail
-# Trusted roots cannot be replaced by the task. find does not follow symlinks.
-# Never prune active/uncertain slots, their receipts or cache. Locks never age
-# out. An operator must first stop every process of the specific reserved UID.
+# Active reservations protect their slot and identifiable run/cache evidence.
+# Unrelated expired state is pruned when reservation evidence identifies what
+# to protect; incomplete evidence preserves expired receipts/caches. Reclaim only after
+# excluding reservation writers and launches, then proving its UID has no live
+# processes. Historical reservations require operator cleanup after stopping the UID.
 python3 - <<'PRUNE_PY'
-import os, re, stat, shutil, time
+import os, re, stat, shutil, time, json, pwd, sys, fcntl
 root, receipts = '/srv/forge-exec', '/srv/forge-receipts'
-active = {name for name in os.listdir(receipts) if name.startswith('worker-active')}
-def prune(parent, age, pattern, files=False):
-    if stat.S_ISLNK(os.lstat(parent).st_mode):
-        raise RuntimeError('unsafe prune root')
+now = time.time()
+active, runs, caches = set(), set(), set()
+unknown_receipts = unknown_caches = False
+def metadata(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > 4*1024*1024: return {}
+        with os.fdopen(os.dup(fd)) as stream: value = json.load(stream)
+        return value if isinstance(value, dict) else {}
+    finally: os.close(fd)
+def uid_processes(uid):
+    present = False
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit(): continue
+        try:
+            if os.stat('/proc/' + pid).st_uid != uid: continue
+            present = True
+            with open('/proc/' + pid + '/stat') as stream:
+                if stream.read().rsplit(')', 1)[1].split()[0] != 'Z': return True, True
+        except FileNotFoundError: continue
+        except (OSError, ValueError, IndexError): return True, True
+    return False, present
+# Take exclusive leases before observing reservations and keep them throughout
+# pruning. A blocked slot stays protected even if its writer has not published
+# reservation.json yet. Runner SH leases allow different slots to run in parallel.
+writer_fds, blocked = [], set()
+names = {'worker-active'} | {'worker-active-' + name[5:] for name in os.listdir(root) if re.fullmatch(r'slot-[1-9][0-9]*', name)}
+names |= {name for name in os.listdir(receipts) if re.fullmatch(r'worker-active(?:-[1-9][0-9]*)?', name)}
+for name in sorted(names):
+    fd = os.open(os.path.join(receipts, '.' + name + '.writer'), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_mode & 0o077 or st.st_uid not in {0, os.stat(receipts).st_uid}:
+        raise RuntimeError('unsafe worker writer guard; use local fallback and inspect slot setup')
+    # Cron runs as root, while controllers may run as ops. Normalize only a
+    # validated root-owned inode, including guards left by an older prune.
+    # Keep mode 0600 and the same inode: replacing it would split flock users.
+    owner = os.stat(receipts)
+    if st.st_uid == 0 and owner.st_uid != 0:
+        os.fchown(fd, owner.st_uid, owner.st_gid)
+    try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        blocked.add(name)
+        active.add(name)
+        os.close(fd)
+    else: writer_fds.append(fd)
+for name in sorted(names):
+    path = os.path.join(receipts, name)
+    try: st = os.lstat(path)
+    except FileNotFoundError:
+        if name in blocked: unknown_receipts = unknown_caches = True
+        continue
+    if not stat.S_ISDIR(st.st_mode): raise RuntimeError('unsafe reservation')
+    try: record = metadata(os.path.join(path, 'reservation.json'))
+    except (OSError, ValueError): record = {}
+    # Missing protocol evidence may belong to an older, uncooperative wrapper.
+    # Only the operator can exclude its future launches.
+    if name not in blocked and record.get('writerGuard') == 1 and now - st.st_mtime > 604800:
+        user = 'forge-exec' + name[len('worker-active'):]
+        try: running, present = uid_processes(pwd.getpwnam(user).pw_uid)
+        except (KeyError, OSError): running, present = True, True
+        if not running:
+            print('forge-exec-prune: abandoned reservation ' + name + '; UID has no live processes', file=sys.stderr)
+            if not present: shutil.rmtree(path)
+            continue
+    active.add(name)
+    run = record.get('run')
+    if not isinstance(run, str) or not re.fullmatch(r'(r-|warm-)[a-f0-9]{32}', run):
+        unknown_receipts = unknown_caches = True
+        continue
+    runs.add(run)
+    identified_cache = False
+    for phase in ('prepared', 'running', 'receipt'):
+        try:
+            lock = metadata(os.path.join(receipts, run + '.' + phase)).get('lock')
+            if isinstance(lock, str) and re.fullmatch(r'[a-f0-9]{64}', lock):
+                caches.add(lock)
+                identified_cache = True
+        except (OSError, ValueError): pass
+    if not identified_cache: unknown_caches = True
+
+def prune(parent, age, pattern, files=False, protected=()):
+    st = os.lstat(parent)
+    if not stat.S_ISDIR(st.st_mode): raise RuntimeError('unsafe prune root')
     for name in os.listdir(parent):
-        if not re.fullmatch(pattern, name): continue
+        if not re.fullmatch(pattern, name) or name in protected: continue
+        if re.fullmatch(r'\.worker-active(?:-[1-9][0-9]*)?\.writer', name): continue
+        if files and name.split('.', 1)[0] in runs: continue
         path = os.path.join(parent, name)
         st = os.lstat(path)
-        if time.time() - st.st_mtime <= age: continue
+        if now - st.st_mtime <= age: continue
         if files and stat.S_ISREG(st.st_mode): os.unlink(path)
         elif not files and stat.S_ISDIR(st.st_mode): shutil.rmtree(path)
 if 'worker-active' not in active:
@@ -275,9 +359,12 @@ if 'worker-active' not in active:
 for slot in os.listdir(root):
     if re.fullmatch(r'slot-[1-9][0-9]*', slot) and 'worker-active-' + slot[5:] not in active:
         prune(os.path.join(root, slot), 86400, r'(r-|warm-)[a-f0-9]{32}')
-if not active:
-    prune(receipts, 86400, r'.*', files=True)
-    prune('/srv/forge-cache', 1209600, r'.*')
+if unknown_receipts:
+    print('forge-exec-prune: incomplete reservation evidence; preserving expired receipts until operator repair or confirmed UID shutdown', file=sys.stderr)
+else: prune(receipts, 86400, r'.*', files=True)
+if unknown_caches:
+    print('forge-exec-prune: incomplete reservation evidence; preserving expired cache entries until operator repair or confirmed UID shutdown', file=sys.stderr)
+else: prune('/srv/forge-cache', 1209600, r'.*', protected=caches)
 PRUNE_PY
 PRUNE
 chown root:root /etc/cron.daily/forge-exec-prune

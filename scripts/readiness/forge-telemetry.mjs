@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import {execFile} from 'node:child_process';
-import {realpath} from 'node:fs/promises';
+import {realpathSync} from 'node:fs';
 import {fileURLToPath} from 'node:url';
 import {parseTelemetry, formatTelemetry} from './forge-exec-run.mjs';
 export {parseTelemetry, formatTelemetry};
@@ -27,7 +27,9 @@ export async function main(args,{read=readForgeTelemetry,write=text=>process.std
   const value=parseTelemetry(JSON.stringify(await read({host})));
   write((json?JSON.stringify(value):formatTelemetry(value,host))+'\n');
 }
-if(process.argv[1] && await realpath(process.argv[1]).catch(()=>'')===await realpath(fileURLToPath(import.meta.url))) {
-  try{await main(process.argv.slice(2));}
-  catch{process.stderr.write('forge-telemetry: unavailable or invalid telemetry\n');process.exitCode=1;}
+const cliPath = (()=>{try{return realpathSync(process.argv[1]);}catch{return '';}})();
+if(process.argv[1] && cliPath===realpathSync(fileURLToPath(import.meta.url))) {
+  main(process.argv.slice(2)).catch(()=>{
+    process.stderr.write('forge-telemetry: unavailable or invalid telemetry\n');process.exitCode=1;
+  });
 }

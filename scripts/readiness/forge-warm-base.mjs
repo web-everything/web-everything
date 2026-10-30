@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Installed root-owned; only anonymous public Git is accessed on this host.
 import * as filesystem from 'node:fs/promises';
+import {realpathSync} from 'node:fs';
 import {spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {join} from 'node:path';
@@ -154,10 +155,13 @@ export async function warmTick({root='/srv/forge-base',exec=run,clock=Date.now,f
   if((await readyBases(root,fs)).some(base=>base.sha===sha))return {sha,reused:true};
   return publish(sha);
 }
-if(process.argv[1]&&await filesystem.realpath(process.argv[1]).catch(()=> '')===await filesystem.realpath(fileURLToPath(import.meta.url))) {
+const cliPath = (()=>{try{return realpathSync(process.argv[1]);}catch{return '';}})();
+if(process.argv[1]&&cliPath===realpathSync(fileURLToPath(import.meta.url))) {
   // Bases refuse group/other-writable directories. Imports must not change the
   // host process mask, and worker runtimes may expose an unsupported umask.
   try {if(typeof process.umask==='function')process.umask(0o022);} catch { /* unsupported runtime */ }
-  try{if(process.argv.length!==2)throw new Error('No arguments accepted');await warmTick();}
-  catch(error){process.stderr.write('forge-warm-base: '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n');process.exitCode=1;}
+  (async()=>{
+    try{if(process.argv.length!==2)throw new Error('No arguments accepted');await warmTick();}
+    catch(error){process.stderr.write('forge-warm-base: '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n');process.exitCode=1;}
+  })();
 }

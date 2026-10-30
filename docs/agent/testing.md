@@ -1,5 +1,7 @@
 # Testing — Three-Tier Strategy
 
+> Authors: APPEND new sections at the END of this file, never right after the title (`.gitattributes` union-merges it, but appending avoids overlapping insertions).
+
 ## Human-only enqueue approval license (R212)
 
 `human-only-enqueue-license.test.mjs` uses local Git repositories to exercise exact clearance,
@@ -1973,11 +1975,14 @@ Use temporary lock roots and injected telemetry in legacy remote-contract fixtur
 contact Forge or consume the real host's remote slots from a unit test. Retain the original
 termination acknowledgements and refusal assertions when updating those fixtures.
 
-Remote telemetry older than 30 seconds (or dated in the future) routes through local admission.
-An idle runner does not fabricate a fresh sample on a telemetry read: a prepare/run/finish
-refresh must occur before remote routing can recover from stale evidence. Cache reads,
-including failed reads, are shared across clients for ten seconds; back-off and failure counts
-are host-shared too. Persist `slot-N.unconfirmed` exclusively before invoking the remote executor;
+Remote telemetry older than 30 seconds or more than 60 seconds ahead routes through local
+admission. Compare ET timestamps by instant with `Date.parse`, independent of the process timezone.
+`forge-health-fresh.test.mjs` pins both freshness boundaries, winter/summer offsets, strict optional
+boolean `prewarmed` entries, and stale persisted-cache recovery. Stale cached telemetry gets exactly
+one fresh read under the mutex before deciding; a failed read is `forge-unreachable`, and a still-stale
+sample is `telemetry-stale`. Fresh data and failed reads share the ten-second cache; an active backoff
+still returns before reading. Back-off and failure counts are host-shared too.
+Persist `slot-N.unconfirmed` exclusively before invoking the remote executor;
 remove it only after confirmed completion or termination. Abrupt client death skips `finally`,
 so quarantine cannot depend on cleanup running. A dead client PID or expired slot lease never
 authorizes reusing an outstanding execution's capacity. An operator must confirm Forge termination
@@ -2031,6 +2036,10 @@ manifests, lock, runtime/platform, fixed install flags). Workspaces, local depen
 unknown locks and unproven resolutions use the original full-input cache/install path.
 Check archive hashes on both source and destination; normal runs still validate npm before
 extracting a seeded profile. Cover sibling-bound profiles as well as primary-only runs.
+Negative reuse cases must seed both a valid archive and the exact candidate
+`.warm-inputs-*` index; a full profile alone cannot challenge the eligibility guard.
+Include a supported-input control proving the seeded evidence can actually reuse
+the archive, and inspect extracted dependency contents after changing the snapshot.
 
 Stage timings use an injected millisecond clock and Eastern timestamps with the actual
 seasonal offset. Install/run durations come from optional, strictly typed receipt timing
@@ -2990,8 +2999,30 @@ The fixed Forge wrapper discovers `slot-K` directories and matching system users
 client concurrency settings never define server identities. Pool prepare reserves
 `forge-exec-K` through finish using an ops-protected `worker-active-K` directory
 bound to run ID and nonce. An interrupted command leaves the reservation closed
-until an operator confirms that UID has no remaining processes. Never expire
-these directories by age. Hosts without pool directories retain the legacy UID.
+until shutdown is confirmed. Age and an empty UID scan alone never authorize
+reclamation: acquisition, prepare, execution, and finish hold shared leases on
+persistent per-slot `.worker-active-K.writer` inodes. Pruning holds exclusive
+leases through scanning and deletion and proves UID process absence before
+removing a reservation.
+The root supervisor requires reservation evidence and rechecks it under its own shared lease;
+a forked child retains that lease through UID drop and closes it before task exec.
+Only reservations declaring `writerGuard: 1` participate; historical or uncertain
+reservations require operator cleanup. Missing, unreadable, malformed, or incomplete
+reservation identity preserves all expired receipts and caches; a known run without
+identifiable dependency-lock evidence preserves caches while unrelated receipts
+can still expire. The prune tests cover empty historical reservations and resume
+age pruning after operator removal. Never unlink writer guard files.
+The worker-pool suite pauses a holder before launch, runs the real prune program
+against an empty UID inventory, and proves a second controller cannot launch as
+that UID. It also tests pruning winning first and refusal at each writer entry.
+Hosts without pool directories retain the legacy UID and its own writer guard.
+Only `testRoot` fixtures without `testWorkerIdentity` or `testSlotStat` use the
+same-UID harness. Production and either explicit isolation injection enforce
+worker identity, private groups, slot ownership and identity uniqueness. Pair
+injected identities with matching slot stats unless the fixture sets real slot
+ownership. Choose synthetic IDs relative to the operator, so host accounts cannot
+mask the intended refusal. Model a distinct non-root receipt owner in prune
+handoff probes even when tests run as root; otherwise a missing transfer passes.
 The privileged fixed wrapper owns metadata operations; tasks and rsync run only
 as the reserved UID. Slot roots are ops-owned with the worker's private group
 and mode 0710 (traverse only); run containers remain operator-owned. Only work
@@ -3091,3 +3122,15 @@ fallback, and claim zero reclaimed bytes. Do not enable reclamation with a polic
 heuristic. The operator must arrange actual writer exclusion before reclamation can be wired in.
 Regression tests append in the final-stat/removal interval, hold an open transcript descriptor, test
 unavailable exclusion, and queue a cooperating writer through the same exclusion used by removal.
+
+### Security condition test shape
+
+Every new bypass-widening condition needs one negative test per conjunct. Security
+checks must not be hidden behind `!testRoot` guards; inject identity, ownership,
+and other system evidence so hermetic tests exercise the production checks.
+
+Writer guards shared by root cron and operator controllers must stay on one
+private inode owned by the operator. Test first-use creation and migration of
+existing root-owned guards, retaining mode 0600 and inode identity. The worker-pool
+suite models ownership transfer on unprivileged hosts and includes a Linux/root
+integration case that runs prune as root then reserves every slot as the operator.

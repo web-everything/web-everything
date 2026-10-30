@@ -85,8 +85,9 @@ function fixture({ probeCode = 0, copyCode = 0, prepareCode = 0, runCode = 0, re
     if (isRun(call)) { state = {...state, ...JSON.parse(call.input)}; return {code: runCode, stdout: ''}; }
     if (isReceipt(call)) {
       const value = {v:1, nonce:state.nonce, run:state.run, inputDigest:state.inputDigest,
-        argvDigest:state.argvDigest, lock:state.lock, phase:'test', code:runCode};
-      return {code:receiptCode, stdout: typeof receipt === 'function' ? receipt(state.nonce, value, state) : receipt ?? JSON.stringify({...value, manifestDigest:state.manifestDigest, ...(state.siblingShas ? {siblingShas:state.siblingShas} : {})})};
+        argvDigest:state.argvDigest, lock:state.lock, manifestDigest:state.manifestDigest,
+        ...(state.siblingShas ? {siblingShas:state.siblingShas} : {}), phase:'test', code:runCode};
+      return {code:receiptCode, stdout: typeof receipt === 'function' ? receipt(state.nonce, value, state) : receipt ?? JSON.stringify(value)};
     }
     if (call.file === 'ssh' && call.args.at(-1) === 'true') return {code:probeCode, stdout:''};
     throw new Error(`Unexpected exec call: ${JSON.stringify(call)}`);
@@ -573,11 +574,12 @@ describe('isAllowedCommand', () => {
       expect(isAllowedCommand(['npm', 'run', script, ...args]), JSON.stringify(args)).toBe(false);
       expect(isAllowedCommand(['npm', 'run', script, ...args])).toBe(false);
     }
-    expect(isAllowedCommand(['npm', 'run', script, '--', '--script-shell=/usr/bin/true'])).toBe(script === 'check:standards');
+    expect(isAllowedCommand(['npm', 'run', script, '--', '--script-shell=/usr/bin/true'])).toBe(false);
   });
   it.each(['test:unit', 'check:standards'])('allows exactly the npm run %s prefix, including extra args', (script) => {
     expect(isAllowedCommand(['npm', 'run', script])).toBe(true);
-    expect(isAllowedCommand(['npm', 'run', script, '--', 'a.test.mjs'])).toBe(true);
+    const args = script === 'check:standards' ? ['--local', '--files=a.test.mjs'] : ['a.test.mjs'];
+    expect(isAllowedCommand(['npm', 'run', script, '--', ...args])).toBe(true);
   });
   it.each([
     [], null, undefined, {}, 'npm run test:unit', ['npm'], ['npm', 'run'],
@@ -615,6 +617,24 @@ describe('validateRunId', () => {
 });
 
 describe('runRemote', () => {
+  it('falls back locally for check:standards -- --unknown before any staging or transfer', async () => {
+    const f = fixture();
+    f.argv = ['npm', 'run', 'check:standards', '--', '--unknown'];
+    const stage = vi.fn(filesystem.mkdtemp);
+    const options = {...f, fs:{...filesystem, mkdtemp:stage}};
+    expect(await runRemote(options)).toEqual({mode:'fallback', reason:'command-not-allowed'});
+    const log = vi.fn();
+    const decision = await runWithRemoteDecision({
+      ...f, log, policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
+      remoteExec:async () => adaptLegacyRemoteResult(await runRemote(options)),
+    });
+    expect(decision).toEqual({handled:false});
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('command-not-allowed'));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('falling back to local admission'));
+    expect(stage).not.toHaveBeenCalled();
+    expect(f.exec).not.toHaveBeenCalled();
+    expect(f.listFiles).not.toHaveBeenCalled();
+  });
   it.each(['bound','wrong nonce','wrong run','started','missing started','extra field','non-Git command'])('accepts only protected not-started Git HEAD refusal and never retries: %s',async kind=>{
     const f=fixture({runCode:254,receipt:(_nonce,value)=>{
       const reply={v:1,nonce:value.nonce,run:value.run,phase:'rejected',reason:'git-head-unavailable',siblings:false,started:false};
@@ -1025,7 +1045,8 @@ describe('runRemote', () => {
 
   it.each(['test:unit', 'check:standards'])('falls back before transport for %s when the snapshot requires an outside-allowlist sibling', async (command) => {
     const f = fixture();
-    f.argv = ['npm', 'run', command, '--', 'blocks/__tests__/unit/resource-loader/ResourceLoader.test.ts'];
+    const file = 'blocks/__tests__/unit/resource-loader/ResourceLoader.test.ts';
+    f.argv = ['npm', 'run', command, '--', command === 'check:standards' ? '--files='+file : file];
     f.listFiles.mockResolvedValue(['package-lock.json', 'vitest.shared.ts']);
     writeFileSync(join(cwd, 'vitest.shared.ts'), "export const fuiPlugsRoot = resolve(repoRoot, '../frontierui/outside');\n");
     const log = vi.fn();
@@ -1208,6 +1229,31 @@ describe('forge-setup.sh', () => {
     return body[1];
   }
 
+  it.each(['0','129','not-a-number'])('rejects FORGE_EXEC_SLOTS=%s before setup',slots=>{
+    const setup=readFileSync(new URL('../forge-setup.sh',import.meta.url),'utf8');
+    const guard=setup.slice(setup.indexOf('set -euo pipefail'),setup.indexOf('export FORGE_EXEC_SLOTS'));
+    const result=spawnSync('bash',['-c',guard],{encoding:'utf8',timeout:10000,env:{...process.env,FORGE_EXEC_SLOTS:slots}});
+    expect(result.status).not.toBe(0);expect(result.stderr).toContain('FORGE_EXEC_SLOTS must be 1..128');
+  });
+  it.each([
+    ['invalid or shared worker identity',"pwd.getpwnam = lambda name: types.SimpleNamespace(pw_uid=0, pw_gid=os.getgid())"],
+    ['invalid or shared worker identity',"original_pwd = pwd.getpwnam\npwd.getpwnam = lambda name: types.SimpleNamespace(pw_uid=5001, pw_gid=original_pwd(name).pw_gid) if name.startswith('forge-exec-') else original_pwd(name)"],
+    ['invalid or shared worker identity',`# Duplicate primary GID with distinct worker UIDs and matching named groups.
+original_pwd, original_grp = pwd.getpwnam, grp.getgrnam
+pwd.getpwnam = lambda name: types.SimpleNamespace(pw_uid=original_pwd(name).pw_uid, pw_gid=6001) if name.startswith('forge-exec-') else original_pwd(name)
+grp.getgrnam = lambda name: types.SimpleNamespace(gr_gid=6001, gr_mem=[]) if name.startswith('forge-exec-') else original_grp(name)`],
+    ['invalid or shared worker identity',"original_grp = grp.getgrnam\ngrp.getgrnam = lambda name: types.SimpleNamespace(gr_gid=9999, gr_mem=[]) if name.startswith('forge-exec-') else original_grp(name)"],
+    ['slot groups must be private',"original_grp = grp.getgrnam\ngrp.getgrnam = lambda name: types.SimpleNamespace(gr_gid=original_grp(name).gr_gid, gr_mem=['intruder'])"],
+    ['slot groups must be private',"os.getgrouplist = lambda name, gid: [gid, 6001] if name == 'ops' else [gid]"],
+    ['slot users must not have supplementary groups',"os.getgrouplist = lambda name, gid: [gid, 9999] if name.startswith('forge-exec-') else [gid]"],
+  ])('rejects setup identity evidence: %s (%s)',(message,override)=>{
+    const srv=join(cwd,'srv');mkdirSync(srv);
+    const body=directorySetup();
+    const harness=directoryHarness(body,srv).replace(body.replaceAll('"/srv"',JSON.stringify(srv)),override+'\n'+body.replaceAll('"/srv"',JSON.stringify(srv)));
+    const result=spawnSync('python3',['-c',harness],{encoding:'utf8',timeout:10000});
+    expect(result.status).not.toBe(0);expect(result.stderr).toContain('RuntimeError: '+message);
+  });
+
   it.each(['forge-exec', 'forge-exec/.cache'])('rejects a symlink at %s without changing its target', (path) => {
     const srv = join(cwd, 'srv');
     const target = join(cwd, 'target');
@@ -1314,13 +1360,30 @@ original_fstat = os.fstat`);
 });
 
 describe('receipt field binding', () => {
-  it.each(['v','nonce','run','inputDigest','argvDigest','lock','phase','code'])('rejects mismatched %s', async field => {
-    const f = fixture({receipt: (_nonce,value) => JSON.stringify({...value,[field]:field === 'v' ? 2 : field === 'code' ? 1 : 'wrong'})});
+  function expectValidReceipt(value) {
+    const {phase,code,...expected} = value;
+    expect(phase).toBe('test');
+    expect(remoteManifestAPI.verifyReceipt(JSON.stringify(value),expected,code)).toBe(true);
+  }
+  it.each(['v','nonce','run','inputDigest','argvDigest','lock','manifestDigest','phase','code'])('rejects mismatched %s', async field => {
+    let baseline;
+    const f = fixture({receipt: (_nonce,value) => {
+      baseline = {...value};
+      return JSON.stringify({...value,[field]:field === 'v' ? 2 : field === 'code' ? 1 : 'wrong'});
+    }});
     expect(await runRemote(f)).toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
+    // Assert outside transport callbacks: runRemote deliberately catches IO
+    // exceptions, so a failing positive control inside one could be swallowed.
+    expectValidReceipt(baseline);
   });
   it('rejects install-phase evidence even with matching status', async () => {
-    expect(await runRemote(fixture({runCode:97,receipt:(_n,v)=>JSON.stringify({...v,phase:'install'})})))
+    let baseline;
+    expect(await runRemote(fixture({runCode:97,receipt:(_n,v)=>{
+      baseline = {...v};
+      return JSON.stringify({...v,phase:'install'});
+    }})))
       .toEqual({mode:'unconfirmed',reason:'ambiguous-result'});
+    expectValidReceipt(baseline);
   });
 });
 
@@ -1468,6 +1531,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     'cert.pem', 'cert.key', 'cert.p12', 'cert.pfx', 'cert.jks', 'cert.keystore',
     'secrets.json', 'tokens.json', 'creds.json', 'credential.json', 'passwd.txt',
     'password.txt', 'oauth.json', 'apikey.json', 'api-key.json', 'ACCESS_TOKEN.json',
+    'api_key.json', 'API_KEY.json', 'api key.json', 'api.key.json',
     'secréts.json', 'tóken.json', 'créds.json', 'íd_backup', 'cert.pém', 'nested/sécrets/hosts.yml',
     '.netrc', '.npmrc', '.env', '.env.production',
   ])('excludes credential class path %s from entries and rsync inventory', async name => {
@@ -1532,7 +1596,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
   const treeRecord = (name, data) => Buffer.from(`100644 blob ${blob(data)}\t${name}\0`);
 
   it.each([
-    '.claude/skills/x/SKILL.md', '.githooks/pre-commit.js', '.eleventy.js',
+    '.claude/skills/x/SKILL.md', '.eleventy.js',
     '.claude/secrets.md', '.secret.js', 'secret-directory/.hidden.md',
     'private.key/safe.md', 'secret.key/safe.js', '.env.local.js',
     '.netrc/safe.md', '.npmrc/safe.js',
@@ -1550,6 +1614,15 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     expect(await runRemote({argv, cwd, runId, exec})).toEqual({mode:'remote', code:0});
     expect(callsOf(exec).find(call => call.file === 'rsync').input).toEqual(Buffer.from('./package-lock.json\0'));
     expect(JSON.parse(callsOf(exec).find(isRun).input).manifest).toEqual(wire(manifest));
+  });
+
+  it('keeps .githooks in the remote snapshot so remote check:standards sees hook files', async () => {
+    const name = '.githooks/pre-commit';
+    mkdirSync(join(cwd, '.githooks'), {recursive:true});
+    writeFileSync(join(cwd, name), '#!/bin/sh\n');
+    const manifest = await build({cwd, exec:gitInventory(['package-lock.json', name].map(value => Buffer.from(value)))});
+    expect(manifest.entries.map(entry => entry.path.toString())).toContain(name);
+    expect(manifest.excluded.map(entry => entry.toString())).not.toContain(name);
   });
 
   it.each(['.claude/skills/x/SKILL.test.md', '.eleventy.test.js', '.claude/secrets.test.js', 'private.key/safe.test.js'])
@@ -1763,8 +1836,18 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
   });
 
   it.each(['missing', 'wrong'])('rejects a %s manifestDigest in an otherwise matching green receipt', async kind => {
-    const f = fixture({receipt:(_nonce,value) => JSON.stringify(kind === 'missing' ? value : {...value,manifestDigest:'0'.repeat(64)})});
+    let baseline;
+    const f = fixture({receipt:(_nonce,value) => {
+      baseline = {...value};
+      const changed = {...value};
+      if (kind === 'missing') delete changed.manifestDigest;
+      else changed.manifestDigest = '0'.repeat(64);
+      return JSON.stringify(changed);
+    }});
     expect(await runRemote(f)).toEqual({mode:'unconfirmed', reason:'ambiguous-result'});
+    const {phase,code,...expected} = baseline;
+    expect(phase).toBe('test');
+    expect(remoteManifestAPI.verifyReceipt(JSON.stringify(baseline),expected,code)).toBe(true);
   });
 });
 

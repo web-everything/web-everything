@@ -15,6 +15,36 @@ beforeEach(()=>{
 });
 afterEach(()=>rmSync(scratch,{recursive:true,force:true}));
 
+it('real verify-lane runGate hands WE_FORGE_GATE_DISPATCH=1 to heavy admission for remote dispatch',()=>{
+  const gate=join(scratch,'admission-gate.mjs'),wire=join(scratch,'admission.json');
+  const pool=join(scratch,'pool'),preferences=join(scratch,'preferences.json');mkdirSync(pool);
+  writeFileSync(preferences,JSON.stringify({heavyAdmission:{remote:{enabled:true,mode:'always'}}}));
+  writeFileSync(gate,`
+import {main} from ${JSON.stringify(new URL('../heavy-admission.mjs',import.meta.url).href)};
+import {easternTimestamp} from ${JSON.stringify(new URL('../forge-exec-run.mjs',import.meta.url).href)};
+import {writeFileSync} from 'node:fs';
+const evidence={held:process.env.WE_HEAVY_ADMISSION_HELD,dispatch:process.env.WE_FORGE_GATE_DISPATCH};
+writeFileSync(${JSON.stringify(wire)},JSON.stringify(evidence));
+await main(['run','--repo='+process.cwd(),'--','npm','run','check:standards'],{
+  remoteExec:async options=>{
+    writeFileSync(${JSON.stringify(wire)},JSON.stringify({...evidence,argv:options.argv}));
+    return {mode:'remote',code:0};
+  },
+  readTelemetry:async()=>({sampledAtET:easternTimestamp(Date.now()),cores:8,loadPerCore:0.1,memFreePct:90,activeRuns:0,recent:[]}),
+});
+`);
+  const result=spawnSync(process.execPath,[verify,`--gate=node ${gate}`,'--json'],{
+    cwd:repo,encoding:'utf8',timeout:30000,maxBuffer:1024*1024,
+    env:{...process.env,CI:'',WE_HEAVY_ADMISSION:'on',WE_FORGE_GATE_DISPATCH:'',
+      WE_HEAVY_ADMISSION_CONTAINER:'',WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES:'',
+      LANE_POOL_ROOT:pool,WE_PLATFORM_PREFERENCES:preferences,CONVEYOR_RUNNER_LOCK_ROOT:join(scratch,'locks')},
+  });
+  expect(result.error).toBeUndefined();
+  expect(result.status,result.stderr).toBe(0);
+  expect(JSON.parse(readFileSync(wire,'utf8'))).toEqual({held:'1',dispatch:'1',argv:['npm','run','check:standards']});
+  expect(JSON.parse(readFileSync(join(repo,'.git','.lane-verify'),'utf8')).status).toBe('green');
+},40000);
+
 it.each([
   {code:0,confirmed:true,green:true},
   {code:17,confirmed:true,green:false},

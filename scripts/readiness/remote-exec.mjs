@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { realpath } from 'node:fs/promises';
 import * as filesystem from 'node:fs/promises';
-import { constants } from 'node:fs';
+import { constants, realpathSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
@@ -18,9 +17,7 @@ const newRunId = () => `${new Date().toISOString().replace(/[^0-9tz]/gi, '').toL
 
 export function isAllowedCommand(argv) {
   // Only task arguments may follow the script name; npm options can skip or replace execution.
-  return Array.isArray(argv) && argv.length >= 3 && argv.every((arg) => typeof arg === 'string' && !arg.includes('\0'))
-    && (allowedCommand(argv) || (argv[0] === 'npm' && argv[1] === 'run' && argv[2] === 'check:standards'
-      && (argv.length === 3 || argv[3] === '--')));
+  return allowedCommand(argv);
 }
 
 export function filterEnv(env = {}) {
@@ -72,6 +69,7 @@ export function createGitBlobReader({cwd, timeoutMs=10000}={}) {
     if(pending){clearTimeout(pending.timer);const reject=pending.reject;pending=undefined;reject(failure);}
     buffer=Buffer.alloc(0);
     if(!closed)child.kill('SIGKILL');
+    resolveClosed();
   }
   child.on('error',()=>{fail('process failed');closed=true;resolveClosed();});
   child.on('close',code=>{closed=true;if(pending||(!closing&&!failure)||code&&!failure)fail('process closed');resolveClosed();});
@@ -107,7 +105,7 @@ export function createGitBlobReader({cwd, timeoutMs=10000}={}) {
     async close() {
       if(!closing){closing=true;if(pending)fail('closed during request');else if(!failure&&!closed)child.stdin.end();}
       const timer=setTimeout(()=>fail('close deadline exceeded'),timeoutMs);
-      try{await completion;}finally{clearTimeout(timer);}
+      try{await completion;if(failure)throw failure;}finally{clearTimeout(timer);}
     },
   };
 }
@@ -661,7 +659,10 @@ export function parseArgs(args) {
   return options;
 }
 
-if (process.argv[1] && await realpath(process.argv[1]).catch(() => '') === await realpath(fileURLToPath(import.meta.url))) {
+const cliPath = (() => { try { return realpathSync(process.argv[1]); } catch { return ''; } })();
+if (process.argv[1] && cliPath === realpathSync(fileURLToPath(import.meta.url))) {
+  (async () => {
   try { process.exitCode = await main(parseArgs(process.argv.slice(2))); }
   catch (error) { process.stderr.write(`remote-exec: ${error.message}\n`); process.exitCode = 1; }
+  })();
 }

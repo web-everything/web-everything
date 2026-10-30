@@ -2094,9 +2094,16 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
     if (!useContainer && ((!bypass && !process.env[ADMISSION_HELD_ENV]) || (bypass==='held' && forgeGate && !isAdmissionOff(process.env) && !/^(true|1)$/i.test(process.env.CI??'')))) {
       const requested=argv.slice(dashDashIdx+1);
       // package.json wraps the underlying executable, so reconstruct only the
-      // fixed standards script contract at this client boundary.
-      const remoteArgv=requested[0]==='node'&&requested[1]==='scripts/check-standards.mjs'
+      // fixed standards and Vitest script contracts at this client boundary.
+      let remoteArgv=requested[0]==='node'&&requested[1]==='scripts/check-standards.mjs'
         ? ['npm','run','check:standards',...(requested.length>2?['--',...requested.slice(2)]:[])] : requested;
+      if(requested[0]==='vitest'&&requested[1]==='run') {
+        const integration=requested[2]==='--config'&&requested[3]==='vitest.integration.config.ts';
+        const coverage=requested[2]==='--coverage';
+        const script=integration?'test:integration:vitest':coverage?'test:coverage':'test:unit';
+        const rest=requested.slice(integration?4:coverage?3:2);
+        remoteArgv=['npm','run',script,...(rest.length?['--',...rest]:[])];
+      }
       const result = await runWithRemoteDecision({
         argv: remoteArgv, policy, cwd: repo ?? process.cwd(),
         env: process.env, remoteExec, readTelemetry, lockRoot,

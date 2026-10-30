@@ -62,6 +62,35 @@ function expectFallback(log, reason) {
 }
 
 describe('remote admission policy', () => {
+  it('runs unsupported check:standards arguments locally with a reason and no remote staging',async()=>{
+    const root=mkdtempSync(join(process.env.TMPDIR,'standards-fallback-')),pool=join(root,'pool');mkdirSync(pool);
+    const preferences=join(root,'preferences.json');
+    writeFileSync(preferences,JSON.stringify({heavyAdmission:{remote:{enabled:true,mode:'always'}}}));
+    const command=['npm','run','check:standards','--','--unknown'];
+    const exited=new Error('test exit'),transport=vi.fn(),stage=vi.fn();
+    const exit=vi.spyOn(process,'exit').mockImplementation(()=>{throw exited;});
+    const stderr=vi.spyOn(process.stderr,'write').mockImplementation(()=>true);
+    for(const [key,value] of Object.entries({LANE_POOL_ROOT:pool,WE_PLATFORM_PREFERENCES:preferences,
+      CI:'',WE_HEAVY_ADMISSION:'on',WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1',
+      WE_HEAVY_ADMISSION_CONTAINER:'',WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES:''}))vi.stubEnv(key,value);
+    vi.mocked(execSync).mockImplementation(()=>{throw Object.assign(new Error('local command exit'),{status:17});});
+    try {
+      await expect(main(['run',`--repo=${root}`,'--',...command],{
+        readTelemetry:healthyRead,
+        remoteExec:async options=>adaptLegacyRemoteResult(await runRemote({...options,exec:transport,fs:{mkdtemp:stage}})),
+      })).rejects.toBe(exited);
+      expect(execSync).toHaveBeenCalledTimes(1);
+      expect(execSync).toHaveBeenCalledWith(command.map(shellQuoteWord).join(' '),expect.objectContaining({cwd:root}));
+      expect(exit).toHaveBeenCalledWith(17);
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining('command-not-allowed'));
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining('falling back to local admission'));
+      expect(vi.mocked(execSync).mock.calls[0][1].env).not.toHaveProperty('WE_FORGE_GATE_DISPATCH');
+      expect(transport).not.toHaveBeenCalled();expect(stage).not.toHaveBeenCalled();
+    }finally{
+      vi.mocked(execSync).mockReset();exit.mockRestore();stderr.mockRestore();vi.unstubAllEnvs();
+      rmSync(root,{recursive:true,force:true});
+    }
+  });
   it('ignores conflicting tool remote settings on the shared pool', () => {
     const remote = { enabled: true, mode: 'always', loadPerCoreThreshold: 5 };
     const policy = resolveAdmissionPolicy({
@@ -78,6 +107,13 @@ describe('remote admission policy', () => {
     {env:{},command:argv,expected:argv},
     {env:{WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'},command:argv,expected:argv},
     {env:{WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'},command:['node','scripts/check-standards.mjs','--local','--files=a.mjs'],expected:['npm','run','check:standards','--','--local','--files=a.mjs']},
+    {env:{},command:['vitest','run','--config','vitest.integration.config.ts','a.test.mjs'],expected:['npm','run','test:integration:vitest','--','a.test.mjs']},
+    {env:{},command:['vitest','run','--config','vitest.integration.config.ts'],expected:['npm','run','test:integration:vitest']},
+    {env:{},command:['vitest','run','--coverage','a.test.mjs'],expected:['npm','run','test:coverage','--','a.test.mjs']},
+    {env:{},command:['vitest','run','--coverage'],expected:['npm','run','test:coverage']},
+    {env:{},command:['vitest','run','a.test.mjs'],expected:['npm','run','test:unit','--','a.test.mjs']},
+    {env:{},command:['vitest','run'],expected:['npm','run','test:unit']},
+    {env:{},command:['vitest','list'],expected:['vitest','list']},
   ])('main run dispatches a direct command or explicitly designated Mac verify gate remotely: %j', async ({env:gateEnv,command,expected}) => {
     const root = mkdtempSync(join(tmpdir(), 'remote-main-'));
     const pool = join(root, 'pool');
@@ -110,6 +146,8 @@ describe('remote admission policy', () => {
   });
 
   it.each([
+    ['CI with Forge gate handoff', {CI:'true',WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'}, [], true, false],
+    ['admission off with Forge gate handoff', {WE_HEAVY_ADMISSION:'off',WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'}, [], true, false],
     ['WE_HEAVY_ADMISSION=off bypass', { WE_HEAVY_ADMISSION: 'off' }, [], true, false],
     ['--container', {}, ['--container'], true, true],
     ['WE_HEAVY_ADMISSION_HELD=1', { WE_HEAVY_ADMISSION_HELD: '1' }, [], true, false],
@@ -148,6 +186,7 @@ describe('remote admission policy', () => {
       expect(localExec).toHaveBeenCalledWith(argv.map(shellQuoteWord).join(' '), expect.objectContaining({
         cwd: root, env: expect.objectContaining({ WE_HEAVY_ADMISSION_HELD: '1' }),
       }));
+      expect(localExec.mock.calls[0][1].env).not.toHaveProperty('WE_FORGE_GATE_DISPATCH');
       expect(exit).toHaveBeenCalledWith(17);
       expect(heldSlots({ lockRoot, cap: 2, fastSlots: 1 })).toHaveLength(0);
       if (!enableRemote) expect(stderr).toHaveBeenCalledWith(expect.stringContaining('remote.enabled=false (standard)'));
