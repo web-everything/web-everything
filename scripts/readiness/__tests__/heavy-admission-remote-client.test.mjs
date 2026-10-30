@@ -6,7 +6,7 @@ import * as provenanceIo from 'node:fs/promises';
 import { dirname, join, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
-import { createRemoteExec, formatAdmissionPolicy, privateAdmissionPool, resolveAdmissionPolicy, resolveRemoteClient, runWithRemoteDecision } from '../heavy-admission.mjs';
+import { createRemoteExec, formatAdmissionPolicy, privateAdmissionPool, resolveAdmissionPolicy, resolveRemoteClient, runWithRemoteDecision, settleClientProvenance } from '../heavy-admission.mjs';
 
 vi.mock('node:child_process', async (importOriginal) => ({
   ...await importOriginal(), execFile: vi.fn(),
@@ -50,6 +50,64 @@ function makeFifo(file, context) {
 }
 
 describe('remote client override', () => {
+  it('drains every pending provenance task, clears the timer, and removes settled tasks including failures', async () => {
+    vi.useFakeTimers();
+    const releases = [];
+    for (let i = 0; i < 2; i++) {
+      const f = fixture();
+      await f.run({ provenanceFs: mockProvenanceFs(), log: () => new Promise((resolve, reject) => {
+        releases.push(i === 0 ? resolve : reject);
+      }) });
+    }
+    await vi.advanceTimersByTimeAsync(0);
+    expect(releases).toHaveLength(2);
+    let settled = false;
+    const draining = settleClientProvenance().then((result) => { settled = true; return result; });
+    releases[0]();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toBe(false);
+    releases[1](new Error('optional log unavailable'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await draining).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    const timer = vi.spyOn(globalThis, 'setTimeout');
+    try {
+      expect(await settleClientProvenance()).toBe(true);
+      expect(timer).not.toHaveBeenCalled();
+    } finally { timer.mockRestore(); }
+  });
+
+  it.each([[25, 25], [1500, 1500], [9000, 1500], [Infinity, 1500], [NaN, 1500], [-10, 0]])(
+    'bounds a stuck provenance drain requested at %s ms to %i ms with an unref\'d timer', async (requested, cap) => {
+      vi.useFakeTimers();
+      const f = fixture();
+      let release;
+      await f.run({ log: () => new Promise((resolve) => { release = resolve; }), provenanceFs: mockProvenanceFs() });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(release).toBeTypeOf('function');
+      const timer = vi.spyOn(globalThis, 'setTimeout');
+      try {
+        let settled = false;
+        const draining = settleClientProvenance(requested).then((result) => { settled = true; return result; });
+        expect(timer).toHaveBeenLastCalledWith(expect.any(Function), cap);
+        expect(timer.mock.results.at(-1).value.hasRef()).toBe(false);
+        if (cap > 0) {
+          await vi.advanceTimersByTimeAsync(cap - 1);
+          expect(settled).toBe(false);
+        }
+        await vi.advanceTimersByTimeAsync(cap > 0 ? 1 : 0);
+        expect(await draining).toBe(false);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        timer.mockRestore();
+        release();
+        await vi.advanceTimersByTimeAsync(0);
+      }
+      expect(await settleClientProvenance()).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
   it.each([undefined, null])('unset %s imports the bundled path and preserves the existing log', async (clientPath) => {
     const f = fixture();
     f.policy.settings.remote.clientPath = clientPath;

@@ -484,6 +484,27 @@ export function resolveRemoteClient({ clientPath, laneRoots = [], fs = realClien
 }
 
 const remoteClientNotice = { logged: false };
+const pendingClientProvenance = new Set();
+const CLIENT_PROVENANCE_SETTLE_MAX_MS = 1500;
+
+/** Best-effort CLI shutdown drain, outside the remote execution deadline. False means skip the
+ * remaining provenance and exit with the remote result; even a stuck IO/log promise cannot hold exit. */
+export async function settleClientProvenance(maxMs = CLIENT_PROVENANCE_SETTLE_MAX_MS) {
+  if (pendingClientProvenance.size === 0) return true;
+  const timeoutMs = Number.isFinite(maxMs)
+    ? Math.max(0, Math.min(maxMs, CLIENT_PROVENANCE_SETTLE_MAX_MS)) : CLIENT_PROVENANCE_SETTLE_MAX_MS;
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.all([...pendingClientProvenance]).then(() => true),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+        timer.unref();
+      }),
+    ]);
+  } finally { clearTimeout(timer); }
+}
+
 const CLIENT_PROVENANCE_MAX_BYTES = 4096;
 const CLIENT_PROVENANCE_OPEN_FLAGS = (constants.O_NONBLOCK ?? 0) | (constants.O_NOFOLLOW ?? 0);
 
@@ -605,7 +626,7 @@ export function createRemoteExec({
       // Invoke the validated client before starting any optional provenance work.
       result = remote.runRemote(options);
     } finally {
-      void (async () => {
+      const provenance = (async () => {
         const sha = oneLine(await boundedClientProvenance(() => readSha(client.clientPath), 1000, 'unknown') || 'unknown');
         if (!notice.logged) {
           notice.logged = true;
@@ -638,7 +659,8 @@ export function createRemoteExec({
             await provenanceFs.writeFile(file, JSON.stringify(pair) + '\n', { encoding: 'utf8', signal });
           }
         }, 100);
-      })().catch(() => {});
+      })().catch(() => {}).finally(() => pendingClientProvenance.delete(provenance));
+      pendingClientProvenance.add(provenance);
     }
     return adaptLegacyRemoteResult(await result);
   };
@@ -2229,7 +2251,12 @@ export async function main(argv, { remoteExec } = {}) {
         env: process.env, remoteExec, lockRoot,
         timeoutMs: classifyCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
       });
-      if (result.handled) process.exit(result.exitCode);
+      if (result.handled) {
+        // An unref'd drain timer permits natural exit if no IO remains; preserve the remote code there too.
+        process.exitCode = result.exitCode;
+        await settleClientProvenance();
+        process.exit(result.exitCode);
+      }
     }
     if (useContainer) {
       // Fail with a clear, actionable message rather than a raw ENOENT/"image not found" surfaced from deep

@@ -2955,6 +2955,11 @@ uses asynchronous Git so it cannot block the execution timer; neither its one-se
 100 ms persistence bound belongs on the client path. The never-resolving SHA/event regressions require
 client invocation and success before advancing fake time. Provenance assertions must await background
 writes explicitly while preserving once-per-process logs and change-only events.
+The real CLI drains tracked provenance only after the remote decision, for at most 1500 ms, with
+an unref'd timer cleared on completion. Set the remote exit code before awaiting so natural exit
+also preserves nonzero results. Keep native CLI regressions for fast event/state persistence and
+never-settling provenance both with and without another live handle; fake timers separately prove
+the drain cap, oversized/invalid budget clamping, timer cleanup, and removal of settled tasks.
 
 The persistence deadline cannot cancel a filesystem open blocked on a FIFO. Before reading override
 state, use `lstat` to reject symlinks and special files, and skip reads above the 4096-byte cap.

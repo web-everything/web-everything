@@ -1,20 +1,85 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { collectImportClosure } from '../../lib/import-closure.mjs';
 import { appendDaemonEvent } from '../../lib/daemon-events.mjs';
-import { createRemoteExec, resolveAdmissionPolicy } from '../heavy-admission.mjs';
+import { createRemoteExec, resolveAdmissionPolicy, resolveRemoteClient } from '../heavy-admission.mjs';
 
 const admissionUrl = new URL('../heavy-admission.mjs', import.meta.url);
 const repoRoot = fileURLToPath(new URL('../../../', import.meta.url));
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
+function cliFixture(source) {
+  const root = mkdtempSync(join(tmpdir(), 'admission-cli-provenance-'));
+  roots.push(root);
+  const clientPath = join(root, 'remote-exec.mjs');
+  const eventPath = join(root, 'events.jsonl');
+  const pool = join(root, 'pool');
+  const preferences = join(root, 'preferences.json');
+  mkdirSync(pool);
+  writeFileSync(clientPath, source);
+  writeFileSync(preferences, JSON.stringify({ heavyAdmission: { remote: { enabled: true, mode: 'always', clientPath } } }));
+  const env = { ...process.env, LANE_POOL_ROOT: pool, WE_PLATFORM_PREFERENCES: preferences,
+    WE_DAEMON_EVENTS: eventPath, WE_HEAVY_ADMISSION: 'on', WE_HEAVY_ADMISSION_HELD: '',
+    WE_HEAVY_ADMISSION_CONTAINER: '', WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES: '', CI: '' };
+  return { clientPath, eventPath, state: join(pool, '.admission', 'remote', 'client-override.json'),
+    run: () => spawnSync(process.execPath, [fileURLToPath(admissionUrl), 'run', '--', 'npm', 'run', 'build'], {
+      cwd: root, env, encoding: 'utf8', timeout: 5000, killSignal: 'SIGKILL', maxBuffer: 64 * 1024,
+    }) };
+}
+
 describe('admission import boundary', () => {
+  it.each([0, 7])('the real CLI persists fast remote provenance before exiting with code %i', (code) => {
+    const f = cliFixture(`export async function runRemote() { return { mode: 'remote', code: ${code} }; }`);
+    const result = f.run();
+    expect(result.error).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.status).toBe(code);
+    const pair = { clientPath: resolveRemoteClient({ clientPath: f.clientPath }).clientPath, sha: 'unknown' };
+    expect(result.stderr).toContain(`heavy-admission: remote client override ${pair.clientPath} @ unknown\n`);
+    expect(JSON.parse(readFileSync(f.state, 'utf8'))).toEqual(pair);
+    expect(readFileSync(f.eventPath, 'utf8').trim().split('\n').map(line => JSON.parse(line))).toEqual([{
+      at: expect.any(String), repo: 'web-everything', kind: 'remote-client-override',
+      detail: { ...pair, previous: null },
+    }]);
+  });
+
+  it.each([false, true])('the real CLI caps never-settling provenance and preserves the remote exit code (live handle=%s)', (liveHandle) => {
+    const f = cliFixture(`
+      export async function runRemote() {
+        const write = process.stderr.write.bind(process.stderr);
+        process.stderr.write = (line, ...args) => {
+          const result = write(line, ...args);
+          if (line.startsWith('heavy-admission: remote client override ')) {
+            const started = performance.now();
+            process.once('exit', () => console.log(JSON.stringify({ elapsed: performance.now() - started })));
+            // Keep the process live so an unref'd drain timer can fire; the CLI must exit explicitly.
+            if (${liveHandle}) setTimeout(() => process.exit(0), 30_000);
+            return new Promise(() => {});
+          }
+          return result;
+        };
+        return { mode: 'remote', code: 7 };
+      }
+    `);
+    const result = f.run();
+    expect(result.error).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.status).toBe(7);
+    expect(result.stderr).toContain('heavy-admission: remote client override ');
+    const { elapsed } = JSON.parse(result.stdout);
+    if (liveHandle) expect(elapsed).toBeGreaterThanOrEqual(1400);
+    // Allow scheduling jitter around the 1500 ms hard cap, excluding CLI startup and SHA lookup.
+    expect(elapsed).toBeLessThan(1900);
+    expect(existsSync(f.state)).toBe(false);
+    expect(existsSync(f.eventPath)).toBe(false);
+  }, 10_000);
+
   it('keeps daemon closures complete without importing the client loader or handoff push CLI', () => {
     const closure = collectImportClosure({ root: repoRoot, entries: ['scripts/readiness/heavy-admission.mjs'] });
     expect(closure.complete).toBe(true);
