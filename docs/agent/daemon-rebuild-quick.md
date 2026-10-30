@@ -27,6 +27,13 @@ consume that result or recover a missing/dead/expired worker as `quick-soak-unav
 one-hour deadline is derived from the exact recorded `adoptedAt`. Failure/unavailability rolls
 back to the previous last-good record; an unsafe rollback quarantines rather than discarding dirt.
 Quick partial passes never enter the full-smoke proof cache.
+Result publishers share a per-result `withFileLock` mutex across the outcome check and atomic
+publication. A diagnostic-bearing unavailable result may replace an unavailable record for the same
+token/SHA by rename; completed results, corrupt records and foreign identities block that upgrade.
+A later bare timeout preserves existing diagnostics. Lock acquisition times out with an error after
+the shared helper's five-second bound; fatal handling or next-tick dead-worker recovery is the fallback.
+Race fixtures interleave at the temporary result write, before the mutex is acquired: `mkdirSync`
+also runs during clone-key resolution and does not reliably mark the publication boundary.
 Quick quarantine retries and interrupted-adoption recovery use the same untracked-aware guarded rollback
 as soak settlement; ignored files and ancestor-path collisions must survive recovery with quarantine and a needs-you page.
 Quarantine records retain `failedHead`; recovery resets only that exact HEAD. A different or unreadable

@@ -46,7 +46,7 @@ export default {
         const silentLog = { error() {} };
         settleQuickSoak({ root, env: w.env, marker, outcome: 'failed', log: silentLog });
         if (git(['rev-parse', 'HEAD']) !== replacement) api.violation('settlement-reset', 'settlement displaced replacement');
-        const run = (args, opts) => spawnSync('git', args, { encoding: 'utf8', ...opts });
+        const run = (args, opts) => spawnSync('git', args, { encoding: 'utf8', ...opts, maxBuffer: 1024 * 1024 });
         const result = await prepareRebuild({ root, env: w.env, run, stateOpts: {}, now: Date.now, log: silentLog });
         const state = readRebuildState(root, w.env);
         if (git(['rev-parse', 'HEAD']) !== replacement) api.violation('recovery-reset', 'next tick displaced replacement');
