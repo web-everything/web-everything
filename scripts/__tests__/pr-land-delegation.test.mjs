@@ -14,11 +14,13 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 const triple = { provider: 'codex', model: 'gpt-6-astra', taskType: 'bugfix' };
+let loadN = 0;
 async function load(args = []) {
-  vi.resetModules();
   vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'author-session');
   process.argv = ['node', 'test-import', ...args];
-  return import('../pr-land.mjs');
+  // Re-evaluate the module-scope flags without rebuilding the entire transitive graph.
+  // Clearing every dependency on each case exhausted the unchanged 5s test deadline.
+  return import(`../pr-land.mjs?fresh=${++loadN}`);
 }
 
 describe('pr-land --delegation', () => {
