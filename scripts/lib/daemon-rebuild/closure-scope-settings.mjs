@@ -1,7 +1,7 @@
 /** Shared closure-scope policy for planning and boot smoke, without a smoke import cycle. */
 import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { cascadePolicy, logCascadeSources } from '../policy-cascade.mjs';
 
 export function daemonRebuildSettingsPath() {
