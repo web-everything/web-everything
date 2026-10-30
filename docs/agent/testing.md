@@ -1,50 +1,6 @@
 # Testing — Three-Tier Strategy
 
-## Worker cancellation during module loading
-
-Never terminate a worker while its ESM graph is loading: Node 22 can abort the entire process in
-`AsyncModuleExecutionFulfilled`. The verify watchdog disarms its shared deadline before cooperative
-shutdown, and `verify-lane` awaits its exit before emitting the final verdict, including timeout and
-spawn-error paths. Keep the escape sweeps intact when the deadline already fired.
-
-The health probe worker uses `worker-deadline.mjs`: announce readiness after all imports and before
-synchronous probe work, check startup cancellation, and drain worker exit before reporting a timeout.
-Module evaluation is allowed to finish during cancellation; the timeout prevents probe work from
-starting but does not forcibly interrupt the loader. Do not use this readiness protocol for work
-that dynamically imports additional modules after announcing readiness.
-`bounded-child-tree-kill.test.mjs` and `worker-deadline.test.mjs` use subprocesses with delayed ESM
-imports to exercise cancellation without taking down the test runner on a native loader regression.
-## Probe worker timeout teardown
-
-Worker timeout promises must wait for `worker.terminate()` before rejecting. Reserve
-the timeout outcome first so late message, error and exit events cannot replace it.
-Rejecting before shutdown lets a caller tear down its own worker while the nested
-worker is still exiting; the health-job test reproduced V8's
-`SourceTextModule::AsyncModuleExecutionFulfilled` fatal error in this window.
-`scripts/conveyor/__tests__/probe-worker-lifecycle.test.mjs` holds termination open
-to test this ordering for both GH probes and PR sweeps, including termination failure.
-
-## Forge manifest reuse
-
-`forge-fast-manifest.test.mjs` compares Git-based reuse with a full byte manifest and spies on
-file reads. Git status is not sufficient byte evidence for filters, encodings, index flags,
-or concurrent writes: hash those leaves normally, and use fresh stat/mode and base blob-size
-checks before reuse. Also bind the warm SHA-256 to verified base Git blob bytes: a dirty
-warm snapshot followed by a same-size clean reversion must hash the current leaf. Blob
-read failures trigger full scans; blobs above the reader limit use normal leaf hashing.
-Ignored test-shaped build output is exempt only when `check-ignore`
-confirms that a known build directory itself is ignored; file-only ignore rules still refuse.
-Run this fixture and the affected Forge tests through heavy admission.
-
-Remote discovery may overlap reachability, HEAD and base discovery, but drain every
-speculative process before returning fallback. `buildManifest` always lists ignored files
-fresh after base-manifest retrieval; ignored tests created during retrieval must still
-refuse admission (`forge-offload.test.mjs`). Capture all base lstat metadata before diff/status, attributes
-and index flags. Metadata capture uses at most 16 workers and drains failures before
-full scanning. Manifest timing substages appear inside the existing stage report;
-`inventory-walk` includes `hashing` (do not add those two counters). SSH and rsync
-share multiplexing options only after checking a short, owner-only 0700 directory;
-unavailable, unsafe or overlong control paths retain ordinary SSH.
+> Authors: APPEND new sections at the END of this file, never right after the title (`.gitattributes` union-merges it, but appending avoids overlapping insertions).
 
 ## Human-only enqueue approval license (R212)
 
@@ -2075,6 +2031,10 @@ manifests, lock, runtime/platform, fixed install flags). Workspaces, local depen
 unknown locks and unproven resolutions use the original full-input cache/install path.
 Check archive hashes on both source and destination; normal runs still validate npm before
 extracting a seeded profile. Cover sibling-bound profiles as well as primary-only runs.
+Negative reuse cases must seed both a valid archive and the exact candidate
+`.warm-inputs-*` index; a full profile alone cannot challenge the eligibility guard.
+Include a supported-input control proving the seeded evidence can actually reuse
+the archive, and inspect extracted dependency contents after changing the snapshot.
 
 Stage timings use an injected millisecond clock and Eastern timestamps with the actual
 seasonal offset. Install/run durations come from optional, strictly typed receipt timing
@@ -3034,8 +2994,30 @@ The fixed Forge wrapper discovers `slot-K` directories and matching system users
 client concurrency settings never define server identities. Pool prepare reserves
 `forge-exec-K` through finish using an ops-protected `worker-active-K` directory
 bound to run ID and nonce. An interrupted command leaves the reservation closed
-until an operator confirms that UID has no remaining processes. Never expire
-these directories by age. Hosts without pool directories retain the legacy UID.
+until shutdown is confirmed. Age and an empty UID scan alone never authorize
+reclamation: acquisition, prepare, execution, and finish hold shared leases on
+persistent per-slot `.worker-active-K.writer` inodes. Pruning holds exclusive
+leases through scanning and deletion and proves UID process absence before
+removing a reservation.
+The root supervisor requires reservation evidence and rechecks it under its own shared lease;
+a forked child retains that lease through UID drop and closes it before task exec.
+Only reservations declaring `writerGuard: 1` participate; historical or uncertain
+reservations require operator cleanup. Missing, unreadable, malformed, or incomplete
+reservation identity preserves all expired receipts and caches; a known run without
+identifiable dependency-lock evidence preserves caches while unrelated receipts
+can still expire. The prune tests cover empty historical reservations and resume
+age pruning after operator removal. Never unlink writer guard files.
+The worker-pool suite pauses a holder before launch, runs the real prune program
+against an empty UID inventory, and proves a second controller cannot launch as
+that UID. It also tests pruning winning first and refusal at each writer entry.
+Hosts without pool directories retain the legacy UID and its own writer guard.
+Only `testRoot` fixtures without `testWorkerIdentity` or `testSlotStat` use the
+same-UID harness. Production and either explicit isolation injection enforce
+worker identity, private groups, slot ownership and identity uniqueness. Pair
+injected identities with matching slot stats unless the fixture sets real slot
+ownership. Choose synthetic IDs relative to the operator, so host accounts cannot
+mask the intended refusal. Model a distinct non-root receipt owner in prune
+handoff probes even when tests run as root; otherwise a missing transfer passes.
 The privileged fixed wrapper owns metadata operations; tasks and rsync run only
 as the reserved UID. Slot roots are ops-owned with the worker's private group
 and mode 0710 (traverse only); run containers remain operator-owned. Only work
@@ -3143,3 +3125,62 @@ fallback, and claim zero reclaimed bytes. Do not enable reclamation with a polic
 heuristic. The operator must arrange actual writer exclusion before reclamation can be wired in.
 Regression tests append in the final-stat/removal interval, hold an open transcript descriptor, test
 unavailable exclusion, and queue a cooperating writer through the same exclusion used by removal.
+
+### Security condition test shape
+
+Every new bypass-widening condition needs one negative test per conjunct. Security
+checks must not be hidden behind `!testRoot` guards; inject identity, ownership,
+and other system evidence so hermetic tests exercise the production checks.
+
+Writer guards shared by root cron and operator controllers must stay on one
+private inode owned by the operator. Test first-use creation and migration of
+existing root-owned guards, retaining mode 0600 and inode identity. The worker-pool
+suite models ownership transfer on unprivileged hosts and includes a Linux/root
+integration case that runs prune as root then reserves every slot as the operator.
+
+## Probe worker timeout teardown
+
+Worker timeout promises must wait for `worker.terminate()` before rejecting. Reserve
+the timeout outcome first so late message, error and exit events cannot replace it.
+Rejecting before shutdown lets a caller tear down its own worker while the nested
+worker is still exiting; the health-job test reproduced V8's
+`SourceTextModule::AsyncModuleExecutionFulfilled` fatal error in this window.
+`scripts/conveyor/__tests__/probe-worker-lifecycle.test.mjs` holds termination open
+to test this ordering for both GH probes and PR sweeps, including termination failure.
+
+## Forge manifest reuse
+
+`forge-fast-manifest.test.mjs` compares Git-based reuse with a full byte manifest and spies on
+file reads. Git status is not sufficient byte evidence for filters, encodings, index flags,
+or concurrent writes: hash those leaves normally, and use fresh stat/mode and base blob-size
+checks before reuse. Also bind the warm SHA-256 to verified base Git blob bytes: a dirty
+warm snapshot followed by a same-size clean reversion must hash the current leaf. Blob
+read failures trigger full scans; blobs above the reader limit use normal leaf hashing.
+Ignored test-shaped build output is exempt only when `check-ignore`
+confirms that a known build directory itself is ignored; file-only ignore rules still refuse.
+Run this fixture and the affected Forge tests through heavy admission.
+
+Remote discovery may overlap reachability, HEAD and base discovery, but drain every
+speculative process before returning fallback. `buildManifest` always lists ignored files
+fresh after base-manifest retrieval; ignored tests created during retrieval must still
+refuse admission (`forge-offload.test.mjs`). Capture all base lstat metadata before diff/status, attributes
+and index flags. Metadata capture uses at most 16 workers and drains failures before
+full scanning. Manifest timing substages appear inside the existing stage report;
+`inventory-walk` includes `hashing` (do not add those two counters). SSH and rsync
+share multiplexing options only after checking a short, owner-only 0700 directory;
+unavailable, unsafe or overlong control paths retain ordinary SSH.
+
+## Worker cancellation during module loading
+
+Never terminate a worker while its ESM graph is loading: Node 22 can abort the entire process in
+`AsyncModuleExecutionFulfilled`. The verify watchdog disarms its shared deadline before cooperative
+shutdown, and `verify-lane` awaits its exit before emitting the final verdict, including timeout and
+spawn-error paths. Keep the escape sweeps intact when the deadline already fired.
+
+The health probe worker uses `worker-deadline.mjs`: announce readiness after all imports and before
+synchronous probe work, check startup cancellation, and drain worker exit before reporting a timeout.
+Module evaluation is allowed to finish during cancellation; the timeout prevents probe work from
+starting but does not forcibly interrupt the loader. Do not use this readiness protocol for work
+that dynamically imports additional modules after announcing readiness.
+`bounded-child-tree-kill.test.mjs` and `worker-deadline.test.mjs` use subprocesses with delayed ESM
+imports to exercise cancellation without taking down the test runner on a native loader regression.

@@ -95,6 +95,7 @@ export function createGitBlobReader({cwd, timeoutMs=10000}={}) {
     if(pending){clearTimeout(pending.timer);const reject=pending.reject;pending=undefined;reject(failure);}
     buffer=Buffer.alloc(0);
     if(!closed)child.kill('SIGKILL');
+    resolveClosed();
   }
   child.on('error',()=>{fail('process failed');closed=true;resolveClosed();});
   child.on('close',code=>{closed=true;if(pending||(!closing&&!failure)||code&&!failure)fail('process closed');resolveClosed();});
@@ -130,7 +131,7 @@ export function createGitBlobReader({cwd, timeoutMs=10000}={}) {
     async close() {
       if(!closing){closing=true;if(pending)fail('closed during request');else if(!failure&&!closed)child.stdin.end();}
       const timer=setTimeout(()=>fail('close deadline exceeded'),timeoutMs);
-      try{await completion;}finally{clearTimeout(timer);}
+      try{await completion;if(failure)throw failure;}finally{clearTimeout(timer);}
     },
   };
 }

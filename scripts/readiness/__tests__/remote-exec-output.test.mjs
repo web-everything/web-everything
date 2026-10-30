@@ -2,13 +2,14 @@
 import { EventEmitter } from 'node:events';
 import {PassThrough} from 'node:stream';
 import * as remote from '../remote-exec.mjs';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { defaultExec } from '../remote-exec.mjs';
 
 const { spawn } = vi.hoisted(() => ({ spawn: vi.fn() }));
 vi.mock('node:child_process', () => ({ spawn }));
 
 beforeEach(() => spawn.mockReset());
+afterEach(()=>vi.useRealTimers());
 
 function capturedChild() {
   const child = new EventEmitter();
@@ -90,6 +91,50 @@ describe('bounded persistent Git blob reader',()=>{
     child.stdin.on('finish',()=>{child.stdout.end();queueMicrotask(()=>child.emit('close',0));});
     spawn.mockReturnValue(child);return child;
   }
+  it('rejects overlapping blob requests',async()=>{
+    const child=batchChild(()=>{}),reader=remote.createGitBlobReader({timeoutMs:50});
+    const first=reader.read('a'.repeat(40));
+    await expect(reader.read('b'.repeat(40))).rejects.toThrow('overlapping blob request');
+    child.stdout.write(`${'a'.repeat(40)} blob 1\nx\n`);
+    await expect(first).resolves.toEqual(Buffer.from('x'));
+    await reader.close();expect(child.kill).not.toHaveBeenCalled();
+  });
+  it('rejects a silent blob read at timeoutMs',async()=>{
+    vi.useFakeTimers();
+    const child=batchChild(()=>{}),reader=remote.createGitBlobReader({timeoutMs:50});
+    const rejected=expect(reader.read('a'.repeat(40))).rejects.toThrow('deadline exceeded');
+    await vi.advanceTimersByTimeAsync(49);expect(child.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);await rejected;
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+    await expect(reader.close()).rejects.toThrow('deadline exceeded');expect(vi.getTimerCount()).toBe(0);
+  });
+  it('kills a process that never closes',async()=>{
+    vi.useFakeTimers();
+    const child=batchChild(()=>{});child.stdin.removeAllListeners('finish');child.kill=vi.fn(()=>true);
+    const reader=remote.createGitBlobReader({timeoutMs:50});
+    const settled=expect(reader.close()).rejects.toThrow('close deadline exceeded');
+    await vi.advanceTimersByTimeAsync(50);await settled;
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL');expect(vi.getTimerCount()).toBe(0);
+  });
+  it('rejects a stalled blob request at its deadline',async()=>{
+    vi.useFakeTimers();
+    const child=batchChild((child,oid)=>child.stdout.write(`${oid} blob 5\nx`));child.kill=vi.fn(()=>true);
+    const reader=remote.createGitBlobReader({timeoutMs:50});
+    const settled=expect(reader.read('a'.repeat(40))).rejects.toThrow('deadline exceeded');
+    await vi.advanceTimersByTimeAsync(49);expect(child.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);await settled;
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+    await expect(reader.close()).rejects.toThrow('deadline exceeded');expect(vi.getTimerCount()).toBe(0);
+  });
+  it('terminates a stalled close at its deadline',async()=>{
+    vi.useFakeTimers();
+    const child=batchChild(()=>{});child.stdin.removeAllListeners('finish');
+    const reader=remote.createGitBlobReader({timeoutMs:50});
+    const settled=expect(reader.close()).rejects.toThrow('close deadline exceeded');
+    await vi.advanceTimersByTimeAsync(49);expect(child.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);await settled;
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL');expect(vi.getTimerCount()).toBe(0);
+  });
   it('reads multiple exact binary blobs through one process, with chunked protocol framing',async()=>{
     const contents=[Buffer.from('é\0bytes'),Buffer.from([0xff,0,1])];let index=0;
     batchChild((child,oid)=>{const content=contents[index++];const frame=Buffer.concat([Buffer.from(`${oid} blob ${content.length}\n`),content,Buffer.from('\n')]);for(const byte of frame)child.stdout.write(Buffer.from([byte]));});
@@ -110,7 +155,7 @@ describe('bounded persistent Git blob reader',()=>{
     });
     const reader=remote.createGitBlobReader({cwd:'local-checkout'});
     await expect(reader.read('a'.repeat(40))).rejects.toThrow(/full ship/i);
-    await reader.close();expect(child.kill).toHaveBeenCalled();
+    await expect(reader.close()).rejects.toThrow(/full ship/i);expect(child.kill).toHaveBeenCalled();
   });
 });
 

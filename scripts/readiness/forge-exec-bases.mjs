@@ -2,7 +2,7 @@ import * as fs from 'node:fs/promises';
 import {constants} from 'node:fs';
 import {join} from 'node:path';
 import {spawn} from 'node:child_process';
-import {createHash} from 'node:crypto';
+import {createHash,randomBytes} from 'node:crypto';
 import {pathParts,bytePath,decodeManifest,digestManifest} from './forge-exec-manifest.mjs';
 const revision=sha=>typeof sha==='string'&&/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(sha);
 export const PUBLIC_REPOSITORY='https://github.com/chalbert/web-everything.git';
@@ -101,12 +101,51 @@ export async function baseDirectory(path,io=fs) {
   const st=await io.lstat(path);
   if(!st.isDirectory()||st.isSymbolicLink()||(st.mode&0o022))throw new Error('Unsafe base directory');
 }
-export async function baseGuard(root,action,io=fs) {
+export async function baseGuard(root,action,io=fs,{clock=Date.now,sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms)),
+  kill=(pid,signal)=>process.kill(pid,signal),waitMs=5000,retryMs=25,maxAgeMs=86400000}={}) {
   await baseDirectory(root,io);
-  const guard=join(root,'.guard');
-  await io.mkdir(guard,{mode:0o700});
-  try{return await action();}finally{await io.rmdir(guard);}
+  const guard=join(root,'.guard'),deadline=clock()+waitMs,token=randomBytes(16).toString('hex');
+  const ownerName='owner-'+token,pending=join(root,'.guard-pending-'+token);
+  const bounded=()=>new Error('Base guard wait exceeded; use local fallback and inspect the guard owner');
+  await io.mkdir(pending,{mode:0o700});
+  try {
+    // Publish a nonempty owner directory atomically. An initializer delayed
+    // past maxAge may lose its empty mkdir placeholder, but its rename cannot
+    // replace a successor's nonempty lock, so it cannot enter the action.
+    await io.writeFile(join(pending,ownerName),JSON.stringify({pid:process.pid,timestamp:clock()}),{flag:'wx',mode:0o600});
+    for(;;) {
+      if(clock()>deadline)throw bounded();
+      try {await io.mkdir(guard,{mode:0o700});await io.rename(pending,guard);break;}
+      catch(error){if(!['EEXIST','ENOTEMPTY'].includes(error.code))throw error;}
+      try {
+        const st=await io.lstat(guard);
+        if(!st.isDirectory()||st.isSymbolicLink())throw new Error('Unsafe base guard');
+        const names=await io.readdir(guard);
+        if(names.length===1&&/^owner-[a-f0-9]{32}$/.test(names[0])) {
+          const file=join(guard,names[0]),owner=JSON.parse(await baseFile(file,io));
+          let dead=false;
+          if(Number.isSafeInteger(owner.pid)&&owner.pid>0) {
+            try{kill(owner.pid,0);}catch(error){if(error.code==='ESRCH')dead=true;else if(error.code!=='EPERM')throw error;}
+          } else if(clock()-st.mtimeMs>maxAgeMs)dead=true;
+          // Age alone never authorizes stealing from a live holder. Unlink
+          // only this generation's owner; losing reapers cannot remove a
+          // successor's owner. rmdir can only remove an empty placeholder.
+          if(dead){await io.unlink(file);await io.rmdir(guard);continue;}
+        } else if(!names.length&&clock()-st.mtimeMs>maxAgeMs) {
+          await io.rmdir(guard);continue;
+        }
+      }catch(error){
+        // A different identity's private guard is held, never stale evidence.
+        // Keep waiting within the same bound when its owner cannot be read.
+        if(!(error instanceof SyntaxError)&&!['ENOENT','ENOTEMPTY','EEXIST','EACCES','EPERM'].includes(error.code))throw error;
+      }
+      if(clock()>=deadline)throw bounded();
+      await sleep(Math.min(retryMs,deadline-clock()));
+    }
+    try{return await action();}finally{await io.unlink(join(guard,ownerName));await io.rmdir(guard);}
+  }finally{await io.rm(pending,{recursive:true,force:true});}
 }
+
 export async function readyBases(root,io=fs) {
   await baseDirectory(root,io);
   const records=[];
