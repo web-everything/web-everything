@@ -472,9 +472,10 @@ export function resolveRemoteClient({ clientPath, laneRoots = [], fs = realClien
   try {
     if (typeof clientPath !== 'string' || !isAbsolute(clientPath)) return { reason: 'clientPath must be absolute' };
     if (basename(clientPath) !== 'remote-exec.mjs') return { reason: 'basename must be remote-exec.mjs' };
+    const named = resolve(clientPath);
     const real = fs.realpathSync(clientPath);
     const roots = laneRoots.flatMap((root) => [resolve(root), canonicalPath(root)]).map((root) => root.toLowerCase());
-    if ([clientPath, real].map((path) => path.toLowerCase()).some((path) => path.includes(sep + '.lanes' + sep)
+    if ([named, real].map((path) => path.toLowerCase()).some((path) => path.includes(sep + '.lanes' + sep)
       || roots.some((root) => path === root || path.startsWith(root + sep)))) return { reason: 'clientPath is inside a lane pool' };
     if (basename(real) !== 'remote-exec.mjs') return { reason: 'target basename must be remote-exec.mjs' };
     if (!fs.statSync(real).isFile()) return { reason: 'clientPath must be a regular file' };

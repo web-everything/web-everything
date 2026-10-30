@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import * as provenanceIo from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, join, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { createRemoteExec, formatAdmissionPolicy, privateAdmissionPool, resolveAdmissionPolicy, resolveRemoteClient, runWithRemoteDecision } from '../heavy-admission.mjs';
@@ -178,6 +178,41 @@ describe('remote client override', () => {
     expect(await f.run({ fs, importClient })).toEqual({ handled: false });
     expect(importClient).not.toHaveBeenCalled();
     expect(fs.statSync).not.toHaveBeenCalled();
+  });
+
+  it.each(['custom-pool', '.lanes'])('rejects a dot-dot named path into %s even when its symlink target is trusted', async (poolName) => {
+    const f = fixture();
+    const pool = join(f.root, poolName);
+    const laneClient = join(pool, 'lane-1', 'remote-exec.mjs');
+    mkdirSync(dirname(laneClient), { recursive: true });
+    symlinkSync(f.clientPath, laneClient);
+    const outside = join(f.root, 'outside');
+    mkdirSync(outside);
+    // Keep dot segments in the input: join() would normalize away the regression.
+    const clientPath = `${outside}${sep}..${sep}.${sep}${poolName}${sep}lane-1${sep}remote-exec.mjs`;
+    f.seams.laneRoots = poolName === 'custom-pool' ? [pool] : [];
+    f.policy.settings.remote.clientPath = clientPath;
+    const importClient = vi.fn();
+    expect(resolveRemoteClient({ clientPath, laneRoots: f.seams.laneRoots }))
+      .toEqual({ reason: 'clientPath is inside a lane pool' });
+    expect(await f.run({ importClient })).toEqual({ handled: false });
+    expect(importClient).not.toHaveBeenCalled();
+    expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('falling back to local admission'));
+  });
+
+  it.each(['outside', 'custom-pool', '.lanes'])('accepts a dot-dot named path from %s that resolves outside lane pools', async (prefix) => {
+    const f = fixture();
+    const outside = join(f.root, prefix);
+    mkdirSync(outside);
+    const clientPath = `${outside}${sep}..${sep}.${sep}client${sep}remote-exec.mjs`;
+    f.seams.laneRoots = [join(f.root, 'custom-pool')];
+    f.policy.settings.remote.clientPath = clientPath;
+    const real = resolveRemoteClient({ clientPath: f.clientPath }).clientPath;
+    expect(real).toEqual(expect.any(String));
+    expect(resolveRemoteClient({ clientPath, laneRoots: f.seams.laneRoots })).toEqual({ clientPath: real });
+    const importClient = vi.fn(async () => ({ runRemote: async () => ({ mode: 'remote', code: 0 }) }));
+    expect(await f.run({ importClient })).toEqual({ handled: true, exitCode: 0 });
+    expect(importClient).toHaveBeenCalledWith(pathToFileURL(real).href);
   });
 
   it('keeps the lane-root directory boundary when comparing case-insensitively', () => {
