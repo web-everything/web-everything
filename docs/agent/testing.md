@@ -1933,6 +1933,8 @@ before manually clearing a retained marker. If marker creation fails, refuse rem
 fall back through local admission. The SIGKILL subprocess regression leaves its simulated remote
 job alive and asserts that a second caller cannot reclaim that capacity. Keep this crash test
 alongside the returned-result and confirmed-cleanup cases when changing remote-slot lifecycle.
+Model the surviving job with `keepAliveScript()` anchored to the test runner, with a bounded
+lifetime; anchoring to the simulated client would invalidate the crash-survival assertion.
 The local host's heavy semaphore is acquired only on a safe local fallback.
 
 ### Forge warm bases and delta snapshots
@@ -1943,6 +1945,8 @@ Run `forge-offload.test.mjs` alongside the existing remote client, runner, outpu
 and admission-contract test files through heavy-admission when changing this protocol.
 Exercise the actual rsync file list and full reconstructed manifest, including executable
 bits, worktree deletions, public credential-named sources, and ignored/excluded tests.
+Give transport and retry cases an explicit 30-second deadline: they perform real Git and
+runner subprocess work, and a safe retry repeats the complete transport/run/finish cycle.
 
 Read-only `bases` discovery precedes local admission so older runners keep their original
 full-ship order: no prepared run or transported bytes before snapshot admission/staging.

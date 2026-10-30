@@ -171,6 +171,7 @@ describe('runner base materialization refuses before install',()=>{
     await expect(fs.stat(join(f.server,'npm.log'))).rejects.toMatchObject({code:'ENOENT'});
     expect(await f.runner.finish(f.request)).toMatchObject({phase:'rejected',started:false,delta:true});
   });
+  // These cases run real Git, file copies and the install supervisor; allow for CI contention.
   it.each(['delta','old runner','manifest unavailable','oversized manifest','late delta failure'])('remote transport uses %s and preserves the exact full manifest',async mode=>{
     const f=await setup(),requests=[],copies=[];
     const transport=async call=>{
@@ -199,7 +200,7 @@ describe('runner base materialization refuses before install',()=>{
       expect(copies[0]).toEqual(Buffer.from('./a.test.mjs\0'));
       expect(requests[0]).toMatchObject({baseSha:f.base.sha,deletions:Buffer.from('deleted.txt\0').toString('base64')});
     }else expect(requests[0].baseSha).toBeUndefined();
-  });
+  },30_000);
   it.each(['corrupt base','missing base','unbound rejection','started rejection','missing finish','second rejection','lost run response','started run response'])('retries only a proven pre-start delta rejection once: %s',async fault=>{
     const f=await setup(),requests=[],prepares=[],finishes=[],copies=[];
     const transport=async call=>{
@@ -254,7 +255,7 @@ describe('runner base materialization refuses before install',()=>{
       if(fault!=='second rejection')expect(stages.lastIndexOf('forge-install')).toBeGreaterThan(stages.lastIndexOf('rsync'));
     }
     expect(result.mode).toBe(fault==='second rejection'?'not-started':retry?'remote':'unconfirmed');
-  });
+  },30_000); // A proven pre-start rejection performs a second complete transport/run/finish cycle.
 
   it('warmer reuses registry-only install inputs across nondependency main changes, while retaining full profile keys',async()=>{
     const f=await setup();
