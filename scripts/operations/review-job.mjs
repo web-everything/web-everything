@@ -956,9 +956,10 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     // tick can retry after cooldown, retaining any pre-admission evidence.
     const guardDeferred = out.redTeam?.deferredByGuard === true
       || (seatsBox.input.redTeamMode !== undefined && out.redTeam?.status === 'disabled');
+    const admissionDeferred = guardDeferred
+      || (out.redTeam?.status === 'skipped' && out.redTeam.deferredByCap === true);
     const prior = seatsBox.input?.redTeamAdmission?.prior;
-    if ((guardDeferred || (out.redTeam?.status === 'skipped' && out.redTeam.deferredByCap === true))
-      && seatsBox.priorRedTeamResult == null && prior == null) {
+    if (admissionDeferred && seatsBox.priorRedTeamResult == null && prior == null) {
       try {
         io.clearRedTeamQueued({ repo: out.repo, pr: out.pr,
           head: seatsBox.input.loopPayload.findings.read.netBasis.rev });
@@ -966,8 +967,9 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
         io.log(`review-job ${out.sessionSlug}: red-team deferral status cleanup failed (${tail(e?.message ?? e, 300)})`);
       }
     } else {
+      // A pre-model deferral restores failed evidence too, so a refunded retry stays eligible.
       // An unsuccessful effects retry must keep the durable clean pass eligible for recovery.
-      const result = guardDeferred && prior ? prior.result
+      const result = admissionDeferred && prior ? prior.result
         : seatsBox.priorRedTeamResult != null && !['ran', 'resumed', 'failed'].includes(out.redTeam?.status)
           ? seatsBox.priorRedTeamResult : out.redTeam?.status === 'skipped'
             ? { status: 'skipped', ...(out.redTeam.policy === 'card-only' ? { policy: 'card-only' } : {}) }
@@ -976,8 +978,8 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       // admission's retry spend so the failed seat stays eligible once the cap, switch or transient read
       // clears. Deterministic skips (policy, no provider, no diff, result on head) keep the spend.
       const refundRetry = seatsBox.input?.redTeamAdmission?.retrySpent === true
-        && (guardDeferred || (out.redTeam?.status === 'skipped' && out.redTeam.deferredByCap === true));
-      io.redTeamStatus?.({ ...seatsBox.input, status: guardDeferred && prior ? prior.status : 'finished', result,
+        && admissionDeferred;
+      io.redTeamStatus?.({ ...seatsBox.input, status: admissionDeferred && prior ? prior.status : 'finished', result,
         ...(refundRetry ? { refundRetry: true } : {}) });
     }
   }
