@@ -8,7 +8,7 @@ import {createHash, randomBytes} from 'node:crypto';
 import {join, relative} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {cpus, loadavg, freemem, totalmem} from 'node:os';
-import {baseGuard, readyBases, readBase, copyLeaves, baseFile, materializeWorktree} from './forge-exec-bases.mjs';
+import {BASE_RETENTION, claimPrewarm, baseGuard, readyBases, readBase, copyLeaves, baseFile, materializeWorktree} from './forge-exec-bases.mjs';
 import {decodeManifest} from './forge-exec-manifest.mjs';
 const LIMIT = 4 * 1024 * 1024;
 const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
@@ -90,7 +90,7 @@ export function parseTelemetry(text) {
   if (!exactKeys(v,'activeRuns,cores,loadPerCore,memFreePct,recent,sampledAtET') || !validET(v.sampledAtET)
     || !Number.isSafeInteger(v.cores) || v.cores<1 || !Number.isFinite(v.loadPerCore) || v.loadPerCore<0
     || !Number.isFinite(v.memFreePct) || v.memFreePct<0 || v.memFreePct>100 || !duration(v.activeRuns)
-    || !Array.isArray(v.recent) || v.recent.length>50 || v.recent.some(r=>!exactKeys(r,'code,runId,stageMs,startedAtET')
+    || !Array.isArray(v.recent) || v.recent.length>50 || v.recent.some(r=>!(exactKeys(r,'code,runId,stageMs,startedAtET')||(exactKeys(r,'code,prewarmed,runId,stageMs,startedAtET')&&typeof r.prewarmed==='boolean'))
       || !runName(r.runId) || !validET(r.startedAtET) || !exactKeys(r.stageMs,'install,run')
       || !duration(r.stageMs.install) || !duration(r.stageMs.run) || !(r.code===null || (duration(r.code)&&r.code<=255))))
     throw new Error('Invalid telemetry schema');
@@ -698,7 +698,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
       return publishTelemetry();
     },
     async bases() {
-      try{return {delta:1,bases:(await readyBases(bases)).slice(0,4).map(({sha,manifestDigest})=>({sha,manifestDigest}))};}
+      try{return {delta:1,bases:(await readyBases(bases)).slice(0,BASE_RETENTION).map(({sha,manifestDigest})=>({sha,manifestDigest}))};}
       catch{return {delta:1,bases:[]};}
     },
     async ['base-manifest']({sha}) {
@@ -782,6 +782,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
       const worker=selected??{user:'forge-exec',root:runs};
       const container=join(worker.root,request.run),work=join(container,'work');
       await directory(container,true,operator); await directory(work);
+      let prewarmed=false;
       if(request.baseSha!==undefined) {
         await baseGuard(bases,async()=>{
           const base=await readBase(bases,request.baseSha,request.baseManifestDigest);
@@ -800,8 +801,27 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
           const walk=async prefix=>{for(const name of await readdir(prefix.length?bytePath(work,prefix):work,{encoding:'buffer'})){const p=prefix.length?Buffer.concat([prefix,Buffer.from('/'),name]):name;pathParts(p);const st=await lstat(bytePath(work,p));if(st.isSymbolicLink())throw new Error('Delta symlink');if(st.isDirectory())await walk(p);else {if(!st.isFile())throw new Error('Delta special file');const entry=finalEntries.find(e=>e.path.equals(p));if(!entry)throw new Error('Unlisted delta leaf');incoming.push(entry);}}};
           await walk(Buffer.alloc(0));
           const overlay=new Set(incoming.map(e=>e.path.toString('hex'))),assembled=join(container,'assembled');
-          await mkdir(assembled,{mode:0o755});
-          await copyLeaves(base.tree,assembled,baseEntries.filter(e=>!deleted.has(e.path.toString('hex'))&&!overlay.has(e.path.toString('hex'))));
+          const slot=/^forge-exec-([1-9]\d*)$/.exec(worker.user)?.[1];
+          prewarmed=await claimPrewarm(bases,request.baseSha,slot,assembled,base.manifest,request.baseManifestDigest,verifyManifest,filesystem,operator.uid);
+          if(prewarmed) {
+            // The claimed tree has just passed full verification under the
+            // guard. Check every component again before unlinking a leaf.
+            for(const entry of baseEntries.filter(e=>deleted.has(e.path.toString('hex'))||overlay.has(e.path.toString('hex')))) {
+              let target=Buffer.from(assembled);
+              const parts=pathParts(entry.path);
+              for(const [i,part] of parts.entries()) {
+                target=bytePath(target,part);const st=await lstat(target);
+                if(st.isSymbolicLink()||(i===parts.length-1?!st.isFile():!st.isDirectory()))throw new Error('Unsafe prewarm overlay');
+              }
+              await rm(target);
+            }
+            // Remove empty parents left by deletions before overlay/verification.
+            const empty=async dir=>{for(const name of await readdir(dir,{encoding:'buffer'})){const child=bytePath(dir,name);if((await lstat(child)).isDirectory())await empty(child);}if(Buffer.from(dir).compare(Buffer.from(assembled))!==0&&(await readdir(dir)).length===0)await rmdir(dir);};
+            await empty(assembled);
+          } else {
+            await mkdir(assembled,{mode:0o755});
+            await copyLeaves(base.tree,assembled,baseEntries.filter(e=>!deleted.has(e.path.toString('hex'))&&!overlay.has(e.path.toString('hex'))));
+          }
           await copyLeaves(work,assembled,incoming);
           // Verify primary full M before installing and before exposing any of
           // the reconstructed bytes to the worker. Siblings remain Mac-shipped.
@@ -838,7 +858,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
       let telemetryError;
       let updates=Promise.resolve();
       const update=()=>{
-        const record={runId:request.run,startedAtET,stageMs:{install:runAt===undefined?Math.max(0,Math.round(clock()-installAt)):installMs,
+        const record={runId:request.run,startedAtET,prewarmed,stageMs:{install:runAt===undefined?Math.max(0,Math.round(clock()-installAt)):installMs,
           run:runAt===undefined?0:Math.max(0,Math.round(clock()-runAt))},code:null};
         updates=updates.then(()=>publishTelemetry(record)).catch(error=>{telemetryError=error;});
         return updates;
@@ -861,7 +881,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
       const {slot:reservedSlot,...receiptState}=prepared;
       const receipt={...receiptState,timings:{installMs,runMs},...(request.manifest.siblings ? {siblingShas:siblingShas(request.manifest)} : {}),manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code};
       await writeFile(statePath(request.run,'receipt'),JSON.stringify(receipt),{flag:'wx',mode:0o600});
-      await publishTelemetry({runId:request.run,startedAtET,stageMs:{install:installMs,run:runMs},code:result.code});
+      await publishTelemetry({runId:request.run,startedAtET,prewarmed,stageMs:{install:installMs,run:runMs},code:result.code});
       if(telemetryError)throw telemetryError;
       return result;
       },prepared);
