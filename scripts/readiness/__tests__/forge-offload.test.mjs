@@ -5,10 +5,9 @@ import {spawnSync} from 'node:child_process';
 import {dirname,join} from 'node:path';
 import {createHash} from 'node:crypto';
 import * as remote from '../remote-exec.mjs';
-import {BASE_RETENTION,baseGuard,claimPrewarm,copyLeaves} from '../forge-exec-bases.mjs';
+import {BASE_RETENTION,baseGuard,claimPrewarm,copyLeaves,createBasePin,pruneBases} from '../forge-exec-bases.mjs';
 import {parseGitTree} from '../forge-exec-manifest.mjs';
 import {createRunner,manifestWire,digestManifest,digestInput,digestArgv} from '../forge-exec-run.mjs';
-import {baseGuard,createBasePin,pruneBases} from '../forge-exec-bases.mjs';
 let root,repo;
 const hash=data=>createHash('sha256').update(data).digest('hex');
 const git=(args,cwd=repo)=>{const r=spawnSync('git',args,{cwd,maxBuffer:4*1024*1024});if(r.status)throw new Error(r.stderr.toString());return r.stdout;};
@@ -828,18 +827,50 @@ describe('warm-base tick',()=>{
 });
 
 describe('bounded shared base guard contention',()=>{
-  it('does not retry permission failures or execute the guarded action',async()=>{
-    const wait=vi.fn(),action=vi.fn();
-    const io={lstat:async()=>({isDirectory:()=>true,isSymbolicLink:()=>false,mode:0o700}),mkdir:async()=>{throw Object.assign(new Error('denied'),{code:'EACCES'});}};
-    await expect(baseGuard(root,action,io,wait)).rejects.toMatchObject({code:'EACCES'});
-    expect(wait).not.toHaveBeenCalled();expect(action).not.toHaveBeenCalled();
+  it.each([
+    ['pending','EACCES'],['pending','EPERM'],['guard','EACCES'],['guard','EPERM'],
+  ])('does not retry a %s mkdir %s failure or execute the guarded action',async(stage,code)=>{
+    const target=join(root,'guard-test'),guard=join(target,'.guard');
+    await fs.mkdir(target,{mode:0o700});
+    const sleep=vi.fn(),action=vi.fn(),denied=vi.fn();
+    const io={...fs,mkdir:async(path,options)=>{
+      if(stage==='pending'?path.startsWith(join(target,'.guard-pending-')):path===guard) {
+        denied();throw Object.assign(new Error('denied'),{code});
+      }
+      return fs.mkdir(path,options);
+    }};
+    await expect(baseGuard(target,action,io,{sleep})).rejects.toMatchObject({code});
+    expect(denied).toHaveBeenCalledOnce();expect(sleep).not.toHaveBeenCalled();expect(action).not.toHaveBeenCalled();
+    expect(await fs.readdir(target)).toEqual([]);
   });
-  it.each([0,3,6])('retries EEXIST up to five waits then throws (failures=%s)',async failures=>{
-    let tries=0;const wait=vi.fn(async()=>{}),action=vi.fn(async()=>42),rmdir=vi.fn(async()=>{});
-    const io={lstat:async()=>({isDirectory:()=>true,isSymbolicLink:()=>false,mode:0o700}),mkdir:async()=>{if(tries++<failures)throw Object.assign(new Error('busy'),{code:'EEXIST'});},rmdir};
-    const result=baseGuard(root,action,io,wait);
-    if(failures===6){await expect(result).rejects.toMatchObject({code:'EEXIST'});expect(action).not.toHaveBeenCalled();expect(rmdir).not.toHaveBeenCalled();}
-    else {expect(await result).toBe(42);expect(rmdir).toHaveBeenCalledOnce();}
-    expect(tries).toBe(Math.min(failures+1,6));expect(wait).toHaveBeenCalledTimes(Math.min(failures,5));
+  it.each([0,3,6])('retries EEXIST within the deadline with at most five waits (failures=%s)',async failures=>{
+    const target=join(root,'guard-test'),guard=join(target,'.guard'),owner='owner-'+'a'.repeat(32);
+    await fs.mkdir(target,{mode:0o700});
+    const holder=JSON.stringify({pid:process.pid,timestamp:0});
+    if(failures){await fs.mkdir(guard,{mode:0o700});await fs.writeFile(join(guard,owner),holder);}
+    let now=0,tries=0;
+    const sleep=vi.fn(async ms=>{
+      now+=ms;
+      if(sleep.mock.calls.length===failures){await fs.unlink(join(guard,owner));await fs.rmdir(guard);}
+    }),action=vi.fn(async()=>42);
+    const io={...fs,mkdir:async(path,options)=>{
+      if(path===guard)tries++;
+      return fs.mkdir(path,options);
+    },unlink:vi.fn(fs.unlink),rmdir:vi.fn(fs.rmdir),rm:vi.fn(fs.rm)};
+    const result=baseGuard(target,action,io,{clock:()=>now,sleep,waitMs:125,retryMs:25});
+    if(failures===6){
+      await expect(result).rejects.toThrow('Base guard wait exceeded; use local fallback and inspect the guard owner');
+      expect(action).not.toHaveBeenCalled();expect(io.unlink).not.toHaveBeenCalled();expect(io.rmdir).not.toHaveBeenCalled();
+      expect(await fs.readFile(join(guard,owner),'utf8')).toBe(holder);
+      expect(await fs.readdir(target)).toEqual(['.guard']);
+    } else {
+      expect(await result).toBe(42);expect(action).toHaveBeenCalledOnce();expect(io.unlink).toHaveBeenCalledOnce();expect(io.rmdir).toHaveBeenCalledOnce();
+      expect(await fs.readdir(target)).toEqual([]);
+    }
+    expect(tries).toBe(Math.min(failures+1,6));
+    expect(sleep.mock.calls).toEqual(Array.from({length:Math.min(failures,5)},()=>[25]));
+    expect(now).toBe(Math.min(failures,5)*25);
+    expect(io.rm).toHaveBeenCalledOnce();
+    expect(io.rm).toHaveBeenCalledWith(expect.stringMatching(/\/\.guard-pending-[a-f0-9]{32}$/),{recursive:true,force:true});
   });
 });
