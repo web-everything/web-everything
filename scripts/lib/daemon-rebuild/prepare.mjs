@@ -208,8 +208,9 @@ export async function prepareRebuild({
     if (alreadyAtLastGood) {
       try {
         const status = git(['status', '--porcelain', '--untracked-files=no']);
-        rollback = status.status !== 0 ? { ok: false, reason: 'status-failed' }
-          : String(status.stdout ?? '').trim() ? { ok: false, reason: 'dirty' } : { ok: true };
+        rollback = status.status !== 0 || status.error || status.signal || typeof status.stdout !== 'string'
+          ? { ok: false, reason: 'status-failed' }
+          : status.stdout.trim() ? { ok: false, reason: 'dirty' } : { ok: true };
       } catch { rollback = { ok: false, reason: 'status-failed' }; }
     } else {
       rollback = rollbackQuick(quarantine.prevHead, quarantine.failedHead);

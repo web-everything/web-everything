@@ -434,7 +434,7 @@ describe('post-adopt soak', () => {
       const state = recovery === 'pending-soak'
         ? { unverified: marker, adopted: { head: marker.sha, unverified: true } }
         : recovery === 'persisted-quarantine'
-          ? { quarantine: { prevHead: f.prevHead, reason: 'quick-soak-rollback-failed' } }
+          ? { quarantine: { prevHead: f.prevHead, failedHead: marker.sha, reason: 'quick-soak-rollback-failed' } }
           : { adopted: marker.lastGood, inProgress: { quick: true, verified: false,
             target: marker.sha, prevHead: f.prevHead, host: 'foreign-fixture', startedAt: new Date(0).toISOString() } };
       writeRebuildState(f.root, state, f.env);
@@ -445,6 +445,11 @@ describe('post-adopt soak', () => {
       const alerts = readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse);
       expect(alerts).toContainEqual(expect.objectContaining({ kind: 'quick-soak-needs-you',
         detail: expect.objectContaining({ lastGood: f.prevHead, rollback: expect.objectContaining({ ok: false }) }) }));
+      if (recovery === 'persisted-quarantine') {
+        expect(alerts).toContainEqual(expect.objectContaining({ kind: 'quick-soak-needs-you',
+          detail: expect.objectContaining({ rollback: { ok: false, reason: 'untracked-collision' } }) }));
+        expect(run.mock.calls.some(([args]) => args[0] === 'ls-tree')).toBe(true);
+      }
       expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
       expect(f.git(['rev-parse', 'HEAD'])).toBe(f.plan.finalSha);
       expect(readFileSync(sidecar)).toEqual(bytes);
@@ -554,6 +559,28 @@ describe('post-adopt soak', () => {
     expect(readFileSync(join(f.root, 'untracked-sidecar'), 'utf8')).toBe('keep');
     expect(run.mock.calls.filter(([args]) => args[0] === 'reset').map(([args]) => args))
       .not.toContainEqual(['reset', '--hard', f.prevHead]);
+  });
+  it.each([
+    { name: 'missing stdout', status: { status: 0 } },
+    { name: 'null stdout', status: { status: 0, stdout: null } },
+    { name: 'buffer stdout', status: { status: 0, stdout: Buffer.alloc(0) } },
+    { name: 'numeric stdout', status: { status: 0, stdout: 0 } },
+    { name: 'error with zero status', status: { status: 0, stdout: '', error: new Error('status failed') } },
+    { name: 'signal with zero status', status: { status: 0, stdout: '', signal: 'SIGTERM' } },
+  ])('keeps last-good quick quarantine with $name', async ({ status }) => {
+    const f = candidateFixture('README.md', '0');
+    writeRebuildState(f.root, { quarantine: { prevHead: f.prevHead, reason: 'quick-soak-rollback-failed' } }, f.env);
+    const run = vi.fn((args, opts) => args[0] === 'status' ? status : f.run(args, opts));
+    const result = await prepareRebuild({ ...f, run, log: { error: vi.fn() }, stateOpts: {}, now: Date.now });
+    expect(result.result.reason).toBe('quarantined');
+    expect(run).toHaveBeenCalledWith(['status', '--porcelain', '--untracked-files=no'], expect.anything());
+    expect(readRebuildState(f.root, f.env).quarantine).toMatchObject({ prevHead: f.prevHead });
+    expect(f.git(['rev-parse', 'HEAD'])).toBe(f.prevHead);
+    expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+    expect(result.alerts.some(row => row.kind === 'quick-soak-quarantine-cleared')).toBe(false);
+    const alerts = readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(alerts).toContainEqual(expect.objectContaining({ kind: 'quick-soak-needs-you',
+      detail: expect.objectContaining({ rollback: { ok: false, reason: 'status-failed' } }) }));
   });
   it.each(['dirty', 'unreadable'])('keeps last-good quick quarantine when tracked status is %s', async status => {
     const f = candidateFixture('README.md', '0');
@@ -850,7 +877,16 @@ describe('post-adopt soak', () => {
     const f = soakFixture();
     f.state.unverified = { ...f.marker, pid: mode === 'missing-pid' ? undefined : 123, host: 'fixture' };
     writeRebuildState(f.root, f.state, f.env);
-    recoverQuickSoak({ ...f, now: () => mode === 'expired' ? f.marker.deadline + 1 : 2000, pidAlive: () => mode !== 'dead' });
+    const nowMs = mode === 'expired' ? f.marker.deadline + 1 : Date.parse(f.marker.adoptedAt) + 1000;
+    // A valid live PID stays pending at this time; dead/missing PID is the only refusal for those cases.
+    if (mode !== 'expired') {
+      expect(recoverQuickSoak({ ...f, state: { ...f.state, unverified: { ...f.marker, pid: 123 } },
+        now: () => nowMs, pidAlive: () => true }).pending).toBe(true);
+    }
+    const pidAlive = vi.fn(() => mode !== 'dead');
+    expect(recoverQuickSoak({ ...f, now: () => nowMs, pidAlive }).pending).toBe(false);
+    if (mode === 'missing-pid') expect(pidAlive).not.toHaveBeenCalled();
+    else expect(pidAlive).toHaveBeenCalledOnce();
     expect(readRebuildState(f.root, f.env).unverified).toBeNull();
     expect(f.alerts().at(-1).kind).toBe('quick-soak-unavailable');
   });
