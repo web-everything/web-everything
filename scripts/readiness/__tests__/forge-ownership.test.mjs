@@ -23,15 +23,18 @@ it('keeps privileged Git in protected metadata when the worker substitutes a rea
 
 it.skipIf(process.platform!=='linux')('a surviving actual worker UID cannot substitute protected Git metadata or execute an fsmonitor payload as root',()=>{
   const driver=`import {exerciseGitMetadataAttack} from ${JSON.stringify(new URL('./fixtures/forge-git-metadata-attack.mjs',import.meta.url).href)};
-await exerciseGitMetadataAttack(${JSON.stringify(root)},{workerUid:65533});
+await exerciseGitMetadataAttack(process.env.TMPDIR,{workerUid:65533});
 console.log('distinct-uid-git-metadata-safe');`;
-  const python="import os,sys; os.execve(sys.argv[1],[sys.argv[1],'--input-type=module','-e',sys.argv[2]],{'PATH':os.environ['PATH'],'TMPDIR':sys.argv[3]})";
-  const result=spawnSync('/usr/bin/sudo',['-n','/usr/bin/python3','-I','-c',python,process.execPath,driver,process.env.TMPDIR],{encoding:'utf8',timeout:30000,maxBuffer:1024*1024});
-  try{expect(result.status,result.stderr).toBe(0);expect(result.stdout).toContain('distinct-uid-git-metadata-safe');}
-  finally{
-    const clean=spawnSync('/usr/bin/sudo',['-n','/usr/bin/python3','-I','-c','import shutil,sys; shutil.rmtree(sys.argv[1])',root],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
-    expect(clean.status,clean.stderr).toBe(0);
-  }
+  // Absolute worker paths must not cross Vitest's private 0700 run root. Use
+  // Linux's shared temp parent without changing any shared ancestor's mode.
+  // Python retains privilege and removes root/worker-owned files on failure too.
+  const python=`import os,subprocess,sys,tempfile
+with tempfile.TemporaryDirectory(prefix='forge-ownership-',dir='/tmp') as fixture:
+ result=subprocess.run([sys.argv[1],'--input-type=module','-e',sys.argv[2]],env={'PATH':os.environ['PATH'],'TMPDIR':fixture},timeout=25)
+ sys.exit(result.returncode)
+`;
+  const result=spawnSync('/usr/bin/sudo',['-n','/usr/bin/python3','-I','-c',python,process.execPath,driver],{encoding:'utf8',timeout:30000,maxBuffer:1024*1024});
+  expect(result.status,result.stderr).toBe(0);expect(result.stdout).toContain('distinct-uid-git-metadata-safe');
 },40000);
 
 it.each(['work','container'])('prepare refuses a replaced %s endpoint without touching the symlink target',async target=>{

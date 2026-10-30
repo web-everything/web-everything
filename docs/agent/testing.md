@@ -2970,7 +2970,14 @@ as hooks. The ownership tests substitute a real executable fsmonitor repository
 at `update-index` and include a positive payload control. A required Linux test
 uses root and an actual worker UID, proving that UID cannot reach the protected
 metadata and its substituted config never executes as root; macOS skips this
-cross-UID proof explicitly. Exercise Git's ownership checks with
+cross-UID proof explicitly. Cross-UID fixtures that use absolute worker paths
+must have traversable ancestors: changing only the fixture root's mode does not
+grant traversal through Vitest's private 0700 run root. Allocate those Linux
+fixtures under the system shared temporary directory with a privileged
+`TemporaryDirectory` supervisor that cleans up on success, failure and child
+timeout; keep shared ancestor permissions unchanged. The executable fsmonitor
+positive control must still run as the actual worker UID before the attack.
+Exercise Git's ownership checks with
 `GIT_TEST_ASSUME_DIFFERENT_OWNER` and a mirror with only `origin/main`
 (an unborn bare `HEAD` is normal for the warmer). Active base pins must remain
 ops-owned and readable by the ops warmer even when the pool wrapper creates them
