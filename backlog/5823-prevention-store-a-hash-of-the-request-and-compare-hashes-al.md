@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/operations/cli-adapter.mjs", "we:scripts/operations/__tests__/cli-adapter-prefilled-seats.test.mjs", "we:scripts/operations/__tests__/parallel-judges.test.mjs", "we:scripts/operations/parallel-judges.mjs", "we:scripts/lib/judge-spawn.mjs", "we:scripts/lib/__tests__/judge-spawn.test.mjs", "we:scripts/operations/run-record.mjs", "we:scripts/operations/__tests__/run-record.test.mjs", "we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules-stderr-redaction.test.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards.test.mjs"]
 dateOpened: "2026-10-10"
-preparedDate: "2026-10-26"
-preparedAgainstSha: "6c38aee9a15e41b3afea9ed63cf375e4d3529463"
+preparedDate: "2026-10-29"
+preparedAgainstSha: "104a9707615752e0937fae44bad99cc578421ac5"
 tags: []
 ---
 
@@ -129,3 +129,5 @@ No stdout authentication, arbitrary secret detection, stdout/result-text sanitat
 - Preparation only: refreshed all five required sections and executable Acceptance. Source inspection establishes the premises; expected pre-build failures remain hypotheses for delivery's RED run. No tests or live providers were run. All frontmatter, including existing preparation stamps, remains unchanged. The runner owns checks and stamping; no claim, resolution, commit, push or PR was performed.
 
 revalidated: Supplied changes affect duplicate-key decoding, leash pins, and timing-manifest validation; they do not alter the preparation’s targeted behavior, design, scope, or proof plan.
+
+revalidated: The supplied timing-key validation change does not alter the preparation’s premises, targeted sinks, implementation scope, or test and proof plan.
