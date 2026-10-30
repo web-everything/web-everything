@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync, renameSync, symlinkSync, utimesSync, cpSync, realpathSync, chmodSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync, renameSync, symlinkSync, utimesSync, cpSync, realpathSync, chmodSync, readdirSync, readlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join, relative } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -421,7 +421,20 @@ describe('real git: cleanup CLI', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 60_000);
 
-  const snapshot = (dir) => ({ config: readFileSync(join(dir, '.git', 'config'), 'utf8'), refs: refs(dir), objects: git(dir, 'count-objects', '-v') });
+  // Snapshot bytes without invoking Git: an unsupported repository extension must still prove zero mutations.
+  const snapshot = (dir) => {
+    const files = {};
+    const visit = (path) => {
+      for (const entry of readdirSync(join(dir, '.git', path), { withFileTypes: true })) {
+        const rel = join(path, entry.name), file = join(dir, '.git', rel);
+        if (entry.isSymbolicLink()) files[rel] = { link: readlinkSync(file) };
+        else if (entry.isDirectory()) { files[rel] = { directory: true }; visit(rel); }
+        else files[rel] = readFileSync(file);
+      }
+    };
+    visit('');
+    return files;
+  };
   const hasOpsRef = (dir) => existsSync(join(dir, '.git', 'refs', 'remotes', 'origin', 'ops', 'review-requests'))
     || readFileSync(join(dir, '.git', 'packed-refs'), 'utf8').includes('refs/remotes/origin/ops/review-requests');
   const hook = (dir, ran) => git(dir, 'config', 'gc.recentObjectsHook', `touch '${ran}'`);
