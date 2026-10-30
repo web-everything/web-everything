@@ -103,11 +103,13 @@ export function formatTelemetry(value,host='forge') {
   const last=v.recent.find(r=>r.code!==null);
   return `${host} ${v.sampledAtET.slice(11,16)} ET load/core ${v.loadPerCore.toFixed(2)} ram free ${Math.round(v.memFreePct)}% runs ${v.activeRuns} last-run ${last ? Math.round((last.stageMs.install+last.stageMs.run)/1000)+'s' : 'none'}`;
 }
-const ENV_KEYS = ['CI','NODE_ENV','TZ','LANG','LC_ALL','FORCE_COLOR','NO_COLOR'];
+const ENV_KEYS = ['CI','NODE_ENV','TZ','LANG','LC_ALL','FORCE_COLOR','NO_COLOR','DIFF_COVERAGE_BASE'];
 export function allowedEnv(env) {
   return env && typeof env === 'object' && !Array.isArray(env) && Object.entries(env).every(([key,value]) =>
     ENV_KEYS.includes(key) && !/secret|token|password|credential|auth|key/i.test(key)
-    && typeof value === 'string' && !value.includes('\0'));
+    && typeof value === 'string' && !value.includes('\0')
+    && (key !== 'DIFF_COVERAGE_BASE' || (/^[A-Za-z0-9_][A-Za-z0-9_./-]*$/.test(value)
+      && !/\s/.test(value) && !value.includes('..') && !value.includes('//') && !/(?:^|\/)\.|\.lock(?:\/|$)|[/.]$/.test(value))));
 }
 async function directory(path, trusted = false, operator = {uid:process.getuid(),gid:process.getgid()}) {
   const fd = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);

@@ -576,7 +576,6 @@ describe('anonymous real Git snapshot',()=>{
           expect(git(call.cwd,'rev-parse','HEAD')).toBe(head);
           expect(git(call.cwd,'rev-parse','origin/main')).toBe(main);
           expect(git(call.cwd,'diff','--cached','--name-only')).toBe(tier);
-          await fs.mkdir(join(call.cwd,'coverage'));await fs.writeFile(join(call.cwd,'coverage/coverage-final.json'),coverage);
           expect(scanMaterializedGuards(call.cwd).coverage).toEqual(local);
           return {code:1};
         }

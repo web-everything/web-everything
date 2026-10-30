@@ -7,12 +7,11 @@ import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { allowedCommand, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile, SIBLING_PATHS, siblingShas, sameSiblingShas } from './forge-exec-run.mjs';
+import { allowedCommand, allowedEnv, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile, SIBLING_PATHS, siblingShas, sameSiblingShas } from './forge-exec-run.mjs';
 
 const ROOT = '/srv/forge-exec';
 const LIMIT = 4 * 1024 * 1024;
 const SSH_OPTIONS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'];
-const ENV_KEYS = ['CI', 'NODE_ENV', 'TZ', 'LANG', 'LC_ALL', 'FORCE_COLOR', 'NO_COLOR'];
 const quote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
 const newRunId = () => `${new Date().toISOString().replace(/[^0-9tz]/gi, '').toLowerCase()}-${randomBytes(4).toString('hex')}`;
 
@@ -22,8 +21,9 @@ export function isAllowedCommand(argv) {
 }
 
 export function filterEnv(env = {}) {
-  return Object.fromEntries(ENV_KEYS.filter((key) => Object.hasOwn(env, key) && typeof env[key] === 'string'
-    && !env[key].includes('\0')).map((key) => [key, env[key]]));
+  if (Object.hasOwn(env, 'DIFF_COVERAGE_BASE') && !allowedEnv({DIFF_COVERAGE_BASE:env.DIFF_COVERAGE_BASE}))
+    throw Object.assign(new Error('Invalid DIFF_COVERAGE_BASE: use local fallback'), {code:'invalid-diff-coverage-base'});
+  return Object.fromEntries(Object.entries(env).filter(([key,value]) => allowedEnv({[key]:value})));
 }
 
 export function validateRunId(id) {
@@ -117,7 +117,8 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   // directories and ambiguous dist/build directories may still contain tests.
   const ignored = await exec({file:'git',args:['ls-files','-o','-i','--exclude-standard','-z'],cwd});
   if (ignored.code !== 0 || !Buffer.isBuffer(ignored.stdout)) throw new Error('Ignored byte inventory unavailable');
-  for (const path of splitPaths(ignored.stdout)) {
+  const ignoredPaths = splitPaths(ignored.stdout);
+  for (const path of ignoredPaths) {
     if (pathParts(path).slice(0,-1).some(part => part.equals(Buffer.from('node_modules')) || part.equals(Buffer.from('.git')))) continue;
     if (isTestFile(path)) throw Object.assign(new Error('Ignored test: use local fallback'), {code:'ignored-test-file'});
   }
@@ -131,6 +132,9 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     if (result.code !== 0 || !Buffer.isBuffer(result.stdout)) throw new Error('Byte inventory unavailable');
     files = splitPaths(result.stdout);
   }
+  // Only this ignored coverage input is transportable; it uses the same leaf
+  // safety checks and digests below as ordinary inventory entries.
+  if (!trackedOnly) files.push(...ignoredPaths.filter(path => path.equals(Buffer.from('coverage/coverage-final.json'))));
   // Index evidence still rejects unsupported gitlinks, including injected inventories.
   const stage = await exec({file:'git',args:['ls-files','--stage','-z'],cwd});
   if (stage.code !== 0 || !Buffer.isBuffer(stage.stdout) || stage.stdout.length > LIMIT
@@ -389,6 +393,8 @@ export async function runRemote(options={}) {
 async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false } = {}) {
   const fallback = (reason) => ({ mode: 'fallback', reason });
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
+  let executionEnv;
+  try { executionEnv = filterEnv(env); } catch (error) { return fallback(error.code); }
   const needsGit=argv[2]==='check:standards';
   if (!validateRunId(runId) || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host)) return fallback('invalid-parameters');
   try {
@@ -432,6 +438,8 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
         if(response.code!==0)throw new Error('Base manifest unavailable');
         const wire=JSON.parse(protocolText(response.stdout,LIMIT));
         delta=await buildDeltaManifest({cwd,exec,fs,base:{...base,manifest:wire},head:logicalHead});
+        // Warm-leaf assembly recreates mtimes; coverage freshness needs full ship.
+        if (delta.entries.some(entry => entry.path.equals(Buffer.from('coverage/coverage-final.json')))) throw new Error('Coverage inputs require full ship');
         manifest=delta;
       } catch {delta=undefined;}
       manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead});
@@ -477,6 +485,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
               const mode = entry.executable ? 0o755 : 0o644;
               await fs.writeFile(destination, await fd.readFile(), {flag:'wx', mode});
               await fs.chmod(destination, mode);
+              await fs.utimes(destination, st.atime, st.mtime);
               const staged = await fs.lstat(destination);
               if (!staged.isFile() || staged.isSymbolicLink() || (staged.mode & 0o7777) !== mode)
                 throw new Error('Invalid staging file mode');
@@ -572,7 +581,7 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       const runAt=clock(),runDone=begin('forge-run');
       let result;
       try {
-        result = await ssh('run',{...expected,manifest:expectedManifest,argv,env:filterEnv(env),...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest,deletions:nulPaths(delta.deletions).toString('base64')}: {})},true);
+        result = await ssh('run',{...expected,manifest:expectedManifest,argv,env:executionEnv,...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest,deletions:nulPaths(delta.deletions).toString('base64')}: {})},true);
       } catch { /* Only a protected finish response can resolve lost run output. */ }
       finally {runDone();}
       const receipt = await finish();

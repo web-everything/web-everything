@@ -3165,3 +3165,11 @@ private inode owned by the operator. Test first-use creation and migration of
 existing root-owned guards, retaining mode 0600 and inode identity. The worker-pool
 suite models ownership transfer on unprivileged hosts and includes a Linux/root
 integration case that runs prune as root then reserves every slot as the operator.
+
+### Remote diff coverage inputs
+
+Remote coverage fixtures must create the ignored `coverage/coverage-final.json` locally,
+then assert its manifest digest and snapshot bytes. Preserve source mtimes through staging
+and full shipping so the freshness guard retains local semantics; warm delta assembly
+recreates mtimes. Compare coverage scope with an explicit `DIFF_COVERAGE_BASE`, including
+a clean HEAD whose changes exist only relative to that base. Invalid refs fall back locally.
