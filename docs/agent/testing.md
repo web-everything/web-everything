@@ -2945,6 +2945,10 @@ a missing or non-callable `runRemote` export establishes that remote work never 
 exit 124 and the operator instruction to confirm termination before retrying. Changes to this boundary must run
 `scripts/readiness/__tests__/heavy-admission-remote-client.test.mjs` and
 `scripts/readiness/__tests__/heavy-admission-remote.test.mjs` through the host heavy-run queue.
+Only the real host preferences file may select `heavyAdmission.remote.clientPath`; fixtures use
+`loadAdmissionPolicy({ home })` for this trust boundary, never an env-selected executable path.
+An env-selected preferences file keeps its other settings but strips this leaf after last-good fallback,
+logs the ignored path with bounded diagnostics, and uses a separate policy cache key from host selection.
 Keep the named regression **refuses local rerun when import starts work before throwing**: it observes
 an initialization side effect before the throw and requires exit 124 without local fallback.
 Also keep **refuses local rerun when import starts work before a missing runRemote export**: it

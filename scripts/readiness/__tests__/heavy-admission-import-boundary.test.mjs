@@ -21,15 +21,24 @@ function cliFixture(source) {
   const clientPath = join(root, 'remote-exec.mjs');
   const eventPath = join(root, 'events.jsonl');
   const pool = join(root, 'pool');
-  const preferences = join(root, 'preferences.json');
+  const preferences = join(root, '.claude', 'platform-preferences.json');
   mkdirSync(pool);
+  mkdirSync(dirname(preferences));
   writeFileSync(clientPath, source);
   writeFileSync(preferences, JSON.stringify({ heavyAdmission: { remote: { enabled: true, mode: 'always', clientPath } } }));
   const env = { ...process.env, LANE_POOL_ROOT: pool, WE_PLATFORM_PREFERENCES: preferences,
     WE_DAEMON_EVENTS: eventPath, WE_HEAVY_ADMISSION: 'on', WE_HEAVY_ADMISSION_HELD: '',
     WE_HEAVY_ADMISSION_CONTAINER: '', WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES: '', CI: '' };
+  // Native CLI routing uses env-selected non-executable settings; only the home seam selects client code.
+  const runner = `
+    import { main, loadAdmissionPolicy, createRemoteExec } from ${JSON.stringify(admissionUrl.href)};
+    const policy = loadAdmissionPolicy({ home: ${JSON.stringify(root)}, env: { ...process.env, WE_PLATFORM_PREFERENCES: '' } });
+    await main(process.argv.slice(1), { remoteExec: createRemoteExec({
+      policy, lockRoot: ${JSON.stringify(join(pool, '.admission', 'heavy'))},
+    }) });
+  `;
   return { clientPath, eventPath, state: join(pool, '.admission', 'remote', 'client-override.json'),
-    run: () => spawnSync(process.execPath, [fileURLToPath(admissionUrl), 'run', '--', 'npm', 'run', 'build'], {
+    run: () => spawnSync(process.execPath, ['--input-type=module', '-e', runner, 'run', '--', 'npm', 'run', 'build'], {
       cwd: root, env, encoding: 'utf8', timeout: 5000, killSignal: 'SIGKILL', maxBuffer: 64 * 1024,
     }) };
 }

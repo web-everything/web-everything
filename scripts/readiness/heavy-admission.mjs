@@ -383,18 +383,22 @@ const PLATFORM_FILE_MAX_BYTES = 256 * 1024;
  * IO: the shared platform/tool settings, cached for ten seconds per path and environment. Never throws.
  * On the shared host pool the platform file is the ONE capacity and priority source; every caller reads the SAME file:
  * the real user's `~/.claude/platform-preferences.json`, never a path derived from the caller's `$HOME`, and
- * `WE_PLATFORM_PREFERENCES` is honoured only for a private pool (or under test). A read that fails keeps the last
+ * `WE_PLATFORM_PREFERENCES` is honoured only for a private pool (or under test), and cannot select executable
+ * remote client code. A read that fails keeps the last
  * good value and is not cached, so a torn write is retried by the next caller instead of pinning the standard.
  */
 export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot, home } = {}) {
-  let platform; let tool; let path; const errors = []; let readFailed = false;
+  let platform; let tool; let path; let envSelected = false; const errors = []; const ignored = []; let readFailed = false;
   try { repoRoot ??= fileURLToPath(new URL('../../', import.meta.url)); }
   catch (e) { errors.push(`tool: ${String(e?.message ?? e).split('\n')[0]}`); }
   checkoutRoot ??= repoRoot;
   const overrideOk = privateAdmissionPool(env, checkoutRoot) || isUnderTest(env) || isUnderTest(process.env);
-  try { path = (overrideOk && env.WE_PLATFORM_PREFERENCES) || join(home ?? realHomeDir(), '.claude', 'platform-preferences.json'); }
+  try {
+    envSelected = Boolean(overrideOk && env.WE_PLATFORM_PREFERENCES);
+    path = envSelected ? env.WE_PLATFORM_PREFERENCES : join(home ?? realHomeDir(), '.claude', 'platform-preferences.json');
+  }
   catch (e) { errors.push(`platform: ${String(e?.message ?? e).split('\n')[0]}`); }
-  const key = JSON.stringify([path, repoRoot, checkoutRoot, env.LANE_POOL_ROOT, ...Object.values(ADMISSION_ENV).map((name) => env[name])]);
+  const key = JSON.stringify([path, envSelected, repoRoot, checkoutRoot, env.LANE_POOL_ROOT, ...Object.values(ADMISSION_ENV).map((name) => env[name])]);
   const nowMs = Date.now();
   const cached = admissionPolicyCache.get(key);
   if (cached && nowMs < cached.expiresAt) return cached.policy;
@@ -410,12 +414,19 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
       if (platformLastGood.has(path)) platform = platformLastGood.get(path);
     } else platformLastGood.delete(path);
   }
+  // Strip after last-good fallback, without changing the block cached for host-file readers.
+  if (envSelected && platform?.remote?.clientPath !== undefined) {
+    const { clientPath, ...remote } = platform.remote;
+    platform = { ...platform, remote };
+    ignored.push(`platform.remote.clientPath=${clientPathForLog(clientPath)} (ignored: preferences selected via WE_PLATFORM_PREFERENCES; only the host preferences file may select executable client code)`);
+  }
   if (repoRoot) try {
     const settingsDir = join(repoRoot, 'scripts', 'settings');
     const declared = readDeclaredSettings({ dir: settingsDir, legacyPath: join(dirname(settingsDir), basename(LEGACY_SETTINGS_PATH)) });
     if (Object.hasOwn(declared.settings, 'heavyAdmission')) tool = declared.settings.heavyAdmission;
   } catch (e) { errors.push(`tool: ${String(e?.message ?? e).split('\n')[0]}`); }
   const policy = resolveAdmissionPolicy({ platform, tool, env, checkoutRoot });
+  policy.ignored.push(...ignored);
   policy.invalid.push(...errors);
   for (const [k, entry] of admissionPolicyCache) if (nowMs >= entry.expiresAt) admissionPolicyCache.delete(k);
   if (!readFailed) admissionPolicyCache.set(key, { policy, expiresAt: nowMs + 10_000 });

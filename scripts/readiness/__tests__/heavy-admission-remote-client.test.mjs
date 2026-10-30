@@ -7,7 +7,7 @@ import * as provenanceIo from 'node:fs/promises';
 import { dirname, join, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
-import { createRemoteExec, formatAdmissionPolicy, privateAdmissionPool, resolveAdmissionPolicy, resolveRemoteClient, runWithRemoteDecision, settleClientProvenance } from '../heavy-admission.mjs';
+import { createRemoteExec, formatAdmissionPolicy, loadAdmissionPolicy, privateAdmissionPool, resolveAdmissionPolicy, resolveRemoteClient, runWithRemoteDecision, settleClientProvenance } from '../heavy-admission.mjs';
 
 vi.mock('node:child_process', async (importOriginal) => ({
   ...await importOriginal(), execFile: vi.fn(),
@@ -52,6 +52,83 @@ function makeFifo(file, context) {
 }
 
 describe('remote client override', () => {
+  it.each(['private pool', 'under test'])('ignores an env-selected preferences clientPath in a %s and uses the bundled client', async (mode) => {
+    const f = fixture();
+    const prefs = join(f.root, 'preferences.json');
+    writeFileSync(prefs, JSON.stringify({ heavyAdmission: { remote: f.policy.settings.remote } }));
+    const env = { WE_PLATFORM_PREFERENCES: prefs,
+      ...(mode === 'private pool' ? { LANE_POOL_ROOT: join(f.root, 'private-pool') } : {}) };
+    expect(privateAdmissionPool(env, f.root)).toBe(mode === 'private pool');
+    const policy = loadAdmissionPolicy({ env, repoRoot: f.root });
+    expect(policy.settings.remote).toEqual({ ...f.policy.settings.remote, clientPath: null });
+    expect(policy.sources['remote.clientPath']).toBe('standard');
+    const reason = `platform.remote.clientPath=${f.clientPath} (ignored: preferences selected via WE_PLATFORM_PREFERENCES; only the host preferences file may select executable client code)`;
+    expect(policy.ignored).toContain(reason);
+    expect(formatAdmissionPolicy(policy)).toContain(reason);
+    const importClient = vi.fn(async () => ({ runRemote: async () => ({ mode: 'remote', code: 0 }) }));
+    expect(await runWithRemoteDecision({ argv: ['npm', 'run', 'build'], cwd: f.root, env, policy,
+      log: f.seams.log, remoteExec: createRemoteExec({ ...f.seams, policy, env, importClient }) }))
+      .toEqual({ handled: true, exitCode: 0 });
+    expect(importClient.mock.calls).toEqual([['./remote-exec.mjs']]);
+    expect(f.seams.readSha).not.toHaveBeenCalled();
+    expect(f.seams.appendEvent).not.toHaveBeenCalled();
+  });
+
+  it.each(['host first', 'env first'])('honors host preferences via home and separates selection modes in the cache (%s)', async (order) => {
+    const f = fixture();
+    mkdirSync(join(f.root, '.claude'));
+    const prefs = join(f.root, '.claude', 'platform-preferences.json');
+    writeFileSync(prefs, JSON.stringify({ heavyAdmission: { remote: f.policy.settings.remote } }));
+    const load = (envSelected) => loadAdmissionPolicy({ home: f.root, repoRoot: f.root,
+      env: envSelected ? { WE_PLATFORM_PREFERENCES: prefs } : {} });
+    const first = load(order === 'env first');
+    const second = load(order !== 'env first');
+    const [host, selected] = order === 'host first' ? [first, second] : [second, first];
+    expect(host.settings.remote.clientPath).toBe(f.clientPath);
+    expect(host.sources['remote.clientPath']).toBe('platform');
+    expect(host.ignored).toEqual([]);
+    expect(selected.settings.remote.clientPath).toBeNull();
+    expect(load(false)).toBe(host);
+    expect(load(true)).toBe(selected);
+    const importClient = vi.fn(async () => ({ runRemote: async () => ({ mode: 'remote', code: 0 }) }));
+    expect(await f.run({ policy: host, importClient })).toEqual({ handled: true, exitCode: 0 });
+    expect(importClient.mock.calls).toEqual([[pathToFileURL(resolveRemoteClient({ clientPath: f.clientPath }).clientPath).href]]);
+    await settleClientProvenance();
+  });
+
+  it.each(['host', 'env'])('strips env-selected last-good clientPath without mutating the cached block (primed by %s)', (mode) => {
+    const f = fixture();
+    vi.useFakeTimers();
+    mkdirSync(join(f.root, '.claude'));
+    const prefs = join(f.root, '.claude', 'platform-preferences.json');
+    writeFileSync(prefs, JSON.stringify({ heavyAdmission: { remote: f.policy.settings.remote } }));
+    const load = (envSelected) => loadAdmissionPolicy({ home: f.root, repoRoot: f.root,
+      env: envSelected ? { WE_PLATFORM_PREFERENCES: prefs } : {} });
+    load(mode === 'env');
+    vi.setSystemTime(Date.now() + 11_000);
+    writeFileSync(prefs, '{"heavyAdmission":');
+    const selected = load(true);
+    expect(selected.settings.remote).toEqual({ ...f.policy.settings.remote, clientPath: null });
+    expect(selected.ignored).toContainEqual(expect.stringContaining('ignored: preferences selected via WE_PLATFORM_PREFERENCES'));
+    expect(selected.invalid).toContainEqual(expect.stringContaining('platform:'));
+    const host = load(false);
+    expect(host.settings.remote.clientPath).toBe(f.clientPath);
+    expect(host.sources['remote.clientPath']).toBe('platform');
+    expect(host.ignored).toEqual([]);
+  });
+
+  it('bounds and sanitizes an ignored env-selected preferences clientPath', () => {
+    const f = fixture();
+    const prefs = join(f.root, 'preferences.json');
+    writeFileSync(prefs, JSON.stringify({ heavyAdmission: { remote: { clientPath: '\n\x1b' + 'x'.repeat(4096) } } }));
+    const policy = loadAdmissionPolicy({ env: { WE_PLATFORM_PREFERENCES: prefs }, repoRoot: f.root });
+    expect(policy.settings.remote.clientPath).toBeNull();
+    expect(policy.ignored).toEqual([
+      `platform.remote.clientPath=${'??' + 'x'.repeat(1022)} (ignored: preferences selected via WE_PLATFORM_PREFERENCES; only the host preferences file may select executable client code)`,
+    ]);
+    expect(formatAdmissionPolicy(policy)).toMatch(/^[\x20-\x7e\u00b7]+$/);
+  });
+
   it('drains every pending provenance task, clears the timer, and removes settled tasks including failures', async () => {
     vi.useFakeTimers();
     const releases = [];
