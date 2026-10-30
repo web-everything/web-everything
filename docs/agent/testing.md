@@ -1,5 +1,17 @@
 # Testing — Three-Tier Strategy
 
+## CI-heal check evidence (R216)
+
+Rank attempts with `scripts/lib/check-state-predicate.mjs#latestAttempts`: completion time
+(invalid or pre-2000/epoch values count as absent), else valid start time, else valid creation time
+(`created_at`/`createdAt`), then BigInt-exact check-run id; an unfinished row
+(queued/in_progress/pending, including waiting/requested) with no valid timestamp after these
+fallbacks ranks newest (effective time `+Infinity`), conservatively keeping the check pending; completed rows with missing/invalid
+timestamps still rank lowest. Workflow run ids and attempt counters never rank evidence. Verdict readers retain
+CheckRun → untagged → StatusContext precedence before ranking within the chosen tier.
+The escalation CLI reuses `excusePrMergeGateHolds` for head-bound hold evidence, with
+`prChecksOptions` supplying hermetic readers. A failed PR or roster read permits recording with a warning; an unreadable merge-gate verdict or freeze read still permits `needs-human` with a warning, but keeps the red-check refusal for `not-a-ci-break`.
+
 ## Direction-aware operation evidence (R131)
 
 In-process review callers import the pure shape derivation from `scripts/lib/review-shape.mjs`.

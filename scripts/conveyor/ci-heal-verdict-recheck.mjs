@@ -14,8 +14,8 @@
  *   - {@link unsettledRequiredChecks}: the escalation CLI refuses to record `not-a-ci-break` while a required check is
  *     still pending, missing, or red — the verdict can only be true once they have all finished green.
  *
- * Reuses the repo's own readers: `collapseRollupToLatestPerName` (latest run per check name), the shared
- * `FAILING_CONCLUSIONS` table, and `withoutImpliedRequiredChecks` (a required `integration` implied by `test`).
+ * Reuses the repo's own readers: `latestAttempts` (latest run per check name), the shared
+ * check-state predicate, and `withoutImpliedRequiredChecks` (a required `integration` implied by `test`).
  * Declared setting `ci-heal-verdict-settings.json` (env `WE_CI_HEAL_RECHECK_NOT_CI_BREAK` beats the file);
  * missing, malformed or `off` = the behaviour before this card. PURE apart from the settings file read.
  */
@@ -24,9 +24,10 @@ import { resolveHumanGateRemovalSetting } from '../lib/merge-gate-hold-class.mjs
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
+import { rollupRowKind } from '../lib/rollup-collapse.mjs';
 import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.mjs';
-import { FAILING_CONCLUSIONS } from '../operations/pr-status.mjs';
+import { latestAttempts, summarize } from '../lib/check-state-predicate.mjs';
+import { CODEQL_CHECK_NAME, failedCodeQLCheck, loadDrainGateSettings } from '../lib/codeql-gate.mjs';
 
 export const CI_HEAL_VERDICT_ENV = 'WE_CI_HEAL_RECHECK_NOT_CI_BREAK';
 export const ciHealVerdictSettingsPath = () => join(dirname(fileURLToPath(import.meta.url)), 'ci-heal-verdict-settings.json');
@@ -79,35 +80,79 @@ export function ciGreenForEscalation({ rollup, requiredChecks }) {
   return !red.length && !pending.length && !missing.length;
 }
 
-const sameSha = (a, b) => {
+export const sameSha = (a, b) => {
   const x = String(a ?? '').trim().toLowerCase();
   const y = String(b ?? '').trim().toLowerCase();
   return x.length >= 7 && y.length >= 7 && (x.startsWith(y) || y.startsWith(x));
 };
 
+const gateNames = [REVIEW_GATE_CHECK, 'merge-gate'];
+const lowerName = name => String(name ?? '').toLowerCase();
+/** Adapt GraphQL rollups and legacy statuses without replacing the shared state policy. */
+function checkEvidence(rollup, requiredChecks) {
+  const rows = Array.isArray(rollup) ? rollup : [];
+  const groups = new Map();
+  for (const row of rows) {
+    const name = lowerName(row?.name ?? row?.context);
+    if (!groups.has(name)) groups.set(name, []);
+    groups.get(name).push({ ...row, name, __typename: rollupRowKind(row) });
+  }
+  const checks = [...groups.values()].flatMap(group => {
+    // Preserve CheckRun > untagged > legacy-status precedence, then use the
+    // same effective-time ranking for every name within its preferred tier.
+    const pool = ['CheckRun', 'untagged', 'StatusContext']
+      .map(kind => group.filter(row => row.__typename === kind)).find(tier => tier.length);
+    return latestAttempts(pool.map(row => {
+      // Normalise legacy StatusContext state BEFORE ranking, so an undated PENDING status ranks as pending.
+      const check = { ...row };
+      if (row?.status == null && row?.state != null) {
+        if (['pending', 'expected'].includes(lowerName(row.state))) check.status = 'pending';
+        else check.conclusion = row.state;
+      }
+      return check;
+    }));
+  });
+  // Only the shared merge-gate hold classifier's annotation proves a review hold.
+  // A job/setup failure (or unreadable verdict) must remain ordinary CI evidence.
+  const holdGateNames = [REVIEW_GATE_CHECK];
+  if (checks.some(row => row.name === 'merge-gate' && row.mergeGateReviewHold)) holdGateNames.push('merge-gate');
+  const roster = withoutImpliedRequiredChecks(Array.isArray(requiredChecks) ? requiredChecks : [], checks)
+    .filter(name => !holdGateNames.includes(lowerName(name)));
+  return { checks, roster, holdGateNames };
+}
+
 /**
- * The required checks (minus `review-gate`) on this head, split by their LATEST run. PURE.
+ * The required checks (minus review-gate and proven merge-gate review holds), split by their LATEST run. PURE.
  * An empty/unknown required set returns nothing at all: with no list to judge against, nothing is claimed.
  * @returns {{red: string[], pending: string[], missing: string[], green: string[]}}
  */
 export function requiredCheckStates({ rollup, requiredChecks }) {
   const out = { red: [], pending: [], missing: [], green: [] };
-  const latest = collapseRollupToLatestPerName(rollup);
-  const required = withoutImpliedRequiredChecks(Array.isArray(requiredChecks) ? requiredChecks : [], latest)
-    .filter((name) => name !== REVIEW_GATE_CHECK);
-  for (const name of required) {
-    const run = latest.find((r) => (r?.name ?? r?.context) === name);
-    if (!run) { out.missing.push(name); continue; }
-    // A CheckRun carries status + conclusion; a legacy StatusContext carries only `state`.
-    const isRun = run.status != null;
-    if (isRun && String(run.status).toLowerCase() !== 'completed') { out.pending.push(name); continue; }
-    const conclusion = String((isRun ? run.conclusion : run.state) ?? '').toLowerCase();
-    if (FAILING_CONCLUSIONS.includes(conclusion) || conclusion === 'error') out.red.push(name);
-    else if (conclusion === 'success') out.green.push(name);
-    else if (conclusion === 'pending' || conclusion === 'expected') out.pending.push(name);
-    else out.green.push(name); // skipped/neutral: not red, and not what a not-a-ci-break verdict is about
+  const { checks, roster } = checkEvidence(rollup, requiredChecks);
+  const { redSet, pendingSet } = summarize(checks, { requiredNames: roster });
+  const observed = new Set(checks.map(row => lowerName(row.name)));
+  for (const name of roster) {
+    const key = lowerName(name);
+    if (!observed.has(key)) out.missing.push(name);
+    else if (redSet.has(key)) out.red.push(name);
+    else if (pendingSet.has(key)) out.pending.push(name);
+    else out.green.push(name);
   }
   return out;
+}
+
+/** Include gates and enabled drain-blocking CodeQL failures, even outside the required roster. */
+export function gateOnlyRedStates({ rollup, requiredChecks, drainGateSettings = loadDrainGateSettings() }) {
+  const { checks, roster, holdGateNames } = checkEvidence(rollup, requiredChecks);
+  // Reuse the drain's failure rule on the already-selected latest attempts. Its
+  // canonical spelling bridges this reader's case-insensitive check names.
+  const codeql = drainGateSettings.drainBlocksOnCodeQL && failedCodeQLCheck({ statusCheckRollup:
+    checks.filter(row => row.name === lowerName(CODEQL_CHECK_NAME)).map(row => ({ ...row, name: CODEQL_CHECK_NAME })) });
+  const requiredNames = [...roster, ...gateNames, ...(codeql ? [CODEQL_CHECK_NAME] : [])];
+  const { gateOnlyRed, redSet } = summarize(checks, { requiredNames, holdGateNames });
+  const originalNames = new Map((Array.isArray(requiredChecks) ? requiredChecks : []).map(name => [lowerName(name), name]));
+  if (codeql && !originalNames.has(lowerName(CODEQL_CHECK_NAME))) originalNames.set(lowerName(CODEQL_CHECK_NAME), CODEQL_CHECK_NAME);
+  return { gateOnlyRed, red: [...redSet].map(name => originalNames.get(name) ?? name) };
 }
 
 /**
