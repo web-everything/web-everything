@@ -3050,6 +3050,7 @@ against the SHA the probe actually reports. Regression files: `fix-run-lane-head
 `fix-run.test.mjs`, and `fix-run-borrow-dies.test.mjs` under `scripts/operations/__tests__/`.
 
 
+
 ## Archive-only host retention (R217)
 
 `scripts/lib/archive-retention.mjs` uses the run store's shared directory resolver without triggering
@@ -3157,3 +3158,13 @@ Exercise Git's ownership checks with
 (an unborn bare `HEAD` is normal for the warmer). Active base pins must remain
 ops-owned and readable by the ops warmer even when the pool wrapper creates them
 as root; pin creation and ownership changes stay inside the shared base guard.
+
+## Optional early review and delayed fix push
+
+`review.startBeforeCi` admits an early review only with `hasGreenLedger` evidence for the exact
+head. Keep ledger IO in the reconcile/publish shells and skip it when disabled. The existing
+red-main hold runs before CI-heal caps; test it with a PR behind main (`aheadByOnMain > 0`),
+since a PR already containing main has its own failure. `fix.pushAfterCi` waits before the
+agent so completed CI failures enter that same repair's fenced context. Its push boundary uses
+the same first-held deadline; unreadable evidence waits until the bound, whose fallback is a
+normal push. Inject the clock, sleep and checks; reads must be at least 30 seconds apart.
