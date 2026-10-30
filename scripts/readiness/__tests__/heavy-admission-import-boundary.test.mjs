@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -65,12 +65,62 @@ describe('admission import boundary', () => {
     expect(existsSync(eventPath)).toBe(false);
   }, 10_000);
 
-  it('loads the native adapter only on remote execution and writes real override provenance and events', () => {
+  it.each(['FIFO', 'directory', 'symlink', 'dangling symlink', 'missing parent', 'non-directory parent', 'symlink parent'])(
+    'skips a daemon-events %s and lets a successful native client exit naturally', (kind, context) => {
+      const root = mkdtempSync(join(tmpdir(), 'admission-events-'));
+      roots.push(root);
+      const clientPath = join(root, 'remote-exec.mjs');
+      let eventPath = join(root, 'events.jsonl');
+      const lockRoot = join(root, 'admission', 'heavy');
+      const target = join(root, 'target');
+      if (kind === 'FIFO') {
+        try { execFileSync('mkfifo', [eventPath], { timeout: 1000, maxBuffer: 4096 }); }
+        catch (error) {
+          if (['ENOENT', 'ENOSYS', 'ENOTSUP'].includes(error.code)) context.skip();
+          throw error;
+        }
+      } else if (kind === 'directory') mkdirSync(eventPath);
+      else if (kind === 'symlink' || kind === 'dangling symlink') {
+        if (kind === 'symlink') writeFileSync(target, 'untouched');
+        symlinkSync(target, eventPath);
+      } else if (kind === 'missing parent') eventPath = join(root, 'missing', 'events.jsonl');
+      else if (kind === 'symlink parent') {
+        mkdirSync(target);
+        symlinkSync(target, join(root, 'parent'));
+        eventPath = join(root, 'parent', 'events.jsonl');
+      } else {
+        writeFileSync(target, 'untouched');
+        eventPath = join(target, 'events.jsonl');
+      }
+      writeFileSync(clientPath, "export async function runRemote() { return { mode: 'remote', code: 0 }; }\n");
+      const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
+        import { createRemoteExec, resolveAdmissionPolicy } from ${JSON.stringify(admissionUrl.href)};
+        const execute = createRemoteExec({
+          policy: resolveAdmissionPolicy({ platform: { remote: { clientPath: ${JSON.stringify(clientPath)} } } }),
+          laneRoots: [], lockRoot: ${JSON.stringify(lockRoot)}, readSha: () => 'events-sha', log: () => {},
+        });
+        console.log(JSON.stringify(await execute({ argv: ['npm', 'run', 'build'] })));
+        // No process.exit(): a blocked append must not keep Node alive after the provenance timeout.
+      `], {
+        env: { ...process.env, WE_DAEMON_EVENTS: eventPath }, encoding: 'utf8',
+        timeout: 5000, killSignal: 'SIGKILL', maxBuffer: 64 * 1024,
+      });
+      expect(JSON.parse(output)).toEqual({ mode: 'remote', code: 0 });
+      expect(existsSync(join(dirname(lockRoot), 'remote', 'client-override.json'))).toBe(false);
+      if (kind === 'FIFO') expect(lstatSync(eventPath).isFIFO()).toBe(true);
+      if (kind === 'symlink' || kind === 'non-directory parent') expect(readFileSync(target, 'utf8')).toBe('untouched');
+      if (kind === 'dangling symlink') expect(existsSync(target)).toBe(false);
+      if (kind === 'missing parent') expect(existsSync(dirname(eventPath))).toBe(false);
+      if (kind === 'symlink parent') expect(readdirSync(target)).toEqual([]);
+    }, 10_000);
+
+  it.each([false, true])('loads the native adapter only on remote execution and writes real override provenance and events (existing file=%s)', (existing) => {
     const root = mkdtempSync(join(tmpdir(), 'admission-import-'));
     roots.push(root);
     const clientPath = join(root, 'remote-exec.mjs');
     const eventPath = join(root, 'events.jsonl');
     const lockRoot = join(root, 'admission', 'heavy');
+    if (existing) writeFileSync(eventPath, '');
     writeFileSync(clientPath, "export async function runRemote() { return { mode: 'remote', code: 7 }; }\n");
     // Native Node proves both the lazy CJS boundary and the event writer without Vitest's module mocks.
     const output = execFileSync(process.execPath, ['--input-type=module', '-e', `

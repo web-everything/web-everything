@@ -14,11 +14,14 @@ vi.mock('node:child_process', async (importOriginal) => ({
 }));
 // Preserve real IO while making the built-in namespace configurable for read-range observation.
 vi.mock('node:fs/promises', async (importOriginal) => ({ ...await importOriginal() }));
-vi.mock('../../lib/daemon-events.mjs', () => ({ appendDaemonEvent: vi.fn(async () => true) }));
+vi.mock('../../lib/daemon-events.mjs', async (importOriginal) => ({
+  ...await importOriginal(), appendDaemonEvent: vi.fn(async () => true),
+}));
 
 const roots = [];
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllEnvs();
   vi.mocked(execFile).mockReset();
   vi.mocked(appendDaemonEvent).mockClear();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -115,6 +118,7 @@ describe('remote client override', () => {
 
   it('forwards lockRoot through the production runWithRemoteDecision default executor', async () => {
     const f = fixture();
+    vi.stubEnv('WE_DAEMON_EVENTS', join(f.root, 'events.jsonl'));
     const lockRoot = join(f.root, 'explicit-pool', '.admission', 'heavy');
     const env = { LANE_POOL_ROOT: join(f.root, 'derived-pool') };
     vi.mocked(execFile).mockImplementation((_file, _args, _options, callback) => callback(null, 'production-sha\n'));

@@ -151,7 +151,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
-import { appendDaemonEvent } from '../lib/daemon-events.mjs';
+import { appendDaemonEvent, daemonEventsPath } from '../lib/daemon-events.mjs';
 import { shadowAdmission, readSnapshot } from '../lib/resource-admission.mjs';
 import { hostLoadAdmission } from '../lib/host-load.mjs';
 import { DEFAULT_HOST_MAX_WAIT_MS, loadHostOverloadSettings } from '../lib/host-overload-settings.mjs';
@@ -499,6 +499,14 @@ async function clientProvenanceStat(file, stat = lstat) {
   return info;
 }
 
+/** A timed-out FIFO append still holds Node open; refuse unsafe event destinations before opening. */
+async function appendClientOverrideEvent(event) {
+  const destination = daemonEventsPath();
+  const info = await clientProvenanceStat(destination);
+  if (!info && !(await lstat(dirname(destination))).isDirectory()) return false;
+  return appendDaemonEvent(event);
+}
+
 /** Oversized state is missing provenance: record the current pair and replace it on this run. */
 async function readClientProvenance(file, { signal }) {
   const handle = await open(file, constants.O_RDONLY | CLIENT_PROVENANCE_OPEN_FLAGS);
@@ -558,7 +566,7 @@ export function createRemoteExec({
   laneRoots = [defaultPoolRoot(cwd, env), defaultPoolRoot(MODULE_CHECKOUT, {})],
   fs = realClientFs(), importClient = importRemoteClient,
   provenanceFs = { lstat, readFile: readClientProvenance, mkdir, writeFile: writeClientProvenance },
-  log = (line) => process.stderr.write(line), appendEvent = appendDaemonEvent,
+  log = (line) => process.stderr.write(line), appendEvent = appendClientOverrideEvent,
   readSha = (path) => new Promise((resolve, reject) => {
     execFile('git', ['-C', dirname(path), 'rev-parse', 'HEAD'],
       { encoding: 'utf8', timeout: 1000, killSignal: 'SIGKILL', maxBuffer: 4096 },
@@ -613,7 +621,7 @@ export function createRemoteExec({
           if (signal.aborted) return;
           const pair = { clientPath: clientPathForLog(client.clientPath), sha };
           if (previous?.clientPath !== pair.clientPath || previous?.sha !== pair.sha) {
-            await appendEvent({ kind: 'remote-client-override', detail: { ...pair, previous } });
+            if (await appendEvent({ kind: 'remote-client-override', detail: { ...pair, previous } }) === false) return;
             if (signal.aborted) return;
             await provenanceFs.mkdir(dirname(file), { recursive: true });
             if (signal.aborted) return;

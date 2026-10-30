@@ -2963,6 +2963,11 @@ Publish through an exclusive sibling temp file plus rename, checking the destina
 or regular before replacement. Unreadable or special state skips persistence while the client runs.
 The native FIFO regression in `heavy-admission-import-boundary.test.mjs` must let its subprocess exit
 naturally under a timeout: observing the client result alone misses a live, abandoned filesystem request.
+Before the default override event append, resolve the destination with `daemonEventsPath` and use
+`lstat`: accept a regular non-symlink file, or an absent file whose parent is a directory. Skip other
+destinations without recording the pair as emitted; injected event writers retain their IO seam.
+Keep the separate native daemon-events FIFO case, including client success and absent pair state,
+alongside symlink, directory and invalid-parent cases and real missing/existing regular-file writes.
 
 ## Admission imports and daemon closures
 
