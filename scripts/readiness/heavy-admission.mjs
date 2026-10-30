@@ -298,7 +298,11 @@ export function canonicalPath(p) {
 /** The real user's home, independent of a caller's `$HOME` (a sandboxed or launchd caller may carry another one). */
 const realHomeDir = () => { try { return userInfo().homedir || homedir(); } catch { return homedir(); } };
 const oneLine = (v) => String(v).replace(/[^\x20-\x7e]/g, '?').slice(0, 80);
-const clientPathForLog = (path) => String(path).replace(/[^\x20-\x7e]/g, '?').slice(0, 1024);
+const clientPathForLog = (path) => {
+  // Never invoke hooks on untrusted settings objects just to report an ignored/invalid path.
+  if ((path !== null && typeof path === 'object') || typeof path === 'function' || typeof path === 'symbol') return '<unprintable>';
+  return String(path).replace(/[^\x20-\x7e]/g, '?').slice(0, 1024);
+};
 
 /**
  * A pool is PRIVATE only when `LANE_POOL_ROOT` points somewhere other than the host-shared pool the checkout
@@ -336,7 +340,12 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
     let value = admissionLeaf(settings, leaf);
     sources[leaf] = 'standard';
     for (const [layer, block] of [['platform', platform], ['tool', tool]]) {
-      const v = admissionLeaf(block, leaf);
+      let v;
+      try { v = admissionLeaf(block, leaf); }
+      catch (error) {
+        if (leaf !== 'remote.clientPath') throw error;
+        v = Symbol('unreadable clientPath'); // invalid even in the trusted platform layer
+      }
       if (v === undefined) continue;
       if (layer === 'tool' && leaf === 'remote.clientPath') {
         ignored.push(`tool.${leaf}=${clientPathForLog(v)} (only platform preferences may select executable client code)`);
@@ -347,7 +356,7 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
         continue;
       }
       if (valid(v)) { value = v; sources[leaf] = layer; }
-      else invalid.push(`${layer}.${leaf}=${oneLine(JSON.stringify(v))}`);
+      else invalid.push(`${layer}.${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(v) : oneLine(JSON.stringify(v))}`);
     }
     const name = ADMISSION_ENV[leaf];
     const raw = name ? env[name] : undefined;
@@ -506,7 +515,7 @@ export function createRemoteExec({
   provenanceFs = { readFile: readClientProvenance, mkdir, writeFile },
   log = (line) => process.stderr.write(line), appendEvent = appendDaemonEvent,
   readSha = (path) => execFileSync('git', ['-C', dirname(path), 'rev-parse', 'HEAD'],
-    { encoding: 'utf8', timeout: 1000, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'ignore'] }).trim(),
+    { encoding: 'utf8', timeout: 1000, killSignal: 'SIGKILL', maxBuffer: 4096, stdio: ['ignore', 'pipe', 'ignore'] }).trim(),
   notice = remoteClientNotice,
 } = {}) {
   return async (options) => {

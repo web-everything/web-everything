@@ -340,6 +340,26 @@ describe('remote client override', () => {
     expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('@ unknown'));
   });
 
+  it('hard-kills a timed-out default git SHA lookup and records unknown without blocking remote execution', async () => {
+    const f = fixture();
+    vi.mocked(execFileSync).mockImplementation(() => {
+      throw Object.assign(new Error('git timed out'), { code: 'ETIMEDOUT', signal: 'SIGKILL' });
+    });
+    expect(await f.run({ readSha: undefined })).toEqual({ handled: true, exitCode: 0 });
+    expect(execFileSync).toHaveBeenCalledTimes(1);
+    const { clientPath } = resolveRemoteClient({ clientPath: f.clientPath });
+    expect(execFileSync).toHaveBeenCalledWith('git', ['-C', dirname(clientPath), 'rev-parse', 'HEAD'],
+      expect.objectContaining({ killSignal: 'SIGKILL', timeout: expect.any(Number), maxBuffer: 4096 }));
+    const { timeout } = vi.mocked(execFileSync).mock.calls[0][2];
+    expect(timeout).toBeGreaterThan(0);
+    expect(timeout).toBeLessThanOrEqual(1000);
+    expect(f.seams.log).toHaveBeenCalledWith(expect.stringContaining('@ unknown'));
+    expect(JSON.parse(readFileSync(f.state, 'utf8')).sha).toBe('unknown');
+    expect(f.seams.appendEvent).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'remote-client-override', detail: expect.objectContaining({ sha: 'unknown' }),
+    }));
+  });
+
   it.each(['readSha', 'readFile', 'appendEvent', 'mkdir', 'writeFile'])(
     'a stalled provenance %s has a deadline and never prevents invocation', async (operation) => {
       const f = fixture();
@@ -426,6 +446,41 @@ describe('remote client override', () => {
     expect(importClient.mock.calls).toEqual([['./remote-exec.mjs']]);
     expect(f.seams.readSha).not.toHaveBeenCalled();
     expect(f.seams.appendEvent).not.toHaveBeenCalled();
+  });
+
+  describe.each(['platform', 'tool'])('%s clientPath diagnostics', (layer) => {
+    it.each([
+      ['null toString', { value: { toString: null } }],
+      ['Symbol', { value: Symbol('clientPath') }],
+      ['throwing toString getter', { value: { get toString() { throw new Error('must not coerce'); } } }],
+      ['throwing toJSON getter', { value: { get toJSON() { throw new Error('must not serialize'); } } }],
+      ['throwing clientPath getter', { get() { throw new Error('cannot read path'); } }],
+      ['cyclic object', { value: (() => { const value = {}; value.self = value; return value; })() }],
+    ])('logs a bounded placeholder for %s and preserves the previous policy', (_kind, descriptor) => {
+      const f = fixture();
+      const remote = Object.defineProperty({}, 'clientPath', descriptor);
+      const policy = resolveAdmissionPolicy({
+        platform: layer === 'tool' ? { remote: { clientPath: f.clientPath } } : { remote },
+        tool: layer === 'tool' ? { remote } : {},
+      });
+      expect(policy.settings.remote.clientPath).toBe(layer === 'tool' ? f.clientPath : null);
+      expect(policy.sources['remote.clientPath']).toBe(layer === 'tool' ? 'platform' : 'standard');
+      const diagnostics = layer === 'tool' ? policy.ignored : policy.invalid;
+      expect(diagnostics).toHaveLength(1);
+      expect(diagnostics[0]).toContain(`${layer}.remote.clientPath=<unprintable>`);
+      expect(diagnostics[0]).toMatch(/^[\x20-\x7e]+$/);
+      expect(diagnostics[0].length).toBeLessThan(200);
+      expect(formatAdmissionPolicy(policy)).toContain(diagnostics[0]);
+    });
+  });
+
+  it('bounds oversized ignored tool clientPath logs and strips control characters', () => {
+    const policy = resolveAdmissionPolicy({ tool: { remote: { clientPath: '\n\x1b' + 'x'.repeat(4096) } } });
+    expect(policy.settings.remote.clientPath).toBeNull();
+    expect(policy.ignored).toEqual([
+      `tool.remote.clientPath=${'??' + 'x'.repeat(1022)} (only platform preferences may select executable client code)`,
+    ]);
+    expect(formatAdmissionPolicy(policy)).toMatch(/^[\x20-\x7e\u00b7]+$/);
   });
 
   it('resolves the leaf with provenance, ignores shared tool settings and has no env mapping', () => {
