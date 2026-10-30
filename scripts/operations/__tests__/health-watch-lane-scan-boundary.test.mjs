@@ -387,6 +387,8 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:../operations/needs-you-feed.mjs#publishAttention:publishAttention",
       "helper:../operations/review-extra-seats.mjs#readSeatCapUsage:readSeatCapUsage",
       "helper:../operations/run-store.mjs#daemonJobsRoot:daemonJobsRoot",
+      // Archive-only hook: handles run/session files, never lane actions. Keep its exact count below.
+      "helper:./archive-retention-tick.mjs#runArchiveRetentionTick:runArchiveRetentionTick",
       "helper:./branch-sync.mjs#notifyDesktopChecked:notifyDesktopChecked",
       "helper:./build-supervision.mjs#probeBuildSessions:probeBuildSessions",
       "helper:./build-supervision.mjs#probeExternalRuns:probeExternalRuns",
@@ -502,6 +504,8 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:../operations/needs-you-feed.mjs#publishAttention:publishAttention": 1,
       "helper:../operations/review-extra-seats.mjs#readSeatCapUsage:readSeatCapUsage": 1,
       "helper:../operations/run-store.mjs#daemonJobsRoot:daemonJobsRoot": 1,
+      // Non-destructive to lanes; repeats still require review like every other maintenance helper.
+      "helper:./archive-retention-tick.mjs#runArchiveRetentionTick:runArchiveRetentionTick": 1,
       "helper:./branch-sync.mjs#notifyDesktopChecked:notifyDesktopChecked": 4,
       "helper:./build-supervision.mjs#probeBuildSessions:probeBuildSessions": 1,
       "helper:./build-supervision.mjs#probeExternalRuns:probeExternalRuns": 1,
@@ -677,7 +681,7 @@ describe('health-watch destructive lane action call-site contract', () => {
     // Repeating an already reviewed mutation must fail even though the distinct
     // module/export inventory is unchanged. Pin each occurrence in both readers.
     const repeatedHelpers = file === 'scripts/conveyor/health-watch.mjs'
-      ? ['writeFileSync', 'renameSync', 'unlinkSync', 'mkdirSync']
+      ? ['writeFileSync', 'renameSync', 'unlinkSync', 'mkdirSync', 'runArchiveRetentionTick']
       : ['cachedLaneScan', 'laneRedirectConfig', 'hardenLaneGitArgs', 'laneProbeEnv', 'assertPushRef'];
     for (const callee of repeatedHelpers) {
       const call = Object.keys(allowedHelpers).find(key => key.endsWith(`:${callee}`));

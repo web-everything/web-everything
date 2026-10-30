@@ -24,14 +24,16 @@
  *   a full pass never run at the same time in one clone.
  *   With a separate code clone, pending daemon refreshes pause new starts; in-flight drains finish normally.
  *
- * SETTING `mergeQueue.enqueueOnEvent` — `{ enabled: boolean, debounceSeconds: number, timeoutSeconds: number,
+ * SETTING `mergeQueue.enqueueOnEvent` — `{ enabled: boolean, debounceSeconds: number, debounceMaxWaitMs: number, timeoutSeconds: number,
  *   catchUp: { enabled: boolean, intervalMinutes: number, concurrency: number, busyIntervalSeconds: number, maxQueued: number, missSmellAfter: number, blockedBackoffRounds: number, timeoutBackoffRounds: number, order: string } }`, resolved through the shared
- *   policy cascade (`./policy-cascade.mjs`): standard default `{enabled:false, debounceSeconds:15, timeoutSeconds:600, catchUp:{enabled:false, intervalMinutes:10, concurrency:3, busyIntervalSeconds:60, maxQueued:12, missSmellAfter:3, blockedBackoffRounds:6, timeoutBackoffRounds:3, order:"priority-then-first-accept"}}` → platform
+ *   policy cascade (`./policy-cascade.mjs`): standard default `{enabled:false, debounceSeconds:15, debounceMaxWaitMs:60000, timeoutSeconds:600, catchUp:{enabled:false, intervalMinutes:10, concurrency:3, busyIntervalSeconds:60, maxQueued:12, missSmellAfter:3, blockedBackoffRounds:6, timeoutBackoffRounds:3, order:"priority-then-first-accept"}}` → platform
  *   preference `mergeQueue.enqueueOnEvent` → tool block `mergeQueue.enqueueOnEvent` in `we:scripts/settings/*.json`
  *   (this repo: `merge-queue.json`) → env `WE_ENQUEUE_ON_EVENT=on|off` (enabled only). Re-read on every tick; the
  *   source of each leaf is logged once per distinct value (`enqueue-on-event: setting …`).
  *   debounceSeconds: wait this long after the PR's LAST eligible event before running (check suites finish in a
  *   burst, and GitHub's mergeable state lags the last check by a few seconds).
+ *   debounceMaxWaitMs: integer 1000–600000 (standard 60000); also due this long after the FIRST eligible
+ *   event of the burst, regardless of newer events.
  *   timeoutSeconds: integer 60–3600 (standard 600); SIGTERM a fast drain after this duration and report timeout.
  *
  *   missSmellAfter: positive integer (standard 3); every threshold of consecutive admission misses logs
@@ -79,7 +81,7 @@ import { readRebuildState } from './daemon-rebuild/state.mjs';
 
 export const ENQUEUE_ON_EVENT_POLICY = 'mergeQueue.enqueueOnEvent';
 export const ENQUEUE_ON_EVENT_ENV = 'WE_ENQUEUE_ON_EVENT';
-export const ENQUEUE_ON_EVENT_DEFAULTS = Object.freeze({ enabled: false, debounceSeconds: 15, timeoutSeconds: 600, catchUp: Object.freeze({ enabled: false, intervalMinutes: 10, concurrency: 3, busyIntervalSeconds: 60, maxQueued: 12, missSmellAfter: 3, blockedBackoffRounds: 6, timeoutBackoffRounds: 3, order: 'priority-then-first-accept' }) });
+export const ENQUEUE_ON_EVENT_DEFAULTS = Object.freeze({ enabled: false, debounceSeconds: 15, debounceMaxWaitMs: 60_000, timeoutSeconds: 600, catchUp: Object.freeze({ enabled: false, intervalMinutes: 10, concurrency: 3, busyIntervalSeconds: 60, maxQueued: 12, missSmellAfter: 3, blockedBackoffRounds: 6, timeoutBackoffRounds: 3, order: 'priority-then-first-accept' }) });
 /** Compatibility constant for the standard fast-drain timeout; the setting controls child runs. */
 export const FAST_DRAIN_TIMEOUT_MS = 10 * 60_000;
 const READY_LABEL = 'ready-to-merge';
@@ -122,12 +124,13 @@ const VALID = {
   catchUp: (v) => Object.values(CATCH_UP_VALID).some((valid) => valid(v)),
   enabled: (v) => typeof v === 'boolean',
   debounceSeconds: (v) => Number.isFinite(v) && v >= 0 && v <= 600,
+  debounceMaxWaitMs: (v) => Number.isInteger(v) && v >= 1000 && v <= 600_000,
   timeoutSeconds: (v) => Number.isInteger(v) && v >= 60 && v <= 3600,
 };
 
 /**
  * Resolve the setting. Never throws. `tool` defaults to the declared settings' `mergeQueue.enqueueOnEvent` block.
- * @returns {{enabled:boolean, debounceSeconds:number, timeoutSeconds:number, catchUp:{enabled:boolean, intervalMinutes:number, concurrency:number, busyIntervalSeconds:number, maxQueued:number, missSmellAfter:number, blockedBackoffRounds:number, timeoutBackoffRounds:number, order:string}, sources:Record<string,string>, invalid:string[], line:string}}
+ * @returns {{enabled:boolean, debounceSeconds:number, debounceMaxWaitMs:number, timeoutSeconds:number, catchUp:{enabled:boolean, intervalMinutes:number, concurrency:number, busyIntervalSeconds:number, maxQueued:number, missSmellAfter:number, blockedBackoffRounds:number, timeoutBackoffRounds:number, order:string}, sources:Record<string,string>, invalid:string[], line:string}}
  */
 export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform } = {}) {
   let block = tool;
@@ -144,6 +147,7 @@ export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform
   const out = {
     enabled: v.enabled === true,
     debounceSeconds: VALID.debounceSeconds(v.debounceSeconds) ? v.debounceSeconds : ENQUEUE_ON_EVENT_DEFAULTS.debounceSeconds,
+    debounceMaxWaitMs: VALID.debounceMaxWaitMs(v.debounceMaxWaitMs) ? v.debounceMaxWaitMs : ENQUEUE_ON_EVENT_DEFAULTS.debounceMaxWaitMs,
     timeoutSeconds: VALID.timeoutSeconds(v.timeoutSeconds) ? v.timeoutSeconds : ENQUEUE_ON_EVENT_DEFAULTS.timeoutSeconds,
     catchUp: {},
     sources: { ...(c.sources || {}) },
@@ -165,7 +169,7 @@ export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform
     if (match && !out.invalid.includes(match[1])) out.invalid.push(match[1]);
   }
   const src = (k) => out.sources[k] || 'standard';
-  out.line = `enqueue-on-event: setting ${ENQUEUE_ON_EVENT_POLICY} enabled=${out.enabled} (${src('enabled')}), debounceSeconds=${out.debounceSeconds} (${src('debounceSeconds')}), timeoutSeconds=${out.timeoutSeconds} (${src('timeoutSeconds')}), catchUp.enabled=${out.catchUp.enabled} (${src('catchUp.enabled')}), catchUp.intervalMinutes=${out.catchUp.intervalMinutes} (${src('catchUp.intervalMinutes')}), catchUp.concurrency=${out.catchUp.concurrency} (${src('catchUp.concurrency')}), catchUp.busyIntervalSeconds=${out.catchUp.busyIntervalSeconds} (${src('catchUp.busyIntervalSeconds')}), catchUp.maxQueued=${out.catchUp.maxQueued} (${src('catchUp.maxQueued')}), catchUp.missSmellAfter=${out.catchUp.missSmellAfter} (${src('catchUp.missSmellAfter')}), catchUp.blockedBackoffRounds=${out.catchUp.blockedBackoffRounds} (${src('catchUp.blockedBackoffRounds')}), catchUp.timeoutBackoffRounds=${out.catchUp.timeoutBackoffRounds} (${src('catchUp.timeoutBackoffRounds')}), catchUp.order=${out.catchUp.order} (${src('catchUp.order')})${out.invalid.length ? ` · ignored invalid: ${out.invalid.join('; ')}` : ''}`;
+  out.line = `enqueue-on-event: setting ${ENQUEUE_ON_EVENT_POLICY} enabled=${out.enabled} (${src('enabled')}), debounceSeconds=${out.debounceSeconds} (${src('debounceSeconds')}), debounceMaxWaitMs=${out.debounceMaxWaitMs} (${src('debounceMaxWaitMs')}), timeoutSeconds=${out.timeoutSeconds} (${src('timeoutSeconds')}), catchUp.enabled=${out.catchUp.enabled} (${src('catchUp.enabled')}), catchUp.intervalMinutes=${out.catchUp.intervalMinutes} (${src('catchUp.intervalMinutes')}), catchUp.concurrency=${out.catchUp.concurrency} (${src('catchUp.concurrency')}), catchUp.busyIntervalSeconds=${out.catchUp.busyIntervalSeconds} (${src('catchUp.busyIntervalSeconds')}), catchUp.maxQueued=${out.catchUp.maxQueued} (${src('catchUp.maxQueued')}), catchUp.missSmellAfter=${out.catchUp.missSmellAfter} (${src('catchUp.missSmellAfter')}), catchUp.blockedBackoffRounds=${out.catchUp.blockedBackoffRounds} (${src('catchUp.blockedBackoffRounds')}), catchUp.timeoutBackoffRounds=${out.catchUp.timeoutBackoffRounds} (${src('catchUp.timeoutBackoffRounds')}), catchUp.order=${out.catchUp.order} (${src('catchUp.order')})${out.invalid.length ? ` · ignored invalid: ${out.invalid.join('; ')}` : ''}`;
   return out;
 }
 
@@ -207,14 +211,17 @@ export function notePending(pending, marked, { localSlug, now }) {
     if (!k || !local || k.repo !== local) continue;
     const key = `${k.repo}#${k.num}`;
     const prev = next.get(key);
-    next.set(key, { ...k, ...(prev?.catchUp ? { catchUp: true } : {}), firstAt: prev?.firstAt ?? now, lastAt: now, causes: [...new Set([...(prev?.causes || []), String(m.cause).replace(/@\d+.*$/, '')])].slice(-3) });
+    // Catch-up firstAt preserves planner order; its first eligible event starts a separate burst clock.
+    // Retain that clock on later events, including after catch-up is disabled.
+    const burstAt = prev?.burstAt ?? (prev?.catchUp ? now : undefined);
+    next.set(key, { ...k, ...(prev?.catchUp ? { catchUp: true } : {}), ...(burstAt !== undefined ? { burstAt } : {}), firstAt: prev?.firstAt ?? now, lastAt: now, causes: [...new Set([...(prev?.causes || []), String(m.cause).replace(/@\d+.*$/, '')])].slice(-3) });
   }
   return next;
 }
 
-/** The pending PRs whose debounce has elapsed, oldest first. PURE. */
-export function duePending(pending, { now, debounceSeconds }) {
-  return [...pending.values()].filter((p) => now - p.lastAt >= debounceSeconds * 1000).sort((a, b) => a.firstAt - b.firstAt);
+/** The pending PRs whose last-event debounce or first-event max-wait has elapsed, oldest first. PURE. */
+export function duePending(pending, { now, debounceSeconds, debounceMaxWaitMs = ENQUEUE_ON_EVENT_DEFAULTS.debounceMaxWaitMs }) {
+  return [...pending.values()].filter((p) => now - p.lastAt >= debounceSeconds * 1000 || now - (p.burstAt ?? p.firstAt) >= debounceMaxWaitMs).sort((a, b) => a.firstAt - b.firstAt);
 }
 
 /** The fast-drain argv (node script + args). The drain's own single-PR path; `--this-repo` keeps the listing local. PURE. */
@@ -681,7 +688,7 @@ export function createEnqueueOnEvent({
         if (!s.catchUp?.enabled) catchUpLater = [].values();
       }
       const immediate = [...pending.values()].filter(p => greenEvent(p) && staged(p));
-      const [p] = [...immediate, ...duePending(pending, { now: now(), debounceSeconds: s.debounceSeconds })]
+      const [p] = [...immediate, ...duePending(pending, { now: now(), debounceSeconds: s.debounceSeconds, debounceMaxWaitMs: s.debounceMaxWaitMs })]
         .filter((p) => !activeNums.has(p.num) && !attempted.has(p.num) && (!catchUpOnly || p.catchUp) && (!p.catchUp || !batchingDeferred && catchUpRoom > 0));
       if (!p) { if (active.size) { await Promise.race(active.values()); continue; } break; }
       if (!p.catchUp && active.size) { await Promise.race(active.values()); continue; }

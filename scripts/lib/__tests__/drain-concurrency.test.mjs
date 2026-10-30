@@ -1,13 +1,96 @@
 // @vitest-environment node
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { mapWithConcurrency, runEnqueueCandidates, canParallelEnqueue, createBranchPreparationRequired, formatConcurrencySources } from '../drain-concurrency.mjs';
+import { mapWithConcurrency, runEnqueueCandidates, canParallelEnqueue, createBranchPreparationRequired, shouldPrepareBranchBeforeEnqueue, formatConcurrencySources } from '../drain-concurrency.mjs';
+import { decideHoldApprovedHumanSurfaceHead } from '../approved-human-surface-hold.mjs';
+import { hashBacklogFiles, prepareBranchBeforeEnqueue, finishBranchPreparation } from '../queue-branch-numbering.mjs';
 import { fetchPrReadsCached, classifyPr } from '../../merge-ai-prs.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 
 const pause = () => new Promise(resolve => setTimeout(resolve, 5));
 
 describe('bounded drain concurrency', () => {
+  it.each([
+    [true, true, true], [true, false, false], [false, true, false], [false, false, false],
+    [undefined, true, false], [true, undefined, false], ['required', 'queue', true],
+  ])('prepares only when required=%s and enqueues=%s (returns %s)', (required, enqueues, expected) => {
+    expect(shouldPrepareBranchBeforeEnqueue({ required, enqueues })).toBe(expected);
+  });
+
+  it('prepares #6003 with a pending hash card even when its approved human-only head is held', () => {
+    const c = { num: 6003, repo: 'owner/repo', headSha: 'a'.repeat(40) };
+    const files = ['.github/workflows/ci.yml', 'backlog/xh6zcov-card.md'];
+    const required = createBranchPreparationRequired({ enabled: true, readFiles: () => files,
+      hasPendingCards: files => hashBacklogFiles(files).length > 0 });
+    const approvedHeadHold = decideHoldApprovedHumanSurfaceHead({ setting: 'on', approved: true,
+      humanSurface: true, conflicting: false, manifestOnHead: false });
+    expect(approvedHeadHold.hold).toBe(true);
+    expect(required(c)).toBe(true);
+    expect(shouldPrepareBranchBeforeEnqueue({ required: required(c), enqueues: true })).toBe(true);
+  });
+
+  it.each([
+    { link: 'assets/logo.svg', cards: [], pending: false },
+    { link: 'assets', cards: ['backlog/041-card.md'], pending: false },
+    { link: 'backlog/041-card.md', cards: ['backlog/041-card.md'], pending: false },
+    { link: 'assets/logo.svg', cards: ['backlog/xabc123-card.md'], pending: true },
+    { link: 'backlog/xabc123-card.md', cards: ['backlog/xabc123-card.md'], pending: true },
+    { link: 'backlog', cards: ['backlog/xabc123-card.md'], pending: true },
+    { link: 'assets/logo.svg', cards: [], failure: 'inventory unreadable' },
+    { link: 'assets/logo.svg', cards: [], failure: 'head moved' },
+  ])('serial approved-head preparation: $link, pending=$pending, failure=$failure', async ({ link, cards, pending, failure }) => {
+    const c = { num: 6003, headRef: 'topic', headSha: 'a'.repeat(40) };
+    const required = createBranchPreparationRequired({ enabled: true, serial: true });
+    const approvedHeadHold = decideHoldApprovedHumanSurfaceHead({ setting: 'on', approved: true,
+      humanSurface: true, conflicting: false, manifestOnHead: false });
+    expect(approvedHeadHold.hold).toBe(true);
+    const exec = vi.fn((_cmd, args) => {
+      if (args[0] === 'ls-remote') return `${failure === 'head moved' ? 'b'.repeat(40) : c.headSha}\trefs/heads/topic`;
+      if (args[0] === 'ls-files') {
+        if (failure === 'inventory unreadable') throw new Error(failure);
+        return (args[1] === 'backlog/' ? cards : [...cards, '.github/workflows/ci.yml', 'assets/logo.svg']).join('\n');
+      }
+      if (['check-ref-format', 'fetch', 'worktree'].includes(args[0])) return '';
+      throw new Error(`unexpected git command: ${args[0]}`);
+    });
+    const fs = {
+      mkdtempSync: vi.fn(() => '/tmp/serial-numbering'), rmSync: vi.fn(),
+      lstatSync: vi.fn(path => ({
+        isSymbolicLink: () => path === `/tmp/serial-numbering/tree/${link}`,
+        isFile: () => /\.(md|yml|svg)$/.test(path),
+        isDirectory: () => !/\.(md|yml|svg)$/.test(path),
+      })),
+    };
+    const lock = vi.fn(), number = vi.fn(), enqueue = vi.fn(), onError = vi.fn();
+    const finish = { c, revalidationAborted: [], needsAcceptanceRestamp: vi.fn(),
+      restampAcceptance: vi.fn(), log: { write: vi.fn() }, emit: vi.fn() };
+    let prepared;
+    await runEnqueueCandidates([c], { concurrency: 1, canParallel: () => false, onError,
+      run: candidate => {
+        expect(shouldPrepareBranchBeforeEnqueue({ required: required(candidate), enqueues: true })).toBe(true);
+        prepared = prepareBranchBeforeEnqueue({ c: candidate, traceHeadSha: c.headSha,
+          cwd: '/clone', statePath: '/state/reservations.json', exec, fs, lock, number });
+        if (finishBranchPreparation(prepared, finish)) enqueue(candidate);
+      },
+    });
+    expect(onError).not.toHaveBeenCalled();
+    if (pending || failure) {
+      expect(prepared).toMatchObject({ action: 'skip', reason: expect.stringContaining(
+        failure === 'head moved' ? 'remote branch head moved' : failure || 'symlink') });
+      expect(enqueue).not.toHaveBeenCalled();
+      expect(finish.emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you' }));
+    } else {
+      expect(prepared).toEqual({ action: 'final' });
+      expect(enqueue).toHaveBeenCalledWith(c);
+      expect(fs.lstatSync).not.toHaveBeenCalled();
+      expect(finish.revalidationAborted).toEqual([]);
+    }
+    expect(number).not.toHaveBeenCalled();
+    expect(lock).not.toHaveBeenCalled();
+    expect(exec.mock.calls.some(([, args]) => ['push', 'commit'].includes(args[0]))).toBe(false);
+    expect(finish.restampAcceptance).not.toHaveBeenCalled();
+  });
+
   it('preserves map order despite out-of-order completion', async () => {
     expect(await mapWithConcurrency([3, 2, 1], 3, async n => {
       await new Promise(resolve => setTimeout(resolve, n)); return n;
@@ -128,5 +211,6 @@ describe('bounded drain concurrency', () => {
     expect(source).toContain('concurrency: resolvedMergePolicy.policy.concurrency.gateReads');
     expect(source).toContain('const { stdout: raw } = await execFileP');
     expect(source).toContain('formatConcurrencySources(resolvedMergePolicy.policy)');
+    expect(source.includes('if (shouldPrepareBranchBeforeEnqueue({ required: branchPreparationRequired(c), enqueues: mergeStrategy.enqueues(c.repo) })) {')).toBe(true);
   });
 });
