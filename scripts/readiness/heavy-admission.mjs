@@ -102,7 +102,7 @@
  * checkout-local tool-settings overrides apply only to a PRIVATE pool — a LANE_POOL_ROOT that is not the host pool. DEFAULT_TIMEOUT_MS remains a legacy CLI fallback; WE_HEAVY_ADMISSION=off bypasses admission.
  *
  * REMOTE ROUTING CONTRACT — remote stays disabled by default (heavyAdmission.remote.enabled=false).
- * Only { mode: 'remote', code: <integer> } exits with that code. Local admission may follow only
+ * Only { mode: 'remote', code: <integer 0..254> } exits with that code. Local admission may follow only
  * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }. After a timeout,
  * only the cancelled+terminated acknowledgement permits local admission. Everything else, including
  * legacy { mode: 'fallback' }, throws, malformed results and unacknowledged timeouts, exits 124.
@@ -425,6 +425,7 @@ const LEGACY_REMOTE_PRE_EXECUTION_REASONS = Object.freeze([
   'invalid-parameters',
   'forge-unreachable',
   'copy-failed',
+  'ignored-test-file',
   'unsupported-sibling-dependency',
 ]);
 
@@ -437,7 +438,7 @@ export function adaptLegacyRemoteResult(result) {
 }
 
 /** Attempt remote execution before taking a local slot; remote is disabled by default.
- * Only { mode: 'remote', code: <integer> } exits with that code. Local admission requires
+ * Only { mode: 'remote', code: <integer 0..254> } exits with that code. Local admission requires
  * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }.
  * After timeout-abort, allow up to one second for cancelled+terminated acknowledgement.
  * Everything else (including legacy fallback, throws, malformed results and unacknowledged
@@ -484,7 +485,7 @@ export async function runWithRemoteDecision({
       }
       reason = 'remote-timeout';
     } else {
-      if (result?.mode === 'remote' && Number.isInteger(result.code)) return { handled: true, exitCode: result.code };
+      if (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254) return { handled: true, exitCode: result.code };
       // Only explicit non-start or cancellation with confirmed termination is safe. Throws and malformed
       // replies may come from an executor whose remote child is still alive.
       if (!((result?.mode === 'not-started' || result?.mode === 'cancelled') && result.terminated === true)) return refuseLocal(result?.reason ?? 'unconfirmed remote result');
