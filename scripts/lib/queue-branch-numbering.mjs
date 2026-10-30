@@ -264,11 +264,13 @@ export function prepareBranchBeforeEnqueue({ c, traceHeadSha, cwd = process.cwd(
       git(['worktree', 'add', '--detach', worktree, traceHeadSha]);
       const tracked = () => lines(git(['ls-files', 'backlog/'], worktree));
       const files = tracked();
+      // A hash-free pinned tree needs no numbering writes. Ordinary tracked symlinks
+      // must not block enqueue just because serial mode always requests preparation.
+      if (!hashBacklogFiles(files).length) return { action: 'final' };
       for (const path of files) assertWorktreeCard(worktree, path, fs);
       // Numbering also rewrites references in docs, memory, flows and soak files.
       // Validate the entire tracked tree, including ledger parents, before calling it.
       for (const path of lines(git(['ls-files'], worktree))) assertWorktreeFile(worktree, path, fs);
-      if (!hashBacklogFiles(files).length) return { action: 'final' };
       const outcome = lock(() => {
         pinned();
         const state = readReservations(fs, statePath);
