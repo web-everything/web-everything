@@ -274,7 +274,7 @@ process.stdout.write('x'.repeat(4*1024*1024+1));
     expect(log).not.toContain('production');
     expect(log).not.toContain(process.env.HOME);
     expect(await runner.finish(request)).toEqual({v:1,nonce:request.nonce,run:request.run,inputDigest:request.inputDigest,
-      argvDigest:request.argvDigest,lock:request.lock,manifestDigest:request.manifestDigest,phase:'test',code:3});
+      argvDigest:request.argvDigest,lock:request.lock,manifestDigest:request.manifestDigest,phase:'test',code:3,timings:{installMs:expect.any(Number),runMs:expect.any(Number)}});
     await expect(stat(join(root,'runs',request.run))).rejects.toThrow();
     await expect(runner.finish(request)).rejects.toThrow();
     expect(await readdir(join(root,'receipts'))).toEqual([request.run+'.consumed']);
@@ -476,7 +476,7 @@ with patch.object(os, 'open', side_effect=local_open), \
      patch.object(os, 'fstat', side_effect=root_stat), patch.object(os, 'fchown') as chown:
     sys.argv = ['installer', source]
     exec(installer)
-    assert chown.call_count == 1
+    assert chown.call_count == 2
     assert chown.call_args.args[1:] == (0, 0)
 `;
     const installed=spawnSync('python3',['-I','-c',harness,installer,
@@ -485,8 +485,8 @@ with patch.object(os, 'open', side_effect=local_open), \
     });
     expect(installed.status,installed.stderr).toBe(0);
     const names=await readdir(join(local,'libexec'));
-    expect(names).toHaveLength(1);
-    const entry=join(local,'libexec',names[0]);
+    expect(names.sort()).toEqual(['forge-exec-run.mjs','forge-warm-base.mjs']);
+    const entry=join(local,'libexec','forge-exec-run.mjs');
     expect((await stat(entry)).mode & 0o777).toBe(0o755);
     // Disable newer Node's syntax detection to retain the Node 22.1 default.
     // Execute the actual shebang path, with no surrounding type:module package.
@@ -496,8 +496,27 @@ with patch.object(os, 'open', side_effect=local_open), \
     });
     expect(result.status,result.stderr).toBe(254);
     expect(result.stderr).toBe('forge-exec-run: Invalid subcommand\n');
+    const warmer=join(local,'libexec','forge-warm-base.mjs');
+    expect((await stat(warmer)).mode & 0o777).toBe(0o755);
+    const warmResult=spawnSync(warmer,['unexpected'],{cwd:local,encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+      env:{PATH:join(root,'bin')+':/usr/bin:/bin',NODE_OPTIONS:'--no-experimental-detect-module --experimental-default-type=commonjs'}});
+    expect(warmResult.status,warmResult.stderr).toBe(1);
+    expect(warmResult.stderr).toBe('forge-warm-base: No arguments accepted\n');
+    expect(setup).toContain('User=ops');
+    // The worker and ops share dependency archives through ordinary 0644/0755
+    // files. A service-wide 0077 mask makes a cold worker install unreadable to ops.
+    const serviceMask=setup.match(/^UMask=([0-7]+)$/m)[1];
+    const modes=spawnSync(process.execPath,['-e',
+      "const fs=require('node:fs');process.umask(parseInt(process.argv[1],8));const dir=process.argv[2];fs.mkdirSync(dir);fs.writeFileSync(dir+'/file','public dependency');console.log(JSON.stringify({dir:fs.statSync(dir).mode&511,file:fs.statSync(dir+'/file').mode&511}));",
+      serviceMask,join(root,'service-created')],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+    expect(modes.status,modes.stderr).toBe(0);
+    expect(JSON.parse(modes.stdout)).toEqual({dir:0o755,file:0o644});
+    expect(serviceMask).toBe('0022');
+    expect(setup).toContain('/usr/bin/flock -n /srv/forge-base/.tick.lock');
+    expect(setup).toContain('OnCalendar=*-*-* *:*:00,30');
+    expect(setup).toContain('Persistent=true');
     const client=await readFile(new URL('../remote-exec.mjs',import.meta.url),'utf8');
-    expect(client).toContain('/usr/local/libexec/'+names[0]+' ${command}');
+    expect(client).toContain('/usr/local/libexec/forge-exec-run.mjs ${command}');
   });
   it('installs a root-owned fixed wrapper, makes the old cache inert, and prunes only expired state', async () => {
     const setup=await readFile(new URL('../forge-setup.sh',import.meta.url),'utf8');

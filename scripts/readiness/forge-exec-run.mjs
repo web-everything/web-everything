@@ -7,6 +7,8 @@ import {open, mkdir, readdir, writeFile, rename, rm, rmdir, lstat, realpath} fro
 import {createHash, randomBytes} from 'node:crypto';
 import {join, relative} from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {baseGuard, readyBases, readBase, copyLeaves, baseFile} from './forge-exec-bases.mjs';
+import {decodeManifest} from './forge-exec-manifest.mjs';
 const LIMIT = 4 * 1024 * 1024;
 const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const runName = value => typeof value === 'string' && /^r-[a-f0-9]{32}$/.test(value);
@@ -81,69 +83,14 @@ async function archiveDigest(path) {
     return hash.digest('hex');
   } finally {await fd.close();}
 }
-// Paths remain bytes throughout inventory, transport, hashing and verification.
-export function pathParts(path) {
-  if (!Buffer.isBuffer(path) || !path.length || path[0] === 47 || path.some(b => b === 0 || b === 10 || b === 13))
-    throw new Error('Unsafe manifest path');
-  const parts = [];
-  let start = 0;
-  for (let i = 0; i <= path.length; i++) if (i === path.length || path[i] === 47) {
-    const part = path.subarray(start, i);
-    if (!part.length || part.equals(Buffer.from('.')) || part.equals(Buffer.from('..'))) throw new Error('Unsafe manifest path component');
-    parts.push(part); start = i + 1;
-  }
-  return parts;
-}
-export const bytePath = (root, path) => Buffer.concat([Buffer.from(root), Buffer.from('/'), path]);
-// latin1 preserves bytes while matching ASCII suffixes and directory names.
-export function isTestFile(path) {
-  const parts = path.toString('latin1').split('/');
-  const basename = parts.pop();
-  return /\.(test|spec)\.[cm]?[jt]sx?$/.test(basename)
-    || (/\.(?:js|mjs|cjs|ts|mts|cts|jsx|tsx)$/.test(basename)
-      && parts.some(part => /^(?:__tests__|__test__|test|tests|spec|specs|e2e)$/.test(part)));
-}
-
-// Test discovery consumes Unicode strings. Refuse names it could merge or lose;
-// non-test assets retain the byte-path transport contract.
-export function validateTestNames(paths) {
-  const normalized = new Set(), folded = new Set();
-  for (const path of paths.filter(isTestFile)) {
-    let name;
-    try { name = new TextDecoder('utf-8', {fatal:true, ignoreBOM:true}).decode(path); }
-    catch { throw new Error('Input digest mismatch: undecodable test name; use local fallback'); }
-    if (!Buffer.from(name).equals(path)) throw new Error('Input digest mismatch: undecodable test name; use local fallback');
-    const nfc = name.normalize('NFC');
-    // Upper then lower also detects expanding case pairs such as ß / SS.
-    const fold = nfc.toUpperCase().toLowerCase().normalize('NFC');
-    if (normalized.has(nfc) || folded.has(fold)) throw new Error('Input digest mismatch: test name collision; use local fallback');
-    normalized.add(nfc); folded.add(fold);
-  }
-}
-export function splitPaths(bytes) {
-  if (!Buffer.isBuffer(bytes) || bytes.length > LIMIT || (bytes.length && bytes.at(-1) !== 0)) throw new Error('Invalid manifest inventory framing');
-  const paths = [];
-  let start = 0;
-  for (let i = 0; i < bytes.length; i++) if (bytes[i] === 0) {
-    const path = bytes.subarray(start, i); pathParts(path); paths.push(path); start = i + 1;
-  }
-  return paths;
-}
-export const nulPaths = paths => Buffer.concat(paths.flatMap(path => [path, Buffer.from([0])]));
-export const manifestWire = ({entries, excluded, siblings}) => ({
-  paths:nulPaths(entries.map(entry => entry.path)).toString('base64'),
-  hashes:entries.map(entry => entry.sha256),
-  executable:entries.map(entry => entry.executable),
-  excluded:nulPaths(excluded).toString('base64'),
-  ...(siblings ? {siblings:{frontierui:{sha:siblings.frontierui.sha,...manifestWire(siblings.frontierui)}}} : {}),
-});
-export const digestManifest = manifest => sha(JSON.stringify(manifest));
+import {pathParts, bytePath, isTestFile, validateTestNames, splitPaths, nulPaths, manifestWire, digestManifest} from './forge-exec-manifest.mjs';
+export {pathParts, bytePath, isTestFile, validateTestNames, splitPaths, nulPaths, manifestWire, digestManifest};
 
 // No-follow opens pin file identity while reading. Injected IO supports byte-path
 // fixtures on filesystems which cannot create arbitrary Unix filenames.
 export async function readManifestFile(path, st, fs = filesystem) {
   if (fs !== filesystem) return fs.readFile(path);
-  const fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const pinned = await fd.stat();
     if (!pinned.isFile() || pinned.ino !== st.ino || pinned.dev !== st.dev || pinned.mode !== st.mode)
@@ -337,7 +284,8 @@ function execute(file,args,{cwd,env,input,inherit=false,detached=false,passFd}={
 }
 // testRoot/testPath/testCleanupExec are explicit dependency injection only. CLI never reads them
 // from its environment, nor transports them in requests.
-export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
+export function createRunner({testRoot, testPath, testCleanupExec, clock=Date.now} = {}) {
+  const bases=testRoot ? join(testRoot,'bases') : '/srv/forge-base';
   const runs = testRoot ? join(testRoot,'runs') : '/srv/forge-exec';
   const receipts = testRoot ? join(testRoot,'receipts') : '/srv/forge-receipts';
   const cache = testRoot ? join(testRoot,'cache') : '/srv/forge-cache';
@@ -405,57 +353,54 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
     }
     await walk(dir);return found;
   }
-  return {
-    async prepare({nonce,label,siblings}) {
-      await init();
-      if(!nonceOK(nonce) || (label!==undefined && (typeof label!=='string' || !/^[a-z0-9][a-z0-9-]{5,63}$/.test(label)))) throw new Error('Invalid prepare');
-      const run='r-'+randomBytes(16).toString('hex');
-      await mkdir(join(runs,run),{mode:0o755}); // exclusive server-generated name
-      const work=join(runs,run,'work');
-      await mkdir(work,{mode:0o755});
-      if(!testRoot) {
-        const result=await execute('/usr/bin/sudo',['-n','/usr/bin/chown','forge-exec:forge-exec',work]);
-        if(result.code) throw new Error('Worker ownership failed');
+  // Cross-main reuse is available only for registry-only installs. Workspaces,
+  // local packages/tarballs, unknown lock formats and unproven resolutions keep
+  // the existing complete-snapshot cache key and install normally.
+  async function registryInstallSignature(work,request) {
+    try {
+      const root=JSON.parse(await readPinned(join(work,'package.json'))),lock=JSON.parse(await readPinned(join(work,'package-lock.json')));
+      if(root.workspaces||lock.lockfileVersion!==3||!lock.packages||typeof lock.packages!=='object')return null;
+      if(/(?:file:|link:|workspace:)/i.test(JSON.stringify([root,lock])))return null;
+      for(const [name,pkg] of Object.entries(lock.packages)) {
+        if(!pkg||typeof pkg!=='object'||pkg.link)return null;
+        if(name&&(!/^https:\/\//.test(pkg.resolved)||typeof pkg.integrity!=='string'||!pkg.integrity))return null;
       }
-      if (siblings === true) {
-        const sibling = join(runs,run,'frontierui');
-        await mkdir(sibling,{mode:0o755});
-        if (!testRoot && (await execute('/usr/bin/sudo',['-n','/usr/bin/chown','forge-exec:forge-exec',sibling])).code)
-          throw new Error('Sibling ownership failed');
-      }
-      await writeFile(statePath(run,'prepared'),JSON.stringify({v:1,nonce,run}),{flag:'wx',mode:0o600});
-      return {run,capabilities:{siblings:1}};
-    },
-    async run(request) {
-      const prepared=await state(request,'prepared');
-      try {
-      if(!allowedCommand(request.argv) || !allowedEnv(request.env) || !hex(request.lock) || !hex(request.inputDigest)
-        || request.argvDigest!==digestArgv(request.argv)) throw new Error('Invalid execution parameters');
-      return await exclusiveWorker(async command => {
-      const container=join(runs,request.run),work=join(container,'work');
-      await directory(container,true); await directory(work);
-      // Preserve the dual-lock refusal before inspecting snapshot differences.
-      const lock = await digestLock(work);
-      // Verify before npm or cache extraction can add generated files.
-      await verifyManifest(work,request.manifest,request.manifestDigest);
-      if (request.manifest.siblings) {
-        if (!sameSiblingShas(request.siblingShas,siblingShas(request.manifest))) throw new Error('Sibling SHA mismatch');
-      } else {
-        if (request.siblingShas !== undefined) throw new Error('Unexpected sibling SHA');
-        const sibling = join(container,'frontierui');
-        const info = await lstat(sibling).catch(error => {if(error.code !== 'ENOENT') throw error;});
-        if (info && (info.isSymbolicLink() || !info.isDirectory() || (await readdir(sibling)).length)) throw new Error('Extra sibling snapshot');
-      }
-      if(await digestInput(work)!==request.inputDigest || lock!==request.lock) throw new Error('Input digest mismatch');
-      await rename(statePath(request.run,'prepared'),statePath(request.run,'running'));
-      let phase='install',result={code:97,stdout:'',stderr:''};
+      const inputs=decodeManifest((({siblings,...rest})=>rest)(request.manifest)).entries.filter(e=>e.path.toString('latin1').split('/').at(-1)==='package.json');
+      return sha(JSON.stringify({lock:request.lock,packages:inputs.map(e=>[e.path.toString('base64'),e.sha256,e.executable]),node:process.version,platform:process.platform,arch:process.arch,install:['ci','--include=dev','--ignore-scripts','--no-audit','--no-fund']}));
+    }catch{return null;}
+  }
+  async function copyCacheArchive(source,destination,expected) {
+    if(await archiveDigest(source)!==expected)throw new Error('Warm cache digest mismatch');
+    const input=await open(source,constants.O_RDONLY|constants.O_NOFOLLOW),output=await open(destination,constants.O_WRONLY|constants.O_CREAT|constants.O_EXCL|constants.O_NOFOLLOW,0o600);
+    try {for await(const chunk of input.createReadStream({autoClose:false}))await output.writeFile(chunk);}
+    finally{await input.close();await output.close();}
+    if(await archiveDigest(destination)!==expected)throw new Error('Warm copied cache digest mismatch');
+  }
+  async function reuseWarmProfile(signature,request) {
+    const parent=join(cache,request.lock),profile=join(parent,'dev-v5-'+(request.manifest.siblings?request.manifestDigest:request.inputDigest));
+    const index=signature?join(parent,'.warm-inputs-'+signature):null;
+    const record=index?await readPinned(index).then(bytes=>JSON.parse(bytes),error=>{if(error.code!=='ENOENT')throw error;return null;}):null;
+    if(!record)return false;
+    if(Object.keys(record).sort().join(',')!=='archiveDigest,profile'||!hex(record.profile)||!hex(record.archiveDigest))throw new Error('Invalid warm install evidence');
+    const source=join(parent,'dev-v5-'+record.profile);await directory(parent,true);await directory(source,true);
+    if((await readPinned(join(source,'sha256'))).toString()!==record.archiveDigest||await archiveDigest(join(source,'dependencies.tar'))!==record.archiveDigest)throw new Error('Warm cache digest mismatch');
+    if(source!==profile) {
+      await mkdir(profile,{mode:0o700}).catch(e=>{if(e.code!=='EEXIST')throw e;});await directory(profile,true);
+      const target=join(profile,'dependencies.tar');
+      const exists=await lstat(target).then(()=>true,error=>{if(error.code!=='ENOENT')throw error;return false;});
+      if(exists){if(await archiveDigest(target)!==record.archiveDigest||(await readPinned(join(profile,'sha256'))).toString()!==record.archiveDigest)throw new Error('Warm target cache mismatch');}
+      else {const pending=join(profile,'pending-'+randomBytes(8).toString('hex'));await copyCacheArchive(join(source,'dependencies.tar'),pending,record.archiveDigest);await writeFile(join(profile,'sha256'),record.archiveDigest,{flag:'wx',mode:0o600});await rename(pending,target);}
+    }
+    return true;
+  }
+  async function installDependencies(request,work,command) {
+    let result;
       // npm accepts some manifest changes without lock changes. Key the entire
       // validated snapshot, including workspace manifests and local dependency
       // contents, so a warm archive represents the same install inputs. Earlier
       // profiles lack this binding (v3 also allowed an unkeyed shrinkwrap).
       const profile=join(cache,request.lock,'dev-v5-'+(request.manifest.siblings ? request.manifestDigest : request.inputDigest));
       const installEnv={PATH:path,HOME:join(work,'.forge-home'),LANG:'C',CI:'true',NODE_ENV:'development'};
-      try {
         // These parents are inaccessible to forge-exec; reject symlinked cache state.
         await mkdir(join(cache,request.lock),{mode:0o700}).catch(e=>{if(e.code!=='EEXIST') throw e;});
         await directory(join(cache,request.lock),true);
@@ -470,6 +415,7 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
           // Historical .busy directories are inert, including abandoned ones.
           const locked=await execute('/usr/bin/python3',['-I','-c','import fcntl; fcntl.flock(3, fcntl.LOCK_EX | fcntl.LOCK_NB)'],{passFd:guard.fd});
           if(locked.code) throw new Error('Cache profile lock unavailable; use local fallback');
+          await reuseWarmProfile(await registryInstallSignature(work,request),request);
           const archive=join(profile,'dependencies.tar');
           const warm=await lstat(archive).then(()=>true,e=>{if(e.code==='ENOENT') return false; throw e;});
           const ci=['npm','ci','--include=dev','--ignore-scripts','--no-audit','--no-fund'];
@@ -489,10 +435,138 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
             await rename(temp,archive);
           }
         } finally {await guard.close();}
+    return result;
+  }
+  return {
+    async bases() {
+      try{return {delta:1,bases:(await readyBases(bases)).slice(0,4).map(({sha,manifestDigest})=>({sha,manifestDigest}))};}
+      catch{return {delta:1,bases:[]};}
+    },
+    async ['base-manifest']({sha}) {
+      return baseGuard(bases,async()=>{
+        const ready=(await readyBases(bases)).find(base=>base.sha===sha);
+        if(!ready)throw new Error('Unknown READY base');
+        return (await readBase(bases,sha,ready.manifestDigest)).manifest;
+      });
+    },
+    // Called only by the fixed warmer, never exposed in the stdin CLI protocol.
+    async warmInstall(source,manifest) {
+      await init();
+      return exclusiveWorker(async command=>{
+        const work=join(runs,'warm-'+randomBytes(16).toString('hex'));
+        await mkdir(work,{mode:0o755});
+        try {
+          const entries=decodeManifest(manifest).entries;
+          await copyLeaves(source,work,entries);
+          await verifyManifest(work,manifest,digestManifest(manifest));
+          if(!testRoot&&(await execute('/usr/bin/sudo',['-n','/usr/bin/chown','-R','-h','--','forge-exec:forge-exec',work])).code)throw new Error('Warm worker ownership failed');
+          const request={lock:await digestLock(work),inputDigest:await digestInput(work),manifest,manifestDigest:digestManifest(manifest)};
+          const signature=await registryInstallSignature(work,request),parent=join(cache,request.lock),profile=join(parent,'dev-v5-'+request.inputDigest);
+          const index=signature?join(parent,'.warm-inputs-'+signature):null;
+          if(!await reuseWarmProfile(signature,request)) {
+            await installDependencies(request,work,command);
+            if(index) {
+              const archiveDigestValue=await archiveDigest(join(profile,'dependencies.tar'));
+              const pending=index+'-'+randomBytes(8).toString('hex');
+              await writeFile(pending,JSON.stringify({profile:request.inputDigest,archiveDigest:archiveDigestValue}),{flag:'wx',mode:0o600});await rename(pending,index);
+            }
+          }
+          return {code:0};
+        } finally {
+          if(testRoot)await rm(work,{recursive:true,force:true});
+          else if((await execute('/usr/bin/sudo',['-n','/usr/bin/rm','-rf','--',work])).code)throw new Error('Warm cleanup failed');
+        }
+      });
+    },
+    async prepare({nonce,label,siblings,baseSha,baseManifestDigest}) {
+      await init();
+      if(!nonceOK(nonce) || (label!==undefined && (typeof label!=='string' || !/^[a-z0-9][a-z0-9-]{5,63}$/.test(label)))) throw new Error('Invalid prepare');
+      const run='r-'+randomBytes(16).toString('hex');
+      await mkdir(join(runs,run),{mode:0o755}); // exclusive server-generated name
+      const work=join(runs,run,'work');
+      await mkdir(work,{mode:0o755});
+      if(!testRoot) {
+        const result=await execute('/usr/bin/sudo',['-n','/usr/bin/chown','forge-exec:forge-exec',work]);
+        if(result.code) throw new Error('Worker ownership failed');
+      }
+      if (siblings === true) {
+        const sibling = join(runs,run,'frontierui');
+        await mkdir(sibling,{mode:0o755});
+        if (!testRoot && (await execute('/usr/bin/sudo',['-n','/usr/bin/chown','forge-exec:forge-exec',sibling])).code)
+          throw new Error('Sibling ownership failed');
+      }
+      await writeFile(statePath(run,'prepared'),JSON.stringify({v:1,nonce,run}),{flag:'wx',mode:0o600});
+      if(baseSha!==undefined)await baseGuard(bases,async()=>{
+        await readBase(bases,baseSha,baseManifestDigest);
+        await mkdir(join(bases,'active'),{recursive:true,mode:0o700});
+        await writeFile(join(bases,'active',run),baseSha,{flag:'wx',mode:0o600});
+        await writeFile(statePath(run,'base'),JSON.stringify({baseSha,baseManifestDigest}),{flag:'wx',mode:0o600});
+      });
+      return {run,capabilities:{siblings:1,...await this.bases()}};
+    },
+    async run(request) {
+      const prepared=await state(request,'prepared');
+      try {
+      if(!allowedCommand(request.argv) || !allowedEnv(request.env) || !hex(request.lock) || !hex(request.inputDigest)
+        || request.argvDigest!==digestArgv(request.argv)) throw new Error('Invalid execution parameters');
+      return await exclusiveWorker(async command => {
+      const container=join(runs,request.run),work=join(container,'work');
+      await directory(container,true); await directory(work);
+      if(request.baseSha!==undefined) {
+        await baseGuard(bases,async()=>{
+          const base=await readBase(bases,request.baseSha,request.baseManifestDigest);
+          // Direct run requests pin before reading, as do prepared delta clients.
+          await mkdir(join(bases,'active'),{recursive:true,mode:0o700});
+          const pin=join(bases,'active',request.run);
+          try{await writeFile(pin,request.baseSha,{flag:'wx',mode:0o600});}catch(e){if(e.code!=='EEXIST'||(await baseFile(pin)).toString()!==request.baseSha)throw e;}
+          await verifyManifest(base.tree,base.manifest,request.baseManifestDigest);
+          if(typeof request.deletions!=='string'||Buffer.from(request.deletions,'base64').toString('base64')!==request.deletions)throw new Error('Invalid deletion list');
+          const deletions=splitPaths(Buffer.from(request.deletions,'base64'));
+          const baseEntries=decodeManifest(base.manifest).entries,finalEntries=decodeManifest((({siblings,...rest})=>rest)(request.manifest)).entries;
+          const finalKeys=new Set(finalEntries.map(e=>e.path.toString('hex')));
+          const deleted=new Set(deletions.map(p=>p.toString('hex')));
+          if(deleted.size!==deletions.length||deletions.some(p=>!baseEntries.some(e=>e.path.equals(p))||finalKeys.has(p.toString('hex'))))throw new Error('Invalid deletion path');
+          // Walk every incoming delta leaf before overlay: reject unknown files,
+          // symlinks and special nodes, even when final verification would omit it.
+          const incoming=[];
+          const walk=async prefix=>{for(const name of await readdir(prefix.length?bytePath(work,prefix):work,{encoding:'buffer'})){const p=prefix.length?Buffer.concat([prefix,Buffer.from('/'),name]):name;pathParts(p);const st=await lstat(bytePath(work,p));if(st.isSymbolicLink())throw new Error('Delta symlink');if(st.isDirectory())await walk(p);else {if(!st.isFile())throw new Error('Delta special file');const entry=finalEntries.find(e=>e.path.equals(p));if(!entry)throw new Error('Unlisted delta leaf');incoming.push(entry);}}};
+          await walk(Buffer.alloc(0));
+          const overlay=new Set(incoming.map(e=>e.path.toString('hex'))),assembled=join(container,'assembled');
+          await mkdir(assembled,{mode:0o755});
+          await copyLeaves(base.tree,assembled,baseEntries.filter(e=>!deleted.has(e.path.toString('hex'))&&!overlay.has(e.path.toString('hex'))));
+          await copyLeaves(work,assembled,incoming);
+          // Verify primary full M before installing and before exposing any of
+          // the reconstructed bytes to the worker. Siblings remain Mac-shipped.
+          await verifyManifest(assembled,(({siblings,...rest})=>rest)(request.manifest),digestManifest((({siblings,...rest})=>rest)(request.manifest)));
+          if(!testRoot&&(await execute('/usr/bin/sudo',['-n','/usr/bin/chown','-R','-h','--','forge-exec:forge-exec',assembled])).code)throw new Error('Delta ownership failed');
+          await rename(work,join(container,'delta'));await rename(assembled,work);
+        });
+      } else if(request.deletions!==undefined||request.baseManifestDigest!==undefined)throw new Error('Unexpected delta evidence');
+      // Preserve the dual-lock refusal before inspecting snapshot differences.
+      const lock = await digestLock(work);
+      // Verify before npm or cache extraction can add generated files.
+      await verifyManifest(work,request.manifest,request.manifestDigest);
+      if (request.manifest.siblings) {
+        if (!sameSiblingShas(request.siblingShas,siblingShas(request.manifest))) throw new Error('Sibling SHA mismatch');
+      } else {
+        if (request.siblingShas !== undefined) throw new Error('Unexpected sibling SHA');
+        const sibling = join(container,'frontierui');
+        const info = await lstat(sibling).catch(error => {if(error.code !== 'ENOENT') throw error;});
+        if (info && (info.isSymbolicLink() || !info.isDirectory() || (await readdir(sibling)).length)) throw new Error('Extra sibling snapshot');
+      }
+      if(await digestInput(work)!==request.inputDigest || lock!==request.lock) throw new Error('Input digest mismatch');
+      await rename(statePath(request.run,'prepared'),statePath(request.run,'running'));
+      let phase='install',result={code:97,stdout:'',stderr:''};
+      const installAt=clock();let installMs=0,runMs=0,runAt;
+      try {
+        result=await installDependencies(request,work,command);
+        installMs=Math.max(0,Math.round(clock()-installAt));
         phase='test';
+        runAt=clock();
         result=await command(request.argv,work,{PATH:path,HOME:join(work,'.forge-home'),...request.env});
       } catch(error) {const code=phase==='install'?97:254; if(phase==='test') phase='supervisor'; result={code,stdout:result.stdout,stderr:String(error.message)};}
-      const receipt={...prepared,...(request.manifest.siblings ? {siblingShas:siblingShas(request.manifest)} : {}),manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code};
+      if(runAt!==undefined)runMs=Math.max(0,Math.round(clock()-runAt));else installMs=Math.max(0,Math.round(clock()-installAt));
+      const receipt={...prepared,timings:{installMs,runMs},...(request.manifest.siblings ? {siblingShas:siblingShas(request.manifest)} : {}),manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code};
       await writeFile(statePath(request.run,'receipt'),JSON.stringify(receipt),{flag:'wx',mode:0o600});
       return result;
       });
@@ -501,7 +575,7 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
         // protected ops state. Never infer not-started from worker-owned files.
         const stillPrepared = await lstat(statePath(request.run,'prepared')).catch(e => {if(e.code !== 'ENOENT') throw e;});
         if (stillPrepared) {
-          await writeFile(statePath(request.run,'rejected'),JSON.stringify({...prepared,phase:'rejected',reason:'snapshot-rejected',siblings:!!request.manifest?.siblings}),{flag:'wx',mode:0o600}).catch(async e => {if (e.code !== 'EEXIST') throw e; await state(request,'rejected');});
+          await writeFile(statePath(request.run,'rejected'),JSON.stringify({...prepared,phase:'rejected',reason:'snapshot-rejected',siblings:!!request.manifest?.siblings,...(request.baseSha!==undefined?{delta:true}:{})}),{flag:'wx',mode:0o600}).catch(async e => {if (e.code !== 'EEXIST') throw e; await state(request,'rejected');});
         }
         throw error;
       }
@@ -529,15 +603,17 @@ export function createRunner({testRoot, testPath, testCleanupExec} = {}) {
       await rm(statePath(request.run,'receipt'),{force:true});
       const rejected = await readPinned(statePath(request.run,'rejected')).then(bytes => JSON.parse(bytes),error => {if(error.code !== 'ENOENT') throw error;});
       await rm(statePath(request.run,'rejected'),{force:true});
+      await rm(join(bases,'active',request.run),{force:true});
+      await rm(statePath(request.run,'base'),{force:true});
       // Legacy callers retain their null finish response for non-sibling failures.
       // Never certify rejection once the protected run phase has started.
-      return receipt ?? (phase === 'prepared' && rejected?.siblings ? {...rejected,started:false} : null) ?? null;
+      return receipt ?? (phase === 'prepared' && (rejected?.siblings||rejected?.delta) ? {...rejected,started:false} : null) ?? null;
     },
   };
 }
 if(process.argv[1] && await realpath(process.argv[1]).catch(()=> '') === await realpath(fileURLToPath(import.meta.url))) {
   try {
-    if(process.argv.length!==3 || !['prepare','run','finish'].includes(process.argv[2])) throw new Error('Invalid subcommand');
+    if(process.argv.length!==3 || !['prepare','run','finish','bases','base-manifest'].includes(process.argv[2])) throw new Error('Invalid subcommand');
     let input='';
     process.stdin.setEncoding('utf8');
     for await(const chunk of process.stdin) {input+=chunk; if(Buffer.byteLength(input)>LIMIT) throw new Error('Request limit exceeded');}

@@ -8,12 +8,20 @@ import { createHash } from 'node:crypto';
 import * as filesystem from 'node:fs/promises';
 import {
   isAllowedCommand, filterEnv, validateRunId,
-  runRemote, main as runRemoteCli, parseArgs,
+  runRemote as timedRunRemote, main as runRemoteCli, parseArgs,
 } from '../remote-exec.mjs';
 import { createRunner, digestInput, digestArgv } from '../forge-exec-run.mjs';
 import * as remoteManifestAPI from '../remote-exec.mjs';
 import * as forgeManifestAPI from '../forge-exec-run.mjs';
 import { adaptLegacyRemoteResult, resolveAdmissionPolicy, runWithRemoteDecision } from '../heavy-admission.mjs';
+
+// Retain every exact legacy/security assertion while checking the added result field.
+async function runRemote(options) {
+  const {timings, ...legacy} = await timedRunRemote(options);
+  expect(Array.isArray(timings)).toBe(true);
+  expect(timings.at(-1)).toMatchObject({stage:'total',ms:expect.any(Number),startedAtET:expect.any(String)});
+  return legacy;
+}
 
 const argv = ['npm', 'run', 'test:unit', '--', 'a.test.mjs'];
 const runId = 'abcdef-1';
@@ -57,6 +65,7 @@ function fixture({ probeCode = 0, copyCode = 0, prepareCode = 0, runCode = 0, re
       return { code: 0, stdout: Buffer.from(records.join('\0') + '\0') };
     }
     if (call.file === 'rsync') return { code: copyCode, stdout: '' };
+    if (call.file === 'ssh' && sshText(call).endsWith(' bases')) return {code:254,stdout:''};
     if (isPrepare(call)) {
       state = JSON.parse(call.input);
       state.run = 'r-' + state.nonce;
@@ -1821,4 +1830,56 @@ node -e "const fs=require('fs'); for(const name of ['plugs','webtheme']) {if(!fs
     expect(await runRemoteCli({...f,log:vi.fn()})).toBe(7);
     expect(f.local).toHaveBeenCalledOnce();
   });
+});
+
+
+describe('offload stage evidence', () => {
+  it('records ordered stages with an injected clock and Eastern offset, including transfer counts', async () => {
+    const f=fixture({receipt:(_nonce,value,state)=>JSON.stringify({...value,manifestDigest:state.manifestDigest,timings:{installMs:12,runMs:34}})});
+    let now=Date.parse('2026-07-01T12:00:00Z');
+    const result=await timedRunRemote({...f,clock:()=>{const value=now;now+=10;return value;}});
+    expect(result.mode).toBe('remote');
+    expect(result.timings.map(value=>value.stage)).toEqual(['manifest-build','mac-stage-and-rehash','forge-prepare','rsync','forge-install','forge-run','finish-receipt','total']);
+    for(const stage of result.timings) {
+      expect(stage.startedAtET).toMatch(/^2026-07-01T08:00:\d{2}\.\d{3}-04:00$/);
+      expect(Number.isInteger(stage.ms) && stage.ms>=0).toBe(true);
+    }
+    expect(result.timings.find(s=>s.stage==='forge-install').ms).toBe(12);
+    expect(result.timings.find(s=>s.stage==='forge-run').ms).toBe(34);
+    expect(result.timings.find(s=>s.stage==='rsync')).toMatchObject({shipMode:'full',fileCount:2,bytesSent:expect.any(Number)});
+  });
+  it('formats winter timestamps with the Eastern standard offset even for early fallback', async () => {
+    const result=await timedRunRemote({argv:[],clock:()=>Date.parse('2026-01-01T12:00:00Z')});
+    expect(result.timings).toEqual([{stage:'total',startedAtET:'2026-01-01T07:00:00.000-05:00',ms:0}]);
+  });
+  it.each([undefined,{installMs:0,runMs:42}])('accepts optional exact runner timings %j', timings => {
+    const expected={v:1,nonce:'a'.repeat(32),run:'r-'+'b'.repeat(32),inputDigest:'c'.repeat(64),argvDigest:'d'.repeat(64),lock:'e'.repeat(64),manifestDigest:'f'.repeat(64)};
+    expect(remoteManifestAPI.verifyReceipt(JSON.stringify({...expected,phase:'test',code:0,...(timings?{timings}:{})}),expected,0)).toBe(true);
+  });
+  it.each([null,[],{installMs:'1',runMs:2},{installMs:1.5,runMs:2},{installMs:-1,runMs:2},{installMs:1},{installMs:1,runMs:2,extra:3}])('rejects malformed optional receipt timings %j', timings=>{
+    const expected={v:1,nonce:'a'.repeat(32),run:'r-'+'b'.repeat(32),inputDigest:'c'.repeat(64),argvDigest:'d'.repeat(64),lock:'e'.repeat(64),manifestDigest:'f'.repeat(64)};
+    expect(remoteManifestAPI.verifyReceipt(JSON.stringify({...expected,phase:'test',code:0,timings}),expected,0)).toBe(false);
+  });
+});
+
+
+it('CLI prints one compact timing table to stderr after remote completion',async()=>{
+  const stderr=vi.spyOn(process.stderr,'write').mockImplementation(()=>true);
+  const timings=[{stage:'total',startedAtET:'2026-01-01T07:00:00.000-05:00',ms:12}];
+  try {
+    expect(await runRemoteCli({argv,remoteExec:async()=>({mode:'remote',code:0,timings}),log:vi.fn()})).toBe(0);
+    expect(stderr).toHaveBeenCalledOnce();
+    expect(stderr.mock.calls[0][0]).toContain('total');
+    expect(stderr.mock.calls[0][0]).toContain('12');
+    expect(stderr.mock.calls[0][0]).toContain('2026-01-01T07:00:00.000-05:00');
+  }finally{stderr.mockRestore();}
+});
+
+
+it('includes an attempted manifest stage on failure and measures old-runner wall run time',async()=>{
+  const failed=fixture();failed.listFiles.mockResolvedValue(['missing-leaf']);
+  expect((await timedRunRemote(failed)).timings.map(t=>t.stage)).toEqual(['manifest-build','total']);
+  const completed=await timedRunRemote(fixture());
+  expect(completed.timings.find(t=>t.stage==='forge-run')).toMatchObject({ms:expect.any(Number)});
+  expect(completed.timings.find(t=>t.stage==='forge-install')).toBeUndefined();
 });

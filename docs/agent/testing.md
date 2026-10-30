@@ -1905,6 +1905,51 @@ Redirect `WE_RESOLVE_CONFLICT_LOG` to temporary storage. Permission-denial compl
 `denied`, hold for 60 minutes, and surface a `permission-blocked` note immediately; they are
 separate from transient infrastructure failures and their retry streak.
 
+### Forge warm bases and delta snapshots
+
+The Mac client and public-base warmer share `forge-exec-manifest.mjs`: path bytes,
+ordering, exclusions, credential-name policy, and leaf hashing must stay identical.
+Run `forge-offload.test.mjs` alongside the existing remote client, runner, output-boundary,
+and admission-contract test files through heavy-admission when changing this protocol.
+Exercise the actual rsync file list and full reconstructed manifest, including executable
+bits, worktree deletions, public credential-named sources, and ignored/excluded tests.
+
+Read-only `bases` discovery precedes local admission so older runners keep their original
+full-ship order: no prepared run or transported bytes before snapshot admission/staging.
+The subsequent `prepare` response must confirm the chosen base and pin it in ops-owned
+state. Base pin creation and pruning share a guard; unknown or unreadable evidence keeps
+pruning closed. A worker receives independent copies, and the existing full-tree manifest
+and input-digest checks still run before cache extraction or npm. Pre-run delta build or
+transport failures rebuild through full shipping; execution ambiguity never retries.
+Delta membership compares a fresh no-follow read and SHA-256 of every final Mac worktree
+leaf (plus its executable bit) against the base, including Git-clean CRLF/filter output;
+Git diff supplies ordering hints only. Unchanged leaves skip staging and rsync, not the
+initial read/hash. Pin this with real Git autocrlf and post-diff race fixtures.
+Each warm tick revalidates retained READY records and their tree count/metadata digest;
+a missing tree marker requires one full manifest verification before publication, while
+mismatched evidence removes and rebuilds the base. Test both legacy-marker migration and
+same-size corruption. A bound protected delta rejection with `started=false` permits
+exactly one fresh full prepare; test the second rejection and ambiguous receipt paths,
+and require `shipMode: delta-then-full` in transfer timings.
+
+The standalone installer embeds the fixed allowlisted dependency graph into both installed
+programs. Probe both installed programs outside the repository's ESM package boundary.
+The warmer fetches only the explicit public HTTPS URL with a fresh credential-free Git
+environment; private siblings always remain Mac snapshots. Its timer runs as ops under
+flock, and only atomically published READY trees are candidates.
+
+Cache profiles retain their complete snapshot/sibling binding. The fixed warmer may seed
+another complete profile only with matching registry-only install evidence (all package
+manifests, lock, runtime/platform, fixed install flags). Workspaces, local dependencies,
+unknown locks and unproven resolutions use the original full-input cache/install path.
+Check archive hashes on both source and destination; normal runs still validate npm before
+extracting a seeded profile. Cover sibling-bound profiles as well as primary-only runs.
+
+Stage timings use an injected millisecond clock and Eastern timestamps with the actual
+seasonal offset. Install/run durations come from optional, strictly typed receipt timing
+fields; older runners provide only a combined wall run duration. Transfer byte counts
+represent staged file payload, including separately shipped sibling files.
+
 ### Direct heavy-run hook probes
 
 The `heavy-enforce` guard requires admission even for one-file Vitest runs, `related`,

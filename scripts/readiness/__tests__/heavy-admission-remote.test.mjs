@@ -355,7 +355,7 @@ describe('runWithRemoteDecision', () => {
           remoteExec: (options) => runRemote({ ...options, exec, listFiles: async () => files }),
         });
         if (!result.handled) local();
-        expect(actions).toEqual(['true', 'prepare', 'run', 'finish']);
+        expect(actions).toEqual(['true', 'bases', 'prepare', 'run', 'finish']);
         expect(result).toEqual({ handled: true, exitCode: 124 });
         expect(local).not.toHaveBeenCalled();
         expect(log.mock.calls[1][0]).toContain('ambiguous-result');
@@ -510,4 +510,11 @@ describe('runWithRemoteDecision', () => {
     expectLines(f.log, 2, 'remote');
     expect(f.log.mock.calls[1][0]).toContain('refusing local rerun');
   });
+});
+
+
+it('carries stage timings through legacy pre-execution adaptation without changing the decision', () => {
+  const timings=[{stage:'total',startedAtET:'2026-01-01T07:00:00.000-05:00',ms:12}];
+  expect(adaptLegacyRemoteResult({mode:'fallback',reason:'copy-failed',timings}))
+    .toEqual({mode:'not-started',terminated:true,reason:'copy-failed',timings});
 });

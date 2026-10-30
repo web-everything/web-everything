@@ -432,7 +432,7 @@ const LEGACY_REMOTE_PRE_EXECUTION_REASONS = Object.freeze([
 /** Translate only known pre-execution refusals from the legacy executor into confirmed non-starts. */
 export function adaptLegacyRemoteResult(result) {
   if (result?.mode === 'fallback' && LEGACY_REMOTE_PRE_EXECUTION_REASONS.includes(result.reason)) {
-    return { mode: 'not-started', terminated: true, reason: result.reason };
+    return { mode: 'not-started', terminated: true, reason: result.reason, ...(result.timings ? {timings:result.timings}: {}) };
   }
   return result;
 }

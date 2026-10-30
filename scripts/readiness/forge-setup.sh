@@ -48,7 +48,8 @@ try:
     finally:
         os.close(root)
     for name, uid, group, mode in [("forge-receipts", ops.pw_uid, ops.pw_gid, 0o700),
-                                    ("forge-cache", 0, ops.pw_gid, 0o770)]:
+                                    ("forge-cache", 0, ops.pw_gid, 0o770),
+                                    ("forge-base", ops.pw_uid, ops.pw_gid, 0o700)]:
         try:
             os.mkdir(name, 0o700, dir_fd=with_parent)
         except FileExistsError:
@@ -88,38 +89,88 @@ try:
         st = os.fstat(dest)
         if st.st_uid != 0 or st.st_mode & 0o022:
             raise RuntimeError("untrusted libexec")
-        source = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW)
-        try:
+        # Bundle only this fixed, explicitly allowlisted source graph. All
+        # installed imports resolve to node builtins, including on Node 22.1.
+        import re, json
+        source_dir = os.path.dirname(sys.argv[1])
+        allowed = {"forge-exec-run.mjs", "forge-exec-siblings.mjs", "forge-exec-manifest.mjs", "forge-exec-bases.mjs", "forge-warm-base.mjs"}
+        def bundle(filename, nested=False):
+            if filename not in allowed:
+                raise RuntimeError("unexpected wrapper dependency")
+            srcfd = os.open(os.path.join(source_dir, filename), os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(srcfd, "r") as src:
+                code = src.read()
+            code = re.sub(r"^#![^\n]*\n", "", code)
+            if nested:
+                code = code.split("\nif(process.argv[1]", 1)[0]
+            exports = re.findall(r"export (?:async )?function (\w+)|export const (\w+)", code)
+            names = [a or b for a, b in exports]
+            for group in re.findall(r"export \{([^}]+)\};", code):
+                names.extend(n.strip() for n in group.split(","))
+            code = re.sub(r"export \{[^}]+\};", "", code)
+            code = re.sub(r"\bexport (?=(?:async )?function |const )", "", code)
+            def dependency(match):
+                binding, spec = match.groups()
+                if spec.startswith("node:"):
+                    value = "await import(" + json.dumps(spec) + ")"
+                elif spec.startswith("./"):
+                    value = bundle(spec[2:], True)
+                else:
+                    raise RuntimeError("non-builtin external dependency")
+                binding = binding.strip()
+                if binding.startswith("* as "):
+                    binding = binding[5:]
+                return "const " + binding + " = " + value + ";"
+            code = re.sub(r"import\s+([^;]+?)\s+from\s+['\"]([^'\"]+)['\"];", dependency, code)
+            if nested:
+                return "(await (async () => {\n" + code + "\nreturn {" + ",".join(dict.fromkeys(names)) + "};\n})())"
+            return "#!/usr/bin/env node\n" + code
+        for filename in ["forge-exec-run.mjs", "forge-warm-base.mjs"]:
             name = ".forge-exec-run-" + secrets.token_hex(16)
             fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700, dir_fd=dest)
             try:
-                with os.fdopen(source, "rb", closefd=False) as src:
-                    with os.fdopen(fd, "wb", closefd=False) as out:
-                        # Keep the installed runner standalone (including Node 22.1).
-                        # The same data-only constant is imported by vitest.shared.ts.
-                        module = os.open(os.path.join(os.path.dirname(sys.argv[1]), "forge-exec-siblings.mjs"), os.O_RDONLY | os.O_NOFOLLOW)
-                        with os.fdopen(module, "rb") as data:
-                            constants = data.read()
-                        code = src.read()
-                        binding = b"import {SIBLING_PATHS} from './forge-exec-siblings.mjs';\nexport {SIBLING_PATHS};"
-                        if code.count(binding) != 1:
-                            raise RuntimeError("missing sibling allowlist binding")
-                        out.write(code.replace(binding, constants))
-                        out.flush()
+                with os.fdopen(fd, "w", closefd=False) as out:
+                    out.write(bundle(filename))
+                    out.flush()
                 os.fchown(fd, 0, 0)
                 os.fchmod(fd, 0o755)
                 os.fsync(fd)
             finally:
                 os.close(fd)
-            # Preserve explicit ESM resolution on Node 22.1 outside a package.
-            os.rename(name, "forge-exec-run.mjs", src_dir_fd=dest, dst_dir_fd=dest)
-        finally:
-            os.close(source)
+            os.rename(name, filename, src_dir_fd=dest, dst_dir_fd=dest)
     finally:
         os.close(dest)
 finally:
     os.close(parent)
 WRAPPER
+# Ops owns the public bare repository. No remote configuration or credentials
+# are copied from the Mac; each tick supplies the public HTTPS URL explicitly.
+sudo -n -u ops env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/nonexistent GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 git -c credential.helper= init --bare /srv/forge-base/repo.git
+cat > /etc/systemd/system/forge-warm-base.service <<'SERVICE'
+[Unit]
+Description=Prepare anonymous public Web Everything bases
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+User=ops
+UMask=0022
+ExecStart=/usr/bin/flock -n /srv/forge-base/.tick.lock /usr/local/libexec/forge-warm-base.mjs
+TimeoutStartSec=20min
+SERVICE
+cat > /etc/systemd/system/forge-warm-base.timer <<'TIMER'
+[Unit]
+Description=Refresh public Forge bases every 30 seconds
+[Timer]
+OnCalendar=*-*-* *:*:00,30
+Persistent=true
+AccuracySec=1s
+Unit=forge-warm-base.service
+[Install]
+WantedBy=timers.target
+TIMER
+systemctl daemon-reload
+systemctl enable --now forge-warm-base.timer
 cat > /etc/cron.daily/forge-exec-prune <<'PRUNE'
 #!/bin/bash
 set -euo pipefail
