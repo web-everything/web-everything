@@ -397,6 +397,78 @@ describe('requiredCheckStates shared predicate regressions', () => {
     }
   });
 
+  // Every completed outcome, undated in every way, against a dated opposite, in every tier and input order.
+  const undatedShapes = [
+    ['no timestamp', {}],
+    ['invalid completion time', { completedAt: 'not-a-date' }],
+    ['epoch completion time', { completedAt: '1970-01-01T00:00:00Z' }],
+    ['pre-2000 completion time', { completed_at: '1999-12-31T23:59:59Z' }],
+    ['invalid start and creation times', { startedAt: 'garbage', created_at: '0' }],
+    // Date.parse reads these as year 2000-2026 dates in local time; none is a real timestamp.
+    ['bare-number strings', { completedAt: '12', startedAt: '1', createdAt: '2026' }],
+    ['numeric values', { completedAt: 0, started_at: 1793192400000 }],
+    ['zone-less and impossible dates', { completedAt: '2026-10-28T02:00:00', startedAt: '2026-02-31T02:00:00Z' }],
+  ];
+  const tierRow = (kind, { conclusion, ...rest }) => kind === 'StatusContext'
+    ? { __typename: kind, context: 'test', state: conclusion, ...rest }
+    : { ...(kind === 'CheckRun' ? { __typename: kind } : {}), name: 'test', status: 'COMPLETED', conclusion, ...rest };
+  const assertUndatedPair = async ({ dated, undated, bucket }) => {
+    for (const kind of ['CheckRun', 'untagged', 'StatusContext']) {
+      for (const [, timestamps] of undatedShapes) {
+        const rows = [
+          tierRow(kind, { conclusion: dated, completedAt: '2026-10-28T01:00:00Z' }),
+          tierRow(kind, { conclusion: undated, ...timestamps }),
+        ];
+        for (const pair of [rows, rows.toReversed()]) {
+          const evidence = { ...input, requiredChecks: ['test'], rollup: [
+            ...pair, { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+          ] };
+          const expected = { red: [], pending: [], missing: [], green: [] };
+          expected[bucket] = ['test'];
+          expect(requiredCheckStates(evidence), `${kind} ${dated}/${undated} ${JSON.stringify(timestamps)}`)
+            .toEqual(expected);
+          expect(contradictingChecks(evidence)).toEqual(expected.red);
+          expect(ciGreenForEscalation(evidence)).toBe(bucket === 'green');
+          expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(bucket !== 'red');
+          const pr = { headRefOid: input.headSha, statusCheckRollup: evidence.rollup };
+          expect(Boolean(notCiBreakRecordRefusal({ headSha: input.headSha, pr, requiredChecks: ['test'] })))
+            .toBe(bucket !== 'green');
+        }
+      }
+    }
+  };
+
+  it.each(['SUCCESS', 'NEUTRAL', 'SKIPPED'])('dated failure outranks undated %s in both input orders', async undated => {
+    await assertUndatedPair({ dated: 'FAILURE', undated, bucket: 'red' });
+  });
+
+  it.each(['TIMED_OUT', 'ACTION_REQUIRED', 'FUTURE_UNKNOWN_CONCLUSION', '', null])(
+    'undated %j outcome outranks a dated success and stays red in both input orders', async undated => {
+      await assertUndatedPair({ dated: 'SUCCESS', undated, bucket: 'red' });
+    },
+  );
+
+  it.each(['CANCELLED', 'STALE'])('undated %s outranks a dated success and stays pending in both input orders', async undated => {
+    await assertUndatedPair({ dated: 'SUCCESS', undated, bucket: 'pending' });
+  });
+
+  it.each(['2026-10-28T02:00:00.5Z', '2026-10-27T22:00:00-04:00', '2026-10-28t02:00:00z'])(
+    'a zoned ISO timestamp %s still ranks as dated evidence in both input orders', completedAt => {
+      const rows = [
+        { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T01:00:00Z' },
+        { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt },
+      ];
+      for (const rollup of [rows, rows.toReversed()]) {
+        expect(requiredCheckStates({ requiredChecks: ['test'], rollup }))
+          .toEqual({ red: [], pending: [], missing: [], green: ['test'] });
+      }
+    },
+  );
+
+  it('undated success under a dated success stays green in both input orders', async () => {
+    await assertUndatedPair({ dated: 'SUCCESS', undated: 'SUCCESS', bucket: 'green' });
+  });
+
   it.each([false, true])('an untagged row outranks a legacy StatusContext (reverse=%s)', reverse => {
     const rows = [
       { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T01:00:00Z' },

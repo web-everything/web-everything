@@ -2944,14 +2944,17 @@ Check names and required rosters match exactly, including case, as in the drain'
 `latestCheckNamed`: a passing `TEST` never clears a failing or missing required `test`.
 Only status and conclusion values are case-insensitive; CodeQL and hold-gate names retain their exact identity.
 Rank rollup evidence with `scripts/conveyor/ci-heal-verdict-recheck.mjs#latestRollupAttempts`: completion time
-(invalid or pre-2000/epoch values count as absent), else valid start time, else valid creation time
-(`created_at`/`createdAt`), then BigInt-exact check-run id; an unfinished row
-(queued/in_progress/pending, including waiting/requested) with no valid timestamp after these
-fallbacks ranks newest (effective time `+Infinity`), conservatively keeping the check pending.
-Undated red evidence also ranks newest: a dated success cannot mask an undated failure,
-startup failure, or unknown outcome. Other completed rows with missing/invalid timestamps
-rank lowest. Test dated/undated SUCCESS, FAILURE and STARTUP_FAILURE pairs in both input
-orders, plus timestamp fallbacks and row flags. Workflow run ids and attempt counters never rank evidence. Verdict readers retain
+(only a zoned ISO-8601 string with a real calendar date counts; numbers, bare-number strings such as
+`"0"`, zone-less, impossible and pre-2000/epoch values count as absent, since `Date.parse` alone reads
+`"0"` as a local-time year-2000 date), else valid start time, else valid creation time
+(`created_at`/`createdAt`), then BigInt-exact check-run id. A row with no valid timestamp after these
+fallbacks ranks newest (effective time `+Infinity`) whenever the shared predicate classifies it
+pending or red: unfinished statuses, CANCELLED/STALE, FAILURE, TIMED_OUT, ACTION_REQUIRED,
+STARTUP_FAILURE, and unknown, empty or missing conclusions. So a dated success can never mask them.
+Only undated green rows (SUCCESS/NEUTRAL/SKIPPED) rank lowest, so they can never mask a dated failure.
+`ci-heal-verdict-recheck.test.mjs` pins every such pairing ("dated failure outranks undated …",
+"undated … outranks a dated success …") in all three source tiers, both input orders and every
+undated shape, plus timestamp fallbacks and row flags. Workflow run ids and attempt counters never rank evidence. Verdict readers retain
 CheckRun → untagged → StatusContext precedence before ranking within the chosen tier.
 The rollup adapter filters by time, then delegates exact id and fail-closed tie handling to
 `scripts/lib/check-state-predicate.mjs#latestAttempts`, whose S1 contract remains the greatest

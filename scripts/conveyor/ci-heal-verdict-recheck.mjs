@@ -97,9 +97,21 @@ const normalizeRollupCheck = row => {
   return check;
 };
 
+// Only zoned ISO-8601 timestamps with a real calendar date count. Date.parse alone
+// reads junk such as "0" or "12" as a local-time year 2000/2001 date.
+const ISO_TIMESTAMP = /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i;
+const timestampValue = value => {
+  const match = typeof value === 'string' ? ISO_TIMESTAMP.exec(value) : null;
+  if (!match) return NaN;
+  const [year, month, day] = match.slice(1).map(Number);
+  const calendar = new Date(Date.UTC(year, month - 1, day));
+  if (calendar.getUTCMonth() !== month - 1 || calendar.getUTCDate() !== day) return NaN;
+  return Date.parse(value);
+};
+
 const rollupTime = row => {
   for (const key of ['completedAt', 'completed_at', 'startedAt', 'started_at', 'createdAt', 'created_at']) {
-    const time = Date.parse(row?.[key]);
+    const time = timestampValue(row?.[key]);
     if (Number.isFinite(time) && time > Date.parse('2000-01-01T00:00:00Z')) return time;
   }
   const state = classifyCheck({ ...normalizeRollupCheck(row), required: true });
