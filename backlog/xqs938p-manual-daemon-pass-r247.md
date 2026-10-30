@@ -9,11 +9,11 @@ tags: []
 
 # manual-daemon-pass: run one daemon pass by hand (R247)
 
-TODO digest — one ≤100-word paragraph: what this item does and why (replace this line).
+Adds the `manual-daemon-pass` operation (R247): when a review or red-team daemon is down, an operator runs exactly one pass by hand against one PR. It refuses a healthy daemon unless forced, refuses stale code, comments on the PR, and appends an audit event. `fix` and `verify` have no single-PR entry point yet and are refused.
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — `npx vitest run we:scripts/operations/__tests__/manual-daemon-pass.test.mjs` fails before and passes after (tests: refuses a healthy daemon before comment or dispatch; uses the shared staleness refusal and never comments or dispatches stale code; audits a dispatch error without repeating the pass).
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
@@ -21,16 +21,16 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] Does not run fix or verify passes (no single-PR entry point yet; follow-up cards), and does not restart daemons.
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — PR number and flags are parsed strictly; the force flag is matched exactly.
+2. **Truncated reads** — n/a: reads checkout HEAD only; an unreadable HEAD refuses.
+3. **Shared state files** — one append-only JSONL audit event per attempt.
+4. **Fail closed** — a launchctl read failure is not treated as a down daemon; stale code and healthy daemons refuse.
+5. **Identity scoping** — the comment strips GH_TOKEN and GITHUB_TOKEN from the env; freshness is checked against this checkout.
+6. **State over time** — the pass is never repeated after a dispatch error.
+7. **Who wrote it** — n/a: the audit event records the daemon, PR, reason and checkout HEAD, not an operator identity.
