@@ -906,6 +906,8 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       // Gate admission must survive failures while deriving the printable summary.
       const redTeamDeferredByCap = Boolean(redTeam?.deferredByCap);
       const status = redTeam?.status;
+      // `failed` is execution failure, never an unpublished completion. Persist it below so
+      // reviewRedTeamOnSkip can use failedRedTeamRetry's single, cooldown/cap-guarded retry.
       const completed = ['ran', 'resumed'].includes(status);
       redTeamCompletionDeferredByCap = completed && redTeamDeferredByCap;
       // Retain lifecycle evidence before reading comment or summary diagnostics.
@@ -966,7 +968,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     } else {
       // An unsuccessful effects retry must keep the durable clean pass eligible for recovery.
       const result = guardDeferred && prior ? prior.result
-        : seatsBox.priorRedTeamResult != null && !['ran', 'resumed'].includes(out.redTeam?.status)
+        : seatsBox.priorRedTeamResult != null && !['ran', 'resumed', 'failed'].includes(out.redTeam?.status)
           ? seatsBox.priorRedTeamResult : out.redTeam?.status === 'skipped'
             ? { status: 'skipped', ...(out.redTeam.policy === 'card-only' ? { policy: 'card-only' } : {}) }
             : out.redTeam?.status ?? null;
