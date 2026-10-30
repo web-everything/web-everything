@@ -122,7 +122,7 @@ describe('rebuildClone coordination events', () => {
     },
   );
 
-  it.each(['up-to-date', 'ready-pending', 'needs-build', 'no-op', 'already-adopted'])(
+  it.each(['up-to-date', 'ready-pending', 'needs-build', 'no-op', 'already-adopted', 'closure-opaque'])(
     'emits nothing for a no-op result: %s', async (reason) => {
       terminal({ moved: false, reason });
       expect(await rebuildClone(options)).toEqual({ moved: false, reason, alerts: [] });
@@ -267,6 +267,8 @@ describe('rebuildClone coordination events', () => {
       'swapped', 'switch-busy', 'touches-dispatch-path', 'unknown', 'unsafe-ref', 'untracked-collision',
       'unverified-build', 'up-to-date', 'scoped-noop', 'fixpoint-exhausted',
       'entries-unreadable', 'closure-incomplete', 'closure-too-large', 'scope-unreadable',
+      // Opaque evidence retains all files in an ok:true scope; it is a diagnostic, not a rebuild failure.
+      'closure-opaque',
     ]);
     const reasons = new Set();
     function collect(expression) {
