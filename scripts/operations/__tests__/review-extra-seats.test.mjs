@@ -924,6 +924,22 @@ it('keeps distinct per-seat policy models in separate calls and reserves both un
 
 
 describe('seat answer extraction — realistic provider replies, fail closed', () => {
+  it('refuses 300 KB of quotes and backslashes followed by a valid answer in under one second', () => {
+    const text = '"\\'.repeat(150 * 1024) + '\n' + answer({ 'red-team': { verdict: 'accept', findings: [] } });
+    const started = performance.now();
+    expect(extractAnswerJson(text)).toBeNull();
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+  it('accepts a valid answer after 100 KB of balanced prose', () => {
+    const obj = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    const prose = 'Reviewed {} and [].\n'.padEnd(100 * 1024, ' ');
+    expect(extractAnswerJson(prose + JSON.stringify(obj))).toEqual(obj);
+  });
+  it.each([0, 1])('enforces the 256 KB scan limit with %i extra characters', extra => {
+    const obj = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    const text = JSON.stringify(obj).padStart(256 * 1024 + extra, ' ');
+    expect(extractAnswerJson(text)).toEqual(extra === 0 ? obj : null);
+  });
   it('refuses 200 KB of unmatched braces in under one second', () => {
     const text = '{'.repeat(200 * 1024);
     const started = performance.now();
@@ -1438,6 +1454,19 @@ describe('durable raw seat evidence', () => {
     const evidence = readFileSync(join(root, call.rawAnswerPath), 'utf8');
     expect(evidence).toContain('[truncated at 64 KB;');
     expect(evidence).toContain('new seat call or manual review');
+  });
+  it('keeps oversized answers unparseable with capped evidence and a manual-review fallback', () => {
+    const text = '"\\'.repeat(150 * 1024) + '\n' + answer({ 'red-team': { verdict: 'accept', findings: [] } });
+    const call = classifySeatCall('codex', { report: { lastMessage: text } });
+    const parsed = parseSeatAnswer(text, seats);
+    preserveSeatRawAnswer({ callId: 'scan-size', call, seats, parsed }, { writeRawAnswer: effect });
+    expect(call.status).toBe('unparseable');
+    expect(parsed['red-team'].ok).toBe(false);
+    expect(buildSeatRows({ callId: 'scan-size', pr: 5, repo: REPO, seats, call, parsed })[0].status).toBe('unparseable');
+    const evidence = readFileSync(join(root, call.rawAnswerPath));
+    expect(evidence.length).toBeLessThanOrEqual(64 * 1024);
+    expect(evidence.toString()).toContain('[truncated at 64 KB;');
+    expect(evidence.toString()).toContain('new seat call or manual review');
   });
   const raw = name => readFileSync(join(process.cwd(), 'scripts/operations/__tests__/fixtures/seat-raw', `${name}.txt`), 'utf8');
   const seats = [{ key: 'red-team', seat: 'red-team', lens: 'red-team' }];

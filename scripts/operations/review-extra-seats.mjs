@@ -101,6 +101,7 @@ export const CAP_TIMEZONE = 'America/New_York';
 
 const MAX_FINDINGS_PER_SEAT = 12;
 const MAX_TEXT = 600;
+const MAX_ANSWER_SCAN_CHARS = 256 * 1024;
 const MAX_RAW_ANSWER_BYTES = 64 * 1024;
 const RAW_ANSWER_CUT = '\n[truncated at 64 KB; remaining evidence requires a new seat call or manual review]\n';
 const QUOTA_RE = /\b(rate[ -]?limit|usage limit|quota|insufficient[_ ]quota|resource[_ ]exhausted|too many requests|429)\b/i;
@@ -350,10 +351,13 @@ export function buildSeatTask({ pr, repo, title, dir, diffFile, bodyFile, inline
  * Require a prefix with balanced braces/brackets that does not end in a comma, opening bracket,
  * or JSON key colon. After the object allow only whitespace, or one closing fence plus whitespace
  * when the object occupies a single fenced block. Return null for all other or incomplete input,
- * including a later truncated `lenses` answer or exhausted scan budget.
+ * including oversized text, a later truncated `lenses` answer or exhausted scan budget.
  */
 export function extractAnswerJson(text) {
   const s = String(text ?? '');
+  // Bound the quoted-key pre-scan too; rejected text is preserved at 64 KB for
+  // a new seat call or manual review by the caller's existing evidence path.
+  if (s.length > MAX_ANSWER_SCAN_CHARS) return null;
   let lastAnswerKey = -1;
   for (const match of s.matchAll(/"((?:\\[\s\S]|[^"\\])*)"\s*:/g)) {
     try {
