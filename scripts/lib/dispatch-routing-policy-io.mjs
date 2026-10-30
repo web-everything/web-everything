@@ -41,9 +41,9 @@ export function createRoutingPolicyReader({ path = ROUTING_POLICY_PATH, read = r
       lastError = null;
     } catch (error) {
       // Report once per invalid edit; keep the last validated repo + operator snapshot.
-      const signature = `error:${error.message}`;
-      if (lastError !== signature) log(`routing-policy-invalid: keeping last good policy: ${error.message}`);
-      lastError = signature;
+      const errorSignature = `error:${error.message}`;
+      if (lastError !== errorSignature) log(`routing-policy-invalid: keeping last good policy: ${error.message}`);
+      lastError = errorSignature;
     }
     return good;
   };

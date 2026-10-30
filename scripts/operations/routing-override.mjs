@@ -9,7 +9,10 @@ export const ROUTING_OVERRIDE_EFFECT = 'routing-override.write';
 export function planRoutingOverride(input, policy = DEFAULT_ROUTING_POLICY) {
   const { operation, taskType, provider, model, clear } = input;
   const key = taskType ? `${operation}:${taskType}` : operation;
-  if (!Object.hasOwn(policy.operations, key)) throw new TypeError(`routing-override: unknown operation ${key}`);
+  // A scoped key must remain removable even after its operation or task type disappears.
+  if (!Object.hasOwn(policy.operations, key) && !(clear && taskType)) {
+    throw new TypeError(`routing-override: unknown operation ${key}`);
+  }
   if (clear && (provider || model)) throw new TypeError('routing-override: --clear cannot accompany --provider or --model');
   if (!clear && !provider) throw new TypeError('routing-override: --provider or --clear is required');
   const patch = clear ? null : { provider, ...(model ? { model } : {}) };

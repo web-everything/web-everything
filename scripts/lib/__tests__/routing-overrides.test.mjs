@@ -112,6 +112,25 @@ describe('operator routing overrides', () => {
       expect(f.log).toHaveBeenCalledTimes(1); expect(f.events).toHaveLength(1);
     });
 
+  it('deduplicates error signatures independently of policy signatures and resets after recovery', () => {
+    const f = fixture(); f.set({ [key]: { provider: 'codex' } });
+    const good = f.reader();
+    f.set({ typo: {} });
+    expect(f.reader()).toBe(good); expect(f.reader()).toBe(good);
+    expect(f.log).toHaveBeenCalledTimes(1);
+    f.set({ [key]: { provider: 'unknown' } });
+    expect(f.reader()).toBe(good); expect(f.reader()).toBe(good);
+    expect(f.log).toHaveBeenCalledTimes(2);
+    f.set({ [key]: { provider: 'agy-gemini' } });
+    const recovered = f.reader();
+    expect(recovered.operations[key].provider).toBe('agy-gemini');
+    expect(f.events).toHaveLength(2);
+    f.set({ typo: {} });
+    expect(f.reader()).toBe(recovered); expect(f.reader()).toBe(recovered);
+    expect(f.log).toHaveBeenCalledTimes(3);
+    expect(f.log.mock.calls[2]).toEqual(f.log.mock.calls[0]);
+  });
+
   it('retains last good on unreadable or torn operator preferences, then recovers', () => {
     const f = fixture(); f.set({ [key]: { provider: 'codex' } }); const good = f.reader();
     writeFileSync(f.prefsPath, '{');

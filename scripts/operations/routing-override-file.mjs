@@ -2,18 +2,25 @@
 import { mkdirSync, readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { operatorPreferencesPath, readPlatformPreferences } from '../lib/policy-cascade.mjs';
+import { operatorPreferencesPath } from '../lib/policy-cascade.mjs';
 import { applyRoutingOverrides } from '../lib/dispatch-routing-policy.mjs';
 import { ROUTING_POLICY_PATH } from '../lib/dispatch-routing-policy-source.mjs';
 import { ROUTING_OVERRIDE_EFFECT, planRoutingOverride } from './routing-override.mjs';
 import { withFileLock } from '../lib/atomic-json-file.mjs';
 
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
 export function writeRoutingOverride({ key, patch }, { env = process.env } = {}) {
   const path = operatorPreferencesPath(env);
   mkdirSync(dirname(path), { recursive: true });
   return withFileLock(`${path}.lock`, () => {
-    const { prefs, errors } = readPlatformPreferences({ env: { WE_PLATFORM_PREFERENCES_FILE: path } });
-    if (errors.length) throw new Error(`routing-override: refusing to overwrite unreadable preferences: ${errors.join('; ')}`);
+    let prefs = {};
+    try {
+      prefs = JSON.parse(readFileSync(path, 'utf8'), (key, value) => UNSAFE_KEYS.has(key) ? undefined : value);
+      if (prefs === null || typeof prefs !== 'object' || Array.isArray(prefs)) throw new TypeError('not a JSON object');
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw new Error(`routing-override: refusing to overwrite unreadable preferences: ${error.message}`);
+    }
     const policy = JSON.parse(readFileSync(ROUTING_POLICY_PATH, 'utf8'));
     const split = key.indexOf(':');
     planRoutingOverride({ operation: split < 0 ? key : key.slice(0, split), taskType: split < 0 ? '' : key.slice(split + 1),

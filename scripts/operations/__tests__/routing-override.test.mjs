@@ -50,6 +50,53 @@ it('uses the operator file replacement and creates a missing preferences file', 
   expect(JSON.parse(readFileSync(path, 'utf8')).routingOverrides[key]).toEqual({ provider: 'agy-claude' });
 });
 
+it('preserves $schema, $comment, and nested metadata on write and --clear', async () => {
+  const f = fixture();
+  const metadata = { $schema: 'https://example.test/preferences.schema.json', $comment: 'Operator notes',
+    unrelated: { $comment: 'Nested notes', values: [null, false, 0, { $custom: 'keep' }] } };
+  writeFileSync(f.path, JSON.stringify(metadata));
+  expect((await f.command(['--operation=review-seat', '--taskType=red-team', '--provider=codex'])).code).toBe(0);
+  expect(JSON.parse(readFileSync(f.path, 'utf8'))).toEqual({ ...metadata, routingOverrides: { [key]: { provider: 'codex' } } });
+  expect((await f.command(['--operation=review-seat', '--taskType=red-team', '--clear'])).code).toBe(0);
+  expect(JSON.parse(readFileSync(f.path, 'utf8'))).toEqual({ ...metadata, routingOverrides: {} });
+});
+
+it.each(['__proto__', 'constructor', 'prototype'])('never emits unsafe %s keys on write or --clear', async unsafe => {
+  const f = fixture();
+  writeFileSync(f.path, JSON.stringify({ [unsafe]: { injected: true },
+    unrelated: { keep: true, [unsafe]: { injected: true }, values: [{ [unsafe]: 'drop', keep: false }] } }));
+  const unrelated = { keep: true, values: [{ keep: false }] };
+  expect((await f.command(['--operation=review-seat', '--taskType=red-team', '--provider=codex'])).code).toBe(0);
+  expect(JSON.parse(readFileSync(f.path, 'utf8'))).toEqual({ unrelated, routingOverrides: { [key]: { provider: 'codex' } } });
+  expect((await f.command(['--operation=review-seat', '--taskType=red-team', '--clear'])).code).toBe(0);
+  expect(JSON.parse(readFileSync(f.path, 'utf8'))).toEqual({ unrelated, routingOverrides: {} });
+});
+
+it.each([
+  ['review-seat', 'retired-seat'], ['review-seat', 'red-teem'], ['review-seat', 'advisory:retired'],
+  ['retired-operation', 'retired-task'], ['reviev-seat', 'red-team'],
+])('plans and executes --clear for an unknown scoped key: %s:%s', async (operation, taskType) => {
+  const f = fixture();
+  const staleKey = `${operation}:${taskType}`;
+  const other = { [key]: { provider: 'codex' } };
+  expect(() => planRoutingOverride({ operation, taskType, provider: 'codex' })).toThrow(/unknown operation/);
+  expect(planRoutingOverride({ operation, taskType, clear: true })).toEqual({
+    key: staleKey, patch: null, source: 'platform', cleared: true,
+  });
+  writeFileSync(f.path, JSON.stringify({ unrelated: true, routingOverrides: { ...other, [staleKey]: { provider: 'codex' } } }));
+  const bytes = readFileSync(f.path, 'utf8');
+  expect((await f.command([`--operation=${operation}`, `--taskType=${taskType}`, '--provider=codex'])).code).not.toBe(0);
+  expect(readFileSync(f.path, 'utf8')).toBe(bytes);
+  expect((await f.command([`--operation=${operation}`, `--taskType=${taskType}`, '--clear'])).code).toBe(0);
+  expect(JSON.parse(readFileSync(f.path, 'utf8'))).toEqual({ unrelated: true, routingOverrides: other });
+});
+
+it.each(['null', '[]', 'true', '1', '"preferences"'])('refuses a non-object preferences root without overwriting it: %s', async text => {
+  const f = fixture(); writeFileSync(f.path, text);
+  expect((await f.command(['--operation=review-seat', '--taskType=red-team', '--provider=codex'])).code).not.toBe(0);
+  expect(readFileSync(f.path, 'utf8')).toBe(text);
+});
+
 it('refuses to modify preferences when the shared lock cannot be acquired', async () => {
   const f = fixture(); writeFileSync(f.path, '{"keep":true}');
   const open = fs.openSync;
