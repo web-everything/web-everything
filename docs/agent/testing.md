@@ -2841,3 +2841,8 @@ since a PR already containing main has its own failure. `fix.pushAfterCi` waits 
 agent so completed CI failures enter that same repair's fenced context. Its push boundary uses
 the same first-held deadline; unreadable evidence waits until the bound, whose fallback is a
 normal push. Inject the clock, sleep and checks; reads must be at least 30 seconds apart.
+Claude repairs mark verify directly, so the verify harness must apply the same gate to both
+early and green-verdict pushes. Persist its previous head and first-held time independently of
+verify retries, retain the waiter on read/write failures, and log the timing policy's source.
+`await-verify-pass-push-after-ci.test.mjs` and the `claude-fix-push-after-ci` soak scenario cover
+this path with injected CI reads, including the bounded fallback when evidence is unavailable.
