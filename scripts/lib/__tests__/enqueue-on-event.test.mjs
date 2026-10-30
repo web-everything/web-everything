@@ -119,6 +119,54 @@ describe('pending marks', () => {
     });
   });
 
+  it.each([undefined, 30_000])('caps a three-minute burst from its first event (cap %s)', (cap) => {
+    const firstAt = 0;
+    const maxWait = cap ?? 60_000;
+    const options = { debounceSeconds: 15, ...(cap === undefined ? {} : { debounceMaxWaitMs: cap }) };
+    let pending = new Map();
+    for (let elapsed = 0; elapsed <= 180_000; elapsed += 10_000) {
+      pending = notePending(pending, [mark()], { localSlug: REPO, now: firstAt + elapsed });
+      expect(pending.get(`${REPO}#42`).firstAt).toBe(firstAt);
+      expect(duePending(pending, { ...options, now: firstAt + elapsed }).map(p => p.num))
+        .toEqual(elapsed < maxWait ? [] : [42]);
+      if (elapsed < maxWait) expect(duePending(pending, { ...options, now: firstAt + elapsed + 9_999 })).toEqual([]);
+    }
+  });
+
+  it('retains normal debounce before the max-wait cap is reached', () => {
+    let pending = notePending(new Map(), [mark()], { localSlug: REPO, now: 0 });
+    pending = notePending(pending, [mark()], { localSlug: REPO, now: 10_000 });
+    expect(duePending(pending, { now: 24_999, debounceSeconds: 15, debounceMaxWaitMs: 60_000 })).toEqual([]);
+    expect(duePending(pending, { now: 25_000, debounceSeconds: 15, debounceMaxWaitMs: 60_000 }).map(p => p.num)).toEqual([42]);
+  });
+
+  it('debounces a new event on retained catch-up work without changing its ordering stamp', () => {
+    const now = 120_000;
+    const key = `${REPO}#42`;
+    const retained = new Map([[key, {
+      repo: REPO, num: 42, firstAt: 0, lastAt: 0, causes: ['catch-up'], catchUp: true,
+    }]]);
+    const pending = notePending(retained, [mark()], { localSlug: REPO, now });
+    const due = (at) => duePending(pending, { now: at, debounceSeconds: 15 });
+    expect(due(now)).toEqual([]);
+    expect(due(now + 14_999)).toEqual([]);
+    expect(due(now + 15_000).map(p => p.num)).toEqual([42]);
+    expect(pending.get(key)).toMatchObject({ firstAt: 0, catchUp: true });
+    expect(retained.get(key)).toEqual({
+      repo: REPO, num: 42, firstAt: 0, lastAt: 0, causes: ['catch-up'], catchUp: true,
+    });
+    let burst = pending;
+    for (let elapsed = 10_000; elapsed <= 60_000; elapsed += 10_000) {
+      burst = notePending(burst, [mark()], { localSlug: REPO, now: now + elapsed });
+      expect(duePending(burst, { now: now + elapsed, debounceSeconds: 15 }).map(p => p.num))
+        .toEqual(elapsed < 60_000 ? [] : [42]);
+    }
+    const ordered = new Map(burst).set(`${REPO}#43`, {
+      repo: REPO, num: 43, firstAt: 1, lastAt: 0, causes: ['catch-up'], catchUp: true,
+    });
+    expect(duePending(ordered, { now: now + 60_000, debounceSeconds: 15 }).map(p => p.num)).toEqual([42, 43]);
+  });
+
   it('debounces from lastAt and orders due PRs by firstAt', () => {
     let pending = notePending(new Map(), [mark(42)], { localSlug: REPO, now: 1000 });
     pending = notePending(pending, [mark(43)], { localSlug: REPO, now: 2000 });
@@ -208,6 +256,32 @@ describe('fast drain helpers', () => {
 });
 
 describe('resolveEnqueueOnEventSetting', () => {
+  it('defaults the max-wait cap to 60000 and logs its source', () => {
+    expect(ENQUEUE_ON_EVENT_DEFAULTS.debounceMaxWaitMs).toBe(60_000);
+    const result = resolveSetting();
+    expect(result).toMatchObject({ debounceMaxWaitMs: 60_000, sources: { debounceMaxWaitMs: 'standard' } });
+    expect(result.line).toContain('debounceMaxWaitMs=60000 (standard)');
+  });
+
+  it.each([1000, 30_000, 600_000])('resolves valid max-wait %s through platform and tool layers', (value) => {
+    const platform = resolveSetting({}, { platform: { debounceMaxWaitMs: value } });
+    expect(platform).toMatchObject({ debounceMaxWaitMs: value, sources: { debounceMaxWaitMs: 'platform' } });
+    expect(platform.line).toContain(`debounceMaxWaitMs=${value} (platform)`);
+    const tool = resolveSetting({ debounceMaxWaitMs: value }, { platform: { debounceMaxWaitMs: 2000 } });
+    expect(tool).toMatchObject({ debounceMaxWaitMs: value, sources: { debounceMaxWaitMs: 'tool' } });
+    expect(tool.line).toContain(`debounceMaxWaitMs=${value} (tool)`);
+  });
+
+  it.each([0, 999, 600_001, 1000.5, '60000', null])('ignores invalid max-wait %s and logs the fallback', (value) => {
+    const result = resolveSetting({ debounceMaxWaitMs: value });
+    expect(result).toMatchObject({ debounceMaxWaitMs: 60_000, sources: { debounceMaxWaitMs: 'standard' } });
+    expect(result.invalid).toContain(`tool.debounceMaxWaitMs=${JSON.stringify(value)}`);
+    expect(result.line).toContain('debounceMaxWaitMs=60000 (standard)');
+    expect(result.line).toContain('ignored invalid:');
+    const platform = resolveSetting({ debounceMaxWaitMs: value }, { platform: { debounceMaxWaitMs: 20_000 } });
+    expect(platform).toMatchObject({ debounceMaxWaitMs: 20_000, sources: { debounceMaxWaitMs: 'platform' } });
+  });
+
   it('uses standard defaults when no tool or platform block is set', () => {
     const result = resolveSetting();
     expect(result).toMatchObject({
@@ -257,6 +331,27 @@ describe('resolveEnqueueOnEventSetting', () => {
 });
 
 describe('createEnqueueOnEvent', () => {
+  it.each([60_000, 30_000])('starts the first run at max-wait %s during a three-minute burst', async (maxWait) => {
+    const { handle, calls, advance } = setup({
+      resolveSetting: () => resolveSetting({ enabled: true, debounceMaxWaitMs: maxWait }),
+    });
+    let firstRunAt;
+    for (let elapsed = 0; elapsed <= 180_000; elapsed += 10_000) {
+      if (elapsed) advance(1);
+      handle.notePoll({ ok: true, marked: [mark()] });
+      await handle.tick();
+      if (calls.length && firstRunAt === undefined) firstRunAt = elapsed;
+      if (elapsed < maxWait) expect(calls).toHaveLength(0);
+      if (elapsed === maxWait) expect(calls).toHaveLength(1);
+      if (elapsed < 180_000) {
+        advance(9_999);
+        await handle.tick();
+        if (elapsed < maxWait) expect(calls).toHaveLength(0);
+      }
+    }
+    expect(firstRunAt).toBe(maxWait);
+  });
+
   it('waits for debounce, then runs the local fast drain and logs its verdict', async () => {
     const { handle, calls, lines, advance } = setup();
     handle.notePoll({ ok: true, marked: [mark()] });
