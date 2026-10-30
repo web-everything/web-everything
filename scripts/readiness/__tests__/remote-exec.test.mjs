@@ -1238,7 +1238,13 @@ describe('forge-setup.sh', () => {
   it.each([
     ['invalid or shared worker identity',"pwd.getpwnam = lambda name: types.SimpleNamespace(pw_uid=0, pw_gid=os.getgid())"],
     ['invalid or shared worker identity',"original_pwd = pwd.getpwnam\npwd.getpwnam = lambda name: types.SimpleNamespace(pw_uid=5001, pw_gid=original_pwd(name).pw_gid) if name.startswith('forge-exec-') else original_pwd(name)"],
+    ['invalid or shared worker identity',`# Duplicate primary GID with distinct worker UIDs and matching named groups.
+original_pwd, original_grp = pwd.getpwnam, grp.getgrnam
+pwd.getpwnam = lambda name: types.SimpleNamespace(pw_uid=original_pwd(name).pw_uid, pw_gid=6001) if name.startswith('forge-exec-') else original_pwd(name)
+grp.getgrnam = lambda name: types.SimpleNamespace(gr_gid=6001, gr_mem=[]) if name.startswith('forge-exec-') else original_grp(name)`],
+    ['invalid or shared worker identity',"original_grp = grp.getgrnam\ngrp.getgrnam = lambda name: types.SimpleNamespace(gr_gid=9999, gr_mem=[]) if name.startswith('forge-exec-') else original_grp(name)"],
     ['slot groups must be private',"original_grp = grp.getgrnam\ngrp.getgrnam = lambda name: types.SimpleNamespace(gr_gid=original_grp(name).gr_gid, gr_mem=['intruder'])"],
+    ['slot groups must be private',"os.getgrouplist = lambda name, gid: [gid, 6001] if name == 'ops' else [gid]"],
     ['slot users must not have supplementary groups',"os.getgrouplist = lambda name, gid: [gid, 9999] if name.startswith('forge-exec-') else [gid]"],
   ])('rejects setup identity evidence: %s (%s)',(message,override)=>{
     const srv=join(cwd,'srv');mkdirSync(srv);

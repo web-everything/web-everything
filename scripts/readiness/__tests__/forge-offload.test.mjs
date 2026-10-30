@@ -455,14 +455,29 @@ describe('runner base materialization refuses before install',()=>{
     expect((await fs.readFile(join(f.server,'npm.log'),'utf8')).trim().split('\n')).toHaveLength(2);
   });
 
-  it.each(['workspaces','file: dependency','link: dependency','unknown lock format','unproven resolution'])(
-    'refuses warm-profile reuse for unsupported install inputs: %s',async fault=>{
-      const f=await setup(),pkg={name:'fixture',version:'1.0.0'},lock={lockfileVersion:3,packages:{'':{name:'fixture'}}};
-      if(fault==='workspaces')pkg.workspaces=['packages/*'];
-      if(fault.includes('dependency'))pkg.dependencies={fixture:fault.startsWith('file:')?'file:./local':'link:./local'};
-      if(fault==='unknown lock format')lock.lockfileVersion=2;
-      if(fault==='unproven resolution')lock.packages['node_modules/fixture']={version:'1.0.0',resolved:'https://registry.npmjs.org/fixture.tgz'};
-      await fs.writeFile(join(repo,'package.json'),JSON.stringify(pkg));
+  it.each([
+    ['registry-only control',()=>{}],
+    ['workspaces',pkg=>{pkg.workspaces=['packages/*'];}],
+    ...['file:./local','file:./local.tgz','link:./local','workspace:*'].map(spec=>[
+      spec+' dependency',pkg=>{pkg.dependencies={fixture:spec};},
+    ]),
+    ...[2,4].map(version=>['unknown lock format '+version,(_pkg,lock)=>{lock.lockfileVersion=version;}]),
+    ['missing package inventory',(_pkg,lock)=>{delete lock.packages;}],
+    ['non-object package inventory',(_pkg,lock)=>{lock.packages='unknown';}],
+    ['null package evidence',(_pkg,lock)=>{lock.packages['node_modules/fixture']=null;}],
+    ['linked package',(_pkg,lock)=>{lock.packages['node_modules/fixture'].link=true;}],
+    ['non-HTTPS resolution',(_pkg,lock)=>{lock.packages['node_modules/fixture'].resolved='http://registry.npmjs.org/fixture.tgz';}],
+    ['missing integrity',(_pkg,lock)=>{delete lock.packages['node_modules/fixture'].integrity;}],
+    ['non-string integrity',(_pkg,lock)=>{lock.packages['node_modules/fixture'].integrity=42;}],
+    ['empty integrity',(_pkg,lock)=>{lock.packages['node_modules/fixture'].integrity='';}],
+  ])('checks warm-profile reuse with available evidence for %s',async(fault,change)=>{
+      const reusable=fault==='registry-only control';
+      const f=await setup(),pkg={name:'fixture',version:'1.0.0'},lock={lockfileVersion:3,packages:{
+        '':{name:'fixture'},
+        'node_modules/fixture':{version:'1.0.0',resolved:'https://registry.npmjs.org/fixture.tgz',integrity:'sha512-fixture'},
+      }};
+      change(pkg,lock);
+      const packageData=JSON.stringify(pkg);await fs.writeFile(join(repo,'package.json'),packageData);
       const lockData=JSON.stringify(lock);await fs.writeFile(join(repo,'package-lock.json'),lockData);
       // The fixture installer materializes observable dependency contents, so
       // incorrectly extracting the first archive cannot look like a full install.
@@ -474,18 +489,37 @@ fs.copyFileSync('a.test.mjs','node_modules/fixture/value');
 `,{mode:0o755});
       await fs.writeFile(join(repo,'a.test.mjs'),'dependency-one');
       await f.runner.warmInstall(repo,manifestWire(await remote.buildManifest({cwd:repo,exec})));
-      // Leave the first full profile and any reusable evidence in place.
+      const parent=join(f.server,'cache',hash(lockData));
+      const profiles=(await fs.readdir(parent)).filter(n=>n.startsWith('dev-v5-'));
+      expect(profiles).toHaveLength(1);
+      const profile=profiles[0].slice('dev-v5-'.length);
+      const archiveDigest=hash(await fs.readFile(join(parent,profiles[0],'dependencies.tar')));
+      expect(await fs.readFile(join(parent,profiles[0],'sha256'),'utf8')).toBe(archiveDigest);
+      // Seed the exact index that accepting these inputs would look up. Merely
+      // leaving a full profile cannot test refusal: unsupported inputs publish
+      // no index. The registry-only row proves this key and archive are usable.
+      const signature=hash(JSON.stringify({lock:hash(lockData),
+        packages:[[Buffer.from('package.json').toString('base64'),hash(packageData),false]],
+        node:process.version,platform:process.platform,arch:process.arch,
+        install:['ci','--include=dev','--ignore-scripts','--no-audit','--no-fund']}));
+      const index=join(parent,'.warm-inputs-'+signature),evidence={profile,archiveDigest};
+      if(reusable)expect(JSON.parse(await fs.readFile(index,'utf8'))).toEqual(evidence);
+      else {
+        await expect(fs.stat(index)).rejects.toMatchObject({code:'ENOENT'});
+        await fs.writeFile(index,JSON.stringify(evidence),{flag:'wx',mode:0o600});
+      }
       await fs.writeFile(join(repo,'a.test.mjs'),'dependency-two');
       await f.runner.warmInstall(repo,manifestWire(await remote.buildManifest({cwd:repo,exec})));
-      expect((await fs.readFile(join(f.server,'npm.log'),'utf8')).trim().split('\n')).toHaveLength(2);
-      const parent=join(f.server,'cache',hash(lockData)),values=[];
+      expect((await fs.readFile(join(f.server,'npm.log'),'utf8')).trim().split('\n')).toHaveLength(reusable?1:2);
+      expect(JSON.parse(await fs.readFile(index,'utf8'))).toEqual(evidence);
+      const values=[];
       for(const profile of (await fs.readdir(parent)).filter(n=>n.startsWith('dev-v5-'))) {
         const extracted=await fs.mkdtemp(join(root,'dependencies-'));
         const result=await exec({file:'/usr/bin/tar',args:['-xf',join(parent,profile,'dependencies.tar'),'-C',extracted]});
         expect(result.code).toBe(0);values.push(await fs.readFile(join(extracted,'node_modules/fixture/value'),'utf8'));
       }
-      expect(values.sort()).toEqual(['dependency-one','dependency-two']);
-    });
+      expect(values.sort()).toEqual(reusable?['dependency-one','dependency-one']:['dependency-one','dependency-two']);
+    },30_000);
 
   it('seeds a full sibling-bound profile from proven registry-only warm inputs, never a lock-only key',async()=>{
     const f=await setup();

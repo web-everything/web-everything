@@ -2031,6 +2031,10 @@ manifests, lock, runtime/platform, fixed install flags). Workspaces, local depen
 unknown locks and unproven resolutions use the original full-input cache/install path.
 Check archive hashes on both source and destination; normal runs still validate npm before
 extracting a seeded profile. Cover sibling-bound profiles as well as primary-only runs.
+Negative reuse cases must seed both a valid archive and the exact candidate
+`.warm-inputs-*` index; a full profile alone cannot challenge the eligibility guard.
+Include a supported-input control proving the seeded evidence can actually reuse
+the archive, and inspect extracted dependency contents after changing the snapshot.
 
 Stage timings use an injected millisecond clock and Eastern timestamps with the actual
 seasonal offset. Install/run durations come from optional, strictly typed receipt timing
