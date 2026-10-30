@@ -859,6 +859,43 @@ Probe identical-content commits, changed trees, expiry, disabled reuse, failure 
 results through the real rebuild fixture, plus actual check selection through `runLiveSmoke`.
 Run these suites through the host heavy-admission queue.
 
+## Quick rebuild soak recovery
+
+`daemonRebuild.quick` defaults to false in `scripts/lib/daemon-rebuild-settings.json` and resolves
+through the policy cascade; `WE_DAEMON_REBUILD_QUICK=1|0` overrides it. Quick candidates defer only
+`dispatch-dry-run` and `reconcile-dry-run`, take one smoke attempt without confirmation, and use a
+60-second finalize wait unless `WE_DAEMON_FINALIZE_LOCK_WAIT_MS` overrides it. The pure policy and
+protected path list live in `scripts/lib/daemon-rebuild/quick.mjs`. Diff or dispatch-closure evidence
+that is unknown, incomplete or oversized selects full smoke and logs why; both sides of a rename
+and both the old and candidate dispatch closures matter. Preserve their `bareDeps` and `jsonNames`
+evidence too: package manifests/locks and named JSON configs force full smoke through the shared
+closure-hit policy. Missing dependency evidence also requires full smoke.
+
+Keep quick provenance on ready records: adopting a partial pass as a full pass loses its owed soak.
+An already-HEAD quick fallback still persists its unverified marker and schedules the deferred checks;
+HEAD equality supplies no soak proof. Snapshot the last-good record before marking adoption unverified.
+The soak uses the shared job runtime with `maxAttempts: 1`; its detached launcher prepares the pinned
+code/dependency snapshot off-tick and records its PID/start-time identity during that preparation.
+The worker holds a read slot while running both deferred dry runs and then `tree-stays-clean` last,
+then settles under the write lock. All three rows must provide fresh, unskipped evidence; the
+pre-adopt deferred list remains exactly the two dry runs.
+Its token/SHA-bound result is durable before the completion lock is attempted. Later ticks
+consume that result or recover a missing/dead/expired worker as `quick-soak-unavailable`; the
+one-hour deadline is derived from the exact recorded `adoptedAt`. Failure/unavailability rolls
+back to the previous last-good record; an unsafe rollback quarantines rather than discarding dirt.
+Quick partial passes never enter the full-smoke proof cache. Regression home:
+`scripts/lib/__tests__/daemon-rebuild-quick.test.mjs` (private state/lock roots and injected children).
+
+Closure pipeline fixtures keep dispatch entry bytes identical while renaming, removing or adding a
+referenced dependency. Editing an entry would independently force full smoke and mask a missing
+old/candidate closure. Rename fixtures first prove Git recognizes the rename, then assert full smoke
+and an unmarked ready record so dropping either the old closure or the source endpoint is observable.
+
+Cache-exclusion fixtures need complete, unskipped evidence and a full-mode positive control that actually
+inserts a proof; incomplete rows would independently prevent caching and mask a missing quick guard.
+Deadline-bound fixtures need a live worker whose recorded deadline is still ahead of now but exceeds
+`adoptedAt + QUICK_SOAK_MAX_MS`; simple expiry does not exercise the adoption-relative bound.
+
 ## Daemon entry import regression
 
 `daemon-entries-import.test.mjs` cold-imports every `DAEMON_ENTRY_MODULES` entry from the

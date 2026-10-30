@@ -21,7 +21,9 @@ import { candidateSmokeEnv, materializeCandidate, removeCandidate } from './cand
 import { hostname } from 'node:os';
 import { pinnedStatus, planRebuild } from './plan.mjs';
 import { runBounded } from '../bounded-child.mjs';
-import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
+import { SMOKE_CHECKS, DISPATCH_DRY_RUN_CODE_ENTRIES } from '../daemon-live-smoke.mjs';
+import { collectImportClosure } from '../import-closure.mjs';
+import { decideQuick, resolveQuick, QUICK_DEFERRED_CHECKS, quickFinalizeWaitMs } from './quick.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 
@@ -363,6 +365,7 @@ export async function smokeAndAdopt({
   };
   const git = makeGit({ run, cwd: root, env });
   const smokeEnv = candidateSmokeEnv({ root, env });
+  const quickSetting = resolveQuick(env);
   // The per-clone state already isolates kinds (drain, review, etc.); include it in the proof as well.
   const cloneKind = posix.basename(root.replace(/\\/g, '/')) === 'code'
     ? posix.basename(posix.dirname(root.replace(/\\/g, '/'))) : posix.basename(root);
@@ -437,6 +440,7 @@ export async function smokeAndAdopt({
   };
 
   /** Materialize `sha` as the candidate worktree, smoke it, tear it down. */
+  let primaryQuick = false;
   const smokeSha = async (sha, changedFiles, label, suspects = [], { failFast = [] } = {}) => {
     // Recovery compares failures in this run. Historical passes (including unchanged-code skips)
     // cannot distinguish a healthy fallback from a harness that has since broken on every tree.
@@ -444,23 +448,52 @@ export async function smokeAndAdopt({
     if (freshComparison) changedFiles = null;
     const identity = smokePassIdentity(git, sha, cloneKind);
     const passes = readRebuildState(root, stEnv).smokePassed;
-    const proven = !freshComparison && reuse.reuseEnabled && identity && Array.isArray(passes) && passes.find(entry => {
+    let proven = !freshComparison && reuse.reuseEnabled && identity && Array.isArray(passes) && passes.find(entry => {
       const age = now() - Date.parse(entry?.passedAt);
       return entry?.key === identity.key && age >= 0 && age < reuse.reuseHours * 3_600_000;
     });
-    if (proven) log.error?.(`daemon-rebuild: smoke reused from ${proven.passedAt} on tree ${identity.tree} (env checks re-run)`);
+    if (proven && !quickSetting.quick) log.error?.(`daemon-rebuild: smoke reused from ${proven.passedAt} on tree ${identity.tree} (env checks re-run)`);
     // Every smoke of this build (A, then B / C) reuses the lease's own unique path, one after another.
     const candidate = materializeCandidate({
       root, sha, run, env, path: lease.path, log,
     });
     if (!candidate.ok) return { worktreeFailed: candidate.reason };
+    let quick = false;
+    if (quickSetting.quick && !(label === 'last-good' && !primaryQuick)) {
+      // Independent of skip-unchanged evidence: even an unknown adopted state must inspect the actual move.
+      // --no-renames includes both endpoints; NUL output preserves unusual Git path names.
+      const diff = git(['diff', '--name-only', '-z', '--no-renames', prevHead, sha]);
+      const files = diff.status === 0 ? String(diff.stdout ?? '').split('\0').filter(Boolean) : null;
+      let dispatchClosure = null;
+      try {
+        const before = collectImportClosure({ root, entries: DISPATCH_DRY_RUN_CODE_ENTRIES });
+        const after = collectImportClosure({ root: candidate.path, entries: DISPATCH_DRY_RUN_CODE_ENTRIES });
+        dispatchClosure = { files: new Set([...(before?.files ?? []), ...(after?.files ?? [])]),
+          bareDeps: before?.bareDeps || after?.bareDeps,
+          jsonNames: new Set([...(before?.jsonNames ?? []), ...(after?.jsonNames ?? [])]),
+          complete: before?.complete === true && after?.complete === true
+            && typeof before.bareDeps === 'boolean' && typeof after.bareDeps === 'boolean'
+            && before.jsonNames instanceof Set && after.jsonNames instanceof Set
+            && DISPATCH_DRY_RUN_CODE_ENTRIES.every(entry => before.files.has(entry) && after.files.has(entry)) };
+      } catch { /* full */ }
+      const decision = decideQuick({ enabled: true, changedFiles: files, dispatchClosure });
+      quick = decision.quick;
+      log.error?.(`daemon-rebuild: quick mode ${quick ? 'on' : 'ignored — full path'}: ${decision.why}`);
+      if (quick) { changedFiles = null; proven = false; }
+    } else if (quickSetting.quick) {
+      log.error?.('daemon-rebuild: quick mode ignored — full path: last-good control for a full-mode candidate');
+    }
+    if (label == null) primaryQuick = quick;
+    if (proven && quickSetting.quick) log.error?.(`daemon-rebuild: smoke reused from ${proven.passedAt} on tree ${identity.tree} (env checks re-run)`);
     let smokeResult = null;
     let threw = null;
     let dispatch = null;
     const t0 = now();
     try {
       const runChild = budgetedRunChild({ deadline, now, failFast: budget.failFast ? failFast : [] });
-      smokeResult = await runSmoke({ root: candidate.path, env: smokeEnv, changedFiles: proven ? null : changedFiles, reuseCode: !!proven, runChild });
+      smokeResult = await runSmoke({ root: candidate.path, env: smokeEnv, changedFiles: proven ? null : changedFiles, reuseCode: !!proven, runChild,
+        ...(quick ? { singleAttempt: true, deferredChecks: QUICK_DEFERRED_CHECKS } : {}) });
+      if (quick) smokeResult = { ...smokeResult, quick: true };
     } catch (e) {
       threw = e;
     }
@@ -486,7 +519,7 @@ export async function smokeAndAdopt({
         ...passTimings,
       });
     }
-    if (!threw && !proven && completeSmokePass(smokeResult) && changedFiles === null && (!dispatch || dispatch.result.ok)
+    if (!quick && !threw && !proven && completeSmokePass(smokeResult) && changedFiles === null && (!dispatch || dispatch.result.ok)
       && !smokeResult.cached && !busyPoolSkippedChecks(smokeResult).length && label !== 'confirm') {
       if (identity) await locked((st) => {
         const prior = Array.isArray(st.smokePassed) ? st.smokePassed : [];
@@ -555,6 +588,7 @@ export async function smokeAndAdopt({
    *  FIRST, so a lock refusal here never throws it away — the next write-lock holder (this process's next tick, or
    *  a sibling at its own tick start) adopts it without re-smoking (see prepareRebuild). */
   const finalize = async (p, onAdopted, readyMeta = { kind: 'candidate' }, smokeResult = null) => {
+    const quick = smokeResult?.quick === true;
     // Record, BEFORE adopting, that this build's tree passed with a busy-pool skip (see `changedSince`).
     const busySkipped = busyPoolSkippedChecks(smokeResult);
     if (busySkipped.length) {
@@ -564,6 +598,7 @@ export async function smokeAndAdopt({
     }
     writeReadyCandidate(root, {
       ...readyMeta,
+      ...(quick ? { quick: true } : {}),
       prevHead,
       tree: verifyRev(git, `${p.finalSha}^{tree}`),
       adopt: {
@@ -591,8 +626,8 @@ export async function smokeAndAdopt({
       };
     }
     const fin = await withWriteLock(root, () => finalizeRebuild({
-      root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted,
-    }), finalizeLockOpts);
+      root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted, quick,
+    }), quick ? { ...finalizeLockOpts, waitMs: quickFinalizeWaitMs({ quick: true, env }) } : finalizeLockOpts);
     if (!fin.ok) {
       if (fin.reason === 'tick-in-progress') {
         log.error?.(`daemon-rebuild: could not take the write lock to finalize ${p.finalSha} after a passing smoke (reader ${fin.heldBy ?? '?'} still ticking) — kept as the ready candidate; the next write-lock holder adopts it without re-smoking`);
@@ -808,9 +843,10 @@ export async function smokeAndAdopt({
       if (bPassed && loadOnly) {
         // Same-run differential, second half: re-smoke A now that plain main passed.
         // No budget left for the re-smoke: no same-run differential, so treat it as load (never blame the overlay).
-        const a2 = budgetAllows('confirm') ? await smokeSha(plan.finalSha, null, 'confirm', aSuspects) : { budgetSkipped: true };
+        const a2 = a.smokeResult.quick ? { quickSkipped: true }
+          : budgetAllows('confirm') ? await smokeSha(plan.finalSha, null, 'confirm', aSuspects) : { budgetSkipped: true };
         if (a2.dispatch && !a2.dispatch.result.ok) return dispatchFailed(a2.dispatch);
-        if (!a2.budgetSkipped && !a2.worktreeFailed && !a2.threw && a2.smokeResult?.verdict === 'pass') {
+        if (!a2.quickSkipped && !a2.budgetSkipped && !a2.worktreeFailed && !a2.threw && a2.smokeResult?.verdict === 'pass') {
           if (a2.dispatch) dispatchPassedAlert(a2.dispatch);
           alert('smoke-load-confirm-passed', {
             failed: failedNames, suspects: suspectInfo,
@@ -823,14 +859,18 @@ export async function smokeAndAdopt({
         const failedNamesA = new Set(failedA.map((r) => r.name));
         const reproduced = failedA2.some((r) => failedNamesA.has(r.name) && !isLoadShapedRow(r, env));
         if (!reproduced) {
-          envLoadAlert({ plainMain: 'passed', confirm: failedA2.map((r) => r.name).join(',') || (a2.budgetSkipped ? 'skipped: budget' : a2.worktreeFailed ? `worktree: ${a2.worktreeFailed}` : 'threw') });
+          envLoadAlert({ plainMain: 'passed', confirm: failedA2.map((r) => r.name).join(',') || (a2.quickSkipped ? 'skipped: quick mode' : a2.budgetSkipped ? 'skipped: budget' : a2.worktreeFailed ? `worktree: ${a2.worktreeFailed}` : 'threw') });
           // Plain main passed: adopt it so the clone stays current, keep every overlay, back A off.
           const recordBackoff = () => {
             const st = readRebuildState(root, stEnv);
             envLoadRecord(st);
             writeRebuildState(root, st, stEnv);
           };
-          const fin = await finalize(planB, recordBackoff, { kind: 'candidate' }, b.smokeResult);
+          // A's load rejection is already known, even when B is only queued for adoption.
+          // Persist it under the state lock before publishing B's ready record; adoption
+          // still needs the hook because finalizeRebuild clears the rejection state.
+          if (readyOnly) await locked(envLoadRecord);
+          const fin = await finalize(planB, readyOnly ? undefined : recordBackoff, { kind: 'candidate' }, b.smokeResult);
           return { ...fin, reason: fin.adopted ? 'smoke-env-load' : fin.reason };
         }
         // A reproduced a code-shaped failure on a check it already failed, while plain main passed: genuine.
