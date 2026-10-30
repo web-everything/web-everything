@@ -1,5 +1,20 @@
 # Testing — Three-Tier Strategy
 
+## Worker cancellation during module loading
+
+Never terminate a worker while its ESM graph is loading: Node 22 can abort the entire process in
+`AsyncModuleExecutionFulfilled`. The verify watchdog disarms its shared deadline before cooperative
+shutdown, and `verify-lane` awaits its exit before emitting the final verdict, including timeout and
+spawn-error paths. Keep the escape sweeps intact when the deadline already fired.
+
+The health probe worker uses `worker-deadline.mjs`: announce readiness after all imports and before
+synchronous probe work, check startup cancellation, and drain worker exit before reporting a timeout.
+Module evaluation is allowed to finish during cancellation; the timeout prevents probe work from
+starting but does not forcibly interrupt the loader. Do not use this readiness protocol for work
+that dynamically imports additional modules after announcing readiness.
+`bounded-child-tree-kill.test.mjs` and `worker-deadline.test.mjs` use subprocesses with delayed ESM
+imports to exercise cancellation without taking down the test runner on a native loader regression.
+
 ## Forge manifest reuse
 
 `forge-fast-manifest.test.mjs` compares Git-based reuse with a full byte manifest and spies on
