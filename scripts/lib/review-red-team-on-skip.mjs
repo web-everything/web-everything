@@ -394,7 +394,12 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           if (refusal) return skip(refusal);
           return { ...row, action: 'clear', why: 'not owed (stored review)' };
         }
-        if (!owed) return skip('stored review does not owe a red team');
+        // Running writers retain only the read, so recover the accepting run before
+        // dispatch instead of treating an absent verdict record as a rejection.
+        // A present non-owed verdict still refuses recovery, even for a dead owner.
+        if (!owed && !(staleOwed && evidence.loopPayload?.verdict == null)) {
+          return skip('stored review does not owe a red team');
+        }
       }
       if (!movedCardOnly && evidence.loopPayload?.findings?.read?.netBasis?.rev !== head) return skip('stored review does not match live head');
       if ((!staleOwed && (evidence.inFlight || status?.status === 'running')) || evidence.queued) return skip('red-team pass in flight');

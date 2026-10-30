@@ -1736,6 +1736,14 @@ describe('staleRedTeamRun — dead running owner recovery', () => {
     expect(result).toEqual({ stale, reason: expect.any(String) });
     expect(result.reason.length).toBeGreaterThan(0);
   });
+  it.each(['isAlive', 'readPidStart'])('probe exceptions refuse recovery even past the deadline (%s)', name => {
+    const probe = staleProbe(true, old);
+    probe[name].mockImplementation(() => { throw new Error('EPERM'); });
+    expect(staleRecovery.staleRedTeamRun({ status: deadRunningStatus({ pidStart: old }),
+      now: staleNow, deadlineMs: staleDeadline, probe }))
+      .toEqual({ stale: false, reason: 'running red team owner probe unreadable' });
+    expect(probe[name]).toHaveBeenCalledOnce();
+  });
   it('missing status fails closed', () => {
     expect(staleRecovery.staleRedTeamRun({ now: staleNow, probe: staleProbe() }))
       .toEqual({ stale: false, reason: expect.any(String) });
@@ -1748,6 +1756,75 @@ describe('staleRedTeamRun — dead running owner recovery', () => {
 });
 
 describe('planRedTeamOnSkip — PR 6039 truncated running payload', () => {
+  it('dead running owner with truncated verdict recovers the accepting run and dispatches', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stale-red-team-truncated-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_DAEMON_EVENTS: join(dir, 'events.jsonl') };
+    try {
+      const acceptingRun = { ...newRunRecord({ id: 'review-pr-accepting', op: 'review-pr', input: { repo, pr } }),
+        ...payload() };
+      writeRun(acceptingRun, env.WE_SHARED_RUNS_DIR);
+      // Match review-extra-seats' production payload; only the writer's owner PID is replaced.
+      const loopPayload = { findings: { read: { netBasis: { rev: head } } } };
+      const writer = { env, host: 'fixture-host', namespace: 'fixture-namespace',
+        readPidStart: () => deadRunningStatus().pidStart };
+      recordRedTeamStatus({ repo, pr, loopPayload, status: 'running' }, writer);
+      const statusPath = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
+      const status = readRedTeamStatus({ repo, pr, head, env });
+      writeFileSync(statusPath, JSON.stringify({ ...status, pid: 6039 }));
+      const probe = { ...staleProbe(), isAlive: pid => pid === process.pid };
+      const readEvidence = key => readDrainRedTeamEvidence({ ...key, env,
+        runsDir: env.WE_SHARED_RUNS_DIR, ...probe, readScorecards: () => [] });
+      const readStatus = key => readRedTeamStatus({ ...key, env });
+      const staleSpent = key => staleRecovery.staleRedTeamSpent({ ...key, env });
+      const staleRedispatch = key => staleRecovery.staleRedTeamRedispatch({ ...key, env });
+      expect(readEvidence({ repo, pr, head })).toMatchObject({ loopPayload, inFlight: false,
+        status: { status: 'running', pid: 6039 } });
+      expect(readEvidence({ repo, pr, head }).loopPayload).not.toHaveProperty('verdict');
+      const f = staleFixture({ readEvidence, readStatus, probe, staleSpent, staleRedispatch });
+      expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'dispatch', mode: 'fresh', abandonStale: true });
+
+      const recoverPayload = vi.fn(staleRecovery.recoverStaleRunPayload);
+      const abandonStale = vi.fn(input => staleRecovery.abandonStaleRedTeamRun({ ...input, clock: () => staleNow }));
+      const dispatch = vi.fn(() => {
+        expect(readStatus({ repo, pr, head }).staleAbandoned.pid).toBe(6039);
+        expect(existsSync(`${statusPath}.stale-redispatch-1`)).toBe(true);
+        recordRedTeamStatus({ repo, pr, loopPayload, status: 'queued' }, writer);
+        return { jobPid: 42 };
+      });
+      const o = staleRunFixture({ ...f, now: () => staleNow, env, recoverPayload, abandonStale, dispatch });
+      expect(runRedTeamOnSkip(o).dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'fresh' }]);
+      expect(recoverPayload).toHaveBeenCalledOnce();
+      expect(recoverPayload).toHaveBeenCalledWith({ repo, pr, head, env });
+      expect(recoverPayload.mock.results[0].value).toEqual(acceptingRun);
+      expect(abandonStale).toHaveBeenCalledOnce();
+      expect(dispatch).toHaveBeenCalledOnce();
+      expect(dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true,
+        redTeamMode: 'fresh', redTeamStaleRecovery: true });
+      o.lastDispatch.clear();
+      o.capacity = { lanes: 1, budget: { left: 1 } };
+      expect(runRedTeamOnSkip(o)).toMatchObject({ rows: [{ action: 'skip', why: 'red-team pass in flight' }],
+        dispatched: [] });
+      expect(dispatch).toHaveBeenCalledOnce();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each([undefined, null])('stale owner with absent verdict record %j may recover', verdict => {
+    const f = staleFixture(), evidence = f.readEvidence();
+    evidence.loopPayload.verdict = verdict;
+    f.readEvidence = () => evidence;
+    expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'dispatch', abandonStale: true });
+  });
+  it.each(['live owner', 'wrong status head', 'not accepted', 'finished status'])(
+    'absent verdict cannot authorize recovery with %s', kind => {
+      const f = staleFixture(), evidence = f.readEvidence();
+      delete evidence.loopPayload.verdict;
+      f.readEvidence = () => evidence;
+      if (kind === 'live owner') f.probe = staleProbe(true);
+      if (kind === 'wrong status head') f.readStatus().head = 'b'.repeat(40);
+      if (kind === 'not accepted') f.rawPrs[0].labels = ['review:changes', 'red-team:pending'];
+      if (kind === 'finished status') f.readStatus().status = 'finished';
+      expect(planRedTeamOnSkip(f)[0]).toMatchObject({ action: 'skip',
+        why: 'stored review does not owe a red team' });
+    });
   it.each([
     ['marker 1', 1, false],
     ['marker 2', 2, true],

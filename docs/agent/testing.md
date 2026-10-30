@@ -538,15 +538,22 @@ Confirmed non-starts release only the marker they claimed; unknown dispatch outc
 `live-job` keeps both abandonment and no-restart claims even when its PID was already budgeted;
 that budget refund proves no new start, not that the existing job cannot run. Null/undefined
 dispatch outcomes keep their claims; the budget start is refunded as for any non-live-job skip. The stale planner bypasses
-only the in-flight refusal: non-owed verdicts and all accepted-head publication guards still apply,
+the in-flight refusal and permits an absent verdict record in a head-matching running payload;
+present non-owed verdicts and all accepted-head publication guards still apply,
 including when the status re-read observes a completed decision after selecting a stale owner.
+Build status-derived fixtures with `recordRedTeamStatus` and read them with the real
+`readDrainRedTeamEvidence`. **dead running owner with truncated verdict recovers the accepting run and dispatches**
+uses the production truncated payload, recovers the accepting run from disk, abandons the dead owner,
+and verifies exactly one dispatch followed by refusal of the live queued handoff.
 Malformed marker metadata stays closed, and exhausted recovery asks the operator to inspect the
 review run. The **stale red-team recovery — bounded second re-dispatch** cases exercise real
 markers, backoff boundaries, owner provenance, retry bounds, and release/retention semantics.
 Production admission re-runs `staleRedTeamRun` on the prior before clearing it. Admission-level tests
 pin only a dead PID (accepted) and a live PID (refused); the other outcomes (reused PID, unprobeable
 owner past or within the deadline, probe error, unknown age) are pinned at the `staleRedTeamRun` unit
-level, not through admission. The execution guard
+level, not through admission. **probe exceptions refuse recovery even past the deadline (%s)**
+throws from each of `isAlive` and `readPidStart` and requires refusal despite expired owner age.
+The execution guard
 refuses every still-running prior, including one marked abandoned: direct callers cannot
 use abandonment as proof of death. The regression
 **refuses direct fresh recovery without admission for an abandoned running live writer with zero calls**
