@@ -2980,3 +2980,6 @@ The rollup adapter filters by time, then delegates exact id and fail-closed tie 
 and returns the original rows, so the CLI annotates the same selected merge-gate evidence.
 The escalation CLI reuses `excusePrMergeGateHolds` for head-bound hold evidence, with
 `prChecksOptions` supplying hermetic readers. A failed PR or roster read permits recording with a warning; an unreadable merge-gate verdict or freeze read still permits `needs-human` with a warning, but keeps the red-check refusal for `not-a-ci-break`.
+Classification errors, including malformed rollup identities, propagate to the CLI's error handler and abort
+before any escalation comment is posted. The read-error fallback never catches refusal classification.
+`ci-heal-escalation-mark.test.mjs` pins both preflights and both CLI outcomes with nameless evidence beside a required failure.

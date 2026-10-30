@@ -341,6 +341,21 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
   const recordOptions = () => ({ pr: 4535, repo: fixture.repo, headSha: head, outcome: 'not-a-ci-break', settings,
     readPr: vi.fn(() => fixture), readRequired: vi.fn(async () => ({ checks: fixture.requiredChecks })) });
 
+  it.each([
+    ['not-a-ci-break', checkNotCiBreakRecordable],
+    ['needs-human', checkNeedsHumanEscalable],
+  ])('%s classification errors abort recording instead of becoming read warnings', async (outcome, preflight) => {
+    for (const malformed of [{}, { name: '' }, { context: '' }, { name: 123 }, null]) {
+      for (const reverse of [false, true]) {
+        const rows = [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }, malformed];
+        await expect(preflight({ ...recordOptions(), outcome,
+          readPr: () => ({ ...fixture, statusCheckRollup: reverse ? rows.toReversed() : rows }),
+          readRequired: async () => ({ checks: ['test'] }),
+        })).rejects.toThrow(TypeError);
+      }
+    }
+  });
+
   describe('gate-only red and cancelled-check recording regressions', () => {
     const check = (name, conclusion, extra = {}) => ({ name, status: 'COMPLETED', conclusion, ...extra });
     const gatePr = (statusCheckRollup = [check('test', 'SUCCESS'), check('review-gate', 'FAILURE')]) => ({
@@ -696,7 +711,11 @@ describe('needs-human CLI preflight wiring — #6004/#5979', () => {
     ['merge-gate', [{ name: 'ready-to-merge' }], 'review'], ['merge-gate', [], 'review'],
     ['merge-gate', [], 'job-failure'], ['merge-gate', [], 'other-head'],
     ['merge-gate', [], 'truncated'], ['merge-gate', [], 'unreadable'],
-  ])('classifies raw %s with labels %j and %s evidence before posting', (gate, labels, evidence) => {
+    ['review-gate', [], 'malformed', 'not-a-ci-break'],
+    ['review-gate', [], 'malformed', 'needs-human'],
+    ['merge-gate', [], 'conflicting-flags', 'not-a-ci-break'],
+    ['merge-gate', [], 'conflicting-flags', 'needs-human'],
+  ])('classifies raw %s with labels %j and %s evidence before posting (outcome=%s)', (gate, labels, evidence, outcome = 'needs-human') => {
     const dir = mkdtempSync(join(tmpdir(), 'ci-heal-gate-cli-'));
     try {
       const log = join(dir, 'calls.jsonl');
@@ -710,7 +729,11 @@ import cp from 'node:child_process';
 import { appendFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 const facts = ${JSON.stringify({ number: 6042, labels, headRefOid: HEAD, statusCheckRollup: [
-  { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+  { name: 'test', status: 'COMPLETED', conclusion: evidence === 'malformed' ? 'FAILURE' : 'SUCCESS' },
+  ...(evidence === 'malformed' ? [{}] : []),
+  ...(evidence === 'conflicting-flags' ? [
+    { name: gate, status: 'COMPLETED', conclusion: 'FAILURE', required: false },
+  ] : []),
   { name: gate, status: 'COMPLETED', conclusion: 'FAILURE',
     ...(gate === 'merge-gate' ? { detailsUrl: 'https://github.com/web-everything/web-everything/actions/runs/100/job/123' } : {}) },
 ] })};
@@ -735,7 +758,7 @@ syncBuiltinESMExports();
 `);
       const result = spawnSync(process.execPath, ['--import', preload,
         join(dirname(fileURLToPath(import.meta.url)), '..', 'ci-heal-escalation-mark.mjs'), '6042',
-        `--head=${HEAD}`, `--base-head=${HEAD}`, '--outcome=needs-human', '--repo=web-everything/web-everything'], {
+        `--head=${HEAD}`, `--base-head=${HEAD}`, `--outcome=${outcome}`, '--repo=web-everything/web-everything'], {
         encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
         env: { ...process.env, NODE_OPTIONS: '', WE_COORDINATION_ROOT: dir,
           WE_CI_HEAL_RECHECK_NOT_CI_BREAK: 'on', MERGE_GATE_CANDIDACY_HOLD_IS_NOT_CI_FAILURE: 'on',
@@ -744,7 +767,13 @@ syncBuiltinESMExports();
       });
       expect(result.error).toBeUndefined();
       expect(result.status, result.stderr).toBe(1);
-      if (evidence === 'review') {
+      if (['malformed', 'conflicting-flags'].includes(evidence)) {
+        expect(result.stderr).toContain(evidence === 'malformed'
+          ? 'Check rows must have a non-empty string name or context'
+          : 'Tied check attempts have conflicting required flags');
+        expect(result.stderr).not.toContain('could not re-check');
+        expect(result.stderr).not.toContain('could not post');
+      } else if (evidence === 'review') {
         expect(result.stderr).toContain('refusing to record needs-human on PR #6042');
         expect(result.stderr).toContain(gate);
       } else {
@@ -760,12 +789,12 @@ syncBuiltinESMExports();
       expect(reads[0].args).toEqual(['gh', ['pr', 'view', '6042', '--json',
         'number,labels,headRefOid,statusCheckRollup,url', '--repo=web-everything/web-everything']]);
       expect(reads.map(call => call.args[1].slice(0, 2))).toEqual([
-        ['pr', 'view'], ...(gate === 'merge-gate' ? [
+        ['pr', 'view'], ...(gate === 'merge-gate' && evidence !== 'conflicting-flags' ? [
           ['api', 'repos/web-everything/web-everything/actions/jobs/123'],
           ...(evidence === 'unreadable' ? [] : [['api', 'repos/web-everything/web-everything/actions/jobs/123/logs']]),
         ] : []),
       ]);
-      if (evidence === 'review') expect(calls).toEqual(reads);
+      if (['review', 'malformed', 'conflicting-flags'].includes(evidence)) expect(calls).toEqual(reads);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

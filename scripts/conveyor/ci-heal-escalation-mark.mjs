@@ -437,21 +437,25 @@ export async function checkNotCiBreakRecordable(options = {}) {
   return checkEscalationRecordable(options, 'not-a-ci-break', notCiBreakRecordRefusal);
 }
 
-/** Both preflights share settings and classification; needs-human permits recording on classifier read failures. */
+/** Both preflights tolerate read failures; classification errors abort before recording. */
 async function checkEscalationRecordable({ pr, repo, headSha, outcome, settings = resolveCiHealVerdictSettings(),
-  prChecksOptions, readPr = args => defaultReadPrChecks(args, prChecksOptions),
+  prChecksOptions, readPr,
   readRequired = defaultReadRequiredChecks }, expectedOutcome, refusalFor) {
   if (outcome !== expectedOutcome || !settings?.recheckNotCiBreak) return { refusal: null };
   const warningFor = error => `could not re-check required checks before recording ${expectedOutcome}: ${String(error?.message || error).split('\n')[0]}`;
+  let facts, checks;
   try {
-    const facts = await readPr({ pr, repo });
-    const { checks } = await readRequired({ repo: repo ?? facts?.slug ?? null });
-    const refusal = facts?.readError && expectedOutcome === 'needs-human'
-      ? null : refusalFor({ headSha, pr: facts, requiredChecks: checks });
-    return { refusal, ...(facts?.readError ? { warning: warningFor(facts.readError) } : {}) };
+    facts = await (readPr ?? (args => defaultReadPrChecks(args, prChecksOptions)))({ pr, repo });
+    ({ checks } = await readRequired({ repo: repo ?? facts?.slug ?? null }));
   } catch (e) {
     return { refusal: null, warning: warningFor(e) };
   }
+  // Only IO failures may use the warning fallback. Malformed check evidence must
+  // reach the CLI's error handler before it can post an escalation.
+  if (!readPr) facts = classifyPrChecks(facts, { pr, repo }, prChecksOptions);
+  const refusal = facts?.readError && expectedOutcome === 'needs-human'
+    ? null : refusalFor({ headSha, pr: facts, requiredChecks: checks });
+  return { refusal, ...(facts?.readError ? { warning: warningFor(facts.readError) } : {}) };
 }
 
 /** Share the not-a-ci-break setting and readers; failed reads permit needs-human with a warning. */
@@ -459,15 +463,20 @@ export async function checkNeedsHumanEscalable(options = {}) {
   return checkEscalationRecordable(options, 'needs-human', needsHumanGateOnlyRefusal);
 }
 
-function defaultReadPrChecks({ pr, repo }, {
-  runGh = runGhSync, readMergeGateVerdict = defaultReadMergeGateVerdict,
-  readFreeze = readSharedFreeze, mergeGateSetting,
-} = {}) {
+function defaultReadPrChecks({ pr, repo }, { runGh = runGhSync } = {}) {
   const args = ['pr', 'view', String(pr), '--json', 'number,labels,headRefOid,statusCheckRollup,url'];
   if (repo) args.push(`--repo=${repo}`);
   const raw = runGh(args, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024 });
   const parsed = JSON.parse(String(raw || '{}'));
   const slug = /^https:\/\/github\.com\/([^/]+\/[^/]+)\//.exec(parsed.url ?? '')?.[1] ?? null;
+  return { ...parsed, slug };
+}
+
+function classifyPrChecks(parsed, { pr, repo }, {
+  readMergeGateVerdict = defaultReadMergeGateVerdict,
+  readFreeze = readSharedFreeze, mergeGateSetting,
+} = {}) {
+  const { slug } = parsed;
   const rows = Array.isArray(parsed.statusCheckRollup) ? parsed.statusCheckRollup : [];
   // Select once with R216 before the shared hold reader examines the job. It
   // must never annotate an older failure beside a newer success/pending run.
