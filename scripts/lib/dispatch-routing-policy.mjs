@@ -14,6 +14,11 @@ const CATALOG = Object.freeze({
 });
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const fail = message => { throw new TypeError(`routing policy: ${message}`); };
+// These settings-backed seats use review-seat-provider's Claude/agy adapters.
+// Added review seats (including red-team) have a separate, wider provider roster.
+const SETTINGS_SEAT_TASKS = ['mandatory:correctness', 'mandatory:security', 'advisory:agy-correctness'];
+const SETTINGS_SEAT_PROVIDERS = ['claude', 'agy-claude', 'agy-gemini'];
+const OPTIONAL_ADVISORY_SEAT = 'review-seat:advisory:agy-correctness';
 function keys(value, allowed, path) {
   if (!object(value)) fail(`${path} must be an object`);
   for (const key of Object.keys(value)) if (!allowed.includes(key)) fail(`${path}.${key} is unknown`);
@@ -85,9 +90,22 @@ export function validateRoutingPolicy(input) {
         modelFor(policy, next.provider, next.model, `${path}.fallback[${i}]`);
         validateEffort(next.effort, next.provider);
       }
+      if (group === 'operations' && SETTINGS_SEAT_TASKS.some(task => name === `review-seat:${task}`)) {
+        for (const route of [entry, ...entry.fallback]) {
+          if (!SETTINGS_SEAT_PROVIDERS.includes(route.provider)) fail(`${path}: unsupported seat provider ${route.provider}`);
+        }
+      }
     }
   }
   if (!policy.operations['*']) fail('operations.* is required');
+  // Validate the same projection used during review-pr initialization, including
+  // inherited/generic entries and disables that exhaust a mandatory seat's chain.
+  for (const taskType of SETTINGS_SEAT_TASKS) {
+    const route = resolveOperationRoute({ operation: 'review-seat', taskType, available: SETTINGS_SEAT_PROVIDERS, policy });
+    if (route?.mode === 'shadow' && !route.fallback.some(next => next.provider === 'claude')) {
+      fail(`review-seat:${taskType}: shadow requires an enabled claude provider to count`);
+    }
+  }
   return freeze(policy);
 }
 /** Provider controls are operation-local and validated even on inherited routes. */
@@ -125,27 +143,40 @@ export function applyRoutingOverrides(base, overrides = {}) {
   return validateRoutingPolicy(policy);
 }
 
-/** Null means retain the existing evidence/tier decision. Availability is supplied by the launch boundary. */
+/** Null retains the evidence/tier decision, or omits the optional agy advisory seat.
+ * Constrained inheritance refuses dispatch unless an explicit route can enforce the disables.
+ * Availability is supplied by the launch boundary. */
 export function resolveOperationRoute({ operation, taskType, size, designQuestion, wellScoped, available, availability = {}, gateClosed = false, vetoes = [], policy = DEFAULT_ROUTING_POLICY } = {}) {
   let entry = policy.operations[`${operation}:${taskType}`] ?? policy.operations[operation] ?? policy.operations[String(operation).split(':')[0]];
+  const disabledProviders = new Set(entry?.disabledProviders ?? []);
+  const optionalAdvisory = (taskType ? `${operation}:${taskType}` : operation) === OPTIONAL_ADVISORY_SEAT;
+  const inheritRoute = () => {
+    // Null delegates to a caller-owned evidence router whose choice is unknown here.
+    // Require an explicit route before allowing a constrained inherited dispatch.
+    if (disabledProviders.size && !optionalAdvisory) fail(`${operation}: inherited route cannot enforce disabled providers; configure an explicit provider and fallback`);
+    return null;
+  };
   if (['prepare', 'prepare-item'].includes(operation) && policy.smallPrepare && Number.isFinite(size) && size > 0 && size <= policy.smallPrepare.maxSize && designQuestion === false && wellScoped === true) entry = policy.smallPrepare.route;
   else if (['prepare', 'prepare-item'].includes(operation) && (size >= 5 || designQuestion === true)) entry = policy.operations['prepare-decision'];
-  const disabledProviders = entry?.disabledProviders ?? [];
+  for (const provider of entry?.disabledProviders ?? []) disabledProviders.add(provider);
   if (!entry || entry.inherit) entry = policy.taskTypes[taskType] ?? entry ?? policy.operations['*'];
+  for (const provider of entry.disabledProviders ?? []) disabledProviders.add(provider);
   if (entry.inherit) {
-    if (!gateClosed) return null;
+    if (!gateClosed) return inheritRoute();
     // An inherited task route must still honour the operation's configured Claude fallback
     // when the critical-work gate closes. The chain below removes every external provider.
     entry = policy.operations[operation] ?? policy.operations[String(operation).split(':')[0]];
-    if (!entry || entry.inherit) return null;
+    if (!entry || entry.inherit) return inheritRoute();
   }
   const chain = [entry, ...entry.fallback].map(({ provider, model, effort }) => ({ provider, model: modelFor(policy, provider, model, operation), effort: resolvePolicyEffort(provider, typeof effort === 'string' ? effort : effort?.[provider] ?? operationEffort(operation, provider, taskType, policy)) }))
-    .filter(route => !disabledProviders.includes(route.provider) && !entry.disabledProviders?.includes(route.provider))
+    .filter(route => !disabledProviders.has(route.provider) && !entry.disabledProviders?.includes(route.provider))
     .filter(route => (!gateClosed || route.provider === 'claude') && (route.provider === 'claude' || !vetoes.some(veto => veto.model === route.model && veto.provider === (route.provider.startsWith('agy-') ? 'antigravity' : route.provider))))
     .filter(route => !availability?.[route.provider]
       && !(route.provider.startsWith('agy-') && availability?.antigravity)
       && !(route.model.startsWith('gemini-') && availability?.codex));
   const selected = chain.find(route => (!gateClosed || route.provider === 'claude') && (!available || available.includes(route.provider)));
+  // This optional seat may be switched off without preventing mandatory review.
+  if (!selected && optionalAdvisory && disabledProviders.size) return null;
   if (!selected) fail(`${operation}: no available route${gateClosed ? ' permitted by critical-work gate' : ''}`);
   return { ...selected, fallback: chain.slice(chain.indexOf(selected) + 1), source: 'routing-policy', ...(vetoes.length ? { vetoes: structuredClone(vetoes) } : {}), ...(entry.mode && selected === chain[0] ? { mode: entry.mode } : {}) };
 }

@@ -16,6 +16,16 @@ import { compute, judge } from '../step-kinds.mjs';
 const dirs = [];
 afterEach(() => { vi.unstubAllEnvs(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const key = 'review-seat:red-team';
+it.each(['advisory:agy-correctness', 'mandatory:correctness', 'mandatory:security'])(
+  'refuses an unsupported provider for %s without writing preferences', async taskType => {
+    const f = fixture();
+    const original = JSON.stringify({ unrelated: true });
+    writeFileSync(f.path, original);
+    expect(() => planRoutingOverride({ operation: 'review-seat', taskType, provider: 'codex' })).toThrow(/provider/);
+    expect((await f.command(['--operation=review-seat', `--taskType=${taskType}`, '--provider=codex'])).code).not.toBe(0);
+    expect(readFileSync(f.path, 'utf8')).toBe(original);
+  });
+
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), 'routing-override-cli-')); dirs.push(dir);
   const path = join(dir, 'preferences.json');

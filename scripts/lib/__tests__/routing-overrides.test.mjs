@@ -9,6 +9,8 @@ import { operatorPreferencesPath, readPlatformPreferences, PLATFORM_PREFERENCES_
 import { resolveRoutingProviderCap } from '../../operations/review-seat-policy.mjs';
 import { runExtraSeats, reserveSeatCalls } from '../../operations/review-extra-seats.mjs';
 import { ROUTED_ADVISORY_LENSES, EXTRA_JUROR_MANDATE } from '../../operations/review-dispatch.mjs';
+import { decideDispatchRoute } from '../dispatch-contracts.mjs';
+import { settingsFromRoutingPolicy } from '../review-seat-provider.mjs';
 
 const key = 'review-seat:red-team';
 const dirs = [];
@@ -28,6 +30,94 @@ function fixture(realEvents = false) {
 }
 
 describe('operator routing overrides', () => {
+  it('refuses an inherited evidence route when provider disables cannot be enforced', () => {
+    const policy = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { fix: { disabledProviders: ['claude'] } });
+    const result = decideDispatchRoute({ kind: 'fix', cause: 'review-finding', scopePaths: ['scripts/example.mjs'],
+      size: 1, risk: 'low' }, { routingPolicy: policy, scorecards: [] });
+    expect(result.outcome).toBe('refused');
+    expect(result.refusal).toMatch(/routing policy/);
+  });
+
+  it.each(['advisory:agy-correctness', 'mandatory:correctness', 'mandatory:security'])(
+    'rejects unsupported providers for %s before accepting an override', task => {
+      for (const provider of ['codex', 'antigravity']) {
+        expect(() => applyRoutingOverrides(DEFAULT_ROUTING_POLICY, {
+          [`review-seat:${task}`]: { provider },
+        })).toThrow(/provider/);
+        expect(() => applyRoutingOverrides(DEFAULT_ROUTING_POLICY, {
+          [`review-seat:${task}`]: { fallback: [{ provider: 'claude', model: 'sonnet' },
+            { provider, model: provider === 'codex' ? 'sol' : 'sonnet' }] },
+        })).toThrow(/provider/);
+      }
+    });
+
+  it('rejects an unsupported generic review route when settings seats inherit it', () => {
+    const base = structuredClone(DEFAULT_ROUTING_POLICY);
+    for (const task of ['mandatory:correctness', 'mandatory:security', 'advisory:agy-correctness']) {
+      delete base.operations[`review-seat:${task}`];
+    }
+    expect(() => applyRoutingOverrides(base, { 'review-seat': { provider: 'codex' } })).toThrow(/no available route/);
+  });
+
+  it('rejects disabling every mandatory seat provider before publishing settings', () => {
+    expect(() => applyRoutingOverrides(DEFAULT_ROUTING_POLICY, {
+      'review-seat:mandatory:correctness': { disabledProviders: ['agy-claude', 'claude'] },
+    })).toThrow(/no available route/);
+  });
+
+  it('rejects disabling the counted Claude provider of a shadow seat', () => {
+    expect(() => applyRoutingOverrides(DEFAULT_ROUTING_POLICY, {
+      'review-seat:mandatory:correctness': { disabledProviders: ['claude'] },
+    })).toThrow(/shadow requires an enabled claude provider/);
+  });
+
+  it.each([false, true])('enforces inherited task disables with gateClosed=%s', gateClosed => {
+    const base = structuredClone(DEFAULT_ROUTING_POLICY);
+    base.taskTypes.bugfix.disabledProviders = ['claude'];
+    const policy = validateRoutingPolicy(base);
+    expect(() => resolveOperationRoute({ operation: 'fix', taskType: 'bugfix', gateClosed, policy }))
+      .toThrow(/disabled providers/);
+  });
+
+  it.each(['fix', 'ci-heal', 'review-seat:red-team'])(
+    'never delegates constrained inherited %s routes to an unfiltered caller', operation => {
+      const policy = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { [operation]: { disabledProviders: ['codex'] } });
+      expect(() => resolveOperationRoute({ operation, policy })).toThrow(/disabled providers/);
+    });
+
+  it.each([
+    { size: 1, designQuestion: false, wellScoped: true },
+    { size: 5, designQuestion: true },
+  ])('preserves operation disables across prepare route selection: %j', input => {
+    const policy = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { 'prepare-item': { disabledProviders: ['codex'] } });
+    expect(resolveOperationRoute({ operation: 'prepare-item', policy, ...input }).provider).toBe('claude');
+  });
+
+  it('retains last good settings after an unsupported live advisory override and recovers on clear', () => {
+    const f = fixture();
+    const good = f.reader();
+    f.set({ 'review-seat:advisory:agy-correctness': { provider: 'codex' } });
+    expect(f.reader()).toBe(good);
+    expect(() => settingsFromRoutingPolicy(f.reader())).not.toThrow();
+    expect(f.log).toHaveBeenCalledTimes(1);
+    f.set({});
+    expect(() => settingsFromRoutingPolicy(f.reader())).not.toThrow();
+  });
+
+  it('keeps review initialization available when the optional advisory provider is disabled', () => {
+    const policy = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, {
+      'review-seat:advisory:agy-correctness': { disabledProviders: ['agy-claude'] },
+    });
+    expect(settingsFromRoutingPolicy(policy).agyCorrectnessAdvisory).toBe(false);
+  });
+
+  it.each(['claude', 'agy-claude', 'agy-gemini'])('initializes review for a supported advisory provider %s', provider => {
+    const policy = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, {
+      'review-seat:advisory:agy-correctness': { provider },
+    });
+    expect(settingsFromRoutingPolicy(policy).agyCorrectnessAdvisory).toBe(provider !== 'claude');
+  });
+
   it('applies operation provider disables after resolving an inherited task-type route', () => {
     const policy = applyRoutingOverrides(DEFAULT_ROUTING_POLICY, { fix: { disabledProviders: ['codex'] } });
     expect(resolveOperationRoute({ operation: 'fix', taskType: 'doc-fix', policy })).toMatchObject({
