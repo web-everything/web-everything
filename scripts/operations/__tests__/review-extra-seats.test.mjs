@@ -8,6 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   reviewSeatRoutes, ROUTED_ADVISORY_LENSES, EXTRA_JUROR_MANDATE, REVIEW_SEAT_MODELS,
@@ -970,7 +971,7 @@ describe('seat answer extraction — realistic provider replies, fail closed', (
     expect(extractAnswerJson(text)).toBeNull();
     expect(performance.now() - started).toBeLessThan(1000);
   });
-  const raw = name => readFileSync(join(process.cwd(), 'scripts/operations/__tests__/fixtures/seat-raw', `${name}.txt`), 'utf8');
+  const raw = name => readFileSync(fileURLToPath(new URL('./fixtures/seat-raw/' + name + '.txt', import.meta.url)), 'utf8');
   const seats = [{ key: 'red-team', seat: 'red-team', lens: 'red-team' }];
   it.each(['codex-fenced', 'inner-backticks', 'echo-then-answer'])('extracts the exact last answer from %s', name => {
     const text = raw(name);
@@ -1394,15 +1395,15 @@ describe('seat answer extraction — realistic provider replies, fail closed', (
 describe('seat answer schemas and provider argv', () => {
   it('uses the strict schema dialect at every object and exactly the requested seat keys', () => {
     const schema = seatAnswerJsonSchema(['red-team', 'claim-accuracy']);
-    const walk = node => {
+    const visitSchema = node => {
       if (node.type === 'object') {
         expect(node.additionalProperties).toBe(false);
         expect(node.required).toEqual(Object.keys(node.properties));
-        Object.values(node.properties).forEach(walk);
+        Object.values(node.properties).forEach(visitSchema);
       }
-      if (node.items) walk(node.items);
+      if (node.items) visitSchema(node.items);
     };
-    walk(schema);
+    visitSchema(schema);
     expect(schema.properties.lenses.required).toEqual(['red-team', 'claim-accuracy']);
     const seat = schema.properties.lenses.properties['red-team'];
     expect(seat.properties.verdict.enum).toEqual(['accept', 'changes']);
@@ -1492,7 +1493,7 @@ describe('durable raw seat evidence', () => {
     expect(evidence.toString()).toContain('[truncated at 64 KB;');
     expect(evidence.toString()).toContain('new seat call or manual review');
   });
-  const raw = name => readFileSync(join(process.cwd(), 'scripts/operations/__tests__/fixtures/seat-raw', `${name}.txt`), 'utf8');
+  const raw = name => readFileSync(fileURLToPath(new URL('./fixtures/seat-raw/' + name + '.txt', import.meta.url)), 'utf8');
   const seats = [{ key: 'red-team', seat: 'red-team', lens: 'red-team' }];
   it.each(['reasoning-only', 'trailing-prose'])('sanitizes call IDs and writes private %s evidence beside the selected store', name => {
     const call = { status: 'unparseable', text: raw(name), error: 'no JSON answer in the final message' };
