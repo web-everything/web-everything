@@ -1905,6 +1905,81 @@ Redirect `WE_RESOLVE_CONFLICT_LOG` to temporary storage. Permission-denial compl
 `denied`, hold for 60 minutes, and surface a `permission-blocked` note immediately; they are
 separate from transient infrastructure failures and their retry streak.
 
+### Forge client telemetry and remote admission
+
+The runner's `telemetry` subcommand samples the host on demand, including on fresh installs
+without `telemetry.json`; it never returns a saved timestamp as evidence of current health.
+Keep the stale-idle-file → SSH adapter → health-check regression alongside the ten-second
+cache boundary and SSH-failure/backoff recovery assertions. Boolean flags `--run`, `--silent`
+and `--no-color` must reject immediately following tokens beginning with `true` or `false`:
+Vitest can consume those positional-looking filters as flag values and change execution mode.
+
+`forge-client-controls.test.mjs` pins strict bounded telemetry, the read-only single-SSH CLI,
+runner sampling at prepare/run/finish and five-second in-process updates, fixed command
+classes, receipt argv binding, separate remote capacity, and persisted health/cache state.
+Use temporary lock roots and injected telemetry in legacy remote-contract fixtures; never
+contact Forge or consume the real host's remote slots from a unit test. Retain the original
+termination acknowledgements and refusal assertions when updating those fixtures.
+
+Remote telemetry older than 30 seconds (or dated in the future) routes through local admission.
+An idle runner does not fabricate a fresh sample on a telemetry read: a prepare/run/finish
+refresh must occur before remote routing can recover from stale evidence. Cache reads,
+including failed reads, are shared across clients for ten seconds; back-off and failure counts
+are host-shared too. Persist `slot-N.unconfirmed` exclusively before invoking the remote executor;
+remove it only after confirmed completion or termination. Abrupt client death skips `finally`,
+so quarantine cannot depend on cleanup running. A dead client PID or expired slot lease never
+authorizes reusing an outstanding execution's capacity. An operator must confirm Forge termination
+before manually clearing a retained marker. If marker creation fails, refuse remote dispatch and
+fall back through local admission. The SIGKILL subprocess regression leaves its simulated remote
+job alive and asserts that a second caller cannot reclaim that capacity. Keep this crash test
+alongside the returned-result and confirmed-cleanup cases when changing remote-slot lifecycle.
+The local host's heavy semaphore is acquired only on a safe local fallback.
+
+### Forge warm bases and delta snapshots
+
+The Mac client and public-base warmer share `forge-exec-manifest.mjs`: path bytes,
+ordering, exclusions, credential-name policy, and leaf hashing must stay identical.
+Run `forge-offload.test.mjs` alongside the existing remote client, runner, output-boundary,
+and admission-contract test files through heavy-admission when changing this protocol.
+Exercise the actual rsync file list and full reconstructed manifest, including executable
+bits, worktree deletions, public credential-named sources, and ignored/excluded tests.
+
+Read-only `bases` discovery precedes local admission so older runners keep their original
+full-ship order: no prepared run or transported bytes before snapshot admission/staging.
+The subsequent `prepare` response must confirm the chosen base and pin it in ops-owned
+state. Base pin creation and pruning share a guard; unknown or unreadable evidence keeps
+pruning closed. A worker receives independent copies, and the existing full-tree manifest
+and input-digest checks still run before cache extraction or npm. Pre-run delta build or
+transport failures rebuild through full shipping; execution ambiguity never retries.
+Delta membership compares a fresh no-follow read and SHA-256 of every final Mac worktree
+leaf (plus its executable bit) against the base, including Git-clean CRLF/filter output;
+Git diff supplies ordering hints only. Unchanged leaves skip staging and rsync, not the
+initial read/hash. Pin this with real Git autocrlf and post-diff race fixtures.
+Each warm tick revalidates retained READY records and their tree count/metadata digest;
+a missing tree marker requires one full manifest verification before publication, while
+mismatched evidence removes and rebuilds the base. Test both legacy-marker migration and
+same-size corruption. A bound protected delta rejection with `started=false` permits
+exactly one fresh full prepare; test the second rejection and ambiguous receipt paths,
+and require `shipMode: delta-then-full` in transfer timings.
+
+The standalone installer embeds the fixed allowlisted dependency graph into both installed
+programs. Probe both installed programs outside the repository's ESM package boundary.
+The warmer fetches only the explicit public HTTPS URL with a fresh credential-free Git
+environment; private siblings always remain Mac snapshots. Its timer runs as ops under
+flock, and only atomically published READY trees are candidates.
+
+Cache profiles retain their complete snapshot/sibling binding. The fixed warmer may seed
+another complete profile only with matching registry-only install evidence (all package
+manifests, lock, runtime/platform, fixed install flags). Workspaces, local dependencies,
+unknown locks and unproven resolutions use the original full-input cache/install path.
+Check archive hashes on both source and destination; normal runs still validate npm before
+extracting a seeded profile. Cover sibling-bound profiles as well as primary-only runs.
+
+Stage timings use an injected millisecond clock and Eastern timestamps with the actual
+seasonal offset. Install/run durations come from optional, strictly typed receipt timing
+fields; older runners provide only a combined wall run duration. Transfer byte counts
+represent staged file payload, including separately shipped sibling files.
+
 ### Direct heavy-run hook probes
 
 The `heavy-enforce` guard requires admission even for one-file Vitest runs, `related`,

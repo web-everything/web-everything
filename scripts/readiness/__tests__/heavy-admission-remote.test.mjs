@@ -1,6 +1,6 @@
 // @vitest-environment node
 /** Contract tests for the pending remote admission exports; all execution and load IO is injected. */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { execSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -21,7 +21,12 @@ vi.mock('../../lib/container-exec.mjs', async (importOriginal) => ({
 }));
 
 const argv = ['npm', 'run', 'test:unit', '--', 'a file.test.mjs', '$(must-stay-literal)'];
-const remoteDefaults = { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3 };
+const remoteDefaults = { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3,
+  maxConcurrent:8, backoffMs:120000, backoffFailures:3, maxLoadPerCore:0.8, minFreeRamPct:15 };
+const testRoots=[];
+afterEach(()=>{for(const root of testRoots.splice(0))rmSync(root,{recursive:true,force:true});});
+const healthyRead=async()=>({sampledAtET:(await import('../forge-exec-run.mjs')).easternTimestamp(Date.now()),
+  cores:8,loadPerCore:0.1,memFreePct:90,activeRuns:0,recent:[]});
 const policyFor = (remote = {}) => resolveAdmissionPolicy({
   platform: { remote: { ...remoteDefaults, enabled: true, ...remote } },
 });
@@ -32,7 +37,8 @@ function expectDecision(result, remote) {
 }
 
 function fixture({ remote = {}, load = 4, result = { mode: 'remote', code: 0 } } = {}) {
-  return {
+  const root=mkdtempSync(join(process.env.TMPDIR,'admission-remote-'));testRoots.push(root);
+  return {lockRoot:join(root,'heavy'),readTelemetry:healthyRead,
     argv: [...argv], policy: policyFor(remote), cwd: 'fixture-checkout',
     loadPerCore: vi.fn(() => load), remoteExec: vi.fn(async () => result), log: vi.fn(),
   };
@@ -61,7 +67,7 @@ describe('remote admission policy', () => {
     const policy = resolveAdmissionPolicy({
       platform: { remote }, tool: { remote: { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 99 } }, env: {},
     });
-    expect(policy.settings.remote).toEqual(remote);
+    expect(policy.settings.remote).toEqual({...remoteDefaults,...remote});
     for (const leaf of Object.keys(remote)) {
       expect(policy.sources[`remote.${leaf}`]).toBe('platform');
       expect(policy.ignored).toContainEqual(expect.stringContaining(`tool.remote.${leaf}=`));
@@ -81,10 +87,11 @@ describe('remote admission policy', () => {
       CI: '', WE_HEAVY_ADMISSION: 'on', WE_HEAVY_ADMISSION_HELD: '', WE_HEAVY_ADMISSION_CONTAINER: '', WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES: '' })) vi.stubEnv(key, value);
     try {
       const remoteExec = vi.fn(async () => ({ mode: 'remote', code: 23 }));
-      await expect(main(['run', `--repo=${root}`, '--', ...argv], { remoteExec })).rejects.toBe(exited);
+      await expect(main(['run', `--repo=${root}`, '--', ...argv], { remoteExec, readTelemetry:healthyRead })).rejects.toBe(exited);
       expect(remoteExec).toHaveBeenCalledWith(expect.objectContaining({ argv, cwd: root, signal: expect.any(AbortSignal) }));
       expect(exit).toHaveBeenCalledWith(23);
-      expect(existsSync(join(pool, '.admission'))).toBe(false);
+      expect(existsSync(join(pool, '.admission','heavy'))).toBe(false);
+      expect(heldSlots({lockRoot:join(pool,'.admission','remote'),cap:8})).toHaveLength(0);
     } finally { exit.mockRestore(); stderr.mockRestore(); vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); }
   });
   it('defaults to disabled, above-threshold, threshold 3, with standard sources', () => {
@@ -131,7 +138,7 @@ describe('remote admission policy', () => {
     });
     try {
       const remoteExec = vi.fn(async () => ({ mode: 'remote', code: 23 }));
-      await expect(main(['run', `--repo=${root}`, ...flags, '--', ...argv], { remoteExec })).rejects.toBe(exited);
+      await expect(main(['run', `--repo=${root}`, ...flags, '--', ...argv], { remoteExec, readTelemetry:healthyRead })).rejects.toBe(exited);
       expect(remoteExec).not.toHaveBeenCalled();
       expect(localExec).toHaveBeenCalledTimes(1);
       expect(localExec).toHaveBeenCalledWith(argv.map(shellQuoteWord).join(' '), expect.objectContaining({
@@ -148,7 +155,7 @@ describe('remote admission policy', () => {
   it('resolves valid platform remote settings and their provenance', () => {
     const remote = { enabled: true, mode: 'always', loadPerCoreThreshold: 5 };
     const policy = policyFor(remote);
-    expect(policy.settings.remote).toEqual(remote);
+    expect(policy.settings.remote).toEqual({...remoteDefaults,...remote});
     expect(policy.sources).toMatchObject({
       'remote.enabled': 'platform',
       'remote.mode': 'platform',
@@ -353,11 +360,12 @@ describe('runWithRemoteDecision', () => {
       try {
         const result = await runWithRemoteDecision({
           argv: ['npm', 'run', 'test:unit', '--', 'a.test.mjs'], cwd, env: {},
+          lockRoot:join(cwd,'heavy'),readTelemetry:healthyRead,
           policy: policyFor({ mode: 'always' }), loadPerCore: () => 0, log,
           remoteExec: (options) => runRemote({ ...options, exec, listFiles: async () => files }),
         });
         if (!result.handled) local();
-        expect(actions).toEqual(['true', 'prepare', 'run', 'finish']);
+        expect(actions).toEqual(['true', 'bases', 'prepare', 'run', 'finish']);
         expect(result).toEqual({ handled: true, exitCode: 124 });
         expect(local).not.toHaveBeenCalled();
         expect(log.mock.calls[1][0]).toContain('ambiguous-result');
@@ -511,4 +519,11 @@ describe('runWithRemoteDecision', () => {
     expectLines(f.log, 2, 'remote');
     expect(f.log.mock.calls[1][0]).toContain('refusing local rerun');
   });
+});
+
+
+it('carries stage timings through legacy pre-execution adaptation without changing the decision', () => {
+  const timings=[{stage:'total',startedAtET:'2026-01-01T07:00:00.000-05:00',ms:12}];
+  expect(adaptLegacyRemoteResult({mode:'fallback',reason:'copy-failed',timings}))
+    .toEqual({mode:'not-started',terminated:true,reason:'copy-failed',timings});
 });
