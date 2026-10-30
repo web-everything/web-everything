@@ -1,4 +1,5 @@
 ---
+bornAs: xn3xlpp
 kind: story
 size: 5
 status: open
@@ -39,7 +40,7 @@ When main moves, ~6 daemons each build and smoke-test their own candidate (we:sc
 
 ## Premise check
 
-Checked against main 88d94eb319: not delivered. `git log` has no commit for xn3xlpp. A per-clone smoke-pass reuse already exists (`resolveSmokeReuse`, `we:scripts/lib/daemon-rebuild/smoke.mjs:45`; `smokePassed` in the per-clone rebuild state file, `we:scripts/lib/daemon-rebuild/state.mjs:51`), but each clone has its own state file, so ~6 daemons that reach the same tree still each run the full smoke. That gap is this card. Scope correction: the card lists `we:scripts/lib/daemon-rebuild/candidate.mjs` and `we:scripts/lib/daemon-rebuild/index.mjs`, but the reuse decision lives in `we:scripts/lib/daemon-rebuild/smoke.mjs` (`smokeSha`, line 439) and `we:scripts/lib/daemon-rebuild/state.mjs`; scope is widened to those plus `we:scripts/settings/rebuild-smoke.json`. No goal change.
+Checked against main 88d94eb319: not delivered. `git log` has no commit for 7499. A per-clone smoke-pass reuse already exists (`resolveSmokeReuse`, `we:scripts/lib/daemon-rebuild/smoke.mjs:45`; `smokePassed` in the per-clone rebuild state file, `we:scripts/lib/daemon-rebuild/state.mjs:51`), but each clone has its own state file, so ~6 daemons that reach the same tree still each run the full smoke. That gap is this card. Scope correction: the card lists `we:scripts/lib/daemon-rebuild/candidate.mjs` and `we:scripts/lib/daemon-rebuild/index.mjs`, but the reuse decision lives in `we:scripts/lib/daemon-rebuild/smoke.mjs` (`smokeSha`, line 439) and `we:scripts/lib/daemon-rebuild/state.mjs`; scope is widened to those plus `we:scripts/settings/rebuild-smoke.json`. No goal change.
 
 ## Design
 
