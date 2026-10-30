@@ -121,13 +121,14 @@ describe('verify-lane writer — overlapping-runs race (#2833 finding 1)', () =>
 });
 
 describe('verify-lane — hard per-phase timeout (verify-admission, 2026-10-20)', () => {
-  it('can stop local heartbeat watchdogs during module startup without crashing Node', () => {
+  it.each(['commonjs', 'module'])('can stop local heartbeat watchdogs during module startup from a %s entry without crashing Node', (inputType) => {
     // Run outside Vitest's process: terminating a worker while its heartbeat import evaluates
     // a top-level await used to abort the entire Node process, not merely reject the worker.
     // Resolve filesystem paths first so Vite cannot turn child imports into HTTP asset URLs.
     const scriptsDir = dirname(dirname(fileURLToPath(import.meta.url)));
     const script = `
-import { startTreeWatchdog } from ${JSON.stringify(pathToFileURL(join(scriptsDir, 'lib/tree-watchdog.mjs')).href)};
+(async () => {
+const { startTreeWatchdog } = await import(${JSON.stringify(pathToFileURL(join(scriptsDir, 'lib/tree-watchdog.mjs')).href)});
 for (let round = 0; round < 24; round++) {
   const watchdog = startTreeWatchdog({
     pid: process.pid, timeoutMs: 60000,
@@ -143,8 +144,9 @@ for (let round = 0; round < 24; round++) {
   watchdog.stop();
 }
 console.log('watchdogs stopped');
+})().catch(error => { console.error(error); process.exitCode = 1; });
 `;
-    const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    const result = spawnSync(process.execPath, ['--input-type=' + inputType, '-e', script], {
       encoding: 'utf8', timeout: 20000, maxBuffer: 1024 * 1024,
     });
     expect(result.error, result.stderr).toBeUndefined();
