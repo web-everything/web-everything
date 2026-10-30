@@ -3,16 +3,27 @@
  * skills-src/conveyor/review-daemon.mjs, skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs.
  * #6109 may be superseded by tools.root. Keep this the entry script's FIRST import:
  * a separate side-effect module completes before the entry's other dependencies evaluate.
+ * Only TOOLS_ROOT_ENTRIES opt in; importing a guarded CLI as a library stays local.
+ * Signal limitation: spawnSync cannot forward signals sent only to the lane wrapper's PID.
+ * Its tools-root child may survive that wrapper. Supervisors must terminate the whole
+ * process group, including during the bounded event write, rather than only that PID.
+ * Async spawning would require deferring the entries' sibling imports as well; awaiting
+ * this side-effect module alone lets those local dependencies evaluate before transfer.
  */
 import * as nativeFs from 'node:fs';
 import { spawnSync as nativeSpawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { resolveToolsRoot, boundedToolsText } from './tools-root.mjs';
 import { daemonEventsPath } from './daemon-events.mjs';
 
 const OWN_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+export const TOOLS_ROOT_ENTRIES = Object.freeze([
+  'scripts/readiness/heavy-admission.mjs',
+  'scripts/readiness/remote-exec.mjs',
+  'scripts/verify-lane.mjs',
+]);
 const clean = value => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
 let provenanceLogged = false;
 
@@ -43,9 +54,7 @@ export function maybeReexecFromToolsRoot({ entryUrl, argv = process.argv, env = 
     if (env.WE_TOOLS_ROOT_REEXEC !== undefined) return;
     // Library imports must not redirect their runner, even if tools.root contains it.
     const rel = relative(fs.realpathSync(ownRoot), fs.realpathSync(fileURLToPath(entryUrl)));
-    const parts = rel.split(sep);
-    if (isAbsolute(rel) || parts[0] !== 'scripts' || parts.length < 2
-      || parts.slice(1, -1).some(part => part === 'node_modules' || part === '__tests__')) return;
+    if (!TOOLS_ROOT_ENTRIES.includes(rel.split(sep).join('/'))) return;
     const result = resolveToolsRoot({ scriptRelPath: rel, env, home, ownRoot, fs, git });
     if (!result.active) {
       if (result.reason) log(`[tools-root] ignored: ${clean(result.reason)}`);

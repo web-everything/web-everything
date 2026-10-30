@@ -6,7 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawnSync as realSpawnSync } from 'node:child_process';
 import { resolveToolsRoot } from '../tools-root.mjs';
-import { maybeReexecFromToolsRoot } from '../tools-root-guard.mjs';
+import { maybeReexecFromToolsRoot, TOOLS_ROOT_ENTRIES } from '../tools-root-guard.mjs';
 
 const script = 'scripts/readiness/heavy-admission.mjs';
 const sha = 'a'.repeat(40);
@@ -34,6 +34,34 @@ const guardOptions = () => ({ ...options, entryUrl: pathToFileURL(join(ownRoot, 
   cwd: ownRoot, spawnSync: vi.fn(() => ({ status: 7 })), exit: vi.fn(), log: vi.fn(),
   appendEvent: vi.fn(() => true),
 });
+// A separate work tree reads the current git directory without writing fixture commits.
+const liveGuardFixture = () => {
+  const repo = resolve('.');
+  const gitDir = realSpawnSync('git', ['rev-parse', '--absolute-git-dir'], { encoding: 'utf8', cwd: repo }).stdout.trim();
+  fs.rmSync(join(root, '.git'), { recursive: true }); fs.symlinkSync(gitDir, join(root, '.git'));
+  for (const name of ['tools-root-guard.mjs', 'tools-root.mjs', 'daemon-clone-layout.mjs']) {
+    write(join(ownRoot, 'scripts/lib', name), fs.readFileSync(join(repo, 'scripts/lib', name), 'utf8'));
+  }
+  return { ...process.env, ...env, WE_TOOLS_ROOT_REEXEC: undefined,
+    WE_PLATFORM_PREFERENCES: join(base, 'absent.json') };
+};
+const rejectionCases = [
+  ['tools-root input exceeds byte limit; use local tooling', o => write(join(root, 'package.json'), ' '.repeat(256 * 1024 + 1))],
+  ['platform preferences must be an object', o => {
+    const prefs = join(base, 'prefs.json'); write(prefs, '[]'); o.env = { WE_PLATFORM_PREFERENCES: prefs };
+  }],
+  ['tools.root must be an absolute path', o => { o.env.WE_TOOLS_ROOT = 'relative'; }],
+  ['tools.root cannot be a lane or daemon clone', o => {
+    const lane = join(base, '.lanes', 'tools'); checkout(lane); o.env.WE_TOOLS_ROOT = lane;
+  }],
+  ['entry script must be inside its repository', o => { o.scriptRelPath = '../escape.mjs'; }],
+  ['tools.root is not a web-everything checkout', o => fs.rmSync(join(root, '.git'), { recursive: true })],
+  ['requested script is missing or outside tools.root', o => {
+    fs.rmSync(join(root, script)); fs.mkdirSync(join(root, script));
+  }],
+  ['tools.root is not a git checkout root', o => { o.git = () => ({ status: 0, stdout: ownRoot }); }],
+  ['tools.root HEAD is unavailable', o => { o.git = (path, args) => ({ status: 0, stdout: args.includes('HEAD') ? '' : path }); }],
+];
 
 describe('tools.root resolution and guard', () => {
   it('unset means local execution without a reason, re-exec, logs or events', async () => {
@@ -72,7 +100,60 @@ describe('tools.root resolution and guard', () => {
     expect(resolveToolsRoot({ ...options, env: { WE_TOOLS_ROOT: 'relative' } }).reason).toMatch(/absolute/);
   });
 
-  it.each(['node_modules/vitest/vitest.mjs', 'other-script.mjs', 'scripts-other/run.mjs',
+  it.each(TOOLS_ROOT_ENTRIES)('allows the explicitly opted-in entry %s', async entry => {
+    write(join(ownRoot, entry), '// local entry'); write(join(root, entry), '// tools entry');
+    const o = { ...guardOptions(), entryUrl: pathToFileURL(join(ownRoot, entry)),
+      argv: [process.execPath, join(ownRoot, entry)] };
+    await maybeReexecFromToolsRoot(o);
+    expect(o.spawnSync).toHaveBeenCalledWith(process.execPath, [join(root, entry)], expect.any(Object));
+  });
+
+  it.each([true, false])('library import from an unlisted scripts entry stays silent (tools counterpart: %s)', async counterpart => {
+    const runner = 'scripts/pr-land.mjs';
+    write(join(ownRoot, runner), '// local runner');
+    if (counterpart) write(join(root, runner), '// tools runner');
+    const o = { ...guardOptions(), entryUrl: pathToFileURL(join(ownRoot, runner)),
+      argv: [process.execPath, join(ownRoot, runner)], git: vi.fn(git) };
+    await maybeReexecFromToolsRoot(o);
+    expect(o.spawnSync).not.toHaveBeenCalled();
+    expect(o.log).not.toHaveBeenCalled();
+    expect(o.appendEvent).not.toHaveBeenCalled();
+    expect(o.git).not.toHaveBeenCalled();
+  });
+
+  it.each(rejectionCases)('rejects the explicit resolver reason: %s', (reason, arrange) => {
+    arrange(options);
+    expect(resolveToolsRoot(options)).toEqual({ active: false, reason });
+  });
+
+  it('requires a table-driven case for every explicit resolver rejection reason', () => {
+    const source = fs.readFileSync(new URL('../tools-root.mjs', import.meta.url), 'utf8');
+    const reasons = [...source.matchAll(/throw Error\('([^']+)'\)/g)].map(match => match[1]);
+    expect(reasons.sort()).toEqual(rejectionCases.map(([reason]) => reason).sort());
+  });
+
+  it('keeps first-import guard wiring and the declared entry allowlist in sync', () => {
+    const guarded = [];
+    const visit = rel => {
+      for (const entry of fs.readdirSync(resolve(rel), { withFileTypes: true })) {
+        if (entry.name === 'node_modules' || entry.name === '__tests__') continue;
+        const path = `${rel}/${entry.name}`;
+        if (entry.isDirectory()) visit(path);
+        else if (entry.name.endsWith('.mjs')) {
+          const imports = fs.readFileSync(resolve(path), 'utf8').match(/^import .*$/gm) ?? [];
+          if (imports.some(line => /from ['"].*tools-root-guard\.mjs|^import ['"].*tools-root-guard\.mjs/.test(line))) {
+            expect(imports[0], path).toMatch(/tools-root-guard/);
+            guarded.push(path);
+          }
+        }
+      }
+    };
+    visit('scripts');
+    expect(guarded.sort()).toEqual([...TOOLS_ROOT_ENTRIES].sort());
+  });
+
+  it.each(['node_modules/vitest/vitest.mjs', 'other-script.mjs', 'scripts-other/run.mjs', 'scripts/pr-land.mjs',
+    'scripts/nested/runner.mjs',
     'scripts/__tests__/runner.mjs', 'scripts/nested/__tests__/runner.mjs', 'scripts/node_modules/runner.mjs',
   ])('silently leaves library entrypoint %s local even when tools.root contains it', entry => {
     write(join(ownRoot, entry), '// local runner');
@@ -120,13 +201,14 @@ describe('tools.root resolution and guard', () => {
     expect(resolveToolsRoot({ ...options, env: {}, fs: { ...fs, openSync: () => { throw Error('denied'); } } }).reason).toBe('denied');
   });
 
-  it.each(['relative', 'missing script', 'not a repo', 'wrong package', 'bad git', 'unknown sha'])('falls back with one diagnostic for %s', async kind => {
+  it.each(['relative', 'missing script', 'not a repo', 'wrong package', 'bad git', 'not a checkout root', 'unknown sha'])('falls back with one diagnostic for %s', async kind => {
     const o = guardOptions();
     if (kind === 'relative') o.env.WE_TOOLS_ROOT = 'relative';
     if (kind === 'missing script') fs.rmSync(join(root, script));
     if (kind === 'not a repo') fs.rmSync(join(root, '.git'), { recursive: true });
     if (kind === 'wrong package') write(join(root, 'package.json'), '{"name":"other"}');
     if (kind === 'bad git') o.git = () => ({ status: 1, stderr: 'fatal' });
+    if (kind === 'not a checkout root') o.git = (path, args) => ({ status: 0, stdout: args.includes('HEAD') ? sha : ownRoot });
     if (kind === 'unknown sha') o.git = (path, args) => ({ status: 0, stdout: args.includes('HEAD') ? '' : path });
     await maybeReexecFromToolsRoot(o);
     expect(o.spawnSync).not.toHaveBeenCalled();
@@ -235,7 +317,8 @@ describe('tools.root resolution and guard', () => {
     expect(o.log).toHaveBeenCalledWith('[tools-root] ignored: bad  [31mevidence');
   });
 
-  it('importing the guard from a node_modules runner neither re-execs nor logs', () => {
+  it.each(['node_modules/vitest/vitest.mjs', 'scripts/pr-land.mjs'])
+    ('importing a guarded module from %s preserves local execution without logs or events', runner => {
     const repo = resolve('.');
     const gitDir = realSpawnSync('git', ['rev-parse', '--absolute-git-dir'], { encoding: 'utf8', cwd: repo }).stdout.trim();
     fs.rmSync(join(root, '.git'), { recursive: true }); fs.symlinkSync(gitDir, join(root, '.git'));
@@ -244,8 +327,9 @@ describe('tools.root resolution and guard', () => {
     }
     const eventsUrl = pathToFileURL(join(repo, 'scripts/lib/daemon-events.mjs')).href;
     write(join(ownRoot, 'scripts/lib/daemon-events.mjs'), `export { appendDaemonEvent, daemonEventsPath } from ${JSON.stringify(eventsUrl)};\n`);
-    const runner = 'node_modules/vitest/vitest.mjs';
-    write(join(ownRoot, runner), "import '../../scripts/lib/tools-root-guard.mjs';\nconsole.log('local runner');\n");
+    write(join(ownRoot, script), "import '../lib/tools-root-guard.mjs';\n");
+    const guardedUrl = pathToFileURL(join(ownRoot, script)).href;
+    write(join(ownRoot, runner), `import ${JSON.stringify(guardedUrl)};\nconsole.log('local runner');\n`);
     write(join(root, runner), "console.log('tools runner'); process.exitCode=9;\n");
     const result = realSpawnSync(process.execPath, [join(ownRoot, runner)], {
       cwd: ownRoot, env: { ...process.env, ...env, WE_TOOLS_ROOT_REEXEC: undefined,
@@ -257,6 +341,33 @@ describe('tools.root resolution and guard', () => {
     expect(fs.existsSync(env.WE_DAEMON_EVENTS)).toBe(false);
     expect(fs.existsSync(join(dirname(env.WE_DAEMON_EVENTS), 'tools-root-last.json'))).toBe(false);
   });
+
+  it.each(['timeout', 'excessive output'])
+    ('default event writer remains bounded and launches tooling after %s', kind => {
+      const childEnv = liveGuardFixture();
+      const missedBound = join(base, 'writer-outlived-bound');
+      // Each fixture self-terminates even if a bound regresses. The sentinel distinguishes
+      // maxBuffer recovery from the independent timeout, without timing the test runner.
+      write(join(ownRoot, 'scripts/lib/daemon-events.mjs'), `
+        import { writeFileSync } from 'node:fs';
+        export const daemonEventsPath = ({env}) => env.WE_DAEMON_EVENTS;
+        export async function appendDaemonEvent() {
+          ${kind === 'excessive output' ? "process.stdout.write('x'.repeat(128 * 1024));" : ''}
+          await new Promise(resolve => setTimeout(resolve, ${kind === 'timeout' ? 7000 : 1500}));
+          writeFileSync(${JSON.stringify(missedBound)}, 'writer exceeded its bound');
+          return false;
+        }
+      `);
+      write(join(ownRoot, script), "import '../lib/tools-root-guard.mjs';\nthrow Error('local entry ran');\n");
+      write(join(root, script), "console.log('selected tooling'); process.exitCode=9;\n");
+      const result = realSpawnSync(process.execPath, [join(ownRoot, script)], {
+        cwd: ownRoot, env: childEnv, encoding: 'utf8', timeout: 15000,
+      });
+      expect(result.status, result.stderr).toBe(9);
+      expect(result.stdout).toBe('selected tooling\n');
+      expect(fs.existsSync(missedBound)).toBe(false);
+      expect(fs.existsSync(join(dirname(env.WE_DAEMON_EVENTS), 'tools-root-last.json'))).toBe(false);
+    }, 20000);
 
   it('runs the actual first-import guard before entry dependencies, preserving the real lane cwd and child exit status', () => {
     // Use the current git directory read-only, with a separate work tree, so no fixture commit is needed.
