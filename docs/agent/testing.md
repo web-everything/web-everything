@@ -1481,6 +1481,24 @@ npx vitest run --coverage           # coverage report
 
 ## Developing & manually testing in a lane
 
+An entry guard placed in the first side-effect import must finish synchronously before
+transferring execution. Awaiting IO in that guard lets sibling entry dependencies evaluate.
+The tools-root subprocess fixture pins this: a later dependency throws if local evaluation
+starts, while the selected tools entry records its actual cwd, argv and exit status.
+Tools-root redirection accepts only the three entries declared in `TOOLS_ROOT_ENTRIES`;
+an ordinary `scripts/` runner importing one of them as a library must stay local, even
+when a counterpart exists in the tools checkout. Pin both the no-spawn seam and the real
+import path. Pin every explicit resolver rejection reason, including a successful Git
+probe that names a different checkout root. The default event-writer fixtures must cover
+both timeout and excessive-output recovery before selected tooling starts.
+
+The synchronous tools-root wrapper cannot forward a signal addressed only to its PID;
+the selected child (or the event writer) can outlive it. Supervisors must terminate the
+whole process group. Moving to async signal forwarding also requires deferring sibling
+entry imports; awaiting the first side-effect import alone does not defer them.
+Oversized-input fixtures must measure requested ranges and cumulative bytes through the
+filesystem seam, including short reads; rejection alone does not prove bounded IO.
+
 Every edit — including an ad-hoc "just fix this one thing" — happens in an **isolated lane clone**, never the main checkout (#2123; the writer model in [platform-decisions.md#pr-flow-rollout-mechanism](platform-decisions.md#pr-flow-rollout-mechanism)). The lane trigger is *making an edit*, not *running a command*. The main checkout stays the human's — its dev server on `:3000`/`:8080` is theirs; don't build or serve into it.
 
 **1 — Pick or provision a lane** (persistent clone pool under `~/workspace/.lanes/<repo>/lane-N`, git objects shared via `--reference`, own HEAD):
