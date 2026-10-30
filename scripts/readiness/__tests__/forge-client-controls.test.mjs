@@ -9,6 +9,7 @@ import {isAllowedCommand, verifyReceipt, runRemote} from '../remote-exec.mjs';
 import {resolveAdmissionPolicy, formatAdmissionPolicy, runWithRemoteDecision, heldSlots} from '../heavy-admission.mjs';
 import {main as telemetryCli, readForgeTelemetry} from '../forge-telemetry.mjs';
 import {checkRemoteHealth} from '../forge-remote-health.mjs';
+import {parseCLI} from 'vitest/node';
 import {keepAliveScript} from '../../lib/test-keepalive.mjs';
 
 const roots = [];
