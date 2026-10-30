@@ -11,8 +11,9 @@ const LEGACY_SETTINGS_NAME = basename(LEGACY_SETTINGS_PATH);
 export const QUICK_ENV = 'WE_DAEMON_REBUILD_QUICK';
 export const QUICK_DEFERRED_CHECKS = Object.freeze(['dispatch-dry-run', 'reconcile-dry-run']);
 export const QUICK_SOAK_CHECKS = Object.freeze([...QUICK_DEFERRED_CHECKS, 'tree-stays-clean']);
-/** One authoritative protected path list; transitive dispatch imports are covered by the post-adopt soak. */
+/** The verifier's import graph spans the script runtime. Keep that entire trust base on full smoke. */
 export const QUICK_ALWAYS_FULL_PATHS = Object.freeze([
+  'scripts/**',
   'scripts/lib/daemon-rebuild/**',
   'scripts/lib/daemon-rebuild*.mjs',
   'scripts/lib/daemon-live-smoke.mjs',

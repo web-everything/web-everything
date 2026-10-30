@@ -17,10 +17,16 @@ import { alertsFilePath, readReadyCandidate, readRebuildState, writeRebuildState
 import { completeSmokePass, smokeAndAdopt } from '../daemon-rebuild/smoke.mjs';
 import { finalizeRebuild } from '../daemon-rebuild/adopt.mjs';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
+import { rebuildClone } from '../daemon-rebuild/rebuild.mjs';
+import { collectImportClosure } from '../import-closure.mjs';
 import { DISPATCH_PATH_DEFAULTS } from '../daemon-rebuild/dispatch-paths.mjs';
 import { DISPATCH_DRY_RUN_CODE_ENTRIES, SMOKE_CHECKS, rollbackToSha, runLiveSmoke, runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
 
 vi.mock('../resource-admission.mjs', () => ({ shadowAdmission: vi.fn(), admit: vi.fn() }));
+vi.mock('../daemon-clone-lock.mjs', async importOriginal => {
+  const real = await importOriginal();
+  return { ...real, withWriteLock: vi.fn(real.withWriteLock) };
+});
 const dirs = [];
 const temp = () => { const dir = mkdtempSync(join(tmpdir(), 'we-quick-')); dirs.push(dir); return dir; };
 afterEach(() => { vi.restoreAllMocks(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -30,6 +36,9 @@ const closure = { complete: true, bareDeps: true, jsonNames: new Set(['dispatch-
 const decision = (changedFiles, extra = {}) => decideQuick({ enabled: true, changedFiles, dispatchClosure: closure, ...extra });
 
 describe('quick mode policy (default OFF)', () => {
+  it('shipped quick settings default off without an environment override', () => {
+    expect(resolveQuick({}, { platform: {} })).toMatchObject({ quick: false, source: 'tool' });
+  });
   it('off preserves full checks and the existing finalize/starvation wait', () => {
     expect(decision(null, { enabled: false })).toEqual({ quick: false, why: 'disabled' });
     expect(quickFinalizeWaitMs({ quick: false, env: {}, waitMs: 900_000 })).toBe(900_000);
@@ -58,6 +67,14 @@ describe('quick mode policy (default OFF)', () => {
   });
 
   it('permits an unrelated readable change', () => { expect(decision(['README.md']).quick).toBe(true); });
+  it('protects the complete local import closure of the soak and rollback verifier', () => {
+    const graph = collectImportClosure({ root: process.cwd(), entries: [
+      'scripts/lib/daemon-rebuild/quick-soak-job.mjs', 'scripts/lib/daemon-live-smoke.mjs',
+    ] });
+    expect(graph?.complete).toBe(true);
+    expect(graph.files.size).toBeGreaterThan(100);
+    expect([...graph.files].filter(path => decision([path]).quick)).toEqual([]);
+  });
   it.each([
     ...DISPATCH_DRY_RUN_CODE_ENTRIES,
     ...DISPATCH_PATH_DEFAULTS.map(path => path.replaceAll('*', 'fixture')),
@@ -78,11 +95,11 @@ describe('quick mode policy (default OFF)', () => {
   it.each([null, { complete: false }, { complete: true, files: [] },
     { ...closure, bareDeps: undefined, jsonNames: undefined }])(
     'does not consult unknown or incomplete dispatch closure evidence: %j', dispatchClosure => {
-      expect(decision(['scripts/lib/red-main-hold.mjs'], { dispatchClosure }).quick).toBe(true);
+      expect(decision(['src/dispatch-only.mjs'], { dispatchClosure }).quick).toBe(true);
       expect(decision([DISPATCH_DRY_RUN_CODE_ENTRIES[0]], { dispatchClosure }).quick).toBe(false);
     });
-  it('allows a transitive-only dispatch dependency even with complete closure evidence', () => {
-    expect(decision(['scripts/lib/red-main-hold.mjs']).quick).toBe(true);
+  it('requires full smoke for a transitive verifier dependency even with complete dispatch closure evidence', () => {
+    expect(decision(['scripts/lib/red-main-hold.mjs']).quick).toBe(false);
   });
   it('exports a single protected path list including the dispatch entries and shared dispatch core paths', () => {
     expect(QUICK_ALWAYS_FULL_PATHS).toEqual(expect.arrayContaining([...DISPATCH_DRY_RUN_CODE_ENTRIES, ...DISPATCH_PATH_DEFAULTS]));
@@ -273,11 +290,34 @@ describe('post-adopt soak', () => {
     expect(run).toHaveBeenCalledOnce();
     expect(run.mock.calls[0][0]).toEqual(['status', '--porcelain', '--untracked-files=no']);
   });
+  it('bounds rollback inventory subprocess output to 1 MiB', () => {
+    const run = vi.fn(() => ({ status: 0, stdout: '' }));
+    expect(rollbackToSha({ root: temp(), sha: prevHead, run, ignoreUntracked: true })).toEqual({ ok: true });
+    for (const command of ['ls-files', 'ls-tree']) {
+      const inventories = run.mock.calls.filter(([args]) => args[0] === command);
+      expect(inventories).toHaveLength(1);
+      expect(inventories[0][1]).toMatchObject({ maxBuffer: 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' });
+    }
+  });
+  it('rolls back with a node_modules-sized ignored tree without enumerating its files', () => {
+    const f = candidateFixture('README.md', '1', { seed: ({ write }) => write('.gitignore', 'node_modules/\n') });
+    f.git(['reset', '--hard', f.plan.finalSha]);
+    const deps = join(f.root, 'node_modules');
+    mkdirSync(deps);
+    for (let i = 0; i < 20_000; i++) writeFileSync(join(deps, `${String(i).padStart(6, '0')}-${'dependency'.repeat(6)}.js`), 'keep');
+    const run = vi.fn(f.run);
+    expect(rollbackToSha({ root: f.root, sha: f.prevHead, run, ignoreUntracked: true })).toEqual({ ok: true });
+    expect(f.git(['rev-parse', 'HEAD'])).toBe(f.prevHead);
+    expect(readFileSync(join(deps, `000000-${'dependency'.repeat(6)}.js`), 'utf8')).toBe('keep');
+  }, 60_000);
   it.each([
     { name: 'same path', tracked: 'runtime-sidecar.md', runtime: 'runtime-sidecar.md' },
     { name: 'untracked file obstructs target directory', tracked: 'runtime/target.md', runtime: 'runtime' },
     { name: 'untracked directory obstructs target file', tracked: 'runtime', runtime: 'runtime/sidecar.md' },
     { name: 'ignored sidecar obstructs target file', tracked: 'ignored.md', runtime: 'ignored.md', ignored: true },
+    { name: 'case variant', tracked: 'Runtime.md', runtime: 'runtime.md' },
+    { name: 'Unicode normalization variant', tracked: 'caf\u00e9.md', runtime: 'cafe\u0301.md' },
+    { name: 'case variant directory prefix', tracked: 'Runtime/target.md', runtime: 'runtime' },
   ])('refuses rollback target collision and preserves obstructing bytes: $name', ({ tracked, runtime, ignored }) => {
     const f = candidateFixture('README.md', '1', {
       seed: ({ write, git }) => {
@@ -422,6 +462,45 @@ describe('post-adopt soak', () => {
     settleQuickSoak({ ...f, outcome: 'passed' });
     expect(f.run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
     expect(f.alerts().at(-1).kind).toBe('quick-soak-unavailable');
+  });
+  it.each(['replacement', 'unreadable', 'legacy'])('prepare preserves a different HEAD during quick-soak recovery: %s', async kind => {
+    const f = soakFixture();
+    const replacement = 'c'.repeat(40);
+    f.run.mockImplementation(args => ({ status: args[0] === 'rev-parse' && kind === 'unreadable' ? 1 : 0,
+      stdout: args[0] === 'rev-parse' ? replacement : '' }));
+    settleQuickSoak({ ...f, outcome: 'failed' });
+    if (kind === 'legacy') writeRebuildState(f.root, { quarantine: { prevHead, reason: 'quick-soak-unavailable' } }, f.env);
+    const result = await prepareRebuild({ ...f, log: { error: vi.fn() }, stateOpts: {}, now: Date.now });
+    expect(result.result.reason).toBe('quarantined');
+    expect(readRebuildState(f.root, f.env).quarantine).toBeTruthy();
+    expect(f.run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+  });
+  it('settlement followed by prepare preserves a real replacement Git HEAD', async () => {
+    const f = candidateFixture();
+    f.git(['reset', '--hard', f.plan.finalSha]);
+    const marker = { quick: true, sha: 'd'.repeat(40), prevHead: f.prevHead,
+      token: 'old-adoption', soakAttempts: 3, lastGood: { head: f.prevHead } };
+    writeRebuildState(f.root, { unverified: marker, adopted: { head: marker.sha, unverified: true } }, f.env);
+    const run = vi.fn(f.run);
+    settleQuickSoak({ ...f, run, marker, outcome: 'failed', log: { error: vi.fn() } });
+    const result = await prepareRebuild({ ...f, run, log: { error: vi.fn() }, stateOpts: {}, now: Date.now });
+    expect(result.result.reason).toBe('quarantined');
+    expect(readRebuildState(f.root, f.env).quarantine).toMatchObject({ failedHead: marker.sha });
+    expect(f.git(['rev-parse', 'HEAD'])).toBe(f.plan.finalSha);
+    expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+  });
+  it('quarantine recovery retries rollback only at its persisted failed HEAD', async () => {
+    const f = candidateFixture();
+    f.git(['reset', '--hard', f.plan.finalSha]);
+    writeRebuildState(f.root, { adopted: { head: f.prevHead }, quarantine: {
+      prevHead: f.prevHead, failedHead: f.plan.finalSha, reason: 'quick-soak-rollback-failed',
+    } }, f.env);
+    const run = vi.fn((args, opts) => args[0] === 'fetch' ? { status: 0, stdout: '' } : f.run(args, opts));
+    await prepareRebuild({ ...f, run, log: { error: vi.fn() }, stateOpts: {}, now: Date.now });
+    expect(f.git(['rev-parse', 'HEAD'])).toBe(f.prevHead);
+    expect(readRebuildState(f.root, f.env).quarantine).toBeNull();
+    expect(run.mock.calls.filter(([args]) => args[0] === 'reset').map(([args]) => args))
+      .toEqual([['reset', '--hard', f.prevHead]]);
   });
   it('recovers a durable completed result even if the worker could not acquire the final lock', () => {
     const f = soakFixture();
@@ -661,17 +740,37 @@ function dependencyFixture(action) {
   });
 }
 
-async function expectDependencyQuickSmoke(f) {
+async function expectDependencyFullSmoke(f) {
   const options = smokeOptions(f);
   const runSmoke = vi.fn(async () => passed());
   await smokeAndAdopt({ ...options, runSmoke });
   expect(runSmoke).toHaveBeenCalledOnce();
-  expect(runSmoke.mock.calls[0][0]).toMatchObject({ singleAttempt: true, deferredChecks: QUICK_DEFERRED_CHECKS });
-  expect(options.log.error).toHaveBeenCalledWith(expect.stringContaining('daemon-rebuild: quick=on reason='));
-  expect(readReadyCandidate(f.root, f.env)).toMatchObject({ quick: true, adopt: { finalSha: f.plan.finalSha } });
+  expect(runSmoke.mock.calls[0][0]).not.toHaveProperty('singleAttempt');
+  expect(runSmoke.mock.calls[0][0]).not.toHaveProperty('deferredChecks');
+  expect(options.log.error).toHaveBeenCalledWith(expect.stringContaining('daemon-rebuild: quick=off reason=protected'));
+  expect(readReadyCandidate(f.root, f.env)).toMatchObject({ adopt: { finalSha: f.plan.finalSha } });
+  expect(readReadyCandidate(f.root, f.env)).not.toHaveProperty('quick');
 }
 
 describe('quick mode through the existing candidate/adoption pipeline', () => {
+  it('ready quick candidate is discarded, not adopted, once quick is disabled, with the full finalize lock wait', async () => {
+    const f = candidateFixture();
+    await smokeAndAdopt({ ...smokeOptions(f), runSmoke: async () => passed() });
+    expect(readReadyCandidate(f.root, f.env).quick).toBe(true);
+    f.git(['update-ref', 'refs/remotes/origin/main', f.plan.finalSha]);
+    vi.mocked(withWriteLock).mockClear();
+    const run = vi.fn((args, opts) => args[0] === 'fetch' ? { status: 0, stdout: '' } : f.run(args, opts));
+    const runSmoke = vi.fn();
+    const result = await rebuildClone({ root: f.root, env: { ...f.env, WE_DAEMON_REBUILD_QUICK: '0' },
+      run, runSmoke, asJob: false, adoptOnly: true, skipCheck: () => ({ skip: false }), log: { error: vi.fn() } });
+    expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'ready-candidate-discarded',
+      detail: expect.objectContaining({ note: 'quick mode disabled — full smoke required' }) }));
+    expect(readReadyCandidate(f.root, f.env)).toBeNull();
+    expect(run.mock.calls.some(([args]) => args[0] === 'reset')).toBe(false);
+    expect(runSmoke).not.toHaveBeenCalled();
+    expect(withWriteLock.mock.calls[0][2].waitMs).toBe(180_000);
+    expect(f.git(['rev-parse', 'HEAD'])).toBe(f.prevHead);
+  });
   it('off keeps the original smoke options and writes an ordinary full-ready record', async () => {
     const f = candidateFixture('README.md', '0');
     const runSmoke = vi.fn(async () => passed());
@@ -784,23 +883,23 @@ describe('quick mode through the existing candidate/adoption pipeline', () => {
     expect(runSmoke.mock.calls[0][0]).toMatchObject({ singleAttempt: true, deferredChecks: QUICK_DEFERRED_CHECKS });
     expect(readReadyCandidate(f.root, f.env)).toMatchObject({ quick: true });
   });
-  it('allows quick when a transitive-only dispatch dependency is renamed', async () => {
+  it('requires full smoke when a transitive verifier dependency is renamed', async () => {
     const f = dependencyFixture('rename');
     // Prove Git recognizes the rename; the quick diff still includes both endpoints.
     expect(f.git(['diff', '--name-only', '--find-renames=100%', f.prevHead, f.plan.finalSha])).toBe(renamedDependency);
     expect(f.git(['diff', '--name-only', '--no-renames', f.prevHead, f.plan.finalSha]).split('\n').sort())
       .toEqual([dependency, renamedDependency].sort());
-    await expectDependencyQuickSmoke(f);
+    await expectDependencyFullSmoke(f);
   });
-  it('allows quick when a transitive-only dispatch dependency is removed', async () => {
+  it('requires full smoke when a transitive verifier dependency is removed', async () => {
     const f = dependencyFixture('remove');
     expect(f.git(['diff', '--name-only', f.prevHead, f.plan.finalSha])).toBe(dependency);
-    await expectDependencyQuickSmoke(f);
+    await expectDependencyFullSmoke(f);
   });
-  it('allows quick when a transitive-only dispatch dependency is added', async () => {
+  it('requires full smoke when a transitive verifier dependency is added', async () => {
     const f = dependencyFixture('add');
     expect(f.git(['diff', '--name-only', f.prevHead, f.plan.finalSha])).toBe(dependency);
-    await expectDependencyQuickSmoke(f);
+    await expectDependencyFullSmoke(f);
   });
   it('keeps plain-main fallback after a code-shaped quick failure and schedules its already-HEAD soak', async () => {
     const f = candidateFixture();
@@ -858,6 +957,51 @@ describe('quick mode through the existing candidate/adoption pipeline', () => {
     expect(readRebuildState(f.root, f.env).rejected).toMatchObject({ envLoad: true });
     expect(readReadyCandidate(f.root, f.env)).toMatchObject({ quick: true, kind: 'candidate' });
     expect(readReadyCandidate(f.root, f.env).dropRefs).toBeUndefined();
+  });
+  it.each([false, true].flatMap(refuseBackoffLock => [false, true].map(alreadyHead => ({ refuseBackoffLock, alreadyHead }))))(
+    'ready-only load fallback preserves backoff through prepare adoption: $refuseBackoffLock lock refusal, already HEAD=$alreadyHead', async ({ refuseBackoffLock, alreadyHead }) => {
+    const f = candidateFixture('README.md', '1', { change: ({ write, git }) => {
+      write('README.md', 'new main\n');
+      git(['add', '.']); git(['commit', '-qm', 'main moves']);
+      write('overlay.md', 'overlay\n');
+    } });
+    f.plan.mainSha = f.git(['rev-parse', `${f.plan.finalSha}^`]);
+    f.git(['update-ref', 'refs/remotes/origin/main', f.plan.mainSha]);
+    if (alreadyHead) {
+      f.git(['reset', '--hard', f.plan.mainSha]);
+      f.prevHead = f.plan.mainSha;
+    }
+    f.plan.applied = [{ ref: 'lane/work', sha: f.plan.finalSha }];
+    f.git(['update-ref', 'refs/remotes/origin/lane/work', f.plan.finalSha]);
+    const runSmoke = vi.fn().mockResolvedValueOnce({ verdict: 'code', smoke: { results: [
+      { name: 'lane-acquire-release', ok: false, mayBeTransient: false, ms: 1000, detail: 'lane acquire refused (lock contention)' },
+    ] } }).mockImplementation(async () => {
+      if (refuseBackoffLock) vi.mocked(withWriteLock).mockResolvedValueOnce({ ok: false, reason: 'tick-in-progress' });
+      return passed();
+    });
+    await smokeAndAdopt({ ...smokeOptions(f), overlaysBefore: [{ ref: 'lane/work' }], runSmoke });
+    const rejection = readReadyCandidate(f.root, f.env).rejectionBackoff;
+    expect(rejection).toMatchObject({ envLoad: true, inputsKey: f.plan.inputsKey });
+    expect(readReadyCandidate(f.root, f.env)).toMatchObject({ rejectionBackoff: rejection });
+    if (!refuseBackoffLock) expect(readRebuildState(f.root, f.env).rejected).toEqual(rejection);
+    // Main-only planning still consumes the candidate for plain main. No detached worker in this fixture.
+    const run = (args, opts) => args[0] === 'fetch' ? { status: 0, stdout: '' } : f.run(args, opts);
+    const launchSoak = vi.fn(async () => ({ started: true }));
+    const result = await prepareRebuild({ ...f, run, mainOnly: true, stateOpts: {}, now: Date.now,
+      log: { error: vi.fn() }, launchSoak });
+    expect(result.result).toMatchObject({ adopted: true, reason: 'ready-adopted' });
+    expect(launchSoak).toHaveBeenCalledOnce();
+    expect(readRebuildState(f.root, f.env).unverified).toMatchObject({ quick: true, sha: f.plan.mainSha });
+    expect(readRebuildState(f.root, f.env).rejected).toEqual(rejection);
+  });
+  it.each([false, true])('immediate adoption restores backoff when candidate already HEAD=%s', async alreadyHead => {
+    const f = candidateFixture();
+    if (alreadyHead) f.git(['reset', '--hard', f.plan.finalSha]);
+    const rejectionBackoff = { inputsKey: 'failed-overlay', envLoad: true, attempts: 2,
+      at: new Date(0).toISOString(), retryAt: new Date(300_000).toISOString(), reason: 'load' };
+    const result = await finalizeRebuild({ ...smokeOptions(f), rejectionBackoff });
+    expect(result.adopted).toBe(true);
+    expect(readRebuildState(f.root, f.env).rejected).toEqual(rejectionBackoff);
   });
   it('an adopted tree that fails its soak actually returns to the previous Git HEAD', async () => {
     const f = candidateFixture();

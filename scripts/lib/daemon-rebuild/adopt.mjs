@@ -47,7 +47,9 @@ export function matchReadyCandidate({
   const passedMs = Date.parse(ready.passedAt || '');
   if (!Number.isFinite(passedMs) || nowMs - passedMs > maxAgeMs) return { adopt: null, reason: 'expired' };
   if (ready.prevHead !== prevHead) return { adopt: null, reason: 'other-base' };
-  if (ready.adopt.finalSha === prevHead && ready.kind !== 'fallback') return { adopt: null, reason: 'already-head' };
+  // An already-HEAD load fallback can still owe its quick soak or rejection backoff.
+  if (ready.adopt.finalSha === prevHead && ready.kind !== 'fallback'
+    && !ready.quick && !ready.rejectionBackoff) return { adopt: null, reason: 'already-head' };
   if (rejected && rejected.inputsKey === ready.adopt.inputsKey && Date.parse(rejected.at || '') > passedMs) {
     return { adopt: null, reason: 'rejected-since' };
   }
@@ -198,7 +200,7 @@ export function staleAlertDetail(result, state) {
  */
 export async function finalizeRebuild({
   root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted,
-  quick = false, launchSoak = launchQuickSoak,
+  quick = false, launchSoak = launchQuickSoak, rejectionBackoff,
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
@@ -220,6 +222,8 @@ export async function finalizeRebuild({
   // Every exit from this (locked) phase ends the build, so every exit releases its lease and persists that.
   releaseBuildLease(state, lease);
   const terminal = (result) => {
+    // This rejection belongs to the failed overlay build, not the passing plain-main candidate.
+    if (result.adopted && rejectionBackoff) state.rejected = rejectionBackoff;
     writeState();
     const stale = staleAlertDetail(result, state);
     if (stale) alert('clone-held-stale', stale);

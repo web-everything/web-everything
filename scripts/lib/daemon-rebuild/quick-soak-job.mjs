@@ -86,7 +86,7 @@ export function settleQuickSoak({ root, env = process.env, marker, outcome, reas
     // A provably different head is never reset by an old soak. Do not certify a pending adopted record
     // merely because something else moved HEAD; preserve an independently recorded newer adoption.
     if (!head || state.adopted?.head === marker.sha) {
-      state.quarantine = { prevHead: marker.prevHead, reason: 'quick-soak-unavailable' };
+      state.quarantine = { prevHead: marker.prevHead, failedHead: marker.sha, reason: 'quick-soak-unavailable' };
       state.adopted = marker.lastGood ?? null;
     }
   } else if (outcome === 'unavailable' && attemptsOf(marker) < QUICK_SOAK_MAX_ATTEMPTS && withinDeadline(marker, now())) {
@@ -110,7 +110,7 @@ export function settleQuickSoak({ root, env = process.env, marker, outcome, reas
       state.held = { since: rejected.at, updatedAt: rejected.at, reason: rejected.reason,
         lastGood: marker.prevHead, target: marker.sha };
     } else {
-      state.quarantine = { prevHead: marker.prevHead, reason: 'quick-soak-rollback-failed' };
+      state.quarantine = { prevHead: marker.prevHead, failedHead: marker.sha, reason: 'quick-soak-rollback-failed' };
       // A failed rollback is never promoted to a verified last-good build.
       state.adopted = marker.lastGood ?? null;
     }

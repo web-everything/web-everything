@@ -74,7 +74,9 @@ export async function prepareRebuild({
 
   const state = readRebuildState(root, stEnv);
   const writeState = () => writeRebuildState(root, state, stEnv);
-  const rollbackQuick = (sha) => {
+  const rollbackQuick = (sha, failedHead) => {
+    // A legacy record without adoption identity cannot authorize resetting today's HEAD.
+    if (!failedHead || verifyRev(git, 'HEAD') !== failedHead) return { ok: false, reason: 'adopted-head-changed-or-unreadable' };
     try { return rollbackToSha({ root, sha, run, ignoreUntracked: true }); }
     catch { return { ok: false, reason: 'rollback-threw' }; }
   };
@@ -123,7 +125,7 @@ export async function prepareRebuild({
       // last verified head and let this tick rebuild + smoke it off-lock like any other candidate.
       const atUnverifiedTarget = headNow === ip.target && ip.target !== ip.prevHead && ip.verified !== true;
       if (atUnverifiedTarget) {
-        const rolled = ip.quick ? rollbackQuick(ip.prevHead).ok : rollbackUnverified({ git, prevHead: ip.prevHead });
+        const rolled = ip.quick ? rollbackQuick(ip.prevHead, ip.target).ok : rollbackUnverified({ git, prevHead: ip.prevHead });
         if (ip.quick) {
           const detail = { sha: ip.target, lastGood: ip.prevHead, attempts: 0, cause: 'adoption-interrupted', rollback: { ok: rolled } };
           reportQuickSoakNeedsYou({ root, env: stEnv, detail, log });
@@ -131,7 +133,7 @@ export async function prepareRebuild({
         }
         if (!rolled) {
           if (ip.quick) {
-            state.quarantine = { prevHead: ip.prevHead, reason: 'quick-soak-unavailable' };
+            state.quarantine = { prevHead: ip.prevHead, failedHead: ip.target, reason: 'quick-soak-unavailable' };
             state.inProgress = null;
             writeState();
           }
@@ -198,7 +200,7 @@ export async function prepareRebuild({
   if (state.quarantine?.reason?.startsWith('quick-soak-')) {
     // Settlement may already have refused this rollback. Never retry through the weaker legacy reset:
     // ignored files and ancestor-path obstructions need the same guard on every recovery tick.
-    const rollback = rollbackQuick(state.quarantine.prevHead);
+    const rollback = rollbackQuick(state.quarantine.prevHead, state.quarantine.failedHead);
     if (!rollback.ok) {
       reportQuickSoakNeedsYou({ root, env: stEnv, log, detail: {
         lastGood: state.quarantine.prevHead, reason: state.quarantine.reason, rollback,
@@ -454,19 +456,6 @@ export async function prepareRebuild({
     return live;
   }
 
-  // ── Step 4: up-to-date / still-rejected short-circuits ──────────────────────────────────────────────
-  if (plan.upToDate) {
-    if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
-      state.adopted = {
-        head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
-      };
-      state.held = null; // x5wbsbc — current again: no longer held on a last-good build
-      writeState();
-    }
-    clearReadyCandidate(root, stEnv); // current already — nothing a passed-but-unadopted build could add
-    return terminal({ moved: false, reason: 'up-to-date', plan });
-  }
-
   // fix-rebuild-finalize — a candidate that already PASSED its smoke but could not be adopted (a reader was
   // mid-tick when its finalize tried the lock) is adopted HERE, under the write lock this phase already holds,
   // instead of being thrown away and re-smoked. Checked before the rejection/backoff short-circuits: a passed
@@ -534,6 +523,8 @@ export async function prepareRebuild({
           prevHead,
           lease: { token: ready.token ?? null },
           quick: ready.quick === true,
+          rejectionBackoff: ready.rejectionBackoff,
+          launchSoak,
           onAdopted: m.dropRefs.length
             ? ({ alert: finAlert }) => dropSuspectOverlays({
               root, env, suspects: m.dropRefs, failed: m.failed, alert: finAlert,
@@ -549,6 +540,19 @@ export async function prepareRebuild({
       }
     }
   }
+  // Process ready metadata first: an already-HEAD fallback can still owe a soak and backoff restoration.
+  if (plan.upToDate) {
+    if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
+      state.adopted = {
+        head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
+      };
+      state.held = null;
+      writeState();
+    }
+    clearReadyCandidate(root, stEnv);
+    return terminal({ moved: false, reason: 'up-to-date', plan });
+  }
+
   // x5wbsbc — a BROKEN SMOKE HARNESS (every candidate, the last-good build included, fails the same checks) is
   // not re-smoked on every main move: it would cost up to three full smokes per move and every one would fail
   // the same way. Until its backoff expires the clone stays on its last-good build (and keeps dispatching —

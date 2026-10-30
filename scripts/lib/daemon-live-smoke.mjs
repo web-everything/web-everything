@@ -1487,12 +1487,17 @@ function rollbackPathList(run, args, root) {
     if (result.status !== 0 || typeof result.stdout !== 'string'
       || Buffer.byteLength(result.stdout) > ROLLBACK_PATH_LIST_MAX_BYTES
       || (result.stdout && !result.stdout.endsWith('\0'))) return null;
-    const paths = result.stdout ? result.stdout.slice(0, -1).split('\0') : [];
+    // --directory emits a trailing slash for collapsed untracked directories.
+    const paths = result.stdout ? result.stdout.slice(0, -1).split('\0').map(path => path.replace(/\/$/, '')) : [];
     return paths.every(path => path && !path.startsWith('/')
       && !path.split('/').some(part => !part || part === '.' || part === '..')) ? paths : null;
   } catch { return null; }
 }
 function rollbackHasUntrackedCollision(untracked, target) {
+  // Conservatively protect case-insensitive and Unicode-normalizing filesystems too.
+  const canonical = path => path.normalize('NFC').toLowerCase().normalize('NFC');
+  untracked = untracked.map(canonical);
+  target = target.map(canonical);
   const files = new Set(target);
   const directories = new Set();
   for (const path of target) {
@@ -1525,7 +1530,7 @@ export function rollbackToSha({ root, sha, run = gitRun, ignoreUntracked = false
   if (dirty !== false) return { ok: false, reason: dirty === null ? 'status-failed' : 'dirty' };
   if (ignoreUntracked) {
     // Include ignored sidecars too: reset --hard can delete either kind of untracked obstruction.
-    const untracked = rollbackPathList(run, ['ls-files', '--others', '-z'], root);
+    const untracked = rollbackPathList(run, ['ls-files', '--others', '--directory', '--no-empty-directory', '-z'], root);
     const target = rollbackPathList(run, ['ls-tree', '-r', '--full-tree', '--name-only', '-z', sha], root);
     if (untracked === null || target === null) return { ok: false, reason: 'status-failed' };
     if (rollbackHasUntrackedCollision(untracked, target)) return { ok: false, reason: 'untracked-collision' };

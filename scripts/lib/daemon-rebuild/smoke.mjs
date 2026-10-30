@@ -619,6 +619,7 @@ export async function smokeAndAdopt({
     }
     const fin = await withWriteLock(root, () => finalizeRebuild({
       root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted, quick,
+      rejectionBackoff: readyMeta.rejectionBackoff,
     }), quick ? { ...finalizeLockOpts, waitMs: quickFinalizeWaitMs({ quick: true, env }) } : finalizeLockOpts);
     if (!fin.ok) {
       if (fin.reason === 'tick-in-progress') {
@@ -853,16 +854,12 @@ export async function smokeAndAdopt({
         if (!reproduced) {
           envLoadAlert({ plainMain: 'passed', confirm: failedA2.map((r) => r.name).join(',') || (a2.quickSkipped ? 'skipped: quick mode' : a2.budgetSkipped ? 'skipped: budget' : a2.worktreeFailed ? `worktree: ${a2.worktreeFailed}` : 'threw') });
           // Plain main passed: adopt it so the clone stays current, keep every overlay, back A off.
-          const recordBackoff = () => {
-            const st = readRebuildState(root, stEnv);
-            envLoadRecord(st);
-            writeRebuildState(root, st, stEnv);
-          };
-          // A's load rejection is already known, even when B is only queued for adoption.
-          // Persist it under the state lock before publishing B's ready record; adoption
-          // still needs the hook because finalizeRebuild clears the rejection state.
-          if (readyOnly) await locked(envLoadRecord);
-          const fin = await finalize(planB, readyOnly ? undefined : recordBackoff, { kind: 'candidate' }, b.smokeResult);
+          // Persist A's rejection once, and carry it with B through both immediate and delayed adoption.
+          // The ready record can still be published if this state lock is refused.
+          // Compute its intent first so that refusal cannot erase the backoff at adoption.
+          let rejectionBackoff = envLoadRecord({ rejected: readRebuildState(root, stEnv).rejected });
+          await locked(st => { rejectionBackoff = envLoadRecord(st); });
+          const fin = await finalize(planB, undefined, { kind: 'candidate', rejectionBackoff }, b.smokeResult);
           return { ...fin, reason: fin.adopted ? 'smoke-env-load' : fin.reason };
         }
         // A reproduced a code-shaped failure on a check it already failed, while plain main passed: genuine.

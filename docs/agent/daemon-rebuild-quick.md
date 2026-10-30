@@ -1,14 +1,17 @@
 # Daemon rebuild quick mode
 
+This change implements only `daemonRebuild.quick`. CI-overlap review and fixer push-hold settings
+(`review.startBeforeCi`, `fix.pushAfterCi`, `fix.pushAfterCiMaxMin`) are outside its scope.
+
 `daemonRebuild.quick` defaults to false in `scripts/lib/daemon-rebuild-settings.json` and resolves
 through the policy cascade; `WE_DAEMON_REBUILD_QUICK=1|0` overrides it. Quick candidates defer only
 `dispatch-dry-run` and `reconcile-dry-run`, take one smoke attempt without confirmation, and use a
 60-second finalize wait unless `WE_DAEMON_FINALIZE_LOCK_WAIT_MS` overrides it. The pure policy and
 protected path list live in `scripts/lib/daemon-rebuild/quick.mjs`. Unknown, malformed or oversized
-change sets select full smoke. Gate code, dispatch entries, the shared dispatch core paths,
-dispatch settings and package manifests/locks always select full smoke. Transitive-only imports
-and unknown import closures do not block quick mode: the deferred checks still run after adoption
-with rollback. Each rebuild logs one `daemon-rebuild: quick=on|off reason=...` line and records a
+change sets select full smoke. All `scripts/**` changes, dispatch settings and package manifests/locks
+always select full smoke. The soak and rollback verifier transitively import much of the script runtime;
+protect that trust base before adoption. A closure regression requires every local verifier import to
+match the protected set. Each rebuild logs one `daemon-rebuild: quick=on|off reason=...` line and records a
 `quick-decision` alert, including the triggering protected file or disabled setting provenance.
 
 Keep quick provenance on ready records: adopting a partial pass as a full pass loses its owed soak.
@@ -26,11 +29,17 @@ back to the previous last-good record; an unsafe rollback quarantines rather tha
 Quick partial passes never enter the full-smoke proof cache.
 Quick quarantine retries and interrupted-adoption recovery use the same untracked-aware guarded rollback
 as soak settlement; ignored files and ancestor-path collisions must survive recovery with quarantine and a needs-you page.
+Quarantine records retain `failedHead`; recovery resets only that exact HEAD. A different or unreadable
+HEAD, or a historical quarantine without this identity, stays quarantined for operator recovery.
+Load fallback ready records retain the failed build's rejection/backoff, which adoption restores after
+clearing the passing candidate's state, including when the candidate is already HEAD.
+Process ready records before the up-to-date shortcut so that HEAD equality cannot discard an owed soak
+or backoff. Keep the backoff in ready metadata even if its initial state-write lock is refused.
 Regression home:
 `scripts/lib/__tests__/daemon-rebuild-quick.test.mjs` (private state/lock roots and injected children).
 
 Pipeline fixtures keep dispatch entry bytes identical while renaming, removing or adding a
-referenced dependency, and assert quick smoke and a marked ready record. Entry and gate-code
+referenced verifier dependency, and assert full smoke and an ordinary ready record. Entry and gate-code
 changes retain full-smoke assertions. Decision visibility fixtures check enabled, disabled and
 protected-path outcomes in both the log and alerts file, with one decision across fallback stages.
 
@@ -52,7 +61,9 @@ untracked dirt, and tracked changes always refuse. Keep the real-Git sidecar-pre
 
 The untracked exception must reject collisions with the rollback target, including a sidecar at
 an exact target path, a file obstructing a target directory, or a directory obstructing a target
-file. Include ignored files in the collision inventory. The named real-Git collision regressions
+file. Include ignored files in the collision inventory, collapsing wholly untracked directories to
+keep dependency trees below the 1 MiB subprocess bound. Compare NFC-normalized, lowercased paths
+conservatively on every platform. The named real-Git collision regressions
 assert refusal, unchanged HEAD, preservation of binary sidecar bytes, quarantine and paging.
 Failed, missing, truncated or oversized path inventories refuse rollback as `status-failed`;
 keep the named evidence-refusal cases alongside the preservation cases.
