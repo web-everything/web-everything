@@ -24,6 +24,7 @@ code/dependency snapshot off-tick and records its PID/start-time identity during
 The worker holds a read slot while running both deferred dry runs and then `tree-stays-clean` last,
 then settles under the write lock. All three rows must provide fresh, unskipped evidence; the
 pre-adopt deferred list remains exactly the two dry runs.
+Only the post-adopt quick soak tolerates exact pre-existing untracked paths from a readable baseline; tracked changes, new untracked files (including siblings in an existing directory), and missing/null baselines fail closed, while generic/full smoke stay strict.
 Its token/SHA-bound result is durable before the completion lock is attempted. Later ticks
 consume that result or recover a missing/dead/expired worker as `quick-soak-unavailable`; the
 one-hour deadline is derived from the exact recorded `adoptedAt`. Failure/unavailability rolls

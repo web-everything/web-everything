@@ -22,7 +22,7 @@
  *   bug this item removes).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readFileSync, cpSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, cpSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -1459,6 +1459,41 @@ describe('daemon-entries-boot — end-to-end through runLiveSmoke (#4468 review 
 });
 
 describe('tree-stays-clean — injected runChild', () => {
+  it.each([false, true])('quick opt-in checks individual untracked files in real Git (new sibling: %s)', async newSibling => {
+    const root = mkdtempSync(join(tmpdir(), 'smoke-baseline-untracked-'));
+    try {
+      execFileSync('git', ['init', '--quiet'], { cwd: root });
+      mkdirSync(join(root, 'sidecars'));
+      writeFileSync(join(root, 'sidecars', 'baseline.json'), '{}');
+      let reads = 0;
+      const runChild = async (cmd, args) => {
+        const out = execFileSync(cmd, args, { cwd: root, encoding: 'utf8' });
+        if (++reads === 1 && newSibling) writeFileSync(join(root, 'sidecars', 'new.json'), '{}');
+        return out;
+      };
+      const smoke = await runLiveSmoke({ root, env: {}, runChild, onlyChecks: ['tree-stays-clean'],
+        tolerateBaselineUntracked: true });
+      expect(reads).toBe(2);
+      expect(smoke.pass).toBe(!newSibling);
+      if (newSibling) expect(smoke.results[0].detail).toContain('sidecars/new.json');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('generic smoke without the option still fails on a pre-existing untracked sidecar', async () => {
+    const runChild = vi.fn(async () => '?? .conveyor/unsupported-repo.json\n');
+    const smoke = await runLiveSmoke({ root: '/x', env: {}, runChild, onlyChecks: ['tree-stays-clean'] });
+    expect(smoke.pass).toBe(false);
+    expect(smoke.results[0]).toMatchObject({ name: 'tree-stays-clean', ok: false });
+    expect(smoke.results[0].detail).toContain('pre-existing dirty path');
+  });
+
+  it.each([null, undefined])('tolerating baseline untracked fails closed with a %s baseline even if the final tree is clean', async beforePorcelain => {
+    const result = await treeStaysCleanCheck({ root: '/x', budgets: { treeStaysCleanMs: 1000 },
+      runChild: async () => '', env: {}, beforePorcelain, tolerateBaselineUntracked: true });
+    expect(result.ok).toBe(false);
+    expect(result.detail).toMatch(/baseline/i);
+  });
+
   it('an empty git status → ok:true', async () => {
     const runChild = vi.fn(async () => '');
     const result = await treeStaysCleanCheck({ root: '/x', budgets: { treeStaysCleanMs: 1000 }, runChild, env: {}, beforePorcelain: null });

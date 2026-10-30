@@ -748,7 +748,7 @@ async function checkDispatchDryRun({ root, budgets, runChild, env }) {
  * `scripts/conveyor/run-scorecards.json`).
  *
  * Records the porcelain BEFORE the checks ran too ({@link runLiveSmoke}'s `beforePorcelain`, best-effort) and
- * reports pre-existing dirt DISTINCTLY from dirt newly introduced by this smoke's own checks — still fails on
+ * reports pre-existing dirt DISTINCTLY from dirt newly introduced by this smoke's own checks — by default fails on
  * either (a dirty tree is a real problem to the caller regardless of which ran first), but names which is
  * which so a human/daemon reading `detail` is not left guessing whether this smoke run itself is the cause.
  *
@@ -759,13 +759,26 @@ async function checkDispatchDryRun({ root, budgets, runChild, env }) {
  * match a symlink of the same name). The fix belongs in candidate setup (a `node_modules`-shaped `info/exclude`
  * entry — see that function's own docblock), never in weakening this check to ignore "pre-existing" dirt: a
  * candidate that is dirty the INSTANT it is checked out is still exactly the anomaly this check exists to catch.
+ * Only the post-adopt quick soak opts into `tolerateBaselineUntracked`: exact `??` lines from a readable
+ * baseline may remain. List individual untracked files so a new sibling cannot hide behind a directory row.
+ * Candidate/full smoke retain the strict rule above; tracked dirt and unknown baselines never qualify.
  */
-async function checkTreeStaysClean({ root, budgets, runChild, env, beforePorcelain }) {
+async function checkTreeStaysClean({ root, budgets, runChild, env, beforePorcelain, tolerateBaselineUntracked = false }) {
   let out;
   try {
-    out = await runChild('git', ['status', '--porcelain'], { cwd: root, timeoutMs: budgets.treeStaysCleanMs, env });
+    out = await runChild('git', ['status', '--porcelain', ...(tolerateBaselineUntracked === true ? ['--untracked-files=all'] : [])],
+      { cwd: root, timeoutMs: budgets.treeStaysCleanMs, env });
   } catch (e) {
     return { ok: false, detail: `git status --porcelain failed: ${firstLine(e)}`, ...childFailureDiagnostics(e) };
+  }
+  if (tolerateBaselineUntracked === true) {
+    if (typeof beforePorcelain !== 'string') return { ok: false, detail: 'baseline git status unavailable — refusing to tolerate untracked paths' };
+    const baselineUntracked = new Set(beforePorcelain.split('\n').filter(line => line.startsWith('?? ')));
+    const remaining = String(out || '').split('\n').filter(line => !baselineUntracked.has(line));
+    if (String(out || '').trim() && !remaining.join('\n').trim()) {
+      return { ok: true, detail: 'only baseline untracked paths remain — tracked tree stayed clean' };
+    }
+    out = remaining.join('\n');
   }
   const after = String(out || '').trim();
   if (!after) return { ok: true, detail: 'git status --porcelain empty — tree stayed clean' };
@@ -853,6 +866,7 @@ export function decideSmokeVerdict(results) {
  * Run every {@link SMOKE_CHECKS} row against `root` (the clone that just merged new code) and report a verdict.
  * Never throws — a check that throws is caught and recorded as a failure, exactly like an explicit `{ok:false}`.
  * @param {{root:string, env?:NodeJS.ProcessEnv, repos?:string[], runChild?:typeof runBounded, now?:number}} o
+ * @param {boolean} [o.tolerateBaselineUntracked=false] Post-adopt quick soak only; candidate/full smoke stay strict.
  * @returns {Promise<{pass:boolean, disabled:boolean, results:Array<object>, sessionSlug:string}>}
  */
 export async function runLiveSmoke({
@@ -861,7 +875,7 @@ export async function runLiveSmoke({
   clock = Date.now, hostBusy = undefined, reuseCode = false,
   load = () => loadavg()[0], cores = () => cpus().length, shadow = shadowAdmission, admit = admitResource,
   makeReadMemoDir = () => mkdtempSync(join(tmpdir(), 'smoke-read-memo-')),
-  deferredChecks = [], onlyChecks = null,
+  deferredChecks = [], onlyChecks = null, tolerateBaselineUntracked = false,
 } = {}) {
   if (isSmokeGateDisabled(env)) return { pass: true, disabled: true, results: [], sessionSlug: null };
   // One shared `rebuild-smoke` decision per run sets the budgets (x9xkupj); the legacy load factor is its logged comparison.
@@ -907,12 +921,13 @@ export async function runLiveSmoke({
     // path found afterward as unclassified rather than guessing.
     let beforePorcelain = null;
     try {
-      beforePorcelain = await runChild('git', ['status', '--porcelain'], { cwd: root, timeoutMs: budgets.treeStaysCleanMs, env });
+      beforePorcelain = await runChild('git', ['status', '--porcelain', ...(tolerateBaselineUntracked === true ? ['--untracked-files=all'] : [])],
+        { cwd: root, timeoutMs: budgets.treeStaysCleanMs, env });
     } catch { /* best-effort — see comment above */ }
     // #4139 — `env` (the caller's OWN, possibly-isolated env) rides alongside `ghChildEnv` (the derived,
     // sanitized-for-gh one) so the lane-pool checks can use the former while the gh checks keep using the
     // latter; see {@link checkLanePoolList}'s comment for why dropping this here silently escaped isolation.
-    const ctx = { root, budgets, repos, sessionSlug, env, ghChildEnv, runChild, beforePorcelain, clock, hostBusy, dryRun };
+    const ctx = { root, budgets, repos, sessionSlug, env, ghChildEnv, runChild, beforePorcelain, tolerateBaselineUntracked, clock, hostBusy, dryRun };
     const results = [];
     for (const check of SMOKE_CHECKS) {
       if (onlyChecks && !onlyChecks.includes(check.name)) continue;

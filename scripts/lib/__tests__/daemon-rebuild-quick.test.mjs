@@ -1143,7 +1143,7 @@ describe('post-adopt soak', () => {
     expect(smoke).toHaveBeenCalledOnce();
     expect(smoke).toHaveBeenCalledWith(expect.objectContaining({ root: f.root,
       onlyChecks: ['dispatch-dry-run', 'reconcile-dry-run', 'tree-stays-clean'],
-      changedFiles: null, reuseCode: false }));
+      changedFiles: null, reuseCode: false, tolerateBaselineUntracked: true }));
     expect(readRebuildState(f.root, f.env).unverified).toBeNull();
   });
   it('excludes a concurrent writer while a soak check is open and admits it after checks finish', async () => {
@@ -1176,7 +1176,15 @@ describe('post-adopt soak', () => {
     expect(await withWriteLock(f.root, writer, writerOptions)).toEqual({ ok: true, value: 'entered' });
     expect(writer).toHaveBeenCalledOnce();
   });
-  it.each([true, false])('both dry runs pass, dirty afterwards=%s: fail and roll back or pass only after settlement', async dirty => {
+  it.each([
+    ['clean tree', '', '', true],
+    ['pre-existing untracked sidecar with clean tracked files', '?? .conveyor/unsupported-repo.json\n', '?? .conveyor/unsupported-repo.json\n', true],
+    ['new untracked path during soak', '?? .conveyor/unsupported-repo.json\n', '?? .conveyor/unsupported-repo.json\n?? new.txt\n', false],
+    ['modified tracked file during soak', '?? .conveyor/unsupported-repo.json\n', '?? .conveyor/unsupported-repo.json\n M tracked\n', false],
+    ['pre-existing modified tracked file', ' M tracked\n', ' M tracked\n', false],
+    ['null baseline with untracked sidecar', null, '?? .conveyor/unsupported-repo.json\n', false],
+    ['null baseline with clean final tree', null, '', false],
+  ])('both dry runs pass: %s settles only on complete cleanliness evidence', async (_name, before, after, passes) => {
     const f = soakFixture();
     const calls = [];
     let result;
@@ -1195,10 +1203,14 @@ describe('post-adopt soak', () => {
         runChild: async (cmd, args) => {
           expectUnverified();
           if (cmd === 'git') {
-            if (!calls.length) { calls.push('before'); return ''; }
+            if (!calls.length) {
+              calls.push('before');
+              if (before === null) throw new Error('baseline status unavailable');
+              return before;
+            }
             expect(calls).toEqual(['before', 'reconcile', 'dispatch']);
             calls.push('after');
-            return dirty ? ' M tracked' : '';
+            return after;
           }
           if (args[0] === 'scripts/conveyor/reconcile-pass.mjs') {
             calls.push('reconcile');
@@ -1218,12 +1230,12 @@ describe('post-adopt soak', () => {
     expect(result.results.map(({ name, ok }) => ({ name, ok }))).toEqual([
       { name: 'reconcile-dry-run', ok: true },
       { name: 'dispatch-dry-run', ok: true },
-      { name: 'tree-stays-clean', ok: !dirty },
+      { name: 'tree-stays-clean', ok: passes },
     ]);
-    expect(result.pass).toBe(!dirty);
+    expect(result.pass).toBe(passes);
     const state = readRebuildState(f.root, f.env);
     expect(state.unverified).toBeNull();
-    if (dirty) {
+    if (!passes) {
       expect(f.run).toHaveBeenCalledWith(['reset', '--hard', prevHead], expect.objectContaining({ cwd: f.root }));
       expect(state.adopted).toEqual(f.marker.lastGood);
       expect(state.rejected).toMatchObject({ reason: 'quick-soak-failed' });

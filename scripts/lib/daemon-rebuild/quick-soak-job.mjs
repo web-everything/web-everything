@@ -285,7 +285,8 @@ export async function runQuickSoak({ root, env = process.env, marker, token, run
           if (!(remaining > 0)) throw new Error('quick soak deadline exhausted');
           return runBounded(cmd, args, { ...opts, timeoutMs: Math.min(opts.timeoutMs ?? remaining, remaining) });
         };
-        return smoke({ root, env, onlyChecks: QUICK_SOAK_CHECKS, changedFiles: null, reuseCode: false, runChild });
+        return smoke({ root, env, onlyChecks: QUICK_SOAK_CHECKS, changedFiles: null, reuseCode: false, runChild,
+          tolerateBaselineUntracked: true });
       }, lockOptions(env));
       if (checked.ok) {
         outcome = decideQuickSoakResult(checked.value);
