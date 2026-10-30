@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 // Installed root:root 0755. No executable source or configuration comes from the task.
 import {spawn} from 'node:child_process';
-import {constants} from 'node:fs';
+import {constants, realpathSync} from 'node:fs';
 import * as filesystem from 'node:fs/promises';
-import {open, mkdir, readdir, writeFile, rename, rm, rmdir, lstat, realpath} from 'node:fs/promises';
+import {open, mkdir, readdir, writeFile, rename, rm, rmdir, lstat} from 'node:fs/promises';
 import {createHash, randomBytes} from 'node:crypto';
 import {join, relative} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {cpus, loadavg, freemem, totalmem} from 'node:os';
-import {BASE_RETENTION, claimPrewarm, baseGuard, readyBases, readBase, copyLeaves, baseFile, materializeWorktree} from './forge-exec-bases.mjs';
+import {baseGuard, readyBases, readBase, copyLeaves, baseFile, createBasePin, materializeWorktree} from './forge-exec-bases.mjs';
 import {decodeManifest} from './forge-exec-manifest.mjs';
 const LIMIT = 4 * 1024 * 1024;
 const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
@@ -90,7 +90,8 @@ export function parseTelemetry(text) {
   if (!exactKeys(v,'activeRuns,cores,loadPerCore,memFreePct,recent,sampledAtET') || !validET(v.sampledAtET)
     || !Number.isSafeInteger(v.cores) || v.cores<1 || !Number.isFinite(v.loadPerCore) || v.loadPerCore<0
     || !Number.isFinite(v.memFreePct) || v.memFreePct<0 || v.memFreePct>100 || !duration(v.activeRuns)
-    || !Array.isArray(v.recent) || v.recent.length>50 || v.recent.some(r=>!(exactKeys(r,'code,runId,stageMs,startedAtET')||(exactKeys(r,'code,prewarmed,runId,stageMs,startedAtET')&&typeof r.prewarmed==='boolean'))
+    || !Array.isArray(v.recent) || v.recent.length>50 || v.recent.some(r=>!(exactKeys(r,'code,runId,stageMs,startedAtET')
+      || (exactKeys(r,'code,prewarmed,runId,stageMs,startedAtET') && typeof r.prewarmed==='boolean'))
       || !runName(r.runId) || !validET(r.startedAtET) || !exactKeys(r.stageMs,'install,run')
       || !duration(r.stageMs.install) || !duration(r.stageMs.run) || !(r.code===null || (duration(r.code)&&r.code<=255))))
     throw new Error('Invalid telemetry schema');
@@ -525,29 +526,9 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
     if(result.code!==0)throw new Error('Worker ownership handoff refused; use local fallback and inspect slot setup');
   }
   async function pinBase(run,baseSha) {
-    const active=join(bases,'active'),pin=join(active,run);
-    await mkdir(active,{recursive:true,mode:0o700});
     // Pool metadata runs as root, but the anonymous warmer runs as ops and
     // must read every active pin before deciding which public bases to prune.
-    if(!testRoot&&process.getuid()===0){
-      const fd=await open(active,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
-      try{
-        const st=await fd.stat();
-        if(![0,operator.uid].includes(st.uid)||(st.mode&0o022))throw new Error('Unsafe base pin directory');
-        await fd.chown(operator.uid,operator.gid);
-      }finally{await fd.close();}
-    }
-    try{await writeFile(pin,baseSha,{flag:'wx',mode:0o600});}
-    catch(error){if(error.code!=='EEXIST'||(await baseFile(pin)).toString()!==baseSha)throw error;}
-    if(!testRoot&&process.getuid()===0){
-      const fd=await open(pin,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
-      try{
-        const st=await fd.stat();
-        if(!st.isFile()||st.nlink!==1||![0,operator.uid].includes(st.uid)||st.size!==baseSha.length
-          ||(await fd.readFile()).toString()!==baseSha)throw new Error('Unsafe base pin');
-        await fd.chown(operator.uid,operator.gid);
-      }finally{await fd.close();}
-    }
+    await createBasePin(bases,run,baseSha,!testRoot&&process.getuid()===0?operator:undefined);
   }
   async function workCommand(worker,argv,work,env,archive) {
     if(testRoot) return testWorkerExec?testWorkerExec({worker,argv,cwd:work,env,archive}):execute(argv[0],archive ? ['-xf',archive] : argv.slice(1),{cwd:work,env,detached:true});
@@ -698,7 +679,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
       return publishTelemetry();
     },
     async bases() {
-      try{return {delta:1,bases:(await readyBases(bases)).slice(0,BASE_RETENTION).map(({sha,manifestDigest})=>({sha,manifestDigest}))};}
+      try{return {delta:1,bases:(await readyBases(bases)).slice(0,4).map(({sha,manifestDigest})=>({sha,manifestDigest}))};}
       catch{return {delta:1,bases:[]};}
     },
     async ['base-manifest']({sha}) {
@@ -782,7 +763,6 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
       const worker=selected??{user:'forge-exec',root:runs};
       const container=join(worker.root,request.run),work=join(container,'work');
       await directory(container,true,operator); await directory(work);
-      let prewarmed=false;
       if(request.baseSha!==undefined) {
         await baseGuard(bases,async()=>{
           const base=await readBase(bases,request.baseSha,request.baseManifestDigest);
@@ -801,27 +781,8 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
           const walk=async prefix=>{for(const name of await readdir(prefix.length?bytePath(work,prefix):work,{encoding:'buffer'})){const p=prefix.length?Buffer.concat([prefix,Buffer.from('/'),name]):name;pathParts(p);const st=await lstat(bytePath(work,p));if(st.isSymbolicLink())throw new Error('Delta symlink');if(st.isDirectory())await walk(p);else {if(!st.isFile())throw new Error('Delta special file');const entry=finalEntries.find(e=>e.path.equals(p));if(!entry)throw new Error('Unlisted delta leaf');incoming.push(entry);}}};
           await walk(Buffer.alloc(0));
           const overlay=new Set(incoming.map(e=>e.path.toString('hex'))),assembled=join(container,'assembled');
-          const slot=/^forge-exec-([1-9]\d*)$/.exec(worker.user)?.[1];
-          prewarmed=await claimPrewarm(bases,request.baseSha,slot,assembled,base.manifest,request.baseManifestDigest,verifyManifest,filesystem,operator.uid);
-          if(prewarmed) {
-            // The claimed tree has just passed full verification under the
-            // guard. Check every component again before unlinking a leaf.
-            for(const entry of baseEntries.filter(e=>deleted.has(e.path.toString('hex'))||overlay.has(e.path.toString('hex')))) {
-              let target=Buffer.from(assembled);
-              const parts=pathParts(entry.path);
-              for(const [i,part] of parts.entries()) {
-                target=bytePath(target,part);const st=await lstat(target);
-                if(st.isSymbolicLink()||(i===parts.length-1?!st.isFile():!st.isDirectory()))throw new Error('Unsafe prewarm overlay');
-              }
-              await rm(target);
-            }
-            // Remove empty parents left by deletions before overlay/verification.
-            const empty=async dir=>{for(const name of await readdir(dir,{encoding:'buffer'})){const child=bytePath(dir,name);if((await lstat(child)).isDirectory())await empty(child);}if(Buffer.from(dir).compare(Buffer.from(assembled))!==0&&(await readdir(dir)).length===0)await rmdir(dir);};
-            await empty(assembled);
-          } else {
-            await mkdir(assembled,{mode:0o755});
-            await copyLeaves(base.tree,assembled,baseEntries.filter(e=>!deleted.has(e.path.toString('hex'))&&!overlay.has(e.path.toString('hex'))));
-          }
+          await mkdir(assembled,{mode:0o755});
+          await copyLeaves(base.tree,assembled,baseEntries.filter(e=>!deleted.has(e.path.toString('hex'))&&!overlay.has(e.path.toString('hex'))));
           await copyLeaves(work,assembled,incoming);
           // Verify primary full M before installing and before exposing any of
           // the reconstructed bytes to the worker. Siblings remain Mac-shipped.
@@ -858,7 +819,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
       let telemetryError;
       let updates=Promise.resolve();
       const update=()=>{
-        const record={runId:request.run,startedAtET,prewarmed,stageMs:{install:runAt===undefined?Math.max(0,Math.round(clock()-installAt)):installMs,
+        const record={runId:request.run,startedAtET,stageMs:{install:runAt===undefined?Math.max(0,Math.round(clock()-installAt)):installMs,
           run:runAt===undefined?0:Math.max(0,Math.round(clock()-runAt))},code:null};
         updates=updates.then(()=>publishTelemetry(record)).catch(error=>{telemetryError=error;});
         return updates;
@@ -881,7 +842,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
       const {slot:reservedSlot,...receiptState}=prepared;
       const receipt={...receiptState,timings:{installMs,runMs},...(request.manifest.siblings ? {siblingShas:siblingShas(request.manifest)} : {}),manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code};
       await writeFile(statePath(request.run,'receipt'),JSON.stringify(receipt),{flag:'wx',mode:0o600});
-      await publishTelemetry({runId:request.run,startedAtET,prewarmed,stageMs:{install:installMs,run:runMs},code:result.code});
+      await publishTelemetry({runId:request.run,startedAtET,stageMs:{install:installMs,run:runMs},code:result.code});
       if(telemetryError)throw telemetryError;
       return result;
       },prepared);
@@ -945,7 +906,9 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
     },
   };
 }
-if(process.argv[1] && await realpath(process.argv[1]).catch(()=> '') === await realpath(fileURLToPath(import.meta.url))) {
+const cliPath = (()=>{try{return realpathSync(process.argv[1]);}catch{return '';}})();
+if(process.argv[1] && cliPath === realpathSync(fileURLToPath(import.meta.url))) {
+  (async()=>{
   try {
     if(process.argv.length!==3 || !['prepare','run','finish','bases','base-manifest','telemetry','warm-install'].includes(process.argv[2])) throw new Error('Invalid subcommand');
     // Pool roots are deliberately 0700 worker-owned. Only this installed,
@@ -969,4 +932,5 @@ if(process.argv[1] && await realpath(process.argv[1]).catch(()=> '') === await r
     if(process.argv[2]==='prepare'&&error.code==='forge-busy')process.stdout.write(JSON.stringify({reason:'forge-busy'})+'\n');
     process.stderr.write('forge-exec-run: '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n'); process.exitCode=254;
   }
+  })();
 }
