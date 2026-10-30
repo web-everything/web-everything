@@ -70,7 +70,8 @@ describe('quick mode policy (default OFF)', () => {
   ])('always uses full smoke for dispatch/smoke/rebuild code: %s', path => {
     expect(decision([path])).toMatchObject({ quick: false, why: expect.stringContaining('protected') });
   });
-  it.each(['package.json', 'package-lock.json', 'nested/package-lock.json', 'scripts/dispatch-settings.json'])(
+  it.each(['package.json', 'package-lock.json', 'nested/package-lock.json',
+    'dispatch-settings.json', 'scripts/dispatch-settings.json', 'nested/config/dispatch-settings.json'])(
     'always uses full smoke for dispatch package/config dependency: %s', path => {
       expect(decision([path])).toMatchObject({ quick: false, why: expect.stringContaining('protected') });
     });

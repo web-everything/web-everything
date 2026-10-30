@@ -1,11 +1,13 @@
 /** Quick rebuild policy. Decisions are pure; only the setting resolver reads policy files. */
 import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DISPATCH_PATH_DEFAULTS } from './dispatch-paths.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
+import { LEGACY_SETTINGS_PATH } from '../settings-files.mjs';
 import { DISPATCH_DRY_RUN_CODE_ENTRIES } from '../daemon-live-smoke.mjs';
 
+const LEGACY_SETTINGS_NAME = basename(LEGACY_SETTINGS_PATH);
 export const QUICK_ENV = 'WE_DAEMON_REBUILD_QUICK';
 export const QUICK_DEFERRED_CHECKS = Object.freeze(['dispatch-dry-run', 'reconcile-dry-run']);
 export const QUICK_SOAK_CHECKS = Object.freeze([...QUICK_DEFERRED_CHECKS, 'tree-stays-clean']);
@@ -19,7 +21,7 @@ export const QUICK_ALWAYS_FULL_PATHS = Object.freeze([
   'scripts/lib/quick*.mjs',
   ...DISPATCH_DRY_RUN_CODE_ENTRIES,
   ...DISPATCH_PATH_DEFAULTS,
-  'dispatch-settings.json', '**/dispatch-settings.json',
+  LEGACY_SETTINGS_NAME, `**/${LEGACY_SETTINGS_NAME}`,
   'package.json', '**/package.json',
   'package-lock.json', '**/package-lock.json',
 ]);
