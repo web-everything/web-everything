@@ -549,9 +549,14 @@ Malformed marker metadata stays closed, and exhausted recovery asks the operator
 review run. The **stale red-team recovery — bounded second re-dispatch** cases exercise real
 markers, backoff boundaries, owner provenance, retry bounds, and release/retention semantics.
 Production admission re-runs `staleRedTeamRun` on the prior before clearing it. Admission-level tests
-pin only a dead PID (accepted) and a live PID (refused); the other outcomes (reused PID, unprobeable
-owner past or within the deadline, probe error, unknown age) are pinned at the `staleRedTeamRun` unit
-level, not through admission. **probe exceptions refuse recovery even past the deadline (%s)**
+pin a dead PID (accepted), a live PID (refused), and foreign hosts/namespaces past or within the
+deadline. **production admission handles %s using real foreign-owner evidence** requires verified
+abandonment and the fresh stale-recovery flag before overriding the drain's conservative in-flight
+hold. Unknown age, completed results, spent retries, queued writers, unknown evidence and changed
+status snapshots still refuse. The **fresh recovery launches an expired foreign host/namespace
+through production admission and the shared guard** cases exercise real abandonment and a model
+call through the job and shared seat. Other outcomes (reused PID and probe error) are pinned at the
+`staleRedTeamRun` unit level. **probe exceptions refuse recovery even past the deadline (%s)**
 throws from each of `isAlive` and `readPidStart` and requires refusal despite expired owner age.
 The execution guard
 refuses every still-running prior, including one marked abandoned: direct callers cannot

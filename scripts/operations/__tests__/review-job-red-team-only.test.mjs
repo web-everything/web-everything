@@ -653,10 +653,12 @@ describe('red-team-only review job', () => {
   });
   it.each([
     ['fresh recovery launches an abandoned stale running pass through production admission and the shared guard', true],
+    ['fresh recovery launches an expired foreign host through production admission and the shared guard', true, 'host'],
+    ['fresh recovery launches an expired foreign namespace through production admission and the shared guard', true, 'pidNamespace'],
     ['fresh recovery without the stale flag refuses an abandoned running prior and keeps it intact', undefined],
     ['fresh recovery with a false stale flag refuses an abandoned running prior and keeps it intact', false],
     ['fresh recovery with a non-boolean stale flag refuses an abandoned running prior and keeps it intact', 'true'],
-  ])('%s', (_name, redTeamStaleRecovery) => {
+  ])('%s', (_name, redTeamStaleRecovery, foreign) => {
     const dir = mkdtempSync(join(tmpdir(), 'red-team-abandoned-running-'));
     const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_DAEMON_EVENTS: join(dir, 'events.jsonl') };
     const loopPayload = { ...payload(), findings: { read: { netBasis: { rev: head },
@@ -678,9 +680,13 @@ describe('red-team-only review job', () => {
     try {
       recordRedTeamStatus({ repo, pr, loopPayload, status: 'running', result: null }, { env });
       const status = { ...read(), pid: 2147483647 };
+      if (foreign) {
+        status[foreign] = `foreign-${status[foreign]}`;
+        status.pidStart = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+      }
       writeJsonAtomic(join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`), status);
       expect(abandonStaleRedTeamRun({ repo, pr, head, env, status,
-        probe: { host: status.host, namespace: status.pidNamespace, isAlive: () => false } }).ok).toBe(true);
+        ...(foreign ? {} : { probe: { host: status.host, namespace: status.pidNamespace, isAlive: () => false } }) }).ok).toBe(true);
       expect(read()).toMatchObject({ status: 'running', result: null,
         staleAbandoned: { at: expect.any(String), pid: status.pid } });
 
@@ -701,6 +707,65 @@ describe('red-team-only review job', () => {
       expect(observed.calls.model).toBe(1);
       expect(observed.result.deferredByGuard).not.toBe(true);
       expect(admittedPrior).toBeNull();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    ['expired foreign host', { foreign: 'host', age: 3 * 60 * 60 * 1000 }, true],
+    ['expired foreign namespace', { foreign: 'pidNamespace', age: 3 * 60 * 60 * 1000 }, true],
+    ['foreign host within deadline', { foreign: 'host', age: 60 * 60 * 1000 }, false],
+    ['foreign namespace within deadline', { foreign: 'pidNamespace', age: 60 * 60 * 1000 }, false],
+    ['foreign owner with unknown age', { foreign: 'host', age: null }, false],
+    ['expired foreign owner without marker', { foreign: 'host', age: 3 * 60 * 60 * 1000, marker: false }, false],
+    ['expired foreign owner without flag', { foreign: 'host', age: 3 * 60 * 60 * 1000, flag: false }, false],
+    ['expired foreign queued owner', { foreign: 'host', age: 3 * 60 * 60 * 1000, status: 'queued' }, false],
+    ['expired foreign owner with result', { foreign: 'host', age: 3 * 60 * 60 * 1000, result: 'ran' }, false],
+    ['expired foreign owner with spent retry', { foreign: 'host', age: 3 * 60 * 60 * 1000, retryCount: 1 }, false],
+    ['expired foreign owner in resume mode', { foreign: 'host', age: 3 * 60 * 60 * 1000, mode: 'resume' }, false],
+    ['expired foreign owner with unknown evidence', { foreign: 'host', age: 3 * 60 * 60 * 1000, evidence: 'unknown' }, false],
+    ['expired foreign owner with missing evidence status', { foreign: 'host', age: 3 * 60 * 60 * 1000, evidence: 'missing status' }, false],
+    ['expired foreign owner with replaced evidence status', { foreign: 'host', age: 3 * 60 * 60 * 1000, evidence: 'replaced status' }, false],
+    ['expired foreign owner with queued evidence', { foreign: 'host', age: 3 * 60 * 60 * 1000, evidence: 'queued' }, false],
+  ])('production admission handles %s using real foreign-owner evidence', (_name, variant, admitted) => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-team-foreign-admission-'));
+    const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+    const path = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${pr}-${head}.json`);
+    const at = Date.now() - 1000;
+    try {
+      recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: variant.status ?? 'running',
+        result: variant.result ?? null }, { env });
+      const row = { ...readRedTeamStatus({ repo, pr, head, env }), pid: 2147483647,
+        pidStart: variant.age === null ? null : new Date(at - variant.age).toISOString(),
+        ...(variant.retryCount ? { retryCount: variant.retryCount } : {}),
+        staleAbandoned: { at: new Date(at).toISOString(), pid: 2147483647 } };
+      row[variant.foreign] = `foreign-${row[variant.foreign]}`;
+      writeJsonAtomic(path, row);
+      if (variant.marker !== false) {
+        writeFileSync(`${path}.stale-redispatch-1`, '');
+        utimesSync(`${path}.stale-redispatch-1`, at / 1000, at / 1000);
+      }
+      const productionEvidence = input => readDrainRedTeamEvidence({ ...input,
+        list: () => [], readScorecards: () => [], isAlive: () => { throw Error('foreign pid must not be probed locally'); } });
+      expect(productionEvidence({ repo, pr, head, env })).toMatchObject(variant.status === 'queued'
+        ? { queued: true } : { inFlight: true });
+      const readEvidence = input => {
+        const evidence = productionEvidence(input);
+        if (variant.evidence === 'unknown') return { ...evidence, inFlight: undefined };
+        if (variant.evidence === 'missing status') return { ...evidence, status: undefined };
+        if (variant.evidence === 'replaced status') return { ...evidence, status: { ...evidence.status, pid: process.pid } };
+        if (variant.evidence === 'queued') return { ...evidence, queued: true };
+        return evidence;
+      };
+      const io = createReviewJobIo({ env, readEvidence });
+      const admit = () => io.redTeamStatus({ repo, pr, loopPayload: payload(), status: 'queued',
+        redTeamMode: variant.mode ?? 'fresh', redTeamStaleRecovery: variant.flag !== false });
+      if (admitted) {
+        expect(admit()).toEqual({ priorResult: null, redTeamAdmission: { pid: process.pid, prior: null } });
+        expect(readRedTeamStatus({ repo, pr, head, env })).toMatchObject({ status: 'queued', pid: process.pid });
+      } else {
+        expect(admit).toThrow('red-team writer is live or unknown');
+        expect(readRedTeamStatus({ repo, pr, head, env })).toEqual(row);
+      }
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 

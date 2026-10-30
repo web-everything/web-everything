@@ -374,6 +374,9 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       try {
         if (queued) {
           prior = readStatus(key);
+          const staleRecovery = input.redTeamMode === 'fresh' && input.redTeamStaleRecovery === true
+            && verifiedStaleRedTeamAbandonment(key, prior)
+            && staleRedTeamRun({ status: prior, deadlineMs: staleRunDeadlineMs(env) }).stale;
           if (['queued', 'running'].includes(prior?.status)) {
             // A normal review may adopt its own speculative child; another live/unknown writer keeps the head.
             const ownSpeculation = Number.isInteger(input.speculativePid) && input.speculativePid > 0
@@ -381,7 +384,12 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
             if (!ownSpeculation) {
               if (!Number.isInteger(prior.pid) || prior.pid <= 0) throw Error('red-team writer is live or unknown');
               const evidence = readEvidence(key);
-              if (evidence?.inFlight !== false || ![undefined, false].includes(evidence.queued)) throw Error('red-team writer is live or unknown');
+              // Foreign owners remain in-flight to the drain. Only verified stale recovery may
+              // supersede that hold, and only if the evidence still describes this exact prior.
+              const staleInFlight = staleRecovery && evidence?.inFlight === true
+                && JSON.stringify(evidence.status) === JSON.stringify(prior);
+              if ((evidence?.inFlight !== false && !staleInFlight)
+                || ![undefined, false].includes(evidence.queued)) throw Error('red-team writer is live or unknown');
             }
           }
           // Carry the daemon's confirmed-dead queued/resumable normalization into
@@ -396,7 +404,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           // writer above. An ordinary finished/null prior must reach the guard intact.
           const retry = input.redTeamMode === 'fresh' && failedRedTeamRetry(admissionPrior, readEvidence(key));
           const withoutRun = redTeamStatusWithoutRun(admissionPrior, {
-            originalStatus: prior, allowAbandonedRunning: input.redTeamStaleRecovery === true
+            originalStatus: prior, allowAbandonedRunning: staleRecovery
               && verifiedStaleRedTeamAbandonment(key, admissionPrior)
               && staleRedTeamRun({ status: admissionPrior, deadlineMs: staleRunDeadlineMs(env) }).stale,
           });
