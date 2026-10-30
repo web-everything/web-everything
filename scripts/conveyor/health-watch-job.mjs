@@ -496,7 +496,7 @@ export async function runGhProbeJobs({
 
 /**
  * Run the probe group in a worker thread, so this process's event loop stays free to heartbeat. Rejects on a
- * worker error, a non-zero exit, or `timeoutMs` (the worker is terminated first).
+ * worker error, a non-zero exit, or `timeoutMs` plus at most 1s of shutdown grace.
  */
 export function runProbeWorker({ input, timeoutMs = GH_PROBE_TIMEOUT_MS, workerUrl = new URL(import.meta.url) }) {
   return new Promise((resolveRun, reject) => {
@@ -504,12 +504,17 @@ export function runProbeWorker({ input, timeoutMs = GH_PROBE_TIMEOUT_MS, workerU
     let settled = false;
     const done = (fn, v) => { if (settled) return; settled = true; clearTimeout(timer); fn(v); };
     const timer = setTimeout(() => {
-      // Reserve the timeout before termination emits 'exit', but wait for shutdown before rejecting.
-      // Otherwise the caller (including Vitest) can tear down its own worker with this one still exiting.
+      // Reserve the timeout before termination emits 'exit'. Normally await shutdown so callers
+      // can tear down safely, but a synchronous native call can hold terminate() open indefinitely.
       if (settled) return;
       settled = true;
       const error = new Error(`gh probe worker timed out after ${timeoutMs}ms`);
-      worker.terminate().then(() => reject(error), () => reject(error));
+      const terminationGraceTimer = setTimeout(() => {
+        worker.unref();
+        reject(error);
+      }, 1000);
+      const terminated = () => { clearTimeout(terminationGraceTimer); reject(error); };
+      Promise.resolve().then(() => worker.terminate()).then(terminated, terminated);
     }, timeoutMs);
     worker.once('message', (msg) => done(resolveRun, msg));
     worker.once('error', (e) => done(reject, e));
