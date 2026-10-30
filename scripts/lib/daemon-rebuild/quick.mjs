@@ -14,14 +14,9 @@ export const QUICK_SOAK_CHECKS = Object.freeze([...QUICK_DEFERRED_CHECKS, 'tree-
 /** The verifier's import graph spans the script runtime. Keep that entire trust base on full smoke. */
 export const QUICK_ALWAYS_FULL_PATHS = Object.freeze([
   'scripts/**',
-  'scripts/lib/daemon-rebuild/**',
-  'scripts/lib/daemon-rebuild*.mjs',
-  'scripts/lib/daemon-live-smoke.mjs',
-  'scripts/lib/daemon-boot-smoke.mjs',
-  'scripts/lib/daemon-last-good.mjs',
-  'scripts/lib/quick*.mjs',
-  ...DISPATCH_DRY_RUN_CODE_ENTRIES,
-  ...DISPATCH_PATH_DEFAULTS,
+  // Script entries are already covered; retain dispatch dependencies outside that tree.
+  ...DISPATCH_DRY_RUN_CODE_ENTRIES.filter(path => !path.startsWith('scripts/')),
+  ...DISPATCH_PATH_DEFAULTS.filter(path => !path.startsWith('scripts/')),
   LEGACY_SETTINGS_NAME, `**/${LEGACY_SETTINGS_NAME}`,
   'package.json', '**/package.json',
   'package-lock.json', '**/package-lock.json',
@@ -44,7 +39,11 @@ export function resolveQuick(env = process.env, { path = SETTINGS_PATH, platform
 
 const safePath = path => typeof path === 'string' && path.length > 0 && path.length <= 4096 && !path.startsWith('/')
   && !path.includes('\\') && !path.split('/').some(part => part === '..' || part === '.') && !/[\p{Cc}\p{Cf}]/u.test(path);
-const matches = (path, pattern) => {
+/** Conservative checkout identity, shared by policy and its per-pattern regression fixtures. */
+export const matchesQuickProtectedPath = (path, pattern) => {
+  const canonical = value => value.normalize('NFC').toLowerCase().normalize('NFC');
+  path = canonical(path);
+  pattern = canonical(pattern);
   const escaped = pattern.split('*').map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
   return new RegExp(`^${escaped.join('.*')}$`).test(path);
 };
@@ -55,7 +54,7 @@ export function decideQuick({ enabled = false, changedFiles } = {}) {
   if (!Array.isArray(changedFiles) || changedFiles.length > 10_000 || !changedFiles.every(safePath)) {
     return { quick: false, why: 'unknown or oversized change set — full smoke required' };
   }
-  const protectedPath = changedFiles.find(path => QUICK_ALWAYS_FULL_PATHS.some(pattern => matches(path, pattern)));
+  const protectedPath = changedFiles.find(path => QUICK_ALWAYS_FULL_PATHS.some(pattern => matchesQuickProtectedPath(path, pattern)));
   if (protectedPath) return { quick: false, why: `protected code changed: ${protectedPath}`, file: protectedPath };
   return { quick: true, why: 'two dry-run checks deferred to post-adopt soak' };
 }

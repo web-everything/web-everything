@@ -9,6 +9,7 @@ import { withWriteLock } from '../daemon-clone-lock.mjs';
 import {
   decideQuick, QUICK_ALWAYS_FULL_PATHS, QUICK_DEFERRED_CHECKS, quickFinalizeWaitMs,
   resolveQuick, QUICK_SOAK_CHECKS, QUICK_SOAK_MAX_MS,
+  matchesQuickProtectedPath,
 } from '../daemon-rebuild/quick.mjs';
 import {
   launchQuickSoak, recoverQuickSoak, recordQuickSoakResult, settleQuickSoak, runQuickSoak, handleQuickSoakFatal, QUICK_SOAK_JOB_KIND,
@@ -17,7 +18,7 @@ import { alertsFilePath, readReadyCandidate, readRebuildState, writeRebuildState
 import { completeSmokePass, smokeAndAdopt } from '../daemon-rebuild/smoke.mjs';
 import { finalizeRebuild } from '../daemon-rebuild/adopt.mjs';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
-import { rebuildClone } from '../daemon-rebuild/rebuild.mjs';
+import { FAILURE_REASONS, rebuildClone } from '../daemon-rebuild/rebuild.mjs';
 import { collectImportClosure } from '../import-closure.mjs';
 import { DISPATCH_PATH_DEFAULTS } from '../daemon-rebuild/dispatch-paths.mjs';
 import { DISPATCH_DRY_RUN_CODE_ENTRIES, SMOKE_CHECKS, rollbackToSha, runLiveSmoke, runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
@@ -32,8 +33,7 @@ const temp = () => { const dir = mkdtempSync(join(tmpdir(), 'we-quick-')); dirs.
 afterEach(() => { vi.restoreAllMocks(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const sha = 'a'.repeat(40);
 const prevHead = 'b'.repeat(40);
-const closure = { complete: true, bareDeps: true, jsonNames: new Set(['dispatch-settings.json']), files: new Set([...DISPATCH_DRY_RUN_CODE_ENTRIES, 'scripts/lib/red-main-hold.mjs']) };
-const decision = (changedFiles, extra = {}) => decideQuick({ enabled: true, changedFiles, dispatchClosure: closure, ...extra });
+const decision = (changedFiles, extra = {}) => decideQuick({ enabled: true, changedFiles, ...extra });
 
 describe('quick mode policy (default OFF)', () => {
   it('shipped quick settings default off without an environment override', () => {
@@ -87,22 +87,52 @@ describe('quick mode policy (default OFF)', () => {
   ])('always uses full smoke for dispatch/smoke/rebuild code: %s', path => {
     expect(decision([path])).toMatchObject({ quick: false, why: expect.stringContaining('protected') });
   });
-  it.each(['package.json', 'package-lock.json', 'nested/package-lock.json',
+  it.each(['package.json', 'nested/package.json', 'package-lock.json', 'nested/package-lock.json',
     'dispatch-settings.json', 'scripts/dispatch-settings.json', 'nested/config/dispatch-settings.json'])(
     'always uses full smoke for dispatch package/config dependency: %s', path => {
       expect(decision([path])).toMatchObject({ quick: false, why: expect.stringContaining('protected') });
     });
-  it.each([null, { complete: false }, { complete: true, files: [] },
-    { ...closure, bareDeps: undefined, jsonNames: undefined }])(
-    'does not consult unknown or incomplete dispatch closure evidence: %j', dispatchClosure => {
-      expect(decision(['src/dispatch-only.mjs'], { dispatchClosure }).quick).toBe(true);
-      expect(decision([DISPATCH_DRY_RUN_CODE_ENTRIES[0]], { dispatchClosure }).quick).toBe(false);
-    });
-  it('requires full smoke for a transitive verifier dependency even with complete dispatch closure evidence', () => {
+  it('requires full smoke for a transitive verifier dependency', () => {
     expect(decision(['scripts/lib/red-main-hold.mjs']).quick).toBe(false);
   });
-  it('exports a single protected path list including the dispatch entries and shared dispatch core paths', () => {
-    expect(QUICK_ALWAYS_FULL_PATHS).toEqual(expect.arrayContaining([...DISPATCH_DRY_RUN_CODE_ENTRIES, ...DISPATCH_PATH_DEFAULTS]));
+  it.each(QUICK_ALWAYS_FULL_PATHS)('protected pattern has an independently covered path: %s', pattern => {
+    const path = pattern.replaceAll('**/', 'nested/').replaceAll('*', 'fixture');
+    expect(decision([path])).toMatchObject({ quick: false, file: path });
+    // Removing this pattern would expose its witness; scripts/** cannot mask these tests.
+    expect(QUICK_ALWAYS_FULL_PATHS.filter(other => matchesQuickProtectedPath(path, other))).toEqual([pattern]);
+  });
+  it.each([
+    'Scripts/lib/daemon-live-smoke.mjs', 'SCRIPTS/lib/daemon-rebuild/quick.mjs',
+    'Skills-Src/Conveyor/Review-Daemon.mjs', 'Skills-Src/Conveyor/Dispatched-Agent-System-Prompt.md',
+    'Dispatch-Settings.JSON', 'nested/Dispatch-Settings.JSON', 'PACKAGE.JSON', 'nested/Package-Lock.JSON',
+  ])('normalizes protected path case while retaining the original diagnostic: %s', path => {
+    expect(decision([path])).toEqual({ quick: false, file: path, why: `protected code changed: ${path}` });
+  });
+  it.each(['caf\u00e9', 'cafe\u0301'])('NFC-normalizes both paths and protected patterns: %s', name => {
+    // Current protected names are ASCII; exercise canonical equivalence for future Unicode entries.
+    expect(matchesQuickProtectedPath(`SKILLS-SRC/${name}/entry.mjs`, 'skills-src/caf\u00e9/*')).toBe(true);
+    expect(matchesQuickProtectedPath('skills-src/caf\u00e9/entry.mjs', `SKILLS-SRC/${name}/*`)).toBe(true);
+    expect(matchesQuickProtectedPath('skills-src/cafe/entry.mjs', `skills-src/${name}/*`)).toBe(false);
+  });
+  it.each(['quick-soak-failed', 'quick-soak-unavailable', 'quick-soak-rollback-failed',
+    'quick-soak-failed: checks rejected'])(
+    'classifies a quick soak failure as a rebuild-failed event: %s', async reason => {
+      const f = soakFixture();
+      const emitEvent = vi.fn();
+      vi.mocked(withWriteLock).mockResolvedValueOnce({ ok: true,
+        value: { terminal: true, result: { moved: false, reason }, alerts: [] } });
+      expect(await rebuildClone({ ...f, asJob: false, versions: null, skipCheck: null, emitEvent }))
+        .toMatchObject({ moved: false, reason });
+      expect(emitEvent).toHaveBeenCalledTimes(1);
+      expect(emitEvent).toHaveBeenCalledWith(expect.objectContaining({
+        kind: 'rebuild-failed', detail: { reason },
+      }), expect.any(Object));
+  });
+  it('keeps the failure inventory sorted and excludes nested soak diagnostics and the bare prefix', () => {
+    expect([...FAILURE_REASONS]).toEqual([...FAILURE_REASONS].sort());
+    for (const reason of ['quick-soak-', 'adopted-head-changed-or-unreadable', 'worker-dead-missing-or-expired',
+      'worker-launch-failed', 'soak-could-not-run', 'soak-deadline', 'worker-fatal', 'rollback-threw',
+      'untracked-list-failed', 'target-list-failed']) expect(FAILURE_REASONS.has(reason)).toBe(false);
   });
   it('fails closed on unknown/incomplete diff evidence, with a full-path explanation', () => {
     for (const changedFiles of [null, ['../escape'], [null], new Array(10_001).fill('a')]) {
@@ -165,6 +195,33 @@ function soakFixture() {
   return { root, env, marker, state, run, alerts };
 }
 describe('post-adopt soak', () => {
+  it.each([
+    ['passed', false], ['failed', false], ['unavailable', false], ['unavailable', true],
+  ])('publication lock timeout for %s (existing unavailable: %s) preserves evidence and permits recovery', (outcome, existing) => {
+    const f = soakFixture();
+    if (existing) recordQuickSoakResult({ ...f, outcome: 'unavailable', reason: 'soak-deadline' });
+    let resultFile;
+    let previous;
+    const io = { link: vi.fn(linkSync), rename: vi.fn(renameSync), write: (path, data, options) => {
+      writeFileSync(path, data, options);
+      resultFile = path.replace(/\.\d+\.[^.]+\.tmp$/, '');
+      expect(resultFile).not.toBe(path);
+      previous = existsSync(resultFile) ? readFileSync(resultFile, 'utf8') : null;
+      // A live holder prevents stale takeover; timeoutMs=0 exercises the real lock helper without waiting.
+      writeFileSync(`${resultFile}.lock`, `${process.pid}\n`, { flag: 'wx' });
+    } };
+    expect(() => recordQuickSoakResult({ ...f, outcome, reason: 'worker-fatal', error: 'worker failed',
+      io, resultLockOptions: { timeoutMs: 0 } })).toThrow('withFileLock: timed out waiting for');
+    expect(io.link).not.toHaveBeenCalled();
+    expect(io.rename).not.toHaveBeenCalled();
+    expect(existsSync(resultFile) ? readFileSync(resultFile, 'utf8') : null).toBe(previous);
+    expect(readFileSync(`${resultFile}.lock`, 'utf8')).toBe(`${process.pid}\n`);
+    expect(readdirSync(f.env.WE_DAEMON_STATE_DIR).some(name => name.endsWith('.tmp'))).toBe(false);
+    expect(readRebuildState(f.root, f.env).unverified).toEqual(f.marker);
+    recoverQuickSoak({ ...f, pidAlive: () => false });
+    expect(readRebuildState(f.root, f.env).unverified).toBeNull();
+    expect(f.alerts().at(-1).kind).toBe('quick-soak-unavailable');
+  });
   it('read barrier retries contention and runs the checks on its second attempt', async () => {
     const f = soakFixture();
     const smoke = vi.fn(async () => ({ pass: true, results: QUICK_SOAK_CHECKS.map(name => ({ name, ok: true })) }));

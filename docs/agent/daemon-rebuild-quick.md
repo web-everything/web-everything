@@ -9,7 +9,9 @@ through the policy cascade; `WE_DAEMON_REBUILD_QUICK=1|0` overrides it. Quick ca
 60-second finalize wait unless `WE_DAEMON_FINALIZE_LOCK_WAIT_MS` overrides it. The pure policy and
 protected path list live in `scripts/lib/daemon-rebuild/quick.mjs`. Unknown, malformed or oversized
 change sets select full smoke. All `scripts/**` changes, dispatch settings and package manifests/locks
-always select full smoke. The soak and rollback verifier transitively import much of the script runtime;
+always select full smoke. Protected paths match case-insensitively after NFC normalization, preserving
+the original changed path in diagnostics. The soak and rollback verifier transitively import much of
+the script runtime;
 protect that trust base before adoption. A closure regression requires every local verifier import to
 match the protected set. Each rebuild logs one `daemon-rebuild: quick=on|off reason=...` line and records a
 `quick-decision` alert, including the triggering protected file or disabled setting provenance.
@@ -32,8 +34,9 @@ publication. A diagnostic-bearing unavailable result may replace an unavailable 
 token/SHA by rename; completed results, corrupt records and foreign identities block that upgrade.
 A later bare timeout preserves existing diagnostics. Lock acquisition times out with an error after
 the shared helper's five-second bound; fatal handling or next-tick dead-worker recovery is the fallback.
-Race fixtures interleave at the temporary result write, before the mutex is acquired: `mkdirSync`
-also runs during clone-key resolution and does not reliably mark the publication boundary.
+Race fixtures interleave inside the mutex at the injected `io.link` / `io.rename` publication calls.
+They assert the lock exists there; `mkdirSync` also runs during clone-key resolution and does not
+reliably mark the publication boundary.
 Quick quarantine retries and interrupted-adoption recovery use the same untracked-aware guarded rollback
 as soak settlement; ignored files and ancestor-path collisions must survive recovery with quarantine and a needs-you page.
 Quarantine records retain `failedHead`; recovery resets only that exact HEAD. A different or unreadable
@@ -69,8 +72,9 @@ untracked dirt, and tracked changes always refuse. Keep the real-Git sidecar-pre
 The untracked exception must reject collisions with the rollback target, including a sidecar at
 an exact target path, a file obstructing a target directory, or a directory obstructing a target
 file. Include ignored files in the collision inventory, collapsing wholly untracked directories to
-keep dependency trees below the 1 MiB subprocess bound. Compare NFC-normalized, lowercased paths
-conservatively on every platform. The named real-Git collision regressions
+keep dependency trees below the 64 MiB `ROLLBACK_PATH_LIST_MAX_BYTES` subprocess bound. Compare
+NFC-normalized, lowercased paths conservatively on every platform. The named real-Git collision regressions
 assert refusal, unchanged HEAD, preservation of binary sidecar bytes, quarantine and paging.
-Failed, missing, truncated or oversized path inventories refuse rollback as `status-failed`;
-keep the named evidence-refusal cases alongside the preservation cases.
+Failed, missing, truncated or oversized path inventories refuse rollback as `untracked-list-failed`
+or `target-list-failed`, according to the inventory; only the status read returns `status-failed`.
+Keep the named evidence-refusal cases alongside the preservation cases.

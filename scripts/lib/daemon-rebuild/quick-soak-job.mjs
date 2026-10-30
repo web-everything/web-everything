@@ -132,7 +132,7 @@ export function settleQuickSoak({ root, env = process.env, marker, outcome, reas
 
 /** Atomic result handoff, outside the live tree. Consumers require the adoption's token AND sha. */
 export function recordQuickSoakResult({ root, env, marker, outcome, reason, error,
-  io = { link: linkSync, rename: renameSync, write: writeFileSync } }) {
+  io = { link: linkSync, rename: renameSync, write: writeFileSync }, resultLockOptions }) {
   // A launcher/watchdog failure is weaker evidence than checks that already completed.
   if (outcome === 'unavailable') {
     const recorded = readQuickSoakResult(root, env, marker);
@@ -160,7 +160,7 @@ export function recordQuickSoakResult({ root, env, marker, outcome, reason, erro
         // Completed checks may atomically supersede an earlier unavailable result.
         io.rename(tmp, file);
       }
-    });
+    }, resultLockOptions);
   } finally {
     try { unlinkSync(tmp); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
