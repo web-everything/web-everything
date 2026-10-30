@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { withReviewFetchTick } from '../../scripts/lib/review-fetch.mjs';
 /**
  * @file skills-src/conveyor/review-daemon.mjs
  * @description #3876 (epic #3383) — the standalone Review daemon: reconcile-pass.mjs (discovery) +
@@ -620,6 +621,7 @@ export function runReviewTick({
     if (!hold) continue;
     try {
       notifyReferral({ repo, prNumber: row.prNumber, hold,
+        pr: (rawPrs ?? []).find(p => Number(p.number) === row.prNumber),
         comments: (rawPrs ?? []).find(p => Number(p.number) === row.prNumber)?.comments ?? [] });
     } catch (e) {
       failed.push({ prNumber: row.prNumber, error: `pause notice: ${String(e.message ?? e).split('\n')[0]}` });
@@ -1644,7 +1646,7 @@ export function buildCliDaemonEffects({
   let priorityNames = new Set();
   return {
     intervalMs,
-    tickOnce: async () => {
+    tickOnce: () => withReviewFetchTick(async () => {
       const started = Date.now();
       const sharing = resolveReviewTickSharing();
       const plans = new Map();
@@ -1716,7 +1718,7 @@ export function buildCliDaemonEffects({
         log.error(`review-daemon: pass timings total ${seconds(Date.now() - started)} — reap ${seconds(phaseMs.reap)}, facts ${seconds(phaseMs.facts)}, review ${seconds(phaseMs.review)} (${repos}), convert ${seconds(phaseMs.convert)}, prep ${seconds(phaseMs.prep)} · reusePlan=${sharing.reusePlan} (source ${sharing.source.reusePlan}) repoConcurrency=${sharing.repoConcurrency} (source ${sharing.source.repoConcurrency})`);
       }
       return { ...result, sessionReap, convertAdvisory, prepReview };
-    },
+    }),
     sleep: realSleep,
     heartbeat: () => heartbeatRunnerLease(RUNNER_LOCK_ROOT, owner, { key: REVIEW_DAEMON_LEASE_KEY }),
     onTick: (result) => {

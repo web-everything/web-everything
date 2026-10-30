@@ -5,7 +5,11 @@
  * through. See `we:scripts/lib/approval-prevention-notice.mjs`'s header for the decision this exercises, and
  * `we:scripts/review-set-label.mjs`'s own `runApprovalPreventionFiling` for the wiring.
  */
-import { describe, it, expect, afterAll } from 'vitest';
+import { describe, it, expect, afterAll, beforeEach, afterEach, vi } from 'vitest';
+
+// The existing spawn/landing contracts run with filing enabled, independently of the prototype pause.
+beforeEach(() => vi.stubEnv('WE_PREVENTION_FILING_ENABLED', 'true'));
+afterEach(() => vi.unstubAllEnvs());
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';

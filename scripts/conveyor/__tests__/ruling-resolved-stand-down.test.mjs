@@ -31,6 +31,21 @@ function fixture({ second = false, file = 'scripts/y.mjs', actor = 'chalbert', r
         findingRefs: bound && reason === 'needs-judgment' ? [{ runId, key: referrals[0].key }] : undefined })),
       comment(3, buildOperatorRulingComment(record), actor === 'auto-policy' ? 'web-everything' : actor)] };
 }
+it.each([
+  ['chalbert/web-everything', 'web-everything/web-everything', true],
+  ['web-everything/web-everything', 'chalbert/web-everything', true],
+  ['web-everything/web-everything', 'other/repo', false],
+])('operator block keeps stand-down held across %s / %s', (subjectRepo, rulingRepo, matches) => {
+  const pr = fixture();
+  const rec = readReferralRecords(pr.comments).records[0];
+  pr.comments[0].body = renderReferralRecord({ ...rec, repo: subjectRepo });
+  const ruling = parseOperatorRulingComment(pr.comments[2]).record;
+  pr.comments[2].body = buildOperatorRulingComment({ ...ruling, repo: rulingRepo,
+    rulings: ruling.rulings.map(r => ({ ...r, result: 'block' })) });
+  const plan = planRulingResolvedStandDown(pr, { repo: subjectRepo });
+  if (matches) expect(plan).toMatchObject({ action: 'held', remaining: [{ state: 'blocked' }] });
+  else expect(plan).toBeNull();
+});
 it('resolves the stand-down, keeps the human gate and publishes a readable answer', () => {
   const pr = fixture(), plan = planRulingResolvedStandDown(pr, { repo });
   expect(plan).toMatchObject({ action: 'resolve', standDownId: 2, head, actor: 'chalbert' });
