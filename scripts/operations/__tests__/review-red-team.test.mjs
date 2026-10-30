@@ -89,6 +89,43 @@ function fakeIo(over = {}) {
   return { io, calls, rows, trials };
 }
 
+describe('failed red-team executions (#6096)', () => {
+  it.each(['quota', 'daily cap'])('a failed seat still defers another call under its %s', async limit => {
+    const { io, rows, calls } = fakeIo({ cliAvailable: provider => provider === 'codex',
+      runSeat: async () => limit === 'quota'
+        ? { report: { quotaState: 'exhausted', quotaResetsAt: NOW + 60 * 60_000 }, error: 'quota exhausted' }
+        : { report: null, error: 'provider unavailable' } });
+    io.readRecords = () => rows;
+    const append = io.append;
+    io.append = row => append({ ...row, scoredAt: new Date(NOW).toISOString() });
+    const input = { pr: 5, repo: REPO, loopPayload: payload('accept'),
+      env: { WE_REVIEW_SEAT_CAP_CODEX: limit === 'daily cap' ? '1' : '100' } };
+    expect((await runRedTeam(input, io)).status).toBe('failed');
+    const result = await runRedTeam(input, io);
+    expect(result).toMatchObject({ status: 'skipped', deferredByCap: true });
+    expect(result.reason).toContain(limit === 'quota' ? 'quota exhausted' : 'daily-cap:');
+    expect(calls.filter(call => call[0] === 'reserve')).toHaveLength(1);
+    expect(rows).toHaveLength(1);
+  });
+
+  it.each([
+    [{ report: null, error: 'provider unavailable' }, 'error', 'provider unavailable'],
+    [{ report: null, timedOut: true }, 'timeout', 'seat call hit its wall'],
+    [{ report: { quotaState: 'exhausted' }, error: 'quota exhausted' }, 'quota-exhausted', 'quota exhausted'],
+  ])('returns failed with the seat reason and retains budget evidence: %s', async (run, status, reason) => {
+    const redTeamStatus = vi.fn();
+    const { io, rows, calls, trials } = fakeIo({ redTeamStatus, runSeat: async () => run });
+    const result = await runRedTeam({ pr: 5, repo: REPO, loopPayload: payload('accept'), env: {} }, io);
+    expect(result).toMatchObject({ status: 'failed', reason, foldedVerdict: 'needs-human', rowsWritten: 1 });
+    expect(redTeamStatus).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'finished', result: 'failed' }));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ status, error: reason, rev: REV });
+    expect(result.findings).toEqual([]);
+    expect(trials).toEqual([]);
+    expect(calls.some(c => ['post', 'recheck'].includes(c[0]))).toBe(false);
+  });
+});
+
 describe('speculative red-team repository isolation', () => {
   it.each([REPO, 'other/repo', undefined])('only a clean row from the target repository supersedes a pass: %s', async rowRepo => {
     const { io, calls, rows } = fakeIo();
