@@ -1257,6 +1257,19 @@ temporary git repo to verify gate arguments and green/red handling without recur
 suite. Exercise real subprocesses and git transport. Emit gate chatter in the fixture too: a CLI's
 machine-readable JSON stdout must remain parseable when its child gate prints output.
 
+Keep real-Git fixtures compatible with Forge's Git 2.43. An unsupported repository extension can
+prevent even read-only repository commands: inspect configuration with `git config --file`, and
+prove refusal by comparing filesystem bytes. Git's fetch negotiation may avoid a stale commit-graph,
+so verify an existing graph explicitly when testing corruption admission and repair. An `ls-files`
+exit 1 alone does not prove an untracked path: sparse-tree read failures can share that exit status.
+For a narrowed catch, keep one negative test per independent condition: the expected status with
+an unrelated diagnostic, and the expected diagnostic with another status. Fail-closed hook checks
+also need nonempty stdout and extra or partial stderr cases, in both reporting and repair modes.
+A test promising "only" or "never" must exercise the excluded case as well as the permitted one;
+assert the absence of retries or writes, not just the returned error.
+Send repository-sized path lists through NUL-delimited stdin, not argv; real-Git regressions should
+exceed the host's `getconf ARG_MAX` and prove the argv form fails with `E2BIG` while stdin succeeds.
+
 ### Passive-wait hook regression probes
 
 Test Stop/SubagentStop with distinct parent and subagent JSONL files: SubagentStop prefers
@@ -1411,6 +1424,11 @@ Real Git fixtures must pass `-c gc.auto=0 -c maintenance.auto=false` on their Gi
 A large seed commit can launch detached maintenance/repack that outlives `execFileSync`, racing
 recursive snapshots and cleanup. Apply the same flags to bounded production freshness fetches;
 do not hide the race with sleeps, cleanup retries, or exclusions from the snapshot.
+
+Git path safety tests must preserve raw command-output bytes until UTF-8 round-trip validation;
+include invalid filename bytes as well as a valid U+FFFD name. For generated safety attributes,
+probe the effective value with `git check-attr`, and test encoded line lengths near Git 2.43's
+2048-byte limit. An ignored override must refuse the merge before Git can allocate conflict markers.
 
 1. Test behavior, not implementation.
 2. One concept per test; descriptive names (`should notify listeners on setItem`).
