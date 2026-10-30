@@ -124,10 +124,11 @@ describe('fast Git manifest',()=>{
     if(fault==='symlink')await expect(buildDeltaManifest({cwd,exec:hidden,base})).rejects.toThrow('Unsafe inventory component');
     else {const spy=readSpy();await compare({exec:hidden,fs:spy.fs});expect(readNames(spy.readFile)).toEqual(['keep.txt']);}
   });
-  it.each(['filter','index flag'])('hashes same-size Git-clean changes hidden by %s',async kind=>{
-    if(kind==='filter') {
-      await write('.gitattributes','keep.txt filter=fixture\n');
-      await git(['config','filter.fixture.clean','printf keep']);
+  it.each(['filter','filter named unset','index flag'])('hashes same-size Git-clean changes hidden by %s',async kind=>{
+    if(kind==='filter'||kind==='filter named unset') {
+      const driver=kind==='filter'?'fixture':'unset';
+      await write('.gitattributes',`keep.txt filter=${driver}\n`);
+      await git(['config',`filter.${driver}.clean`,'printf keep']);
       await git(['add','.']);await commit();
     } else await git(['update-index','--assume-unchanged','keep.txt']);
     await write('keep.txt','diff');

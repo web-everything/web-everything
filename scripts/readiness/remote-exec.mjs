@@ -357,7 +357,8 @@ export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,bas
     if(attributes.length%3)throw new Error('Incomplete Git attributes');
     const sensitive=new Set(['filter','working-tree-encoding','ident','text','eol']);
     for(let i=0;i<attributes.length;i+=3) {
-      if(sensitive.has(attributes[i+1].toString('latin1'))&&!['unspecified','unset'].includes(attributes[i+2].toString('latin1')))changed.add(attributes[i].toString('hex'));
+      // A driver may literally be named 'unset'/'set'; any listed attribute is treated as active.
+      if(sensitive.has(attributes[i+1].toString('latin1')))changed.add(attributes[i].toString('hex'));
     }
     for(const record of splitPaths(await git(['ls-files','-f','-v','-z']))) {
       if(record.length<3||record[1]!==32)throw new Error('Invalid Git index flags');
