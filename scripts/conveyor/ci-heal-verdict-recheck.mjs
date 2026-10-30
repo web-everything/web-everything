@@ -109,10 +109,13 @@ const timestampValue = value => {
   return Date.parse(value);
 };
 
-const rollupTime = row => {
+// A time more than a day past the reader's clock cannot be real evidence, so a
+// status poster cannot pin a far-future success above every later failure.
+const FUTURE_SKEW_MS = 24 * 60 * 60 * 1000;
+const rollupTime = (row, now) => {
   for (const key of ['completedAt', 'completed_at', 'startedAt', 'started_at', 'createdAt', 'created_at']) {
     const time = timestampValue(row?.[key]);
-    if (Number.isFinite(time) && time > Date.parse('2000-01-01T00:00:00Z')) return time;
+    if (Number.isFinite(time) && time > Date.parse('2000-01-01T00:00:00Z') && time <= now + FUTURE_SKEW_MS) return time;
   }
   const state = classifyCheck({ ...normalizeRollupCheck(row), required: true });
   return state === 'pending' || state === 'red' ? Infinity : -Infinity;
@@ -123,8 +126,9 @@ const rollupTime = row => {
  * Workflow attempt counters are scoped to different runs, so cannot rank this feed.
  * Keep S1's integer-pair contract intact: filter by time, then let latestAttempts
  * compare ids and resolve ambiguous ties using the shared fail-closed policy.
+ * `now` (ms) only bounds future timestamps; inject it for hermetic tests.
  */
-export function latestRollupAttempts(rollup) {
+export function latestRollupAttempts(rollup, { now = Date.now() } = {}) {
   const rows = Array.isArray(rollup) ? rollup : [];
   const groups = new Map();
   for (const row of rows) {
@@ -135,7 +139,7 @@ export function latestRollupAttempts(rollup) {
   return [...groups.values()].flatMap(group => {
     const pool = ['CheckRun', 'untagged', 'StatusContext']
       .map(kind => group.filter(row => rollupRowKind(row) === kind)).find(tier => tier.length);
-    const timed = pool.map(row => ({ row, time: rollupTime(row) }));
+    const timed = pool.map(row => ({ row, time: rollupTime(row, now) }));
     const newest = timed.reduce((best, item) => Math.max(best, item.time), -Infinity);
     const originals = new Map(timed.filter(item => item.time === newest)
       .map(({ row }) => [{ ...normalizeRollupCheck(row), run_attempt: 0 }, row]));

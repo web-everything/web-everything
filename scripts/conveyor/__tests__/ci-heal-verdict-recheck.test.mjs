@@ -408,6 +408,7 @@ describe('requiredCheckStates shared predicate regressions', () => {
     ['bare-number strings', { completedAt: '12', startedAt: '1', createdAt: '2026' }],
     ['numeric values', { completedAt: 0, started_at: 1793192400000 }],
     ['zone-less and impossible dates', { completedAt: '2026-10-28T02:00:00', startedAt: '2026-02-31T02:00:00Z' }],
+    ['far-future times', { completedAt: '9999-12-31T23:59:59Z', startedAt: new Date(Date.now() + 2 * 86400000).toISOString() }],
   ];
   const tierRow = (kind, { conclusion, ...rest }) => kind === 'StatusContext'
     ? { __typename: kind, context: 'test', state: conclusion, ...rest }
@@ -464,6 +465,19 @@ describe('requiredCheckStates shared predicate regressions', () => {
       }
     },
   );
+
+  it('a timestamp more than a day past the injected clock counts as absent; within a day it ranks', () => {
+    const now = Date.parse('2026-10-28T12:00:00Z');
+    const failure = { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T11:00:00Z' };
+    for (const [completedAt, winner] of [
+      ['2026-10-29T11:59:59Z', 'SUCCESS'], ['2026-10-29T12:00:00Z', 'SUCCESS'], ['2026-10-29T12:00:01Z', 'FAILURE'],
+    ]) {
+      const success = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt };
+      for (const rollup of [[failure, success], [success, failure]]) {
+        expect(verdictRecheck.latestRollupAttempts(rollup, { now }).map(row => row.conclusion)).toEqual([winner]);
+      }
+    }
+  });
 
   it('undated success under a dated success stays green in both input orders', async () => {
     await assertUndatedPair({ dated: 'SUCCESS', undated: 'SUCCESS', bucket: 'green' });

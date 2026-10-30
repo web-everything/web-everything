@@ -2945,7 +2945,7 @@ Check names and required rosters match exactly, including case, as in the drain'
 Only status and conclusion values are case-insensitive; CodeQL and hold-gate names retain their exact identity.
 Rank rollup evidence with `scripts/conveyor/ci-heal-verdict-recheck.mjs#latestRollupAttempts`: completion time
 (only a zoned ISO-8601 string with a real calendar date counts; numbers, bare-number strings such as
-`"0"`, zone-less, impossible and pre-2000/epoch values count as absent, since `Date.parse` alone reads
+`"0"`, zone-less, impossible, pre-2000/epoch and more-than-a-day-in-the-future values count as absent, since `Date.parse` alone reads
 `"0"` as a local-time year-2000 date), else valid start time, else valid creation time
 (`created_at`/`createdAt`), then BigInt-exact check-run id. A row with no valid timestamp after these
 fallbacks ranks newest (effective time `+Infinity`) whenever the shared predicate classifies it
