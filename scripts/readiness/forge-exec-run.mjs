@@ -8,7 +8,7 @@ import {createHash, randomBytes} from 'node:crypto';
 import {join, relative} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {cpus, loadavg, freemem, totalmem} from 'node:os';
-import {baseGuard, readyBases, readBase, copyLeaves, baseFile} from './forge-exec-bases.mjs';
+import {baseGuard, readyBases, readBase, copyLeaves, baseFile, materializeWorktree} from './forge-exec-bases.mjs';
 import {decodeManifest} from './forge-exec-manifest.mjs';
 const LIMIT = 4 * 1024 * 1024;
 const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
@@ -32,6 +32,8 @@ export const VITEST_ALLOWED_OPTIONS = Object.freeze([
 ]);
 export function allowedCommand(argv) {
   if (!(Array.isArray(argv) && argv.length >= 3 && argv.every(a => typeof a === 'string' && !a.includes('\0')))) return false;
+  if(argv[0]==='npm' && argv[1]==='run' && argv[2]==='check:standards')
+    return argv.length===3 || (argv[3]==='--' && argv.slice(4).every(arg=>arg==='--local'||/^--files=[^\x00-\x1f]+$/.test(arg)));
   const npm = argv[0] === 'npm' && argv[1] === 'run'
     && ['test:unit','test:integration:vitest','test:coverage'].includes(argv[2])
     && (argv.length === 3 || argv[3] === '--');
@@ -65,6 +67,7 @@ export function allowedCommand(argv) {
 // The original test:unit class retains its installed npm-script contract.
 export function executionArgv(argv) {
   if (!allowedCommand(argv)) throw new Error('Invalid execution parameters');
+  if(argv[2]==='check:standards')return ['npm','run','check:standards',...argv.slice(3)];
   if (argv[0] === 'npm' && argv[2] === 'test:unit') return ['npm','run','test:unit',...argv.slice(3)];
   const options=argv.slice(argv[0] === 'npm' ? 4 : 3);
   return ['node','node_modules/vitest/vitest.mjs',argv[0] === 'npx' ? argv[2] : 'run',
@@ -105,11 +108,11 @@ export function allowedEnv(env) {
     ENV_KEYS.includes(key) && !/secret|token|password|credential|auth|key/i.test(key)
     && typeof value === 'string' && !value.includes('\0'));
 }
-async function directory(path, trusted = false) {
+async function directory(path, trusted = false, operator = {uid:process.getuid(),gid:process.getgid()}) {
   const fd = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   const info = await fd.stat();
   await fd.close();
-  if (!info.isDirectory() || (trusted && ((info.uid !== process.getuid() && info.uid !== 0) || (info.mode & 0o002) || ((info.mode & 0o020) && info.gid !== process.getgid())))) throw new Error('Untrusted directory');
+  if (!info.isDirectory() || (trusted && ((info.uid !== operator.uid && info.uid !== 0) || (info.mode & 0o002) || ((info.mode & 0o020) && info.gid !== operator.gid)))) throw new Error('Untrusted directory');
 }
 async function readPinned(path) {
   const fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -156,8 +159,10 @@ export async function readManifestFile(path, st, fs = filesystem) {
 }
 
 export async function verifyManifest(root, manifest, manifestDigest, {fs = filesystem, sibling = false} = {}) {
-  const keys = manifest && Object.keys(manifest).sort().join(',');
-  if (!manifest || !['excluded,executable,hashes,paths', ...(!sibling ? ['excluded,executable,hashes,paths,siblings'] : [])].includes(keys)
+  const {git,...content}=manifest??{};
+  if(git!==undefined && (sibling || !git || Object.keys(git).join(',')!=='head' || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(git.head)))throw new Error('Invalid Git evidence');
+  const keys = manifest && Object.keys(content).sort().join(',');
+  if (!manifest || manifest.v!==2 || !['excluded,executable,hashes,paths,tracked,v', ...(!sibling ? ['excluded,executable,hashes,paths,siblings,tracked,v'] : [])].includes(keys)
     || !hex(manifestDigest) || Buffer.byteLength(JSON.stringify(manifest)) > LIMIT
     || digestManifest(manifest) !== manifestDigest) throw new Error('Manifest digest mismatch or limit exceeded; use local fallback');
   const decode = value => {
@@ -169,13 +174,14 @@ export async function verifyManifest(root, manifest, manifestDigest, {fs = files
     return paths;
   };
   const paths = decode(manifest.paths), excluded = decode(manifest.excluded);
-  if (!Array.isArray(manifest.hashes) || !Array.isArray(manifest.executable)
-    || manifest.hashes.length !== paths.length || manifest.executable.length !== paths.length
-    || !manifest.hashes.every(hex) || !manifest.executable.every(v => typeof v === 'boolean')) throw new Error('Invalid manifest hashes or executable bits');
+  if (!Array.isArray(manifest.hashes) || !Array.isArray(manifest.executable) || !Array.isArray(manifest.tracked)
+    || manifest.hashes.length !== paths.length || manifest.executable.length !== paths.length || manifest.tracked.length !== paths.length
+    || !manifest.hashes.every(hex) || !manifest.executable.every(v => typeof v === 'boolean')
+    || !manifest.tracked.every(v => typeof v === 'boolean')) throw new Error('Invalid manifest hashes, executable bits or tracking evidence');
   validateTestNames(paths);
   if (sibling && [...paths,...excluded].some(path => !siblingPrefixes.some(prefix => path.subarray(0,prefix.length).equals(prefix))))
     throw new Error('Unsupported sibling manifest path');
-  const expected = new Map(paths.map((path, i) => [path.toString('hex'), {path, sha256:manifest.hashes[i], executable:manifest.executable[i]}]));
+  const expected = new Map(paths.map((path, i) => [path.toString('hex'), {path, sha256:manifest.hashes[i], executable:manifest.executable[i],tracked:manifest.tracked[i]}]));
   for (const path of excluded) if (expected.has(path.toString('hex')) || isTestFile(path) || /\.(test|spec)\./.test(pathParts(path).at(-1).toString('latin1')))
     throw new Error('Manifest excluded test or overlapping path');
   const parents = new Set();
@@ -215,7 +221,7 @@ export async function verifyManifest(root, manifest, manifestDigest, {fs = files
   if (Object.hasOwn(manifest,'siblings')) {
     if (!manifest.siblings || typeof manifest.siblings !== 'object' || Object.keys(manifest.siblings).join(',') !== 'frontierui') throw new Error('Unsupported sibling manifest');
     const section = manifest.siblings.frontierui;
-    if (!section || Object.keys(section).sort().join(',') !== 'excluded,executable,hashes,paths,sha'
+    if (!section || Object.keys(section).sort().join(',') !== 'excluded,executable,hashes,paths,sha,tracked,v'
       || !sameSiblingShas({frontierui:section.sha},{frontierui:section.sha})) throw new Error('Invalid sibling SHA or manifest');
     const {sha:revision,...snapshot} = section;
     await verifyManifest(join(root,'../frontierui'),snapshot,digestManifest(snapshot),{fs,sibling:true});
@@ -264,10 +270,68 @@ export async function digestInput(root, files) {
   if (selected && [...selected].some(name => !seen.has(name))) throw new Error('Input inventory incomplete');
   return hash.digest('hex');
 }
+// Ownership handoffs pin every path component. A worker can modify its work
+// tree, but cannot replace the operator-owned slot/container ancestors. Refuse
+// symlinks, foreign owners and hardlinks rather than chown an unverified inode.
+export const ownershipSource = String.raw`
+import os, sys, json, stat
+cfg = json.loads(sys.argv[1])
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+trusted = {0, cfg['operator']['uid']}
+worker = cfg['worker']
+def unsafe():
+    raise RuntimeError('Unsafe ownership handoff; use local fallback and inspect slot setup')
+def check(fd, directory=True, worker_parent=False):
+    st = os.fstat(fd)
+    owners = trusted | ({worker['uid']} if worker_parent else set())
+    if st.st_uid not in owners or (directory and not stat.S_ISDIR(st.st_mode)):
+        unsafe()
+    if not worker_parent and st.st_mode & 0o022: unsafe()
+    if not directory and (not stat.S_ISREG(st.st_mode) or st.st_nlink != 1): unsafe()
+    return st
+def transfer(fd, depth=0):
+    if depth > 128: unsafe()
+    check(fd)
+    if cfg['recursive']:
+        for name in os.listdir(fd):
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            directory = stat.S_ISDIR(info.st_mode)
+            if not directory and not stat.S_ISREG(info.st_mode): unsafe()
+            child = os.open(name, flags if directory else os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+            try:
+                pinned = check(child, directory)
+                if (pinned.st_dev, pinned.st_ino) != (info.st_dev, info.st_ino): unsafe()
+                if directory: transfer(child, depth+1)
+                else: os.fchown(child, worker['uid'], worker['gid'])
+            finally: os.close(child)
+    # Hand directories over last; no worker can replace entries before their
+    # descriptors have been verified and all privileged recursion has finished.
+    os.fchown(fd, worker['uid'], worker['gid'])
+parts = cfg['parts']
+if not parts or len(parts) > 128 or any(not isinstance(p, str) or p in ('', '.', '..') or '/' in p or '\x00' in p for p in parts): unsafe()
+parent = os.open(cfg['root'], flags)
+try:
+    check(parent)
+    for i, name in enumerate(parts):
+        child = os.open(name, flags, dir_fd=parent)
+        try:
+            worker_parent = cfg.get('workerParent', False) and i == len(parts)-2 and name == 'work'
+            check(child, worker_parent=worker_parent)
+        except:
+            os.close(child)
+            raise
+        os.close(parent)
+        parent = child
+    transfer(parent)
+except (OSError, RuntimeError):
+    unsafe()
+finally:
+    os.close(parent)
+`;
 // A root supervisor is a subreaper: children which call setsid/double-fork are
 // adopted here, and killed before the ops process publishes any evidence.
 export const supervisorSource = String.raw`
-import os, sys, json, signal, subprocess, ctypes
+import os, sys, json, signal, subprocess, ctypes, time
 PR_SET_CHILD_SUBREAPER = 36
 if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
     raise RuntimeError('subreaper unavailable')
@@ -308,12 +372,29 @@ def children():
         frontier = {pid for pid, ppid in parents.items() if ppid in frontier} - found
         found.update(frontier)
     return found
+def uid_processes():
+    found = set()
+    if not cfg.get('reapUid', False): return found
+    for entry in os.listdir('/proc'):
+        if not entry.isdigit(): continue
+        try:
+            if int(entry) == os.getpid() or os.stat('/proc/' + entry).st_uid != uid: continue
+            with open('/proc/' + entry + '/stat', 'rb') as stat:
+                data = stat.read()
+            if data[data.rfind(b')')+2:].split()[0] != b'Z': found.add(int(entry))
+        except (FileNotFoundError, ProcessLookupError): pass
+    return found
+deadline = time.monotonic() + 30
 while True:
-    for pid in children():
+    # Escaped sessions and externally reparented children still belong only to
+    # this slot UID. Re-scan after killing to close the fork-during-scan race.
+    if time.monotonic() > deadline: raise RuntimeError('uid cleanup unconfirmed; operator must stop reserved uid')
+    for pid in children() | uid_processes():
         try: os.kill(pid, signal.SIGKILL)
         except ProcessLookupError: pass
     try: os.waitpid(-1, 0)
-    except ChildProcessError: break
+    except ChildProcessError:
+        if not uid_processes(): break
 fd = os.open(cfg['status'], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
 with os.fdopen(fd, 'w') as result: result.write(str(code if 0 <= code <= 255 else 255))
 sys.exit(0)
@@ -340,13 +421,67 @@ function execute(file,args,{cwd,env,input,inherit=false,detached=false,passFd}={
 }
 // testRoot/testPath/testCleanupExec are explicit dependency injection only. CLI never reads them
 // from its environment, nor transports them in requests.
-export function createRunner({testRoot, testPath, testCleanupExec, clock=Date.now} = {}) {
+export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIdentity, testWorkerExec, testOwnershipExec, testGitExec, clock=Date.now} = {}) {
   const bases=testRoot ? join(testRoot,'bases') : '/srv/forge-base';
   const runs = testRoot ? join(testRoot,'runs') : '/srv/forge-exec';
   const receipts = testRoot ? join(testRoot,'receipts') : '/srv/forge-receipts';
   const cache = testRoot ? join(testRoot,'cache') : '/srv/forge-cache';
   const path = testRoot ? testPath : '/usr/local/bin:/usr/bin:/bin';
+  let operator={uid:process.getuid(),gid:process.getgid()};
   const statePath = (run,phase) => join(receipts,run+'.'+phase);
+  const busy=()=>Object.assign(new Error('Worker execution busy or interrupted; use local fallback. Operator must stop the reserved UID before removing its worker-active lock'),{code:'forge-busy'});
+  async function identity(user) {
+    if(testRoot)return testWorkerIdentity?.(user)??{uid:process.getuid(),gid:process.getgid()};
+    const uid=await execute('/usr/bin/id',['-u',user]),gid=await execute('/usr/bin/id',['-g',user]);
+    if(uid.code||gid.code||!/^\d+\n$/.test(uid.stdout)||!/^\d+\n$/.test(gid.stdout)||Number(uid.stdout)===0)throw new Error('Unknown worker identity');
+    if(/^forge-exec-[1-9]\d*$/.test(user)){
+      const groups=await execute('/usr/bin/id',['-G',user]);
+      if(groups.code||groups.stdout.trim()!==gid.stdout.trim())throw new Error('Worker groups must be private');
+    }
+    return {uid:Number(uid.stdout),gid:Number(gid.stdout)};
+  }
+  async function workers() {
+    const names=(await readdir(runs)).filter(name=>/^slot-[1-9]\d*$/.test(name)).sort((a,b)=>Number(a.slice(5))-Number(b.slice(5)));
+    if(names.length>128)throw new Error('Worker pool exceeds 128 slots; use local fallback and inspect setup');
+    const found=[];
+    for(const name of names) {
+      const user='forge-exec-'+name.slice(5),ids=await identity(user),root=join(runs,name),st=await lstat(root);
+      if(!testRoot&&(ids.uid===operator.uid||ids.gid===operator.gid))throw new Error('Worker must not share the operator identity');
+      if(st.isSymbolicLink()||!st.isDirectory()||(st.mode&0o7777)!==0o710
+        ||(!testRoot&&(st.uid!==operator.uid||st.gid!==ids.gid)))throw new Error('Untrusted slot directory; redeploy forge-setup and use local fallback');
+      if(found.some(w=>w.uid===ids.uid||w.gid===ids.gid)&&!testRoot)throw new Error('Duplicate worker identity');
+      found.push({user,root,active:join(receipts,'worker-active-'+name.slice(5)),...ids});
+    }
+    return found;
+  }
+  async function workerFor(record,request=record) {
+    if(request.slot!==undefined&&request.slot!==record.slot)throw new Error('Slot mismatch');
+    if(record.slot===undefined)return {user:'forge-exec',root:runs};
+    const worker=(await workers()).find(w=>w.user===record.slot);
+    if(!worker)throw new Error('Invalid slot');
+    const reservation=JSON.parse(await readPinned(join(worker.active,'reservation.json')));
+    if(reservation.run!==record.run||reservation.nonce!==record.nonce||reservation.slot!==record.slot)throw new Error('Reservation mismatch');
+    return worker;
+  }
+  async function reserveWorker(run,nonce,slot) {
+    const pool=await workers();
+    if(slot!==undefined&&!pool.some(w=>w.user===slot))throw new Error('Invalid slot');
+    if(!pool.length)return {user:'forge-exec',root:runs};
+    for(const worker of pool) {
+      try{await mkdir(worker.active,{mode:0o700});}catch(error){if(error.code==='EEXIST')continue;throw error;}
+      // If persistence fails, retain the empty lock: incomplete evidence is busy.
+      await writeFile(join(worker.active,'reservation.json'),JSON.stringify({run,nonce,slot:worker.user}),{flag:'wx',mode:0o600});
+      return worker;
+    }
+    throw busy();
+  }
+  async function releaseWorker(record) {
+    const worker=await workerFor(record);
+    if(worker.active){
+      if(await lstat(join(worker.active,'executing')).catch(e=>{if(e.code!=='ENOENT')throw e;}))throw new Error('Worker execution unconfirmed; operator must stop the reserved UID');
+      await rm(join(worker.active,'reservation.json'));await rmdir(worker.active);
+    }
+  }
   async function atomicJSON(file,value) {
     const pending=file+'-'+randomBytes(8).toString('hex');
     try {await writeFile(pending,JSON.stringify(value),{flag:'wx',mode:0o600});await rename(pending,file);}
@@ -368,31 +503,73 @@ export function createRunner({testRoot, testPath, testCleanupExec, clock=Date.no
     return value;
   }
   async function init() {
+    if(!testRoot&&process.getuid()===0)operator=await identity('ops');
     if(testRoot) for(const dir of [runs,receipts,cache]) await mkdir(dir,{recursive:true,mode:0o700});
-    for(const dir of [runs,receipts,cache]) await directory(dir,true);
+    for(const dir of [runs,receipts,cache]) await directory(dir,true,operator);
+    if((await lstat(receipts)).mode&0o077)throw new Error('Receipts must be ops-only 0700');
   }
   async function state(request,phase) {
     await init();
     if(!runName(request.run) || !nonceOK(request.nonce)) throw new Error('Invalid run');
     const value=JSON.parse(await readPinned(statePath(request.run,phase)));
     if(value.nonce!==request.nonce || value.run!==request.run) throw new Error('State mismatch');
+    if(request.slot!==undefined&&request.slot!==value.slot)throw new Error('Slot mismatch');
     return value;
   }
-  async function workCommand(argv,work,env,archive) {
-    if(testRoot) return execute(argv[0],archive ? ['-xf',archive] : argv.slice(1),{cwd:work,env,detached:true});
-    const identity = await execute('/usr/bin/id',['-u','forge-exec']);
-    const group = await execute('/usr/bin/id',['-g','forge-exec']);
-    if(identity.code || group.code || !/^\d+\n$/.test(identity.stdout) || !/^\d+\n$/.test(group.stdout)) throw new Error('Unknown worker identity');
+  async function handoff(worker,target,{recursive=false,workerParent=false}={}) {
+    if(testRoot&&!testOwnershipExec)return;
+    const ids=worker.uid===undefined?await identity(worker.user):worker;
+    const cfg={root:runs,parts:relative(runs,target).split('/'),operator,worker:{uid:ids.uid,gid:ids.gid},recursive,workerParent};
+    const call={file:'/usr/bin/sudo',args:['-n','/usr/bin/python3','-I','-c',ownershipSource,JSON.stringify(cfg)]};
+    const result=testRoot?await testOwnershipExec(call):await execute(call.file,call.args,{env:{PATH:path,LANG:'C'}});
+    if(result.code!==0)throw new Error('Worker ownership handoff refused; use local fallback and inspect slot setup');
+  }
+  async function pinBase(run,baseSha) {
+    const active=join(bases,'active'),pin=join(active,run);
+    await mkdir(active,{recursive:true,mode:0o700});
+    // Pool metadata runs as root, but the anonymous warmer runs as ops and
+    // must read every active pin before deciding which public bases to prune.
+    if(!testRoot&&process.getuid()===0){
+      const fd=await open(active,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
+      try{
+        const st=await fd.stat();
+        if(![0,operator.uid].includes(st.uid)||(st.mode&0o022))throw new Error('Unsafe base pin directory');
+        await fd.chown(operator.uid,operator.gid);
+      }finally{await fd.close();}
+    }
+    try{await writeFile(pin,baseSha,{flag:'wx',mode:0o600});}
+    catch(error){if(error.code!=='EEXIST'||(await baseFile(pin)).toString()!==baseSha)throw error;}
+    if(!testRoot&&process.getuid()===0){
+      const fd=await open(pin,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
+      try{
+        const st=await fd.stat();
+        if(!st.isFile()||st.nlink!==1||![0,operator.uid].includes(st.uid)||st.size!==baseSha.length
+          ||(await fd.readFile()).toString()!==baseSha)throw new Error('Unsafe base pin');
+        await fd.chown(operator.uid,operator.gid);
+      }finally{await fd.close();}
+    }
+  }
+  async function workCommand(worker,argv,work,env,archive) {
+    if(testRoot) return testWorkerExec?testWorkerExec({worker,argv,cwd:work,env,archive}):execute(argv[0],archive ? ['-xf',archive] : argv.slice(1),{cwd:work,env,detached:true});
+    const ids=await identity(worker.user);
     const status=join(receipts,'supervisor-'+randomBytes(16).toString('hex'));
     try {
-      const result=await execute('/usr/bin/sudo',['-n','/usr/bin/python3','-I','-c',supervisorSource,JSON.stringify({argv,cwd:work,env,status,...(archive?{archive}:{}),uid:Number(identity.stdout),gid:Number(group.stdout)})],{inherit:true});
+      const result=await execute('/usr/bin/sudo',['-n','/usr/bin/python3','-I','-c',supervisorSource,JSON.stringify({argv,cwd:work,env,status,reapUid:true,...(archive?{archive}:{}),...ids})],{inherit:true});
       if(result.code!==0) throw new Error('Supervisor failed');
       const code=Number((await readPinned(status)).toString());
       if(!Number.isInteger(code) || code<0 || code>255) throw new Error('Invalid supervisor status');
       return {...result,code};
     } finally {await rm(status,{force:true});}
   }
-  async function exclusiveWorker(action) {
+  async function exclusiveWorker(action,record) {
+    if(record?.slot) {
+      const worker=await workerFor(record),executing=join(worker.active,'executing');
+      await mkdir(executing,{mode:0o700}).catch(error=>{if(error.code==='EEXIST')throw busy();throw error;});
+      let settled=true;
+      const command=async(...args)=>{settled=false;const result=await workCommand(worker,...args);settled=true;return result;};
+      try{return await action(command,worker);}
+      finally{if(settled)await rmdir(executing);}
+    }
     // All work still shares one uid. Serialize across ALL profiles and runners,
     // before hashing input, until the supervisor has reaped every descendant.
     // An atomic directory persists across wrapper/supervisor death. Never age
@@ -405,7 +582,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, clock=Date.no
     let settled=true;
     const command=async (...args)=>{
       settled=false;
-      const result=await workCommand(...args);
+      const result=await workCommand({user:'forge-exec'},...args);
       settled=true;
       return result;
     };
@@ -441,7 +618,7 @@ export function createRunner({testRoot, testPath, testCleanupExec, clock=Date.no
         if(!pkg||typeof pkg!=='object'||pkg.link)return null;
         if(name&&(!/^https:\/\//.test(pkg.resolved)||typeof pkg.integrity!=='string'||!pkg.integrity))return null;
       }
-      const inputs=decodeManifest((({siblings,...rest})=>rest)(request.manifest)).entries.filter(e=>e.path.toString('latin1').split('/').at(-1)==='package.json');
+      const inputs=decodeManifest((({siblings,git,...rest})=>rest)(request.manifest)).entries.filter(e=>e.path.toString('latin1').split('/').at(-1)==='package.json');
       return sha(JSON.stringify({lock:request.lock,packages:inputs.map(e=>[e.path.toString('base64'),e.sha256,e.executable]),node:process.version,platform:process.platform,arch:process.arch,install:['ci','--include=dev','--ignore-scripts','--no-audit','--no-fund']}));
     }catch{return null;}
   }
@@ -458,10 +635,10 @@ export function createRunner({testRoot, testPath, testCleanupExec, clock=Date.no
     const record=index?await readPinned(index).then(bytes=>JSON.parse(bytes),error=>{if(error.code!=='ENOENT')throw error;return null;}):null;
     if(!record)return false;
     if(Object.keys(record).sort().join(',')!=='archiveDigest,profile'||!hex(record.profile)||!hex(record.archiveDigest))throw new Error('Invalid warm install evidence');
-    const source=join(parent,'dev-v5-'+record.profile);await directory(parent,true);await directory(source,true);
+    const source=join(parent,'dev-v5-'+record.profile);await directory(parent,true,operator);await directory(source,true,operator);
     if((await readPinned(join(source,'sha256'))).toString()!==record.archiveDigest||await archiveDigest(join(source,'dependencies.tar'))!==record.archiveDigest)throw new Error('Warm cache digest mismatch');
     if(source!==profile) {
-      await mkdir(profile,{mode:0o700}).catch(e=>{if(e.code!=='EEXIST')throw e;});await directory(profile,true);
+      await mkdir(profile,{mode:0o700}).catch(e=>{if(e.code!=='EEXIST')throw e;});await directory(profile,true,operator);
       const target=join(profile,'dependencies.tar');
       const exists=await lstat(target).then(()=>true,error=>{if(error.code!=='ENOENT')throw error;return false;});
       if(exists){if(await archiveDigest(target)!==record.archiveDigest||(await readPinned(join(profile,'sha256'))).toString()!==record.archiveDigest)throw new Error('Warm target cache mismatch');}
@@ -479,9 +656,9 @@ export function createRunner({testRoot, testPath, testCleanupExec, clock=Date.no
       const installEnv={PATH:path,HOME:join(work,'.forge-home'),LANG:'C',CI:'true',NODE_ENV:'development'};
         // These parents are inaccessible to forge-exec; reject symlinked cache state.
         await mkdir(join(cache,request.lock),{mode:0o700}).catch(e=>{if(e.code!=='EEXIST') throw e;});
-        await directory(join(cache,request.lock),true);
+        await directory(join(cache,request.lock),true,operator);
         await mkdir(profile,{mode:0o700}).catch(e=>{if(e.code!=='EEXIST') throw e;});
-        await directory(profile,true);
+        await directory(profile,true,operator);
         const guard=await open(join(profile,'.lock'),constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK,0o600);
         try {
           if(!(await guard.stat()).isFile()) throw new Error('Invalid cache lock; use local fallback');
@@ -531,17 +708,19 @@ export function createRunner({testRoot, testPath, testCleanupExec, clock=Date.no
         return (await readBase(bases,sha,ready.manifestDigest)).manifest;
       });
     },
-    // Called only by the fixed warmer, never exposed in the stdin CLI protocol.
+    // Called by the fixed warmer; the privileged CLI restricts its source root.
     async warmInstall(source,manifest) {
       await init();
-      return exclusiveWorker(async command=>{
-        const work=join(runs,'warm-'+randomBytes(16).toString('hex'));
+      const run='warm-'+randomBytes(16).toString('hex'),nonce=randomBytes(16).toString('hex');
+      const worker=await reserveWorker(run,nonce),record={run,nonce,...(worker.active?{slot:worker.user}:{})};
+      try{return await exclusiveWorker(async command=>{
+        const work=join(worker.root,run);
         await mkdir(work,{mode:0o755});
         try {
           const entries=decodeManifest(manifest).entries;
           await copyLeaves(source,work,entries);
           await verifyManifest(work,manifest,digestManifest(manifest));
-          if(!testRoot&&(await execute('/usr/bin/sudo',['-n','/usr/bin/chown','-R','-h','--','forge-exec:forge-exec',work])).code)throw new Error('Warm worker ownership failed');
+          await handoff(worker,work,{recursive:true});
           const request={lock:await digestLock(work),inputDigest:await digestInput(work),manifest,manifestDigest:digestManifest(manifest)};
           const signature=await registryInstallSignature(work,request),parent=join(cache,request.lock),profile=join(parent,'dev-v5-'+request.inputDigest);
           const index=signature?join(parent,'.warm-inputs-'+signature):null;
@@ -558,54 +737,60 @@ export function createRunner({testRoot, testPath, testCleanupExec, clock=Date.no
           if(testRoot)await rm(work,{recursive:true,force:true});
           else if((await execute('/usr/bin/sudo',['-n','/usr/bin/rm','-rf','--',work])).code)throw new Error('Warm cleanup failed');
         }
-      });
+      },record);
+      }finally{if(worker.active)await releaseWorker(record);}
     },
-    async prepare({nonce,label,siblings,baseSha,baseManifestDigest}) {
+    async prepare({nonce,label,siblings,baseSha,baseManifestDigest,slot}) {
       await init();
       if(!nonceOK(nonce) || (label!==undefined && (typeof label!=='string' || !/^[a-z0-9][a-z0-9-]{5,63}$/.test(label)))) throw new Error('Invalid prepare');
       const run='r-'+randomBytes(16).toString('hex');
-      await mkdir(join(runs,run),{mode:0o755}); // exclusive server-generated name
-      const work=join(runs,run,'work');
+      const worker=await reserveWorker(run,nonce,slot),record={v:1,nonce,run,...(worker.active?{slot:worker.user}:{})};
+      const container=join(worker.root,run);
+      try {
+      await mkdir(container,{mode:0o755}); // exclusive server-generated name
+      const work=join(container,'work');
       await mkdir(work,{mode:0o755});
-      if(!testRoot) {
-        const result=await execute('/usr/bin/sudo',['-n','/usr/bin/chown','forge-exec:forge-exec',work]);
-        if(result.code) throw new Error('Worker ownership failed');
-      }
+      await handoff(worker,work);
       if (siblings === true) {
-        const sibling = join(runs,run,'frontierui');
+        const sibling = join(container,'frontierui');
         await mkdir(sibling,{mode:0o755});
-        if (!testRoot && (await execute('/usr/bin/sudo',['-n','/usr/bin/chown','forge-exec:forge-exec',sibling])).code)
-          throw new Error('Sibling ownership failed');
+        await handoff(worker,sibling);
       }
-      await writeFile(statePath(run,'prepared'),JSON.stringify({v:1,nonce,run}),{flag:'wx',mode:0o600});
+      await writeFile(statePath(run,'prepared'),JSON.stringify(record),{flag:'wx',mode:0o600});
       await publishTelemetry({runId:run,startedAtET:easternTimestamp(clock()),stageMs:{install:0,run:0},code:null});
       if(baseSha!==undefined)await baseGuard(bases,async()=>{
         await readBase(bases,baseSha,baseManifestDigest);
-        await mkdir(join(bases,'active'),{recursive:true,mode:0o700});
-        await writeFile(join(bases,'active',run),baseSha,{flag:'wx',mode:0o600});
+        await pinBase(run,baseSha);
         await writeFile(statePath(run,'base'),JSON.stringify({baseSha,baseManifestDigest}),{flag:'wx',mode:0o600});
       });
-      return {run,capabilities:{siblings:1,commandClasses:1,...await this.bases()}};
+      return {run,...(worker.active?{slot:worker.user,worker:{user:worker.user,uid:worker.uid,gid:worker.gid}}:{}),capabilities:{siblings:1,commandClasses:1,gitWorktree:2,...(worker.active?{workers:(await workers()).map(w=>w.user)}:{}),...await this.bases()}};
+      }catch(error){
+        await rm(container,{recursive:true,force:true});
+        await rm(statePath(run,'prepared'),{force:true});
+        await rm(statePath(run,'base'),{force:true});
+        await rm(join(bases,'active',run),{force:true});
+        if(worker.active)await releaseWorker(record);
+        throw error;
+      }
     },
     async run(request) {
       const prepared=await state(request,'prepared');
       try {
       if(!allowedCommand(request.argv) || !allowedEnv(request.env) || !hex(request.lock) || !hex(request.inputDigest)
         || request.argvDigest!==digestArgv(request.argv)) throw new Error('Invalid execution parameters');
-      return await exclusiveWorker(async command => {
-      const container=join(runs,request.run),work=join(container,'work');
-      await directory(container,true); await directory(work);
+      return await exclusiveWorker(async (command,selected) => {
+      const worker=selected??{user:'forge-exec',root:runs};
+      const container=join(worker.root,request.run),work=join(container,'work');
+      await directory(container,true,operator); await directory(work);
       if(request.baseSha!==undefined) {
         await baseGuard(bases,async()=>{
           const base=await readBase(bases,request.baseSha,request.baseManifestDigest);
           // Direct run requests pin before reading, as do prepared delta clients.
-          await mkdir(join(bases,'active'),{recursive:true,mode:0o700});
-          const pin=join(bases,'active',request.run);
-          try{await writeFile(pin,request.baseSha,{flag:'wx',mode:0o600});}catch(e){if(e.code!=='EEXIST'||(await baseFile(pin)).toString()!==request.baseSha)throw e;}
+          await pinBase(request.run,request.baseSha);
           await verifyManifest(base.tree,base.manifest,request.baseManifestDigest);
           if(typeof request.deletions!=='string'||Buffer.from(request.deletions,'base64').toString('base64')!==request.deletions)throw new Error('Invalid deletion list');
           const deletions=splitPaths(Buffer.from(request.deletions,'base64'));
-          const baseEntries=decodeManifest(base.manifest).entries,finalEntries=decodeManifest((({siblings,...rest})=>rest)(request.manifest)).entries;
+          const baseEntries=decodeManifest(base.manifest).entries,finalEntries=decodeManifest((({siblings,git,...rest})=>rest)(request.manifest)).entries;
           const finalKeys=new Set(finalEntries.map(e=>e.path.toString('hex')));
           const deleted=new Set(deletions.map(p=>p.toString('hex')));
           if(deleted.size!==deletions.length||deletions.some(p=>!baseEntries.some(e=>e.path.equals(p))||finalKeys.has(p.toString('hex'))))throw new Error('Invalid deletion path');
@@ -620,8 +805,8 @@ export function createRunner({testRoot, testPath, testCleanupExec, clock=Date.no
           await copyLeaves(work,assembled,incoming);
           // Verify primary full M before installing and before exposing any of
           // the reconstructed bytes to the worker. Siblings remain Mac-shipped.
-          await verifyManifest(assembled,(({siblings,...rest})=>rest)(request.manifest),digestManifest((({siblings,...rest})=>rest)(request.manifest)));
-          if(!testRoot&&(await execute('/usr/bin/sudo',['-n','/usr/bin/chown','-R','-h','--','forge-exec:forge-exec',assembled])).code)throw new Error('Delta ownership failed');
+          await verifyManifest(assembled,(({siblings,git,...rest})=>rest)(request.manifest),digestManifest((({siblings,git,...rest})=>rest)(request.manifest)));
+          await handoff(worker,assembled,{recursive:true});
           await rename(work,join(container,'delta'));await rename(assembled,work);
         });
       } else if(request.deletions!==undefined||request.baseManifestDigest!==undefined)throw new Error('Unexpected delta evidence');
@@ -638,6 +823,14 @@ export function createRunner({testRoot, testPath, testCleanupExec, clock=Date.no
         if (info && (info.isSymbolicLink() || !info.isDirectory() || (await readdir(sibling)).length)) throw new Error('Extra sibling snapshot');
       }
       if(await digestInput(work)!==request.inputDigest || lock!==request.lock) throw new Error('Input digest mismatch');
+      if(request.argv[2]==='check:standards') {
+        if(!request.manifest.git)throw new Error('Missing Git evidence');
+        try {
+          await materializeWorktree({work,root:bases,baseSha:request.baseSha,head:request.manifest.git.head,manifest:request.manifest,manifestDigest:request.manifestDigest,
+            ...(testRoot&&testGitExec?{exec:testGitExec}:{})});
+          await handoff(worker,join(work,'.git'),{recursive:true,workerParent:true});
+        } catch(error) {throw Object.assign(error,{code:'git-head-unavailable'});}
+      }
       await rename(statePath(request.run,'prepared'),statePath(request.run,'running'));
       let phase='install',result={code:97,stdout:'',stderr:''};
       const installAt=clock();let installMs=0,runMs=0,runAt;
@@ -665,31 +858,47 @@ export function createRunner({testRoot, testPath, testCleanupExec, clock=Date.no
       } catch(error) {const code=phase==='install'?97:254; if(phase==='test') phase='supervisor'; result={code,stdout:result.stdout,stderr:String(error.message)};}
       finally {clearInterval(telemetryTimer);await updates;}
       if(runAt!==undefined)runMs=Math.max(0,Math.round(clock()-runAt));else installMs=Math.max(0,Math.round(clock()-installAt));
-      const receipt={...prepared,timings:{installMs,runMs},...(request.manifest.siblings ? {siblingShas:siblingShas(request.manifest)} : {}),manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code};
+      const {slot:reservedSlot,...receiptState}=prepared;
+      const receipt={...receiptState,timings:{installMs,runMs},...(request.manifest.siblings ? {siblingShas:siblingShas(request.manifest)} : {}),manifestDigest:request.manifestDigest,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,phase,code:result.code};
       await writeFile(statePath(request.run,'receipt'),JSON.stringify(receipt),{flag:'wx',mode:0o600});
       await publishTelemetry({runId:request.run,startedAtET,stageMs:{install:installMs,run:runMs},code:result.code});
       if(telemetryError)throw telemetryError;
       return result;
-      });
+      },prepared);
       } catch (error) {
         // A separately installed runner must publish pre-execution rejection in
         // protected ops state. Never infer not-started from worker-owned files.
         const stillPrepared = await lstat(statePath(request.run,'prepared')).catch(e => {if(e.code !== 'ENOENT') throw e;});
         if (stillPrepared) {
-          const reason=error.code==='forge-busy' && !(request.argv?.[0]==='npm' && request.argv?.[2]==='test:unit') ? 'forge-busy' : 'snapshot-rejected';
-          await writeFile(statePath(request.run,'rejected'),JSON.stringify({...prepared,phase:'rejected',reason,siblings:!!request.manifest?.siblings,...(request.baseSha!==undefined?{delta:true}:{})}),{flag:'wx',mode:0o600}).catch(async e => {if (e.code !== 'EEXIST') throw e; await state(request,'rejected');});
+          const reason=error.code==='git-head-unavailable' ? error.code
+            : error.code==='forge-busy' && !(request.argv?.[0]==='npm' && request.argv?.[2]==='test:unit') ? 'forge-busy' : 'snapshot-rejected';
+          await writeFile(statePath(request.run,'rejected'),JSON.stringify({v:prepared.v,nonce:prepared.nonce,run:prepared.run,phase:'rejected',reason,siblings:!!request.manifest?.siblings,...(request.baseSha!==undefined?{delta:true}:{})}),{flag:'wx',mode:0o600}).catch(async e => {if (e.code !== 'EEXIST') throw e; await state(request,'rejected');});
         }
         throw error;
       }
     },
     async finish(request) {
+      let finishingWorker,settled=true;
+      try {
       // Only the protected state is evidence; receipt-like files in work are data.
       let phase='running';
       try {await state(request,phase);} catch {phase='prepared'; await state(request,phase);}
       let receipt;
       try {receipt=JSON.parse(await readPinned(statePath(request.run,'receipt')));} catch(e) {if(e.code!=='ENOENT') throw e;}
-      const container=join(runs,request.run);
-      await directory(container,true);
+      const record=await state(request,phase),worker=await workerFor(record,request);
+      if(worker.active){
+        await mkdir(join(worker.active,'executing'),{mode:0o700}).catch(error=>{if(error.code==='EEXIST')throw new Error('Worker execution unconfirmed; operator must stop the reserved UID');throw error;});
+        finishingWorker=worker;
+      }
+      const container=join(worker.root,request.run);
+      await directory(container,true,operator);
+      if(worker.active){
+        // Includes cancelled rsync and children left before task execution.
+        settled=false;
+        const reaped=await workCommand(worker,['/usr/bin/true'],container,{PATH:path,HOME:'/nonexistent'});
+        if(reaped.code!==0)throw new Error('Worker cleanup unconfirmed');
+        settled=true;
+      }
       // The worker owns work and may remove ops' write permission. Only the
       // ops-owned container is a cleanup authority: it is validated above, and
       // its parent is protected by init(), so the worker cannot swap this path.
@@ -707,21 +916,37 @@ export function createRunner({testRoot, testPath, testCleanupExec, clock=Date.no
       await rm(statePath(request.run,'rejected'),{force:true});
       await rm(join(bases,'active',request.run),{force:true});
       await rm(statePath(request.run,'base'),{force:true});
+      if(worker.active){await rmdir(join(worker.active,'executing'));finishingWorker=undefined;await releaseWorker(record);}
       await publishTelemetry();
       // Legacy callers retain their null finish response for non-sibling failures.
       // Never certify rejection once the protected run phase has started.
-      return receipt ?? (phase === 'prepared' && (rejected?.siblings||rejected?.delta||rejected?.reason==='forge-busy') ? {...rejected,started:false} : null) ?? null;
+      return receipt ?? (phase === 'prepared' && (rejected?.siblings||rejected?.delta||['forge-busy','git-head-unavailable'].includes(rejected?.reason)) ? {...rejected,started:false} : null) ?? null;
+      }finally{if(finishingWorker&&settled)await rmdir(join(finishingWorker.active,'executing'));}
     },
   };
 }
 if(process.argv[1] && await realpath(process.argv[1]).catch(()=> '') === await realpath(fileURLToPath(import.meta.url))) {
   try {
-    if(process.argv.length!==3 || !['prepare','run','finish','bases','base-manifest','telemetry'].includes(process.argv[2])) throw new Error('Invalid subcommand');
+    if(process.argv.length!==3 || !['prepare','run','finish','bases','base-manifest','telemetry','warm-install'].includes(process.argv[2])) throw new Error('Invalid subcommand');
+    // Pool roots are deliberately 0700 worker-owned. Only this installed,
+    // root-owned fixed wrapper may cross identities for metadata operations.
+    const pool=(await readdir('/srv/forge-exec').catch(e=>{if(e.code!=='ENOENT')throw e;return [];})).some(name=>/^slot-[1-9]\d*$/.test(name));
+    if(pool&&process.getuid()!==0) {
+      const child=spawn('/usr/bin/sudo',['-n','/usr/local/libexec/forge-exec-run.mjs',process.argv[2]],{stdio:'inherit',env:{PATH:'/usr/local/bin:/usr/bin:/bin',HOME:'/nonexistent'}});
+      process.exitCode=await new Promise((resolve,reject)=>{child.on('error',reject);child.on('close',code=>resolve(code??254));});
+    } else {
     let input='';
     process.stdin.setEncoding('utf8');
     if(process.argv[2]!=='telemetry')for await(const chunk of process.stdin) {input+=chunk; if(Buffer.byteLength(input)>LIMIT) throw new Error('Request limit exceeded');}
-    const result=await createRunner()[process.argv[2]](process.argv[2]==='telemetry'?undefined:JSON.parse(input));
+    const request=process.argv[2]==='telemetry'?undefined:JSON.parse(input);
+    if(process.argv[2]==='warm-install' && (!request||!/^\/srv\/forge-base\/[a-f0-9]{40}(?:[a-f0-9]{24})?\.tmp\/tree$/.test(request.source)))throw new Error('Invalid warm source');
+    const runner=createRunner();
+    const result=process.argv[2]==='warm-install'?await runner.warmInstall(request.source,request.manifest):await runner[process.argv[2]](request);
     if(process.argv[2]==='run') process.exitCode=result.code;
     else process.stdout.write(JSON.stringify(result)+'\n');
-  } catch(error) {process.stderr.write('forge-exec-run: '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n'); process.exitCode=254;}
+    }
+  } catch(error) {
+    if(process.argv[2]==='prepare'&&error.code==='forge-busy')process.stdout.write(JSON.stringify({reason:'forge-busy'})+'\n');
+    process.stderr.write('forge-exec-run: '+String(error.message).replace(/[\x00-\x1f\x7f]/g,' ')+'\n'); process.exitCode=254;
+  }
 }

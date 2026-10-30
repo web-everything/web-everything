@@ -25,6 +25,28 @@ async function baseFixture() {
   return {sha,manifest:manifestWire(manifest),manifestDigest:manifest.manifestDigest};
 }
 describe('warm base selection and delta proof',()=>{
+  it('hashes Mac index membership even when tracked and untracked file bytes are identical',async()=>{
+    await fs.writeFile(join(repo,'new.md'),'same bytes');
+    const untracked=await remote.buildManifest({cwd:repo,exec});
+    expect(untracked.entries.find(e=>e.path.toString()==='new.md').tracked).toBe(false);
+    git(['add','new.md']);
+    const tracked=await remote.buildManifest({cwd:repo,exec});
+    expect(tracked.entries.find(e=>e.path.toString()==='new.md').tracked).toBe(true);
+    expect(tracked.manifestDigest).not.toBe(untracked.manifestDigest);
+    const base=await baseFixture();
+    git(['rm','--cached','new.md']);
+    const delta=await remote.buildDeltaManifest({cwd:repo,exec,base});
+    expect(delta.entries.find(e=>e.path.toString()==='new.md').tracked).toBe(false);
+    expect(delta.deltaPaths).toEqual([]);
+    expect(delta.manifestDigest).toBe((await remote.buildManifest({cwd:repo,exec})).manifestDigest);
+    expect(delta.manifestDigest).not.toBe(base.manifestDigest);
+  });
+  it('refuses a legacy warm-base manifest with its valid historical digest and requires full shipping',async()=>{
+    const base=await baseFixture();
+    delete base.manifest.v;delete base.manifest.tracked;
+    base.manifestDigest=digestManifest(base.manifest);
+    await expect(remote.buildDeltaManifest({cwd:repo,exec,base})).rejects.toThrow(/manifest|full ship/i);
+  });
   it.each([['120000','blob'],['160000','commit']])('retains excluded %s tree entries for manifest policy', (mode,type)=>{
     const oid='a'.repeat(40);
     const tree=Buffer.from([`${mode} ${type} ${oid}\t.claude/skills`,`${mode} ${type} ${oid}\t.claude/agent-memory`,`100644 blob ${oid}\tnormal.txt`,''].join('\0'));

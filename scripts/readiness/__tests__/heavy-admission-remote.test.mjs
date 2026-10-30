@@ -74,7 +74,11 @@ describe('remote admission policy', () => {
     }
   });
 
-  it('main run routes through the decision and exits remotely without creating a local slot', async () => {
+  it.each([
+    {env:{},command:argv,expected:argv},
+    {env:{WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'},command:argv,expected:argv},
+    {env:{WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'},command:['node','scripts/check-standards.mjs','--local','--files=a.mjs'],expected:['npm','run','check:standards','--','--local','--files=a.mjs']},
+  ])('main run dispatches a direct command or explicitly designated Mac verify gate remotely: %j', async ({env:gateEnv,command,expected}) => {
     const root = mkdtempSync(join(tmpdir(), 'remote-main-'));
     const pool = join(root, 'pool');
     mkdirSync(pool);
@@ -84,11 +88,11 @@ describe('remote admission policy', () => {
     const exit = vi.spyOn(process, 'exit').mockImplementation(() => { throw exited; });
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     for (const [key, value] of Object.entries({ LANE_POOL_ROOT: pool, WE_PLATFORM_PREFERENCES: prefs,
-      CI: '', WE_HEAVY_ADMISSION: 'on', WE_HEAVY_ADMISSION_HELD: '', WE_HEAVY_ADMISSION_CONTAINER: '', WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES: '' })) vi.stubEnv(key, value);
+      CI: '', WE_HEAVY_ADMISSION: 'on', WE_HEAVY_ADMISSION_HELD: '', WE_HEAVY_ADMISSION_CONTAINER: '', WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES: '',...gateEnv })) vi.stubEnv(key, value);
     try {
       const remoteExec = vi.fn(async () => ({ mode: 'remote', code: 23 }));
-      await expect(main(['run', `--repo=${root}`, '--', ...argv], { remoteExec, readTelemetry:healthyRead })).rejects.toBe(exited);
-      expect(remoteExec).toHaveBeenCalledWith(expect.objectContaining({ argv, cwd: root, signal: expect.any(AbortSignal) }));
+      await expect(main(['run', `--repo=${root}`, '--', ...command], { remoteExec, readTelemetry:healthyRead })).rejects.toBe(exited);
+      expect(remoteExec).toHaveBeenCalledWith(expect.objectContaining({ argv:expected, cwd: root, signal: expect.any(AbortSignal) }));
       expect(exit).toHaveBeenCalledWith(23);
       expect(existsSync(join(pool, '.admission','heavy'))).toBe(false);
       expect(heldSlots({lockRoot:join(pool,'.admission','remote'),cap:8})).toHaveLength(0);
@@ -206,7 +210,6 @@ describe('decideRemote', () => {
 describe('adaptLegacyRemoteResult', () => {
   it.each([
     'command-not-allowed',
-    'requires-git-worktree',
     'invalid-parameters',
     'forge-unreachable',
     'copy-failed',
@@ -221,7 +224,7 @@ describe('adaptLegacyRemoteResult', () => {
     expect(await runWithRemoteDecision(fixture({ result: legacy }))).toEqual({ handled: true, exitCode: 124 });
   });
 
-  it.each(['ambiguous-result', 'unknown-reason', undefined])('preserves unsafe fallback reason %s and refuses local rerun', async (reason) => {
+  it.each(['ambiguous-result', 'unknown-reason', 'requires-git-worktree', undefined])('preserves unsafe fallback reason %s and refuses local rerun', async (reason) => {
     const legacy = { mode: 'fallback', reason };
     expect(adaptLegacyRemoteResult(legacy)).toBe(legacy);
     expect(await runWithRemoteDecision(fixture({ result: adaptLegacyRemoteResult(legacy) })))

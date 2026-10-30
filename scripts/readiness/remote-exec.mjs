@@ -112,7 +112,8 @@ export function createGitBlobReader({cwd, timeoutMs=10000}={}) {
   };
 }
 import {classifyManifestPath, manifestEntry, decodeManifest, parseGitTree, nulPaths} from './forge-exec-manifest.mjs';
-export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false} = {}) {
+export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head} = {}) {
+  if(head!==undefined&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head))throw new Error('Invalid Git HEAD');
   // Only dependency and Git internals are exempt. In particular, secret/hidden
   // directories and ambiguous dist/build directories may still contain tests.
   const ignored = await exec({file:'git',args:['ls-files','-o','-i','--exclude-standard','-z'],cwd});
@@ -206,7 +207,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       const missing=await fs.lstat(bytePath(cwd,path)).then(()=>false,error=>{if(error.code==='ENOENT')return true;throw error;});
       if(missing) {
         if(!deletedWorktreePaths) {
-          const deleted=await exec({file:'git',args:['diff','--no-ext-diff','--no-textconv','--name-status','-z','--no-renames','HEAD','--'],cwd});
+          const deleted=await exec({file:'git',args:['diff','--no-ext-diff','--no-textconv','--name-status','-z','--no-renames',head??'HEAD','--'],cwd});
           if(deleted.code!==0)throw new Error('Missing deletion evidence');
           const fields=splitPaths(deleted.stdout);deletedWorktreePaths=new Set();
           for(let i=0;i<fields.length;i+=2) {
@@ -233,7 +234,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
         .update(`blob ${content.length}\0`).update(content).digest('hex');
       if (oid !== publicOid) throw excludedSource();
     }
-    entries.push(manifestEntry(path,content,!!(st.mode & 0o111)));
+    entries.push(manifestEntry(path,content,!!(st.mode & 0o111),indexBlobs.has(path.toString('base64'))));
   }
   let siblings;
   if (!trackedOnly && entries.some(entry => entry.path.equals(Buffer.from('vitest.shared.ts')))) {
@@ -287,27 +288,25 @@ function changedPaths(bytes) {
   }
   return paths;
 }
-export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,base}={}) {
+export async function buildDeltaManifest({cwd,exec=defaultExec,fs=filesystem,base,head}={}) {
   if(!base || digestManifest(base.manifest)!==base.manifestDigest)throw new Error('Base manifest digest mismatch');
   const snapshot=decodeManifest(base.manifest);
   const git=async args=>{const result=await exec({file:'git',args,cwd});if(result.code!==0||!Buffer.isBuffer(result.stdout)||result.stdout.length>LIMIT)throw new Error('Delta git evidence unavailable; use full ship');return result.stdout;};
   const tree=parseGitTree(await git(['ls-tree','-r','-z',base.sha]));
   const blobs=new Map(tree.map(entry=>[entry.path.toString('hex'),entry]));
-  const changed=new Set();
-  for(const args of [
-    ['diff','--no-ext-diff','--no-textconv','--name-status','-z','--no-renames',base.sha,'HEAD','--'],
-    ['diff','--no-ext-diff','--no-textconv','--name-status','-z','--no-renames','HEAD','--'],
-  ])for(const path of changedPaths(await git(args)))changed.add(path.toString('hex'));
-  for(const path of splitPaths(await git(['ls-files','-o','--exclude-standard','-z'])))changed.add(path.toString('hex'));
-  // Git diff is only an ordering hint. Every included leaf is read and hashed
-  // from the worktree, even when filters, CRLF or a race leave Git reporting clean.
-  const manifest=await buildManifest({cwd,exec,fs});
+  // Validate working changes against Mac HEAD, never the warm base. Every final
+  // leaf is still read and hashed even when Git filters or CRLF report it clean.
+  changedPaths(await git(['diff','--no-ext-diff','--no-textconv','--name-status','-z','--no-renames',head??'HEAD','--']));
+  splitPaths(await git(['ls-files','-o','--exclude-standard','-z']));
+  const manifest=await buildManifest({cwd,exec,fs,head});
+  // This is a byte-transfer delta, not Git scope. Reuse a warm leaf only when
+  // its hash and mode match the complete Mac snapshot at the pinned HEAD.
   const baseEntries=new Map(snapshot.entries.map(entry=>[entry.path.toString('hex'),entry]));
   const final=new Set(manifest.entries.map(e=>e.path.toString('hex')));
   const deltaPaths=manifest.entries.filter(entry=>{
     const previous=baseEntries.get(entry.path.toString('hex'));
     return !previous || previous.sha256!==entry.sha256 || previous.executable!==entry.executable;
-  }).map(e=>e.path).sort((a,b)=>Number(changed.has(b.toString('hex')))-Number(changed.has(a.toString('hex')))||Buffer.compare(a,b));
+  }).map(e=>e.path).sort(Buffer.compare);
   const deletions=snapshot.entries.filter(e=>!final.has(e.path.toString('hex'))).map(e=>e.path);
   let deltaBytes=0;for(const path of deltaPaths)deltaBytes+=(await fs.lstat(bytePath(cwd,path))).size;
   return {...manifest,deltaPaths,deletions,deltaBytes,baseSha:base.sha,baseManifestDigest:base.manifestDigest,baseBlobs:blobs};
@@ -391,9 +390,7 @@ export async function runRemote(options={}) {
 async function executeRemote({ argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false } = {}) {
   const fallback = (reason) => ({ mode: 'fallback', reason });
   if (!isAllowedCommand(argv)) return fallback('command-not-allowed');
-  // Standards inspects Git's work tree and index. The transported snapshot has
-  // neither, so run it through local admission instead of certifying a false failure.
-  if (argv[2] === 'check:standards') return fallback('requires-git-worktree');
+  const needsGit=argv[2]==='check:standards';
   if (!validateRunId(runId) || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host)) return fallback('invalid-parameters');
   try {
     if ((await exec({ file: 'ssh', args: [host, 'true'], cwd })).code !== 0) return fallback('forge-unreachable');
@@ -416,6 +413,12 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
     try {
       const manifestDone=begin('manifest-build');
       let manifest;
+      let logicalHead;
+      if(needsGit){
+        const evidence=await exec({file:'git',args:['rev-parse','HEAD'],cwd});
+        logicalHead=protocolText(evidence.stdout,128).trim();
+        if(evidence.code!==0||!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(logicalHead))throw new Error('Missing Git evidence');
+      }
       // Discovery is read-only. Older separately installed wrappers reject this
       // subcommand; their full-ship path retains its existing admission order.
       try {
@@ -429,10 +432,10 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
         const response=await ssh('base-manifest',{sha:base.sha});
         if(response.code!==0)throw new Error('Base manifest unavailable');
         const wire=JSON.parse(protocolText(response.stdout,LIMIT));
-        delta=await buildDeltaManifest({cwd,exec,fs,base:{...base,manifest:wire}});
+        delta=await buildDeltaManifest({cwd,exec,fs,base:{...base,manifest:wire},head:logicalHead});
         manifest=delta;
       } catch {delta=undefined;}
-      manifest ??= await buildManifest({cwd,exec,listFiles,fs});
+      manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead});
       manifestDone();
       const selected = (delta ? delta.deltaPaths : manifest.entries.map(entry => entry.path));
       const selectedKeys=new Set(selected.map(path=>path.toString('hex')));
@@ -498,7 +501,12 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       }
       // Anchor comment-like and option-like names for both rsync implementations.
       const inventory = Buffer.concat(selected.flatMap(path => [Buffer.from('./'),path,Buffer.from([0])]));
-      const wire = manifestWire(manifest);
+      if(needsGit){
+        const current=await exec({file:'git',args:['rev-parse','HEAD'],cwd});
+        if(current.code!==0||protocolText(current.stdout,128).trim()!==logicalHead)throw new Error('Git HEAD changed during snapshot; use local fallback');
+      }
+      const wire = {...manifestWire(manifest),...(needsGit?{git:{head:logicalHead}}:{})};
+      const wireDigest=digestManifest(wire);
       // Preserve local lockfile-precedence admission even when an injected
       // inventory omits shrinkwrap; only the staged digest is transmitted.
       await digestLock(cwd);
@@ -509,10 +517,18 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       const prepareDone=begin('forge-prepare');
       const prepared = await ssh('prepare',{nonce,label:runId,...(delta ? {baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest}:{}),...(manifest.siblings ? {siblings:true} : {})});
       prepareDone();
-      if(prepared.code !== 0) throw new Error('Prepare failed');
+      if(prepared.code !== 0) {
+        // Prepare precedes every byte transfer and cannot have started work.
+        try {if(protocolText(prepared.stdout,4096).trim()===JSON.stringify({reason:'forge-busy'}))return {mode:'not-started',terminated:true,reason:'forge-busy'};}catch { /* malformed prepare stays a safe pre-transfer failure */ }
+        throw new Error('Prepare failed');
+      }
       const preparation = JSON.parse(protocolText(prepared.stdout,4096));
       run = preparation.run;
       if(typeof run !== 'string' || !/^r-[a-f0-9]{32}$/.test(run)) {run=undefined; throw new Error('Invalid server run');}
+      const slot=preparation.slot??'forge-exec';
+      if(slot!=='forge-exec'&&(!/^forge-exec-[1-9]\d*$/.test(slot)||!Array.isArray(preparation.capabilities?.workers)||!preparation.capabilities.workers.includes(slot)))throw new Error('Invalid server slot');
+      const runRoot=slot==='forge-exec'?ROOT:ROOT+'/'+slot.replace('forge-exec-','slot-');
+      if(needsGit&&preparation.capabilities?.gitWorktree!==2)return {mode:'not-started',terminated:true,reason:'forge-runner-too-old'};
       // forge-exec-run.mjs is separately installed by forge-setup.sh. Redeploy
       // that fixed wrapper before siblings can run; old runners stay local.
       if (manifest.siblings && preparation.capabilities?.siblings !== 1)
@@ -529,18 +545,18 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       // already normalizes every mode; additive directory access avoids Apple
       // openrsync's '=' parser corrupting file permission masks.
       const copied = await exec({file:'rsync',args:['-a','--chmod=Da+rx','--no-recursive','--no-dirs','--no-links','--safe-links','--exclude=.exit-code',
-        '--from0','--files-from=-','--rsync-path=sudo -u forge-exec rsync','-e',`ssh ${SSH_OPTIONS.join(' ')}`,
-        './',`${host}:${ROOT}/${run}/work/`],cwd:workStage,input:inventory});
+        '--from0','--files-from=-',`--rsync-path=sudo -u ${slot} rsync`,'-e',`ssh ${SSH_OPTIONS.join(' ')}`,
+        './',`${host}:${runRoot}/${run}/work/`],cwd:workStage,input:inventory});
       if(copied.code !== 0) throw new Error('Copy failed');
       if (manifest.siblings) {
         const inventory = Buffer.concat(manifest.siblings.frontierui.entries.flatMap(entry => [Buffer.from('./'),entry.path,Buffer.from([0])]));
         const siblingsCopied = await exec({file:'rsync',args:['-a','--chmod=Da+rx','--no-recursive','--no-dirs','--no-links','--safe-links','--exclude=.exit-code',
-          '--from0','--files-from=-','--rsync-path=sudo -u forge-exec rsync','-e',`ssh ${SSH_OPTIONS.join(' ')}`,
-          './',`${host}:${ROOT}/${run}/frontierui/`],cwd:join(staging,'frontierui'),input:inventory});
+          '--from0','--files-from=-',`--rsync-path=sudo -u ${slot} rsync`,'-e',`ssh ${SSH_OPTIONS.join(' ')}`,
+          './',`${host}:${runRoot}/${run}/frontierui/`],cwd:join(staging,'frontierui'),input:inventory});
         if (siblingsCopied.code !== 0) throw new Error('Sibling copy failed');
       }
       rsyncDone({shipMode:delta?'delta':'full',fileCount:transferCount,bytesSent:transferBytes,deltaFileCount:delta?selected.length:0,deltaBytes:delta?delta.deltaBytes:0});
-      expected = {v:1,nonce,run,inputDigest,argvDigest:digestArgv(argv),lock,manifestDigest:manifest.manifestDigest,...(manifest.siblings ? {siblingShas:siblingShas(wire)} : {})};
+      expected = {v:1,nonce,run,inputDigest,argvDigest:digestArgv(argv),lock,manifestDigest:wireDigest,...(manifest.siblings ? {siblingShas:siblingShas(wire)} : {})};
       expectedManifest = wire;
     } catch (error) {
       if(delta) {
@@ -567,10 +583,12 @@ async function executeRemote({ argv, cwd = process.cwd(), env = process.env, run
       // Only the fixed wrapper's protected prepared state can certify no execution.
       if (reply && (Object.keys(reply).sort().join(',') === 'nonce,phase,reason,run,siblings,started,v' || (delta && reply.delta===true && Object.keys(reply).sort().join(',') === 'delta,nonce,phase,reason,run,siblings,started,v'))
         && reply.v === 1 && reply.nonce === nonce && reply.run === run
-        && reply.phase === 'rejected' && ['snapshot-rejected','forge-busy'].includes(reply.reason)
-        && (reply.reason === 'forge-busy' || reply.siblings === true || (delta && reply.delta===true && reply.siblings===!!expectedManifest.siblings)) && reply.started === false)
+        && reply.phase === 'rejected' && ['snapshot-rejected','forge-busy','git-head-unavailable'].includes(reply.reason)
+        && (reply.reason!=='git-head-unavailable'||needsGit)
+        && (reply.reason === 'forge-busy' || (needsGit && reply.reason==='git-head-unavailable' && reply.siblings===!!expectedManifest.siblings) || reply.siblings === true || (delta && reply.delta===true && reply.siblings===!!expectedManifest.siblings)) && reply.started === false)
       {
         if(reply.reason === 'forge-busy')return {mode:'not-started',terminated:true,reason:'forge-busy'};
+        if(needsGit&&reply.reason==='git-head-unavailable')return {mode:'not-started',terminated:true,reason:'git-head-unavailable'};
         if(delta && reply.delta===true) {
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.

@@ -51,9 +51,11 @@ export function splitPaths(bytes) {
 }
 export const nulPaths = paths => Buffer.concat(paths.flatMap(path => [path, Buffer.from([0])]));
 export const manifestWire = ({entries, excluded, siblings}) => ({
+  v:2,
   paths:nulPaths(entries.map(entry => entry.path)).toString('base64'),
   hashes:entries.map(entry => entry.sha256),
   executable:entries.map(entry => entry.executable),
+  tracked:entries.map(entry => entry.tracked ?? false),
   excluded:nulPaths(excluded).toString('base64'),
   ...(siblings ? {siblings:{frontierui:{sha:siblings.frontierui.sha,...manifestWire(siblings.frontierui)}}} : {}),
 });
@@ -92,12 +94,13 @@ export function classifyManifestPath(path) {
     && !names.some((name,i)=>excludedComponent(name,i===names.length-1,true));
   return {parts,names,excluded,credentialSource};
 }
-export function manifestEntry(path,content,executable) {
+export function manifestEntry(path,content,executable,tracked) {
   pathParts(path);
-  return {path,sha256:sha(content),executable};
+  if(typeof tracked!=='boolean')throw new Error('Missing manifest tracking evidence');
+  return {path,sha256:sha(content),executable,tracked};
 }
 export function decodeManifest(manifest) {
-  if(!manifest || Object.keys(manifest).sort().join(',')!=='excluded,executable,hashes,paths'
+  if(!manifest || manifest.v!==2 || Object.keys(manifest).sort().join(',')!=='excluded,executable,hashes,paths,tracked,v'
     || Buffer.byteLength(JSON.stringify(manifest))>LIMIT)throw new Error('Invalid base manifest; use full ship');
   const decode=value=>{
     if(typeof value!=='string')throw new Error('Invalid base manifest paths');
@@ -107,12 +110,14 @@ export function decodeManifest(manifest) {
     return paths;
   };
   const paths=decode(manifest.paths),excluded=decode(manifest.excluded);
-  if(!Array.isArray(manifest.hashes)||!Array.isArray(manifest.executable)||paths.length!==manifest.hashes.length||paths.length!==manifest.executable.length
-    ||!manifest.hashes.every(h=>typeof h==='string'&&/^[a-f0-9]{64}$/.test(h))||!manifest.executable.every(v=>typeof v==='boolean'))throw new Error('Invalid base manifest entries');
+  if(!Array.isArray(manifest.hashes)||!Array.isArray(manifest.executable)||!Array.isArray(manifest.tracked)
+    ||paths.length!==manifest.hashes.length||paths.length!==manifest.executable.length||paths.length!==manifest.tracked.length
+    ||!manifest.hashes.every(h=>typeof h==='string'&&/^[a-f0-9]{64}$/.test(h))||!manifest.executable.every(v=>typeof v==='boolean')
+    ||!manifest.tracked.every(v=>typeof v==='boolean'))throw new Error('Invalid base manifest entries');
   validateTestNames(paths);
   const keys=new Set(paths.map(p=>p.toString('hex')));
   if(excluded.some(p=>keys.has(p.toString('hex'))||isTestFile(p)))throw new Error('Invalid base exclusions');
-  return {entries:paths.map((path,i)=>({path,sha256:manifest.hashes[i],executable:manifest.executable[i]})),excluded};
+  return {entries:paths.map((path,i)=>({path,sha256:manifest.hashes[i],executable:manifest.executable[i],tracked:manifest.tracked[i]})),excluded};
 }
 // Decode Git's byte-safe tree protocol. Only policy-excluded paths may have
 // non-regular modes; retain them so callers record the same exclusions as full ship.
