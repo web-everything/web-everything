@@ -85,10 +85,15 @@ export function reviewRunEvidence(run) {
       });
   } catch { /* unreadable step or seat evidence cannot establish a quota-only attempt */ }
   if (!sha(head) || !Number.isFinite(startedAt)) return null;
+  // Match the reader's filename safeguard for historical chosen ids as well as explicit idChosen records.
+  // Keep the minted-id pattern inline so changing this classification invalidates the disk projection.
+  const custom = run.idChosen === true
+    || !/^review-pr-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(String(run.id));
   if (!Number.isFinite(completedAt)) {
     // Crashes before/during advise still consumed a retry. Keep them in the cached projection, without
     // inventing a completed panel or clean referral evidence for acceptance/carry readers.
     return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt: null,
+      ...(custom ? { custom: true } : {}),
       incomplete: true, quotaOnly, parked: false, attempted: false, persistenceFailed: false, count: 0,
       pending: ['review-incomplete'], rulings: [] };
   }
@@ -103,7 +108,7 @@ export function reviewRunEvidence(run) {
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
     quotaOnly,
     ...(resumeAdvise ? { resumeAdvise: true } : {}),
-    ...(run.idChosen === true ? { custom: true } : {}),
+    ...(custom ? { custom: true } : {}),
     parked: verdict?.verdict === 'needs-human' && pending.length > 0,
     // A list of only reason tokens names no referral, so it was never "attempted" (not vacuously true).
     pending, attempted: findingKeys.length > 0 && findingKeys.every(key => attempted.has(key)),
