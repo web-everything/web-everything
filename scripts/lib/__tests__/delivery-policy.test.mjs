@@ -1050,18 +1050,27 @@ describe('policy journal', () => {
     writeFileSync(workerFile, `
       import fs from 'node:fs';
       import { syncBuiltinESMExports } from 'node:module';
+      import { performance } from 'node:perf_hooks';
       import { parentPort, workerData } from 'node:worker_threads';
       const { recordPolicyEvent } = await import(workerData.module);
       const { env, role, barrier } = workerData;
       const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
       const control = new Int32Array(barrier);
       const original = { open: fs.openSync, unlink: fs.unlinkSync, write: fs.writeSync };
+      const now = performance.now.bind(performance);
+      let barrierMs = 0;
+      // Worker startup and parent scheduling while deliberately paused are test
+      // orchestration, not lock contention. Keep real time for ordinary retries.
+      Object.defineProperty(performance, 'now', { value: () => now() - barrierMs });
       let paused = false, competing = false, survived;
       const compete = kind => {
         if (!competing) { competing = true; parentPort.postMessage({ phase: 'competing', kind }); }
       };
       const wait = index => {
-        if (Atomics.wait(control, index, 0, 8000) === 'timed-out') throw Error('barrier timed out');
+        const start = now();
+        try {
+          if (Atomics.wait(control, index, 0, 8000) === 'timed-out') throw Error('barrier timed out');
+        } finally { barrierMs += now() - start; }
       };
       fs.unlinkSync = (path, ...args) => {
         if (role === 'first' && path === lock && !paused) {
