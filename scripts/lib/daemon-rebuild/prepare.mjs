@@ -27,6 +27,9 @@ import { planRebuild } from './plan.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
 import { repairCloneRefs, holdsCloneWriteLock } from '../lane-repair.mjs';
+import { recoverQuickSoak, launchQuickSoak, reportQuickSoakNeedsYou } from './quick-soak-job.mjs';
+import { rollbackToSha } from '../daemon-live-smoke.mjs';
+import { resolveQuick } from './quick.mjs';
 import {
   markOverlayConflictWake, readOverlayConflictWakes, clearOverlayConflictWake,
 } from '../overlay-conflict-wake.mjs';
@@ -39,7 +42,7 @@ import {
  * smoke a candidate — see {@link rebuildClone}).
  */
 export async function prepareRebuild({
-  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase,
+  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase, launchSoak = launchQuickSoak,
 }) {
   // Tests reaching the hold must opt in before launching a detached repair or cleaning up swaps.
   if (process.env.VITEST === 'true' && env?.WE_DAEMON_AUTO_REBASE === undefined) {
@@ -71,6 +74,10 @@ export async function prepareRebuild({
 
   const state = readRebuildState(root, stEnv);
   const writeState = () => writeRebuildState(root, state, stEnv);
+  const rollbackQuick = (sha) => {
+    try { return rollbackToSha({ root, sha, run, ignoreUntracked: true }); }
+    catch { return { ok: false, reason: 'rollback-threw' }; }
+  };
 
   const finishVerifiedSwaps = async () => {
     try {
@@ -116,8 +123,18 @@ export async function prepareRebuild({
       // last verified head and let this tick rebuild + smoke it off-lock like any other candidate.
       const atUnverifiedTarget = headNow === ip.target && ip.target !== ip.prevHead && ip.verified !== true;
       if (atUnverifiedTarget) {
-        const rolled = rollbackUnverified({ git, prevHead: ip.prevHead });
+        const rolled = ip.quick ? rollbackQuick(ip.prevHead).ok : rollbackUnverified({ git, prevHead: ip.prevHead });
+        if (ip.quick) {
+          const detail = { sha: ip.target, lastGood: ip.prevHead, attempts: 0, cause: 'adoption-interrupted', rollback: { ok: rolled } };
+          reportQuickSoakNeedsYou({ root, env: stEnv, detail, log });
+          alert('quick-soak-unavailable', detail);
+        }
         if (!rolled) {
+          if (ip.quick) {
+            state.quarantine = { prevHead: ip.prevHead, reason: 'quick-soak-unavailable' };
+            state.inProgress = null;
+            writeState();
+          }
           alert('rebuild-interrupted-unrecoverable', { inProgress: ip, headNow, unverified: true });
           return terminal({ moved: false, reason: 'rebuild-interrupted-unrecoverable' });
         }
@@ -156,8 +173,15 @@ export async function prepareRebuild({
   }
 
   // PR #2731 review: the pre-fix recovery could leave `state.unverified` — a build reset onto but never smoked.
-  // This design never writes it, so treat it exactly like an unmarked inProgress record at its target: roll back
-  // to its verified prevHead so this tick re-smokes it off-lock, instead of reading HEAD as up-to-date.
+  // Quick records have bounded detached-soak recovery. Legacy marks still roll back to their verified
+  // prevHead so this tick re-smokes off-lock, instead of reading an unsmoked HEAD as up-to-date.
+  if (state.unverified?.quick === true) {
+    const soak = recoverQuickSoak({ root, env: stEnv, state, now, run, log });
+    if (soak.pending) {
+      if (soak.retry) await launchSoak({ root, env: stEnv, marker: state.unverified, run, log });
+      return terminal({ moved: false, reason: 'rebuild-in-progress', heldBy: 'quick-soak' });
+    }
+  }
   if (state.unverified) {
     const uv = state.unverified;
     if (verifyRev(git, 'HEAD') === uv.head && uv.head !== uv.prevHead) {
@@ -171,6 +195,19 @@ export async function prepareRebuild({
     writeState();
   }
 
+  if (state.quarantine?.reason?.startsWith('quick-soak-')) {
+    // Settlement may already have refused this rollback. Never retry through the weaker legacy reset:
+    // ignored files and ancestor-path obstructions need the same guard on every recovery tick.
+    const rollback = rollbackQuick(state.quarantine.prevHead);
+    if (!rollback.ok) {
+      reportQuickSoakNeedsYou({ root, env: stEnv, log, detail: {
+        lastGood: state.quarantine.prevHead, reason: state.quarantine.reason, rollback,
+      } });
+      return terminal({ moved: false, reason: 'quarantined' });
+    }
+    state.quarantine = null;
+    writeState();
+  }
   if (state.quarantine) {
     // Same definition of "clean" as findUnsafeLocalState: tracked changes only (an untracked sidecar must never
     // freeze recovery), plus the same untracked-collision guard Step 4.5 runs — refuse if prevHead has content
@@ -468,7 +505,10 @@ export async function prepareRebuild({
         carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
         leftForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
       });
-      if (!m.adopt) {
+      if (ready.quick && !resolveQuick(env).quick) {
+        clearReadyCandidate(root, stEnv);
+        alert('ready-candidate-discarded', { target: ready.adopt.finalSha, note: 'quick mode disabled — full smoke required' });
+      } else if (!m.adopt) {
         clearReadyCandidate(root, stEnv);
         alert('ready-candidate-discarded', { target: ready.adopt.finalSha, reason: m.reason });
       } else {
@@ -493,6 +533,7 @@ export async function prepareRebuild({
           plan: m.adopt,
           prevHead,
           lease: { token: ready.token ?? null },
+          quick: ready.quick === true,
           onAdopted: m.dropRefs.length
             ? ({ alert: finAlert }) => dropSuspectOverlays({
               root, env, suspects: m.dropRefs, failed: m.failed, alert: finAlert,
