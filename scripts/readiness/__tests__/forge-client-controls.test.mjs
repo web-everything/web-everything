@@ -28,7 +28,8 @@ describe('Forge synchronous module loading', () => {
   ('loads %s synchronously without executing its CLI', module => {
     // Native require rejects any top-level await in the entire static import graph.
     const result=spawnSync(process.execPath,['--experimental-require-module','-e',
-      'require(process.argv[1]);',fileURLToPath(new URL('../'+module,import.meta.url))],{
+      'require(process.env.FORGE_MODULE);'],{
+      env:{...process.env,FORGE_MODULE:fileURLToPath(new URL('../'+module,import.meta.url))},
       encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
     });
     expect(result.status,result.stderr).toBe(0);
