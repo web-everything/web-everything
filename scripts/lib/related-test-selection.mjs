@@ -25,7 +25,7 @@
 
 // `from '<spec>'` is matched on its own, not anchored to its `import {`: a multi-line import list can hold a comment
 // with a quote or `;` in it. A stray match in a comment or string only ADDS an edge (more tests), never drops one.
-const SPECIFIER_RE = /\bfrom\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*['"]([^'"\n]+)['"]\s*\)|\bimport\s+['"]([^'"\n]+)['"]|\b(?:require|mock|doMock|unmock|doUnmock|importActual|importMock)\s*\(\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*`([^`$\n]+)/g;
+const SPECIFIER_RE = /\bfrom\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*['"]([^'"\n]+)['"]\s*\)|\bimport\s+['"]([^'"\n]+)['"]|\b(?:require|mock|doMock|unmock|doUnmock|importActual|importMock)\s*\(\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*(?:\/\*[^*]*\*+(?:[^/*][^*]*\*+)*\/\s*)?`([^`$\n]+)/g;
 const SOURCE_EXT_RE = /\.(?:mjs|cjs|js|jsx|ts|tsx|mts|cts)$/;
 const RESOLVE_SUFFIXES = ['', '.mjs', '.js', '.ts', '.tsx', '.cjs', '.mts', '.jsx', '/index.mjs', '/index.js', '/index.ts', '/index.tsx', '/index.cjs', '/index.mts', '/index.jsx'];
 
