@@ -12,20 +12,67 @@ import {cachedPublicGitExec} from './fixtures/forge-public-git.mjs';
 
 // Simulate only filesystem ownership; retain real directory modes/inodes and
 // run every production identity/ownership check on the supplied evidence.
-const slotStat=async path=>Object.assign(await fs.lstat(path),{uid:process.getuid(),gid:2000+Number(path.split('-').at(-1))});
+const workerIdentity=user=>{
+  const k=Number(user.split('-').at(-1)),uid=process.getuid()+1000+k,gid=process.getgid()+2000+k;
+  return {uid,gid,groups:[gid]};
+};
+const slotStat=async path=>Object.assign(await fs.lstat(path),{uid:process.getuid(),gid:workerIdentity(path).gid});
 const createRunner=options=>productionRunner({testSlotStat:slotStat,
-  testWorkerIdentity:user=>{const k=Number(user.split('-').at(-1));return {uid:1000+k,gid:2000+k,groups:[2000+k]};},...options});
+  testWorkerIdentity:workerIdentity,...options});
 let root, runner;
 const nonce='a'.repeat(32), hash=value=>createHash('sha256').update(value).digest('hex');
 beforeEach(async()=>{
   root=await fs.mkdtemp(join(process.env.TMPDIR,'forge-pool-'));
   for(const k of [1,2])await fs.mkdir(join(root,'runs',`slot-${k}`),{recursive:true,mode:0o710});
-  runner=createRunner({testRoot:root,testPath:'/usr/bin:/bin',testWorkerIdentity:user=>({uid:1000+Number(user.split('-').at(-1)),gid:2000+Number(user.split('-').at(-1)),groups:[2000+Number(user.split('-').at(-1))]})});
+  runner=createRunner({testRoot:root,testPath:'/usr/bin:/bin'});
 });
 afterEach(async()=>fs.rm(root,{recursive:true,force:true}));
 const work=p=>join(root,'runs',p.slot.replace('forge-exec-','slot-'),p.run,'work');
 const lock=p=>join(root,'receipts','worker-active-'+p.slot.split('-').at(-1));
 describe('per-user worker reservations',()=>{
+  it('legacy fixtures without isolation injections reserve multiple slots as the operator',async()=>{
+    runner=productionRunner({testRoot:root,testPath:'/usr/bin:/bin'});
+    const a=await runner.prepare({nonce}),b=await runner.prepare({nonce});
+    expect([a.slot,b.slot]).toEqual(['forge-exec-1','forge-exec-2']);
+    for(const p of [a,b])expect(p.worker).toMatchObject({uid:process.getuid(),gid:process.getgid()});
+    await runner.finish({...a,nonce});await runner.finish({...b,nonce});
+  });
+  it('an identity injection alone still requires real slot ownership to match',async()=>{
+    runner=productionRunner({testRoot:root,testWorkerIdentity:workerIdentity});
+    await expect(runner.prepare({nonce})).rejects.toThrow('Untrusted slot directory');
+    expect(await fs.readdir(join(root,'receipts'))).toEqual([]);
+  });
+  it('a slot-stat injection alone enforces isolation against resolved system identities',async()=>{
+    const identity=workerIdentity('forge-exec-1');
+    // Supply system id output without requiring forge-exec accounts on the host.
+    const lookup=vi.fn(async(file,args)=>{
+      expect(file).toBe('/usr/bin/id');
+      expect(args[1]).toBe('forge-exec-1');
+      expect(['-u','-g','-G']).toContain(args[0]);
+      return {code:0,stdout:String(args[0]==='-u'?identity.uid:identity.gid)+'\n',stderr:''};
+    });
+    const stat=vi.fn(async path=>Object.assign(await fs.lstat(path),{uid:process.getuid()+1,gid:identity.gid}));
+    runner=productionRunner({testRoot:root,testSlotStat:stat,testIdExec:lookup});
+    await expect(runner.prepare({nonce})).rejects.toThrow('Untrusted slot directory');
+    expect(stat).toHaveBeenCalledOnce();
+    expect(lookup.mock.calls).toEqual(['-u','-g','-G'].map(flag=>['/usr/bin/id',[flag,'forge-exec-1']]));
+    expect(await fs.readdir(join(root,'receipts'))).toEqual([]);
+  });
+  it.each(['symlink','non-private mode'])('legacy fixtures still refuse a %s slot directory',async fault=>{
+    const slot=join(root,'runs/slot-1');
+    if(fault==='symlink'){
+      await fs.rename(slot,slot+'.saved');await fs.symlink(slot+'.saved',slot);
+    }else await fs.chmod(slot,0o777);
+    runner=productionRunner({testRoot:root});
+    await expect(runner.prepare({nonce})).rejects.toThrow('Untrusted slot directory');
+    expect(await fs.readdir(join(root,'receipts'))).toEqual([]);
+  });
+  it('explicit isolation never accepts UID zero',async()=>{
+    const identity=user=>({...workerIdentity(user),uid:0});
+    runner=createRunner({testRoot:root,testWorkerIdentity:identity,testSlotStat:slotStat});
+    await expect(runner.prepare({nonce})).rejects.toThrow(process.getuid()===0?'Worker must not share the operator identity':'Unknown worker identity');
+    expect(await fs.readdir(join(root,'receipts'))).toEqual([]);
+  });
   async function requestFor(p) {
     const dir=work(p);await fs.writeFile(join(dir,'package-lock.json'),'lock');
     const manifest=manifestWire({entries:[{path:Buffer.from('package-lock.json'),sha256:hash('lock'),executable:false}],excluded:[]});
@@ -48,10 +95,17 @@ describe('per-user worker reservations',()=>{
       const path=join(root,'receipts','.'+name+'.writer');await fs.writeFile(path,'',{mode:0o600});
       inodes.push((await fs.stat(path)).ino);
     }
-    // Model root-owned guards on unprivileged hosts. Real opens, modes,
-    // inodes and flock remain intact; missing fchown fails the ownership proof.
-    const before=String.raw`original_open, original_fstat = os.open, os.fstat
+    // Model root guards and a distinct operator even when this test runs as
+    // root. Real opens, modes, inodes and flock remain intact; missing fchown
+    // fails the ownership proof on both privileged and unprivileged hosts.
+    const before=String.raw`original_open, original_fstat, original_stat = os.open, os.fstat, os.stat
+operator = (os.getuid() or 1000, os.getgid() or 1000)
 owners = {}
+def operator_stat(path, *args, **kwargs):
+    st = original_stat(path, *args, **kwargs)
+    values = list(st)
+    if path == ${JSON.stringify(join(root,'receipts'))}: values[4:6] = operator
+    return os.stat_result(values)
 def root_open(path, *args, **kwargs):
     fd = original_open(path, *args, **kwargs)
     if str(path).endswith('.writer'): owners.setdefault(original_fstat(fd).st_ino, (0, 0))
@@ -65,9 +119,9 @@ def transfer(fd, uid, gid):
     st = original_fstat(fd)
     assert owners[st.st_ino] == (0, 0)
     owners[st.st_ino] = (uid, gid)
-os.open, os.fstat, os.fchown = root_open, root_stat, transfer
+os.open, os.fstat, os.stat, os.fchown = root_open, root_stat, operator_stat, transfer
 `;
-    const after=`assert len(owners) == 3\nassert all(owner == (os.getuid(), os.getgid()) for owner in owners.values()), owners`;
+    const after=`assert len(owners) == 3\nassert all(owner == operator for owner in owners.values()), owners`;
     const result=await pruneWithoutUidProcesses(before,after);expect(result.status,result.stderr).toBe(0);
     for(const [i,name] of names.entries()){
       const st=await fs.stat(join(root,'receipts','.'+name+'.writer'));
@@ -87,8 +141,12 @@ os.open, os.fstat, os.fchown = root_open, root_stat, transfer
       const st=await fs.stat(join(root,'receipts','.'+name+'.writer'));
       expect(st.uid).toBe(uid);expect(st.gid).toBe(gid);expect(st.mode&0o777).toBe(0o600);
     }
+    // Load the runner and enter the fixture before dropping privilege. Private
+    // checkout/TMPDIR ancestors need not be traversable by the operator UID.
     const source=`import {createRunner} from ${JSON.stringify(new URL('../forge-exec-run.mjs',import.meta.url).href)};
-const runner=createRunner({testRoot:process.argv[1],testWorkerIdentity:user=>{
+process.chdir(process.argv[1]);
+process.setgroups([]);process.setgid(${gid});process.setuid(${uid});
+const runner=createRunner({testRoot:'.',testWorkerIdentity:user=>{
   const k=Number(user.split('-').at(-1));return {uid:1000+k,gid:2000+k,groups:[2000+k]};
 }});
 for(const k of [1,2]){
@@ -96,7 +154,7 @@ for(const k of [1,2]){
   if(p.slot!=='forge-exec-'+k)throw new Error('Wrong reservation');
 }`;
     const acquired=spawnSync(process.execPath,['--input-type=module','-e',source,root],
-      {uid,gid,encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
+      {encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
     expect(acquired.status,acquired.stderr).toBe(0);
   });
   it.each(['foreign owner','non-private mode','symlink'])('prune refuses %s before transferring writer ownership',async fault=>{
@@ -267,24 +325,24 @@ with patch.object(ctypes, 'CDLL') as libc, patch.object(os, 'listdir', return_va
   });
   it.each([
     ['duplicate uid','Duplicate worker identity'],['duplicate gid','Duplicate worker identity'],
-    ['operator uid',process.getuid()===0?'Unknown worker identity':'Worker must not share the operator identity'],['operator gid','Worker must not share the operator identity'],
+    ['operator uid','Worker must not share the operator identity'],['operator gid','Worker must not share the operator identity'],
     ['foreign owner','Untrusted slot directory'],['foreign group','Untrusted slot directory'],
     ['non-private worker group','Worker groups must be private'],
   ])('refuses production isolation violation: %s',async(fault,message)=>{
     const identity=user=>{
-      const k=Number(user.split('-').at(-1)),ids={uid:1000+k,gid:2000+k};
-      if(fault==='duplicate uid')ids.uid=1001;
-      if(fault==='duplicate gid')ids.gid=2001;
+      const ids=workerIdentity(user);
+      if(fault==='duplicate uid')ids.uid=workerIdentity('forge-exec-1').uid;
+      if(fault==='duplicate gid')ids.gid=workerIdentity('forge-exec-1').gid;
       if(fault==='operator uid')ids.uid=process.getuid();
       if(fault==='operator gid')ids.gid=process.getgid();
-      ids.groups=fault==='non-private worker group'?[ids.gid,9999]:[ids.gid];
+      ids.groups=fault==='non-private worker group'?[ids.gid,ids.gid+1]:[ids.gid];
       return ids;
     };
     const stat=async path=>{
       const st=await slotStat(path);
-      if(fault==='duplicate gid')st.gid=2001;
-      if(fault==='foreign owner')st.uid=9999;
-      if(fault==='foreign group')st.gid=9999;
+      if(fault==='duplicate gid')st.gid=workerIdentity('forge-exec-1').gid;
+      if(fault==='foreign owner')st.uid=process.getuid()+1;
+      if(fault==='foreign group')st.gid++;
       return st;
     };
     runner=createRunner({testRoot:root,testPath:'/usr/bin:/bin',testWorkerIdentity:identity,testSlotStat:stat});
@@ -300,7 +358,7 @@ with patch.object(ctypes, 'CDLL') as libc, patch.object(os, 'listdir', return_va
   it('runs two commands concurrently under separate UIDs and reaps only the finishing UID',async()=>{
     const calls=[],pending=[];
     runner=createRunner({testRoot:root,testPath:'/usr/bin:/bin',
-      testWorkerIdentity:user=>({uid:1000+Number(user.split('-').at(-1)),gid:2000+Number(user.split('-').at(-1)),groups:[2000+Number(user.split('-').at(-1))]}),
+      testWorkerIdentity:workerIdentity,testSlotStat:slotStat,
       testWorkerExec:async call=>{
         calls.push(call);
         if(call.argv[1]==='run')return new Promise(done=>pending.push(()=>done({code:0})));
@@ -317,7 +375,7 @@ with patch.object(ctypes, 'CDLL') as libc, patch.object(os, 'listdir', return_va
     try {
       await vi.waitFor(()=>expect(pending).toHaveLength(2));
       const tasks=calls.filter(c=>c.argv[1]==='run');
-      expect(tasks.map(c=>c.worker.uid).sort()).toEqual([1001,1002]);
+      expect(tasks.map(c=>c.worker.uid).sort()).toEqual([workerIdentity('forge-exec-1').uid,workerIdentity('forge-exec-2').uid]);
       expect(tasks.map(c=>c.cwd).sort()).toEqual([work(a),work(b)].sort());
       expect(tasks.every(c=>[a.slot,b.slot].includes(c.worker.user))).toBe(true);
     }finally{for(const done of pending)done();await Promise.all(running);}

@@ -3007,6 +3007,13 @@ The worker-pool suite pauses a holder before launch, runs the real prune program
 against an empty UID inventory, and proves a second controller cannot launch as
 that UID. It also tests pruning winning first and refusal at each writer entry.
 Hosts without pool directories retain the legacy UID and its own writer guard.
+Only `testRoot` fixtures without `testWorkerIdentity` or `testSlotStat` use the
+same-UID harness. Production and either explicit isolation injection enforce
+worker identity, private groups, slot ownership and identity uniqueness. Pair
+injected identities with matching slot stats unless the fixture sets real slot
+ownership. Choose synthetic IDs relative to the operator, so host accounts cannot
+mask the intended refusal. Model a distinct non-root receipt owner in prune
+handoff probes even when tests run as root; otherwise a missing transfer passes.
 The privileged fixed wrapper owns metadata operations; tasks and rsync run only
 as the reserved UID. Slot roots are ops-owned with the worker's private group
 and mode 0710 (traverse only); run containers remain operator-owned. Only work

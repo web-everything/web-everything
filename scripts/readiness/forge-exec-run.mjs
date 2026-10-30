@@ -438,32 +438,38 @@ function execute(file,args,{cwd,env,input,inherit=false,detached=false,passFd}={
     if(input!==undefined) {child.stdin.on('error',()=>{}); child.stdin.end(input);}
   });
 }
-// testRoot/testPath/testCleanupExec are explicit dependency injection only. CLI never reads them
+// testRoot/testPath/testCleanupExec/testIdExec are explicit dependency injection only. CLI never reads them
 // from its environment, nor transports them in requests.
-export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, clock=Date.now} = {}) {
+export function createRunner({testRoot, testPath, testCleanupExec, testIdExec, testWorkerIdentity, testSlotStat, testWorkerExec, testOwnershipExec, testGitExec, clock=Date.now} = {}) {
   const bases=testRoot ? join(testRoot,'bases') : '/srv/forge-base';
   const runs = testRoot ? join(testRoot,'runs') : '/srv/forge-exec';
   const receipts = testRoot ? join(testRoot,'receipts') : '/srv/forge-receipts';
   const cache = testRoot ? join(testRoot,'cache') : '/srv/forge-cache';
   const path = testRoot ? testPath : '/usr/local/bin:/usr/bin:/bin';
+  const idExec=testRoot&&testIdExec?testIdExec:execute;
+  // Only the legacy, same-UID test harness omits isolation evidence. Production
+  // and either explicit isolation injection always use the production checks.
+  const isolatedWorkers=!testRoot||testWorkerIdentity!==undefined||testSlotStat!==undefined;
   let operator={uid:process.getuid(),gid:process.getgid()};
   const statePath = (run,phase) => join(receipts,run+'.'+phase);
   const busy=()=>Object.assign(new Error('Worker execution busy or interrupted; use local fallback. Operator must stop the reserved UID before removing its worker-active lock'),{code:'forge-busy'});
   async function identity(user) {
+    if(!isolatedWorkers)return {uid:process.getuid(),gid:process.getgid()};
     let ids;
     if(testWorkerIdentity)ids=await testWorkerIdentity(user);
-    else if(testRoot&&user==='forge-exec')return {uid:process.getuid(),gid:process.getgid()};
     else {
-      const uid=await execute('/usr/bin/id',['-u',user]),gid=await execute('/usr/bin/id',['-g',user]);
+      const uid=await idExec('/usr/bin/id',['-u',user]),gid=await idExec('/usr/bin/id',['-g',user]);
       if(uid.code||gid.code||!/^\d+\n$/.test(uid.stdout)||!/^\d+\n$/.test(gid.stdout))throw new Error('Unknown worker identity');
       ids={uid:Number(uid.stdout),gid:Number(gid.stdout)};
       if(/^forge-exec-[1-9]\d*$/.test(user)){
-        const groups=await execute('/usr/bin/id',['-G',user]);
+        const groups=await idExec('/usr/bin/id',['-G',user]);
         if(groups.code||!/^\d+(?: \d+)*\n$/.test(groups.stdout))throw new Error('Worker groups must be private');
         ids.groups=groups.stdout.trim().split(' ').map(Number);
       }
     }
-    if(!ids||!Number.isSafeInteger(ids.uid)||ids.uid<=0||!Number.isSafeInteger(ids.gid)||ids.gid<0)throw new Error('Unknown worker identity');
+    if(!ids||!Number.isSafeInteger(ids.uid)||ids.uid<0||!Number.isSafeInteger(ids.gid)||ids.gid<0)throw new Error('Unknown worker identity');
+    if(/^forge-exec-[1-9]\d*$/.test(user)&&(ids.uid===operator.uid||ids.gid===operator.gid))throw new Error('Worker must not share the operator identity');
+    if(ids.uid===0)throw new Error('Unknown worker identity');
     if(/^forge-exec-[1-9]\d*$/.test(user)&&(!Array.isArray(ids.groups)||ids.groups.length!==1||ids.groups[0]!==ids.gid))throw new Error('Worker groups must be private');
     return {uid:ids.uid,gid:ids.gid};
   }
@@ -473,10 +479,9 @@ export function createRunner({testRoot, testPath, testCleanupExec, testWorkerIde
     const found=[];
     for(const name of names) {
       const user='forge-exec-'+name.slice(5),ids=await identity(user),root=join(runs,name),st=await (testSlotStat??lstat)(root);
-      if(ids.uid===operator.uid||ids.gid===operator.gid)throw new Error('Worker must not share the operator identity');
       if(st.isSymbolicLink()||!st.isDirectory()||(st.mode&0o7777)!==0o710
-        ||st.uid!==operator.uid||st.gid!==ids.gid)throw new Error('Untrusted slot directory; redeploy forge-setup and use local fallback');
-      if(found.some(w=>w.uid===ids.uid||w.gid===ids.gid))throw new Error('Duplicate worker identity');
+        ||(isolatedWorkers&&(st.uid!==operator.uid||st.gid!==ids.gid)))throw new Error('Untrusted slot directory; redeploy forge-setup and use local fallback');
+      if(isolatedWorkers&&found.some(w=>w.uid===ids.uid||w.gid===ids.gid))throw new Error('Duplicate worker identity');
       found.push({user,root,active:join(receipts,'worker-active-'+name.slice(5)),...ids});
     }
     return found;
