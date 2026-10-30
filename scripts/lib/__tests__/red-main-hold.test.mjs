@@ -241,3 +241,11 @@ describe('red-main freeze marker — one-time legacy migration (PR #4624 review)
     expect(existsSync(path)).toBe(false);
   });
 });
+
+describe('red-main-hold — latestRedSha on the signal', () => {
+  it('carries latestRedSha from the published record (or the priority record), null otherwise', () => {
+    expect(redMainSignal({ mainRedState: { ...red, latestRedSha: 'fbcf1cc849' }, now: NOW }).latestRedSha).toBe('fbcf1cc849');
+    expect(redMainSignal({ mainRedState: red, priority: { ...pri, latestRedSha: 'abc' }, now: NOW }).latestRedSha).toBe('abc');
+    expect(redMainSignal({ mainRedState: red, now: NOW }).latestRedSha).toBeNull();
+  });
+});

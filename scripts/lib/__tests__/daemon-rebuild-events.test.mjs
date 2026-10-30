@@ -266,9 +266,7 @@ describe('rebuildClone coordination events', () => {
       'stack-contained', 'state-file-busy', 'superseded-live-set-unknown', 'superseded-omits-live-overlay',
       'swapped', 'switch-busy', 'touches-dispatch-path', 'unknown', 'unsafe-ref', 'untracked-collision',
       'unverified-build', 'up-to-date', 'scoped-noop', 'fixpoint-exhausted',
-      'entries-unreadable', 'closure-incomplete', 'closure-too-large', 'scope-unreadable',
-      // Opaque evidence retains all files in an ok:true scope; it is a diagnostic, not a rebuild failure.
-      'closure-opaque',
+      'entries-unreadable', 'closure-incomplete', 'closure-too-large', 'closure-opaque', 'scope-unreadable',
     ]);
     const reasons = new Set();
     function collect(expression) {

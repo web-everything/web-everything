@@ -5,7 +5,8 @@ import { fileURLToPath } from 'node:url';
 import { cascadePolicy, logCascadeSources } from '../policy-cascade.mjs';
 
 export function daemonRebuildSettingsPath() {
-  return join(dirname(fileURLToPath(import.meta.url)), '..', 'daemon-rebuild-settings.json');
+  // Resolve on the filesystem: Vite rewrites static new URL expressions as browser assets.
+  return join(dirname(fileURLToPath(import.meta.url)), '../daemon-rebuild-settings.json');
 }
 
 /** Standard shadow never auto-graduates: enabling scoped adoption requires an explicit layer. */
