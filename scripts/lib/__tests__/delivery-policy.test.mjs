@@ -1152,6 +1152,23 @@ describe('policy journal', () => {
     expect(() => statSync(env.WE_POLICY_EVENTS_FILE + '.lock')).toThrow(/ENOENT/);
   });
 
+  it('waits out a lock holder that is slow under host load instead of dropping the event (main-red 545e68a5b)', () => {
+    const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
+    writeFileSync(lock, 'held');
+    // Deterministic stand-in for a loaded host: the holder releases once the writer has
+    // asked to sleep 600ms in total, which is longer than the old ten-attempt budget (440ms).
+    let requested = 0;
+    const sleep = vi.spyOn(Atomics, 'wait').mockImplementation((_cell, _index, _value, ms) => {
+      requested += ms;
+      if (requested >= 600) rmSync(lock, { force: true });
+      return 'timed-out';
+    });
+    try {
+      recordPolicyEvent({ event: 'after-slow-holder' }, env);
+    } finally { sleep.mockRestore(); }
+    expect(readPolicyEvents({ env })).toMatchObject([{ event: 'after-slow-holder' }]);
+  });
+
   it('refuses a live lock within a bounded wait without stopping the daemon', () => {
     const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
     writeFileSync(lock, 'held');
