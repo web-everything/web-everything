@@ -57,8 +57,9 @@ import { collectCiAuthDiagnosis, renderCiAuthDiagnosis } from './ci-auth-diagnos
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { isBudgetRefusal, postPrComment, recordOwedWrite, resolveOwedRepo } from './ci-heal-owed.mjs';
-import { resolveCiHealVerdictSettings, unsettledRequiredChecks, gateOnlyRedStates, ciGreenForEscalation, sameSha, latestRollupAttempts } from './ci-heal-verdict-recheck.mjs';
+import { resolveCiHealVerdictSettings, unsettledRequiredChecks, gateOnlyRedStates, ciGreenForEscalation, sameSha } from './ci-heal-verdict-recheck.mjs';
 import { excusePrMergeGateHolds, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
+import { summarize } from '../lib/check-state-predicate.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { HUMAN_REVIEW_HOLD_GATES } from '../lib/merge-gate-verdict.mjs';
@@ -478,10 +479,8 @@ function classifyPrChecks(parsed, { pr, repo }, {
 } = {}) {
   const { slug } = parsed;
   const rows = Array.isArray(parsed.statusCheckRollup) ? parsed.statusCheckRollup : [];
-  // Select once with R216 before the shared hold reader examines the job. It
-  // must never annotate an older failure beside a newer success/pending run.
-  const [mergeGate] = latestRollupAttempts(rows.filter(row => row.name === 'merge-gate'));
-  const statusCheckRollup = rows.filter(row => row.name !== 'merge-gate' || row === mergeGate);
+  // Reject malformed identities and conflicting flags before any hold-evidence IO.
+  summarize(rows, { requiredNames: [] });
   let readError;
   const checkedRead = reader => input => {
     try {
@@ -493,20 +492,22 @@ function classifyPrChecks(parsed, { pr, repo }, {
       throw error;
     }
   };
-  const [classified] = excusePrMergeGateHolds([{ ...parsed, number: Number(pr), statusCheckRollup }], {
+  // Classify each row separately so the shared hold reader cannot collapse attempts.
+  // One batch keeps its lazy freeze read shared across all merge-gate rows.
+  const classified = excusePrMergeGateHolds(rows.map(row => ({
+    ...parsed, number: Number(pr), statusCheckRollup: [row],
+  })), {
     repo: repo ?? slug, readMergeGateVerdict: checkedRead(readMergeGateVerdict),
     readFreeze: checkedRead(readFreeze), mergeGateSetting,
   });
   // Keep unknown evidence red and expose failures swallowed by the helper so
   // each outcome can apply its recording policy without losing check facts.
-  return { ...classified, slug, readError, statusCheckRollup: classified.statusCheckRollup.map(row => {
+  return { ...parsed, slug, readError, statusCheckRollup: classified.flatMap((item, index) => item.statusCheckRollup.map(row => {
     const excused = row.mergeGateHoldExcused;
     if (!excused?.holds?.length || !excused.holds.every(hold => hold.status === 'hold' && HUMAN_REVIEW_HOLD_GATES.includes(hold.id))) return row;
-    // Retain the observed red review gate for the escalation preflight even
-    // when the drain may excuse it for a non-candidate. Classification is shared.
-    return { ...row, conclusion: mergeGate.conclusion,
+    return { ...row, conclusion: rows[index].conclusion,
       mergeGateReviewHold: { holds: excused.holds.map(hold => hold.id), jobId: excused.jobId } };
-  }) };
+  })) };
 }
 
 async function defaultReadRequiredChecks({ repo }) {

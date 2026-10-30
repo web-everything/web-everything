@@ -770,7 +770,7 @@ syncBuiltinESMExports();
       if (['malformed', 'conflicting-flags'].includes(evidence)) {
         expect(result.stderr).toContain(evidence === 'malformed'
           ? 'Check rows must have a non-empty string name or context'
-          : 'Tied check attempts have conflicting required flags');
+          : 'Check rows have conflicting required flags');
         expect(result.stderr).not.toContain('could not re-check');
         expect(result.stderr).not.toContain('could not post');
       } else if (evidence === 'review') {
@@ -1000,15 +1000,46 @@ describe('R4: default CLI check reader classifies merge-gate review holds', () =
       .toEqual({ refusal: expect.stringContaining('merge-gate') });
   });
 
-  it('classifies only the latest merge-gate attempt by effective time', async () => {
+  it('classifies every failed merge-gate attempt independently', async () => {
     const opts = options();
     const facts = JSON.parse(opts.prChecksOptions.runGh());
     facts.statusCheckRollup.push({ name: 'merge-gate', id: 99, run_id: 1, run_attempt: 2,
       status: 'COMPLETED', conclusion: 'FAILURE', completed_at: '2026-10-28T14:00:00-04:00' });
     opts.prChecksOptions.runGh.mockReturnValue(JSON.stringify(facts));
     expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: expect.stringContaining('merge-gate') });
-    expect(opts.prChecksOptions.readMergeGateVerdict).toHaveBeenCalledTimes(1);
+    expect(opts.prChecksOptions.readMergeGateVerdict).toHaveBeenCalledTimes(2);
+    expect(opts.prChecksOptions.readMergeGateVerdict).toHaveBeenCalledWith({ repo: 'example/repo', prNumber: 6042, jobId });
     expect(opts.prChecksOptions.readMergeGateVerdict).toHaveBeenCalledWith({ repo: 'example/repo', prNumber: 6042, jobId: 99 });
+  });
+
+  it.each([false, true])('a review hold cannot excuse another merge-gate job failure (reverse=%s)', async reverse => {
+    const opts = options({ readMergeGateVerdict: vi.fn(({ jobId: id }) => ({
+      num: 6042, head_sha: HEAD, ok: false,
+      results: [{ id: id === jobId ? 'review-acceptance' : 'main-ci',
+        status: id === jobId ? 'hold' : 'fail-closed', reason: 'job-specific evidence' }],
+    })) });
+    const facts = JSON.parse(opts.prChecksOptions.runGh());
+    facts.statusCheckRollup.push({ name: 'merge-gate', id: 99,
+      status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T12:00:00-04:00' });
+    if (reverse) facts.statusCheckRollup.reverse();
+    opts.prChecksOptions.runGh.mockReturnValue(JSON.stringify(facts));
+    expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: null });
+    expect(await checkNotCiBreakRecordable({ ...opts, outcome: 'not-a-ci-break' }))
+      .toEqual({ refusal: expect.stringContaining('red: merge-gate') });
+  });
+
+  it.each([false, true])('CodeQL failure is never excused as gate-only through the default reader (reverse=%s)', async reverse => {
+    const opts = options();
+    const facts = JSON.parse(opts.prChecksOptions.runGh());
+    facts.statusCheckRollup.push(
+      { name: 'CodeQL', status: 'COMPLETED', conclusion: 'FAILURE', run_attempt: 1 },
+      { name: 'CodeQL', status: 'COMPLETED', conclusion: 'SUCCESS', run_attempt: 2 },
+    );
+    if (reverse) facts.statusCheckRollup.reverse();
+    opts.prChecksOptions.runGh.mockReturnValue(JSON.stringify(facts));
+    expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: null });
+    expect(await checkNotCiBreakRecordable({ ...opts, outcome: 'not-a-ci-break' }))
+      .toEqual({ refusal: expect.stringContaining('red: CodeQL') });
   });
 
   it('keeps a distinct required MERGE-GATE failure through the default reader', async () => {
@@ -1024,7 +1055,7 @@ describe('R4: default CLI check reader classifies merge-gate review holds', () =
     expect(opts.prChecksOptions.readMergeGateVerdict).toHaveBeenCalledWith({ repo: 'example/repo', prNumber: 6042, jobId });
   });
 
-  it.each(['SUCCESS', null])('newer success/pending evidence (%s) supersedes an older failed merge-gate without reading its verdict', async conclusion => {
+  it.each(['SUCCESS', null])('newer success/pending evidence (%s) retains the older failed merge-gate and reads its verdict', async conclusion => {
     const opts = options();
     const facts = JSON.parse(opts.prChecksOptions.runGh());
     facts.statusCheckRollup.push({ name: 'merge-gate', id: 99,
@@ -1032,9 +1063,9 @@ describe('R4: default CLI check reader classifies merge-gate review holds', () =
       started_at: '2026-10-28T14:00:00-04:00',
       ...(conclusion ? { completed_at: '2026-10-28T14:01:00-04:00' } : {}) });
     opts.prChecksOptions.runGh.mockReturnValue(JSON.stringify(facts));
-    expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: null });
+    expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: conclusion ? expect.stringContaining('merge-gate') : null });
     expect(await checkNotCiBreakRecordable({ ...opts, outcome: 'not-a-ci-break' }))
       .toEqual({ refusal: conclusion ? null : expect.stringContaining('merge-gate') });
-    expect(opts.prChecksOptions.readMergeGateVerdict).not.toHaveBeenCalled();
+    expect(opts.prChecksOptions.readMergeGateVerdict).toHaveBeenCalledWith({ repo: 'example/repo', prNumber: 6042, jobId });
   });
 });

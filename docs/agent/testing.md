@@ -2956,28 +2956,22 @@ heuristic. The operator must arrange actual writer exclusion before reclamation 
 Regression tests append in the final-stat/removal interval, hold an open transcript descriptor, test
 unavailable exclusion, and queue a cooperating writer through the same exclusion used by removal.
 
-## CI-heal check evidence (R216)
+## CI-heal check evidence (R272)
 
-Check names and required rosters match exactly, including case, as in the drain's
-`latestCheckNamed`: a passing `TEST` never clears a failing or missing required `test`.
-Only status and conclusion values are case-insensitive; CodeQL and hold-gate names retain their exact identity.
-Rank rollup evidence with `scripts/conveyor/ci-heal-verdict-recheck.mjs#latestRollupAttempts`: completion time
-(only a zoned ISO-8601 string with a real calendar date counts; numbers, bare-number strings such as
-`"0"`, zone-less, impossible, pre-2000/epoch and more-than-a-day-in-the-future values count as absent, since `Date.parse` alone reads
-`"0"` as a local-time year-2000 date), else valid start time, else valid creation time
-(`created_at`/`createdAt`), then BigInt-exact check-run id. A row with no valid timestamp after these
-fallbacks ranks newest (effective time `+Infinity`) whenever the shared predicate classifies it
-pending or red: unfinished statuses, CANCELLED/STALE, FAILURE, TIMED_OUT, ACTION_REQUIRED,
-STARTUP_FAILURE, and unknown, empty or missing conclusions. So a dated success can never mask them.
-Only undated green rows (SUCCESS/NEUTRAL/SKIPPED) rank lowest, so they can never mask a dated failure.
-`ci-heal-verdict-recheck.test.mjs` pins every such pairing ("dated failure outranks undated …",
-"undated … outranks a dated success …") in all three source tiers, both input orders and every
-undated shape, plus timestamp fallbacks and row flags. Workflow run ids and attempt counters never rank evidence. Verdict readers retain
-CheckRun → untagged → StatusContext precedence before ranking within the chosen tier.
-The rollup adapter filters by time, then delegates exact id and fail-closed tie handling to
-`scripts/lib/check-state-predicate.mjs#latestAttempts`, whose S1 contract remains the greatest
-`(run_attempt, id)` integer pair. The adapter clears workflow attempt ranks on temporary copies
-and returns the original rows, so the CLI annotates the same selected merge-gate evidence.
+Check names and required rosters match exactly, including case: a passing `TEST`
+never clears a failing or missing required `test`. Only status and conclusion values
+are case-insensitive; CodeQL and hold-gate names retain their exact identity.
+Every row for a required name must classify green under the shared check-state
+predicate. Any failed, cancelled, stale, unfinished, unknown or unreadable row blocks
+successful admission, even beside a success. No source tier, workflow run, attempt,
+id or timestamp can discard evidence. Compatibility exports `latestAttempts` and
+`latestRollupAttempts` retain all rows without ranking or mutation.
+The regression suites retain timestamp, metadata, source-tier, undated and input-order
+scenarios and require mixed evidence to fail closed. CodeQL failures always block
+`not-a-ci-break` and gate-only excusal, including when CodeQL is outside the required
+roster and the drain's CodeQL switch is off. A merge-gate name is excusable only when
+every non-green row is positively classified as a review hold; each row is classified
+independently, so one held job cannot excuse another job's failure or unfinished state.
 The escalation CLI reuses `excusePrMergeGateHolds` for head-bound hold evidence, with
 `prChecksOptions` supplying hermetic readers. A failed PR or roster read permits recording with a warning; an unreadable merge-gate verdict or freeze read still permits `needs-human` with a warning, but keeps the red-check refusal for `not-a-ci-break`.
 Classification errors, including malformed rollup identities, propagate to the CLI's error handler and abort

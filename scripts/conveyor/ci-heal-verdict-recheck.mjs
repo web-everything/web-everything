@@ -8,14 +8,13 @@
  * for hours, and the notes half told the operator it "needs your decision".
  *
  * `not-a-ci-break` means "every required check is green; only the review gate is red". A required check other than
- * `review-gate` whose LATEST run on this head completed failing contradicts it. Two uses:
+ * `review-gate` with any failing row on this head contradicts it. Two uses:
  *   - {@link contradictingChecks}: the daemon voids a contradicted verdict (a void comment, see
  *     `ci-heal-escalation-mark.mjs#CI_HEAL_VERDICT_VOID_MARKER`); the ordinary ci-heal path (caps included) resumes.
  *   - {@link unsettledRequiredChecks}: the escalation CLI refuses to record `not-a-ci-break` while a required check is
  *     still pending, missing, or red — the verdict can only be true once they have all finished green.
  *
- * Reuses the repo's own readers: `latestAttempts` (latest run per check name), the shared
- * check-state predicate, and `withoutImpliedRequiredChecks` (a required `integration` implied by `test`).
+ * Reuses the shared check-state predicate, and `withoutImpliedRequiredChecks` (a required `integration` implied by `test`).
  * Declared setting `ci-heal-verdict-settings.json` (env `WE_CI_HEAL_RECHECK_NOT_CI_BREAK` beats the file);
  * missing, malformed or `off` = the behaviour before this card. PURE apart from the settings file read.
  */
@@ -24,10 +23,9 @@ import { resolveHumanGateRemovalSetting } from '../lib/merge-gate-hold-class.mjs
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { rollupRowKind } from '../lib/rollup-collapse.mjs';
 import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.mjs';
-import { classifyCheck, latestAttempts, summarize } from '../lib/check-state-predicate.mjs';
-import { CODEQL_CHECK_NAME, failedCodeQLCheck, loadDrainGateSettings } from '../lib/codeql-gate.mjs';
+import { classifyCheck, summarize } from '../lib/check-state-predicate.mjs';
+import { CODEQL_CHECK_NAME } from '../lib/codeql-gate.mjs';
 
 export const CI_HEAL_VERDICT_ENV = 'WE_CI_HEAL_RECHECK_NOT_CI_BREAK';
 export const ciHealVerdictSettingsPath = () => join(dirname(fileURLToPath(import.meta.url)), 'ci-heal-verdict-settings.json');
@@ -97,71 +95,34 @@ const normalizeRollupCheck = row => {
   return check;
 };
 
-// Only zoned ISO-8601 timestamps with a real calendar date count. Date.parse alone
-// reads junk such as "0" or "12" as a local-time year 2000/2001 date.
-const ISO_TIMESTAMP = /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i;
-const timestampValue = value => {
-  const match = typeof value === 'string' ? ISO_TIMESTAMP.exec(value) : null;
-  if (!match) return NaN;
-  const [year, month, day] = match.slice(1).map(Number);
-  const calendar = new Date(Date.UTC(year, month - 1, day));
-  if (calendar.getUTCMonth() !== month - 1 || calendar.getUTCDate() !== day) return NaN;
-  return Date.parse(value);
-};
-
-// A time more than a day past the reader's clock cannot be real evidence, so a
-// status poster cannot pin a far-future success above every later failure.
-const FUTURE_SKEW_MS = 24 * 60 * 60 * 1000;
-const rollupTime = (row, now) => {
-  for (const key of ['completedAt', 'completed_at', 'startedAt', 'started_at', 'createdAt', 'created_at']) {
-    const time = timestampValue(row?.[key]);
-    if (Number.isFinite(time) && time > Date.parse('2000-01-01T00:00:00Z') && time <= now + FUTURE_SKEW_MS) return time;
-  }
-  const state = classifyCheck({ ...normalizeRollupCheck(row), required: true });
-  return state === 'pending' || state === 'red' ? Infinity : -Infinity;
-};
-
-/**
- * Select original rollup rows by source tier, effective time, then exact check id.
- * Workflow attempt counters are scoped to different runs, so cannot rank this feed.
- * Keep S1's integer-pair contract intact: filter by time, then let latestAttempts
- * compare ids and resolve ambiguous ties using the shared fail-closed policy.
- * `now` (ms) only bounds future timestamps; inject it for hermetic tests.
- */
-export function latestRollupAttempts(rollup, { now = Date.now() } = {}) {
-  const rows = Array.isArray(rollup) ? rollup : [];
-  const groups = new Map();
-  for (const row of rows) {
-    const name = row?.name || row?.context;
-    if (!groups.has(name)) groups.set(name, []);
-    groups.get(name).push(row);
-  }
-  return [...groups.values()].flatMap(group => {
-    const pool = ['CheckRun', 'untagged', 'StatusContext']
-      .map(kind => group.filter(row => rollupRowKind(row) === kind)).find(tier => tier.length);
-    const timed = pool.map(row => ({ row, time: rollupTime(row, now) }));
-    const newest = timed.reduce((best, item) => Math.max(best, item.time), -Infinity);
-    const originals = new Map(timed.filter(item => item.time === newest)
-      .map(({ row }) => [{ ...normalizeRollupCheck(row), run_attempt: 0 }, row]));
-    return latestAttempts([...originals.keys()]).map(check => originals.get(check));
-  });
+/** Compatibility export: preserve every rollup row; metadata never selects evidence. */
+export function latestRollupAttempts(rollup) {
+  return Array.isArray(rollup) ? [...rollup] : [];
 }
 
 /** Adapt GraphQL rollups and legacy statuses without replacing the shared state policy. */
 function checkEvidence(rollup, requiredChecks) {
-  const checks = latestRollupAttempts(rollup).map(normalizeRollupCheck);
+  const checks = (Array.isArray(rollup) ? rollup : []).map(normalizeRollupCheck);
   // Only the shared merge-gate hold classifier's annotation proves a review hold.
   // A job/setup failure (or unreadable verdict) must remain ordinary CI evidence.
   const holdGateNames = [REVIEW_GATE_CHECK];
-  if (checks.some(row => row.name === 'merge-gate' && row.mergeGateReviewHold)) holdGateNames.push('merge-gate');
+  const mergeGates = checks.filter(row => row.name === 'merge-gate');
+  if (mergeGates.length && mergeGates.every(row =>
+    classifyCheck({ ...row, required: true }) === 'green' || row.mergeGateReviewHold)) {
+    holdGateNames.push('merge-gate');
+  }
   const roster = withoutImpliedRequiredChecks(Array.isArray(requiredChecks) ? requiredChecks : [], checks)
     .filter(name => !holdGateNames.includes(name));
+  // CodeQL evidence is never excused by a drain setting or an optional roster.
+  if (checks.some(row => row.name === CODEQL_CHECK_NAME) && !roster.includes(CODEQL_CHECK_NAME)) {
+    roster.push(CODEQL_CHECK_NAME);
+  }
   return { checks, roster, holdGateNames };
 }
 
 /**
- * The required checks (minus review-gate and proven merge-gate review holds), split by their LATEST run. PURE.
- * An empty/unknown required set returns nothing at all: with no list to judge against, nothing is claimed.
+ * The required checks (minus review-gate and proven merge-gate review holds), judged across every row. PURE.
+ * An empty/unknown required set judges only observed CodeQL evidence.
  * @returns {{red: string[], pending: string[], missing: string[], green: string[]}}
  */
 export function requiredCheckStates({ rollup, requiredChecks }) {
@@ -178,19 +139,16 @@ export function requiredCheckStates({ rollup, requiredChecks }) {
   return out;
 }
 
-/** Include gates and enabled drain-blocking CodeQL failures, even outside the required roster. */
-export function gateOnlyRedStates({ rollup, requiredChecks, drainGateSettings = loadDrainGateSettings() }) {
+/** Include gates and CodeQL evidence, even outside the required roster. */
+export function gateOnlyRedStates({ rollup, requiredChecks }) {
   const { checks, roster, holdGateNames } = checkEvidence(rollup, requiredChecks);
-  // Reuse the drain's exact-name failure rule on the already-selected latest attempts.
-  const codeql = drainGateSettings.drainBlocksOnCodeQL && failedCodeQLCheck({ statusCheckRollup: checks });
-  const requiredNames = [...roster, ...gateNames, ...(codeql ? [CODEQL_CHECK_NAME] : [])];
+  const requiredNames = [...roster, ...gateNames];
   const { gateOnlyRed, redSet } = summarize(checks, { requiredNames, holdGateNames });
   return { gateOnlyRed, red: [...redSet] };
 }
 
 /**
- * The required checks that contradict a `not-a-ci-break` verdict on THIS head: names whose latest run completed
- * failing. `[]` when the escalation is not `not-a-ci-break`, names another head, or nothing is red. PURE.
+ * The required checks that contradict a `not-a-ci-break` verdict on THIS head: names with any failing row. `[]` when the escalation is not `not-a-ci-break`, names another head, or nothing is red. PURE.
  * @param {{escalation:{outcome?:string, headSha?:string}|null, headSha:string, rollup:Array<object>, requiredChecks:string[]}} o
  * @returns {string[]}
  */
