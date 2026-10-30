@@ -326,10 +326,21 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
   const now = deps.now ?? (() => new Date().toISOString());
   let step = 'state';
   const setStep = name => { step = name; };
-  const git = (args, cwd = root) => {
+  const git = (args, cwd = root, globalArgs = [], opts = {}) => {
     setStep(args[0]);
-    return retryGit(deps.git ?? executeGit, args, { cwd, env: { ...env, ...REBUILD_IDENTITY_ENV } }, deps,
-      () => { if (args[0] === 'clone') io.rmSync(args.at(-1), { recursive: true, force: true }); });
+    return retryGit((args, opts) => (deps.git ?? executeGit)([...globalArgs, ...args], opts),
+      args, { ...opts, cwd, env: { ...env, ...REBUILD_IDENTITY_ENV } }, deps,
+      () => {
+        if (args[0] === 'clone') io.rmSync(args.at(-1), { recursive: true, force: true });
+        else if (args[0] === 'checkout' && cwd !== root) {
+          // Interrupted checkouts can leave a partial index and untracked target files.
+          io.rmSync(join(cwd, '.git', 'index'), { force: true });
+          io.rmSync(join(cwd, '.git', 'index.lock'), { force: true });
+          for (const entry of io.readdirSync(cwd)) {
+            if (entry !== '.git') io.rmSync(join(cwd, entry), { recursive: true, force: true });
+          }
+        }
+      });
   };
   const failureEvent = async error => {
     const detail = { ref, step: error.step ?? step, stderrTail: error.stderrTail ?? '', main: main ?? null };
@@ -371,13 +382,21 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     output(git(['clone', '--shared', '--no-checkout', root, scratch]));
     output(git(['remote', 'set-url', 'origin', origin], scratch));
     if (!fetchOverlay(args => git(args, scratch), root, env, ref, old, io)) return await skip('stale-registration');
-    output(git(['checkout', '-b', ref, `origin/${ref}`], scratch));
+    output(git(['checkout', '--force', '-b', ref, `origin/${ref}`], scratch, [], { timeout: 300_000 }));
     const from = sha(git(['rev-parse', 'HEAD'], scratch));
     main = sha(git(['rev-parse', 'origin/main'], scratch));
     const base = sha(git(['merge-base', main, from], scratch));
     const own = paths(git(['diff', '--name-only', '-z', base, from], scratch));
     let merge, mergeError;
-    try { merge = git(['merge', '--no-edit', 'origin/main'], scratch); }
+    try {
+      // The overlay may predate main's merge attributes. Keep the retry/diagnostic step as merge.
+      merge = git(['merge', '--no-edit', 'origin/main'], scratch, ['--attr-source=origin/main']);
+      if (merge.status === 129 && !merge.error
+        && /^unknown option: --attr-source(?:=origin\/main)?\r?$/m.test(merge.stderr ?? '')) {
+        // Git before 2.40 rejects the global option before starting a merge.
+        merge = git(['merge', '--no-edit', 'origin/main'], scratch);
+      }
+    }
     catch (error) {
       if (!error.transientGit) throw error;
       mergeError = error; merge = { error };
