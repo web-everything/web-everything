@@ -1374,7 +1374,7 @@ it('an unscopable default request refuses before stamping a runnable marker', ()
 });
 
 describe('local timeout-only retry under admission', () => {
-  function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, live = false, phaseAdmission, scan = false, scanExit = 0, importsSource = false, guard = false, guardExit = 0, guardExcluded = false, guardReport = true } = {}) {
+  function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, live = false, phaseAdmission, scan = false, scanExit = 0, importsSource = false, guard = false, guardExit = 0, guardExcluded = false, guardReport = true, outputLines = 148 } = {}) {
     const files = truncated ? Array.from({ length: 21 }, (_, i) => `untouched-${i}.test.mjs`) : ['untouched-a.test.mjs', 'untouched-b.test.mjs'];
     // No trailing newline: a gate may end its stderr mid-line, and dispatch's markers must still start a line.
     const stderr = files.map((f, i) => ` FAIL  ${f} > case ${i}\n${mixed && i === 1 ? 'AssertionError: wrong value' : 'Error: Test timed out in 5000ms.'}\n`).join('').trimEnd();
@@ -1403,9 +1403,11 @@ it('first attempt times out', async () => {
     if (live) writeFileSync(join(dir, 'vitest.config.mjs'), 'export default { test: { environment: "node", include: ["*.test.mjs"] } };\n');
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ type: 'module', scripts: { 'test:unit': 'vitest run', 'check:standards': 'true' } }));
     const admissionModule = resolve(process.cwd(), 'scripts/readiness/heavy-admission.mjs');
+    // Stub commands exit immediately too; drain their pipe writes before exiting.
     const fake = `#!/usr/bin/env node
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { admissionLockRoot, heldSlots } from ${JSON.stringify(admissionModule)};
+import { writeAllSync } from ${JSON.stringify(resolve(process.cwd(), 'scripts/lib/write-all-sync.mjs'))};
 const args = process.argv.slice(2);
 const held = heldSlots({ lockRoot: admissionLockRoot(process.cwd()), cap: 1, fastSlots: 1 });
 appendFileSync('calls.jsonl', JSON.stringify({ args, held, inherited: process.env.WE_HEAVY_ADMISSION_HELD, nonce: process.env.WE_VERIFY_MARKER_NONCE ?? null }) + '\\n');
@@ -1415,17 +1417,17 @@ if (${live} && args[0] === 'vitest') {
   process.exit(result.status ?? 2);
 }
 if (args[0] === 'vitest' && args[1] === 'related') {
-  process.stdout.write('passed file\\n'.repeat(148));
-  process.stderr.write(${JSON.stringify(stderr)});
-  process.stdout.write(${JSON.stringify(stdout)});
+  writeAllSync(1, 'passed file\\n'.repeat(${outputLines}));
+  writeAllSync(2, ${JSON.stringify(stderr)});
+  writeAllSync(1, ${JSON.stringify(stdout)});
   process.exit(1);
 }
 if (args[0] === 'vitest' && args.some(a => a.includes('conformance'))) {
-  if (${scanExit}) process.stderr.write(' FAIL  scripts/lib/__tests__/review-policy.conformance.test.mjs > scans changed files\\n');
+  if (${scanExit}) writeAllSync(2, ' FAIL  scripts/lib/__tests__/review-policy.conformance.test.mjs > scans changed files\\n');
   process.exit(${scanExit});
 }
 if (args[0] === 'vitest' && args.some(a => a.includes('guard.test'))) {
-  if (${guardExit}) process.stderr.write(' FAIL  guard.test.mjs > repo-wide guard\\n');
+  if (${guardExit}) writeAllSync(2, ' FAIL  guard.test.mjs > repo-wide guard\\n');
   const report = args.find(a => a.startsWith('--outputFile.json='));
   if (report && ${guardReport}) {
     const names = args.filter(a => a.endsWith('.test.mjs') && !a.includes('excluded')).map(a => process.cwd() + '/' + a);
@@ -1434,7 +1436,7 @@ if (args[0] === 'vitest' && args.some(a => a.includes('guard.test'))) {
   process.exit(${guardExit});
 }
 if (args[0] === 'vitest') process.exit(${retryExit});
-if (${standardsExit}) process.stdout.write('  error  invisible-characters: U+200B in source.mjs\\n');
+if (${standardsExit}) writeAllSync(1, '  error  invisible-characters: U+200B in source.mjs\\n');
 process.exit(${standardsExit});
 `;
     for (const name of ['npx', 'npm']) {
@@ -1449,10 +1451,24 @@ process.exit(${standardsExit});
     const env = { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}`, LANE_POOL_ROOT: join(dir, 'pool'), WE_HEAVY_ADMISSION_CAP: '1', WE_VERIFY_PHASE_ADMISSION: phaseAdmission, WE_VERIFY_STANDARDS: 'always', TMPDIR: join(dir, 'tmp'), ...(guard ? { WE_VERIFY_ALWAYS_RUN_TESTS: guardExcluded ? 'guard.test.mjs,excluded.test.mjs' : 'guard.test.mjs' } : {}) };
     function invoke(args = [], extraEnv = {}) {
       const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, env: { ...env, ...extraEnv }, encoding: 'utf8' });
-      return { code: result.status, json: JSON.parse(result.stdout.trim().split('\n').at(-1)), stdout: result.stdout, stderr: result.stderr };
+      expect(result.error, result.stderr).toBeUndefined();
+      expect(result.signal, result.stderr).toBeNull();
+      const terminal = result.stdout.trim().split('\n').at(-1);
+      expect(terminal, `missing verification verdict (exit ${result.status}): ${result.stderr}`).toMatch(/^\{"sha":/);
+      return { code: result.status, json: JSON.parse(terminal), stdout: result.stdout, stderr: result.stderr };
     }
     return { files, invoke, calls: () => readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) };
   }
+
+  it('drains phase output larger than a pipe buffer before the terminal JSON verdict', () => {
+    const outputLines = 24000;
+    const f = fixture({ outputLines });
+    const result = f.invoke();
+    expect(result.code, result.stderr).toBe(0);
+    expect(result.json).toMatchObject({ status: 'green', retriedTimeouts: f.files });
+    expect(result.stdout.split('passed file\n')).toHaveLength(outputLines + 1);
+    expect(f.calls()).toHaveLength(3);
+  });
 
   // #verify-phase-admission — real slots across the related run, retry, and standards.
   it.each([undefined, '0'])('records phase admission or the opt-out (%s)', phaseAdmission => {

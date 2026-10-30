@@ -9,6 +9,7 @@ import {isAllowedCommand, verifyReceipt, runRemote} from '../remote-exec.mjs';
 import {resolveAdmissionPolicy, formatAdmissionPolicy, runWithRemoteDecision, heldSlots} from '../heavy-admission.mjs';
 import {main as telemetryCli, readForgeTelemetry} from '../forge-telemetry.mjs';
 import {checkRemoteHealth} from '../forge-remote-health.mjs';
+import {keepAliveScript} from '../../lib/test-keepalive.mjs';
 
 const roots = [];
 const scratch = () => {const root=mkdtempSync(join(process.env.TMPDIR,'forge-controls-')); roots.push(root); return root;};
@@ -311,7 +312,7 @@ describe('remote controls', () => {
         readTelemetry:async()=>({sampledAtET:easternTimestamp(${now}),cores:8,loadPerCore:0.1,memFreePct:90,activeRuns:0,recent:[]}),
         remoteExec:()=>new Promise((resolve,reject)=>{
           // Model the remote process boundary: the job outlives this client.
-          const job=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});
+          const job=spawn(process.execPath,['-e',${JSON.stringify(keepAliveScript())}],{detached:true,stdio:'ignore'});
           job.on('error',reject);
           job.once('spawn',()=>{job.unref();process.send({stage:'dispatched',jobPid:job.pid});});
         }),

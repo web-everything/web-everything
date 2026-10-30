@@ -67,7 +67,14 @@ function fixture() {
     WE_DAEMON_OVERLAY_DIR: mktemp('we-hold-live-overlay-'),
   };
   const smoke = vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [{ name: 'reconcile-dry-run', ok: true, ms: 10 }] } }));
-  const tick = () => rebuildClone({ root: clone, env, runSmoke: smoke, prState: async () => 'OPEN', log: { error: () => {} } });
+  // This fixture proves overlay planning/adoption, with smoke already injected. Supply
+  // all dispatch-smoke hooks too, so it never loads the real dispatcher's module graph.
+  const dispatchSmoke = {
+    settings: { dispatchSmoke: 'off' },
+    run: () => { throw new Error('unexpected real dispatch smoke'); },
+    match: () => [],
+  };
+  const tick = () => rebuildClone({ root: clone, env, runSmoke: smoke, dispatchSmoke, prState: async () => 'OPEN', log: { error: () => {} } });
   const head = () => gitOk(clone, ['rev-parse', 'HEAD']).trim();
   return { clone, env, init, push, tick, head, smoke };
 }

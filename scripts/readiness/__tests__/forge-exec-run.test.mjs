@@ -98,7 +98,8 @@ describe('sibling root snapshot acceptance', () => {
     expect(await readFile(join(sibling,'plugs','runtime.js'),'utf8')).toBe('export const plug = true;\n');
     expect(await runner.finish(request)).toEqual({v:1,nonce:request.nonce,run:request.run,
       inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,
-      manifestDigest:request.manifestDigest,siblingShas:request.siblingShas,phase:'test',code:3});
+      manifestDigest:request.manifestDigest,siblingShas:request.siblingShas,phase:'test',code:3,
+      timings:{installMs:expect.any(Number),runMs:expect.any(Number)}});
   });
 
   it.each([
@@ -999,10 +1000,10 @@ if (globalThis.loaded !== ${tests.length}) process.exit(9);
       .flatMap(pattern => ['', 'nested/'].map(depth => pattern.replaceAll('**/', depth).replaceAll('*', 'identity'))));
     const names = [...new Set([...positives, 'scripts/__tests__/support.json',
       'scripts/__tests__/credentials.js', 'notes.test.txt', 'support.js'])];
-    for (const name of names) {
+    await Promise.all(names.map(async name => {
       await mkdir(join(work, name, '..'), {recursive:true});
       await writeFile(join(work, name), 'fixture');
-    }
+    }));
     const binding = await snapshot(['package-lock.json', ...names]);
     const verified = await verify(binding.manifest, binding.manifestDigest);
     const selected = new Set(verified.testPaths.map(path => path.toString()));
