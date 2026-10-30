@@ -36,6 +36,14 @@ export function resolveProviderCap(provider, env = process.env) {
   if (provider === 'codex' && env?.[DAILY_CAP_ENV] !== undefined) return resolveDailyCap(env);
   return PROVIDER_CAP_DEFAULT[provider] ?? DEFAULT_DAILY_CAP;
 }
+/** Live operation controls may enable a default-disabled provider; explicit env caps always win. */
+export function resolveRoutingProviderCap(provider, env = process.env, entry) {
+  if (entry?.disabledProviders?.includes(provider)) return 0;
+  const cap = resolveProviderCap(provider, env);
+  return entry?.enabledProviders?.includes(provider) && cap === 0 && PROVIDER_CAP_DEFAULT[provider] === 0
+    && env?.[PROVIDER_CAP_ENV[provider]] === undefined
+    ? (PROVIDER_CAP_DEFAULT[provider] || 300) : cap;
+}
 /** @returns {number} the configured daily call cap (a non-negative integer), else the default. PURE. */
 export function resolveDailyCap(env = process.env) {
   const n = Number(env?.[DAILY_CAP_ENV]);

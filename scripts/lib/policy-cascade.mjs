@@ -25,6 +25,7 @@
  *   Never throws. A missing platform file is "layer not set"; an unreadable one is skipped and named in `errors`.
  */
 import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isUnderTest } from './under-test.mjs';
@@ -34,6 +35,10 @@ export const PLATFORM_PREFERENCES_PATH = join(HERE, 'delivery-platform-preferenc
 /** The older platform-layer file (deliveryPriority). Read under the main file; the main file wins per key. */
 export const LEGACY_PLATFORM_PREFERENCES_PATHS = Object.freeze([join(HERE, 'delivery-priority-settings.json')]);
 export const PLATFORM_PREFERENCES_ENV = 'WE_PLATFORM_PREFERENCES_FILE';
+/** Operator-owned final platform layer; never written inside a checkout. */
+export function operatorPreferencesPath(env = process.env) {
+  return String(env?.[PLATFORM_PREFERENCES_ENV] ?? '').trim() || join(homedir(), '.claude', 'platform-preferences.json');
+}
 export const POLICY_CASCADE_LOG_ENV = 'WE_POLICY_CASCADE_LOG';
 export const CASCADE_LAYERS = Object.freeze(['standard', 'platform', 'tool', 'env']);
 
@@ -46,7 +51,7 @@ const UNSAFE = new Set(['__proto__', 'constructor', 'prototype']);
  */
 export function readPlatformPreferences({ env = process.env, readFile = readFileSync } = {}) {
   const override = String(env?.[PLATFORM_PREFERENCES_ENV] ?? '').trim();
-  const paths = override ? [override] : [...LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH];
+  const paths = override ? [override] : [...LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH, operatorPreferencesPath(env)];
   const prefs = {};
   const errors = [];
   for (const path of paths) {

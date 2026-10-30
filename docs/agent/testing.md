@@ -1,5 +1,19 @@
 # Testing — Three-Tier Strategy
 
+## Live operator routing fixtures
+
+`routing-overrides.test.mjs` covers the routing reader's last-good snapshot across repo edits and
+operator `routingOverrides` changes, including clearing and one event per applied change.
+`routing-override.test.mjs` exercises the declared CLI and atomic preference writer with a temporary
+`WE_PLATFORM_PREFERENCES_FILE`; never point write tests at the operator's real preferences.
+The red-team live-reload case injects `io.readRoutingPolicy` and keeps CLI, quota and reservation
+checks in the selection path. Explicit provider selection enables a default-zero provider with a
+finite daily cap only when its env cap is unset; explicit env caps (including zero) remain binding.
+Clearing restores the repo/env defaults on the next pass. The preference writer holds the shared
+file lock across the full read-modify-write; overlapping writer fixtures must preserve both updates.
+Non-judged operation declarations may use `provider` and `model` as real inputs. On judged
+operations those names remain reserved juror controls; undeclared juror flags still fail closed.
+
 ## Human-only enqueue approval license (R212)
 
 `human-only-enqueue-license.test.mjs` uses local Git repositories to exercise exact clearance,

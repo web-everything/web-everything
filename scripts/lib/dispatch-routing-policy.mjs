@@ -5,9 +5,10 @@ import { initialRoutingPolicy as defaults } from './dispatch-routing-policy-sour
 const CATALOG = Object.freeze({
   claude: ['claude-haiku-5-5', 'claude-sonnet-5-5', 'claude-opus-5-5'],
   codex: ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra'],
-  antigravity: ['claude-sonnet-4-6', 'claude-opus-4-6-thinking', 'gemini-3.8-flash-high', 'gemini-3.8-flash', 'gemini-3.1-pro', 'gemini-4-argon-high'],
+  // Historical ids remain valid for persisted runs; aliases select the current family.
+  antigravity: ['claude-sonnet-5-5', 'claude-sonnet-4-6', 'claude-opus-4-6-thinking', 'gemini-3.8-flash-high', 'gemini-3.8-flash', 'gemini-3.1-pro', 'gemini-4-argon-high'],
   // Card 84 — agy 1.3.0 serves the 5.5 family with the effort baked into the id (`agy models`, 2026-10-06).
-  'agy-claude': ['claude-sonnet-4-6', 'claude-opus-4-6-thinking', 'claude-opus-5-5-high', 'claude-opus-5-5-medium', 'claude-opus-5-5-low',
+  'agy-claude': ['claude-sonnet-5-5', 'claude-sonnet-4-6', 'claude-opus-4-6-thinking', 'claude-opus-5-5-high', 'claude-opus-5-5-medium', 'claude-opus-5-5-low',
     'claude-sonnet-5-5-high', 'claude-sonnet-5-5-medium', 'claude-sonnet-5-5-low'],
   'agy-gemini': ['gemini-3.8-flash-high', 'gemini-3.8-flash', 'gemini-3.1-pro'],
 });
@@ -68,8 +69,9 @@ export function validateRoutingPolicy(input) {
     for (const [name, entry] of Object.entries(entries)) {
       const path = `${group}.${name}`;
       if (!name.trim()) fail(`${group} has an empty key`);
-      if (entry?.inherit === true) { keys(entry, ['inherit', 'effort'], path); validateEffort(entry.effort); continue; }
-      keys(entry, ['provider', 'model', 'effort', 'fallback', 'mode'], path);
+      validateProviderControls(entry, path);
+      if (entry?.inherit === true) { keys(entry, ['inherit', 'effort', 'enabledProviders', 'disabledProviders'], path); validateEffort(entry.effort); continue; }
+      keys(entry, ['provider', 'model', 'effort', 'fallback', 'mode', 'enabledProviders', 'disabledProviders'], path);
       // Card 84 — `mode: "shadow"`: the primary provider runs as a recorded shadow beside the first Claude route in
       // `fallback`, which alone counts. Only review seats read it (we:scripts/lib/review-seat-provider.mjs).
       if (entry.mode !== undefined && (entry.mode !== 'shadow' || !entry.fallback?.some?.((f) => f?.provider === 'claude'))) {
@@ -88,6 +90,41 @@ export function validateRoutingPolicy(input) {
   if (!policy.operations['*']) fail('operations.* is required');
   return freeze(policy);
 }
+/** Provider controls are operation-local and validated even on inherited routes. */
+function validateProviderControls(entry, path) {
+  for (const key of ['enabledProviders', 'disabledProviders']) {
+    if (entry?.[key] !== undefined && (!Array.isArray(entry[key]) || entry[key].some(p => !Object.hasOwn(CATALOG, p)) || new Set(entry[key]).size !== entry[key].length)) fail(`${path}.${key} must contain distinct known providers`);
+  }
+  if (entry?.enabledProviders?.some(p => entry.disabledProviders?.includes(p))) fail(`${path}: provider cannot be both enabled and disabled`);
+}
+
+export function defaultPolicyModel(provider) {
+  const model = { claude: 'sonnet', codex: 'default', antigravity: 'sonnet', 'agy-claude': 'sonnet', 'agy-gemini': 'flash' }[provider];
+  if (!model) fail(`unknown provider ${JSON.stringify(provider)}`);
+  return model;
+}
+
+/** Arrays replace; nested effort maps merge. Overrides never mutate the repo snapshot. */
+export function applyRoutingOverrides(base, overrides = {}) {
+  if (!object(overrides)) fail('routingOverrides must be an object');
+  const policy = structuredClone(base);
+  for (const [name, patch] of Object.entries(overrides)) {
+    if (!Object.hasOwn(policy.operations, name)) fail(`routingOverrides: unknown operation ${name}`);
+    keys(patch, ['provider', 'model', 'effort', 'fallback', 'mode', 'enabledProviders', 'disabledProviders'], `routingOverrides.${name}`);
+    const entry = { ...policy.operations[name], ...patch };
+    if (object(patch.effort)) entry.effort = { ...(object(policy.operations[name].effort) ? policy.operations[name].effort : {}), ...patch.effort };
+    if (patch.provider !== undefined) {
+      delete entry.inherit;
+      entry.model = patch.model ?? (patch.provider === policy.operations[name].provider ? policy.operations[name].model : defaultPolicyModel(patch.provider));
+      entry.fallback ??= [];
+      // Selecting a provider explicitly is also a live enable, including a default-zero Gemini cap.
+      entry.enabledProviders = [...new Set([...(entry.enabledProviders ?? []), patch.provider])];
+    }
+    policy.operations[name] = entry;
+  }
+  return validateRoutingPolicy(policy);
+}
+
 /** Null means retain the existing evidence/tier decision. Availability is supplied by the launch boundary. */
 export function resolveOperationRoute({ operation, taskType, size, designQuestion, wellScoped, available, availability = {}, gateClosed = false, vetoes = [], policy = DEFAULT_ROUTING_POLICY } = {}) {
   let entry = policy.operations[`${operation}:${taskType}`] ?? policy.operations[operation] ?? policy.operations[String(operation).split(':')[0]];
@@ -102,6 +139,7 @@ export function resolveOperationRoute({ operation, taskType, size, designQuestio
     if (!entry || entry.inherit) return null;
   }
   const chain = [entry, ...entry.fallback].map(({ provider, model, effort }) => ({ provider, model: modelFor(policy, provider, model, operation), effort: resolvePolicyEffort(provider, typeof effort === 'string' ? effort : effort?.[provider] ?? operationEffort(operation, provider, taskType, policy)) }))
+    .filter(route => !entry.disabledProviders?.includes(route.provider))
     .filter(route => (!gateClosed || route.provider === 'claude') && (route.provider === 'claude' || !vetoes.some(veto => veto.model === route.model && veto.provider === (route.provider.startsWith('agy-') ? 'antigravity' : route.provider))))
     .filter(route => !availability?.[route.provider]
       && !(route.provider.startsWith('agy-') && availability?.antigravity)

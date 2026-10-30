@@ -1,5 +1,6 @@
 {
   "_howTo": [
+    "Live routingOverrides in ~/.claude/platform-preferences.json (or WE_PLATFORM_PREFERENCES_FILE) deep-merge operation entries over this policy, validated every read. Example: {\"routingOverrides\":{\"review-seat:red-team\":{\"provider\":\"agy-gemini\",\"model\":\"flash\",\"disabledProviders\":[\"codex\"]}}}. Clear the key to restore repo defaults. Arrays replace; effort maps merge. Selecting a provider enables it; enabledProviders also enables inherited candidates, disabledProviders excludes them. Live enables replace a zero cap with 80 (codex) or 300 (agy), retaining positive env caps and quota checks. Applied/cleared changes emit routing-override-applied events with platform provenance. CLI: node scripts/operations/run.mjs routing-override --operation=review-seat --taskType=red-team --provider=agy-gemini, or --clear.",
     "Operation entries select provider, model, effort and fallback together (operations, operations.X:taskType or taskTypes). For fix and ci-heal, codex.modelByTask overlays model, effort and retry through standard policy → platform → settings → env.",
     "An entry with inherit:true preserves the existing evidence/tier router. taskTypes entries override inherited operations; operations may also use operation:taskType keys (review-seat:security, for example).",
     "Aliases below resolve to explicit model IDs. Every policy-routed dispatch requires the critical-work check; criticalWorkGate.kinds also governs inherited routing. A closed gate takes the Claude fallback.",
@@ -26,13 +27,13 @@
       "terra-5.6": "gpt-5.6-terra"
     },
     "antigravity": {
-      "sonnet": "claude-sonnet-4-6",
+      "sonnet": "claude-sonnet-5-5",
       "opus": "claude-opus-4-6-thinking",
       "flash": "gemini-3.8-flash",
       "pro": "gemini-3.1-pro"
     },
     "agy-claude": {
-      "sonnet": "claude-sonnet-4-6",
+      "sonnet": "claude-sonnet-5-5",
       "opus": "claude-opus-4-6-thinking",
       "opus-5-5": "claude-opus-5-5-high"
     },
