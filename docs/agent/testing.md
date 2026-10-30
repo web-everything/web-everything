@@ -2937,3 +2937,15 @@ fallback, and claim zero reclaimed bytes. Do not enable reclamation with a polic
 heuristic. The operator must arrange actual writer exclusion before reclamation can be wired in.
 Regression tests append in the final-stat/removal interval, hold an open transcript descriptor, test
 unavailable exclusion, and queue a cooperating writer through the same exclusion used by removal.
+
+## Remote client import failures
+
+Importing a host-selected remote client executes its top-level code. Neither an import exception nor
+a missing or non-callable `runRemote` export establishes that remote work never started: preserve
+exit 124 and the operator instruction to confirm termination before retrying. Changes to this boundary must run
+`scripts/readiness/__tests__/heavy-admission-remote-client.test.mjs` and
+`scripts/readiness/__tests__/heavy-admission-remote.test.mjs` through the host heavy-run queue.
+Keep the named regression **refuses local rerun when import starts work before throwing**: it observes
+an initialization side effect before the throw and requires exit 124 without local fallback.
+Also keep **refuses local rerun when import starts work before a missing runRemote export**: it
+observes initialization before export validation fails and requires the same refusal.

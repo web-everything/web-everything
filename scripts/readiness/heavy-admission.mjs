@@ -97,9 +97,12 @@
  * (exit 75); a caller that cannot defer keeps waiting. `admission.onTimeout` (defer|run) is resolved through
  * heavyAdmission: standard → platform preferences → tool settings → env WE_HEAVY_ADMISSION_ON_TIMEOUT.
  * Explicit `run` retains the loud unslotted escape. Dead / lease-expired holders are still reclaimed first.
- * Cap, fastSlots, fastScale, priority and remote (enabled/mode/loadPerCoreThreshold) use one host-wide resolver
+ * Cap, fastSlots, fastScale, priority and remote (enabled/mode/loadPerCoreThreshold/clientPath) use one host-wide resolver
  * (standard → platform preferences); remote has no env mapping. Their env and
  * checkout-local tool-settings overrides apply only to a PRIVATE pool — a LANE_POOL_ROOT that is not the host pool. DEFAULT_TIMEOUT_MS remains a legacy CLI fallback; WE_HEAVY_ADMISSION=off bypasses admission.
+ *
+ * Settings: heavyAdmission.remote.clientPath selects an external remote-exec.mjs outside all lane pools.
+ * Remove the setting to revert to the bundled client; no environment mapping.
  *
  * REMOTE ROUTING CONTRACT — remote stays disabled by default (heavyAdmission.remote.enabled=false).
  * Only { mode: 'remote', code: <integer> } exits with that code. Local admission may follow only
@@ -141,11 +144,14 @@
  *     fresh resource snapshot permits it. Status and release scan every slot that scaling may hand out.
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync } from 'node:fs';
-import { execSync } from 'node:child_process';
+import { readFile, mkdir, writeFile } from 'node:fs/promises';
+import { execSync, execFileSync } from 'node:child_process';
 import { hostname, homedir, userInfo, loadavg, cpus } from 'node:os';
 import { createHash } from 'node:crypto';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { appendDaemonEvent } from '../lib/daemon-events.mjs';
+import { importRemoteClient } from './remote-client-import.mjs';
 import { shadowAdmission, readSnapshot } from '../lib/resource-admission.mjs';
 import { hostLoadAdmission } from '../lib/host-load.mjs';
 import { DEFAULT_HOST_MAX_WAIT_MS, loadHostOverloadSettings } from '../lib/host-overload-settings.mjs';
@@ -231,7 +237,7 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
   fastScale: Object.freeze({ maxSlots: null, minShortWaiters: 3, minShortShare: 0.6, minCpuIdlePct: 30, maxMemPressureLevel: 1 }),
   // main-fix-queue-priority — a red-main repair waiter (P0) is admitted to the next free slot ahead of all others.
   priority: Object.freeze({ mode: 'enforce', repairPatterns: DEFAULT_REPAIR_PATTERNS }),
-  remote: Object.freeze({ enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3 }),
+  remote: Object.freeze({ enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null }),
 });
 
 /** Upper bound on a `run --wait-ms` budget (24h): a typo must not turn into an unbounded wait. */
@@ -256,6 +262,7 @@ const ADMISSION_VALID = {
   'fastScale.maxMemPressureLevel': (v) => admissionInt(1)(v) && v <= 4,
   'priority.mode': (v) => ADMISSION_PRIORITY_MODES.includes(v),
   'priority.repairPatterns': validRepairPatterns,
+  'remote.clientPath': (v) => v === null || typeof v === 'string',
   'remote.enabled': (v) => typeof v === 'boolean',
   'remote.mode': (v) => v === 'above-threshold' || v === 'always',
   'remote.loadPerCoreThreshold': (v) => Number.isFinite(v) && v > 0,
@@ -291,6 +298,7 @@ export function canonicalPath(p) {
 /** The real user's home, independent of a caller's `$HOME` (a sandboxed or launchd caller may carry another one). */
 const realHomeDir = () => { try { return userInfo().homedir || homedir(); } catch { return homedir(); } };
 const oneLine = (v) => String(v).replace(/[^\x20-\x7e]/g, '?').slice(0, 80);
+const clientPathForLog = (path) => String(path).replace(/[^\x20-\x7e]/g, '?').slice(0, 1024);
 
 /**
  * A pool is PRIVATE only when `LANE_POOL_ROOT` points somewhere other than the host-shared pool the checkout
@@ -403,8 +411,9 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
 
 export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid = [] }) {
   const values = ['cap', 'fastSlots', 'onTimeout', 'fastScale.maxSlots', 'priority.mode',
-    'remote.enabled', 'remote.mode', 'remote.loadPerCoreThreshold']
-    .map((leaf) => `${leaf}=${admissionLeaf(settings, leaf)} (${sources[leaf] ?? 'standard'})`);
+    'remote.enabled', 'remote.mode', 'remote.loadPerCoreThreshold',
+    ...(settings.remote?.clientPath != null ? ['remote.clientPath'] : [])]
+    .map((leaf) => `${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(admissionLeaf(settings, leaf)) : admissionLeaf(settings, leaf)} (${sources[leaf] ?? 'standard'})`);
   return `heavy-admission policy · ${values.join(', ')}${ignored.length ? ` · ignored: ${ignored.join('; ')}` : ''}${invalid.length ? ` · invalid: ${invalid.join('; ')}` : ''}`;
 }
 
@@ -436,6 +445,94 @@ export function adaptLegacyRemoteResult(result) {
   return result;
 }
 
+const realClientFs = () => ({ realpathSync, statSync });
+
+/** Validate both the named path and its target; symlinks cannot smuggle a lane client outside the pool. */
+export function resolveRemoteClient({ clientPath, laneRoots = [], fs = realClientFs() }) {
+  if (clientPath == null) return { clientPath: null };
+  try {
+    if (typeof clientPath !== 'string' || !isAbsolute(clientPath)) return { reason: 'clientPath must be absolute' };
+    if (basename(clientPath) !== 'remote-exec.mjs') return { reason: 'basename must be remote-exec.mjs' };
+    const real = fs.realpathSync(clientPath);
+    const roots = laneRoots.flatMap((root) => [resolve(root), canonicalPath(root)]).map((root) => root.toLowerCase());
+    if ([clientPath, real].map((path) => path.toLowerCase()).some((path) => path.includes(sep + '.lanes' + sep)
+      || roots.some((root) => path === root || path.startsWith(root + sep)))) return { reason: 'clientPath is inside a lane pool' };
+    if (basename(real) !== 'remote-exec.mjs') return { reason: 'target basename must be remote-exec.mjs' };
+    if (!fs.statSync(real).isFile()) return { reason: 'clientPath must be a regular file' };
+    return { clientPath: real };
+  } catch (error) { return { reason: `clientPath unreadable: ${oneLine(error?.code ?? error?.message ?? error)}` }; }
+}
+
+const remoteClientNotice = { logged: false };
+
+/** Provenance is optional: storage deadlines skip it without changing remote execution semantics. */
+async function boundedClientProvenance(work, timeoutMs, fallback) {
+  const controller = new AbortController();
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => work(controller.signal)),
+      new Promise((resolve) => {
+        timer = setTimeout(() => { controller.abort(); resolve(fallback); }, timeoutMs);
+      }),
+    ]);
+  } catch { return fallback; }
+  finally { clearTimeout(timer); }
+}
+
+/** Importing executes top-level code, so import exceptions or invalid exports cannot confirm a non-start.
+ * Import/export failures and runRemote results/throws retain the existing safety contract:
+ * unconfirmed termination refuses a local rerun with exit 124. */
+export function createRemoteExec({
+  policy, cwd = process.cwd(), env = process.env, lockRoot,
+  laneRoots = [defaultPoolRoot(cwd, env), defaultPoolRoot(MODULE_CHECKOUT, {})],
+  fs = realClientFs(), importClient = importRemoteClient,
+  provenanceFs = { readFile, mkdir, writeFile },
+  log = (line) => process.stderr.write(line), appendEvent = appendDaemonEvent,
+  readSha = (path) => execFileSync('git', ['-C', dirname(path), 'rev-parse', 'HEAD'],
+    { encoding: 'utf8', timeout: 1000, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'ignore'] }).trim(),
+  notice = remoteClientNotice,
+} = {}) {
+  return async (options) => {
+    const client = resolveRemoteClient({ clientPath: policy.settings.remote.clientPath, laneRoots, fs });
+    if (client.clientPath === null) return adaptLegacyRemoteResult(await (await importClient('./remote-exec.mjs')).runRemote(options));
+    const ignored = (reason) => {
+      reason = oneLine(reason);
+      log(`heavy-admission: remote client override ignored (${oneLine(reason)}) - using bundled client\n`);
+      return { mode: 'not-started', terminated: true, reason: `remote client override: ${reason}` };
+    };
+    if (client.reason) return ignored(client.reason);
+    let remote;
+    try {
+      remote = await importClient(pathToFileURL(client.clientPath).href);
+    } catch (error) {
+      throw new Error(`remote client override import failed: ${oneLine(error?.message ?? error)}`, { cause: error });
+    }
+    if (typeof remote.runRemote !== 'function') throw new Error('remote client override runRemote export is not a function');
+    const sha = await boundedClientProvenance(() => readSha(client.clientPath), 1000, 'unknown') || 'unknown';
+    if (!notice.logged) {
+      notice.logged = true;
+      const displayPath = clientPathForLog(client.clientPath);
+      log(`heavy-admission: remote client override ${displayPath} @ ${oneLine(sha)}\n`);
+    }
+    await boundedClientProvenance(async (signal) => {
+      const file = join(dirname(lockRoot ?? admissionLockRoot(cwd, env)), 'remote', 'client-override.json');
+      let previous = null;
+      try { previous = JSON.parse(await provenanceFs.readFile(file, { encoding: 'utf8', signal })); } catch { /* first use or unreadable state */ }
+      if (signal.aborted) return;
+      const pair = { clientPath: client.clientPath, sha };
+      if (previous?.clientPath !== pair.clientPath || previous?.sha !== pair.sha) {
+        await appendEvent({ kind: 'remote-client-override', detail: { ...pair, previous } });
+        if (signal.aborted) return;
+        await provenanceFs.mkdir(dirname(file), { recursive: true });
+        if (signal.aborted) return;
+        await provenanceFs.writeFile(file, JSON.stringify(pair) + '\n', { encoding: 'utf8', signal });
+      }
+    }, 100);
+    return adaptLegacyRemoteResult(await remote.runRemote(options));
+  };
+}
+
 /** Attempt remote execution before taking a local slot; remote is disabled by default.
  * Only { mode: 'remote', code: <integer> } exits with that code. Local admission requires
  * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }.
@@ -448,7 +545,7 @@ export async function runWithRemoteDecision({
     ? resolveFastRunTimeoutMs(env)
     : env ? resolveCeilingMs(env) : DEFAULT_ADMISSION_CEILING_MS,
   loadPerCore = () => loadavg()[0] / cpus().length,
-  remoteExec = async (options) => adaptLegacyRemoteResult(await (await import('./remote-exec.mjs')).runRemote(options)),
+  remoteExec, lockRoot,
   log = (line) => process.stderr.write(line),
 }) {
   let load;
@@ -456,6 +553,7 @@ export async function runWithRemoteDecision({
   const decision = decideRemote({ policy, loadPerCore: load, argv });
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
   if (!decision.remote) return { handled: false };
+  remoteExec = remoteExec ?? createRemoteExec({ policy, cwd, env, lockRoot, log });
   const refuseLocal = (reason) => {
     log(`heavy-admission: remote failed (${oneLine(reason)}) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying.\n`);
     return { handled: true, exitCode: 124 };
@@ -2017,7 +2115,7 @@ export async function main(argv, { remoteExec } = {}) {
     if (!bypass && !useContainer && !process.env[ADMISSION_HELD_ENV]) {
       const result = await runWithRemoteDecision({
         argv: argv.slice(dashDashIdx + 1), policy, cwd: repo ?? process.cwd(),
-        env: process.env, remoteExec,
+        env: process.env, remoteExec, lockRoot,
         timeoutMs: classifyCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
       });
       if (result.handled) process.exit(result.exitCode);
