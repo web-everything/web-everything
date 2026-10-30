@@ -78,3 +78,18 @@ assert refusal, unchanged HEAD, preservation of binary sidecar bytes, quarantine
 Failed, missing, truncated or oversized path inventories refuse rollback as `untracked-list-failed`
 or `target-list-failed`, according to the inventory; only the status read returns `status-failed`.
 Keep the named evidence-refusal cases alongside the preservation cases.
+
+### Review scope and regression checklist
+
+- PR body scope equals diff scope: match each claimed setting to its shipped default, implementation
+  and named test before handoff. This PR delivers `daemonRebuild.quick`; remove the unrelated R231
+  CI-overlap and fixer push-hold claims from its description.
+- Every early-return guard in a fail-closed parser needs a table row that triggers it. Rollback
+  inventory cases include empty paths, absolute paths, empty segments and `.` / `..` segments for
+  both `ls-files` and `ls-tree`.
+- Exercise the detached launcher through the shared runtime: pin the adopted SHA, hold dependency
+  preparation pending while adoption returns, then assert dependency readiness, worker startup and
+  durable settlement. Inject materialization/install IO for an offline subprocess fixture.
+- Re-read adoption token and SHA after acquiring the write lock in launcher and fatal recovery.
+  A stale launcher must preserve the replacement state, live job and HEAD with retries remaining
+  or exhausted. The `quick-soak-launcher-replacement-adoption` soak exercises the real read barrier.

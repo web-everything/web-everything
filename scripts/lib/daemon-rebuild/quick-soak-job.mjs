@@ -305,13 +305,14 @@ export async function runQuickSoak({ root, env = process.env, marker, token, run
  * Remain alive until its child exits so pending-state recovery also covers snapshot preparation.
  * Unavailable attempts schedule bounded retries; only the next tick launches them.
  */
-async function launchPinnedSoak({ root, token, jobId, env = process.env }) {
+export async function launchPinnedSoak({ root, token, jobId, env = process.env, run = gitRun, log = console,
+  snapshot = { repoDir: root, install: cloneNodeModulesInstaller(root) } }) {
   const store = createJobStore(jobsDir(root, env));
   let child;
   let completion;
   const launched = launchJob({
     store, id: jobId, kindDef: QUICK_SOAK_JOB_KIND, env,
-    snapshot: { repoDir: root, install: cloneNodeModulesInstaller(root) },
+    snapshot,
     spawnFn: ({ entryPath, cwd, env: childEnv, logPath }) => {
       const fd = openSync(logPath, 'a');
       try { child = spawn(process.execPath, [entryPath], { cwd, env: childEnv, detached: true, stdio: ['ignore', fd, fd] }); }
@@ -324,15 +325,22 @@ async function launchPinnedSoak({ root, token, jobId, env = process.env }) {
     },
   });
   if (child) await completion;
-  // One dead-handle reconciliation closes an import/launch failure in the standard job store, capped at 1.
-  await reattachTick({ store, kinds: KINDS, maxConcurrent: 0 });
+  // Reconcile dead handles without launching other queued jobs. Admission requires a positive cap;
+  // a no-op launcher keeps retries at tick boundaries even when the store contains a successor.
+  await reattachTick({ store, kinds: KINDS, maxConcurrent: 1, launch: () => null });
   store.update(jobId, record => TERMINAL_JOB_STATUSES.includes(record.job.status) ? null
     : markFailed(record, { at: new Date().toISOString(), reason: JOB_FAIL_NO_COMPLETION }));
   const marker = readRebuildState(root, env).unverified;
   if (marker?.quick && marker.token === token) {
     // A worker may have persisted its result but failed its completion lock. Consume that evidence first.
     if ((!launched || !child) && !readQuickSoakResult(root, env, marker)) recordQuickSoakResult({ root, env, marker, outcome: 'unavailable', reason: 'worker-launch-failed' });
-    await withWriteLock(root, () => recoverQuickSoak({ root, env, pidAlive: () => false }), lockOptions(env));
+    await withWriteLock(root, () => {
+      const state = readRebuildState(root, env);
+      // Waiting for the barrier may let another writer replace this adoption. The old launcher's
+      // dead-worker observation applies only to its original token AND SHA.
+      if (!same(state.unverified, marker)) return;
+      return recoverQuickSoak({ root, env, state, run, log, pidAlive: () => false });
+    }, lockOptions(env));
   }
 }
 

@@ -1,18 +1,21 @@
 /** Quick rebuild policy, real check selection, and durable post-adopt recovery. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, linkSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { EventEmitter } from 'node:events';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
+import { createJobStore, enqueueJob, launchJob } from '../daemon-jobs-runtime.mjs';
+import { cloneKey } from '../daemon-overlays.mjs';
+import { daemonJobsDir } from '../../operations/run-store.mjs';
 import {
   decideQuick, QUICK_ALWAYS_FULL_PATHS, QUICK_DEFERRED_CHECKS, quickFinalizeWaitMs,
   resolveQuick, QUICK_SOAK_CHECKS, QUICK_SOAK_MAX_MS,
   matchesQuickProtectedPath,
 } from '../daemon-rebuild/quick.mjs';
 import {
-  launchQuickSoak, recoverQuickSoak, recordQuickSoakResult, settleQuickSoak, runQuickSoak, handleQuickSoakFatal, QUICK_SOAK_JOB_KIND,
+  launchQuickSoak, launchPinnedSoak, recoverQuickSoak, recordQuickSoakResult, settleQuickSoak, runQuickSoak, handleQuickSoakFatal, QUICK_SOAK_JOB_KIND,
 } from '../daemon-rebuild/quick-soak-job.mjs';
 import { alertsFilePath, readReadyCandidate, readRebuildState, writeRebuildState } from '../daemon-rebuild/state.mjs';
 import { completeSmokePass, smokeAndAdopt } from '../daemon-rebuild/smoke.mjs';
@@ -24,6 +27,10 @@ import { DISPATCH_PATH_DEFAULTS } from '../daemon-rebuild/dispatch-paths.mjs';
 import { DISPATCH_DRY_RUN_CODE_ENTRIES, SMOKE_CHECKS, rollbackToSha, runLiveSmoke, runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
 
 vi.mock('../resource-admission.mjs', () => ({ shadowAdmission: vi.fn(), admit: vi.fn() }));
+vi.mock('../daemon-jobs-runtime.mjs', async importOriginal => {
+  const real = await importOriginal();
+  return { ...real, launchJob: vi.fn(real.launchJob) };
+});
 vi.mock('../daemon-clone-lock.mjs', async importOriginal => {
   const real = await importOriginal();
   return { ...real, withWriteLock: vi.fn(real.withWriteLock) };
@@ -457,6 +464,10 @@ describe('post-adopt soak', () => {
     { name: 'target listing truncated', command: 'ls-tree', result: { status: 0, stdout: 'partial' } },
     { name: 'untracked listing truncated', command: 'ls-files', result: { status: 0, stdout: 'partial' } },
     { name: 'listing oversized', command: 'ls-tree', result: { status: 0, stdout: 'x'.repeat(64 * 1024 * 1024) + '\0' } },
+    ...['ls-files', 'ls-tree'].flatMap(command => ['../x', '/abs', 'a//b', './x', 'a/../b', '', '.'].map(path => ({
+      name: `${command} malformed path ${JSON.stringify(path)}`, command,
+      result: { status: 0, stdout: `${path}\0` },
+    }))),
   ])('unreadable collision evidence refuses rollback: $name', ({ command, result }) => {
     const run = vi.fn(args => args[0] === command ? result : { status: 0, stdout: '' });
     expect(rollbackToSha({ root: temp(), sha: prevHead, run, ignoreUntracked: true }))
@@ -924,6 +935,30 @@ describe('post-adopt soak', () => {
     expect(readRebuildState(f.root, f.env).unverified).toEqual(f.marker);
     expect(f.run).not.toHaveBeenCalled();
   });
+  it.each(['token', 'sha'].flatMap(field => [1, 3].map(soakAttempts => ({ field, soakAttempts }))))(
+    'detached launcher preserves replacement $field adoption during lock acquisition (attempt $soakAttempts)',
+    async ({ field, soakAttempts }) => {
+      const f = soakFixture();
+      const store = createJobStore(daemonJobsDir(`quick-soak-${cloneKey(f.root)}`, f.env));
+      mkdirSync(store.dir, { recursive: true });
+      const oldJob = enqueueJob({ store, kindDef: QUICK_SOAK_JOB_KIND, codeSha: f.marker.sha });
+      const replacementJob = enqueueJob({ store, kindDef: QUICK_SOAK_JOB_KIND, codeSha: f.marker.sha });
+      const replacement = { ...f.marker, [field]: field === 'sha' ? 'c'.repeat(40) : 'replacement-token',
+        soakAttempts, pid: process.pid, jobId: replacementJob.id };
+      let expected;
+      vi.mocked(launchJob).mockReturnValueOnce(null);
+      vi.mocked(withWriteLock).mockImplementationOnce(async (_root, recover) => {
+        writeRebuildState(f.root, { ...f.state, unverified: replacement,
+          adopted: { ...f.state.adopted, head: replacement.sha } }, f.env);
+        expected = readRebuildState(f.root, f.env);
+        return { ok: true, value: await recover() };
+      });
+      await launchPinnedSoak({ ...f, token: f.marker.token, jobId: oldJob.id, log: { error() {} } });
+      expect(withWriteLock).toHaveBeenCalledOnce();
+      expect(readRebuildState(f.root, f.env)).toEqual(expected);
+      expect(store.read(replacementJob.id)).toEqual(replacementJob);
+      expect(f.run).not.toHaveBeenCalled();
+    });
   it('recovers a durable completed result even if the worker could not acquire the final lock', () => {
     const f = soakFixture();
     recordQuickSoakResult({ ...f, outcome: 'passed' });
@@ -985,6 +1020,112 @@ describe('post-adopt soak', () => {
     expect(readRebuildState(f.root, f.env).unverified.jobId).toEqual(expect.any(String));
     expect(QUICK_SOAK_JOB_KIND).toMatchObject({ maxAttempts: 1, codeMode: 'readonly-tree' });
   });
+  it('detached launcher runs the pinned adoption snapshot after dependency preparation without blocking adoption', async () => {
+    const f = soakFixture();
+    const control = temp();
+    const release = join(control, 'release');
+    const proof = join(control, 'proof.json');
+    const driver = join(control, 'launcher.mjs');
+    const soakUrl = new URL('../daemon-rebuild/quick-soak-job.mjs', import.meta.url).href;
+    const runtimeUrl = new URL('../daemon-jobs-runtime.mjs', import.meta.url).href;
+    const stateUrl = new URL('../daemon-rebuild/state.mjs', import.meta.url).href;
+    const worker = `
+      import { readFileSync, writeFileSync } from 'node:fs';
+      import { runJob } from ${JSON.stringify(runtimeUrl)};
+      import { runQuickSoak } from ${JSON.stringify(soakUrl)};
+      const watchdog = setTimeout(() => process.exit(1), 10000);
+      const result = await runJob({ readStart: () => 'Thu Jan  1 00:00:00 1970',
+        steps: [{ name: 'post-adopt-soak', run: ({ input }) =>
+        runQuickSoak({ root: input.root, token: input.token,
+          run: args => ({ status: 0, stdout: args[0] === 'rev-parse' ? ${JSON.stringify(sha)} : '' }),
+          smoke: async ({ onlyChecks }) => {
+            writeFileSync(${JSON.stringify(proof)}, JSON.stringify({ cwd: process.cwd(),
+              sha: readFileSync('snapshot-sha', 'utf8'),
+              dependency: readFileSync('node_modules/ready', 'utf8'), checks: onlyChecks }));
+            return { pass: true, results: onlyChecks.map(name => ({ name, ok: true })) };
+          }, log: { error() {} } }) }] });
+      if (result.outcome !== 'succeeded') throw new Error(JSON.stringify(result));
+      clearTimeout(watchdog);
+    `;
+    writeFileSync(driver, `
+      import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+      import { dirname, join } from 'node:path';
+      import { launchPinnedSoak } from ${JSON.stringify(soakUrl)};
+      import { readRebuildState } from ${JSON.stringify(stateUrl)};
+      const watchdog = setTimeout(() => process.exit(1), 20000);
+      const root = process.argv[2];
+      const snapshot = {
+        repoDir: root,
+        materialize(into) {
+          const adopted = readRebuildState(root).unverified.sha;
+          writeFileSync(join(into, 'snapshot-sha'), adopted);
+          writeFileSync(join(into, 'package.json'), '{"type":"module"}');
+          writeFileSync(join(into, 'package-lock.json'), '{"lockfileVersion":3}');
+          const entry = join(into, ${JSON.stringify(QUICK_SOAK_JOB_KIND.entry)});
+          mkdirSync(dirname(entry), { recursive: true });
+          writeFileSync(entry, ${JSON.stringify(worker)});
+        },
+        install(into) {
+          process.send({ event: 'preparing' });
+          const until = Date.now() + 15000;
+          while (!existsSync(${JSON.stringify(release)})) {
+            if (Date.now() > until) throw new Error('dependency preparation not released');
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+          }
+          mkdirSync(join(into, 'node_modules'));
+          writeFileSync(join(into, 'node_modules/ready'), 'installed');
+        },
+      };
+      await launchPinnedSoak({ root, token: process.argv[3], jobId: process.argv[5], snapshot,
+        run: args => ({ status: 0, stdout: args[0] === 'rev-parse' ? ${JSON.stringify(sha)} : '' }),
+        log: { error() {} } });
+      clearTimeout(watchdog);
+      process.disconnect();
+    `);
+    // The adopted snapshot differs from the mutable clone; the worker must execute the former.
+    writeFileSync(join(f.root, 'snapshot-sha'), 'newer-live-tree');
+    let child; let preparing; let completion;
+    let diagnostic = '';
+    const spawnFn = (cmd, args, opts) => {
+      child = spawn(cmd, [driver, ...args.slice(1)], { ...opts,
+        env: { ...process.env, ...opts.env }, stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+      child.stderr.on('data', data => { diagnostic = (diagnostic + data).slice(-4000); });
+      preparing = new Promise((resolveReady, reject) => {
+        child.once('message', resolveReady);
+        child.once('error', reject);
+        child.once('close', () => reject(new Error(`launcher exited before preparation: ${diagnostic}`)));
+      });
+      // Attach immediately so a launch error cannot leave an unhandled rejection before assertion.
+      preparing.catch(() => {});
+      completion = new Promise((resolveDone, reject) => {
+        child.once('error', reject);
+        child.once('close', code => resolveDone(code));
+      });
+      completion.catch(() => {});
+      return child;
+    };
+    try {
+      expect(await launchQuickSoak({ ...f, spawnFn, readStart: () => 'Thu Jan  1 00:00:00 1970' }))
+        .toEqual({ started: true });
+      expect(await preparing).toEqual({ event: 'preparing' });
+      const pending = readRebuildState(f.root, f.env).unverified;
+      expect(pending).toMatchObject({ sha, pid: child.pid });
+      expect(existsSync(proof)).toBe(false);
+      const store = createJobStore(daemonJobsDir(`quick-soak-${cloneKey(f.root)}`, f.env));
+      expect(store.read(pending.jobId).job.status).toBe('queued');
+      writeFileSync(release, 'ready');
+      expect(await completion, diagnostic).toBe(0);
+      expect(JSON.parse(readFileSync(proof, 'utf8'))).toEqual({
+        cwd: realpathSync(join(store.dir, '.snapshots', 'code', sha)), sha, dependency: 'installed', checks: QUICK_SOAK_CHECKS,
+      });
+      expect(store.read(pending.jobId).job).toMatchObject({ status: 'succeeded', codeSha: sha,
+        attempts: 1, snapshotKeys: [`code:${sha}`, expect.stringMatching(/^node-modules:/)] });
+      expect(readRebuildState(f.root, f.env)).toMatchObject({ unverified: null, adopted: { head: sha } });
+      expect(readRebuildState(f.root, f.env).adopted).not.toHaveProperty('unverified');
+    } finally {
+      if (child && child.exitCode === null) { child.kill('SIGKILL'); await completion; }
+    }
+  }, 25_000);
   it('failed launch records unavailable and rolls back without waiting for a later tick', async () => {
     const f = soakFixture();
     await launchQuickSoak({ ...f, spawnFn: () => { throw new Error('unavailable'); } });
