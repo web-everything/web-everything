@@ -7,7 +7,7 @@ import {createHash} from 'node:crypto';
 import * as remote from '../remote-exec.mjs';
 import {parseGitTree} from '../forge-exec-manifest.mjs';
 import {createRunner,manifestWire,digestManifest,digestInput,digestArgv} from '../forge-exec-run.mjs';
-import {createBasePin,pruneBases} from '../forge-exec-bases.mjs';
+import {baseGuard,createBasePin,pruneBases} from '../forge-exec-bases.mjs';
 let root,repo;
 const hash=data=>createHash('sha256').update(data).digest('hex');
 const git=(args,cwd=repo)=>{const r=spawnSync('git',args,{cwd,maxBuffer:4*1024*1024});if(r.status)throw new Error(r.stderr.toString());return r.stdout;};
@@ -37,6 +37,95 @@ async function pruningFixture() {
   return {target,shas};
 }
 describe('active base pin safety',()=>{
+  async function guardFixture(owner={pid:process.pid,timestamp:Date.now()}) {
+    const target=join(root,'guard-test'),guard=join(target,'.guard');
+    await fs.mkdir(guard,{recursive:true,mode:0o700});
+    await fs.writeFile(join(guard,'owner-'+ 'a'.repeat(32)),JSON.stringify(owner));
+    return {target,guard};
+  }
+  it('contention waits then succeeds when the holder releases',async()=>{
+    const target=join(root,'guard-test');await fs.mkdir(target);
+    let release,entered;
+    const ready=new Promise(resolve=>entered=resolve),held=new Promise(resolve=>release=resolve);
+    const first=baseGuard(target,async()=>{entered();await held;});await ready;
+    let now=0;const sleep=vi.fn(async ms=>{now+=ms;release();await first;});
+    const action=vi.fn(()=>42);
+    expect(await baseGuard(target,action,fs,{clock:()=>now,sleep,waitMs:100})).toBe(42);
+    expect(sleep).toHaveBeenCalledOnce();expect(action).toHaveBeenCalledOnce();
+    expect(await fs.readdir(target)).toEqual([]);
+  });
+  it('fails within its wait bound when held and never steals a live old holder',async()=>{
+    const {target,guard}=await guardFixture({pid:process.pid,timestamp:0});
+    await fs.utimes(guard,new Date(0),new Date(0));
+    let now=100000000;const action=vi.fn(),sleep=vi.fn(async ms=>{now+=ms;});
+    await expect(baseGuard(target,action,fs,{clock:()=>now,sleep,waitMs:50,retryMs:25,maxAgeMs:1})).rejects.toThrow('Base guard wait exceeded; use local fallback');
+    expect(sleep).toHaveBeenCalledTimes(2);expect(action).not.toHaveBeenCalled();
+    expect(await fs.readdir(guard)).toEqual(['owner-'+ 'a'.repeat(32)]);
+  });
+  it.each([
+    ['lstat','EACCES'],['lstat','EPERM'],
+    ['readdir','EACCES'],['readdir','EPERM'],
+    ['open','EACCES'],['open','EPERM'],
+  ])('waits to the bounded error without removing a guard when %s throws %s',async(operation,code)=>{
+    const {target,guard}=await guardFixture({pid:0,timestamp:0});
+    await fs.utimes(guard,new Date(0),new Date(0));
+    const owner=join(guard,'owner-'+ 'a'.repeat(32));
+    const inspect=vi.fn(async(path,...args)=>{
+      if(String(path)===(operation==='open'?owner:guard))throw Object.assign(new Error('denied'),{code});
+      return fs[operation](path,...args);
+    });
+    const io={...fs,[operation]:inspect,unlink:vi.fn(fs.unlink),rmdir:vi.fn(fs.rmdir)};
+    let now=100000000;const action=vi.fn(),sleep=vi.fn(async ms=>{now+=ms;});
+    await expect(baseGuard(target,action,io,{clock:()=>now,sleep,waitMs:50,retryMs:25,maxAgeMs:1}))
+      .rejects.toThrow('Base guard wait exceeded; use local fallback and inspect the guard owner');
+    expect(sleep.mock.calls).toEqual([[25],[25]]);expect(now).toBe(100000050);
+    expect(action).not.toHaveBeenCalled();expect(io.unlink).not.toHaveBeenCalled();expect(io.rmdir).not.toHaveBeenCalled();
+    expect(await fs.readdir(guard)).toEqual(['owner-'+ 'a'.repeat(32)]);
+    expect(await fs.readdir(target)).toEqual(['.guard']);
+  });
+  it.each(['dead pid','old unknown owner'])('recovers a stale guard with %s',async fault=>{
+    const {target,guard}=await guardFixture({pid:fault==='dead pid'?123456:0,timestamp:0});
+    await fs.utimes(guard,new Date(0),new Date(0));
+    const kill=vi.fn(()=>{throw Object.assign(new Error('dead'),{code:'ESRCH'});}),action=vi.fn(()=>42);
+    expect(await baseGuard(target,action,fs,{kill,maxAgeMs:1})).toBe(42);
+    expect(action).toHaveBeenCalledOnce();expect(await fs.readdir(target)).toEqual([]);
+  });
+  it('recovers an old empty guard left before owner publication',async()=>{
+    const {target,guard}=await guardFixture();
+    await fs.unlink(join(guard,'owner-'+ 'a'.repeat(32)));await fs.utimes(guard,new Date(0),new Date(0));
+    expect(await baseGuard(target,()=>42,fs,{maxAgeMs:1})).toBe(42);
+    expect(await fs.readdir(target)).toEqual([]);
+  });
+  it('keeps stale recovery exclusive when another contender publishes first',async()=>{
+    const {target}=await guardFixture({pid:123456,timestamp:0});
+    let holders=0,maxHolders=0;
+    const options={kill:pid=>{if(pid===123456)throw Object.assign(new Error('dead'),{code:'ESRCH'});},retryMs:1};
+    const action=async()=>{holders++;maxHolders=Math.max(maxHolders,holders);await new Promise(resolve=>setTimeout(resolve,5));holders--;};
+    await Promise.all([baseGuard(target,action,fs,options),baseGuard(target,action,fs,options)]);
+    expect(maxHolders).toBe(1);expect(await fs.readdir(target)).toEqual([]);
+  });
+  it('a delayed initializer cannot replace a live successor after its empty guard ages out',async()=>{
+    const target=join(root,'guard-test');await fs.mkdir(target);
+    let pause,resume;
+    const paused=new Promise(resolve=>pause=resolve),resumed=new Promise(resolve=>resume=resolve);
+    const io={...fs,rename:async(from,to)=>{
+      if(String(to)===join(target,'.guard')){pause();await resumed;}
+      return fs.rename(from,to);
+    }};
+    let now=0;const lateAction=vi.fn();
+    const late=baseGuard(target,lateAction,io,{clock:()=>now,waitMs:50,sleep:async ms=>{now+=ms;}});
+    await paused;await fs.utimes(join(target,'.guard'),new Date(0),new Date(0));
+    await baseGuard(target,async()=>{
+      resume();await expect(late).rejects.toThrow('Base guard wait exceeded');expect(lateAction).not.toHaveBeenCalled();
+    },fs,{maxAgeMs:1});
+    expect(await fs.readdir(target)).toEqual([]);
+  });
+  it('does not steal a holder whose PID probe is permission denied',async()=>{
+    const {target,guard}=await guardFixture();let now=0;
+    await expect(baseGuard(target,vi.fn(),fs,{clock:()=>now,sleep:async ms=>{now+=ms;},waitMs:25,
+      kill:()=>{throw Object.assign(new Error('denied'),{code:'EPERM'});}})).rejects.toThrow('Base guard wait exceeded');
+    expect(await fs.readdir(guard)).toHaveLength(1);
+  });
   it.each(['garbage','unreadable'])('refuses pruning with a %s active pin and keeps every base',async fault=>{
     const {target,shas}=await pruningFixture(),active=join(target,'active');
     await fs.mkdir(active,{mode:0o700});
@@ -365,6 +454,38 @@ describe('runner base materialization refuses before install',()=>{
     await f.runner.warmInstall(repo,manifestWire(await remote.buildManifest({cwd:repo,exec})));
     expect((await fs.readFile(join(f.server,'npm.log'),'utf8')).trim().split('\n')).toHaveLength(2);
   });
+
+  it.each(['workspaces','file: dependency','link: dependency','unknown lock format','unproven resolution'])(
+    'refuses warm-profile reuse for unsupported install inputs: %s',async fault=>{
+      const f=await setup(),pkg={name:'fixture',version:'1.0.0'},lock={lockfileVersion:3,packages:{'':{name:'fixture'}}};
+      if(fault==='workspaces')pkg.workspaces=['packages/*'];
+      if(fault.includes('dependency'))pkg.dependencies={fixture:fault.startsWith('file:')?'file:./local':'link:./local'};
+      if(fault==='unknown lock format')lock.lockfileVersion=2;
+      if(fault==='unproven resolution')lock.packages['node_modules/fixture']={version:'1.0.0',resolved:'https://registry.npmjs.org/fixture.tgz'};
+      await fs.writeFile(join(repo,'package.json'),JSON.stringify(pkg));
+      const lockData=JSON.stringify(lock);await fs.writeFile(join(repo,'package-lock.json'),lockData);
+      // The fixture installer materializes observable dependency contents, so
+      // incorrectly extracting the first archive cannot look like a full install.
+      await fs.writeFile(join(f.server,'bin/npm'),String.raw`#!${process.execPath}
+const fs=require('node:fs');
+fs.appendFileSync(${JSON.stringify(join(f.server,'npm.log'))},'install\n');
+fs.mkdirSync('node_modules/fixture',{recursive:true});
+fs.copyFileSync('a.test.mjs','node_modules/fixture/value');
+`,{mode:0o755});
+      await fs.writeFile(join(repo,'a.test.mjs'),'dependency-one');
+      await f.runner.warmInstall(repo,manifestWire(await remote.buildManifest({cwd:repo,exec})));
+      // Leave the first full profile and any reusable evidence in place.
+      await fs.writeFile(join(repo,'a.test.mjs'),'dependency-two');
+      await f.runner.warmInstall(repo,manifestWire(await remote.buildManifest({cwd:repo,exec})));
+      expect((await fs.readFile(join(f.server,'npm.log'),'utf8')).trim().split('\n')).toHaveLength(2);
+      const parent=join(f.server,'cache',hash(lockData)),values=[];
+      for(const profile of (await fs.readdir(parent)).filter(n=>n.startsWith('dev-v5-'))) {
+        const extracted=await fs.mkdtemp(join(root,'dependencies-'));
+        const result=await exec({file:'/usr/bin/tar',args:['-xf',join(parent,profile,'dependencies.tar'),'-C',extracted]});
+        expect(result.code).toBe(0);values.push(await fs.readFile(join(extracted,'node_modules/fixture/value'),'utf8'));
+      }
+      expect(values.sort()).toEqual(['dependency-one','dependency-two']);
+    });
 
   it('seeds a full sibling-bound profile from proven registry-only warm inputs, never a lock-only key',async()=>{
     const f=await setup();

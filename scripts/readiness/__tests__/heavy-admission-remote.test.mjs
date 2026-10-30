@@ -84,6 +84,7 @@ describe('remote admission policy', () => {
       expect(exit).toHaveBeenCalledWith(17);
       expect(stderr).toHaveBeenCalledWith(expect.stringContaining('command-not-allowed'));
       expect(stderr).toHaveBeenCalledWith(expect.stringContaining('falling back to local admission'));
+      expect(vi.mocked(execSync).mock.calls[0][1].env).not.toHaveProperty('WE_FORGE_GATE_DISPATCH');
       expect(transport).not.toHaveBeenCalled();expect(stage).not.toHaveBeenCalled();
     }finally{
       vi.mocked(execSync).mockReset();exit.mockRestore();stderr.mockRestore();vi.unstubAllEnvs();
@@ -138,6 +139,8 @@ describe('remote admission policy', () => {
   });
 
   it.each([
+    ['CI with Forge gate handoff', {CI:'true',WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'}, [], true, false],
+    ['admission off with Forge gate handoff', {WE_HEAVY_ADMISSION:'off',WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1'}, [], true, false],
     ['WE_HEAVY_ADMISSION=off bypass', { WE_HEAVY_ADMISSION: 'off' }, [], true, false],
     ['--container', {}, ['--container'], true, true],
     ['WE_HEAVY_ADMISSION_HELD=1', { WE_HEAVY_ADMISSION_HELD: '1' }, [], true, false],
@@ -176,6 +179,7 @@ describe('remote admission policy', () => {
       expect(localExec).toHaveBeenCalledWith(argv.map(shellQuoteWord).join(' '), expect.objectContaining({
         cwd: root, env: expect.objectContaining({ WE_HEAVY_ADMISSION_HELD: '1' }),
       }));
+      expect(localExec.mock.calls[0][1].env).not.toHaveProperty('WE_FORGE_GATE_DISPATCH');
       expect(exit).toHaveBeenCalledWith(17);
       expect(heldSlots({ lockRoot, cap: 2, fastSlots: 1 })).toHaveLength(0);
       if (!enableRemote) expect(stderr).toHaveBeenCalledWith(expect.stringContaining('remote.enabled=false (standard)'));

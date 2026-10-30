@@ -2990,8 +2990,23 @@ The fixed Forge wrapper discovers `slot-K` directories and matching system users
 client concurrency settings never define server identities. Pool prepare reserves
 `forge-exec-K` through finish using an ops-protected `worker-active-K` directory
 bound to run ID and nonce. An interrupted command leaves the reservation closed
-until an operator confirms that UID has no remaining processes. Never expire
-these directories by age. Hosts without pool directories retain the legacy UID.
+until shutdown is confirmed. Age and an empty UID scan alone never authorize
+reclamation: acquisition, prepare, execution, and finish hold shared leases on
+persistent per-slot `.worker-active-K.writer` inodes. Pruning holds exclusive
+leases through scanning and deletion and proves UID process absence before
+removing a reservation.
+The root supervisor requires reservation evidence and rechecks it under its own shared lease;
+a forked child retains that lease through UID drop and closes it before task exec.
+Only reservations declaring `writerGuard: 1` participate; historical or uncertain
+reservations require operator cleanup. Missing, unreadable, malformed, or incomplete
+reservation identity preserves all expired receipts and caches; a known run without
+identifiable dependency-lock evidence preserves caches while unrelated receipts
+can still expire. The prune tests cover empty historical reservations and resume
+age pruning after operator removal. Never unlink writer guard files.
+The worker-pool suite pauses a holder before launch, runs the real prune program
+against an empty UID inventory, and proves a second controller cannot launch as
+that UID. It also tests pruning winning first and refusal at each writer entry.
+Hosts without pool directories retain the legacy UID and its own writer guard.
 The privileged fixed wrapper owns metadata operations; tasks and rsync run only
 as the reserved UID. Slot roots are ops-owned with the worker's private group
 and mode 0710 (traverse only); run containers remain operator-owned. Only work
@@ -3091,3 +3106,15 @@ fallback, and claim zero reclaimed bytes. Do not enable reclamation with a polic
 heuristic. The operator must arrange actual writer exclusion before reclamation can be wired in.
 Regression tests append in the final-stat/removal interval, hold an open transcript descriptor, test
 unavailable exclusion, and queue a cooperating writer through the same exclusion used by removal.
+
+### Security condition test shape
+
+Every new bypass-widening condition needs one negative test per conjunct. Security
+checks must not be hidden behind `!testRoot` guards; inject identity, ownership,
+and other system evidence so hermetic tests exercise the production checks.
+
+Writer guards shared by root cron and operator controllers must stay on one
+private inode owned by the operator. Test first-use creation and migration of
+existing root-owned guards, retaining mode 0600 and inode identity. The worker-pool
+suite models ownership transfer on unprivileged hosts and includes a Linux/root
+integration case that runs prune as root then reserves every slot as the operator.
