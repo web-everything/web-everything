@@ -27,7 +27,7 @@ import { readSettings as readOperatorSettings } from './settings-files.mjs';
 export function gitRun(args, opts = {}) {
   // A synchronous preflight must not leave Git's detached maintenance writing the checkout.
   const r = spawnSync('git', ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false', ...args], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, ...opts });
-  return { status: r.status == null ? 1 : r.status, stdout: r.stdout || '', stderr: r.stderr || '' };
+  return { status: r.status == null ? 1 : r.status, stdout: r.stdout || '', stderr: r.stderr || '', ...(r.error ? { error: r.error } : {}), ...(r.signal ? { signal: r.signal } : {}) };
 }
 
 /**

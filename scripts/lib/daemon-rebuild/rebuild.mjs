@@ -21,6 +21,7 @@ import { prepareRebuild } from './prepare.mjs';
 import { smokeAndAdopt } from './smoke.mjs';
 import { resolveVersionedContext, versionedRebuild } from '../daemon-version-runtime.mjs';
 import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
+import { quickFinalizeWaitMs, resolveQuick } from './quick.mjs';
 
 // ── rebuildClone — the IO shell ──────────────────────────────────────────────────────────────────────────────
 
@@ -28,19 +29,56 @@ import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
 // unknown future reasons stay quiet; the reason-inventory contract test requires
 // new reasons to be classified. `error` covers versionedRebuild's error: <detail>.
 export const FAILURE_REASONS = new Set([
-  'candidate-worktree-failed', 'deps-job-queue-failed', 'dispatch-smoke-failed',
-  'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed',
-  'git-common-dir-failed', 'git-dir-unreadable', 'head-unresolved', 'launch-failed',
-  'main-unresolved', 'merge-tree-failed', 'no-origin-url', 'not-built',
-  'overlay-state-corrupt', 'pinned-overlay-conflict', 'pinned-overlay-unavailable',
-  'pinned-unparsable', 'pinned-unreadable', 'pinned-write-failed', 'quarantined',
-  'rebuild-error', 'rebuild-interrupted-unrecoverable', 'rebuild-job-queue-failed',
-  'rebuild-threw', 'reset-failed', 'reset-rollback-failed', 'restore-failed',
-  'rev-parse-failed', 'rollback-failed', 'save-failed', 'scratch-init-failed',
-  'smoke-failed', 'smoke-harness-broken', 'smoke-rejected', 'smoke-retry',
-  'smoke-reused-env-failed', 'smoke-threw', 'state-file-unparsable', 'state-file-unreadable',
-  'status-failed', 'status-unreadable', 'still-rejected', 'swap-failed', 'switch-failed',
-  'worktree-add-failed', 'error',
+  'candidate-worktree-failed',
+  'deps-job-queue-failed',
+  'dispatch-smoke-failed',
+  'error',
+  'established-overlay-conflict',
+  'existing-overlays-unresolved',
+  'fetch-failed',
+  'git-common-dir-failed',
+  'git-dir-unreadable',
+  'head-unresolved',
+  'launch-failed',
+  'main-unresolved',
+  'merge-tree-failed',
+  'no-origin-url',
+  'not-built',
+  'overlay-state-corrupt',
+  'pinned-overlay-conflict',
+  'pinned-overlay-unavailable',
+  'pinned-unparsable',
+  'pinned-unreadable',
+  'pinned-write-failed',
+  'quarantined',
+  'quick-soak-failed',
+  'quick-soak-rollback-failed',
+  'quick-soak-unavailable',
+  'rebuild-error',
+  'rebuild-interrupted-unrecoverable',
+  'rebuild-job-queue-failed',
+  'rebuild-threw',
+  'reset-failed',
+  'reset-rollback-failed',
+  'restore-failed',
+  'rev-parse-failed',
+  'rollback-failed',
+  'save-failed',
+  'scratch-init-failed',
+  'smoke-failed',
+  'smoke-harness-broken',
+  'smoke-rejected',
+  'smoke-retry',
+  'smoke-reused-env-failed',
+  'smoke-threw',
+  'state-file-unparsable',
+  'state-file-unreadable',
+  'status-failed',
+  'status-unreadable',
+  'still-rejected',
+  'swap-failed',
+  'switch-failed',
+  'worktree-add-failed',
 ]);
 
 // Array view for event-contract consumers, sharing the explicit failure classification.
@@ -146,10 +184,12 @@ async function rebuildCloneInternal({
   const pendingReady = readReadyCandidate(root, stEnv);
   const readyOnHead = !!pendingReady
     && pendingReady.prevHead === verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
+  const readyLockOpts = readyOnHead && pendingReady.quick && resolveQuick(env).quick
+    ? { ...finalizeLockOpts, waitMs: quickFinalizeWaitMs({ quick: true, env }) } : finalizeLockOpts;
   const startedMs = now();
   const prep = await withWriteLock(root, () => prepareRebuild({
     root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider,
-  }), readyOnHead ? finalizeLockOpts : admissionLockOpts);
+  }), readyOnHead ? readyLockOpts : admissionLockOpts);
 
   if (prep.ok) {
     // live 2026-10-11 rebuild-job livelock: an adopt-only needs-build did not make progress.

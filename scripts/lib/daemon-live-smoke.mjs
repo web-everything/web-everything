@@ -93,7 +93,7 @@ import { collectImportClosure, closureHits } from './import-closure.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { gitRun } from './main-staleness.mjs';
 import { DAEMON_BOOT_SMOKE_CHECK, DEFAULT_DAEMON_BOOT_MS } from './daemon-boot-smoke.mjs';
-import { redactDetail } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
+import { redactDetail, redactDiagnosticLine } from './daemon-rebuild/smoke-classify/redact-detail.mjs';
 
 /** Set to `1`/`true`/`yes` to disable the whole gate — every merge is adopted unconditionally, exactly like
  *  before this file existed. The one intentionally fail-OPEN switch in this module. */
@@ -748,7 +748,7 @@ async function checkDispatchDryRun({ root, budgets, runChild, env }) {
  * `scripts/conveyor/run-scorecards.json`).
  *
  * Records the porcelain BEFORE the checks ran too ({@link runLiveSmoke}'s `beforePorcelain`, best-effort) and
- * reports pre-existing dirt DISTINCTLY from dirt newly introduced by this smoke's own checks — still fails on
+ * reports pre-existing dirt DISTINCTLY from dirt newly introduced by this smoke's own checks — by default fails on
  * either (a dirty tree is a real problem to the caller regardless of which ran first), but names which is
  * which so a human/daemon reading `detail` is not left guessing whether this smoke run itself is the cause.
  *
@@ -759,13 +759,26 @@ async function checkDispatchDryRun({ root, budgets, runChild, env }) {
  * match a symlink of the same name). The fix belongs in candidate setup (a `node_modules`-shaped `info/exclude`
  * entry — see that function's own docblock), never in weakening this check to ignore "pre-existing" dirt: a
  * candidate that is dirty the INSTANT it is checked out is still exactly the anomaly this check exists to catch.
+ * Only the post-adopt quick soak opts into `tolerateBaselineUntracked`: exact `??` lines from a readable
+ * baseline may remain. List individual untracked files so a new sibling cannot hide behind a directory row.
+ * Candidate/full smoke retain the strict rule above; tracked dirt and unknown baselines never qualify.
  */
-async function checkTreeStaysClean({ root, budgets, runChild, env, beforePorcelain }) {
+async function checkTreeStaysClean({ root, budgets, runChild, env, beforePorcelain, tolerateBaselineUntracked = false }) {
   let out;
   try {
-    out = await runChild('git', ['status', '--porcelain'], { cwd: root, timeoutMs: budgets.treeStaysCleanMs, env });
+    out = await runChild('git', ['status', '--porcelain', ...(tolerateBaselineUntracked === true ? ['--untracked-files=all'] : [])],
+      { cwd: root, timeoutMs: budgets.treeStaysCleanMs, env });
   } catch (e) {
     return { ok: false, detail: `git status --porcelain failed: ${firstLine(e)}`, ...childFailureDiagnostics(e) };
+  }
+  if (tolerateBaselineUntracked === true) {
+    if (typeof beforePorcelain !== 'string') return { ok: false, detail: 'baseline git status unavailable — refusing to tolerate untracked paths' };
+    const baselineUntracked = new Set(beforePorcelain.split('\n').filter(line => line.startsWith('?? ')));
+    const remaining = String(out || '').split('\n').filter(line => !baselineUntracked.has(line));
+    if (String(out || '').trim() && !remaining.join('\n').trim()) {
+      return { ok: true, detail: 'only baseline untracked paths remain — tracked tree stayed clean' };
+    }
+    out = remaining.join('\n');
   }
   const after = String(out || '').trim();
   if (!after) return { ok: true, detail: 'git status --porcelain empty — tree stayed clean' };
@@ -853,6 +866,7 @@ export function decideSmokeVerdict(results) {
  * Run every {@link SMOKE_CHECKS} row against `root` (the clone that just merged new code) and report a verdict.
  * Never throws — a check that throws is caught and recorded as a failure, exactly like an explicit `{ok:false}`.
  * @param {{root:string, env?:NodeJS.ProcessEnv, repos?:string[], runChild?:typeof runBounded, now?:number}} o
+ * @param {boolean} [o.tolerateBaselineUntracked=false] Post-adopt quick soak only; candidate/full smoke stay strict.
  * @returns {Promise<{pass:boolean, disabled:boolean, results:Array<object>, sessionSlug:string}>}
  */
 export async function runLiveSmoke({
@@ -861,6 +875,7 @@ export async function runLiveSmoke({
   clock = Date.now, hostBusy = undefined, reuseCode = false,
   load = () => loadavg()[0], cores = () => cpus().length, shadow = shadowAdmission, admit = admitResource,
   makeReadMemoDir = () => mkdtempSync(join(tmpdir(), 'smoke-read-memo-')),
+  deferredChecks = [], onlyChecks = null, tolerateBaselineUntracked = false,
 } = {}) {
   if (isSmokeGateDisabled(env)) return { pass: true, disabled: true, results: [], sessionSlug: null };
   // One shared `rebuild-smoke` decision per run sets the budgets (x9xkupj); the legacy load factor is its logged comparison.
@@ -906,14 +921,21 @@ export async function runLiveSmoke({
     // path found afterward as unclassified rather than guessing.
     let beforePorcelain = null;
     try {
-      beforePorcelain = await runChild('git', ['status', '--porcelain'], { cwd: root, timeoutMs: budgets.treeStaysCleanMs, env });
+      beforePorcelain = await runChild('git', ['status', '--porcelain', ...(tolerateBaselineUntracked === true ? ['--untracked-files=all'] : [])],
+        { cwd: root, timeoutMs: budgets.treeStaysCleanMs, env });
     } catch { /* best-effort — see comment above */ }
     // #4139 — `env` (the caller's OWN, possibly-isolated env) rides alongside `ghChildEnv` (the derived,
     // sanitized-for-gh one) so the lane-pool checks can use the former while the gh checks keep using the
     // latter; see {@link checkLanePoolList}'s comment for why dropping this here silently escaped isolation.
-    const ctx = { root, budgets, repos, sessionSlug, env, ghChildEnv, runChild, beforePorcelain, clock, hostBusy, dryRun };
+    const ctx = { root, budgets, repos, sessionSlug, env, ghChildEnv, runChild, beforePorcelain, tolerateBaselineUntracked, clock, hostBusy, dryRun };
     const results = [];
     for (const check of SMOKE_CHECKS) {
+      if (onlyChecks && !onlyChecks.includes(check.name)) continue;
+      if (deferredChecks.includes(check.name)) {
+        results.push({ name: check.name, ms: 0, ok: true, skipped: true, mayBeTransient: check.mayBeTransient !== false,
+          detail: 'deferred to post-adopt soak (quick mode)' });
+        continue;
+      }
       const startedAt = clock();
       let result;
       if (check.kind === 'code' && (reuseCode || checkCodeUnchanged({ check, changedFiles, root, closureOf }))) {
@@ -1089,6 +1111,7 @@ export async function runLiveSmokeWithRetry({
   clock = Date.now,
   loadAvg = () => loadavg(),
   log = console,
+  singleAttempt = false, deferredChecks = [],
 } = {}) {
   if (isSmokeGateDisabled(env)) return { verdict: 'pass', disabled: true };
   let smoke;
@@ -1108,8 +1131,9 @@ export async function runLiveSmokeWithRetry({
     // Fresh token for EVERY attempt, the same way the daemon's own tick gets one (see refreshSmokeGithubEnv).
     const { env: runEnv, refresh } = await refreshAuth({ env: attemptEnv, force: forceRefresh });
     forceRefresh = false;
-    smoke = await runLiveSmoke({ root, env: runEnv, runChild, changedFiles, reuseCode, clock });
+    smoke = await runLiveSmoke({ root, env: runEnv, runChild, changedFiles, reuseCode, clock, deferredChecks });
     verdict = classifySmokeFailure(smoke.results);
+    if (singleAttempt) break;
     // A gate-confirmed outage may spend the retry's remaining budget before later checks can run.
     // Those gate-observed refusals are incomplete evidence, not a newly discovered code regression.
     // Still reject any independent code row, and never promote skips without prior probe confirmation.
@@ -1492,18 +1516,77 @@ export function clearRejectedSha(root, env = process.env) {
   }
 }
 
+// Bound both Git output and parsing work. Missing/truncated/oversized evidence refuses rollback.
+const ROLLBACK_PATH_LIST_MAX_BYTES = 64 * 1024 * 1024;
+function rollbackRead(run, args, root, pathList = false) {
+  let result;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      result = run(args, { cwd: root, timeout: 60_000, killSignal: 'SIGKILL',
+        env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' }, maxBuffer: ROLLBACK_PATH_LIST_MAX_BYTES });
+    } catch (error) { result = { error, stderr: error?.message }; }
+    const stdout = result?.stdout;
+    if (result?.status !== 0 || result.error || result.signal || typeof stdout !== 'string'
+      || Buffer.byteLength(stdout) > ROLLBACK_PATH_LIST_MAX_BYTES) continue;
+    if (!pathList) return { value: stdout };
+    if (stdout && !stdout.endsWith('\0')) continue;
+    // --directory emits a trailing slash for collapsed untracked directories.
+    const paths = stdout ? stdout.slice(0, -1).split('\0').map(path => path.replace(/\/$/, '')) : [];
+    if (paths.every(path => path && !path.startsWith('/')
+      && !path.split('/').some(part => !part || part === '.' || part === '..'))) return { value: paths };
+  }
+  const bytes = typeof result?.stdout === 'string' || Buffer.isBuffer(result?.stdout) ? Buffer.byteLength(result.stdout) : 0;
+  return { detail: `status=${result?.status === undefined ? 'unknown' : result.status} signal=${redactDiagnosticLine(result?.signal ?? 'none')} code=${redactDiagnosticLine(result?.error?.code ?? 'none')} bytes=${bytes} stderr=${redactDiagnosticLine(result?.stderr ?? result?.error?.message)}` };
+}
+function rollbackHasUntrackedCollision(untracked, target) {
+  // Conservatively protect case-insensitive and Unicode-normalizing filesystems too.
+  const canonical = path => path.normalize('NFC').toLowerCase().normalize('NFC');
+  untracked = untracked.map(canonical);
+  target = target.map(canonical);
+  const files = new Set(target);
+  const directories = new Set();
+  for (const path of target) {
+    for (let slash = path.indexOf('/'); slash !== -1; slash = path.indexOf('/', slash + 1)) {
+      directories.add(path.slice(0, slash));
+    }
+  }
+  return untracked.some(path => {
+    if (files.has(path) || directories.has(path)) return true;
+    for (let slash = path.indexOf('/'); slash !== -1; slash = path.indexOf('/', slash + 1)) {
+      if (files.has(path.slice(0, slash))) return true;
+    }
+    return false;
+  });
+}
+
 /**
  * Roll a clone back to `sha` — ALLOWED ONLY because the tree is verified clean first (a `git status --porcelain`
  * that fails, times out, or reports dirt fails CLOSED: never reset a tree we could not confirm was safe to
- * discard). Mirrors `daemon-self-sync.mjs#decideSelfSync`'s own fail-closed posture on an unreadable tree state.
- * @param {{root:string, sha:string|null, run?:typeof gitRun}} o
- * @returns {{ok:boolean, reason?:string}}
+ * discard). `ignoreUntracked` opts runtime sidecars out of the dirty check; tracked dirt still refuses.
+ * Untracked paths (including ignored files) must not obstruct a file or directory in the target tree.
+ * Mirrors `daemon-self-sync.mjs#decideSelfSync`'s own fail-closed posture on an unreadable tree state.
+ * @param {{root:string, sha:string|null, run?:typeof gitRun, ignoreUntracked?:boolean}} o
+ * @returns {{ok:boolean, reason?:string, detail?:string}}
  */
-export function rollbackToSha({ root, sha, run = gitRun }) {
+export function rollbackToSha({ root, sha, run = gitRun, ignoreUntracked = false }) {
   if (!sha) return { ok: false, reason: 'no-sha' };
-  const status = run(['status', '--porcelain'], { cwd: root, timeout: 60_000, killSignal: 'SIGKILL' });
-  const dirty = status.status === 0 ? !!String(status.stdout ?? '').trim() : null;
-  if (dirty !== false) return { ok: false, reason: dirty === null ? 'status-failed' : 'dirty' };
+  const args = ['status', '--porcelain', ...(ignoreUntracked ? ['--untracked-files=no'] : [])];
+  if (ignoreUntracked) {
+    const status = rollbackRead(run, args, root);
+    if (status.value === undefined) return { ok: false, reason: 'status-failed', detail: status.detail };
+    if (status.value.trim()) return { ok: false, reason: 'dirty' };
+    // Include ignored sidecars too: reset --hard can delete either kind of untracked obstruction.
+    const untracked = rollbackRead(run, ['ls-files', '--others', '--directory', '--no-empty-directory', '-z'], root, true);
+    if (!untracked.value) return { ok: false, reason: 'untracked-list-failed', detail: untracked.detail };
+    const target = rollbackRead(run, ['ls-tree', '-r', '--full-tree', '--name-only', '-z', sha], root, true);
+    if (!target.value) return { ok: false, reason: 'target-list-failed', detail: target.detail };
+    if (rollbackHasUntrackedCollision(untracked.value, target.value)) return { ok: false, reason: 'untracked-collision' };
+  } else {
+    // Preserve the default caller's status flags, result shape and single-read behavior.
+    const status = run(args, { cwd: root, timeout: 60_000, killSignal: 'SIGKILL' });
+    const dirty = status.status === 0 ? !!String(status.stdout ?? '').trim() : null;
+    if (dirty !== false) return { ok: false, reason: dirty === null ? 'status-failed' : 'dirty' };
+  }
   const reset = run(['reset', '--hard', sha], { cwd: root, timeout: 60_000, killSignal: 'SIGKILL' });
   if (reset.status !== 0) return { ok: false, reason: 'reset-failed' };
   return { ok: true };
