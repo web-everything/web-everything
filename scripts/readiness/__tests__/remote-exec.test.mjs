@@ -1531,6 +1531,7 @@ describe('certified snapshot equals selected inventory: client acceptance', () =
     'cert.pem', 'cert.key', 'cert.p12', 'cert.pfx', 'cert.jks', 'cert.keystore',
     'secrets.json', 'tokens.json', 'creds.json', 'credential.json', 'passwd.txt',
     'password.txt', 'oauth.json', 'apikey.json', 'api-key.json', 'ACCESS_TOKEN.json',
+    'api_key.json', 'API_KEY.json', 'api key.json', 'api.key.json',
     'secréts.json', 'tóken.json', 'créds.json', 'íd_backup', 'cert.pém', 'nested/sécrets/hosts.yml',
     '.netrc', '.npmrc', '.env', '.env.production',
   ])('excludes credential class path %s from entries and rsync inventory', async name => {
