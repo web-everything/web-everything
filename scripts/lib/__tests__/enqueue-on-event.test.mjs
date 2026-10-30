@@ -2015,6 +2015,27 @@ describe('catch-up miss backoff', () => {
     expect(f.lines.at(-1)).toContain('nothing runnable');
   });
 
+  it('records an event-origin miss and skips a later catch-up for the same head and labels', async () => {
+    let catchUpEnabled = false;
+    const f = fixture({ resolveSetting: () => ({ ...CATCH_UP_SETTING,
+      catchUp: { ...CATCH_UP_SETTING.catchUp, enabled: catchUpEnabled } }) });
+    f.handle.notePoll({ ok: true, marked: [mark(42)] });
+    f.advance(15_000);
+    const eventRan = await f.handle.tick();
+    expect(eventRan).toMatchObject([{ num: 42, what: 'not enqueued: red-team-pending' }]);
+    expect(eventRan[0].catchUp).toBeUndefined();
+    expect(attempts(f)).toEqual(['--only=42']);
+    expect(f.handle.missBackoff().get(42)).toMatchObject({ pr: 42, headSha: 'miss-head',
+      labelsDigest: expect.stringMatching(/^[a-f0-9]{64}$/), reason: 'red-team-pending', at: expect.any(Number), logged: false });
+
+    catchUpEnabled = true;
+    f.advance(600_000);
+    const catchUpRan = await f.handle.catchUp();
+    expect(catchUpRan).toMatchObject([{ num: 42, catchUp: true, outcome: 'skipped',
+      what: 'miss-backoff: skipped (reason red-team-pending) until head/labels change or TTL' }]);
+    expect(attempts(f)).toEqual(['--only=42']);
+  });
+
   it.each(['head', 'labels', 'TTL'])('re-picks after %s changes', async change => {
     let pr = head;
     const f = fixture({ readPr: async () => pr });
