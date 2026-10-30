@@ -3,6 +3,7 @@ kind: story
 size: 3
 status: open
 scope: ["we:docs/agent/testing.md", "we:scripts/conveyor/health-investigate-dispatch.mjs", "we:scripts/lib/__tests__/routing-overrides.test.mjs", "we:scripts/lib/dispatch-routing-policy-io.mjs", "we:scripts/lib/dispatch-routing-policy.json", "we:scripts/lib/dispatch-routing-policy.mjs", "we:scripts/lib/policy-cascade.mjs", "we:scripts/operations/__tests__/http-adapter.test.mjs", "we:scripts/operations/__tests__/review-red-team.test.mjs", "we:scripts/operations/__tests__/routing-override.test.mjs", "we:scripts/operations/__tests__/runner-freshness.test.mjs", "we:scripts/operations/cli-adapter.mjs", "we:scripts/operations/review-dispatch.mjs", "we:scripts/operations/review-extra-seats.mjs", "we:scripts/operations/review-seat-policy.mjs", "we:scripts/operations/routing-override-file.mjs", "we:scripts/operations/routing-override.mjs", "we:scripts/operations/run.mjs"]
+scopeRationale: "Existing review-dispatch, review-extra-seats and run tests are exercised unchanged; new coverage lives in the routing-override suites listed in A1."
 dateOpened: "2026-10-30"
 tags: []
 ---
