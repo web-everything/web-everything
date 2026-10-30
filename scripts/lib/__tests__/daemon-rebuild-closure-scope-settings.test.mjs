@@ -1,36 +1,36 @@
-import { afterEach, expect, it } from 'vitest';
+// @vitest-environment happy-dom
+// Keep Vite's browser asset transformation active using the repository's declared DOM runner.
+import { afterAll, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import { spawnSync } from 'node:child_process';
-import { daemonRebuildSettingsPath, resolveClosureScopeMode } from '../daemon-rebuild/closure-scope-settings.mjs';
-import { resolveSkipUnrelated } from '../daemon-rebuild/skip-unrelated.mjs';
+import { fileURLToPath } from 'node:url';
+import { daemonRebuildSettingsPath, resolveClosureScopeMode, resolveSkipUnrelated } from '../daemon-rebuild/skip-unrelated.mjs';
+import { resolveWrongBranchHealSettings } from '../daemon-rebuild/wrong-branch-heal.mjs';
 
-const libDir = join(dirname(fileURLToPath(import.meta.url)), '..');
-const settingsPath = join(libDir, 'daemon-rebuild-settings.json');
-let scratch;
-afterEach(() => { if (scratch) rmSync(scratch, { recursive: true, force: true }); });
+const root = mkdtempSync(join(tmpdir(), 'closure-scope-settings-'));
+const env = { WE_PLATFORM_PREFERENCES_FILE: join(root, 'absent.json') };
+const expectedPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'daemon-rebuild-settings.json');
+afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-it('resolves the shipped settings to a filesystem path under the Vite transform', () => {
-  expect(daemonRebuildSettingsPath()).toBe(settingsPath);
-  expect(JSON.parse(readFileSync(daemonRebuildSettingsPath(), 'utf8'))).toHaveProperty('closureScope');
+it('default rebuild settings resolve to the module-relative filesystem path in a DOM environment', () => {
+  expect(document.defaultView).toBe(window);
+  expect(daemonRebuildSettingsPath()).toBe(expectedPath);
+  expect(JSON.parse(readFileSync(daemonRebuildSettingsPath(), 'utf8')).closureScope).toEqual({ mode: 'shadow' });
 });
 
-it('both default policy readers load shipped settings without a caller path override', () => {
-  scratch = mkdtempSync(join(tmpdir(), 'closure-settings-'));
-  const env = { WE_PLATFORM_PREFERENCES_FILE: join(scratch, 'absent.json') };
+it('default rebuild settings supply tool provenance without a path override', () => {
   expect(resolveClosureScopeMode(env)).toEqual({ mode: 'shadow', source: 'tool' });
-  expect(resolveSkipUnrelated(env)).toBe(true);
+  expect(resolveClosureScopeMode({ ...env, WE_DAEMON_CLOSURE_SCOPE: 'on' })).toEqual({ mode: 'on', source: 'env' });
 });
 
-it('native Node resolves settings relative to the module from an unrelated working directory', () => {
-  scratch = mkdtempSync(join(tmpdir(), 'closure-settings-'));
-  const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
-    import { daemonRebuildSettingsPath } from ${JSON.stringify(pathToFileURL(join(libDir, 'daemon-rebuild/closure-scope-settings.mjs')).href)};
-    process.stdout.write(daemonRebuildSettingsPath());
-  `], { cwd: scratch, encoding: 'utf8', timeout: 10_000 });
-  expect(result.error).toBeUndefined();
-  expect(result.status, result.stderr).toBe(0);
-  expect(result.stdout).toBe(settingsPath);
+it('default rebuild settings remain usable through skip and wrong-branch callers', () => {
+  expect(resolveSkipUnrelated(env)).toBe(true);
+  expect(resolveSkipUnrelated({ ...env, WE_DAEMON_REBUILD_SKIP_UNRELATED: 'false' })).toBe(false);
+  const read = vi.fn(() => JSON.stringify({ wrongBranchHeal: { branches: ['ops/test'], pathPrefixes: ['store/'] } }));
+  expect(resolveWrongBranchHealSettings({ read })).toEqual({ branches: ['ops/test'], pathPrefixes: ['store/'] });
+  expect(read).toHaveBeenCalledWith(expectedPath);
+  expect(resolveWrongBranchHealSettings({ read: () => '{' })).toEqual({
+    branches: ['ops/review-requests'], pathPrefixes: ['verdict-ledger/'],
+  });
 });

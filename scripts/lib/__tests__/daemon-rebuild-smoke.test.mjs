@@ -11,6 +11,7 @@ import { dispatchSmokeSuspects, smokeAndAdopt, smokeFailureFiles } from '../daem
 import { checkDaemonEntriesBoot, DAEMON_ENTRIES_ENV } from '../daemon-boot-smoke.mjs';
 import { runRealDispatchSmoke } from '../daemon-load-overlay.mjs';
 import { alertsFilePath } from '../daemon-rebuild/state.mjs';
+import { replayFallbackRegistration } from '../../conveyor/soak/breaks/overlay-fallback-registration.mjs';
 
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
@@ -86,6 +87,19 @@ function addDispatchOverlay(f, ref = 'lane/s3b', file = 'scripts/operations/disp
   return sha;
 }
 const refs = (f) => readOverlayState(f.cloneDir, { env: f.env }).overlays.map((o) => o.ref);
+
+describe('fallback registration evidence', () => {
+  for (const selective of [false, true]) for (const recovery of [false, true]) {
+    it(`fallback adoption preserves retained mechanism registration evidence across refresh failure (${selective ? 'selective' : 'plain'}, ${recovery ? 'recovered' : 'direct'})`, async () => {
+      expect((await replayFallbackRegistration({ selective, recovery })).violations).toEqual([]);
+    }, 30_000);
+  }
+  for (const selective of [false, true]) {
+    it(`fallback adoption does not bind old mechanism evidence to a replacement registration (${selective ? 'selective' : 'plain'})`, async () => {
+      expect((await replayFallbackRegistration({ selective, replace: true })).violations).toEqual([]);
+    }, 30_000);
+  }
+});
 
 beforeEach(() => { tempDirs.length = 0; });
 afterEach(() => {

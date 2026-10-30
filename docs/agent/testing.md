@@ -1,5 +1,15 @@
 # Testing — Three-Tier Strategy
 
+## Human-only enqueue approval license (R212)
+
+`human-only-enqueue-license.test.mjs` uses local Git repositories to exercise exact clearance,
+the shared numbering proof, and main merges whose sensitive blobs match `origin/main`.
+Admission reads complete comments and live head/labels; missing or unreadable evidence retains
+the human hold. Successor proof is read-only, with 8 MiB per Git output and 1024 changed paths;
+exceeding either limit asks the operator to re-approve the current head or queue it.
+`drain-merge-strategy.test.mjs` covers the setting-off refusal and best-effort `needs-you` event.
+Run these and `merge-queue-enqueue.test.mjs` through the host heavy-admission queue.
+
 The real-Git daemon rebuild suites `daemon-rebuild-keep-established.test.mjs` and
 `daemon-rebuild-fallback.test.mjs` run in the blocking integration tier's serial fork.
 Their multi-rebuild cases exceeded the five-second deadline in concurrent unit shards.
@@ -1013,6 +1023,21 @@ clearances remain confined to the explicitly requested numbering-only proof. Tes
 commits and changed trees through the writer, alongside refusal cases with zero writer calls.
 
 ## Human clearance across drain numbering
+
+An approved human-surface head hold suppresses rebasing, never pending-card numbering before
+enqueue. Regress that preparation predicate with an approved human-only head carrying a hash card,
+and run real branch numbering with workflow edits while unqueued. Queued human-only or
+human-enqueued hash cards retain their skip event and emit `needs-you` with the files and
+dequeue/re-queue instructions; hash-free branches emit no alert.
+
+Branch preparation accepts flat backlog cards and `backlog/raised-by/<digits>/<basename>.md`
+ledger files; ledger basenames allow ASCII letters, digits, dots, underscores and hyphens.
+Reject `..`, NUL and symlinks at every parent or file before numbering. Keep nested ledgers
+outside card discovery, renaming, number floors and reservation pruning.
+`queue-branch-numbering.test.mjs` exercises real Git
+numbering beside unchanged ledgers, including a hash-like ledger basename. Preparation skips
+emit a best-effort `needs-you` event with the refusal and manual-numbering fallback; numbered
+and final outcomes emit none. Regress both synchronous and asynchronous emitter failures.
 
 A `clear-human` record already counts as acceptance; a numbering carry must also run before
 workflow and anti-test-gaming holds can re-park it. Use the existing human carry writer with a

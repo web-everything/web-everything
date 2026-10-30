@@ -1127,7 +1127,7 @@ async function main(argv) {
   let sizePolicy = null;
   if (!flags['no-size-check']) {
     try {
-      const { defaultReadSizePolicy } = await import('../operations/dispatch-lane-io.mjs');
+      const { defaultReadSizePolicy } = await import('../lib/dispatch-size-policy.mjs');
       const { validateSizePolicy } = await import('../lib/dispatch-contracts.mjs');
       const result = validateSizePolicy(defaultReadSizePolicy());
       if (result.ok) sizePolicy = result.policy;
