@@ -294,6 +294,12 @@ const capText = (text, max) => {
   return s.length <= max ? s : `${s.slice(0, max)}\n… [truncated: ${s.length - max} more characters not shown]`;
 };
 
+export const SEAT_ANSWER_CONTRACT = [
+  'Your final message must contain ONLY this single JSON object (a single ```json block is also accepted); put NO commentary after it.',
+  'Any reasoning must come BEFORE it, must not contain unbalanced { } [ ] characters, and must not end with a comma (,), an opening bracket ([), or a JSON key colon. The answer must be in the final message itself, NOT written to a file or reported via tool output.',
+  'Findings text must not contain triple backticks. An empty findings list with verdict "accept" is a valid answer.',
+].join('\n');
+
 /**
  * The review brief one provider's call receives, covering every seat routed to it. PURE. With `inline`, the brief
  * carries the diff and PR description in its own text and points at no file (a tool-free seat); otherwise it
@@ -335,9 +341,7 @@ export function buildSeatTask({ pr, repo, title, dir, diffFile, bodyFile, inline
     `Rate each finding's impactIfUnfixed as one of ${Object.values(IMPACT_LEVELS).join(' | ')}.`,
     'If a seat finds nothing, give it verdict "accept" and an empty findings list.',
     '',
-    'Your final message must contain ONLY this single JSON object (a single ```json block is also accepted); put NO commentary after it.',
-    'Any reasoning must come BEFORE it, must not contain unbalanced { } [ ] characters, and must not end with a comma (,), an opening bracket ([), or a JSON key colon. The answer must be in the final message itself, NOT written to a file or reported via tool output.',
-    'Findings text must not contain triple backticks. An empty findings list with verdict "accept" is a valid answer.',
+    SEAT_ANSWER_CONTRACT,
     JSON.stringify({ lenses: example }),
     'where each findings entry is {"summary": string, "category": string|null, "file": (repo-relative path, e.g. "scripts/x.mjs")|null, "line": integer|null, "impactIfUnfixed": string, "failure_scenario": string|null}',
     'Every finding must include all six fields above; summary and impactIfUnfixed must be non-empty strings. Include only the requested seat keys under lenses.',
@@ -359,9 +363,20 @@ export function extractAnswerJson(text) {
   // a new seat call or manual review by the caller's existing evidence path.
   if (s.length > MAX_ANSWER_SCAN_CHARS) return null;
   let lastAnswerKey = -1;
-  for (const match of s.matchAll(/"((?:\\[\s\S]|[^"\\])*)"\s*:/g)) {
+  // Consume each string and its following whitespace once, including non-key
+  // strings: retrying at escaped quotes can make a regex pre-scan quadratic.
+  for (let cursor = 0; cursor < s.length;) {
+    if (s[cursor] !== '"') { cursor += 1; continue; }
+    const start = cursor++;
+    while (cursor < s.length && s[cursor] !== '"') {
+      cursor += s[cursor] === '\\' ? 2 : 1;
+    }
+    if (cursor >= s.length) break;
+    const end = ++cursor;
+    while (cursor < s.length && /\s/.test(s[cursor])) cursor += 1;
+    if (s[cursor] !== ':') continue;
     try {
-      if (JSON.parse('"' + match[1] + '"') === 'lenses') lastAnswerKey = match.index;
+      if (JSON.parse(s.slice(start, end)) === 'lenses') lastAnswerKey = start;
     } catch { /* An invalid quoted key is not an answer-key token. */ }
   }
   let last = null;
@@ -1224,9 +1239,7 @@ export function buildRedTeamTask({ pr, repo, title, dir, diffFile, bodyFile, inl
     `Set "category" to one of ${RED_TEAM_CATEGORIES.join(' | ')}, and rate impactIfUnfixed as one of ${Object.values(IMPACT_LEVELS).join(' | ')}.`,
     'If the change holds up, answer verdict "accept" with an empty findings list — an empty list is a real answer, never a failure.',
     '',
-    'Your final message must contain ONLY this single JSON object (a single ```json block is also accepted); put NO commentary after it.',
-    'Any reasoning must come BEFORE it, must not contain unbalanced { } [ ] characters, and must not end with a comma (,), an opening bracket ([), or a JSON key colon. The answer must be in the final message itself, NOT written to a file or reported via tool output.',
-    'Findings text must not contain triple backticks. An empty findings list with verdict "accept" is a valid answer.',
+    SEAT_ANSWER_CONTRACT,
     JSON.stringify(example),
     'where each findings entry is {"summary": string, "category": string, "file": (repo-relative path)|null, "line": integer|null, "impactIfUnfixed": string, "failure_scenario": string}',
     'Every finding must include all six fields above; summary and impactIfUnfixed must be non-empty strings. category and failure_scenario must be strings, never null. Include only the requested seat keys under lenses.',

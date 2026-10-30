@@ -86,6 +86,16 @@ describe('buildCodexDirectTaskArgv — pure argv for agentic/workspace-write mod
       expect(() => buildCodexDirectTaskArgv({ ...options, outputSchemaFile })).toThrow(/outputSchemaFile/);
     }
   });
+  it('treats a null resume thread as an initial turn and keeps its schema', () => {
+    const options = { cwd: '/lane', outputSchemaFile: 'seat.schema.json' };
+    const argv = buildCodexDirectTaskArgv({ ...options, resumeThreadId: null });
+    expect(argv).toEqual(buildCodexDirectTaskArgv(options));
+    expect(argv).not.toContain('resume');
+    expect(argv.slice(argv.indexOf('--output-schema'), argv.indexOf('--output-schema') + 2)).toEqual(['--output-schema', options.outputSchemaFile]);
+  });
+  it.each(['', false, 0])('rejects a non-null invalid resume thread %j instead of starting an initial turn', resumeThreadId => {
+    expect(() => buildCodexDirectTaskArgv({ cwd: '/lane', resumeThreadId, outputSchemaFile: 'seat.schema.json' })).toThrow(/resumeThreadId/);
+  });
   it('optionally forwards the schema file as a separate argv value without changing defaults', () => {
     const outputSchemaFile = 'task with spaces.schema.json';
     const argv = buildCodexDirectTaskArgv({ cwd: '/lane', review: true, outputSchemaFile });

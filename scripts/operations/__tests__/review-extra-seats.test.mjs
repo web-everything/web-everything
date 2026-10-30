@@ -15,7 +15,7 @@ import {
 import {
   runExtraSeats, extraSeatsEnabled, resolveDailyCap, callsUsedToday, callsUsedTodayForProvider, quotaHold,
   PROBE_INTERVAL_ENV, DEFAULT_PROBE_INTERVAL_MS, resolveProbeIntervalMs, probeDue, quotaHoldOrProbe,
-  claudeFindingsFromLoop, buildSeatTask, parseSeatAnswer, classifySeatCall, buildSeatRows, seatCallArgv, capDay,
+  claudeFindingsFromLoop, buildSeatTask, SEAT_ANSWER_CONTRACT, parseSeatAnswer, classifySeatCall, buildSeatRows, seatCallArgv, capDay,
   renderSeatSummary, EXTRA_SEATS_ENV, DAILY_CAP_ENV, DEFAULT_DAILY_CAP, PROVIDER_CAP_ENV, PROVIDER_CAP_DEFAULT,
   resolveProviderCap, reviewSeatCapUsage, toIsoInstant, extractAnswerJson, reserveSeatCalls, createExtraSeatsIo,
   withLedgerLock, isPinnedRev, repoRelativeFindings, readSeatCapUsage,
@@ -385,6 +385,18 @@ describe('#4194 the direct-task scripts in --review mode', () => {
 
 describe('#4194 prompt, answer parsing, confirmation, rows', () => {
   const seats = reviewSeatRoutes({}).routes.map((r) => ({ ...r }));
+
+  it('both briefs use the same unchanged three-line answer contract', () => {
+    expect(SEAT_ANSWER_CONTRACT).toBe([
+      'Your final message must contain ONLY this single JSON object (a single ```json block is also accepted); put NO commentary after it.',
+      'Any reasoning must come BEFORE it, must not contain unbalanced { } [ ] characters, and must not end with a comma (,), an opening bracket ([), or a JSON key colon. The answer must be in the final message itself, NOT written to a file or reported via tool output.',
+      'Findings text must not contain triple backticks. An empty findings list with verdict "accept" is a valid answer.',
+    ].join('\n'));
+    const options = { pr: 5, repo: REPO, title: 'T', inline: { diffText: '', body: '' }, seats };
+    for (const build of [buildSeatTask, buildRedTeamTask]) {
+      expect(build(options)).toContain('\n' + SEAT_ANSWER_CONTRACT + '\n');
+    }
+  });
 
   it('the brief names each seat, the files, and the JSON contract', () => {
     const t = buildSeatTask({ pr: 5, repo: REPO, title: 'T', dir: '/s', diffFile: '/s/.git/d', bodyFile: '/s/.git/b', seats });
@@ -934,6 +946,18 @@ describe('seat answer extraction — realistic provider replies, fail closed', (
     const obj = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
     const prose = 'Reviewed {} and [].\n'.padEnd(100 * 1024, ' ');
     expect(extractAnswerJson(prose + JSON.stringify(obj))).toEqual(obj);
+  });
+  it('scans 200 KB of backslash/quote-heavy text below the cap in under one second', () => {
+    const obj = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };
+    const prose = '"' + '\\"'.repeat(100 * 1024) + '"\nActual answer:\n';
+    const text = prose + JSON.stringify(obj);
+    expect(text.length).toBeGreaterThan(200_000);
+    expect(text.length).toBeLessThan(256 * 1024);
+    const started = performance.now();
+    const result = extractAnswerJson(text);
+    const elapsed = performance.now() - started;
+    expect(result).toEqual(obj);
+    expect(elapsed).toBeLessThan(1000);
   });
   it.each([0, 1])('enforces the 256 KB scan limit with %i extra characters', extra => {
     const obj = { lenses: { 'red-team': { verdict: 'accept', findings: [] } } };

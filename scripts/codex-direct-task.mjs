@@ -223,7 +223,7 @@ export function buildCodexDirectTaskArgv({
       throw new TypeError('codex-direct-task: `outputSchemaFile` must be a non-empty path when given');
     }
     // `exec resume` does not support --output-schema; validate the option on every path.
-    if (resumeThreadId === undefined) argv.push('--output-schema', outputSchemaFile);
+    if (resumeThreadId == null) argv.push('--output-schema', outputSchemaFile);
   }
   if (outputLastMessageFile) {
     if (typeof outputLastMessageFile !== 'string' || !outputLastMessageFile.trim()) {
@@ -264,7 +264,7 @@ export function buildCodexDirectTaskArgv({
   }
   // Exec-level options precede the subcommand: resume itself does not accept -s/-C/--add-dir.
   // Reuse all routed configuration and grants rather than inheriting the user's defaults.
-  if (resumeThreadId !== undefined) {
+  if (resumeThreadId != null) {
     if (typeof resumeThreadId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(resumeThreadId)) {
       throw new TypeError('codex-direct-task: `resumeThreadId` must be a session id or thread name');
     }
