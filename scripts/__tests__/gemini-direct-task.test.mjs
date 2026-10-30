@@ -292,6 +292,14 @@ describe('runGate — none/standards/full, never commits', () => {
 
 
 describe('buildAgyDirectTaskArgv — observed stdin route, no invented flags or defaults', () => {
+  it.each(['seat with spaces.schema.json', '{"type":"object"}'])('passes a schema string or path unchanged: %s', jsonSchema => {
+    const argv = buildAgyDirectTaskArgv({ jsonSchema });
+    expect(argv.slice(argv.indexOf('--json-schema'), argv.indexOf('--json-schema') + 2)).toEqual(['--json-schema', jsonSchema]);
+    expect(buildAgyDirectTaskArgv()).not.toContain('--json-schema');
+  });
+  it.each(['', ' ', null, 42])('rejects invalid schema value %j', jsonSchema => {
+    expect(() => buildAgyDirectTaskArgv({ jsonSchema })).toThrow(/jsonSchema/);
+  });
   const BASE = ['--input-format', 'stream-json', '--output-format', 'stream-json',
     '--disable-slash-commands', '--dangerously-skip-permissions'];
   it('has exactly the mandatory flags and explicit empty --print value', () => {
@@ -713,7 +721,7 @@ describe('runAgyDirectExec / geminiDirectTask — injected process mechanics', (
     const logFile = join(dir, 'events.jsonl');
     const stdout = jsonl(REAL_EVENTS);
     const { fn, seen } = fakeSpawn(stdout, { chunks: [stdout.slice(0, 30), stdout.slice(30)] });
-    const opts = { model: 'future-model', effort: 'high', addDirs: ['/other'], sandbox: true, timeoutMs: 5010 };
+    const opts = { model: 'future-model', effort: 'high', jsonSchema: 'seat.schema.json', addDirs: ['/other'], sandbox: true, timeoutMs: 5010 };
     const output = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
     const result = await runAgyDirectExec({ dir, task: '/settings\nDo the thing', logFile, stream: false, spawnFn: fn, ...opts });
     expect(seen.cli).toBe(AGY_CLI);
@@ -815,6 +823,16 @@ describe('runAgyDirectExec / geminiDirectTask — injected process mechanics', (
 });
 
 describe('CLI — flag parsing and truthful reports without a real process', () => {
+  it('threads the schema from CLI through the task and print-mode spawn', async () => {
+    const dir = tempDir();
+    const { fn: spawnFn, seen } = fakeSpawn(jsonl(REAL_EVENTS));
+    const output = vi.spyOn(console, 'log').mockImplementation(() => {});
+    await main(['--task=review', `--dir=${dir}`, '--json-schema=seat.schema.json', '--json', '--review'], {
+      taskFn: opts => geminiDirectTask({ ...opts, execFn: fakeExec(), spawnFn }),
+    });
+    expect(seen.argv.slice(seen.argv.indexOf('--json-schema'), seen.argv.indexOf('--json-schema') + 2)).toEqual(['--json-schema', 'seat.schema.json']);
+    expect(output).toHaveBeenCalledOnce();
+  });
   const report = {
     dir: '/d', scratch: { created: false }, startSha: 'abc', argv: [], logFile: '/d/.git/log', exitCode: 0, timedOut: false,
     events: summarizeAgyEvents(REAL_EVENTS), diff: { status: ' M file', diff: '+actual change', diffStat: '1 file', commits: [], hasChanges: true },

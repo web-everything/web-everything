@@ -76,6 +76,15 @@ describe('defaultExecFn — real child-process output buffering', () => {
 });
 
 describe('buildCodexDirectTaskArgv — pure argv for agentic/workspace-write mode', () => {
+  it('optionally forwards the schema file as a separate argv value without changing defaults', () => {
+    const outputSchemaFile = 'task with spaces.schema.json';
+    const argv = buildCodexDirectTaskArgv({ cwd: '/lane', review: true, outputSchemaFile });
+    expect(argv.slice(argv.indexOf('--output-schema'), argv.indexOf('--output-schema') + 2)).toEqual(['--output-schema', outputSchemaFile]);
+    expect(buildCodexDirectTaskArgv({ cwd: '/lane' })).not.toContain('--output-schema');
+    for (const value of ['', ' ', null, 42]) {
+      expect(() => buildCodexDirectTaskArgv({ cwd: '/lane', outputSchemaFile: value })).toThrow(/outputSchemaFile/);
+    }
+  });
   it('#4665 encodes exact edit roots and temp environment without shell interpolation', () => {
     const roots = ['/lane/.git', '/pool/.admission/heavy', '/tmp/a "quoted" \\ root'];
     const argv = buildCodexDirectTaskArgv({ cwd: '/lane', writableRoots: roots, tempRoot: roots[2] });
@@ -1048,9 +1057,10 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     const stdout = '{"type":"thread.started","thread_id":"t1"}\n{"type":"turn.completed","usage":{}}\n';
     const { fn, seen } = fakeSpawn(stdout);
     try {
-      const r = await runCodexDirectExec({ dir, task: 'do the thing', logFile, stream: false, spawnFn: fn });
+      const outputSchemaFile = join(dir, 'seat.schema.json');
+      const r = await runCodexDirectExec({ dir, task: 'do the thing', outputSchemaFile, logFile, stream: false, spawnFn: fn });
       expect(seen.cli).toBe(CODEX_CLI);
-      expect(seen.argv).toEqual(buildCodexDirectTaskArgv({ cwd: dir, outputLastMessageFile: join(dir, '.git', 'codex-direct-task-last-message.txt') }));
+      expect(seen.argv).toEqual(buildCodexDirectTaskArgv({ cwd: dir, outputSchemaFile, outputLastMessageFile: join(dir, '.git', 'codex-direct-task-last-message.txt') }));
       expect(seen.stdin).toContain('do the thing');
       expect(seen.stdin).toMatch(/do not run `git commit`/);
       expect(r.stdout).toBe(stdout);
