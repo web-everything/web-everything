@@ -48,6 +48,7 @@
  * PURE-CORE / IO-SHELL SPLIT, mirroring `ci-queue-watch.mjs`: the pure planner
  * ({@link module:./main-red-recovery.mjs.planMainRedRebases}) is imported, not re-derived; this file owns every
  * `gh`/git call and the CLI.
+ * The pr-cancelled pass grants one durable, free failed-jobs rerun per cancelled required workflow on a PR head.
  *
  * `--apply` GATES THE REAL WRITE (the rebase + push), mirroring `we:scripts/conveyor/orphan-claim-release.mjs`'s
  * own convention: bare `sweep` is a DRY RUN (plans and reports, touches nothing), `sweep --apply` actually
@@ -73,6 +74,7 @@ import { resolveExhaustedRetry, exhaustionFacts, countExhaustedRetries, planExha
   buildExhaustedRetryRecoveredComment, EXHAUSTED_RETRY_RECOVERED_MARKER } from './exhausted-retry.mjs';
 import { excusePrMergeGateHolds } from '../lib/merge-gate-hold-class.mjs';
 import { pushMissingRunCommit } from './missing-run-push.mjs';
+import { sweepPrCancelledRerun, formatPrCancelledReport } from './pr-cancelled-rerun.mjs';
 import { DECLARED_REQUIRED_STATUS_CHECKS, getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -253,7 +255,7 @@ export function sweepCiRedRecovery({
   readPriority = () => readMainRedPriority(),
 } = {}) {
   const retrySettings = exhaustedRetrySettings ?? resolveExhaustedRetry();
-  const prs = readOpenPrs({ repo, extraFields: ['labels'] });
+  const prs = readOpenPrs({ repo, extraFields: ['labels', 'baseRefName'] });
   // soak-main-red — judge every REQUIRED check (shared ruleset ∪ classic-protection set when available, else
   // DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS), so a `daemon-soak`-only red PR is refreshed like a `test`-red one.
   // Required checks also judge terminal retry outcomes when the CLI shares green PRs with the next pass.
@@ -1016,6 +1018,21 @@ export function defaultReadAttributedRequiredChecks({
   }
 }
 
+/** Required checks for cancelled-PR recovery: only a fresh live read can authorize a rerun. */
+export function readLiveRequiredChecks({
+  repo = null, branch = 'main', readRequiredChecks = getRequiredStatusChecks,
+} = {}) {
+  if (!repo) return null;
+  try {
+    const result = readRequiredChecks({ repo, branch, ttlMs: 0 });
+    if (result?.source !== 'live' || !Array.isArray(result.checks) || !result.checks.length ||
+      result.checks.some(check => typeof check !== 'string' || !check)) return null;
+    return result.checks;
+  } catch {
+    return null;
+  }
+}
+
 // ── MISSING-CI-RUN RECOVERY (we:backlog/xi4od2p-*.md, parent #4075/#3383) ──────────────────────────────────────
 // See `we:scripts/conveyor/main-red-recovery.mjs`'s own "MISSING-CI-RUN RECOVERY" section header for the full
 // incident (PR web-everything/web-everything#2729) and why this is a THIRD, disjoint population from the main-red and
@@ -1463,6 +1480,17 @@ export function mainRetriggerRecordPath(repo = null, home = handoffHome()) {
     : `main-ci-retrigger.${encodeURIComponent(slug)}.json`);
 }
 
+export function prCancelledRecordPath(repo = null, home = handoffHome()) {
+  const slug = repoSlug(repo);
+  return join(home, slug === CONSTELLATION_REPOS.we.slug ? 'pr-ci-cancelled-rerun.json'
+    : `pr-ci-cancelled-rerun.${encodeURIComponent(slug)}.json`);
+}
+
+function readPrCancelledRecord(path) {
+  try { return JSON.parse(readFileSync(path, 'utf8')); }
+  catch (e) { if (e.code === 'ENOENT') return {}; throw e; }
+}
+
 /** Exclusive advisory lock around a record's read-modify-write (atomic rename protects one write, not the sequence).
  *  Returns {locked:false} when another holder is still live after `waitMs`; a lock older than `staleMs`
  *  (a crashed holder) is stolen. The lock is always released, including when `fn` throws. */
@@ -1665,6 +1693,7 @@ export function formatReport({ dispatch = [], refusals = [], applied = [] } = {}
 export async function main(argv, { sweepOptions = {}, sweepMainRed = sweepCiRedRecovery,
   sweepExhausted = sweepExhaustedRetry, sweepHung = sweepHungCiRecovery, sweepMissingRun = sweepMissingRunRecovery,
   sweepMainCancelled = sweepMainCancelledRetrigger,
+  sweepPrCancelled = sweepPrCancelledRerun,
   writeLine = writeLineSync, writeAll = writeAllSync } = {}) {
   const [verbRaw, ...rest] = argv;
   const verb = verbRaw && !verbRaw.startsWith('--') ? verbRaw : 'sweep';
@@ -1708,15 +1737,25 @@ export async function main(argv, { sweepOptions = {}, sweepMainRed = sweepCiRedR
   // already schedules this script gets the missing-run fix for free rather than needing a third entry.
   const missingRunResult = runPass('missing-run', sweepMissingRun, { ...options, mainRuns: result.mainRuns?.length ? result.mainRuns : null });
   const mainCancelledResult = runPass('main-cancelled', sweepMainCancelled, options);
+  const prCancelledResult = runPass('pr-cancelled', sweepPrCancelled, {
+    ...options, repo: repoSlug(options.repo),
+    // Reuse defaultReadOpenPrs' snapshot from main-red; a failed pass provides no actionable evidence.
+    readOpenPrs: options.readOpenPrs ?? (() => result.prs ?? null),
+    requiredChecks: undefined,
+    readRequiredChecks: readLiveRequiredChecks,
+    recordPath: prCancelledRecordPath(options.repo), lock: withMainRetriggerLock,
+    readRecord: readPrCancelledRecord, writeRecord: writeMainRetriggerRecord,
+  });
   if (flags.json) {
     writeLine(2, formatExhaustedRetryReport(exhaustedResult).split('\n')[0]);
-    writeAll(1, `${JSON.stringify({ mainRedRecovery: result, hungRecovery: hungResult, missingRunRecovery: missingRunResult, exhaustedRetry: exhaustedResult, mainCancelledRetrigger: mainCancelledResult })}\n`);
+    writeAll(1, `${JSON.stringify({ mainRedRecovery: result, hungRecovery: hungResult, missingRunRecovery: missingRunResult, exhaustedRetry: exhaustedResult, mainCancelledRetrigger: mainCancelledResult, prCancelledRerun: prCancelledResult })}\n`);
   } else {
     writeLine(2, formatReport(result));
     writeLine(2, formatExhaustedRetryReport(exhaustedResult));
     writeLine(2, formatHungReport(hungResult));
     writeLine(2, formatMissingRunReport(missingRunResult));
     writeLine(2, formatMainCancelledReport(mainCancelledResult));
+    writeLine(2, formatPrCancelledReport(prCancelledResult));
   }
   process.exitCode = failed ? 1 : 0;
 }

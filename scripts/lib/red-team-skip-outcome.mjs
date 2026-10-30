@@ -36,17 +36,19 @@ function itemKey(item) {
 }
 
 /** PURE. A reason string is never evidence of a policy exemption. */
-export function classifyRedTeamSkip(redTeam) {
+export function classifyRedTeamSkip(redTeam, { accepted = false } = {}) {
   const valid = redTeam != null && typeof redTeam === 'object' && !Array.isArray(redTeam);
   const deferred = valid && Boolean(redTeam.deferredByGuard || redTeam.deferredByCap);
-  // Settlement is reached only for an accepted head: a terminal not-owed contradicts that admission.
+  // R100: a terminal not-owed on an ACCEPTED head (caller asserts accepted === true) is policy-clear,
+  // since nothing is owed. Anything not explicitly accepted, or deferred, still alerts and never clears.
   const reason = valid && redTeam.status === 'not-owed' && !deferred
     ? 'red team reported not-owed on an accepted head'
     : valid && typeof redTeam.reason === 'string' && redTeam.reason.trim()
       ? redTeam.reason : 'unknown red-team outcome';
-  return { kind: valid && redTeam.status === 'skipped' && redTeam.policy === 'card-only'
-    && !deferred
-    ? 'policy' : 'non-policy', reason };
+  const notOwedClear = accepted === true && valid && redTeam.status === 'not-owed' && !deferred;
+  return { kind: notOwedClear || (valid && redTeam.status === 'skipped' && redTeam.policy === 'card-only'
+    && !deferred)
+    ? 'policy' : 'non-policy', reason, ...(notOwedClear ? { notOwed: true } : {}) };
 }
 
 /** Retry notification IO only; old failures must not prevent this job's settlement. */
@@ -128,12 +130,13 @@ export function settleRedTeamSkip(input = {}) {
     const { redTeam, pr, repo, comments } = input;
     const realHead = isRealHead(input.head);
     const head = realHead ? input.head : 'unknown';
-    // Only recovery's acceptance/hold-checked stored-review path may settle not-owed.
-    // Ordinary job settlement retains its contradictory-not-owed refusal.
+    // Recovery requires explicit authority after acceptance/hold checks. The overlay's
+    // accepted-head form remains supported only when recovery authority is absent;
+    // an explicit false, unknown or malformed authority never falls back to it.
     const storedClear = input.storedReviewPolicyClear === true && input.accepted === true
       && redTeam?.status === 'not-owed' && !redTeam.deferredByGuard && !redTeam.deferredByCap;
     const classified = storedClear ? { kind: 'policy', reason: 'not owed (stored review)' }
-      : classifyRedTeamSkip(redTeam);
+      : classifyRedTeamSkip(redTeam, { accepted: !Object.hasOwn(input, 'storedReviewPolicyClear') && input.accepted === true });
     let { reason } = classified;
     const boundRead = isRealHead(input.readHead)
       && realHead && input.readHead.toLowerCase() === head.toLowerCase();
@@ -150,7 +153,9 @@ export function settleRedTeamSkip(input = {}) {
         const thread = comments ?? io.readComments({ repo, pr });
         if (!Array.isArray(thread)) throw Error('PR comments unreadable');
         if (redTeamForHead(thread, pr, head)) return { outcome: 'already' };
-        io.postComment({ repo, pr, body: `${redTeamMarker(pr, head)}\n\nRed team not required on this head: ${storedClear ? 'not owed (stored review)' : 'card-only diff (policy redTeam.skipCardOnly)'}` });
+        io.postComment({ repo, pr, body: `${redTeamMarker(pr, head)}\n\nRed team not required on this head: ${storedClear ? 'not owed (stored review)' : classified.notOwed
+          ? 'red team reported not-owed on an accepted head (policy clear)' : 'card-only diff (policy redTeam.skipCardOnly)'}${
+          typeof input.reason === 'string' && input.reason.trim() ? ` — ${boundReason(input.reason)}` : ''}` });
         return { outcome: 'policy-clear' };
       } catch (error) {
         reason = `policy-clear comment failed: ${safeErrorText(error)}`;

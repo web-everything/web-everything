@@ -2872,9 +2872,34 @@ export function planReconcile({
     const bouncedRealRed = isBouncedRealRed({ pr, phase, check, requiredChecks });
     // At the review-fix cap an unused operator-directed round still belongs to the existing fix path below.
     // Routing it through CI healing would refuse at the cap before that path can carry the allowance.
-    const ciRepairOwed = phase === 'ci-red' || (phase === 'needs-human' && check.state === 'red')
-      || (bouncedRealRed && !(sendBackRound && roundAttempts() >= effectiveRoundCap));
-    if (!(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
+    // Review holds own review-gate failures; cancelled/skipped jobs are not real CI red.
+    // Inspect all visible checks so a non-required failure still keeps its repair owner.
+    const visibleRealRed = collapseRollupToLatestPerName(pr?.statusCheckRollup)
+      .filter(row => FAILED_CHECK_CONCLUSIONS.filter(c => c !== 'CANCELLED')
+        .includes(String(row?.conclusion || row?.state || '').toUpperCase()))
+      .filter(row => row?.name !== 'merge-gate' || !reviewHoldGatesOnlyRed([row], ['merge-gate']))
+      .map(row => row?.name || row?.context);
+    const reviewHoldHasRealRed = withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))
+      // A non-required merge-gate is reported only; required failures still route via check.state below.
+      && visibleRealRed.includes('review-gate') && visibleRealRed.some(name => name !== 'review-gate' && name !== 'merge-gate');
+    const reviewGateOnlyRed = withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))
+      && !requiredChecks?.includes('review-gate')
+      && visibleRealRed.length > 0 && visibleRealRed.every(name => name === 'review-gate');
+    const ciRepairOwed = !reviewGateOnlyRed && (phase === 'ci-red' || (phase === 'needs-human' && (check.state === 'red' || reviewHoldHasRealRed))
+      || (bouncedRealRed && !(sendBackRound && roundAttempts() >= effectiveRoundCap)));
+    const cancelledReviewWork = reviewGateOnlyRed && collapseRollupToLatestPerName(pr?.statusCheckRollup)
+      .some(row => String(row?.status).toLowerCase() === 'completed' && String(row?.conclusion).toLowerCase() === 'cancelled');
+    if (reviewGateOnlyRed && (phase === 'ci-red' || (phase === 'needs-human'
+        && (cancelledReviewWork || check.state !== 'green') && !withPhase.labels.includes(ADVISORY_LABELS.CHANGES)))) {
+      // Ignore completed cancellations only for this review decision; preserve missing/pending evidence.
+      const reviewPr = { ...pr, statusCheckRollup: collapseRollupToLatestPerName(pr?.statusCheckRollup).map(row =>
+        String(row?.status).toLowerCase() === 'completed' && String(row?.conclusion).toLowerCase() === 'cancelled'
+          ? { ...row, conclusion: 'neutral' } : row) };
+      dispatchReviewRow({ pr: reviewPr, requiredChecks, withPhase, base, attempts: roundAttempts(),
+        roundCap: effectiveRoundCap, now, refuse, refuseCapExhausted, dispatch });
+      continue;
+    }
+    if (!reviewHoldHasRealRed && !(advisoryReviewOnHumanHandoff === 'on' && withPhase.labels.some(l => ['review:human', 'review:pending'].includes(l))) && ciRepairOwed && reviewCi.reason === 'required-review-gate-conflict'
         && reviewCi.affected.every(row => row.name === 'review-gate')) {
       refuse('review-ci', { ...withPhase, ci: reviewCi, why: 'required review-gate must succeed before review; resolve the review-dependent required-check configuration' });
       continue;
@@ -2987,7 +3012,7 @@ export function planReconcile({
     }
 
     const heldGates = ciRepairOwed ? splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required : [];
-    const reviewHoldRed = ciRepairOwed
+    const reviewHoldRed = ciRepairOwed && !reviewHoldHasRealRed
       && withPhase.labels.some(l => ['review:human', 'review:pending', 'review:changes', 'review:held-mechanical'].includes(l))
       && reviewHoldGatesOnlyRed(pr?.statusCheckRollup, requiredChecks);
     if (reviewHoldRed) {
