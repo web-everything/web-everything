@@ -299,7 +299,8 @@ describe('main cancelled CLI pass', () => {
     const pass = name => vi.fn(() => { order.push(name); return { dispatch: [], refusals: [], applied: [] }; });
     return { order, deps: { sweepOptions: { exhaustedRetrySettings: {} }, sweepMainRed: pass('main-red'),
       sweepExhausted: pass('exhausted-retry'), sweepHung: pass('hung'), sweepMissingRun: pass('missing-run'),
-      sweepMainCancelled: pass('main-cancelled'), writeAll: vi.fn(), writeLine: vi.fn() } };
+      sweepMainCancelled: pass('main-cancelled'), sweepPrCancelled: vi.fn(() => ({ dispatch: [], refusals: [], applied: [] })),
+      writeAll: vi.fn(), writeLine: vi.fn() } };
   }
 
   it('runs after missing-run and includes the result in JSON', async () => {

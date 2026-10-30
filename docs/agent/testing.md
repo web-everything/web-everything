@@ -282,7 +282,7 @@ acceptance re-stamp at the live head can carry only the policy-clear of its prec
 acceptance record. A newer result on another revision, including one posted after the live-head
 re-stamp, or missing/untrusted source acceptance
 refuses carry; recovery never searches older revisions for a convenient clear.
-Stored-review recovery passes explicit `storedReviewPolicyClear` authority only after its acceptance/hold guards; ordinary job settlement still refuses contradictory `not-owed` results. The stored-context tests in `red-team-skip-outcome.test.mjs` require acceptance, a bound read and no guard/cap deferral.
+Stored-review recovery passes explicit `storedReviewPolicyClear` authority only after its acceptance/hold guards; settlement without explicit acceptance authority still refuses contradictory `not-owed` results. The overlay accepted-head form (`accepted: true` with no recovery-authority field) remains supported; an explicitly false or malformed recovery authority never falls back to that form. The stored-context tests in `red-team-skip-outcome.test.mjs` require acceptance, a bound read and no guard/cap deferral.
 Both carry and stored clear pass formal reviews into `latestAcceptRecord`; unreadable reviews
 refuse publication and require operator inspection. A standing formal CHANGES_REQUESTED blocks both.
 Stored clear (null status or finished/not-owed) requires a trusted acceptance record whose SHA is
@@ -433,7 +433,7 @@ prevents dispatch, except a finished `skipped` status with `skipCardOnly === tru
 stored card-only net read with non-empty trimmed `diffText` and `netBasis.rev` matching the status head: that historical gap dispatches fresh to settle the skip. A structured result with an absent policy or any policy other than `card-only` never heals; legacy string `skipped` remains eligible.
 The dispatcher carries the selected mode into the job. At job time, resume requires a clean row selected by `priorRedTeamRow` from a strict scorecard-store read, plus a finished `ran` or `resumed` status without a posted comment. Fresh mode re-reads and refuses any status or red-team seat row for that head; admission treats the validated historical card-only skip as fresh while retaining the seat-row and comment guards. Unreadable scorecards refuse with `red-team-not-owed`; inspect the stored evidence before retrying.
 
-Settlement runs for skipped, error, disabled and unknown outcomes before the finished status write and gate in both normal and red-team-only jobs. Budget/guard deferrals (including `deferredByCap` and `deferredByGuard`) also reach non-policy settlement. An accepted head already owes a pass: even plain `not-owed` settles as non-policy needs-you with reason `red team reported not-owed on an accepted head`. Only completed (`ran`/`resumed`) outcomes with a `posted` or `deduped` result comment bypass settlement. Completion also requires no truthy guard/cap deferral flag, successful summary/diagnostic derivations, and a complete live comment read with a trusted result for exactly the settlement head. The production visibility hook shares settlement's `readCompletePrComments` reader and uses `redTeamForHead`; missing readers, unreadable/incomplete threads, other heads and untrusted authors fail closed to needs-you, without posting or clearing. Completed outcomes that fail these checks settle as `unpublished`; those with any other or missing comment status settle as `unpublished`, with reason `red team <status> but its result comment is <comment status or unknown>` through the same sanitized, bounded needs-you path; they never post a result comment or clear.
+Settlement runs for skipped, error, disabled and unknown outcomes before the finished status write and gate in both normal and red-team-only jobs. Budget/guard deferrals (including `deferredByCap` and `deferredByGuard`) also reach non-policy settlement. Operator ruling R100: a plain `not-owed` on an ACCEPTED head (review-job passes `accepted: true`; absent or non-true never clears) settles as policy-clear, publishing the clear result marker with reason `red team reported not-owed on an accepted head (policy clear)` so label sync sets `red-team:clear`; deferred (`deferredByGuard`/`deferredByCap`) and unbound-read not-owed still alert and never clear. Only completed (`ran`/`resumed`) outcomes with a `posted` or `deduped` result comment bypass settlement. Completion also requires no truthy guard/cap deferral flag, successful summary/diagnostic derivations, and a complete live comment read with a trusted result for exactly the settlement head. The production visibility hook shares settlement's `readCompletePrComments` reader and uses `redTeamForHead`; missing readers, unreadable/incomplete threads, other heads and untrusted authors fail closed to needs-you, without posting or clearing. Completed outcomes that fail these checks settle as `unpublished`; those with any other or missing comment status settle as `unpublished`, with reason `red team <status> but its result comment is <comment status or unknown>` through the same sanitized, bounded needs-you path; they never post a result comment or clear.
 The persisted `skipCardOnly` boolean records the writer's resolved setting; consumers must still classify the stored net read, so a `.mjs` code diff remains owed. Settlement exception diagnostics cannot abort the finished status write or gate even if the logger throws.
 Contain summary construction, seat diagnostics and unpublished-comment reason coercion too: malformed
 findings or an unstringifiable comment status must still reach settlement and preserve the finished
@@ -469,8 +469,8 @@ Regression mapping (one representative assertion per guarantee; names are in the
 - Legacy unknown-head retries fail closed: **legacy unknown-head pending records without attempt identity are quarantined**.
 - Production comment and feed effects: **production settlement posts marker via gh argv/body and publishes real needs-you**.
 - Budget/guard deferrals escalate once per head/reason without posting a result: **unfinished publication or deferral publishes needs-you once without a result comment: %j**.
-- A plain `not-owed` on an accepted code head is contradictory evidence and escalates in both job modes: **not-owed on an accepted head publishes needs-you (redTeamOnly=%s)** in `review-job-red-team-skip.test.mjs`.
-- A terminal `not-owed` cannot grant policy clearance even with a card-only policy or a misleading reason, and repeated settlement notifies once: **contradictory not-owed never clears and notifies once: %j** in `red-team-skip-outcome.test.mjs`.
+- A plain `not-owed` on an accepted code head settles policy-clear in both job modes: **not-owed on an accepted head settles policy-clear without an alert (redTeamOnly=%s)** in `review-job-red-team-skip.test.mjs`.
+- Accepted-head `not-owed` publishes a reasoned clear marker without an alert: **not-owed on an ACCEPTED head clears with a reasoned marker and no alert: %j** in `red-team-skip-outcome.test.mjs`. Non-accepted, deferred, and unbound-read outcomes remain closed: **not-owed on a NON-accepted head (accepted=%j) never clears and alerts once**, **deferred not-owed never clears: %j**, and **not-owed with unbound read %j never clears**.
 - Finished but unpublished results escalate once without posting or clearing: **unfinished publication or deferral publishes needs-you once without a result comment: %j**.
 - Writer setting never classifies a code PR as card-only: **never exempts a code read from speculation, recovery guards or an owed pending label**.
 - A throwing settlement logger preserves finished status and gate: **throwing settlement and logger still write finished status and run the gate**.
@@ -526,6 +526,44 @@ The back-port from `8173660fcf` also pins the guard in `review-red-team-resume-o
 Its production admission regression in `review-job-red-team-only.test.mjs` is
 **fresh recovery preserves unknown finished-null history through production admission and launches no call**;
 it verifies that refusal restores the original finished/null status and publishes no comment.
+Stale abandonment retains `status: running`; fresh recovery recognizes its null/absent result only
+with a finite abandonment time and an integer abandonment PID matching the status PID. Production
+planner recovery may re-dispatch an unchanged abandoned row even when its stale redispatch marker
+is spent, provided no retry is spent; it must not abandon the row again. A queued or replaced row
+still blocks this recovery. `review-red-team-on-skip.test.mjs` exercises the real durable marker,
+planner and executor through re-dispatch and the subsequent queued-state refusal.
+Production recovery spends at most two exclusive `.stale-redispatch-1` / `.stale-redispatch-2` markers per head.
+An existing marker 1 spends only the first attempt; `staleRedTeamSpent` means both are spent.
+The second abandonment requires a stale running owner with no result, absent/zero `retryCount`,
+and a parseable `pidStart` strictly later than marker 1's mtime. It waits at least
+`STALE_REDISPATCH_BACKOFF_MS` (15 minutes) from that mtime, independently of the retry cooldown.
+The abandonment function rechecks these conditions against disk and emits `detail.attempt`.
+Confirmed non-starts release only the marker they claimed; unknown dispatch outcomes retain it.
+`live-job` keeps both abandonment and no-restart claims even when its PID was already budgeted;
+that budget refund proves no new start, not that the existing job cannot run. Null/undefined
+dispatch outcomes keep their claims; the budget start is refunded as for any non-live-job skip. The stale planner bypasses
+only the in-flight refusal: non-owed verdicts and all accepted-head publication guards still apply,
+including when the status re-read observes a completed decision after selecting a stale owner.
+Malformed marker metadata stays closed, and exhausted recovery asks the operator to inspect the
+review run. The **stale red-team recovery — bounded second re-dispatch** cases exercise real
+markers, backoff boundaries, owner provenance, retry bounds, and release/retention semantics.
+Production admission must still prove the writer dead before clearing that prior. The execution guard
+refuses every still-running prior, including one marked abandoned: direct callers cannot
+use abandonment as proof of death. The regression
+**refuses direct fresh recovery without admission for an abandoned running live writer with zero calls**
+in `review-red-team-resume-only.test.mjs` pins that closed path. The regressions
+**fresh recovery launches an abandoned stale running pass through production admission and the shared guard**,
+**fresh production admission holds a live running writer without stale abandonment**, and
+**fresh production admission and shared guard never rerun a finished ran result with a posted comment**
+pin that boundary; `red-team-run-result.test.mjs` covers malformed abandonment and spent retry evidence.
+The stale-recovery flag is only a hint: production admission independently reads the head's
+redispatch/spent/no-restart markers and binds the running row's head, PID and abandonment time
+to the latest abandonment claim (allowing 1 second for timestamp precision). A no-restart claim
+uses marker 1's original abandonment; a later process start or more than two claims refuses
+admission. Missing, unreadable or inconsistent claims preserve the row and require operator
+inspection. `stale flag cannot authorize production admission with %s` covers those refusals;
+`verified %s permits production admission at the dispatch boundary` covers both dispatch ordinals
+and the no-restart handoff. Direct seat calls still refuse every running prior, regardless of flags.
 These exercise the shared execution guard and production admission, alongside the planner's
 **f: a null completion without queued provenance skips (stored status %s)** in
 `review-red-team-on-skip.test.mjs`. Live or unknown liveness
@@ -2876,6 +2914,21 @@ the current occupant as ours. Git optional locks are disabled, so status does no
 refresh the index. The live PR head may have advanced since an incident; compare
 against the SHA the probe actually reports. Regression files: `fix-run-lane-head.test.mjs`,
 `fix-run.test.mjs`, and `fix-run-borrow-dies.test.mjs` under `scripts/operations/__tests__/`.
+
+## Optional early review and delayed fix push
+
+`review.startBeforeCi` admits an early review only with `hasGreenLedger` evidence for the exact
+head. Keep ledger IO in the reconcile/publish shells and skip it when disabled. The existing
+red-main hold runs before CI-heal caps; test it with a PR behind main (`aheadByOnMain > 0`),
+since a PR already containing main has its own failure. `fix.pushAfterCi` waits before the
+agent so completed CI failures enter that same repair's fenced context. Its push boundary uses
+the same first-held deadline; unreadable evidence waits until the bound, whose fallback is a
+normal push. Inject the clock, sleep and checks; reads must be at least 30 seconds apart.
+Claude repairs mark verify directly, so the verify harness must apply the same gate to both
+early and green-verdict pushes. Persist its previous head and first-held time independently of
+verify retries, retain the waiter on read/write failures, and log the timing policy's source.
+`await-verify-pass-push-after-ci.test.mjs` and the `claude-fix-push-after-ci` soak scenario cover
+this path with injected CI reads, including the bounded fallback when evidence is unavailable.
 
 ## Archive-only host retention (R217)
 
