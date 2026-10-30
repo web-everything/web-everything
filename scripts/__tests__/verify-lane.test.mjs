@@ -15,7 +15,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, chmodSync, readdirSync, renameSync } from 'node:fs';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { acquireRunnerLease, makeOwner, heartbeatRunnerLease, RUNNER_LEASE_MINUTES } from '../../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY } from '../../skills-src/conveyor/verify-daemon.mjs';
 import { LEASE_FILENAME } from '../lib/lane-lease.mjs';
@@ -123,14 +124,16 @@ describe('verify-lane — hard per-phase timeout (verify-admission, 2026-10-20)'
   it('can stop local heartbeat watchdogs during module startup without crashing Node', () => {
     // Run outside Vitest's process: terminating a worker while its heartbeat import evaluates
     // a top-level await used to abort the entire Node process, not merely reject the worker.
+    // Resolve filesystem paths first so Vite cannot turn child imports into HTTP asset URLs.
+    const scriptsDir = dirname(dirname(fileURLToPath(import.meta.url)));
     const script = `
-import { startTreeWatchdog } from ${JSON.stringify(new URL('../lib/tree-watchdog.mjs', import.meta.url).href)};
+import { startTreeWatchdog } from ${JSON.stringify(pathToFileURL(join(scriptsDir, 'lib/tree-watchdog.mjs')).href)};
 for (let round = 0; round < 24; round++) {
   const watchdog = startTreeWatchdog({
     pid: process.pid, timeoutMs: 60000,
     warn: message => { throw new Error(message); },
     heartbeat: {
-      module: ${JSON.stringify(new URL('../readiness/heavy-admission.mjs', import.meta.url).href)},
+      module: ${JSON.stringify(pathToFileURL(join(scriptsDir, 'readiness/heavy-admission.mjs')).href)},
       exportName: 'heartbeatOwnedSlot',
       args: { lockRoot: ${JSON.stringify(join(dir, 'watchdog-pool'))}, cap: 1, owner: 'startup-probe' },
       everyMs: 300000,
