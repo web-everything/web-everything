@@ -2888,6 +2888,10 @@ the namespace link (which can disappear at exit): all exited tasks plus an uncha
 task-ID set in a final census prove dead; any live task yields `unknown` with
 `zombie-leader-live-tasks`. Changed, duplicate, unreadable, incomplete or over-budget
 censuses yield `unknown` with `evidence-unavailable`; retry or inspect manually.
+An initial task-directory `ENOENT`/`ESRCH` can also mean hidepid concealed live workers:
+require independent absence confirmation (readable boot ID and signal-zero `ESRCH`)
+before returning dead. Test both directory errors with signal-zero success, `EPERM`,
+`EACCES`, and other failures (unknown), alongside confirmed absence (dead).
 Race fixtures must include a worker spawning a live successor before its own stat is
 read as Z/X/x, and a same-count task replacement. Reordering an unchanged set must
 still permit dead. `record` still requires the namespace

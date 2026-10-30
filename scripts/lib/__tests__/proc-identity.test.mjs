@@ -1046,6 +1046,21 @@ describe('single-pid tri-state probe', () => {
     deps.readdir = () => { throw enoent(); };
     expect(probe(linuxIdentity, deps)).toEqual(outcome('dead', 'exited'));
   });
+  it.each(['ENOENT', 'ESRCH'].flatMap((code) =>
+    ['live', 'EPERM', 'EACCES', 'EIO', 'ESRCH'].map((signal) => [code, signal])))
+  ('missing zombie task directory (%s) requires confirmed absence (%s)', (code, signal) => {
+    const deps = singleDeps('linux', { processes: [{ pid: PID, state: 'Z' }] });
+    // Matching leader evidence remains readable until hidepid conceals the census.
+    // A live worker cannot be ruled out by the directory error alone.
+    deps.readdir = vi.fn(() => { throw Object.assign(new Error('task directory hidden'), { code }); });
+    deps.kill = vi.fn(() => {
+      if (signal !== 'live') throw Object.assign(new Error('signal check'), { code: signal });
+    });
+    expect(probe(expectedFor('linux'), deps)).toEqual(signal === 'ESRCH'
+      ? outcome('dead', 'exited') : outcome('unknown', 'evidence-unavailable'));
+    expect(deps.readdir).toHaveBeenCalledWith(`/proc/${PID}/task`);
+    expect(deps.kill).toHaveBeenCalledWith(PID, 0);
+  });
   it('unreadable zombie tasks stays unknown', () => {
     const deps = singleDeps('linux', { processes: [{ pid: PID, state: 'Z' }] });
     deps.readdir = denied;

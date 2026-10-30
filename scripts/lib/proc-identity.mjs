@@ -353,7 +353,11 @@ export function record(pid, deps = {}) {
 function exitedTasks(pid, io) {
   let names;
   try { names = io.readdir(`/proc/${pid}/task`); } catch (error) {
-    if (error.code === 'ENOENT' || error.code === 'ESRCH') return triState('dead', 'exited');
+    // A hidepid remount can conceal live workers after the leader stat was read.
+    // A missing directory proves exit only with independent process absence.
+    if ((error.code === 'ENOENT' || error.code === 'ESRCH') && linuxAbsenceConfirmed(pid, io)) {
+      return triState('dead', 'exited');
+    }
     throw error;
   }
   if (!Array.isArray(names) || !names.length || names.length > MAX_ENTRIES) {
