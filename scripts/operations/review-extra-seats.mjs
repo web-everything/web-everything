@@ -61,7 +61,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   chmodSync, closeSync, existsSync, linkSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync,
-  writeFileSync,
+  readdirSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
@@ -334,8 +334,8 @@ export function buildSeatTask({ pr, repo, title, dir, diffFile, bodyFile, inline
     `Rate each finding's impactIfUnfixed as one of ${Object.values(IMPACT_LEVELS).join(' | ')}.`,
     'If a seat finds nothing, give it verdict "accept" and an empty findings list.',
     '',
-    'Your final message must contain ONLY this single JSON object (a single ```json block is also accepted), with no commentary before or after it.',
-    'If you write reasoning, put it BEFORE the answer block. The answer must be in the final message itself, NOT written to a file or reported via tool output.',
+    'Your final message must contain ONLY this single JSON object (a single ```json block is also accepted); put NO commentary after it.',
+    'Any reasoning must come BEFORE it, must not contain unbalanced { } [ ] characters, and must not end with a comma (,), an opening bracket ([), or a JSON key colon. The answer must be in the final message itself, NOT written to a file or reported via tool output.',
     'Findings text must not contain triple backticks. An empty findings list with verdict "accept" is a valid answer.',
     JSON.stringify({ lenses: example }),
     'where each findings entry is {"summary": string, "category": string|null, "file": (repo-relative path, e.g. "scripts/x.mjs")|null, "line": integer|null, "impactIfUnfixed": string, "failure_scenario": string|null}',
@@ -345,7 +345,13 @@ export function buildSeatTask({ pr, repo, title, dir, diffFile, bodyFile, inline
   ].filter((l) => l !== null).join('\n');
 }
 
-/** Pull the LAST parseable JSON object carrying `lenses` out of an agent's final message. PURE. */
+/**
+ * Return the last complete root JSON object whose sole key is `lenses` (an object). PURE.
+ * Require a prefix with balanced braces/brackets that does not end in a comma, opening bracket,
+ * or JSON key colon. After the object allow only whitespace, or one closing fence plus whitespace
+ * when the object occupies a single fenced block. Return null for all other or incomplete input,
+ * including a later truncated `lenses` answer or exhausted scan budget.
+ */
 export function extractAnswerJson(text) {
   const s = String(text ?? '');
   let lastAnswerKey = -1;
@@ -977,6 +983,16 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
       chmodSync(dirname(path), 0o700);
       writeFileSync(path, text, { mode: 0o600 });
       chmodSync(path, 0o600);
+      try {
+        const cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000;
+        for (const entry of readdirSync(dirname(path), { withFileTypes: true })) {
+          if (!entry.isFile()) continue;
+          try {
+            const candidate = join(dirname(path), entry.name);
+            if (statSync(candidate).mtimeMs < cutoff) unlinkSync(candidate);
+          } catch { /* Retention cleanup must never prevent saving new evidence. */ }
+        }
+      } catch { /* Best-effort retention; the new evidence is already saved. */ }
       return relative;
     },
     // Read → reserve → write under a FAIL-CLOSED lock: a lock not taken in time THROWS, and so does an unreadable
@@ -1204,8 +1220,8 @@ export function buildRedTeamTask({ pr, repo, title, dir, diffFile, bodyFile, inl
     `Set "category" to one of ${RED_TEAM_CATEGORIES.join(' | ')}, and rate impactIfUnfixed as one of ${Object.values(IMPACT_LEVELS).join(' | ')}.`,
     'If the change holds up, answer verdict "accept" with an empty findings list — an empty list is a real answer, never a failure.',
     '',
-    'Your final message must contain ONLY this single JSON object (a single ```json block is also accepted), with no commentary before or after it.',
-    'If you write reasoning, put it BEFORE the answer block. The answer must be in the final message itself, NOT written to a file or reported via tool output.',
+    'Your final message must contain ONLY this single JSON object (a single ```json block is also accepted); put NO commentary after it.',
+    'Any reasoning must come BEFORE it, must not contain unbalanced { } [ ] characters, and must not end with a comma (,), an opening bracket ([), or a JSON key colon. The answer must be in the final message itself, NOT written to a file or reported via tool output.',
     'Findings text must not contain triple backticks. An empty findings list with verdict "accept" is a valid answer.',
     JSON.stringify(example),
     'where each findings entry is {"summary": string, "category": string, "file": (repo-relative path)|null, "line": integer|null, "impactIfUnfixed": string, "failure_scenario": string}',

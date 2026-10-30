@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, relative } from 'node:path';
 import { readAgyHold, saveAgyHold } from '../lib/antigravity-run-evidence.mjs';
 import {
   AGY_CLI, AGY_RESUME_PROMPT, AGY_EFFORT_UNSUPPORTED_MODELS, DEFAULT_TIMEOUT_MS, buildAgyDirectTaskArgv, buildAgyPrompt, buildAgyStdinLine,
@@ -826,14 +826,18 @@ describe('runAgyDirectExec / geminiDirectTask — injected process mechanics', (
 });
 
 describe('CLI — flag parsing and truthful reports without a real process', () => {
-  it('threads the schema from CLI through the task and print-mode spawn', async () => {
+  it.each(['existing file', 'inline JSON', 'missing path'])('threads the %s schema from CLI through the task and print-mode spawn', async kind => {
     const dir = tempDir();
+    const jsonSchema = kind === 'inline JSON' ? '{"type":"object"}'
+      : relative(process.cwd(), join(dir, 'seat with spaces.schema.json'));
+    if (kind === 'existing file') writeFileSync(resolve(jsonSchema), '{"type":"object"}');
     const { fn: spawnFn, seen } = fakeSpawn(jsonl(REAL_EVENTS));
     const output = vi.spyOn(console, 'log').mockImplementation(() => {});
-    await main(['--task=review', `--dir=${dir}`, '--json-schema=seat.schema.json', '--json', '--review'], {
+    await main(['--task=review', `--dir=${dir}`, `--json-schema=${jsonSchema}`, '--json', '--review'], {
       taskFn: opts => geminiDirectTask({ ...opts, execFn: fakeExec(), spawnFn }),
     });
-    expect(seen.argv.slice(seen.argv.indexOf('--json-schema'), seen.argv.indexOf('--json-schema') + 2)).toEqual(['--json-schema', 'seat.schema.json']);
+    expect(seen.argv.slice(seen.argv.indexOf('--json-schema'), seen.argv.indexOf('--json-schema') + 2))
+      .toEqual(['--json-schema', kind === 'existing file' ? resolve(jsonSchema) : jsonSchema]);
     expect(output).toHaveBeenCalledOnce();
   });
   const report = {

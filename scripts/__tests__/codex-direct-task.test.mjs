@@ -76,6 +76,16 @@ describe('defaultExecFn — real child-process output buffering', () => {
 });
 
 describe('buildCodexDirectTaskArgv — pure argv for agentic/workspace-write mode', () => {
+  it('omits the schema on resume in the builder while retaining schema validation', () => {
+    const options = { cwd: '/lane', resumeThreadId: 'thread-123', outputSchemaFile: 'seat.schema.json' };
+    const argv = buildCodexDirectTaskArgv(options);
+    expect(argv).not.toContain('--output-schema');
+    expect(argv).not.toContain(options.outputSchemaFile);
+    expect(argv.slice(-3)).toEqual(['resume', options.resumeThreadId, '-']);
+    for (const outputSchemaFile of ['', ' ', null, 3]) {
+      expect(() => buildCodexDirectTaskArgv({ ...options, outputSchemaFile })).toThrow(/outputSchemaFile/);
+    }
+  });
   it('optionally forwards the schema file as a separate argv value without changing defaults', () => {
     const outputSchemaFile = 'task with spaces.schema.json';
     const argv = buildCodexDirectTaskArgv({ cwd: '/lane', review: true, outputSchemaFile });

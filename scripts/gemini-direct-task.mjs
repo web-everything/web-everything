@@ -687,7 +687,7 @@ export async function main(argv = process.argv.slice(2), { taskFn = geminiDirect
     task, dir: flags.dir ? resolve(flags.dir) : undefined,
     repoRoot: flags['repo-root'] ? resolve(flags['repo-root']) : undefined,
     model: flags.model, effort: flags.effort, addDirs: flags['add-dir']?.map((dir) => resolve(dir)),
-    jsonSchema: flags['json-schema'],
+    jsonSchema: flags['json-schema'] && existsSync(flags['json-schema']) ? resolve(flags['json-schema']) : flags['json-schema'],
     sandbox: Boolean(flags.sandbox), timeoutMs: flags['timeout-ms'] ? Number(flags['timeout-ms']) : DEFAULT_TIMEOUT_MS,
     gate: flags.gate ?? 'none', logFile: flags.log ? resolve(flags.log) : undefined,
     stream: !flags['no-stream'] && !flags.json, installDeps: !flags['no-install'],

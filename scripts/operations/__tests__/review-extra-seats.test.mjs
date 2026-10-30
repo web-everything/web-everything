@@ -3,7 +3,7 @@ import { readRoutingPolicy } from '../../lib/dispatch-routing-policy-io.mjs';
  * #4194 — ADDED NON-CLAUDE REVIEW SEATS: advisory lenses + one extra juror routed to Codex/Gemini through the
  * direct-task scripts, BESIDE Claude's mandatory seats. No real codex/agy/git/GitHub process: every effect is a fake.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -1339,7 +1339,10 @@ describe('seat answer extraction — realistic provider replies, fail closed', (
         expect(task).toContain('"failure_scenario": string}');
         expect(task).toContain('category and failure_scenario must be strings, never null.');
       }
-      expect(task).toContain('no commentary before or after');
+      expect(task).toContain('put NO commentary after it.');
+      expect(task).not.toContain('no commentary before or after');
+      expect(task).toContain('Any reasoning must come BEFORE it, must not contain unbalanced { } [ ] characters');
+      expect(task).toContain('must not end with a comma (,), an opening bracket ([), or a JSON key colon.');
       expect(task).toContain('final message itself, NOT written to a file or reported via tool output');
       expect(task).toContain('must not contain triple backticks');
       expect(task).toContain('empty findings list with verdict "accept" is a valid answer');
@@ -1388,6 +1391,33 @@ describe('durable raw seat evidence', () => {
     effect = createExtraSeatsIo({ storePath: join(root, 'scores.json') }).writeRawAnswer;
   });
   afterEach(() => rmSync(root, { recursive: true, force: true }));
+  it('deletes raw files older than 14 days after writing, preserving recent files and directories', () => {
+    const directory = join(root, 'seat-raw');
+    mkdirSync(directory);
+    const old = join(directory, 'old.txt');
+    const recent = join(directory, 'recent.txt');
+    const nested = join(directory, 'nested');
+    writeFileSync(old, 'old evidence');
+    writeFileSync(recent, 'recent evidence');
+    mkdirSync(nested);
+    const oldTime = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000);
+    utimesSync(old, oldTime, oldTime);
+    utimesSync(nested, oldTime, oldTime);
+    const relative = effect({ callId: 'new', text: 'new evidence' });
+    expect(existsSync(old)).toBe(false);
+    expect(readFileSync(recent, 'utf8')).toBe('recent evidence');
+    expect(statSync(nested).isDirectory()).toBe(true);
+    expect(readFileSync(join(root, relative), 'utf8')).toBe('new evidence');
+  });
+  it('returns saved evidence even when retention cleanup throws', () => {
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => { throw new Error('cleanup clock failed'); });
+    try {
+      const relative = effect({ callId: 'cleanup-failure', text: 'saved evidence' });
+      expect(readFileSync(join(root, relative), 'utf8')).toBe('saved evidence');
+    } finally {
+      clock.mockRestore();
+    }
+  });
   it('tightens an existing seat-raw directory to owner-only access before writing evidence', () => {
     const directory = join(root, 'seat-raw');
     mkdirSync(directory);

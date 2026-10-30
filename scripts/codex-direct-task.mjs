@@ -222,7 +222,8 @@ export function buildCodexDirectTaskArgv({
     if (typeof outputSchemaFile !== 'string' || !outputSchemaFile.trim()) {
       throw new TypeError('codex-direct-task: `outputSchemaFile` must be a non-empty path when given');
     }
-    argv.push('--output-schema', outputSchemaFile);
+    // `exec resume` does not support --output-schema; validate the option on every path.
+    if (resumeThreadId === undefined) argv.push('--output-schema', outputSchemaFile);
   }
   if (outputLastMessageFile) {
     if (typeof outputLastMessageFile !== 'string' || !outputLastMessageFile.trim()) {
