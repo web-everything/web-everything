@@ -41,6 +41,10 @@ import { listWrappedWorkerAgents, requestWrappedResume } from '../operations/wor
 import { AGENT_GONE_STATES } from './lease-reaper.mjs';
 import { loadVerifyRecoverySettings } from '../lib/verify-recovery-settings.mjs';
 import { loadFixPushPolicy, formatFixPushPolicyLine } from '../lib/fix-push-policy.mjs';
+import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
+import { fixPushGate } from '../lib/review-timing.mjs';
+import { readReviewHead, readReviewChecks } from '../lib/review-ci-gate-io.mjs';
+import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { listSalvage, writeSalvage, clearSalvage, planSalvage, resolveSalvageTuning, salvageKey, stashCommit, salvageStoreDir } from './verified-push-salvage.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -328,6 +332,43 @@ const UNCLEARABLE_DONE = new Set();
 /** The last fix-push-policy line this process logged (see runAwaitVerifyPass). */
 const LOGGED_POLICY_LINE = { value: null };
 
+/** One bounded poll per tick for both harness push paths (Claude bypasses fix-run).
+ * Persist the previous head and first hold before reading CI. Verify retries may change
+ * requestedAt; neither those retries nor a daemon restart may extend this deadline.
+ */
+async function previousCiPushGate({ io, record, nowMs, policy, persist }) {
+  if (!policy?.pushAfterCi || record.kind !== 'fix'
+    || (record.earlyPush?.ok && lower(record.earlyPush.sha) === lower(record.sha))) return { action: 'push', reason: 'off-or-already-pushed' };
+  let state = record.previousCi ?? { firstHeldAt: nowMs };
+  if (!Number.isFinite(state.firstHeldAt)) state = { firstHeldAt: nowMs };
+  if (!persist({ ...record, previousCi: state })) return { action: 'wait', reason: 'persist-failed' };
+  if (state.ready) return state.ready;
+  const bound = fixPushGate({ firstHeldAt: state.firstHeldAt, now: nowMs, policy });
+  if (bound.action === 'push') return bound; // Unknown evidence falls back to a normal push at the fixed bound.
+  if (Number.isFinite(state.lastReadAt) && nowMs - state.lastReadAt < 30_000) return bound;
+  if (!state.headSha) {
+    try {
+      const head = await io.readPreviousHead({ repo: record.repo, pr: record.pr });
+      if (SHA_RE.test(String(head ?? ''))) state = { ...state, headSha: lower(head) };
+    } catch { /* Unknown head remains held until the bound. */ }
+    // A crash during the following CI reads must not select a different head on recovery.
+    if (!persist({ ...record, previousCi: state })) return { action: 'wait', reason: 'persist-failed' };
+  }
+  let checks = null;
+  let required = [];
+  if (state.headSha) {
+    try {
+      required = (await io.readPreviousRequired({ repo: record.repo, ttlMs: 0 }))?.checks ?? [];
+      checks = await io.readPreviousChecks({ repo: record.repo, headSha: state.headSha });
+    } catch { /* Incomplete evidence remains held until the bound. */ }
+  }
+  const decision = state.headSha === lower(record.sha) ? { action: 'push', reason: 'already-on-remote' }
+    : fixPushGate({ previousHeadChecks: checks, requiredChecks: required, firstHeldAt: state.firstHeldAt, now: nowMs, policy });
+  state = { ...state, lastReadAt: nowMs, ...(decision.action === 'push' ? { ready: decision } : {}) };
+  if (!persist({ ...record, previousCi: state })) return { action: 'wait', reason: 'persist-failed' };
+  return decision;
+}
+
 /**
  * Apply the policy to every stored record once. Every effect is an injected port, so the whole pass replays
  * offline (see the test's fix-4115 replay).
@@ -347,6 +388,7 @@ export async function runAwaitVerifyPass({
   };
   // fix.pushBeforeGate (we:scripts/lib/fix-push-policy.mjs): an injected policy wins; else the IO's own; else OFF (today's flow).
   const policy = pushPolicy ?? (typeof io.pushPolicy === 'function' ? io.pushPolicy() : null);
+  const timing = io.fixTimingPolicy?.();
   const recovery = retryPolicy ?? io.retryPolicy?.() ?? loadVerifyRecoverySettings();
   for (const { key, record: stored } of io.listRecords()) {
     let record = stored;
@@ -376,7 +418,28 @@ export async function runAwaitVerifyPass({
         row.result = `${row.result ? `${row.result}; ` : ''}persist-failed`;
         return false;
       };
-      if (!(record?.infraRetry?.scheduled && d.action === 'wait') && isEarlyPushOwed({ record, decision: d, policy, limits })) {
+      let earlyOwed = !(record?.infraRetry?.scheduled && d.action === 'wait') && isEarlyPushOwed({ record, decision: d, policy, limits });
+      const ciReadiness = earlyOwed || d.action === 'push'
+        ? await previousCiPushGate({ io, record, nowMs, policy: timing, persist }) : null;
+      if (timing?.pushAfterCi && record.kind === 'fix' && ciReadiness?.action === 'push') {
+        // CI reads can outlast the local gate or an agent edit. Re-prove the lane and
+        // verdict before either push path; a newly red or moved lane takes precedence.
+        const currentLane = io.laneState(record.lane);
+        marker = currentLane ? io.readMarker(record.lane) : null;
+        d = classifyAwaitVerdict({ record, marker, lane: currentLane, nowMs, ttlMs, limits });
+        Object.assign(row, { action: d.action, reason: d.reason });
+        earlyOwed = !(record?.infraRetry?.scheduled && d.action === 'wait') && isEarlyPushOwed({ record, decision: d, policy, limits });
+      }
+      if (ciReadiness && timing?.pushAfterCi && record.kind === 'fix') {
+        rows.push({ ...row, action: 'push-ci-gate', reason: ciReadiness.reason,
+          result: ciReadiness.action === 'wait' ? `held until ${ciReadiness.deadline ?? 'state is persisted'}; bound fallback is push` : 'push allowed' });
+      }
+      if (d.action === 'push' && ciReadiness?.action === 'wait') {
+        Object.assign(row, { action: 'wait', reason: `previous-head CI: ${ciReadiness.reason}` });
+        rows.push(row); continue;
+      }
+      // Keep processing local verify recovery while an early push is held by CI.
+      if (earlyOwed && ciReadiness?.action !== 'wait') {
         const early = runEarlyPush({ io, record, nowMs, policy, persist: (next) => (io.writeRecord(next)?.ok === true ? ((record = next), true) : false) });
         // `record` now carries `earlyPush`; the rest of this record's handling keeps it.
         if (early) rows.push({ key, pr: record.pr, repo: record.repo, sha: record.sha, ...early });
@@ -517,7 +580,8 @@ export async function runAwaitVerifyPass({
   }
   if (io.listSalvage) rows.push(...runSalvagePhase({ io, nowMs }));
   // Name the layer that set fix.pushBeforeGate: once per process, and again whenever the effective value changes.
-  const policyLine = policy ? formatFixPushPolicyLine(policy) : null;
+  const timingLine = timing ? `; pushAfterCi=${timing.pushAfterCi} (${timing.sources?.pushAfterCi ?? 'standard'}), pushAfterCiMaxMin=${timing.pushAfterCiMaxMin} (${timing.sources?.pushAfterCiMaxMin ?? 'standard'})` : '';
+  const policyLine = policy ? `${formatFixPushPolicyLine(policy)}${timingLine}` : null;
   // A row (not a result field) so the slot-aware wrapper in await-verify-loop.mjs, which rebuilds the result, keeps it.
   if (policyLine && policyLine !== loggedPolicyLine.value) { loggedPolicyLine.value = policyLine; rows.unshift({ key: null, action: 'policy', result: policyLine }); }
   return { rows };
@@ -733,6 +797,13 @@ export async function defaultAwaitVerifyIo({
   return {
     // fix.pushBeforeGate through the policy cascade, re-read every pass so a settings flip applies without a restart.
     pushPolicy: () => loadFixPushPolicy({ env }),
+    fixTimingPolicy: () => {
+      const timing = resolveTimingPolicy({ env });
+      return { ...timing.fix, sources: timing.sources.fix };
+    },
+    readPreviousHead: readReviewHead,
+    readPreviousChecks: readReviewChecks,
+    readPreviousRequired: getRequiredStatusChecks,
     retryPolicy: () => loadVerifyRecoverySettings({ env }),
     // Match fix-end: missing is allowed; unreadable/malformed must retain the waiter and report the error.
     readSelfReview: (record) => readSelfReview({ repo: record.repo, pr: record.pr }, { dir: selfReviewStoreDir(env), strict: true }),

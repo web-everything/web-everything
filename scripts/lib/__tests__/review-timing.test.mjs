@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { REVIEW_TIMING_DEFAULTS as review, FIX_TIMING_DEFAULTS as fix,
-  reviewStartGate, reviewMustVoid, rereviewMode, joinedFixDecision, fixReadiness, fastChecksFor, NON_HEALABLE_CHECKS, ciRedOnHead } from '../review-timing.mjs';
+  fixPushGate, reviewStartGate, reviewMustVoid, rereviewMode, joinedFixDecision, fixReadiness, fastChecksFor, NON_HEALABLE_CHECKS, ciRedOnHead } from '../review-timing.mjs';
 import { CI_TRUTH_EXCLUDED_CHECKS } from '../../operations/pr-status.mjs';
 import { resolveTimingPolicy } from '../review-timing-settings.mjs';
 const head = 'a'.repeat(40);
@@ -140,7 +140,7 @@ it('resolves every timing leaf through the cascade, logging sources and rejectin
   const result = resolveTimingPolicy({ env: { WE_REVIEW_DELTA_MAX_LINES: '12', WE_FIX_JOIN_CI_AND_REVIEW: 'false' },
     review: { deltaMaxFiles: 2, cancelOnCiRed: 'bad' }, fix: {}, platformReview: { cancelOnCiRed: false }, platformFix: { joinWaitMaxMin: 7 } });
   expect(result.review).toMatchObject({ startAfter: 'fast-checks', deltaMaxLines: 12, deltaMaxFiles: 2, cancelOnCiRed: false });
-  expect(result.fix).toEqual({ joinCiAndReview: false, joinWaitMaxMin: 7 });
+  expect(result.fix).toEqual({ joinCiAndReview: false, joinWaitMaxMin: 7, pushAfterCi: false, pushAfterCiMaxMin: 30 });
   expect(result.sources.review).toMatchObject({ startAfter: 'standard', deltaMaxLines: 'env', deltaMaxFiles: 'tool', cancelOnCiRed: 'platform' });
 });
 it('logs each timing setting with its effective source, including enabled defaults', () => {
@@ -151,4 +151,43 @@ it('logs each timing setting with its effective source, including enabled defaul
   expect(logs.join('\n')).toContain('skipDrainMechanical=true (standard)');
   expect(logs.join('\n')).toContain('joinCiAndReview=true (standard)');
   expect(logs.join('\n')).toContain('joinWaitMaxMin=15 (standard)');
+});
+
+describe('verified early review', () => {
+  it.each(['fast-checks', 'ci-green'])('starts with an exact-head verification under %s', startAfter => {
+    const args = { headSha: head, checks: [], requiredChecks: ['test'], verifyGreen: true,
+      policy: { ...review, startAfter, startBeforeCi: true } };
+    expect(reviewStartGate(args)).toMatchObject({ allowed: true, reason: 'verify-marker' });
+    for (const verifyGreen of [false, undefined, 'true'])
+      expect(reviewStartGate({ ...args, verifyGreen }).allowed).toBe(false);
+    expect(reviewStartGate({ ...args, headSha: null }).allowed).toBe(false);
+    expect(reviewStartGate({ ...args, policy: { ...args.policy, startBeforeCi: false } }).allowed).toBe(false);
+    expect(reviewStartGate({ ...args, checks: [check('test', 'failure')] })).toMatchObject({ allowed: false, reason: 'ci-red' });
+    // Unknown required set: a red check still blocks the marker path.
+    expect(reviewStartGate({ ...args, requiredChecks: [], checks: [check('test', 'failure')] })).toMatchObject({ allowed: false, reason: 'ci-red' });
+  });
+});
+describe('fix push gate', () => {
+  const policy = { ...fix, pushAfterCi: true, pushAfterCiMaxMin: 1 };
+  const args = { previousHeadChecks: [check('test', null, { status: 'in_progress' })], requiredChecks: ['test'], firstHeldAt: 1000, now: 1000, policy };
+  it('is immediate when off, waits with a fixed deadline when on, and pushes at the bound', () => {
+    expect(fixPushGate({ ...args, policy: fix })).toEqual({ action: 'push', reason: 'off' });
+    expect(fixPushGate(args)).toEqual({ action: 'wait', reason: 'ci-pending', deadline: 61000 });
+    expect(fixPushGate({ ...args, now: 61000 })).toMatchObject({ action: 'push', reason: 'bound' });
+  });
+  it('folds completed required failures and ignores pending optional checks', () => {
+    expect(fixPushGate({ ...args, previousHeadChecks: [check('test', 'failure'), check('optional', null, { status: 'queued' })] }))
+      .toMatchObject({ action: 'push', reason: 'ci-complete', ciFailures: [{ name: 'test', conclusion: 'failure' }] });
+    expect(fixPushGate({ ...args, previousHeadChecks: [check('test')] })).toMatchObject({ action: 'push', reason: 'ci-complete', ciFailures: [] });
+  });
+  it.each([undefined, null, [], [{ name: 'test', status: 'completed', conclusion: null }]])('waits on missing or unreadable evidence: %j', previousHeadChecks => {
+    expect(fixPushGate({ ...args, previousHeadChecks }).action).toBe('wait');
+    expect(fixPushGate({ ...args, previousHeadChecks, now: 61000 }).reason).toBe('bound');
+  });
+});
+
+it('push gating refuses unknown required evidence and waits for remaining required checks after a failure', () => {
+  const args = { previousHeadChecks: [check('test')], firstHeldAt: 0, now: 0, policy: { ...fix, pushAfterCi: true } };
+  for (const requiredChecks of [null, undefined, []]) expect(fixPushGate({ ...args, requiredChecks }).action).toBe('wait');
+  expect(fixPushGate({ ...args, requiredChecks: ['test', 'smoke'], previousHeadChecks: [check('test', 'failure'), check('smoke', null, { status: 'queued' })] }).action).toBe('wait');
 });
