@@ -7,23 +7,18 @@ import { dirname, join, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { createRemoteExec, formatAdmissionPolicy, privateAdmissionPool, resolveAdmissionPolicy, resolveRemoteClient, runWithRemoteDecision } from '../heavy-admission.mjs';
-import { appendDaemonEvent } from '../../lib/daemon-events.mjs';
 
 vi.mock('node:child_process', async (importOriginal) => ({
   ...await importOriginal(), execFile: vi.fn(),
 }));
 // Preserve real IO while making the built-in namespace configurable for read-range observation.
 vi.mock('node:fs/promises', async (importOriginal) => ({ ...await importOriginal() }));
-vi.mock('../../lib/daemon-events.mjs', async (importOriginal) => ({
-  ...await importOriginal(), appendDaemonEvent: vi.fn(async () => true),
-}));
 
 const roots = [];
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllEnvs();
   vi.mocked(execFile).mockReset();
-  vi.mocked(appendDaemonEvent).mockClear();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 const success = "export async function runRemote() { return { mode: 'remote', code: 0 }; }";
@@ -127,7 +122,10 @@ describe('remote client override', () => {
       policy: f.policy, lockRoot, log: f.seams.log })).toEqual({ handled: true, exitCode: 0 });
     const pair = { clientPath: resolveRemoteClient({ clientPath: f.clientPath }).clientPath, sha: 'production-sha' };
     await vi.waitFor(() => expect(JSON.parse(readFileSync(join(dirname(lockRoot), 'remote', 'client-override.json'), 'utf8'))).toEqual(pair));
-    expect(appendDaemonEvent).toHaveBeenCalledWith({ kind: 'remote-client-override', detail: { ...pair, previous: null } });
+    expect(JSON.parse(readFileSync(join(f.root, 'events.jsonl'), 'utf8'))).toEqual({
+      at: expect.any(String), kind: 'remote-client-override', repo: 'web-everything',
+      detail: { ...pair, previous: null },
+    });
     expect(existsSync(join(env.LANE_POOL_ROOT, '.admission', 'remote', 'client-override.json'))).toBe(false);
     expect(existsSync(f.state)).toBe(false);
   });
@@ -141,6 +139,43 @@ describe('remote client override', () => {
     expect(runRemote.mock.calls[0][0]).toBe(options);
     expect(importClient).toHaveBeenCalledWith(pathToFileURL(resolveRemoteClient({ clientPath: f.clientPath }).clientPath).href);
   });
+
+  it.each(['regular', 'not regular', 'stat error', 'write error', 'close error'])(
+    'default event writer opens nonblocking, checks the fd and always closes it (%s)', async (kind) => {
+      const f = fixture();
+      const destination = join(f.root, 'events.jsonl');
+      vi.stubEnv('WE_DAEMON_EVENTS', destination);
+      const handle = {
+        stat: vi.fn(async () => {
+          if (kind === 'stat error') throw new Error('stat unavailable');
+          return { isFile: () => kind !== 'not regular' };
+        }),
+        writeFile: vi.fn(async () => { if (kind === 'write error') throw new Error('write unavailable'); }),
+        close: vi.fn(async () => { if (kind === 'close error') throw new Error('close unavailable'); }),
+      };
+      const realOpen = provenanceIo.open;
+      const open = vi.spyOn(provenanceIo, 'open').mockImplementation((file, ...args) =>
+        file === destination ? Promise.resolve(handle) : realOpen(file, ...args));
+      try {
+        expect(await f.run({ appendEvent: undefined })).toEqual({ handled: true, exitCode: 0 });
+        await vi.waitFor(() => expect(handle.close).toHaveBeenCalledTimes(1));
+        if (kind === 'regular') {
+          await vi.waitFor(() => expect(JSON.parse(readFileSync(f.state, 'utf8')).sha).toBe('abc123'));
+        }
+        expect(open.mock.calls.filter(([file]) => file === destination)).toEqual([[
+          destination, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT
+            | (constants.O_NONBLOCK ?? 0) | (constants.O_NOFOLLOW ?? 0),
+        ]]);
+        expect(handle.stat).toHaveBeenCalledTimes(1);
+        if (kind === 'not regular' || kind === 'stat error') expect(handle.writeFile).not.toHaveBeenCalled();
+        else {
+          expect(handle.writeFile).toHaveBeenCalledTimes(1);
+          expect(handle.stat.mock.invocationCallOrder[0]).toBeLessThan(handle.writeFile.mock.invocationCallOrder[0]);
+        }
+        if (kind !== 'regular') expect(existsSync(f.state)).toBe(false);
+      } finally { open.mockRestore(); }
+    },
+  );
 
   it.each(['relative', 'missing', 'directory', 'basename', 'lane', 'custom pool', 'symlink into lane'])('rejects %s and falls back locally with a reason', async (kind) => {
     const f = fixture();

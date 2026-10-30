@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { collectImportClosure } from '../../lib/import-closure.mjs';
+import { appendDaemonEvent } from '../../lib/daemon-events.mjs';
 import { createRemoteExec, resolveAdmissionPolicy } from '../heavy-admission.mjs';
 
 const admissionUrl = new URL('../heavy-admission.mjs', import.meta.url);
@@ -66,7 +67,7 @@ describe('admission import boundary', () => {
   }, 10_000);
 
   it.each(['FIFO', 'directory', 'symlink', 'dangling symlink', 'missing parent', 'non-directory parent', 'symlink parent'])(
-    'skips a daemon-events %s and lets a successful native client exit naturally', (kind, context) => {
+    'skips a daemon-events %s (FIFO has no reader) and lets a successful native client exit naturally', (kind, context) => {
       const root = mkdtempSync(join(tmpdir(), 'admission-events-'));
       roots.push(root);
       const clientPath = join(root, 'remote-exec.mjs');
@@ -108,13 +109,14 @@ describe('admission import boundary', () => {
       expect(JSON.parse(output)).toEqual({ mode: 'remote', code: 0 });
       expect(existsSync(join(dirname(lockRoot), 'remote', 'client-override.json'))).toBe(false);
       if (kind === 'FIFO') expect(lstatSync(eventPath).isFIFO()).toBe(true);
+      if (kind === 'symlink' || kind === 'dangling symlink') expect(lstatSync(eventPath).isSymbolicLink()).toBe(true);
       if (kind === 'symlink' || kind === 'non-directory parent') expect(readFileSync(target, 'utf8')).toBe('untouched');
       if (kind === 'dangling symlink') expect(existsSync(target)).toBe(false);
       if (kind === 'missing parent') expect(existsSync(dirname(eventPath))).toBe(false);
       if (kind === 'symlink parent') expect(readdirSync(target)).toEqual([]);
     }, 10_000);
 
-  it.each([false, true])('loads the native adapter only on remote execution and writes real override provenance and events (existing file=%s)', (existing) => {
+  it.each([false, true])('loads the native adapter only on remote execution and writes real override provenance and identical daemon event lines (existing file=%s)', async (existing) => {
     const root = mkdtempSync(join(tmpdir(), 'admission-import-'));
     roots.push(root);
     const clientPath = join(root, 'remote-exec.mjs');
@@ -145,9 +147,16 @@ describe('admission import boundary', () => {
     });
     const pair = JSON.parse(readFileSync(join(dirname(lockRoot), 'remote', 'client-override.json'), 'utf8'));
     expect(pair.sha).toBe('native-sha');
-    const events = readFileSync(eventPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-    expect(events).toEqual([expect.objectContaining({
-      kind: 'remote-client-override', detail: { ...pair, previous: null },
-    })]);
+    const raw = readFileSync(eventPath, 'utf8');
+    const events = raw.trim().split('\n').map(line => JSON.parse(line));
+    const event = { kind: 'remote-client-override', detail: { ...pair, previous: null } };
+    expect(events).toEqual([{
+      at: expect.any(String), repo: 'web-everything', ...event,
+    }]);
+    const reference = join(root, 'reference-events.jsonl');
+    expect(await appendDaemonEvent(event, {
+      env: { WE_DAEMON_EVENTS: reference }, now: () => new Date(events[0].at),
+    })).toBe(true);
+    expect(raw).toBe(readFileSync(reference, 'utf8'));
   });
 });

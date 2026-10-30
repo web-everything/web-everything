@@ -151,7 +151,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
-import { appendDaemonEvent, daemonEventsPath } from '../lib/daemon-events.mjs';
+import { daemonEventsPath } from '../lib/daemon-events.mjs';
 import { shadowAdmission, readSnapshot } from '../lib/resource-admission.mjs';
 import { hostLoadAdmission } from '../lib/host-load.mjs';
 import { DEFAULT_HOST_MAX_WAIT_MS, loadHostOverloadSettings } from '../lib/host-overload-settings.mjs';
@@ -499,12 +499,22 @@ async function clientProvenanceStat(file, stat = lstat) {
   return info;
 }
 
-/** A timed-out FIFO append still holds Node open; refuse unsafe event destinations before opening. */
+/** Nonblocking open cannot strand Node on a FIFO; validate the opened destination before writing. */
 async function appendClientOverrideEvent(event) {
-  const destination = daemonEventsPath();
-  const info = await clientProvenanceStat(destination);
-  if (!info && !(await lstat(dirname(destination))).isDirectory()) return false;
-  return appendDaemonEvent(event);
+  try {
+    const destination = daemonEventsPath();
+    if (!(await lstat(dirname(destination))).isDirectory()) return false;
+    const handle = await open(destination,
+      constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | CLIENT_PROVENANCE_OPEN_FLAGS);
+    try {
+      if (!(await handle.stat()).isFile()) return false;
+      // Match appendDaemonEvent's JSON line, including default repo and omitted optional fields.
+      const { kind, repo = 'web-everything', pr, daemon, detail } = event;
+      const line = `${JSON.stringify({ at: new Date().toISOString(), kind, repo, pr, daemon, detail })}\n`;
+      await handle.writeFile(line);
+    } finally { await handle.close(); }
+    return true;
+  } catch { return false; }
 }
 
 /** Oversized state is missing provenance: record the current pair and replace it on this run. */
