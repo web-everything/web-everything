@@ -1968,11 +1968,14 @@ Use temporary lock roots and injected telemetry in legacy remote-contract fixtur
 contact Forge or consume the real host's remote slots from a unit test. Retain the original
 termination acknowledgements and refusal assertions when updating those fixtures.
 
-Remote telemetry older than 30 seconds (or dated in the future) routes through local admission.
-An idle runner does not fabricate a fresh sample on a telemetry read: a prepare/run/finish
-refresh must occur before remote routing can recover from stale evidence. Cache reads,
-including failed reads, are shared across clients for ten seconds; back-off and failure counts
-are host-shared too. Persist `slot-N.unconfirmed` exclusively before invoking the remote executor;
+Remote telemetry older than 30 seconds or more than 60 seconds ahead routes through local
+admission. Compare ET timestamps by instant with `Date.parse`, independent of the process timezone.
+`forge-health-fresh.test.mjs` pins both freshness boundaries, winter/summer offsets, strict optional
+boolean `prewarmed` entries, and stale persisted-cache recovery. Stale cached telemetry gets exactly
+one fresh read under the mutex before deciding; a failed read is `forge-unreachable`, and a still-stale
+sample is `telemetry-stale`. Fresh data and failed reads share the ten-second cache; an active backoff
+still returns before reading. Back-off and failure counts are host-shared too.
+Persist `slot-N.unconfirmed` exclusively before invoking the remote executor;
 remove it only after confirmed completion or termination. Abrupt client death skips `finally`,
 so quarantine cannot depend on cleanup running. A dead client PID or expired slot lease never
 authorizes reusing an outstanding execution's capacity. An operator must confirm Forge termination
