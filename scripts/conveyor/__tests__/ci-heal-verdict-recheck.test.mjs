@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { requiredCheckStates, contradictingChecks, notCiBreakContradicted, unsettledRequiredChecks, ciGreenForEscalation, resolveVoidNeedsHumanWhenCiGreen, resolveCiHealVerdictSettings } from '../ci-heal-verdict-recheck.mjs';
 import * as verdictRecheck from '../ci-heal-verdict-recheck.mjs';
-import { checkNeedsHumanEscalable, notCiBreakRecordRefusal } from '../ci-heal-escalation-mark.mjs';
+import { checkNeedsHumanEscalable, checkNotCiBreakRecordable, notCiBreakRecordRefusal } from '../ci-heal-escalation-mark.mjs';
 import { excuseMergeGateRows } from '../../lib/merge-gate-hold-class.mjs';
 import { latestCheckNamed } from '../../lib/rollup-collapse.mjs';
 
@@ -331,6 +331,42 @@ describe('requiredCheckStates shared predicate regressions', () => {
     ];
     expect(requiredCheckStates({ requiredChecks: ['test'], rollup: reverse ? rows.toReversed() : rows }))
       .toEqual({ red: ['test'], pending: [], missing: [], green: [] });
+  });
+
+  it.each([false, true])('CheckRun failure outranks an untagged named success (reverse=%s)', reverse => {
+    const rows = [
+      { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T01:00:00Z' },
+      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-28T02:00:00Z' },
+    ];
+    expect(requiredCheckStates({ requiredChecks: ['test'], rollup: reverse ? rows.toReversed() : rows }))
+      .toEqual({ red: ['test'], pending: [], missing: [], green: [] });
+  });
+
+  it.each(['FAILURE', 'STARTUP_FAILURE'])('undated %s blocks false CI-green verdicts across readers', async conclusion => {
+    for (const kind of ['CheckRun', 'untagged', 'StatusContext']) {
+      const rows = [
+        { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: '2026-10-28T01:00:00Z' },
+        { name: 'test', status: 'COMPLETED', conclusion },
+      ].map(row => kind === 'StatusContext'
+        ? { __typename: kind, context: row.name, state: row.conclusion, completedAt: row.completedAt }
+        : kind === 'CheckRun' ? { ...row, __typename: kind } : row);
+      for (const pair of [rows, rows.toReversed()]) {
+        const evidence = { ...input, requiredChecks: ['test'], rollup: [
+          ...pair, { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+        ] };
+        expect(requiredCheckStates(evidence)).toEqual({ red: ['test'], pending: [], missing: [], green: [] });
+        expect(contradictingChecks(evidence)).toEqual(['test']);
+        expect(ciGreenForEscalation(evidence)).toBe(false);
+        expect(verdictRecheck.gateOnlyRedStates(evidence).gateOnlyRed).toBe(false);
+        const pr = { headRefOid: input.headSha, statusCheckRollup: evidence.rollup };
+        expect(notCiBreakRecordRefusal({ headSha: input.headSha, pr, requiredChecks: ['test'] })).toBeTruthy();
+        const options = { headSha: input.headSha, settings: { recheckNotCiBreak: true },
+          readPr: async () => pr, readRequired: async () => ({ checks: ['test'] }) };
+        expect(await checkNeedsHumanEscalable({ ...options, outcome: 'needs-human' })).toEqual({ refusal: null });
+        expect(await checkNotCiBreakRecordable({ ...options, outcome: 'not-a-ci-break' }))
+          .toEqual({ refusal: expect.stringContaining('red: test') });
+      }
+    }
   });
 
   it.each([false, true])('an untagged row outranks a legacy StatusContext (reverse=%s)', reverse => {

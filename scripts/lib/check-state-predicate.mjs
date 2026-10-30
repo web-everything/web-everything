@@ -58,8 +58,9 @@ const numeric = (value) => {
  * created_at/createdAt. Invalid timestamps and pre-2000/epoch
  * timestamps count as absent, falling through to the next valid timestamp.
  * Unfinished rows with no valid timestamps rank newest (+Infinity), conservatively
- * keeping undated attempts pending. Other missing or invalid timestamps rank
- * lowest. Workflow run identities and attempt counters never rank checks;
+ * keeping undated attempts pending. Undated red evidence also ranks newest,
+ * so incomplete failure evidence cannot establish green admission. Other missing
+ * or invalid timestamps rank lowest. Workflow run identities and attempt counters never rank checks;
  * numeric check-run ids break time ties.
  * Exact ties retain the first row. Inputs are never mutated.
  * @param {object[]} checks Check attempts.
@@ -83,7 +84,10 @@ export function latestAttempts(checks = []) {
         if (timestamp === 0 || timestamp === '0' || time < Date.UTC(2000, 0, 1)) continue;
         return time;
       }
-      return ownValue(CHECK_STATE_TABLE, normalize(check.status)) === 'pending' ? Infinity : -Infinity;
+      // Requiredness is applied by summarize AFTER selection; a row flag must
+      // never hide undated red evidence for a name in an explicit required roster.
+      const undatedRed = classifyCheck({ ...check, required: true }) === 'red';
+      return undatedRed || ownValue(CHECK_STATE_TABLE, normalize(check.status)) === 'pending' ? Infinity : -Infinity;
     };
     return group.reduce((previous, check) => {
       const time = effectiveTime(check), previousTime = effectiveTime(previous);
