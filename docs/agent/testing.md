@@ -1692,6 +1692,11 @@ A core file that dynamically imports its CLI cannot await that import at module 
 its CLI statically imports the core. A staged Node probe of that cycle exits 13 with unsettled
 top-level await. Defer the import with `.then(...)`, and test both entry paths as subprocesses.
 
+Keep the local admission heartbeat import graph free of remote CLI modules with top-level
+await: terminating a watchdog worker during their evaluation can abort Node with SIGTRAP.
+Load remote health only after selecting remote execution. The subprocess startup/stop case
+in `scripts/__tests__/verify-lane.test.mjs` exercises that worker lifetime boundary.
+
 ### Daemon worker risk routing
 
 For the [daemon model rule](platform-decisions.md#daemon-claude-worker-risk), exercise

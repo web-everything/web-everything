@@ -120,6 +120,36 @@ describe('verify-lane writer — overlapping-runs race (#2833 finding 1)', () =>
 });
 
 describe('verify-lane — hard per-phase timeout (verify-admission, 2026-10-20)', () => {
+  it('can stop local heartbeat watchdogs during module startup without crashing Node', () => {
+    // Run outside Vitest's process: terminating a worker while its heartbeat import evaluates
+    // a top-level await used to abort the entire Node process, not merely reject the worker.
+    const script = `
+import { startTreeWatchdog } from ${JSON.stringify(new URL('../lib/tree-watchdog.mjs', import.meta.url).href)};
+for (let round = 0; round < 24; round++) {
+  const watchdog = startTreeWatchdog({
+    pid: process.pid, timeoutMs: 60000,
+    warn: message => { throw new Error(message); },
+    heartbeat: {
+      module: ${JSON.stringify(new URL('../readiness/heavy-admission.mjs', import.meta.url).href)},
+      exportName: 'heartbeatOwnedSlot',
+      args: { lockRoot: ${JSON.stringify(join(dir, 'watchdog-pool'))}, cap: 1, owner: 'startup-probe' },
+      everyMs: 300000,
+    },
+  });
+  await new Promise(resolve => setTimeout(resolve, 50 + (round % 8) * 25));
+  watchdog.stop();
+}
+console.log('watchdogs stopped');
+`;
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+      encoding: 'utf8', timeout: 20000, maxBuffer: 1024 * 1024,
+    });
+    expect(result.error, result.stderr).toBeUndefined();
+    expect(result.signal, result.stderr).toBeNull();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe('watchdogs stopped\n');
+  }, 25000);
+
   it('non-leader timeout does not sweep unrelated group orphans', () => {
     // Isolate the shared group from Vitest/the agent shell. The supervisor leads it; verify-lane and an
     // unrelated, reparented sleeper share it. Removing the caller's leader guard kills this survivor.
@@ -1454,8 +1484,10 @@ process.exit(${standardsExit});
       expect(result.error, result.stderr).toBeUndefined();
       expect(result.signal, result.stderr).toBeNull();
       const terminal = result.stdout.trim().split('\n').at(-1);
-      expect(terminal, `missing verification verdict (exit ${result.status}): ${result.stderr}`).toMatch(/^\{"sha":/);
-      return { code: result.status, json: JSON.parse(terminal), stdout: result.stdout, stderr: result.stderr };
+      let json;
+      try { json = JSON.parse(terminal); } catch { /* the assertion below reports the full child diagnostics */ }
+      expect(json, `missing verification verdict (exit ${result.status}): ${result.stdout}\n${result.stderr}`).toHaveProperty('sha', headSha());
+      return { code: result.status, json, stdout: result.stdout, stderr: result.stderr };
     }
     return { files, invoke, calls: () => readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) };
   }
