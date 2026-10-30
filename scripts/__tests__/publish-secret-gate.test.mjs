@@ -46,6 +46,8 @@ beforeAll(() => {
   // the script silently does NOTHING and exits 0 — a green test proving only that nothing ran.
   clone = realpathSync(mkdtempSync(join(tmpdir(), 'we-publish-secret-gate-')));
   execFileSync('cp', ['-R', SCRIPTS, join(clone, 'scripts')]);
+  cpSync(join(ROOT, 'skills-src/conveyor/daemon-manifest.mjs'),
+    join(clone, 'skills-src/conveyor/daemon-manifest.mjs'));
   // The transcript check imports this skill module during CLI startup.
   cpSync(join(ROOT, 'skills-src', 'inspect-codex-transcript'),
     join(clone, 'skills-src', 'inspect-codex-transcript'), { recursive: true });

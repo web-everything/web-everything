@@ -539,7 +539,6 @@
   "scripts/lib/__tests__/daemon-live-smoke.test.mjs": 3.97,
   "scripts/lib/__tests__/daemon-load-overlay.test.mjs": 0.85,
   "scripts/lib/__tests__/daemon-overlays.test.mjs": 2.9,
-  "scripts/lib/__tests__/daemon-rebuild-fallback.test.mjs": 13.16,
   "scripts/lib/__tests__/daemon-rebuild-ready.test.mjs": 40.46,
   "scripts/lib/__tests__/daemon-rebuild-smoke-cache.test.mjs": 13.57,
   "scripts/lib/__tests__/daemon-rebuild.test.mjs": 60.68,

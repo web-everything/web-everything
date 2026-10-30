@@ -24,6 +24,8 @@ import { runBounded } from '../bounded-child.mjs';
 import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
+import { cloneRuntimeEntries } from '../daemon-clone-entries.mjs';
+import { resolveClosureScopeMode } from './skip-unrelated.mjs';
 
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 
@@ -334,8 +336,10 @@ async function resolveDispatchSmoke(opt, env) {
  */
 export async function smokeAndAdopt({
   root, env, stEnv, log, run, runSmoke, stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
-  finalLockOpts, finalizeLockOpts = finalLockOpts, dispatchSmoke, readyOnly = false,
+  finalLockOpts, finalizeLockOpts = finalLockOpts, dispatchSmoke, readyOnly = false, entries = [],
 }) {
+  const closureScopeMode = resolveClosureScopeMode(env).mode;
+  const runtimeEntries = () => cloneRuntimeEntries({ root, entries, env });
   /** Every state write here happens UNDER the write lock (PR #2731 review: an unlocked write could clobber a
    *  sibling's locked one). `release` also drops our build lease — done by the outcome that ENDS this build,
    *  never mid-fallback (a sibling must not start a build while B/C are still being smoked). Returns the
@@ -733,6 +737,7 @@ export async function smokeAndAdopt({
       const culpritRefs = new Set(culprits.map((ap) => ap.ref));
       const kept = plan.applied.filter((ap) => !culpritRefs.has(ap.ref));
       const planA2 = await planRebuild({
+        entries: runtimeEntries, env, closureScopeMode,
         git, headSha: prevHead, mainRef: 'origin/main',
         overlays: kept.map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr })),
         edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
@@ -776,6 +781,7 @@ export async function smokeAndAdopt({
   if (!mainOnly && suspects.length > 0) {
     const pinnedOverlays = withPin.filter((ap) => ap.pinned).map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr }));
     const planB = await planRebuild({
+      entries: runtimeEntries, env, closureScopeMode,
       git, headSha: prevHead, mainRef: 'origin/main', overlays: pinnedOverlays,
       edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
     });
